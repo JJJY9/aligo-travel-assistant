@@ -392,7 +392,7 @@ c) 避免不必要的短途飞行
 
 联系我们：
 如有环保建议或疑问，请联系：
-- 企业社会责任部：csr@alibaba-inc.com
-- 人力资源部：hr@alibaba-inc.com
+- 企业社会责任部：csr@example.com
+- 人力资源部：hr@example.com
 
 让我们一起为更美好的地球而努力！
