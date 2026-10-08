@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AgentScope
+.agentscope/
+
+# Data
+data/rag_knowledge/
+data/preferences/*.json
+!data/preferences/.gitkeep
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ===== 本地/敏感文件（切勿提交）=====
+# Claude/Claudian 本机配置（含机器与账号信息）
+.claude/settings.local.json
+.claude/claudian-settings.json
+
+# 用户记忆数据（运行时生成，含对话历史）
+data/memory/
+
+# 本地 Embedding 模型（从 HuggingFace/ModelScope 下载，见 README）
+data/models/*
+!data/models/.gitkeep
+
+# RAG 向量库（运行 init_knowledge_base.py 生成）
+.claude/skills/ask-question/data/rag_knowledge/
+
+# 演示视频等大文件
+*.mp4
