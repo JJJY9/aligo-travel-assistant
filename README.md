@@ -1,6 +1,6 @@
 # Aligo 智能旅行助手
 
-基于**豆包大模型**和**AgentScope框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
+基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
 ## ✨ 核心亮点
 
@@ -272,23 +272,34 @@ pip install ddgs==9.10.0                    # 网络搜索
 
 ### 2. 配置模型
 
-推荐通过**环境变量**提供豆包大模型API密钥，避免密钥写入代码：
+项目默认使用 **DeepSeek**（OpenAI 兼容接口），API 密钥二选一：
+
+**方式一（推荐）：本地配置文件**
+
+在项目根目录创建 `config_local.py`：
+
+```python
+API_KEY = "sk-你的密钥"
+```
+
+该文件已在 `.gitignore` 中，不会被误提交。
+
+**方式二：环境变量**
 
 ```bash
 # macOS / Linux
-export ARK_API_KEY=你的API密钥
+export LLM_API_KEY=你的API密钥
 
 # Windows PowerShell
-$env:ARK_API_KEY="你的API密钥"
+$env:LLM_API_KEY="你的API密钥"
 ```
 
-也可以在 `config.py` 中直接填写 `api_key`（本地调试用，注意不要提交真实密钥）。
-
 **配置说明**：
-- `ARK_API_KEY`: 豆包大模型API密钥（必填，从[火山方舟控制台](https://console.volcengine.com/ark)获取）
-- `ARK_MODEL_NAME`: 模型名称（可选，默认 `doubao-seed-1-6-flash-250828`，推荐 flash 系列）
-- `temperature`: 控制生成的随机性（0-1，0.7为推荐值）
-- `max_tokens`: 最大输出token数（8192）
+- `LLM_API_KEY`: 大模型API密钥（必填，从 [DeepSeek 开放平台](https://platform.deepseek.com) 获取）
+- `LLM_MODEL_NAME`: 模型名称（可选，默认 `deepseek-chat`；也可用 `deepseek-reasoner`）
+- `LLM_BASE_URL`: 接口地址（可选，默认 `https://api.deepseek.com`）
+- 切换其他服务商（豆包 / OpenAI 等）：覆盖上面两个变量，或修改 `config.py` 中的默认值（文件内有示例）
+- `temperature` / `max_tokens`: 生成参数（0.7 / 8192）
 
 ### 3. 初始化知识库
 
@@ -456,7 +467,7 @@ shanglv/
 
 ### 核心框架
 - 📦 **AgentScope 1.0.16** - 多智能体框架
-- 🤖 **豆包大模型 (doubao-seed-1-6-flash-250828)** - 大语言模型
+- 🤖 **DeepSeek (deepseek-chat)** - 大语言模型（OpenAI 兼容接口，可切换豆包 / OpenAI 等）
 
 ### 数据存储
 - 🗄️ **PostgreSQL** - 长期记忆持久化（用户偏好、历史行程、聊天记录）
@@ -492,8 +503,8 @@ shanglv/
 ## ⚠️ 注意事项
 
 ### 模型配置
-- 必须配置豆包大模型API密钥（环境变量 `ARK_API_KEY`，或在 `config.py` 中填写）
-- 推荐使用 flash 系列模型（响应速度快）
+- 必须配置大模型API密钥（默认 DeepSeek：环境变量 `LLM_API_KEY`，或本地 `config_local.py`）
+- 默认使用 `deepseek-chat`（响应快、成本低），可在 `config.py` / 环境变量中切换模型与服务商
 - BGE Embedding模型需下载到 `data/models/bge-small-zh-v1.5/`（仓库不含模型文件）：
   - HuggingFace: https://huggingface.co/BAAI/bge-small-zh-v1.5
   - ModelScope（国内更快）: https://modelscope.cn/models/BAAI/bge-small-zh-v1.5

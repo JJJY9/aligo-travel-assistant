@@ -4,13 +4,29 @@ Configuration for the Aligo Multi-Agent System
 import os
 
 # LLM Configuration
-# 优先从环境变量读取，避免把真实密钥提交到代码库：
-#   macOS/Linux:        export ARK_API_KEY=你的密钥
-#   Windows PowerShell: $env:ARK_API_KEY="你的密钥"
+# 默认使用 DeepSeek（OpenAI 兼容接口），也支持豆包、OpenAI 等任意兼容服务。
+#
+# 密钥读取优先级：环境变量 LLM_API_KEY > 本地 config_local.py 中的 API_KEY
+#   macOS/Linux:        export LLM_API_KEY=你的密钥
+#   Windows PowerShell: $env:LLM_API_KEY="你的密钥"
+#   （Windows 推荐在项目根目录创建 config_local.py，内容为 API_KEY = "sk-..."，该文件已 gitignore）
+#
+# 切换服务商：覆盖下面两个环境变量，或直接修改默认值。示例——
+#   豆包:   LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+#           LLM_MODEL_NAME=doubao-seed-1-6-flash-250828
+#   OpenAI: LLM_BASE_URL=https://api.openai.com/v1
+#           LLM_MODEL_NAME=gpt-4o-mini
+_api_key = os.environ.get("LLM_API_KEY", "")
+if not _api_key:
+    try:
+        from config_local import API_KEY as _api_key  # 本地私有配置（已 gitignore）
+    except ImportError:
+        pass
+
 LLM_CONFIG = {
-    "api_key": os.environ.get("ARK_API_KEY", ""),  # 本地调试也可直接填入（切勿提交）
-    "model_name": os.environ.get("ARK_MODEL_NAME", "doubao-seed-1-6-flash-250828"),
-    "base_url": os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+    "api_key": _api_key,
+    "model_name": os.environ.get("LLM_MODEL_NAME", "deepseek-chat"),
+    "base_url": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
     "temperature": 0.7,
     "max_tokens": 8192,
 }

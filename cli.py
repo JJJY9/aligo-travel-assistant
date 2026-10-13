@@ -95,7 +95,8 @@ class AligoCLI:
             # 初始化模型
             if not LLM_CONFIG["api_key"]:
                 self.console.print(
-                    "[bold red]⚠ 未检测到 API Key，请设置环境变量 ARK_API_KEY 或在 config.py 中填写[/bold red]"
+                    "[bold red]⚠ 未检测到 API Key，请设置环境变量 LLM_API_KEY，"
+                    '或创建 config_local.py（内容：API_KEY = "sk-..."）[/bold red]'
                 )
             timeout_sec = SYSTEM_CONFIG.get("timeout", 60)
             self.model = OpenAIChatModel(
