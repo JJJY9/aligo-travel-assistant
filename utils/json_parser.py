@@ -54,10 +54,15 @@ def robust_json_parse(text: str, fallback=None) -> dict:
 
     json_str = text[start_idx:end_idx+1]
 
+    # 记录最后一次解析错误：Python 3 会回收 except 变量，
+    # 不显式保存的话最终兜底处引用 e 会抛 NameError（Issue #6）
+    last_error = None
+
     # 尝试1: 直接解析
     try:
         return json.loads(json_str)
     except json.JSONDecodeError as e:
+        last_error = e
         logger.warning(f"Direct JSON parse failed: {e}")
         # 输出出错位置附近的内容
         error_pos = getattr(e, 'pos', 0)
@@ -72,6 +77,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.info("JSON parsed successfully after removing control characters")
         return result
     except json.JSONDecodeError as e:
+        last_error = e
         logger.warning(f"JSON parse failed after cleaning: {e}")
 
     # 尝试3: 修复引号问题
@@ -84,6 +90,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.info("JSON parsed successfully after fixing quotes")
         return result
     except json.JSONDecodeError as e:
+        last_error = e
         logger.warning(f"JSON parse failed after fixing quotes: {e}")
 
     # 尝试4: 修复常见的尾部逗号问题
@@ -94,6 +101,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.info("JSON parsed successfully after removing trailing commas")
         return result
     except json.JSONDecodeError as e:
+        last_error = e
         logger.warning(f"JSON parse failed after removing trailing commas: {e}")
 
     # 尝试5: 修复未转义的换行符（只在字符串值内部）
@@ -139,6 +147,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.info("JSON parsed successfully after smart escaping")
         return result
     except json.JSONDecodeError as e:
+        last_error = e
         logger.warning(f"JSON parse failed after smart escaping: {e}")
 
     # 尝试6: 使用 json5 或其他宽松解析器（如果可用）
@@ -147,9 +156,11 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         result = json5.loads(json_str)
         logger.info("JSON parsed successfully using json5")
         return result
-    except ImportError:
+    except ImportError as e:
+        last_error = e
         logger.debug("json5 not available")
     except Exception as e:
+        last_error = e
         logger.warning(f"JSON5 parse failed: {e}")
 
     # 所有尝试都失败
@@ -159,7 +170,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.warning("Using fallback value")
         return fallback
 
-    raise ValueError(f"Failed to parse JSON after all attempts. Last error: {e}")
+    raise ValueError(f"Failed to parse JSON after all attempts. Last error: {last_error}")
 
 
 def extract_json_from_response(response, field_name="content") -> str:

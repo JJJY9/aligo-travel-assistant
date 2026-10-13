@@ -76,6 +76,8 @@ class LongTermMemory:
             data["statistics"] = {}
         if "total_messages" not in data.get("statistics", {}):
             data["statistics"]["total_messages"] = 0
+        if "total_queries" not in data.get("statistics", {}):
+            data["statistics"]["total_queries"] = 0
         if "preferences" not in data:
             data["preferences"] = []
 
@@ -124,6 +126,7 @@ class LongTermMemory:
             "statistics": {
                 "total_trips": 0,
                 "total_messages": 0,
+                "total_queries": 0,
                 "frequent_destinations": {}
             }
         }
@@ -334,7 +337,8 @@ class LongTermMemory:
 
     def increment_query_count(self):
         """增加查询计数"""
-        self.data["statistics"]["total_queries"] += 1
+        stats = self.data["statistics"]
+        stats["total_queries"] = stats.get("total_queries", 0) + 1
         self._save()
 
     def get_statistics(self) -> Dict[str, Any]:
