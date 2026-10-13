@@ -1,70 +1,105 @@
 """
-测试事项收集智能体
+测试事项收集智能体（无需 API Key，mock 模型）
+
+覆盖：
+1. 偏好值为字符串时 prompt 保持完整（Issue #2 回归：不被 ', '.join 拆成单字）
+2. 偏好值为列表时正常拼接
+3. 正常提取流程与结果解析
+
+运行：python tests/test_event_collection_agent.py
 """
 import sys
-sys.path.append('..')
+import os
+import asyncio
+import json
+import importlib.util
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
 
 from agentscope.message import Msg
-from config_agentscope import init_agentscope
-from agents.event_collection_agent import EventCollectionAgent
 
 
-def test_event_collection_agent():
-    """测试事项收集智能体"""
+def _load_agent_class():
+    """与 LazyAgentRegistry 一致，从 .claude/skills 动态加载"""
+    path = os.path.join(project_root, ".claude", "skills", "event-collection", "script", "agent.py")
+    spec = importlib.util.spec_from_file_location("skills.event_collection.agent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.EventCollectionAgent
 
-    print("初始化 AgentScope...")
-    init_agentscope()
 
-    agent = EventCollectionAgent(
-        name="EventCollectionAgent",
-        model_config_name="doubao_api"
-    )
+class _CaptureModel:
+    """记录 prompt 并返回固定 JSON 的 mock 模型"""
 
-    test_cases = [
-        "我要从北京去上海出差3天",
-        "下周一从杭州出发去深圳，周五回来",
-        "去上海玩",  # 信息不完整的情况
-        "3月15日从北京到上海，3月18日返回北京，出差",
-    ]
+    def __init__(self, response_text: str):
+        self.response_text = response_text
+        self.prompts = []
 
-    for i, query in enumerate(test_cases, 1):
-        print("\n" + "="*70)
-        print(f"测试 {i}")
-        print("="*70)
-        print(f"用户查询: {query}")
-        print()
+    async def __call__(self, messages):
+        self.prompts.append(messages[-1]["content"])
 
-        msg = Msg(name="User", content=query, role="user")
-        result = agent(msg)
+        class _Resp:
+            pass
 
-        # 显示结果
-        content = result.content
-        print("【提取结果】")
+        resp = _Resp()
+        resp.text = self.response_text
+        return resp
 
-        if content.get("origin"):
-            print(f"  ✓ 出发地: {content['origin']}")
-        if content.get("destination"):
-            print(f"  ✓ 目的地: {content['destination']}")
-        if content.get("start_date"):
-            print(f"  ✓ 出发日期: {content['start_date']}")
-        if content.get("end_date"):
-            print(f"  ✓ 返程日期: {content['end_date']}")
-        if content.get("duration_days"):
-            print(f"  ✓ 行程天数: {content['duration_days']}天")
-        if content.get("return_location"):
-            print(f"  ✓ 返程地: {content['return_location']}")
-        if content.get("trip_purpose"):
-            print(f"  ✓ 行程目的: {content['trip_purpose']}")
 
-        print(f"\n  已提取: {content.get('extracted_count', 0)}/7 项信息")
+def _reply(agent):
+    payload = json.dumps({
+        "context": {
+            "rewritten_query": "我要从北京去上海出差3天",
+            "user_preferences": {
+                "home_location": "北京朝阳区",
+                "hotel_brands": "万豪酒店和希尔顿",
+                "airlines": ["国航", "东航"],
+            },
+        }
+    }, ensure_ascii=False)
+    return asyncio.run(agent.reply(Msg(name="Orchestrator", content=payload, role="user")))
 
-        if content.get("missing_info"):
-            print(f"  ⚠ 缺失信息: {', '.join(content['missing_info'])}")
+
+def test_string_preference_not_split():
+    """Issue #2 回归：字符串偏好不能被拆成单字"""
+    agent_class = _load_agent_class()
+    model = _CaptureModel('{"origin": "北京", "destination": "上海", "duration_days": 3, "missing_info": []}')
+    agent = agent_class(name="EventCollectionAgent", model=model)
+    _reply(agent)
+
+    prompt = model.prompts[0]
+    assert "万豪酒店和希尔顿" in prompt, "字符串偏好应保持完整"
+    assert "万, 豪" not in prompt, "字符串偏好被拆成了单字（Issue #2 复现）"
+    print("✓ 字符串偏好保持完整")
+
+
+def test_list_preference_joined():
+    """列表偏好应拼接为 国航, 东航"""
+    agent_class = _load_agent_class()
+    model = _CaptureModel('{"origin": "北京", "destination": "上海", "missing_info": []}')
+    agent = agent_class(name="EventCollectionAgent", model=model)
+    _reply(agent)
+
+    prompt = model.prompts[0]
+    assert "国航, 东航" in prompt, "列表偏好应以 ', ' 拼接"
+    print("✓ 列表偏好正常拼接")
+
+
+def test_result_parsed():
+    """正常提取流程：mock 返回的 JSON 能被解析并返回"""
+    agent_class = _load_agent_class()
+    model = _CaptureModel('{"origin": "北京", "destination": "上海", "duration_days": 3, "missing_info": []}')
+    agent = agent_class(name="EventCollectionAgent", model=model)
+    result = json.loads(_reply(agent).content)
+    assert result["origin"] == "北京"
+    assert result["destination"] == "上海"
+    assert result["duration_days"] == 3
+    print("✓ 提取结果解析正常")
 
 
 if __name__ == "__main__":
-    print("="*70)
-    print("事项收集智能体测试")
-    print("="*70)
-    test_event_collection_agent()
-    print("\n测试完成！")
+    test_string_preference_not_split()
+    test_list_preference_joined()
+    test_result_parsed()
+    print("\n全部通过")

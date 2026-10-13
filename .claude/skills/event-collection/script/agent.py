@@ -20,6 +20,16 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 logger = logging.getLogger(__name__)
 
 
+def _format_pref_value(value) -> str:
+    """偏好值可能是字符串或列表（见 LongTermMemory），统一为可读文本。
+
+    直接对字符串做 ', '.join 会把内容按单个字符拆开（Issue #2）。
+    """
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
 class EventCollectionAgent(AgentBase):
     """事项收集智能体"""
 
@@ -54,11 +64,11 @@ class EventCollectionAgent(AgentBase):
         if user_preferences:
             bg_parts = ["【用户背景信息】（可用于推断缺失信息）"]
             if user_preferences.get("home_location"):
-                bg_parts.append(f"• 家庭住址: {user_preferences['home_location']}")
+                bg_parts.append(f"• 家庭住址: {_format_pref_value(user_preferences['home_location'])}")
             if user_preferences.get("hotel_brands"):
-                bg_parts.append(f"• 酒店偏好: {', '.join(user_preferences['hotel_brands'])}")
+                bg_parts.append(f"• 酒店偏好: {_format_pref_value(user_preferences['hotel_brands'])}")
             if user_preferences.get("airlines"):
-                bg_parts.append(f"• 航空偏好: {', '.join(user_preferences['airlines'])}")
+                bg_parts.append(f"• 航空偏好: {_format_pref_value(user_preferences['airlines'])}")
 
             if len(bg_parts) > 1:
                 background_info = "\n".join(bg_parts) + "\n\n"
