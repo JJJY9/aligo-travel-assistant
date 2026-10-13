@@ -507,7 +507,8 @@ shanglv/
 ### 知识库初始化
 - 首次运行前必须初始化RAG知识库
 - 知识库文档位于 `.claude/skills/ask-question/data/documents/`
-- Milvus数据库文件生成在 `.claude/skills/ask-question/data/milvus_travel_kb.db`
+- Milvus数据库文件生成在 `.claude/skills/ask-question/data/rag_knowledge/milvus_lite.db`
+- **Windows 说明**：`requirements.txt` 会按平台自动选择依赖（非 Windows 用 `pymilvus 2.6.9 + milvus-lite 2.x`，Windows 用 `pymilvus 3.x + milvus-lite 3.x`）。如果目录中已有旧版（2.x 时代）生成的 `milvus_lite.db` 文件，需先删除再运行初始化脚本（两个版本的数据文件互不兼容；该文件为可再生文件）
 
 ### 性能优化
 - 懒加载机制：系统启动时仅扫描Skill元数据，首次调用时才加载

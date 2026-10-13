@@ -230,6 +230,15 @@ class RAGKnowledgeAgent(AgentBase):
         try:
             # 确保连接正常
             self._ensure_connection()
+
+            # 确保 collection 已加载后再检索：
+            # Milvus Lite 3.x（Windows）新会话中 collection 默认为 released 状态，
+            # 不加载会报 "call load() before search/get/query"；2.x 上该调用无副作用。
+            try:
+                self.milvus_client.load_collection(self.collection_name)
+            except Exception as load_err:
+                logger.debug(f"load_collection skipped: {load_err}")
+
             k = top_k or self.top_k
 
             # 生成查询向量
