@@ -91,7 +91,9 @@ class RAGKnowledgeAgent(AgentBase):
         model_path_or_id = embedding_model
         path_obj = Path(embedding_model).expanduser()
         if not path_obj.is_absolute():
-            path_obj = Path.cwd() / path_obj
+            # 相对路径锚定到项目根目录，避免依赖运行时 CWD（Issue #5）
+            project_root = Path(__file__).resolve().parents[4]
+            path_obj = project_root / path_obj
         if path_obj.exists():
             model_path_or_id = str(path_obj.resolve())
             logger.info(f"Using local embedding model: {model_path_or_id}")
