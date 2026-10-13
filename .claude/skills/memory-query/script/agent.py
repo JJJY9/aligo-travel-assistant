@@ -231,17 +231,24 @@ class MemoryQueryAgent(AgentBase):
             return "（暂无偏好记录）"
 
         lines = []
+        # 与 cli.py 的 type_names 及系统实际存储的偏好类型保持一致（Issue #3）
         pref_names = {
-            "budget": "预算偏好",
-            "accommodation": "住宿偏好",
-            "transportation": "交通偏好",
-            "food": "餐饮偏好",
-            "activity": "活动偏好",
-            "other": "其他偏好"
+            "home_location": "常驻地",
+            "transportation_preference": "交通偏好",
+            "hotel_brands": "酒店偏好",
+            "airlines": "航空公司偏好",
+            "seat_preference": "座位偏好",
+            "meal_preference": "餐食偏好",
+            "budget_level": "预算等级",
         }
 
         for key, value in preferences.items():
-            if value and key in pref_names:
-                lines.append(f"- {pref_names[key]}: {value}")
+            if not value:
+                continue
+            # 未知/自定义偏好类型不再丢弃，直接使用原始类型名
+            name = pref_names.get(key, key)
+            if isinstance(value, (list, tuple)):
+                value = ", ".join(str(v) for v in value)
+            lines.append(f"- {name}: {value}")
 
         return "\n".join(lines) if lines else "（暂无偏好记录）"
