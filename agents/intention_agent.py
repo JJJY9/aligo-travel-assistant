@@ -19,6 +19,7 @@ from typing import Optional, Union, List
 import json
 import logging
 from utils.skill_loader import SkillLoader
+from utils.llm_resilience import is_retriable_error
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,11 @@ class IntentionAgent(AgentBase):
                     raise ValueError(f"No JSON found in response. Parse error: {e1}")
 
         except Exception as e:
+            # 可重试错误（超时/连接失败/429/5xx）向上抛出，
+            # 交由 cli.py 的 retry_with_backoff 与熔断器处理（Issue #1）
+            if is_retriable_error(e):
+                logger.error(f"Intent recognition failed (retriable): {e}")
+                raise
             logger.error(f"Intent recognition failed: {e}")
             # 返回默认结果
             result = {
