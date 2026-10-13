@@ -20,6 +20,16 @@ from utils.json_parser import robust_json_parse, extract_json_from_async_respons
 logger = logging.getLogger(__name__)
 
 
+def _format_pref_value(value) -> str:
+    """偏好值可能是字符串或列表（见 LongTermMemory），统一为可读文本。
+
+    直接对字符串做 ', '.join 会把内容按单个字符拆开（Issue #2）。
+    """
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
 class ItineraryPlanningAgent(AgentBase):
     """
     行程规划智能体（主协调）
@@ -81,13 +91,13 @@ class ItineraryPlanningAgent(AgentBase):
         if user_preferences:
             pref_parts = ["【用户偏好】（规划时优先考虑）"]
             if user_preferences.get("home_location"):
-                pref_parts.append(f"• 家庭住址: {user_preferences['home_location']}")
+                pref_parts.append(f"• 家庭住址: {_format_pref_value(user_preferences['home_location'])}")
             if user_preferences.get("hotel_brands"):
-                pref_parts.append(f"• 酒店偏好: {', '.join(user_preferences['hotel_brands'])}")
+                pref_parts.append(f"• 酒店偏好: {_format_pref_value(user_preferences['hotel_brands'])}")
             if user_preferences.get("airlines"):
-                pref_parts.append(f"• 航空偏好: {', '.join(user_preferences['airlines'])}")
+                pref_parts.append(f"• 航空偏好: {_format_pref_value(user_preferences['airlines'])}")
             if user_preferences.get("seat_preference"):
-                pref_parts.append(f"• 座位偏好: {user_preferences['seat_preference']}")
+                pref_parts.append(f"• 座位偏好: {_format_pref_value(user_preferences['seat_preference'])}")
 
             if len(pref_parts) > 1:
                 preferences_info = "\n".join(pref_parts) + "\n\n"
