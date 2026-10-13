@@ -1,0 +1,83 @@
+"""
+工具类回归测试（无需 API Key）
+
+覆盖 Issue #6：
+1. robust_json_parse 所有解析尝试失败时抛 ValueError（修复前抛 NameError），fallback 生效；
+2. LongTermMemory.increment_query_count 在新建数据 / 旧版数据（无 total_queries 字段）上均可用。
+
+运行：python tests/test_utils_bugs.py
+"""
+import sys
+import os
+import json
+import tempfile
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+from utils.json_parser import robust_json_parse
+from context.long_term_memory import LongTermMemory
+
+
+def test_json_parse_failure_raises_value_error():
+    """全部解析尝试失败时应抛 ValueError（而不是 NameError）"""
+    try:
+        robust_json_parse('{"a": 1 "b": 2}')  # 缺逗号，连 json5 也解析不了的非法 JSON
+    except ValueError as e:
+        assert "Last error" in str(e) or "Failed to parse" in str(e)
+        print("✓ 全部失败时抛 ValueError")
+        return
+    except NameError as e:
+        raise AssertionError(f"仍抛 NameError（Issue #6a 复现）: {e}")
+    raise AssertionError("应抛 ValueError")
+
+
+def test_json_parse_fallback():
+    """提供 fallback 时返回 fallback"""
+    value = robust_json_parse("完全不是 JSON", fallback={"ok": True})
+    assert value == {"ok": True}
+    print("✓ fallback 生效")
+
+
+def test_json_parse_success_paths_unchanged():
+    """正常解析路径不受影响"""
+    assert robust_json_parse('{"a": 1}') == {"a": 1}
+    assert robust_json_parse('```json\n{"b": 2}\n```') == {"b": 2}
+    print("✓ 正常解析路径不受影响")
+
+
+def test_increment_query_count_fresh_data():
+    """新建数据上 increment_query_count 可用（修复前 KeyError）"""
+    d = tempfile.mkdtemp(prefix="chailv_stats_")
+    memory = LongTermMemory("stats_user", d)
+    memory.increment_query_count()
+    memory.increment_query_count()
+    assert memory.get_statistics().get("total_queries") == 2, "计数应为 2"
+    print("✓ increment_query_count 正常（新建数据）")
+
+
+def test_increment_query_count_legacy_data():
+    """旧版数据（statistics 中无 total_queries）迁移后可用"""
+    d = tempfile.mkdtemp(prefix="chailv_stats_")
+    legacy_path = os.path.join(d, "old_user.json")
+    with open(legacy_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "user_id": "old_user",
+            "preferences": [],
+            "chat_history": [],
+            "trip_history": [],
+            "statistics": {"total_trips": 0, "total_messages": 0, "frequent_destinations": {}},
+        }, f)
+    memory = LongTermMemory("old_user", d)
+    memory.increment_query_count()
+    assert memory.get_statistics()["total_queries"] == 1
+    print("✓ 旧数据迁移后 increment_query_count 正常")
+
+
+if __name__ == "__main__":
+    test_json_parse_failure_raises_value_error()
+    test_json_parse_fallback()
+    test_json_parse_success_paths_unchanged()
+    test_increment_query_count_fresh_data()
+    test_increment_query_count_legacy_data()
+    print("\n全部通过")
