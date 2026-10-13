@@ -29,11 +29,15 @@ class LongTermMemory:
             storage_path: 存储路径
         """
         self.user_id = user_id
-        self.storage_path = storage_path
-        self.db_path = os.path.join(storage_path, f"{user_id}.json")
+        # 相对路径锚定到项目根目录，避免从其它目录运行时数据写到 CWD（Issue #5）
+        storage = Path(storage_path)
+        if not storage.is_absolute():
+            storage = Path(__file__).resolve().parent.parent / storage
+        self.storage_path = str(storage)
+        self.db_path = os.path.join(self.storage_path, f"{user_id}.json")
 
         # 确保存储目录存在
-        Path(storage_path).mkdir(parents=True, exist_ok=True)
+        Path(self.storage_path).mkdir(parents=True, exist_ok=True)
 
         # 加载或初始化数据
         self.data = self._load()

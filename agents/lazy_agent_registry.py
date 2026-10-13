@@ -34,8 +34,8 @@ class LazyAgentRegistry:
         self.memory_manager = memory_manager
         self.console = Console()
         
-        # 技能目录路径
-        self.skills_root = Path(".claude/skills")
+        # 技能目录路径（锚定项目根目录，避免依赖运行时 CWD，Issue #5）
+        self.skills_root = Path(__file__).resolve().parent.parent / ".claude" / "skills"
         
         # 技能映射表: skill_name -> agent_script_path
         self._skill_map: Dict[str, Path] = {}
