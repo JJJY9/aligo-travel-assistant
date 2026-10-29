@@ -9,11 +9,11 @@
 
 运行：python tests/test_memory_query_preferences.py
 """
-import sys
-import os
 import asyncio
-import json
 import importlib.util
+import json
+import os
+import sys
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)

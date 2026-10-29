@@ -2,9 +2,9 @@
 短期记忆 (Short-term Memory)
 存储当前会话最近的对话历史，用于理解上下文和消歧
 """
-from typing import List, Dict, Any
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,9 @@ class ShortTermMemory:
             max_turns: 最大保存轮数（一轮 = 一对用户-助手消息）
         """
         self.max_turns = max_turns
-        self.messages: List[Dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
 
-    def add_message(self, role: str, content: str, metadata: Dict = None):
+    def add_message(self, role: str, content: str, metadata: dict | None = None):
         """
         添加消息到短期记忆
 
@@ -53,7 +53,7 @@ class ShortTermMemory:
 
         logger.debug(f"Added message to short-term memory: {role}")
 
-    def get_recent_context(self, n_turns: int = None) -> List[Dict[str, Any]]:
+    def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:
         """
         获取最近 n 轮对话
 
@@ -96,7 +96,7 @@ class ShortTermMemory:
         self.messages = []
         logger.info("Short-term memory cleared")
 
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self) -> dict[str, Any]:
         """获取统计信息"""
         return {
             "total_messages": len(self.messages),

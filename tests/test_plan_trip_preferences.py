@@ -5,11 +5,11 @@
 
 运行：python tests/test_plan_trip_preferences.py
 """
-import sys
-import os
 import asyncio
-import json
 import importlib.util
+import json
+import os
+import sys
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -26,7 +26,7 @@ def _load_agent_class():
 
 
 class _CaptureModel:
-    """记录 prompt 并返回固定行程 JSON 的 mock 模型"""
+    """记录 prompt 并返回固定行程 JSON 的确定性假模型（测试替身）"""
 
     def __init__(self):
         self.prompts = []

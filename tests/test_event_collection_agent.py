@@ -1,5 +1,5 @@
 """
-测试事项收集智能体（无需 API Key，mock 模型）
+测试事项收集智能体（无需 API Key，用确定性假模型驱动）
 
 覆盖：
 1. 偏好值为字符串时 prompt 保持完整（Issue #2 回归：不被 ', '.join 拆成单字）
@@ -8,11 +8,11 @@
 
 运行：python tests/test_event_collection_agent.py
 """
-import sys
-import os
 import asyncio
-import json
 import importlib.util
+import json
+import os
+import sys
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -30,11 +30,11 @@ def _load_agent_class():
 
 
 class _CaptureModel:
-    """记录 prompt 并返回固定 JSON 的 mock 模型"""
+    """记录 prompt 并返回固定 JSON 的确定性假模型（测试替身）"""
 
     def __init__(self, response_text: str):
         self.response_text = response_text
-        self.prompts = []
+        self.prompts: list[str] = []
 
     async def __call__(self, messages):
         self.prompts.append(messages[-1]["content"])
@@ -87,7 +87,11 @@ def test_list_preference_joined():
 
 
 def test_result_parsed():
-    """正常提取流程：mock 返回的 JSON 能被解析并返回"""
+    """正常提取流程：假模型返回的 JSON 能被解析并返回"""
+
+    # 说明：这里用确定性假模型替代真实 LLM（无需 API Key 与网络）。
+    # 假模型只负责返回固定 JSON，被测的是真实的 EventCollectionAgent.reply
+    # 与 prompt 组装逻辑，因此断言仍落在生产代码上。
     agent_class = _load_agent_class()
     model = _CaptureModel('{"origin": "北京", "destination": "上海", "duration_days": 3, "missing_info": []}')
     agent = agent_class(name="EventCollectionAgent", model=model)

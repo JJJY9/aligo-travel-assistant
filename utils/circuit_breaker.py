@@ -2,10 +2,9 @@
 熔断器 (Circuit Breaker)
 在连续失败后暂停调用 LLM，避免雪崩；一段时间后半开试探恢复。
 """
-import time
 import logging
+import time
 from enum import Enum
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +18,6 @@ class CircuitState(Enum):
 
 class CircuitOpenError(Exception):
     """熔断器打开时抛出的异常，表示当前不执行 LLM 调用"""
-    pass
 
 
 class CircuitBreaker:
@@ -46,8 +44,8 @@ class CircuitBreaker:
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._half_open_success_count = 0
-        self._last_failure_time: Optional[float] = None
-        self._opened_at: Optional[float] = None
+        self._last_failure_time: float | None = None
+        self._opened_at: float | None = None
 
     @property
     def state(self) -> CircuitState:

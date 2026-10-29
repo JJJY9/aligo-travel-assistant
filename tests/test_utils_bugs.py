@@ -7,16 +7,17 @@
 
 运行：python tests/test_utils_bugs.py
 """
-import sys
-import os
 import json
+import os
+import sys
 import tempfile
+import uuid
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.json_parser import robust_json_parse
 from context.long_term_memory import LongTermMemory
+from utils.json_parser import robust_json_parse
 
 
 def test_json_parse_failure_raises_value_error():
@@ -49,7 +50,7 @@ def test_json_parse_success_paths_unchanged():
 def test_increment_query_count_fresh_data():
     """新建数据上 increment_query_count 可用（修复前 KeyError）"""
     d = tempfile.mkdtemp(prefix="chailv_stats_")
-    memory = LongTermMemory("stats_user", d)
+    memory = LongTermMemory(f"stats-probe-{uuid.uuid4().hex[:8]}", d)
     memory.increment_query_count()
     memory.increment_query_count()
     assert memory.get_statistics().get("total_queries") == 2, "计数应为 2"
@@ -59,16 +60,17 @@ def test_increment_query_count_fresh_data():
 def test_increment_query_count_legacy_data():
     """旧版数据（statistics 中无 total_queries）迁移后可用"""
     d = tempfile.mkdtemp(prefix="chailv_stats_")
-    legacy_path = os.path.join(d, "old_user.json")
+    legacy_user_id = f"legacy-profile-{uuid.uuid4().hex[:8]}"
+    legacy_path = os.path.join(d, f"{legacy_user_id}.json")
     with open(legacy_path, "w", encoding="utf-8") as f:
         json.dump({
-            "user_id": "old_user",
+            "user_id": legacy_user_id,
             "preferences": [],
             "chat_history": [],
             "trip_history": [],
             "statistics": {"total_trips": 0, "total_messages": 0, "frequent_destinations": {}},
         }, f)
-    memory = LongTermMemory("old_user", d)
+    memory = LongTermMemory(legacy_user_id, d)
     memory.increment_query_count()
     assert memory.get_statistics()["total_queries"] == 1
     print("✓ 旧数据迁移后 increment_query_count 正常")

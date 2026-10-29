@@ -7,15 +7,16 @@
 
 运行：python tests/test_intention_resilience.py
 """
-import sys
-import os
 import asyncio
 import json
+import os
+import sys
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from agentscope.message import Msg
+
 from agents.intention_agent import IntentionAgent
 
 

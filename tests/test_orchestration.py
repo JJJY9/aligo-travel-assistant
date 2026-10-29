@@ -1,30 +1,46 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 测试智能体协调系统
 """
-import sys
-import os
 import asyncio
 import json
+import os
+import sys
+import uuid
+from datetime import datetime
+
+import pytest
 
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from agentscope.model import OpenAIChatModel
+# 每次运行使用独立的用户/会话命名空间，避免上一次运行残留的长期记忆影响本次结论
+RUN_TAG = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:8]}"
+RUN_USER_ID = f"orchestration-check-{RUN_TAG}"
+RUN_SESSION_ID = f"orchestration-session-{RUN_TAG}"
+RUN_STORAGE_PATH = f"data/test_memory/orchestration/{RUN_TAG}"
+
 from agentscope.message import Msg
-from config_agentscope import init_agentscope
-from config import LLM_CONFIG
-from context.memory_manager import MemoryManager
-from agents.intention_agent import IntentionAgent
-from agents.orchestration_agent import OrchestrationAgent
+from agentscope.model import OpenAIChatModel
+
 from agents.event_collection_agent import EventCollectionAgent
-from agents.itinerary_planning_agent import ItineraryPlanningAgent
 from agents.information_query_agent import InformationQueryAgent
+from agents.intention_agent import IntentionAgent
+from agents.itinerary_planning_agent import ItineraryPlanningAgent
+from agents.orchestration_agent import OrchestrationAgent
 from agents.rag_knowledge_agent import RAGKnowledgeAgent
+from config import LLM_CONFIG
+from config_agentscope import init_agentscope
+from context.memory_manager import MemoryManager
+
+requires_llm_key = pytest.mark.skipif(
+    not LLM_CONFIG["api_key"],
+    reason="需要真实模型密钥（LLM_API_KEY 或 config_local.API_KEY）；未配置时如实跳过",
+)
 
 
+@requires_llm_key
 async def test_orchestration():
     """测试智能体协调系统"""
     print("=" * 70)
@@ -51,8 +67,9 @@ async def test_orchestration():
 
     # 初始化记忆管理器
     memory = MemoryManager(
-        user_id="test_user",
-        session_id="test_orchestration"
+        user_id=RUN_USER_ID,
+        session_id=RUN_SESSION_ID,
+        storage_path=RUN_STORAGE_PATH
     )
     print("✓ 记忆管理器初始化成功")
 

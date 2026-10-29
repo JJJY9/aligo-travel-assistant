@@ -1,11 +1,9 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 记忆系统测试脚本
 测试短期记忆和长期记忆的功能
 """
 import sys
-import os
 from pathlib import Path
 
 # 添加项目根目录到路径
@@ -13,10 +11,15 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import asyncio
-from context.memory_manager import MemoryManager
+import logging
+import uuid
+from datetime import datetime
+
+import pytest
 from agentscope import init as init_agentscope
 from agentscope.model import OpenAIChatModel
-import logging
+
+from context.memory_manager import MemoryManager
 
 # 配置日志（只显示WARNING及以上）
 logging.basicConfig(
@@ -27,6 +30,20 @@ logging.basicConfig(
 # 从配置文件读取LLM配置
 from config import LLM_CONFIG
 
+requires_llm_key = pytest.mark.skipif(
+    not LLM_CONFIG["api_key"],
+    reason="需要真实模型密钥（LLM_API_KEY 或 config_local.API_KEY）；未配置时如实跳过",
+)
+
+# 每次运行使用独立的用户命名空间：避免上一次运行残留的长期记忆数据影响本次结论
+RUN_TAG = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:8]}"
+RUN_USER_ID = f"memory-check-{RUN_TAG}"
+RUN_SESSION_FIRST = f"session-first-{RUN_TAG}"
+RUN_SESSION_SECOND = f"session-second-{RUN_TAG}"
+# 本次运行的独立存储目录：同一用户的两个会话仍共享长期记忆，
+# 但不与上一次运行或仓库里已有的数据互相污染
+RUN_STORAGE_PATH = f"data/test_memory/{RUN_TAG}"
+
 
 def print_section(title):
     """打印分隔线"""
@@ -35,6 +52,7 @@ def print_section(title):
     print("=" * 80 + "\n")
 
 
+@requires_llm_key
 async def test_memory_system():
     """测试记忆系统"""
 
@@ -56,9 +74,9 @@ async def test_memory_system():
 
     # 初始化记忆管理器
     memory_manager = MemoryManager(
-        user_id="test_user_001",
-        session_id="test_session_001",
-        storage_path="data/test_memory",
+        user_id=RUN_USER_ID,
+        session_id=RUN_SESSION_FIRST,
+        storage_path=RUN_STORAGE_PATH,
         llm_model=model
     )
     print("✓ 记忆管理器初始化完成")
@@ -244,9 +262,9 @@ async def test_memory_system():
 
     print("创建新的记忆管理器（新会话ID，但相同用户ID）...")
     new_memory_manager = MemoryManager(
-        user_id="test_user_001",  # 相同用户
-        session_id="test_session_002",  # 不同会话
-        storage_path="data/test_memory",
+        user_id=RUN_USER_ID,  # 相同用户
+        session_id=RUN_SESSION_SECOND,  # 不同会话
+        storage_path=RUN_STORAGE_PATH,
         llm_model=model
     )
     print("✓ 新会话记忆管理器创建完成\n")
@@ -279,7 +297,7 @@ async def test_memory_system():
     print("  5. ✓ LLM总结：自动总结长期记忆生成摘要")
     print("  6. ✓ 上下文聚合：整合短期+长期记忆供Agent使用")
     print("  7. ✓ 跨会话持久化：同一用户不同会话共享长期记忆")
-    print("\n测试数据存储位置: data/test_memory/")
+    print(f"\n测试数据存储位置: {RUN_STORAGE_PATH}")
 
 
 if __name__ == "__main__":

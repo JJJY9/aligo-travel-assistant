@@ -3,13 +3,13 @@
 职责：收集用户的长期偏好
 如"我的家在XXX"、"我喜欢XXX酒店"
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List
 import json
 import logging
-import sys
 import os
+import sys
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
@@ -28,7 +28,7 @@ class PreferenceAgent(AgentBase):
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
             return Msg(name=self.name, content={}, role="assistant")
 
@@ -104,12 +104,9 @@ class PreferenceAgent(AgentBase):
 
             # 清理文本，移除markdown代码块标记
             text = text.strip()
-            if text.startswith('```json'):
-                text = text[7:]
-            if text.startswith('```'):
-                text = text[3:]
-            if text.endswith('```'):
-                text = text[:-3]
+            text = text.removeprefix('```json')
+            text = text.removeprefix('```')
+            text = text.removesuffix('```')
             text = text.strip()
 
             # 提取JSON

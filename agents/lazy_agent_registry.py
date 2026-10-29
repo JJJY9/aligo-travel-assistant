@@ -1,17 +1,16 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 懒加载智能体注册器
 基于 .claude/skills 目录结构的插件化加载机制
 """
-import os
-import sys
 import importlib.util
 import inspect
+import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
-from rich.console import Console
+
 from agentscope.agent import AgentBase
+from rich.console import Console
+
 
 class LazyAgentRegistry:
     """
@@ -20,7 +19,7 @@ class LazyAgentRegistry:
     自动扫描 .claude/skills 下的技能目录，动态加载 script/agent.py
     """
 
-    def __init__(self, model, cache: Dict, memory_manager=None):
+    def __init__(self, model, cache: dict, memory_manager=None):
         """
         初始化懒加载注册器
 
@@ -38,7 +37,7 @@ class LazyAgentRegistry:
         self.skills_root = Path(__file__).resolve().parent.parent / ".claude" / "skills"
         
         # 技能映射表: skill_name -> agent_script_path
-        self._skill_map: Dict[str, Path] = {}
+        self._skill_map: dict[str, Path] = {}
         
         # 发现技能
         self._discover_skills()
@@ -73,7 +72,7 @@ class LazyAgentRegistry:
                 
         # self.console.print(f"[dim]已发现 {count} 个技能插件[/dim]")
 
-    def _resolve_agent_name(self, agent_name: str) -> Optional[str]:
+    def _resolve_agent_name(self, agent_name: str) -> str | None:
         """解析智能体名称到技能目录名"""
         # 1. 直接匹配技能名
         if agent_name in self._skill_map:

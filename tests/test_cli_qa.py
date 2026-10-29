@@ -3,14 +3,18 @@ CLI 自动问答测试 - 直接运行生成 QA 对文档
 Usage: python tests/test_cli_qa.py
 使用 cli.AligoCLI._display_results 统一打印结果，避免重复逻辑。
 """
-import sys
 import asyncio
 import json
+import logging
+import sys
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from datetime import datetime
-from typing import List, Dict
-import logging
+
+# 每次运行使用独立的用户/会话命名空间，避免不同运行之间的长期记忆互相污染
+RUN_TAG = datetime.now().strftime("%Y%m%d_%H%M%S")
+QA_USER_ID = f"cli-qa-{RUN_TAG}"
+QA_SESSION_ID = f"cli-qa-session-{RUN_TAG}"
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -22,6 +26,7 @@ logger = logging.getLogger(__name__)
 def capture_display_results(result_data: dict) -> str:
     """调用 cli 的 _display_results，将输出捕获为字符串（无 ANSI 颜色）。"""
     from rich.console import Console
+
     from cli import AligoCLI
 
     capture = StringIO()
@@ -56,15 +61,16 @@ async def main():
     # 初始化系统 - 完全按照 CLI 的方式
     print("\n[1/3] 初始化系统...")
 
-    from config import LLM_CONFIG
-    from config_agentscope import init_agentscope
-    from agentscope.model import OpenAIChatModel
-    from context.memory_manager import MemoryManager
-    from agents.intention_agent import IntentionAgent
-    from agents.orchestration_agent import OrchestrationAgent
-    from agents.lazy_agent_registry import LazyAgentRegistry
     # Removed manual imports of sub-agents as they are now dynamically loaded
     from agentscope.message import Msg
+    from agentscope.model import OpenAIChatModel
+
+    from agents.intention_agent import IntentionAgent
+    from agents.lazy_agent_registry import LazyAgentRegistry
+    from agents.orchestration_agent import OrchestrationAgent
+    from config import LLM_CONFIG
+    from config_agentscope import init_agentscope
+    from context.memory_manager import MemoryManager
 
     # 初始化 AgentScope
     init_agentscope()
@@ -80,8 +86,8 @@ async def main():
 
     # 初始化记忆管理器
     memory_manager = MemoryManager(
-        user_id="test_user",
-        session_id="test_session",
+        user_id=QA_USER_ID,
+        session_id=QA_SESSION_ID,
         llm_model=model
     )
 
@@ -143,7 +149,7 @@ async def main():
             results.append({
                 "num": i,
                 "question": question,
-                "answer": f"错误: {str(e)}",
+                "answer": f"错误: {e!s}",
                 "status": "error",
                 "duration": round(duration, 2)
             })
@@ -166,7 +172,7 @@ async def main():
     print(f"{'='*70}\n")
 
 
-def save_results(results: List[Dict]):
+def save_results(results: list[dict]):
     """保存结果为 Markdown"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = project_root / "tests" / "results" / f"qa_test_{timestamp}.md"
@@ -174,13 +180,13 @@ def save_results(results: List[Dict]):
 
     with open(output, 'w', encoding='utf-8') as f:
         # 标题
-        f.write(f"# CLI QA 测试报告\n\n")
+        f.write("# CLI QA 测试报告\n\n")
         f.write(f"**测试时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
         # 统计
         success = sum(1 for r in results if r["status"] == "success")
         total_time = sum(r["duration"] for r in results)
-        f.write(f"## 统计\n\n")
+        f.write("## 统计\n\n")
         f.write(f"- 总问题: {len(results)}\n")
         f.write(f"- 成功: {success} ({success/len(results)*100:.1f}%)\n")
         f.write(f"- 失败: {len(results)-success}\n")
@@ -188,13 +194,13 @@ def save_results(results: List[Dict]):
         f.write(f"- 平均: {total_time/len(results):.1f}秒/问题\n\n")
 
         # QA 对
-        f.write(f"## QA 对\n\n")
+        f.write("## QA 对\n\n")
         for r in results:
             icon = "✅" if r["status"] == "success" else "❌"
             f.write(f"### {icon} Q{r['num']}: {r['question']}\n\n")
             f.write(f"**耗时**: {r['duration']}秒\n\n")
             f.write(f"**回答**:\n\n```\n{r['answer']}\n```\n\n")
-            f.write(f"---\n\n")
+            f.write("---\n\n")
 
     print(f"结果已保存: {output}")
 

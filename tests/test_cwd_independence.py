@@ -7,10 +7,11 @@ CWD 无关性回归测试（Issue #5，无需 API Key）
 
 运行：python tests/test_cwd_independence.py
 """
-import sys
 import os
 import subprocess
+import sys
 import tempfile
+import uuid
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -19,11 +20,11 @@ sys.path.insert(0, project_root)
 def test_registry_from_other_cwd():
     """从系统临时目录运行注册器，应仍发现 6 个技能"""
     code = (
-        "import sys; sys.path.insert(0, r'{repo}');"
+        f"import sys; sys.path.insert(0, r'{project_root}');"
         "from agents.lazy_agent_registry import LazyAgentRegistry;"
-        "r = LazyAgentRegistry(model=None, cache={{}});"
+        "r = LazyAgentRegistry(model=None, cache={});"
         "print(len(r._skill_map))"
-    ).format(repo=project_root)
+    )
 
     out = subprocess.run(
         [sys.executable, "-c", code],
@@ -46,7 +47,7 @@ def test_memory_path_anchored_to_project_root():
     old_cwd = os.getcwd()
     os.chdir(other_cwd)  # 模拟从其它目录启动
     try:
-        memory = LongTermMemory("cwd_test_user", "data/memory")
+        memory = LongTermMemory(f"cwd-probe-{uuid.uuid4().hex[:8]}", "data/memory")
         try:
             assert os.path.abspath(memory.db_path).startswith(os.path.abspath(project_root)), (
                 f"db_path 应锚定项目根，实际: {memory.db_path}"

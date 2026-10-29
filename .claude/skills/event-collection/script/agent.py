@@ -6,13 +6,13 @@
 - 提取出发地、目的地、时间、返程地等基础信息
 - 识别缺失信息并提示
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List
 import json
 import logging
-import sys
 import os
+import sys
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
@@ -38,7 +38,7 @@ class EventCollectionAgent(AgentBase):
         self.name = name
         self.model = model
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
             return Msg(name=self.name, content={}, role="assistant")
 
@@ -155,12 +155,9 @@ class EventCollectionAgent(AgentBase):
 
             # 清理文本，移除markdown代码块标记
             text = text.strip()
-            if text.startswith('```json'):
-                text = text[7:]
-            if text.startswith('```'):
-                text = text[3:]
-            if text.endswith('```'):
-                text = text[:-3]
+            text = text.removeprefix('```json')
+            text = text.removeprefix('```')
+            text = text.removesuffix('```')
             text = text.strip()
 
             # 提取JSON

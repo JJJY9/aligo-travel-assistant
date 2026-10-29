@@ -2,12 +2,12 @@
 长期记忆 (Long-term Memory)
 持久化存储用户信息，支持跨会话访问
 """
-from typing import Dict, Any, List, Optional
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
-import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class LongTermMemory:
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
-    def _load(self) -> Dict[str, Any]:
+    def _load(self) -> dict[str, Any]:
         """从文件加载数据"""
         if os.path.exists(self.db_path):
             try:
@@ -61,7 +61,7 @@ class LongTermMemory:
             logger.info("No existing long-term memory, creating new")
             return self._init_data()
 
-    def _migrate_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _migrate_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """
         迁移旧数据格式到新格式
 
@@ -118,7 +118,7 @@ class LongTermMemory:
 
         return data
 
-    def _init_data(self) -> Dict[str, Any]:
+    def _init_data(self) -> dict[str, Any]:
         """初始化数据结构"""
         return {
             "user_id": self.user_id,
@@ -170,7 +170,7 @@ class LongTermMemory:
         self._save()
         logger.info(f"Saved preference: {pref_type} = {value}")
 
-    def get_preference(self, pref_type: str = None) -> Any:
+    def get_preference(self, pref_type: str | None = None) -> Any:
         """
         获取用户偏好
 
@@ -245,7 +245,7 @@ class LongTermMemory:
         self._save()
         logger.info(f"Added airline preference: {airline}")
 
-    def add_chat_message(self, role: str, content: str, session_id: str = None):
+    def add_chat_message(self, role: str, content: str, session_id: str | None = None):
         """
         添加聊天消息到长期记忆
 
@@ -266,7 +266,7 @@ class LongTermMemory:
         self._save()
         logger.debug(f"Added chat message to long-term memory: {role}")
 
-    def get_chat_history(self, limit: int = None, session_id: str = None) -> List[Dict[str, Any]]:
+    def get_chat_history(self, limit: int | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
         """
         获取聊天历史
 
@@ -286,7 +286,7 @@ class LongTermMemory:
             return messages[-limit:]
         return messages
 
-    def save_trip_history(self, trip_info: Dict[str, Any]):
+    def save_trip_history(self, trip_info: dict[str, Any]):
         """
         保存行程历史
 
@@ -313,7 +313,7 @@ class LongTermMemory:
         self._save()
         logger.info(f"Saved trip history: {trip_record['trip_id']}")
 
-    def get_trip_history(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_trip_history(self, limit: int = 10) -> list[dict[str, Any]]:
         """
         获取历史行程
 
@@ -325,7 +325,7 @@ class LongTermMemory:
         """
         return self.data["trip_history"][-limit:] if limit else self.data["trip_history"]
 
-    def get_frequent_destinations(self, top_n: int = 5) -> List[tuple]:
+    def get_frequent_destinations(self, top_n: int = 5) -> list[tuple]:
         """
         获取常去目的地
 
@@ -345,7 +345,7 @@ class LongTermMemory:
         stats["total_queries"] = stats.get("total_queries", 0) + 1
         self._save()
 
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self) -> dict[str, Any]:
         """获取统计信息"""
         return self.data["statistics"].copy()
 

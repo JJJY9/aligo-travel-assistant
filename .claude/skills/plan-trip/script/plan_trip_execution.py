@@ -5,7 +5,6 @@
 import asyncio
 import json
 import sys
-import os
 from pathlib import Path
 
 # Add project root to sys.path
@@ -20,9 +19,10 @@ if str(parent_dir) not in sys.path:
 from agentscope.message import Msg
 from agentscope.model import OpenAIChatModel
 
+import config
+
 # Import from absolute paths
 import config_agentscope
-import config
 from agents.intention_agent import IntentionAgent
 from agents.orchestration_agent import OrchestrationAgent
 
@@ -31,6 +31,7 @@ init_agentscope = config_agentscope.init_agentscope
 
 # Import agents
 import importlib.util
+
 
 def load_agent_module(skill_name, agent_class_name):
     """Dynamically load agent module from skill directory"""
@@ -173,7 +174,7 @@ async def main():
                 # 用餐信息
                 meals = day_plan.get("meals", {})
                 if meals:
-                    print(f"  用餐:")
+                    print("  用餐:")
                     if meals.get("lunch"):
                         print(f"    午餐: {meals['lunch']}")
                     if meals.get("dinner"):

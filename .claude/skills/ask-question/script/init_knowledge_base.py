@@ -2,11 +2,9 @@
 初始化RAG知识库 (Plugin Version)
 从 .claude/skills/ask-question/data/documents 目录加载商旅相关文档并导入到向量数据库中
 """
-import sys
-import os
 import importlib.util
+import sys
 from pathlib import Path
-from typing import List, Dict
 
 # 添加项目根目录到路径 (假设脚本在 .claude/skills/ask-question/script/)
 current_dir = Path(__file__).parent
@@ -14,8 +12,10 @@ project_root = current_dir.parent.parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from config import LLM_CONFIG
 from agentscope.model import OpenAIChatModel
+
+from config import LLM_CONFIG
+
 
 # 动态加载同目录下的 agent.py
 def load_rag_agent_class():
@@ -28,7 +28,7 @@ def load_rag_agent_class():
 
 RAGKnowledgeAgent = load_rag_agent_class()
 
-def split_text(text: str, max_chars: int = 600, overlap: int = 100) -> List[str]:
+def split_text(text: str, max_chars: int = 600, overlap: int = 100) -> list[str]:
     """
     简单的文本切分：优先按段落切分，控制每块大小
     """
@@ -80,7 +80,7 @@ def split_text(text: str, max_chars: int = 600, overlap: int = 100) -> List[str]
         
     return chunks
 
-def load_documents_from_directory(directory_path: str) -> List[Dict]:
+def load_documents_from_directory(directory_path: str) -> list[dict]:
     """
     从指定目录加载所有文档
     """
@@ -95,7 +95,7 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
     doc_files = sorted(doc_dir.glob("*.txt"))
 
     if not doc_files:
-        print(f"❌ 未找到任何文档文件 (.txt)")
+        print("❌ 未找到任何文档文件 (.txt)")
         return documents
 
     # 定义类别映射（根据文件名判断）
@@ -293,7 +293,7 @@ def main():
                         try:
                             import json
                             metadata = json.loads(metadata)
-                        except:
+                        except Exception:
                             metadata = {}
                     
                     title = metadata.get('title', 'Unknown')
@@ -313,7 +313,7 @@ def main():
             print("\n正在清理资源...")
             try:
                 rag_agent.close()
-            except:
+            except Exception:
                 pass
             print("✓ 资源清理完成")
 

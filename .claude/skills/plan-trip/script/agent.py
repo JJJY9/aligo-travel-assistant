@@ -1,21 +1,20 @@
 """
 行程规划智能体
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List, Dict, Any
 import json
 import logging
-import sys
 import os
-from pathlib import Path
+import sys
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 # project_root = Path(__file__).parent.parent # Removed old logic
 # sys.path.insert(0, str(project_root))
 
-from utils.json_parser import robust_json_parse, extract_json_from_async_response
+from utils.json_parser import extract_json_from_async_response, robust_json_parse
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ class ItineraryPlanningAgent(AgentBase):
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
             return Msg(name=self.name, content={}, role="assistant")
 

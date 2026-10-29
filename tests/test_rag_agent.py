@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 测试RAG知识库智能体
 
@@ -10,11 +9,13 @@
   # 然后运行测试
   python tests/test_rag_agent.py
 """
-import sys
-import os
 import asyncio
 import json
+import os
+import sys
 import time
+
+import pytest
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,11 +23,18 @@ sys.path.insert(0, project_root)
 
 from agentscope.message import Msg
 from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
+
 from agents.rag_knowledge_agent import RAGKnowledgeAgent
 from config import LLM_CONFIG
+from config_agentscope import init_agentscope
+
+requires_llm_key = pytest.mark.skipif(
+    not LLM_CONFIG["api_key"],
+    reason="需要真实模型密钥（LLM_API_KEY 或 config_local.API_KEY）；未配置时如实跳过",
+)
 
 
+@requires_llm_key
 async def test_rag_agent():
     """测试RAG知识库智能体"""
 

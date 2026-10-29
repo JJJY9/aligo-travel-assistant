@@ -1,6 +1,7 @@
 import os
+
 import yaml
-from typing import Dict, List, Optional
+
 
 class SkillLoader:
     """加载 .claude/skills 下的技能描述"""
@@ -10,9 +11,9 @@ class SkillLoader:
         current_file_path = os.path.abspath(__file__)
         project_root = os.path.dirname(os.path.dirname(current_file_path))
         self.skills_dir = os.path.join(project_root, skills_dir)
-        self.skills: Dict[str, Dict] = {}
+        self.skills: dict[str, dict] = {}
         
-    def load_skills(self) -> Dict[str, Dict]:
+    def load_skills(self) -> dict[str, dict]:
         """
         读取所有 SKILL.md 文件并解析 frontmatter
         返回格式: { "skill-name": { "name": "...", "description": "..." } }
@@ -32,7 +33,7 @@ class SkillLoader:
                         
         return self.skills
 
-    def _parse_skill_md(self, file_path: str) -> Optional[Dict]:
+    def _parse_skill_md(self, file_path: str) -> dict | None:
         """解析 markdown 文件的 yaml frontmatter"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -53,7 +54,7 @@ class SkillLoader:
             print(f"Error reading {file_path}: {e}")
             return None
 
-    def get_skill_prompt(self, skill_mapping: Optional[Dict[str, str]] = None) -> str:
+    def get_skill_prompt(self, skill_mapping: dict[str, str] | None = None) -> str:
         """
         生成用于 Prompt 的技能描述字符串
         
@@ -84,7 +85,7 @@ class SkillLoader:
             
         return "\n\n".join(prompt_lines)
 
-    def get_skill_content(self, skill_name: str) -> Optional[str]:
+    def get_skill_content(self, skill_name: str) -> str | None:
         """
         获取指定 Skill 的完整 markdown 内容（去除 frontmatter）
         用于执行阶段的 Prompt 注入

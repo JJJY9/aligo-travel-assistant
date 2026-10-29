@@ -13,13 +13,13 @@
 - 用户询问："我之前说过什么偏好？"
 - 用户询问："我上次去北京是什么时候？"
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List, Dict
 import json
 import logging
-import sys
 import os
+import sys
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
@@ -44,7 +44,7 @@ class MemoryQueryAgent(AgentBase):
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         """
         处理记忆查询请求
 
@@ -196,13 +196,13 @@ class MemoryQueryAgent(AgentBase):
                 name=self.name,
                 content=json.dumps({
                     "status": "error",
-                    "message": f"记忆查询失败: {str(e)}",
+                    "message": f"记忆查询失败: {e!s}",
                     "query": user_query
                 }),
                 role="assistant"
             )
 
-    def _format_trip_history(self, trip_history: List[Dict]) -> str:
+    def _format_trip_history(self, trip_history: list[dict]) -> str:
         """格式化旅行历史"""
         if not trip_history:
             return "（暂无旅行记录）"
@@ -225,7 +225,7 @@ class MemoryQueryAgent(AgentBase):
 
         return "\n".join(lines)
 
-    def _format_preferences(self, preferences: Dict) -> str:
+    def _format_preferences(self, preferences: dict) -> str:
         """格式化用户偏好"""
         if not preferences or not any(v for v in preferences.values() if v):
             return "（暂无偏好记录）"

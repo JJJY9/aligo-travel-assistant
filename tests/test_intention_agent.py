@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 测试意图识别智能体
 
@@ -7,10 +6,10 @@
   conda activate base  # 先激活conda环境
   python tests/test_intention_agent.py
 """
-import sys
-import os
 import asyncio
 import json
+import os
+import sys
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,9 +36,10 @@ except ImportError as e:
 
 from agentscope.message import Msg
 from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
+
 from agents.intention_agent import IntentionAgent
 from config import LLM_CONFIG
+from config_agentscope import init_agentscope
 
 
 async def test_intention_agent():
@@ -67,7 +67,7 @@ async def test_intention_agent():
             temperature=LLM_CONFIG.get("temperature", 0.7),
             max_tokens=LLM_CONFIG.get("max_tokens", 2000),
         )
-        print(f"✓ 模型创建成功")
+        print("✓ 模型创建成功")
     except Exception as e:
         print(f"❌ 模型创建失败: {e}")
         import traceback
@@ -81,7 +81,7 @@ async def test_intention_agent():
             name="IntentionAgent",
             model=model
         )
-        print(f"✓ Agent 创建成功")
+        print("✓ Agent 创建成功")
     except Exception as e:
         print(f"❌ Agent 创建失败: {e}")
         import traceback

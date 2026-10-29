@@ -13,13 +13,14 @@
 - 输入：用户query（自然语言）
 - 输出：推理过程生成（包含reasoning+原因） + 多意图识别（原因） + 智能Query改写 + 构建结构化决策
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List
 import json
 import logging
-from utils.skill_loader import SkillLoader
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
+
 from utils.llm_resilience import is_retriable_error
+from utils.skill_loader import SkillLoader
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,10 @@ class IntentionAgent(AgentBase):
         super().__init__()
         self.name = name
         self.model = model
-        self.conversation_history = []
+        self.conversation_history: list[str] = []
         self.skill_loader = SkillLoader()
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         """
         意图识别主流程
         1. 推理过程生成
@@ -59,9 +60,10 @@ class IntentionAgent(AgentBase):
                     else:
                         # 对话历史（user/assistant）- 适当截断但保留更多信息
                         role_name = "用户" if msg.role == "user" else "助手"
-                        content = msg.content[:800] if len(msg.content) > 800 else msg.content
-                        if len(msg.content) > 800:
-                            content += "..."
+                        raw_content = msg.content
+                        content = raw_content if isinstance(raw_content, str) else str(raw_content)
+                        if len(content) > 800:
+                            content = content[:800] + "..."
                         self.conversation_history.append(f"{role_name}: {content}")
         else:
             user_query = x.content
@@ -247,12 +249,9 @@ class IntentionAgent(AgentBase):
 
             # 清理文本
             text = text.strip()
-            if text.startswith('```json'):
-                text = text[7:]
-            if text.startswith('```'):
-                text = text[3:]
-            if text.endswith('```'):
-                text = text[:-3]
+            text = text.removeprefix('```json')
+            text = text.removeprefix('```')
+            text = text.removesuffix('```')
             text = text.strip()
 
             # 解析JSON
@@ -282,7 +281,7 @@ class IntentionAgent(AgentBase):
             logger.error(f"Intent recognition failed: {e}")
             # 返回默认结果
             result = {
-                "reasoning": f"意图识别出错，使用默认策略。错误: {str(e)}",
+                "reasoning": f"意图识别出错，使用默认策略。错误: {e!s}",
                 "intents": [
                     {
                         "type": "information_query",

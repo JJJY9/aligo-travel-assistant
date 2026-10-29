@@ -2,11 +2,11 @@
 记忆管理器 (Memory Manager)
 统一管理两层记忆，提供简单的API
 """
-from typing import Dict, Any, List, Optional
-from .short_term_memory import ShortTermMemory
-from .long_term_memory import LongTermMemory
 import logging
-import json
+from typing import Any
+
+from .long_term_memory import LongTermMemory
+from .short_term_memory import ShortTermMemory
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class MemoryManager:
 
     # ========== 短期记忆操作 ==========
 
-    def add_message(self, role: str, content: str, metadata: Dict = None):
+    def add_message(self, role: str, content: str, metadata: dict | None = None):
         """
         添加消息到短期记忆和长期记忆
 
@@ -60,7 +60,7 @@ class MemoryManager:
 
     # ========== 综合查询 ==========
 
-    def get_full_context(self) -> Dict[str, Any]:
+    def get_full_context(self) -> dict[str, Any]:
         """
         获取完整上下文（两层记忆）
 
@@ -82,7 +82,7 @@ class MemoryManager:
             }
         }
 
-    def get_context_for_agent(self, long_term_summary: str = None) -> str:
+    def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
         """
         获取用于Agent的上下文字符串
 
@@ -243,7 +243,7 @@ class MemoryManager:
 
         # 检查是否在事件循环中
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             # 已经在事件循环中，不能使用 asyncio.run
             logger.warning("get_long_term_summary called from async context, please use get_long_term_summary_async instead")
             return ""

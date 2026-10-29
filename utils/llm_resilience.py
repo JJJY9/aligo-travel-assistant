@@ -3,10 +3,10 @@ LLM 连接与可用性：重试退避、可重试错误判断、健康检查
 """
 import asyncio
 import logging
-import time
-from typing import TypeVar, Callable, Awaitable, Tuple
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
-from .circuit_breaker import CircuitBreaker, CircuitOpenError
+from .circuit_breaker import CircuitOpenError
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,10 @@ def is_retriable_error(exc: BaseException) -> bool:
         return True
     if "500" in msg or "502" in msg or "503" in msg or "504" in msg:
         return True
-    if "timeout" in msg or "timed out" in msg:
-        return True
-    return False
+    return bool("timeout" in msg or "timed out" in msg)
 
 
-async def retry_with_backoff(
+async def retry_with_backoff[T](
     coro_factory: Callable[[], Awaitable[T]],
     max_retries: int = 3,
     base_delay_sec: float = 1.0,
@@ -52,7 +50,7 @@ async def retry_with_backoff(
     Raises:
         最后一次尝试的异常（若全部失败）
     """
-    last_exc = None
+    last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
             return await coro_factory()
@@ -71,6 +69,8 @@ async def retry_with_backoff(
                 attempt + 1, max_retries + 1, delay, e,
             )
             await asyncio.sleep(delay)
+    if last_exc is None:
+        raise RuntimeError("retry loop ended without an exception")
     raise last_exc
 
 
@@ -79,7 +79,7 @@ async def run_health_check(
     api_key: str,
     model_name: str,
     timeout_sec: float = 10.0,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     对 LLM 服务做一次最小化健康检查（发一条极简请求）。
 
@@ -115,7 +115,7 @@ async def run_health_check(
         elif hasattr(response, "text"):
             text = response.text
         elif hasattr(response, "content"):
-            text = response.content or ""
+            text = str(response.content or "")
         elif isinstance(response, dict) and "content" in response:
             text = response["content"] or ""
 

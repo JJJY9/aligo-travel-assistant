@@ -6,14 +6,15 @@
 - 天气：wttr.in（无需 API Key）
 - 搜索：ddgs（Dux Distributed Global Search，可选 bing/duckduckgo 等，需安装：pip install ddgs）
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List, Dict, Any
 import json
 import logging
+import os
 import re
 import sys
-import os
+from typing import Any
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
@@ -34,10 +35,10 @@ except ImportError:
 # 疑似垃圾/低质域名：多为 SEO 或不良站，不展示给用户
 _SUSPICIOUS_DOMAIN_PATTERN = re.compile(
     r"\.(cc|tk|ml|ga|cf|gq|xyz|top|work|click|link|pw|buzz)(/|$)",
-    re.I
+    re.IGNORECASE
 )
 # 域名主体若为长随机字母（无明显词），则过滤
-_RANDOM_DOMAIN_PATTERN = re.compile(r"^[a-z0-9]{10,}$", re.I)
+_RANDOM_DOMAIN_PATTERN = re.compile(r"^[a-z0-9]{10,}$", re.IGNORECASE)
 
 
 def _is_suspicious_url(url: str) -> bool:
@@ -57,9 +58,7 @@ def _is_suspicious_url(url: str) -> bool:
         # 主域名部分（最后一个 . 之前若还有多段则取倒数第二段之前）
         parts = host.rsplit(".", 2)
         name = parts[0] if parts else ""
-        if len(name) >= 10 and _RANDOM_DOMAIN_PATTERN.match(name):
-            return True
-        return False
+        return bool(len(name) >= 10 and _RANDOM_DOMAIN_PATTERN.match(name))
     except Exception:
         return False
 
@@ -83,7 +82,7 @@ class InformationQueryAgent(AgentBase):
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
             return Msg(name=self.name, content=json.dumps({"query_success": False}), role="assistant")
 
@@ -133,7 +132,7 @@ class InformationQueryAgent(AgentBase):
             return False
         return "天气" in q or "气温" in q or "下雨" in q or "预报" in q
 
-    async def _weather_query(self, query: str) -> Dict[str, Any]:
+    async def _weather_query(self, query: str) -> dict[str, Any]:
         """
         使用 wttr.in 免费 API 查询天气（无需 API Key，结果可靠）。
         支持中文城市名，如：杭州、北京。
@@ -222,7 +221,7 @@ class InformationQueryAgent(AgentBase):
         m = re.search(r"[\u4e00-\u9fa5]{2,6}", q)
         return m.group(0).strip() if m else ""
 
-    async def _web_search(self, query: str) -> Dict[str, Any]:
+    async def _web_search(self, query: str) -> dict[str, Any]:
         """
         网络搜索 - 使用 DDGS（Dux Distributed Global Search），开启 safesearch，过滤可疑来源。
 
@@ -298,10 +297,10 @@ class InformationQueryAgent(AgentBase):
             return {
                 "query_type": "网络搜索",
                 "query_success": False,
-                "results": {"error": f"搜索失败: {str(e)}"},
+                "results": {"error": f"搜索失败: {e!s}"},
             }
 
-    async def _summarize_search_results(self, query: str, results: List[Dict]) -> str:
+    async def _summarize_search_results(self, query: str, results: list[dict]) -> str:
         """
         使用 LLM 总结搜索结果
 

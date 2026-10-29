@@ -13,12 +13,13 @@
 - Sequential (顺序执行): 按优先级依次执行，前一个的输出作为后一个的输入
 - Parallel (并行执行): 同时执行多个智能体（暂不实现）
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List, Dict, Any
+import asyncio
 import json
 import logging
-import asyncio
+from typing import Any
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class OrchestrationAgent(AgentBase):
     def __init__(
         self,
         name: str = "OrchestrationAgent",
-        agent_registry: Dict[str, AgentBase] = None,
+        agent_registry: dict[str, AgentBase] | None = None,
         memory_manager = None,
         **kwargs
     ):
@@ -57,7 +58,7 @@ class OrchestrationAgent(AgentBase):
             del self.agent_registry[agent_name]
             logger.info(f"Unregistered agent: {agent_name}")
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         """
         协调执行流程
 
@@ -92,6 +93,13 @@ class OrchestrationAgent(AgentBase):
             )
 
         # 获取智能体调度计划
+        if not isinstance(intention_data, dict):
+            logger.error("Intention output is not a JSON object")
+            return Msg(
+                name=self.name,
+                content=json.dumps({"error": "Invalid intention format"}),
+                role="assistant",
+            )
         agent_schedule = intention_data.get("agent_schedule", [])
         if not agent_schedule:
             return Msg(
@@ -112,7 +120,7 @@ class OrchestrationAgent(AgentBase):
         context = self._prepare_context(intention_data)
 
         # 并行执行智能体（按优先级分组）
-        results = []
+        results: list[dict[str, Any]] = []
         current_priority = None
         parallel_tasks = []
 
@@ -148,7 +156,7 @@ class OrchestrationAgent(AgentBase):
             role="assistant"
         )
 
-    def _prepare_context(self, intention_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _prepare_context(self, intention_data: dict[str, Any]) -> dict[str, Any]:
         """
         准备上下文信息，供子智能体使用
 
@@ -179,10 +187,10 @@ class OrchestrationAgent(AgentBase):
 
     async def _execute_parallel_agents(
         self,
-        tasks: List[Dict],
-        context: Dict[str, Any],
-        previous_results: List[Dict]
-    ) -> List[Dict]:
+        tasks: list[dict],
+        context: dict[str, Any],
+        previous_results: list[dict]
+    ) -> list[dict]:
         """
         并行执行多个智能体
 
@@ -200,8 +208,8 @@ class OrchestrationAgent(AgentBase):
         # 如果只有一个任务，直接执行
         if len(tasks) == 1:
             task = tasks[0]
-            result = await self._execute_agent(
-                agent_name=task.get("agent_name"),
+            result: dict[str, Any] = await self._execute_agent(
+                agent_name=str(task.get("agent_name") or ""),
                 context=context,
                 reason=task.get("reason", ""),
                 expected_output=task.get("expected_output", ""),
@@ -219,7 +227,7 @@ class OrchestrationAgent(AgentBase):
         # 创建并行任务
         parallel_coroutines = []
         for task in tasks:
-            agent_name = task.get("agent_name")
+            agent_name = str(task.get("agent_name") or "")
             priority = task.get("priority", 0)
             reason = task.get("reason", "")
             expected_output = task.get("expected_output", "")
@@ -243,15 +251,15 @@ class OrchestrationAgent(AgentBase):
         )
 
         # 整理结果
-        results = []
+        results: list[dict[str, Any]] = []
         for (agent_name, priority, _), exec_result in zip(parallel_coroutines, execution_results):
-            if isinstance(exec_result, Exception):
+            if isinstance(exec_result, BaseException):
                 logger.error(f"Parallel agent execution failed: {agent_name}, error: {exec_result}")
                 result = {
                     "status": "error",
                     "agent_name": agent_name,
                     "data": {"error": str(exec_result)},
-                    "message": f"并行执行失败: {str(exec_result)}"
+                    "message": f"并行执行失败: {exec_result!s}"
                 }
             else:
                 result = exec_result
@@ -267,11 +275,11 @@ class OrchestrationAgent(AgentBase):
     async def _execute_agent(
         self,
         agent_name: str,
-        context: Dict[str, Any],
+        context: dict[str, Any],
         reason: str,
         expected_output: str,
-        previous_results: List[Dict]
-    ) -> Dict[str, Any]:
+        previous_results: list[dict]
+    ) -> dict[str, Any]:
         """
         执行单个智能体
 
@@ -344,14 +352,14 @@ class OrchestrationAgent(AgentBase):
                 "status": "error",
                 "agent_name": agent_name,
                 "data": {"error": str(e)},
-                "message": f"智能体执行失败: {str(e)}"
+                "message": f"智能体执行失败: {e!s}"
             }
 
     def _aggregate_results(
         self,
-        results: List[Dict],
-        intention_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        results: list[dict],
+        intention_data: dict[str, Any]
+    ) -> dict[str, Any]:
         """
         聚合多个智能体的结果
 
@@ -362,7 +370,7 @@ class OrchestrationAgent(AgentBase):
         Returns:
             聚合后的最终结果
         """
-        aggregated = {
+        aggregated: dict[str, Any] = {
             "status": "completed",
             "intention": {
                 "intents": intention_data.get("intents", []),
@@ -389,7 +397,7 @@ class OrchestrationAgent(AgentBase):
 
         return aggregated
 
-    def _update_memory(self, intention_data: Dict[str, Any], results: List[Dict]):
+    def _update_memory(self, intention_data: dict[str, Any], results: list[dict]):
         """
         更新记忆系统
 

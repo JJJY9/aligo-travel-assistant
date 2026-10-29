@@ -1,38 +1,33 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 Aligo 商旅助手 - CLI 交互界面
 使用 Rich 库实现美观的终端交互
 """
 import asyncio
-import sys
 import os
-from typing import Optional
+import sys
 
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
-from rich.table import Table
-from rich.markdown import Markdown
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.layout import Layout
-from rich.live import Live
-from rich.text import Text
 import json
 
 # 导入系统组件
 from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
-from config import LLM_CONFIG, SYSTEM_CONFIG, RESILIENCE_CONFIG
-from context.memory_manager import MemoryManager
-from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.llm_resilience import retry_with_backoff, run_health_check as check_llm_health
+from rich.console import Console
+from rich.prompt import Prompt
+from rich.table import Table
+
 from agents.intention_agent import IntentionAgent
 from agents.orchestration_agent import OrchestrationAgent
+from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
+from config_agentscope import init_agentscope
+from context.memory_manager import MemoryManager
+from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
+from utils.llm_resilience import retry_with_backoff
+from utils.llm_resilience import run_health_check as check_llm_health
+
 # 移除其他智能体的导入，改用懒加载
 
 
@@ -157,7 +152,7 @@ class AligoCLI:
         处理用户查询（原逻辑保留；仅在入口加熔断检查、对 LLM 调用加重试）
         """
         import time
-        start_time = time.time()
+        time.time()
 
         # ---------- 仅新增：熔断检查 ----------
         if self.circuit_breaker:
@@ -171,7 +166,7 @@ class AligoCLI:
                 return
 
         rc = RESILIENCE_CONFIG
-        max_retries = rc.get("max_retries", 3)
+        max_retries = int(rc.get("max_retries", 3))
 
         with self.console.status("思考中...", spinner="dots"):
             from agentscope.message import Msg
@@ -199,14 +194,14 @@ class AligoCLI:
                     self.circuit_breaker.record_success()
             except CircuitOpenError:
                 raise
-            except Exception as e:
+            except Exception:
                 if self.circuit_breaker:
                     self.circuit_breaker.record_failure()
                 raise
 
             # 3. 解析意图识别结果（原逻辑不变：解析失败则友好提示并 return）
             try:
-                intention_data = json.loads(intention_result.content)
+                json.loads(intention_result.content)
             except json.JSONDecodeError:
                 self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
                 return
@@ -227,7 +222,7 @@ class AligoCLI:
                 self.circuit_breaker.record_success()
         except CircuitOpenError:
             raise
-        except Exception as e:
+        except Exception:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure()
             raise
@@ -500,14 +495,17 @@ class AligoCLI:
 
                 has_itinerary = any(r.get("agent_name") == "itinerary_planning" for r in results)
                 info_shown = False
-                if not has_itinerary:
-                    if destination or origin:
-                        self.console.print("✓ [bold green]已收集行程信息[/bold green]")
-                        if origin: self.console.print(f"  • 出发地: [cyan]{origin}[/cyan]")
-                        if destination: self.console.print(f"  • 目的地: [cyan]{destination}[/cyan]")
-                        if start_date: self.console.print(f"  • 出发日期: [cyan]{start_date}[/cyan]")
-                        if end_date: self.console.print(f"  • 返程日期: [cyan]{end_date}[/cyan]")
-                        info_shown = True
+                if not has_itinerary and (destination or origin):
+                    self.console.print("✓ [bold green]已收集行程信息[/bold green]")
+                    if origin:
+                        self.console.print(f"  • 出发地: [cyan]{origin}[/cyan]")
+                    if destination:
+                        self.console.print(f"  • 目的地: [cyan]{destination}[/cyan]")
+                    if start_date:
+                        self.console.print(f"  • 出发日期: [cyan]{start_date}[/cyan]")
+                    if end_date:
+                        self.console.print(f"  • 返程日期: [cyan]{end_date}[/cyan]")
+                    info_shown = True
 
                 if missing_info:
                     self.console.print(f"\n💡 还需要补充: {', '.join(missing_info)}", style="yellow")
@@ -569,7 +567,7 @@ class AligoCLI:
                         json_obj = json.loads(answer)
                         if isinstance(json_obj, dict) and "answer" in json_obj:
                             answer = json_obj["answer"]
-                    except:
+                    except Exception:
                         pass
 
                 if answer:
@@ -683,7 +681,7 @@ class AligoCLI:
                     try:
                         dt = datetime.fromisoformat(timestamp)
                         time_str = dt.strftime("%H:%M:%S")
-                    except:
+                    except Exception:
                         time_str = ""
                 else:
                     time_str = ""
@@ -809,9 +807,9 @@ def run_health_check_standalone() -> int:
     import asyncio
     init_agentscope()
     ok, msg = asyncio.run(check_llm_health(
-        base_url=LLM_CONFIG["base_url"],
-        api_key=LLM_CONFIG["api_key"],
-        model_name=LLM_CONFIG["model_name"],
+        base_url=str(LLM_CONFIG["base_url"]),
+        api_key=str(LLM_CONFIG["api_key"]),
+        model_name=str(LLM_CONFIG["model_name"]),
         timeout_sec=RESILIENCE_CONFIG.get("health_check_timeout_sec", 10.0),
     ))
     if ok:
@@ -824,7 +822,7 @@ def run_health_check_standalone() -> int:
 def main():
     """主函数"""
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "health":
-        exit(run_health_check_standalone())
+        sys.exit(run_health_check_standalone())
     cli = AligoCLI()
     asyncio.run(cli.run())
 

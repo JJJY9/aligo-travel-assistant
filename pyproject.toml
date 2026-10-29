@@ -1,0 +1,86 @@
+[build-system]
+# milvus_lite 仍依赖 pkg_resources，setuptools 需 <82（与 requirements.txt 一致）；
+# 下限 77 是因为下面用了 PEP 639 的 SPDX license 字段
+requires = ["setuptools>=77.0.0,<82", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aligo-travel-assistant"
+version = "1.0.0"
+description = "Aligo 智能旅行助手：基于 AgentScope 的多智能体旅行规划系统"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "JJJY9" }]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["agentscope", "multi-agent", "travel", "rag", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "setuptools>=69.0.0,<82",
+    "agentscope==1.0.16",
+    "requests==2.32.3",
+    "pymilvus[milvus_lite]==2.6.9; sys_platform != 'win32'",
+    "pymilvus==3.0.2; sys_platform == 'win32'",
+    "milvus-lite==3.2.1; sys_platform == 'win32'",
+    "sentence-transformers==5.2.3",
+    "rich==13.9.4",
+    "ddgs==9.10.0",
+    "greenlet==3.5.6",
+    "tqdm==4.70.1",
+    "mcp==1.30.0",
+]
+
+[project.scripts]
+aligo = "cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio"]
+dev = ["ruff", "mypy"]
+
+[project.urls]
+Homepage = "https://github.com/JJJY9/aligo-travel-assistant"
+
+[tool.setuptools]
+# 顶层模块：CLI 入口与配置（config_local.py 为用户私有配置，已 gitignore，不打包）
+py-modules = ["cli", "config", "config_agentscope"]
+
+[tool.setuptools.packages.find]
+# utils/ 没有 __init__.py，按命名空间包发现
+namespaces = true
+where = ["."]
+include = ["agents*", "context*", "utils*"]
+# 显式排除：包发现阶段不要走进 venv/（本地约 1.5 GB）、build/、dist/、tests/ 等目录，
+# 否则 `python -m build` 的包发现会白扫几十万文件（实测约 20 秒），构建又慢又不稳定
+exclude = ["venv*", "build*", "dist*", "tests*", "data*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# ruff 0.17 的默认规则集比旧版宽得多（会报 BLE001/S110 等风格规则）。
+# 这里显式选定项目自己的基线：pycodestyle 错误（E4/E7/E9）与 pyflakes（F）。
+# 各智能体边界上的 broad-except 是有意的兜底，不在这套规则里。
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# 这些入口在 import 前先锚定项目根目录到 sys.path（Issue #5 的约定），
+# 模块级 import 因此不在文件顶部；这是有意为之的启动顺序。
+"cli.py" = ["E402"]
+"tests/*.py" = ["E402"]
+".claude/skills/**/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+# 只检查项目源码；venv 里的第三方脚本不是本项目代码。
+exclude = ["^venv/", "^build/", "^dist/", "^data/"]
+# utils/ 是命名空间包（无 __init__.py），不加这两项 mypy 会把同一文件同时当成
+# 顶层模块和 utils.* 模块，报 "Source file found twice" 后拒绝检查。
+explicit_package_bases = true
+mypy_path = "."

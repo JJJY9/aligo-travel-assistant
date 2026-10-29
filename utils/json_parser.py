@@ -3,8 +3,8 @@ JSON 解析辅助工具
 提供更鲁棒的 JSON 解析功能，处理常见的格式问题
 """
 import json
-import re
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         text = text[7:]
     elif text.startswith('```'):
         text = text[3:]
-    if text.endswith('```'):
-        text = text[:-3]
+    text = text.removesuffix('```')
     text = text.strip()
 
     # 提取 JSON 部分
@@ -56,7 +55,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
 
     # 记录最后一次解析错误：Python 3 会回收 except 变量，
     # 不显式保存的话最终兜底处引用 e 会抛 NameError（Issue #6）
-    last_error = None
+    last_error: Exception | None = None
 
     # 尝试1: 直接解析
     try:

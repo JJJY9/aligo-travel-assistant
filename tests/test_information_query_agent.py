@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 测试信息查询智能体（免费API版）
 
@@ -15,11 +14,13 @@
 注意：
   此测试需要网络连接。如果网络受限或API服务不可达，测试可能失败。
 """
-import sys
-import os
 import asyncio
 import json
+import os
+import sys
 import time
+
+import pytest
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,13 +28,22 @@ sys.path.insert(0, project_root)
 
 from agentscope.message import Msg
 from agentscope.model import OpenAIChatModel
+
 from config_agentscope import init_agentscope
+
 # 导入 skill 目录下的 agent
 sys.path.insert(0, os.path.join(project_root, '.claude', 'skills', 'query-info', 'script'))
 from agent import InformationQueryAgent
+
 from config import LLM_CONFIG
 
+requires_llm_key = pytest.mark.skipif(
+    not LLM_CONFIG["api_key"],
+    reason="需要真实模型密钥（LLM_API_KEY 或 config_local.API_KEY）；未配置时如实跳过",
+)
 
+
+@requires_llm_key
 async def test_information_query_agent():
     """测试信息查询智能体"""
 
@@ -191,7 +201,7 @@ async def test_information_query_agent():
         print("\n" + "="*70)
 
     # 打印统计
-    print(f"\n✅ 测试完成")
+    print("\n✅ 测试完成")
     print("="*70)
     print(f"总测试数: {len(test_cases)}")
     print(f"✓ 通过: {passed} ({passed/len(test_cases)*100:.0f}%)")

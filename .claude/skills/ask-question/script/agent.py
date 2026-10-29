@@ -16,16 +16,17 @@ RAG知识库智能体 RAGKnowledgeAgent
 安装：
 pip install milvus sentence-transformers
 """
-from agentscope.agent import AgentBase
-from agentscope.message import Msg
-from typing import Optional, Union, List, Dict
 import json
 import logging
 import os
-from pathlib import Path
 
 # Add project root to sys.path
 import sys
+from pathlib import Path
+
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 _GRPC_MAX_MS = '2147483647'  # gRPC 使用的 int32 上限，约 24.8 天
@@ -38,7 +39,7 @@ os.environ['GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS'] = _GRPC_MAX_MS
 logger = logging.getLogger(__name__)
 
 try:
-    from pymilvus import MilvusClient, DataType
+    from pymilvus import MilvusClient
     from sentence_transformers import SentenceTransformer
     DEPENDENCIES_AVAILABLE = True
 except ImportError as e:
@@ -54,7 +55,7 @@ class RAGKnowledgeAgent(AgentBase):
         self,
         name: str = "RAGKnowledgeAgent",
         model=None,
-        knowledge_base_path: str = None,
+        knowledge_base_path: str | None = None,
         collection_name: str = "business_travel_knowledge",
         embedding_model: str = "BAAI/bge-small-zh-v1.5",
         top_k: int = 3,
@@ -144,7 +145,7 @@ class RAGKnowledgeAgent(AgentBase):
                 if hasattr(self.milvus_client, 'close'):
                     try:
                         self.milvus_client.close()
-                    except:
+                    except Exception:
                         pass
 
                 # 重新创建客户端
@@ -154,7 +155,7 @@ class RAGKnowledgeAgent(AgentBase):
                 logger.error(f"Failed to reconnect Milvus: {reconnect_error}")
                 raise
 
-    def add_documents(self, documents: List[Dict[str, str]]) -> Dict:
+    def add_documents(self, documents: list[dict[str, str]]) -> dict:
         """
         添加文档到知识库
 
@@ -215,7 +216,7 @@ class RAGKnowledgeAgent(AgentBase):
             logger.error(f"Error adding documents: {e}")
             return {"status": "error", "message": str(e)}
 
-    def search_knowledge(self, query: str, top_k: Optional[int] = None) -> List[Dict]:
+    def search_knowledge(self, query: str, top_k: int | None = None) -> list[dict]:
         """
         检索知识库
 
@@ -262,7 +263,7 @@ class RAGKnowledgeAgent(AgentBase):
                     metadata_str = hit.get("entity", {}).get("metadata", "{}")
                     try:
                         metadata = json.loads(metadata_str)
-                    except:
+                    except Exception:
                         metadata = {}
 
                     retrieved_docs.append({
@@ -279,7 +280,7 @@ class RAGKnowledgeAgent(AgentBase):
             logger.error(f"Error searching knowledge: {e}")
             return []
 
-    async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
+    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         """
         RAG问答主流程
         1. 接收用户查询
@@ -320,7 +321,7 @@ class RAGKnowledgeAgent(AgentBase):
                 
                 # 使用提取到的 query（即使为空，也比 JSON 字符串好）
                 user_query = extracted_query
-            except:
+            except Exception:
                 pass  # 解析失败则保留原字符串
 
         # 检索相关知识
@@ -408,12 +409,12 @@ class RAGKnowledgeAgent(AgentBase):
                         # 如果 LLM 输出了 {"answer": "..."} 或 {"content": "..."}
                         if isinstance(json_obj, dict):
                             answer = json_obj.get("answer") or json_obj.get("content") or answer
-                    except:
+                    except Exception:
                         pass
 
             except Exception as e:
                 logger.error(f"Error generating answer with LLM: {e}")
-                answer = f"知识库中找到相关信息，但生成答案时出错：{str(e)}"
+                answer = f"知识库中找到相关信息，但生成答案时出错：{e!s}"
         else:
             # 如果没有LLM，直接返回检索到的知识
             answer = "以下是知识库中的相关信息：\n\n" + knowledge_context
@@ -433,7 +434,7 @@ class RAGKnowledgeAgent(AgentBase):
 
         return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
 
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> dict:
         """获取知识库统计信息"""
         if not self.initialized:
             return {"status": "error", "message": "Not initialized"}

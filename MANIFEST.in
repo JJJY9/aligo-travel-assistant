@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include requirements.txt
+
+# 技能插件（运行时由 LazyAgentRegistry 从 .claude/skills 动态加载）
+recursive-include .claude/skills *
+
+# 测试脚本（脚本式测试，无需打包为包）
+recursive-include tests *.py
