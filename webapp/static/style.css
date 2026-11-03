@@ -1165,3 +1165,9 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 .doctor-row.skip .doctor-status { color: var(--ink-3); }
 .doctor-name { color: var(--ink-2); font-weight: 600; }
 .doctor-detail { color: var(--ink-3); word-break: break-word; }
+
+/* 搜索命中后跳转到消息：短暂高亮气泡 */
+.msg-flash .bubble { box-shadow: 0 0 0 3px var(--accent); border-color: var(--accent); }
+@media (prefers-reduced-motion: no-preference) {
+  .msg-flash .bubble { transition: box-shadow 0.2s ease, border-color 0.2s ease; }
+}

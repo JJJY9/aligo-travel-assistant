@@ -461,6 +461,8 @@ def _group_sessions(
             snippet = _match_snippet(_message_search_text(message), needle)
             if snippet:
                 entry["snippet"] = snippet
+                # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
+                entry["match_index"] = entry["message_count"] - 1
 
     sessions = sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
     custom_titles = titles or {}
