@@ -5,20 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
   <title>Aligo · 智能旅行助手</title>
-  <script>
-    (function () {
-      try {
-        var theme = localStorage.getItem("aligo.theme");
-        if (!theme) {
-          theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-        }
-        document.documentElement.dataset.theme = theme;
-      } catch (error) {
-        document.documentElement.dataset.theme = "light";
-      }
-    })();
-  </script>
-  <link rel="stylesheet" href="/static/style.css?v=1.2.0" />
+  <script src="/static/theme.js?v=1.3.0"></script>
+  <link rel="stylesheet" href="/static/style.css?v=1.3.0" />
 </head>
 <body>
   <svg class="sprite" aria-hidden="true">
@@ -264,6 +252,6 @@
 
   <div class="toast" id="toast" role="status" hidden></div>
 
-  <script src="/static/app.js?v=1.2.0"></script>
+  <script src="/static/app.js?v=1.3.0"></script>
 </body>
 </html>
