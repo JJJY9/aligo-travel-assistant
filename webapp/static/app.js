@@ -107,6 +107,10 @@ const els = {
   stats: byId("stats"),
   usageStats: byId("usageStats"),
   usageAgents: byId("usageAgents"),
+  usageTrend: byId("usageTrend"),
+  usageTrendTotal: byId("usageTrendTotal"),
+  usageChart: byId("usageChart"),
+  usageTable: byId("usageTable"),
   storageChips: byId("storageChips"),
   toast: byId("toast"),
 };
@@ -1365,6 +1369,7 @@ function renderOverview() {
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
     els.usageAgents.innerHTML = "";
+    els.usageTrend.hidden = true;
     els.storageChips.innerHTML = "";
     return;
   }
@@ -1500,6 +1505,76 @@ function renderOverview() {
       els.usageAgents.appendChild(chip);
     });
   }
+
+  renderUsageTrend(usage);
+}
+
+function renderUsageTrend(usage) {
+  const days = Array.isArray(usage.by_day) ? usage.by_day : [];
+  const total = days.reduce((sum, day) => sum + (Number(day.tokens) || 0), 0);
+  if (!days.length || total <= 0) {
+    els.usageTrend.hidden = true;
+    return;
+  }
+  els.usageTrend.hidden = false;
+
+  const maxTokens = Math.max(...days.map((day) => Number(day.tokens) || 0), 1);
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate(),
+  ).padStart(2, "0")}`;
+
+  els.usageTrendTotal.textContent = `7 天合计 ${total.toLocaleString("zh-CN")} tokens`;
+  els.usageChart.innerHTML = "";
+  els.usageTable.innerHTML = "";
+
+  const caption = document.createElement("caption");
+  caption.textContent = "近 7 天模型 tokens 用量";
+  const headRow = document.createElement("tr");
+  ["日期", "调用次数", "tokens"].forEach((text) => {
+    const th = document.createElement("th");
+    th.scope = "col";
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  const thead = document.createElement("thead");
+  thead.appendChild(headRow);
+  const tbody = document.createElement("tbody");
+
+  days.forEach((day) => {
+    const tokens = Number(day.tokens) || 0;
+    const calls = Number(day.calls) || 0;
+
+    const column = document.createElement("div");
+    column.className = day.date === today ? "usage-day today" : "usage-day";
+    const wrap = document.createElement("div");
+    wrap.className = "usage-bar-wrap";
+    const bar = document.createElement("span");
+    bar.className = tokens ? "usage-bar" : "usage-bar empty";
+    bar.style.height = `${tokens ? Math.max(6, Math.round((tokens / maxTokens) * 100)) : 3}%`;
+    bar.title = `${day.date}：${calls} 次调用 · ${tokens.toLocaleString("zh-CN")} tokens`;
+    bar.setAttribute("aria-hidden", "true");
+    wrap.appendChild(bar);
+    const label = document.createElement("span");
+    label.className = "usage-day-label";
+    label.textContent = String(day.date).slice(5);
+    column.append(wrap, label);
+    els.usageChart.appendChild(column);
+
+    const row = document.createElement("tr");
+    [
+      day.date,
+      String(calls),
+      tokens.toLocaleString("zh-CN"),
+    ].forEach((text) => {
+      const cell = document.createElement("td");
+      cell.textContent = text;
+      row.appendChild(cell);
+    });
+    tbody.appendChild(row);
+  });
+
+  els.usageTable.append(caption, thead, tbody);
 }
 
 function startEditPreference(row, type, currentValue) {

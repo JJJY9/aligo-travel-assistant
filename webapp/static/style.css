@@ -820,6 +820,66 @@ a { color: var(--teal); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .usage-agents { margin-top: 8px; }
 
+.usage-trend { margin-top: 14px; }
+.usage-trend-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.usage-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  height: 92px;
+  margin-top: 10px;
+}
+.usage-day {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.usage-bar-wrap {
+  width: 100%;
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+.usage-bar {
+  width: min(26px, 72%);
+  min-height: 2px;
+  border-radius: 4px 4px 0 0;
+  background: var(--accent);
+  transition: height 0.3s ease;
+}
+.usage-bar.empty { background: var(--line-strong); }
+.usage-day-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.usage-day.today .usage-day-label { color: var(--ink-2); font-weight: 600; }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .pref-list { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .pref-row {
   display: flex;

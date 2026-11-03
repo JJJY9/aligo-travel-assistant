@@ -27,7 +27,7 @@ import time
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -393,6 +393,7 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     elapsed_total = 0.0
     elapsed_count = 0
     agent_counts: Counter[str] = Counter()
+    by_day: dict[str, dict[str, int]] = {}
 
     for message in history:
         if message.get("role") != "assistant":
@@ -402,9 +403,21 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         usage = meta.get("usage")
         if isinstance(usage, dict):
-            calls += int(usage.get("calls") or 0)
+            message_calls = int(usage.get("calls") or 0)
+            calls += message_calls
             input_tokens += int(usage.get("input_tokens") or 0)
             output_tokens += int(usage.get("output_tokens") or 0)
+
+            timestamp = str(message.get("timestamp") or "")
+            try:
+                message_day = datetime.fromisoformat(timestamp).date().isoformat()
+            except ValueError:
+                message_day = ""
+            if message_day:
+                bucket = by_day.setdefault(message_day, {"calls": 0, "tokens": 0})
+                bucket["calls"] += message_calls
+                bucket["tokens"] += int(usage.get("total_tokens") or 0)
+
         elapsed = meta.get("elapsed")
         if isinstance(elapsed, (int, float)):
             elapsed_total += float(elapsed)
@@ -412,6 +425,13 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
         for agent in meta.get("agents") or []:
             if isinstance(agent, dict) and agent.get("name"):
                 agent_counts[str(agent["name"])] += 1
+
+    today = datetime.now().date()
+    recent_days = []
+    for offset in range(6, -1, -1):
+        day = (today - timedelta(days=offset)).isoformat()
+        bucket = by_day.get(day, {"calls": 0, "tokens": 0})
+        recent_days.append({"date": day, "calls": bucket["calls"], "tokens": bucket["tokens"]})
 
     return {
         "calls": calls,
@@ -422,6 +442,7 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
         "top_agents": [
             {"name": name, "count": count} for name, count in agent_counts.most_common(5)
         ],
+        "by_day": recent_days,
     }
 
 

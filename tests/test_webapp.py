@@ -264,7 +264,12 @@ def test_status_usage_totals():
         assert usage["total_tokens"] >= 20
         assert usage["avg_elapsed"] >= 0
         assert isinstance(usage["top_agents"], list)
-        print("✓ /api/status 汇总模型用量")
+        by_day = usage["by_day"]
+        assert len(by_day) == 7
+        assert by_day[-1]["calls"] >= 2
+        assert by_day[-1]["tokens"] == usage["total_tokens"]
+        assert all("date" in day for day in by_day)
+        print("✓ /api/status 汇总模型用量（含近 7 天）")
     finally:
         _cleanup(user_id)
 
