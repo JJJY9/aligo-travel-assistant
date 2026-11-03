@@ -84,8 +84,9 @@ class _WebSession:
 class AligoWebApp:
     """应用状态：共享模型 / 熔断器 / 会话表。"""
 
-    # 进程内缓存的会话上限（超出后按最久未使用淘汰，避免长时间运行内存与连接增长）
-    max_sessions = 100
+    # 进程内缓存的会话上限（超出后按最久未使用淘汰，避免长时间运行内存与连接增长）。
+    # 每个会话在 PostgreSQL 后端下持有 1 个连接，保守取 50，避免撞上数据库连接上限。
+    max_sessions = 50
 
     def __init__(self, model: Any = None) -> None:
         init_agentscope()
