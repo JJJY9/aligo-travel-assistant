@@ -4,12 +4,19 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-03
+
 ### 新增
 - **Web 界面**（FastAPI + 无构建前端）：多轮对话、示例问题、偏好 / 行程概览、数据导出、会话管理；提供 `/api/chat`、`/api/status`、`/api/export` 接口
 - `export` 命令：导出用户数据（偏好 / 行程 / 对话历史 / 统计）为 JSON + Markdown，保存到 `exports/`（已 gitignore）
 
 ### 修复
 - 编排器：未注册智能体的错误原因在结果聚合后不再丢失（界面不再显示「未知错误」）
+- Windows GBK 控制台下打印 ✓ / emoji 崩溃（CLI / Web / 知识库初始化入口统一切换 UTF-8）
+
+### 变更
+- CI 增加 Python 3.10 / 3.12 测试矩阵与 Dependabot 自动依赖更新
+- 依赖升级：actions/setup-python 7、actions/checkout 7、requests 2.34.2、milvus-lite 3.2.2
 
 ## [1.0.0] - 2026-11-03
 
