@@ -251,6 +251,17 @@ class TripPayload(BaseModel):
     purpose: str = Field(default="出差", max_length=20)
 
 
+class TripUpdatePayload(BaseModel):
+    """更新行程（仅修改提供的字段）。"""
+
+    user_id: str = Field(pattern=_ID_PATTERN)
+    origin: str | None = Field(default=None, max_length=50)
+    destination: str | None = Field(default=None, min_length=1, max_length=50)
+    start_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
+    end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
+    purpose: str | None = Field(default=None, max_length=20)
+
+
 class SessionTitlePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
     title: str = Field(max_length=60)
@@ -1165,6 +1176,76 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         return {"trip_id": trip_id, "saved": True}
+
+    @app.put("/api/trips/{trip_id}")
+    def update_trip(
+        payload: TripUpdatePayload,
+        trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """更新一条行程（仅修改提供的字段；与其它行程重复时返回 409）。"""
+        fields = payload.model_dump(exclude_unset=True)
+        fields.pop("user_id", None)
+        if not fields:
+            raise HTTPException(status_code=400, detail="没有需要更新的字段")
+        if "destination" in fields and not fields["destination"]:
+            raise HTTPException(status_code=422, detail="目的地不能为空")
+        if "start_date" in fields and not fields["start_date"]:
+            raise HTTPException(status_code=422, detail="出发日期不能为空")
+
+        store = _open_long_term(payload.user_id)
+        try:
+            trips = store.get_trip_history(limit=None)
+            current = next(
+                (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
+                None,
+            )
+            if current is None:
+                raise HTTPException(status_code=404, detail="行程不存在")
+
+            merged = {**current, **fields}
+            for key in ("start_date", "end_date"):
+                value = fields.get(key)
+                if value:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=422, detail="日期格式应为 YYYY-MM-DD"
+                        ) from exc
+
+            start = end = None
+            try:
+                if merged.get("start_date"):
+                    start = datetime.strptime(str(merged["start_date"]), "%Y-%m-%d")
+                if merged.get("end_date"):
+                    end = datetime.strptime(str(merged["end_date"]), "%Y-%m-%d")
+            except ValueError:
+                start = end = None
+            if fields.get("end_date") and start is None:
+                raise HTTPException(status_code=422, detail="填写返程日期前请先设置出发日期")
+            if start is not None and end is not None and end < start:
+                raise HTTPException(status_code=422, detail="结束日期不能早于出发日期")
+
+            try:
+                updated = store.update_trip(trip_id, fields)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if not updated:
+                raise HTTPException(status_code=404, detail="行程不存在")
+
+            trips = store.get_trip_history(limit=None)
+            saved = next(
+                (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
+                {"trip_id": trip_id, **merged},
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
+            logger.warning("更新行程失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"更新行程失败：{exc}") from exc
+        finally:
+            _close_long_term(store)
+        return {"trip_id": trip_id, "saved": True, "trip": saved}
 
     @app.get("/api/trips/calendar")
     def export_trips_calendar(

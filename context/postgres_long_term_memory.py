@@ -361,6 +361,66 @@ class PostgresLongTermMemory:
         )
         return True
 
+    def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:
+        """更新一条行程的字段；返回是否存在。
+
+        Raises:
+            ValueError: 更新后与另一条既有行程（同路线 + 同起止日期）重复
+        """
+        row = self._fetchone(
+            "SELECT id, origin, destination, start_date, end_date "
+            "FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
+            (self.user_id, trip_id),
+        )
+        if not row:
+            return False
+
+        current = {
+            "origin": row[1],
+            "destination": row[2],
+            "start_date": row[3],
+            "end_date": row[4],
+        }
+        merged = {**current, **fields}
+        destination = merged.get("destination")
+        start_date = str(merged.get("start_date") or "")
+        if destination and start_date:
+            same = self._fetchone(
+                """
+                SELECT id FROM aligo_trips
+                WHERE user_id = %s
+                  AND id <> %s
+                  AND destination = %s
+                  AND origin IS NOT DISTINCT FROM %s
+                  AND start_date = %s
+                  AND end_date IS NOT DISTINCT FROM %s
+                LIMIT 1
+                """,
+                (
+                    self.user_id,
+                    row[0],
+                    destination,
+                    merged.get("origin"),
+                    start_date,
+                    merged.get("end_date"),
+                ),
+            )
+            if same:
+                raise ValueError("已存在相同行程（同路线 + 同起止日期）")
+
+        updates = {
+            key: fields[key]
+            for key in ("origin", "destination", "start_date", "end_date", "purpose")
+            if key in fields
+        }
+        if updates:
+            assignments = ", ".join(f"{key} = %s" for key in updates)
+            self._execute(
+                f"UPDATE aligo_trips SET {assignments} WHERE id = %s",
+                (*updates.values(), row[0]),
+            )
+        return True
+
     def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
         base = (
             "SELECT trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at "
