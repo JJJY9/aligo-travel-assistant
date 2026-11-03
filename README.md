@@ -441,6 +441,8 @@ python cli.py
 
 知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`）；`python cli.py kb-import <file.json>` 批量导入（单次最多 200 条），适合备份、换机与批量补充知识。
 
+知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 60 字预览）；`python cli.py kb-delete <id>` 删除指定片段。
+
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
 
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。

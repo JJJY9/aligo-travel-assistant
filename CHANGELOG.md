@@ -28,6 +28,7 @@
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1 / hit@3 / hit@5 与 MRR（只检索、不调用大模型），知识库未初始化时提示跳过，hit@5 低于 80% 退出码 1
 - 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
 - 知识库导出 / 导入：`GET /api/knowledge/export` 下载 JSON 备份，`POST /api/knowledge/import` 批量导入（单次最多 200 条，超长字段自动截断）；记忆面板新增「导出知识库 / 导入 JSON」；CLI 对应 `python cli.py kb-export [path]` 与 `kb-import <file>`
+- CLI 知识片段管理：`python cli.py kb-list [关键词]` 列出片段（分类 + 预览），`python cli.py kb-delete <id>` 删除片段
 - 行程管理：记忆面板可删除误记录的行程（`DELETE /api/trips/{id}`），JSON / PostgreSQL 同步更新统计与常去目的地
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
@@ -81,6 +82,7 @@
 - 新增 `cli.py eval` 退出码语义用例（未初始化跳过 / 后端故障失败 / Agent 初始化失败 / 阈值与全量未命中提示）
 - 新增知识库导出（排序 / 不含 id）与导入（跳过空项 / 截断超长字段 / 空导入 / 未初始化）用例、导出下载头与导入参数校验接口用例
 - 新增 CLI `kb-export` / `kb-import` 用例（导出文件 / 未初始化 / 文件缺失 / 格式错误 / 批量上限 / 纯数组格式）
+- 新增 CLI `kb-list` / `kb-delete` 用例（列表输出 / 关键词透传 / 不可用 / 读取失败 / 删除成功 / 不存在 / 删除失败）
 - 会话搜索用例增加命中消息序号断言（用户消息 0 / 助手消息 1）
 - 新增行程删除用例（JSON 统计 / 常去目的地递减、删除后新增 id 不与已有记录冲突；PostgreSQL 同步断言）与 `DELETE /api/trips/{id}` 接口用例
 - 新增旧快照写回不复活已删除行程、删除写入失败映射 503、ICS UID 随行程内容变化、CLI 大文件导入不受 200 条限制、导入空条目跳过等用例

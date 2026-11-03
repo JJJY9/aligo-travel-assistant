@@ -1047,6 +1047,58 @@ def run_knowledge_import_standalone(source: str) -> int:
     return 0
 
 
+def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
+    """列出知识片段（用于 `python cli.py kb-list [关键词]`）。
+
+    Returns:
+        0 列出成功；1 知识库不可用或读取失败
+    """
+    from utils.knowledge_admin import list_documents
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        return 1
+    try:
+        data = list_documents(limit=limit, offset=0, query=query)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"读取失败：{exc}")
+        return 1
+
+    items = data.get("items") or []
+    total = data.get("total", len(items))
+    suffix = f"（关键词：{query}）" if query else ""
+    print(f"共 {total} 条{suffix}，显示前 {len(items)} 条（按 id 倒序）")
+    for item in items:
+        meta = item.get("metadata") or {}
+        category = meta.get("category") or meta.get("title") or ""
+        preview = " ".join(str(item.get("content", "")).split())[:60]
+        tag = f" · {category}" if category else ""
+        print(f"  #{item['id']}{tag}  {preview}")
+    return 0
+
+
+def run_knowledge_delete_standalone(doc_id: int) -> int:
+    """删除一个知识片段（用于 `python cli.py kb-delete <id>`）。
+
+    Returns:
+        0 删除成功；1 片段不存在或删除失败
+    """
+    from utils.knowledge_admin import delete_document
+
+    try:
+        removed = delete_document(doc_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"删除失败：{exc}")
+        return 1
+    if not removed:
+        print(f"片段不存在：#{doc_id}")
+        return 1
+    print(f"已删除知识片段 #{doc_id}")
+    return 0
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -1067,6 +1119,14 @@ def main():
                 print("用法：python cli.py kb-import <file.json>")
                 sys.exit(2)
             sys.exit(run_knowledge_import_standalone(sys.argv[2]))
+        if arg == "kb-list":
+            keywords = sys.argv[2] if len(sys.argv) > 2 else ""
+            sys.exit(run_knowledge_list_standalone(keywords))
+        if arg == "kb-delete":
+            if len(sys.argv) < 3 or not sys.argv[2].isdigit():
+                print("用法：python cli.py kb-delete <id>")
+                sys.exit(2)
+            sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
     cli = AligoCLI()
     asyncio.run(cli.run())
 
