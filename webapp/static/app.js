@@ -97,6 +97,7 @@ const els = {
   themeToggle: byId("themeToggle"),
   exportChat: byId("exportChat"),
   copyLink: byId("copyLink"),
+  printChat: byId("printChat"),
   menuBtn: byId("menuBtn"),
   collapseSidebar: byId("collapseSidebar"),
   scrim: byId("scrim"),
@@ -880,6 +881,7 @@ function syncUrl() {
 function syncSessionControls() {
   els.exportChat.hidden = !state.sessionId;
   els.copyLink.hidden = !state.sessionId;
+  els.printChat.hidden = !state.sessionId;
   syncUrl();
 }
 
@@ -1917,6 +1919,8 @@ function bindEvents() {
   els.themeToggle.addEventListener("click", () => {
     applyTheme(currentTheme() === "dark" ? "light" : "dark");
   });
+
+  els.printChat.addEventListener("click", () => window.print());
 
   els.copyLink.addEventListener("click", () => {
     if (!state.sessionId) return;
