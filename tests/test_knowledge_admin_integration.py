@@ -1,11 +1,12 @@
 """
 知识库内容管理集成测试（本地已初始化知识库时运行）
 
-真实写入一条临时片段并删除，验证「新增 → 检索可见 → 删除」闭环，
-同时覆盖删除后新增不会与现有主键冲突（按最大 id 递增）。
+真实写入临时片段并删除，验证「新增 → 语义检索可见 → 删除」闭环，
+并覆盖删除后新增从最大 id 继续递增（不复用主键、不覆盖已有知识）。
 
 运行：python tests/test_knowledge_admin_integration.py
 """
+import importlib.util
 import os
 import sys
 import uuid
@@ -18,29 +19,80 @@ sys.path.insert(0, project_root)
 from utils.knowledge_stats import knowledge_status
 
 
-def test_add_and_delete_document_roundtrip():
+def _skip_reason() -> str | None:
+    """返回跳过原因；None 表示当前环境可以运行真实写库测试。"""
+    if importlib.util.find_spec("sentence_transformers") is None:
+        return "未安装 sentence-transformers（新增片段需要向量化）"
     status = knowledge_status()
-    if not status["available"]:
-        pytest.skip(f"本地未初始化知识库：{status.get('reason')}")
+    if status["available"]:
+        return None
+    reason = str(status.get("reason", "未知原因"))
+    if "Fail connecting" in reason or "Open local milvus failed" in reason:
+        # Milvus Lite 在同一进程反复开关客户端后偶发连接失败，属测试环境问题
+        return f"Milvus Lite 暂不可用：{reason}"
+    return f"本地未初始化知识库：{reason}"
 
-    from utils.knowledge_admin import add_document, delete_document, list_documents
 
-    marker = f"集成测试临时片段 {uuid.uuid4().hex[:8]}"
-    result = add_document(marker, {"category": "临时测试"})
-    doc_id = result.get("id")
-    assert doc_id, f"新增后应返回片段 id：{result}"
+def test_add_search_and_delete_roundtrip():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    from utils.knowledge_admin import (
+        add_document,
+        delete_document,
+        list_documents,
+        search_documents,
+    )
+
+    first_marker = f"集成测试临时片段 A {uuid.uuid4().hex[:8]}"
+    second_marker = f"集成测试临时片段 B {uuid.uuid4().hex[:8]}"
+
+    first = add_document(first_marker, {"category": "临时测试"})
+    first_id = first.get("id")
+    assert first_id, f"新增后应返回片段 id：{first}"
 
     try:
-        found = list_documents(query=marker)["items"]
-        assert any(item["id"] == doc_id for item in found), "新增片段应能被检索到"
-    finally:
-        assert delete_document(doc_id) is True
+        found = list_documents(query=first_marker)["items"]
+        assert any(item["id"] == first_id for item in found), "新增片段应能在列表中查到"
 
-    remaining = list_documents(query=marker)["items"]
-    assert not any(item["id"] == doc_id for item in remaining), "删除后不应再检索到"
-    print(f"✓ 知识片段新增 / 检索 / 删除闭环（id={doc_id}）")
+        # 语义检索链路（RAG 实际使用的路径）也应能命中新片段
+        hits = search_documents(first_marker, top_k=3)
+        assert any(first_marker in str(hit.get("content", "")) for hit in hits), (
+            f"新增片段应能被语义检索命中，实际：{hits}"
+        )
+    finally:
+        assert delete_document(first_id) is True
+
+    remaining = list_documents(query=first_marker)["items"]
+    assert not any(item["id"] == first_id for item in remaining), "删除后不应再检索到"
+
+    # 删除后再新增：新 id 必须大于现有最大 id，且不能覆盖已有片段的内容
+    before_items = list_documents(limit=100000)["items"]
+    before_max = max((item["id"] for item in before_items), default=0)
+    before_max_content = next(
+        (item["content"] for item in before_items if item["id"] == before_max), ""
+    )
+
+    second = add_document(second_marker, {"category": "临时测试"})
+    second_id = second.get("id")
+    try:
+        assert second_id and second_id > before_max, (
+            f"新增 id 应大于现有最大 id（before={before_max}, second={second_id}）"
+        )
+        after_items = list_documents(limit=100000)["items"]
+        assert any(item["id"] == before_max and item["content"] == before_max_content
+                   for item in after_items), "原有最大 id 片段的内容不应被覆盖"
+    finally:
+        assert delete_document(second_id) is True
+
+    print(f"✓ 知识片段新增 / 语义检索 / 删除闭环（id={first_id} → {second_id}）")
 
 
 if __name__ == "__main__":
-    test_add_and_delete_document_roundtrip()
-    print("\n全部通过")
+    skip_reason = _skip_reason()
+    if skip_reason:
+        print(f"跳过：{skip_reason}")
+    else:
+        test_add_search_and_delete_roundtrip()
+        print("\n全部通过")

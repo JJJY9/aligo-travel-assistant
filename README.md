@@ -41,7 +41,7 @@
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
-- 知识库维护：记忆面板可查看 / 新增 / 删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可被检索；删除后再新增按最大 id 递增，不会与已有主键冲突
+- 知识库维护：记忆面板可搜索 / 分页查看、新增、删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可被检索；删除后再新增按最大 id 递增，不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归
 
 ### ⚡ 优先级并行调度
@@ -446,6 +446,8 @@ python cli.py
 执行过程中会实时显示当前正在运行的智能体（例如「正在执行 行程规划…」）；完成后智能体列表包含各自耗时（例如 `信息查询 ✓ 2.3s`），与 Web 执行路线一致。
 
 > **排障提示**：启动时若出现 `No sentence-transformers model found ... mean pooling` 警告，说明本地模型目录缺少 `modules.json` / `1_Pooling/config.json` 等元数据文件（通常只复制了权重文件）。从 HuggingFace 下载完整模型仓库文件即可消除；`doctor` 会检查并提示。
+>
+> Milvus Lite 3.x 在**非 ASCII 路径**（例如用户名含中文的 `C:\Users\张三\...`）下可能无法写 Faiss 索引（`FileIOWriter ... No such file or directory`）。请把项目放在纯英文路径（如 `D:\Code\chailv`）后重新初始化知识库。
 
 ---
 

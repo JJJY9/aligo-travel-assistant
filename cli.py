@@ -921,22 +921,31 @@ def run_rag_eval_standalone(min_hit5: float = 0.8) -> int:
     """运行 RAG 检索评测（用于 `python cli.py eval`），不进入交互式 CLI。
 
     Returns:
-        0 评测完成且 hit@5 达标（或知识库未初始化，跳过）；1 未达标
+        0 评测完成且 hit@5 达标（或知识库未初始化，跳过）；1 未达标或后端故障
     """
     from utils.knowledge_stats import knowledge_status
 
     status = knowledge_status()
     if not status.get("available"):
-        print(f"跳过评测：知识库不可用（{status.get('reason', '未知原因')}）")
-        return 0
+        reason = str(status.get("reason", "未知原因"))
+        if reason in {"知识库未初始化", "集合不存在"}:
+            print(f"跳过评测：{reason}")
+            return 0
+        # 读取失败 / 文件锁占用等属于基础设施故障，不能当作“跳过”并返回成功
+        print(f"评测失败：知识库不可用（{reason}）")
+        return 1
 
     from agents.rag_knowledge_agent import RAGKnowledgeAgent
     from utils.rag_eval import evaluate_retrieval
 
-    agent = RAGKnowledgeAgent(collection_name=status["collection"])
+    try:
+        agent = RAGKnowledgeAgent(collection_name=status["collection"])
+    except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
+        print(f"评测失败：无法初始化 RAG Agent（{exc}）")
+        return 1
     if not agent.initialized:
-        print("跳过评测：RAG 依赖未安装（pip install -r requirements.txt）")
-        return 0
+        print("评测失败：RAG 依赖未安装（pip install -r requirements.txt）")
+        return 1
 
     result = evaluate_retrieval(
         lambda query, top_k: agent.search_knowledge(query, top_k=top_k),
@@ -949,6 +958,8 @@ def run_rag_eval_standalone(min_hit5: float = 0.8) -> int:
         f"hit@3 {result['hit3']:.0%} · hit@5 {result['hit5']:.0%} · MRR {result['mrr']:.2f}"
     )
     if result["hit5"] < min_hit5:
+        if result["hit5"] == 0:
+            print("提示：所有问题均未命中，可能是索引未加载 / 知识库故障，而非切分策略问题")
         print(f"低于阈值 hit@5 >= {min_hit5:.0%}，请检查知识库内容或切分策略")
         return 1
     return 0

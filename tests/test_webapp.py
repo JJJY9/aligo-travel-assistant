@@ -892,6 +892,46 @@ def test_knowledge_document_write_api(monkeypatch):
     print("✓ /api/knowledge/documents 新增 / 删除接口")
 
 
+def test_knowledge_api_maps_backend_errors(monkeypatch):
+    """Milvus 查询 / 写入失败应映射为 503，而不是 200 空库或 404。"""
+    from webapp import server as server_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("collection is in state 'released'")
+
+    monkeypatch.setattr(server_module, "list_documents", boom)
+    monkeypatch.setattr(server_module, "delete_document", boom)
+    client = _client()
+    assert client.get("/api/knowledge/documents").status_code == 503
+    assert client.delete("/api/knowledge/documents/1").status_code == 503
+
+    def missing_db(*args, **kwargs):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "add_document", missing_db)
+    response = client.post("/api/knowledge/documents", json={"content": "新知识"})
+    assert response.status_code == 503
+    assert "初始化" in response.json()["detail"]
+    print("✓ 知识接口把后端故障映射为 503")
+
+
+def test_knowledge_metadata_limits():
+    """metadata 键数与键值长度受限，防止超大对象拖垮列表接口。"""
+    client = _client()
+    too_many = {f"k{i}": "v" for i in range(11)}
+    response = client.post(
+        "/api/knowledge/documents", json={"content": "x", "metadata": too_many}
+    )
+    assert response.status_code == 422
+
+    too_long = {"category": "长" * 201}
+    response = client.post(
+        "/api/knowledge/documents", json={"content": "x", "metadata": too_long}
+    )
+    assert response.status_code == 422
+    print("✓ 知识片段 metadata 键数 / 长度受限")
+
+
 def test_next_trip_from_full_history():
     from datetime import datetime, timedelta
 
@@ -985,6 +1025,12 @@ if __name__ == "__main__":
         test_knowledge_document_write_api(_mp)
     finally:
         _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_knowledge_api_maps_backend_errors(_mp)
+    finally:
+        _mp.undo()
+    test_knowledge_metadata_limits()
     test_status_endpoint()
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()

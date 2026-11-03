@@ -250,7 +250,25 @@
       </section>
       <section class="sheet-section">
         <h3>知识库维护</h3>
-        <div class="kb-list" id="kbList">加载中…</div>
+        <input
+          id="kbSearch"
+          class="kb-search"
+          type="search"
+          maxlength="100"
+          placeholder="搜索片段内容或分类"
+          aria-label="搜索知识片段"
+        />
+        <div
+          class="kb-list"
+          id="kbList"
+          role="status"
+          aria-live="polite"
+          tabindex="-1"
+          aria-label="知识片段列表"
+        >
+          加载中…
+        </div>
+        <button class="ghost kb-more" id="kbMore" type="button" hidden>加载更多</button>
         <form class="kb-form" id="kbForm">
           <textarea
             id="kbContent"
@@ -280,7 +298,7 @@
             检查 LLM 连通性
           </label>
         </div>
-        <div class="doctor-list" id="doctorList">尚未运行</div>
+        <div class="doctor-list" id="doctorList" role="status" aria-live="polite">尚未运行</div>
       </section>
       <section class="sheet-section">
         <h3>偏好</h3>

@@ -50,6 +50,10 @@ const state = {
   busy: false,
   controller: null,
   lastUserText: "",
+  kbItems: [],
+  kbTotal: 0,
+  kbQuery: "",
+  kbDeleting: new Set(),
 };
 
 function isValidId(value) {
@@ -123,6 +127,8 @@ const els = {
   storageChips: byId("storageChips"),
   knowledgeChip: byId("knowledgeChip"),
   kbList: byId("kbList"),
+  kbSearch: byId("kbSearch"),
+  kbMore: byId("kbMore"),
   kbForm: byId("kbForm"),
   kbContent: byId("kbContent"),
   kbCategory: byId("kbCategory"),
@@ -234,7 +240,9 @@ async function copyText(text, message = "已复制") {
 async function getJSON(url, options) {
   const response = await fetch(url, options);
   if (!response.ok) {
-    throw new Error(await errorMessage(response));
+    const error = new Error(await errorMessage(response));
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -1896,35 +1904,74 @@ async function refreshKnowledge() {
   }
 }
 
+const KB_PAGE_SIZE = 20;
+let kbSearchTimer = null;
+
+function knowledgeQueryParams(offset) {
+  const params = new URLSearchParams({
+    limit: String(KB_PAGE_SIZE),
+    offset: String(offset),
+  });
+  if (state.kbQuery) params.set("q", state.kbQuery);
+  return params;
+}
+
 async function refreshKnowledgeDocuments() {
   if (!els.kbList) return;
   els.kbList.textContent = "加载中…";
+  state.kbItems = [];
+  state.kbTotal = 0;
   try {
-    const data = await getJSON("/api/knowledge/documents?limit=100");
-    renderKnowledgeDocuments(data.items || [], Number(data.total || 0));
+    const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
+    state.kbTotal = Number(data.total || 0);
+    renderKnowledgeDocuments(data.items || [], false);
   } catch (error) {
-    els.kbList.textContent = `知识库不可用：${error.message}`;
+    els.kbList.textContent = error.message;
+  }
+  updateKnowledgeMore();
+}
+
+async function loadMoreKnowledgeDocuments() {
+  if (!els.kbList) return;
+  els.kbMore.disabled = true;
+  try {
+    const data = await getJSON(
+      `/api/knowledge/documents?${knowledgeQueryParams(state.kbItems.length)}`,
+    );
+    state.kbTotal = Number(data.total || 0);
+    renderKnowledgeDocuments(data.items || [], true);
+    els.kbList.focus();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    els.kbMore.disabled = false;
+    updateKnowledgeMore();
   }
 }
 
-function renderKnowledgeDocuments(items, total) {
-  els.kbList.innerHTML = "";
-  if (total > items.length) {
-    const note = document.createElement("p");
-    note.className = "kb-meta";
-    note.textContent = `共 ${total} 条，显示最新 ${items.length} 条`;
-    els.kbList.appendChild(note);
+function updateKnowledgeMore() {
+  if (!els.kbMore) return;
+  els.kbMore.hidden = state.kbItems.length >= state.kbTotal;
+}
+
+function renderKnowledgeDocuments(items, append) {
+  if (!append) {
+    els.kbList.innerHTML = "";
+    state.kbItems = [];
   }
-  if (!items.length) {
+  if (!append && !items.length) {
     const empty = document.createElement("p");
     empty.className = "kb-empty";
-    empty.textContent = "还没有知识片段，可以在下方添加。";
+    empty.textContent = state.kbQuery
+      ? "没有匹配的知识片段。"
+      : "还没有知识片段，可以在下方添加。";
     els.kbList.appendChild(empty);
     return;
   }
   for (const doc of items) {
     const row = document.createElement("div");
     row.className = "pref-row kb-row";
+    row.dataset.id = String(doc.id);
 
     const main = document.createElement("div");
     main.className = "kb-main";
@@ -1952,17 +1999,51 @@ function renderKnowledgeDocuments(items, total) {
 
     row.append(main, actions);
     els.kbList.appendChild(row);
+    state.kbItems.push(doc.id);
+  }
+
+  let note = els.kbList.querySelector(".kb-note");
+  if (state.kbTotal > state.kbItems.length) {
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "kb-meta kb-note";
+      els.kbList.prepend(note);
+    }
+    note.textContent = state.kbQuery
+      ? `匹配 ${state.kbTotal} 条，已显示 ${state.kbItems.length} 条`
+      : `共 ${state.kbTotal} 条，已显示 ${state.kbItems.length} 条`;
+  } else if (note) {
+    note.remove();
   }
 }
 
 async function removeKnowledgeDocument(docId) {
   if (!window.confirm(`删除知识片段 #${docId}？`)) return;
+  if (state.kbDeleting.has(docId)) return;
+  state.kbDeleting.add(docId);
+  const row = els.kbList.querySelector(`.kb-row[data-id="${docId}"]`);
+  const button = row?.querySelector(".pref-actions button");
+  if (button) button.disabled = true;
+  let removed = false;
   try {
     await getJSON(`/api/knowledge/documents/${docId}`, { method: "DELETE" });
+    removed = true;
     toast("知识片段已删除");
-    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
-    toast(`删除失败：${error.message}`);
+    if (error.status === 404) {
+      removed = true;
+      toast("知识片段已不存在，已刷新列表");
+    } else {
+      toast(error.message);
+    }
+  } finally {
+    state.kbDeleting.delete(docId);
+  }
+  if (removed) {
+    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+    els.kbList.focus();
+  } else if (button) {
+    button.disabled = false;
   }
 }
 
@@ -1984,12 +2065,13 @@ async function addKnowledgeDocument(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content, metadata }),
     });
-    els.kbContent.value = "";
-    els.kbCategory.value = "";
+    // 提交期间用户可能继续输入下一条，只清空仍是本次提交内容的输入框
+    if (els.kbContent.value.trim() === content) els.kbContent.value = "";
+    if (els.kbCategory.value.trim() === category) els.kbCategory.value = "";
     toast("知识片段已添加");
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
-    toast(`添加失败：${error.message}`);
+    toast(error.message);
   } finally {
     els.kbSubmit.disabled = false;
     els.kbSubmit.textContent = "添加片段";
@@ -2104,6 +2186,22 @@ function bindEvents() {
   });
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
+  els.kbSearch.addEventListener("input", () => {
+    clearTimeout(kbSearchTimer);
+    kbSearchTimer = setTimeout(() => {
+      state.kbQuery = els.kbSearch.value.trim();
+      refreshKnowledgeDocuments();
+    }, 250);
+  });
+  els.kbSearch.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      clearTimeout(kbSearchTimer);
+      state.kbQuery = els.kbSearch.value.trim();
+      refreshKnowledgeDocuments();
+    }
+  });
+  els.kbMore.addEventListener("click", loadMoreKnowledgeDocuments);
   els.runDoctor.addEventListener("click", runDoctorCheck);
 
   document.addEventListener("click", (event) => {
