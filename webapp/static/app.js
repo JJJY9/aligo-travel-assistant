@@ -954,9 +954,21 @@ function renderHistory() {
         item.appendChild(snippet);
       }
 
+      const actions = document.createElement("span");
+      actions.className = "hi-actions";
+
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.title = "重命名会话";
+      rename.setAttribute("aria-label", "重命名会话");
+      rename.innerHTML = icon("edit");
+      rename.addEventListener("click", (event) => {
+        event.stopPropagation();
+        startRenameSession(item, session);
+      });
+
       const remove = document.createElement("button");
       remove.type = "button";
-      remove.className = "hi-del";
       remove.title = "删除会话";
       remove.setAttribute("aria-label", "删除会话");
       remove.innerHTML = icon("trash");
@@ -964,7 +976,9 @@ function renderHistory() {
         event.stopPropagation();
         deleteSession(session.session_id);
       });
-      item.appendChild(remove);
+
+      actions.append(rename, remove);
+      item.appendChild(actions);
 
       item.addEventListener("click", () => openSession(session.session_id));
       item.addEventListener("keydown", (event) => {
@@ -1052,6 +1066,65 @@ async function openSession(sessionId, options = {}) {
   } catch (error) {
     if (!options.silent) toast(`加载会话失败：${error.message}`);
   }
+}
+
+function startRenameSession(item, session) {
+  if (item.querySelector(".hi-input")) return;
+  const titleEl = item.querySelector(".hi-title");
+  if (!titleEl) return;
+
+  const input = document.createElement("input");
+  input.className = "hi-input";
+  input.maxLength = 60;
+  input.value = session.title || "";
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let settled = false;
+
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    if (input.isConnected) input.replaceWith(titleEl);
+  };
+
+  const save = async () => {
+    if (settled) return;
+    const value = input.value.trim();
+    settled = true;
+    try {
+      await getJSON(`/api/sessions/${encodeURIComponent(session.session_id)}/title`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: state.userId, title: value }),
+      });
+      toast(value ? "会话已重命名" : "已恢复自动标题");
+      await loadSessions();
+      if (state.sessionId === session.session_id) {
+        const updated = state.sessions.find((s) => s.session_id === session.session_id);
+        setConversationTitle(updated ? updated.title : value);
+      }
+    } catch (error) {
+      settled = false;
+      toast(`重命名失败：${error.message}`);
+      input.focus();
+    }
+  };
+
+  input.addEventListener("click", (event) => event.stopPropagation());
+  input.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      save();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancel();
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!settled) cancel();
+  });
 }
 
 async function deleteSession(sessionId) {

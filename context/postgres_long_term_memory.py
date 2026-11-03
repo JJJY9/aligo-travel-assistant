@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS aligo_user_stats (
     user_id TEXT PRIMARY KEY,
     total_queries INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS aligo_session_titles (
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, session_id)
+);
 """
 
 
@@ -199,11 +207,42 @@ class PostgresLongTermMemory:
                 (self.user_id, session_id),
             )
             removed = cursor.rowcount or 0
+            cursor.execute(
+                "DELETE FROM aligo_session_titles WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
         if removed:
             logger.info(
                 "Deleted chat session from PostgreSQL: %s (%s messages)", session_id, removed
             )
         return removed
+
+    def set_session_title(self, session_id: str, title: str) -> None:
+        """设置会话自定义标题；空标题表示恢复自动标题。"""
+        cleaned = title.strip()
+        if not cleaned:
+            self._execute(
+                "DELETE FROM aligo_session_titles WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
+            return
+        self._execute(
+            """
+            INSERT INTO aligo_session_titles (user_id, session_id, title)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, session_id)
+            DO UPDATE SET title = EXCLUDED.title, updated_at = now()
+            """,
+            (self.user_id, session_id, cleaned[:60]),
+        )
+
+    def get_session_titles(self) -> dict[str, str]:
+        """返回全部会话自定义标题。"""
+        rows = self._fetchall(
+            "SELECT session_id, title FROM aligo_session_titles WHERE user_id = %s",
+            (self.user_id,),
+        )
+        return {session_id: title for session_id, title in rows}
 
     # ---------- 历史行程 ----------
 

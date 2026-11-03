@@ -454,6 +454,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - **执行路线**：`/api/chat/stream` 通过 SSE 推送 `phase`（阶段）、`plan`（调度计划）、`agent_start` / `agent_done`（子智能体进度）与 `done`（最终结果 / 用量 / 耗时），前端实时渲染为路线图，每个智能体显示单独耗时；生成过程中可随时停止
 - **路线回看**：每轮助手消息会附带 `_meta` 元数据（意图、调度计划、各智能体状态与耗时、用量），恢复历史会话时同样可展开「执行路线」
 - **会话历史与搜索**：侧栏按日期分组展示历史会话，点击恢复完整对话（助手消息从编排结果重新渲染为 Markdown），悬停删除；搜索框按标题与消息内容全文检索，并显示命中片段
+- **会话重命名**：侧栏铅笔按钮内联编辑标题（Enter 保存 / Esc 取消），自定义标题持久化在 JSON / PostgreSQL 中并参与搜索；清空标题恢复自动标题
 - **对话深链接**：地址栏同步 `user` / `session` 参数（例如 `/?user=alice&session=abc123`），打开链接即可恢复会话；顶栏提供「复制链接」，无效链接会自动清理参数并回到新对话
 - **主题与布局**：浅色 / 深色主题跟随系统并可切换；窄屏下侧栏变为抽屉
 - **记忆与用量面板**：在线编辑 / 删除偏好、查看最近 5 条行程与统计、存储后端、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体），修改用户 ID，导出长期记忆 JSON
@@ -477,6 +478,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |
 | GET | `/api/sessions` | 历史会话列表（`q` 可选：按标题与消息内容搜索，返回命中片段） |
 | GET | `/api/sessions/{id}` | 某个会话的消息（助手消息已渲染为 Markdown，并附执行元数据） |
+| PUT | `/api/sessions/{id}/title` | 设置或清除会话自定义标题（空字符串恢复自动标题） |
 | GET | `/api/sessions/{id}/export` | 把会话导出为 Markdown 附件 |
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | GET | `/api/export` | 导出用户长期记忆 JSON（附件下载） |
