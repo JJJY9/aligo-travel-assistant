@@ -143,6 +143,39 @@
 用户看到结果
 ```
 
+### 一次 Web 对话的请求流程（SSE）
+
+```mermaid
+sequenceDiagram
+    participant U as 浏览器
+    participant W as FastAPI /api/chat/stream
+    participant C as ConversationRuntime
+    participant I as IntentionAgent
+    participant O as OrchestrationAgent
+    participant A as 子智能体（Skill）
+    participant M as 记忆（Redis / JSON / PostgreSQL）
+
+    U->>W: POST 消息（user_id / session_id）
+    W->>W: 限流 / 熔断检查
+    W->>C: ask(on_event)
+    C->>M: 重载长期记忆、组装上下文
+    C->>I: 意图识别（带重试）
+    I-->>C: intents / agent_schedule
+    C-->>U: SSE phase / plan
+    C->>M: 写入用户消息
+    C->>O: reply(intention)
+    O->>A: 按优先级并行执行
+    A-->>O: 结果 + 耗时
+    O->>M: 保存偏好 / 行程
+    O-->>C: 聚合结果
+    C-->>U: SSE agent_start / agent_done
+    C->>M: 写入助手消息（含执行元数据）
+    C-->>U: SSE done（回复 + 用量 + 耗时）
+```
+
+RAG 检索在 `RAGKnowledgeAgent` 内使用 Milvus Lite（与记忆读写分离，进程内共享客户端）；
+SSE 每 15 秒发送一次 `: keep-alive` 心跳，浏览器断开时服务端取消本轮任务。
+
 ### 连接与可用性
 
 为保证 LLM 服务不稳定时的可用性，在调用链外增加了以下机制（不改变原有业务逻辑）：
@@ -332,6 +365,7 @@ $env:LLM_API_KEY="你的API密钥"
 - `LLM_BASE_URL`: 接口地址（可选，默认 `https://api.deepseek.com`）
 - 切换其他服务商（豆包 / OpenAI 等）：覆盖上面两个变量，或修改 `config.py` 中的默认值（文件内有示例）
 - `temperature` / `max_tokens`: 生成参数（0.7 / 8192）
+- 完整环境变量清单见根目录 [`.env.example`](.env.example)（含 Redis / PostgreSQL 与限流配置；项目不会自动加载 `.env`，请自行 export 或使用 `config_local.py`）
 
 ### 3. 初始化知识库
 
