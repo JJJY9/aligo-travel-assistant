@@ -5,6 +5,7 @@
 JSON lines（`event=http_request`），便于日志采集、检索与告警。
 """
 import json
+import logging
 import os
 
 
@@ -39,3 +40,26 @@ def format_access_log(
         f"{method} {path} -> {status} "
         f"({float(elapsed_ms):.0f}ms) [{request_id}]"
     )
+
+
+class JsonLogFormatter(logging.Formatter):
+    """把日志记录输出为单行 JSON；访问日志的 JSON 字段提升到顶层。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+        }
+        message = record.getMessage()
+        try:
+            data = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            payload.update(data)
+        else:
+            payload["message"] = message
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)

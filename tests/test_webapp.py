@@ -552,6 +552,24 @@ def test_trip_ics_uid_includes_content():
     print("✓ ICS UID 包含行程内容（复用 id 不覆盖旧事件）")
 
 
+def test_ics_escape_handles_lone_cr():
+    from webapp.server import _build_trip_ics, _ics_escape
+
+    assert _ics_escape("a\rb") == "a\\nb"
+    trip = {
+        "trip_id": "trip_1",
+        "origin": "北京",
+        "destination": "上海\r恶意行",
+        "start_date": "2026-11-09",
+        "end_date": "2026-11-11",
+        "purpose": "出差",
+    }
+    content = _build_trip_ics(trip, "u1")
+    assert "上海\\n恶意行" in content
+    assert "\r恶意行" not in content
+    print("✓ ICS 转义孤立 CR（不破坏行结构）")
+
+
 def test_build_trips_ics_multiple_events():
     from webapp.server import _build_trips_ics
 
@@ -1267,6 +1285,7 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_trip_ics_uid_includes_content()
+    test_ics_escape_handles_lone_cr()
     test_build_trips_ics_multiple_events()
     test_trips_calendar_api()
     test_session_markdown_export()

@@ -1105,7 +1105,7 @@ def run_trips_dedupe_standalone(user_id: str) -> int:
     同路线 + 同起止日期视为重复：保留最早一条，删除其余记录（统计同步更新）。
 
     Returns:
-        0 清理完成（含无重复）；1 参数 / 读取失败
+        0 清理完成（含无重复）；1 参数 / 读取 / 删除失败
     """
     import re
 
@@ -1113,6 +1113,8 @@ def run_trips_dedupe_standalone(user_id: str) -> int:
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
 
+    from config import STORAGE_CONFIG
+    from context.long_term_memory import LongTermMemory
     from context.storage import create_long_term_memory
 
     try:
@@ -1122,14 +1124,19 @@ def run_trips_dedupe_standalone(user_id: str) -> int:
         return 1
 
     try:
+        # PostgreSQL 配置了但连接失败时，工厂会静默回退本地 JSON；维护命令
+        # 必须确保清理的是目标后端，避免对过期本地数据“成功”而真实库未处理
+        if STORAGE_CONFIG.get("postgres_dsn") and isinstance(store, LongTermMemory):
+            print("PostgreSQL 已配置但连接失败（已回退本地 JSON），未执行去重；请检查数据库后重试")
+            return 1
+
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             print(f"读取行程失败：{exc}")
             return 1
 
-        seen: set[tuple[str, str, str, str]] = set()
-        duplicates: list[str] = []
+        groups: dict[tuple[str, str, str, str], list[str]] = {}
         for trip in trips:
             start_date = str(trip.get("start_date") or "")
             if not start_date:
@@ -1140,19 +1147,42 @@ def run_trips_dedupe_standalone(user_id: str) -> int:
                 start_date,
                 str(trip.get("end_date") or ""),
             )
-            if key in seen:
-                duplicates.append(str(trip.get("trip_id") or ""))
-            else:
-                seen.add(key)
+            groups.setdefault(key, []).append(str(trip.get("trip_id") or ""))
+
+        if all(len(ids) <= 1 for ids in groups.values()):
+            print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
+            return 0
+
+        # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，
+        # 避免把仅剩的副本也删掉
+        try:
+            fresh_ids = {
+                str(trip.get("trip_id") or "")
+                for trip in store.get_trip_history(limit=None)
+            }
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取行程失败：{exc}")
+            return 1
+
+        duplicates = [
+            trip_id
+            for ids in groups.values()
+            for trip_id in ids[1:]
+            if ids[0] in fresh_ids
+        ]
 
         removed = 0
-        for trip_id in duplicates:
-            if trip_id and store.delete_trip(trip_id):
-                removed += 1
+        try:
+            for trip_id in duplicates:
+                if trip_id and store.delete_trip(trip_id):
+                    removed += 1
+        except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
+            print(f"删除过程中失败：{exc}（已删除 {removed} 条）")
+            return 1
         if duplicates:
             print(f"用户 {user_id}：删除 {removed} 条重复行程（保留最早记录）")
         else:
-            print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
+            print(f"用户 {user_id}：没有需要删除的重复行程（共 {len(trips)} 条）")
         return 0
     finally:
         close = getattr(store, "close", None)

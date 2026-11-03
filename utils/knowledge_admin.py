@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 # 单次查询上限（Milvus query 的 limit 上限为 16384），本地知识库远小于该规模
 _MAX_SCAN = 16384
+# 导入时每次嵌入 / 插入的条数，控制大文件的峰值内存
+_IMPORT_CHUNK = 500
 _WRITE_LOCK = threading.Lock()
 _agent: Any = None
 _agent_lock = threading.Lock()
@@ -181,27 +183,32 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
-    # 按内容去重：重复导入同一备份（或分批中断后重试）不会产生重复片段
-    existing = {
-        str(item.get("content", "")).strip()
-        for item in list_documents(limit=_MAX_SCAN)["items"]
-    }
-    unique: list[dict[str, Any]] = []
-    for item in cleaned:
-        if item["content"] in existing:
-            skipped += 1
-            continue
-        existing.add(item["content"])
-        unique.append(item)
-    if not unique:
-        return {"imported": 0, "skipped": skipped}
-
     agent = _get_agent()
+    imported: list[int] = []
     with _WRITE_LOCK:
-        result = agent.add_documents(unique)
-    if result.get("status") != "success":
-        raise RuntimeError(str(result.get("message") or "导入知识片段失败"))
-    return {"imported": len(result.get("ids") or []), "skipped": skipped}
+        # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
+        # 插入同一批内容
+        existing = {
+            str(item.get("content", "")).strip()
+            for item in list_documents(limit=_MAX_SCAN)["items"]
+        }
+        unique: list[dict[str, Any]] = []
+        for item in cleaned:
+            if item["content"] in existing:
+                skipped += 1
+                continue
+            existing.add(item["content"])
+            unique.append(item)
+        if not unique:
+            return {"imported": 0, "skipped": skipped}
+
+        # 分块嵌入 / 插入，控制大文件（CLI 导入）的峰值内存
+        for start in range(0, len(unique), _IMPORT_CHUNK):
+            result = agent.add_documents(unique[start : start + _IMPORT_CHUNK])
+            if result.get("status") != "success":
+                raise RuntimeError(str(result.get("message") or "导入知识片段失败"))
+            imported.extend(int(doc_id) for doc_id in (result.get("ids") or []))
+    return {"imported": len(imported), "skipped": skipped}
 
 
 def delete_document(doc_id: int) -> bool:

@@ -46,7 +46,7 @@ from context.storage import (
     create_long_term_memory,
     describe_backends,
 )
-from utils.access_log import format_access_log
+from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.doctor import run_doctor
@@ -624,13 +624,14 @@ def _ics_date(value: str) -> str | None:
 
 
 def _ics_escape(value: str) -> str:
-    """按 RFC 5545 转义文本字段。"""
+    """按 RFC 5545 转义文本字段（含孤立的 CR，避免破坏行结构）。"""
     return (
         str(value)
         .replace("\\", "\\\\")
         .replace(";", "\\;")
         .replace(",", "\\,")
         .replace("\r\n", "\\n")
+        .replace("\r", "\\n")
         .replace("\n", "\\n")
     )
 
@@ -1234,11 +1235,18 @@ def main() -> None:
     args = parser.parse_args()
 
     configure_stdio()
-    # uvicorn 只配置自己的日志：为应用日志（访问日志 / 智能体等）补一个根 handler
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    # uvicorn 只配置自己的日志：为应用日志（访问日志 / 智能体等）补一个根 handler。
+    # LOG_FORMAT=json 时整行输出 JSON（time / level / logger + 访问日志字段），
+    # 而不是在 JSON 前拼文本前缀。
+    if access_log_format() == "json":
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonLogFormatter())
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
     try:
         application = create_app()
     except Exception as exc:  # noqa: BLE001 - 启动失败时给出友好提示

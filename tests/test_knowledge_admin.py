@@ -237,6 +237,37 @@ def test_import_empty_and_missing_db(monkeypatch):
     print("✓ 空导入返回 0；知识库缺失时报错")
 
 
+def test_import_chunks_large_documents(monkeypatch):
+    """大文件按块嵌入 / 插入，控制峰值内存。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin, "list_documents", lambda limit, offset=0: {"total": 0, "items": []}
+    )
+
+    class _BatchAgent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append([item["content"] for item in documents])
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _BatchAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    documents = [{"content": f"item-{i}"} for i in range(1200)]
+    result = knowledge_admin.import_documents(documents)
+    assert result == {"imported": 1200, "skipped": 0}
+    assert [len(batch) for batch in agent.calls] == [500, 500, 200]
+    print("✓ 大文件导入按 500 条分块嵌入 / 插入")
+
+
 if __name__ == "__main__":
     for case in (
         test_list_documents_parses_sorts_and_filters,
@@ -249,6 +280,7 @@ if __name__ == "__main__":
         test_export_documents_sorted_and_stripped,
         test_import_documents_sanitizes,
         test_import_skips_existing_and_duplicate_content,
+        test_import_chunks_large_documents,
         test_import_empty_and_missing_db,
     ):
         mp = pytest.MonkeyPatch()

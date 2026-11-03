@@ -132,6 +132,63 @@ def test_store_open_failure(monkeypatch):
     print("✓ 存储打开失败返回 1")
 
 
+def test_skips_group_when_keeper_deleted_concurrently(monkeypatch):
+    """删除前复核：保留者已被并发删除时，跳过该组，避免删掉仅剩副本。"""
+    fake = _FakeStore([_trip("trip_1"), _trip("trip_2")])
+    original = fake.get_trip_history
+    calls = {"n": 0}
+
+    def second_read_without_keeper(limit=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original(limit)
+        return [trip for trip in fake.trips if trip["trip_id"] != "trip_1"]
+
+    fake.get_trip_history = second_read_without_keeper
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u1")
+    assert code == 0
+    assert fake.deleted == [], "保留者已不存在时不应删除仅剩的副本"
+    assert "没有需要删除的重复行程" in out
+    print("✓ 保留者被并发删除时跳过该组")
+
+
+def test_delete_failure_returns_1(monkeypatch):
+    class _FailDeleteStore(_FakeStore):
+        def delete_trip(self, trip_id):
+            raise RuntimeError("disk error")
+
+    fake = _FailDeleteStore([_trip("trip_1"), _trip("trip_2")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u1")
+    assert code == 1 and "删除过程中失败" in out
+    print("✓ 删除过程中失败返回 1")
+
+
+def test_pg_configured_but_json_fallback(monkeypatch):
+    """PostgreSQL 配置错误时工厂会回退 JSON，维护命令必须拒绝执行。"""
+    from config import STORAGE_CONFIG
+    from context import long_term_memory as ltm
+
+    class _JsonStore:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ltm, "LongTermMemory", _JsonStore)
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://localhost/x")
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: _JsonStore()
+    )
+    code, out = _run("u1")
+    assert code == 1
+    assert "回退本地 JSON" in out
+    print("✓ PostgreSQL 回退时拒绝执行去重")
+
+
 if __name__ == "__main__":
     for case in (
         test_dedupes_and_keeps_first,
@@ -140,6 +197,9 @@ if __name__ == "__main__":
         test_invalid_user_id,
         test_read_failure,
         test_store_open_failure,
+        test_skips_group_when_keeper_deleted_concurrently,
+        test_delete_failure_returns_1,
+        test_pg_configured_but_json_fallback,
     ):
         mp = pytest.MonkeyPatch()
         try:
