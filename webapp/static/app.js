@@ -101,6 +101,7 @@ const els = {
   closeMemory: byId("closeMemory"),
   saveUser: byId("saveUser"),
   exportData: byId("exportData"),
+  exportDataMd: byId("exportDataMd"),
   overview: byId("overview"),
   trips: byId("trips"),
   stats: byId("stats"),
@@ -1730,6 +1731,12 @@ function bindEvents() {
   els.saveUser.addEventListener("click", saveUser);
   els.exportData.addEventListener("click", () => {
     window.open(`/api/export?user_id=${encodeURIComponent(state.userId)}`, "_blank");
+  });
+  els.exportDataMd.addEventListener("click", () => {
+    window.open(
+      `/api/export?user_id=${encodeURIComponent(state.userId)}&format=md`,
+      "_blank",
+    );
   });
 
   els.themeToggle.addEventListener("click", () => {

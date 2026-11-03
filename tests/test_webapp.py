@@ -438,6 +438,50 @@ def test_session_rename():
         _cleanup(user_id)
 
 
+def test_export_markdown():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_md")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_preference("hotel_brands", ["汉庭"])
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-11-09",
+                    "purpose": "出差",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-md-export"},
+        )
+
+        response = client.get("/api/export", params={"user_id": user_id, "format": "md"})
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/markdown")
+        assert "attachment" in response.headers.get("content-disposition", "")
+        text = response.text
+        assert "# Aligo 用户数据导出" in text
+        assert "hotel_brands：汉庭" in text
+        assert "北京 → 上海" in text
+        assert "## 最近会话" in text and "你好" in text
+
+        invalid = client.get("/api/export", params={"user_id": user_id, "format": "pdf"})
+        assert invalid.status_code == 422
+        print("✓ 用户数据导出 Markdown（JSON 仍为默认）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -471,6 +515,7 @@ if __name__ == "__main__":
     test_request_id_header()
     test_chat_rate_limit()
     test_session_rename()
+    test_export_markdown()
     test_invalid_user_id_rejected()
     test_export_attachment()
     print("\n全部通过")
