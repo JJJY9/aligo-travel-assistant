@@ -13,11 +13,11 @@
 | 对话与执行路线（浅色） | 深色模式 |
 |---|---|
 | ![对话与执行路线](docs/screenshots/webui-answer-light.jpg) | ![深色模式](docs/screenshots/webui-answer-dark.jpg) |
-| **执行中的智能体路线**（SSE 实时推送） | **欢迎页** |
-| ![执行路线](docs/screenshots/webui-trace.jpg) | ![欢迎页](docs/screenshots/webui-welcome.jpg) |
+| **记忆与用量面板**（偏好 / 行程 / 7 天趋势） | **欢迎页**（会话搜索 / 置顶） |
+| ![记忆与用量面板](docs/screenshots/webui-memory.jpg) | ![欢迎页](docs/screenshots/webui-welcome.jpg) |
 
 界面为 **FastAPI + 无构建前端**（原生 HTML / CSS / JS，无需 Node），支持流式执行进度、
-会话历史、深浅主题与移动端布局，启动方式见「Web 界面」小节。
+会话搜索 / 重命名 / 置顶、记忆与用量面板、深浅主题与移动端布局，启动方式见「Web 界面」小节。
 
 ## ✨ 核心亮点
 
