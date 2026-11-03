@@ -246,6 +246,14 @@
         <h3>模型用量</h3>
         <div class="stat-grid" id="usageStats"></div>
         <div class="chips usage-agents" id="usageAgents"></div>
+        <div class="usage-trend" id="usageTrend" hidden>
+          <div class="usage-trend-head">
+            <span>近 7 天 tokens</span>
+            <span id="usageTrendTotal"></span>
+          </div>
+          <div class="usage-chart" id="usageChart" role="img" aria-label="近 7 天模型 tokens 用量柱状图"></div>
+          <table class="sr-only" id="usageTable"></table>
+        </div>
       </section>
     </div>
   </div>

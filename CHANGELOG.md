@@ -16,6 +16,7 @@
 - 会话重命名：侧栏内联编辑标题（`PUT /api/sessions/{id}/title`），JSON / PostgreSQL 持久化；自定义标题参与搜索，空标题恢复自动标题
 - 会话置顶：侧栏图钉按钮置顶 / 取消置顶（`PUT /api/sessions/{id}/pin`），置顶会话进入「置顶」分组并优先展示，JSON / PostgreSQL 持久化
 - 行程记录关联来源会话：保存行程时写入 `session_id`（PostgreSQL 自动加列），记忆面板点击行程可回到对应对话
+- 模型用量趋势：`/api/status` 的 `usage.by_day` 按消息时间聚合最近 7 天 calls / tokens，记忆面板新增柱状图（悬停提示 + 屏幕阅读器表格）
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 
