@@ -579,7 +579,7 @@ pytest tests/ -q
 |------|------|
 | Web API / SSE / 会话 / 导出 / 知识库接口 / 自检 | `test_webapp.py` |
 | 编排调度与记忆更新 | `test_orchestration_unit.py`、`test_orchestration.py` |
-| 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py` |
+| 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py`、`test_webapp_postgres.py` |
 | 知识库维护与状态 | `test_knowledge_admin*.py`、`test_knowledge_stats.py` |
 | 检索评测与 CLI 退出码 | `test_rag_eval.py`、`test_cli_eval.py` |
 | CLI 知识库 / 行程命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py` |
