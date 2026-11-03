@@ -546,6 +546,18 @@ a { color: var(--teal); }
 }
 .msg-foot .usage { margin-left: auto; font-family: var(--mono); font-size: 10.5px; }
 
+.follow-ups { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.follow-up {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.follow-up:hover { border-color: var(--accent); color: var(--accent); }
+
 .chip {
   display: inline-flex;
   align-items: center;
