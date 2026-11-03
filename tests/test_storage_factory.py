@@ -97,6 +97,23 @@ def test_long_term_delete_preference():
     print("✓ 长期记忆删除偏好")
 
 
+def test_session_titles():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-title", tempfile.mkdtemp())
+    memory.add_chat_message("user", "hi", "s1")
+    memory.set_session_title("s1", " 杭州出差 ")
+    assert memory.get_session_titles() == {"s1": "杭州出差"}
+
+    memory.set_session_title("s1", "")
+    assert memory.get_session_titles() == {}
+
+    memory.set_session_title("s1", "标题")
+    memory.delete_chat_session("s1")
+    assert memory.get_session_titles() == {}
+    print("✓ 会话标题设置 / 清除 / 随会话删除")
+
+
 class _CountingModel:
     """记录调用次数的假模型（用于验证总结缓存）。"""
 
@@ -158,6 +175,7 @@ if __name__ == "__main__":
     test_memory_manager_uses_factory()
     test_long_term_delete_session()
     test_long_term_delete_preference()
+    test_session_titles()
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()
     print("\n全部通过")

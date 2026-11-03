@@ -129,6 +129,11 @@ class PreferencePayload(BaseModel):
     value: PreferenceValue
 
 
+class SessionTitlePayload(BaseModel):
+    user_id: str = Field(pattern=_ID_PATTERN)
+    title: str = Field(max_length=60)
+
+
 class _WebSession:
     """一个浏览器会话（对应一个 ConversationRuntime）。"""
 
@@ -252,6 +257,7 @@ def _load_user_data(user_id: str) -> dict[str, Any]:
             "preferences": store.get_preference(),
             "trip_history": store.get_trip_history(limit=None),
             "chat_history": store.get_chat_history(),
+            "session_titles": store.get_session_titles(),
             "statistics": store.get_statistics(),
         }
     finally:
@@ -306,6 +312,7 @@ def _group_sessions(
     history: list[dict[str, Any]],
     limit: int,
     query: str = "",
+    titles: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。"""
     needle = query.strip().lower()
@@ -332,8 +339,17 @@ def _group_sessions(
                 entry["snippet"] = snippet
 
     sessions = sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
+    custom_titles = titles or {}
+    for entry in sessions:
+        custom = custom_titles.get(entry["session_id"])
+        if custom:
+            entry["title"] = custom
     if needle:
-        sessions = [entry for entry in sessions if entry.get("snippet")]
+        sessions = [
+            entry
+            for entry in sessions
+            if entry.get("snippet") or needle in str(entry.get("title", "")).lower()
+        ]
     for entry in sessions:
         if not entry["title"]:
             entry["title"] = "新对话"
@@ -457,7 +473,8 @@ def create_app(model: Any = None) -> FastAPI:
         q: str = Query(default="", max_length=100),
     ) -> dict[str, Any]:
         data = _load_user_data(user_id)
-        return {"sessions": _group_sessions(data["chat_history"], limit, q)}
+        titles = data.get("session_titles") or {}
+        return {"sessions": _group_sessions(data["chat_history"], limit, q, titles)}
 
     @app.get("/api/sessions/{session_id}")
     def get_session_messages(
@@ -483,6 +500,20 @@ def create_app(model: Any = None) -> FastAPI:
                 for message in messages
             ],
         }
+
+    @app.put("/api/sessions/{session_id}/title")
+    def rename_session(
+        payload: SessionTitlePayload,
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """设置或清除会话自定义标题（空标题恢复自动标题）。"""
+        store = _open_long_term(payload.user_id)
+        try:
+            store.set_session_title(session_id, payload.title)
+            saved = (store.get_session_titles() or {}).get(session_id, "")
+        finally:
+            _close_long_term(store)
+        return {"session_id": session_id, "title": saved}
 
     @app.get("/api/sessions/{session_id}/export")
     def export_session(

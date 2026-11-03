@@ -77,6 +77,8 @@ class LongTermMemory:
         # 1. 确保必需字段存在
         if "chat_history" not in data:
             data["chat_history"] = []
+        if not isinstance(data.get("session_titles"), dict):
+            data["session_titles"] = {}
         if "trip_history" not in data:
             data["trip_history"] = []
         if "statistics" not in data:
@@ -129,6 +131,7 @@ class LongTermMemory:
             "updated_at": datetime.now().isoformat(),
             "preferences": [],  # 偏好列表: [{"type": "home_location", "value": "天津"}, ...]
             "chat_history": [],  # 所有聊天记录（跨会话）
+            "session_titles": {},  # 会话自定义标题 {session_id: title}
             "trip_history": [],  # 所有行程记录
             "statistics": {
                 "total_trips": 0,
@@ -307,11 +310,27 @@ class LongTermMemory:
         removed = len(messages) - len(remaining)
         if removed:
             self.data["chat_history"] = remaining
+            self.data.get("session_titles", {}).pop(session_id, None)
             stats = self.data["statistics"]
             stats["total_messages"] = max(0, stats.get("total_messages", 0) - removed)
             self._save()
             logger.info(f"Deleted chat session: {session_id} ({removed} messages)")
         return removed
+
+    def set_session_title(self, session_id: str, title: str) -> None:
+        """设置会话自定义标题；空标题表示恢复自动标题。"""
+        titles = self.data.setdefault("session_titles", {})
+        cleaned = title.strip()
+        if cleaned:
+            titles[session_id] = cleaned[:60]
+        else:
+            titles.pop(session_id, None)
+        self._save()
+        logger.info(f"Set session title: {session_id} -> {cleaned or '(auto)'}")
+
+    def get_session_titles(self) -> dict[str, str]:
+        """返回全部会话自定义标题。"""
+        return dict(self.data.get("session_titles") or {})
 
     def save_trip_history(self, trip_info: dict[str, Any]):
         """
