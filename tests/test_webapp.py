@@ -498,6 +498,41 @@ def test_chat_rate_limit():
         _cleanup(other_id)
 
 
+def test_chat_rate_limit_ip_bucket():
+    """用户 ID 由请求方提供、可轮换；同一客户端 IP 仍受总量桶约束。"""
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=100, window_sec=60)  # 用户桶放宽
+    state.ip_limiter = RateLimiter(limit=2, window_sec=60)      # IP 桶收紧
+    client = TestClient(app)
+
+    users = []
+    try:
+        for i in range(2):
+            user_id = _unique_user(f"web_test_ip_{i}")
+            users.append(user_id)
+            response = client.post(
+                "/api/chat",
+                json={"message": "你好", "user_id": user_id, "session_id": f"sess-ip-{i}"},
+            )
+            assert response.status_code == 200
+
+        rotated = _unique_user("web_test_ip_rotated")
+        users.append(rotated)
+        limited = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": rotated, "session_id": "sess-ip-rotated"},
+        )
+        assert limited.status_code == 429, "轮换用户 ID 不应绕过客户端 IP 限流"
+        assert limited.headers["Retry-After"].isdigit()
+        print("✓ 轮换用户 ID 仍受客户端 IP 限流约束")
+    finally:
+        for user_id in users:
+            _cleanup(user_id)
+
+
 def test_session_rename():
     client = _client()
     user_id = _unique_user("web_test_title")
@@ -734,6 +769,7 @@ if __name__ == "__main__":
     test_request_id_header()
     test_security_headers()
     test_chat_rate_limit()
+    test_chat_rate_limit_ip_bucket()
     test_session_rename()
     test_session_pin()
     test_export_markdown()

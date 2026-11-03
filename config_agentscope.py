@@ -90,6 +90,20 @@ class UsageTrackingModel:
         return getattr(self._model, item)
 
 
+def unwrap_usage_model(model):
+    """返回用量跟踪包装下的底层模型；非包装模型原样返回。"""
+    return model._model if isinstance(model, UsageTrackingModel) else model
+
+
+def wrap_usage_tracking(model):
+    """为单个会话创建独立的用量跟踪包装。
+
+    底层模型（HTTP 客户端 / 连接池）仍共享，只把计数分开，避免多会话并发时
+    各自的 token 增量互相污染（甚至出现负数）。
+    """
+    return UsageTrackingModel(unwrap_usage_model(model))
+
+
 def create_chat_model(
     api_key: str | None = None,
     model_name: str | None = None,

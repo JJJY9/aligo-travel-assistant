@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -38,7 +39,7 @@ from pydantic import BaseModel, Field
 
 from agents.conversation import ConversationRuntime
 from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG
-from config_agentscope import create_chat_model, init_agentscope
+from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tracking
 from context.storage import (
     clear_short_term_session,
     create_long_term_memory,
@@ -200,6 +201,11 @@ class AligoWebApp:
             limit=RATE_LIMIT_CONFIG.get("chat_requests", 30),
             window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
         )
+        # 用户 ID 由请求方提供、可以轮换；再按纯客户端 IP 限流，防止换 ID 绕过
+        self.ip_limiter = RateLimiter(
+            limit=RATE_LIMIT_CONFIG.get("ip_requests", 120),
+            window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
+        )
 
     def get_session(self, user_id: str, session_id: str | None) -> _WebSession:
         if not session_id:
@@ -210,7 +216,8 @@ class AligoWebApp:
             self.drop_session(session_id)
             session = None
         if session is None:
-            session = _WebSession(user_id, session_id, self.model, self.breaker)
+            # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
+            session = _WebSession(user_id, session_id, wrap_usage_tracking(self.model), self.breaker)
             self.sessions[session_id] = session
             while len(self.sessions) > self.max_sessions:
                 _, evicted = self.sessions.popitem(last=False)
@@ -243,15 +250,18 @@ def _request_id(request: Request) -> str:
 
 
 def _enforce_rate_limit(state: AligoWebApp, user_id: str, request: Request) -> None:
-    """对对话接口做简单滑动窗口限流（按 客户端 + 用户）。"""
+    """对对话接口做滑动窗口限流（按 客户端 + 用户，以及客户端 IP 两个维度）。"""
     client = request.client.host if request.client else "unknown"
     retry_after = state.rate_limiter.check(f"{client}:{user_id}")
-    if retry_after is None:
+    ip_retry_after = state.ip_limiter.check(client)
+    if retry_after is None and ip_retry_after is None:
         return
+    # HTTP Retry-After 需要整数秒，向上取整并至少 1 秒
+    wait_seconds = max(1, math.ceil(max(retry_after or 0.0, ip_retry_after or 0.0)))
     raise HTTPException(
         status_code=429,
-        detail=f"请求过于频繁，请约 {retry_after:.0f} 秒后重试（请求 ID：{_request_id(request)}）",
-        headers={"Retry-After": str(retry_after)},
+        detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
+        headers={"Retry-After": str(wait_seconds)},
     )
 
 

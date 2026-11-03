@@ -73,9 +73,10 @@ class RAGKnowledgeAgent(AgentBase):
         self.model = model
         
         if knowledge_base_path is None:
-            # Default to local data directory in skill folder
-            current_dir = Path(__file__).parent.parent
-            knowledge_base_path = str(current_dir / "data" / "rag_knowledge")
+            # 与 Web / CLI / doctor 共用同一套路径解析（Skill 数据目录优先）
+            from utils.knowledge_paths import default_knowledge_dir
+
+            knowledge_base_path = str(default_knowledge_dir())
 
         self.knowledge_base_path = Path(knowledge_base_path)
         self.collection_name = collection_name
@@ -119,16 +120,17 @@ class RAGKnowledgeAgent(AgentBase):
         milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
 
-        self.milvus_client = get_milvus_client(milvus_db_path)
+        self._milvus_db_path = milvus_db_path
         self._client_created_at = None  # 用于追踪客户端创建时间
+        client = self.milvus_client
 
         # 检查collection是否存在
-        if self.milvus_client.has_collection(collection_name):
+        if client.has_collection(collection_name):
             logger.info(f"Loaded existing collection: {collection_name}")
         else:
             # 创建新collection
             logger.info(f"Creating new collection: {collection_name}")
-            self.milvus_client.create_collection(
+            client.create_collection(
                 collection_name=collection_name,
                 dimension=self.embedding_dim,
                 metric_type="COSINE",  # 余弦相似度
@@ -137,8 +139,12 @@ class RAGKnowledgeAgent(AgentBase):
             logger.info(f"Created new collection: {collection_name}")
 
         self.initialized = True
-        self._milvus_db_path = milvus_db_path  # 保存路径用于重连
         logger.info("RAG Knowledge Agent (Milvus Lite) initialized successfully")
+
+    @property
+    def milvus_client(self):
+        """每次从共享注册表取当前客户端，避免重连后其它会话持有已关闭句柄。"""
+        return get_milvus_client(self._milvus_db_path)
 
     def _ensure_connection(self):
         """确保 Milvus 连接正常，如果需要则重新创建客户端"""
@@ -148,10 +154,9 @@ class RAGKnowledgeAgent(AgentBase):
         except Exception as e:
             logger.warning(f"Milvus connection issue detected: {e}, reconnecting...")
             try:
-                # 丢弃并关闭旧共享客户端，再重新创建
+                # 丢弃并关闭旧共享客户端；属性会重新创建并取到新实例
                 reset_milvus_client(self._milvus_db_path)
-
-                self.milvus_client = get_milvus_client(self._milvus_db_path)
+                self.milvus_client.has_collection(self.collection_name)
                 logger.info("Milvus client reconnected successfully")
             except Exception as reconnect_error:
                 logger.error(f"Failed to reconnect Milvus: {reconnect_error}")
