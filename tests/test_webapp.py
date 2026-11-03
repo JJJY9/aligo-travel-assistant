@@ -687,6 +687,16 @@ def test_trip_calendar_export():
         _cleanup(user_id)
 
 
+def test_knowledge_endpoint():
+    data = _client().get("/api/knowledge").json()
+    assert "available" in data and "collection" in data
+    if data["available"]:
+        assert data["documents"] >= 0
+    else:
+        assert data.get("reason")
+    print("✓ /api/knowledge 返回知识库状态")
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -705,6 +715,7 @@ def test_export_attachment():
 if __name__ == "__main__":
     test_index_page()
     test_health_endpoint()
+    test_knowledge_endpoint()
     test_status_endpoint()
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()

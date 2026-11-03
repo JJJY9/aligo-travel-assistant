@@ -899,6 +899,24 @@ def run_doctor_standalone() -> int:
     return 1 if has_failures(results) else 0
 
 
+def run_knowledge_status_standalone() -> int:
+    """打印知识库状态（用于 `python cli.py kb`），不进入交互式 CLI。
+
+    Returns:
+        0 知识库可用；1 未初始化或不可用
+    """
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if status.get("available"):
+        print(f"知识库：{status['collection']} · {status['documents']} 片段")
+        print(f"数据库：{status['path']}")
+        return 0
+    print(f"知识库不可用：{status.get('reason', '未知原因')}")
+    print(f"数据库：{status.get('path', '')}")
+    return 1
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -908,6 +926,8 @@ def main():
             sys.exit(run_health_check_standalone())
         if arg == "doctor":
             sys.exit(run_doctor_standalone())
+        if arg == "kb":
+            sys.exit(run_knowledge_status_standalone())
     cli = AligoCLI()
     asyncio.run(cli.run())
 

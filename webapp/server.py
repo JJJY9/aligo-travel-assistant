@@ -46,6 +46,7 @@ from context.storage import (
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
+from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import extract_turn_meta
@@ -596,6 +597,11 @@ def create_app(model: Any = None) -> FastAPI:
             "storage": describe_backends(),
             "time": datetime.now().isoformat(timespec="seconds"),
         }
+
+    @app.get("/api/knowledge")
+    def knowledge() -> dict[str, Any]:
+        """知识库状态（集合 / 片段数 / 是否可用）。"""
+        return knowledge_status()
 
     @app.get("/api/status")
     def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:
