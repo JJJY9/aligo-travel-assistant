@@ -1446,6 +1446,24 @@ function renderOverview() {
           openSession(trip.session_id);
         });
       }
+
+      const calendar = document.createElement("button");
+      calendar.type = "button";
+      calendar.className = "trip-calendar";
+      calendar.title = "加入日历（.ics）";
+      calendar.setAttribute("aria-label", "加入日历");
+      calendar.innerHTML = icon("calendar");
+      calendar.addEventListener("click", (event) => {
+        event.stopPropagation();
+        window.open(
+          `/api/trips/${encodeURIComponent(trip.trip_id)}/calendar?user_id=${encodeURIComponent(
+            state.userId,
+          )}`,
+          "_blank",
+        );
+      });
+      row.appendChild(calendar);
+
       els.trips.appendChild(row);
     });
   }

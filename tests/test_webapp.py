@@ -576,6 +576,54 @@ def test_session_pin():
         _cleanup(user_id)
 
 
+def test_trip_calendar_export():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_ics")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-11-09",
+                    "end_date": "2026-11-11",
+                    "purpose": "出差",
+                    "session_id": "sess-ics",
+                }
+            )
+            store.save_trip_history(
+                {"origin": "北京", "destination": "上海", "purpose": "旅游"}
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        response = client.get(
+            "/api/trips/trip_1/calendar", params={"user_id": user_id}
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/calendar")
+        assert "attachment" in response.headers.get("content-disposition", "")
+        text = response.text
+        assert "BEGIN:VCALENDAR" in text
+        assert "DTSTART;VALUE=DATE:20261109" in text
+        assert "DTEND;VALUE=DATE:20261112" in text, "全天事件结束日期应为次日（exclusive）"
+        assert "北京 → 杭州" in text
+
+        missing = client.get("/api/trips/trip_999/calendar", params={"user_id": user_id})
+        assert missing.status_code == 404
+
+        no_date = client.get("/api/trips/trip_2/calendar", params={"user_id": user_id})
+        assert no_date.status_code == 400
+        print("✓ 行程导出 iCalendar（含日期校验）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -613,6 +661,7 @@ if __name__ == "__main__":
     test_session_rename()
     test_session_pin()
     test_export_markdown()
+    test_trip_calendar_export()
     test_invalid_user_id_rejected()
     test_export_attachment()
     print("\n全部通过")
