@@ -38,7 +38,10 @@ const PREF_NAMES = {
 };
 
 const state = {
-  userId: localStorage.getItem("aligo.userId") || "web_user",
+  userId:
+    sessionStorage.getItem("aligo.userId") ||
+    localStorage.getItem("aligo.userId") ||
+    "web_user",
   sessionId: sessionStorage.getItem("aligo.sessionId") || null,
   sessions: [],
   searchQuery: "",
@@ -60,7 +63,8 @@ function isValidId(value) {
     const urlUser = params.get("user");
     if (urlUser && isValidId(urlUser)) {
       state.userId = urlUser;
-      localStorage.setItem("aligo.userId", urlUser);
+      // 分享链接只作为当前标签页的临时身份，不覆盖本地长期身份
+      sessionStorage.setItem("aligo.userId", urlUser);
     }
     const urlSession = params.get("session");
     if (urlSession && isValidId(urlSession)) {
@@ -124,6 +128,7 @@ const els = {
 let welcomeTemplate = null;
 let sessionLoadToken = 0;
 let sessionsRequestId = 0;
+let searchTimer = null;
 
 /* ---------- 基础工具 ---------- */
 
@@ -145,14 +150,25 @@ function escapeHtml(text) {
 }
 
 function highlightSnippet(text, query) {
-  const escaped = escapeHtml(text);
+  const source = String(text ?? "");
   const needle = String(query || "").trim();
-  if (!needle) return escaped;
-  const pattern = new RegExp(
-    escapeHtml(needle).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-    "gi",
-  );
-  return escaped.replace(pattern, (match) => `<mark>${match}</mark>`);
+  if (!needle) return escapeHtml(source);
+
+  const lowerSource = source.toLowerCase();
+  const lowerNeedle = needle.toLowerCase();
+  let cursor = 0;
+  let found = lowerSource.indexOf(lowerNeedle, cursor);
+  if (found < 0) return escapeHtml(source);
+
+  const parts = [];
+  while (found >= 0) {
+    parts.push(escapeHtml(source.slice(cursor, found)));
+    parts.push(`<mark>${escapeHtml(source.slice(found, found + needle.length))}</mark>`);
+    cursor = found + needle.length;
+    found = lowerSource.indexOf(lowerNeedle, cursor);
+  }
+  parts.push(escapeHtml(source.slice(cursor)));
+  return parts.join("");
 }
 
 function clampText(text, max) {
@@ -992,6 +1008,7 @@ function renderHistoryItem(session) {
 
   item.addEventListener("click", () => openSession(session.session_id));
   item.addEventListener("keydown", (event) => {
+    if (event.target !== item) return;
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       openSession(session.session_id);
@@ -1168,6 +1185,7 @@ function startRenameSession(item, session) {
   input.addEventListener("click", (event) => event.stopPropagation());
   input.addEventListener("keydown", (event) => {
     event.stopPropagation();
+    if (event.isComposing) return;
     if (event.key === "Enter") {
       event.preventDefault();
       save();
@@ -1395,7 +1413,8 @@ function renderOverview() {
   }
 
   const preferences = Object.entries(status.preferences || {}).filter(([, value]) => {
-    return Array.isArray(value) ? value.length : Boolean(value);
+    if (Array.isArray(value)) return value.length > 0;
+    return value !== null && value !== undefined && value !== "";
   });
   if (!preferences.length) {
     els.overview.innerHTML =
@@ -1500,7 +1519,7 @@ function renderOverview() {
     els.destinations.appendChild(chip);
   });
 
-  renderUpcoming(trips);
+  renderUpcoming(status.next_trip || pickUpcomingTrip(trips));
 
   const stats = [
     ["历史行程", status.trip_count || 0],
@@ -1637,7 +1656,7 @@ function renderUsageTrend(usage) {
   els.usageTable.append(caption, thead, tbody);
 }
 
-function renderUpcoming(trips) {
+function pickUpcomingTrip(trips) {
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
     now.getDate(),
@@ -1647,22 +1666,49 @@ function renderUpcoming(trips) {
     .sort((a, b) => {
       const byDate = String(a.start_date).localeCompare(String(b.start_date));
       if (byDate !== 0) return byDate;
-      // 同一天的行程优先选择能跳回对话的记录
       return (b.session_id ? 1 : 0) - (a.session_id ? 1 : 0);
     })[0];
+  return upcoming || null;
+}
 
-  if (!upcoming) {
+function renderUpcoming(trip) {
+  if (!trip) {
     els.upcoming.hidden = true;
     return;
   }
   els.upcoming.hidden = false;
-  els.upcoming.dataset.session = upcoming.session_id || "";
-  els.upcomingRoute.textContent = `${upcoming.origin || "—"} → ${
-    upcoming.destination || "—"
-  }`;
-  els.upcomingDate.textContent = `${upcoming.start_date}${
-    upcoming.end_date ? ` ~ ${upcoming.end_date}` : ""
-  } · ${upcoming.purpose || "出行"}`;
+  els.upcoming.dataset.session = trip.session_id || "";
+  els.upcomingRoute.textContent = `${trip.origin || "—"} → ${trip.destination || "—"}`;
+  els.upcomingDate.textContent = `${trip.start_date}${
+    trip.end_date ? ` ~ ${trip.end_date}` : ""
+  } · ${trip.purpose || "出行"}`;
+}
+
+function preferenceInputValue(value) {
+  if (Array.isArray(value)) return value.join("、");
+  if (value !== null && typeof value === "object") return JSON.stringify(value);
+  return String(value ?? "");
+}
+
+function preferenceOutputValue(original, text) {
+  if (Array.isArray(original)) {
+    return text
+      .split(/[、，]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  const trimmed = text.trim();
+  if (
+    typeof original === "number" &&
+    trimmed !== "" &&
+    !Number.isNaN(Number(trimmed))
+  ) {
+    return Number(trimmed);
+  }
+  if (typeof original === "boolean" && /^(true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === "true";
+  }
+  return trimmed;
 }
 
 function startEditPreference(row, type, currentValue) {
@@ -1671,9 +1717,7 @@ function startEditPreference(row, type, currentValue) {
 
   const input = document.createElement("input");
   input.className = "pref-input";
-  input.value = Array.isArray(currentValue)
-    ? currentValue.join("、")
-    : String(currentValue ?? "");
+  input.value = preferenceInputValue(currentValue);
   valueEl.replaceWith(input);
   input.focus();
   input.select();
@@ -1694,12 +1738,13 @@ function startEditPreference(row, type, currentValue) {
       return;
     }
     settled = true;
-    const value = Array.isArray(currentValue)
-      ? text
-          .split(/[、,，]/)
-          .map((item) => item.trim())
-          .filter(Boolean)
-      : text;
+    const value = preferenceOutputValue(currentValue, text);
+    if (Array.isArray(value) && !value.length) {
+      settled = false;
+      toast("偏好内容不能为空");
+      input.focus();
+      return;
+    }
     try {
       await getJSON(`/api/preferences/${encodeURIComponent(type)}`, {
         method: "PUT",
@@ -1716,6 +1761,7 @@ function startEditPreference(row, type, currentValue) {
   };
 
   input.addEventListener("keydown", (event) => {
+    if (event.isComposing) return;
     if (event.key === "Enter") {
       event.preventDefault();
       save();
@@ -1864,8 +1910,10 @@ async function saveUser() {
     state.userId = value;
     els.historySearch.value = "";
     state.searchQuery = "";
+    clearTimeout(searchTimer);
     try {
       localStorage.setItem("aligo.userId", value);
+      sessionStorage.setItem("aligo.userId", value);
     } catch {
       /* 忽略 */
     }
@@ -1928,14 +1976,13 @@ function bindEvents() {
     newSession();
   });
 
-  let searchTimer = null;
   els.historySearch.addEventListener("input", () => {
     clearTimeout(searchTimer);
     const value = els.historySearch.value;
     searchTimer = setTimeout(() => loadSessions(value), 250);
   });
   els.historySearch.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
+    if (event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
       clearTimeout(searchTimer);
       loadSessions(els.historySearch.value);
@@ -2004,6 +2051,7 @@ function bindEvents() {
     }
     if (event.key === "Escape") {
       if (document.activeElement === els.historySearch && els.historySearch.value) {
+        clearTimeout(searchTimer);
         els.historySearch.value = "";
         loadSessions("");
         return;
