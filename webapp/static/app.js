@@ -129,6 +129,8 @@ const els = {
   kbList: byId("kbList"),
   kbSearch: byId("kbSearch"),
   kbMore: byId("kbMore"),
+  kbImport: byId("kbImport"),
+  kbImportFile: byId("kbImportFile"),
   kbForm: byId("kbForm"),
   kbContent: byId("kbContent"),
   kbCategory: byId("kbCategory"),
@@ -2078,6 +2080,55 @@ async function addKnowledgeDocument(event) {
   }
 }
 
+const KB_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+
+async function importKnowledgeFile() {
+  const file = els.kbImportFile.files && els.kbImportFile.files[0];
+  els.kbImportFile.value = "";
+  if (!file) return;
+  if (file.size > KB_IMPORT_MAX_BYTES) {
+    toast("JSON 文件不能超过 2 MB");
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    toast("无法解析 JSON 文件");
+    return;
+  }
+  const documents = Array.isArray(data)
+    ? data
+    : data && Array.isArray(data.documents)
+      ? data.documents
+      : null;
+  if (!documents || !documents.length) {
+    toast("文件中没有知识片段（需要 documents 数组）");
+    return;
+  }
+  if (documents.length > 200) {
+    toast("单次最多导入 200 条知识片段");
+    return;
+  }
+  if (!window.confirm(`导入 ${documents.length} 条知识片段？`)) return;
+  els.kbImport.disabled = true;
+  els.kbImport.textContent = "导入中…";
+  try {
+    const result = await getJSON("/api/knowledge/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ documents }),
+    });
+    toast(`已导入 ${result.imported || 0} 条知识片段`);
+    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    els.kbImport.disabled = false;
+    els.kbImport.textContent = "导入 JSON";
+  }
+}
+
 const DOCTOR_MARKS = { ok: "✓", warn: "⚠", fail: "✗", skip: "—" };
 
 async function runDoctorCheck() {
@@ -2186,6 +2237,8 @@ function bindEvents() {
   });
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
+  els.kbImport.addEventListener("click", () => els.kbImportFile.click());
+  els.kbImportFile.addEventListener("change", importKnowledgeFile);
   els.kbSearch.addEventListener("input", () => {
     clearTimeout(kbSearchTimer);
     kbSearchTimer = setTimeout(() => {

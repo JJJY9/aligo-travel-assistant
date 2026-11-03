@@ -153,6 +153,63 @@ def test_search_documents_delegates_to_agent(monkeypatch):
     print("✓ 语义检索委托 RAG Agent")
 
 
+def test_export_documents_sorted_and_stripped(monkeypatch):
+    fake = _FakeMilvusClient(
+        [
+            {"id": 3, "content": "c3", "metadata": "{}"},
+            {"id": 1, "content": "c1", "metadata": '{"category": "a"}'},
+            {"id": 2, "content": "c2", "metadata": ""},
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    documents = knowledge_admin.export_documents()
+    assert [item["content"] for item in documents] == ["c1", "c2", "c3"]
+    assert all("id" not in item for item in documents), "导出不含数据库 id，导入时重新分配"
+    assert documents[0]["metadata"] == {"category": "a"}
+    print("✓ 导出知识片段（按 id 升序 / 不含 id）")
+
+
+def test_import_documents_sanitizes(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    agent = _FakeAgent({"status": "success", "ids": [1, 2], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    result = knowledge_admin.import_documents(
+        [
+            {"content": "  a  ", "metadata": {"category": "x"}},
+            {"content": ""},
+            "not-a-dict",
+            {
+                "content": "b" * 2100,
+                "metadata": {f"k{i}": "v" * 300 for i in range(15)},
+            },
+        ]
+    )
+    assert result == {"imported": 2, "skipped": 2}
+    sent = agent.calls[0]
+    assert sent[0]["content"] == "a"
+    assert sent[1]["content"] == "b" * 2000
+    assert len(sent[1]["metadata"]) == 10
+    assert max(len(value) for value in sent[1]["metadata"].values()) == 200
+    print("✓ 导入知识片段（跳过空项 / 截断超长字段）")
+
+
+def test_import_empty_and_missing_db(monkeypatch):
+    from pathlib import Path
+
+    result = knowledge_admin.import_documents([{"content": "  "}, None])
+    assert result == {"imported": 0, "skipped": 2}
+
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda: Path("missing/milvus_lite.db")
+    )
+    with pytest.raises(FileNotFoundError, match="知识库未初始化"):
+        knowledge_admin.import_documents([{"content": "x"}])
+    print("✓ 空导入返回 0；知识库缺失时报错")
+
+
 if __name__ == "__main__":
     for case in (
         test_list_documents_parses_sorts_and_filters,
@@ -162,6 +219,9 @@ if __name__ == "__main__":
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,
         test_search_documents_delegates_to_agent,
+        test_export_documents_sorted_and_stripped,
+        test_import_documents_sanitizes,
+        test_import_empty_and_missing_db,
     ):
         mp = pytest.MonkeyPatch()
         try:

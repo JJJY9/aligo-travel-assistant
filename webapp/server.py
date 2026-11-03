@@ -49,7 +49,13 @@ from context.storage import (
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.doctor import run_doctor
-from utils.knowledge_admin import add_document, delete_document, list_documents
+from utils.knowledge_admin import (
+    add_document,
+    delete_document,
+    export_documents,
+    import_documents,
+    list_documents,
+)
 from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
 from utils.result_formatter import result_to_markdown
@@ -211,6 +217,19 @@ class KnowledgeDocumentPayload(BaseModel):
     metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] = Field(
         default_factory=dict, max_length=10
     )
+
+
+class KnowledgeImportItem(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] = Field(
+        default_factory=dict, max_length=10
+    )
+
+
+class KnowledgeImportPayload(BaseModel):
+    """批量导入知识片段（单次最多 200 条）。"""
+
+    documents: list[KnowledgeImportItem] = Field(min_length=1, max_length=200)
 
 
 class PreferencePayload(BaseModel):
@@ -753,6 +772,44 @@ def create_app(model: Any = None) -> FastAPI:
         if not removed:
             raise HTTPException(status_code=404, detail="知识片段不存在")
         return {"id": doc_id, "deleted": True}
+
+    @app.get("/api/knowledge/export")
+    def knowledge_export() -> Response:
+        """导出全部知识片段为 JSON 文件（备份 / 迁移）。"""
+        try:
+            documents = export_documents()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
+            logger.warning("导出知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
+        payload = {
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "documents": documents,
+        }
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="aligo-knowledge.json"'
+            },
+        )
+
+    @app.post("/api/knowledge/import")
+    def knowledge_import(payload: KnowledgeImportPayload) -> dict[str, Any]:
+        """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。"""
+        try:
+            return import_documents([item.model_dump() for item in payload.documents])
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
+            logger.warning("导入知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"导入失败：{exc}") from exc
 
     @app.get("/api/status")
     def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:

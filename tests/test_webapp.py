@@ -932,6 +932,50 @@ def test_knowledge_metadata_limits():
     print("✓ 知识片段 metadata 键数 / 长度受限")
 
 
+def test_knowledge_transfer_api(monkeypatch):
+    """知识库导出 / 导入接口：下载头、参数校验与导入数量映射。"""
+    from webapp import server as server_module
+
+    client = _client()
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [{"content": "a", "metadata": {"category": "测试"}}],
+    )
+    exported = client.get("/api/knowledge/export")
+    assert exported.status_code == 200
+    assert "attachment" in exported.headers["content-disposition"]
+    payload = exported.json()
+    assert payload["documents"] == [{"content": "a", "metadata": {"category": "测试"}}]
+    assert payload["version"] == 1
+
+    calls = {}
+
+    def fake_import(documents):
+        calls["documents"] = documents
+        return {"imported": len(documents), "skipped": 0}
+
+    monkeypatch.setattr(server_module, "import_documents", fake_import)
+    imported = client.post(
+        "/api/knowledge/import",
+        json={"documents": [{"content": "x", "metadata": {"category": "c"}}]},
+    )
+    assert imported.status_code == 200
+    assert imported.json()["imported"] == 1
+    assert calls["documents"] == [{"content": "x", "metadata": {"category": "c"}}]
+
+    assert (
+        client.post("/api/knowledge/import", json={"documents": []}).status_code == 422
+    )
+    too_many = [{"content": "x"} for _ in range(201)]
+    assert (
+        client.post("/api/knowledge/import", json={"documents": too_many}).status_code
+        == 422
+    )
+    print("✓ /api/knowledge/export 与 /api/knowledge/import")
+
+
 def test_next_trip_from_full_history():
     from datetime import datetime, timedelta
 
@@ -1031,6 +1075,11 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_knowledge_metadata_limits()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_knowledge_transfer_api(_mp)
+    finally:
+        _mp.undo()
     test_status_endpoint()
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()
