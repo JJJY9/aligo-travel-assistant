@@ -36,6 +36,14 @@ pytest tests/ -q
 pip install -r requirements-ci.txt
 ```
 
+### 提交前钩子（可选）
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
+之后每次 `git commit` 会自动运行 ruff 与基础文件检查（配置见 `.pre-commit-config.yaml`）。
+
 ## 分支与提交规范
 
 - 分支命名：`feat/简短说明`、`fix/简短说明`、`docs/简短说明`、`chore/简短说明`
@@ -49,6 +57,16 @@ pip install -r requirements-ci.txt
 - 关联相关 Issue（正文写 `Closes #123`）
 - 提交前确保 CI 全绿（ruff / mypy / pytest）
 - PR 标题与描述请使用中文
+
+## 发布
+
+推送 `v*` 标签会触发 `.github/workflows/release.yml`：自动构建 sdist/wheel 并创建 GitHub Release。
+
+```bash
+git tag v1.0.1 && git push origin v1.0.1
+```
+
+发布前请同步更新 `CHANGELOG.md`。
 
 ## 敏感信息
 
