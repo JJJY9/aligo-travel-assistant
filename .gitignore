@@ -23,6 +23,11 @@ wheels/
 .installed.cfg
 *.egg
 
+# 工具缓存（pytest / mypy / ruff）
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # IDEs
 .vscode/
 .idea/
