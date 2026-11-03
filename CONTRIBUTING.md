@@ -1,0 +1,62 @@
+# 贡献指南
+
+感谢你愿意参与改进 Aligo 智能旅行助手！请遵循以下约定。
+
+## 沟通语言
+
+本仓库的 Issue、Pull Request 标题与描述、提交信息统一使用**中文**（代码标识符与注释可用英文）。
+
+## 开发环境
+
+```bash
+# 1. 安装运行依赖（含 RAG 重型依赖，首次安装较慢）
+pip install -r requirements.txt
+
+# 2. 配置大模型 API Key（二选一，密钥切勿提交到仓库）
+#    方式一：在项目根目录创建 config_local.py，内容为：API_KEY = "sk-..."
+#    方式二：设置环境变量 LLM_API_KEY
+```
+
+## 本地检查（提交前必须通过）
+
+```bash
+# 代码风格检查
+ruff check .
+
+# 类型检查
+mypy .
+
+# 回归测试（不需要 API Key，使用确定性 mock 模型）
+pytest tests/ -q
+```
+
+如果不想安装 torch / pymilvus 等重型依赖，可以只安装轻量测试依赖（与 CI 环境一致）：
+
+```bash
+pip install -r requirements-ci.txt
+```
+
+## 分支与提交规范
+
+- 分支命名：`feat/简短说明`、`fix/简短说明`、`docs/简短说明`、`chore/简短说明`
+- 提交信息采用 [Conventional Commits](https://www.conventionalcommits.org/) 前缀（`feat` / `fix` / `docs` / `chore` / `test` / `refactor`），描述使用中文
+- 一个提交只做一件事，避免混合无关改动
+
+## Pull Request
+
+- 标题格式：`类型: 中文描述`，例如 `fix: 修复偏好查询永远为空的问题`
+- 使用仓库的 PR 模板（创建 PR 时自动带出），完整填写变更说明与验证方式
+- 关联相关 Issue（正文写 `Closes #123`）
+- 提交前确保 CI 全绿（ruff / mypy / pytest）
+- PR 标题与描述请使用中文
+
+## 敏感信息
+
+- **不要提交任何 API Key、密码、内网地址**；
+- 本地配置请放在 `config_local.py`（已在 `.gitignore` 中）；
+- `data/memory/`、`data/models/`、向量库文件等运行时产物同样不应提交。
+
+## Issue 规范
+
+- Bug 反馈请使用 Bug 模板，附上复现步骤、期望结果、实际结果与环境信息；
+- 功能建议请使用 Feature 模板，说明使用场景与期望行为。
