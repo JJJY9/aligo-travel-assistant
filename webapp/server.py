@@ -934,12 +934,22 @@ def create_app(model: Any = None) -> FastAPI:
     def list_sessions(
         user_id: str = Query(..., pattern=_ID_PATTERN),
         limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
     ) -> dict[str, Any]:
         data = _load_user_data(user_id)
         titles = data.get("session_titles") or {}
         pinned = data.get("pinned_sessions") or []
-        return {"sessions": _group_sessions(data["chat_history"], limit, q, titles, pinned)}
+        sessions = _group_sessions(
+            data["chat_history"], 1_000_000, q, titles, pinned
+        )
+        total = len(sessions)
+        return {
+            "sessions": sessions[offset : offset + limit],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
 
     @app.get("/api/sessions/{session_id}")
     def get_session_messages(

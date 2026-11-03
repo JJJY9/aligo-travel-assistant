@@ -1203,3 +1203,17 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-size: 12.5px;
 }
 .trip-form-row .ghost { flex: none; }
+
+/* 侧栏「加载更多会话」 */
+.history-more {
+  display: block;
+  margin: 8px auto 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--sidebar-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--sidebar-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.history-more:hover { color: var(--sidebar-ink); }

@@ -56,6 +56,7 @@ const state = {
   kbDeleting: new Set(),
   kbImporting: false,
   tripEditingId: null,
+  sessionTotal: 0,
 };
 
 function isValidId(value) {
@@ -1238,6 +1239,15 @@ function renderHistory() {
     groups.get(label).push(session);
   });
   groups.forEach((items, label) => addSection(label, items));
+
+  if (state.sessions.length < state.sessionTotal) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "history-more";
+    more.textContent = `加载更多会话（已显示 ${state.sessions.length} / 共 ${state.sessionTotal}）`;
+    more.addEventListener("click", loadMoreSessions);
+    els.history.appendChild(more);
+  }
 }
 
 async function togglePin(session) {
@@ -1254,23 +1264,56 @@ async function togglePin(session) {
   }
 }
 
-async function loadSessions(query = state.searchQuery) {
+async function loadSessions(query = state.searchQuery, options = {}) {
   state.searchQuery = String(query || "").trim();
   const requestId = (sessionsRequestId += 1);
-  const queryParam = state.searchQuery
-    ? `&q=${encodeURIComponent(state.searchQuery)}`
-    : "";
+  // 重置（搜索 / 切换用户）取第一页；其它刷新（重命名 / 置顶 / 删除）
+  // 保留用户已经「加载更多」展开的数量
+  const limit = options.reset
+    ? 50
+    : Math.min(200, Math.max(50, state.sessions.length));
+  const params = new URLSearchParams({
+    user_id: state.userId,
+    limit: String(limit),
+    offset: "0",
+  });
+  if (state.searchQuery) params.set("q", state.searchQuery);
   try {
-    const data = await getJSON(
-      `/api/sessions?user_id=${encodeURIComponent(state.userId)}${queryParam}`,
-    );
+    const data = await getJSON(`/api/sessions?${params}`);
     if (requestId !== sessionsRequestId) return;
     state.sessions = data.sessions || [];
+    state.sessionTotal = Number(data.total || state.sessions.length);
   } catch {
     if (requestId !== sessionsRequestId) return;
     state.sessions = [];
+    state.sessionTotal = 0;
   }
   renderHistory();
+}
+
+async function loadMoreSessions() {
+  const requestId = (sessionsRequestId += 1);
+  const params = new URLSearchParams({
+    user_id: state.userId,
+    limit: "50",
+    offset: String(state.sessions.length),
+  });
+  if (state.searchQuery) params.set("q", state.searchQuery);
+  try {
+    const data = await getJSON(`/api/sessions?${params}`);
+    if (requestId !== sessionsRequestId) return;
+    const seen = new Set(state.sessions.map((session) => session.session_id));
+    for (const session of data.sessions || []) {
+      if (!seen.has(session.session_id)) {
+        seen.add(session.session_id);
+        state.sessions.push(session);
+      }
+    }
+    state.sessionTotal = Number(data.total || state.sessionTotal);
+    renderHistory();
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 async function openSession(sessionId, options = {}) {
@@ -2488,7 +2531,7 @@ async function saveUser() {
     setConversationTitle("新对话");
     showWelcome();
     updateUserCard();
-    await loadSessions();
+    await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
   closeMemorySheet();
@@ -2565,13 +2608,13 @@ function bindEvents() {
   els.historySearch.addEventListener("input", () => {
     clearTimeout(searchTimer);
     const value = els.historySearch.value;
-    searchTimer = setTimeout(() => loadSessions(value), 250);
+    searchTimer = setTimeout(() => loadSessions(value, { reset: true }), 250);
   });
   els.historySearch.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
       clearTimeout(searchTimer);
-      loadSessions(els.historySearch.value);
+      loadSessions(els.historySearch.value, { reset: true });
     }
   });
 
@@ -2660,7 +2703,7 @@ function bindEvents() {
       if (document.activeElement === els.historySearch && els.historySearch.value) {
         clearTimeout(searchTimer);
         els.historySearch.value = "";
-        loadSessions("");
+        loadSessions("", { reset: true });
         return;
       }
       closeMemorySheet();

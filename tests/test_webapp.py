@@ -778,6 +778,47 @@ def test_update_trip_api():
         _cleanup(user_id)
 
 
+def test_sessions_pagination():
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_paging")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for index in range(6):
+                store.add_chat_message("user", f"消息 {index}", f"page-{index}")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        first = client.get(
+            "/api/sessions", params={"user_id": user_id, "limit": 2}
+        ).json()
+        assert first["total"] == 6
+        assert len(first["sessions"]) == 2
+        assert first["offset"] == 0 and first["limit"] == 2
+
+        second = client.get(
+            "/api/sessions", params={"user_id": user_id, "limit": 2, "offset": 2}
+        ).json()
+        assert len(second["sessions"]) == 2
+        first_ids = {item["session_id"] for item in first["sessions"]}
+        second_ids = {item["session_id"] for item in second["sessions"]}
+        assert not (first_ids & second_ids), "分页之间不应重复"
+
+        search = client.get(
+            "/api/sessions",
+            params={"user_id": user_id, "q": "消息 3", "limit": 2, "offset": 0},
+        ).json()
+        assert search["total"] == 1
+        assert "消息 3" in search["sessions"][0]["title"]
+        print("✓ 会话列表分页（total / offset / 去重 / 搜索）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -1415,6 +1456,7 @@ if __name__ == "__main__":
     test_delete_trip_api()
     test_create_trip_api()
     test_update_trip_api()
+    test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:
         test_delete_trip_storage_failure_maps_503(_mp)
