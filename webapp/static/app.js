@@ -145,6 +145,7 @@ let welcomeTemplate = null;
 let sessionLoadToken = 0;
 let sessionsRequestId = 0;
 let searchTimer = null;
+let memorySheetOpener = null;
 
 /* ---------- 基础工具 ---------- */
 
@@ -2222,16 +2223,51 @@ function renderDoctorChecks(checks) {
   }
 }
 
+function memorySheetFocusable() {
+  const card = els.memorySheet.querySelector(".sheet-card");
+  if (!card) return [];
+  return [
+    ...card.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), ' +
+        'select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    ),
+  ].filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+function trapMemorySheetFocus(event) {
+  if (event.key !== "Tab") return;
+  const focusable = memorySheetFocusable();
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  const inside = els.memorySheet.contains(active);
+  if (event.shiftKey && (active === first || !inside)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (active === last || !inside)) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function openMemorySheet() {
+  memorySheetOpener = document.activeElement;
   els.userIdInput.value = state.userId;
   els.memorySheet.hidden = false;
+  els.closeMemory.focus();
   refreshStatus();
   refreshKnowledge();
   refreshKnowledgeDocuments();
 }
 
 function closeMemorySheet() {
+  if (els.memorySheet.hidden) return;
   els.memorySheet.hidden = true;
+  if (memorySheetOpener && memorySheetOpener.isConnected) {
+    memorySheetOpener.focus();
+  }
+  memorySheetOpener = null;
 }
 
 async function saveUser() {
@@ -2356,6 +2392,7 @@ function bindEvents() {
 
   byId("openMemory").addEventListener("click", openMemorySheet);
   els.closeMemory.addEventListener("click", closeMemorySheet);
+  els.memorySheet.addEventListener("keydown", trapMemorySheetFocus);
   els.memorySheet.addEventListener("click", (event) => {
     if (event.target === els.memorySheet) closeMemorySheet();
   });
