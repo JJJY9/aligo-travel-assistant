@@ -1113,6 +1113,21 @@ def create_app(model: Any = None) -> FastAPI:
             },
         )
 
+    @app.delete("/api/trips/{trip_id}")
+    def delete_trip(
+        trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """删除一条历史行程（清理误记录）。"""
+        store = _open_long_term(user_id)
+        try:
+            removed = store.delete_trip(trip_id)
+        finally:
+            _close_long_term(store)
+        if not removed:
+            raise HTTPException(status_code=404, detail="行程不存在")
+        return {"trip_id": trip_id, "deleted": True}
+
     @app.get("/api/export")
     def export(
         user_id: str = Query(..., pattern=_ID_PATTERN),
