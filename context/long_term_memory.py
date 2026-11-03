@@ -79,6 +79,8 @@ class LongTermMemory:
             data["chat_history"] = []
         if not isinstance(data.get("session_titles"), dict):
             data["session_titles"] = {}
+        if not isinstance(data.get("pinned_sessions"), list):
+            data["pinned_sessions"] = []
         if "trip_history" not in data:
             data["trip_history"] = []
         if "statistics" not in data:
@@ -132,6 +134,7 @@ class LongTermMemory:
             "preferences": [],  # 偏好列表: [{"type": "home_location", "value": "天津"}, ...]
             "chat_history": [],  # 所有聊天记录（跨会话）
             "session_titles": {},  # 会话自定义标题 {session_id: title}
+            "pinned_sessions": [],  # 置顶会话 ID（列表有序）
             "trip_history": [],  # 所有行程记录
             "statistics": {
                 "total_trips": 0,
@@ -308,13 +311,26 @@ class LongTermMemory:
         messages = self.data["chat_history"]
         remaining = [m for m in messages if m.get("session_id") != session_id]
         removed = len(messages) - len(remaining)
+        titles = self.data.get("session_titles") or {}
+        pinned_sessions = self.data.get("pinned_sessions") or []
+        metadata_changed = session_id in titles or session_id in pinned_sessions
+
         if removed:
             self.data["chat_history"] = remaining
-            self.data.get("session_titles", {}).pop(session_id, None)
             stats = self.data["statistics"]
             stats["total_messages"] = max(0, stats.get("total_messages", 0) - removed)
+
+        if removed or metadata_changed:
+            self.data.get("session_titles", {}).pop(session_id, None)
+            if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
+                pinned_sessions.remove(session_id)
             self._save()
-            logger.info(f"Deleted chat session: {session_id} ({removed} messages)")
+            logger.info(
+                "Deleted chat session: %s (%s messages, metadata=%s)",
+                session_id,
+                removed,
+                metadata_changed,
+            )
         return removed
 
     def set_session_title(self, session_id: str, title: str) -> None:
@@ -331,6 +347,19 @@ class LongTermMemory:
     def get_session_titles(self) -> dict[str, str]:
         """返回全部会话自定义标题。"""
         return dict(self.data.get("session_titles") or {})
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> None:
+        """置顶 / 取消置顶会话。"""
+        pinned_sessions = self.data.setdefault("pinned_sessions", [])
+        if pinned and session_id not in pinned_sessions:
+            pinned_sessions.append(session_id)
+        elif not pinned and session_id in pinned_sessions:
+            pinned_sessions.remove(session_id)
+        self._save()
+
+    def get_pinned_sessions(self) -> list[str]:
+        """返回置顶会话 ID（按置顶时间先后）。"""
+        return list(self.data.get("pinned_sessions") or [])
 
     def save_trip_history(self, trip_info: dict[str, Any]):
         """

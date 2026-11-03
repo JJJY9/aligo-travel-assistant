@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS aligo_session_titles (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, session_id)
 );
+
+CREATE TABLE IF NOT EXISTS aligo_pinned_sessions (
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    pinned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, session_id)
+);
 """
 
 
@@ -211,6 +218,10 @@ class PostgresLongTermMemory:
                 "DELETE FROM aligo_session_titles WHERE user_id = %s AND session_id = %s",
                 (self.user_id, session_id),
             )
+            cursor.execute(
+                "DELETE FROM aligo_pinned_sessions WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
         if removed:
             logger.info(
                 "Deleted chat session from PostgreSQL: %s (%s messages)", session_id, removed
@@ -243,6 +254,29 @@ class PostgresLongTermMemory:
             (self.user_id,),
         )
         return {session_id: title for session_id, title in rows}
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> None:
+        """置顶 / 取消置顶会话。"""
+        if pinned:
+            self._execute(
+                "INSERT INTO aligo_pinned_sessions (user_id, session_id) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING",
+                (self.user_id, session_id),
+            )
+        else:
+            self._execute(
+                "DELETE FROM aligo_pinned_sessions WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
+
+    def get_pinned_sessions(self) -> list[str]:
+        """返回置顶会话 ID（按置顶时间先后）。"""
+        rows = self._fetchall(
+            "SELECT session_id FROM aligo_pinned_sessions WHERE user_id = %s "
+            "ORDER BY pinned_at, session_id",
+            (self.user_id,),
+        )
+        return [row[0] for row in rows]
 
     # ---------- 历史行程 ----------
 

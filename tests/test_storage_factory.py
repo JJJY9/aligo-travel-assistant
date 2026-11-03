@@ -114,6 +114,26 @@ def test_session_titles():
     print("✓ 会话标题设置 / 清除 / 随会话删除")
 
 
+def test_session_pinned():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-pin", tempfile.mkdtemp())
+    memory.add_chat_message("user", "hi", "s1")
+    memory.set_session_pinned("s1", True)
+    memory.set_session_pinned("s2", True)
+    assert memory.get_pinned_sessions() == ["s1", "s2"]
+
+    memory.set_session_pinned("s1", False)
+    assert memory.get_pinned_sessions() == ["s2"]
+
+    memory.set_session_pinned("s2", True)  # 幂等
+    assert memory.get_pinned_sessions() == ["s2"]
+
+    memory.delete_chat_session("s2")
+    assert memory.get_pinned_sessions() == []
+    print("✓ 会话置顶 / 取消 / 随会话删除")
+
+
 class _CountingModel:
     """记录调用次数的假模型（用于验证总结缓存）。"""
 
@@ -176,6 +196,7 @@ if __name__ == "__main__":
     test_long_term_delete_session()
     test_long_term_delete_preference()
     test_session_titles()
+    test_session_pinned()
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()
     print("\n全部通过")
