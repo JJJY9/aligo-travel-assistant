@@ -22,6 +22,7 @@
 - 打印 / 导出 PDF：顶栏打印按钮 + 打印样式（隐藏侧栏 / 输入区 / 执行路线 / 操作按钮，用户消息浅灰、回答正文黑色）
 - 会话搜索命中片段支持关键词高亮；记忆面板「最近行程」下方展示常去目的地（Top 5）
 - RAG 回答附带 Top 3 参考片段（140 字截断），便于核对知识来源
+- Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 
