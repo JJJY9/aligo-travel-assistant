@@ -29,6 +29,7 @@
 - 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
 - 知识库导出 / 导入：`GET /api/knowledge/export` 下载 JSON 备份，`POST /api/knowledge/import` 批量导入（单次最多 200 条，超长字段自动截断）；记忆面板新增「导出知识库 / 导入 JSON」；CLI 对应 `python cli.py kb-export [path]` 与 `kb-import <file>`
 - CLI 知识片段管理：`python cli.py kb-list [关键词]` 列出片段（分类 + 预览），`python cli.py kb-delete <id>` 删除片段
+- CLI 行程去重：`python cli.py trips-dedupe <user_id>` 清理去重功能上线前已存在的重复行程（保留最早一条，统计同步更新）
 - 行程管理：记忆面板可删除误记录的行程（`DELETE /api/trips/{id}`），JSON / PostgreSQL 同步更新统计与常去目的地
 - 会话导出 HTML：顶栏新增「导出对话（HTML）」，生成内嵌样式的单文件 HTML（去除执行路线与操作按钮，可直接分享 / 打印 / 离线查看）
 - 行程日历导出全部：`GET /api/trips/calendar` 把一个用户的历史行程合并为一个 `.ics`（缺少出发日期的跳过），记忆面板「最近行程」标题右侧新增「导出全部日历」
@@ -97,6 +98,7 @@
 - 新增偏好抽取输入选择用例（优先用户原话 / 回退重写查询）与编排上下文 `user_query` 用例
 - 新增全部行程日历用例（多事件合并 / 跳过缺日期行程 / 空列表；接口附件头与事件数）
 - 新增访问日志格式用例（默认文本 / JSON 字段 / `LOG_FORMAT` 环境变量切换）
+- 新增 CLI `trips-dedupe` 用例（去重保留最早 / 无日期跳过 / 空列表 / 非法 ID / 读取失败 / 打开失败）
 - 新增 Milvus 客户端首次打开重试用例（一次失败后成功 / 持续失败上抛且不缓存坏客户端）
 - CI 回归测试附加覆盖率报告（`pytest-cov`，仅展示不设阈值；本地全量环境覆盖率更高）
 
