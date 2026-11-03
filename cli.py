@@ -1099,6 +1099,67 @@ def run_knowledge_delete_standalone(doc_id: int) -> int:
     return 0
 
 
+def run_trips_dedupe_standalone(user_id: str) -> int:
+    """清理历史行程中的完全重复记录（用于 `python cli.py trips-dedupe <user_id>`）。
+
+    同路线 + 同起止日期视为重复：保留最早一条，删除其余记录（统计同步更新）。
+
+    Returns:
+        0 清理完成（含无重复）；1 参数 / 读取失败
+    """
+    import re
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+
+    from context.storage import create_long_term_memory
+
+    try:
+        store = create_long_term_memory(user_id, "data/memory")
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+
+    try:
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取行程失败：{exc}")
+            return 1
+
+        seen: set[tuple[str, str, str, str]] = set()
+        duplicates: list[str] = []
+        for trip in trips:
+            start_date = str(trip.get("start_date") or "")
+            if not start_date:
+                continue
+            key = (
+                str(trip.get("origin") or ""),
+                str(trip.get("destination") or ""),
+                start_date,
+                str(trip.get("end_date") or ""),
+            )
+            if key in seen:
+                duplicates.append(str(trip.get("trip_id") or ""))
+            else:
+                seen.add(key)
+
+        removed = 0
+        for trip_id in duplicates:
+            if trip_id and store.delete_trip(trip_id):
+                removed += 1
+        if duplicates:
+            print(f"用户 {user_id}：删除 {removed} 条重复行程（保留最早记录）")
+        else:
+            print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
+        return 0
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -1127,6 +1188,11 @@ def main():
                 print("用法：python cli.py kb-delete <id>")
                 sys.exit(2)
             sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
+        if arg == "trips-dedupe":
+            if len(sys.argv) < 3:
+                print("用法：python cli.py trips-dedupe <user_id>")
+                sys.exit(2)
+            sys.exit(run_trips_dedupe_standalone(sys.argv[2]))
     cli = AligoCLI()
     asyncio.run(cli.run())
 

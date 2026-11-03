@@ -478,6 +478,8 @@ python cli.py
 
 知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 60 字预览）；`python cli.py kb-delete <id>` 删除指定片段。
 
+历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id>` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），可清理去重功能上线前已存在的重复记录。
+
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
 
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。
