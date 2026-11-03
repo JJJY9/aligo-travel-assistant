@@ -46,6 +46,7 @@ from context.storage import (
     create_long_term_memory,
     describe_backends,
 )
+from utils.access_log import format_access_log
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.doctor import run_doctor
@@ -179,12 +180,14 @@ class RequestContextMiddleware:
             if path.startswith("/api/"):
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 logger.info(
-                    "%s %s -> %s (%.0fms) [%s]",
-                    scope.get("method", ""),
-                    path,
-                    status_code,
-                    elapsed_ms,
-                    request_id,
+                    "%s",
+                    format_access_log(
+                        scope.get("method", ""),
+                        path,
+                        status_code,
+                        elapsed_ms,
+                        request_id,
+                    ),
                 )
 
 
@@ -1231,6 +1234,11 @@ def main() -> None:
     args = parser.parse_args()
 
     configure_stdio()
+    # uvicorn 只配置自己的日志：为应用日志（访问日志 / 智能体等）补一个根 handler
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     try:
         application = create_app()
     except Exception as exc:  # noqa: BLE001 - 启动失败时给出友好提示
