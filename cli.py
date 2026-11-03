@@ -965,6 +965,91 @@ def run_rag_eval_standalone(min_hit5: float = 0.8) -> int:
     return 0
 
 
+def run_knowledge_export_standalone(target: str | None = None) -> int:
+    """导出知识库为 JSON 文件（用于 `python cli.py kb-export [path]`）。
+
+    Returns:
+        0 导出成功；1 知识库不可用或写入失败
+    """
+    from pathlib import Path
+
+    from utils.knowledge_admin import export_documents
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"导出失败：知识库不可用（{status.get('reason', '未知原因')}）")
+        return 1
+
+    try:
+        documents = export_documents()
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"导出失败：{exc}")
+        return 1
+
+    from datetime import datetime, timezone
+
+    payload = {
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "documents": documents,
+    }
+    path = Path(target) if target else Path("exports") / "knowledge-export.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"写入失败：{exc}")
+        return 1
+    print(f"已导出 {len(documents)} 条知识片段到 {path}")
+    return 0
+
+
+def run_knowledge_import_standalone(source: str) -> int:
+    """从 JSON 文件批量导入知识片段（用于 `python cli.py kb-import <file>`）。
+
+    Returns:
+        0 导入成功；1 文件 / 格式 / 知识库错误
+    """
+    from pathlib import Path
+
+    from utils.knowledge_admin import import_documents
+
+    path = Path(source)
+    if not path.exists():
+        print(f"文件不存在：{path}")
+        return 1
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"读取失败：{exc}")
+        return 1
+
+    documents = (
+        data
+        if isinstance(data, list)
+        else data.get("documents")
+        if isinstance(data, dict)
+        else None
+    )
+    if not isinstance(documents, list) or not documents:
+        print("文件中没有知识片段（需要 documents 数组或纯数组）")
+        return 1
+    if len(documents) > 200:
+        print(f"单次最多导入 200 条，当前 {len(documents)} 条")
+        return 1
+
+    try:
+        result = import_documents(documents)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"导入失败：{exc}")
+        return 1
+    print(f"已导入 {result['imported']} 条知识片段，跳过 {result['skipped']} 条")
+    return 0
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -978,6 +1063,13 @@ def main():
             sys.exit(run_knowledge_status_standalone())
         if arg == "eval":
             sys.exit(run_rag_eval_standalone())
+        if arg == "kb-export":
+            sys.exit(run_knowledge_export_standalone(sys.argv[2] if len(sys.argv) > 2 else None))
+        if arg == "kb-import":
+            if len(sys.argv) < 3:
+                print("用法：python cli.py kb-import <file.json>")
+                sys.exit(2)
+            sys.exit(run_knowledge_import_standalone(sys.argv[2]))
     cli = AligoCLI()
     asyncio.run(cli.run())
 

@@ -26,7 +26,7 @@
 - 知识库维护：记忆面板查看 / 新增 / 删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可检索，列表按 id 倒序显示最新片段；新增按最大 id 递增，删除后再添加不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1 / hit@3 / hit@5 与 MRR（只检索、不调用大模型），知识库未初始化时提示跳过，hit@5 低于 80% 退出码 1
 - 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
-- 知识库导出 / 导入：`GET /api/knowledge/export` 下载 JSON 备份，`POST /api/knowledge/import` 批量导入（单次最多 200 条，超长字段自动截断）；记忆面板新增「导出知识库 / 导入 JSON」
+- 知识库导出 / 导入：`GET /api/knowledge/export` 下载 JSON 备份，`POST /api/knowledge/import` 批量导入（单次最多 200 条，超长字段自动截断）；记忆面板新增「导出知识库 / 导入 JSON」；CLI 对应 `python cli.py kb-export [path]` 与 `kb-import <file>`
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
@@ -72,6 +72,7 @@
 - 新增 `next_entity_id`（load 顺序 / 最大 id / 查询失败传播）、知识库查询失败透传与 503 映射、metadata 限长、集成测试语义检索与“不覆盖已有片段”用例
 - 新增 `cli.py eval` 退出码语义用例（未初始化跳过 / 后端故障失败 / Agent 初始化失败 / 阈值与全量未命中提示）
 - 新增知识库导出（排序 / 不含 id）与导入（跳过空项 / 截断超长字段 / 空导入 / 未初始化）用例、导出下载头与导入参数校验接口用例
+- 新增 CLI `kb-export` / `kb-import` 用例（导出文件 / 未初始化 / 文件缺失 / 格式错误 / 批量上限 / 纯数组格式）
 
 ## [1.3.0] - 2026-11-03
 
