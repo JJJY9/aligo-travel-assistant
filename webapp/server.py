@@ -106,7 +106,7 @@ def _read_user_memory(user_id: str) -> dict[str, Any]:
 
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
-    app = FastAPI(title="Aligo 智能旅行助手", version="1.0.0")
+    app = FastAPI(title="Aligo 智能旅行助手", version="1.1.0")
     state = AligoWebApp(model=model)
     app.state.aligo = state
 
