@@ -58,6 +58,9 @@ class PostgresLongTermMemory:
     各方法在调用时直接查询数据库（无常驻内存快照），多会话 / 多进程写入天然一致。
     """
 
+    # 直接查询数据库，无内存快照，无需在多轮对话前重建
+    snapshot_based = False
+
     def __init__(self, user_id: str, dsn: str):
         import psycopg
 

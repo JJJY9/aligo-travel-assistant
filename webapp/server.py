@@ -21,7 +21,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +45,7 @@ from context.storage import (
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.result_formatter import result_to_markdown
+from utils.turn_meta import extract_turn_meta
 
 APP_VERSION = "1.2.0"
 
@@ -72,9 +76,17 @@ class _WebSession:
             circuit_breaker=breaker,
         )
 
+    def close(self) -> None:
+        """释放会话资源（PostgreSQL 连接等）。"""
+        self.runtime.close()
+
 
 class AligoWebApp:
     """应用状态：共享模型 / 熔断器 / 会话表。"""
+
+    # 进程内缓存的会话上限（超出后按最久未使用淘汰，避免长时间运行内存与连接增长）。
+    # 每个会话在 PostgreSQL 后端下持有 1 个连接，保守取 50，避免撞上数据库连接上限。
+    max_sessions = 50
 
     def __init__(self, model: Any = None) -> None:
         init_agentscope()
@@ -85,17 +97,38 @@ class AligoWebApp:
             recovery_timeout_sec=float(config.get("circuit_recovery_timeout_sec", 60.0)),
             half_open_successes=int(config.get("circuit_half_open_successes", 2)),
         )
-        self.sessions: dict[str, _WebSession] = {}
+        self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
 
     def get_session(self, user_id: str, session_id: str | None) -> _WebSession:
         if not session_id:
             session_id = uuid.uuid4().hex[:12]
         session = self.sessions.get(session_id)
-        if session is None or session.user_id != user_id:
+        if session is not None and session.user_id != user_id:
+            # 同一会话 ID 被另一个用户使用：丢弃旧会话，避免串用记忆
+            self.drop_session(session_id)
+            session = None
+        if session is None:
             session = _WebSession(user_id, session_id, self.model, self.breaker)
             self.sessions[session_id] = session
+            while len(self.sessions) > self.max_sessions:
+                _, evicted = self.sessions.popitem(last=False)
+                evicted.close()
+        else:
+            self.sessions.move_to_end(session_id)
         return session
+
+    def drop_session(self, session_id: str) -> None:
+        """移除并关闭一个会话。"""
+        session = self.sessions.pop(session_id, None)
+        if session is not None:
+            session.close()
+
+    def close_all(self) -> None:
+        """关闭所有会话（进程退出时调用）。"""
+        for session in list(self.sessions.values()):
+            session.close()
+        self.sessions.clear()
 
     def lock_for(self, user_id: str) -> asyncio.Lock:
         """同一用户的请求串行处理，避免长期记忆并发写覆盖。"""
@@ -117,6 +150,12 @@ def _close_long_term(store: Any) -> None:
     if callable(close):
         with contextlib.suppress(Exception):
             close()
+
+
+def _safe_filename(value: str, fallback: str = "aligo") -> str:
+    """把用户 / 会话 ID 转为只含 ASCII 的安全下载文件名。"""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", value)
+    return cleaned or fallback
 
 
 def _load_user_data(user_id: str) -> dict[str, Any]:
@@ -180,8 +219,14 @@ def _group_sessions(history: list[dict[str, Any]], limit: int) -> list[dict[str,
 
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
-    app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION)
     state = AligoWebApp(model=model)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        state.close_all()
+
+    app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
 
     if STATIC_DIR.is_dir():
@@ -239,11 +284,59 @@ def create_app(model: Any = None) -> FastAPI:
                 {
                     "role": message.get("role", "assistant"),
                     "content": _render_stored_message(message),
+                    "meta": extract_turn_meta(str(message.get("content", "")))
+                    if message.get("role") == "assistant"
+                    else None,
                     "timestamp": message.get("timestamp", ""),
                 }
                 for message in messages
             ],
         }
+
+    @app.get("/api/sessions/{session_id}/export")
+    def export_session(
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> Response:
+        """把一个会话导出为 Markdown（便于保存或分享行程）。"""
+        store = _open_long_term(user_id)
+        try:
+            messages = store.get_chat_history(session_id=session_id)
+        finally:
+            _close_long_term(store)
+        if not messages:
+            raise HTTPException(status_code=404, detail="会话不存在或没有消息")
+
+        title = "Aligo 对话"
+        for message in messages:
+            if message.get("role") == "user":
+                title = " ".join(str(message.get("content", "")).split())[:40] or title
+                break
+
+        lines = [
+            f"# {title}",
+            "",
+            f"- 用户：{user_id}",
+            f"- 会话：{session_id}",
+            f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
+            "",
+        ]
+        for message in messages:
+            is_user = message.get("role") == "user"
+            role = "用户" if is_user else "Aligo"
+            content = (
+                str(message.get("content", ""))
+                if is_user
+                else _render_stored_message(message)
+            )
+            lines.extend([f"## {role}", "", content.strip(), ""])
+
+        filename = f"aligo_{_safe_filename(session_id, 'conversation')}.md"
+        return Response(
+            content="\n".join(lines),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.delete("/api/sessions/{session_id}")
     def delete_session(
@@ -255,7 +348,7 @@ def create_app(model: Any = None) -> FastAPI:
             removed = store.delete_chat_session(session_id)
         finally:
             _close_long_term(store)
-        state.sessions.pop(session_id, None)
+        state.drop_session(session_id)
         clear_short_term_session(session_id)
         return {"session_id": session_id, "deleted": removed}
 
@@ -330,7 +423,9 @@ def create_app(model: Any = None) -> FastAPI:
         return Response(
             content=payload,
             media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="aligo_{user_id}.json"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="aligo_{_safe_filename(user_id)}.json"'
+            },
         )
 
     return app

@@ -20,6 +20,9 @@ class LongTermMemory:
     - 统计信息
     """
 
+    # JSON 实现把数据快照放在内存中，多会话写入后需要重新加载
+    snapshot_based = True
+
     def __init__(self, user_id: str, storage_path: str = "data/memory"):
         """
         初始化长期记忆

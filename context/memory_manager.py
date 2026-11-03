@@ -8,6 +8,7 @@ from typing import Any
 
 from .storage import create_long_term_memory, create_short_term_memory
 from utils.json_parser import extract_json_from_async_response
+from utils.turn_meta import strip_turn_meta
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ class MemoryManager:
         # 未配置或连接失败时回退进程内 / JSON 实现）
         self.short_term = create_short_term_memory(session_id, max_turns=10)
         self.long_term = create_long_term_memory(user_id, storage_path)
+        # 长期记忆总结缓存：同一会话内其它会话的历史未变化时不再重复调用 LLM
+        self._summary_cache: tuple[tuple, str] | None = None
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -102,7 +105,12 @@ class MemoryManager:
 
         多会话（如 Web 界面同时开多个标签页）/ 多进程写入后，内存中的快照可能
         过期；在一轮对话开始前调用本方法可避免覆盖其它会话刚写入的数据。
+
+        仅对基于内存快照的后端（JSON 文件）需要重建；PostgreSQL 每次调用直接
+        查询数据库，重建反而会每轮新建连接，故跳过。
         """
+        if not getattr(self.long_term, "snapshot_based", True):
+            return
         self.long_term = create_long_term_memory(self.user_id, self._storage_path)
 
     def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
@@ -176,11 +184,25 @@ class MemoryManager:
         if not history_from_other_sessions and not trip_history:
             return ""
 
+        # 同一会话内其它会话的历史 / 行程未变化时复用上次总结，避免每轮多一次 LLM 调用
+        fingerprint = (
+            len(history_from_other_sessions),
+            str(history_from_other_sessions[-1].get("timestamp", ""))
+            if history_from_other_sessions
+            else "",
+            len(trip_history),
+            str(trip_history[-1].get("timestamp", "")) if trip_history else "",
+        )
+        if self._summary_cache is not None and self._summary_cache[0] == fingerprint:
+            return self._summary_cache[1]
+
         # 构建聊天记录文本
         history_text = []
         for msg in history_from_other_sessions[-max_messages:]:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
+            if role == "assistant":
+                content = strip_turn_meta(str(content))
             timestamp = msg.get("timestamp", "")
             history_text.append(f"[{timestamp}] {role}: {content}")
 
@@ -228,6 +250,8 @@ class MemoryManager:
             summary = await extract_json_from_async_response(response)
 
             summary = summary.strip()
+            if summary:
+                self._summary_cache = (fingerprint, summary)
             logger.info(f"Generated long-term memory summary ({len(summary)} chars)")
             return summary
 
