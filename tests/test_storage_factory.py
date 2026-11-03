@@ -134,6 +134,56 @@ def test_session_pinned():
     print("✓ 会话置顶 / 取消 / 随会话删除")
 
 
+def test_add_message_preserves_metadata():
+    from context.long_term_memory import LongTermMemory
+    from context.memory_manager import MemoryManager
+
+    storage_path = tempfile.mkdtemp()
+    manager = MemoryManager("u-race", "s1", storage_path=storage_path)
+    manager.long_term.add_chat_message("user", "hi", "s1")
+
+    # 模拟对话进行期间，记忆面板另开存储写入标题 / 偏好
+    other = LongTermMemory("u-race", storage_path)
+    other.set_session_title("s1", "新标题")
+    other.save_preference("home_location", "北京")
+
+    manager.add_message("assistant", "yo")
+
+    again = LongTermMemory("u-race", storage_path)
+    assert again.get_session_titles()["s1"] == "新标题"
+    assert again.get_preference("home_location") == "北京"
+    assert [item["content"] for item in again.get_chat_history()] == ["hi", "yo"]
+    print("✓ 对话写入前重新加载，保留中途元数据")
+
+
+def test_clear_history_clears_metadata():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-clear", tempfile.mkdtemp())
+    memory.add_chat_message("user", "hi", "s1")
+    memory.set_session_title("s1", "标题")
+    memory.set_session_pinned("s1", True)
+
+    memory.clear_history()
+    assert memory.get_chat_history() == []
+    assert memory.get_session_titles() == {}
+    assert memory.get_pinned_sessions() == []
+    print("✓ clear_history 同时清理会话元数据")
+
+
+def test_export_data_includes_session_metadata():
+    from context.memory_manager import MemoryManager
+
+    manager = MemoryManager("u-export", "s1", storage_path=tempfile.mkdtemp())
+    manager.long_term.set_session_title("s1", "T")
+    manager.long_term.set_session_pinned("s1", True)
+
+    data = manager.export_data()
+    assert data["session_titles"]["s1"] == "T"
+    assert "s1" in data["pinned_sessions"]
+    print("✓ 导出数据包含标题 / 置顶")
+
+
 class _CountingModel:
     """记录调用次数的假模型（用于验证总结缓存）。"""
 
@@ -197,6 +247,9 @@ if __name__ == "__main__":
     test_long_term_delete_preference()
     test_session_titles()
     test_session_pinned()
+    test_add_message_preserves_metadata()
+    test_clear_history_clears_metadata()
+    test_export_data_includes_session_metadata()
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()
     print("\n全部通过")

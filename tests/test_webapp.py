@@ -405,6 +405,20 @@ def test_preferences_api():
         ).json()
         assert again["deleted"] is False
 
+        zero = client.put(
+            "/api/preferences/budget_level",
+            json={"user_id": user_id, "value": 0},
+        )
+        assert zero.status_code == 200
+        flag = client.put(
+            "/api/preferences/eco_mode",
+            json={"user_id": user_id, "value": False},
+        )
+        assert flag.status_code == 200
+        updated = client.get("/api/status", params={"user_id": user_id}).json()
+        assert updated["preferences"]["budget_level"] == 0
+        assert updated["preferences"]["eco_mode"] is False
+
         invalid = client.put(
             "/api/preferences/bad type", json={"user_id": user_id, "value": "x"}
         )
@@ -515,6 +529,12 @@ def test_session_rename():
         assert renamed.status_code == 200
         assert renamed.json()["title"] == "杭州出差计划"
 
+        export = client.get(
+            "/api/sessions/sess-title/export", params={"user_id": user_id}
+        )
+        assert export.status_code == 200
+        assert export.text.startswith("# 杭州出差计划")
+
         sessions = client.get("/api/sessions", params={"user_id": user_id}).json()["sessions"]
         assert sessions[0]["title"] == "杭州出差计划"
 
@@ -568,6 +588,7 @@ def test_export_markdown():
         store = create_long_term_memory(user_id, str(MEMORY_DIR))
         try:
             store.save_preference("hotel_brands", ["汉庭"])
+            store.save_preference("budget_level", 0)
             store.save_trip_history(
                 {
                     "origin": "北京",
@@ -594,6 +615,7 @@ def test_export_markdown():
         text = response.text
         assert "# Aligo 用户数据导出" in text
         assert "hotel_brands：汉庭" in text
+        assert "budget_level：0" in text
         assert "北京 → 上海" in text
         assert "## 最近会话" in text and "你好" in text
 
@@ -659,6 +681,15 @@ def test_trip_calendar_export():
             store.save_trip_history(
                 {"origin": "北京", "destination": "上海", "purpose": "旅游"}
             )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-11-11",
+                    "end_date": "2026-11-09",
+                    "purpose": "出差",
+                }
+            )
         finally:
             close = getattr(store, "close", None)
             if callable(close):
@@ -676,6 +707,18 @@ def test_trip_calendar_export():
         assert "DTSTART;VALUE=DATE:20261109" in text
         assert "DTEND;VALUE=DATE:20261112" in text, "全天事件结束日期应为次日（exclusive）"
         assert "北京 → 杭州" in text
+
+        again = client.get("/api/trips/trip_1/calendar", params={"user_id": user_id})
+        uid_first = next(line for line in text.splitlines() if line.startswith("UID:"))
+        uid_second = next(line for line in again.text.splitlines() if line.startswith("UID:"))
+        assert uid_first == uid_second, "同一行程的 UID 应稳定"
+
+        reversed_range = client.get(
+            "/api/trips/trip_3/calendar", params={"user_id": user_id}
+        )
+        assert reversed_range.status_code == 200
+        assert "DTSTART;VALUE=DATE:20261111" in reversed_range.text
+        assert "DTEND;VALUE=DATE:20261112" in reversed_range.text
 
         missing = client.get("/api/trips/trip_999/calendar", params={"user_id": user_id})
         assert missing.status_code == 404
@@ -695,6 +738,69 @@ def test_knowledge_endpoint():
     else:
         assert data.get("reason")
     print("✓ /api/knowledge 返回知识库状态")
+
+
+def test_next_trip_from_full_history():
+    from datetime import datetime, timedelta
+
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_next")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            future = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
+            past = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": future,
+                    "session_id": "sess-next",
+                }
+            )
+            for _ in range(6):
+                store.save_trip_history(
+                    {"origin": "上海", "destination": "南京", "start_date": past}
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        status = _client().get("/api/status", params={"user_id": user_id}).json()
+        assert status["next_trip"]["session_id"] == "sess-next"
+        assert status["next_trip"]["start_date"] == future
+        assert len(status["trips"]) == 5, "列表仍只返回最近 5 条"
+        print("✓ next_trip 基于完整行程历史计算")
+    finally:
+        _cleanup(user_id)
+
+
+def test_usage_by_day_local_date():
+    from datetime import datetime, timezone
+
+    from webapp.server import _usage_summary
+
+    aware = datetime.now(timezone.utc).replace(microsecond=0)
+    meta = {
+        "usage": {"calls": 1, "input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        "elapsed": 1.0,
+        "agents": [],
+    }
+    history = [
+        {
+            "role": "assistant",
+            "content": json.dumps({"results": [], "_meta": meta}, ensure_ascii=False),
+            "timestamp": aware.isoformat(),
+            "session_id": "s",
+        }
+    ]
+    usage = _usage_summary(history)
+    expected = aware.astimezone().date().isoformat()
+    bucket = next(day for day in usage["by_day"] if day["date"] == expected)
+    assert bucket["tokens"] == 5
+    print("✓ by_day 使用本地日期")
 
 
 def test_invalid_user_id_rejected():
@@ -738,6 +844,8 @@ if __name__ == "__main__":
     test_session_pin()
     test_export_markdown()
     test_trip_calendar_export()
+    test_next_trip_from_full_history()
+    test_usage_by_day_local_date()
     test_invalid_user_id_rejected()
     test_export_attachment()
     print("\n全部通过")

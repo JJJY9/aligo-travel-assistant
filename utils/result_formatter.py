@@ -163,6 +163,8 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
             return ""
         text = str(answer)
         documents = data.get("retrieved_documents") or []
+        if not isinstance(documents, list):
+            documents = []
         doc_names: list[str] = []
         for document in documents:
             if not isinstance(document, dict):

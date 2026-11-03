@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -119,10 +120,8 @@ class LongTermMemory:
             if fixed_prefs != data["preferences"]:
                 data["preferences"] = fixed_prefs
 
-        # 保存迁移后的数据
-        self.data = data
-        self._save()
-
+        # 迁移结果在下次写入时落盘：读取路径不再无条件重写文件，
+        # 避免搜索/状态等只读请求与对话写入互相覆盖。
         return data
 
     def _init_data(self) -> dict[str, Any]:
@@ -145,11 +144,20 @@ class LongTermMemory:
         }
 
     def _save(self):
-        """保存数据到文件"""
+        """原子写入数据文件（临时文件 + os.replace），避免并发读到半截 JSON。"""
         try:
             self.data["updated_at"] = datetime.now().isoformat()
-            with open(self.db_path, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            directory = os.path.dirname(self.db_path) or "."
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f".{self.user_id}.", suffix=".tmp", dir=directory
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(self.data, handle, ensure_ascii=False, indent=2)
+                os.replace(temp_path, self.db_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             logger.debug(f"Saved long-term memory to {self.db_path}")
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")
@@ -428,6 +436,8 @@ class LongTermMemory:
         """清空历史记录（保留偏好）"""
         self.data["chat_history"] = []
         self.data["trip_history"] = []
+        self.data["session_titles"] = {}
+        self.data["pinned_sessions"] = []
         self.data["statistics"]["total_trips"] = 0
         self.data["statistics"]["total_messages"] = 0
         self.data["statistics"]["frequent_destinations"] = {}
