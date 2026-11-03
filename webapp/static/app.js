@@ -49,6 +49,29 @@ const state = {
   lastUserText: "",
 };
 
+function isValidId(value) {
+  return /^[A-Za-z0-9_一-龥-]{1,64}$/.test(String(value || ""));
+}
+
+/* 深链接：?user=...&session=... 可直接打开某个会话 */
+(function applyUrlState() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const urlUser = params.get("user");
+    if (urlUser && isValidId(urlUser)) {
+      state.userId = urlUser;
+      localStorage.setItem("aligo.userId", urlUser);
+    }
+    const urlSession = params.get("session");
+    if (urlSession && isValidId(urlSession)) {
+      state.sessionId = urlSession;
+      sessionStorage.setItem("aligo.sessionId", urlSession);
+    }
+  } catch {
+    /* 忽略非法的 URL 参数 */
+  }
+})();
+
 const els = {
   app: byId("app"),
   sidebar: byId("sidebar"),
@@ -70,6 +93,7 @@ const els = {
   healthText: byId("healthText"),
   themeToggle: byId("themeToggle"),
   exportChat: byId("exportChat"),
+  copyLink: byId("copyLink"),
   menuBtn: byId("menuBtn"),
   collapseSidebar: byId("collapseSidebar"),
   scrim: byId("scrim"),
@@ -135,21 +159,27 @@ function toast(message) {
   }, 2000);
 }
 
-async function copyText(text) {
+async function copyText(text, message = "已复制") {
   try {
     if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const area = document.createElement("textarea");
-      area.value = text;
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.appendChild(area);
-      area.select();
-      document.execCommand("copy");
-      area.remove();
+      try {
+        await navigator.clipboard.writeText(text);
+        toast(message);
+        return;
+      } catch {
+        /* 权限受限时回退到 execCommand */
+      }
     }
-    toast("已复制");
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    if (!copied) throw new Error("copy failed");
+    toast(message);
   } catch {
     toast("复制失败");
   }
@@ -754,8 +784,25 @@ function setConversationTitle(title) {
   els.convTitle.title = title || "";
 }
 
+function shareUrl() {
+  const params = new URLSearchParams();
+  params.set("user", state.userId);
+  if (state.sessionId) params.set("session", state.sessionId);
+  return `${location.origin}${location.pathname}?${params.toString()}`;
+}
+
+function syncUrl() {
+  try {
+    history.replaceState(null, "", shareUrl());
+  } catch {
+    /* 某些环境下 history API 不可用 */
+  }
+}
+
 function syncSessionControls() {
   els.exportChat.hidden = !state.sessionId;
+  els.copyLink.hidden = !state.sessionId;
+  syncUrl();
 }
 
 function newSession() {
@@ -1438,7 +1485,7 @@ function closeMemorySheet() {
 
 async function saveUser() {
   const value = els.userIdInput.value.trim() || "web_user";
-  if (!/^[A-Za-z0-9_一-龥-]{1,64}$/.test(value)) {
+  if (!isValidId(value)) {
     toast("用户 ID 只能包含中文、字母、数字、下划线和短横线");
     return;
   }
@@ -1537,6 +1584,11 @@ function bindEvents() {
 
   els.themeToggle.addEventListener("click", () => {
     applyTheme(currentTheme() === "dark" ? "light" : "dark");
+  });
+
+  els.copyLink.addEventListener("click", () => {
+    if (!state.sessionId) return;
+    copyText(shareUrl(), "链接已复制");
   });
 
   els.exportChat.addEventListener("click", () => {

@@ -58,6 +58,10 @@
       <path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
       <path d="m13.5 7.5 3 3" fill="none" stroke="currentColor" stroke-width="1.7"/>
     </symbol>
+    <symbol id="i-link" viewBox="0 0 24 24">
+      <path d="M10 14a4.5 4.5 0 0 0 6.4 0l2.2-2.2a4.5 4.5 0 0 0-6.4-6.4L11 6.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      <path d="M14 10a4.5 4.5 0 0 0-6.4 0l-2.2 2.2a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    </symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24">
       <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
@@ -141,6 +145,9 @@
           <span class="model-chip" id="modelChip">DeepSeek</span>
         </div>
         <div class="topbar-right">
+          <button class="icon-btn" id="copyLink" type="button" title="复制对话链接" aria-label="复制对话链接" hidden>
+            <svg class="icon"><use href="#i-link"></use></svg>
+          </button>
           <button class="icon-btn" id="exportChat" type="button" title="导出对话（Markdown）" aria-label="导出对话" hidden>
             <svg class="icon"><use href="#i-download"></use></svg>
           </button>
