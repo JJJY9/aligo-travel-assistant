@@ -911,6 +911,73 @@ function dateGroupLabel(timestamp) {
   return "更早";
 }
 
+function renderHistoryItem(session) {
+  const item = document.createElement("div");
+  item.className = "history-item";
+  item.dataset.id = session.session_id;
+  item.setAttribute("role", "button");
+  item.setAttribute("tabindex", "0");
+  if (session.session_id === state.sessionId) item.classList.add("active");
+  if (session.pinned) item.classList.add("pinned");
+
+  const title = document.createElement("span");
+  title.className = "hi-title";
+  title.textContent = session.title || "新对话";
+  item.appendChild(title);
+
+  if (session.snippet) {
+    const snippet = document.createElement("span");
+    snippet.className = "hi-snippet";
+    snippet.textContent = session.snippet;
+    item.appendChild(snippet);
+  }
+
+  const actions = document.createElement("span");
+  actions.className = "hi-actions";
+
+  const pin = document.createElement("button");
+  pin.type = "button";
+  pin.title = session.pinned ? "取消置顶" : "置顶会话";
+  pin.setAttribute("aria-label", pin.title);
+  pin.innerHTML = icon("pin");
+  pin.addEventListener("click", (event) => {
+    event.stopPropagation();
+    togglePin(session);
+  });
+
+  const rename = document.createElement("button");
+  rename.type = "button";
+  rename.title = "重命名会话";
+  rename.setAttribute("aria-label", "重命名会话");
+  rename.innerHTML = icon("edit");
+  rename.addEventListener("click", (event) => {
+    event.stopPropagation();
+    startRenameSession(item, session);
+  });
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.title = "删除会话";
+  remove.setAttribute("aria-label", "删除会话");
+  remove.innerHTML = icon("trash");
+  remove.addEventListener("click", (event) => {
+    event.stopPropagation();
+    deleteSession(session.session_id);
+  });
+
+  actions.append(pin, rename, remove);
+  item.appendChild(actions);
+
+  item.addEventListener("click", () => openSession(session.session_id));
+  item.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openSession(session.session_id);
+    }
+  });
+  return item;
+}
+
 function renderHistory() {
   els.history.innerHTML = "";
   if (!state.sessions.length) {
@@ -921,78 +988,42 @@ function renderHistory() {
     return;
   }
 
-  const groups = new Map();
-  state.sessions.forEach((session) => {
-    const label = dateGroupLabel(session.updated_at);
-    if (!groups.has(label)) groups.set(label, []);
-    groups.get(label).push(session);
-  });
+  const pinned = state.sessions.filter((session) => session.pinned);
+  const regular = state.sessions.filter((session) => !session.pinned);
 
-  groups.forEach((items, label) => {
+  const addSection = (label, items) => {
     const section = document.createElement("div");
     section.className = "history-group";
     const heading = document.createElement("h3");
     heading.textContent = label;
     section.appendChild(heading);
-
-    items.forEach((session) => {
-      const item = document.createElement("div");
-      item.className = "history-item";
-      item.dataset.id = session.session_id;
-      item.setAttribute("role", "button");
-      item.setAttribute("tabindex", "0");
-      if (session.session_id === state.sessionId) item.classList.add("active");
-
-      const title = document.createElement("span");
-      title.className = "hi-title";
-      title.textContent = session.title || "新对话";
-      item.appendChild(title);
-
-      if (session.snippet) {
-        const snippet = document.createElement("span");
-        snippet.className = "hi-snippet";
-        snippet.textContent = session.snippet;
-        item.appendChild(snippet);
-      }
-
-      const actions = document.createElement("span");
-      actions.className = "hi-actions";
-
-      const rename = document.createElement("button");
-      rename.type = "button";
-      rename.title = "重命名会话";
-      rename.setAttribute("aria-label", "重命名会话");
-      rename.innerHTML = icon("edit");
-      rename.addEventListener("click", (event) => {
-        event.stopPropagation();
-        startRenameSession(item, session);
-      });
-
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.title = "删除会话";
-      remove.setAttribute("aria-label", "删除会话");
-      remove.innerHTML = icon("trash");
-      remove.addEventListener("click", (event) => {
-        event.stopPropagation();
-        deleteSession(session.session_id);
-      });
-
-      actions.append(rename, remove);
-      item.appendChild(actions);
-
-      item.addEventListener("click", () => openSession(session.session_id));
-      item.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          openSession(session.session_id);
-        }
-      });
-      section.appendChild(item);
-    });
-
+    items.forEach((session) => section.appendChild(renderHistoryItem(session)));
     els.history.appendChild(section);
+  };
+
+  if (pinned.length) addSection("置顶", pinned);
+
+  const groups = new Map();
+  regular.forEach((session) => {
+    const label = dateGroupLabel(session.updated_at);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(session);
   });
+  groups.forEach((items, label) => addSection(label, items));
+}
+
+async function togglePin(session) {
+  try {
+    await getJSON(`/api/sessions/${encodeURIComponent(session.session_id)}/pin`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: state.userId, pinned: !session.pinned }),
+    });
+    toast(session.pinned ? "已取消置顶" : "已置顶会话");
+    await loadSessions();
+  } catch (error) {
+    toast(`操作失败：${error.message}`);
+  }
 }
 
 async function loadSessions(query = state.searchQuery) {

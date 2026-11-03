@@ -89,6 +89,9 @@ def test_postgres_long_term_memory():
         memory.set_session_title("s1", "杭州出差")
         assert memory.get_session_titles() == {"s1": "杭州出差"}
 
+        memory.set_session_pinned("s1", True)
+        assert memory.get_pinned_sessions() == ["s1"]
+
         memory.save_trip_history(
             {
                 "origin": "北京",
@@ -117,6 +120,7 @@ def test_postgres_long_term_memory():
         assert memory.delete_chat_session("s1") == 2
         assert memory.get_chat_history(session_id="s1") == []
         assert memory.get_session_titles() == {}
+        assert memory.get_pinned_sessions() == []
         assert len(memory.get_chat_history()) == 1
 
         memory.clear_history()

@@ -151,6 +151,11 @@ class SessionTitlePayload(BaseModel):
     title: str = Field(max_length=60)
 
 
+class SessionPinPayload(BaseModel):
+    user_id: str = Field(pattern=_ID_PATTERN)
+    pinned: bool
+
+
 class _WebSession:
     """一个浏览器会话（对应一个 ConversationRuntime）。"""
 
@@ -275,6 +280,7 @@ def _load_user_data(user_id: str) -> dict[str, Any]:
             "trip_history": store.get_trip_history(limit=None),
             "chat_history": store.get_chat_history(),
             "session_titles": store.get_session_titles(),
+            "pinned_sessions": store.get_pinned_sessions(),
             "statistics": store.get_statistics(),
         }
     finally:
@@ -330,6 +336,7 @@ def _group_sessions(
     limit: int,
     query: str = "",
     titles: dict[str, str] | None = None,
+    pinned: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。"""
     needle = query.strip().lower()
@@ -361,6 +368,13 @@ def _group_sessions(
         custom = custom_titles.get(entry["session_id"])
         if custom:
             entry["title"] = custom
+
+    pinned_ids = set(pinned or [])
+    for entry in sessions:
+        entry["pinned"] = entry["session_id"] in pinned_ids
+    # 稳定排序：置顶会话在前，其余保持最近更新时间倒序
+    sessions.sort(key=lambda entry: not entry["pinned"])
+
     if needle:
         sessions = [
             entry
@@ -550,7 +564,8 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         data = _load_user_data(user_id)
         titles = data.get("session_titles") or {}
-        return {"sessions": _group_sessions(data["chat_history"], limit, q, titles)}
+        pinned = data.get("pinned_sessions") or []
+        return {"sessions": _group_sessions(data["chat_history"], limit, q, titles, pinned)}
 
     @app.get("/api/sessions/{session_id}")
     def get_session_messages(
@@ -590,6 +605,20 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "title": saved}
+
+    @app.put("/api/sessions/{session_id}/pin")
+    def pin_session(
+        payload: SessionPinPayload,
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """置顶 / 取消置顶会话。"""
+        store = _open_long_term(payload.user_id)
+        try:
+            store.set_session_pinned(session_id, payload.pinned)
+            pinned = store.get_pinned_sessions()
+        finally:
+            _close_long_term(store)
+        return {"session_id": session_id, "pinned": session_id in pinned}
 
     @app.get("/api/sessions/{session_id}/export")
     def export_session(
