@@ -104,6 +104,7 @@ const els = {
   healthText: byId("healthText"),
   themeToggle: byId("themeToggle"),
   exportChat: byId("exportChat"),
+  exportHtml: byId("exportHtml"),
   copyLink: byId("copyLink"),
   printChat: byId("printChat"),
   menuBtn: byId("menuBtn"),
@@ -678,6 +679,89 @@ function triggerExport() {
   );
 }
 
+function exportSafeName(text) {
+  return (
+    String(text || "aligo")
+      .replace(/[\\/:*?"<>|\s]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "aligo"
+  );
+}
+
+function buildExportHtml(title, bodyHtml) {
+  const exportedAt = new Date().toLocaleString("zh-CN");
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  :root { --ink:#14262e; --ink-3:#7b8d93; --line:#e2e9e8; --accent:#d9552c;
+    --bg:#f2f5f4; --surface:#ffffff; --code-bg:#0e1e24; --code-ink:#dce9e6; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.65 "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", system-ui, sans-serif; }
+  .page { max-width: 820px; margin: 24px auto; padding: 32px 36px; background: var(--surface);
+    border-radius: 16px; box-shadow: 0 12px 40px rgba(15, 36, 42, 0.08); }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .meta { margin-bottom: 20px; color: var(--ink-3); font-size: 12.5px; }
+  .msg { margin: 18px 0; }
+  .msg.user { display: flex; justify-content: flex-end; }
+  .msg.user .bubble { max-width: 85%; padding: 10px 14px; border-radius: 14px 14px 4px 14px;
+    background: #162c34; color: #f3f7f6; white-space: pre-wrap; }
+  .msg.assistant .bubble { padding: 12px 16px; border: 1px solid var(--line);
+    border-radius: 14px 14px 14px 4px; background: var(--surface); }
+  .msg-head, .trace, .msg-foot, .follow-ups, .code-copy { display: none !important; }
+  .bubble p { margin: 8px 0; }
+  .bubble h2, .bubble h3, .bubble h4 { margin: 14px 0 6px; }
+  .bubble ul, .bubble ol { margin: 8px 0; padding-left: 22px; }
+  .bubble pre { padding: 12px 14px; border-radius: 10px; overflow: auto;
+    background: var(--code-bg); color: var(--code-ink); font-size: 13px; }
+  .bubble code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  .bubble table { width: 100%; margin: 10px 0; border-collapse: collapse; font-size: 13.5px; }
+  .bubble th, .bubble td { padding: 6px 10px; border: 1px solid var(--line); text-align: left; }
+  .bubble a { color: var(--accent); }
+  .footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid var(--line);
+    color: var(--ink-3); font-size: 12px; }
+  @media print {
+    body { background: #fff; }
+    .page { margin: 0; padding: 0; box-shadow: none; }
+    .msg, .bubble { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+<h1>${escapeHtml(title)}</h1>
+<div class="meta">Aligo 智能旅行助手 · 导出于 ${escapeHtml(exportedAt)}</div>
+${bodyHtml}
+<div class="footer">由 Aligo 智能旅行助手生成 · 回答由 AI 生成，请核对关键信息</div>
+</div>
+</body>
+</html>`;
+}
+
+function exportSessionHtml() {
+  if (!state.sessionId) return;
+  const title = (els.convTitle.textContent || "").trim() || "Aligo 对话";
+  const clone = els.messages.cloneNode(true);
+  clone
+    .querySelectorAll(".trace, .msg-foot, .follow-ups, .code-copy, .welcome")
+    .forEach((node) => node.remove());
+  const html = buildExportHtml(title, clone.innerHTML);
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${exportSafeName(title)}-${new Date().toISOString().slice(0, 10)}.html`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  toast("HTML 已导出");
+}
+
 /* ---------- 执行路线 ---------- */
 
 function summarizeIntents(intents) {
@@ -928,6 +1012,7 @@ function syncUrl() {
 
 function syncSessionControls() {
   els.exportChat.hidden = !state.sessionId;
+  els.exportHtml.hidden = !state.sessionId;
   els.copyLink.hidden = !state.sessionId;
   els.printChat.hidden = !state.sessionId;
   syncUrl();
@@ -2419,6 +2504,7 @@ function bindEvents() {
   });
 
   els.exportChat.addEventListener("click", triggerExport);
+  els.exportHtml.addEventListener("click", exportSessionHtml);
 
   els.menuBtn.addEventListener("click", toggleSidebar);
   els.collapseSidebar.addEventListener("click", toggleSidebar);
