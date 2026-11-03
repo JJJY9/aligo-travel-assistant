@@ -85,10 +85,66 @@ def test_long_term_delete_session():
     print("✓ 长期记忆按会话删除")
 
 
+class _CountingModel:
+    """记录调用次数的假模型（用于验证总结缓存）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, messages, **kwargs):
+        self.calls += 1
+        return {
+            "content": [{"type": "text", "text": "用户偏好汉庭，常驻北京"}],
+            "usage": {"input_tokens": 8, "output_tokens": 4, "time": 0.05},
+        }
+
+
+def test_summary_cache_avoids_repeated_calls():
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-cache", "s-cache", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term.add_chat_message("user", "我之前去了上海", "s-other")
+
+    first = asyncio.run(manager.get_long_term_summary_async())
+    second = asyncio.run(manager.get_long_term_summary_async())
+    assert first and first == second
+    assert model.calls == 1, "历史未变化时应复用总结"
+
+    manager.long_term.add_chat_message("user", "我又去了杭州", "s-other")
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 2, "其它会话新增消息后应重新总结"
+    print("✓ 长期记忆总结按指纹缓存")
+
+
+def test_reload_long_term_respects_backend():
+    from context.memory_manager import MemoryManager
+
+    manager = MemoryManager("u-reload", "s-reload", storage_path=tempfile.mkdtemp())
+    original = manager.long_term
+    manager.reload_long_term()
+    assert manager.long_term is not original, "JSON 快照后端应重新加载"
+
+    class _LiveStore:
+        snapshot_based = False
+
+    live = _LiveStore()
+    manager.long_term = live  # type: ignore[assignment]
+    manager.reload_long_term()
+    assert manager.long_term is live, "无快照后端不应重建（避免每轮新建连接）"
+    print("✓ 长期记忆重载按后端类型决定")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
     test_bad_postgres_falls_back()
     test_memory_manager_uses_factory()
     test_long_term_delete_session()
+    test_summary_cache_avoids_repeated_calls()
+    test_reload_long_term_respects_backend()
     print("\n全部通过")

@@ -27,6 +27,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
+from utils.turn_meta import attach_turn_meta, build_turn_meta
 
 # 移除其他智能体的导入，改用懒加载
 
@@ -195,7 +196,7 @@ class AligoCLI:
 
             # 3. 解析意图识别结果（原逻辑不变：解析失败则友好提示并 return）
             try:
-                json.loads(intention_result.content)
+                intention_data = json.loads(intention_result.content)
             except json.JSONDecodeError:
                 self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
                 return
@@ -231,20 +232,34 @@ class AligoCLI:
         self._display_agents_called(result_data)
         self.console.print()
         self._display_results(result_data)
-        self.memory_manager.add_message("assistant", json.dumps(result_data, ensure_ascii=False))
 
         # 8. 本次查询的 LLM 用量与耗时（模型层统一统计）
+        usage_delta = None
+        elapsed = time.time() - start_time
         if usage_before is not None:
             after = self.model.usage.snapshot()
-            delta_calls = after["calls"] - usage_before["calls"]
+            usage_delta = {key: after[key] - usage_before[key] for key in usage_before}
+            delta_calls = usage_delta["calls"]
             if delta_calls > 0:
                 self.console.print(
                     f"[dim]📊 本次调用 LLM {delta_calls} 次 · "
-                    f"tokens {after['total_tokens'] - usage_before['total_tokens']}"
-                    f"（输入 {after['input_tokens'] - usage_before['input_tokens']} / "
-                    f"输出 {after['output_tokens'] - usage_before['output_tokens']}）· "
-                    f"总耗时 {time.time() - start_time:.1f}s[/dim]"
+                    f"tokens {usage_delta['total_tokens']}"
+                    f"（输入 {usage_delta['input_tokens']} / "
+                    f"输出 {usage_delta['output_tokens']}）· "
+                    f"总耗时 {elapsed:.1f}s[/dim]"
                 )
+
+        # 9. 写入长期记忆（附带执行元数据，Web 端历史会话可回看执行路线）
+        meta = build_turn_meta(
+            intention_data if isinstance(intention_data, dict) else {},
+            result_data,
+            usage=usage_delta,
+            elapsed=elapsed,
+        )
+        self.memory_manager.add_message(
+            "assistant",
+            json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
+        )
 
     def _display_agents_called(self, result_data: dict):
         """显示调用的智能体列表"""

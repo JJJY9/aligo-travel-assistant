@@ -67,6 +67,7 @@ const els = {
   health: byId("health"),
   healthText: byId("healthText"),
   themeToggle: byId("themeToggle"),
+  exportChat: byId("exportChat"),
   menuBtn: byId("menuBtn"),
   collapseSidebar: byId("collapseSidebar"),
   scrim: byId("scrim"),
@@ -374,8 +375,65 @@ function renderUserNode(text) {
   return node;
 }
 
+function renderHistoryTrace(meta) {
+  const schedule = Array.isArray(meta.schedule) ? meta.schedule : [];
+  const agents = Array.isArray(meta.agents) ? meta.agents : [];
+  const agentStatuses = new Map();
+  agents.forEach((agent) => {
+    if (agent && agent.name) agentStatuses.set(agent.name, agent.status);
+  });
+  const steps = schedule.length
+    ? schedule
+    : agents.map((agent) => ({ agent_name: agent.name, reason: "" }));
+
+  const root = document.createElement("div");
+  root.className = "trace done collapsed";
+  root.innerHTML = `
+    <button type="button" class="trace-head" aria-expanded="false">
+      <span class="trace-status" aria-hidden="true"></span>
+      <span class="trace-title">执行路线</span>
+      <span class="trace-meta"></span>
+      <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <ol class="route"></ol>`;
+
+  const list = root.querySelector(".route");
+  const addStop = (label, note, status) => {
+    const li = document.createElement("li");
+    li.className = `stop ${status}`;
+    li.innerHTML =
+      '<span class="stop-dot" aria-hidden="true"></span><span class="stop-body"><span class="stop-label"></span><span class="stop-note"></span></span>';
+    li.querySelector(".stop-label").textContent = label;
+    const noteEl = li.querySelector(".stop-note");
+    noteEl.textContent = note;
+    noteEl.hidden = !note;
+    list.appendChild(li);
+  };
+
+  addStop("整理记忆与上下文", "已加载偏好与最近对话", "done");
+  const intentText = summarizeIntents(meta.intents);
+  addStop("理解你的需求", intentText ? `识别为：${intentText}` : "", "done");
+  steps.forEach((item) => {
+    const name = item.agent_name || "";
+    const status = agentStatuses.get(name) === "error" ? "error" : "done";
+    addStop(AGENT_NAMES[name] || name, item.reason ? clampText(item.reason, 48) : "", status);
+  });
+
+  const elapsed = Number(meta.elapsed || 0);
+  root.querySelector(".trace-meta").textContent = `${2 + steps.length} 站${
+    elapsed ? ` · ${elapsed.toFixed(1)}s` : ""
+  }`;
+
+  const head = root.querySelector(".trace-head");
+  head.addEventListener("click", () => {
+    root.classList.toggle("collapsed");
+    head.setAttribute("aria-expanded", String(!root.classList.contains("collapsed")));
+  });
+  return root;
+}
+
 function renderAssistantNode(markdown, options = {}) {
-  const { timestamp = "", regenText = "" } = options;
+  const { timestamp = "", regenText = "", meta = null } = options;
   const node = document.createElement("div");
   node.className = "msg assistant";
   const bubble = document.createElement("div");
@@ -383,13 +441,38 @@ function renderAssistantNode(markdown, options = {}) {
   bubble.innerHTML = renderMarkdown(markdown || "（无内容）");
   const foot = document.createElement("div");
   foot.className = "msg-foot";
+
+  if (meta) {
+    (Array.isArray(meta.agents) ? meta.agents : []).forEach((agent) => {
+      foot.appendChild(makeBadge(agent.name, agent.status));
+    });
+  }
   foot.appendChild(chipButton("copy", "复制", () => copyText(markdown || "")));
+  if (meta) {
+    const usageText = formatUsage(meta.usage, meta.elapsed);
+    if (usageText) {
+      const usage = document.createElement("span");
+      usage.className = "usage";
+      usage.textContent = usageText;
+      foot.appendChild(usage);
+    }
+  }
   if (regenText) {
     const regen = chipButton("refresh", "重新生成", () => regenerate(node, regenText));
     regen.dataset.action = "regen";
     foot.appendChild(regen);
   }
-  node.append(messageHead(timestamp), bubble, foot);
+
+  const parts = [messageHead(timestamp)];
+  const hasTrace =
+    meta &&
+    ((Array.isArray(meta.schedule) && meta.schedule.length > 0) ||
+      (Array.isArray(meta.agents) && meta.agents.length > 0));
+  if (hasTrace) {
+    parts.push(renderHistoryTrace(meta));
+  }
+  parts.push(bubble, foot);
+  node.append(...parts);
   return node;
 }
 
@@ -644,6 +727,10 @@ function setConversationTitle(title) {
   els.convTitle.title = title || "";
 }
 
+function syncSessionControls() {
+  els.exportChat.hidden = !state.sessionId;
+}
+
 function newSession() {
   if (state.busy) {
     toast("请等待当前回复完成");
@@ -652,6 +739,7 @@ function newSession() {
   sessionLoadToken += 1;
   state.sessionId = null;
   sessionStorage.removeItem("aligo.sessionId");
+  syncSessionControls();
   setConversationTitle("新对话");
   showWelcome();
   markActiveHistory();
@@ -770,6 +858,7 @@ async function openSession(sessionId, options = {}) {
     }
     state.sessionId = sessionId;
     sessionStorage.setItem("aligo.sessionId", sessionId);
+    syncSessionControls();
 
     const session = state.sessions.find((item) => item.session_id === sessionId);
     setConversationTitle(session ? session.title : "对话");
@@ -785,6 +874,7 @@ async function openSession(sessionId, options = {}) {
           renderAssistantNode(message.content, {
             timestamp: message.timestamp,
             regenText: lastUserText,
+            meta: message.meta || null,
           }),
         );
       }
@@ -808,6 +898,7 @@ async function deleteSession(sessionId) {
     if (state.sessionId === sessionId) {
       state.sessionId = null;
       sessionStorage.removeItem("aligo.sessionId");
+      syncSessionControls();
       setConversationTitle("新对话");
       showWelcome();
     }
@@ -937,6 +1028,7 @@ function handleStreamEvent(assistant, event) {
       if (event.session_id) {
         state.sessionId = event.session_id;
         sessionStorage.setItem("aligo.sessionId", event.session_id);
+        syncSessionControls();
       }
       if (els.convTitle.textContent === "新对话") {
         setConversationTitle(clampText(state.lastUserText, 40));
@@ -1145,6 +1237,7 @@ async function saveUser() {
     }
     state.sessionId = null;
     sessionStorage.removeItem("aligo.sessionId");
+    syncSessionControls();
     setConversationTitle("新对话");
     showWelcome();
     updateUserCard();
@@ -1214,6 +1307,14 @@ function bindEvents() {
     applyTheme(currentTheme() === "dark" ? "light" : "dark");
   });
 
+  els.exportChat.addEventListener("click", () => {
+    if (!state.sessionId) return;
+    const url = `/api/sessions/${encodeURIComponent(
+      state.sessionId,
+    )}/export?user_id=${encodeURIComponent(state.userId)}`;
+    window.open(url, "_blank");
+  });
+
   els.menuBtn.addEventListener("click", toggleSidebar);
   els.collapseSidebar.addEventListener("click", toggleSidebar);
   els.scrim.addEventListener("click", closeMobileSidebar);
@@ -1252,6 +1353,7 @@ async function init() {
   } else {
     showWelcome();
   }
+  syncSessionControls();
   els.input.focus();
   requestAnimationFrame(resizeInput);
 }

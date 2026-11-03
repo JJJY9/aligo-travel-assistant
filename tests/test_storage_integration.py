@@ -132,6 +132,11 @@ def test_memory_manager_uses_configured_backends(monkeypatch):
     assert isinstance(manager.short_term, RedisShortTermMemory)
     assert isinstance(manager.long_term, PostgresLongTermMemory)
 
+    # PostgreSQL 无内存快照：多轮对话前不应重建连接
+    live_store = manager.long_term
+    manager.reload_long_term()
+    assert manager.long_term is live_store
+
     manager.add_message("user", "hello")
     assert manager.short_term.get_statistics()["total_messages"] == 1
     assert len(manager.long_term.get_chat_history()) == 1

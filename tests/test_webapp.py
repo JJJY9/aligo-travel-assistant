@@ -153,14 +153,62 @@ def test_sessions_listing_and_delete():
         roles = [message["role"] for message in detail["messages"]]
         assert roles == ["user", "assistant", "user", "assistant"]
         assert detail["messages"][1]["content"], "助手消息应渲染为可读文本"
+        meta = detail["messages"][1]["meta"]
+        assert meta is not None, "助手消息应包含执行元数据"
+        assert meta["usage"]["calls"] >= 1
+        assert meta["elapsed"] >= 0
 
         deletion = client.delete("/api/sessions/sess-hist", params={"user_id": user_id}).json()
         assert deletion["deleted"] == 4
         remaining = client.get("/api/sessions", params={"user_id": user_id}).json()["sessions"]
         assert remaining == []
-        print("✓ 会话列表 / 明细 / 删除正常")
+        print("✓ 会话列表 / 明细（含执行元数据）/ 删除正常")
     finally:
         _cleanup(user_id)
+
+
+def test_session_markdown_export():
+    client = _client()
+    user_id = _unique_user("web_test_export")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-md"},
+        )
+        assert response.status_code == 200
+
+        export = client.get("/api/sessions/sess-md/export", params={"user_id": user_id})
+        assert export.status_code == 200
+        assert export.headers["content-type"].startswith("text/markdown")
+        assert "attachment" in export.headers.get("content-disposition", "")
+        assert "# 你好" in export.text
+        assert "## 用户" in export.text and "## Aligo" in export.text
+
+        missing = client.get("/api/sessions/sess-none/export", params={"user_id": user_id})
+        assert missing.status_code == 404
+        print("✓ 会话导出为 Markdown（并可 404）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_export_filename_is_ascii():
+    response = _client().get("/api/export", params={"user_id": "旅行者"})
+    assert response.status_code == 200
+    disposition = response.headers.get("content-disposition", "")
+    assert "attachment" in disposition
+    assert "旅行者" not in disposition, "下载文件名应为 ASCII，避免响应头编码错误"
+    print("✓ 中文用户 ID 的导出文件名安全")
+
+
+def test_session_lru_eviction():
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 2
+    for session_id in ("s-a", "s-b", "s-c"):
+        state.get_session("web_test_lru", session_id)
+    assert list(state.sessions.keys()) == ["s-b", "s-c"]
+    state.close_all()
+    print("✓ 会话缓存按 LRU 淘汰并释放")
 
 
 def test_invalid_user_id_rejected():
@@ -186,6 +234,9 @@ if __name__ == "__main__":
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
     test_sessions_listing_and_delete()
+    test_session_markdown_export()
+    test_export_filename_is_ascii()
+    test_session_lru_eviction()
     test_invalid_user_id_rejected()
     test_export_attachment()
     print("\n全部通过")

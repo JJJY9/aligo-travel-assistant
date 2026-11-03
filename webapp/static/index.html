@@ -47,6 +47,9 @@
     <symbol id="i-close" viewBox="0 0 24 24">
       <path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
     </symbol>
+    <symbol id="i-download" viewBox="0 0 24 24">
+      <path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24">
       <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
@@ -125,6 +128,9 @@
           <span class="model-chip" id="modelChip">DeepSeek</span>
         </div>
         <div class="topbar-right">
+          <button class="icon-btn" id="exportChat" type="button" title="导出对话（Markdown）" aria-label="导出对话" hidden>
+            <svg class="icon"><use href="#i-download"></use></svg>
+          </button>
           <span class="health" id="health" title="服务状态"><i></i><span id="healthText">连接中</span></span>
           <button class="icon-btn" id="themeToggle" type="button" title="切换主题" aria-label="切换主题">
             <svg class="icon"><use href="#i-moon"></use></svg>

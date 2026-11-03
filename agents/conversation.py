@@ -25,6 +25,7 @@ from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.llm_resilience import retry_with_backoff
 from utils.result_formatter import result_to_markdown
+from utils.turn_meta import attach_turn_meta, build_turn_meta
 
 logger = logging.getLogger(__name__)
 
@@ -137,19 +138,35 @@ class ConversationRuntime:
             result_data = json.loads(orchestration.content)
         except json.JSONDecodeError as exc:
             raise ValueError("编排结果解析失败，请重试") from exc
-
-        self.memory.add_message("assistant", json.dumps(result_data, ensure_ascii=False))
+        if not isinstance(result_data, dict):
+            raise ValueError("编排结果格式错误，请重试")
 
         agents = [
             {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
             for item in result_data.get("results", [])
         ]
+        usage = self._usage_delta(usage_before)
+        elapsed = round(time.time() - start, 2)
+        meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
+        self.memory.add_message(
+            "assistant",
+            json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
+        )
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
-            "usage": self._usage_delta(usage_before),
-            "elapsed": round(time.time() - start, 2),
+            "usage": usage,
+            "elapsed": elapsed,
         }
+
+    def close(self) -> None:
+        """释放会话占用的资源（PostgreSQL 连接等）。"""
+        close = getattr(self.memory.long_term, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响退出
+                logger.debug("关闭长期记忆连接失败", exc_info=True)
 
     @staticmethod
     def _emit(on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
