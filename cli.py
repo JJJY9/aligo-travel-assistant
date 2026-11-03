@@ -27,6 +27,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
+from utils.progress import format_progress_event
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 
 # 移除其他智能体的导入，改用懒加载
@@ -163,7 +164,7 @@ class AligoCLI:
         rc = RESILIENCE_CONFIG
         max_retries = int(rc.get("max_retries", 3))
 
-        with self.console.status("思考中...", spinner="dots"):
+        with self.console.status("正在理解需求…", spinner="dots"):
             from agentscope.message import Msg
 
             # 1. 获取长期记忆摘要与上下文（原逻辑不变）
@@ -204,15 +205,22 @@ class AligoCLI:
         # 4. 添加用户输入到短期记忆（原逻辑不变）
         self.memory_manager.add_message("user", user_input)
 
-        # 5. 调度智能体
+        # 5. 调度智能体（实时显示智能体进度）
         orchestration_result = None
         try:
-            orchestration_result = await retry_with_backoff(
-                lambda: self.orchestrator.reply(intention_result),
-                max_retries=max_retries,
-                base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
-                max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
-            )
+            with self.console.status("正在调度智能体…", spinner="dots") as orchestration_status:
+
+                def on_progress(event: dict) -> None:
+                    text = format_progress_event(event, self._get_agent_display_name)
+                    if text:
+                        orchestration_status.update(text)
+
+                orchestration_result = await retry_with_backoff(
+                    lambda: self.orchestrator.reply(intention_result, on_event=on_progress),
+                    max_retries=max_retries,
+                    base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
+                    max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
+                )
             if self.circuit_breaker:
                 self.circuit_breaker.record_success()
         except CircuitOpenError:
@@ -274,14 +282,16 @@ class AligoCLI:
             status = result.get("status", "")
 
             display_name = self._get_agent_display_name(agent_name)
+            duration = result.get("duration")
+            suffix = f" {float(duration):.1f}s" if isinstance(duration, (int, float)) else ""
 
             # 根据状态添加标记
             if status == "success":
-                agents_called.append(f"{display_name} ✓")
+                agents_called.append(f"{display_name} ✓{suffix}")
             elif status == "error":
-                agents_called.append(f"{display_name} ✗")
+                agents_called.append(f"{display_name} ✗{suffix}")
             else:
-                agents_called.append(f"{display_name} ?")
+                agents_called.append(f"{display_name} ?{suffix}")
 
         if agents_called:
             self.console.print()
