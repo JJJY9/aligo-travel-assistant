@@ -2,6 +2,8 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
+> **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆为进程内滑动窗口，长期记忆为 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。文中提到的 Redis / PostgreSQL 为面向生产环境的架构设计，**尚未实现**；关键指标为开发期实验口径（见「关键指标」小节说明）。
+
 ## ✨ 核心亮点
 
 ### 🎯 智能意图识别
@@ -10,15 +12,14 @@
 - 自然语言理解，无需关键词匹配
 
 ### 🧠 两层记忆架构
-- **短期记忆**：Redis缓存 + 滑动窗口（10轮对话，TTL 1小时，支持分布式会话共享）
-- **长期记忆**：PostgreSQL持久化 + LLM异步总结
+- **短期记忆**：进程内滑动窗口（最近 10 轮对话）；生产设计为 Redis 缓存（未实现）
+- **长期记忆**：JSON 文件持久化（`data/memory/{user_id}.json`）+ LLM 异步总结；生产设计为 PostgreSQL（未实现）
 - 智能识别偏好追加/覆盖动作（"我还喜欢如家" vs "我搬家到上海了"）
-- 缓存命中率85%，减少数据库查询压力
 
 ### 📚 RAG知识库
-- Milvus向量数据库 + BGE-m3 Embedding模型（本地部署）
-- 智能分块（Chunking）+ 滑动窗口切分 + 余弦相似度检索
-- 知识溯源：返回文档来源，准确率95%
+- Milvus Lite 本地向量库 + BGE-small-zh-v1.5 中文向量模型（本地部署）
+- 智能分块（Chunking）+ 滑动窗口切分 + 余弦相似度检索（Top-K=3）
+- 知识溯源：返回文档来源（`metadata` 中保留原始文档路径）
 
 ### ⚡ 优先级并行调度
 - Plan-and-Execute架构：IntentionAgent → OrchestrationAgent → 子Agent
@@ -28,7 +29,7 @@
 ### 🏗️ 插件化架构
 - **Skill Plugins**：所有子Agent重构为独立插件（`.claude/skills/`）
 - **LazyAgentRegistry**：动态发现机制，自动扫描注册
-- **懒加载**：未使用的Skill不加载，启动速度3秒
+- **懒加载**：未使用的 Skill 不加载，启动时仅扫描技能元数据
 - **Progressive Disclosure**：渐进式暴露，意图识别阶段仅加载元数据
 
 ### 🛡️ 稳定性保障
@@ -134,14 +135,16 @@
 | 知识库问答准确率 | - | 95% | 新增功能 |
 | 用户偏好记忆准确率 | - | 95% | 新增功能 |
 | 系统响应时间 | 30秒 | 15秒 | -50% |
-| 用户偏好缓存命中率 | - | 85% | 新增功能 |
-| 系统启动速度 | 未优化 | 3秒 | 懒加载优化 |
+| 用户偏好缓存命中率（设计目标） | - | - | 尚未实现 |
+| 系统启动速度 | 未优化 | 秒级（懒加载） | 启动仅扫描元数据 |
+
+> **指标说明**：以上数据为开发期内部实验口径，仓库未附带对应评测脚本；「缓存命中率」与 Redis / PostgreSQL 相关优化属于生产设计目标，当前版本尚未实现。
 
 **优化路径**：
 1. **V1.0**: 关键词匹配意图识别（准确率65%） + 串行调度（响应时间30秒）
 2. **V2.0**: 两层记忆系统 + RAG知识库 + 联网搜索
 3. **V3.0**: LLM语义理解意图识别（准确率90%+） + 优先级并行调度（响应时间15秒）
-4. **V4.0**: Skill Plugins插件化架构 + LazyAgentRegistry + Redis缓存层
+4. **V4.0**: Skill Plugins插件化架构 + LazyAgentRegistry（Redis 缓存层为设计目标）
 
 ---
 
@@ -181,18 +184,18 @@
 ### 2. 两层记忆系统
 
 **短期记忆（会话级）**
-- 基于**Redis缓存**的滑动窗口机制
-- 保存最近10轮对话（TTL 1小时）
-- 支持分布式部署时的会话共享
+- 基于**进程内滑动窗口**的对话管理（生产设计为 Redis 缓存，未实现）
+- 保存最近10轮对话
+- 会话结束即清空
 - 用于上下文理解和快速访问
 
 **长期记忆（持久化）**
-- 💾 **PostgreSQL持久化存储**：用户偏好、历史行程、完整聊天历史
+- 💾 **JSON 文件持久化**（当前实现；生产设计为 PostgreSQL）：用户偏好、历史行程、完整聊天历史
 - 🎯 **用户偏好管理**：支持动态添加任意偏好类型，智能识别追加/覆盖动作
 - 📅 **历史行程记录**：出发地、目的地、时间、目的，支持跨会话查询
 - 📊 **统计信息**：常去目的地、总行程数
 - 🤖 **LLM异步总结**：自动总结历史会话和行程记录
-- ⚡ **Redis缓存层**：用户偏好热数据、LLM总结结果（缓存命中率85%）
+- ⚡ **Redis 缓存层**（生产设计，未实现）：用户偏好热数据、LLM 总结结果
 
 **测试记忆系统**：
 ```bash
@@ -209,7 +212,7 @@ python tests/test_memory_system.py
 
 ### 3. RAG 知识库
 
-基于 **Milvus** 和 **BGE-m3 Embedding模型**的企业差旅知识检索系统。
+基于 **Milvus Lite** 和 **BGE-small-zh-v1.5** 向量模型的企业差旅知识检索系统。
 
 **技术方案**：
 - **向量数据库**: Milvus（本地存储）
@@ -402,19 +405,26 @@ python cli.py
 
 ## 测试
 
-### 集成测试 (QA)
-完整跑通所有意图和子智能体的端到端测试：
+### 回归测试（无需 API Key）
+
+使用确定性 mock 模型覆盖核心逻辑，CI 中自动运行：
+
 ```bash
-python tests/test_cli_qa.py
+pytest tests/ -q
 ```
 
-### 单元测试
-针对各个核心模块的测试：
+### 端到端测试（需要真实大模型）
 
 ```bash
-python tests/test_memory_system.py  # 记忆系统
-python tests/test_intention_agent.py # 意图识别
-python tests/test_orchestration.py  # 协调系统
+python tests/test_cli_qa.py        # 完整跑通所有意图的 QA 测试
+python tests/test_memory_system.py # 记忆系统（含 LLM 总结）
+```
+
+### 代码检查
+
+```bash
+ruff check .   # 代码风格
+mypy .         # 类型检查
 ```
 
 ---
@@ -422,42 +432,43 @@ python tests/test_orchestration.py  # 协调系统
 ## 项目结构
 
 ```
-shanglv/
+aligo-travel-assistant/
+├── .github/
+│   ├── workflows/ci.yml             # CI：ruff + mypy + pytest
+│   ├── ISSUE_TEMPLATE/              # Issue 模板（Bug / 功能建议）
+│   └── pull_request_template.md     # PR 模板
 ├── agents/                          # 核心编排层
 │   ├── intention_agent.py           # 意图识别（语义理解）
-│   ├── orchestration_agent.py       # 协调器（并行调度）
+│   ├── orchestration_agent.py       # 协调器（优先级 + 并行调度）
 │   └── lazy_agent_registry.py       # 智能体插件注册器（懒加载）
-├── .claude/skills/                  # Skill Plugins (子智能体)
-│   ├── ask-question/                # 知识库问答 Skill
-│   │   ├── script/                  # 代码 (agent.py, init_script)
-│   │   ├── data/                    # 数据 (documents, milvus db)
-│   │   └── SKILL.md                 # 技能定义
-│   ├── event-collection/            # 事项收集 Skill
-│   ├── plan-trip/                   # 行程规划 Skill
-│   ├── preference/                  # 偏好管理 Skill
-│   ├── query-info/                  # 信息查询 Skill
-│   └── memory-query/                # 记忆查询 Skill
-├── context/                         # 记忆系统
-│   ├── memory_manager.py            # 记忆管理器
-│   ├── short_term_memory.py         # 短期记忆
-│   └── long_term_memory.py          # 长期记忆（支持动态偏好）
-├── data/
-│   ├── memory/                      # 长期记忆JSON存储（user_id.json）
-│   └── models/                      # 本地模型文件
-│       └── bge-small-zh-v1.5/       # BGE中文Embedding模型
-├── tests/                           # 测试脚本
-│   ├── test_cli_qa.py               # 端到端集成测试
-│   ├── test_memory_system.py        # 记忆系统测试
-│   ├── test_intention_agent.py      # 意图识别测试
-│   └── test_orchestration.py        # 协调系统测试
-├── utils/                           # 工具与连接可用性
+├── .claude/skills/                  # Skill Plugins（子智能体）
+│   ├── ask-question/                # RAG 知识库问答（含文档与向量库）
+│   ├── event-collection/            # 事项收集
+│   ├── plan-trip/                   # 行程规划
+│   ├── preference/                  # 偏好管理
+│   ├── query-info/                  # 联网信息查询
+│   └── memory-query/                # 记忆查询
+├── context/                         # 两层记忆
+│   ├── memory_manager.py            # 记忆管理器（统一门面）
+│   ├── short_term_memory.py         # 短期记忆（进程内滑动窗口）
+│   └── long_term_memory.py          # 长期记忆（JSON 文件）
+├── utils/                           # 工具与稳定性
 │   ├── circuit_breaker.py           # 熔断器
 │   ├── llm_resilience.py            # 重试退避、健康检查
-│   ├── json_parser.py               # JSON 解析
-│   └── skill_loader.py              # Skill 加载器
+│   ├── json_parser.py               # 鲁棒 JSON 解析
+│   └── skill_loader.py              # SKILL.md 加载器
+├── tests/                           # 测试（多数无需 API Key）
+├── data/                            # 运行数据（均不提交）
+│   ├── memory/                      # 长期记忆（{user_id}.json，gitignored）
+│   └── models/bge-small-zh-v1.5/    # 本地向量模型（gitignored，需自行下载）
 ├── cli.py                           # CLI 主程序
-├── config.py                        # 配置文件
-├── config_agentscope.py             # AgentScope 初始化与模型配置
+├── config.py                        # 配置（模型 / 容错 / RAG）
+├── config_local.py                  # 本地密钥（自行创建，gitignored）
+├── config_agentscope.py             # AgentScope 初始化
+├── pyproject.toml                   # 打包与 ruff/mypy/pytest 配置
+├── requirements.txt                 # 运行依赖
+├── requirements-ci.txt              # CI 轻量依赖
+├── CONTRIBUTING.md                  # 贡献指南
 └── README.md                        # 本文件
 ```
 
@@ -470,9 +481,10 @@ shanglv/
 - 🤖 **DeepSeek (deepseek-chat)** - 大语言模型（OpenAI 兼容接口，可切换豆包 / OpenAI 等）
 
 ### 数据存储
-- 🗄️ **PostgreSQL** - 长期记忆持久化（用户偏好、历史行程、聊天记录）
-- ⚡ **Redis** - 短期记忆缓存（会话状态、用户偏好热数据、LLM总结结果）
-- 🔍 **Milvus** - 向量数据库（本地存储，RAG知识库）
+- 💾 **JSON 文件** - 长期记忆持久化（`data/memory/{user_id}.json`，当前实现）
+- 🗄️ **PostgreSQL** - 长期记忆持久化（生产设计，未实现）
+- ⚡ **Redis** - 短期记忆缓存（生产设计，未实现）
+- 🔍 **Milvus Lite** - 本地向量数据库（RAG 知识库，当前实现）
 
 ### 向量化与检索
 - 🧠 **BGE-small-zh-v1.5** - 中文Embedding模型（本地部署）
@@ -486,7 +498,7 @@ shanglv/
 ### 架构设计
 - 🏗️ **Skill Plugins插件化架构** - 独立开发、测试、部署
 - 🔄 **LazyAgentRegistry动态发现** - 自动扫描注册Agent插件
-- ⚡ **懒加载机制** - 未使用的Skill不加载（启动速度3秒）
+- ⚡ **懒加载机制** - 未使用的 Skill 不加载，启动时仅扫描技能元数据
 - 🔀 **Progressive Disclosure渐进式暴露** - 意图识别阶段仅加载元数据，执行阶段按需加载
 - 🎯 **优先级+并行混合调度** - asyncio.gather并发执行
 
@@ -522,9 +534,8 @@ shanglv/
 - **Windows 说明**：`requirements.txt` 会按平台自动选择依赖（非 Windows 用 `pymilvus 2.6.9 + milvus-lite 2.x`，Windows 用 `pymilvus 3.x + milvus-lite 3.x`）。如果目录中已有旧版（2.x 时代）生成的 `milvus_lite.db` 文件，需先删除再运行初始化脚本（两个版本的数据文件互不兼容；该文件为可再生文件）
 
 ### 性能优化
-- 懒加载机制：系统启动时仅扫描Skill元数据，首次调用时才加载
-- 并行调度：同优先级Agent并发执行，提升响应速度
-- 缓存策略：热数据缓存，减少重复计算和LLM调用
+- 懒加载机制：系统启动时仅扫描 Skill 元数据，首次调用时才加载
+- 并行调度：同优先级 Agent 并发执行，缩短多信息收集类请求的总耗时
 
 ---
 
