@@ -33,10 +33,13 @@ dependencies = [
     "greenlet==3.5.6",
     "tqdm==4.70.1",
     "mcp==1.30.0",
+    "fastapi==0.162.0",
+    "uvicorn==0.54.0",
 ]
 
 [project.scripts]
 aligo = "cli:main"
+aligo-web = "webapp.server:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio"]
@@ -55,7 +58,7 @@ py-modules = ["cli", "config", "config_agentscope"]
 # utils/ 没有 __init__.py，按命名空间包发现
 namespaces = true
 where = ["."]
-include = ["agents*", "context*", "utils*"]
+include = ["agents*", "context*", "utils*", "webapp*"]
 # 显式排除：包发现阶段不要走进 venv/（本地约 1.5 GB）、build/、dist/、tests/ 等目录，
 # 否则 `python -m build` 的包发现会白扫几十万文件（实测约 20 秒），构建又慢又不稳定
 exclude = ["venv*", "build*", "dist*", "tests*", "data*"]
@@ -95,3 +98,6 @@ asyncio_mode = "auto"
 # 显式指定异步 fixture 的默认事件循环作用域，消除 pytest-asyncio 的弃用警告
 asyncio_default_fixture_loop_scope = "function"
 
+
+[tool.setuptools.package-data]
+webapp = ["static/*"]

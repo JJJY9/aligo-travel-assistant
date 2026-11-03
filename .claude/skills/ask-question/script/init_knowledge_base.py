@@ -13,6 +13,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from config_agentscope import create_chat_model
+from utils.console import configure_stdio
 from utils.text_chunker import split_text
 
 
@@ -25,6 +26,7 @@ def load_rag_agent_class():
     spec.loader.exec_module(module)
     return module.RAGKnowledgeAgent
 
+configure_stdio()
 RAGKnowledgeAgent = load_rag_agent_class()
 
 def load_documents_from_directory(directory_path: str) -> list[dict]:

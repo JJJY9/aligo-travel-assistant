@@ -96,6 +96,14 @@ class MemoryManager:
             "statistics": self.long_term.get_statistics(),
         }
 
+    def reload_long_term(self) -> None:
+        """重新从磁盘加载长期记忆。
+
+        多会话（如 Web 界面同时开多个标签页）/ 多进程写入后，内存中的快照可能
+        过期；在一轮对话开始前调用本方法可避免覆盖其它会话刚写入的数据。
+        """
+        self.long_term = LongTermMemory(self.user_id, self.long_term.storage_path)
+
     def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
         """
         获取用于Agent的上下文字符串

@@ -30,8 +30,8 @@ class OrchestrationAgent(AgentBase):
     def __init__(
         self,
         name: str = "OrchestrationAgent",
-        agent_registry: dict[str, AgentBase] | None = None,
-        memory_manager = None,
+        agent_registry: Any = None,  # dict 或 LazyAgentRegistry（鸭子类型）
+        memory_manager: Any = None,
         **kwargs
     ):
         """
