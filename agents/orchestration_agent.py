@@ -296,9 +296,13 @@ class OrchestrationAgent(AgentBase):
         # 检查智能体是否注册
         if agent_name not in self.agent_registry:
             logger.warning(f"Agent not registered: {agent_name}")
+            error_message = f"智能体未注册: {agent_name}"
             return {
                 "status": "error",
-                "message": f"智能体未注册: {agent_name}"
+                # data.error 供结果聚合与 CLI 展示使用（此前只放在 message 字段，
+                # 聚合后错误原因会丢失，界面显示为"未知错误"）
+                "data": {"error": error_message},
+                "message": error_message,
             }
 
         agent = self.agent_registry[agent_name]
