@@ -72,8 +72,14 @@ def test_rag_answer_with_sources():
             "data": {
                 "answer": "一线城市住宿标准为 500 元/晚。",
                 "retrieved_documents": [
-                    {"metadata": {"parent_doc": "01_travel_standards.txt"}},
-                    {"metadata": {"parent_doc": "01_travel_standards.txt"}},
+                    {
+                        "content": "一线城市住宿标准：500 元/晚，凭发票报销。",
+                        "metadata": {"parent_doc": "01_travel_standards.txt"},
+                    },
+                    {
+                        "content": "其他城市住宿标准：350 元/晚。",
+                        "metadata": {"parent_doc": "01_travel_standards.txt"},
+                    },
                 ],
             },
         }
@@ -81,7 +87,10 @@ def test_rag_answer_with_sources():
     md = result_to_markdown(data)
     assert "500 元/晚" in md
     assert "参考来源" in md and "01_travel_standards.txt" in md
-    print("✓ RAG 回答与来源渲染正常")
+    assert "参考片段" in md
+    assert "凭发票报销" in md and "其他城市" in md
+    assert "> " in md
+    print("✓ RAG 回答与来源 / 参考片段渲染正常")
 
 
 def test_information_query_sources():
