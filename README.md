@@ -431,6 +431,8 @@ python cli.py
 
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。
 
+执行过程中会实时显示当前正在运行的智能体（例如「正在执行 行程规划…」）；完成后智能体列表包含各自耗时（例如 `信息查询 ✓ 2.3s`），与 Web 执行路线一致。
+
 > **排障提示**：启动时若出现 `No sentence-transformers model found ... mean pooling` 警告，说明本地模型目录缺少 `modules.json` / `1_Pooling/config.json` 等元数据文件（通常只复制了权重文件）。从 HuggingFace 下载完整模型仓库文件即可消除；`doctor` 会检查并提示。
 
 ---
@@ -550,6 +552,7 @@ aligo-travel-assistant/
 │   ├── json_parser.py               # 鲁棒 JSON 解析
 │   ├── result_formatter.py          # 编排结果 → Markdown
 │   ├── turn_meta.py                 # 执行路线元数据（意图 / 调度 / 用量）
+│   ├── progress.py                  # 智能体进度事件 → CLI 文本
 │   ├── exporter.py                  # 用户数据导出（JSON / Markdown）
 │   ├── rate_limit.py                # 对话接口进程内滑动窗口限流
 │   ├── text_chunker.py              # RAG 文本按小节切分
