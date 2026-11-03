@@ -57,6 +57,21 @@ APP_VERSION = "1.3.0"
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
 
+# 基础安全响应头：CSP 仅允许同源脚本（主题脚本已拆为 /static/theme.js）；
+# 样式允许内联以支持 JS 动态设置 style 属性。
+_SECURITY_HEADERS = [
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+    (
+        b"content-security-policy",
+        b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        b"img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+        b"base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    ),
+]
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = PROJECT_ROOT / "data" / "memory"
@@ -87,9 +102,11 @@ class RequestContextMiddleware:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = int(message.get("status", 0))
-                message["headers"] = list(message.get("headers") or []) + [
-                    (b"x-request-id", request_id.encode("latin-1"))
-                ]
+                message["headers"] = (
+                    list(message.get("headers") or [])
+                    + _SECURITY_HEADERS
+                    + [(b"x-request-id", request_id.encode("latin-1"))]
+                )
             await send(message)
 
         try:

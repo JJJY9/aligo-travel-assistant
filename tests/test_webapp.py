@@ -438,6 +438,25 @@ def test_session_rename():
         _cleanup(user_id)
 
 
+def test_security_headers():
+    client = _client()
+    for path in ("/", "/api/health", "/static/theme.js"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        csp = response.headers["content-security-policy"]
+        assert "default-src 'self'" in csp
+        assert "script-src 'self'" in csp
+        assert "frame-ancestors 'none'" in csp
+
+    html = client.get("/").text
+    assert "/static/theme.js" in html
+    assert "<script>" not in html, "不应再使用内联脚本（CSP 禁止）"
+    print("✓ 安全响应头（CSP / nosniff / frame / referrer）")
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -469,6 +488,7 @@ if __name__ == "__main__":
     test_export_filename_is_ascii()
     test_session_lru_eviction()
     test_request_id_header()
+    test_security_headers()
     test_chat_rate_limit()
     test_session_rename()
     test_invalid_user_id_rejected()
