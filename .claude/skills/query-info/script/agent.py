@@ -1,9 +1,9 @@
 """
 信息查询智能体 - 真实检索版（免费API）
-支持：天气（wttr.in）、网络搜索（DDGS，开启 safesearch + 结果过滤）
+支持：天气（Open-Meteo）、网络搜索（DDGS，开启 safesearch + 结果过滤）
 
 使用免费API：
-- 天气：wttr.in（无需 API Key）
+- 天气：Open-Meteo（无需 API Key，国内可达性好）
 - 搜索：ddgs（Dux Distributed Global Search，可选 bing/duckduckgo 等，需安装：pip install ddgs）
 """
 import json
@@ -70,7 +70,7 @@ class InformationQueryAgent(AgentBase):
     信息查询智能体（真实检索版）
 
     核心功能：
-    - 天气查询 - 使用 wttr.in 免费 API（无需搜索，结果可靠）
+    - 天气查询 - 使用 Open-Meteo 免费 API（无需 Key / 无需搜索）
     - 网络搜索 - 使用 DDGS（开启 safesearch，过滤可疑来源）
 
     注意：
@@ -101,19 +101,20 @@ class InformationQueryAgent(AgentBase):
         else:
             user_query = str(content)
 
-        # 天气类问题优先走 wttr.in，避免通用搜索返回低质结果
+        # 天气类问题优先走 Open-Meteo；接口不可用时回退到联网搜索
+        result = None
         if self._is_weather_query(user_query):
             logger.info(f"Weather query: {user_query}")
             try:
                 result = await self._weather_query(user_query)
-                return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
             except Exception as e:
                 logger.warning(f"Weather query failed, fallback to web search: {e}")
                 result = None
-        else:
-            result = None
+            if result is not None and result.get("query_success"):
+                return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
+            logger.warning("Weather API unavailable, falling back to web search")
 
-        if result is None:
+        if result is None or not result.get("query_success"):
             logger.info(f"Web search query: {user_query}")
             try:
                 result = await self._web_search(user_query)
@@ -134,22 +135,44 @@ class InformationQueryAgent(AgentBase):
             return False
         return "天气" in q or "气温" in q or "下雨" in q or "预报" in q
 
+    # WMO 天气代码 → 中文描述（Open-Meteo 使用 WMO 4677 标准）
+    _WEATHER_CODE_MAP: dict[int, str] = {
+        0: "晴", 1: "大部晴朗", 2: "多云", 3: "阴",
+        45: "有雾", 48: "雾凇",
+        51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+        61: "小雨", 63: "中雨", 65: "大雨",
+        66: "冻雨", 67: "强冻雨",
+        71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+        80: "阵雨", 81: "强阵雨", 82: "暴雨",
+        85: "阵雪", 86: "强阵雪",
+        95: "雷暴", 96: "雷暴伴冰雹", 99: "强雷暴伴冰雹",
+    }
+
+    async def _http_json(self, url: str, params: dict[str, Any]) -> dict:
+        """在 executor 中执行 GET 并返回 JSON（避免阻塞事件循环）。"""
+        import asyncio
+
+        import httpx
+
+        def _get() -> dict:
+            resp = httpx.get(
+                url,
+                params=params,
+                timeout=10.0,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; AligoTravel/1.0)"},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get)
+
     async def _weather_query(self, query: str) -> dict[str, Any]:
         """
-        使用 wttr.in 免费 API 查询天气（无需 API Key，结果可靠）。
-        支持中文城市名，如：杭州、北京。
-        """
-        import asyncio
-        try:
-            import httpx
-        except ImportError:
-            return {
-                "query_type": "天气查询",
-                "query_success": False,
-                "results": {"message": "需要安装 httpx: pip install httpx"},
-            }
+        使用 Open-Meteo 免费 API 查询天气（无需 API Key，国内网络可达性优于 wttr.in）。
 
-        # 从问题中提取城市（简单取第一个常见城市名或整句前 10 字中连续中文）
+        流程：城市名 → 地理编码 → 实时天气 + 未来 3 天预报。
+        """
         city = self._extract_city_from_query(query)
         if not city:
             return {
@@ -158,58 +181,84 @@ class InformationQueryAgent(AgentBase):
                 "results": {"message": "未识别到城市，请说明具体城市，如：杭州下周的天气怎么样？"},
             }
 
-        url = f"https://wttr.in/{city}?format=j1"
         try:
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(
-                None,
-                lambda: httpx.get(url, timeout=10.0, headers={"User-Agent": "curl/7.64.1"}),
+            geo = await self._http_json(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                {"name": city, "count": 1, "language": "zh", "format": "json"},
             )
-            resp.raise_for_status()
-            data = resp.json()
+            matches = geo.get("results") or []
+            if not matches:
+                return {
+                    "query_type": "天气查询",
+                    "query_success": False,
+                    "results": {"message": f"未找到城市「{city}」，请检查城市名"},
+                }
+            location = matches[0]
+            city_name = location.get("name") or city
+
+            data = await self._http_json(
+                "https://api.open-meteo.com/v1/forecast",
+                {
+                    "latitude": location["latitude"],
+                    "longitude": location["longitude"],
+                    "current": "temperature_2m,relative_humidity_2m,weather_code",
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+                    "timezone": "Asia/Shanghai",
+                    "forecast_days": 3,
+                },
+            )
         except Exception as e:
-            logger.warning(f"wttr.in request failed: {e}")
+            logger.warning(f"Open-Meteo request failed: {e}")
             return {
                 "query_type": "天气查询",
                 "query_success": False,
-                "results": {"message": f"天气接口暂时不可用: {e}", "sources": [{"url": "https://wttr.in", "title": "wttr.in"}]},
+                "results": {
+                    "message": f"天气接口暂时不可用: {e}",
+                    "sources": [{"url": "https://open-meteo.com", "title": "Open-Meteo"}],
+                },
             }
 
         try:
-            current = data.get("current_condition", [{}])[0]
-            temp_c = current.get("temp_C", "?")
-            wdesc = current.get("weatherDesc", [{}])
-            desc = (wdesc[0].get("value") if wdesc else None) or "—"
-            humidity = current.get("humidity", "?")
-            weather_text = f"{city}当前天气：{desc}，气温 {temp_c}°C，湿度 {humidity}%。"
+            current = data.get("current", {})
+            desc = self._WEATHER_CODE_MAP.get(current.get("weather_code"), "未知")
+            weather_text = (
+                f"{city_name}当前天气：{desc}，气温 {current.get('temperature_2m', '?')}°C，"
+                f"湿度 {current.get('relative_humidity_2m', '?')}%。"
+            )
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])[:3]
+            codes = daily.get("weather_code", [])
+            lows = daily.get("temperature_2m_min", [])
+            highs = daily.get("temperature_2m_max", [])
             forecasts = []
-            for day in data.get("weather", [])[:5]:
-                date = day.get("date", "")
-                maxtemp = day.get("maxtempC", "?")
-                mintemp = day.get("mintempC", "?")
-                h = (day.get("hourly") or [{}])[0] if day.get("hourly") else {}
-                daily_desc = (h.get("weatherDesc") or [{}])[0].get("value", "—") if h else "—"
-                forecasts.append(f"{date}: {daily_desc}，{mintemp}~{maxtemp}°C")
+            for i, date in enumerate(dates):
+                day_desc = self._WEATHER_CODE_MAP.get(codes[i] if i < len(codes) else None, "未知")
+                low = lows[i] if i < len(lows) else "?"
+                high = highs[i] if i < len(highs) else "?"
+                forecasts.append(f"{date}: {day_desc}，{low}~{high}°C")
             if forecasts:
-                weather_text += " 未来几日：" + "；".join(forecasts[:3])
+                weather_text += " 未来几日：" + "；".join(forecasts)
             return {
                 "query_type": "天气查询",
                 "query_success": True,
                 "results": {
                     "summary": weather_text,
-                    "sources": [{"url": "https://wttr.in", "title": "wttr.in"}],
+                    "sources": [{"url": "https://open-meteo.com", "title": "Open-Meteo"}],
                 },
             }
         except Exception as e:
-            logger.warning(f"Parse wttr.in response failed: {e}")
+            logger.warning(f"Parse Open-Meteo response failed: {e}")
             return {
                 "query_type": "天气查询",
                 "query_success": False,
-                "results": {"message": "天气数据解析失败", "sources": [{"url": "https://wttr.in", "title": "wttr.in"}]},
+                "results": {
+                    "message": "天气数据解析失败",
+                    "sources": [{"url": "https://open-meteo.com", "title": "Open-Meteo"}],
+                },
             }
 
     def _extract_city_from_query(self, query: str) -> str:
-        """从问题中提取城市名（简单实现：常见城市列表匹配）。"""
+        """从问题中提取城市名：先匹配常见城市，再取关键词前的连续中文字。"""
         common_cities = [
             "北京", "上海", "广州", "深圳", "杭州", "南京", "成都", "武汉", "西安", "苏州",
             "天津", "重庆", "厦门", "青岛", "大连", "宁波", "无锡", "长沙", "郑州", "济南",
@@ -219,9 +268,11 @@ class InformationQueryAgent(AgentBase):
         for city in common_cities:
             if city in q:
                 return city
-        # 否则取前 2～6 个连续中文字作为可能城市名
-        m = re.search(r"[\u4e00-\u9fa5]{2,6}", q)
-        return m.group(0).strip() if m else ""
+        # 去掉时间词与问句措辞，取剩余文本中第一段 2~6 个连续中文字
+        head = re.split(r"(?:的?天气|气温|下雨|预报|怎么样|如何|情况)", q, maxsplit=1)[0]
+        head = re.sub(r"(明天|今天|后天|昨天|周[一二三四五六日末]|下周|这周|未来|这几天|近期)", "", head)
+        match = re.search(r"[一-龥]{2,6}", head)
+        return match.group(0).strip() if match else ""
 
     async def _web_search(self, query: str) -> dict[str, Any]:
         """
