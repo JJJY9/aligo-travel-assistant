@@ -77,6 +77,9 @@ const els = {
   sidebar: byId("sidebar"),
   history: byId("history"),
   historySearch: byId("historySearch"),
+  upcoming: byId("upcoming"),
+  upcomingRoute: byId("upcomingRoute"),
+  upcomingDate: byId("upcomingDate"),
   messages: byId("messages"),
   scroll: byId("scroll"),
   input: byId("input"),
@@ -1366,6 +1369,7 @@ function renderOverview() {
   if (!status) {
     els.overview.innerHTML = '<div class="empty">无法获取数据概览</div>';
     els.trips.innerHTML = "";
+    els.upcoming.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
     els.usageAgents.innerHTML = "";
@@ -1467,6 +1471,8 @@ function renderOverview() {
       els.trips.appendChild(row);
     });
   }
+
+  renderUpcoming(trips);
 
   const stats = [
     ["历史行程", status.trip_count || 0],
@@ -1601,6 +1607,34 @@ function renderUsageTrend(usage) {
   });
 
   els.usageTable.append(caption, thead, tbody);
+}
+
+function renderUpcoming(trips) {
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate(),
+  ).padStart(2, "0")}`;
+  const upcoming = (trips || [])
+    .filter((trip) => trip.start_date && String(trip.start_date) >= today)
+    .sort((a, b) => {
+      const byDate = String(a.start_date).localeCompare(String(b.start_date));
+      if (byDate !== 0) return byDate;
+      // 同一天的行程优先选择能跳回对话的记录
+      return (b.session_id ? 1 : 0) - (a.session_id ? 1 : 0);
+    })[0];
+
+  if (!upcoming) {
+    els.upcoming.hidden = true;
+    return;
+  }
+  els.upcoming.hidden = false;
+  els.upcoming.dataset.session = upcoming.session_id || "";
+  els.upcomingRoute.textContent = `${upcoming.origin || "—"} → ${
+    upcoming.destination || "—"
+  }`;
+  els.upcomingDate.textContent = `${upcoming.start_date}${
+    upcoming.end_date ? ` ~ ${upcoming.end_date}` : ""
+  } · ${upcoming.purpose || "出行"}`;
 }
 
 function startEditPreference(row, type, currentValue) {
@@ -1852,6 +1886,15 @@ function bindEvents() {
       event.preventDefault();
       clearTimeout(searchTimer);
       loadSessions(els.historySearch.value);
+    }
+  });
+
+  els.upcoming.addEventListener("click", () => {
+    if (els.upcoming.dataset.session) {
+      openSession(els.upcoming.dataset.session);
+      closeMobileSidebar();
+    } else {
+      openMemorySheet();
     }
   });
 
