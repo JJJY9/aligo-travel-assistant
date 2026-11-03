@@ -31,6 +31,7 @@
 - CLI 知识片段管理：`python cli.py kb-list [关键词]` 列出片段（分类 + 预览），`python cli.py kb-delete <id>` 删除片段
 - 行程管理：记忆面板可删除误记录的行程（`DELETE /api/trips/{id}`），JSON / PostgreSQL 同步更新统计与常去目的地
 - 会话导出 HTML：顶栏新增「导出对话（HTML）」，生成内嵌样式的单文件 HTML（去除执行路线与操作按钮，可直接分享 / 打印 / 离线查看）
+- 行程日历导出全部：`GET /api/trips/calendar` 把一个用户的历史行程合并为一个 `.ics`（缺少出发日期的跳过），记忆面板「最近行程」标题右侧新增「导出全部日历」
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
@@ -92,6 +93,7 @@
 - 新增旧快照写回不复活已删除行程、删除写入失败映射 503、ICS UID 随行程内容变化、CLI 大文件导入不受 200 条限制、导入空条目跳过等用例
 - 新增行程重复保存去重用例（JSON：同日期更新 / 不同日期新增 / 无日期不去重；PostgreSQL 集成断言）
 - 新增偏好抽取输入选择用例（优先用户原话 / 回退重写查询）与编排上下文 `user_query` 用例
+- 新增全部行程日历用例（多事件合并 / 跳过缺日期行程 / 空列表；接口附件头与事件数）
 - 新增 Milvus 客户端首次打开重试用例（一次失败后成功 / 持续失败上抛且不缓存坏客户端）
 - CI 回归测试附加覆盖率报告（`pytest-cov`，仅展示不设阈值；本地全量环境覆盖率更高）
 

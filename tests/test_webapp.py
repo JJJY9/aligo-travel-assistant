@@ -552,6 +552,80 @@ def test_trip_ics_uid_includes_content():
     print("✓ ICS UID 包含行程内容（复用 id 不覆盖旧事件）")
 
 
+def test_build_trips_ics_multiple_events():
+    from webapp.server import _build_trips_ics
+
+    trips = [
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-11-09",
+            "end_date": "2026-11-11",
+            "purpose": "出差",
+        },
+        {
+            "trip_id": "trip_2",
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        },
+    ]
+    content = _build_trips_ics(trips, "u1")
+    assert content.count("BEGIN:VCALENDAR") == 1
+    assert content.count("BEGIN:VEVENT") == 2
+    assert content.count("END:VEVENT") == 2
+    assert content.endswith("END:VCALENDAR\r\n")
+
+    # 缺少出发日期的行程被跳过
+    content = _build_trips_ics(trips + [{"trip_id": "trip_3", "destination": "杭州"}], "u1")
+    assert content.count("BEGIN:VEVENT") == 2
+
+    empty = _build_trips_ics([], "u1")
+    assert "BEGIN:VCALENDAR" in empty and "BEGIN:VEVENT" not in empty
+    print("✓ 全部行程合并为一个日历（跳过缺日期行程）")
+
+
+def test_trips_calendar_api():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_all_trips")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for day, destination in ((9, "上海"), (12, "杭州")):
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": destination,
+                        "start_date": f"2026-11-{day:02d}",
+                        "end_date": f"2026-11-{day + 1:02d}",
+                        "purpose": "出差",
+                    }
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        response = _client().get("/api/trips/calendar", params={"user_id": user_id})
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/calendar")
+        assert "attachment" in response.headers["content-disposition"]
+        assert response.text.count("BEGIN:VEVENT") == 2
+
+        empty = _client().get(
+            "/api/trips/calendar", params={"user_id": _unique_user("web_test_no_trips")}
+        )
+        assert empty.status_code == 200
+        assert "BEGIN:VEVENT" not in empty.text
+        print("✓ /api/trips/calendar 导出全部行程")
+    finally:
+        _cleanup(user_id)
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -1193,6 +1267,8 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_trip_ics_uid_includes_content()
+    test_build_trips_ics_multiple_events()
+    test_trips_calendar_api()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()

@@ -632,8 +632,8 @@ def _ics_escape(value: str) -> str:
     )
 
 
-def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
-    """把一条行程渲染为全天事件的 iCalendar 文本；缺少出发日期时返回 None。"""
+def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | None:
+    """单条行程的 VEVENT 行；缺少出发日期时返回 None。"""
     start = _ics_date(trip.get("start_date") or "")
     if not start:
         return None
@@ -667,11 +667,7 @@ def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
     uid_digest = hashlib.sha1(uid_source.encode("utf-8")).hexdigest()[:16]
     uid = f"aligo-{uid_digest}@aligo.local"
 
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Aligo//Travel Assistant//CN",
-        "CALSCALE:GREGORIAN",
+    return [
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{stamp}",
@@ -680,10 +676,39 @@ def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
         f"SUMMARY:{_ics_escape(summary)}",
         f"DESCRIPTION:{_ics_escape(description)}",
         "END:VEVENT",
-        "END:VCALENDAR",
-        "",
     ]
+
+
+def _ics_calendar(events: list[list[str]]) -> str:
+    """把若干 VEVENT 行组合为完整的 iCalendar 文本。"""
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Aligo//Travel Assistant//CN",
+        "CALSCALE:GREGORIAN",
+    ]
+    for event in events:
+        lines.extend(event)
+    lines.extend(["END:VCALENDAR", ""])
     return "\r\n".join(lines)
+
+
+def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
+    """把一条行程渲染为全天事件的 iCalendar 文本；缺少出发日期时返回 None。"""
+    event = _trip_ics_event_lines(trip, user_id)
+    if event is None:
+        return None
+    return _ics_calendar([event])
+
+
+def _build_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
+    """把全部行程渲染为一个 iCalendar 文件（缺少出发日期的行程跳过）。"""
+    events = [
+        event
+        for event in (_trip_ics_event_lines(trip, user_id) for trip in trips)
+        if event is not None
+    ]
+    return _ics_calendar(events)
 
 
 def create_app(model: Any = None) -> FastAPI:
@@ -1088,6 +1113,22 @@ def create_app(model: Any = None) -> FastAPI:
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
             },
+        )
+
+    @app.get("/api/trips/calendar")
+    def export_trips_calendar(
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> Response:
+        """导出全部历史行程为一个 iCalendar 文件。"""
+        store = _open_long_term(user_id)
+        try:
+            trips = store.get_trip_history(limit=None)
+        finally:
+            _close_long_term(store)
+        return Response(
+            content=_build_trips_ics(trips, user_id),
+            media_type="text/calendar; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="aligo_trips.ics"'},
         )
 
     @app.get("/api/trips/{trip_id}/calendar")
