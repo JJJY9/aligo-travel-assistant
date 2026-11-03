@@ -385,7 +385,7 @@ python cli.py
 python cli.py
 ```
 
-**启动速度**: 约 3 秒（采用LazyAgentRegistry懒加载技术）
+启动时仅扫描技能元数据（懒加载），首次调用某个技能时才加载其代码。
 
 ### 内置命令
 
@@ -394,12 +394,17 @@ python cli.py
 | `help` | 显示帮助信息 |
 | `status` | 查看当前状态和记忆 |
 | `health` | 检查 LLM 服务是否可用并显示熔断器状态 |
+| `doctor` | 环境自检：依赖 / API Key / 嵌入模型文件 / 知识库 / LLM 连通性 |
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
 | `preferences` | 查看用户偏好 |
 | `exit` | 退出程序 |
 
 单独做健康检查（不进入交互）：`python cli.py health`，返回 `OK` / `FAIL: ...`，退出码 0/1。
+
+环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
+
+> **排障提示**：启动时若出现 `No sentence-transformers model found ... mean pooling` 警告，说明本地模型目录缺少 `modules.json` / `1_Pooling/config.json` 等元数据文件（通常只复制了权重文件）。从 HuggingFace 下载完整模型仓库文件即可消除；`doctor` 会检查并提示。
 
 ---
 

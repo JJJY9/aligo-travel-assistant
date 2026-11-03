@@ -58,6 +58,7 @@ class AligoCLI:
         table.add_row("help", "显示此帮助信息")
         table.add_row("status", "查看当前状态和记忆")
         table.add_row("health", "检查 LLM 服务是否可用")
+        table.add_row("doctor", "环境自检（依赖 / 密钥 / 模型 / 知识库 / 连通性）")
         table.add_row("clear", "清空当前任务（保留长期记忆）")
         table.add_row("history", "查看历史行程")
         table.add_row("preferences", "查看用户偏好")
@@ -698,6 +699,16 @@ class AligoCLI:
             self.console.print(f"LLM 服务: [red]不可用[/red] - {msg}", style="bold")
         self.console.print()
 
+    async def run_doctor(self):
+        """在会话内执行环境自检（依赖 / 密钥 / 模型 / 知识库 / 连通性）"""
+        from utils.doctor import build_report_table, run_doctor, summarize
+
+        results = await run_doctor(include_network=bool(LLM_CONFIG["api_key"]))
+        self.console.print(build_report_table(results))
+        text, style = summarize(results)
+        self.console.print(text, style=style)
+        self.console.print()
+
     def show_history(self):
         """显示历史行程"""
         history = self.memory_manager.long_term.get_trip_history(10)
@@ -768,6 +779,8 @@ class AligoCLI:
                     self.show_status()
                 elif command == "health":
                     await self.run_health_check()
+                elif command == "doctor":
+                    await self.run_doctor()
                 elif command == "clear":
                     self.memory_manager.short_term.clear()
                     self.console.print("✓ 已清空短期记忆", style="green")
@@ -809,10 +822,32 @@ def run_health_check_standalone() -> int:
     return 1
 
 
+def run_doctor_standalone() -> int:
+    """
+    独立执行环境自检（用于 `python cli.py doctor`），不进入交互式 CLI。
+
+    Returns:
+        0 无 fail 项；1 存在必须处理的问题（便于脚本/监控）
+    """
+    import asyncio
+
+    from utils.doctor import build_report_table, has_failures, run_doctor, summarize
+
+    results = asyncio.run(run_doctor(include_network=bool(LLM_CONFIG["api_key"])))
+    Console().print(build_report_table(results))
+    text, style = summarize(results)
+    Console().print(text, style=style)
+    return 1 if has_failures(results) else 0
+
+
 def main():
     """主函数"""
-    if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "health":
-        sys.exit(run_health_check_standalone())
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].strip().lower()
+        if arg == "health":
+            sys.exit(run_health_check_standalone())
+        if arg == "doctor":
+            sys.exit(run_doctor_standalone())
     cli = AligoCLI()
     asyncio.run(cli.run())
 
