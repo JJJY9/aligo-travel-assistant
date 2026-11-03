@@ -1,0 +1,13 @@
+# 可选的提交前检查：pip install pre-commit && pre-commit install
+# 与 CI 保持一致的 ruff 检查 + 基础文件卫生检查
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
