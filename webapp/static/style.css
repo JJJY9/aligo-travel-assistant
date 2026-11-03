@@ -845,7 +845,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 }
 .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
-.sheet-tools { display: flex; gap: 8px; margin-top: 10px; }
+.sheet-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.sheet-tools .ghost { white-space: nowrap; }
 .ghost {
   padding: 7px 12px;
   border: 1px solid var(--line-strong);
