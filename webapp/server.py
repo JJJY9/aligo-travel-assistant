@@ -29,7 +29,7 @@ from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -411,6 +411,65 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
+    """把用户长期记忆整理为便于阅读的 Markdown（偏好 / 行程 / 统计 / 最近会话）。"""
+    lines = [
+        "# Aligo 用户数据导出",
+        "",
+        f"- 用户：{user_id}",
+        f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
+        "",
+    ]
+
+    preferences = {key: value for key, value in (data.get("preferences") or {}).items() if value}
+    lines.extend(["## 用户偏好", ""])
+    if preferences:
+        for key, value in preferences.items():
+            text = "、".join(str(item) for item in value) if isinstance(value, list) else str(value)
+            lines.append(f"- {key}：{text}")
+    else:
+        lines.append("- （暂无）")
+
+    lines.extend(["", "## 最近行程", ""])
+    trips = data.get("trip_history") or []
+    if trips:
+        for trip in trips[-10:]:
+            route = f"{trip.get('origin') or '—'} → {trip.get('destination') or '—'}"
+            dates = " ~ ".join(
+                part for part in (trip.get("start_date"), trip.get("end_date")) if part
+            ) or "日期未记录"
+            lines.append(f"- {route}（{dates}，{trip.get('purpose') or '出行'}）")
+    else:
+        lines.append("- （暂无）")
+
+    history = data.get("chat_history") or []
+    stats = data.get("statistics") or {}
+    usage = _usage_summary(history)
+    lines.extend(
+        [
+            "",
+            "## 统计",
+            "",
+            f"- 历史行程：{stats.get('total_trips', len(trips))}",
+            f"- 对话消息：{stats.get('total_messages', len(history))}",
+            f"- 模型调用：{usage['calls']} 次，tokens {usage['total_tokens']}",
+            "",
+        ]
+    )
+
+    sessions = _group_sessions(
+        history, 10, "", data.get("session_titles") or {}
+    )
+    lines.extend(["## 最近会话", ""])
+    if sessions:
+        for session in sessions:
+            lines.append(f"- {session['title']}（{session['message_count']} 条消息）")
+    else:
+        lines.append("- （暂无）")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -664,8 +723,21 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/export")
-    def export(user_id: str = Query(..., pattern=_ID_PATTERN)) -> Response:
+    def export(
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+        format: Literal["json", "md"] = Query(default="json"),
+    ) -> Response:
         data = _load_user_data(user_id)
+        safe_user = _safe_filename(user_id)
+        if format == "md":
+            return Response(
+                content=_user_data_markdown(user_id, data),
+                media_type="text/markdown; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="aligo_{safe_user}.md"'
+                },
+            )
+
         payload = json.dumps(
             {
                 "user_id": user_id,
@@ -679,7 +751,7 @@ def create_app(model: Any = None) -> FastAPI:
             content=payload,
             media_type="application/json",
             headers={
-                "Content-Disposition": f'attachment; filename="aligo_{_safe_filename(user_id)}.json"'
+                "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"'
             },
         )
 

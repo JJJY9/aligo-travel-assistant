@@ -457,7 +457,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - **会话重命名**：侧栏铅笔按钮内联编辑标题（Enter 保存 / Esc 取消），自定义标题持久化在 JSON / PostgreSQL 中并参与搜索；清空标题恢复自动标题
 - **对话深链接**：地址栏同步 `user` / `session` 参数（例如 `/?user=alice&session=abc123`），打开链接即可恢复会话；顶栏提供「复制链接」，无效链接会自动清理参数并回到新对话
 - **主题与布局**：浅色 / 深色主题跟随系统并可切换；窄屏下侧栏变为抽屉
-- **记忆与用量面板**：在线编辑 / 删除偏好、查看最近 5 条行程与统计、存储后端、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体），修改用户 ID，导出长期记忆 JSON
+- **记忆与用量面板**：在线编辑 / 删除偏好、查看最近 5 条行程与统计、存储后端、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体），修改用户 ID，导出长期记忆 JSON / Markdown
 - **消息操作**：复制、重新生成；Markdown 支持标题、列表、引用、表格与代码块（带复制按钮）；会话可导出为 Markdown
 - **跟进建议**：回答完成后根据本轮执行的智能体推荐 2–3 个下一步（如导出行程、查出发当天天气、调整行程），点击即可继续对话
 
@@ -465,6 +465,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 
 - 所有 `/api/` 响应带 `X-Request-ID` 头（透传请求头中的值，否则自动生成 12 位十六进制）；错误详情也会附带请求 ID，便于排查。
 - 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，超限返回 `429` 与 `Retry-After`；可用环境变量 `CHAT_RATE_LIMIT`（次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。实现为进程内滑动窗口（`utils/rate_limit.py`），多实例部署时需替换为 Redis 等共享存储。
+- 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。
 
 **接口**
 
@@ -481,7 +482,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | PUT | `/api/sessions/{id}/title` | 设置或清除会话自定义标题（空字符串恢复自动标题） |
 | GET | `/api/sessions/{id}/export` | 把会话导出为 Markdown 附件 |
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
-| GET | `/api/export` | 导出用户长期记忆 JSON（附件下载） |
+| GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载） |
 
 > 说明：短期记忆按会话级管理——进程内实现随服务重启清空，配置 `REDIS_URL` 后由 Redis TTL 控制；长期记忆与历史会话在默认 JSON（`data/memory/`）或 PostgreSQL 中持久化。用户 / 会话 ID 限制为中文、字母、数字、下划线与短横线（避免路径穿越）。服务默认只监听 `127.0.0.1`，按单机演示用途设计。
 
