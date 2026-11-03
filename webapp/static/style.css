@@ -318,10 +318,18 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   right: 4px;
   top: 50%;
   transform: translateY(-50%);
-  display: none;
+  display: flex;
   gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
 }
-.history-item:hover .hi-actions, .hi-actions:focus-within { display: flex; }
+.history-item:hover .hi-actions,
+.history-item:focus-within .hi-actions,
+.hi-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
 .hi-actions button {
   display: grid;
   place-items: center;
@@ -346,7 +354,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 }
 
 @media (hover: none) {
-  .hi-actions { display: flex; }
+  .hi-actions { opacity: 1; pointer-events: auto; }
 }
 
 .user-card {
