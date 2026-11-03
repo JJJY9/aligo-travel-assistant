@@ -39,6 +39,11 @@ class _FakeModel:
         }
 
 
+class _FailingModel:
+    async def __call__(self, messages, **kwargs):
+        raise ConnectionError("connection reset")
+
+
 def _client() -> TestClient:
     return TestClient(create_app(model=UsageTrackingModel(_FakeModel())))
 
@@ -167,6 +172,64 @@ def test_stream_heartbeat():
     finally:
         server_module.SSE_HEARTBEAT_SEC = original
         _cleanup(user_id)
+
+
+def test_chat_failure_returns_500():
+    from config import RESILIENCE_CONFIG
+
+    client = TestClient(create_app(model=UsageTrackingModel(_FailingModel())))
+    original = dict(RESILIENCE_CONFIG)
+    RESILIENCE_CONFIG.update(
+        {"max_retries": 0, "retry_base_delay_sec": 0.01, "retry_max_delay_sec": 0.01}
+    )
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": "web_test_fail", "session_id": "sess-fail"},
+            headers={"X-Request-ID": "fail-test"},
+        )
+    finally:
+        RESILIENCE_CONFIG.clear()
+        RESILIENCE_CONFIG.update(original)
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert "处理失败" in detail and "fail-test" in detail
+    assert response.headers["x-request-id"] == "fail-test"
+    print("✓ 对话失败返回 500 与请求 ID")
+
+
+def test_chat_stream_failure_event():
+    from config import RESILIENCE_CONFIG
+
+    client = TestClient(create_app(model=UsageTrackingModel(_FailingModel())))
+    original = dict(RESILIENCE_CONFIG)
+    RESILIENCE_CONFIG.update(
+        {"max_retries": 0, "retry_base_delay_sec": 0.01, "retry_max_delay_sec": 0.01}
+    )
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": "web_test_fail_stream",
+                "session_id": "sess-fail-stream",
+            },
+        ) as response:
+            assert response.status_code == 200
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+    finally:
+        RESILIENCE_CONFIG.clear()
+        RESILIENCE_CONFIG.update(original)
+
+    assert events and events[-1]["type"] == "error"
+    assert "处理失败" in events[-1]["message"]
+    print("✓ 流式对话失败推送 error 事件")
 
 
 def test_sessions_listing_and_delete():
@@ -647,6 +710,8 @@ if __name__ == "__main__":
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
     test_stream_heartbeat()
+    test_chat_failure_returns_500()
+    test_chat_stream_failure_event()
     test_sessions_listing_and_delete()
     test_session_search()
     test_status_usage_totals()
