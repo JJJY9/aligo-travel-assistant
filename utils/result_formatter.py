@@ -173,6 +173,21 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                 doc_names.append(str(name))
         if doc_names:
             text += "\n\n**参考来源**：" + "、".join(doc_names[:3])
+
+        snippets: list[str] = []
+        for document in documents[:3]:
+            if not isinstance(document, dict):
+                continue
+            excerpt = " ".join(str(document.get("content") or "").split())
+            if not excerpt:
+                continue
+            if len(excerpt) > 140:
+                excerpt = excerpt[:140] + "…"
+            snippets.append(excerpt)
+        if snippets:
+            text += "\n\n**参考片段**"
+            for snippet in snippets:
+                text += f"\n\n> {snippet}"
         return text
 
     if agent_name == "memory_query":
