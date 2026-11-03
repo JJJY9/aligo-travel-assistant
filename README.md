@@ -1,5 +1,9 @@
 # Aligo 智能旅行助手
 
+[![CI](https://github.com/JJJY9/aligo-travel-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/JJJY9/aligo-travel-assistant/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆为进程内滑动窗口，长期记忆为 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。文中提到的 Redis / PostgreSQL 为面向生产环境的架构设计，**尚未实现**；关键指标为开发期实验口径（见「关键指标」小节说明）。
