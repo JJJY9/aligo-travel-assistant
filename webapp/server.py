@@ -63,11 +63,13 @@ _ID_PATTERN = r"^[\w-]{1,64}$"
 
 # 基础安全响应头：CSP 仅允许同源脚本（主题脚本已拆为 /static/theme.js）；
 # 样式允许内联以支持 JS 动态设置 style 属性。
-_SECURITY_HEADERS = [
+_BASE_SECURITY_HEADERS = [
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
     (b"referrer-policy", b"no-referrer"),
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+]
+_SECURITY_HEADERS = _BASE_SECURITY_HEADERS + [
     (
         b"content-security-policy",
         b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -75,6 +77,26 @@ _SECURITY_HEADERS = [
         b"base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     ),
 ]
+# Swagger UI / ReDoc 需要从 CDN 加载脚本并内联初始化，仅在文档页面放宽 CSP；
+# 其它页面仍使用上面的严格策略。
+_DOCS_SECURITY_HEADERS = _BASE_SECURITY_HEADERS + [
+    (
+        b"content-security-policy",
+        b"default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        b"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+        b"img-src 'self' data: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
+        b"font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; "
+        b"connect-src 'self'; worker-src blob:; "
+        b"base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
+    ),
+]
+
+
+def _security_headers_for(path: str) -> list[tuple[bytes, bytes]]:
+    """按路径返回安全响应头：文档页面使用放宽 CSP，其它页面保持严格策略。"""
+    if path in ("/docs", "/redoc") or path.startswith(("/docs/", "/redoc/")):
+        return _DOCS_SECURITY_HEADERS
+    return _SECURITY_HEADERS
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -101,22 +123,49 @@ class RequestContextMiddleware:
 
         started = time.perf_counter()
         status_code = 0
+        response_started = False
+        path = str(scope.get("path", ""))
+        response_headers = _security_headers_for(path)
 
         async def send_wrapper(message: dict[str, Any]) -> None:
-            nonlocal status_code
+            nonlocal status_code, response_started
             if message["type"] == "http.response.start":
+                response_started = True
                 status_code = int(message.get("status", 0))
                 message["headers"] = (
                     list(message.get("headers") or [])
-                    + _SECURITY_HEADERS
+                    + response_headers
                     + [(b"x-request-id", request_id.encode("latin-1"))]
                 )
             await send(message)
 
         try:
             await self.app(scope, receive, send_wrapper)
+        except Exception as exc:  # noqa: BLE001 - 兜底：未处理异常也要带上安全头与请求 ID
+            logger.exception("未处理的请求异常 [%s] %s", request_id, path)
+            if response_started:
+                # 响应已开始（如流式输出中断），无法再补发 500，交由服务器断开连接
+                raise
+            try:
+                await send_wrapper(
+                    {
+                        "type": "http.response.start",
+                        "status": 500,
+                        "headers": [(b"content-type", b"application/json; charset=utf-8")],
+                    }
+                )
+                await send_wrapper(
+                    {
+                        "type": "http.response.body",
+                        "body": json.dumps(
+                            {"detail": f"服务器内部错误，请稍后重试（请求 ID：{request_id}）"},
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                    }
+                )
+            except Exception:  # noqa: BLE001 - 客户端可能已断开
+                raise exc from None
         finally:
-            path = str(scope.get("path", ""))
             if path.startswith("/api/"):
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 logger.info(

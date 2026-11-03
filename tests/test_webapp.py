@@ -560,6 +560,39 @@ def test_security_headers():
     print("✓ 安全响应头（CSP / nosniff / frame / referrer）")
 
 
+def test_docs_csp_allows_cdn():
+    """Swagger UI 需要从 CDN 加载资源：仅文档页面放宽 CSP，普通页面保持严格。"""
+    client = _client()
+    docs = client.get("/docs")
+    assert docs.status_code == 200
+    docs_csp = docs.headers["content-security-policy"]
+    assert "cdn.jsdelivr.net" in docs_csp
+    assert "script-src 'self'" in docs_csp
+
+    home_csp = client.get("/").headers["content-security-policy"]
+    assert "cdn.jsdelivr.net" not in home_csp
+    assert "script-src 'self'" in home_csp
+    assert "frame-ancestors 'none'" in home_csp
+    print("✓ 文档页面放宽 CSP，普通页面保持严格策略")
+
+
+def test_unhandled_error_returns_500_with_headers():
+    """未处理异常由中间件兜底：500 响应也要带安全头与请求 ID。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+
+    @app.get("/api/_boom")
+    async def boom():
+        raise RuntimeError("boom")
+
+    response = TestClient(app).get("/api/_boom", headers={"X-Request-ID": "boom-1"})
+    assert response.status_code == 500
+    assert response.headers["x-request-id"] == "boom-1"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "content-security-policy" in response.headers
+    assert "boom-1" in response.json()["detail"]
+    print("✓ 未处理异常返回 500 且带安全响应头 / 请求 ID")
+
+
 def test_export_markdown():
     from context.storage import create_long_term_memory
 
@@ -733,6 +766,8 @@ if __name__ == "__main__":
     test_session_lru_eviction()
     test_request_id_header()
     test_security_headers()
+    test_docs_csp_allows_cdn()
+    test_unhandled_error_returns_500_with_headers()
     test_chat_rate_limit()
     test_session_rename()
     test_session_pin()
