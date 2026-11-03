@@ -37,6 +37,7 @@
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
+- 知识库维护：记忆面板可查看 / 新增 / 删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可被检索；删除后再新增按最大 id 递增，不会与已有主键冲突
 
 ### ⚡ 优先级并行调度
 - Plan-and-Execute架构：IntentionAgent → OrchestrationAgent → 子Agent
@@ -482,6 +483,9 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
 | GET | `/api/health` | 服务版本 / 模型 / 存储后端状态 |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
+| GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q`，按 id 倒序） |
+| POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
+| DELETE | `/api/knowledge/documents/{id}` | 删除知识片段 |
 | GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程数 / 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |

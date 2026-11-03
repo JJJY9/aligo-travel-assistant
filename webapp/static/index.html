@@ -249,6 +249,29 @@
         <div class="chips" id="knowledgeChip"></div>
       </section>
       <section class="sheet-section">
+        <h3>知识库维护</h3>
+        <div class="kb-list" id="kbList">加载中…</div>
+        <form class="kb-form" id="kbForm">
+          <textarea
+            id="kbContent"
+            rows="2"
+            maxlength="2000"
+            placeholder="新增知识片段，例如：一线城市住宿标准为每晚 600 元"
+            aria-label="知识片段内容"
+          ></textarea>
+          <div class="kb-form-row">
+            <input
+              id="kbCategory"
+              type="text"
+              maxlength="20"
+              placeholder="分类（可选）"
+              aria-label="知识分类"
+            />
+            <button class="ghost" id="kbSubmit" type="submit">添加片段</button>
+          </div>
+        </form>
+      </section>
+      <section class="sheet-section">
         <h3>偏好</h3>
         <div class="pref-list" id="overview">加载中…</div>
       </section>
