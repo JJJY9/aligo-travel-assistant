@@ -47,6 +47,7 @@ def build_turn_meta(
             {
                 "name": item.get("agent_name", ""),
                 "status": item.get("status", "unknown"),
+                "duration": item.get("duration"),
             }
         )
 

@@ -16,6 +16,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -309,6 +310,7 @@ class OrchestrationAgent(AgentBase):
     ) -> dict[str, Any]:
         """执行单个智能体，并在开始 / 结束时发出进度事件。"""
         self._emit(on_event, {"type": "agent_start", "agent_name": agent_name})
+        started = time.perf_counter()
         result = await self._run_agent(
             agent_name=agent_name,
             context=context,
@@ -316,6 +318,8 @@ class OrchestrationAgent(AgentBase):
             expected_output=expected_output,
             previous_results=previous_results,
         )
+        duration = round(time.perf_counter() - started, 2)
+        result["duration"] = duration
         self._emit(
             on_event,
             {
@@ -323,6 +327,7 @@ class OrchestrationAgent(AgentBase):
                 "agent_name": agent_name,
                 "status": result.get("status", "unknown"),
                 "message": result.get("message", ""),
+                "duration": duration,
             },
         )
         return result
@@ -445,7 +450,8 @@ class OrchestrationAgent(AgentBase):
                 "agent_name": result["agent_name"],
                 "priority": result["priority"],
                 "status": result["result"].get("status", "unknown"),
-                "data": result["result"].get("data", {})
+                "data": result["result"].get("data", {}),
+                "duration": result["result"].get("duration"),
             })
 
         # 检查是否有错误

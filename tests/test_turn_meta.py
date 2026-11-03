@@ -37,6 +37,7 @@ _RESULT = {
             "agent_name": "preference",
             "priority": 1,
             "status": "success",
+            "duration": 1.23,
             "data": {
                 "preferences": [
                     {"type": "hotel_brands", "value": "汉庭", "action": "replace"}
@@ -58,7 +59,7 @@ _USAGE = {
 def test_build_and_roundtrip():
     meta = build_turn_meta(_INTENTION, _RESULT, usage=_USAGE, elapsed=3.14159)
     assert meta["schedule"][0]["agent_name"] == "preference"
-    assert meta["agents"] == [{"name": "preference", "status": "success"}]
+    assert meta["agents"] == [{"name": "preference", "status": "success", "duration": 1.23}]
     assert meta["elapsed"] == 3.14
     assert meta["usage"] == _USAGE
 
