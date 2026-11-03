@@ -644,6 +644,53 @@ def test_trips_calendar_api():
         _cleanup(user_id)
 
 
+def test_create_trip_api():
+    user_id = _unique_user("web_test_add_trip")
+    client = _client()
+    payload = {
+        "user_id": user_id,
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-11-20",
+        "end_date": "2026-11-22",
+        "purpose": "出差",
+    }
+    try:
+        created = client.post("/api/trips", json=payload)
+        assert created.status_code == 201
+        assert created.json()["trip_id"] == "trip_1"
+
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["trip_count"] == 1
+        assert status["trips"][0]["destination"] == "上海"
+        assert status["trips"][0]["purpose"] == "出差"
+
+        # 同路线 + 同起止日期重复添加：去重并返回同一 trip_id
+        again = client.post("/api/trips", json=payload)
+        assert again.status_code == 201
+        assert again.json()["trip_id"] == "trip_1"
+        assert (
+            client.get("/api/status", params={"user_id": user_id}).json()["trip_count"]
+            == 1
+        )
+
+        # 结束日期早于出发日期 / 非法日期 / 缺少目的地
+        bad_range = client.post(
+            "/api/trips",
+            json={**payload, "start_date": "2026-11-22", "end_date": "2026-11-20"},
+        )
+        assert bad_range.status_code == 422
+        bad_date = client.post(
+            "/api/trips", json={**payload, "start_date": "2026-02-30"}
+        )
+        assert bad_date.status_code == 422
+        missing = client.post("/api/trips", json={**payload, "destination": ""})
+        assert missing.status_code == 422
+        print("✓ /api/trips 手动添加行程（去重 / 日期校验）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -1279,6 +1326,7 @@ if __name__ == "__main__":
     test_preferences_api()
     test_status_trips()
     test_delete_trip_api()
+    test_create_trip_api()
     _mp = pytest.MonkeyPatch()
     try:
         test_delete_trip_storage_failure_maps_503(_mp)

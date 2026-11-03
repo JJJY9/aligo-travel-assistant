@@ -283,15 +283,15 @@ class PostgresLongTermMemory:
 
     # ---------- 历史行程 ----------
 
-    def save_trip_history(self, trip_info: dict[str, Any]) -> None:
-        """保存行程历史；同路线 + 同起止日期视为重复记录，更新而不是新增。"""
+    def save_trip_history(self, trip_info: dict[str, Any]) -> str:
+        """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。"""
         purpose = trip_info.get("purpose") or "旅游"
         destination = trip_info.get("destination")
         start_date = str(trip_info.get("start_date") or "")
         if destination and start_date:
             existing = self._fetchone(
                 """
-                SELECT id FROM aligo_trips
+                SELECT id, trip_id FROM aligo_trips
                 WHERE user_id = %s
                   AND destination = %s
                   AND origin IS NOT DISTINCT FROM %s
@@ -312,9 +312,10 @@ class PostgresLongTermMemory:
                     "UPDATE aligo_trips SET purpose = %s, session_id = %s WHERE id = %s",
                     (purpose, trip_info.get("session_id"), existing[0]),
                 )
-                return
+                return str(existing[1] or "")
 
         trip_number = self._next_trip_number()
+        trip_id = f"trip_{trip_number}"
         self._execute(
             """
             INSERT INTO aligo_trips
@@ -323,7 +324,7 @@ class PostgresLongTermMemory:
             """,
             (
                 self.user_id,
-                f"trip_{trip_number}",
+                trip_id,
                 trip_info.get("origin"),
                 destination,
                 trip_info.get("start_date"),
@@ -332,6 +333,7 @@ class PostgresLongTermMemory:
                 trip_info.get("session_id"),
             ),
         )
+        return trip_id
 
     def _next_trip_number(self) -> int:
         """下一个行程序号：现有最大 trip_N 的 N + 1（删除后不复用）。"""

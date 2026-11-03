@@ -237,6 +237,20 @@ class PreferencePayload(BaseModel):
     value: PreferenceValue
 
 
+_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+
+
+class TripPayload(BaseModel):
+    """手动添加行程（记忆面板入口）。"""
+
+    user_id: str = Field(pattern=_ID_PATTERN)
+    origin: str = Field(default="", max_length=50)
+    destination: str = Field(min_length=1, max_length=50)
+    start_date: str = Field(pattern=_DATE_PATTERN)
+    end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
+    purpose: str = Field(default="出差", max_length=20)
+
+
 class SessionTitlePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
     title: str = Field(max_length=60)
@@ -1118,6 +1132,39 @@ def create_app(model: Any = None) -> FastAPI:
                 "Connection": "keep-alive",
             },
         )
+
+    @app.post("/api/trips", status_code=201)
+    def create_trip(payload: TripPayload) -> dict[str, Any]:
+        """手动添加一条行程（同路线 + 同起止日期自动去重）。"""
+        try:
+            start = datetime.strptime(payload.start_date, "%Y-%m-%d")
+            end = (
+                datetime.strptime(payload.end_date, "%Y-%m-%d")
+                if payload.end_date
+                else None
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="日期格式应为 YYYY-MM-DD") from exc
+        if end is not None and end < start:
+            raise HTTPException(status_code=422, detail="结束日期不能早于出发日期")
+
+        store = _open_long_term(payload.user_id)
+        try:
+            trip_id = store.save_trip_history(
+                {
+                    "origin": payload.origin.strip(),
+                    "destination": payload.destination.strip(),
+                    "start_date": payload.start_date,
+                    "end_date": payload.end_date,
+                    "purpose": payload.purpose.strip() or "出差",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
+            logger.warning("添加行程失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"添加行程失败：{exc}") from exc
+        finally:
+            _close_long_term(store)
+        return {"trip_id": trip_id, "saved": True}
 
     @app.get("/api/trips/calendar")
     def export_trips_calendar(
