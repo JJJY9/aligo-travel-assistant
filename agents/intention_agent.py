@@ -19,6 +19,7 @@ import logging
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
+from utils.json_parser import extract_json_from_async_response
 from utils.llm_resilience import is_retriable_error
 from utils.skill_loader import SkillLoader
 
@@ -224,28 +225,8 @@ class IntentionAgent(AgentBase):
             ]
             response = await self.model(messages)
 
-            # 获取响应文本 - 处理异步生成器
-            text = ""
-            if hasattr(response, '__aiter__'):
-                # 异步生成器，需要迭代获取内容
-                async for chunk in response:
-                    if isinstance(chunk, str):
-                        text = chunk
-                    elif hasattr(chunk, 'content'):
-                        if isinstance(chunk.content, str):
-                            text = chunk.content
-                        elif isinstance(chunk.content, list):
-                            for item in chunk.content:
-                                if isinstance(item, dict) and item.get('type') == 'text':
-                                    text = item.get('text', '')
-            elif hasattr(response, 'text'):
-                text = response.text
-            elif hasattr(response, 'content'):
-                text = response.content
-            elif isinstance(response, dict) and 'content' in response:
-                text = response['content']
-            else:
-                text = str(response) if response else ""
+            # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
+            text = await extract_json_from_async_response(response)
 
             # 清理文本
             text = text.strip()

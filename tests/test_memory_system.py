@@ -12,12 +12,14 @@ sys.path.insert(0, str(project_root))
 
 import asyncio
 import logging
+import tempfile
 import uuid
 from datetime import datetime
 
 import pytest
 from agentscope import init as init_agentscope
-from agentscope.model import OpenAIChatModel
+
+from config_agentscope import create_chat_model
 
 from context.memory_manager import MemoryManager
 
@@ -40,9 +42,9 @@ RUN_TAG = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:8]}"
 RUN_USER_ID = f"memory-check-{RUN_TAG}"
 RUN_SESSION_FIRST = f"session-first-{RUN_TAG}"
 RUN_SESSION_SECOND = f"session-second-{RUN_TAG}"
-# 本次运行的独立存储目录：同一用户的两个会话仍共享长期记忆，
-# 但不与上一次运行或仓库里已有的数据互相污染
-RUN_STORAGE_PATH = f"data/test_memory/{RUN_TAG}"
+# 本次运行的独立存储目录（放在系统临时目录，避免污染仓库）：
+# 同一用户的两个会话仍共享长期记忆，但不与上一次运行或仓库里已有的数据互相污染
+RUN_STORAGE_PATH = str(Path(tempfile.gettempdir()) / "chailv_test_memory" / RUN_TAG)
 
 
 def print_section(title):
@@ -63,13 +65,7 @@ async def test_memory_system():
     import warnings
     warnings.filterwarnings("ignore")
 
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"]},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-    )
+    model = create_chat_model()
     print("✓ LLM模型初始化完成")
 
     # 初始化记忆管理器

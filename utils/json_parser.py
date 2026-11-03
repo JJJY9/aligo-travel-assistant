@@ -172,69 +172,92 @@ def robust_json_parse(text: str, fallback=None) -> dict:
     raise ValueError(f"Failed to parse JSON after all attempts. Last error: {last_error}")
 
 
+def _extract_text_from_block(block) -> str:
+    """从 agentscope 内容块中提取文本（TextBlock 形如 {'type': 'text', 'text': ...}）。"""
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict):
+        if block.get("type") == "text":
+            return block.get("text") or ""
+        return ""
+    # 其他实现：对象形式的文本块
+    if getattr(block, "type", None) == "text":
+        return getattr(block, "text", "") or ""
+    return ""
+
+
+def extract_response_text(response) -> str:
+    """从模型返回中提取纯文本，兼容以下形态：
+
+    - **非流式 ChatResponse**：agentscope 1.0.16 的 `dict` 子类，形如
+      `{"content": [{"type": "text", "text": "..."}, ...]}`。
+      注意它重写了 `__getattr__`，访问不存在的属性会抛 `KeyError` 而不是
+      `AttributeError`，因此必须先按 dict 处理，不能使用 `hasattr`。
+    - 字符串，或带 `.text` / `.content` 属性的简单对象（测试 mock、其他模型封装）；
+    - 其他对象，兜底转字符串。
+    """
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        content = response.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(_extract_text_from_block(block) for block in content)
+        if content is None:
+            return ""
+        return str(content)
+    # 非 dict 对象：常规属性访问，hasattr 安全
+    text = getattr(response, "text", None)
+    if text is not None:
+        return str(text)
+    content = getattr(response, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(_extract_text_from_block(block) for block in content)
+    if content is not None:
+        return str(content)
+    return str(response)
+
+
 def extract_json_from_response(response, field_name="content") -> str:
     """
-    从各种响应格式中提取 JSON 字符串
+    从各种响应格式中提取文本（兼容旧接口，field_name 参数已废弃）
 
     Args:
-        response: 模型响应（可能是异步生成器、字典、字符串等）
-        field_name: 要提取的字段名
+        response: 模型响应（ChatResponse / 字典 / 字符串等）
+        field_name: 保留以兼容旧调用方，无实际作用
 
     Returns:
         提取的文本内容
     """
-    text = ""
-
-    # 处理不同的响应格式
-    if hasattr(response, 'text'):
-        text = response.text
-    elif hasattr(response, field_name):
-        content = getattr(response, field_name)
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get('type') == 'text':
-                    text = item.get('text', '')
-                    break
-    elif isinstance(response, dict) and field_name in response:
-        text = response[field_name]
-    elif isinstance(response, str):
-        text = response
-    else:
-        text = str(response) if response else ""
-
-    return text
+    return extract_response_text(response)
 
 
 async def extract_json_from_async_response(response, field_name="content") -> str:
     """
-    从异步响应中提取 JSON 字符串
+    从（可能是异步生成器的）模型响应中提取文本。
+
+    流式返回时取最后一个非空文本块的累积结果（agentscope 的流式块
+    携带逐次累积的 content）；非流式响应直接走同步解析。
 
     Args:
-        response: 模型响应（可能是异步生成器）
-        field_name: 要提取的字段名
+        response: 模型响应（可能是异步生成器 / ChatResponse / 字符串等）
+        field_name: 保留以兼容旧调用方，无实际作用
 
     Returns:
         提取的文本内容
     """
-    text = ""
-
-    # 处理异步生成器
-    if hasattr(response, '__aiter__'):
+    # ChatResponse 是 dict 子类，必须先排除再判断 __aiter__（其 __getattr__ 会抛 KeyError）
+    if not isinstance(response, dict) and hasattr(response, "__aiter__"):
+        text = ""
         async for chunk in response:
-            if isinstance(chunk, str):
-                text = chunk
-            elif hasattr(chunk, field_name):
-                content = getattr(chunk, field_name)
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get('type') == 'text':
-                            text = item.get('text', '')
-    else:
-        # 非异步响应，使用同步方法
-        text = extract_json_from_response(response, field_name)
+            chunk_text = extract_response_text(chunk)
+            if chunk_text:
+                text = chunk_text
+        return text
+    return extract_json_from_response(response)
 
-    return text

@@ -60,6 +60,8 @@ config_local.py
 
 # 用户记忆数据（运行时生成，含对话历史）
 data/memory/
+# 测试生成的临时记忆数据
+data/test_memory/
 
 # 本地 Embedding 模型（从 HuggingFace/ModelScope 下载，见 README）
 data/models/*

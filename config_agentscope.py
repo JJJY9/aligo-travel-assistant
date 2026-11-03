@@ -24,6 +24,50 @@ def init_agentscope():
     print(f"✓ AgentScope initialized (version: {agentscope.__version__})")
 
 
+def create_chat_model(
+    api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+    timeout: float | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+):
+    """
+    创建 OpenAI 兼容的聊天模型实例（默认 DeepSeek）。
+
+    针对 agentscope 1.0.16 的两个注意点：
+    1. `temperature` / `max_tokens` 必须通过 `generate_kwargs` 传入，
+       作为构造函数顶层参数会被静默忽略（只打印 Unknown keyword arguments 警告）；
+    2. 其流式解析在 DeepSeek 等标准 OpenAI 兼容服务上会崩溃
+       （delta.audio 为 None 时仍执行 `"data" in None`），因此统一使用
+       非流式（stream=False）。非流式响应为 ChatResponse（dict 子类，
+       content 为文本块列表），解析统一走 utils.json_parser.extract_response_text。
+    """
+    from agentscope.model import OpenAIChatModel
+
+    from config import SYSTEM_CONFIG
+
+    return OpenAIChatModel(
+        model_name=model_name or LLM_CONFIG["model_name"],
+        api_key=LLM_CONFIG["api_key"] if api_key is None else api_key,
+        stream=False,
+        client_kwargs={
+            "base_url": base_url or LLM_CONFIG["base_url"],
+            "timeout": float(
+                timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
+            ),
+        },
+        generate_kwargs={
+            "temperature": (
+                LLM_CONFIG.get("temperature", 0.7) if temperature is None else temperature
+            ),
+            "max_tokens": (
+                LLM_CONFIG.get("max_tokens", 8192) if max_tokens is None else max_tokens
+            ),
+        },
+    )
+
+
 def get_model_config():
     """
     获取模型配置（用于Agent初始化）

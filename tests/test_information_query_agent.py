@@ -27,9 +27,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
-
-from config_agentscope import init_agentscope
+from config_agentscope import create_chat_model, init_agentscope
 
 # 导入 skill 目录下的 agent
 sys.path.insert(0, os.path.join(project_root, '.claude', 'skills', 'query-info', 'script'))
@@ -60,14 +58,7 @@ async def test_information_query_agent():
     print()
 
     # 创建模型
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"]},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-        stream=True,
-    )
+    model = create_chat_model()
 
     # 创建智能体
     agent = InformationQueryAgent(

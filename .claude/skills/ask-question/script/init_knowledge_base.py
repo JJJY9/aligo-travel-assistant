@@ -12,9 +12,7 @@ project_root = current_dir.parent.parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from agentscope.model import OpenAIChatModel
-
-from config import LLM_CONFIG
+from config_agentscope import create_chat_model
 
 
 # 动态加载同目录下的 agent.py
@@ -183,17 +181,9 @@ def main():
 
     rag_agent = None
     try:
-        # 创建模型
+        # 创建模型（知识库导入阶段不会调用模型，仅保持 Agent 接口一致）
         print("1. 创建模型...")
-        model = OpenAIChatModel(
-            model_name=LLM_CONFIG["model_name"],
-            api_key=LLM_CONFIG["api_key"],
-            client_kwargs={
-                "base_url": LLM_CONFIG["base_url"],
-            },
-            temperature=LLM_CONFIG.get("temperature", 0.7),
-            max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-        )
+        model = create_chat_model()
         print("✓ 模型创建成功")
         print()
 

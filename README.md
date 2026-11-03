@@ -517,6 +517,7 @@ aligo-travel-assistant/
 ### 模型配置
 - 必须配置大模型API密钥（默认 DeepSeek：环境变量 `LLM_API_KEY`，或本地 `config_local.py`）
 - 默认使用 `deepseek-chat`（响应快、成本低），可在 `config.py` / 环境变量中切换模型与服务商
+- **兼容性说明**：agentscope 1.0.16 的流式解析在 DeepSeek 等标准 OpenAI 兼容服务上会报错（上游对 `delta.audio` 的判断缺陷），项目统一使用**非流式**调用；`temperature` / `max_tokens` 通过 `generate_kwargs` 传入（顶层参数会被静默忽略）。模型统一由 `config_agentscope.create_chat_model()` 创建
 - BGE Embedding模型需下载到 `data/models/bge-small-zh-v1.5/`（仓库不含模型文件）：
   - HuggingFace: https://huggingface.co/BAAI/bge-small-zh-v1.5
   - ModelScope（国内更快）: https://modelscope.cn/models/BAAI/bge-small-zh-v1.5

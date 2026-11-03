@@ -22,11 +22,10 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
 
 from agents.rag_knowledge_agent import RAGKnowledgeAgent
 from config import LLM_CONFIG
-from config_agentscope import init_agentscope
+from config_agentscope import create_chat_model, init_agentscope
 
 requires_llm_key = pytest.mark.skipif(
     not LLM_CONFIG["api_key"],
@@ -50,13 +49,7 @@ async def test_rag_agent():
     print()
 
     print("创建模型...")
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"]},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-    )
+    model = create_chat_model()
     print("✓ 模型创建成功")
     print()
 
@@ -64,9 +57,8 @@ async def test_rag_agent():
     agent = RAGKnowledgeAgent(
         name="RAGKnowledgeAgent",
         model=model,
-        knowledge_base_path="./data/rag_knowledge",
         collection_name="business_travel_knowledge",
-        top_k=3
+        top_k=3,
     )
 
     if not agent.initialized:
