@@ -26,3 +26,6 @@ pytest-asyncio==1.4.1
 pytest-cov==7.1.0
 ruff==0.17.3
 mypy==2.4.1
+
+# 打包检查（CI 中构建 wheel，验证 pyproject / 包数据完整）
+build==1.6.1

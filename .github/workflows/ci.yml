@@ -83,3 +83,7 @@ jobs:
           python -m pytest tests/ -q \
             --cov=agents --cov=context --cov=utils --cov=webapp \
             --cov=config_agentscope --cov-report=term-missing:skip-covered
+
+      - name: 打包检查（wheel）
+        if: matrix.python-version == '3.12'
+        run: python -m build --wheel
