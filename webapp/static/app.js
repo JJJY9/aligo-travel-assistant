@@ -117,6 +117,7 @@ const els = {
   exportDataMd: byId("exportDataMd"),
   overview: byId("overview"),
   trips: byId("trips"),
+  exportTrips: byId("exportTrips"),
   destinations: byId("destinations"),
   stats: byId("stats"),
   usageStats: byId("usageStats"),
@@ -1655,8 +1656,9 @@ function renderOverview() {
     });
   }
 
-  const frequent = (status.statistics && status.statistics.frequent_destinations) || {};
-  const destinations = Object.entries(frequent)
+  els.exportTrips.hidden = !trips.length;
+
+  const frequent = (status.statistics && status.statistics.frequent_destinations) || {};  const destinations = Object.entries(frequent)
     .sort((a, b) => Number(b[1]) - Number(a[1]))
     .slice(0, 5);
   els.destinations.innerHTML = "";
@@ -2505,6 +2507,12 @@ function bindEvents() {
 
   els.exportChat.addEventListener("click", triggerExport);
   els.exportHtml.addEventListener("click", exportSessionHtml);
+  els.exportTrips.addEventListener("click", () => {
+    window.open(
+      `/api/trips/calendar?user_id=${encodeURIComponent(state.userId)}`,
+      "_blank",
+    );
+  });
 
   els.menuBtn.addEventListener("click", toggleSidebar);
   els.collapseSidebar.addEventListener("click", toggleSidebar);
