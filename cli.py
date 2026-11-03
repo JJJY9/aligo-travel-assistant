@@ -24,6 +24,7 @@ from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
 from config_agentscope import create_chat_model, init_agentscope
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
+from utils.console import configure_stdio
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 
@@ -875,6 +876,7 @@ def run_doctor_standalone() -> int:
 
 def main():
     """主函数"""
+    configure_stdio()
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip().lower()
         if arg == "health":

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aligo 智能旅行助手</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-logo">🌏</span>
+        <div>
+          <strong>Aligo</strong>
+          <small>智能旅行助手</small>
+        </div>
+      </div>
+
+      <label class="field">
+        <span>用户 ID</span>
+        <input id="userId" type="text" maxlength="64" placeholder="输入用户 ID" autocomplete="off" />
+      </label>
+
+      <div class="actions">
+        <button id="newSession" class="ghost" type="button">＋ 新会话</button>
+        <button id="exportData" class="ghost" type="button">⬇ 导出数据</button>
+      </div>
+
+      <section class="panel">
+        <h3>数据概览</h3>
+        <div id="overview" class="overview">加载中…</div>
+      </section>
+
+      <section class="panel">
+        <h3>试试这样问</h3>
+        <div class="examples">
+          <button type="button" data-example="帮我规划下周一从北京去杭州出差3天，我喜欢住汉庭">规划去杭州的出差行程</button>
+          <button type="button" data-example="杭州明天天气怎么样？">杭州明天天气</button>
+          <button type="button" data-example="一线城市住宿标准是多少？">一线城市住宿标准</button>
+          <button type="button" data-example="我之前说过什么偏好？">我有哪些偏好</button>
+        </div>
+      </section>
+
+      <footer class="sidebar-footer">FastAPI · DeepSeek · AgentScope</footer>
+    </aside>
+
+    <main class="chat">
+      <header class="chat-header">
+        <div>
+          <h1>对话</h1>
+          <p id="sessionInfo" class="muted">会话：新</p>
+        </div>
+        <span id="connState" class="status-dot" title="服务状态"></span>
+      </header>
+
+      <div id="messages" class="messages">
+        <div class="welcome">
+          <h2>你好，我是 Aligo 👋</h2>
+          <p>我可以规划行程、回答差旅政策、查天气，并记住你的出行偏好。</p>
+        </div>
+      </div>
+
+      <form id="composer" class="composer">
+        <textarea id="input" rows="2" maxlength="4000" placeholder="输入你的需求，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="send" type="submit">发送</button>
+      </form>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

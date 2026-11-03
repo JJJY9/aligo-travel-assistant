@@ -415,6 +415,31 @@ python cli.py
 
 ---
 
+## Web 界面
+
+除 CLI 外，项目提供轻量 Web 界面（FastAPI 后端 + 无构建前端，无需 Node）：
+
+```bash
+pip install -r requirements.txt   # 已包含 fastapi / uvicorn
+python -m webapp.server            # 安装后也可直接执行 aligo-web
+```
+
+打开 <http://127.0.0.1:8000> 即可对话。界面支持：多轮对话、示例问题、偏好 / 行程
+概览、数据导出、新会话管理。
+
+后端接口：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/chat` | 发送消息（`message` / `user_id` / `session_id`） |
+| GET | `/api/status` | 用户数据概览（偏好 / 行程数 / 统计） |
+| GET | `/api/export` | 导出用户长期记忆 JSON（附件下载） |
+
+> 说明：短期会话保存在服务进程内存中（重启后为新的短期记忆），长期记忆仍持久化在
+> `data/memory/`；服务默认只监听 `127.0.0.1`，按单机演示用途设计。
+
+---
+
 ## 测试
 
 ### 回归测试（无需 API Key）
@@ -452,7 +477,8 @@ aligo-travel-assistant/
 ├── agents/                          # 核心编排层
 │   ├── intention_agent.py           # 意图识别（语义理解）
 │   ├── orchestration_agent.py       # 协调器（优先级 + 并行调度）
-│   └── lazy_agent_registry.py       # 智能体插件注册器（懒加载）
+│   ├── lazy_agent_registry.py       # 智能体插件注册器（懒加载）
+│   └── conversation.py              # 对话运行时（Web 界面的完整流水线）
 ├── .claude/skills/                  # Skill Plugins（子智能体）
 │   ├── ask-question/                # RAG 知识库问答（含文档与向量库）
 │   ├── event-collection/            # 事项收集
@@ -468,7 +494,14 @@ aligo-travel-assistant/
 │   ├── circuit_breaker.py           # 熔断器
 │   ├── llm_resilience.py            # 重试退避、健康检查
 │   ├── json_parser.py               # 鲁棒 JSON 解析
+│   ├── result_formatter.py          # 编排结果 → Markdown
+│   ├── exporter.py                  # 用户数据导出（JSON / Markdown）
+│   ├── text_chunker.py              # RAG 文本按小节切分
+│   ├── doctor.py                    # 环境自检
 │   └── skill_loader.py              # SKILL.md 加载器
+├── webapp/                          # Web 界面（FastAPI）
+│   ├── server.py                    # API 服务与静态页面
+│   └── static/                      # 无构建前端（HTML / CSS / JS）
 ├── tests/                           # 测试（多数无需 API Key）
 ├── data/                            # 运行数据（均不提交）
 │   ├── memory/                      # 长期记忆（{user_id}.json，gitignored）
