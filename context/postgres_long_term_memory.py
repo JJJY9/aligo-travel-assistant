@@ -176,6 +176,20 @@ class PostgresLongTermMemory:
             for role, content, session_id_value, created_at in rows
         ]
 
+    def delete_chat_session(self, session_id: str) -> int:
+        """删除某个会话的全部聊天记录，返回删除条数。"""
+        with self._conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM aligo_chat_messages WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
+            removed = cursor.rowcount or 0
+        if removed:
+            logger.info(
+                "Deleted chat session from PostgreSQL: %s (%s messages)", session_id, removed
+            )
+        return removed
+
     # ---------- 历史行程 ----------
 
     def save_trip_history(self, trip_info: dict[str, Any]) -> None:

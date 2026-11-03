@@ -10,7 +10,9 @@
 - 结果写入短期 / 长期记忆。
 """
 import json
+import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from agentscope.message import Msg
@@ -23,6 +25,10 @@ from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.llm_resilience import retry_with_backoff
 from utils.result_formatter import result_to_markdown
+
+logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class ConversationRuntime:
@@ -53,8 +59,17 @@ class ConversationRuntime:
             memory_manager=self.memory,
         )
 
-    async def ask(self, user_input: str) -> dict[str, Any]:
+    async def ask(
+        self,
+        user_input: str,
+        on_event: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         """处理一条用户消息。
+
+        Args:
+            user_input: 用户输入
+            on_event: 进度回调（可选）。事件类型：
+                phase / plan / agent_start / agent_done
 
         Returns:
             {"reply": Markdown 文本, "agents": [{name, status}],
@@ -68,10 +83,14 @@ class ConversationRuntime:
         if self.circuit_breaker:
             self.circuit_breaker.raise_if_open()
 
+        self._emit(on_event, {"type": "phase", "phase": "context", "label": "整理记忆与上下文"})
+
         # 多会话写入后保持长期记忆最新（避免覆盖其它会话刚写入的数据）
         self.memory.reload_long_term()
 
         context = await self._build_context(user_input)
+        self._emit(on_event, {"type": "phase", "phase": "intent", "label": "理解你的需求"})
+
         intention = await self._call_with_resilience(
             lambda: self.intention_agent.reply(context),
             max_retries=int(rc.get("max_retries", 3)),
@@ -80,13 +99,35 @@ class ConversationRuntime:
         )
 
         try:
-            json.loads(intention.content)  # 仅校验 JSON 可解析，具体调度由编排器处理
+            intention_data = json.loads(intention.content)
         except json.JSONDecodeError as exc:
             raise ValueError("意图识别结果解析失败，请重试") from exc
+        if not isinstance(intention_data, dict):
+            raise ValueError("意图识别结果格式错误，请重试")
+
+        schedule = intention_data.get("agent_schedule") or []
+        self._emit(
+            on_event,
+            {
+                "type": "plan",
+                "intents": intention_data.get("intents") or [],
+                "reasoning": intention_data.get("reasoning") or "",
+                "schedule": [
+                    {
+                        "agent_name": item.get("agent_name", ""),
+                        "priority": item.get("priority", 0),
+                        "reason": item.get("reason", ""),
+                    }
+                    for item in schedule
+                    if isinstance(item, dict)
+                ],
+            },
+        )
+        logger.info("Plan: %s agents", len(schedule))
 
         self.memory.add_message("user", user_input)
         orchestration = await self._call_with_resilience(
-            lambda: self.orchestrator.reply(intention),
+            lambda: self.orchestrator.reply(intention, on_event=on_event),
             max_retries=int(rc.get("max_retries", 3)),
             base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
             max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
@@ -109,6 +150,16 @@ class ConversationRuntime:
             "usage": self._usage_delta(usage_before),
             "elapsed": round(time.time() - start, 2),
         }
+
+    @staticmethod
+    def _emit(on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
+        """安全地发出进度事件（回调异常不影响主流程）。"""
+        if on_event is None:
+            return
+        try:
+            on_event(event)
+        except Exception:  # noqa: BLE001 - 进度展示失败不应中断对话
+            logger.debug("Progress callback failed", exc_info=True)
 
     async def _build_context(self, user_input: str) -> list[Msg]:
         """组装意图识别上下文：系统记忆（偏好 + 历史摘要）+ 最近对话 + 当前输入。"""

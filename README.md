@@ -8,6 +8,17 @@
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
+## 界面预览
+
+| 对话与执行路线（浅色） | 深色模式 |
+|---|---|
+| ![对话与执行路线](docs/screenshots/webui-answer-light.jpg) | ![深色模式](docs/screenshots/webui-answer-dark.jpg) |
+| **执行中的智能体路线**（SSE 实时推送） | **欢迎页** |
+| ![执行路线](docs/screenshots/webui-trace.jpg) | ![欢迎页](docs/screenshots/webui-welcome.jpg) |
+
+界面为 **FastAPI + 无构建前端**（原生 HTML / CSS / JS，无需 Node），支持流式执行进度、
+会话历史、深浅主题与移动端布局，启动方式见「Web 界面」小节。
+
 ## ✨ 核心亮点
 
 ### 🎯 智能意图识别
@@ -40,6 +51,12 @@
 - **熔断器**：连续失败后自动熔断，保护服务
 - **指数退避重试**：自动重试失败请求（最大3次）
 - **健康检查**：实时监控LLM服务可用性
+
+### 🌐 Web 界面
+- **SSE 流式执行进度**：意图识别与每个子智能体的执行状态实时点亮，形成一条「执行路线」，完成后自动折叠为耗时摘要
+- **会话历史**：历史会话列表（按日期分组）、点击恢复、删除；长期记忆在 JSON / PostgreSQL 后端下均可回溯
+- **现代交互**：深浅主题、停止生成、重新生成、复制回答、Markdown 表格 / 代码块、移动端抽屉布局
+- **记忆与数据面板**：查看偏好、行程统计、当前存储后端，一键导出 JSON
 
 ---
 
@@ -316,8 +333,11 @@ python .claude/skills/ask-question/script/init_knowledge_base.py
 ### 4. 启动系统
 
 ```bash
-python cli.py
+python cli.py                  # 命令行界面
+python -m webapp.server        # Web 界面：http://127.0.0.1:8000
 ```
+
+Web 服务默认只监听本机，可用 `--host` / `--port` 调整（例如 `--port 8001`）。
 
 ---
 
@@ -416,26 +436,37 @@ python cli.py
 
 ## Web 界面
 
-除 CLI 外，项目提供轻量 Web 界面（FastAPI 后端 + 无构建前端，无需 Node）：
+除 CLI 外，项目提供完整的智能体对话界面（FastAPI 后端 + 无构建前端，无需 Node）：
 
 ```bash
 pip install -r requirements.txt   # 已包含 fastapi / uvicorn
 python -m webapp.server            # 安装后也可直接执行 aligo-web
 ```
 
-打开 <http://127.0.0.1:8000> 即可对话。界面支持：多轮对话、示例问题、偏好 / 行程
-概览、数据导出、新会话管理。
+打开 <http://127.0.0.1:8000> 即可对话。
 
-后端接口：
+**界面能力**
+
+- **执行路线**：`/api/chat/stream` 通过 SSE 推送 `phase`（阶段）、`plan`（调度计划）、`agent_start` / `agent_done`（子智能体进度）与 `done`（最终结果 / 用量 / 耗时），前端实时渲染为路线图；生成过程中可随时停止
+- **会话历史**：侧栏按日期分组展示历史会话，点击恢复完整对话（助手消息从编排结果重新渲染为 Markdown），悬停删除
+- **主题与布局**：浅色 / 深色主题跟随系统并可切换；窄屏下侧栏变为抽屉
+- **记忆面板**：查看偏好、行程 / 对话统计与当前存储后端，修改用户 ID，导出长期记忆 JSON
+- **消息操作**：复制、重新生成；Markdown 支持标题、列表、引用、表格与代码块（带复制按钮）
+
+**接口**
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat` | 发送消息（`message` / `user_id` / `session_id`） |
-| GET | `/api/status` | 用户数据概览（偏好 / 行程数 / 统计） |
+| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
+| POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
+| GET | `/api/health` | 服务版本 / 模型 / 存储后端状态 |
+| GET | `/api/status` | 用户数据概览（偏好 / 行程数 / 对话数 / 统计 / 存储后端） |
+| GET | `/api/sessions` | 历史会话列表（按最近更新时间倒序） |
+| GET | `/api/sessions/{id}` | 某个会话的消息（助手消息已渲染为 Markdown） |
+| DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | GET | `/api/export` | 导出用户长期记忆 JSON（附件下载） |
 
-> 说明：短期会话保存在服务进程内存中（重启后为新的短期记忆），长期记忆仍持久化在
-> `data/memory/`；服务默认只监听 `127.0.0.1`，按单机演示用途设计。
+> 说明：短期记忆按会话级管理——进程内实现随服务重启清空，配置 `REDIS_URL` 后由 Redis TTL 控制；长期记忆与历史会话在默认 JSON（`data/memory/`）或 PostgreSQL 中持久化。用户 / 会话 ID 限制为中文、字母、数字、下划线与短横线（避免路径穿越）。服务默认只监听 `127.0.0.1`，按单机演示用途设计。
 
 ---
 
@@ -512,8 +543,10 @@ aligo-travel-assistant/
 │   ├── doctor.py                    # 环境自检
 │   └── skill_loader.py              # SKILL.md 加载器
 ├── webapp/                          # Web 界面（FastAPI）
-│   ├── server.py                    # API 服务与静态页面
+│   ├── server.py                    # API 服务（对话 / SSE 流式 / 会话历史 / 导出）
 │   └── static/                      # 无构建前端（HTML / CSS / JS）
+├── docs/
+│   └── screenshots/                 # README 界面截图
 ├── tests/                           # 测试（多数无需 API Key）
 ├── data/                            # 运行数据（均不提交）
 │   ├── memory/                      # 长期记忆（{user_id}.json，gitignored）
@@ -608,8 +641,8 @@ aligo-travel-assistant/
 
 - [x] 完整实现PostgreSQL持久化存储（可选后端，`DATABASE_URL` 启用）
 - [x] 完整实现Redis短期记忆（可选后端，`REDIS_URL` 启用）
+- [x] Web 界面升级（SSE 流式执行进度、会话历史、深色模式；保持无构建前端）
 - [ ] 支持更多LLM模型（OpenAI、Claude等）
-- [ ] Web界面升级（React 前端）
 - [ ] 更多Skill插件（酒店预订、机票查询等）
 - [ ] 监控和日志系统
 

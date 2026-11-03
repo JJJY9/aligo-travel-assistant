@@ -15,7 +15,7 @@ from typing import Any
 from config import STORAGE_CONFIG
 from context.long_term_memory import LongTermMemory
 from context.postgres_long_term_memory import PostgresLongTermMemory
-from context.short_term_memory import RedisShortTermMemory, ShortTermMemory
+from context.short_term_memory import RedisShortTermMemory, ShortTermMemory, session_key
 
 logger = logging.getLogger(__name__)
 
@@ -93,3 +93,26 @@ def reset_failure_cache() -> None:
     global _redis_client
     _FAILED_UNTIL.clear()
     _redis_client = None
+
+
+def describe_backends() -> dict[str, str]:
+    """返回当前实际使用的后端名称（供 /api/health 与界面展示）。"""
+    url = STORAGE_CONFIG.get("redis_url") or ""
+    dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
+    short_term = "redis" if url and _get_redis_client(url) is not None else "memory"
+    long_term = "postgres" if dsn and not _failed_recently(f"postgres:{dsn}") else "json"
+    return {"short_term": short_term, "long_term": long_term}
+
+
+def clear_short_term_session(session_id: str) -> None:
+    """删除某个会话的 Redis 短期记忆（未启用 Redis 时为空操作）。"""
+    url = STORAGE_CONFIG.get("redis_url") or ""
+    if not url:
+        return
+    client = _get_redis_client(url)
+    if client is None:
+        return
+    try:
+        client.delete(session_key(session_id))
+    except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程
+        logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)

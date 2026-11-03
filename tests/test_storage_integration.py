@@ -99,6 +99,10 @@ def test_postgres_long_term_memory():
         assert stats["total_queries"] == 2
         assert stats["frequent_destinations"] == {"上海": 2}
 
+        assert memory.delete_chat_session("s1") == 2
+        assert memory.get_chat_history(session_id="s1") == []
+        assert len(memory.get_chat_history()) == 1
+
         memory.clear_history()
         cleared = memory.get_statistics()
         assert cleared["total_trips"] == 0 and cleared["total_messages"] == 0

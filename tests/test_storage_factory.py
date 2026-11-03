@@ -71,9 +71,24 @@ def test_memory_manager_uses_factory():
     print("✓ MemoryManager 走存储工厂")
 
 
+def test_long_term_delete_session():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-del", tempfile.mkdtemp())
+    memory.add_chat_message("user", "你好", "s1")
+    memory.add_chat_message("assistant", "您好", "s1")
+    memory.add_chat_message("user", "其他", "s2")
+    assert memory.delete_chat_session("s1") == 2
+    assert [item["content"] for item in memory.get_chat_history()] == ["其他"]
+    assert memory.get_statistics()["total_messages"] == 1
+    assert memory.delete_chat_session("s1") == 0
+    print("✓ 长期记忆按会话删除")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
     test_bad_postgres_falls_back()
     test_memory_manager_uses_factory()
+    test_long_term_delete_session()
     print("\n全部通过")
