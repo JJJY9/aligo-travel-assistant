@@ -868,6 +868,8 @@ a { color: var(--teal); }
 .trip-route { display: flex; justify-content: space-between; gap: 10px; font-weight: 600; }
 .trip-route span:last-child { color: var(--ink-3); font-size: 11.5px; font-weight: 500; }
 .trip-meta { margin-top: 2px; color: var(--ink-3); font-size: 11.5px; }
+.trip.clickable { cursor: pointer; transition: background 0.15s ease; }
+.trip.clickable:hover { background: var(--accent-soft); }
 
 @media (hover: none) {
   .pref-actions { opacity: 1; }

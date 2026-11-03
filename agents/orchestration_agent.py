@@ -556,7 +556,8 @@ class OrchestrationAgent(AgentBase):
                             "destination": destination,
                             "start_date": start_date,
                             "end_date": end_date,
-                            "purpose": purpose
+                            "purpose": purpose,
+                            "session_id": getattr(self.memory_manager, "session_id", None),
                         })
                         logger.info(f"Saved trip to long-term memory: {origin} -> {destination}")
 
