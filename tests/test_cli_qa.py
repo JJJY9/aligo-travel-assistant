@@ -63,26 +63,18 @@ async def main():
 
     # Removed manual imports of sub-agents as they are now dynamically loaded
     from agentscope.message import Msg
-    from agentscope.model import OpenAIChatModel
+    from config_agentscope import create_chat_model, init_agentscope
 
     from agents.intention_agent import IntentionAgent
     from agents.lazy_agent_registry import LazyAgentRegistry
     from agents.orchestration_agent import OrchestrationAgent
-    from config import LLM_CONFIG
-    from config_agentscope import init_agentscope
     from context.memory_manager import MemoryManager
 
     # 初始化 AgentScope
     init_agentscope()
 
     # 初始化模型
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"]},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-    )
+    model = create_chat_model()
 
     # 初始化记忆管理器
     memory_manager = MemoryManager(

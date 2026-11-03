@@ -7,6 +7,7 @@ from typing import Any
 
 from .long_term_memory import LongTermMemory
 from .short_term_memory import ShortTermMemory
+from utils.json_parser import extract_json_from_async_response
 
 logger = logging.getLogger(__name__)
 
@@ -201,27 +202,12 @@ class MemoryManager:
             # 调用模型（异步调用）
             response = await self.llm_model([{"role": "user", "content": summarization_prompt}])
 
-            # 处理异步生成器响应
-            summary = ""
-            if hasattr(response, '__aiter__'):
-                # 异步生成器，需要迭代获取内容
-                async for chunk in response:
-                    if isinstance(chunk, str):
-                        summary = chunk
-                    elif hasattr(chunk, 'content'):
-                        if isinstance(chunk.content, str):
-                            summary = chunk.content
-                        elif isinstance(chunk.content, list):
-                            for item in chunk.content:
-                                if isinstance(item, dict) and item.get('type') == 'text':
-                                    summary = item.get('text', '')
-            elif hasattr(response, 'content'):
-                summary = str(response.content)
-            else:
-                summary = str(response)
+            # 处理模型响应（兼容非流式 ChatResponse / 流式生成器）
+            summary = await extract_json_from_async_response(response)
 
+            summary = summary.strip()
             logger.info(f"Generated long-term memory summary ({len(summary)} chars)")
-            return summary.strip()
+            return summary
 
         except Exception as e:
             logger.error(f"Failed to generate long-term summary: {e}")

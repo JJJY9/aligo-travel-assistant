@@ -87,40 +87,21 @@ async def run_health_check(
         (success, message)
     """
     try:
-        from agentscope.model import OpenAIChatModel
+        from config_agentscope import create_chat_model
     except ImportError:
         return False, "AgentScope not installed"
 
     try:
-        model = OpenAIChatModel(
-            model_name=model_name,
+        model = create_chat_model(
             api_key=api_key,
-            client_kwargs={"base_url": base_url, "timeout": timeout_sec},
+            model_name=model_name,
+            base_url=base_url,
+            timeout=timeout_sec,
             temperature=0,
-            max_tokens=5,
+            max_tokens=8,
         )
-        # 最小请求
-        messages = [{"role": "user", "content": "1"}]
-        response = await model(messages)
-        # 可能是异步生成器或直接结果
-        text = ""
-        if hasattr(response, "__aiter__"):
-            async for chunk in response:
-                if isinstance(chunk, str):
-                    text = chunk
-                    break
-                if hasattr(chunk, "content"):
-                    text = getattr(chunk, "content", "") or ""
-                    break
-        elif hasattr(response, "text"):
-            text = response.text
-        elif hasattr(response, "content"):
-            text = str(response.content or "")
-        elif isinstance(response, dict) and "content" in response:
-            text = response["content"] or ""
-
-        if text is not None and len(str(text)) >= 0:
-            return True, "ok"
-        return True, "ok (no content)"
+        # 最小请求：能正常返回即视为服务可用（不校验内容）
+        await model([{"role": "user", "content": "1"}])
+        return True, "ok"
     except Exception as e:
         return False, str(e)

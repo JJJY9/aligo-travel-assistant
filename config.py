@@ -2,6 +2,7 @@
 Configuration for the Aligo Multi-Agent System
 """
 import os
+from typing import TypedDict
 
 # LLM Configuration
 # 默认使用 DeepSeek（OpenAI 兼容接口），也支持豆包、OpenAI 等任意兼容服务。
@@ -27,7 +28,37 @@ if not _api_key:
     except ImportError:
         pass
 
-LLM_CONFIG = {
+
+class LLMConfig(TypedDict):
+    api_key: str
+    model_name: str
+    base_url: str
+    temperature: float
+    max_tokens: int
+
+
+class SystemConfig(TypedDict):
+    enable_llm: bool
+    log_level: str
+    max_retries: int
+    timeout: int
+
+
+class RAGConfig(TypedDict):
+    embedding_model: str
+
+
+class ResilienceConfig(TypedDict):
+    max_retries: int
+    retry_base_delay_sec: float
+    retry_max_delay_sec: float
+    circuit_failure_threshold: int
+    circuit_recovery_timeout_sec: float
+    circuit_half_open_successes: int
+    health_check_timeout_sec: float
+
+
+LLM_CONFIG: LLMConfig = {
     "api_key": _api_key,
     "model_name": os.environ.get("LLM_MODEL_NAME", "deepseek-chat"),
     "base_url": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
@@ -36,7 +67,7 @@ LLM_CONFIG = {
 }
 
 # System Configuration
-SYSTEM_CONFIG = {
+SYSTEM_CONFIG: SystemConfig = {
     "enable_llm": True,  # Set to True to use LLM (recommended), False for rule-based
     "log_level": "INFO",
     "max_retries": 3,
@@ -44,12 +75,12 @@ SYSTEM_CONFIG = {
 }
 
 # RAG 知识库：嵌入模型（本地路径，无需连 HuggingFace）
-RAG_CONFIG = {
+RAG_CONFIG: RAGConfig = {
     "embedding_model": "data/models/bge-small-zh-v1.5",
 }
 
 # 连接与可用性：重试、熔断、健康检查
-RESILIENCE_CONFIG = {
+RESILIENCE_CONFIG: ResilienceConfig = {
     "max_retries": 3,              # 单次请求最大重试次数（与 SYSTEM_CONFIG 对齐）
     "retry_base_delay_sec": 1.0,   # 重试退避基数（秒）
     "retry_max_delay_sec": 30.0,   # 重试退避上限（秒）

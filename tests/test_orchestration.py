@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import uuid
 from datetime import datetime
 
@@ -19,10 +20,11 @@ sys.path.insert(0, project_root)
 RUN_TAG = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:8]}"
 RUN_USER_ID = f"orchestration-check-{RUN_TAG}"
 RUN_SESSION_ID = f"orchestration-session-{RUN_TAG}"
-RUN_STORAGE_PATH = f"data/test_memory/orchestration/{RUN_TAG}"
+RUN_STORAGE_PATH = os.path.join(
+    tempfile.gettempdir(), "chailv_test_memory", "orchestration", RUN_TAG
+)
 
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
 
 from agents.event_collection_agent import EventCollectionAgent
 from agents.information_query_agent import InformationQueryAgent
@@ -31,7 +33,7 @@ from agents.itinerary_planning_agent import ItineraryPlanningAgent
 from agents.orchestration_agent import OrchestrationAgent
 from agents.rag_knowledge_agent import RAGKnowledgeAgent
 from config import LLM_CONFIG
-from config_agentscope import init_agentscope
+from config_agentscope import create_chat_model, init_agentscope
 from context.memory_manager import MemoryManager
 
 requires_llm_key = pytest.mark.skipif(
@@ -56,13 +58,7 @@ async def test_orchestration():
     init_agentscope()
 
     # 初始化模型
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"]},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-    )
+    model = create_chat_model()
     print("✓ 模型加载成功")
 
     # 初始化记忆管理器
@@ -190,16 +186,12 @@ async def test_orchestration():
     print("[4] 测试记忆更新")
     print("-" * 60)
 
-    # 检查工作记忆
-    task_info = memory.get_task_info()
-    print(f"✓ 工作记忆: {len(task_info)} 项信息")
-    for key, value in task_info.items():
-        if value:
-            print(f"  - {key}: {value}")
-
     # 检查短期记忆
+    full_context = memory.get_full_context()
+    short_stats = full_context["short_term"]["statistics"]
+    print(f"✓ 短期记忆: {short_stats['total_messages']} 条消息")
     recent = memory.short_term.get_recent_context(2)
-    print(f"✓ 短期记忆: {len(recent)} 条消息")
+    print(f"✓ 最近对话: {len(recent)} 条")
     print()
 
     # ========== 完成 ==========

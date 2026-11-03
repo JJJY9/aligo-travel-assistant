@@ -14,7 +14,6 @@ sys.path.insert(0, project_root)
 import json
 
 # 导入系统组件
-from agentscope.model import OpenAIChatModel
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
@@ -22,7 +21,7 @@ from rich.table import Table
 from agents.intention_agent import IntentionAgent
 from agents.orchestration_agent import OrchestrationAgent
 from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
-from config_agentscope import init_agentscope
+from config_agentscope import create_chat_model, init_agentscope
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.llm_resilience import retry_with_backoff
@@ -94,16 +93,7 @@ class AligoCLI:
                     '或创建 config_local.py（内容：API_KEY = "sk-..."）[/bold red]'
                 )
             timeout_sec = SYSTEM_CONFIG.get("timeout", 60)
-            self.model = OpenAIChatModel(
-                model_name=LLM_CONFIG["model_name"],
-                api_key=LLM_CONFIG["api_key"],
-                client_kwargs={
-                    "base_url": LLM_CONFIG["base_url"],
-                    "timeout": float(timeout_sec),
-                },
-                temperature=LLM_CONFIG.get("temperature", 0.7),
-                max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-            )
+            self.model = create_chat_model(timeout=timeout_sec)
 
             # 初始化记忆管理器（传入LLM模型用于总结）
             self.memory_manager = MemoryManager(

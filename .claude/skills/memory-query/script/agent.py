@@ -24,6 +24,8 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.json_parser import extract_json_from_async_response
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,28 +148,8 @@ class MemoryQueryAgent(AgentBase):
                 {"role": "user", "content": prompt}
             ])
 
-            # 获取响应文本 - 处理异步生成器
-            answer = ""
-            if hasattr(response, '__aiter__'):
-                # 异步生成器，需要迭代获取内容
-                async for chunk in response:
-                    if isinstance(chunk, str):
-                        answer = chunk
-                    elif hasattr(chunk, 'content'):
-                        if isinstance(chunk.content, str):
-                            answer = chunk.content
-                        elif isinstance(chunk.content, list):
-                            for item in chunk.content:
-                                if isinstance(item, dict) and item.get('type') == 'text':
-                                    answer = item.get('text', '')
-            elif hasattr(response, 'text'):
-                answer = response.text
-            elif hasattr(response, 'content'):
-                answer = response.content
-            elif isinstance(response, dict) and 'content' in response:
-                answer = response['content']
-            else:
-                answer = str(response) if response else "无法生成回答"
+            # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
+            answer = await extract_json_from_async_response(response)
 
             if not answer:
                 answer = "无法基于记忆生成回答"
