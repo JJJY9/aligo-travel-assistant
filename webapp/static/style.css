@@ -80,6 +80,7 @@ button { cursor: pointer; }
 a { color: var(--teal); }
 [hidden] { display: none !important; }
 ::selection { background: var(--accent-soft); color: var(--accent-strong); }
+mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; padding: 0 1px; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
@@ -850,6 +851,7 @@ a { color: var(--teal); }
 .sheet-section { margin-top: 18px; }
 .sheet-section h3 { margin: 0 0 8px; font-size: 11.5px; font-weight: 500; color: var(--ink-3); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.destination-chips { margin-top: 8px; }
 .usage-agents { margin-top: 8px; }
 
 .usage-trend { margin-top: 14px; }

@@ -107,6 +107,7 @@ const els = {
   exportDataMd: byId("exportDataMd"),
   overview: byId("overview"),
   trips: byId("trips"),
+  destinations: byId("destinations"),
   stats: byId("stats"),
   usageStats: byId("usageStats"),
   usageAgents: byId("usageAgents"),
@@ -139,6 +140,17 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function highlightSnippet(text, query) {
+  const escaped = escapeHtml(text);
+  const needle = String(query || "").trim();
+  if (!needle) return escaped;
+  const pattern = new RegExp(
+    escapeHtml(needle).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+    "gi",
+  );
+  return escaped.replace(pattern, (match) => `<mark>${match}</mark>`);
 }
 
 function clampText(text, max) {
@@ -935,7 +947,7 @@ function renderHistoryItem(session) {
   if (session.snippet) {
     const snippet = document.createElement("span");
     snippet.className = "hi-snippet";
-    snippet.textContent = session.snippet;
+    snippet.innerHTML = highlightSnippet(session.snippet, state.searchQuery);
     item.appendChild(snippet);
   }
 
@@ -1369,6 +1381,7 @@ function renderOverview() {
   if (!status) {
     els.overview.innerHTML = '<div class="empty">无法获取数据概览</div>';
     els.trips.innerHTML = "";
+    els.destinations.innerHTML = "";
     els.upcoming.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
@@ -1471,6 +1484,18 @@ function renderOverview() {
       els.trips.appendChild(row);
     });
   }
+
+  const frequent = (status.statistics && status.statistics.frequent_destinations) || {};
+  const destinations = Object.entries(frequent)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 5);
+  els.destinations.innerHTML = "";
+  destinations.forEach(([name, count]) => {
+    const chip = document.createElement("span");
+    chip.className = "badge";
+    chip.textContent = `${name} ×${count}`;
+    els.destinations.appendChild(chip);
+  });
 
   renderUpcoming(trips);
 
