@@ -552,6 +552,75 @@ function trimRegenButtons() {
   buttons.slice(0, -1).forEach((button) => button.remove());
 }
 
+const FOLLOW_UP_SETS = {
+  itinerary_planning: [
+    { label: "导出这份行程", action: "export" },
+    { label: "出发当天天气如何？", prompt: "帮我查一下出发当天的天气" },
+    { label: "调整行程安排", prompt: "帮我调整一下行程安排" },
+  ],
+  information_query: [
+    { label: "据此规划行程", prompt: "根据上面的信息帮我规划行程" },
+    { label: "查差旅住宿标准", prompt: "一线城市住宿标准是多少？" },
+  ],
+  rag_knowledge: [
+    { label: "帮我规划一次出差", prompt: "帮我规划下周一从北京去杭州出差 3 天" },
+    { label: "查一下杭州天气", prompt: "杭州明天天气怎么样？" },
+  ],
+  memory_query: [
+    { label: "规划新行程", prompt: "帮我规划一次出差" },
+    { label: "查看我的偏好", prompt: "我有哪些出行偏好？" },
+  ],
+  preference: [
+    { label: "按偏好规划行程", prompt: "根据我的偏好帮我规划一次出差" },
+  ],
+};
+
+function buildFollowUps(agents) {
+  const names = new Set((agents || []).map((agent) => agent && agent.name).filter(Boolean));
+  for (const key of [
+    "itinerary_planning",
+    "information_query",
+    "rag_knowledge",
+    "memory_query",
+    "preference",
+  ]) {
+    if (names.has(key)) return FOLLOW_UP_SETS[key];
+  }
+  return [];
+}
+
+function addFollowUps(node, agents) {
+  const items = buildFollowUps(agents);
+  if (!items.length) return;
+  const row = document.createElement("div");
+  row.className = "follow-ups";
+  items.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "follow-up";
+    button.textContent = item.label;
+    button.addEventListener("click", () => {
+      if (item.action === "export") {
+        triggerExport();
+        return;
+      }
+      sendMessage(item.prompt);
+    });
+    row.appendChild(button);
+  });
+  node.appendChild(row);
+}
+
+function triggerExport() {
+  if (!state.sessionId) return;
+  window.open(
+    `/api/sessions/${encodeURIComponent(state.sessionId)}/export?user_id=${encodeURIComponent(
+      state.userId,
+    )}`,
+    "_blank",
+  );
+}
+
 /* ---------- 执行路线 ---------- */
 
 function summarizeIntents(intents) {
@@ -748,6 +817,7 @@ function createAssistantMessage(regenText = "") {
       regen.dataset.action = "regen";
       foot.appendChild(regen);
     }
+    addFollowUps(root, data.agents || []);
   }
 
   function fail(message) {
@@ -969,20 +1039,26 @@ async function openSession(sessionId, options = {}) {
 
     els.messages.innerHTML = "";
     let lastUserText = "";
+    let lastAssistantNode = null;
+    let lastAssistantMeta = null;
     data.messages.forEach((message) => {
       if (message.role === "user") {
         lastUserText = message.content;
         els.messages.appendChild(renderUserNode(message.content));
       } else {
-        els.messages.appendChild(
-          renderAssistantNode(message.content, {
-            timestamp: message.timestamp,
-            regenText: lastUserText,
-            meta: message.meta || null,
-          }),
-        );
+        const node = renderAssistantNode(message.content, {
+          timestamp: message.timestamp,
+          regenText: lastUserText,
+          meta: message.meta || null,
+        });
+        lastAssistantNode = node;
+        lastAssistantMeta = message.meta || null;
+        els.messages.appendChild(node);
       }
     });
+    if (lastAssistantNode && lastAssistantMeta) {
+      addFollowUps(lastAssistantNode, lastAssistantMeta.agents || []);
+    }
     trimRegenButtons();
     markActiveHistory();
     scrollToBottom(true);
@@ -1089,6 +1165,7 @@ async function sendMessage(text, options = {}) {
   state.controller = new AbortController();
   setBusy(true);
   trimRegenButtons();
+  document.querySelectorAll(".follow-ups").forEach((row) => row.remove());
 
   mutate(() => {
     hideWelcome();
@@ -1664,13 +1741,7 @@ function bindEvents() {
     copyText(shareUrl(), "链接已复制");
   });
 
-  els.exportChat.addEventListener("click", () => {
-    if (!state.sessionId) return;
-    const url = `/api/sessions/${encodeURIComponent(
-      state.sessionId,
-    )}/export?user_id=${encodeURIComponent(state.userId)}`;
-    window.open(url, "_blank");
-  });
+  els.exportChat.addEventListener("click", triggerExport);
 
   els.menuBtn.addEventListener("click", toggleSidebar);
   els.collapseSidebar.addEventListener("click", toggleSidebar);
