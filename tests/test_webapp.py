@@ -511,6 +511,47 @@ def test_delete_trip_api():
         _cleanup(user_id)
 
 
+def test_delete_trip_storage_failure_maps_503(monkeypatch):
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def delete_trip(self, trip_id):
+            raise OSError("disk full")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _BrokenStore())
+    response = _client().delete(
+        "/api/trips/trip_1", params={"user_id": "web_test_trip_broken"}
+    )
+    assert response.status_code == 503
+    print("✓ 行程删除写入失败返回 503（不伪装成成功）")
+
+
+def test_trip_ics_uid_includes_content():
+    from webapp.server import _build_trip_ics
+
+    base = {
+        "trip_id": "trip_1",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-11-09",
+        "end_date": "2026-11-11",
+        "purpose": "出差",
+    }
+    other = {**base, "destination": "杭州"}
+
+    def uid(trip):
+        return next(
+            line for line in _build_trip_ics(trip, "u1").splitlines() if line.startswith("UID:")
+        )
+
+    assert uid(base) != uid(other), "复用 trip_id 的新行程不应覆盖旧日历事件"
+    assert uid(base) == uid(base), "同一行程的 UID 应保持稳定"
+    print("✓ ICS UID 包含行程内容（复用 id 不覆盖旧事件）")
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -994,6 +1035,13 @@ def test_knowledge_transfer_api(monkeypatch):
     assert payload["documents"] == [{"content": "a", "metadata": {"category": "测试"}}]
     assert payload["version"] == 1
 
+    # 空内容条目被跳过而不是整批 422（与 CLI 行为一致）
+    empty_item = client.post(
+        "/api/knowledge/import", json={"documents": [{"content": ""}]}
+    )
+    assert empty_item.status_code == 200
+    assert empty_item.json() == {"imported": 0, "skipped": 1}
+
     calls = {}
 
     def fake_import(documents):
@@ -1137,6 +1185,12 @@ if __name__ == "__main__":
     test_preferences_api()
     test_status_trips()
     test_delete_trip_api()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_delete_trip_storage_failure_maps_503(_mp)
+    finally:
+        _mp.undo()
+    test_trip_ics_uid_includes_content()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()

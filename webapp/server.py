@@ -219,17 +219,14 @@ class KnowledgeDocumentPayload(BaseModel):
     )
 
 
-class KnowledgeImportItem(BaseModel):
-    content: str = Field(min_length=1, max_length=2000)
-    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] = Field(
-        default_factory=dict, max_length=10
-    )
-
-
 class KnowledgeImportPayload(BaseModel):
-    """批量导入知识片段（单次最多 200 条）。"""
+    """批量导入知识片段（单次最多 200 条）。
 
-    documents: list[KnowledgeImportItem] = Field(min_length=1, max_length=200)
+    条目结构放宽为字典：空内容跳过、超长字段截断由 import_documents 统一处理，
+    避免一条不合规就让整个备份无法恢复（与 CLI 行为一致）。
+    """
+
+    documents: list[dict[str, Any]] = Field(min_length=1, max_length=200)
 
 
 class PreferencePayload(BaseModel):
@@ -655,9 +652,19 @@ def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
         f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，{purpose}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    uid_digest = hashlib.sha1(
-        f"{user_id}:{trip.get('trip_id') or 'trip'}".encode("utf-8")
-    ).hexdigest()[:16]
+    # UID 同时包含行程内容：删除最新行程后 id 可能被复用，仅用 trip_id
+    # 会让新行程覆盖日历里已存在的旧事件
+    uid_source = ":".join(
+        [
+            user_id,
+            str(trip.get("trip_id") or "trip"),
+            origin,
+            destination,
+            str(trip.get("start_date") or ""),
+            str(trip.get("end_date") or ""),
+        ]
+    )
+    uid_digest = hashlib.sha1(uid_source.encode("utf-8")).hexdigest()[:16]
     uid = f"aligo-{uid_digest}@aligo.local"
 
     lines = [
@@ -804,7 +811,7 @@ def create_app(model: Any = None) -> FastAPI:
     def knowledge_import(payload: KnowledgeImportPayload) -> dict[str, Any]:
         """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。"""
         try:
-            return import_documents([item.model_dump() for item in payload.documents])
+            return import_documents(payload.documents)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
@@ -1122,6 +1129,9 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             removed = store.delete_trip(trip_id)
+        except Exception as exc:  # noqa: BLE001 - 存储写入失败要显式返回 503
+            logger.warning("删除行程失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
         finally:
             _close_long_term(store)
         if not removed:
