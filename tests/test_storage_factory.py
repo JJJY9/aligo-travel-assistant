@@ -101,13 +101,13 @@ def test_trip_history_delete_and_ids():
     from context.long_term_memory import LongTermMemory
 
     memory = LongTermMemory("u-trip", tempfile.mkdtemp())
-    for destination in ("上海", "上海", "杭州"):
+    for day, destination in ((9, "上海"), (10, "上海"), (11, "杭州")):
         memory.save_trip_history(
             {
                 "origin": "北京",
                 "destination": destination,
-                "start_date": "2026-11-09",
-                "end_date": "2026-11-11",
+                "start_date": f"2026-11-{day:02d}",
+                "end_date": f"2026-11-{day:02d}",
                 "purpose": "出差",
             }
         )
@@ -317,6 +317,42 @@ def test_stale_snapshot_does_not_resurrect_trip():
     print("✓ 旧快照写回不会复活已删除的行程")
 
 
+def test_trip_save_deduplicates_same_trip():
+    """同路线 + 同起止日期的行程重复保存时更新既有记录，不重复计数。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-dup", tempfile.mkdtemp())
+    base = {
+        "origin": "北京",
+        "destination": "杭州",
+        "start_date": "2026-11-09",
+        "end_date": "2026-11-11",
+        "purpose": "出差",
+    }
+    memory.save_trip_history(base)
+    memory.save_trip_history({**base, "session_id": "sess-dedup"})
+
+    trips = memory.get_trip_history(limit=None)
+    assert len(trips) == 1, "同一行程不应重复保存"
+    assert trips[0]["session_id"] == "sess-dedup", "重复保存应更新会话关联"
+    stats = memory.get_statistics()
+    assert stats["total_trips"] == 1
+    assert stats["frequent_destinations"] == {"杭州": 1}
+
+    # 日期不同视为新行程
+    memory.save_trip_history(
+        {**base, "start_date": "2026-12-01", "end_date": "2026-12-02"}
+    )
+    assert len(memory.get_trip_history(limit=None)) == 2
+
+    # 缺少出发日期时不参与去重
+    undated = {"origin": "北京", "destination": "杭州", "purpose": "出差"}
+    memory.save_trip_history(undated)
+    memory.save_trip_history(undated)
+    assert len(memory.get_trip_history(limit=None)) == 4
+    print("✓ 行程重复保存去重（同日期更新、不同日期新增）")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -326,6 +362,7 @@ if __name__ == "__main__":
     test_long_term_delete_preference()
     test_trip_history_delete_and_ids()
     test_stale_snapshot_does_not_resurrect_trip()
+    test_trip_save_deduplicates_same_trip()
     test_session_titles()
     test_session_pinned()
     test_add_message_preserves_metadata()

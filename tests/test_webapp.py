@@ -1078,7 +1078,6 @@ def test_next_trip_from_full_history():
         store = create_long_term_memory(user_id, str(MEMORY_DIR))
         try:
             future = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d")
-            past = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
             store.save_trip_history(
                 {
                     "origin": "北京",
@@ -1087,9 +1086,12 @@ def test_next_trip_from_full_history():
                     "session_id": "sess-next",
                 }
             )
-            for _ in range(6):
+            for index in range(6):
+                past_day = (datetime.now() - timedelta(days=1 + index)).strftime(
+                    "%Y-%m-%d"
+                )
                 store.save_trip_history(
-                    {"origin": "上海", "destination": "南京", "start_date": past}
+                    {"origin": "上海", "destination": "南京", "start_date": past_day}
                 )
         finally:
             close = getattr(store, "close", None)

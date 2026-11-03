@@ -109,6 +109,20 @@ def test_postgres_long_term_memory():
         assert trips[1]["session_id"] is None
         assert memory.get_frequent_destinations(1) == [("上海", 2)]
 
+        # 同路线 + 同起止日期的重复保存：更新会话关联，不新增记录
+        memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-11-09",
+                "purpose": "出差",
+                "session_id": "sess-pg-dup",
+            }
+        )
+        deduped = memory.get_trip_history(limit=None)
+        assert len(deduped) == 2, "同一行程不应重复保存"
+        assert deduped[0]["session_id"] == "sess-pg-dup"
+
         memory.increment_query_count()
         memory.increment_query_count()
         stats = memory.get_statistics()

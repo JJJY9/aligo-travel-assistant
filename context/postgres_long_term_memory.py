@@ -284,6 +284,36 @@ class PostgresLongTermMemory:
     # ---------- 历史行程 ----------
 
     def save_trip_history(self, trip_info: dict[str, Any]) -> None:
+        """保存行程历史；同路线 + 同起止日期视为重复记录，更新而不是新增。"""
+        purpose = trip_info.get("purpose") or "旅游"
+        destination = trip_info.get("destination")
+        start_date = str(trip_info.get("start_date") or "")
+        if destination and start_date:
+            existing = self._fetchone(
+                """
+                SELECT id FROM aligo_trips
+                WHERE user_id = %s
+                  AND destination = %s
+                  AND origin IS NOT DISTINCT FROM %s
+                  AND start_date = %s
+                  AND end_date IS NOT DISTINCT FROM %s
+                LIMIT 1
+                """,
+                (
+                    self.user_id,
+                    destination,
+                    trip_info.get("origin"),
+                    start_date,
+                    trip_info.get("end_date"),
+                ),
+            )
+            if existing:
+                self._execute(
+                    "UPDATE aligo_trips SET purpose = %s, session_id = %s WHERE id = %s",
+                    (purpose, trip_info.get("session_id"), existing[0]),
+                )
+                return
+
         trip_number = self._next_trip_number()
         self._execute(
             """
@@ -295,10 +325,10 @@ class PostgresLongTermMemory:
                 self.user_id,
                 f"trip_{trip_number}",
                 trip_info.get("origin"),
-                trip_info.get("destination"),
+                destination,
                 trip_info.get("start_date"),
                 trip_info.get("end_date"),
-                trip_info.get("purpose") or "旅游",
+                purpose,
                 trip_info.get("session_id"),
             ),
         )

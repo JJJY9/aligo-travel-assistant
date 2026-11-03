@@ -430,12 +430,22 @@ class LongTermMemory:
 
     @_locked_mutation
     def save_trip_history(self, trip_info: dict[str, Any]):
-        """
-        保存行程历史
+        """保存行程历史。
 
-        Args:
-            trip_info: 行程信息
+        同路线 + 同起止日期的行程视为重复记录（多次对话规划同一趟行程），
+        更新既有记录而不是追加，避免行程 / 统计 / 日历重复。
         """
+        existing = self._find_same_trip(trip_info)
+        if existing is not None:
+            for key in ("purpose", "session_id"):
+                value = trip_info.get(key)
+                if value is not None:
+                    existing[key] = value
+            existing["timestamp"] = datetime.now().isoformat()
+            self._save()
+            logger.info(f"Updated existing trip history: {existing.get('trip_id')}")
+            return
+
         trip_record = {
             "trip_id": self._next_trip_id(),
             "timestamp": datetime.now().isoformat(),
@@ -455,6 +465,24 @@ class LongTermMemory:
 
         self._save()
         logger.info(f"Saved trip history: {trip_record['trip_id']}")
+
+    def _find_same_trip(self, trip_info: dict[str, Any]) -> dict[str, Any] | None:
+        """查找同路线、同起止日期的既有行程（无出发日期时不参与去重）。"""
+        destination = trip_info.get("destination")
+        start_date = str(trip_info.get("start_date") or "")
+        if not destination or not start_date:
+            return None
+        origin = str(trip_info.get("origin") or "")
+        end_date = str(trip_info.get("end_date") or "")
+        for trip in self.data.get("trip_history", []):
+            if (
+                trip.get("destination") == destination
+                and str(trip.get("origin") or "") == origin
+                and str(trip.get("start_date") or "") == start_date
+                and str(trip.get("end_date") or "") == end_date
+            ):
+                return trip
+        return None
 
     def _next_trip_id(self) -> str:
         """下一个行程 id：现有最大序号 + 1（删除后不复用，避免与统计/会话关联错乱）。"""
