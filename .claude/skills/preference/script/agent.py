@@ -42,7 +42,13 @@ class PreferenceAgent(AgentBase):
             try:
                 data = json.loads(content)
                 context = data.get("context", {})
-                user_query = context.get("rewritten_query", "") or str(data)
+                # 优先使用用户本轮原话：只从用户自己的表述中抽取偏好，
+                # 避免把上下文或助手建议（如行程里提到的舱位）误记为用户偏好
+                user_query = (
+                    context.get("user_query")
+                    or context.get("rewritten_query", "")
+                    or str(data)
+                )
             except json.JSONDecodeError:
                 user_query = content
         else:
