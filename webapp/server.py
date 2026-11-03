@@ -47,7 +47,7 @@ from utils.console import configure_stdio
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import extract_turn_meta
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
