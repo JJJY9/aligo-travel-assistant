@@ -40,7 +40,9 @@ aligo = "cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio"]
-dev = ["ruff", "mypy"]
+# dev 里必须包含 build：`python -m build` 的校验依赖它，
+# 只装 `pip install -e .[dev]` 的环境要能直接跑打包校验（与 requirements.txt 的 build>=1.2.2 对齐）
+dev = ["ruff", "mypy", "build>=1.2.2"]
 
 [project.urls]
 Homepage = "https://github.com/JJJY9/aligo-travel-assistant"
