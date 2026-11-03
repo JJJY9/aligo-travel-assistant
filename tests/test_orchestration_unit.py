@@ -193,6 +193,26 @@ def test_memory_update_preference_and_trip():
     )
     assert memory.long_term.get_preference("hotel_brands") == "汉庭"
 
+    # 追加同值：存量是字符串且与新值相同，不应产生重复列表
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": "hotel_brands", "value": "汉庭", "action": "append"}
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference("hotel_brands") == ["汉庭"]
+
     # 追加：seat_preference 已有值，action=append 生成列表
     memory.long_term.save_preference("seat_preference", "靠窗")
     orchestrator._update_memory(

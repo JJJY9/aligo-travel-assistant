@@ -508,8 +508,13 @@ class OrchestrationAgent(AgentBase):
                                 self.memory_manager.long_term.save_preference(pref_type, existing_value)
                                 logger.info(f"Appended to {pref_type}: {pref_value}, total: {existing_value}")
                             else:
-                                # 如果现有值不是列表，创建新列表
-                                new_list = [existing_value, pref_value] if existing_value else [pref_value]
+                                # 如果现有值不是列表，创建新列表（同值不重复）
+                                if existing_value == pref_value:
+                                    new_list = [pref_value]
+                                elif existing_value:
+                                    new_list = [existing_value, pref_value]
+                                else:
+                                    new_list = [pref_value]
                                 self.memory_manager.long_term.save_preference(pref_type, new_list)
                                 logger.info(f"Created list for {pref_type}: {new_list}")
                         else:

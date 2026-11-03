@@ -268,6 +268,85 @@ def test_status_usage_totals():
         _cleanup(user_id)
 
 
+def test_preferences_api():
+    client = _client()
+    user_id = _unique_user("web_test_pref")
+    try:
+        response = client.put(
+            "/api/preferences/hotel_brands",
+            json={"user_id": user_id, "value": ["汉庭", "如家"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["value"] == ["汉庭", "如家"]
+
+        response = client.put(
+            "/api/preferences/home_location",
+            json={"user_id": user_id, "value": "北京"},
+        )
+        assert response.status_code == 200
+
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"] == {
+            "hotel_brands": ["汉庭", "如家"],
+            "home_location": "北京",
+        }
+
+        deleted = client.delete(
+            "/api/preferences/hotel_brands", params={"user_id": user_id}
+        ).json()
+        assert deleted["deleted"] is True
+        remaining = client.get("/api/status", params={"user_id": user_id}).json()
+        assert "hotel_brands" not in remaining["preferences"]
+
+        again = client.delete(
+            "/api/preferences/hotel_brands", params={"user_id": user_id}
+        ).json()
+        assert again["deleted"] is False
+
+        invalid = client.put(
+            "/api/preferences/bad type", json={"user_id": user_id, "value": "x"}
+        )
+        assert invalid.status_code == 422
+        too_long = client.put(
+            "/api/preferences/home_location",
+            json={"user_id": user_id, "value": "x" * 201},
+        )
+        assert too_long.status_code == 422
+        print("✓ 偏好新增 / 覆盖 / 删除 / 参数校验")
+    finally:
+        _cleanup(user_id)
+
+
+def test_status_trips():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trip")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-11-09",
+                    "end_date": "2026-11-11",
+                    "purpose": "出差",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        status = _client().get("/api/status", params={"user_id": user_id}).json()
+        assert status["trip_count"] == 1
+        assert status["trips"][0]["destination"] == "上海"
+        assert status["trips"][0]["start_date"] == "2026-11-09"
+        print("✓ /api/status 返回最近行程")
+    finally:
+        _cleanup(user_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -293,6 +372,8 @@ if __name__ == "__main__":
     test_sessions_listing_and_delete()
     test_session_search()
     test_status_usage_totals()
+    test_preferences_api()
+    test_status_trips()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()

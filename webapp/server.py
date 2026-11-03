@@ -27,7 +27,7 @@ from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -61,6 +61,21 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     user_id: str = Field(default="web_user", pattern=_ID_PATTERN)
     session_id: str | None = Field(default=None, pattern=_ID_PATTERN)
+
+
+_ShortText = Annotated[str, Field(max_length=200)]
+PreferenceValue = (
+    _ShortText
+    | Annotated[list[_ShortText], Field(max_length=20)]
+    | int
+    | float
+    | bool
+)
+
+
+class PreferencePayload(BaseModel):
+    user_id: str = Field(pattern=_ID_PATTERN)
+    value: PreferenceValue
 
 
 class _WebSession:
@@ -329,11 +344,38 @@ def create_app(model: Any = None) -> FastAPI:
             "user_id": user_id,
             "preferences": preferences,
             "trip_count": len(data["trip_history"]),
+            "trips": data["trip_history"][-5:],
             "chat_count": len(data["chat_history"]),
             "statistics": data["statistics"],
             "storage": describe_backends(),
             "usage": _usage_summary(data["chat_history"]),
         }
+
+    @app.put("/api/preferences/{pref_type}")
+    def update_preference(
+        payload: PreferencePayload,
+        pref_type: str = ApiPath(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """新增或覆盖一条用户偏好（记忆面板的手动维护入口）。"""
+        store = _open_long_term(payload.user_id)
+        try:
+            store.save_preference(pref_type, payload.value)
+            value = store.get_preference(pref_type)
+        finally:
+            _close_long_term(store)
+        return {"type": pref_type, "value": value}
+
+    @app.delete("/api/preferences/{pref_type}")
+    def delete_preference(
+        pref_type: str = ApiPath(..., pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        store = _open_long_term(user_id)
+        try:
+            removed = store.delete_preference(pref_type)
+        finally:
+            _close_long_term(store)
+        return {"type": pref_type, "deleted": removed}
 
     @app.get("/api/sessions")
     def list_sessions(
