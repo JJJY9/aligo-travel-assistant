@@ -58,6 +58,10 @@
       <rect x="4" y="5.5" width="16" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
       <path d="M4 9.5h16M8 3.5v4M16 3.5v4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
     </symbol>
+    <symbol id="i-print" viewBox="0 0 24 24">
+      <path d="M7 9V4h10v5M7 17H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+      <rect x="7" y="14" width="10" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.6"/>
+    </symbol>
     <symbol id="i-chevron" viewBox="0 0 24 24">
       <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
@@ -141,6 +145,9 @@
           <span class="model-chip" id="modelChip">DeepSeek</span>
         </div>
         <div class="topbar-right">
+          <button class="icon-btn" id="printChat" type="button" title="打印 / 导出 PDF" aria-label="打印对话" hidden>
+            <svg class="icon"><use href="#i-print"></use></svg>
+          </button>
           <button class="icon-btn" id="copyLink" type="button" title="复制对话链接" aria-label="复制对话链接" hidden>
             <svg class="icon"><use href="#i-link"></use></svg>
           </button>
