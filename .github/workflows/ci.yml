@@ -1,10 +1,11 @@
-# 持续集成：代码风格（ruff）、类型检查（mypy）、无需 API Key 的回归测试（pytest）
+# 持续集成：代码风格（ruff）、类型检查（mypy）、无需 API Key 的回归测试（pytest，含覆盖率）
 #
 # 说明：
 # - 只安装轻量依赖（requirements-ci.txt），不安装 torch / pymilvus /
 #   sentence-transformers 等重型 RAG 依赖；缺少依赖或密钥的测试会自动跳过；
 # - CI 中不会调用真实大模型，构建快速且无需任何密钥；
-# - 测试矩阵覆盖项目声明的 Python 3.10 与 3.12。
+# - 测试矩阵覆盖项目声明的 Python 3.10 与 3.12；
+# - 覆盖率仅作展示（重型 RAG 模块在 CI 中不可导入，绝对数值低于本地全量环境）。
 name: CI
 
 on:
@@ -78,4 +79,7 @@ jobs:
         run: python -m mypy .
 
       - name: 回归测试（pytest，无需 API Key）
-        run: python -m pytest tests/ -q
+        run: |
+          python -m pytest tests/ -q \
+            --cov=agents --cov=context --cov=utils --cov=webapp \
+            --cov=config_agentscope --cov-report=term-missing:skip-covered
