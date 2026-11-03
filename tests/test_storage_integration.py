@@ -124,6 +124,16 @@ def test_postgres_long_term_memory():
         assert len(deduped) == 2, "同一行程不应重复保存"
         assert deduped[0]["session_id"] == "sess-pg-dup"
 
+        # 更新行程字段；改成与另一条重复时拒绝
+        assert memory.update_trip("trip_2", {"purpose": "会议"}) is True
+        trip_2 = next(
+            item for item in memory.get_trip_history(limit=None) if item["trip_id"] == "trip_2"
+        )
+        assert trip_2["purpose"] == "会议"
+        with pytest.raises(ValueError):
+            memory.update_trip("trip_2", {"start_date": "2026-11-09"})
+        assert memory.update_trip("trip_99", {"purpose": "x"}) is False
+
         memory.increment_query_count()
         memory.increment_query_count()
         stats = memory.get_statistics()

@@ -691,6 +691,93 @@ def test_create_trip_api():
         _cleanup(user_id)
 
 
+def test_update_trip_api():
+    user_id = _unique_user("web_test_update_trip")
+    client = _client()
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-11-20",
+                "end_date": "2026-11-22",
+                "purpose": "出差",
+            },
+        )
+        trip_id = created.json()["trip_id"]
+
+        updated = client.put(
+            f"/api/trips/{trip_id}", json={"user_id": user_id, "destination": "南京"}
+        )
+        assert updated.status_code == 200
+        assert updated.json()["trip"]["destination"] == "南京"
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["trips"][0]["destination"] == "南京"
+        assert status["statistics"]["frequent_destinations"] == {"南京": 1}
+
+        # 没有提供字段 → 400
+        assert (
+            client.put(f"/api/trips/{trip_id}", json={"user_id": user_id}).status_code
+            == 400
+        )
+        # 结束早于出发 / 非法日期 → 422
+        assert (
+            client.put(
+                f"/api/trips/{trip_id}",
+                json={"user_id": user_id, "end_date": "2026-11-19"},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.put(
+                f"/api/trips/{trip_id}",
+                json={"user_id": user_id, "start_date": "2026-02-30"},
+            ).status_code
+            == 422
+        )
+        # 不存在 → 404
+        assert (
+            client.put(
+                "/api/trips/trip_99", json={"user_id": user_id, "purpose": "x"}
+            ).status_code
+            == 404
+        )
+
+        # 与另一条行程重复 → 409
+        client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+            },
+        )
+        conflict = client.put(
+            f"/api/trips/{trip_id}",
+            json={
+                "user_id": user_id,
+                "destination": "杭州",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+            },
+        )
+        assert conflict.status_code == 409
+
+        # 显式传 null 清空返程日期
+        cleared = client.put(
+            f"/api/trips/{trip_id}", json={"user_id": user_id, "end_date": None}
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["trip"]["end_date"] is None
+        print("✓ /api/trips/{id} 更新行程（部分更新 / 校验 / 冲突 / 清空日期）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -1327,6 +1414,7 @@ if __name__ == "__main__":
     test_status_trips()
     test_delete_trip_api()
     test_create_trip_api()
+    test_update_trip_api()
     _mp = pytest.MonkeyPatch()
     try:
         test_delete_trip_storage_failure_maps_503(_mp)

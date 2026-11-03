@@ -12,6 +12,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -353,6 +355,53 @@ def test_trip_save_deduplicates_same_trip():
     print("✓ 行程重复保存去重（同日期更新、不同日期新增）")
 
 
+def test_trip_update_and_conflict():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-update", tempfile.mkdtemp())
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-11-09",
+            "end_date": "2026-11-11",
+            "purpose": "出差",
+        }
+    )
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        }
+    )
+
+    assert memory.update_trip("trip_1", {"destination": "南京"}) is True
+    trips = memory.get_trip_history(limit=None)
+    assert trips[0]["destination"] == "南京"
+    assert memory.get_statistics()["frequent_destinations"] == {"南京": 1, "杭州": 1}
+
+    # 清空返程日期
+    assert memory.update_trip("trip_1", {"end_date": None}) is True
+    assert memory.get_trip_history(limit=None)[0]["end_date"] is None
+
+    # 更新后与另一条行程重复 → 拒绝
+    with pytest.raises(ValueError, match="已存在相同行程"):
+        memory.update_trip(
+            "trip_1",
+            {"destination": "杭州", "start_date": "2026-12-01", "end_date": "2026-12-03"},
+        )
+    assert [trip["destination"] for trip in memory.get_trip_history(limit=None)] == [
+        "南京",
+        "杭州",
+    ], "冲突时不应修改数据"
+
+    assert memory.update_trip("trip_missing", {"purpose": "x"}) is False
+    print("✓ 行程更新（字段 / 统计 / 清空日期 / 冲突拒绝）")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -363,6 +412,7 @@ if __name__ == "__main__":
     test_trip_history_delete_and_ids()
     test_stale_snapshot_does_not_resurrect_trip()
     test_trip_save_deduplicates_same_trip()
+    test_trip_update_and_conflict()
     test_session_titles()
     test_session_pinned()
     test_add_message_preserves_metadata()

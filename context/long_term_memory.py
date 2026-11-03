@@ -515,6 +515,40 @@ class LongTermMemory:
                 return True
         return False
 
+    @_locked_mutation
+    def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:
+        """更新一条行程的字段；返回是否存在。
+
+        Raises:
+            ValueError: 更新后与另一条既有行程（同路线 + 同起止日期）重复
+        """
+        for trip in self.data.get("trip_history", []):
+            if str(trip.get("trip_id", "")) != str(trip_id):
+                continue
+            merged = {**trip, **fields}
+            same = self._find_same_trip(merged)
+            if same is not None and same is not trip:
+                raise ValueError("已存在相同行程（同路线 + 同起止日期）")
+
+            old_destination = trip.get("destination")
+            for key in ("origin", "destination", "start_date", "end_date", "purpose"):
+                if key in fields:
+                    trip[key] = fields[key]
+            new_destination = trip.get("destination")
+            if old_destination != new_destination:
+                stats = self.data.setdefault("statistics", {})
+                frequent = stats.setdefault("frequent_destinations", {})
+                if old_destination and old_destination in frequent:
+                    frequent[old_destination] = int(frequent[old_destination]) - 1
+                    if frequent[old_destination] <= 0:
+                        del frequent[old_destination]
+                if new_destination:
+                    frequent[new_destination] = int(frequent.get(new_destination, 0)) + 1
+            self._save()
+            logger.info("Updated trip history: %s", trip_id)
+            return True
+        return False
+
     def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
         """
         获取历史行程
