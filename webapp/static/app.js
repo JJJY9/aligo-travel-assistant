@@ -1402,6 +1402,14 @@ function renderOverview() {
       meta.textContent =
         start && end ? `${start} ~ ${end}` : start || end || "日期未记录";
       row.append(route, meta);
+      if (trip.session_id) {
+        row.classList.add("clickable");
+        row.title = "查看对应对话";
+        row.addEventListener("click", () => {
+          closeMemorySheet();
+          openSession(trip.session_id);
+        });
+      }
       els.trips.appendChild(row);
     });
   }

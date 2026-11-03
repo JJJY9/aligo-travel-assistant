@@ -31,8 +31,10 @@ CREATE TABLE IF NOT EXISTS aligo_trips (
     start_date TEXT,
     end_date TEXT,
     purpose TEXT,
+    session_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE aligo_trips ADD COLUMN IF NOT EXISTS session_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_aligo_trips_user ON aligo_trips (user_id, id);
 
 CREATE TABLE IF NOT EXISTS aligo_chat_messages (
@@ -254,8 +256,9 @@ class PostgresLongTermMemory:
         trip_number = int(row[0]) + 1 if row else 1
         self._execute(
             """
-            INSERT INTO aligo_trips (user_id, trip_id, origin, destination, start_date, end_date, purpose)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO aligo_trips
+                (user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 self.user_id,
@@ -265,12 +268,13 @@ class PostgresLongTermMemory:
                 trip_info.get("start_date"),
                 trip_info.get("end_date"),
                 trip_info.get("purpose") or "旅游",
+                trip_info.get("session_id"),
             ),
         )
 
     def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
         base = (
-            "SELECT trip_id, origin, destination, start_date, end_date, purpose, created_at "
+            "SELECT trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at "
             "FROM aligo_trips WHERE user_id = %s"
         )
         if limit:
@@ -287,9 +291,10 @@ class PostgresLongTermMemory:
                 "start_date": start_date,
                 "end_date": end_date,
                 "purpose": purpose,
+                "session_id": session_id,
                 "timestamp": created_at.isoformat(),
             }
-            for trip_id, origin, destination, start_date, end_date, purpose, created_at in rows
+            for trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at in rows
         ]
 
     def get_frequent_destinations(self, top_n: int = 5) -> list[tuple]:
