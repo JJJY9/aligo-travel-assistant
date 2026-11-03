@@ -1,0 +1,29 @@
+# 本地一键启动 Redis + PostgreSQL（仅用于开发 / 演示）
+#
+# 用法：
+#   docker compose up -d
+#   export REDIS_URL=redis://localhost:6379/0
+#   export DATABASE_URL=postgresql://aligo:aligo@localhost:5432/aligo
+#   python cli.py            # 或 python -m webapp.server
+#
+# 说明：未配置这两个环境变量时，项目仍使用进程内短期记忆 + JSON 文件长期记忆。
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aligo
+      POSTGRES_PASSWORD: aligo
+      POSTGRES_DB: aligo
+    ports:
+      - "5432:5432"
+    volumes:
+      - aligo_pgdata:/var/lib/postgresql/data
+
+volumes:
+  aligo_pgdata:

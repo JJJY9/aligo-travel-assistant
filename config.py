@@ -48,6 +48,12 @@ class RAGConfig(TypedDict):
     embedding_model: str
 
 
+class StorageConfig(TypedDict):
+    redis_url: str
+    postgres_dsn: str
+    redis_ttl_sec: int
+
+
 class ResilienceConfig(TypedDict):
     max_retries: int
     retry_base_delay_sec: float
@@ -77,6 +83,23 @@ SYSTEM_CONFIG: SystemConfig = {
 # RAG 知识库：嵌入模型（本地路径，无需连 HuggingFace）
 RAG_CONFIG: RAGConfig = {
     "embedding_model": "data/models/bge-small-zh-v1.5",
+}
+
+# 存储后端（生产模式可选；未配置或连接失败时自动回退本地实现）：
+#   REDIS_URL     例如 redis://localhost:6379/0 —— 启用 Redis 短期记忆
+#   DATABASE_URL  例如 postgresql://user:pass@localhost:5432/db —— 启用 PostgreSQL 长期记忆
+#   未设置时分别使用进程内滑动窗口 / data/memory/*.json
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+STORAGE_CONFIG: StorageConfig = {
+    "redis_url": os.environ.get("REDIS_URL", ""),
+    "postgres_dsn": os.environ.get("DATABASE_URL", ""),
+    "redis_ttl_sec": _env_int("REDIS_TTL_SEC", 3600),
 }
 
 # 连接与可用性：重试、熔断、健康检查

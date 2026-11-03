@@ -6,7 +6,7 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
-> **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆为进程内滑动窗口，长期记忆为 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。文中提到的 Redis / PostgreSQL 为面向生产环境的架构设计，**尚未实现**；关键指标为开发期实验口径（见「关键指标」小节说明）。
+> **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
 ## ✨ 核心亮点
 
@@ -16,8 +16,8 @@
 - 自然语言理解，无需关键词匹配
 
 ### 🧠 两层记忆架构
-- **短期记忆**：进程内滑动窗口（最近 10 轮对话）；生产设计为 Redis 缓存（未实现）
-- **长期记忆**：JSON 文件持久化（`data/memory/{user_id}.json`）+ LLM 异步总结；生产设计为 PostgreSQL（未实现）
+- **短期记忆**：默认进程内滑动窗口（最近 10 轮对话）；配置 `REDIS_URL` 后使用 Redis（支持跨进程会话共享）
+- **长期记忆**：默认 JSON 文件持久化（`data/memory/{user_id}.json`）+ LLM 异步总结；配置 `DATABASE_URL` 后使用 PostgreSQL
 - 智能识别偏好追加/覆盖动作（"我还喜欢如家" vs "我搬家到上海了"）
 
 ### 📚 RAG知识库
@@ -142,13 +142,13 @@
 | 用户偏好缓存命中率（设计目标） | - | - | 尚未实现 |
 | 系统启动速度 | 未优化 | 秒级（懒加载） | 启动仅扫描元数据 |
 
-> **指标说明**：以上数据为开发期内部实验口径，仓库未附带对应评测脚本；「缓存命中率」与 Redis / PostgreSQL 相关优化属于生产设计目标，当前版本尚未实现。
+> **指标说明**：以上数据为开发期内部实验口径，仓库未附带对应评测脚本；「缓存命中率」为设计目标，当前未提供独立缓存层（存储层已支持 Redis / PostgreSQL，见「数据存储」）。
 
 **优化路径**：
 1. **V1.0**: 关键词匹配意图识别（准确率65%） + 串行调度（响应时间30秒）
 2. **V2.0**: 两层记忆系统 + RAG知识库 + 联网搜索
 3. **V3.0**: LLM语义理解意图识别（准确率90%+） + 优先级并行调度（响应时间15秒）
-4. **V4.0**: Skill Plugins插件化架构 + LazyAgentRegistry（Redis 缓存层为设计目标）
+4. **V4.0**: Skill Plugins插件化架构 + LazyAgentRegistry
 
 ---
 
@@ -188,18 +188,17 @@
 ### 2. 两层记忆系统
 
 **短期记忆（会话级）**
-- 基于**进程内滑动窗口**的对话管理（生产设计为 Redis 缓存，未实现）
+- 基于**滑动窗口**的对话管理（默认进程内；配置 `REDIS_URL` 后使用 Redis，支持跨进程会话共享）
 - 保存最近10轮对话
 - 会话结束即清空
 - 用于上下文理解和快速访问
 
 **长期记忆（持久化）**
-- 💾 **JSON 文件持久化**（当前实现；生产设计为 PostgreSQL）：用户偏好、历史行程、完整聊天历史
+- 💾 **持久化存储**：默认 JSON 文件（`data/memory/{user_id}.json`）；配置 `DATABASE_URL` 后使用 PostgreSQL（表结构自动创建）
 - 🎯 **用户偏好管理**：支持动态添加任意偏好类型，智能识别追加/覆盖动作
 - 📅 **历史行程记录**：出发地、目的地、时间、目的，支持跨会话查询
 - 📊 **统计信息**：常去目的地、总行程数
 - 🤖 **LLM异步总结**：自动总结历史会话和行程记录
-- ⚡ **Redis 缓存层**（生产设计，未实现）：用户偏好热数据、LLM 总结结果
 
 **测试记忆系统**：
 ```bash
@@ -457,6 +456,17 @@ python tests/test_cli_qa.py        # 完整跑通所有意图的 QA 测试
 python tests/test_memory_system.py # 记忆系统（含 LLM 总结）
 ```
 
+### 存储后端集成测试（需要 Redis / PostgreSQL）
+
+```bash
+docker compose up -d
+TEST_REDIS_URL=redis://localhost:6379/0 \
+TEST_POSTGRES_DSN=postgresql://aligo:aligo@localhost:5432/aligo \
+pytest tests/test_storage_integration.py -q
+```
+
+CI 中通过 service 容器自动启用；未配置环境变量时相关用例自动跳过。
+
 ### 代码检查
 
 ```bash
@@ -486,10 +496,12 @@ aligo-travel-assistant/
 │   ├── preference/                  # 偏好管理
 │   ├── query-info/                  # 联网信息查询
 │   └── memory-query/                # 记忆查询
-├── context/                         # 两层记忆
+├── context/                         # 两层记忆（可插拔后端）
 │   ├── memory_manager.py            # 记忆管理器（统一门面）
-│   ├── short_term_memory.py         # 短期记忆（进程内滑动窗口）
-│   └── long_term_memory.py          # 长期记忆（JSON 文件）
+│   ├── storage.py                   # 存储工厂（Redis / PostgreSQL 自动启用与回退）
+│   ├── short_term_memory.py         # 短期记忆（进程内 / Redis）
+│   ├── long_term_memory.py          # 长期记忆（JSON 文件）
+│   └── postgres_long_term_memory.py # 长期记忆（PostgreSQL）
 ├── utils/                           # 工具与稳定性
 │   ├── circuit_breaker.py           # 熔断器
 │   ├── llm_resilience.py            # 重试退避、健康检查
@@ -506,6 +518,7 @@ aligo-travel-assistant/
 ├── data/                            # 运行数据（均不提交）
 │   ├── memory/                      # 长期记忆（{user_id}.json，gitignored）
 │   └── models/bge-small-zh-v1.5/    # 本地向量模型（gitignored，需自行下载）
+├── docker-compose.yml               # 本地启动 Redis + PostgreSQL（可选）
 ├── cli.py                           # CLI 主程序
 ├── config.py                        # 配置（模型 / 容错 / RAG）
 ├── config_local.py                  # 本地密钥（自行创建，gitignored）
@@ -526,10 +539,10 @@ aligo-travel-assistant/
 - 🤖 **DeepSeek (deepseek-chat)** - 大语言模型（OpenAI 兼容接口，可切换豆包 / OpenAI 等）
 
 ### 数据存储
-- 💾 **JSON 文件** - 长期记忆持久化（`data/memory/{user_id}.json`，当前实现）
-- 🗄️ **PostgreSQL** - 长期记忆持久化（生产设计，未实现）
-- ⚡ **Redis** - 短期记忆缓存（生产设计，未实现）
-- 🔍 **Milvus Lite** - 本地向量数据库（RAG 知识库，当前实现）
+- 💾 **JSON 文件** - 长期记忆默认实现（`data/memory/{user_id}.json`）
+- 🗄️ **PostgreSQL** - 长期记忆可选后端（设置 `DATABASE_URL` 启用，表结构自动创建）
+- ⚡ **Redis** - 短期记忆可选后端（设置 `REDIS_URL` 启用，List + TTL）
+- 🔍 **Milvus Lite** - 本地向量数据库（RAG 知识库）
 
 ### 向量化与检索
 - 🧠 **BGE-small-zh-v1.5** - 中文Embedding模型（本地部署）
@@ -569,9 +582,15 @@ aligo-travel-assistant/
   - 将仓库内全部文件放入该目录即可
 
 ### 数据存储
-- 当前版本使用**JSON文件存储**长期记忆（`data/memory/{user_id}.json`）
-- 项目描述中提到的PostgreSQL和Redis是**架构设计方案**（面向生产环境）
-- 如需切换到PostgreSQL/Redis，需修改 `context/long_term_memory.py` 和 `context/short_term_memory.py`
+- **默认（开箱即用）**：短期记忆为进程内滑动窗口，长期记忆为 JSON 文件（`data/memory/{user_id}.json`）
+- **生产模式（可选）**：设置 `REDIS_URL` 启用 Redis 短期记忆（List + 滑动窗口 + TTL）；设置 `DATABASE_URL` 启用 PostgreSQL 长期记忆（表结构首次连接自动创建）；未配置或连接失败时自动回退默认实现（失败后 60 秒冷却，不阻塞启动）
+- **本地一键启动依赖**：`docker compose up -d`（见 `docker-compose.yml`），然后：
+
+  ```bash
+  export REDIS_URL=redis://localhost:6379/0
+  export DATABASE_URL=postgresql://aligo:aligo@localhost:5432/aligo
+  python cli.py        # 或 python -m webapp.server
+  ```
 
 ### 知识库初始化
 - 首次运行前必须初始化RAG知识库
@@ -587,10 +606,10 @@ aligo-travel-assistant/
 
 ## 🚀 未来规划
 
-- [ ] 完整实现PostgreSQL持久化存储
-- [ ] 完整实现Redis缓存层
+- [x] 完整实现PostgreSQL持久化存储（可选后端，`DATABASE_URL` 启用）
+- [x] 完整实现Redis短期记忆（可选后端，`REDIS_URL` 启用）
 - [ ] 支持更多LLM模型（OpenAI、Claude等）
-- [ ] Web界面（FastAPI + React）
+- [ ] Web界面升级（React 前端）
 - [ ] 更多Skill插件（酒店预订、机票查询等）
 - [ ] 监控和日志系统
 

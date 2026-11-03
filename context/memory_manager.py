@@ -6,8 +6,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from .long_term_memory import LongTermMemory
-from .short_term_memory import ShortTermMemory
+from .storage import create_long_term_memory, create_short_term_memory
 from utils.json_parser import extract_json_from_async_response
 
 logger = logging.getLogger(__name__)
@@ -33,10 +32,12 @@ class MemoryManager:
         self.user_id = user_id
         self.session_id = session_id
         self.llm_model = llm_model
+        self._storage_path = storage_path
 
-        # 初始化两层记忆
-        self.short_term = ShortTermMemory(max_turns=10)
-        self.long_term = LongTermMemory(user_id, storage_path)
+        # 初始化两层记忆（配置 REDIS_URL / DATABASE_URL 时自动使用 Redis / PostgreSQL，
+        # 未配置或连接失败时回退进程内 / JSON 实现）
+        self.short_term = create_short_term_memory(session_id, max_turns=10)
+        self.long_term = create_long_term_memory(user_id, storage_path)
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -102,7 +103,7 @@ class MemoryManager:
         多会话（如 Web 界面同时开多个标签页）/ 多进程写入后，内存中的快照可能
         过期；在一轮对话开始前调用本方法可避免覆盖其它会话刚写入的数据。
         """
-        self.long_term = LongTermMemory(self.user_id, self.long_term.storage_path)
+        self.long_term = create_long_term_memory(self.user_id, self._storage_path)
 
     def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
         """
