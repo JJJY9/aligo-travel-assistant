@@ -86,6 +86,9 @@ def test_postgres_long_term_memory():
         assert len(memory.get_chat_history(session_id="s1")) == 2
         assert memory.get_chat_history(limit=1)[0]["content"] == "其他会话"
 
+        memory.set_session_title("s1", "杭州出差")
+        assert memory.get_session_titles() == {"s1": "杭州出差"}
+
         memory.save_trip_history(
             {"origin": "北京", "destination": "上海", "start_date": "2026-11-09", "purpose": "出差"}
         )
@@ -105,6 +108,7 @@ def test_postgres_long_term_memory():
 
         assert memory.delete_chat_session("s1") == 2
         assert memory.get_chat_history(session_id="s1") == []
+        assert memory.get_session_titles() == {}
         assert len(memory.get_chat_history()) == 1
 
         memory.clear_history()

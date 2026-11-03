@@ -395,6 +395,49 @@ def test_chat_rate_limit():
         _cleanup(other_id)
 
 
+def test_session_rename():
+    client = _client()
+    user_id = _unique_user("web_test_title")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-title"},
+        )
+        assert response.status_code == 200
+
+        renamed = client.put(
+            "/api/sessions/sess-title/title",
+            json={"user_id": user_id, "title": "杭州出差计划"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["title"] == "杭州出差计划"
+
+        sessions = client.get("/api/sessions", params={"user_id": user_id}).json()["sessions"]
+        assert sessions[0]["title"] == "杭州出差计划"
+
+        hits = client.get(
+            "/api/sessions", params={"user_id": user_id, "q": "出差计划"}
+        ).json()["sessions"]
+        assert [item["session_id"] for item in hits] == ["sess-title"], "自定义标题应可被搜索"
+
+        cleared = client.put(
+            "/api/sessions/sess-title/title",
+            json={"user_id": user_id, "title": ""},
+        )
+        assert cleared.json()["title"] == ""
+        sessions = client.get("/api/sessions", params={"user_id": user_id}).json()["sessions"]
+        assert sessions[0]["title"] == "你好", "空标题应恢复自动标题"
+
+        too_long = client.put(
+            "/api/sessions/sess-title/title",
+            json={"user_id": user_id, "title": "x" * 61},
+        )
+        assert too_long.status_code == 422
+        print("✓ 会话重命名 / 标题搜索 / 恢复自动标题")
+    finally:
+        _cleanup(user_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -427,6 +470,7 @@ if __name__ == "__main__":
     test_session_lru_eviction()
     test_request_id_header()
     test_chat_rate_limit()
+    test_session_rename()
     test_invalid_user_id_rejected()
     test_export_attachment()
     print("\n全部通过")
