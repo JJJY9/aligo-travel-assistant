@@ -1790,6 +1790,15 @@ function isMobile() {
   return window.matchMedia("(max-width: 900px)").matches;
 }
 
+function focusSearch() {
+  if (isMobile()) {
+    els.app.classList.add("side-open");
+    els.scrim.hidden = false;
+  }
+  els.historySearch.focus();
+  els.historySearch.select();
+}
+
 function toggleSidebar() {
   if (isMobile()) {
     const open = !els.app.classList.contains("side-open");
@@ -1976,7 +1985,29 @@ function bindEvents() {
   els.scrim.addEventListener("click", closeMobileSidebar);
 
   window.addEventListener("keydown", (event) => {
+    const target = event.target;
+    const typing =
+      target instanceof HTMLElement &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable);
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      focusSearch();
+      return;
+    }
+    if (event.key === "/" && !typing) {
+      event.preventDefault();
+      focusSearch();
+      return;
+    }
     if (event.key === "Escape") {
+      if (document.activeElement === els.historySearch && els.historySearch.value) {
+        els.historySearch.value = "";
+        loadSessions("");
+        return;
+      }
       closeMemorySheet();
       closeMobileSidebar();
     }
