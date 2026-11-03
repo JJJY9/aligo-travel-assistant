@@ -65,9 +65,69 @@ def test_load_failure_still_queries():
     print("✓ load_collection 不可用时仍继续查询")
 
 
+def test_client_creation_retries_transient_failure(monkeypatch):
+    """另一进程刚释放文件锁时首次打开可能失败，应重试一次。"""
+    from utils import milvus_client as mc
+
+    calls = {"n": 0}
+
+    class _Fake:
+        def close(self):
+            pass
+
+    def fake_create(db_path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("another process holds the lock")
+        return _Fake()
+
+    monkeypatch.setattr(mc, "_create_client", fake_create)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    path = "retry-once-test.db"
+    try:
+        client = mc.get_milvus_client(path)
+        assert calls["n"] == 2
+        assert mc.peek_milvus_client(path) is client
+    finally:
+        mc.reset_milvus_client(path)
+    print("✓ 客户端首次打开失败时重试一次")
+
+
+def test_client_creation_retry_failure_propagates(monkeypatch):
+    from utils import milvus_client as mc
+
+    def always_fail(db_path):
+        raise RuntimeError("still locked")
+
+    monkeypatch.setattr(mc, "_create_client", always_fail)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    path = "retry-fail-test.db"
+    try:
+        with pytest.raises(RuntimeError, match="still locked"):
+            mc.get_milvus_client(path)
+        assert mc.peek_milvus_client(path) is None
+    finally:
+        mc.reset_milvus_client(path)
+    print("✓ 重试仍失败时向上抛出，不缓存坏客户端")
+
+
 if __name__ == "__main__":
-    test_uses_max_id_not_row_count()
-    test_empty_collection_starts_at_one()
-    test_query_failure_propagates()
-    test_load_failure_still_queries()
+    for plain_case in (
+        test_uses_max_id_not_row_count,
+        test_empty_collection_starts_at_one,
+        test_query_failure_propagates,
+        test_load_failure_still_queries,
+    ):
+        plain_case()
+    for patched_case in (
+        test_client_creation_retries_transient_failure,
+        test_client_creation_retry_failure_propagates,
+    ):
+        mp = pytest.MonkeyPatch()
+        try:
+            patched_case(mp)
+        finally:
+            mp.undo()
     print("\n全部通过")
