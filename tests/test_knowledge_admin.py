@@ -72,6 +72,9 @@ def test_list_documents_parses_sorts_and_filters(monkeypatch):
 
 
 def test_add_document_maps_result(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     agent = _FakeAgent({"status": "success", "ids": [42], "total_count": 43})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
 
@@ -85,6 +88,9 @@ def test_add_document_maps_result(monkeypatch):
 
 
 def test_add_document_error_raises(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     agent = _FakeAgent({"status": "error", "message": "写入失败"})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
     with pytest.raises(RuntimeError, match="写入失败"):
@@ -102,12 +108,60 @@ def test_delete_document_checks_existence(monkeypatch):
     print("✓ 删除知识片段（存在性判断）")
 
 
+class _BrokenMilvusClient(_FakeMilvusClient):
+    def query(self, *args, **kwargs):
+        raise RuntimeError("collection is in state 'released'")
+
+
+def test_query_errors_propagate(monkeypatch):
+    """查询失败不能伪装成空库 / 片段不存在，否则接口会返回错误的 200 / 404。"""
+    fake = _BrokenMilvusClient([])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+
+    with pytest.raises(RuntimeError, match="released"):
+        knowledge_admin.list_documents()
+    with pytest.raises(RuntimeError, match="released"):
+        knowledge_admin.delete_document(1)
+    print("✓ 查询失败向上抛出（不伪装成空库 / 不存在）")
+
+
+def test_add_document_requires_initialized_db(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda: Path("missing-dir/milvus_lite.db")
+    )
+    with pytest.raises(FileNotFoundError, match="知识库未初始化"):
+        knowledge_admin.add_document("内容")
+    print("✓ 知识库未初始化时新增给出明确错误")
+
+
+def test_search_documents_delegates_to_agent(monkeypatch):
+    class _SearchAgent:
+        def __init__(self):
+            self.calls = []
+
+        def search_knowledge(self, query, top_k=5):
+            self.calls.append((query, top_k))
+            return [{"content": "命中"}]
+
+    agent = _SearchAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.search_documents("住宿标准", top_k=3)
+    assert result == [{"content": "命中"}]
+    assert agent.calls == [("住宿标准", 3)]
+    print("✓ 语义检索委托 RAG Agent")
+
+
 if __name__ == "__main__":
     for case in (
         test_list_documents_parses_sorts_and_filters,
         test_add_document_maps_result,
         test_add_document_error_raises,
         test_delete_document_checks_existence,
+        test_query_errors_propagate,
+        test_add_document_requires_initialized_db,
+        test_search_documents_delegates_to_agent,
     ):
         mp = pytest.MonkeyPatch()
         try:

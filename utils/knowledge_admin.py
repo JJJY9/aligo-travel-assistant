@@ -75,23 +75,23 @@ def list_documents(
     offset: int = 0,
     query: str = "",
 ) -> dict[str, Any]:
-    """列出知识片段（按 id 升序，可按内容 / 元数据过滤）。
+    """列出知识片段（按 id 倒序，可按内容 / 元数据过滤）。
 
     Returns:
         {"total": int, "items": [{"id", "content", "metadata"}]}
+
+    Raises:
+        FileNotFoundError: 知识库未初始化
+        Exception: Milvus 查询失败（由上层映射为 503，不能伪装成空库）
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    try:
-        rows = client.query(
-            collection_name=COLLECTION_NAME,
-            filter="id >= 0",
-            output_fields=["id", "content", "metadata"],
-            limit=_MAX_SCAN,
-        )
-    except Exception as exc:  # noqa: BLE001 - 空集合等场景按无数据处理
-        logger.debug("知识库查询失败: %s", exc)
-        rows = []
+    rows = client.query(
+        collection_name=COLLECTION_NAME,
+        filter="id >= 0",
+        output_fields=["id", "content", "metadata"],
+        limit=_MAX_SCAN,
+    )
 
     documents: list[dict[str, Any]] = [
         {
@@ -123,24 +123,33 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     text = content.strip()
     if not text:
         raise ValueError("知识内容不能为空")
+    if not knowledge_db_path().exists():
+        raise FileNotFoundError("知识库未初始化")
 
+    # 模型加载可能耗时数秒，放在锁外；锁只保护 id 生成 + 写入
+    agent = _get_agent()
     with _WRITE_LOCK:
-        agent = _get_agent()
         result = agent.add_documents(
             [{"content": text, "metadata": dict(metadata or {})}]
         )
     if result.get("status") != "success":
         raise RuntimeError(str(result.get("message") or "添加知识片段失败"))
     ids = result.get("ids") or []
+    total = result.get("total_count")
     return {
         "status": "success",
         "id": int(ids[-1]) if ids else None,
-        "total_count": int(result.get("total_count") or 0),
+        "total_count": int(total) if total is not None else None,
     }
 
 
 def delete_document(doc_id: int) -> bool:
-    """按 id 删除知识片段；返回是否真的删除了记录。"""
+    """按 id 删除知识片段；返回是否真的删除了记录。
+
+    Raises:
+        FileNotFoundError: 知识库未初始化
+        Exception: Milvus 查询 / 删除失败（由上层映射为 503，不能误报为 404）
+    """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
     with _WRITE_LOCK:
@@ -150,14 +159,17 @@ def delete_document(doc_id: int) -> bool:
         return False
 
 
+def search_documents(query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    """语义检索知识片段（供评测与集成测试验证检索链路）。"""
+    agent = _get_agent()
+    return agent.search_knowledge(query, top_k=top_k)
+
+
 def _exists(client: Any, doc_id: int) -> bool:
-    try:
-        rows = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f"id == {doc_id}",
-            output_fields=["id"],
-            limit=1,
-        )
-    except Exception:  # noqa: BLE001 - 查询失败按不存在处理
-        return False
+    rows = client.query(
+        collection_name=COLLECTION_NAME,
+        filter=f"id == {doc_id}",
+        output_fields=["id"],
+        limit=1,
+    )
     return bool(rows)

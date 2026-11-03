@@ -32,6 +32,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 from utils.json_parser import extract_json_from_async_response
 from utils.milvus_client import (  # noqa: F401 - shutdown_milvus_clients 供外部清理
     get_milvus_client,
+    next_entity_id,
     reset_milvus_client,
     shutdown_milvus_clients,
 )
@@ -210,9 +211,13 @@ class RAGKnowledgeAgent(AgentBase):
                 data=data_to_insert
             )
 
-            # 获取总数
-            stats = self.milvus_client.get_collection_stats(self.collection_name)
-            total_count = stats.get("row_count", len(documents))
+            # 获取总数（仅用于展示；统计失败不能把已成功的写入报成失败）
+            try:
+                stats = self.milvus_client.get_collection_stats(self.collection_name)
+                total_count = int(stats.get("row_count", len(documents)) or 0)
+            except Exception as stats_err:  # noqa: BLE001 - 写入已成功，统计失败只记录
+                logger.warning(f"get_collection_stats failed after insert: {stats_err}")
+                total_count = None
 
             logger.info(f"Successfully added {len(documents)} documents to knowledge base")
             return {
@@ -227,19 +232,12 @@ class RAGKnowledgeAgent(AgentBase):
             return {"status": "error", "message": str(e)}
 
     def _next_document_id(self) -> int:
-        """返回下一个可用的文档 id（现有最大 id + 1，空集合从 1 开始）。"""
-        try:
-            rows = self.milvus_client.query(
-                collection_name=self.collection_name,
-                filter="id >= 0",
-                output_fields=["id"],
-                limit=16384,
-            )
-            return max((int(row.get("id", 0) or 0) for row in rows or []), default=0) + 1
-        except Exception as exc:  # noqa: BLE001 - 空集合 / 旧版本查询失败时兜底
-            logger.debug(f"query max id failed, fallback to row_count: {exc}")
-            stats = self.milvus_client.get_collection_stats(self.collection_name)
-            return int(stats.get("row_count", 0) or 0) + 1
+        """返回下一个可用的文档 id（现有最大 id + 1，空集合从 1 开始）。
+
+        查询失败时直接抛出，由 add_documents 返回错误；不能用行数兜底，
+        否则删除过片段后可能与已有主键冲突并静默覆盖旧知识。
+        """
+        return next_entity_id(self.milvus_client, self.collection_name)
 
     def search_knowledge(self, query: str, top_k: int | None = None) -> list[dict]:
         """

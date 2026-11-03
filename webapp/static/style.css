@@ -1128,8 +1128,18 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-size: 13px;
 }
 .kb-form-row .ghost { flex: none; }
-.kb-row .pref-actions { opacity: 0; }
-.kb-row:hover .pref-actions, .kb-row .pref-actions:focus-within { opacity: 1; }
+.kb-search {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+}
+.kb-more { margin-top: 6px; }
+.kb-list:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------- 系统自检 ---------- */
 .doctor-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

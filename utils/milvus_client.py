@@ -62,6 +62,32 @@ def create_temporary_milvus_client(db_path: str) -> Any:
     return _create_client(db_path)
 
 
+def next_entity_id(
+    client: Any,
+    collection_name: str,
+    id_field: str = "id",
+    max_scan: int = 16384,
+) -> int:
+    """返回集合内最大 ``id`` + 1（空集合从 1 开始）。
+
+    先 ``load_collection``：Milvus Lite 3.x 新进程中集合默认 released，
+    未加载时 query 会直接报错。查询失败时向上抛出，而不是退回行数兜底——
+    删除过片段后 row_count 小于最大 id，按行数递增会与已有主键冲突，
+    而 Milvus 对重复主键的 insert 会静默覆盖旧实体（数据丢失）。
+    """
+    try:
+        client.load_collection(collection_name)
+    except Exception as exc:  # noqa: BLE001 - 2.x 无该调用；查询失败会在下面暴露
+        logger.debug("load_collection before next id skipped: %s", exc)
+    rows = client.query(
+        collection_name=collection_name,
+        filter=f"{id_field} >= 0",
+        output_fields=[id_field],
+        limit=max_scan,
+    )
+    return max((int(row.get(id_field, 0) or 0) for row in rows or []), default=0) + 1
+
+
 def reset_milvus_client(db_path: str) -> None:
     """关闭并移除某个数据库路径的共享客户端（重连时使用）。"""
     with _LOCK:

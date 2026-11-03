@@ -198,11 +198,19 @@ PreferenceValue = (
 )
 
 
+_KnowledgeMetaKey = Annotated[str, Field(max_length=32)]
+_KnowledgeMetaValue = Annotated[str, Field(max_length=200)]
+
+
 class KnowledgeDocumentPayload(BaseModel):
     """新增知识片段（记忆面板维护入口）。"""
 
     content: str = Field(min_length=1, max_length=2000)
-    metadata: dict[str, str] = Field(default_factory=dict)
+    # 限制键数 / 键值长度：metadata 原样写入向量库并在列表接口返回，
+    # 不放任超大对象拖垮后续读取
+    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] = Field(
+        default_factory=dict, max_length=10
+    )
 
 
 class PreferencePayload(BaseModel):

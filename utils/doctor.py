@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import sys
@@ -183,17 +184,26 @@ async def check_llm_connectivity() -> CheckResult:
     return CheckResult("LLM 连通性", STATUS_FAIL, message[:150])
 
 
-async def run_doctor(include_network: bool = True) -> list[CheckResult]:
-    """执行全部自检项。
-
-    Args:
-        include_network: 是否包含 LLM 连通性检查（测试中可关闭，避免真实请求）
-    """
+def run_doctor_offline() -> list[CheckResult]:
+    """执行不依赖网络的同步检查项（供线程池调用，避免阻塞事件循环）。"""
     results: list[CheckResult] = [check_python()]
     results.extend(check_dependencies())
     results.append(check_config())
     results.append(check_model_files())
     results.append(check_knowledge_base())
+    return results
+
+
+async def run_doctor(include_network: bool = True) -> list[CheckResult]:
+    """执行全部自检项。
+
+    同步检查（含冷启动打开 Milvus）放到线程池，避免在 Web 事件循环上
+    阻塞对话 SSE 与其它接口。
+
+    Args:
+        include_network: 是否包含 LLM 连通性检查（测试中可关闭，避免真实请求）
+    """
+    results = await asyncio.to_thread(run_doctor_offline)
     if include_network:
         results.append(await check_llm_connectivity())
     else:
