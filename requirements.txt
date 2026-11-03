@@ -5,7 +5,7 @@ setuptools>=69.0.0,<82
 agentscope==1.0.16
 
 # LLM 调用
-requests==2.32.3
+requests==2.34.2
 
 # RAG 与向量库（pymilvus[milvus_lite] 用于本地 .db 连接）
 # 注意：milvus-lite 2.x 没有 Windows 轮子（pymilvus 的 extra 显式排除 win32），
