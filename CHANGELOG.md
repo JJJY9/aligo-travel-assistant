@@ -25,6 +25,7 @@
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与记忆面板「知识库 · N 片段」；Milvus 客户端抽到 `utils/milvus_client.py` 供 RAG Skill 与状态查询共享
 - 知识库维护：记忆面板查看 / 新增 / 删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可检索，列表按 id 倒序显示最新片段；新增按最大 id 递增，删除后再添加不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1 / hit@3 / hit@5 与 MRR（只检索、不调用大模型），知识库未初始化时提示跳过，hit@5 低于 80% 退出码 1
+- 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
@@ -59,6 +60,7 @@
 - 新增对话失败路径测试：`/api/chat` 返回 500（含请求 ID 与失败原因）、SSE 推送 `error` 事件
 - 新增存储一致性（原子写入 / 对话中途元数据 / 清理完整 / 导出 / 时区归日 / ICS）、每会话用量隔离、IP 限流与 key 淘汰、文档页 CSP、未处理异常 500 响应头用例
 - 新增知识库维护（列表解析 / 排序 / 分页、接口校验与 404、真实 Milvus 增删闭环）与检索评测指标（hit@K / MRR / top_k 截断）用例
+- 新增 `/api/doctor` 自检接口用例（结构 / 状态取值 / 默认不请求网络）
 
 ## [1.3.0] - 2026-11-03
 
