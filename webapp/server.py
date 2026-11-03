@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 
 APP_VERSION = "1.3.0"
 
+# SSE 心跳间隔（秒）：LLM 调用可能持续数十秒，定期发送注释行避免代理/浏览器超时
+SSE_HEARTBEAT_SEC = 15.0
+
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
 
@@ -729,13 +732,29 @@ def create_app(model: Any = None) -> FastAPI:
 
         async def event_stream() -> Any:
             task = asyncio.create_task(run())
+            heartbeat: asyncio.Task[None] | None = None
+
+            async def send_heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(SSE_HEARTBEAT_SEC)
+                    await queue.put({"type": "heartbeat"})
+
+            if SSE_HEARTBEAT_SEC > 0:
+                heartbeat = asyncio.create_task(send_heartbeat())
             try:
                 while True:
                     event = await queue.get()
+                    if event.get("type") == "heartbeat":
+                        yield ": keep-alive\n\n"
+                        continue
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     if event["type"] in ("done", "error"):
                         break
             finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat
                 if not task.done():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
