@@ -89,10 +89,34 @@ def test_add_search_and_delete_roundtrip():
     print(f"✓ 知识片段新增 / 语义检索 / 删除闭环（id={first_id} → {second_id}）")
 
 
+def test_export_import_roundtrip_is_idempotent():
+    """导出 → 原样导入：已有片段全部按内容跳过，数量不变。"""
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    from utils.knowledge_admin import (
+        export_documents,
+        import_documents,
+        list_documents,
+    )
+
+    documents = export_documents()
+    assert documents, "本地知识库应有片段"
+    before = list_documents(limit=1)["total"]
+    result = import_documents(documents)
+    assert result == {"imported": 0, "skipped": len(documents)}, (
+        "重复导入同一备份应全部跳过"
+    )
+    assert list_documents(limit=1)["total"] == before
+    print(f"✓ 导出→导入幂等（{len(documents)} 条全部跳过）")
+
+
 if __name__ == "__main__":
     skip_reason = _skip_reason()
     if skip_reason:
         print(f"跳过：{skip_reason}")
     else:
         test_add_search_and_delete_roundtrip()
+        test_export_import_roundtrip_is_idempotent()
         print("\n全部通过")
