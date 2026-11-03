@@ -9,6 +9,7 @@
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -40,13 +41,22 @@ def _create_client(db_path: str) -> Any:
     )
 
 
+def _create_client_with_retry(db_path: str) -> Any:
+    """创建客户端；另一进程刚释放文件锁时可能瞬时失败，重试一次。"""
+    try:
+        return _create_client(db_path)
+    except Exception:  # noqa: BLE001 - 仅对首次失败做一次短暂重试
+        time.sleep(0.5)
+        return _create_client(db_path)
+
+
 def get_milvus_client(db_path: str) -> Any:
     """获取（或创建）进程内共享的 Milvus Lite 客户端。"""
     with _LOCK:
         client = _CLIENTS.get(db_path)
         if client is not None:
             return client
-        client = _create_client(db_path)
+        client = _create_client_with_retry(db_path)
         _CLIENTS[db_path] = client
         return client
 
@@ -59,7 +69,7 @@ def peek_milvus_client(db_path: str) -> Any | None:
 
 def create_temporary_milvus_client(db_path: str) -> Any:
     """创建一个不缓存的临时客户端（调用方负责 close，避免长期占用文件锁）。"""
-    return _create_client(db_path)
+    return _create_client_with_retry(db_path)
 
 
 def next_entity_id(
