@@ -482,6 +482,41 @@ def test_export_markdown():
         _cleanup(user_id)
 
 
+def test_session_pin():
+    client = _client()
+    user_id = _unique_user("web_test_pin")
+    try:
+        for session_id in ("sess-pin-a", "sess-pin-b"):
+            response = client.post(
+                "/api/chat",
+                json={"message": "你好", "user_id": user_id, "session_id": session_id},
+            )
+            assert response.status_code == 200
+
+        pinned = client.put(
+            "/api/sessions/sess-pin-a/pin",
+            json={"user_id": user_id, "pinned": True},
+        )
+        assert pinned.status_code == 200
+        assert pinned.json()["pinned"] is True
+
+        sessions = client.get("/api/sessions", params={"user_id": user_id}).json()["sessions"]
+        assert sessions[0]["session_id"] == "sess-pin-a", "置顶会话应排在最前"
+        assert sessions[0]["pinned"] is True
+        assert all(item["pinned"] is False for item in sessions[1:])
+
+        unpinned = client.put(
+            "/api/sessions/sess-pin-a/pin",
+            json={"user_id": user_id, "pinned": False},
+        )
+        assert unpinned.json()["pinned"] is False
+        sessions = client.get("/api/sessions", params={"user_id": user_id}).json()["sessions"]
+        assert all(item["pinned"] is False for item in sessions)
+        print("✓ 会话置顶 / 取消置顶与排序")
+    finally:
+        _cleanup(user_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -515,6 +550,7 @@ if __name__ == "__main__":
     test_request_id_header()
     test_chat_rate_limit()
     test_session_rename()
+    test_session_pin()
     test_export_markdown()
     test_invalid_user_id_rejected()
     test_export_attachment()
