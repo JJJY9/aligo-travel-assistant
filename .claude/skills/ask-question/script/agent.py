@@ -60,7 +60,7 @@ class RAGKnowledgeAgent(AgentBase):
         knowledge_base_path: str | None = None,
         collection_name: str = "business_travel_knowledge",
         embedding_model: str = "BAAI/bge-small-zh-v1.5",
-        top_k: int = 3,
+        top_k: int = 5,
         **kwargs
     ):
         super().__init__()
@@ -312,7 +312,6 @@ class RAGKnowledgeAgent(AgentBase):
         user_query = content
         if isinstance(content, str) and content.strip().startswith('{'):
             try:
-                import json
                 data = json.loads(content)
                 # 只要解析成功，就认为 content 是结构化数据，尝试提取 query
                 extracted_query = ""
@@ -386,7 +385,6 @@ class RAGKnowledgeAgent(AgentBase):
                 answer_str = answer.strip()
                 if answer_str.startswith("{") and answer_str.endswith("}"):
                     try:
-                        import json
                         json_obj = json.loads(answer_str)
                         # 如果 LLM 输出了 {"answer": "..."} 或 {"content": "..."}
                         if isinstance(json_obj, dict):
