@@ -11,7 +11,7 @@ requests==2.34.2
 # 注意：milvus-lite 2.x 没有 Windows 轮子（pymilvus 的 extra 显式排除 win32），
 # Windows 下改用 pymilvus 3.x + milvus-lite 3.x（已在 Windows 实测可用）。
 # 从 2.x 升级时，旧版 milvus_lite.db 文件与 3.x 不兼容，需删除后重新初始化知识库。
-pymilvus[milvus_lite]==2.6.9; sys_platform != "win32"
+pymilvus[milvus_lite]==3.0.2; sys_platform != "win32"
 pymilvus==3.0.2; sys_platform == "win32"
 milvus-lite==3.2.2; sys_platform == "win32"
 sentence-transformers==5.2.3
