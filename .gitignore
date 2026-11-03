@@ -62,6 +62,8 @@ config_local.py
 data/memory/
 # 测试生成的临时记忆数据
 data/test_memory/
+# export 命令导出的用户数据
+exports/
 
 # 本地 Embedding 模型（从 HuggingFace/ModelScope 下载，见 README）
 data/models/*

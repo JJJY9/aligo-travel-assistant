@@ -62,6 +62,7 @@ class AligoCLI:
         table.add_row("clear", "清空当前任务（保留长期记忆）")
         table.add_row("history", "查看历史行程")
         table.add_row("preferences", "查看用户偏好")
+        table.add_row("export", "导出用户数据（JSON + Markdown，保存到 exports/）")
         table.add_row("exit", "退出程序")
         table.add_row("", "")
         table.add_row("[自然语言]", "直接输入您的需求，如：")
@@ -770,6 +771,15 @@ class AligoCLI:
 
         self.console.print(table)
 
+    def export_memory(self):
+        """把当前用户的长期记忆导出为 JSON 与 Markdown（exports/ 目录）"""
+        from utils.exporter import export_files
+
+        data = self.memory_manager.export_data()
+        paths = export_files(data, "exports")
+        for path in paths:
+            self.console.print(f"✓ 已导出: {path}", style="green")
+
     async def run(self):
         """运行 CLI"""
         # 打印横幅
@@ -809,6 +819,8 @@ class AligoCLI:
                     self.show_history()
                 elif command == "preferences":
                     self.show_preferences()
+                elif command == "export":
+                    self.export_memory()
                 else:
                     # 处理自然语言查询
                     await self.process_query(user_input)

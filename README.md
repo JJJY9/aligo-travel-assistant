@@ -402,6 +402,7 @@ python cli.py
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
 | `preferences` | 查看用户偏好 |
+| `export` | 导出用户数据（偏好 / 行程 / 对话历史 / 统计）为 JSON + Markdown（保存到 `exports/`） |
 | `exit` | 退出程序 |
 
 单独做健康检查（不进入交互）：`python cli.py health`，返回 `OK` / `FAIL: ...`，退出码 0/1。
