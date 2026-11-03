@@ -51,6 +51,7 @@ class _StubMemory:
     """带真实 LongTermMemory 的桩记忆管理器（写入临时目录）。"""
 
     def __init__(self):
+        self.session_id = "unit-session"
         self.long_term = LongTermMemory("orchestration_unit_test", tempfile.mkdtemp())
 
 
@@ -263,6 +264,7 @@ def test_memory_update_preference_and_trip():
     trips = memory.long_term.get_trip_history(limit=5)
     assert trips[-1]["destination"] == "上海"
     assert trips[-1]["origin"] == "北京"
+    assert trips[-1]["session_id"] == "unit-session", "行程应记录来源会话"
     print("✓ 偏好覆盖/追加与行程写入正常")
 
 

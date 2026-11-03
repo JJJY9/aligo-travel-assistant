@@ -93,12 +93,20 @@ def test_postgres_long_term_memory():
         assert memory.get_pinned_sessions() == ["s1"]
 
         memory.save_trip_history(
-            {"origin": "北京", "destination": "上海", "start_date": "2026-11-09", "purpose": "出差"}
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-11-09",
+                "purpose": "出差",
+                "session_id": "sess-pg",
+            }
         )
         memory.save_trip_history({"origin": "北京", "destination": "上海", "purpose": "出差"})
         trips = memory.get_trip_history()
         assert len(trips) == 2
         assert trips[0]["trip_id"] == "trip_1"
+        assert trips[0]["session_id"] == "sess-pg"
+        assert trips[1]["session_id"] is None
         assert memory.get_frequent_destinations(1) == [("上海", 2)]
 
         memory.increment_query_count()

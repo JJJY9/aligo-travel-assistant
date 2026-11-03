@@ -337,6 +337,7 @@ def test_status_trips():
                     "start_date": "2026-11-09",
                     "end_date": "2026-11-11",
                     "purpose": "出差",
+                    "session_id": "sess-trip-link",
                 }
             )
         finally:
@@ -348,6 +349,7 @@ def test_status_trips():
         assert status["trip_count"] == 1
         assert status["trips"][0]["destination"] == "上海"
         assert status["trips"][0]["start_date"] == "2026-11-09"
+        assert status["trips"][0]["session_id"] == "sess-trip-link"
         print("✓ /api/status 返回最近行程")
     finally:
         _cleanup(user_id)
