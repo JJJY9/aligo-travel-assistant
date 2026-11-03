@@ -1179,6 +1179,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 /* 行程小节标题右侧的「导出全部日历」 */
 .trip-export {
   float: right;
+  margin-left: 8px;
   padding: 0;
   border: 0;
   background: none;

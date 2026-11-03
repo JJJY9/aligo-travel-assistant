@@ -15,7 +15,7 @@
 | 对话与执行路线（浅色） | 深色模式 |
 |---|---|
 | ![对话与执行路线](docs/screenshots/webui-answer-light.jpg) | ![深色模式](docs/screenshots/webui-answer-dark.jpg) |
-| **记忆与用量面板**（偏好 / 行程 / 7 天趋势） | **欢迎页**（会话搜索 / 置顶） |
+| **记忆与用量面板**（行程 / 统计 / 7 天趋势） | **欢迎页**（会话搜索 / 置顶） |
 | ![记忆与用量面板](docs/screenshots/webui-memory.jpg) | ![欢迎页](docs/screenshots/webui-welcome.jpg) |
 
 ![知识库维护：查看 / 新增 / 删除知识片段](docs/screenshots/webui-knowledge.jpg)
