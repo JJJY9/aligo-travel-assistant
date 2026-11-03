@@ -917,6 +917,43 @@ def run_knowledge_status_standalone() -> int:
     return 1
 
 
+def run_rag_eval_standalone(min_hit5: float = 0.8) -> int:
+    """运行 RAG 检索评测（用于 `python cli.py eval`），不进入交互式 CLI。
+
+    Returns:
+        0 评测完成且 hit@5 达标（或知识库未初始化，跳过）；1 未达标
+    """
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"跳过评测：知识库不可用（{status.get('reason', '未知原因')}）")
+        return 0
+
+    from agents.rag_knowledge_agent import RAGKnowledgeAgent
+    from utils.rag_eval import evaluate_retrieval
+
+    agent = RAGKnowledgeAgent(collection_name=status["collection"])
+    if not agent.initialized:
+        print("跳过评测：RAG 依赖未安装（pip install -r requirements.txt）")
+        return 0
+
+    result = evaluate_retrieval(
+        lambda query, top_k: agent.search_knowledge(query, top_k=top_k),
+    )
+    for row in result["rows"]:
+        mark = f"#{row['rank']}" if row["rank"] else "未命中"
+        print(f"  {row['query']} → {mark}")
+    print(
+        f"检索评测：{result['total']} 个问题 · hit@1 {result['hit1']:.0%} · "
+        f"hit@3 {result['hit3']:.0%} · hit@5 {result['hit5']:.0%} · MRR {result['mrr']:.2f}"
+    )
+    if result["hit5"] < min_hit5:
+        print(f"低于阈值 hit@5 >= {min_hit5:.0%}，请检查知识库内容或切分策略")
+        return 1
+    return 0
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -928,6 +965,8 @@ def main():
             sys.exit(run_doctor_standalone())
         if arg == "kb":
             sys.exit(run_knowledge_status_standalone())
+        if arg == "eval":
+            sys.exit(run_rag_eval_standalone())
     cli = AligoCLI()
     asyncio.run(cli.run())
 
