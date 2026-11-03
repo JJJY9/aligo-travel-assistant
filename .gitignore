@@ -24,8 +24,10 @@ aligo_travel_assistant-*/
 .installed.cfg
 *.egg
 
-# 工具缓存（pytest / mypy / ruff）
+# 工具缓存（pytest / mypy / ruff / coverage）
 .pytest_cache/
+.coverage
+.coverage.*
 .mypy_cache/
 .ruff_cache/
 
