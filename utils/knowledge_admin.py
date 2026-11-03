@@ -143,6 +143,52 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     }
 
 
+def export_documents() -> list[dict[str, Any]]:
+    """导出全部知识片段（按 id 升序，便于备份 / 迁移；不含 id）。"""
+    data = list_documents(limit=_MAX_SCAN, offset=0)
+    items = sorted(data["items"], key=lambda item: item["id"])
+    return [
+        {"content": item["content"], "metadata": item["metadata"]} for item in items
+    ]
+
+
+def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
+    """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。"""
+    cleaned: list[dict[str, Any]] = []
+    skipped = 0
+    for item in documents:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        content = str(item.get("content", "")).strip()
+        if not content:
+            skipped += 1
+            continue
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        cleaned.append(
+            {
+                "content": content[:2000],
+                "metadata": {
+                    str(key)[:32]: str(value)[:200]
+                    for key, value in list(metadata.items())[:10]
+                },
+            }
+        )
+
+    if not cleaned:
+        return {"imported": 0, "skipped": skipped}
+    if not knowledge_db_path().exists():
+        raise FileNotFoundError("知识库未初始化")
+
+    agent = _get_agent()
+    with _WRITE_LOCK:
+        result = agent.add_documents(cleaned)
+    if result.get("status") != "success":
+        raise RuntimeError(str(result.get("message") or "导入知识片段失败"))
+    return {"imported": len(result.get("ids") or []), "skipped": skipped}
+
+
 def delete_document(doc_id: int) -> bool:
     """按 id 删除知识片段；返回是否真的删除了记录。
 

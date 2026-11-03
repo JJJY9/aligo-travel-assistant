@@ -250,6 +250,18 @@
       </section>
       <section class="sheet-section">
         <h3>知识库维护</h3>
+        <div class="kb-tools">
+          <a
+            class="ghost"
+            id="kbExport"
+            href="/api/knowledge/export"
+            download="aligo-knowledge.json"
+          >
+            导出知识库
+          </a>
+          <button class="ghost" id="kbImport" type="button">导入 JSON</button>
+          <input id="kbImportFile" type="file" accept="application/json,.json" hidden />
+        </div>
         <input
           id="kbSearch"
           class="kb-search"

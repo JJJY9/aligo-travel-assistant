@@ -1128,6 +1128,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-size: 13px;
 }
 .kb-form-row .ghost { flex: none; }
+.kb-tools { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.kb-tools a.ghost { display: inline-block; text-decoration: none; }
 .kb-search {
   width: 100%;
   margin-bottom: 8px;
