@@ -1170,7 +1170,9 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="结束日期不能早于出发日期")
 
         store = _open_long_term(payload.user_id)
+        created = False
         try:
+            before = len(store.get_trip_history(limit=None))
             trip_id = store.save_trip_history(
                 {
                     "origin": payload.origin.strip(),
@@ -1180,12 +1182,13 @@ def create_app(model: Any = None) -> FastAPI:
                     "purpose": payload.purpose.strip() or "出差",
                 }
             )
+            created = len(store.get_trip_history(limit=None)) > before
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("添加行程失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"添加行程失败：{exc}") from exc
         finally:
             _close_long_term(store)
-        return {"trip_id": trip_id, "saved": True}
+        return {"trip_id": trip_id, "saved": True, "created": created}
 
     @app.put("/api/trips/{trip_id}")
     def update_trip(

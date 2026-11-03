@@ -659,6 +659,7 @@ def test_create_trip_api():
         created = client.post("/api/trips", json=payload)
         assert created.status_code == 201
         assert created.json()["trip_id"] == "trip_1"
+        assert created.json()["created"] is True
 
         status = client.get("/api/status", params={"user_id": user_id}).json()
         assert status["trip_count"] == 1
@@ -669,6 +670,7 @@ def test_create_trip_api():
         again = client.post("/api/trips", json=payload)
         assert again.status_code == 201
         assert again.json()["trip_id"] == "trip_1"
+        assert again.json()["created"] is False
         assert (
             client.get("/api/status", params={"user_id": user_id}).json()["trip_count"]
             == 1
