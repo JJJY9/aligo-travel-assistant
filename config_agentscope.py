@@ -24,6 +24,72 @@ def init_agentscope():
     print(f"✓ AgentScope initialized (version: {agentscope.__version__})")
 
 
+class UsageTracker:
+    """累计模型调用的次数、token 用量与调用耗时。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.time = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def record_usage(self, usage) -> None:
+        """累计一次调用的 usage（agentscope ChatUsage，dict 子类，可能为 None）。"""
+        if not usage:
+            return
+        self.input_tokens += int(usage.get("input_tokens", 0) or 0)
+        self.output_tokens += int(usage.get("output_tokens", 0) or 0)
+        self.time += float(usage.get("time", 0.0) or 0.0)
+
+    def snapshot(self) -> dict:
+        """当前用量快照（用于计算单次查询的增量）。"""
+        return {
+            "calls": self.calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "time": self.time,
+        }
+
+    def summary_text(self) -> str:
+        return (
+            f"{self.calls} 次调用 · tokens {self.total_tokens}"
+            f"（输入 {self.input_tokens} / 输出 {self.output_tokens}）"
+        )
+
+
+class UsageTrackingModel:
+    """模型代理：透明转发调用，并累计每次调用的 token 用量。
+
+    说明：agentscope 的非流式响应 ChatResponse 携带 usage（ChatUsage）；
+    若底层模型没有返回 usage，则只统计调用次数、不累计 token。
+    其余属性（stream / generate_kwargs 等）透明代理到底层模型。
+    """
+
+    def __init__(self, model) -> None:
+        self._model = model
+        self.usage = UsageTracker()
+
+    async def __call__(self, messages, **kwargs):
+        response = await self._model(messages, **kwargs)
+        self.usage.calls += 1
+        usage = (
+            response.get("usage")
+            if isinstance(response, dict)
+            else getattr(response, "usage", None)
+        )
+        self.usage.record_usage(usage)
+        return response
+
+    def __getattr__(self, item):
+        # 仅在常规属性查找失败时触发；透明代理底层模型属性
+        return getattr(self._model, item)
+
+
 def create_chat_model(
     api_key: str | None = None,
     model_name: str | None = None,
@@ -47,24 +113,26 @@ def create_chat_model(
 
     from config import SYSTEM_CONFIG
 
-    return OpenAIChatModel(
-        model_name=model_name or LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"] if api_key is None else api_key,
-        stream=False,
-        client_kwargs={
-            "base_url": base_url or LLM_CONFIG["base_url"],
-            "timeout": float(
-                timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
-            ),
-        },
-        generate_kwargs={
-            "temperature": (
-                LLM_CONFIG.get("temperature", 0.7) if temperature is None else temperature
-            ),
-            "max_tokens": (
-                LLM_CONFIG.get("max_tokens", 8192) if max_tokens is None else max_tokens
-            ),
-        },
+    return UsageTrackingModel(
+        OpenAIChatModel(
+            model_name=model_name or LLM_CONFIG["model_name"],
+            api_key=LLM_CONFIG["api_key"] if api_key is None else api_key,
+            stream=False,
+            client_kwargs={
+                "base_url": base_url or LLM_CONFIG["base_url"],
+                "timeout": float(
+                    timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
+                ),
+            },
+            generate_kwargs={
+                "temperature": (
+                    LLM_CONFIG.get("temperature", 0.7) if temperature is None else temperature
+                ),
+                "max_tokens": (
+                    LLM_CONFIG.get("max_tokens", 8192) if max_tokens is None else max_tokens
+                ),
+            },
+        )
     )
 
 

@@ -143,7 +143,8 @@ class AligoCLI:
         处理用户查询（原逻辑保留；仅在入口加熔断检查、对 LLM 调用加重试）
         """
         import time
-        time.time()
+        start_time = time.time()
+        usage_before = self.model.usage.snapshot() if hasattr(self.model, "usage") else None
 
         # ---------- 仅新增：熔断检查 ----------
         if self.circuit_breaker:
@@ -229,6 +230,19 @@ class AligoCLI:
         self.console.print()
         self._display_results(result_data)
         self.memory_manager.add_message("assistant", json.dumps(result_data, ensure_ascii=False))
+
+        # 8. 本次查询的 LLM 用量与耗时（模型层统一统计）
+        if usage_before is not None:
+            after = self.model.usage.snapshot()
+            delta_calls = after["calls"] - usage_before["calls"]
+            if delta_calls > 0:
+                self.console.print(
+                    f"[dim]📊 本次调用 LLM {delta_calls} 次 · "
+                    f"tokens {after['total_tokens'] - usage_before['total_tokens']}"
+                    f"（输入 {after['input_tokens'] - usage_before['input_tokens']} / "
+                    f"输出 {after['output_tokens'] - usage_before['output_tokens']}）· "
+                    f"总耗时 {time.time() - start_time:.1f}s[/dim]"
+                )
 
     def _display_agents_called(self, result_data: dict):
         """显示调用的智能体列表"""
@@ -645,6 +659,13 @@ class AligoCLI:
             "已加载智能体",
             f"{len(self._agent_cache)} 个"
         )
+        usage = getattr(self.model, "usage", None)
+        if usage is not None:
+            memory_table.add_row(
+                "本次会话 LLM 用量",
+                f"{usage.calls} 次调用 · tokens {usage.total_tokens}"
+                f"（输入 {usage.input_tokens} / 输出 {usage.output_tokens}）"
+            )
 
         self.console.print(memory_table)
         self.console.print()
