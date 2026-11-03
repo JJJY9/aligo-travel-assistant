@@ -4,9 +4,23 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-03
+
 ### 新增
+- **Web 界面全面升级**（保持无构建前端）：执行路线（智能体进度实时可视化）、会话历史（按日期分组 / 恢复 / 删除）、深色模式、记忆与数据面板、停止生成 / 重新生成 / 复制回答、移动端抽屉布局、Markdown 表格与代码块
+- **SSE 流式对话**：`POST /api/chat/stream` 推送 `phase` / `plan` / `agent_start` / `agent_done` / `done` 事件；`ConversationRuntime` 与 `OrchestrationAgent` 增加进度回调
+- 会话历史接口：`GET /api/sessions`、`GET /api/sessions/{id}`（助手消息重新渲染为 Markdown）、`DELETE /api/sessions/{id}`；JSON 与 PostgreSQL 后端均支持按会话删除
+- `GET /api/health`：返回版本、模型与当前存储后端；`/api/status`、`/api/export` 改为经存储工厂读取，PostgreSQL 后端下数据一致
 - **可插拔存储后端**：设置 `REDIS_URL` 启用 Redis 短期记忆（List + 滑动窗口 + TTL）；设置 `DATABASE_URL` 启用 PostgreSQL 长期记忆（偏好 / 行程 / 对话 / 统计，表结构自动创建）；未配置或连接失败时自动回退本地实现
 - `docker-compose.yml` 一键启动 Redis + PostgreSQL；存储后端集成测试（CI 通过 service 容器自动运行）
+- README 增加界面截图与 Web 接口说明
+
+### 修复
+- 历史会话中的助手消息此前以原始编排 JSON 存储，恢复会话时无法阅读；现在读取时重新渲染为 Markdown
+- 用户 / 会话 ID 增加字符校验（中文、字母、数字、下划线、短横线），避免拼接到文件路径时发生路径穿越
+
+### 变更
+- Web 服务版本号升至 1.2.0；新增 `tests/test_webapp.py` 流式接口、会话历史与 ID 校验用例
 
 ## [1.1.0] - 2026-11-03
 

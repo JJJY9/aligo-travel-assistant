@@ -286,6 +286,19 @@ class LongTermMemory:
             return messages[-limit:]
         return messages
 
+    def delete_chat_session(self, session_id: str) -> int:
+        """删除某个会话的全部聊天记录，返回删除条数。"""
+        messages = self.data["chat_history"]
+        remaining = [m for m in messages if m.get("session_id") != session_id]
+        removed = len(messages) - len(remaining)
+        if removed:
+            self.data["chat_history"] = remaining
+            stats = self.data["statistics"]
+            stats["total_messages"] = max(0, stats.get("total_messages", 0) - removed)
+            self._save()
+            logger.info(f"Deleted chat session: {session_id} ({removed} messages)")
+        return removed
+
     def save_trip_history(self, trip_info: dict[str, Any]):
         """
         保存行程历史

@@ -16,12 +16,15 @@
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class OrchestrationAgent(AgentBase):
@@ -58,12 +61,17 @@ class OrchestrationAgent(AgentBase):
             del self.agent_registry[agent_name]
             logger.info(f"Unregistered agent: {agent_name}")
 
-    async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
+    async def reply(
+        self,
+        x: Msg | list[Msg] | None = None,
+        on_event: ProgressCallback | None = None,
+    ) -> Msg:
         """
         协调执行流程
 
         Args:
             x: 输入消息，应包含 IntentionAgent 的输出
+            on_event: 进度回调（可选），接收 agent_start / agent_done 事件
 
         Returns:
             Msg: 执行结果
@@ -131,7 +139,9 @@ class OrchestrationAgent(AgentBase):
             if current_priority is not None and priority != current_priority:
                 # 并行执行当前优先级的所有任务
                 if parallel_tasks:
-                    batch_results = await self._execute_parallel_agents(parallel_tasks, context, results)
+                    batch_results = await self._execute_parallel_agents(
+                        parallel_tasks, context, results, on_event
+                    )
                     results.extend(batch_results)
                     parallel_tasks = []
 
@@ -140,7 +150,9 @@ class OrchestrationAgent(AgentBase):
 
         # 执行最后一批
         if parallel_tasks:
-            batch_results = await self._execute_parallel_agents(parallel_tasks, context, results)
+            batch_results = await self._execute_parallel_agents(
+                parallel_tasks, context, results, on_event
+            )
             results.extend(batch_results)
 
         # 聚合结果
@@ -189,7 +201,8 @@ class OrchestrationAgent(AgentBase):
         self,
         tasks: list[dict],
         context: dict[str, Any],
-        previous_results: list[dict]
+        previous_results: list[dict],
+        on_event: ProgressCallback | None = None,
     ) -> list[dict]:
         """
         并行执行多个智能体
@@ -198,6 +211,7 @@ class OrchestrationAgent(AgentBase):
             tasks: 任务列表，每个任务包含 agent_name, priority, reason, expected_output
             context: 上下文信息
             previous_results: 前序智能体的结果
+            on_event: 进度回调
 
         Returns:
             执行结果列表
@@ -213,7 +227,8 @@ class OrchestrationAgent(AgentBase):
                 context=context,
                 reason=task.get("reason", ""),
                 expected_output=task.get("expected_output", ""),
-                previous_results=previous_results
+                previous_results=previous_results,
+                on_event=on_event,
             )
             return [{
                 "agent_name": task.get("agent_name"),
@@ -240,7 +255,8 @@ class OrchestrationAgent(AgentBase):
                 context=context,
                 reason=reason,
                 expected_output=expected_output,
-                previous_results=previous_results
+                previous_results=previous_results,
+                on_event=on_event,
             )
             parallel_coroutines.append((agent_name, priority, coroutine))
 
@@ -272,7 +288,46 @@ class OrchestrationAgent(AgentBase):
 
         return results
 
+    @staticmethod
+    def _emit(on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
+        """安全地发出进度事件（回调异常不影响调度）。"""
+        if on_event is None:
+            return
+        try:
+            on_event(event)
+        except Exception:  # noqa: BLE001 - 进度展示失败不应中断执行
+            logger.debug("Progress callback failed", exc_info=True)
+
     async def _execute_agent(
+        self,
+        agent_name: str,
+        context: dict[str, Any],
+        reason: str,
+        expected_output: str,
+        previous_results: list[dict],
+        on_event: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """执行单个智能体，并在开始 / 结束时发出进度事件。"""
+        self._emit(on_event, {"type": "agent_start", "agent_name": agent_name})
+        result = await self._run_agent(
+            agent_name=agent_name,
+            context=context,
+            reason=reason,
+            expected_output=expected_output,
+            previous_results=previous_results,
+        )
+        self._emit(
+            on_event,
+            {
+                "type": "agent_done",
+                "agent_name": agent_name,
+                "status": result.get("status", "unknown"),
+                "message": result.get("message", ""),
+            },
+        )
+        return result
+
+    async def _run_agent(
         self,
         agent_name: str,
         context: dict[str, Any],
