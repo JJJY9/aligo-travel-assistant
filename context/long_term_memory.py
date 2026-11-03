@@ -198,6 +198,17 @@ class LongTermMemory:
                     return pref.get("value")
             return None
 
+    def delete_preference(self, pref_type: str) -> bool:
+        """删除指定类型的偏好，返回是否确实删除。"""
+        preferences = self.data["preferences"]
+        remaining = [pref for pref in preferences if pref.get("type") != pref_type]
+        if len(remaining) == len(preferences):
+            return False
+        self.data["preferences"] = remaining
+        self._save()
+        logger.info(f"Deleted preference: {pref_type}")
+        return True
+
     def add_hotel_brand(self, brand: str):
         """添加酒店品牌偏好（追加到列表）"""
         # 查找 hotel_brands 偏好

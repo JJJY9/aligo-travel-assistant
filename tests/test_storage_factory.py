@@ -85,6 +85,18 @@ def test_long_term_delete_session():
     print("✓ 长期记忆按会话删除")
 
 
+def test_long_term_delete_preference():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-pref", tempfile.mkdtemp())
+    memory.save_preference("home_location", "北京")
+    memory.save_preference("hotel_brands", ["汉庭"])
+    assert memory.delete_preference("home_location") is True
+    assert memory.get_preference() == {"hotel_brands": ["汉庭"]}
+    assert memory.delete_preference("home_location") is False
+    print("✓ 长期记忆删除偏好")
+
+
 class _CountingModel:
     """记录调用次数的假模型（用于验证总结缓存）。"""
 
@@ -145,6 +157,7 @@ if __name__ == "__main__":
     test_bad_postgres_falls_back()
     test_memory_manager_uses_factory()
     test_long_term_delete_session()
+    test_long_term_delete_preference()
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()
     print("\n全部通过")

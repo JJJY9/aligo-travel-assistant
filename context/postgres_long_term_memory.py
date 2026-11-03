@@ -122,6 +122,18 @@ class PostgresLongTermMemory:
         )
         return row[0] if row else None
 
+    def delete_preference(self, pref_type: str) -> bool:
+        """删除指定类型的偏好，返回是否确实删除。"""
+        with self._conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM aligo_preferences WHERE user_id = %s AND pref_type = %s",
+                (self.user_id, pref_type),
+            )
+            removed = cursor.rowcount or 0
+        if removed:
+            logger.info("Deleted preference from PostgreSQL: %s", pref_type)
+        return bool(removed)
+
     def add_hotel_brand(self, brand: str) -> None:
         current = self.get_preference("hotel_brands")
         values = list(current) if isinstance(current, list) else ([current] if current else [])

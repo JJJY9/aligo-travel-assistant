@@ -78,6 +78,7 @@ const els = {
   saveUser: byId("saveUser"),
   exportData: byId("exportData"),
   overview: byId("overview"),
+  trips: byId("trips"),
   stats: byId("stats"),
   usageStats: byId("usageStats"),
   usageAgents: byId("usageAgents"),
@@ -1131,6 +1132,7 @@ function renderOverview() {
   const status = state.status;
   if (!status) {
     els.overview.innerHTML = '<div class="empty">无法获取数据概览</div>';
+    els.trips.innerHTML = "";
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
     els.usageAgents.innerHTML = "";
@@ -1150,11 +1152,59 @@ function renderOverview() {
       const row = document.createElement("div");
       row.className = "pref-row";
       const label = document.createElement("span");
+      label.className = "pref-name";
       label.textContent = PREF_NAMES[key] || key;
       const val = document.createElement("span");
+      val.className = "pref-value";
       val.textContent = Array.isArray(value) ? value.join("、") : String(value);
-      row.append(label, val);
+
+      const actions = document.createElement("span");
+      actions.className = "pref-actions";
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.title = "编辑偏好";
+      edit.setAttribute("aria-label", "编辑偏好");
+      edit.innerHTML = icon("edit");
+      edit.addEventListener("click", () => startEditPreference(row, key, value));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.title = "删除偏好";
+      remove.setAttribute("aria-label", "删除偏好");
+      remove.innerHTML = icon("trash");
+      remove.addEventListener("click", () => deletePreference(key, label.textContent));
+      actions.append(edit, remove);
+
+      row.append(label, val, actions);
       els.overview.appendChild(row);
+    });
+  }
+
+  const trips = Array.isArray(status.trips) ? status.trips : [];
+  els.trips.innerHTML = "";
+  if (!trips.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "还没有行程记录";
+    els.trips.appendChild(empty);
+  } else {
+    [...trips].reverse().forEach((trip) => {
+      const row = document.createElement("div");
+      row.className = "trip";
+      const route = document.createElement("div");
+      route.className = "trip-route";
+      const path = document.createElement("span");
+      path.textContent = `${trip.origin || "—"} → ${trip.destination || "—"}`;
+      const purpose = document.createElement("span");
+      purpose.textContent = trip.purpose || "出行";
+      route.append(path, purpose);
+      const meta = document.createElement("div");
+      meta.className = "trip-meta";
+      const start = trip.start_date || "";
+      const end = trip.end_date || "";
+      meta.textContent =
+        start && end ? `${start} ~ ${end}` : start || end || "日期未记录";
+      row.append(route, meta);
+      els.trips.appendChild(row);
     });
   }
 
@@ -1220,6 +1270,86 @@ function renderOverview() {
       chip.textContent = `${AGENT_NAMES[agent.name] || agent.name} ×${agent.count}`;
       els.usageAgents.appendChild(chip);
     });
+  }
+}
+
+function startEditPreference(row, type, currentValue) {
+  const valueEl = row.querySelector(".pref-value");
+  if (!valueEl || row.querySelector(".pref-input")) return;
+
+  const input = document.createElement("input");
+  input.className = "pref-input";
+  input.value = Array.isArray(currentValue)
+    ? currentValue.join("、")
+    : String(currentValue ?? "");
+  valueEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let settled = false;
+
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    if (input.isConnected) input.replaceWith(valueEl);
+  };
+
+  const save = async () => {
+    if (settled) return;
+    const text = input.value.trim();
+    if (!text) {
+      toast("偏好内容不能为空");
+      input.focus();
+      return;
+    }
+    settled = true;
+    const value = Array.isArray(currentValue)
+      ? text
+          .split(/[、,，]/)
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : text;
+    try {
+      await getJSON(`/api/preferences/${encodeURIComponent(type)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: state.userId, value }),
+      });
+      toast("偏好已更新");
+      await refreshStatus();
+    } catch (error) {
+      settled = false;
+      toast(`保存失败：${error.message}`);
+      input.focus();
+    }
+  };
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      save();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancel();
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!settled) cancel();
+  });
+}
+
+async function deletePreference(type, label) {
+  if (!window.confirm(`删除偏好「${label}」？`)) return;
+  try {
+    await getJSON(
+      `/api/preferences/${encodeURIComponent(type)}?user_id=${encodeURIComponent(
+        state.userId,
+      )}`,
+      { method: "DELETE" },
+    );
+    toast("偏好已删除");
+    await refreshStatus();
+  } catch (error) {
+    toast(`删除失败：${error.message}`);
   }
 }
 

@@ -75,6 +75,10 @@ def test_postgres_long_term_memory():
         assert memory.get_preference() == {"hotel_brands": ["汉庭", "如家"], "home_location": "北京"}
         assert memory.get_preference("home_location") == "北京"
 
+        assert memory.delete_preference("hotel_brands") is True
+        assert memory.get_preference("hotel_brands") is None
+        memory.save_preference("hotel_brands", ["汉庭", "如家"])
+
         memory.add_chat_message("user", "你好", "s1")
         memory.add_chat_message("assistant", "您好", "s1")
         memory.add_chat_message("user", "其他会话", "s2")
