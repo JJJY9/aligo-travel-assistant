@@ -458,6 +458,11 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - **记忆与用量面板**：在线编辑 / 删除偏好、查看最近 5 条行程与统计、存储后端、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体），修改用户 ID，导出长期记忆 JSON
 - **消息操作**：复制、重新生成；Markdown 支持标题、列表、引用、表格与代码块（带复制按钮）；会话可导出为 Markdown
 
+**接口观测与限流**
+
+- 所有 `/api/` 响应带 `X-Request-ID` 头（透传请求头中的值，否则自动生成 12 位十六进制）；错误详情也会附带请求 ID，便于排查。
+- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，超限返回 `429` 与 `Retry-After`；可用环境变量 `CHAT_RATE_LIMIT`（次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。实现为进程内滑动窗口（`utils/rate_limit.py`），多实例部署时需替换为 Redis 等共享存储。
+
 **接口**
 
 | 方法 | 路径 | 说明 |
@@ -549,6 +554,7 @@ aligo-travel-assistant/
 │   ├── turn_meta.py                 # 执行路线元数据（意图 / 调度 / 用量）
 │   ├── progress.py                  # 智能体进度事件 → CLI 文本
 │   ├── exporter.py                  # 用户数据导出（JSON / Markdown）
+│   ├── rate_limit.py                # 对话接口进程内滑动窗口限流
 │   ├── text_chunker.py              # RAG 文本按小节切分
 │   ├── doctor.py                    # 环境自检
 │   └── skill_loader.py              # SKILL.md 加载器

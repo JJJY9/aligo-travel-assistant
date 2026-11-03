@@ -64,6 +64,11 @@ class ResilienceConfig(TypedDict):
     health_check_timeout_sec: float
 
 
+class RateLimitConfig(TypedDict):
+    chat_requests: int
+    window_sec: int
+
+
 LLM_CONFIG: LLMConfig = {
     "api_key": _api_key,
     "model_name": os.environ.get("LLM_MODEL_NAME", "deepseek-chat"),
@@ -111,4 +116,12 @@ RESILIENCE_CONFIG: ResilienceConfig = {
     "circuit_recovery_timeout_sec": 60.0,  # 熔断后多少秒进入半开
     "circuit_half_open_successes": 2,      # 半开状态下连续成功多少次后关闭
     "health_check_timeout_sec": 10.0,      # 健康检查请求超时（秒）
+}
+
+# 对话接口限流（进程内滑动窗口，按 客户端 + 用户；用于本地演示 / 简单防滥用）
+#   CHAT_RATE_LIMIT      窗口内允许的对话请求数（默认 30）
+#   CHAT_RATE_WINDOW_SEC 窗口长度（秒，默认 60）
+RATE_LIMIT_CONFIG: RateLimitConfig = {
+    "chat_requests": _env_int("CHAT_RATE_LIMIT", 30),
+    "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
 }
