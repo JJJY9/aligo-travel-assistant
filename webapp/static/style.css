@@ -187,6 +187,32 @@ a { color: var(--teal); }
 .new-chat .icon { width: 16px; height: 16px; }
 .new-chat:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.2); }
 
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--sidebar-line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--sidebar-muted);
+  transition: border-color 0.15s ease;
+}
+.search .icon { width: 15px; height: 15px; }
+.search:focus-within { border-color: rgba(255, 255, 255, 0.24); }
+.search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--sidebar-ink);
+  font-size: 12.5px;
+}
+.search input::placeholder { color: var(--sidebar-muted); }
+.search input::-webkit-search-cancel-button { filter: invert(0.6); }
+
 .history {
   flex: 1;
   overflow-y: auto;
@@ -238,6 +264,15 @@ a { color: var(--teal); }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.hi-snippet {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--sidebar-muted);
 }
 
 .hi-del {
@@ -608,6 +643,16 @@ a { color: var(--teal); }
 .stop.error .stop-dot { border-color: var(--danger); background: var(--danger); }
 .stop.pending { opacity: 0.6; }
 .stop-body { min-width: 0; }
+.stop-time {
+  flex: none;
+  align-self: center;
+  margin-left: auto;
+  padding-left: 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
 .stop-label { display: block; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); }
 .stop-note { display: block; margin-top: 1px; font-size: 11.5px; line-height: 1.5; color: var(--ink-3); }
 .stop.error .stop-note { color: var(--danger); }
@@ -738,6 +783,7 @@ a { color: var(--teal); }
 .sheet-section { margin-top: 18px; }
 .sheet-section h3 { margin: 0 0 8px; font-size: 11.5px; font-weight: 500; color: var(--ink-3); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.usage-agents { margin-top: 8px; }
 
 .pref-list { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .pref-row {

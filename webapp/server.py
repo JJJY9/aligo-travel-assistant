@@ -23,7 +23,7 @@ import contextlib
 import json
 import re
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -191,7 +191,37 @@ def _render_stored_message(message: dict[str, Any]) -> str:
     return content
 
 
-def _group_sessions(history: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+def _message_search_text(message: dict[str, Any]) -> str:
+    """用于全文搜索的文本：助手消息按渲染后的 Markdown 搜索，避免命中的是 JSON 字段名。"""
+    if message.get("role") == "assistant":
+        return _render_stored_message(message)
+    return str(message.get("content", ""))
+
+
+def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
+    """截取命中位置附近的片段（用于会话搜索结果的预览）。"""
+    index = text.lower().find(needle)
+    if index < 0:
+        return ""
+    start = max(0, index - radius)
+    end = min(len(text), index + len(needle) + radius)
+    snippet = " ".join(text[start:end].split())
+    # 片段来自 Markdown 渲染结果，去掉常见标记让预览更干净
+    snippet = snippet.replace("**", "").replace("`", "")
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet += "…"
+    return snippet
+
+
+def _group_sessions(
+    history: list[dict[str, Any]],
+    limit: int,
+    query: str = "",
+) -> list[dict[str, Any]]:
+    """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。"""
+    needle = query.strip().lower()
     grouped: dict[str, dict[str, Any]] = {}
     for message in history:
         session_id = message.get("session_id")
@@ -209,12 +239,56 @@ def _group_sessions(history: list[dict[str, Any]], limit: int) -> list[dict[str,
             title = " ".join(str(message.get("content", "")).split())
             if title:
                 entry["title"] = title[:40]
+        if needle and "snippet" not in entry:
+            snippet = _match_snippet(_message_search_text(message), needle)
+            if snippet:
+                entry["snippet"] = snippet
 
     sessions = sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
+    if needle:
+        sessions = [entry for entry in sessions if entry.get("snippet")]
     for entry in sessions:
         if not entry["title"]:
             entry["title"] = "新对话"
     return sessions[:limit]
+
+
+def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
+    """从历史消息的执行元数据汇总模型用量（旧消息没有 _meta，自动忽略）。"""
+    calls = input_tokens = output_tokens = 0
+    elapsed_total = 0.0
+    elapsed_count = 0
+    agent_counts: Counter[str] = Counter()
+
+    for message in history:
+        if message.get("role") != "assistant":
+            continue
+        meta = extract_turn_meta(str(message.get("content", "")))
+        if not meta:
+            continue
+        usage = meta.get("usage")
+        if isinstance(usage, dict):
+            calls += int(usage.get("calls") or 0)
+            input_tokens += int(usage.get("input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
+        elapsed = meta.get("elapsed")
+        if isinstance(elapsed, (int, float)):
+            elapsed_total += float(elapsed)
+            elapsed_count += 1
+        for agent in meta.get("agents") or []:
+            if isinstance(agent, dict) and agent.get("name"):
+                agent_counts[str(agent["name"])] += 1
+
+    return {
+        "calls": calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "avg_elapsed": round(elapsed_total / elapsed_count, 2) if elapsed_count else 0,
+        "top_agents": [
+            {"name": name, "count": count} for name, count in agent_counts.most_common(5)
+        ],
+    }
 
 
 def create_app(model: Any = None) -> FastAPI:
@@ -258,15 +332,17 @@ def create_app(model: Any = None) -> FastAPI:
             "chat_count": len(data["chat_history"]),
             "statistics": data["statistics"],
             "storage": describe_backends(),
+            "usage": _usage_summary(data["chat_history"]),
         }
 
     @app.get("/api/sessions")
     def list_sessions(
         user_id: str = Query(..., pattern=_ID_PATTERN),
         limit: int = Query(default=50, ge=1, le=200),
+        q: str = Query(default="", max_length=100),
     ) -> dict[str, Any]:
         data = _load_user_data(user_id)
-        return {"sessions": _group_sessions(data["chat_history"], limit)}
+        return {"sessions": _group_sessions(data["chat_history"], limit, q)}
 
     @app.get("/api/sessions/{session_id}")
     def get_session_messages(

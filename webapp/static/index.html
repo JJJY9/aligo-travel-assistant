@@ -47,6 +47,10 @@
     <symbol id="i-close" viewBox="0 0 24 24">
       <path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
     </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24">
+      <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/>
+      <path d="m16 16 4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    </symbol>
     <symbol id="i-download" viewBox="0 0 24 24">
       <path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
@@ -103,6 +107,11 @@
         <svg class="icon"><use href="#i-plus"></use></svg>
         新对话
       </button>
+
+      <label class="search" for="historySearch">
+        <svg class="icon"><use href="#i-search"></use></svg>
+        <input id="historySearch" type="search" maxlength="100" placeholder="搜索对话" autocomplete="off" aria-label="搜索对话" />
+      </label>
 
       <nav class="history" id="history" aria-label="历史对话"></nav>
 
@@ -224,6 +233,11 @@
       <section class="sheet-section">
         <h3>统计</h3>
         <div class="stat-grid" id="stats"></div>
+      </section>
+      <section class="sheet-section">
+        <h3>模型用量</h3>
+        <div class="stat-grid" id="usageStats"></div>
+        <div class="chips usage-agents" id="usageAgents"></div>
       </section>
     </div>
   </div>

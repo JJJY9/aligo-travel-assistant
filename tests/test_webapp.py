@@ -76,6 +76,8 @@ def test_status_endpoint():
     assert data["preferences"] == {}
     assert data["trip_count"] == 0
     assert "storage" in data
+    assert data["usage"]["calls"] == 0
+    assert data["usage"]["top_agents"] == []
     print("✓ /api/status 正常")
 
 
@@ -211,6 +213,61 @@ def test_session_lru_eviction():
     print("✓ 会话缓存按 LRU 淘汰并释放")
 
 
+def test_session_search():
+    client = _client()
+    user_id = _unique_user("web_test_search")
+    try:
+        for message, session_id in (
+            ("杭州的住宿标准是多少", "sess-search"),
+            ("北京天气怎么样", "sess-other"),
+        ):
+            response = client.post(
+                "/api/chat",
+                json={"message": message, "user_id": user_id, "session_id": session_id},
+            )
+            assert response.status_code == 200
+
+        results = client.get(
+            "/api/sessions", params={"user_id": user_id, "q": "杭州"}
+        ).json()["sessions"]
+        assert [item["session_id"] for item in results] == ["sess-search"]
+        assert "杭州" in results[0]["snippet"]
+
+        assistant_hits = client.get(
+            "/api/sessions", params={"user_id": user_id, "q": "已记录"}
+        ).json()["sessions"]
+        assert len(assistant_hits) == 2, "助手消息按渲染后的文本参与搜索"
+
+        empty = client.get(
+            "/api/sessions", params={"user_id": user_id, "q": "不存在的关键词"}
+        ).json()["sessions"]
+        assert empty == []
+        print("✓ 会话全文搜索与命中片段")
+    finally:
+        _cleanup(user_id)
+
+
+def test_status_usage_totals():
+    client = _client()
+    user_id = _unique_user("web_test_usage")
+    try:
+        for _ in range(2):
+            response = client.post(
+                "/api/chat",
+                json={"message": "你好", "user_id": user_id, "session_id": "sess-usage"},
+            )
+            assert response.status_code == 200
+
+        usage = client.get("/api/status", params={"user_id": user_id}).json()["usage"]
+        assert usage["calls"] >= 2
+        assert usage["total_tokens"] >= 20
+        assert usage["avg_elapsed"] >= 0
+        assert isinstance(usage["top_agents"], list)
+        print("✓ /api/status 汇总模型用量")
+    finally:
+        _cleanup(user_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -234,6 +291,8 @@ if __name__ == "__main__":
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
     test_sessions_listing_and_delete()
+    test_session_search()
+    test_status_usage_totals()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()

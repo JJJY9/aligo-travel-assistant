@@ -41,6 +41,7 @@ const state = {
   userId: localStorage.getItem("aligo.userId") || "web_user",
   sessionId: sessionStorage.getItem("aligo.sessionId") || null,
   sessions: [],
+  searchQuery: "",
   status: null,
   health: null,
   busy: false,
@@ -52,6 +53,7 @@ const els = {
   app: byId("app"),
   sidebar: byId("sidebar"),
   history: byId("history"),
+  historySearch: byId("historySearch"),
   messages: byId("messages"),
   scroll: byId("scroll"),
   input: byId("input"),
@@ -77,12 +79,15 @@ const els = {
   exportData: byId("exportData"),
   overview: byId("overview"),
   stats: byId("stats"),
+  usageStats: byId("usageStats"),
+  usageAgents: byId("usageAgents"),
   storageChips: byId("storageChips"),
   toast: byId("toast"),
 };
 
 let welcomeTemplate = null;
 let sessionLoadToken = 0;
+let sessionsRequestId = 0;
 
 /* ---------- 基础工具 ---------- */
 
@@ -379,8 +384,13 @@ function renderHistoryTrace(meta) {
   const schedule = Array.isArray(meta.schedule) ? meta.schedule : [];
   const agents = Array.isArray(meta.agents) ? meta.agents : [];
   const agentStatuses = new Map();
+  const agentDurations = new Map();
   agents.forEach((agent) => {
-    if (agent && agent.name) agentStatuses.set(agent.name, agent.status);
+    if (!agent || !agent.name) return;
+    agentStatuses.set(agent.name, agent.status);
+    if (agent.duration !== null && agent.duration !== undefined) {
+      agentDurations.set(agent.name, agent.duration);
+    }
   });
   const steps = schedule.length
     ? schedule
@@ -398,15 +408,18 @@ function renderHistoryTrace(meta) {
     <ol class="route"></ol>`;
 
   const list = root.querySelector(".route");
-  const addStop = (label, note, status) => {
+  const addStop = (label, note, status, duration = null) => {
     const li = document.createElement("li");
     li.className = `stop ${status}`;
     li.innerHTML =
-      '<span class="stop-dot" aria-hidden="true"></span><span class="stop-body"><span class="stop-label"></span><span class="stop-note"></span></span>';
+      '<span class="stop-dot" aria-hidden="true"></span><span class="stop-body"><span class="stop-label"></span><span class="stop-note"></span></span><span class="stop-time"></span>';
     li.querySelector(".stop-label").textContent = label;
     const noteEl = li.querySelector(".stop-note");
     noteEl.textContent = note;
     noteEl.hidden = !note;
+    if (duration !== null && duration !== undefined) {
+      li.querySelector(".stop-time").textContent = `${Number(duration).toFixed(1)}s`;
+    }
     list.appendChild(li);
   };
 
@@ -416,7 +429,12 @@ function renderHistoryTrace(meta) {
   steps.forEach((item) => {
     const name = item.agent_name || "";
     const status = agentStatuses.get(name) === "error" ? "error" : "done";
-    addStop(AGENT_NAMES[name] || name, item.reason ? clampText(item.reason, 48) : "", status);
+    addStop(
+      AGENT_NAMES[name] || name,
+      item.reason ? clampText(item.reason, 48) : "",
+      status,
+      agentDurations.get(name),
+    );
   });
 
   const elapsed = Number(meta.elapsed || 0);
@@ -549,12 +567,13 @@ function createTrace() {
       const li = document.createElement("li");
       li.className = "stop";
       li.innerHTML =
-        '<span class="stop-dot" aria-hidden="true"></span><span class="stop-body"><span class="stop-label"></span><span class="stop-note"></span></span>';
+        '<span class="stop-dot" aria-hidden="true"></span><span class="stop-body"><span class="stop-label"></span><span class="stop-note"></span></span><span class="stop-time"></span>';
       list.appendChild(li);
       stop = {
         li,
         label: li.querySelector(".stop-label"),
         note: li.querySelector(".stop-note"),
+        time: li.querySelector(".stop-time"),
       };
       stops.set(key, stop);
     }
@@ -569,19 +588,26 @@ function createTrace() {
     upsertStop(key, label, note, "done");
   }
 
-  function setAgent(name, status, note = "") {
+  function setAgent(name, status, note = "", duration = null) {
+    let stop = null;
     const entries = [...stops.entries()].reverse();
-    for (const [key, stop] of entries) {
+    for (const [key, candidate] of entries) {
       if (key.startsWith(`agent:${name}:`)) {
-        stop.li.className = `stop ${status}`;
-        if (note) {
-          stop.note.textContent = note;
-          stop.note.hidden = false;
-        }
-        return;
+        stop = candidate;
+        break;
       }
     }
-    upsertStop(`agent:${name}:extra`, AGENT_NAMES[name] || name, note, status);
+    if (!stop) {
+      stop = upsertStop(`agent:${name}:extra`, AGENT_NAMES[name] || name, note, status);
+    }
+    stop.li.className = `stop ${status}`;
+    if (note) {
+      stop.note.textContent = note;
+      stop.note.hidden = false;
+    }
+    if (duration !== null && duration !== undefined) {
+      stop.time.textContent = `${Number(duration).toFixed(1)}s`;
+    }
   }
 
   return {
@@ -618,11 +644,11 @@ function createTrace() {
     agentStart(name) {
       setAgent(name, "running");
     },
-    agentDone(name, status, message) {
+    agentDone(name, status, message, duration) {
       if (status === "error") {
-        setAgent(name, "error", clampText(message || "执行失败", 80));
+        setAgent(name, "error", clampText(message || "执行失败", 80), duration);
       } else {
-        setAgent(name, "done");
+        setAgent(name, "done", "", duration);
       }
     },
     finish(elapsed) {
@@ -771,7 +797,7 @@ function renderHistory() {
   if (!state.sessions.length) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
-    empty.textContent = "还没有历史对话";
+    empty.textContent = state.searchQuery ? "没有匹配的对话" : "还没有历史对话";
     els.history.appendChild(empty);
     return;
   }
@@ -803,6 +829,13 @@ function renderHistory() {
       title.textContent = session.title || "新对话";
       item.appendChild(title);
 
+      if (session.snippet) {
+        const snippet = document.createElement("span");
+        snippet.className = "hi-snippet";
+        snippet.textContent = session.snippet;
+        item.appendChild(snippet);
+      }
+
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "hi-del";
@@ -829,11 +862,20 @@ function renderHistory() {
   });
 }
 
-async function loadSessions() {
+async function loadSessions(query = state.searchQuery) {
+  state.searchQuery = String(query || "").trim();
+  const requestId = (sessionsRequestId += 1);
+  const queryParam = state.searchQuery
+    ? `&q=${encodeURIComponent(state.searchQuery)}`
+    : "";
   try {
-    const data = await getJSON(`/api/sessions?user_id=${encodeURIComponent(state.userId)}`);
+    const data = await getJSON(
+      `/api/sessions?user_id=${encodeURIComponent(state.userId)}${queryParam}`,
+    );
+    if (requestId !== sessionsRequestId) return;
     state.sessions = data.sessions || [];
   } catch {
+    if (requestId !== sessionsRequestId) return;
     state.sessions = [];
   }
   renderHistory();
@@ -1022,7 +1064,14 @@ function handleStreamEvent(assistant, event) {
       mutate(() => assistant.trace.agentStart(event.agent_name));
       break;
     case "agent_done":
-      mutate(() => assistant.trace.agentDone(event.agent_name, event.status, event.message));
+      mutate(() =>
+        assistant.trace.agentDone(
+          event.agent_name,
+          event.status,
+          event.message,
+          event.duration,
+        ),
+      );
       break;
     case "done": {
       if (event.session_id) {
@@ -1083,6 +1132,8 @@ function renderOverview() {
   if (!status) {
     els.overview.innerHTML = '<div class="empty">无法获取数据概览</div>';
     els.stats.innerHTML = "";
+    els.usageStats.innerHTML = "";
+    els.usageAgents.innerHTML = "";
     els.storageChips.innerHTML = "";
     return;
   }
@@ -1136,6 +1187,40 @@ function renderOverview() {
     chip.textContent = text;
     els.storageChips.appendChild(chip);
   });
+
+  const usage = status.usage || {};
+  const usageTiles = [
+    ["调用次数", usage.calls || 0],
+    ["总 tokens", Number(usage.total_tokens || 0).toLocaleString("zh-CN")],
+    ["平均耗时", usage.avg_elapsed ? `${usage.avg_elapsed}s` : "—"],
+  ];
+  els.usageStats.innerHTML = "";
+  usageTiles.forEach(([label, value]) => {
+    const box = document.createElement("div");
+    box.className = "stat";
+    const number = document.createElement("b");
+    number.textContent = String(value);
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    box.append(number, caption);
+    els.usageStats.appendChild(box);
+  });
+
+  els.usageAgents.innerHTML = "";
+  const topAgents = Array.isArray(usage.top_agents) ? usage.top_agents : [];
+  if (!topAgents.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "暂无智能体调用记录";
+    els.usageAgents.appendChild(empty);
+  } else {
+    topAgents.forEach((agent) => {
+      const chip = document.createElement("span");
+      chip.className = "badge";
+      chip.textContent = `${AGENT_NAMES[agent.name] || agent.name} ×${agent.count}`;
+      els.usageAgents.appendChild(chip);
+    });
+  }
 }
 
 async function refreshHealth() {
@@ -1230,6 +1315,8 @@ async function saveUser() {
   if (value !== state.userId) {
     sessionLoadToken += 1;
     state.userId = value;
+    els.historySearch.value = "";
+    state.searchQuery = "";
     try {
       localStorage.setItem("aligo.userId", value);
     } catch {
@@ -1293,6 +1380,21 @@ function bindEvents() {
     event.preventDefault();
     newSession();
   });
+
+  let searchTimer = null;
+  els.historySearch.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    const value = els.historySearch.value;
+    searchTimer = setTimeout(() => loadSessions(value), 250);
+  });
+  els.historySearch.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      clearTimeout(searchTimer);
+      loadSessions(els.historySearch.value);
+    }
+  });
+
   byId("openMemory").addEventListener("click", openMemorySheet);
   els.closeMemory.addEventListener("click", closeMemorySheet);
   els.memorySheet.addEventListener("click", (event) => {

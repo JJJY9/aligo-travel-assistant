@@ -145,6 +145,23 @@ def test_failure_aggregated_as_partial_failure():
     print("✓ 单智能体失败聚合为 partial_failure")
 
 
+def test_agent_duration_and_progress_events():
+    """agent_done 事件与聚合结果都带上单个智能体耗时"""
+    events: list[dict] = []
+    orchestrator = OrchestrationAgent(agent_registry={"a": _StubAgent("a", {"answer": "ok"})})
+    message = asyncio.run(
+        orchestrator.reply(
+            _intent([{"agent_name": "a", "priority": 1}]),
+            on_event=events.append,
+        )
+    )
+    result = json.loads(message.content)
+    assert result["results"][0]["duration"] >= 0
+    done_events = [event for event in events if event["type"] == "agent_done"]
+    assert done_events and done_events[0]["duration"] >= 0
+    print("✓ 智能体耗时写入进度事件与聚合结果")
+
+
 def test_unregistered_agent_reports_error():
     orchestrator = OrchestrationAgent(agent_registry={})
     result = json.loads(
@@ -233,6 +250,7 @@ if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
     test_failure_aggregated_as_partial_failure()
+    test_agent_duration_and_progress_events()
     test_unregistered_agent_reports_error()
     test_memory_update_preference_and_trip()
     print("\n全部通过")
