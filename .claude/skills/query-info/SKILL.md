@@ -1,11 +1,11 @@
 ---
 name: query-info
-description: Use this skill when the user wants to query real-time information like weather or general web search. Triggers when user asks "天气怎么样", "XX天气", "查一下XX", "搜索XX". This skill uses InformationQueryAgent (weather via wttr.in, web search via DDGS). For travel standards or policy questions use ask-question (RAG) instead.
+description: Use this skill when the user wants to query real-time information like weather or general web search. Triggers when user asks "天气怎么样", "XX天气", "查一下XX", "搜索XX". This skill uses InformationQueryAgent (weather via Open-Meteo, web search via DDGS). For travel standards or policy questions use ask-question (RAG) instead.
 ---
 
 # Query Information (天气与网络搜索)
 
-查询**天气**（wttr.in）和**网络搜索**（DDGS），使用 **InformationQueryAgent**。差旅标准、报销政策等由 **ask-question**（RAG）处理。
+查询**天气**（Open-Meteo）和**网络搜索**（DDGS），使用 **InformationQueryAgent**。差旅标准、报销政策等由 **ask-question**（RAG）处理。
 
 ## When to Use
 
@@ -20,7 +20,7 @@ description: Use this skill when the user wants to query real-time information l
 
 ## 支持的查询类型（本 Agent 实际实现）
 
-1. **天气查询**：基于 wttr.in，无需 API Key
+1. **天气查询**：基于 Open-Meteo（免费、无需 API Key）
 2. **网络搜索**：基于 DDGS（需 `pip install ddgs`），带摘要
 
 ## 初始化与调用
