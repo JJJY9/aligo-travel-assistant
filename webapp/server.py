@@ -48,6 +48,7 @@ from context.storage import (
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
+from utils.doctor import run_doctor
 from utils.knowledge_admin import add_document, delete_document, list_documents
 from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
@@ -678,6 +679,18 @@ def create_app(model: Any = None) -> FastAPI:
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
             "storage": describe_backends(),
             "time": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    @app.get("/api/doctor")
+    async def doctor(network: bool = Query(default=False)) -> dict[str, Any]:
+        """环境自检（默认不做网络请求；network=true 时检查 LLM 连通性）。"""
+        results = await run_doctor(include_network=network)
+        return {
+            "status": "fail" if any(item.status == "fail" for item in results) else "ok",
+            "checks": [
+                {"name": item.name, "status": item.status, "detail": item.detail}
+                for item in results
+            ],
         }
 
     @app.get("/api/knowledge")

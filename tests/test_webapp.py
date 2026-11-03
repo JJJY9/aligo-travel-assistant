@@ -810,6 +810,22 @@ def test_knowledge_endpoint():
     print("✓ /api/knowledge 返回知识库状态")
 
 
+def test_doctor_endpoint():
+    response = _client().get("/api/doctor")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] in {"ok", "fail"}
+    names = [check["name"] for check in data["checks"]]
+    assert "Python 版本" in names
+    assert "RAG 知识库" in names
+    assert all(
+        check["status"] in {"ok", "warn", "fail", "skip"} for check in data["checks"]
+    )
+    llm = next(check for check in data["checks"] if check["name"] == "LLM 连通性")
+    assert llm["status"] == "skip", "默认不发起网络检查"
+    print("✓ /api/doctor 返回自检结果（默认不请求网络）")
+
+
 def test_knowledge_documents_api(monkeypatch):
     """知识片段列表接口：透传分页 / 搜索参数（后端 Milvus 由假实现替代）。"""
     from webapp import server as server_module
@@ -958,6 +974,7 @@ if __name__ == "__main__":
     test_index_page()
     test_health_endpoint()
     test_knowledge_endpoint()
+    test_doctor_endpoint()
     _mp = pytest.MonkeyPatch()
     try:
         test_knowledge_documents_api(_mp)

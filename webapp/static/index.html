@@ -272,6 +272,17 @@
         </form>
       </section>
       <section class="sheet-section">
+        <h3>系统自检</h3>
+        <div class="doctor-actions">
+          <button class="ghost" id="runDoctor" type="button">运行自检</button>
+          <label class="doctor-network">
+            <input id="doctorNetwork" type="checkbox" />
+            检查 LLM 连通性
+          </label>
+        </div>
+        <div class="doctor-list" id="doctorList">尚未运行</div>
+      </section>
+      <section class="sheet-section">
         <h3>偏好</h3>
         <div class="pref-list" id="overview">加载中…</div>
       </section>

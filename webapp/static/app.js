@@ -127,6 +127,9 @@ const els = {
   kbContent: byId("kbContent"),
   kbCategory: byId("kbCategory"),
   kbSubmit: byId("kbSubmit"),
+  runDoctor: byId("runDoctor"),
+  doctorNetwork: byId("doctorNetwork"),
+  doctorList: byId("doctorList"),
   toast: byId("toast"),
 };
 
@@ -1993,6 +1996,43 @@ async function addKnowledgeDocument(event) {
   }
 }
 
+const DOCTOR_MARKS = { ok: "✓", warn: "⚠", fail: "✗", skip: "—" };
+
+async function runDoctorCheck() {
+  els.runDoctor.disabled = true;
+  els.runDoctor.textContent = "检查中…";
+  els.doctorList.textContent = "正在检查…";
+  try {
+    const query = els.doctorNetwork.checked ? "?network=true" : "";
+    const data = await getJSON(`/api/doctor${query}`);
+    renderDoctorChecks(data.checks || []);
+  } catch (error) {
+    els.doctorList.textContent = `自检失败：${error.message}`;
+  } finally {
+    els.runDoctor.disabled = false;
+    els.runDoctor.textContent = "运行自检";
+  }
+}
+
+function renderDoctorChecks(checks) {
+  els.doctorList.innerHTML = "";
+  for (const check of checks) {
+    const row = document.createElement("div");
+    row.className = `doctor-row ${check.status}`;
+    const mark = document.createElement("span");
+    mark.className = "doctor-status";
+    mark.textContent = DOCTOR_MARKS[check.status] || "?";
+    const name = document.createElement("span");
+    name.className = "doctor-name";
+    name.textContent = check.name;
+    const detail = document.createElement("span");
+    detail.className = "doctor-detail";
+    detail.textContent = check.detail;
+    row.append(mark, name, detail);
+    els.doctorList.appendChild(row);
+  }
+}
+
 function openMemorySheet() {
   els.userIdInput.value = state.userId;
   els.memorySheet.hidden = false;
@@ -2064,6 +2104,7 @@ function bindEvents() {
   });
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
+  els.runDoctor.addEventListener("click", runDoctorCheck);
 
   document.addEventListener("click", (event) => {
     const example = event.target.closest("[data-example]");

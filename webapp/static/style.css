@@ -1130,3 +1130,25 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 .kb-form-row .ghost { flex: none; }
 .kb-row .pref-actions { opacity: 0; }
 .kb-row:hover .pref-actions, .kb-row .pref-actions:focus-within { opacity: 1; }
+
+/* ---------- 系统自检 ---------- */
+.doctor-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.doctor-network { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-3); }
+.doctor-network input { accent-color: var(--teal); }
+.doctor-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; font-size: 12.5px; color: var(--ink-3); }
+.doctor-row {
+  display: grid;
+  grid-template-columns: 18px 92px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  background: var(--bg);
+}
+.doctor-status { font-weight: 700; }
+.doctor-row.ok .doctor-status { color: var(--teal); }
+.doctor-row.warn .doctor-status { color: var(--accent); }
+.doctor-row.fail .doctor-status { color: var(--danger); }
+.doctor-row.skip .doctor-status { color: var(--ink-3); }
+.doctor-name { color: var(--ink-2); font-weight: 600; }
+.doctor-detail { color: var(--ink-3); word-break: break-word; }
