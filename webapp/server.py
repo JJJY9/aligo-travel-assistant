@@ -21,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import re
+import time
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
@@ -29,13 +31,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Path as ApiPath, Query
+from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agents.conversation import ConversationRuntime
-from config import LLM_CONFIG, RESILIENCE_CONFIG
+from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG
 from config_agentscope import create_chat_model, init_agentscope
 from context.storage import (
     clear_short_term_session,
@@ -44,8 +46,11 @@ from context.storage import (
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
+from utils.rate_limit import RateLimiter
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import extract_turn_meta
+
+logger = logging.getLogger(__name__)
 
 APP_VERSION = "1.3.0"
 
@@ -55,6 +60,52 @@ _ID_PATTERN = r"^[\w-]{1,64}$"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = PROJECT_ROOT / "data" / "memory"
+
+
+class RequestContextMiddleware:
+    """为每个 HTTP 请求生成 / 透传 X-Request-ID，并记录 /api/ 请求耗时。"""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get("headers") or []}
+        incoming = headers.get(b"x-request-id", b"").decode("latin-1").strip()
+        request_id = (
+            re.sub(r"[^A-Za-z0-9._-]", "", incoming)[:64] or uuid.uuid4().hex[:12]
+        )
+        scope.setdefault("state", {})["request_id"] = request_id
+
+        started = time.perf_counter()
+        status_code = 0
+
+        async def send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message.get("status", 0))
+                message["headers"] = list(message.get("headers") or []) + [
+                    (b"x-request-id", request_id.encode("latin-1"))
+                ]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            path = str(scope.get("path", ""))
+            if path.startswith("/api/"):
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.info(
+                    "%s %s -> %s (%.0fms) [%s]",
+                    scope.get("method", ""),
+                    path,
+                    status_code,
+                    elapsed_ms,
+                    request_id,
+                )
 
 
 class ChatRequest(BaseModel):
@@ -114,6 +165,10 @@ class AligoWebApp:
         )
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
+        self.rate_limiter = RateLimiter(
+            limit=RATE_LIMIT_CONFIG.get("chat_requests", 30),
+            window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
+        )
 
     def get_session(self, user_id: str, session_id: str | None) -> _WebSession:
         if not session_id:
@@ -150,6 +205,23 @@ class AligoWebApp:
         if user_id not in self.locks:
             self.locks[user_id] = asyncio.Lock()
         return self.locks[user_id]
+
+
+def _request_id(request: Request) -> str:
+    return str(getattr(request.state, "request_id", "") or "")
+
+
+def _enforce_rate_limit(state: AligoWebApp, user_id: str, request: Request) -> None:
+    """对对话接口做简单滑动窗口限流（按 客户端 + 用户）。"""
+    client = request.client.host if request.client else "unknown"
+    retry_after = state.rate_limiter.check(f"{client}:{user_id}")
+    if retry_after is None:
+        return
+    raise HTTPException(
+        status_code=429,
+        detail=f"请求过于频繁，请约 {retry_after:.0f} 秒后重试（请求 ID：{_request_id(request)}）",
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 # ---------- 长期记忆读取 ----------
@@ -317,6 +389,7 @@ def create_app(model: Any = None) -> FastAPI:
 
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
+    app.add_middleware(RequestContextMiddleware)
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -471,36 +544,52 @@ def create_app(model: Any = None) -> FastAPI:
         return {"session_id": session_id, "deleted": removed}
 
     @app.post("/api/chat")
-    async def chat(request: ChatRequest) -> dict[str, Any]:
-        session = state.get_session(request.user_id, request.session_id)
-        async with state.lock_for(request.user_id):
+    async def chat(request: Request, payload: ChatRequest) -> dict[str, Any]:
+        _enforce_rate_limit(state, payload.user_id, request)
+        session = state.get_session(payload.user_id, payload.session_id)
+        async with state.lock_for(payload.user_id):
             try:
-                result = await session.runtime.ask(request.message)
+                result = await session.runtime.ask(payload.message)
             except CircuitOpenError as exc:
-                raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后再试") from exc
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"服务暂时不可用，请稍后再试（请求 ID：{_request_id(request)}）",
+                ) from exc
             except Exception as exc:  # noqa: BLE001 - 对外返回友好错误
-                raise HTTPException(status_code=500, detail=f"处理失败：{exc}") from exc
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"处理失败：{exc}（请求 ID：{_request_id(request)}）",
+                ) from exc
         return {"session_id": session.session_id, **result}
 
     @app.post("/api/chat/stream")
-    async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
-        session = state.get_session(request.user_id, request.session_id)
+        _enforce_rate_limit(state, payload.user_id, request)
+        rid = _request_id(request)
+        session = state.get_session(payload.user_id, payload.session_id)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
         async def run() -> None:
             try:
-                async with state.lock_for(request.user_id):
+                async with state.lock_for(payload.user_id):
                     result = await session.runtime.ask(
-                        request.message, on_event=queue.put_nowait
+                        payload.message, on_event=queue.put_nowait
                     )
                 await queue.put({"type": "done", "session_id": session.session_id, **result})
             except asyncio.CancelledError:
                 raise
             except CircuitOpenError:
-                await queue.put({"type": "error", "message": "服务暂时不可用，请稍后再试"})
+                await queue.put(
+                    {
+                        "type": "error",
+                        "message": f"服务暂时不可用，请稍后再试（请求 ID：{rid}）",
+                    }
+                )
             except Exception as exc:  # noqa: BLE001 - 通过事件返回友好错误
-                await queue.put({"type": "error", "message": f"处理失败：{exc}"})
+                await queue.put(
+                    {"type": "error", "message": f"处理失败：{exc}（请求 ID：{rid}）"}
+                )
 
         async def event_stream() -> Any:
             task = asyncio.create_task(run())

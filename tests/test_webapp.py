@@ -8,6 +8,7 @@ Web 界面 API 测试（无需 API Key、不访问网络）
 """
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -347,6 +348,53 @@ def test_status_trips():
         _cleanup(user_id)
 
 
+def test_request_id_header():
+    client = _client()
+    response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
+    assert response.headers.get("x-request-id") == "trace-abc-123"
+
+    generated = client.get("/api/health").headers.get("x-request-id", "")
+    assert re.fullmatch(r"[0-9a-f]{12}", generated), generated
+    print("✓ X-Request-ID 透传 / 自动生成")
+
+
+def test_chat_rate_limit():
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=2, window_sec=60)
+    client = TestClient(app)
+
+    user_id = _unique_user("web_test_limit")
+    other_id = _unique_user("web_test_limit_other")
+    try:
+        for _ in range(2):
+            response = client.post(
+                "/api/chat",
+                json={"message": "你好", "user_id": user_id, "session_id": "sess-limit"},
+            )
+            assert response.status_code == 200
+
+        limited = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-limit"},
+        )
+        assert limited.status_code == 429
+        assert "Retry-After" in limited.headers
+        assert "请求 ID" in limited.json()["detail"]
+
+        other = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": other_id, "session_id": "sess-other"},
+        )
+        assert other.status_code == 200, "不同用户不应共享限流额度"
+        print("✓ 对话接口限流（429 / Retry-After / 用户隔离）")
+    finally:
+        _cleanup(user_id)
+        _cleanup(other_id)
+
+
 def test_invalid_user_id_rejected():
     response = _client().post("/api/chat", json={"message": "你好", "user_id": "../etc"})
     assert response.status_code == 422
@@ -377,6 +425,8 @@ if __name__ == "__main__":
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()
+    test_request_id_header()
+    test_chat_rate_limit()
     test_invalid_user_id_rejected()
     test_export_attachment()
     print("\n全部通过")
