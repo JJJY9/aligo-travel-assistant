@@ -23,6 +23,7 @@ import os
 # Add project root to sys.path
 import sys
 from pathlib import Path
+from typing import Any
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
@@ -48,6 +49,39 @@ except ImportError as e:
     logger.warning(f"RAG dependencies not available: {e}")
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
+
+# 同一进程内按数据库路径共享 Milvus Lite 客户端：多个 RAGKnowledgeAgent
+# （Web 多会话、测试中多个智能体）若各自打开同一个本地库，会因文件锁冲突失败。
+_MILVUS_CLIENTS: dict[str, Any] = {}
+
+
+def _get_milvus_client(db_path: str) -> Any:
+    """获取（或创建）进程内共享的 Milvus Lite 客户端。"""
+    client = _MILVUS_CLIENTS.get(db_path)
+    if client is not None:
+        return client
+    client = MilvusClient(
+        db_path,
+        grpc_options={
+            "keepalive_time": _GRPC_MAX_MS,
+            "keepalive_timeout": "20000",
+            "keepalive_permit_without_calls": "0",
+            "http2_min_recv_ping_interval_without_data": _GRPC_MAX_MS,
+            "http2_min_ping_interval_without_data": _GRPC_MAX_MS,
+        },
+    )
+    _MILVUS_CLIENTS[db_path] = client
+    return client
+
+
+def shutdown_milvus_clients() -> None:
+    """关闭并清空共享客户端（测试或进程退出前使用）。"""
+    for client in list(_MILVUS_CLIENTS.values()):
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响退出
+            pass
+    _MILVUS_CLIENTS.clear()
 
 
 class RAGKnowledgeAgent(AgentBase):
@@ -114,7 +148,7 @@ class RAGKnowledgeAgent(AgentBase):
         milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
 
-        self.milvus_client = MilvusClient(milvus_db_path, grpc_options={"keepalive_time": _GRPC_MAX_MS, "keepalive_timeout": "20000", "keepalive_permit_without_calls": "0", "http2_min_recv_ping_interval_without_data": _GRPC_MAX_MS, "http2_min_ping_interval_without_data": _GRPC_MAX_MS})
+        self.milvus_client = _get_milvus_client(milvus_db_path)
         self._client_created_at = None  # 用于追踪客户端创建时间
 
         # 检查collection是否存在
@@ -143,15 +177,15 @@ class RAGKnowledgeAgent(AgentBase):
         except Exception as e:
             logger.warning(f"Milvus connection issue detected: {e}, reconnecting...")
             try:
-                # 关闭旧连接
-                if hasattr(self.milvus_client, 'close'):
+                # 丢弃并关闭旧共享客户端，再重新创建
+                old = _MILVUS_CLIENTS.pop(self._milvus_db_path, None)
+                if old is not None and hasattr(old, "close"):
                     try:
-                        self.milvus_client.close()
+                        old.close()
                     except Exception:
                         pass
 
-                # 重新创建客户端
-                self.milvus_client = MilvusClient(self._milvus_db_path)
+                self.milvus_client = _get_milvus_client(self._milvus_db_path)
                 logger.info("Milvus client reconnected successfully")
             except Exception as reconnect_error:
                 logger.error(f"Failed to reconnect Milvus: {reconnect_error}")
@@ -433,14 +467,12 @@ class RAGKnowledgeAgent(AgentBase):
             return {"status": "error", "message": str(e)}
 
     def close(self):
-        """关闭 Milvus 连接"""
-        if hasattr(self, 'milvus_client'):
-            try:
-                if hasattr(self.milvus_client, 'close'):
-                    self.milvus_client.close()
-                    logger.info("Milvus client closed successfully")
-            except Exception as e:
-                logger.warning(f"Error closing Milvus client: {e}")
+        """Milvus Lite 客户端在进程内按数据库路径共享，这里不主动关闭。
+
+        单独关闭会影响其它共用该客户端的 RAGKnowledgeAgent；进程退出时由
+        操作系统释放文件句柄。需要强制关闭时调用模块级 shutdown_milvus_clients()。
+        """
+        logger.debug("Milvus client is shared; skip close")
 
     def __del__(self):
         """析构函数，确保资源被释放"""
