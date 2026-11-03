@@ -1,0 +1,26 @@
+# 依赖自动更新：每周为 pip 依赖与 GitHub Actions 创建升级 PR
+#
+# 说明：
+# - requirements*.txt 与 pyproject.toml 中有较多兼容性硬约束
+#   （如 mcp<2、setuptools<82、agentscope==1.0.16），升级 PR 仍需按
+#   CONTRIBUTING 流程人工验证（ruff / mypy / pytest + 真实冒烟）后再合并；
+# - 仅对 pip 与 GitHub Actions 两类依赖开启自动更新。
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5

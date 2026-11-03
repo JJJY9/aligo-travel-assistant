@@ -27,7 +27,7 @@ def is_retriable_error(exc: BaseException) -> bool:
     return bool("timeout" in msg or "timed out" in msg)
 
 
-async def retry_with_backoff[T](
+async def retry_with_backoff(
     coro_factory: Callable[[], Awaitable[T]],
     max_retries: int = 3,
     base_delay_sec: float = 1.0,

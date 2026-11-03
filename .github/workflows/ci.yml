@@ -3,7 +3,8 @@
 # 说明：
 # - 只安装轻量依赖（requirements-ci.txt），不安装 torch / pymilvus /
 #   sentence-transformers 等重型 RAG 依赖；缺少依赖或密钥的测试会自动跳过；
-# - CI 中不会调用真实大模型，构建快速且无需任何密钥。
+# - CI 中不会调用真实大模型，构建快速且无需任何密钥；
+# - 测试矩阵覆盖项目声明的 Python 3.10 与 3.12。
 name: CI
 
 on:
@@ -21,16 +22,20 @@ concurrency:
 
 jobs:
   quality:
-    name: 代码检查与测试
+    name: 代码检查与测试（Python ${{ matrix.python-version }}）
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Python 3.12
+      - name: 安装 Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements-ci.txt
 
