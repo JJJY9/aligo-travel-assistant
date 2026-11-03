@@ -6,6 +6,8 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
+> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance and JSON export/import, parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history & search, memory/usage panel, trip management with calendar export, knowledge maintenance, self-diagnostics). Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
+
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
 ## 界面预览
