@@ -1,0 +1,49 @@
+# 持续集成：代码风格（ruff）、类型检查（mypy）、无需 API Key 的回归测试（pytest）
+#
+# 说明：
+# - 只安装轻量依赖（requirements-ci.txt），不安装 torch / pymilvus /
+#   sentence-transformers 等重型 RAG 依赖；缺少依赖或密钥的测试会自动跳过；
+# - CI 中不会调用真实大模型，构建快速且无需任何密钥。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: 代码检查与测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: 安装轻量依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+
+      - name: 代码风格检查（ruff）
+        run: python -m ruff check .
+
+      - name: 类型检查（mypy）
+        run: python -m mypy .
+
+      - name: 回归测试（pytest，无需 API Key）
+        run: python -m pytest tests/ -q
