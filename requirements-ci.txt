@@ -1,0 +1,19 @@
+# 持续集成 / 轻量测试环境的依赖清单
+# 说明：不包含 torch、pymilvus、sentence-transformers 等重型 RAG 依赖——
+# 缺少依赖或缺少 API Key 的测试会自动跳过；CI 不调用真实大模型。
+agentscope==1.0.16
+requests==2.32.3
+rich==13.9.4
+ddgs==9.10.0
+PyYAML==6.0.3
+
+# agentscope==1.0.16 的隐含依赖（其元数据未声明，缺失会导致 import 失败）
+greenlet==3.5.6
+tqdm==4.70.1
+mcp==1.30.0
+
+# 测试与检查工具（锁定版本，保证本地与 CI 结果一致）
+pytest==9.2.0
+pytest-asyncio==1.4.1
+ruff==0.17.3
+mypy==2.4.1

@@ -19,7 +19,11 @@ import os
 _api_key = os.environ.get("LLM_API_KEY", "")
 if not _api_key:
     try:
-        from config_local import API_KEY as _api_key  # 本地私有配置（已 gitignore）
+        # 本地私有配置（已 gitignore）。注意不要用 import ... as _api_key 的写法：
+        # config_local.py 不存在时 mypy 会报 "Name already defined [no-redef]"
+        from config_local import API_KEY
+
+        _api_key = API_KEY
     except ImportError:
         pass
 
