@@ -728,21 +728,23 @@ async function addTrip(event) {
   };
   els.tripSubmit.disabled = true;
   try {
+    let message = "行程已更新";
     if (editingId) {
       await getJSON(`/api/trips/${encodeURIComponent(editingId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      toast("行程已更新");
     } else {
-      await getJSON("/api/trips", {
+      const result = await getJSON("/api/trips", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      toast("行程已添加");
+      message =
+        result.created === false ? "已存在相同行程，已更新该记录" : "行程已添加";
     }
+    toast(message);
     els.tripForm.hidden = true;
     resetTripForm();
     await refreshStatus();

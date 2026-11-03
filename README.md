@@ -553,7 +553,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/sessions/{id}/export` | 把会话导出为 Markdown 附件 |
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载） |
-| POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id`） |
+| POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id` 与 `created`） |
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；可与其它行程冲突时返回 409） |
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过） |
