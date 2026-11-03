@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -248,10 +250,11 @@ def _enforce_rate_limit(state: AligoWebApp, user_id: str, request: Request) -> N
     retry_after = state.rate_limiter.check(f"{client}:{user_id}")
     if retry_after is None:
         return
+    wait_seconds = max(1, math.ceil(retry_after))
     raise HTTPException(
         status_code=429,
-        detail=f"请求过于频繁，请约 {retry_after:.0f} 秒后重试（请求 ID：{_request_id(request)}）",
-        headers={"Retry-After": str(retry_after)},
+        detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
+        headers={"Retry-After": str(wait_seconds)},
     )
 
 
@@ -414,7 +417,11 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
 
             timestamp = str(message.get("timestamp") or "")
             try:
-                message_day = datetime.fromisoformat(timestamp).date().isoformat()
+                parsed_timestamp = datetime.fromisoformat(timestamp)
+                if parsed_timestamp.tzinfo is not None:
+                    # PostgreSQL timestamptz 序列化为 UTC；统一转到本地时区再取日期
+                    parsed_timestamp = parsed_timestamp.astimezone()
+                message_day = parsed_timestamp.date().isoformat()
             except ValueError:
                 message_day = ""
             if message_day:
@@ -460,7 +467,11 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
         "",
     ]
 
-    preferences = {key: value for key, value in (data.get("preferences") or {}).items() if value}
+    preferences = {
+        key: value
+        for key, value in (data.get("preferences") or {}).items()
+        if value is not None and value != "" and value != [] and value != {}
+    }
     lines.extend(["## 用户偏好", ""])
     if preferences:
         for key, value in preferences.items():
@@ -529,12 +540,15 @@ def _ics_escape(value: str) -> str:
     )
 
 
-def _build_trip_ics(trip: dict[str, Any]) -> str | None:
+def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
     """把一条行程渲染为全天事件的 iCalendar 文本；缺少出发日期时返回 None。"""
     start = _ics_date(trip.get("start_date") or "")
     if not start:
         return None
     end = _ics_date(trip.get("end_date") or "") or start
+    if end < start:
+        logger.warning("行程结束日期早于出发日期，按单日处理: %s", trip.get("trip_id"))
+        end = start
     end_exclusive = (datetime.strptime(end, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
 
     origin = str(trip.get("origin") or "出发地")
@@ -546,7 +560,10 @@ def _build_trip_ics(trip: dict[str, Any]) -> str | None:
         f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，{purpose}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    uid = f"aligo-{trip.get('trip_id') or 'trip'}-{uuid.uuid4().hex[:8]}@aligo.local"
+    uid_digest = hashlib.sha1(
+        f"{user_id}:{trip.get('trip_id') or 'trip'}".encode("utf-8")
+    ).hexdigest()[:16]
+    uid = f"aligo-{uid_digest}@aligo.local"
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -606,12 +623,27 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/status")
     def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:
         data = _load_user_data(user_id)
-        preferences = {key: value for key, value in data["preferences"].items() if value}
+        preferences = {
+            key: value
+            for key, value in data["preferences"].items()
+            # 保留 0 / false 等合法值，仅过滤空值
+            if value is not None and value != "" and value != [] and value != {}
+        }
+        today = datetime.now().date().isoformat()
+        upcoming_trips = [
+            trip
+            for trip in data["trip_history"]
+            if trip.get("start_date") and str(trip["start_date"]) >= today
+        ]
+        upcoming_trips.sort(
+            key=lambda trip: (str(trip["start_date"]), 0 if trip.get("session_id") else 1)
+        )
         return {
             "user_id": user_id,
             "preferences": preferences,
             "trip_count": len(data["trip_history"]),
             "trips": data["trip_history"][-5:],
+            "next_trip": upcoming_trips[0] if upcoming_trips else None,
             "chat_count": len(data["chat_history"]),
             "statistics": data["statistics"],
             "storage": describe_backends(),
@@ -717,16 +749,19 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             messages = store.get_chat_history(session_id=session_id)
+            titles = store.get_session_titles()
         finally:
             _close_long_term(store)
         if not messages:
             raise HTTPException(status_code=404, detail="会话不存在或没有消息")
 
-        title = "Aligo 对话"
-        for message in messages:
-            if message.get("role") == "user":
-                title = " ".join(str(message.get("content", "")).split())[:40] or title
-                break
+        title = str(titles.get(session_id) or "")
+        if not title:
+            title = "Aligo 对话"
+            for message in messages:
+                if message.get("role") == "user":
+                    title = " ".join(str(message.get("content", "")).split())[:40] or title
+                    break
 
         lines = [
             f"# {title}",
@@ -861,14 +896,18 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> Response:
         """导出一条行程为 iCalendar（.ics）全天事件。"""
-        data = _load_user_data(user_id)
+        store = _open_long_term(user_id)
+        try:
+            trips = store.get_trip_history(limit=None)
+        finally:
+            _close_long_term(store)
         trip = next(
-            (item for item in data["trip_history"] if str(item.get("trip_id")) == trip_id),
+            (item for item in trips if str(item.get("trip_id")) == trip_id),
             None,
         )
         if trip is None:
             raise HTTPException(status_code=404, detail="行程不存在")
-        content = _build_trip_ics(trip)
+        content = _build_trip_ics(trip, user_id)
         if content is None:
             raise HTTPException(status_code=400, detail="该行程缺少出发日期，无法生成日历")
         return Response(

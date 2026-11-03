@@ -123,12 +123,20 @@ def test_postgres_long_term_memory():
         assert memory.get_pinned_sessions() == []
         assert len(memory.get_chat_history()) == 1
 
+        memory.set_session_title("s2", "残留标题")
+        memory.set_session_pinned("s2", True)
         memory.clear_history()
         cleared = memory.get_statistics()
         assert cleared["total_trips"] == 0 and cleared["total_messages"] == 0
+        assert memory.get_session_titles() == {}
+        assert memory.get_pinned_sessions() == []
 
+        memory.set_session_title("s3", "标题")
+        memory.set_session_pinned("s3", True)
         memory.delete_all()
         assert memory.get_preference() == {}
+        assert memory.get_session_titles() == {}
+        assert memory.get_pinned_sessions() == []
         print("✓ PostgreSQL 长期记忆（偏好 / 对话 / 行程 / 统计 / 清理）")
     finally:
         memory.close()

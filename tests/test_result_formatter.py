@@ -93,6 +93,18 @@ def test_rag_answer_with_sources():
     print("✓ RAG 回答与来源 / 参考片段渲染正常")
 
 
+def test_rag_malformed_documents():
+    data = _wrap([
+        {
+            "agent_name": "rag_knowledge",
+            "status": "success",
+            "data": {"answer": "答案", "retrieved_documents": {"oops": 1}},
+        }
+    ])
+    assert result_to_markdown(data) == "答案"
+    print("✓ RAG 非列表检索结果安全兜底")
+
+
 def test_information_query_sources():
     data = _wrap([
         {
@@ -127,6 +139,7 @@ if __name__ == "__main__":
     test_itinerary()
     test_preference()
     test_rag_answer_with_sources()
+    test_rag_malformed_documents()
     test_information_query_sources()
     test_error_result()
     test_no_agents()
