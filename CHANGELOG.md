@@ -14,6 +14,7 @@
 - 接口观测与限流：`/api/` 响应携带 `X-Request-ID`（透传或自动生成），请求日志包含方法 / 状态 / 耗时；对话接口默认按「客户端 + 用户」限流 30 次/分钟（429 + `Retry-After`，可用 `CHAT_RATE_LIMIT` / `CHAT_RATE_WINDOW_SEC` 调整）
 - 跟进建议：回答完成后根据本轮执行的智能体推荐 2–3 个下一步操作（导出行程 / 查出发当天天气 / 调整行程等），点击直接继续对话
 - 会话重命名：侧栏内联编辑标题（`PUT /api/sessions/{id}/title`），JSON / PostgreSQL 持久化；自定义标题参与搜索，空标题恢复自动标题
+- 会话置顶：侧栏图钉按钮置顶 / 取消置顶（`PUT /api/sessions/{id}/pin`），置顶会话进入「置顶」分组并优先展示，JSON / PostgreSQL 持久化
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 
@@ -26,6 +27,7 @@
 ### 修复
 - 偏好追加时若存量与新值相同（字符串 → 列表），不再产生重复项（如「汉庭、汉庭」）
 - RAG 智能体在进程内按数据库路径共享 Milvus Lite 客户端，修复多会话 / 全量测试中重复打开本地库导致的偶发文件锁错误
+- 删除无消息的会话时也会清理其标题与置顶元数据（此前仅在有消息时清理）
 
 ### 测试
 - 新增偏好编辑 / 删除 API、最近行程、JSON / PostgreSQL 删除偏好、追加去重用例
