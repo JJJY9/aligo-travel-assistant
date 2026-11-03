@@ -25,7 +25,7 @@ ddgs==9.10.0
 # agentscope==1.0.16 的隐含依赖（其元数据未声明，缺失会导致 `import agentscope` 失败）
 greenlet==3.5.6  # SQLAlchemy asyncio 模式必需
 tqdm==4.70.1     # agentscope.evaluate 模块导入必需
-mcp==1.30.0      # 必须保持 <2：mcp 2.x 移除了 streamablehttp_client，agentscope 1.0.16 仍按旧名导入
+mcp==2.3.0      # 必须保持 <2：mcp 2.x 移除了 streamablehttp_client，agentscope 1.0.16 仍按旧名导入
 
 # 打包发布（`python -m build` 的前端；打包元数据见 pyproject.toml）
 build>=1.2.2
