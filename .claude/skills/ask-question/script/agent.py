@@ -23,7 +23,6 @@ import os
 # Add project root to sys.path
 import sys
 from pathlib import Path
-from typing import Any
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
@@ -31,6 +30,11 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.json_parser import extract_json_from_async_response
+from utils.milvus_client import (  # noqa: F401 - shutdown_milvus_clients 供外部清理
+    get_milvus_client,
+    reset_milvus_client,
+    shutdown_milvus_clients,
+)
 
 _GRPC_MAX_MS = '2147483647'  # gRPC 使用的 int32 上限，约 24.8 天
 os.environ['GRPC_KEEPALIVE_TIME_MS'] = _GRPC_MAX_MS
@@ -42,46 +46,13 @@ os.environ['GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS'] = _GRPC_MAX_MS
 logger = logging.getLogger(__name__)
 
 try:
-    from pymilvus import MilvusClient
+    import pymilvus  # noqa: F401 - 仅用于检测依赖是否安装
     from sentence_transformers import SentenceTransformer
     DEPENDENCIES_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"RAG dependencies not available: {e}")
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
-
-# 同一进程内按数据库路径共享 Milvus Lite 客户端：多个 RAGKnowledgeAgent
-# （Web 多会话、测试中多个智能体）若各自打开同一个本地库，会因文件锁冲突失败。
-_MILVUS_CLIENTS: dict[str, Any] = {}
-
-
-def _get_milvus_client(db_path: str) -> Any:
-    """获取（或创建）进程内共享的 Milvus Lite 客户端。"""
-    client = _MILVUS_CLIENTS.get(db_path)
-    if client is not None:
-        return client
-    client = MilvusClient(
-        db_path,
-        grpc_options={
-            "keepalive_time": _GRPC_MAX_MS,
-            "keepalive_timeout": "20000",
-            "keepalive_permit_without_calls": "0",
-            "http2_min_recv_ping_interval_without_data": _GRPC_MAX_MS,
-            "http2_min_ping_interval_without_data": _GRPC_MAX_MS,
-        },
-    )
-    _MILVUS_CLIENTS[db_path] = client
-    return client
-
-
-def shutdown_milvus_clients() -> None:
-    """关闭并清空共享客户端（测试或进程退出前使用）。"""
-    for client in list(_MILVUS_CLIENTS.values()):
-        try:
-            client.close()
-        except Exception:  # noqa: BLE001 - 关闭失败不影响退出
-            pass
-    _MILVUS_CLIENTS.clear()
 
 
 class RAGKnowledgeAgent(AgentBase):
@@ -148,7 +119,7 @@ class RAGKnowledgeAgent(AgentBase):
         milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
 
-        self.milvus_client = _get_milvus_client(milvus_db_path)
+        self.milvus_client = get_milvus_client(milvus_db_path)
         self._client_created_at = None  # 用于追踪客户端创建时间
 
         # 检查collection是否存在
@@ -178,14 +149,9 @@ class RAGKnowledgeAgent(AgentBase):
             logger.warning(f"Milvus connection issue detected: {e}, reconnecting...")
             try:
                 # 丢弃并关闭旧共享客户端，再重新创建
-                old = _MILVUS_CLIENTS.pop(self._milvus_db_path, None)
-                if old is not None and hasattr(old, "close"):
-                    try:
-                        old.close()
-                    except Exception:
-                        pass
+                reset_milvus_client(self._milvus_db_path)
 
-                self.milvus_client = _get_milvus_client(self._milvus_db_path)
+                self.milvus_client = get_milvus_client(self._milvus_db_path)
                 logger.info("Milvus client reconnected successfully")
             except Exception as reconnect_error:
                 logger.error(f"Failed to reconnect Milvus: {reconnect_error}")

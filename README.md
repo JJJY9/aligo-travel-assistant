@@ -36,6 +36,7 @@
 - 按小节切分（Chunking，保留章节边界）+ 余弦相似度检索（Top-K=5）
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
+- 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
 
 ### ⚡ 优先级并行调度
 - Plan-and-Execute架构：IntentionAgent → OrchestrationAgent → 子Agent
@@ -428,6 +429,8 @@ python cli.py
 
 单独做健康检查（不进入交互）：`python cli.py health`，返回 `OK` / `FAIL: ...`，退出码 0/1。
 
+知识库状态（不进入交互）：`python cli.py kb`，输出集合名 / 片段数与数据库路径，退出码 0/1。
+
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
 
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。
@@ -478,6 +481,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
 | GET | `/api/health` | 服务版本 / 模型 / 存储后端状态 |
+| GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
 | GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程数 / 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |
@@ -566,6 +570,8 @@ aligo-travel-assistant/
 │   ├── progress.py                  # 智能体进度事件 → CLI 文本
 │   ├── exporter.py                  # 用户数据导出（JSON / Markdown）
 │   ├── rate_limit.py                # 对话接口进程内滑动窗口限流
+│   ├── milvus_client.py             # 进程内共享 Milvus Lite 客户端
+│   ├── knowledge_stats.py           # 知识库集合 / 片段数状态
 │   ├── text_chunker.py              # RAG 文本按小节切分
 │   ├── doctor.py                    # 环境自检
 │   └── skill_loader.py              # SKILL.md 加载器

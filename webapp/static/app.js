@@ -117,6 +117,7 @@ const els = {
   usageChart: byId("usageChart"),
   usageTable: byId("usageTable"),
   storageChips: byId("storageChips"),
+  knowledgeChip: byId("knowledgeChip"),
   toast: byId("toast"),
 };
 
@@ -1826,10 +1827,26 @@ function restoreSidebar() {
 
 /* ---------- 记忆与数据面板 ---------- */
 
+async function refreshKnowledge() {
+  try {
+    const data = await getJSON("/api/knowledge");
+    els.knowledgeChip.innerHTML = "";
+    const chip = document.createElement("span");
+    chip.className = data.available ? "badge" : "badge err";
+    chip.textContent = data.available
+      ? `知识库 · ${Number(data.documents || 0).toLocaleString("zh-CN")} 片段`
+      : `知识库 · ${data.reason || "不可用"}`;
+    els.knowledgeChip.appendChild(chip);
+  } catch {
+    els.knowledgeChip.innerHTML = "";
+  }
+}
+
 function openMemorySheet() {
   els.userIdInput.value = state.userId;
   els.memorySheet.hidden = false;
   refreshStatus();
+  refreshKnowledge();
 }
 
 function closeMemorySheet() {
