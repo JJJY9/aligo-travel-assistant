@@ -2,16 +2,50 @@
 长期记忆 (Long-term Memory)
 持久化存储用户信息，支持跨会话访问
 """
+import functools
 import json
 import logging
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
+# MemoryManager 还会重建实例），按路径共享一把进程内可重入锁，避免并发
+# 读改写互相覆盖。
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_path(path: str) -> threading.RLock:
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[path] = lock
+        return lock
+
+
+def _locked_mutation(func):
+    """写操作装饰器：按文件路径加锁，并在修改前重载磁盘数据。
+
+    长期记忆是整文件快照写回：调用方可能持有回合开始时的旧快照（例如一轮
+    对话进行中），直接覆盖会丢失其它请求刚完成的写入（删掉的行程复活、
+    新偏好丢失）。所有修改方法统一「重载 → 修改 → 原子写回」。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self._write_lock:
+            self._reload_latest()
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class LongTermMemory:
@@ -40,6 +74,7 @@ class LongTermMemory:
             storage = Path(__file__).resolve().parent.parent / storage
         self.storage_path = str(storage)
         self.db_path = os.path.join(self.storage_path, f"{user_id}.json")
+        self._write_lock = _lock_for_path(self.db_path)
 
         # 确保存储目录存在
         Path(self.storage_path).mkdir(parents=True, exist_ok=True)
@@ -65,6 +100,19 @@ class LongTermMemory:
         else:
             logger.info("No existing long-term memory, creating new")
             return self._init_data()
+
+    def _reload_latest(self) -> None:
+        """从磁盘重载最新数据（写操作前调用，避免旧快照覆盖其它写入）。"""
+        try:
+            with open(self.db_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception:  # noqa: BLE001 - 重载失败时沿用内存快照
+            logger.warning("重载长期记忆失败，沿用内存快照", exc_info=True)
+            return
+        if isinstance(data, dict):
+            self.data = self._migrate_data(data)
 
     def _migrate_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """
@@ -144,8 +192,8 @@ class LongTermMemory:
             }
         }
 
-    def _save(self):
-        """原子写入数据文件（临时文件 + os.replace），避免并发读到半截 JSON。"""
+    def _save(self) -> bool:
+        """原子写入数据文件（临时文件 + os.replace），返回是否写入成功。"""
         try:
             self.data["updated_at"] = datetime.now().isoformat()
             directory = os.path.dirname(self.db_path) or "."
@@ -160,9 +208,12 @@ class LongTermMemory:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
             logger.debug(f"Saved long-term memory to {self.db_path}")
+            return True
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")
+            return False
 
+    @_locked_mutation
     def save_preference(self, pref_type: str, value: Any):
         """
         保存用户偏好（列表格式）
@@ -213,6 +264,7 @@ class LongTermMemory:
                     return pref.get("value")
             return None
 
+    @_locked_mutation
     def delete_preference(self, pref_type: str) -> bool:
         """删除指定类型的偏好，返回是否确实删除。"""
         preferences = self.data["preferences"]
@@ -224,6 +276,7 @@ class LongTermMemory:
         logger.info(f"Deleted preference: {pref_type}")
         return True
 
+    @_locked_mutation
     def add_hotel_brand(self, brand: str):
         """添加酒店品牌偏好（追加到列表）"""
         # 查找 hotel_brands 偏好
@@ -249,6 +302,7 @@ class LongTermMemory:
         self._save()
         logger.info(f"Added hotel brand preference: {brand}")
 
+    @_locked_mutation
     def add_airline(self, airline: str):
         """添加航空公司偏好（追加到列表）"""
         # 查找 airlines 偏好
@@ -274,6 +328,7 @@ class LongTermMemory:
         self._save()
         logger.info(f"Added airline preference: {airline}")
 
+    @_locked_mutation
     def add_chat_message(self, role: str, content: str, session_id: str | None = None):
         """
         添加聊天消息到长期记忆
@@ -315,6 +370,7 @@ class LongTermMemory:
             return messages[-limit:]
         return messages
 
+    @_locked_mutation
     def delete_chat_session(self, session_id: str) -> int:
         """删除某个会话的全部聊天记录，返回删除条数。"""
         messages = self.data["chat_history"]
@@ -342,6 +398,7 @@ class LongTermMemory:
             )
         return removed
 
+    @_locked_mutation
     def set_session_title(self, session_id: str, title: str) -> None:
         """设置会话自定义标题；空标题表示恢复自动标题。"""
         titles = self.data.setdefault("session_titles", {})
@@ -357,6 +414,7 @@ class LongTermMemory:
         """返回全部会话自定义标题。"""
         return dict(self.data.get("session_titles") or {})
 
+    @_locked_mutation
     def set_session_pinned(self, session_id: str, pinned: bool) -> None:
         """置顶 / 取消置顶会话。"""
         pinned_sessions = self.data.setdefault("pinned_sessions", [])
@@ -370,6 +428,7 @@ class LongTermMemory:
         """返回置顶会话 ID（按置顶时间先后）。"""
         return list(self.data.get("pinned_sessions") or [])
 
+    @_locked_mutation
     def save_trip_history(self, trip_info: dict[str, Any]):
         """
         保存行程历史
@@ -406,6 +465,7 @@ class LongTermMemory:
                 max_number = max(max_number, int(match.group(1)))
         return f"trip_{max_number + 1}"
 
+    @_locked_mutation
     def delete_trip(self, trip_id: str) -> bool:
         """删除一条历史行程并同步统计；返回是否删除。"""
         trips = self.data.get("trip_history", [])
@@ -420,7 +480,8 @@ class LongTermMemory:
                     frequent[destination] = int(frequent[destination]) - 1
                     if frequent[destination] <= 0:
                         del frequent[destination]
-                self._save()
+                if not self._save():
+                    raise OSError("写入长期记忆失败")
                 logger.info(f"Deleted trip history: {trip_id}")
                 return True
         return False
@@ -451,6 +512,7 @@ class LongTermMemory:
         sorted_dest = sorted(freq.items(), key=lambda x: x[1], reverse=True)
         return sorted_dest[:top_n]
 
+    @_locked_mutation
     def increment_query_count(self):
         """增加查询计数"""
         stats = self.data["statistics"]
@@ -461,6 +523,7 @@ class LongTermMemory:
         """获取统计信息"""
         return self.data["statistics"].copy()
 
+    @_locked_mutation
     def clear_history(self):
         """清空历史记录（保留偏好）"""
         self.data["chat_history"] = []
@@ -473,6 +536,7 @@ class LongTermMemory:
         self._save()
         logger.info("Cleared all history (chat + trips)")
 
+    @_locked_mutation
     def delete_all(self):
         """删除所有数据（包括文件）"""
         if os.path.exists(self.db_path):

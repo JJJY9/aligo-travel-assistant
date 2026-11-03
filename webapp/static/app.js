@@ -1031,7 +1031,7 @@ function renderHistoryItem(session) {
     if (event.target !== item) return;
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      openSession(session.session_id);
+      openSession(session.session_id, { matchIndex: session.match_index });
     }
   });
   return item;
@@ -1552,8 +1552,13 @@ function renderOverview() {
           toast("行程已删除");
           await refreshStatus();
         } catch (error) {
-          toast(error.message);
-          remove.disabled = false;
+          if (error.status === 404) {
+            toast("行程不存在，已刷新列表");
+            await refreshStatus();
+          } else {
+            toast(error.message);
+            remove.disabled = false;
+          }
         }
       });
 
@@ -2145,20 +2150,32 @@ async function importKnowledgeFile() {
     toast("文件中没有知识片段（需要 documents 数组）");
     return;
   }
-  if (documents.length > 200) {
-    toast("单次最多导入 200 条知识片段");
+  if (documents.length > 16384) {
+    toast("单次最多导入 16384 条知识片段");
     return;
   }
   if (!window.confirm(`导入 ${documents.length} 条知识片段？`)) return;
   els.kbImport.disabled = true;
   els.kbImport.textContent = "导入中…";
   try {
-    const result = await getJSON("/api/knowledge/import", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ documents }),
-    });
-    toast(`已导入 ${result.imported || 0} 条知识片段`);
+    // 接口单次最多 200 条；导出文件可能更大，按批上传保证备份可完整恢复
+    let imported = 0;
+    let skipped = 0;
+    for (let start = 0; start < documents.length; start += 200) {
+      const batch = documents.slice(start, start + 200);
+      const result = await getJSON("/api/knowledge/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ documents: batch }),
+      });
+      imported += result.imported || 0;
+      skipped += result.skipped || 0;
+      els.kbImport.textContent = `导入中… ${Math.min(
+        start + batch.length,
+        documents.length,
+      )}/${documents.length}`;
+    }
+    toast(`已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}`);
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
     toast(error.message);

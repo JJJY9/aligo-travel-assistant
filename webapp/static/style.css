@@ -990,8 +990,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   border-radius: 6px;
   background: transparent;
   color: var(--ink-3);
-  opacity: 0;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  transition: background 0.15s ease;
 }
 .trip-actions { opacity: 0; transition: opacity 0.15s ease; }
 .trip:hover .trip-actions, .trip-actions:focus-within { opacity: 1; }

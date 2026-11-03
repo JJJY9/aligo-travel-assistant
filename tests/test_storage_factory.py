@@ -279,6 +279,44 @@ def test_reload_long_term_respects_backend():
     print("✓ 长期记忆重载按后端类型决定")
 
 
+def test_stale_snapshot_does_not_resurrect_trip():
+    """回合开始时的旧快照写回时，不能把别处刚删除的行程/统计恢复。"""
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    stale = LongTermMemory("u-stale", path)
+    for destination in ("上海", "杭州"):
+        stale.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": destination,
+                "start_date": "2026-11-09",
+                "end_date": "2026-11-11",
+                "purpose": "出差",
+            }
+        )
+    other = LongTermMemory("u-stale", path)
+    assert other.delete_trip("trip_1") is True
+
+    # stale 仍持有删除前的快照；模拟对话回合结束时保存新行程
+    stale.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "广州",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+    )
+
+    fresh = LongTermMemory("u-stale", path)
+    trips = fresh.get_trip_history(limit=None)
+    assert [trip["trip_id"] for trip in trips] == ["trip_2", "trip_3"]
+    assert all(trip["destination"] != "上海" for trip in trips), "已删除的行程不应复活"
+    assert fresh.get_statistics()["total_trips"] == 2
+    print("✓ 旧快照写回不会复活已删除的行程")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -287,6 +325,7 @@ if __name__ == "__main__":
     test_long_term_delete_session()
     test_long_term_delete_preference()
     test_trip_history_delete_and_ids()
+    test_stale_snapshot_does_not_resurrect_trip()
     test_session_titles()
     test_session_pinned()
     test_add_message_preserves_metadata()

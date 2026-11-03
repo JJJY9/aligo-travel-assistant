@@ -1037,9 +1037,6 @@ def run_knowledge_import_standalone(source: str) -> int:
     if not isinstance(documents, list) or not documents:
         print("文件中没有知识片段（需要 documents 数组或纯数组）")
         return 1
-    if len(documents) > 200:
-        print(f"单次最多导入 200 条，当前 {len(documents)} 条")
-        return 1
 
     try:
         result = import_documents(documents)

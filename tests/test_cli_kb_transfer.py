@@ -128,12 +128,6 @@ def test_import_errors(monkeypatch):
         code, out = _capture(cli.run_knowledge_import_standalone, str(empty))
         assert code == 1 and "没有知识片段" in out
 
-        too_many = _write_json(
-            tmp, {"documents": [{"content": "x"} for _ in range(201)]}
-        )
-        code, out = _capture(cli.run_knowledge_import_standalone, str(too_many))
-        assert code == 1 and "单次最多导入 200 条" in out
-
         good = _write_json(tmp, {"documents": [{"content": "x"}]})
 
         def boom(documents):
@@ -145,6 +139,26 @@ def test_import_errors(monkeypatch):
     print("✓ kb-import 各类错误路径返回 1")
 
 
+def test_import_large_file_not_capped(monkeypatch):
+    """CLI 直接调用导入实现，不套用 HTTP 接口的单次 200 条上限（备份需可完整恢复）。"""
+    calls = {}
+
+    def fake_import(documents):
+        calls["count"] = len(documents)
+        return {"imported": len(documents), "skipped": 0}
+
+    monkeypatch.setattr(knowledge_admin, "import_documents", fake_import)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_json(
+            tmp, {"documents": [{"content": f"item-{i}"} for i in range(250)]}
+        )
+        code, out = _capture(cli.run_knowledge_import_standalone, str(path))
+    assert code == 0
+    assert calls["count"] == 250
+    assert "已导入 250 条知识片段" in out
+    print("✓ kb-import 不受接口 200 条上限限制")
+
+
 if __name__ == "__main__":
     for case in (
         test_export_writes_json,
@@ -152,6 +166,7 @@ if __name__ == "__main__":
         test_import_success,
         test_import_plain_array,
         test_import_errors,
+        test_import_large_file_not_capped,
     ):
         mp = pytest.MonkeyPatch()
         try:
