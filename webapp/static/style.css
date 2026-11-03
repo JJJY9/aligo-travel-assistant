@@ -213,6 +213,38 @@ a { color: var(--teal); }
 .search input::placeholder { color: var(--sidebar-muted); }
 .search input::-webkit-search-cancel-button { filter: invert(0.6); }
 
+.upcoming {
+  display: block;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid rgba(224, 85, 43, 0.32);
+  border-radius: 10px;
+  background: rgba(224, 85, 43, 0.14);
+  color: var(--sidebar-ink);
+  text-align: left;
+  transition: background 0.15s ease;
+}
+.upcoming:hover { background: rgba(224, 85, 43, 0.22); }
+.upcoming-label { display: block; font-size: 10.5px; color: var(--accent); }
+.upcoming-route {
+  display: block;
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+.upcoming-date {
+  display: block;
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--sidebar-muted);
+}
+
 .history {
   flex: 1;
   overflow-y: auto;
