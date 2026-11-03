@@ -188,9 +188,21 @@ class OrchestrationAgent(AgentBase):
 
         # 从记忆系统获取上下文
         if self.memory_manager:
-            # 短期记忆：最近对话
-            recent_context = self.memory_manager.short_term.get_recent_context(3)
+            short_term = getattr(self.memory_manager, "short_term", None)
+            recent_context = (
+                short_term.get_recent_context(3) if short_term is not None else []
+            )
             context["recent_dialogue"] = recent_context
+            # 用户本轮原话：偏好等抽取只依据该文本，避免把上下文 / 助手建议
+            # 里的内容误当成用户偏好
+            context["user_query"] = next(
+                (
+                    str(item.get("content") or "")
+                    for item in reversed(recent_context)
+                    if item.get("role") == "user"
+                ),
+                "",
+            )
 
             # 长期记忆：用户偏好
             preferences = self.memory_manager.long_term.get_preference()

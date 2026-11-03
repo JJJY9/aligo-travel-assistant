@@ -55,6 +55,16 @@ class _StubMemory:
         self.long_term = LongTermMemory("orchestration_unit_test", tempfile.mkdtemp())
 
 
+class _StubShortTerm:
+    """只提供最近一条用户消息的短期记忆桩。"""
+
+    def __init__(self, user_text: str):
+        self.user_text = user_text
+
+    def get_recent_context(self, n_turns: int = 1):
+        return [{"role": "user", "content": self.user_text}]
+
+
 def _intent(schedule: list[dict]) -> Msg:
     return Msg(
         name="IntentionAgent",
@@ -268,6 +278,25 @@ def test_memory_update_preference_and_trip():
     print("✓ 偏好覆盖/追加与行程写入正常")
 
 
+def test_prepare_context_includes_user_query():
+    """上下文携带用户本轮原话，供偏好等抽取使用。"""
+    memory = _StubMemory()
+    memory.short_term = _StubShortTerm("我常坐东航")
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+    context = orchestrator._prepare_context(
+        {"rewritten_query": "用户提到航空公司偏好"}
+    )
+    assert context["user_query"] == "我常坐东航"
+    assert context["rewritten_query"] == "用户提到航空公司偏好"
+
+    # 没有短期记忆的桩（或独立使用）不报错
+    bare = _StubMemory()
+    context = OrchestrationAgent(agent_registry={}, memory_manager=bare)._prepare_context({})
+    assert context["user_query"] == ""
+    print("✓ 上下文包含用户本轮原话（user_query）")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -275,4 +304,5 @@ if __name__ == "__main__":
     test_agent_duration_and_progress_events()
     test_unregistered_agent_reports_error()
     test_memory_update_preference_and_trip()
+    test_prepare_context_includes_user_query()
     print("\n全部通过")
