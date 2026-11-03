@@ -6,6 +6,7 @@ Web 界面 API 测试（无需 API Key、不访问网络）
 
 运行：python tests/test_webapp.py
 """
+import asyncio
 import json
 import os
 import re
@@ -133,6 +134,38 @@ def test_chat_stream_events():
         assert done["usage"]["calls"] >= 1
         print("✓ /api/chat/stream 推送进度事件并以 done 结束")
     finally:
+        _cleanup(user_id)
+
+
+def test_stream_heartbeat():
+    import webapp.server as server_module
+
+    class _SlowModel:
+        async def __call__(self, messages, **kwargs):
+            await asyncio.sleep(0.15)
+            return {
+                "content": [{"type": "text", "text": json.dumps(_INTENT, ensure_ascii=False)}],
+                "usage": {"input_tokens": 6, "output_tokens": 4, "time": 0.15},
+            }
+
+    original = server_module.SSE_HEARTBEAT_SEC
+    server_module.SSE_HEARTBEAT_SEC = 0.05
+    user_id = _unique_user("web_test_heartbeat")
+    try:
+        client = TestClient(create_app(model=UsageTrackingModel(_SlowModel())))
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-heartbeat"},
+        ) as response:
+            assert response.status_code == 200
+            lines = list(response.iter_lines())
+
+        assert any(line.startswith(": keep-alive") for line in lines), lines[:5]
+        assert any(line.startswith("data:") for line in lines)
+        print("✓ SSE 心跳保活")
+    finally:
+        server_module.SSE_HEARTBEAT_SEC = original
         _cleanup(user_id)
 
 
@@ -558,6 +591,7 @@ if __name__ == "__main__":
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
+    test_stream_heartbeat()
     test_sessions_listing_and_delete()
     test_session_search()
     test_status_usage_totals()
