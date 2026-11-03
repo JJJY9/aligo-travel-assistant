@@ -31,16 +31,6 @@ STATUS_SKIP = "skip"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "data" / "models" / "bge-small-zh-v1.5"
-DEFAULT_KB_DB = (
-    PROJECT_ROOT
-    / ".claude"
-    / "skills"
-    / "ask-question"
-    / "data"
-    / "rag_knowledge"
-    / "milvus_lite.db"
-)
-COLLECTION_NAME = "business_travel_knowledge"
 
 
 @dataclass
@@ -152,38 +142,26 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
 
 
 def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
-    """检查 RAG 知识库是否已初始化。"""
-    db = Path(db_path) if db_path else DEFAULT_KB_DB
-    if not db.exists():
-        return CheckResult(
-            "RAG 知识库",
-            STATUS_WARN,
-            "未初始化：python .claude/skills/ask-question/script/init_knowledge_base.py",
-        )
+    """检查 RAG 知识库是否已初始化（复用 knowledge_status，避免重复实现）。"""
+    from utils.knowledge_stats import knowledge_status
 
-    try:
-        from pymilvus import MilvusClient
-    except ImportError:
-        return CheckResult("RAG 知识库", STATUS_WARN, "数据库文件存在，但未安装 pymilvus，无法读取统计")
-
-    client = None
-    try:
-        client = MilvusClient(str(db))
-        if not client.has_collection(COLLECTION_NAME):
+    status = knowledge_status(db_path)
+    if not status["available"]:
+        reason = str(status.get("reason", "未知原因"))
+        if reason == "知识库未初始化":
+            return CheckResult(
+                "RAG 知识库",
+                STATUS_WARN,
+                "未初始化：python .claude/skills/ask-question/script/init_knowledge_base.py",
+            )
+        if reason == "集合不存在":
             return CheckResult("RAG 知识库", STATUS_WARN, "数据库存在，但缺少知识集合（请重新初始化）")
-        stats = client.get_collection_stats(COLLECTION_NAME)
-        count = stats.get("row_count", 0)
-        if count <= 0:
-            return CheckResult("RAG 知识库", STATUS_WARN, "知识集合为空（请运行初始化脚本）")
-        return CheckResult("RAG 知识库", STATUS_OK, f"已初始化，{count} 个知识片段")
-    except Exception as e:  # noqa: BLE001 - 自检场景需要兜底展示错误
-        return CheckResult("RAG 知识库", STATUS_WARN, f"无法读取知识库: {str(e)[:120]}")
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+        return CheckResult("RAG 知识库", STATUS_WARN, f"无法读取知识库: {reason[:120]}")
+
+    count = int(status.get("documents", 0))
+    if count <= 0:
+        return CheckResult("RAG 知识库", STATUS_WARN, "知识集合为空（请运行初始化脚本）")
+    return CheckResult("RAG 知识库", STATUS_OK, f"已初始化，{count} 个知识片段")
 
 
 async def check_llm_connectivity() -> CheckResult:

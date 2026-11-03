@@ -38,7 +38,22 @@ def test_reset():
     print("✓ 重置限流状态")
 
 
+def test_key_eviction_bounds_memory():
+    """大量随机 key（如轮换用户 ID）不应导致内存无限增长。"""
+    limiter = RateLimiter(limit=1, window_sec=0.2, max_keys=8)
+    for i in range(50):
+        limiter.check(f"user-{i}")
+    assert len(limiter) <= 8, f"key 数量应被限制在上限内，实际 {len(limiter)}"
+
+    # 窗口过期后再触发一次扫描，过期 key 应被清空
+    time.sleep(0.25)
+    limiter.check("fresh")
+    assert len(limiter) == 1, f"过期 key 应被清理，实际 {len(limiter)}"
+    print("✓ key 数量有上限且过期 key 会被清理")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
+    test_key_eviction_bounds_memory()
     print("\n全部通过")

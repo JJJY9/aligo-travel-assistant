@@ -16,7 +16,12 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from config_agentscope import UsageTrackingModel, create_chat_model
+from config_agentscope import (
+    UsageTrackingModel,
+    create_chat_model,
+    unwrap_usage_model,
+    wrap_usage_tracking,
+)
 
 
 class _FakeModel:
@@ -75,10 +80,30 @@ def test_snapshot_delta():
     print("✓ 快照增量计算正常")
 
 
+def test_per_session_tracking_is_independent():
+    """两个会话包装同一底层模型时，各自的计数互不影响（并发增量不串台）。"""
+    base = UsageTrackingModel(_FakeModel({"input_tokens": 10, "output_tokens": 5, "time": 0.1}))
+    assert unwrap_usage_model(base) is base._model
+    assert unwrap_usage_model(base._model) is base._model
+
+    session_a = wrap_usage_tracking(base)
+    session_b = wrap_usage_tracking(base)
+    asyncio.run(session_a([{"role": "user", "content": "a"}]))
+    assert session_a.usage.total_tokens == 15
+    assert session_b.usage.calls == 0
+    assert base.usage.calls == 0, "共享模型自身的计数器不应被会话调用累加"
+
+    asyncio.run(session_b([{"role": "user", "content": "b"}]))
+    assert session_b.usage.total_tokens == 15
+    assert session_a.usage.total_tokens == 15
+    print("✓ 每个会话的用量计数相互独立")
+
+
 if __name__ == "__main__":
     test_tracks_usage()
     test_missing_usage_counts_call_only()
     test_attribute_delegation()
     test_factory_returns_tracked_model()
     test_snapshot_delta()
+    test_per_session_tracking_is_independent()
     print("\n全部通过")

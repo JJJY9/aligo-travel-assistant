@@ -66,6 +66,7 @@ class ResilienceConfig(TypedDict):
 
 class RateLimitConfig(TypedDict):
     chat_requests: int
+    ip_requests: int
     window_sec: int
 
 
@@ -118,10 +119,13 @@ RESILIENCE_CONFIG: ResilienceConfig = {
     "health_check_timeout_sec": 10.0,      # 健康检查请求超时（秒）
 }
 
-# 对话接口限流（进程内滑动窗口，按 客户端 + 用户；用于本地演示 / 简单防滥用）
-#   CHAT_RATE_LIMIT      窗口内允许的对话请求数（默认 30）
+# 对话接口限流（进程内滑动窗口；用于本地演示 / 简单防滥用）
+#   CHAT_RATE_LIMIT      单个用户（客户端 + 用户 ID）窗口内允许的对话请求数（默认 30）
+#   CHAT_RATE_LIMIT_IP   单个客户端 IP 窗口内允许的对话请求总数（默认 120，用户 ID 由
+#                        请求方提供、可轮换，IP 桶防止通过换 ID 绕过限流）
 #   CHAT_RATE_WINDOW_SEC 窗口长度（秒，默认 60）
 RATE_LIMIT_CONFIG: RateLimitConfig = {
     "chat_requests": _env_int("CHAT_RATE_LIMIT", 30),
+    "ip_requests": _env_int("CHAT_RATE_LIMIT_IP", 120),
     "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
 }
