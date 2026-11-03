@@ -122,6 +122,11 @@ const els = {
   usageTable: byId("usageTable"),
   storageChips: byId("storageChips"),
   knowledgeChip: byId("knowledgeChip"),
+  kbList: byId("kbList"),
+  kbForm: byId("kbForm"),
+  kbContent: byId("kbContent"),
+  kbCategory: byId("kbCategory"),
+  kbSubmit: byId("kbSubmit"),
   toast: byId("toast"),
 };
 
@@ -1888,11 +1893,112 @@ async function refreshKnowledge() {
   }
 }
 
+async function refreshKnowledgeDocuments() {
+  if (!els.kbList) return;
+  els.kbList.textContent = "加载中…";
+  try {
+    const data = await getJSON("/api/knowledge/documents?limit=100");
+    renderKnowledgeDocuments(data.items || [], Number(data.total || 0));
+  } catch (error) {
+    els.kbList.textContent = `知识库不可用：${error.message}`;
+  }
+}
+
+function renderKnowledgeDocuments(items, total) {
+  els.kbList.innerHTML = "";
+  if (total > items.length) {
+    const note = document.createElement("p");
+    note.className = "kb-meta";
+    note.textContent = `共 ${total} 条，显示最新 ${items.length} 条`;
+    els.kbList.appendChild(note);
+  }
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "kb-empty";
+    empty.textContent = "还没有知识片段，可以在下方添加。";
+    els.kbList.appendChild(empty);
+    return;
+  }
+  for (const doc of items) {
+    const row = document.createElement("div");
+    row.className = "pref-row kb-row";
+
+    const main = document.createElement("div");
+    main.className = "kb-main";
+    const text = document.createElement("div");
+    text.className = "kb-text";
+    const content = String(doc.content || "");
+    text.textContent = content.length > 140 ? `${content.slice(0, 140)}…` : content;
+    const meta = document.createElement("div");
+    meta.className = "kb-meta";
+    const bits = [`#${doc.id}`];
+    if (doc.metadata && doc.metadata.category) bits.push(String(doc.metadata.category));
+    if (doc.metadata && doc.metadata.title) bits.push(String(doc.metadata.title));
+    meta.textContent = bits.join(" · ");
+    main.append(text, meta);
+
+    const actions = document.createElement("span");
+    actions.className = "pref-actions";
+    const del = document.createElement("button");
+    del.type = "button";
+    del.title = "删除片段";
+    del.setAttribute("aria-label", `删除知识片段 ${doc.id}`);
+    del.innerHTML = icon("trash");
+    del.addEventListener("click", () => removeKnowledgeDocument(doc.id));
+    actions.appendChild(del);
+
+    row.append(main, actions);
+    els.kbList.appendChild(row);
+  }
+}
+
+async function removeKnowledgeDocument(docId) {
+  if (!window.confirm(`删除知识片段 #${docId}？`)) return;
+  try {
+    await getJSON(`/api/knowledge/documents/${docId}`, { method: "DELETE" });
+    toast("知识片段已删除");
+    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+  } catch (error) {
+    toast(`删除失败：${error.message}`);
+  }
+}
+
+async function addKnowledgeDocument(event) {
+  event.preventDefault();
+  const content = els.kbContent.value.trim();
+  if (!content) {
+    toast("请输入知识内容");
+    return;
+  }
+  const metadata = {};
+  const category = els.kbCategory.value.trim();
+  if (category) metadata.category = category;
+  els.kbSubmit.disabled = true;
+  els.kbSubmit.textContent = "添加中…";
+  try {
+    await getJSON("/api/knowledge/documents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, metadata }),
+    });
+    els.kbContent.value = "";
+    els.kbCategory.value = "";
+    toast("知识片段已添加");
+    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+  } catch (error) {
+    toast(`添加失败：${error.message}`);
+  } finally {
+    els.kbSubmit.disabled = false;
+    els.kbSubmit.textContent = "添加片段";
+  }
+}
+
 function openMemorySheet() {
   els.userIdInput.value = state.userId;
   els.memorySheet.hidden = false;
   refreshStatus();
   refreshKnowledge();
+  refreshKnowledgeDocuments();
 }
 
 function closeMemorySheet() {
@@ -1956,6 +2062,8 @@ function bindEvents() {
   els.stopBtn.addEventListener("click", () => {
     if (state.controller) state.controller.abort();
   });
+
+  els.kbForm.addEventListener("submit", addKnowledgeDocument);
 
   document.addEventListener("click", (event) => {
     const example = event.target.closest("[data-example]");

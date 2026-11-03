@@ -12,6 +12,8 @@ import os
 import re
 import sys
 import uuid
+
+import pytest
 from pathlib import Path
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -808,6 +810,72 @@ def test_knowledge_endpoint():
     print("✓ /api/knowledge 返回知识库状态")
 
 
+def test_knowledge_documents_api(monkeypatch):
+    """知识片段列表接口：透传分页 / 搜索参数（后端 Milvus 由假实现替代）。"""
+    from webapp import server as server_module
+
+    captured = {}
+
+    def fake_list(limit, offset, query):
+        captured.update(limit=limit, offset=offset, query=query)
+        return {"total": 1, "items": [{"id": 7, "content": "住宿标准", "metadata": {}}]}
+
+    monkeypatch.setattr(server_module, "list_documents", fake_list)
+    response = _client().get(
+        "/api/knowledge/documents", params={"limit": 10, "offset": 0, "q": "住宿"}
+    )
+    assert response.status_code == 200
+    assert response.json()["items"][0]["id"] == 7
+    assert captured == {"limit": 10, "offset": 0, "query": "住宿"}
+    print("✓ /api/knowledge/documents 列表接口")
+
+
+def test_knowledge_document_write_api(monkeypatch):
+    """知识片段新增 / 删除接口：参数校验、错误映射与 404。"""
+    from webapp import server as server_module
+
+    calls = {}
+
+    def fake_add(content, metadata):
+        calls["add"] = (content, metadata)
+        return {"status": "success", "id": 7, "total_count": 1}
+
+    monkeypatch.setattr(server_module, "add_document", fake_add)
+    client = _client()
+
+    created = client.post(
+        "/api/knowledge/documents",
+        json={"content": "新知识", "metadata": {"category": "测试"}},
+    )
+    assert created.status_code == 201
+    assert created.json()["id"] == 7
+    assert calls["add"] == ("新知识", {"category": "测试"})
+
+    # 空内容由 Pydantic 拦截
+    assert client.post("/api/knowledge/documents", json={"content": ""}).status_code == 422
+
+    # 业务校验失败 → 400
+    def fake_add_invalid(content, metadata):
+        raise ValueError("知识内容不能为空")
+
+    monkeypatch.setattr(server_module, "add_document", fake_add_invalid)
+    invalid = client.post("/api/knowledge/documents", json={"content": "   "})
+    assert invalid.status_code == 400
+
+    deleted = {}
+
+    def fake_delete(doc_id):
+        deleted["id"] = doc_id
+        return doc_id == 7
+
+    monkeypatch.setattr(server_module, "delete_document", fake_delete)
+    ok = client.delete("/api/knowledge/documents/7")
+    assert ok.status_code == 200 and ok.json()["deleted"] is True
+    assert deleted["id"] == 7
+    assert client.delete("/api/knowledge/documents/8").status_code == 404
+    print("✓ /api/knowledge/documents 新增 / 删除接口")
+
+
 def test_next_trip_from_full_history():
     from datetime import datetime, timedelta
 
@@ -890,6 +958,16 @@ if __name__ == "__main__":
     test_index_page()
     test_health_endpoint()
     test_knowledge_endpoint()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_knowledge_documents_api(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_knowledge_document_write_api(_mp)
+    finally:
+        _mp.undo()
     test_status_endpoint()
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()

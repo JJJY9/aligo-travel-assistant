@@ -48,6 +48,7 @@ from context.storage import (
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
+from utils.knowledge_admin import add_document, delete_document, list_documents
 from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
 from utils.result_formatter import result_to_markdown
@@ -194,6 +195,13 @@ PreferenceValue = (
     | float
     | bool
 )
+
+
+class KnowledgeDocumentPayload(BaseModel):
+    """新增知识片段（记忆面板维护入口）。"""
+
+    content: str = Field(min_length=1, max_length=2000)
+    metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class PreferencePayload(BaseModel):
@@ -676,6 +684,54 @@ def create_app(model: Any = None) -> FastAPI:
     def knowledge() -> dict[str, Any]:
         """知识库状态（集合 / 片段数 / 是否可用）。"""
         return knowledge_status()
+
+    @app.get("/api/knowledge/documents")
+    def knowledge_documents(
+        limit: int = Query(default=20, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        q: str = Query(default="", max_length=100),
+    ) -> dict[str, Any]:
+        """列出知识片段（记忆面板的知识库维护）。"""
+        try:
+            return list_documents(limit=limit, offset=offset, query=q)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{exc}（先运行 python .claude/skills/ask-question/script/init_knowledge_base.py）",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 统一转为 503，避免泄露内部堆栈
+            logger.warning("列出知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
+
+    @app.post("/api/knowledge/documents", status_code=201)
+    def knowledge_add(payload: KnowledgeDocumentPayload) -> dict[str, Any]:
+        """新增知识片段（首次调用会加载嵌入模型，可能需要数秒）。"""
+        try:
+            return add_document(payload.content, payload.metadata)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{exc}（先运行 python .claude/skills/ask-question/script/init_knowledge_base.py）",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
+            logger.warning("添加知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"添加失败：{exc}") from exc
+
+    @app.delete("/api/knowledge/documents/{doc_id}")
+    def knowledge_delete(doc_id: int = ApiPath(..., ge=1)) -> dict[str, Any]:
+        """按 id 删除知识片段。"""
+        try:
+            removed = delete_document(doc_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
+        except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
+            logger.warning("删除知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail="知识片段不存在")
+        return {"id": doc_id, "deleted": True}
 
     @app.get("/api/status")
     def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:

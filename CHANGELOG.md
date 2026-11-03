@@ -23,6 +23,7 @@
 - 会话搜索命中片段支持关键词高亮；记忆面板「最近行程」下方展示常去目的地（Top 5）
 - RAG 回答附带 Top 3 参考片段（140 字截断），便于核对知识来源
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与记忆面板「知识库 · N 片段」；Milvus 客户端抽到 `utils/milvus_client.py` 供 RAG Skill 与状态查询共享
+- 知识库维护：记忆面板查看 / 新增 / 删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可检索，列表按 id 倒序显示最新片段；新增按最大 id 递增，删除后再添加不会与已有主键冲突
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
