@@ -331,11 +331,15 @@ def test_session_search():
         ).json()["sessions"]
         assert [item["session_id"] for item in results] == ["sess-search"]
         assert "杭州" in results[0]["snippet"]
+        assert results[0]["match_index"] == 0, "命中用户消息时返回会话内序号 0"
 
         assistant_hits = client.get(
             "/api/sessions", params={"user_id": user_id, "q": "已记录"}
         ).json()["sessions"]
         assert len(assistant_hits) == 2, "助手消息按渲染后的文本参与搜索"
+        assert all(
+            item["match_index"] == 1 for item in assistant_hits
+        ), "命中助手消息时返回会话内序号 1"
 
         empty = client.get(
             "/api/sessions", params={"user_id": user_id, "q": "不存在的关键词"}

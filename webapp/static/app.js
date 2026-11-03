@@ -1024,7 +1024,9 @@ function renderHistoryItem(session) {
   actions.append(pin, rename, remove);
   item.appendChild(actions);
 
-  item.addEventListener("click", () => openSession(session.session_id));
+  item.addEventListener("click", () =>
+    openSession(session.session_id, { matchIndex: session.match_index }),
+  );
   item.addEventListener("keydown", (event) => {
     if (event.target !== item) return;
     if (event.key === "Enter" || event.key === " ") {
@@ -1150,7 +1152,16 @@ async function openSession(sessionId, options = {}) {
     }
     trimRegenButtons();
     markActiveHistory();
-    scrollToBottom(true);
+    const matchIndex = Number.isInteger(options.matchIndex) ? options.matchIndex : -1;
+    const matchNode =
+      matchIndex >= 0 ? els.messages.querySelectorAll(".msg")[matchIndex] : null;
+    if (matchNode) {
+      matchNode.classList.add("msg-flash");
+      matchNode.scrollIntoView({ block: "center" });
+      setTimeout(() => matchNode.classList.remove("msg-flash"), 1800);
+    } else {
+      scrollToBottom(true);
+    }
     closeMobileSidebar();
   } catch (error) {
     if (!options.silent) toast(`加载会话失败：${error.message}`);
