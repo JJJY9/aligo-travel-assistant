@@ -27,7 +27,7 @@ import time
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -508,6 +508,64 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _ics_date(value: str) -> str | None:
+    """把 YYYY-MM-DD 转为 iCalendar 日期（YYYYMMDD）；非法值返回 None。"""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%Y%m%d")
+    except (TypeError, ValueError):
+        return None
+
+
+def _ics_escape(value: str) -> str:
+    """按 RFC 5545 转义文本字段。"""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def _build_trip_ics(trip: dict[str, Any]) -> str | None:
+    """把一条行程渲染为全天事件的 iCalendar 文本；缺少出发日期时返回 None。"""
+    start = _ics_date(trip.get("start_date") or "")
+    if not start:
+        return None
+    end = _ics_date(trip.get("end_date") or "") or start
+    end_exclusive = (datetime.strptime(end, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+
+    origin = str(trip.get("origin") or "出发地")
+    destination = str(trip.get("destination") or "目的地")
+    purpose = str(trip.get("purpose") or "出行")
+    summary = f"{origin} → {destination}（{purpose}）"
+    description = (
+        f"Aligo 行程：{origin} → {destination}，"
+        f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，{purpose}"
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    uid = f"aligo-{trip.get('trip_id') or 'trip'}-{uuid.uuid4().hex[:8]}@aligo.local"
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Aligo//Travel Assistant//CN",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{stamp}",
+        f"DTSTART;VALUE=DATE:{start}",
+        f"DTEND;VALUE=DATE:{end_exclusive}",
+        f"SUMMARY:{_ics_escape(summary)}",
+        f"DESCRIPTION:{_ics_escape(description)}",
+        "END:VEVENT",
+        "END:VCALENDAR",
+        "",
+    ]
+    return "\r\n".join(lines)
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -788,6 +846,32 @@ def create_app(model: Any = None) -> FastAPI:
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
+            },
+        )
+
+    @app.get("/api/trips/{trip_id}/calendar")
+    def export_trip_calendar(
+        trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> Response:
+        """导出一条行程为 iCalendar（.ics）全天事件。"""
+        data = _load_user_data(user_id)
+        trip = next(
+            (item for item in data["trip_history"] if str(item.get("trip_id")) == trip_id),
+            None,
+        )
+        if trip is None:
+            raise HTTPException(status_code=404, detail="行程不存在")
+        content = _build_trip_ics(trip)
+        if content is None:
+            raise HTTPException(status_code=400, detail="该行程缺少出发日期，无法生成日历")
+        return Response(
+            content=content,
+            media_type="text/calendar; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="aligo_{_safe_filename(trip_id, "trip")}.ics"'
+                )
             },
         )
 
