@@ -54,6 +54,7 @@ const state = {
   kbTotal: 0,
   kbQuery: "",
   kbDeleting: new Set(),
+  kbImporting: false,
 };
 
 function isValidId(value) {
@@ -726,8 +727,12 @@ function buildExportHtml(title, bodyHtml) {
   .footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid var(--line);
     color: var(--ink-3); font-size: 12px; }
   @media print {
-    body { background: #fff; }
+    body { background: #fff; color: #111; }
     .page { margin: 0; padding: 0; box-shadow: none; }
+    .msg.user .bubble { background: #f0f0f0 !important; color: #111 !important; }
+    .msg.assistant .bubble { border-color: #ddd; }
+    .bubble pre { background: #f5f5f5 !important; color: #111 !important; border: 1px solid #ddd; }
+    .bubble a { color: #111; }
     .msg, .bubble { break-inside: avoid; }
   }
 </style>
@@ -755,11 +760,17 @@ function exportSessionHtml() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${exportSafeName(title)}-${new Date().toISOString().slice(0, 10)}.html`;
+  const now = new Date();
+  const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    "0",
+  )}-${String(now.getDate()).padStart(2, "0")}`;
+  link.download = `${exportSafeName(title)}-${localDate}.html`;
   document.body.appendChild(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  // 下载是异步读取 Blob 的，稍后再释放，避免 Firefox / Safari 取消下载
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
   toast("HTML 已导出");
 }
 
@@ -1520,6 +1531,7 @@ function renderOverview() {
     els.trips.innerHTML = "";
     els.destinations.innerHTML = "";
     els.upcoming.hidden = true;
+    els.exportTrips.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
     els.usageAgents.innerHTML = "";
@@ -1911,6 +1923,7 @@ function startEditPreference(row, type, currentValue) {
   };
 
   input.addEventListener("keydown", (event) => {
+    event.stopPropagation();
     if (event.isComposing) return;
     if (event.key === "Enter") {
       event.preventDefault();
@@ -2215,40 +2228,43 @@ async function addKnowledgeDocument(event) {
 const KB_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
 
 async function importKnowledgeFile() {
-  const file = els.kbImportFile.files && els.kbImportFile.files[0];
-  els.kbImportFile.value = "";
-  if (!file) return;
-  if (file.size > KB_IMPORT_MAX_BYTES) {
-    toast("JSON 文件不能超过 2 MB");
-    return;
-  }
-  let data;
-  try {
-    data = JSON.parse(await file.text());
-  } catch {
-    toast("无法解析 JSON 文件");
-    return;
-  }
-  const documents = Array.isArray(data)
-    ? data
-    : data && Array.isArray(data.documents)
-      ? data.documents
-      : null;
-  if (!documents || !documents.length) {
-    toast("文件中没有知识片段（需要 documents 数组）");
-    return;
-  }
-  if (documents.length > 16384) {
-    toast("单次最多导入 16384 条知识片段");
-    return;
-  }
-  if (!window.confirm(`导入 ${documents.length} 条知识片段？`)) return;
+  if (state.kbImporting) return;
+  state.kbImporting = true;
   els.kbImport.disabled = true;
-  els.kbImport.textContent = "导入中…";
+  let imported = 0;
+  let skipped = 0;
   try {
+    const file = els.kbImportFile.files && els.kbImportFile.files[0];
+    els.kbImportFile.value = "";
+    if (!file) return;
+    if (file.size > KB_IMPORT_MAX_BYTES) {
+      toast("JSON 文件不能超过 2 MB");
+      return;
+    }
+    let data;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      toast("无法解析 JSON 文件");
+      return;
+    }
+    const documents = Array.isArray(data)
+      ? data
+      : data && Array.isArray(data.documents)
+        ? data.documents
+        : null;
+    if (!documents || !documents.length) {
+      toast("文件中没有知识片段（需要 documents 数组）");
+      return;
+    }
+    if (documents.length > 16384) {
+      toast("单次最多导入 16384 条知识片段");
+      return;
+    }
+    if (!window.confirm(`导入 ${documents.length} 条知识片段？`)) return;
+
+    els.kbImport.textContent = "导入中…";
     // 接口单次最多 200 条；导出文件可能更大，按批上传保证备份可完整恢复
-    let imported = 0;
-    let skipped = 0;
     for (let start = 0; start < documents.length; start += 200) {
       const batch = documents.slice(start, start + 200);
       const result = await getJSON("/api/knowledge/import", {
@@ -2266,8 +2282,14 @@ async function importKnowledgeFile() {
     toast(`已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}`);
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
-    toast(error.message);
+    if (imported > 0) {
+      toast(`已导入 ${imported} 条后失败：${error.message}（重试会跳过已导入内容）`);
+      await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+    } else {
+      toast(error.message);
+    }
   } finally {
+    state.kbImporting = false;
     els.kbImport.disabled = false;
     els.kbImport.textContent = "导入 JSON";
   }
@@ -2322,7 +2344,7 @@ function memorySheetFocusable() {
 }
 
 function trapMemorySheetFocus(event) {
-  if (event.key !== "Tab") return;
+  if (event.key !== "Tab" || els.memorySheet.hidden) return;
   const focusable = memorySheetFocusable();
   if (!focusable.length) return;
   const first = focusable[0];
@@ -2351,10 +2373,14 @@ function openMemorySheet() {
 function closeMemorySheet() {
   if (els.memorySheet.hidden) return;
   els.memorySheet.hidden = true;
-  if (memorySheetOpener && memorySheetOpener.isConnected) {
-    memorySheetOpener.focus();
-  }
+  const opener = memorySheetOpener;
   memorySheetOpener = null;
+  if (opener && opener.isConnected && !opener.hidden) {
+    opener.focus();
+    return;
+  }
+  // 触发按钮已被移除或隐藏时回到输入框，避免焦点落到 body
+  els.input?.focus();
 }
 
 async function saveUser() {
@@ -2479,7 +2505,9 @@ function bindEvents() {
 
   byId("openMemory").addEventListener("click", openMemorySheet);
   els.closeMemory.addEventListener("click", closeMemorySheet);
-  els.memorySheet.addEventListener("keydown", trapMemorySheetFocus);
+  // Tab 监听绑在 document：面板内元素被重渲染 / 禁用导致焦点回到 body 时，
+  // 下一次 Tab 仍会被拉回面板（绑在面板上会收不到事件）
+  document.addEventListener("keydown", trapMemorySheetFocus);
   els.memorySheet.addEventListener("click", (event) => {
     if (event.target === els.memorySheet) closeMemorySheet();
   });
