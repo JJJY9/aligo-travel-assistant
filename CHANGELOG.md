@@ -28,6 +28,7 @@
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1 / hit@3 / hit@5 与 MRR（只检索、不调用大模型），知识库未初始化时提示跳过，hit@5 低于 80% 退出码 1
 - 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
 - 知识库导出 / 导入：`GET /api/knowledge/export` 下载 JSON 备份，`POST /api/knowledge/import` 批量导入（单次最多 200 条，超长字段自动截断）；记忆面板新增「导出知识库 / 导入 JSON」；CLI 对应 `python cli.py kb-export [path]` 与 `kb-import <file>`
+- 行程管理：记忆面板可删除误记录的行程（`DELETE /api/trips/{id}`），JSON / PostgreSQL 同步更新统计与常去目的地
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
@@ -38,6 +39,7 @@
 - 对话接口错误详情附带请求 ID，便于定位日志
 - 前端静态资源版本号更新为 1.3.0（`style.css` / `app.js` / `theme.js`）
 - 限流新增客户端 IP 维度：`CHAT_RATE_LIMIT_IP`（默认 120 次/窗口），用户 ID 由请求方提供、可轮换，IP 桶防止绕过
+- 写入行程时按现有最大 `trip_N` 序号递增（此前按条数生成，配合删除功能会与已有行程 id 冲突）
 
 ### 修复
 - 偏好追加时若存量与新值相同（字符串 → 列表），不再产生重复项（如「汉庭、汉庭」）
@@ -75,6 +77,7 @@
 - 新增知识库导出（排序 / 不含 id）与导入（跳过空项 / 截断超长字段 / 空导入 / 未初始化）用例、导出下载头与导入参数校验接口用例
 - 新增 CLI `kb-export` / `kb-import` 用例（导出文件 / 未初始化 / 文件缺失 / 格式错误 / 批量上限 / 纯数组格式）
 - 会话搜索用例增加命中消息序号断言（用户消息 0 / 助手消息 1）
+- 新增行程删除用例（JSON 统计 / 常去目的地递减、删除后新增 id 不与已有记录冲突；PostgreSQL 同步断言）与 `DELETE /api/trips/{id}` 接口用例
 - CI 回归测试附加覆盖率报告（`pytest-cov`，仅展示不设阈值；本地全量环境覆盖率更高）
 
 ## [1.3.0] - 2026-11-03

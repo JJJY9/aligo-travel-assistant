@@ -9,6 +9,7 @@ PostgreSQL 长期记忆后端
 - 偏好值以 JSONB 存储（字符串 / 列表等类型原样保留）。
 """
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -283,11 +284,7 @@ class PostgresLongTermMemory:
     # ---------- 历史行程 ----------
 
     def save_trip_history(self, trip_info: dict[str, Any]) -> None:
-        row = self._fetchone(
-            "SELECT COUNT(*) FROM aligo_trips WHERE user_id = %s",
-            (self.user_id,),
-        )
-        trip_number = int(row[0]) + 1 if row else 1
+        trip_number = self._next_trip_number()
         self._execute(
             """
             INSERT INTO aligo_trips
@@ -305,6 +302,32 @@ class PostgresLongTermMemory:
                 trip_info.get("session_id"),
             ),
         )
+
+    def _next_trip_number(self) -> int:
+        """下一个行程序号：现有最大 trip_N 的 N + 1（删除后不复用）。"""
+        rows = self._fetchall(
+            "SELECT trip_id FROM aligo_trips WHERE user_id = %s", (self.user_id,)
+        )
+        max_number = 0
+        for (trip_id,) in rows:
+            match = re.fullmatch(r"trip_(\d+)", str(trip_id or ""))
+            if match:
+                max_number = max(max_number, int(match.group(1)))
+        return max_number + 1
+
+    def delete_trip(self, trip_id: str) -> bool:
+        """删除一条历史行程；返回是否删除（统计由查询动态计算）。"""
+        row = self._fetchone(
+            "SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
+            (self.user_id, trip_id),
+        )
+        if not row:
+            return False
+        self._execute(
+            "DELETE FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
+            (self.user_id, trip_id),
+        )
+        return True
 
     def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
         base = (

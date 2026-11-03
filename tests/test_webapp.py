@@ -471,6 +471,46 @@ def test_status_trips():
         _cleanup(user_id)
 
 
+def test_delete_trip_api():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trip_del")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for destination in ("上海", "杭州"):
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": destination,
+                        "start_date": "2026-11-09",
+                        "end_date": "2026-11-11",
+                        "purpose": "出差",
+                    }
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        deleted = client.delete(
+            "/api/trips/trip_1", params={"user_id": user_id}
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted"] is True
+
+        again = client.delete("/api/trips/trip_1", params={"user_id": user_id})
+        assert again.status_code == 404
+
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["trip_count"] == 1
+        assert status["trips"][0]["destination"] == "杭州"
+        print("✓ /api/trips/{id} 删除行程（404 / 统计同步）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -1096,6 +1136,7 @@ if __name__ == "__main__":
     test_status_usage_totals()
     test_preferences_api()
     test_status_trips()
+    test_delete_trip_api()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()

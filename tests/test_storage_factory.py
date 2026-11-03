@@ -97,6 +97,47 @@ def test_long_term_delete_preference():
     print("✓ 长期记忆删除偏好")
 
 
+def test_trip_history_delete_and_ids():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-trip", tempfile.mkdtemp())
+    for destination in ("上海", "上海", "杭州"):
+        memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": destination,
+                "start_date": "2026-11-09",
+                "end_date": "2026-11-11",
+                "purpose": "出差",
+            }
+        )
+    trips = memory.get_trip_history(limit=None)
+    assert [trip["trip_id"] for trip in trips] == ["trip_1", "trip_2", "trip_3"]
+
+    assert memory.delete_trip("trip_2") is True
+    assert memory.delete_trip("trip_2") is False
+    stats = memory.get_statistics()
+    assert stats["total_trips"] == 2
+    assert stats["frequent_destinations"] == {"上海": 1, "杭州": 1}
+
+    # 删除中间片段后新增：id 必须大于现有最大 id（trip_3），不能与已有记录冲突
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "广州",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+    )
+    ids = [trip["trip_id"] for trip in memory.get_trip_history(limit=None)]
+    assert ids == ["trip_1", "trip_3", "trip_4"], "删除后新增按现有最大 id 递增"
+
+    assert memory.delete_trip("trip_3") is True
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 1, "广州": 1}
+    print("✓ 行程删除同步统计，新增 id 不与已有记录冲突")
+
+
 def test_session_titles():
     from context.long_term_memory import LongTermMemory
 
@@ -245,6 +286,7 @@ if __name__ == "__main__":
     test_memory_manager_uses_factory()
     test_long_term_delete_session()
     test_long_term_delete_preference()
+    test_trip_history_delete_and_ids()
     test_session_titles()
     test_session_pinned()
     test_add_message_preserves_metadata()

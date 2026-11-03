@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -377,7 +378,7 @@ class LongTermMemory:
             trip_info: 行程信息
         """
         trip_record = {
-            "trip_id": f"trip_{len(self.data['trip_history']) + 1}",
+            "trip_id": self._next_trip_id(),
             "timestamp": datetime.now().isoformat(),
             **trip_info
         }
@@ -395,6 +396,34 @@ class LongTermMemory:
 
         self._save()
         logger.info(f"Saved trip history: {trip_record['trip_id']}")
+
+    def _next_trip_id(self) -> str:
+        """下一个行程 id：现有最大序号 + 1（删除后不复用，避免与统计/会话关联错乱）。"""
+        max_number = 0
+        for trip in self.data.get("trip_history", []):
+            match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
+            if match:
+                max_number = max(max_number, int(match.group(1)))
+        return f"trip_{max_number + 1}"
+
+    def delete_trip(self, trip_id: str) -> bool:
+        """删除一条历史行程并同步统计；返回是否删除。"""
+        trips = self.data.get("trip_history", [])
+        for index, trip in enumerate(trips):
+            if str(trip.get("trip_id", "")) == str(trip_id):
+                removed = trips.pop(index)
+                stats = self.data.setdefault("statistics", {})
+                stats["total_trips"] = max(0, int(stats.get("total_trips", 0)) - 1)
+                destination = removed.get("destination")
+                frequent = stats.setdefault("frequent_destinations", {})
+                if destination and destination in frequent:
+                    frequent[destination] = int(frequent[destination]) - 1
+                    if frequent[destination] <= 0:
+                        del frequent[destination]
+                self._save()
+                logger.info(f"Deleted trip history: {trip_id}")
+                return True
+        return False
 
     def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
         """

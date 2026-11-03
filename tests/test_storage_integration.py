@@ -117,6 +117,14 @@ def test_postgres_long_term_memory():
         assert stats["total_queries"] == 2
         assert stats["frequent_destinations"] == {"上海": 2}
 
+        assert memory.delete_trip("trip_1") is True
+        assert memory.delete_trip("trip_1") is False
+        assert memory.get_frequent_destinations(1) == [("上海", 1)]
+        memory.save_trip_history({"origin": "上海", "destination": "杭州", "purpose": "出差"})
+        newest = memory.get_trip_history(1)[0]
+        assert newest["trip_id"] == "trip_3", "删除后新增按现有最大 id（trip_2）递增"
+        assert memory.get_statistics()["total_trips"] == 2
+
         assert memory.delete_chat_session("s1") == 2
         assert memory.get_chat_history(session_id="s1") == []
         assert memory.get_session_titles() == {}

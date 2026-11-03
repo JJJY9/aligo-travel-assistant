@@ -1515,9 +1515,11 @@ function renderOverview() {
         });
       }
 
+      const actions = document.createElement("span");
+      actions.className = "trip-actions";
+
       const calendar = document.createElement("button");
       calendar.type = "button";
-      calendar.className = "trip-calendar";
       calendar.title = "加入日历（.ics）";
       calendar.setAttribute("aria-label", "加入日历");
       calendar.innerHTML = icon("calendar");
@@ -1530,7 +1532,33 @@ function renderOverview() {
           "_blank",
         );
       });
-      row.appendChild(calendar);
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.title = "删除行程";
+      remove.setAttribute("aria-label", `删除行程 ${path.textContent}`);
+      remove.innerHTML = icon("trash");
+      remove.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        if (!window.confirm(`删除行程「${path.textContent}」？`)) return;
+        remove.disabled = true;
+        try {
+          await getJSON(
+            `/api/trips/${encodeURIComponent(trip.trip_id)}?user_id=${encodeURIComponent(
+              state.userId,
+            )}`,
+            { method: "DELETE" },
+          );
+          toast("行程已删除");
+          await refreshStatus();
+        } catch (error) {
+          toast(error.message);
+          remove.disabled = false;
+        }
+      });
+
+      actions.append(calendar, remove);
+      row.appendChild(actions);
 
       els.trips.appendChild(row);
     });
