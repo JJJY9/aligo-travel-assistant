@@ -181,9 +181,24 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
+    # 按内容去重：重复导入同一备份（或分批中断后重试）不会产生重复片段
+    existing = {
+        str(item.get("content", "")).strip()
+        for item in list_documents(limit=_MAX_SCAN)["items"]
+    }
+    unique: list[dict[str, Any]] = []
+    for item in cleaned:
+        if item["content"] in existing:
+            skipped += 1
+            continue
+        existing.add(item["content"])
+        unique.append(item)
+    if not unique:
+        return {"imported": 0, "skipped": skipped}
+
     agent = _get_agent()
     with _WRITE_LOCK:
-        result = agent.add_documents(cleaned)
+        result = agent.add_documents(unique)
     if result.get("status") != "success":
         raise RuntimeError(str(result.get("message") or "导入知识片段失败"))
     return {"imported": len(result.get("ids") or []), "skipped": skipped}

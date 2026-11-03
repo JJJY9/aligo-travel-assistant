@@ -173,6 +173,9 @@ def test_import_documents_sanitizes(monkeypatch):
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin, "list_documents", lambda limit, offset=0: {"total": 0, "items": []}
+    )
     agent = _FakeAgent({"status": "success", "ids": [1, 2], "total_count": 2})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
 
@@ -194,6 +197,30 @@ def test_import_documents_sanitizes(monkeypatch):
     assert len(sent[1]["metadata"]) == 10
     assert max(len(value) for value in sent[1]["metadata"].values()) == 200
     print("✓ 导入知识片段（跳过空项 / 截断超长字段）")
+
+
+def test_import_skips_existing_and_duplicate_content(monkeypatch):
+    """已有内容与同批次重复内容都跳过，重复导入同一备份不会产生重复片段。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset=0: {
+            "total": 1,
+            "items": [{"id": 1, "content": "已有内容", "metadata": {}}],
+        },
+    )
+    agent = _FakeAgent({"status": "success", "ids": [2], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    result = knowledge_admin.import_documents(
+        [{"content": "已有内容"}, {"content": "新内容"}, {"content": "新内容"}]
+    )
+    assert result == {"imported": 1, "skipped": 2}
+    assert [item["content"] for item in agent.calls[0]] == ["新内容"]
+    print("✓ 导入按内容去重（已有 / 同批次重复）")
 
 
 def test_import_empty_and_missing_db(monkeypatch):
@@ -221,6 +248,7 @@ if __name__ == "__main__":
         test_search_documents_delegates_to_agent,
         test_export_documents_sorted_and_stripped,
         test_import_documents_sanitizes,
+        test_import_skips_existing_and_duplicate_content,
         test_import_empty_and_missing_db,
     ):
         mp = pytest.MonkeyPatch()
