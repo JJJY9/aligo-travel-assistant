@@ -571,6 +571,19 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 pytest tests/ -q
 ```
 
+主要测试覆盖：
+
+| 范围 | 文件 |
+|------|------|
+| Web API / SSE / 会话 / 导出 / 知识库接口 / 自检 | `test_webapp.py` |
+| 编排调度与记忆更新 | `test_orchestration_unit.py`、`test_orchestration.py` |
+| 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py` |
+| 知识库维护与状态 | `test_knowledge_admin*.py`、`test_knowledge_stats.py` |
+| 检索评测与 CLI 退出码 | `test_rag_eval.py`、`test_cli_eval.py` |
+| CLI 知识库 / 行程命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py` |
+| Milvus 客户端 | `test_milvus_client.py` |
+| 偏好抽取 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_access_log.py`、`test_rate_limit.py`、`test_progress.py` 等 |
+
 ### 端到端测试（需要真实大模型）
 
 ```bash
@@ -603,7 +616,10 @@ mypy .         # 类型检查
 ```
 aligo-travel-assistant/
 ├── .github/
-│   ├── workflows/ci.yml             # CI：ruff + mypy + pytest
+│   ├── workflows/
+│   │   ├── ci.yml                   # CI：ruff + mypy + pytest（覆盖率 / wheel 打包检查）
+│   │   └── release.yml              # 打 tag 时构建并发布 wheel / sdist
+│   ├── dependabot.yml               # 依赖更新
 │   ├── ISSUE_TEMPLATE/              # Issue 模板（Bug / 功能建议）
 │   └── pull_request_template.md     # PR 模板
 ├── agents/                          # 核心编排层
@@ -633,8 +649,12 @@ aligo-travel-assistant/
 │   ├── progress.py                  # 智能体进度事件 → CLI 文本
 │   ├── exporter.py                  # 用户数据导出（JSON / Markdown）
 │   ├── rate_limit.py                # 对话接口进程内滑动窗口限流
-│   ├── milvus_client.py             # 进程内共享 Milvus Lite 客户端
+│   ├── milvus_client.py             # 进程内共享 Milvus Lite 客户端（含首次打开重试）
+│   ├── knowledge_paths.py           # 知识库路径 / 集合名统一解析
 │   ├── knowledge_stats.py           # 知识库集合 / 片段数状态
+│   ├── knowledge_admin.py           # 知识片段列表 / 新增 / 删除 / 导出导入
+│   ├── rag_eval.py                  # RAG 检索离线评测（hit@K / MRR）
+│   ├── access_log.py                # 访问日志格式化（文本 / JSON lines）
 │   ├── text_chunker.py              # RAG 文本按小节切分
 │   ├── doctor.py                    # 环境自检
 │   └── skill_loader.py              # SKILL.md 加载器
@@ -656,6 +676,9 @@ aligo-travel-assistant/
 ├── requirements.txt                 # 运行依赖
 ├── requirements-ci.txt              # CI 轻量依赖
 ├── CONTRIBUTING.md                  # 贡献指南
+├── SECURITY.md                      # 安全策略（漏洞报告 / 部署提示）
+├── CHANGELOG.md                     # 更新日志
+├── .env.example                     # 环境变量示例（LLM / 存储 / 限流 / 日志）
 └── README.md                        # 本文件
 ```
 
