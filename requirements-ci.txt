@@ -12,8 +12,8 @@ greenlet==3.5.6
 tqdm==4.70.1
 mcp==1.30.0
 
-# 测试与检查工具
-pytest>=8
-pytest-asyncio>=0.23
-ruff
-mypy
+# 测试与检查工具（锁定版本，保证本地与 CI 结果一致）
+pytest==9.2.0
+pytest-asyncio==1.4.1
+ruff==0.17.3
+mypy==2.4.1
