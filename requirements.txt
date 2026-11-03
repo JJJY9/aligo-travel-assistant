@@ -13,7 +13,7 @@ requests==2.34.2
 # 从 2.x 升级时，旧版 milvus_lite.db 文件与 3.x 不兼容，需删除后重新初始化知识库。
 pymilvus[milvus_lite]==2.6.9; sys_platform != "win32"
 pymilvus==3.0.2; sys_platform == "win32"
-milvus-lite==3.2.1; sys_platform == "win32"
+milvus-lite==3.2.2; sys_platform == "win32"
 sentence-transformers==5.2.3
 
 # CLI 界面
