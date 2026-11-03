@@ -313,7 +313,7 @@ class LongTermMemory:
         self._save()
         logger.info(f"Saved trip history: {trip_record['trip_id']}")
 
-    def get_trip_history(self, limit: int = 10) -> list[dict[str, Any]]:
+    def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
         """
         获取历史行程
 

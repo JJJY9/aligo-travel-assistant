@@ -3,6 +3,7 @@
 统一管理两层记忆，提供简单的API
 """
 import logging
+from datetime import datetime
 from typing import Any
 
 from .long_term_memory import LongTermMemory
@@ -81,6 +82,18 @@ class MemoryManager:
                 "frequent_destinations": self.long_term.get_frequent_destinations(3),
                 "statistics": self.long_term.get_statistics()
             }
+        }
+
+    def export_data(self) -> dict[str, Any]:
+        """导出当前用户的长期记忆数据（偏好 / 行程 / 对话历史 / 统计）。"""
+        return {
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "exported_at": datetime.now().isoformat(),
+            "preferences": self.long_term.get_preference(),
+            "trip_history": self.long_term.get_trip_history(limit=None),
+            "chat_history": self.long_term.get_chat_history(),
+            "statistics": self.long_term.get_statistics(),
         }
 
     def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
