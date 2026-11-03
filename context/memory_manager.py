@@ -58,6 +58,11 @@ class MemoryManager:
         # 添加到短期记忆（当前会话）
         self.short_term.add_message(role, content, metadata)
 
+        # JSON 后端持有内存快照：写入前重新加载，避免本轮对话期间通过记忆面板
+        # 写入的标题 / 置顶 / 偏好被旧快照覆盖；PostgreSQL 直接查询，无需重载。
+        if getattr(self.long_term, "snapshot_based", True):
+            self.long_term = create_long_term_memory(self.user_id, self._storage_path)
+
         # 同时添加到长期记忆（跨会话持久化）
         self.long_term.add_chat_message(role, content, self.session_id)
 
@@ -97,6 +102,8 @@ class MemoryManager:
             "preferences": self.long_term.get_preference(),
             "trip_history": self.long_term.get_trip_history(limit=None),
             "chat_history": self.long_term.get_chat_history(),
+            "session_titles": self.long_term.get_session_titles(),
+            "pinned_sessions": self.long_term.get_pinned_sessions(),
             "statistics": self.long_term.get_statistics(),
         }
 

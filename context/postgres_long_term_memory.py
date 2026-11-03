@@ -388,6 +388,8 @@ class PostgresLongTermMemory:
     def clear_history(self) -> None:
         self._execute("DELETE FROM aligo_chat_messages WHERE user_id = %s", (self.user_id,))
         self._execute("DELETE FROM aligo_trips WHERE user_id = %s", (self.user_id,))
+        self._execute("DELETE FROM aligo_session_titles WHERE user_id = %s", (self.user_id,))
+        self._execute("DELETE FROM aligo_pinned_sessions WHERE user_id = %s", (self.user_id,))
 
     def delete_all(self) -> None:
         for table in (
@@ -395,6 +397,8 @@ class PostgresLongTermMemory:
             "aligo_trips",
             "aligo_preferences",
             "aligo_user_stats",
+            "aligo_session_titles",
+            "aligo_pinned_sessions",
         ):
             self._execute(f"DELETE FROM {table} WHERE user_id = %s", (self.user_id,))
 
