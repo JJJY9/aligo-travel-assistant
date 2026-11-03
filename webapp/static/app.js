@@ -119,6 +119,14 @@ const els = {
   overview: byId("overview"),
   trips: byId("trips"),
   exportTrips: byId("exportTrips"),
+  addTripBtn: byId("addTripBtn"),
+  tripForm: byId("tripForm"),
+  tripOrigin: byId("tripOrigin"),
+  tripDestination: byId("tripDestination"),
+  tripStart: byId("tripStart"),
+  tripEnd: byId("tripEnd"),
+  tripPurpose: byId("tripPurpose"),
+  tripSubmit: byId("tripSubmit"),
   destinations: byId("destinations"),
   stats: byId("stats"),
   usageStats: byId("usageStats"),
@@ -679,6 +687,39 @@ function triggerExport() {
     )}`,
     "_blank",
   );
+}
+
+async function addTrip(event) {
+  event.preventDefault();
+  const destination = els.tripDestination.value.trim();
+  const startDate = els.tripStart.value;
+  if (!destination || !startDate) {
+    toast("请填写目的地与出发日期");
+    return;
+  }
+  els.tripSubmit.disabled = true;
+  try {
+    await getJSON("/api/trips", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: state.userId,
+        origin: els.tripOrigin.value.trim(),
+        destination,
+        start_date: startDate,
+        end_date: els.tripEnd.value || null,
+        purpose: els.tripPurpose.value.trim() || "出差",
+      }),
+    });
+    toast("行程已添加");
+    els.tripForm.reset();
+    els.tripForm.hidden = true;
+    await refreshStatus();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    els.tripSubmit.disabled = false;
+  }
 }
 
 function exportSafeName(text) {
@@ -2541,6 +2582,11 @@ function bindEvents() {
       "_blank",
     );
   });
+  els.addTripBtn.addEventListener("click", () => {
+    els.tripForm.hidden = !els.tripForm.hidden;
+    if (!els.tripForm.hidden) els.tripDestination.focus();
+  });
+  els.tripForm.addEventListener("submit", addTrip);
 
   els.menuBtn.addEventListener("click", toggleSidebar);
   els.collapseSidebar.addEventListener("click", toggleSidebar);

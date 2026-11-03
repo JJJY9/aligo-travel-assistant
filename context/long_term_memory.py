@@ -429,8 +429,8 @@ class LongTermMemory:
         return list(self.data.get("pinned_sessions") or [])
 
     @_locked_mutation
-    def save_trip_history(self, trip_info: dict[str, Any]):
-        """保存行程历史。
+    def save_trip_history(self, trip_info: dict[str, Any]) -> str:
+        """保存行程历史，返回 trip_id。
 
         同路线 + 同起止日期的行程视为重复记录（多次对话规划同一趟行程），
         更新既有记录而不是追加，避免行程 / 统计 / 日历重复。
@@ -444,7 +444,7 @@ class LongTermMemory:
             existing["timestamp"] = datetime.now().isoformat()
             self._save()
             logger.info(f"Updated existing trip history: {existing.get('trip_id')}")
-            return
+            return str(existing.get("trip_id") or "")
 
         trip_record = {
             "trip_id": self._next_trip_id(),
@@ -465,6 +465,7 @@ class LongTermMemory:
 
         self._save()
         logger.info(f"Saved trip history: {trip_record['trip_id']}")
+        return str(trip_record["trip_id"])
 
     def _find_same_trip(self, trip_info: dict[str, Any]) -> dict[str, Any] | None:
         """查找同路线、同起止日期的既有行程（无出发日期时不参与去重）。"""

@@ -1188,3 +1188,18 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   cursor: pointer;
 }
 .trip-export:hover { text-decoration: underline; }
+
+/* 手动添加行程表单 */
+.trip-form { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 10px; }
+.trip-form-row { display: flex; gap: 6px; }
+.trip-form-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12.5px;
+}
+.trip-form-row .ghost { flex: none; }
