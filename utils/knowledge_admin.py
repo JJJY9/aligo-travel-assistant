@@ -145,6 +145,25 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     }
 
 
+def update_document(
+    doc_id: int, content: str, metadata: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """按 id 覆盖更新知识片段（重新嵌入）；片段不存在时抛 LookupError。"""
+    text = content.strip()
+    if not text:
+        raise ValueError("知识内容不能为空")
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    agent = _get_agent()
+    with _WRITE_LOCK:
+        if not _exists(client, int(doc_id)):
+            raise LookupError("知识片段不存在")
+        result = agent.update_document(int(doc_id), text, dict(metadata or {}))
+    if result.get("status") != "success":
+        raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
+    return {"status": "success", "id": int(doc_id)}
+
+
 def export_documents() -> list[dict[str, Any]]:
     """导出全部知识片段（按 id 升序，便于备份 / 迁移；不含 id）。"""
     data = list_documents(limit=_MAX_SCAN, offset=0)

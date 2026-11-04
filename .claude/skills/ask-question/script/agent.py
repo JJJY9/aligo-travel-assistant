@@ -231,6 +231,32 @@ class RAGKnowledgeAgent(AgentBase):
             logger.error(f"Error adding documents: {e}")
             return {"status": "error", "message": str(e)}
 
+    def update_document(
+        self, document_id: int, content: str, metadata: dict | None = None
+    ) -> dict:
+        """按 id 覆盖更新一个知识片段（重新计算向量后 upsert）。"""
+        if not self.initialized:
+            return {"status": "error", "message": "RAG Agent not initialized"}
+        try:
+            self._ensure_connection()
+            embedding = self.embedding_model.encode(content).tolist()
+            self.milvus_client.upsert(
+                collection_name=self.collection_name,
+                data=[
+                    {
+                        "id": int(document_id),
+                        "vector": embedding,
+                        "content": content,
+                        "metadata": json.dumps(metadata or {}, ensure_ascii=False),
+                    }
+                ],
+            )
+            logger.info(f"Successfully updated document {document_id}")
+            return {"status": "success", "id": int(document_id)}
+        except Exception as e:
+            logger.error(f"Error updating document: {e}")
+            return {"status": "error", "message": str(e)}
+
     def _next_document_id(self) -> int:
         """返回下一个可用的文档 id（现有最大 id + 1，空集合从 1 开始）。
 

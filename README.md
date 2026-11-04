@@ -18,9 +18,9 @@
 | **记忆与用量面板**（行程 / 统计 / 7 天趋势） | **欢迎页**（会话搜索 / 置顶） |
 | ![记忆与用量面板](docs/screenshots/webui-memory.jpg) | ![欢迎页](docs/screenshots/webui-welcome.jpg) |
 
-![知识库维护：查看 / 新增 / 删除知识片段](docs/screenshots/webui-knowledge.jpg)
+![知识库维护：查看 / 新增 / 编辑 / 删除知识片段](docs/screenshots/webui-knowledge.jpg)
 
-*知识库维护：在记忆面板中查看、新增、删除 RAG 知识片段，新增后立即可被检索。*
+*知识库维护：在记忆面板中查看、新增、编辑、删除 RAG 知识片段，新增 / 编辑后立即可被检索。*
 
 界面为 **FastAPI + 无构建前端**（原生 HTML / CSS / JS，无需 Node），支持流式执行进度、
 会话搜索 / 重命名 / 置顶、记忆与用量面板、知识库维护、深浅主题与移动端布局，启动方式见「Web 界面」小节。
@@ -43,7 +43,7 @@
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
-- 知识库维护：记忆面板可搜索 / 分页查看、新增、删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），支持导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 200 条，Web 导入自动分批、CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
+- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`），支持导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 200 条，Web 导入自动分批、CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归
 
 ### ⚡ 优先级并行调度
@@ -540,6 +540,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q`，按 id 倒序） |
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
+| PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404） |
 | DELETE | `/api/knowledge/documents/{id}` | 删除知识片段 |
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 200 条） |
@@ -655,7 +656,7 @@ aligo-travel-assistant/
 │   ├── milvus_client.py             # 进程内共享 Milvus Lite 客户端（含首次打开重试）
 │   ├── knowledge_paths.py           # 知识库路径 / 集合名统一解析
 │   ├── knowledge_stats.py           # 知识库集合 / 片段数状态
-│   ├── knowledge_admin.py           # 知识片段列表 / 新增 / 删除 / 导出导入
+│   ├── knowledge_admin.py           # 知识片段列表 / 新增 / 更新 / 删除 / 导出导入
 │   ├── rag_eval.py                  # RAG 检索离线评测（hit@K / MRR）
 │   ├── access_log.py                # 访问日志格式化（文本 / JSON lines）
 │   ├── text_chunker.py              # RAG 文本按小节切分
