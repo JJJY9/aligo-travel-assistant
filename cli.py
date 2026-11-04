@@ -976,11 +976,13 @@ def run_rag_eval_standalone(min_hit5: float = 0.8) -> int:
     return 0
 
 
-def run_knowledge_export_standalone(target: str | None = None) -> int:
-    """导出知识库为 JSON 文件（用于 `python cli.py kb-export [path]`）。
+def run_knowledge_export_standalone(
+    target: str | None = None, force: bool = False
+) -> int:
+    """导出知识库为 JSON 文件（用于 `python cli.py kb-export [path] [--force]`）。
 
     Returns:
-        0 导出成功；1 知识库不可用或写入失败
+        0 导出成功；1 参数 / 知识库不可用 / 文件已存在 / 写入失败
     """
     from pathlib import Path
 
@@ -1006,6 +1008,11 @@ def run_knowledge_export_standalone(target: str | None = None) -> int:
         "documents": documents,
     }
     path = Path(target) if target else Path("exports") / "knowledge-export.json"
+    # 与 trips-export / session-export 一致：默认不覆盖已有文件，
+    # 避免把用户数据（如误把 data/memory/*.json 当作导出路径）静默替换
+    if path.exists() and not force:
+        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+        return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -1246,6 +1253,26 @@ def _open_cli_store(user_id: str):
     return store
 
 
+def _local_timestamp_text(value: str) -> str:
+    """把 ISO 时间转换为本地时区的展示文本。
+
+    PostgreSQL 返回带时区的 UTC 时间，JSON 后端存本地 naive 时间；直接截断
+    ISO 字符串会让同一条会话在两种后端下显示相差数小时。
+    """
+    from datetime import datetime
+
+    text = str(value or "")
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text[:19].replace("T", " ")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _session_summaries(store) -> list[dict]:
     """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。"""
     history = store.get_chat_history()
@@ -1339,7 +1366,7 @@ def run_sessions_list_standalone(
             status = "置顶"
         else:
             status = "—"
-        updated = item["updated_at"][:19].replace("T", " ") or "—"
+        updated = _local_timestamp_text(item["updated_at"]) or "—"
         title = item["title"][:30]
         print(
             f"  [{status}] {item['session_id']:<16} {title:<32}"
@@ -1611,6 +1638,23 @@ def run_trips_list_standalone(user_id: str) -> int:
     return 0
 
 
+def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool] | None:
+    """解析 kb-export 的 [path] [--force]；冲突 / 未知参数返回 None。"""
+    target: str | None = None
+    force = False
+    for item in args:
+        lowered = item.lower()
+        if lowered == "--force":
+            force = True
+        elif item.startswith("-"):
+            return None
+        elif target is None:
+            target = item
+        else:
+            return None
+    return target, force
+
+
 def _parse_export_args(
     args: list[str],
 ) -> tuple[str | None, bool, bool] | None:
@@ -1647,7 +1691,12 @@ def main():
         if arg == "eval":
             sys.exit(run_rag_eval_standalone())
         if arg == "kb-export":
-            sys.exit(run_knowledge_export_standalone(sys.argv[2] if len(sys.argv) > 2 else None))
+            parsed_kb_export = _parse_kb_export_args(sys.argv[2:])
+            if parsed_kb_export is None:
+                print("用法：python cli.py kb-export [path] [--force]")
+                sys.exit(2)
+            kb_target, kb_force = parsed_kb_export
+            sys.exit(run_knowledge_export_standalone(kb_target, force=kb_force))
         if arg == "kb-import":
             if len(sys.argv) < 3:
                 print("用法：python cli.py kb-import <file.json>")

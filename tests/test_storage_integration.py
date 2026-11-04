@@ -58,7 +58,21 @@ def test_redis_short_term_memory():
 
     memory.clear()
     assert memory.get_statistics()["total_messages"] == 0
-    print("✓ Redis 短期记忆（滑动窗口 / TTL / 清空）")
+
+    # Python strip() 与 Lua %s 的空白字符集不同：全角空格结尾的提问也必须
+    # 能按「去掉首尾空白后一致」删除，否则长期记忆已删、短期记忆残留
+    memory2 = RedisShortTermMemory(
+        client,
+        f"pytest-{uuid.uuid4().hex[:8]}",
+        max_turns=2,
+        ttl_sec=60,
+        user_id="pytest-user",
+    )
+    memory2.add_message("user", "报销标准是多少　")
+    memory2.add_message("assistant", "回答")
+    assert memory2.truncate_last_turn(expect="报销标准是多少") == 2
+    assert memory2.get_statistics()["total_messages"] == 0
+    print("✓ Redis 短期记忆（滑动窗口 / TTL / 清空 / 全角空格裁剪）")
 
 
 def test_postgres_long_term_memory():

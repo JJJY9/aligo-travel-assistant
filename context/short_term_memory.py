@@ -57,7 +57,10 @@ if check == '1' then
   if not msg_ok or type(msg) ~= 'table' or msg['role'] ~= 'user' then return 0 end
   local content = msg['content']
   if type(content) ~= 'string' then return 0 end
-  if string.match(content, '^%s*(.-)%s*$') ~= expected then return 0 end
+  -- Python 端用 str.strip()（含全角空格 U+3000 / 不间断空格 U+00A0），
+  -- Lua 的 %s 只覆盖 ASCII；两侧必须按同一字符集裁剪，否则带全角空格的
+  -- 提问会被误判为不一致（长期记忆删了、短期记忆还留着旧一轮）
+  if string.match(content, '^[%s\\194\\160\\227\\128\\128]*(.-)[%s\\194\\160\\227\\128\\128]*$') ~= expected then return 0 end
 end
 if count >= n then
   redis.call('DEL', key)
