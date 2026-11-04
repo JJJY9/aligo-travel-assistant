@@ -18,6 +18,7 @@
 - 会话归档：侧栏会话操作新增「归档」，归档后从默认列表隐藏但消息保留；侧栏「已归档（N）」切换到归档列表，可恢复或删除；普通视图搜索时显示「另有 N 条归档会话匹配」并可直接切换；`PUT /api/sessions/{id}/archive`、`GET /api/sessions?archived=true`，`/api/status` 返回 `archived_count`
 - CLI 行程导出：`python cli.py trips-export <user_id> [path] [--stdout] [--force]`（默认 `exports/aligo_trips.csv`，CSV 渲染与 Web 共用 `utils/trip_export.py`）
 - CLI 行程列表：`python cli.py trips <user_id>` 按新→旧列出全部行程，标注「进行中 / 即将出行 / 已结束」与日期重叠提示；日期解析 / 重叠判断抽到 `utils/trip_conflicts.py`，Web 与 CLI 共用
+- CLI 偏好列表：`python cli.py preferences <user_id>` 列出长期记忆中的偏好（中文类型名、列表值用「、」拼接、布尔显示为是 / 否）
 - CLI 会话管理：`python cli.py sessions <user_id> [--archived|--all]` 列出会话（置顶优先，显示消息数与最近更新时间），`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复，`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown；PostgreSQL 回退本地 JSON 时拒绝执行
 - 会话列表分页：`GET /api/sessions` 支持 `offset` 并返回 `total`，侧栏超过一页时显示「加载更多会话（已显示 X / 共 Y）」
 - 侧栏「即将出行」卡片：根据行程日期展示最近一次即将开始的行程（路线 / 日期 / 目的），点击回到对应对话（无关联会话时打开记忆面板）
@@ -237,6 +238,7 @@
 - 新增语义检索拒绝未初始化库、导入跳过非字符串内容、分批失败报告已导入数量、Web 导入非对象条目、kb-import 非 UTF-8 文件、初始化脚本退出码用例
 - 新增 `tests/test_reliability_utils.py`（可重试错误判定 / 重试不误伤 / 健康检查空响应 / 熔断器半开单飞与迟到失败 / 元数据非列表容错 / 访问日志控制字符）与意图 NaN / 非对象输出用例
 - 新增会话缓存用户隔离 / 删除墓碑 / 限流桶不连坐 / 空白目的地与消息 / 9999-12-31 日历边界 / 幽灵元数据 404 用例与 `RateLimiter.peek` 用例
+- 新增 CLI `preferences` 用例（列表输出 / 空列表 / 读取与打开失败 / 非法用户 / 严格参数）
 
 ## [1.3.0] - 2026-11-03
 

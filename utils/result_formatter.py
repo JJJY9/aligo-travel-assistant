@@ -36,6 +36,11 @@ def display_name(agent_name: str) -> str:
     return _DISPLAY_NAMES.get(agent_name, agent_name)
 
 
+def preference_label(pref_type: str) -> str:
+    """偏好类型的中文显示名（未知类型原样返回）。"""
+    return _PREF_NAMES.get(pref_type, pref_type)
+
+
 def result_to_markdown(result_data: dict[str, Any]) -> str:
     """把编排结果转换为 Markdown 文本。"""
     results = result_data.get("results") or []
@@ -162,7 +167,7 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                 pref_type = pref.get("type", "")
                 value = pref.get("value", "")
                 action = "追加" if pref.get("action") == "append" else "设置为"
-                name = _PREF_NAMES.get(pref_type, pref_type)
+                name = preference_label(pref_type)
                 lines.append(f"- {name} **{action}** {value}")
             return "\n".join(lines)
         return ""
@@ -220,9 +225,9 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
             if not isinstance(document, dict):
                 continue
             metadata = document.get("metadata") or {}
-            name = metadata.get("parent_doc") or metadata.get("title")
-            if name and name not in doc_names:
-                doc_names.append(str(name))
+            doc_name = metadata.get("parent_doc") or metadata.get("title")
+            if doc_name and doc_name not in doc_names:
+                doc_names.append(str(doc_name))
         if doc_names:
             text += "\n\n**参考来源**：" + "、".join(doc_names[:3])
 
