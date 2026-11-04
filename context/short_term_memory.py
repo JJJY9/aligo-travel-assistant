@@ -15,8 +15,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def session_key(session_id: str) -> str:
-    """Redis 中一个会话对应的键名（存储层与会话清理共用）。"""
+def session_key(session_id: str, user_id: str = "") -> str:
+    """Redis 中一个会话对应的键名。
+
+    传入 user_id 时按用户隔离（``aligo:session:{user}:{id}:messages``），
+    避免不同用户恰好复用同一 session_id 时共享上下文；不传时保留旧格式，
+    仅用于清理历史遗留键。
+    """
+    if user_id:
+        return f"aligo:session:{user_id}:{session_id}:messages"
     return f"aligo:session:{session_id}:messages"
 
 
@@ -200,12 +207,14 @@ class RedisShortTermMemory:
         session_id: str,
         max_turns: int = 10,
         ttl_sec: int = 3600,
+        user_id: str = "",
     ) -> None:
         self.client = client
         self.session_id = session_id
         self.max_turns = max_turns
         self.ttl_sec = ttl_sec
-        self.key = session_key(session_id)
+        self.user_id = user_id
+        self.key = session_key(session_id, user_id)
 
     def add_message(self, role: str, content: str, metadata: dict | None = None) -> None:
         message = {

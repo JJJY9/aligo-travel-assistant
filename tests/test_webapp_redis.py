@@ -88,7 +88,7 @@ def test_webapp_with_redis_short_term(monkeypatch):
         status = http.get("/api/status", params={"user_id": user_id}).json()
         assert status["storage"]["short_term"] == "redis"
 
-        key = session_key(session_id)
+        key = session_key(session_id, user_id)
         assert client.exists(key) == 1, "对话应写入 Redis 短期记忆"
         assert client.llen(key) >= 2, "至少包含用户与助手两条消息"
 
@@ -111,8 +111,26 @@ def test_webapp_with_redis_short_term(monkeypatch):
         first = json.loads(client.lindex(key, 0))
         assert first["content"] == "你好", "应保留第一轮消息，只裁掉最后一轮"
 
+        # 未缓存会话（重启 / LRU 淘汰）也能清理 Redis（用户级键）
+        third = http.post(
+            "/api/chat",
+            json={"message": "第三问", "user_id": user_id, "session_id": session_id},
+        )
+        assert third.status_code == 200
+        before_uncached = client.llen(key)
+        app.state.aligo.sessions.clear()
+        uncached = http.delete(
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "第三问"},
+        )
+        assert uncached.status_code == 200
+        assert uncached.json()["removed"] == 2
+        assert client.llen(key) == before_uncached - 2
+
         # Lua 脚本的内容校验：不一致时不动列表，匹配时删除整轮
-        probe = RedisShortTermMemory(client, f"redis-expect-{uuid.uuid4().hex[:8]}")
+        probe = RedisShortTermMemory(
+            client, f"redis-expect-{uuid.uuid4().hex[:8]}", user_id=user_id
+        )
         try:
             probe.add_message("user", "Q1")
             probe.add_message("assistant", "A1")
@@ -123,6 +141,21 @@ def test_webapp_with_redis_short_term(monkeypatch):
         finally:
             client.delete(probe.key)
 
+        # 同一 session_id 的不同用户使用不同键，互不影响
+        shared_session = f"redis-shared-{uuid.uuid4().hex[:8]}"
+        alice = RedisShortTermMemory(client, shared_session, user_id="alice")
+        bob = RedisShortTermMemory(client, shared_session, user_id="bob")
+        try:
+            alice.add_message("user", "alice 的消息")
+            bob.add_message("user", "bob 的消息")
+            assert alice.key != bob.key
+            assert client.llen(alice.key) == 1 and client.llen(bob.key) == 1
+            assert alice.truncate_last_turn("alice 的消息") == 1
+            assert client.exists(alice.key) == 0
+            assert client.llen(bob.key) == 1, "不应清理其它用户的会话"
+        finally:
+            client.delete(alice.key, bob.key)
+
         # 删除会话 → 同时清理 Redis 短期记忆
         deleted = http.delete(
             f"/api/sessions/{session_id}", params={"user_id": user_id}
@@ -131,7 +164,7 @@ def test_webapp_with_redis_short_term(monkeypatch):
         assert client.exists(key) == 0
         print("✓ Web API 在 Redis 短期记忆下的读写与清理")
     finally:
-        client.delete(session_key(session_id))
+        client.delete(session_key(session_id), session_key(session_id, user_id))
         memory_file.unlink(missing_ok=True)
         storage.reset_failure_cache()
 

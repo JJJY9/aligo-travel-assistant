@@ -45,6 +45,7 @@ from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tra
 from context.storage import (
     clear_short_term_session,
     create_long_term_memory,
+    create_short_term_memory,
     describe_backends,
 )
 from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
@@ -1260,7 +1261,7 @@ def create_app(model: Any = None) -> FastAPI:
             finally:
                 _close_long_term(store)
             state.drop_session(session_id)
-            clear_short_term_session(session_id)
+            clear_short_term_session(session_id, user_id)
         return {"session_id": session_id, "deleted": removed}
 
     @app.delete("/api/sessions/{session_id}/last-turn")
@@ -1285,13 +1286,16 @@ def create_app(model: Any = None) -> FastAPI:
                 _close_long_term(store)
 
             if removed > 0:
-                # 短期记忆只是上下文缓存：清理失败（或会话不在本进程、无法确认
-                # 归属）都不影响已完成的长期记忆删除。Redis 的键只按 session_id
-                # 区分，未缓存的会话不能在这里清理，否则可能截断其他用户的数据。
+                # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
+                # Redis 键按 user_id + session_id 隔离，未缓存的会话也可安全清理。
                 try:
                     session = state.sessions.get(session_id)
                     if session is not None and session.user_id == user_id:
                         session.runtime.memory.short_term.truncate_last_turn(expect)
+                    else:
+                        create_short_term_memory(
+                            session_id, user_id=user_id
+                        ).truncate_last_turn(expect)
                 except Exception as exc:  # noqa: BLE001 - 缓存清理失败只记录
                     logger.warning("清理短期记忆失败（%s）: %s", session_id, exc)
         return {

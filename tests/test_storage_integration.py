@@ -43,7 +43,9 @@ def test_redis_short_term_memory():
     from context.short_term_memory import RedisShortTermMemory
 
     session_id = f"pytest-{uuid.uuid4().hex[:8]}"
-    memory = RedisShortTermMemory(client, session_id, max_turns=2, ttl_sec=60)
+    memory = RedisShortTermMemory(
+        client, session_id, max_turns=2, ttl_sec=60, user_id="pytest-user"
+    )
     for index in range(6):
         role = "user" if index % 2 == 0 else "assistant"
         memory.add_message(role, f"m{index}")
