@@ -2578,6 +2578,21 @@ function updateKnowledgeMore() {
   els.kbMore.hidden = state.kbItems.length >= state.kbTotal;
 }
 
+function knowledgePreview(content, query) {
+  const text = String(content || "");
+  const needle = String(query || "").trim();
+  if (!needle) {
+    return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+  }
+  const index = text.toLowerCase().indexOf(needle.toLowerCase());
+  if (index < 0) {
+    return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+  }
+  const start = Math.max(0, index - 48);
+  const end = Math.min(text.length, start + 140);
+  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+}
+
 function renderKnowledgeDocuments(items, append) {
   if (!append) {
     els.kbList.innerHTML = "";
@@ -2602,13 +2617,23 @@ function renderKnowledgeDocuments(items, append) {
     const text = document.createElement("div");
     text.className = "kb-text";
     const content = String(doc.content || "");
-    text.textContent = content.length > 140 ? `${content.slice(0, 140)}…` : content;
+    const preview = knowledgePreview(content, state.kbQuery);
+    if (state.kbQuery) {
+      text.innerHTML = highlightSnippet(preview, state.kbQuery);
+    } else {
+      text.textContent = preview;
+    }
     const meta = document.createElement("div");
     meta.className = "kb-meta";
     const bits = [`#${doc.id}`];
     if (doc.metadata && doc.metadata.category) bits.push(String(doc.metadata.category));
     if (doc.metadata && doc.metadata.title) bits.push(String(doc.metadata.title));
-    meta.textContent = bits.join(" · ");
+    const metaText = bits.join(" · ");
+    if (state.kbQuery) {
+      meta.innerHTML = highlightSnippet(metaText, state.kbQuery);
+    } else {
+      meta.textContent = metaText;
+    }
     main.append(text, meta);
 
     const actions = document.createElement("span");

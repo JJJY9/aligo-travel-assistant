@@ -31,6 +31,7 @@
 - 知识库维护：记忆面板查看 / 新增 / 删除知识片段（`GET/POST/DELETE /api/knowledge/documents`），新增后立即可检索，列表按 id 倒序显示最新片段；新增按最大 id 递增，删除后再添加不会与已有主键冲突
 - 知识片段编辑：记忆面板知识库列表新增编辑按钮，修改内容 / 分类后重新向量化并覆盖原片段（`PUT /api/knowledge/documents/{id}`，片段不存在返回 404；增删改共用写锁，避免并发覆盖）
 - 知识库分类筛选：`GET /api/knowledge/documents` 支持 `category` 参数，新增 `GET /api/knowledge/categories` 统计各分类片段数；维护面板新增分类下拉框，可与关键词搜索组合使用
+- 知识库搜索命中高亮：片段预览围绕首个命中位置截取并高亮关键词，分类 / 标题同样高亮
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1 / hit@3 / hit@5 与 MRR（只检索、不调用大模型），知识库未初始化时提示跳过，hit@5 低于 80% 退出码 1
 - 系统自检新增记忆存储检查：报告短期 / 长期记忆实际使用的后端，配置 Redis / PostgreSQL 后测试连通性，不可用时提示将回退本地默认实现
 - 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
