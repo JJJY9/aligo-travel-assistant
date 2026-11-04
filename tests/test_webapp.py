@@ -494,6 +494,70 @@ def test_status_trips():
         _cleanup(user_id)
 
 
+def test_list_trips_api():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_list_trips")
+    specs = [
+        ("上海", "2026-12-01", "2026-12-02"),
+        ("杭州", "2026-12-03", "2026-12-06"),
+        ("南京", "2026-12-04", "2026-12-07"),
+        ("成都", "2026-12-08", "2026-12-09"),
+        ("西安", "2026-12-10", "2026-12-11"),
+        ("武汉", "2026-12-12", "2026-12-13"),
+        ("重庆", "2026-12-14", "2026-12-15"),
+    ]
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for destination, start, end in specs:
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": destination,
+                        "start_date": start,
+                        "end_date": end,
+                        "purpose": "出差",
+                    }
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        page1 = client.get(
+            "/api/trips", params={"user_id": user_id, "limit": 3, "offset": 0}
+        ).json()
+        assert page1["total"] == 7
+        assert [item["destination"] for item in page1["trips"]] == ["上海", "杭州", "南京"]
+        by_destination = {item["destination"]: item for item in page1["trips"]}
+        assert [item["destination"] for item in by_destination["杭州"]["conflicts"]] == [
+            "南京"
+        ]
+        assert [item["destination"] for item in by_destination["南京"]["conflicts"]] == [
+            "杭州"
+        ]
+
+        page2 = client.get(
+            "/api/trips", params={"user_id": user_id, "limit": 3, "offset": 3}
+        ).json()
+        assert [item["destination"] for item in page2["trips"]] == ["成都", "西安", "武汉"]
+        page3 = client.get(
+            "/api/trips", params={"user_id": user_id, "limit": 3, "offset": 6}
+        ).json()
+        assert [item["destination"] for item in page3["trips"]] == ["重庆"]
+        assert (
+            client.get(
+                "/api/trips", params={"user_id": user_id, "limit": 0}
+            ).status_code
+            == 422
+        )
+        print("✓ /api/trips 列表（分页 / 重叠信息 / 参数校验）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_delete_trip_api():
     from context.storage import create_long_term_memory
 
@@ -1388,7 +1452,9 @@ def test_trips_csv_storage_failure_maps_503(monkeypatch):
     )
     response = _client().get("/api/trips/export", params={"user_id": "u1"})
     assert response.status_code == 503
-    print("✓ 行程 CSV 导出读取失败 → 503")
+    listed = _client().get("/api/trips", params={"user_id": "u1"})
+    assert listed.status_code == 503
+    print("✓ 行程 CSV / 列表读取失败 → 503")
 
 
 def test_delete_session_storage_failure_maps_503(monkeypatch):
@@ -2343,6 +2409,7 @@ if __name__ == "__main__":
     test_update_trip_api()
     test_trip_overlap_conflicts_api()
     test_trip_conflicts_helper_edges()
+    test_list_trips_api()
     test_delete_last_turn_api()
     test_next_trip_prefers_ongoing()
     test_status_trips_include_conflicts()
