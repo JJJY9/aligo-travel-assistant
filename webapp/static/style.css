@@ -1319,6 +1319,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   cursor: pointer;
 }
 .history-more:hover { color: var(--sidebar-ink); }
+.archived-hint { color: #e28a6c; border-color: rgba(224, 85, 43, 0.35); }
+.archived-hint:hover { color: #ffb29a; border-color: rgba(224, 85, 43, 0.6); }
 
 /* 侧栏「已归档」开关 */
 .archived-toggle {
