@@ -19,6 +19,7 @@ sys.path.insert(0, project_root)
 
 from context import storage
 from context.long_term_memory import LongTermMemory
+from utils.errors import MemoryPersistenceError
 from context.short_term_memory import ShortTermMemory
 
 
@@ -227,7 +228,59 @@ def test_corrupt_memory_file_is_backed_up():
     backups = list(Path(storage_dir).glob("u-corrupt.json.corrupt-*"))
     assert backups, "损坏文件应保留备份"
     assert backups[0].read_text(encoding="utf-8") == "{bad json"
+    assert str(os.getpid()) in backups[0].name, "备份名带进程号，避免并发损坏互相覆盖"
     print("✓ 损坏的记忆文件备份后重建")
+
+
+def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
+    """解析失败后、备份前若其它线程写入了新文件，不能把有效数据当损坏文件移走。"""
+    import json as json_module
+    from pathlib import Path
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-race.json"
+    path.write_text("{bad json", encoding="utf-8")
+    real_load = json_module.load
+    calls = {"count": 0}
+
+    def flaky_load(handle, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # 模拟另一线程在首次解析失败后完成了新的原子写入
+            path.write_text(
+                json_module.dumps({"chat_history": [], "preferences": []}),
+                encoding="utf-8",
+            )
+            raise ValueError("Expecting property name enclosed in double quotes")
+        return real_load(handle, *args, **kwargs)
+
+    monkeypatch.setattr(json_module, "load", flaky_load)
+    memory = LongTermMemory("u-race", storage_dir)
+    assert memory.get_chat_history() == []
+    assert path.exists(), "并发写入的有效文件不能被移走"
+    assert not list(Path(storage_dir).glob("u-race.json.corrupt-*"))
+    print("✓ 损坏备份不会误移并发写入的新文件")
+
+
+def test_memory_persistence_error_is_not_retriable():
+    """写盘失败不能被当作可重试的网络错误（否则会重跑整轮对话、误开熔断器）。"""
+    from utils.llm_resilience import is_retriable_error
+
+    assert is_retriable_error(MemoryPersistenceError("磁盘已满")) is False
+    assert is_retriable_error(OSError("network unreachable")) is True
+    print("✓ 写盘失败不触发对话重试")
+
+
+def test_redact_url_masks_password_containing_at():
+    """密码里含未转义的 @ 时不能只隐藏第一个 @ 之前的部分。"""
+    redacted = storage._redact_url("redis://default:p@ssw0rd@redis.internal:6379/0")
+    assert "p@ssw0rd" not in redacted
+    assert redacted == "redis://***@redis.internal:6379/0"
+    assert (
+        storage._redact_url("redis://redis.internal:6379/0")
+        == "redis://redis.internal:6379/0"
+    )
+    print("✓ Redis URL 日志隐藏完整密码（含 @）")
 
 
 def test_session_metadata_save_failure_raises():
@@ -240,7 +293,7 @@ def test_session_metadata_save_failure_raises():
         lambda: memory.set_session_pinned("s1", True),
         lambda: memory.set_session_title("s1", "标题"),
     ):
-        with pytest.raises(OSError):
+        with pytest.raises(MemoryPersistenceError):
             setter()
     print("✓ 会话元数据写入失败时抛错（不再静默成功）")
 
@@ -287,7 +340,7 @@ def test_json_write_failures_raise():
         ("清空历史", memory.clear_history),
     ]
     for label, action in actions:
-        with pytest.raises(OSError):
+        with pytest.raises(MemoryPersistenceError):
             action()
     print("✓ JSON 偏好 / 消息 / 行程 / 清空写盘失败均抛错")
 
@@ -498,6 +551,9 @@ if __name__ == "__main__":
     test_add_message_preserves_metadata()
     test_clear_history_clears_metadata()
     test_corrupt_memory_file_is_backed_up()
+    test_corrupt_backup_does_not_move_concurrently_written_file(pytest.MonkeyPatch())
+    test_memory_persistence_error_is_not_retriable()
+    test_redact_url_masks_password_containing_at()
     test_session_metadata_save_failure_raises()
     test_json_write_failures_raise()
     _mp = pytest.MonkeyPatch()

@@ -21,8 +21,12 @@ from context.short_term_memory import RedisShortTermMemory, ShortTermMemory, ses
 logger = logging.getLogger(__name__)
 
 def _redact_url(url: str) -> str:
-    """隐藏 Redis URL 中的密码，避免日志泄露。"""
-    return re.sub(r"://([^@/]+)@", r"://***@", url)
+    """隐藏 Redis URL 中的密码，避免日志泄露。
+
+    用户信息段可能在密码中包含未转义的 ``@``，按最后一个 ``@`` 切分
+    （与 ``urlsplit`` / redis-py 的解析一致），不能停在第一个 ``@``。
+    """
+    return re.sub(r"://[^/]*@", "://***@", url)
 
 ShortTermStore = ShortTermMemory | RedisShortTermMemory
 LongTermStore = LongTermMemory | PostgresLongTermMemory

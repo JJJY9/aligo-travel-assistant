@@ -23,6 +23,7 @@ from agents.orchestration_agent import OrchestrationAgent
 from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
+from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
@@ -219,6 +220,10 @@ class ConversationRuntime:
                 self.circuit_breaker.record_success()
             return result
         except CircuitOpenError:
+            raise
+        except MemoryPersistenceError:
+            # 记忆写盘失败与 LLM 服务无关，不计入熔断（否则多次磁盘故障会让
+            # 所有用户一起收到「服务暂时不可用」）
             raise
         except Exception:
             if self.circuit_breaker:

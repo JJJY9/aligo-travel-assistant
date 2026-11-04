@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from .circuit_breaker import CircuitOpenError
+from .errors import MemoryPersistenceError
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,9 @@ def is_retriable_error(exc: BaseException) -> bool:
     """
     判断是否为可重试错误（网络/超时/限流/5xx）。
     """
+    # 写盘失败不是网络故障：重试整轮对话只会重复调用大模型，不会让磁盘恢复
+    if isinstance(exc, MemoryPersistenceError):
+        return False
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
     msg = str(exc).lower()

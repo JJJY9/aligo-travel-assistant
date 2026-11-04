@@ -270,9 +270,14 @@ def delete_document(doc_id: int) -> bool:
 
 
 def search_documents(query: str, top_k: int = 5) -> list[dict[str, Any]]:
-    """语义检索知识片段（供评测与集成测试验证检索链路）。"""
+    """语义检索知识片段（供 Web 维护面板、评测与集成测试验证检索链路）。
+
+    Raises:
+        FileNotFoundError: 知识库未初始化
+        Exception: 嵌入 / Milvus 检索失败（由上层映射为 503，不能伪装成无结果）
+    """
     agent = _get_agent()
-    return agent.search_knowledge(query, top_k=top_k)
+    return agent.search_knowledge(query, top_k=top_k, strict=True)
 
 
 def _exists(client: Any, doc_id: int) -> bool:

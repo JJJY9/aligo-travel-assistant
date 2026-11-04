@@ -229,6 +229,82 @@ class RequestContextMiddleware:
                 )
 
 
+class _BodyTooLarge(Exception):
+    """请求体超过上限的内部信号（由 BodySizeLimitMiddleware 转换为 413）。"""
+
+
+class BodySizeLimitMiddleware:
+    """按实际读取字节数限制请求体大小。
+
+    ``RequestContextMiddleware`` 只检查 ``Content-Length``；分块传输
+    （``Transfer-Encoding: chunked``）或 HTTP/2 请求没有该头，若不在这里
+    按实际读取量截断，超大请求体会被完整读入内存，绕过 2 MB 上限。
+    """
+
+    def __init__(self, app: Any, max_bytes: int = MAX_REQUEST_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        received = 0
+        exceeded = False
+        sent_413 = False
+        payload = json.dumps(
+            {"detail": f"请求体过大（上限 {self.max_bytes // (1024 * 1024)} MB）"},
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        async def send_413() -> None:
+            nonlocal sent_413
+            if sent_413:
+                return
+            sent_413 = True
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [(b"content-type", b"application/json; charset=utf-8")],
+                }
+            )
+            await send({"type": "http.response.body", "body": payload})
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received, exceeded
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self.max_bytes:
+                    exceeded = True
+                    raise _BodyTooLarge()
+            return message
+
+        async def limited_send(message: dict[str, Any]) -> None:
+            if not exceeded:
+                await send(message)
+                return
+            # 应用可能在捕获异常后照常发送 500 / 200，甚至忽略异常继续输出；
+            # 统一改写为 413，并丢弃其响应体
+            if message.get("type") == "http.response.start":
+                await send_413()
+            elif message.get("type") not in (
+                "http.response.body",
+                "http.response.trailers",
+            ):
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except _BodyTooLarge:
+            pass
+        # 应用吞掉异常且没有发出任何响应时，在这里补发 413
+        if exceeded:
+            await send_413()
+
+
 class SelectiveGZipMiddleware:
     """对除 SSE 流以外的响应启用 gzip。
 
@@ -371,6 +447,9 @@ class AligoWebApp:
         )
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
+        # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
+        # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
+        self.overflow_lock = asyncio.Lock()
         self.rate_limiter = RateLimiter(
             limit=RATE_LIMIT_CONFIG.get("chat_requests", 30),
             window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
@@ -421,6 +500,9 @@ class AligoWebApp:
                     if not candidate.locked():
                         del self.locks[key]
                         break
+            if len(self.locks) >= self.max_locks:
+                # 所有锁都在使用中：共享兜底锁（并发高峰下新用户串行，但内存有界）
+                return self.overflow_lock
             lock = asyncio.Lock()
             self.locks[user_id] = lock
         return lock
@@ -443,6 +525,11 @@ def _enforce_rate_limit(
     retry_after = state.rate_limiter.check(user_key)
     ip_retry_after = state.ip_limiter.check(client)
     if retry_after is not None or ip_retry_after is not None:
+        # 429 的额度头描述真正触发限制的桶（等待更久的那个）
+        if (retry_after or 0.0) >= (ip_retry_after or 0.0):
+            limit = state.rate_limiter.limit
+        else:
+            limit = state.ip_limiter.limit
         # HTTP Retry-After 需要整数秒，向上取整并至少 1 秒
         wait_seconds = max(
             1, math.ceil(max(retry_after or 0.0, ip_retry_after or 0.0))
@@ -452,19 +539,21 @@ def _enforce_rate_limit(
             detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
             headers={
                 "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(state.rate_limiter.limit),
+                "X-RateLimit-Limit": str(limit),
                 "X-RateLimit-Remaining": "0",
                 "X-RateLimit-Reset": str(wait_seconds),
             },
         )
     remaining_user, reset_user = state.rate_limiter.status(user_key)
     remaining_ip, reset_ip = state.ip_limiter.status(client)
-    if remaining_user <= remaining_ip:
-        remaining, reset = remaining_user, reset_user
+    # 额度头取自当前更紧的桶（剩余更少；剩余相同时取重置更晚的），
+    # 避免 Limit 来自用户桶而 Remaining 来自 IP 桶导致三个值自相矛盾
+    if (remaining_ip, -reset_ip) < (remaining_user, -reset_user):
+        limit, remaining, reset = state.ip_limiter.limit, remaining_ip, reset_ip
     else:
-        remaining, reset = remaining_ip, reset_ip
+        limit, remaining, reset = state.rate_limiter.limit, remaining_user, reset_user
     return {
-        "X-RateLimit-Limit": str(state.rate_limiter.limit),
+        "X-RateLimit-Limit": str(limit),
         "X-RateLimit-Remaining": str(remaining),
         "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
     }
@@ -937,6 +1026,8 @@ def create_app(model: Any = None) -> FastAPI:
     # Starlette 后注册的中间件在最外层：压缩放在内层，保证 RequestContextMiddleware
     # 能给压缩后的响应补安全头 / 请求 ID，并在异常时可靠地兜底 500。
     app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
+    # 分块传输没有 Content-Length，需在读取时按实际字节数兜底限制
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
     app.add_middleware(RequestContextMiddleware)
 
     @app.exception_handler(RequestValidationError)
@@ -1179,6 +1270,9 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             store.save_preference(pref_type, payload.value)
             value = store.get_preference(pref_type)
+        except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
+            logger.warning("保存偏好失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
         finally:
             _close_long_term(store)
         return {"type": pref_type, "value": value}
@@ -1191,6 +1285,9 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             removed = store.delete_preference(pref_type)
+        except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
+            logger.warning("删除偏好失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
         finally:
             _close_long_term(store)
         return {"type": pref_type, "deleted": removed}

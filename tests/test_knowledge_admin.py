@@ -212,16 +212,29 @@ def test_search_documents_delegates_to_agent(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def search_knowledge(self, query, top_k=5):
-            self.calls.append((query, top_k))
+        def search_knowledge(self, query, top_k=5, strict=False):
+            self.calls.append((query, top_k, strict))
             return [{"content": "命中"}]
 
     agent = _SearchAgent()
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
     result = knowledge_admin.search_documents("住宿标准", top_k=3)
     assert result == [{"content": "命中"}]
-    assert agent.calls == [("住宿标准", 3)]
-    print("✓ 语义检索委托 RAG Agent")
+    # strict=True：后端故障要抛出（映射 503），不能伪装成“没有相关内容”
+    assert agent.calls == [("住宿标准", 3, True)]
+    print("✓ 语义检索委托 RAG Agent（严格模式）")
+
+
+def test_rag_agent_strict_search_raises_when_uninitialized(monkeypatch):
+    """未初始化的知识库在严格模式下抛出（Web 接口据此返回 503）。"""
+    from agents.rag_knowledge_agent import RAGKnowledgeAgent
+
+    agent = object.__new__(RAGKnowledgeAgent)
+    agent.initialized = False
+    assert agent.search_knowledge("住宿标准") == []
+    with pytest.raises(RuntimeError, match="未初始化"):
+        agent.search_knowledge("住宿标准", strict=True)
+    print("✓ 未初始化知识库的严格检索抛出异常")
 
 
 def test_export_documents_sorted_and_stripped(monkeypatch):
@@ -351,6 +364,7 @@ if __name__ == "__main__":
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,
         test_search_documents_delegates_to_agent,
+        test_rag_agent_strict_search_raises_when_uninitialized,
         test_export_documents_sorted_and_stripped,
         test_import_documents_sanitizes,
         test_import_skips_existing_and_duplicate_content,
