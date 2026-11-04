@@ -216,6 +216,21 @@ def test_clear_history_clears_metadata():
     print("✓ clear_history 同时清理会话元数据（标题 / 置顶 / 归档）")
 
 
+def test_session_metadata_save_failure_raises():
+    """JSON 写入失败时会话元数据操作必须抛错，不能静默返回成功。"""
+    memory = LongTermMemory("u-save-fail", tempfile.mkdtemp())
+    memory.add_chat_message("user", "hi", "s1")
+    memory._save = lambda: False
+    for setter in (
+        lambda: memory.set_session_archived("s1", True),
+        lambda: memory.set_session_pinned("s1", True),
+        lambda: memory.set_session_title("s1", "标题"),
+    ):
+        with pytest.raises(OSError):
+            setter()
+    print("✓ 会话元数据写入失败时抛错（不再静默成功）")
+
+
 def test_export_data_includes_session_metadata():
     from context.memory_manager import MemoryManager
 
@@ -421,6 +436,7 @@ if __name__ == "__main__":
     test_session_pinned()
     test_add_message_preserves_metadata()
     test_clear_history_clears_metadata()
+    test_session_metadata_save_failure_raises()
     test_export_data_includes_session_metadata()
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()

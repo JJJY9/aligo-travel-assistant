@@ -837,8 +837,10 @@ def create_app(model: Any = None) -> FastAPI:
 
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
-    app.add_middleware(RequestContextMiddleware)
+    # Starlette 后注册的中间件在最外层：压缩放在内层，保证 RequestContextMiddleware
+    # 能给压缩后的响应补安全头 / 请求 ID，并在异常时可靠地兜底 500。
     app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
+    app.add_middleware(RequestContextMiddleware)
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

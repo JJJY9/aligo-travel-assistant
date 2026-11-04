@@ -1250,7 +1250,7 @@ def run_sessions_list_standalone(
     """
     import re
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -1319,10 +1319,10 @@ def run_session_archive_standalone(
     """
     import re
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
-    if not re.fullmatch(r"[\w-]{1,64}", session_id):
+    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
         print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -1350,6 +1350,24 @@ def run_session_archive_standalone(
             close()
     print(f"已{'归档' if archived else '恢复'}会话 {session_id}")
     return 0
+
+
+def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool] | None:
+    """解析 sessions 的 --archived / --all；未知参数或同时使用返回 None。"""
+    flags = [item.lower() for item in args]
+    if any(flag not in {"--archived", "--all"} for flag in flags):
+        return None
+    if "--archived" in flags and "--all" in flags:
+        return None
+    return "--archived" in flags, "--all" in flags
+
+
+def _parse_archive_flags(args: list[str]) -> bool | None:
+    """解析 session-archive 的 --restore；未知参数返回 None。"""
+    flags = [item.lower() for item in args]
+    if any(flag != "--restore" for flag in flags):
+        return None
+    return "--restore" in flags
 
 
 def main():
@@ -1386,29 +1404,42 @@ def main():
                 sys.exit(2)
             sys.exit(run_trips_dedupe_standalone(sys.argv[2]))
         if arg == "sessions":
-            if len(sys.argv) < 3:
+            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py sessions <user_id> [--archived|--all]")
                 sys.exit(2)
-            flags = {item.lower() for item in sys.argv[3:]}
+            parsed = _parse_sessions_flags(sys.argv[3:])
+            if parsed is None:
+                print("用法：python cli.py sessions <user_id> [--archived|--all]")
+                sys.exit(2)
+            archived_only, include_all = parsed
             sys.exit(
                 run_sessions_list_standalone(
                     sys.argv[2],
-                    archived_only="--archived" in flags,
-                    include_all="--all" in flags,
+                    archived_only=archived_only,
+                    include_all=include_all,
                 )
             )
         if arg == "session-archive":
-            if len(sys.argv) < 4:
+            if (
+                len(sys.argv) < 4
+                or sys.argv[2].startswith("-")
+                or sys.argv[3].startswith("-")
+            ):
                 print(
                     "用法：python cli.py session-archive <user_id> <session_id> [--restore]"
                 )
                 sys.exit(2)
-            flags = {item.lower() for item in sys.argv[4:]}
+            restore = _parse_archive_flags(sys.argv[4:])
+            if restore is None:
+                print(
+                    "用法：python cli.py session-archive <user_id> <session_id> [--restore]"
+                )
+                sys.exit(2)
             sys.exit(
                 run_session_archive_standalone(
                     sys.argv[2],
                     sys.argv[3],
-                    archived="--restore" not in flags,
+                    archived=not restore,
                 )
             )
     cli = AligoCLI()
