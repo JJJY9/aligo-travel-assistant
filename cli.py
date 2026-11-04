@@ -1375,8 +1375,9 @@ def run_session_export_standalone(
     session_id: str,
     target: str | None = None,
     to_stdout: bool = False,
+    force: bool = False,
 ) -> int:
-    """导出单个会话为 Markdown（`python cli.py session-export <user> <session> [path] [--stdout]`）。
+    """导出单个会话为 Markdown（`python cli.py session-export <user> <session> [path] [--stdout] [--force]`）。
 
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败或会话不存在
@@ -1446,6 +1447,9 @@ def run_session_export_standalone(
         return 0
 
     path = Path(target) if target else Path("exports") / f"aligo_{session_id}.md"
+    if path.exists() and not force:
+        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+        return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
@@ -1456,20 +1460,26 @@ def run_session_export_standalone(
     return 0
 
 
-def _parse_session_export_args(args: list[str]) -> tuple[str | None, bool] | None:
-    """解析 session-export 的 [path] [--stdout]；未知参数或多余路径返回 None。"""
+def _parse_session_export_args(
+    args: list[str],
+) -> tuple[str | None, bool, bool] | None:
+    """解析 session-export 的 [path] [--stdout] [--force]；冲突 / 未知参数返回 None。"""
     to_stdout = False
+    force = False
     paths: list[str] = []
     for item in args:
-        if item.lower() == "--stdout":
+        lowered = item.lower()
+        if lowered == "--stdout":
             to_stdout = True
+        elif lowered == "--force":
+            force = True
         elif item.startswith("-"):
             return None
         else:
             paths.append(item)
-    if len(paths) > 1:
+    if len(paths) > 1 or (to_stdout and paths):
         return None
-    return (paths[0] if paths else None), to_stdout
+    return (paths[0] if paths else None), to_stdout, force
 
 
 def main():
@@ -1551,22 +1561,23 @@ def main():
                 or sys.argv[3].startswith("-")
             ):
                 print(
-                    "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout]"
+                    "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
             parsed_export = _parse_session_export_args(sys.argv[4:])
             if parsed_export is None:
                 print(
-                    "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout]"
+                    "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            target, to_stdout = parsed_export
+            target, to_stdout, force = parsed_export
             sys.exit(
                 run_session_export_standalone(
                     sys.argv[2],
                     sys.argv[3],
                     target=target,
                     to_stdout=to_stdout,
+                    force=force,
                 )
             )
     cli = AligoCLI()

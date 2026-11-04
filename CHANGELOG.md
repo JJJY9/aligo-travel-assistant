@@ -68,6 +68,9 @@
 - 写入行程时按现有最大 `trip_N` 序号递增（此前按条数生成，配合删除功能会与已有行程 id 冲突）
 
 ### 修复
+- 行程 CSV 导出对以 `=` / `+` / `-` / `@` 开头的内容加前导单引号，防止 Excel 公式注入；测试断言 UTF-8 BOM 原始字节
+- CLI `session-export`：`--stdout` 与路径同时使用返回用法错误；默认拒绝覆盖已有文件（`--force` 覆盖）；补充默认路径与 dispatch 用例
+- Markdown 用户数据导出测试增加未归档会话对照，避免「全部标注已归档」的回归被掩盖
 - JSON 后端的会话标题 / 置顶 / 归档在写盘失败时抛错，Web 与 CLI 不再静默报告成功
 - CLI `sessions` / `session-archive` 严格校验参数：未知 / 冲突参数与 `--restore=1` 等写法返回用法错误，以短横线开头的 ID 被拒绝；补充 PG 正常放行与写入失败用例
 - gzip 中间件移到 `RequestContextMiddleware` 内层，压缩响应（含异常 500）仍带安全响应头与请求 ID；新增中间件级用例，SSE 按路径排除不再依赖响应 Content-Type

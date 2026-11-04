@@ -298,11 +298,15 @@ def test_main_accepts_valid_flags(monkeypatch):
     print("✓ dispatch 层合法参数正常执行")
 
 
-def _run_export(user_id, session_id, target=None, to_stdout=False):
+def _run_export(user_id, session_id, target=None, to_stdout=False, force=False):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_session_export_standalone(
-            user_id, session_id, target=target, to_stdout=to_stdout
+            user_id,
+            session_id,
+            target=target,
+            to_stdout=to_stdout,
+            force=force,
         )
     return code, buf.getvalue()
 
@@ -344,12 +348,72 @@ def test_session_export_missing_and_invalid(monkeypatch):
 
 
 def test_session_export_flag_parsing():
-    assert cli._parse_session_export_args([]) == (None, False)
-    assert cli._parse_session_export_args(["out.md"]) == ("out.md", False)
-    assert cli._parse_session_export_args(["--stdout"]) == (None, True)
+    assert cli._parse_session_export_args([]) == (None, False, False)
+    assert cli._parse_session_export_args(["out.md"]) == ("out.md", False, False)
+    assert cli._parse_session_export_args(["--stdout"]) == (None, True, False)
+    assert cli._parse_session_export_args(["--force"]) == (None, False, True)
+    assert cli._parse_session_export_args(["out.md", "--force"]) == (
+        "out.md",
+        False,
+        True,
+    )
+    assert cli._parse_session_export_args(["out.md", "--stdout"]) is None
     assert cli._parse_session_export_args(["a.md", "b.md"]) is None
     assert cli._parse_session_export_args(["--bad"]) is None
-    print("✓ session-export 参数解析")
+    print("✓ session-export 参数解析（--stdout 与路径冲突被拒绝）")
+
+
+def test_session_export_refuses_overwrite(monkeypatch):
+    import tempfile
+
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    target = os.path.join(tempfile.mkdtemp(), "existing.md")
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write("旧内容")
+
+    code, out = _run_export("u1", "s-active", target=target)
+    assert code == 1 and "文件已存在" in out
+    with open(target, encoding="utf-8") as handle:
+        assert handle.read() == "旧内容", "未加 --force 不应覆盖"
+
+    code, out = _run_export("u1", "s-active", target=target, force=True)
+    assert code == 0
+    with open(target, encoding="utf-8") as handle:
+        assert "住宿标准问题" in handle.read()
+    print("✓ 默认拒绝覆盖已有文件，--force 可覆盖")
+
+
+def test_session_export_default_path(monkeypatch):
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_export("u1", "s-active")
+    assert code == 0
+    path = os.path.join(workdir, "exports", "aligo_s-active.md")
+    assert os.path.exists(path)
+    print("✓ 未指定路径时写入 exports/aligo_<session>.md")
+
+
+def test_main_session_export_dispatch(monkeypatch):
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "session-export", "u1", "s-active", "--force"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_s-active.md"))
+    print("✓ dispatch 层 session-export 正常执行")
 
 
 if __name__ == "__main__":
@@ -370,6 +434,9 @@ if __name__ == "__main__":
         test_session_export_to_file,
         test_session_export_to_stdout,
         test_session_export_missing_and_invalid,
+        test_session_export_refuses_overwrite,
+        test_session_export_default_path,
+        test_main_session_export_dispatch,
         test_read_failure,
         test_store_open_failure,
         test_pg_fallback_refused,

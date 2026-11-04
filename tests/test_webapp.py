@@ -1265,6 +1265,14 @@ def test_trips_csv_export():
                     "purpose": "出差,客户拜访",
                 }
             )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": '=HYPERLINK("http://example.invalid")',
+                    "start_date": "2026-12-11",
+                    "purpose": "@SUM(1)",
+                }
+            )
         finally:
             close = getattr(store, "close", None)
             if callable(close):
@@ -1274,9 +1282,12 @@ def test_trips_csv_export():
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/csv")
         assert "attachment" in response.headers.get("content-disposition", "")
+        assert response.content.startswith(b"\xef\xbb\xbf"), "缺少 UTF-8 BOM"
         rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
         assert rows[0] == ["出发地", "目的地", "出发日期", "返程日期", "目的"]
         assert rows[1] == ["北京", "上海", "2026-12-05", "2026-12-07", "出差,客户拜访"]
+        assert rows[2][1] == '\'=HYPERLINK("http://example.invalid")', "公式前缀应被转义"
+        assert rows[2][4] == "'@SUM(1)"
 
         empty_user = _unique_user("web_test_trips_csv_empty")
         try:
@@ -1620,6 +1631,14 @@ def test_export_markdown():
             "/api/chat",
             json={"message": "你好", "user_id": user_id, "session_id": "sess-md-export"},
         )
+        client.post(
+            "/api/chat",
+            json={
+                "message": "另一个问题",
+                "user_id": user_id,
+                "session_id": "sess-md-other",
+            },
+        )
         client.put(
             "/api/sessions/sess-md-export/archive",
             json={"user_id": user_id, "archived": True},
@@ -1637,6 +1656,8 @@ def test_export_markdown():
         assert "## 最近会话" in text and "你好" in text
         assert "（已归档）" in text
         assert "归档会话：1" in text
+        assert "另一个问题（2 条消息）" in text
+        assert "另一个问题（2 条消息）（已归档）" not in text, "未归档会话不应带标记"
 
         invalid = client.get("/api/export", params={"user_id": user_id, "format": "pdf"})
         assert invalid.status_code == 422
