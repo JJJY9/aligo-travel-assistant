@@ -430,20 +430,44 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", "") or "")
 
 
-def _enforce_rate_limit(state: AligoWebApp, user_id: str, request: Request) -> None:
-    """对对话接口做滑动窗口限流（按 客户端 + 用户，以及客户端 IP 两个维度）。"""
+def _enforce_rate_limit(
+    state: AligoWebApp, user_id: str, request: Request
+) -> dict[str, str]:
+    """对对话接口做滑动窗口限流（按 客户端 + 用户，以及客户端 IP 两个维度）。
+
+    Returns:
+        供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
+    """
     client = request.client.host if request.client else "unknown"
-    retry_after = state.rate_limiter.check(f"{client}:{user_id}")
+    user_key = f"{client}:{user_id}"
+    retry_after = state.rate_limiter.check(user_key)
     ip_retry_after = state.ip_limiter.check(client)
-    if retry_after is None and ip_retry_after is None:
-        return
-    # HTTP Retry-After 需要整数秒，向上取整并至少 1 秒
-    wait_seconds = max(1, math.ceil(max(retry_after or 0.0, ip_retry_after or 0.0)))
-    raise HTTPException(
-        status_code=429,
-        detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
-        headers={"Retry-After": str(wait_seconds)},
-    )
+    if retry_after is not None or ip_retry_after is not None:
+        # HTTP Retry-After 需要整数秒，向上取整并至少 1 秒
+        wait_seconds = max(
+            1, math.ceil(max(retry_after or 0.0, ip_retry_after or 0.0))
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(state.rate_limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+    remaining_user, reset_user = state.rate_limiter.status(user_key)
+    remaining_ip, reset_ip = state.ip_limiter.status(client)
+    if remaining_user <= remaining_ip:
+        remaining, reset = remaining_user, reset_user
+    else:
+        remaining, reset = remaining_ip, reset_ip
+    return {
+        "X-RateLimit-Limit": str(state.rate_limiter.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
 
 
 # ---------- 长期记忆读取 ----------
@@ -1389,8 +1413,10 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.post("/api/chat")
-    async def chat(request: Request, payload: ChatRequest) -> dict[str, Any]:
-        _enforce_rate_limit(state, payload.user_id, request)
+    async def chat(
+        request: Request, payload: ChatRequest, response: Response
+    ) -> dict[str, Any]:
+        rate_headers = _enforce_rate_limit(state, payload.user_id, request)
         session = state.get_session(payload.user_id, payload.session_id)
         async with state.lock_for(payload.user_id):
             try:
@@ -1405,12 +1431,13 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=500,
                     detail=f"处理失败：{exc}（请求 ID：{_request_id(request)}）",
                 ) from exc
+        response.headers.update(rate_headers)
         return {"session_id": session.session_id, **result}
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
-        _enforce_rate_limit(state, payload.user_id, request)
+        rate_headers = _enforce_rate_limit(state, payload.user_id, request)
         rid = _request_id(request)
         session = state.get_session(payload.user_id, payload.session_id)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -1482,6 +1509,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
+                **rate_headers,
             },
         )
 

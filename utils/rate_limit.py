@@ -51,6 +51,19 @@ class RateLimiter:
         events.append(now)
         return None
 
+    def status(self, key: str) -> tuple[int, float]:
+        """返回 (剩余次数, 窗口重置剩余秒数)，不记录新请求。"""
+        now = time.monotonic()
+        events = self._events.get(key)
+        if events is None:
+            return self.limit, 0.0
+        while events and now - events[0] >= self.window_sec:
+            events.popleft()
+        if not events:
+            return self.limit, 0.0
+        reset = max(0.0, self.window_sec - (now - events[0]))
+        return max(0, self.limit - len(events)), reset
+
     def _sweep(self, now: float, force: bool = False, reserve: int = 0) -> None:
         """清理已过期 / 空 key；force 时若仍超上限，淘汰事件最旧的 key。
 

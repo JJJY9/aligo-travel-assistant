@@ -52,8 +52,20 @@ def test_key_eviction_bounds_memory():
     print("✓ key 数量有上限且过期 key 会被清理")
 
 
+def test_status_reports_remaining():
+    limiter = RateLimiter(limit=2, window_sec=60)
+    assert limiter.status("k") == (2, 0.0)
+    assert limiter.check("k") is None
+    remaining, reset = limiter.status("k")
+    assert remaining == 1 and 0 < reset <= 60
+    limiter.check("k")
+    assert limiter.status("k")[0] == 0
+    print("✓ status 报告剩余次数 / 重置时间")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
     test_key_eviction_bounds_memory()
+    test_status_reports_remaining()
     print("\n全部通过")

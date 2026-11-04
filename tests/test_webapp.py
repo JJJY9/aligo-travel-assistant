@@ -127,6 +127,8 @@ def test_chat_stream_events():
         ) as response:
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("text/event-stream")
+            assert response.headers["x-ratelimit-limit"] == "30"
+            assert "x-ratelimit-remaining" in response.headers
             events = []
             for line in response.iter_lines():
                 if line.startswith("data:"):
@@ -1458,6 +1460,30 @@ def test_request_id_header():
     print("✓ X-Request-ID 透传 / 自动生成")
 
 
+def test_rate_limit_headers():
+    client = _client()
+    user_id = _unique_user("web_test_rl_headers")
+    try:
+        first = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "rl-h1"},
+        )
+        assert first.status_code == 200
+        assert first.headers["x-ratelimit-limit"] == "30"
+        remaining_first = int(first.headers["x-ratelimit-remaining"])
+        assert int(first.headers["x-ratelimit-reset"]) >= 1
+
+        second = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "rl-h2"},
+        )
+        remaining_second = int(second.headers["x-ratelimit-remaining"])
+        assert remaining_second == remaining_first - 1
+        print("✓ 对话响应附带 X-RateLimit-Limit / Remaining / Reset")
+    finally:
+        _cleanup(user_id)
+
+
 def test_chat_rate_limit():
     from utils.rate_limit import RateLimiter
 
@@ -1482,6 +1508,7 @@ def test_chat_rate_limit():
         )
         assert limited.status_code == 429
         assert "Retry-After" in limited.headers
+        assert limited.headers["x-ratelimit-remaining"] == "0"
         assert "请求 ID" in limited.json()["detail"]
 
         other = client.post(
@@ -2350,6 +2377,7 @@ if __name__ == "__main__":
     test_docs_csp_allows_cdn()
     test_unhandled_error_returns_500_with_headers()
     test_chat_rate_limit()
+    test_rate_limit_headers()
     test_chat_rate_limit_ip_bucket()
     test_session_rename()
     test_session_pin()
