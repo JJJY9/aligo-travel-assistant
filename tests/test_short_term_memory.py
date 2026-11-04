@@ -51,9 +51,45 @@ def test_truncate_empty():
     print("✓ 空历史返回 0")
 
 
+def test_max_turns_evicts_oldest():
+    memory = ShortTermMemory(max_turns=2)
+    for index in range(3):
+        memory.add_message("user", f"问题 {index}")
+        memory.add_message("assistant", f"回答 {index}")
+    assert len(memory.messages) == 4
+    assert memory.messages[0]["content"] == "问题 1"
+    print("✓ max_turns 滑动窗口淘汰最旧消息")
+
+
+def test_recent_context_and_string():
+    memory = _seeded()
+    recent = memory.get_recent_context(1)
+    assert [item["content"] for item in recent] == ["问题 2", "回答 2"]
+    text = memory.get_context_string(1)
+    assert "用户: 问题 2" in text and "助手: 回答 2" in text
+    assert "问题 1" not in text
+    print("✓ get_recent_context / get_context_string 按轮截取")
+
+
+def test_statistics_and_clear():
+    memory = _seeded()
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 4
+    assert stats["max_turns"] == 10
+    assert stats["oldest_message_time"] and stats["newest_message_time"]
+    memory.clear()
+    assert memory.messages == []
+    assert memory.get_statistics()["total_messages"] == 0
+    assert memory.get_context_string() == "无历史对话"
+    print("✓ 统计信息与 clear")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
     test_truncate_trailing_user_only()
     test_truncate_empty()
+    test_max_turns_evicts_oldest()
+    test_recent_context_and_string()
+    test_statistics_and_clear()
     print("\n全部通过")
