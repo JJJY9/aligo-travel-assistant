@@ -208,6 +208,9 @@ def test_add_document_requires_initialized_db(monkeypatch):
 
 
 def test_search_documents_delegates_to_agent(monkeypatch):
+    import tempfile
+    from pathlib import Path
+
     class _SearchAgent:
         def __init__(self):
             self.calls = []
@@ -216,6 +219,10 @@ def test_search_documents_delegates_to_agent(monkeypatch):
             self.calls.append((query, top_k, strict))
             return [{"content": "命中"}]
 
+    db = Path(tempfile.mkdtemp()) / "milvus_lite.db"
+    db.write_text("placeholder", encoding="utf-8")
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: db)
+
     agent = _SearchAgent()
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
     result = knowledge_admin.search_documents("住宿标准", top_k=3)
@@ -223,6 +230,29 @@ def test_search_documents_delegates_to_agent(monkeypatch):
     # strict=True：后端故障要抛出（映射 503），不能伪装成“没有相关内容”
     assert agent.calls == [("住宿标准", 3, True)]
     print("✓ 语义检索委托 RAG Agent（严格模式）")
+
+
+def test_search_documents_requires_initialized_db(monkeypatch):
+    """未初始化的知识库不能被一次检索悄悄建成空库。"""
+    import tempfile
+    from pathlib import Path
+
+    called = {"agent": 0}
+
+    def fake_agent():
+        called["agent"] += 1
+        raise AssertionError("未初始化时不应构造 RAG Agent")
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "knowledge_db_path",
+        lambda: Path(tempfile.mkdtemp()) / "missing.db",
+    )
+    monkeypatch.setattr(knowledge_admin, "_get_agent", fake_agent)
+    with pytest.raises(FileNotFoundError, match="未初始化"):
+        knowledge_admin.search_documents("住宿标准")
+    assert called["agent"] == 0
+    print("✓ 语义检索拒绝未初始化知识库（不会新建空库）")
 
 
 def test_rag_agent_strict_search_raises_when_uninitialized(monkeypatch):
@@ -274,19 +304,22 @@ def test_import_documents_sanitizes(monkeypatch):
             {"content": "  a  ", "metadata": {"category": "x"}},
             {"content": ""},
             "not-a-dict",
+            {"content": None},
+            {"content": False},
+            {"content": 0},
             {
                 "content": "b" * 2100,
                 "metadata": {f"k{i}": "v" * 300 for i in range(15)},
             },
         ]
     )
-    assert result == {"imported": 2, "skipped": 2}
+    assert result == {"imported": 2, "skipped": 5}
     sent = agent.calls[0]
-    assert sent[0]["content"] == "a"
-    assert sent[1]["content"] == "b" * 2000
+    assert [item["content"] for item in sent] == ["a", "b" * 2000]
+    assert all(item["content"] not in ("None", "False", "0") for item in sent)
     assert len(sent[1]["metadata"]) == 10
     assert max(len(value) for value in sent[1]["metadata"].values()) == 200
-    print("✓ 导入知识片段（跳过空项 / 截断超长字段）")
+    print("✓ 导入知识片段（跳过空项 / 非字符串内容 / 截断超长字段）")
 
 
 def test_import_skips_existing_and_duplicate_content(monkeypatch):
@@ -311,6 +344,38 @@ def test_import_skips_existing_and_duplicate_content(monkeypatch):
     assert result == {"imported": 1, "skipped": 2}
     assert [item["content"] for item in agent.calls[0]] == ["新内容"]
     print("✓ 导入按内容去重（已有 / 同批次重复）")
+
+
+def test_import_failure_reports_partial_count(monkeypatch):
+    """第二批失败时应报告已持久化的数量（用户可判断是否需重试 / 核对）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin, "list_documents", lambda limit, offset=0: {"total": 0, "items": []}
+    )
+
+    class _FailSecondBatch:
+        def __init__(self):
+            self.calls = 0
+
+        def add_documents(self, documents):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "status": "success",
+                    "ids": list(range(len(documents))),
+                    "total_count": len(documents),
+                }
+            raise RuntimeError("Milvus 故障")
+
+    agent = _FailSecondBatch()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    with pytest.raises(RuntimeError, match="已导入 500 条"):
+        knowledge_admin.import_documents(
+            [{"content": f"item-{i}"} for i in range(800)]
+        )
+    print("✓ 分批导入失败时报告已导入数量")
 
 
 def test_import_empty_and_missing_db(monkeypatch):
@@ -370,11 +435,13 @@ if __name__ == "__main__":
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,
         test_search_documents_delegates_to_agent,
+        test_search_documents_requires_initialized_db,
         test_rag_agent_strict_search_raises_when_uninitialized,
         test_export_documents_sorted_and_stripped,
         test_import_documents_sanitizes,
         test_import_skips_existing_and_duplicate_content,
         test_import_chunks_large_documents,
+        test_import_failure_reports_partial_count,
         test_import_empty_and_missing_db,
     ):
         mp = pytest.MonkeyPatch()

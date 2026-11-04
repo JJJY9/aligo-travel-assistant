@@ -1041,8 +1041,8 @@ def run_knowledge_import_standalone(source: str) -> int:
         return 1
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"读取失败：{exc}")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"读取失败：{exc}（文件需为 UTF-8 编码的 JSON）")
         return 1
 
     documents = (

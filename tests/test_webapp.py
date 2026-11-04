@@ -2304,6 +2304,14 @@ def test_knowledge_search_api(monkeypatch):
     assert (
         client.get("/api/knowledge/search", params={"q": "住宿"}).status_code == 503
     )
+
+    def missing(query, top_k):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "search_documents", missing)
+    missing_response = client.get("/api/knowledge/search", params={"q": "住宿"})
+    assert missing_response.status_code == 503
+    assert "未初始化" in missing_response.json()["detail"]
     print("✓ /api/knowledge/search 语义检索（参数 / 结果 / 503）")
 
 
@@ -2386,6 +2394,14 @@ def test_knowledge_transfer_api(monkeypatch):
     assert imported.status_code == 200
     assert imported.json()["imported"] == 1
     assert calls["documents"] == [{"content": "x", "metadata": {"category": "c"}}]
+
+    # 条目不是对象（null）时交给 import_documents 跳过，不能整批 422
+    mixed = client.post(
+        "/api/knowledge/import",
+        json={"documents": [{"content": "x"}, None]},
+    )
+    assert mixed.status_code == 200
+    assert calls["documents"] == [{"content": "x"}, None]
 
     assert (
         client.post("/api/knowledge/import", json={"documents": []}).status_code == 422

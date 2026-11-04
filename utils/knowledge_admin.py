@@ -204,7 +204,12 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
         if not isinstance(item, dict):
             skipped += 1
             continue
-        content = str(item.get("content", "")).strip()
+        raw_content = item.get("content")
+        # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
+        if not isinstance(raw_content, str):
+            skipped += 1
+            continue
+        content = raw_content.strip()
         if not content:
             skipped += 1
             continue
@@ -246,9 +251,18 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
 
         # 分块嵌入 / 插入，控制大文件（CLI 导入）的峰值内存
         for start in range(0, len(unique), _IMPORT_CHUNK):
-            result = agent.add_documents(unique[start : start + _IMPORT_CHUNK])
+            batch_no = start // _IMPORT_CHUNK + 1
+            try:
+                result = agent.add_documents(unique[start : start + _IMPORT_CHUNK])
+            except Exception as exc:  # noqa: BLE001 - 保留已导入数量供上层展示
+                raise RuntimeError(
+                    f"第 {batch_no} 批导入失败（已导入 {len(imported)} 条）：{exc}"
+                ) from exc
             if result.get("status") != "success":
-                raise RuntimeError(str(result.get("message") or "导入知识片段失败"))
+                raise RuntimeError(
+                    f"第 {batch_no} 批导入失败（已导入 {len(imported)} 条）："
+                    f"{result.get('message') or '导入知识片段失败'}"
+                )
             imported.extend(int(doc_id) for doc_id in (result.get("ids") or []))
     return {"imported": len(imported), "skipped": skipped}
 
@@ -276,6 +290,10 @@ def search_documents(query: str, top_k: int = 5) -> list[dict[str, Any]]:
         FileNotFoundError: 知识库未初始化
         Exception: 嵌入 / Milvus 检索失败（由上层映射为 503，不能伪装成无结果）
     """
+    # RAG Agent 构造时会「按需」新建空数据库：未初始化的知识库必须先拒绝，
+    # 否则一次语义检索会把缺失的知识库悄悄建成空库并返回 200 无结果
+    if not knowledge_db_path().exists():
+        raise FileNotFoundError("知识库未初始化")
     agent = _get_agent()
     return agent.search_knowledge(query, top_k=top_k, strict=True)
 
