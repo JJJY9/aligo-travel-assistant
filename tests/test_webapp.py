@@ -133,7 +133,9 @@ def test_chat_stream_events():
                     events.append(json.loads(line[5:].strip()))
 
         types = [event["type"] for event in events]
-        assert types[0] == "phase"
+        assert types[0] == "session", "先推送会话 ID，停止 / 失败后仍可编辑"
+        assert events[0]["session_id"] == "sess-stream"
+        assert types[1] == "phase"
         assert "plan" in types
         assert types[-1] == "done"
         done = events[-1]
@@ -231,8 +233,10 @@ def test_chat_stream_failure_event():
         RESILIENCE_CONFIG.update(original)
 
     assert events and events[-1]["type"] == "error"
+    assert events[0]["type"] == "session", "失败时也应先收到会话 ID"
+    assert events[0]["session_id"] == "sess-fail-stream"
     assert "处理失败" in events[-1]["message"]
-    print("✓ 流式对话失败推送 error 事件")
+    print("✓ 流式对话失败推送 error 事件（先推送会话 ID）")
 
 
 def test_sessions_listing_and_delete():
@@ -1369,6 +1373,24 @@ def test_trips_csv_storage_failure_maps_503(monkeypatch):
     print("✓ 行程 CSV 导出读取失败 → 503")
 
 
+def test_delete_session_storage_failure_maps_503(monkeypatch):
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def delete_chat_session(self, session_id):
+            raise RuntimeError("disk full")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    response = _client().delete("/api/sessions/s1", params={"user_id": "u1"})
+    assert response.status_code == 503
+    print("✓ 删除会话存储失败 → 503")
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
@@ -2204,6 +2226,7 @@ if __name__ == "__main__":
     try:
         test_session_metadata_storage_failure_maps_503(_mp_storage)
         test_trips_csv_storage_failure_maps_503(_mp_storage)
+        test_delete_session_storage_failure_maps_503(_mp_storage)
     finally:
         _mp_storage.undo()
     test_sessions_pagination()

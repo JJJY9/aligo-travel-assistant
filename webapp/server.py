@@ -1245,17 +1245,22 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.delete("/api/sessions/{session_id}")
-    def delete_session(
+    async def delete_session(
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
-        store = _open_long_term(user_id)
-        try:
-            removed = store.delete_chat_session(session_id)
-        finally:
-            _close_long_term(store)
-        state.drop_session(session_id)
-        clear_short_term_session(session_id)
+        """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
+        async with state.lock_for(user_id):
+            store = _open_long_term(user_id)
+            try:
+                removed = store.delete_chat_session(session_id)
+            except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
+                logger.warning("删除会话失败: %s", exc)
+                raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            finally:
+                _close_long_term(store)
+            state.drop_session(session_id)
+            clear_short_term_session(session_id)
         return {"session_id": session_id, "deleted": removed}
 
     @app.delete("/api/sessions/{session_id}/last-turn")
@@ -1344,6 +1349,15 @@ def create_app(model: Any = None) -> FastAPI:
                 )
 
         async def event_stream() -> Any:
+            # 先告知会话 ID：即使生成被停止或失败，前端也能对这条提问执行编辑 / 重试
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "session", "session_id": session.session_id},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
             task = asyncio.create_task(run())
             heartbeat: asyncio.Task[None] | None = None
 
