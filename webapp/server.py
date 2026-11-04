@@ -38,7 +38,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 
 from agents.conversation import ConversationRuntime
@@ -330,6 +330,14 @@ class ChatRequest(BaseModel):
     user_id: str = Field(default="web_user", pattern=_ID_PATTERN)
     session_id: str | None = Field(default=None, pattern=_ID_PATTERN)
 
+    @field_validator("message")
+    @classmethod
+    def _message_not_blank(cls, value: str) -> str:
+        # min_length 在 strip 之前校验，"   " 会通过并浪费一次 LLM 调用
+        if not value.strip():
+            raise ValueError("消息不能为空")
+        return value
+
 
 _ShortText = Annotated[str, Field(max_length=200)]
 _FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
@@ -385,6 +393,20 @@ class TripPayload(BaseModel):
     end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
     purpose: str = Field(default="出差", max_length=20)
 
+    @field_validator("destination")
+    @classmethod
+    def _destination_not_blank(cls, value: str) -> str:
+        # 纯空白通过 min_length，但去重按空目的地跳过，会不断产生重复记录
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("目的地不能为空")
+        return cleaned
+
+    @field_validator("origin", "purpose")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        return value.strip()
+
 
 class TripUpdatePayload(BaseModel):
     """更新行程（仅修改提供的字段）。"""
@@ -395,6 +417,21 @@ class TripUpdatePayload(BaseModel):
     start_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
     end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
     purpose: str | None = Field(default=None, max_length=20)
+
+    @field_validator("destination")
+    @classmethod
+    def _destination_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("目的地不能为空")
+        return cleaned
+
+    @field_validator("origin", "purpose")
+    @classmethod
+    def _strip_optional_text(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
 
 class SessionTitlePayload(BaseModel):
@@ -438,6 +475,9 @@ class AligoWebApp:
     max_sessions = 50
     # 用户锁表同样有上限：用户 ID 由请求方提供，未命中时淘汰未持有的锁
     max_locks = 1000
+    # 已删除会话的短时墓碑：在途 / 重连的对话不能把刚删除的会话写回（复活）
+    max_tombstones = 1000
+    tombstone_ttl_sec = 300.0
 
     def __init__(self, model: Any = None) -> None:
         init_agentscope()
@@ -450,6 +490,7 @@ class AligoWebApp:
         )
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
+        self._deleted_sessions: OrderedDict[str, float] = OrderedDict()
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
@@ -463,30 +504,53 @@ class AligoWebApp:
             window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
         )
 
+    @staticmethod
+    def _session_key(user_id: str, session_id: str) -> str:
+        return f"{user_id}\n{session_id}"
+
     def get_session(self, user_id: str, session_id: str | None) -> _WebSession:
         if not session_id:
             session_id = uuid.uuid4().hex[:12]
-        session = self.sessions.get(session_id)
-        if session is not None and session.user_id != user_id:
-            # 同一会话 ID 被另一个用户使用：丢弃旧会话，避免串用记忆
-            self.drop_session(session_id)
-            session = None
+        # 缓存键包含用户：同一 session_id 被不同用户使用时各有独立运行时，
+        # 互不覆盖，也不会因为别人关闭同名会话而丢掉自己在进程内的短期记忆
+        key = self._session_key(user_id, session_id)
+        session = self.sessions.get(key)
         if session is None:
             # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
             session = _WebSession(user_id, session_id, wrap_usage_tracking(self.model), self.breaker)
-            self.sessions[session_id] = session
+            self.sessions[key] = session
             while len(self.sessions) > self.max_sessions:
                 _, evicted = self.sessions.popitem(last=False)
                 evicted.close()
         else:
-            self.sessions.move_to_end(session_id)
+            self.sessions.move_to_end(key)
         return session
 
-    def drop_session(self, session_id: str) -> None:
-        """移除并关闭一个会话。"""
-        session = self.sessions.pop(session_id, None)
+    def drop_session(self, user_id: str, session_id: str) -> None:
+        """移除并关闭某用户的一个会话（其它用户的同名会话不受影响）。"""
+        session = self.sessions.pop(self._session_key(user_id, session_id), None)
         if session is not None:
             session.close()
+
+    def mark_deleted(self, user_id: str, session_id: str) -> None:
+        """记录短时墓碑，阻止在途对话把刚删除的会话写回。"""
+        key = self._session_key(user_id, session_id)
+        self._deleted_sessions[key] = time.monotonic()
+        self._deleted_sessions.move_to_end(key)
+        while len(self._deleted_sessions) > self.max_tombstones:
+            self._deleted_sessions.popitem(last=False)
+
+    def is_recently_deleted(self, user_id: str, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        key = self._session_key(user_id, session_id)
+        created = self._deleted_sessions.get(key)
+        if created is None:
+            return False
+        if time.monotonic() - created > self.tombstone_ttl_sec:
+            self._deleted_sessions.pop(key, None)
+            return False
+        return True
 
     def close_all(self) -> None:
         """关闭所有会话（进程退出时调用）。"""
@@ -525,8 +589,10 @@ def _enforce_rate_limit(
     """
     client = request.client.host if request.client else "unknown"
     user_key = f"{client}:{user_id}"
-    retry_after = state.rate_limiter.check(user_key)
-    ip_retry_after = state.ip_limiter.check(client)
+    # 先用 peek 检查两个桶，都有额度才记录：否则被 429 的请求会消耗
+    # 另一个桶的配额，一个客户端的重试循环会把同 IP 的其它客户端一起锁死
+    retry_after = state.rate_limiter.peek(user_key)
+    ip_retry_after = state.ip_limiter.peek(client)
     if retry_after is not None or ip_retry_after is not None:
         # 429 的额度头描述真正触发限制的桶（等待更久的那个）
         if (retry_after or 0.0) >= (ip_retry_after or 0.0):
@@ -547,6 +613,8 @@ def _enforce_rate_limit(
                 "X-RateLimit-Reset": str(wait_seconds),
             },
         )
+    state.rate_limiter.check(user_key)
+    state.ip_limiter.check(client)
     remaining_user, reset_user = state.rate_limiter.status(user_key)
     remaining_ip, reset_ip = state.ip_limiter.status(client)
     # 额度头取自当前更紧的桶（剩余更少；剩余相同时取重置更晚的），
@@ -885,7 +953,12 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     if end < start:
         logger.warning("行程结束日期早于出发日期，按单日处理: %s", trip.get("trip_id"))
         end = start
-    end_exclusive = (datetime.strptime(end, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+    end_dt = datetime.strptime(end, "%Y%m%d")
+    try:
+        # ICS 的 DTEND 是排他的；9999-12-31 无法再加一天
+        end_exclusive = (end_dt + timedelta(days=1)).strftime("%Y%m%d")
+    except OverflowError:
+        end_exclusive = end
 
     origin = str(trip.get("origin") or "出发地")
     destination = str(trip.get("destination") or "目的地")
@@ -1309,8 +1382,14 @@ def create_app(model: Any = None) -> FastAPI:
         """设置或清除会话自定义标题（空标题恢复自动标题）。"""
         store = _open_long_term(payload.user_id)
         try:
+            # 与归档 / 导出接口一致：不存在的会话不能写入幽灵标题，
+            # 否则复用该 id 的新对话会继承旧标题
+            if not store.get_chat_history(session_id=session_id):
+                raise LookupError("会话不存在")
             store.set_session_title(session_id, payload.title)
             saved = (store.get_session_titles() or {}).get(session_id, "")
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="会话不存在") from exc
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("设置会话标题失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
@@ -1326,8 +1405,12 @@ def create_app(model: Any = None) -> FastAPI:
         """置顶 / 取消置顶会话。"""
         store = _open_long_term(payload.user_id)
         try:
+            if not store.get_chat_history(session_id=session_id):
+                raise LookupError("会话不存在")
             store.set_session_pinned(session_id, payload.pinned)
             pinned = store.get_pinned_sessions()
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="会话不存在") from exc
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("设置会话置顶失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
@@ -1410,16 +1493,23 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
         async with state.lock_for(user_id):
-            store = _open_long_term(user_id)
+            def _delete() -> int:
+                store = _open_long_term(user_id)
+                try:
+                    return store.delete_chat_session(session_id)
+                finally:
+                    _close_long_term(store)
+
             try:
-                removed = store.delete_chat_session(session_id)
+                # PostgreSQL / JSON 的打开与删除是阻塞 IO，放到线程池，
+                # 慢库不能让整个事件循环（其它会话的 SSE 心跳）停住
+                removed = await asyncio.to_thread(_delete)
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
-            finally:
-                _close_long_term(store)
-            state.drop_session(session_id)
-            clear_short_term_session(session_id, user_id)
+            await asyncio.to_thread(state.drop_session, user_id, session_id)
+            state.mark_deleted(user_id, session_id)
+            await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}
 
     @app.delete("/api/sessions/{session_id}/last-turn")
@@ -1434,26 +1524,36 @@ def create_app(model: Any = None) -> FastAPI:
         内容（例如这条提问在意图识别阶段就失败、并未写入历史），避免误删上一轮。
         """
         async with state.lock_for(user_id):
-            store = _open_long_term(user_id)
+            def _remove_last_turn() -> int:
+                store = _open_long_term(user_id)
+                try:
+                    return store.delete_last_turn(session_id, expect)
+                finally:
+                    _close_long_term(store)
+
             try:
-                removed = store.delete_last_turn(session_id, expect)
+                # 阻塞的数据库 / 文件操作放到线程池
+                removed = await asyncio.to_thread(_remove_last_turn)
             except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
                 logger.warning("删除最后一轮对话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
-            finally:
-                _close_long_term(store)
 
             if removed > 0:
-                # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
-                # Redis 键按 user_id + session_id 隔离，未缓存的会话也可安全清理。
-                try:
-                    session = state.sessions.get(session_id)
-                    if session is not None and session.user_id == user_id:
+                def _truncate_short_term() -> None:
+                    # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
+                    # Redis 键按 user_id + session_id 隔离，未缓存的会话也可安全清理。
+                    session = state.sessions.get(
+                        state._session_key(user_id, session_id)
+                    )
+                    if session is not None:
                         session.runtime.memory.short_term.truncate_last_turn(expect)
                     else:
                         create_short_term_memory(
                             session_id, user_id=user_id
                         ).truncate_last_turn(expect)
+
+                try:
+                    await asyncio.to_thread(_truncate_short_term)
                 except Exception as exc:  # noqa: BLE001 - 缓存清理失败只记录
                     logger.warning("清理短期记忆失败（%s）: %s", session_id, exc)
         return {
@@ -1467,8 +1567,15 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request, payload: ChatRequest, response: Response
     ) -> dict[str, Any]:
         rate_headers = _enforce_rate_limit(state, payload.user_id, request)
-        session = state.get_session(payload.user_id, payload.session_id)
         async with state.lock_for(payload.user_id):
+            if state.is_recently_deleted(payload.user_id, payload.session_id):
+                raise HTTPException(
+                    status_code=404, detail="会话已删除，请开始新对话"
+                )
+            # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池
+            session = await asyncio.to_thread(
+                state.get_session, payload.user_id, payload.session_id
+            )
             try:
                 result = await session.runtime.ask(payload.message)
             except CircuitOpenError as exc:
@@ -1489,51 +1596,74 @@ def create_app(model: Any = None) -> FastAPI:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
         rate_headers = _enforce_rate_limit(state, payload.user_id, request)
         rid = _request_id(request)
-        session = state.get_session(payload.user_id, payload.session_id)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
-        async def run() -> None:
-            try:
-                async with state.lock_for(payload.user_id):
-                    result = await session.runtime.ask(
-                        payload.message, on_event=queue.put_nowait
-                    )
-                await queue.put({"type": "done", "session_id": session.session_id, **result})
-            except asyncio.CancelledError:
-                raise
-            except CircuitOpenError:
-                await queue.put(
-                    {
-                        "type": "error",
-                        "message": f"服务暂时不可用，请稍后再试（请求 ID：{rid}）",
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001 - 通过事件返回友好错误
-                await queue.put(
-                    {"type": "error", "message": f"处理失败：{exc}（请求 ID：{rid}）"}
-                )
-
         async def event_stream() -> Any:
-            # 先告知会话 ID：即使生成被停止或失败，前端也能对这条提问执行编辑 / 重试
-            yield (
-                "data: "
-                + json.dumps(
-                    {"type": "session", "session_id": session.session_id},
-                    ensure_ascii=False,
-                )
-                + "\n\n"
-            )
-            task = asyncio.create_task(run())
+            # 在推送第一个事件前拿到用户锁：删除会话会等待本轮结束。
+            # 若像以前那样在 get_session 之后才加锁，流已返回、run 尚未开始时
+            # 到达的删除会让本轮结束时把已删除的会话重新写回。
+            lock = state.lock_for(payload.user_id)
+            await lock.acquire()
+            task: asyncio.Task[None] | None = None
             heartbeat: asyncio.Task[None] | None = None
-
-            async def send_heartbeat() -> None:
-                while True:
-                    await asyncio.sleep(SSE_HEARTBEAT_SEC)
-                    await queue.put({"type": "heartbeat"})
-
-            if SSE_HEARTBEAT_SEC > 0:
-                heartbeat = asyncio.create_task(send_heartbeat())
             try:
+                if state.is_recently_deleted(payload.user_id, payload.session_id):
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {"type": "error", "message": "会话已删除，请开始新对话"},
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    return
+                session = await asyncio.to_thread(
+                    state.get_session, payload.user_id, payload.session_id
+                )
+
+                async def run() -> None:
+                    try:
+                        result = await session.runtime.ask(
+                            payload.message, on_event=queue.put_nowait
+                        )
+                        await queue.put(
+                            {"type": "done", "session_id": session.session_id, **result}
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except CircuitOpenError:
+                        await queue.put(
+                            {
+                                "type": "error",
+                                "message": f"服务暂时不可用，请稍后再试（请求 ID：{rid}）",
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 通过事件返回友好错误
+                        await queue.put(
+                            {
+                                "type": "error",
+                                "message": f"处理失败：{exc}（请求 ID：{rid}）",
+                            }
+                        )
+
+                # 先告知会话 ID：即使生成被停止或失败，前端也能对这条提问执行编辑 / 重试
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {"type": "session", "session_id": session.session_id},
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+                task = asyncio.create_task(run())
+
+                async def send_heartbeat() -> None:
+                    while True:
+                        await asyncio.sleep(SSE_HEARTBEAT_SEC)
+                        await queue.put({"type": "heartbeat"})
+
+                if SSE_HEARTBEAT_SEC > 0:
+                    heartbeat = asyncio.create_task(send_heartbeat())
                 while True:
                     event = await queue.get()
                     if event.get("type") == "heartbeat":
@@ -1547,10 +1677,11 @@ def create_app(model: Any = None) -> FastAPI:
                     heartbeat.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await heartbeat
-                if not task.done():
+                if task is not None and not task.done():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
+                lock.release()
 
         return StreamingResponse(
             event_stream(),
@@ -1876,6 +2007,9 @@ def main() -> None:
         host=args.host,
         port=args.port,
         log_level="info",
+        # h11 默认 16 KB 的请求行上限放不下长中文提问的 expect 查询串
+        # （4000 字 × 9 字节 percent-encoding），编辑 / 重发会被协议层拒绝
+        h11_max_incomplete_event_size=64 * 1024,
         # 自带访问日志不记录查询串（避免把编辑原文等用户内容写入日志），
         # /api/ 请求由 RequestContextMiddleware 结构化记录
         access_log=False,

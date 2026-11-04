@@ -308,15 +308,77 @@ def test_export_filename_is_ascii():
     print("✓ 中文用户 ID 的导出文件名安全")
 
 
+def test_trip_whitespace_destination_rejected():
+    """纯空白目的地通过 min_length，但会被去重跳过并产生重复记录。"""
+    client = _client()
+    user_id = _unique_user("web_test_blank_trip")
+    try:
+        response = client.post(
+            "/api/trips",
+            json={"user_id": user_id, "destination": "   ", "start_date": "2026-12-01"},
+        )
+        assert response.status_code == 422
+        chat = client.post("/api/chat", json={"message": "   ", "user_id": user_id})
+        assert chat.status_code == 422, "纯空白消息不应进入 LLM 调用"
+        print("✓ 纯空白目的地 / 消息被拒绝")
+    finally:
+        _cleanup(user_id)
+
+
+def test_ics_handles_overflow_end_date():
+    """9999-12-31 的行程不能让日历导出 500（DTEND 无法再加一天）。"""
+    client = _client()
+    user_id = _unique_user("web_test_ics_max")
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "9999-12-31",
+                "end_date": "9999-12-31",
+            },
+        )
+        assert created.status_code == 201
+        trip_id = created.json()["trip_id"]
+        single = client.get(
+            f"/api/trips/{trip_id}/calendar", params={"user_id": user_id}
+        )
+        assert single.status_code == 200 and "BEGIN:VCALENDAR" in single.text
+        all_cal = client.get("/api/trips/calendar", params={"user_id": user_id})
+        assert all_cal.status_code == 200
+        print("✓ 9999-12-31 行程的日历导出不再 500")
+    finally:
+        _cleanup(user_id)
+
+
 def test_session_lru_eviction():
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
     state.max_sessions = 2
     for session_id in ("s-a", "s-b", "s-c"):
         state.get_session("web_test_lru", session_id)
-    assert list(state.sessions.keys()) == ["s-b", "s-c"]
+    assert list(state.sessions.keys()) == [
+        "web_test_lru\ns-b",
+        "web_test_lru\ns-c",
+    ]
     state.close_all()
     print("✓ 会话缓存按 LRU 淘汰并释放")
+
+
+def test_session_cache_is_user_scoped():
+    """同一 session_id 下不同用户各持独立运行时，drop 不影响他人。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    session_a = state.get_session("user-a", "shared")
+    session_b = state.get_session("user-b", "shared")
+    assert session_a is not session_b
+    state.drop_session("user-b", "shared")
+    assert state.sessions.get(state._session_key("user-a", "shared")) is session_a
+    assert state.sessions.get(state._session_key("user-b", "shared")) is None
+    state.close_all()
+    print("✓ 会话缓存按用户隔离（drop 不影响同名会话）")
 
 
 def test_session_search():
@@ -1636,6 +1698,93 @@ def test_chat_rate_limit():
         _cleanup(other_id)
 
 
+def test_chat_rate_limit_rejected_request_does_not_consume_other_bucket():
+    """被 429 的请求不能消耗另一个桶的配额（否则同 IP 其它用户被连坐）。"""
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=1, window_sec=60)   # 用户桶：1 次
+    state.ip_limiter = RateLimiter(limit=2, window_sec=60)     # IP 桶：2 次
+    client = TestClient(app)
+
+    users = []
+    try:
+        user_a = _unique_user("web_test_bucket_a")
+        user_b = _unique_user("web_test_bucket_b")
+        users = [user_a, user_b]
+        first = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_a, "session_id": "bucket-a1"},
+        )
+        assert first.status_code == 200
+        rejected = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_a, "session_id": "bucket-a2"},
+        )
+        assert rejected.status_code == 429, "用户桶已用尽"
+        # 若被拒绝的请求仍记录 IP 配额，B 的第一次请求会因 IP 桶（2 次）已满而 429
+        other = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_b, "session_id": "bucket-b1"},
+        )
+        assert other.status_code == 200, "被拒绝的请求不应消耗 IP 桶配额"
+        print("✓ 429 请求不消耗另一限流桶的配额")
+    finally:
+        for user_id in users:
+            _cleanup(user_id)
+
+
+def test_deleted_session_cannot_be_resurrected():
+    """删除后的会话在墓碑窗口内不能通过旧 session_id 写回。"""
+    client = _client()
+    user_id = _unique_user("web_test_tombstone")
+    try:
+        created = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "tomb-sess"},
+        )
+        assert created.status_code == 200
+        deleted = client.delete(
+            "/api/sessions/tomb-sess", params={"user_id": user_id}
+        )
+        assert deleted.status_code == 200 and deleted.json()["deleted"] == 2
+
+        again = client.post(
+            "/api/chat",
+            json={"message": "再问一次", "user_id": user_id, "session_id": "tomb-sess"},
+        )
+        assert again.status_code == 404
+        sessions = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert sessions["total"] == 0, "已删除的会话不应被写回"
+        print("✓ 删除后的会话不会被旧 session_id 复活")
+    finally:
+        _cleanup(user_id)
+
+
+def test_session_metadata_requires_existing_session():
+    client = _client()
+    user_id = _unique_user("web_test_ghost")
+    try:
+        renamed = client.put(
+            "/api/sessions/ghost-session/title",
+            json={"user_id": user_id, "title": "幽灵标题"},
+        )
+        assert renamed.status_code == 404
+        pinned = client.put(
+            "/api/sessions/ghost-session/pin",
+            json={"user_id": user_id, "pinned": True},
+        )
+        assert pinned.status_code == 404
+        detail = client.get(
+            "/api/sessions/ghost-session", params={"user_id": user_id}
+        ).json()
+        assert "幽灵标题" not in detail["title"], "不存在的会话不应产生幽灵标题"
+        print("✓ 重命名 / 置顶拒绝不存在的会话")
+    finally:
+        _cleanup(user_id)
+
+
 def test_chat_rate_limit_ip_bucket():
     """用户 ID 由请求方提供、可轮换；同一客户端 IP 仍受总量桶约束。"""
     from utils.rate_limit import RateLimiter
@@ -2571,6 +2720,9 @@ if __name__ == "__main__":
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()
+    test_session_cache_is_user_scoped()
+    test_trip_whitespace_destination_rejected()
+    test_ics_handles_overflow_end_date()
     test_request_id_header()
     test_security_headers()
     test_lock_table_is_bounded()
@@ -2584,6 +2736,9 @@ if __name__ == "__main__":
     test_chat_rate_limit()
     test_rate_limit_headers()
     test_chat_rate_limit_ip_bucket()
+    test_chat_rate_limit_rejected_request_does_not_consume_other_bucket()
+    test_deleted_session_cannot_be_resurrected()
+    test_session_metadata_requires_existing_session()
     test_session_rename()
     test_session_pin()
     test_export_markdown()
