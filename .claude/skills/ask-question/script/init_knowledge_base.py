@@ -124,7 +124,7 @@ def load_documents_from_directory(directory_path: str) -> list[dict]:
     return documents
 
 
-def main():
+def main() -> int:
     print("="*70)
     print("初始化RAG知识库 (Plugin Version) - With Chunking")
     print("="*70)
@@ -159,7 +159,7 @@ def main():
 
         if not rag_agent.initialized:
             print("❌ RAG Agent初始化失败")
-            return
+            return 1
 
         print("✓ RAG Agent初始化成功")
         print()
@@ -170,7 +170,7 @@ def main():
 
         if not documents:
             print("❌ 未加载到任何文档")
-            return
+            return 1
 
         print(f"✓ 成功切分并加载 {len(documents)} 个片段")
         print()
@@ -201,7 +201,7 @@ def main():
             print(f"✓ 知识库总文档数: {result['total_count']}")
         else:
             print(f"❌ 添加文档失败: {result.get('message', 'Unknown error')}")
-            return
+            return 1
 
         print()
 
@@ -239,7 +239,7 @@ def main():
                     
                     title = metadata.get('title', 'Unknown')
                     distance = doc.get('distance', 0.0)
-                    print(f"      [{i}] {title} (相似度: {1-distance:.3f})")
+                    print(f"      [{i}] {title} (相似度: {distance:.3f})")
             else:
                 print("   ❌ 未找到相关文档")
 
@@ -247,6 +247,7 @@ def main():
         print("="*70)
         print("知识库初始化完成！")
         print("="*70)
+        return 0
 
     finally:
         # 确保资源被正确清理
@@ -260,4 +261,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

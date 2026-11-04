@@ -105,6 +105,17 @@ def test_kb_export_dispatch_strict(monkeypatch):
     print("✓ kb-export 严格参数解析")
 
 
+def test_import_rejects_non_utf8_file(monkeypatch):
+    """GBK 备份文件应给出「读取失败」而不是抛 UnicodeDecodeError。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "gbk.json"
+        path.write_bytes('{"documents": [{"content": "中文"}]}'.encode("gbk"))
+        code, out = _capture(cli.run_knowledge_import_standalone, str(path))
+    assert code == 1
+    assert "读取失败" in out and "UTF-8" in out
+    print("✓ kb-import 非 UTF-8 文件给出读取失败")
+
+
 def test_export_unavailable_or_failure(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
@@ -218,6 +229,7 @@ if __name__ == "__main__":
         test_import_success,
         test_import_plain_array,
         test_import_errors,
+        test_import_rejects_non_utf8_file,
         test_import_large_file_not_capped,
     ):
         mp = pytest.MonkeyPatch()

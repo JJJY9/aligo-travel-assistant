@@ -67,11 +67,6 @@ def peek_milvus_client(db_path: str) -> Any | None:
         return _CLIENTS.get(db_path)
 
 
-def create_temporary_milvus_client(db_path: str) -> Any:
-    """创建一个不缓存的临时客户端（调用方负责 close，避免长期占用文件锁）。"""
-    return _create_client_with_retry(db_path)
-
-
 def next_entity_id(
     client: Any,
     collection_name: str,
