@@ -16,6 +16,7 @@ RAG知识库智能体 RAGKnowledgeAgent
 安装：
 pip install milvus sentence-transformers
 """
+import asyncio
 import json
 import logging
 import os
@@ -48,12 +49,37 @@ logger = logging.getLogger(__name__)
 
 try:
     import pymilvus  # noqa: F401 - 仅用于检测依赖是否安装
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer  # noqa: F401 - 依赖检测
     DEPENDENCIES_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"RAG dependencies not available: {e}")
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
+
+from utils.embedding_model import get_embedding_model
+
+
+def extract_user_query(content: str) -> str:
+    """从 Orchestrator 的结构化输入里取出检索问题。
+
+    ``rewritten_query`` 缺失 / 为空 / null 时回退到原始用户提问：
+    空字符串检索会返回任意 top-k 片段，答非所问。
+    """
+    if not isinstance(content, str) or not content.strip().startswith("{"):
+        return content
+    try:
+        data = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(data, dict):
+        return content
+    context = data.get("context") if isinstance(data.get("context"), dict) else {}
+    extracted = context.get("rewritten_query", data.get("rewritten_query", ""))
+    if not isinstance(extracted, str) or not extracted.strip():
+        extracted = context.get("user_query") if context else ""
+    if not isinstance(extracted, str) or not extracted.strip():
+        extracted = content
+    return extracted
 
 
 class RAGKnowledgeAgent(AgentBase):
@@ -114,7 +140,8 @@ class RAGKnowledgeAgent(AgentBase):
                 )
                 model_path_or_id = "BAAI/bge-small-zh-v1.5"
         logger.info(f"Loading embedding model: {model_path_or_id}")
-        self.embedding_model = SentenceTransformer(model_path_or_id)
+        # 进程内共享同一份嵌入模型：每个会话各建一份会重复占用 ~90 MB
+        self.embedding_model = get_embedding_model(model_path_or_id)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
         # 初始化 Milvus Lite（本地文件存储）
@@ -283,6 +310,13 @@ class RAGKnowledgeAgent(AgentBase):
                 raise RuntimeError("知识库未初始化")
             return []
 
+        # 空查询会返回任意 top-k 片段（答非所问），直接视为无结果
+        if not query or not str(query).strip():
+            if strict:
+                raise ValueError("查询内容为空")
+            return []
+        query = str(query)
+
         try:
             # 确保连接正常
             self._ensure_connection()
@@ -361,25 +395,12 @@ class RAGKnowledgeAgent(AgentBase):
         else:
             content = x.content
 
-        # 尝试解析 JSON 输入 (来自 Orchestrator)
-        user_query = content
-        if isinstance(content, str) and content.strip().startswith('{'):
-            try:
-                data = json.loads(content)
-                # 只要解析成功，就认为 content 是结构化数据，尝试提取 query
-                extracted_query = ""
-                if "context" in data and isinstance(data["context"], dict):
-                    extracted_query = data["context"].get("rewritten_query", "")
-                elif "rewritten_query" in data:
-                    extracted_query = data.get("rewritten_query", "")
-                
-                # 使用提取到的 query（即使为空，也比 JSON 字符串好）
-                user_query = extracted_query
-            except Exception:
-                pass  # 解析失败则保留原字符串
+        # 尝试解析 JSON 输入 (来自 Orchestrator)，取出检索问题
+        user_query = extract_user_query(content)
 
-        # 检索相关知识
-        retrieved_docs = self.search_knowledge(user_query)
+        # 检索相关知识。嵌入模型编码与 Milvus 查询是同步阻塞调用，
+        # 放到线程池执行，避免卡住事件循环（SSE 心跳与其它会话）
+        retrieved_docs = await asyncio.to_thread(self.search_knowledge, user_query)
 
         if not retrieved_docs:
             result = {

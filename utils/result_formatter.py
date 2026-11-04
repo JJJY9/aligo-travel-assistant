@@ -7,6 +7,10 @@ OrchestrationAgent 返回的 results 列表包含各子智能体的结构化输�
 """
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 _DISPLAY_NAMES = {
     "event_collection": "事项收集",
     "preference": "偏好管理",
@@ -42,30 +46,70 @@ def result_to_markdown(result_data: dict[str, Any]) -> str:
 
     blocks: list[str] = []
     for item in results:
+        if not isinstance(item, dict):
+            continue
         agent_name = item.get("agent_name", "")
         status = item.get("status")
-        data = item.get("data") or {}
+        data = item.get("data")
+        if not isinstance(data, dict):
+            # 智能体可能返回字符串 / 列表 / null：包一层，渲染器不再崩溃
+            data = {"result": data}
         if status == "error":
             error = data.get("error") or data.get("message") or "未知错误"
             blocks.append(f"> ⚠️ **{display_name(agent_name)}** 执行失败：{error}")
             continue
-        rendered = _render_agent(agent_name, data)
+        try:
+            rendered = _render_agent(agent_name, data)
+        except Exception:  # noqa: BLE001 - 渲染失败不能让整轮回答 500
+            logger.warning("渲染智能体结果失败: %s", agent_name, exc_info=True)
+            rendered = _fallback_text(data)
         if rendered:
             blocks.append(rendered)
 
     return "\n\n".join(blocks) if blocks else "已处理您的请求。"
 
 
-def _render_itinerary(itinerary: dict[str, Any]) -> str:
+def _fallback_text(data: Any) -> str:
+    """渲染器无法处理该结构时的兜底：尽量取出可读文本。"""
+    if isinstance(data, str):
+        return data.strip()
+    if isinstance(data, dict):
+        for key in ("answer", "content", "message", "summary", "text", "output"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _render_itinerary(itinerary: Any) -> str:
+    if isinstance(itinerary, str):
+        return f"## ✈️ 行程规划\n\n{itinerary}"
+    if not isinstance(itinerary, dict):
+        return f"## ✈️ 行程规划\n\n{itinerary}"
     lines = [f"## ✈️ {itinerary.get('title', '行程规划')}"]
     if itinerary.get("duration"):
         lines.append(f"**时长**：{itinerary['duration']}")
 
-    for day_plan in itinerary.get("daily_plans", []):
+    daily_plans = itinerary.get("daily_plans")
+    if isinstance(daily_plans, dict):
+        daily_plans = list(daily_plans.values())
+    if not isinstance(daily_plans, list):
+        daily_plans = []
+    for day_plan in daily_plans:
         lines.append("")
+        if not isinstance(day_plan, dict):
+            lines.append(f"### {day_plan}")
+            continue
         lines.append(f"### 第 {day_plan.get('day', '?')} 天")
         activities = day_plan.get("activities") or day_plan.get("time_slots") or []
+        if isinstance(activities, dict):
+            activities = list(activities.values())
+        if not isinstance(activities, list):
+            activities = []
         for slot in activities:
+            if not isinstance(slot, dict):
+                lines.append(f"- {slot}")
+                continue
             time_text = slot.get("time", "")
             activity = slot.get("activity") or slot.get("location") or ""
             description = slot.get("description", "")
@@ -77,12 +121,18 @@ def _render_itinerary(itinerary: dict[str, Any]) -> str:
                 line += f"（🚇 {transport}）"
             lines.append(line)
         meals = day_plan.get("meals") or {}
+        if not isinstance(meals, dict):
+            meals = {}
         if meals.get("lunch"):
             lines.append(f"- 🍜 午餐：{meals['lunch']}")
         if meals.get("dinner"):
             lines.append(f"- 🍽️ 晚餐：{meals['dinner']}")
 
     notes = itinerary.get("notes") or []
+    if isinstance(notes, str):
+        notes = [notes]
+    if not isinstance(notes, list):
+        notes = []
     if notes:
         lines.append("")
         lines.append("### 📌 注意事项")

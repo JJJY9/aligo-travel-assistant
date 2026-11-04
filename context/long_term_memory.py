@@ -269,6 +269,38 @@ class LongTermMemory:
             raise MemoryPersistenceError("长期记忆写入失败")
 
     @_locked_mutation
+    def append_preference(self, pref_type: str, value: Any) -> Any:
+        """在锁内重新加载并追加一个偏好值（列表语义），返回合并后的值。
+
+        ``get_preference() + save_preference()`` 的读改写会覆盖并发写入的
+        偏好（例如本轮 LLM 调用期间用户在记忆面板修改了同一类型）。
+        """
+        preferences = self.data["preferences"]
+        existing = None
+        for pref in preferences:
+            if pref.get("type") == pref_type:
+                existing = pref
+                break
+        current = existing.get("value") if existing is not None else None
+        if isinstance(current, list):
+            merged = list(current)
+            if value not in merged:
+                merged.append(value)
+        elif current == value:
+            merged = [value]
+        elif current:
+            merged = [current, value]
+        else:
+            merged = [value]
+        if existing is not None:
+            existing["value"] = merged
+        else:
+            preferences.append({"type": pref_type, "value": merged})
+        self._persist()
+        logger.info(f"Appended preference {pref_type}: {value} (total {len(merged)})")
+        return merged
+
+    @_locked_mutation
     def save_preference(self, pref_type: str, value: Any):
         """
         保存用户偏好（列表格式）

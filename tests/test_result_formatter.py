@@ -135,6 +135,61 @@ def test_no_agents():
     print("✓ 无智能体调度时的提示正常")
 
 
+def test_itinerary_malformed_shapes_do_not_crash():
+    """模型返回非标准行程结构时渲染不能抛异常（否则整轮回答 500）。"""
+    payloads = [
+        {"itinerary": "以下是为您规划的行程：北京出发，高铁前往杭州。"},
+        {"itinerary": ["北京", "上海"]},
+        {"itinerary": {"daily_plans": {"第1天": [{"time": "09:00", "activity": "出发"}]}}},
+        {
+            "itinerary": {
+                "daily_plans": [
+                    "不是字典的一天",
+                    {"day": 1, "activities": "不是列表", "meals": "不是字典"},
+                    {"day": 2, "activities": [{"time": "10:00", "activity": "会议"}]},
+                ],
+                "notes": "带伞",
+            }
+        },
+    ]
+    for payload in payloads:
+        md = result_to_markdown(
+            _wrap(
+                [
+                    {
+                        "agent_name": "itinerary_planning",
+                        "priority": 1,
+                        "status": "success",
+                        "data": payload,
+                    }
+                ]
+            )
+        )
+        assert md.strip(), payload
+
+    # data 不是对象、status=error 且 data 为字符串
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "priority": 1,
+                    "status": "success",
+                    "data": ["a", "b"],
+                }
+            ]
+        )
+    )
+    assert md
+    md = result_to_markdown(
+        _wrap(
+            [{"agent_name": "x", "priority": 1, "status": "error", "data": "服务不可用"}]
+        )
+    )
+    assert "执行失败" in md
+    print("✓ 非标准行程结构 / 非对象 data 不崩溃")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -143,4 +198,5 @@ if __name__ == "__main__":
     test_information_query_sources()
     test_error_result()
     test_no_agents()
+    test_itinerary_malformed_shapes_do_not_crash()
     print("\n全部通过")

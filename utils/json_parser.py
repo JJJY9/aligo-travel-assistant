@@ -9,6 +9,28 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def extract_first_json_object(text: str) -> dict:
+    """返回文本中第一个能完整解析的 JSON 对象，忽略前后的说明文字。
+
+    ``find('{')`` / ``rfind('}')`` 会把结尾说明里的花括号（例如「如 {日期}
+    未提供可默认明天」）一起截进 JSON，导致合法输出解析失败。这里逐个尝试
+    每个 ``{`` 的 ``raw_decode``，只接受完整解析出的 dict。
+    """
+    if not text:
+        raise ValueError("Empty text provided")
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("No JSON object found in response")
+
+
 def robust_json_parse(text: str, fallback=None) -> dict:
     """
     鲁棒的 JSON 解析函数
