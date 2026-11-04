@@ -9,6 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -25,10 +27,15 @@ from utils.doctor import (
 
 def test_storage_defaults(monkeypatch):
     from config import STORAGE_CONFIG
+    from context import storage as storage_module
 
     monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
-    result = check_storage()
+    storage_module.reset_failure_cache()
+    try:
+        result = check_storage()
+    finally:
+        storage_module.reset_failure_cache()
     assert result.status == STATUS_OK, result.detail
     assert "进程内" in result.detail and "JSON" in result.detail
     print("✓ 存储后端未配置 → 本地默认实现")
@@ -36,10 +43,15 @@ def test_storage_defaults(monkeypatch):
 
 def test_storage_unreachable_warns(monkeypatch):
     from config import STORAGE_CONFIG
+    from context import storage as storage_module
 
     monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0")
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
-    result = check_storage()
+    storage_module.reset_failure_cache()
+    try:
+        result = check_storage()
+    finally:
+        storage_module.reset_failure_cache()
     assert result.status == STATUS_WARN
     assert "Redis" in result.detail and "回退" in result.detail
     print("✓ Redis 不可达 → 警告并提示回退")
@@ -110,5 +122,11 @@ if __name__ == "__main__":
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
     test_knowledge_base_missing()
+    for case in (test_storage_defaults, test_storage_unreachable_warns):
+        mp = pytest.MonkeyPatch()
+        try:
+            case(mp)
+        finally:
+            mp.undo()
     test_run_doctor_without_network()
     print("\n全部通过")

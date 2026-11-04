@@ -20,6 +20,47 @@ def session_key(session_id: str) -> str:
     return f"aligo:session:{session_id}:messages"
 
 
+# 原子地删除最后一轮（助手 + 用户）消息。ARGV[1] 为 "1" 时校验最后一条
+# 用户提问的内容是否等于 ARGV[2]（不一致则不删除），避免与并发写入交错。
+_TRUNCATE_LAST_TURN_LUA = """
+local key = KEYS[1]
+local check = ARGV[1]
+local expected = ARGV[2]
+local n = redis.call('LLEN', key)
+if n == 0 then return 0 end
+local last_raw = redis.call('LINDEX', key, -1)
+local last_ok, last = pcall(cjson.decode, last_raw)
+local count = 1
+local user_raw = nil
+if last_ok and type(last) == 'table' and last['role'] == 'assistant' then
+  if n >= 2 then
+    local prev_raw = redis.call('LINDEX', key, -2)
+    local prev_ok, prev = pcall(cjson.decode, prev_raw)
+    if prev_ok and type(prev) == 'table' and prev['role'] == 'user' then
+      count = 2
+      user_raw = prev_raw
+    end
+  end
+elseif last_ok and type(last) == 'table' and last['role'] == 'user' then
+  user_raw = last_raw
+end
+if check == '1' then
+  if user_raw == nil then return 0 end
+  local msg_ok, msg = pcall(cjson.decode, user_raw)
+  if not msg_ok or type(msg) ~= 'table' or msg['role'] ~= 'user' then return 0 end
+  local content = msg['content']
+  if type(content) ~= 'string' then return 0 end
+  if string.match(content, '^%s*(.-)%s*$') ~= expected then return 0 end
+end
+if count >= n then
+  redis.call('DEL', key)
+else
+  redis.call('LTRIM', key, 0, -count - 1)
+end
+return count
+"""
+
+
 class ShortTermMemory:
     """
     短期记忆：存储最近的对话历史
@@ -107,20 +148,30 @@ class ShortTermMemory:
         self.messages = []
         logger.info("Short-term memory cleared")
 
-    def truncate_last_turn(self) -> int:
+    def truncate_last_turn(self, expect: str | None = None) -> int:
         """删除最后一轮对话（助手 + 提问的用户），返回删除条数。
 
         历史以用户提问结尾（例如回答过程中被停止）时只删除该条提问。
+        ``expect`` 不为 None 时先校验最后一条用户提问的内容，不一致则不做修改
+        （例如这条提问并未真正写入）。
         """
         if not self.messages:
             return 0
         count = 1
+        last_user = self.messages[-1] if self.messages[-1].get("role") == "user" else None
         if (
             len(self.messages) >= 2
             and self.messages[-1].get("role") == "assistant"
             and self.messages[-2].get("role") == "user"
         ):
             count = 2
+            last_user = self.messages[-2]
+        if expect is not None:
+            if last_user is None:
+                return 0
+            if str(last_user.get("content", "")).strip() != expect.strip():
+                logger.info("Skip truncating last turn: content mismatch")
+                return 0
         del self.messages[-count:]
         logger.info("Truncated last turn from short-term memory (%s messages)", count)
         return count
@@ -191,29 +242,26 @@ class RedisShortTermMemory:
         self.client.delete(self.key)
         logger.info("Redis short-term memory cleared: %s", self.key)
 
-    def truncate_last_turn(self) -> int:
-        """删除 Redis 中最后一轮对话，返回删除条数（保留的条目 TTL 不变）。"""
-        raw = self.client.lrange(self.key, 0, -1)
-        if not raw:
-            return 0
-        try:
-            last = json.loads(raw[-1])
-            previous = json.loads(raw[-2]) if len(raw) >= 2 else None
-        except (TypeError, json.JSONDecodeError):
-            last, previous = {}, None
-        count = 1
-        if (
-            isinstance(last, dict)
-            and last.get("role") == "assistant"
-            and isinstance(previous, dict)
-            and previous.get("role") == "user"
-        ):
-            count = 2
-        if count >= len(raw):
-            self.client.delete(self.key)
-        else:
-            self.client.rtrim(self.key, 0, -count - 1)
-        logger.info("Truncated last turn from Redis memory: %s (%s messages)", self.key, count)
+    def truncate_last_turn(self, expect: str | None = None) -> int:
+        """删除 Redis 中最后一轮对话，返回删除条数（保留的条目 TTL 不变）。
+
+        使用 Lua 脚本把「读取最后两条 → 判断 → 裁剪」放在一次原子调用里，
+        避免与其它进程 / worker 追加消息的写入交错后裁错条目；``expect`` 不为
+        None 时内容不一致则不修改。
+        """
+        count = int(
+            self.client.eval(
+                _TRUNCATE_LAST_TURN_LUA,
+                1,
+                self.key,
+                "1" if expect is not None else "0",
+                (expect or "").strip(),
+            )
+            or 0
+        )
+        logger.info(
+            "Truncated last turn from Redis memory: %s (%s messages)", self.key, count
+        )
         return count
 
     def get_statistics(self) -> dict[str, Any]:

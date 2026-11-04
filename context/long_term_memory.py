@@ -399,8 +399,13 @@ class LongTermMemory:
         return removed
 
     @_locked_mutation
-    def delete_last_turn(self, session_id: str) -> int:
-        """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。"""
+    def delete_last_turn(self, session_id: str, expect: str | None = None) -> int:
+        """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。
+
+        ``expect`` 不为 None 时会校验最后一轮的用户提问内容：不一致说明这条
+        提问并未真正写入（例如意图识别阶段就失败），此时不删除任何内容，
+        避免误删上一轮已保存的对话。
+        """
         history = self.data["chat_history"]
         indexes = [
             index
@@ -410,12 +415,23 @@ class LongTermMemory:
         if not indexes:
             return 0
         count = 1
+        last_user_index = indexes[-1] if history[indexes[-1]].get("role") == "user" else None
         if (
             len(indexes) >= 2
             and history[indexes[-1]].get("role") == "assistant"
             and history[indexes[-2]].get("role") == "user"
         ):
             count = 2
+            last_user_index = indexes[-2]
+        if expect is not None:
+            if last_user_index is None:
+                return 0
+            actual = str(history[last_user_index].get("content", "")).strip()
+            if actual != expect.strip():
+                logger.info(
+                    "Skip deleting last turn of session %s: content mismatch", session_id
+                )
+                return 0
         removed_indexes = set(indexes[-count:])
         self.data["chat_history"] = [
             message
@@ -424,7 +440,8 @@ class LongTermMemory:
         ]
         stats = self.data["statistics"]
         stats["total_messages"] = max(0, stats.get("total_messages", 0) - count)
-        self._save()
+        if not self._save():
+            raise OSError("长期记忆写入失败")
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
         return count
 
