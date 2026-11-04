@@ -54,6 +54,7 @@
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 
 ### 变更
+- 响应压缩：静态资源与 JSON 响应启用 gzip（≥1KB），`/api/chat/stream`（SSE）保持不压缩，避免缓冲破坏实时进度
 - 侧栏出行卡片优先展示进行中的行程（标注「进行中」，多条时取结束最晚的），没有进行中行程时再展示最近一次即将开始的行程；`/api/status` 的 `next_trip` 同步支持进行中行程
 - 编排器在聚合结果与 `agent_done` 事件中附带 `duration`
 - 复制文本在 Clipboard API 不可用时回退到 `execCommand`

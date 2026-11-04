@@ -37,6 +37,7 @@ from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.gzip import GZipMiddleware
 
 from agents.conversation import ConversationRuntime
 from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG
@@ -191,6 +192,23 @@ class RequestContextMiddleware:
                         request_id,
                     ),
                 )
+
+
+class SelectiveGZipMiddleware:
+    """对除 SSE 流以外的响应启用 gzip。
+
+    SSE 需要逐事件即时送达，压缩会引入缓冲并破坏实时进度，因此按路径排除。
+    """
+
+    def __init__(self, app: Any, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.compressed_app = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and scope.get("path") == "/api/chat/stream":
+            await self.app(scope, receive, send)
+            return
+        await self.compressed_app(scope, receive, send)
 
 
 class ChatRequest(BaseModel):
@@ -820,6 +838,7 @@ def create_app(model: Any = None) -> FastAPI:
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
     app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

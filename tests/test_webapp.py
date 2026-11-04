@@ -1437,6 +1437,70 @@ def test_security_headers():
     print("✓ 安全响应头（CSP / nosniff / frame / referrer）")
 
 
+def test_gzip_compression_excludes_sse():
+    """静态资源与 JSON 启用 gzip；SSE 流保持原样（压缩会破坏实时进度）。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    static_gzip = client.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
+    assert static_gzip.status_code == 200
+    assert static_gzip.headers.get("content-encoding") == "gzip"
+    assert len(static_gzip.content) > 10_000
+
+    static_plain = client.get(
+        "/static/app.js", headers={"Accept-Encoding": "identity"}
+    )
+    assert "content-encoding" not in static_plain.headers
+    assert static_plain.content == static_gzip.content
+
+    user_id = _unique_user("web_test_gzip")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "长消息 " + "x" * 3000, "gzip-session")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        exported = client.get(
+            "/api/export", params={"user_id": user_id}, headers={"Accept-Encoding": "gzip"}
+        )
+        assert exported.status_code == 200
+        assert exported.headers.get("content-encoding") == "gzip"
+        assert len(exported.content) > 3000
+        plain_export = client.get(
+            "/api/export",
+            params={"user_id": user_id},
+            headers={"Accept-Encoding": "identity"},
+        )
+        assert "content-encoding" not in plain_export.headers
+        assert b"x" * 100 in plain_export.content
+        assert b"x" * 100 in exported.content
+        assert abs(len(plain_export.content) - len(exported.content)) < 64
+    finally:
+        _cleanup(user_id)
+
+    sse_user = _unique_user("web_test_gzip_sse")
+    try:
+        stream = client.post(
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": sse_user,
+                "session_id": uuid.uuid4().hex[:12],
+            },
+            headers={"Accept-Encoding": "gzip"},
+        )
+        assert stream.status_code == 200
+        assert stream.headers.get("content-encoding") != "gzip"
+        assert "text/event-stream" in stream.headers.get("content-type", "")
+        assert "data:" in stream.text
+    finally:
+        _cleanup(sse_user)
+    print("✓ gzip 压缩（静态 / JSON 启用，SSE 排除）")
+
+
 def test_docs_csp_allows_cdn():
     """Swagger UI 需要从 CDN 加载资源：仅文档页面放宽 CSP，普通页面保持严格。"""
     client = _client()
@@ -2001,6 +2065,7 @@ if __name__ == "__main__":
     test_session_lru_eviction()
     test_request_id_header()
     test_security_headers()
+    test_gzip_compression_excludes_sse()
     test_docs_csp_allows_cdn()
     test_unhandled_error_returns_500_with_headers()
     test_chat_rate_limit()
