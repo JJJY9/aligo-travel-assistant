@@ -12,7 +12,8 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
+      # 只绑定本机，避免同网段其它机器访问无认证的 Redis
+      - "127.0.0.1:6379:6379"
 
   postgres:
     image: postgres:16-alpine
@@ -21,7 +22,8 @@ services:
       POSTGRES_PASSWORD: aligo
       POSTGRES_DB: aligo
     ports:
-      - "5432:5432"
+      # 只绑定本机（演示账号 aligo/aligo），不要暴露到局域网
+      - "127.0.0.1:5432:5432"
     volumes:
       - aligo_pgdata:/var/lib/postgresql/data
 

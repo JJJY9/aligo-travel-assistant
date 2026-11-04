@@ -35,13 +35,23 @@ def test_header_and_rows():
 
 def test_formula_prefix_neutralized():
     text = render_trips_csv(
-        [{"origin": "=1+1", "destination": "@cmd", "purpose": "+SUM(A1)"}]
+        [
+            {
+                "origin": "=1+1",
+                "destination": "@cmd",
+                "start_date": "=cmd|' /C calc'!A0",
+                "end_date": "-2+3",
+                "purpose": "+SUM(A1)",
+            }
+        ]
     )
     row = list(csv.reader(io.StringIO(text[1:])))[1]
     assert row[0] == "'=1+1"
     assert row[1] == "'@cmd"
+    assert row[2] == "'=cmd|' /C calc'!A0", "日期列同样需要防公式注入"
+    assert row[3] == "'-2+3"
     assert row[4] == "'+SUM(A1)"
-    print("✓ 公式前缀加单引号")
+    print("✓ 公式前缀加单引号（含日期列）")
 
 
 def test_empty_trips():

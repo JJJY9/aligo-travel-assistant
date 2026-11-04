@@ -14,6 +14,7 @@ CI 中通过 service 容器 + TEST_REDIS_URL / TEST_POSTGRES_DSN 自动启用；
 """
 import os
 import sys
+import threading
 import uuid
 
 import pytest
@@ -177,6 +178,72 @@ def test_postgres_long_term_memory():
         memory.close()
 
 
+def test_postgres_trip_id_concurrent():
+    """并发保存行程时 trip_id 不重复（advisory lock）。"""
+    if not TEST_POSTGRES_DSN:
+        pytest.skip("未设置 TEST_POSTGRES_DSN")
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    user_id = f"pytest-conc-{uuid.uuid4().hex[:8]}"
+    try:
+        probe = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    except Exception as exc:  # noqa: BLE001 - 无 PG 时跳过
+        pytest.skip(f"PostgreSQL 不可用: {exc}")
+    probe.close()
+
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+    errors: list[Exception] = []
+
+    def worker(destination: str) -> None:
+        store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+        try:
+            barrier.wait(timeout=5)
+            results.append(
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": destination,
+                        "start_date": "2026-12-05",
+                        "end_date": "2026-12-07",
+                        "purpose": "出差",
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - 线程内错误收集
+            errors.append(exc)
+        finally:
+            store.close()
+
+    threads = [
+        threading.Thread(target=worker, args=(destination,))
+        for destination in ("上海", "杭州")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    try:
+        assert not errors, errors
+        assert len(results) == 2
+        assert len(set(results)) == 2, f"trip_id 重复：{results}"
+        store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+        try:
+            trips = store.get_trip_history(limit=None)
+            assert len(trips) == 2
+            assert len({trip["trip_id"] for trip in trips}) == 2
+        finally:
+            store.close()
+    finally:
+        cleanup = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+        try:
+            cleanup.delete_all()
+        finally:
+            cleanup.close()
+    print("✓ PostgreSQL 并发保存行程 trip_id 不重复")
+
+
 def test_memory_manager_uses_configured_backends(monkeypatch):
     if not TEST_REDIS_URL or not TEST_POSTGRES_DSN:
         pytest.skip("需要同时配置 TEST_REDIS_URL 与 TEST_POSTGRES_DSN")
@@ -212,5 +279,6 @@ def test_memory_manager_uses_configured_backends(monkeypatch):
 if __name__ == "__main__":
     test_redis_short_term_memory()
     test_postgres_long_term_memory()
+    test_postgres_trip_id_concurrent()
     # 本地脚本运行时手动设置环境变量才能跑第三项
     print("\n完成（未配置服务时相关用例跳过）")

@@ -34,7 +34,9 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.gzip import GZipMiddleware
@@ -74,6 +76,8 @@ APP_VERSION = "1.3.0"
 
 # SSE 心跳间隔（秒）：LLM 调用可能持续数十秒，定期发送注释行避免代理/浏览器超时
 SSE_HEARTBEAT_SEC = 15.0
+# 请求体大小上限（JSON 接口都是小请求；防止超大 body 在 Pydantic 校验前耗尽内存）
+MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
@@ -157,6 +161,34 @@ class RequestContextMiddleware:
             await send(message)
 
         try:
+            content_length = headers.get(b"content-length", b"")
+            if content_length:
+                try:
+                    body_size = int(content_length)
+                except ValueError:
+                    body_size = 0
+                if body_size > MAX_REQUEST_BODY_BYTES:
+                    detail = (
+                        f"请求体过大（上限 {MAX_REQUEST_BODY_BYTES // (1024 * 1024)} MB）"
+                    )
+                    await send_wrapper(
+                        {
+                            "type": "http.response.start",
+                            "status": 413,
+                            "headers": [
+                                (b"content-type", b"application/json; charset=utf-8")
+                            ],
+                        }
+                    )
+                    await send_wrapper(
+                        {
+                            "type": "http.response.body",
+                            "body": json.dumps(
+                                {"detail": detail}, ensure_ascii=False
+                            ).encode("utf-8"),
+                        }
+                    )
+                    return
             await self.app(scope, receive, send_wrapper)
         except Exception as exc:  # noqa: BLE001 - 兜底：未处理异常也要带上安全头与请求 ID
             logger.exception("未处理的请求异常 [%s] %s", request_id, path)
@@ -221,11 +253,12 @@ class ChatRequest(BaseModel):
 
 
 _ShortText = Annotated[str, Field(max_length=200)]
+_FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PreferenceValue = (
     _ShortText
     | Annotated[list[_ShortText], Field(max_length=20)]
     | int
-    | float
+    | _FiniteFloat
     | bool
 )
 
@@ -425,11 +458,25 @@ def _safe_filename(value: str, fallback: str = "aligo") -> str:
     return cleaned or fallback
 
 
+def _json_safe_value(value: Any) -> Any:
+    """把历史遗留的 NaN / Infinity 归一为 None，避免 JSON 响应序列化失败。"""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, list):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_safe_value(item) for key, item in value.items()}
+    return value
+
+
 def _load_user_data(user_id: str) -> dict[str, Any]:
     store = _open_long_term(user_id)
     try:
         return {
-            "preferences": store.get_preference(),
+            "preferences": {
+                key: _json_safe_value(value)
+                for key, value in store.get_preference().items()
+            },
             "trip_history": store.get_trip_history(limit=None),
             "chat_history": store.get_chat_history(),
             "session_titles": store.get_session_titles(),
@@ -834,6 +881,16 @@ def create_app(model: Any = None) -> FastAPI:
     # 能给压缩后的响应补安全头 / 请求 ID，并在异常时可靠地兜底 500。
     app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
     app.add_middleware(RequestContextMiddleware)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # 校验错误的 input 可能包含 NaN（JSON 解析允许），直接返回会序列化失败
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _json_safe_value(jsonable_encoder(exc.errors()))},
+        )
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -1697,7 +1754,15 @@ def main() -> None:
         print("请先配置 API Key（环境变量 LLM_API_KEY，或创建 config_local.py）")
         raise SystemExit(1) from exc
 
-    uvicorn.run(application, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        application,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        # 自带访问日志不记录查询串（避免把编辑原文等用户内容写入日志），
+        # /api/ 请求由 RequestContextMiddleware 结构化记录
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

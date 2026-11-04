@@ -9,6 +9,7 @@
 连接失败会记录一次警告并进入 60 秒冷却，避免每个会话都等待连接超时。
 """
 import logging
+import re
 import time
 from typing import Any
 
@@ -18,6 +19,10 @@ from context.postgres_long_term_memory import PostgresLongTermMemory
 from context.short_term_memory import RedisShortTermMemory, ShortTermMemory, session_key
 
 logger = logging.getLogger(__name__)
+
+def _redact_url(url: str) -> str:
+    """隐藏 Redis URL 中的密码，避免日志泄露。"""
+    return re.sub(r"://([^@/]+)@", r"://***@", url)
 
 ShortTermStore = ShortTermMemory | RedisShortTermMemory
 LongTermStore = LongTermMemory | PostgresLongTermMemory
@@ -55,7 +60,7 @@ def _get_redis_client(url: str):
         )
         client.ping()
         _redis_client = client
-        logger.info("Redis 短期记忆已启用: %s", url)
+        logger.info("Redis 短期记忆已启用: %s", _redact_url(url))
         return client
     except Exception as exc:  # noqa: BLE001 - 连接失败回退
         _mark_failed(f"redis:{url}")

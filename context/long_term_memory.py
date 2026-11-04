@@ -96,6 +96,15 @@ class LongTermMemory:
                     return data
             except Exception as e:
                 logger.error(f"Failed to load long-term memory: {e}")
+                backup = (
+                    f"{self.db_path}.corrupt-"
+                    f"{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                )
+                try:
+                    os.replace(self.db_path, backup)
+                    logger.warning("损坏的记忆文件已备份到 %s", backup)
+                except OSError as backup_error:
+                    logger.error("备份损坏的记忆文件失败: %s", backup_error)
                 return self._init_data()
         else:
             logger.info("No existing long-term memory, creating new")
@@ -216,6 +225,11 @@ class LongTermMemory:
             logger.error(f"Failed to save long-term memory: {e}")
             return False
 
+    def _persist(self) -> None:
+        """写盘失败时抛错，避免上层把未落盘的修改当成功。"""
+        if not self._save():
+            raise OSError("长期记忆写入失败")
+
     @_locked_mutation
     def save_preference(self, pref_type: str, value: Any):
         """
@@ -239,7 +253,7 @@ class LongTermMemory:
         if not found:
             preferences.append({"type": pref_type, "value": value})
 
-        self._save()
+        self._persist()
         logger.info(f"Saved preference: {pref_type} = {value}")
 
     def get_preference(self, pref_type: str | None = None) -> Any:
@@ -275,7 +289,7 @@ class LongTermMemory:
         if len(remaining) == len(preferences):
             return False
         self.data["preferences"] = remaining
-        self._save()
+        self._persist()
         logger.info(f"Deleted preference: {pref_type}")
         return True
 
@@ -302,7 +316,7 @@ class LongTermMemory:
         if not found:
             preferences.append({"type": "hotel_brands", "value": [brand]})
 
-        self._save()
+        self._persist()
         logger.info(f"Added hotel brand preference: {brand}")
 
     @_locked_mutation
@@ -328,7 +342,7 @@ class LongTermMemory:
         if not found:
             preferences.append({"type": "airlines", "value": [airline]})
 
-        self._save()
+        self._persist()
         logger.info(f"Added airline preference: {airline}")
 
     @_locked_mutation
@@ -350,7 +364,7 @@ class LongTermMemory:
 
         self.data["chat_history"].append(message)
         self.data["statistics"]["total_messages"] += 1
-        self._save()
+        self._persist()
         logger.debug(f"Added chat message to long-term memory: {role}")
 
     def get_chat_history(self, limit: int | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
@@ -399,7 +413,7 @@ class LongTermMemory:
                 pinned_sessions.remove(session_id)
             if isinstance(archived_sessions, list) and session_id in archived_sessions:
                 archived_sessions.remove(session_id)
-            self._save()
+            self._persist()
             logger.info(
                 "Deleted chat session: %s (%s messages, metadata=%s)",
                 session_id,
@@ -525,7 +539,7 @@ class LongTermMemory:
                 if value is not None:
                     existing[key] = value
             existing["timestamp"] = datetime.now().isoformat()
-            self._save()
+            self._persist()
             logger.info(f"Updated existing trip history: {existing.get('trip_id')}")
             return str(existing.get("trip_id") or "")
 
@@ -546,7 +560,7 @@ class LongTermMemory:
             freq = self.data["statistics"]["frequent_destinations"]
             freq[destination] = freq.get(destination, 0) + 1
 
-        self._save()
+        self._persist()
         logger.info(f"Saved trip history: {trip_record['trip_id']}")
         return str(trip_record["trip_id"])
 
@@ -627,7 +641,7 @@ class LongTermMemory:
                         del frequent[old_destination]
                 if new_destination:
                     frequent[new_destination] = int(frequent.get(new_destination, 0)) + 1
-            self._save()
+            self._persist()
             logger.info("Updated trip history: %s", trip_id)
             return True
         return False
@@ -663,8 +677,7 @@ class LongTermMemory:
         """增加查询计数"""
         stats = self.data["statistics"]
         stats["total_queries"] = stats.get("total_queries", 0) + 1
-        self._save()
-
+        self._persist()
     def get_statistics(self) -> dict[str, Any]:
         """获取统计信息"""
         return self.data["statistics"].copy()
@@ -680,7 +693,7 @@ class LongTermMemory:
         self.data["statistics"]["total_trips"] = 0
         self.data["statistics"]["total_messages"] = 0
         self.data["statistics"]["frequent_destinations"] = {}
-        self._save()
+        self._persist()
         logger.info("Cleared all history (chat + trips)")
 
     @_locked_mutation
