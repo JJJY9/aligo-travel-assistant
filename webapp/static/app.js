@@ -160,6 +160,8 @@ const els = {
   destinations: byId("destinations"),
   stats: byId("stats"),
   usageStats: byId("usageStats"),
+  metricsStats: byId("metricsStats"),
+  metricsNote: byId("metricsNote"),
   usageAgents: byId("usageAgents"),
   usageTrend: byId("usageTrend"),
   usageTrendTotal: byId("usageTrendTotal"),
@@ -2042,6 +2044,66 @@ function updateUserCard() {
   els.storageLabel.textContent = storageParts(storage).join(" · ");
 }
 
+const BREAKER_LABELS = { closed: "正常", half_open: "半开", open: "熔断" };
+
+function formatUptime(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total} 秒`;
+  if (total < 3600) return `${Math.floor(total / 60)} 分钟`;
+  if (total < 86400) {
+    return `${Math.floor(total / 3600)} 小时 ${Math.floor((total % 3600) / 60)} 分`;
+  }
+  return `${Math.floor(total / 86400)} 天 ${Math.floor((total % 86400) / 3600)} 小时`;
+}
+
+async function refreshMetrics() {
+  if (!els.metricsStats) return;
+  try {
+    const data = await getJSON("/api/metrics");
+    const requests = data.requests || {};
+    const total = Number(requests.requests_total || 0);
+    const tiles = [
+      ["请求总数", total.toLocaleString("zh-CN")],
+      [
+        "平均耗时",
+        total ? `${Math.round(Number(requests.avg_duration_ms || 0))} ms` : "—",
+      ],
+      [
+        "最大耗时",
+        total ? `${Math.round(Number(requests.max_duration_ms || 0))} ms` : "—",
+      ],
+      [
+        "熔断器",
+        BREAKER_LABELS[String((data.circuit_breaker || {}).state || "")] || "—",
+      ],
+    ];
+    els.metricsStats.innerHTML = "";
+    tiles.forEach(([label, value]) => {
+      const box = document.createElement("div");
+      box.className = "stat";
+      const number = document.createElement("b");
+      number.textContent = String(value);
+      const caption = document.createElement("span");
+      caption.textContent = label;
+      box.append(number, caption);
+      els.metricsStats.appendChild(box);
+    });
+    if (els.metricsNote) {
+      const cached = Number(data.sessions_cached || 0);
+      els.metricsNote.hidden = false;
+      els.metricsNote.textContent = `进程运行 ${formatUptime(
+        requests.uptime_sec,
+      )} · 缓存会话 ${cached} 个 · 多进程各自统计`;
+    }
+  } catch {
+    els.metricsStats.innerHTML = "";
+    if (els.metricsNote) {
+      els.metricsNote.hidden = false;
+      els.metricsNote.textContent = "无法获取运行指标";
+    }
+  }
+}
+
 async function refreshStatus() {
   const requestId = (statusRequestId += 1);
   const userId = state.userId;
@@ -3337,6 +3399,7 @@ function openMemorySheet() {
   refreshStatus();
   refreshKnowledge();
   refreshKnowledgeDocuments();
+  refreshMetrics();
 }
 
 function closeMemorySheet() {
