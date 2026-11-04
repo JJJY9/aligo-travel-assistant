@@ -206,6 +206,44 @@ async def test_rag_agent():
     print("="*70)
 
 
+def test_rag_query_extraction_falls_back_to_raw_query():
+    """rewritten_query 缺失 / 为空 / null 时用原始提问检索。"""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(project_root) / ".claude/skills/ask-question/script/agent.py"
+    spec = importlib.util.spec_from_file_location("_test_ask_question_agent", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    extract = getattr(module, "extract_user_query")
+
+    assert (
+        extract(
+            json.dumps({"context": {"rewritten_query": "", "user_query": "住宿标准是多少"}})
+        )
+        == "住宿标准是多少"
+    )
+    assert (
+        extract(
+            json.dumps({"context": {"rewritten_query": None, "user_query": "出差报销流程"}})
+        )
+        == "出差报销流程"
+    )
+    assert (
+        extract(
+            json.dumps(
+                {"context": {"rewritten_query": "改写后问题", "user_query": "原始问题"}}
+            )
+        )
+        == "改写后问题"
+    )
+    assert extract(json.dumps({"rewritten_query": "顶层改写"})) == "顶层改写"
+    assert extract("直接提问") == "直接提问"
+    assert extract("{不是JSON") == "{不是JSON"
+    print("✓ RAG 使用原始提问兜底（空 / null 改写结果）")
+
+
 if __name__ == "__main__":
     asyncio.run(test_rag_agent())
     print("\n测试完成！")

@@ -295,19 +295,28 @@ class InformationQueryAgent(AgentBase):
             }
 
         try:
+            import asyncio
+
             ddgs = DDGS()
             # 开启安全搜索，优先 bing 后端（质量更稳定），多取几条再过滤
             search_results = []
+            loop = asyncio.get_running_loop()
             for backend in ("bing", "duckduckgo", "auto"):
                 try:
-                    raw = ddgs.text(
-                        query,
-                        max_results=10,
-                        safesearch="on",
-                        region="cn-zh",
-                        backend=backend,
-                    )
-                    search_results = list(raw)
+                    def _search(backend_name: str = backend) -> list:
+                        return list(
+                            ddgs.text(
+                                query,
+                                max_results=10,
+                                safesearch="on",
+                                region="cn-zh",
+                                backend=backend_name,
+                            )
+                        )
+
+                    # ddgs.text 是同步网络调用，必须放到线程池，
+                    # 否则会卡住事件循环（SSE 心跳与其它会话全部停顿）
+                    search_results = await loop.run_in_executor(None, _search)
                     if search_results:
                         break
                 except Exception as e:

@@ -76,10 +76,30 @@ def test_increment_query_count_legacy_data():
     print("✓ 旧数据迁移后 increment_query_count 正常")
 
 
+def test_extract_first_json_object_ignores_prose_braces():
+    """说明文字 / 示例里的花括号不能截进 JSON（find/rfind 的旧缺陷）。"""
+    from utils.json_parser import extract_first_json_object
+
+    text = (
+        '好的，结果如下：\n{"status": "ok", "agent_schedule": []}\n'
+        "提示：如 {日期} 未提供可默认明天。"
+    )
+    assert extract_first_json_object(text) == {"status": "ok", "agent_schedule": []}
+    assert extract_first_json_object("示例 {不是JSON} 然后：{\"a\": 1}") == {"a": 1}
+    try:
+        extract_first_json_object("没有对象")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("应抛 ValueError")
+    print("✓ extract_first_json_object 忽略说明文字中的花括号")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_json_parse_fallback()
     test_json_parse_success_paths_unchanged()
+    test_extract_first_json_object_ignores_prose_braces()
     test_increment_query_count_fresh_data()
     test_increment_query_count_legacy_data()
     print("\n全部通过")

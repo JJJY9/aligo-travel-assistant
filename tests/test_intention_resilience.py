@@ -34,6 +34,17 @@ class _UnparsableModel:
         return "这不是 JSON，无法解析"
 
 
+class _TrailingProseModel:
+    """合法 JSON 后带说明文字（其中含花括号）的输出"""
+
+    async def __call__(self, messages):
+        return (
+            '{"reasoning": "用户要出行", "intents": [{"type": "plan_trip", "confidence": 0.9}], '
+            '"key_entities": {}, "agent_schedule": [{"agent_name": "itinerary_planning", "priority": 1}]}\n'
+            "提示：如 {日期} 未提供可默认明天。"
+        )
+
+
 def _user_msg():
     return Msg(name="user", content="帮我规划去北京的行程", role="user")
 
@@ -59,7 +70,18 @@ def test_unparsable_output_falls_back():
     print("✓ 不可重试错误保持降级为默认结果")
 
 
+def test_json_with_trailing_prose_braces_parses():
+    """结尾说明里的花括号不能影响 JSON 解析（否则规划请求被降级为信息查询）。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_TrailingProseModel())
+    out = asyncio.run(agent.reply([_user_msg()]))
+    data = json.loads(out.content)
+    assert data["intents"][0]["type"] == "plan_trip"
+    assert data["agent_schedule"][0]["agent_name"] == "itinerary_planning"
+    print("✓ JSON 后带花括号说明文字仍能解析")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
+    test_json_with_trailing_prose_braces_parses()
     print("\n全部通过")

@@ -19,7 +19,7 @@ import logging
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
-from utils.json_parser import extract_json_from_async_response
+from utils.json_parser import extract_first_json_object, extract_json_from_async_response
 from utils.llm_resilience import is_retriable_error
 from utils.skill_loader import SkillLoader
 
@@ -239,19 +239,13 @@ class IntentionAgent(AgentBase):
             try:
                 result = json.loads(text)
             except json.JSONDecodeError as e1:
-                # 如果直接解析失败，尝试提取JSON
-                start_idx = text.find('{')
-                end_idx = text.rfind('}')
-
-                if start_idx != -1 and end_idx != -1:
-                    json_str = text[start_idx:end_idx+1]
-                    try:
-                        result = json.loads(json_str)
-                    except json.JSONDecodeError as e2:
-                        logger.error(f"JSON parse failed. Text sample: {json_str[:100]}")
-                        raise ValueError(f"Failed to parse JSON. Error: {e2}")
-                else:
-                    raise ValueError(f"No JSON found in response. Parse error: {e1}")
+                # 直接解析失败时扫描第一个完整 JSON 对象：不能简单取
+                # find('{')..rfind('}')，结尾说明里的花括号会被一起截进来
+                try:
+                    result = extract_first_json_object(text)
+                except ValueError:
+                    logger.error(f"JSON parse failed. Text sample: {text[:100]}")
+                    raise ValueError(f"Failed to parse JSON. Error: {e1}") from e1
 
         except Exception as e:
             # 可重试错误（超时/连接失败/429/5xx）向上抛出，

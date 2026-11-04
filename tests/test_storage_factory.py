@@ -492,6 +492,83 @@ def test_summary_not_starved_by_long_current_session():
     print("✓ 长当前会话不会饿死跨会话总结")
 
 
+def test_append_preference_merges_atomically():
+    """append_preference 在锁内重新加载后合并，避免覆盖并发写入。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-append", storage_dir)
+    assert memory.append_preference("hotel_brands", "汉庭") == ["汉庭"]
+    assert memory.append_preference("hotel_brands", "如家") == ["汉庭", "如家"]
+    assert memory.append_preference("hotel_brands", "如家") == ["汉庭", "如家"]
+    memory.save_preference("seat_preference", "靠窗")
+    assert memory.append_preference("seat_preference", "过道") == ["靠窗", "过道"]
+
+    # 并发场景：先由记忆面板写入新值，再追加；追加基于磁盘最新值合并
+    memory.save_preference("hotel_brands", ["万豪"])
+    assert memory.append_preference("hotel_brands", "希尔顿") == ["万豪", "希尔顿"]
+    reopened = LongTermMemory("u-append", storage_dir)
+    assert reopened.get_preference("hotel_brands") == ["万豪", "希尔顿"]
+    print("✓ append_preference 原子合并（字符串→列表 / 去重 / 并发值保留）")
+
+
+def test_summary_invalidated_by_trip_edit():
+    """编辑行程（不更新时间戳）也要让跨会话总结缓存失效。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-trip-cache", "s-trip", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    trip_id = manager.long_term.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        }
+    )
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 1
+    assert manager.long_term.update_trip(
+        trip_id, {"start_date": "2026-12-10", "purpose": "会议"}
+    )
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 2, "编辑行程后总结应重新生成"
+    print("✓ 行程编辑使跨会话总结缓存失效")
+
+
+def test_embedding_model_shared(monkeypatch):
+    """同一嵌入模型路径在进程内只加载一次。"""
+    import sys
+    import types
+
+    from utils import embedding_model as embedding_module
+
+    embedding_module.reset_embedding_models()
+    created: list[str] = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, path):
+            created.append(path)
+            self.path = path
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+    try:
+        first = embedding_module.get_embedding_model("model-x")
+        second = embedding_module.get_embedding_model("model-x")
+        assert first is second
+        assert created == ["model-x"], "同一路径只加载一次"
+        other = embedding_module.get_embedding_model("model-y")
+        assert other is not first
+        assert created == ["model-x", "model-y"]
+    finally:
+        embedding_module.reset_embedding_models()
+    print("✓ 嵌入模型进程内共享（按路径缓存）")
+
+
 def test_summary_cache_avoids_repeated_calls():
     import asyncio
 
@@ -685,6 +762,9 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_export_data_includes_session_metadata()
+    test_append_preference_merges_atomically()
+    test_summary_invalidated_by_trip_edit()
+    test_embedding_model_shared(pytest.MonkeyPatch())
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()
     print("\n全部通过")

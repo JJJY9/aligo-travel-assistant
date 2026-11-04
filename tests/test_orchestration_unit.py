@@ -297,12 +297,105 @@ def test_prepare_context_includes_user_query():
     print("✓ 上下文包含用户本轮原话（user_query）")
 
 
+def test_agent_status_error_and_null_error():
+    """status=error 视为失败；error 为 null 视为正常输出。"""
+
+    class StatusError(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps({"status": "error", "message": "记忆查询失败"}),
+                role="assistant",
+            )
+
+    class NullError(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps({"error": None, "itinerary": {"title": "行程"}}),
+                role="assistant",
+            )
+
+    failed = OrchestrationAgent(agent_registry={"mem": StatusError("mem")})
+    result = json.loads(
+        asyncio.run(failed.reply(_intent([{"agent_name": "mem", "priority": 1}]))).content
+    )
+    assert result["status"] == "partial_failure"
+    assert result["results"][0]["status"] == "error"
+    assert "记忆查询失败" in json.dumps(result, ensure_ascii=False)
+
+    ok = OrchestrationAgent(agent_registry={"itin": NullError("itin")})
+    result_ok = json.loads(
+        asyncio.run(ok.reply(_intent([{"agent_name": "itin", "priority": 1}]))).content
+    )
+    assert result_ok["status"] == "completed"
+    assert result_ok["results"][0]["status"] == "success", "error=null 不应判为失败"
+    print("✓ status=error / error=null 判定正确")
+
+
+def test_malformed_schedule_is_sanitized():
+    """字符串项 / 非法 priority 的调度计划不应让整轮对话崩溃"""
+    orchestrator = OrchestrationAgent(
+        agent_registry={"a": _StubAgent("a", {"answer": "ok"})}
+    )
+    schedule = [
+        "a",
+        {"agent_name": "a", "priority": "2"},
+        {"agent_name": "", "priority": 1},
+        {"priority": None},
+        None,
+    ]
+    message = Msg(
+        name="IntentionAgent",
+        content=json.dumps(
+            {"reasoning": "x", "intents": [], "rewritten_query": "q", "agent_schedule": schedule},
+            ensure_ascii=False,
+        ),
+        role="assistant",
+    )
+    result = json.loads(asyncio.run(orchestrator.reply(message)).content)
+    executed = [item["agent_name"] for item in result["results"]]
+    assert executed == ["a"], "只执行有效的调度项，且 priority 字符串已转换"
+    print("✓ 非法调度计划被清洗（不再整轮 500）")
+
+
+def test_registry_load_failure_reports_agent_error():
+    """懒加载失败应变成单个智能体的错误，而不是整轮 500"""
+    from typing import Any, cast
+
+    class FlakyRegistry:
+        def __contains__(self, name):
+            return True
+
+        def __getitem__(self, name):
+            raise ImportError("模型文件缺失")
+
+    events: list[dict] = []
+    orchestrator = OrchestrationAgent(agent_registry=cast(Any, FlakyRegistry()))
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(
+                _intent([{"agent_name": "rag_knowledge", "priority": 1}]),
+                on_event=events.append,
+            )
+        ).content
+    )
+    assert result["status"] == "partial_failure"
+    assert "模型文件缺失" in json.dumps(result, ensure_ascii=False)
+    done = [event for event in events if event["type"] == "agent_done"]
+    assert done and done[0]["status"] == "error", "加载失败也要发出 agent_done"
+    print("✓ 懒加载失败转为智能体错误并发出完成事件")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
     test_failure_aggregated_as_partial_failure()
     test_agent_duration_and_progress_events()
     test_unregistered_agent_reports_error()
+    test_agent_status_error_and_null_error()
+    test_malformed_schedule_is_sanitized()
+    test_registry_load_failure_reports_agent_error()
     test_memory_update_preference_and_trip()
     test_prepare_context_includes_user_query()
     print("\n全部通过")

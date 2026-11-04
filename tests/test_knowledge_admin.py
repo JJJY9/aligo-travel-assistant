@@ -234,6 +234,12 @@ def test_rag_agent_strict_search_raises_when_uninitialized(monkeypatch):
     assert agent.search_knowledge("住宿标准") == []
     with pytest.raises(RuntimeError, match="未初始化"):
         agent.search_knowledge("住宿标准", strict=True)
+
+    # 空查询不能返回任意 top-k 片段；严格模式抛错（管理接口按 503 处理）
+    agent.initialized = True
+    assert agent.search_knowledge("   ") == []
+    with pytest.raises(ValueError, match="为空"):
+        agent.search_knowledge(None, strict=True)
     print("✓ 未初始化知识库的严格检索抛出异常")
 
 

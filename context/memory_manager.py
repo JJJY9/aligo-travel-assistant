@@ -202,7 +202,18 @@ class MemoryManager:
         if not history_from_other_sessions and not trip_history:
             return ""
 
-        # 同一会话内其它会话的历史 / 行程未变化时复用上次总结，避免每轮多一次 LLM 调用
+        # 同一会话内其它会话的历史 / 行程未变化时复用上次总结，避免每轮多一次 LLM 调用。
+        # 行程的编辑（改日期 / 目的）不会更新时间戳，指纹必须包含字段内容，
+        # 否则修改行程后仍会注入旧总结。
+        trip_signature = tuple(
+            (
+                str(trip.get("trip_id") or ""),
+                str(trip.get("start_date") or ""),
+                str(trip.get("end_date") or ""),
+                str(trip.get("purpose") or ""),
+            )
+            for trip in trip_history
+        )
         fingerprint = (
             len(history_from_other_sessions),
             str(history_from_other_sessions[-1].get("timestamp", ""))
@@ -210,6 +221,7 @@ class MemoryManager:
             else "",
             len(trip_history),
             str(trip_history[-1].get("timestamp", "")) if trip_history else "",
+            trip_signature,
         )
         if self._summary_cache is not None and self._summary_cache[0] == fingerprint:
             return self._summary_cache[1]

@@ -109,7 +109,23 @@ class OrchestrationAgent(AgentBase):
                 content=json.dumps({"error": "Invalid intention format"}),
                 role="assistant",
             )
-        agent_schedule = intention_data.get("agent_schedule", [])
+        # 规范化调度计划：LLM 可能返回字符串项 / 单对象 / 非法 priority，
+        # 直接 sorted 会抛 TypeError 让整轮对话 500
+        raw_schedule = intention_data.get("agent_schedule", [])
+        if isinstance(raw_schedule, dict):
+            raw_schedule = [raw_schedule]
+        if not isinstance(raw_schedule, list):
+            raw_schedule = []
+        agent_schedule = [
+            task
+            for task in raw_schedule
+            if isinstance(task, dict) and str(task.get("agent_name") or "").strip()
+        ]
+        for task in agent_schedule:
+            try:
+                task["priority"] = int(task.get("priority", 999))
+            except (TypeError, ValueError):
+                task["priority"] = 999
         if not agent_schedule:
             return Msg(
                 name=self.name,
@@ -121,7 +137,7 @@ class OrchestrationAgent(AgentBase):
             )
 
         # 按优先级排序
-        sorted_schedule = sorted(agent_schedule, key=lambda x: x.get("priority", 999))
+        sorted_schedule = sorted(agent_schedule, key=lambda x: x["priority"])
 
         logger.info(f"Orchestrating {len(sorted_schedule)} agents")
 
@@ -377,8 +393,6 @@ class OrchestrationAgent(AgentBase):
                 "message": error_message,
             }
 
-        agent = self.agent_registry[agent_name]
-
         # 构建输入消息
         input_msg = Msg(
             name="Orchestrator",
@@ -392,6 +406,13 @@ class OrchestrationAgent(AgentBase):
         )
 
         try:
+            # 懒加载失败（缺依赖 / 模型文件损坏）也必须落在下面的 except 里，
+            # 否则错误会绕过 per-agent 处理让整轮对话 500、进度停在执行中。
+            # 首次加载 RAG 会导入 torch / 加载嵌入模型（约 10s），放到线程池
+            # 避免卡住事件循环（SSE 心跳与其它会话）
+            agent = await asyncio.get_running_loop().run_in_executor(
+                None, self.agent_registry.__getitem__, agent_name
+            )
             # 调用智能体
             response = await agent.reply(input_msg)
 
@@ -404,16 +425,23 @@ class OrchestrationAgent(AgentBase):
             else:
                 result = response.content
 
-            # 检查 result 中是否有 error 字段
-            # 如果有，说明智能体内部执行失败了
-            if isinstance(result, dict) and "error" in result:
-                error_msg = result.get("error", "未知错误")
-                return {
-                    "status": "error",
-                    "agent_name": agent_name,
-                    "data": result,
-                    "message": error_msg
-                }
+            # 智能体可能用 error 字段或 status=error 表示失败；
+            # error 为 null / 空串时是正常输出，不能当作失败
+            if isinstance(result, dict):
+                error_value = result.get("error")
+                state = str(result.get("status") or "").lower()
+                if error_value or state == "error":
+                    error_msg = (
+                        error_value
+                        or result.get("message")
+                        or "智能体返回错误状态"
+                    )
+                    return {
+                        "status": "error",
+                        "agent_name": agent_name,
+                        "data": result,
+                        "message": error_msg,
+                    }
 
             return {
                 "status": "success",
@@ -509,7 +537,20 @@ class OrchestrationAgent(AgentBase):
 
                         # 根据 action 决定操作
                         if pref_action == "append":
-                            # 追加模式：获取现有值并追加
+                            append_pref = getattr(
+                                self.memory_manager.long_term,
+                                "append_preference",
+                                None,
+                            )
+                            if callable(append_pref):
+                                # 存储层在锁内重新读取再合并，避免覆盖本轮
+                                # LLM 调用期间用户在记忆面板写入的偏好
+                                merged = append_pref(pref_type, pref_value)
+                                logger.info(
+                                    f"Appended to {pref_type}: {pref_value}, total: {merged}"
+                                )
+                                continue
+                            # 旧实现 / 自定义后端没有原子追加时的兜底
                             current_prefs = self.memory_manager.long_term.get_preference()
                             existing_value = current_prefs.get(pref_type)
 

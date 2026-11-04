@@ -168,6 +168,39 @@ class PostgresLongTermMemory:
             logger.info("Deleted preference from PostgreSQL: %s", pref_type)
         return bool(removed)
 
+    def append_preference(self, pref_type: str, value: Any) -> Any:
+        """原子地追加一个偏好值（列表语义），返回合并后的值。
+
+        用会话级 advisory lock 包住「读 + 写」，避免与本轮 LLM 调用期间
+        用户在记忆面板修改同一类型偏好互相覆盖。
+        """
+        lock_name = f"aligo-pref-{self.user_id}-{pref_type}"
+        with self._conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+            )
+        try:
+            current = self.get_preference(pref_type)
+            if isinstance(current, list):
+                merged = list(current)
+                if value not in merged:
+                    merged.append(value)
+            elif current == value:
+                merged = [value]
+            elif current:
+                merged = [current, value]
+            else:
+                merged = [value]
+            self.save_preference(pref_type, merged)
+            return merged
+        finally:
+            with contextlib.suppress(Exception):
+                with self._conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                        (lock_name,),
+                    )
+
     def add_hotel_brand(self, brand: str) -> None:
         current = self.get_preference("hotel_brands")
         values = list(current) if isinstance(current, list) else ([current] if current else [])
