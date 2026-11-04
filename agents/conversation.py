@@ -107,12 +107,18 @@ class ConversationRuntime:
         if not isinstance(intention_data, dict):
             raise ValueError("意图识别结果格式错误，请重试")
 
-        schedule = intention_data.get("agent_schedule") or []
+        schedule = intention_data.get("agent_schedule")
+        if not isinstance(schedule, list):
+            # 模型可能返回非列表（如单个对象 / 数字），直接迭代会 TypeError
+            schedule = []
+        intents = intention_data.get("intents")
+        if not isinstance(intents, list):
+            intents = []
         self._emit(
             on_event,
             {
                 "type": "plan",
-                "intents": intention_data.get("intents") or [],
+                "intents": intents,
                 "reasoning": intention_data.get("reasoning") or "",
                 "schedule": [
                     {

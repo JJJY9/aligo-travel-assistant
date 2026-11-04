@@ -7,6 +7,12 @@ JSON lines（`event=http_request`），便于日志采集、检索与告警。
 import json
 import logging
 import os
+import re
+
+
+def _safe_log_text(value: object) -> str:
+    """去掉控制字符：uvicorn 会 percent-decode 路径，%0A 可伪造整行日志。"""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
 
 
 def access_log_format() -> str:
@@ -37,8 +43,8 @@ def format_access_log(
             ensure_ascii=False,
         )
     return (
-        f"{method} {path} -> {status} "
-        f"({float(elapsed_ms):.0f}ms) [{request_id}]"
+        f"{_safe_log_text(method)} {_safe_log_text(path)} -> {status} "
+        f"({float(elapsed_ms):.0f}ms) [{_safe_log_text(request_id)}]"
     )
 
 

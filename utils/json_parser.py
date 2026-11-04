@@ -9,6 +9,11 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def reject_json_constant(value: str):
+    """拒绝 NaN / Infinity（Python 默认允许，会让持久化的 JSON 无法再被标准解析）。"""
+    raise ValueError(f"非法 JSON 数值: {value}")
+
+
 def extract_first_json_object(text: str) -> dict:
     """返回文本中第一个能完整解析的 JSON 对象，忽略前后的说明文字。
 
@@ -18,7 +23,7 @@ def extract_first_json_object(text: str) -> dict:
     """
     if not text:
         raise ValueError("Empty text provided")
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(parse_constant=reject_json_constant)
     for index, char in enumerate(text):
         if char != "{":
             continue

@@ -19,7 +19,11 @@ import logging
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
-from utils.json_parser import extract_first_json_object, extract_json_from_async_response
+from utils.json_parser import (
+    extract_first_json_object,
+    extract_json_from_async_response,
+    reject_json_constant,
+)
 from utils.llm_resilience import is_retriable_error
 from utils.skill_loader import SkillLoader
 
@@ -235,9 +239,11 @@ class IntentionAgent(AgentBase):
             text = text.removesuffix('```')
             text = text.strip()
 
-            # 解析JSON
+            # 解析JSON（拒绝 NaN / Infinity；顶层必须是对象）
             try:
-                result = json.loads(text)
+                result = json.loads(text, parse_constant=reject_json_constant)
+                if not isinstance(result, dict):
+                    raise ValueError("意图识别结果不是 JSON 对象")
             except json.JSONDecodeError as e1:
                 # 直接解析失败时扫描第一个完整 JSON 对象：不能简单取
                 # find('{')..rfind('}')，结尾说明里的花括号会被一起截进来
