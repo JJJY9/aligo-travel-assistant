@@ -152,6 +152,42 @@ def test_access_log_strips_control_characters():
     print("✓ 访问日志清理 CR/LF 与转义字符")
 
 
+def test_memory_persistence_error_does_not_trip_breaker():
+    """记忆写盘失败不能计入熔断器（磁盘故障与 LLM 健康无关）。"""
+    from agents.conversation import ConversationRuntime
+    from utils.circuit_breaker import CircuitBreaker
+
+    runtime = object.__new__(ConversationRuntime)
+    runtime.circuit_breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+
+    async def disk_error():
+        raise MemoryPersistenceError("disk full")
+
+    with pytest.raises(MemoryPersistenceError):
+        asyncio.run(
+            runtime._call_with_resilience(
+                disk_error, max_retries=0, base_delay=0.0, max_delay=0.0
+            )
+        )
+    status = runtime.circuit_breaker.get_status()
+    assert status["failure_count"] == 0, "写盘失败不应计入熔断"
+    assert runtime.circuit_breaker.state.value == "closed"
+
+    async def llm_error():
+        raise RuntimeError("llm down")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            runtime._call_with_resilience(
+                llm_error, max_retries=0, base_delay=0.0, max_delay=0.0
+            )
+        )
+    assert runtime.circuit_breaker.get_status()["failure_count"] == 1
+    print("✓ 记忆写盘失败不计入熔断器")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -162,6 +198,7 @@ if __name__ == "__main__":
         test_failure_after_recovery_timeout_reopens(_mp)
         test_build_turn_meta_tolerates_non_list_shapes()
         test_access_log_strips_control_characters()
+        test_memory_persistence_error_does_not_trip_breaker()
     finally:
         _mp.undo()
     print("\n全部通过")

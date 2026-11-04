@@ -367,6 +367,86 @@ def test_session_lru_eviction():
     print("✓ 会话缓存按 LRU 淘汰并释放")
 
 
+def test_session_lru_closes_evicted_session():
+    """被淘汰的会话必须 close()，否则 PostgreSQL 连接会随会话数泄漏。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 1
+    first = state.get_session("user-a", "s-a")
+    closed: list[bool] = []
+    setattr(first, "close", lambda: closed.append(True))
+    state.get_session("user-a", "s-b")
+    assert closed, "被淘汰的会话必须 close()（释放 PG 连接）"
+    state.close_all()
+    print("✓ LRU 淘汰时关闭会话（释放连接）")
+
+
+def test_streaming_releases_user_lock():
+    """SSE 流结束后必须释放用户锁，否则同一用户后续请求全部卡死。"""
+    import json as json_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app)
+    state = app.state.aligo
+    user_id = _unique_user("web_test_stream_lock")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "你好", "user_id": user_id, "session_id": "stream-lock"},
+        ) as response:
+            assert response.status_code == 200
+            events = [
+                json_module.loads(line[6:])
+                for line in response.iter_lines()
+                if line.startswith("data: ")
+            ]
+        assert events and events[0]["type"] == "session"
+        assert events[-1]["type"] in ("done", "error")
+        assert state.locks[user_id].locked() is False, "流结束后必须释放用户锁"
+        deleted = client.delete(
+            "/api/sessions/stream-lock", params={"user_id": user_id}
+        )
+        assert deleted.status_code == 200, "锁未释放时删除会卡住"
+        print("✓ SSE 流结束后释放用户锁")
+    finally:
+        _cleanup(user_id)
+
+
+def test_delete_last_turn_clears_cached_short_term():
+    """缓存的进程内会话也必须清掉被删除的一轮（否则下一轮把旧问答再发给模型）。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app)
+    state = app.state.aligo
+    user_id = _unique_user("web_test_last_turn_cache")
+    try:
+        first = client.post(
+            "/api/chat",
+            json={"message": "第一问", "user_id": user_id, "session_id": "lt-cache"},
+        )
+        assert first.status_code == 200
+        session = state.sessions[state._session_key(user_id, "lt-cache")]
+        short_term = session.runtime.memory.short_term
+        before = short_term.get_statistics()["total_messages"]
+        assert before >= 2
+
+        removed = client.delete(
+            "/api/sessions/lt-cache/last-turn",
+            params={"user_id": user_id, "expect": "第一问"},
+        )
+        assert removed.status_code == 200 and removed.json()["removed"] == 2
+        assert short_term.get_statistics()["total_messages"] == before - 2
+
+        again = client.delete(
+            "/api/sessions/lt-cache/last-turn",
+            params={"user_id": user_id, "expect": "第一问"},
+        )
+        assert again.json()["mismatch"] is True
+        print("✓ 删除最后一轮同步清理缓存的进程内短期记忆")
+    finally:
+        _cleanup(user_id)
+
+
 def test_session_cache_is_user_scoped():
     """同一 session_id 下不同用户各持独立运行时，drop 不影响他人。"""
     app = create_app(model=UsageTrackingModel(_FakeModel()))
@@ -1735,6 +1815,34 @@ def test_chat_rate_limit_rejected_request_does_not_consume_other_bucket():
             _cleanup(user_id)
 
 
+def test_ip_rejection_does_not_consume_user_bucket():
+    """IP 桶拒绝时不能消耗用户桶配额（与用户桶拒绝对称）。"""
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=10, window_sec=60)
+    state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_bucket_rev")
+    try:
+        first = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "b2-1"},
+        )
+        assert first.status_code == 200
+        rejected = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "b2-2"},
+        )
+        assert rejected.status_code == 429
+        remaining, _ = state.rate_limiter.status(f"testclient:{user_id}")
+        assert remaining == 9, f"被 IP 桶拒绝时消耗了用户桶配额（剩 {remaining}）"
+        print("✓ IP 桶拒绝不消耗用户桶配额")
+    finally:
+        _cleanup(user_id)
+
+
 def test_deleted_session_cannot_be_resurrected():
     """删除后的会话在墓碑窗口内不能通过旧 session_id 写回。"""
     client = _client()
@@ -2720,6 +2828,9 @@ if __name__ == "__main__":
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()
+    test_session_lru_closes_evicted_session()
+    test_streaming_releases_user_lock()
+    test_delete_last_turn_clears_cached_short_term()
     test_session_cache_is_user_scoped()
     test_trip_whitespace_destination_rejected()
     test_ics_handles_overflow_end_date()
@@ -2737,6 +2848,7 @@ if __name__ == "__main__":
     test_rate_limit_headers()
     test_chat_rate_limit_ip_bucket()
     test_chat_rate_limit_rejected_request_does_not_consume_other_bucket()
+    test_ip_rejection_does_not_consume_user_bucket()
     test_deleted_session_cannot_be_resurrected()
     test_session_metadata_requires_existing_session()
     test_session_rename()

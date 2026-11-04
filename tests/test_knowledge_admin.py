@@ -31,7 +31,8 @@ class _FakeMilvusClient:
         if filter.startswith("id =="):
             doc_id = int(filter.split("==")[1])
             return [row for row in self.rows if int(row["id"]) == doc_id]
-        return list(self.rows)
+        # 与真实 Milvus 一致：查询受 limit 限制（导出截断回归才能被测出）
+        return list(self.rows)[:limit]
 
     def delete(self, collection_name, ids):
         self.deleted.extend(ids)
@@ -289,6 +290,19 @@ def test_export_documents_sorted_and_stripped(monkeypatch):
     print("✓ 导出知识片段（按 id 升序 / 不含 id）")
 
 
+def test_export_not_truncated_by_default_page(monkeypatch):
+    """导出必须取全量（_MAX_SCAN），不能退回列表默认分页（20 条）。"""
+    rows = [
+        {"id": index, "content": f"c{index}", "metadata": "{}"}
+        for index in range(1, 26)
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    documents = knowledge_admin.export_documents()
+    assert len(documents) == 25, "导出被默认分页截断"
+    print("✓ 导出不受列表默认分页截断")
+
+
 def test_import_documents_sanitizes(monkeypatch):
     from pathlib import Path
 
@@ -438,6 +452,7 @@ if __name__ == "__main__":
         test_search_documents_requires_initialized_db,
         test_rag_agent_strict_search_raises_when_uninitialized,
         test_export_documents_sorted_and_stripped,
+        test_export_not_truncated_by_default_page,
         test_import_documents_sanitizes,
         test_import_skips_existing_and_duplicate_content,
         test_import_chunks_large_documents,

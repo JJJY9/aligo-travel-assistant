@@ -34,12 +34,20 @@ except ImportError as e:
     print("=" * 70)
     sys.exit(1)
 
+import pytest
 from agentscope.message import Msg
+from config import LLM_CONFIG
 from config_agentscope import create_chat_model, init_agentscope
 
 from agents.intention_agent import IntentionAgent
 
+requires_llm_key = pytest.mark.skipif(
+    not LLM_CONFIG["api_key"],
+    reason="需要真实模型密钥（LLM_API_KEY 或 config_local.API_KEY）；未配置时如实跳过",
+)
 
+
+@requires_llm_key
 async def test_intention_agent():
     """测试意图识别智能体的各种场景"""
 
@@ -51,7 +59,7 @@ async def test_intention_agent():
         print(f"❌ 初始化失败: {e}")
         import traceback
         traceback.print_exc()
-        return
+        pytest.fail(f"AgentScope 初始化失败: {e}")
 
     # 创建模型配置
     print("创建模型...")
@@ -62,7 +70,7 @@ async def test_intention_agent():
         print(f"❌ 模型创建失败: {e}")
         import traceback
         traceback.print_exc()
-        return
+        pytest.fail(f"模型创建失败: {e}")
 
     # 创建意图识别智能体
     print("创建意图识别智能体...")
@@ -76,7 +84,7 @@ async def test_intention_agent():
         print(f"❌ Agent 创建失败: {e}")
         import traceback
         traceback.print_exc()
-        return
+        pytest.fail(f"意图识别 Agent 创建失败: {e}")
 
     # 测试用例
     test_cases = [
@@ -98,6 +106,7 @@ async def test_intention_agent():
         },
     ]
 
+    failures: list[str] = []
     for i, test_case in enumerate(test_cases, 1):
         print("\n" + "="*70)
         print(f"测试 {i}: {test_case['name']}")
@@ -119,10 +128,13 @@ async def test_intention_agent():
             display_result(result_data)
         except Exception as e:
             print(f"❌ 测试失败: {e}")
+            failures.append(f"{test_case['name']}: {e}")
             import traceback
             traceback.print_exc()
 
         print()
+
+    assert not failures, f"以下用例失败: {failures}"
 
 
 def display_result(result):

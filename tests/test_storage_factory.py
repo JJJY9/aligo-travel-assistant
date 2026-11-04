@@ -389,9 +389,11 @@ class _CountingModel:
 
     def __init__(self):
         self.calls = 0
+        self.prompts = []
 
     async def __call__(self, messages, **kwargs):
         self.calls += 1
+        self.prompts.append(messages)
         return {
             "content": [{"type": "text", "text": "用户偏好汉庭，常驻北京"}],
             "usage": {"input_tokens": 8, "output_tokens": 4, "time": 0.05},
@@ -489,7 +491,9 @@ def test_summary_not_starved_by_long_current_session():
     summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
     assert summary, "长会话不应让跨会话总结为空"
     assert model.calls == 1
-    print("✓ 长当前会话不会饿死跨会话总结")
+    prompt_text = str(model.prompts[0])
+    assert "较早的其它会话内容" in prompt_text, "总结提示词必须包含其它会话的历史"
+    print("✓ 长当前会话不会饿死跨会话总结（提示词含其它会话）")
 
 
 def test_append_preference_merges_atomically():
