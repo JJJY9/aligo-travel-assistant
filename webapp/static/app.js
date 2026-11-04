@@ -56,6 +56,8 @@ const state = {
   kbDeleting: new Set(),
   kbImporting: false,
   kbEditingId: null,
+  kbEditingMetadata: {},
+  kbSaving: false,
   tripEditingId: null,
   sessionTotal: 0,
 };
@@ -501,11 +503,16 @@ function refreshEditButtons() {
 }
 
 function cancelPendingEdits() {
-  els.messages
-    .querySelectorAll(".msg.user.editing .user-edit-input")
-    .forEach((input) => {
-      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    });
+  const inputs = [
+    ...els.messages.querySelectorAll(".msg.user.editing .user-edit-input"),
+  ];
+  if (!inputs.length) return true;
+  // 正在提交的编辑不能取消（否则界面显示已取消，但请求仍会删除并重发）
+  if (inputs.some((input) => input.dataset.saving === "1")) return false;
+  inputs.forEach((input) => {
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  });
+  return true;
 }
 
 function startEditUserNode(node, originalText) {
@@ -515,6 +522,7 @@ function startEditUserNode(node, originalText) {
   const foot = node.querySelector(".user-edit");
   if (foot) foot.remove();
   node.classList.add("editing");
+  let saving = false;
 
   const form = document.createElement("div");
   form.className = "user-edit-form";
@@ -522,6 +530,7 @@ function startEditUserNode(node, originalText) {
   input.className = "user-edit-input";
   input.maxLength = 4000;
   input.value = originalText;
+  input.dataset.saving = "0";
   input.setAttribute("aria-label", "编辑提问");
   const actions = document.createElement("div");
   actions.className = "user-edit-actions";
@@ -546,6 +555,7 @@ function startEditUserNode(node, originalText) {
     refreshEditButtons();
   };
   const close = () => {
+    if (saving) return;
     input.removeEventListener("keydown", onKeydown);
     restore();
   };
@@ -564,6 +574,7 @@ function startEditUserNode(node, originalText) {
   cancel.addEventListener("click", close);
 
   async function submit() {
+    if (saving) return;
     const text = input.value.trim();
     if (!text) {
       toast("提问不能为空");
@@ -574,25 +585,36 @@ function startEditUserNode(node, originalText) {
       close();
       return;
     }
+    saving = true;
+    input.dataset.saving = "1";
     save.disabled = true;
     cancel.disabled = true;
     save.textContent = "发送中…";
+    // 删除 + 重发期间锁住输入区与会话切换，避免交错的发送改动被当作本轮删除
+    setBusy(true);
+    let mismatch = false;
     try {
-      await getJSON(
+      const result = await getJSON(
         `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn?user_id=${encodeURIComponent(
           state.userId,
-        )}`,
+        )}&expect=${encodeURIComponent(originalText)}`,
         { method: "DELETE" },
       );
+      mismatch = Boolean(result && result.mismatch);
     } catch (error) {
+      saving = false;
+      input.dataset.saving = "0";
+      setBusy(false);
       toast(`编辑失败：${error.message}`);
       save.disabled = false;
       cancel.disabled = false;
       save.textContent = "保存并重新发送";
       return;
     }
+    setBusy(false);
     input.removeEventListener("keydown", onKeydown);
-    // 本轮的用户提问与回答一并移除后重新发送
+    // 本轮的用户提问与回答一并移除后重新发送；内容不一致说明这条提问
+    // 尚未写入历史，此时只清理界面并直接重发，不删除服务端上一轮
     let next = node.nextElementSibling;
     while (next) {
       const following = next.nextElementSibling;
@@ -600,6 +622,7 @@ function startEditUserNode(node, originalText) {
       next = following;
     }
     node.remove();
+    if (mismatch) toast("这条提问还没有保存到历史，已直接重新发送");
     await sendMessage(text);
   }
 
@@ -960,7 +983,10 @@ ${bodyHtml}
 
 function exportSessionHtml() {
   if (!state.sessionId) return;
-  cancelPendingEdits();
+  if (!cancelPendingEdits()) {
+    toast("正在保存修改，请稍候");
+    return;
+  }
   const title = (els.convTitle.textContent || "").trim() || "Aligo 对话";
   const clone = els.messages.cloneNode(true);
   clone
@@ -1613,6 +1639,7 @@ async function sendMessage(text, options = {}) {
   const message = String(text || "").trim();
   if (!message || state.busy) return;
 
+  cancelPendingEdits();
   sessionLoadToken += 1;
   state.lastUserText = message;
   state.controller = new AbortController();
@@ -2476,11 +2503,15 @@ function renderKnowledgeDocuments(items, append) {
 }
 
 async function removeKnowledgeDocument(docId) {
+  if (state.kbSaving) {
+    toast("正在保存知识片段，请稍候");
+    return;
+  }
   if (!window.confirm(`删除知识片段 #${docId}？`)) return;
   if (state.kbDeleting.has(docId)) return;
   state.kbDeleting.add(docId);
   const row = els.kbList.querySelector(`.kb-row[data-id="${docId}"]`);
-  const button = row?.querySelector(".pref-actions button");
+  const button = row?.querySelector('button[title="删除片段"]');
   if (button) button.disabled = true;
   let removed = false;
   try {
@@ -2507,7 +2538,13 @@ async function removeKnowledgeDocument(docId) {
 }
 
 function startEditKnowledge(doc) {
+  if (state.kbSaving) {
+    toast("正在保存知识片段，请稍候");
+    return;
+  }
   state.kbEditingId = doc.id;
+  // 保留完整 metadata：PUT 会整体覆盖，只回填分类会丢掉 title / source 等字段
+  state.kbEditingMetadata = { ...(doc.metadata || {}) };
   els.kbContent.value = doc.content || "";
   els.kbCategory.value = doc.metadata?.category ? String(doc.metadata.category) : "";
   els.kbSubmit.textContent = "保存修改";
@@ -2521,6 +2558,7 @@ function startEditKnowledge(doc) {
 
 function resetKnowledgeForm({ clear = true } = {}) {
   state.kbEditingId = null;
+  state.kbEditingMetadata = {};
   els.kbSubmit.textContent = "添加片段";
   els.kbCancel.hidden = true;
   if (clear) {
@@ -2531,16 +2569,23 @@ function resetKnowledgeForm({ clear = true } = {}) {
 
 async function addKnowledgeDocument(event) {
   event.preventDefault();
+  if (state.kbSaving) return;
   const content = els.kbContent.value.trim();
   if (!content) {
     toast("请输入知识内容");
     return;
   }
-  const metadata = {};
+  const editingId = state.kbEditingId;
+  const metadata = editingId ? { ...state.kbEditingMetadata } : {};
   const category = els.kbCategory.value.trim();
   if (category) metadata.category = category;
-  const editingId = state.kbEditingId;
+  else delete metadata.category;
+  state.kbSaving = true;
   els.kbSubmit.disabled = true;
+  els.kbCancel.disabled = true;
+  els.kbList
+    .querySelectorAll(".pref-actions button")
+    .forEach((button) => (button.disabled = true));
   els.kbSubmit.textContent = editingId ? "保存中…" : "添加中…";
   try {
     await getJSON(
@@ -2553,16 +2598,22 @@ async function addKnowledgeDocument(event) {
         body: JSON.stringify({ content, metadata }),
       },
     );
+    state.kbSaving = false;
     toast(editingId ? "知识片段已更新" : "知识片段已添加");
     // 提交期间用户可能继续输入下一条，只清空仍是本次提交内容的输入框
     if (els.kbContent.value.trim() === content) els.kbContent.value = "";
     if (els.kbCategory.value.trim() === category) els.kbCategory.value = "";
-    resetKnowledgeForm({ clear: false });
+    if (state.kbEditingId === editingId) resetKnowledgeForm({ clear: false });
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
     toast(error.message);
   } finally {
+    state.kbSaving = false;
     els.kbSubmit.disabled = false;
+    els.kbCancel.disabled = false;
+    els.kbList
+      .querySelectorAll(".pref-actions button")
+      .forEach((button) => (button.disabled = false));
     els.kbSubmit.textContent = state.kbEditingId ? "保存修改" : "添加片段";
   }
 }
@@ -2870,7 +2921,10 @@ function bindEvents() {
   });
 
   els.printChat.addEventListener("click", () => {
-    cancelPendingEdits();
+    if (!cancelPendingEdits()) {
+      toast("正在保存修改，请稍候");
+      return;
+    }
     window.print();
   });
 

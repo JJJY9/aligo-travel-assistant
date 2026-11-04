@@ -231,22 +231,42 @@ class PostgresLongTermMemory:
             )
         return removed
 
-    def delete_last_turn(self, session_id: str) -> int:
-        """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。"""
+    def delete_last_turn(self, session_id: str, expect: str | None = None) -> int:
+        """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。
+
+        ``expect`` 不为 None 时先校验最后一轮的用户提问内容，不一致直接返回 0，
+        避免删除上一轮已保存的对话。删除语句带「没有更新消息」条件，避免在
+        多进程场景下与并发写入交错后删错回合。
+        """
         rows = self._fetchall(
-            "SELECT id, role FROM aligo_chat_messages "
+            "SELECT id, role, content FROM aligo_chat_messages "
             "WHERE user_id = %s AND session_id = %s ORDER BY id DESC LIMIT 2",
             (self.user_id, session_id),
         )
         if not rows:
             return 0
         ids = [rows[0][0]]
+        last_user_content: str | None = None
         if len(rows) >= 2 and rows[0][1] == "assistant" and rows[1][1] == "user":
             ids.append(rows[1][0])
+            last_user_content = str(rows[1][2])
+        elif rows[0][1] == "user":
+            last_user_content = str(rows[0][2])
+        if expect is not None:
+            if last_user_content is None or last_user_content.strip() != expect.strip():
+                logger.info(
+                    "Skip deleting last turn of session %s: content mismatch", session_id
+                )
+                return 0
         with self._conn.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM aligo_chat_messages WHERE user_id = %s AND id = ANY(%s)",
-                (self.user_id, ids),
+                "DELETE FROM aligo_chat_messages "
+                "WHERE user_id = %s AND id = ANY(%s) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM aligo_chat_messages "
+                "  WHERE user_id = %s AND session_id = %s AND id > %s"
+                ")",
+                (self.user_id, ids, self.user_id, session_id, rows[0][0]),
             )
             removed = cursor.rowcount or 0
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)

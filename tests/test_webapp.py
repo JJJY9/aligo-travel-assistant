@@ -920,8 +920,36 @@ def test_delete_last_turn_api():
         finally:
             close(store)
 
+        # 内容不匹配：说明这条提问没有写入历史，不能删除上一轮
+        mismatch = client.delete(
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "问题 3"},
+        )
+        assert mismatch.status_code == 200
+        assert mismatch.json()["removed"] == 0
+        assert mismatch.json()["mismatch"] is True
+
+        # 其它用户不能删除该会话（此时会话仍有 4 条消息）
+        stranger = _unique_user("web_test_last_turn_x")
+        try:
+            denied = client.delete(
+                f"/api/sessions/{session_id}/last-turn",
+                params={"user_id": stranger, "expect": "问题 2"},
+            )
+            assert denied.status_code == 200
+            assert denied.json()["removed"] == 0
+            store = open_store()
+            try:
+                assert len(store.get_chat_history(session_id=session_id)) == 4
+            finally:
+                close(store)
+        finally:
+            _cleanup(stranger)
+
+        # 内容匹配：成对删除最后一轮
         response = client.delete(
-            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "问题 2"},
         )
         assert response.status_code == 200
         assert response.json()["removed"] == 2
@@ -939,31 +967,24 @@ def test_delete_last_turn_api():
 
         # 回答中断、只剩提问时只删除提问
         single = client.delete(
-            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "只有提问没有回答"},
         )
         assert single.json()["removed"] == 1
 
         # 再删一次移除剩余的一轮，之后没有可删除的消息（幂等返回 0）
         pair = client.delete(
-            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "问题 1"},
         )
         assert pair.json()["removed"] == 2
         empty = client.delete(
-            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "问题 1"},
         )
         assert empty.status_code == 200
         assert empty.json()["removed"] == 0
-
-        stranger = _unique_user("web_test_last_turn_x")
-        try:
-            denied = client.delete(
-                f"/api/sessions/{session_id}/last-turn", params={"user_id": stranger}
-            )
-            assert denied.status_code == 200
-            assert denied.json()["removed"] == 0
-        finally:
-            _cleanup(stranger)
-        print("✓ 删除最后一轮对话（成对删除 / 仅提问 / 幂等 / 会话隔离）")
+        print("✓ 删除最后一轮对话（内容校验 / 成对删除 / 仅提问 / 幂等 / 会话隔离）")
     finally:
         _cleanup(user_id)
 
@@ -992,6 +1013,15 @@ def test_next_trip_prefers_ongoing():
                     "origin": "北京",
                     "destination": "杭州",
                     "start_date": (today + timedelta(days=10)).isoformat(),
+                }
+            )
+            # 非 ISO 结束日期不能按字符串比较成「进行中」，按单日处理
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "广州",
+                    "start_date": (today - timedelta(days=5)).isoformat(),
+                    "end_date": "2026/12/31",
                 }
             )
         finally:
@@ -1739,6 +1769,10 @@ if __name__ == "__main__":
     test_delete_trip_api()
     test_create_trip_api()
     test_update_trip_api()
+    test_trip_overlap_conflicts_api()
+    test_trip_conflicts_helper_edges()
+    test_delete_last_turn_api()
+    test_next_trip_prefers_ongoing()
     test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:

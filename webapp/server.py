@@ -44,7 +44,6 @@ from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tra
 from context.storage import (
     clear_short_term_session,
     create_long_term_memory,
-    create_short_term_memory,
     describe_backends,
 )
 from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
@@ -942,28 +941,29 @@ def create_app(model: Any = None) -> FastAPI:
             # 保留 0 / false 等合法值，仅过滤空值
             if value is not None and value != "" and value != [] and value != {}
         }
-        today = datetime.now().date().isoformat()
-        active_trips: list[dict[str, Any]] = []
-        upcoming_trips: list[dict[str, Any]] = []
+        today = datetime.now().date()
+        active_trips: list[tuple[datetime, dict[str, Any]]] = []
+        upcoming_trips: list[tuple[datetime, dict[str, Any]]] = []
         for trip in data["trip_history"]:
-            start = str(trip.get("start_date") or "")
-            if not start:
+            interval = _trip_interval(trip)
+            if interval is None:
                 continue
-            end = str(trip.get("end_date") or start)
-            if end < start:
-                end = start
-            if start <= today <= end:
-                active_trips.append(trip)
-            elif start > today:
-                upcoming_trips.append(trip)
+            start_dt, end_dt = interval
+            if start_dt.date() <= today <= end_dt.date():
+                active_trips.append((end_dt, trip))
+            elif start_dt.date() > today:
+                upcoming_trips.append((start_dt, trip))
         # 进行中的行程优先展示（多条时取结束最晚的）
-        active_trips.sort(key=lambda trip: str(trip.get("end_date") or trip.get("start_date")))
+        active_trips.sort(key=lambda item: item[0])
         upcoming_trips.sort(
-            key=lambda trip: (str(trip["start_date"]), 0 if trip.get("session_id") else 1)
+            key=lambda item: (item[0], 0 if item[1].get("session_id") else 1)
         )
-        featured_trip = active_trips[-1] if active_trips else (
-            upcoming_trips[0] if upcoming_trips else None
-        )
+        if active_trips:
+            featured_trip = active_trips[-1][1]
+        elif upcoming_trips:
+            featured_trip = upcoming_trips[0][1]
+        else:
+            featured_trip = None
         return {
             "user_id": user_id,
             "preferences": preferences,
@@ -1142,25 +1142,38 @@ def create_app(model: Any = None) -> FastAPI:
     async def delete_last_turn(
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
+        expect: str | None = Query(default=None, max_length=4000),
     ) -> dict[str, Any]:
-        """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。"""
+        """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。
+
+        ``expect`` 为待编辑提问的原文：与最后一轮用户提问不一致时不删除任何
+        内容（例如这条提问在意图识别阶段就失败、并未写入历史），避免误删上一轮。
+        """
         async with state.lock_for(user_id):
             store = _open_long_term(user_id)
             try:
-                removed = store.delete_last_turn(session_id)
+                removed = store.delete_last_turn(session_id, expect)
             except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
                 logger.warning("删除最后一轮对话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
             finally:
                 _close_long_term(store)
 
-            session = state.sessions.get(session_id)
-            if session is not None and session.user_id == user_id:
-                session.runtime.memory.short_term.truncate_last_turn()
-            else:
-                # 应用重启后进程内短期记忆已清空，但 Redis 后端可能仍保留该会话
-                create_short_term_memory(session_id).truncate_last_turn()
-        return {"session_id": session_id, "removed": removed}
+            if removed > 0:
+                # 短期记忆只是上下文缓存：清理失败（或会话不在本进程、无法确认
+                # 归属）都不影响已完成的长期记忆删除。Redis 的键只按 session_id
+                # 区分，未缓存的会话不能在这里清理，否则可能截断其他用户的数据。
+                try:
+                    session = state.sessions.get(session_id)
+                    if session is not None and session.user_id == user_id:
+                        session.runtime.memory.short_term.truncate_last_turn(expect)
+                except Exception as exc:  # noqa: BLE001 - 缓存清理失败只记录
+                    logger.warning("清理短期记忆失败（%s）: %s", session_id, exc)
+        return {
+            "session_id": session_id,
+            "removed": removed,
+            "mismatch": removed == 0 and expect is not None,
+        }
 
     @app.post("/api/chat")
     async def chat(request: Request, payload: ChatRequest) -> dict[str, Any]:

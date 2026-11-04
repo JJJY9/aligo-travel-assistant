@@ -111,15 +111,18 @@ def check_config() -> CheckResult:
 
 
 def check_storage() -> CheckResult:
-    """检查记忆存储后端：未配置时使用本地默认实现，配置后测试连通性。"""
+    """检查记忆存储：报告实际生效的后端，并测试配置后端的连通性。"""
     from config import STORAGE_CONFIG
+    from context.storage import describe_backends
 
     redis_url = STORAGE_CONFIG.get("redis_url") or ""
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
+    # describe_backends 与应用启动时走同一套选择 / 冷却逻辑，报告才和实际一致
+    backends = describe_backends()
     parts: list[str] = []
     failures: list[str] = []
 
-    if redis_url:
+    if backends["short_term"] == "redis":
         try:
             import redis
 
@@ -132,8 +135,10 @@ def check_storage() -> CheckResult:
             failures.append(f"Redis 不可用：{str(exc)[:80]}")
     else:
         parts.append("短期记忆 · 进程内")
+        if redis_url:
+            failures.append("Redis 已配置但当前不可用（已回退进程内）")
 
-    if dsn:
+    if backends["long_term"] == "postgres":
         try:
             from context.postgres_long_term_memory import PostgresLongTermMemory
 
@@ -144,13 +149,11 @@ def check_storage() -> CheckResult:
             failures.append(f"PostgreSQL 不可用：{str(exc)[:80]}")
     else:
         parts.append("长期记忆 · JSON 文件")
+        if dsn:
+            failures.append("PostgreSQL 已配置但当前不可用（已回退 JSON）")
 
     if failures:
-        return CheckResult(
-            "记忆存储",
-            STATUS_WARN,
-            "；".join(failures) + "（将回退本地默认实现）",
-        )
+        return CheckResult("记忆存储", STATUS_WARN, "；".join(parts + failures))
     return CheckResult("记忆存储", STATUS_OK, "；".join(parts))
 
 

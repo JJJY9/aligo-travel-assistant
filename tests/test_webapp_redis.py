@@ -92,14 +92,36 @@ def test_webapp_with_redis_short_term(monkeypatch):
         assert client.exists(key) == 1, "对话应写入 Redis 短期记忆"
         assert client.llen(key) >= 2, "至少包含用户与助手两条消息"
 
-        # 删除最后一轮对话 → Redis 短期记忆与长期记忆同步清理
+        second = http.post(
+            "/api/chat",
+            json={"message": "第二问", "user_id": user_id, "session_id": session_id},
+        )
+        assert second.status_code == 200
+        assert client.llen(key) >= 4
+
+        # 删除最后一轮对话 → Redis 短期记忆与长期记忆同步清理（走 RTRIM 分支）
         before = client.llen(key)
         turn = http.delete(
-            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "第二问"},
         )
         assert turn.status_code == 200
         assert turn.json()["removed"] == 2
-        assert client.llen(key) == max(0, before - 2)
+        assert client.llen(key) == before - 2
+        first = json.loads(client.lindex(key, 0))
+        assert first["content"] == "你好", "应保留第一轮消息，只裁掉最后一轮"
+
+        # Lua 脚本的内容校验：不一致时不动列表，匹配时删除整轮
+        probe = RedisShortTermMemory(client, f"redis-expect-{uuid.uuid4().hex[:8]}")
+        try:
+            probe.add_message("user", "Q1")
+            probe.add_message("assistant", "A1")
+            assert probe.truncate_last_turn("其它内容") == 0
+            assert client.llen(probe.key) == 2
+            assert probe.truncate_last_turn("Q1") == 2
+            assert client.exists(probe.key) == 0
+        finally:
+            client.delete(probe.key)
 
         # 删除会话 → 同时清理 Redis 短期记忆
         deleted = http.delete(
