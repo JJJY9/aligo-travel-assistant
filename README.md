@@ -484,6 +484,8 @@ python cli.py
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id>` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），可清理去重功能上线前已存在的重复记录；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
+行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`，已存在时需 `--force` 覆盖）。
+
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部；`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复会话；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
 
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
@@ -593,9 +595,9 @@ pytest tests/ -q
 | 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py`、`test_webapp_postgres.py`、`test_webapp_redis.py` |
 | 知识库维护与状态 | `test_knowledge_admin*.py`、`test_knowledge_stats.py` |
 | 检索评测与 CLI 退出码 | `test_rag_eval.py`、`test_cli_eval.py` |
-| CLI 知识库 / 行程 / 会话命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py`、`test_cli_sessions.py` |
+| CLI 知识库 / 行程 / 会话命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py`、`test_cli_trips_export.py`、`test_cli_sessions.py` |
 | Milvus 客户端 | `test_milvus_client.py` |
-| 偏好抽取 / 历史消息渲染 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_stored_message.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_progress.py` 等 |
+| 偏好抽取 / 历史消息渲染 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_stored_message.py`、`test_trip_export.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_progress.py` 等 |
 
 ### 端到端测试（需要真实大模型）
 
@@ -662,6 +664,7 @@ aligo-travel-assistant/
 │   ├── progress.py                  # 智能体进度事件 → CLI 文本
 │   ├── exporter.py                  # 用户数据导出（JSON / Markdown）
 │   ├── stored_message.py            # 历史消息渲染（Web 导出 / CLI 共用）
+│   ├── trip_export.py               # 行程 CSV 渲染（Web / CLI 共用，防公式注入）
 │   ├── rate_limit.py                # 对话接口进程内滑动窗口限流
 │   ├── milvus_client.py             # 进程内共享 Milvus Lite 客户端（含首次打开重试）
 │   ├── knowledge_paths.py           # 知识库路径 / 集合名统一解析
