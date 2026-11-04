@@ -65,6 +65,7 @@ from utils.knowledge_admin import (
     update_document,
 )
 from utils.knowledge_stats import knowledge_status
+from utils.metrics import REQUEST_METRICS
 from utils.rate_limit import RateLimiter
 from utils.stored_message import render_stored_message
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
@@ -229,6 +230,9 @@ class RequestContextMiddleware:
                         elapsed_ms,
                         request_id,
                     ),
+                )
+                REQUEST_METRICS.record(
+                    scope.get("method", ""), path, status_code, elapsed_ms
                 )
 
 
@@ -1072,6 +1076,18 @@ def create_app(model: Any = None) -> FastAPI:
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
             "storage": describe_backends(),
             "time": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    @app.get("/api/metrics")
+    def metrics() -> dict[str, Any]:
+        """进程内请求指标：请求计数 / 状态分布 / 平均与最大耗时、熔断器状态。
+
+        多进程 / 多实例部署时各进程独立统计（与限流一致）。
+        """
+        return {
+            "requests": REQUEST_METRICS.snapshot(),
+            "circuit_breaker": state.breaker.get_status(),
+            "sessions_cached": len(state.sessions),
         }
 
     @app.get("/api/doctor")

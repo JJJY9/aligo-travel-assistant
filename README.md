@@ -6,7 +6,7 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
-> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance (category filter, semantic search, CRUD, JSON export/import), parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel with manual preferences, trip management with calendar & CSV export and keyword filtering, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`preferences`, `trips`, `sessions`, `session-archive`, `session-export`, `kb-*`, `trips-export`, `trips-dedupe`, `eval`, `doctor`), responses are gzip-compressed except SSE and carry rate-limit headers. Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
+> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance (category filter, semantic search, CRUD, JSON export/import), parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel with manual preferences, trip management with calendar & CSV export and keyword filtering, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`preferences`, `trips`, `sessions`, `session-archive`, `session-export`, `kb-*`, `trips-export`, `trips-dedupe`, `eval`, `doctor`), responses are gzip-compressed except SSE, carry rate-limit headers and are exposed as in-process request metrics (`/api/metrics`). Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
@@ -538,6 +538,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
 - 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
+- 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径、平均与最大耗时、熔断器状态与缓存会话数（多进程各自统计，与限流一致）。
 - 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。实现为进程内滑动窗口（`utils/rate_limit.py`），多实例部署时需替换为 Redis 等共享存储。
 - 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc` 使用仅对文档页放宽的 CSP（允许 CDN 资源）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`。
 
@@ -548,6 +549,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
 | GET | `/api/health` | 服务版本 / 模型 / 存储后端状态 |
+| GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 耗时 / 熔断器状态） |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
@@ -802,11 +804,11 @@ aligo-travel-assistant/
 - [x] 会话管理（搜索 / 重命名 / 置顶 / 归档、分页、编辑重发、Markdown / HTML 导出）
 - [x] 知识库维护（Web / CLI 增删改查、分类筛选、导出导入、离线检索评测）
 - [x] 行程管理（删除误记录、手动补录 / 编辑、日历与 CSV 导出、重复保存自动去重）
-- [x] 性能与可观测性（gzip、JSON 访问日志、请求 ID、限流、系统自检）
+- [x] 性能与可观测性（gzip、JSON 访问日志、请求 ID、限流、系统自检、请求指标）
 - [ ] 支持更多 LLM 服务商（OpenAI / Claude 兼容网关等，当前任意 OpenAI 兼容接口可用）
 - [ ] 回答逐 token 流式输出（依赖 agentscope 流式解析兼容性修复）
 - [ ] 多实例部署（共享限流 / 会话存储）
-- [ ] 可观测性（结构化日志与请求指标）
+- [x] 可观测性（结构化日志与请求指标：`/api/metrics`、`LOG_FORMAT=json`）
 
 ---
 
