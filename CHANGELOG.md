@@ -47,6 +47,7 @@
 - 删除最后一轮对话：`DELETE /api/sessions/{id}/last-turn` 成对删除最后一轮用户提问与助手回答（回答中断时只删除提问），JSON 长期记忆、PostgreSQL 与 Redis 短期记忆同步清理，供「编辑上一条提问后重新发送」使用
 - 编辑上一条提问：最后一条用户消息旁新增「编辑」按钮，就地修改后「保存并重新发送」会先删除上一轮问答再重新提问；`Ctrl/⌘ + Enter` 保存、`Esc` 取消，重新发送后历史与短期记忆保持一致
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
+- 快捷键帮助面板：顶栏「?」按钮或按 `?` 打开，列出 Enter / Shift+Enter、搜索、编辑重发、Esc 等快捷键；Esc / 点击遮罩关闭，焦点回到触发按钮
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 

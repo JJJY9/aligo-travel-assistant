@@ -167,6 +167,9 @@
           <button class="icon-btn" id="themeToggle" type="button" title="切换主题" aria-label="切换主题">
             <svg class="icon"><use href="#i-moon"></use></svg>
           </button>
+          <button class="icon-btn" id="shortcutsBtn" type="button" title="键盘快捷键" aria-label="键盘快捷键" aria-haspopup="dialog" aria-expanded="false">
+            <span class="shortcut-glyph" aria-hidden="true">?</span>
+          </button>
         </div>
       </header>
 
@@ -367,6 +370,20 @@
   </div>
 
   <div class="toast" id="toast" role="status" hidden></div>
+  <div class="shortcut-overlay" id="shortcutOverlay" hidden>
+    <div class="shortcut-card" role="dialog" aria-modal="true" aria-labelledby="shortcutTitle">
+      <h2 id="shortcutTitle">键盘快捷键</h2>
+      <dl class="shortcut-list">
+        <div><dt><kbd>Enter</kbd></dt><dd>发送消息</dd></div>
+        <div><dt><kbd>Shift</kbd> + <kbd>Enter</kbd></dt><dd>输入换行</dd></div>
+        <div><dt><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>K</kbd> 或 <kbd>/</kbd></dt><dd>搜索会话</dd></div>
+        <div><dt><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Enter</kbd></dt><dd>保存编辑并重新发送</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>关闭面板 / 清空搜索</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>打开快捷键帮助</dd></div>
+      </dl>
+      <button class="ghost" id="closeShortcuts" type="button">关闭</button>
+    </div>
+  </div>
 
   <script src="/static/app.js?v=1.3.0"></script>
 </body>

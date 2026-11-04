@@ -159,6 +159,9 @@ const els = {
   doctorNetwork: byId("doctorNetwork"),
   doctorList: byId("doctorList"),
   toast: byId("toast"),
+  shortcutsBtn: byId("shortcutsBtn"),
+  shortcutOverlay: byId("shortcutOverlay"),
+  closeShortcuts: byId("closeShortcuts"),
 };
 
 let welcomeTemplate = null;
@@ -2828,6 +2831,20 @@ function closeMemorySheet() {
   els.input?.focus();
 }
 
+function openShortcuts() {
+  if (!els.shortcutOverlay.hidden) return;
+  els.shortcutOverlay.hidden = false;
+  els.shortcutsBtn.setAttribute("aria-expanded", "true");
+  els.closeShortcuts.focus();
+}
+
+function closeShortcuts() {
+  if (els.shortcutOverlay.hidden) return;
+  els.shortcutOverlay.hidden = true;
+  els.shortcutsBtn.setAttribute("aria-expanded", "false");
+  els.shortcutsBtn.focus();
+}
+
 async function saveUser() {
   const value = els.userIdInput.value.trim() || "web_user";
   if (!isValidId(value)) {
@@ -2976,6 +2993,18 @@ function bindEvents() {
     applyTheme(currentTheme() === "dark" ? "light" : "dark");
   });
 
+  els.shortcutsBtn.addEventListener("click", openShortcuts);
+  els.closeShortcuts.addEventListener("click", closeShortcuts);
+  els.shortcutOverlay.addEventListener("click", (event) => {
+    if (event.target === els.shortcutOverlay) closeShortcuts();
+  });
+  els.shortcutOverlay.addEventListener("keydown", (event) => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      els.closeShortcuts.focus();
+    }
+  });
+
   els.printChat.addEventListener("click", () => {
     if (!cancelPendingEdits()) {
       toast("正在保存修改，请稍候");
@@ -3019,8 +3048,14 @@ function bindEvents() {
       target instanceof HTMLElement &&
       (target.tagName === "INPUT" ||
         target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT" ||
         target.isContentEditable);
 
+    if (event.key === "Escape" && !els.shortcutOverlay.hidden) {
+      event.preventDefault();
+      closeShortcuts();
+      return;
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       focusSearch();
@@ -3029,6 +3064,17 @@ function bindEvents() {
     if (event.key === "/" && !typing) {
       event.preventDefault();
       focusSearch();
+      return;
+    }
+    if (
+      event.key === "?" &&
+      !typing &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey
+    ) {
+      event.preventDefault();
+      openShortcuts();
       return;
     }
     if (event.key === "Escape") {
