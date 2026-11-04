@@ -709,6 +709,15 @@ function startEditTrip(trip) {
   els.tripDestination.focus();
 }
 
+function conflictNote(conflicts) {
+  if (!Array.isArray(conflicts) || !conflicts.length) return "";
+  const first = conflicts[0];
+  const route = `${first.origin || "—"} → ${first.destination || "—"}`;
+  const suffix =
+    conflicts.length > 1 ? ` 等 ${conflicts.length} 条行程的` : "的行程";
+  return `，与 ${route}${suffix}日期重叠`;
+}
+
 async function addTrip(event) {
   event.preventDefault();
   const destination = els.tripDestination.value.trim();
@@ -730,11 +739,12 @@ async function addTrip(event) {
   try {
     let message = "行程已更新";
     if (editingId) {
-      await getJSON(`/api/trips/${encodeURIComponent(editingId)}`, {
+      const result = await getJSON(`/api/trips/${encodeURIComponent(editingId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      message += conflictNote(result.conflicts);
     } else {
       const result = await getJSON("/api/trips", {
         method: "POST",
@@ -743,6 +753,7 @@ async function addTrip(event) {
       });
       message =
         result.created === false ? "已存在相同行程，已更新该记录" : "行程已添加";
+      message += conflictNote(result.conflicts);
     }
     toast(message);
     els.tripForm.hidden = true;
@@ -1716,10 +1727,20 @@ function renderOverview() {
       route.append(path, purpose);
       const meta = document.createElement("div");
       meta.className = "trip-meta";
+      const status = tripStatus(trip);
+      if (status) {
+        const badge = document.createElement("span");
+        badge.className = `trip-status ${status.cls}`;
+        badge.textContent = status.label;
+        meta.appendChild(badge);
+      }
       const start = trip.start_date || "";
       const end = trip.end_date || "";
-      meta.textContent =
-        start && end ? `${start} ~ ${end}` : start || end || "日期未记录";
+      meta.appendChild(
+        document.createTextNode(
+          start && end ? `${start} ~ ${end}` : start || end || "日期未记录",
+        ),
+      );
       row.append(route, meta);
       if (trip.session_id) {
         row.classList.add("clickable");
@@ -1944,11 +1965,25 @@ function renderUsageTrend(usage) {
   els.usageTable.append(caption, thead, tbody);
 }
 
-function pickUpcomingTrip(trips) {
+function todayISO() {
   const now = new Date();
-  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
     now.getDate(),
   ).padStart(2, "0")}`;
+}
+
+function tripStatus(trip) {
+  const start = String(trip.start_date || "");
+  if (!start) return null;
+  const end = String(trip.end_date || start);
+  const today = todayISO();
+  if (today < start) return { label: "即将出行", cls: "upcoming" };
+  if (today > end) return { label: "已结束", cls: "past" };
+  return { label: "进行中", cls: "active" };
+}
+
+function pickUpcomingTrip(trips) {
+  const today = todayISO();
   const upcoming = (trips || [])
     .filter((trip) => trip.start_date && String(trip.start_date) >= today)
     .sort((a, b) => {
