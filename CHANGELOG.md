@@ -56,6 +56,7 @@
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 快捷键帮助面板：顶栏「?」按钮或按 `?` 打开，列出 Enter / Shift+Enter、搜索、编辑重发、Esc 等快捷键；Esc / 点击遮罩关闭，焦点回到触发按钮
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
+- 记忆面板偏好支持手动添加：常用类型（常住地 / 交通 / 酒店 / 航司 / 座位 / 餐食 / 预算）+ 值输入，多个值用「、」分隔，酒店与航司自动存为列表、预算自动转数字
 - 用户数据 Markdown 导出标注归档会话（「最近会话」后缀「（已归档）」），统计中加入归档会话数
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 

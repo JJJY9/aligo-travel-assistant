@@ -1304,6 +1304,15 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   color: var(--ink);
   font-size: 12.5px;
 }
+.trip-form-row select {
+  flex: none;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12.5px;
+}
 .trip-form-row .ghost { flex: none; }
 
 /* 侧栏「加载更多会话」 */
