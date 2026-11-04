@@ -298,8 +298,63 @@ def test_main_accepts_valid_flags(monkeypatch):
     print("✓ dispatch 层合法参数正常执行")
 
 
+def _run_export(user_id, session_id, target=None, to_stdout=False):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_session_export_standalone(
+            user_id, session_id, target=target, to_stdout=to_stdout
+        )
+    return code, buf.getvalue()
+
+
+def test_session_export_to_file(monkeypatch):
+    import tempfile
+
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    target = os.path.join(tempfile.mkdtemp(), "session.md")
+    code, out = _run_export("u1", "s-active", target=target)
+    assert code == 0 and "已导出会话 s-active" in out
+    with open(target, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "# 住宿标准问题" in text
+    assert "## 用户" in text and "住宿标准问题" in text
+    assert "## Aligo" in text and "回答 A" in text
+    assert fake.closed
+    print("✓ session-export 写入 Markdown 文件")
+
+
+def test_session_export_to_stdout(monkeypatch):
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_export("u1", "s-pinned", to_stdout=True)
+    assert code == 0
+    assert "# 行程规划问题" in out and "回答 B" in out
+    print("✓ session-export --stdout 输出 Markdown")
+
+
+def test_session_export_missing_and_invalid(monkeypatch):
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_export("u1", "s-missing")
+    assert code == 1 and "不存在或没有消息" in out
+    code, out = _run_export("--bad", "s-active")
+    assert code == 1 and "用户 ID" in out
+    print("✓ session-export 缺失会话 / 非法 ID")
+
+
+def test_session_export_flag_parsing():
+    assert cli._parse_session_export_args([]) == (None, False)
+    assert cli._parse_session_export_args(["out.md"]) == ("out.md", False)
+    assert cli._parse_session_export_args(["--stdout"]) == (None, True)
+    assert cli._parse_session_export_args(["a.md", "b.md"]) is None
+    assert cli._parse_session_export_args(["--bad"]) is None
+    print("✓ session-export 参数解析")
+
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
+    test_session_export_flag_parsing()
     test_main_rejects_bad_usage(pytest.MonkeyPatch())
     for case in (
         test_lists_active_sessions,
@@ -312,6 +367,9 @@ if __name__ == "__main__":
         test_main_accepts_valid_flags,
         test_archive_and_restore,
         test_archive_missing_session,
+        test_session_export_to_file,
+        test_session_export_to_stdout,
+        test_session_export_missing_and_invalid,
         test_read_failure,
         test_store_open_failure,
         test_pg_fallback_refused,

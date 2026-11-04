@@ -1370,6 +1370,108 @@ def _parse_archive_flags(args: list[str]) -> bool | None:
     return "--restore" in flags
 
 
+def run_session_export_standalone(
+    user_id: str,
+    session_id: str,
+    target: str | None = None,
+    to_stdout: bool = False,
+) -> int:
+    """导出单个会话为 Markdown（`python cli.py session-export <user> <session> [path] [--stdout]`）。
+
+    Returns:
+        0 导出成功；1 参数 / 读取 / 写入失败或会话不存在
+    """
+    import re
+    from datetime import datetime
+    from pathlib import Path
+
+    from utils.stored_message import render_stored_message
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+        print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            messages = store.get_chat_history(session_id=session_id)
+            titles = store.get_session_titles()
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取会话失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if not messages:
+        print(f"会话 {session_id} 不存在或没有消息")
+        return 1
+
+    title = str(titles.get(session_id) or "")
+    if not title:
+        for message in messages:
+            if message.get("role") == "user":
+                title = " ".join(str(message.get("content", "")).split())[:40]
+                break
+    title = title or "Aligo 对话"
+
+    lines = [
+        f"# {title}",
+        "",
+        f"- 用户：{user_id}",
+        f"- 会话：{session_id}",
+        f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
+        "",
+    ]
+    for message in messages:
+        is_user = message.get("role") == "user"
+        role = "用户" if is_user else "Aligo"
+        content = (
+            str(message.get("content", ""))
+            if is_user
+            else render_stored_message(message)
+        )
+        lines.extend([f"## {role}", "", content.strip(), ""])
+    text = "\n".join(lines)
+
+    if to_stdout:
+        print(text)
+        return 0
+
+    path = Path(target) if target else Path("exports") / f"aligo_{session_id}.md"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        print(f"写入失败：{exc}")
+        return 1
+    print(f"已导出会话 {session_id} 到 {path}（{len(messages)} 条消息）")
+    return 0
+
+
+def _parse_session_export_args(args: list[str]) -> tuple[str | None, bool] | None:
+    """解析 session-export 的 [path] [--stdout]；未知参数或多余路径返回 None。"""
+    to_stdout = False
+    paths: list[str] = []
+    for item in args:
+        if item.lower() == "--stdout":
+            to_stdout = True
+        elif item.startswith("-"):
+            return None
+        else:
+            paths.append(item)
+    if len(paths) > 1:
+        return None
+    return (paths[0] if paths else None), to_stdout
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -1440,6 +1542,31 @@ def main():
                     sys.argv[2],
                     sys.argv[3],
                     archived=not restore,
+                )
+            )
+        if arg == "session-export":
+            if (
+                len(sys.argv) < 4
+                or sys.argv[2].startswith("-")
+                or sys.argv[3].startswith("-")
+            ):
+                print(
+                    "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout]"
+                )
+                sys.exit(2)
+            parsed_export = _parse_session_export_args(sys.argv[4:])
+            if parsed_export is None:
+                print(
+                    "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout]"
+                )
+                sys.exit(2)
+            target, to_stdout = parsed_export
+            sys.exit(
+                run_session_export_standalone(
+                    sys.argv[2],
+                    sys.argv[3],
+                    target=target,
+                    to_stdout=to_stdout,
                 )
             )
     cli = AligoCLI()

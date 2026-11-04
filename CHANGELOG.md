@@ -16,7 +16,7 @@
 - 会话重命名：侧栏内联编辑标题（`PUT /api/sessions/{id}/title`），JSON / PostgreSQL 持久化；自定义标题参与搜索，空标题恢复自动标题
 - 会话置顶：侧栏图钉按钮置顶 / 取消置顶（`PUT /api/sessions/{id}/pin`），置顶会话进入「置顶」分组并优先展示，JSON / PostgreSQL 持久化
 - 会话归档：侧栏会话操作新增「归档」，归档后从默认列表隐藏但消息保留；侧栏「已归档（N）」切换到归档列表，可恢复或删除；`PUT /api/sessions/{id}/archive`、`GET /api/sessions?archived=true`，`/api/status` 返回 `archived_count`
-- CLI 会话管理：`python cli.py sessions <user_id> [--archived|--all]` 列出会话（置顶优先，显示消息数与最近更新时间），`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复；PostgreSQL 回退本地 JSON 时拒绝执行
+- CLI 会话管理：`python cli.py sessions <user_id> [--archived|--all]` 列出会话（置顶优先，显示消息数与最近更新时间），`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复，`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown；PostgreSQL 回退本地 JSON 时拒绝执行
 - 会话列表分页：`GET /api/sessions` 支持 `offset` 并返回 `total`，侧栏超过一页时显示「加载更多会话（已显示 X / 共 Y）」
 - 侧栏「即将出行」卡片：根据行程日期展示最近一次即将开始的行程（路线 / 日期 / 目的），点击回到对应对话（无关联会话时打开记忆面板）
 - 行程记录关联来源会话：保存行程时写入 `session_id`（PostgreSQL 自动加列），记忆面板点击行程可回到对应对话
