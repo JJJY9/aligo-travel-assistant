@@ -1161,6 +1161,9 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             store.set_session_title(session_id, payload.title)
             saved = (store.get_session_titles() or {}).get(session_id, "")
+        except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
+            logger.warning("设置会话标题失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "title": saved}
@@ -1175,6 +1178,9 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             store.set_session_pinned(session_id, payload.pinned)
             pinned = store.get_pinned_sessions()
+        except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
+            logger.warning("设置会话置顶失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "pinned": session_id in pinned}
@@ -1534,6 +1540,9 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("导出行程 CSV 失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
         finally:
             _close_long_term(store)
         buffer = io.StringIO()
