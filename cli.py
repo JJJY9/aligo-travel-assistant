@@ -15,6 +15,7 @@ import json
 
 # 导入系统组件
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Prompt
 from rich.table import Table
 
@@ -80,9 +81,16 @@ class AligoCLI:
         import re
 
         while True:
-            value = (
-                Prompt.ask("用户ID", default="default_user").strip() or "default_user"
-            )
+            try:
+                value = (
+                    Prompt.ask("用户ID", default="default_user").strip()
+                    or "default_user"
+                )
+            except EOFError:
+                # 管道 / IDE 运行到末尾：退出而不是抛出 traceback 后死循环
+                print()
+                print("未检测到输入，已退出")
+                raise SystemExit(0) from None
             if re.fullmatch(r"[\w-]{1,64}", value) and not value.startswith("-"):
                 return value
             self.console.print(
@@ -359,7 +367,9 @@ class AligoCLI:
                 if pref_value:  # 只添加有值的偏好
                     # 如果是列表，用逗号连接
                     if isinstance(pref_value, list):
-                        pref_lines.append(f"• {pref_key}: {', '.join(pref_value)}")
+                        pref_lines.append(
+                            f"• {pref_key}: {', '.join(str(item) for item in pref_value)}"
+                        )
                     else:
                         pref_lines.append(f"• {pref_key}: {pref_value}")
 
@@ -381,8 +391,8 @@ class AligoCLI:
             other_trips = []
 
             for trip in all_trips:
-                origin = trip.get("origin", "") or ""
-                destination = trip.get("destination", "") or ""
+                origin = str(trip.get("origin") or "")
+                destination = str(trip.get("destination") or "")
 
                 # 如果用户输入提到了这个行程的地点，标记为相关
                 if (origin and origin in user_input) or (destination and destination in user_input):
@@ -425,7 +435,10 @@ class AligoCLI:
             if status == "error":
                 error_msg = data.get("error", "未知错误")
                 agent_display_name = self._get_agent_display_name(agent_name)
-                self.console.print(f"❌ {agent_display_name}执行失败: {error_msg}", style="red")
+                self.console.print(
+                    f"❌ {escape(str(agent_display_name))}执行失败: {escape(str(error_msg))}",
+                    style="red",
+                )
                 has_output = True
                 continue
 
@@ -441,48 +454,177 @@ class AligoCLI:
                 # 增强：支持从 data.data.itinerary 获取
                 if not itinerary and "data" in data and isinstance(data["data"], dict):
                     itinerary = data["data"].get("itinerary")
-                
-                if itinerary:
-                    title = itinerary.get('title', '行程规划')
-                    self.console.print(f"\n✈️  [bold cyan]{title}[/bold cyan]")
-                    self.console.print(f"时长: {itinerary.get('duration', '未知')}\n")
 
-                    # 每日行程
-                    for day_plan in itinerary.get("daily_plans", []):
-                        day_num = day_plan.get("day", 1)
+                if isinstance(itinerary, str):
+                    # 模型可能直接返回一段文字行程
+                    self.console.print()
+                    self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
+                    self.console.print(escape(itinerary))
+                    current_agent_shown = True
+                elif itinerary and not isinstance(itinerary, dict):
+                    self.console.print()
+                    self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
+                    self.console.print(escape(str(itinerary)))
+                    current_agent_shown = True
+                elif itinerary:
+                    title = escape(str(itinerary.get("title", "行程规划")))
+                    self.console.print()
+                    self.console.print(f"✈️  [bold cyan]{title}[/bold cyan]")
+                    self.console.print(
+                        f"时长: {escape(str(itinerary.get('duration', '未知')))}"
+                    )
+                    self.console.print()
+
+                    # 每日行程（结构异常时按纯文本兜底，不能让整轮回答丢失）
+                    daily_plans = itinerary.get("daily_plans") or []
+                    if isinstance(daily_plans, dict):
+                        daily_plans = list(daily_plans.values())
+                    if not isinstance(daily_plans, list):
+                        daily_plans = []
+                    for day_plan in daily_plans:
+                        if not isinstance(day_plan, dict):
+                            self.console.print(escape(str(day_plan)))
+                            continue
+                        day_num = escape(str(day_plan.get("day", 1)))
                         self.console.print(f"[bold yellow]第 {day_num} 天[/bold yellow]")
 
                         # 兼容 activities 和 time_slots
-                        activities = day_plan.get("activities") or day_plan.get("time_slots") or []
+                        activities = (
+                            day_plan.get("activities") or day_plan.get("time_slots") or []
+                        )
+                        if isinstance(activities, dict):
+                            activities = list(activities.values())
+                        if not isinstance(activities, list):
+                            activities = []
                         for slot in activities:
-                            time = slot.get("time", "")
-                            # 兼容 activity 和 location
-                            activity = slot.get("activity") or slot.get("location") or ""
+                            if not isinstance(slot, dict):
+                                self.console.print(escape(str(slot)))
+                                continue
+                            time_text = escape(str(slot.get("time", "")))
+                            activity = escape(
+                                str(slot.get("activity") or slot.get("location") or "")
+                            )
                             description = slot.get("description", "")
                             transport = slot.get("transport", "")
 
-                            self.console.print(f"  {time} - {activity}")
+                            self.console.print(f"  {time_text} - {activity}")
                             if description:
-                                self.console.print(f"    {description}", style="dim")
+                                self.console.print(
+                                    f"    {escape(str(description))}", style="dim"
+                                )
                             if transport:
-                                self.console.print(f"    🚇 {transport}", style="dim")
+                                self.console.print(
+                                    f"    🚇 {escape(str(transport))}", style="dim"
+                                )
 
                         # 餐食建议
-                        meals = day_plan.get("meals", {})
+                        meals = day_plan.get("meals") or {}
+                        if not isinstance(meals, dict):
+                            meals = {}
                         if meals:
                             self.console.print()
                             if meals.get("lunch"):
-                                self.console.print(f"  🍜 {meals['lunch']}", style="dim")
+                                self.console.print(
+                                    f"  🍜 {escape(str(meals['lunch']))}", style="dim"
+                                )
                             if meals.get("dinner"):
-                                self.console.print(f"  🍽️  {meals['dinner']}", style="dim")
+                                self.console.print(
+                                    f"  🍽️  {escape(str(meals['dinner']))}", style="dim"
+                                )
                         self.console.print()
 
                     # 注意事项
-                    notes = itinerary.get("notes", [])
+                    notes = itinerary.get("notes") or []
+                    if isinstance(notes, str):
+                        notes = [notes]
+                    if not isinstance(notes, list):
+                        notes = []
                     if notes:
                         self.console.print("[bold]📌 注意事项[/bold]")
                         for note in notes:
-                            self.console.print(f"  • {note}")
+                            self.console.print(f"  • {escape(str(note))}")
+                    current_agent_shown = True
+                elif itinerary and not isinstance(itinerary, dict):
+                    self.console.print()
+                    self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
+                    self.console.print(escape(str(itinerary)))
+                    current_agent_shown = True
+                elif itinerary:
+                    title = escape(str(itinerary.get("title", "行程规划")))
+                    self.console.print()
+                    self.console.print(f"✈️  [bold cyan]{title}[/bold cyan]")
+                    self.console.print(
+                        f"时长: {escape(str(itinerary.get('duration', '未知')))}"
+                    )
+
+                    # 每日行程（结构异常时按纯文本兜底，不能让整轮回答丢失）
+                    daily_plans = itinerary.get("daily_plans") or []
+                    if isinstance(daily_plans, dict):
+                        daily_plans = list(daily_plans.values())
+                    if not isinstance(daily_plans, list):
+                        daily_plans = []
+                    for day_plan in daily_plans:
+                        if not isinstance(day_plan, dict):
+                            self.console.print(escape(str(day_plan)))
+                            continue
+                        day_num = escape(str(day_plan.get("day", 1)))
+                        self.console.print(f"[bold yellow]第 {day_num} 天[/bold yellow]")
+
+                        # 兼容 activities 和 time_slots
+                        activities = (
+                            day_plan.get("activities") or day_plan.get("time_slots") or []
+                        )
+                        if isinstance(activities, dict):
+                            activities = list(activities.values())
+                        if not isinstance(activities, list):
+                            activities = []
+                        for slot in activities:
+                            if not isinstance(slot, dict):
+                                self.console.print(escape(str(slot)))
+                                continue
+                            time_text = escape(str(slot.get("time", "")))
+                            activity = escape(
+                                str(slot.get("activity") or slot.get("location") or "")
+                            )
+                            description = slot.get("description", "")
+                            transport = slot.get("transport", "")
+
+                            self.console.print(f"  {time_text} - {activity}")
+                            if description:
+                                self.console.print(
+                                    f"    {escape(str(description))}", style="dim"
+                                )
+                            if transport:
+                                self.console.print(
+                                    f"    🚇 {escape(str(transport))}", style="dim"
+                                )
+
+                        # 餐食建议
+                        meals = day_plan.get("meals") or {}
+                        if not isinstance(meals, dict):
+                            meals = {}
+                        if meals:
+                            self.console.print()
+                            if meals.get("lunch"):
+                                self.console.print(
+                                    f"  🍜 {escape(str(meals['lunch']))}", style="dim"
+                                )
+                            if meals.get("dinner"):
+                                self.console.print(
+                                    f"  🍽️  {escape(str(meals['dinner']))}", style="dim"
+                                )
+                        self.console.print()
+
+                    # 注意事项
+                    notes = itinerary.get("notes") or []
+                    if isinstance(notes, str):
+                        notes = [notes]
+                    if not isinstance(notes, list):
+                        notes = []
+                    if notes:
+                        self.console.print("[bold]📌 注意事项[/bold]")
+                        for note in notes:
+                            self.console.print(f"  • {escape(str(note))}")
                     current_agent_shown = True
 
             # 偏好管理
@@ -514,7 +656,10 @@ class AligoCLI:
                         action = pref.get("action", "replace")
                         display_type = type_names.get(pref_type, pref_type)
                         action_text = "追加" if action == "append" else "设置为"
-                        self.console.print(f"  • {display_type} {action_text} [cyan]{pref_value}[/cyan]")
+                        self.console.print(
+                            f"  • {escape(str(display_type))} {action_text} "
+                            f"[cyan]{escape(str(pref_value))}[/cyan]"
+                        )
                     current_agent_shown = True
                     has_itinerary = any(r.get("agent_name") == "itinerary_planning" for r in results)
                     if not has_itinerary:
@@ -523,7 +668,7 @@ class AligoCLI:
                     # 检查是否有错误信息
                     err = data.get("error", "")
                     if err:
-                        self.console.print(f"偏好未保存: {err}", style="yellow")
+                        self.console.print(f"偏好未保存: {escape(str(err))}", style="yellow")
                         current_agent_shown = True
                     # 如果只是没提取到，可能就是没偏好，不强求显示，交给兜底逻辑
 
@@ -541,13 +686,13 @@ class AligoCLI:
                 if not has_itinerary and (destination or origin):
                     self.console.print("✓ [bold green]已收集行程信息[/bold green]")
                     if origin:
-                        self.console.print(f"  • 出发地: [cyan]{origin}[/cyan]")
+                        self.console.print(f"  • 出发地: [cyan]{escape(str(origin))}[/cyan]")
                     if destination:
-                        self.console.print(f"  • 目的地: [cyan]{destination}[/cyan]")
+                        self.console.print(f"  • 目的地: [cyan]{escape(str(destination))}[/cyan]")
                     if start_date:
-                        self.console.print(f"  • 出发日期: [cyan]{start_date}[/cyan]")
+                        self.console.print(f"  • 出发日期: [cyan]{escape(str(start_date))}[/cyan]")
                     if end_date:
-                        self.console.print(f"  • 返程日期: [cyan]{end_date}[/cyan]")
+                        self.console.print(f"  • 返程日期: [cyan]{escape(str(end_date))}[/cyan]")
                     info_shown = True
 
                 if missing_info:
@@ -574,20 +719,23 @@ class AligoCLI:
                 error = query_results.get("error", "")
 
                 if summary:
-                    self.console.print(f"\n{summary}")
+                    self.console.print()
+                    self.console.print(escape(str(summary)))
                     current_agent_shown = True
                 elif message:
-                    self.console.print(f"\n{message}", style="dim")
+                    self.console.print()
+                    self.console.print(escape(str(message)), style="dim")
                     current_agent_shown = True
                 elif error:
-                    self.console.print(f"\n{error}", style="yellow")
+                    self.console.print()
+                    self.console.print(escape(str(error)), style="yellow")
                     current_agent_shown = True
 
                 if sources:
                     self.console.print("\n[bold]参考来源[/bold]")
                     for i, source in enumerate(sources[:3], 1):
                         url = source.get("url", "") if isinstance(source, dict) else str(source)
-                        self.console.print(f"  {i}. {url}", style="dim")
+                        self.console.print(f"  {i}. {escape(str(url))}", style="dim")
                     current_agent_shown = True
 
             # RAG知识库查询
@@ -614,7 +762,8 @@ class AligoCLI:
                         pass
 
                 if answer:
-                    self.console.print(f"\n{answer}")
+                    self.console.print()
+                    self.console.print(escape(str(answer)))
                     current_agent_shown = True
 
             # 记忆查询
@@ -625,7 +774,8 @@ class AligoCLI:
                     query_result = inner.get("answer") or inner.get("result") or inner.get("content")
 
                 if query_result:
-                    self.console.print(f"\n{query_result}")
+                    self.console.print()
+                    self.console.print(escape(str(query_result)))
                     current_agent_shown = True
 
             # --- 通用兜底 (如果特定逻辑未生效) ---
@@ -648,7 +798,8 @@ class AligoCLI:
                             break
 
                 if fallback_content:
-                    self.console.print(f"\n{fallback_content}")
+                    self.console.print()
+                    self.console.print(escape(str(fallback_content)))
                     current_agent_shown = True
                 else:
                     # 实在啥也没有，打印个成功标记，避免完全静默
@@ -676,6 +827,8 @@ class AligoCLI:
 
     def show_status(self):
         """显示当前状态"""
+        # 其它进程（Web 面板 / CLI）可能刚写入：先重载 JSON 快照
+        self.memory_manager.reload_long_term()
         # 记忆统计
         full_context = self.memory_manager.get_full_context()
         short_term_stats = full_context["short_term"]["statistics"]
@@ -736,7 +889,9 @@ class AligoCLI:
                 else:
                     time_str = ""
 
-                dialogue_table.add_row(role_name, content, time_str)
+                dialogue_table.add_row(
+                    escape(str(role_name)), escape(str(content)), escape(str(time_str))
+                )
 
             self.console.print(dialogue_table)
             self.console.print()
@@ -770,6 +925,7 @@ class AligoCLI:
 
     def show_history(self):
         """显示历史行程"""
+        self.memory_manager.reload_long_term()
         history = self.memory_manager.long_term.get_trip_history(10)
 
         if not history:
@@ -785,17 +941,18 @@ class AligoCLI:
 
         for trip in history:
             table.add_row(
-                trip.get("trip_id", ""),
-                trip.get("origin", ""),
-                trip.get("destination", ""),
-                trip.get("start_date", ""),
-                trip.get("purpose", "")
+                escape(str(trip.get("trip_id", ""))),
+                escape(str(trip.get("origin", ""))),
+                escape(str(trip.get("destination", ""))),
+                escape(str(trip.get("start_date", ""))),
+                escape(str(trip.get("purpose", ""))),
             )
 
         self.console.print(table)
 
     def show_preferences(self):
         """显示用户偏好"""
+        self.memory_manager.reload_long_term()
         prefs = self.memory_manager.long_term.get_preference()
 
         table = Table(title="用户偏好", show_header=True, header_style="bold magenta")
@@ -804,7 +961,7 @@ class AligoCLI:
 
         for key, value in prefs.items():
             if value:
-                table.add_row(key, str(value))
+                table.add_row(escape(str(key)), escape(str(value)))
 
         self.console.print(table)
 
@@ -812,6 +969,7 @@ class AligoCLI:
         """把当前用户的长期记忆导出为 JSON 与 Markdown（exports/ 目录）"""
         from utils.exporter import export_files
 
+        self.memory_manager.reload_long_term()
         data = self.memory_manager.export_data()
         paths = export_files(data, "exports")
         for path in paths:
@@ -862,6 +1020,11 @@ class AligoCLI:
                     # 处理自然语言查询
                     await self.process_query(user_input)
 
+            except EOFError:
+                # 管道 / IDE 末尾：退出，避免每次循环都报错刷屏
+                self.console.print()
+                self.console.print("未检测到输入，已退出", style="dim")
+                break
             except KeyboardInterrupt:
                 self.console.print("\n使用 'exit' 退出", style="dim")
             except CircuitOpenError:
@@ -1868,7 +2031,13 @@ def main():
                 )
             )
     cli = AligoCLI()
-    asyncio.run(cli.run())
+    try:
+        asyncio.run(cli.run())
+    except KeyboardInterrupt:
+        # 查询进行中按 Ctrl-C：asyncio.run 会取消任务后抛到这里
+        print()
+        print("已退出")
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

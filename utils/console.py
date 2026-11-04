@@ -9,8 +9,12 @@ import sys
 
 
 def configure_stdio() -> None:
-    """将 stdout / stderr 切换为 UTF-8（无法切换的流自动跳过）。"""
-    for stream_name in ("stdout", "stderr"):
+    """将 stdin / stdout / stderr 切换为 UTF-8（无法切换的流自动跳过）。
+
+    Windows 下管道输入默认按 locale（GBK）解码，UTF-8 管道（Git Bash / CI）
+    会变成乱码；与输出统一为 UTF-8，真实控制台（PEP 528）本来就是 UTF-8。
+    """
+    for stream_name in ("stdin", "stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):

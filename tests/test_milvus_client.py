@@ -113,12 +113,38 @@ def test_client_creation_retry_failure_propagates(monkeypatch):
     print("✓ 重试仍失败时向上抛出，不缓存坏客户端")
 
 
+def test_large_collection_paginates_beyond_query_limit():
+    """超过单次 query 上限（16384）时按 id 分页扫描，取到真正的最大 id。"""
+    ids = list(range(1, 40001))
+
+    class _BoundedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def load_collection(self, name):
+            pass
+
+        def query(self, collection_name, filter="", output_fields=None, limit=16384):
+            self.calls += 1
+            threshold = 0
+            if ">=" in filter:
+                threshold = int(filter.split(">=")[1])
+            matched = [value for value in ids if value >= threshold]
+            return [{"id": value} for value in matched[:limit]]
+
+    client = _BoundedClient()
+    assert next_entity_id(client, "knowledge") == 40001
+    assert client.calls >= 3, "超过单次查询上限时应分页扫描"
+    print("✓ 超过 16384 条时分页扫描最大 id")
+
+
 if __name__ == "__main__":
     for plain_case in (
         test_uses_max_id_not_row_count,
         test_empty_collection_starts_at_one,
         test_query_failure_propagates,
         test_load_failure_still_queries,
+        test_large_collection_paginates_beyond_query_limit,
     ):
         plain_case()
     for patched_case in (

@@ -13,6 +13,8 @@ import logging
 import re
 from typing import Any
 
+from utils.preference_values import merge_preference_value
+
 logger = logging.getLogger(__name__)
 
 _SCHEMA_SQL = """
@@ -181,16 +183,7 @@ class PostgresLongTermMemory:
             )
         try:
             current = self.get_preference(pref_type)
-            if isinstance(current, list):
-                merged = list(current)
-                if value not in merged:
-                    merged.append(value)
-            elif current == value:
-                merged = [value]
-            elif current:
-                merged = [current, value]
-            else:
-                merged = [value]
+            merged = merge_preference_value(current, value)
             self.save_preference(pref_type, merged)
             return merged
         finally:

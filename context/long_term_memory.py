@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from utils.errors import MemoryPersistenceError
+from utils.preference_values import merge_preference_value
 
 logger = logging.getLogger(__name__)
 
@@ -282,16 +283,7 @@ class LongTermMemory:
                 existing = pref
                 break
         current = existing.get("value") if existing is not None else None
-        if isinstance(current, list):
-            merged = list(current)
-            if value not in merged:
-                merged.append(value)
-        elif current == value:
-            merged = [value]
-        elif current:
-            merged = [current, value]
-        else:
-            merged = [value]
+        merged = merge_preference_value(current, value)
         if existing is not None:
             existing["value"] = merged
         else:
