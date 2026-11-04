@@ -169,6 +169,7 @@ let sessionLoadToken = 0;
 let sessionsRequestId = 0;
 let searchTimer = null;
 let memorySheetOpener = null;
+let shortcutOpener = null;
 
 /* ---------- 基础工具 ---------- */
 
@@ -2792,7 +2793,14 @@ function memorySheetFocusable() {
 }
 
 function trapMemorySheetFocus(event) {
-  if (event.key !== "Tab" || els.memorySheet.hidden) return;
+  if (
+    event.key !== "Tab" ||
+    els.memorySheet.hidden ||
+    !els.shortcutOverlay.hidden
+  ) {
+    // 快捷键面板是叠在记忆面板之上的独立模态，Tab 由它自己处理
+    return;
+  }
   const focusable = memorySheetFocusable();
   if (!focusable.length) return;
   const first = focusable[0];
@@ -2833,6 +2841,9 @@ function closeMemorySheet() {
 
 function openShortcuts() {
   if (!els.shortcutOverlay.hidden) return;
+  const active = document.activeElement;
+  shortcutOpener =
+    active instanceof HTMLElement && active !== document.body ? active : null;
   els.shortcutOverlay.hidden = false;
   els.shortcutsBtn.setAttribute("aria-expanded", "true");
   els.closeShortcuts.focus();
@@ -2842,6 +2853,13 @@ function closeShortcuts() {
   if (els.shortcutOverlay.hidden) return;
   els.shortcutOverlay.hidden = true;
   els.shortcutsBtn.setAttribute("aria-expanded", "false");
+  const opener = shortcutOpener;
+  shortcutOpener = null;
+  if (opener && opener.isConnected && !opener.hidden) {
+    opener.focus();
+    // 不可聚焦的打开者（如 html / body）focus 后仍留在 body，回退到按钮
+    if (document.activeElement === opener) return;
+  }
   els.shortcutsBtn.focus();
 }
 
