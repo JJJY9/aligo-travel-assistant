@@ -381,6 +381,22 @@ def test_status_usage_totals():
         _cleanup(user_id)
 
 
+def test_preference_rejects_non_finite():
+    """NaN / Infinity 不能写入偏好，否则会让 /api/status JSON 永久失败。"""
+    client = _client()
+    for raw in (
+        '{"user_id": "web_test_nan", "value": NaN}',
+        '{"user_id": "web_test_nan", "value": Infinity}',
+    ):
+        response = client.put(
+            "/api/preferences/home_location",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422, raw
+    print("✓ 偏好拒绝 NaN / Infinity")
+
+
 def test_preferences_api():
     client = _client()
     user_id = _unique_user("web_test_pref")
@@ -1582,6 +1598,23 @@ def test_security_headers():
     print("✓ 安全响应头（CSP / nosniff / frame / referrer）")
 
 
+def test_request_body_too_large():
+    client = _client()
+    response = client.post(
+        "/api/chat",
+        content=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "99999999",
+        },
+    )
+    assert response.status_code == 413
+    assert "请求体过大" in response.json()["detail"]
+    assert response.headers.get("x-request-id")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    print("✓ 超大请求体返回 413（带安全头 / 请求 ID）")
+
+
 def test_gzip_compression_excludes_sse():
     """静态资源与 JSON 启用 gzip；SSE 流保持原样（压缩会破坏实时进度）。"""
     from context.storage import create_long_term_memory
@@ -2261,6 +2294,7 @@ if __name__ == "__main__":
     test_sessions_listing_and_delete()
     test_session_search()
     test_status_usage_totals()
+    test_preference_rejects_non_finite()
     test_preferences_api()
     test_status_trips()
     test_delete_trip_api()
@@ -2296,6 +2330,7 @@ if __name__ == "__main__":
     test_session_lru_eviction()
     test_request_id_header()
     test_security_headers()
+    test_request_body_too_large()
     test_gzip_compression_excludes_sse()
     test_docs_csp_allows_cdn()
     test_unhandled_error_returns_500_with_headers()

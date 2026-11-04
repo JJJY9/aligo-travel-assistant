@@ -216,6 +216,20 @@ def test_clear_history_clears_metadata():
     print("✓ clear_history 同时清理会话元数据（标题 / 置顶 / 归档）")
 
 
+def test_corrupt_memory_file_is_backed_up():
+    from pathlib import Path
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-corrupt.json"
+    path.write_text("{bad json", encoding="utf-8")
+    memory = LongTermMemory("u-corrupt", storage_dir)
+    assert memory.get_chat_history() == []
+    backups = list(Path(storage_dir).glob("u-corrupt.json.corrupt-*"))
+    assert backups, "损坏文件应保留备份"
+    assert backups[0].read_text(encoding="utf-8") == "{bad json"
+    print("✓ 损坏的记忆文件备份后重建")
+
+
 def test_session_metadata_save_failure_raises():
     """JSON 写入失败时会话元数据操作必须抛错，不能静默返回成功。"""
     memory = LongTermMemory("u-save-fail", tempfile.mkdtemp())
@@ -457,6 +471,7 @@ if __name__ == "__main__":
     test_session_pinned()
     test_add_message_preserves_metadata()
     test_clear_history_clears_metadata()
+    test_corrupt_memory_file_is_backed_up()
     test_session_metadata_save_failure_raises()
     _mp = pytest.MonkeyPatch()
     try:

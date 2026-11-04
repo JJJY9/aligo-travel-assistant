@@ -5,5 +5,14 @@ include requirements.txt
 # 技能插件（运行时由 LazyAgentRegistry 从 .claude/skills 动态加载）
 recursive-include .claude/skills *
 
+# 绝不打包运行时数据（本地知识库含业务文档内容，模型/记忆/导出同理）
+prune .claude/skills/ask-question/data/rag_knowledge
+prune data/models
+prune data/memory
+prune exports
+prune dist
+prune build
+global-exclude __pycache__ *.pyc
+
 # 测试脚本（脚本式测试，无需打包为包）
 recursive-include tests *.py

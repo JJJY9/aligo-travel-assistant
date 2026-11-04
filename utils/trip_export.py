@@ -26,8 +26,8 @@ def render_trips_csv(trips: list[dict[str, Any]]) -> str:
             [
                 _csv_safe(trip.get("origin")),
                 _csv_safe(trip.get("destination")),
-                trip.get("start_date") or "",
-                trip.get("end_date") or "",
+                _csv_safe(trip.get("start_date")),
+                _csv_safe(trip.get("end_date")),
                 _csv_safe(trip.get("purpose")),
             ]
         )

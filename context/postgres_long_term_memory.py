@@ -8,6 +8,7 @@ PostgreSQL 长期记忆后端
 - 未配置或连接失败时，由 ``context.storage`` 的工厂回退到 JSON 文件实现；
 - 偏好值以 JSONB 存储（字符串 / 列表等类型原样保留）。
 """
+import contextlib
 import logging
 import re
 from typing import Any
@@ -100,6 +101,14 @@ class PostgresLongTermMemory:
     def _ensure_schema(self) -> None:
         with self._conn.cursor() as cursor:
             cursor.execute(_SCHEMA_SQL)
+            try:
+                # 历史库可能已有重复 trip_id，建索引失败只记录，不阻止后端启用
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_aligo_trips_user_trip "
+                    "ON aligo_trips (user_id, trip_id)"
+                )
+            except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
+                logger.warning("无法创建 trip_id 唯一索引: %s", exc)
 
     def _execute(self, sql: str, params: tuple | None = None) -> None:
         with self._conn.cursor() as cursor:
@@ -373,6 +382,28 @@ class PostgresLongTermMemory:
         """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。"""
         purpose = trip_info.get("purpose") or "旅游"
         destination = trip_info.get("destination")
+        # 会话级 advisory lock：多线程 / 多进程同时写入同一用户时串行生成 trip_N
+        lock_name = f"aligo-trip-{self.user_id}"
+        with self._conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+            )
+        try:
+            return self._save_trip_history_locked(trip_info, purpose, destination)
+        finally:
+            with contextlib.suppress(Exception):
+                with self._conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                        (lock_name,),
+                    )
+
+    def _save_trip_history_locked(
+        self,
+        trip_info: dict[str, Any],
+        purpose: str,
+        destination: Any,
+    ) -> str:
         start_date = str(trip_info.get("start_date") or "")
         if destination and start_date:
             existing = self._fetchone(
