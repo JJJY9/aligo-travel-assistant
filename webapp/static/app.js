@@ -1893,6 +1893,22 @@ function renderOverview() {
         badge.textContent = status.label;
         meta.appendChild(badge);
       }
+      const conflicts = Array.isArray(trip.conflicts) ? trip.conflicts : [];
+      if (conflicts.length) {
+        const badge = document.createElement("span");
+        badge.className = "trip-status conflict";
+        badge.textContent = "重叠";
+        badge.title = conflicts
+          .map((item) => {
+            const dates = item.start_date
+              ? `（${item.start_date}${item.end_date ? ` ~ ${item.end_date}` : ""}）`
+              : "";
+            return `${item.origin || "—"} → ${item.destination || "—"}${dates}`;
+          })
+          .join("\n");
+        badge.setAttribute("aria-label", `与其它行程日期重叠：${badge.title}`);
+        meta.appendChild(badge);
+      }
       const start = trip.start_date || "";
       const end = trip.end_date || "";
       meta.appendChild(
