@@ -798,14 +798,21 @@ async function regenerate(node, text) {
   if (state.sessionId) {
     // 先删除服务端上一轮，避免重新生成在历史里叠加重复问答
     setBusy(true);
+    let mismatched = false;
     try {
-      await deleteLastTurn(text);
+      mismatched = await deleteLastTurn(text);
     } catch (error) {
       setBusy(false);
       toast(`重新生成失败：${error.message}`);
       return;
     }
     setBusy(false);
+    if (mismatched) {
+      // 服务端最后一轮已不是这条回答对应的提问（例如历史在其它页面被修改）：
+      // 不能删除当前节点后重发旧问题，否则会打乱顺序并在历史中留下重复问答
+      toast("上一轮对话已变化，未重新生成；请刷新页面后重试");
+      return;
+    }
   }
   node.remove();
   await sendMessage(text, { echo: false });
@@ -1733,7 +1740,16 @@ async function openSession(sessionId, options = {}) {
     }
     closeMobileSidebar();
   } catch (error) {
-    if (!options.silent) toast(`加载会话失败：${error.message}`);
+    if (!options.silent) {
+      toast(`加载会话失败：${error.message}`);
+    } else if (token === sessionLoadToken) {
+      // 启动恢复失败（服务重启 / 网络抖动）：丢弃旧会话 ID，避免下一条消息
+      // 被写进界面从未展示过的隐藏会话
+      state.sessionId = null;
+      sessionStorage.removeItem("aligo.sessionId");
+      syncSessionControls();
+      showWelcome();
+    }
   }
 }
 
@@ -1803,6 +1819,9 @@ async function deleteSession(sessionId) {
     return;
   }
   if (!window.confirm("删除这个会话？聊天记录会从长期记忆中移除。")) return;
+  // 作废进行中的会话加载：否则删除后晚到的 GET 会把已删除的会话重新渲染出来，
+  // 后续消息还会以同一 session_id 复活它
+  sessionLoadToken += 1;
   try {
     await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
@@ -1890,9 +1909,24 @@ async function sendMessage(text, options = {}) {
     state.controller = null;
     setBusy(false);
     refreshEditButtons();
-    els.input.focus();
-    await loadSessions();
-    refreshStatus();
+    // 只保留最新一条回答的「重新生成」：旧按钮对应的已不是最后一轮，
+    // 点击只会触发 mismatch，甚至在外层历史中插入重复问答
+    trimRegenButtons();
+    const panelOpen = els.memorySheet && !els.memorySheet.hidden;
+    if (!panelOpen) {
+      // 用户正在侧栏重命名等输入框里操作时不抢焦点
+      const active = document.activeElement;
+      const editing =
+        active &&
+        active !== els.input &&
+        (active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.tagName === "SELECT" ||
+          active.isContentEditable);
+      if (!editing) els.input.focus();
+      if (!document.querySelector(".hi-input")) await loadSessions();
+      refreshStatus();
+    }
   }
 }
 
@@ -2515,8 +2549,9 @@ function preferenceInputValue(value) {
 
 function preferenceOutputValue(original, text) {
   if (Array.isArray(original)) {
+    // 与「添加偏好」保持一致：ASCII 逗号同样视为分隔符
     return text
-      .split(/[、，]/)
+      .split(/[、，,]/)
       .map((item) => item.trim())
       .filter(Boolean);
   }
@@ -2807,12 +2842,18 @@ async function loadMoreKnowledgeDocuments() {
     if (seq === kbListSeq && !state.kbSemanticMode) toast(error.message);
   } finally {
     els.kbMore.disabled = false;
-    updateKnowledgeMore();
+    // 期间可能已开始语义检索：不要把属于关键词列表的分页按钮重新显示出来
+    if (seq === kbListSeq && !state.kbSemanticMode) updateKnowledgeMore();
   }
 }
 
 function updateKnowledgeMore() {
   if (!els.kbMore) return;
+  if (state.kbSemanticMode) {
+    // 语义结果不参与关键词分页
+    els.kbMore.hidden = true;
+    return;
+  }
   els.kbMore.hidden = state.kbItems.length >= state.kbTotal;
 }
 
@@ -3350,10 +3391,18 @@ async function saveUser() {
     state.tripsExpanded = false;
     state.tripsAll = [];
     state.tripsAllTotal = 0;
+    // 立即清空上一个用户的列表与面板：新用户的 /api/sessions、/api/status
+    // 返回前旧行仍可点击，而删除 / 编辑按当前 user_id 执行，会误伤新用户的同名记录
+    closeMemorySheet();
+    state.status = null;
+    state.sessions = [];
+    state.sessionTotal = 0;
+    state.archivedMatches = 0;
+    els.history.innerHTML = "";
+    renderOverview();
     await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
-  closeMemorySheet();
   toast("已切换用户");
 }
 
