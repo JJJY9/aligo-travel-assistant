@@ -183,6 +183,79 @@ def test_unregistered_agent_reports_error():
     print("✓ 未注册智能体返回错误结果")
 
 
+def test_failed_itinerary_is_not_saved_as_trip():
+    """规划失败的兜底 itinerary 不能写入行程历史。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 1,
+                "result": {
+                    "status": "error",
+                    "data": {
+                        "itinerary": {"title": "兜底行程"},
+                        "error": "Failed to parse JSON",
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_trip_history(limit=None) == [], "失败行程不应入库"
+    print("✓ 规划失败不写入行程历史")
+
+
+def test_skill_folder_names_are_canonicalized():
+    """调度里使用技能目录名时，结果与行程写入仍按标准智能体名处理。"""
+    memory = _StubMemory()
+
+    class EventStub(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "origin": "北京",
+                        "destination": "杭州",
+                        "start_date": "2026-12-01",
+                        "purpose": "出差",
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class PlanStub(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps({"itinerary": {"title": "杭州行程"}}, ensure_ascii=False),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "event-collection": EventStub("event-collection"),
+            "plan-trip": PlanStub("plan-trip"),
+        },
+        memory_manager=memory,
+    )
+    schedule = [
+        {"agent_name": "event-collection", "priority": 1},
+        {"agent_name": "plan-trip", "priority": 2},
+    ]
+    result = json.loads(asyncio.run(orchestrator.reply(_intent(schedule))).content)
+    assert [item["agent_name"] for item in result["results"]] == [
+        "event_collection",
+        "itinerary_planning",
+    ]
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert trips and trips[0]["destination"] == "杭州"
+    print("✓ 技能目录名规范化为标准智能体名并正常写入行程")
+
+
 def test_memory_update_preference_and_trip():
     """偏好覆盖 / 追加与行程写入"""
     memory = _StubMemory()
@@ -396,6 +469,8 @@ if __name__ == "__main__":
     test_agent_status_error_and_null_error()
     test_malformed_schedule_is_sanitized()
     test_registry_load_failure_reports_agent_error()
+    test_failed_itinerary_is_not_saved_as_trip()
+    test_skill_folder_names_are_canonicalized()
     test_memory_update_preference_and_trip()
     test_prepare_context_includes_user_query()
     print("\n全部通过")

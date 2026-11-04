@@ -57,29 +57,7 @@ except ImportError as e:
     DEPENDENCIES_AVAILABLE = False
 
 from utils.embedding_model import get_embedding_model
-
-
-def extract_user_query(content: str) -> str:
-    """从 Orchestrator 的结构化输入里取出检索问题。
-
-    ``rewritten_query`` 缺失 / 为空 / null 时回退到原始用户提问：
-    空字符串检索会返回任意 top-k 片段，答非所问。
-    """
-    if not isinstance(content, str) or not content.strip().startswith("{"):
-        return content
-    try:
-        data = json.loads(content)
-    except Exception:
-        return content
-    if not isinstance(data, dict):
-        return content
-    context = data.get("context") if isinstance(data.get("context"), dict) else {}
-    extracted = context.get("rewritten_query", data.get("rewritten_query", ""))
-    if not isinstance(extracted, str) or not extracted.strip():
-        extracted = context.get("user_query") if context else ""
-    if not isinstance(extracted, str) or not extracted.strip():
-        extracted = content
-    return extracted
+from utils.user_query import extract_user_query
 
 
 class RAGKnowledgeAgent(AgentBase):

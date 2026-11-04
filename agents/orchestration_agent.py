@@ -25,6 +25,16 @@ from agentscope.message import Msg
 
 logger = logging.getLogger(__name__)
 
+# 注册器同时接受技能目录名与旧智能体名（plan-trip / event-collection 等）；
+# 下游的聚合、记忆写入与前端展示统一使用旧名称
+_SKILL_AGENT_NAMES = {
+    "plan-trip": "itinerary_planning",
+    "event-collection": "event_collection",
+    "ask-question": "rag_knowledge",
+    "memory-query": "memory_query",
+    "query-info": "information_query",
+}
+
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -259,8 +269,9 @@ class OrchestrationAgent(AgentBase):
                 previous_results=previous_results,
                 on_event=on_event,
             )
+            requested_name = str(task.get("agent_name") or "")
             return [{
-                "agent_name": task.get("agent_name"),
+                "agent_name": _SKILL_AGENT_NAMES.get(requested_name, requested_name),
                 "priority": task.get("priority", 0),
                 "result": result
             }]
@@ -298,11 +309,12 @@ class OrchestrationAgent(AgentBase):
         # 整理结果
         results: list[dict[str, Any]] = []
         for (agent_name, priority, _), exec_result in zip(parallel_coroutines, execution_results):
+            canonical_name = _SKILL_AGENT_NAMES.get(agent_name, agent_name)
             if isinstance(exec_result, BaseException):
                 logger.error(f"Parallel agent execution failed: {agent_name}, error: {exec_result}")
                 result = {
                     "status": "error",
-                    "agent_name": agent_name,
+                    "agent_name": canonical_name,
                     "data": {"error": str(exec_result)},
                     "message": f"并行执行失败: {exec_result!s}"
                 }
@@ -310,7 +322,7 @@ class OrchestrationAgent(AgentBase):
                 result = exec_result
 
             results.append({
-                "agent_name": agent_name,
+                "agent_name": canonical_name,
                 "priority": priority,
                 "result": result
             })
@@ -337,7 +349,9 @@ class OrchestrationAgent(AgentBase):
         on_event: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         """执行单个智能体，并在开始 / 结束时发出进度事件。"""
-        self._emit(on_event, {"type": "agent_start", "agent_name": agent_name})
+        # 注册器两种名称都接受，但事件与结果统一用标准名
+        canonical_name = _SKILL_AGENT_NAMES.get(agent_name, agent_name)
+        self._emit(on_event, {"type": "agent_start", "agent_name": canonical_name})
         started = time.perf_counter()
         result = await self._run_agent(
             agent_name=agent_name,
@@ -352,7 +366,7 @@ class OrchestrationAgent(AgentBase):
             on_event,
             {
                 "type": "agent_done",
-                "agent_name": agent_name,
+                "agent_name": canonical_name,
                 "status": result.get("status", "unknown"),
                 "message": result.get("message", ""),
                 "duration": duration,
@@ -584,6 +598,10 @@ class OrchestrationAgent(AgentBase):
 
             # 如果是行程规划智能体，保存行程到长期记忆
             if agent_name == "itinerary_planning" and isinstance(data, dict):
+                # 规划失败时 plan-trip 返回的兜底 itinerary 不是真实行程，
+                # 不能写入历史/统计/日历
+                if result["result"].get("status") != "success":
+                    continue
                 itinerary = data.get("itinerary", {})
 
                 # 只要有行程信息就保存（不管是否完全规划好）
