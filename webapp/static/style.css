@@ -226,6 +226,9 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   transition: background 0.15s ease;
 }
 .upcoming:hover { background: rgba(224, 85, 43, 0.22); }
+.upcoming.ongoing { border-color: rgba(82, 183, 174, 0.42); background: rgba(82, 183, 174, 0.14); }
+.upcoming.ongoing:hover { background: rgba(82, 183, 174, 0.22); }
+.upcoming.ongoing .upcoming-label { color: #6cc9c0; }
 .upcoming-label { display: block; font-size: 10.5px; color: var(--accent); }
 .upcoming-route {
   display: block;
