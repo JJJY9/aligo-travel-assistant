@@ -37,7 +37,7 @@
 - 系统自检：`GET /api/doctor` 返回 Python / 依赖 / 配置 / 嵌入模型 / 知识库检查结果（`network=true` 时包含 LLM 连通性），记忆面板新增「运行自检」区块
 - 知识库导出 / 导入：`GET /api/knowledge/export` 下载 JSON 备份，`POST /api/knowledge/import` 批量导入（单次最多 200 条，超长字段自动截断）；记忆面板新增「导出知识库 / 导入 JSON」；CLI 对应 `python cli.py kb-export [path]` 与 `kb-import <file>`
 - CLI 知识片段管理：`python cli.py kb-list [关键词]` 列出片段（分类 + 预览），`python cli.py kb-delete <id>` 删除片段
-- CLI 行程去重：`python cli.py trips-dedupe <user_id>` 清理去重功能上线前已存在的重复行程（保留最早一条，统计同步更新）
+- CLI 行程去重：`python cli.py trips-dedupe <user_id>` 清理去重功能上线前已存在的重复行程（保留最早一条，统计同步更新）；新增 `--dry-run` 只列出将被删除的记录
 - 行程去重 / CLI 健壮性：删除前复核保留行程仍存在（并发删除时不误删仅剩副本），删除失败返回 1；PostgreSQL 配置错误回退本地 JSON 时拒绝执行；ICS 文本转义孤立 CR
 - 行程管理：记忆面板可删除误记录的行程（`DELETE /api/trips/{id}`），JSON / PostgreSQL 同步更新统计与常去目的地
 - 记忆面板「最近行程」标题右侧的「添加行程 / 导出全部日历」两个按钮增加间距（此前贴在一起难以区分），并更新 README 记忆面板截图

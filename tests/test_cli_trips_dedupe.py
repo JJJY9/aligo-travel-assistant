@@ -50,10 +50,10 @@ def _trip(trip_id, origin="北京", destination="上海", start="2026-11-09", en
     }
 
 
-def _run(user_id):
+def _run(user_id, dry_run=False):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = cli.run_trips_dedupe_standalone(user_id)
+        code = cli.run_trips_dedupe_standalone(user_id, dry_run=dry_run)
     return code, buf.getvalue()
 
 
@@ -189,6 +189,34 @@ def test_pg_configured_but_json_fallback(monkeypatch):
     print("✓ PostgreSQL 回退时拒绝执行去重")
 
 
+def test_dry_run_does_not_delete(monkeypatch):
+    fake = _FakeStore(
+        [_trip("trip_1"), _trip("trip_2"), _trip("trip_3", destination="杭州")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u1", dry_run=True)
+    assert code == 0
+    assert fake.deleted == [], "dry-run 不应删除任何记录"
+    assert "发现 1 条重复行程" in out
+    assert "将删除 trip_2" in out
+    assert "去掉 --dry-run" in out
+    print("✓ --dry-run 只列出重复记录，不删除")
+
+
+def test_main_rejects_unknown_flags(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips-dedupe", "u1", "--dryrun"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    assert "用法" in buf.getvalue()
+    print("✓ 未知参数返回用法错误")
+
+
 if __name__ == "__main__":
     for case in (
         test_dedupes_and_keeps_first,
@@ -200,6 +228,8 @@ if __name__ == "__main__":
         test_skips_group_when_keeper_deleted_concurrently,
         test_delete_failure_returns_1,
         test_pg_configured_but_json_fallback,
+        test_dry_run_does_not_delete,
+        test_main_rejects_unknown_flags,
     ):
         mp = pytest.MonkeyPatch()
         try:
