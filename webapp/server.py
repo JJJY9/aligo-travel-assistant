@@ -921,20 +921,33 @@ def create_app(model: Any = None) -> FastAPI:
             if value is not None and value != "" and value != [] and value != {}
         }
         today = datetime.now().date().isoformat()
-        upcoming_trips = [
-            trip
-            for trip in data["trip_history"]
-            if trip.get("start_date") and str(trip["start_date"]) >= today
-        ]
+        active_trips: list[dict[str, Any]] = []
+        upcoming_trips: list[dict[str, Any]] = []
+        for trip in data["trip_history"]:
+            start = str(trip.get("start_date") or "")
+            if not start:
+                continue
+            end = str(trip.get("end_date") or start)
+            if end < start:
+                end = start
+            if start <= today <= end:
+                active_trips.append(trip)
+            elif start > today:
+                upcoming_trips.append(trip)
+        # 进行中的行程优先展示（多条时取结束最晚的）
+        active_trips.sort(key=lambda trip: str(trip.get("end_date") or trip.get("start_date")))
         upcoming_trips.sort(
             key=lambda trip: (str(trip["start_date"]), 0 if trip.get("session_id") else 1)
+        )
+        featured_trip = active_trips[-1] if active_trips else (
+            upcoming_trips[0] if upcoming_trips else None
         )
         return {
             "user_id": user_id,
             "preferences": preferences,
             "trip_count": len(data["trip_history"]),
             "trips": data["trip_history"][-5:],
-            "next_trip": upcoming_trips[0] if upcoming_trips else None,
+            "next_trip": featured_trip,
             "chat_count": len(data["chat_history"]),
             "statistics": data["statistics"],
             "storage": describe_backends(),

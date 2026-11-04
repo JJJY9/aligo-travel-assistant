@@ -89,6 +89,7 @@ const els = {
   history: byId("history"),
   historySearch: byId("historySearch"),
   upcoming: byId("upcoming"),
+  upcomingLabel: byId("upcomingLabel"),
   upcomingRoute: byId("upcomingRoute"),
   upcomingDate: byId("upcomingDate"),
   messages: byId("messages"),
@@ -2099,15 +2100,26 @@ function tripStatus(trip) {
 }
 
 function pickUpcomingTrip(trips) {
-  const today = todayISO();
-  const upcoming = (trips || [])
-    .filter((trip) => trip.start_date && String(trip.start_date) >= today)
+  const candidates = (trips || [])
+    .filter((trip) => trip.start_date)
+    .map((trip) => ({ trip, status: tripStatus(trip) }))
+    .filter((item) => item.status);
+  const ongoing = candidates
+    .filter((item) => item.status.cls === "active")
+    .sort((a, b) =>
+      String(b.trip.end_date || b.trip.start_date).localeCompare(
+        String(a.trip.end_date || a.trip.start_date),
+      ),
+    );
+  if (ongoing.length) return ongoing[0].trip;
+  const upcoming = candidates
+    .filter((item) => item.status.cls === "upcoming")
     .sort((a, b) => {
-      const byDate = String(a.start_date).localeCompare(String(b.start_date));
+      const byDate = String(a.trip.start_date).localeCompare(String(b.trip.start_date));
       if (byDate !== 0) return byDate;
-      return (b.session_id ? 1 : 0) - (a.session_id ? 1 : 0);
+      return (b.trip.session_id ? 1 : 0) - (a.trip.session_id ? 1 : 0);
     })[0];
-  return upcoming || null;
+  return upcoming ? upcoming.trip : null;
 }
 
 function renderUpcoming(trip) {
@@ -2115,8 +2127,11 @@ function renderUpcoming(trip) {
     els.upcoming.hidden = true;
     return;
   }
+  const status = tripStatus(trip);
   els.upcoming.hidden = false;
+  els.upcoming.classList.toggle("ongoing", Boolean(status && status.cls === "active"));
   els.upcoming.dataset.session = trip.session_id || "";
+  els.upcomingLabel.textContent = status ? status.label : "即将出行";
   els.upcomingRoute.textContent = `${trip.origin || "—"} → ${trip.destination || "—"}`;
   els.upcomingDate.textContent = `${trip.start_date}${
     trip.end_date ? ` ~ ${trip.end_date}` : ""

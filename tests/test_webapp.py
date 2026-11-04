@@ -968,6 +968,65 @@ def test_delete_last_turn_api():
         _cleanup(user_id)
 
 
+def test_next_trip_prefers_ongoing():
+    from datetime import datetime, timedelta
+
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_next_ongoing")
+    try:
+        today = datetime.now().date()
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "深圳",
+                    "start_date": (today - timedelta(days=1)).isoformat(),
+                    "end_date": (today + timedelta(days=1)).isoformat(),
+                    "session_id": "sess-ongoing",
+                }
+            )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": (today + timedelta(days=10)).isoformat(),
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        status = _client().get("/api/status", params={"user_id": user_id}).json()
+        assert status["next_trip"]["session_id"] == "sess-ongoing"
+        assert status["next_trip"]["destination"] == "深圳"
+
+        # 进行中的行程结束后回落到未来行程
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            trips = store.get_trip_history(limit=None)
+            ongoing = next(t for t in trips if t.get("session_id") == "sess-ongoing")
+            store.update_trip(
+                str(ongoing["trip_id"]),
+                {
+                    "start_date": (today - timedelta(days=3)).isoformat(),
+                    "end_date": (today - timedelta(days=2)).isoformat(),
+                },
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        status = _client().get("/api/status", params={"user_id": user_id}).json()
+        assert status["next_trip"]["destination"] == "杭州"
+        print("✓ next_trip 优先进行中行程，结束后回落到未来行程")
+    finally:
+        _cleanup(user_id)
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
