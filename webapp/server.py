@@ -357,6 +357,8 @@ class AligoWebApp:
     # 进程内缓存的会话上限（超出后按最久未使用淘汰，避免长时间运行内存与连接增长）。
     # 每个会话在 PostgreSQL 后端下持有 1 个连接，保守取 50，避免撞上数据库连接上限。
     max_sessions = 50
+    # 用户锁表同样有上限：用户 ID 由请求方提供，未命中时淘汰未持有的锁
+    max_locks = 1000
 
     def __init__(self, model: Any = None) -> None:
         init_agentscope()
@@ -412,9 +414,16 @@ class AligoWebApp:
 
     def lock_for(self, user_id: str) -> asyncio.Lock:
         """同一用户的请求串行处理，避免长期记忆并发写覆盖。"""
-        if user_id not in self.locks:
-            self.locks[user_id] = asyncio.Lock()
-        return self.locks[user_id]
+        lock = self.locks.get(user_id)
+        if lock is None:
+            if len(self.locks) >= self.max_locks:
+                for key, candidate in list(self.locks.items()):
+                    if not candidate.locked():
+                        del self.locks[key]
+                        break
+            lock = asyncio.Lock()
+            self.locks[user_id] = lock
+        return lock
 
 
 def _request_id(request: Request) -> str:
