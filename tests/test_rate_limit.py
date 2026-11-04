@@ -63,9 +63,21 @@ def test_status_reports_remaining():
     print("✓ status 报告剩余次数 / 重置时间")
 
 
+def test_peek_does_not_record():
+    """peek 只检查是否会被限流，不消耗配额。"""
+    limiter = RateLimiter(limit=1, window_sec=60)
+    assert limiter.peek("k") is None
+    assert limiter.check("k") is None
+    assert limiter.peek("k") is not None
+    assert limiter.peek("k") is not None
+    assert limiter.status("k")[0] == 0, "peek 不应改变剩余次数"
+    print("✓ peek 只检查不记录")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
     test_key_eviction_bounds_memory()
     test_status_reports_remaining()
+    test_peek_does_not_record()
     print("\n全部通过")

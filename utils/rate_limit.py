@@ -51,6 +51,22 @@ class RateLimiter:
         events.append(now)
         return None
 
+    def peek(self, key: str) -> float | None:
+        """不记录请求，返回现在发起请求会被限流的 Retry-After（否则 None）。
+
+        多桶限流时先用 peek 检查所有桶，全部有额度再 check 记录，
+        避免一个桶已经拒绝、另一个桶却仍被消耗配额。
+        """
+        now = time.monotonic()
+        events = self._events.get(key)
+        if events is None:
+            return None
+        while events and now - events[0] >= self.window_sec:
+            events.popleft()
+        if len(events) >= self.limit:
+            return round(max(0.1, self.window_sec - (now - events[0])), 1)
+        return None
+
     def status(self, key: str) -> tuple[int, float]:
         """返回 (剩余次数, 窗口重置剩余秒数)，不记录新请求。"""
         now = time.monotonic()
