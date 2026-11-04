@@ -155,6 +155,51 @@ def test_skips_group_when_keeper_deleted_concurrently(monkeypatch):
     print("✓ 保留者被并发删除时跳过该组")
 
 
+def test_json_backend_reloads_before_keeper_recheck(monkeypatch):
+    """JSON 后端删除前必须重载磁盘：保留者被 Web 端并发删除时不能误删仅剩副本。"""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-real.json"
+    trips = [
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        },
+        {
+            "trip_id": "trip_2",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        },
+    ]
+    path.write_text(json.dumps({"trip_history": trips}), encoding="utf-8")
+    # CLI 进程启动时加载的快照包含 trip_1 / trip_2
+    store = LongTermMemory("u-real", storage_dir)
+    # 模拟 Web 端在 CLI 运行期间删除了保留者 trip_1
+    path.write_text(json.dumps({"trip_history": [trips[1]]}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u-real")
+    assert code == 0
+    assert "没有需要删除的重复行程" in out.getvalue()
+    remaining = json.loads(path.read_text(encoding="utf-8"))["trip_history"]
+    assert [item["trip_id"] for item in remaining] == ["trip_2"], "不能删掉仅剩的副本"
+    print("✓ JSON 后端删除前重载磁盘（保留者并发删除时不误删）")
+
+
 def test_delete_failure_returns_1(monkeypatch):
     class _FailDeleteStore(_FakeStore):
         def delete_trip(self, trip_id):
@@ -226,6 +271,7 @@ if __name__ == "__main__":
         test_read_failure,
         test_store_open_failure,
         test_skips_group_when_keeper_deleted_concurrently,
+        test_json_backend_reloads_before_keeper_recheck,
         test_delete_failure_returns_1,
         test_pg_configured_but_json_fallback,
         test_dry_run_does_not_delete,

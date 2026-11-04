@@ -425,9 +425,14 @@ class PostgresLongTermMemory:
                 ),
             )
             if existing:
+                # 与 JSON 后端一致：未提供的字段（None）保留原值，不能被默认值
+                # 覆盖（手动补录同一行程会丢失来源会话 / 用户修改过的目的）
                 self._execute(
-                    "UPDATE aligo_trips SET purpose = %s, session_id = %s WHERE id = %s",
-                    (purpose, trip_info.get("session_id"), existing[0]),
+                    "UPDATE aligo_trips SET "
+                    "purpose = COALESCE(%s, purpose), "
+                    "session_id = COALESCE(%s, session_id) "
+                    "WHERE id = %s",
+                    (trip_info.get("purpose"), trip_info.get("session_id"), existing[0]),
                 )
                 return str(existing[1] or "")
 
@@ -465,16 +470,21 @@ class PostgresLongTermMemory:
         return max_number + 1
 
     def delete_trip(self, trip_id: str) -> bool:
-        """删除一条历史行程；返回是否删除（统计由查询动态计算）。"""
+        """删除一条历史行程；返回是否删除（统计由查询动态计算）。
+
+        历史库可能存在重复的 trip_id（旧版按 COUNT 生成），只删除最早插入的
+        那一行，不能按 trip_id 批量删除，否则一次操作会抹掉多条不同行程。
+        """
         row = self._fetchone(
-            "SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
+            "SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s "
+            "ORDER BY id LIMIT 1",
             (self.user_id, trip_id),
         )
         if not row:
             return False
         self._execute(
-            "DELETE FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
-            (self.user_id, trip_id),
+            "DELETE FROM aligo_trips WHERE user_id = %s AND id = %s",
+            (self.user_id, row[0]),
         )
         return True
 
