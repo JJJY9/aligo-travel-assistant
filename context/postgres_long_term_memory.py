@@ -231,6 +231,27 @@ class PostgresLongTermMemory:
             )
         return removed
 
+    def delete_last_turn(self, session_id: str) -> int:
+        """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。"""
+        rows = self._fetchall(
+            "SELECT id, role FROM aligo_chat_messages "
+            "WHERE user_id = %s AND session_id = %s ORDER BY id DESC LIMIT 2",
+            (self.user_id, session_id),
+        )
+        if not rows:
+            return 0
+        ids = [rows[0][0]]
+        if len(rows) >= 2 and rows[0][1] == "assistant" and rows[1][1] == "user":
+            ids.append(rows[1][0])
+        with self._conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM aligo_chat_messages WHERE user_id = %s AND id = ANY(%s)",
+                (self.user_id, ids),
+            )
+            removed = cursor.rowcount or 0
+        logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
+        return removed
+
     def set_session_title(self, session_id: str, title: str) -> None:
         """设置会话自定义标题；空标题表示恢复自动标题。"""
         cleaned = title.strip()

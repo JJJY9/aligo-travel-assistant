@@ -40,6 +40,7 @@
 - 手动添加行程的响应新增 `created` 标志：重复添加已有行程时界面提示「已存在相同行程，已更新该记录」，不再误报为新增
 - 编辑行程：`PUT /api/trips/{id}` 支持部分字段更新（显式传 `null` 可清空返程日期；与其它行程重复时返回 409），记忆面板行程行新增编辑按钮（复用「添加行程」表单，保存后原记录就地更新）
 - 行程状态与日期重叠提醒：新增 / 编辑行程时接口返回与之日期重叠的其它行程（`conflicts`），界面保存后提示「与 XX 的行程日期重叠」；记忆面板每条行程展示「进行中 / 即将出行 / 已结束」状态标签
+- 删除最后一轮对话：`DELETE /api/sessions/{id}/last-turn` 成对删除最后一轮用户提问与助手回答（回答中断时只删除提问），JSON 长期记忆、PostgreSQL 与 Redis 短期记忆同步清理，供「编辑上一条提问后重新发送」使用
 - Web 快捷键与键盘可达性：`Ctrl/Cmd + K` 或 `/` 聚焦搜索，`Esc` 清空搜索 / 关闭面板；会话操作按钮支持键盘聚焦
 - 用户数据导出新增 Markdown：`GET /api/export?format=md` 汇总偏好、最近行程、统计与最近会话；Web 记忆面板新增「导出 Markdown」按钮
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP

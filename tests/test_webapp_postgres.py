@@ -150,6 +150,17 @@ def test_webapp_with_postgres_backend(monkeypatch):
             client.get("/api/status", params={"user_id": user_id}).json()["trip_count"]
             == 0
         )
+
+        # 删除最后一轮对话（按 id 倒序识别用户 + 助手两条消息）
+        turn = client.delete(
+            "/api/sessions/sess-pg-web/last-turn", params={"user_id": user_id}
+        )
+        assert turn.status_code == 200
+        assert turn.json()["removed"] == 2
+        remaining = client.get(
+            "/api/sessions/sess-pg-web", params={"user_id": user_id}
+        ).json()["messages"]
+        assert remaining == []
         print("✓ Web API 在 PostgreSQL 后端下的读写路径")
     finally:
         try:

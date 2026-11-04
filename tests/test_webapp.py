@@ -887,6 +887,87 @@ def test_trip_conflicts_helper_edges():
     print("✓ 行程重叠辅助函数（脏数据 / 单日 / 排除自身）")
 
 
+def test_delete_last_turn_api():
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_last_turn")
+    session_id = "edit-session-1"
+    other_session = "edit-session-2"
+
+    def seed(store):
+        for role, content in [
+            ("user", "问题 1"),
+            ("assistant", "回答 1"),
+            ("user", "问题 2"),
+            ("assistant", "回答 2"),
+        ]:
+            store.add_chat_message(role, content, session_id)
+        store.add_chat_message("user", "其它会话", other_session)
+
+    def open_store():
+        return create_long_term_memory(user_id, str(MEMORY_DIR))
+
+    def close(store):
+        closer = getattr(store, "close", None)
+        if callable(closer):
+            closer()
+
+    try:
+        store = open_store()
+        try:
+            seed(store)
+        finally:
+            close(store)
+
+        response = client.delete(
+            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+        )
+        assert response.status_code == 200
+        assert response.json()["removed"] == 2
+
+        store = open_store()
+        try:
+            history = store.get_chat_history(session_id=session_id)
+            assert [item["content"] for item in history] == ["问题 1", "回答 1"]
+            other = store.get_chat_history(session_id=other_session)
+            assert [item["content"] for item in other] == ["其它会话"]
+            assert store.get_statistics()["total_messages"] == 3
+            store.add_chat_message("user", "只有提问没有回答", session_id)
+        finally:
+            close(store)
+
+        # 回答中断、只剩提问时只删除提问
+        single = client.delete(
+            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+        )
+        assert single.json()["removed"] == 1
+
+        # 再删一次移除剩余的一轮，之后没有可删除的消息（幂等返回 0）
+        pair = client.delete(
+            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+        )
+        assert pair.json()["removed"] == 2
+        empty = client.delete(
+            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+        )
+        assert empty.status_code == 200
+        assert empty.json()["removed"] == 0
+
+        stranger = _unique_user("web_test_last_turn_x")
+        try:
+            denied = client.delete(
+                f"/api/sessions/{session_id}/last-turn", params={"user_id": stranger}
+            )
+            assert denied.status_code == 200
+            assert denied.json()["removed"] == 0
+        finally:
+            _cleanup(stranger)
+        print("✓ 删除最后一轮对话（成对删除 / 仅提问 / 幂等 / 会话隔离）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 

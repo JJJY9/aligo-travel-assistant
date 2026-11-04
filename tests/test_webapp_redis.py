@@ -92,6 +92,15 @@ def test_webapp_with_redis_short_term(monkeypatch):
         assert client.exists(key) == 1, "对话应写入 Redis 短期记忆"
         assert client.llen(key) >= 2, "至少包含用户与助手两条消息"
 
+        # 删除最后一轮对话 → Redis 短期记忆与长期记忆同步清理
+        before = client.llen(key)
+        turn = http.delete(
+            f"/api/sessions/{session_id}/last-turn", params={"user_id": user_id}
+        )
+        assert turn.status_code == 200
+        assert turn.json()["removed"] == 2
+        assert client.llen(key) == max(0, before - 2)
+
         # 删除会话 → 同时清理 Redis 短期记忆
         deleted = http.delete(
             f"/api/sessions/{session_id}", params={"user_id": user_id}
