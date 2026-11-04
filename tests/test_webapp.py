@@ -1305,6 +1305,70 @@ def test_trips_csv_export():
         _cleanup(user_id)
 
 
+def test_session_metadata_storage_failure_maps_503(monkeypatch):
+    """标题 / 置顶 / 归档写盘失败统一返回 503。"""
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def get_chat_history(self, session_id=None):
+            return [{"role": "user", "content": "x", "session_id": session_id}]
+
+        def set_session_title(self, *args):
+            raise RuntimeError("disk full")
+
+        def set_session_pinned(self, *args):
+            raise RuntimeError("disk full")
+
+        def set_session_archived(self, *args):
+            raise RuntimeError("disk full")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    client = _client()
+    assert (
+        client.put(
+            "/api/sessions/s1/title", json={"user_id": "u1", "title": "标题"}
+        ).status_code
+        == 503
+    )
+    assert (
+        client.put(
+            "/api/sessions/s1/pin", json={"user_id": "u1", "pinned": True}
+        ).status_code
+        == 503
+    )
+    assert (
+        client.put(
+            "/api/sessions/s1/archive",
+            json={"user_id": "u1", "archived": True},
+        ).status_code
+        == 503
+    )
+    print("✓ 会话标题 / 置顶 / 归档写盘失败 → 503")
+
+
+def test_trips_csv_storage_failure_maps_503(monkeypatch):
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def get_trip_history(self, limit=None):
+            raise RuntimeError("db down")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    response = _client().get("/api/trips/export", params={"user_id": "u1"})
+    assert response.status_code == 503
+    print("✓ 行程 CSV 导出读取失败 → 503")
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
@@ -2136,6 +2200,12 @@ if __name__ == "__main__":
     test_status_trips_include_conflicts()
     test_session_archive_api()
     test_archived_sessions_search_and_pagination()
+    _mp_storage = pytest.MonkeyPatch()
+    try:
+        test_session_metadata_storage_failure_maps_503(_mp_storage)
+        test_trips_csv_storage_failure_maps_503(_mp_storage)
+    finally:
+        _mp_storage.undo()
     test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:
