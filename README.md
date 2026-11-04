@@ -571,7 +571,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过） |
 | GET | `/api/trips/export` | 导出全部历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开） |
-| GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，附带日期重叠信息） |
+| GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，`order=asc\|desc` 切换记录顺序，附带日期重叠信息） |
 | DELETE | `/api/trips/{id}` | 删除一条历史行程（同步统计与常去目的地） |
 
 > 说明：短期记忆按会话级管理——进程内实现随服务重启清空，配置 `REDIS_URL` 后由 Redis TTL 控制；长期记忆与历史会话在默认 JSON（`data/memory/`）或 PostgreSQL 中持久化。用户 / 会话 ID 限制为中文、字母、数字、下划线与短横线（避免路径穿越）。服务默认只监听 `127.0.0.1`，按单机演示用途设计。

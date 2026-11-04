@@ -104,6 +104,11 @@ class LongTermMemory:
                     try:
                         with open(self.db_path, 'r', encoding='utf-8') as f:
                             latest = json.load(f)
+                        # 与首次读取一致：合法 JSON 但不是对象 / 字段结构异常
+                        # 同样视为损坏，必须进入备份分支，不能让异常逃逸
+                        if not isinstance(latest, dict):
+                            raise ValueError("记忆文件内容不是 JSON 对象")
+                        latest = self._migrate_data(latest)
                     except FileNotFoundError:
                         return self._init_data()
                     except Exception:
@@ -120,7 +125,7 @@ class LongTermMemory:
                             logger.error("备份损坏的记忆文件失败: %s", backup_error)
                         return self._init_data()
                     logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
-                    return self._migrate_data(latest)
+                    return latest
         else:
             logger.info("No existing long-term memory, creating new")
             return self._init_data()
