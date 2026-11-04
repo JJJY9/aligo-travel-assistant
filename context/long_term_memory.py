@@ -86,21 +86,26 @@ class LongTermMemory:
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
     def _load(self) -> dict[str, Any]:
-        """从文件加载数据"""
-        if os.path.exists(self.db_path):
-            try:
-                with open(self.db_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    logger.debug(f"Loaded long-term memory from {self.db_path}")
+        """从文件加载数据。
 
-                    # 数据迁移：兼容旧格式
-                    data = self._migrate_data(data)
-                    return data
-            except Exception as e:
-                logger.error(f"Failed to load long-term memory: {e}")
-                # 复核时持锁：错误与加锁之间其它线程可能已写入新的有效文件，
-                # 不能把刚写入的数据当成损坏文件移走
-                with self._write_lock:
+        读取全程持有按路径的写锁：Windows 上打开的文件句柄会阻止其它线程 /
+        实例的 ``os.replace``（WinError 5），并发写盘会被误报为失败。锁是
+        可重入的，下方复核分支可安全再次进入。
+        """
+        with self._write_lock:
+            if os.path.exists(self.db_path):
+                try:
+                    with open(self.db_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        logger.debug(f"Loaded long-term memory from {self.db_path}")
+
+                        # 数据迁移：兼容旧格式
+                        data = self._migrate_data(data)
+                        return data
+                except Exception as e:
+                    logger.error(f"Failed to load long-term memory: {e}")
+                    # 复核时持锁：错误与加锁之间其它线程可能已写入新的有效文件，
+                    # 不能把刚写入的数据当成损坏文件移走
                     try:
                         with open(self.db_path, 'r', encoding='utf-8') as f:
                             latest = json.load(f)
@@ -126,9 +131,14 @@ class LongTermMemory:
                         return self._init_data()
                     logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
                     return latest
-        else:
-            logger.info("No existing long-term memory, creating new")
-            return self._init_data()
+            else:
+                logger.info("No existing long-term memory, creating new")
+                return self._init_data()
+
+    def reload(self) -> None:
+        """重新从磁盘加载最新数据（供 CLI 并发复核等只读场景调用）。"""
+        with self._write_lock:
+            self._reload_latest()
 
     def _reload_latest(self) -> None:
         """从磁盘重载最新数据（写操作前调用，避免旧快照覆盖其它写入）。"""
@@ -171,6 +181,14 @@ class LongTermMemory:
         if "total_queries" not in data.get("statistics", {}):
             data["statistics"]["total_queries"] = 0
         if "preferences" not in data:
+            data["preferences"] = []
+
+        # 字段存在但为 null / 类型错误时按空集合处理：这类文件是合法 JSON，
+        # 若不在读取时修复，每次 get_* / 写入都会抛 TypeError，且永远不会备份
+        for list_key in ("chat_history", "trip_history"):
+            if not isinstance(data.get(list_key), list):
+                data[list_key] = []
+        if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []
 
         # 2. 迁移旧格式：字典 → 列表

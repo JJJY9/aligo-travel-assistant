@@ -127,6 +127,22 @@ def test_postgres_long_term_memory():
         assert len(deduped) == 2, "同一行程不应重复保存"
         assert deduped[0]["session_id"] == "sess-pg-dup"
 
+        # 再次保存时不带 purpose / session_id：与 JSON 后端一致，保留原值
+        memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-11-09",
+            }
+        )
+        preserved = next(
+            item
+            for item in memory.get_trip_history(limit=None)
+            if item["trip_id"] == "trip_1"
+        )
+        assert preserved["purpose"] == "出差", "未提供 purpose 时不能被默认值覆盖"
+        assert preserved["session_id"] == "sess-pg-dup", "未提供 session_id 时不能置空"
+
         # 更新行程字段；改成与另一条重复时拒绝
         assert memory.update_trip("trip_2", {"purpose": "会议"}) is True
         trip_2 = next(

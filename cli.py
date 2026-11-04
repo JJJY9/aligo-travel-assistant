@@ -1166,7 +1166,11 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
             return 0
 
         # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，
-        # 避免把仅剩的副本也删掉
+        # 避免把仅剩的副本也删掉。JSON 后端的 get_trip_history 返回进程启动时
+        # 的快照，必须先 reload，否则复核永远是“未变化”
+        reload = getattr(store, "reload", None)
+        if callable(reload):
+            reload()
         try:
             fresh_ids = {
                 str(trip.get("trip_id") or "")

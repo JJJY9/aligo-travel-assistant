@@ -398,6 +398,100 @@ class _CountingModel:
         }
 
 
+def test_pg_delete_trip_deletes_single_row():
+    """PostgreSQL 删除行程按主键：历史库重复 trip_id 时不能整批删除。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    calls: dict[str, list[tuple[str, object]]] = {"fetch": [], "exec": []}
+
+    def fake_fetch(sql, params):
+        calls["fetch"].append((sql, params))
+        return (42,)
+
+    def fake_execute(sql, params):
+        calls["exec"].append((sql, params))
+
+    setattr(store, "_fetchone", fake_fetch)
+    setattr(store, "_execute", fake_execute)
+    assert store.delete_trip("trip_1") is True
+    select_sql, _ = calls["fetch"][0]
+    assert "ORDER BY id LIMIT 1" in select_sql
+    delete_sql, delete_params = calls["exec"][0]
+    assert "WHERE user_id = %s AND id = %s" in delete_sql
+    assert delete_params == ("u1", 42)
+
+    setattr(store, "_fetchone", lambda sql, params: None)
+    assert store.delete_trip("missing") is False
+    assert len(calls["exec"]) == 1, "不存在时不应执行删除"
+    print("✓ PostgreSQL 删除行程按主键（重复 trip_id 只删一行）")
+
+
+def test_null_list_fields_are_repaired():
+    """preferences / chat_history / trip_history 为 null 时按空集合修复。"""
+    import json as json_module
+    from pathlib import Path
+
+    for field in ("preferences", "chat_history", "trip_history"):
+        storage_dir = tempfile.mkdtemp()
+        path = Path(storage_dir) / "u-null.json"
+        path.write_text(json_module.dumps({field: None}), encoding="utf-8")
+        memory = LongTermMemory("u-null", storage_dir)
+        assert memory.get_preference() == {}
+        assert memory.get_chat_history() == []
+        assert memory.get_trip_history(limit=None) == []
+        memory.save_preference("home_location", "北京")
+        assert memory.get_preference("home_location") == "北京"
+        assert not list(Path(storage_dir).glob("u-null.json.corrupt-*")), field
+    print("✓ null 字段读取时修复为空集合")
+
+
+def test_load_holds_path_lock():
+    """读取全程持锁：Windows 上打开的文件句柄会让并发 os.replace 失败。"""
+    import json as json_module
+    from pathlib import Path
+
+    from context import long_term_memory as lt
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-lock.json"
+    path.write_text(json_module.dumps({"chat_history": []}), encoding="utf-8")
+    lock = lt._lock_for_path(str(path))
+    real_load = json_module.load
+    checked = {"n": 0}
+
+    def load_inside_lock(handle, *args, **kwargs):
+        checked["n"] += 1
+        assert getattr(lock, "_is_owned")(), "读取应在按路径锁内进行"
+        return real_load(handle, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(json_module, "load", load_inside_lock)
+        LongTermMemory("u-lock", storage_dir)
+    assert checked["n"] >= 1
+    print("✓ 记忆文件读取全程持锁")
+
+
+def test_summary_not_starved_by_long_current_session():
+    """当前会话很长时，跨会话总结仍应包含其它会话的历史。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-starve", "s-current", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term.add_chat_message("user", "较早的其它会话内容", "s-other")
+    for index in range(40):
+        manager.long_term.add_chat_message("user", f"当前会话第 {index} 条", "s-current")
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    assert summary, "长会话不应让跨会话总结为空"
+    assert model.calls == 1
+    print("✓ 长当前会话不会饿死跨会话总结")
+
+
 def test_summary_cache_avoids_repeated_calls():
     import asyncio
 
@@ -577,6 +671,10 @@ if __name__ == "__main__":
     test_corrupt_memory_file_is_backed_up()
     test_corrupt_backup_does_not_move_concurrently_written_file(pytest.MonkeyPatch())
     test_valid_json_non_object_memory_file_is_backed_up()
+    test_null_list_fields_are_repaired()
+    test_load_holds_path_lock()
+    test_pg_delete_trip_deletes_single_row()
+    test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()
     test_session_metadata_save_failure_raises()

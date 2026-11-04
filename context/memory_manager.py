@@ -180,8 +180,16 @@ class MemoryManager:
         if not self.llm_model:
             return ""
 
-        # 获取长期聊天历史（排除当前会话）
-        all_history = self.long_term.get_chat_history(limit=max_messages)
+        # 获取长期聊天历史（排除当前会话）。只取最后 max_messages 条会被
+        # 当前会话自身占满（长会话几十轮后其它会话历史永远为空），因此按
+        # 「当前会话消息数 + max_messages」取窗口，保证至少有 max_messages
+        # 条其它会话的消息可供总结。
+        own_messages = len(
+            self.long_term.get_chat_history(session_id=self.session_id)
+        )
+        all_history = self.long_term.get_chat_history(
+            limit=max_messages + own_messages
+        )
         history_from_other_sessions = [
             msg for msg in all_history
             if msg.get("session_id") != self.session_id
