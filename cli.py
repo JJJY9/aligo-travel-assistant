@@ -1549,6 +1549,64 @@ def run_trips_export_standalone(
     return 0
 
 
+def run_trips_list_standalone(user_id: str) -> int:
+    """列出用户行程（用于 `python cli.py trips <user_id>`）。
+
+    Returns:
+        0 列出成功（含无行程）；1 参数 / 读取失败
+    """
+    import re
+
+    from utils.trip_conflicts import trip_state_label, trips_with_conflicts
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取行程失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if not trips:
+        print(f"用户 {user_id}：还没有行程记录")
+        return 0
+
+    # 与 Web 记忆面板一致：新→旧展示，并标注状态与日期重叠
+    views = trips_with_conflicts(trips)
+    print(f"用户 {user_id}：共 {len(views)} 条行程（新→旧）")
+    for trip in reversed(views):
+        start = trip.get("start_date") or "日期未记录"
+        end = trip.get("end_date") or ""
+        dates = f"{start} ~ {end}" if end and end != start else str(start)
+        route = f"{trip.get('origin') or '—'} → {trip.get('destination') or '—'}"
+        marks = []
+        state = trip_state_label(trip)
+        if state:
+            marks.append(f"[{state}]")
+        conflicts = trip.get("conflicts") or []
+        if conflicts:
+            routes = "、".join(
+                f"{item.get('origin') or '—'} → {item.get('destination') or '—'}"
+                for item in conflicts
+            )
+            marks.append(f"⚠ 与 {routes} 日期重叠")
+        purpose = trip.get("purpose") or "出行"
+        line = f"  {dates}  {route}  {' '.join(marks)}".rstrip()
+        print(f"{line}  {purpose}")
+    return 0
+
+
 def _parse_export_args(
     args: list[str],
 ) -> tuple[str | None, bool, bool] | None:
@@ -1599,6 +1657,11 @@ def main():
                 print("用法：python cli.py kb-delete <id>")
                 sys.exit(2)
             sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
+        if arg == "trips":
+            if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
+                print("用法：python cli.py trips <user_id>")
+                sys.exit(2)
+            sys.exit(run_trips_list_standalone(sys.argv[2]))
         if arg == "trips-dedupe":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py trips-dedupe <user_id> [--dry-run]")

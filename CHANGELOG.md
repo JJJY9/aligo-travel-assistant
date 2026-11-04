@@ -17,6 +17,7 @@
 - 会话置顶：侧栏图钉按钮置顶 / 取消置顶（`PUT /api/sessions/{id}/pin`），置顶会话进入「置顶」分组并优先展示，JSON / PostgreSQL 持久化
 - 会话归档：侧栏会话操作新增「归档」，归档后从默认列表隐藏但消息保留；侧栏「已归档（N）」切换到归档列表，可恢复或删除；普通视图搜索时显示「另有 N 条归档会话匹配」并可直接切换；`PUT /api/sessions/{id}/archive`、`GET /api/sessions?archived=true`，`/api/status` 返回 `archived_count`
 - CLI 行程导出：`python cli.py trips-export <user_id> [path] [--stdout] [--force]`（默认 `exports/aligo_trips.csv`，CSV 渲染与 Web 共用 `utils/trip_export.py`）
+- CLI 行程列表：`python cli.py trips <user_id>` 按新→旧列出全部行程，标注「进行中 / 即将出行 / 已结束」与日期重叠提示；日期解析 / 重叠判断抽到 `utils/trip_conflicts.py`，Web 与 CLI 共用
 - CLI 会话管理：`python cli.py sessions <user_id> [--archived|--all]` 列出会话（置顶优先，显示消息数与最近更新时间），`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复，`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown；PostgreSQL 回退本地 JSON 时拒绝执行
 - 会话列表分页：`GET /api/sessions` 支持 `offset` 并返回 `total`，侧栏超过一页时显示「加载更多会话（已显示 X / 共 Y）」
 - 侧栏「即将出行」卡片：根据行程日期展示最近一次即将开始的行程（路线 / 日期 / 目的），点击回到对应对话（无关联会话时打开记忆面板）
@@ -183,6 +184,7 @@
 - CI 增加 wheel 打包检查（Python 3.12 job：`python -m build --wheel`，提前发现 pyproject / 包数据问题）
 - 新增写盘失败不可重试、偏好写盘失败映射 503、损坏文件并发写入不被误移、含 `@` 密码脱敏用例；分块请求体超限 413 与小请求放行、IP 桶额度头、锁表占满共享兜底锁用例；RAG Agent 严格检索（未初始化抛错）用例
 - 新增记忆文件为合法 JSON 非对象 / 结构异常时的备份重建、`/api/trips` 倒序分页用例；并发写入用例改为断言新偏好被真正加载
+- 新增 CLI `trips` 用例（列表输出 / 状态 / 重叠 / 空列表 / 读取与打开失败 / 非法用户 / 严格参数）与行程日期工具用例
 
 ## [1.3.0] - 2026-11-03
 
