@@ -14,6 +14,7 @@
 - 接口观测与限流：`/api/` 响应携带 `X-Request-ID`（透传或自动生成），请求日志包含方法 / 状态 / 耗时；对话接口默认按「客户端 + 用户」限流 30 次/分钟（429 + `Retry-After`，可用 `CHAT_RATE_LIMIT` / `CHAT_RATE_WINDOW_SEC` 调整）
 - 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 20 路径、平均与最大耗时、熔断器状态与缓存会话数（路径基数上限 100，超出归入 `__other__`；控制字符清理）
 - 记忆面板「运行指标」区块：请求总数 / 平均与最大耗时 / 熔断器状态 / 运行时长与缓存会话（数据来自 `/api/metrics`）
+- 全部会话导出：`GET /api/sessions/export` 把全部会话渲染为单个 Markdown（按最近更新排序，含归档会话；无标题时用首条提问），记忆面板新增「导出全部会话」按钮
 - 跟进建议：回答完成后根据本轮执行的智能体推荐 2–3 个下一步操作（导出行程 / 查出发当天天气 / 调整行程等），点击直接继续对话
 - 会话重命名：侧栏内联编辑标题（`PUT /api/sessions/{id}/title`），JSON / PostgreSQL 持久化；自定义标题参与搜索，空标题恢复自动标题
 - 会话置顶：侧栏图钉按钮置顶 / 取消置顶（`PUT /api/sessions/{id}/pin`），置顶会话进入「置顶」分组并优先展示，JSON / PostgreSQL 持久化
@@ -260,6 +261,7 @@
 - 新增 `tests/test_cli_interactive.py`（EOF / 主循环 EOF / UTF-8 管道 / 富文本转义 / 非标准行程 / 快照刷新 / 嵌套偏好）与超过 16384 条的 `next_entity_id` 分页用例；偏好追加补列表值用例
 - 新增 `tests/test_metrics.py`（计数 / 状态 / 耗时 / 路径基数上限 / 控制字符 / 重置）与 `/api/metrics` 接口用例
 - 新增 `tests/test_skill_agents.py`（天气城市提取 / 时区 / 搜索摘要防注入 / 共享提问提取 / null 行程字段）与编排器「规划失败不入库 / 技能目录名规范化」用例
+- 新增 `tests/test_session_markdown.py` 与 `/api/sessions/export` 接口用例（全部会话 / 归档 / 404 / 503 / 静态路由不被动态路由捕获）
 
 ## [1.3.0] - 2026-11-03
 

@@ -135,6 +135,7 @@ const els = {
   saveUser: byId("saveUser"),
   exportData: byId("exportData"),
   exportDataMd: byId("exportDataMd"),
+  exportSessions: byId("exportSessions"),
   overview: byId("overview"),
   addPrefBtn: byId("addPrefBtn"),
   prefForm: byId("prefForm"),
@@ -3612,6 +3613,12 @@ function bindEvents() {
   els.exportDataMd.addEventListener("click", () => {
     window.open(
       `/api/export?user_id=${encodeURIComponent(state.userId)}&format=md`,
+      "_blank",
+    );
+  });
+  els.exportSessions.addEventListener("click", () => {
+    window.open(
+      `/api/sessions/export?user_id=${encodeURIComponent(state.userId)}`,
       "_blank",
     );
   });

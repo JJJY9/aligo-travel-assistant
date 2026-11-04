@@ -68,6 +68,7 @@ from utils.knowledge_stats import knowledge_status
 from utils.metrics import REQUEST_METRICS
 from utils.rate_limit import RateLimiter
 from utils.stored_message import render_stored_message
+from utils.session_markdown import render_all_sessions_markdown
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
@@ -1354,6 +1355,32 @@ def create_app(model: Any = None) -> FastAPI:
             "archived": archived,
             "archived_count": _archived_count(data),
         }
+
+    @app.get("/api/sessions/export")
+    def export_sessions(user_id: str = Query(..., pattern=_ID_PATTERN)) -> Response:
+        """导出全部会话为单个 Markdown 文件（按最近更新排序，含归档会话）。
+
+        必须声明在 ``/api/sessions/{session_id}`` 之前，否则会被动态路由捕获。
+        """
+        store = _open_long_term(user_id)
+        try:
+            messages = store.get_chat_history()
+            titles = store.get_session_titles()
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("导出全部会话失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
+        finally:
+            _close_long_term(store)
+        if not messages:
+            raise HTTPException(status_code=404, detail="没有可导出的会话")
+        markdown, count = render_all_sessions_markdown(user_id, messages, titles)
+        filename = f"aligo_sessions_{_safe_filename(user_id, 'user')}.md"
+        logger.info("Exported %s sessions for %s", count, user_id)
+        return Response(
+            content=markdown,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.get("/api/sessions/{session_id}")
     def get_session_messages(
