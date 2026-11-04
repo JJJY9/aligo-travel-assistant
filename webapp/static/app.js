@@ -2204,6 +2204,15 @@ function renderOverview() {
     chip.textContent = text;
     els.storageChips.appendChild(chip);
   });
+  const fallback =
+    (storage.short_term_configured && storage.short_term !== "redis") ||
+    (storage.long_term_configured && storage.long_term !== "postgres");
+  if (fallback) {
+    const warn = document.createElement("span");
+    warn.className = "badge err";
+    warn.textContent = "已配置的后端暂不可用 · 已回退本地";
+    els.storageChips.appendChild(warn);
+  }
 
   const usage = status.usage || {};
   const usageTiles = [
