@@ -484,6 +484,8 @@ python cli.py
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id>` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），可清理去重功能上线前已存在的重复记录；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
+会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部；`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复会话。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
+
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
 
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。

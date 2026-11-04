@@ -1190,6 +1190,168 @@ def run_trips_dedupe_standalone(user_id: str) -> int:
             close()
 
 
+def _open_cli_store(user_id: str):
+    """打开长期记忆；PostgreSQL 配置错误回退 JSON 时拒绝执行维护命令。"""
+    from config import STORAGE_CONFIG
+    from context.long_term_memory import LongTermMemory
+    from context.storage import create_long_term_memory
+
+    store = create_long_term_memory(user_id, "data/memory")
+    if STORAGE_CONFIG.get("postgres_dsn") and isinstance(store, LongTermMemory):
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        raise RuntimeError(
+            "PostgreSQL 已配置但连接失败（已回退本地 JSON），请检查数据库后重试"
+        )
+    return store
+
+
+def _session_summaries(store) -> list[dict]:
+    """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。"""
+    history = store.get_chat_history()
+    titles = store.get_session_titles() or {}
+    pinned = {str(item) for item in (store.get_pinned_sessions() or [])}
+    archived = {str(item) for item in (store.get_archived_sessions() or [])}
+    grouped: dict[str, dict] = {}
+    for message in history:
+        session_id = message.get("session_id")
+        if not session_id:
+            continue
+        sid = str(session_id)
+        entry = grouped.setdefault(
+            sid,
+            {"session_id": sid, "title": "", "messages": 0, "updated_at": ""},
+        )
+        entry["messages"] += 1
+        timestamp = str(message.get("timestamp") or "")
+        if timestamp:
+            entry["updated_at"] = timestamp
+        if not entry["title"] and message.get("role") == "user":
+            title = " ".join(str(message.get("content", "")).split())
+            if title:
+                entry["title"] = title[:40]
+    for entry in grouped.values():
+        entry["title"] = str(
+            titles.get(entry["session_id"]) or entry["title"] or "新对话"
+        )
+        entry["pinned"] = entry["session_id"] in pinned
+        entry["archived"] = entry["session_id"] in archived
+    return sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
+
+
+def run_sessions_list_standalone(
+    user_id: str, archived_only: bool = False, include_all: bool = False
+) -> int:
+    """列出用户会话（用于 `python cli.py sessions <user_id> [--archived|--all]`）。
+
+    Returns:
+        0 列出成功（含无会话）；1 参数 / 读取失败
+    """
+    import re
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            summaries = _session_summaries(store)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取会话失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    archived_total = sum(1 for item in summaries if item["archived"])
+    if include_all:
+        visible = summaries
+        scope = "全部"
+    elif archived_only:
+        visible = [item for item in summaries if item["archived"]]
+        scope = "归档"
+    else:
+        visible = [item for item in summaries if not item["archived"]]
+        scope = "未归档"
+        # 与 Web 侧栏一致：置顶会话排在前面
+        visible.sort(key=lambda item: not item["pinned"])
+
+    if not visible:
+        print(
+            f"用户 {user_id}：没有{scope}会话"
+            f"（共 {len(summaries)} 个，归档 {archived_total} 个）"
+        )
+        return 0
+
+    print(
+        f"用户 {user_id}：{len(visible)} 个{scope}会话"
+        f"（共 {len(summaries)} 个，归档 {archived_total} 个）"
+    )
+    for item in visible:
+        if item["archived"]:
+            status = "归档"
+        elif item["pinned"]:
+            status = "置顶"
+        else:
+            status = "—"
+        updated = item["updated_at"][:19].replace("T", " ") or "—"
+        title = item["title"][:30]
+        print(
+            f"  [{status}] {item['session_id']:<16} {title:<32}"
+            f" {item['messages']:>3} 条  {updated}"
+        )
+    return 0
+
+
+def run_session_archive_standalone(
+    user_id: str, session_id: str, archived: bool = True
+) -> int:
+    """归档 / 恢复一个会话（用于 `python cli.py session-archive <user> <session> [--restore]`）。
+
+    Returns:
+        0 操作成功；1 参数 / 读取 / 写入失败
+    """
+    import re
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    if not re.fullmatch(r"[\w-]{1,64}", session_id):
+        print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            exists = bool(store.get_chat_history(session_id=session_id))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取会话失败：{exc}")
+            return 1
+        if not exists:
+            print(f"会话 {session_id} 不存在或没有消息")
+            return 1
+        try:
+            store.set_session_archived(session_id, archived)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"操作失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+    print(f"已{'归档' if archived else '恢复'}会话 {session_id}")
+    return 0
+
+
 def main():
     """主函数"""
     configure_stdio()
@@ -1223,6 +1385,32 @@ def main():
                 print("用法：python cli.py trips-dedupe <user_id>")
                 sys.exit(2)
             sys.exit(run_trips_dedupe_standalone(sys.argv[2]))
+        if arg == "sessions":
+            if len(sys.argv) < 3:
+                print("用法：python cli.py sessions <user_id> [--archived|--all]")
+                sys.exit(2)
+            flags = {item.lower() for item in sys.argv[3:]}
+            sys.exit(
+                run_sessions_list_standalone(
+                    sys.argv[2],
+                    archived_only="--archived" in flags,
+                    include_all="--all" in flags,
+                )
+            )
+        if arg == "session-archive":
+            if len(sys.argv) < 4:
+                print(
+                    "用法：python cli.py session-archive <user_id> <session_id> [--restore]"
+                )
+                sys.exit(2)
+            flags = {item.lower() for item in sys.argv[4:]}
+            sys.exit(
+                run_session_archive_standalone(
+                    sys.argv[2],
+                    sys.argv[3],
+                    archived="--restore" not in flags,
+                )
+            )
     cli = AligoCLI()
     asyncio.run(cli.run())
 
