@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import csv
 import hashlib
+import io
 import json
 import logging
 import math
@@ -1514,6 +1516,35 @@ def create_app(model: Any = None) -> FastAPI:
             content=_build_trips_ics(trips, user_id),
             media_type="text/calendar; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="aligo_trips.ics"'},
+        )
+
+    @app.get("/api/trips/export")
+    def export_trips_csv(
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> Response:
+        """导出全部历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）。"""
+        store = _open_long_term(user_id)
+        try:
+            trips = store.get_trip_history(limit=None)
+        finally:
+            _close_long_term(store)
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["出发地", "目的地", "出发日期", "返程日期", "目的"])
+        for trip in trips:
+            writer.writerow(
+                [
+                    trip.get("origin") or "",
+                    trip.get("destination") or "",
+                    trip.get("start_date") or "",
+                    trip.get("end_date") or "",
+                    trip.get("purpose") or "",
+                ]
+            )
+        return Response(
+            content="\ufeff" + buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="aligo_trips.csv"'},
         )
 
     @app.get("/api/trips/{trip_id}/calendar")
