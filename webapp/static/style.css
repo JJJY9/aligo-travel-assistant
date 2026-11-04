@@ -8,11 +8,11 @@
   --surface-2: #f6f8f7;
   --ink: #14262e;
   --ink-2: #40555e;
-  --ink-3: #7b8d93;
+  --ink-3: #5f727a;
   --line: #e2e9e8;
   --line-strong: #cfdad9;
-  --accent: #d9552c;
-  --accent-strong: #bf4520;
+  --accent: #c44720;
+  --accent-strong: #b83f1c;
   --accent-soft: #fbe9e2;
   --teal: #0f6f69;
   --teal-soft: #e0f0ee;
@@ -229,7 +229,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 .upcoming.ongoing { border-color: rgba(82, 183, 174, 0.42); background: rgba(82, 183, 174, 0.14); }
 .upcoming.ongoing:hover { background: rgba(82, 183, 174, 0.22); }
 .upcoming.ongoing .upcoming-label { color: #6cc9c0; }
-.upcoming-label { display: block; font-size: 10.5px; color: var(--accent); }
+.upcoming-label { display: block; font-size: 10.5px; color: #ff8259; }
 .upcoming-route {
   display: block;
   margin-top: 1px;

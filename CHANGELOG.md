@@ -61,6 +61,7 @@
 - 安全响应头：CSP（仅同源脚本）/ `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy`；主题初始化拆分为 `/static/theme.js` 以满足 CSP
 
 ### 变更
+- 浅色主题可读性：次要文字（`--ink-3`）与信号橙调整到 WCAG AA 对比度（≥4.5:1），侧栏「即将出行」标签改用更亮的橙色
 - 记忆面板存储状态在「已配置 Redis / PostgreSQL 但当前回退本地」时显示红色提示，避免误以为数据写入了远端后端
 - Redis 短期记忆键改为 `aligo:session:{user_id}:{session_id}:messages`（用户级隔离；删除会话时同时清理旧格式键）；未缓存会话的「删除最后一轮」也会清理 Redis，多用户复用同一 session_id 不再串上下文
 - 响应压缩：静态资源与 JSON 响应启用 gzip（≥1KB），`/api/chat/stream`（SSE）保持不压缩，避免缓冲破坏实时进度
