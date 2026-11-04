@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import csv
 import hashlib
-import io
 import json
 import logging
 import math
@@ -65,6 +63,7 @@ from utils.knowledge_admin import (
 from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
 from utils.stored_message import render_stored_message
+from utils.trip_export import render_trips_csv
 from utils.turn_meta import extract_turn_meta
 
 logger = logging.getLogger(__name__)
@@ -780,14 +779,6 @@ def _build_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
         if event is not None
     ]
     return _ics_calendar(events)
-
-
-def _csv_safe(value: object) -> str:
-    """防 CSV 公式注入：以 = + - @ 等开头的内容加前导单引号，Excel 按文本处理。"""
-    text = str(value or "")
-    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
-        return "'" + text
-    return text
 
 
 def _trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
@@ -1545,21 +1536,8 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
         finally:
             _close_long_term(store)
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-        writer.writerow(["出发地", "目的地", "出发日期", "返程日期", "目的"])
-        for trip in trips:
-            writer.writerow(
-                [
-                    _csv_safe(trip.get("origin")),
-                    _csv_safe(trip.get("destination")),
-                    trip.get("start_date") or "",
-                    trip.get("end_date") or "",
-                    _csv_safe(trip.get("purpose")),
-                ]
-            )
         return Response(
-            content="\ufeff" + buffer.getvalue(),
+            content=render_trips_csv(trips),
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="aligo_trips.csv"'},
         )

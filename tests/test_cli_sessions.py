@@ -348,18 +348,18 @@ def test_session_export_missing_and_invalid(monkeypatch):
 
 
 def test_session_export_flag_parsing():
-    assert cli._parse_session_export_args([]) == (None, False, False)
-    assert cli._parse_session_export_args(["out.md"]) == ("out.md", False, False)
-    assert cli._parse_session_export_args(["--stdout"]) == (None, True, False)
-    assert cli._parse_session_export_args(["--force"]) == (None, False, True)
-    assert cli._parse_session_export_args(["out.md", "--force"]) == (
+    assert cli._parse_export_args([]) == (None, False, False)
+    assert cli._parse_export_args(["out.md"]) == ("out.md", False, False)
+    assert cli._parse_export_args(["--stdout"]) == (None, True, False)
+    assert cli._parse_export_args(["--force"]) == (None, False, True)
+    assert cli._parse_export_args(["out.md", "--force"]) == (
         "out.md",
         False,
         True,
     )
-    assert cli._parse_session_export_args(["out.md", "--stdout"]) is None
-    assert cli._parse_session_export_args(["a.md", "b.md"]) is None
-    assert cli._parse_session_export_args(["--bad"]) is None
+    assert cli._parse_export_args(["out.md", "--stdout"]) is None
+    assert cli._parse_export_args(["a.md", "b.md"]) is None
+    assert cli._parse_export_args(["--bad"]) is None
     print("✓ session-export 参数解析（--stdout 与路径冲突被拒绝）")
 
 

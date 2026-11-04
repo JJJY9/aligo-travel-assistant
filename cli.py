@@ -1460,10 +1460,64 @@ def run_session_export_standalone(
     return 0
 
 
-def _parse_session_export_args(
+def run_trips_export_standalone(
+    user_id: str,
+    target: str | None = None,
+    to_stdout: bool = False,
+    force: bool = False,
+) -> int:
+    """导出全部行程为 CSV（`python cli.py trips-export <user_id> [path] [--stdout] [--force]`）。
+
+    Returns:
+        0 导出成功；1 参数 / 读取 / 写入失败
+    """
+    import re
+    from pathlib import Path
+
+    from utils.trip_export import render_trips_csv
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取行程失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    text = render_trips_csv(trips)
+    if to_stdout:
+        print(text, end="")
+        return 0
+
+    path = Path(target) if target else Path("exports") / "aligo_trips.csv"
+    if path.exists() and not force:
+        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+        return 1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        print(f"写入失败：{exc}")
+        return 1
+    print(f"已导出 {len(trips)} 条行程到 {path}")
+    return 0
+
+
+def _parse_export_args(
     args: list[str],
 ) -> tuple[str | None, bool, bool] | None:
-    """解析 session-export 的 [path] [--stdout] [--force]；冲突 / 未知参数返回 None。"""
+    """解析导出命令的 [path] [--stdout] [--force]；冲突 / 未知参数返回 None。"""
     to_stdout = False
     force = False
     paths: list[str] = []
@@ -1564,7 +1618,7 @@ def main():
                     "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            parsed_export = _parse_session_export_args(sys.argv[4:])
+            parsed_export = _parse_export_args(sys.argv[4:])
             if parsed_export is None:
                 print(
                     "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force]"
@@ -1575,6 +1629,27 @@ def main():
                 run_session_export_standalone(
                     sys.argv[2],
                     sys.argv[3],
+                    target=target,
+                    to_stdout=to_stdout,
+                    force=force,
+                )
+            )
+        if arg == "trips-export":
+            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+                print(
+                    "用法：python cli.py trips-export <user_id> [path] [--stdout] [--force]"
+                )
+                sys.exit(2)
+            parsed_export = _parse_export_args(sys.argv[3:])
+            if parsed_export is None:
+                print(
+                    "用法：python cli.py trips-export <user_id> [path] [--stdout] [--force]"
+                )
+                sys.exit(2)
+            target, to_stdout, force = parsed_export
+            sys.exit(
+                run_trips_export_standalone(
+                    sys.argv[2],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
