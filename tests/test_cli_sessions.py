@@ -201,12 +201,82 @@ def test_pg_fallback_refused(monkeypatch):
     print("✓ PostgreSQL 回退时拒绝执行")
 
 
+def test_flag_parsing_helpers():
+    assert cli._parse_sessions_flags([]) == (False, False)
+    assert cli._parse_sessions_flags(["--archived"]) == (True, False)
+    assert cli._parse_sessions_flags(["--ALL"]) == (False, True)
+    assert cli._parse_sessions_flags(["--archived=true"]) is None
+    assert cli._parse_sessions_flags(["--archivd"]) is None
+    assert cli._parse_sessions_flags(["--archived", "--all"]) is None
+    assert cli._parse_archive_flags([]) is False
+    assert cli._parse_archive_flags(["--restore"]) is True
+    assert cli._parse_archive_flags(["--restore=1"]) is None
+    print("✓ 未知 / 冲突参数被拒绝（--restore=1 不会误归档）")
+
+
+def test_leading_hyphen_ids_rejected(monkeypatch):
+    called = {"n": 0}
+
+    def fake_factory(*args):
+        called["n"] += 1
+        return _FakeStore([])
+
+    monkeypatch.setattr(storage, "create_long_term_memory", fake_factory)
+    code, out = _run_list("--archived")
+    assert code == 1 and "用户 ID" in out
+    code, out = _run_archive("u1", "--restore")
+    assert code == 1 and "会话 ID" in out
+    assert called["n"] == 0, "以短横线开头的参数不应打开存储"
+    print("✓ 以短横线开头的 ID（疑似参数）被拒绝")
+
+
+def test_pg_healthy_store_passthrough(monkeypatch):
+    """配置了 PG 且返回健康 PG 存储时应正常执行，而不是一律拒绝。"""
+    from config import STORAGE_CONFIG
+    from context import long_term_memory as ltm
+
+    class _JsonCls:
+        pass
+
+    class _PgStore(_FakeStore):
+        pass
+
+    monkeypatch.setattr(ltm, "LongTermMemory", _JsonCls)
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://localhost/x")
+    fake = _PgStore(
+        [_message("user", "PG 会话", "pg-s1")],
+        archived=[],
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_list("u1")
+    assert code == 0 and "pg-s1" in out
+    assert fake.closed
+    print("✓ PostgreSQL 正常时正常执行（仅回退时拒绝）")
+
+
+def test_save_failure_reports_error(monkeypatch):
+    fake = _sessions_store()
+
+    def boom(session_id, archived):
+        raise OSError("长期记忆写入失败")
+
+    fake.set_session_archived = boom
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_archive("u1", "s-active", archived=True)
+    assert code == 1 and "操作失败" in out
+    print("✓ 存储写入失败返回 1")
+
+
 if __name__ == "__main__":
+    test_flag_parsing_helpers()
     for case in (
         test_lists_active_sessions,
         test_lists_archived_and_all,
         test_empty_sessions,
         test_invalid_user_id,
+        test_leading_hyphen_ids_rejected,
+        test_pg_healthy_store_passthrough,
+        test_save_failure_reports_error,
         test_archive_and_restore,
         test_archive_missing_session,
         test_read_failure,

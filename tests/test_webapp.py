@@ -1531,7 +1531,18 @@ def test_unhandled_error_returns_500_with_headers():
     assert response.headers["x-content-type-options"] == "nosniff"
     assert "content-security-policy" in response.headers
     assert "boom-1" in response.json()["detail"]
-    print("✓ 未处理异常返回 500 且带安全响应头 / 请求 ID")
+
+    # 客户端支持 gzip 时也必须有同样的安全头 / JSON 错误体
+    gzip_response = TestClient(app).get(
+        "/api/_boom",
+        headers={"X-Request-ID": "boom-2", "Accept-Encoding": "gzip"},
+    )
+    assert gzip_response.status_code == 500
+    assert gzip_response.headers["x-request-id"] == "boom-2"
+    assert gzip_response.headers["x-content-type-options"] == "nosniff"
+    assert "content-security-policy" in gzip_response.headers
+    assert "boom-2" in gzip_response.json()["detail"]
+    print("✓ 未处理异常返回 500 且带安全响应头 / 请求 ID（含 gzip 请求）")
 
 
 def test_export_markdown():

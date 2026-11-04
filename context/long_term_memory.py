@@ -472,7 +472,8 @@ class LongTermMemory:
             titles[session_id] = cleaned[:60]
         else:
             titles.pop(session_id, None)
-        self._save()
+        if not self._save():
+            raise OSError("长期记忆写入失败")
         logger.info(f"Set session title: {session_id} -> {cleaned or '(auto)'}")
 
     def get_session_titles(self) -> dict[str, str]:
@@ -487,7 +488,8 @@ class LongTermMemory:
             pinned_sessions.append(session_id)
         elif not pinned and session_id in pinned_sessions:
             pinned_sessions.remove(session_id)
-        self._save()
+        if not self._save():
+            raise OSError("长期记忆写入失败")
 
     def get_pinned_sessions(self) -> list[str]:
         """返回置顶会话 ID（按置顶时间先后）。"""
@@ -501,7 +503,8 @@ class LongTermMemory:
             archived_sessions.append(session_id)
         elif not archived and session_id in archived_sessions:
             archived_sessions.remove(session_id)
-        self._save()
+        if not self._save():
+            raise OSError("长期记忆写入失败")
         logger.info("Set session archived: %s -> %s", session_id, archived)
 
     def get_archived_sessions(self) -> list[str]:
