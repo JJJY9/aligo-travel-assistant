@@ -64,6 +64,7 @@ const state = {
   showArchived: false,
   archivedCount: 0,
   archivedMatches: 0,
+  sessionsLoading: false,
 };
 
 function isValidId(value) {
@@ -607,13 +608,7 @@ function startEditUserNode(node, originalText) {
     setBusy(true);
     let mismatch = false;
     try {
-      const result = await getJSON(
-        `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn?user_id=${encodeURIComponent(
-          state.userId,
-        )}&expect=${encodeURIComponent(originalText)}`,
-        { method: "DELETE" },
-      );
-      mismatch = Boolean(result && result.mismatch);
+      mismatch = await deleteLastTurn(originalText);
     } catch (error) {
       saving = false;
       input.dataset.saving = "0";
@@ -771,11 +766,33 @@ function formatUsage(usage, elapsed) {
   return parts.join(" · ");
 }
 
-function regenerate(node, text) {
+async function deleteLastTurn(expect) {
+  const result = await getJSON(
+    `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn?user_id=${encodeURIComponent(
+      state.userId,
+    )}&expect=${encodeURIComponent(expect)}`,
+    { method: "DELETE" },
+  );
+  return Boolean(result && result.mismatch);
+}
+
+async function regenerate(node, text) {
   if (state.busy) return;
   trimRegenButtons();
+  if (state.sessionId) {
+    // 先删除服务端上一轮，避免重新生成在历史里叠加重复问答
+    setBusy(true);
+    try {
+      await deleteLastTurn(text);
+    } catch (error) {
+      setBusy(false);
+      toast(`重新生成失败：${error.message}`);
+      return;
+    }
+    setBusy(false);
+  }
   node.remove();
-  sendMessage(text, { echo: false });
+  await sendMessage(text, { echo: false });
 }
 
 function trimRegenButtons() {
@@ -1531,6 +1548,7 @@ function updateArchivedToggle(count) {
 async function loadSessions(query = state.searchQuery, options = {}) {
   state.searchQuery = String(query || "").trim();
   const requestId = (sessionsRequestId += 1);
+  state.sessionsLoading = true;
   // 重置（搜索 / 切换用户）取第一页；其它刷新（重命名 / 置顶 / 删除）
   // 保留用户已经「加载更多」展开的数量
   const limit = options.reset
@@ -1574,11 +1592,17 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     state.sessions = [];
     state.sessionTotal = 0;
   }
+  if (requestId !== sessionsRequestId) return;
+  state.sessionsLoading = false;
   state.archivedMatches = archivedMatches;
   renderHistory();
 }
 
 async function loadMoreSessions() {
+  // 视图切换 / 新搜索的第一页仍在加载时，旧列表的 offset 不能用于新查询
+  if (state.sessionsLoading) return;
+  const viewQuery = state.searchQuery;
+  const viewArchived = state.showArchived;
   const requestId = (sessionsRequestId += 1);
   const params = new URLSearchParams({
     user_id: state.userId,
@@ -1590,6 +1614,7 @@ async function loadMoreSessions() {
   try {
     const data = await getJSON(`/api/sessions?${params}`);
     if (requestId !== sessionsRequestId) return;
+    if (viewQuery !== state.searchQuery || viewArchived !== state.showArchived) return;
     const seen = new Set(state.sessions.map((session) => session.session_id));
     for (const session of data.sessions || []) {
       if (!seen.has(session.session_id)) {
@@ -1730,6 +1755,10 @@ function startRenameSession(item, session) {
 }
 
 async function deleteSession(sessionId) {
+  if (state.busy) {
+    toast("请等待当前回复完成");
+    return;
+  }
   if (!window.confirm("删除这个会话？聊天记录会从长期记忆中移除。")) return;
   try {
     await getJSON(
@@ -1877,6 +1906,17 @@ function handleStreamEvent(assistant, event) {
         ),
       );
       break;
+    case "session": {
+      if (event.session_id) {
+        state.sessionId = event.session_id;
+        sessionStorage.setItem("aligo.sessionId", event.session_id);
+        syncSessionControls();
+        if (els.convTitle.textContent === "新对话") {
+          setConversationTitle(clampText(state.lastUserText, 40));
+        }
+      }
+      break;
+    }
     case "done": {
       if (event.session_id) {
         state.sessionId = event.session_id;
@@ -3015,6 +3055,10 @@ function closeShortcuts() {
 }
 
 async function saveUser() {
+  if (state.busy) {
+    toast("请等待当前回复完成");
+    return;
+  }
   const value = els.userIdInput.value.trim() || "web_user";
   if (!isValidId(value)) {
     toast("用户 ID 只能包含中文、字母、数字、下划线和短横线");
@@ -3041,6 +3085,10 @@ async function saveUser() {
     state.showArchived = false;
     state.archivedCount = 0;
     updateArchivedToggle(0);
+    // 清掉上一个用户遗留的行程 / 知识编辑状态，避免提交到新用户
+    resetTripForm();
+    els.tripForm.hidden = true;
+    resetKnowledgeForm();
     await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
