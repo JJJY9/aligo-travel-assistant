@@ -1908,6 +1908,7 @@ function renderOverview() {
     els.destinations.innerHTML = "";
     els.upcoming.hidden = true;
     els.exportTrips.hidden = true;
+    els.exportTripsCsv.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
     els.usageAgents.innerHTML = "";

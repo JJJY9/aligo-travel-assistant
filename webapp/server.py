@@ -782,6 +782,14 @@ def _build_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
     return _ics_calendar(events)
 
 
+def _csv_safe(value: object) -> str:
+    """防 CSV 公式注入：以 = + - @ 等开头的内容加前导单引号，Excel 按文本处理。"""
+    text = str(value or "")
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
+
+
 def _trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
     """行程的日期区间（含首尾）；缺少或无法解析出发日期时返回 None。"""
     try:
@@ -1534,11 +1542,11 @@ def create_app(model: Any = None) -> FastAPI:
         for trip in trips:
             writer.writerow(
                 [
-                    trip.get("origin") or "",
-                    trip.get("destination") or "",
+                    _csv_safe(trip.get("origin")),
+                    _csv_safe(trip.get("destination")),
                     trip.get("start_date") or "",
                     trip.get("end_date") or "",
-                    trip.get("purpose") or "",
+                    _csv_safe(trip.get("purpose")),
                 ]
             )
         return Response(
