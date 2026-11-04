@@ -1099,13 +1099,14 @@ def run_knowledge_delete_standalone(doc_id: int) -> int:
     return 0
 
 
-def run_trips_dedupe_standalone(user_id: str) -> int:
-    """清理历史行程中的完全重复记录（用于 `python cli.py trips-dedupe <user_id>`）。
+def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
+    """清理历史行程中的完全重复记录（用于 `python cli.py trips-dedupe <user_id> [--dry-run]`）。
 
     同路线 + 同起止日期视为重复：保留最早一条，删除其余记录（统计同步更新）。
+    ``dry_run`` 仅列出将被删除的记录，不做修改。
 
     Returns:
-        0 清理完成（含无重复）；1 参数 / 读取 / 删除失败
+        0 清理完成（含无重复 / dry-run）；1 参数 / 读取 / 删除失败
     """
     import re
 
@@ -1170,6 +1171,29 @@ def run_trips_dedupe_standalone(user_id: str) -> int:
             for trip_id in ids[1:]
             if ids[0] in fresh_ids
         ]
+
+        if dry_run:
+            if not duplicates:
+                print(f"用户 {user_id}：没有需要删除的重复行程（共 {len(trips)} 条）")
+                return 0
+            by_id = {str(trip.get("trip_id") or ""): trip for trip in trips}
+            print(
+                f"用户 {user_id}：发现 {len(duplicates)} 条重复行程（--dry-run，不删除）："
+            )
+            for trip_id in duplicates:
+                trip = by_id.get(trip_id, {})
+                route = f"{trip.get('origin') or '—'} → {trip.get('destination') or '—'}"
+                dates = (
+                    " ~ ".join(
+                        part
+                        for part in (trip.get("start_date"), trip.get("end_date"))
+                        if part
+                    )
+                    or "日期未记录"
+                )
+                print(f"  将删除 {trip_id}（{route}，{dates}）")
+            print("去掉 --dry-run 即可执行删除")
+            return 0
 
         removed = 0
         try:
@@ -1565,10 +1589,18 @@ def main():
                 sys.exit(2)
             sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
         if arg == "trips-dedupe":
-            if len(sys.argv) < 3:
-                print("用法：python cli.py trips-dedupe <user_id>")
+            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+                print("用法：python cli.py trips-dedupe <user_id> [--dry-run]")
                 sys.exit(2)
-            sys.exit(run_trips_dedupe_standalone(sys.argv[2]))
+            flags = [item.lower() for item in sys.argv[3:]]
+            if any(flag != "--dry-run" for flag in flags):
+                print("用法：python cli.py trips-dedupe <user_id> [--dry-run]")
+                sys.exit(2)
+            sys.exit(
+                run_trips_dedupe_standalone(
+                    sys.argv[2], dry_run="--dry-run" in flags
+                )
+            )
         if arg == "sessions":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py sessions <user_id> [--archived|--all]")
