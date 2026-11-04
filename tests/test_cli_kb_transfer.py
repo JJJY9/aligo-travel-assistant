@@ -55,6 +55,56 @@ def test_export_writes_json(monkeypatch):
     print("✓ kb-export 写入 JSON（自动创建目录）")
 
 
+def test_export_refuses_overwrite_without_force(monkeypatch):
+    """kb-export 默认不覆盖已有文件（与 trips-export / session-export 一致）。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "export_documents",
+        lambda: [{"content": "住宿标准", "metadata": {"category": "住宿"}}],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "keep.json"
+        target.write_text('{"keep": true}', encoding="utf-8")
+        code, out = _capture(cli.run_knowledge_export_standalone, str(target))
+        assert code == 1 and "文件已存在" in out
+        assert json.loads(target.read_text(encoding="utf-8")) == {"keep": True}
+
+        code, out = _capture(
+            lambda path: cli.run_knowledge_export_standalone(path, force=True),
+            str(target),
+        )
+        assert code == 0 and "已导出 1 条知识片段" in out
+        assert "documents" in json.loads(target.read_text(encoding="utf-8"))
+    print("✓ kb-export 默认拒绝覆盖，--force 覆盖")
+
+
+def test_kb_export_dispatch_strict(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_export_standalone",
+        lambda target, force=False: calls.append((target, force)) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-export", "a.json", "--force"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls == [("a.json", True)]
+
+    for argv in (
+        ["cli.py", "kb-export", "--unknown"],
+        ["cli.py", "kb-export", "a.json", "b.json"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "用法：python cli.py kb-export [path] [--force]" in out.getvalue()
+    print("✓ kb-export 严格参数解析")
+
+
 def test_export_unavailable_or_failure(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
@@ -162,6 +212,8 @@ def test_import_large_file_not_capped(monkeypatch):
 if __name__ == "__main__":
     for case in (
         test_export_writes_json,
+        test_export_refuses_overwrite_without_force,
+        test_kb_export_dispatch_strict,
         test_export_unavailable_or_failure,
         test_import_success,
         test_import_plain_array,

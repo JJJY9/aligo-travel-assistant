@@ -119,6 +119,24 @@ def test_lists_archived_and_all(monkeypatch):
     print("✓ --archived / --all 视图正确过滤")
 
 
+def test_session_list_converts_utc_timestamps(monkeypatch):
+    """PostgreSQL 返回带时区的 UTC 时间，列表应按本地时区展示。"""
+    from datetime import datetime
+
+    fake = _FakeStore(
+        [_message("user", "问题", "s-utc", "2026-11-04T12:00:00+00:00")]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_list("u1")
+    expected = (
+        datetime.fromisoformat("2026-11-04T12:00:00+00:00")
+        .astimezone()
+        .strftime("%Y-%m-%d %H:%M")
+    )
+    assert code == 0 and expected in out
+    print("✓ UTC 时间戳按本地时区展示")
+
+
 def test_empty_sessions(monkeypatch):
     fake = _FakeStore([])
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
@@ -431,6 +449,7 @@ if __name__ == "__main__":
     test_main_rejects_bad_usage(pytest.MonkeyPatch())
     for case in (
         test_lists_active_sessions,
+        test_session_list_converts_utc_timestamps,
         test_lists_archived_and_all,
         test_empty_sessions,
         test_invalid_user_id,
