@@ -1598,6 +1598,20 @@ def test_security_headers():
     print("✓ 安全响应头（CSP / nosniff / frame / referrer）")
 
 
+def test_lock_table_is_bounded():
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    original = state.max_locks
+    state.max_locks = 10
+    try:
+        for index in range(50):
+            state.lock_for(f"lock-user-{index}")
+        assert len(state.locks) <= 10, "用户锁表应有上限"
+    finally:
+        state.max_locks = original
+    print("✓ 用户锁表有上限（未持有的旧锁被淘汰）")
+
+
 def test_request_body_too_large():
     client = _client()
     response = client.post(
@@ -2330,6 +2344,7 @@ if __name__ == "__main__":
     test_session_lru_eviction()
     test_request_id_header()
     test_security_headers()
+    test_lock_table_is_bounded()
     test_request_body_too_large()
     test_gzip_compression_excludes_sse()
     test_docs_csp_allows_cdn()

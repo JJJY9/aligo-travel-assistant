@@ -73,6 +73,7 @@
 - 写入行程时按现有最大 `trip_N` 序号递增（此前按条数生成，配合删除功能会与已有行程 id 冲突）
 
 ### 修复
+- 用户锁表增加上限（1000，淘汰未持有的旧锁），避免轮换用户 ID 造成内存持续增长
 - 安全加固：sdist 排除本地知识库 / 模型 / 记忆 / 导出目录（`MANIFEST.in`），避免分享安装包时带出业务文档；请求体超过 2 MB 返回 413（带安全头 / 请求 ID）；`docker-compose.yml` 的 Redis / PostgreSQL 仅绑定 127.0.0.1；CSV 日期列同样做公式注入转义；偏好拒绝 NaN / Infinity（历史遗留值读取时归一为 None）；Redis URL 日志隐藏密码；关闭 uvicorn 自带 access log（避免查询串中的用户原文入日志）
 - JSON 长期记忆：偏好 / 消息 / 行程 / 删除等写盘失败统一抛 `OSError`（不再静默成功）；损坏的记忆文件先备份为 `.corrupt-<时间戳>` 再重建，避免直接覆盖
 - PostgreSQL 行程 `trip_id` 使用 advisory lock 串行生成，并尝试建立 `(user_id, trip_id)` 唯一索引（历史重复时跳过建索引）
