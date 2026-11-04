@@ -6,7 +6,7 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
-> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance and JSON export/import, parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history & search, memory/usage panel, trip management with calendar export, knowledge maintenance, self-diagnostics). Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
+> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance and JSON export/import, parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel, trip management with calendar export, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`sessions`, `session-archive`, `kb-*`, `trips-dedupe`, `eval`, `doctor`), and responses are gzip-compressed except SSE. Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
@@ -592,9 +592,9 @@ pytest tests/ -q
 | 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py`、`test_webapp_postgres.py`、`test_webapp_redis.py` |
 | 知识库维护与状态 | `test_knowledge_admin*.py`、`test_knowledge_stats.py` |
 | 检索评测与 CLI 退出码 | `test_rag_eval.py`、`test_cli_eval.py` |
-| CLI 知识库 / 行程命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py` |
+| CLI 知识库 / 行程 / 会话命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py`、`test_cli_sessions.py` |
 | Milvus 客户端 | `test_milvus_client.py` |
-| 偏好抽取 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_access_log.py`、`test_rate_limit.py`、`test_progress.py` 等 |
+| 偏好抽取 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_progress.py` 等 |
 
 ### 端到端测试（需要真实大模型）
 
