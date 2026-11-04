@@ -17,13 +17,15 @@
 | ![对话与执行路线](docs/screenshots/webui-answer-light.jpg) | ![深色模式](docs/screenshots/webui-answer-dark.jpg) |
 | **记忆与用量面板**（行程 / 统计 / 7 天趋势） | **欢迎页**（会话搜索 / 置顶） |
 | ![记忆与用量面板](docs/screenshots/webui-memory.jpg) | ![欢迎页](docs/screenshots/webui-welcome.jpg) |
+| **会话归档**（已归档视图 / 恢复） | **快捷键帮助**（按 `?` 打开） |
+| ![会话归档](docs/screenshots/webui-archive.jpg) | ![快捷键帮助](docs/screenshots/webui-shortcuts.jpg) |
 
 ![知识库维护：查看 / 新增 / 编辑 / 删除知识片段](docs/screenshots/webui-knowledge.jpg)
 
 *知识库维护：在记忆面板中查看、按分类筛选、新增、编辑、删除 RAG 知识片段，新增 / 编辑后立即可被检索。*
 
 界面为 **FastAPI + 无构建前端**（原生 HTML / CSS / JS，无需 Node），支持流式执行进度、
-会话搜索 / 重命名 / 置顶、记忆与用量面板、知识库维护、深浅主题与移动端布局，启动方式见「Web 界面」小节。
+会话搜索 / 重命名 / 置顶 / 归档、记忆与用量面板、知识库维护、深浅主题与移动端布局，启动方式见「Web 界面」小节。
 
 ## ✨ 核心亮点
 
