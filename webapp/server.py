@@ -665,6 +665,7 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     history = data.get("chat_history") or []
     stats = data.get("statistics") or {}
     usage = _usage_summary(history)
+    archived_ids = set(data.get("archived_sessions") or [])
     lines.extend(
         [
             "",
@@ -672,6 +673,7 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
             "",
             f"- 历史行程：{stats.get('total_trips', len(trips))}",
             f"- 对话消息：{stats.get('total_messages', len(history))}",
+            f"- 归档会话：{_archived_count(data)}",
             f"- 模型调用：{usage['calls']} 次，tokens {usage['total_tokens']}",
             "",
         ]
@@ -683,7 +685,10 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     lines.extend(["## 最近会话", ""])
     if sessions:
         for session in sessions:
-            lines.append(f"- {session['title']}（{session['message_count']} 条消息）")
+            suffix = "（已归档）" if session["session_id"] in archived_ids else ""
+            lines.append(
+                f"- {session['title']}（{session['message_count']} 条消息）{suffix}"
+            )
     else:
         lines.append("- （暂无）")
     lines.append("")

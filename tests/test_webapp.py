@@ -1572,6 +1572,10 @@ def test_export_markdown():
             "/api/chat",
             json={"message": "你好", "user_id": user_id, "session_id": "sess-md-export"},
         )
+        client.put(
+            "/api/sessions/sess-md-export/archive",
+            json={"user_id": user_id, "archived": True},
+        )
 
         response = client.get("/api/export", params={"user_id": user_id, "format": "md"})
         assert response.status_code == 200
@@ -1583,6 +1587,8 @@ def test_export_markdown():
         assert "budget_level：0" in text
         assert "北京 → 上海" in text
         assert "## 最近会话" in text and "你好" in text
+        assert "（已归档）" in text
+        assert "归档会话：1" in text
 
         invalid = client.get("/api/export", params={"user_id": user_id, "format": "pdf"})
         assert invalid.status_code == 422
