@@ -1053,6 +1053,15 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   .pref-actions { opacity: 1; }
 }
 
+.trip-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.trip-filter .kb-search { flex: 1; }
+.trip-filter .empty { flex: none; font-size: 12px; }
+
 .empty { font-size: 12.5px; color: var(--ink-3); }
 
 .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
