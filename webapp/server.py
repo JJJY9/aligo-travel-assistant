@@ -899,6 +899,30 @@ def _trip_conflicts(
     return conflicts
 
 
+def _trips_with_conflicts(
+    trips: list[dict[str, Any]],
+    context: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """给每条行程附加与 context（默认自身）中其它行程的日期重叠信息。"""
+    pool = context if context is not None else trips
+    intervals = [(trip, _trip_interval(trip)) for trip in pool]
+    views: list[dict[str, Any]] = []
+    for trip in trips:
+        interval = _trip_interval(trip)
+        conflicts: list[dict[str, Any]] = []
+        if interval is not None:
+            start_dt, end_dt = interval
+            for other, other_interval in intervals:
+                if other is trip or other_interval is None:
+                    continue
+                other_start, other_end = other_interval
+                if other_start <= end_dt and start_dt <= other_end:
+                    conflicts.append(other)
+            conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
+        views.append({**trip, "conflicts": conflicts})
+    return views
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -1129,23 +1153,9 @@ def create_app(model: Any = None) -> FastAPI:
         else:
             featured_trip = None
         # 最近 5 条行程附带与其它行程的日期重叠信息（列表用徽标提示）
-        intervals = [
-            (trip, _trip_interval(trip)) for trip in data["trip_history"]
-        ]
-        trips_view: list[dict[str, Any]] = []
-        for trip in data["trip_history"][-5:]:
-            interval = _trip_interval(trip)
-            conflicts: list[dict[str, Any]] = []
-            if interval is not None:
-                start_dt, end_dt = interval
-                for other, other_interval in intervals:
-                    if other is trip or other_interval is None:
-                        continue
-                    other_start, other_end = other_interval
-                    if other_start <= end_dt and start_dt <= other_end:
-                        conflicts.append(other)
-                conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
-            trips_view.append({**trip, "conflicts": conflicts})
+        trips_view = _trips_with_conflicts(
+            data["trip_history"][-5:], data["trip_history"]
+        )
         return {
             "user_id": user_id,
             "preferences": preferences,
@@ -1512,6 +1522,30 @@ def create_app(model: Any = None) -> FastAPI:
                 **rate_headers,
             },
         )
+
+    @app.get("/api/trips")
+    def list_trips(
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        """列出历史行程（记录顺序，支持分页；附带日期重叠信息）。"""
+        store = _open_long_term(user_id)
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("列出历史行程失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"读取行程失败：{exc}") from exc
+        finally:
+            _close_long_term(store)
+        total = len(trips)
+        page = trips[offset : offset + limit]
+        return {
+            "trips": _trips_with_conflicts(page, trips),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
 
     @app.post("/api/trips", status_code=201)
     def create_trip(payload: TripPayload) -> dict[str, Any]:

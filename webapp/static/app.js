@@ -61,6 +61,9 @@ const state = {
   kbSaving: false,
   kbSemanticMode: false,
   tripEditingId: null,
+  tripsExpanded: false,
+  tripsAll: [],
+  tripsAllTotal: 0,
   sessionTotal: 0,
   showArchived: false,
   archivedCount: 0,
@@ -141,6 +144,7 @@ const els = {
   exportTrips: byId("exportTrips"),
   exportTripsCsv: byId("exportTripsCsv"),
   addTripBtn: byId("addTripBtn"),
+  expandTrips: byId("expandTrips"),
   tripForm: byId("tripForm"),
   tripOrigin: byId("tripOrigin"),
   tripDestination: byId("tripDestination"),
@@ -875,6 +879,28 @@ function triggerExport() {
     )}`,
     "_blank",
   );
+}
+
+async function toggleTripsExpanded() {
+  if (state.tripsExpanded) {
+    state.tripsExpanded = false;
+    renderOverview();
+    return;
+  }
+  els.expandTrips.disabled = true;
+  try {
+    const data = await getJSON(
+      `/api/trips?user_id=${encodeURIComponent(state.userId)}&limit=200`,
+    );
+    state.tripsAll = data.trips || [];
+    state.tripsAllTotal = Number(data.total || state.tripsAll.length);
+    state.tripsExpanded = true;
+    renderOverview();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    els.expandTrips.disabled = false;
+  }
 }
 
 function resetTripForm() {
@@ -1977,6 +2003,24 @@ async function refreshStatus() {
     // 丢弃过期响应：归档 / 切换用户后，旧请求可能晚到并覆盖新的归档计数
     if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = data;
+    if (state.tripsExpanded && Number(data.trip_count || 0) > 0) {
+      try {
+        const tripsData = await getJSON(
+          `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200`,
+        );
+        if (requestId !== statusRequestId || userId !== state.userId) return;
+        state.tripsAll = tripsData.trips || [];
+        state.tripsAllTotal = Number(tripsData.total || state.tripsAll.length);
+      } catch {
+        if (requestId !== statusRequestId || userId !== state.userId) return;
+        state.tripsAll = [];
+        state.tripsAllTotal = 0;
+      }
+    } else if (!data.trip_count) {
+      state.tripsExpanded = false;
+      state.tripsAll = [];
+      state.tripsAllTotal = 0;
+    }
   } catch {
     if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = null;
@@ -1994,6 +2038,7 @@ function renderOverview() {
     els.upcoming.hidden = true;
     els.exportTrips.hidden = true;
     els.exportTripsCsv.hidden = true;
+    els.expandTrips.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
     els.usageAgents.innerHTML = "";
@@ -2042,7 +2087,11 @@ function renderOverview() {
     });
   }
 
-  const trips = Array.isArray(status.trips) ? status.trips : [];
+  const trips = state.tripsExpanded
+    ? state.tripsAll
+    : Array.isArray(status.trips)
+      ? status.trips
+      : [];
   els.trips.innerHTML = "";
   if (!trips.length) {
     const empty = document.createElement("div");
@@ -2168,6 +2217,17 @@ function renderOverview() {
 
   els.exportTrips.hidden = !trips.length;
   els.exportTripsCsv.hidden = !trips.length;
+  const tripTotal = Number(status.trip_count || trips.length);
+  els.expandTrips.hidden = !state.tripsExpanded && tripTotal <= 5;
+  els.expandTrips.textContent = state.tripsExpanded
+    ? "收起全部"
+    : `查看全部（${tripTotal}）`;
+  if (state.tripsExpanded && state.tripsAllTotal > trips.length) {
+    const note = document.createElement("div");
+    note.className = "empty";
+    note.textContent = `仅显示最近 ${trips.length} 条（共 ${state.tripsAllTotal} 条）`;
+    els.trips.appendChild(note);
+  }
 
   const frequent = (status.statistics && status.statistics.frequent_destinations) || {};  const destinations = Object.entries(frequent)
     .sort((a, b) => Number(b[1]) - Number(a[1]))
@@ -3239,6 +3299,9 @@ async function saveUser() {
     els.tripForm.hidden = true;
     resetKnowledgeForm();
     resetPreferenceForm();
+    state.tripsExpanded = false;
+    state.tripsAll = [];
+    state.tripsAllTotal = 0;
     await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
@@ -3415,6 +3478,7 @@ function bindEvents() {
   els.prefForm.addEventListener("submit", addPreference);
   els.prefCancel.addEventListener("click", resetPreferenceForm);
 
+  els.expandTrips.addEventListener("click", toggleTripsExpanded);
   els.addTripBtn.addEventListener("click", () => {    if (els.tripForm.hidden) {
       resetTripForm();
       els.tripForm.hidden = false;
