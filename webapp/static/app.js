@@ -63,6 +63,7 @@ const state = {
   sessionTotal: 0,
   showArchived: false,
   archivedCount: 0,
+  archivedMatches: 0,
 };
 
 function isValidId(value) {
@@ -1416,6 +1417,21 @@ function renderHistoryItem(session) {
 
 function renderHistory() {
   els.history.innerHTML = "";
+
+  const appendArchivedHint = () => {
+    if (state.showArchived || state.archivedMatches <= 0) return;
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "history-more archived-hint";
+    hint.textContent = `另有 ${state.archivedMatches} 条归档会话匹配`;
+    hint.addEventListener("click", () => {
+      state.showArchived = true;
+      updateArchivedToggle();
+      loadSessions(state.searchQuery, { reset: true });
+    });
+    els.history.appendChild(hint);
+  };
+
   if (!state.sessions.length) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
@@ -1425,6 +1441,7 @@ function renderHistory() {
       empty.textContent = state.searchQuery ? "没有匹配的对话" : "还没有历史对话";
     }
     els.history.appendChild(empty);
+    appendArchivedHint();
     return;
   }
 
@@ -1462,6 +1479,7 @@ function renderHistory() {
     more.addEventListener("click", loadMoreSessions);
     els.history.appendChild(more);
   }
+  appendArchivedHint();
 }
 
 async function togglePin(session) {
@@ -1525,6 +1543,7 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   });
   if (state.searchQuery) params.set("q", state.searchQuery);
   if (state.showArchived) params.set("archived", "1");
+  let archivedMatches = 0;
   try {
     const data = await getJSON(`/api/sessions?${params}`);
     if (requestId !== sessionsRequestId) return;
@@ -1533,11 +1552,29 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     if (data.archived_count !== undefined) {
       updateArchivedToggle(Number(data.archived_count));
     }
+    // 普通视图搜索时提示归档会话中的匹配数量（不把归档内容混进主列表）
+    if (state.searchQuery && !state.showArchived) {
+      const archivedParams = new URLSearchParams({
+        user_id: state.userId,
+        limit: "1",
+        offset: "0",
+        archived: "1",
+        q: state.searchQuery,
+      });
+      try {
+        const archivedData = await getJSON(`/api/sessions?${archivedParams}`);
+        if (requestId !== sessionsRequestId) return;
+        archivedMatches = Number(archivedData.total || 0);
+      } catch {
+        archivedMatches = 0;
+      }
+    }
   } catch {
     if (requestId !== sessionsRequestId) return;
     state.sessions = [];
     state.sessionTotal = 0;
   }
+  state.archivedMatches = archivedMatches;
   renderHistory();
 }
 
