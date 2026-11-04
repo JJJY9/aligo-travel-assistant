@@ -784,7 +784,7 @@ aligo-travel-assistant/
 ### 已知限制
 - **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
-- **限流是进程内实现**：多实例部署时各实例独立计数，需替换为 Redis 等共享存储。
+- **限流与请求指标是进程内实现**：多实例部署时各实例独立计数 / 统计（`/api/metrics` 只反映当前进程），共享限流需替换为 Redis 等存储。
 - **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；但 CLI 与 Web 服务同时修改**同一用户**时仍是「后写覆盖先写」，演示时建议只保留一个写入端。
 - **存储后端故障回退**：配置的 PostgreSQL 连接失败时自动回退本地 JSON；故障期间新会话写入 JSON 的消息 / 偏好不会在恢复后自动合并到 PostgreSQL（文件保留在 `data/memory/`，恢复时日志会给出警告），需要时请手动迁移。
 - **Windows 文件名大小写不敏感**：用户 ID `Alice` 与 `alice` 会读写同一个 JSON 记忆文件；需要区分用户时请使用不同的名字。
