@@ -75,13 +75,24 @@ class AligoCLI:
 
         self.console.print(table)
 
+    def _prompt_user_id(self) -> str:
+        """交互式询问用户 ID，并按与 Web 相同的规则校验。"""
+        import re
+
+        while True:
+            value = (
+                Prompt.ask("用户ID", default="default_user").strip() or "default_user"
+            )
+            if re.fullmatch(r"[\w-]{1,64}", value) and not value.startswith("-"):
+                return value
+            self.console.print(
+                "[red]用户 ID 只能包含中文、字母、数字、下划线和短横线[/red]"
+            )
+
     async def initialize_system(self):
         """初始化系统 - 使用懒加载优化启动速度"""
         # 获取用户信息
-        self.user_id = Prompt.ask(
-            "用户ID",
-            default="default_user"
-        )
+        self.user_id = self._prompt_user_id()
 
         # 生成会话ID
         import uuid
