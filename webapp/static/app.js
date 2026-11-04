@@ -59,6 +59,7 @@ const state = {
   kbEditingId: null,
   kbEditingMetadata: {},
   kbSaving: false,
+  kbSemanticMode: false,
   tripEditingId: null,
   sessionTotal: 0,
   showArchived: false,
@@ -157,6 +158,7 @@ const els = {
   kbMore: byId("kbMore"),
   kbImport: byId("kbImport"),
   kbImportFile: byId("kbImportFile"),
+  kbSemantic: byId("kbSemantic"),
   kbForm: byId("kbForm"),
   kbContent: byId("kbContent"),
   kbCategory: byId("kbCategory"),
@@ -2627,6 +2629,7 @@ async function refreshKnowledgeCategories() {
 
 async function refreshKnowledgeDocuments() {
   if (!els.kbList) return;
+  state.kbSemanticMode = false;
   els.kbList.textContent = "加载中…";
   state.kbItems = [];
   state.kbTotal = 0;
@@ -2721,24 +2724,7 @@ function renderKnowledgeDocuments(items, append) {
       meta.textContent = metaText;
     }
     main.append(text, meta);
-
-    const actions = document.createElement("span");
-    actions.className = "pref-actions";
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.title = "编辑片段";
-    edit.setAttribute("aria-label", `编辑知识片段 ${doc.id}`);
-    edit.innerHTML = icon("edit");
-    edit.addEventListener("click", () => startEditKnowledge(doc));
-    const del = document.createElement("button");
-    del.type = "button";
-    del.title = "删除片段";
-    del.setAttribute("aria-label", `删除知识片段 ${doc.id}`);
-    del.innerHTML = icon("trash");
-    del.addEventListener("click", () => removeKnowledgeDocument(doc.id));
-    actions.append(edit, del);
-
-    row.append(main, actions);
+    row.append(main, knowledgeRowActions(doc));
     els.kbList.appendChild(row);
     state.kbItems.push(doc.id);
   }
@@ -2756,6 +2742,102 @@ function renderKnowledgeDocuments(items, append) {
   } else if (note) {
     note.remove();
   }
+}
+
+function knowledgeRowActions(doc) {
+  const actions = document.createElement("span");
+  actions.className = "pref-actions";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.title = "编辑片段";
+  edit.setAttribute("aria-label", `编辑知识片段 ${doc.id}`);
+  edit.innerHTML = icon("edit");
+  edit.addEventListener("click", () => startEditKnowledge(doc));
+  const del = document.createElement("button");
+  del.type = "button";
+  del.title = "删除片段";
+  del.setAttribute("aria-label", `删除知识片段 ${doc.id}`);
+  del.innerHTML = icon("trash");
+  del.addEventListener("click", () => removeKnowledgeDocument(doc.id));
+  actions.append(edit, del);
+  return actions;
+}
+
+async function runSemanticSearch() {
+  const query = els.kbSearch.value.trim();
+  if (!query) {
+    toast("请输入搜索内容");
+    return;
+  }
+  // 取消尚未触发的子串搜索刷新，避免它晚到后覆盖语义结果
+  clearTimeout(kbSearchTimer);
+  els.kbSemantic.disabled = true;
+  els.kbSemantic.textContent = "检索中…";
+  els.kbList.textContent = "语义检索中…（首次使用需加载向量模型）";
+  try {
+    const data = await getJSON(
+      `/api/knowledge/search?q=${encodeURIComponent(query)}&top_k=8`,
+    );
+    state.kbSemanticMode = true;
+    renderSemanticResults(query, data.results || []);
+  } catch (error) {
+    els.kbList.textContent = error.message;
+  } finally {
+    els.kbSemantic.disabled = false;
+    els.kbSemantic.textContent = "语义搜索";
+  }
+}
+
+function renderSemanticResults(query, results) {
+  els.kbList.innerHTML = "";
+  els.kbMore.hidden = true;
+  const note = document.createElement("p");
+  note.className = "kb-meta";
+  note.textContent = `语义检索「${query}」：${results.length} 条结果（按相似度排序）`;
+  els.kbList.appendChild(note);
+  if (!results.length) {
+    const empty = document.createElement("p");
+    empty.className = "kb-empty";
+    empty.textContent = "没有相关内容。";
+    els.kbList.appendChild(empty);
+  }
+  results.forEach((doc) => {
+    const row = document.createElement("div");
+    row.className = "pref-row kb-row";
+    row.dataset.id = String(doc.id);
+    const main = document.createElement("div");
+    main.className = "kb-main";
+    const text = document.createElement("div");
+    text.className = "kb-text";
+    const content = String(doc.content || "");
+    const preview =
+      content.length > 160 ? `${content.slice(0, 160)}…` : content;
+    text.innerHTML = highlightSnippet(preview, query);
+    const meta = document.createElement("div");
+    meta.className = "kb-meta";
+    const bits = [`#${doc.id}`];
+    if (doc.metadata && doc.metadata.category) {
+      bits.push(String(doc.metadata.category));
+    }
+    if (doc.metadata && doc.metadata.title) {
+      bits.push(String(doc.metadata.title));
+    }
+    bits.push(`相似度 ${Number(doc.distance || 0).toFixed(3)}`);
+    meta.textContent = bits.join(" · ");
+    main.append(text, meta);
+    row.append(main, knowledgeRowActions(doc));
+    els.kbList.appendChild(row);
+  });
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "kb-more ghost";
+  back.textContent = "返回全部片段";
+  back.addEventListener("click", () => {
+    els.kbSearch.value = "";
+    state.kbQuery = "";
+    refreshKnowledgeDocuments();
+  });
+  els.kbList.appendChild(back);
 }
 
 async function removeKnowledgeDocument(docId) {
@@ -3134,6 +3216,7 @@ function bindEvents() {
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
   els.kbCancel.addEventListener("click", () => resetKnowledgeForm());
+  els.kbSemantic.addEventListener("click", runSemanticSearch);
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
   els.kbSearch.addEventListener("input", () => {

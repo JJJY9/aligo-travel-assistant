@@ -45,7 +45,7 @@
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
-- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 200 条，Web 导入自动分批、CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
+- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 200 条，Web 导入自动分批、CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归
 
 ### ⚡ 优先级并行调度
@@ -550,6 +550,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
 | PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404） |
 | GET | `/api/knowledge/categories` | 知识片段分类统计（维护面板筛选下拉框） |
+| GET | `/api/knowledge/search` | 语义检索知识片段（`q` / `top_k`，返回相似度） |
 | DELETE | `/api/knowledge/documents/{id}` | 删除知识片段 |
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 200 条） |
@@ -791,8 +792,10 @@ aligo-travel-assistant/
 - [x] 完整实现PostgreSQL持久化存储（可选后端，`DATABASE_URL` 启用）
 - [x] 完整实现Redis短期记忆（可选后端，`REDIS_URL` 启用）
 - [x] Web 界面升级（SSE 流式执行进度、会话历史、深色模式；保持无构建前端）
-- [x] 知识库维护（Web / CLI 增删查、导出导入、离线检索评测）
-- [x] 行程管理（删除误记录、日历导出、重复保存自动去重）
+- [x] 会话管理（搜索 / 重命名 / 置顶 / 归档、分页、编辑重发、Markdown / HTML 导出）
+- [x] 知识库维护（Web / CLI 增删改查、分类筛选、导出导入、离线检索评测）
+- [x] 行程管理（删除误记录、手动补录 / 编辑、日历与 CSV 导出、重复保存自动去重）
+- [x] 性能与可观测性（gzip、JSON 访问日志、请求 ID、限流、系统自检）
 - [ ] 支持更多 LLM 服务商（OpenAI / Claude 兼容网关等，当前任意 OpenAI 兼容接口可用）
 - [ ] 回答逐 token 流式输出（依赖 agentscope 流式解析兼容性修复）
 - [ ] 多实例部署（共享限流 / 会话存储）

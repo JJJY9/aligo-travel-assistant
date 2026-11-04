@@ -59,6 +59,7 @@ from utils.knowledge_admin import (
     import_documents,
     list_categories,
     list_documents,
+    search_documents,
     update_document,
 )
 from utils.knowledge_stats import knowledge_status
@@ -898,6 +899,23 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 统一转为 503
             logger.warning("统计知识分类失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
+
+    @app.get("/api/knowledge/search")
+    def knowledge_search(
+        q: str = Query(..., min_length=1, max_length=100),
+        top_k: int = Query(default=5, ge=1, le=10),
+    ) -> dict[str, Any]:
+        """语义检索知识片段（向量相似度排序；首次调用会加载嵌入模型）。"""
+        try:
+            results = search_documents(q, top_k=top_k)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
+            logger.warning("语义检索知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"检索失败：{exc}") from exc
+        return {"query": q, "results": results}
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(payload: KnowledgeDocumentPayload) -> dict[str, Any]:
