@@ -1246,6 +1246,54 @@ def test_archived_sessions_search_and_pagination():
         _cleanup(user_id)
 
 
+def test_trips_csv_export():
+    import csv
+    import io
+
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trips_csv")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-12-05",
+                    "end_date": "2026-12-07",
+                    "purpose": "出差,客户拜访",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        response = _client().get("/api/trips/export", params={"user_id": user_id})
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/csv")
+        assert "attachment" in response.headers.get("content-disposition", "")
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
+        assert rows[0] == ["出发地", "目的地", "出发日期", "返程日期", "目的"]
+        assert rows[1] == ["北京", "上海", "2026-12-05", "2026-12-07", "出差,客户拜访"]
+
+        empty_user = _unique_user("web_test_trips_csv_empty")
+        try:
+            empty = _client().get(
+                "/api/trips/export", params={"user_id": empty_user}
+            )
+            empty_rows = list(
+                csv.reader(io.StringIO(empty.content.decode("utf-8-sig")))
+            )
+            assert len(empty_rows) == 1, "无行程时只输出表头"
+        finally:
+            _cleanup(empty_user)
+        print("✓ 行程 CSV 导出（BOM / 逗号转义 / 空列表）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
@@ -2077,6 +2125,7 @@ if __name__ == "__main__":
     test_ics_escape_handles_lone_cr()
     test_build_trips_ics_multiple_events()
     test_trips_calendar_api()
+    test_trips_csv_export()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()

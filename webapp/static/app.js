@@ -130,6 +130,7 @@ const els = {
   overview: byId("overview"),
   trips: byId("trips"),
   exportTrips: byId("exportTrips"),
+  exportTripsCsv: byId("exportTripsCsv"),
   addTripBtn: byId("addTripBtn"),
   tripForm: byId("tripForm"),
   tripOrigin: byId("tripOrigin"),
@@ -2080,6 +2081,7 @@ function renderOverview() {
   }
 
   els.exportTrips.hidden = !trips.length;
+  els.exportTripsCsv.hidden = !trips.length;
 
   const frequent = (status.statistics && status.statistics.frequent_destinations) || {};  const destinations = Object.entries(frequent)
     .sort((a, b) => Number(b[1]) - Number(a[1]))
@@ -3135,6 +3137,12 @@ function bindEvents() {
   els.exportTrips.addEventListener("click", () => {
     window.open(
       `/api/trips/calendar?user_id=${encodeURIComponent(state.userId)}`,
+      "_blank",
+    );
+  });
+  els.exportTripsCsv.addEventListener("click", () => {
+    window.open(
+      `/api/trips/export?user_id=${encodeURIComponent(state.userId)}`,
       "_blank",
     );
   });
