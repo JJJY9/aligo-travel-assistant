@@ -78,11 +78,17 @@ class ItineraryPlanningAgent(AgentBase):
             "context": context_info,
         }
 
-        # 从previous_results中提取其他agent的数据
+        # 从 previous_results 中提取其他 agent 的数据。
+        # 兼容编排器的嵌套结构 {"result": {"data": ...}} 与 SKILL.md 文档中的
+        # 简化结构 {"data": ...}
         for prev in previous_results:
-            agent_name = prev.get("agent_name", "")
-            result_data = prev.get("result", {}).get("data", {})
-            if result_data and agent_name:
+            agent_name = str(prev.get("agent_name") or "")
+            nested = prev.get("result")
+            if isinstance(nested, dict):
+                result_data = nested.get("data") or {}
+            else:
+                result_data = prev.get("data") or {}
+            if isinstance(result_data, dict) and result_data and agent_name:
                 all_info[agent_name] = result_data
 
         # 构建用户偏好信息

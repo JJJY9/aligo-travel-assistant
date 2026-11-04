@@ -98,8 +98,8 @@ class MemoryQueryAgent(AgentBase):
         chat_summary = ""
 
         if self.memory_manager:
-            # 获取旅行历史（最近50条）
-            trip_history = self.memory_manager.long_term.get_trip_history(limit=50)
+            # 取全部行程：截断会让「我去过昆明吗」在超过 50 条时误答没有记录
+            trip_history = self.memory_manager.long_term.get_trip_history(limit=None)
 
             # 获取用户偏好
             preferences = self.memory_manager.long_term.get_preference()
@@ -191,12 +191,13 @@ class MemoryQueryAgent(AgentBase):
 
         lines = []
         for i, trip in enumerate(trip_history, 1):
-            origin = trip.get("origin", "未知")
-            destination = trip.get("destination", "未知")
-            start_date = trip.get("start_date", "")
-            end_date = trip.get("end_date", "")
-            purpose = trip.get("purpose", "旅游")
-            timestamp = trip.get("timestamp", "")
+            # 事件收集会对缺失字段显式写 null（key 存在），必须用 or 取默认值
+            origin = trip.get("origin") or "未知"
+            destination = trip.get("destination") or "未知"
+            start_date = trip.get("start_date") or ""
+            end_date = trip.get("end_date") or ""
+            purpose = trip.get("purpose") or "旅游"
+            timestamp = trip.get("timestamp") or ""
 
             if start_date and end_date:
                 lines.append(f"{i}. {origin} → {destination} ({start_date} 至 {end_date}) - {purpose}")
