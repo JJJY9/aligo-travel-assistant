@@ -55,6 +55,7 @@ from utils.knowledge_admin import (
     delete_document,
     export_documents,
     import_documents,
+    list_categories,
     list_documents,
     update_document,
 )
@@ -830,10 +831,11 @@ def create_app(model: Any = None) -> FastAPI:
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
+        category: str = Query(default="", max_length=20),
     ) -> dict[str, Any]:
         """列出知识片段（记忆面板的知识库维护）。"""
         try:
-            return list_documents(limit=limit, offset=offset, query=q)
+            return list_documents(limit=limit, offset=offset, query=q, category=category)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503,
@@ -841,6 +843,17 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503，避免泄露内部堆栈
             logger.warning("列出知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
+
+    @app.get("/api/knowledge/categories")
+    def knowledge_categories() -> dict[str, Any]:
+        """知识片段分类统计（维护面板筛选下拉框）。"""
+        try:
+            return {"categories": list_categories()}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
+        except Exception as exc:  # noqa: BLE001 - 统一转为 503
+            logger.warning("统计知识分类失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
 
     @app.post("/api/knowledge/documents", status_code=201)

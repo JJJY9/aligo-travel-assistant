@@ -1458,23 +1458,44 @@ def test_doctor_endpoint():
 
 
 def test_knowledge_documents_api(monkeypatch):
-    """知识片段列表接口：透传分页 / 搜索参数（后端 Milvus 由假实现替代）。"""
+    """知识片段列表接口：透传分页 / 搜索 / 分类参数（后端 Milvus 由假实现替代）。"""
     from webapp import server as server_module
 
     captured = {}
 
-    def fake_list(limit, offset, query):
-        captured.update(limit=limit, offset=offset, query=query)
+    def fake_list(limit, offset, query, category=""):
+        captured.update(
+            limit=limit, offset=offset, query=query, category=category
+        )
         return {"total": 1, "items": [{"id": 7, "content": "住宿标准", "metadata": {}}]}
 
     monkeypatch.setattr(server_module, "list_documents", fake_list)
     response = _client().get(
-        "/api/knowledge/documents", params={"limit": 10, "offset": 0, "q": "住宿"}
+        "/api/knowledge/documents",
+        params={"limit": 10, "offset": 0, "q": "住宿", "category": "住宿"},
     )
     assert response.status_code == 200
     assert response.json()["items"][0]["id"] == 7
-    assert captured == {"limit": 10, "offset": 0, "query": "住宿"}
-    print("✓ /api/knowledge/documents 列表接口")
+    assert captured == {
+        "limit": 10,
+        "offset": 0,
+        "query": "住宿",
+        "category": "住宿",
+    }
+
+    def fake_categories():
+        return [{"category": "住宿", "count": 2}]
+    monkeypatch.setattr(server_module, "list_categories", fake_categories)
+    summary = _client().get("/api/knowledge/categories")
+    assert summary.status_code == 200
+    assert summary.json()["categories"] == [{"category": "住宿", "count": 2}]
+
+    def boom():
+        raise RuntimeError("collection is in state 'released'")
+
+    monkeypatch.setattr(server_module, "list_categories", boom)
+    assert _client().get("/api/knowledge/categories").status_code == 503
+    print("✓ /api/knowledge/documents 列表接口（分页 / 搜索 / 分类）与分类统计")
 
 
 def test_knowledge_document_write_api(monkeypatch):

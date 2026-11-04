@@ -1191,6 +1191,16 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   color: var(--ink);
   font-size: 13px;
 }
+.kb-filter {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+}
 .kb-more { margin-top: 6px; }
 .kb-list:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
