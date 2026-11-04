@@ -231,6 +231,27 @@ def test_session_metadata_save_failure_raises():
     print("✓ 会话元数据写入失败时抛错（不再静默成功）")
 
 
+def test_describe_backends_configured_flags(monkeypatch):
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    info = storage.describe_backends()
+    assert info["short_term"] == "memory" and info["long_term"] == "json"
+    assert info["short_term_configured"] is False
+    assert info["long_term_configured"] is False
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0")
+    storage.reset_failure_cache()
+    try:
+        info = storage.describe_backends()
+    finally:
+        storage.reset_failure_cache()
+    assert info["short_term_configured"] is True
+    assert info["short_term"] == "memory", "连接失败时回退进程内"
+    print("✓ describe_backends 报告配置 / 回退状态")
+
+
 def test_export_data_includes_session_metadata():
     from context.memory_manager import MemoryManager
 
@@ -437,6 +458,11 @@ if __name__ == "__main__":
     test_add_message_preserves_metadata()
     test_clear_history_clears_metadata()
     test_session_metadata_save_failure_raises()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_describe_backends_configured_flags(_mp)
+    finally:
+        _mp.undo()
     test_export_data_includes_session_metadata()
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()

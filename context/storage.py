@@ -103,13 +103,22 @@ def reset_failure_cache() -> None:
     _redis_client = None
 
 
-def describe_backends() -> dict[str, str]:
-    """返回当前实际使用的后端名称（供 /api/health 与界面展示）。"""
+def describe_backends() -> dict[str, Any]:
+    """返回当前实际使用的后端名称（供 /api/health 与界面展示）。
+
+    ``*_configured`` 表示是否配置了对应后端：配置了但当前回退本地时，
+    界面可提示「已配置后端暂不可用」。
+    """
     url = STORAGE_CONFIG.get("redis_url") or ""
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
     short_term = "redis" if url and _get_redis_client(url) is not None else "memory"
     long_term = "postgres" if dsn and not _failed_recently(f"postgres:{dsn}") else "json"
-    return {"short_term": short_term, "long_term": long_term}
+    return {
+        "short_term": short_term,
+        "long_term": long_term,
+        "short_term_configured": bool(url),
+        "long_term_configured": bool(dsn),
+    }
 
 
 def clear_short_term_session(session_id: str, user_id: str = "") -> None:
