@@ -3,8 +3,9 @@ LLM 连接与可用性：重试退避、可重试错误判断、健康检查
 """
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from .circuit_breaker import CircuitOpenError
 from .errors import MemoryPersistenceError
@@ -12,6 +13,38 @@ from .errors import MemoryPersistenceError
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# 第三方 SDK 的连接类异常不是内置 OSError / ConnectionError 的子类，
+# 且消息可能只有 "Connection error."，按类名识别（避免 import 可选依赖）
+_RETRIABLE_EXCEPTION_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "RateLimitError",
+        "InternalServerError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "ReadError",
+        "RemoteProtocolError",
+        "NetworkError",
+    }
+)
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """尽量取出异常携带的 HTTP 状态码。"""
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def is_retriable_error(exc: BaseException) -> bool:
@@ -23,12 +56,21 @@ def is_retriable_error(exc: BaseException) -> bool:
         return False
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
+    if any(
+        cls.__name__ in _RETRIABLE_EXCEPTION_NAMES for cls in type(exc).__mro__
+    ):
+        return True
+    status = _status_code(exc)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
     msg = str(exc).lower()
-    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+    # 只把带 HTTP 标记的数字当作状态码：裸 "500" 会命中报错位置 / token 数，
+    # 把「模型输出无法解析」这类永久错误误判为可重试
+    if re.search(r"(?:status|code|http)\D{0,12}(?:429|5\d{2})\b", msg):
         return True
-    if "500" in msg or "502" in msg or "503" in msg or "504" in msg:
+    if "rate limit" in msg or "too many requests" in msg:
         return True
-    return bool("timeout" in msg or "timed out" in msg)
+    return "timeout" in msg or "timed out" in msg or "deadline exceeded" in msg
 
 
 async def retry_with_backoff(
@@ -78,14 +120,31 @@ async def retry_with_backoff(
     raise last_exc
 
 
+def _response_text(reply: Any) -> str:
+    """尽量从 ChatResponse / dict / list / str 中取出文本。"""
+    content = getattr(reply, "content", reply)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(getattr(item, "text", item)))
+        return "".join(parts)
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "")
+    return str(content or "")
+
+
 async def run_health_check(
     base_url: str,
     api_key: str,
     model_name: str,
     timeout_sec: float = 10.0,
 ) -> tuple[bool, str]:
-    """
-    对 LLM 服务做一次最小化健康检查（发一条极简请求）。
+    """对 LLM 服务做一次最小化健康检查（发一条极简请求）。
 
     Returns:
         (success, message)
@@ -104,8 +163,11 @@ async def run_health_check(
             temperature=0,
             max_tokens=8,
         )
-        # 最小请求：能正常返回即视为服务可用（不校验内容）
-        await model([{"role": "user", "content": "1"}])
+        # 最小请求：必须返回非空文本才算可用。部分兼容网关以 HTTP 200
+        # 返回错误对象，SDK 不抛异常、choices 为空，只看“未抛错”会误报健康
+        reply = await model([{"role": "user", "content": "1"}])
+        if not _response_text(reply).strip():
+            return False, "模型返回空响应（请检查密钥 / 网关日志）"
         return True, "ok"
     except Exception as e:
         return False, str(e)

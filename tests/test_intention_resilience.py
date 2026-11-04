@@ -80,8 +80,41 @@ def test_json_with_trailing_prose_braces_parses():
     print("✓ JSON 后带花括号说明文字仍能解析")
 
 
+class _NanModel:
+    """合法 JSON 但包含 NaN（Python 默认接受，标准 JSON 不允许）"""
+
+    async def __call__(self, messages):
+        return '{"intents": [{"type": "plan_trip", "confidence": NaN}], "agent_schedule": []}'
+
+
+class _ArrayModel:
+    """顶层是数组而不是对象"""
+
+    async def __call__(self, messages):
+        return "[]"
+
+
+def test_non_finite_json_falls_back():
+    agent = IntentionAgent(name="IntentionAgent", model=_NanModel())
+    out = asyncio.run(agent.reply([_user_msg()]))
+    data = json.loads(out.content)
+    assert "意图识别出错" in data.get("reasoning", "")
+    print("✓ 含 NaN 的输出降级为默认结果（不会写入记忆）")
+
+
+def test_non_object_json_falls_back():
+    agent = IntentionAgent(name="IntentionAgent", model=_ArrayModel())
+    out = asyncio.run(agent.reply([_user_msg()]))
+    data = json.loads(out.content)
+    assert "意图识别出错" in data.get("reasoning", "")
+    assert isinstance(data, dict) and data.get("agent_schedule")
+    print("✓ 顶层非对象输出降级为默认结果")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
     test_json_with_trailing_prose_braces_parses()
+    test_non_finite_json_falls_back()
+    test_non_object_json_falls_back()
     print("\n全部通过")

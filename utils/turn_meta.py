@@ -27,8 +27,12 @@ def build_turn_meta(
     intention = intention_data if isinstance(intention_data, dict) else {}
     result = result_data if isinstance(result_data, dict) else {}
 
+    schedule_source = intention.get("agent_schedule")
+    if not isinstance(schedule_source, list):
+        # 模型可能返回字符串 / 数字 / 对象；真值非可迭代会抛 TypeError
+        schedule_source = []
     schedule = []
-    for item in intention.get("agent_schedule") or []:
+    for item in schedule_source:
         if not isinstance(item, dict):
             continue
         schedule.append(
@@ -39,8 +43,11 @@ def build_turn_meta(
             }
         )
 
+    results_source = result.get("results")
+    if not isinstance(results_source, list):
+        results_source = []
     agents = []
-    for item in result.get("results") or []:
+    for item in results_source:
         if not isinstance(item, dict):
             continue
         agents.append(
@@ -51,8 +58,11 @@ def build_turn_meta(
             }
         )
 
+    intents = intention.get("intents")
+    if not isinstance(intents, list):
+        intents = []
     return {
-        "intents": intention.get("intents") or [],
+        "intents": intents,
         "reasoning": intention.get("reasoning") or "",
         "schedule": schedule,
         "agents": agents,
