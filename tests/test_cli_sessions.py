@@ -267,8 +267,40 @@ def test_save_failure_reports_error(monkeypatch):
     print("✓ 存储写入失败返回 1")
 
 
+def test_main_rejects_bad_usage(monkeypatch):
+    """dispatch 层：漏写用户 / 未知参数 / --restore=1 均返回用法错误（退出码 2）。"""
+    for argv in (
+        ["cli.py", "sessions", "--archived"],
+        ["cli.py", "sessions", "u1", "--archived=true"],
+        ["cli.py", "sessions", "u1", "--archived", "--all"],
+        ["cli.py", "session-archive", "u1", "s1", "--restore=1"],
+        ["cli.py", "session-archive", "u1", "--restore"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "用法" in buf.getvalue(), argv
+    print("✓ dispatch 层拒绝错误用法（退出码 2）")
+
+
+def test_main_accepts_valid_flags(monkeypatch):
+    """合法参数应进入对应函数（用假 store，避免真实读取）。"""
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(sys, "argv", ["cli.py", "sessions", "u1", "--archived"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert "s-archived" in buf.getvalue()
+    print("✓ dispatch 层合法参数正常执行")
+
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
+    test_main_rejects_bad_usage(pytest.MonkeyPatch())
     for case in (
         test_lists_active_sessions,
         test_lists_archived_and_all,
@@ -277,6 +309,7 @@ if __name__ == "__main__":
         test_leading_hyphen_ids_rejected,
         test_pg_healthy_store_passthrough,
         test_save_failure_reports_error,
+        test_main_accepts_valid_flags,
         test_archive_and_restore,
         test_archive_missing_session,
         test_read_failure,
