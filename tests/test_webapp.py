@@ -462,6 +462,38 @@ def test_preferences_api():
         _cleanup(user_id)
 
 
+def test_preference_storage_failure_maps_503(monkeypatch):
+    """偏好写盘失败应返回 503（与其它存储接口一致），而不是通用 500。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def save_preference(self, pref_type, value):
+            raise MemoryPersistenceError("磁盘已满")
+
+        def delete_preference(self, pref_type):
+            raise MemoryPersistenceError("磁盘已满")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    client = _client()
+    saved = client.put(
+        "/api/preferences/home_location", json={"user_id": "pref-fail", "value": "北京"}
+    )
+    assert saved.status_code == 503
+    assert "保存失败" in saved.json()["detail"]
+    deleted = client.delete(
+        "/api/preferences/home_location", params={"user_id": "pref-fail"}
+    )
+    assert deleted.status_code == 503
+    assert "删除失败" in deleted.json()["detail"]
+    print("✓ 偏好写入 / 删除失败映射 503")
+
+
 def test_status_trips():
     from context.storage import create_long_term_memory
 
@@ -1608,6 +1640,8 @@ def test_chat_rate_limit_ip_bucket():
                 json={"message": "你好", "user_id": user_id, "session_id": f"sess-ip-{i}"},
             )
             assert response.status_code == 200
+            # 额度头应描述更紧的 IP 桶，而不是用户桶的 100
+            assert response.headers["x-ratelimit-limit"] == "2"
 
         rotated = _unique_user("web_test_ip_rotated")
         users.append(rotated)
@@ -1617,6 +1651,7 @@ def test_chat_rate_limit_ip_bucket():
         )
         assert limited.status_code == 429, "轮换用户 ID 不应绕过客户端 IP 限流"
         assert limited.headers["Retry-After"].isdigit()
+        assert limited.headers["x-ratelimit-limit"] == "2"
         print("✓ 轮换用户 ID 仍受客户端 IP 限流约束")
     finally:
         for user_id in users:
@@ -1705,6 +1740,34 @@ def test_lock_table_is_bounded():
     print("✓ 用户锁表有上限（未持有的旧锁被淘汰）")
 
 
+def test_lock_table_overflow_uses_shared_lock():
+    """锁表满且全部在用（并发高峰）时，新用户共享兜底锁，表不再增长。"""
+    import asyncio
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    original = state.max_locks
+    state.max_locks = 2
+    try:
+        for index in range(2):
+            lock = asyncio.Lock()
+            # 模拟锁正在被持有：同步测试里没有可直接 acquire 的事件循环
+            setattr(lock, "_locked", True)
+            state.locks[f"held-{index}"] = lock
+        assert state.lock_for("brand-new-user") is state.overflow_lock
+        assert len(state.locks) == 2, "锁表占满时不能再为每个新用户建锁"
+        assert state.lock_for("yet-another-user") is state.overflow_lock
+        # 有锁释放后可以重新入表
+        setattr(state.locks["held-0"], "_locked", False)
+        fresh = state.lock_for("recovered-user")
+        assert fresh is not state.overflow_lock
+        assert "recovered-user" in state.locks
+    finally:
+        state.max_locks = original
+        state.locks.clear()
+    print("✓ 并发高峰下锁表保持有界（共享兜底锁）")
+
+
 def test_request_body_too_large():
     client = _client()
     response = client.post(
@@ -1720,6 +1783,45 @@ def test_request_body_too_large():
     assert response.headers.get("x-request-id")
     assert response.headers["x-content-type-options"] == "nosniff"
     print("✓ 超大请求体返回 413（带安全头 / 请求 ID）")
+
+
+def test_chunked_request_body_too_large():
+    """分块传输没有 Content-Length，也要在读取时截断。"""
+    client = _client()
+    oversized = b"x" * (1024 * 1024 * 2 + 1)
+
+    response = client.post(
+        "/api/chat",
+        content=[oversized],
+        headers={"Content-Type": "application/json"},
+    )
+    assert "content-length" not in response.request.headers, "用例应走分块传输"
+    assert response.status_code == 413
+    assert "请求体过大" in response.json()["detail"]
+    assert response.headers.get("x-request-id")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    print("✓ 分块请求体超过 2 MB 同样返回 413")
+
+
+def test_chunked_request_body_allowed_under_limit():
+    """未提供 Content-Length 的正常小请求不受影响。"""
+    client = _client()
+    user_id = _unique_user("web_test_chunked_ok")
+    payload = json.dumps(
+        {"message": "你好", "user_id": user_id, "session_id": "sess-chunked"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    try:
+        response = client.post(
+            "/api/chat",
+            content=[payload],
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["session_id"] == "sess-chunked"
+    finally:
+        _cleanup(user_id)
+    print("✓ 分块传输的小请求正常处理")
 
 
 def test_gzip_compression_excludes_sse():
@@ -2403,6 +2505,7 @@ if __name__ == "__main__":
     test_status_usage_totals()
     test_preference_rejects_non_finite()
     test_preferences_api()
+    test_preference_storage_failure_maps_503(pytest.MonkeyPatch())
     test_status_trips()
     test_delete_trip_api()
     test_create_trip_api()
@@ -2439,7 +2542,10 @@ if __name__ == "__main__":
     test_request_id_header()
     test_security_headers()
     test_lock_table_is_bounded()
+    test_lock_table_overflow_uses_shared_lock()
     test_request_body_too_large()
+    test_chunked_request_body_too_large()
+    test_chunked_request_body_allowed_under_limit()
     test_gzip_compression_excludes_sse()
     test_docs_csp_allows_cdn()
     test_unhandled_error_returns_500_with_headers()

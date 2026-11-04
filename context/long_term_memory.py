@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from utils.errors import MemoryPersistenceError
+
 logger = logging.getLogger(__name__)
 
 # 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
@@ -96,16 +98,29 @@ class LongTermMemory:
                     return data
             except Exception as e:
                 logger.error(f"Failed to load long-term memory: {e}")
-                backup = (
-                    f"{self.db_path}.corrupt-"
-                    f"{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                )
-                try:
-                    os.replace(self.db_path, backup)
-                    logger.warning("损坏的记忆文件已备份到 %s", backup)
-                except OSError as backup_error:
-                    logger.error("备份损坏的记忆文件失败: %s", backup_error)
-                return self._init_data()
+                # 复核时持锁：错误与加锁之间其它线程可能已写入新的有效文件，
+                # 不能把刚写入的数据当成损坏文件移走
+                with self._write_lock:
+                    try:
+                        with open(self.db_path, 'r', encoding='utf-8') as f:
+                            latest = json.load(f)
+                    except FileNotFoundError:
+                        return self._init_data()
+                    except Exception:
+                        # 备份名带微秒与进程号，同一秒内的多次损坏不会互相覆盖
+                        backup = (
+                            f"{self.db_path}.corrupt-"
+                            f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                            f"-{os.getpid()}"
+                        )
+                        try:
+                            os.replace(self.db_path, backup)
+                            logger.warning("损坏的记忆文件已备份到 %s", backup)
+                        except OSError as backup_error:
+                            logger.error("备份损坏的记忆文件失败: %s", backup_error)
+                        return self._init_data()
+                    logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
+                    return self._migrate_data(latest)
         else:
             logger.info("No existing long-term memory, creating new")
             return self._init_data()
@@ -228,7 +243,7 @@ class LongTermMemory:
     def _persist(self) -> None:
         """写盘失败时抛错，避免上层把未落盘的修改当成功。"""
         if not self._save():
-            raise OSError("长期记忆写入失败")
+            raise MemoryPersistenceError("长期记忆写入失败")
 
     @_locked_mutation
     def save_preference(self, pref_type: str, value: Any):
@@ -473,7 +488,7 @@ class LongTermMemory:
             if session_id in archived_sessions:
                 archived_sessions.remove(session_id)
         if not self._save():
-            raise OSError("长期记忆写入失败")
+            raise MemoryPersistenceError("长期记忆写入失败")
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
         return count
 
@@ -487,7 +502,7 @@ class LongTermMemory:
         else:
             titles.pop(session_id, None)
         if not self._save():
-            raise OSError("长期记忆写入失败")
+            raise MemoryPersistenceError("长期记忆写入失败")
         logger.info(f"Set session title: {session_id} -> {cleaned or '(auto)'}")
 
     def get_session_titles(self) -> dict[str, str]:
@@ -503,7 +518,7 @@ class LongTermMemory:
         elif not pinned and session_id in pinned_sessions:
             pinned_sessions.remove(session_id)
         if not self._save():
-            raise OSError("长期记忆写入失败")
+            raise MemoryPersistenceError("长期记忆写入失败")
 
     def get_pinned_sessions(self) -> list[str]:
         """返回置顶会话 ID（按置顶时间先后）。"""
@@ -518,7 +533,7 @@ class LongTermMemory:
         elif not archived and session_id in archived_sessions:
             archived_sessions.remove(session_id)
         if not self._save():
-            raise OSError("长期记忆写入失败")
+            raise MemoryPersistenceError("长期记忆写入失败")
         logger.info("Set session archived: %s -> %s", session_id, archived)
 
     def get_archived_sessions(self) -> list[str]:
@@ -607,7 +622,7 @@ class LongTermMemory:
                     if frequent[destination] <= 0:
                         del frequent[destination]
                 if not self._save():
-                    raise OSError("写入长期记忆失败")
+                    raise MemoryPersistenceError("写入长期记忆失败")
                 logger.info(f"Deleted trip history: {trip_id}")
                 return True
         return False

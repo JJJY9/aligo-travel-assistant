@@ -265,18 +265,22 @@ class RAGKnowledgeAgent(AgentBase):
         """
         return next_entity_id(self.milvus_client, self.collection_name)
 
-    def search_knowledge(self, query: str, top_k: int | None = None) -> list[dict]:
+    def search_knowledge(self, query: str, top_k: int | None = None, strict: bool = False) -> list[dict]:
         """
         检索知识库
 
         Args:
             query: 查询文本
             top_k: 返回top k个结果
+            strict: 为 True 时不吞掉异常（未初始化 / 后端故障直接抛出），
+                供需要区分“空结果”与“检索失败”的管理接口使用
 
         Returns:
             检索结果列表
         """
         if not self.initialized:
+            if strict:
+                raise RuntimeError("知识库未初始化")
             return []
 
         try:
@@ -327,6 +331,8 @@ class RAGKnowledgeAgent(AgentBase):
 
         except Exception as e:
             logger.error(f"Error searching knowledge: {e}")
+            if strict:
+                raise
             return []
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:

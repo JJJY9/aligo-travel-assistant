@@ -60,6 +60,7 @@ const state = {
   kbEditingMetadata: {},
   kbSaving: false,
   kbSemanticMode: false,
+  kbSemanticQuery: "",
   tripEditingId: null,
   tripsExpanded: false,
   tripsAll: [],
@@ -2702,6 +2703,14 @@ async function refreshKnowledge() {
 
 const KB_PAGE_SIZE = 20;
 let kbSearchTimer = null;
+// 知识库列表 / 语义检索共用的请求序号：只渲染最后一次发起的请求结果，
+// 避免先发出的子串搜索晚到后覆盖语义检索结果（或反之）
+let kbListSeq = 0;
+
+function exitKbSemanticMode() {
+  state.kbSemanticMode = false;
+  state.kbSemanticQuery = "";
+}
 
 function knowledgeQueryParams(offset) {
   const params = new URLSearchParams({
@@ -2747,33 +2756,43 @@ async function refreshKnowledgeCategories() {
 
 async function refreshKnowledgeDocuments() {
   if (!els.kbList) return;
-  state.kbSemanticMode = false;
+  if (state.kbSemanticMode) {
+    // 保持在语义检索模式：删除 / 编辑 / 导入后刷新的是当前语义结果，
+    // 而不是悄悄切回关键词列表
+    await runSemanticSearch({ silent: true });
+    return;
+  }
+  const seq = ++kbListSeq;
   els.kbList.textContent = "加载中…";
   state.kbItems = [];
   state.kbTotal = 0;
   refreshKnowledgeCategories();
   try {
     const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
+    if (seq !== kbListSeq) return;
     state.kbTotal = Number(data.total || 0);
     renderKnowledgeDocuments(data.items || [], false);
   } catch (error) {
+    if (seq !== kbListSeq) return;
     els.kbList.textContent = error.message;
   }
   updateKnowledgeMore();
 }
 
 async function loadMoreKnowledgeDocuments() {
-  if (!els.kbList) return;
+  if (!els.kbList || state.kbSemanticMode) return;
+  const seq = kbListSeq;
   els.kbMore.disabled = true;
   try {
     const data = await getJSON(
       `/api/knowledge/documents?${knowledgeQueryParams(state.kbItems.length)}`,
     );
+    if (seq !== kbListSeq) return;
     state.kbTotal = Number(data.total || 0);
     renderKnowledgeDocuments(data.items || [], true);
     els.kbList.focus();
   } catch (error) {
-    toast(error.message);
+    if (seq === kbListSeq) toast(error.message);
   } finally {
     els.kbMore.disabled = false;
     updateKnowledgeMore();
@@ -2881,25 +2900,37 @@ function knowledgeRowActions(doc) {
   return actions;
 }
 
-async function runSemanticSearch() {
-  const query = els.kbSearch.value.trim();
+async function runSemanticSearch({ silent = false } = {}) {
+  const query = silent ? state.kbSemanticQuery : els.kbSearch.value.trim();
   if (!query) {
-    toast("请输入搜索内容");
+    if (!silent) toast("请输入搜索内容");
     return;
   }
-  // 取消尚未触发的子串搜索刷新，避免它晚到后覆盖语义结果
+  // 取消尚未触发的子串搜索刷新，并让已发出的列表请求作废
   clearTimeout(kbSearchTimer);
+  const seq = ++kbListSeq;
   els.kbSemantic.disabled = true;
   els.kbSemantic.textContent = "检索中…";
-  els.kbList.textContent = "语义检索中…（首次使用需加载向量模型）";
+  if (!silent) els.kbList.textContent = "语义检索中…（首次使用需加载向量模型）";
   try {
     const data = await getJSON(
       `/api/knowledge/search?q=${encodeURIComponent(query)}&top_k=8`,
     );
+    if (seq !== kbListSeq) return;
     state.kbSemanticMode = true;
+    state.kbSemanticQuery = query;
     renderSemanticResults(query, data.results || []);
   } catch (error) {
-    els.kbList.textContent = error.message;
+    if (seq !== kbListSeq) return;
+    if (silent) {
+      // 刷新语义结果失败（如知识库暂时不可用）：退回关键词列表，避免面板卡在旧结果
+      exitKbSemanticMode();
+      state.kbQuery = els.kbSearch.value.trim();
+      toast(`语义结果刷新失败：${error.message}`);
+      await refreshKnowledgeDocuments();
+    } else {
+      els.kbList.textContent = error.message;
+    }
   } finally {
     els.kbSemantic.disabled = false;
     els.kbSemantic.textContent = "语义搜索";
@@ -2951,6 +2982,7 @@ function renderSemanticResults(query, results) {
   back.className = "kb-more ghost";
   back.textContent = "返回全部片段";
   back.addEventListener("click", () => {
+    exitKbSemanticMode();
     els.kbSearch.value = "";
     state.kbQuery = "";
     refreshKnowledgeDocuments();
@@ -3338,12 +3370,13 @@ function bindEvents() {
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
   els.kbCancel.addEventListener("click", () => resetKnowledgeForm());
-  els.kbSemantic.addEventListener("click", runSemanticSearch);
+  els.kbSemantic.addEventListener("click", () => runSemanticSearch());
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
   els.kbSearch.addEventListener("input", () => {
     clearTimeout(kbSearchTimer);
     kbSearchTimer = setTimeout(() => {
+      exitKbSemanticMode();
       state.kbQuery = els.kbSearch.value.trim();
       refreshKnowledgeDocuments();
     }, 250);
@@ -3352,11 +3385,13 @@ function bindEvents() {
     if (event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
       clearTimeout(kbSearchTimer);
+      exitKbSemanticMode();
       state.kbQuery = els.kbSearch.value.trim();
       refreshKnowledgeDocuments();
     }
   });
   els.kbCategoryFilter.addEventListener("change", () => {
+    exitKbSemanticMode();
     state.kbCategory = els.kbCategoryFilter.value;
     refreshKnowledgeDocuments();
   });
