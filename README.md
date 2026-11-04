@@ -463,7 +463,7 @@ python cli.py
 | `help` | 显示帮助信息 |
 | `status` | 查看当前状态和记忆 |
 | `health` | 检查 LLM 服务是否可用并显示熔断器状态 |
-| `doctor` | 环境自检：依赖 / API Key / 嵌入模型文件 / 知识库 / LLM 连通性 |
+| `doctor` | 环境自检：依赖 / API Key / 记忆存储后端 / 嵌入模型文件 / 知识库 / LLM 连通性 |
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
 | `preferences` | 查看用户偏好 |
@@ -525,7 +525,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 
 - 所有 `/api/` 响应带 `X-Request-ID` 头（透传请求头中的值，否则自动生成 12 位十六进制）；错误详情也会附带请求 ID，便于排查。
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
-- 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
+- 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
 - 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。实现为进程内滑动窗口（`utils/rate_limit.py`），多实例部署时需替换为 Redis 等共享存储。
 - 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc` 使用仅对文档页放宽的 CSP（允许 CDN 资源）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`。
 
@@ -760,7 +760,8 @@ aligo-travel-assistant/
 - 存储连接复用：PostgreSQL 后端不再每轮对话重建连接；Web 会话缓存按 LRU 淘汰（上限 50）并在服务关闭时释放
 
 ### 已知限制
-- **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。- **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
+- **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。
+- **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
 - **限流是进程内实现**：多实例部署时各实例独立计数，需替换为 Redis 等共享存储。
 - **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；但 CLI 与 Web 服务同时修改**同一用户**时仍是「后写覆盖先写」，演示时建议只保留一个写入端。
 - **PostgreSQL 的行程去重 / 编号为应用层检查**：多进程同时写入同一用户时仍可能产生重复（单实例 Web 通过按用户串行锁避免）；多实例部署请自行加唯一约束或使用分布式锁。
