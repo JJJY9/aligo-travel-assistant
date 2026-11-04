@@ -373,6 +373,17 @@
             <button class="ghost" id="tripSubmit" type="submit">保存行程</button>
           </div>
         </form>
+        <div class="trip-filter" id="tripFilterRow" hidden>
+          <input
+            id="tripFilter"
+            class="kb-search"
+            type="search"
+            maxlength="50"
+            placeholder="筛选行程（路线 / 日期 / 目的）"
+            aria-label="筛选行程"
+          />
+          <span class="empty" id="tripFilterCount" role="status"></span>
+        </div>
         <div class="trip-list" id="trips"></div>
         <div class="chips destination-chips" id="destinations"></div>
       </section>

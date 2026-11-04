@@ -65,6 +65,7 @@ const state = {
   tripsExpanded: false,
   tripsAll: [],
   tripsAllTotal: 0,
+  tripsFilter: "",
   sessionTotal: 0,
   showArchived: false,
   archivedCount: 0,
@@ -146,6 +147,9 @@ const els = {
   exportTripsCsv: byId("exportTripsCsv"),
   addTripBtn: byId("addTripBtn"),
   expandTrips: byId("expandTrips"),
+  tripFilterRow: byId("tripFilterRow"),
+  tripFilter: byId("tripFilter"),
+  tripFilterCount: byId("tripFilterCount"),
   tripForm: byId("tripForm"),
   tripOrigin: byId("tripOrigin"),
   tripDestination: byId("tripDestination"),
@@ -2130,16 +2134,36 @@ function renderOverview() {
     });
   }
 
-  const trips = state.tripsExpanded
+  const allTrips = state.tripsExpanded
     ? state.tripsAll
     : Array.isArray(status.trips)
       ? status.trips
       : [];
+  const filterText = state.tripsExpanded ? state.tripsFilter.trim().toLowerCase() : "";
+  const trips = filterText
+    ? allTrips.filter((trip) =>
+        [trip.origin, trip.destination, trip.purpose, trip.start_date, trip.end_date]
+          .map((value) => String(value || ""))
+          .join(" ")
+          .toLowerCase()
+          .includes(filterText),
+      )
+    : allTrips;
+  els.tripFilterRow.hidden = !state.tripsExpanded;
+  if (state.tripsExpanded) {
+    // 刷新状态时保留筛选框内容与光标位置
+    if (els.tripFilter.value !== state.tripsFilter) {
+      els.tripFilter.value = state.tripsFilter;
+    }
+    els.tripFilterCount.textContent = filterText
+      ? `匹配 ${trips.length} / ${allTrips.length} 条`
+      : "";
+  }
   els.trips.innerHTML = "";
   if (!trips.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = "还没有行程记录";
+    empty.textContent = filterText ? "没有匹配的行程" : "还没有行程记录";
     els.trips.appendChild(empty);
   } else {
     // 状态接口按记录顺序（旧→新）返回，界面新→旧展示；
@@ -2268,10 +2292,10 @@ function renderOverview() {
   els.expandTrips.textContent = state.tripsExpanded
     ? "收起全部"
     : `查看全部（${tripTotal}）`;
-  if (state.tripsExpanded && state.tripsAllTotal > trips.length) {
+  if (state.tripsExpanded && !filterText && state.tripsAllTotal > allTrips.length) {
     const note = document.createElement("div");
     note.className = "empty";
-    note.textContent = `仅显示最近 ${trips.length} 条（共 ${state.tripsAllTotal} 条）`;
+    note.textContent = `仅显示最近 ${allTrips.length} 条（共 ${state.tripsAllTotal} 条）`;
     els.trips.appendChild(note);
   }
 
@@ -3391,6 +3415,7 @@ async function saveUser() {
     state.tripsExpanded = false;
     state.tripsAll = [];
     state.tripsAllTotal = 0;
+    state.tripsFilter = "";
     // 立即清空上一个用户的列表与面板：新用户的 /api/sessions、/api/status
     // 返回前旧行仍可点击，而删除 / 编辑按当前 user_id 执行，会误伤新用户的同名记录
     closeMemorySheet();
@@ -3579,6 +3604,10 @@ function bindEvents() {
   els.prefCancel.addEventListener("click", resetPreferenceForm);
 
   els.expandTrips.addEventListener("click", toggleTripsExpanded);
+  els.tripFilter.addEventListener("input", () => {
+    state.tripsFilter = els.tripFilter.value;
+    renderOverview();
+  });
   els.addTripBtn.addEventListener("click", () => {    if (els.tripForm.hidden) {
       resetTripForm();
       els.tripForm.hidden = false;
