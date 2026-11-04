@@ -37,7 +37,9 @@ class MemoryManager:
 
         # 初始化两层记忆（配置 REDIS_URL / DATABASE_URL 时自动使用 Redis / PostgreSQL，
         # 未配置或连接失败时回退进程内 / JSON 实现）
-        self.short_term = create_short_term_memory(session_id, max_turns=10)
+        self.short_term = create_short_term_memory(
+            session_id, max_turns=10, user_id=user_id
+        )
         self.long_term = create_long_term_memory(user_id, storage_path)
         # 长期记忆总结缓存：同一会话内其它会话的历史未变化时不再重复调用 LLM
         self._summary_cache: tuple[tuple, str] | None = None

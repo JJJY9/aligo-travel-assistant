@@ -63,14 +63,22 @@ def _get_redis_client(url: str):
         return None
 
 
-def create_short_term_memory(session_id: str, max_turns: int = 10) -> ShortTermStore:
+def create_short_term_memory(
+    session_id: str, max_turns: int = 10, user_id: str = ""
+) -> ShortTermStore:
     """创建短期记忆：优先 Redis（如已配置且可用），否则进程内滑动窗口。"""
     url = STORAGE_CONFIG.get("redis_url") or ""
     if url:
         client = _get_redis_client(url)
         if client is not None:
             ttl = int(STORAGE_CONFIG.get("redis_ttl_sec", 3600))
-            return RedisShortTermMemory(client, session_id, max_turns=max_turns, ttl_sec=ttl)
+            return RedisShortTermMemory(
+                client,
+                session_id,
+                max_turns=max_turns,
+                ttl_sec=ttl,
+                user_id=user_id,
+            )
     return ShortTermMemory(max_turns=max_turns)
 
 
@@ -104,15 +112,21 @@ def describe_backends() -> dict[str, str]:
     return {"short_term": short_term, "long_term": long_term}
 
 
-def clear_short_term_session(session_id: str) -> None:
-    """删除某个会话的 Redis 短期记忆（未启用 Redis 时为空操作）。"""
+def clear_short_term_session(session_id: str, user_id: str = "") -> None:
+    """删除某个会话的 Redis 短期记忆（未启用 Redis 时为空操作）。
+
+    同时清理旧格式键（``aligo:session:{id}:messages``），便于升级后回收遗留数据。
+    """
     url = STORAGE_CONFIG.get("redis_url") or ""
     if not url:
         return
     client = _get_redis_client(url)
     if client is None:
         return
+    keys = {session_key(session_id)}
+    if user_id:
+        keys.add(session_key(session_id, user_id))
     try:
-        client.delete(session_key(session_id))
+        client.delete(*keys)
     except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程
         logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)
