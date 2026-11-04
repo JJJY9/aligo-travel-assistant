@@ -1638,6 +1638,54 @@ def run_trips_list_standalone(user_id: str) -> int:
     return 0
 
 
+def run_preferences_list_standalone(user_id: str) -> int:
+    """列出用户偏好（用于 `python cli.py preferences <user_id>`）。
+
+    Returns:
+        0 列出成功（含无偏好）；1 参数 / 读取失败
+    """
+    import re
+
+    from utils.result_formatter import preference_label
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            preferences = store.get_preference()
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取偏好失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if not preferences:
+        print(f"用户 {user_id}：还没有偏好记录")
+        return 0
+
+    print(f"用户 {user_id}：{len(preferences)} 条偏好")
+    for pref_type in sorted(preferences, key=preference_label):
+        value = preferences[pref_type]
+        if isinstance(value, list):
+            text = "、".join(str(item) for item in value) or "—"
+        elif value is None or value == "":
+            text = "—"
+        elif isinstance(value, bool):
+            text = "是" if value else "否"
+        else:
+            text = str(value)
+        print(f"  {preference_label(pref_type)}：{text}")
+    return 0
+
+
 def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool] | None:
     """解析 kb-export 的 [path] [--force]；冲突 / 未知参数返回 None。"""
     target: str | None = None
@@ -1710,6 +1758,11 @@ def main():
                 print("用法：python cli.py kb-delete <id>")
                 sys.exit(2)
             sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
+        if arg == "preferences":
+            if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
+                print("用法：python cli.py preferences <user_id>")
+                sys.exit(2)
+            sys.exit(run_preferences_list_standalone(sys.argv[2]))
         if arg == "trips":
             if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py trips <user_id>")

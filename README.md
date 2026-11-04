@@ -6,7 +6,7 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
-> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance (category filter, semantic search, CRUD, JSON export/import), parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel with manual preferences, trip management with calendar & CSV export and keyword filtering, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`trips`, `sessions`, `session-archive`, `session-export`, `kb-*`, `trips-export`, `trips-dedupe`, `eval`, `doctor`), responses are gzip-compressed except SSE and carry rate-limit headers. Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
+> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance (category filter, semantic search, CRUD, JSON export/import), parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel with manual preferences, trip management with calendar & CSV export and keyword filtering, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`preferences`, `trips`, `sessions`, `session-archive`, `session-export`, `kb-*`, `trips-export`, `trips-dedupe`, `eval`, `doctor`), responses are gzip-compressed except SSE and carry rate-limit headers. Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
@@ -481,6 +481,8 @@ python cli.py
 知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path] [--force]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`，已存在时需 `--force` 覆盖）；`python cli.py kb-import <file.json>` 批量导入（CLI 不限条数，Web 接口单次最多 200 条），适合备份、换机与批量补充知识。
 
 知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 60 字预览）；`python cli.py kb-delete <id>` 删除指定片段。
+
+偏好列表（不进入交互）：`python cli.py preferences <user_id>` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否）。
 
 行程列表（不进入交互）：`python cli.py trips <user_id>` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
 
