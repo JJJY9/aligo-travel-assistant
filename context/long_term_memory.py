@@ -399,6 +399,36 @@ class LongTermMemory:
         return removed
 
     @_locked_mutation
+    def delete_last_turn(self, session_id: str) -> int:
+        """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。"""
+        history = self.data["chat_history"]
+        indexes = [
+            index
+            for index, message in enumerate(history)
+            if message.get("session_id") == session_id
+        ]
+        if not indexes:
+            return 0
+        count = 1
+        if (
+            len(indexes) >= 2
+            and history[indexes[-1]].get("role") == "assistant"
+            and history[indexes[-2]].get("role") == "user"
+        ):
+            count = 2
+        removed_indexes = set(indexes[-count:])
+        self.data["chat_history"] = [
+            message
+            for index, message in enumerate(history)
+            if index not in removed_indexes
+        ]
+        stats = self.data["statistics"]
+        stats["total_messages"] = max(0, stats.get("total_messages", 0) - count)
+        self._save()
+        logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
+        return count
+
+    @_locked_mutation
     def set_session_title(self, session_id: str, title: str) -> None:
         """设置会话自定义标题；空标题表示恢复自动标题。"""
         titles = self.data.setdefault("session_titles", {})

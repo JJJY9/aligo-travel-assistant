@@ -44,6 +44,7 @@ from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tra
 from context.storage import (
     clear_short_term_session,
     create_long_term_memory,
+    create_short_term_memory,
     describe_backends,
 )
 from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
@@ -1101,6 +1102,30 @@ def create_app(model: Any = None) -> FastAPI:
         state.drop_session(session_id)
         clear_short_term_session(session_id)
         return {"session_id": session_id, "deleted": removed}
+
+    @app.delete("/api/sessions/{session_id}/last-turn")
+    async def delete_last_turn(
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。"""
+        async with state.lock_for(user_id):
+            store = _open_long_term(user_id)
+            try:
+                removed = store.delete_last_turn(session_id)
+            except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
+                logger.warning("删除最后一轮对话失败: %s", exc)
+                raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            finally:
+                _close_long_term(store)
+
+            session = state.sessions.get(session_id)
+            if session is not None and session.user_id == user_id:
+                session.runtime.memory.short_term.truncate_last_turn()
+            else:
+                # 应用重启后进程内短期记忆已清空，但 Redis 后端可能仍保留该会话
+                create_short_term_memory(session_id).truncate_last_turn()
+        return {"session_id": session_id, "removed": removed}
 
     @app.post("/api/chat")
     async def chat(request: Request, payload: ChatRequest) -> dict[str, Any]:

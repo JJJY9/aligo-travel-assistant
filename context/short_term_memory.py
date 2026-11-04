@@ -107,6 +107,24 @@ class ShortTermMemory:
         self.messages = []
         logger.info("Short-term memory cleared")
 
+    def truncate_last_turn(self) -> int:
+        """删除最后一轮对话（助手 + 提问的用户），返回删除条数。
+
+        历史以用户提问结尾（例如回答过程中被停止）时只删除该条提问。
+        """
+        if not self.messages:
+            return 0
+        count = 1
+        if (
+            len(self.messages) >= 2
+            and self.messages[-1].get("role") == "assistant"
+            and self.messages[-2].get("role") == "user"
+        ):
+            count = 2
+        del self.messages[-count:]
+        logger.info("Truncated last turn from short-term memory (%s messages)", count)
+        return count
+
     def get_statistics(self) -> dict[str, Any]:
         """获取统计信息"""
         return {
@@ -172,6 +190,31 @@ class RedisShortTermMemory:
     def clear(self) -> None:
         self.client.delete(self.key)
         logger.info("Redis short-term memory cleared: %s", self.key)
+
+    def truncate_last_turn(self) -> int:
+        """删除 Redis 中最后一轮对话，返回删除条数（保留的条目 TTL 不变）。"""
+        raw = self.client.lrange(self.key, 0, -1)
+        if not raw:
+            return 0
+        try:
+            last = json.loads(raw[-1])
+            previous = json.loads(raw[-2]) if len(raw) >= 2 else None
+        except (TypeError, json.JSONDecodeError):
+            last, previous = {}, None
+        count = 1
+        if (
+            isinstance(last, dict)
+            and last.get("role") == "assistant"
+            and isinstance(previous, dict)
+            and previous.get("role") == "user"
+        ):
+            count = 2
+        if count >= len(raw):
+            self.client.delete(self.key)
+        else:
+            self.client.rtrim(self.key, 0, -count - 1)
+        logger.info("Truncated last turn from Redis memory: %s (%s messages)", self.key, count)
+        return count
 
     def get_statistics(self) -> dict[str, Any]:
         total = int(self.client.llen(self.key) or 0)
