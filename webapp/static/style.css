@@ -515,6 +515,37 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   white-space: pre-wrap;
   word-break: break-word;
 }
+.msg.user.editing { max-width: min(560px, 92%); width: min(560px, 92%); }
+.user-edit-form { display: flex; flex-direction: column; gap: 8px; width: 100%; text-align: left; }
+.user-edit-input {
+  width: 100%;
+  min-height: 62px;
+  max-height: 220px;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--user-ink);
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+.user-edit-input:focus { outline: none; border-color: var(--accent); }
+.user-edit-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.user-edit-actions button {
+  padding: 5px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--user-ink);
+  font-size: 12px;
+}
+.user-edit-actions button:hover:not(:disabled) { border-color: rgba(255, 255, 255, 0.55); }
+.user-edit-actions button.save { border-color: var(--accent); background: var(--accent); color: #fff; }
+.user-edit-actions button.save:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); }
+.user-edit-actions button:disabled { opacity: 0.55; cursor: default; }
+.msg.user .user-edit { margin-top: 2px; }
 
 .msg.assistant { width: 100%; }
 .msg-head {

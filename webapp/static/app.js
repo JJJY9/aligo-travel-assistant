@@ -481,6 +481,120 @@ function renderUserNode(text) {
   return node;
 }
 
+function refreshEditButtons() {
+  els.messages.querySelectorAll(".user-edit").forEach((node) => node.remove());
+  if (state.busy || !state.sessionId) return;
+  const users = els.messages.querySelectorAll(".msg.user");
+  const last = users[users.length - 1];
+  if (!last) return;
+  const bubble = last.querySelector(".bubble");
+  if (!bubble || bubble.querySelector(".user-edit-form")) return;
+  const foot = document.createElement("div");
+  foot.className = "msg-foot user-edit";
+  foot.appendChild(
+    chipButton("edit", "编辑", () => startEditUserNode(last, bubble.textContent)),
+  );
+  last.appendChild(foot);
+}
+
+function startEditUserNode(node, originalText) {
+  if (state.busy) return;
+  const bubble = node.querySelector(".bubble");
+  if (!bubble || bubble.querySelector(".user-edit-form")) return;
+  const foot = node.querySelector(".user-edit");
+  if (foot) foot.remove();
+  node.classList.add("editing");
+
+  const form = document.createElement("div");
+  form.className = "user-edit-form";
+  const input = document.createElement("textarea");
+  input.className = "user-edit-input";
+  input.maxLength = 4000;
+  input.value = originalText;
+  input.setAttribute("aria-label", "编辑提问");
+  const actions = document.createElement("div");
+  actions.className = "user-edit-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "save";
+  save.textContent = "保存并重新发送";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "取消";
+  actions.append(save, cancel);
+  form.append(input, actions);
+
+  bubble.textContent = "";
+  bubble.appendChild(form);
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+
+  const restore = () => {
+    node.classList.remove("editing");
+    bubble.textContent = originalText;
+    refreshEditButtons();
+  };
+  const close = () => {
+    input.removeEventListener("keydown", onKeydown);
+    restore();
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      event.preventDefault();
+      close();
+    } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      submit();
+    }
+  };
+  input.addEventListener("keydown", onKeydown);
+
+  cancel.addEventListener("click", close);
+
+  async function submit() {
+    const text = input.value.trim();
+    if (!text) {
+      toast("提问不能为空");
+      input.focus();
+      return;
+    }
+    if (text === originalText) {
+      close();
+      return;
+    }
+    save.disabled = true;
+    cancel.disabled = true;
+    save.textContent = "发送中…";
+    try {
+      await getJSON(
+        `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn?user_id=${encodeURIComponent(
+          state.userId,
+        )}`,
+        { method: "DELETE" },
+      );
+    } catch (error) {
+      toast(`编辑失败：${error.message}`);
+      save.disabled = false;
+      cancel.disabled = false;
+      save.textContent = "保存并重新发送";
+      return;
+    }
+    input.removeEventListener("keydown", onKeydown);
+    // 本轮的用户提问与回答一并移除后重新发送
+    let next = node.nextElementSibling;
+    while (next) {
+      const following = next.nextElementSibling;
+      if (next.classList.contains("msg")) next.remove();
+      next = following;
+    }
+    node.remove();
+    await sendMessage(text);
+  }
+
+  save.addEventListener("click", submit);
+}
+
 function renderHistoryTrace(meta) {
   const schedule = Array.isArray(meta.schedule) ? meta.schedule : [];
   const agents = Array.isArray(meta.agents) ? meta.agents : [];
@@ -1376,6 +1490,7 @@ async function openSession(sessionId, options = {}) {
       addFollowUps(lastAssistantNode, lastAssistantMeta.agents || []);
     }
     trimRegenButtons();
+    refreshEditButtons();
     markActiveHistory();
     const matchIndex = Number.isInteger(options.matchIndex) ? options.matchIndex : -1;
     const matchNode =
@@ -1538,6 +1653,7 @@ async function sendMessage(text, options = {}) {
   } finally {
     state.controller = null;
     setBusy(false);
+    refreshEditButtons();
     els.input.focus();
     await loadSessions();
     refreshStatus();
