@@ -280,6 +280,17 @@ class PostgresLongTermMemory:
                 (self.user_id, ids, self.user_id, session_id, rows[0][0]),
             )
             removed = cursor.rowcount or 0
+        if removed:
+            # 会话消息已被删空时同步清理归档标记，避免幽灵归档
+            self._execute(
+                "DELETE FROM aligo_archived_sessions "
+                "WHERE user_id = %s AND session_id = %s "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM aligo_chat_messages "
+                "  WHERE user_id = %s AND session_id = %s"
+                ")",
+                (self.user_id, session_id, self.user_id, session_id),
+            )
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
@@ -580,6 +591,7 @@ class PostgresLongTermMemory:
         self._execute("DELETE FROM aligo_trips WHERE user_id = %s", (self.user_id,))
         self._execute("DELETE FROM aligo_session_titles WHERE user_id = %s", (self.user_id,))
         self._execute("DELETE FROM aligo_pinned_sessions WHERE user_id = %s", (self.user_id,))
+        self._execute("DELETE FROM aligo_archived_sessions WHERE user_id = %s", (self.user_id,))
 
     def delete_all(self) -> None:
         for table in (
@@ -589,6 +601,7 @@ class PostgresLongTermMemory:
             "aligo_user_stats",
             "aligo_session_titles",
             "aligo_pinned_sessions",
+            "aligo_archived_sessions",
         ):
             self._execute(f"DELETE FROM {table} WHERE user_id = %s", (self.user_id,))
 

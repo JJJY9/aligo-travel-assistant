@@ -450,6 +450,14 @@ class LongTermMemory:
         ]
         stats = self.data["statistics"]
         stats["total_messages"] = max(0, stats.get("total_messages", 0) - count)
+        # 会话消息已被删空时同步清理归档标记，避免幽灵归档
+        if not any(
+            message.get("session_id") == session_id
+            for message in self.data["chat_history"]
+        ):
+            archived_sessions = self.data.get("archived_sessions") or []
+            if session_id in archived_sessions:
+                archived_sessions.remove(session_id)
         if not self._save():
             raise OSError("长期记忆写入失败")
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
@@ -665,6 +673,7 @@ class LongTermMemory:
         self.data["trip_history"] = []
         self.data["session_titles"] = {}
         self.data["pinned_sessions"] = []
+        self.data["archived_sessions"] = []
         self.data["statistics"]["total_trips"] = 0
         self.data["statistics"]["total_messages"] = 0
         self.data["statistics"]["frequent_destinations"] = {}

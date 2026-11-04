@@ -1134,12 +1134,14 @@ def test_session_archive_api():
         assert archived_list["sessions"][0]["archived"] is True
         assert archived_list["archived_count"] == 1
 
-        # 归档不影响读取会话内容
+        # 归档不影响读取会话内容，详情返回标题与归档标记
         detail = client.get(
             f"/api/sessions/{session_id}", params={"user_id": user_id}
         )
         assert detail.status_code == 200
         assert len(detail.json()["messages"]) == 2
+        assert detail.json()["title"] == "消息 archive-1"
+        assert detail.json()["archived"] is True
 
         status = client.get("/api/status", params={"user_id": user_id}).json()
         assert status["archived_count"] == 1
@@ -1173,10 +1175,73 @@ def test_session_archive_api():
         assert removed.json()["removed"] == 2
         status = client.get("/api/status", params={"user_id": user_id}).json()
         assert status["archived_count"] == 0, "没有消息的归档标记不应计入"
+        ghost_list = client.get(
+            "/api/sessions", params={"user_id": user_id, "archived": True}
+        ).json()
+        assert ghost_list["total"] == 0, "消息删光后归档列表应为空"
         client.delete(f"/api/sessions/{session_id}", params={"user_id": user_id})
         status = client.get("/api/status", params={"user_id": user_id}).json()
         assert status["archived_count"] == 0
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            assert session_id not in store.get_archived_sessions(), "删除会话应清理归档标记"
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
         print("✓ 会话归档 / 恢复（列表过滤 / 内容可读 / 计数 / 删除清理）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_archived_sessions_search_and_pagination():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_arch_paging")
+    client = _client()
+    sessions = ["arch-page-1", "arch-page-2", "arch-page-3"]
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for index, sid in enumerate(sessions, start=1):
+                store.add_chat_message("user", f"归档分页问题 {index}", sid)
+                store.add_chat_message("assistant", f"回答 {index}", sid)
+            store.set_session_pinned(sessions[0], True)
+            store.set_session_archived(sessions[0], True)
+            store.set_session_archived(sessions[1], True)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        searched = client.get(
+            "/api/sessions",
+            params={"user_id": user_id, "archived": True, "q": "分页问题 2"},
+        ).json()
+        assert [item["session_id"] for item in searched["sessions"]] == [sessions[1]]
+
+        page1 = client.get(
+            "/api/sessions",
+            params={"user_id": user_id, "archived": True, "limit": 1, "offset": 0},
+        ).json()
+        page2 = client.get(
+            "/api/sessions",
+            params={"user_id": user_id, "archived": True, "limit": 1, "offset": 1},
+        ).json()
+        assert page1["total"] == page2["total"] == 2
+        page_ids = {
+            page1["sessions"][0]["session_id"],
+            page2["sessions"][0]["session_id"],
+        }
+        assert page_ids == {sessions[0], sessions[1]}
+        assert page1["sessions"][0]["pinned"] is False, "归档视图不展示置顶排序"
+        assert all(
+            item["archived"] for item in page1["sessions"] + page2["sessions"]
+        )
+
+        active = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert [item["session_id"] for item in active["sessions"]] == [sessions[2]]
+        print("✓ 归档会话搜索 / 分页 / 置顶标记")
     finally:
         _cleanup(user_id)
 
@@ -1920,6 +1985,7 @@ if __name__ == "__main__":
     test_next_trip_prefers_ongoing()
     test_status_trips_include_conflicts()
     test_session_archive_api()
+    test_archived_sessions_search_and_pagination()
     test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:

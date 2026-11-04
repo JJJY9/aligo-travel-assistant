@@ -206,12 +206,14 @@ def test_clear_history_clears_metadata():
     memory.add_chat_message("user", "hi", "s1")
     memory.set_session_title("s1", "标题")
     memory.set_session_pinned("s1", True)
+    memory.set_session_archived("s1", True)
 
     memory.clear_history()
     assert memory.get_chat_history() == []
     assert memory.get_session_titles() == {}
     assert memory.get_pinned_sessions() == []
-    print("✓ clear_history 同时清理会话元数据")
+    assert memory.get_archived_sessions() == []
+    print("✓ clear_history 同时清理会话元数据（标题 / 置顶 / 归档）")
 
 
 def test_export_data_includes_session_metadata():
@@ -220,11 +222,13 @@ def test_export_data_includes_session_metadata():
     manager = MemoryManager("u-export", "s1", storage_path=tempfile.mkdtemp())
     manager.long_term.set_session_title("s1", "T")
     manager.long_term.set_session_pinned("s1", True)
+    manager.long_term.set_session_archived("s1", True)
 
     data = manager.export_data()
     assert data["session_titles"]["s1"] == "T"
     assert "s1" in data["pinned_sessions"]
-    print("✓ 导出数据包含标题 / 置顶")
+    assert "s1" in data["archived_sessions"]
+    print("✓ 导出数据包含标题 / 置顶 / 归档")
 
 
 class _CountingModel:
