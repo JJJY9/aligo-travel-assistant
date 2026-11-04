@@ -2003,6 +2003,52 @@ def test_knowledge_document_write_api(monkeypatch):
     print("✓ /api/knowledge/documents 新增 / 更新 / 删除接口")
 
 
+def test_knowledge_search_api(monkeypatch):
+    """语义检索接口：参数校验、结果透传与 503 映射。"""
+    from webapp import server as server_module
+
+    calls = {}
+
+    def fake_search(query, top_k):
+        calls["args"] = (query, top_k)
+        return [
+            {
+                "id": 7,
+                "content": "住宿超标准需提前审批",
+                "metadata": {"category": "住宿"},
+                "distance": 0.87,
+            }
+        ]
+
+    monkeypatch.setattr(server_module, "search_documents", fake_search)
+    client = _client()
+    response = client.get(
+        "/api/knowledge/search", params={"q": "住宿超标准", "top_k": 5}
+    )
+    assert response.status_code == 200
+    assert calls["args"] == ("住宿超标准", 5)
+    payload = response.json()
+    assert payload["query"] == "住宿超标准"
+    assert payload["results"][0]["distance"] == 0.87
+
+    assert client.get("/api/knowledge/search", params={"q": ""}).status_code == 422
+    assert (
+        client.get(
+            "/api/knowledge/search", params={"q": "住宿", "top_k": 0}
+        ).status_code
+        == 422
+    )
+
+    def boom(query, top_k):
+        raise RuntimeError("collection released")
+
+    monkeypatch.setattr(server_module, "search_documents", boom)
+    assert (
+        client.get("/api/knowledge/search", params={"q": "住宿"}).status_code == 503
+    )
+    print("✓ /api/knowledge/search 语义检索（参数 / 结果 / 503）")
+
+
 def test_knowledge_api_maps_backend_errors(monkeypatch):
     """Milvus 查询 / 写入失败应映射为 503，而不是 200 空库或 404。"""
     from webapp import server as server_module
@@ -2182,6 +2228,11 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_knowledge_documents_api(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_knowledge_search_api(_mp)
     finally:
         _mp.undo()
     _mp = pytest.MonkeyPatch()
