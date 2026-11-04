@@ -977,11 +977,29 @@ def create_app(model: Any = None) -> FastAPI:
             featured_trip = upcoming_trips[0][1]
         else:
             featured_trip = None
+        # 最近 5 条行程附带与其它行程的日期重叠信息（列表用徽标提示）
+        intervals = [
+            (trip, _trip_interval(trip)) for trip in data["trip_history"]
+        ]
+        trips_view: list[dict[str, Any]] = []
+        for trip in data["trip_history"][-5:]:
+            interval = _trip_interval(trip)
+            conflicts: list[dict[str, Any]] = []
+            if interval is not None:
+                start_dt, end_dt = interval
+                for other, other_interval in intervals:
+                    if other is trip or other_interval is None:
+                        continue
+                    other_start, other_end = other_interval
+                    if other_start <= end_dt and start_dt <= other_end:
+                        conflicts.append(other)
+                conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
+            trips_view.append({**trip, "conflicts": conflicts})
         return {
             "user_id": user_id,
             "preferences": preferences,
             "trip_count": len(data["trip_history"]),
-            "trips": data["trip_history"][-5:],
+            "trips": trips_view,
             "next_trip": featured_trip,
             "chat_count": len(data["chat_history"]),
             "statistics": data["statistics"],

@@ -1057,6 +1057,45 @@ def test_next_trip_prefers_ongoing():
         _cleanup(user_id)
 
 
+def test_status_trips_include_conflicts():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trip_badges")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for destination, start, end in [
+                ("上海", "2026-12-05", "2026-12-07"),
+                ("杭州", "2026-12-06", "2026-12-08"),
+                ("南京", "2026-12-09", "2026-12-10"),
+            ]:
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": destination,
+                        "start_date": start,
+                        "end_date": end,
+                    }
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        status = _client().get("/api/status", params={"user_id": user_id}).json()
+        by_destination = {trip["destination"]: trip for trip in status["trips"]}
+        assert [
+            item["destination"] for item in by_destination["上海"]["conflicts"]
+        ] == ["杭州"]
+        assert [
+            item["destination"] for item in by_destination["杭州"]["conflicts"]
+        ] == ["上海"]
+        assert by_destination["南京"]["conflicts"] == []
+        print("✓ /api/status 行程附带日期重叠信息（不包含自身）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
@@ -1794,6 +1833,7 @@ if __name__ == "__main__":
     test_trip_conflicts_helper_edges()
     test_delete_last_turn_api()
     test_next_trip_prefers_ongoing()
+    test_status_trips_include_conflicts()
     test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:

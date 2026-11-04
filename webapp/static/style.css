@@ -1017,6 +1017,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 .trip-status.active { background: var(--teal-soft); color: var(--teal); }
 .trip-status.upcoming { background: var(--accent-soft); color: var(--accent-strong); }
 .trip-status.past { background: var(--surface-2); color: var(--ink-3); }
+.trip-status.conflict { background: var(--danger-soft); color: var(--danger); }
 .trip.clickable { cursor: pointer; transition: background 0.15s ease; }
 .trip.clickable:hover { background: var(--accent-soft); }
 .trip-actions {
