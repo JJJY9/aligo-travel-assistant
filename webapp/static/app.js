@@ -131,6 +131,12 @@ const els = {
   exportData: byId("exportData"),
   exportDataMd: byId("exportDataMd"),
   overview: byId("overview"),
+  addPrefBtn: byId("addPrefBtn"),
+  prefForm: byId("prefForm"),
+  prefType: byId("prefType"),
+  prefValue: byId("prefValue"),
+  prefSubmit: byId("prefSubmit"),
+  prefCancel: byId("prefCancel"),
   trips: byId("trips"),
   exportTrips: byId("exportTrips"),
   exportTripsCsv: byId("exportTripsCsv"),
@@ -2377,6 +2383,58 @@ function renderUpcoming(trip) {
   } · ${trip.purpose || "出行"}`;
 }
 
+const LIST_PREF_TYPES = new Set(["hotel_brands", "airlines"]);
+
+function newPreferenceValue(type, text) {
+  if (LIST_PREF_TYPES.has(type)) {
+    const items = text
+      .split(/[、，,]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return items.length ? items : text;
+  }
+  if (type === "budget_level") {
+    const number = Number(text);
+    return Number.isFinite(number) ? number : text;
+  }
+  return text;
+}
+
+function resetPreferenceForm() {
+  if (!els.prefForm) return;
+  els.prefForm.hidden = true;
+  els.prefForm.reset();
+  els.prefType.value = "home_location";
+}
+
+async function addPreference(event) {
+  event.preventDefault();
+  const type = els.prefType.value;
+  const text = els.prefValue.value.trim();
+  if (!text) {
+    toast("请输入偏好值");
+    return;
+  }
+  els.prefSubmit.disabled = true;
+  try {
+    await getJSON(`/api/preferences/${encodeURIComponent(type)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: state.userId,
+        value: newPreferenceValue(type, text),
+      }),
+    });
+    toast("偏好已保存");
+    resetPreferenceForm();
+    await refreshStatus();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    els.prefSubmit.disabled = false;
+  }
+}
+
 function preferenceInputValue(value) {
   if (Array.isArray(value)) return value.join("、");
   if (value !== null && typeof value === "object") return JSON.stringify(value);
@@ -3180,6 +3238,7 @@ async function saveUser() {
     resetTripForm();
     els.tripForm.hidden = true;
     resetKnowledgeForm();
+    resetPreferenceForm();
     await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
@@ -3349,8 +3408,14 @@ function bindEvents() {
       "_blank",
     );
   });
-  els.addTripBtn.addEventListener("click", () => {
-    if (els.tripForm.hidden) {
+  els.addPrefBtn.addEventListener("click", () => {
+    els.prefForm.hidden = !els.prefForm.hidden;
+    if (!els.prefForm.hidden) els.prefValue.focus();
+  });
+  els.prefForm.addEventListener("submit", addPreference);
+  els.prefCancel.addEventListener("click", resetPreferenceForm);
+
+  els.addTripBtn.addEventListener("click", () => {    if (els.tripForm.hidden) {
       resetTripForm();
       els.tripForm.hidden = false;
       els.tripDestination.focus();

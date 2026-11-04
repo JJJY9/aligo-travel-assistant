@@ -338,7 +338,23 @@
         <div class="doctor-list" id="doctorList" role="status" aria-live="polite">尚未运行</div>
       </section>
       <section class="sheet-section">
-        <h3>偏好</h3>
+        <h3>偏好 <button class="trip-export" id="addPrefBtn" type="button">添加偏好</button></h3>
+        <form class="trip-form" id="prefForm" hidden>
+          <div class="trip-form-row">
+            <select id="prefType" aria-label="偏好类型">
+              <option value="home_location">常住地</option>
+              <option value="transportation_preference">交通偏好</option>
+              <option value="hotel_brands">酒店偏好</option>
+              <option value="airlines">航空公司偏好</option>
+              <option value="seat_preference">座位偏好</option>
+              <option value="meal_preference">餐食偏好</option>
+              <option value="budget_level">预算等级</option>
+            </select>
+            <input id="prefValue" maxlength="200" placeholder="值（多个用、分隔，如 汉庭、如家）" aria-label="偏好值" required />
+            <button class="ghost" id="prefSubmit" type="submit">保存</button>
+            <button class="ghost" id="prefCancel" type="button">取消</button>
+          </div>
+        </form>
         <div class="pref-list" id="overview">加载中…</div>
       </section>
       <section class="sheet-section">
