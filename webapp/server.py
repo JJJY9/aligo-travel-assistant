@@ -67,6 +67,9 @@ from utils.knowledge_admin import (
 from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
 from utils.stored_message import render_stored_message
+from utils.trip_conflicts import trip_conflicts as _trip_conflicts
+from utils.trip_conflicts import trip_interval as _trip_interval
+from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
 from utils.trip_export import render_trips_csv
 from utils.turn_meta import extract_turn_meta
 
@@ -950,66 +953,6 @@ def _build_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
         if event is not None
     ]
     return _ics_calendar(events)
-
-
-def _trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
-    """行程的日期区间（含首尾）；缺少或无法解析出发日期时返回 None。"""
-    try:
-        start = datetime.strptime(str(trip.get("start_date") or ""), "%Y-%m-%d")
-    except ValueError:
-        return None
-    try:
-        end = datetime.strptime(str(trip.get("end_date") or ""), "%Y-%m-%d")
-    except ValueError:
-        end = start
-    if end < start:
-        end = start
-    return start, end
-
-
-def _trip_conflicts(
-    trips: list[dict[str, Any]],
-    start: datetime,
-    end: datetime,
-    exclude_id: str | None = None,
-) -> list[dict[str, Any]]:
-    """找出与给定日期区间重叠的其它行程（按出发日期排序）。"""
-    conflicts = []
-    for trip in trips:
-        if exclude_id is not None and str(trip.get("trip_id")) == exclude_id:
-            continue
-        interval = _trip_interval(trip)
-        if interval is None:
-            continue
-        other_start, other_end = interval
-        if other_start <= end and start <= other_end:
-            conflicts.append(trip)
-    conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
-    return conflicts
-
-
-def _trips_with_conflicts(
-    trips: list[dict[str, Any]],
-    context: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    """给每条行程附加与 context（默认自身）中其它行程的日期重叠信息。"""
-    pool = context if context is not None else trips
-    intervals = [(trip, _trip_interval(trip)) for trip in pool]
-    views: list[dict[str, Any]] = []
-    for trip in trips:
-        interval = _trip_interval(trip)
-        conflicts: list[dict[str, Any]] = []
-        if interval is not None:
-            start_dt, end_dt = interval
-            for other, other_interval in intervals:
-                if other is trip or other_interval is None:
-                    continue
-                other_start, other_end = other_interval
-                if other_start <= end_dt and start_dt <= other_end:
-                    conflicts.append(other)
-            conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
-        views.append({**trip, "conflicts": conflicts})
-    return views
 
 
 def create_app(model: Any = None) -> FastAPI:
