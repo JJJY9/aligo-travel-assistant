@@ -171,6 +171,7 @@ const els = {
 let welcomeTemplate = null;
 let sessionLoadToken = 0;
 let sessionsRequestId = 0;
+let statusRequestId = 0;
 let searchTimer = null;
 let memorySheetOpener = null;
 let shortcutOpener = null;
@@ -1288,6 +1289,12 @@ function newSession() {
   syncSessionControls();
   setConversationTitle("新对话");
   showWelcome();
+  if (state.showArchived) {
+    // 归档视图下新建对话：切回普通列表，否则新会话不会出现在侧栏
+    state.showArchived = false;
+    updateArchivedToggle();
+    loadSessions(state.searchQuery, { reset: true });
+  }
   markActiveHistory();
   closeMobileSidebar();
   els.input.focus();
@@ -1581,7 +1588,7 @@ async function openSession(sessionId, options = {}) {
     syncSessionControls();
 
     const session = state.sessions.find((item) => item.session_id === sessionId);
-    setConversationTitle(session ? session.title : "对话");
+    setConversationTitle(session ? session.title : data.title || "对话");
 
     els.messages.innerHTML = "";
     let lastUserText = "";
@@ -1877,9 +1884,15 @@ function updateUserCard() {
 }
 
 async function refreshStatus() {
+  const requestId = (statusRequestId += 1);
+  const userId = state.userId;
   try {
-    state.status = await getJSON(`/api/status?user_id=${encodeURIComponent(state.userId)}`);
+    const data = await getJSON(`/api/status?user_id=${encodeURIComponent(userId)}`);
+    // 丢弃过期响应：归档 / 切换用户后，旧请求可能晚到并覆盖新的归档计数
+    if (requestId !== statusRequestId || userId !== state.userId) return;
+    state.status = data;
   } catch {
+    if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = null;
   }
   updateUserCard();

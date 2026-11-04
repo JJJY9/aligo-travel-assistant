@@ -1103,10 +1103,20 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             messages = store.get_chat_history(session_id=session_id)
+            titles = store.get_session_titles()
+            archived_ids = set(store.get_archived_sessions())
         finally:
             _close_long_term(store)
+        title = str(titles.get(session_id) or "")
+        if not title:
+            for message in messages:
+                if message.get("role") == "user":
+                    title = " ".join(str(message.get("content", "")).split())[:40]
+                    break
         return {
             "session_id": session_id,
+            "title": title or "新对话",
+            "archived": session_id in archived_ids,
             "messages": [
                 {
                     "role": message.get("role", "assistant"),

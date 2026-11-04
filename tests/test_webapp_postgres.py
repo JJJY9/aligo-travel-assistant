@@ -196,6 +196,15 @@ def test_webapp_with_postgres_backend(monkeypatch):
             assert "sess-arch-cleanup" in cleanup_store.get_archived_sessions()
             cleanup_store.delete_chat_session("sess-arch-cleanup")
             assert "sess-arch-cleanup" not in cleanup_store.get_archived_sessions()
+            # clear_history / delete_all 同样清理归档标记
+            cleanup_store.add_chat_message("user", "临时2", "sess-arch-clear")
+            cleanup_store.set_session_archived("sess-arch-clear", True)
+            cleanup_store.clear_history()
+            assert cleanup_store.get_archived_sessions() == []
+            cleanup_store.add_chat_message("user", "临时3", "sess-arch-delete")
+            cleanup_store.set_session_archived("sess-arch-delete", True)
+            cleanup_store.delete_all()
+            assert cleanup_store.get_archived_sessions() == []
         finally:
             cleanup_store.close()
         print("✓ Web API 在 PostgreSQL 后端下的读写路径")
