@@ -246,9 +246,16 @@ def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
     def flaky_load(handle, *args, **kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
-            # 模拟另一线程在首次解析失败后完成了新的原子写入
+            # 模拟另一线程在首次解析失败后完成了新的原子写入（带可区分的偏好）
             path.write_text(
-                json_module.dumps({"chat_history": [], "preferences": []}),
+                json_module.dumps(
+                    {
+                        "chat_history": [],
+                        "preferences": [
+                            {"type": "home_location", "value": "杭州"}
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             raise ValueError("Expecting property name enclosed in double quotes")
@@ -256,10 +263,27 @@ def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
 
     monkeypatch.setattr(json_module, "load", flaky_load)
     memory = LongTermMemory("u-race", storage_dir)
-    assert memory.get_chat_history() == []
+    # 必须真正采用并发写入的内容，而不是丢弃后返回空数据
+    assert memory.get_preference("home_location") == "杭州"
     assert path.exists(), "并发写入的有效文件不能被移走"
     assert not list(Path(storage_dir).glob("u-race.json.corrupt-*"))
     print("✓ 损坏备份不会误移并发写入的新文件")
+
+
+def test_valid_json_non_object_memory_file_is_backed_up():
+    """合法 JSON 但不是对象 / 字段结构异常时同样按损坏处理，不能抛错。"""
+    from pathlib import Path
+
+    for content in ("[]", "null", '{"statistics": null}'):
+        storage_dir = tempfile.mkdtemp()
+        path = Path(storage_dir) / "u-shape.json"
+        path.write_text(content, encoding="utf-8")
+        memory = LongTermMemory("u-shape", storage_dir)
+        assert memory.get_chat_history() == [], content
+        backups = list(Path(storage_dir).glob("u-shape.json.corrupt-*"))
+        assert backups, f"结构异常的文件应备份：{content}"
+        assert backups[0].read_text(encoding="utf-8") == content
+    print("✓ 非对象 / 结构异常的记忆文件备份后重建")
 
 
 def test_memory_persistence_error_is_not_retriable():
@@ -552,6 +576,7 @@ if __name__ == "__main__":
     test_clear_history_clears_metadata()
     test_corrupt_memory_file_is_backed_up()
     test_corrupt_backup_does_not_move_concurrently_written_file(pytest.MonkeyPatch())
+    test_valid_json_non_object_memory_file_is_backed_up()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()
     test_session_metadata_save_failure_raises()

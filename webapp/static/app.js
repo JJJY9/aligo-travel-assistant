@@ -188,6 +188,9 @@ let welcomeTemplate = null;
 let sessionLoadToken = 0;
 let sessionsRequestId = 0;
 let statusRequestId = 0;
+// 行程列表（展开全部 / 状态刷新时的二次请求）共用序号：只应用最新一次结果，
+// 防止切换用户后旧用户的数据被渲染（行内删除按当前用户执行，会误删同名 trip_id）
+let tripsRequestId = 0;
 let searchTimer = null;
 let memorySheetOpener = null;
 let shortcutOpener = null;
@@ -888,16 +891,21 @@ async function toggleTripsExpanded() {
     renderOverview();
     return;
   }
+  const userId = state.userId;
+  const requestId = (tripsRequestId += 1);
   els.expandTrips.disabled = true;
   try {
+    // order=desc：取「最近 200 条」，而不是最早的 200 条
     const data = await getJSON(
-      `/api/trips?user_id=${encodeURIComponent(state.userId)}&limit=200`,
+      `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc`,
     );
+    if (requestId !== tripsRequestId || userId !== state.userId) return;
     state.tripsAll = data.trips || [];
     state.tripsAllTotal = Number(data.total || state.tripsAll.length);
     state.tripsExpanded = true;
     renderOverview();
   } catch (error) {
+    if (requestId !== tripsRequestId || userId !== state.userId) return;
     toast(error.message);
   } finally {
     els.expandTrips.disabled = false;
@@ -2007,7 +2015,7 @@ async function refreshStatus() {
     if (state.tripsExpanded && Number(data.trip_count || 0) > 0) {
       try {
         const tripsData = await getJSON(
-          `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200`,
+          `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc`,
         );
         if (requestId !== statusRequestId || userId !== state.userId) return;
         state.tripsAll = tripsData.trips || [];
@@ -2100,7 +2108,10 @@ function renderOverview() {
     empty.textContent = "还没有行程记录";
     els.trips.appendChild(empty);
   } else {
-    [...trips].reverse().forEach((trip) => {
+    // 状态接口按记录顺序（旧→新）返回，界面新→旧展示；
+    // 展开列表已按 order=desc 取回最近若干条，直接使用
+    const ordered = state.tripsExpanded ? [...trips] : [...trips].reverse();
+    ordered.forEach((trip) => {
       const row = document.createElement("div");
       row.className = "trip";
       const route = document.createElement("div");
@@ -2787,12 +2798,13 @@ async function loadMoreKnowledgeDocuments() {
     const data = await getJSON(
       `/api/knowledge/documents?${knowledgeQueryParams(state.kbItems.length)}`,
     );
-    if (seq !== kbListSeq) return;
+    // 语义检索可能在请求期间开始：不能再把关键词行追加进语义结果
+    if (seq !== kbListSeq || state.kbSemanticMode) return;
     state.kbTotal = Number(data.total || 0);
     renderKnowledgeDocuments(data.items || [], true);
     els.kbList.focus();
   } catch (error) {
-    if (seq === kbListSeq) toast(error.message);
+    if (seq === kbListSeq && !state.kbSemanticMode) toast(error.message);
   } finally {
     els.kbMore.disabled = false;
     updateKnowledgeMore();
@@ -2911,6 +2923,9 @@ async function runSemanticSearch({ silent = false } = {}) {
   const seq = ++kbListSeq;
   els.kbSemantic.disabled = true;
   els.kbSemantic.textContent = "检索中…";
+  // 语义检索期间隐藏「加载更多」：它属于关键词列表，点击结果不应掺入语义视图
+  els.kbMore.hidden = true;
+  els.kbMore.disabled = true;
   if (!silent) els.kbList.textContent = "语义检索中…（首次使用需加载向量模型）";
   try {
     const data = await getJSON(
@@ -2934,6 +2949,7 @@ async function runSemanticSearch({ silent = false } = {}) {
   } finally {
     els.kbSemantic.disabled = false;
     els.kbSemantic.textContent = "语义搜索";
+    els.kbMore.disabled = false;
   }
 }
 

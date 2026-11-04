@@ -1625,8 +1625,12 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        order: str = Query(default="asc", pattern="^(asc|desc)$"),
     ) -> dict[str, Any]:
-        """列出历史行程（记录顺序，支持分页；附带日期重叠信息）。"""
+        """列出历史行程（默认记录顺序，支持分页；附带日期重叠信息）。
+
+        ``order=desc`` 返回从最新记录开始的顺序，供记忆面板展示「最近 N 条」。
+        """
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
@@ -1636,12 +1640,14 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         total = len(trips)
-        page = trips[offset : offset + limit]
+        ordered = trips[::-1] if order == "desc" else trips
+        page = ordered[offset : offset + limit]
         return {
             "trips": _trips_with_conflicts(page, trips),
             "total": total,
             "offset": offset,
             "limit": limit,
+            "order": order,
         }
 
     @app.post("/api/trips", status_code=201)

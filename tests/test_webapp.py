@@ -579,13 +579,29 @@ def test_list_trips_api():
             "/api/trips", params={"user_id": user_id, "limit": 3, "offset": 6}
         ).json()
         assert [item["destination"] for item in page3["trips"]] == ["重庆"]
+
+        latest = client.get(
+            "/api/trips", params={"user_id": user_id, "limit": 3, "order": "desc"}
+        ).json()
+        assert [item["destination"] for item in latest["trips"]] == [
+            "重庆",
+            "武汉",
+            "西安",
+        ]
+        assert latest["total"] == 7
+        assert (
+            client.get(
+                "/api/trips", params={"user_id": user_id, "order": "sideways"}
+            ).status_code
+            == 422
+        )
         assert (
             client.get(
                 "/api/trips", params={"user_id": user_id, "limit": 0}
             ).status_code
             == 422
         )
-        print("✓ /api/trips 列表（分页 / 重叠信息 / 参数校验）")
+        print("✓ /api/trips 列表（分页 / 倒序 / 重叠信息 / 参数校验）")
     finally:
         _cleanup(user_id)
 
