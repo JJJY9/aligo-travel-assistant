@@ -498,6 +498,14 @@ function refreshEditButtons() {
   last.appendChild(foot);
 }
 
+function cancelPendingEdits() {
+  els.messages
+    .querySelectorAll(".msg.user.editing .user-edit-input")
+    .forEach((input) => {
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+}
+
 function startEditUserNode(node, originalText) {
   if (state.busy) return;
   const bubble = node.querySelector(".bubble");
@@ -950,6 +958,7 @@ ${bodyHtml}
 
 function exportSessionHtml() {
   if (!state.sessionId) return;
+  cancelPendingEdits();
   const title = (els.convTitle.textContent || "").trim() || "Aligo 对话";
   const clone = els.messages.cloneNode(true);
   clone
@@ -1615,6 +1624,8 @@ async function sendMessage(text, options = {}) {
       els.messages.appendChild(renderUserNode(message));
     }
   }, true);
+  // 生成期间不保留上一条消息的编辑入口（结束后由 refreshEditButtons 移动到新提问）
+  els.messages.querySelectorAll(".user-edit").forEach((node) => node.remove());
   els.input.value = "";
   resizeInput();
 
@@ -2818,7 +2829,10 @@ function bindEvents() {
     applyTheme(currentTheme() === "dark" ? "light" : "dark");
   });
 
-  els.printChat.addEventListener("click", () => window.print());
+  els.printChat.addEventListener("click", () => {
+    cancelPendingEdits();
+    window.print();
+  });
 
   els.copyLink.addEventListener("click", () => {
     if (!state.sessionId) return;
