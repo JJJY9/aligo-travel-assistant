@@ -76,8 +76,9 @@ def list_documents(
     limit: int = 20,
     offset: int = 0,
     query: str = "",
+    category: str = "",
 ) -> dict[str, Any]:
-    """列出知识片段（按 id 倒序，可按内容 / 元数据过滤）。
+    """列出知识片段（按 id 倒序，可按内容 / 元数据 / 分类过滤）。
 
     Returns:
         {"total": int, "items": [{"id", "content", "metadata"}]}
@@ -114,10 +115,32 @@ def list_documents(
             or needle in json.dumps(doc["metadata"], ensure_ascii=False).lower()
         ]
 
+    wanted_category = category.strip()
+    if wanted_category:
+        documents = [
+            doc
+            for doc in documents
+            if str(doc["metadata"].get("category", "")).strip() == wanted_category
+        ]
+
     total = len(documents)
     start = max(0, int(offset))
     size = max(0, int(limit))
     return {"total": total, "items": documents[start : start + size]}
+
+
+def list_categories() -> list[dict[str, Any]]:
+    """统计知识片段的分类分布（供维护面板的筛选下拉框使用）。"""
+    items = list_documents(limit=_MAX_SCAN, offset=0)["items"]
+    counts: dict[str, int] = {}
+    for item in items:
+        category = str(item.get("metadata", {}).get("category", "")).strip()
+        if category:
+            counts[category] = counts.get(category, 0) + 1
+    return [
+        {"category": name, "count": count}
+        for name, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    ]
 
 
 def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[str, Any]:

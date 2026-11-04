@@ -53,6 +53,7 @@ const state = {
   kbItems: [],
   kbTotal: 0,
   kbQuery: "",
+  kbCategory: "",
   kbDeleting: new Set(),
   kbImporting: false,
   kbEditingId: null,
@@ -145,6 +146,7 @@ const els = {
   knowledgeChip: byId("knowledgeChip"),
   kbList: byId("kbList"),
   kbSearch: byId("kbSearch"),
+  kbCategoryFilter: byId("kbCategoryFilter"),
   kbMore: byId("kbMore"),
   kbImport: byId("kbImport"),
   kbImportFile: byId("kbImportFile"),
@@ -2392,7 +2394,40 @@ function knowledgeQueryParams(offset) {
     offset: String(offset),
   });
   if (state.kbQuery) params.set("q", state.kbQuery);
+  if (state.kbCategory) params.set("category", state.kbCategory);
   return params;
+}
+
+async function refreshKnowledgeCategories() {
+  if (!els.kbCategoryFilter) return;
+  try {
+    const data = await getJSON("/api/knowledge/categories");
+    const categories = Array.isArray(data.categories) ? data.categories : [];
+    const current = state.kbCategory;
+    els.kbCategoryFilter.innerHTML = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "全部分类";
+    els.kbCategoryFilter.appendChild(all);
+    let found = false;
+    categories.forEach((item) => {
+      const option = document.createElement("option");
+      option.value = String(item.category);
+      option.textContent = `${item.category}（${item.count}）`;
+      if (option.value === current) found = true;
+      els.kbCategoryFilter.appendChild(option);
+    });
+    if (current && !found) {
+      // 分类在刷新间消失（刚被改名 / 删除）：保留选项避免筛选静默失效
+      const option = document.createElement("option");
+      option.value = current;
+      option.textContent = `${current}（0）`;
+      els.kbCategoryFilter.appendChild(option);
+    }
+    els.kbCategoryFilter.value = current;
+  } catch {
+    // 分类统计失败不影响片段列表
+  }
 }
 
 async function refreshKnowledgeDocuments() {
@@ -2400,6 +2435,7 @@ async function refreshKnowledgeDocuments() {
   els.kbList.textContent = "加载中…";
   state.kbItems = [];
   state.kbTotal = 0;
+  refreshKnowledgeCategories();
   try {
     const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
     state.kbTotal = Number(data.total || 0);
@@ -2852,6 +2888,10 @@ function bindEvents() {
       state.kbQuery = els.kbSearch.value.trim();
       refreshKnowledgeDocuments();
     }
+  });
+  els.kbCategoryFilter.addEventListener("change", () => {
+    state.kbCategory = els.kbCategoryFilter.value;
+    refreshKnowledgeDocuments();
   });
   els.kbMore.addEventListener("click", loadMoreKnowledgeDocuments);
   els.runDoctor.addEventListener("click", runDoctorCheck);

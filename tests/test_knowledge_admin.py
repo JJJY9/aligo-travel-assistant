@@ -68,7 +68,31 @@ def test_list_documents_parses_sorts_and_filters(monkeypatch):
     filtered = knowledge_admin.list_documents(query="住宿")
     assert filtered["total"] == 1
     assert filtered["items"][0]["id"] == 3
-    print("✓ 知识片段列表（解析 / 排序 / 过滤 / 分页）")
+
+    by_category = knowledge_admin.list_documents(category="住宿")
+    assert by_category["total"] == 1
+    assert by_category["items"][0]["id"] == 3
+    assert knowledge_admin.list_documents(category="交通")["items"][0]["id"] == 1
+    assert knowledge_admin.list_documents(category="不存在")["total"] == 0
+    print("✓ 知识片段列表（解析 / 排序 / 过滤 / 分类 / 分页）")
+
+
+def test_list_categories_counts(monkeypatch):
+    rows = [
+        {"id": 4, "content": "住宿标准 A", "metadata": '{"category": "住宿"}'},
+        {"id": 3, "content": "住宿标准 B", "metadata": '{"category": "住宿"}'},
+        {"id": 2, "content": "交通标准", "metadata": '{"category": "交通"}'},
+        {"id": 1, "content": "无分类", "metadata": "{}"},
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+
+    categories = knowledge_admin.list_categories()
+    assert categories == [
+        {"category": "住宿", "count": 2},
+        {"category": "交通", "count": 1},
+    ], "按数量倒序，未分类不出现"
+    print("✓ 知识分类统计（按数量倒序 / 忽略未分类）")
 
 
 def test_add_document_maps_result(monkeypatch):
@@ -318,6 +342,7 @@ def test_import_chunks_large_documents(monkeypatch):
 if __name__ == "__main__":
     for case in (
         test_list_documents_parses_sorts_and_filters,
+        test_list_categories_counts,
         test_add_document_maps_result,
         test_add_document_error_raises,
         test_update_document_rewrites_content,
