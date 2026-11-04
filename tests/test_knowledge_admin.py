@@ -98,6 +98,53 @@ def test_add_document_error_raises(monkeypatch):
     print("✓ 新增失败时抛出错误")
 
 
+def test_update_document_rewrites_content(monkeypatch):
+    from pathlib import Path
+
+    rows = [{"id": 7, "content": "旧内容", "metadata": '{"category": "住宿"}'}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _UpdateAgent:
+        def __init__(self):
+            self.calls = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.calls.append((doc_id, content, metadata))
+            return {"status": "success", "id": doc_id}
+
+    agent = _UpdateAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    result = knowledge_admin.update_document(7, "  新内容  ", {"category": "交通"})
+    assert result == {"status": "success", "id": 7}
+    assert agent.calls == [(7, "新内容", {"category": "交通"})]
+
+    with pytest.raises(LookupError):
+        knowledge_admin.update_document(99, "不存在")
+    with pytest.raises(ValueError):
+        knowledge_admin.update_document(7, "   ")
+    print("✓ 知识片段更新（存在性 / 内容清洗 / 缺省 id）")
+
+
+def test_update_document_error_propagates(monkeypatch):
+    from pathlib import Path
+
+    fake_client = _FakeMilvusClient([{"id": 7, "content": "旧内容", "metadata": "{}"}])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _FailAgent:
+        def update_document(self, doc_id, content, metadata):
+            return {"status": "error", "message": "embedding failed"}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _FailAgent())
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        knowledge_admin.update_document(7, "新内容")
+    print("✓ 知识片段更新失败向上抛出（不静默成功）")
+
+
 def test_delete_document_checks_existence(monkeypatch):
     fake = _FakeMilvusClient([{"id": 5, "content": "x", "metadata": "{}"}])
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
@@ -273,6 +320,8 @@ if __name__ == "__main__":
         test_list_documents_parses_sorts_and_filters,
         test_add_document_maps_result,
         test_add_document_error_raises,
+        test_update_document_rewrites_content,
+        test_update_document_error_propagates,
         test_delete_document_checks_existence,
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,

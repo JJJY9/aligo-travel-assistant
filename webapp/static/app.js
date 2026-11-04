@@ -55,6 +55,7 @@ const state = {
   kbQuery: "",
   kbDeleting: new Set(),
   kbImporting: false,
+  kbEditingId: null,
   tripEditingId: null,
   sessionTotal: 0,
 };
@@ -149,6 +150,7 @@ const els = {
   kbContent: byId("kbContent"),
   kbCategory: byId("kbCategory"),
   kbSubmit: byId("kbSubmit"),
+  kbCancel: byId("kbCancel"),
   runDoctor: byId("runDoctor"),
   doctorNetwork: byId("doctorNetwork"),
   doctorList: byId("doctorList"),
@@ -2439,13 +2441,19 @@ function renderKnowledgeDocuments(items, append) {
 
     const actions = document.createElement("span");
     actions.className = "pref-actions";
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.title = "编辑片段";
+    edit.setAttribute("aria-label", `编辑知识片段 ${doc.id}`);
+    edit.innerHTML = icon("edit");
+    edit.addEventListener("click", () => startEditKnowledge(doc));
     const del = document.createElement("button");
     del.type = "button";
     del.title = "删除片段";
     del.setAttribute("aria-label", `删除知识片段 ${doc.id}`);
     del.innerHTML = icon("trash");
     del.addEventListener("click", () => removeKnowledgeDocument(doc.id));
-    actions.appendChild(del);
+    actions.append(edit, del);
 
     row.append(main, actions);
     els.kbList.appendChild(row);
@@ -2490,10 +2498,34 @@ async function removeKnowledgeDocument(docId) {
     state.kbDeleting.delete(docId);
   }
   if (removed) {
+    if (state.kbEditingId === docId) resetKnowledgeForm();
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
     els.kbList.focus();
   } else if (button) {
     button.disabled = false;
+  }
+}
+
+function startEditKnowledge(doc) {
+  state.kbEditingId = doc.id;
+  els.kbContent.value = doc.content || "";
+  els.kbCategory.value = doc.metadata?.category ? String(doc.metadata.category) : "";
+  els.kbSubmit.textContent = "保存修改";
+  els.kbCancel.hidden = false;
+  els.kbContent.focus();
+  els.kbContent.setSelectionRange(
+    els.kbContent.value.length,
+    els.kbContent.value.length,
+  );
+}
+
+function resetKnowledgeForm({ clear = true } = {}) {
+  state.kbEditingId = null;
+  els.kbSubmit.textContent = "添加片段";
+  els.kbCancel.hidden = true;
+  if (clear) {
+    els.kbContent.value = "";
+    els.kbCategory.value = "";
   }
 }
 
@@ -2507,24 +2539,31 @@ async function addKnowledgeDocument(event) {
   const metadata = {};
   const category = els.kbCategory.value.trim();
   if (category) metadata.category = category;
+  const editingId = state.kbEditingId;
   els.kbSubmit.disabled = true;
-  els.kbSubmit.textContent = "添加中…";
+  els.kbSubmit.textContent = editingId ? "保存中…" : "添加中…";
   try {
-    await getJSON("/api/knowledge/documents", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, metadata }),
-    });
+    await getJSON(
+      editingId
+        ? `/api/knowledge/documents/${encodeURIComponent(editingId)}`
+        : "/api/knowledge/documents",
+      {
+        method: editingId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, metadata }),
+      },
+    );
+    toast(editingId ? "知识片段已更新" : "知识片段已添加");
     // 提交期间用户可能继续输入下一条，只清空仍是本次提交内容的输入框
     if (els.kbContent.value.trim() === content) els.kbContent.value = "";
     if (els.kbCategory.value.trim() === category) els.kbCategory.value = "";
-    toast("知识片段已添加");
+    resetKnowledgeForm({ clear: false });
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
     toast(error.message);
   } finally {
     els.kbSubmit.disabled = false;
-    els.kbSubmit.textContent = "添加片段";
+    els.kbSubmit.textContent = state.kbEditingId ? "保存修改" : "添加片段";
   }
 }
 
@@ -2745,6 +2784,7 @@ function bindEvents() {
   });
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
+  els.kbCancel.addEventListener("click", () => resetKnowledgeForm());
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
   els.kbSearch.addEventListener("input", () => {

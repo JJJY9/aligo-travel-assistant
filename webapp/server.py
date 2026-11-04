@@ -57,6 +57,7 @@ from utils.knowledge_admin import (
     export_documents,
     import_documents,
     list_documents,
+    update_document,
 )
 from utils.knowledge_stats import knowledge_status
 from utils.rate_limit import RateLimiter
@@ -858,6 +859,27 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("添加知识片段失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"添加失败：{exc}") from exc
+
+    @app.put("/api/knowledge/documents/{doc_id}")
+    def knowledge_update(
+        payload: KnowledgeDocumentPayload,
+        doc_id: int = ApiPath(..., ge=1),
+    ) -> dict[str, Any]:
+        """更新知识片段（内容重新向量化；片段不存在返回 404）。"""
+        try:
+            return update_document(doc_id, payload.content, payload.metadata)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{exc}（先运行 python .claude/skills/ask-question/script/init_knowledge_base.py）",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
+            logger.warning("更新知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"更新失败：{exc}") from exc
 
     @app.delete("/api/knowledge/documents/{doc_id}")
     def knowledge_delete(doc_id: int = ApiPath(..., ge=1)) -> dict[str, Any]:

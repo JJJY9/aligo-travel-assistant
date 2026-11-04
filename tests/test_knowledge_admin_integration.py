@@ -89,6 +89,49 @@ def test_add_search_and_delete_roundtrip():
     print(f"✓ 知识片段新增 / 语义检索 / 删除闭环（id={first_id} → {second_id}）")
 
 
+def test_update_document_roundtrip():
+    """更新片段：内容与 metadata 覆盖、重新嵌入后可检索，删除后不残留。"""
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    from utils.knowledge_admin import (
+        add_document,
+        delete_document,
+        list_documents,
+        search_documents,
+        update_document,
+    )
+
+    old_marker = f"集成测试原始内容 {uuid.uuid4().hex[:8]}"
+    new_marker = f"集成测试更新内容 {uuid.uuid4().hex[:8]}"
+
+    created = add_document(old_marker, {"category": "旧分类"})
+    doc_id = created.get("id")
+    assert doc_id, f"新增后应返回片段 id：{created}"
+
+    try:
+        result = update_document(doc_id, new_marker, {"category": "临时测试"})
+        assert result == {"status": "success", "id": doc_id}
+
+        items = list_documents(query=new_marker)["items"]
+        updated = next((item for item in items if item["id"] == doc_id), None)
+        assert updated is not None, "更新后应能按新内容查到"
+        assert updated["content"] == new_marker, "内容应被覆盖"
+        assert updated["metadata"].get("category") == "临时测试"
+
+        assert not list_documents(query=old_marker)["items"], "旧内容不应残留"
+
+        hits = search_documents(new_marker, top_k=3)
+        assert any(new_marker in str(hit.get("content", "")) for hit in hits), (
+            f"更新后的片段应能被语义检索命中，实际：{hits}"
+        )
+    finally:
+        assert delete_document(doc_id) is True
+
+    print(f"✓ 知识片段更新闭环（重新嵌入 + 覆盖旧内容，id={doc_id}）")
+
+
 def test_export_import_roundtrip_is_idempotent():
     """导出 → 原样导入：已有片段全部按内容跳过，数量不变。"""
     reason = _skip_reason()
@@ -118,5 +161,6 @@ if __name__ == "__main__":
         print(f"跳过：{skip_reason}")
     else:
         test_add_search_and_delete_roundtrip()
+        test_update_document_roundtrip()
         test_export_import_roundtrip_is_idempotent()
         print("\n全部通过")

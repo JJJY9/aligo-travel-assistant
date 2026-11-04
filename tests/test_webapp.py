@@ -1490,7 +1490,41 @@ def test_knowledge_document_write_api(monkeypatch):
     assert ok.status_code == 200 and ok.json()["deleted"] is True
     assert deleted["id"] == 7
     assert client.delete("/api/knowledge/documents/8").status_code == 404
-    print("✓ /api/knowledge/documents 新增 / 删除接口")
+
+    updated = {}
+
+    def fake_update(doc_id, content, metadata):
+        updated["call"] = (doc_id, content, metadata)
+        return {"status": "success", "id": doc_id}
+
+    monkeypatch.setattr(server_module, "update_document", fake_update)
+    changed = client.put(
+        "/api/knowledge/documents/7",
+        json={"content": "更新后的知识", "metadata": {"category": "交通"}},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["id"] == 7
+    assert updated["call"] == (7, "更新后的知识", {"category": "交通"})
+    assert (
+        client.put("/api/knowledge/documents/7", json={"content": ""}).status_code
+        == 422
+    )
+    assert (
+        client.put("/api/knowledge/documents/0", json={"content": "x"}).status_code
+        == 422
+    )
+
+    def fake_update_missing(doc_id, content, metadata):
+        raise LookupError("知识片段不存在")
+
+    monkeypatch.setattr(server_module, "update_document", fake_update_missing)
+    assert (
+        client.put(
+            "/api/knowledge/documents/99", json={"content": "不存在"}
+        ).status_code
+        == 404
+    )
+    print("✓ /api/knowledge/documents 新增 / 更新 / 删除接口")
 
 
 def test_knowledge_api_maps_backend_errors(monkeypatch):
