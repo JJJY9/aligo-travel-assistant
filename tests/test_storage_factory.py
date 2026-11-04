@@ -509,9 +509,16 @@ def test_append_preference_merges_atomically():
     # 并发场景：先由记忆面板写入新值，再追加；追加基于磁盘最新值合并
     memory.save_preference("hotel_brands", ["万豪"])
     assert memory.append_preference("hotel_brands", "希尔顿") == ["万豪", "希尔顿"]
+
+    # 模型给出列表形式的 append 值：逐项合并，不能存成嵌套列表
+    memory.save_preference("airlines", ["东航"])
+    assert memory.append_preference("airlines", ["国航", "东航"]) == ["东航", "国航"]
+    assert memory.get_preference("airlines") == ["东航", "国航"]
+
     reopened = LongTermMemory("u-append", storage_dir)
     assert reopened.get_preference("hotel_brands") == ["万豪", "希尔顿"]
-    print("✓ append_preference 原子合并（字符串→列表 / 去重 / 并发值保留）")
+    assert reopened.get_preference("airlines") == ["东航", "国航"]
+    print("✓ append_preference 原子合并（字符串→列表 / 列表逐项 / 去重 / 并发值保留）")
 
 
 def test_summary_invalidated_by_trip_edit():

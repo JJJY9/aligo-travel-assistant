@@ -79,18 +79,32 @@ def next_entity_id(
     未加载时 query 会直接报错。查询失败时向上抛出，而不是退回行数兜底——
     删除过片段后 row_count 小于最大 id，按行数递增会与已有主键冲突，
     而 Milvus 对重复主键的 insert 会静默覆盖旧实体（数据丢失）。
+
+    单次 query 最多返回 ``max_scan`` 行且顺序不确定；集合超过该规模时
+    按 ``id >= 上一批最大值 + 1`` 逐批扫描，避免只看到任意子集而取到
+    一个偏小的「最大值」、与已有主键冲突。
     """
     try:
         client.load_collection(collection_name)
     except Exception as exc:  # noqa: BLE001 - 2.x 无该调用；查询失败会在下面暴露
         logger.debug("load_collection before next id skipped: %s", exc)
-    rows = client.query(
-        collection_name=collection_name,
-        filter=f"{id_field} >= 0",
-        output_fields=[id_field],
-        limit=max_scan,
-    )
-    return max((int(row.get(id_field, 0) or 0) for row in rows or []), default=0) + 1
+    max_id = 0
+    while True:
+        rows = client.query(
+            collection_name=collection_name,
+            filter=f"{id_field} >= {max_id + 1}",
+            output_fields=[id_field],
+            limit=max_scan,
+        )
+        if not rows:
+            break
+        batch_max = max(int(row.get(id_field, 0) or 0) for row in rows)
+        if batch_max <= max_id:
+            break
+        max_id = batch_max
+        if len(rows) < max_scan:
+            break
+    return max_id + 1
 
 
 def reset_milvus_client(db_path: str) -> None:

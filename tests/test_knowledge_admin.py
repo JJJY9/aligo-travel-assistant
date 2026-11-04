@@ -31,6 +31,9 @@ class _FakeMilvusClient:
         if filter.startswith("id =="):
             doc_id = int(filter.split("==")[1])
             return [row for row in self.rows if int(row["id"]) == doc_id]
+        if filter.startswith("id >="):
+            threshold = int(filter.split(">=")[1])
+            return [row for row in self.rows if int(row["id"]) >= threshold][:limit]
         # 与真实 Milvus 一致：查询受 limit 限制（导出截断回归才能被测出）
         return list(self.rows)[:limit]
 
