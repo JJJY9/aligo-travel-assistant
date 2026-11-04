@@ -416,6 +416,15 @@ def test_main_session_export_dispatch(monkeypatch):
     print("✓ dispatch 层 session-export 正常执行")
 
 
+def test_interactive_user_id_validation(monkeypatch):
+    answers = iter(["../etc/passwd", "-bad", "alice"])
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *args, **kwargs: next(answers))
+    instance = cli.AligoCLI()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert instance._prompt_user_id() == "alice"
+    print("✓ 交互式用户 ID 校验（拒绝路径穿越 / 短横线开头）")
+
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
     test_session_export_flag_parsing()
@@ -428,6 +437,7 @@ if __name__ == "__main__":
         test_leading_hyphen_ids_rejected,
         test_pg_healthy_store_passthrough,
         test_save_failure_reports_error,
+        test_interactive_user_id_validation,
         test_main_accepts_valid_flags,
         test_archive_and_restore,
         test_archive_missing_session,
