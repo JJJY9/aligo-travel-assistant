@@ -591,6 +591,38 @@ def test_summary_cache_avoids_repeated_calls():
     print("✓ 长期记忆总结按指纹缓存")
 
 
+def test_recovered_postgres_logs_fallback_warning(monkeypatch):
+    """PG 从故障恢复、会话从 JSON 切回 PG 时记录「故障期数据未合并」警告。"""
+    from config import STORAGE_CONFIG
+    from context import memory_manager as mm_module
+
+    manager = mm_module.MemoryManager(
+        "u-switch", "s-switch", storage_path=tempfile.mkdtemp()
+    )
+    assert isinstance(manager.long_term, LongTermMemory)
+
+    class _PostgresLike:
+        snapshot_based = False
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://localhost/x")
+    monkeypatch.setattr(
+        mm_module, "create_long_term_memory", lambda user_id, path: _PostgresLike()
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        mm_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args if args else msg),
+    )
+    manager._rebuild_long_term()
+    assert isinstance(manager.long_term, _PostgresLike)
+    assert any("不会自动合并" in text for text in warnings)
+    print("✓ PG 恢复切换后端时记录回退数据警告")
+
+
 def test_reload_long_term_respects_backend():
     from context.memory_manager import MemoryManager
 
@@ -767,4 +799,5 @@ if __name__ == "__main__":
     test_embedding_model_shared(pytest.MonkeyPatch())
     test_summary_cache_avoids_repeated_calls()
     test_reload_long_term_respects_backend()
+    test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
     print("\n全部通过")

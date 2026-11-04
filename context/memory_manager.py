@@ -6,7 +6,9 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from .long_term_memory import LongTermMemory
 from .storage import create_long_term_memory, create_short_term_memory
+from config import STORAGE_CONFIG
 from utils.json_parser import extract_json_from_async_response
 from utils.turn_meta import strip_turn_meta
 
@@ -46,6 +48,27 @@ class MemoryManager:
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
+    def _rebuild_long_term(self) -> None:
+        """重建长期记忆实例。
+
+        PostgreSQL 故障期间工厂会回退本地 JSON，恢复后下一次重建会切回 PG；
+        故障窗口内写入 JSON 的消息 / 偏好不会自动合并，这里明确记录警告，
+        避免用户以为数据丢失（文件仍在 data/memory/<user>.json）。
+        """
+        previous = self.long_term
+        new_store = create_long_term_memory(self.user_id, self._storage_path)
+        if (
+            isinstance(previous, LongTermMemory)
+            and not isinstance(new_store, LongTermMemory)
+            and STORAGE_CONFIG.get("postgres_dsn")
+        ):
+            logger.warning(
+                "PostgreSQL 已恢复：故障期间写入本地 JSON 的记忆"
+                "（data/memory/%s.json）不会自动合并到 PostgreSQL",
+                self.user_id,
+            )
+        self.long_term = new_store
+
     # ========== 短期记忆操作 ==========
 
     def add_message(self, role: str, content: str, metadata: dict | None = None):
@@ -63,7 +86,7 @@ class MemoryManager:
         # JSON 后端持有内存快照：写入前重新加载，避免本轮对话期间通过记忆面板
         # 写入的标题 / 置顶 / 偏好被旧快照覆盖；PostgreSQL 直接查询，无需重载。
         if getattr(self.long_term, "snapshot_based", True):
-            self.long_term = create_long_term_memory(self.user_id, self._storage_path)
+            self._rebuild_long_term()
 
         # 同时添加到长期记忆（跨会话持久化）
         self.long_term.add_chat_message(role, content, self.session_id)
@@ -121,7 +144,7 @@ class MemoryManager:
         """
         if not getattr(self.long_term, "snapshot_based", True):
             return
-        self.long_term = create_long_term_memory(self.user_id, self._storage_path)
+        self._rebuild_long_term()
 
     def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
         """
