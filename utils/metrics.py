@@ -9,9 +9,10 @@ import time
 from collections import Counter
 from typing import Any
 
-# 路径基数上限：路径可能包含会话 ID 等高基数片段，超出后归入 __other__
+# 基数上限：路径可能包含会话 ID、方法名由客户端任意指定，超出后归入 __other__
 MAX_PATHS = 100
-_OTHER_PATH = "__other__"
+MAX_METHODS = 16
+_OTHER = "__other__"
 
 
 class RequestMetrics:
@@ -33,11 +34,15 @@ class RequestMetrics:
         with self._lock:
             self._total += 1
             self._by_status[int(status)] += 1
-            self._by_method[str(method)[:10] or "UNKNOWN"] += 1
+            safe_method = str(method)[:16] or "UNKNOWN"
+            if len(self._by_method) < MAX_METHODS or safe_method in self._by_method:
+                self._by_method[safe_method] += 1
+            else:
+                self._by_method[_OTHER] += 1
             if len(self._by_path) < MAX_PATHS or safe_path in self._by_path:
                 self._by_path[safe_path] += 1
             else:
-                self._by_path[_OTHER_PATH] += 1
+                self._by_path[_OTHER] += 1
             self._duration_sum_ms += max(0.0, float(elapsed_ms))
             self._duration_max_ms = max(self._duration_max_ms, float(elapsed_ms))
 
@@ -48,7 +53,7 @@ class RequestMetrics:
                 "uptime_sec": round(time.time() - self._started_at, 1),
                 "requests_total": total,
                 "by_status": {str(key): value for key, value in sorted(self._by_status.items())},
-                "by_method": dict(self._by_method.most_common()),
+                "by_method": dict(self._by_method.most_common(20)),
                 "by_path": dict(self._by_path.most_common(20)),
                 "avg_duration_ms": round(self._duration_sum_ms / total, 2) if total else 0.0,
                 "max_duration_ms": round(self._duration_max_ms, 2),

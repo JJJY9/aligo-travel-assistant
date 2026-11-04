@@ -314,7 +314,10 @@ class AligoCLI:
 
         if agents_called:
             self.console.print()
-            self.console.print(f"🤖 调用智能体: {', '.join(agents_called)}", style="dim")
+            self.console.print(
+                f"🤖 调用智能体: {escape(', '.join(agents_called))}",
+                style="dim",
+            )
 
     def _display_results(self, result_data: dict):
         """显示执行结果 - 确保永远有回复"""
@@ -455,7 +458,7 @@ class AligoCLI:
                 if not itinerary and "data" in data and isinstance(data["data"], dict):
                     itinerary = data["data"].get("itinerary")
 
-                if isinstance(itinerary, str):
+                if isinstance(itinerary, str) and itinerary.strip():
                     # 模型可能直接返回一段文字行程
                     self.console.print()
                     self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
@@ -474,88 +477,6 @@ class AligoCLI:
                         f"时长: {escape(str(itinerary.get('duration', '未知')))}"
                     )
                     self.console.print()
-
-                    # 每日行程（结构异常时按纯文本兜底，不能让整轮回答丢失）
-                    daily_plans = itinerary.get("daily_plans") or []
-                    if isinstance(daily_plans, dict):
-                        daily_plans = list(daily_plans.values())
-                    if not isinstance(daily_plans, list):
-                        daily_plans = []
-                    for day_plan in daily_plans:
-                        if not isinstance(day_plan, dict):
-                            self.console.print(escape(str(day_plan)))
-                            continue
-                        day_num = escape(str(day_plan.get("day", 1)))
-                        self.console.print(f"[bold yellow]第 {day_num} 天[/bold yellow]")
-
-                        # 兼容 activities 和 time_slots
-                        activities = (
-                            day_plan.get("activities") or day_plan.get("time_slots") or []
-                        )
-                        if isinstance(activities, dict):
-                            activities = list(activities.values())
-                        if not isinstance(activities, list):
-                            activities = []
-                        for slot in activities:
-                            if not isinstance(slot, dict):
-                                self.console.print(escape(str(slot)))
-                                continue
-                            time_text = escape(str(slot.get("time", "")))
-                            activity = escape(
-                                str(slot.get("activity") or slot.get("location") or "")
-                            )
-                            description = slot.get("description", "")
-                            transport = slot.get("transport", "")
-
-                            self.console.print(f"  {time_text} - {activity}")
-                            if description:
-                                self.console.print(
-                                    f"    {escape(str(description))}", style="dim"
-                                )
-                            if transport:
-                                self.console.print(
-                                    f"    🚇 {escape(str(transport))}", style="dim"
-                                )
-
-                        # 餐食建议
-                        meals = day_plan.get("meals") or {}
-                        if not isinstance(meals, dict):
-                            meals = {}
-                        if meals:
-                            self.console.print()
-                            if meals.get("lunch"):
-                                self.console.print(
-                                    f"  🍜 {escape(str(meals['lunch']))}", style="dim"
-                                )
-                            if meals.get("dinner"):
-                                self.console.print(
-                                    f"  🍽️  {escape(str(meals['dinner']))}", style="dim"
-                                )
-                        self.console.print()
-
-                    # 注意事项
-                    notes = itinerary.get("notes") or []
-                    if isinstance(notes, str):
-                        notes = [notes]
-                    if not isinstance(notes, list):
-                        notes = []
-                    if notes:
-                        self.console.print("[bold]📌 注意事项[/bold]")
-                        for note in notes:
-                            self.console.print(f"  • {escape(str(note))}")
-                    current_agent_shown = True
-                elif itinerary and not isinstance(itinerary, dict):
-                    self.console.print()
-                    self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
-                    self.console.print(escape(str(itinerary)))
-                    current_agent_shown = True
-                elif itinerary:
-                    title = escape(str(itinerary.get("title", "行程规划")))
-                    self.console.print()
-                    self.console.print(f"✈️  [bold cyan]{title}[/bold cyan]")
-                    self.console.print(
-                        f"时长: {escape(str(itinerary.get('duration', '未知')))}"
-                    )
 
                     # 每日行程（结构异常时按纯文本兜底，不能让整轮回答丢失）
                     daily_plans = itinerary.get("daily_plans") or []
@@ -696,7 +617,17 @@ class AligoCLI:
                     info_shown = True
 
                 if missing_info:
-                    self.console.print(f"\n💡 还需要补充: {', '.join(missing_info)}", style="yellow")
+                    if isinstance(missing_info, str):
+                        missing_items = [missing_info]
+                    elif isinstance(missing_info, (list, tuple)):
+                        missing_items = [str(item) for item in missing_info]
+                    else:
+                        missing_items = [str(missing_info)]
+                    self.console.print()
+                    self.console.print(
+                        f"💡 还需要补充: {escape(', '.join(missing_items))}",
+                        style="yellow",
+                    )
                     info_shown = True
                 
                 if info_shown:
@@ -910,7 +841,10 @@ class AligoCLI:
         if ok:
             self.console.print("LLM 服务: [green]正常[/green]", style="bold")
         else:
-            self.console.print(f"LLM 服务: [red]不可用[/red] - {msg}", style="bold")
+            self.console.print(
+                f"LLM 服务: [red]不可用[/red] - {escape(str(msg))}",
+                style="bold",
+            )
         self.console.print()
 
     async def run_doctor(self):

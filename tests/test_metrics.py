@@ -41,6 +41,19 @@ def test_path_cardinality_is_bounded():
     print("✓ 高基数路径归入 __other__，聚合有界")
 
 
+def test_method_cardinality_is_bounded():
+    """HTTP 方法由客户端指定（h11 接受任意 token），同样要有基数上限。"""
+    metrics = RequestMetrics()
+    for index in range(50):
+        metrics.record(f"X{index}", "/api/health", 200, 1.0)
+    snapshot = metrics.snapshot()
+    assert len(snapshot["by_method"]) <= 20
+    full = metrics._by_method  # noqa: SLF001 - 直接断言内部聚合
+    assert len(full) <= 16 + 1
+    assert full["__other__"] == 50 - 16
+    print("✓ 方法基数有上限（超出归 __other__）")
+
+
 def test_control_characters_are_sanitized():
     metrics = RequestMetrics()
     metrics.record("GET", "/api/x\nfake-line", 200, 1.0)
@@ -63,6 +76,7 @@ def test_reset():
 if __name__ == "__main__":
     test_record_and_snapshot()
     test_path_cardinality_is_bounded()
+    test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()
     test_reset()
     print("\n全部通过")

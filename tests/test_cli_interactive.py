@@ -63,6 +63,27 @@ def test_eof_at_main_prompt_breaks_loop(monkeypatch):
     print("✓ 主循环 EOF 正常退出（不再刷屏）")
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="GBK 管道只在 Windows 中文 locale 下有区分度"
+)
+def test_gbk_piped_input_keeps_locale_decoding():
+    """原生 cmd 的 GBK 管道输入不能被强行按 UTF-8 解码成乱码。"""
+    script = (
+        "import sys; sys.path.insert(0, r'%s'); "
+        "from utils.console import configure_stdio; configure_stdio(); "
+        "print(input())" % project_root
+    )
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8=0", "-c", script],
+        input="我要去北京".encode("gbk"),
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert result.stdout.decode("utf-8").strip() == "我要去北京"
+    print("✓ GBK 管道输入保持 locale 解码")
+
+
 def test_utf8_piped_input_not_mojibake():
     """Windows GBK locale 下，UTF-8 管道输入应被正确解码。"""
     script = (
@@ -104,7 +125,14 @@ def test_human_response_escapes_markup():
     text = buffer.getvalue()
     assert "https://example.com" in text
     assert "[/red]" in text
-    print("✓ 回答中的方括号 / 关闭标签按原文显示")
+
+    # 模型给出的智能体名同样可能带标记：不能在汇总行抛 MarkupError
+    agent2, buffer2 = _capture_console()
+    agent2._display_agents_called(
+        {"results": [{"agent_name": "bad[/red]", "status": "success"}]}
+    )
+    assert "bad[/red]" in buffer2.getvalue()
+    print("✓ 回答 / 智能体名中的方括号与关闭标签按原文显示")
 
 
 def test_human_response_tolerates_malformed_itinerary():
@@ -121,6 +149,7 @@ def test_human_response_tolerates_malformed_itinerary():
             }
         },
         {"itinerary": ["北京", "上海"]},
+        {"itinerary": "", "answer": "缺少出发地，请补充"},
     ]
     for payload in payloads:
         agent, buffer = _capture_console()
@@ -128,7 +157,19 @@ def test_human_response_tolerates_malformed_itinerary():
             [{"agent_name": "itinerary_planning", "status": "success", "data": payload}]
         )
         assert buffer.getvalue().strip(), payload
-    print("✓ 非标准行程结构渲染不崩溃")
+    # 空字符串 itinerary 应回退到通用字段，而不是只打印空标题
+    agent, buffer = _capture_console()
+    agent._generate_human_response(
+        [
+            {
+                "agent_name": "itinerary_planning",
+                "status": "success",
+                "data": {"itinerary": "", "answer": "缺少出发地，请补充"},
+            }
+        ]
+    )
+    assert "缺少出发地" in buffer.getvalue()
+    print("✓ 非标准行程结构渲染不崩溃（空字符串回退通用字段）")
 
 
 def test_read_commands_reload_snapshot():
@@ -208,6 +249,7 @@ if __name__ == "__main__":
     try:
         test_eof_at_user_prompt_exits_cleanly()
         test_eof_at_main_prompt_breaks_loop(_mp)
+        test_gbk_piped_input_keeps_locale_decoding()
         test_utf8_piped_input_not_mojibake()
         test_human_response_escapes_markup()
         test_human_response_tolerates_malformed_itinerary()
