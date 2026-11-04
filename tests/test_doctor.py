@@ -18,8 +18,31 @@ from utils.doctor import (
     check_knowledge_base,
     check_model_files,
     check_python,
+    check_storage,
     run_doctor,
 )
+
+
+def test_storage_defaults(monkeypatch):
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    result = check_storage()
+    assert result.status == STATUS_OK, result.detail
+    assert "进程内" in result.detail and "JSON" in result.detail
+    print("✓ 存储后端未配置 → 本地默认实现")
+
+
+def test_storage_unreachable_warns(monkeypatch):
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0")
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    result = check_storage()
+    assert result.status == STATUS_WARN
+    assert "Redis" in result.detail and "回退" in result.detail
+    print("✓ Redis 不可达 → 警告并提示回退")
 
 
 def test_python_ok():
@@ -74,6 +97,7 @@ def test_run_doctor_without_network():
     assert "Python 版本" in names
     assert "核心依赖" in names
     assert "大模型配置" in names
+    assert "记忆存储" in names
     assert "嵌入模型文件" in names
     assert "RAG 知识库" in names
     assert "LLM 连通性" in names

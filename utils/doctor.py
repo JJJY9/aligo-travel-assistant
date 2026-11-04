@@ -11,10 +11,11 @@
 1. Python 版本
 2. 核心依赖与 RAG 可选依赖
 3. 大模型配置（API Key / 模型 / 接口地址）
-4. 本地嵌入模型文件完整性（modules.json 等元数据缺失会导致 SentenceTransformer
+4. 记忆存储后端（默认进程内 + JSON；配置后检查 Redis / PostgreSQL 连通性）
+5. 本地嵌入模型文件完整性（modules.json 等元数据缺失会导致 SentenceTransformer
    回退 mean pooling 并打印警告）
-5. RAG 知识库状态（是否已初始化 / 片段数）
-6. LLM 服务连通性（有密钥时）
+6. RAG 知识库状态（是否已初始化 / 片段数）
+7. LLM 服务连通性（有密钥时）
 """
 from __future__ import annotations
 
@@ -109,6 +110,50 @@ def check_config() -> CheckResult:
     )
 
 
+def check_storage() -> CheckResult:
+    """检查记忆存储后端：未配置时使用本地默认实现，配置后测试连通性。"""
+    from config import STORAGE_CONFIG
+
+    redis_url = STORAGE_CONFIG.get("redis_url") or ""
+    dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
+    parts: list[str] = []
+    failures: list[str] = []
+
+    if redis_url:
+        try:
+            import redis
+
+            client = redis.Redis.from_url(
+                redis_url, socket_connect_timeout=1.5, socket_timeout=1.5
+            )
+            client.ping()
+            parts.append("短期记忆 · Redis 可用")
+        except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
+            failures.append(f"Redis 不可用：{str(exc)[:80]}")
+    else:
+        parts.append("短期记忆 · 进程内")
+
+    if dsn:
+        try:
+            from context.postgres_long_term_memory import PostgresLongTermMemory
+
+            memory = PostgresLongTermMemory("__doctor_probe__", dsn)
+            memory.close()
+            parts.append("长期记忆 · PostgreSQL 可用")
+        except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
+            failures.append(f"PostgreSQL 不可用：{str(exc)[:80]}")
+    else:
+        parts.append("长期记忆 · JSON 文件")
+
+    if failures:
+        return CheckResult(
+            "记忆存储",
+            STATUS_WARN,
+            "；".join(failures) + "（将回退本地默认实现）",
+        )
+    return CheckResult("记忆存储", STATUS_OK, "；".join(parts))
+
+
 def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
     """检查本地嵌入模型文件完整性。"""
     model_path = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
@@ -189,6 +234,7 @@ def run_doctor_offline() -> list[CheckResult]:
     results: list[CheckResult] = [check_python()]
     results.extend(check_dependencies())
     results.append(check_config())
+    results.append(check_storage())
     results.append(check_model_files())
     results.append(check_knowledge_base())
     return results
