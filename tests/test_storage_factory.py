@@ -266,6 +266,32 @@ def test_describe_backends_configured_flags(monkeypatch):
     print("✓ describe_backends 报告配置 / 回退状态")
 
 
+def test_json_write_failures_raise():
+    """所有 JSON 写操作在 _save 失败时都必须抛错（不能静默成功）。"""
+    memory = LongTermMemory("u-persist-fail", tempfile.mkdtemp())
+    memory._save = lambda: False
+    actions = [
+        ("偏好", lambda: memory.save_preference("home_location", "北京")),
+        ("消息", lambda: memory.add_chat_message("user", "hi", "s1")),
+        (
+            "行程",
+            lambda: memory.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-12-05",
+                }
+            ),
+        ),
+        ("删除偏好", lambda: memory.delete_preference("home_location")),
+        ("清空历史", memory.clear_history),
+    ]
+    for label, action in actions:
+        with pytest.raises(OSError):
+            action()
+    print("✓ JSON 偏好 / 消息 / 行程 / 清空写盘失败均抛错")
+
+
 def test_export_data_includes_session_metadata():
     from context.memory_manager import MemoryManager
 
@@ -473,6 +499,7 @@ if __name__ == "__main__":
     test_clear_history_clears_metadata()
     test_corrupt_memory_file_is_backed_up()
     test_session_metadata_save_failure_raises()
+    test_json_write_failures_raise()
     _mp = pytest.MonkeyPatch()
     try:
         test_describe_backends_configured_flags(_mp)
