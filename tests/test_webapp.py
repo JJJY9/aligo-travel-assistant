@@ -1706,6 +1706,44 @@ def test_sessions_pagination():
         _cleanup(user_id)
 
 
+def test_metrics_api():
+    """GET /api/metrics 返回请求计数 / 状态 / 耗时与熔断器状态。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = _client()
+    try:
+        assert client.get("/api/health").status_code == 200
+        assert client.get("/api/health").status_code == 200
+        data = client.get("/api/metrics").json()
+        requests = data["requests"]
+        assert requests["requests_total"] >= 2
+        assert requests["by_path"]["/api/health"] >= 2
+        assert requests["by_status"].get("200", 0) >= 2
+        assert requests["avg_duration_ms"] >= 0
+        assert data["circuit_breaker"]["state"] in ("closed", "open", "half_open")
+        assert isinstance(data["sessions_cached"], int)
+        print("✓ /api/metrics 请求指标")
+    finally:
+        REQUEST_METRICS.reset()
+
+
+def test_metrics_endpoint_not_in_snapshot_before_recording():
+    """指标接口自身在返回后才计数，快照不包含当前请求（避免自增误导）。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = _client()
+    try:
+        first = client.get("/api/metrics").json()
+        second = client.get("/api/metrics").json()
+        assert first["requests"]["requests_total"] == 0
+        assert second["requests"]["requests_total"] == 1
+        print("✓ 指标接口自身在快照之后再计数")
+    finally:
+        REQUEST_METRICS.reset()
+
+
 def test_request_id_header():
     client = _client()
     response = client.get("/api/health", headers={"X-Request-ID": "trace-abc-123"})
@@ -2835,6 +2873,8 @@ if __name__ == "__main__":
     test_trip_whitespace_destination_rejected()
     test_ics_handles_overflow_end_date()
     test_request_id_header()
+    test_metrics_api()
+    test_metrics_endpoint_not_in_snapshot_before_recording()
     test_security_headers()
     test_lock_table_is_bounded()
     test_lock_table_overflow_uses_shared_lock()
