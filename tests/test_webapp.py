@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import uuid
+from datetime import datetime
 
 import pytest
 from pathlib import Path
@@ -778,6 +779,112 @@ def test_update_trip_api():
         print("✓ /api/trips/{id} 更新行程（部分更新 / 校验 / 冲突 / 清空日期）")
     finally:
         _cleanup(user_id)
+
+
+def test_trip_overlap_conflicts_api():
+    user_id = _unique_user("web_test_trip_overlap")
+    client = _client()
+    try:
+        first = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+            },
+        )
+        assert first.status_code == 201
+        assert first.json()["conflicts"] == []
+        first_id = first.json()["trip_id"]
+
+        overlapping = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-06",
+                "end_date": "2026-12-08",
+            },
+        )
+        assert overlapping.status_code == 201
+        conflicts = overlapping.json()["conflicts"]
+        assert [item["trip_id"] for item in conflicts] == [first_id]
+        assert conflicts[0]["destination"] == "上海"
+        second_id = overlapping.json()["trip_id"]
+
+        # 紧邻（12-09 出发）不算重叠
+        adjacent = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "南京",
+                "start_date": "2026-12-09",
+                "end_date": "2026-12-10",
+            },
+        )
+        assert adjacent.json()["conflicts"] == []
+
+        # 单日行程（无返程日期）与包含该日期的区间重叠
+        single = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "成都",
+                "start_date": "2026-12-07",
+            },
+        )
+        assert single.status_code == 201
+        single_conflicts = {item["destination"] for item in single.json()["conflicts"]}
+        assert single_conflicts == {"上海", "杭州"}
+
+        # 修改行程后重新计算重叠（12-10 与南京行程的末日重叠）
+        updated = client.put(
+            f"/api/trips/{second_id}",
+            json={"user_id": user_id, "start_date": "2026-12-10", "end_date": "2026-12-12"},
+        )
+        assert updated.status_code == 200
+        assert [item["destination"] for item in updated.json()["conflicts"]] == ["南京"]
+
+        # 去重保存自身不算冲突
+        again = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+            },
+        )
+        assert again.json()["created"] is False
+        assert first_id not in {item["trip_id"] for item in again.json()["conflicts"]}
+        assert [item["destination"] for item in again.json()["conflicts"]] == ["成都"]
+        print("✓ 行程日期重叠检测（新增 / 单日 / 修改 / 去重排除自身）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trip_conflicts_helper_edges():
+    from webapp.server import _trip_conflicts
+
+    trips = [
+        {"trip_id": "trip_1", "start_date": "2026-12-05", "end_date": "2026-12-07"},
+        {"trip_id": "trip_2", "start_date": "bad-date", "end_date": "2026-12-06"},
+        {"trip_id": "trip_3", "start_date": "2026-12-07", "end_date": "2026-12-01"},
+    ]
+    start = datetime.strptime("2026-12-07", "%Y-%m-%d")
+    found = _trip_conflicts(trips, start, start)
+    # 非法出发日期跳过；结束早于出发的脏数据按单日处理
+    assert [item["trip_id"] for item in found] == ["trip_1", "trip_3"]
+    assert _trip_conflicts(trips, start, start, exclude_id="trip_1") == [
+        item for item in found if item["trip_id"] != "trip_1"
+    ]
+    print("✓ 行程重叠辅助函数（脏数据 / 单日 / 排除自身）")
 
 
 def test_sessions_pagination():

@@ -740,6 +740,42 @@ def _build_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
     return _ics_calendar(events)
 
 
+def _trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
+    """行程的日期区间（含首尾）；缺少或无法解析出发日期时返回 None。"""
+    try:
+        start = datetime.strptime(str(trip.get("start_date") or ""), "%Y-%m-%d")
+    except ValueError:
+        return None
+    try:
+        end = datetime.strptime(str(trip.get("end_date") or ""), "%Y-%m-%d")
+    except ValueError:
+        end = start
+    if end < start:
+        end = start
+    return start, end
+
+
+def _trip_conflicts(
+    trips: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    exclude_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """找出与给定日期区间重叠的其它行程（按出发日期排序）。"""
+    conflicts = []
+    for trip in trips:
+        if exclude_id is not None and str(trip.get("trip_id")) == exclude_id:
+            continue
+        interval = _trip_interval(trip)
+        if interval is None:
+            continue
+        other_start, other_end = interval
+        if other_start <= end and start <= other_end:
+            conflicts.append(trip)
+    conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
+    return conflicts
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -1171,6 +1207,7 @@ def create_app(model: Any = None) -> FastAPI:
 
         store = _open_long_term(payload.user_id)
         created = False
+        conflicts: list[dict[str, Any]] = []
         try:
             before = len(store.get_trip_history(limit=None))
             trip_id = store.save_trip_history(
@@ -1182,13 +1219,20 @@ def create_app(model: Any = None) -> FastAPI:
                     "purpose": payload.purpose.strip() or "出差",
                 }
             )
-            created = len(store.get_trip_history(limit=None)) > before
+            trips = store.get_trip_history(limit=None)
+            created = len(trips) > before
+            conflicts = _trip_conflicts(trips, start, end or start, exclude_id=trip_id)
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("添加行程失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"添加行程失败：{exc}") from exc
         finally:
             _close_long_term(store)
-        return {"trip_id": trip_id, "saved": True, "created": created}
+        return {
+            "trip_id": trip_id,
+            "saved": True,
+            "created": created,
+            "conflicts": conflicts,
+        }
 
     @app.put("/api/trips/{trip_id}")
     def update_trip(
@@ -1206,6 +1250,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="出发日期不能为空")
 
         store = _open_long_term(payload.user_id)
+        conflicts: list[dict[str, Any]] = []
         try:
             trips = store.get_trip_history(limit=None)
             current = next(
@@ -1251,6 +1296,10 @@ def create_app(model: Any = None) -> FastAPI:
                 (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
                 {"trip_id": trip_id, **merged},
             )
+            if start is not None:
+                conflicts = _trip_conflicts(
+                    trips, start, end or start, exclude_id=trip_id
+                )
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
@@ -1258,7 +1307,12 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"更新行程失败：{exc}") from exc
         finally:
             _close_long_term(store)
-        return {"trip_id": trip_id, "saved": True, "trip": saved}
+        return {
+            "trip_id": trip_id,
+            "saved": True,
+            "trip": saved,
+            "conflicts": conflicts,
+        }
 
     @app.get("/api/trips/calendar")
     def export_trips_calendar(
