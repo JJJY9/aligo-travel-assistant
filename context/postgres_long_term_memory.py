@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS aligo_pinned_sessions (
     pinned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, session_id)
 );
+
+CREATE TABLE IF NOT EXISTS aligo_archived_sessions (
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    archived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, session_id)
+);
 """
 
 
@@ -225,6 +232,10 @@ class PostgresLongTermMemory:
                 "DELETE FROM aligo_pinned_sessions WHERE user_id = %s AND session_id = %s",
                 (self.user_id, session_id),
             )
+            cursor.execute(
+                "DELETE FROM aligo_archived_sessions WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
         if removed:
             logger.info(
                 "Deleted chat session from PostgreSQL: %s (%s messages)", session_id, removed
@@ -318,6 +329,29 @@ class PostgresLongTermMemory:
         rows = self._fetchall(
             "SELECT session_id FROM aligo_pinned_sessions WHERE user_id = %s "
             "ORDER BY pinned_at, session_id",
+            (self.user_id,),
+        )
+        return [row[0] for row in rows]
+
+    def set_session_archived(self, session_id: str, archived: bool) -> None:
+        """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。"""
+        if archived:
+            self._execute(
+                "INSERT INTO aligo_archived_sessions (user_id, session_id) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING",
+                (self.user_id, session_id),
+            )
+        else:
+            self._execute(
+                "DELETE FROM aligo_archived_sessions WHERE user_id = %s AND session_id = %s",
+                (self.user_id, session_id),
+            )
+
+    def get_archived_sessions(self) -> list[str]:
+        """返回归档会话 ID（按归档时间倒序）。"""
+        rows = self._fetchall(
+            "SELECT session_id FROM aligo_archived_sessions WHERE user_id = %s "
+            "ORDER BY archived_at DESC, session_id",
             (self.user_id,),
         )
         return [row[0] for row in rows]

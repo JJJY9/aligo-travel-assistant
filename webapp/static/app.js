@@ -61,6 +61,8 @@ const state = {
   kbSaving: false,
   tripEditingId: null,
   sessionTotal: 0,
+  showArchived: false,
+  archivedCount: 0,
 };
 
 function isValidId(value) {
@@ -92,6 +94,8 @@ const els = {
   sidebar: byId("sidebar"),
   history: byId("history"),
   historySearch: byId("historySearch"),
+  archivedToggle: byId("archivedToggle"),
+  archivedLabel: byId("archivedLabel"),
   upcoming: byId("upcoming"),
   upcomingLabel: byId("upcomingLabel"),
   upcomingRoute: byId("upcomingRoute"),
@@ -1316,6 +1320,7 @@ function renderHistoryItem(session) {
   item.setAttribute("tabindex", "0");
   if (session.session_id === state.sessionId) item.classList.add("active");
   if (session.pinned) item.classList.add("pinned");
+  if (session.archived) item.classList.add("archived");
 
   const title = document.createElement("span");
   title.className = "hi-title";
@@ -1332,26 +1337,6 @@ function renderHistoryItem(session) {
   const actions = document.createElement("span");
   actions.className = "hi-actions";
 
-  const pin = document.createElement("button");
-  pin.type = "button";
-  pin.title = session.pinned ? "取消置顶" : "置顶会话";
-  pin.setAttribute("aria-label", pin.title);
-  pin.innerHTML = icon("pin");
-  pin.addEventListener("click", (event) => {
-    event.stopPropagation();
-    togglePin(session);
-  });
-
-  const rename = document.createElement("button");
-  rename.type = "button";
-  rename.title = "重命名会话";
-  rename.setAttribute("aria-label", "重命名会话");
-  rename.innerHTML = icon("edit");
-  rename.addEventListener("click", (event) => {
-    event.stopPropagation();
-    startRenameSession(item, session);
-  });
-
   const remove = document.createElement("button");
   remove.type = "button";
   remove.title = "删除会话";
@@ -1362,7 +1347,50 @@ function renderHistoryItem(session) {
     deleteSession(session.session_id);
   });
 
-  actions.append(pin, rename, remove);
+  if (session.archived) {
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.title = "恢复会话";
+    restore.setAttribute("aria-label", "恢复会话");
+    restore.innerHTML = icon("refresh");
+    restore.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleArchive(session);
+    });
+    actions.append(restore, remove);
+  } else {
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.title = session.pinned ? "取消置顶" : "置顶会话";
+    pin.setAttribute("aria-label", pin.title);
+    pin.innerHTML = icon("pin");
+    pin.addEventListener("click", (event) => {
+      event.stopPropagation();
+      togglePin(session);
+    });
+
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.title = "重命名会话";
+    rename.setAttribute("aria-label", "重命名会话");
+    rename.innerHTML = icon("edit");
+    rename.addEventListener("click", (event) => {
+      event.stopPropagation();
+      startRenameSession(item, session);
+    });
+
+    const archive = document.createElement("button");
+    archive.type = "button";
+    archive.title = "归档会话";
+    archive.setAttribute("aria-label", "归档会话");
+    archive.innerHTML = icon("archive");
+    archive.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleArchive(session);
+    });
+
+    actions.append(pin, rename, archive, remove);
+  }
   item.appendChild(actions);
 
   item.addEventListener("click", () =>
@@ -1383,13 +1411,14 @@ function renderHistory() {
   if (!state.sessions.length) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
-    empty.textContent = state.searchQuery ? "没有匹配的对话" : "还没有历史对话";
+    if (state.showArchived) {
+      empty.textContent = state.searchQuery ? "没有匹配的归档会话" : "还没有归档的会话";
+    } else {
+      empty.textContent = state.searchQuery ? "没有匹配的对话" : "还没有历史对话";
+    }
     els.history.appendChild(empty);
     return;
   }
-
-  const pinned = state.sessions.filter((session) => session.pinned);
-  const regular = state.sessions.filter((session) => !session.pinned);
 
   const addSection = (label, items) => {
     const section = document.createElement("div");
@@ -1401,15 +1430,21 @@ function renderHistory() {
     els.history.appendChild(section);
   };
 
-  if (pinned.length) addSection("置顶", pinned);
+  if (state.showArchived) {
+    addSection("已归档", state.sessions);
+  } else {
+    const pinned = state.sessions.filter((session) => session.pinned);
+    const regular = state.sessions.filter((session) => !session.pinned);
+    if (pinned.length) addSection("置顶", pinned);
 
-  const groups = new Map();
-  regular.forEach((session) => {
-    const label = dateGroupLabel(session.updated_at);
-    if (!groups.has(label)) groups.set(label, []);
-    groups.get(label).push(session);
-  });
-  groups.forEach((items, label) => addSection(label, items));
+    const groups = new Map();
+    regular.forEach((session) => {
+      const label = dateGroupLabel(session.updated_at);
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(session);
+    });
+    groups.forEach((items, label) => addSection(label, items));
+  }
 
   if (state.sessions.length < state.sessionTotal) {
     const more = document.createElement("button");
@@ -1435,6 +1470,38 @@ async function togglePin(session) {
   }
 }
 
+async function toggleArchive(session) {
+  const archived = !session.archived;
+  try {
+    await getJSON(
+      `/api/sessions/${encodeURIComponent(session.session_id)}/archive`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: state.userId, archived }),
+      },
+    );
+    toast(archived ? "会话已归档" : "会话已恢复");
+    await Promise.all([
+      loadSessions(state.searchQuery, { reset: true }),
+      refreshStatus(),
+    ]);
+  } catch (error) {
+    toast(`操作失败：${error.message}`);
+  }
+}
+
+function updateArchivedToggle(count) {
+  if (!els.archivedToggle) return;
+  if (Number.isFinite(count)) state.archivedCount = count;
+  const total = state.archivedCount || 0;
+  els.archivedToggle.hidden = total <= 0 && !state.showArchived;
+  els.archivedToggle.setAttribute("aria-pressed", String(state.showArchived));
+  els.archivedLabel.textContent = state.showArchived
+    ? "返回全部会话"
+    : `已归档（${total}）`;
+}
+
 async function loadSessions(query = state.searchQuery, options = {}) {
   state.searchQuery = String(query || "").trim();
   const requestId = (sessionsRequestId += 1);
@@ -1449,11 +1516,15 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     offset: "0",
   });
   if (state.searchQuery) params.set("q", state.searchQuery);
+  if (state.showArchived) params.set("archived", "1");
   try {
     const data = await getJSON(`/api/sessions?${params}`);
     if (requestId !== sessionsRequestId) return;
     state.sessions = data.sessions || [];
     state.sessionTotal = Number(data.total || state.sessions.length);
+    if (data.archived_count !== undefined) {
+      updateArchivedToggle(Number(data.archived_count));
+    }
   } catch {
     if (requestId !== sessionsRequestId) return;
     state.sessions = [];
@@ -1470,6 +1541,7 @@ async function loadMoreSessions() {
     offset: String(state.sessions.length),
   });
   if (state.searchQuery) params.set("q", state.searchQuery);
+  if (state.showArchived) params.set("archived", "1");
   try {
     const data = await getJSON(`/api/sessions?${params}`);
     if (requestId !== sessionsRequestId) return;
@@ -2008,6 +2080,7 @@ function renderOverview() {
   });
 
   renderUpcoming(status.next_trip || pickUpcomingTrip(trips));
+  updateArchivedToggle(Number(status.archived_count || 0));
 
   const stats = [
     ["历史行程", status.trip_count || 0],
@@ -2887,6 +2960,9 @@ async function saveUser() {
     setConversationTitle("新对话");
     showWelcome();
     updateUserCard();
+    state.showArchived = false;
+    state.archivedCount = 0;
+    updateArchivedToggle(0);
     await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
@@ -2961,6 +3037,11 @@ function bindEvents() {
   });
 
   byId("newSession").addEventListener("click", newSession);
+  els.archivedToggle.addEventListener("click", () => {
+    state.showArchived = !state.showArchived;
+    updateArchivedToggle();
+    loadSessions(state.searchQuery, { reset: true });
+  });
   byId("brandHome").addEventListener("click", (event) => {
     event.preventDefault();
     newSession();

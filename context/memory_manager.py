@@ -104,6 +104,7 @@ class MemoryManager:
             "chat_history": self.long_term.get_chat_history(),
             "session_titles": self.long_term.get_session_titles(),
             "pinned_sessions": self.long_term.get_pinned_sessions(),
+            "archived_sessions": self.long_term.get_archived_sessions(),
             "statistics": self.long_term.get_statistics(),
         }
 

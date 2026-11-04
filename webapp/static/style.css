@@ -273,7 +273,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   display: block;
   width: 100%;
   text-align: left;
-  padding: 8px 78px 8px 10px;
+  padding: 8px 104px 8px 10px;
   border: 0;
   border-radius: 9px;
   background: transparent;
@@ -283,6 +283,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   opacity: 0.82;
   transition: background 0.15s ease, opacity 0.15s ease;
 }
+.history-item.archived { padding-right: 56px; }
 .history-item:hover { background: rgba(255, 255, 255, 0.06); opacity: 1; }
 .history-item.active { background: rgba(217, 85, 44, 0.16); opacity: 1; }
 .history-item.active::before {
@@ -1318,3 +1319,24 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   cursor: pointer;
 }
 .history-more:hover { color: var(--sidebar-ink); }
+
+/* 侧栏「已归档」开关 */
+.archived-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 8px 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--sidebar-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--sidebar-muted);
+  font-size: 12px;
+  text-align: left;
+}
+.archived-toggle:hover,
+.archived-toggle[aria-pressed="true"] {
+  color: var(--sidebar-ink);
+  background: rgba(255, 255, 255, 0.05);
+}
+.archived-toggle .icon { width: 13px; height: 13px; }

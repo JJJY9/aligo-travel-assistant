@@ -131,6 +131,8 @@ class LongTermMemory:
             data["session_titles"] = {}
         if not isinstance(data.get("pinned_sessions"), list):
             data["pinned_sessions"] = []
+        if not isinstance(data.get("archived_sessions"), list):
+            data["archived_sessions"] = []
         if "trip_history" not in data:
             data["trip_history"] = []
         if "statistics" not in data:
@@ -183,6 +185,7 @@ class LongTermMemory:
             "chat_history": [],  # 所有聊天记录（跨会话）
             "session_titles": {},  # 会话自定义标题 {session_id: title}
             "pinned_sessions": [],  # 置顶会话 ID（列表有序）
+            "archived_sessions": [],  # 归档会话 ID（列表展示时默认隐藏）
             "trip_history": [],  # 所有行程记录
             "statistics": {
                 "total_trips": 0,
@@ -378,7 +381,12 @@ class LongTermMemory:
         removed = len(messages) - len(remaining)
         titles = self.data.get("session_titles") or {}
         pinned_sessions = self.data.get("pinned_sessions") or []
-        metadata_changed = session_id in titles or session_id in pinned_sessions
+        archived_sessions = self.data.get("archived_sessions") or []
+        metadata_changed = (
+            session_id in titles
+            or session_id in pinned_sessions
+            or session_id in archived_sessions
+        )
 
         if removed:
             self.data["chat_history"] = remaining
@@ -389,6 +397,8 @@ class LongTermMemory:
             self.data.get("session_titles", {}).pop(session_id, None)
             if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
                 pinned_sessions.remove(session_id)
+            if isinstance(archived_sessions, list) and session_id in archived_sessions:
+                archived_sessions.remove(session_id)
             self._save()
             logger.info(
                 "Deleted chat session: %s (%s messages, metadata=%s)",
@@ -474,6 +484,21 @@ class LongTermMemory:
     def get_pinned_sessions(self) -> list[str]:
         """返回置顶会话 ID（按置顶时间先后）。"""
         return list(self.data.get("pinned_sessions") or [])
+
+    @_locked_mutation
+    def set_session_archived(self, session_id: str, archived: bool) -> None:
+        """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。"""
+        archived_sessions = self.data.setdefault("archived_sessions", [])
+        if archived and session_id not in archived_sessions:
+            archived_sessions.append(session_id)
+        elif not archived and session_id in archived_sessions:
+            archived_sessions.remove(session_id)
+        self._save()
+        logger.info("Set session archived: %s -> %s", session_id, archived)
+
+    def get_archived_sessions(self) -> list[str]:
+        """返回归档会话 ID。"""
+        return list(self.data.get("archived_sessions") or [])
 
     @_locked_mutation
     def save_trip_history(self, trip_info: dict[str, Any]) -> str:
