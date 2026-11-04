@@ -512,6 +512,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - **会话历史与搜索**：侧栏按日期分组展示历史会话，点击恢复完整对话（助手消息从编排结果重新渲染为 Markdown），悬停删除；搜索框按标题与消息内容全文检索，命中片段中高亮关键词
 - **会话重命名**：侧栏铅笔按钮内联编辑标题（Enter 保存 / Esc 取消），自定义标题持久化在 JSON / PostgreSQL 中并参与搜索；清空标题恢复自动标题
 - **会话置顶**：侧栏图钉按钮置顶 / 取消置顶，置顶会话进入「置顶」分组并排在日期分组之前；JSON / PostgreSQL 持久化
+- **会话归档**：侧栏会话操作新增「归档」，归档后从默认列表隐藏但消息与标题保留；「已归档（N）」切换到归档列表，可恢复或删除，JSON / PostgreSQL 持久化
 - **即将出行**：侧栏根据保存的行程日期显示出行提醒——有进行中的行程时优先展示并标注「进行中」，否则展示最近一次即将开始的行程（路线 / 日期 / 目的），点击回到对应对话（无关联会话时打开记忆面板）
 - **对话深链接**：地址栏同步 `user` / `session` 参数（例如 `/?user=alice&session=abc123`），打开链接即可恢复会话；顶栏提供「复制链接」，无效链接会自动清理参数并回到新对话
 - **主题与布局**：浅色 / 深色主题跟随系统并可切换；窄屏下侧栏变为抽屉
@@ -548,10 +549,11 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程数 / 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |
-| GET | `/api/sessions` | 历史会话列表（`limit` / `offset` 分页并返回 `total`；`q` 可选：按标题与消息内容搜索，返回命中片段） |
+| GET | `/api/sessions` | 历史会话列表（`limit` / `offset` 分页并返回 `total`；`q` 可选：按标题与消息内容搜索，返回命中片段；`archived=true` 只返回归档会话，同时返回 `archived_count`） |
 | GET | `/api/sessions/{id}` | 某个会话的消息（助手消息已渲染为 Markdown，并附执行元数据） |
 | PUT | `/api/sessions/{id}/title` | 设置或清除会话自定义标题（空字符串恢复自动标题） |
 | PUT | `/api/sessions/{id}/pin` | 置顶 / 取消置顶会话 |
+| PUT | `/api/sessions/{id}/archive` | 归档 / 恢复会话（归档只从列表隐藏，不删除消息） |
 | GET | `/api/sessions/{id}/export` | 把会话导出为 Markdown 附件 |
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | DELETE | `/api/sessions/{id}/last-turn` | 删除最后一轮对话（用户提问 + 助手回答；`expect` 内容不一致时不删除，供编辑后重新发送） |

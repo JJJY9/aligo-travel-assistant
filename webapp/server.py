@@ -274,6 +274,11 @@ class SessionPinPayload(BaseModel):
     pinned: bool
 
 
+class SessionArchivePayload(BaseModel):
+    user_id: str = Field(pattern=_ID_PATTERN)
+    archived: bool
+
+
 class _WebSession:
     """一个浏览器会话（对应一个 ConversationRuntime）。"""
 
@@ -408,10 +413,22 @@ def _load_user_data(user_id: str) -> dict[str, Any]:
             "chat_history": store.get_chat_history(),
             "session_titles": store.get_session_titles(),
             "pinned_sessions": store.get_pinned_sessions(),
+            "archived_sessions": store.get_archived_sessions(),
             "statistics": store.get_statistics(),
         }
     finally:
         _close_long_term(store)
+
+
+def _archived_count(data: dict[str, Any]) -> int:
+    """实际仍存在于历史中的归档会话数（消息被删光的归档标记不计入）。"""
+    session_ids = {
+        str(message.get("session_id"))
+        for message in data.get("chat_history") or []
+        if message.get("session_id")
+    }
+    archived = data.get("archived_sessions") or []
+    return sum(1 for session_id in archived if str(session_id) in session_ids)
 
 
 def _render_stored_message(message: dict[str, Any]) -> str:
@@ -464,8 +481,13 @@ def _group_sessions(
     query: str = "",
     titles: dict[str, str] | None = None,
     pinned: list[str] | None = None,
+    archived: list[str] | None = None,
+    archived_mode: str = "exclude",
 ) -> list[dict[str, Any]]:
-    """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。"""
+    """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。
+
+    ``archived_mode``：``exclude`` 只返回未归档会话，``only`` 只返回归档会话。
+    """
     needle = query.strip().lower()
     grouped: dict[str, dict[str, Any]] = {}
     for message in history:
@@ -499,10 +521,18 @@ def _group_sessions(
             entry["title"] = custom
 
     pinned_ids = set(pinned or [])
+    archived_ids = set(archived or [])
     for entry in sessions:
         entry["pinned"] = entry["session_id"] in pinned_ids
-    # 稳定排序：置顶会话在前，其余保持最近更新时间倒序
-    sessions.sort(key=lambda entry: not entry["pinned"])
+        entry["archived"] = entry["session_id"] in archived_ids
+    if archived_mode == "only":
+        sessions = [entry for entry in sessions if entry["archived"]]
+        for entry in sessions:
+            entry["pinned"] = False
+    else:
+        sessions = [entry for entry in sessions if not entry["archived"]]
+        # 稳定排序：置顶会话在前，其余保持最近更新时间倒序
+        sessions.sort(key=lambda entry: not entry["pinned"])
 
     if needle:
         sessions = [
@@ -1002,6 +1032,7 @@ def create_app(model: Any = None) -> FastAPI:
             "trips": trips_view,
             "next_trip": featured_trip,
             "chat_count": len(data["chat_history"]),
+            "archived_count": _archived_count(data),
             "statistics": data["statistics"],
             "storage": describe_backends(),
             "usage": _usage_summary(data["chat_history"]),
@@ -1039,12 +1070,20 @@ def create_app(model: Any = None) -> FastAPI:
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
+        archived: bool = Query(default=False),
     ) -> dict[str, Any]:
         data = _load_user_data(user_id)
         titles = data.get("session_titles") or {}
         pinned = data.get("pinned_sessions") or []
+        archived_ids = data.get("archived_sessions") or []
         sessions = _group_sessions(
-            data["chat_history"], 1_000_000, q, titles, pinned
+            data["chat_history"],
+            1_000_000,
+            q,
+            titles,
+            pinned,
+            archived_ids,
+            "only" if archived else "exclude",
         )
         total = len(sessions)
         return {
@@ -1052,6 +1091,8 @@ def create_app(model: Any = None) -> FastAPI:
             "total": total,
             "offset": offset,
             "limit": limit,
+            "archived": archived,
+            "archived_count": _archived_count(data),
         }
 
     @app.get("/api/sessions/{session_id}")
@@ -1106,6 +1147,26 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "pinned": session_id in pinned}
+
+    @app.put("/api/sessions/{session_id}/archive")
+    def archive_session(
+        payload: SessionArchivePayload,
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """归档 / 恢复会话（归档只从列表隐藏，不删除消息）。"""
+        store = _open_long_term(payload.user_id)
+        try:
+            if not store.get_chat_history(session_id=session_id):
+                raise HTTPException(status_code=404, detail="会话不存在或没有消息")
+            store.set_session_archived(session_id, payload.archived)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
+            logger.warning("归档会话失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"操作失败：{exc}") from exc
+        finally:
+            _close_long_term(store)
+        return {"session_id": session_id, "archived": payload.archived}
 
     @app.get("/api/sessions/{session_id}/export")
     def export_session(

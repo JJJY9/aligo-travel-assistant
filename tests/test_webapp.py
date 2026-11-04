@@ -1096,6 +1096,91 @@ def test_status_trips_include_conflicts():
         _cleanup(user_id)
 
 
+def test_session_archive_api():
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_archive")
+    session_id = "archive-1"
+    other_session = "archive-2"
+    client = _client()
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for sid in (session_id, other_session):
+                store.add_chat_message("user", f"消息 {sid}", sid)
+                store.add_chat_message("assistant", f"回答 {sid}", sid)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        archived = client.put(
+            f"/api/sessions/{session_id}/archive",
+            json={"user_id": user_id, "archived": True},
+        )
+        assert archived.status_code == 200
+        assert archived.json()["archived"] is True
+
+        active = client.get("/api/sessions", params={"user_id": user_id}).json()
+        active_ids = {item["session_id"] for item in active["sessions"]}
+        assert session_id not in active_ids, "归档会话不应出现在默认列表"
+        assert other_session in active_ids
+        assert active["archived_count"] == 1
+
+        archived_list = client.get(
+            "/api/sessions", params={"user_id": user_id, "archived": True}
+        ).json()
+        assert [item["session_id"] for item in archived_list["sessions"]] == [session_id]
+        assert archived_list["sessions"][0]["archived"] is True
+        assert archived_list["archived_count"] == 1
+
+        # 归档不影响读取会话内容
+        detail = client.get(
+            f"/api/sessions/{session_id}", params={"user_id": user_id}
+        )
+        assert detail.status_code == 200
+        assert len(detail.json()["messages"]) == 2
+
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["archived_count"] == 1
+
+        restored = client.put(
+            f"/api/sessions/{session_id}/archive",
+            json={"user_id": user_id, "archived": False},
+        )
+        assert restored.status_code == 200
+        active = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert session_id in {item["session_id"] for item in active["sessions"]}
+        assert active["archived_count"] == 0
+
+        assert (
+            client.put(
+                "/api/sessions/no-such-session/archive",
+                json={"user_id": user_id, "archived": True},
+            ).status_code
+            == 404
+        )
+
+        # 消息被删光的归档标记不计入计数；删除会话时清理归档标记
+        client.put(
+            f"/api/sessions/{session_id}/archive",
+            json={"user_id": user_id, "archived": True},
+        )
+        removed = client.delete(
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "消息 archive-1"},
+        )
+        assert removed.json()["removed"] == 2
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["archived_count"] == 0, "没有消息的归档标记不应计入"
+        client.delete(f"/api/sessions/{session_id}", params={"user_id": user_id})
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["archived_count"] == 0
+        print("✓ 会话归档 / 恢复（列表过滤 / 内容可读 / 计数 / 删除清理）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
@@ -1834,6 +1919,7 @@ if __name__ == "__main__":
     test_delete_last_turn_api()
     test_next_trip_prefers_ongoing()
     test_status_trips_include_conflicts()
+    test_session_archive_api()
     test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:

@@ -122,6 +122,32 @@ def test_webapp_with_postgres_backend(monkeypatch):
             == 200
         )
 
+        # 归档 / 恢复（PG 归档表）
+        assert (
+            client.put(
+                "/api/sessions/sess-pg-web/archive",
+                json={"user_id": user_id, "archived": True},
+            ).status_code
+            == 200
+        )
+        archived_list = client.get(
+            "/api/sessions", params={"user_id": user_id, "archived": True}
+        ).json()
+        assert [item["session_id"] for item in archived_list["sessions"]] == [
+            "sess-pg-web"
+        ]
+        assert archived_list["sessions"][0]["archived"] is True
+        active_list = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert active_list["sessions"] == []
+        assert active_list["archived_count"] == 1
+        assert (
+            client.put(
+                "/api/sessions/sess-pg-web/archive",
+                json={"user_id": user_id, "archived": False},
+            ).status_code
+            == 200
+        )
+
         status = client.get("/api/status", params={"user_id": user_id}).json()
         assert status["storage"]["long_term"] == "postgres"
         assert status["preferences"]["home_location"] == "北京"
@@ -161,6 +187,17 @@ def test_webapp_with_postgres_backend(monkeypatch):
             "/api/sessions/sess-pg-web", params={"user_id": user_id}
         ).json()["messages"]
         assert remaining == []
+
+        # 删除会话时同步清理归档表
+        cleanup_store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+        try:
+            cleanup_store.add_chat_message("user", "临时", "sess-arch-cleanup")
+            cleanup_store.set_session_archived("sess-arch-cleanup", True)
+            assert "sess-arch-cleanup" in cleanup_store.get_archived_sessions()
+            cleanup_store.delete_chat_session("sess-arch-cleanup")
+            assert "sess-arch-cleanup" not in cleanup_store.get_archived_sessions()
+        finally:
+            cleanup_store.close()
         print("✓ Web API 在 PostgreSQL 后端下的读写路径")
     finally:
         try:
