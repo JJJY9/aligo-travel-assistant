@@ -3,16 +3,30 @@
 优先级：
 1. ``ALIGO_SKILLS_DIR`` 环境变量（自定义技能目录）；
 2. 仓库或 site-packages 旁的 ``.claude/skills``（源码运行）；
-3. ``sys.prefix/.claude/skills``（wheel 的 data-files 安装位置，虚拟环境根目录）。
+3. ``sys.prefix/.claude/skills``（wheel 的 data-files 安装位置，虚拟环境根目录）；
+4. ``site.getuserbase()/.claude/skills``（``pip install --user`` 的 data-files 位置）。
 
-wheel 中的技能文件通过 ``[tool.setuptools.data-files]`` 安装到 ``sys.prefix``，
-因此安装后也能像源码运行一样动态加载技能。
+wheel 中的技能文件通过 ``[tool.setuptools.data-files]`` 安装到 ``sys.prefix``
+（普通安装）或用户目录（``--user`` 安装），因此安装后也能像源码运行一样动态加载技能。
 """
 import os
 import sys
 from pathlib import Path
 
 ENV_SKILLS_DIR = "ALIGO_SKILLS_DIR"
+
+
+def _user_base_skills() -> Path | None:
+    """返回 ``pip install --user`` 对应的技能目录；取不到用户目录时返回 None。"""
+    try:
+        import site
+
+        base = site.getuserbase()
+    except Exception:  # noqa: BLE001 - 可选路径，环境不支持时忽略
+        return None
+    if not base:
+        return None
+    return Path(base) / ".claude" / "skills"
 
 
 def skill_roots() -> list[Path]:
@@ -23,6 +37,9 @@ def skill_roots() -> list[Path]:
         roots.append(Path(override).expanduser())
     roots.append(Path(__file__).resolve().parent.parent / ".claude" / "skills")
     roots.append(Path(sys.prefix) / ".claude" / "skills")
+    user_base = _user_base_skills()
+    if user_base is not None:
+        roots.append(user_base)
     return roots
 
 
