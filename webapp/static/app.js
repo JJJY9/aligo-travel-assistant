@@ -59,6 +59,7 @@ const state = {
   kbEditingId: null,
   kbEditingMetadata: {},
   kbEditingGroupParts: 0,
+  kbEditSeq: 0,
   kbSaving: false,
   kbSemanticMode: false,
   kbSemanticQuery: "",
@@ -3546,6 +3547,7 @@ async function startEditKnowledge(doc) {
     toast("正在保存知识片段，请稍候");
     return;
   }
+  const seq = (state.kbEditSeq += 1);
   const parts = Number(doc.metadata && doc.metadata.parts);
   const group = String((doc.metadata && doc.metadata.group) || "");
   if (parts > 1 && !group) {
@@ -3560,9 +3562,12 @@ async function startEditKnowledge(doc) {
       const data = await getJSON(
         `/api/knowledge/documents/${encodeURIComponent(doc.id)}/group`,
       );
+      // 请求期间用户可能点了另一行的编辑：只认最后一次点击
+      if (seq !== state.kbEditSeq) return;
       content = String(data.content || "");
       groupParts = Number(data.parts || parts);
     } catch (error) {
+      if (seq !== state.kbEditSeq) return;
       toast(`读取整份文档失败：${error.message}`);
       return;
     }
@@ -3596,6 +3601,7 @@ async function startEditKnowledge(doc) {
 }
 
 function resetKnowledgeForm({ clear = true } = {}) {
+  state.kbEditSeq += 1; // 作废可能在途的整组回填请求
   state.kbEditingId = null;
   state.kbEditingMetadata = {};
   state.kbEditingGroupParts = 0;
