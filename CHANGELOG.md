@@ -9,6 +9,7 @@
 - Redis 限流故障自动回退进程内实现（60 秒冷却后重试），限流后端故障不影响请求处理
 - `/api/health` 新增 `rate_limit` 字段（`redis` / `memory`），便于确认当前限流后端
 - `/api/health` 新增 `rate_limit_degraded` 字段：Redis 限流故障回退进程内期间为 `true`
+- `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 
 ### 修复
 - `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找

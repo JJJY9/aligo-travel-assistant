@@ -2091,10 +2091,17 @@ async function refreshMetrics() {
     });
     if (els.metricsNote) {
       const cached = Number(data.sessions_cached || 0);
+      const rate = data.rate_limit || {};
+      const rateBackend =
+        rate.backend === "redis"
+          ? rate.degraded
+            ? "Redis 共享（降级中）"
+            : "Redis 共享"
+          : "进程内";
       els.metricsNote.hidden = false;
       els.metricsNote.textContent = `进程运行 ${formatUptime(
         requests.uptime_sec,
-      )} · 缓存会话 ${cached} 个 · 多进程各自统计`;
+      )} · 缓存会话 ${cached} 个 · 限流 ${rateBackend} · 请求指标按进程统计`;
     }
   } catch {
     els.metricsStats.innerHTML = "";

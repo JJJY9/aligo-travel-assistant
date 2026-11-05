@@ -1784,6 +1784,11 @@ def test_metrics_api():
         assert requests["avg_duration_ms"] >= 0
         assert data["circuit_breaker"]["state"] in ("closed", "open", "half_open")
         assert isinstance(data["sessions_cached"], int)
+        rate = data["rate_limit"]
+        assert rate["backend"] in {"memory", "redis"}
+        assert rate["degraded"] is False
+        assert rate["user_limit"] >= 1 and rate["ip_limit"] >= 1
+        assert rate["window_sec"] > 0
         print("✓ /api/metrics 请求指标")
     finally:
         REQUEST_METRICS.reset()
