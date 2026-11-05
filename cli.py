@@ -967,26 +967,42 @@ class AligoCLI:
                 self.console.print(f"\n错误: {e}", style="red")
 
 
-def run_health_check_standalone() -> int:
+def run_health_check_standalone(as_json: bool = False) -> int:
     """
     独立执行健康检查（用于 `python cli.py health`）。
     不进入交互式 CLI，只检测 LLM 是否可达。
+    Args:
+        as_json: 输出机器可读的 JSON（便于监控 / 脚本）
     Returns:
         0 成功，1 失败（便于脚本/监控）
     """
     import asyncio
-    init_agentscope()
-    ok, msg = asyncio.run(check_llm_health(
-        base_url=str(LLM_CONFIG["base_url"]),
-        api_key=str(LLM_CONFIG["api_key"]),
-        model_name=str(LLM_CONFIG["model_name"]),
-        timeout_sec=RESILIENCE_CONFIG.get("health_check_timeout_sec", 10.0),
-    ))
-    if ok:
-        print("OK")
-        return 0
-    print(f"FAIL: {msg}")
-    return 1
+    import contextlib
+    import io
+
+    def _probe() -> tuple[bool, str]:
+        init_agentscope()
+        return asyncio.run(
+            check_llm_health(
+                base_url=str(LLM_CONFIG["base_url"]),
+                api_key=str(LLM_CONFIG["api_key"]),
+                model_name=str(LLM_CONFIG["model_name"]),
+                timeout_sec=RESILIENCE_CONFIG.get("health_check_timeout_sec", 10.0),
+            )
+        )
+
+    if as_json:
+        # init_agentscope 会打印版本信息；JSON 模式屏蔽 stdout，保证输出可解析
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, msg = _probe()
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False, indent=2))
+    else:
+        ok, msg = _probe()
+        if ok:
+            print("OK")
+        else:
+            print(f"FAIL: {msg}")
+    return 0 if ok else 1
 
 
 def run_doctor_standalone(as_json: bool = False) -> int:
@@ -1077,8 +1093,11 @@ def run_skills_standalone(as_json: bool = False) -> int:
     return 0
 
 
-def run_knowledge_status_standalone() -> int:
+def run_knowledge_status_standalone(as_json: bool = False) -> int:
     """打印知识库状态（用于 `python cli.py kb`），不进入交互式 CLI。
+
+    Args:
+        as_json: 输出机器可读的 JSON（便于监控 / 脚本）
 
     Returns:
         0 知识库可用；1 未初始化或不可用
@@ -1086,6 +1105,9 @@ def run_knowledge_status_standalone() -> int:
     from utils.knowledge_stats import knowledge_status
 
     status = knowledge_status()
+    if as_json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0 if status.get("available") else 1
     if status.get("available"):
         print(f"知识库：{status['collection']} · {status['documents']} 片段")
         print(f"数据库：{status['path']}")
@@ -1959,7 +1981,10 @@ def main():
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip().lower()
         if arg == "health":
-            sys.exit(run_health_check_standalone())
+            health_json = _parse_json_flag(sys.argv[2:], "python cli.py health [--json]")
+            if health_json is None:
+                sys.exit(2)
+            sys.exit(run_health_check_standalone(as_json=health_json))
         if arg == "doctor":
             doctor_json = _parse_json_flag(sys.argv[2:], "python cli.py doctor [--json]")
             if doctor_json is None:
@@ -1971,7 +1996,10 @@ def main():
                 sys.exit(2)
             sys.exit(run_skills_standalone(as_json=skills_json))
         if arg == "kb":
-            sys.exit(run_knowledge_status_standalone())
+            kb_json = _parse_json_flag(sys.argv[2:], "python cli.py kb [--json]")
+            if kb_json is None:
+                sys.exit(2)
+            sys.exit(run_knowledge_status_standalone(as_json=kb_json))
         if arg == "eval":
             sys.exit(run_rag_eval_standalone())
         if arg == "kb-export":
