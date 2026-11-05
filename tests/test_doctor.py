@@ -89,6 +89,25 @@ def test_version_check_skips_without_pyproject(monkeypatch, tmp_path):
     print("✓ 安装 wheel（无 pyproject）时跳过版本一致性检查")
 
 
+def test_version_check_detects_static_version_mismatch(monkeypatch, tmp_path):
+    from utils import doctor as doctor_module
+    from utils.version import APP_VERSION
+
+    (tmp_path / "pyproject.toml").write_text(
+        f'version = "{APP_VERSION}"', encoding="utf-8"
+    )
+    static = tmp_path / "webapp" / "static"
+    static.mkdir(parents=True)
+    (static / "index.html").write_text(
+        '<script src="/static/app.js?v=1.3.0"></script>', encoding="utf-8"
+    )
+    monkeypatch.setattr(doctor_module, "PROJECT_ROOT", tmp_path)
+    result = check_version_consistency()
+    assert result.status == STATUS_WARN
+    assert "1.3.0" in result.detail and "静态资源" in result.detail
+    print("✓ index.html 静态资源版本不一致时警告")
+
+
 def test_skills_check_reports_repo_skills():
     result = check_skills()
     assert result.status == STATUS_OK, result.detail
