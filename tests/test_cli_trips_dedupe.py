@@ -262,6 +262,43 @@ def test_main_rejects_unknown_flags(monkeypatch):
     print("✓ 未知参数返回用法错误")
 
 
+def test_ambiguous_trip_id_is_not_deleted(monkeypatch):
+    """同一 trip_id 出现在多条不同行程里时，不自动删除并返回 1。"""
+    fake = _FakeStore(
+        [
+            _trip("trip_1"),
+            _trip("trip_2"),
+            _trip("trip_2", destination="杭州"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u1")
+    assert code == 1
+    assert "无法安全自动删除" in out
+    assert "trip_2" in out
+    assert fake.deleted == [], "歧义 id 不能删除"
+    print("✓ 歧义 trip_id 不自动删除并返回 1")
+
+
+def test_one_day_trips_use_start_as_end(monkeypatch):
+    """无返程日期与返程=出发日按同一行程去重。"""
+    fake = _FakeStore(
+        [
+            _trip("trip_1", start="2026-12-01", end=None),
+            _trip("trip_2", start="2026-12-01", end="2026-12-01"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u1")
+    assert code == 0
+    assert fake.deleted == ["trip_2"]
+    print("✓ 单日行程的两种返程写法按重复处理")
+
+
 if __name__ == "__main__":
     for case in (
         test_dedupes_and_keeps_first,
@@ -276,6 +313,8 @@ if __name__ == "__main__":
         test_pg_configured_but_json_fallback,
         test_dry_run_does_not_delete,
         test_main_rejects_unknown_flags,
+        test_ambiguous_trip_id_is_not_deleted,
+        test_one_day_trips_use_start_as_end,
     ):
         mp = pytest.MonkeyPatch()
         try:

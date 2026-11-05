@@ -231,6 +231,8 @@ class MemoryManager:
         trip_signature = tuple(
             (
                 str(trip.get("trip_id") or ""),
+                str(trip.get("origin") or ""),
+                str(trip.get("destination") or ""),
                 str(trip.get("start_date") or ""),
                 str(trip.get("end_date") or ""),
                 str(trip.get("purpose") or ""),

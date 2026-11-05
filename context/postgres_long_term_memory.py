@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS aligo_trips (
 ALTER TABLE aligo_trips ADD COLUMN IF NOT EXISTS session_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_aligo_trips_user ON aligo_trips (user_id, id);
 
+CREATE TABLE IF NOT EXISTS aligo_trip_counters (
+    user_id TEXT PRIMARY KEY,
+    last_number BIGINT NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS aligo_chat_messages (
     id BIGSERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -469,23 +474,25 @@ class PostgresLongTermMemory:
         destination: Any,
     ) -> str:
         start_date = str(trip_info.get("start_date") or "")
+        origin = str(trip_info.get("origin") or "")
+        end_date = str(trip_info.get("end_date") or start_date)
         if destination and start_date:
             existing = self._fetchone(
                 """
                 SELECT id, trip_id FROM aligo_trips
                 WHERE user_id = %s
                   AND destination = %s
-                  AND origin IS NOT DISTINCT FROM %s
+                  AND COALESCE(origin, '') = %s
                   AND start_date = %s
-                  AND end_date IS NOT DISTINCT FROM %s
+                  AND COALESCE(end_date, start_date) = %s
                 LIMIT 1
                 """,
                 (
                     self.user_id,
                     destination,
-                    trip_info.get("origin"),
+                    origin,
                     start_date,
-                    trip_info.get("end_date"),
+                    end_date,
                 ),
             )
             if existing:
@@ -522,7 +529,7 @@ class PostgresLongTermMemory:
         return trip_id
 
     def _next_trip_number(self) -> int:
-        """下一个行程序号：现有最大 trip_N 的 N + 1（删除后不复用）。"""
+        """下一个行程序号：持久化计数与现有最大值取大后 +1（删除后不复用）。"""
         rows = self._fetchall(
             "SELECT trip_id FROM aligo_trips WHERE user_id = %s", (self.user_id,)
         )
@@ -531,7 +538,25 @@ class PostgresLongTermMemory:
             match = re.fullmatch(r"trip_(\d+)", str(trip_id or ""))
             if match:
                 max_number = max(max_number, int(match.group(1)))
-        return max_number + 1
+        row = self._fetchone(
+            "SELECT last_number FROM aligo_trip_counters WHERE user_id = %s",
+            (self.user_id,),
+        )
+        if row is not None:
+            max_number = max(max_number, int(row[0] or 0))
+        number = max_number + 1
+        self._execute(
+            """
+            INSERT INTO aligo_trip_counters (user_id, last_number)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET last_number = GREATEST(
+                aligo_trip_counters.last_number, EXCLUDED.last_number
+            )
+            """,
+            (self.user_id, number),
+        )
+        return number
 
     def delete_trip(self, trip_id: str) -> bool:
         """删除一条历史行程；返回是否删除（统计由查询动态计算）。

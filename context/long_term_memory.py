@@ -668,25 +668,28 @@ class LongTermMemory:
         if not destination or not start_date:
             return None
         origin = str(trip_info.get("origin") or "")
-        end_date = str(trip_info.get("end_date") or "")
+        end_date = str(trip_info.get("end_date") or start_date)
         for trip in self.data.get("trip_history", []):
             if (
                 trip.get("destination") == destination
                 and str(trip.get("origin") or "") == origin
                 and str(trip.get("start_date") or "") == start_date
-                and str(trip.get("end_date") or "") == end_date
+                and str(trip.get("end_date") or trip.get("start_date") or "") == end_date
             ):
                 return trip
         return None
 
     def _next_trip_id(self) -> str:
-        """下一个行程 id：现有最大序号 + 1（删除后不复用，避免与统计/会话关联错乱）。"""
-        max_number = 0
+        """下一个行程 id：持久化序号 + 1（删除后不复用，避免与旧 ID 混淆）。"""
+        stats = self.data.setdefault("statistics", {})
+        max_number = int(stats.get("last_trip_number") or 0)
         for trip in self.data.get("trip_history", []):
             match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
             if match:
                 max_number = max(max_number, int(match.group(1)))
-        return f"trip_{max_number + 1}"
+        number = max_number + 1
+        stats["last_trip_number"] = number
+        return f"trip_{number}"
 
     @_locked_mutation
     def delete_trip(self, trip_id: str) -> bool:
