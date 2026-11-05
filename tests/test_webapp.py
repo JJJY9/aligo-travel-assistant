@@ -3501,6 +3501,14 @@ def test_knowledge_eval_api(monkeypatch):
     limited = client.get("/api/knowledge/eval")
     assert limited.status_code == 429
     assert limited.headers["x-ratelimit-remaining"] == "0"
+
+    # 评测期间共享锁失效（心跳续期返回 0）时，结果必须打标而不是当作独占评测
+    state.eval_lock.lost = True
+    state.kb_limiter = RateLimiter(limit=3, window_sec=60)  # 重置额度
+    warned = client.get("/api/knowledge/eval")
+    assert warned.status_code == 200
+    assert "warning" in warned.json()
+    state.eval_lock.lost = False
     print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429 不耗额度）")
 
 

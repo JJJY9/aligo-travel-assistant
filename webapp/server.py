@@ -1599,11 +1599,19 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=503, detail="RAG 依赖未安装")
             try:
                 # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
-                return evaluate_retrieval(
+                result = evaluate_retrieval(
                     lambda query, top_k: agent.search_knowledge(
                         query, top_k=top_k, strict=True
                     )
                 )
+                # 心跳续期发现共享锁已失效（过期后被其它实例拿走）：本次评测
+                # 可能与之并发，结果需要打标而不能当作独占评测
+                if getattr(state.eval_lock, "lost", False) and isinstance(result, dict):
+                    logger.warning("检索评测期间共享锁失效，结果可能受并发评测影响")
+                    result["warning"] = (
+                        "评测期间共享锁失效（可能存在并发评测），结果仅供参考"
+                    )
+                return result
             except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
                 logger.warning("检索评测失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
