@@ -194,7 +194,7 @@ def test_cache_is_bounded_and_prunes_expired(monkeypatch):
         weather.fetch_weather(city)
     assert list(weather._cache) == ["乙城", "丙城"], "超过上限应淘汰最旧条目"
 
-    weather._cache["丁城"] = (time.monotonic() - weather.CACHE_TTL_SEC - 1, {})
+    weather._cache["丁城"] = (time.monotonic() - weather.STALE_TTL_SEC - 1, {})
     weather.fetch_weather("戊城")
     assert set(weather._cache) == {"丙城", "戊城"}, "写入时应清理过期条目并维持上限"
     print("✓ 天气缓存有上限且清理过期条目")
@@ -302,6 +302,74 @@ def test_success_clears_cached_failure(monkeypatch):
     print("✓ 成功结果清除同城失败缓存")
 
 
+def test_stale_cache_served_when_upstream_fails(monkeypatch):
+    def ok_get(url, params=None, timeout=None, headers=None):
+        return _Response(_geo("北京") if "geocoding" in url else _forecast())
+
+    monkeypatch.setattr(weather.requests, "get", ok_get)
+    weather.clear_weather_cache()
+    fresh = weather.fetch_weather("北京")
+    assert "stale" not in fresh
+
+    # 缓存超过新鲜期但仍在 stale 窗口内
+    key = weather._cache_key("北京")
+    at, result = weather._cache[key]
+    weather._cache[key] = (at - weather.CACHE_TTL_SEC - 1, result)
+
+    def fail_get(url, params=None, timeout=None, headers=None):
+        raise weather.requests.ConnectionError("network down")
+
+    monkeypatch.setattr(weather.requests, "get", fail_get)
+    stale = weather.fetch_weather("北京")
+    assert stale["stale"] is True
+    assert stale["city"] == "北京"
+    assert weather._failures == {}, "沿用旧数据时不应记录失败缓存"
+    print("✓ 上游故障时沿用 stale 窗口内的成功数据")
+
+
+def test_stale_cache_expires(monkeypatch):
+    def ok_get(url, params=None, timeout=None, headers=None):
+        return _Response(_geo("北京") if "geocoding" in url else _forecast())
+
+    monkeypatch.setattr(weather.requests, "get", ok_get)
+    weather.clear_weather_cache()
+    weather.fetch_weather("北京")
+
+    key = weather._cache_key("北京")
+    at, result = weather._cache[key]
+    weather._cache[key] = (at - weather.STALE_TTL_SEC - 1, result)
+
+    def fail_get(url, params=None, timeout=None, headers=None):
+        raise weather.requests.ConnectionError("network down")
+
+    monkeypatch.setattr(weather.requests, "get", fail_get)
+    with pytest.raises(weather.WeatherError, match="天气接口暂时不可用"):
+        weather.fetch_weather("北京")
+    assert weather._failures, "超过 stale 窗口后应记录失败缓存"
+    print("✓ 超过 stale 窗口后不再沿用旧数据")
+
+
+def test_unknown_city_does_not_use_stale_cache(monkeypatch):
+    responses = [_geo("北京"), {"results": []}]
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if "geocoding" in url:
+            return _Response(responses.pop(0))
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    weather.fetch_weather("北京")
+
+    key = weather._cache_key("北京")
+    at, result = weather._cache[key]
+    weather._cache[key] = (at - weather.CACHE_TTL_SEC - 1, result)
+
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("北京")
+    print("✓ 城市不存在时不使用旧缓存掩盖错误")
+
+
 if __name__ == "__main__":
     for case in (
         test_fetch_weather_and_cache,
@@ -316,6 +384,9 @@ if __name__ == "__main__":
         test_failure_cache_prevents_repeat_requests,
         test_failure_cache_expires,
         test_success_clears_cached_failure,
+        test_stale_cache_served_when_upstream_fails,
+        test_stale_cache_expires,
+        test_unknown_city_does_not_use_stale_cache,
     ):
         mp = pytest.MonkeyPatch()
         try:

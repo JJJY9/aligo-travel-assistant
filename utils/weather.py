@@ -16,6 +16,8 @@ GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 TIMEZONE_DEFAULT = "Asia/Shanghai"
 CACHE_TTL_SEC = 600.0
+# 上游故障时最多沿用最近一次成功结果的窗口（stale-while-error）
+STALE_TTL_SEC = 3600.0
 # 失败结果（城市不存在 / 上游故障）短时缓存：避免侧栏每次刷新都重打上游
 FAILURE_TTL_SEC = 60.0
 # 缓存条目上限：城市名来自请求参数，不能让缓存随查询过的城市无限增长
@@ -126,8 +128,9 @@ def _finish_fetch(name: str, event: threading.Event) -> None:
 def _store_cache(name: str, result: dict[str, Any]) -> None:
     """写入缓存：顺带清掉过期条目，并按上限淘汰最旧的一条。"""
     now = time.monotonic()
+    keep_sec = max(CACHE_TTL_SEC, STALE_TTL_SEC)
     with _cache_lock:
-        expired = [key for key, (at, _) in _cache.items() if now - at >= CACHE_TTL_SEC]
+        expired = [key for key, (at, _) in _cache.items() if now - at >= keep_sec]
         for key in expired:
             del _cache[key]
         if name not in _cache and len(_cache) >= _CACHE_MAX_ENTRIES:
@@ -135,6 +138,15 @@ def _store_cache(name: str, result: dict[str, Any]) -> None:
             del _cache[oldest]
         _cache[name] = (now, result)
         _failures.pop(name, None)
+
+
+def _stale_hit(key: str) -> dict[str, Any] | None:
+    """上游失败时的降级数据：STALE_TTL_SEC 内的旧结果，带 stale 标记。"""
+    with _cache_lock:
+        cached = _cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < STALE_TTL_SEC:
+            return {**cached[1], "stale": True}
+    return None
 
 
 def _failure_hit(key: str) -> str | None:
@@ -165,10 +177,11 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
 
     同一城市的并发未命中只放行一个线程访问上游，其余线程等待并复用
     结果；成功结果缓存 10 分钟，失败结果缓存 60 秒。缓存键忽略大小写
-    与多余空白。
+    与多余空白。上游故障时，若该城市 1 小时内有过成功结果，则沿用旧
+    数据并带 ``stale: true`` 标记。
 
     Raises:
-        WeatherError: 城市为空 / 未找到，或 Open-Meteo 不可用。
+        WeatherError: 城市为空 / 未找到，或 Open-Meteo 不可用且无旧数据可用。
     """
     name = city.strip()
     if not name:
@@ -205,7 +218,13 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     try:
         return _fetch_weather_uncached(name, key, timeout)
     except WeatherError as exc:
-        _store_failure(key, str(exc))
+        message = str(exc)
+        # 上游抖动 / 格式异常时沿用最近一次成功数据；城市不存在没有旧数据可用
+        stale = None if message.startswith("未找到城市") else _stale_hit(key)
+        if stale is not None:
+            logger.warning("天气接口失败（%s），沿用最近一次成功数据：%s", name, message)
+            return stale
+        _store_failure(key, message)
         raise
     finally:
         if leader:

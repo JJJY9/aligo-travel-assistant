@@ -602,7 +602,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 200 条） |
 | GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程数 / 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
-| GET | `/api/weather` | 目的地天气（Open-Meteo，无 API Key；实时 + 未来 3 天，成功结果 10 分钟进程内缓存、失败结果 60 秒；按客户端 IP 限流，默认 30 次 / 分钟） |
+| GET | `/api/weather` | 目的地天气（Open-Meteo，无 API Key；实时 + 未来 3 天，成功结果 10 分钟进程内缓存、失败结果 60 秒；上游故障时 1 小时内沿用最近成功数据并标记 `stale`；按客户端 IP 限流，默认 30 次 / 分钟） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |
 | GET | `/api/sessions` | 历史会话列表（`limit` / `offset` 分页并返回 `total`；`q` 可选：按标题与消息内容搜索，返回命中片段；`archived=true` 只返回归档会话，同时返回 `archived_count`） |

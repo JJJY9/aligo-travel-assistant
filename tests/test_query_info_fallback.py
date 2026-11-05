@@ -240,6 +240,31 @@ def test_weather_query_unavailable():
     print("✓ 天气接口不可用时返回失败并附来源")
 
 
+def test_weather_query_marks_stale_data():
+    from utils import weather
+
+    agent = _load_agent_class()(name="InformationQueryAgent", model=_FakeModel())
+
+    def fake_fetch(city, timeout=8.0):
+        return {
+            "city": "北京",
+            "stale": True,
+            "current": {"description": "晴", "temperature": 10, "humidity": 30},
+            "daily": [],
+            "source": {"name": "Open-Meteo", "url": "https://open-meteo.com"},
+        }
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(weather, "fetch_weather", fake_fetch)
+        result = asyncio.run(agent._weather_query("北京天气"))
+    finally:
+        mp.undo()
+    assert result["query_success"] is True
+    assert "可能不是最新" in result["results"]["summary"]
+    print("✓ stale 数据在摘要中标注")
+
+
 if __name__ == "__main__":
     test_weather_failure_falls_back_to_search()
     test_weather_exception_falls_back_to_search()
@@ -249,4 +274,5 @@ if __name__ == "__main__":
     test_weather_query_open_meteo_formatting()
     test_weather_query_unknown_city()
     test_weather_query_unavailable()
+    test_weather_query_marks_stale_data()
     print("\n全部通过")

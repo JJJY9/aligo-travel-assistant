@@ -2636,7 +2636,7 @@ async function loadUpcomingWeather(city) {
     }
     const text = parts.join(" · ");
     if (!text) return;
-    el.textContent = text;
+    el.textContent = data.stale ? `${text}（较早）` : text;
     el.hidden = false;
   } catch {
     if (seq === upcomingWeatherSeq) el.hidden = true;
