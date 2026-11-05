@@ -1623,6 +1623,67 @@ def run_session_export_standalone(
     return 0
 
 
+def run_sessions_export_standalone(
+    user_id: str,
+    target: str | None = None,
+    to_stdout: bool = False,
+    force: bool = False,
+) -> int:
+    """导出全部会话为单个 Markdown（`python cli.py sessions-export <user> [path] [--stdout] [--force]`）。
+
+    Returns:
+        0 导出成功；1 参数 / 读取 / 写入失败或没有会话
+    """
+    import re
+    from pathlib import Path
+
+    from utils.session_markdown import render_all_sessions_markdown
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            messages = store.get_chat_history()
+            titles = store.get_session_titles()
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取会话失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if not messages:
+        print(f"用户 {user_id}：没有可导出的会话")
+        return 1
+
+    text, count = render_all_sessions_markdown(user_id, messages, titles)
+
+    if to_stdout:
+        print(text)
+        return 0
+
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24] or "user"
+    path = Path(target) if target else Path("exports") / f"aligo_sessions_{safe_user}.md"
+    if path.exists() and not force:
+        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+        return 1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        print(f"写入失败：{exc}")
+        return 1
+    print(f"已导出 {count} 个会话到 {path}（{len(messages)} 条消息）")
+    return 0
+
+
 def run_trips_export_standalone(
     user_id: str,
     target: str | None = None,
@@ -1938,6 +1999,27 @@ def main():
                 run_session_export_standalone(
                     sys.argv[2],
                     sys.argv[3],
+                    target=target,
+                    to_stdout=to_stdout,
+                    force=force,
+                )
+            )
+        if arg == "sessions-export":
+            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+                print(
+                    "用法：python cli.py sessions-export <user_id> [path] [--stdout] [--force]"
+                )
+                sys.exit(2)
+            parsed_export = _parse_export_args(sys.argv[3:])
+            if parsed_export is None:
+                print(
+                    "用法：python cli.py sessions-export <user_id> [path] [--stdout] [--force]"
+                )
+                sys.exit(2)
+            target, to_stdout, force = parsed_export
+            sys.exit(
+                run_sessions_export_standalone(
+                    sys.argv[2],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
