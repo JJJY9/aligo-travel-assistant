@@ -1440,7 +1440,12 @@ def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> i
     if not removed:
         print(f"片段不存在：#{doc_id}")
         return 1
-    print(f"已删除{'整组分片' if whole_group else '知识片段'} #{doc_id}")
+    if whole_group and removed > 1:
+        print(f"已删除整组分片 #{doc_id}（共 {removed} 片）")
+    elif whole_group:
+        print(f"未找到同组分片，已删除单个片段 #{doc_id}")
+    else:
+        print(f"已删除知识片段 #{doc_id}")
     return 0
 
 

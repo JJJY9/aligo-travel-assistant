@@ -169,17 +169,15 @@ def _chunk_documents(
     if not chunks:
         chunks = [text]
     # 分片标记是派生字段：调用方回传的旧 part/parts/group 必须丢弃，
-    # 否则编辑后会沿用旧编号 / 旧组
+    # 否则编辑后会沿用旧编号 / 旧组。派生标记是内部记账字段，不受用户
+    # 元数据 10 键上限约束（该上限只约束输入 / 导入），否则用户元数据
+    # 占用 8 个键时分片记录会没有任何标记、面板与整组删除都无法识别。
     base_meta = {
         key: value
         for key, value in (metadata or {}).items()
         if key not in _DERIVED_CHUNK_KEYS
     }
-    group_id = ""
-    if len(chunks) > 1:
-        needed = len(set(base_meta) | _DERIVED_CHUNK_KEYS)
-        if needed <= _METADATA_MAX_KEYS:
-            group_id = uuid.uuid4().hex[:12]
+    group_id = uuid.uuid4().hex[:12] if len(chunks) > 1 else ""
     documents: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks):
         meta = dict(base_meta)
@@ -240,20 +238,31 @@ def _document_info(client: Any, doc_id: int) -> tuple[int, str]:
 
 
 def _group_member_ids(client: Any, group: str) -> list[int]:
-    """同一拆分组的其它分片 id（本地知识库规模远小于扫描上限）。"""
+    """同一拆分组的其它分片 id。
+
+    单次 query 受 limit（16384）约束，CLI 导入不受限时集合可能超过该规模，
+    必须分页扫描，否则整组删除 / 替换只会命中其中一页。
+    """
     if not group:
         return []
-    rows = client.query(
-        collection_name=COLLECTION_NAME,
-        filter="id >= 0",
-        output_fields=["id", "metadata"],
-        limit=_MAX_SCAN,
-    )
     members: list[int] = []
-    for row in rows or []:
-        meta = _parse_metadata(row.get("metadata"))
-        if str(meta.get("group") or "") == group:
-            members.append(int(row.get("id", 0) or 0))
+    offset = 0
+    while True:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter="id >= 0",
+            output_fields=["id", "metadata"],
+            limit=_MAX_SCAN,
+            offset=offset,
+        )
+        rows = rows or []
+        for row in rows:
+            meta = _parse_metadata(row.get("metadata"))
+            if str(meta.get("group") or "") == group:
+                members.append(int(row.get("id", 0) or 0))
+        if len(rows) < _MAX_SCAN:
+            break
+        offset += _MAX_SCAN
     return members
 
 
@@ -262,9 +271,11 @@ def update_document(
 ) -> dict[str, Any]:
     """按 id 覆盖更新知识片段（重新嵌入）；长内容其余分片以新记录追加。
 
-    新拆分（带 group 元数据）的多分片记录按「整组替换」处理：更新目标
-    分片与追加新分片成功后，删除同组的其余旧分片。旧数据没有 group，
-    无法定位其余分片，单条编辑仍被拒绝（请整组删除后重新添加）。
+    新拆分（带 group 元数据）的多分片记录按「整组替换」处理：先写新分片、
+    再覆盖目标分片，最后删除同组的其余旧分片。顺序保证任一前缀失败时
+    旧内容仍完整可恢复（覆盖目标放在新分片写入成功之后，失败时补偿删除
+    已插入的新分片）。旧数据没有 group，单条编辑仍被拒绝（请整组删除后
+    重新添加）。
     """
     text = content.strip()
     if not text:
@@ -282,22 +293,32 @@ def update_document(
                 f"该片段属于多分片知识内容（共 {existing_parts} 段），"
                 "暂不支持单条编辑：请删除整组后重新添加，避免旧分片残留"
             )
-        first = documents[0]
-        result = agent.update_document(
-            int(doc_id), first["content"], first["metadata"]
-        )
-        if result.get("status") != "success":
-            raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
+        # 先写其余新分片：失败时目标分片与旧分片原样保留，可直接重试
         extra_ids: list[int] = []
         if len(documents) > 1:
             added = agent.add_documents(documents[1:])
             if added.get("status") != "success":
                 raise RuntimeError(
-                    "更新成功但新增分片失败："
+                    "新增分片失败，原内容未修改："
                     + str(added.get("message") or "未知错误")
                 )
             extra_ids = [int(item) for item in (added.get("ids") or [])]
-        # 新分片写入成功后再删旧分片：中途失败最多留下旧分片，不会丢内容
+        first = documents[0]
+        try:
+            result = agent.update_document(
+                int(doc_id), first["content"], first["metadata"]
+            )
+            if result.get("status") != "success":
+                raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
+        except Exception:
+            # 补偿：删除本次已插入的其余分片，保持原记录可重试
+            if extra_ids:
+                try:
+                    client.delete(collection_name=COLLECTION_NAME, ids=extra_ids)
+                except Exception:  # noqa: BLE001 - 补偿失败不覆盖原始错误
+                    logger.warning("更新失败后补偿删除新分片失败：%s", extra_ids)
+            raise
+        # 目标已换成新内容后再删旧分片（旧组仅此时失去定位目标）
         removed_ids: list[int] = []
         if group:
             removed_ids = [
@@ -325,8 +346,65 @@ def export_documents() -> list[dict[str, Any]]:
     ]
 
 
+def _regroup_exported_documents(documents: list[Any]) -> list[Any]:
+    """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
+
+    导出文件包含 part/parts/group 元数据；逐条导入会把一篇文档拆成互不
+    相关的单条记录（单条编辑、整组删除都无法识别）。这里先合并回整篇，
+    再由 ``_chunk_documents`` 重新拆分并生成新的组标识。
+    """
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    order: list[tuple[str, Any]] = []
+    for item in documents:
+        if not isinstance(item, dict):
+            order.append(("single", item))
+            continue
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        group = str(metadata.get("group") or "")
+        try:
+            parts = int(metadata.get("parts") or 1)
+        except (TypeError, ValueError):
+            parts = 1
+        if group and parts > 1:
+            try:
+                part_no = int(metadata.get("part") or 0)
+            except (TypeError, ValueError):
+                part_no = 0
+            grouped.setdefault(group, []).append((part_no, item))
+            if not any(kind == "group" and key == group for kind, key in order):
+                order.append(("group", group))
+        else:
+            order.append(("single", item))
+
+    merged: list[Any] = []
+    for kind, key in order:
+        if kind == "single":
+            merged.append(key)
+            continue
+        pieces = sorted(grouped.get(key, []), key=lambda pair: pair[0])
+        contents: list[str] = []
+        base_meta: dict[str, Any] = {}
+        for index, (_, piece) in enumerate(pieces):
+            metadata = piece.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            content = piece.get("content")
+            if isinstance(content, str):
+                contents.append(content)
+            if index == 0:
+                base_meta = {
+                    meta_key: meta_value
+                    for meta_key, meta_value in metadata.items()
+                    if meta_key not in _DERIVED_CHUNK_KEYS
+                }
+        if contents:
+            merged.append({"content": "\n".join(contents), "metadata": base_meta})
+    return merged
+
+
 def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。"""
+    documents = _regroup_exported_documents(list(documents))
     cleaned: list[dict[str, Any]] = []
     skipped = 0
     for item in documents:
@@ -393,11 +471,11 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     return {"imported": len(imported), "skipped": skipped}
 
 
-def delete_document(doc_id: int, whole_group: bool = False) -> bool:
-    """按 id 删除知识片段；返回是否真的删除了记录。
+def delete_document(doc_id: int, whole_group: bool = False) -> int:
+    """按 id 删除知识片段；返回实际删除的分片数（不存在返回 0）。
 
     ``whole_group=True`` 时，如果该片段属于带 group 标识的多分片记录，
-    同时删除同组的其余分片（旧数据没有 group 时只删除当前片段）。
+    同时删除同组的其余分片（旧数据没有 group 时只删除当前片段，返回 1）。
 
     Raises:
         FileNotFoundError: 知识库未初始化
@@ -407,14 +485,14 @@ def delete_document(doc_id: int, whole_group: bool = False) -> bool:
     _load_collection(client, COLLECTION_NAME)
     with _WRITE_LOCK:
         if not _exists(client, int(doc_id)):
-            return False
+            return 0
         ids = [int(doc_id)]
         if whole_group:
             _, group = _document_info(client, int(doc_id))
             if group:
                 ids = sorted(set(_group_member_ids(client, group)) | {int(doc_id)})
         client.delete(collection_name=COLLECTION_NAME, ids=ids)
-        return True
+        return len(ids)
 
 
 def search_documents(query: str, top_k: int = 5) -> list[dict[str, Any]]:

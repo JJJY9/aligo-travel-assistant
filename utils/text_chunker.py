@@ -83,8 +83,9 @@ def _merge_short_chunks(
         if pending:
             candidate = f"{pending}\n{chunk}"
             if max_chars is not None and len(candidate) > max_chars:
-                merged.append(pending)
-                merged.append(chunk)
+                # 标题 + 正文超过上限时把标题并入正文开头再切分，
+                # 不能把标题单独成块（会重新产生无内容的标题片段）
+                merged.extend(_split_long_paragraph(candidate, max_chars))
             else:
                 merged.append(candidate)
             pending = ""

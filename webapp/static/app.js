@@ -72,6 +72,8 @@ const state = {
   archivedMatches: 0,
   sessionsLoading: false,
   sessionLoading: false,
+  // 偏好编辑被取消时置位：刷新被有意跳过，面板关闭时补一次
+  statusStale: false,
 };
 
 function isValidId(value) {
@@ -545,7 +547,7 @@ function renderUserNode(text) {
 
 function refreshEditButtons() {
   els.messages.querySelectorAll(".user-edit").forEach((node) => node.remove());
-  if (state.busy || !state.sessionId) return;
+  if (state.busy || state.sessionLoading || !state.sessionId) return;
   const users = els.messages.querySelectorAll(".msg.user");
   const last = users[users.length - 1];
   if (!last) return;
@@ -573,7 +575,11 @@ function cancelPendingEdits() {
 }
 
 function startEditUserNode(node, originalText) {
-  if (state.busy || state.sessionLoading) return;
+  if (state.busy) return;
+  if (state.sessionLoading) {
+    toast("会话正在加载，请稍候");
+    return;
+  }
   const bubble = node.querySelector(".bubble");
   if (!bubble || bubble.querySelector(".user-edit-form")) return;
   const foot = node.querySelector(".user-edit");
@@ -1803,6 +1809,8 @@ async function openSession(sessionId, options = {}) {
   }
   const token = ++sessionLoadToken;
   state.sessionLoading = true;
+  // 加载期间隐藏旧会话的「编辑」入口，避免点击后无反馈
+  refreshEditButtons();
   try {
     const data = await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
@@ -1869,7 +1877,11 @@ async function openSession(sessionId, options = {}) {
       showWelcome();
     }
   } finally {
-    if (token === sessionLoadToken) state.sessionLoading = false;
+    if (token === sessionLoadToken) {
+      state.sessionLoading = false;
+      // 加载期间 refreshEditButtons 被跳过，这里补回编辑入口
+      refreshEditButtons();
+    }
   }
 }
 
@@ -2303,7 +2315,10 @@ async function refreshStatus() {
   // 记忆面板里正在编辑的偏好输入框会随 renderOverview 重建被销毁：
   // 在真正渲染前（异步请求返回后）再检查一次，编辑期间保留旧视图，
   // 编辑结束的保存 / 取消路径会各补一次刷新
-  if (!preferenceEditActive()) renderOverview();
+  if (!preferenceEditActive()) {
+    renderOverview();
+    state.statusStale = false;
+  }
 }
 
 function preferenceEditActive() {
@@ -2925,8 +2940,9 @@ function startEditPreference(row, type, currentValue) {
     if (settled) return;
     settled = true;
     if (input.isConnected) input.replaceWith(valueEl);
-    // 编辑期间的 refreshStatus 被跳过，这里补一次，避免行程 / 统计停在旧数据
-    refreshStatus();
+    // 不在 blur（mousedown 阶段）里重建列表：那会把本次点击的目标节点
+    // 换掉、吞掉 click。标记为过期，面板关闭时统一补一次刷新。
+    state.statusStale = true;
   };
 
   const save = async () => {
@@ -2952,7 +2968,9 @@ function startEditPreference(row, type, currentValue) {
         body: JSON.stringify({ user_id: state.userId, value }),
       });
       toast("偏好已更新");
-      // 先撤掉编辑框再刷新：refreshStatus 在编辑框存在时会跳过渲染
+      // 先把行内显示改成新值再撤掉编辑框：状态请求慢时不能长时间显示旧值，
+      // 否则用户以为没保存成功，再次编辑会把旧值 PUT 回去
+      valueEl.textContent = formatPreferenceValue(value);
       if (input.isConnected) input.replaceWith(valueEl);
       await refreshStatus();
     } catch (error) {
@@ -3395,13 +3413,15 @@ async function runKbEval() {
     const data = await getJSON("/api/knowledge/eval");
     const pct = (value) => `${Math.round(Number(value || 0) * 100)}%`;
     const hit5 = Number(data.hit5 || 0);
+    const warning = String(data.warning || "").trim();
     if (els.kbEvalResult) {
       els.kbEvalResult.textContent =
         `检索评测：${data.total} 个问题 · hit@1 ${pct(data.hit1)}` +
         ` · hit@3 ${pct(data.hit3)} · hit@5 ${pct(data.hit5)}` +
         ` · MRR ${Number(data.mrr || 0).toFixed(2)}` +
-        (hit5 < 0.8 ? " · 低于 80% 基线" : "");
-      els.kbEvalResult.classList.toggle("warn", hit5 < 0.8);
+        (hit5 < 0.8 ? " · 低于 80% 基线" : "") +
+        (warning ? ` · ${warning}` : "");
+      els.kbEvalResult.classList.toggle("warn", hit5 < 0.8 || Boolean(warning));
     }
   } catch (error) {
     if (els.kbEvalResult) els.kbEvalResult.textContent = `评测失败：${error.message}`;
@@ -3756,6 +3776,10 @@ function openMemorySheet() {
 function closeMemorySheet() {
   if (els.memorySheet.hidden) return;
   els.memorySheet.hidden = true;
+  if (state.statusStale) {
+    state.statusStale = false;
+    refreshStatus();
+  }
   const opener = memorySheetOpener;
   memorySheetOpener = null;
   if (opener && opener.isConnected && !opener.hidden) {

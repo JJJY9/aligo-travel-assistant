@@ -73,6 +73,9 @@ class DistributedLock:
         # 先拿进程内锁：本进程任一时刻最多一个持有者，再谈跨实例
         if not self._local.acquire(blocking=False):
             return None
+        # 每次取得本地互斥后重置上一次持有的 lost：Redis 持续故障 / 回退
+        # 路径不会清零它，残留值会把没拿到共享锁的调用误标为「锁失效」
+        self.lost = False
         client = self._get_client()
         if client is None:
             self.degraded = True
@@ -91,7 +94,6 @@ class DistributedLock:
             self.degraded = False
             return None
         self.degraded = False
-        self.lost = False
         self._start_heartbeat(token)
         return token
 
@@ -133,6 +135,10 @@ class DistributedLock:
                 # EXPIRE 返回 0：键已过期（被其它实例重新获取）或 token 已不匹配。
                 # 此时本进程已不是唯一持有者，继续执行会与另一个实例并发。
                 if not renewed:
+                    if stop.is_set():
+                        # 释放 / 重新加锁后才返回的旧续期：不能把新的持有点
+                        # 标记为已丢失
+                        return
                     self.lost = True
                     logger.warning(
                         "Redis 互斥锁在持有期间失效（%s），互斥保护已丢失", self._key

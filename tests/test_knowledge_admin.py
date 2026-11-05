@@ -28,15 +28,16 @@ class _FakeMilvusClient:
     def load_collection(self, name):
         pass
 
-    def query(self, collection_name, filter="", output_fields=None, limit=10):
+    def query(self, collection_name, filter="", output_fields=None, limit=10, offset=0):
         if filter.startswith("id =="):
             doc_id = int(filter.split("==")[1])
             return [row for row in self.rows if int(row["id"]) == doc_id]
         if filter.startswith("id >="):
             threshold = int(filter.split(">=")[1])
-            return [row for row in self.rows if int(row["id"]) >= threshold][:limit]
-        # 与真实 Milvus 一致：查询受 limit 限制（导出截断回归才能被测出）
-        return list(self.rows)[:limit]
+            matched = [row for row in self.rows if int(row["id"]) >= threshold]
+            return matched[offset : offset + limit]
+        # 与真实 Milvus 一致：查询受 limit / offset 限制（分页回归才能被测出）
+        return list(self.rows)[offset : offset + limit]
 
     def delete(self, collection_name, ids):
         self.deleted.extend(ids)
@@ -178,9 +179,9 @@ def test_delete_document_checks_existence(monkeypatch):
     fake = _FakeMilvusClient([{"id": 5, "content": "x", "metadata": "{}"}])
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
 
-    assert knowledge_admin.delete_document(5) is True
+    assert knowledge_admin.delete_document(5) == 1
     assert fake.deleted == [5]
-    assert knowledge_admin.delete_document(99) is False
+    assert knowledge_admin.delete_document(99) == 0
     print("✓ 删除知识片段（存在性判断）")
 
 
@@ -338,8 +339,11 @@ def test_import_documents_sanitizes(monkeypatch):
     assert all(len(item["content"]) <= 400 for item in sent)
     assert "".join(item["content"] for item in sent[1:]) == long_content[:2000]
     assert all(item["content"] not in ("None", "False", "0") for item in sent)
-    assert len(sent[1]["metadata"]) == 10
-    assert max(len(value) for value in sent[1]["metadata"].values()) == 200
+    meta = sent[1]["metadata"]
+    user_keys = {key for key in meta if key not in {"part", "parts", "group"}}
+    assert len(user_keys) == 10, "用户元数据仍按 10 键清洗"
+    assert {"part", "parts", "group"} <= set(meta), "分片标记必须写入"
+    assert max(len(meta[key]) for key in user_keys) == 200
     print("✓ 导入知识片段（跳过空项 / 非字符串内容 / 截断超长字段 / 长内容拆分）")
 
 
@@ -507,6 +511,144 @@ def test_update_document_replaces_grouped_multipart(monkeypatch):
     print("✓ 带组标识的多分片记录整组替换")
 
 
+def test_update_grouped_add_failure_keeps_old_content(monkeypatch):
+    """整组替换先写新分片：新增失败时目标分片与旧分片都不能被改动。"""
+    from pathlib import Path
+
+    def _meta(part):
+        return json.dumps({"part": str(part), "parts": "3", "group": "g-old"})
+
+    rows = [
+        {"id": 1, "content": "第一段", "metadata": _meta(1)},
+        {"id": 2, "content": "第二段", "metadata": _meta(2)},
+        {"id": 3, "content": "第三段", "metadata": _meta(3)},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+            self.added = None
+
+        def update_document(self, *args, **kwargs):
+            self.updated = (args, kwargs)
+            raise AssertionError("新增失败时不应覆盖目标分片")
+
+        def add_documents(self, documents):
+            self.added = documents
+            return {"status": "error", "message": "embedding down"}
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    with pytest.raises(RuntimeError, match="原内容未修改"):
+        knowledge_admin.update_document(2, "长" * 1000, {"category": "测试"})
+    assert agent.updated is None
+    assert fake_client.deleted == [], "失败时不能删除任何旧分片"
+    print("✓ 整组替换新增失败时保留旧内容")
+
+
+def test_update_grouped_update_failure_rolls_back_extras(monkeypatch):
+    """新分片写入成功但覆盖目标失败：补偿删除本次插入的分片后报错。"""
+    from pathlib import Path
+
+    rows = [{"id": 7, "content": "旧内容", "metadata": "{}"}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def add_documents(self, documents):
+            return {"status": "success", "ids": [8, 9], "total_count": 2}
+
+        def update_document(self, doc_id, content, metadata):
+            return {"status": "error", "message": "upsert failed"}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(RuntimeError, match="upsert failed"):
+        knowledge_admin.update_document(7, "长" * 1000, {"category": "测试"})
+    assert fake_client.deleted == [8, 9], "应补偿删除本次插入的分片"
+    print("✓ 覆盖目标失败时补偿删除新分片")
+
+
+def test_chunk_documents_marks_even_with_full_metadata(monkeypatch):
+    """用户元数据占满 10 键时分片记录仍必须带 part/parts/group。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.documents = None
+
+        def add_documents(self, documents):
+            self.documents = documents
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    metadata = {f"k{index}": f"v{index}" for index in range(8)}
+    knowledge_admin.add_document("第一段内容。" * 200, metadata)
+    assert len(agent.documents) > 1
+    for item in agent.documents:
+        assert item["metadata"]["parts"] == str(len(agent.documents))
+        assert item["metadata"]["group"]
+    print("✓ 元数据较多时分片标记仍然写入")
+
+
+def test_import_regroups_exported_chunks(monkeypatch):
+    """导出备份中同一 group 的分片应按 part 拼回整篇再导入，而不是各自成条。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset=0: {"total": 0, "items": []},
+    )
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    text = "".join(f"第{i}段内容，长度适中，用于触发多分片拆分与重组验证。" for i in range(1, 61))
+    exported = [
+        {
+            "content": text[1000:],
+            "metadata": {"group": "g1", "part": "2", "parts": "2", "category": "测试"},
+        },
+        {
+            "content": text[:1000],
+            "metadata": {"group": "g1", "part": "1", "parts": "2", "category": "测试"},
+        },
+        {"content": "普通片段", "metadata": {}},
+    ]
+    knowledge_admin.import_documents(exported)
+    added = agent.calls[0]
+    grouped = [doc for doc in added if doc["metadata"].get("group")]
+    assert len(grouped) > 1, "整篇内容应重新拆分并带组标识"
+    assert len({doc["metadata"]["group"] for doc in grouped}) == 1
+    rejoined = "".join(doc["content"] for doc in grouped)
+    assert rejoined.replace("\n", "") == (text[:1000] + text[1000:]).replace("\n", "")
+    assert any(doc["content"] == "普通片段" for doc in added)
+    print("✓ 导入按 group 重新合并导出分片")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -521,11 +663,11 @@ def test_delete_document_whole_group(monkeypatch):
     fake_client = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
 
-    assert knowledge_admin.delete_document(2, whole_group=True) is True
+    assert knowledge_admin.delete_document(2, whole_group=True) == 3
     assert sorted(fake_client.deleted) == [1, 2, 3], "应删除同组全部分片"
-    assert knowledge_admin.delete_document(4, whole_group=True) is True
+    assert knowledge_admin.delete_document(4, whole_group=True) == 1
     assert fake_client.deleted == [1, 2, 3, 4], "无 group 的旧记录只删除当前片段"
-    assert knowledge_admin.delete_document(99) is False
+    assert knowledge_admin.delete_document(99) == 0
     print("✓ 知识分片整组删除")
 
 
@@ -642,6 +784,10 @@ if __name__ == "__main__":
         test_chunk_documents_overrides_stale_part_metadata,
         test_update_document_rejects_multipart_edit,
         test_update_document_replaces_grouped_multipart,
+        test_update_grouped_add_failure_keeps_old_content,
+        test_update_grouped_update_failure_rolls_back_extras,
+        test_chunk_documents_marks_even_with_full_metadata,
+        test_import_regroups_exported_chunks,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,

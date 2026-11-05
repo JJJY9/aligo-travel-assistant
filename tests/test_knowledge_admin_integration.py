@@ -62,7 +62,7 @@ def test_add_search_and_delete_roundtrip():
             f"新增片段应能被语义检索命中，实际：{hits}"
         )
     finally:
-        assert delete_document(first_id) is True
+        assert delete_document(first_id) == 1
 
     remaining = list_documents(query=first_marker)["items"]
     assert not any(item["id"] == first_id for item in remaining), "删除后不应再检索到"
@@ -84,7 +84,7 @@ def test_add_search_and_delete_roundtrip():
         assert any(item["id"] == before_max and item["content"] == before_max_content
                    for item in after_items), "原有最大 id 片段的内容不应被覆盖"
     finally:
-        assert delete_document(second_id) is True
+        assert delete_document(second_id) == 1
 
     print(f"✓ 知识片段新增 / 语义检索 / 删除闭环（id={first_id} → {second_id}）")
 
@@ -127,7 +127,7 @@ def test_update_document_roundtrip():
             f"更新后的片段应能被语义检索命中，实际：{hits}"
         )
     finally:
-        assert delete_document(doc_id) is True
+        assert delete_document(doc_id) == 1
 
     print(f"✓ 知识片段更新闭环（重新嵌入 + 覆盖旧内容，id={doc_id}）")
 

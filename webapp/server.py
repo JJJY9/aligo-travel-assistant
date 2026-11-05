@@ -539,6 +539,9 @@ class AligoWebApp:
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
         self._deleted_sessions: OrderedDict[str, float] = OrderedDict()
+        # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
+        # 不同 user_id 的请求互不串行：OrderedDict 的迭代 + 删除必须加锁
+        self._tombstone_lock = threading.Lock()
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
@@ -651,18 +654,19 @@ class AligoWebApp:
         """
         key = self._session_key(user_id, session_id)
         now = time.monotonic()
-        self._deleted_sessions[key] = now
-        self._deleted_sessions.move_to_end(key)
-        # 先清掉已过期的墓碑，避免仍有效的墓碑被容量上限淘汰
-        expired = [
-            candidate
-            for candidate, at in self._deleted_sessions.items()
-            if now - at > self.tombstone_ttl_sec
-        ]
-        for candidate in expired:
-            del self._deleted_sessions[candidate]
-        while len(self._deleted_sessions) > self.max_tombstones:
-            self._deleted_sessions.popitem(last=False)
+        with self._tombstone_lock:
+            self._deleted_sessions[key] = now
+            self._deleted_sessions.move_to_end(key)
+            # 先清掉已过期的墓碑，避免仍有效的墓碑被容量上限淘汰
+            expired = [
+                candidate
+                for candidate, at in self._deleted_sessions.items()
+                if now - at > self.tombstone_ttl_sec
+            ]
+            for candidate in expired:
+                del self._deleted_sessions[candidate]
+            while len(self._deleted_sessions) > self.max_tombstones:
+                self._deleted_sessions.popitem(last=False)
         client = self._shared_tombstones()
         if client is not None:
             try:
@@ -679,7 +683,8 @@ class AligoWebApp:
 
     def unmark_deleted(self, user_id: str, session_id: str) -> None:
         """撤销墓碑（删除失败时使用），避免把仍存在的会话误判为已删除。"""
-        self._deleted_sessions.pop(self._session_key(user_id, session_id), None)
+        with self._tombstone_lock:
+            self._deleted_sessions.pop(self._session_key(user_id, session_id), None)
         client = self._shared_tombstones()
         if client is None:
             return
@@ -692,11 +697,12 @@ class AligoWebApp:
         if not session_id:
             return False
         key = self._session_key(user_id, session_id)
-        created = self._deleted_sessions.get(key)
-        if created is not None:
-            if time.monotonic() - created <= self.tombstone_ttl_sec:
-                return True
-            self._deleted_sessions.pop(key, None)
+        with self._tombstone_lock:
+            created = self._deleted_sessions.get(key)
+            if created is not None:
+                if time.monotonic() - created <= self.tombstone_ttl_sec:
+                    return True
+                self._deleted_sessions.pop(key, None)
         client = self._shared_tombstones()
         if client is not None:
             try:
@@ -922,8 +928,10 @@ def _get_weather_executor() -> ThreadPoolExecutor:
 def _open_long_term(user_id: str) -> Any:
     """按当前配置打开长期记忆（JSON 或 PostgreSQL）。
 
-    打开失败（数据库不可达 / 文件损坏）属于可重试的存储故障，统一映射为
-    503，避免所有调用点都抛裸 500；调用点仍负责关闭返回的 store。
+    注意：PostgreSQL 连接失败时存储工厂会按既有降级策略回退到本地 JSON，
+    不会走到这里的异常分支；这里兜住的是其余打开失败（文件损坏 / 依赖缺失
+    等），统一映射为可重试的 503，避免所有调用点都抛裸 500。调用点仍负责
+    关闭返回的 store。
     """
     try:
         return create_long_term_memory(user_id, str(MEMORY_DIR))
@@ -1604,12 +1612,23 @@ def create_app(model: Any = None) -> FastAPI:
                         query, top_k=top_k, strict=True
                     )
                 )
-                # 心跳续期发现共享锁已失效（过期后被其它实例拿走）：本次评测
+                # 心跳续期发现共享锁已失效（过期后被其它实例拿走），或配置了
+                # Redis 但加锁时回退到进程内（共享锁实际不存在）：本次评测
                 # 可能与之并发，结果需要打标而不能当作独占评测
-                if getattr(state.eval_lock, "lost", False) and isinstance(result, dict):
-                    logger.warning("检索评测期间共享锁失效，结果可能受并发评测影响")
+                lock_lost = bool(getattr(state.eval_lock, "lost", False))
+                lock_degraded = bool(getattr(state.eval_lock, "degraded", False))
+                lock_expected = bool(STORAGE_CONFIG.get("redis_url"))
+                if (
+                    lock_lost or (lock_degraded and lock_expected)
+                ) and isinstance(result, dict):
+                    logger.warning(
+                        "检索评测期间共享锁不可用（lost=%s, degraded=%s），"
+                        "结果可能受并发评测影响",
+                        lock_lost,
+                        lock_degraded,
+                    )
                     result["warning"] = (
-                        "评测期间共享锁失效（可能存在并发评测），结果仅供参考"
+                        "评测期间共享锁不可用（可能存在并发评测），结果仅供参考"
                     )
                 return result
             except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
@@ -1679,7 +1698,12 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
         if not removed:
             raise HTTPException(status_code=404, detail="知识片段不存在")
-        return {"id": doc_id, "deleted": True, "group": bool(group)}
+        return {
+            "id": doc_id,
+            "deleted": True,
+            "group": bool(group),
+            "count": int(removed),
+        }
 
     @app.get("/api/knowledge/export")
     def knowledge_export(request: Request) -> Response:
@@ -2026,17 +2050,25 @@ def create_app(model: Any = None) -> FastAPI:
                 finally:
                     _close_long_term(store)
 
+            # 先落墓碑再查存在性：从请求开始其它在途对话就会被拒绝，
+            # 不会在存在性检查期间把已删除的会话写回。重复删除（之前已有
+            # 墓碑）保留墓碑；从未存在的 id 在确认后撤销，避免 300 秒内
+            # 无法用该 id 新开对话。
+            already_marked = await asyncio.to_thread(
+                state.is_recently_deleted, user_id, session_id
+            )
+            if not already_marked:
+                await asyncio.to_thread(state.mark_deleted, user_id, session_id)
+
             try:
                 existed = await asyncio.to_thread(_exists)
             except Exception as exc:  # noqa: BLE001 - 读失败统一提示
+                if not already_marked:
+                    await asyncio.to_thread(
+                        state.unmark_deleted, user_id, session_id
+                    )
                 logger.warning("检查会话是否存在失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
-
-            # 只为确实存在的会话落墓碑：不存在的 id 不写墓碑（否则 300 秒内
-            # 无法新开对话）；重复删除 / 并发删除返回 0 时保留墓碑，避免
-            # 旧 session_id 在墓碑窗口内被复活
-            if existed:
-                await asyncio.to_thread(state.mark_deleted, user_id, session_id)
 
             def _delete() -> int:
                 store = _open_long_term(user_id)
@@ -2050,7 +2082,7 @@ def create_app(model: Any = None) -> FastAPI:
                 # 慢库不能让整个事件循环（其它会话的 SSE 心跳）停住
                 removed = await asyncio.to_thread(_delete)
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
-                if existed:
+                if not already_marked:
                     # 删除失败：会话仍存在时撤销墓碑（查询也失败则保留墓碑，
                     # 宁可短暂误判已删除，也不放开防复活保护）
                     try:
@@ -2063,6 +2095,9 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            if removed == 0 and not existed and not already_marked:
+                # 从未存在的 id：撤销本请求落的墓碑，允许用该 id 新开对话
+                await asyncio.to_thread(state.unmark_deleted, user_id, session_id)
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}

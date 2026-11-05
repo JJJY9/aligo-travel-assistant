@@ -269,6 +269,81 @@ def test_outage_writes_replayed_after_recovery(monkeypatch):
     print("✓ 故障期消息在恢复后补写")
 
 
+class _ApplyThenFailRedis(_FlakyRedis):
+    """写入已生效但响应丢失：execute 在数据写入后抛连接错误。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_after_apply = False
+
+    def pipeline(self):
+        client = self
+
+        class _Pipe:
+            def rpush(self, key, *values):
+                client._check()
+                client.data.extend(values)
+
+            def ltrim(self, key, start, end):
+                client._check()
+                if end == -1 and start < 0:
+                    client.data = client.data[-abs(start):]
+
+            def expire(self, key, ttl):
+                client._check()
+
+            def execute(self):
+                client._check()
+                if client.fail_after_apply:
+                    raise ConnectionError("response lost after commit")
+
+        return _Pipe()
+
+
+def test_outage_backlog_is_bounded(monkeypatch):
+    """长时间故障时待补写消息只保留最近窗口，进程内存不会无限增长。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=2, user_id="u1")
+
+    client.fail = True
+    for index in range(10):
+        memory.add_message("user" if index % 2 == 0 else "assistant", f"m{index}")
+    assert len(memory._pending) <= 4, "待补写队列应与滑动窗口一致"
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["m6", "m7", "m8", "m9"]
+    assert len(client.data) == 4
+    print("✓ 故障期待补写队列有界（只保留最近窗口）")
+
+
+def test_replay_dedupes_committed_payload(monkeypatch):
+    """写入已在 Redis 生效但响应丢失时，恢复补写不能重复追加同一条消息。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _ApplyThenFailRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    client.fail_after_apply = True
+    memory.add_message("user", "Q2")
+    assert memory._pending, "响应丢失时消息应进入待补写队列"
+    assert len(client.data) == 3, "写入本身已在服务端生效"
+
+    client.fail_after_apply = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["Q1", "A1", "Q2"], "补写不能重复"
+    assert memory._pending == []
+    print("✓ 补写按已提交内容去重（至少一次语义不重复）")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
@@ -300,6 +375,16 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_outage_writes_replayed_after_recovery(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_backlog_is_bounded(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_replay_dedupes_committed_payload(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")
