@@ -946,6 +946,11 @@ def _json_safe_value(value: Any) -> Any:
     return value
 
 
+def _ambiguous_trip_id(trips: list[dict[str, Any]], trip_id: str) -> bool:
+    """历史数据里同一 trip_id 可能对应多条不同行程，这类 id 不能按 id 操作。"""
+    return sum(1 for trip in trips if str(trip.get("trip_id")) == trip_id) > 1
+
+
 def _load_user_data(user_id: str) -> dict[str, Any]:
     try:
         store = _open_long_term(user_id)
@@ -2266,6 +2271,11 @@ def create_app(model: Any = None) -> FastAPI:
         conflicts: list[dict[str, Any]] = []
         try:
             trips = store.get_trip_history(limit=None)
+            if _ambiguous_trip_id(trips, trip_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理",
+                )
             current = next(
                 (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
                 None,
@@ -2373,6 +2383,11 @@ def create_app(model: Any = None) -> FastAPI:
             trips = store.get_trip_history(limit=None)
         finally:
             _close_long_term(store)
+        if _ambiguous_trip_id(trips, trip_id):
+            raise HTTPException(
+                status_code=409,
+                detail="该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理",
+            )
         trip = next(
             (item for item in trips if str(item.get("trip_id")) == trip_id),
             None,
@@ -2400,7 +2415,15 @@ def create_app(model: Any = None) -> FastAPI:
         """删除一条历史行程（清理误记录）。"""
         store = _open_long_term(user_id)
         try:
+            trips = store.get_trip_history(limit=None)
+            if _ambiguous_trip_id(trips, trip_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理",
+                )
             removed = store.delete_trip(trip_id)
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001 - 存储写入失败要显式返回 503
             logger.warning("删除行程失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
