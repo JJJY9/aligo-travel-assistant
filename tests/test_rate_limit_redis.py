@@ -11,6 +11,7 @@ CI 中通过 `TEST_REDIS_URL` 自动启用；未提供时跳过。验证两件�
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -84,6 +85,39 @@ def test_shared_window_across_instances():
         remaining, reset = second.status("k")
         assert remaining == 0 and 0 <= reset <= 60
         print("✓ 两个实例共享滑动窗口计数")
+    finally:
+        _cleanup(name, client)
+
+
+def test_concurrent_checks_share_atomic_quota():
+    """多线程同时 check（模拟多实例并发）时，Lua 脚本应严格只放行 limit 次。"""
+    name = f"it-conc-{uuid.uuid4().hex[:8]}"
+    client = _client()
+    limit = 5
+    try:
+        limiters = [
+            RedisRateLimiter(client, name, limit=limit, window_sec=60) for _ in range(2)
+        ]
+        allowed: list[bool] = []
+        result_lock = threading.Lock()
+
+        def worker(limiter):
+            local = [limiter.check("k") is None for _ in range(10)]
+            with result_lock:
+                allowed.extend(local)
+
+        threads = [
+            threading.Thread(target=worker, args=(limiters[index % len(limiters)],))
+            for index in range(10)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert sum(allowed) == limit, f"应恰好放行 {limit} 次，实际 {sum(allowed)}"
+        assert limiters[0].status("k")[0] == 0
+        print("✓ 并发 check 严格按额度放行（Lua 原子）")
     finally:
         _cleanup(name, client)
 
@@ -173,6 +207,7 @@ def test_webapp_uses_redis_rate_limit_across_instances(monkeypatch):
 
 if __name__ == "__main__":
     test_shared_window_across_instances()
+    test_concurrent_checks_share_atomic_quota()
     test_peek_does_not_record_and_window_expires()
     test_bucket_names_isolated_and_reset()
     print("\n全部通过（Web 集成用例需 pytest 的 monkeypatch，未在 __main__ 中运行）")
