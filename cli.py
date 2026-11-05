@@ -989,9 +989,12 @@ def run_health_check_standalone() -> int:
     return 1
 
 
-def run_doctor_standalone() -> int:
+def run_doctor_standalone(as_json: bool = False) -> int:
     """
     独立执行环境自检（用于 `python cli.py doctor`），不进入交互式 CLI。
+
+    Args:
+        as_json: 输出机器可读的 JSON（便于监控 / 脚本）
 
     Returns:
         0 无 fail 项；1 存在必须处理的问题（便于脚本/监控）
@@ -1001,14 +1004,43 @@ def run_doctor_standalone() -> int:
     from utils.doctor import build_report_table, has_failures, run_doctor, summarize
 
     results = asyncio.run(run_doctor(include_network=bool(LLM_CONFIG["api_key"])))
+    failed = has_failures(results)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "status": "fail" if failed else "ok",
+                    "checks": [
+                        {"name": item.name, "status": item.status, "detail": item.detail}
+                        for item in results
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1 if failed else 0
     Console().print(build_report_table(results))
     text, style = summarize(results)
     Console().print(text, style=style)
-    return 1 if has_failures(results) else 0
+    return 1 if failed else 0
 
 
-def run_skills_standalone() -> int:
+def _parse_json_flag(args: list[str], usage: str) -> bool | None:
+    """解析可选 ``--json``；参数非法时打印用法并返回 None（调用方退出码 2）。"""
+    if not args:
+        return False
+    if args == ["--json"]:
+        return True
+    print(f"用法：{usage}")
+    return None
+
+
+def run_skills_standalone(as_json: bool = False) -> int:
     """列出技能目录与已发现的技能（用于 `python cli.py skills`）。
+
+    Args:
+        as_json: 输出机器可读的 JSON（便于监控 / 脚本）
 
     Returns:
         0 至少发现一个技能；1 技能目录缺失或没有可加载技能
@@ -1017,6 +1049,19 @@ def run_skills_standalone() -> int:
 
     root = resolve_skills_root()
     scripts = skill_scripts(root)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "root": str(root),
+                    "skills": sorted(scripts),
+                    "ok": bool(scripts),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if scripts else 1
     if not scripts:
         if not root.is_dir():
             print(f"未找到技能目录：{root}")
@@ -1916,9 +1961,15 @@ def main():
         if arg == "health":
             sys.exit(run_health_check_standalone())
         if arg == "doctor":
-            sys.exit(run_doctor_standalone())
+            doctor_json = _parse_json_flag(sys.argv[2:], "python cli.py doctor [--json]")
+            if doctor_json is None:
+                sys.exit(2)
+            sys.exit(run_doctor_standalone(as_json=doctor_json))
         if arg == "skills":
-            sys.exit(run_skills_standalone())
+            skills_json = _parse_json_flag(sys.argv[2:], "python cli.py skills [--json]")
+            if skills_json is None:
+                sys.exit(2)
+            sys.exit(run_skills_standalone(as_json=skills_json))
         if arg == "kb":
             sys.exit(run_knowledge_status_standalone())
         if arg == "eval":

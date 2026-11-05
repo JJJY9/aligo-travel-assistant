@@ -4,6 +4,9 @@ doctor 环境自检测试（无需 API Key、不访问网络）
 运行：python tests/test_doctor.py
 """
 import asyncio
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
@@ -139,6 +142,40 @@ def test_run_doctor_without_network():
     print(f"✓ run_doctor 汇总正常（共 {len(results)} 项，跳过网络）")
 
 
+def test_doctor_json_output(monkeypatch):
+    """doctor --json 输出机器可读结果；存在 fail 时退出码 1。"""
+    import cli
+    from utils import doctor as doctor_module
+    from utils.doctor import CheckResult
+
+    async def fake_ok(include_network=True):
+        return [CheckResult("Python 版本", STATUS_OK, "3.12.10")]
+
+    monkeypatch.setattr(doctor_module, "run_doctor", fake_ok)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_doctor_standalone(as_json=True)
+    payload = json.loads(buf.getvalue())
+    assert code == 0
+    assert payload["status"] == "ok"
+    assert payload["checks"] == [
+        {"name": "Python 版本", "status": STATUS_OK, "detail": "3.12.10"}
+    ]
+
+    async def fake_fail(include_network=True):
+        return [CheckResult("故障项", STATUS_FAIL, "boom")]
+
+    monkeypatch.setattr(doctor_module, "run_doctor", fake_fail)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_doctor_standalone(as_json=True)
+    payload = json.loads(buf.getvalue())
+    assert code == 1
+    assert payload["status"] == "fail"
+    assert payload["checks"][0]["name"] == "故障项"
+    print("✓ doctor --json 输出与退出码")
+
+
 if __name__ == "__main__":
     test_python_ok()
     test_model_files_missing_dir()
@@ -152,4 +189,9 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_run_doctor_without_network()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_doctor_json_output(mp)
+    finally:
+        mp.undo()
     print("\n全部通过")

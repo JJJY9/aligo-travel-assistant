@@ -5,6 +5,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -65,6 +66,30 @@ def test_main_dispatch(monkeypatch):
     print("✓ cli.py skills 命令分发")
 
 
+def test_json_output():
+    """--json 输出机器可读的技能列表（监控 / 脚本）。"""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_skills_standalone(as_json=True)
+    payload = json.loads(buf.getvalue())
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["skills"] == sorted(payload["skills"])
+    assert "plan-trip" in payload["skills"]
+    assert payload["root"].replace("\\", "/").endswith(".claude/skills")
+    print("✓ skills --json 输出")
+
+
+def test_main_rejects_unknown_flag(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["cli.py", "skills", "--bogus"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    assert "用法" in buf.getvalue()
+    print("✓ skills 未知参数 → 退出码 2")
+
+
 if __name__ == "__main__":
     test_lists_repo_skills()
     mp = pytest.MonkeyPatch()
@@ -80,6 +105,12 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_main_dispatch(mp)
+    finally:
+        mp.undo()
+    test_json_output()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_main_rejects_unknown_flag(mp)
     finally:
         mp.undo()
     print("\n全部通过")
