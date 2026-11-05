@@ -70,6 +70,7 @@ from utils.metrics import REQUEST_METRICS
 from utils.rate_limit import create_rate_limiter
 from utils.stored_message import render_stored_message
 from utils.session_markdown import render_all_sessions_markdown
+from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
@@ -1116,6 +1117,7 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         rate = _rate_limit_info(state)
+        skills_root = resolve_skills_root()
         return {
             "status": "ok",
             "version": APP_VERSION,
@@ -1125,6 +1127,10 @@ def create_app(model: Any = None) -> FastAPI:
             "rate_limit": rate["backend"],
             "rate_limit_configured": rate["configured"],
             "rate_limit_degraded": rate["degraded"],
+            "skills": {
+                "count": len(skill_scripts(skills_root)),
+                "dir_found": skills_root.is_dir(),
+            },
             "time": datetime.now().isoformat(timespec="seconds"),
         }
 

@@ -11,6 +11,7 @@
 - `/api/health` 新增 `rate_limit_configured` / `rate_limit_degraded` 字段：配置了 Redis 但限流器回退进程内（启动时不可用或运行中故障）时 `degraded` 为 `true`
 - `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否配置 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 - 反向代理部署：设置 `TRUST_PROXY_HEADERS=1` 后限流按 `X-Forwarded-For` 第一个地址计算客户端 IP；默认关闭，避免客户端伪造该头绕过 IP 桶
+- 技能可观测性：`/api/health` 返回 `skills.count` / `skills.dir_found`；`doctor` 新增「技能目录」检查（发现数量、缺失时提示 `ALIGO_SKILLS_DIR`），安装后技能未注册可直接定位
 
 ### 修复
 - `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找
@@ -19,6 +20,7 @@
 ### 测试
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例
 - `tests/test_rate_limit.py` 补充 Redis 故障回退与限流器工厂用例
+- `tests/test_skill_paths.py` 覆盖 `skill_scripts` 技能发现；`test_doctor.py` 覆盖技能目录检查（正常 / 缺失）；健康接口断言 `skills.count` 与 `dir_found`
 
 ## [1.4.1] - 2026-11-05
 

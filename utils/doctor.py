@@ -157,6 +157,27 @@ def check_storage() -> CheckResult:
     return CheckResult("记忆存储", STATUS_OK, "；".join(parts))
 
 
+def check_skills() -> CheckResult:
+    """检查技能目录：源码运行 / wheel 安装后都应能发现技能脚本。"""
+    from utils.skill_paths import resolve_skills_root, skill_scripts
+
+    root = resolve_skills_root()
+    scripts = skill_scripts(root)
+    if scripts:
+        return CheckResult("技能目录", STATUS_OK, f"{len(scripts)} 个技能（{root}）")
+    if not root.is_dir():
+        return CheckResult(
+            "技能目录",
+            STATUS_FAIL,
+            f"未找到 {root}；请检查安装，或用 ALIGO_SKILLS_DIR 指定技能目录",
+        )
+    return CheckResult(
+        "技能目录",
+        STATUS_FAIL,
+        f"{root} 下没有可加载的技能（缺少 */script/agent.py）",
+    )
+
+
 def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
     """检查本地嵌入模型文件完整性。"""
     model_path = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
@@ -237,6 +258,7 @@ def run_doctor_offline() -> list[CheckResult]:
     results: list[CheckResult] = [check_python()]
     results.extend(check_dependencies())
     results.append(check_config())
+    results.append(check_skills())
     results.append(check_storage())
     results.append(check_model_files())
     results.append(check_knowledge_base())

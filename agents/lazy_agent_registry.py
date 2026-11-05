@@ -11,7 +11,7 @@ from pathlib import Path
 from agentscope.agent import AgentBase
 from rich.console import Console
 
-from utils.skill_paths import resolve_skills_root
+from utils.skill_paths import resolve_skills_root, skill_scripts
 
 
 class LazyAgentRegistry:
@@ -60,19 +60,7 @@ class LazyAgentRegistry:
             self.console.print(f"[yellow]Warning: Skills directory {self.skills_root} not found[/yellow]")
             return
 
-        count = 0
-        for skill_dir in self.skills_root.iterdir():
-            if not skill_dir.is_dir():
-                continue
-            
-            # 查找 script/agent.py
-            agent_script = skill_dir / "script" / "agent.py"
-            if agent_script.exists():
-                skill_name = skill_dir.name
-                self._skill_map[skill_name] = agent_script
-                count += 1
-                
-        # self.console.print(f"[dim]已发现 {count} 个技能插件[/dim]")
+        self._skill_map.update(skill_scripts(self.skills_root))
 
     def _resolve_agent_name(self, agent_name: str) -> str | None:
         """解析智能体名称到技能目录名"""

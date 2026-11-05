@@ -75,6 +75,25 @@ def test_user_base_fallback_for_pip_user_install(monkeypatch):
     print("✓ pip install --user 的用户目录回退，且 sys.prefix 优先")
 
 
+def test_skill_scripts_discovers_agents():
+    """skill_scripts 返回技能名 → agent.py，缺失目录返回空字典。"""
+    from utils.skill_paths import skill_scripts
+
+    root = Path(project_root) / ".claude" / "skills"
+    scripts = skill_scripts(root)
+    assert set(scripts) == {
+        "ask-question",
+        "event-collection",
+        "memory-query",
+        "plan-trip",
+        "preference",
+        "query-info",
+    }
+    assert scripts["plan-trip"].is_file()
+    assert skill_scripts(root / "missing") == {}
+    print("✓ skill_scripts 发现技能脚本，缺失目录返回空")
+
+
 def test_wheel_data_files_cover_skill_code():
     """pyproject 的 data-files 必须覆盖全部技能代码与声明，且不包含运行时数据。"""
     if tomllib is None:
@@ -119,5 +138,6 @@ if __name__ == "__main__":
         test_user_base_fallback_for_pip_user_install(mp)
     finally:
         mp.undo()
+    test_skill_scripts_discovers_agents()
     test_wheel_data_files_cover_skill_code()
     print("\n全部通过")

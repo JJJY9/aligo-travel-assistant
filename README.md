@@ -348,6 +348,8 @@ aligo-web        # 启动 Web 界面（也可用 python -m webapp.server）
 aligo            # 启动交互式 CLI
 ```
 
+安装后可访问 `/api/health` 确认 `skills.count` 为 6（或运行 `python cli.py doctor` 查看「技能目录」检查）；若为 0，用环境变量 `ALIGO_SKILLS_DIR` 指向技能目录。
+
 RAG 知识库文档、嵌入模型与记忆数据属于运行时数据，不随安装包分发，需要按「知识库初始化」自行准备；技能目录可用环境变量 `ALIGO_SKILLS_DIR` 覆盖。
 
 ### 2. 配置模型
@@ -549,7 +551,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 所有 `/api/` 响应带 `X-Request-ID` 头（透传请求头中的值，否则自动生成 12 位十六进制）；错误详情也会附带请求 ID，便于排查。
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
-- 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
+- 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、技能目录（发现数量）、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
 - 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径、平均与最大耗时、熔断器状态、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP 额度配置（请求指标多进程各自统计）。
 - 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试。部署在反向代理后面时设置 `TRUST_PROXY_HEADERS=1`，限流按 `X-Forwarded-For` 第一个地址计算客户端 IP（默认关闭以防客户端伪造，代理需覆盖写入该头）。
 - 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc` 使用仅对文档页放宽的 CSP（允许 CDN 资源）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`。
@@ -560,7 +562,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 |------|------|------|
 | POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
-| GET | `/api/health` | 服务版本 / 模型 / 存储与限流后端状态 |
+| GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态 |
 | GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 耗时 / 熔断器状态）与限流后端信息 |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
