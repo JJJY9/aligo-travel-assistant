@@ -33,8 +33,16 @@ class _FakeMilvusClient:
             doc_id = int(filter.split("==")[1])
             return [row for row in self.rows if int(row["id"]) == doc_id]
         if filter.startswith("id >="):
-            threshold = int(filter.split(">=")[1])
-            matched = [row for row in self.rows if int(row["id"]) >= threshold]
+            import re
+
+            match = re.match(r"id >= (\d+)(?: and id < (\d+))?", filter)
+            low = int(match.group(1)) if match else 0
+            high = int(match.group(2)) if match and match.group(2) else None
+            matched = [
+                row
+                for row in self.rows
+                if int(row["id"]) >= low and (high is None or int(row["id"]) < high)
+            ]
             return matched[offset : offset + limit]
         # 与真实 Milvus 一致：查询受 limit / offset 限制（分页回归才能被测出）
         return list(self.rows)[offset : offset + limit]
@@ -732,6 +740,25 @@ def test_import_restores_large_group_without_truncation(monkeypatch):
     print("✓ 超长整组备份恢复不截断")
 
 
+def test_group_member_ids_scans_multiple_windows(monkeypatch):
+    """分片分散在多个 id 窗口时都要扫描到（不依赖单页 / offset 上限）。"""
+    rows = [
+        {
+            "id": index,
+            "content": f"c{index}",
+            "metadata": json.dumps(
+                {"group": "g" if index in (3, 15, 25) else "other"}
+            ),
+        }
+        for index in range(1, 31)
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_MAX_SCAN", 10)
+    assert sorted(knowledge_admin._group_member_ids(fake, "g")) == [3, 15, 25]
+    assert knowledge_admin._group_member_ids(fake, "missing") == []
+    print("✓ 组内分片跨多个 id 窗口扫描")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -873,6 +900,7 @@ if __name__ == "__main__":
         test_import_regroups_exported_chunks,
         test_import_skips_fully_existing_group,
         test_import_restores_large_group_without_truncation,
+        test_group_member_ids_scans_multiple_windows,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,

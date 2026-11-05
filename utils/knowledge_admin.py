@@ -244,29 +244,35 @@ def _document_info(client: Any, doc_id: int) -> tuple[int, str]:
 def _group_member_ids(client: Any, group: str) -> list[int]:
     """同一拆分组的其它分片 id。
 
-    单次 query 受 limit（16384）约束，CLI 导入不受限时集合可能超过该规模，
-    必须分页扫描，否则整组删除 / 替换只会命中其中一页。
+    单次 query 受 limit（16384）约束，且部分引擎对 offset + limit 有上限，
+    CLI 导入不受限时集合可能超过该规模：按 id 区间窗口扫描（主键范围查询），
+    不依赖 offset。窗口推进到超过已见最大 id 的空窗口即结束。
     """
     if not group:
         return []
     members: list[int] = []
-    offset = 0
+    window = _MAX_SCAN
+    start = 0
+    max_seen = 0
     while True:
         rows = client.query(
             collection_name=COLLECTION_NAME,
-            filter="id >= 0",
+            filter=f"id >= {start} and id < {start + window}",
             output_fields=["id", "metadata"],
-            limit=_MAX_SCAN,
-            offset=offset,
+            limit=window,
         )
         rows = rows or []
-        for row in rows:
-            meta = _parse_metadata(row.get("metadata"))
-            if str(meta.get("group") or "") == group:
-                members.append(int(row.get("id", 0) or 0))
-        if len(rows) < _MAX_SCAN:
+        if rows:
+            max_seen = max(
+                max_seen, max(int(row.get("id", 0) or 0) for row in rows)
+            )
+            for row in rows:
+                meta = _parse_metadata(row.get("metadata"))
+                if str(meta.get("group") or "") == group:
+                    members.append(int(row.get("id", 0) or 0))
+        elif start > max_seen:
             break
-        offset += _MAX_SCAN
+        start += window
     return members
 
 
