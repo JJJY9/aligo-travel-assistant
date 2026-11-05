@@ -76,6 +76,7 @@ def test_health_endpoint():
     assert data["storage"]["short_term"] in {"memory", "redis"}
     assert data["storage"]["long_term"] in {"json", "postgres"}
     assert data["rate_limit"] in {"memory", "redis"}
+    assert data["rate_limit_degraded"] is False
     print("✓ /api/health 返回版本 / 模型 / 存储后端")
 
 

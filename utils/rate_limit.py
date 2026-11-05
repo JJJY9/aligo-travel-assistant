@@ -88,6 +88,7 @@ class RateLimiter:
     """滑动窗口限流器：窗口内最多允许 ``limit`` 次请求。"""
 
     backend = "memory"
+    degraded = False
 
     def __init__(self, limit: int, window_sec: float, max_keys: int = MAX_KEYS) -> None:
         self.limit = max(1, int(limit))
@@ -192,6 +193,11 @@ class RedisRateLimiter:
         self._fallback = RateLimiter(limit=self.limit, window_sec=self.window_sec)
         self._degraded_until = 0.0
 
+    @property
+    def degraded(self) -> bool:
+        """Redis 故障后是否正处于进程内回退冷却期。"""
+        return time.monotonic() < self._degraded_until
+
     def _key(self, key: str) -> str:
         return f"{REDIS_KEY_PREFIX}:{self.name}:{key}"
 
@@ -211,8 +217,15 @@ class RedisRateLimiter:
             return None
 
     @staticmethod
-    def _retry_after(result: Any) -> float | None:
-        retry = float(result)
+    def _as_float(value: Any) -> float:
+        """兼容未开启 decode_responses 的 Redis 客户端（返回 bytes）。"""
+        if isinstance(value, bytes):
+            value = value.decode()
+        return float(value)
+
+    @classmethod
+    def _retry_after(cls, result: Any) -> float | None:
+        retry = cls._as_float(result)
         if retry < 0:
             return None
         return round(max(0.1, retry), 1)
@@ -239,7 +252,9 @@ class RedisRateLimiter:
         if result is None:
             return self._fallback.status(key)
         remaining, reset = result
-        return max(0, int(remaining)), max(0.0, float(reset))
+        return max(0, int(self._as_float(remaining))), max(
+            0.0, self._as_float(reset)
+        )
 
     def reset(self) -> None:
         """清空该实例的进程内回退状态，并删除 Redis 中同名桶的全部键。"""

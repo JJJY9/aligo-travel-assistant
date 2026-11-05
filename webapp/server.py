@@ -1085,6 +1085,9 @@ def create_app(model: Any = None) -> FastAPI:
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
             "storage": describe_backends(),
             "rate_limit": getattr(state.rate_limiter, "backend", "memory"),
+            "rate_limit_degraded": bool(
+                getattr(state.rate_limiter, "degraded", False)
+            ),
             "time": datetime.now().isoformat(timespec="seconds"),
         }
 
