@@ -81,6 +81,21 @@ def test_control_characters_are_sanitized():
     print("✓ 指标路径清理控制字符")
 
 
+def test_prometheus_render():
+    metrics = RequestMetrics()
+    metrics.record("GET", "/api/health", 200, 12.0)
+    metrics.record("POST", "/api/chat", 500, 30.0)
+    metrics.record("GET", '/api/x"y', 200, 18.0)
+    text = metrics.render_prometheus()
+    assert "aligo_requests_total 3" in text
+    assert 'aligo_requests_by_status_total{status="200"} 2' in text
+    assert 'aligo_requests_by_method_total{method="GET"} 2' in text
+    assert 'aligo_requests_by_path_total{path="/api/x\\"y"} 1' in text
+    assert 'aligo_request_duration_seconds{quantile="p95"} 0.030000' in text
+    assert "aligo_uptime_seconds" in text
+    print("✓ Prometheus 文本指标（标签转义 / 百分位）")
+
+
 def test_reset():
     metrics = RequestMetrics()
     metrics.record("GET", "/api/health", 200, 1.0)
@@ -100,5 +115,6 @@ if __name__ == "__main__":
     test_path_cardinality_is_bounded()
     test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()
+    test_prometheus_render()
     test_reset()
     print("\n全部通过")

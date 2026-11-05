@@ -1842,6 +1842,26 @@ def test_metrics_api():
         REQUEST_METRICS.reset()
 
 
+def test_prometheus_metrics_endpoint():
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = _client()
+    try:
+        assert client.get("/api/health").status_code == 200
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.headers["cache-control"] == "no-store"
+        text = response.text
+        assert "aligo_requests_total" in text
+        assert "aligo_circuit_breaker_state" in text
+        assert "aligo_sessions_cached" in text
+        print("✓ /metrics Prometheus 文本指标")
+    finally:
+        REQUEST_METRICS.reset()
+
+
 def test_metrics_endpoint_not_in_snapshot_before_recording():
     """指标接口自身在返回后才计数，快照不包含当前请求（避免自增误导）。"""
     from utils.metrics import REQUEST_METRICS

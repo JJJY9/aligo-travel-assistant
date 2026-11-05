@@ -27,6 +27,16 @@ def _percentile(sorted_values: list[float], fraction: float) -> float:
     return sorted_values[rank - 1]
 
 
+def _escape_label(value: str) -> str:
+    """转义 Prometheus 标签值（反斜杠、双引号、换行）。"""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
+
+
 class RequestMetrics:
     """线程安全的请求计数 / 耗时聚合。"""
 
@@ -77,6 +87,72 @@ class RequestMetrics:
                 "p95_duration_ms": round(_percentile(samples, 0.95), 2),
                 "duration_samples": len(samples),
             }
+
+    def render_prometheus(self) -> str:
+        """渲染 Prometheus 文本格式（每次调用是一份一致的快照）。"""
+        with self._lock:
+            total = self._total
+            statuses = sorted(self._by_status.items())
+            methods = self._by_method.most_common()
+            paths = self._by_path.most_common()
+            avg_seconds = (
+                self._duration_sum_ms / total / 1000 if total else 0.0
+            )
+            max_seconds = self._duration_max_ms / 1000
+            samples = sorted(self._durations)
+            p50_seconds = _percentile(samples, 0.50) / 1000
+            p95_seconds = _percentile(samples, 0.95) / 1000
+            sample_count = len(samples)
+            uptime = time.time() - self._started_at
+
+        lines = [
+            "# HELP aligo_requests_total Total HTTP requests recorded by this process.",
+            "# TYPE aligo_requests_total counter",
+            f"aligo_requests_total {total}",
+            "# HELP aligo_requests_by_status_total Requests grouped by HTTP status.",
+            "# TYPE aligo_requests_by_status_total counter",
+        ]
+        for status, value in statuses:
+            lines.append(
+                f'aligo_requests_by_status_total{{status="{_escape_label(str(status))}"}} {value}'
+            )
+        lines.extend(
+            [
+                "# HELP aligo_requests_by_method_total Requests grouped by HTTP method.",
+                "# TYPE aligo_requests_by_method_total counter",
+            ]
+        )
+        for method, value in methods:
+            lines.append(
+                f'aligo_requests_by_method_total{{method="{_escape_label(method)}"}} {value}'
+            )
+        lines.extend(
+            [
+                "# HELP aligo_requests_by_path_total Requests grouped by path (top cardinality capped).",
+                "# TYPE aligo_requests_by_path_total counter",
+            ]
+        )
+        for path, value in paths:
+            lines.append(
+                f'aligo_requests_by_path_total{{path="{_escape_label(path)}"}} {value}'
+            )
+        lines.extend(
+            [
+                "# HELP aligo_request_duration_seconds Request duration statistics.",
+                "# TYPE aligo_request_duration_seconds gauge",
+                f"aligo_request_duration_seconds{{quantile=\"avg\"}} {avg_seconds:.6f}",
+                f"aligo_request_duration_seconds{{quantile=\"max\"}} {max_seconds:.6f}",
+                f"aligo_request_duration_seconds{{quantile=\"p50\"}} {p50_seconds:.6f}",
+                f"aligo_request_duration_seconds{{quantile=\"p95\"}} {p95_seconds:.6f}",
+                "# HELP aligo_request_duration_samples Number of durations used for percentiles.",
+                "# TYPE aligo_request_duration_samples gauge",
+                f"aligo_request_duration_samples {sample_count}",
+                "# HELP aligo_uptime_seconds Process uptime in seconds.",
+                "# TYPE aligo_uptime_seconds gauge",
+                f"aligo_uptime_seconds {uptime:.1f}",
+            ]
+        )
+        return "\n".join(lines) + "\n"
 
     def reset(self) -> None:
         """清空统计（测试或运维需要时使用）。"""

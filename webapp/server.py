@@ -1219,6 +1219,32 @@ def create_app(model: Any = None) -> FastAPI:
             "rate_limit": _rate_limit_info(state),
         }
 
+    @app.get("/metrics")
+    def prometheus_metrics() -> Response:
+        """Prometheus 文本指标（进程内统计，多实例需分别采集）。"""
+        breaker = state.breaker.get_status()
+        breaker_state = {"closed": 0, "half_open": 1, "open": 2}.get(
+            str(breaker.get("state")), 3
+        )
+        body = REQUEST_METRICS.render_prometheus()
+        body += (
+            "# HELP aligo_circuit_breaker_state Circuit breaker state "
+            "(0 closed, 1 half_open, 2 open, 3 unknown).\n"
+            "# TYPE aligo_circuit_breaker_state gauge\n"
+            f"aligo_circuit_breaker_state {breaker_state}\n"
+            "# HELP aligo_circuit_breaker_failures Consecutive failure count.\n"
+            "# TYPE aligo_circuit_breaker_failures gauge\n"
+            f"aligo_circuit_breaker_failures {int(breaker.get('failure_count') or 0)}\n"
+            "# HELP aligo_sessions_cached Cached sessions in this process.\n"
+            "# TYPE aligo_sessions_cached gauge\n"
+            f"aligo_sessions_cached {len(state.sessions)}\n"
+        )
+        return Response(
+            content=body,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/doctor")
     async def doctor(network: bool = Query(default=False)) -> dict[str, Any]:
         """环境自检（默认不做网络请求；network=true 时检查 LLM 连通性）。"""
