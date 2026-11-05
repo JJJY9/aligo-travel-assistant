@@ -799,7 +799,7 @@ def test_import_restore_over_limit_raises(monkeypatch):
             raise AssertionError("超限备份不应进入写入")
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
-    monkeypatch.setattr(knowledge_admin, "_RESTORE_CONTENT_MAX_CHARS", 500)
+    monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 500)
     part_text = "长" * 300
     documents = [
         {"content": part_text, "metadata": {"group": "g", "part": "1", "parts": "2"}},
@@ -832,10 +832,17 @@ def test_get_document_group_returns_joined_content(monkeypatch):
         "id": 2,
         "group": "g",
         "parts": 3,
-        "content": "第一段第二段第三段",
+        "size": 9,
+        "content": "第一段\n第二段\n第三段",
     }
     single = knowledge_admin.get_document_group(4)
-    assert single == {"id": 4, "group": "", "parts": 1, "content": "普通片段"}
+    assert single == {
+        "id": 4,
+        "group": "",
+        "parts": 1,
+        "size": 4,
+        "content": "普通片段",
+    }
     assert knowledge_admin.get_document_group(99) is None
     print("✓ 整组文档回填（按 part 拼接 / 单条 / 不存在）")
 
@@ -866,7 +873,8 @@ def test_document_group_at_size_limit_roundtrip(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
     grouped = knowledge_admin.get_document_group(1)
     assert grouped["parts"] == len(parts)
-    assert len(grouped["content"]) == 20000, "回填不能因拼接分隔符超出上限"
+    assert grouped["size"] == 20000, "文档大小按分片长度之和"
+    assert len(grouped["content"]) == 20000 + len(parts) - 1, "拼接只多出分片间分隔符"
 
     # 备份还原：整篇仍是 20000 字，不应触发还原上限错误
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -893,23 +901,29 @@ def test_document_group_at_size_limit_roundtrip(monkeypatch):
     result = knowledge_admin.import_documents(exported)
     assert result["imported"] >= 1
     assert agent.calls, "20000 字整组备份应能还原"
-    restored = "".join(doc["content"] for doc in agent.calls[0])
-    assert restored == text, "还原后的整篇内容必须完整（不截断、不丢分隔）"
+    restored = "".join(doc["content"] for doc in agent.calls[0]).replace("\n", "")
+    assert restored == text, "还原后的整篇内容必须完整（不截断、不丢内容）"
     print("✓ 上限大小整组文档可回填、可还原")
 
 
 def test_find_duplicate_contents(monkeypatch):
-    """重复内容扫描：去空白后相同归为一组，空内容忽略。"""
+    """重复内容扫描：只统计独立片段，分片记录内部相同段落不算重复。"""
     rows = [
         {"id": 1, "content": "重复内容", "metadata": "{}"},
         {"id": 2, "content": "唯一内容", "metadata": "{}"},
         {"id": 3, "content": " 重复内容 ", "metadata": "{}"},
         {"id": 4, "content": "", "metadata": "{}"},
+        {
+            "id": 5,
+            "content": "重复内容",
+            "metadata": json.dumps({"group": "g", "part": "1", "parts": "2"}),
+        },
     ]
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    # 5 号属于多分片记录：整组内容含相同段落是正常的，整组内容不参与重复统计
     assert knowledge_admin.find_duplicate_contents() == [("重复内容", [1, 3])]
-    print("✓ 重复内容扫描（去空白后相同）")
+    print("✓ 重复内容扫描（去空白后相同 / 排除多分片记录）")
 
 
 def test_delete_document_whole_group(monkeypatch):

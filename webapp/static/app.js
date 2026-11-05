@@ -3564,6 +3564,7 @@ async function startEditKnowledge(doc) {
   }
   let content = doc.content || "";
   let groupParts = 0;
+  let docSize = 0;
   if (parts > 1) {
     // 整组编辑：回填整篇文档（按 part 拼接），保存时服务端整组替换
     try {
@@ -3574,6 +3575,8 @@ async function startEditKnowledge(doc) {
       if (seq !== state.kbEditSeq || state.kbSaving) return;
       content = String(data.content || "");
       groupParts = Number(data.parts || parts);
+      // 上限按文档大小（分片长度之和）判断；回填文本含分片间分隔符，略长
+      docSize = Number(data.size || content.length);
     } catch (error) {
       if (seq !== state.kbEditSeq || state.kbSaving) return;
       toast(`读取整份文档失败：${error.message}`);
@@ -3583,7 +3586,7 @@ async function startEditKnowledge(doc) {
       toast("整份文档为空，无法编辑");
       return;
     }
-    if (content.length > 20000) {
+    if (docSize > 20000) {
       toast("整份文档超过 20000 字，请拆分后维护");
       return;
     }
@@ -3592,7 +3595,7 @@ async function startEditKnowledge(doc) {
   state.kbEditingGroupParts = groupParts;
   // 保留完整 metadata：PUT 会整体覆盖，只回填分类会丢掉 title / source 等字段
   state.kbEditingMetadata = { ...(doc.metadata || {}) };
-  els.kbContent.maxLength = groupParts > 1 ? 20000 : 2000;
+  els.kbContent.maxLength = groupParts > 1 ? 20500 : 2000;
   els.kbContent.placeholder =
     groupParts > 1
       ? `正在编辑整份文档（${groupParts} 片），保存后整组替换`
@@ -3634,6 +3637,8 @@ async function addKnowledgeDocument(event) {
   const editingId = state.kbEditingId;
   const editingGroupParts = state.kbEditingGroupParts;
   const metadata = editingId ? { ...state.kbEditingMetadata } : {};
+  // 保存开始即作废在途的整组回填：否则慢响应可能在保存失败后覆盖表单
+  state.kbEditSeq += 1;
   const category = els.kbCategory.value.trim();
   if (category) metadata.category = category;
   else delete metadata.category;

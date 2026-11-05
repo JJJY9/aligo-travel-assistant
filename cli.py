@@ -1457,7 +1457,10 @@ def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> i
 
 
 def run_knowledge_duplicates_standalone(limit: int = 20) -> int:
-    """列出内容完全相同的知识片段组（用于 `python cli.py kb-duplicates`）。
+    """列出内容完全相同的独立知识片段组（用于 `python cli.py kb-duplicates [limit]`）。
+
+    ``limit`` 为 0 时显示全部；只统计不带 group 的独立片段（多分片记录内部
+    的相同段落属于同一篇文档，不能按单条重复处理）。
 
     Returns:
         0 扫描成功（有无重复都算成功）；1 读取失败
@@ -1470,17 +1473,18 @@ def run_knowledge_duplicates_standalone(limit: int = 20) -> int:
         print(f"读取失败：{exc}")
         return 1
     if not groups:
-        print("没有重复内容的知识片段")
+        print("没有重复内容的独立知识片段")
         return 0
     total = sum(len(ids) for _, ids in groups)
     print(f"发现 {len(groups)} 组重复内容（共 {total} 条片段）：")
-    for content, ids in groups[:limit]:
+    shown = groups if limit <= 0 else groups[:limit]
+    for content, ids in shown:
         preview = " ".join(content.split())[:60]
         joined = "、".join(f"#{doc_id}" for doc_id in ids)
         print(f"  {len(ids)} 条 · {joined}  {preview}")
-    if len(groups) > limit:
-        print(f"  … 其余 {len(groups) - limit} 组未显示（可保留不同的那一份后删除其余）")
-    print("提示：多分片记录请用整份编辑或整组删除维护，避免只删掉其中一片")
+    if len(groups) > len(shown):
+        print(f"  … 其余 {len(groups) - len(shown)} 组未显示（limit=0 显示全部）")
+    print("提示：以上均为未分组的独立片段，确认保留哪一份后可删除其余")
     return 0
 
 
@@ -2282,10 +2286,13 @@ def main():
                 )
             )
         if arg == "kb-duplicates":
-            if len(sys.argv) != 2:
-                print("用法：python cli.py kb-duplicates")
+            args = sys.argv[2:]
+            if len(args) > 1 or (args and not args[0].isdigit()):
+                print("用法：python cli.py kb-duplicates [limit]（0 显示全部，默认 20）")
                 sys.exit(2)
-            sys.exit(run_knowledge_duplicates_standalone())
+            sys.exit(
+                run_knowledge_duplicates_standalone(int(args[0]) if args else 20)
+            )
         if arg == "preferences":
             if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py preferences <user_id>")
