@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,33 @@ def check_skills() -> CheckResult:
     )
 
 
+def check_version_consistency() -> CheckResult:
+    """检查 pyproject.toml 与 ``utils.version.APP_VERSION`` 是否一致。"""
+    from utils.version import APP_VERSION
+
+    pyproject = PROJECT_ROOT / "pyproject.toml"
+    if not pyproject.is_file():
+        # 安装 wheel 后没有源码目录的 pyproject.toml，不应因此给用户警告
+        return CheckResult(
+            "版本一致性", STATUS_SKIP, "未找到 pyproject.toml（已安装 wheel 时跳过）"
+        )
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError as exc:
+        return CheckResult("版本一致性", STATUS_WARN, f"无法读取 pyproject.toml：{exc}")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not match:
+        return CheckResult("版本一致性", STATUS_WARN, "pyproject.toml 中未找到 version")
+    pyproject_version = match.group(1)
+    if pyproject_version == APP_VERSION:
+        return CheckResult("版本一致性", STATUS_OK, APP_VERSION)
+    return CheckResult(
+        "版本一致性",
+        STATUS_WARN,
+        f"utils/version.py 为 {APP_VERSION}，pyproject.toml 为 {pyproject_version}",
+    )
+
+
 def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
     """检查本地嵌入模型文件完整性。"""
     model_path = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
@@ -258,6 +286,7 @@ def run_doctor_offline() -> list[CheckResult]:
     results: list[CheckResult] = [check_python()]
     results.extend(check_dependencies())
     results.append(check_config())
+    results.append(check_version_consistency())
     results.append(check_skills())
     results.append(check_storage())
     results.append(check_model_files())

@@ -20,12 +20,14 @@ sys.path.insert(0, project_root)
 from utils.doctor import (
     STATUS_FAIL,
     STATUS_OK,
+    STATUS_SKIP,
     STATUS_WARN,
     check_knowledge_base,
     check_model_files,
     check_python,
     check_skills,
     check_storage,
+    check_version_consistency,
     run_doctor,
 )
 
@@ -65,6 +67,26 @@ def test_storage_unreachable_warns(monkeypatch):
 def test_python_ok():
     assert check_python().status == STATUS_OK
     print("✓ Python 版本检查")
+
+
+def test_version_consistency(monkeypatch):
+    from utils import version as version_module
+
+    assert check_version_consistency().status == STATUS_OK
+    monkeypatch.setattr(version_module, "APP_VERSION", "0.0.0")
+    result = check_version_consistency()
+    assert result.status == STATUS_WARN
+    assert "0.0.0" in result.detail and "pyproject" in result.detail
+    print("✓ 版本一致性检查（不一致时警告）")
+
+
+def test_version_check_skips_without_pyproject(monkeypatch, tmp_path):
+    from utils import doctor as doctor_module
+
+    monkeypatch.setattr(doctor_module, "PROJECT_ROOT", tmp_path)
+    result = check_version_consistency()
+    assert result.status == STATUS_SKIP
+    print("✓ 安装 wheel（无 pyproject）时跳过版本一致性检查")
 
 
 def test_skills_check_reports_repo_skills():
@@ -134,6 +156,7 @@ def test_run_doctor_without_network():
     assert "Python 版本" in names
     assert "核心依赖" in names
     assert "大模型配置" in names
+    assert "版本一致性" in names
     assert "技能目录" in names
     assert "记忆存储" in names
     assert "嵌入模型文件" in names
@@ -189,6 +212,11 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_run_doctor_without_network()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_version_consistency(mp)
+    finally:
+        mp.undo()
     mp = pytest.MonkeyPatch()
     try:
         test_doctor_json_output(mp)

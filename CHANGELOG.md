@@ -22,6 +22,7 @@
 - 记忆面板用户卡片显示技能数量（来自 `/api/health`），安装后技能缺失可直接看到「技能 0」
 - Web 启动参数：`aligo-web --version` / `python -m webapp.server --version` 输出版本号；监听非环回地址（如 `0.0.0.0`）时启动日志输出安全警告，提示通过反向代理提供认证 / HTTPS 并配置 `TRUST_PROXY_HEADERS`
 - 版本号统一到 `utils/version.py`（Web / CLI 共用）；`python cli.py --version` / `-V` 输出 `Aligo 差旅助手 x.y.z`
+- `doctor` 新增「版本一致性」检查：`pyproject.toml` 与 `utils/version.py` 不一致时警告（发布时漏改版本能直接发现）；安装 wheel 没有 pyproject 时跳过
 - 技能可观测性：`/api/health` 返回 `skills.count` / `skills.dir_found`；`doctor` 新增「技能目录」检查（发现数量、缺失时提示 `ALIGO_SKILLS_DIR`），安装后技能未注册可直接定位
 - `python cli.py skills`：输出技能目录与已发现技能（目录缺失或没有可加载技能时退出码 1），便于确认 wheel 安装 / `ALIGO_SKILLS_DIR` 是否生效；`skill_scripts()` 在目录不可读时安全返回空，健康检查不会因此报错
 
@@ -44,6 +45,7 @@
 - 新增 `tests/test_long_term_memory_lock.py`：两个子进程各 25 次写入，断言总计数不丢
 - 新增 `tests/test_server_cli.py`：环回地址判断、`--version`、非环回监听警告
 - 新增 `tests/test_version.py`：版本格式、Web / CLI 共用常量、`--version` / `-V` 分发
+- `test_doctor.py` 补充版本一致性（一致 / 不一致警告 / 无 pyproject 跳过）用例
 - ICS 日历用例断言每个事件包含 `VALARM` 与 `TRIGGER:-PT15H`
 - 安全头用例断言 `/api/` 响应带 `Cache-Control: no-store`，页面与静态资源不受影响
 - 浏览器实测：用户卡片显示「本地内存 · JSON · 技能 6」
