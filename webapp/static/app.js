@@ -821,6 +821,10 @@ async function deleteLastTurn(expect) {
 
 async function retryFailed(node, text) {
   if (state.busy) return;
+  if (state.sessionLoading) {
+    toast("会话正在加载，请稍候");
+    return;
+  }
   trimRegenButtons();
   // 失败可能发生在提问写入历史之前：只重发，不删服务端上一轮，
   // 避免误删已保存的问答（最多产生一条重复提问，可接受）
@@ -830,6 +834,11 @@ async function retryFailed(node, text) {
 
 async function regenerate(node, text) {
   if (state.busy) return;
+  if (state.sessionLoading) {
+    // 会话还没加载完就删上一轮，可能删掉 / 重发到错误的会话
+    toast("会话正在加载，请稍候");
+    return;
+  }
   trimRegenButtons();
   if (state.sessionId) {
     // 先删除服务端上一轮，避免重新生成在历史里叠加重复问答
@@ -1362,6 +1371,7 @@ function createAssistantMessage(regenText = "") {
     foot.innerHTML = "";
     if (regenText) {
       const retry = chipButton("refresh", "重试", () => retryFailed(root, regenText));
+      retry.dataset.action = "regen";
       foot.appendChild(retry);
     }
   }
@@ -2046,7 +2056,9 @@ async function sendMessage(text, options = {}) {
         active.isContentEditable);
     if (!isModalOpen() && !editing) els.input.focus();
     if (!document.querySelector(".hi-input")) await loadSessions();
-    refreshStatus();
+    // 记忆面板里正在编辑的偏好输入框会被 refreshStatus 重建销毁；
+    // 编辑结束后保存 / 取消路径会自行刷新
+    if (!document.querySelector(".pref-input")) refreshStatus();
   }
 }
 
@@ -3015,7 +3027,16 @@ function focusSearch() {
   if (isMobile()) {
     els.app.classList.add("side-open");
     els.scrim.hidden = false;
+  } else if (els.app.classList.contains("side-collapsed")) {
+    // 折叠的侧栏带 inert，里面的搜索框无法聚焦：先展开再聚焦
+    els.app.classList.remove("side-collapsed");
+    try {
+      localStorage.setItem("aligo.sideCollapsed", "0");
+    } catch {
+      /* 忽略 */
+    }
   }
+  syncSidebarA11y();
   els.historySearch.focus();
   els.historySearch.select();
 }
@@ -3737,6 +3758,9 @@ async function saveUser() {
   }
   if (value !== state.userId) {
     sessionLoadToken += 1;
+    // 作废进行中的会话加载，并清掉 loading 标志：旧加载的 finally 会因
+    // token 不匹配而跳过重置，否则之后一直提示「会话正在加载」
+    state.sessionLoading = false;
     state.userId = value;
     els.historySearch.value = "";
     state.searchQuery = "";
@@ -4000,6 +4024,13 @@ function bindEvents() {
     if (event.key === "Escape" && !els.shortcutOverlay.hidden) {
       event.preventDefault();
       closeShortcuts();
+      return;
+    }
+    // 记忆面板打开时 Escape 应先关闭面板；isModalOpen() 的提前返回会让
+    // 后面的关闭逻辑永远够不到
+    if (event.key === "Escape" && els.memorySheet && !els.memorySheet.hidden) {
+      event.preventDefault();
+      closeMemorySheet();
       return;
     }
     // 弹层打开时快捷键不穿透到背后的侧栏搜索框
