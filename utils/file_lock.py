@@ -17,8 +17,9 @@ if os.name == "nt":  # pragma: no cover - 平台分支在 Windows 上执行
 else:  # pragma: no cover - 平台分支在非 Windows 上执行
     import fcntl
 
-# 锁等待上限：单次写盘是毫秒级，超过这个时间通常意味着对方进程卡住
-DEFAULT_TIMEOUT_SEC = 10.0
+# 锁等待上限：单次写盘是毫秒级；Web 侧文件锁在事件循环上同步等待，
+# 上限过大会在跨进程争用时冻结整个服务，这里限制为 2 秒
+DEFAULT_TIMEOUT_SEC = 2.0
 
 
 def _ensure_lockable(handle) -> None:

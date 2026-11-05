@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -49,9 +50,13 @@ def _locked_mutation(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         with self._write_lock:
-            with file_lock(self.db_path):
-                self._reload_latest()
-                return func(self, *args, **kwargs)
+            try:
+                with file_lock(self.db_path):
+                    self._reload_latest()
+                    return func(self, *args, **kwargs)
+            except TimeoutError as exc:
+                # 写锁超时按持久化失败处理：不触发整轮对话重试 / 熔断器
+                raise MemoryPersistenceError(f"长期记忆写锁等待超时：{exc}") from exc
 
     return wrapper
 
@@ -259,7 +264,16 @@ class LongTermMemory:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(self.data, handle, ensure_ascii=False, indent=2)
-                os.replace(temp_path, self.db_path)
+                # Windows 上另一个进程短暂打开数据文件时 os.replace 会报
+                # PermissionError / WinError 5；读句柄通常毫秒级释放，重试几次
+                for attempt in range(4):
+                    try:
+                        os.replace(temp_path, self.db_path)
+                        break
+                    except OSError:
+                        if attempt == 3:
+                            raise
+                        time.sleep(0.02)
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
