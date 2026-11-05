@@ -27,6 +27,7 @@
 - 行程标识与去重加固：`trip_id` 使用持久化计数器（JSON `statistics.last_trip_number`、PostgreSQL `aligo_trip_counters` 表），删除最新行程后不再复用 id；去重口径统一（无返程日期与返程=出发日视为同一天，PostgreSQL 用 `COALESCE(origin, '')` / `COALESCE(end_date, start_date)` 比较，空字符串与 NULL 不再产生重复）；`trips-dedupe` 遇到同一 id 属于多条不同行程时拒绝自动删除并返回 1；跨会话总结指纹加入出发地 / 目的地，编辑路线后不再注入旧总结
 - PostgreSQL 长期记忆连接失效后自动重连并重试一次（查询与事务路径统一走重试助手），数据库重启 / 连接被终止后已缓存的 Web 会话不再持续 500；偏好写入（保存 / 删除 / 追加）统一使用同一把会话级 advisory lock，并发修改不再丢更新
 - JSON 长期记忆迁移加固：`statistics` 缺失 / 为 null 时补齐 `total_trips`、`frequent_destinations`、`last_trip_number` 等默认值（保存行程不再 KeyError）；`chat_history` / `trip_history` 中的非对象元素读取时丢弃；`os.replace` 冲突重试从约 60ms 提升到约 500ms，大文件并发读时写入更稳
+- 行程接口在历史重复 trip_id（同一 id 对应多条不同行程）下拒绝按 id 修改 / 删除 / 导出单条日历，返回 409 并提示先运行 `python cli.py trips-dedupe`，避免改到或删掉别的行程
 
 ### 修复
 - 天气工具加固：上游响应形状异常统一映射为 `WeatherError`（此前可能抛 `AttributeError` 导致 500）；缓存改为有界（写入时清理过期条目，上限 256 条）；同一城市的并发未命中合并为一次上游请求
@@ -39,7 +40,7 @@
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义（含无样本不输出耗时、单调时钟 uptime）；`test_webapp.py` 覆盖 `/metrics` 端点与路由模板聚合
 - 新增 `tests/test_cli_weather.py`：文本 / JSON 输出、失败退出码、stale 标注、命令分发与参数校验
 - 新增 `tests/test_console.py`（空闲管道不阻塞、probe 开关）与 `tests/test_cli_hardening.py`（未知命令 / `--help`、参数校验、导出文件名唯一性、BrokenPipe、BOM 导入）
-- `test_webapp.py` 补会话读取 503、删除后重命名 404、删除不存在会话不留墓碑、保留字 session_id 用例；`test_storage_factory.py` 的元数据用例改为先写入消息（与接口契约一致），并补 trip_id 删除后不复用、单日行程去重、路线编辑使总结失效、statistics 默认值、非对象历史记录丢弃、PostgreSQL 连接失效重连用例；`test_cli_trips_dedupe.py` 补歧义 trip_id 与单日去重用例
+- `test_webapp.py` 补会话读取 503、删除后重命名 404、删除不存在会话不留墓碑、保留字 session_id 用例；`test_storage_factory.py` 的元数据用例改为先写入消息（与接口契约一致），并补 trip_id 删除后不复用、单日行程去重、路线编辑使总结失效、statistics 默认值、非对象历史记录丢弃、PostgreSQL 连接失效重连用例；`test_cli_trips_dedupe.py` 补歧义 trip_id 与单日去重用例；`test_webapp.py` 补重复 trip_id 的改 / 删 / 单条日历 409 用例
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑，断言 TTL）；`test_webapp.py` 补假 Redis 共享墓碑用例（含 TTL、撤销、故障回退与恢复、启动后接入、过期墓碑清理、删除失败回滚）
 - 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区 / 429 映射 / 响应形状异常 / 缓存上限与过期清理 / 同城并发合并 / 失败短时缓存与键归一化 / stale-while-error）；`test_webapp.py` 补 `/api/weather` 用例与独立限流用例
 - `test_query_info_fallback.py` / `test_skill_agents.py` 天气用例改为校验技能委托 `utils.weather.fetch_weather`，不再模拟内部 HTTP；补天气与搜索都失败时返回天气原因的用例

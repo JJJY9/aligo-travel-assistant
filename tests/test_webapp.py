@@ -443,6 +443,54 @@ def test_trip_whitespace_destination_rejected():
         _cleanup(user_id)
 
 
+def test_ambiguous_trip_id_operations_return_409():
+    """历史数据里同一 trip_id 对应多条行程时，改 / 删 / 单条日历都不能猜行。"""
+    user_id = _unique_user("web_test_dup_trip")
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    trips = [
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        },
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-06",
+            "purpose": "出差",
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"trip_history": trips}), encoding="utf-8")
+    client = _client()
+    try:
+        updated = client.put(
+            "/api/trips/trip_1",
+            json={"user_id": user_id, "destination": "南京"},
+        )
+        assert updated.status_code == 409
+        deleted = client.delete("/api/trips/trip_1", params={"user_id": user_id})
+        assert deleted.status_code == 409
+        calendar = client.get(
+            "/api/trips/trip_1/calendar", params={"user_id": user_id}
+        )
+        assert calendar.status_code == 409
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert {trip["destination"] for trip in data["trip_history"]} == {
+            "上海",
+            "杭州",
+        }, "歧义 id 上的操作不能改动数据"
+        print("✓ 重复 trip_id 的改 / 删 / 单条日历返回 409")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ics_handles_overflow_end_date():
     """9999-12-31 的行程不能让日历导出 500（DTEND 无法再加一天）。"""
     client = _client()
