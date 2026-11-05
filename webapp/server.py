@@ -99,6 +99,8 @@ def _is_loopback_host(host: str) -> bool:
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
+# 会话删除墓碑在 Redis 中的 key 前缀（配置 REDIS_URL 时跨实例共享）
+_DELETED_KEY_PREFIX = "aligo:deleted"
 
 # 基础安全响应头：CSP 仅允许同源脚本（主题脚本已拆为 /static/theme.js）；
 # 样式允许内联以支持 JS 动态设置 style 属性。
@@ -547,6 +549,8 @@ class AligoWebApp:
         self.eval_lock = DistributedLock(
             redis_client, "aligo:lock:kb_eval", ttl_sec=300
         )
+        self._redis_client = redis_client
+        self._tombstones_shared = redis_client is not None
 
     @staticmethod
     def _session_key(user_id: str, session_id: str) -> str:
@@ -576,25 +580,52 @@ class AligoWebApp:
         if session is not None:
             session.close()
 
+    @staticmethod
+    def _deleted_key(user_id: str, session_id: str) -> str:
+        return f"{_DELETED_KEY_PREFIX}:{user_id}:{session_id}"
+
     def mark_deleted(self, user_id: str, session_id: str) -> None:
-        """记录短时墓碑，阻止在途对话把刚删除的会话写回。"""
+        """记录短时墓碑，阻止在途对话把刚删除的会话写回。
+
+        配置 Redis 时同时写入共享墓碑（TTL 与本地一致），其它实例的新请求
+        也能看到该会话已删除；运行中 Redis 故障时本实例回退进程内墓碑。
+        """
         key = self._session_key(user_id, session_id)
         self._deleted_sessions[key] = time.monotonic()
         self._deleted_sessions.move_to_end(key)
         while len(self._deleted_sessions) > self.max_tombstones:
             self._deleted_sessions.popitem(last=False)
+        if self._tombstones_shared and self._redis_client is not None:
+            try:
+                self._redis_client.setex(
+                    self._deleted_key(user_id, session_id),
+                    int(self.tombstone_ttl_sec),
+                    "1",
+                )
+            except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
+                self._tombstones_shared = False
+                logger.warning("写入会话删除墓碑失败（%s），本实例回退进程内墓碑", exc)
 
     def is_recently_deleted(self, user_id: str, session_id: str | None) -> bool:
         if not session_id:
             return False
         key = self._session_key(user_id, session_id)
         created = self._deleted_sessions.get(key)
-        if created is None:
-            return False
-        if time.monotonic() - created > self.tombstone_ttl_sec:
+        if created is not None:
+            if time.monotonic() - created <= self.tombstone_ttl_sec:
+                return True
             self._deleted_sessions.pop(key, None)
-            return False
-        return True
+        if self._tombstones_shared and self._redis_client is not None:
+            try:
+                return bool(
+                    self._redis_client.exists(
+                        self._deleted_key(user_id, session_id)
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - 读失败时回退进程内墓碑
+                self._tombstones_shared = False
+                logger.warning("读取会话删除墓碑失败（%s），本实例回退进程内墓碑", exc)
+        return False
 
     def close_all(self) -> None:
         """关闭所有会话（进程退出时调用）。"""

@@ -2103,6 +2103,35 @@ def test_deleted_session_cannot_be_resurrected():
         _cleanup(user_id)
 
 
+def test_shared_tombstones_across_instances():
+    """配置 Redis 时，删除墓碑跨实例可见（新请求会被拒绝）。"""
+
+    class _FakeRedis:
+        def __init__(self):
+            self.data = {}
+
+        def setex(self, key, ttl, value):
+            self.data[key] = value
+
+        def exists(self, key):
+            return int(key in self.data)
+
+    shared = _FakeRedis()
+    app_a = create_app(model=UsageTrackingModel(_FakeModel()))
+    app_b = create_app(model=UsageTrackingModel(_FakeModel()))
+    state_a = app_a.state.aligo
+    state_b = app_b.state.aligo
+    for state in (state_a, state_b):
+        state._redis_client = shared
+        state._tombstones_shared = True
+
+    state_a.mark_deleted("u-shared", "s-shared")
+    assert "aligo:deleted:u-shared:s-shared" in shared.data
+    assert state_b.is_recently_deleted("u-shared", "s-shared") is True
+    assert state_b.is_recently_deleted("u-shared", "other") is False
+    print("✓ 删除墓碑通过 Redis 跨实例共享")
+
+
 def test_session_metadata_requires_existing_session():
     client = _client()
     user_id = _unique_user("web_test_ghost")
