@@ -517,6 +517,14 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
         )
+        # 知识库写入 / 导入 / 语义检索会触发嵌入模型推理，单独按客户端 IP 限流，
+        # 不占用对话额度（Web 批量导入每批 200 条，60 次/分钟足够）
+        self.kb_limiter = create_rate_limiter(
+            "kb",
+            RATE_LIMIT_CONFIG.get("kb_requests", 60),
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
+        )
 
     @staticmethod
     def _session_key(user_id: str, session_id: str) -> str:
@@ -626,6 +634,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         "degraded": degraded,
         "user_limit": state.rate_limiter.limit,
         "ip_limit": state.ip_limiter.limit,
+        "kb_limit": state.kb_limiter.limit,
         "window_sec": state.rate_limiter.window_sec,
     }
 
@@ -679,6 +688,36 @@ def _enforce_rate_limit(
         "X-RateLimit-Remaining": str(remaining),
         "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
     }
+
+
+def _enforce_kb_rate_limit(
+    state: AligoWebApp, request: Request, response: Response
+) -> None:
+    """知识库高开销接口的独立限流（按客户端 IP，与对话额度互不影响）。"""
+    client = _client_host(request)
+    retry_after = state.kb_limiter.peek(client)
+    if retry_after is not None:
+        wait_seconds = max(1, math.ceil(retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail=f"知识库操作过于频繁，请约 {wait_seconds} 秒后重试"
+            f"（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(state.kb_limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+    state.kb_limiter.check(client)
+    remaining, reset = state.kb_limiter.status(client)
+    response.headers.update(
+        {
+            "X-RateLimit-Limit": str(state.kb_limiter.limit),
+            "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+        }
+    )
 
 
 # ---------- 长期记忆读取 ----------
@@ -1196,10 +1235,13 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/knowledge/search")
     def knowledge_search(
+        request: Request,
+        response: Response,
         q: str = Query(..., min_length=1, max_length=100),
         top_k: int = Query(default=5, ge=1, le=10),
     ) -> dict[str, Any]:
         """语义检索知识片段（向量相似度排序；首次调用会加载嵌入模型）。"""
+        _enforce_kb_rate_limit(state, request, response)
         try:
             results = search_documents(q, top_k=top_k)
         except FileNotFoundError as exc:
@@ -1212,8 +1254,11 @@ def create_app(model: Any = None) -> FastAPI:
         return {"query": q, "results": results}
 
     @app.post("/api/knowledge/documents", status_code=201)
-    def knowledge_add(payload: KnowledgeDocumentPayload) -> dict[str, Any]:
+    def knowledge_add(
+        payload: KnowledgeDocumentPayload, request: Request, response: Response
+    ) -> dict[str, Any]:
         """新增知识片段（首次调用会加载嵌入模型，可能需要数秒）。"""
+        _enforce_kb_rate_limit(state, request, response)
         try:
             return add_document(payload.content, payload.metadata)
         except ValueError as exc:
@@ -1230,9 +1275,12 @@ def create_app(model: Any = None) -> FastAPI:
     @app.put("/api/knowledge/documents/{doc_id}")
     def knowledge_update(
         payload: KnowledgeDocumentPayload,
+        request: Request,
+        response: Response,
         doc_id: int = ApiPath(..., ge=1),
     ) -> dict[str, Any]:
         """更新知识片段（内容重新向量化；片段不存在返回 404）。"""
+        _enforce_kb_rate_limit(state, request, response)
         try:
             return update_document(doc_id, payload.content, payload.metadata)
         except ValueError as exc:
@@ -1249,8 +1297,11 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"更新失败：{exc}") from exc
 
     @app.delete("/api/knowledge/documents/{doc_id}")
-    def knowledge_delete(doc_id: int = ApiPath(..., ge=1)) -> dict[str, Any]:
+    def knowledge_delete(
+        request: Request, response: Response, doc_id: int = ApiPath(..., ge=1)
+    ) -> dict[str, Any]:
         """按 id 删除知识片段。"""
+        _enforce_kb_rate_limit(state, request, response)
         try:
             removed = delete_document(doc_id)
         except FileNotFoundError as exc:
@@ -1288,8 +1339,11 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.post("/api/knowledge/import")
-    def knowledge_import(payload: KnowledgeImportPayload) -> dict[str, Any]:
+    def knowledge_import(
+        payload: KnowledgeImportPayload, request: Request, response: Response
+    ) -> dict[str, Any]:
         """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。"""
+        _enforce_kb_rate_limit(state, request, response)
         try:
             return import_documents(payload.documents)
         except FileNotFoundError as exc:

@@ -1807,6 +1807,7 @@ def test_metrics_api():
         assert rate["configured"] is False
         assert rate["degraded"] is False
         assert rate["user_limit"] >= 1 and rate["ip_limit"] >= 1
+        assert rate["kb_limit"] >= 1
         assert rate["window_sec"] > 0
         print("✓ /api/metrics 请求指标")
     finally:
@@ -2754,6 +2755,47 @@ def test_knowledge_search_api(monkeypatch):
     assert missing_response.status_code == 503
     assert "未初始化" in missing_response.json()["detail"]
     print("✓ /api/knowledge/search 语义检索（参数 / 结果 / 503）")
+
+
+def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
+    """知识库高开销接口按 IP 独立限流，不占用对话额度。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "add_document",
+        lambda content, metadata: {"status": "success", "id": 1, "total_count": 1},
+    )
+    monkeypatch.setattr(server_module, "search_documents", lambda q, top_k: [])
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.kb_limiter = RateLimiter(limit=1, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_kb_limit")
+    try:
+        first = client.post("/api/knowledge/documents", json={"content": "测试知识"})
+        assert first.status_code == 201
+        assert first.headers["x-ratelimit-limit"] == "1"
+        assert first.headers["x-ratelimit-remaining"] == "0"
+
+        second = client.post("/api/knowledge/documents", json={"content": "第二条"})
+        assert second.status_code == 429
+        assert "Retry-After" in second.headers
+        assert second.headers["x-ratelimit-remaining"] == "0"
+
+        search = client.get("/api/knowledge/search", params={"q": "住宿"})
+        assert search.status_code == 429, "写入与检索应共享知识库桶"
+
+        chat = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "kb-limit"},
+        )
+        assert chat.status_code == 200, "知识库限流不应影响对话额度"
+        print("✓ 知识库接口独立限流（写入 / 检索共享，不影响对话）")
+    finally:
+        _cleanup(user_id)
 
 
 def test_knowledge_api_maps_backend_errors(monkeypatch):
