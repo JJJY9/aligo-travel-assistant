@@ -2581,7 +2581,7 @@ function pickUpcomingTrip(trips) {
 function renderUpcoming(trip) {
   if (!trip) {
     els.upcoming.hidden = true;
-    if (els.upcomingWeather) els.upcomingWeather.hidden = true;
+    loadUpcomingWeather("");
     return;
   }
   const status = tripStatus(trip);
@@ -2597,9 +2597,9 @@ function renderUpcoming(trip) {
 }
 
 let upcomingWeatherSeq = 0;
-const UPCOMING_WEATHER_CACHE = new Map();
 
 function formatWeatherTemp(value) {
+  if (value === null || value === undefined || value === "") return "";
   const number = Number(value);
   return Number.isFinite(number) ? `${Math.round(number)}°C` : "";
 }
@@ -2609,16 +2609,15 @@ async function loadUpcomingWeather(city) {
   if (!el) return;
   const name = String(city || "").trim();
   if (!name) {
+    // 让在途请求失效，否则上一个城市的天气会落到当前卡片上
+    upcomingWeatherSeq += 1;
+    el.textContent = "";
     el.hidden = true;
     return;
   }
   const seq = ++upcomingWeatherSeq;
-  const cached = UPCOMING_WEATHER_CACHE.get(name);
-  if (cached && Date.now() - cached.at < 10 * 60 * 1000) {
-    el.textContent = cached.text;
-    el.hidden = false;
-    return;
-  }
+  // 服务端已有 10 分钟缓存，这里不再叠加前端缓存，避免展示过期数据
+  el.textContent = "";
   el.hidden = true;
   try {
     const data = await getJSON(`/api/weather?city=${encodeURIComponent(name)}`);
@@ -2637,7 +2636,6 @@ async function loadUpcomingWeather(city) {
     }
     const text = parts.join(" · ");
     if (!text) return;
-    UPCOMING_WEATHER_CACHE.set(name, { at: Date.now(), text });
     el.textContent = text;
     el.hidden = false;
   } catch {

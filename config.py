@@ -68,6 +68,7 @@ class RateLimitConfig(TypedDict):
     chat_requests: int
     ip_requests: int
     kb_requests: int
+    weather_requests: int
     window_sec: int
     # 是否信任反向代理写入的 X-Forwarded-For（默认关闭，避免客户端伪造 IP 绕过 IP 桶）
     trust_proxy_headers: bool
@@ -140,6 +141,7 @@ RATE_LIMIT_CONFIG: RateLimitConfig = {
     "chat_requests": _env_int("CHAT_RATE_LIMIT", 30),
     "ip_requests": _env_int("CHAT_RATE_LIMIT_IP", 120),
     "kb_requests": _env_int("KB_RATE_LIMIT", 60),
+    "weather_requests": _env_int("WEATHER_RATE_LIMIT", 30),
     "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
     "trust_proxy_headers": _env_bool("TRUST_PROXY_HEADERS", False),
 }

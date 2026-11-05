@@ -147,6 +147,35 @@ def test_weather_api(monkeypatch):
     print("✓ /api/weather 天气查询（成功 / 422 / 404 / 503）")
 
 
+def test_weather_rate_limit(monkeypatch):
+    """天气接口按客户端 IP 独立限流，空白城市不消耗额度。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "fetch_weather",
+        lambda city: {"city": city, "current": {}, "daily": []},
+    )
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    app.state.aligo.weather_limiter = RateLimiter(limit=1, window_sec=60)
+    client = TestClient(app)
+
+    first = client.get("/api/weather", params={"city": "北京"})
+    assert first.status_code == 200
+    assert first.headers["x-ratelimit-limit"] == "1"
+    assert first.headers["x-ratelimit-remaining"] == "0"
+
+    second = client.get("/api/weather", params={"city": "上海"})
+    assert second.status_code == 429
+    assert "Retry-After" in second.headers
+    assert second.headers["x-ratelimit-remaining"] == "0"
+
+    blank = client.get("/api/weather", params={"city": "   "})
+    assert blank.status_code == 422
+    print("✓ /api/weather 按 IP 独立限流（空白城市不耗额度）")
+
+
 def test_status_endpoint():
     response = _client().get("/api/status", params={"user_id": "web_test_missing"})
     assert response.status_code == 200
@@ -1869,6 +1898,7 @@ def test_metrics_api():
         assert rate["degraded"] is False
         assert rate["user_limit"] >= 1 and rate["ip_limit"] >= 1
         assert rate["kb_limit"] >= 1
+        assert rate["weather_limit"] >= 1
         assert rate["window_sec"] > 0
         print("✓ /api/metrics 请求指标")
     finally:

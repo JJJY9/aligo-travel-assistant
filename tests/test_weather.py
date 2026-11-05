@@ -5,6 +5,9 @@ Open-Meteo 天气工具测试（无需 API Key、不访问网络）
 """
 import os
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -15,11 +18,13 @@ from utils import weather
 
 
 class _Response:
-    def __init__(self, data):
+    def __init__(self, data, error=None):
         self._data = data
+        self._error = error
 
     def raise_for_status(self):
-        pass
+        if self._error is not None:
+            raise self._error
 
     def json(self):
         return self._data
@@ -136,12 +141,85 @@ def test_empty_city_raises():
     print("✓ 空城市拒绝")
 
 
+def test_http_error_maps_to_weather_error(monkeypatch):
+    def fake_get(url, params=None, timeout=None, headers=None):
+        return _Response({}, error=weather.requests.HTTPError("429 Too Many Requests"))
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    with pytest.raises(weather.WeatherError, match="天气接口暂时不可用"):
+        weather.fetch_weather("北京")
+    print("✓ 上游 429 / 5xx 映射为 WeatherError")
+
+
+def test_malformed_payload_raises(monkeypatch):
+    payloads = [
+        {"current": "oops", "daily": []},
+        {"current": {}, "daily": {"time": 3}},
+        {"current": {}, "daily": {"time": ["2026-11-05"], "weather_code": 1}},
+    ]
+    weather.clear_weather_cache()
+    for payload in payloads:
+        def fake_get(url, params=None, timeout=None, headers=None, _payload=payload):
+            return _Response(_geo() if "geocoding" in url else _payload)
+
+        monkeypatch.setattr(weather.requests, "get", fake_get)
+        with pytest.raises(weather.WeatherError, match="天气接口返回格式异常"):
+            weather.fetch_weather("北京")
+    print("✓ 上游返回形状异常映射为 WeatherError")
+
+
+def test_cache_is_bounded_and_prunes_expired(monkeypatch):
+    monkeypatch.setattr(weather, "_CACHE_MAX_ENTRIES", 2)
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if "geocoding" in url:
+            return _Response(
+                {"results": [{"name": params["name"], "latitude": 1, "longitude": 2}]}
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    for city in ("甲城", "乙城", "丙城"):
+        weather.fetch_weather(city)
+    assert list(weather._cache) == ["乙城", "丙城"], "超过上限应淘汰最旧条目"
+
+    weather._cache["丁城"] = (time.monotonic() - weather.CACHE_TTL_SEC - 1, {})
+    weather.fetch_weather("戊城")
+    assert set(weather._cache) == {"丙城", "戊城"}, "写入时应清理过期条目并维持上限"
+    print("✓ 天气缓存有上限且清理过期条目")
+
+
+def test_concurrent_misses_share_upstream_request(monkeypatch):
+    calls = []
+    calls_lock = threading.Lock()
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        with calls_lock:
+            calls.append(url)
+        time.sleep(0.05)
+        return _Response(_geo("北京") if "geocoding" in url else _forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: weather.fetch_weather("北京"), range(8)))
+    assert all(item["city"] == "北京" for item in results)
+    assert len(calls) == 2, f"同城并发未命中只应请求上游一次，实际 {len(calls)} 次"
+    print("✓ 同城并发未命中合并为一次上游请求")
+
+
 if __name__ == "__main__":
     for case in (
         test_fetch_weather_and_cache,
         test_forecast_uses_location_timezone,
         test_unknown_city_raises,
         test_request_failure_raises,
+        test_http_error_maps_to_weather_error,
+        test_malformed_payload_raises,
+        test_cache_is_bounded_and_prunes_expired,
+        test_concurrent_misses_share_upstream_request,
     ):
         mp = pytest.MonkeyPatch()
         try:
