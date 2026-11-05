@@ -155,6 +155,67 @@ def test_export_import_roundtrip_is_idempotent():
     print(f"✓ 导出→导入幂等（{len(documents)} 条全部跳过）")
 
 
+def test_multipart_group_roundtrip():
+    """多分片记录：真实 Milvus 上的整组替换与整组删除。"""
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    from utils.knowledge_admin import (
+        add_document,
+        delete_document,
+        list_documents,
+        update_document,
+    )
+
+    marker = f"集成测试整组 {uuid.uuid4().hex[:8]}"
+    long_text = "".join(
+        f"{marker}第{i}段内容。" + "补充说明文字。" * 8 for i in range(30)
+    )
+    created = add_document(long_text, {"category": "临时测试"})
+    assert created.get("parts", 1) > 1, f"长内容应拆成多片：{created}"
+
+    def group_docs(group_id: str) -> list[dict]:
+        return [
+            item
+            for item in list_documents(limit=100000)["items"]
+            if item["metadata"].get("group") == group_id
+        ]
+
+    first_docs = [
+        item
+        for item in list_documents(query=marker)["items"]
+        if item["metadata"].get("group")
+    ]
+    group_id = first_docs[0]["metadata"]["group"] if first_docs else ""
+    assert group_id, "拆分应写入 group 元数据"
+    assert len(group_docs(group_id)) == created["parts"]
+    target = first_docs[0]
+
+    try:
+        new_text = "".join(
+            f"{marker}替换后第{i}段。" + "更新内容。" * 8 for i in range(30)
+        )
+        result = update_document(target["id"], new_text, {"category": "临时测试"})
+        assert result.get("parts", 1) > 1, f"替换内容仍应多片：{result}"
+        assert result.get("removed_ids"), "整组替换应删除其余旧分片"
+        assert group_docs(group_id) == [], "旧组不应残留分片"
+        new_docs = [
+            item
+            for item in list_documents(query=marker)["items"]
+            if item["metadata"].get("group")
+        ]
+        new_groups = {item["metadata"]["group"] for item in new_docs}
+        assert len(new_groups) == 1 and group_id not in new_groups
+        removed = delete_document(new_docs[0]["id"], whole_group=True)
+        assert removed == len(new_docs), f"整组删除应删除 {len(new_docs)} 片，实际 {removed}"
+    finally:
+        for item in list_documents(query=marker)["items"]:
+            if item["metadata"].get("group"):
+                delete_document(item["id"], whole_group=True)
+    print(f"✓ 多分片整组替换 / 整组删除（group={group_id}）")
+
+
 if __name__ == "__main__":
     skip_reason = _skip_reason()
     if skip_reason:
@@ -162,5 +223,6 @@ if __name__ == "__main__":
     else:
         test_add_search_and_delete_roundtrip()
         test_update_document_roundtrip()
+        test_multipart_group_roundtrip()
         test_export_import_roundtrip_is_idempotent()
         print("\n全部通过")
