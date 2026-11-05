@@ -152,14 +152,16 @@ class PostgresLongTermMemory:
             self._conn.close()
         self._conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=3)
         self._ensure_schema()
-        # 旧连接上的 advisory lock 已被服务端释放：在新的连接上重新获取，
-        # 否则重试的读改写会在没有互斥保护的情况下执行（trip_N / 偏好并发重复）。
+        # 旧连接上的 advisory lock 已被服务端释放：在新的连接上按重入计数
+        # 重新获取，否则重试的读改写会在没有互斥保护的情况下执行（trip_N /
+        # 偏好并发重复）；计数为 2 时只恢复一次会让内层解锁把锁彻底释放。
         # 直接使用游标而不再走 _run_with_retry，避免数据库不可用时无限递归重连。
-        for lock_name in list(self._held_locks):
+        for lock_name, count in list(self._held_locks.items()):
             with self._conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
-                )
+                for _ in range(max(1, count)):
+                    cursor.execute(
+                        "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+                    )
         logger.info("PostgreSQL 连接已重建（user=%s）", self.user_id)
 
     def _run_with_retry(self, operation):

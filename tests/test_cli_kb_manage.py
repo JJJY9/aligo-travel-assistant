@@ -81,21 +81,28 @@ def test_delete_success(monkeypatch):
 
     def fake_delete(doc_id, whole_group=False):
         calls.append((doc_id, whole_group))
-        return doc_id == 7
+        return 3 if whole_group else 1
 
     monkeypatch.setattr(knowledge_admin, "delete_document", fake_delete)
     code, out = _capture(cli.run_knowledge_delete_standalone, 7)
     assert code == 0 and "已删除知识片段 #7" in out
     assert calls[-1] == (7, False)
     gcode, gout = _capture(cli.run_knowledge_delete_standalone, 7, whole_group=True)
-    assert gcode == 0 and "已删除整组分片 #7" in gout
+    assert gcode == 0 and "已删除整组分片 #7（共 3 片）" in gout
     assert calls[-1] == (7, True)
-    print("✓ kb-delete 删除成功（单条 / 整组）")
+
+    # 旧记录没有 group：--group 回退为单条删除，提示不能声称删掉了整组
+    monkeypatch.setattr(
+        knowledge_admin, "delete_document", lambda doc_id, whole_group=False: 1
+    )
+    fcode, fout = _capture(cli.run_knowledge_delete_standalone, 7, whole_group=True)
+    assert fcode == 0 and "未找到同组分片" in fout
+    print("✓ kb-delete 删除成功（单条 / 整组 / 无组回退）")
 
 
 def test_delete_not_found(monkeypatch):
     monkeypatch.setattr(
-        knowledge_admin, "delete_document", lambda doc_id, whole_group=False: False
+        knowledge_admin, "delete_document", lambda doc_id, whole_group=False: 0
     )
     code, out = _capture(cli.run_knowledge_delete_standalone, 99)
     assert code == 1 and "片段不存在" in out

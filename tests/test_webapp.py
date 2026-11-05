@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -691,7 +692,11 @@ def test_export_all_sessions_storage_failure_maps_503(monkeypatch):
 
 
 def test_open_long_term_failure_maps_503(monkeypatch):
-    """长期记忆打开失败（如 PostgreSQL 不可达）应返回可重试的 503 而不是 500。"""
+    """长期记忆打开失败（文件损坏 / 依赖缺失等）应返回可重试的 503 而不是 500。
+
+    注意 PostgreSQL 不可达时存储工厂会回退本地 JSON（既有降级策略），
+    不经过这里的异常分支。
+    """
     from webapp import server as server_module
 
     def _boom(*args, **kwargs):
@@ -2065,6 +2070,79 @@ def test_repeated_delete_keeps_tombstone():
         _cleanup(user_id)
 
 
+def test_delete_missing_session_allows_new_chat():
+    """从未存在的会话删除后不保留本地墓碑：该 id 仍可新开对话。"""
+    client = _client()
+    state = client.app.state.aligo
+    if state.shared_tombstones_active():
+        pytest.skip("配置了共享墓碑（REDIS_URL），跨实例保护优先，不适用本地回退语义")
+    user_id = _unique_user("web_test_missing_delete")
+    try:
+        deleted = client.delete(
+            "/api/sessions/never-existed", params={"user_id": user_id}
+        )
+        assert deleted.status_code == 200 and deleted.json()["deleted"] == 0
+        chat = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "never-existed"},
+        )
+        assert chat.status_code == 200, "不存在的会话删除后不应留下墓碑"
+        print("✓ 不存在会话删除后不保留墓碑")
+    finally:
+        _cleanup(user_id)
+
+
+def test_delete_missing_session_failure_does_not_leave_tombstone(monkeypatch):
+    """从未存在的会话删除又失败时也要撤销墓碑，允许该 id 新开对话。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def get_chat_history(self, session_id=None):
+            return []
+
+        def delete_chat_session(self, session_id):
+            raise RuntimeError("delete boom")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    client = _client()
+    state = client.app.state.aligo
+    if state.shared_tombstones_active():
+        pytest.skip("配置了共享墓碑（REDIS_URL），跨实例保护优先，不适用本地回退语义")
+    response = client.delete("/api/sessions/ghost", params={"user_id": "u-ghost"})
+    assert response.status_code == 503
+    assert state.is_recently_deleted("u-ghost", "ghost") is False
+    print("✓ 删除不存在会话失败后不留墓碑")
+
+
+def test_tombstone_helpers_are_thread_safe():
+    """墓碑的 mark/unmark/读取会被线程池并发调用，OrderedDict 不能裸迭代。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    errors: list[BaseException] = []
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(1500):
+                state.mark_deleted(f"u{n}", f"s{i % 40}")
+                state.is_recently_deleted(f"u{n}", f"s{i % 40}")
+                if i % 3:
+                    state.unmark_deleted(f"u{n}", f"s{i % 40}")
+        except BaseException as exc:  # noqa: BLE001 - 收集线程内异常
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors[:1]
+    assert len(state._deleted_sessions) <= state.max_tombstones
+    print("✓ 删除墓碑字典并发安全")
+
+
 def test_sessions_pagination():
     from context.storage import create_long_term_memory
 
@@ -2460,6 +2538,57 @@ def test_shared_tombstones_across_instances():
     state_a.unmark_deleted("u-shared", "s-shared")
     assert state_b.is_recently_deleted("u-shared", "s-shared") is False
     print("✓ 删除墓碑通过 Redis 跨实例共享（含 TTL 与撤销）")
+
+
+def test_repeated_delete_repairs_shared_tombstone():
+    """首次删除时共享墓碑写入失败，冷却结束后的重复删除要补写。"""
+
+    class _FlakySharedRedis:
+        def __init__(self):
+            self.data = {}
+            self.fail = True
+
+        def setex(self, key, ttl, value):
+            if self.fail:
+                raise ConnectionError("redis down")
+            self.data[key] = value
+
+        def exists(self, key):
+            if self.fail:
+                raise ConnectionError("redis down")
+            return int(key in self.data)
+
+        def delete(self, key):
+            self.data.pop(key, None)
+            return 1
+
+    shared = _FlakySharedRedis()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state._redis_client = shared
+    state._tombstones_shared = False
+    client = TestClient(app)
+    user_id = _unique_user("web_test_tombstone_repair")
+    try:
+        created = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "repair"},
+        )
+        assert created.status_code == 200
+        first = client.delete("/api/sessions/repair", params={"user_id": user_id})
+        assert first.status_code == 200 and first.json()["deleted"] == 2
+        assert not shared.data, "共享墓碑写入应失败"
+
+        shared.fail = False
+        state._tombstone_retry_at = 0.0  # 模拟冷却结束
+        second = client.delete("/api/sessions/repair", params={"user_id": user_id})
+        assert second.status_code == 200 and second.json()["deleted"] == 0
+        assert f"aligo:deleted:{user_id}:repair" in shared.data, (
+            "重复删除应补写上一次失败的共享墓碑"
+        )
+        print("✓ 重复删除补写共享墓碑")
+    finally:
+        _cleanup(user_id)
 
 
 def test_tombstone_redis_retry_after_failure():
@@ -3502,13 +3631,42 @@ def test_knowledge_eval_api(monkeypatch):
     assert limited.status_code == 429
     assert limited.headers["x-ratelimit-remaining"] == "0"
 
-    # 评测期间共享锁失效（心跳续期返回 0）时，结果必须打标而不是当作独占评测
-    state.eval_lock.lost = True
+    # 共享锁在评测期间失效（心跳续期返回 0）时，结果必须打标；用假锁模拟
+    # 真实时序（真锁 acquire 成功会清零 lost，直接置位不算覆盖）
+    class _LostEvalLock:
+        lost = True
+        degraded = False
+
+        def acquire(self):
+            return "token"
+
+        def release(self, token):
+            pass
+
+    state.eval_lock = _LostEvalLock()
     state.kb_limiter = RateLimiter(limit=3, window_sec=60)  # 重置额度
     warned = client.get("/api/knowledge/eval")
     assert warned.status_code == 200
     assert "warning" in warned.json()
-    state.eval_lock.lost = False
+
+    # 配置了 Redis 但加锁回退进程内（degraded）同样不能当作独占评测
+    class _DegradedEvalLock(_LostEvalLock):
+        lost = False
+        degraded = True
+
+    state.eval_lock = _DegradedEvalLock()
+    monkeypatch.setitem(
+        server_module.STORAGE_CONFIG, "redis_url", "redis://localhost:6379/0"
+    )
+    state.kb_limiter = RateLimiter(limit=3, window_sec=60)
+    degraded = client.get("/api/knowledge/eval")
+    assert degraded.status_code == 200 and "warning" in degraded.json()
+
+    # 未配置 Redis 时进程内锁是正常模式，不应误报
+    monkeypatch.setitem(server_module.STORAGE_CONFIG, "redis_url", "")
+    state.kb_limiter = RateLimiter(limit=3, window_sec=60)
+    single = client.get("/api/knowledge/eval")
+    assert single.status_code == 200 and "warning" not in single.json()
     print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429 不耗额度）")
 
 
@@ -3814,6 +3972,15 @@ if __name__ == "__main__":
     test_chat_rate_limit_rejected_request_does_not_consume_other_bucket()
     test_ip_rejection_does_not_consume_user_bucket()
     test_deleted_session_cannot_be_resurrected()
+    test_repeated_delete_keeps_tombstone()
+    test_delete_missing_session_allows_new_chat()
+    _mp_ghost = pytest.MonkeyPatch()
+    try:
+        test_delete_missing_session_failure_does_not_leave_tombstone(_mp_ghost)
+    finally:
+        _mp_ghost.undo()
+    test_tombstone_helpers_are_thread_safe()
+    test_repeated_delete_repairs_shared_tombstone()
     test_session_metadata_requires_existing_session()
     test_session_rename()
     test_session_pin()

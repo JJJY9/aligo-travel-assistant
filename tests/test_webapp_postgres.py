@@ -266,5 +266,45 @@ def test_advisory_lock_reacquired_after_reconnect():
         store.close()
 
 
+def test_advisory_lock_reentrant_reacquire_after_reconnect():
+    """嵌套持有同一把 advisory lock 时，重连必须按重入计数恢复服务端持有。
+
+    会话级 advisory lock 可重入：重连后只恢复一次时，内层解锁会把整把锁
+    释放，外层临界区失去互斥。用另一条连接尝试加锁来验证（持有时拿不到）。
+    """
+    import psycopg
+
+    user_id = f"pglock-nested-{uuid.uuid4().hex[:8]}"
+    lock_name = f"aligo-test-nested-{user_id}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    other = psycopg.connect(TEST_POSTGRES_DSN, autocommit=True, connect_timeout=3)
+
+    def other_can_acquire() -> bool:
+        with other.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+            )
+            acquired = bool(cursor.fetchone()[0])
+            if acquired:
+                cursor.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,)
+                )
+            return acquired
+
+    try:
+        with store._advisory_lock(lock_name):
+            with store._advisory_lock(lock_name):
+                assert not other_can_acquire()
+                store._conn.close()
+                store.get_preference("home_location")  # 触发重连 + 按计数重取
+                assert not other_can_acquire(), "重连后锁应仍然持有"
+            assert not other_can_acquire(), "内层解锁不能把整把锁释放"
+        assert other_can_acquire(), "外层解锁后应可被其它连接获取"
+        print("✓ advisory lock 重连后按重入计数恢复")
+    finally:
+        other.close()
+        store.close()
+
+
 if __name__ == "__main__":
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")

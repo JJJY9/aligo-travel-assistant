@@ -236,13 +236,29 @@ class RedisShortTermMemory:
         self._pending: list[str] = []
 
     def _flush_pending(self) -> None:
-        """把故障期间新增的消息补写进 Redis（保持最近窗口与 TTL）。"""
+        """把故障期间新增的消息补写进 Redis（保持最近窗口与 TTL）。
+
+        补写是至少一次语义：写入已在服务端生效但响应超时（或连接中断）时，
+        同一条消息会留在待补写列表里。补写前与 Redis 末尾窗口去重，
+        避免恢复后对话轮次重复。
+        """
         if not self._pending:
             return
-        payloads = list(self._pending)
+        window = self.max_turns * 2
+        existing = self.client.lrange(self.key, -window, -1)
+        seen = set(existing or [])
+        payloads: list[str] = []
+        for payload in self._pending:
+            if payload in seen:
+                continue
+            seen.add(payload)
+            payloads.append(payload)
+        if not payloads:
+            self._pending.clear()
+            return
         pipe = self.client.pipeline()
         pipe.rpush(self.key, *payloads)
-        pipe.ltrim(self.key, -self.max_turns * 2, -1)
+        pipe.ltrim(self.key, -window, -1)
         pipe.expire(self.key, self.ttl_sec)
         pipe.execute()
         self._pending.clear()
@@ -291,8 +307,12 @@ class RedisShortTermMemory:
 
         _, via_redis = self._call_redis(op, lambda: None)
         if not via_redis:
-            # 故障期间的消息先记下，Redis 恢复后补写，避免恢复后上下文缺轮次
+            # 故障期间的消息先记下，Redis 恢复后补写，避免恢复后上下文缺轮次；
+            # 与影子缓存一致只保留最近窗口，长时间故障不会无限增长
             self._pending.append(payload)
+            window = self.max_turns * 2
+            if len(self._pending) > window:
+                self._pending = self._pending[-window:]
         logger.debug("Added message to Redis short-term memory: %s", role)
 
     def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:

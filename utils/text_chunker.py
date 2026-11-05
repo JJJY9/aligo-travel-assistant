@@ -83,8 +83,21 @@ def _merge_short_chunks(
         if pending:
             candidate = f"{pending}\n{chunk}"
             if max_chars is not None and len(candidate) > max_chars:
-                merged.append(pending)
-                merged.append(chunk)
+                # 标题 + 正文超过上限：把标题接到正文第一段开头，按剩余空间
+                # 切分正文（无句读的长段落 hard-split 后第一段也可能超长，
+                # 直接整体切分会让标题又单独成块）
+                body_pieces = _split_long_paragraph(chunk, max_chars)
+                room = max_chars - len(pending) - 1
+                if room <= 0:
+                    merged.append(pending)
+                    merged.extend(body_pieces)
+                else:
+                    first = body_pieces[0]
+                    head, tail = first[:room], first[room:]
+                    body_pieces[0] = f"{pending}\n{head}"
+                    if tail:
+                        body_pieces.insert(1, tail)
+                    merged.extend(body_pieces)
             else:
                 merged.append(candidate)
             pending = ""

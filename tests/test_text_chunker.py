@@ -118,6 +118,25 @@ def test_title_only_run_respects_max_chars():
     print(f"✓ 连续标题块受上限约束（{len(chunks)} 块）")
 
 
+def test_heading_attached_to_long_body():
+    """标题后跟超长正文时，标题应并入第一段正文，不能单独成块。"""
+    text = "一、住宿标准\n\n" + "住宿标准为500元。" * 100
+    chunks = split_text(text)
+    assert chunks[0].startswith("一、住宿标准"), chunks[0][:30]
+    assert "500" in chunks[0], "标题应与正文首段在同一块"
+    assert all(len(c) <= 400 for c in chunks)
+    print("✓ 标题并入超长正文首段")
+
+
+def test_heading_attached_to_unpunctuated_body():
+    """标题后是无句读的长段落（hard-split）时，标题仍并入第一块。"""
+    chunks = split_text("一、住宿标准\n\n" + "住" * 900 + "。")
+    assert chunks[0].startswith("一、住宿标准"), chunks[0][:20]
+    assert "住" in chunks[0]
+    assert all(len(chunk) <= 400 for chunk in chunks)
+    print("✓ 标题并入无句读长段落首块")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -126,4 +145,6 @@ if __name__ == "__main__":
     test_consecutive_titles_merge_into_body()
     test_short_title_merged()
     test_title_only_run_respects_max_chars()
+    test_heading_attached_to_long_body()
+    test_heading_attached_to_unpunctuated_body()
     print("\n全部通过")

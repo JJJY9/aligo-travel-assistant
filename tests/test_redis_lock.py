@@ -9,6 +9,7 @@ Redis 互斥锁测试
 """
 import os
 import sys
+import threading
 import time
 import uuid
 
@@ -203,6 +204,53 @@ def test_heartbeat_detects_lost_lock():
     print("✓ 续期失败时标记锁已丢失")
 
 
+class _StalledRenewRedis:
+    """第一次续期被卡住（模拟释放时仍在途的旧续期），之后续期正常。"""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.renew_calls = 0
+        self.renew_entered = threading.Event()
+        self.finish_renew = threading.Event()
+
+    def set(self, key, value, nx=False, ex=None):
+        self.store[key] = value
+        return True
+
+    def eval(self, script, numkeys, key, *args):
+        if "EXPIRE" in script:
+            self.renew_calls += 1
+            if self.renew_calls == 1:
+                self.renew_entered.set()
+                self.finish_renew.wait(timeout=10)
+                return 0
+            return 1
+        if "DEL" in script:
+            self.store.pop(key, None)
+            return 1
+        return 0
+
+
+def test_stale_renewal_does_not_mark_new_hold_lost():
+    """释放时卡住的旧续期返回 0，不能把重新加锁后的新持有点标记为 lost。"""
+    client = _StalledRenewRedis()
+    lock = DistributedLock(client, "aligo:test:stale-renew", ttl_sec=1)
+    first = lock.acquire()
+    assert first
+    assert client.renew_entered.wait(timeout=5), "续期线程应启动"
+
+    lock.release(first)  # join 超时后返回，本地锁释放
+    second = lock.acquire()
+    assert second and second != first
+    assert lock.lost is False
+
+    client.finish_renew.set()  # 旧续期此刻才返回 0
+    time.sleep(0.3)
+    assert lock.lost is False, "旧续期不能污染新的持有"
+    lock.release(second)
+    print("✓ 旧续期返回 0 不污染新的持有点")
+
+
 if __name__ == "__main__":
     test_fallback_when_redis_unavailable()
     test_local_mutex_blocks_even_if_redis_errors()
@@ -210,4 +258,5 @@ if __name__ == "__main__":
     test_release_cleans_key_after_set_timeout()
     test_heartbeat_renews_lock_ttl()
     test_heartbeat_detects_lost_lock()
+    test_stale_renewal_does_not_mark_new_hold_lost()
     print("\n全部通过（Redis 集成用例需 TEST_REDIS_URL）")
