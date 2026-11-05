@@ -495,7 +495,7 @@ python cli.py
 
 知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path] [--force]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`，已存在时需 `--force` 覆盖）；`python cli.py kb-import <file.json>` 批量导入（CLI 不限条数，Web 接口单次最多 200 条），适合备份、换机与批量补充知识。
 
-知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 60 字预览）；`python cli.py kb-delete <id>` 删除指定片段。
+知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 60 字预览）；`python cli.py kb-delete <id> [--group]` 删除指定片段（`--group` 时连同同一拆分组的其余分片）。
 
 偏好列表（不进入交互）：`python cli.py preferences <user_id>` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否）。
 
