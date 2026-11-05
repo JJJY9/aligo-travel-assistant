@@ -439,6 +439,22 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     items = list(documents)
     if not items:
         return {"imported": 0, "skipped": 0}
+
+    # 与数据库无关的校验先做：全部为空 / 非法时不需要知识库，直接返回
+    valid: list[Any] = []
+    skipped = 0
+    for item in items:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        raw_content = item.get("content")
+        # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            skipped += 1
+            continue
+        valid.append(item)
+    if not valid:
+        return {"imported": 0, "skipped": skipped}
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
@@ -451,15 +467,12 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
             str(item.get("content", "")).strip()
             for item in list_documents(limit=_MAX_SCAN)["items"]
         }
-        merged_items, skipped = _regroup_exported_documents(items, existing)
+        merged_items, group_skipped = _regroup_exported_documents(valid, existing)
+        skipped += group_skipped
         cleaned: list[dict[str, Any]] = []
         for item in merged_items:
-            if not isinstance(item, dict):
-                skipped += 1
-                continue
             restored = bool(item.pop("__restored_group__", False))
             raw_content = item.get("content")
-            # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
             if not isinstance(raw_content, str):
                 skipped += 1
                 continue
