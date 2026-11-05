@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
@@ -85,6 +86,8 @@ APP_VERSION = "1.4.1"
 SSE_HEARTBEAT_SEC = 15.0
 # 请求体大小上限（JSON 接口都是小请求；防止超大 body 在 Pydantic 校验前耗尽内存）
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+# 检索评测会加载嵌入模型并逐个问题检索；同一进程同时只允许一个评测
+_KB_EVAL_LOCK = threading.Lock()
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
@@ -1270,31 +1273,42 @@ def create_app(model: Any = None) -> FastAPI:
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
         """离线检索评测：14 个差旅问题计算 hit@1/3/5 与 MRR（不调用大模型）。"""
         response.headers.update(_enforce_kb_rate_limit(state, request))
-        status = knowledge_status()
-        if not status.get("available"):
+        if not _KB_EVAL_LOCK.acquire(blocking=False):
             raise HTTPException(
-                status_code=503,
-                detail=f"知识库不可用：{status.get('reason', '未知原因')}",
+                status_code=429,
+                detail="已有检索评测在运行，请稍后再试",
+                headers={"Retry-After": "5"},
             )
-
-        from agents.rag_knowledge_agent import RAGKnowledgeAgent
-        from utils.rag_eval import evaluate_retrieval
-
         try:
-            agent = RAGKnowledgeAgent(collection_name=status["collection"])
-        except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
-            logger.warning("检索评测初始化失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"评测初始化失败：{exc}") from exc
-        if not agent.initialized:
-            raise HTTPException(status_code=503, detail="RAG 依赖未安装")
-        try:
-            # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
-            return evaluate_retrieval(
-                lambda query, top_k: agent.search_knowledge(query, top_k=top_k)
-            )
-        except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
-            logger.warning("检索评测失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
+            status = knowledge_status()
+            if not status.get("available"):
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"知识库不可用：{status.get('reason', '未知原因')}",
+                )
+
+            from agents.rag_knowledge_agent import RAGKnowledgeAgent
+            from utils.rag_eval import evaluate_retrieval
+
+            try:
+                agent = RAGKnowledgeAgent(collection_name=status["collection"])
+            except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
+                logger.warning("检索评测初始化失败: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail=f"评测初始化失败：{exc}"
+                ) from exc
+            if not agent.initialized:
+                raise HTTPException(status_code=503, detail="RAG 依赖未安装")
+            try:
+                # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
+                return evaluate_retrieval(
+                    lambda query, top_k: agent.search_knowledge(query, top_k=top_k)
+                )
+            except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
+                logger.warning("检索评测失败: %s", exc)
+                raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
+        finally:
+            _KB_EVAL_LOCK.release()
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(

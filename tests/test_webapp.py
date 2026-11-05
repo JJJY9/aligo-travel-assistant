@@ -2863,7 +2863,15 @@ def test_knowledge_eval_api(monkeypatch):
         lambda: {"available": False, "reason": "知识库未初始化", "path": "p"},
     )
     assert client.get("/api/knowledge/eval").status_code == 503
-    print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头）")
+
+    assert server_module._KB_EVAL_LOCK.acquire(blocking=False)
+    try:
+        busy = client.get("/api/knowledge/eval")
+        assert busy.status_code == 429
+        assert "Retry-After" in busy.headers
+    finally:
+        server_module._KB_EVAL_LOCK.release()
+    print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429）")
 
 
 def test_knowledge_api_maps_backend_errors(monkeypatch):
