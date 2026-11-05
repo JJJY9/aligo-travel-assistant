@@ -14,6 +14,7 @@ from typing import Any
 
 from utils.knowledge_paths import COLLECTION_NAME, knowledge_db_path
 from utils.milvus_client import get_milvus_client
+from utils.text_chunker import split_text
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 _MAX_SCAN = 16384
 # 导入时每次嵌入 / 插入的条数，控制大文件的峰值内存
 _IMPORT_CHUNK = 500
+# 单条内容超过该长度时按语义边界拆片：嵌入模型只编码前 512 token
+# （约 400 个汉字），更长的尾部内容对检索完全不可见
+_MAX_CONTENT_CHARS = 400
+# 元数据最多 10 个键（与导入清洗保持一致），分片标记只在放得下时添加
+_METADATA_MAX_KEYS = 10
 _WRITE_LOCK = threading.Lock()
 _agent: Any = None
 _agent_lock = threading.Lock()
@@ -143,48 +149,89 @@ def list_categories() -> list[dict[str, Any]]:
     ]
 
 
+def _chunk_documents(
+    text: str, metadata: dict[str, str] | None
+) -> list[dict[str, Any]]:
+    """长内容按语义边界拆成 ≤400 字的片段（嵌入模型 512 token 截断）。"""
+    chunks = (
+        [text]
+        if len(text) <= _MAX_CONTENT_CHARS
+        else [chunk for chunk in split_text(text, max_chars=_MAX_CONTENT_CHARS) if chunk.strip()]
+    )
+    if not chunks:
+        chunks = [text]
+    base_meta = dict(metadata or {})
+    documents: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        meta = dict(base_meta)
+        if len(chunks) > 1 and len(meta) + 2 <= _METADATA_MAX_KEYS:
+            meta.setdefault("part", str(index + 1))
+            meta.setdefault("parts", str(len(chunks)))
+        documents.append({"content": chunk, "metadata": meta})
+    return documents
+
+
 def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[str, Any]:
-    """新增一个知识片段，返回新片段 id。"""
+    """新增知识片段；长内容按语义边界拆成多条（返回最后一条 id 与分片数）。"""
     text = content.strip()
     if not text:
         raise ValueError("知识内容不能为空")
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
+    documents = _chunk_documents(text, metadata)
 
     # 模型加载可能耗时数秒，放在锁外；锁只保护 id 生成 + 写入
     agent = _get_agent()
     with _WRITE_LOCK:
-        result = agent.add_documents(
-            [{"content": text, "metadata": dict(metadata or {})}]
-        )
+        result = agent.add_documents(documents)
     if result.get("status") != "success":
         raise RuntimeError(str(result.get("message") or "添加知识片段失败"))
     ids = result.get("ids") or []
     total = result.get("total_count")
-    return {
+    payload: dict[str, Any] = {
         "status": "success",
         "id": int(ids[-1]) if ids else None,
         "total_count": int(total) if total is not None else None,
     }
+    if len(documents) > 1:
+        payload["parts"] = len(documents)
+    return payload
 
 
 def update_document(
     doc_id: int, content: str, metadata: dict[str, str] | None = None
 ) -> dict[str, Any]:
-    """按 id 覆盖更新知识片段（重新嵌入）；片段不存在时抛 LookupError。"""
+    """按 id 覆盖更新知识片段（重新嵌入）；长内容其余分片以新记录追加。"""
     text = content.strip()
     if not text:
         raise ValueError("知识内容不能为空")
     client = _client()
     _load_collection(client, COLLECTION_NAME)
     agent = _get_agent()
+    documents = _chunk_documents(text, metadata)
     with _WRITE_LOCK:
         if not _exists(client, int(doc_id)):
             raise LookupError("知识片段不存在")
-        result = agent.update_document(int(doc_id), text, dict(metadata or {}))
-    if result.get("status") != "success":
-        raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
-    return {"status": "success", "id": int(doc_id)}
+        first = documents[0]
+        result = agent.update_document(
+            int(doc_id), first["content"], first["metadata"]
+        )
+        if result.get("status") != "success":
+            raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
+        extra_ids: list[int] = []
+        if len(documents) > 1:
+            added = agent.add_documents(documents[1:])
+            if added.get("status") != "success":
+                raise RuntimeError(
+                    "更新成功但新增分片失败："
+                    + str(added.get("message") or "未知错误")
+                )
+            extra_ids = [int(item) for item in (added.get("ids") or [])]
+    payload: dict[str, Any] = {"status": "success", "id": int(doc_id)}
+    if len(documents) > 1:
+        payload["parts"] = len(documents)
+        payload["extra_ids"] = extra_ids
+    return payload
 
 
 def export_documents() -> list[dict[str, Any]]:
@@ -215,15 +262,12 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         metadata = item.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
-        cleaned.append(
-            {
-                "content": content[:2000],
-                "metadata": {
-                    str(key)[:32]: str(value)[:200]
-                    for key, value in list(metadata.items())[:10]
-                },
-            }
-        )
+        sanitized_meta = {
+            str(key)[:32]: str(value)[:200]
+            for key, value in list(metadata.items())[:_METADATA_MAX_KEYS]
+        }
+        # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索
+        cleaned.extend(_chunk_documents(content[:2000], sanitized_meta))
 
     if not cleaned:
         return {"imported": 0, "skipped": skipped}
