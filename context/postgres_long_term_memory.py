@@ -101,6 +101,9 @@ class PostgresLongTermMemory:
         self.dsn = dsn
         self._conn = psycopg.connect(dsn, autocommit=True, connect_timeout=3)
         self._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
+        # 当前连接持有的会话级 advisory lock（锁名 -> 重入计数）。advisory lock
+        # 随连接失效由服务端释放，重连后必须重新获取，否则读改写失去互斥。
+        self._held_locks: dict[str, int] = {}
         self._ensure_schema()
         logger.info("PostgreSQL long-term memory initialized for user: %s", user_id)
 
@@ -149,6 +152,14 @@ class PostgresLongTermMemory:
             self._conn.close()
         self._conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=3)
         self._ensure_schema()
+        # 旧连接上的 advisory lock 已被服务端释放：在新的连接上重新获取，
+        # 否则重试的读改写会在没有互斥保护的情况下执行（trip_N / 偏好并发重复）。
+        # 直接使用游标而不再走 _run_with_retry，避免数据库不可用时无限递归重连。
+        for lock_name in list(self._held_locks):
+            with self._conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+                )
         logger.info("PostgreSQL 连接已重建（user=%s）", self.user_id)
 
     def _run_with_retry(self, operation):
@@ -166,17 +177,28 @@ class PostgresLongTermMemory:
         return Json(value)
 
     @contextlib.contextmanager
-    def _preference_lock(self, pref_type: str):
-        """同一用户同一偏好类型的读改写跨会话串行（会话级 advisory lock，可重入）。"""
-        lock_name = f"aligo-pref-{self.user_id}-{pref_type}"
+    def _advisory_lock(self, lock_name: str):
+        """会话级 advisory lock：同一连接内可重入，连接重建后自动重新获取。"""
         self._execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
+        self._held_locks[lock_name] = self._held_locks.get(lock_name, 0) + 1
         try:
             yield
         finally:
+            count = self._held_locks.get(lock_name, 0) - 1
+            if count > 0:
+                self._held_locks[lock_name] = count
+            else:
+                self._held_locks.pop(lock_name, None)
             with contextlib.suppress(Exception):
                 self._execute(
                     "SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,)
                 )
+
+    @contextlib.contextmanager
+    def _preference_lock(self, pref_type: str):
+        """同一用户同一偏好类型的读改写跨会话串行（会话级 advisory lock，可重入）。"""
+        with self._advisory_lock(f"aligo-pref-{self.user_id}-{pref_type}"):
+            yield
 
     # ---------- 偏好 ----------
 
@@ -440,7 +462,10 @@ class PostgresLongTermMemory:
                 """,
                 (self.user_id, session_id, self.user_id, session_id),
             )
-            return row is not None
+            if row is not None:
+                return True
+            # 已置顶时 ON CONFLICT DO NOTHING 不返回行：会话存在即视为成功（幂等）
+            return self._session_exists(session_id)
         if not self._session_exists(session_id):
             return False
         self._execute(
@@ -474,7 +499,10 @@ class PostgresLongTermMemory:
                 """,
                 (self.user_id, session_id, self.user_id, session_id),
             )
-            return row is not None
+            if row is not None:
+                return True
+            # 已归档时 ON CONFLICT DO NOTHING 不返回行：会话存在即视为成功（幂等）
+            return self._session_exists(session_id)
         if not self._session_exists(session_id):
             return False
         self._execute(
@@ -499,15 +527,8 @@ class PostgresLongTermMemory:
         purpose = trip_info.get("purpose") or "旅游"
         destination = trip_info.get("destination")
         # 会话级 advisory lock：多线程 / 多进程同时写入同一用户时串行生成 trip_N
-        lock_name = f"aligo-trip-{self.user_id}"
-        self._execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
-        try:
+        with self._advisory_lock(f"aligo-trip-{self.user_id}"):
             return self._save_trip_history_locked(trip_info, purpose, destination)
-        finally:
-            with contextlib.suppress(Exception):
-                self._execute(
-                    "SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,)
-                )
 
     def _save_trip_history_locked(
         self,

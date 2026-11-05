@@ -232,13 +232,30 @@ class RedisShortTermMemory:
         # Redis 故障时的进程内影子缓存：对话继续可用（跨实例共享暂时失效）。
         # 成功的写入也镜像一份，故障切换时上下文与删除操作仍然正确。
         self._fallback = ShortTermMemory(max_turns=max_turns)
+        # Redis 故障期间新增的消息（JSON 列表项），恢复后补写进 Redis
+        self._pending: list[str] = []
 
-    def _redis(self, operation, fallback):
-        """执行 Redis 操作；连接级故障时回退影子缓存并进入 60 秒冷却。"""
+    def _flush_pending(self) -> None:
+        """把故障期间新增的消息补写进 Redis（保持最近窗口与 TTL）。"""
+        if not self._pending:
+            return
+        payloads = list(self._pending)
+        pipe = self.client.pipeline()
+        pipe.rpush(self.key, *payloads)
+        pipe.ltrim(self.key, -self.max_turns * 2, -1)
+        pipe.expire(self.key, self.ttl_sec)
+        pipe.execute()
+        self._pending.clear()
+
+    def _call_redis(self, operation, fallback):
+        """执行 Redis 操作；返回 (结果, 是否走了 Redis)，故障时回退影子缓存。"""
         global _redis_degraded_until
         if time.monotonic() < _redis_degraded_until:
-            return fallback()
+            return fallback(), False
         try:
+            # 恢复后的第一次 Redis 调用先补写故障期间的新消息，
+            # 否则刚恢复时读到的上下文会缺少最近几轮
+            self._flush_pending()
             result = operation()
         except Exception as exc:  # noqa: BLE001 - 短期缓存故障不能中断对话
             _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
@@ -247,9 +264,13 @@ class RedisShortTermMemory:
                 exc,
                 int(_REDIS_RETRY_COOLDOWN_SEC),
             )
-            return fallback()
+            return fallback(), False
         _redis_degraded_until = 0.0
-        return result
+        return result, True
+
+    def _redis(self, operation, fallback):
+        """执行 Redis 操作；连接级故障时回退影子缓存并进入 60 秒冷却。"""
+        return self._call_redis(operation, fallback)[0]
 
     def add_message(self, role: str, content: str, metadata: dict | None = None) -> None:
         message = {
@@ -258,16 +279,20 @@ class RedisShortTermMemory:
             "timestamp": datetime.now().isoformat(),
             "metadata": metadata or {},
         }
+        payload = json.dumps(message, ensure_ascii=False)
         self._fallback.add_message(role, content, metadata)
 
         def op() -> None:
             pipe = self.client.pipeline()
-            pipe.rpush(self.key, json.dumps(message, ensure_ascii=False))
+            pipe.rpush(self.key, payload)
             pipe.ltrim(self.key, -self.max_turns * 2, -1)
             pipe.expire(self.key, self.ttl_sec)
             pipe.execute()
 
-        self._redis(op, lambda: None)
+        _, via_redis = self._call_redis(op, lambda: None)
+        if not via_redis:
+            # 故障期间的消息先记下，Redis 恢复后补写，避免恢复后上下文缺轮次
+            self._pending.append(payload)
         logger.debug("Added message to Redis short-term memory: %s", role)
 
     def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:
@@ -291,7 +316,11 @@ class RedisShortTermMemory:
         return "\n".join(lines)
 
     def clear(self) -> None:
-        self._redis(lambda: self.client.delete(self.key), self._fallback.clear)
+        self._call_redis(lambda: self.client.delete(self.key), lambda: None)
+        # 无论 Redis 是否可用都清空影子缓存与待补写消息，否则故障切换后
+        # 已清空的对话会从内存里“复活”
+        self._fallback.clear()
+        self._pending.clear()
         logger.info("Redis short-term memory cleared: %s", self.key)
 
     def truncate_last_turn(self, expect: str | None = None) -> int:
@@ -301,19 +330,26 @@ class RedisShortTermMemory:
         避免与其它进程 / worker 追加消息的写入交错后裁错条目；``expect`` 不为
         None 时内容不一致则不修改。
         """
-        count = int(
-            self._redis(
-                lambda: self.client.eval(
-                    _TRUNCATE_LAST_TURN_LUA,
-                    1,
-                    self.key,
-                    "1" if expect is not None else "0",
-                    (expect or "").strip(),
-                ),
-                lambda: self._fallback.truncate_last_turn(expect),
-            )
-            or 0
+        raw, via_redis = self._call_redis(
+            lambda: self.client.eval(
+                _TRUNCATE_LAST_TURN_LUA,
+                1,
+                self.key,
+                "1" if expect is not None else "0",
+                (expect or "").strip(),
+            ),
+            lambda: self._fallback.truncate_last_turn(expect),
         )
+        count = int(raw or 0)
+        if via_redis and count:
+            # Redis 删除成功时同步镜像缓存，避免 Redis 再故障时把已删除的
+            # 一轮从影子缓存读回来
+            self._fallback.truncate_last_turn(expect)
+        if count:
+            # 故障期间的消息可能还没补写进 Redis，同样要从待补写列表移除
+            self._pending = (
+                self._pending[:-count] if count <= len(self._pending) else []
+            )
         logger.info(
             "Truncated last turn from Redis memory: %s (%s messages)", self.key, count
         )

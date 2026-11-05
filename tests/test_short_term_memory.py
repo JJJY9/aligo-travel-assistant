@@ -3,6 +3,7 @@
 
 运行：python tests/test_short_term_memory.py
 """
+import json
 import os
 import sys
 
@@ -138,6 +139,136 @@ def test_redis_recovery_resets_degraded(monkeypatch):
     print("✓ Redis 恢复后清除降级标记")
 
 
+class _FlakyRedis:
+    """可切换故障的假 Redis（实现短期记忆用到的最小命令集）。"""
+
+    def __init__(self):
+        self.fail = False
+        self.data: list[str] = []
+
+    def _check(self):
+        if self.fail:
+            raise ConnectionError("redis down")
+
+    def pipeline(self):
+        client = self
+
+        class _Pipe:
+            def rpush(self, key, *values):
+                client._check()
+                client.data.extend(values)
+
+            def ltrim(self, key, start, end):
+                client._check()
+                if end == -1 and start < 0:
+                    client.data = client.data[-abs(start):]
+
+            def expire(self, key, ttl):
+                client._check()
+
+            def execute(self):
+                client._check()
+
+        return _Pipe()
+
+    def lrange(self, key, start, end):
+        # Redis 的 end 是闭区间，-1 表示最后一条（Python 切片 end 是开区间）
+        self._check()
+        data = list(self.data)
+        return data[start:] if end == -1 else data[start:end + 1]
+
+    def delete(self, key):
+        self._check()
+        self.data.clear()
+        return 1
+
+    def eval(self, script, numkeys, key, check, expected):
+        self._check()
+        if not self.data:
+            return 0
+        count = 2 if len(self.data) >= 2 else 1
+        if check == "1" and expected:
+            user_raw = self.data[-2] if count == 2 else self.data[-1]
+            if str(json.loads(user_raw).get("content", "")).strip() != expected:
+                return 0
+        del self.data[-count:]
+        return count
+
+    def llen(self, key):
+        self._check()
+        return len(self.data)
+
+    def lindex(self, key, index):
+        self._check()
+        return self.data[index]
+
+
+def test_shadow_cache_mirrors_truncate(monkeypatch):
+    """Redis 截断成功时影子缓存同步删除，故障回退不会读回已删除的一轮。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    for role, content in [
+        ("user", "Q1"),
+        ("assistant", "A1"),
+        ("user", "Q2"),
+        ("assistant", "A2"),
+    ]:
+        memory.add_message(role, content)
+    assert memory.truncate_last_turn("Q2") == 2
+
+    client.fail = True
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["Q1", "A1"]
+    print("✓ 影子缓存镜像截断，故障时不复活已删除轮次")
+
+
+def test_shadow_cache_mirrors_clear(monkeypatch):
+    """清空对话后 Redis 故障回退，影子缓存不能把已清空的对话读回来。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    memory.clear()
+
+    client.fail = True
+    assert memory.get_recent_context() == []
+    print("✓ 影子缓存镜像清空")
+
+
+def test_outage_writes_replayed_after_recovery(monkeypatch):
+    """故障期间新增的消息在 Redis 恢复后补写，上下文不丢轮次。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    client.fail = True
+    memory.add_message("user", "Q2")
+    memory.add_message("assistant", "A2")
+    assert [item["content"] for item in memory.get_recent_context()] == [
+        "Q1",
+        "A1",
+        "Q2",
+        "A2",
+    ]
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["Q1", "A1", "Q2", "A2"]
+    assert module.redis_short_term_degraded() is False
+    print("✓ 故障期消息在恢复后补写")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
@@ -154,6 +285,21 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_redis_recovery_resets_degraded(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_shadow_cache_mirrors_truncate(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_shadow_cache_mirrors_clear(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_writes_replayed_after_recovery(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")

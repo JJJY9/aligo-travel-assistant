@@ -920,8 +920,18 @@ def _get_weather_executor() -> ThreadPoolExecutor:
 
 
 def _open_long_term(user_id: str) -> Any:
-    """按当前配置打开长期记忆（JSON 或 PostgreSQL）。"""
-    return create_long_term_memory(user_id, str(MEMORY_DIR))
+    """按当前配置打开长期记忆（JSON 或 PostgreSQL）。
+
+    打开失败（数据库不可达 / 文件损坏）属于可重试的存储故障，统一映射为
+    503，避免所有调用点都抛裸 500；调用点仍负责关闭返回的 store。
+    """
+    try:
+        return create_long_term_memory(user_id, str(MEMORY_DIR))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
+        logger.warning("打开长期记忆失败（%s）：%s", user_id, exc)
+        raise HTTPException(status_code=503, detail=f"存储暂不可用：{exc}") from exc
 
 
 def _close_long_term(store: Any) -> None:
@@ -1998,9 +2008,24 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
         async with state.lock_for(user_id):
-            # 先落墓碑再删库：删除进行中到达其它实例的新请求会直接被拒绝，
-            # 避免删完后在途生成把会话写回；删除失败时撤销墓碑
-            state.mark_deleted(user_id, session_id)
+            def _exists() -> bool:
+                store = _open_long_term(user_id)
+                try:
+                    return bool(store.get_chat_history(session_id=session_id))
+                finally:
+                    _close_long_term(store)
+
+            try:
+                existed = await asyncio.to_thread(_exists)
+            except Exception as exc:  # noqa: BLE001 - 读失败统一提示
+                logger.warning("检查会话是否存在失败: %s", exc)
+                raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+
+            # 只为确实存在的会话落墓碑：不存在的 id 不写墓碑（否则 300 秒内
+            # 无法新开对话）；重复删除 / 并发删除返回 0 时保留墓碑，避免
+            # 旧 session_id 在墓碑窗口内被复活
+            if existed:
+                await asyncio.to_thread(state.mark_deleted, user_id, session_id)
 
             def _delete() -> int:
                 store = _open_long_term(user_id)
@@ -2014,12 +2039,19 @@ def create_app(model: Any = None) -> FastAPI:
                 # 慢库不能让整个事件循环（其它会话的 SSE 心跳）停住
                 removed = await asyncio.to_thread(_delete)
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
-                state.unmark_deleted(user_id, session_id)
+                if existed:
+                    # 删除失败：会话仍存在时撤销墓碑（查询也失败则保留墓碑，
+                    # 宁可短暂误判已删除，也不放开防复活保护）
+                    try:
+                        still_exists = await asyncio.to_thread(_exists)
+                    except Exception:  # noqa: BLE001 - 保守保留墓碑
+                        still_exists = False
+                    if still_exists:
+                        await asyncio.to_thread(
+                            state.unmark_deleted, user_id, session_id
+                        )
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
-            if removed == 0:
-                # 不存在 / 没有消息的会话不留下墓碑，避免该 id 在 300 秒内无法新开对话
-                state.unmark_deleted(user_id, session_id)
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}
@@ -2028,7 +2060,7 @@ def create_app(model: Any = None) -> FastAPI:
     async def delete_last_turn(
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
-        expect: str | None = Query(default=None, max_length=20000),
+        expect: str | None = Query(default=None, max_length=6000),
     ) -> dict[str, Any]:
         """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。
 
@@ -2080,7 +2112,9 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         rate_headers = _enforce_rate_limit(state, payload.user_id, request)
         async with state.lock_for(payload.user_id):
-            if state.is_recently_deleted(payload.user_id, payload.session_id):
+            if await asyncio.to_thread(
+                state.is_recently_deleted, payload.user_id, payload.session_id
+            ):
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
@@ -2119,7 +2153,9 @@ def create_app(model: Any = None) -> FastAPI:
             task: asyncio.Task[None] | None = None
             heartbeat: asyncio.Task[None] | None = None
             try:
-                if state.is_recently_deleted(payload.user_id, payload.session_id):
+                if await asyncio.to_thread(
+                    state.is_recently_deleted, payload.user_id, payload.session_id
+                ):
                     yield (
                         "data: "
                         + json.dumps(
