@@ -54,6 +54,9 @@ class DistributedLock:
         self._heartbeat_lock = threading.Lock()
         # 最近一次 acquire 是否因 Redis 不可用回退到进程内锁
         self.degraded = False
+        # 持有期间是否在续期时发现锁已失效（过期后被其它实例拿走）：
+        # 此时互斥已不成立，长任务不能再假定自己是唯一执行者
+        self.lost = False
 
     def _get_client(self) -> Any:
         """返回 Redis 客户端；启动时不可用则通过工厂重试获取。"""
@@ -88,6 +91,7 @@ class DistributedLock:
             self.degraded = False
             return None
         self.degraded = False
+        self.lost = False
         self._start_heartbeat(token)
         return token
 
@@ -120,9 +124,21 @@ class DistributedLock:
                 if client is None:
                     continue
                 try:
-                    client.eval(_RENEW_SCRIPT, 1, self._key, token, self._ttl_sec)
+                    renewed = client.eval(
+                        _RENEW_SCRIPT, 1, self._key, token, self._ttl_sec
+                    )
                 except Exception as exc:  # noqa: BLE001 - 续期失败下次再试
                     logger.warning("续期 Redis 互斥锁失败：%s", exc)
+                    continue
+                # EXPIRE 返回 0：键已过期（被其它实例重新获取）或 token 已不匹配。
+                # 此时本进程已不是唯一持有者，继续执行会与另一个实例并发。
+                if not renewed:
+                    self.lost = True
+                    logger.warning(
+                        "Redis 互斥锁在持有期间失效（%s），互斥保护已丢失", self._key
+                    )
+                    stop.set()
+                    return
 
         thread = threading.Thread(
             target=_renew, name=f"aligo-lock-{self._key}", daemon=True

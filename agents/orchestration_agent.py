@@ -24,7 +24,7 @@ from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.llm_resilience import retry_with_backoff
-from utils.preference_values import has_preference_value
+from utils.preference_values import has_preference_value, merge_preference_value
 
 logger = logging.getLogger(__name__)
 
@@ -306,19 +306,11 @@ class OrchestrationAgent(AgentBase):
                         continue
                     action = str(item.get("action") or "replace").strip().lower()
                     if action in {"append", "add", "追加"}:
-                        existing = preferences.get(pref_type)
-                        if isinstance(existing, list):
-                            values = list(existing)
-                            if value not in values:
-                                values.append(value)
-                            preferences[pref_type] = values
-                        elif has_preference_value(existing):
-                            if existing == value:
-                                preferences[pref_type] = [value]
-                            else:
-                                preferences[pref_type] = [existing, value]
-                        else:
-                            preferences[pref_type] = [value]
+                        # 与持久化路径一致：列表值逐项合并，不能把整个列表
+                        # 塞进列表（嵌套列表会让后续 ", ".join 报错）
+                        preferences[pref_type] = merge_preference_value(
+                            preferences.get(pref_type), value
+                        )
                     else:
                         preferences[pref_type] = value
             elif isinstance(raw, dict):

@@ -949,6 +949,24 @@ def test_summary_cache_avoids_repeated_calls():
     print("✓ 长期记忆总结按指纹缓存")
 
 
+def test_summary_cache_shared_across_max_messages():
+    """CLI(50) 与对话 / 技能(30) 的总结调用必须共用缓存，不能重复调用 LLM。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-cache-window", "s-window", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term.add_chat_message("user", "我之前去了上海", "s-other")
+    first = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    second = asyncio.run(manager.get_long_term_summary_async(max_messages=50))
+    assert first and first == second
+    assert model.calls == 1, "不同 max_messages 不应让总结缓存互相失效"
+    print("✓ 不同 max_messages 共用总结缓存")
+
+
 def test_recovered_postgres_logs_fallback_warning(monkeypatch):
     """PG 从故障恢复、会话从 JSON 切回 PG 时记录「故障期数据未合并」警告。"""
     from config import STORAGE_CONFIG
@@ -1163,6 +1181,7 @@ if __name__ == "__main__":
     test_summary_invalidated_by_trip_edit()
     test_embedding_model_shared(pytest.MonkeyPatch())
     test_summary_cache_avoids_repeated_calls()
+    test_summary_cache_shared_across_max_messages()
     test_summary_fingerprint_detects_history_replacement()
     test_summary_prompt_is_budgeted_and_formats_nulls()
     test_summary_failure_cooldown()

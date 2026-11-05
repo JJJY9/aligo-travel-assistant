@@ -51,24 +51,49 @@ def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
     return bool(lines) and all(_is_title_like(line, min_chars) for line in lines)
 
 
-def _merge_short_chunks(chunks: list[str], min_chars: int = 30) -> list[str]:
-    """把孤立的标题块并入相邻块。
+def _merge_short_chunks(
+    chunks: list[str], min_chars: int = 30, max_chars: int | None = None
+) -> list[str]:
+    """把孤立的标题块并入相邻块（``max_chars`` 给定时保证合并后不超长）。
 
     纯标题块本身没有知识内容，却会因为与查询字面高度相似而挤占检索名额。
     注意只合并「标题形态」的块（单行、无句读），避免误合并短问答段落；
     连续多行标题（如总标题 + 节标题）要一直挂起到遇到正文为止。
+    超长上限必须兜住：连续几十行目录式标题累计起来会超过嵌入窗口，
+    尾部内容会再次变得不可检索。
     """
     merged: list[str] = []
     pending = ""
     for chunk in chunks:
-        candidate = f"{pending}\n{chunk}" if pending else chunk
-        if _is_title_block(candidate, min_chars):
-            pending = candidate
+        if _is_title_block(chunk, min_chars):
+            if max_chars is not None and len(chunk) > max_chars:
+                # 单个标题块本身超长（如几十行目录）：按行切开，不能整块挂起
+                if pending:
+                    merged.append(pending)
+                    pending = ""
+                merged.extend(_split_long_paragraph(chunk, max_chars))
+                continue
+            candidate = f"{pending}\n{chunk}" if pending else chunk
+            if max_chars is not None and len(candidate) > max_chars:
+                merged.append(pending)
+                pending = chunk
+            else:
+                pending = candidate
             continue
-        pending = ""
-        merged.append(candidate)
+        if pending:
+            candidate = f"{pending}\n{chunk}"
+            if max_chars is not None and len(candidate) > max_chars:
+                merged.append(pending)
+                merged.append(chunk)
+            else:
+                merged.append(candidate)
+            pending = ""
+        else:
+            merged.append(chunk)
     if pending:
-        if merged:
+        if merged and (
+            max_chars is None or len(merged[-1]) + 1 + len(pending) <= max_chars
+        ):
             merged[-1] = f"{merged[-1]}\n{pending}"
         else:
             merged.append(pending)
@@ -113,4 +138,4 @@ def split_text(text: str, max_chars: int = 400) -> list[str]:
         current = f"{current}\n{paragraph}" if current else paragraph
 
     flush()
-    return _merge_short_chunks(chunks)
+    return _merge_short_chunks(chunks, max_chars=max_chars)

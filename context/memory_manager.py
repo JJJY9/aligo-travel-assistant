@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 _SUMMARY_MESSAGE_MAX_CHARS = 1200
 _SUMMARY_TOTAL_MAX_CHARS = 24000
 _SUMMARY_FAILURE_COOLDOWN_SEC = 60.0
+# 跨会话总结的固定窗口：CLI（50）、对话与 memory-query 技能（30）等不同
+# 调用方必须共用同一份缓存，否则同一轮里不同 max_messages 会让缓存互相
+# 失效、每次记忆查询都重复调用一次总结 LLM
+_SUMMARY_WINDOW_MESSAGES = 50
 
 
 class MemoryManager:
@@ -208,7 +212,9 @@ class MemoryManager:
         使用LLM总结长期聊天历史（异步版本）
 
         Args:
-            max_messages: 最多总结的消息数量
+            max_messages: 兼容旧接口的提示值；总结窗口固定为
+                ``_SUMMARY_WINDOW_MESSAGES``，保证 CLI / 对话 / memory-query
+                技能等不同调用方共享同一份缓存（不同窗口会让缓存互相失效）
 
         Returns:
             总结后的文本
@@ -216,15 +222,14 @@ class MemoryManager:
         if not self.llm_model:
             return ""
 
-        # 获取长期聊天历史（排除当前会话）。只取最后 max_messages 条会被
+        # 获取长期聊天历史（排除当前会话）。只取最后固定窗口条会被
         # 当前会话自身占满（长会话几十轮后其它会话历史永远为空），因此按
-        # 「当前会话消息数 + max_messages」取窗口，保证至少有 max_messages
-        # 条其它会话的消息可供总结。
+        # 「当前会话消息数 + 窗口」取数，保证至少有窗口条其它会话的消息。
         own_messages = len(
             self.long_term.get_chat_history(session_id=self.session_id)
         )
         all_history = self.long_term.get_chat_history(
-            limit=max_messages + own_messages
+            limit=_SUMMARY_WINDOW_MESSAGES + own_messages
         )
         history_from_other_sessions = [
             msg for msg in all_history
@@ -242,7 +247,7 @@ class MemoryManager:
 
         # 指纹要能感知「其它会话的消息被删除后由更旧消息补位」：
         # 条数与最后时间戳可能都不变，必须比较窗口内每条消息的身份
-        window = history_from_other_sessions[-max_messages:]
+        window = history_from_other_sessions[-_SUMMARY_WINDOW_MESSAGES:]
         history_signature = tuple(
             (
                 str(item.get("session_id") or ""),
@@ -268,7 +273,6 @@ class MemoryManager:
             for trip in trip_history
         )
         fingerprint = (
-            max_messages,
             len(window),
             history_signature,
             len(trip_history),

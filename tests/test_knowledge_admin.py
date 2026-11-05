@@ -407,6 +407,59 @@ def test_update_document_splits_long_content(monkeypatch):
     print("✓ 长内容自动拆分（更新）")
 
 
+def test_chunk_documents_overrides_stale_part_metadata(monkeypatch):
+    """编辑旧分片时传入的旧 part/parts 必须被实际分片编号覆盖。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.documents = None
+
+        def add_documents(self, documents):
+            self.documents = documents
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    knowledge_admin.add_document(
+        "第一段内容。" * 200, {"category": "测试", "part": "2", "parts": "9"}
+    )
+    assert [item["metadata"]["part"] for item in agent.documents] == [
+        str(index + 1) for index in range(len(agent.documents))
+    ]
+    assert all(
+        item["metadata"]["parts"] == str(len(agent.documents))
+        for item in agent.documents
+    )
+    print("✓ 分片标记覆盖旧 part/parts")
+
+
+def test_update_document_rejects_multipart_edit(monkeypatch):
+    """多分片记录缺少组标识：单条编辑会留下无法定位的旧分片，应明确拒绝。"""
+    from pathlib import Path
+
+    rows = [{"id": 7, "content": "第一段", "metadata": '{"part": "1", "parts": "3"}'}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def update_document(self, *args, **kwargs):
+            raise AssertionError("多分片记录不应进入更新流程")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(ValueError, match="多分片"):
+        knowledge_admin.update_document(7, "新内容")
+    assert not fake_client.deleted, "拒绝编辑时不应删除任何分片"
+    print("✓ 多分片知识片段拒绝单条编辑")
+
+
 def test_import_skips_existing_and_duplicate_content(monkeypatch):
     """已有内容与同批次重复内容都跳过，重复导入同一备份不会产生重复片段。"""
     from pathlib import Path
@@ -517,6 +570,8 @@ if __name__ == "__main__":
         test_add_document_splits_long_content,
         test_update_document_rewrites_content,
         test_update_document_splits_long_content,
+        test_chunk_documents_overrides_stale_part_metadata,
+        test_update_document_rejects_multipart_edit,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,
         test_query_errors_propagate,

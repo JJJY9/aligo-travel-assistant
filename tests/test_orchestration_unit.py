@@ -619,13 +619,51 @@ def test_conversation_schedule_normalization():
         {"agent_name": "itinerary_planning", "priority": 0, "reason": ""},
         {"agent_name": "information_query", "priority": 0, "reason": ""},
     ]
-    assert ConversationRuntime._orchestration_succeeded(
-        Msg(name="o", content=json.dumps({"status": "completed"}), role="assistant")
-    )
-    assert not ConversationRuntime._orchestration_succeeded(
-        Msg(name="o", content=json.dumps({"status": "partial_failure"}), role="assistant")
-    )
-    print("✓ 进度调度计划规范化 + 部分失败不计为成功")
+    print("✓ 进度调度计划规范化")
+
+
+def test_partial_failure_does_not_trip_breaker():
+    """partial_failure 是子智能体故障，不计入 LLM 熔断（避免误伤所有用户）。"""
+    from agents.conversation import ConversationRuntime
+    from utils.circuit_breaker import CircuitBreaker
+
+    runtime = object.__new__(ConversationRuntime)
+    runtime.circuit_breaker = CircuitBreaker(failure_threshold=2)
+
+    async def _result():
+        return Msg(
+            name="orchestrator",
+            content=json.dumps({"status": "partial_failure"}),
+            role="assistant",
+        )
+
+    for _ in range(5):
+        asyncio.run(runtime._call_with_resilience(_result, 0, 0.0, 0.0))
+    status = runtime.circuit_breaker.get_status()
+    assert status["state"] == "closed", status
+    assert status["failure_count"] == 0, status
+    print("✓ 部分失败不计入 LLM 熔断")
+
+
+def test_previous_preference_append_flattens_list():
+    """前序批次的 append 偏好值是列表时应逐项合并，不能产生嵌套列表。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    context = {"user_preferences": {"airlines": ["东航"]}}
+    previous = [
+        {
+            "agent_name": "preference",
+            "result": {
+                "data": {
+                    "preferences": [
+                        {"type": "airlines", "value": ["国航", "东航"], "action": "append"}
+                    ]
+                }
+            },
+        }
+    ]
+    merged = orchestrator._context_with_previous_preferences(context, previous)
+    assert merged["user_preferences"]["airlines"] == ["东航", "国航"]
+    print("✓ 前序偏好 append 列表逐项合并")
 
 
 if __name__ == "__main__":
@@ -644,4 +682,6 @@ if __name__ == "__main__":
     test_planning_runs_after_collection_and_sees_new_preferences()
     test_preference_append_action_variants()
     test_infinite_priority_is_sanitized()
+    test_partial_failure_does_not_trip_breaker()
+    test_previous_preference_append_flattens_list()
     print("\n全部通过")
