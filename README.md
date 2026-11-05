@@ -394,6 +394,7 @@ python .claude/skills/ask-question/script/init_knowledge_base.py
 
 ```bash
 python cli.py                     # 命令行界面
+python cli.py --help              # 列出一次性命令（health / doctor / weather / kb / eval 等）
 python cli.py --version           # 显示 CLI 版本后退出
 python -m webapp.server           # Web 界面：http://127.0.0.1:8000
 python -m webapp.server --version # 显示 Web 版本后退出
