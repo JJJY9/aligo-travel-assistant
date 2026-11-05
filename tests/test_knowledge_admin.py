@@ -316,6 +316,7 @@ def test_import_documents_sanitizes(monkeypatch):
     agent = _FakeAgent({"status": "success", "ids": [1, 2], "total_count": 2})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
 
+    long_content = "".join(f"第{i}段。" for i in range(500))
     result = knowledge_admin.import_documents(
         [
             {"content": "  a  ", "metadata": {"category": "x"}},
@@ -325,18 +326,85 @@ def test_import_documents_sanitizes(monkeypatch):
             {"content": False},
             {"content": 0},
             {
-                "content": "b" * 2100,
+                "content": long_content,
                 "metadata": {f"k{i}": "v" * 300 for i in range(15)},
             },
         ]
     )
     assert result == {"imported": 2, "skipped": 5}
     sent = agent.calls[0]
-    assert [item["content"] for item in sent] == ["a", "b" * 2000]
+    assert sent[0]["content"] == "a"
+    assert all(len(item["content"]) <= 400 for item in sent)
+    assert "".join(item["content"] for item in sent[1:]) == long_content[:2000]
     assert all(item["content"] not in ("None", "False", "0") for item in sent)
     assert len(sent[1]["metadata"]) == 10
     assert max(len(value) for value in sent[1]["metadata"].values()) == 200
-    print("✓ 导入知识片段（跳过空项 / 非字符串内容 / 截断超长字段）")
+    print("✓ 导入知识片段（跳过空项 / 非字符串内容 / 截断超长字段 / 长内容拆分）")
+
+
+def test_add_document_splits_long_content(monkeypatch):
+    """长内容按语义边界拆成 ≤400 字片段，返回分片数。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.documents = None
+
+        def add_documents(self, documents):
+            self.documents = documents
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    content = "第一段内容。" * 200
+    result = knowledge_admin.add_document(content, {"category": "测试"})
+    assert result["parts"] == len(agent.documents)
+    assert len(agent.documents) > 1
+    assert all(len(item["content"]) <= 400 for item in agent.documents)
+    assert all(item["metadata"]["category"] == "测试" for item in agent.documents)
+    assert [item["metadata"]["part"] for item in agent.documents] == [
+        str(index + 1) for index in range(len(agent.documents))
+    ]
+    print("✓ 长内容自动拆分（新增）")
+
+
+def test_update_document_splits_long_content(monkeypatch):
+    """长内容更新时首片覆盖原 id，其余分片以新记录追加。"""
+    from pathlib import Path
+
+    rows = [{"id": 7, "content": "旧内容", "metadata": "{}"}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+            self.added = None
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+        def add_documents(self, documents):
+            self.added = documents
+            return {"status": "success", "ids": [8, 9], "total_count": 3}
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.update_document(7, "长" * 1000, {"category": "测试"})
+    assert result["id"] == 7 and result["parts"] > 1
+    assert agent.updated[0] == 7
+    assert len(agent.updated[1]) <= 400
+    assert agent.added, "其余分片应作为新记录追加"
+    assert all(len(item["content"]) <= 400 for item in agent.added)
+    print("✓ 长内容自动拆分（更新）")
 
 
 def test_import_skips_existing_and_duplicate_content(monkeypatch):
@@ -446,7 +514,9 @@ if __name__ == "__main__":
         test_list_categories_counts,
         test_add_document_maps_result,
         test_add_document_error_raises,
+        test_add_document_splits_long_content,
         test_update_document_rewrites_content,
+        test_update_document_splits_long_content,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,
         test_query_errors_propagate,

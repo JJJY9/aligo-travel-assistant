@@ -3493,7 +3493,7 @@ async function addKnowledgeDocument(event) {
     .forEach((button) => (button.disabled = true));
   els.kbSubmit.textContent = editingId ? "保存中…" : "添加中…";
   try {
-    await getJSON(
+    const data = await getJSON(
       editingId
         ? `/api/knowledge/documents/${encodeURIComponent(editingId)}`
         : "/api/knowledge/documents",
@@ -3504,7 +3504,12 @@ async function addKnowledgeDocument(event) {
       },
     );
     state.kbSaving = false;
-    toast(editingId ? "知识片段已更新" : "知识片段已添加");
+    const parts = Number((data && data.parts) || 0);
+    if (parts > 1) {
+      toast(`长内容已拆分为 ${parts} 条片段，可分别编辑`);
+    } else {
+      toast(editingId ? "知识片段已更新" : "知识片段已添加");
+    }
     // 提交期间用户可能继续输入下一条，只清空仍是本次提交内容的输入框
     if (els.kbContent.value.trim() === content) els.kbContent.value = "";
     if (els.kbCategory.value.trim() === category) els.kbCategory.value = "";
