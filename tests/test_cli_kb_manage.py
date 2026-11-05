@@ -24,10 +24,10 @@ def _status(available=True, reason=None):
     return data
 
 
-def _capture(func, *args):
+def _capture(func, *args, **kwargs):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = func(*args)
+        code = func(*args, **kwargs)
     return code, buf.getvalue()
 
 
@@ -77,21 +77,33 @@ def test_list_error(monkeypatch):
 
 
 def test_delete_success(monkeypatch):
-    monkeypatch.setattr(knowledge_admin, "delete_document", lambda doc_id: doc_id == 7)
+    calls = []
+
+    def fake_delete(doc_id, whole_group=False):
+        calls.append((doc_id, whole_group))
+        return doc_id == 7
+
+    monkeypatch.setattr(knowledge_admin, "delete_document", fake_delete)
     code, out = _capture(cli.run_knowledge_delete_standalone, 7)
     assert code == 0 and "已删除知识片段 #7" in out
-    print("✓ kb-delete 删除成功")
+    assert calls[-1] == (7, False)
+    gcode, gout = _capture(cli.run_knowledge_delete_standalone, 7, whole_group=True)
+    assert gcode == 0 and "已删除整组分片 #7" in gout
+    assert calls[-1] == (7, True)
+    print("✓ kb-delete 删除成功（单条 / 整组）")
 
 
 def test_delete_not_found(monkeypatch):
-    monkeypatch.setattr(knowledge_admin, "delete_document", lambda doc_id: False)
+    monkeypatch.setattr(
+        knowledge_admin, "delete_document", lambda doc_id, whole_group=False: False
+    )
     code, out = _capture(cli.run_knowledge_delete_standalone, 99)
     assert code == 1 and "片段不存在" in out
     print("✓ kb-delete 片段不存在返回 1")
 
 
 def test_delete_error(monkeypatch):
-    def boom(doc_id):
+    def boom(doc_id, whole_group=False):
         raise RuntimeError("Milvus 故障")
 
     monkeypatch.setattr(knowledge_admin, "delete_document", boom)

@@ -3310,10 +3310,17 @@ function knowledgeRowActions(doc) {
   edit.addEventListener("click", () => startEditKnowledge(doc));
   const del = document.createElement("button");
   del.type = "button";
-  del.title = "删除片段";
-  del.setAttribute("aria-label", `删除知识片段 ${doc.id}`);
+  const delParts = Number(doc.metadata && doc.metadata.parts);
+  const delGroup = delParts > 1 && Boolean(doc.metadata && doc.metadata.group);
+  del.title = delGroup ? `删除整组（${delParts} 片）` : "删除片段";
+  del.setAttribute(
+    "aria-label",
+    delGroup
+      ? `删除知识片段 ${doc.id} 所在的整组分片（共 ${delParts} 片）`
+      : `删除知识片段 ${doc.id}`,
+  );
   del.innerHTML = icon("trash");
-  del.addEventListener("click", () => removeKnowledgeDocument(doc.id));
+  del.addEventListener("click", () => removeKnowledgeDocument(doc));
   actions.append(edit, del);
   return actions;
 }
@@ -3440,22 +3447,34 @@ function renderSemanticResults(query, results) {  els.kbList.innerHTML = "";
   els.kbList.appendChild(back);
 }
 
-async function removeKnowledgeDocument(docId) {
+async function removeKnowledgeDocument(doc) {
+  const docId = Number(typeof doc === "object" && doc ? doc.id : doc);
+  const metadata = (typeof doc === "object" && doc && doc.metadata) || {};
+  const parts = Number(metadata.parts);
+  const wholeGroup = parts > 1 && Boolean(metadata.group);
   if (state.kbSaving) {
     toast("正在保存知识片段，请稍候");
     return;
   }
-  if (!window.confirm(`删除知识片段 #${docId}？`)) return;
+  const label = wholeGroup
+    ? `整组分片（#${docId}，共 ${parts} 片）`
+    : `知识片段 #${docId}`;
+  if (!window.confirm(`删除${label}？`)) return;
   if (state.kbDeleting.has(docId)) return;
   state.kbDeleting.add(docId);
   const row = els.kbList.querySelector(`.kb-row[data-id="${docId}"]`);
-  const button = row?.querySelector('button[title="删除片段"]');
+  const button = row?.querySelector(
+    'button[title="删除片段"], button[title^="删除整组"]',
+  );
   if (button) button.disabled = true;
   let removed = false;
   try {
-    await getJSON(`/api/knowledge/documents/${docId}`, { method: "DELETE" });
+    await getJSON(
+      `/api/knowledge/documents/${docId}${wholeGroup ? "?group=1" : ""}`,
+      { method: "DELETE" },
+    );
     removed = true;
-    toast("知识片段已删除");
+    toast(wholeGroup ? "已删除整组分片" : "知识片段已删除");
   } catch (error) {
     if (error.status === 404) {
       removed = true;
@@ -3543,7 +3562,7 @@ async function addKnowledgeDocument(event) {
     state.kbSaving = false;
     const parts = Number((data && data.parts) || 0);
     if (parts > 1) {
-      toast(`长内容已拆分为 ${parts} 条片段（多分片记录请整组删除后重加，暂不支持单条编辑）`);
+      toast(`长内容已拆分为 ${parts} 条片段（可在列表中整组删除，暂不支持单条编辑）`);
     } else {
       toast(editingId ? "知识片段已更新" : "知识片段已添加");
     }

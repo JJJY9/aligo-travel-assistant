@@ -1655,12 +1655,15 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.delete("/api/knowledge/documents/{doc_id}")
     def knowledge_delete(
-        request: Request, response: Response, doc_id: int = ApiPath(..., ge=1)
+        request: Request,
+        response: Response,
+        doc_id: int = ApiPath(..., ge=1),
+        group: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """按 id 删除知识片段。"""
+        """按 id 删除知识片段；``group=1`` 时连同同组分片一起删除。"""
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            removed = delete_document(doc_id)
+            removed = delete_document(doc_id, whole_group=group)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
@@ -1668,7 +1671,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
         if not removed:
             raise HTTPException(status_code=404, detail="知识片段不存在")
-        return {"id": doc_id, "deleted": True}
+        return {"id": doc_id, "deleted": True, "group": bool(group)}
 
     @app.get("/api/knowledge/export")
     def knowledge_export(request: Request) -> Response:

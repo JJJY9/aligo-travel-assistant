@@ -8,6 +8,7 @@
 
 运行：python tests/test_knowledge_admin.py
 """
+import json
 import os
 import sys
 
@@ -433,6 +434,8 @@ def test_chunk_documents_overrides_stale_part_metadata(monkeypatch):
     assert [item["metadata"]["part"] for item in agent.documents] == [
         str(index + 1) for index in range(len(agent.documents))
     ]
+    groups = {item["metadata"].get("group") for item in agent.documents}
+    assert len(groups) == 1 and "" not in groups, "一次拆分应共享同一个 group"
     assert all(
         item["metadata"]["parts"] == str(len(agent.documents))
         for item in agent.documents
@@ -458,6 +461,72 @@ def test_update_document_rejects_multipart_edit(monkeypatch):
         knowledge_admin.update_document(7, "新内容")
     assert not fake_client.deleted, "拒绝编辑时不应删除任何分片"
     print("✓ 多分片知识片段拒绝单条编辑")
+
+
+def test_update_document_replaces_grouped_multipart(monkeypatch):
+    """带 group 的多分片记录按整组替换：更新目标分片后删除其余旧分片。"""
+    from pathlib import Path
+
+    def _meta(part):
+        return json.dumps({"part": str(part), "parts": "3", "group": "g-old", "category": "测试"})
+
+    rows = [
+        {"id": 1, "content": "第一段", "metadata": _meta(1)},
+        {"id": 2, "content": "第二段", "metadata": _meta(2)},
+        {"id": 3, "content": "第三段", "metadata": _meta(3)},
+        {"id": 9, "content": "无关片段", "metadata": "{}"},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+            self.added = None
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+        def add_documents(self, documents):
+            self.added = documents
+            return {"status": "success", "ids": [10, 11], "total_count": 2}
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.update_document(2, "长" * 1000, {"category": "测试"})
+    assert agent.updated[0] == 2
+    assert result["parts"] > 1
+    assert result["removed_ids"] == [1, 3], "整组替换后应删除其余旧分片"
+    assert fake_client.deleted == [1, 3]
+    new_group = agent.updated[2].get("group")
+    assert new_group and new_group != "g-old", "替换后的分片应使用新的组标识"
+    assert agent.updated[2]["part"] == "1"
+    assert all(item["metadata"].get("group") == new_group for item in agent.added)
+    print("✓ 带组标识的多分片记录整组替换")
+
+
+def test_delete_document_whole_group(monkeypatch):
+    """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
+    def _meta(part, group="g-del"):
+        return json.dumps({"part": str(part), "parts": "3", "group": group})
+
+    rows = [
+        {"id": 1, "content": "第一段", "metadata": _meta(1)},
+        {"id": 2, "content": "第二段", "metadata": _meta(2)},
+        {"id": 3, "content": "第三段", "metadata": _meta(3)},
+        {"id": 4, "content": "旧分片", "metadata": '{"part": "1", "parts": "3"}'},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+
+    assert knowledge_admin.delete_document(2, whole_group=True) is True
+    assert sorted(fake_client.deleted) == [1, 2, 3], "应删除同组全部分片"
+    assert knowledge_admin.delete_document(4, whole_group=True) is True
+    assert fake_client.deleted == [1, 2, 3, 4], "无 group 的旧记录只删除当前片段"
+    assert knowledge_admin.delete_document(99) is False
+    print("✓ 知识分片整组删除")
 
 
 def test_import_skips_existing_and_duplicate_content(monkeypatch):
@@ -572,6 +641,8 @@ if __name__ == "__main__":
         test_update_document_splits_long_content,
         test_chunk_documents_overrides_stale_part_metadata,
         test_update_document_rejects_multipart_edit,
+        test_update_document_replaces_grouped_multipart,
+        test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,
         test_query_errors_propagate,

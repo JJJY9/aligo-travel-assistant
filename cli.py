@@ -1422,8 +1422,10 @@ def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
     return 0
 
 
-def run_knowledge_delete_standalone(doc_id: int) -> int:
-    """删除一个知识片段（用于 `python cli.py kb-delete <id>`）。
+def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> int:
+    """删除一个知识片段（用于 `python cli.py kb-delete <id> [--group]`）。
+
+    ``--group`` 时连同同组分片一起删除（仅新拆分、带 group 元数据的记录）。
 
     Returns:
         0 删除成功；1 片段不存在或删除失败
@@ -1431,14 +1433,14 @@ def run_knowledge_delete_standalone(doc_id: int) -> int:
     from utils.knowledge_admin import delete_document
 
     try:
-        removed = delete_document(doc_id)
+        removed = delete_document(doc_id, whole_group=whole_group)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         print(f"删除失败：{exc}")
         return 1
     if not removed:
         print(f"片段不存在：#{doc_id}")
         return 1
-    print(f"已删除知识片段 #{doc_id}")
+    print(f"已删除{'整组分片' if whole_group else '知识片段'} #{doc_id}")
     return 0
 
 
@@ -2225,10 +2227,20 @@ def main():
             keywords = sys.argv[2] if len(sys.argv) > 2 else ""
             sys.exit(run_knowledge_list_standalone(keywords))
         if arg == "kb-delete":
-            if len(sys.argv) != 3 or not sys.argv[2].isdigit():
-                print("用法：python cli.py kb-delete <id>")
+            args = sys.argv[2:]
+            if (
+                not args
+                or not args[0].isdigit()
+                or len(args) > 2
+                or any(extra != "--group" for extra in args[1:])
+            ):
+                print("用法：python cli.py kb-delete <id> [--group]")
                 sys.exit(2)
-            sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
+            sys.exit(
+                run_knowledge_delete_standalone(
+                    int(args[0]), whole_group="--group" in args[1:]
+                )
+            )
         if arg == "preferences":
             if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py preferences <user_id>")
