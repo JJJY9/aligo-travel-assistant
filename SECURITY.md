@@ -16,7 +16,11 @@
 
 - 设置 `REDIS_URL`：短期记忆与限流计数（用户 / IP / 知识库三个桶）多实例共享，运行中 Redis 故障会回退进程内实现
 - 设置 `DATABASE_URL`：长期记忆、偏好、行程与会话元数据使用 PostgreSQL；多实例部署不要使用默认 JSON 后端
-- 反向代理后设置 `TRUST_PROXY_HEADERS=1`，并让代理**覆盖写入** `X-Forwarded-For`（而不是追加客户端自带值）；否则限流会把所有用户当成同一个代理 IP
+- 反向代理后设置 `TRUST_PROXY_HEADERS=1`，并让代理**覆盖写入** `X-Forwarded-For`（应用取第一个地址；添加而不是覆盖会让客户端自带的伪造值排在前面）：
+  ```nginx
+  proxy_set_header X-Forwarded-For $remote_addr;
+  ```
+  不要使用 `$proxy_add_x_forwarded_for` 追加模式。多层代理时请让最外层代理覆盖该头；否则客户端可以伪造 IP 绕过 IP 限流桶。
 - 限制知识库维护接口（写入 / 导入 / 导出）的访问范围，并按部署规模调整 `CHAT_RATE_LIMIT` / `CHAT_RATE_LIMIT_IP` / `KB_RATE_LIMIT`
 - 评估 Milvus Lite 单进程文件锁与本地 JSON 存储在并发 / 多实例场景下的限制（见 README「已知限制」）；共享向量库需替换为 Milvus 服务端部署
 
