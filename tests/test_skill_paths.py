@@ -6,8 +6,12 @@
 import os
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 没有 tomllib
+    tomllib = None  # type: ignore[assignment]
 
 import pytest
 
@@ -49,6 +53,8 @@ def test_prefix_fallback_for_installed_wheel(monkeypatch):
 
 def test_wheel_data_files_cover_skill_code():
     """pyproject 的 data-files 必须覆盖全部技能代码与声明，且不包含运行时数据。"""
+    if tomllib is None:
+        pytest.skip("Python 3.10 无 tomllib；打包清单在 Python 3.12 CI 校验")
     with open(Path(project_root) / "pyproject.toml", "rb") as handle:
         pyproject = tomllib.load(handle)
     data_files = pyproject["tool"]["setuptools"]["data-files"]
