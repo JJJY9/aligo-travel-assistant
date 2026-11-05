@@ -1093,14 +1093,22 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/metrics")
     def metrics() -> dict[str, Any]:
-        """进程内请求指标：请求计数 / 状态分布 / 平均与最大耗时、熔断器状态。
+        """进程内请求指标与限流后端信息。
 
-        多进程 / 多实例部署时各进程独立统计。
+        多进程 / 多实例部署时请求指标各进程独立统计；限流在配置 Redis 后共享。
         """
+        rate_limiter = state.rate_limiter
         return {
             "requests": REQUEST_METRICS.snapshot(),
             "circuit_breaker": state.breaker.get_status(),
             "sessions_cached": len(state.sessions),
+            "rate_limit": {
+                "backend": getattr(rate_limiter, "backend", "memory"),
+                "degraded": bool(getattr(rate_limiter, "degraded", False)),
+                "user_limit": rate_limiter.limit,
+                "ip_limit": state.ip_limiter.limit,
+                "window_sec": rate_limiter.window_sec,
+            },
         }
 
     @app.get("/api/doctor")
