@@ -3426,6 +3426,18 @@ def test_knowledge_document_write_api(monkeypatch):
     assert changed.status_code == 200
     assert changed.json()["id"] == 7
     assert updated["call"] == (7, "更新后的知识", {"category": "交通"})
+    # 更新允许整份文档（≤20000 字，整组编辑用）；新增仍限制 2000 字
+    long_update = client.put(
+        "/api/knowledge/documents/7", json={"content": "长" * 15000}
+    )
+    assert long_update.status_code == 200
+    assert len(updated["call"][1]) == 15000
+    assert (
+        client.post(
+            "/api/knowledge/documents", json={"content": "长" * 2001}
+        ).status_code
+        == 422
+    )
     assert (
         client.put("/api/knowledge/documents/7", json={"content": ""}).status_code
         == 422
@@ -3446,6 +3458,34 @@ def test_knowledge_document_write_api(monkeypatch):
         == 404
     )
     print("✓ /api/knowledge/documents 新增 / 更新 / 删除接口")
+
+
+def test_knowledge_group_document_api(monkeypatch):
+    """整组文档回填接口：整篇内容 / 404 / 503。"""
+    from webapp import server as server_module
+
+    client = _client()
+    monkeypatch.setattr(
+        server_module,
+        "get_document_group",
+        lambda doc_id: (
+            {"id": doc_id, "group": "g", "parts": 2, "content": "第一段\n第二段"}
+            if doc_id == 7
+            else None
+        ),
+    )
+    ok = client.get("/api/knowledge/documents/7/group")
+    assert ok.status_code == 200
+    assert ok.json()["content"] == "第一段\n第二段"
+    assert ok.json()["parts"] == 2
+    assert client.get("/api/knowledge/documents/8/group").status_code == 404
+
+    def boom(doc_id):
+        raise RuntimeError("milvus down")
+
+    monkeypatch.setattr(server_module, "get_document_group", boom)
+    assert client.get("/api/knowledge/documents/7/group").status_code == 503
+    print("✓ /api/knowledge/documents/{id}/group 整组回填")
 
 
 def test_knowledge_search_api(monkeypatch):
@@ -3900,6 +3940,11 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_knowledge_document_write_api(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_knowledge_group_document_api(_mp)
     finally:
         _mp.undo()
     _mp = pytest.MonkeyPatch()

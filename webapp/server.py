@@ -62,6 +62,7 @@ from utils.knowledge_admin import (
     add_document,
     delete_document,
     export_documents,
+    get_document_group,
     import_documents,
     list_categories,
     list_documents,
@@ -409,6 +410,12 @@ class KnowledgeDocumentPayload(BaseModel):
     metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] = Field(
         default_factory=dict, max_length=10
     )
+
+
+class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
+    """更新知识片段：支持整份文档（整组）编辑后按 400 字重新拆分。"""
+
+    content: str = Field(min_length=1, max_length=20000)
 
 
 class KnowledgeImportPayload(BaseModel):
@@ -1662,7 +1669,7 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.put("/api/knowledge/documents/{doc_id}")
     def knowledge_update(
-        payload: KnowledgeDocumentPayload,
+        payload: KnowledgeUpdatePayload,
         request: Request,
         response: Response,
         doc_id: int = ApiPath(..., ge=1),
@@ -1683,6 +1690,25 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("更新知识片段失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"更新失败：{exc}") from exc
+
+    @app.get("/api/knowledge/documents/{doc_id}/group")
+    def knowledge_document_group(
+        request: Request, response: Response, doc_id: int = ApiPath(..., ge=1)
+    ) -> dict[str, Any]:
+        """返回片段所属的整篇文档（多分片按 part 拼接），供整份编辑回填。"""
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        try:
+            result = get_document_group(doc_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("读取整组知识文档失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"读取失败：{exc}") from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="知识片段不存在")
+        return result
 
     @app.delete("/api/knowledge/documents/{doc_id}")
     def knowledge_delete(

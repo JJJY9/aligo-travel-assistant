@@ -445,6 +445,51 @@ def _regroup_exported_documents(
     return merged, skipped
 
 
+def get_document_group(doc_id: int) -> dict[str, Any] | None:
+    """返回片段所属整篇文档（多分片按 part 顺序拼接）与分片数。
+
+    不存在返回 None；单条 / 无 group 的旧分片返回其自身内容。供面板
+    「编辑整份文档」回填：整组保存时由 ``update_document`` 整组替换。
+    """
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    parts, group = _document_info(client, int(doc_id))
+    if parts == 0:
+        return None
+    if not group:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f"id == {int(doc_id)}",
+            output_fields=["content"],
+            limit=1,
+        )
+        content = str(rows[0].get("content", "")) if rows else ""
+        return {"id": int(doc_id), "group": "", "parts": parts, "content": content}
+    pieces: list[tuple[int, str]] = []
+    for member in _group_member_ids(client, group):
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f"id == {member}",
+            output_fields=["content", "metadata"],
+            limit=1,
+        )
+        if not rows:
+            continue
+        meta = _parse_metadata(rows[0].get("metadata"))
+        try:
+            part_no = int(meta.get("part") or 0)
+        except (TypeError, ValueError):
+            part_no = 0
+        pieces.append((part_no, str(rows[0].get("content", ""))))
+    pieces.sort(key=lambda pair: pair[0])
+    return {
+        "id": int(doc_id),
+        "group": group,
+        "parts": len(pieces) or parts,
+        "content": "\n".join(text for _, text in pieces),
+    }
+
+
 def _existing_contents() -> set[str]:
     """库中全部片段的内容集合（全量扫描，不受单页 16384 条限制）。"""
     return {
