@@ -20,9 +20,8 @@ from utils.text_chunker import split_text
 
 logger = logging.getLogger(__name__)
 
-# 单次查询上限（Milvus query 的 limit 上限为 16384），本地知识库远小于该规模
-_MAX_SCAN = 16384
 # 导入时每次嵌入 / 插入的条数，控制大文件的峰值内存
+# （全量扫描 query_iterator 也用它作为每批行数）
 _IMPORT_CHUNK = 500
 # 单条内容超过该长度时按语义边界拆片：嵌入模型只编码前 512 token
 # （约 400 个汉字），更长的尾部内容对检索完全不可见
@@ -98,6 +97,9 @@ def list_documents(
 ) -> dict[str, Any]:
     """列出知识片段（按 id 倒序，可按内容 / 元数据 / 分类过滤）。
 
+    全量扫描（``query_iterator``）后在内存中排序 / 过滤 / 分页：单次 query
+    受 16384 条上限约束，直接用 offset 翻页在更大的集合上会翻不到后面的行。
+
     Returns:
         {"total": int, "items": [{"id", "content", "metadata"}]}
 
@@ -107,12 +109,6 @@ def list_documents(
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    rows = client.query(
-        collection_name=COLLECTION_NAME,
-        filter="id >= 0",
-        output_fields=["id", "content", "metadata"],
-        limit=_MAX_SCAN,
-    )
 
     documents: list[dict[str, Any]] = [
         {
@@ -120,7 +116,7 @@ def list_documents(
             "content": str(row.get("content", "")),
             "metadata": _parse_metadata(row.get("metadata")),
         }
-        for row in rows or []
+        for row in _iter_all_rows(client)
     ]
     documents.sort(key=lambda item: item["id"], reverse=True)
 
@@ -149,7 +145,8 @@ def list_documents(
 
 def list_categories() -> list[dict[str, Any]]:
     """统计知识片段的分类分布（供维护面板的筛选下拉框使用）。"""
-    items = list_documents(limit=_MAX_SCAN, offset=0)["items"]
+    # 分类统计要覆盖全部片段（列表已全量扫描，这里只是不设分页上限）
+    items = list_documents(limit=10**9, offset=0)["items"]
     counts: dict[str, int] = {}
     for item in items:
         category = str(item.get("metadata", {}).get("category", "")).strip()

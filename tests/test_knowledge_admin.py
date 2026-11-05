@@ -120,6 +120,21 @@ def test_list_documents_parses_sorts_and_filters(monkeypatch):
     print("✓ 知识片段列表（解析 / 排序 / 过滤 / 分类 / 分页）")
 
 
+def test_list_documents_pages_full_scan(monkeypatch):
+    """列表翻页走全量扫描 + 内存分页，不受单次 query 上限影响。"""
+    rows = [
+        {"id": index, "content": f"c{index}", "metadata": "{}"}
+        for index in range(1, 26)
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 7)  # 迭代器多批次
+    page = knowledge_admin.list_documents(limit=5, offset=20)
+    assert page["total"] == 25
+    assert [item["id"] for item in page["items"]] == [5, 4, 3, 2, 1]
+    print("✓ 列表翻页（全量扫描 / 多批次）")
+
+
 def test_list_categories_counts(monkeypatch):
     rows = [
         {"id": 4, "content": "住宿标准 A", "metadata": '{"category": "住宿"}'},
@@ -224,6 +239,9 @@ def test_delete_document_checks_existence(monkeypatch):
 
 class _BrokenMilvusClient(_FakeMilvusClient):
     def query(self, *args, **kwargs):
+        raise RuntimeError("collection is in state 'released'")
+
+    def query_iterator(self, *args, **kwargs):
         raise RuntimeError("collection is in state 'released'")
 
 
@@ -333,7 +351,7 @@ def test_export_documents_sorted_and_stripped(monkeypatch):
 
 
 def test_export_not_truncated_by_default_page(monkeypatch):
-    """导出必须取全量（_MAX_SCAN），不能退回列表默认分页（20 条）。"""
+    """导出必须取全量（全量扫描），不能退回列表默认分页（20 条）。"""
     rows = [
         {"id": index, "content": f"c{index}", "metadata": "{}"}
         for index in range(1, 26)
@@ -1043,6 +1061,7 @@ def test_import_chunks_large_documents(monkeypatch):
 if __name__ == "__main__":
     for case in (
         test_list_documents_parses_sorts_and_filters,
+        test_list_documents_pages_full_scan,
         test_list_categories_counts,
         test_add_document_maps_result,
         test_add_document_error_raises,
