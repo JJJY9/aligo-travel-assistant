@@ -555,7 +555,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
 - 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、技能目录（发现数量）、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
 - 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径、平均与最大耗时、熔断器状态、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP 额度配置（请求指标多进程各自统计）。
-- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试。知识库写入 / 导入 / 语义检索会触发嵌入模型推理，按客户端 IP 单独限流（默认 **60 次 / 分钟**，`KB_RATE_LIMIT` 调整），与对话额度互不影响，429 同样附带额度头。部署在反向代理后面时设置 `TRUST_PROXY_HEADERS=1`，限流按 `X-Forwarded-For` 第一个地址计算客户端 IP（默认关闭以防客户端伪造，代理需覆盖写入该头）。
+- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试。知识库写入 / 导入 / 导出 / 语义检索会触发嵌入模型推理或整库读取，按客户端 IP 单独限流（默认 **60 次 / 分钟**，`KB_RATE_LIMIT` 调整），与对话额度互不影响，429 同样附带额度头。部署在反向代理后面时设置 `TRUST_PROXY_HEADERS=1`，限流按 `X-Forwarded-For` 第一个地址计算客户端 IP（默认关闭以防客户端伪造，代理需覆盖写入该头）。
 - 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc` 使用仅对文档页放宽的 CSP（允许 CDN 资源）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`。
 
 **接口**
@@ -797,7 +797,7 @@ python -m webapp.server --port 8001
 python -m webapp.server --port 8002   # 另一个进程 / 机器
 ```
 
-- **限流**：两个实例的用户桶与 IP 桶计数都在 Redis（`aligo:ratelimit:*`），总额度按实例集合共享；`/api/health` 应返回 `rate_limit: redis`、`rate_limit_configured: true`、`rate_limit_degraded: false`。配置了 Redis 但限流器显示 `memory` 时 `rate_limit_degraded` 为 `true`（进程启动时 Redis 不可用，该进程重启后恢复共享）；运行中 Redis 故障则临时回退进程内实现，60 秒后自动重试。
+- **限流**：两个实例的用户桶、IP 桶与知识库桶计数都在 Redis（`aligo:ratelimit:*`），总额度按实例集合共享；`/api/health` 应返回 `rate_limit: redis`、`rate_limit_configured: true`、`rate_limit_degraded: false`。配置了 Redis 但限流器显示 `memory` 时 `rate_limit_degraded` 为 `true`（进程启动时 Redis 不可用，该进程重启后恢复共享）；运行中 Redis 故障则临时回退进程内实现，60 秒后自动重试。
 - **会话**：Redis 短期记忆按「用户 + 会话」共享，同一会话在任一实例都能继续；每个实例的运行时缓存（上限 50）互相独立，同一会话的并发请求建议用会话粘滞（session affinity）保持消息顺序。会话删除的防复活墓碑也是进程内的：删除请求与另一实例上正在生成的同一会话并发时，生成结束后仍可能写回消息，删除前请先停止生成，或用会话粘滞把同一会话固定到同一实例。
 - **持久化**：长期记忆、偏好、行程与会话标题 / 置顶 / 归档都在 PostgreSQL；不要在多实例下使用默认 JSON 后端（文件在各实例本地，跨进程写会互相覆盖）。
 - **反向代理**：前面有 Nginx / 负载均衡时设置 `TRUST_PROXY_HEADERS=1`，并按代理实际行为覆盖写入 `X-Forwarded-For`；否则所有用户共用代理地址的 IP 桶，默认不信任该头是为了防止客户端伪造。

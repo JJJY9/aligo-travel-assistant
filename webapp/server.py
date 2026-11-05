@@ -690,10 +690,12 @@ def _enforce_rate_limit(
     }
 
 
-def _enforce_kb_rate_limit(
-    state: AligoWebApp, request: Request, response: Response
-) -> None:
-    """知识库高开销接口的独立限流（按客户端 IP，与对话额度互不影响）。"""
+def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, str]:
+    """知识库高开销接口的独立限流（按客户端 IP，与对话额度互不影响）。
+
+    Returns:
+        供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
+    """
     client = _client_host(request)
     retry_after = state.kb_limiter.peek(client)
     if retry_after is not None:
@@ -711,13 +713,11 @@ def _enforce_kb_rate_limit(
         )
     state.kb_limiter.check(client)
     remaining, reset = state.kb_limiter.status(client)
-    response.headers.update(
-        {
-            "X-RateLimit-Limit": str(state.kb_limiter.limit),
-            "X-RateLimit-Remaining": str(remaining),
-            "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
-        }
-    )
+    return {
+        "X-RateLimit-Limit": str(state.kb_limiter.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
 
 
 # ---------- 长期记忆读取 ----------
@@ -1241,7 +1241,7 @@ def create_app(model: Any = None) -> FastAPI:
         top_k: int = Query(default=5, ge=1, le=10),
     ) -> dict[str, Any]:
         """语义检索知识片段（向量相似度排序；首次调用会加载嵌入模型）。"""
-        _enforce_kb_rate_limit(state, request, response)
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             results = search_documents(q, top_k=top_k)
         except FileNotFoundError as exc:
@@ -1258,7 +1258,7 @@ def create_app(model: Any = None) -> FastAPI:
         payload: KnowledgeDocumentPayload, request: Request, response: Response
     ) -> dict[str, Any]:
         """新增知识片段（首次调用会加载嵌入模型，可能需要数秒）。"""
-        _enforce_kb_rate_limit(state, request, response)
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return add_document(payload.content, payload.metadata)
         except ValueError as exc:
@@ -1280,7 +1280,7 @@ def create_app(model: Any = None) -> FastAPI:
         doc_id: int = ApiPath(..., ge=1),
     ) -> dict[str, Any]:
         """更新知识片段（内容重新向量化；片段不存在返回 404）。"""
-        _enforce_kb_rate_limit(state, request, response)
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return update_document(doc_id, payload.content, payload.metadata)
         except ValueError as exc:
@@ -1301,7 +1301,7 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request, response: Response, doc_id: int = ApiPath(..., ge=1)
     ) -> dict[str, Any]:
         """按 id 删除知识片段。"""
-        _enforce_kb_rate_limit(state, request, response)
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             removed = delete_document(doc_id)
         except FileNotFoundError as exc:
@@ -1314,8 +1314,9 @@ def create_app(model: Any = None) -> FastAPI:
         return {"id": doc_id, "deleted": True}
 
     @app.get("/api/knowledge/export")
-    def knowledge_export() -> Response:
+    def knowledge_export(request: Request) -> Response:
         """导出全部知识片段为 JSON 文件（备份 / 迁移）。"""
+        rate_headers = _enforce_kb_rate_limit(state, request)
         try:
             documents = export_documents()
         except FileNotFoundError as exc:
@@ -1334,7 +1335,8 @@ def create_app(model: Any = None) -> FastAPI:
             content=json.dumps(payload, ensure_ascii=False, indent=2),
             media_type="application/json; charset=utf-8",
             headers={
-                "Content-Disposition": 'attachment; filename="aligo-knowledge.json"'
+                "Content-Disposition": 'attachment; filename="aligo-knowledge.json"',
+                **rate_headers,
             },
         )
 
@@ -1343,7 +1345,7 @@ def create_app(model: Any = None) -> FastAPI:
         payload: KnowledgeImportPayload, request: Request, response: Response
     ) -> dict[str, Any]:
         """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。"""
-        _enforce_kb_rate_limit(state, request, response)
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return import_documents(payload.documents)
         except FileNotFoundError as exc:

@@ -2788,6 +2788,9 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
         search = client.get("/api/knowledge/search", params={"q": "住宿"})
         assert search.status_code == 429, "写入与检索应共享知识库桶"
 
+        export = client.get("/api/knowledge/export")
+        assert export.status_code == 429, "导出也应使用知识库限流桶"
+
         chat = client.post(
             "/api/chat",
             json={"message": "你好", "user_id": user_id, "session_id": "kb-limit"},
