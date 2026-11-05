@@ -3816,11 +3816,21 @@ def test_knowledge_transfer_api(monkeypatch):
 
     calls = {}
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False):
         calls["documents"] = documents
+        calls["dry_run"] = dry_run
+        if dry_run:
+            return {"imported": 0, "skipped": 0, "would_import": len(documents)}
         return {"imported": len(documents), "skipped": 0}
 
     monkeypatch.setattr(server_module, "import_documents", fake_import)
+    preview = client.post(
+        "/api/knowledge/import?dry_run=1",
+        json={"documents": [{"content": "y"}]},
+    )
+    assert preview.status_code == 200
+    assert preview.json()["would_import"] == 1
+    assert calls["dry_run"] is True
     imported = client.post(
         "/api/knowledge/import",
         json={"documents": [{"content": "x", "metadata": {"category": "c"}}]},
@@ -3847,7 +3857,7 @@ def test_knowledge_transfer_api(monkeypatch):
     )
 
     # 备份还原超限 → 400（不能静默截断，也不能误报为 503）
-    def too_big(documents):
+    def too_big(documents, dry_run=False):
         raise ValueError("备份中的文档超过还原上限（20000 字），请拆分后导入")
 
     monkeypatch.setattr(server_module, "import_documents", too_big)

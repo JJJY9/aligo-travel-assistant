@@ -1783,12 +1783,18 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.post("/api/knowledge/import")
     def knowledge_import(
-        payload: KnowledgeImportPayload, request: Request, response: Response
+        payload: KnowledgeImportPayload,
+        request: Request,
+        response: Response,
+        dry_run: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。"""
+        """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。
+
+        ``dry_run=1`` 时只校验 / 去重并返回 ``would_import``，不写库。
+        """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            return import_documents(payload.documents)
+            return import_documents(payload.documents, dry_run=dry_run)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
