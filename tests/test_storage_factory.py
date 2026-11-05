@@ -163,6 +163,7 @@ def test_session_pinned():
 
     memory = LongTermMemory("u-pin", tempfile.mkdtemp())
     memory.add_chat_message("user", "hi", "s1")
+    memory.add_chat_message("user", "hi", "s2")
     memory.set_session_pinned("s1", True)
     memory.set_session_pinned("s2", True)
     assert memory.get_pinned_sessions() == ["s1", "s2"]
@@ -373,6 +374,7 @@ def test_export_data_includes_session_metadata():
     from context.memory_manager import MemoryManager
 
     manager = MemoryManager("u-export", "s1", storage_path=tempfile.mkdtemp())
+    manager.long_term.add_chat_message("user", "hi", "s1")
     manager.long_term.set_session_title("s1", "T")
     manager.long_term.set_session_pinned("s1", True)
     manager.long_term.set_session_archived("s1", True)

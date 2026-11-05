@@ -252,8 +252,8 @@ class PostgresLongTermMemory:
         ]
 
     def delete_chat_session(self, session_id: str) -> int:
-        """删除某个会话的全部聊天记录，返回删除条数。"""
-        with self._conn.cursor() as cursor:
+        """删除某个会话的全部聊天记录与元数据（单事务），返回删除条数。"""
+        with self._conn.transaction(), self._conn.cursor() as cursor:
             cursor.execute(
                 "DELETE FROM aligo_chat_messages WHERE user_id = %s AND session_id = %s",
                 (self.user_id, session_id),
@@ -329,24 +329,40 @@ class PostgresLongTermMemory:
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
-    def set_session_title(self, session_id: str, title: str) -> None:
-        """设置会话自定义标题；空标题表示恢复自动标题。"""
+    def _session_exists(self, session_id: str) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM aligo_chat_messages "
+            "WHERE user_id = %s AND session_id = %s LIMIT 1",
+            (self.user_id, session_id),
+        )
+        return row is not None
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """设置会话自定义标题；空标题表示恢复自动标题。返回会话是否存在。"""
         cleaned = title.strip()
         if not cleaned:
+            if not self._session_exists(session_id):
+                return False
             self._execute(
                 "DELETE FROM aligo_session_titles WHERE user_id = %s AND session_id = %s",
                 (self.user_id, session_id),
             )
-            return
-        self._execute(
+            return True
+        row = self._fetchone(
             """
             INSERT INTO aligo_session_titles (user_id, session_id, title)
-            VALUES (%s, %s, %s)
+            SELECT %s, %s, %s
+            WHERE EXISTS (
+                SELECT 1 FROM aligo_chat_messages
+                WHERE user_id = %s AND session_id = %s
+            )
             ON CONFLICT (user_id, session_id)
             DO UPDATE SET title = EXCLUDED.title, updated_at = now()
+            RETURNING 1
             """,
-            (self.user_id, session_id, cleaned[:60]),
+            (self.user_id, session_id, cleaned[:60], self.user_id, session_id),
         )
+        return row is not None
 
     def get_session_titles(self) -> dict[str, str]:
         """返回全部会话自定义标题。"""
@@ -356,19 +372,30 @@ class PostgresLongTermMemory:
         )
         return {session_id: title for session_id, title in rows}
 
-    def set_session_pinned(self, session_id: str, pinned: bool) -> None:
-        """置顶 / 取消置顶会话。"""
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        """置顶 / 取消置顶会话。返回会话是否存在。"""
         if pinned:
-            self._execute(
-                "INSERT INTO aligo_pinned_sessions (user_id, session_id) VALUES (%s, %s) "
-                "ON CONFLICT DO NOTHING",
-                (self.user_id, session_id),
+            row = self._fetchone(
+                """
+                INSERT INTO aligo_pinned_sessions (user_id, session_id)
+                SELECT %s, %s
+                WHERE EXISTS (
+                    SELECT 1 FROM aligo_chat_messages
+                    WHERE user_id = %s AND session_id = %s
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING 1
+                """,
+                (self.user_id, session_id, self.user_id, session_id),
             )
-        else:
-            self._execute(
-                "DELETE FROM aligo_pinned_sessions WHERE user_id = %s AND session_id = %s",
-                (self.user_id, session_id),
-            )
+            return row is not None
+        if not self._session_exists(session_id):
+            return False
+        self._execute(
+            "DELETE FROM aligo_pinned_sessions WHERE user_id = %s AND session_id = %s",
+            (self.user_id, session_id),
+        )
+        return True
 
     def get_pinned_sessions(self) -> list[str]:
         """返回置顶会话 ID（按置顶时间先后）。"""
@@ -379,19 +406,30 @@ class PostgresLongTermMemory:
         )
         return [row[0] for row in rows]
 
-    def set_session_archived(self, session_id: str, archived: bool) -> None:
-        """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。"""
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。返回会话是否存在。"""
         if archived:
-            self._execute(
-                "INSERT INTO aligo_archived_sessions (user_id, session_id) VALUES (%s, %s) "
-                "ON CONFLICT DO NOTHING",
-                (self.user_id, session_id),
+            row = self._fetchone(
+                """
+                INSERT INTO aligo_archived_sessions (user_id, session_id)
+                SELECT %s, %s
+                WHERE EXISTS (
+                    SELECT 1 FROM aligo_chat_messages
+                    WHERE user_id = %s AND session_id = %s
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING 1
+                """,
+                (self.user_id, session_id, self.user_id, session_id),
             )
-        else:
-            self._execute(
-                "DELETE FROM aligo_archived_sessions WHERE user_id = %s AND session_id = %s",
-                (self.user_id, session_id),
-            )
+            return row is not None
+        if not self._session_exists(session_id):
+            return False
+        self._execute(
+            "DELETE FROM aligo_archived_sessions WHERE user_id = %s AND session_id = %s",
+            (self.user_id, session_id),
+        )
+        return True
 
     def get_archived_sessions(self) -> list[str]:
         """返回归档会话 ID（按归档时间倒序）。"""
