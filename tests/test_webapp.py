@@ -1928,6 +1928,25 @@ def test_metrics_api():
         REQUEST_METRICS.reset()
 
 
+def test_metrics_paths_use_route_templates():
+    """指标按路由模板聚合：动态段不撑基数，未匹配路径归入 __unmatched__。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = _client()
+    user_id = _unique_user("web_test_metric_template")
+    try:
+        client.get("/api/sessions/deadbeefcafe", params={"user_id": user_id})
+        client.get("/api/no-such-endpoint")
+        by_path = REQUEST_METRICS.snapshot()["by_path"]
+        assert "/api/sessions/{session_id}" in by_path
+        assert "/api/sessions/deadbeefcafe" not in by_path
+        assert "__unmatched__" in by_path
+        print("✓ 指标路径使用路由模板，未匹配路径归入 __unmatched__")
+    finally:
+        REQUEST_METRICS.reset()
+
+
 def test_prometheus_metrics_endpoint():
     from utils.metrics import REQUEST_METRICS
 
