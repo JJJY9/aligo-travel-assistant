@@ -2,6 +2,14 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+- 检索评测互斥升级为 Redis 跨实例锁：配置 `REDIS_URL` 时多个 Web 实例共享同一把锁（`SET NX EX` + token 比对释放，TTL 300 秒），未配置或 Redis 故障时回退进程内锁；并发请求仍返回 429
+
+### 测试
+- 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁
+
 ## [1.5.0] - 2026-11-05
 
 ### 新增
