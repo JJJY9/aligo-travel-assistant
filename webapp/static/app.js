@@ -3260,6 +3260,10 @@ function renderKnowledgeDocuments(items, append) {
     const bits = [`#${doc.id}`];
     if (doc.metadata && doc.metadata.category) bits.push(String(doc.metadata.category));
     if (doc.metadata && doc.metadata.title) bits.push(String(doc.metadata.title));
+    const docParts = Number(doc.metadata && doc.metadata.parts);
+    if (docParts > 1) {
+      bits.push(`分片 ${doc.metadata.part || "?"}/${docParts}`);
+    }
     const metaText = bits.join(" · ");
     if (state.kbQuery) {
       meta.innerHTML = highlightSnippet(metaText, state.kbQuery);
@@ -3292,8 +3296,16 @@ function knowledgeRowActions(doc) {
   actions.className = "pref-actions";
   const edit = document.createElement("button");
   edit.type = "button";
-  edit.title = "编辑片段";
-  edit.setAttribute("aria-label", `编辑知识片段 ${doc.id}`);
+  const parts = Number(doc.metadata && doc.metadata.parts);
+  if (parts > 1) {
+    // 多分片记录没有稳定的组标识，单条编辑会留下无法定位的旧分片（服务端 400）
+    edit.disabled = true;
+    edit.title = "多分片记录请整组删除后重新添加，暂不支持单条编辑";
+    edit.setAttribute("aria-label", `知识片段 ${doc.id} 属于多分片记录，不支持单条编辑`);
+  } else {
+    edit.title = "编辑片段";
+    edit.setAttribute("aria-label", `编辑知识片段 ${doc.id}`);
+  }
   edit.innerHTML = icon("edit");
   edit.addEventListener("click", () => startEditKnowledge(doc));
   const del = document.createElement("button");
@@ -3466,6 +3478,10 @@ async function removeKnowledgeDocument(docId) {
 function startEditKnowledge(doc) {
   if (state.kbSaving) {
     toast("正在保存知识片段，请稍候");
+    return;
+  }
+  if (Number(doc.metadata && doc.metadata.parts) > 1) {
+    toast("多分片记录请整组删除后重新添加，暂不支持单条编辑");
     return;
   }
   state.kbEditingId = doc.id;
