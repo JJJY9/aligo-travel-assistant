@@ -352,6 +352,12 @@ def test_describe_backends_configured_flags(monkeypatch):
         storage.reset_failure_cache()
     assert info["short_term_configured"] is True
     assert info["short_term"] == "memory", "连接失败时回退进程内"
+
+    monkeypatch.setattr(storage, "_get_redis_client", lambda url: object())
+    monkeypatch.setattr(storage, "redis_short_term_degraded", lambda: True)
+    info = storage.describe_backends()
+    assert info["short_term"] == "redis"
+    assert info["short_term_degraded"] is True, "运行中故障回退要在健康信息里可见"
     print("✓ describe_backends 报告配置 / 回退状态")
 
 

@@ -64,6 +64,30 @@ def test_storage_unreachable_warns(monkeypatch):
     print("✓ Redis 不可达 → 警告并提示回退")
 
 
+def test_storage_runtime_degraded_warns(monkeypatch):
+    """Redis 运行中故障回退进程内时，doctor 要明确提示而不是报告可用。"""
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0")
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    monkeypatch.setattr(
+        storage_module,
+        "describe_backends",
+        lambda: {
+            "short_term": "redis",
+            "long_term": "json",
+            "short_term_configured": True,
+            "long_term_configured": False,
+            "short_term_degraded": True,
+        },
+    )
+    result = check_storage()
+    assert result.status == STATUS_WARN
+    assert "回退进程内" in result.detail
+    print("✓ Redis 运行中故障 → doctor 警告回退")
+
+
 def test_python_ok():
     assert check_python().status == STATUS_OK
     print("✓ Python 版本检查")
@@ -298,7 +322,11 @@ if __name__ == "__main__":
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
     test_knowledge_base_missing()
-    for case in (test_storage_defaults, test_storage_unreachable_warns):
+    for case in (
+        test_storage_defaults,
+        test_storage_unreachable_warns,
+        test_storage_runtime_degraded_warns,
+    ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)

@@ -124,16 +124,21 @@ def check_storage() -> CheckResult:
     failures: list[str] = []
 
     if backends["short_term"] == "redis":
-        try:
-            import redis
-
-            client = redis.Redis.from_url(
-                redis_url, socket_connect_timeout=1.5, socket_timeout=1.5
+        if backends.get("short_term_degraded"):
+            failures.append(
+                "Redis 运行中故障：短期记忆已暂时回退进程内（60 秒后自动重试）"
             )
-            client.ping()
-            parts.append("短期记忆 · Redis 可用")
-        except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
-            failures.append(f"Redis 不可用：{str(exc)[:80]}")
+        else:
+            try:
+                import redis
+
+                client = redis.Redis.from_url(
+                    redis_url, socket_connect_timeout=1.5, socket_timeout=1.5
+                )
+                client.ping()
+                parts.append("短期记忆 · Redis 可用")
+            except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
+                failures.append(f"Redis 不可用：{str(exc)[:80]}")
     else:
         parts.append("短期记忆 · 进程内")
         if redis_url:
