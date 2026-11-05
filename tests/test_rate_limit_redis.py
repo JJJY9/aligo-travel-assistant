@@ -160,6 +160,7 @@ def test_webapp_uses_redis_rate_limit_across_instances(monkeypatch):
 
         health = TestClient(app_b).get("/api/health").json()
         assert health["rate_limit"] == "redis"
+        assert health["rate_limit_configured"] is True
         assert health["rate_limit_degraded"] is False
         print("✓ Web 两实例共享 Redis 限流，/api/health 报告 redis")
     finally:
