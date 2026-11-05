@@ -189,7 +189,7 @@ SSE 每 15 秒发送一次 `: keep-alive` 心跳，浏览器断开时服务端�
 |------|------|
 | **熔断器** | 连续失败若干次后暂停调用 LLM，直接提示「服务暂时不可用」；一段时间后自动半开试探恢复。 |
 | **重试与退避** | 对意图识别、编排两次 LLM 调用做有限次重试，仅对超时、429、5xx 等可重试错误生效，采用指数退避。 |
-| **健康检查** | 会话内输入 `health` 可查看熔断状态并探测 LLM 是否可达；命令行执行 `python cli.py health` 可单独做一次探测（退出码 0/1，便于监控）。 |
+| **健康检查** | 会话内输入 `health` 可查看熔断状态并探测 LLM 是否可达；命令行执行 `python cli.py health` 可单独做一次探测（退出码 0/1，便于监控），`--json` 输出 `{"ok", "message"}`。 |
 
 配置见 `config.py` 中的 `RESILIENCE_CONFIG`（重试次数、熔断阈值、恢复时间等）。
 
@@ -484,9 +484,9 @@ python cli.py
 | `export` | 导出用户数据（偏好 / 行程 / 对话历史 / 统计）为 JSON + Markdown（保存到 `exports/`） |
 | `exit` | 退出程序 |
 
-单独做健康检查（不进入交互）：`python cli.py health`，返回 `OK` / `FAIL: ...`，退出码 0/1。
+单独做健康检查（不进入交互）：`python cli.py health`，返回 `OK` / `FAIL: ...`，退出码 0/1；`--json` 输出 `{"ok", "message"}`，便于监控解析。
 
-知识库状态（不进入交互）：`python cli.py kb`，输出集合名 / 片段数与数据库路径，退出码 0/1。
+知识库状态（不进入交互）：`python cli.py kb`，输出集合名 / 片段数与数据库路径，退出码 0/1；`--json` 输出完整状态对象（`available` / `collection` / `documents` / `path` / `reason`）。
 
 知识库检索评测（不进入交互、不调用大模型）：`python cli.py eval`，对 14 个差旅问题计算 hit@1 / hit@3 / hit@5 与 MRR（当前基线：hit@5 100%，MRR 0.80），hit@5 低于 80% 时退出码 1；知识库未初始化时提示跳过。
 

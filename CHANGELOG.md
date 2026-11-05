@@ -14,6 +14,7 @@
 - 知识库接口独立限流：写入 / 更新 / 删除 / 导入 / 导出 / 语义检索按客户端 IP 限流（默认 60 次 / 分钟，`KB_RATE_LIMIT` 调整），与对话额度互不影响；配置 Redis 时与其他桶共享后端，`/api/metrics.rate_limit` 增加 `kb_limit`
 - 请求指标新增 P50 / P95 耗时（最近 1000 个请求样本，内存有界）与 `duration_samples`；记忆面板运行指标新增「P95 耗时」卡片
 - CLI `doctor` / `skills` 支持 `--json`：`doctor` 输出 `status` / `checks`，`skills` 输出 `root` / `skills` / `ok`，便于监控与脚本读取；非法参数退出码 2
+- CLI `health` / `kb` 也支持 `--json`：`health` 输出 `{"ok", "message"}`，`kb` 输出完整知识库状态对象；非法参数退出码 2
 - 行程日历提醒：导出的 `.ics` 事件新增 `VALARM`，出行前一天 09:00 提醒（单条行程与全部行程导出均生效）
 - 安全响应头：`/api/` 响应默认带 `Cache-Control: no-store`，用户数据不进入浏览器 / 代理缓存（导出接口保留自身的 `no-cache`）
 - 记忆面板用户卡片显示技能数量（来自 `/api/health`），安装后技能缺失可直接看到「技能 0」
@@ -32,6 +33,7 @@
 - 新增知识库接口限流用例：首次写入 201 并带额度头，第二次 429；语义检索与导出均与写入共享知识库桶；对话不受该桶影响
 - `tests/test_metrics.py` 补充 P50 / P95、有界样本窗口与重置用例；`/api/metrics` 接口用例断言百分位与样本数
 - `test_cli_skills.py` / `test_doctor.py` 补充 `--json` 输出、失败退出码与未知参数用例
+- 新增 `tests/test_cli_json.py`：health JSON 成功 / 失败、kb 状态可用 / 不可用的退出码与字段
 - ICS 日历用例断言每个事件包含 `VALARM` 与 `TRIGGER:-PT15H`
 - 安全头用例断言 `/api/` 响应带 `Cache-Control: no-store`，页面与静态资源不受影响
 - 浏览器实测：用户卡片显示「本地内存 · JSON · 技能 6」
