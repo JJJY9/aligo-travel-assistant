@@ -1425,6 +1425,7 @@ function renderHistoryItem(session) {
 
   const remove = document.createElement("button");
   remove.type = "button";
+  remove.dataset.action = "remove";
   remove.title = "删除会话";
   remove.setAttribute("aria-label", "删除会话");
   remove.innerHTML = icon("trash");
@@ -1436,6 +1437,7 @@ function renderHistoryItem(session) {
   if (session.archived) {
     const restore = document.createElement("button");
     restore.type = "button";
+    restore.dataset.action = "restore";
     restore.title = "恢复会话";
     restore.setAttribute("aria-label", "恢复会话");
     restore.innerHTML = icon("refresh");
@@ -1447,6 +1449,7 @@ function renderHistoryItem(session) {
   } else {
     const pin = document.createElement("button");
     pin.type = "button";
+    pin.dataset.action = "pin";
     pin.title = session.pinned ? "取消置顶" : "置顶会话";
     pin.setAttribute("aria-label", pin.title);
     pin.innerHTML = icon("pin");
@@ -1457,6 +1460,7 @@ function renderHistoryItem(session) {
 
     const rename = document.createElement("button");
     rename.type = "button";
+    rename.dataset.action = "rename";
     rename.title = "重命名会话";
     rename.setAttribute("aria-label", "重命名会话");
     rename.innerHTML = icon("edit");
@@ -1467,6 +1471,7 @@ function renderHistoryItem(session) {
 
     const archive = document.createElement("button");
     archive.type = "button";
+    archive.dataset.action = "archive";
     archive.title = "归档会话";
     archive.setAttribute("aria-label", "归档会话");
     archive.innerHTML = icon("archive");
@@ -1493,6 +1498,14 @@ function renderHistoryItem(session) {
 }
 
 function renderHistory() {
+  const focused = document.activeElement;
+  const focusInfo =
+    focused instanceof HTMLElement && els.history.contains(focused)
+      ? {
+          id: focused.closest(".history-item")?.dataset.id || "",
+          action: focused.dataset.action || "",
+        }
+      : null;
   els.history.innerHTML = "";
 
   const appendArchivedHint = () => {
@@ -1519,6 +1532,7 @@ function renderHistory() {
     }
     els.history.appendChild(empty);
     appendArchivedHint();
+    restoreHistoryFocus(focusInfo);
     return;
   }
 
@@ -1557,6 +1571,19 @@ function renderHistory() {
     els.history.appendChild(more);
   }
   appendArchivedHint();
+  restoreHistoryFocus(focusInfo);
+}
+
+function restoreHistoryFocus(info) {
+  if (!info || !info.id) return;
+  const item = els.history.querySelector(
+    `.history-item[data-id="${CSS.escape(info.id)}"]`,
+  );
+  if (!item) return;
+  const target = info.action
+    ? item.querySelector(`[data-action="${info.action}"]`)
+    : item;
+  (target || item).focus();
 }
 
 async function togglePin(session) {
@@ -1922,7 +1949,7 @@ async function sendMessage(text, options = {}) {
     // 只保留最新一条回答的「重新生成」：旧按钮对应的已不是最后一轮，
     // 点击只会触发 mismatch，甚至在外层历史中插入重复问答
     trimRegenButtons();
-    const panelOpen = els.memorySheet && !els.memorySheet.hidden;
+    const panelOpen = isModalOpen();
     if (!panelOpen) {
       // 用户正在侧栏重命名等输入框里操作时不抢焦点
       const active = document.activeElement;
@@ -2296,9 +2323,19 @@ function renderOverview() {
       if (trip.session_id) {
         row.classList.add("clickable");
         row.title = "查看对应对话";
-        row.addEventListener("click", () => {
+        row.setAttribute("role", "button");
+        row.tabIndex = 0;
+        const openTrip = () => {
           closeMemorySheet();
           openSession(trip.session_id);
+        };
+        row.addEventListener("click", openTrip);
+        row.addEventListener("keydown", (event) => {
+          if (event.target !== row) return;
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            openTrip();
+          }
         });
       }
 
@@ -2881,17 +2918,29 @@ function toggleSidebar() {
       /* 忽略 */
     }
   }
+  syncSidebarA11y();
+}
+
+function syncSidebarA11y() {
+  if (!els.sidebar) return;
+  const hidden = isMobile()
+    ? !els.app.classList.contains("side-open")
+    : els.app.classList.contains("side-collapsed");
+  els.sidebar.toggleAttribute("inert", hidden);
+  els.sidebar.setAttribute("aria-hidden", hidden ? "true" : "false");
 }
 
 function closeMobileSidebar() {
   els.app.classList.remove("side-open");
   els.scrim.hidden = true;
+  syncSidebarA11y();
 }
 
 function restoreSidebar() {
   if (!isMobile() && localStorage.getItem("aligo.sideCollapsed") === "1") {
     els.app.classList.add("side-collapsed");
   }
+  syncSidebarA11y();
 }
 
 /* ---------- 记忆与数据面板 ---------- */
@@ -3522,6 +3571,13 @@ function closeMemorySheet() {
   els.input?.focus();
 }
 
+function isModalOpen() {
+  return Boolean(
+    (els.shortcutOverlay && !els.shortcutOverlay.hidden) ||
+      (els.memorySheet && !els.memorySheet.hidden),
+  );
+}
+
 function openShortcuts() {
   if (!els.shortcutOverlay.hidden) return;
   const active = document.activeElement;
@@ -3814,6 +3870,8 @@ function bindEvents() {
       closeShortcuts();
       return;
     }
+    // 弹层打开时快捷键不穿透到背后的侧栏搜索框
+    if (isModalOpen()) return;
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       focusSearch();
@@ -3853,6 +3911,7 @@ function bindEvents() {
       els.scrim.hidden = true;
     }
     resizeInput();
+    syncSidebarA11y();
   });
 }
 
