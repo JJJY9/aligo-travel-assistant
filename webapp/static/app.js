@@ -2593,7 +2593,7 @@ function renderUpcoming(trip) {
   els.upcomingDate.textContent = `${trip.start_date}${
     trip.end_date ? ` ~ ${trip.end_date}` : ""
   } · ${trip.purpose || "出行"}`;
-  loadUpcomingWeather(trip.destination || "");
+  loadUpcomingWeather(trip.destination || "", trip.start_date || "");
 }
 
 let upcomingWeatherSeq = 0;
@@ -2604,7 +2604,7 @@ function formatWeatherTemp(value) {
   return Number.isFinite(number) ? `${Math.round(number)}°C` : "";
 }
 
-async function loadUpcomingWeather(city) {
+async function loadUpcomingWeather(city, startDate) {
   const el = els.upcomingWeather;
   if (!el) return;
   const name = String(city || "").trim();
@@ -2623,16 +2623,26 @@ async function loadUpcomingWeather(city) {
     const data = await getJSON(`/api/weather?city=${encodeURIComponent(name)}`);
     if (seq !== upcomingWeatherSeq) return;
     const current = data.current || {};
-    const today =
-      Array.isArray(data.daily) && data.daily.length ? data.daily[0] : null;
+    const daily = Array.isArray(data.daily) ? data.daily : [];
+    // 3 天窗口内优先展示出发日预报，窗口外退回今日
+    let forecast = daily.length ? daily[0] : null;
+    let forecastLabel = "今日";
+    const start = String(startDate || "").trim();
+    if (start && daily.length) {
+      const match = daily.find((item) => item && item.date === start);
+      if (match) {
+        forecast = match;
+        if (start !== todayISO()) forecastLabel = "出发日";
+      }
+    }
     const parts = [];
     if (current.description) parts.push(current.description);
     const currentTemp = formatWeatherTemp(current.temperature);
     if (currentTemp) parts.push(currentTemp);
-    if (today) {
-      const low = formatWeatherTemp(today.min);
-      const high = formatWeatherTemp(today.max);
-      if (low && high) parts.push(`今日 ${low}~${high}`);
+    if (forecast) {
+      const low = formatWeatherTemp(forecast.min);
+      const high = formatWeatherTemp(forecast.max);
+      if (low && high) parts.push(`${forecastLabel} ${low}~${high}`);
     }
     const text = parts.join(" · ");
     if (!text) return;
