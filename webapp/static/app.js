@@ -573,7 +573,7 @@ function cancelPendingEdits() {
 }
 
 function startEditUserNode(node, originalText) {
-  if (state.busy) return;
+  if (state.busy || state.sessionLoading) return;
   const bubble = node.querySelector(".bubble");
   if (!bubble || bubble.querySelector(".user-edit-form")) return;
   const foot = node.querySelector(".user-edit");
@@ -632,6 +632,11 @@ function startEditUserNode(node, originalText) {
 
   async function submit() {
     if (saving) return;
+    if (state.sessionLoading) {
+      // 会话还在加载就删上一轮，会删掉 / 重发到错误的会话
+      toast("会话正在加载，请稍候");
+      return;
+    }
     const text = input.value.trim();
     if (!text) {
       toast("提问不能为空");
@@ -2056,9 +2061,8 @@ async function sendMessage(text, options = {}) {
         active.isContentEditable);
     if (!isModalOpen() && !editing) els.input.focus();
     if (!document.querySelector(".hi-input")) await loadSessions();
-    // 记忆面板里正在编辑的偏好输入框会被 refreshStatus 重建销毁；
-    // 编辑结束后保存 / 取消路径会自行刷新
-    if (!document.querySelector(".pref-input")) refreshStatus();
+    // refreshStatus 内部会在偏好编辑框存在时跳过渲染（编辑结束后补刷新）
+    refreshStatus();
   }
 }
 
@@ -2296,7 +2300,15 @@ async function refreshStatus() {
     state.status = null;
   }
   updateUserCard();
-  renderOverview();
+  // 记忆面板里正在编辑的偏好输入框会随 renderOverview 重建被销毁：
+  // 在真正渲染前（异步请求返回后）再检查一次，编辑期间保留旧视图，
+  // 编辑结束的保存 / 取消路径会各补一次刷新
+  if (!preferenceEditActive()) renderOverview();
+}
+
+function preferenceEditActive() {
+  const input = document.querySelector(".pref-input");
+  return Boolean(input && input.getClientRects().length > 0);
 }
 
 function renderOverview() {
@@ -2913,6 +2925,8 @@ function startEditPreference(row, type, currentValue) {
     if (settled) return;
     settled = true;
     if (input.isConnected) input.replaceWith(valueEl);
+    // 编辑期间的 refreshStatus 被跳过，这里补一次，避免行程 / 统计停在旧数据
+    refreshStatus();
   };
 
   const save = async () => {
@@ -2938,6 +2952,8 @@ function startEditPreference(row, type, currentValue) {
         body: JSON.stringify({ user_id: state.userId, value }),
       });
       toast("偏好已更新");
+      // 先撤掉编辑框再刷新：refreshStatus 在编辑框存在时会跳过渲染
+      if (input.isConnected) input.replaceWith(valueEl);
       await refreshStatus();
     } catch (error) {
       settled = false;
@@ -4048,6 +4064,8 @@ function bindEvents() {
   els.scrim.addEventListener("click", closeMobileSidebar);
 
   window.addEventListener("keydown", (event) => {
+    // 输入法组合中的按键（如用 Esc 取消候选词）不触发展开 / 关闭等全局行为
+    if (event.isComposing) return;
     const target = event.target;
     const typing =
       target instanceof HTMLElement &&
