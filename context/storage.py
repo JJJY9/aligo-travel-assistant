@@ -72,6 +72,17 @@ def _get_redis_client(url: str):
         return None
 
 
+def get_shared_redis_client() -> Any | None:
+    """返回共享 Redis 客户端（供限流等模块复用连接池）。
+
+    未配置 ``REDIS_URL``、Redis 不可用或处于失败冷却期时返回 None。
+    """
+    url = STORAGE_CONFIG.get("redis_url") or ""
+    if not url:
+        return None
+    return _get_redis_client(url)
+
+
 def create_short_term_memory(
     session_id: str, max_turns: int = 10, user_id: str = ""
 ) -> ShortTermStore:

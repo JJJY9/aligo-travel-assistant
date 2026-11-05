@@ -550,8 +550,8 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
 - 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
-- 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径、平均与最大耗时、熔断器状态与缓存会话数（多进程各自统计，与限流一致）。
-- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。实现为进程内滑动窗口（`utils/rate_limit.py`），多实例部署时需替换为 Redis 等共享存储。
+- 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径、平均与最大耗时、熔断器状态与缓存会话数（多进程各自统计）。
+- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试。
 - 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc` 使用仅对文档页放宽的 CSP（允许 CDN 资源）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`。
 
 **接口**
@@ -560,7 +560,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 |------|------|------|
 | POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
-| GET | `/api/health` | 服务版本 / 模型 / 存储后端状态 |
+| GET | `/api/health` | 服务版本 / 模型 / 存储与限流后端状态 |
 | GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 耗时 / 熔断器状态） |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
@@ -731,7 +731,7 @@ aligo-travel-assistant/
 ### 数据存储
 - 💾 **JSON 文件** - 长期记忆默认实现（`data/memory/{user_id}.json`）
 - 🗄️ **PostgreSQL** - 长期记忆可选后端（设置 `DATABASE_URL` 启用，表结构自动创建）
-- ⚡ **Redis** - 短期记忆可选后端（设置 `REDIS_URL` 启用，List + TTL）
+- ⚡ **Redis** - 短期记忆与共享限流可选后端（设置 `REDIS_URL` 启用，List + TTL）
 - 🔍 **Milvus Lite** - 本地向量数据库（RAG 知识库）
 
 ### 向量化与检索
@@ -797,7 +797,7 @@ aligo-travel-assistant/
 ### 已知限制
 - **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
-- **限流与请求指标是进程内实现**：多实例部署时各实例独立计数 / 统计（`/api/metrics` 只反映当前进程），共享限流需替换为 Redis 等存储。
+- **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。
 - **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；但 CLI 与 Web 服务同时修改**同一用户**时仍是「后写覆盖先写」，演示时建议只保留一个写入端。
 - **存储后端故障回退**：配置的 PostgreSQL 连接失败时自动回退本地 JSON；故障期间新会话写入 JSON 的消息 / 偏好不会在恢复后自动合并到 PostgreSQL（文件保留在 `data/memory/`，恢复时日志会给出警告），需要时请手动迁移。
 - **Windows 文件名大小写不敏感**：用户 ID `Alice` 与 `alice` 会读写同一个 JSON 记忆文件；需要区分用户时请使用不同的名字。
@@ -820,7 +820,7 @@ aligo-travel-assistant/
 - [x] 性能与可观测性（gzip、JSON 访问日志、请求 ID、限流、系统自检、请求指标）
 - [ ] 支持更多 LLM 服务商（OpenAI / Claude 兼容网关等，当前任意 OpenAI 兼容接口可用）
 - [ ] 回答逐 token 流式输出（依赖 agentscope 流式解析兼容性修复）
-- [ ] 多实例部署（共享限流 / 会话存储）
+- [x] 多实例部署（`REDIS_URL` 启用共享限流与跨进程会话存储；请求指标仍为进程内统计）
 - [x] 可观测性（结构化日志与请求指标：`/api/metrics`、`LOG_FORMAT=json`）
 
 ---
