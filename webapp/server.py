@@ -508,6 +508,8 @@ class AligoWebApp:
     # 已删除会话的短时墓碑：在途 / 重连的对话不能把刚删除的会话写回（复活）
     max_tombstones = 1000
     tombstone_ttl_sec = 300.0
+    # 共享墓碑故障后的重试冷却：期间只用进程内墓碑，避免每个请求都等 Redis 超时
+    tombstone_retry_sec = 60.0
 
     def __init__(self, model: Any = None) -> None:
         init_agentscope()
@@ -566,6 +568,7 @@ class AligoWebApp:
         )
         self._redis_client = redis_client
         self._tombstones_shared = redis_client is not None
+        self._tombstone_retry_at = 0.0
 
     @staticmethod
     def _session_key(user_id: str, session_id: str) -> str:
@@ -599,27 +602,75 @@ class AligoWebApp:
     def _deleted_key(user_id: str, session_id: str) -> str:
         return f"{_DELETED_KEY_PREFIX}:{user_id}:{session_id}"
 
+    def _shared_tombstones(self) -> Any | None:
+        """共享墓碑可用时返回 Redis 客户端；故障冷却期内只用进程内墓碑。
+
+        启动时 Redis 不可用（``_redis_client`` 为 None）也允许通过
+        ``get_shared_redis_client``（自带 60 秒冷却）在恢复后重新接入。
+        """
+        if self._redis_client is None:
+            self._redis_client = get_shared_redis_client()
+            if self._redis_client is None:
+                return None
+        if not self._tombstones_shared and time.monotonic() < self._tombstone_retry_at:
+            return None
+        return self._redis_client
+
+    def _tombstone_failed(self, exc: Exception, action: str) -> None:
+        self._tombstones_shared = False
+        self._tombstone_retry_at = time.monotonic() + self.tombstone_retry_sec
+        logger.warning(
+            "会话删除墓碑%s失败（%s），本实例回退进程内墓碑，%.0f 秒后重试共享墓碑",
+            action,
+            exc,
+            self.tombstone_retry_sec,
+        )
+
     def mark_deleted(self, user_id: str, session_id: str) -> None:
         """记录短时墓碑，阻止在途对话把刚删除的会话写回。
 
         配置 Redis 时同时写入共享墓碑（TTL 与本地一致），其它实例的新请求
-        也能看到该会话已删除；运行中 Redis 故障时本实例回退进程内墓碑。
+        也能看到该会话已删除；运行中 Redis 故障时本实例回退进程内墓碑，
+        并在冷却后自动重试共享墓碑。
         """
         key = self._session_key(user_id, session_id)
-        self._deleted_sessions[key] = time.monotonic()
+        now = time.monotonic()
+        self._deleted_sessions[key] = now
         self._deleted_sessions.move_to_end(key)
+        # 先清掉已过期的墓碑，避免仍有效的墓碑被容量上限淘汰
+        expired = [
+            candidate
+            for candidate, at in self._deleted_sessions.items()
+            if now - at > self.tombstone_ttl_sec
+        ]
+        for candidate in expired:
+            del self._deleted_sessions[candidate]
         while len(self._deleted_sessions) > self.max_tombstones:
             self._deleted_sessions.popitem(last=False)
-        if self._tombstones_shared and self._redis_client is not None:
+        client = self._shared_tombstones()
+        if client is not None:
             try:
-                self._redis_client.setex(
+                client.setex(
                     self._deleted_key(user_id, session_id),
                     int(self.tombstone_ttl_sec),
                     "1",
                 )
             except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
-                self._tombstones_shared = False
-                logger.warning("写入会话删除墓碑失败（%s），本实例回退进程内墓碑", exc)
+                self._tombstone_failed(exc, "写入")
+            else:
+                self._tombstones_shared = True
+                self._tombstone_retry_at = 0.0
+
+    def unmark_deleted(self, user_id: str, session_id: str) -> None:
+        """撤销墓碑（删除失败时使用），避免把仍存在的会话误判为已删除。"""
+        self._deleted_sessions.pop(self._session_key(user_id, session_id), None)
+        client = self._shared_tombstones()
+        if client is None:
+            return
+        try:
+            client.delete(self._deleted_key(user_id, session_id))
+        except Exception as exc:  # noqa: BLE001 - 留着墓碑由 TTL 过期更安全
+            self._tombstone_failed(exc, "撤销")
 
     def is_recently_deleted(self, user_id: str, session_id: str | None) -> bool:
         if not session_id:
@@ -630,16 +681,18 @@ class AligoWebApp:
             if time.monotonic() - created <= self.tombstone_ttl_sec:
                 return True
             self._deleted_sessions.pop(key, None)
-        if self._tombstones_shared and self._redis_client is not None:
+        client = self._shared_tombstones()
+        if client is not None:
             try:
-                return bool(
-                    self._redis_client.exists(
-                        self._deleted_key(user_id, session_id)
-                    )
+                exists = bool(
+                    client.exists(self._deleted_key(user_id, session_id))
                 )
             except Exception as exc:  # noqa: BLE001 - 读失败时回退进程内墓碑
-                self._tombstones_shared = False
-                logger.warning("读取会话删除墓碑失败（%s），本实例回退进程内墓碑", exc)
+                self._tombstone_failed(exc, "读取")
+            else:
+                self._tombstones_shared = True
+                self._tombstone_retry_at = 0.0
+                return exists
         return False
 
     def close_all(self) -> None:
@@ -1888,6 +1941,10 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
         async with state.lock_for(user_id):
+            # 先落墓碑再删库：删除进行中到达其它实例的新请求会直接被拒绝，
+            # 避免删完后在途生成把会话写回；删除失败时撤销墓碑
+            state.mark_deleted(user_id, session_id)
+
             def _delete() -> int:
                 store = _open_long_term(user_id)
                 try:
@@ -1900,10 +1957,10 @@ def create_app(model: Any = None) -> FastAPI:
                 # 慢库不能让整个事件循环（其它会话的 SSE 心跳）停住
                 removed = await asyncio.to_thread(_delete)
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
+                state.unmark_deleted(user_id, session_id)
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
             await asyncio.to_thread(state.drop_session, user_id, session_id)
-            state.mark_deleted(user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}
 

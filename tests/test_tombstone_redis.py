@@ -68,8 +68,10 @@ def test_shared_tombstone_with_redis(monkeypatch):
 
         state_a.mark_deleted(user, session)
         assert client.exists(key) == 1
+        ttl = client.ttl(key)
+        assert 0 < ttl <= int(state_a.tombstone_ttl_sec), "共享墓碑 TTL 应与本地一致"
         assert state_b.is_recently_deleted(user, session) is True
-        print("✓ 删除墓碑通过 Redis 跨实例共享")
+        print("✓ 删除墓碑通过 Redis 跨实例共享（含 TTL）")
     finally:
         client.delete(key)
         storage.reset_failure_cache()
