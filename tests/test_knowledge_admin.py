@@ -898,6 +898,20 @@ def test_document_group_at_size_limit_roundtrip(monkeypatch):
     print("✓ 上限大小整组文档可回填、可还原")
 
 
+def test_find_duplicate_contents(monkeypatch):
+    """重复内容扫描：去空白后相同归为一组，空内容忽略。"""
+    rows = [
+        {"id": 1, "content": "重复内容", "metadata": "{}"},
+        {"id": 2, "content": "唯一内容", "metadata": "{}"},
+        {"id": 3, "content": " 重复内容 ", "metadata": "{}"},
+        {"id": 4, "content": "", "metadata": "{}"},
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    assert knowledge_admin.find_duplicate_contents() == [("重复内容", [1, 3])]
+    print("✓ 重复内容扫描（去空白后相同）")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -1035,6 +1049,7 @@ if __name__ == "__main__":
         test_import_restore_over_limit_raises,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,
+        test_find_duplicate_contents,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,
