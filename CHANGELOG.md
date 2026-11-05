@@ -8,9 +8,11 @@
 - 多实例共享限流：配置 `REDIS_URL` 后对话接口的用户桶与 IP 桶计数写入 Redis 有序集合（`aligo:ratelimit:*`），多个 Web 实例共享同一份额度；窗口时间取自 Redis 服务器时钟，避免实例间时钟不一致
 - Redis 限流故障自动回退进程内实现（60 秒冷却后重试），限流后端故障不影响请求处理
 - `/api/health` 新增 `rate_limit` 字段（`redis` / `memory`），便于确认当前限流后端
+- `/api/health` 新增 `rate_limit_degraded` 字段：Redis 限流故障回退进程内期间为 `true`
 
 ### 修复
 - `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找
+- Redis 限流响应解析兼容未开启 `decode_responses` 的客户端（bytes 返回值），避免 `float()` 抛错
 
 ### 测试
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例

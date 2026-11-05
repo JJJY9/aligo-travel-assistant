@@ -99,7 +99,9 @@ def test_redis_limiter_falls_back_when_unavailable():
     """Redis 故障时回退进程内限流，并在冷却期内不再尝试 Redis。"""
     client = _UnavailableRedis()
     limiter = RedisRateLimiter(client, "unit-fallback", limit=2, window_sec=60)
+    assert limiter.degraded is False
     assert limiter.check("k") is None
+    assert limiter.degraded is True
     assert client.eval_calls == 1
     assert limiter.check("k") is None
     assert limiter.check("k") is not None, "回退实现也应执行限流"
@@ -124,6 +126,30 @@ def test_create_rate_limiter_backends():
     print("✓ 限流器工厂按是否提供 Redis 客户端选择后端")
 
 
+class _BytesRedis:
+    """模拟未开启 decode_responses 的 Redis 客户端：返回 bytes。"""
+
+    def __init__(self, result) -> None:
+        self.result = result
+
+    def eval(self, *args, **kwargs):
+        return self.result
+
+
+def test_redis_limiter_handles_bytes_replies():
+    peek = RedisRateLimiter(_BytesRedis(b"1.5"), "unit-bytes", limit=2, window_sec=60)
+    assert peek.peek("k") == 1.5
+
+    allowed = RedisRateLimiter(_BytesRedis(b"-1"), "unit-bytes", limit=2, window_sec=60)
+    assert allowed.check("k") is None
+
+    status = RedisRateLimiter(
+        _BytesRedis([b"1", b"2.5"]), "unit-bytes", limit=2, window_sec=60
+    )
+    assert status.status("k") == (1, 2.5)
+    print("✓ 兼容未解码（bytes）的 Redis 返回值")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
@@ -132,4 +158,5 @@ if __name__ == "__main__":
     test_peek_does_not_record()
     test_redis_limiter_falls_back_when_unavailable()
     test_create_rate_limiter_backends()
+    test_redis_limiter_handles_bytes_replies()
     print("\n全部通过")
