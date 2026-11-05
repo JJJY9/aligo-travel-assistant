@@ -592,6 +592,22 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", "") or "")
 
 
+def _client_host(request: Request) -> str:
+    """限流使用的客户端地址。
+
+    默认取 TCP 对端地址。部署在反向代理后面时设置 ``TRUST_PROXY_HEADERS=1``，
+    改为取 ``X-Forwarded-For`` 的第一个地址（代理需覆盖写入该头）；默认关闭，
+    避免客户端自行伪造该头绕过 IP 桶。
+    """
+    if RATE_LIMIT_CONFIG.get("trust_proxy_headers"):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first[:64]
+    return request.client.host if request.client else "unknown"
+
+
 def _enforce_rate_limit(
     state: AligoWebApp, user_id: str, request: Request
 ) -> dict[str, str]:
@@ -600,7 +616,7 @@ def _enforce_rate_limit(
     Returns:
         供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
     """
-    client = request.client.host if request.client else "unknown"
+    client = _client_host(request)
     user_key = f"{client}:{user_id}"
     # 先用 peek 检查两个桶，都有额度才记录：否则被 429 的请求会消耗
     # 另一个桶的配额，一个客户端的重试循环会把同 IP 的其它客户端一起锁死

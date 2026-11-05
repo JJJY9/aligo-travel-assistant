@@ -68,6 +68,8 @@ class RateLimitConfig(TypedDict):
     chat_requests: int
     ip_requests: int
     window_sec: int
+    # 是否信任反向代理写入的 X-Forwarded-For（默认关闭，避免客户端伪造 IP 绕过 IP 桶）
+    trust_proxy_headers: bool
 
 
 LLM_CONFIG: LLMConfig = {
@@ -102,6 +104,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 STORAGE_CONFIG: StorageConfig = {
     "redis_url": os.environ.get("REDIS_URL", ""),
     "postgres_dsn": os.environ.get("DATABASE_URL", ""),
@@ -124,8 +133,10 @@ RESILIENCE_CONFIG: ResilienceConfig = {
 #   CHAT_RATE_LIMIT_IP   单个客户端 IP 窗口内允许的对话请求总数（默认 120，用户 ID 由
 #                        请求方提供、可轮换，IP 桶防止通过换 ID 绕过限流）
 #   CHAT_RATE_WINDOW_SEC 窗口长度（秒，默认 60）
+#   TRUST_PROXY_HEADERS  为 1 时按反向代理的 X-Forwarded-For 第一个地址限流（默认关闭）
 RATE_LIMIT_CONFIG: RateLimitConfig = {
     "chat_requests": _env_int("CHAT_RATE_LIMIT", 30),
     "ip_requests": _env_int("CHAT_RATE_LIMIT_IP", 120),
     "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
+    "trust_proxy_headers": _env_bool("TRUST_PROXY_HEADERS", False),
 }
