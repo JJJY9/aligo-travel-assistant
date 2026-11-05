@@ -502,6 +502,24 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
         }
 
 
+def find_duplicate_contents() -> list[tuple[str, list[int]]]:
+    """返回内容完全相同的片段组（按首次出现顺序），供人工清理。
+
+    历史版本的导入容错较差时可能留下重复内容；这里只做只读扫描，不删除。
+    """
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    seen: dict[str, list[int]] = {}
+    for row in _iter_all_rows(client):
+        content = str(row.get("content", "")).strip()
+        if not content:
+            continue
+        seen.setdefault(content, []).append(int(row.get("id", 0) or 0))
+    return [
+        (content, ids) for content, ids in seen.items() if len(ids) > 1
+    ]
+
+
 def _existing_contents() -> set[str]:
     """库中全部片段的内容集合（全量扫描，不受单页 16384 条限制）。"""
     return {

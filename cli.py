@@ -1456,6 +1456,34 @@ def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> i
     return 0
 
 
+def run_knowledge_duplicates_standalone(limit: int = 20) -> int:
+    """列出内容完全相同的知识片段组（用于 `python cli.py kb-duplicates`）。
+
+    Returns:
+        0 扫描成功（有无重复都算成功）；1 读取失败
+    """
+    from utils.knowledge_admin import find_duplicate_contents
+
+    try:
+        groups = find_duplicate_contents()
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"读取失败：{exc}")
+        return 1
+    if not groups:
+        print("没有重复内容的知识片段")
+        return 0
+    total = sum(len(ids) for _, ids in groups)
+    print(f"发现 {len(groups)} 组重复内容（共 {total} 条片段）：")
+    for content, ids in groups[:limit]:
+        preview = " ".join(content.split())[:60]
+        joined = "、".join(f"#{doc_id}" for doc_id in ids)
+        print(f"  {len(ids)} 条 · {joined}  {preview}")
+    if len(groups) > limit:
+        print(f"  … 其余 {len(groups) - limit} 组未显示（可保留不同的那一份后删除其余）")
+    print("提示：多分片记录请用整份编辑或整组删除维护，避免只删掉其中一片")
+    return 0
+
+
 def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
     """清理历史行程中的完全重复记录（用于 `python cli.py trips-dedupe <user_id> [--dry-run]`）。
 
@@ -2140,7 +2168,7 @@ def _parse_export_args(
 
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / kb / eval / kb-export / "
-    "kb-import / kb-list / kb-delete / preferences / trips / trips-dedupe / "
+    "kb-import / kb-list / kb-delete / kb-duplicates / preferences / trips / trips-dedupe / "
     "sessions / session-archive / session-export / sessions-export / trips-export"
 )
 
@@ -2253,6 +2281,11 @@ def main():
                     int(args[0]), whole_group="--group" in args[1:]
                 )
             )
+        if arg == "kb-duplicates":
+            if len(sys.argv) != 2:
+                print("用法：python cli.py kb-duplicates")
+                sys.exit(2)
+            sys.exit(run_knowledge_duplicates_standalone())
         if arg == "preferences":
             if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py preferences <user_id>")

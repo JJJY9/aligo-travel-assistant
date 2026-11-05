@@ -125,6 +125,37 @@ def test_delete_error(monkeypatch):
     print("✓ kb-delete 删除失败返回 1")
 
 
+def test_duplicates_reports_groups(monkeypatch):
+    monkeypatch.setattr(
+        knowledge_admin,
+        "find_duplicate_contents",
+        lambda: [
+            ("重复内容甲", [3, 9]),
+            ("重复内容乙", [5, 6, 7]),
+        ],
+    )
+    code, out = _capture(cli.run_knowledge_duplicates_standalone)
+    assert code == 0
+    assert "发现 2 组重复内容（共 5 条片段）" in out
+    assert "#3、#9" in out
+    assert "重复内容甲" in out
+    print("✓ kb-duplicates 列出重复组")
+
+
+def test_duplicates_none_and_error(monkeypatch):
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: [])
+    code, out = _capture(cli.run_knowledge_duplicates_standalone)
+    assert code == 0 and "没有重复内容" in out
+
+    def boom():
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", boom)
+    code, out = _capture(cli.run_knowledge_duplicates_standalone)
+    assert code == 1 and "读取失败" in out
+    print("✓ kb-duplicates 无重复 / 读取失败")
+
+
 if __name__ == "__main__":
     for case in (
         test_list_unavailable,
@@ -133,6 +164,8 @@ if __name__ == "__main__":
         test_delete_success,
         test_delete_not_found,
         test_delete_error,
+        test_duplicates_reports_groups,
+        test_duplicates_none_and_error,
     ):
         mp = pytest.MonkeyPatch()
         try:
