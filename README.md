@@ -507,7 +507,7 @@ python cli.py
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部；`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复会话；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
 
-全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`，按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
+全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`；中文或超长用户名会追加短哈希避免重名；按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
 
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）；`python cli.py doctor --json` 输出机器可读的 `status` / `checks`，便于监控脚本解析，退出码不变；`--offline`（或 `--no-network`）跳过 LLM 连通性检查，适合网络不可达或 CI 环境。
 
