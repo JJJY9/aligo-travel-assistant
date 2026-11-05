@@ -1418,7 +1418,14 @@ def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
         category = meta.get("category") or meta.get("title") or ""
         preview = " ".join(str(item.get("content", "")).split())[:60]
         tag = f" · {category}" if category else ""
-        print(f"  #{item['id']}{tag}  {preview}")
+        chunk = ""
+        try:
+            parts = int(meta.get("parts") or 1)
+        except (TypeError, ValueError):
+            parts = 1
+        if parts > 1:
+            chunk = f" · 分片 {meta.get('part') or '?'}/{parts}"
+        print(f"  #{item['id']}{tag}{chunk}  {preview}")
     return 0
 
 
