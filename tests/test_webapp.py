@@ -3831,6 +3831,16 @@ def test_knowledge_transfer_api(monkeypatch):
     assert preview.status_code == 200
     assert preview.json()["would_import"] == 1
     assert calls["dry_run"] is True
+
+    # 预览端点一次接收整个备份（不受导入 200 条上限），只透传 dry_run
+    preview_many = client.post(
+        "/api/knowledge/import/preview",
+        json={"documents": [{"content": f"p{index}"} for index in range(250)]},
+    )
+    assert preview_many.status_code == 200
+    assert preview_many.json()["would_import"] == 250
+    assert calls["dry_run"] is True
+    assert len(calls["documents"]) == 250
     imported = client.post(
         "/api/knowledge/import",
         json={"documents": [{"content": "x", "metadata": {"category": "c"}}]},
