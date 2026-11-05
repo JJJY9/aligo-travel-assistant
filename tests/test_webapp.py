@@ -3442,6 +3442,23 @@ def test_knowledge_document_write_api(monkeypatch):
         client.put("/api/knowledge/documents/7", json={"content": ""}).status_code
         == 422
     )
+    # 整份编辑回传的派生分片元数据（part/parts/group）在校验前被丢弃：
+    # 8 个用户键 + 3 个派生键不应 422；11 个用户键仍被拒绝
+    derived = {f"k{index}": "v" for index in range(8)}
+    derived.update({"part": "1", "parts": "2", "group": "g"})
+    accepted = client.put(
+        "/api/knowledge/documents/7", json={"content": "x", "metadata": derived}
+    )
+    assert accepted.status_code == 200
+    assert "part" not in updated["call"][2] and "group" not in updated["call"][2]
+    too_many_keys = {f"k{index}": "v" for index in range(11)}
+    assert (
+        client.put(
+            "/api/knowledge/documents/7",
+            json={"content": "x", "metadata": too_many_keys},
+        ).status_code
+        == 422
+    )
     assert (
         client.put("/api/knowledge/documents/0", json={"content": "x"}).status_code
         == 422

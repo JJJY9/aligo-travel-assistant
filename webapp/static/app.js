@@ -3534,7 +3534,15 @@ async function removeKnowledgeDocument(doc) {
     state.kbDeleting.delete(docId);
   }
   if (removed) {
-    if (state.kbEditingId === docId) resetKnowledgeForm();
+    const editingGroup = String(
+      (state.kbEditingMetadata && state.kbEditingMetadata.group) || "",
+    );
+    const deletesEditingGroup =
+      wholeGroup &&
+      Boolean(editingGroup) &&
+      editingGroup === String(metadata.group || "");
+    // 整组删除时，正在编辑的可能是同组的另一分片：同样要退出编辑态
+    if (state.kbEditingId === docId || deletesEditingGroup) resetKnowledgeForm();
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
     els.kbList.focus();
   } else if (button) {
@@ -3562,12 +3570,12 @@ async function startEditKnowledge(doc) {
       const data = await getJSON(
         `/api/knowledge/documents/${encodeURIComponent(doc.id)}/group`,
       );
-      // 请求期间用户可能点了另一行的编辑：只认最后一次点击
-      if (seq !== state.kbEditSeq) return;
+      // 请求期间用户可能点了另一行的编辑或开始了保存：只认最后一次操作
+      if (seq !== state.kbEditSeq || state.kbSaving) return;
       content = String(data.content || "");
       groupParts = Number(data.parts || parts);
     } catch (error) {
-      if (seq !== state.kbEditSeq) return;
+      if (seq !== state.kbEditSeq || state.kbSaving) return;
       toast(`读取整份文档失败：${error.message}`);
       return;
     }
@@ -3650,7 +3658,9 @@ async function addKnowledgeDocument(event) {
     state.kbSaving = false;
     const parts = Number((data && data.parts) || 0);
     if (editingId && editingGroupParts > 1) {
-      toast(`整份文档已更新（${parts || editingGroupParts} 片）`);
+      // 内容缩短成单条时服务端不再返回 parts：提示按实际（1 片）展示
+      const resultParts = parts > 1 ? parts : 1;
+      toast(`整份文档已更新（${resultParts} 片）`);
     } else if (parts > 1) {
       toast(`长内容已拆分为 ${parts} 条片段（编辑任一分片会整份替换）`);
     } else {
