@@ -51,6 +51,30 @@ def test_prefix_fallback_for_installed_wheel(monkeypatch):
     print("✓ 源码目录缺失时回退到 sys.prefix/.claude/skills")
 
 
+def test_user_base_fallback_for_pip_user_install(monkeypatch):
+    """源码与 sys.prefix 都没有技能时，回退到 pip install --user 的用户目录。"""
+    monkeypatch.delenv(skill_paths.ENV_SKILLS_DIR, raising=False)
+    with (
+        tempfile.TemporaryDirectory() as fake_pkg,
+        tempfile.TemporaryDirectory() as prefix,
+        tempfile.TemporaryDirectory() as userbase,
+    ):
+        monkeypatch.setattr(
+            skill_paths, "__file__", str(Path(fake_pkg) / "utils" / "skill_paths.py")
+        )
+        monkeypatch.setattr(sys, "prefix", prefix)
+        monkeypatch.setattr("site.getuserbase", lambda: userbase)
+        installed = Path(userbase) / ".claude" / "skills"
+        (installed / "plan-trip").mkdir(parents=True)
+        assert skill_paths.resolve_skills_root() == installed
+
+        # sys.prefix 下的技能目录优先于用户目录
+        prefix_skills = Path(prefix) / ".claude" / "skills"
+        (prefix_skills / "plan-trip").mkdir(parents=True)
+        assert skill_paths.resolve_skills_root() == prefix_skills
+    print("✓ pip install --user 的用户目录回退，且 sys.prefix 优先")
+
+
 def test_wheel_data_files_cover_skill_code():
     """pyproject 的 data-files 必须覆盖全部技能代码与声明，且不包含运行时数据。"""
     if tomllib is None:
@@ -88,6 +112,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_prefix_fallback_for_installed_wheel(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_base_fallback_for_pip_user_install(mp)
     finally:
         mp.undo()
     test_wheel_data_files_cover_skill_code()

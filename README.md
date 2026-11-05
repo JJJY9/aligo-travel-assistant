@@ -340,7 +340,7 @@ pip install rich==13.9.4                    # CLI界面
 pip install ddgs==9.10.0                    # 网络搜索
 ```
 
-也可以直接安装 [Releases](https://github.com/JJJY9/aligo-travel-assistant/releases) 中的 wheel（已包含 Web 静态资源与 `.claude/skills` 技能代码，技能会安装到虚拟环境的 `.claude/skills`）：
+也可以直接安装 [Releases](https://github.com/JJJY9/aligo-travel-assistant/releases) 中的 wheel（已包含 Web 静态资源与 `.claude/skills` 技能代码，普通安装时技能位于虚拟环境根目录，`pip install --user` 时位于用户目录）：
 
 ```bash
 pip install aligo_travel_assistant-1.4.1-py3-none-any.whl

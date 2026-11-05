@@ -9,6 +9,9 @@
 - Redis 限流故障自动回退进程内实现（60 秒冷却后重试），限流后端故障不影响请求处理
 - `/api/health` 新增 `rate_limit` 字段（`redis` / `memory`），便于确认当前限流后端
 
+### 修复
+- `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找
+
 ### 测试
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例
 - `tests/test_rate_limit.py` 补充 Redis 故障回退与限流器工厂用例
