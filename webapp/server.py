@@ -546,6 +546,14 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
         )
+        # 天气接口每次未命中会上游发两次请求；按客户端 IP 限流，
+        # 保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度
+        self.weather_limiter = create_rate_limiter(
+            "weather",
+            RATE_LIMIT_CONFIG.get("weather_requests", 30),
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
+        )
         # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内
         self.eval_lock = DistributedLock(
             redis_client, "aligo:lock:kb_eval", ttl_sec=300
@@ -679,11 +687,12 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """
     backend = getattr(state.rate_limiter, "backend", "memory")
     configured = bool(STORAGE_CONFIG.get("redis_url"))
-    # 三个桶各自回退：任一桶处于降级冷却期都应上报，不能只看用户桶
+    # 各桶独立回退：任一桶处于降级冷却期都应上报，不能只看用户桶
     degradation_states = (
         getattr(state.rate_limiter, "degraded", False),
         getattr(state.ip_limiter, "degraded", False),
         getattr(state.kb_limiter, "degraded", False),
+        getattr(state.weather_limiter, "degraded", False),
     )
     degraded = any(degradation_states) or (backend == "memory" and configured)
     return {
@@ -693,6 +702,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         "user_limit": state.rate_limiter.limit,
         "ip_limit": state.ip_limiter.limit,
         "kb_limit": state.kb_limiter.limit,
+        "weather_limit": state.weather_limiter.limit,
         "window_sec": state.rate_limiter.window_sec,
     }
 
@@ -774,6 +784,37 @@ def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, st
     remaining, reset = state.kb_limiter.status(client)
     return {
         "X-RateLimit-Limit": str(state.kb_limiter.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
+
+
+def _enforce_weather_rate_limit(
+    state: AligoWebApp, request: Request
+) -> dict[str, str]:
+    """天气接口的独立限流（按客户端 IP，与对话 / 知识库额度互不影响）。
+
+    Returns:
+        供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
+    """
+    client = _client_host(request)
+    retry_after = state.weather_limiter.check(client)
+    if retry_after is not None:
+        wait_seconds = max(1, math.ceil(retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail=f"天气查询过于频繁，请约 {wait_seconds} 秒后重试"
+            f"（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(state.weather_limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+    remaining, reset = state.weather_limiter.status(client)
+    return {
+        "X-RateLimit-Limit": str(state.weather_limiter.limit),
         "X-RateLimit-Remaining": str(remaining),
         "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
     }
@@ -1239,17 +1280,22 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.get("/api/weather")
-    def weather(city: str = Query(..., min_length=1, max_length=50)) -> dict[str, Any]:
-        """目的地天气（Open-Meteo，无 API Key；结果缓存 10 分钟）。"""
+    def weather(
+        request: Request, city: str = Query(..., min_length=1, max_length=50)
+    ) -> JSONResponse:
+        """目的地天气（Open-Meteo，无 API Key；进程内缓存 10 分钟，按 IP 限流）。"""
         name = city.strip()
         if not name:
             raise HTTPException(status_code=422, detail="城市不能为空")
+        headers = _enforce_weather_rate_limit(state, request)
         try:
-            return fetch_weather(name)
+            data = fetch_weather(name)
         except WeatherError as exc:
             message = str(exc)
+            logger.warning("天气查询失败（%s）：%s", name, message)
             status_code = 404 if message.startswith("未找到城市") else 503
             raise HTTPException(status_code=status_code, detail=message) from exc
+        return JSONResponse(content=jsonable_encoder(data), headers=headers)
 
     @app.get("/api/metrics")
     def metrics() -> dict[str, Any]:

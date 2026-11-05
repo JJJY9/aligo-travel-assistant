@@ -125,6 +125,36 @@ def test_weather_success_no_search():
     print("✓ 天气可用时不触发搜索")
 
 
+def test_weather_and_search_failure_surfaces_weather_message():
+    """搜索也失败时，返回天气失败的具体原因，而不是笼统的搜索错误。"""
+    agent = _load_agent_class()(name="InformationQueryAgent", model=_FakeModel())
+    calls = {"search": 0}
+
+    async def fake_weather(query):
+        return {
+            "query_type": "天气查询",
+            "query_success": False,
+            "results": {"message": "未找到城市「杭洲」，请检查城市名"},
+        }
+
+    async def fake_search(query):
+        calls["search"] += 1
+        return {
+            "query_type": "网络搜索",
+            "query_success": False,
+            "results": {"message": "未找到相关结果"},
+        }
+
+    agent._weather_query = fake_weather
+    agent._web_search = fake_search
+
+    result = json.loads(asyncio.run(agent.reply(_msg())).content)
+    assert calls["search"] == 1, "仍应先尝试联网搜索"
+    assert result["query_type"] == "天气查询"
+    assert "未找到城市" in result["results"]["message"]
+    print("✓ 天气与搜索都失败时返回具体的天气原因")
+
+
 def test_extract_city():
     agent = _load_agent_class()(name="InformationQueryAgent", model=_FakeModel())
     assert agent._extract_city_from_query("杭州明天天气怎么样？") == "杭州"
@@ -214,6 +244,7 @@ if __name__ == "__main__":
     test_weather_failure_falls_back_to_search()
     test_weather_exception_falls_back_to_search()
     test_weather_success_no_search()
+    test_weather_and_search_failure_surfaces_weather_message()
     test_extract_city()
     test_weather_query_open_meteo_formatting()
     test_weather_query_unknown_city()

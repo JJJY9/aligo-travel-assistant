@@ -98,6 +98,7 @@ class InformationQueryAgent(AgentBase):
 
         # 天气类问题优先走 Open-Meteo；接口不可用时回退到联网搜索
         result = None
+        weather_failure = None
         if self._is_weather_query(user_query):
             logger.info(f"Weather query: {user_query}")
             try:
@@ -107,7 +108,8 @@ class InformationQueryAgent(AgentBase):
                 result = None
             if result is not None and result.get("query_success"):
                 return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
-            logger.warning("Weather API unavailable, falling back to web search")
+            weather_failure = result
+            logger.warning("Weather query unavailable, falling back to web search")
 
         if result is None or not result.get("query_success"):
             logger.info(f"Web search query: {user_query}")
@@ -120,6 +122,13 @@ class InformationQueryAgent(AgentBase):
                     "query_success": False,
                     "results": {"error": str(e)},
                 }
+            if (
+                weather_failure is not None
+                and (result is None or not result.get("query_success"))
+            ):
+                # 搜索也失败时，天气失败的具体原因（如城市名拼错）比
+                # 「搜索库未安装 / 未找到相关结果」更能指导用户
+                result = weather_failure
 
         return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
 
