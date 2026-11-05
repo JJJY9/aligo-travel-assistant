@@ -8,9 +8,11 @@
 
 运行：python tests/test_storage_factory.py
 """
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -272,10 +274,10 @@ def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
 
 
 def test_valid_json_non_object_memory_file_is_backed_up():
-    """合法 JSON 但不是对象 / 字段结构异常时同样按损坏处理，不能抛错。"""
+    """合法 JSON 但不是对象时按损坏处理；对象内字段异常读取时修复。"""
     from pathlib import Path
 
-    for content in ("[]", "null", '{"statistics": null}'):
+    for content in ("[]", "null"):
         storage_dir = tempfile.mkdtemp()
         path = Path(storage_dir) / "u-shape.json"
         path.write_text(content, encoding="utf-8")
@@ -284,7 +286,16 @@ def test_valid_json_non_object_memory_file_is_backed_up():
         backups = list(Path(storage_dir).glob("u-shape.json.corrupt-*"))
         assert backups, f"结构异常的文件应备份：{content}"
         assert backups[0].read_text(encoding="utf-8") == content
-    print("✓ 非对象 / 结构异常的记忆文件备份后重建")
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-shape.json"
+    path.write_text('{"statistics": null}', encoding="utf-8")
+    memory = LongTermMemory("u-shape", storage_dir)
+    assert memory.get_chat_history() == []
+    assert not list(Path(storage_dir).glob("u-shape.json.corrupt-*")), (
+        "对象内的 null 字段可修复，不应备份成损坏文件"
+    )
+    print("✓ 非对象记忆文件备份重建；字段异常读取时修复")
 
 
 def test_memory_persistence_error_is_not_retriable():
@@ -451,10 +462,100 @@ def test_null_list_fields_are_repaired():
     print("✓ null 字段读取时修复为空集合")
 
 
+def test_migrate_fills_statistics_defaults():
+    """statistics 缺子字段时补默认值，保存行程不再 KeyError。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-stats.json"
+    path.write_text(json.dumps({"statistics": {}}), encoding="utf-8")
+    memory = LongTermMemory("u-stats", storage_dir)
+    trip_id = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        }
+    )
+    assert trip_id == "trip_1"
+    stats = memory.get_statistics()
+    assert stats["total_trips"] == 1
+    assert stats["frequent_destinations"] == {"上海": 1}
+    print("✓ 缺失 statistics 子字段时补默认值")
+
+
+def test_migrate_drops_non_object_entries():
+    """chat_history / trip_history 里的非对象元素在迁移时丢弃。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-bad-entry.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    None,
+                    "oops",
+                    {"role": "user", "content": "hi", "session_id": "s1"},
+                ],
+                "trip_history": [42, ["x"]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-bad-entry", storage_dir)
+    assert len(memory.get_chat_history()) == 1
+    assert memory.get_trip_history(limit=None) == []
+    memory.add_chat_message("user", "again", "s1")
+    assert len(memory.get_chat_history()) == 2
+    print("✓ 非对象历史记录在迁移时被丢弃")
+
+
+def test_pg_reconnects_after_connection_error():
+    """连接被服务端终止后自动重连并重试一次。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    class _Boom(Exception):
+        pass
+
+    class _BrokenConn:
+        def cursor(self):
+            raise _Boom("server closed the connection")
+
+    class _GoodCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _GoodConn:
+        def cursor(self):
+            return _GoodCursor()
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store.dsn = "postgresql://example/db"
+    store._conn = _BrokenConn()
+    store._retry_errors = (_Boom,)
+    reconnects = []
+
+    def fake_reconnect():
+        reconnects.append(True)
+        store._conn = _GoodConn()
+
+    store._reconnect = fake_reconnect
+    assert store._fetchall("SELECT 1") == [(1,)]
+    assert reconnects == [True], "连接级错误后应重连一次并重试"
+    print("✓ PostgreSQL 连接失效后重连重试")
+
+
 def test_load_holds_path_lock():
     """读取全程持锁：Windows 上打开的文件句柄会让并发 os.replace 失败。"""
     import json as json_module
-    from pathlib import Path
 
     from context import long_term_memory as lt
 
@@ -855,6 +956,9 @@ if __name__ == "__main__":
     test_corrupt_backup_does_not_move_concurrently_written_file(pytest.MonkeyPatch())
     test_valid_json_non_object_memory_file_is_backed_up()
     test_null_list_fields_are_repaired()
+    test_migrate_fills_statistics_defaults()
+    test_migrate_drops_non_object_entries()
+    test_pg_reconnects_after_connection_error()
     test_load_holds_path_lock()
     test_pg_delete_trip_deletes_single_row()
     test_summary_not_starved_by_long_current_session()
