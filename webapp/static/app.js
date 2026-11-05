@@ -3527,7 +3527,7 @@ async function addKnowledgeDocument(event) {
     state.kbSaving = false;
     const parts = Number((data && data.parts) || 0);
     if (parts > 1) {
-      toast(`长内容已拆分为 ${parts} 条片段，可分别编辑`);
+      toast(`长内容已拆分为 ${parts} 条片段（多分片记录请整组删除后重加，暂不支持单条编辑）`);
     } else {
       toast(editingId ? "知识片段已更新" : "知识片段已添加");
     }

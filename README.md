@@ -598,7 +598,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
-| PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404） |
+| PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404；多分片记录暂不支持单条编辑，返回 400） |
 | GET | `/api/knowledge/categories` | 知识片段分类统计（维护面板筛选下拉框） |
 | GET | `/api/knowledge/search` | 语义检索知识片段（`q` / `top_k`，返回相似度） |
 | GET | `/api/knowledge/eval` | 离线检索评测（14 个问题，hit@1/3/5 与 MRR；不调用大模型） |
@@ -853,7 +853,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
 - **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。
 - **天气缓存是进程内缓存**：`/api/weather` 的 10 分钟缓存与同城并发合并都在单个进程内，多实例 / 多 worker 部署时各进程分别请求上游、缓存不共享（限流配置 `REDIS_URL` 后仍跨实例共享）。
-- **知识片段长度**：嵌入模型（BGE-small-zh）只编码前 512 token（约 400 个汉字）；Web / API 单条上限 2000 字，超过 400 字的内容在新增 / 更新 / 导入时会自动按语义边界拆成多条片段（列表中各占一行，可分别编辑 / 删除）。
+- **知识片段长度**：嵌入模型（BGE-small-zh）只编码前 512 token（约 400 个汉字）；Web / API 单条上限 2000 字，超过 400 字的内容在新增 / 更新 / 导入时会自动按语义边界拆成多条片段（列表中各占一行，可分别删除）。多分片记录没有稳定的组标识，**暂不支持单条编辑**（`PUT` 返回 400）：请删除整组后重新添加，避免旧分片残留。
 - **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；CLI 与 Web 同时修改**同一用户**时通过 `<data>.json.lock` 文件锁串行化（Windows / Unix 均支持，等待上限 2 秒；超时按写盘失败处理）。网络文件系统（NFS / SMB）上的锁语义取决于挂载方式，演示时仍建议只保留一个写入端。
 - **存储后端故障回退**：配置的 PostgreSQL 连接失败时自动回退本地 JSON；故障期间新会话写入 JSON 的消息 / 偏好不会在恢复后自动合并到 PostgreSQL（文件保留在 `data/memory/`，恢复时日志会给出警告），需要时请手动迁移。
 - **Windows 文件名大小写不敏感**：用户 ID `Alice` 与 `alice` 会读写同一个 JSON 记忆文件；需要区分用户时请使用不同的名字。
