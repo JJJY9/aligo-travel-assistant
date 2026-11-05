@@ -46,10 +46,15 @@ def test_list_prints_items(monkeypatch):
     def fake_list(limit, offset, query):
         calls.update(limit=limit, offset=offset, query=query)
         return {
-            "total": 2,
+            "total": 3,
             "items": [
                 {"id": 7, "content": "住宿标准：一线城市 500 元/晚", "metadata": {"category": "住宿"}},
                 {"id": 6, "content": "交通标准", "metadata": {}},
+                {
+                    "id": 5,
+                    "content": "第二段",
+                    "metadata": {"category": "住宿", "part": "2", "parts": "3"},
+                },
             ],
         }
 
@@ -58,10 +63,11 @@ def test_list_prints_items(monkeypatch):
     code, out = _capture(cli.run_knowledge_list_standalone, "住宿")
     assert code == 0
     assert calls == {"limit": 50, "offset": 0, "query": "住宿"}
-    assert "共 2 条（关键词：住宿）" in out
+    assert "共 3 条（关键词：住宿）" in out
     assert "#7 · 住宿" in out
     assert "住宿标准" in out
-    print("✓ kb-list 输出总数、分类与预览")
+    assert "#5 · 住宿 · 分片 2/3" in out, "多分片记录应显示分片序号"
+    print("✓ kb-list 输出总数、分类、分片序号与预览")
 
 
 def test_list_error(monkeypatch):
