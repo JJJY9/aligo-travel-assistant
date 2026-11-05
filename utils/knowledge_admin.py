@@ -537,16 +537,23 @@ def find_duplicate_contents() -> list[tuple[str, list[int]]]:
 
 def _existing_contents() -> set[str]:
     """库中全部片段的内容集合（全量扫描，不受单页 16384 条限制）。"""
+    client = _client()
+    # CLI 新进程里 collection 默认可能是 released 状态，先加载再迭代
+    _load_collection(client, COLLECTION_NAME)
     return {
-        str(row.get("content", "")).strip() for row in _iter_all_rows(_client())
+        str(row.get("content", "")).strip() for row in _iter_all_rows(client)
     }
 
 
-def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
+def import_documents(
+    documents: list[dict[str, Any]], dry_run: bool = False
+) -> dict[str, Any]:
     """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。
 
     导出备份中的多分片记录先按 group 拼回整篇再重新拆分；整组已完整存在
     于库中时整组跳过（重复导入同一备份保持幂等，不会因重新拆分产生重复）。
+    ``dry_run`` 只做校验 / 去重并返回 ``would_import``，不加载嵌入模型、
+    不写入任何内容。
     """
     items = list(documents)
     if not items:
@@ -570,7 +577,6 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
-    agent = _get_agent()
     imported: list[int] = []
     with _WRITE_LOCK:
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
@@ -619,7 +625,15 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
             unique.append(item)
         if not unique:
             return {"imported": 0, "skipped": skipped}
+        if dry_run:
+            # 预览：只做校验 / 去重，不加载嵌入模型、不写入
+            return {
+                "imported": 0,
+                "skipped": skipped,
+                "would_import": len(unique),
+            }
 
+        agent = _get_agent()
         # 分块嵌入 / 插入，控制大文件（CLI 导入）的峰值内存
         for start in range(0, len(unique), _IMPORT_CHUNK):
             batch_no = start // _IMPORT_CHUNK + 1

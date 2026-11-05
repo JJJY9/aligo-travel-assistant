@@ -1350,8 +1350,10 @@ def run_knowledge_export_standalone(
     return 0
 
 
-def run_knowledge_import_standalone(source: str) -> int:
-    """从 JSON 文件批量导入知识片段（用于 `python cli.py kb-import <file>`）。
+def run_knowledge_import_standalone(source: str, dry_run: bool = False) -> int:
+    """从 JSON 文件批量导入知识片段（用于 `python cli.py kb-import <file> [--dry-run]`）。
+
+    ``--dry-run`` 只校验 / 去重并报告将导入的数量，不加载嵌入模型、不写入。
 
     Returns:
         0 导入成功；1 文件 / 格式 / 知识库错误
@@ -1382,10 +1384,16 @@ def run_knowledge_import_standalone(source: str) -> int:
         return 1
 
     try:
-        result = import_documents(documents)
+        result = import_documents(documents, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         print(f"导入失败：{exc}")
         return 1
+    if dry_run:
+        print(
+            f"预览：将导入 {result.get('would_import', 0)} 条知识片段，"
+            f"跳过 {result['skipped']} 条（未写入）"
+        )
+        return 0
     print(f"已导入 {result['imported']} 条知识片段，跳过 {result['skipped']} 条")
     return 0
 
@@ -2258,10 +2266,20 @@ def main():
             kb_target, kb_force = parsed_kb_export
             sys.exit(run_knowledge_export_standalone(kb_target, force=kb_force))
         if arg == "kb-import":
-            if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
-                print("用法：python cli.py kb-import <file.json>")
+            args = sys.argv[2:]
+            if (
+                not args
+                or args[0].startswith("-")
+                or len(args) > 2
+                or any(extra != "--dry-run" for extra in args[1:])
+            ):
+                print("用法：python cli.py kb-import <file.json> [--dry-run]")
                 sys.exit(2)
-            sys.exit(run_knowledge_import_standalone(sys.argv[2]))
+            sys.exit(
+                run_knowledge_import_standalone(
+                    args[0], dry_run="--dry-run" in args[1:]
+                )
+            )
         if arg == "kb-list":
             if len(sys.argv) > 3 or (
                 len(sys.argv) == 3 and sys.argv[2].startswith("-")

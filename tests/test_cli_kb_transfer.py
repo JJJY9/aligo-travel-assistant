@@ -30,10 +30,10 @@ def _status(available=True, reason=None):
     return data
 
 
-def _capture(func, *args):
+def _capture(func, *args, **kwargs):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = func(*args)
+        code = func(*args, **kwargs)
     return code, buf.getvalue()
 
 
@@ -146,7 +146,7 @@ def _write_json(tmp, payload):
 def test_import_success(monkeypatch):
     calls = {}
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False):
         calls["documents"] = documents
         return {"imported": len(documents), "skipped": 1}
 
@@ -166,7 +166,7 @@ def test_import_plain_array(monkeypatch):
     monkeypatch.setattr(
         knowledge_admin,
         "import_documents",
-        lambda documents: {"imported": len(documents), "skipped": 0},
+        lambda documents, dry_run=False: {"imported": len(documents), "skipped": 0},
     )
     with tempfile.TemporaryDirectory() as tmp:
         path = _write_json(tmp, [{"content": "a"}])
@@ -191,7 +191,7 @@ def test_import_errors(monkeypatch):
 
         good = _write_json(tmp, {"documents": [{"content": "x"}]})
 
-        def boom(documents):
+        def boom(documents, dry_run=False):
             raise RuntimeError("Milvus 故障")
 
         monkeypatch.setattr(knowledge_admin, "import_documents", boom)
@@ -204,7 +204,7 @@ def test_import_large_file_not_capped(monkeypatch):
     """CLI 直接调用导入实现，不套用 HTTP 接口的单次 200 条上限（备份需可完整恢复）。"""
     calls = {}
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False):
         calls["count"] = len(documents)
         return {"imported": len(documents), "skipped": 0}
 
@@ -220,6 +220,27 @@ def test_import_large_file_not_capped(monkeypatch):
     print("✓ kb-import 不受接口 200 条上限限制")
 
 
+def test_import_dry_run(monkeypatch):
+    calls = {}
+
+    def fake_import(documents, dry_run=False):
+        calls["dry_run"] = dry_run
+        return {"imported": 0, "skipped": 1, "would_import": len(documents)}
+
+    monkeypatch.setattr(knowledge_admin, "import_documents", fake_import)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_json(
+            tmp, {"documents": [{"content": "a"}, {"content": "b"}]}
+        )
+        code, out = _capture(
+            cli.run_knowledge_import_standalone, str(path), dry_run=True
+        )
+    assert code == 0
+    assert calls["dry_run"] is True
+    assert "预览：将导入 2 条知识片段，跳过 1 条（未写入）" in out
+    print("✓ kb-import --dry-run 预览不写入")
+
+
 if __name__ == "__main__":
     for case in (
         test_export_writes_json,
@@ -231,6 +252,7 @@ if __name__ == "__main__":
         test_import_errors,
         test_import_rejects_non_utf8_file,
         test_import_large_file_not_capped,
+        test_import_dry_run,
     ):
         mp = pytest.MonkeyPatch()
         try:

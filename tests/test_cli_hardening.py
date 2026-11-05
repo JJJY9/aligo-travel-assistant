@@ -113,7 +113,7 @@ def test_kb_import_accepts_utf8_bom(monkeypatch):
 
     imported = {}
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False):
         imported["count"] = len(documents)
         return {"imported": len(documents), "skipped": 0}
 
