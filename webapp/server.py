@@ -556,9 +556,13 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
         )
-        # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内
+        # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内；
+        # 工厂让启动时 Redis 不可用的实例在恢复后重新参与共享锁
         self.eval_lock = DistributedLock(
-            redis_client, "aligo:lock:kb_eval", ttl_sec=300
+            redis_client,
+            "aligo:lock:kb_eval",
+            ttl_sec=300,
+            client_factory=get_shared_redis_client,
         )
         self._redis_client = redis_client
         self._tombstones_shared = redis_client is not None
