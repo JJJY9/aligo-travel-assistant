@@ -8,8 +8,8 @@
 - 多实例共享限流：配置 `REDIS_URL` 后对话接口的用户桶与 IP 桶计数写入 Redis 有序集合（`aligo:ratelimit:*`），多个 Web 实例共享同一份额度；窗口时间取自 Redis 服务器时钟，避免实例间时钟不一致
 - Redis 限流故障自动回退进程内实现（60 秒冷却后重试），限流后端故障不影响请求处理
 - `/api/health` 新增 `rate_limit` 字段（`redis` / `memory`），便于确认当前限流后端
-- `/api/health` 新增 `rate_limit_degraded` 字段：Redis 限流故障回退进程内期间为 `true`
-- `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
+- `/api/health` 新增 `rate_limit_configured` / `rate_limit_degraded` 字段：配置了 Redis 但限流器回退进程内（启动时不可用或运行中故障）时 `degraded` 为 `true`
+- `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否配置 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 - 反向代理部署：设置 `TRUST_PROXY_HEADERS=1` 后限流按 `X-Forwarded-For` 第一个地址计算客户端 IP；默认关闭，避免客户端伪造该头绕过 IP 桶
 
 ### 修复

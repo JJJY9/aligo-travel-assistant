@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 
 from agents.conversation import ConversationRuntime
-from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG
+from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG, STORAGE_CONFIG
 from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tracking
 from context.storage import (
     clear_short_term_session,
@@ -608,6 +608,27 @@ def _client_host(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
+    """限流后端与状态（健康检查与指标接口共用）。
+
+    配置了 ``REDIS_URL`` 但限流器仍是进程内实现（启动时 Redis 不可用），
+    同样视为降级；否则运维无法区分「未配置」与「配置了但回退了」。
+    """
+    backend = getattr(state.rate_limiter, "backend", "memory")
+    configured = bool(STORAGE_CONFIG.get("redis_url"))
+    degraded = bool(getattr(state.rate_limiter, "degraded", False)) or (
+        backend == "memory" and configured
+    )
+    return {
+        "backend": backend,
+        "configured": configured,
+        "degraded": degraded,
+        "user_limit": state.rate_limiter.limit,
+        "ip_limit": state.ip_limiter.limit,
+        "window_sec": state.rate_limiter.window_sec,
+    }
+
+
 def _enforce_rate_limit(
     state: AligoWebApp, user_id: str, request: Request
 ) -> dict[str, str]:
@@ -1094,16 +1115,16 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
+        rate = _rate_limit_info(state)
         return {
             "status": "ok",
             "version": APP_VERSION,
             "model": LLM_CONFIG.get("model_name", ""),
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
             "storage": describe_backends(),
-            "rate_limit": getattr(state.rate_limiter, "backend", "memory"),
-            "rate_limit_degraded": bool(
-                getattr(state.rate_limiter, "degraded", False)
-            ),
+            "rate_limit": rate["backend"],
+            "rate_limit_configured": rate["configured"],
+            "rate_limit_degraded": rate["degraded"],
             "time": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -1113,18 +1134,11 @@ def create_app(model: Any = None) -> FastAPI:
 
         多进程 / 多实例部署时请求指标各进程独立统计；限流在配置 Redis 后共享。
         """
-        rate_limiter = state.rate_limiter
         return {
             "requests": REQUEST_METRICS.snapshot(),
             "circuit_breaker": state.breaker.get_status(),
             "sessions_cached": len(state.sessions),
-            "rate_limit": {
-                "backend": getattr(rate_limiter, "backend", "memory"),
-                "degraded": bool(getattr(rate_limiter, "degraded", False)),
-                "user_limit": rate_limiter.limit,
-                "ip_limit": state.ip_limiter.limit,
-                "window_sec": rate_limiter.window_sec,
-            },
+            "rate_limit": _rate_limit_info(state),
         }
 
     @app.get("/api/doctor")

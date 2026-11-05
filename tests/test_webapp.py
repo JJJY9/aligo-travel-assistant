@@ -76,8 +76,24 @@ def test_health_endpoint():
     assert data["storage"]["short_term"] in {"memory", "redis"}
     assert data["storage"]["long_term"] in {"json", "postgres"}
     assert data["rate_limit"] in {"memory", "redis"}
+    assert data["rate_limit_configured"] is False
     assert data["rate_limit_degraded"] is False
     print("✓ /api/health 返回版本 / 模型 / 存储后端")
+
+
+def test_health_marks_configured_redis_fallback_degraded(monkeypatch):
+    """配置 REDIS_URL 但限流器为进程内（启动时 Redis 不可用）时标记降级。"""
+    from context import storage
+
+    client = _client()
+    monkeypatch.setitem(
+        storage.STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0"
+    )
+    data = client.get("/api/health").json()
+    assert data["rate_limit"] == "memory"
+    assert data["rate_limit_configured"] is True
+    assert data["rate_limit_degraded"] is True
+    print("✓ 配置 Redis 但回退进程内限流时 health 标记降级")
 
 
 def test_status_endpoint():
@@ -1786,6 +1802,7 @@ def test_metrics_api():
         assert isinstance(data["sessions_cached"], int)
         rate = data["rate_limit"]
         assert rate["backend"] in {"memory", "redis"}
+        assert rate["configured"] is False
         assert rate["degraded"] is False
         assert rate["user_limit"] >= 1 and rate["ip_limit"] >= 1
         assert rate["window_sec"] > 0

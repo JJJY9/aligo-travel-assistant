@@ -2092,12 +2092,11 @@ async function refreshMetrics() {
     if (els.metricsNote) {
       const cached = Number(data.sessions_cached || 0);
       const rate = data.rate_limit || {};
-      const rateBackend =
-        rate.backend === "redis"
-          ? rate.degraded
-            ? "Redis 共享（降级中）"
-            : "Redis 共享"
-          : "进程内";
+      let rateBackend = rate.backend === "redis" ? "Redis 共享" : "进程内";
+      if (rate.degraded) {
+        rateBackend =
+          rate.backend === "redis" ? "Redis 共享（降级中）" : "进程内（Redis 不可用）";
+      }
       els.metricsNote.hidden = false;
       els.metricsNote.textContent = `进程运行 ${formatUptime(
         requests.uptime_sec,
