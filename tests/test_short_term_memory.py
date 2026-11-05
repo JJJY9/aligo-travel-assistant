@@ -84,6 +84,60 @@ def test_statistics_and_clear():
     print("✓ 统计信息与 clear")
 
 
+class _BrokenRedis:
+    """所有操作都抛连接错误的 Redis 桩。"""
+
+    def pipeline(self):
+        raise ConnectionError("redis down")
+
+    def lrange(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+    def delete(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+    def eval(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+    def llen(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+    def lindex(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+
+def test_redis_failure_falls_back_to_memory(monkeypatch):
+    """Redis 运行中故障时短期记忆回退进程内缓存，对话不应 500。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory = module.RedisShortTermMemory(
+        _BrokenRedis(), "s1", max_turns=2, user_id="u1"
+    )
+    memory.add_message("user", "问题")
+    memory.add_message("assistant", "回答")
+    assert [m["content"] for m in memory.get_recent_context()] == ["问题", "回答"]
+    assert memory.get_statistics()["total_messages"] == 2
+    assert memory.truncate_last_turn("问题") == 2
+    assert memory.get_recent_context() == []
+    assert module.redis_short_term_degraded() is True
+    print("✓ Redis 短期记忆故障回退进程内缓存")
+
+
+def test_redis_recovery_resets_degraded(monkeypatch):
+    """冷却结束后一次成功的 Redis 调用应清除降级标记。"""
+    import time
+
+    from context import short_term_memory as module
+
+    memory = module.RedisShortTermMemory(_BrokenRedis(), "s1")
+    # 冷却结束（标记为过去）后走 Redis 成功路径，降级标记保持清除
+    monkeypatch.setattr(module, "_redis_degraded_until", time.monotonic() - 1)
+    assert memory._redis(lambda: "ok", lambda: "fallback") == "ok"
+    assert module.redis_short_term_degraded() is False
+    print("✓ Redis 恢复后清除降级标记")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
@@ -92,4 +146,14 @@ if __name__ == "__main__":
     test_max_turns_evicts_oldest()
     test_recent_context_and_string()
     test_statistics_and_clear()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_redis_failure_falls_back_to_memory(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_redis_recovery_resets_degraded(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")

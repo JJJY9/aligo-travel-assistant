@@ -37,6 +37,8 @@
 - 面板与导出一致性：输入 `maxlength` 与服务端上限对齐（行程 100 字、偏好 500 字）；含空格的自定义偏好键可编辑 / 删除；所有导出按钮改为 fetch 下载，接口返回 400/404/409/503 JSON 时提示错误而不是保存成文件
 - 智能体编排加固：行程规划自动排在事项收集 / 偏好抽取之后，并把本轮新偏好合并进规划上下文；子智能体瞬时错误重试一次、单次执行 300 秒超时（卡住的智能体不再无限占用会话锁）；`partial_failure` 计入熔断器失败；偏好追加动作兼容 `Append` / `add` / `追加` 等变体，不再把追加静默当覆盖；`Infinity` 优先级被清洗
 - 意图识别兜底校验 `agent_schedule`：扫描到的嵌套 JSON 片段不再被当成完整意图（避免请求被 `no_agents` 吞掉）；Web 进度事件的调度计划统一智能体名称并过滤空白 / 非法优先级
+- 跨会话总结加固：缓存指纹包含 `max_messages` 与窗口内每条消息的身份（其它会话消息被删除后由更旧消息补位也能感知）；输入按单条 1200 字 / 总量 24000 字预算截断；失败进入 60 秒冷却，不再每轮重试；行程字段为 null 时显示「未知」而不是字面量 `None`
+- 短期记忆 Redis 运行中故障时回退进程内影子缓存并进入 60 秒冷却（对话不再 500），`/api/health.storage` 新增 `short_term_degraded`；`add_message` 改为先写长期记忆再写短期缓存，长期失败不再留下孤立提问；memory-query 与 CLI 的意图上下文按 `has_preference_value` 展示 0 / False 偏好
 
 ### 修复
 - 天气工具加固：上游响应形状异常统一映射为 `WeatherError`（此前可能抛 `AttributeError` 导致 500）；缓存改为有界（写入时清理过期条目，上限 256 条）；同一城市的并发未命中合并为一次上游请求
@@ -50,6 +52,7 @@
 - 新增 `tests/test_cli_weather.py`：文本 / JSON 输出、失败退出码、stale 标注、命令分发与参数校验
 - `test_webapp.py` 补含空格偏好键、搜索片段剥离 Markdown 用例
 - `test_orchestration_unit.py` 补规划依赖顺序 / 本轮偏好上下文 / 追加动作变体 / Infinity 优先级 / 智能体超时 / 子智能体重试 / 调度规范化用例；`test_intention_resilience.py` 补嵌套 JSON 片段兜底用例
+- `test_storage_factory.py` 补总结指纹感知窗口替换 / prompt 预算与 null 格式化 / 失败冷却 / add_message 写序用例；`test_short_term_memory.py` 补 Redis 故障回退与降级标记；`test_skill_agents.py` 补 memory-query 展示 0 / False 偏好
 - 新增 `tests/test_lazy_agent_registry.py`：技能发现 / 遗留名称映射 / 缓存 / 缺失目录 / 导入失败 / 缺少 AgentBase 子类
 - 新增 `tests/test_console.py`（空闲管道不阻塞、probe 开关）与 `tests/test_cli_hardening.py`（未知命令 / `--help`、参数校验、导出文件名唯一性、BrokenPipe、BOM 导入）
 - `test_webapp.py` 补会话读取 503、删除后重命名 404、删除不存在会话不留墓碑、保留字 session_id 用例；`test_storage_factory.py` 的元数据用例改为先写入消息（与接口契约一致），并补 trip_id 删除后不复用、单日行程去重、路线编辑使总结失效、statistics 默认值、非对象历史记录丢弃、PostgreSQL 连接失效重连用例；`test_cli_trips_dedupe.py` 补歧义 trip_id 与单日去重用例；`test_webapp.py` 补重复 trip_id 的改 / 删 / 单条日历 409、长字段行程 / 偏好面板编辑、超长编辑重发用例；`test_storage_factory.py` 补 0 / False 偏好进入上下文与路径锁弱引用用例

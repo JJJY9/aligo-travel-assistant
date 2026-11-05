@@ -16,7 +16,12 @@ from typing import Any
 from config import STORAGE_CONFIG
 from context.long_term_memory import LongTermMemory
 from context.postgres_long_term_memory import PostgresLongTermMemory
-from context.short_term_memory import RedisShortTermMemory, ShortTermMemory, session_key
+from context.short_term_memory import (
+    RedisShortTermMemory,
+    ShortTermMemory,
+    redis_short_term_degraded,
+    session_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +143,10 @@ def describe_backends() -> dict[str, Any]:
         "long_term": long_term,
         "short_term_configured": bool(url),
         "long_term_configured": bool(dsn),
+        # 配置了 Redis 但运行中故障、短期记忆已回退进程内缓存
+        "short_term_degraded": bool(url)
+        and short_term == "redis"
+        and redis_short_term_degraded(),
     }
 
 

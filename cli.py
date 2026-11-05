@@ -28,6 +28,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
+from utils.preference_values import has_preference_value
 from utils.progress import format_progress_event
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.version import APP_VERSION
@@ -368,7 +369,7 @@ class AligoCLI:
 
             # 遍历所有偏好，全部加载
             for pref_key, pref_value in prefs.items():
-                if pref_value:  # 只添加有值的偏好
+                if has_preference_value(pref_value):  # 0 / False 也是合法偏好
                     # 如果是列表，用逗号连接
                     if isinstance(pref_value, list):
                         pref_lines.append(

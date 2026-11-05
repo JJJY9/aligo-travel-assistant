@@ -3,6 +3,7 @@
 统一管理两层记忆，提供简单的API
 """
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,12 @@ from utils.preference_values import has_preference_value
 from utils.turn_meta import strip_turn_meta
 
 logger = logging.getLogger(__name__)
+
+# 跨会话总结的输入预算：长期记忆里的助手消息是完整编排 JSON，
+# 不设上限会把模型上下文撑爆，导致总结永久失败
+_SUMMARY_MESSAGE_MAX_CHARS = 1200
+_SUMMARY_TOTAL_MAX_CHARS = 24000
+_SUMMARY_FAILURE_COOLDOWN_SEC = 60.0
 
 
 class MemoryManager:
@@ -46,6 +53,8 @@ class MemoryManager:
         self.long_term = create_long_term_memory(user_id, storage_path)
         # 长期记忆总结缓存：同一会话内其它会话的历史未变化时不再重复调用 LLM
         self._summary_cache: tuple[tuple, str] | None = None
+        # 总结失败后的短时冷却：避免模型持续报错时每轮都重试
+        self._summary_failure_until = 0.0
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -81,16 +90,19 @@ class MemoryManager:
             content: 消息内容
             metadata: 元数据
         """
-        # 添加到短期记忆（当前会话）
-        self.short_term.add_message(role, content, metadata)
-
+        # 添加到长期记忆（跨会话持久化）：先写长期、再写短期，长期失败时
+        # 短期记忆不会留下一条永远不会被删除的孤立提问
         # JSON 后端持有内存快照：写入前重新加载，避免本轮对话期间通过记忆面板
         # 写入的标题 / 置顶 / 偏好被旧快照覆盖；PostgreSQL 直接查询，无需重载。
         if getattr(self.long_term, "snapshot_based", True):
             self._rebuild_long_term()
-
-        # 同时添加到长期记忆（跨会话持久化）
         self.long_term.add_chat_message(role, content, self.session_id)
+
+        # 短期记忆只是上下文缓存：失败不影响已经持久化的消息
+        try:
+            self.short_term.add_message(role, content, metadata)
+        except Exception as exc:  # noqa: BLE001 - 缓存失败降级为缺少本轮上下文
+            logger.warning("短期记忆写入失败（%s），本轮上下文可能缺少该消息", exc)
 
     # ========== 长期记忆操作 ==========
     # 注意：大部分方法直接使用 self.short_term 和 self.long_term 即可，无需封装
@@ -225,6 +237,21 @@ class MemoryManager:
         # 如果既没有聊天记录也没有行程记录，直接返回
         if not history_from_other_sessions and not trip_history:
             return ""
+        if time.monotonic() < self._summary_failure_until:
+            return ""
+
+        # 指纹要能感知「其它会话的消息被删除后由更旧消息补位」：
+        # 条数与最后时间戳可能都不变，必须比较窗口内每条消息的身份
+        window = history_from_other_sessions[-max_messages:]
+        history_signature = tuple(
+            (
+                str(item.get("session_id") or ""),
+                str(item.get("timestamp") or ""),
+                str(item.get("role") or ""),
+                len(str(item.get("content") or "")),
+            )
+            for item in window
+        )
 
         # 同一会话内其它会话的历史 / 行程未变化时复用上次总结，避免每轮多一次 LLM 调用。
         # 行程的编辑（改日期 / 目的）不会更新时间戳，指纹必须包含字段内容，
@@ -241,10 +268,9 @@ class MemoryManager:
             for trip in trip_history
         )
         fingerprint = (
-            len(history_from_other_sessions),
-            str(history_from_other_sessions[-1].get("timestamp", ""))
-            if history_from_other_sessions
-            else "",
+            max_messages,
+            len(window),
+            history_signature,
             len(trip_history),
             str(trip_history[-1].get("timestamp", "")) if trip_history else "",
             trip_signature,
@@ -252,27 +278,38 @@ class MemoryManager:
         if self._summary_cache is not None and self._summary_cache[0] == fingerprint:
             return self._summary_cache[1]
 
-        # 构建聊天记录文本
-        history_text = []
-        for msg in history_from_other_sessions[-max_messages:]:
+        # 构建聊天记录文本：单条截断 + 总字符预算，按时间倒序装入后再反转，
+        # 保证预算不足时保留的是较新的历史
+        history_text: list[str] = []
+        budget = _SUMMARY_TOTAL_MAX_CHARS
+        for msg in reversed(window):
             role = msg.get("role", "unknown")
-            content = msg.get("content", "")
+            content = str(msg.get("content", ""))
             if role == "assistant":
-                content = strip_turn_meta(str(content))
+                content = strip_turn_meta(content)
+            if len(content) > _SUMMARY_MESSAGE_MAX_CHARS:
+                content = content[:_SUMMARY_MESSAGE_MAX_CHARS] + "…"
             timestamp = msg.get("timestamp", "")
-            history_text.append(f"[{timestamp}] {role}: {content}")
+            line = f"[{timestamp}] {role}: {content}"
+            if history_text and len(line) > budget:
+                break
+            history_text.append(line)
+            budget -= len(line)
+            if budget <= 0:
+                break
+        history_text.reverse()
 
         history_str = "\n".join(history_text) if history_text else "（无聊天记录）"
 
-        # 构建行程历史文本
+        # 构建行程历史文本（字段存在但为 null 时不能输出字面量 None）
         trip_text = []
         for trip in trip_history:
-            origin = trip.get("origin", "未知")
-            destination = trip.get("destination", "未知")
-            start_date = trip.get("start_date", "")
-            end_date = trip.get("end_date", "")
-            purpose = trip.get("purpose", "旅游")
-            timestamp = trip.get("timestamp", "")
+            origin = str(trip.get("origin") or "未知")
+            destination = str(trip.get("destination") or "未知")
+            start_date = str(trip.get("start_date") or "")
+            end_date = str(trip.get("end_date") or "")
+            purpose = str(trip.get("purpose") or "旅游")
+            timestamp = str(trip.get("timestamp") or "")
 
             if start_date and end_date:
                 trip_text.append(f"[{timestamp}] {origin} → {destination} ({start_date} 至 {end_date}) - {purpose}")
@@ -308,10 +345,14 @@ class MemoryManager:
             summary = summary.strip()
             if summary:
                 self._summary_cache = (fingerprint, summary)
+                self._summary_failure_until = 0.0
             logger.info(f"Generated long-term memory summary ({len(summary)} chars)")
             return summary
 
         except Exception as e:
+            self._summary_failure_until = (
+                time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SEC
+            )
             logger.error(f"Failed to generate long-term summary: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")

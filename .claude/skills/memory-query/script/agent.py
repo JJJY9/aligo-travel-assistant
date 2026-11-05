@@ -25,6 +25,7 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.json_parser import extract_json_from_async_response
+from utils.preference_values import has_preference_value
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,9 @@ class MemoryQueryAgent(AgentBase):
                 "answer": answer,
                 "memory_sources": {
                     "trip_count": len(trip_history),
-                    "has_preferences": any(v for v in preferences.values() if v),
+                    "has_preferences": any(
+                        has_preference_value(v) for v in preferences.values()
+                    ),
                     "has_chat_summary": bool(chat_summary)
                 }
             }
@@ -210,7 +213,9 @@ class MemoryQueryAgent(AgentBase):
 
     def _format_preferences(self, preferences: dict) -> str:
         """格式化用户偏好"""
-        if not preferences or not any(v for v in preferences.values() if v):
+        if not preferences or not any(
+            has_preference_value(v) for v in preferences.values()
+        ):
             return "（暂无偏好记录）"
 
         lines = []
@@ -226,7 +231,7 @@ class MemoryQueryAgent(AgentBase):
         }
 
         for key, value in preferences.items():
-            if not value:
+            if not has_preference_value(value):
                 continue
             # 未知/自定义偏好类型不再丢弃，直接使用原始类型名
             name = pref_names.get(key, key)

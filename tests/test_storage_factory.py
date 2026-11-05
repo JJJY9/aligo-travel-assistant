@@ -757,6 +757,155 @@ def test_one_day_trip_dedupes_end_date_variants():
     print("✓ 单日行程的两种返程写法视为同一条")
 
 
+class _FakeLongTerm:
+    """总结相关的最小长期记忆桩（可替换 chat / trip 历史）。"""
+
+    snapshot_based = False
+
+    def __init__(self, history=None, trips=None):
+        self.history = list(history or [])
+        self.trips = list(trips or [])
+
+    def get_chat_history(self, session_id=None, limit=None):
+        if session_id is not None:
+            return [m for m in self.history if m.get("session_id") == session_id]
+        if limit:
+            return self.history[-limit:]
+        return list(self.history)
+
+    def get_trip_history(self, limit=None):
+        return self.trips[:limit] if limit else list(self.trips)
+
+    def get_preference(self):
+        return {}
+
+
+def test_summary_fingerprint_detects_history_replacement():
+    """条数与最后时间戳不变、窗口内消息被替换时，总结缓存必须失效。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-fp", "s-cur", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term = _FakeLongTerm(
+        [
+            {"role": "user", "content": "A", "timestamp": "t1", "session_id": "s1"},
+            {"role": "assistant", "content": "B", "timestamp": "t2", "session_id": "s1"},
+        ]
+    )
+    assert asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 1
+    manager.long_term.history = [
+        {"role": "user", "content": "C", "timestamp": "t1", "session_id": "s2"},
+        {"role": "assistant", "content": "D", "timestamp": "t2", "session_id": "s2"},
+    ]
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 2, "窗口内容变化必须使总结缓存失效"
+    print("✓ 总结指纹感知窗口内容替换")
+
+
+def test_summary_prompt_is_budgeted_and_formats_nulls():
+    """超长历史按预算截断；行程字段为 null 时不能输出字面量 None。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-budget", "s-cur", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term = _FakeLongTerm(
+        [
+            {
+                "role": "assistant",
+                "content": "x" * 5000,
+                "timestamp": f"t{i}",
+                "session_id": "s1",
+            }
+            for i in range(5)
+        ],
+        trips=[
+            {
+                "trip_id": "trip_1",
+                "origin": None,
+                "destination": "上海",
+                "start_date": None,
+                "end_date": None,
+                "purpose": None,
+            }
+        ],
+    )
+    asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    prompt = str(model.prompts[0])
+    assert "None" not in prompt
+    assert len(prompt) < 30000
+    assert "…" in prompt
+    print("✓ 总结 prompt 有长度预算且不输出 None")
+
+
+def test_summary_failure_cooldown():
+    """总结失败后 60 秒内不重复调用模型，冷却结束再重试。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    class _BoomModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, messages):
+            self.calls += 1
+            raise RuntimeError("model down")
+
+    model = _BoomModel()
+    manager = MemoryManager(
+        "u-fail", "s-cur", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term = _FakeLongTerm(
+        [{"role": "user", "content": "A", "timestamp": "t1", "session_id": "s1"}]
+    )
+    assert asyncio.run(manager.get_long_term_summary_async()) == ""
+    assert asyncio.run(manager.get_long_term_summary_async()) == ""
+    assert model.calls == 1, "失败后冷却期内不应重复调用"
+    manager._summary_failure_until = 0.0
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 2
+    print("✓ 总结失败进入冷却，冷却后重试")
+
+
+def test_add_message_writes_long_term_first():
+    """长期记忆写入失败时，短期记忆不能留下孤立提问。"""
+    from context.memory_manager import MemoryManager
+
+    class _BoomLongTerm:
+        snapshot_based = False
+
+        def add_chat_message(self, *args, **kwargs):
+            raise RuntimeError("disk full")
+
+    class _ShortTerm:
+        def __init__(self):
+            self.messages = []
+
+        def add_message(self, role, content, metadata=None):
+            self.messages.append(content)
+
+    manager = MemoryManager("u-order", "s1", storage_path=tempfile.mkdtemp())
+    manager.long_term = _BoomLongTerm()
+    manager.short_term = _ShortTerm()
+    try:
+        manager.add_message("user", "hi")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("长期记忆写入失败应向上抛出")
+    assert manager.short_term.messages == [], "长期记忆失败时短期记忆不能留下孤立提问"
+    print("✓ add_message 先写长期记忆")
+
+
 def test_summary_cache_avoids_repeated_calls():
     import asyncio
 
@@ -1008,6 +1157,10 @@ if __name__ == "__main__":
     test_summary_invalidated_by_trip_edit()
     test_embedding_model_shared(pytest.MonkeyPatch())
     test_summary_cache_avoids_repeated_calls()
+    test_summary_fingerprint_detects_history_replacement()
+    test_summary_prompt_is_budgeted_and_formats_nulls()
+    test_summary_failure_cooldown()
+    test_add_message_writes_long_term_first()
     test_reload_long_term_respects_backend()
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
     print("\n全部通过")

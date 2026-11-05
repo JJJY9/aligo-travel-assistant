@@ -9,10 +9,21 @@
 """
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Redis 运行中故障的冷却：期间短期记忆回退进程内缓存（多实例共享暂时退化为
+# 单实例），60 秒后自动重试；健康检查用它区分「配置了 Redis 但当前降级」
+_REDIS_RETRY_COOLDOWN_SEC = 60.0
+_redis_degraded_until = 0.0
+
+
+def redis_short_term_degraded() -> bool:
+    """短期记忆是否因 Redis 故障处于进程内回退状态。"""
+    return time.monotonic() < _redis_degraded_until
 
 
 def session_key(session_id: str, user_id: str = "") -> str:
@@ -218,6 +229,27 @@ class RedisShortTermMemory:
         self.ttl_sec = ttl_sec
         self.user_id = user_id
         self.key = session_key(session_id, user_id)
+        # Redis 故障时的进程内影子缓存：对话继续可用（跨实例共享暂时失效）。
+        # 成功的写入也镜像一份，故障切换时上下文与删除操作仍然正确。
+        self._fallback = ShortTermMemory(max_turns=max_turns)
+
+    def _redis(self, operation, fallback):
+        """执行 Redis 操作；连接级故障时回退影子缓存并进入 60 秒冷却。"""
+        global _redis_degraded_until
+        if time.monotonic() < _redis_degraded_until:
+            return fallback()
+        try:
+            result = operation()
+        except Exception as exc:  # noqa: BLE001 - 短期缓存故障不能中断对话
+            _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
+            logger.warning(
+                "Redis 短期记忆不可用（%s），本进程回退内存缓存 %ss",
+                exc,
+                int(_REDIS_RETRY_COOLDOWN_SEC),
+            )
+            return fallback()
+        _redis_degraded_until = 0.0
+        return result
 
     def add_message(self, role: str, content: str, metadata: dict | None = None) -> None:
         message = {
@@ -226,19 +258,27 @@ class RedisShortTermMemory:
             "timestamp": datetime.now().isoformat(),
             "metadata": metadata or {},
         }
-        pipe = self.client.pipeline()
-        pipe.rpush(self.key, json.dumps(message, ensure_ascii=False))
-        pipe.ltrim(self.key, -self.max_turns * 2, -1)
-        pipe.expire(self.key, self.ttl_sec)
-        pipe.execute()
+        self._fallback.add_message(role, content, metadata)
+
+        def op() -> None:
+            pipe = self.client.pipeline()
+            pipe.rpush(self.key, json.dumps(message, ensure_ascii=False))
+            pipe.ltrim(self.key, -self.max_turns * 2, -1)
+            pipe.expire(self.key, self.ttl_sec)
+            pipe.execute()
+
+        self._redis(op, lambda: None)
         logger.debug("Added message to Redis short-term memory: %s", role)
 
     def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:
-        if n_turns is None:
-            raw = self.client.lrange(self.key, 0, -1)
-        else:
-            raw = self.client.lrange(self.key, -n_turns * 2, -1)
-        return [json.loads(item) for item in raw]
+        def op() -> list[dict[str, Any]]:
+            if n_turns is None:
+                raw = self.client.lrange(self.key, 0, -1)
+            else:
+                raw = self.client.lrange(self.key, -n_turns * 2, -1)
+            return [json.loads(item) for item in raw]
+
+        return self._redis(op, lambda: self._fallback.get_recent_context(n_turns))
 
     def get_context_string(self, n_turns: int = 5) -> str:
         messages = self.get_recent_context(n_turns)
@@ -251,7 +291,7 @@ class RedisShortTermMemory:
         return "\n".join(lines)
 
     def clear(self) -> None:
-        self.client.delete(self.key)
+        self._redis(lambda: self.client.delete(self.key), self._fallback.clear)
         logger.info("Redis short-term memory cleared: %s", self.key)
 
     def truncate_last_turn(self, expect: str | None = None) -> int:
@@ -262,12 +302,15 @@ class RedisShortTermMemory:
         None 时内容不一致则不修改。
         """
         count = int(
-            self.client.eval(
-                _TRUNCATE_LAST_TURN_LUA,
-                1,
-                self.key,
-                "1" if expect is not None else "0",
-                (expect or "").strip(),
+            self._redis(
+                lambda: self.client.eval(
+                    _TRUNCATE_LAST_TURN_LUA,
+                    1,
+                    self.key,
+                    "1" if expect is not None else "0",
+                    (expect or "").strip(),
+                ),
+                lambda: self._fallback.truncate_last_turn(expect),
             )
             or 0
         )
@@ -277,19 +320,22 @@ class RedisShortTermMemory:
         return count
 
     def get_statistics(self) -> dict[str, Any]:
-        total = int(self.client.llen(self.key) or 0)
-        oldest = newest = None
-        if total:
-            try:
-                first = self.client.lindex(self.key, 0)
-                last = self.client.lindex(self.key, -1)
-                oldest = json.loads(first).get("timestamp") if first else None
-                newest = json.loads(last).get("timestamp") if last else None
-            except (TypeError, json.JSONDecodeError):
-                pass
-        return {
-            "total_messages": total,
-            "max_turns": self.max_turns,
-            "oldest_message_time": oldest,
-            "newest_message_time": newest,
-        }
+        def op() -> dict[str, Any]:
+            total = int(self.client.llen(self.key) or 0)
+            oldest = newest = None
+            if total:
+                try:
+                    first = self.client.lindex(self.key, 0)
+                    last = self.client.lindex(self.key, -1)
+                    oldest = json.loads(first).get("timestamp") if first else None
+                    newest = json.loads(last).get("timestamp") if last else None
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            return {
+                "total_messages": total,
+                "max_turns": self.max_turns,
+                "oldest_message_time": oldest,
+                "newest_message_time": newest,
+            }
+
+        return self._redis(op, self._fallback.get_statistics)
