@@ -30,6 +30,7 @@ from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.progress import format_progress_event
 from utils.turn_meta import attach_turn_meta, build_turn_meta
+from utils.version import APP_VERSION
 
 # 移除其他智能体的导入，改用懒加载
 
@@ -2027,6 +2028,9 @@ def main():
     configure_stdio()
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip().lower()
+        if arg in {"--version", "-v"}:
+            print(f"Aligo 差旅助手 {APP_VERSION}")
+            sys.exit(0)
         if arg == "health":
             health_json = _parse_json_flag(sys.argv[2:], "python cli.py health [--json]")
             if health_json is None:
