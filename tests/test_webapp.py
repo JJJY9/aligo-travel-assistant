@@ -353,6 +353,65 @@ def test_ics_handles_overflow_end_date():
         _cleanup(user_id)
 
 
+def test_export_all_sessions_api():
+    """GET /api/sessions/export 导出全部会话（含归档），静态路由不被动态路由吞掉。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_export_all")
+    empty_user = _unique_user("web_test_export_empty")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "第一问", "s-a")
+            store.add_chat_message("assistant", "回答一", "s-a")
+            store.add_chat_message("user", "第二问", "s-b")
+            store.set_session_title("s-b", "杭州行程")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        exported = client.get("/api/sessions/export", params={"user_id": user_id})
+        assert exported.status_code == 200
+        disposition = exported.headers.get("content-disposition", "")
+        assert "attachment" in disposition and "aligo_sessions_" in disposition
+        assert exported.text.startswith("# Aligo 会话导出")
+        assert "杭州行程" in exported.text and "第一问" in exported.text
+        assert "### 用户" in exported.text and "### Aligo" in exported.text
+
+        # 静态路由优先于 /api/sessions/{session_id}
+        detail = client.get("/api/sessions/s-a", params={"user_id": user_id})
+        assert detail.status_code == 200 and detail.json()["messages"]
+
+        missing = client.get("/api/sessions/export", params={"user_id": empty_user})
+        assert missing.status_code == 404
+        print("✓ /api/sessions/export 导出全部会话")
+    finally:
+        _cleanup(user_id)
+        _cleanup(empty_user)
+
+
+def test_export_all_sessions_storage_failure_maps_503(monkeypatch):
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def get_chat_history(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    response = _client().get(
+        "/api/sessions/export", params={"user_id": "u-export-fail"}
+    )
+    assert response.status_code == 503
+    print("✓ 全部会话导出读取失败映射 503")
+
+
 def test_session_lru_eviction():
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
@@ -2899,4 +2958,6 @@ if __name__ == "__main__":
     test_usage_by_day_local_date()
     test_invalid_user_id_rejected()
     test_export_attachment()
+    test_export_all_sessions_api()
+    test_export_all_sessions_storage_failure_maps_503(pytest.MonkeyPatch())
     print("\n全部通过")
