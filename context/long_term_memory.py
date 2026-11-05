@@ -558,9 +558,18 @@ class LongTermMemory:
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
         return count
 
+    def _session_exists(self, session_id: str) -> bool:
+        """当前快照里是否还有该会话的消息（写元数据前的存在性检查）。"""
+        return any(
+            str(message.get("session_id")) == session_id
+            for message in self.data.get("chat_history", [])
+        )
+
     @_locked_mutation
-    def set_session_title(self, session_id: str, title: str) -> None:
-        """设置会话自定义标题；空标题表示恢复自动标题。"""
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """设置会话自定义标题；空标题表示恢复自动标题。返回会话是否存在。"""
+        if not self._session_exists(session_id):
+            return False
         titles = self.data.setdefault("session_titles", {})
         cleaned = title.strip()
         if cleaned:
@@ -570,14 +579,17 @@ class LongTermMemory:
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
         logger.info(f"Set session title: {session_id} -> {cleaned or '(auto)'}")
+        return True
 
     def get_session_titles(self) -> dict[str, str]:
         """返回全部会话自定义标题。"""
         return dict(self.data.get("session_titles") or {})
 
     @_locked_mutation
-    def set_session_pinned(self, session_id: str, pinned: bool) -> None:
-        """置顶 / 取消置顶会话。"""
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        """置顶 / 取消置顶会话。返回会话是否存在。"""
+        if not self._session_exists(session_id):
+            return False
         pinned_sessions = self.data.setdefault("pinned_sessions", [])
         if pinned and session_id not in pinned_sessions:
             pinned_sessions.append(session_id)
@@ -585,14 +597,17 @@ class LongTermMemory:
             pinned_sessions.remove(session_id)
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
+        return True
 
     def get_pinned_sessions(self) -> list[str]:
         """返回置顶会话 ID（按置顶时间先后）。"""
         return list(self.data.get("pinned_sessions") or [])
 
     @_locked_mutation
-    def set_session_archived(self, session_id: str, archived: bool) -> None:
-        """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。"""
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。返回会话是否存在。"""
+        if not self._session_exists(session_id):
+            return False
         archived_sessions = self.data.setdefault("archived_sessions", [])
         if archived and session_id not in archived_sessions:
             archived_sessions.append(session_id)
@@ -601,6 +616,7 @@ class LongTermMemory:
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
         logger.info("Set session archived: %s -> %s", session_id, archived)
+        return True
 
     def get_archived_sessions(self) -> list[str]:
         """返回归档会话 ID。"""

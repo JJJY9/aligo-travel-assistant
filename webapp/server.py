@@ -366,6 +366,14 @@ class ChatRequest(BaseModel):
     user_id: str = Field(default="web_user", pattern=_ID_PATTERN)
     session_id: str | None = Field(default=None, pattern=_ID_PATTERN)
 
+    @field_validator("session_id")
+    @classmethod
+    def _session_id_not_reserved(cls, value: str | None) -> str | None:
+        # /api/sessions/export 是静态路由，名为 export 的会话永远打不开
+        if value == "export":
+            raise ValueError("session_id 不能使用保留字 export")
+        return value
+
     @field_validator("message")
     @classmethod
     def _message_not_blank(cls, value: str) -> str:
@@ -939,22 +947,28 @@ def _json_safe_value(value: Any) -> Any:
 
 
 def _load_user_data(user_id: str) -> dict[str, Any]:
-    store = _open_long_term(user_id)
     try:
-        return {
-            "preferences": {
-                key: _json_safe_value(value)
-                for key, value in store.get_preference().items()
-            },
-            "trip_history": store.get_trip_history(limit=None),
-            "chat_history": store.get_chat_history(),
-            "session_titles": store.get_session_titles(),
-            "pinned_sessions": store.get_pinned_sessions(),
-            "archived_sessions": store.get_archived_sessions(),
-            "statistics": store.get_statistics(),
-        }
-    finally:
-        _close_long_term(store)
+        store = _open_long_term(user_id)
+        try:
+            return {
+                "preferences": {
+                    key: _json_safe_value(value)
+                    for key, value in store.get_preference().items()
+                },
+                "trip_history": store.get_trip_history(limit=None),
+                "chat_history": store.get_chat_history(),
+                "session_titles": store.get_session_titles(),
+                "pinned_sessions": store.get_pinned_sessions(),
+                "archived_sessions": store.get_archived_sessions(),
+                "statistics": store.get_statistics(),
+            }
+        finally:
+            _close_long_term(store)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
+        logger.warning("读取用户数据失败（%s）：%s", user_id, exc)
+        raise HTTPException(status_code=503, detail=f"读取用户数据失败：{exc}") from exc
 
 
 def _archived_count(data: dict[str, Any]) -> int:
@@ -1804,6 +1818,9 @@ def create_app(model: Any = None) -> FastAPI:
             messages = store.get_chat_history(session_id=session_id)
             titles = store.get_session_titles()
             archived_ids = set(store.get_archived_sessions())
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("读取会话失败（%s）：%s", session_id, exc)
+            raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
         finally:
             _close_long_term(store)
         title = str(titles.get(session_id) or "")
@@ -1837,11 +1854,10 @@ def create_app(model: Any = None) -> FastAPI:
         """设置或清除会话自定义标题（空标题恢复自动标题）。"""
         store = _open_long_term(payload.user_id)
         try:
-            # 与归档 / 导出接口一致：不存在的会话不能写入幽灵标题，
-            # 否则复用该 id 的新对话会继承旧标题
-            if not store.get_chat_history(session_id=session_id):
+            # 存在性检查与写入在存储层的同一把写锁内完成：
+            # 并发 DELETE 落在两者之间时不会写入幽灵标题
+            if not store.set_session_title(session_id, payload.title):
                 raise LookupError("会话不存在")
-            store.set_session_title(session_id, payload.title)
             saved = (store.get_session_titles() or {}).get(session_id, "")
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="会话不存在") from exc
@@ -1860,9 +1876,8 @@ def create_app(model: Any = None) -> FastAPI:
         """置顶 / 取消置顶会话。"""
         store = _open_long_term(payload.user_id)
         try:
-            if not store.get_chat_history(session_id=session_id):
+            if not store.set_session_pinned(session_id, payload.pinned):
                 raise LookupError("会话不存在")
-            store.set_session_pinned(session_id, payload.pinned)
             pinned = store.get_pinned_sessions()
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="会话不存在") from exc
@@ -1881,9 +1896,8 @@ def create_app(model: Any = None) -> FastAPI:
         """归档 / 恢复会话（归档只从列表隐藏，不删除消息）。"""
         store = _open_long_term(payload.user_id)
         try:
-            if not store.get_chat_history(session_id=session_id):
+            if not store.set_session_archived(session_id, payload.archived):
                 raise HTTPException(status_code=404, detail="会话不存在或没有消息")
-            store.set_session_archived(session_id, payload.archived)
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
@@ -1903,6 +1917,9 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             messages = store.get_chat_history(session_id=session_id)
             titles = store.get_session_titles()
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("导出会话失败（%s）：%s", session_id, exc)
+            raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
         finally:
             _close_long_term(store)
         if not messages:
@@ -1967,6 +1984,9 @@ def create_app(model: Any = None) -> FastAPI:
                 state.unmark_deleted(user_id, session_id)
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            if removed == 0:
+                # 不存在 / 没有消息的会话不留下墓碑，避免该 id 在 300 秒内无法新开对话
+                state.unmark_deleted(user_id, session_id)
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}

@@ -2371,6 +2371,106 @@ def test_session_metadata_requires_existing_session():
         _cleanup(user_id)
 
 
+def test_rename_after_delete_is_rejected():
+    """删除后写入标题在存储层同一把锁内被拒绝，不会留下幽灵标题。"""
+    client = _client()
+    user_id = _unique_user("web_test_ghost_deleted")
+    try:
+        created = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "ghost-del"},
+        )
+        assert created.status_code == 200
+        assert (
+            client.put(
+                "/api/sessions/ghost-del/title",
+                json={"user_id": user_id, "title": "正常标题"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.delete(
+                "/api/sessions/ghost-del", params={"user_id": user_id}
+            ).status_code
+            == 200
+        )
+        renamed = client.put(
+            "/api/sessions/ghost-del/title",
+            json={"user_id": user_id, "title": "幽灵标题"},
+        )
+        assert renamed.status_code == 404
+        detail = client.get(
+            "/api/sessions/ghost-del", params={"user_id": user_id}
+        ).json()
+        assert detail["title"] != "幽灵标题"
+        print("✓ 删除后重命名返回 404，不写幽灵标题")
+    finally:
+        _cleanup(user_id)
+
+
+def test_delete_unknown_session_does_not_block_new_chat():
+    """删除不存在的会话不应留下墓碑，该 id 仍可新开对话。"""
+    client = _client()
+    user_id = _unique_user("web_test_delete_missing")
+    try:
+        deleted = client.delete(
+            "/api/sessions/never-existed", params={"user_id": user_id}
+        )
+        assert deleted.status_code == 200 and deleted.json()["deleted"] == 0
+        created = client.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "never-existed",
+            },
+        )
+        assert created.status_code == 200, "删除不存在的会话不应留下墓碑"
+        print("✓ 删除不存在的会话不留墓碑")
+    finally:
+        _cleanup(user_id)
+
+
+def test_reserved_session_id_is_rejected():
+    response = _client().post(
+        "/api/chat",
+        json={"message": "你好", "user_id": "u1", "session_id": "export"},
+    )
+    assert response.status_code == 422
+    print("✓ 保留字 session_id（export）被拒绝")
+
+
+def test_session_read_failures_map_503(monkeypatch):
+    """会话相关读接口在存储故障时应返回可重试的 503，而不是通用 500。"""
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def _fail(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+        get_preference = get_trip_history = _fail
+        get_chat_history = get_session_titles = _fail
+        get_pinned_sessions = get_archived_sessions = _fail
+        get_statistics = _fail
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    client = _client()
+    for path in (
+        "/api/sessions",
+        "/api/sessions/s1",
+        "/api/sessions/s1/export",
+        "/api/status",
+    ):
+        response = client.get(path, params={"user_id": "u1"})
+        assert response.status_code == 503, (path, response.text)
+    print("✓ 会话读取失败统一 503")
+
+
 def test_chat_rate_limit_ip_bucket():
     """用户 ID 由请求方提供、可轮换；同一客户端 IP 仍受总量桶约束。"""
     from utils.rate_limit import RateLimiter
