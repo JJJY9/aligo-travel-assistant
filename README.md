@@ -782,6 +782,24 @@ aligo-travel-assistant/
   python cli.py        # 或 python -m webapp.server
   ```
 
+### 多实例部署（可选）
+
+同一份代码可以启动多个 Web 实例，共享 Redis / PostgreSQL 中的会话与限流额度：
+
+```bash
+export REDIS_URL=redis://localhost:6379/0
+export DATABASE_URL=postgresql://aligo:aligo@localhost:5432/aligo
+python -m webapp.server --port 8001
+python -m webapp.server --port 8002   # 另一个进程 / 机器
+```
+
+- **限流**：两个实例的用户桶与 IP 桶计数都在 Redis（`aligo:ratelimit:*`），总额度按实例集合共享；`/api/health` 应返回 `rate_limit: redis`，`rate_limit_degraded` 为 `false`。Redis 故障期间各实例临时回退进程内限流（额度不再共享），恢复后自动重新使用 Redis。
+- **会话**：Redis 短期记忆按「用户 + 会话」共享，同一会话在任一实例都能继续；每个实例的运行时缓存（上限 50）互相独立，同一会话的并发请求建议用会话粘滞（session affinity）保持消息顺序。
+- **持久化**：长期记忆、偏好、行程与会话标题 / 置顶 / 归档都在 PostgreSQL；不要在多实例下使用默认 JSON 后端（文件在各实例本地，跨进程写会互相覆盖）。
+- **反向代理**：前面有 Nginx / 负载均衡时设置 `TRUST_PROXY_HEADERS=1`，并按代理实际行为覆盖写入 `X-Forwarded-For`；否则所有用户共用代理地址的 IP 桶，默认不信任该头是为了防止客户端伪造。
+- **观测**：请求指标（`/api/metrics`）是进程内统计，需要分别采集每个实例；`/api/health` 可用于实例级健康检查。
+- **知识库**：Milvus Lite 是本地单进程文件锁，多个实例无法共享同一个向量库文件；这里的多实例共享适用于无 RAG 或各实例独立知识库的场景，需要共享向量库时请替换为 Milvus 服务端部署。
+
 ### 知识库初始化
 - 首次运行前必须初始化RAG知识库
 - 知识库文档位于 `.claude/skills/ask-question/data/documents/`
