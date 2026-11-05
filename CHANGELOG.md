@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.4.0] - 2026-11-05
 
 ### 新增
 - 会话全文搜索：`/api/sessions?q=` 按标题与消息内容检索（助手消息按渲染后的 Markdown 匹配），返回命中片段；侧栏新增搜索框
@@ -76,7 +76,7 @@
 - 编排器在聚合结果与 `agent_done` 事件中附带 `duration`
 - 复制文本在 Clipboard API 不可用时回退到 `execCommand`
 - 对话接口错误详情附带请求 ID，便于定位日志
-- 前端静态资源版本号更新为 1.3.0（`style.css` / `app.js` / `theme.js`）
+- 前端静态资源版本号更新为 1.4.0（`style.css` / `app.js` / `theme.js`），避免浏览器使用旧缓存
 - 限流新增客户端 IP 维度：`CHAT_RATE_LIMIT_IP`（默认 120 次/窗口），用户 ID 由请求方提供、可轮换，IP 桶防止绕过
 - 访问日志支持 JSON lines：设置 `LOG_FORMAT=json` 后应用日志每行为合法 JSON（time / level / logger + event=http_request 等字段），默认保持原单行文本格式
 - Web 服务启动时配置应用日志 handler：访问日志（含请求 ID / 耗时）与智能体日志此前在默认运行下不可见，现已输出到控制台
