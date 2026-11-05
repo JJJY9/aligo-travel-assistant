@@ -553,6 +553,36 @@ def test_pg_reconnects_after_connection_error():
     print("✓ PostgreSQL 连接失效后重连重试")
 
 
+def test_falsey_preferences_included_in_context():
+    """0 / False 是合法偏好，必须进入 Agent 上下文；空串视为未设置。"""
+    from context.memory_manager import MemoryManager
+
+    manager = MemoryManager("u-falsey", "s1", storage_path=tempfile.mkdtemp())
+    manager.long_term.save_preference("budget_level", 0)
+    manager.long_term.save_preference("window_seat", False)
+    manager.long_term.save_preference("home_location", "")
+    text = manager.get_context_for_agent()
+    assert "budget_level: 0" in text
+    assert "window_seat: False" in text
+    assert "home_location" not in text
+    print("✓ 0 / False 偏好进入上下文，空串不算")
+
+
+def test_path_locks_do_not_grow_unbounded():
+    """路径锁为弱引用：实例释放后自动移除，不随用户数无限增长。"""
+    import gc
+
+    from context import long_term_memory as lt
+
+    storage_dir = tempfile.mkdtemp()
+    for index in range(40):
+        memory = LongTermMemory(f"u-weak-{index}", storage_dir)
+        del memory
+    gc.collect()
+    assert len(lt._PATH_LOCKS) < 40, "锁表应随实例释放收缩"
+    print("✓ 路径锁为弱引用，不随用户数无限增长")
+
+
 def test_load_holds_path_lock():
     """读取全程持锁：Windows 上打开的文件句柄会让并发 os.replace 失败。"""
     import json as json_module
@@ -959,6 +989,8 @@ if __name__ == "__main__":
     test_migrate_fills_statistics_defaults()
     test_migrate_drops_non_object_entries()
     test_pg_reconnects_after_connection_error()
+    test_falsey_preferences_included_in_context()
+    test_path_locks_do_not_grow_unbounded()
     test_load_holds_path_lock()
     test_pg_delete_trip_deletes_single_row()
     test_summary_not_starved_by_long_current_session()

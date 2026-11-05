@@ -25,6 +25,7 @@ from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
+from utils.preference_values import has_preference_value
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 
@@ -189,7 +190,11 @@ class ConversationRuntime:
         """组装意图识别上下文：系统记忆（偏好 + 历史摘要）+ 最近对话 + 当前输入。"""
         memory_parts: list[str] = []
 
-        preferences = {key: value for key, value in self.memory.long_term.get_preference().items() if value}
+        preferences = {
+            key: value
+            for key, value in self.memory.long_term.get_preference().items()
+            if has_preference_value(value)
+        }
         if preferences:
             pref_lines = ["【用户背景信息】（来自长期记忆，可用于推断缺失信息）"]
             for key, value in preferences.items():

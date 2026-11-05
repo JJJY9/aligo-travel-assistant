@@ -2,6 +2,15 @@
 from typing import Any
 
 
+def has_preference_value(value: Any) -> bool:
+    """偏好是否有实际值。
+
+    0 / False 是合法偏好（如预算为 0、不要靠窗），只有 None、空串、
+    空列表 / 空字典视为「未设置」。
+    """
+    return value is not None and value != "" and value != [] and value != {}
+
+
 def merge_preference_value(current: Any, value: Any) -> list[Any]:
     """把新值合并进现有偏好，返回去重后的列表（保持先后顺序）。
 

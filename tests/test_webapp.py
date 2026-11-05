@@ -491,6 +491,67 @@ def test_ambiguous_trip_id_operations_return_409():
         _cleanup(user_id)
 
 
+def test_trip_panel_accepts_long_fields_from_chat():
+    """对话写入的长 purpose / origin 不应让面板编辑直接 422。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_long_trip")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        long_purpose = "参加华东区年度渠道合作伙伴大会并拜访重点客户" * 2
+        trip_id = store.save_trip_history(
+            {
+                "origin": "北京市朝阳区望京SOHO塔1",
+                "destination": "上海市浦东新区张江高科园区",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+                "purpose": long_purpose,
+            }
+        )
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        response = client.put(
+            f"/api/trips/{trip_id}",
+            json={"user_id": user_id, "purpose": long_purpose + "（更新）"},
+        )
+        assert response.status_code == 200, response.text
+        print("✓ 面板可编辑对话写入的长字段行程")
+    finally:
+        _cleanup(user_id)
+
+
+def test_preference_panel_accepts_long_value():
+    """面板偏好值上限应与对话写入路径一致，而不是 200 字。"""
+    client = _client()
+    user_id = _unique_user("web_test_long_pref")
+    try:
+        response = client.put(
+            "/api/preferences/home_location",
+            json={"user_id": user_id, "value": "备注：" + "x" * 300},
+        )
+        assert response.status_code == 200, response.text
+        print("✓ 面板接受 200 字以上的偏好值")
+    finally:
+        _cleanup(user_id)
+
+
+def test_last_turn_expect_accepts_long_message():
+    """CLI 写入的超长消息也应能通过 Web「编辑重发」删除。"""
+    client = _client()
+    user_id = _unique_user("web_test_long_expect")
+    try:
+        response = client.delete(
+            "/api/sessions/s-long/last-turn",
+            params={"user_id": user_id, "expect": "长" * 5000},
+        )
+        assert response.status_code == 200, response.text
+        print("✓ 编辑重发接受 4000 字以上的历史消息")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ics_handles_overflow_end_date():
     """9999-12-31 的行程不能让日历导出 500（DTEND 无法再加一天）。"""
     client = _client()
@@ -821,7 +882,7 @@ def test_preferences_api():
         assert invalid.status_code == 422
         too_long = client.put(
             "/api/preferences/home_location",
-            json={"user_id": user_id, "value": "x" * 201},
+            json={"user_id": user_id, "value": "x" * 501},
         )
         assert too_long.status_code == 422
         print("✓ 偏好新增 / 覆盖 / 删除 / 参数校验")

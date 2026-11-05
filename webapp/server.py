@@ -383,11 +383,11 @@ class ChatRequest(BaseModel):
         return value
 
 
-_ShortText = Annotated[str, Field(max_length=200)]
+_ShortText = Annotated[str, Field(max_length=500)]
 _FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PreferenceValue = (
     _ShortText
-    | Annotated[list[_ShortText], Field(max_length=20)]
+    | Annotated[list[_ShortText], Field(max_length=50)]
     | int
     | _FiniteFloat
     | bool
@@ -431,11 +431,11 @@ class TripPayload(BaseModel):
     """手动添加行程（记忆面板入口）。"""
 
     user_id: str = Field(pattern=_ID_PATTERN)
-    origin: str = Field(default="", max_length=50)
-    destination: str = Field(min_length=1, max_length=50)
+    origin: str = Field(default="", max_length=100)
+    destination: str = Field(min_length=1, max_length=100)
     start_date: str = Field(pattern=_DATE_PATTERN)
     end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
-    purpose: str = Field(default="出差", max_length=20)
+    purpose: str = Field(default="出差", max_length=100)
 
     @field_validator("destination")
     @classmethod
@@ -456,11 +456,11 @@ class TripUpdatePayload(BaseModel):
     """更新行程（仅修改提供的字段）。"""
 
     user_id: str = Field(pattern=_ID_PATTERN)
-    origin: str | None = Field(default=None, max_length=50)
-    destination: str | None = Field(default=None, min_length=1, max_length=50)
+    origin: str | None = Field(default=None, max_length=100)
+    destination: str | None = Field(default=None, min_length=1, max_length=100)
     start_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
     end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
-    purpose: str | None = Field(default=None, max_length=20)
+    purpose: str | None = Field(default=None, max_length=100)
 
     @field_validator("destination")
     @classmethod
@@ -2000,7 +2000,7 @@ def create_app(model: Any = None) -> FastAPI:
     async def delete_last_turn(
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
-        expect: str | None = Query(default=None, max_length=4000),
+        expect: str | None = Query(default=None, max_length=20000),
     ) -> dict[str, Any]:
         """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。
 
