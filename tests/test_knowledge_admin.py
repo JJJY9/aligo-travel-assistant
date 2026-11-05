@@ -509,8 +509,6 @@ def test_update_document_replaces_grouped_multipart(monkeypatch):
 
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
-    from pathlib import Path
-
     def _meta(part, group="g-del"):
         return json.dumps({"part": str(part), "parts": "3", "group": group})
 
