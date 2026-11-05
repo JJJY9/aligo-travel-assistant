@@ -510,6 +510,18 @@ python cli.py
 
 技能目录（不进入交互）：`python cli.py skills`，输出当前技能目录与已发现的技能名，退出码 0/1；`--json` 输出 `root` / `skills` / `ok`，便于脚本读取。安装 wheel 或设置 `ALIGO_SKILLS_DIR` 后可用它确认技能是否生效。
 
+**脚本与监控示例**
+
+一次性检查命令都支持 `--json`（退出码与文本模式一致），可以直接接到部署脚本或监控：
+
+```bash
+python cli.py health --json | jq -e '.ok'
+python cli.py doctor --json | jq -e '.status == "ok"'
+python cli.py skills --json | jq -e '(.skills | length) >= 6'
+python cli.py kb --json | jq '{available, documents}'
+python cli.py eval --json | jq -e '.ok and .hit5 >= 0.8'
+```
+
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。
 
 执行过程中会实时显示当前正在运行的智能体（例如「正在执行 行程规划…」）；完成后智能体列表包含各自耗时（例如 `信息查询 ✓ 2.3s`），与 Web 执行路线一致。
