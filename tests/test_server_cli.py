@@ -18,11 +18,14 @@ from webapp import server
 
 def test_loopback_host_detection():
     assert server._is_loopback_host("127.0.0.1")
+    assert server._is_loopback_host("127.0.0.2")
+    assert server._is_loopback_host("127.1.2.3")
     assert server._is_loopback_host("localhost")
     assert server._is_loopback_host("::1")
     assert not server._is_loopback_host("0.0.0.0")
     assert not server._is_loopback_host("192.168.1.5")
-    print("✓ 环回地址判断")
+    assert not server._is_loopback_host("")
+    print("✓ 环回地址判断（127.0.0.0/8 / localhost / ::1）")
 
 
 def test_version_flag(monkeypatch, capsys):

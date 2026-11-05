@@ -36,6 +36,8 @@
 - 进程内限流桶增加线程锁，FastAPI 线程池并发调用不再可能因 deque 竞态报 500；`/api/health` 聚合用户 / IP / 知识库三个桶的降级状态
 - 本地 JSON 长期记忆：写锁等待上限从 10 秒收紧到 2 秒（Web 事件循环同步等待），超时抛 `MemoryPersistenceError`，不再被判定为可重试网络错误；Windows 上其他进程短暂读文件导致 `os.replace` 失败时自动重试 3 次
 - `doctor` 版本一致性：读取非 UTF-8 文件时给出警告而不是崩溃；wheel 安装改用 dist-info 元数据校验，详情只列实际检查过的项
+- 知识库评测接口捕获 RAG 模块导入失败（如 wheel 缺少技能文件），返回 503 而不是未处理的 500
+- 启动时的环回地址判断支持整个 `127.0.0.0/8` 与 IPv6 `::1`，`127.0.0.2` 等地址不再误报对外监听警告
 
 ### 测试
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例；并发 check（多线程同时请求）严格只放行额度内的次数
@@ -47,6 +49,7 @@
 - 内存限流并发用例：10 线程同时请求严格放行 50 次；评测用例断言 `strict=True`、并发锁 429 不消耗额度、任一桶降级都会上报
 - 跨进程写锁用例改为 3 进程 × 20 次、同一屏障启动、每次新建实例；补写锁超时映射与 `os.replace` 重试用例
 - `test_doctor` 补 wheel 静态资源 / 元数据不一致、非 UTF-8 文件用例
+- 评测模块 import 失败返回 503、ICS VALARM 位于 DTEND 与 END:VEVENT 之间、`127.0.0.0/8` 环回判断用例
 - `tests/test_metrics.py` 补充 P50 / P95、有界样本窗口与重置用例；`/api/metrics` 接口用例断言百分位与样本数
 - `test_cli_skills.py` / `test_doctor.py` 补充 `--json` 输出、失败退出码与未知参数用例
 - 新增 `tests/test_cli_json.py`：health JSON 成功 / 失败、kb 状态可用 / 不可用的退出码与字段

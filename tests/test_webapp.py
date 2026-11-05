@@ -971,6 +971,11 @@ def test_build_trips_ics_multiple_events():
     assert content.count("END:VALARM") == 2
     assert "TRIGGER:-PT15H" in content
     assert "出行提醒" in content
+    # VALARM 必须位于同一 VEVENT 的 DTEND 之后、END:VEVENT 之前
+    for event in content.split("BEGIN:VEVENT")[1:]:
+        body = event.split("END:VEVENT")[0]
+        assert "BEGIN:VALARM" in body
+        assert body.index("DTEND") < body.index("BEGIN:VALARM")
     assert content.endswith("END:VCALENDAR\r\n")
 
     # 缺少出发日期的行程被跳过
@@ -2915,6 +2920,28 @@ def test_knowledge_eval_api(monkeypatch):
     assert limited.status_code == 429
     assert limited.headers["x-ratelimit-remaining"] == "0"
     print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429 不耗额度）")
+
+
+def test_knowledge_eval_import_failure(monkeypatch):
+    """技能文件缺失时评测依赖 import 失败，应返回 503 而不是 500。"""
+    import sys
+    import types
+
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda: {"available": True, "collection": "kb", "path": "p"},
+    )
+    monkeypatch.setitem(
+        sys.modules, "agents.rag_knowledge_agent", types.ModuleType("agents.rag_knowledge_agent")
+    )
+    client = _client()
+    response = client.get("/api/knowledge/eval")
+    assert response.status_code == 503
+    assert "评测依赖不可用" in response.json()["detail"]
+    print("✓ 评测依赖缺失返回 503")
 
 
 def test_knowledge_api_maps_backend_errors(monkeypatch):

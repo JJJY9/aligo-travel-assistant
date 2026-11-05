@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -88,12 +89,15 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 检索评测会加载嵌入模型并逐个问题检索；同一进程同时只允许一个评测
 _KB_EVAL_LOCK = threading.Lock()
 
-# 只有这些监听地址视为「仅本机」；其它地址启动时提示需要反向代理做认证 / HTTPS
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-
-
+# 只有环回地址视为「仅本机」；其它地址启动时提示需要反向代理做认证 / HTTPS
 def _is_loopback_host(host: str) -> bool:
-    return host.strip().lower() in _LOOPBACK_HOSTS
+    value = host.strip().lower()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
@@ -1299,8 +1303,14 @@ def create_app(model: Any = None) -> FastAPI:
                     detail=f"知识库不可用：{status.get('reason', '未知原因')}",
                 )
 
-            from agents.rag_knowledge_agent import RAGKnowledgeAgent
-            from utils.rag_eval import evaluate_retrieval
+            try:
+                from agents.rag_knowledge_agent import RAGKnowledgeAgent
+                from utils.rag_eval import evaluate_retrieval
+            except ImportError as exc:
+                logger.warning("检索评测依赖不可用: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail=f"评测依赖不可用：{exc}"
+                ) from exc
 
             try:
                 agent = RAGKnowledgeAgent(collection_name=status["collection"])
