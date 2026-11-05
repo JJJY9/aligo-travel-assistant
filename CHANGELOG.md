@@ -26,6 +26,7 @@
 ### 修复
 - `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找
 - Redis 限流响应解析兼容未开启 `decode_responses` 的客户端（bytes 返回值），避免 `float()` 抛错
+- 本地 JSON 长期记忆：CLI 与 Web 等多进程同时写同一用户时，修改操作使用 `<data>.json.lock` 跨进程文件锁串行化（Windows `msvcrt` / Unix `flock`），避免后写覆盖先写
 
 ### 测试
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例；并发 check（多线程同时请求）严格只放行额度内的次数
@@ -38,6 +39,7 @@
 - `test_cli_skills.py` / `test_doctor.py` 补充 `--json` 输出、失败退出码与未知参数用例
 - 新增 `tests/test_cli_json.py`：health JSON 成功 / 失败、kb 状态可用 / 不可用的退出码与字段
 - `test_cli_eval.py` 补充 `eval --json` 四种状态（成功 / 未达标 / 跳过 / 故障）与退出码断言
+- 新增 `tests/test_long_term_memory_lock.py`：两个子进程各 25 次写入，断言总计数不丢
 - ICS 日历用例断言每个事件包含 `VALARM` 与 `TRIGGER:-PT15H`
 - 安全头用例断言 `/api/` 响应带 `Cache-Control: no-store`，页面与静态资源不受影响
 - 浏览器实测：用户卡片显示「本地内存 · JSON · 技能 6」

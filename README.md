@@ -833,7 +833,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
 - **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。
-- **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；但 CLI 与 Web 服务同时修改**同一用户**时仍是「后写覆盖先写」，演示时建议只保留一个写入端。
+- **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；CLI 与 Web 同时修改**同一用户**时通过 `<data>.json.lock` 文件锁串行化（Windows / Unix 均支持，等待上限 10 秒）。网络文件系统（NFS / SMB）上的锁语义取决于挂载方式，演示时仍建议只保留一个写入端。
 - **存储后端故障回退**：配置的 PostgreSQL 连接失败时自动回退本地 JSON；故障期间新会话写入 JSON 的消息 / 偏好不会在恢复后自动合并到 PostgreSQL（文件保留在 `data/memory/`，恢复时日志会给出警告），需要时请手动迁移。
 - **Windows 文件名大小写不敏感**：用户 ID `Alice` 与 `alice` 会读写同一个 JSON 记忆文件；需要区分用户时请使用不同的名字。
 - **PostgreSQL 的行程去重 / 编号为应用层检查**：`trip_id` 使用 `pg_advisory_lock` 串行生成，并尝试建立 `(user_id, trip_id)` 唯一索引；单实例 Web 的行程写入已串行化，多实例部署仍建议自行加分布式锁或唯一约束兜底。
