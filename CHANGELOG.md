@@ -35,6 +35,8 @@
 - 按钮触发的发送（重新生成 / 追问 / 欢迎示例）不再清空正在输入的草稿；弹层打开时回复结束只跳过抢焦点，会话列表与统计照常刷新；「查看全部」行程与状态刷新统一请求序号，行程 / 会话列表请求失败时保留旧数据并提示，不再伪装成空列表
 - Markdown / 渲染：链接 URL 支持一层括号（维基百科等）、行内代码先隔离再处理其它记号；标题 / 预览 / 文件名按码点截断，不再劈开 emoji；对象型偏好显示 JSON 而非 `[object Object]`；会话搜索预览剥离标题 / 列表 / 表格 / 引用
 - 面板与导出一致性：输入 `maxlength` 与服务端上限对齐（行程 100 字、偏好 500 字）；含空格的自定义偏好键可编辑 / 删除；所有导出按钮改为 fetch 下载，接口返回 400/404/409/503 JSON 时提示错误而不是保存成文件
+- 智能体编排加固：行程规划自动排在事项收集 / 偏好抽取之后，并把本轮新偏好合并进规划上下文；子智能体瞬时错误重试一次、单次执行 300 秒超时（卡住的智能体不再无限占用会话锁）；`partial_failure` 计入熔断器失败；偏好追加动作兼容 `Append` / `add` / `追加` 等变体，不再把追加静默当覆盖；`Infinity` 优先级被清洗
+- 意图识别兜底校验 `agent_schedule`：扫描到的嵌套 JSON 片段不再被当成完整意图（避免请求被 `no_agents` 吞掉）；Web 进度事件的调度计划统一智能体名称并过滤空白 / 非法优先级
 
 ### 修复
 - 天气工具加固：上游响应形状异常统一映射为 `WeatherError`（此前可能抛 `AttributeError` 导致 500）；缓存改为有界（写入时清理过期条目，上限 256 条）；同一城市的并发未命中合并为一次上游请求
@@ -47,6 +49,7 @@
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义（含无样本不输出耗时、单调时钟 uptime）；`test_webapp.py` 覆盖 `/metrics` 端点与路由模板聚合
 - 新增 `tests/test_cli_weather.py`：文本 / JSON 输出、失败退出码、stale 标注、命令分发与参数校验
 - `test_webapp.py` 补含空格偏好键、搜索片段剥离 Markdown 用例
+- `test_orchestration_unit.py` 补规划依赖顺序 / 本轮偏好上下文 / 追加动作变体 / Infinity 优先级 / 智能体超时 / 子智能体重试 / 调度规范化用例；`test_intention_resilience.py` 补嵌套 JSON 片段兜底用例
 - 新增 `tests/test_lazy_agent_registry.py`：技能发现 / 遗留名称映射 / 缓存 / 缺失目录 / 导入失败 / 缺少 AgentBase 子类
 - 新增 `tests/test_console.py`（空闲管道不阻塞、probe 开关）与 `tests/test_cli_hardening.py`（未知命令 / `--help`、参数校验、导出文件名唯一性、BrokenPipe、BOM 导入）
 - `test_webapp.py` 补会话读取 503、删除后重命名 404、删除不存在会话不留墓碑、保留字 session_id 用例；`test_storage_factory.py` 的元数据用例改为先写入消息（与接口契约一致），并补 trip_id 删除后不复用、单日行程去重、路线编辑使总结失效、statistics 默认值、非对象历史记录丢弃、PostgreSQL 连接失效重连用例；`test_cli_trips_dedupe.py` 补歧义 trip_id 与单日去重用例；`test_webapp.py` 补重复 trip_id 的改 / 删 / 单条日历 409、长字段行程 / 偏好面板编辑、超长编辑重发用例；`test_storage_factory.py` 补 0 / False 偏好进入上下文与路径锁弱引用用例

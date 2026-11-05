@@ -19,7 +19,7 @@ from agentscope.message import Msg
 
 from agents.intention_agent import IntentionAgent
 from agents.lazy_agent_registry import LazyAgentRegistry
-from agents.orchestration_agent import OrchestrationAgent
+from agents.orchestration_agent import OrchestrationAgent, canonical_agent_name
 from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
@@ -121,15 +121,7 @@ class ConversationRuntime:
                 "type": "plan",
                 "intents": intents,
                 "reasoning": intention_data.get("reasoning") or "",
-                "schedule": [
-                    {
-                        "agent_name": item.get("agent_name", ""),
-                        "priority": item.get("priority", 0),
-                        "reason": item.get("reason", ""),
-                    }
-                    for item in schedule
-                    if isinstance(item, dict)
-                ],
+                "schedule": self._normalized_schedule(schedule),
             },
         )
         logger.info("Plan: %s agents", len(schedule))
@@ -140,6 +132,7 @@ class ConversationRuntime:
             max_retries=int(rc.get("max_retries", 3)),
             base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
             max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
+            success_check=self._orchestration_succeeded,
         )
 
         try:
@@ -186,6 +179,44 @@ class ConversationRuntime:
         except Exception:  # noqa: BLE001 - 进度展示失败不应中断对话
             logger.debug("Progress callback failed", exc_info=True)
 
+    @staticmethod
+    def _normalized_schedule(schedule: list[Any]) -> list[dict[str, Any]]:
+        """进度事件的调度计划：统一名称、过滤空白项与非法优先级。"""
+        normalized: list[dict[str, Any]] = []
+        for item in schedule:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("agent_name") or "").strip()
+            if not name:
+                continue
+            try:
+                priority = int(item.get("priority", 0))
+            except (TypeError, ValueError, OverflowError):
+                priority = 0
+            normalized.append(
+                {
+                    "agent_name": canonical_agent_name(name),
+                    "priority": priority,
+                    "reason": item.get("reason", ""),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _orchestration_succeeded(message: Msg) -> bool:
+        """子智能体全部成功才算成功（partial_failure 要让熔断器看到）。"""
+        try:
+            payload = (
+                json.loads(message.content)
+                if isinstance(message.content, str)
+                else message.content
+            )
+        except (TypeError, json.JSONDecodeError):
+            return True
+        if not isinstance(payload, dict):
+            return True
+        return payload.get("status") != "partial_failure"
+
     async def _build_context(self, user_input: str) -> list[Msg]:
         """组装意图识别上下文：系统记忆（偏好 + 历史摘要）+ 最近对话 + 当前输入。"""
         memory_parts: list[str] = []
@@ -218,7 +249,9 @@ class ConversationRuntime:
         messages.append(Msg(name="user", content=user_input, role="user"))
         return messages
 
-    async def _call_with_resilience(self, factory, max_retries: int, base_delay: float, max_delay: float):
+    async def _call_with_resilience(
+        self, factory, max_retries: int, base_delay: float, max_delay: float, success_check=None
+    ):
         """带重试与熔断记录的单次 LLM 调用。"""
         try:
             result = await retry_with_backoff(
@@ -228,7 +261,10 @@ class ConversationRuntime:
                 max_delay_sec=max_delay,
             )
             if self.circuit_breaker:
-                self.circuit_breaker.record_success()
+                if success_check is not None and not success_check(result):
+                    self.circuit_breaker.record_failure()
+                else:
+                    self.circuit_breaker.record_success()
             return result
         except CircuitOpenError:
             raise

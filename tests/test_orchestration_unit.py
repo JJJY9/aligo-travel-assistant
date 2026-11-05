@@ -460,6 +460,174 @@ def test_registry_load_failure_reports_agent_error():
     print("✓ 懒加载失败转为智能体错误并发出完成事件")
 
 
+def test_planning_runs_after_collection_and_sees_new_preferences():
+    """行程规划必须排在事项收集 / 偏好抽取之后，并看到本轮新偏好。"""
+    order: list[str] = []
+    captured: dict = {}
+
+    class Recorder(_StubAgent):
+        async def reply(self, x):
+            order.append(f"start:{self.name}")
+            if self.name == "preference":
+                payload = {
+                    "preferences": [
+                        {"type": "home_location", "value": "上海", "action": "replace"}
+                    ]
+                }
+            elif self.name == "plan-trip":
+                captured["payload"] = json.loads(x.content)
+                payload = {"itinerary": "ok"}
+            else:
+                payload = {"origin": "北京"}
+            await asyncio.sleep(0.02)
+            order.append(f"end:{self.name}")
+            return Msg(
+                name=self.name,
+                content=json.dumps(payload, ensure_ascii=False),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "event-collection": Recorder("event-collection"),
+            "preference": Recorder("preference"),
+            "plan-trip": Recorder("plan-trip"),
+        }
+    )
+    schedule = [
+        {"agent_name": "plan-trip", "priority": 1},
+        {"agent_name": "event-collection", "priority": 1},
+        {"agent_name": "preference", "priority": 1},
+    ]
+    asyncio.run(orchestrator.reply(_intent(schedule)))
+
+    planning_start = order.index("start:plan-trip")
+    assert planning_start > order.index("end:event-collection")
+    assert planning_start > order.index("end:preference")
+    prefs = captured["payload"]["context"]["user_preferences"]
+    assert prefs["home_location"] == "上海"
+    print("✓ 行程规划自动后置并看到本轮新偏好")
+
+
+def test_preference_append_action_variants():
+    """Append / add / 追加 等大小写或中文变体都应走追加，不能覆盖已有列表。"""
+    memory = _StubMemory()
+    memory.long_term.save_preference("hotel_brands", ["汉庭"])
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": "hotel_brands", "value": "如家", "action": "Append"}
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference("hotel_brands") == ["汉庭", "如家"]
+    print("✓ 偏好追加动作兼容大小写变体")
+
+
+def test_infinite_priority_is_sanitized():
+    """priority 为 Infinity 时 int() 抛 OverflowError，不能带崩整轮。"""
+    orchestrator = OrchestrationAgent(
+        agent_registry={"a": _StubAgent("a", {"answer": "ok"})}
+    )
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(_intent([{"agent_name": "a", "priority": float("inf")}]))
+        ).content
+    )
+    assert result["status"] == "completed"
+    print("✓ Infinity 优先级被清洗")
+
+
+def test_agent_timeout_returns_error(monkeypatch):
+    """单个智能体卡住时应超时失败，而不是无限占用整轮。"""
+    from agents import orchestration_agent as module
+
+    class Slow(_StubAgent):
+        async def reply(self, x):
+            await asyncio.sleep(0.2)
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    monkeypatch.setattr(module, "_AGENT_TIMEOUT_SEC", 0.05)
+    orchestrator = OrchestrationAgent(agent_registry={"slow": Slow("slow")})
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(_intent([{"agent_name": "slow", "priority": 1}]))
+        ).content
+    )
+    assert result["status"] == "partial_failure"
+    assert "超时" in json.dumps(result, ensure_ascii=False)
+    print("✓ 单智能体超时转为错误结果")
+
+
+def test_subagent_transient_error_retried(monkeypatch):
+    """子智能体的瞬时连接错误应重试一次，而不是直接失败。"""
+    from agents import orchestration_agent as module
+
+    class Flaky(_StubAgent):
+        def __init__(self, name):
+            super().__init__(name)
+            self.failures = 0
+
+        async def reply(self, x):
+            self.calls += 1
+            if self.failures == 0:
+                self.failures = 1
+                raise ConnectionError("temporary")
+            return Msg(
+                name=self.name,
+                content=json.dumps({"answer": "ok"}),
+                role="assistant",
+            )
+
+    monkeypatch.setattr(module, "_AGENT_RETRY_BASE_DELAY", 0.01)
+    agent = Flaky("a")
+    orchestrator = OrchestrationAgent(agent_registry={"a": agent})
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(_intent([{"agent_name": "a", "priority": 1}]))
+        ).content
+    )
+    assert result["status"] == "completed"
+    assert agent.calls == 2, "瞬时错误应重试一次"
+    print("✓ 子智能体瞬时错误重试一次")
+
+
+def test_conversation_schedule_normalization():
+    """进度事件的调度计划应统一名称、过滤空白项与非法优先级。"""
+    from agents.conversation import ConversationRuntime
+
+    normalized = ConversationRuntime._normalized_schedule(
+        [
+            {"agent_name": "plan-trip", "priority": float("inf")},
+            {"agent_name": "  ", "priority": 1},
+            "bad",
+            {"agent_name": "query-info"},
+        ]
+    )
+    assert normalized == [
+        {"agent_name": "itinerary_planning", "priority": 0, "reason": ""},
+        {"agent_name": "information_query", "priority": 0, "reason": ""},
+    ]
+    assert ConversationRuntime._orchestration_succeeded(
+        Msg(name="o", content=json.dumps({"status": "completed"}), role="assistant")
+    )
+    assert not ConversationRuntime._orchestration_succeeded(
+        Msg(name="o", content=json.dumps({"status": "partial_failure"}), role="assistant")
+    )
+    print("✓ 进度调度计划规范化 + 部分失败不计为成功")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -473,4 +641,7 @@ if __name__ == "__main__":
     test_skill_folder_names_are_canonicalized()
     test_memory_update_preference_and_trip()
     test_prepare_context_includes_user_query()
+    test_planning_runs_after_collection_and_sees_new_preferences()
+    test_preference_append_action_variants()
+    test_infinite_priority_is_sanitized()
     print("\n全部通过")

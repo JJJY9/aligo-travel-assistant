@@ -23,7 +23,20 @@ from typing import Any
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
+from utils.llm_resilience import retry_with_backoff
+from utils.preference_values import has_preference_value
+
 logger = logging.getLogger(__name__)
+
+# 单个子智能体的执行上限与瞬时错误重试：防止一个卡住的智能体让整轮对话
+# （以及该用户的会话锁）无限等待；重试只针对可重试的 LLM / 网络错误
+_AGENT_TIMEOUT_SEC = 300.0
+_AGENT_RETRY_MAX = 1
+_AGENT_RETRY_BASE_DELAY = 1.0
+_AGENT_RETRY_MAX_DELAY = 5.0
+
+# 行程规划依赖事项收集与偏好抽取的结果：两者同批时规划拿不到这些上下文
+_PLANNING_DEPENDENCIES = {"event_collection", "preference"}
 
 # 注册器同时接受技能目录名与旧智能体名（plan-trip / event-collection 等）；
 # 下游的聚合、记忆写入与前端展示统一使用旧名称
@@ -34,6 +47,11 @@ _SKILL_AGENT_NAMES = {
     "memory-query": "memory_query",
     "query-info": "information_query",
 }
+
+
+def canonical_agent_name(agent_name: str) -> str:
+    """把技能目录名统一为标准智能体名（未知名称原样返回）。"""
+    return _SKILL_AGENT_NAMES.get(agent_name, agent_name)
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -134,8 +152,27 @@ class OrchestrationAgent(AgentBase):
         for task in agent_schedule:
             try:
                 task["priority"] = int(task.get("priority", 999))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 task["priority"] = 999
+
+        # 行程规划必须在事项收集 / 偏好抽取之后一批执行，否则拿不到本轮结果
+        def _canonical(task: dict[str, Any]) -> str:
+            name = str(task.get("agent_name") or "")
+            return _SKILL_AGENT_NAMES.get(name, name)
+
+        dependency_priorities = [
+            task["priority"]
+            for task in agent_schedule
+            if _canonical(task) in _PLANNING_DEPENDENCIES
+        ]
+        if dependency_priorities:
+            planning_floor = max(dependency_priorities) + 1
+            for task in agent_schedule:
+                if (
+                    _canonical(task) == "itinerary_planning"
+                    and task["priority"] <= max(dependency_priorities)
+                ):
+                    task["priority"] = planning_floor
         if not agent_schedule:
             return Msg(
                 name=self.name,
@@ -167,7 +204,10 @@ class OrchestrationAgent(AgentBase):
                 # 并行执行当前优先级的所有任务
                 if parallel_tasks:
                     batch_results = await self._execute_parallel_agents(
-                        parallel_tasks, context, results, on_event
+                        parallel_tasks,
+                        self._context_with_previous_preferences(context, results),
+                        results,
+                        on_event,
                     )
                     results.extend(batch_results)
                     parallel_tasks = []
@@ -178,7 +218,10 @@ class OrchestrationAgent(AgentBase):
         # 执行最后一批
         if parallel_tasks:
             batch_results = await self._execute_parallel_agents(
-                parallel_tasks, context, results, on_event
+                parallel_tasks,
+                self._context_with_previous_preferences(context, results),
+                results,
+                on_event,
             )
             results.extend(batch_results)
 
@@ -235,6 +278,57 @@ class OrchestrationAgent(AgentBase):
             context["user_preferences"] = preferences
 
         return context
+
+    def _context_with_previous_preferences(
+        self, context: dict[str, Any], previous_results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """把前序批次里偏好智能体抽到的新偏好合并进上下文。
+
+        偏好在全部智能体执行完才落库，后续批次的行程规划需要先看到本轮
+        新偏好（例如用户刚说「我搬到上海了」就开始规划行程）。
+        """
+        merged = dict(context)
+        preferences = dict(context.get("user_preferences") or {})
+        for result in previous_results:
+            if result.get("agent_name") != "preference":
+                continue
+            data = (result.get("result") or {}).get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            raw = data.get("preferences")
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    pref_type = item.get("type")
+                    value = item.get("value")
+                    if not pref_type or not has_preference_value(value):
+                        continue
+                    action = str(item.get("action") or "replace").strip().lower()
+                    if action in {"append", "add", "追加"}:
+                        existing = preferences.get(pref_type)
+                        if isinstance(existing, list):
+                            values = list(existing)
+                            if value not in values:
+                                values.append(value)
+                            preferences[pref_type] = values
+                        elif has_preference_value(existing):
+                            if existing == value:
+                                preferences[pref_type] = [value]
+                            else:
+                                preferences[pref_type] = [existing, value]
+                        else:
+                            preferences[pref_type] = [value]
+                    else:
+                        preferences[pref_type] = value
+            elif isinstance(raw, dict):
+                for pref_type, value in raw.items():
+                    if pref_type in {"has_preferences", "error"}:
+                        continue
+                    if has_preference_value(value):
+                        preferences[pref_type] = value
+        merged["user_preferences"] = preferences
+        return merged
 
     async def _execute_parallel_agents(
         self,
@@ -427,8 +521,17 @@ class OrchestrationAgent(AgentBase):
             agent = await asyncio.get_running_loop().run_in_executor(
                 None, self.agent_registry.__getitem__, agent_name
             )
-            # 调用智能体
-            response = await agent.reply(input_msg)
+            # 调用智能体：瞬时 LLM / 网络错误重试一次；单次执行有超时上限，
+            # 卡住的智能体不能无限占用整轮与该用户的会话锁
+            response = await asyncio.wait_for(
+                retry_with_backoff(
+                    lambda: agent.reply(input_msg),
+                    max_retries=_AGENT_RETRY_MAX,
+                    base_delay_sec=_AGENT_RETRY_BASE_DELAY,
+                    max_delay_sec=_AGENT_RETRY_MAX_DELAY,
+                ),
+                timeout=_AGENT_TIMEOUT_SEC,
+            )
 
             # 解析响应
             if isinstance(response.content, str):
@@ -461,6 +564,15 @@ class OrchestrationAgent(AgentBase):
                 "status": "success",
                 "agent_name": agent_name,
                 "data": result
+            }
+
+        except asyncio.TimeoutError:
+            logger.error("Agent execution timed out: %s", agent_name)
+            return {
+                "status": "error",
+                "agent_name": agent_name,
+                "data": {"error": f"执行超时（>{_AGENT_TIMEOUT_SEC:g} 秒）"},
+                "message": "智能体执行超时",
             }
 
         except Exception as e:
@@ -544,13 +656,13 @@ class OrchestrationAgent(AgentBase):
 
                         pref_type = pref_item.get("type")
                         pref_value = pref_item.get("value")
-                        pref_action = pref_item.get("action", "replace")  # 默认覆盖
+                        pref_action = str(pref_item.get("action") or "replace").strip().lower()
 
-                        if not pref_type or not pref_value:
+                        if not pref_type or not has_preference_value(pref_value):
                             continue
 
-                        # 根据 action 决定操作
-                        if pref_action == "append":
+                        # 根据 action 决定操作（模型可能返回 Append / add / 追加 等变体）
+                        if pref_action in {"append", "add", "追加"}:
                             append_pref = getattr(
                                 self.memory_manager.long_term,
                                 "append_preference",
@@ -592,7 +704,10 @@ class OrchestrationAgent(AgentBase):
                 # 旧格式兼容：preferences 是字典
                 elif isinstance(preferences_data, dict):
                     for pref_type, value in preferences_data.items():
-                        if value and pref_type != "has_preferences" and pref_type != "error":
+                        if (
+                            has_preference_value(value)
+                            and pref_type not in {"has_preferences", "error"}
+                        ):
                             self.memory_manager.long_term.save_preference(pref_type, value)
                             logger.info(f"Updated {pref_type}: {value} (legacy format)")
 
