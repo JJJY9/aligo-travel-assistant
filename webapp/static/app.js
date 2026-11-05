@@ -2074,6 +2074,10 @@ async function refreshMetrics() {
         total ? `${Math.round(Number(requests.max_duration_ms || 0))} ms` : "—",
       ],
       [
+        "P95 耗时",
+        total ? `${Math.round(Number(requests.p95_duration_ms || 0))} ms` : "—",
+      ],
+      [
         "熔断器",
         BREAKER_LABELS[String((data.circuit_breaker || {}).state || "")] || "—",
       ],
