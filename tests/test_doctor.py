@@ -81,12 +81,57 @@ def test_version_consistency(monkeypatch):
 
 
 def test_version_check_skips_without_pyproject(monkeypatch, tmp_path):
+    import importlib.metadata
+
     from utils import doctor as doctor_module
 
     monkeypatch.setattr(doctor_module, "PROJECT_ROOT", tmp_path)
+
+    def missing(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing)
     result = check_version_consistency()
     assert result.status == STATUS_SKIP
-    print("✓ 安装 wheel（无 pyproject）时跳过版本一致性检查")
+    print("✓ 无 pyproject / 安装元数据 / 静态资源时跳过版本一致性检查")
+
+
+def test_version_check_wheel_mode_checks_static(monkeypatch, tmp_path):
+    """wheel 安装没有 pyproject：仍校验 dist-info 元数据与静态资源版本。"""
+    import importlib.metadata
+
+    from utils import doctor as doctor_module
+    from utils.version import APP_VERSION
+
+    static = tmp_path / "webapp" / "static"
+    static.mkdir(parents=True)
+    (static / "index.html").write_text(
+        f'<script src="/static/app.js?v={APP_VERSION}"></script>', encoding="utf-8"
+    )
+    monkeypatch.setattr(doctor_module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: APP_VERSION)
+
+    result = check_version_consistency()
+    assert result.status == STATUS_OK
+    assert "wheel 元数据" in result.detail and "静态资源" in result.detail
+    assert "pyproject" not in result.detail
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.0.0")
+    result = check_version_consistency()
+    assert result.status == STATUS_WARN
+    assert "wheel 元数据为 0.0.0" in result.detail
+    print("✓ wheel 模式校验安装元数据与静态资源版本")
+
+
+def test_version_check_handles_non_utf8_files(monkeypatch, tmp_path):
+    from utils import doctor as doctor_module
+
+    (tmp_path / "pyproject.toml").write_bytes(b'version = "1.4.1"\n# \xd6\xd0\xce\xc4\n')
+    monkeypatch.setattr(doctor_module, "PROJECT_ROOT", tmp_path)
+    result = check_version_consistency()
+    assert result.status == STATUS_WARN
+    assert "无法读取 pyproject.toml" in result.detail
+    print("✓ 非 UTF-8 文件不会让 doctor 崩溃")
 
 
 def test_version_check_detects_static_version_mismatch(monkeypatch, tmp_path):

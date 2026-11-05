@@ -180,7 +180,7 @@ def check_skills() -> CheckResult:
 
 
 def check_version_consistency() -> CheckResult:
-    """检查 pyproject.toml / index.html 静态资源版本与 ``APP_VERSION`` 是否一致。"""
+    """检查 pyproject/安装元数据、静态资源版本与 ``APP_VERSION`` 是否一致。"""
     from utils.version import APP_VERSION
 
     problems: list[str] = []
@@ -190,7 +190,7 @@ def check_version_consistency() -> CheckResult:
     if pyproject.is_file():
         try:
             text = pyproject.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             problems.append(f"无法读取 pyproject.toml：{exc}")
         else:
             match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
@@ -200,12 +200,26 @@ def check_version_consistency() -> CheckResult:
                     problems.append(f"pyproject.toml 为 {match.group(1)}")
             else:
                 problems.append("pyproject.toml 中未找到 version")
+    else:
+        # wheel 安装没有源码 pyproject.toml：改用 dist-info 元数据校验
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+
+            installed = version("aligo-travel-assistant")
+        except PackageNotFoundError:
+            installed = None
+        except Exception:  # noqa: BLE001 - 元数据损坏时按未安装处理
+            installed = None
+        if installed:
+            checked.append("wheel 元数据")
+            if installed != APP_VERSION:
+                problems.append(f"wheel 元数据为 {installed}")
 
     index_html = PROJECT_ROOT / "webapp" / "static" / "index.html"
     if index_html.is_file():
         try:
             html = index_html.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             problems.append(f"无法读取 index.html：{exc}")
         else:
             versions = set(re.findall(r"\?v=([0-9][0-9A-Za-z.\-]*)", html))
@@ -225,12 +239,12 @@ def check_version_consistency() -> CheckResult:
         )
     if not checked:
         return CheckResult(
-            "版本一致性", STATUS_SKIP, "未找到 pyproject.toml / 静态资源版本，跳过"
+            "版本一致性", STATUS_SKIP, "未找到 pyproject.toml / 安装元数据 / 静态资源版本，跳过"
         )
     return CheckResult(
         "版本一致性",
         STATUS_OK,
-        f"{APP_VERSION}（pyproject / 静态资源一致）",
+        f"{APP_VERSION}（{' / '.join(checked)} 一致）",
     )
 
 
