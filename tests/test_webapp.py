@@ -2895,13 +2895,14 @@ def test_knowledge_eval_api(monkeypatch):
     )
     assert client.get("/api/knowledge/eval").status_code == 503
 
-    assert server_module._KB_EVAL_LOCK.acquire(blocking=False)
+    token = state.eval_lock.acquire()
+    assert token
     try:
         busy = client.get("/api/knowledge/eval")
         assert busy.status_code == 429
         assert "Retry-After" in busy.headers
     finally:
-        server_module._KB_EVAL_LOCK.release()
+        state.eval_lock.release(token)
 
     # 并发锁拒绝不应消耗知识库额度：恢复知识库后仍可再评测一次（额度 3/3）
     monkeypatch.setattr(

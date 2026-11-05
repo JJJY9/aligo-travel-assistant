@@ -26,7 +26,6 @@ import json
 import logging
 import math
 import re
-import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
@@ -70,6 +69,7 @@ from utils.knowledge_admin import (
 from utils.knowledge_stats import knowledge_status
 from utils.metrics import REQUEST_METRICS
 from utils.rate_limit import create_rate_limiter
+from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
 from utils.session_markdown import render_all_sessions_markdown
 from utils.skill_paths import resolve_skills_root, skill_scripts
@@ -86,8 +86,6 @@ logger = logging.getLogger(__name__)
 SSE_HEARTBEAT_SEC = 15.0
 # 请求体大小上限（JSON 接口都是小请求；防止超大 body 在 Pydantic 校验前耗尽内存）
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
-# 检索评测会加载嵌入模型并逐个问题检索；同一进程同时只允许一个评测
-_KB_EVAL_LOCK = threading.Lock()
 
 # 只有环回地址视为「仅本机」；其它地址启动时提示需要反向代理做认证 / HTTPS
 def _is_loopback_host(host: str) -> bool:
@@ -544,6 +542,10 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("kb_requests", 60),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
+        )
+        # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内
+        self.eval_lock = DistributedLock(
+            redis_client, "aligo:lock:kb_eval", ttl_sec=300
         )
 
     @staticmethod
@@ -1287,7 +1289,8 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/knowledge/eval")
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
         """离线检索评测：14 个差旅问题计算 hit@1/3/5 与 MRR（不调用大模型）。"""
-        if not _KB_EVAL_LOCK.acquire(blocking=False):
+        token = state.eval_lock.acquire()
+        if token is None:
             raise HTTPException(
                 status_code=429,
                 detail="已有检索评测在运行，请稍后再试",
@@ -1332,7 +1335,7 @@ def create_app(model: Any = None) -> FastAPI:
                 logger.warning("检索评测失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
         finally:
-            _KB_EVAL_LOCK.release()
+            state.eval_lock.release(token)
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
