@@ -2,15 +2,20 @@ import os
 
 import yaml
 
+from utils.skill_paths import resolve_skills_root
+
 
 class SkillLoader:
     """加载 .claude/skills 下的技能描述"""
     
-    def __init__(self, skills_dir: str = ".claude/skills"):
-        # 获取当前文件的绝对路径，然后找到项目根目录
-        current_file_path = os.path.abspath(__file__)
-        project_root = os.path.dirname(os.path.dirname(current_file_path))
-        self.skills_dir = os.path.join(project_root, skills_dir)
+    def __init__(self, skills_dir: str | None = None):
+        # 默认按源码 / 环境变量 / wheel 安装位置解析；显式传入时以传入为准
+        if skills_dir:
+            current_file_path = os.path.abspath(__file__)
+            project_root = os.path.dirname(os.path.dirname(current_file_path))
+            self.skills_dir = os.path.join(project_root, skills_dir)
+        else:
+            self.skills_dir = str(resolve_skills_root())
         self.skills: dict[str, dict] = {}
         
     def load_skills(self) -> dict[str, dict]:

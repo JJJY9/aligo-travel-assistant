@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.1] - 2026-11-05
+
+### 修复
+- wheel 未包含 `.claude/skills`：安装后所有智能体无法注册，对话只会返回空结果。现在通过 setuptools data-files 把技能代码与 `SKILL.md` 安装到虚拟环境的 `.claude/skills`，并新增统一技能目录解析 `utils/skill_paths.py`（支持 `ALIGO_SKILLS_DIR` 覆盖，源码 / wheel 安装两种位置），`LazyAgentRegistry`、`SkillLoader` 与知识库路径共用
+- sdist / wheel 仍不包含 `data/` 下的知识库文档、嵌入模型与记忆数据；安装后 RAG 需按「知识库初始化」自行准备
+
+### 测试
+- 新增 `tests/test_skill_paths.py`：源码目录 / 环境变量 / `sys.prefix` 回退 / pyproject data-files 覆盖全部技能文件
+- 发布验证：fresh venv 安装 wheel 后六个智能体全部可注册、`aligo-web --help` 与健康接口正常、静态页面可访问
+
 ## [1.4.0] - 2026-11-05
 
 ### 新增

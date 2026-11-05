@@ -340,6 +340,16 @@ pip install rich==13.9.4                    # CLI界面
 pip install ddgs==9.10.0                    # 网络搜索
 ```
 
+也可以直接安装 [Releases](https://github.com/JJJY9/aligo-travel-assistant/releases) 中的 wheel（已包含 Web 静态资源与 `.claude/skills` 技能代码，技能会安装到虚拟环境的 `.claude/skills`）：
+
+```bash
+pip install aligo_travel_assistant-1.4.1-py3-none-any.whl
+aligo-web        # 启动 Web 界面（也可用 python -m webapp.server）
+aligo            # 启动交互式 CLI
+```
+
+RAG 知识库文档、嵌入模型与记忆数据属于运行时数据，不随安装包分发，需要按「知识库初始化」自行准备；技能目录可用环境变量 `ALIGO_SKILLS_DIR` 覆盖。
+
 ### 2. 配置模型
 
 项目默认使用 **DeepSeek**（OpenAI 兼容接口），API 密钥二选一：
