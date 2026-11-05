@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from utils.errors import MemoryPersistenceError
+from utils.file_lock import file_lock
 from utils.preference_values import merge_preference_value
 
 logger = logging.getLogger(__name__)
@@ -35,18 +36,22 @@ def _lock_for_path(path: str) -> threading.RLock:
 
 
 def _locked_mutation(func):
-    """写操作装饰器：按文件路径加锁，并在修改前重载磁盘数据。
+    """写操作装饰器：加锁（进程内 RLock + 跨进程文件锁）后重载再修改。
 
     长期记忆是整文件快照写回：调用方可能持有回合开始时的旧快照（例如一轮
     对话进行中），直接覆盖会丢失其它请求刚完成的写入（删掉的行程复活、
     新偏好丢失）。所有修改方法统一「重载 → 修改 → 原子写回」。
+
+    同一进程内用按路径 RLock 串行化；CLI 与 Web 同时写同一用户时再叠加
+    ``<data>.lock`` 跨进程文件锁，避免后写覆盖先写。
     """
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         with self._write_lock:
-            self._reload_latest()
-            return func(self, *args, **kwargs)
+            with file_lock(self.db_path):
+                self._reload_latest()
+                return func(self, *args, **kwargs)
 
     return wrapper
 
