@@ -393,11 +393,12 @@ python .claude/skills/ask-question/script/init_knowledge_base.py
 ### 4. 启动系统
 
 ```bash
-python cli.py                  # 命令行界面
-python -m webapp.server        # Web 界面：http://127.0.0.1:8000
+python cli.py                     # 命令行界面
+python -m webapp.server           # Web 界面：http://127.0.0.1:8000
+python -m webapp.server --version # 显示版本号后退出
 ```
 
-Web 服务默认只监听本机，可用 `--host` / `--port` 调整（例如 `--port 8001`）。
+Web 服务默认只监听本机，可用 `--host` / `--port` 调整（例如 `--port 8001`）。使用非环回地址（如 `--host 0.0.0.0`）启动时会输出安全警告：请通过反向代理提供认证与 HTTPS（见 [SECURITY.md](SECURITY.md)）。
 
 ---
 

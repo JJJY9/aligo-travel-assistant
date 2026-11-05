@@ -89,6 +89,13 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 检索评测会加载嵌入模型并逐个问题检索；同一进程同时只允许一个评测
 _KB_EVAL_LOCK = threading.Lock()
 
+# 只有这些监听地址视为「仅本机」；其它地址启动时提示需要反向代理做认证 / HTTPS
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
 
@@ -2192,6 +2199,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="启动 Aligo Web 服务")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口（默认 8000）")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Aligo Web {APP_VERSION}",
+        help="显示版本号并退出",
+    )
     args = parser.parse_args()
 
     configure_stdio()
@@ -2206,6 +2219,12 @@ def main() -> None:
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    if not _is_loopback_host(args.host):
+        logger.warning(
+            "服务监听在 %s，可能对外可访问；请通过反向代理提供认证与 HTTPS，"
+            "并按 SECURITY.md 配置 REDIS_URL / TRUST_PROXY_HEADERS",
+            args.host,
         )
     try:
         application = create_app()
