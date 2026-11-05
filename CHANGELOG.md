@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.5.0] - 2026-11-05
 
 ### 新增
 - 多实例共享限流：配置 `REDIS_URL` 后对话接口的用户桶与 IP 桶计数写入 Redis 有序集合（`aligo:ratelimit:*`），多个 Web 实例共享同一份额度；窗口时间取自 Redis 服务器时钟，避免实例间时钟不一致
