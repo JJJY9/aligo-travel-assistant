@@ -59,6 +59,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.doctor import run_doctor
 from utils.knowledge_admin import (
+    JOINED_MAX_CHARS,
     add_document,
     delete_document,
     export_documents,
@@ -415,7 +416,9 @@ class KnowledgeDocumentPayload(BaseModel):
 class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     """更新知识片段：支持整份文档（整组）编辑后按 400 字重新拆分。"""
 
-    content: str = Field(min_length=1, max_length=20000)
+    # 文档大小上限 20000 字（分片长度之和）；回填的拼接文本含分片间分隔符，
+    # 上限略高（JOINED_MAX_CHARS），面板按 size 字段判断是否可编辑
+    content: str = Field(min_length=1, max_length=JOINED_MAX_CHARS)
 
     @field_validator("metadata", mode="before")
     @classmethod

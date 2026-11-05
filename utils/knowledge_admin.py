@@ -27,10 +27,14 @@ _IMPORT_CHUNK = 500
 # 单条内容超过该长度时按语义边界拆片：嵌入模型只编码前 512 token
 # （约 400 个汉字），更长的尾部内容对检索完全不可见
 _MAX_CONTENT_CHARS = 400
+# 文档大小上限（各分片内容长度之和）。回填 / 还原时按分片拼接会插入分隔符，
+# 因此允许的拼接文本长度略高（每 400 字一片，20000 字最多 50 片）
+DOC_MAX_CHARS = 20000
+JOINED_MAX_CHARS = DOC_MAX_CHARS + 100
 # 导入时单条内容上限（用户输入 / 任意备份的安全边界）；从导出备份还原的
-# 多分片记录是完整文档，用更大的上限避免备份恢复被截断
+# 多分片记录是完整文档，用拼接上限避免备份恢复被截断
 _IMPORT_CONTENT_MAX_CHARS = 2000
-_RESTORE_CONTENT_MAX_CHARS = 20000
+_RESTORE_CONTENT_MAX_CHARS = JOINED_MAX_CHARS
 # 元数据最多 10 个键（与导入清洗保持一致），分片标记只在放得下时添加
 _METADATA_MAX_KEYS = 10
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
@@ -431,16 +435,18 @@ def _regroup_exported_documents(
                 }
         if not contents:
             continue
-        if all(stripped in existing for stripped in (c.strip() for c in contents)):
+        stripped_contents = [content.strip() for content in contents]
+        if all(stripped in existing for stripped in stripped_contents):
             # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
             skipped += len(contents)
             continue
         merged.append(
             {
                 "__restored_group__": True,
-                # 与 get_document_group 一致不插入分隔符：还原内容的长度不能
-                # 超过文档本身（否则恰好在上限的备份无法还原）
-                "content": "".join(contents),
+                # 还原上限按分片总长度判断；拼接用换行分隔（分片边界处原文
+                # 可能是段落 / 标题，空串拼接会把两段文字粘在一起）
+                "__restored_size__": sum(len(text) for text in stripped_contents),
+                "content": "\n".join(contents),
                 "metadata": base_meta,
             }
         )
@@ -453,9 +459,10 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
     不存在返回 None；单条 / 无 group 的旧分片返回其自身内容。供面板
     「编辑整份文档」回填：整组保存时由 ``update_document`` 整组替换。
 
-    拼接不额外插入分隔符：分片边界本身来自语义切分（切分时已去掉边界
-    空白），加分隔符会让回填长度超过文档本身的字数上限。读取在写锁内
-    进行，避免读到整组替换过程中的中间状态。
+    拼接用换行分隔（分片边界处原文可能是段落 / 标题，空串拼接会把
+    两段文字粘在一起）；文档大小（``size``，各片长度之和）才是上限判断
+    依据，拼接文本长度上限另留余量。读取在写锁内进行，避免读到整组
+    替换过程中的中间状态。
     """
     with _WRITE_LOCK:
         client = _client()
@@ -475,6 +482,7 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
                 "id": int(doc_id),
                 "group": "",
                 "parts": parts,
+                "size": len(content),
                 "content": content,
             }
         pieces: list[tuple[int, str]] = []
@@ -498,26 +506,36 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
             "id": int(doc_id),
             "group": group,
             "parts": len(pieces) or parts,
-            "content": "".join(text for _, text in pieces),
+            "size": sum(len(text) for _, text in pieces),
+            "content": "\n".join(text for _, text in pieces),
         }
 
 
 def find_duplicate_contents() -> list[tuple[str, list[int]]]:
-    """返回内容完全相同的片段组（按首次出现顺序），供人工清理。
+    """返回内容完全相同的**独立**片段组（按首次出现顺序），供人工清理。
 
-    历史版本的导入容错较差时可能留下重复内容；这里只做只读扫描，不删除。
+    只统计不带 ``group`` 的独立片段：多分片记录内部出现相同段落是正常的，
+    而且必须通过整份编辑 / 整组删除维护，按单条重复删除会破坏整篇文档。
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    seen: dict[str, list[int]] = {}
+    seen: dict[str, list[tuple[int, bool]]] = {}
     for row in _iter_all_rows(client):
         content = str(row.get("content", "")).strip()
         if not content:
             continue
-        seen.setdefault(content, []).append(int(row.get("id", 0) or 0))
-    return [
-        (content, ids) for content, ids in seen.items() if len(ids) > 1
-    ]
+        meta = _parse_metadata(row.get("metadata"))
+        grouped = bool(meta.get("group"))
+        seen.setdefault(content, []).append(
+            (int(row.get("id", 0) or 0), grouped)
+        )
+    duplicates: list[tuple[str, list[int]]] = []
+    for content, entries in seen.items():
+        standalone = [doc_id for doc_id, grouped in entries if not grouped]
+        if len(standalone) < 2:
+            continue
+        duplicates.append((content, standalone))
+    return duplicates
 
 
 def _existing_contents() -> set[str]:
@@ -566,6 +584,7 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
         cleaned: list[dict[str, Any]] = []
         for item in merged_items:
             restored = bool(item.pop("__restored_group__", False))
+            restored_size = int(item.pop("__restored_size__", 0) or 0)
             raw_content = item.get("content")
             if not isinstance(raw_content, str):
                 skipped += 1
@@ -584,11 +603,14 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
             limit = (
                 _RESTORE_CONTENT_MAX_CHARS if restored else _IMPORT_CONTENT_MAX_CHARS
             )
-            if restored and len(content) > limit:
-                # 备份还原不能静默截断：超出还原上限时整批报错，提示拆分后导入
-                raise ValueError(
-                    f"备份中的文档超过还原上限（{limit} 字），请拆分后导入"
-                )
+            if restored:
+                # 还原上限按文档大小（分片长度之和）判断；拼接文本允许略长
+                # （分片间的分隔符不计入文档大小），超出则整批报错不静默截断
+                doc_size = restored_size or len(content)
+                if doc_size > DOC_MAX_CHARS or len(content) > limit:
+                    raise ValueError(
+                        f"备份中的文档超过还原上限（{DOC_MAX_CHARS} 字），请拆分后导入"
+                    )
             cleaned.extend(_chunk_documents(content[:limit], sanitized_meta))
 
         unique: list[dict[str, Any]] = []

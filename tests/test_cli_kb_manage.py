@@ -139,13 +139,20 @@ def test_duplicates_reports_groups(monkeypatch):
     assert "发现 2 组重复内容（共 5 条片段）" in out
     assert "#3、#9" in out
     assert "重复内容甲" in out
-    print("✓ kb-duplicates 列出重复组")
+
+    # limit 限制显示组数并给出提示；limit=0 显示全部
+    limited_code, limited = _capture(cli.run_knowledge_duplicates_standalone, 1)
+    assert limited_code == 0 and "其余 1 组未显示" in limited
+    assert "重复内容乙" not in limited
+    full_code, full = _capture(cli.run_knowledge_duplicates_standalone, 0)
+    assert full_code == 0 and "重复内容乙" in full and "未显示" not in full
+    print("✓ kb-duplicates 列出重复组（limit）")
 
 
 def test_duplicates_none_and_error(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: [])
     code, out = _capture(cli.run_knowledge_duplicates_standalone)
-    assert code == 0 and "没有重复内容" in out
+    assert code == 0 and "没有重复内容的独立知识片段" in out
 
     def boom():
         raise RuntimeError("Milvus 故障")
