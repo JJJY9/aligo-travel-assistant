@@ -2,9 +2,10 @@
 信息查询智能体天气回退测试（无需 API Key、不访问网络）
 
 覆盖：
-1. wttr.in 不可用（返回 query_success=False）时，自动回退到联网搜索；
+1. 天气接口不可用（返回 query_success=False）时，自动回退到联网搜索；
 2. 天气接口正常时不触发联网搜索；
-3. 天气查询抛异常时同样回退。
+3. 天气查询抛异常时同样回退；
+4. 天气结果格式化为中文摘要（复用 utils.weather.fetch_weather）。
 
 运行：python tests/test_query_info_fallback.py
 """
@@ -13,6 +14,8 @@ import importlib.util
 import json
 import os
 import sys
+
+import pytest
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -130,42 +133,81 @@ def test_extract_city():
 
 
 def test_weather_query_open_meteo_formatting():
-    """Open-Meteo 返回结果应格式化为可读的中文摘要"""
+    """fetch_weather 的结构化结果应格式化为可读的中文摘要"""
+    from utils import weather
+
     agent = _load_agent_class()(name="InformationQueryAgent", model=_FakeModel())
 
-    async def fake_http(url, params):
-        if "geocoding" in url:
-            return {"results": [{"name": "杭州", "latitude": 30.29, "longitude": 120.16}]}
+    def fake_fetch(city, timeout=8.0):
+        assert city == "杭州"
         return {
-            "current": {"temperature_2m": 18.5, "relative_humidity_2m": 72, "weather_code": 2},
-            "daily": {
-                "time": ["2026-11-04", "2026-11-05", "2026-11-06"],
-                "weather_code": [2, 61, 0],
-                "temperature_2m_min": [12, 11, 10],
-                "temperature_2m_max": [20, 18, 22],
+            "city": "杭州",
+            "timezone": "Asia/Shanghai",
+            "current": {
+                "description": "多云",
+                "temperature": 18.5,
+                "humidity": 72,
+                "weather_code": 2,
             },
+            "daily": [
+                {"date": "2026-11-04", "description": "多云", "min": 12, "max": 20},
+                {"date": "2026-11-05", "description": "小雨", "min": 11, "max": 18},
+            ],
+            "source": {"name": "Open-Meteo", "url": "https://open-meteo.com"},
         }
 
-    agent._http_json = fake_http
-    result = asyncio.run(agent._weather_query("杭州明天天气怎么样？"))
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(weather, "fetch_weather", fake_fetch)
+        result = asyncio.run(agent._weather_query("杭州明天天气怎么样？"))
+    finally:
+        mp.undo()
     assert result["query_success"] is True
     summary = result["results"]["summary"]
     assert "杭州当前天气：多云" in summary
     assert "18.5" in summary
     assert "小雨" in summary
-    print("✓ Open-Meteo 天气结果格式化正常")
+    print("✓ 天气结果格式化正常")
 
 
 def test_weather_query_unknown_city():
+    from utils import weather
+
     agent = _load_agent_class()(name="InformationQueryAgent", model=_FakeModel())
 
-    async def fake_http(url, params):
-        return {"results": []}
+    def fake_fetch(city, timeout=8.0):
+        raise weather.WeatherError(f"未找到城市「{city}」")
 
-    agent._http_json = fake_http
-    result = asyncio.run(agent._weather_query("某些小城天气怎么样"))
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(weather, "fetch_weather", fake_fetch)
+        result = asyncio.run(agent._weather_query("某些小城天气怎么样"))
+    finally:
+        mp.undo()
     assert result["query_success"] is False
+    assert "未找到城市" in result["results"]["message"]
+    assert "请检查城市名" in result["results"]["message"]
     print("✓ 城市未找到时返回失败")
+
+
+def test_weather_query_unavailable():
+    from utils import weather
+
+    agent = _load_agent_class()(name="InformationQueryAgent", model=_FakeModel())
+
+    def fake_fetch(city, timeout=8.0):
+        raise weather.WeatherError("天气接口暂时不可用：network down")
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(weather, "fetch_weather", fake_fetch)
+        result = asyncio.run(agent._weather_query("杭州天气怎么样"))
+    finally:
+        mp.undo()
+    assert result["query_success"] is False
+    assert "天气接口暂时不可用" in result["results"]["message"]
+    assert result["results"]["sources"][0]["title"] == "Open-Meteo"
+    print("✓ 天气接口不可用时返回失败并附来源")
 
 
 if __name__ == "__main__":
@@ -175,4 +217,5 @@ if __name__ == "__main__":
     test_extract_city()
     test_weather_query_open_meteo_formatting()
     test_weather_query_unknown_city()
+    test_weather_query_unavailable()
     print("\n全部通过")

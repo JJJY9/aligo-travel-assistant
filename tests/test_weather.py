@@ -77,6 +77,35 @@ def test_fetch_weather_and_cache(monkeypatch):
     print("✓ 天气查询与进程内缓存")
 
 
+def test_forecast_uses_location_timezone(monkeypatch):
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append((url, dict(params or {})))
+        if "geocoding" in url:
+            return _Response(
+                {
+                    "results": [
+                        {
+                            "name": "New York",
+                            "latitude": 40.7,
+                            "longitude": -74.0,
+                            "timezone": "America/New_York",
+                        }
+                    ]
+                }
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+
+    data = weather.fetch_weather("纽约")
+    assert data["timezone"] == "America/New_York"
+    assert calls[-1][1]["timezone"] == "America/New_York", "预报应按地点自身时区聚合日期"
+    print("✓ 天气预报使用地点自身时区")
+
+
 def test_unknown_city_raises(monkeypatch):
     monkeypatch.setattr(
         weather.requests,
@@ -110,6 +139,7 @@ def test_empty_city_raises():
 if __name__ == "__main__":
     for case in (
         test_fetch_weather_and_cache,
+        test_forecast_uses_location_timezone,
         test_unknown_city_raises,
         test_request_failure_raises,
     ):

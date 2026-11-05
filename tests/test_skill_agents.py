@@ -1,7 +1,7 @@
 """
 技能智能体纯逻辑测试（无需 API Key、不访问网络）
 
-覆盖：天气城市提取、天气预报时区、搜索摘要提示词防注入、共享用户提问提取、
+覆盖：天气城市提取、天气查询委托共享工具、搜索摘要提示词防注入、共享用户提问提取、
 memory-query 对 null 行程字段的格式化。
 
 运行：python tests/test_skill_agents.py
@@ -59,43 +59,32 @@ def test_weather_city_extraction():
     print("✓ 天气城市提取（问句前缀 / 时间词 / 多城市顺序）")
 
 
-def test_weather_forecast_uses_location_timezone():
+def test_weather_query_delegates_to_shared_util():
+    from utils import weather
+
     agent = _load_skill("query-info", "InformationQueryAgent")(model=_FakeModel())
     calls = []
 
-    async def fake_http(url, params):
-        calls.append((url, dict(params)))
-        if "geocoding" in url:
-            return {
-                "results": [
-                    {
-                        "name": "New York",
-                        "latitude": 40.7,
-                        "longitude": -74.0,
-                        "timezone": "America/New_York",
-                    }
-                ]
-            }
+    def fake_fetch(city, timeout=8.0):
+        calls.append(city)
         return {
-            "current": {
-                "temperature_2m": 10,
-                "relative_humidity_2m": 50,
-                "weather_code": 0,
-            },
-            "daily": {
-                "time": ["2026-11-05"],
-                "weather_code": [0],
-                "temperature_2m_max": [12],
-                "temperature_2m_min": [5],
-            },
+            "city": "纽约",
+            "timezone": "America/New_York",
+            "current": {"description": "晴", "temperature": 10, "humidity": 50, "weather_code": 0},
+            "daily": [{"date": "2026-11-05", "description": "晴", "min": 5, "max": 12}],
+            "source": {"name": "Open-Meteo", "url": "https://open-meteo.com"},
         }
 
-    setattr(agent, "_http_json", fake_http)
-    result = asyncio.run(agent._weather_query("纽约天气"))
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(weather, "fetch_weather", fake_fetch)
+        result = asyncio.run(agent._weather_query("纽约天气"))
+    finally:
+        monkeypatch.undo()
+    assert calls == ["纽约"], "应把提取出的城市交给共享天气工具"
     assert result["query_success"] is True
-    forecast_params = calls[-1][1]
-    assert forecast_params["timezone"] == "America/New_York"
-    print("✓ 天气预报使用地点自身时区")
+    assert "纽约当前天气：晴" in result["results"]["summary"]
+    print("✓ 天气查询委托给 utils.weather.fetch_weather")
 
 
 def test_search_summary_prompt_treats_results_as_data():
@@ -154,7 +143,7 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_weather_city_extraction()
-        test_weather_forecast_uses_location_timezone()
+        test_weather_query_delegates_to_shared_util()
         test_search_summary_prompt_treats_results_as_data()
         test_extract_user_query_fallback()
         test_memory_query_formats_null_trip_fields()
