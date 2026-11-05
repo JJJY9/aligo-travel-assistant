@@ -1857,6 +1857,8 @@ def test_prometheus_metrics_endpoint():
         assert "aligo_requests_total" in text
         assert "aligo_circuit_breaker_state" in text
         assert "aligo_sessions_cached" in text
+        assert "aligo_rate_limit_degraded 0" in text
+        assert 'aligo_rate_limit_backend{backend="memory"} 1' in text
         print("✓ /metrics Prometheus 文本指标")
     finally:
         REQUEST_METRICS.reset()

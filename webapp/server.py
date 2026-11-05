@@ -1258,6 +1258,15 @@ def create_app(model: Any = None) -> FastAPI:
             str(breaker.get("state")), 3
         )
         body = REQUEST_METRICS.render_prometheus()
+        rate = _rate_limit_info(state)
+        body += (
+            "# HELP aligo_rate_limit_degraded 1 if any rate limiter is in fallback.\n"
+            "# TYPE aligo_rate_limit_degraded gauge\n"
+            f"aligo_rate_limit_degraded {1 if rate['degraded'] else 0}\n"
+            "# HELP aligo_rate_limit_backend Current rate limit backend (one-hot).\n"
+            "# TYPE aligo_rate_limit_backend gauge\n"
+            f'aligo_rate_limit_backend{{backend="{rate["backend"]}"}} 1\n'
+        )
         body += (
             "# HELP aligo_circuit_breaker_state Circuit breaker state "
             "(0 closed, 1 half_open, 2 open, 3 unknown).\n"
