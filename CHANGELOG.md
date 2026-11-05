@@ -12,6 +12,7 @@
 - `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否配置 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 - 反向代理部署：设置 `TRUST_PROXY_HEADERS=1` 后限流按 `X-Forwarded-For` 第一个地址计算客户端 IP；默认关闭，避免客户端伪造该头绕过 IP 桶
 - 技能可观测性：`/api/health` 返回 `skills.count` / `skills.dir_found`；`doctor` 新增「技能目录」检查（发现数量、缺失时提示 `ALIGO_SKILLS_DIR`），安装后技能未注册可直接定位
+- `python cli.py skills`：输出技能目录与已发现技能（目录缺失或没有可加载技能时退出码 1），便于确认 wheel 安装 / `ALIGO_SKILLS_DIR` 是否生效；`skill_scripts()` 在目录不可读时安全返回空，健康检查不会因此报错
 
 ### 修复
 - `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找
@@ -21,6 +22,7 @@
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例；并发 check（多线程同时请求）严格只放行额度内的次数
 - `tests/test_rate_limit.py` 补充 Redis 故障回退与限流器工厂用例
 - `tests/test_skill_paths.py` 覆盖 `skill_scripts` 技能发现；`test_doctor.py` 覆盖技能目录检查（正常 / 缺失）；健康接口断言 `skills.count` 与 `dir_found`
+- 新增 `tests/test_cli_skills.py`（正常 / 目录缺失 / 空目录 / 命令分发）；`tests/test_skill_paths.py` 补充技能目录不可读时安全返回空的用例
 
 ## [1.4.1] - 2026-11-05
 

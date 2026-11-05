@@ -94,6 +94,19 @@ def test_skill_scripts_discovers_agents():
     print("✓ skill_scripts 发现技能脚本，缺失目录返回空")
 
 
+def test_skill_scripts_handles_permission_error(monkeypatch):
+    """技能目录不可读时返回空字典，健康检查不应因此报错。"""
+    from utils.skill_paths import skill_scripts
+
+    def denied(self):
+        raise PermissionError("denied")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(Path, "iterdir", denied)
+        assert skill_scripts(Path(tmp)) == {}
+    print("✓ 技能目录不可读时安全返回空")
+
+
 def test_wheel_data_files_cover_skill_code():
     """pyproject 的 data-files 必须覆盖全部技能代码与声明，且不包含运行时数据。"""
     if tomllib is None:
@@ -139,5 +152,10 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     test_skill_scripts_discovers_agents()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_skill_scripts_handles_permission_error(mp)
+    finally:
+        mp.undo()
     test_wheel_data_files_cover_skill_code()
     print("\n全部通过")
