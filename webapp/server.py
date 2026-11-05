@@ -26,9 +26,11 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -820,6 +822,27 @@ def _enforce_weather_rate_limit(
     }
 
 
+_WEATHER_EXECUTOR_MAX_WORKERS = 8
+_weather_executor: ThreadPoolExecutor | None = None
+_weather_executor_lock = threading.Lock()
+
+
+def _get_weather_executor() -> ThreadPoolExecutor:
+    """天气查询专用线程池。
+
+    上游（Open-Meteo）变慢时，天气请求只占满自己的线程，不会把 FastAPI
+    执行同步端点的共享线程池一起拖住；超出的请求在事件循环里排队。
+    """
+    global _weather_executor
+    with _weather_executor_lock:
+        if _weather_executor is None:
+            _weather_executor = ThreadPoolExecutor(
+                max_workers=_WEATHER_EXECUTOR_MAX_WORKERS,
+                thread_name_prefix="aligo-weather",
+            )
+        return _weather_executor
+
+
 # ---------- 长期记忆读取 ----------
 
 
@@ -1280,16 +1303,19 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.get("/api/weather")
-    def weather(
+    async def weather(
         request: Request, city: str = Query(..., min_length=1, max_length=50)
     ) -> JSONResponse:
-        """目的地天气（Open-Meteo，无 API Key；进程内缓存 10 分钟，按 IP 限流）。"""
+        """目的地天气（Open-Meteo，无 API Key；专用线程池，进程内缓存 10 分钟）。"""
         name = city.strip()
         if not name:
             raise HTTPException(status_code=422, detail="城市不能为空")
         headers = _enforce_weather_rate_limit(state, request)
+        loop = asyncio.get_running_loop()
         try:
-            data = fetch_weather(name)
+            data = await loop.run_in_executor(
+                _get_weather_executor(), fetch_weather, name
+            )
         except WeatherError as exc:
             message = str(exc)
             logger.warning("天气查询失败（%s）：%s", name, message)
