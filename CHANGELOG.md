@@ -7,10 +7,12 @@
 ### 新增
 - 检索评测互斥升级为 Redis 跨实例锁：配置 `REDIS_URL` 时多个 Web 实例共享同一把锁（`SET NX EX` + token 比对释放，TTL 300 秒），未配置或 Redis 故障时回退进程内锁；并发请求仍返回 429
 - Prometheus 文本指标端点 `GET /metrics`：请求总数 / 状态 / 方法 / 路径 / 耗时分位 / 熔断器 / 缓存会话，`text/plain; version=0.0.4`，多实例需分别采集
+- 会话删除墓碑在配置 `REDIS_URL` 时写入 Redis（`aligo:deleted:*`，TTL 与本地一致），其它实例的新请求会被拒绝；Redis 故障时回退进程内墓碑
 
 ### 测试
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义；`test_webapp.py` 覆盖 `/metrics` 端点
+- 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑）；`test_webapp.py` 补假 Redis 共享墓碑用例
 
 ## [1.5.0] - 2026-11-05
 
