@@ -10,11 +10,15 @@
 - 会话删除墓碑在配置 `REDIS_URL` 时写入 Redis（`aligo:deleted:*`，TTL 与本地一致），其它实例的新请求会被拒绝；Redis 故障时回退进程内墓碑
 - 侧栏「即将出行」显示目的地天气：新增 `GET /api/weather`（Open-Meteo，无 Key，实时 + 未来 3 天，10 分钟进程内缓存），前端异步展示，失败时静默隐藏
 
+### 变更
+- `query-info` 技能的天气查询改为复用 `utils/weather.py`：删除重复的天气码映射与 HTTP 请求逻辑，城市提取后调用共享 `fetch_weather`（同样 10 分钟缓存、按地点自身时区），Web 侧栏与技能结果保持一致
+
 ### 测试
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义；`test_webapp.py` 覆盖 `/metrics` 端点
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑）；`test_webapp.py` 补假 Redis 共享墓碑用例
-- 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障）；`test_webapp.py` 补 `/api/weather` 用例
+- 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区）；`test_webapp.py` 补 `/api/weather` 用例
+- `test_query_info_fallback.py` / `test_skill_agents.py` 天气用例改为校验技能委托 `utils.weather.fetch_weather`，不再模拟内部 HTTP
 
 ## [1.5.0] - 2026-11-05
 
