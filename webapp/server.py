@@ -1266,6 +1266,36 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"检索失败：{exc}") from exc
         return {"query": q, "results": results}
 
+    @app.get("/api/knowledge/eval")
+    def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
+        """离线检索评测：14 个差旅问题计算 hit@1/3/5 与 MRR（不调用大模型）。"""
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        status = knowledge_status()
+        if not status.get("available"):
+            raise HTTPException(
+                status_code=503,
+                detail=f"知识库不可用：{status.get('reason', '未知原因')}",
+            )
+
+        from agents.rag_knowledge_agent import RAGKnowledgeAgent
+        from utils.rag_eval import evaluate_retrieval
+
+        try:
+            agent = RAGKnowledgeAgent(collection_name=status["collection"])
+        except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
+            logger.warning("检索评测初始化失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"评测初始化失败：{exc}") from exc
+        if not agent.initialized:
+            raise HTTPException(status_code=503, detail="RAG 依赖未安装")
+        try:
+            # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
+            return evaluate_retrieval(
+                lambda query, top_k: agent.search_knowledge(query, top_k=top_k)
+            )
+        except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
+            logger.warning("检索评测失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
+
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
         payload: KnowledgeDocumentPayload, request: Request, response: Response

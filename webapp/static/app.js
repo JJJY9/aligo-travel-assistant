@@ -177,6 +177,8 @@ const els = {
   kbImport: byId("kbImport"),
   kbImportFile: byId("kbImportFile"),
   kbSemantic: byId("kbSemantic"),
+  kbEval: byId("kbEval"),
+  kbEvalResult: byId("kbEvalResult"),
   kbForm: byId("kbForm"),
   kbContent: byId("kbContent"),
   kbCategory: byId("kbCategory"),
@@ -3096,8 +3098,35 @@ async function runSemanticSearch({ silent = false } = {}) {
   }
 }
 
-function renderSemanticResults(query, results) {
-  els.kbList.innerHTML = "";
+async function runKbEval() {
+  if (!els.kbEval) return;
+  els.kbEval.disabled = true;
+  els.kbEval.textContent = "评测中…";
+  if (els.kbEvalResult) {
+    els.kbEvalResult.hidden = false;
+    els.kbEvalResult.textContent = "检索评测中…（首次使用需加载向量模型）";
+  }
+  try {
+    const data = await getJSON("/api/knowledge/eval");
+    const pct = (value) => `${Math.round(Number(value || 0) * 100)}%`;
+    const hit5 = Number(data.hit5 || 0);
+    if (els.kbEvalResult) {
+      els.kbEvalResult.textContent =
+        `检索评测：${data.total} 个问题 · hit@1 ${pct(data.hit1)}` +
+        ` · hit@3 ${pct(data.hit3)} · hit@5 ${pct(data.hit5)}` +
+        ` · MRR ${Number(data.mrr || 0).toFixed(2)}` +
+        (hit5 < 0.8 ? " · 低于 80% 基线" : "");
+      els.kbEvalResult.classList.toggle("warn", hit5 < 0.8);
+    }
+  } catch (error) {
+    if (els.kbEvalResult) els.kbEvalResult.textContent = `评测失败：${error.message}`;
+  } finally {
+    els.kbEval.disabled = false;
+    els.kbEval.textContent = "检索评测";
+  }
+}
+
+function renderSemanticResults(query, results) {  els.kbList.innerHTML = "";
   els.kbMore.hidden = true;
   const note = document.createElement("p");
   note.className = "kb-meta";
@@ -3540,6 +3569,7 @@ function bindEvents() {
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
   els.kbCancel.addEventListener("click", () => resetKnowledgeForm());
   els.kbSemantic.addEventListener("click", () => runSemanticSearch());
+  if (els.kbEval) els.kbEval.addEventListener("click", () => runKbEval());
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
   els.kbSearch.addEventListener("input", () => {

@@ -2815,6 +2815,57 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
         _cleanup(user_id)
 
 
+def test_knowledge_eval_api(monkeypatch):
+    """检索评测接口：返回 hit@K / MRR，带额度头；知识库不可用返回 503。"""
+    from webapp import server as server_module
+
+    class FakeAgent:
+        def __init__(self, collection_name):
+            self.collection_name = collection_name
+            self.initialized = True
+
+        def search_knowledge(self, query, top_k=5):
+            return [{"content": query}]
+
+    monkeypatch.setattr("agents.rag_knowledge_agent.RAGKnowledgeAgent", FakeAgent)
+    monkeypatch.setattr(
+        "utils.rag_eval.evaluate_retrieval",
+        lambda search: {
+            "total": 14,
+            "hit1": 0.64,
+            "hit3": 0.93,
+            "hit5": 1.0,
+            "mrr": 0.80,
+            "rows": [],
+        },
+    )
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda: {
+            "available": True,
+            "collection": "kb",
+            "documents": 141,
+            "path": "p",
+        },
+    )
+    client = _client()
+    response = client.get("/api/knowledge/eval")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 14
+    assert data["hit5"] == 1.0
+    assert "x-ratelimit-limit" in response.headers
+
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda: {"available": False, "reason": "知识库未初始化", "path": "p"},
+    )
+    assert client.get("/api/knowledge/eval").status_code == 503
+    print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头）")
+
+
 def test_knowledge_api_maps_backend_errors(monkeypatch):
     """Milvus 查询 / 写入失败应映射为 503，而不是 200 空库或 404。"""
     from webapp import server as server_module
