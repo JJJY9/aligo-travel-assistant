@@ -9,7 +9,7 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.metrics import MAX_PATHS, RequestMetrics
+from utils.metrics import MAX_DURATION_SAMPLES, MAX_PATHS, RequestMetrics
 
 
 def test_record_and_snapshot():
@@ -24,8 +24,26 @@ def test_record_and_snapshot():
     assert snapshot["by_path"]["/api/health"] == 2
     assert snapshot["avg_duration_ms"] == 20.0
     assert snapshot["max_duration_ms"] == 30.0
+    assert snapshot["p50_duration_ms"] == 18.0
+    assert snapshot["p95_duration_ms"] == 30.0
+    assert snapshot["duration_samples"] == 3
     assert snapshot["uptime_sec"] >= 0
     print("✓ 请求计数 / 状态 / 方法 / 耗时快照")
+
+
+def test_percentiles_use_bounded_recent_samples():
+    """P50 / P95 只基于最近 N 个请求；max 保留全量历史。"""
+    metrics = RequestMetrics()
+    for _ in range(200):
+        metrics.record("GET", "/api/slow", 200, 1000.0)
+    for _ in range(MAX_DURATION_SAMPLES):
+        metrics.record("GET", "/api/fast", 200, 1.0)
+    snapshot = metrics.snapshot()
+    assert snapshot["duration_samples"] == MAX_DURATION_SAMPLES
+    assert snapshot["p50_duration_ms"] == 1.0
+    assert snapshot["p95_duration_ms"] == 1.0, "早期慢请求应已滑出样本窗口"
+    assert snapshot["max_duration_ms"] == 1000.0, "最大值仍保留全量历史"
+    print("✓ P50 / P95 使用有界近期样本，max 保留历史")
 
 
 def test_path_cardinality_is_bounded():
@@ -70,11 +88,15 @@ def test_reset():
     snapshot = metrics.snapshot()
     assert snapshot["requests_total"] == 0
     assert snapshot["by_status"] == {}
+    assert snapshot["duration_samples"] == 0
+    assert snapshot["p50_duration_ms"] == 0.0
+    assert snapshot["p95_duration_ms"] == 0.0
     print("✓ 重置指标")
 
 
 if __name__ == "__main__":
     test_record_and_snapshot()
+    test_percentiles_use_bounded_recent_samples()
     test_path_cardinality_is_bounded()
     test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()

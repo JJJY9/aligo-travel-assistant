@@ -1800,6 +1800,9 @@ def test_metrics_api():
         assert requests["by_path"]["/api/health"] >= 2
         assert requests["by_status"].get("200", 0) >= 2
         assert requests["avg_duration_ms"] >= 0
+        assert requests["p50_duration_ms"] >= 0
+        assert requests["p95_duration_ms"] >= requests["p50_duration_ms"]
+        assert requests["duration_samples"] >= 2
         assert data["circuit_breaker"]["state"] in ("closed", "open", "half_open")
         assert isinstance(data["sessions_cached"], int)
         rate = data["rate_limit"]
