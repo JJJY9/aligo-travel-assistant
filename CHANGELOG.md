@@ -14,6 +14,7 @@
 - `query-info` 技能的天气查询改为复用 `utils/weather.py`：删除重复的天气码映射与 HTTP 请求逻辑，城市提取后调用共享 `fetch_weather`（同样 10 分钟缓存、按地点自身时区），Web 侧栏与技能结果保持一致
 - 天气查询失败结果（城市不存在 / 上游故障）增加 60 秒短时缓存：TTL 内同一城市直接复用错误、不再请求上游，成功结果会清除对应失败缓存；缓存键忽略大小写与多余空白（`Beijing` / `beijing` 共享一条）
 - `/api/weather` 改为在专用天气线程池中执行（8 个线程）：上游变慢时不会占用 FastAPI 共享线程池，其它同步接口保持可用
+- 天气上游故障时启用 stale-while-error：该城市 1 小时内有过成功结果则沿用旧数据并在响应中标记 `stale`（侧栏显示「（较早）」，技能摘要注明可能不是最新），城市不存在仍返回 404；只有超过 1 小时才降级为 503
 
 ### 修复
 - 天气工具加固：上游响应形状异常统一映射为 `WeatherError`（此前可能抛 `AttributeError` 导致 500）；缓存改为有界（写入时清理过期条目，上限 256 条）；同一城市的并发未命中合并为一次上游请求
@@ -25,7 +26,7 @@
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义；`test_webapp.py` 覆盖 `/metrics` 端点
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑）；`test_webapp.py` 补假 Redis 共享墓碑用例
-- 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区 / 429 映射 / 响应形状异常 / 缓存上限与过期清理 / 同城并发合并 / 失败短时缓存与键归一化）；`test_webapp.py` 补 `/api/weather` 用例与独立限流用例
+- 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区 / 429 映射 / 响应形状异常 / 缓存上限与过期清理 / 同城并发合并 / 失败短时缓存与键归一化 / stale-while-error）；`test_webapp.py` 补 `/api/weather` 用例与独立限流用例
 - `test_query_info_fallback.py` / `test_skill_agents.py` 天气用例改为校验技能委托 `utils.weather.fetch_weather`，不再模拟内部 HTTP；补天气与搜索都失败时返回天气原因的用例
 
 ## [1.5.0] - 2026-11-05

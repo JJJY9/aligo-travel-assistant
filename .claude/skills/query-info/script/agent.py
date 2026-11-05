@@ -191,6 +191,8 @@ class InformationQueryAgent(AgentBase):
             )
         if forecasts:
             weather_text += " 未来几日：" + "；".join(forecasts)
+        if data.get("stale"):
+            weather_text += "（天气数据可能不是最新）"
 
         source = data.get("source") or {}
         return {
