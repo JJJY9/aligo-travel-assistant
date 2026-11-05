@@ -1007,6 +1007,31 @@ def run_doctor_standalone() -> int:
     return 1 if has_failures(results) else 0
 
 
+def run_skills_standalone() -> int:
+    """列出技能目录与已发现的技能（用于 `python cli.py skills`）。
+
+    Returns:
+        0 至少发现一个技能；1 技能目录缺失或没有可加载技能
+    """
+    from utils.skill_paths import resolve_skills_root, skill_scripts
+
+    root = resolve_skills_root()
+    scripts = skill_scripts(root)
+    if not scripts:
+        if not root.is_dir():
+            print(f"未找到技能目录：{root}")
+            print("请检查安装，或用环境变量 ALIGO_SKILLS_DIR 指定技能目录")
+        else:
+            print(f"技能目录没有可加载的技能：{root}")
+            print("每个技能需要包含 script/agent.py")
+        return 1
+    print(f"技能目录：{root}")
+    print(f"已发现 {len(scripts)} 个技能：")
+    for name in sorted(scripts):
+        print(f"  - {name}")
+    return 0
+
+
 def run_knowledge_status_standalone() -> int:
     """打印知识库状态（用于 `python cli.py kb`），不进入交互式 CLI。
 
@@ -1892,6 +1917,8 @@ def main():
             sys.exit(run_health_check_standalone())
         if arg == "doctor":
             sys.exit(run_doctor_standalone())
+        if arg == "skills":
+            sys.exit(run_skills_standalone())
         if arg == "kb":
             sys.exit(run_knowledge_status_standalone())
         if arg == "eval":

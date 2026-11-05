@@ -58,7 +58,11 @@ def skill_scripts(root: Path | None = None) -> dict[str, Path]:
     scripts: dict[str, Path] = {}
     if not base.is_dir():
         return scripts
-    for skill_dir in base.iterdir():
+    try:
+        entries = list(base.iterdir())
+    except OSError:  # 权限不足等文件系统问题：按「没有技能」处理，避免健康检查 500
+        return scripts
+    for skill_dir in entries:
         if not skill_dir.is_dir():
             continue
         script = skill_dir / "script" / "agent.py"
