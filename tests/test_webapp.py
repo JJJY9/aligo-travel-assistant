@@ -951,6 +951,10 @@ def test_build_trips_ics_multiple_events():
     assert content.count("BEGIN:VCALENDAR") == 1
     assert content.count("BEGIN:VEVENT") == 2
     assert content.count("END:VEVENT") == 2
+    assert content.count("BEGIN:VALARM") == 2
+    assert content.count("END:VALARM") == 2
+    assert "TRIGGER:-PT15H" in content
+    assert "出行提醒" in content
     assert content.endswith("END:VCALENDAR\r\n")
 
     # 缺少出发日期的行程被跳过

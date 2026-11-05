@@ -1082,6 +1082,12 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
         f"DTEND;VALUE=DATE:{end_exclusive}",
         f"SUMMARY:{_ics_escape(summary)}",
         f"DESCRIPTION:{_ics_escape(description)}",
+        # 全天事件的 DTSTART 是出发日 00:00，提前 15 小时即前一天 09:00 提醒
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        f"DESCRIPTION:{_ics_escape(f'出行提醒：明天 {origin} → {destination}')}",
+        "TRIGGER:-PT15H",
+        "END:VALARM",
         "END:VEVENT",
     ]
 
