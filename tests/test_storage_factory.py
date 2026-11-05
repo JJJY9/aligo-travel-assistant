@@ -582,6 +582,50 @@ def test_embedding_model_shared(monkeypatch):
     print("✓ 嵌入模型进程内共享（按路径缓存）")
 
 
+def test_next_trip_id_not_reused_after_deleting_latest():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-trip-id", tempfile.mkdtemp())
+    base = {
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "purpose": "出差",
+    }
+    assert memory.save_trip_history(dict(base)) == "trip_1"
+    assert memory.save_trip_history({**base, "destination": "杭州"}) == "trip_2"
+    assert memory.delete_trip("trip_2") is True
+    third = memory.save_trip_history({**base, "destination": "广州"})
+    assert third == "trip_3", "删除最新行程后新 id 不能复用"
+    print("✓ 删除最新行程后 trip_id 不复用")
+
+
+def test_one_day_trip_dedupes_end_date_variants():
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-day-trip", tempfile.mkdtemp())
+    first = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "天津",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        }
+    )
+    second = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "天津",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-01",
+            "purpose": "出差",
+        }
+    )
+    assert first == second, "无返程日期与返程=出发日应视为同一行程"
+    assert len(memory.get_trip_history(limit=None)) == 1
+    print("✓ 单日行程的两种返程写法视为同一条")
+
+
 def test_summary_cache_avoids_repeated_calls():
     import asyncio
 
@@ -601,6 +645,21 @@ def test_summary_cache_avoids_repeated_calls():
     manager.long_term.add_chat_message("user", "我又去了杭州", "s-other")
     asyncio.run(manager.get_long_term_summary_async())
     assert model.calls == 2, "其它会话新增消息后应重新总结"
+
+    manager.long_term.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        }
+    )
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 3, "新增行程后应重新总结"
+
+    manager.long_term.update_trip("trip_1", {"destination": "杭州"})
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 4, "修改行程目的地后应重新总结"
     print("✓ 长期记忆总结按指纹缓存")
 
 
@@ -786,6 +845,8 @@ if __name__ == "__main__":
     test_stale_snapshot_does_not_resurrect_trip()
     test_trip_save_deduplicates_same_trip()
     test_trip_update_and_conflict()
+    test_next_trip_id_not_reused_after_deleting_latest()
+    test_one_day_trip_dedupes_end_date_variants()
     test_session_titles()
     test_session_pinned()
     test_add_message_preserves_metadata()

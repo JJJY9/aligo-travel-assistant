@@ -1473,13 +1473,26 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
                 str(trip.get("origin") or ""),
                 str(trip.get("destination") or ""),
                 start_date,
-                str(trip.get("end_date") or ""),
+                str(trip.get("end_date") or start_date),
             )
             groups.setdefault(key, []).append(str(trip.get("trip_id") or ""))
 
         if all(len(ids) <= 1 for ids in groups.values()):
             print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
             return 0
+
+        # 同一 trip_id 出现在多条不同行程里时，delete_trip 可能删错行：
+        # 这类 id 不自动处理，提示人工清理
+        id_groups: dict[str, set[tuple[str, str, str, str]]] = {}
+        for key, ids in groups.items():
+            for trip_id in ids:
+                id_groups.setdefault(trip_id, set()).add(key)
+        ambiguous = {trip_id for trip_id, keys in id_groups.items() if len(keys) > 1}
+        if ambiguous:
+            print(
+                "警告：以下 trip_id 同时属于多条不同行程，无法安全自动删除，"
+                "请人工处理：" + "、".join(sorted(ambiguous))
+            )
 
         # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，
         # 避免把仅剩的副本也删掉。JSON 后端的 get_trip_history 返回进程启动时
@@ -1500,7 +1513,7 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
             trip_id
             for ids in groups.values()
             for trip_id in ids[1:]
-            if ids[0] in fresh_ids
+            if ids[0] in fresh_ids and trip_id not in ambiguous
         ]
 
         if dry_run:
@@ -1538,7 +1551,7 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
             print(f"用户 {user_id}：删除 {removed} 条重复行程（保留最早记录）")
         else:
             print(f"用户 {user_id}：没有需要删除的重复行程（共 {len(trips)} 条）")
-        return 0
+        return 1 if ambiguous else 0
     finally:
         close = getattr(store, "close", None)
         if callable(close):
