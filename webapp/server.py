@@ -447,6 +447,12 @@ class KnowledgeImportPayload(BaseModel):
     documents: list[Any] = Field(min_length=1, max_length=200)
 
 
+class KnowledgeImportPreviewPayload(BaseModel):
+    """预览导入（不写库）：可一次提交整个备份文件，条目规则与导入一致。"""
+
+    documents: list[Any] = Field(min_length=1, max_length=20000)
+
+
 class PreferencePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
     value: PreferenceValue
@@ -1804,6 +1810,24 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
             logger.warning("导入知识片段失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"导入失败：{exc}") from exc
+
+    @app.post("/api/knowledge/import/preview")
+    def knowledge_import_preview(
+        payload: KnowledgeImportPreviewPayload, request: Request, response: Response
+    ) -> dict[str, Any]:
+        """预览导入（不写库）：整个备份一次校验 / 去重，返回将导入 / 跳过的数量。"""
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        try:
+            return import_documents(payload.documents, dry_run=True)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - 预览失败统一提示
+            logger.warning("预览导入知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"预览失败：{exc}") from exc
 
     @app.get("/api/status")
     def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:

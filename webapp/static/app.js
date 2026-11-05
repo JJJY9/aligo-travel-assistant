@@ -3725,7 +3725,25 @@ async function importKnowledgeFile() {
       toast("单次最多导入 16384 条知识片段");
       return;
     }
-    if (!window.confirm(`导入 ${documents.length} 条知识片段？`)) return;
+    // 先预览（不写库）：告诉用户将导入 / 跳过多少条，再确认
+    let confirmText = `导入 ${documents.length} 条知识片段？`;
+    try {
+      const preview = await getJSON("/api/knowledge/import/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ documents }),
+      });
+      const wouldImport = Number(preview.would_import || 0);
+      const skippedCount = Number(preview.skipped || 0);
+      confirmText =
+        `将导入 ${wouldImport} 条知识片段` +
+        (skippedCount ? `（跳过 ${skippedCount} 条已存在 / 无效内容）` : "") +
+        "？";
+    } catch (error) {
+      // 预览失败（如知识库暂不可用）不阻断：退回按文件条数确认
+      confirmText = `导入 ${documents.length} 条知识片段？`;
+    }
+    if (!window.confirm(confirmText)) return;
 
     els.kbImport.textContent = "导入中…";
     // 接口单次最多 200 条；导出文件可能更大，按批上传保证备份可完整恢复
