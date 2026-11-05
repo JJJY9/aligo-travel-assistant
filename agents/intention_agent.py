@@ -244,6 +244,8 @@ class IntentionAgent(AgentBase):
                 result = json.loads(text, parse_constant=reject_json_constant)
                 if not isinstance(result, dict):
                     raise ValueError("意图识别结果不是 JSON 对象")
+                if "agent_schedule" not in result:
+                    raise ValueError("意图识别结果缺少 agent_schedule")
             except json.JSONDecodeError as e1:
                 # 直接解析失败时扫描第一个完整 JSON 对象：不能简单取
                 # find('{')..rfind('}')，结尾说明里的花括号会被一起截进来
@@ -252,6 +254,11 @@ class IntentionAgent(AgentBase):
                 except ValueError:
                     logger.error(f"JSON parse failed. Text sample: {text[:100]}")
                     raise ValueError(f"Failed to parse JSON. Error: {e1}") from e1
+                # 截到的可能只是嵌套片段（如单个 key_entities 对象），不能当作
+                # 完整意图结果，否则缺少 agent_schedule 会被当成 no_agents 吞掉
+                if not isinstance(result, dict) or "agent_schedule" not in result:
+                    logger.error("提取到的 JSON 片段不是完整意图结果")
+                    raise ValueError("意图识别结果缺少 agent_schedule（可能是嵌套片段）")
 
         except Exception as e:
             # 可重试错误（超时/连接失败/429/5xx）向上抛出，

@@ -45,6 +45,13 @@ class _TrailingProseModel:
         )
 
 
+class _NestedFragmentModel:
+    """返回带说明文字、只含嵌套片段的输出（缺少 agent_schedule）"""
+
+    async def __call__(self, messages):
+        return '分析结果：{"type": "greeting", "confidence": 0.9}，其余省略'
+
+
 def _user_msg():
     return Msg(name="user", content="帮我规划去北京的行程", role="user")
 
@@ -111,10 +118,21 @@ def test_non_object_json_falls_back():
     print("✓ 顶层非对象输出降级为默认结果")
 
 
+def test_nested_fragment_falls_back_to_default_schedule():
+    """扫描到的 JSON 片段缺少 agent_schedule 时不能当成完整意图（否则 no_agents 吞请求）。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_NestedFragmentModel())
+    out = asyncio.run(agent.reply([_user_msg()]))
+    data = json.loads(out.content)
+    assert "意图识别出错" in data.get("reasoning", "")
+    assert data["agent_schedule"][0]["agent_name"] == "information_query"
+    print("✓ 嵌套 JSON 片段降级为默认调度")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
     test_json_with_trailing_prose_braces_parses()
     test_non_finite_json_falls_back()
     test_non_object_json_falls_back()
+    test_nested_fragment_falls_back_to_default_schedule()
     print("\n全部通过")
