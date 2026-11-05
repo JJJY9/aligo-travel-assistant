@@ -944,6 +944,32 @@ def test_find_duplicate_contents(monkeypatch):
     print("✓ 重复内容扫描（去空白后相同 / 排除多分片记录）")
 
 
+def test_import_dry_run_skips_writes(monkeypatch):
+    """dry-run 只统计将导入 / 跳过的数量，不加载嵌入模型、不写入。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _Agent:
+        def add_documents(self, documents):
+            raise AssertionError("dry-run 不应写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    result = knowledge_admin.import_documents([{"content": "新内容"}], dry_run=True)
+    assert result == {"imported": 0, "skipped": 0, "would_import": 1}
+
+    # 已有内容仍计入跳过
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: {"已有内容"}
+    )
+    result2 = knowledge_admin.import_documents(
+        [{"content": "已有内容"}, {"content": "新内容"}], dry_run=True
+    )
+    assert result2 == {"imported": 0, "skipped": 1, "would_import": 1}
+    print("✓ 导入 dry-run 只统计不写入")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -1080,6 +1106,7 @@ if __name__ == "__main__":
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_raises,
+        test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,
         test_find_duplicate_contents,
