@@ -443,6 +443,57 @@ def test_trip_whitespace_destination_rejected():
         _cleanup(user_id)
 
 
+def test_preference_type_with_space_is_editable():
+    """模型 / 面板写入的含空格偏好键也能编辑与删除。"""
+    client = _client()
+    user_id = _unique_user("web_test_pref_key")
+    try:
+        key = "酒店 偏好"
+        saved = client.put(
+            f"/api/preferences/{key}",
+            json={"user_id": user_id, "value": "汉庭"},
+        )
+        assert saved.status_code == 200, saved.text
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"][key] == "汉庭"
+        deleted = client.delete(
+            f"/api/preferences/{key}", params={"user_id": user_id}
+        ).json()
+        assert deleted["deleted"] is True
+        print("✓ 含空格的偏好键可编辑 / 删除")
+    finally:
+        _cleanup(user_id)
+
+
+def test_session_search_snippet_strips_markdown():
+    """搜索预览应剥离标题 / 列表 / 表格 / 引用等 Markdown 记号。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_snippet")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_message("user", "查杭州天气", "s-snip")
+        store.add_chat_message(
+            "assistant",
+            "## ✈️ 行程规划\n\n- **杭州** 明日小雨\n\n"
+            "| 日期 | 天气 |\n| --- | --- |\n| 11-06 | 小雨 |\n\n> 带伞",
+            "s-snip",
+        )
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        data = _client().get(
+            "/api/sessions", params={"user_id": user_id, "q": "杭州"}
+        ).json()
+        snippet = data["sessions"][0]["snippet"]
+        assert "杭州" in snippet
+        for token in ("**", "##", "|", "> "):
+            assert token not in snippet, (token, snippet)
+        print("✓ 搜索片段剥离 Markdown 记号")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ambiguous_trip_id_operations_return_409():
     """历史数据里同一 trip_id 对应多条行程时，改 / 删 / 单条日历都不能猜行。"""
     user_id = _unique_user("web_test_dup_trip")
@@ -877,7 +928,7 @@ def test_preferences_api():
         assert updated["preferences"]["eco_mode"] is False
 
         invalid = client.put(
-            "/api/preferences/bad type", json={"user_id": user_id, "value": "x"}
+            "/api/preferences/" + "x" * 65, json={"user_id": user_id, "value": "x"}
         )
         assert invalid.status_code == 422
         too_long = client.put(

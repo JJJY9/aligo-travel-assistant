@@ -354,7 +354,7 @@
               <option value="meal_preference">餐食偏好</option>
               <option value="budget_level">预算等级</option>
             </select>
-            <input id="prefValue" maxlength="200" placeholder="值（多个用、分隔，如 汉庭、如家）" aria-label="偏好值" required />
+            <input id="prefValue" maxlength="500" placeholder="值（多个用、分隔，如 汉庭、如家）" aria-label="偏好值" required />
             <button class="ghost" id="prefSubmit" type="submit">保存</button>
             <button class="ghost" id="prefCancel" type="button">取消</button>
           </div>
@@ -365,15 +365,15 @@
         <h3>最近行程 <button class="trip-export" id="expandTrips" type="button" hidden>查看全部</button><button class="trip-export" id="addTripBtn" type="button">添加行程</button><button class="trip-export" id="exportTrips" type="button" hidden>导出全部日历</button><button class="trip-export" id="exportTripsCsv" type="button" hidden>导出 CSV</button></h3>
         <form class="trip-form" id="tripForm" hidden>
           <div class="trip-form-row">
-            <input id="tripOrigin" maxlength="50" placeholder="出发地（可选）" aria-label="出发地" />
-            <input id="tripDestination" maxlength="50" placeholder="目的地" aria-label="目的地" required />
+            <input id="tripOrigin" maxlength="100" placeholder="出发地（可选）" aria-label="出发地" />
+            <input id="tripDestination" maxlength="100" placeholder="目的地" aria-label="目的地" required />
           </div>
           <div class="trip-form-row">
             <input id="tripStart" type="date" aria-label="出发日期" required />
             <input id="tripEnd" type="date" aria-label="返程日期" />
           </div>
           <div class="trip-form-row">
-            <input id="tripPurpose" maxlength="20" placeholder="目的（默认出差）" aria-label="出行目的" />
+            <input id="tripPurpose" maxlength="100" placeholder="目的（默认出差）" aria-label="出行目的" />
             <button class="ghost" id="tripSubmit" type="submit">保存行程</button>
           </div>
         </form>
