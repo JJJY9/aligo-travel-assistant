@@ -16,6 +16,7 @@
 - CLI `doctor` / `skills` 支持 `--json`：`doctor` 输出 `status` / `checks`，`skills` 输出 `root` / `skills` / `ok`，便于监控与脚本读取；非法参数退出码 2
 - 行程日历提醒：导出的 `.ics` 事件新增 `VALARM`，出行前一天 09:00 提醒（单条行程与全部行程导出均生效）
 - 安全响应头：`/api/` 响应默认带 `Cache-Control: no-store`，用户数据不进入浏览器 / 代理缓存（导出接口保留自身的 `no-cache`）
+- 记忆面板用户卡片显示技能数量（来自 `/api/health`），安装后技能缺失可直接看到「技能 0」
 - 技能可观测性：`/api/health` 返回 `skills.count` / `skills.dir_found`；`doctor` 新增「技能目录」检查（发现数量、缺失时提示 `ALIGO_SKILLS_DIR`），安装后技能未注册可直接定位
 - `python cli.py skills`：输出技能目录与已发现技能（目录缺失或没有可加载技能时退出码 1），便于确认 wheel 安装 / `ALIGO_SKILLS_DIR` 是否生效；`skill_scripts()` 在目录不可读时安全返回空，健康检查不会因此报错
 
@@ -33,6 +34,7 @@
 - `test_cli_skills.py` / `test_doctor.py` 补充 `--json` 输出、失败退出码与未知参数用例
 - ICS 日历用例断言每个事件包含 `VALARM` 与 `TRIGGER:-PT15H`
 - 安全头用例断言 `/api/` 响应带 `Cache-Control: no-store`，页面与静态资源不受影响
+- 浏览器实测：用户卡片显示「本地内存 · JSON · 技能 6」
 
 ## [1.4.1] - 2026-11-05
 

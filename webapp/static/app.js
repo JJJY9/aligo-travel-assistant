@@ -2034,6 +2034,11 @@ function storageParts(storage) {
   const parts = [];
   parts.push(storage.short_term === "redis" ? "Redis" : "本地内存");
   parts.push(storage.long_term === "postgres" ? "PostgreSQL" : "JSON");
+  // 技能数量放在用户卡片上：安装后技能缺失（如 wheel 未打包）能直接看到
+  const skills = state.health && state.health.skills;
+  if (skills && typeof skills.count === "number") {
+    parts.push(`技能 ${skills.count}`);
+  }
   return parts;
 }
 
