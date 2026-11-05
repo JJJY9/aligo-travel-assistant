@@ -1113,6 +1113,59 @@ def run_skills_standalone(as_json: bool = False) -> int:
     return 0
 
 
+def run_weather_standalone(city: str, as_json: bool = False) -> int:
+    """查询城市天气（用于 `python cli.py weather <城市>`）。
+
+    Args:
+        city: 城市名
+        as_json: 输出完整 JSON（便于脚本 / 监控）
+
+    Returns:
+        0 查询成功；1 城市不存在或天气接口不可用
+    """
+    from utils.weather import WeatherError, fetch_weather
+
+    try:
+        data = fetch_weather(city)
+    except WeatherError as exc:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "city": city, "error": str(exc)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"天气查询失败：{exc}")
+        return 1
+
+    if as_json:
+        print(json.dumps({**data, "ok": True}, ensure_ascii=False, indent=2))
+        return 0
+
+    def _temp(value: object) -> str:
+        return "?" if value is None else str(value)
+
+    current = data.get("current") or {}
+    print(
+        f"{data.get('city') or city} 当前天气：{current.get('description') or '未知'}，"
+        f"气温 {_temp(current.get('temperature'))}°C，"
+        f"湿度 {_temp(current.get('humidity'))}%"
+    )
+    daily = data.get("daily") or []
+    if daily:
+        print("未来几天：")
+        for day in daily:
+            print(
+                f"  {day.get('date')}: {day.get('description') or '未知'}，"
+                f"{_temp(day.get('min'))}~{_temp(day.get('max'))}°C"
+            )
+    if data.get("stale"):
+        print("（天气数据可能不是最新）")
+    return 0
+
+
 def run_knowledge_status_standalone(as_json: bool = False) -> int:
     """打印知识库状态（用于 `python cli.py kb`），不进入交互式 CLI。
 
@@ -2071,6 +2124,14 @@ def main():
             if skills_json is None:
                 sys.exit(2)
             sys.exit(run_skills_standalone(as_json=skills_json))
+        if arg == "weather":
+            weather_args = sys.argv[2:]
+            weather_json = "--json" in weather_args
+            cities = [item for item in weather_args if item != "--json"]
+            if len(cities) != 1 or cities[0].startswith("-"):
+                print("用法：python cli.py weather <城市> [--json]")
+                sys.exit(2)
+            sys.exit(run_weather_standalone(cities[0], as_json=weather_json))
         if arg == "kb":
             kb_json = _parse_json_flag(sys.argv[2:], "python cli.py kb [--json]")
             if kb_json is None:
