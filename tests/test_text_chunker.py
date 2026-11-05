@@ -128,6 +128,15 @@ def test_heading_attached_to_long_body():
     print("✓ 标题并入超长正文首段")
 
 
+def test_heading_attached_to_unpunctuated_body():
+    """标题后是无句读的长段落（hard-split）时，标题仍并入第一块。"""
+    chunks = split_text("一、住宿标准\n\n" + "住" * 900 + "。")
+    assert chunks[0].startswith("一、住宿标准"), chunks[0][:20]
+    assert "住" in chunks[0]
+    assert all(len(chunk) <= 400 for chunk in chunks)
+    print("✓ 标题并入无句读长段落首块")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -137,4 +146,5 @@ if __name__ == "__main__":
     test_short_title_merged()
     test_title_only_run_respects_max_chars()
     test_heading_attached_to_long_body()
+    test_heading_attached_to_unpunctuated_body()
     print("\n全部通过")

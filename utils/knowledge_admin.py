@@ -26,6 +26,10 @@ _IMPORT_CHUNK = 500
 # 单条内容超过该长度时按语义边界拆片：嵌入模型只编码前 512 token
 # （约 400 个汉字），更长的尾部内容对检索完全不可见
 _MAX_CONTENT_CHARS = 400
+# 导入时单条内容上限（用户输入 / 任意备份的安全边界）；从导出备份还原的
+# 多分片记录是完整文档，用更大的上限避免备份恢复被截断
+_IMPORT_CONTENT_MAX_CHARS = 2000
+_RESTORE_CONTENT_MAX_CHARS = 20000
 # 元数据最多 10 个键（与导入清洗保持一致），分片标记只在放得下时添加
 _METADATA_MAX_KEYS = 10
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
@@ -346,12 +350,18 @@ def export_documents() -> list[dict[str, Any]]:
     ]
 
 
-def _regroup_exported_documents(documents: list[Any]) -> list[Any]:
+def _regroup_exported_documents(
+    documents: list[Any], existing: set[str]
+) -> tuple[list[Any], int]:
     """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
 
     导出文件包含 part/parts/group 元数据；逐条导入会把一篇文档拆成互不
     相关的单条记录（单条编辑、整组删除都无法识别）。这里先合并回整篇，
     再由 ``_chunk_documents`` 重新拆分并生成新的组标识。
+
+    整组的每个分片都已存在于库中时整组跳过（重复导入同一备份保持幂等）；
+    合并后的记录带 ``__restored_group__`` 标记，导入时使用更大的内容上限。
+    返回 (合并后的文档列表, 因整组已存在而跳过的分片数)。
     """
     grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     order: list[tuple[str, Any]] = []
@@ -378,6 +388,7 @@ def _regroup_exported_documents(documents: list[Any]) -> list[Any]:
             order.append(("single", item))
 
     merged: list[Any] = []
+    skipped = 0
     for kind, key in order:
         if kind == "single":
             merged.append(key)
@@ -397,40 +408,31 @@ def _regroup_exported_documents(documents: list[Any]) -> list[Any]:
                     for meta_key, meta_value in metadata.items()
                     if meta_key not in _DERIVED_CHUNK_KEYS
                 }
-        if contents:
-            merged.append({"content": "\n".join(contents), "metadata": base_meta})
-    return merged
+        if not contents:
+            continue
+        if all(stripped in existing for stripped in (c.strip() for c in contents)):
+            # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
+            skipped += len(contents)
+            continue
+        merged.append(
+            {
+                "__restored_group__": True,
+                "content": "\n".join(contents),
+                "metadata": base_meta,
+            }
+        )
+    return merged, skipped
 
 
 def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
-    """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。"""
-    documents = _regroup_exported_documents(list(documents))
-    cleaned: list[dict[str, Any]] = []
-    skipped = 0
-    for item in documents:
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
-        raw_content = item.get("content")
-        # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
-        if not isinstance(raw_content, str):
-            skipped += 1
-            continue
-        content = raw_content.strip()
-        if not content:
-            skipped += 1
-            continue
-        metadata = item.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
-        sanitized_meta = {
-            str(key)[:32]: str(value)[:200]
-            for key, value in list(metadata.items())[:_METADATA_MAX_KEYS]
-        }
-        # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索
-        cleaned.extend(_chunk_documents(content[:2000], sanitized_meta))
+    """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。
 
-    if not cleaned:
-        return {"imported": 0, "skipped": skipped}
+    导出备份中的多分片记录先按 group 拼回整篇再重新拆分；整组已完整存在
+    于库中时整组跳过（重复导入同一备份保持幂等，不会因重新拆分产生重复）。
+    """
+    items = list(documents)
+    if not items:
+        return {"imported": 0, "skipped": 0}
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
@@ -443,6 +445,34 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
             str(item.get("content", "")).strip()
             for item in list_documents(limit=_MAX_SCAN)["items"]
         }
+        merged_items, skipped = _regroup_exported_documents(items, existing)
+        cleaned: list[dict[str, Any]] = []
+        for item in merged_items:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            restored = bool(item.pop("__restored_group__", False))
+            raw_content = item.get("content")
+            # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
+            if not isinstance(raw_content, str):
+                skipped += 1
+                continue
+            content = raw_content.strip()
+            if not content:
+                skipped += 1
+                continue
+            metadata = item.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            sanitized_meta = {
+                str(key)[:32]: str(value)[:200]
+                for key, value in list(metadata.items())[:_METADATA_MAX_KEYS]
+            }
+            # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索
+            limit = (
+                _RESTORE_CONTENT_MAX_CHARS if restored else _IMPORT_CONTENT_MAX_CHARS
+            )
+            cleaned.extend(_chunk_documents(content[:limit], sanitized_meta))
+
         unique: list[dict[str, Any]] = []
         for item in cleaned:
             if item["content"] in existing:

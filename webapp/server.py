@@ -693,6 +693,10 @@ class AligoWebApp:
         except Exception as exc:  # noqa: BLE001 - 留着墓碑由 TTL 过期更安全
             self._tombstone_failed(exc, "撤销")
 
+    def shared_tombstones_active(self) -> bool:
+        """共享墓碑是否在用（配置了 Redis 且最近一次写入成功）。"""
+        return self._tombstones_shared
+
     def is_recently_deleted(self, user_id: str, session_id: str | None) -> bool:
         if not session_id:
             return False
@@ -2052,13 +2056,12 @@ def create_app(model: Any = None) -> FastAPI:
 
             # 先落墓碑再查存在性：从请求开始其它在途对话就会被拒绝，
             # 不会在存在性检查期间把已删除的会话写回。重复删除（之前已有
-            # 墓碑）保留墓碑；从未存在的 id 在确认后撤销，避免 300 秒内
-            # 无法用该 id 新开对话。
+            # 墓碑）也要重新写一次：上一次的共享墓碑可能因 Redis 故障没写
+            # 成功，这里顺带修复；从未存在的 id 在确认后撤销本地墓碑。
             already_marked = await asyncio.to_thread(
                 state.is_recently_deleted, user_id, session_id
             )
-            if not already_marked:
-                await asyncio.to_thread(state.mark_deleted, user_id, session_id)
+            await asyncio.to_thread(state.mark_deleted, user_id, session_id)
 
             try:
                 existed = await asyncio.to_thread(_exists)
@@ -2095,8 +2098,14 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
-            if removed == 0 and not existed and not already_marked:
-                # 从未存在的 id：撤销本请求落的墓碑，允许用该 id 新开对话
+            if (
+                removed == 0
+                and not existed
+                and not already_marked
+                and not state.shared_tombstones_active()
+            ):
+                # 从未存在的 id：只有进程内墓碑时才撤销，允许用该 id 新开
+                # 对话；共享墓碑可能属于其它实例的同一次删除，不能代为删除
                 await asyncio.to_thread(state.unmark_deleted, user_id, session_id)
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)

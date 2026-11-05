@@ -649,6 +649,89 @@ def test_import_regroups_exported_chunks(monkeypatch):
     print("✓ 导入按 group 重新合并导出分片")
 
 
+def test_import_skips_fully_existing_group(monkeypatch):
+    """整组已完整存在于库中时整组跳过，重复导入备份不产生新记录。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    part1, part2 = "第一片内容", "第二片内容"
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset=0: {
+            "total": 2,
+            "items": [
+                {"id": 1, "content": part1, "metadata": {"group": "g"}},
+                {"id": 2, "content": part2, "metadata": {"group": "g"}},
+            ],
+        },
+    )
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {"status": "success", "ids": [], "total_count": 0}
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.import_documents(
+        [
+            {"content": part1, "metadata": {"group": "g", "part": "1", "parts": "2"}},
+            {"content": part2, "metadata": {"group": "g", "part": "2", "parts": "2"}},
+        ]
+    )
+    assert result == {"imported": 0, "skipped": 2}
+    assert agent.calls == []
+    print("✓ 已存在的整组分片导入时整组跳过")
+
+
+def test_import_restores_large_group_without_truncation(monkeypatch):
+    """备份还原的超长整组文档不能被 2000 字导入上限截断。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset=0: {"total": 0, "items": []},
+    )
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    text = "".join(f"第{i}段内容，用于验证备份恢复不截断。" for i in range(1, 300))
+    parts = [text[index : index + 400] for index in range(0, len(text), 400)]
+    documents = [
+        {
+            "content": part,
+            "metadata": {
+                "group": "g2",
+                "part": str(index + 1),
+                "parts": str(len(parts)),
+            },
+        }
+        for index, part in enumerate(parts)
+    ]
+    knowledge_admin.import_documents(documents)
+    rejoined = "".join(doc["content"] for doc in agent.calls[0]).replace("\n", "")
+    assert rejoined == text, "整篇内容应完整恢复，不能被导入上限截断"
+    print("✓ 超长整组备份恢复不截断")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -788,6 +871,8 @@ if __name__ == "__main__":
         test_update_grouped_update_failure_rolls_back_extras,
         test_chunk_documents_marks_even_with_full_metadata,
         test_import_regroups_exported_chunks,
+        test_import_skips_fully_existing_group,
+        test_import_restores_large_group_without_truncation,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,

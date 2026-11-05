@@ -2071,8 +2071,11 @@ def test_repeated_delete_keeps_tombstone():
 
 
 def test_delete_missing_session_allows_new_chat():
-    """从未存在的会话删除后不保留墓碑：该 id 仍可新开对话。"""
+    """从未存在的会话删除后不保留本地墓碑：该 id 仍可新开对话。"""
     client = _client()
+    state = client.app.state.aligo
+    if state.shared_tombstones_active():
+        pytest.skip("配置了共享墓碑（REDIS_URL），跨实例保护优先，不适用本地回退语义")
     user_id = _unique_user("web_test_missing_delete")
     try:
         deleted = client.delete(
@@ -2510,6 +2513,57 @@ def test_shared_tombstones_across_instances():
     state_a.unmark_deleted("u-shared", "s-shared")
     assert state_b.is_recently_deleted("u-shared", "s-shared") is False
     print("✓ 删除墓碑通过 Redis 跨实例共享（含 TTL 与撤销）")
+
+
+def test_repeated_delete_repairs_shared_tombstone():
+    """首次删除时共享墓碑写入失败，冷却结束后的重复删除要补写。"""
+
+    class _FlakySharedRedis:
+        def __init__(self):
+            self.data = {}
+            self.fail = True
+
+        def setex(self, key, ttl, value):
+            if self.fail:
+                raise ConnectionError("redis down")
+            self.data[key] = value
+
+        def exists(self, key):
+            if self.fail:
+                raise ConnectionError("redis down")
+            return int(key in self.data)
+
+        def delete(self, key):
+            self.data.pop(key, None)
+            return 1
+
+    shared = _FlakySharedRedis()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state._redis_client = shared
+    state._tombstones_shared = False
+    client = TestClient(app)
+    user_id = _unique_user("web_test_tombstone_repair")
+    try:
+        created = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "repair"},
+        )
+        assert created.status_code == 200
+        first = client.delete("/api/sessions/repair", params={"user_id": user_id})
+        assert first.status_code == 200 and first.json()["deleted"] == 2
+        assert not shared.data, "共享墓碑写入应失败"
+
+        shared.fail = False
+        state._tombstone_retry_at = 0.0  # 模拟冷却结束
+        second = client.delete("/api/sessions/repair", params={"user_id": user_id})
+        assert second.status_code == 200 and second.json()["deleted"] == 0
+        assert f"aligo:deleted:{user_id}:repair" in shared.data, (
+            "重复删除应补写上一次失败的共享墓碑"
+        )
+        print("✓ 重复删除补写共享墓碑")
+    finally:
+        _cleanup(user_id)
 
 
 def test_tombstone_redis_retry_after_failure():
@@ -3896,6 +3950,7 @@ if __name__ == "__main__":
     test_repeated_delete_keeps_tombstone()
     test_delete_missing_session_allows_new_chat()
     test_tombstone_helpers_are_thread_safe()
+    test_repeated_delete_repairs_shared_tombstone()
     test_session_metadata_requires_existing_session()
     test_session_rename()
     test_session_pin()
