@@ -506,9 +506,9 @@ python cli.py
 
 全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`，按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
 
-环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
+环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）；`python cli.py doctor --json` 输出机器可读的 `status` / `checks`，便于监控脚本解析，退出码不变。
 
-技能目录（不进入交互）：`python cli.py skills`，输出当前技能目录与已发现的技能名，退出码 0/1；安装 wheel 或设置 `ALIGO_SKILLS_DIR` 后可用它确认技能是否生效。
+技能目录（不进入交互）：`python cli.py skills`，输出当前技能目录与已发现的技能名，退出码 0/1；`--json` 输出 `root` / `skills` / `ok`，便于脚本读取。安装 wheel 或设置 `ALIGO_SKILLS_DIR` 后可用它确认技能是否生效。
 
 每次对话结束后会显示本次的 LLM 调用次数、token 用量与总耗时；`status` 命令可查看本次会话的累计用量。
 
