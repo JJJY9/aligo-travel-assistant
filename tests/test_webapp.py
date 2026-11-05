@@ -2092,6 +2092,31 @@ def test_delete_missing_session_allows_new_chat():
         _cleanup(user_id)
 
 
+def test_delete_missing_session_failure_does_not_leave_tombstone(monkeypatch):
+    """从未存在的会话删除又失败时也要撤销墓碑，允许该 id 新开对话。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def get_chat_history(self, session_id=None):
+            return []
+
+        def delete_chat_session(self, session_id):
+            raise RuntimeError("delete boom")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    client = _client()
+    state = client.app.state.aligo
+    if state.shared_tombstones_active():
+        pytest.skip("配置了共享墓碑（REDIS_URL），跨实例保护优先，不适用本地回退语义")
+    response = client.delete("/api/sessions/ghost", params={"user_id": "u-ghost"})
+    assert response.status_code == 503
+    assert state.is_recently_deleted("u-ghost", "ghost") is False
+    print("✓ 删除不存在会话失败后不留墓碑")
+
+
 def test_tombstone_helpers_are_thread_safe():
     """墓碑的 mark/unmark/读取会被线程池并发调用，OrderedDict 不能裸迭代。"""
     app = create_app(model=UsageTrackingModel(_FakeModel()))
@@ -3949,6 +3974,7 @@ if __name__ == "__main__":
     test_deleted_session_cannot_be_resurrected()
     test_repeated_delete_keeps_tombstone()
     test_delete_missing_session_allows_new_chat()
+    test_delete_missing_session_failure_does_not_leave_tombstone()
     test_tombstone_helpers_are_thread_safe()
     test_repeated_delete_repairs_shared_tombstone()
     test_session_metadata_requires_existing_session()

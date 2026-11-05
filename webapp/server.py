@@ -2086,13 +2086,22 @@ def create_app(model: Any = None) -> FastAPI:
                 removed = await asyncio.to_thread(_delete)
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
                 if not already_marked:
-                    # 删除失败：会话仍存在时撤销墓碑（查询也失败则保留墓碑，
-                    # 宁可短暂误判已删除，也不放开防复活保护）
                     try:
                         still_exists = await asyncio.to_thread(_exists)
-                    except Exception:  # noqa: BLE001 - 保守保留墓碑
-                        still_exists = False
+                    except Exception:  # noqa: BLE001 - 查询失败：保守保留墓碑
+                        still_exists = None
                     if still_exists:
+                        # 删除失败但会话仍存在：撤销本请求落的墓碑，恢复正常对话
+                        await asyncio.to_thread(
+                            state.unmark_deleted, user_id, session_id
+                        )
+                    elif (
+                        still_exists is False
+                        and not existed
+                        and not state.shared_tombstones_active()
+                    ):
+                        # 读到了「确实不存在」且删除前也不存在（从未存在的 id）：
+                        # 撤销进程内墓碑，允许该 id 新开对话
                         await asyncio.to_thread(
                             state.unmark_deleted, user_id, session_id
                         )
