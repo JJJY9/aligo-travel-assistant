@@ -64,7 +64,7 @@ pip install pre-commit && pre-commit install
 
 发布前检查清单：
 
-1. 同步版本号（`python cli.py doctor` 会检查 `pyproject.toml` 与 `utils/version.py` 是否一致）：
+1. 同步版本号（`python cli.py doctor` 会检查 `pyproject.toml`、`index.html` 静态资源 `?v=` 与 `utils/version.py` 是否一致）：
    - `pyproject.toml` 的 `version`
    - `utils/version.py` 的 `APP_VERSION`
    - `webapp/static/index.html` 中静态资源引用 `?v=` 查询参数（避免浏览器继续用旧缓存）

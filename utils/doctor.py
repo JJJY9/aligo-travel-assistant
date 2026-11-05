@@ -180,29 +180,57 @@ def check_skills() -> CheckResult:
 
 
 def check_version_consistency() -> CheckResult:
-    """检查 pyproject.toml 与 ``utils.version.APP_VERSION`` 是否一致。"""
+    """检查 pyproject.toml / index.html 静态资源版本与 ``APP_VERSION`` 是否一致。"""
     from utils.version import APP_VERSION
 
+    problems: list[str] = []
+    checked: list[str] = []
+
     pyproject = PROJECT_ROOT / "pyproject.toml"
-    if not pyproject.is_file():
-        # 安装 wheel 后没有源码目录的 pyproject.toml，不应因此给用户警告
+    if pyproject.is_file():
+        try:
+            text = pyproject.read_text(encoding="utf-8")
+        except OSError as exc:
+            problems.append(f"无法读取 pyproject.toml：{exc}")
+        else:
+            match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+            if match:
+                checked.append("pyproject")
+                if match.group(1) != APP_VERSION:
+                    problems.append(f"pyproject.toml 为 {match.group(1)}")
+            else:
+                problems.append("pyproject.toml 中未找到 version")
+
+    index_html = PROJECT_ROOT / "webapp" / "static" / "index.html"
+    if index_html.is_file():
+        try:
+            html = index_html.read_text(encoding="utf-8")
+        except OSError as exc:
+            problems.append(f"无法读取 index.html：{exc}")
+        else:
+            versions = set(re.findall(r"\?v=([0-9][0-9A-Za-z.\-]*)", html))
+            if versions:
+                checked.append("静态资源")
+                mismatched = sorted(version for version in versions if version != APP_VERSION)
+                if mismatched:
+                    problems.append(f"index.html 静态资源为 {', '.join(mismatched)}")
+            else:
+                problems.append("index.html 未找到 ?v= 静态资源版本")
+
+    if problems:
         return CheckResult(
-            "版本一致性", STATUS_SKIP, "未找到 pyproject.toml（已安装 wheel 时跳过）"
+            "版本一致性",
+            STATUS_WARN,
+            f"utils/version.py 为 {APP_VERSION}；" + "；".join(problems),
         )
-    try:
-        text = pyproject.read_text(encoding="utf-8")
-    except OSError as exc:
-        return CheckResult("版本一致性", STATUS_WARN, f"无法读取 pyproject.toml：{exc}")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    if not match:
-        return CheckResult("版本一致性", STATUS_WARN, "pyproject.toml 中未找到 version")
-    pyproject_version = match.group(1)
-    if pyproject_version == APP_VERSION:
-        return CheckResult("版本一致性", STATUS_OK, APP_VERSION)
+    if not checked:
+        return CheckResult(
+            "版本一致性", STATUS_SKIP, "未找到 pyproject.toml / 静态资源版本，跳过"
+        )
     return CheckResult(
         "版本一致性",
-        STATUS_WARN,
-        f"utils/version.py 为 {APP_VERSION}，pyproject.toml 为 {pyproject_version}",
+        STATUS_OK,
+        f"{APP_VERSION}（pyproject / 静态资源一致）",
     )
 
 
