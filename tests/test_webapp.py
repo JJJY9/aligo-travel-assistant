@@ -176,6 +176,25 @@ def test_weather_rate_limit(monkeypatch):
     print("✓ /api/weather 按 IP 独立限流（空白城市不耗额度）")
 
 
+def test_weather_endpoint_uses_dedicated_executor():
+    """天气端点改为异步 + 专用线程池：慢上游不会占满共享线程池。"""
+    import inspect
+    from concurrent.futures import ThreadPoolExecutor
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    routes = [
+        route for route in app.routes if getattr(route, "path", "") == "/api/weather"
+    ]
+    assert routes, "应存在 /api/weather 路由"
+    assert inspect.iscoroutinefunction(routes[0].endpoint), "天气端点应为异步函数"
+
+    executor = server_module._get_weather_executor()
+    assert isinstance(executor, ThreadPoolExecutor)
+    assert executor is server_module._get_weather_executor(), "线程池应复用同一实例"
+    print("✓ 天气端点使用专用线程池（异步执行）")
+
+
 def test_status_endpoint():
     response = _client().get("/api/status", params={"user_id": "web_test_missing"})
     assert response.status_code == 200
