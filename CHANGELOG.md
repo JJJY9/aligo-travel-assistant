@@ -12,7 +12,7 @@
 - `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否配置 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 - 反向代理部署：设置 `TRUST_PROXY_HEADERS=1` 后限流按 `X-Forwarded-For` 第一个地址计算客户端 IP；默认关闭，避免客户端伪造该头绕过 IP 桶
 - 知识库接口独立限流：写入 / 更新 / 删除 / 导入 / 导出 / 语义检索按客户端 IP 限流（默认 60 次 / 分钟，`KB_RATE_LIMIT` 调整），与对话额度互不影响；配置 Redis 时与其他桶共享后端，`/api/metrics.rate_limit` 增加 `kb_limit`
-- 知识库维护面板新增「检索评测」按钮（`/api/knowledge/eval`）：14 个问题离线计算 hit@1/3/5 与 MRR，不调用大模型，受知识库限流保护；hit@5 低于 80% 时结果标红提示；同一时间只允许一个评测（并发请求返回 429）
+- 知识库维护面板新增「检索评测」按钮（`/api/knowledge/eval`）：14 个问题离线计算 hit@1/3/5 与 MRR，不调用大模型，受知识库限流保护；hit@5 低于 80% 时结果标红提示；同一进程内只允许一个评测（并发请求返回 429）
 - 请求指标新增 P50 / P95 耗时（最近 1000 个请求样本，内存有界）与 `duration_samples`；记忆面板运行指标新增「P95 耗时」卡片
 - CLI `doctor` / `skills` 支持 `--json`：`doctor` 输出 `status` / `checks`，`skills` 输出 `root` / `skills` / `ok`，便于监控与脚本读取；非法参数退出码 2
 - CLI `health` / `kb` 也支持 `--json`：`health` 输出 `{"ok", "message"}`，`kb` 输出完整知识库状态对象；非法参数退出码 2
@@ -30,6 +30,9 @@
 - `pip install --user` 安装 wheel 时技能文件落在用户目录（`site.getuserbase()`），此前解析器只查 `sys.prefix`，导致智能体无法注册；现在按 `ALIGO_SKILLS_DIR` → 源码目录 → `sys.prefix` → 用户目录的顺序查找
 - Redis 限流响应解析兼容未开启 `decode_responses` 的客户端（bytes 返回值），避免 `float()` 抛错
 - 本地 JSON 长期记忆：CLI 与 Web 等多进程同时写同一用户时，修改操作使用 `<data>.json.lock` 跨进程文件锁串行化（Windows `msvcrt` / Unix `flock`），避免后写覆盖先写
+- 知识库限流改为单桶直接 `check()` 原子记录，并发请求不会超发；已有评测运行时的 429 不再消耗知识库配额
+- 知识库检索评测使用 `strict=True`，后端 / 嵌入失败返回 503，而不是当作 0% 命中的成功评测
+- 进程内限流桶增加线程锁，FastAPI 线程池并发调用不再可能因 deque 竞态报 500；`/api/health` 聚合用户 / IP / 知识库三个桶的降级状态
 
 ### 测试
 - 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例；并发 check（多线程同时请求）严格只放行额度内的次数
@@ -38,6 +41,7 @@
 - 新增 `tests/test_cli_skills.py`（正常 / 目录缺失 / 空目录 / 命令分发）；`tests/test_skill_paths.py` 补充技能目录不可读时安全返回空的用例
 - 新增知识库接口限流用例：首次写入 201 并带额度头，第二次 429；语义检索与导出均与写入共享知识库桶；对话不受该桶影响
 - 新增 `/api/knowledge/eval` 用例：正常返回 hit@K / MRR 与额度头，知识库不可用返回 503，已有评测运行时返回 429
+- 内存限流并发用例：10 线程同时请求严格放行 50 次；评测用例断言 `strict=True`、并发锁 429 不消耗额度、任一桶降级都会上报
 - `tests/test_metrics.py` 补充 P50 / P95、有界样本窗口与重置用例；`/api/metrics` 接口用例断言百分位与样本数
 - `test_cli_skills.py` / `test_doctor.py` 补充 `--json` 输出、失败退出码与未知参数用例
 - 新增 `tests/test_cli_json.py`：health JSON 成功 / 失败、kb 状态可用 / 不可用的退出码与字段

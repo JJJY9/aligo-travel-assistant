@@ -98,6 +98,22 @@ def test_health_marks_configured_redis_fallback_degraded(monkeypatch):
     print("✓ 配置 Redis 但回退进程内限流时 health 标记降级")
 
 
+def test_health_reports_any_degraded_limiter():
+    """用户桶未降级、知识库桶降级时也应上报 degraded。"""
+
+    class _DegradedLimiter:
+        backend = "redis"
+        limit = 1
+        window_sec = 60
+        degraded = True
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    app.state.aligo.kb_limiter = _DegradedLimiter()
+    data = TestClient(app).get("/api/health").json()
+    assert data["rate_limit_degraded"] is True
+    print("✓ 任一限流桶降级都会上报 degraded")
+
+
 def test_status_endpoint():
     response = _client().get("/api/status", params={"user_id": "web_test_missing"})
     assert response.status_code == 200
@@ -2817,28 +2833,33 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
 
 def test_knowledge_eval_api(monkeypatch):
     """检索评测接口：返回 hit@K / MRR，带额度头；知识库不可用返回 503。"""
+    from utils.rate_limit import RateLimiter
     from webapp import server as server_module
+
+    runs = []
 
     class FakeAgent:
         def __init__(self, collection_name):
             self.collection_name = collection_name
             self.initialized = True
 
-        def search_knowledge(self, query, top_k=5):
+        def search_knowledge(self, query, top_k=5, strict=False):
+            runs.append(strict)
             return [{"content": query}]
 
-    monkeypatch.setattr("agents.rag_knowledge_agent.RAGKnowledgeAgent", FakeAgent)
-    monkeypatch.setattr(
-        "utils.rag_eval.evaluate_retrieval",
-        lambda search: {
+    def fake_evaluate(search):
+        search("测试", 5)
+        return {
             "total": 14,
             "hit1": 0.64,
             "hit3": 0.93,
             "hit5": 1.0,
             "mrr": 0.80,
             "rows": [],
-        },
-    )
+        }
+
+    monkeypatch.setattr("agents.rag_knowledge_agent.RAGKnowledgeAgent", FakeAgent)
+    monkeypatch.setattr("utils.rag_eval.evaluate_retrieval", fake_evaluate)
     monkeypatch.setattr(
         server_module,
         "knowledge_status",
@@ -2849,13 +2870,18 @@ def test_knowledge_eval_api(monkeypatch):
             "path": "p",
         },
     )
-    client = _client()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.kb_limiter = RateLimiter(limit=3, window_sec=60)
+    client = TestClient(app)
+
     response = client.get("/api/knowledge/eval")
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 14
     assert data["hit5"] == 1.0
     assert "x-ratelimit-limit" in response.headers
+    assert runs == [True], "评测必须用 strict=True 区分空结果与检索失败"
 
     monkeypatch.setattr(
         server_module,
@@ -2871,7 +2897,24 @@ def test_knowledge_eval_api(monkeypatch):
         assert "Retry-After" in busy.headers
     finally:
         server_module._KB_EVAL_LOCK.release()
-    print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429）")
+
+    # 并发锁拒绝不应消耗知识库额度：恢复知识库后仍可再评测一次（额度 3/3）
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda: {
+            "available": True,
+            "collection": "kb",
+            "documents": 141,
+            "path": "p",
+        },
+    )
+    assert client.get("/api/knowledge/eval").status_code == 200
+    assert len(runs) == 2 and all(runs)
+    limited = client.get("/api/knowledge/eval")
+    assert limited.status_code == 429
+    assert limited.headers["x-ratelimit-remaining"] == "0"
+    print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429 不耗额度）")
 
 
 def test_knowledge_api_maps_backend_errors(monkeypatch):
