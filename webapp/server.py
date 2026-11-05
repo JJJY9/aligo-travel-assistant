@@ -160,8 +160,15 @@ class RequestContextMiddleware:
             if message["type"] == "http.response.start":
                 response_started = True
                 status_code = int(message.get("status", 0))
+                headers_list = list(message.get("headers") or [])
+                # 用户数据接口不进入浏览器 / 代理缓存；响应自己声明了 Cache-Control
+                # （如导出接口的 no-cache）时保持原样，避免重复头
+                if path.startswith("/api/") and not any(
+                    key.lower() == b"cache-control" for key, _ in headers_list
+                ):
+                    headers_list.append((b"cache-control", b"no-store"))
                 message["headers"] = (
-                    list(message.get("headers") or [])
+                    headers_list
                     + response_headers
                     + [(b"x-request-id", request_id.encode("latin-1"))]
                 )

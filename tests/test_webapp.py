@@ -2184,11 +2184,18 @@ def test_security_headers():
         assert "default-src 'self'" in csp
         assert "script-src 'self'" in csp
         assert "frame-ancestors 'none'" in csp
+        if path.startswith("/api/"):
+            assert response.headers["cache-control"] == "no-store"
+        else:
+            assert "no-store" not in response.headers.get("cache-control", "")
+
+    status_response = client.get("/api/status", params={"user_id": "web_test_cache"})
+    assert status_response.headers["cache-control"] == "no-store"
 
     html = client.get("/").text
     assert "/static/theme.js" in html
     assert "<script>" not in html, "不应再使用内联脚本（CSP 禁止）"
-    print("✓ 安全响应头（CSP / nosniff / frame / referrer）")
+    print("✓ 安全响应头（CSP / nosniff / frame / referrer / API no-store）")
 
 
 def test_lock_table_is_bounded():
