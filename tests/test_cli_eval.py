@@ -11,6 +11,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import sys
 
@@ -29,11 +30,11 @@ def _status(available, reason=None, collection="business_travel_knowledge"):
     return data
 
 
-def _run(monkeypatch):
+def _run(monkeypatch, as_json=False):
     """执行评测并捕获 stdout（pytest 与脚本直跑均可）。"""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = cli.run_rag_eval_standalone()
+        code = cli.run_rag_eval_standalone(as_json=as_json)
     return code, buf.getvalue()
 
 
@@ -120,6 +121,42 @@ def test_hint_when_all_miss(monkeypatch):
     print("✓ 全部未命中时提示索引故障")
 
 
+def test_json_output(monkeypatch):
+    """eval --json：成功 / 未达标 / 跳过 / 基础设施故障四种状态。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
+    monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent())
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(1.0))
+
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 0
+    assert payload["ok"] is True and payload["skipped"] is False
+    assert payload["hit5"] == 1.0 and payload["threshold"] == 0.8
+
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(0.5))
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 1
+    assert payload["ok"] is False and payload["hit5"] == 0.5
+
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
+    )
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 0
+    assert payload["skipped"] is True and payload["ok"] is True
+
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "Fail connecting")
+    )
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 1
+    assert payload["ok"] is False and "Fail" in payload["reason"]
+    print("✓ eval --json 四种状态与退出码")
+
+
 if __name__ == "__main__":
     import pytest
 
@@ -129,6 +166,7 @@ if __name__ == "__main__":
         test_failure_when_agent_init_raises,
         test_pass_and_fail_thresholds,
         test_hint_when_all_miss,
+        test_json_output,
     ):
         mp = pytest.MonkeyPatch()
         try:

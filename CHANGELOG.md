@@ -16,6 +16,7 @@
 - 请求指标新增 P50 / P95 耗时（最近 1000 个请求样本，内存有界）与 `duration_samples`；记忆面板运行指标新增「P95 耗时」卡片
 - CLI `doctor` / `skills` 支持 `--json`：`doctor` 输出 `status` / `checks`，`skills` 输出 `root` / `skills` / `ok`，便于监控与脚本读取；非法参数退出码 2
 - CLI `health` / `kb` 也支持 `--json`：`health` 输出 `{"ok", "message"}`，`kb` 输出完整知识库状态对象；非法参数退出码 2
+- CLI `eval` 也支持 `--json`：输出 `ok` / `skipped` / `threshold` / `hit@K` / `mrr` / `rows`，成功、未达标、跳过与故障四种状态的退出码与文本模式一致
 - 行程日历提醒：导出的 `.ics` 事件新增 `VALARM`，出行前一天 09:00 提醒（单条行程与全部行程导出均生效）
 - 安全响应头：`/api/` 响应默认带 `Cache-Control: no-store`，用户数据不进入浏览器 / 代理缓存（导出接口保留自身的 `no-cache`）
 - 记忆面板用户卡片显示技能数量（来自 `/api/health`），安装后技能缺失可直接看到「技能 0」
@@ -36,6 +37,7 @@
 - `tests/test_metrics.py` 补充 P50 / P95、有界样本窗口与重置用例；`/api/metrics` 接口用例断言百分位与样本数
 - `test_cli_skills.py` / `test_doctor.py` 补充 `--json` 输出、失败退出码与未知参数用例
 - 新增 `tests/test_cli_json.py`：health JSON 成功 / 失败、kb 状态可用 / 不可用的退出码与字段
+- `test_cli_eval.py` 补充 `eval --json` 四种状态（成功 / 未达标 / 跳过 / 故障）与退出码断言
 - ICS 日历用例断言每个事件包含 `VALARM` 与 `TRIGGER:-PT15H`
 - 安全头用例断言 `/api/` 响应带 `Cache-Control: no-store`，页面与静态资源不受影响
 - 浏览器实测：用户卡片显示「本地内存 · JSON · 技能 6」
