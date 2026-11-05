@@ -78,6 +78,8 @@ def test_health_endpoint():
     assert data["rate_limit"] in {"memory", "redis"}
     assert data["rate_limit_configured"] is False
     assert data["rate_limit_degraded"] is False
+    assert data["skills"]["count"] >= 6
+    assert data["skills"]["dir_found"] is True
     print("✓ /api/health 返回版本 / 模型 / 存储后端")
 
 

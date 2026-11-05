@@ -50,3 +50,18 @@ def resolve_skills_root() -> Path:
         if root.is_dir():
             return root
     return roots[0]
+
+
+def skill_scripts(root: Path | None = None) -> dict[str, Path]:
+    """返回技能名 → ``script/agent.py`` 路径（目录不存在或没有技能时为空）。"""
+    base = root if root is not None else resolve_skills_root()
+    scripts: dict[str, Path] = {}
+    if not base.is_dir():
+        return scripts
+    for skill_dir in base.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        script = skill_dir / "script" / "agent.py"
+        if script.is_file():
+            scripts[skill_dir.name] = script
+    return scripts

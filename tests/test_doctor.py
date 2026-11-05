@@ -15,11 +15,13 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from utils.doctor import (
+    STATUS_FAIL,
     STATUS_OK,
     STATUS_WARN,
     check_knowledge_base,
     check_model_files,
     check_python,
+    check_skills,
     check_storage,
     run_doctor,
 )
@@ -60,6 +62,26 @@ def test_storage_unreachable_warns(monkeypatch):
 def test_python_ok():
     assert check_python().status == STATUS_OK
     print("✓ Python 版本检查")
+
+
+def test_skills_check_reports_repo_skills():
+    result = check_skills()
+    assert result.status == STATUS_OK, result.detail
+    assert "个技能" in result.detail
+    print("✓ 技能目录检查（源码运行）")
+
+
+def test_skills_check_missing_root(monkeypatch):
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(
+            skill_paths, "resolve_skills_root", lambda: Path(tmp) / "missing"
+        )
+        result = check_skills()
+    assert result.status == STATUS_FAIL
+    assert "ALIGO_SKILLS_DIR" in result.detail
+    print("✓ 技能目录缺失 → 失败并提示 ALIGO_SKILLS_DIR")
 
 
 def test_model_files_missing_dir():
@@ -109,6 +131,7 @@ def test_run_doctor_without_network():
     assert "Python 版本" in names
     assert "核心依赖" in names
     assert "大模型配置" in names
+    assert "技能目录" in names
     assert "记忆存储" in names
     assert "嵌入模型文件" in names
     assert "RAG 知识库" in names
