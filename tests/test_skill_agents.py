@@ -108,6 +108,19 @@ def test_search_summary_prompt_treats_results_as_data():
     print("✓ 搜索摘要把网页内容当数据（防指令注入）")
 
 
+def test_memory_query_formats_falsey_preferences():
+    """0 / False 是合法偏好，memory-query 不能当作未设置。"""
+    agent_class = _load_skill("memory-query", "MemoryQueryAgent")
+    agent = object.__new__(agent_class)
+    text = agent._format_preferences(
+        {"budget_level": 0, "eco_mode": False, "home_location": ""}
+    )
+    assert "预算等级: 0" in text
+    assert "eco_mode: False" in text
+    assert "home_location" not in text
+    print("✓ memory-query 展示 0 / False 偏好")
+
+
 def test_extract_user_query_fallback():
     payload = '{"context": {"rewritten_query": null, "user_query": "义乌明天天气怎么样"}}'
     assert extract_user_query(payload) == "义乌明天天气怎么样"
@@ -147,6 +160,7 @@ if __name__ == "__main__":
         test_search_summary_prompt_treats_results_as_data()
         test_extract_user_query_fallback()
         test_memory_query_formats_null_trip_fields()
+        test_memory_query_formats_falsey_preferences()
     finally:
         _mp.undo()
     print("\n全部通过")
