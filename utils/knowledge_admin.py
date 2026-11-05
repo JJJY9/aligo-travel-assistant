@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -241,38 +242,40 @@ def _document_info(client: Any, doc_id: int) -> tuple[int, str]:
     return parts, str(meta.get("group") or "") if parts > 1 else ""
 
 
-def _group_member_ids(client: Any, group: str) -> list[int]:
-    """同一拆分组的其它分片 id。
+def _iter_all_rows(client: Any):
+    """遍历集合的全部行。
 
-    单次 query 受 limit（16384）约束，且部分引擎对 offset + limit 有上限，
-    CLI 导入不受限时集合可能超过该规模：按 id 区间窗口扫描（主键范围查询），
-    不依赖 offset。窗口推进到超过已见最大 id 的空窗口即结束。
+    单次 query 受 limit（16384）与 offset 组合上限约束；query_iterator 由
+    引擎分批下发，集合超过单页规模时也不会漏行（CLI 导入不受条数限制）。
     """
+    iterator = client.query_iterator(
+        collection_name=COLLECTION_NAME,
+        filter="id >= 0",
+        batch_size=_IMPORT_CHUNK,
+        output_fields=["id", "content", "metadata"],
+    )
+    try:
+        while True:
+            batch = iterator.next()
+            if not batch:
+                break
+            yield from batch
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+
+
+def _group_member_ids(client: Any, group: str) -> list[int]:
+    """同一拆分组的其它分片 id（遍历全部行，不受单页 16384 条限制）。"""
     if not group:
         return []
     members: list[int] = []
-    window = _MAX_SCAN
-    start = 0
-    max_seen = 0
-    while True:
-        rows = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f"id >= {start} and id < {start + window}",
-            output_fields=["id", "metadata"],
-            limit=window,
-        )
-        rows = rows or []
-        if rows:
-            max_seen = max(
-                max_seen, max(int(row.get("id", 0) or 0) for row in rows)
-            )
-            for row in rows:
-                meta = _parse_metadata(row.get("metadata"))
-                if str(meta.get("group") or "") == group:
-                    members.append(int(row.get("id", 0) or 0))
-        elif start > max_seen:
-            break
-        start += window
+    for row in _iter_all_rows(client):
+        meta = _parse_metadata(row.get("metadata"))
+        if str(meta.get("group") or "") == group:
+            members.append(int(row.get("id", 0) or 0))
     return members
 
 
@@ -348,9 +351,21 @@ def update_document(
 
 
 def export_documents() -> list[dict[str, Any]]:
-    """导出全部知识片段（按 id 升序，便于备份 / 迁移；不含 id）。"""
-    data = list_documents(limit=_MAX_SCAN, offset=0)
-    items = sorted(data["items"], key=lambda item: item["id"])
+    """导出全部知识片段（按 id 升序，便于备份 / 迁移；不含 id）。
+
+    全量扫描（query_iterator），集合超过单页 16384 条时也不会截断。
+    """
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    items: list[dict[str, Any]] = [
+        {
+            "id": int(row.get("id", 0) or 0),
+            "content": str(row.get("content", "")),
+            "metadata": _parse_metadata(row.get("metadata")),
+        }
+        for row in _iter_all_rows(client)
+    ]
+    items.sort(key=lambda item: item["id"])
     return [
         {"content": item["content"], "metadata": item["metadata"]} for item in items
     ]
@@ -430,6 +445,13 @@ def _regroup_exported_documents(
     return merged, skipped
 
 
+def _existing_contents() -> set[str]:
+    """库中全部片段的内容集合（全量扫描，不受单页 16384 条限制）。"""
+    return {
+        str(row.get("content", "")).strip() for row in _iter_all_rows(_client())
+    }
+
+
 def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。
 
@@ -462,11 +484,8 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
     imported: list[int] = []
     with _WRITE_LOCK:
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
-        # 插入同一批内容
-        existing = {
-            str(item.get("content", "")).strip()
-            for item in list_documents(limit=_MAX_SCAN)["items"]
-        }
+        # 插入同一批内容；快照走全量扫描，集合超过单页规模时也不会重复导入
+        existing = _existing_contents()
         merged_items, group_skipped = _regroup_exported_documents(valid, existing)
         skipped += group_skipped
         cleaned: list[dict[str, Any]] = []
@@ -490,6 +509,11 @@ def import_documents(documents: list[dict[str, Any]]) -> dict[str, Any]:
             limit = (
                 _RESTORE_CONTENT_MAX_CHARS if restored else _IMPORT_CONTENT_MAX_CHARS
             )
+            if restored and len(content) > limit:
+                # 备份还原不能静默截断：超出还原上限时整批报错，提示拆分后导入
+                raise ValueError(
+                    f"备份中的文档超过还原上限（{limit} 字），请拆分后导入"
+                )
             cleaned.extend(_chunk_documents(content[:limit], sanitized_meta))
 
         unique: list[dict[str, Any]] = []

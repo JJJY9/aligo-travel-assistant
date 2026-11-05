@@ -83,21 +83,16 @@ def _merge_short_chunks(
         if pending:
             candidate = f"{pending}\n{chunk}"
             if max_chars is not None and len(candidate) > max_chars:
-                # 标题 + 正文超过上限：把标题接到正文第一段开头，按剩余空间
-                # 切分正文（无句读的长段落 hard-split 后第一段也可能超长，
-                # 直接整体切分会让标题又单独成块）
-                body_pieces = _split_long_paragraph(chunk, max_chars)
-                room = max_chars - len(pending) - 1
-                if room <= 0:
-                    merged.append(pending)
+                short_heading = "\n" not in pending and len(pending) <= min_chars
+                if short_heading:
+                    # 单行短标题（≤30 字）并入正文第一段，最多超出标题长度；
+                    # 保留正文的句子边界，也不会产生无内容的标题块
+                    body_pieces = _split_long_paragraph(chunk, max_chars)
+                    body_pieces[0] = f"{pending}\n{body_pieces[0]}"
                     merged.extend(body_pieces)
                 else:
-                    first = body_pieces[0]
-                    head, tail = first[:room], first[room:]
-                    body_pieces[0] = f"{pending}\n{head}"
-                    if tail:
-                        body_pieces.insert(1, tail)
-                    merged.extend(body_pieces)
+                    # 多行目录式标题：按上限切分，不能整体并入正文
+                    merged.extend(_split_long_paragraph(candidate, max_chars))
             else:
                 merged.append(candidate)
             pending = ""
