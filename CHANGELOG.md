@@ -41,6 +41,7 @@
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁；补瞬时故障下进程内互斥、故障恢复后重新走 Redis、SET 超时后释放清理锁键、持有期间自动续期用例
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义（含无样本不输出耗时、单调时钟 uptime）；`test_webapp.py` 覆盖 `/metrics` 端点与路由模板聚合
 - 新增 `tests/test_cli_weather.py`：文本 / JSON 输出、失败退出码、stale 标注、命令分发与参数校验
+- 新增 `tests/test_lazy_agent_registry.py`：技能发现 / 遗留名称映射 / 缓存 / 缺失目录 / 导入失败 / 缺少 AgentBase 子类
 - 新增 `tests/test_console.py`（空闲管道不阻塞、probe 开关）与 `tests/test_cli_hardening.py`（未知命令 / `--help`、参数校验、导出文件名唯一性、BrokenPipe、BOM 导入）
 - `test_webapp.py` 补会话读取 503、删除后重命名 404、删除不存在会话不留墓碑、保留字 session_id 用例；`test_storage_factory.py` 的元数据用例改为先写入消息（与接口契约一致），并补 trip_id 删除后不复用、单日行程去重、路线编辑使总结失效、statistics 默认值、非对象历史记录丢弃、PostgreSQL 连接失效重连用例；`test_cli_trips_dedupe.py` 补歧义 trip_id 与单日去重用例；`test_webapp.py` 补重复 trip_id 的改 / 删 / 单条日历 409、长字段行程 / 偏好面板编辑、超长编辑重发用例；`test_storage_factory.py` 补 0 / False 偏好进入上下文与路径锁弱引用用例
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑，断言 TTL）；`test_webapp.py` 补假 Redis 共享墓碑用例（含 TTL、撤销、故障回退与恢复、启动后接入、过期墓碑清理、删除失败回滚）
