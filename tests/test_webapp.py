@@ -3268,14 +3268,19 @@ def test_knowledge_document_write_api(monkeypatch):
 
     deleted = {}
 
-    def fake_delete(doc_id):
+    def fake_delete(doc_id, whole_group=False):
         deleted["id"] = doc_id
-        return doc_id == 7
+        deleted["group"] = whole_group
+        return doc_id in {7, 9}
 
     monkeypatch.setattr(server_module, "delete_document", fake_delete)
     ok = client.delete("/api/knowledge/documents/7")
     assert ok.status_code == 200 and ok.json()["deleted"] is True
-    assert deleted["id"] == 7
+    assert deleted == {"id": 7, "group": False}
+    # group=1 删除整组分片
+    grouped = client.delete("/api/knowledge/documents/9?group=1")
+    assert grouped.status_code == 200 and grouped.json()["group"] is True
+    assert deleted == {"id": 9, "group": True}
     assert client.delete("/api/knowledge/documents/8").status_code == 404
 
     updated = {}
