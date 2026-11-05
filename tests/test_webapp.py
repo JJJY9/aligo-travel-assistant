@@ -1919,6 +1919,67 @@ def test_chat_rate_limit_rejected_request_does_not_consume_other_bucket():
             _cleanup(user_id)
 
 
+def test_rate_limit_trusted_proxy_headers(monkeypatch):
+    """TRUST_PROXY_HEADERS 开启后按 X-Forwarded-For 第一个地址限流。"""
+    from config import RATE_LIMIT_CONFIG
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=100, window_sec=60)
+    client = TestClient(app)
+    users = []
+    try:
+        # 默认不信任 XFF：不同 XFF 的请求仍共用同一 IP 桶（TCP 对端）
+        user_a = _unique_user("web_test_proxy_a")
+        user_b = _unique_user("web_test_proxy_b")
+        users = [user_a, user_b]
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        first = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_a, "session_id": "proxy-a1"},
+            headers={"X-Forwarded-For": "198.51.100.1"},
+        )
+        assert first.status_code == 200
+        second = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_b, "session_id": "proxy-b1"},
+            headers={"X-Forwarded-For": "198.51.100.2"},
+        )
+        assert second.status_code == 429, "默认配置下不应信任 X-Forwarded-For"
+
+        # 开启信任后：相同 XFF 共享 IP 桶，不同 XFF 互不影响
+        user_c = _unique_user("web_test_proxy_c")
+        user_d = _unique_user("web_test_proxy_d")
+        user_e = _unique_user("web_test_proxy_e")
+        users += [user_c, user_d, user_e]
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_headers", True)
+        forwarded = "203.0.113.9, 10.0.0.1"
+        third = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_c, "session_id": "proxy-c1"},
+            headers={"X-Forwarded-For": forwarded},
+        )
+        assert third.status_code == 200
+        fourth = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_d, "session_id": "proxy-d1"},
+            headers={"X-Forwarded-For": forwarded},
+        )
+        assert fourth.status_code == 429, "相同转发地址应共享 IP 桶"
+        fifth = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_e, "session_id": "proxy-e1"},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        assert fifth.status_code == 200, "不同转发地址不应互相影响"
+        print("✓ 可信代理开启后按 X-Forwarded-For 第一个地址限流")
+    finally:
+        for user_id in users:
+            _cleanup(user_id)
+
+
 def test_ip_rejection_does_not_consume_user_bucket():
     """IP 桶拒绝时不能消耗用户桶配额（与用户桶拒绝对称）。"""
     from utils.rate_limit import RateLimiter
