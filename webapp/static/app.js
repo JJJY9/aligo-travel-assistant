@@ -58,6 +58,7 @@ const state = {
   kbImporting: false,
   kbEditingId: null,
   kbEditingMetadata: {},
+  kbEditingGroupParts: 0,
   kbSaving: false,
   kbSemanticMode: false,
   kbSemanticQuery: "",
@@ -3331,11 +3332,21 @@ function knowledgeRowActions(doc) {
   const edit = document.createElement("button");
   edit.type = "button";
   const parts = Number(doc.metadata && doc.metadata.parts);
-  if (parts > 1) {
-    // 多分片记录没有稳定的组标识，单条编辑会留下无法定位的旧分片（服务端 400）
+  const group = String((doc.metadata && doc.metadata.group) || "");
+  if (parts > 1 && !group) {
+    // 旧数据没有 group，无法定位其余分片，单条编辑会留下孤儿分片（服务端 400）
     edit.disabled = true;
-    edit.title = "多分片记录请整组删除后重新添加，暂不支持单条编辑";
-    edit.setAttribute("aria-label", `知识片段 ${doc.id} 属于多分片记录，不支持单条编辑`);
+    edit.title = "旧的多分片记录请整组删除后重新添加，暂不支持单条编辑";
+    edit.setAttribute(
+      "aria-label",
+      `知识片段 ${doc.id} 属于旧的多分片记录，不支持单条编辑`,
+    );
+  } else if (parts > 1) {
+    edit.title = `编辑整份文档（${parts} 片）`;
+    edit.setAttribute(
+      "aria-label",
+      `编辑知识片段 ${doc.id} 所属的整份文档（共 ${parts} 片）`,
+    );
   } else {
     edit.title = "编辑片段";
     edit.setAttribute("aria-label", `编辑知识片段 ${doc.id}`);
@@ -3530,19 +3541,50 @@ async function removeKnowledgeDocument(doc) {
   }
 }
 
-function startEditKnowledge(doc) {
+async function startEditKnowledge(doc) {
   if (state.kbSaving) {
     toast("正在保存知识片段，请稍候");
     return;
   }
-  if (Number(doc.metadata && doc.metadata.parts) > 1) {
-    toast("多分片记录请整组删除后重新添加，暂不支持单条编辑");
+  const parts = Number(doc.metadata && doc.metadata.parts);
+  const group = String((doc.metadata && doc.metadata.group) || "");
+  if (parts > 1 && !group) {
+    toast("旧的多分片记录请整组删除后重新添加，暂不支持单条编辑");
     return;
   }
+  let content = doc.content || "";
+  let groupParts = 0;
+  if (parts > 1) {
+    // 整组编辑：回填整篇文档（按 part 拼接），保存时服务端整组替换
+    try {
+      const data = await getJSON(
+        `/api/knowledge/documents/${encodeURIComponent(doc.id)}/group`,
+      );
+      content = String(data.content || "");
+      groupParts = Number(data.parts || parts);
+    } catch (error) {
+      toast(`读取整份文档失败：${error.message}`);
+      return;
+    }
+    if (!content) {
+      toast("整份文档为空，无法编辑");
+      return;
+    }
+    if (content.length > 20000) {
+      toast("整份文档超过 20000 字，请拆分后维护");
+      return;
+    }
+  }
   state.kbEditingId = doc.id;
+  state.kbEditingGroupParts = groupParts;
   // 保留完整 metadata：PUT 会整体覆盖，只回填分类会丢掉 title / source 等字段
   state.kbEditingMetadata = { ...(doc.metadata || {}) };
-  els.kbContent.value = doc.content || "";
+  els.kbContent.maxLength = groupParts > 1 ? 20000 : 2000;
+  els.kbContent.placeholder =
+    groupParts > 1
+      ? `正在编辑整份文档（${groupParts} 片），保存后整组替换`
+      : "新增知识片段，例如：一线城市住宿标准为每晚 600 元";
+  els.kbContent.value = content;
   els.kbCategory.value = doc.metadata?.category ? String(doc.metadata.category) : "";
   els.kbSubmit.textContent = "保存修改";
   els.kbCancel.hidden = false;
@@ -3556,6 +3598,9 @@ function startEditKnowledge(doc) {
 function resetKnowledgeForm({ clear = true } = {}) {
   state.kbEditingId = null;
   state.kbEditingMetadata = {};
+  state.kbEditingGroupParts = 0;
+  els.kbContent.maxLength = 2000;
+  els.kbContent.placeholder = "新增知识片段，例如：一线城市住宿标准为每晚 600 元";
   els.kbSubmit.textContent = "添加片段";
   els.kbCancel.hidden = true;
   if (clear) {
@@ -3573,6 +3618,7 @@ async function addKnowledgeDocument(event) {
     return;
   }
   const editingId = state.kbEditingId;
+  const editingGroupParts = state.kbEditingGroupParts;
   const metadata = editingId ? { ...state.kbEditingMetadata } : {};
   const category = els.kbCategory.value.trim();
   if (category) metadata.category = category;
@@ -3597,8 +3643,10 @@ async function addKnowledgeDocument(event) {
     );
     state.kbSaving = false;
     const parts = Number((data && data.parts) || 0);
-    if (parts > 1) {
-      toast(`长内容已拆分为 ${parts} 条片段（可在列表中整组删除，暂不支持单条编辑）`);
+    if (editingId && editingGroupParts > 1) {
+      toast(`整份文档已更新（${parts || editingGroupParts} 片）`);
+    } else if (parts > 1) {
+      toast(`长内容已拆分为 ${parts} 条片段（编辑任一分片会整份替换）`);
     } else {
       toast(editingId ? "知识片段已更新" : "知识片段已添加");
     }

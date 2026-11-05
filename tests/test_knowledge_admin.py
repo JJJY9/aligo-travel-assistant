@@ -810,6 +810,36 @@ def test_import_restore_over_limit_raises(monkeypatch):
     print("✓ 超限备份还原明确报错（不静默截断）")
 
 
+def test_get_document_group_returns_joined_content(monkeypatch):
+    """整组回填：按 part 顺序拼接整篇文档；单条返回自身；不存在返回 None。"""
+    rows = [
+        {
+            "id": 1,
+            "content": "第一段",
+            "metadata": json.dumps(
+                {"part": "1", "parts": "3", "group": "g", "category": "测试"}
+            ),
+        },
+        {"id": 2, "content": "第二段", "metadata": json.dumps({"part": "2", "parts": "3", "group": "g"})},
+        {"id": 3, "content": "第三段", "metadata": json.dumps({"part": "3", "parts": "3", "group": "g"})},
+        {"id": 4, "content": "普通片段", "metadata": "{}"},
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+
+    grouped = knowledge_admin.get_document_group(2)
+    assert grouped == {
+        "id": 2,
+        "group": "g",
+        "parts": 3,
+        "content": "第一段\n第二段\n第三段",
+    }
+    single = knowledge_admin.get_document_group(4)
+    assert single == {"id": 4, "group": "", "parts": 1, "content": "普通片段"}
+    assert knowledge_admin.get_document_group(99) is None
+    print("✓ 整组文档回填（按 part 拼接 / 单条 / 不存在）")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -945,6 +975,7 @@ if __name__ == "__main__":
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_raises,
+        test_get_document_group_returns_joined_content,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,
