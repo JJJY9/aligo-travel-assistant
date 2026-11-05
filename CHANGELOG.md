@@ -18,7 +18,7 @@
 - Redis 限流响应解析兼容未开启 `decode_responses` 的客户端（bytes 返回值），避免 `float()` 抛错
 
 ### 测试
-- 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例
+- 新增 `tests/test_rate_limit_redis.py`：两个限流器实例共享计数、`peek` 不消耗额度、窗口过期、桶名隔离与 `reset`，以及两个 Web 实例共享额度并返回 429 的集成用例；并发 check（多线程同时请求）严格只放行额度内的次数
 - `tests/test_rate_limit.py` 补充 Redis 故障回退与限流器工厂用例
 - `tests/test_skill_paths.py` 覆盖 `skill_scripts` 技能发现；`test_doctor.py` 覆盖技能目录检查（正常 / 缺失）；健康接口断言 `skills.count` 与 `dir_found`
 
