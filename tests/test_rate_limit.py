@@ -5,6 +5,7 @@
 """
 import os
 import sys
+import threading
 import time
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +77,27 @@ def test_peek_does_not_record():
     assert limiter.peek("k") is not None
     assert limiter.status("k")[0] == 0, "peek 不应改变剩余次数"
     print("✓ peek 只检查不记录")
+
+
+def test_thread_safe_checks():
+    """线程池并发调用时严格放行 limit 次（内部锁保护 deque）。"""
+    limiter = RateLimiter(limit=50, window_sec=60)
+    allowed: list[bool] = []
+    result_lock = threading.Lock()
+
+    def worker():
+        local = [limiter.check("k") is None for _ in range(20)]
+        with result_lock:
+            allowed.extend(local)
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sum(allowed) == 50
+    assert limiter.status("k")[0] == 0
+    print("✓ 并发 check 严格按额度放行（内存桶线程安全）")
 
 
 class _UnavailableRedis:
@@ -156,6 +178,7 @@ if __name__ == "__main__":
     test_key_eviction_bounds_memory()
     test_status_reports_remaining()
     test_peek_does_not_record()
+    test_thread_safe_checks()
     test_redis_limiter_falls_back_when_unavailable()
     test_create_rate_limiter_backends()
     test_redis_limiter_handles_bytes_replies()

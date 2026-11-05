@@ -641,9 +641,13 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """
     backend = getattr(state.rate_limiter, "backend", "memory")
     configured = bool(STORAGE_CONFIG.get("redis_url"))
-    degraded = bool(getattr(state.rate_limiter, "degraded", False)) or (
-        backend == "memory" and configured
+    # 三个桶各自回退：任一桶处于降级冷却期都应上报，不能只看用户桶
+    degradation_states = (
+        getattr(state.rate_limiter, "degraded", False),
+        getattr(state.ip_limiter, "degraded", False),
+        getattr(state.kb_limiter, "degraded", False),
     )
+    degraded = any(degradation_states) or (backend == "memory" and configured)
     return {
         "backend": backend,
         "configured": configured,
@@ -713,7 +717,9 @@ def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, st
         供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
     """
     client = _client_host(request)
-    retry_after = state.kb_limiter.peek(client)
+    # 单桶直接 check：内存实现内部加锁、Redis 实现 Lua 原子，避免 peek/check
+    # 之间被并发请求插队导致超发；check 超限时本身不会记录事件
+    retry_after = state.kb_limiter.check(client)
     if retry_after is not None:
         wait_seconds = max(1, math.ceil(retry_after))
         raise HTTPException(
@@ -727,7 +733,6 @@ def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, st
                 "X-RateLimit-Reset": str(wait_seconds),
             },
         )
-    state.kb_limiter.check(client)
     remaining, reset = state.kb_limiter.status(client)
     return {
         "X-RateLimit-Limit": str(state.kb_limiter.limit),
@@ -1278,7 +1283,6 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/knowledge/eval")
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
         """离线检索评测：14 个差旅问题计算 hit@1/3/5 与 MRR（不调用大模型）。"""
-        response.headers.update(_enforce_kb_rate_limit(state, request))
         if not _KB_EVAL_LOCK.acquire(blocking=False):
             raise HTTPException(
                 status_code=429,
@@ -1286,6 +1290,8 @@ def create_app(model: Any = None) -> FastAPI:
                 headers={"Retry-After": "5"},
             )
         try:
+            # 先拿评测锁再计额度：已有评测时的 429 不应消耗知识库配额
+            response.headers.update(_enforce_kb_rate_limit(state, request))
             status = knowledge_status()
             if not status.get("available"):
                 raise HTTPException(
@@ -1308,7 +1314,9 @@ def create_app(model: Any = None) -> FastAPI:
             try:
                 # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
                 return evaluate_retrieval(
-                    lambda query, top_k: agent.search_knowledge(query, top_k=top_k)
+                    lambda query, top_k: agent.search_knowledge(
+                        query, top_k=top_k, strict=True
+                    )
                 )
             except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
                 logger.warning("检索评测失败: %s", exc)

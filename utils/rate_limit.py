@@ -12,6 +12,7 @@ key 由请求方提供（用户 ID 可被轮换），因此调用方应同时用
 防止大量随机 key 造成内存无限增长。
 """
 import logging
+import threading
 import time
 import uuid
 from collections import deque
@@ -94,10 +95,13 @@ class RateLimiter:
         self.limit = max(1, int(limit))
         self.window_sec = max(0.01, float(window_sec))
         self.max_keys = max(1, int(max_keys))
+        # KB 等同步接口在 FastAPI 线程池并发执行，内存桶必须自己加锁
+        self._lock = threading.Lock()
         self._events: dict[str, deque[float]] = {}
 
     def __len__(self) -> int:
-        return len(self._events)
+        with self._lock:
+            return len(self._events)
 
     def check(self, key: str) -> float | None:
         """记录一次请求。
@@ -105,23 +109,24 @@ class RateLimiter:
         Returns:
             None 表示放行；超限时返回建议的 Retry-After 秒数（保留 1 位小数）。
         """
-        now = time.monotonic()
-        events = self._events.get(key)
-        if events is None:
-            if len(self._events) >= self.max_keys:
-                # 为新 key 预留一个位置，确保插入后总数不超过上限
-                self._sweep(now, force=True, reserve=1)
-            events = deque()
-            self._events[key] = events
+        with self._lock:
+            now = time.monotonic()
+            events = self._events.get(key)
+            if events is None:
+                if len(self._events) >= self.max_keys:
+                    # 为新 key 预留一个位置，确保插入后总数不超过上限
+                    self._sweep(now, force=True, reserve=1)
+                events = deque()
+                self._events[key] = events
 
-        while events and now - events[0] >= self.window_sec:
-            events.popleft()
+            while events and now - events[0] >= self.window_sec:
+                events.popleft()
 
-        if len(events) >= self.limit:
-            return round(max(0.1, self.window_sec - (now - events[0])), 1)
+            if len(events) >= self.limit:
+                return round(max(0.1, self.window_sec - (now - events[0])), 1)
 
-        events.append(now)
-        return None
+            events.append(now)
+            return None
 
     def peek(self, key: str) -> float | None:
         """不记录请求，返回现在发起请求会被限流的 Retry-After（否则 None）。
@@ -129,28 +134,30 @@ class RateLimiter:
         多桶限流时先用 peek 检查所有桶，全部有额度再 check 记录，
         避免一个桶已经拒绝、另一个桶却仍被消耗配额。
         """
-        now = time.monotonic()
-        events = self._events.get(key)
-        if events is None:
+        with self._lock:
+            now = time.monotonic()
+            events = self._events.get(key)
+            if events is None:
+                return None
+            while events and now - events[0] >= self.window_sec:
+                events.popleft()
+            if len(events) >= self.limit:
+                return round(max(0.1, self.window_sec - (now - events[0])), 1)
             return None
-        while events and now - events[0] >= self.window_sec:
-            events.popleft()
-        if len(events) >= self.limit:
-            return round(max(0.1, self.window_sec - (now - events[0])), 1)
-        return None
 
     def status(self, key: str) -> tuple[int, float]:
         """返回 (剩余次数, 窗口重置剩余秒数)，不记录新请求。"""
-        now = time.monotonic()
-        events = self._events.get(key)
-        if events is None:
-            return self.limit, 0.0
-        while events and now - events[0] >= self.window_sec:
-            events.popleft()
-        if not events:
-            return self.limit, 0.0
-        reset = max(0.0, self.window_sec - (now - events[0]))
-        return max(0, self.limit - len(events)), reset
+        with self._lock:
+            now = time.monotonic()
+            events = self._events.get(key)
+            if events is None:
+                return self.limit, 0.0
+            while events and now - events[0] >= self.window_sec:
+                events.popleft()
+            if not events:
+                return self.limit, 0.0
+            reset = max(0.0, self.window_sec - (now - events[0]))
+            return max(0, self.limit - len(events)), reset
 
     def _sweep(self, now: float, force: bool = False, reserve: int = 0) -> None:
         """清理已过期 / 空 key；force 时若仍超上限，淘汰事件最旧的 key。
@@ -172,7 +179,8 @@ class RateLimiter:
 
     def reset(self) -> None:
         """清空所有限流状态（测试或运维需要时使用）。"""
-        self._events.clear()
+        with self._lock:
+            self._events.clear()
 
 
 class RedisRateLimiter:
