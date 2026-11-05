@@ -121,8 +121,24 @@ def test_webapp_with_postgres_backend(monkeypatch):
             ).status_code
             == 200
         )
+        # 重复置顶必须幂等：ON CONFLICT DO NOTHING 不返回行，不能误判 404
+        assert (
+            client.put(
+                "/api/sessions/sess-pg-web/pin",
+                json={"user_id": user_id, "pinned": True},
+            ).status_code
+            == 200
+        )
 
         # 归档 / 恢复（PG 归档表）
+        assert (
+            client.put(
+                "/api/sessions/sess-pg-web/archive",
+                json={"user_id": user_id, "archived": True},
+            ).status_code
+            == 200
+        )
+        # 重复归档同样幂等
         assert (
             client.put(
                 "/api/sessions/sess-pg-web/archive",
@@ -218,6 +234,36 @@ def test_webapp_with_postgres_backend(monkeypatch):
         except Exception:  # noqa: BLE001 - 清理失败不影响测试结论
             pass
         storage.reset_failure_cache()
+
+
+def test_advisory_lock_reacquired_after_reconnect():
+    """连接中断重连后，进程内持有中的 advisory lock 必须在新连接上重新获取。
+
+    会话级锁随旧连接由服务端释放；若重连后不重新获取，重试的读改写会在
+    没有互斥保护的情况下执行（并发重复生成 trip_N / 覆盖偏好）。
+    """
+    user_id = f"pglock-{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+
+    def held_lock_count() -> int:
+        row = store._fetchone(
+            "SELECT count(*) FROM pg_locks "
+            "WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+        return int(row[0]) if row else 0
+
+    try:
+        with store._advisory_lock(f"aligo-test-{user_id}"):
+            assert held_lock_count() >= 1
+            # 模拟连接被服务端终止：下一次操作会触发重连与重试
+            store._conn.close()
+            store.get_preference("home_location")
+            assert held_lock_count() >= 1, "重连后未重新获取 advisory lock"
+        # 释放后不再持有
+        assert held_lock_count() == 0
+        print("✓ advisory lock 在重连后重新获取")
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

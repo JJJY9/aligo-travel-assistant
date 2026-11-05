@@ -690,6 +690,26 @@ def test_export_all_sessions_storage_failure_maps_503(monkeypatch):
     print("✓ 全部会话导出读取失败映射 503")
 
 
+def test_open_long_term_failure_maps_503(monkeypatch):
+    """长期记忆打开失败（如 PostgreSQL 不可达）应返回可重试的 503 而不是 500。"""
+    from webapp import server as server_module
+
+    def _boom(*args, **kwargs):
+        raise ConnectionError("storage down")
+
+    monkeypatch.setattr(server_module, "create_long_term_memory", _boom)
+    client = _client()
+    for path in (
+        "/api/sessions",
+        "/api/sessions/export",
+        "/api/sessions/s-open-fail",
+        "/api/sessions/s-open-fail/export",
+    ):
+        response = client.get(path, params={"user_id": "u-open-fail"})
+        assert response.status_code == 503, (path, response.status_code)
+    print("✓ 长期记忆打开失败映射 503")
+
+
 def test_session_lru_eviction():
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
@@ -1997,6 +2017,9 @@ def test_delete_session_storage_failure_maps_503(monkeypatch):
     from webapp import server as server_module
 
     class _BrokenStore:
+        def get_chat_history(self, session_id=None):
+            return [{"role": "user", "content": "hi", "session_id": session_id}]
+
         def delete_chat_session(self, session_id):
             raise RuntimeError("disk full")
 
@@ -2012,6 +2035,34 @@ def test_delete_session_storage_failure_maps_503(monkeypatch):
     state = client.app.state.aligo
     assert state.is_recently_deleted("u1", "s1") is False, "删除失败应撤销墓碑"
     print("✓ 删除会话存储失败 → 503（墓碑回滚）")
+
+
+def test_repeated_delete_keeps_tombstone():
+    """重复删除（重试 / 另一标签页）返回 0 时必须保留墓碑，旧 id 不能复活。"""
+    client = _client()
+    user_id = _unique_user("web_test_double_delete")
+    try:
+        created = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "double-del"},
+        )
+        assert created.status_code == 200
+        first = client.delete(
+            "/api/sessions/double-del", params={"user_id": user_id}
+        )
+        assert first.status_code == 200 and first.json()["deleted"] == 2
+        again = client.delete(
+            "/api/sessions/double-del", params={"user_id": user_id}
+        )
+        assert again.status_code == 200 and again.json()["deleted"] == 0
+        blocked = client.post(
+            "/api/chat",
+            json={"message": "再问", "user_id": user_id, "session_id": "double-del"},
+        )
+        assert blocked.status_code == 404, "重复删除不能撤销墓碑"
+        print("✓ 重复删除保留墓碑，旧 id 不能复活")
+    finally:
+        _cleanup(user_id)
 
 
 def test_sessions_pagination():
@@ -3761,4 +3812,9 @@ if __name__ == "__main__":
     test_export_attachment()
     test_export_all_sessions_api()
     test_export_all_sessions_storage_failure_maps_503(pytest.MonkeyPatch())
+    _mp_open = pytest.MonkeyPatch()
+    try:
+        test_open_long_term_failure_maps_503(_mp_open)
+    finally:
+        _mp_open.undo()
     print("\n全部通过")
