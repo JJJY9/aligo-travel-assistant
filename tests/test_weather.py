@@ -30,6 +30,14 @@ class _Response:
         return self._data
 
 
+@pytest.fixture(autouse=True)
+def _isolate_weather_cache():
+    """天气缓存是进程级全局状态，避免成功 / 失败结果在用例之间泄漏。"""
+    weather.clear_weather_cache()
+    yield
+    weather.clear_weather_cache()
+
+
 def _geo(city="北京"):
     return {
         "results": [
@@ -164,6 +172,7 @@ def test_malformed_payload_raises(monkeypatch):
             return _Response(_geo() if "geocoding" in url else _payload)
 
         monkeypatch.setattr(weather.requests, "get", fake_get)
+        weather.clear_weather_cache()
         with pytest.raises(weather.WeatherError, match="天气接口返回格式异常"):
             weather.fetch_weather("北京")
     print("✓ 上游返回形状异常映射为 WeatherError")
@@ -210,6 +219,89 @@ def test_concurrent_misses_share_upstream_request(monkeypatch):
     print("✓ 同城并发未命中合并为一次上游请求")
 
 
+def test_cache_key_ignores_case_and_extra_space(monkeypatch):
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if "geocoding" in url:
+            calls.append(params["name"])
+            return _Response(
+                {"results": [{"name": params["name"], "latitude": 1, "longitude": 2}]}
+            )
+        calls.append("forecast")
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    first = weather.fetch_weather("Beijing")
+    second = weather.fetch_weather("  beijing ")
+    assert first == second
+    assert calls == ["Beijing", "forecast"], "大小写 / 空白不同的同一城市应共享缓存"
+    print("✓ 缓存键忽略大小写与多余空白")
+
+
+def test_failure_cache_prevents_repeat_requests(monkeypatch):
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append(url)
+        return _Response({"results": []})
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("不存在")
+    assert len(calls) == 1
+
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("不存在")
+    assert len(calls) == 1, "失败结果在 TTL 内不应重复请求上游"
+    print("✓ 失败结果短时缓存，避免重复请求上游")
+
+
+def test_failure_cache_expires(monkeypatch):
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append(url)
+        return _Response({"results": []})
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("不存在")
+    assert len(calls) == 1
+
+    # 直接把失败条目的时间戳拨到 TTL 之外（Windows 上 sleep 精度不足 15.6ms）
+    at, message = weather._failures["不存在"]
+    weather._failures["不存在"] = (at - weather.FAILURE_TTL_SEC - 1, message)
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("不存在")
+    assert len(calls) == 2, "失败缓存过期后应重新请求上游"
+    print("✓ 失败缓存过期后重试上游")
+
+
+def test_success_clears_cached_failure(monkeypatch):
+    responses = [{"results": []}, _geo("北京")]
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if "geocoding" in url:
+            return _Response(responses.pop(0))
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("北京")
+    with pytest.raises(weather.WeatherError, match="未找到城市"):
+        weather.fetch_weather("北京")
+    weather._failures.clear()  # 模拟缓存过期后上游恢复
+    data = weather.fetch_weather("北京")
+    assert data["city"] == "北京"
+    assert "北京" not in weather._failures
+    print("✓ 成功结果清除同城失败缓存")
+
+
 if __name__ == "__main__":
     for case in (
         test_fetch_weather_and_cache,
@@ -220,6 +312,10 @@ if __name__ == "__main__":
         test_malformed_payload_raises,
         test_cache_is_bounded_and_prunes_expired,
         test_concurrent_misses_share_upstream_request,
+        test_cache_key_ignores_case_and_extra_space,
+        test_failure_cache_prevents_repeat_requests,
+        test_failure_cache_expires,
+        test_success_clears_cached_failure,
     ):
         mp = pytest.MonkeyPatch()
         try:

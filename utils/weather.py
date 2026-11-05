@@ -16,6 +16,8 @@ GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 TIMEZONE_DEFAULT = "Asia/Shanghai"
 CACHE_TTL_SEC = 600.0
+# 失败结果（城市不存在 / 上游故障）短时缓存：避免侧栏每次刷新都重打上游
+FAILURE_TTL_SEC = 60.0
 # 缓存条目上限：城市名来自请求参数，不能让缓存随查询过的城市无限增长
 _CACHE_MAX_ENTRIES = 256
 _USER_AGENT = "Mozilla/5.0 (compatible; AligoTravel/1.0)"
@@ -50,6 +52,7 @@ WEATHER_CODE_MAP: dict[int, str] = {
 }
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_failures: dict[str, tuple[float, str]] = {}
 _cache_lock = threading.Lock()
 # 同一城市并发未命中时，只让一个线程访问上游，其余线程等待它的结果
 _inflight: dict[str, threading.Event] = {}
@@ -60,9 +63,15 @@ class WeatherError(Exception):
 
 
 def clear_weather_cache() -> None:
-    """清空天气缓存（测试或运维需要时使用）。"""
+    """清空天气成功 / 失败缓存（测试或运维需要时使用）。"""
     with _cache_lock:
         _cache.clear()
+        _failures.clear()
+
+
+def _cache_key(name: str) -> str:
+    """归一化城市键：忽略大小写与多余空白，避免同一地点重复占用缓存。"""
+    return " ".join(name.casefold().split())
 
 
 def _describe(code: Any) -> str:
@@ -125,13 +134,38 @@ def _store_cache(name: str, result: dict[str, Any]) -> None:
             oldest = min(_cache, key=lambda key: _cache[key][0])
             del _cache[oldest]
         _cache[name] = (now, result)
+        _failures.pop(name, None)
+
+
+def _failure_hit(key: str) -> str | None:
+    with _cache_lock:
+        failed = _failures.get(key)
+        if failed is not None and time.monotonic() - failed[0] < FAILURE_TTL_SEC:
+            return failed[1]
+    return None
+
+
+def _store_failure(key: str, message: str) -> None:
+    """失败结果短时缓存：同样的错误在 TTL 内直接复用，不再请求上游。"""
+    now = time.monotonic()
+    with _cache_lock:
+        expired = [
+            name for name, (at, _) in _failures.items() if now - at >= FAILURE_TTL_SEC
+        ]
+        for name in expired:
+            del _failures[name]
+        if key not in _failures and len(_failures) >= _CACHE_MAX_ENTRIES:
+            oldest = min(_failures, key=lambda name: _failures[name][0])
+            del _failures[oldest]
+        _failures[key] = (now, message)
 
 
 def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     """查询城市的实时天气与未来 3 天预报。
 
     同一城市的并发未命中只放行一个线程访问上游，其余线程等待并复用
-    结果；成功结果带 10 分钟进程内缓存。
+    结果；成功结果缓存 10 分钟，失败结果缓存 60 秒。缓存键忽略大小写
+    与多余空白。
 
     Raises:
         WeatherError: 城市为空 / 未找到，或 Open-Meteo 不可用。
@@ -139,32 +173,46 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     name = city.strip()
     if not name:
         raise WeatherError("城市不能为空")
+    key = _cache_key(name)
 
-    cached = _cache_hit(name)
+    cached = _cache_hit(key)
     if cached is not None:
         return cached
+    failed = _failure_hit(key)
+    if failed is not None:
+        raise WeatherError(failed)
 
-    leader, event = _claim_fetch(name)
+    leader, event = _claim_fetch(key)
     if leader:
         # 检查缓存与登记在途之间可能有别的线程刚好写入了结果
-        cached = _cache_hit(name)
+        cached = _cache_hit(key)
         if cached is not None:
-            _finish_fetch(name, event)
+            _finish_fetch(key, event)
             return cached
+        failed = _failure_hit(key)
+        if failed is not None:
+            _finish_fetch(key, event)
+            raise WeatherError(failed)
     else:
         # 等待领先线程：成功时缓存已写入，直接复用；失败或超时则自己重试
         event.wait(timeout * 2 + 1)
-        cached = _cache_hit(name)
+        cached = _cache_hit(key)
         if cached is not None:
             return cached
+        failed = _failure_hit(key)
+        if failed is not None:
+            raise WeatherError(failed)
     try:
-        return _fetch_weather_uncached(name, timeout)
+        return _fetch_weather_uncached(name, key, timeout)
+    except WeatherError as exc:
+        _store_failure(key, str(exc))
+        raise
     finally:
         if leader:
-            _finish_fetch(name, event)
+            _finish_fetch(key, event)
 
 
-def _fetch_weather_uncached(name: str, timeout: float) -> dict[str, Any]:
+def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, Any]:
     try:
         geo = _get_json(
             GEO_URL,
@@ -195,7 +243,7 @@ def _fetch_weather_uncached(name: str, timeout: float) -> dict[str, Any]:
         raise WeatherError("天气接口返回格式异常") from exc
 
     result = _parse_weather(name, location, data)
-    _store_cache(name, result)
+    _store_cache(key, result)
     return result
 
 
