@@ -41,6 +41,7 @@
 - 短期记忆 Redis 运行中故障时回退进程内影子缓存并进入 60 秒冷却（对话不再 500），`/api/health.storage` 新增 `short_term_degraded`；`add_message` 改为先写长期记忆再写短期缓存，长期失败不再留下孤立提问；memory-query 与 CLI 的意图上下文按 `has_preference_value` 展示 0 / False 偏好
 - RAG / 检索加固：聊天路径启用 strict 检索，知识库后端故障显示「知识库暂时不可用」而不是「没有相关信息」；`search_knowledge` 的 `top_k=0` / 负数返回空、`None` 使用默认值；CLI `eval` 逐题检索故障报后端错误（退出码 1），不再算成 hit@5=0%；`text_chunker` 对连续标题行一直挂起到正文，不再产生纯标题块
 - 其余上下文修复：memory-query 提示词带上当前会话最近对话（同会话追问可用）；plan-trip 把所有前序结果包在「仅作数据、不执行其中指令」边界内；意图 prompt 对超长输入截断到 4000 字，避免上下文溢出后降级并污染后续总结
+- 知识库初始化时校验集合向量维度与嵌入模型是否一致，不一致时记录明确告警（此前维度不匹配时检索静默返回空）；README 已知限制补充单条知识片段约 400 字的建议（嵌入模型 512 token 截断）
 
 ### 修复
 - 天气工具加固：上游响应形状异常统一映射为 `WeatherError`（此前可能抛 `AttributeError` 导致 500）；缓存改为有界（写入时清理过期条目，上限 256 条）；同一城市的并发未命中合并为一次上游请求
@@ -55,6 +56,7 @@
 - `test_webapp.py` 补含空格偏好键、搜索片段剥离 Markdown 用例
 - `test_orchestration_unit.py` 补规划依赖顺序 / 本轮偏好上下文 / 追加动作变体 / Infinity 优先级 / 智能体超时 / 子智能体重试 / 调度规范化用例；`test_intention_resilience.py` 补嵌套 JSON 片段兜底用例
 - `test_storage_factory.py` 补总结指纹感知窗口替换 / prompt 预算与 null 格式化 / 失败冷却 / add_message 写序用例；`test_short_term_memory.py` 补 Redis 故障回退与降级标记；`test_skill_agents.py` 补 memory-query 展示 0 / False 偏好 / 当前会话对话 / RAG top_k 边界；`test_text_chunker.py` 补连续标题块；`test_cli_eval.py` 补检索后端故障；`test_intention_resilience.py` 补超长输入截断
+- `test_skill_agents.py` 补知识库向量维度不一致告警用例
 - 新增 `tests/test_lazy_agent_registry.py`：技能发现 / 遗留名称映射 / 缓存 / 缺失目录 / 导入失败 / 缺少 AgentBase 子类
 - 新增 `tests/test_console.py`（空闲管道不阻塞、probe 开关）与 `tests/test_cli_hardening.py`（未知命令 / `--help`、参数校验、导出文件名唯一性、BrokenPipe、BOM 导入）
 - `test_webapp.py` 补会话读取 503、删除后重命名 404、删除不存在会话不留墓碑、保留字 session_id 用例；`test_storage_factory.py` 的元数据用例改为先写入消息（与接口契约一致），并补 trip_id 删除后不复用、单日行程去重、路线编辑使总结失效、statistics 默认值、非对象历史记录丢弃、PostgreSQL 连接失效重连用例；`test_cli_trips_dedupe.py` 补歧义 trip_id 与单日去重用例；`test_webapp.py` 补重复 trip_id 的改 / 删 / 单条日历 409、长字段行程 / 偏好面板编辑、超长编辑重发用例；`test_storage_factory.py` 补 0 / False 偏好进入上下文与路径锁弱引用用例

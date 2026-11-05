@@ -133,6 +133,7 @@ class RAGKnowledgeAgent(AgentBase):
         # 检查collection是否存在
         if client.has_collection(collection_name):
             logger.info(f"Loaded existing collection: {collection_name}")
+            self._check_embedding_dimension(client)
         else:
             # 创建新collection
             logger.info(f"Creating new collection: {collection_name}")
@@ -151,6 +152,37 @@ class RAGKnowledgeAgent(AgentBase):
     def milvus_client(self):
         """每次从共享注册表取当前客户端，避免重连后其它会话持有已关闭句柄。"""
         return get_milvus_client(self._milvus_db_path)
+
+    def _check_embedding_dimension(self, client) -> None:
+        """集合向量维度与当前嵌入模型不一致时给出明确警告（检索会静默为空）。"""
+        try:
+            description = client.describe_collection(self.collection_name)
+        except Exception as exc:  # noqa: BLE001 - 仅诊断，不影响初始化
+            logger.debug("无法读取集合结构，跳过维度检查: %s", exc)
+            return
+        if not isinstance(description, dict):
+            return
+        fields = description.get("fields")
+        if not isinstance(fields, list):
+            return
+        for field in fields:
+            if not isinstance(field, dict) or field.get("name") != "vector":
+                continue
+            params = field.get("params")
+            dim = params.get("dim") if isinstance(params, dict) else None
+            if dim is None and isinstance(field.get("type_params"), dict):
+                dim = field["type_params"].get("dim")
+            try:
+                if dim is not None and int(dim) != int(self.embedding_dim):
+                    logger.warning(
+                        "知识库向量维度 %s 与嵌入模型 %s 不一致，检索会为空；"
+                        "请重新初始化知识库",
+                        dim,
+                        self.embedding_dim,
+                    )
+            except (TypeError, ValueError):
+                return
+            return
 
     def _ensure_connection(self):
         """确保 Milvus 连接正常，如果需要则重新创建客户端"""
