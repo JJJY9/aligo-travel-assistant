@@ -78,6 +78,21 @@ def test_content_preserved():
     print("✓ 切分后内容完整保留")
 
 
+def test_consecutive_titles_merge_into_body():
+    """总标题 + 节标题的连续标题块要并入正文，不能单独成块。"""
+    text = (
+        "商旅常见问题解答（FAQ）\n\n"
+        "一、出差申请相关\n\n"
+        "Q1: 出差申请需要提前几天？\n"
+        "一般提前 3 个工作日提交。\n"
+    )
+    chunks = split_text(text)
+    assert len(chunks) == 1, chunks
+    assert "出差申请需要提前几天" in chunks[0]
+    assert "3 个工作日" in chunks[0]
+    print("✓ 连续标题行并入正文，不再产生纯标题块")
+
+
 def test_short_title_merged():
     """孤立的文档标题不应单独成块（会挤占检索名额）"""
     text = (
@@ -97,5 +112,6 @@ if __name__ == "__main__":
     test_faq_questions_separated()
     test_long_paragraph_split()
     test_content_preserved()
+    test_consecutive_titles_merge_into_body()
     test_short_title_merged()
     print("\n全部通过")

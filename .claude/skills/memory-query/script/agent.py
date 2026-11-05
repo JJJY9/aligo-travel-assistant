@@ -83,6 +83,26 @@ class MemoryQueryAgent(AgentBase):
                         user_query = msg.get("content", "")
                         break
 
+        # 同会话追问需要当前会话的最近对话，不能只看其它会话的长期摘要
+        raw_dialogue = context.get("recent_dialogue")
+        current_dialogue = (
+            [
+                item
+                for item in raw_dialogue[-6:]
+                if isinstance(item, dict)
+                and str(item.get("content") or "").strip()
+            ]
+            if isinstance(raw_dialogue, list)
+            else []
+        )
+        dialogue_text = (
+            "\n".join(
+                f"{'用户' if item.get('role') == 'user' else '助手'}: {item.get('content')}"
+                for item in current_dialogue
+            )
+            or "（暂无当前会话上下文）"
+        )
+
         if not user_query:
             return Msg(
                 name=self.name,
@@ -128,6 +148,9 @@ class MemoryQueryAgent(AgentBase):
 
 【用户问题】
 {user_query}
+
+【当前会话最近对话】
+{dialogue_text}
 
 【用户旅行历史】
 {trip_text}

@@ -8,6 +8,7 @@ memory-query 对 null 行程字段的格式化。
 """
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 
@@ -15,6 +16,8 @@ import pytest
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+
+from agentscope.message import Msg
 
 from utils.user_query import extract_user_query
 
@@ -121,6 +124,105 @@ def test_memory_query_formats_falsey_preferences():
     print("✓ memory-query 展示 0 / False 偏好")
 
 
+def test_memory_query_includes_current_dialogue():
+    """同会话追问要带上当前对话，不能只看其它会话的长期摘要。"""
+    agent_class = _load_skill("memory-query", "MemoryQueryAgent")
+
+    class _LongTerm:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_preference(self):
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    class _SkillLoader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _Model:
+        def __init__(self):
+            self.prompts = []
+
+        async def __call__(self, messages, **kwargs):
+            self.prompts.append(messages)
+            return "好的"
+
+    agent = agent_class(
+        name="MemoryQueryAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _SkillLoader()
+    payload = json.dumps(
+        {
+            "context": {
+                "rewritten_query": "那后天呢",
+                "recent_dialogue": [
+                    {"role": "user", "content": "我昨天去了杭州"},
+                    {"role": "assistant", "content": "杭州天气不错"},
+                ],
+            }
+        }
+    )
+    result = asyncio.run(
+        agent.reply(Msg(name="orchestrator", content=payload, role="user"))
+    )
+    prompt = str(agent.model.prompts[0])
+    assert "【当前会话最近对话】" in prompt
+    assert "我昨天去了杭州" in prompt
+    assert "那后天呢" in prompt
+    assert json.loads(result.content)["status"] == "success"
+    print("✓ memory-query 带上当前会话对话")
+
+
+def test_rag_search_top_k_bounds():
+    """top_k=0 / 负数返回空，None 使用默认值，不能把非法 limit 传给 Milvus。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    search = agent_class.search_knowledge
+
+    class _Milvus:
+        def __init__(self):
+            self.limits = []
+
+        def load_collection(self, name):
+            pass
+
+        def search(self, **kwargs):
+            self.limits.append(kwargs["limit"])
+            return [[]]
+
+    class _Embedding:
+        def encode(self, query):
+            class _Vector:
+                def tolist(self):
+                    return [0.0]
+
+            return _Vector()
+
+    class _FakeSelf:
+        initialized = True
+        top_k = 5
+        collection_name = "kb"
+
+        def __init__(self):
+            self.milvus_client = _Milvus()
+            self.embedding_model = _Embedding()
+
+        def _ensure_connection(self):
+            pass
+
+    fake = _FakeSelf()
+    assert search(fake, "住宿", top_k=0) == []
+    assert search(fake, "住宿", top_k=-3) == []
+    search(fake, "住宿")
+    assert fake.milvus_client.limits == [5]
+    print("✓ search_knowledge top_k 边界")
+
+
 def test_extract_user_query_fallback():
     payload = '{"context": {"rewritten_query": null, "user_query": "义乌明天天气怎么样"}}'
     assert extract_user_query(payload) == "义乌明天天气怎么样"
@@ -161,6 +263,8 @@ if __name__ == "__main__":
         test_extract_user_query_fallback()
         test_memory_query_formats_null_trip_fields()
         test_memory_query_formats_falsey_preferences()
+        test_memory_query_includes_current_dialogue()
+        test_rag_search_top_k_bounds()
     finally:
         _mp.undo()
     print("\n全部通过")

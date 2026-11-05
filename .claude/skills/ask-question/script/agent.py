@@ -307,7 +307,15 @@ class RAGKnowledgeAgent(AgentBase):
             except Exception as load_err:
                 logger.debug(f"load_collection skipped: {load_err}")
 
-            k = top_k or self.top_k
+            if top_k is None:
+                k = self.top_k
+            else:
+                try:
+                    k = int(top_k)
+                except (TypeError, ValueError):
+                    k = self.top_k
+                if k <= 0:
+                    return []
 
             # 生成查询向量
             query_embedding = self.embedding_model.encode(query).tolist()
@@ -377,8 +385,25 @@ class RAGKnowledgeAgent(AgentBase):
         user_query = extract_user_query(content)
 
         # 检索相关知识。嵌入模型编码与 Milvus 查询是同步阻塞调用，
-        # 放到线程池执行，避免卡住事件循环（SSE 心跳与其它会话）
-        retrieved_docs = await asyncio.to_thread(self.search_knowledge, user_query)
+        # 放到线程池执行，避免卡住事件循环（SSE 心跳与其它会话）。
+        # strict=True：后端故障要显式报错，不能伪装成「知识库没有相关信息」
+        try:
+            retrieved_docs = await asyncio.to_thread(
+                self.search_knowledge, user_query, None, True
+            )
+        except Exception as exc:  # noqa: BLE001 - 知识库故障转为智能体错误
+            logger.warning("知识库检索失败: %s", exc)
+            result = {
+                "status": "error",
+                "query": user_query,
+                "answer": f"知识库暂时不可用，请稍后再试（{exc}）",
+                "data": {"error": str(exc)},
+            }
+            return Msg(
+                name=self.name,
+                content=json.dumps(result, ensure_ascii=False),
+                role="assistant",
+            )
 
         if not retrieved_docs:
             result = {
