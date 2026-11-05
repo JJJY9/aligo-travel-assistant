@@ -438,7 +438,9 @@ def _regroup_exported_documents(
         merged.append(
             {
                 "__restored_group__": True,
-                "content": "\n".join(contents),
+                # 与 get_document_group 一致不插入分隔符：还原内容的长度不能
+                # 超过文档本身（否则恰好在上限的备份无法还原）
+                "content": "".join(contents),
                 "metadata": base_meta,
             }
         )
@@ -450,44 +452,54 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
 
     不存在返回 None；单条 / 无 group 的旧分片返回其自身内容。供面板
     「编辑整份文档」回填：整组保存时由 ``update_document`` 整组替换。
+
+    拼接不额外插入分隔符：分片边界本身来自语义切分（切分时已去掉边界
+    空白），加分隔符会让回填长度超过文档本身的字数上限。读取在写锁内
+    进行，避免读到整组替换过程中的中间状态。
     """
-    client = _client()
-    _load_collection(client, COLLECTION_NAME)
-    parts, group = _document_info(client, int(doc_id))
-    if parts == 0:
-        return None
-    if not group:
-        rows = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f"id == {int(doc_id)}",
-            output_fields=["content"],
-            limit=1,
-        )
-        content = str(rows[0].get("content", "")) if rows else ""
-        return {"id": int(doc_id), "group": "", "parts": parts, "content": content}
-    pieces: list[tuple[int, str]] = []
-    for member in _group_member_ids(client, group):
-        rows = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f"id == {member}",
-            output_fields=["content", "metadata"],
-            limit=1,
-        )
-        if not rows:
-            continue
-        meta = _parse_metadata(rows[0].get("metadata"))
-        try:
-            part_no = int(meta.get("part") or 0)
-        except (TypeError, ValueError):
-            part_no = 0
-        pieces.append((part_no, str(rows[0].get("content", ""))))
-    pieces.sort(key=lambda pair: pair[0])
-    return {
-        "id": int(doc_id),
-        "group": group,
-        "parts": len(pieces) or parts,
-        "content": "\n".join(text for _, text in pieces),
-    }
+    with _WRITE_LOCK:
+        client = _client()
+        _load_collection(client, COLLECTION_NAME)
+        parts, group = _document_info(client, int(doc_id))
+        if parts == 0:
+            return None
+        if not group:
+            rows = client.query(
+                collection_name=COLLECTION_NAME,
+                filter=f"id == {int(doc_id)}",
+                output_fields=["content"],
+                limit=1,
+            )
+            content = str(rows[0].get("content", "")) if rows else ""
+            return {
+                "id": int(doc_id),
+                "group": "",
+                "parts": parts,
+                "content": content,
+            }
+        pieces: list[tuple[int, str]] = []
+        for member in _group_member_ids(client, group):
+            rows = client.query(
+                collection_name=COLLECTION_NAME,
+                filter=f"id == {member}",
+                output_fields=["content", "metadata"],
+                limit=1,
+            )
+            if not rows:
+                continue
+            meta = _parse_metadata(rows[0].get("metadata"))
+            try:
+                part_no = int(meta.get("part") or 0)
+            except (TypeError, ValueError):
+                part_no = 0
+            pieces.append((part_no, str(rows[0].get("content", ""))))
+        pieces.sort(key=lambda pair: pair[0])
+        return {
+            "id": int(doc_id),
+            "group": group,
+            "parts": len(pieces) or parts,
+            "content": "".join(text for _, text in pieces),
+        }
 
 
 def _existing_contents() -> set[str]:

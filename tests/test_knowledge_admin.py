@@ -832,12 +832,70 @@ def test_get_document_group_returns_joined_content(monkeypatch):
         "id": 2,
         "group": "g",
         "parts": 3,
-        "content": "第一段\n第二段\n第三段",
+        "content": "第一段第二段第三段",
     }
     single = knowledge_admin.get_document_group(4)
     assert single == {"id": 4, "group": "", "parts": 1, "content": "普通片段"}
     assert knowledge_admin.get_document_group(99) is None
     print("✓ 整组文档回填（按 part 拼接 / 单条 / 不存在）")
+
+
+def test_document_group_at_size_limit_roundtrip(monkeypatch):
+    """恰好 20000 字的整组文档：回填长度不超上限、备份可完整还原。"""
+    from pathlib import Path
+
+    # 独特句子组成的 20000 字文档（避免重复内容被同批去重）
+    base = "".join(f"第{i:05d}段验证内容。" for i in range(3000))
+    text = base[:20000]
+    parts = [text[index : index + 400] for index in range(0, len(text), 400)]
+    rows = [
+        {
+            "id": index + 1,
+            "content": part,
+            "metadata": json.dumps(
+                {
+                    "part": str(index + 1),
+                    "parts": str(len(parts)),
+                    "group": "g-limit",
+                }
+            ),
+        }
+        for index, part in enumerate(parts)
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    grouped = knowledge_admin.get_document_group(1)
+    assert grouped["parts"] == len(parts)
+    assert len(grouped["content"]) == 20000, "回填不能因拼接分隔符超出上限"
+
+    # 备份还原：整篇仍是 20000 字，不应触发还原上限错误
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    exported = [
+        {"content": row["content"], "metadata": json.loads(row["metadata"])}
+        for row in rows
+    ]
+    result = knowledge_admin.import_documents(exported)
+    assert result["imported"] >= 1
+    assert agent.calls, "20000 字整组备份应能还原"
+    restored = "".join(doc["content"] for doc in agent.calls[0])
+    assert restored == text, "还原后的整篇内容必须完整（不截断、不丢分隔）"
+    print("✓ 上限大小整组文档可回填、可还原")
 
 
 def test_delete_document_whole_group(monkeypatch):
@@ -976,6 +1034,7 @@ if __name__ == "__main__":
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_raises,
         test_get_document_group_returns_joined_content,
+        test_document_group_at_size_limit_roundtrip,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,

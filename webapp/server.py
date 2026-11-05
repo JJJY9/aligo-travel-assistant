@@ -417,6 +417,22 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
 
     content: str = Field(min_length=1, max_length=20000)
 
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def _drop_derived_chunk_keys(cls, value: object) -> object:
+        """丢弃回传的派生分片元数据（part/parts/group）。
+
+        面板整份编辑会把读到的完整 metadata 原样提交；这些派生键由服务端
+        按新分片重写，先丢弃再校验，避免 8+ 用户键的记录因 11 个键被 422。
+        """
+        if isinstance(value, dict):
+            return {
+                key: item
+                for key, item in value.items()
+                if key not in {"part", "parts", "group"}
+            }
+        return value
+
 
 class KnowledgeImportPayload(BaseModel):
     """批量导入知识片段（单次最多 200 条）。
