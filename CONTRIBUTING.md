@@ -62,11 +62,24 @@ pip install pre-commit && pre-commit install
 
 推送 `v*` 标签会触发 `.github/workflows/release.yml`：自动构建 sdist/wheel 并创建 GitHub Release。
 
+发布前检查清单：
+
+1. 同步版本号（`python cli.py doctor` 会检查 `pyproject.toml` 与 `utils/version.py` 是否一致）：
+   - `pyproject.toml` 的 `version`
+   - `utils/version.py` 的 `APP_VERSION`
+   - `webapp/static/index.html` 中静态资源引用 `?v=` 查询参数（避免浏览器继续用旧缓存）
+   - README 安装示例中的 wheel 文件名
+2. 把 `CHANGELOG.md` 的 `[Unreleased]` 整理为 `[x.y.z] - 日期`，必要时用中文精选说明替换自动生成的 Release notes
+3. 本地检查通过：`ruff check .`、`mypy .`、`pytest tests/ -q`、`python cli.py doctor`
+4. 合并版本 PR 后，在 `main` 上创建 annotated tag 并推送：
+
 ```bash
-git tag v1.0.1 && git push origin v1.0.1
+git tag -a v1.0.1 -m "v1.0.1: 简要说明"
+git push origin v1.0.1
 ```
 
-发布前请同步更新 `CHANGELOG.md`。
+5. 确认 Release workflow 成功、wheel / sdist 资产可下载；建议在全新虚拟环境安装 wheel 后做一次冒烟（`aligo-web --version`、`/api/health` 的 `skills.count`、静态页面）
+6. 如果发布后发现问题（如 wheel 缺文件），保留原 tag / Release，在 Release 说明中标注替代版本；不要重写已发布的标签
 
 ## 敏感信息
 
