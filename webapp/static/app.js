@@ -71,6 +71,7 @@ const state = {
   archivedCount: 0,
   archivedMatches: 0,
   sessionsLoading: false,
+  sessionLoading: false,
 };
 
 function isValidId(value) {
@@ -134,6 +135,7 @@ const els = {
   memorySheet: byId("memorySheet"),
   closeMemory: byId("closeMemory"),
   saveUser: byId("saveUser"),
+  kbExport: byId("kbExport"),
   exportData: byId("exportData"),
   exportDataMd: byId("exportDataMd"),
   exportSessions: byId("exportSessions"),
@@ -248,7 +250,13 @@ function highlightSnippet(text, query) {
 
 function clampText(text, max) {
   const value = String(text || "").trim();
-  return value.length > max ? `${value.slice(0, max)}…` : value;
+  const chars = Array.from(value);
+  return chars.length > max ? `${chars.slice(0, max).join("")}…` : value;
+}
+
+function sliceCodePoints(text, max) {
+  const chars = Array.from(String(text || ""));
+  return chars.length > max ? `${chars.slice(0, max).join("")}…` : String(text || "");
 }
 
 function clockNow() {
@@ -328,13 +336,22 @@ async function errorMessage(response) {
    因此不会执行任何 HTML / 脚本。 */
 
 function renderInline(raw) {
-  return escapeHtml(raw)
+  // 行内代码先抽出为占位符：代码里的链接 / ** 不能被当作 Markdown 处理
+  const codeSpans = [];
+  let text = escapeHtml(raw).replace(/`([^`]+)`/g, (_, code) => {
+    codeSpans.push(code);
+    return `${codeSpans.length - 1}`;
+  });
+  text = text
+    // URL 允许一层嵌套括号（维基百科 / Microsoft Learn 等常见）
     .replace(
-      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      /\[([^\]]+)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
     )
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  return text.replace(/(\d+)/g, (_, index) => {
+    return `<code>${codeSpans[Number(index)] ?? ""}</code>`;
+  });
 }
 
 function splitTableRow(line) {
@@ -802,6 +819,15 @@ async function deleteLastTurn(expect) {
   return Boolean(result && result.mismatch);
 }
 
+async function retryFailed(node, text) {
+  if (state.busy) return;
+  trimRegenButtons();
+  // 失败可能发生在提问写入历史之前：只重发，不删服务端上一轮，
+  // 避免误删已保存的问答（最多产生一条重复提问，可接受）
+  node.remove();
+  await sendMessage(text, { echo: false });
+}
+
 async function regenerate(node, text) {
   if (state.busy) return;
   trimRegenButtons();
@@ -892,13 +918,44 @@ function addFollowUps(node, agents) {
   node.appendChild(row);
 }
 
+async function downloadFromApi(url, fallbackName) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(await errorMessage(response));
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+    let filename = fallbackName;
+    if (match) {
+      try {
+        filename = decodeURIComponent(match[1]);
+      } catch {
+        filename = match[1];
+      }
+    }
+    const link = document.createElement("a");
+    const objectUrl = URL.createObjectURL(blob);
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  } catch (error) {
+    // 接口可能返回 400/404/409/503 JSON：不能把错误页当成文件下载
+    toast(`下载失败：${error.message}`);
+  }
+}
+
 function triggerExport() {
   if (!state.sessionId) return;
-  window.open(
+  downloadFromApi(
     `/api/sessions/${encodeURIComponent(state.sessionId)}/export?user_id=${encodeURIComponent(
       state.userId,
     )}`,
-    "_blank",
+    `aligo_${state.sessionId}.md`,
   );
 }
 
@@ -1005,12 +1062,10 @@ async function addTrip(event) {
 }
 
 function exportSafeName(text) {
-  return (
-    String(text || "aligo")
-      .replace(/[\\/:*?"<>|\s]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 40) || "aligo"
-  );
+  const cleaned = String(text || "aligo")
+    .replace(/[\\/:*?"<>|\s]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return Array.from(cleaned).slice(0, 40).join("") || "aligo";
 }
 
 function buildExportHtml(title, bodyHtml) {
@@ -1306,8 +1361,7 @@ function createAssistantMessage(regenText = "") {
     foot.hidden = false;
     foot.innerHTML = "";
     if (regenText) {
-      const retry = chipButton("refresh", "重试", () => regenerate(root, regenText));
-      retry.dataset.action = "regen";
+      const retry = chipButton("refresh", "重试", () => retryFailed(root, regenText));
       foot.appendChild(retry);
     }
   }
@@ -1363,6 +1417,7 @@ function newSession() {
     return;
   }
   sessionLoadToken += 1;
+  state.sessionLoading = false;
   state.sessionId = null;
   sessionStorage.removeItem("aligo.sessionId");
   syncSessionControls();
@@ -1674,10 +1729,20 @@ async function loadSessions(query = state.searchQuery, options = {}) {
         archivedMatches = 0;
       }
     }
-  } catch {
+  } catch (error) {
     if (requestId !== sessionsRequestId) return;
-    state.sessions = [];
-    state.sessionTotal = 0;
+    state.sessionsLoading = false;
+    // 存储故障 / 网络抖动不能伪装成「没有历史」：保留已有列表并提示
+    toast(`加载会话列表失败：${error.message || error}`);
+    if (!state.sessions.length) {
+      state.sessionTotal = 0;
+      state.archivedMatches = 0;
+      els.history.innerHTML =
+        '<div class="history-empty">加载会话列表失败，请稍后重试</div>';
+      return;
+    }
+    renderHistory();
+    return;
   }
   if (requestId !== sessionsRequestId) return;
   state.sessionsLoading = false;
@@ -1722,6 +1787,7 @@ async function openSession(sessionId, options = {}) {
     return;
   }
   const token = ++sessionLoadToken;
+  state.sessionLoading = true;
   try {
     const data = await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
@@ -1787,6 +1853,8 @@ async function openSession(sessionId, options = {}) {
       syncSessionControls();
       showWelcome();
     }
+  } finally {
+    if (token === sessionLoadToken) state.sessionLoading = false;
   }
 }
 
@@ -1859,6 +1927,7 @@ async function deleteSession(sessionId) {
   // 作废进行中的会话加载：否则删除后晚到的 GET 会把已删除的会话重新渲染出来，
   // 后续消息还会以同一 session_id 复活它
   sessionLoadToken += 1;
+  state.sessionLoading = false;
   try {
     await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
@@ -1889,6 +1958,11 @@ function setBusy(busy) {
 async function sendMessage(text, options = {}) {
   const message = String(text || "").trim();
   if (!message || state.busy) return;
+  if (state.sessionLoading) {
+    toast("会话正在加载，请稍候");
+    return;
+  }
+  const draft = els.input.value;
 
   cancelPendingEdits();
   sessionLoadToken += 1;
@@ -1906,13 +1980,17 @@ async function sendMessage(text, options = {}) {
   }, true);
   // 生成期间不保留上一条消息的编辑入口（结束后由 refreshEditButtons 移动到新提问）
   els.messages.querySelectorAll(".user-edit").forEach((node) => node.remove());
-  els.input.value = "";
-  resizeInput();
+  // 按钮触发的发送（重新生成 / 追问 / 欢迎示例）不应丢掉正在输入的草稿
+  if (draft.trim() === message) {
+    els.input.value = "";
+    resizeInput();
+  }
 
   const assistant = createAssistantMessage(message);
   assistant.trace.start();
   mutate(() => els.messages.appendChild(assistant.root), true);
 
+  let terminal = null;
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
@@ -1927,15 +2005,23 @@ async function sendMessage(text, options = {}) {
     if (!response.ok) {
       throw new Error(await errorMessage(response));
     }
-    await readEventStream(response.body, (event) => handleStreamEvent(assistant, event));
-    els.health.className = "health ok";
+    await readEventStream(response.body, (event) => {
+      // 已收到 done / error 后忽略后续事件：连接错误不能覆盖已完成的回答
+      if (terminal) return;
+      if (event.type === "done" || event.type === "error") terminal = event.type;
+      handleStreamEvent(assistant, event);
+    });
+    if (!terminal) {
+      throw new Error("连接意外中断，回答可能不完整");
+    }
+    els.health.className = terminal === "error" ? "health err" : "health ok";
   } catch (error) {
     if (error.name === "AbortError") {
       mutate(() => {
         assistant.trace.fail("已停止");
         assistant.fail("已停止生成。");
       });
-    } else {
+    } else if (!terminal) {
       mutate(() => {
         assistant.trace.fail(error.message || "请求失败");
         assistant.fail(error.message || "请求失败，请稍后再试。");
@@ -1949,21 +2035,18 @@ async function sendMessage(text, options = {}) {
     // 只保留最新一条回答的「重新生成」：旧按钮对应的已不是最后一轮，
     // 点击只会触发 mismatch，甚至在外层历史中插入重复问答
     trimRegenButtons();
-    const panelOpen = isModalOpen();
-    if (!panelOpen) {
-      // 用户正在侧栏重命名等输入框里操作时不抢焦点
-      const active = document.activeElement;
-      const editing =
-        active &&
-        active !== els.input &&
-        (active.tagName === "INPUT" ||
-          active.tagName === "TEXTAREA" ||
-          active.tagName === "SELECT" ||
-          active.isContentEditable);
-      if (!editing) els.input.focus();
-      if (!document.querySelector(".hi-input")) await loadSessions();
-      refreshStatus();
-    }
+    // 弹层打开时只不抢焦点，会话列表与状态仍要刷新（新会话需出现在侧栏）
+    const active = document.activeElement;
+    const editing =
+      active &&
+      active !== els.input &&
+      (active.tagName === "INPUT" ||
+        active.tagName === "TEXTAREA" ||
+        active.tagName === "SELECT" ||
+        active.isContentEditable);
+    if (!isModalOpen() && !editing) els.input.focus();
+    if (!document.querySelector(".hi-input")) await loadSessions();
+    refreshStatus();
   }
 }
 
@@ -2046,12 +2129,23 @@ function handleStreamEvent(assistant, event) {
       }, true);
       break;
     }
-    case "error":
+    case "error": {
+      const message = event.message || "处理失败";
+      // 会话在其它标签页 / CLI 被删除后，继续用旧 id 发送只会反复失败，
+      // 墓碑过期后还会复活该会话；这里直接切回新对话状态
+      if (message.includes("会话已删除")) {
+        state.sessionId = null;
+        sessionStorage.removeItem("aligo.sessionId");
+        syncSessionControls();
+        setConversationTitle("新对话");
+        toast("会话已被删除，下一条消息将开始新对话");
+      }
       mutate(() => {
-        assistant.trace.fail(event.message || "处理失败");
-        assistant.fail(event.message || "处理失败，请稍后再试。");
+        assistant.trace.fail(message);
+        assistant.fail(message);
       });
       break;
+    }
     default:
       break;
   }
@@ -2159,19 +2253,22 @@ async function refreshStatus() {
     if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = data;
     if (state.tripsExpanded && Number(data.trip_count || 0) > 0) {
+      const tripRequestId = (tripsRequestId += 1);
       try {
         const tripsData = await getJSON(
           `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc`,
         );
         if (requestId !== statusRequestId || userId !== state.userId) return;
+        if (tripRequestId !== tripsRequestId) return;
         state.tripsAll = tripsData.trips || [];
         state.tripsAllTotal = Number(tripsData.total || state.tripsAll.length);
-      } catch {
+      } catch (error) {
         if (requestId !== statusRequestId || userId !== state.userId) return;
-        state.tripsAll = [];
-        state.tripsAllTotal = 0;
+        // 保留旧列表：接口短暂失败不应把已展示的行程清空
+        toast(`加载行程列表失败：${error.message || error}`);
       }
     } else if (!data.trip_count) {
+      tripsRequestId += 1;
       state.tripsExpanded = false;
       state.tripsAll = [];
       state.tripsAllTotal = 0;
@@ -2219,7 +2316,7 @@ function renderOverview() {
       label.textContent = PREF_NAMES[key] || key;
       const val = document.createElement("span");
       val.className = "pref-value";
-      val.textContent = Array.isArray(value) ? value.join("、") : String(value);
+      val.textContent = formatPreferenceValue(value);
 
       const actions = document.createElement("span");
       actions.className = "pref-actions";
@@ -2359,11 +2456,11 @@ function renderOverview() {
       calendar.innerHTML = icon("calendar");
       calendar.addEventListener("click", (event) => {
         event.stopPropagation();
-        window.open(
+        downloadFromApi(
           `/api/trips/${encodeURIComponent(trip.trip_id)}/calendar?user_id=${encodeURIComponent(
             state.userId,
           )}`,
-          "_blank",
+          `aligo_${trip.trip_id}.ics`,
         );
       });
 
@@ -2742,6 +2839,18 @@ async function addPreference(event) {
   }
 }
 
+function formatPreferenceValue(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) =>
+        item !== null && typeof item === "object" ? JSON.stringify(item) : String(item),
+      )
+      .join("、");
+  }
+  if (value !== null && typeof value === "object") return JSON.stringify(value);
+  return String(value ?? "");
+}
+
 function preferenceInputValue(value) {
   if (Array.isArray(value)) return value.join("、");
   if (value !== null && typeof value === "object") return JSON.stringify(value);
@@ -3072,17 +3181,21 @@ function updateKnowledgeMore() {
 
 function knowledgePreview(content, query) {
   const text = String(content || "");
+  const chars = Array.from(text);
   const needle = String(query || "").trim();
   if (!needle) {
-    return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+    return sliceCodePoints(text, 140);
   }
   const index = text.toLowerCase().indexOf(needle.toLowerCase());
   if (index < 0) {
-    return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+    return sliceCodePoints(text, 140);
   }
-  const start = Math.max(0, index - 48);
-  const end = Math.min(text.length, start + 140);
-  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+  // UTF-16 下标换算成码点下标，避免窗口边界劈开 emoji 代理对
+  const startIndex = Math.max(0, Array.from(text.slice(0, index)).length - 48);
+  const end = Math.min(chars.length, startIndex + 140);
+  return `${startIndex > 0 ? "…" : ""}${chars.slice(startIndex, end).join("")}${
+    end < chars.length ? "…" : ""
+  }`;
 }
 
 function renderKnowledgeDocuments(items, append) {
@@ -3258,8 +3371,7 @@ function renderSemanticResults(query, results) {  els.kbList.innerHTML = "";
     const text = document.createElement("div");
     text.className = "kb-text";
     const content = String(doc.content || "");
-    const preview =
-      content.length > 160 ? `${content.slice(0, 160)}…` : content;
+    const preview = sliceCodePoints(content, 160);
     text.innerHTML = highlightSnippet(preview, query);
     const meta = document.createElement("div");
     meta.className = "kb-meta";
@@ -3771,18 +3883,21 @@ function bindEvents() {
   });
   els.saveUser.addEventListener("click", saveUser);
   els.exportData.addEventListener("click", () => {
-    window.open(`/api/export?user_id=${encodeURIComponent(state.userId)}`, "_blank");
+    downloadFromApi(
+      `/api/export?user_id=${encodeURIComponent(state.userId)}`,
+      `aligo_${exportSafeName(state.userId)}.json`,
+    );
   });
   els.exportDataMd.addEventListener("click", () => {
-    window.open(
+    downloadFromApi(
       `/api/export?user_id=${encodeURIComponent(state.userId)}&format=md`,
-      "_blank",
+      `aligo_${exportSafeName(state.userId)}.md`,
     );
   });
   els.exportSessions.addEventListener("click", () => {
-    window.open(
+    downloadFromApi(
       `/api/sessions/export?user_id=${encodeURIComponent(state.userId)}`,
-      "_blank",
+      `aligo_sessions_${exportSafeName(state.userId)}.md`,
     );
   });
 
@@ -3818,17 +3933,23 @@ function bindEvents() {
   els.exportChat.addEventListener("click", triggerExport);
   els.exportHtml.addEventListener("click", exportSessionHtml);
   els.exportTrips.addEventListener("click", () => {
-    window.open(
+    downloadFromApi(
       `/api/trips/calendar?user_id=${encodeURIComponent(state.userId)}`,
-      "_blank",
+      "aligo_trips.ics",
     );
   });
   els.exportTripsCsv.addEventListener("click", () => {
-    window.open(
+    downloadFromApi(
       `/api/trips/export?user_id=${encodeURIComponent(state.userId)}`,
-      "_blank",
+      "aligo_trips.csv",
     );
   });
+  if (els.kbExport) {
+    els.kbExport.addEventListener("click", (event) => {
+      event.preventDefault();
+      downloadFromApi("/api/knowledge/export", "aligo-knowledge.json");
+    });
+  }
   els.addPrefBtn.addEventListener("click", () => {
     els.prefForm.hidden = !els.prefForm.hidden;
     if (!els.prefForm.hidden) els.prefValue.focus();

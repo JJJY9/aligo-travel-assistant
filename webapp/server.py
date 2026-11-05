@@ -102,6 +102,8 @@ def _is_loopback_host(host: str) -> bool:
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
+# 偏好类型可由模型 / 面板自定义（可能含空格等），只限制长度与非空
+_PREF_TYPE_PATTERN = r"^[^/]{1,64}$"
 # 会话删除墓碑在 Redis 中的 key 前缀（配置 REDIS_URL 时跨实例共享）
 _DELETED_KEY_PREFIX = "aligo:deleted"
 
@@ -999,19 +1001,45 @@ def _message_search_text(message: dict[str, Any]) -> str:
     return str(message.get("content", ""))
 
 
+_MARKDOWN_SNIPPET_PREFIX = re.compile(
+    r"^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)"
+)
+_MARKDOWN_TABLE_SEPARATOR = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+
+
+def _strip_markdown_for_snippet(text: str) -> str:
+    """去掉常见 Markdown 记号（标题 / 列表 / 表格 / 引用 / 强调），供搜索预览使用。"""
+    lines: list[str] = []
+    for line in str(text).splitlines():
+        line = _MARKDOWN_SNIPPET_PREFIX.sub("", line)
+        if _MARKDOWN_TABLE_SEPARATOR.fullmatch(line):
+            continue
+        if line.lstrip().startswith("|"):
+            line = line.replace("|", " ")
+        lines.append(line)
+    cleaned = " ".join(" ".join(lines).split())
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", cleaned)
+    cleaned = re.sub(r"\*\*|__|~~|`", "", cleaned)
+    return cleaned.strip()
+
+
 def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     """截取命中位置附近的片段（用于会话搜索结果的预览）。"""
-    index = text.lower().find(needle)
+    cleaned = _strip_markdown_for_snippet(text)
+    index = cleaned.lower().find(needle)
+    if index < 0:
+        # 关键字本身含被剥离的记号时回退到原文匹配
+        cleaned = " ".join(str(text).split())
+        index = cleaned.lower().find(needle)
     if index < 0:
         return ""
     start = max(0, index - radius)
-    end = min(len(text), index + len(needle) + radius)
-    snippet = " ".join(text[start:end].split())
-    # 片段来自 Markdown 渲染结果，去掉常见标记让预览更干净
-    snippet = snippet.replace("**", "").replace("`", "")
+    end = min(len(cleaned), index + len(needle) + radius)
+    snippet = " ".join(cleaned[start:end].split())
     if start > 0:
         snippet = "…" + snippet
-    if end < len(text):
+    if end < len(cleaned):
         snippet += "…"
     return snippet
 
@@ -1727,7 +1755,7 @@ def create_app(model: Any = None) -> FastAPI:
     @app.put("/api/preferences/{pref_type}")
     def update_preference(
         payload: PreferencePayload,
-        pref_type: str = ApiPath(..., pattern=_ID_PATTERN),
+        pref_type: str = ApiPath(..., pattern=_PREF_TYPE_PATTERN),
     ) -> dict[str, Any]:
         """新增或覆盖一条用户偏好（记忆面板的手动维护入口）。"""
         store = _open_long_term(payload.user_id)
@@ -1743,7 +1771,7 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.delete("/api/preferences/{pref_type}")
     def delete_preference(
-        pref_type: str = ApiPath(..., pattern=_ID_PATTERN),
+        pref_type: str = ApiPath(..., pattern=_PREF_TYPE_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         store = _open_long_term(user_id)
