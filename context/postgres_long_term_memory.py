@@ -100,6 +100,7 @@ class PostgresLongTermMemory:
         self.user_id = user_id
         self.dsn = dsn
         self._conn = psycopg.connect(dsn, autocommit=True, connect_timeout=3)
+        self._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
         self._ensure_schema()
         logger.info("PostgreSQL long-term memory initialized for user: %s", user_id)
 
@@ -118,18 +119,45 @@ class PostgresLongTermMemory:
                 logger.warning("无法创建 trip_id 唯一索引: %s", exc)
 
     def _execute(self, sql: str, params: tuple | None = None) -> None:
-        with self._conn.cursor() as cursor:
-            cursor.execute(sql, params)
+        def run() -> None:
+            with self._conn.cursor() as cursor:
+                cursor.execute(sql, params)
+
+        self._run_with_retry(run)
 
     def _fetchall(self, sql: str, params: tuple | None = None) -> list[tuple]:
-        with self._conn.cursor() as cursor:
-            cursor.execute(sql, params)
-            return cursor.fetchall()
+        def run() -> list[tuple]:
+            with self._conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                return cursor.fetchall()
+
+        return self._run_with_retry(run)
 
     def _fetchone(self, sql: str, params: tuple | None = None):
-        with self._conn.cursor() as cursor:
-            cursor.execute(sql, params)
-            return cursor.fetchone()
+        def run():
+            with self._conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                return cursor.fetchone()
+
+        return self._run_with_retry(run)
+
+    def _reconnect(self) -> None:
+        """连接失效（数据库重启 / 被服务端终止）时重建连接并确保表结构。"""
+        import psycopg
+
+        with contextlib.suppress(Exception):
+            self._conn.close()
+        self._conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=3)
+        self._ensure_schema()
+        logger.info("PostgreSQL 连接已重建（user=%s）", self.user_id)
+
+    def _run_with_retry(self, operation):
+        """执行一次数据库操作；连接级错误时重连并重试一次。"""
+        try:
+            return operation()
+        except self._retry_errors:
+            self._reconnect()
+            return operation()
 
     @staticmethod
     def _json(value: Any) -> Any:
@@ -137,18 +165,32 @@ class PostgresLongTermMemory:
 
         return Json(value)
 
+    @contextlib.contextmanager
+    def _preference_lock(self, pref_type: str):
+        """同一用户同一偏好类型的读改写跨会话串行（会话级 advisory lock，可重入）。"""
+        lock_name = f"aligo-pref-{self.user_id}-{pref_type}"
+        self._execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
+        try:
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                self._execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,)
+                )
+
     # ---------- 偏好 ----------
 
     def save_preference(self, pref_type: str, value: Any) -> None:
-        self._execute(
-            """
-            INSERT INTO aligo_preferences (user_id, pref_type, value)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id, pref_type)
-            DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-            """,
-            (self.user_id, pref_type, self._json(value)),
-        )
+        with self._preference_lock(pref_type):
+            self._execute(
+                """
+                INSERT INTO aligo_preferences (user_id, pref_type, value)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, pref_type)
+                DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+                """,
+                (self.user_id, pref_type, self._json(value)),
+            )
 
     def get_preference(self, pref_type: str | None = None) -> Any:
         if pref_type is None:
@@ -165,12 +207,17 @@ class PostgresLongTermMemory:
 
     def delete_preference(self, pref_type: str) -> bool:
         """删除指定类型的偏好，返回是否确实删除。"""
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM aligo_preferences WHERE user_id = %s AND pref_type = %s",
-                (self.user_id, pref_type),
-            )
-            removed = cursor.rowcount or 0
+
+        def run() -> int:
+            with self._conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM aligo_preferences WHERE user_id = %s AND pref_type = %s",
+                    (self.user_id, pref_type),
+                )
+                return cursor.rowcount or 0
+
+        with self._preference_lock(pref_type):
+            removed = self._run_with_retry(run)
         if removed:
             logger.info("Deleted preference from PostgreSQL: %s", pref_type)
         return bool(removed)
@@ -181,23 +228,11 @@ class PostgresLongTermMemory:
         用会话级 advisory lock 包住「读 + 写」，避免与本轮 LLM 调用期间
         用户在记忆面板修改同一类型偏好互相覆盖。
         """
-        lock_name = f"aligo-pref-{self.user_id}-{pref_type}"
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
-            )
-        try:
+        with self._preference_lock(pref_type):
             current = self.get_preference(pref_type)
             merged = merge_preference_value(current, value)
             self.save_preference(pref_type, merged)
             return merged
-        finally:
-            with contextlib.suppress(Exception):
-                with self._conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
-                        (lock_name,),
-                    )
 
     def add_hotel_brand(self, brand: str) -> None:
         current = self.get_preference("hotel_brands")
@@ -258,24 +293,33 @@ class PostgresLongTermMemory:
 
     def delete_chat_session(self, session_id: str) -> int:
         """删除某个会话的全部聊天记录与元数据（单事务），返回删除条数。"""
-        with self._conn.transaction(), self._conn.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM aligo_chat_messages WHERE user_id = %s AND session_id = %s",
-                (self.user_id, session_id),
-            )
-            removed = cursor.rowcount or 0
-            cursor.execute(
-                "DELETE FROM aligo_session_titles WHERE user_id = %s AND session_id = %s",
-                (self.user_id, session_id),
-            )
-            cursor.execute(
-                "DELETE FROM aligo_pinned_sessions WHERE user_id = %s AND session_id = %s",
-                (self.user_id, session_id),
-            )
-            cursor.execute(
-                "DELETE FROM aligo_archived_sessions WHERE user_id = %s AND session_id = %s",
-                (self.user_id, session_id),
-            )
+
+        def run() -> int:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM aligo_chat_messages "
+                    "WHERE user_id = %s AND session_id = %s",
+                    (self.user_id, session_id),
+                )
+                removed = cursor.rowcount or 0
+                cursor.execute(
+                    "DELETE FROM aligo_session_titles "
+                    "WHERE user_id = %s AND session_id = %s",
+                    (self.user_id, session_id),
+                )
+                cursor.execute(
+                    "DELETE FROM aligo_pinned_sessions "
+                    "WHERE user_id = %s AND session_id = %s",
+                    (self.user_id, session_id),
+                )
+                cursor.execute(
+                    "DELETE FROM aligo_archived_sessions "
+                    "WHERE user_id = %s AND session_id = %s",
+                    (self.user_id, session_id),
+                )
+                return removed
+
+        removed = self._run_with_retry(run)
         if removed:
             logger.info(
                 "Deleted chat session from PostgreSQL: %s (%s messages)", session_id, removed
@@ -309,17 +353,20 @@ class PostgresLongTermMemory:
                     "Skip deleting last turn of session %s: content mismatch", session_id
                 )
                 return 0
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM aligo_chat_messages "
-                "WHERE user_id = %s AND id = ANY(%s) "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM aligo_chat_messages "
-                "  WHERE user_id = %s AND session_id = %s AND id > %s"
-                ")",
-                (self.user_id, ids, self.user_id, session_id, rows[0][0]),
-            )
-            removed = cursor.rowcount or 0
+        def _delete_rows() -> int:
+            with self._conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM aligo_chat_messages "
+                    "WHERE user_id = %s AND id = ANY(%s) "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM aligo_chat_messages "
+                    "  WHERE user_id = %s AND session_id = %s AND id > %s"
+                    ")",
+                    (self.user_id, ids, self.user_id, session_id, rows[0][0]),
+                )
+                return cursor.rowcount or 0
+
+        removed = self._run_with_retry(_delete_rows)
         if removed:
             # 会话消息已被删空时同步清理归档标记，避免幽灵归档
             self._execute(
@@ -453,19 +500,14 @@ class PostgresLongTermMemory:
         destination = trip_info.get("destination")
         # 会话级 advisory lock：多线程 / 多进程同时写入同一用户时串行生成 trip_N
         lock_name = f"aligo-trip-{self.user_id}"
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
-            )
+        self._execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
         try:
             return self._save_trip_history_locked(trip_info, purpose, destination)
         finally:
             with contextlib.suppress(Exception):
-                with self._conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
-                        (lock_name,),
-                    )
+                self._execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,)
+                )
 
     def _save_trip_history_locked(
         self,

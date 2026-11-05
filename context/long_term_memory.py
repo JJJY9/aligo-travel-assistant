@@ -185,12 +185,15 @@ class LongTermMemory:
             data["archived_sessions"] = []
         if "trip_history" not in data:
             data["trip_history"] = []
-        if "statistics" not in data:
+        if not isinstance(data.get("statistics"), dict):
             data["statistics"] = {}
-        if "total_messages" not in data.get("statistics", {}):
-            data["statistics"]["total_messages"] = 0
-        if "total_queries" not in data.get("statistics", {}):
-            data["statistics"]["total_queries"] = 0
+        stats = data["statistics"]
+        stats.setdefault("total_messages", 0)
+        stats.setdefault("total_queries", 0)
+        stats.setdefault("total_trips", 0)
+        if not isinstance(stats.get("frequent_destinations"), dict):
+            stats["frequent_destinations"] = {}
+        stats.setdefault("last_trip_number", 0)
         if "preferences" not in data:
             data["preferences"] = []
 
@@ -199,6 +202,15 @@ class LongTermMemory:
         for list_key in ("chat_history", "trip_history"):
             if not isinstance(data.get(list_key), list):
                 data[list_key] = []
+                continue
+            cleaned = [item for item in data[list_key] if isinstance(item, dict)]
+            if len(cleaned) != len(data[list_key]):
+                logger.warning(
+                    "丢弃 %s 中 %d 条非对象记录",
+                    list_key,
+                    len(data[list_key]) - len(cleaned),
+                )
+            data[list_key] = cleaned
         if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []
 
@@ -265,15 +277,16 @@ class LongTermMemory:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(self.data, handle, ensure_ascii=False, indent=2)
                 # Windows 上另一个进程短暂打开数据文件时 os.replace 会报
-                # PermissionError / WinError 5；读句柄通常毫秒级释放，重试几次
-                for attempt in range(4):
+                # PermissionError / WinError 5；大文件读取可能持续数百毫秒，
+                # 重试到约 500ms 再放弃
+                for attempt in range(10):
                     try:
                         os.replace(temp_path, self.db_path)
                         break
                     except OSError:
-                        if attempt == 3:
+                        if attempt == 9:
                             raise
-                        time.sleep(0.02)
+                        time.sleep(0.05)
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
