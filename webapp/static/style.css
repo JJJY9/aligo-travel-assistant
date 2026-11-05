@@ -248,6 +248,15 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-size: 11px;
   color: var(--sidebar-muted);
 }
+.upcoming-weather {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--sidebar-muted);
+}
 
 .history {
   flex: 1;

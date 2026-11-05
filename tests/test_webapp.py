@@ -114,6 +114,39 @@ def test_health_reports_any_degraded_limiter():
     print("✓ 任一限流桶降级都会上报 degraded")
 
 
+def test_weather_api(monkeypatch):
+    from utils.weather import WeatherError
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "fetch_weather",
+        lambda city: {
+            "city": city,
+            "current": {"description": "晴", "temperature": 12},
+            "daily": [],
+        },
+    )
+    client = _client()
+    data = client.get("/api/weather", params={"city": "北京"}).json()
+    assert data["city"] == "北京" and data["current"]["description"] == "晴"
+
+    assert client.get("/api/weather", params={"city": "   "}).status_code == 422
+
+    def missing(city):
+        raise WeatherError(f"未找到城市「{city}」")
+
+    monkeypatch.setattr(server_module, "fetch_weather", missing)
+    assert client.get("/api/weather", params={"city": "不存在"}).status_code == 404
+
+    def unavailable(city):
+        raise WeatherError("天气接口暂时不可用")
+
+    monkeypatch.setattr(server_module, "fetch_weather", unavailable)
+    assert client.get("/api/weather", params={"city": "北京"}).status_code == 503
+    print("✓ /api/weather 天气查询（成功 / 422 / 404 / 503）")
+
+
 def test_status_endpoint():
     response = _client().get("/api/status", params={"user_id": "web_test_missing"})
     assert response.status_code == 200
