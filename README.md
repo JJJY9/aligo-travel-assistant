@@ -630,12 +630,13 @@ pytest tests/ -q
 |------|------|
 | Web API / SSE / 会话 / 导出 / 知识库接口 / 自检 | `test_webapp.py` |
 | 编排调度与记忆更新 | `test_orchestration_unit.py`、`test_orchestration.py` |
-| 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py`、`test_webapp_postgres.py`、`test_webapp_redis.py`、`test_cli_postgres_integration.py` |
+| 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py`、`test_webapp_postgres.py`、`test_webapp_redis.py`、`test_cli_postgres_integration.py`、`test_long_term_memory_lock.py`（跨进程写锁） |
 | 知识库维护与状态 | `test_knowledge_admin*.py`、`test_knowledge_stats.py` |
-| 检索评测与 CLI 退出码 | `test_rag_eval.py`、`test_cli_eval.py` |
+| 检索评测与 CLI 退出码 | `test_rag_eval.py`、`test_cli_eval.py`（含 `--json`） |
+| CLI 一次性命令与 JSON 输出 | `test_cli_skills.py`、`test_cli_json.py`、`test_doctor.py` |
 | CLI 知识库 / 行程 / 会话命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips_dedupe.py`、`test_cli_trips_export.py`、`test_cli_sessions.py` |
 | Milvus 客户端 | `test_milvus_client.py` |
-| 偏好抽取 / 历史消息渲染 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_stored_message.py`、`test_trip_export.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_progress.py` 等 |
+| 偏好抽取 / 历史消息渲染 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_stored_message.py`、`test_trip_export.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_rate_limit_redis.py`、`test_progress.py` 等 |
 
 ### 端到端测试（需要真实大模型）
 
