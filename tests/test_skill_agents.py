@@ -223,6 +223,31 @@ def test_rag_search_top_k_bounds():
     print("✓ search_knowledge top_k 边界")
 
 
+def test_rag_dimension_mismatch_warns(monkeypatch):
+    """集合向量维度与当前嵌入模型不一致时给出告警（否则检索静默为空）。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    check = agent_class._check_embedding_dimension
+    logger = check.__globals__["logger"]
+    warnings = []
+    monkeypatch.setattr(
+        logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args if args else msg),
+    )
+
+    class _Client:
+        def describe_collection(self, name):
+            return {"fields": [{"name": "vector", "params": {"dim": 1024}}]}
+
+    class _Self:
+        collection_name = "kb"
+        embedding_dim = 512
+
+    check(_Self(), _Client())
+    assert any("不一致" in message for message in warnings)
+    print("✓ 知识库向量维度不一致时告警")
+
+
 def test_extract_user_query_fallback():
     payload = '{"context": {"rewritten_query": null, "user_query": "义乌明天天气怎么样"}}'
     assert extract_user_query(payload) == "义乌明天天气怎么样"
@@ -265,6 +290,7 @@ if __name__ == "__main__":
         test_memory_query_formats_falsey_preferences()
         test_memory_query_includes_current_dialogue()
         test_rag_search_top_k_bounds()
+        test_rag_dimension_mismatch_warns(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")
