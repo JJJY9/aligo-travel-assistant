@@ -12,7 +12,7 @@
 - `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否配置 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 - 反向代理部署：设置 `TRUST_PROXY_HEADERS=1` 后限流按 `X-Forwarded-For` 第一个地址计算客户端 IP；默认关闭，避免客户端伪造该头绕过 IP 桶
 - 知识库接口独立限流：写入 / 更新 / 删除 / 导入 / 导出 / 语义检索按客户端 IP 限流（默认 60 次 / 分钟，`KB_RATE_LIMIT` 调整），与对话额度互不影响；配置 Redis 时与其他桶共享后端，`/api/metrics.rate_limit` 增加 `kb_limit`
-- 知识库维护面板新增「检索评测」按钮（`/api/knowledge/eval`）：14 个问题离线计算 hit@1/3/5 与 MRR，不调用大模型，受知识库限流保护
+- 知识库维护面板新增「检索评测」按钮（`/api/knowledge/eval`）：14 个问题离线计算 hit@1/3/5 与 MRR，不调用大模型，受知识库限流保护；hit@5 低于 80% 时结果标红提示
 - 请求指标新增 P50 / P95 耗时（最近 1000 个请求样本，内存有界）与 `duration_samples`；记忆面板运行指标新增「P95 耗时」卡片
 - CLI `doctor` / `skills` 支持 `--json`：`doctor` 输出 `status` / `checks`，`skills` 输出 `root` / `skills` / `ok`，便于监控与脚本读取；非法参数退出码 2
 - CLI `health` / `kb` 也支持 `--json`：`health` 输出 `{"ok", "message"}`，`kb` 输出完整知识库状态对象；非法参数退出码 2

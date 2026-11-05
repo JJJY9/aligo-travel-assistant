@@ -3109,11 +3109,14 @@ async function runKbEval() {
   try {
     const data = await getJSON("/api/knowledge/eval");
     const pct = (value) => `${Math.round(Number(value || 0) * 100)}%`;
+    const hit5 = Number(data.hit5 || 0);
     if (els.kbEvalResult) {
       els.kbEvalResult.textContent =
         `检索评测：${data.total} 个问题 · hit@1 ${pct(data.hit1)}` +
         ` · hit@3 ${pct(data.hit3)} · hit@5 ${pct(data.hit5)}` +
-        ` · MRR ${Number(data.mrr || 0).toFixed(2)}`;
+        ` · MRR ${Number(data.mrr || 0).toFixed(2)}` +
+        (hit5 < 0.8 ? " · 低于 80% 基线" : "");
+      els.kbEvalResult.classList.toggle("warn", hit5 < 0.8);
     }
   } catch (error) {
     if (els.kbEvalResult) els.kbEvalResult.textContent = `评测失败：${error.message}`;
