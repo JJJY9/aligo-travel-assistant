@@ -10,7 +10,11 @@ import time
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.rate_limit import RateLimiter
+from utils.rate_limit import (
+    RateLimiter,
+    RedisRateLimiter,
+    create_rate_limiter,
+)
 
 
 def test_window_and_keys():
@@ -74,10 +78,58 @@ def test_peek_does_not_record():
     print("✓ peek 只检查不记录")
 
 
+class _UnavailableRedis:
+    """模拟 Redis 运行中故障：所有命令抛连接错误。"""
+
+    def __init__(self) -> None:
+        self.eval_calls = 0
+
+    def eval(self, *args, **kwargs):
+        self.eval_calls += 1
+        raise ConnectionError("redis down")
+
+    def scan_iter(self, **kwargs):
+        raise ConnectionError("redis down")
+
+    def delete(self, *keys):
+        raise ConnectionError("redis down")
+
+
+def test_redis_limiter_falls_back_when_unavailable():
+    """Redis 故障时回退进程内限流，并在冷却期内不再尝试 Redis。"""
+    client = _UnavailableRedis()
+    limiter = RedisRateLimiter(client, "unit-fallback", limit=2, window_sec=60)
+    assert limiter.check("k") is None
+    assert client.eval_calls == 1
+    assert limiter.check("k") is None
+    assert limiter.check("k") is not None, "回退实现也应执行限流"
+    assert client.eval_calls == 1, "冷却期内不应再次调用 Redis"
+    assert limiter.peek("k") is not None
+    assert limiter.status("k")[0] == 0
+
+    limiter.reset()
+    assert limiter.check("k") is None, "reset 后回退计数清零"
+    assert client.eval_calls == 2, "reset 后应立即重试 Redis"
+    print("✓ Redis 故障回退进程内限流并进入冷却")
+
+
+def test_create_rate_limiter_backends():
+    memory = create_rate_limiter("unit", 1, 60)
+    assert isinstance(memory, RateLimiter)
+    assert memory.backend == "memory"
+
+    shared = create_rate_limiter("unit", 1, 60, redis_client=object())
+    assert isinstance(shared, RedisRateLimiter)
+    assert shared.backend == "redis"
+    print("✓ 限流器工厂按是否提供 Redis 客户端选择后端")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
     test_key_eviction_bounds_memory()
     test_status_reports_remaining()
     test_peek_does_not_record()
+    test_redis_limiter_falls_back_when_unavailable()
+    test_create_rate_limiter_backends()
     print("\n全部通过")

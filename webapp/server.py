@@ -49,6 +49,7 @@ from context.storage import (
     create_long_term_memory,
     create_short_term_memory,
     describe_backends,
+    get_shared_redis_client,
 )
 from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
@@ -66,7 +67,7 @@ from utils.knowledge_admin import (
 )
 from utils.knowledge_stats import knowledge_status
 from utils.metrics import REQUEST_METRICS
-from utils.rate_limit import RateLimiter
+from utils.rate_limit import create_rate_limiter
 from utils.stored_message import render_stored_message
 from utils.session_markdown import render_all_sessions_markdown
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
@@ -499,14 +500,21 @@ class AligoWebApp:
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
-        self.rate_limiter = RateLimiter(
-            limit=RATE_LIMIT_CONFIG.get("chat_requests", 30),
-            window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
+        # 配置 REDIS_URL 且可用时，两个桶都使用 Redis 共享计数，多实例共享额度；
+        # 未配置或 Redis 不可用时回退进程内滑动窗口（单个实例内仍然有效）
+        redis_client = get_shared_redis_client()
+        self.rate_limiter = create_rate_limiter(
+            "user",
+            RATE_LIMIT_CONFIG.get("chat_requests", 30),
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
         )
         # 用户 ID 由请求方提供、可以轮换；再按纯客户端 IP 限流，防止换 ID 绕过
-        self.ip_limiter = RateLimiter(
-            limit=RATE_LIMIT_CONFIG.get("ip_requests", 120),
-            window_sec=RATE_LIMIT_CONFIG.get("window_sec", 60),
+        self.ip_limiter = create_rate_limiter(
+            "ip",
+            RATE_LIMIT_CONFIG.get("ip_requests", 120),
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
         )
 
     @staticmethod
@@ -1076,6 +1084,7 @@ def create_app(model: Any = None) -> FastAPI:
             "model": LLM_CONFIG.get("model_name", ""),
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
             "storage": describe_backends(),
+            "rate_limit": getattr(state.rate_limiter, "backend", "memory"),
             "time": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -1083,7 +1092,7 @@ def create_app(model: Any = None) -> FastAPI:
     def metrics() -> dict[str, Any]:
         """进程内请求指标：请求计数 / 状态分布 / 平均与最大耗时、熔断器状态。
 
-        多进程 / 多实例部署时各进程独立统计（与限流一致）。
+        多进程 / 多实例部署时各进程独立统计。
         """
         return {
             "requests": REQUEST_METRICS.snapshot(),
