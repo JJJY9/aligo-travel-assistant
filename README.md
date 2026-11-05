@@ -6,7 +6,7 @@
 
 基于**大语言模型**（默认 DeepSeek，兼容豆包 / OpenAI 等 OpenAI 兼容接口）和 **AgentScope 框架**的多智能体旅行规划系统，采用Plan-and-Execute架构，实现智能意图识别、两层记忆系统、RAG知识库、联网搜索和优先级并行调度。
 
-> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance (category filter, semantic search, CRUD, JSON export/import), parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel with manual preferences, trip management with calendar & CSV export and keyword filtering, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`preferences`, `trips`, `sessions`, `session-archive`, `session-export`, `kb-*`, `trips-export`, `trips-dedupe`, `eval`, `doctor`), responses are gzip-compressed except SSE, carry rate-limit headers and are exposed as in-process request metrics (`/api/metrics`). Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
+> **English TL;DR** — Aligo is a local-first, multi-agent travel-planning assistant built with **FastAPI + AgentScope** and any OpenAI-compatible LLM (DeepSeek by default). It combines a two-tier memory system (in-process/Redis short-term, JSON/PostgreSQL long-term), a **Milvus Lite RAG** knowledge base with web maintenance (category filter, semantic search, CRUD, JSON export/import), parallel Plan-and-Execute agents with **live SSE progress**, and a dependency-free web UI (session history with search / pin / archive, memory/usage panel with manual preferences, trip management with calendar & CSV export and keyword filtering, knowledge maintenance, self-diagnostics). A CLI covers maintenance tasks (`preferences`, `trips`, `sessions`, `session-archive`, `session-export`, `sessions-export`, `kb-*`, `trips-export`, `trips-dedupe`, `eval`, `doctor`), responses are gzip-compressed except SSE, carry rate-limit headers and are exposed as in-process request metrics (`/api/metrics`). Tests run without API keys (`pytest tests -q`); CI covers Python 3.10/3.12 with Redis and PostgreSQL service containers.
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
@@ -491,6 +491,8 @@ python cli.py
 行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`，已存在时需 `--force` 覆盖）。
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部；`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复会话；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
+
+全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`，按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
 
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）。
 
