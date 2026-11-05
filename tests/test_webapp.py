@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime
 
@@ -1845,9 +1846,12 @@ def test_delete_session_storage_failure_maps_503(monkeypatch):
     monkeypatch.setattr(
         server_module, "_open_long_term", lambda user_id: _BrokenStore()
     )
-    response = _client().delete("/api/sessions/s1", params={"user_id": "u1"})
+    client = _client()
+    response = client.delete("/api/sessions/s1", params={"user_id": "u1"})
     assert response.status_code == 503
-    print("✓ 删除会话存储失败 → 503")
+    state = client.app.state.aligo
+    assert state.is_recently_deleted("u1", "s1") is False, "删除失败应撤销墓碑"
+    print("✓ 删除会话存储失败 → 503（墓碑回滚）")
 
 
 def test_sessions_pagination():
@@ -2193,12 +2197,18 @@ def test_shared_tombstones_across_instances():
     class _FakeRedis:
         def __init__(self):
             self.data = {}
+            self.ttls = {}
 
         def setex(self, key, ttl, value):
             self.data[key] = value
+            self.ttls[key] = ttl
 
         def exists(self, key):
             return int(key in self.data)
+
+        def delete(self, key):
+            self.data.pop(key, None)
+            return 1
 
     shared = _FakeRedis()
     app_a = create_app(model=UsageTrackingModel(_FakeModel()))
@@ -2211,9 +2221,112 @@ def test_shared_tombstones_across_instances():
 
     state_a.mark_deleted("u-shared", "s-shared")
     assert "aligo:deleted:u-shared:s-shared" in shared.data
+    assert shared.ttls["aligo:deleted:u-shared:s-shared"] == int(
+        state_a.tombstone_ttl_sec
+    ), "共享墓碑 TTL 应与本地一致"
     assert state_b.is_recently_deleted("u-shared", "s-shared") is True
     assert state_b.is_recently_deleted("u-shared", "other") is False
-    print("✓ 删除墓碑通过 Redis 跨实例共享")
+
+    state_a.unmark_deleted("u-shared", "s-shared")
+    assert state_b.is_recently_deleted("u-shared", "s-shared") is False
+    print("✓ 删除墓碑通过 Redis 跨实例共享（含 TTL 与撤销）")
+
+
+def test_tombstone_redis_retry_after_failure():
+    """共享墓碑一次失败只回退本次，冷却后自动恢复 Redis 路径。"""
+
+    class _FlakyRedis:
+        def __init__(self):
+            self.fail = False
+            self.data = {}
+            self.calls = 0
+
+        def setex(self, key, ttl, value):
+            self.calls += 1
+            if self.fail:
+                raise ConnectionError("redis blip")
+            self.data[key] = value
+
+        def exists(self, key):
+            self.calls += 1
+            if self.fail:
+                raise ConnectionError("redis blip")
+            return int(key in self.data)
+
+        def delete(self, key):
+            self.calls += 1
+            if self.fail:
+                raise ConnectionError("redis blip")
+            self.data.pop(key, None)
+
+    client = _FlakyRedis()
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state._redis_client = client
+    state._tombstones_shared = True
+
+    client.fail = True
+    state.mark_deleted("u-retry", "s-retry")
+    assert state._tombstones_shared is False
+    assert state._tombstone_retry_at > 0
+    assert state.is_recently_deleted("u-retry", "s-retry") is True, "本地墓碑兜底"
+
+    calls_before = client.calls
+    state.is_recently_deleted("u-retry", "s-other")
+    assert client.calls == calls_before, "冷却期内不应重复请求 Redis"
+
+    client.fail = False
+    state._tombstone_retry_at = 0.0
+    client.data["aligo:deleted:u-retry:s-other"] = "1"
+    assert state.is_recently_deleted("u-retry", "s-other") is True
+    assert state._tombstones_shared is True, "冷却后应恢复共享墓碑"
+
+    state.unmark_deleted("u-retry", "s-other")
+    assert "aligo:deleted:u-retry:s-other" not in client.data
+    print("✓ 共享墓碑故障回退并在冷却后恢复")
+
+
+def test_tombstone_reconnects_when_redis_appears_later(monkeypatch):
+    """启动时没有 Redis 客户端，恢复后通过共享客户端工厂重新接入。"""
+    from webapp import server as server_module
+
+    class _FakeRedis:
+        def __init__(self):
+            self.data = {}
+
+        def setex(self, key, ttl, value):
+            self.data[key] = value
+
+        def exists(self, key):
+            return int(key in self.data)
+
+        def delete(self, key):
+            self.data.pop(key, None)
+
+    client = _FakeRedis()
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state._redis_client = None
+    state._tombstones_shared = False
+    monkeypatch.setattr(server_module, "get_shared_redis_client", lambda: client)
+
+    state.mark_deleted("u-late", "s-late")
+    assert "aligo:deleted:u-late:s-late" in client.data
+    assert state._tombstones_shared is True
+    print("✓ 启动时无 Redis 的墓碑在恢复后接入共享")
+
+
+def test_tombstone_expired_entries_pruned_before_eviction():
+    """容量淘汰前先清理过期墓碑，避免仍有效的墓碑被挤出。"""
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state.max_tombstones = 2
+    now = time.monotonic()
+    state._deleted_sessions["u\nold"] = now - state.tombstone_ttl_sec - 1
+    state._deleted_sessions["u\nkeep"] = now
+
+    state.mark_deleted("u", "new")
+    assert "u\nold" not in state._deleted_sessions
+    assert "u\nkeep" in state._deleted_sessions
+    assert "u\nnew" in state._deleted_sessions
+    print("✓ 墓碑容量淘汰前先清理过期条目")
 
 
 def test_session_metadata_requires_existing_session():
