@@ -654,10 +654,17 @@ def test_append_preference_merges_atomically():
     assert memory.append_preference("airlines", ["国航", "东航"]) == ["东航", "国航"]
     assert memory.get_preference("airlines") == ["东航", "国航"]
 
+    # 0 / False 是合法偏好：追加时不能被真值判断丢掉
+    memory.save_preference("budget_min", 0)
+    assert memory.append_preference("budget_min", 500) == [0, 500]
+    memory.save_preference("window_seat", False)
+    assert memory.append_preference("window_seat", True) == [False, True]
+
     reopened = LongTermMemory("u-append", storage_dir)
     assert reopened.get_preference("hotel_brands") == ["万豪", "希尔顿"]
     assert reopened.get_preference("airlines") == ["东航", "国航"]
-    print("✓ append_preference 原子合并（字符串→列表 / 列表逐项 / 去重 / 并发值保留）")
+    assert reopened.get_preference("budget_min") == [0, 500]
+    print("✓ append_preference 原子合并（字符串→列表 / 列表逐项 / 去重 / 并发值 / 假值偏好保留）")
 
 
 def test_summary_invalidated_by_trip_edit():

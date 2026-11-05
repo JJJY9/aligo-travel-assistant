@@ -16,10 +16,13 @@ def merge_preference_value(current: Any, value: Any) -> list[Any]:
 
     模型可能给出列表形式的 append 值（如 ``["汉庭", "如家"]``）；逐项合并
     而不是把整个列表塞进列表，避免存储出现嵌套列表并让后续的
-    ``", ".join`` 报 TypeError。
+    ``", ".join`` 报 TypeError。``0`` / ``False`` 是合法偏好（预算为 0、
+    不要靠窗），不能用真值判断丢弃。
     """
     merged: list[Any] = (
-        list(current) if isinstance(current, list) else ([current] if current else [])
+        list(current)
+        if isinstance(current, list)
+        else ([current] if has_preference_value(current) else [])
     )
     incoming = value if isinstance(value, list) else [value]
     for item in incoming:
