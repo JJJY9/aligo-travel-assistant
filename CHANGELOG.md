@@ -11,7 +11,7 @@
 - `/api/health` 新增 `rate_limit_configured` / `rate_limit_degraded` 字段：配置了 Redis 但限流器回退进程内（启动时不可用或运行中故障）时 `degraded` 为 `true`
 - `/api/metrics` 新增 `rate_limit` 字段（后端 / 是否配置 / 是否降级 / 用户与 IP 额度 / 窗口秒数），记忆面板运行指标说明行显示当前限流后端
 - 反向代理部署：设置 `TRUST_PROXY_HEADERS=1` 后限流按 `X-Forwarded-For` 第一个地址计算客户端 IP；默认关闭，避免客户端伪造该头绕过 IP 桶
-- 知识库接口独立限流：写入 / 更新 / 删除 / 导入 / 语义检索按客户端 IP 限流（默认 60 次 / 分钟，`KB_RATE_LIMIT` 调整），与对话额度互不影响；配置 Redis 时与其他桶共享后端，`/api/metrics.rate_limit` 增加 `kb_limit`
+- 知识库接口独立限流：写入 / 更新 / 删除 / 导入 / 导出 / 语义检索按客户端 IP 限流（默认 60 次 / 分钟，`KB_RATE_LIMIT` 调整），与对话额度互不影响；配置 Redis 时与其他桶共享后端，`/api/metrics.rate_limit` 增加 `kb_limit`
 - 技能可观测性：`/api/health` 返回 `skills.count` / `skills.dir_found`；`doctor` 新增「技能目录」检查（发现数量、缺失时提示 `ALIGO_SKILLS_DIR`），安装后技能未注册可直接定位
 - `python cli.py skills`：输出技能目录与已发现技能（目录缺失或没有可加载技能时退出码 1），便于确认 wheel 安装 / `ALIGO_SKILLS_DIR` 是否生效；`skill_scripts()` 在目录不可读时安全返回空，健康检查不会因此报错
 
@@ -24,7 +24,7 @@
 - `tests/test_rate_limit.py` 补充 Redis 故障回退与限流器工厂用例
 - `tests/test_skill_paths.py` 覆盖 `skill_scripts` 技能发现；`test_doctor.py` 覆盖技能目录检查（正常 / 缺失）；健康接口断言 `skills.count` 与 `dir_found`
 - 新增 `tests/test_cli_skills.py`（正常 / 目录缺失 / 空目录 / 命令分发）；`tests/test_skill_paths.py` 补充技能目录不可读时安全返回空的用例
-- 新增知识库接口限流用例：首次写入 201 并带额度头，第二次 429；语义检索与写入共享知识库桶；对话不受该桶影响
+- 新增知识库接口限流用例：首次写入 201 并带额度头，第二次 429；语义检索与导出均与写入共享知识库桶；对话不受该桶影响
 
 ## [1.4.1] - 2026-11-05
 
