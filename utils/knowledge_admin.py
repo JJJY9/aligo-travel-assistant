@@ -164,9 +164,13 @@ def _chunk_documents(
     documents: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks):
         meta = dict(base_meta)
-        if len(chunks) > 1 and len(meta) + 2 <= _METADATA_MAX_KEYS:
-            meta.setdefault("part", str(index + 1))
-            meta.setdefault("parts", str(len(chunks)))
+        if len(chunks) > 1:
+            # 分片标记必须按实际分片重写：编辑旧分片时传入的元数据可能带着
+            # 旧的 part/parts，沿用会把所有新分片标成同一个 part
+            needed = len(set(meta) | {"part", "parts"})
+            if needed <= _METADATA_MAX_KEYS:
+                meta["part"] = str(index + 1)
+                meta["parts"] = str(len(chunks))
         documents.append({"content": chunk, "metadata": meta})
     return documents
 
@@ -198,10 +202,31 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     return payload
 
 
+def _document_parts(client: Any, doc_id: int) -> int:
+    """已有片段所属的分片数；记录不存在返回 0，非多分片记录返回 1。"""
+    rows = client.query(
+        collection_name=COLLECTION_NAME,
+        filter=f"id == {doc_id}",
+        output_fields=["metadata"],
+        limit=1,
+    )
+    if not rows:
+        return 0
+    meta = _parse_metadata(rows[0].get("metadata"))
+    try:
+        return max(1, int(meta.get("parts") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def update_document(
     doc_id: int, content: str, metadata: dict[str, str] | None = None
 ) -> dict[str, Any]:
-    """按 id 覆盖更新知识片段（重新嵌入）；长内容其余分片以新记录追加。"""
+    """按 id 覆盖更新知识片段（重新嵌入）；长内容其余分片以新记录追加。
+
+    多分片知识内容暂无稳定的组标识，单条编辑会留下无法定位的旧分片，
+    因此拒绝编辑（整组删除后重新添加）。
+    """
     text = content.strip()
     if not text:
         raise ValueError("知识内容不能为空")
@@ -210,8 +235,14 @@ def update_document(
     agent = _get_agent()
     documents = _chunk_documents(text, metadata)
     with _WRITE_LOCK:
-        if not _exists(client, int(doc_id)):
+        existing_parts = _document_parts(client, int(doc_id))
+        if existing_parts == 0:
             raise LookupError("知识片段不存在")
+        if existing_parts > 1:
+            raise ValueError(
+                f"该片段属于多分片知识内容（共 {existing_parts} 段），"
+                "暂不支持单条编辑：请删除整组后重新添加，避免旧分片残留"
+            )
         first = documents[0]
         result = agent.update_document(
             int(doc_id), first["content"], first["metadata"]

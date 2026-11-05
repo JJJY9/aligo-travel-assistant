@@ -244,6 +244,28 @@ def test_rag_query_extraction_falls_back_to_raw_query():
     print("✓ RAG 使用原始提问兜底（空 / null 改写结果）")
 
 
+def test_strict_search_error_has_top_level_message():
+    """strict 检索失败的错误载荷要带顶层 error/message，编排聚合才能展示原因。"""
+    agent = object.__new__(RAGKnowledgeAgent)
+    agent.name = "RAGKnowledgeAgent"
+    agent.initialized = True
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("milvus locked")
+
+    agent.search_knowledge = _boom
+    # 绕过 AgentScope 需要完整实例 hook 的 reply 包装器，直接调用原始实现
+    reply_impl = RAGKnowledgeAgent.reply.__wrapped__
+    message = asyncio.run(
+        reply_impl(agent, Msg(name="user", content="住宿标准是多少", role="user"))
+    )
+    payload = json.loads(message.content)
+    assert payload["status"] == "error"
+    assert payload.get("error"), "缺少顶层 error，编排聚合会丢弃原因"
+    assert "milvus locked" in str(payload.get("message") or "")
+    print("✓ strict 检索失败带顶层 error/message")
+
+
 if __name__ == "__main__":
     asyncio.run(test_rag_agent())
     print("\n测试完成！")

@@ -425,9 +425,14 @@ class RAGKnowledgeAgent(AgentBase):
             )
         except Exception as exc:  # noqa: BLE001 - 知识库故障转为智能体错误
             logger.warning("知识库检索失败: %s", exc)
+            # 顶层 error / message 供编排聚合与前端展示使用：聚合器按
+            # result["error"] / result["message"] 提取原因，只放在
+            # answer / data.error 里会被丢弃渲染成「智能体返回错误状态」
             result = {
                 "status": "error",
                 "query": user_query,
+                "error": str(exc),
+                "message": f"知识库检索失败：{exc}",
                 "answer": f"知识库暂时不可用，请稍后再试（{exc}）",
                 "data": {"error": str(exc)},
             }

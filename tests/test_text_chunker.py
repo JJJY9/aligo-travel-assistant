@@ -107,6 +107,17 @@ def test_short_title_merged():
     print("✓ 孤立标题并入内容块")
 
 
+def test_title_only_run_respects_max_chars():
+    """连续几十行目录式标题累计后必须受 max_chars 约束，不能整块超长。"""
+    text = "\n\n".join(f"目录标题{i}" for i in range(60)) + "\n\n正文内容。"
+    chunks = split_text(text, max_chars=100)
+    assert all(len(c) <= 100 for c in chunks), max(len(c) for c in chunks)
+    joined = "".join(chunks)
+    assert "目录标题0" in joined and "目录标题59" in joined
+    assert "正文内容" in joined
+    print(f"✓ 连续标题块受上限约束（{len(chunks)} 块）")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -114,4 +125,5 @@ if __name__ == "__main__":
     test_content_preserved()
     test_consecutive_titles_merge_into_body()
     test_short_title_merged()
+    test_title_only_run_respects_max_chars()
     print("\n全部通过")

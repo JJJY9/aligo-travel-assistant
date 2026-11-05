@@ -132,7 +132,6 @@ class ConversationRuntime:
             max_retries=int(rc.get("max_retries", 3)),
             base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
             max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
-            success_check=self._orchestration_succeeded,
         )
 
         try:
@@ -202,21 +201,6 @@ class ConversationRuntime:
             )
         return normalized
 
-    @staticmethod
-    def _orchestration_succeeded(message: Msg) -> bool:
-        """子智能体全部成功才算成功（partial_failure 要让熔断器看到）。"""
-        try:
-            payload = (
-                json.loads(message.content)
-                if isinstance(message.content, str)
-                else message.content
-            )
-        except (TypeError, json.JSONDecodeError):
-            return True
-        if not isinstance(payload, dict):
-            return True
-        return payload.get("status") != "partial_failure"
-
     async def _build_context(self, user_input: str) -> list[Msg]:
         """组装意图识别上下文：系统记忆（偏好 + 历史摘要）+ 最近对话 + 当前输入。"""
         memory_parts: list[str] = []
@@ -250,9 +234,16 @@ class ConversationRuntime:
         return messages
 
     async def _call_with_resilience(
-        self, factory, max_retries: int, base_delay: float, max_delay: float, success_check=None
+        self, factory, max_retries: int, base_delay: float, max_delay: float
     ):
-        """带重试与熔断记录的单次 LLM 调用。"""
+        """带重试与熔断记录的单次 LLM 调用。
+
+        只有调用本身抛错才计为熔断失败。编排结果 ``partial_failure`` 是
+        子智能体（RAG / 天气等）的问题，不是 LLM 服务不可用：把它计为失败
+        会让 CLOSED 状态下每轮先被意图调用的成功记录清零（永远累计不到
+        阈值），也会让 HALF_OPEN 状态下的第一个真实请求被非 LLM 故障重新
+        打开全局共享熔断器，误伤所有用户。
+        """
         try:
             result = await retry_with_backoff(
                 factory,
@@ -261,10 +252,7 @@ class ConversationRuntime:
                 max_delay_sec=max_delay,
             )
             if self.circuit_breaker:
-                if success_check is not None and not success_check(result):
-                    self.circuit_breaker.record_failure()
-                else:
-                    self.circuit_breaker.record_success()
+                self.circuit_breaker.record_success()
             return result
         except CircuitOpenError:
             raise

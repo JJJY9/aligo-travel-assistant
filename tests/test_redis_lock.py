@@ -170,10 +170,44 @@ def test_cross_instance_lock():
         client.delete(key)
 
 
+class _LostLockRedis:
+    """续期时锁已过期并被其它实例拿走（EXPIRE 返回 0）。"""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    def set(self, key, value, nx=False, ex=None):
+        self.store[key] = value
+        return True
+
+    def eval(self, script, numkeys, key, *args):
+        if "DEL" in script:
+            self.store.pop(key, None)
+            return 1
+        if "EXPIRE" in script:
+            return 0
+        return 0
+
+
+def test_heartbeat_detects_lost_lock():
+    """续期发现锁已被别人拿走时必须置 lost，不能继续假定自己独占。"""
+    client = _LostLockRedis()
+    lock = DistributedLock(client, "aligo:test:lost", ttl_sec=1)
+    token = lock.acquire()
+    assert token
+    assert lock.lost is False
+
+    time.sleep(1.5)
+    assert lock.lost is True, "续期失败（锁已失效）应标记 lost"
+    lock.release(token)
+    print("✓ 续期失败时标记锁已丢失")
+
+
 if __name__ == "__main__":
     test_fallback_when_redis_unavailable()
     test_local_mutex_blocks_even_if_redis_errors()
     test_redis_path_recovers_after_transient_failure()
     test_release_cleans_key_after_set_timeout()
     test_heartbeat_renews_lock_ttl()
+    test_heartbeat_detects_lost_lock()
     print("\n全部通过（Redis 集成用例需 TEST_REDIS_URL）")
