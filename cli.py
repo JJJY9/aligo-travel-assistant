@@ -1006,12 +1006,15 @@ def run_health_check_standalone(as_json: bool = False) -> int:
     return 0 if ok else 1
 
 
-def run_doctor_standalone(as_json: bool = False) -> int:
+def run_doctor_standalone(
+    as_json: bool = False, include_network: bool | None = None
+) -> int:
     """
     独立执行环境自检（用于 `python cli.py doctor`），不进入交互式 CLI。
 
     Args:
         as_json: 输出机器可读的 JSON（便于监控 / 脚本）
+        include_network: 是否检查 LLM 连通性；None 表示有 API Key 时检查
 
     Returns:
         0 无 fail 项；1 存在必须处理的问题（便于脚本/监控）
@@ -1020,7 +1023,9 @@ def run_doctor_standalone(as_json: bool = False) -> int:
 
     from utils.doctor import build_report_table, has_failures, run_doctor, summarize
 
-    results = asyncio.run(run_doctor(include_network=bool(LLM_CONFIG["api_key"])))
+    if include_network is None:
+        include_network = bool(LLM_CONFIG["api_key"])
+    results = asyncio.run(run_doctor(include_network=include_network))
     failed = has_failures(results)
     if as_json:
         print(
@@ -1051,6 +1056,20 @@ def _parse_json_flag(args: list[str], usage: str) -> bool | None:
         return True
     print(f"用法：{usage}")
     return None
+
+
+def _parse_doctor_args(args: list[str]) -> tuple[bool, bool] | None:
+    """解析 doctor 的 ``[--json] [--offline]``；非法参数返回 None。"""
+    as_json = False
+    include_network = True
+    for item in args:
+        if item == "--json":
+            as_json = True
+        elif item in {"--offline", "--no-network"}:
+            include_network = False
+        else:
+            return None
+    return as_json, include_network
 
 
 def run_skills_standalone(as_json: bool = False) -> int:
@@ -2037,10 +2056,16 @@ def main():
                 sys.exit(2)
             sys.exit(run_health_check_standalone(as_json=health_json))
         if arg == "doctor":
-            doctor_json = _parse_json_flag(sys.argv[2:], "python cli.py doctor [--json]")
-            if doctor_json is None:
+            doctor_args = _parse_doctor_args(sys.argv[2:])
+            if doctor_args is None:
+                print("用法：python cli.py doctor [--json] [--offline]")
                 sys.exit(2)
-            sys.exit(run_doctor_standalone(as_json=doctor_json))
+            doctor_json, doctor_network = doctor_args
+            sys.exit(
+                run_doctor_standalone(
+                    as_json=doctor_json, include_network=doctor_network
+                )
+            )
         if arg == "skills":
             skills_json = _parse_json_flag(sys.argv[2:], "python cli.py skills [--json]")
             if skills_json is None:

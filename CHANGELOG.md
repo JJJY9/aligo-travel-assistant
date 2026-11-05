@@ -15,6 +15,7 @@
 - 知识库维护面板新增「检索评测」按钮（`/api/knowledge/eval`）：14 个问题离线计算 hit@1/3/5 与 MRR，不调用大模型，受知识库限流保护；hit@5 低于 80% 时结果标红提示；同一进程内只允许一个评测（并发请求返回 429）
 - 请求指标新增 P50 / P95 耗时（最近 1000 个请求样本，内存有界）与 `duration_samples`；记忆面板运行指标新增「P95 耗时」卡片
 - CLI `doctor` / `skills` 支持 `--json`：`doctor` 输出 `status` / `checks`，`skills` 输出 `root` / `skills` / `ok`，便于监控与脚本读取；非法参数退出码 2
+- CLI `doctor --offline`（`--no-network`）跳过 LLM 连通性检查，网络不可达 / CI 环境不再长时间等待
 - CLI `health` / `kb` 也支持 `--json`：`health` 输出 `{"ok", "message"}`，`kb` 输出完整知识库状态对象；非法参数退出码 2
 - CLI `eval` 也支持 `--json`：输出 `ok` / `skipped` / `threshold` / `hit@K` / `mrr` / `rows`，成功、未达标、跳过与故障四种状态的退出码与文本模式一致
 - 行程日历提醒：导出的 `.ics` 事件新增 `VALARM`，出行前一天 09:00 提醒（单条行程与全部行程导出均生效）
@@ -54,6 +55,7 @@
 - 新增 `tests/test_server_cli.py`：环回地址判断、`--version`、非环回监听警告
 - 新增 `tests/test_version.py`：版本格式、Web / CLI 共用常量、`--version` / `-V` 分发
 - `test_doctor.py` 补充版本一致性（一致 / 不一致警告 / 无版本文件跳过 / 静态资源不一致）用例
+- `test_doctor.py` 补 `doctor --offline` 分发与未知参数退出码用例
 - ICS 日历用例断言每个事件包含 `VALARM` 与 `TRIGGER:-PT15H`
 - 安全头用例断言 `/api/` 响应带 `Cache-Control: no-store`，页面与静态资源不受影响
 - 浏览器实测：用户卡片显示「本地内存 · JSON · 技能 6」

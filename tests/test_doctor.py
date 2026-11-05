@@ -263,6 +263,35 @@ def test_doctor_json_output(monkeypatch):
     print("✓ doctor --json 输出与退出码")
 
 
+def test_doctor_offline_flag(monkeypatch):
+    import cli
+
+    calls = {}
+
+    def fake_standalone(**kwargs):
+        calls.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run_doctor_standalone", fake_standalone)
+    monkeypatch.setattr(sys, "argv", ["cli.py", "doctor", "--json", "--offline"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls == {"as_json": True, "include_network": False}
+    print("✓ doctor --offline 跳过网络检查")
+
+
+def test_doctor_rejects_unknown_flag(monkeypatch, capsys):
+    import cli
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "doctor", "--bogus"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    assert "用法" in capsys.readouterr().out
+    print("✓ doctor 未知参数退出码 2")
+
+
 if __name__ == "__main__":
     test_python_ok()
     test_model_files_missing_dir()
