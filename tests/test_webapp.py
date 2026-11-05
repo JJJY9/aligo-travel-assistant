@@ -3974,7 +3974,11 @@ if __name__ == "__main__":
     test_deleted_session_cannot_be_resurrected()
     test_repeated_delete_keeps_tombstone()
     test_delete_missing_session_allows_new_chat()
-    test_delete_missing_session_failure_does_not_leave_tombstone()
+    _mp_ghost = pytest.MonkeyPatch()
+    try:
+        test_delete_missing_session_failure_does_not_leave_tombstone(_mp_ghost)
+    finally:
+        _mp_ghost.undo()
     test_tombstone_helpers_are_thread_safe()
     test_repeated_delete_repairs_shared_tombstone()
     test_session_metadata_requires_existing_session()
