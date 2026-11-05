@@ -1349,7 +1349,7 @@ def run_knowledge_import_standalone(source: str) -> int:
         print(f"文件不存在：{path}")
         return 1
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"读取失败：{exc}（文件需为 UTF-8 编码的 JSON）")
         return 1
@@ -1818,7 +1818,7 @@ def run_session_export_standalone(
     text = "\n".join(lines)
 
     if to_stdout:
-        print(text)
+        _print_stdout(text)
         return 0
 
     path = Path(target) if target else Path("exports") / f"aligo_{session_id}.md"
@@ -1878,10 +1878,10 @@ def run_sessions_export_standalone(
     text, count = render_all_sessions_markdown(user_id, messages, titles)
 
     if to_stdout:
-        print(text)
+        _print_stdout(text)
         return 0
 
-    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24] or "user"
+    safe_user = _safe_export_user(user_id)
     path = Path(target) if target else Path("exports") / f"aligo_sessions_{safe_user}.md"
     if path.exists() and not force:
         print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
@@ -1933,7 +1933,7 @@ def run_trips_export_standalone(
 
     text = render_trips_csv(trips)
     if to_stdout:
-        print(text, end="")
+        _print_stdout(text, end="")
         return 0
 
     path = Path(target) if target else Path("exports") / "aligo_trips.csv"
@@ -2095,9 +2095,42 @@ def _parse_export_args(
     return (paths[0] if paths else None), to_stdout, force
 
 
+_COMMANDS_HINT = (
+    "可用命令：health / doctor / skills / weather / kb / eval / kb-export / "
+    "kb-import / kb-list / kb-delete / preferences / trips / trips-dedupe / "
+    "sessions / session-archive / session-export / sessions-export / trips-export"
+)
+
+
+def _safe_export_user(user_id: str) -> str:
+    """导出文件名里的用户 ID：清洗非法字符，撞名风险时追加短哈希。"""
+    import hashlib
+    import re
+
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24] or "user"
+    if safe != user_id:
+        # 中文 / 超长用户 ID 清洗后可能撞名，追加短哈希避免 --force 覆盖他人导出
+        digest = hashlib.sha1(user_id.encode("utf-8")).hexdigest()[:6]
+        safe = f"{safe}_{digest}"
+    return safe
+
+
+def _print_stdout(text: str, end: str = "\n") -> None:
+    """输出导出内容；下游提前关闭（如 `| head`）时静默收尾，不抛 traceback。"""
+    try:
+        print(text, end=end)
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except Exception:
+            pass
+
+
 def main():
     """主函数"""
-    configure_stdio()
+    # 一次性命令不读 stdin：跳过编码探测，避免已连接但无数据的管道卡住启动
+    configure_stdio(probe_stdin=len(sys.argv) == 1)
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip().lower()
         if arg in {"--version", "-v"}:
@@ -2150,15 +2183,20 @@ def main():
             kb_target, kb_force = parsed_kb_export
             sys.exit(run_knowledge_export_standalone(kb_target, force=kb_force))
         if arg == "kb-import":
-            if len(sys.argv) < 3:
+            if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py kb-import <file.json>")
                 sys.exit(2)
             sys.exit(run_knowledge_import_standalone(sys.argv[2]))
         if arg == "kb-list":
+            if len(sys.argv) > 3 or (
+                len(sys.argv) == 3 and sys.argv[2].startswith("-")
+            ):
+                print("用法：python cli.py kb-list [关键词]")
+                sys.exit(2)
             keywords = sys.argv[2] if len(sys.argv) > 2 else ""
             sys.exit(run_knowledge_list_standalone(keywords))
         if arg == "kb-delete":
-            if len(sys.argv) < 3 or not sys.argv[2].isdigit():
+            if len(sys.argv) != 3 or not sys.argv[2].isdigit():
                 print("用法：python cli.py kb-delete <id>")
                 sys.exit(2)
             sys.exit(run_knowledge_delete_standalone(int(sys.argv[2])))
@@ -2292,6 +2330,14 @@ def main():
                     force=force,
                 )
             )
+        if arg in {"help", "--help", "-h"}:
+            print(_COMMANDS_HINT)
+            print("不带参数进入交互模式；--version 查看版本")
+            sys.exit(0)
+        print(f"未知命令：{sys.argv[1]}")
+        print(_COMMANDS_HINT)
+        print("不带参数进入交互模式；--version 查看版本")
+        sys.exit(2)
     cli = AligoCLI()
     try:
         asyncio.run(cli.run())

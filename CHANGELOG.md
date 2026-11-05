@@ -22,6 +22,7 @@
 - 分布式锁加固：进程内先互斥再尝试 Redis（Redis 抖动回退时同进程不再并发评测）；一次 Redis 异常不再永久禁用共享锁（保留客户端并在下次加锁重试，启动时不可用则由 `client_factory` 在恢复后重新获取）；SET 响应超时保留 token，释放时尽力清理可能已生效的锁键；持有期间按 TTL/3 自动续期，模型下载等长评测不会中途失去锁
 - 会话删除墓碑加固：删除请求先写墓碑再删库（其它实例在删除窗口内的新请求直接 404，删除失败回滚墓碑）；共享墓碑一次 Redis 异常只回退本次，60 秒后自动重试，启动时未拿到 Redis 的实例在恢复后也能重新接入；本地墓碑容量淘汰前先清理过期条目，避免仍有效的墓碑被挤出
 - 请求指标按路由模板聚合（如 `/api/sessions/{session_id}`），动态路径段不再占用基数配额，未知路径统一记为 `__unmatched__`；Prometheus `/metrics` 在无耗时样本时不再输出 0 秒的 avg / max / p50 / p95（只保留样本数）；uptime 改用单调时钟计算，系统时间回拨不再让指标倒退或变负；熔断失败数的 HELP 文案与实际语义（open / half_open 期间冻结在触发阈值）一致
+- CLI 加固：`configure_stdio` 的管道编码探测改为有界等待（已连接但暂时无数据的管道不再卡住所有命令，包括 `--version`）；未知命令退出码 2、`--help` / `-h` 列出命令；`kb-delete` / `kb-import` / `kb-list` 拒绝多余参数（避免 `--dry-run` 等标志被静默忽略后执行删除）；`sessions-export` 默认文件名对中文 / 超长用户追加短哈希，避免 `--force` 覆盖他人导出；`--stdout` 导出在下游提前关闭时不再抛 traceback；`kb-import` 兼容带 BOM 的 UTF-8 备份
 
 ### 修复
 - 天气工具加固：上游响应形状异常统一映射为 `WeatherError`（此前可能抛 `AttributeError` 导致 500）；缓存改为有界（写入时清理过期条目，上限 256 条）；同一城市的并发未命中合并为一次上游请求
@@ -33,6 +34,7 @@
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁；补瞬时故障下进程内互斥、故障恢复后重新走 Redis、SET 超时后释放清理锁键、持有期间自动续期用例
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义（含无样本不输出耗时、单调时钟 uptime）；`test_webapp.py` 覆盖 `/metrics` 端点与路由模板聚合
 - 新增 `tests/test_cli_weather.py`：文本 / JSON 输出、失败退出码、stale 标注、命令分发与参数校验
+- 新增 `tests/test_console.py`（空闲管道不阻塞、probe 开关）与 `tests/test_cli_hardening.py`（未知命令 / `--help`、参数校验、导出文件名唯一性、BrokenPipe、BOM 导入）
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑，断言 TTL）；`test_webapp.py` 补假 Redis 共享墓碑用例（含 TTL、撤销、故障回退与恢复、启动后接入、过期墓碑清理、删除失败回滚）
 - 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区 / 429 映射 / 响应形状异常 / 缓存上限与过期清理 / 同城并发合并 / 失败短时缓存与键归一化 / stale-while-error）；`test_webapp.py` 补 `/api/weather` 用例与独立限流用例
 - `test_query_info_fallback.py` / `test_skill_agents.py` 天气用例改为校验技能委托 `utils.weather.fetch_weather`，不再模拟内部 HTTP；补天气与搜索都失败时返回天气原因的用例
