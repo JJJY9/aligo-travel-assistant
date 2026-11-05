@@ -663,7 +663,28 @@ def test_previous_preference_append_flattens_list():
     ]
     merged = orchestrator._context_with_previous_preferences(context, previous)
     assert merged["user_preferences"]["airlines"] == ["东航", "国航"]
-    print("✓ 前序偏好 append 列表逐项合并")
+
+    # 0 / False 是合法偏好，append 时不能被真值判断丢掉
+    falsy = {
+        "user_preferences": {"budget_min": 0, "window_seat": False},
+    }
+    falsy_previous = [
+        {
+            "agent_name": "preference",
+            "result": {
+                "data": {
+                    "preferences": [
+                        {"type": "budget_min", "value": 500, "action": "append"},
+                        {"type": "window_seat", "value": True, "action": "append"},
+                    ]
+                }
+            },
+        }
+    ]
+    merged_falsy = orchestrator._context_with_previous_preferences(falsy, falsy_previous)
+    assert merged_falsy["user_preferences"]["budget_min"] == [0, 500]
+    assert merged_falsy["user_preferences"]["window_seat"] == [False, True]
+    print("✓ 前序偏好 append 列表逐项合并（含假值偏好）")
 
 
 if __name__ == "__main__":
