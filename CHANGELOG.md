@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- CLI 新增 `python cli.py weather <城市> [--json]`：输出当前天气与未来几天预报（复用 `utils/weather` 的缓存与 stale 降级），城市不存在或接口不可用时退出码 1，`--json` 附带 `ok`
 - 检索评测互斥升级为 Redis 跨实例锁：配置 `REDIS_URL` 时多个 Web 实例共享同一把锁（`SET NX EX` + token 比对释放，TTL 300 秒），未配置或 Redis 故障时回退进程内锁；并发请求仍返回 429
 - Prometheus 文本指标端点 `GET /metrics`：请求总数 / 状态 / 方法 / 路径 / 耗时分位 / 熔断器 / 缓存会话 / 限流后端与降级状态，`text/plain; version=0.0.4`，多实例需分别采集；README 补抓取配置示例
 - 会话删除墓碑在配置 `REDIS_URL` 时写入 Redis（`aligo:deleted:*`，TTL 与本地一致），其它实例的新请求会被拒绝；Redis 故障时回退进程内墓碑
@@ -31,6 +32,7 @@
 ### 测试
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁；补瞬时故障下进程内互斥、故障恢复后重新走 Redis、SET 超时后释放清理锁键、持有期间自动续期用例
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义（含无样本不输出耗时、单调时钟 uptime）；`test_webapp.py` 覆盖 `/metrics` 端点与路由模板聚合
+- 新增 `tests/test_cli_weather.py`：文本 / JSON 输出、失败退出码、stale 标注、命令分发与参数校验
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑，断言 TTL）；`test_webapp.py` 补假 Redis 共享墓碑用例（含 TTL、撤销、故障回退与恢复、启动后接入、过期墓碑清理、删除失败回滚）
 - 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区 / 429 映射 / 响应形状异常 / 缓存上限与过期清理 / 同城并发合并 / 失败短时缓存与键归一化 / stale-while-error）；`test_webapp.py` 补 `/api/weather` 用例与独立限流用例
 - `test_query_info_fallback.py` / `test_skill_agents.py` 天气用例改为校验技能委托 `utils.weather.fetch_weather`，不再模拟内部 HTTP；补天气与搜索都失败时返回天气原因的用例
