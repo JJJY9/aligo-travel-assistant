@@ -11,6 +11,8 @@ from pathlib import Path
 from agentscope.agent import AgentBase
 from rich.console import Console
 
+from utils.skill_paths import resolve_skills_root
+
 
 class LazyAgentRegistry:
     """
@@ -33,8 +35,8 @@ class LazyAgentRegistry:
         self.memory_manager = memory_manager
         self.console = Console()
         
-        # 技能目录路径（锚定项目根目录，避免依赖运行时 CWD，Issue #5）
-        self.skills_root = Path(__file__).resolve().parent.parent / ".claude" / "skills"
+        # 技能目录路径：源码 / 自定义目录 / wheel 安装位置（见 utils.skill_paths）
+        self.skills_root = resolve_skills_root()
         
         # 技能映射表: skill_name -> agent_script_path
         self._skill_map: dict[str, Path] = {}

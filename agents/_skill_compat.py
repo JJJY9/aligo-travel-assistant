@@ -7,6 +7,8 @@
 import importlib.util
 from pathlib import Path
 
+from utils.skill_paths import resolve_skills_root
+
 _SKILLS_ROOT = Path(__file__).resolve().parent.parent / ".claude" / "skills"
 
 
@@ -20,7 +22,7 @@ def load_skill_agent(skill: str, class_name: str):
     Raises:
         ImportError: 文件不存在、无法加载，或文件里没有这个类。
     """
-    path = _SKILLS_ROOT / skill / "script" / "agent.py"
+    path = resolve_skills_root() / skill / "script" / "agent.py"
     if not path.is_file():
         raise ImportError(f"智能体实现不存在: {path}")
     module_name = f"_chailv_skill_{skill.replace('-', '_')}_agent"

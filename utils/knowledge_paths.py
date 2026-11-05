@@ -6,9 +6,11 @@ RAG Skill、Web 状态接口、CLI 与 doctor 共用同一套解析逻辑，避�
 """
 from pathlib import Path
 
+from utils.skill_paths import resolve_skills_root
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SKILL_KNOWLEDGE_DIR = (
-    PROJECT_ROOT / ".claude" / "skills" / "ask-question" / "data" / "rag_knowledge"
+    resolve_skills_root() / "ask-question" / "data" / "rag_knowledge"
 )
 LEGACY_KNOWLEDGE_DIR = PROJECT_ROOT / "rag_knowledge"
 COLLECTION_NAME = "business_travel_knowledge"

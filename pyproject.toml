@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aligo-travel-assistant"
-version = "1.4.0"
+version = "1.4.1"
 description = "Aligo 智能旅行助手：基于 AgentScope 的多智能体旅行规划系统"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -103,3 +103,35 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.setuptools.package-data]
 webapp = ["static/*"]
+
+# 技能插件随 wheel 安装到 sys.prefix/.claude/skills（utils/skill_paths.py 会从
+# 源码目录、ALIGO_SKILLS_DIR 或该位置解析），否则安装后 LazyAgentRegistry
+# 找不到任何技能。只打包代码与声明，不包含 data/ 下的知识库 / 文档 / 模型。
+[tool.setuptools.data-files]
+".claude/skills" = [".claude/skills/README.md"]
+".claude/skills/ask-question" = [".claude/skills/ask-question/SKILL.md"]
+".claude/skills/ask-question/script" = [
+    ".claude/skills/ask-question/script/agent.py",
+    ".claude/skills/ask-question/script/init_knowledge_base.py",
+]
+".claude/skills/event-collection" = [".claude/skills/event-collection/SKILL.md"]
+".claude/skills/event-collection/script" = [
+    ".claude/skills/event-collection/script/agent.py",
+]
+".claude/skills/memory-query" = [".claude/skills/memory-query/SKILL.md"]
+".claude/skills/memory-query/script" = [
+    ".claude/skills/memory-query/script/agent.py",
+]
+".claude/skills/plan-trip" = [".claude/skills/plan-trip/SKILL.md"]
+".claude/skills/plan-trip/script" = [
+    ".claude/skills/plan-trip/script/agent.py",
+    ".claude/skills/plan-trip/script/plan_trip_execution.py",
+]
+".claude/skills/preference" = [".claude/skills/preference/SKILL.md"]
+".claude/skills/preference/script" = [
+    ".claude/skills/preference/script/agent.py",
+]
+".claude/skills/query-info" = [".claude/skills/query-info/SKILL.md"]
+".claude/skills/query-info/script" = [
+    ".claude/skills/query-info/script/agent.py",
+]

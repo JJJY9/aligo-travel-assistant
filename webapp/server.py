@@ -77,7 +77,7 @@ from utils.turn_meta import extract_turn_meta
 
 logger = logging.getLogger(__name__)
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # SSE 心跳间隔（秒）：LLM 调用可能持续数十秒，定期发送注释行避免代理/浏览器超时
 SSE_HEARTBEAT_SEC = 15.0
