@@ -10,6 +10,7 @@ from .long_term_memory import LongTermMemory
 from .storage import create_long_term_memory, create_short_term_memory
 from config import STORAGE_CONFIG
 from utils.json_parser import extract_json_from_async_response
+from utils.preference_values import has_preference_value
 from utils.turn_meta import strip_turn_meta
 
 logger = logging.getLogger(__name__)
@@ -166,11 +167,11 @@ class MemoryManager:
 
         # 用户偏好
         prefs = self.long_term.get_preference()
-        has_prefs = any(v for v in prefs.values() if v)
+        has_prefs = any(has_preference_value(v) for v in prefs.values())
         if has_prefs:
             lines.append("【用户偏好】")
             for key, value in prefs.items():
-                if value:
+                if has_preference_value(value):
                     lines.append(f"- {key}: {value}")
             lines.append("")
 

@@ -10,6 +10,7 @@ import re
 import tempfile
 import threading
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,10 @@ logger = logging.getLogger(__name__)
 
 # 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
 # MemoryManager 还会重建实例），按路径共享一把进程内可重入锁，避免并发
-# 读改写互相覆盖。
-_PATH_LOCKS: dict[str, threading.RLock] = {}
+# 读改写互相覆盖。弱引用：实例释放后锁自动移除，不随用户数无限增长。
+_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
 _PATH_LOCKS_GUARD = threading.Lock()
 
 
