@@ -8,13 +8,13 @@
 
 - 仓库**不包含任何真实密钥**：大模型 API Key 通过环境变量 `LLM_API_KEY` 或本地 `config_local.py`（已 gitignore）提供，示例值见 `.env.example`
 - `data/memory/`、`data/models/`、`rag_knowledge/`、`.env` 等运行时产物与本地配置不入库
-- Web 服务默认仅监听 `127.0.0.1`；用户 / 会话 ID 会做字符集校验，接口带基础安全响应头（CSP / `X-Frame-Options` / `/api/` 的 `Cache-Control: no-store` 等）与请求频率限制（对话接口按用户 + IP，知识库写入 / 导入 / 导出 / 语义检索单独按 IP）
+- Web 服务默认仅监听 `127.0.0.1`；用户 / 会话 ID 会做字符集校验，接口带基础安全响应头（CSP / `X-Frame-Options` / `/api/` 的 `Cache-Control: no-store` 等）与请求频率限制（对话接口按用户 + IP，知识库写入 / 导入 / 导出 / 语义检索按 IP，天气查询按 IP）
 
 ## 部署提示
 
 本项目定位为**本地演示实现**。如需对外部署，请自行补充身份认证与授权、HTTPS、反向代理，并建议：
 
-- 设置 `REDIS_URL`：短期记忆与限流计数（用户 / IP / 知识库三个桶）多实例共享，运行中 Redis 故障会回退进程内实现
+- 设置 `REDIS_URL`：短期记忆与限流计数（用户 / IP / 知识库 / 天气四个桶）多实例共享，运行中 Redis 故障会回退进程内实现
 - 设置 `DATABASE_URL`：长期记忆、偏好、行程与会话元数据使用 PostgreSQL；多实例部署不要使用默认 JSON 后端
 - 反向代理后设置 `TRUST_PROXY_HEADERS=1`，并让代理**覆盖写入** `X-Forwarded-For`（应用取第一个地址；添加而不是覆盖会让客户端自带的伪造值排在前面）：
   ```nginx
