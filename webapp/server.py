@@ -79,6 +79,7 @@ from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
 from utils.trip_export import render_trips_csv
 from utils.turn_meta import extract_turn_meta
 from utils.version import APP_VERSION
+from utils.weather import WeatherError, fetch_weather
 
 logger = logging.getLogger(__name__)
 
@@ -1236,6 +1237,19 @@ def create_app(model: Any = None) -> FastAPI:
             },
             "time": datetime.now().isoformat(timespec="seconds"),
         }
+
+    @app.get("/api/weather")
+    def weather(city: str = Query(..., min_length=1, max_length=50)) -> dict[str, Any]:
+        """目的地天气（Open-Meteo，无 API Key；结果缓存 10 分钟）。"""
+        name = city.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="城市不能为空")
+        try:
+            return fetch_weather(name)
+        except WeatherError as exc:
+            message = str(exc)
+            status_code = 404 if message.startswith("未找到城市") else 503
+            raise HTTPException(status_code=status_code, detail=message) from exc
 
     @app.get("/api/metrics")
     def metrics() -> dict[str, Any]:

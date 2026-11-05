@@ -108,6 +108,7 @@ const els = {
   upcomingLabel: byId("upcomingLabel"),
   upcomingRoute: byId("upcomingRoute"),
   upcomingDate: byId("upcomingDate"),
+  upcomingWeather: byId("upcomingWeather"),
   messages: byId("messages"),
   scroll: byId("scroll"),
   input: byId("input"),
@@ -2580,6 +2581,7 @@ function pickUpcomingTrip(trips) {
 function renderUpcoming(trip) {
   if (!trip) {
     els.upcoming.hidden = true;
+    if (els.upcomingWeather) els.upcomingWeather.hidden = true;
     return;
   }
   const status = tripStatus(trip);
@@ -2591,6 +2593,56 @@ function renderUpcoming(trip) {
   els.upcomingDate.textContent = `${trip.start_date}${
     trip.end_date ? ` ~ ${trip.end_date}` : ""
   } · ${trip.purpose || "出行"}`;
+  loadUpcomingWeather(trip.destination || "");
+}
+
+let upcomingWeatherSeq = 0;
+const UPCOMING_WEATHER_CACHE = new Map();
+
+function formatWeatherTemp(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${Math.round(number)}°C` : "";
+}
+
+async function loadUpcomingWeather(city) {
+  const el = els.upcomingWeather;
+  if (!el) return;
+  const name = String(city || "").trim();
+  if (!name) {
+    el.hidden = true;
+    return;
+  }
+  const seq = ++upcomingWeatherSeq;
+  const cached = UPCOMING_WEATHER_CACHE.get(name);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) {
+    el.textContent = cached.text;
+    el.hidden = false;
+    return;
+  }
+  el.hidden = true;
+  try {
+    const data = await getJSON(`/api/weather?city=${encodeURIComponent(name)}`);
+    if (seq !== upcomingWeatherSeq) return;
+    const current = data.current || {};
+    const today =
+      Array.isArray(data.daily) && data.daily.length ? data.daily[0] : null;
+    const parts = [];
+    if (current.description) parts.push(current.description);
+    const currentTemp = formatWeatherTemp(current.temperature);
+    if (currentTemp) parts.push(currentTemp);
+    if (today) {
+      const low = formatWeatherTemp(today.min);
+      const high = formatWeatherTemp(today.max);
+      if (low && high) parts.push(`今日 ${low}~${high}`);
+    }
+    const text = parts.join(" · ");
+    if (!text) return;
+    UPCOMING_WEATHER_CACHE.set(name, { at: Date.now(), text });
+    el.textContent = text;
+    el.hidden = false;
+  } catch {
+    if (seq === upcomingWeatherSeq) el.hidden = true;
+  }
 }
 
 const LIST_PREF_TYPES = new Set(["hotel_brands", "airlines"]);
