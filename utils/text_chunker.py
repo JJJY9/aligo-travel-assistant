@@ -45,22 +45,28 @@ def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
     return not re.search(r"[。；！？!?.;:：]", stripped)
 
 
+def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
+    """判断块是否只由标题行组成（多行连续标题也算）。"""
+    lines = [line for line in chunk.splitlines() if line.strip()]
+    return bool(lines) and all(_is_title_like(line, min_chars) for line in lines)
+
+
 def _merge_short_chunks(chunks: list[str], min_chars: int = 30) -> list[str]:
     """把孤立的标题块并入相邻块。
 
     纯标题块本身没有知识内容，却会因为与查询字面高度相似而挤占检索名额。
-    注意只合并「标题形态」的块（单行、无句读），避免误合并短问答段落。
+    注意只合并「标题形态」的块（单行、无句读），避免误合并短问答段落；
+    连续多行标题（如总标题 + 节标题）要一直挂起到遇到正文为止。
     """
     merged: list[str] = []
     pending = ""
     for chunk in chunks:
-        if pending:
-            chunk = f"{pending}\n{chunk}"
-            pending = ""
-        if _is_title_like(chunk, min_chars):
-            pending = chunk
+        candidate = f"{pending}\n{chunk}" if pending else chunk
+        if _is_title_block(candidate, min_chars):
+            pending = candidate
             continue
-        merged.append(chunk)
+        pending = ""
+        merged.append(candidate)
     if pending:
         if merged:
             merged[-1] = f"{merged[-1]}\n{pending}"

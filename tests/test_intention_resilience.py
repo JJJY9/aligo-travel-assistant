@@ -52,6 +52,25 @@ class _NestedFragmentModel:
         return '分析结果：{"type": "greeting", "confidence": 0.9}，其余省略'
 
 
+class _CaptureModel:
+    """记录 prompt 并返回空调度结果的模型。"""
+
+    def __init__(self):
+        self.prompts = []
+
+    async def __call__(self, messages):
+        self.prompts.append(messages)
+        return json.dumps(
+            {
+                "reasoning": "x",
+                "intents": [],
+                "key_entities": {},
+                "rewritten_query": "x",
+                "agent_schedule": [],
+            }
+        )
+
+
 def _user_msg():
     return Msg(name="user", content="帮我规划去北京的行程", role="user")
 
@@ -128,6 +147,19 @@ def test_nested_fragment_falls_back_to_default_schedule():
     print("✓ 嵌套 JSON 片段降级为默认调度")
 
 
+def test_long_input_is_truncated():
+    """超长输入在意图 prompt 中截断，避免撑爆上下文后被降级并持久化原文。"""
+    model = _CaptureModel()
+    agent = IntentionAgent(name="IntentionAgent", model=model)
+    asyncio.run(
+        agent.reply(Msg(name="user", content="长" * 5000, role="user"))
+    )
+    prompt = str(model.prompts[0])
+    assert "输入过长已截断" in prompt
+    assert len(prompt) < 20000
+    print("✓ 超长输入在意图 prompt 中截断")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
@@ -135,4 +167,5 @@ if __name__ == "__main__":
     test_non_finite_json_falls_back()
     test_non_object_json_falls_back()
     test_nested_fragment_falls_back_to_default_schedule()
+    test_long_input_is_truncated()
     print("\n全部通过")

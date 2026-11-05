@@ -29,6 +29,10 @@ from utils.skill_loader import SkillLoader
 
 logger = logging.getLogger(__name__)
 
+# 意图 prompt 的输入上限：CLI 等入口可以传任意长度，超长输入会触发模型
+# 上下文错误并降级为携带原文的信息查询，污染后续总结
+_MAX_QUERY_CHARS = 4000
+
 
 class IntentionAgent(AgentBase):
     """意图识别智能体（IntentionRecognitionAgent）"""
@@ -72,6 +76,10 @@ class IntentionAgent(AgentBase):
                         self.conversation_history.append(f"{role_name}: {content}")
         else:
             user_query = x.content
+
+        user_query = str(user_query or "")
+        if len(user_query) > _MAX_QUERY_CHARS:
+            user_query = user_query[:_MAX_QUERY_CHARS] + "…（输入过长已截断）"
 
         # 构建上下文
         # 策略：长期记忆始终保留，短期对话全部保留（已在 cli.py 控制数量）

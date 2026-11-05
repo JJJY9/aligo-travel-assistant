@@ -1261,9 +1261,24 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             print("评测失败：RAG 依赖未安装（pip install -r requirements.txt）")
         return 1
 
-    result = evaluate_retrieval(
-        lambda query, top_k: agent.search_knowledge(query, top_k=top_k),
-    )
+    try:
+        result = evaluate_retrieval(
+            lambda query, top_k: agent.search_knowledge(
+                query, top_k=top_k, strict=True
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - 检索后端故障不能报成 0% 命中
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"检索后端不可用：{exc}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"评测失败：检索后端不可用（{exc}）")
+        return 1
     passed = result["hit5"] >= min_hit5
     if as_json:
         payload = dict(result)

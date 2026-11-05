@@ -77,8 +77,32 @@ def test_failure_when_agent_init_raises(monkeypatch):
 class _FakeAgent:
     initialized = True
 
-    def search_knowledge(self, query, top_k=5):
+    def search_knowledge(self, query, top_k=5, strict=False):
         return [{"content": "命中"}]
+
+
+class _SearchBoomAgent:
+    initialized = True
+
+    def __init__(self, **kwargs):
+        pass
+
+    def search_knowledge(self, query, top_k=5, strict=False):
+        raise ConnectionError("milvus down")
+
+
+def test_failure_when_search_backend_raises(monkeypatch):
+    """逐题检索故障要报后端错误，不能算成 hit@5=0% 的质量不达标。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
+    monkeypatch.setattr(
+        rag_knowledge_agent, "RAGKnowledgeAgent", _SearchBoomAgent
+    )
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 1
+    assert payload["ok"] is False
+    assert "检索后端不可用" in payload["error"]
+    print("✓ 检索故障 → 失败（退出码 1）")
 
 
 def _fake_result(hit5):
@@ -164,6 +188,7 @@ if __name__ == "__main__":
         test_skip_when_uninitialized,
         test_failure_on_infra_error,
         test_failure_when_agent_init_raises,
+        test_failure_when_search_backend_raises,
         test_pass_and_fail_thresholds,
         test_hint_when_all_miss,
         test_json_output,
