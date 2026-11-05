@@ -3101,6 +3101,7 @@ async function runSemanticSearch({ silent = false } = {}) {
 async function runKbEval() {
   if (!els.kbEval) return;
   els.kbEval.disabled = true;
+  els.kbEval.setAttribute("aria-busy", "true");
   els.kbEval.textContent = "评测中…";
   if (els.kbEvalResult) {
     els.kbEvalResult.hidden = false;
@@ -3122,6 +3123,7 @@ async function runKbEval() {
     if (els.kbEvalResult) els.kbEvalResult.textContent = `评测失败：${error.message}`;
   } finally {
     els.kbEval.disabled = false;
+    els.kbEval.removeAttribute("aria-busy");
     els.kbEval.textContent = "检索评测";
   }
 }
