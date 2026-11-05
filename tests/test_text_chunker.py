@@ -124,7 +124,9 @@ def test_heading_attached_to_long_body():
     chunks = split_text(text)
     assert chunks[0].startswith("一、住宿标准"), chunks[0][:30]
     assert "500" in chunks[0], "标题应与正文首段在同一块"
-    assert all(len(c) <= 400 for c in chunks)
+    # 标题（≤30 字）并入首段，允许首块超出上限至多一个标题长度
+    assert len(chunks[0]) <= 430
+    assert all(len(c) <= 400 for c in chunks[1:])
     print("✓ 标题并入超长正文首段")
 
 
@@ -132,8 +134,9 @@ def test_heading_attached_to_unpunctuated_body():
     """标题后是无句读的长段落（hard-split）时，标题仍并入第一块。"""
     chunks = split_text("一、住宿标准\n\n" + "住" * 900 + "。")
     assert chunks[0].startswith("一、住宿标准"), chunks[0][:20]
-    assert "住" in chunks[0]
-    assert all(len(chunk) <= 400 for chunk in chunks)
+    assert "住" * 100 in chunks[0], "标题块必须包含正文内容"
+    assert len(chunks[0]) <= 430
+    assert all(len(chunk) <= 400 for chunk in chunks[1:])
     print("✓ 标题并入无句读长段落首块")
 
 

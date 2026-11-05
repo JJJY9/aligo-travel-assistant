@@ -3788,6 +3788,17 @@ def test_knowledge_transfer_api(monkeypatch):
         client.post("/api/knowledge/import", json={"documents": too_many}).status_code
         == 422
     )
+
+    # 备份还原超限 → 400（不能静默截断，也不能误报为 503）
+    def too_big(documents):
+        raise ValueError("备份中的文档超过还原上限（20000 字），请拆分后导入")
+
+    monkeypatch.setattr(server_module, "import_documents", too_big)
+    oversized = client.post(
+        "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+    )
+    assert oversized.status_code == 400
+    assert "还原上限" in oversized.json()["detail"]
     print("✓ /api/knowledge/export 与 /api/knowledge/import")
 
 

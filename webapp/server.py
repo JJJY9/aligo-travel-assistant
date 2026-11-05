@@ -1748,6 +1748,8 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
             logger.warning("导入知识片段失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"导入失败：{exc}") from exc
@@ -2066,7 +2068,9 @@ def create_app(model: Any = None) -> FastAPI:
             try:
                 existed = await asyncio.to_thread(_exists)
             except Exception as exc:  # noqa: BLE001 - 读失败统一提示
-                if not already_marked:
+                if not already_marked and not state.shared_tombstones_active():
+                    # 进程内墓碑可以撤销（允许该 id 继续使用）；共享墓碑可能
+                    # 被其它实例的同一删除依赖，读失败时保守保留
                     await asyncio.to_thread(
                         state.unmark_deleted, user_id, session_id
                     )

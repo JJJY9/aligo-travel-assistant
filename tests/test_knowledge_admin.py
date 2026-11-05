@@ -47,6 +47,35 @@ class _FakeMilvusClient:
         # 与真实 Milvus 一致：查询受 limit / offset 限制（分页回归才能被测出）
         return list(self.rows)[offset : offset + limit]
 
+    def query_iterator(self, collection_name, batch_size=1000, limit=-1, filter="", output_fields=None):
+        low, high = 0, None
+        if filter and filter.startswith("id >="):
+            import re
+
+            match = re.match(r"id >= (\d+)(?: and id < (\d+))?", filter)
+            if match:
+                low = int(match.group(1))
+                high = int(match.group(2)) if match.group(2) else None
+        rows = [
+            row
+            for row in self.rows
+            if int(row["id"]) >= low and (high is None or int(row["id"]) < high)
+        ]
+
+        class _Iterator:
+            def __init__(self):
+                self.pos = 0
+
+            def next(self):
+                batch = rows[self.pos : self.pos + batch_size]
+                self.pos += batch_size
+                return batch
+
+            def close(self):
+                pass
+
+        return _Iterator()
+
     def delete(self, collection_name, ids):
         self.deleted.extend(ids)
         self.rows = [row for row in self.rows if int(row["id"]) not in ids]
@@ -320,9 +349,7 @@ def test_import_documents_sanitizes(monkeypatch):
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
-    monkeypatch.setattr(
-        knowledge_admin, "list_documents", lambda limit, offset=0: {"total": 0, "items": []}
-    )
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
     agent = _FakeAgent({"status": "success", "ids": [1, 2], "total_count": 2})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
 
@@ -609,16 +636,31 @@ def test_chunk_documents_marks_even_with_full_metadata(monkeypatch):
     print("✓ 元数据较多时分片标记仍然写入")
 
 
+def test_existing_contents_scans_all_rows(monkeypatch):
+    """去重快照走全量扫描（iterator 分批），不依赖单页 16384 条上限。"""
+    rows = [
+        {"id": index, "content": f"c{index}", "metadata": "{}"}
+        for index in range(1, 26)
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 4)
+    assert knowledge_admin._existing_contents() == {
+        row["content"] for row in rows
+    }
+    documents = knowledge_admin.export_documents()
+    assert [item["content"] for item in documents] == [
+        f"c{index}" for index in range(1, 26)
+    ]
+    print("✓ 去重快照与导出的全量扫描")
+
+
 def test_import_regroups_exported_chunks(monkeypatch):
     """导出备份中同一 group 的分片应按 part 拼回整篇再导入，而不是各自成条。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
-    monkeypatch.setattr(
-        knowledge_admin,
-        "list_documents",
-        lambda limit, offset=0: {"total": 0, "items": []},
-    )
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
 
     class _Agent:
         def __init__(self):
@@ -663,17 +705,7 @@ def test_import_skips_fully_existing_group(monkeypatch):
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     part1, part2 = "第一片内容", "第二片内容"
-    monkeypatch.setattr(
-        knowledge_admin,
-        "list_documents",
-        lambda limit, offset=0: {
-            "total": 2,
-            "items": [
-                {"id": 1, "content": part1, "metadata": {"group": "g"}},
-                {"id": 2, "content": part2, "metadata": {"group": "g"}},
-            ],
-        },
-    )
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {part1, part2})
 
     class _Agent:
         def __init__(self):
@@ -701,11 +733,7 @@ def test_import_restores_large_group_without_truncation(monkeypatch):
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
-    monkeypatch.setattr(
-        knowledge_admin,
-        "list_documents",
-        lambda limit, offset=0: {"total": 0, "items": []},
-    )
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
 
     class _Agent:
         def __init__(self):
@@ -740,8 +768,8 @@ def test_import_restores_large_group_without_truncation(monkeypatch):
     print("✓ 超长整组备份恢复不截断")
 
 
-def test_group_member_ids_scans_multiple_windows(monkeypatch):
-    """分片分散在多个 id 窗口时都要扫描到（不依赖单页 / offset 上限）。"""
+def test_group_member_ids_scans_all_batches(monkeypatch):
+    """分片分散在多个迭代批次时都要扫描到（不依赖单页 16384 条限制）。"""
     rows = [
         {
             "id": index,
@@ -753,10 +781,33 @@ def test_group_member_ids_scans_multiple_windows(monkeypatch):
         for index in range(1, 31)
     ]
     fake = _FakeMilvusClient(rows)
-    monkeypatch.setattr(knowledge_admin, "_MAX_SCAN", 10)
+    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 10)
     assert sorted(knowledge_admin._group_member_ids(fake, "g")) == [3, 15, 25]
     assert knowledge_admin._group_member_ids(fake, "missing") == []
-    print("✓ 组内分片跨多个 id 窗口扫描")
+    print("✓ 组内分片跨多个迭代批次扫描")
+
+
+def test_import_restore_over_limit_raises(monkeypatch):
+    """备份还原超过上限时报错而不是静默截断。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _Agent:
+        def add_documents(self, documents):
+            raise AssertionError("超限备份不应进入写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    monkeypatch.setattr(knowledge_admin, "_RESTORE_CONTENT_MAX_CHARS", 500)
+    part_text = "长" * 300
+    documents = [
+        {"content": part_text, "metadata": {"group": "g", "part": "1", "parts": "2"}},
+        {"content": part_text, "metadata": {"group": "g", "part": "2", "parts": "2"}},
+    ]
+    with pytest.raises(ValueError, match="还原上限"):
+        knowledge_admin.import_documents(documents)
+    print("✓ 超限备份还原明确报错（不静默截断）")
 
 
 def test_delete_document_whole_group(monkeypatch):
@@ -787,12 +838,7 @@ def test_import_skips_existing_and_duplicate_content(monkeypatch):
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(
-        knowledge_admin,
-        "list_documents",
-        lambda limit, offset=0: {
-            "total": 1,
-            "items": [{"id": 1, "content": "已有内容", "metadata": {}}],
-        },
+        knowledge_admin, "_existing_contents", lambda: {"已有内容"}
     )
     agent = _FakeAgent({"status": "success", "ids": [2], "total_count": 2})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
@@ -810,9 +856,7 @@ def test_import_failure_reports_partial_count(monkeypatch):
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
-    monkeypatch.setattr(
-        knowledge_admin, "list_documents", lambda limit, offset=0: {"total": 0, "items": []}
-    )
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
 
     class _FailSecondBatch:
         def __init__(self):
@@ -856,9 +900,7 @@ def test_import_chunks_large_documents(monkeypatch):
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
-    monkeypatch.setattr(
-        knowledge_admin, "list_documents", lambda limit, offset=0: {"total": 0, "items": []}
-    )
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
 
     class _BatchAgent:
         def __init__(self):
@@ -898,9 +940,11 @@ if __name__ == "__main__":
         test_update_grouped_update_failure_rolls_back_extras,
         test_chunk_documents_marks_even_with_full_metadata,
         test_import_regroups_exported_chunks,
+        test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_restores_large_group_without_truncation,
-        test_group_member_ids_scans_multiple_windows,
+        test_group_member_ids_scans_all_batches,
+        test_import_restore_over_limit_raises,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
         test_delete_document_checks_existence,
