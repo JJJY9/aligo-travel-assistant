@@ -145,6 +145,8 @@ def _security_headers_for(path: str) -> list[tuple[bytes, bytes]]:
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = PROJECT_ROOT / "data" / "memory"
+# 未匹配路由（404 / 405）的指标路径统一取值，避免任意路径撑爆指标基数
+_UNMATCHED_METRIC_PATH = "__unmatched__"
 
 
 class RequestContextMiddleware:
@@ -257,8 +259,12 @@ class RequestContextMiddleware:
                         request_id,
                     ),
                 )
+                # 指标用路由模板（/api/sessions/{session_id}）而不是原始路径：
+                # 会话 ID 等动态段不会撑爆基数，未匹配的 404 统一归入 __unmatched__
+                route = scope.get("route")
+                metric_path = getattr(route, "path", None) or _UNMATCHED_METRIC_PATH
                 REQUEST_METRICS.record(
-                    scope.get("method", ""), path, status_code, elapsed_ms
+                    scope.get("method", ""), metric_path, status_code, elapsed_ms
                 )
 
 
@@ -1415,7 +1421,8 @@ def create_app(model: Any = None) -> FastAPI:
             "(0 closed, 1 half_open, 2 open, 3 unknown).\n"
             "# TYPE aligo_circuit_breaker_state gauge\n"
             f"aligo_circuit_breaker_state {breaker_state}\n"
-            "# HELP aligo_circuit_breaker_failures Consecutive failure count.\n"
+            "# HELP aligo_circuit_breaker_failures Circuit breaker failure count "
+            "(frozen at the trip threshold while open / half_open).\n"
             "# TYPE aligo_circuit_breaker_failures gauge\n"
             f"aligo_circuit_breaker_failures {int(breaker.get('failure_count') or 0)}\n"
             "# HELP aligo_sessions_cached Cached sessions in this process.\n"

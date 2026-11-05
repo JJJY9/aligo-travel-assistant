@@ -42,7 +42,8 @@ class RequestMetrics:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._started_at = time.time()
+        # 用单调时钟计算 uptime：系统时间回拨 / 校时不会让指标倒退或变负
+        self._started_at = time.monotonic()
         self._total = 0
         self._by_status: Counter[int] = Counter()
         self._by_method: Counter[str] = Counter()
@@ -76,7 +77,7 @@ class RequestMetrics:
             total = self._total
             samples = sorted(self._durations)
             return {
-                "uptime_sec": round(time.time() - self._started_at, 1),
+                "uptime_sec": round(time.monotonic() - self._started_at, 1),
                 "requests_total": total,
                 "by_status": {str(key): value for key, value in sorted(self._by_status.items())},
                 "by_method": dict(self._by_method.most_common(20)),
@@ -103,7 +104,7 @@ class RequestMetrics:
             p50_seconds = _percentile(samples, 0.50) / 1000
             p95_seconds = _percentile(samples, 0.95) / 1000
             sample_count = len(samples)
-            uptime = time.time() - self._started_at
+            uptime = time.monotonic() - self._started_at
 
         lines = [
             "# HELP aligo_requests_total Total HTTP requests recorded by this process.",
@@ -140,10 +141,20 @@ class RequestMetrics:
             [
                 "# HELP aligo_request_duration_seconds Request duration statistics.",
                 "# TYPE aligo_request_duration_seconds gauge",
-                f"aligo_request_duration_seconds{{quantile=\"avg\"}} {avg_seconds:.6f}",
-                f"aligo_request_duration_seconds{{quantile=\"max\"}} {max_seconds:.6f}",
-                f"aligo_request_duration_seconds{{quantile=\"p50\"}} {p50_seconds:.6f}",
-                f"aligo_request_duration_seconds{{quantile=\"p95\"}} {p95_seconds:.6f}",
+            ]
+        )
+        # 没有样本时省略数值行：输出 0 会被误读成“测得 0 秒”
+        if sample_count:
+            lines.extend(
+                [
+                    f'aligo_request_duration_seconds{{quantile="avg"}} {avg_seconds:.6f}',
+                    f'aligo_request_duration_seconds{{quantile="max"}} {max_seconds:.6f}',
+                    f'aligo_request_duration_seconds{{quantile="p50"}} {p50_seconds:.6f}',
+                    f'aligo_request_duration_seconds{{quantile="p95"}} {p95_seconds:.6f}',
+                ]
+            )
+        lines.extend(
+            [
                 "# HELP aligo_request_duration_samples Number of durations used for percentiles.",
                 "# TYPE aligo_request_duration_samples gauge",
                 f"aligo_request_duration_samples {sample_count}",
@@ -157,7 +168,7 @@ class RequestMetrics:
     def reset(self) -> None:
         """清空统计（测试或运维需要时使用）。"""
         with self._lock:
-            self._started_at = time.time()
+            self._started_at = time.monotonic()
             self._total = 0
             self._by_status.clear()
             self._by_method.clear()

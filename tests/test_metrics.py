@@ -5,6 +5,7 @@
 """
 import os
 import sys
+import time
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -96,6 +97,22 @@ def test_prometheus_render():
     print("✓ Prometheus 文本指标（标签转义 / 百分位）")
 
 
+def test_prometheus_omits_duration_stats_without_samples():
+    metrics = RequestMetrics()
+    text = metrics.render_prometheus()
+    assert "aligo_request_duration_samples 0" in text
+    assert "aligo_request_duration_seconds{" not in text, "无样本时不应输出 0 耗时"
+    print("✓ 无样本时不输出耗时统计")
+
+
+def test_uptime_uses_monotonic_clock():
+    metrics = RequestMetrics()
+    metrics._started_at = time.monotonic() - 3.0  # noqa: SLF001
+    uptime = metrics.snapshot()["uptime_sec"]
+    assert 3.0 <= uptime < 60, "uptime 应基于单调时钟，墙钟回拨不影响"
+    print("✓ uptime 基于单调时钟")
+
+
 def test_reset():
     metrics = RequestMetrics()
     metrics.record("GET", "/api/health", 200, 1.0)
@@ -116,5 +133,7 @@ if __name__ == "__main__":
     test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()
     test_prometheus_render()
+    test_prometheus_omits_duration_stats_without_samples()
+    test_uptime_uses_monotonic_clock()
     test_reset()
     print("\n全部通过")
