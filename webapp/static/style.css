@@ -13,6 +13,9 @@
   --line-strong: #cfdad9;
   --accent: #c44720;
   --accent-strong: #b83f1c;
+  --accent-fill: #c44720;
+  --accent-fill-strong: #b83f1c;
+  --accent-text: #b83f1c;
   --accent-soft: #fbe9e2;
   --teal: #0f6f69;
   --teal-soft: #e0f0ee;
@@ -44,7 +47,10 @@
   --line-strong: #2b434a;
   --accent: #ff6b3d;
   --accent-strong: #ff8259;
-  --accent-soft: rgba(255, 107, 61, 0.13);
+  --accent-fill: #cc461a;
+  --accent-fill-strong: #b03a17;
+  --accent-text: #ff9a78;
+  --accent-soft: rgba(204, 70, 26, 0.16);
   --teal: #52b7ae;
   --teal-soft: rgba(82, 183, 174, 0.14);
   --danger: #ff7a70;
@@ -79,7 +85,7 @@ button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 a { color: var(--teal); }
 [hidden] { display: none !important; }
-::selection { background: var(--accent-soft); color: var(--accent-strong); }
+::selection { background: var(--accent-soft); color: var(--accent-text); }
 mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; padding: 0 1px; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
@@ -158,7 +164,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   border-radius: 11px;
   display: grid;
   place-items: center;
-  background: var(--accent);
+  background: var(--accent-fill);
   color: #fff;
   flex: none;
 }
@@ -555,8 +561,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-size: 12px;
 }
 .user-edit-actions button:hover:not(:disabled) { border-color: rgba(255, 255, 255, 0.55); }
-.user-edit-actions button.save { border-color: var(--accent); background: var(--accent); color: #fff; }
-.user-edit-actions button.save:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); }
+.user-edit-actions button.save { border-color: var(--accent-fill); background: var(--accent-fill); color: #fff; }
+.user-edit-actions button.save:hover:not(:disabled) { background: var(--accent-fill-strong); border-color: var(--accent-fill-strong); }
 .user-edit-actions button:disabled { opacity: 0.55; cursor: default; }
 .msg.user .user-edit { margin-top: 2px; }
 
@@ -575,7 +581,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   border-radius: 7px;
   display: grid;
   place-items: center;
-  background: var(--accent);
+  background: var(--accent-fill);
   color: #fff;
 }
 .msg-avatar .icon { width: 13px; height: 13px; }
@@ -637,7 +643,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   opacity: 0;
   transition: opacity 0.15s ease;
 }
-.bubble.answer pre:hover .code-copy { opacity: 1; }
+.bubble.answer pre:hover .code-copy,
+.bubble.answer pre:focus-within .code-copy { opacity: 1; }
 .table-wrap { margin: 12px 0; overflow-x: auto; }
 .bubble.answer table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .bubble.answer th, .bubble.answer td { padding: 7px 10px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
@@ -822,13 +829,13 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   height: 34px;
   border: 0;
   border-radius: 10px;
-  background: var(--accent);
+  background: var(--accent-fill);
   color: #fff;
   flex: none;
   transition: background 0.15s ease, opacity 0.15s ease;
 }
 .send-btn .icon { width: 17px; height: 17px; }
-.send-btn:hover { background: var(--accent-strong); }
+.send-btn:hover { background: var(--accent-fill-strong); }
 .send-btn:disabled { opacity: 0.4; cursor: default; }
 .stop-btn {
   display: inline-flex;
@@ -1025,7 +1032,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-weight: 600;
 }
 .trip-status.active { background: var(--teal-soft); color: var(--teal); }
-.trip-status.upcoming { background: var(--accent-soft); color: var(--accent-strong); }
+.trip-status.upcoming { background: var(--accent-soft); color: var(--accent-text); }
 .trip-status.past { background: var(--surface-2); color: var(--ink-3); }
 .trip-status.conflict { background: var(--danger-soft); color: var(--danger); }
 .trip.clickable { cursor: pointer; transition: background 0.15s ease; }
