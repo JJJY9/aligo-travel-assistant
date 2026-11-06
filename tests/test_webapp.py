@@ -301,6 +301,9 @@ def test_chat_stream_events():
         assert done["session_id"] == "sess-stream"
         assert done["reply"]
         assert done["usage"]["calls"] >= 1
+        state = client.app.state.aligo
+        session = state.sessions[state._session_key(user_id, "sess-stream")]
+        assert session.in_use() is False, "流结束后必须解除在用标记"
         print("✓ /api/chat/stream 推送进度事件并以 done 结束")
     finally:
         _cleanup(user_id)
@@ -406,7 +409,7 @@ def test_chat_storage_failure_maps_503(monkeypatch):
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
 
-    def boom(user, session):
+    def boom(user, session, *args):
         raise MemoryPersistenceError("disk full")
 
     monkeypatch.setattr(state, "get_session", boom)
@@ -3351,6 +3354,78 @@ def test_lock_table_overflow_uses_shared_lock():
     print("✓ 并发高峰下锁表保持有界（共享兜底锁）")
 
 
+def test_lock_eviction_skips_waiting_lock():
+    """有等待者的锁不能被淘汰：持有者刚 release 时等待者还没恢复执行。"""
+    import asyncio
+
+    async def scenario():
+        state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+        state.max_locks = 1
+        state.locks.clear()
+        lock = state.lock_for("holder")
+        await lock.acquire()
+        waiter = asyncio.create_task(lock.acquire())
+        await asyncio.sleep(0)  # 等待者已排队但拿不到锁
+        lock.release()  # 等待者即将恢复执行，此刻 locked() 为 False
+        picked = state.lock_for("newcomer")
+        assert picked is state.overflow_lock, "有等待者的锁不能被淘汰"
+        assert "holder" in state.locks
+        await waiter
+        lock.release()
+
+    asyncio.run(scenario())
+    print("✓ 用户锁淘汰跳过有等待者的锁")
+
+
+def test_session_lru_skips_in_use_sessions():
+    """LRU 淘汰不能关闭正在对话的会话，也不能淘汰本次要返回的会话。"""
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state.max_sessions = 1
+    closed = []
+
+    busy = state.get_session("u-lru", "busy", True)
+    busy.close = lambda: closed.append(busy)  # 实例属性覆盖 close
+
+    idle = state.get_session("u-lru", "idle")
+    assert len(state.sessions) == 2, "在用会话不能被淘汰（暂时超限）"
+    assert idle not in closed and busy not in closed, "本次返回的会话也不能被淘汰"
+
+    busy.end_turn()
+    state.get_session("u-lru", "next")
+    assert closed == [busy], "请求结束后最久未用的会话可被淘汰"
+    assert len(state.sessions) == 1, "超出上限的其它空闲会话应继续回收"
+
+    only = state.sessions[state._session_key("u-lru", "next")]
+    only.begin_turn()
+    state.get_session("u-lru", "third")
+    assert len(state.sessions) == 2, "全部在用时应暂时超限而不是关闭"
+
+    # 占用标记泄漏（如 SSE 响应未启动就断开）：超过上限时长后允许回收
+    only._turn_started_at -= state.session_turn_leak_sec + 1
+    state.get_session("u-lru", "fourth")
+    assert state._session_key("u-lru", "next") not in state.sessions
+    only.end_turn()
+    print("✓ 会话 LRU 跳过在用会话 / 本次返回的会话")
+
+
+def test_chat_releases_session_in_use_mark():
+    """对话结束后必须解除在用标记，否则会话永远不会被回收。"""
+    client = _client()
+    user_id = _unique_user("web_test_turn_flag")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "turn-flag"},
+        )
+        assert response.status_code == 200
+        state = client.app.state.aligo
+        session = state.sessions[state._session_key(user_id, "turn-flag")]
+        assert session.in_use() is False
+        print("✓ 对话结束后解除会话在用标记")
+    finally:
+        _cleanup(user_id)
+
+
 def test_request_body_too_large():
     client = _client()
     response = client.post(
@@ -4453,6 +4528,9 @@ if __name__ == "__main__":
     test_security_headers()
     test_lock_table_is_bounded()
     test_lock_table_overflow_uses_shared_lock()
+    test_lock_eviction_skips_waiting_lock()
+    test_session_lru_skips_in_use_sessions()
+    test_chat_releases_session_in_use_mark()
     test_request_body_too_large()
     test_chunked_request_body_too_large()
     test_chunked_request_body_allowed_under_limit()
