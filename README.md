@@ -503,7 +503,7 @@ python cli.py
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id> [--dry-run] [--json]` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），`--dry-run` 只列出将被删除的记录，`--json` 输出结构化结果（将删除 / 已删除条目与歧义 id）；同一 trip_id 出现在多条不同行程里（历史数据异常）时拒绝自动删除并提示人工处理；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
-行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`）或 iCalendar（`--ics`，与 Web 的 `/api/trips/calendar` 同一实现，默认 `exports/aligo_trips.ics`；已存在时需 `--force` 覆盖）。
+行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics] [--query 关键词]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`）或 iCalendar（`--ics`，与 Web 的 `/api/trips/calendar` 同一实现，默认 `exports/aligo_trips.ics`；已存在时需 `--force` 覆盖；`--query` 与面板 / CLI 列表同一口径过滤后导出）。
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部、`--query <关键词>` 按标题与消息内容过滤并附命中片段、`--json` 输出机器可读列表；`python cli.py session-archive <user_id> <session_id> [--restore] [--json]` 归档 / 恢复会话（`--json` 输出结构化结果）；`python cli.py session-title <user_id> <session_id> <标题|--reset> [--json]` 设置 / 重置会话标题（上限 60 字，`--reset` 恢复自动标题）；`python cli.py session-pin <user_id> <session_id> [--off] [--json]` 置顶 / 取消置顶会话；`python cli.py session-show <user_id> <session_id> [--json]` 查看单个会话（标题 / 置顶 / 归档状态与按时间排序的消息，助手消息重新渲染，`--json` 输出原始消息）；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
 
@@ -629,7 +629,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；与其它行程完全重复时返回 409，返回日期重叠的 `conflicts`） |
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件，含出行前一天 09:00 提醒 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过；每个事件含前一天 09:00 提醒） |
-| GET | `/api/trips/export` | 导出全部历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开） |
+| GET | `/api/trips/export` | 导出历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开；`q` 与列表接口同一口径过滤后导出） |
 | GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，`order=asc\|desc` 切换记录顺序，`q` 按路线 / 日期 / 目的过滤，附带日期重叠信息） |
 | DELETE | `/api/trips/{id}` | 删除一条历史行程（同步统计与常去目的地） |
 

@@ -134,6 +134,33 @@ def test_trip_interval_and_state(monkeypatch):
     print("✓ trip_interval / trip_state_label")
 
 
+def test_filter_trips_by_query_helper():
+    """面板 / API / CLI 共用的关键词过滤口径。"""
+    from utils.trip_conflicts import filter_trips_by_query
+
+    trips = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "purpose": "出差",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "purpose": "会议",
+            "start_date": "2026-12-05",
+        },
+    ]
+    assert filter_trips_by_query(trips, "") == trips
+    assert filter_trips_by_query(trips, "上海") == [trips[0]]
+    assert filter_trips_by_query(trips, "北京 上海") == [trips[0]], "跨字段多词"
+    assert filter_trips_by_query(trips, "会议") == [trips[1]]
+    assert filter_trips_by_query(trips, "不存在") == []
+    print("✓ filter_trips_by_query（面板口径）")
+
+
 def test_trips_with_conflicts_uses_pool_without_mutation(monkeypatch):
     trips = [
         _trip("上海", "2026-12-01", "2026-12-03"),
@@ -894,6 +921,7 @@ def test_trips_query_args_and_dispatch(monkeypatch):
 if __name__ == "__main__":
     for case in (
         test_trip_interval_and_state,
+        test_filter_trips_by_query_helper,
         test_trips_with_conflicts_uses_pool_without_mutation,
         test_trips_list_json,
         test_trips_list_output,

@@ -39,6 +39,35 @@ def trip_conflicts(
     return conflicts
 
 
+def filter_trips_by_query(
+    trips: list[dict[str, Any]], query: str
+) -> list[dict[str, Any]]:
+    """按关键词过滤行程（面板 / Web API / CLI 同一口径）。
+
+    五个展示字段（origin / destination / purpose / start_date / end_date）
+    用空格拼接后做整体包含匹配（大小写不敏感），支持跨字段多词查询
+    （如「北京 上海」）；空关键词原样返回。
+    """
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return list(trips)
+    return [
+        trip
+        for trip in trips
+        if needle
+        in " ".join(
+            str(trip.get(key) or "")
+            for key in (
+                "origin",
+                "destination",
+                "purpose",
+                "start_date",
+                "end_date",
+            )
+        ).casefold()
+    ]
+
+
 def trips_with_conflicts(
     trips: list[dict[str, Any]], pool: list[dict[str, Any]] | None = None
 ) -> list[dict[str, Any]]:

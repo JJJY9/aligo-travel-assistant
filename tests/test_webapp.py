@@ -2326,6 +2326,60 @@ def test_session_metadata_storage_failure_maps_503(monkeypatch):
     print("✓ 会话标题 / 置顶 / 归档写盘失败 → 503")
 
 
+def test_trips_csv_export_query_filter():
+    """导出接口的 q 与列表接口同一口径，只导出命中的行程。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trips_export_q")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-12-01",
+                    "end_date": "2026-12-02",
+                    "purpose": "出差",
+                }
+            )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-12-05",
+                    "end_date": "2026-12-06",
+                    "purpose": "会议",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        full = client.get("/api/trips/export", params={"user_id": user_id})
+        assert full.status_code == 200
+        assert "上海" in full.text and "杭州" in full.text
+
+        filtered = client.get(
+            "/api/trips/export", params={"user_id": user_id, "q": "上海"}
+        )
+        assert filtered.status_code == 200
+        assert filtered.text.startswith("﻿")
+        assert "上海" in filtered.text and "杭州" not in filtered.text
+
+        empty = client.get(
+            "/api/trips/export", params={"user_id": user_id, "q": "不存在"}
+        )
+        assert empty.status_code == 200
+        lines = [line for line in empty.text.strip().splitlines() if line]
+        assert len(lines) == 1, "无匹配时只保留表头"
+        print("✓ /api/trips/export q 过滤")
+    finally:
+        _cleanup(user_id)
+
+
 def test_trips_csv_storage_failure_maps_503(monkeypatch):
     from webapp import server as server_module
 
@@ -4890,6 +4944,7 @@ if __name__ == "__main__":
     finally:
         _mp_ics.undo()
     test_trips_csv_export()
+    test_trips_csv_export_query_filter()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()
