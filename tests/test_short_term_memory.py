@@ -235,6 +235,27 @@ class _FlakyRedis:
         self.eval_calls += 1
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:]) or [""]
+        if "ipairs(stale)" in script:
+            # 条件清空：只删除 cutoff 之前写入的消息
+            cut = args[0] if args else ""
+            if cut == "":
+                count = len(self.data)
+                self.data.clear()
+                return count
+            stale = 0
+            kept = []
+            for raw in self.data:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    msg = None
+                timestamp = msg.get("timestamp") if isinstance(msg, dict) else None
+                if isinstance(timestamp, str) and timestamp <= cut:
+                    stale += 1
+                else:
+                    kept.append(raw)
+            self.data = kept
+            return stale
         if "SADD" in script:
             # 幂等追加：按 op_id 去重后 RPUSH，窗口裁剪与 TTL 略去
             applied = self.applied.setdefault(keys[1], set())
@@ -632,6 +653,7 @@ def test_truncate_replay_cutoff_skips_newer_same_text_turn(monkeypatch):
     assert contents == ["同一个问题", "回答一", "同一个问题", "回答二"], (
         "cutoff 之后写入的同文本轮次不能被重放误删"
     )
+    assert client.markers == {}, "重放（未匹配）后标记也要清理"
     print("✓ 截断重放用 cutoff 排除故障期新写入的同文本轮次")
 
 
@@ -781,6 +803,7 @@ def test_online_truncate_response_lost_does_not_double_delete(monkeypatch):
     contents = [item["content"] for item in reader.get_recent_context()]
     assert contents == ["同一个问题", "回答一"], "响应丢失后重放不能多删一轮"
     assert reader._pending_ops == []
+    assert client.markers == {}, "标记命中（-1）后也要清理"
     print("✓ 在线截断响应丢失后重放不多删")
 
 
@@ -798,8 +821,9 @@ def test_clear_then_add_replays_in_order(monkeypatch):
     memory.add_message("user", "清空前的消息")
     memory.clear()  # 丢弃更早的排队操作
     memory.add_message("user", "清空后的消息")
-    kinds = [kind for kind, _ in memory._pending_ops]
-    assert kinds == ["clear", "add"], kinds
+    ops = memory._pending_ops
+    assert [kind for kind, _ in ops] == ["clear", "add"], ops
+    assert isinstance(ops[0][1], str) and ops[0][1], "clear 必须携带发起时刻"
 
     client.fail = False
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -923,7 +947,7 @@ def test_clear_short_term_session_failure_queues_clear(monkeypatch):
     print("✓ 会话删除失败时登记整键删除")
 
 
-def test_eviction_prefers_add_only_journals(monkeypatch):
+def test_eviction_prefers_add_only_journals(monkeypatch, caplog):
     """注册表满额时优先淘汰只含新增的日志，含删除操作的日志留到最后。"""
     from context import short_term_memory as module
 
@@ -940,6 +964,7 @@ def test_eviction_prefers_add_only_journals(monkeypatch):
             pass
         assert "del-keep" in module._PENDING_JOURNALS, "含删除的日志应最后淘汰"
         assert len(module._PENDING_JOURNALS) <= module._PENDING_JOURNALS_MAX
+        assert "丢弃最旧会话" in caplog.text, "淘汰待重放消息必须记录警告"
     finally:
         with module._PENDING_JOURNALS_LOCK:
             module._PENDING_JOURNALS.clear()
@@ -968,22 +993,24 @@ def test_clear_op_survives_journal_trim(monkeypatch):
     print("✓ clear 操作不参与日志裁剪")
 
 
-def test_expired_clear_op_is_skipped(monkeypatch):
-    """迟到的整键删除（超过墓碑窗口）不应清掉已合法复用的会话。"""
+def test_clear_replay_keeps_messages_written_after_cutoff(monkeypatch):
+    """迟到的清空只删 cutoff 之前的消息，墓碑过期后复用的新会话消息保留。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     client = _FlakyRedis()
-    client.data = [_message("user", "复用的新会话", "2000-01-01T00:00:00")]
-    memory = module.RedisShortTermMemory(client, "s-expired", max_turns=5, user_id="u1")
+    client.data = [
+        _message("user", "已删除会话的旧内容", "2000-01-01T00:00:00"),
+        _message("assistant", "旧回答", "2000-01-01T00:00:01"),
+        _message("user", "复用后的新会话", "2099-01-01T00:00:00"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-cutclear", max_turns=5, user_id="u1")
     module.queue_clear(memory.key)
-    with module._pending_journal(memory.key) as journal:
-        journal.ops[:] = [("clear", "2000-01-01T00:00:00")]  # 人为改老
 
     contents = [item["content"] for item in memory.get_recent_context()]
-    assert contents == ["复用的新会话"], "过期的清空操作不能删掉新会话"
+    assert contents == ["复用后的新会话"], "新会话消息不能被迟到的清空删掉"
     assert memory._pending_ops == []
-    print("✓ 过期的 clear 操作被跳过")
+    print("✓ 迟到的清空保留新会话消息、删除旧内容")
 
 
 def test_replay_cleans_applied_ids_and_markers(monkeypatch):
@@ -1022,6 +1049,10 @@ def test_clear_short_term_session_without_client_queues_clear(monkeypatch):
     assert [kind for kind, _ in probe._pending_ops] == ["clear"]
     with module._PENDING_JOURNALS_LOCK:
         module._PENDING_JOURNALS.pop(key, None)
+        module._PENDING_JOURNALS.pop(module.session_key("s-noclient"), None)
+    assert module.session_key("s-noclient") not in module._PENDING_JOURNALS, (
+        "旧格式键没有重放者，不应登记"
+    )
     print("✓ 客户端不可用时删除会话登记整键删除")
 
 

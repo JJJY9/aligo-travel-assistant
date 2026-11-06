@@ -23,9 +23,6 @@ logger = logging.getLogger(__name__)
 _REDIS_RETRY_COOLDOWN_SEC = 60.0
 _redis_degraded_until = 0.0
 
-# 故障期「整键删除」操作的有效期：会话墓碑只保留 300 秒，超过这个窗口
-# 后 session_id 可能已被合法复用，迟到的清空会把新会话的对话删掉
-_CLEAR_OP_MAX_AGE_SEC = 600.0
 
 
 def redis_short_term_degraded() -> bool:
@@ -179,6 +176,34 @@ end
 return 1
 """
 
+# 故障期清空的延迟重放：只删除「清空发起时刻（cutoff）之前」写入的消息，
+# 保留之后由其它实例写入的新消息。会话删除后墓碑过期、session_id 被合法
+# 复用时，新会话的消息时间戳晚于 cutoff，不会被迟到的清空误删；旧对话
+# 则一定早于 cutoff，会被清掉——不依赖操作年龄，也不怕故障持续很久。
+# 无时间戳的条目保守保留。ARGV[1] 为空时退化为整键删除（兼容旧日志）。
+_CLEAR_BEFORE_LUA = """
+local key = KEYS[1]
+local cut = ARGV[1]
+local n = redis.call('LLEN', key)
+if cut == '' then
+  redis.call('DEL', key)
+  return n
+end
+local stale = {}
+for i = 1, n do
+  local raw = redis.call('LINDEX', key, i)
+  local ok, msg = pcall(cjson.decode, raw)
+  if ok and type(msg) == 'table' and type(msg['timestamp']) == 'string'
+     and msg['timestamp'] <= cut then
+    stale[#stale + 1] = raw
+  end
+end
+for _, raw in ipairs(stale) do
+  redis.call('LREM', key, 0, raw)
+end
+return #stale
+"""
+
 # 幂等追加消息：以 op_id 在 applied 集合中记账，与 RPUSH 在同一脚本里原子
 # 完成。故障期重放时同一条消息（同 op_id）不会重复追加；而只按消息列表
 # 去重无法区分「已追加但被新消息挤出窗口」与「从未写入」——前者应跳过，
@@ -232,18 +257,20 @@ _PENDING_JOURNALS_LOCK = threading.Lock()
 _PENDING_JOURNALS_MAX = 2048
 
 
-def _evict_journal_locked() -> None:
+def _evict_journal_locked() -> tuple[str, int, str] | None:
     """注册表满时淘汰一条日志（调用方持有注册表锁）。
 
     按「空日志 → 只含新增的日志 → 任意日志」的顺序淘汰：删除类操作丢失会
     让已清空 / 已删除的轮次在恢复后复活，放到最后才牺牲。
+    返回 (会话键, 丢弃条数, 类别)，由调用方在释放注册表锁后再记录日志，
+    避免日志 I/O 拉长全局锁的持有时间。
     """
     for stale_key, stale in _PENDING_JOURNALS.items():
         if stale.lock.acquire(blocking=False):
             if not stale.ops:
                 del _PENDING_JOURNALS[stale_key]
                 stale.lock.release()
-                return
+                return None
             stale.lock.release()
     for stale_key, stale in list(_PENDING_JOURNALS.items()):
         if stale.lock.acquire(blocking=False):
@@ -252,35 +279,36 @@ def _evict_journal_locked() -> None:
                 dropped = len(stale.ops)
                 del _PENDING_JOURNALS[stale_key]
                 stale.lock.release()
-                logger.warning(
-                    "短期记忆故障操作日志过多，丢弃最旧会话的 %s 条待重放消息",
-                    dropped,
-                )
-                return
+                return stale_key, dropped, "消息"
             stale.lock.release()
     for stale_key, stale in list(_PENDING_JOURNALS.items()):
         if stale.lock.acquire(blocking=False):
             dropped = len(stale.ops)
             del _PENDING_JOURNALS[stale_key]
             stale.lock.release()
-            logger.warning(
-                "短期记忆故障操作日志过多，丢弃最旧会话的 %s 条待重放操作",
-                dropped,
-            )
-            return
+            return stale_key, dropped, "操作"
+    return None
 
 
 @contextmanager
 def _pending_journal(key: str) -> Iterator[_PendingJournal]:
     """获取会话键对应的操作日志并持有其锁（跨实例共享）。"""
     while True:
+        evicted = None
         with _PENDING_JOURNALS_LOCK:
             journal = _PENDING_JOURNALS.get(key)
             if journal is None:
                 if len(_PENDING_JOURNALS) >= _PENDING_JOURNALS_MAX:
-                    _evict_journal_locked()
+                    evicted = _evict_journal_locked()
                 journal = _PendingJournal()
                 _PENDING_JOURNALS[key] = journal
+        if evicted is not None:
+            logger.warning(
+                "短期记忆故障操作日志过多，丢弃最旧会话（%s）的 %s 条待重放%s",
+                evicted[0],
+                evicted[1],
+                evicted[2],
+            )
         journal.lock.acquire()
         with _PENDING_JOURNALS_LOCK:
             owned = _PENDING_JOURNALS.get(key) is journal
@@ -307,7 +335,7 @@ def discard_pending_ops(key: str) -> int:
     返回被丢弃的操作条数。删除会话后复用的同一 session_id 不能把旧会话
     排队的消息或删除动作重放进新会话。
     """
-    while True:
+    for _ in range(3):
         with _PENDING_JOURNALS_LOCK:
             journal = _PENDING_JOURNALS.get(key)
         if journal is None:
@@ -316,13 +344,16 @@ def discard_pending_ops(key: str) -> int:
             with _PENDING_JOURNALS_LOCK:
                 owned = _PENDING_JOURNALS.get(key) is journal
             if not owned:
-                # 等待锁期间日志已被重放 / 淘汰替换：重新查找新日志
+                # 等待锁期间日志已被重放 / 淘汰替换：重新查找新日志（有界重试）
                 continue
             dropped = len(journal.ops)
             journal.ops.clear()
             # 持锁时判空并移除：释放锁后再移除会把并发追加的操作一起丢掉
             _drop_idle_journal(key, journal)
             return dropped
+    # 连续三次都遇到日志被替换（极端的同键并发）：本次放弃，下次删除再处理
+    logger.debug("丢弃排队操作时日志持续被替换，跳过：%s", key)
+    return 0
 
 
 def queue_clear(key: str) -> None:
@@ -489,8 +520,8 @@ class RedisShortTermMemory:
         # 成功的写入也镜像一份，故障切换时上下文与删除操作仍然正确。
         self._fallback = ShortTermMemory(max_turns=max_turns)
         # 故障期变更记入按会话键共享的操作日志（见 _PendingJournal）：
-        # ("add", JSON 项) / ("truncate", (expect, op_id, cutoff)) /
-        # ("remove", [JSON 项]) / ("clear", None)，恢复后按发生顺序重放。
+        # ("add", (JSON 项, op_id)) / ("truncate", (expect, op_id, cutoff)) /
+        # ("remove", [JSON 项]) / ("clear", cutoff)，恢复后按发生顺序重放。
         # 只补写新增会在恢复后复活已删除的轮次；按影子缓存整键重写会丢掉
         # 其它实例在故障期间写入、而本对象从未见过的消息。
 
@@ -596,24 +627,8 @@ class RedisShortTermMemory:
                     self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
                 ops.pop(0)
             else:  # clear
-                cutoff = payload if isinstance(payload, str) else None
-                if cutoff is not None:
-                    try:
-                        age = (
-                            datetime.now() - datetime.fromisoformat(cutoff)
-                        ).total_seconds()
-                    except ValueError:
-                        age = 0.0
-                    if age > _CLEAR_OP_MAX_AGE_SEC:
-                        # 迟到太久的整键删除可能命中已合法复用的新会话
-                        logger.warning(
-                            "短期记忆故障期清空已过期（%s 秒），跳过：%s",
-                            int(age),
-                            self.key,
-                        )
-                        ops.pop(0)
-                        continue
-                self.client.delete(self.key, applied_key(self.key))
+                cutoff = payload if isinstance(payload, str) else ""
+                self.client.eval(_CLEAR_BEFORE_LUA, 1, self.key, cutoff)
                 ops.pop(0)
 
     def _call_redis(self, operation, fallback, on_failure=None):
