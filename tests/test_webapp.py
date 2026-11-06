@@ -3948,7 +3948,7 @@ def test_knowledge_transfer_api(monkeypatch):
     assert (
         client.post("/api/knowledge/import", json={"documents": []}).status_code == 422
     )
-    too_many = [{"content": "x"} for _ in range(301)]
+    too_many = [{"content": "x"} for _ in range(20001)]
     assert (
         client.post("/api/knowledge/import", json={"documents": too_many}).status_code
         == 422

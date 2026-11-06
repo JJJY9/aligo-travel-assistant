@@ -976,6 +976,26 @@ def test_import_dry_run_skips_writes(monkeypatch):
     print("✓ 导入 dry-run 只统计不写入")
 
 
+def test_import_rejects_incomplete_group(monkeypatch):
+    """缺少分片的组必须报错，不能按残片重组（会造成文档被拆段导入）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    def _no_agent():
+        raise AssertionError("不完整备份不应进入写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", _no_agent)
+    documents = [
+        {"content": "第一片", "metadata": {"group": "g", "part": "1", "parts": "3"}},
+        {"content": "第二片", "metadata": {"group": "g", "part": "2", "parts": "3"}},
+    ]
+    with pytest.raises(ValueError, match="多分片文档不完整"):
+        knowledge_admin.import_documents(documents)
+    print("✓ 不完整的分片组导入报错")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -1112,6 +1132,7 @@ if __name__ == "__main__":
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_raises,
+        test_import_rejects_incomplete_group,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,
