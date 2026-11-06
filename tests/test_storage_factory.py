@@ -22,7 +22,7 @@ sys.path.insert(0, project_root)
 from context import storage
 from context.long_term_memory import LongTermMemory
 from utils.errors import MemoryPersistenceError
-from context.short_term_memory import ShortTermMemory
+from context.short_term_memory import RedisShortTermMemory, ShortTermMemory
 
 
 def _set(url_key: str, value: str) -> None:
@@ -45,12 +45,24 @@ def test_defaults_use_local_backends():
 
 
 def test_bad_redis_falls_back():
+    from context import short_term_memory as short_term_module
+    from context.short_term_memory import discard_pending_ops
+
     _set("redis_url", "redis://127.0.0.1:1/0")
-    assert isinstance(storage.create_short_term_memory("s-bad"), ShortTermMemory)
-    # 失败冷却期内直接回退（不再尝试连接）
+    short_term_module._redis_degraded_until = 0.0
+    # 配置了 Redis 但连接失败：仍返回 Redis 实现（调用走影子缓存 + 操作
+    # 日志，恢复后由后续实例重放），不能回退纯内存——否则故障期的删除 /
+    # 清空会彻底丢失
+    memory = storage.create_short_term_memory("s-bad")
+    assert isinstance(memory, RedisShortTermMemory)
     assert storage._failed_recently("redis:redis://127.0.0.1:1/0")
-    assert isinstance(storage.create_short_term_memory("s-bad2"), ShortTermMemory)
-    print("✓ Redis 不可用时回退并进入冷却")
+    memory.add_message("user", "故障期消息")
+    assert [item["content"] for item in memory.get_recent_context()] == ["故障期消息"]
+    assert [kind for kind, _ in memory._pending_ops] == ["add"]
+    discard_pending_ops(memory.key)
+    assert isinstance(storage.create_short_term_memory("s-bad2"), RedisShortTermMemory)
+    short_term_module._redis_degraded_until = 0.0
+    print("✓ Redis 不可用时仍使用 Redis 实现并走故障路径")
 
 
 def test_bad_postgres_falls_back():

@@ -98,15 +98,18 @@ def create_short_term_memory(
     url = STORAGE_CONFIG.get("redis_url") or ""
     if url:
         client = _get_redis_client(url)
-        if client is not None:
-            ttl = int(STORAGE_CONFIG.get("redis_ttl_sec", 3600))
-            return RedisShortTermMemory(
-                client,
-                session_id,
-                max_turns=max_turns,
-                ttl_sec=ttl,
-                user_id=user_id,
-            )
+        ttl = int(STORAGE_CONFIG.get("redis_ttl_sec", 3600))
+        # 连接暂不可用（启动失败 / 工厂 60 秒冷却）时仍返回 Redis 实现：
+        # 调用会走故障路径（影子缓存 + 操作日志），恢复后由后续实例重放。
+        # 回退纯内存实现会让故障期的删除 / 清空彻底丢失（与
+        # clear_short_term_session 的 queue_clear 兜底不对称）
+        return RedisShortTermMemory(
+            client,
+            session_id,
+            max_turns=max_turns,
+            ttl_sec=ttl,
+            user_id=user_id,
+        )
     return ShortTermMemory(max_turns=max_turns)
 
 
