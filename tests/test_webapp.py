@@ -3940,7 +3940,12 @@ def test_knowledge_transfer_api(monkeypatch):
         "/api/knowledge/import", json={"documents": [{"content": ""}]}
     )
     assert empty_item.status_code == 200
-    assert empty_item.json() == {"imported": 0, "skipped": 1}
+    assert empty_item.json() == {
+        "imported": 0,
+        "skipped": 1,
+        "skipped_invalid": 1,
+        "skipped_duplicate": 0,
+    }
 
     calls = {}
 

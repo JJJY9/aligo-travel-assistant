@@ -3741,10 +3741,19 @@ async function importKnowledgeFile() {
       });
       const wouldImport = Number(preview.would_import || 0);
       const skippedCount = Number(preview.skipped || 0);
-      confirmText =
-        `将导入 ${wouldImport} 条知识片段` +
-        (skippedCount ? `（跳过 ${skippedCount} 条已存在 / 无效内容）` : "") +
-        "？";
+      const duplicateCount = Number(preview.skipped_duplicate || 0);
+      const invalidCount = Number(preview.skipped_invalid || 0);
+      // 跳过原因由服务端分别统计（已存在 / 无效内容）；旧服务端只返回
+      // 总数时退回笼统文案
+      const reasonParts = [];
+      if (duplicateCount) reasonParts.push(`${duplicateCount} 条已存在`);
+      if (invalidCount) reasonParts.push(`${invalidCount} 条无效`);
+      const skippedText = skippedCount
+        ? reasonParts.length
+          ? `（跳过 ${skippedCount} 条：${reasonParts.join(" / ")}）`
+          : `（跳过 ${skippedCount} 条已存在 / 无效内容）`
+        : "";
+      confirmText = `将导入 ${wouldImport} 条知识片段${skippedText}？`;
     } catch (error) {
       // 预览失败（如知识库暂不可用）不阻断：退回按文件条数确认
       confirmText = `导入 ${documents.length} 条知识片段？`;
