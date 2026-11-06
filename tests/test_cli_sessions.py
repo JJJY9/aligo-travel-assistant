@@ -505,6 +505,116 @@ def test_session_pin_dispatch(monkeypatch):
     print("✓ session-pin dispatch 参数")
 
 
+def test_session_show_text_and_json(monkeypatch):
+    import json as _json
+
+    store = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-pinned")
+    text = out.getvalue()
+    assert code == 0 and store.closed
+    assert "会话 s-pinned：（自动标题）（置顶） · 2 条消息" in text
+    assert "[2026-11-04 11:00:00] assistant: 回答 B" in text
+
+    store.titles["s-active"] = "住宿咨询"
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-active")
+    assert "会话 s-active：住宿咨询 · 2 条消息" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-archived", as_json=True)
+    data = _json.loads(out.getvalue())
+    assert code == 0 and data["archived"] is True
+    assert data["messages"][0]["content"] == "归档的问题"
+    print("✓ session-show 文本 / JSON")
+
+
+def test_session_show_renders_assistant_markdown(monkeypatch):
+    """助手消息是编排 JSON 时，预览要重新渲染成 Markdown 文本。"""
+    import json as _json
+
+    payload = _json.dumps(
+        {"status": "no_agents", "results": []}, ensure_ascii=False
+    )
+    store = _FakeStore([_message("assistant", payload, "s-json")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-json")
+    assert code == 0 and "已记录您的需求" in out.getvalue()
+    print("✓ session-show 助手消息重新渲染")
+
+
+def test_session_show_errors(monkeypatch):
+    store = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-missing")
+    assert code == 1 and "不存在或没有消息" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("bad id", "s1")
+    assert code == 1 and "用户 ID" in out.getvalue()
+
+    store.fail_history = True
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-active")
+    assert code == 1 and "读取会话失败" in out.getvalue()
+    store.fail_history = False
+
+    def boom(*args):
+        raise RuntimeError("open down")
+
+    monkeypatch.setattr(storage, "create_long_term_memory", boom)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-active", as_json=True)
+    data = json.loads(out.getvalue())
+    assert code == 1 and "打开长期记忆失败" in data["error"]
+    print("✓ session-show 不存在 / 非法 ID / 读取与打开失败")
+
+
+def test_session_show_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_session_show_standalone",
+        lambda user_id, session_id, as_json=False: (
+            calls.append((user_id, session_id, as_json)) or 0
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["cli.py", "session-show", "u1", "s1"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0 and calls[-1] == ("u1", "s1", False)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "session-show", "u1", "s1", "--json"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0 and calls[-1] == ("u1", "s1", True)
+    for argv in (
+        ["cli.py", "session-show"],
+        ["cli.py", "session-show", "u1"],
+        ["cli.py", "session-show", "u1", "s1", "extra"],
+        ["cli.py", "session-show", "u1", "s1", "--bad"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "session-show" in out.getvalue()
+    print("✓ session-show dispatch 参数")
+
+
 def test_read_failure(monkeypatch):
     fake = _sessions_store()
     fake.fail_history = True
@@ -827,6 +937,10 @@ if __name__ == "__main__":
         test_session_pin_set_and_unset,
         test_session_pin_validation_and_failures,
         test_session_pin_dispatch,
+        test_session_show_text_and_json,
+        test_session_show_renders_assistant_markdown,
+        test_session_show_errors,
+        test_session_show_dispatch,
         test_session_export_to_file,
         test_session_export_to_stdout,
         test_session_export_missing_and_invalid,
