@@ -2111,8 +2111,12 @@ def run_trips_export_standalone(
     target: str | None = None,
     to_stdout: bool = False,
     force: bool = False,
+    ics: bool = False,
 ) -> int:
-    """导出全部行程为 CSV（`python cli.py trips-export <user_id> [path] [--stdout] [--force]`）。
+    """导出全部行程（`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics]`）。
+
+    ``ics=True`` 时导出 iCalendar（与 Web 的 /api/trips/calendar 同一实现），
+    否则导出带 BOM 的 CSV。
 
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败
@@ -2120,7 +2124,7 @@ def run_trips_export_standalone(
     import re
     from pathlib import Path
 
-    from utils.trip_export import render_trips_csv
+    from utils.trip_export import render_trips_csv, render_trips_ics
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -2141,12 +2145,17 @@ def run_trips_export_standalone(
         if callable(close):
             close()
 
-    text = render_trips_csv(trips)
+    if ics:
+        text = render_trips_ics(trips, user_id)
+        default_name = "aligo_trips.ics"
+    else:
+        text = render_trips_csv(trips)
+        default_name = "aligo_trips.csv"
     if to_stdout:
         _print_stdout(text, end="")
         return 0
 
-    path = Path(target) if target else Path("exports") / "aligo_trips.csv"
+    path = Path(target) if target else Path("exports") / default_name
     if path.exists() and not force:
         print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
         return 1
@@ -2156,7 +2165,8 @@ def run_trips_export_standalone(
     except OSError as exc:
         print(f"写入失败：{exc}")
         return 1
-    print(f"已导出 {len(trips)} 条行程到 {path}")
+    suffix = "（iCalendar）" if ics else ""
+    print(f"已导出 {len(trips)} 条行程到 {path}{suffix}")
     return 0
 
 
@@ -2284,11 +2294,16 @@ def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool] | None:
 
 
 def _parse_export_args(
-    args: list[str],
-) -> tuple[str | None, bool, bool] | None:
-    """解析导出命令的 [path] [--stdout] [--force]；冲突 / 未知参数返回 None。"""
+    args: list[str], allow_ics: bool = False
+) -> tuple[str | None, bool, bool, bool] | None:
+    """解析导出命令的 [path] [--stdout] [--force] [--ics]。
+
+    ``--ics`` 只在 ``allow_ics=True``（trips-export）时接受；冲突 / 未知
+    参数返回 None。
+    """
     to_stdout = False
     force = False
+    ics = False
     paths: list[str] = []
     for item in args:
         lowered = item.lower()
@@ -2296,13 +2311,15 @@ def _parse_export_args(
             to_stdout = True
         elif lowered == "--force":
             force = True
+        elif lowered == "--ics" and allow_ics:
+            ics = True
         elif item.startswith("-"):
             return None
         else:
             paths.append(item)
     if len(paths) > 1 or (to_stdout and paths):
         return None
-    return (paths[0] if paths else None), to_stdout, force
+    return (paths[0] if paths else None), to_stdout, force, ics
 
 
 _COMMANDS_HINT = (
@@ -2533,7 +2550,7 @@ def main():
                     "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            target, to_stdout, force = parsed_export
+            target, to_stdout, force, _ = parsed_export
             sys.exit(
                 run_session_export_standalone(
                     sys.argv[2],
@@ -2555,7 +2572,7 @@ def main():
                     "用法：python cli.py sessions-export <user_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            target, to_stdout, force = parsed_export
+            target, to_stdout, force, _ = parsed_export
             sys.exit(
                 run_sessions_export_standalone(
                     sys.argv[2],
@@ -2570,19 +2587,21 @@ def main():
                     "用法：python cli.py trips-export <user_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            parsed_export = _parse_export_args(sys.argv[3:])
+            parsed_export = _parse_export_args(sys.argv[3:], allow_ics=True)
             if parsed_export is None:
                 print(
-                    "用法：python cli.py trips-export <user_id> [path] [--stdout] [--force]"
+                    "用法：python cli.py trips-export <user_id> [path] "
+                    "[--stdout] [--force] [--ics]"
                 )
                 sys.exit(2)
-            target, to_stdout, force = parsed_export
+            target, to_stdout, force, ics = parsed_export
             sys.exit(
                 run_trips_export_standalone(
                     sys.argv[2],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
+                    ics=ics,
                 )
             )
         if arg in {"help", "--help", "-h"}:

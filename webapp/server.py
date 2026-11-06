@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import ipaddress
 import json
 import logging
@@ -80,7 +79,7 @@ from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
-from utils.trip_export import render_trips_csv
+from utils.trip_export import render_trip_ics, render_trips_csv, render_trips_ics
 from utils.turn_meta import extract_turn_meta
 from utils.version import APP_VERSION
 from utils.weather import WeatherError, fetch_weather
@@ -1340,117 +1339,6 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _ics_date(value: str) -> str | None:
-    """把 YYYY-MM-DD 转为 iCalendar 日期（YYYYMMDD）；非法值返回 None。"""
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%Y%m%d")
-    except (TypeError, ValueError):
-        return None
-
-
-def _ics_escape(value: str) -> str:
-    """按 RFC 5545 转义文本字段（含孤立的 CR，避免破坏行结构）。"""
-    return (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace(";", "\\;")
-        .replace(",", "\\,")
-        .replace("\r\n", "\\n")
-        .replace("\r", "\\n")
-        .replace("\n", "\\n")
-    )
-
-
-def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | None:
-    """单条行程的 VEVENT 行；缺少出发日期时返回 None。"""
-    start = _ics_date(trip.get("start_date") or "")
-    if not start:
-        return None
-    end = _ics_date(trip.get("end_date") or "") or start
-    if end < start:
-        logger.warning("行程结束日期早于出发日期，按单日处理: %s", trip.get("trip_id"))
-        end = start
-    end_dt = datetime.strptime(end, "%Y%m%d")
-    try:
-        # ICS 的 DTEND 是排他的；9999-12-31 无法再加一天
-        end_exclusive = (end_dt + timedelta(days=1)).strftime("%Y%m%d")
-    except OverflowError:
-        end_exclusive = end
-
-    origin = str(trip.get("origin") or "出发地")
-    destination = str(trip.get("destination") or "目的地")
-    purpose = str(trip.get("purpose") or "出行")
-    summary = f"{origin} → {destination}（{purpose}）"
-    description = (
-        f"Aligo 行程：{origin} → {destination}，"
-        f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，{purpose}"
-    )
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    # UID 同时包含行程内容：删除最新行程后 id 可能被复用，仅用 trip_id
-    # 会让新行程覆盖日历里已存在的旧事件
-    uid_source = ":".join(
-        [
-            user_id,
-            str(trip.get("trip_id") or "trip"),
-            origin,
-            destination,
-            str(trip.get("start_date") or ""),
-            str(trip.get("end_date") or ""),
-        ]
-    )
-    uid_digest = hashlib.sha1(uid_source.encode("utf-8")).hexdigest()[:16]
-    uid = f"aligo-{uid_digest}@aligo.local"
-
-    return [
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"DTSTAMP:{stamp}",
-        f"DTSTART;VALUE=DATE:{start}",
-        f"DTEND;VALUE=DATE:{end_exclusive}",
-        f"SUMMARY:{_ics_escape(summary)}",
-        f"DESCRIPTION:{_ics_escape(description)}",
-        # 全天事件的 DTSTART 是出发日 00:00，提前 15 小时即前一天 09:00 提醒
-        "BEGIN:VALARM",
-        "ACTION:DISPLAY",
-        f"DESCRIPTION:{_ics_escape(f'出行提醒：明天 {origin} → {destination}')}",
-        "TRIGGER:-PT15H",
-        "END:VALARM",
-        "END:VEVENT",
-    ]
-
-
-def _ics_calendar(events: list[list[str]]) -> str:
-    """把若干 VEVENT 行组合为完整的 iCalendar 文本。"""
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Aligo//Travel Assistant//CN",
-        "CALSCALE:GREGORIAN",
-    ]
-    for event in events:
-        lines.extend(event)
-    lines.extend(["END:VCALENDAR", ""])
-    return "\r\n".join(lines)
-
-
-def _build_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
-    """把一条行程渲染为全天事件的 iCalendar 文本；缺少出发日期时返回 None。"""
-    event = _trip_ics_event_lines(trip, user_id)
-    if event is None:
-        return None
-    return _ics_calendar([event])
-
-
-def _build_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
-    """把全部行程渲染为一个 iCalendar 文件（缺少出发日期的行程跳过）。"""
-    events = [
-        event
-        for event in (_trip_ics_event_lines(trip, user_id) for trip in trips)
-        if event is not None
-    ]
-    return _ics_calendar(events)
-
-
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -2611,7 +2499,7 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         return Response(
-            content=_build_trips_ics(trips, user_id),
+            content=render_trips_ics(trips, user_id),
             media_type="text/calendar; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="aligo_trips.ics"'},
         )
@@ -2660,7 +2548,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
         if trip is None:
             raise HTTPException(status_code=404, detail="行程不存在")
-        content = _build_trip_ics(trip, user_id)
+        content = render_trip_ics(trip, user_id)
         if content is None:
             raise HTTPException(status_code=400, detail="该行程缺少出发日期，无法生成日历")
         return Response(

@@ -11,7 +11,7 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.trip_export import render_trips_csv
+from utils.trip_export import _ics_escape, render_trip_ics, render_trips_csv, render_trips_ics
 
 
 def test_header_and_rows():
@@ -65,3 +65,48 @@ if __name__ == "__main__":
     test_formula_prefix_neutralized()
     test_empty_trips()
     print("\n全部通过")
+
+
+def test_ics_single_trip():
+    """单条行程：全天事件、排他结束日期、全天事件前一天提醒。"""
+    trip = {
+        "trip_id": "trip_1",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-07",
+        "purpose": "出差",
+    }
+    text = render_trip_ics(trip, "u1")
+    assert text.startswith("BEGIN:VCALENDAR") and text.rstrip().endswith("END:VCALENDAR")
+    assert "DTSTART;VALUE=DATE:20261205" in text
+    assert "DTEND;VALUE=DATE:20261208" in text, "DTEND 应为排他日期（返程日 +1）"
+    assert "SUMMARY:北京 → 上海（出差）" in text
+    assert "TRIGGER:-PT15H" in text, "应带前一天提醒"
+    assert "UID:aligo-" in text
+    print("✓ ICS 单条行程（全天事件 / 排他结束 / 提醒）")
+
+
+def test_ics_missing_or_invalid_dates():
+    assert render_trip_ics({"destination": "上海"}, "u1") is None
+    assert render_trip_ics({"start_date": "not-a-date"}, "u1") is None
+    # 返程早于出发：按单日事件处理
+    trip = {"start_date": "2026-12-05", "end_date": "2026-12-01"}
+    text = render_trip_ics(trip, "u1")
+    assert "DTSTART;VALUE=DATE:20261205" in text
+    assert "DTEND;VALUE=DATE:20261206" in text
+    print("✓ ICS 缺日期 / 非法日期 / 结束早于开始")
+
+
+def test_ics_escape_and_multiple_events():
+    assert _ics_escape("a;b,c") == "a\\;b\\,c"
+    assert _ics_escape("a\rb") == "a\\nb", "孤立的 CR 必须转义"
+    trips = [
+        {"start_date": "2026-12-05", "end_date": "2026-12-06", "destination": "上海"},
+        {"start_date": "2026-12-09", "end_date": "2026-12-10", "destination": "杭州"},
+        {"destination": "无日期"},
+    ]
+    text = render_trips_ics(trips, "u1")
+    assert text.count("BEGIN:VEVENT") == 2
+    assert text.count("UID:") == 2
+    print("✓ ICS 文本转义与多事件组合")
