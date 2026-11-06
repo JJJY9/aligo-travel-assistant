@@ -264,6 +264,133 @@ def test_preference_reads_memory_off_event_loop():
     print("✓ preference 的偏好读取离开事件循环线程")
 
 
+def _load_skill_module(skill: str):
+    """加载技能脚本模块本身（不止类），供模块级函数断言。"""
+    path = os.path.join(
+        project_root, ".claude", "skills", skill, "script", "agent.py"
+    )
+    module_name = f"_test_skill_module_{skill.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_suspicious_url_uses_registrable_domain():
+    """随机域名按主域名主体（倒数第二段）判断：正规站长首标签不误杀、www 前缀不漏过。"""
+    module = _load_skill_module("query-info")
+    assert module._is_suspicious_url("https://documentation.example.com/page") is False
+    assert module._is_suspicious_url("https://www.randomdomain123.com/a") is True
+    assert module._is_suspicious_url("https://randomdomain123.com/a") is True
+    print("✓ 可疑域名按主域名主体判断")
+
+
+def test_weather_city_prefers_destination_side():
+    """「从A去B」的天气问句取目的地城市，不能答成出发地。"""
+    agent_class = _load_skill("query-info", "InformationQueryAgent")
+    agent = object.__new__(agent_class)
+    assert agent._extract_city_from_query("从北京去纽约的天气怎么样") == "纽约"
+    assert agent._extract_city_from_query("从北京去杭州出差，天气怎么样") == "杭州"
+    assert agent._extract_city_from_query("北京明天天气怎么样") == "北京"
+    assert agent._extract_city_from_query("上海和广州的天气对比") == "上海"
+    print("✓ 天气城市优先取目的地一侧")
+
+
+def test_all_search_backends_fail_reports_error(monkeypatch):
+    """三个搜索后端全部抛错时如实返回搜索失败，不能伪装成未找到结果。"""
+    module = _load_skill_module("query-info")
+    monkeypatch.setattr(module, "DDGS_AVAILABLE", True)
+
+    class _BoomDDGS:
+        def text(self, *args, **kwargs):
+            raise ConnectionError("search backend down")
+
+    monkeypatch.setattr(module, "DDGS", _BoomDDGS)
+    agent = object.__new__(module.InformationQueryAgent)
+    agent.name = "InformationQueryAgent"
+    result = asyncio.run(agent._web_search("某个问题"))
+    assert result["query_success"] is False
+    assert "搜索失败" in result["results"]["error"]
+    print("✓ 搜索后端全部失败时返回真实错误")
+
+
+class _PlanTripLoader:
+    def get_skill_content(self, name):
+        return ""
+
+
+def test_plan_trip_null_rewritten_query_falls_back():
+    """rewritten_query 为 null 时回退用户原话，需求不能变空或字面量 None。"""
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        def __init__(self):
+            self.prompts = []
+
+        async def __call__(self, messages, **kwargs):
+            self.prompts.append(messages)
+            return '{"itinerary": {"title": "x"}}'
+
+    model = _Model()
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=model
+    )
+    agent.skill_loader = _PlanTripLoader()
+    payload = json.dumps(
+        {"context": {"rewritten_query": None, "user_query": "下周一从北京去杭州"}},
+        ensure_ascii=False,
+    )
+    asyncio.run(agent.reply(Msg(name="x", content=payload, role="user")))
+    prompt = model.prompts[0][-1]["content"]
+    assert "【用户需求】\n下周一从北京去杭州" in prompt
+    print("✓ 行程规划回退用户原话")
+
+
+def test_plan_trip_rejects_non_object_result():
+    """数组输出不能当成功行程返回（robust_json_parse 会把它截成第一个元素）。"""
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return '[{"day": 1, "plan": "x"}]'
+
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=_Model()
+    )
+    agent.skill_loader = _PlanTripLoader()
+    payload = json.dumps({"context": {"rewritten_query": "测试出行"}}, ensure_ascii=False)
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content=payload, role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("planning_complete") is False
+    assert "error" in data
+    print("✓ 行程规划拒绝非对象结果")
+
+
+def test_plan_trip_accepts_object_with_array_fields():
+    """对象内部含数组字段（days 等）不能被误判为数组输出。"""
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return '{"itinerary": {"title": "杭州行", "days": [{"day": 1}]}}'
+
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=_Model()
+    )
+    agent.skill_loader = _PlanTripLoader()
+    payload = json.dumps({"context": {"rewritten_query": "测试出行"}}, ensure_ascii=False)
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content=payload, role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("itinerary", {}).get("title") == "杭州行"
+    assert "error" not in data
+    print("✓ 含数组字段的对象结果正常接受")
+
+
 def test_rag_search_top_k_bounds():
     """top_k=0 / 负数返回空，None 使用默认值，不能把非法 limit 传给 Milvus。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
@@ -376,7 +503,17 @@ if __name__ == "__main__":
         test_memory_query_includes_current_dialogue()
         test_memory_query_reads_memory_off_event_loop()
         test_preference_reads_memory_off_event_loop()
+        test_suspicious_url_uses_registrable_domain()
+        test_weather_city_prefers_destination_side()
+        test_plan_trip_null_rewritten_query_falls_back()
+        test_plan_trip_rejects_non_object_result()
+        test_plan_trip_accepts_object_with_array_fields()
         test_rag_search_top_k_bounds()
+        _mp_search = pytest.MonkeyPatch()
+        try:
+            test_all_search_backends_fail_reports_error(_mp_search)
+        finally:
+            _mp_search.undo()
         test_rag_dimension_mismatch_warns(_mp)
     finally:
         _mp.undo()

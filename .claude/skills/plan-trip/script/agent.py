@@ -29,6 +29,30 @@ def _format_pref_value(value) -> str:
     return str(value)
 
 
+def _starts_with_json_array(text: str) -> bool:
+    """文本中第一个完整的 JSON 值是数组（而不是对象）。
+
+    ``robust_json_parse`` 会把 ``[{...}]`` 截成第一个元素返回 dict，单看最终
+    类型无法发现「模型输出了数组」；这里按原始文本判定，数组输出必须按
+    解析失败处理，不能把数组元素当成功行程。说明文字里的 ``[注]`` 之类
+    因无法整体解析为 JSON 不会被误判；对象在数组之前出现时以对象为准
+    （对象内部的数组字段不影响判定）。
+    """
+    decoder = json.JSONDecoder()
+    first_object = text.find("{")
+    index = text.find("[")
+    while index != -1:
+        if first_object != -1 and first_object < index:
+            return False
+        try:
+            value, _ = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("[", index + 1)
+            continue
+        return isinstance(value, list)
+    return False
+
+
 class ItineraryPlanningAgent(AgentBase):
     """
     行程规划智能体（主协调）
@@ -61,16 +85,38 @@ class ItineraryPlanningAgent(AgentBase):
         if isinstance(content, str):
             try:
                 data = json.loads(content)
-                context_info = data.get("context", {})
-                user_query = context_info.get("rewritten_query", "")
-                previous_results = data.get("previous_results", [])
-                user_preferences = context_info.get("user_preferences", {})
             except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                context_info = data.get("context")
+                if not isinstance(context_info, dict):
+                    context_info = {}
+                # rewritten_query 缺失或为 null 时回退到用户原话 / 原始内容：
+                # 用户需求变成空串会让规划基于空提示生成，null 还会变成
+                # 字面量 "None" 进入 prompt
+                user_query = str(
+                    context_info.get("rewritten_query")
+                    or context_info.get("user_query")
+                    or ""
+                )
+                previous_results = data.get("previous_results")
+                if not isinstance(previous_results, list):
+                    previous_results = []
+                user_preferences = context_info.get("user_preferences")
+                if not isinstance(user_preferences, dict):
+                    user_preferences = {}
+            else:
                 user_query = content
         elif isinstance(content, dict):
             context_info = content
-            user_query = content.get("rewritten_query", str(content))
-            user_preferences = content.get("user_preferences", {})
+            user_query = str(
+                content.get("rewritten_query")
+                or content.get("user_query")
+                or str(content)
+            )
+            user_preferences = content.get("user_preferences")
+            if not isinstance(user_preferences, dict):
+                user_preferences = {}
 
         # 整合所有可用信息
         all_info = {
@@ -82,6 +128,8 @@ class ItineraryPlanningAgent(AgentBase):
         # 兼容编排器的嵌套结构 {"result": {"data": ...}} 与 SKILL.md 文档中的
         # 简化结构 {"data": ...}
         for prev in previous_results:
+            if not isinstance(prev, dict):
+                continue
             agent_name = str(prev.get("agent_name") or "")
             nested = prev.get("result")
             if isinstance(nested, dict):
@@ -150,6 +198,11 @@ class ItineraryPlanningAgent(AgentBase):
             # 获取响应文本
             text = await extract_json_from_async_response(response)
 
+            # 数组输出会被 robust_json_parse 截成第一个元素仍按成功返回：
+            # 必须在解析前按原始文本判定顶层结构
+            if _starts_with_json_array(text):
+                raise ValueError("行程规划结果顶层是 JSON 数组，不是行程对象")
+
             # 解析结果
             result = None
             
@@ -181,8 +234,13 @@ class ItineraryPlanningAgent(AgentBase):
                     # 如果策略2也失败，抛出包含详细信息的异常
                     raise ValueError(f"All JSON parsing attempts failed. Strategy 2 error: {decode_err}")
 
-            if result is None:
-                raise ValueError("Parsed result is None")
+            if not isinstance(result, dict):
+                # 数组 / 标量输出（robust_json_parse 会把数组截成第一个
+                # 元素）不是行程对象：必须按解析失败处理，不能当成功返回
+                raise ValueError(
+                    "行程规划结果不是 JSON 对象"
+                    f"（实际类型：{type(result).__name__}）"
+                )
 
         except Exception as e:
             logger.error(f"Itinerary planning failed: {e}")

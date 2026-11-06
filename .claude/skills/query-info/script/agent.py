@@ -58,9 +58,12 @@ def _is_suspicious_url(url: str) -> bool:
         # 可疑 TLD
         if _SUSPICIOUS_DOMAIN_PATTERN.search(host):
             return True
-        # 主域名部分（最后一个 . 之前若还有多段则取倒数第二段之前）
-        parts = host.rsplit(".", 2)
-        name = parts[0] if parts else ""
+        # 主域名主体取倒数第二段（example.com → example；
+        # www.randomdomain123.com → randomdomain123）。此前取第一段：正规站点
+        # 的长首标签（documentation.example.com → documentation）被误杀，
+        # 带 www 的随机域名反而漏过
+        labels = [label for label in host.split(".") if label]
+        name = labels[-2] if len(labels) >= 2 else (labels[0] if labels else "")
         return bool(len(name) >= 10 and _RANDOM_DOMAIN_PATTERN.match(name))
     except Exception:
         return False
@@ -219,6 +222,47 @@ class InformationQueryAgent(AgentBase):
             "呼和浩特", "珠海", "佛山", "东莞", "温州", "绍兴", "泉州", "烟台", "徐州",
         ]
         q = (query or "").strip()
+
+        def _destination_city(dest_text: str) -> str:
+            """从目的地一侧的文本提取城市；提不到返回空串。"""
+            hits_ = [
+                (dest_text.find(city), -len(city), city)
+                for city in common_cities
+                if city in dest_text
+            ]
+            if hits_:
+                hits_.sort()
+                return hits_[0][2]
+            # 非内置常见城市（如「纽约」）：截到 的 / 天气 / 气温 之前的
+            # 2~6 个连续中文字，并去掉出行目的后缀
+            head = re.split(
+                r"(?:的|天气|气温|怎么样|如何)", dest_text, maxsplit=1
+            )[0]
+            for suffix in ("出差", "旅行", "旅游", "开会", "办事"):
+                head = head.removesuffix(suffix)
+            head = head.strip()
+            if 2 <= len(head) <= 6 and re.fullmatch(r"[一-龥]+", head):
+                return head
+            return ""
+
+        # 「从北京去纽约的天气」：行程问句问的是目的地一侧，按最早出现的
+        # 城市会答成出发地（纽约不是内置常见城市时尤其明显）
+        route = re.split(r"从|自", q, maxsplit=1)
+        if len(route) == 2:
+            hop = re.split(r"去|到|飞往|飞", route[1], maxsplit=1)
+            if len(hop) == 2:
+                destination = _destination_city(hop[1])
+                if destination:
+                    return destination
+        else:
+            # 「北京到上海的天气」：只有前半段确实是城市时才按目的地解释，
+            # 避免「去哪里玩天气」之类的问句被截出假城市
+            hop = re.split(r"到|去|飞往", q, maxsplit=1)
+            if len(hop) == 2 and any(city in hop[0] for city in common_cities):
+                destination = _destination_city(hop[1])
+                if destination:
+                    return destination
+
         # 按在问题中最早出现的位置选择（列表顺序会让「深圳和广州」选成广州）
         hits = [(q.find(city), -len(city), city) for city in common_cities if city in q]
         if hits:
@@ -268,6 +312,7 @@ class InformationQueryAgent(AgentBase):
             ddgs = DDGS()
             # 开启安全搜索，优先 bing 后端（质量更稳定），多取几条再过滤
             search_results = []
+            backend_errors: list[str] = []
             loop = asyncio.get_running_loop()
             for backend in ("bing", "duckduckgo", "auto"):
                 try:
@@ -288,7 +333,8 @@ class InformationQueryAgent(AgentBase):
                     if search_results:
                         break
                 except Exception as e:
-                    logger.debug(f"DDGS backend {backend} failed: {e}")
+                    backend_errors.append(str(e))
+                    logger.warning(f"DDGS backend {backend} failed: {e}")
                     continue
 
             results = []
@@ -305,6 +351,16 @@ class InformationQueryAgent(AgentBase):
                     break
 
             if not results:
+                if not search_results and backend_errors:
+                    # 三个后端全部抛错：是搜索服务故障而不是「没有结果」，
+                    # 不能把真实错误吞成未找到（此前仅 debug 级别记录）
+                    return {
+                        "query_type": "网络搜索",
+                        "query_success": False,
+                        "results": {
+                            "error": f"搜索失败: {backend_errors[-1]}"
+                        },
+                    }
                 return {
                     "query_type": "网络搜索",
                     "query_success": False,

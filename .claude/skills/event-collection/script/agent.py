@@ -51,7 +51,14 @@ class EventCollectionAgent(AgentBase):
         if isinstance(content, str):
             try:
                 data = json.loads(content)
-                context = data.get("context", {})
+            except json.JSONDecodeError:
+                data = None
+            # 顶层 / context 可能不是对象（模型或调用方给了数组 / 数字 /
+            # 字符串）：直接 .get 会 AttributeError 绕过上面的兜底
+            if isinstance(data, dict):
+                context = data.get("context")
+                if not isinstance(context, dict):
+                    context = {}
                 # 与其它技能一致：优先用户本轮原话，其次改写查询；都没有时
                 # 才退回整段上下文（含 recent_dialogue / previous_results，
                 # 直接当作事项描述会带进大量无关上下文）
@@ -60,8 +67,10 @@ class EventCollectionAgent(AgentBase):
                     or context.get("rewritten_query", "")
                     or str(data)
                 )
-                user_preferences = context.get("user_preferences", {})
-            except json.JSONDecodeError:
+                user_preferences = context.get("user_preferences")
+                if not isinstance(user_preferences, dict):
+                    user_preferences = {}
+            else:
                 user_query = content
                 user_preferences = {}
         else:
