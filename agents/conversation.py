@@ -9,6 +9,7 @@
 - 意图识别与编排两次 LLM 调用都通过 retry_with_backoff 重试，并接入熔断器；
 - 结果写入短期 / 长期记忆。
 """
+import asyncio
 import json
 import logging
 import time
@@ -88,8 +89,10 @@ class ConversationRuntime:
 
         self._emit(on_event, {"type": "phase", "phase": "context", "label": "整理记忆与上下文"})
 
-        # 多会话写入后保持长期记忆最新（避免覆盖其它会话刚写入的数据）
-        self.memory.reload_long_term()
+        # 多会话写入后保持长期记忆最新（避免覆盖其它会话刚写入的数据）。
+        # 读盘 / 查询 / Redis 都是阻塞调用，放到线程池，避免卡住事件循环
+        # （Web 端同时服务多个 SSE 流，这里的毫秒级阻塞会放大到所有连接）
+        await asyncio.to_thread(self.memory.reload_long_term)
 
         context = await self._build_context(user_input)
         self._emit(on_event, {"type": "phase", "phase": "intent", "label": "理解你的需求"})
@@ -126,7 +129,9 @@ class ConversationRuntime:
         )
         logger.info("Plan: %s agents", len(schedule))
 
-        self.memory.add_message("user", user_input)
+        # 长期 / 短期记忆写入是阻塞 IO（JSON 文件、PostgreSQL、Redis），
+        # 放到线程池执行，避免阻塞事件循环
+        await asyncio.to_thread(self.memory.add_message, "user", user_input)
         orchestration = await self._call_with_resilience(
             lambda: self.orchestrator.reply(intention, on_event=on_event),
             max_retries=int(rc.get("max_retries", 3)),
@@ -148,7 +153,8 @@ class ConversationRuntime:
         usage = self._usage_delta(usage_before)
         elapsed = round(time.time() - start, 2)
         meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
-        self.memory.add_message(
+        await asyncio.to_thread(
+            self.memory.add_message,
             "assistant",
             json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
         )
@@ -202,12 +208,19 @@ class ConversationRuntime:
         return normalized
 
     async def _build_context(self, user_input: str) -> list[Msg]:
-        """组装意图识别上下文：系统记忆（偏好 + 历史摘要）+ 最近对话 + 当前输入。"""
+        """组装意图识别上下文：系统记忆（偏好 + 历史摘要）+ 最近对话 + 当前输入。
+
+        偏好与最近对话的读取会访问 JSON 文件 / Redis，放到线程池执行，
+        避免阻塞事件循环。
+        """
+        preferences_raw, recent_context = await asyncio.to_thread(
+            self._memory_snapshot
+        )
         memory_parts: list[str] = []
 
         preferences = {
             key: value
-            for key, value in self.memory.long_term.get_preference().items()
+            for key, value in preferences_raw.items()
             if has_preference_value(value)
         }
         if preferences:
@@ -228,10 +241,16 @@ class ConversationRuntime:
         messages: list[Msg] = []
         if memory_parts:
             messages.append(Msg(name="system", content="\n\n".join(memory_parts), role="system"))
-        for message in self.memory.short_term.get_recent_context(n_turns=5):
+        for message in recent_context:
             messages.append(Msg(name=message["role"], content=message["content"], role=message["role"]))
         messages.append(Msg(name="user", content=user_input, role="user"))
         return messages
+
+    def _memory_snapshot(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """同步读取记忆快照（偏好 + 最近对话），供 ``asyncio.to_thread`` 调用。"""
+        preferences = self.memory.long_term.get_preference()
+        recent = list(self.memory.short_term.get_recent_context(n_turns=5))
+        return preferences, recent
 
     async def _call_with_resilience(
         self, factory, max_retries: int, base_delay: float, max_delay: float
