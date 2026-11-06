@@ -951,11 +951,12 @@ def test_previous_preference_append_flattens_list():
         {
             "agent_name": "preference",
             "result": {
+                "status": "success",
                 "data": {
                     "preferences": [
                         {"type": "airlines", "value": ["国航", "东航"], "action": "append"}
                     ]
-                }
+                },
             },
         }
     ]
@@ -970,12 +971,13 @@ def test_previous_preference_append_flattens_list():
         {
             "agent_name": "preference",
             "result": {
+                "status": "success",
                 "data": {
                     "preferences": [
                         {"type": "budget_min", "value": 500, "action": "append"},
                         {"type": "window_seat", "value": True, "action": "append"},
                     ]
-                }
+                },
             },
         }
     ]
@@ -1027,6 +1029,74 @@ def test_agent_load_timeout_is_bounded(monkeypatch):
     print("✓ 懒加载受智能体超时约束")
 
 
+def test_duplicate_schedule_agents_deduped():
+    """同一智能体以别名 / 重复条目出现时只执行一次（避免重复调用与双份结果）。"""
+    plan = _StubAgent("plan-trip", {"itinerary": {"title": "杭州行程"}})
+    orchestrator = OrchestrationAgent(
+        agent_registry={"plan-trip": plan, "itinerary_planning": plan},
+    )
+    schedule = [
+        {"agent_name": "plan-trip", "priority": 1},
+        {"agent_name": "itinerary_planning", "priority": 1},
+        {"agent_name": "plan-trip", "priority": 2},
+    ]
+    result = json.loads(asyncio.run(orchestrator.reply(_intent(schedule))).content)
+    assert plan.calls == 1, f"同一智能体应只执行一次，实际 {plan.calls} 次"
+    assert [item["agent_name"] for item in result["results"]] == [
+        "itinerary_planning"
+    ]
+    print("✓ 调度计划按 canonical 名去重")
+
+
+def test_failed_preference_not_merged_into_later_context():
+    """status=error 的偏好结果不能进入后续批次上下文（与落库守卫一致）。"""
+    captured: dict = {}
+
+    class Capture(_StubAgent):
+        async def reply(self, x):
+            captured["payload"] = json.loads(x.content)
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    class FailingPreference(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "status": "error",
+                        "message": "boomed",
+                        "data": {
+                            "preferences": [
+                                {"type": "hotel_brands", "value": ["错误品牌"]}
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "preference": FailingPreference("preference"),
+            "a": Capture("a"),
+        },
+    )
+    asyncio.run(
+        orchestrator.reply(
+            _intent(
+                [
+                    {"agent_name": "preference", "priority": 1},
+                    {"agent_name": "a", "priority": 2},
+                ]
+            )
+        )
+    )
+    preferences = captured["payload"]["context"]["user_preferences"]
+    assert "hotel_brands" not in preferences, "失败偏好的残缺值不能进入上下文"
+    print("✓ 失败偏好不进入后续批次上下文")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -1055,6 +1125,8 @@ if __name__ == "__main__":
     test_partial_failure_does_not_trip_breaker()
     test_previous_preference_append_flattens_list()
     test_schedule_names_are_trimmed()
+    test_duplicate_schedule_agents_deduped()
+    test_failed_preference_not_merged_into_later_context()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)

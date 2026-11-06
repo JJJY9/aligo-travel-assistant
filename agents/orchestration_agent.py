@@ -217,6 +217,20 @@ class OrchestrationAgent(AgentBase):
             name = str(task.get("agent_name") or "")
             return _SKILL_AGENT_NAMES.get(name, name)
 
+        # 同一智能体可能以「技能目录名 + 标准名」或重复条目出现：注册表同时
+        # 接受两种写法，不去重会被并行执行多次（重复调用 LLM、偏好重复落库、
+        # 回复出现两份结果）。按 canonical 名保留第一次出现的条目
+        deduped_schedule: list[dict[str, Any]] = []
+        seen_agents: set[str] = set()
+        for task in agent_schedule:
+            canonical = _canonical(task)
+            if canonical in seen_agents:
+                logger.warning("调度计划中重复的智能体已去重：%s", canonical)
+                continue
+            seen_agents.add(canonical)
+            deduped_schedule.append(task)
+        agent_schedule = deduped_schedule
+
         dependency_priorities = [
             task["priority"]
             for task in agent_schedule
@@ -349,6 +363,11 @@ class OrchestrationAgent(AgentBase):
         preferences = dict(context.get("user_preferences") or {})
         for result in previous_results:
             if result.get("agent_name") != "preference":
+                continue
+            # 抽取失败（status=error）的偏好不能进入后续批次上下文：界面与
+            # 聚合结果已把它标为失败，携带的 preferences 可能是残缺 / 错误的
+            # （与 _update_memory 的落库守卫一致），会误导行程规划
+            if (result.get("result") or {}).get("status") != "success":
                 continue
             data = (result.get("result") or {}).get("data") or {}
             if not isinstance(data, dict):

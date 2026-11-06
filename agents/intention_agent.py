@@ -20,8 +20,8 @@ from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.json_parser import (
-    extract_first_json_object,
     extract_json_from_async_response,
+    iter_json_objects,
     reject_json_constant,
 )
 from utils.llm_resilience import is_retriable_error
@@ -32,6 +32,29 @@ logger = logging.getLogger(__name__)
 # 意图 prompt 的输入上限：CLI 等入口可以传任意长度，超长输入会触发模型
 # 上下文错误并降级为携带原文的信息查询，污染后续总结
 _MAX_QUERY_CHARS = 4000
+
+
+def _message_text(content) -> str:
+    """把 Msg.content（字符串或 agentscope content block 列表）转成纯文本。
+
+    agentscope 的 ``Msg.content`` 类型是 ``str | Sequence[ContentBlock]``：
+    直接 ``str()`` 会把文本块变成 ``[{'type': 'text', 'text': ...}]`` 的
+    Python repr 拼进 prompt，模型收到的是容器语法而非用户原话，
+    ``_MAX_QUERY_CHARS`` 截断也按 repr 长度计算。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content or "")
 
 
 class IntentionAgent(AgentBase):
@@ -57,7 +80,7 @@ class IntentionAgent(AgentBase):
 
         # 获取用户查询
         if isinstance(x, list):
-            user_query = x[-1].content if x else ""
+            user_query = _message_text(x[-1].content) if x else ""
             # 提取历史对话，保留角色信息
             self.conversation_history = []
             for msg in x[:-1]:
@@ -65,19 +88,19 @@ class IntentionAgent(AgentBase):
                     # 区分处理不同角色的消息
                     if msg.role == "system":
                         # 长期记忆（system）- 完整保留，不截断
-                        self.conversation_history.append(f"[系统记忆]\n{msg.content}")
+                        self.conversation_history.append(f"[系统记忆]\n{_message_text(msg.content)}")
                     else:
                         # 对话历史（user/assistant）- 适当截断但保留更多信息
                         role_name = "用户" if msg.role == "user" else "助手"
-                        raw_content = msg.content
-                        content = raw_content if isinstance(raw_content, str) else str(raw_content)
+                        content = _message_text(msg.content)
                         if len(content) > 800:
                             content = content[:800] + "..."
                         self.conversation_history.append(f"{role_name}: {content}")
         else:
-            user_query = x.content
-
-        user_query = str(user_query or "")
+            user_query = _message_text(x.content)
+            # 单条 Msg 调用没有历史：必须清空上一种输入形态（列表）遗留的
+            # conversation_history，否则上一轮对话会串进本次意图 prompt
+            self.conversation_history = []
         if len(user_query) > _MAX_QUERY_CHARS:
             user_query = user_query[:_MAX_QUERY_CHARS] + "…（输入过长已截断）"
 
@@ -255,18 +278,18 @@ class IntentionAgent(AgentBase):
                 if "agent_schedule" not in result:
                     raise ValueError("意图识别结果缺少 agent_schedule")
             except json.JSONDecodeError as e1:
-                # 直接解析失败时扫描第一个完整 JSON 对象：不能简单取
-                # find('{')..rfind('}')，结尾说明里的花括号会被一起截进来
-                try:
-                    result = extract_first_json_object(text)
-                except ValueError:
+                # 直接解析失败时扫描文本中的全部 JSON 对象：说明文字 / 推理
+                # 过程里可能先出现一个合法的小对象（如单个 key_entities
+                # 片段），只取第一个会丢弃后面完整的意图结果并整体降级为
+                # information_query。优先采用最后一个带 agent_schedule 的
+                # 对象——模型回显 prompt 模板时占位对象在前、真实结果在后
+                result = None
+                for candidate in iter_json_objects(text):
+                    if "agent_schedule" in candidate:
+                        result = candidate
+                if result is None:
                     logger.error(f"JSON parse failed. Text sample: {text[:100]}")
                     raise ValueError(f"Failed to parse JSON. Error: {e1}") from e1
-                # 截到的可能只是嵌套片段（如单个 key_entities 对象），不能当作
-                # 完整意图结果，否则缺少 agent_schedule 会被当成 no_agents 吞掉
-                if not isinstance(result, dict) or "agent_schedule" not in result:
-                    logger.error("提取到的 JSON 片段不是完整意图结果")
-                    raise ValueError("意图识别结果缺少 agent_schedule（可能是嵌套片段）")
 
         except Exception as e:
             # 可重试错误（超时/连接失败/429/5xx）向上抛出，

@@ -36,6 +36,31 @@ def extract_first_json_object(text: str) -> dict:
     raise ValueError("No JSON object found in response")
 
 
+def iter_json_objects(text: str):
+    """按出现顺序产出文本中所有能完整解析的 JSON 对象。
+
+    说明文字或推理过程中可能先出现一个合法的小对象（如单个
+    ``key_entities`` 片段），只取第一个会丢弃后面真正完整的结构化结果；
+    调用方需要自行挑选（例如最后一个带 ``agent_schedule`` 的对象）。
+    """
+    if not text:
+        return
+    decoder = json.JSONDecoder(parse_constant=reject_json_constant)
+    index = 0
+    while True:
+        index = text.find("{", index)
+        if index < 0:
+            return
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except (json.JSONDecodeError, ValueError):
+            index += 1
+            continue
+        if isinstance(value, dict):
+            yield value
+        index = max(end, index + 1)
+
+
 def robust_json_parse(text: str, fallback=None) -> dict:
     """
     鲁棒的 JSON 解析函数
