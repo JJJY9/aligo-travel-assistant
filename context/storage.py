@@ -170,11 +170,17 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
         return
     client = _get_redis_client(url)
     if client is None:
+        # 启动 / 重连失败时客户端尚不可用（工厂 60 秒冷却）：同样要登记
+        # 整键删除，否则冷却结束、会话 ID 被复用后会读到已删除的旧对话
+        logger.warning("Redis 客户端不可用，登记会话清理（%s）", session_id)
+        for key in keys:
+            queue_clear(key)
         return
     try:
         client.delete(*keys, *[applied_key(key) for key in keys])
     except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程
         logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)
-        # 删除失败时登记一次整键删除：墓碑（300 秒）过期后复用同一
+        # 删除失败时登记整键删除：墓碑（300 秒）过期后复用同一
         # session_id 时，下一次访问会先重放它，不会读到旧对话
-        queue_clear(session_key(session_id, user_id) if user_id else session_key(session_id))
+        for key in keys:
+            queue_clear(key)

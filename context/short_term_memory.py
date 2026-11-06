@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 _REDIS_RETRY_COOLDOWN_SEC = 60.0
 _redis_degraded_until = 0.0
 
+# 故障期「整键删除」操作的有效期：会话墓碑只保留 300 秒，超过这个窗口
+# 后 session_id 可能已被合法复用，迟到的清空会把新会话的对话删掉
+_CLEAR_OP_MAX_AGE_SEC = 600.0
+
 
 def redis_short_term_degraded() -> bool:
     """短期记忆是否因 Redis 故障处于进程内回退状态。"""
@@ -245,8 +249,13 @@ def _evict_journal_locked() -> None:
         if stale.lock.acquire(blocking=False):
             only_adds = all(kind == "add" for kind, _ in stale.ops)
             if only_adds:
+                dropped = len(stale.ops)
                 del _PENDING_JOURNALS[stale_key]
                 stale.lock.release()
+                logger.warning(
+                    "短期记忆故障操作日志过多，丢弃最旧会话的 %s 条待重放消息",
+                    dropped,
+                )
                 return
             stale.lock.release()
     for stale_key, stale in list(_PENDING_JOURNALS.items()):
@@ -298,16 +307,22 @@ def discard_pending_ops(key: str) -> int:
     返回被丢弃的操作条数。删除会话后复用的同一 session_id 不能把旧会话
     排队的消息或删除动作重放进新会话。
     """
-    with _PENDING_JOURNALS_LOCK:
-        journal = _PENDING_JOURNALS.get(key)
-    if journal is None:
-        return 0
-    with journal.lock:
-        dropped = len(journal.ops)
-        journal.ops.clear()
-        # 持锁时判空并移除：释放锁后再移除会把并发追加的操作一起丢掉
-        _drop_idle_journal(key, journal)
-    return dropped
+    while True:
+        with _PENDING_JOURNALS_LOCK:
+            journal = _PENDING_JOURNALS.get(key)
+        if journal is None:
+            return 0
+        with journal.lock:
+            with _PENDING_JOURNALS_LOCK:
+                owned = _PENDING_JOURNALS.get(key) is journal
+            if not owned:
+                # 等待锁期间日志已被重放 / 淘汰替换：重新查找新日志
+                continue
+            dropped = len(journal.ops)
+            journal.ops.clear()
+            # 持锁时判空并移除：释放锁后再移除会把并发追加的操作一起丢掉
+            _drop_idle_journal(key, journal)
+            return dropped
 
 
 def queue_clear(key: str) -> None:
@@ -318,7 +333,7 @@ def queue_clear(key: str) -> None:
     """
     with _pending_journal(key) as journal:
         journal.ops.clear()
-        journal.ops.append(("clear", None))
+        journal.ops.append(("clear", datetime.now().isoformat()))
 
 
 class ShortTermMemory:
@@ -540,6 +555,14 @@ class RedisShortTermMemory:
                 self.client.eval(
                     _ADD_MESSAGES_LUA, 2, self.key, applied_key(self.key), *arguments
                 )
+                # 这些操作已成功出队、不会再重放，回收对应的去重记录；
+                # 回收失败只是多留几条无用记录（集合带 TTL），不回调错误
+                try:
+                    self.client.srem(
+                        applied_key(self.key), *[op_id for _, op_id in batch]
+                    )
+                except Exception:  # noqa: BLE001 - 清理失败不影响重放结果
+                    logger.debug("清理已重放 applied 记录失败：%s", self.key)
                 del ops[:consumed]
                 continue
             if kind == "truncate":
@@ -562,12 +585,34 @@ class RedisShortTermMemory:
                         "短期记忆故障期截断重放未匹配（列表末尾已变化），已跳过：%s",
                         self.key,
                     )
+                # 拿到脚本响应后标记不会再被使用，删除避免残留到 TTL
+                try:
+                    self.client.delete(self._op_marker_key(op_id))
+                except Exception:  # noqa: BLE001 - 标记带 TTL，删除失败也会过期
+                    logger.debug("清理截断标记失败：%s", self.key)
                 ops.pop(0)
             elif kind == "remove":
                 if payload:
                     self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
                 ops.pop(0)
             else:  # clear
+                cutoff = payload if isinstance(payload, str) else None
+                if cutoff is not None:
+                    try:
+                        age = (
+                            datetime.now() - datetime.fromisoformat(cutoff)
+                        ).total_seconds()
+                    except ValueError:
+                        age = 0.0
+                    if age > _CLEAR_OP_MAX_AGE_SEC:
+                        # 迟到太久的整键删除可能命中已合法复用的新会话
+                        logger.warning(
+                            "短期记忆故障期清空已过期（%s 秒），跳过：%s",
+                            int(age),
+                            self.key,
+                        )
+                        ops.pop(0)
+                        continue
                 self.client.delete(self.key, applied_key(self.key))
                 ops.pop(0)
 
@@ -691,10 +736,12 @@ class RedisShortTermMemory:
         return "\n".join(lines)
 
     def clear(self) -> None:
+        cutoff = datetime.now().isoformat()
+
         def on_failure(journal: _PendingJournal) -> None:
             # 故障期间删不掉 Redis 里的旧内容：恢复后重放一次删除（该操作
             # 会覆盖日志中更早的变更，_append_op 已按此合并）
-            self._append_op(journal, "clear")
+            self._append_op(journal, "clear", cutoff)
 
         self._call_redis(
             lambda: self.client.delete(self.key, applied_key(self.key)),

@@ -947,6 +947,84 @@ def test_eviction_prefers_add_only_journals(monkeypatch):
     print("✓ 淘汰优先选择只含新增的日志")
 
 
+def test_clear_op_survives_journal_trim(monkeypatch):
+    """日志裁剪永不丢弃 clear：删除类操作保留，新增/截断各自限额。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-cleartrim", max_turns=2, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "清空前的消息")
+    memory.clear()
+    for _ in range(300):
+        memory.truncate_last_turn("同一提问")
+    kinds = [kind for kind, _ in memory._pending_ops]
+    assert kinds[0] == "clear", "clear 必须在日志首位且不被裁剪"
+    assert kinds.count("clear") == 1
+    assert kinds.count("truncate") == 64
+    with module._PENDING_JOURNALS_LOCK:
+        module._PENDING_JOURNALS.pop(memory.key, None)
+    print("✓ clear 操作不参与日志裁剪")
+
+
+def test_expired_clear_op_is_skipped(monkeypatch):
+    """迟到的整键删除（超过墓碑窗口）不应清掉已合法复用的会话。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [_message("user", "复用的新会话", "2000-01-01T00:00:00")]
+    memory = module.RedisShortTermMemory(client, "s-expired", max_turns=5, user_id="u1")
+    module.queue_clear(memory.key)
+    with module._pending_journal(memory.key) as journal:
+        journal.ops[:] = [("clear", "2000-01-01T00:00:00")]  # 人为改老
+
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["复用的新会话"], "过期的清空操作不能删掉新会话"
+    assert memory._pending_ops == []
+    print("✓ 过期的 clear 操作被跳过")
+
+
+def test_replay_cleans_applied_ids_and_markers(monkeypatch):
+    """重放成功后回收 applied 记录与截断标记，键空间不随故障次数增长。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-reclaim", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    module.RedisShortTermMemory(client, "s-reclaim", max_turns=5, user_id="u1").truncate_last_turn("Q1")
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory.get_recent_context()
+    assert client.applied.get(module.applied_key(memory.key), set()) == set(), (
+        "重放成功的 op_id 应被回收"
+    )
+    assert client.markers == {}, "重放成功的截断标记应被删除"
+    print("✓ 重放成功后回收 applied 与标记")
+
+
+def test_clear_short_term_session_without_client_queues_clear(monkeypatch):
+    """Redis 客户端不可用（冷却期）时删除会话也要登记整键删除。"""
+    from context import short_term_memory as module
+    from context import storage
+
+    client = _FlakyRedis()
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "redis_url", "redis://fake")
+    monkeypatch.setattr(storage, "_get_redis_client", lambda url: None)
+    storage.clear_short_term_session("s-noclient", "u-noclient")
+    key = module.session_key("s-noclient", "u-noclient")
+    probe = module.RedisShortTermMemory(client, "s-noclient", user_id="u-noclient")
+    assert [kind for kind, _ in probe._pending_ops] == ["clear"]
+    with module._PENDING_JOURNALS_LOCK:
+        module._PENDING_JOURNALS.pop(key, None)
+    print("✓ 客户端不可用时删除会话登记整键删除")
+
+
 def test_replay_failure_still_registers_current_add(monkeypatch):
     """重放中途失败时本次新增也要登记，恢复后按顺序补写。"""
     from context import short_term_memory as module
