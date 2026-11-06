@@ -2608,6 +2608,88 @@ def run_session_archive_standalone(
     return 0
 
 
+def run_session_title_standalone(
+    user_id: str,
+    session_id: str,
+    title: str,
+    as_json: bool = False,
+) -> int:
+    """设置会话标题（`python cli.py session-title <user> <session> <标题|--reset> [--json]`）。
+
+    空标题 / ``--reset`` 表示恢复自动标题（由第一条消息生成）。与面板
+    PUT ``/api/sessions/{id}/title`` 同一限制：标题最多 60 个字符。
+
+    Returns:
+        0 设置成功；1 参数 / 读取 / 写入失败（含会话不存在）
+    """
+    import re
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+        return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+    cleaned = title.strip()
+    if len(cleaned) > 60:
+        return _fail("标题最多 60 个字符")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            exists = bool(store.get_chat_history(session_id=session_id))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取会话失败：{exc}")
+        if not exists:
+            return _fail(f"会话 {session_id} 不存在或没有消息")
+        try:
+            store.set_session_title(session_id, cleaned)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"操作失败：{exc}")
+        try:
+            saved = str((store.get_session_titles() or {}).get(session_id) or "")
+        except Exception:  # noqa: BLE001 - 读回失败时按提交值展示
+            saved = cleaned
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "title": saved,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if saved:
+        print(f"已设置会话 {session_id} 标题：{saved}")
+    else:
+        print(f"已恢复会话 {session_id} 的自动标题")
+    return 0
+
+
 def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str, bool] | None:
     """解析 sessions 的 --archived / --all / --query 关键词 / --json。
 
@@ -3719,7 +3801,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / "
     "preferences / pref-set / pref-delete / "
-    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-export / "
+    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-export / "
     "sessions-export / trips-export / user-export"
 )
 
@@ -4147,6 +4229,39 @@ def main():
                     sys.argv[3],
                     archived=not restore,
                     as_json=as_json,
+                )
+            )
+        if arg == "session-title":
+            positional: list[str] = []
+            as_json = False
+            reset = False
+            valid = True
+            for item in sys.argv[2:]:
+                lowered = item.lower()
+                if lowered == "--json":
+                    as_json = True
+                elif lowered == "--reset":
+                    reset = True
+                elif item.startswith("-") or len(positional) >= 3:
+                    valid = False
+                    break
+                else:
+                    positional.append(item)
+            if (
+                not valid
+                or len(positional) < 2
+                or (reset and len(positional) == 3)
+                or (not reset and len(positional) != 3)
+            ):
+                print(
+                    "用法：python cli.py session-title <user_id> <session_id> "
+                    "<标题|--reset> [--json]"
+                )
+                sys.exit(2)
+            title = "" if reset else positional[2]
+            sys.exit(
+                run_session_title_standalone(
+                    positional[0], positional[1], title, as_json=as_json
                 )
             )
         if arg == "session-export":
