@@ -126,9 +126,24 @@ def test_user_query_preferred_over_whole_context():
     print("✓ 事项收集优先用户原话（不注入整段上下文）")
 
 
+def test_non_object_payload_does_not_crash():
+    """顶层 / context 非对象时按纯文本处理（.get 的 AttributeError 曾绕过 JSONDecodeError 兜底）。"""
+    agent_class = _load_agent_class()
+    model = _CaptureModel('{"origin": "北京", "missing_info": []}')
+    agent = agent_class(name="EventCollectionAgent", model=model)
+    for payload in ("[1, 2, 3]", "42", '"纯文本输入"', '{"context": null}'):
+        out = asyncio.run(
+            agent.reply(Msg(name="x", content=payload, role="user"))
+        )
+        data = json.loads(out.content)
+        assert data.get("origin") == "北京", f"payload={payload} 未正常走提取流程"
+    print("✓ 非对象 payload 不崩溃")
+
+
 if __name__ == "__main__":
     test_string_preference_not_split()
     test_list_preference_joined()
     test_result_parsed()
     test_user_query_preferred_over_whole_context()
+    test_non_object_payload_does_not_crash()
     print("\n全部通过")
