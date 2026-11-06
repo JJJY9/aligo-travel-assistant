@@ -234,6 +234,81 @@ def test_kb_search_dispatch(monkeypatch):
     print("✓ dispatch 层 kb-search 正常执行")
 
 
+def test_show_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
+    )
+    code, out = _capture(cli.run_knowledge_show_standalone, 7)
+    assert code == 1 and "不可用" in out
+    print("✓ kb-show 知识库不可用时返回 1")
+
+
+def test_show_success_and_json(monkeypatch):
+    document = {
+        "id": 7,
+        "group": "g-abc",
+        "parts": 3,
+        "size": 1200,
+        "content": "第一段\n第二段\n第三段",
+    }
+    calls = {}
+
+    def fake_group(doc_id):
+        calls["doc_id"] = doc_id
+        return document
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "get_document_group", fake_group)
+    code, out = _capture(cli.run_knowledge_show_standalone, 7)
+    assert code == 0
+    assert calls["doc_id"] == 7
+    assert "#7 · 整篇 3 片 · group g-abc · 1200 字" in out
+    assert "第二段" in out
+
+    code, out = _capture(cli.run_knowledge_show_standalone, 7, as_json=True)
+    assert code == 0
+    data = json.loads(out)
+    assert data["group"] == "g-abc" and data["parts"] == 3
+    print("✓ kb-show 文本 / JSON 输出（整篇拼接）")
+
+
+def test_show_missing_and_error(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "get_document_group", lambda doc_id: None)
+    code, out = _capture(cli.run_knowledge_show_standalone, 9)
+    assert code == 1 and "#9 不存在" in out
+
+    def boom(doc_id):
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "get_document_group", boom)
+    code, out = _capture(cli.run_knowledge_show_standalone, 9)
+    assert code == 1 and "读取失败" in out
+    print("✓ kb-show 不存在 / 读取失败")
+
+
+def test_kb_show_dispatch(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document_group",
+        lambda doc_id: {"id": doc_id, "group": "", "parts": 1, "size": 2, "content": "内容"},
+    )
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-show", "7"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert "#7" in buf.getvalue()
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-show", "7", "8"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2 and "用法" in buf.getvalue()
+    print("✓ dispatch 层 kb-show 正常执行 / 多余参数拒绝")
+
+
 def test_delete_success(monkeypatch):
     calls = []
 
@@ -376,6 +451,10 @@ if __name__ == "__main__":
         test_search_empty_and_error,
         test_kb_search_args,
         test_kb_search_dispatch,
+        test_show_unavailable,
+        test_show_success_and_json,
+        test_show_missing_and_error,
+        test_kb_show_dispatch,
     ):
         mp = pytest.MonkeyPatch()
         try:

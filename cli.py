@@ -1556,6 +1556,52 @@ def run_knowledge_search_standalone(
     return 0
 
 
+def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
+    """查看知识片段（多分片按整篇拼接，`python cli.py kb-show <id> [--json]`）。
+
+    与面板「编辑整份文档」同一实现（``get_document_group``）：带 group 的
+    记录按 part 顺序拼接为整篇，便于在终端核对拆分结果。
+
+    Returns:
+        0 查看成功；1 片段不存在 / 知识库不可用 / 读取失败
+    """
+    from utils.knowledge_admin import get_document_group
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        return 1
+    try:
+        document = get_document_group(doc_id)
+    except FileNotFoundError:
+        print("知识库未初始化")
+        return 1
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"读取失败：{exc}")
+        return 1
+    if document is None:
+        print(f"知识点 #{doc_id} 不存在")
+        return 1
+    if as_json:
+        print(json.dumps(document, ensure_ascii=False, indent=2))
+        return 0
+    parts = int(document.get("parts") or 1)
+    group = str(document.get("group") or "")
+    content = str(document.get("content") or "")
+    size = int(document.get("size") or len(content))
+    meta = [f"#{doc_id}"]
+    if parts > 1:
+        meta.append(f"整篇 {parts} 片")
+    if group:
+        meta.append(f"group {group}")
+    meta.append(f"{size} 字")
+    print(" · ".join(meta))
+    print()
+    print(content)
+    return 0
+
+
 def _parse_cli_int(value: str) -> int | None:
     """ASCII 十进制整数解析（用于 <id> / limit 参数）。
 
@@ -2423,7 +2469,8 @@ def _parse_export_args(
 
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / kb / eval / kb-export / "
-    "kb-import / kb-list / kb-search / kb-categories / kb-delete / kb-duplicates / "
+    "kb-import / kb-list / kb-search / kb-show / kb-categories / kb-delete / "
+    "kb-duplicates / "
     "preferences / "
     "trips / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export"
@@ -2546,6 +2593,19 @@ def main():
                     search_query, top_k=search_top_k, as_json=search_json
                 )
             )
+        if arg == "kb-show":
+            show_args = sys.argv[2:]
+            show_json = "--json" in [item.lower() for item in show_args]
+            ids = [
+                item
+                for item in show_args
+                if item.lower() != "--json"
+            ]
+            doc_id = _parse_cli_int(ids[0]) if len(ids) == 1 else None
+            if doc_id is None or any(item.startswith("-") for item in ids):
+                print("用法：python cli.py kb-show <id> [--json]")
+                sys.exit(2)
+            sys.exit(run_knowledge_show_standalone(doc_id, as_json=show_json))
         if arg == "kb-categories":
             kb_categories_json = _parse_json_flag(
                 sys.argv[2:], "python cli.py kb-categories [--json]"
