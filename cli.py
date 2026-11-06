@@ -1077,6 +1077,40 @@ def _parse_json_flag(args: list[str], usage: str) -> bool | None:
     return None
 
 
+def _parse_eval_args(args: list[str]) -> tuple[bool, float] | None:
+    """解析 eval 的 ``[--json] [--min-hit5 X]``；非法参数返回 None。
+
+    ``--min-hit5`` 取 0..1 的小数（默认 0.8），用于判定评测是否达标。
+    """
+    as_json = False
+    min_hit5 = 0.8
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+        elif lowered == "--min-hit5" or lowered.startswith("--min-hit5="):
+            if lowered == "--min-hit5":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--min-hit5="):]
+            try:
+                parsed = float(value)
+            except ValueError:
+                return None
+            if not 0.0 <= parsed <= 1.0:
+                return None
+            min_hit5 = parsed
+        else:
+            return None
+        index += 1
+    return as_json, min_hit5
+
+
 def _parse_doctor_args(args: list[str]) -> tuple[bool, bool] | None:
     """解析 doctor 的 ``[--json] [--offline]``；非法参数返回 None。"""
     as_json = False
@@ -2742,10 +2776,16 @@ def main():
                 sys.exit(2)
             sys.exit(run_knowledge_status_standalone(as_json=kb_json))
         if arg == "eval":
-            eval_json = _parse_json_flag(sys.argv[2:], "python cli.py eval [--json]")
-            if eval_json is None:
+            parsed_eval = _parse_eval_args(sys.argv[2:])
+            if parsed_eval is None:
+                print("用法：python cli.py eval [--json] [--min-hit5 0.8]")
                 sys.exit(2)
-            sys.exit(run_rag_eval_standalone(as_json=eval_json))
+            eval_json, eval_min_hit5 = parsed_eval
+            sys.exit(
+                run_rag_eval_standalone(
+                    as_json=eval_json, min_hit5=eval_min_hit5
+                )
+            )
         if arg == "kb-export":
             parsed_kb_export = _parse_kb_export_args(sys.argv[2:])
             if parsed_kb_export is None:
