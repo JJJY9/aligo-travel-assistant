@@ -238,6 +238,132 @@ def test_knowledge_base_missing():
     print("✓ 知识库未初始化 → 警告")
 
 
+def test_knowledge_base_reason_variants(monkeypatch):
+    """知识库检查的各类 reason / 空集合 / 正常分支。"""
+    from utils import knowledge_stats
+
+    def _status(reason=None, documents=None):
+        data = {"collection": "c", "available": reason is None}
+        if reason is not None:
+            data["reason"] = reason
+        if documents is not None:
+            data["documents"] = documents
+        return data
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda path=None: _status("集合不存在"),
+    )
+    result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_WARN and "缺少知识集合" in result.detail
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda path=None: _status("连接被拒绝" * 60),
+    )
+    result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_WARN
+    assert result.detail.startswith("无法读取知识库:")
+    assert len(result.detail) <= len("无法读取知识库: ") + 120
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda path=None: _status(None, 0),
+    )
+    result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_WARN and "知识集合为空" in result.detail
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda path=None: _status(None, 3),
+    )
+    result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_OK and "3 个知识片段" in result.detail
+
+
+def test_config_and_dependencies_branches(monkeypatch):
+    """缺少 API Key / 缺少核心依赖时的失败分支。"""
+    import importlib.util as ilu
+
+    from config import LLM_CONFIG
+    from utils import doctor as doctor_module
+
+    monkeypatch.setitem(LLM_CONFIG, "api_key", "")
+    result = doctor_module.check_config()
+    assert result.status == STATUS_FAIL and "未配置 API Key" in result.detail
+
+    real_find_spec = ilu.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "agentscope":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(ilu, "find_spec", fake_find_spec)
+    results = doctor_module.check_dependencies()
+    core = next(item for item in results if item.name == "核心依赖")
+    assert core.status == STATUS_FAIL and "agentscope" in core.detail
+
+
+def test_llm_connectivity_branches(monkeypatch):
+    """无密钥跳过 / 连通 / 失败三种状态。"""
+    from config import LLM_CONFIG
+    from utils import doctor as doctor_module
+    from utils import llm_resilience
+
+    monkeypatch.setitem(LLM_CONFIG, "api_key", "")
+    skipped = asyncio.run(doctor_module.check_llm_connectivity())
+    assert skipped.status == STATUS_SKIP and "未配置 API Key" in skipped.detail
+
+    monkeypatch.setitem(LLM_CONFIG, "api_key", "sk-test")
+
+    async def fake_health(**kwargs):
+        return True, "ok"
+
+    monkeypatch.setattr(llm_resilience, "run_health_check", fake_health)
+    ok = asyncio.run(doctor_module.check_llm_connectivity())
+    assert ok.status == STATUS_OK and "可用" in ok.detail
+
+    async def fake_fail(**kwargs):
+        return False, "连接超时" * 40
+
+    monkeypatch.setattr(llm_resilience, "run_health_check", fake_fail)
+    failed = asyncio.run(doctor_module.check_llm_connectivity())
+    assert failed.status == STATUS_FAIL
+    assert len(failed.detail) <= 150
+
+
+def test_report_and_summary_statuses():
+    """汇总结论与表格覆盖全部状态（含未知状态）。"""
+    from utils.doctor import (
+        CheckResult,
+        build_report_table,
+        has_failures,
+        summarize,
+    )
+
+    ok = CheckResult("A", STATUS_OK, "d")
+    warn = CheckResult("B", STATUS_WARN, "d")
+    fail = CheckResult("C", STATUS_FAIL, "d")
+    skip = CheckResult("D", STATUS_SKIP, "d")
+    unknown = CheckResult("E", "weird", "d")
+
+    assert has_failures([ok, warn, skip]) is False
+    assert has_failures([ok, fail]) is True
+    assert summarize([ok, skip]) == ("✓ 环境检查全部通过", "green")
+    text, style = summarize([ok, warn])
+    assert style == "yellow" and "警告" in text
+    text, style = summarize([fail, warn])
+    assert style == "red" and "必须处理" in text
+
+    table = build_report_table([ok, warn, fail, skip, unknown])
+    assert table.row_count == 5
+
+
 def test_run_doctor_without_network():
     results = asyncio.run(run_doctor(include_network=False))
     names = [r.name for r in results]
@@ -322,10 +448,14 @@ if __name__ == "__main__":
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
     test_knowledge_base_missing()
+    test_report_and_summary_statuses()
     for case in (
         test_storage_defaults,
         test_storage_unreachable_warns,
         test_storage_runtime_degraded_warns,
+        test_knowledge_base_reason_variants,
+        test_config_and_dependencies_branches,
+        test_llm_connectivity_branches,
     ):
         mp = pytest.MonkeyPatch()
         try:
