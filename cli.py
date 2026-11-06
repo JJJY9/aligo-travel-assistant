@@ -2064,11 +2064,14 @@ def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> i
     return 0
 
 
-def run_knowledge_duplicates_standalone(limit: int = 20) -> int:
-    """列出内容完全相同的独立知识片段组（用于 `python cli.py kb-duplicates [limit]`）。
+def run_knowledge_duplicates_standalone(
+    limit: int = 20, as_json: bool = False
+) -> int:
+    """列出内容完全相同的独立知识片段组（`python cli.py kb-duplicates [limit] [--json]`）。
 
     ``limit`` 为 0 时显示全部；只统计不带 group 的独立片段（多分片记录内部
-    的相同段落属于同一篇文档，不能按单条重复处理）。
+    的相同段落属于同一篇文档，不能按单条重复处理）。``--json`` 输出结构化
+    结果（total_groups / total_fragments / shown / groups），供脚本消费。
 
     Returns:
         0 扫描成功（有无重复都算成功）；1 读取失败
@@ -2078,18 +2081,49 @@ def run_knowledge_duplicates_standalone(limit: int = 20) -> int:
     try:
         groups = find_duplicate_contents()
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"读取失败：{exc}")
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": str(exc)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"读取失败：{exc}")
         return 1
+    shown = groups if limit <= 0 else groups[:limit]
+    entries = [
+        {
+            "content": content,
+            "preview": " ".join(content.split())[:60],
+            "ids": list(ids),
+        }
+        for content, ids in shown
+    ]
+    total = sum(len(ids) for _, ids in groups)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "total_groups": len(groups),
+                    "total_fragments": total,
+                    "shown": len(shown),
+                    "groups": entries,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if not groups:
         print("没有重复内容的独立知识片段")
         return 0
-    total = sum(len(ids) for _, ids in groups)
     print(f"发现 {len(groups)} 组重复内容（共 {total} 条片段）：")
-    shown = groups if limit <= 0 else groups[:limit]
-    for content, ids in shown:
-        preview = " ".join(content.split())[:60]
-        joined = "、".join(f"#{doc_id}" for doc_id in ids)
-        print(f"  {len(ids)} 条 · {joined}  {preview}")
+    for entry in entries:
+        joined = "、".join(f"#{doc_id}" for doc_id in entry["ids"])
+        print(f"  {len(entry['ids'])} 条 · {joined}  {entry['preview']}")
     if len(groups) > len(shown):
         print(f"  … 其余 {len(groups) - len(shown)} 组未显示（limit=0 显示全部）")
     print("提示：以上均为未分组的独立片段，确认保留哪一份后可删除其余")
@@ -3157,17 +3191,29 @@ def main():
                 )
             )
         if arg == "kb-duplicates":
-            args = sys.argv[2:]
             limit = 20
-            if args:
-                parsed = _parse_cli_int(args[0])
-                if parsed is None or len(args) > 1:
-                    print(
-                        "用法：python cli.py kb-duplicates [limit]（0 显示全部，默认 20）"
-                    )
-                    sys.exit(2)
+            as_json = False
+            seen_limit = False
+            valid = True
+            for item in sys.argv[2:]:
+                if item.lower() == "--json":
+                    as_json = True
+                    continue
+                parsed = _parse_cli_int(item) if not seen_limit else None
+                if parsed is None:
+                    valid = False
+                    break
+                seen_limit = True
                 limit = parsed
-            sys.exit(run_knowledge_duplicates_standalone(limit))
+            if not valid:
+                print(
+                    "用法：python cli.py kb-duplicates [limit] [--json]"
+                    "（0 显示全部，默认 20）"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_knowledge_duplicates_standalone(limit, as_json=as_json)
+            )
         if arg == "stats":
             parsed_stats = _parse_user_and_json_args(sys.argv[2:])
             if parsed_stats is None:

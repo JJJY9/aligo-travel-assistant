@@ -395,6 +395,60 @@ def test_add_and_update_failures(monkeypatch):
     print("✓ kb-add / kb-update 失败路径与更新成功")
 
 
+def test_duplicates_json_output(monkeypatch):
+    """kb-duplicates --json：结构化分组（含 preview / ids）与错误输出。"""
+    import json as _json
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "find_duplicate_contents",
+        lambda: [("重复内容甲", [3, 9]), ("重复内容乙", [5, 6, 7])],
+    )
+    code, out = _capture(cli.run_knowledge_duplicates_standalone, 1, as_json=True)
+    payload = _json.loads(out)
+    assert code == 0 and payload["ok"] is True
+    assert payload["total_groups"] == 2
+    assert payload["total_fragments"] == 5
+    assert payload["shown"] == 1
+    assert payload["groups"][0]["ids"] == [3, 9]
+    assert payload["groups"][0]["content"] == "重复内容甲"
+
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: [])
+    code, out = _capture(cli.run_knowledge_duplicates_standalone, as_json=True)
+    payload = _json.loads(out)
+    assert code == 0 and payload["groups"] == [] and payload["total_groups"] == 0
+
+    def boom():
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", boom)
+    code, out = _capture(cli.run_knowledge_duplicates_standalone, as_json=True)
+    payload = _json.loads(out)
+    assert code == 1 and payload["ok"] is False and "Milvus" in payload["error"]
+    print("✓ kb-duplicates --json 分组 / 空结果 / 错误")
+
+
+def test_duplicates_dispatch_json_flag(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_duplicates_standalone",
+        lambda limit=20, as_json=False: calls.append((limit, as_json)) or 0,
+    )
+    for argv, expected in (
+        (["cli.py", "kb-duplicates"], (20, False)),
+        (["cli.py", "kb-duplicates", "--json"], (20, True)),
+        (["cli.py", "kb-duplicates", "0", "--json"], (0, True)),
+        (["cli.py", "kb-duplicates", "--JSON", "5"], (5, True)),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert calls[-1] == expected, argv
+    print("✓ kb-duplicates dispatch --json 任意位置")
+
+
 def test_update_reports_leftover_parts(monkeypatch):
     """整组替换有旧分片没删掉时，CLI 要把残留 id 提示出来。"""
     import tempfile
@@ -505,7 +559,7 @@ def test_knowledge_dispatch_rejects_unicode_digits(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_knowledge_duplicates_standalone",
-        lambda limit=20: calls.append(("dup", limit)) or 0,
+        lambda limit=20, as_json=False: calls.append(("dup", limit, as_json)) or 0,
     )
     for argv in (
         ["cli.py", "kb-delete", "²"],
@@ -528,7 +582,7 @@ def test_knowledge_dispatch_rejects_unicode_digits(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["cli.py", "kb-duplicates", "0"])
     with pytest.raises(SystemExit) as exc:
         cli.main()
-    assert exc.value.code == 0 and calls[-1] == ("dup", 0)
+    assert exc.value.code == 0 and calls[-1] == ("dup", 0, False)
     print("✓ kb-delete / kb-duplicates 拒绝 Unicode 数字与超长参数")
 
 
@@ -581,6 +635,8 @@ if __name__ == "__main__":
         test_knowledge_dispatch_rejects_unicode_digits,
         test_duplicates_reports_groups,
         test_duplicates_none_and_error,
+        test_duplicates_json_output,
+        test_duplicates_dispatch_json_flag,
         test_categories_unavailable,
         test_categories_prints,
         test_categories_json_and_empty,
@@ -596,6 +652,7 @@ if __name__ == "__main__":
         test_kb_show_dispatch,
         test_add_from_file,
         test_add_and_update_failures,
+        test_update_reports_leftover_parts,
         test_kb_write_args_and_dispatch,
     ):
         mp = pytest.MonkeyPatch()
