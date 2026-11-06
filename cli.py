@@ -20,6 +20,7 @@ import json
 from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
+from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import has_preference_value
@@ -197,6 +198,11 @@ class AligoCLI:
         rc = RESILIENCE_CONFIG
         max_retries = int(rc.get("max_retries", 3))
 
+        # 每轮对话前重载长期记忆（与 Web 端一致）：记忆面板 / 其它进程刚写入的
+        # 标题、偏好、行程必须进入本轮上下文，本进程的旧快照也不能在写回时
+        # 覆盖它们
+        await asyncio.to_thread(self.memory_manager.reload_long_term)
+
         with self.console.status("正在理解需求…", spinner="dots"):
             from agentscope.message import Msg
 
@@ -222,6 +228,9 @@ class AligoCLI:
                 if self.circuit_breaker:
                     self.circuit_breaker.record_success()
             except CircuitOpenError:
+                raise
+            except MemoryPersistenceError:
+                # 记忆写盘失败与 LLM 健康无关，不计入熔断（与 ConversationRuntime 一致）
                 raise
             except Exception:
                 if self.circuit_breaker:
@@ -257,6 +266,9 @@ class AligoCLI:
             if self.circuit_breaker:
                 self.circuit_breaker.record_success()
         except CircuitOpenError:
+            raise
+        except MemoryPersistenceError:
+            # 记忆写盘失败与 LLM 健康无关，不计入熔断（与 ConversationRuntime 一致）
             raise
         except Exception:
             if self.circuit_breaker:

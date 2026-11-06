@@ -525,6 +525,39 @@ def test_migrate_fills_statistics_defaults():
     print("✓ 缺失 statistics 子字段时补默认值")
 
 
+def test_migrate_repairs_bad_statistics_values():
+    """计数器为 null / 字符串时必须修复，否则每次写入都抛 TypeError。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-bad-stats.json"
+    path.write_text(
+        json.dumps(
+            {
+                "statistics": {
+                    "total_messages": None,
+                    "total_trips": "12",
+                    "last_trip_number": None,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-bad-stats", storage_dir)
+    memory.add_chat_message("user", "hi", "s1")
+    assert memory.get_statistics()["total_messages"] == 1
+    memory.increment_query_count()
+    assert memory.get_statistics()["total_queries"] == 1
+    trip_id = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-02",
+            "purpose": "出差",
+        }
+    )
+    assert trip_id == "trip_1", "last_trip_number 为 null 时也应从 1 开始编号"
+    print("✓ statistics 计数器为 null / 字符串时自动修复")
+
+
 def test_migrate_drops_non_object_entries():
     """chat_history / trip_history 里的非对象元素在迁移时丢弃。"""
     storage_dir = tempfile.mkdtemp()
@@ -1323,6 +1356,7 @@ if __name__ == "__main__":
     test_valid_json_non_object_memory_file_is_backed_up()
     test_null_list_fields_are_repaired()
     test_migrate_fills_statistics_defaults()
+    test_migrate_repairs_bad_statistics_values()
     test_migrate_drops_non_object_entries()
     test_pg_reconnects_after_connection_error()
     test_pg_failed_retry_wrapped_as_memory_error()

@@ -55,6 +55,9 @@ def _locked_mutation(func):
         with self._write_lock:
             try:
                 with file_lock(self.db_path):
+                    # 加载时没能确认的损坏文件在这里补复核：否则空快照会把
+                    # 磁盘上的损坏文件直接覆盖且不产生 .corrupt-* 备份
+                    self._ensure_corrupt_backed_up()
                     self._reload_latest()
                     return func(self, *args, **kwargs)
             except TimeoutError as exc:
@@ -96,6 +99,9 @@ class LongTermMemory:
         Path(self.storage_path).mkdir(parents=True, exist_ok=True)
 
         # 加载或初始化数据
+        # 「加载时没能确认损坏文件已备份」的标记：等锁超时 / 备份失败时置位，
+        # 下一次持锁写入前必须复核并补备份，否则空快照会直接覆盖损坏文件
+        self._corrupt_pending = False
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -145,6 +151,9 @@ class LongTermMemory:
                                     os.replace(self.db_path, backup)
                                     logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 except OSError as backup_error:
+                                    # 文件可能仍被其它进程持有：先以空快照启动，
+                                    # 但写入前必须补备份（见 _ensure_corrupt_backed_up）
+                                    self._corrupt_pending = True
                                     logger.error(
                                         "备份损坏的记忆文件失败: %s", backup_error
                                     )
@@ -153,7 +162,8 @@ class LongTermMemory:
                             return latest
                     except TimeoutError as lock_error:
                         # 等锁超时：不能把可能有效的数据当损坏文件移走，
-                        # 以空快照启动（写操作前会重载磁盘最新内容）
+                        # 以空快照启动；写入前会在持锁状态补做复核 / 备份
+                        self._corrupt_pending = True
                         logger.error(
                             "加载损坏记忆文件时等待文件锁超时: %s", lock_error
                         )
@@ -161,6 +171,39 @@ class LongTermMemory:
             else:
                 logger.info("No existing long-term memory, creating new")
                 return self._init_data()
+
+    def _ensure_corrupt_backed_up(self) -> None:
+        """写操作前的损坏文件复核（调用方必须已持有跨进程文件锁）。
+
+        ``_load`` 在等锁超时 / 备份失败时以空快照启动，磁盘上可能仍是一份
+        无法解析的损坏文件：``_reload_latest`` 会静默沿用内存快照，随后的
+        写入直接覆盖文件，原本可能可手工恢复的数据永久丢失。这里在持锁
+        状态下重新复核：文件已恢复为合法 JSON 就交给 ``_reload_latest``
+        采用；仍然损坏则补备份；备份再次失败拒绝写入。
+        """
+        if not self._corrupt_pending:
+            return
+        try:
+            with open(self.db_path, "r", encoding="utf-8") as f:
+                json.load(f)
+        except FileNotFoundError:
+            self._corrupt_pending = False
+            return
+        except Exception:  # noqa: BLE001 - 仍是损坏文件：补备份
+            backup = (
+                f"{self.db_path}.corrupt-"
+                f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                f"-{os.getpid()}"
+            )
+            try:
+                os.replace(self.db_path, backup)
+            except OSError as exc:
+                raise MemoryPersistenceError(
+                    "记忆文件损坏且无法备份，已拒绝覆盖写入"
+                    f"（可手动处理 {self.db_path}）"
+                ) from exc
+            logger.warning("损坏的记忆文件已补备份到 %s", backup)
+        self._corrupt_pending = False
 
     def reload(self) -> None:
         """重新从磁盘加载最新数据（供 CLI 并发复核等只读场景调用）。"""
@@ -204,12 +247,20 @@ class LongTermMemory:
         if not isinstance(data.get("statistics"), dict):
             data["statistics"] = {}
         stats = data["statistics"]
-        stats.setdefault("total_messages", 0)
-        stats.setdefault("total_queries", 0)
-        stats.setdefault("total_trips", 0)
+        # 计数器存在但为 null / 字符串 / 布尔时按 0 处理：这类文件是合法
+        # JSON，不修复的话每次写入（+= 1）都会抛 TypeError，而且永远不会
+        # 进入损坏备份 / 自愈路径
+        for counter in (
+            "total_messages",
+            "total_queries",
+            "total_trips",
+            "last_trip_number",
+        ):
+            value = stats.get(counter)
+            if not isinstance(value, int) or isinstance(value, bool):
+                stats[counter] = 0
         if not isinstance(stats.get("frequent_destinations"), dict):
             stats["frequent_destinations"] = {}
-        stats.setdefault("last_trip_number", 0)
         if "preferences" not in data:
             data["preferences"] = []
 

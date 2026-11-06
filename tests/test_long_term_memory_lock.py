@@ -101,6 +101,90 @@ def test_save_retries_transient_replace_errors(monkeypatch, tmp_path):
     print("✓ os.replace 短暂失败自动重试")
 
 
+def test_file_lock_normalizes_oserror(monkeypatch, tmp_path):
+    """权限 / 路径类 OSError 也按契约转成 TimeoutError（调用方只捕获它）。"""
+    import builtins
+
+    from utils import file_lock as lock_module
+
+    real_open = builtins.open
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", denied)
+    with pytest.raises(TimeoutError):
+        with lock_module.file_lock(str(tmp_path / "demo.json")):
+            pass
+    print("✓ 文件锁把 OSError 归一为 TimeoutError")
+
+
+def _first_lock_timeout(monkeypatch):
+    """让第一次 file_lock 抛 TimeoutError（模拟加载时等锁超时）。"""
+    from context import long_term_memory as lt
+
+    real_lock = lt.file_lock
+    calls = {"count": 0}
+
+    @contextlib.contextmanager
+    def first_timeout(path, timeout=2.0):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise TimeoutError("busy")
+        with real_lock(path, timeout=timeout):
+            yield
+
+    monkeypatch.setattr("context.long_term_memory.file_lock", first_timeout)
+    return calls
+
+
+def test_corrupt_file_backed_up_before_overwrite(monkeypatch, tmp_path):
+    """加载等锁超时 → 首次写入持锁补备份，不能直接覆盖损坏文件。"""
+    from context import long_term_memory as lt
+
+    path = Path(tmp_path) / "pending.json"
+    path.write_text("{not json", encoding="utf-8")
+    calls = _first_lock_timeout(monkeypatch)
+
+    memory = lt.LongTermMemory("pending", str(tmp_path))
+    assert calls["count"] == 1
+    assert memory._corrupt_pending is True
+    assert memory.get_chat_history() == []
+
+    memory.add_chat_message("user", "hi", "s1")
+    backups = list(Path(tmp_path).glob("pending.json.corrupt-*"))
+    assert len(backups) == 1, "损坏文件必须先备份再覆盖"
+    assert backups[0].read_text(encoding="utf-8") == "{not json"
+    assert memory._corrupt_pending is False
+    repaired = LongTermMemory("pending", str(tmp_path))
+    assert [item["content"] for item in repaired.get_chat_history()] == ["hi"]
+    print("✓ 等锁超时后首次写入补备份损坏文件")
+
+
+def test_corrupt_file_write_refused_when_backup_fails(monkeypatch, tmp_path):
+    """备份始终失败（文件被其它进程持有）：拒绝覆盖，损坏文件保持原样。"""
+    from context import long_term_memory as lt
+
+    path = Path(tmp_path) / "blocked.json"
+    path.write_text("{not json", encoding="utf-8")
+    _first_lock_timeout(monkeypatch)
+
+    memory = lt.LongTermMemory("blocked", str(tmp_path))
+
+    def locked_replace(src, dst):
+        raise PermissionError("held by another process")
+
+    monkeypatch.setattr("context.long_term_memory.os.replace", locked_replace)
+    with pytest.raises(MemoryPersistenceError) as info:
+        memory.add_chat_message("user", "hi", "s1")
+    assert "无法备份" in str(info.value)
+    assert path.read_text(encoding="utf-8") == "{not json", "损坏文件不能被覆盖"
+    assert memory._corrupt_pending is True, "失败后保持标记，下次写入重试备份"
+    print("✓ 备份失败时拒绝覆盖损坏文件")
+
+
 if __name__ == "__main__":
     test_cross_process_increments_are_not_lost()
     print("\n全部通过（monkeypatch 用例需 pytest）")

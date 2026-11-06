@@ -6,7 +6,9 @@
 
 运行：python tests/test_cli_interactive.py
 """
+import asyncio
 import io
+import json
 import os
 import subprocess
 import sys
@@ -244,6 +246,86 @@ def test_summary_tolerates_legacy_nested_preference_and_trip_fields():
     print("✓ 嵌套偏好 / 非字符串行程字段不崩溃")
 
 
+class _TextMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+def _make_cli_stub():
+    """构造可跑 process_query 的轻量 CLI 桩（假记忆 / 假意图 / 假编排）。"""
+    agent = cli.AligoCLI()
+    agent.console = Console(file=io.StringIO(), force_terminal=False, width=100)
+    events = {"reload": 0, "messages": []}
+
+    class _Memory:
+        def __init__(self):
+            self.short_term = self
+
+        def reload_long_term(self):
+            events["reload"] += 1
+
+        def add_message(self, role, content, metadata=None):
+            events["messages"].append(role)
+
+        def get_recent_context(self, n_turns=5):
+            return []
+
+    class _Intention:
+        async def reply(self, context):
+            return _TextMessage(json.dumps({"agent_schedule": []}))
+
+    class _Orchestrator:
+        async def reply(self, intention, on_event=None):
+            return _TextMessage(json.dumps({"results": []}))
+
+    agent.memory_manager = _Memory()
+    agent.intention_agent = _Intention()
+    agent.orchestrator = _Orchestrator()
+
+    async def _summary(user_input=""):
+        return ""
+
+    agent._get_long_term_summary = _summary
+    agent._display_agents_called = lambda result_data: None
+    agent._display_results = lambda result_data: None
+    return agent, events
+
+
+def test_process_query_reloads_long_term_each_turn():
+    """CLI 每轮对话前重载长期记忆（与 Web 端一致），避免旧快照覆盖外部写入。"""
+    agent, events = _make_cli_stub()
+    asyncio.run(agent.process_query("你好"))
+    assert events["reload"] == 1, "每轮对话前必须重载长期记忆"
+    assert events["messages"] == ["user", "assistant"]
+    print("✓ CLI 每轮对话前重载长期记忆")
+
+
+def test_process_query_memory_failure_not_counted_by_breaker():
+    """记忆写盘失败不计入熔断器（与 ConversationRuntime 一致）。"""
+    from utils.circuit_breaker import CircuitBreaker
+    from utils.errors import MemoryPersistenceError
+
+    agent, _ = _make_cli_stub()
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    agent.circuit_breaker = breaker
+
+    class _BrokenOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise MemoryPersistenceError("disk full")
+
+    agent.orchestrator = _BrokenOrchestrator()
+    try:
+        asyncio.run(agent.process_query("你好"))
+    except MemoryPersistenceError:
+        pass
+    else:
+        raise AssertionError("应抛出 MemoryPersistenceError")
+    assert breaker.get_status()["failure_count"] == 0, "写盘失败不应计入熔断"
+    print("✓ CLI 记忆写盘失败不计入熔断器")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -255,6 +337,8 @@ if __name__ == "__main__":
         test_human_response_tolerates_malformed_itinerary()
         test_read_commands_reload_snapshot()
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
+        test_process_query_reloads_long_term_each_turn()
+        test_process_query_memory_failure_not_counted_by_breaker()
     finally:
         _mp.undo()
     print("\n全部通过")
