@@ -42,11 +42,11 @@ def _trip(destination="上海", start="2026-12-05", end="2026-12-07"):
     }
 
 
-def _run(user_id, target=None, to_stdout=False, force=False):
+def _run(user_id, target=None, to_stdout=False, force=False, ics=False):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_trips_export_standalone(
-            user_id, target=target, to_stdout=to_stdout, force=force
+            user_id, target=target, to_stdout=to_stdout, force=force, ics=ics
         )
     return code, buf.getvalue()
 
@@ -157,6 +157,62 @@ def test_pg_fallback_refused(monkeypatch):
     print("✓ PostgreSQL 回退时拒绝执行")
 
 
+def test_export_ics(monkeypatch):
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    fake = _FakeStore(
+        [_trip("上海"), _trip("杭州", "2026-12-09", "2026-12-10"), {"destination": "无日期"}]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+
+    code, out = _run("u1", ics=True)
+    assert code == 0 and "iCalendar" in out
+    path = os.path.join(workdir, "exports", "aligo_trips.ics")
+    assert os.path.exists(path)
+    text = open(path, encoding="utf-8").read()
+    assert text.startswith("BEGIN:VCALENDAR")
+    assert text.count("BEGIN:VEVENT") == 2, "缺少出发日期的行程应跳过"
+    assert "DTSTART;VALUE=DATE:20261205" in text
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_trips_export_standalone("u1", to_stdout=True, ics=True)
+    assert code == 0 and "BEGIN:VCALENDAR" in buf.getvalue()
+    print("✓ trips-export --ics 导出日历（默认路径 / stdout / 跳过无日期行程）")
+
+
+def test_parse_export_args_ics_flag(monkeypatch):
+    assert cli._parse_export_args(["--ics"], allow_ics=True) == (None, False, False, True)
+    assert cli._parse_export_args(["out.ics", "--ics"], allow_ics=True) == (
+        "out.ics",
+        False,
+        False,
+        True,
+    )
+    assert cli._parse_export_args(["--ics"]) is None, "sessions-export 不接受 --ics"
+    print("✓ --ics 只在 trips-export 中接受")
+
+
+def test_main_dispatch_ics(monkeypatch):
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    fake = _FakeStore([_trip()])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips-export", "u1", "--ics", "--force"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_trips.ics"))
+    print("✓ dispatch 层 trips-export --ics 正常执行")
+
+
 def test_main_dispatch(monkeypatch):
     import tempfile
 
@@ -185,6 +241,9 @@ if __name__ == "__main__":
         test_store_open_failure,
         test_pg_fallback_refused,
         test_main_dispatch,
+        test_export_ics,
+        test_parse_export_args_ics_flag,
+        test_main_dispatch_ics,
     ):
         mp = pytest.MonkeyPatch()
         try:

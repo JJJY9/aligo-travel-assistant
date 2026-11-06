@@ -1233,7 +1233,7 @@ def test_delete_trip_storage_failure_maps_503(monkeypatch):
 
 
 def test_trip_ics_uid_includes_content():
-    from webapp.server import _build_trip_ics
+    from utils.trip_export import render_trip_ics
 
     base = {
         "trip_id": "trip_1",
@@ -1247,7 +1247,7 @@ def test_trip_ics_uid_includes_content():
 
     def uid(trip):
         return next(
-            line for line in _build_trip_ics(trip, "u1").splitlines() if line.startswith("UID:")
+            line for line in render_trip_ics(trip, "u1").splitlines() if line.startswith("UID:")
         )
 
     assert uid(base) != uid(other), "复用 trip_id 的新行程不应覆盖旧日历事件"
@@ -1256,7 +1256,7 @@ def test_trip_ics_uid_includes_content():
 
 
 def test_ics_escape_handles_lone_cr():
-    from webapp.server import _build_trip_ics, _ics_escape
+    from utils.trip_export import _ics_escape, render_trip_ics
 
     assert _ics_escape("a\rb") == "a\\nb"
     trip = {
@@ -1267,14 +1267,14 @@ def test_ics_escape_handles_lone_cr():
         "end_date": "2026-11-11",
         "purpose": "出差",
     }
-    content = _build_trip_ics(trip, "u1")
+    content = render_trip_ics(trip, "u1")
     assert "上海\\n恶意行" in content
     assert "\r恶意行" not in content
     print("✓ ICS 转义孤立 CR（不破坏行结构）")
 
 
 def test_build_trips_ics_multiple_events():
-    from webapp.server import _build_trips_ics
+    from utils.trip_export import render_trips_ics
 
     trips = [
         {
@@ -1294,7 +1294,7 @@ def test_build_trips_ics_multiple_events():
             "purpose": "出差",
         },
     ]
-    content = _build_trips_ics(trips, "u1")
+    content = render_trips_ics(trips, "u1")
     assert content.count("BEGIN:VCALENDAR") == 1
     assert content.count("BEGIN:VEVENT") == 2
     assert content.count("END:VEVENT") == 2
@@ -1310,10 +1310,10 @@ def test_build_trips_ics_multiple_events():
     assert content.endswith("END:VCALENDAR\r\n")
 
     # 缺少出发日期的行程被跳过
-    content = _build_trips_ics(trips + [{"trip_id": "trip_3", "destination": "杭州"}], "u1")
+    content = render_trips_ics(trips + [{"trip_id": "trip_3", "destination": "杭州"}], "u1")
     assert content.count("BEGIN:VEVENT") == 2
 
-    empty = _build_trips_ics([], "u1")
+    empty = render_trips_ics([], "u1")
     assert "BEGIN:VCALENDAR" in empty and "BEGIN:VEVENT" not in empty
     print("✓ 全部行程合并为一个日历（跳过缺日期行程）")
 
