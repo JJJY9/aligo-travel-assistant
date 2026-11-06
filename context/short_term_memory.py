@@ -30,6 +30,12 @@ def redis_short_term_degraded() -> bool:
     return time.monotonic() < _redis_degraded_until
 
 
+def reset_redis_degraded() -> None:
+    """清空降级冷却（测试隔离 / 配置热更新后立即重试）。"""
+    global _redis_degraded_until
+    _redis_degraded_until = 0.0
+
+
 def session_key(session_id: str, user_id: str = "") -> str:
     """Redis 中一个会话对应的键名。
 
@@ -515,8 +521,13 @@ class RedisShortTermMemory:
         max_turns: int = 10,
         ttl_sec: int = 3600,
         user_id: str = "",
+        client_factory: Any = None,
     ) -> None:
         self.client = client
+        # 启动 / 重连失败时工厂返回 None，此处保留工厂：恢复后首次访问自动
+        # 重新接入共享客户端；否则实例会永久停留在影子缓存（连健康 Redis
+        # 之后的实例也继续「失败」，把进程级降级标志一次次重新置位）
+        self._client_factory = client_factory
         self.session_id = session_id
         self.max_turns = max_turns
         self.ttl_sec = ttl_sec
@@ -677,6 +688,17 @@ class RedisShortTermMemory:
                 with _pending_journal(self.key) as journal:
                     on_failure(journal)
             return fallback_result, False
+        if self.client is None and self._client_factory is not None:
+            # 工厂自身带失败冷却（不会每次 ping）：恢复后这里自动重新接入
+            self.client = self._client_factory()
+        if self.client is None:
+            # 没有可用客户端：只走影子缓存并登记重放，不重置进程级降级标志——
+            # 其它持有健康客户端的实例不应被本实例的「失败」拖累 60 秒
+            fallback_result = fallback()
+            if on_failure is not None:
+                with _pending_journal(self.key) as journal:
+                    on_failure(journal)
+            return fallback_result, False
         fallback_result: Any = None
         fallback_done = False
         try:
@@ -697,6 +719,11 @@ class RedisShortTermMemory:
                     _drop_idle_journal(self.key, journal)
         except Exception as exc:  # noqa: BLE001 - 短期缓存故障不能中断对话
             _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
+            # 有工厂时丢弃可能已坏的客户端：冷却结束后经由工厂重新解析
+            # （共享工厂通常直接返回缓存客户端，连接池会在下次命令时自动
+            # 重连）；没有工厂的实例保持原客户端重试，行为与旧版一致
+            if self._client_factory is not None:
+                self.client = None
             logger.warning(
                 "Redis 短期记忆不可用（%s），本进程回退内存缓存 %ss",
                 exc,

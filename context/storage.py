@@ -23,8 +23,10 @@ from context.short_term_memory import (
     discard_pending_ops,
     queue_clear,
     redis_short_term_degraded,
+    reset_redis_degraded,
     session_key,
 )
+from utils.errors import MemoryPersistenceError
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +34,16 @@ def _redact_url(url: str) -> str:
     """隐藏 Redis URL 中的密码，避免日志泄露。
 
     用户信息段可能在密码中包含未转义的 ``@``，按最后一个 ``@`` 切分
-    （与 ``urlsplit`` / redis-py 的解析一致），不能停在第一个 ``@``。
+    （与 ``urlsplit`` / redis-py 的解析一致），不能停在第一个 ``@``；
+    redis-py 同样接受查询串里的 ``password=`` / ``pwd=`` 参数，也要脱敏。
     """
-    return re.sub(r"://[^/]*@", "://***@", url)
+    url = re.sub(r"://[^/]*@", "://***@", url)
+    return re.sub(
+        r"([?&](?:password|passwd|pwd|auth)=)[^&#]*",
+        r"\1***",
+        url,
+        flags=re.IGNORECASE,
+    )
 
 ShortTermStore = ShortTermMemory | RedisShortTermMemory
 LongTermStore = LongTermMemory | PostgresLongTermMemory
@@ -42,6 +51,9 @@ LongTermStore = LongTermMemory | PostgresLongTermMemory
 _FAILED_UNTIL: dict[str, float] = {}
 _FAILURE_COOLDOWN_SEC = 60.0
 _redis_client: Any = None
+# 最近一次实际返回的后端（describe_backends 用真实状态而不是仅凭时间戳
+# 推断：冷却过期后、下一次成功创建之前，实际仍在使用回退后端）
+_ACTUAL_BACKEND: dict[str, str] = {}
 
 
 def _failed_recently(key: str) -> bool:
@@ -102,36 +114,61 @@ def create_short_term_memory(
         # 连接暂不可用（启动失败 / 工厂 60 秒冷却）时仍返回 Redis 实现：
         # 调用会走故障路径（影子缓存 + 操作日志），恢复后由后续实例重放。
         # 回退纯内存实现会让故障期的删除 / 清空彻底丢失（与
-        # clear_short_term_session 的 queue_clear 兜底不对称）
+        # clear_short_term_session 的 queue_clear 兜底不对称）。
+        # 保留客户端工厂：实例启动时拿不到客户端也可以在工厂恢复后自动
+        # 重新接入，而不是永久停留在影子缓存。
+        _ACTUAL_BACKEND["short_term"] = "redis"
         return RedisShortTermMemory(
             client,
             session_id,
             max_turns=max_turns,
             ttl_sec=ttl,
             user_id=user_id,
+            client_factory=get_shared_redis_client,
         )
+    _ACTUAL_BACKEND["short_term"] = "memory"
     return ShortTermMemory(max_turns=max_turns)
 
 
-def create_long_term_memory(user_id: str, storage_path: str = "data/memory") -> LongTermStore:
-    """创建长期记忆：优先 PostgreSQL（如已配置且可用），否则 JSON 文件。"""
+def create_long_term_memory(
+    user_id: str, storage_path: str = "data/memory", strict: bool = False
+) -> LongTermStore:
+    """创建长期记忆：优先 PostgreSQL（如已配置且可用），否则 JSON 文件。
+
+    ``strict=True`` 用于删除等破坏性操作：配置了 PostgreSQL 但当前不可用
+    （连接失败 / 失败冷却期）时抛 ``MemoryPersistenceError``，而不是静默
+    回退到 JSON——在回退库上「删除成功」会留下 PostgreSQL 里的数据，冷却
+    结束后会话 / 消息重新出现。
+    """
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
     if dsn and not _failed_recently(f"postgres:{dsn}"):
         try:
             memory = PostgresLongTermMemory(user_id, dsn)
+            _ACTUAL_BACKEND["long_term"] = "postgres"
             logger.info("PostgreSQL 长期记忆已启用")
             return memory
         except Exception as exc:  # noqa: BLE001 - 连接失败回退
             _mark_failed(f"postgres:{dsn}")
             logger.warning("PostgreSQL 不可用（%s），长期记忆回退为 JSON 文件", exc)
+            if strict:
+                raise MemoryPersistenceError(
+                    f"PostgreSQL 不可用：{exc}"
+                ) from exc
+    elif dsn and strict:
+        raise MemoryPersistenceError(
+            "PostgreSQL 处于故障冷却期，删除操作暂不可用，请稍后再试"
+        )
+    _ACTUAL_BACKEND["long_term"] = "json"
     return LongTermMemory(user_id, storage_path)
 
 
 def reset_failure_cache() -> None:
-    """清空失败冷却与缓存的 Redis 客户端（测试或配置热更新时使用）。"""
+    """清空失败冷却、缓存的 Redis 客户端与最近后端记录（测试 / 配置热更新）。"""
     global _redis_client
     _FAILED_UNTIL.clear()
     _redis_client = None
+    _ACTUAL_BACKEND.clear()
+    reset_redis_degraded()
 
 
 def describe_backends() -> dict[str, Any]:
@@ -143,7 +180,14 @@ def describe_backends() -> dict[str, Any]:
     url = STORAGE_CONFIG.get("redis_url") or ""
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
     short_term = "redis" if url and _get_redis_client(url) is not None else "memory"
-    long_term = "postgres" if dsn and not _failed_recently(f"postgres:{dsn}") else "json"
+    long_term = _ACTUAL_BACKEND.get("long_term")
+    if long_term is None:
+        # 本进程还没创建过长期记忆：只能按配置与失败冷却推断
+        long_term = (
+            "postgres"
+            if dsn and not _failed_recently(f"postgres:{dsn}")
+            else "json"
+        )
     return {
         "short_term": short_term,
         "long_term": long_term,

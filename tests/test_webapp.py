@@ -605,6 +605,41 @@ def test_get_session_constructs_outside_lock(monkeypatch):
     print("✓ 会话构造移出缓存锁且竞争失败实例被关闭")
 
 
+def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
+    """PG 冷却期：删除类接口必须 503，不能静默作用在 JSON 回退库上。"""
+    import time as time_module
+
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+
+    dsn = "postgresql://aligo:secret@127.0.0.1:1/aligo"
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", dsn)
+    monkeypatch.setitem(
+        storage_module._FAILED_UNTIL,
+        f"postgres:{dsn}",
+        time_module.monotonic() + 60,
+    )
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app)
+    user_id = _unique_user("web_pg_cool")
+
+    response = client.delete(f"/api/sessions/s-cool?user_id={user_id}")
+    assert response.status_code == 503, response.text
+    assert "存储暂时不可用" in response.json()["detail"]
+    # 删除失败：墓碑必须撤销，同一 id 仍可继续对话
+    assert app.state.aligo.is_recently_deleted(user_id, "s-cool") is False
+
+    response = client.delete(f"/api/sessions/s-cool/last-turn?user_id={user_id}")
+    assert response.status_code == 503, response.text
+
+    response = client.delete(f"/api/trips/trip_1?user_id={user_id}")
+    assert response.status_code == 503, response.text
+
+    response = client.delete(f"/api/preferences/home_location?user_id={user_id}")
+    assert response.status_code == 503, response.text
+    print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑")
+
+
 def test_sessions_listing_and_delete():
     client = _client()
     user_id = _unique_user("web_test_hist")
@@ -853,7 +888,7 @@ def test_trip_update_validation_and_errors(monkeypatch):
 
     client = _client()
     valid = _Store([_trip()])
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: valid)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: valid)
 
     response = client.put("/api/trips/trip_1", json={"user_id": "u-trip-v"})
     assert response.status_code == 400
@@ -892,7 +927,7 @@ def test_trip_update_validation_and_errors(monkeypatch):
 
     # 旧行程没有出发日期时不能单独设置返程
     dateless = _Store([{"trip_id": "trip_1", "origin": "北京", "destination": "上海"}])
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: dateless)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: dateless)
     response = client.put(
         "/api/trips/trip_1", json={"user_id": "u-trip-v", "end_date": "2026-12-05"}
     )
@@ -901,7 +936,7 @@ def test_trip_update_validation_and_errors(monkeypatch):
 
     # 行程不存在
     empty = _Store([])
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: empty)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: empty)
     response = client.put(
         "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
     )
@@ -909,7 +944,7 @@ def test_trip_update_validation_and_errors(monkeypatch):
 
     # trip_id 歧义（历史数据异常）
     duplicate = _Store([_trip(), _trip("杭州")])
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: duplicate)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: duplicate)
     response = client.put(
         "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
     )
@@ -918,7 +953,7 @@ def test_trip_update_validation_and_errors(monkeypatch):
 
     # update_trip 抛 ValueError → 409；其它异常 → 503
     conflict = _Store([_trip()], update_error="conflict")
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: conflict)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: conflict)
     response = client.put(
         "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
     )
@@ -926,7 +961,7 @@ def test_trip_update_validation_and_errors(monkeypatch):
     assert "冲突" in response.json()["detail"]
 
     broken = _Store([_trip()], update_error="boom")
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: broken)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: broken)
     response = client.put(
         "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
     )
@@ -1043,7 +1078,7 @@ def test_export_all_sessions_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     response = _client().get(
         "/api/sessions/export", params={"user_id": "u-export-fail"}
@@ -1369,7 +1404,7 @@ def test_preference_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     client = _client()
     saved = client.put(
@@ -1547,7 +1582,7 @@ def test_delete_trip_storage_failure_maps_503(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _BrokenStore())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore())
     response = _client().delete(
         "/api/trips/trip_1", params={"user_id": "web_test_trip_broken"}
     )
@@ -1691,7 +1726,7 @@ def test_trip_calendar_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     client = _client()
     for path in ("/api/trips/calendar", "/api/trips/trip_1/calendar"):
@@ -2443,7 +2478,7 @@ def test_session_metadata_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     client = _client()
     assert (
@@ -2533,7 +2568,7 @@ def test_trips_csv_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     response = _client().get("/api/trips/export", params={"user_id": "u1"})
     assert response.status_code == 503
@@ -2556,7 +2591,7 @@ def test_delete_session_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     client = _client()
     response = client.delete("/api/sessions/s1", params={"user_id": "u1"})
@@ -2627,7 +2662,7 @@ def test_delete_missing_session_failure_does_not_leave_tombstone(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, strict=False: _Store())
     client = _client()
     state = client.app.state.aligo
     response = client.delete("/api/sessions/ghost", params={"user_id": "u-ghost"})
@@ -3235,7 +3270,7 @@ def test_delete_failures_roll_back_shared_tombstone(monkeypatch):
     state = app.state.aligo
     state._redis_client = shared
     state._tombstones_shared = True
-    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: _Store())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid, strict=False: _Store())
     client = TestClient(app)
 
     failed = client.delete("/api/sessions/s-db", params={"user_id": "u-db"})
@@ -3589,7 +3624,7 @@ def test_session_read_failures_map_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
     )
     client = _client()
     for path in (
@@ -5030,6 +5065,7 @@ if __name__ == "__main__":
         test_chat_stream_user_facing_error_keeps_curated_message,
         test_chat_stream_storage_error_maps_friendly_message,
         test_get_session_constructs_outside_lock,
+        test_destructive_endpoints_503_while_pg_cooling_down,
     ):
         mp = pytest.MonkeyPatch()
         try:

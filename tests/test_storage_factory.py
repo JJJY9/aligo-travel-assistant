@@ -595,6 +595,95 @@ def test_pg_reconnects_after_connection_error():
     print("✓ PostgreSQL 连接失效后重连重试")
 
 
+def _restore_local() -> None:
+    """恢复默认本地后端配置（本文件的配置改动不能泄漏到后续测试）。"""
+    _set("redis_url", "")
+    _set("postgres_dsn", "")
+
+
+def test_describe_reports_actual_backend_after_cooldown(monkeypatch):
+    """冷却过期后、下一次创建之前：描述仍反映实际在用的回退后端。"""
+    _set("redis_url", "")
+    _set("postgres_dsn", "postgresql://user:pass@127.0.0.1:1/db")
+    try:
+
+        def broken_pg(user_id, dsn):
+            raise ConnectionError("refused")
+
+        monkeypatch.setattr(storage, "PostgresLongTermMemory", broken_pg)
+        memory = storage.create_long_term_memory("u-actual", tempfile.mkdtemp())
+        assert isinstance(memory, LongTermMemory)
+        # 模拟冷却过期：仅凭时间戳会误报 postgres，但实际仍是 JSON
+        monkeypatch.setattr(storage, "_failed_recently", lambda key: False)
+        info = storage.describe_backends()
+        assert info["long_term"] == "json"
+        assert info["long_term_degraded"] is True
+    finally:
+        _restore_local()
+    print("✓ 后端描述使用实际创建结果而不是时间戳推断")
+
+
+def test_strict_long_term_raises_when_unreachable():
+    """strict 创建在 PG 不可用时抛 MemoryPersistenceError（不回退 JSON）。"""
+    _set("redis_url", "")
+    _set("postgres_dsn", "postgresql://user:pass@127.0.0.1:1/db")
+    try:
+        storage.create_long_term_memory("u-strict", tempfile.mkdtemp(), strict=True)
+    except MemoryPersistenceError as exc:
+        assert "PostgreSQL" in str(exc)
+    else:
+        raise AssertionError("strict 创建应抛 MemoryPersistenceError")
+    finally:
+        _restore_local()
+    print("✓ strict 创建在 PG 不可用时直接失败")
+
+
+def test_strict_long_term_raises_during_cooldown():
+    """冷却期内 strict 创建直接失败；非 strict 仍回退 JSON 保持可用。"""
+    dsn = "postgresql://user:pass@db.example/aligo"
+    _set("redis_url", "")
+    _set("postgres_dsn", dsn)
+    try:
+        storage._mark_failed(f"postgres:{dsn}")
+        try:
+            storage.create_long_term_memory(
+                "u-strict2", tempfile.mkdtemp(), strict=True
+            )
+        except MemoryPersistenceError as exc:
+            assert "冷却" in str(exc)
+        else:
+            raise AssertionError("冷却期 strict 创建应失败")
+        memory = storage.create_long_term_memory("u-strict2", tempfile.mkdtemp())
+        assert isinstance(memory, LongTermMemory)
+    finally:
+        _restore_local()
+    print("✓ 冷却期 strict 创建失败、非 strict 回退 JSON")
+
+
+def test_redact_url_masks_query_password():
+    """redis-py 接受查询串里的 password 参数，日志脱敏必须覆盖。"""
+    redacted = storage._redact_url(
+        "redis://redis.internal:6379/0?password=s3cret&ssl=true"
+    )
+    assert "s3cret" not in redacted
+    assert "password=***" in redacted and "ssl=true" in redacted
+    assert storage._redact_url("redis://h:6379/0?Password=abc").endswith(
+        "Password=***"
+    )
+    print("✓ Redis URL 查询串密码脱敏")
+
+
+def test_reset_failure_cache_resets_short_term_degraded():
+    """reset_failure_cache 同时清除短期记忆的降级冷却（测试 / 热更新用）。"""
+    from context import short_term_memory as module
+
+    module._redis_degraded_until = module.time.monotonic() + 60
+    assert module.redis_short_term_degraded() is True
+    storage.reset_failure_cache()
+    assert module.redis_short_term_degraded() is False
+    print("✓ reset_failure_cache 清除短期记忆降级")
+
+
 def test_pg_failed_retry_wrapped_as_memory_error():
     """重连后仍失败：包装为 MemoryPersistenceError（按存储不可用降级）。"""
     from context.postgres_long_term_memory import PostgresLongTermMemory
@@ -1244,6 +1333,15 @@ if __name__ == "__main__":
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()
+    test_redact_url_masks_query_password()
+    test_strict_long_term_raises_when_unreachable()
+    test_strict_long_term_raises_during_cooldown()
+    test_reset_failure_cache_resets_short_term_degraded()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_describe_reports_actual_backend_after_cooldown(_mp)
+    finally:
+        _mp.undo()
     test_session_metadata_save_failure_raises()
     test_json_write_failures_raise()
     _mp = pytest.MonkeyPatch()
