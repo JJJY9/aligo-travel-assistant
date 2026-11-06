@@ -134,7 +134,7 @@ def test_trip_interval_and_state(monkeypatch):
     print("✓ trip_interval / trip_state_label")
 
 
-def test_filter_trips_by_query_helper():
+def test_filter_trips_by_query_helper(monkeypatch):
     """面板 / API / CLI 共用的关键词过滤口径。"""
     from utils.trip_conflicts import filter_trips_by_query
 
