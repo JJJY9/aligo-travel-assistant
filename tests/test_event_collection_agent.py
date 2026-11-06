@@ -102,8 +102,33 @@ def test_result_parsed():
     print("✓ 提取结果解析正常")
 
 
+def test_user_query_preferred_over_whole_context():
+    """rewritten_query 缺失时优先用户本轮原话，不能把整段上下文当事项描述。"""
+    agent_class = _load_agent_class()
+    model = _CaptureModel(json.dumps({"events": []}, ensure_ascii=False))
+    agent = agent_class(name="EventCollectionAgent", model=model)
+    payload = json.dumps(
+        {
+            "context": {
+                "user_query": "下周一从北京去杭州出差",
+                "user_preferences": {},
+                "recent_dialogue": [
+                    {"role": "assistant", "content": "上一轮助手的无关建议ABCDEFG"}
+                ],
+            }
+        },
+        ensure_ascii=False,
+    )
+    asyncio.run(agent.reply(Msg(name="Orchestrator", content=payload, role="user")))
+    prompt = model.prompts[0]
+    assert "下周一从北京去杭州出差" in prompt
+    assert "无关建议ABCDEFG" not in prompt, "不能把 recent_dialogue 整段注入事项描述"
+    print("✓ 事项收集优先用户原话（不注入整段上下文）")
+
+
 if __name__ == "__main__":
     test_string_preference_not_split()
     test_list_preference_joined()
     test_result_parsed()
+    test_user_query_preferred_over_whole_context()
     print("\n全部通过")

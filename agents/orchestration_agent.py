@@ -144,11 +144,17 @@ class OrchestrationAgent(AgentBase):
             raw_schedule = [raw_schedule]
         if not isinstance(raw_schedule, list):
             raw_schedule = []
-        agent_schedule = [
-            task
-            for task in raw_schedule
-            if isinstance(task, dict) and str(task.get("agent_name") or "").strip()
-        ]
+        agent_schedule: list[dict[str, Any]] = []
+        for task in raw_schedule:
+            if not isinstance(task, dict):
+                continue
+            name = str(task.get("agent_name") or "").strip()
+            if not name:
+                continue
+            # 存回裁剪后的名称：canonical 映射与注册表查找都依赖它，
+            # 带空白的原始值会让 " plan-trip " 匹配不到任何智能体
+            task["agent_name"] = name
+            agent_schedule.append(task)
         for task in agent_schedule:
             try:
                 task["priority"] = int(task.get("priority", 999))
@@ -509,20 +515,22 @@ class OrchestrationAgent(AgentBase):
             # 懒加载失败（缺依赖 / 模型文件损坏）也必须落在下面的 except 里，
             # 否则错误会绕过 per-agent 处理让整轮对话 500、进度停在执行中。
             # 首次加载 RAG 会导入 torch / 加载嵌入模型（约 10s），放到线程池
-            # 避免卡住事件循环（SSE 心跳与其它会话）
-            agent = await asyncio.get_running_loop().run_in_executor(
-                None, self.agent_registry.__getitem__, agent_name
-            )
-            # 调用智能体：瞬时 LLM / 网络错误重试一次；单次执行有超时上限，
-            # 卡住的智能体不能无限占用整轮与该用户的会话锁
-            response = await asyncio.wait_for(
-                retry_with_backoff(
+            # 避免卡住事件循环（SSE 心跳与其它会话）；加载与调用一起受超时
+            # 约束，卡在导入 / 模型加载上也不会无限占用整轮与该用户的会话锁
+            async def _load_and_reply() -> Any:
+                agent = await asyncio.get_running_loop().run_in_executor(
+                    None, self.agent_registry.__getitem__, agent_name
+                )
+                # 调用智能体：瞬时 LLM / 网络错误重试一次
+                return await retry_with_backoff(
                     lambda: agent.reply(input_msg),
                     max_retries=_AGENT_RETRY_MAX,
                     base_delay_sec=_AGENT_RETRY_BASE_DELAY,
                     max_delay_sec=_AGENT_RETRY_MAX_DELAY,
-                ),
-                timeout=_AGENT_TIMEOUT_SEC,
+                )
+
+            response = await asyncio.wait_for(
+                _load_and_reply(), timeout=_AGENT_TIMEOUT_SEC
             )
 
             # 解析响应

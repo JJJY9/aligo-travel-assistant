@@ -574,6 +574,9 @@ class AligoWebApp:
         # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
         # 不同 user_id 的请求互不串行：OrderedDict 的迭代 + 删除必须加锁
         self._tombstone_lock = threading.Lock()
+        # 会话缓存同样会被线程池里的 drop_session 与事件循环里的 get_session
+        # 并发修改（插入 / move_to_end / popitem），需要独立互斥
+        self._sessions_lock = threading.Lock()
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
@@ -631,21 +634,31 @@ class AligoWebApp:
         # 缓存键包含用户：同一 session_id 被不同用户使用时各有独立运行时，
         # 互不覆盖，也不会因为别人关闭同名会话而丢掉自己在进程内的短期记忆
         key = self._session_key(user_id, session_id)
-        session = self.sessions.get(key)
-        if session is None:
-            # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
-            session = _WebSession(user_id, session_id, wrap_usage_tracking(self.model), self.breaker)
-            self.sessions[key] = session
-            while len(self.sessions) > self.max_sessions:
-                _, evicted = self.sessions.popitem(last=False)
-                evicted.close()
-        else:
-            self.sessions.move_to_end(key)
+        evicted: list[_WebSession] = []
+        with self._sessions_lock:
+            session = self.sessions.get(key)
+            if session is None:
+                # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
+                session = _WebSession(
+                    user_id, session_id, wrap_usage_tracking(self.model), self.breaker
+                )
+                self.sessions[key] = session
+                while len(self.sessions) > self.max_sessions:
+                    _, stale = self.sessions.popitem(last=False)
+                    evicted.append(stale)
+            else:
+                self.sessions.move_to_end(key)
+        # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求
+        for stale in evicted:
+            stale.close()
         return session
 
     def drop_session(self, user_id: str, session_id: str) -> None:
         """移除并关闭某用户的一个会话（其它用户的同名会话不受影响）。"""
-        session = self.sessions.pop(self._session_key(user_id, session_id), None)
+        with self._sessions_lock:
+            session = self.sessions.pop(
+                self._session_key(user_id, session_id), None
+            )
         if session is not None:
             session.close()
 
@@ -755,9 +768,11 @@ class AligoWebApp:
 
     def close_all(self) -> None:
         """关闭所有会话（进程退出时调用）。"""
-        for session in list(self.sessions.values()):
+        with self._sessions_lock:
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
+        for session in sessions:
             session.close()
-        self.sessions.clear()
 
     def lock_for(self, user_id: str) -> asyncio.Lock:
         """同一用户的请求串行处理，避免长期记忆并发写覆盖。"""
@@ -834,6 +849,21 @@ def _enforce_rate_limit(
     """
     client = _client_host(request)
     user_key = f"{client}:{user_id}"
+
+    def _over_limit(limit: int, retry_after: float) -> HTTPException:
+        """429 响应：Retry-After 取整数秒（向上取整、至少 1 秒）。"""
+        wait_seconds = max(1, math.ceil(retry_after))
+        return HTTPException(
+            status_code=429,
+            detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+
     # 先用 peek 检查两个桶，都有额度才记录：否则被 429 的请求会消耗
     # 另一个桶的配额，一个客户端的重试循环会把同 IP 的其它客户端一起锁死
     retry_after = state.rate_limiter.peek(user_key)
@@ -844,22 +874,15 @@ def _enforce_rate_limit(
             limit = state.rate_limiter.limit
         else:
             limit = state.ip_limiter.limit
-        # HTTP Retry-After 需要整数秒，向上取整并至少 1 秒
-        wait_seconds = max(
-            1, math.ceil(max(retry_after or 0.0, ip_retry_after or 0.0))
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
-        )
-    state.rate_limiter.check(user_key)
-    state.ip_limiter.check(client)
+        raise _over_limit(limit, max(retry_after or 0.0, ip_retry_after or 0.0))
+    # peek 与 check 之间额度可能被并发请求抢走：check 返回非 None 时请求已
+    # 超额，必须按它的结果拒绝，否则会放行超出额度的请求
+    user_retry = state.rate_limiter.check(user_key)
+    if user_retry is not None:
+        raise _over_limit(state.rate_limiter.limit, user_retry)
+    ip_retry = state.ip_limiter.check(client)
+    if ip_retry is not None:
+        raise _over_limit(state.ip_limiter.limit, ip_retry)
     remaining_user, reset_user = state.rate_limiter.status(user_key)
     remaining_ip, reset_ip = state.ip_limiter.status(client)
     # 额度头取自当前更紧的桶（剩余更少；剩余相同时取重置更晚的），
@@ -2552,6 +2575,9 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("导出行程日历失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
         finally:
             _close_long_term(store)
         return Response(
@@ -2588,6 +2614,9 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("导出行程日历失败（%s）：%s", trip_id, exc)
+            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
         finally:
             _close_long_term(store)
         if _ambiguous_trip_id(trips, trip_id):

@@ -17,6 +17,9 @@ import json
 import os
 import sys
 import tempfile
+import time
+
+import pytest
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -687,6 +690,48 @@ def test_previous_preference_append_flattens_list():
     print("✓ 前序偏好 append 列表逐项合并（含假值偏好）")
 
 
+def test_schedule_names_are_trimmed():
+    """调度计划里的名称带空白时要裁剪，否则注册表查找与依赖判断都会失效。"""
+    calls = []
+
+    class Echo(_StubAgent):
+        async def reply(self, x):
+            calls.append(self.name)
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    orchestrator = OrchestrationAgent(agent_registry={"a": Echo("a")})
+    asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "  a  ", "priority": 1}]))
+    )
+    assert calls == ["a"], f"空白名称未被裁剪：{calls}"
+    print("✓ 调度计划名称裁剪")
+
+
+def test_agent_load_timeout_is_bounded(monkeypatch):
+    """懒加载卡住也要受单智能体超时约束（不无限占用会话锁）。"""
+    import agents.orchestration_agent as module
+
+    class SlowRegistry(dict):
+        def __getitem__(self, name):
+            time.sleep(0.5)
+            return super().__getitem__(name)
+
+    monkeypatch.setattr(module, "_AGENT_TIMEOUT_SEC", 0.05)
+    orchestrator = OrchestrationAgent(
+        agent_registry=SlowRegistry({"a": _StubAgent("a", {"answer": "ok"})})
+    )
+    result = asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "a", "priority": 1}]))
+    )
+    payload = json.loads(result.content)
+    assert payload["status"] == "partial_failure", payload
+    first = payload["results"][0]
+    assert first["status"] == "error"
+    error_text = (first.get("data") or {}).get("error") or ""
+    assert "超时" in error_text, error_text
+    print("✓ 懒加载受智能体超时约束")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -705,4 +750,10 @@ if __name__ == "__main__":
     test_infinite_priority_is_sanitized()
     test_partial_failure_does_not_trip_breaker()
     test_previous_preference_append_flattens_list()
+    test_schedule_names_are_trimmed()
+    _mp_load = pytest.MonkeyPatch()
+    try:
+        test_agent_load_timeout_is_bounded(_mp_load)
+    finally:
+        _mp_load.undo()
     print("\n全部通过")
