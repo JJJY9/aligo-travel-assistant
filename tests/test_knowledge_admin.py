@@ -1109,12 +1109,23 @@ def test_find_duplicate_contents(monkeypatch):
             "content": "重复内容",
             "metadata": json.dumps({"group": "g", "part": "1", "parts": "2"}),
         },
+        # 旧版多分片记录（只有 parts 没有 group）：同样不能按单条删除
+        {
+            "id": 6,
+            "content": "旧分片内容",
+            "metadata": json.dumps({"part": "1", "parts": "2"}),
+        },
+        {
+            "id": 7,
+            "content": "旧分片内容",
+            "metadata": json.dumps({"part": "2", "parts": "2"}),
+        },
     ]
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
-    # 5 号属于多分片记录：整组内容含相同段落是正常的，整组内容不参与重复统计
+    # 5 / 6 / 7 号属于多分片记录：整组内容含相同段落是正常的，不参与重复统计
     assert knowledge_admin.find_duplicate_contents() == [("重复内容", [1, 3])]
-    print("✓ 重复内容扫描（去空白后相同 / 排除多分片记录）")
+    print("✓ 重复内容扫描（去空白后相同 / 排除多分片记录与旧版 parts>1）")
 
 
 def test_import_dry_run_skips_writes(monkeypatch):

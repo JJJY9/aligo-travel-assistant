@@ -129,9 +129,38 @@ def test_export_to_stdout_writes_no_file(monkeypatch):
     )
     assert code == 0
     payload = json.loads(out)
+    assert payload["ok"] is True
     assert payload["version"] == 1
     assert payload["documents"][0]["content"] == "住宿标准"
     print("✓ kb-export --stdout 打印 JSON 且不写文件")
+
+
+def test_export_to_stdout_failure_is_json(monkeypatch):
+    """--stdout 失败时也输出 JSON，管道下游不会拿到人类可读文本。"""
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda: _status(False, "知识库未初始化"),
+    )
+    code, out = _capture(
+        cli.run_knowledge_export_standalone, None, to_stdout=True
+    )
+    payload = json.loads(out)
+    assert code == 1 and payload["ok"] is False
+    assert "不可用" in payload["error"]
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+
+    def boom():
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "export_documents", boom)
+    code, out = _capture(
+        cli.run_knowledge_export_standalone, None, to_stdout=True
+    )
+    payload = json.loads(out)
+    assert code == 1 and "Milvus" in payload["error"]
+    print("✓ kb-export --stdout 失败输出 JSON")
 
 
 def test_import_rejects_non_utf8_file(monkeypatch):
@@ -411,6 +440,7 @@ if __name__ == "__main__":
         test_export_refuses_overwrite_without_force,
         test_kb_export_dispatch_strict,
         test_export_to_stdout_writes_no_file,
+        test_export_to_stdout_failure_is_json,
         test_export_unavailable_or_failure,
         test_import_success,
         test_import_plain_array,
