@@ -259,10 +259,227 @@ def test_trips_dispatch_strict(monkeypatch):
     print("✓ trips 严格参数解析")
 
 
+class _AddStore(_FakeStore):
+    """支持 save_trip_history 的假存储（trip-add 用例）。"""
+
+    def __init__(self, trips=()):
+        super().__init__(trips)
+        self.saved = []
+
+    def save_trip_history(self, record):
+        self.saved.append(dict(record))
+        trip_id = f"trip_{len(self.trips) + 1}"
+        self.trips.append({**record, "trip_id": trip_id})
+        return trip_id
+
+
+def _run_trip_add(*args, **kwargs):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trip_add_standalone(*args, **kwargs)
+    return code, out.getvalue()
+
+
+def test_trip_add_saves_and_reports_conflicts(monkeypatch):
+    store = _AddStore([_trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_add(
+        "u1", "北京", "上海", "2026-12-02", "2026-12-04", "出差"
+    )
+    assert code == 0
+    assert "已添加行程 #trip_2" in out
+    assert "北京 → 上海" in out and "2026-12-02 ~ 2026-12-04" in out
+    assert "与 1 条行程日期重叠：#trip_1" in out
+    assert store.saved[0]["destination"] == "上海"
+    assert store.saved[0]["purpose"] == "出差"
+    assert store.closed
+    print("✓ trip-add 保存并提示日期重叠")
+
+
+def test_trip_add_json_output(monkeypatch):
+    store = _AddStore([_trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_add(
+        "u1", "北京", "杭州", "2026-12-02", None, as_json=True
+    )
+    data = json.loads(out)
+    assert code == 0
+    assert data["ok"] is True and data["created"] is True
+    assert data["trip_id"] == "trip_2"
+    assert data["conflicts"][0]["trip_id"] == "trip_1"
+    print("✓ trip-add --json 输出")
+
+
+def test_trip_add_dedupes_same_route_and_dates(monkeypatch):
+    """同路线同日期视为同一趟行程：第二次保存更新既有记录而不是追加。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    store = LongTermMemory("u-trip-add", tempfile.mkdtemp())
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_add("u-trip-add", "北京", "上海", "2026-12-01", None)
+    assert code == 0 and "已添加行程" in out
+    code, out = _run_trip_add(
+        "u-trip-add", "北京", "上海", "2026-12-01", None, "会议"
+    )
+    assert code == 0 and "已更新行程" in out
+    assert len(store.get_trip_history(limit=None)) == 1
+    print("✓ trip-add 同路线同日期更新既有记录")
+
+
+def test_trip_add_validation_errors(monkeypatch):
+    store = _AddStore([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    cases = [
+        (("bad id", "北京", "上海", "2026-12-01"), "用户 ID"),
+        (("u1", "北京", "上海", "2026/12/01"), "出发日期格式"),
+        (("u1", "北京", "上海", "2026-12-01", "2026-13-01"), "返程日期格式"),
+        (("u1", "北京", "上海", "2026-12-05", "2026-12-01"), "不能早于"),
+    ]
+    for args, needle in cases:
+        code, out = _run_trip_add(*args)
+        assert code == 1 and needle in out, (args, out)
+    assert store.saved == [], "校验失败不应写入"
+    print("✓ trip-add 校验错误（ID / 日期格式 / 结束早于开始）")
+
+
+def test_trip_add_store_failures(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("open down")
+
+    monkeypatch.setattr(storage, "create_long_term_memory", boom)
+    code, out = _run_trip_add(
+        "u1", "北京", "上海", "2026-12-01", as_json=True
+    )
+    data = json.loads(out)
+    assert code == 1 and data["ok"] is False
+    assert "打开长期记忆失败" in data["error"]
+
+    class _FailSave(_AddStore):
+        def save_trip_history(self, record):
+            raise RuntimeError("disk full")
+
+    store = _FailSave([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_add("u1", "北京", "上海", "2026-12-01")
+    assert code == 1 and "保存行程失败" in out
+    print("✓ trip-add 打开 / 保存失败")
+
+
+def test_trip_add_args_and_dispatch(monkeypatch):
+    assert cli._parse_trip_add_args([]) is None
+    assert cli._parse_trip_add_args(["u1"]) is None
+    assert cli._parse_trip_add_args(["u1", "--destination", "上海"]) is None
+    assert (
+        cli._parse_trip_add_args(["u1", "--destination", "上海", "--start"])
+        is None
+    )
+    assert (
+        cli._parse_trip_add_args(
+            ["u1", "--destination", "上海", "--start", "2026-12-01", "--bad"]
+        )
+        is None
+    )
+    assert (
+        cli._parse_trip_add_args(
+            ["u1", "u2", "--destination", "上海", "--start", "2026-12-01"]
+        )
+        is None
+    )
+    parsed = cli._parse_trip_add_args(
+        [
+            "--json",
+            "u1",
+            "--destination=上海",
+            "--start",
+            "2026-12-01",
+            "--origin",
+            "北京",
+            "--end",
+            "2026-12-02",
+            "--purpose",
+            "会议",
+        ]
+    )
+    assert parsed == {
+        "user_id": "u1",
+        "values": {
+            "destination": "上海",
+            "start": "2026-12-01",
+            "origin": "北京",
+            "end": "2026-12-02",
+            "purpose": "会议",
+        },
+        "as_json": True,
+    }
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_trip_add_standalone",
+        lambda user_id, origin, destination, start, end=None, purpose="出差", as_json=False: (
+            calls.append((user_id, origin, destination, start, end, purpose, as_json))
+            or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cli.py",
+            "trip-add",
+            "u1",
+            "--destination",
+            "上海",
+            "--start",
+            "2026-12-01",
+            "--json",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "", "上海", "2026-12-01", None, "出差", True)
+
+    for argv in (
+        ["cli.py", "trip-add"],
+        ["cli.py", "trip-add", "u1", "--start", "2026-12-01"],
+        [
+            "cli.py",
+            "trip-add",
+            "u1",
+            "--destination",
+            "上海",
+            "--start",
+            "2026-12-01",
+            "--bad",
+        ],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "trip-add" in out.getvalue()
+    print("✓ trip-add 参数解析与 dispatch")
+
+
 if __name__ == "__main__":
     for case in (
         test_trip_interval_and_state,
         test_trips_with_conflicts_uses_pool_without_mutation,
+        test_trips_list_json,
         test_trips_list_output,
         test_trips_list_empty,
         test_trips_list_read_failure,
@@ -270,6 +487,12 @@ if __name__ == "__main__":
         test_trips_list_rejects_bad_user_id,
         test_trips_dispatch_strict,
         test_trips_dispatch_json_flexible,
+        test_trip_add_saves_and_reports_conflicts,
+        test_trip_add_json_output,
+        test_trip_add_dedupes_same_route_and_dates,
+        test_trip_add_validation_errors,
+        test_trip_add_store_failures,
+        test_trip_add_args_and_dispatch,
     ):
         mp = pytest.MonkeyPatch()
         try:

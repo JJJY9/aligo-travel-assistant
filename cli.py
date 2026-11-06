@@ -2893,6 +2893,184 @@ def run_trips_export_standalone(
     return 0
 
 
+_TRIP_ADD_FLAGS = ("--origin", "--destination", "--start", "--end", "--purpose")
+
+
+def _parse_trip_add_args(args: list[str]) -> dict[str, Any] | None:
+    """解析 trip-add 参数：``<user_id> --destination X --start YYYY-MM-DD [...]``。
+
+    支持 ``--flag value`` 与 ``--flag=value`` 两种写法、``--json`` 任意位置；
+    未知参数、缺值、位置参数数量不符或缺少必填项时返回 None。
+    """
+    values: dict[str, str] = {}
+    positional: list[str] = []
+    as_json = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+            index += 1
+            continue
+        flag = next(
+            (
+                name
+                for name in _TRIP_ADD_FLAGS
+                if lowered == name or lowered.startswith(name + "=")
+            ),
+            None,
+        )
+        if flag is None:
+            if item.startswith("-"):
+                return None
+            positional.append(item)
+            index += 1
+            continue
+        if "=" in item:
+            value = item.split("=", 1)[1]
+        else:
+            index += 1
+            if index >= len(args):
+                return None
+            value = args[index]
+        if not value.strip():
+            return None
+        values[flag[2:]] = value.strip()
+        index += 1
+    if (
+        len(positional) != 1
+        or not values.get("destination")
+        or not values.get("start")
+    ):
+        return None
+    return {"user_id": positional[0], "values": values, "as_json": as_json}
+
+
+def run_trip_add_standalone(
+    user_id: str,
+    origin: str,
+    destination: str,
+    start_date: str,
+    end_date: str | None = None,
+    purpose: str = "出差",
+    as_json: bool = False,
+) -> int:
+    """保存一条行程（`python cli.py trip-add ... [--json]`）。
+
+    与 Web 面板 / 对话写入同一存储路径：同路线同日期视为同一趟行程（更新
+    既有记录而不是追加），并提示与其它行程的日期重叠。``--json`` 输出结构化
+    结果（trip_id / created / conflicts）。
+
+    Returns:
+        0 保存成功；1 参数 / 读取 / 写入失败
+    """
+    import re
+    from datetime import datetime
+
+    from utils.trip_conflicts import trip_conflicts
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    except ValueError:
+        return _fail(f"出发日期格式应为 YYYY-MM-DD：{start_date}")
+    end_dt = None
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            return _fail(f"返程日期格式应为 YYYY-MM-DD：{end_date}")
+        if end_dt < start_dt:
+            return _fail("结束日期不能早于出发日期")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            before = len(store.get_trip_history(limit=None))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+        record = {
+            "origin": origin,
+            "destination": destination,
+            "start_date": start_date,
+            "end_date": end_date,
+            "purpose": purpose or "出差",
+        }
+        try:
+            trip_id = store.save_trip_history(record)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"保存行程失败：{exc}")
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    created = len(trips) > before
+    conflicts = trip_conflicts(
+        trips, start_dt, end_dt or start_dt, exclude_id=trip_id
+    )
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "trip_id": trip_id,
+                    "saved": True,
+                    "created": created,
+                    "conflicts": [
+                        {
+                            "trip_id": str(trip.get("trip_id") or ""),
+                            "origin": str(trip.get("origin") or ""),
+                            "destination": str(trip.get("destination") or ""),
+                            "start_date": str(trip.get("start_date") or ""),
+                            "end_date": str(trip.get("end_date") or ""),
+                        }
+                        for trip in conflicts
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    dates = (
+        start_date
+        if not end_date or end_date == start_date
+        else f"{start_date} ~ {end_date}"
+    )
+    print(
+        f"{'已添加' if created else '已更新'}行程 #{trip_id}"
+        f"（{origin or '—'} → {destination}，{dates}）"
+    )
+    if conflicts:
+        ids = "、".join(f"#{str(item.get('trip_id') or '')}" for item in conflicts)
+        print(f"注意：与 {len(conflicts)} 条行程日期重叠：{ids}")
+    return 0
+
+
 def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
     """列出用户行程（`python cli.py trips <user_id> [--json]`）。
 
@@ -3102,7 +3280,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / "
     "preferences / "
-    "trips / trips-dedupe / sessions / session-archive / session-export / "
+    "trips / trip-add / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export / user-export"
 )
 
@@ -3336,6 +3514,27 @@ def main():
             pref_user, pref_json = parsed_pref
             sys.exit(
                 run_preferences_list_standalone(pref_user, as_json=pref_json)
+            )
+        if arg == "trip-add":
+            parsed_trip_add = _parse_trip_add_args(sys.argv[2:])
+            if parsed_trip_add is None:
+                print(
+                    "用法：python cli.py trip-add <user_id> --destination X "
+                    "--start YYYY-MM-DD [--origin X] [--end YYYY-MM-DD] "
+                    "[--purpose X] [--json]"
+                )
+                sys.exit(2)
+            trip_values = parsed_trip_add["values"]
+            sys.exit(
+                run_trip_add_standalone(
+                    parsed_trip_add["user_id"],
+                    trip_values.get("origin", ""),
+                    trip_values["destination"],
+                    trip_values["start"],
+                    trip_values.get("end"),
+                    trip_values.get("purpose", "出差"),
+                    as_json=parsed_trip_add["as_json"],
+                )
             )
         if arg == "trips":
             parsed_trips_list = _parse_user_and_json_args(sys.argv[2:])
