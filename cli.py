@@ -1495,6 +1495,67 @@ def run_knowledge_categories_standalone(as_json: bool = False) -> int:
     return 0
 
 
+def run_knowledge_search_standalone(
+    query: str, top_k: int = 5, as_json: bool = False
+) -> int:
+    """语义检索知识片段（`python cli.py kb-search <关键词> [--top-k N] [--json]`）。
+
+    与 Web 面板的语义检索、RAG 问答共用同一条检索链路（嵌入模型 + Milvus）。
+
+    Returns:
+        0 检索成功（含无结果）；1 知识库不可用或检索失败
+    """
+    from utils.knowledge_admin import search_documents
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        return 1
+    try:
+        results = search_documents(query, top_k=top_k)
+    except FileNotFoundError:
+        print("知识库未初始化")
+        return 1
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"检索失败：{exc}")
+        return 1
+
+    if as_json:
+        print(
+            json.dumps(
+                {"query": query, "top_k": top_k, "results": results},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if not results:
+        print(f"没有与「{query}」相关的内容")
+        return 0
+    print(f"语义检索「{query}」：{len(results)} 条结果（按相似度排序）")
+    for item in results:
+        metadata = item.get("metadata") or {}
+        category = metadata.get("category") or metadata.get("title") or ""
+        preview = " ".join(str(item.get("content", "")).split())[:60]
+        bits: list[str] = []
+        if item.get("id") is not None:
+            bits.append(f"#{item['id']}")
+        if category:
+            bits.append(str(category))
+        distance = item.get("distance")
+        if isinstance(distance, (int, float)):
+            bits.append(f"相似度 {float(distance):.3f}")
+        prefix = " · ".join(bits)
+        if prefix and preview:
+            print(f"  {prefix}  {preview}")
+        elif prefix:
+            print(f"  {prefix}")
+        elif preview:
+            print(f"  {preview}")
+    return 0
+
+
 def _parse_cli_int(value: str) -> int | None:
     """ASCII 十进制整数解析（用于 <id> / limit 参数）。
 
@@ -1507,6 +1568,44 @@ def _parse_cli_int(value: str) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _parse_kb_search_args(args: list[str]) -> tuple[str, int, bool] | None:
+    """解析 kb-search 的 <关键词> [--top-k N] [--json]。
+
+    关键词可由多个词组成（以空格拼接）；--top-k 取 1..50 的 ASCII 十进制
+    整数；未知参数或缺关键词返回 None。
+    """
+    top_k = 5
+    as_json = False
+    words: list[str] = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+        elif lowered == "--top-k" or lowered.startswith("--top-k="):
+            if lowered == "--top-k":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--top-k="):]
+            parsed = _parse_cli_int(value)
+            if parsed is None or not 1 <= parsed <= 50:
+                return None
+            top_k = parsed
+        elif item.startswith("-"):
+            return None
+        else:
+            words.append(item)
+        index += 1
+    query = " ".join(words).strip()
+    if not query:
+        return None
+    return query, top_k, as_json
 
 
 def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> int:
@@ -2324,7 +2423,8 @@ def _parse_export_args(
 
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / kb / eval / kb-export / "
-    "kb-import / kb-list / kb-categories / kb-delete / kb-duplicates / preferences / "
+    "kb-import / kb-list / kb-search / kb-categories / kb-delete / kb-duplicates / "
+    "preferences / "
     "trips / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export"
 )
@@ -2433,6 +2533,19 @@ def main():
                 sys.exit(2)
             keywords = sys.argv[2] if len(sys.argv) > 2 else ""
             sys.exit(run_knowledge_list_standalone(keywords))
+        if arg == "kb-search":
+            parsed_search = _parse_kb_search_args(sys.argv[2:])
+            if parsed_search is None:
+                print(
+                    "用法：python cli.py kb-search <关键词> [--top-k N] [--json]"
+                )
+                sys.exit(2)
+            search_query, search_top_k, search_json = parsed_search
+            sys.exit(
+                run_knowledge_search_standalone(
+                    search_query, top_k=search_top_k, as_json=search_json
+                )
+            )
         if arg == "kb-categories":
             kb_categories_json = _parse_json_flag(
                 sys.argv[2:], "python cli.py kb-categories [--json]"
