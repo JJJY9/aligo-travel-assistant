@@ -186,8 +186,14 @@ class _FlakyRedis:
         self.data.clear()
         return 1
 
-    def eval(self, script, numkeys, key, check, expected):
+    def eval(self, script, numkeys, key, *args):
         self._check()
+        if "LREM" in script:
+            for payload in args:
+                self.data = [item for item in self.data if item != payload]
+            return 1
+        check = args[0] if args else "0"
+        expected = args[1] if len(args) > 1 else ""
         if not self.data:
             return 0
         count = 2 if len(self.data) >= 2 else 1
@@ -309,7 +315,7 @@ class _ApplyThenFailRedis(_FlakyRedis):
 
 
 def test_outage_backlog_is_bounded(monkeypatch):
-    """长时间故障时待补写消息只保留最近窗口，进程内存不会无限增长。"""
+    """长时间故障时操作日志有界，进程内存不会无限增长。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -317,16 +323,16 @@ def test_outage_backlog_is_bounded(monkeypatch):
     memory = module.RedisShortTermMemory(client, "s1", max_turns=2, user_id="u1")
 
     client.fail = True
-    for index in range(10):
+    for index in range(200):
         memory.add_message("user" if index % 2 == 0 else "assistant", f"m{index}")
-    assert len(memory._pending) <= 4, "待补写队列应与滑动窗口一致"
+    assert len(memory._pending_ops) <= max(64, 2 * 8), "操作日志应有上界"
 
     client.fail = False
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     messages = memory.get_recent_context()
-    assert [item["content"] for item in messages] == ["m6", "m7", "m8", "m9"]
+    assert [item["content"] for item in messages] == ["m196", "m197", "m198", "m199"]
     assert len(client.data) == 4
-    print("✓ 故障期待补写队列有界（只保留最近窗口）")
+    print("✓ 故障期操作日志有界（重放后仍只保留最近窗口）")
 
 
 def test_replay_dedupes_committed_payload(monkeypatch):
@@ -341,19 +347,19 @@ def test_replay_dedupes_committed_payload(monkeypatch):
 
     client.fail_after_apply = True
     memory.add_message("user", "Q2")
-    assert memory._pending, "响应丢失时消息应进入待补写队列"
+    assert memory._pending_ops, "响应丢失时消息应进入操作日志"
     assert len(client.data) == 3, "写入本身已在服务端生效"
 
     client.fail_after_apply = False
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     messages = memory.get_recent_context()
     assert [item["content"] for item in messages] == ["Q1", "A1", "Q2"], "补写不能重复"
-    assert memory._pending == []
+    assert memory._pending_ops == []
     print("✓ 补写按已提交内容去重（至少一次语义不重复）")
 
 
-def test_outage_truncate_rewrites_on_recovery(monkeypatch):
-    """故障期间删除的轮次不能在恢复后从 Redis 复活（按影子整体重写）。"""
+def test_outage_truncate_replays_on_recovery(monkeypatch):
+    """故障期间删除的轮次不能在恢复后从 Redis 复活（按完整消息项精确删除）。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -378,11 +384,80 @@ def test_outage_truncate_rewrites_on_recovery(monkeypatch):
         "恢复后已删除的轮次不能从 Redis 复活"
     )
     assert len(client.data) == 2
-    print("✓ 故障期截断在恢复后整体重写")
+    print("✓ 故障期截断在恢复后精确删除")
+
+
+def test_outage_add_then_truncate_replays_in_order(monkeypatch):
+    """故障期先新增再截断：重放顺序保证新增项先补写、随后被精确删除。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    client.fail = True
+    memory.add_message("user", "Q2")
+    memory.add_message("assistant", "A2")
+    assert memory.truncate_last_turn("Q2") == 2
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["Q1", "A1"]
+    assert len(client.data) == 2
+    assert memory._pending_ops == []
+    print("✓ 故障期新增 + 截断按顺序重放")
+
+
+def test_outage_truncate_keeps_other_instance_messages(monkeypatch):
+    """故障期截断的重放只能删除本对象删掉的消息，不能整体重写其它实例的轮次。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    alice = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    bob = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    alice.add_message("user", "Q1")
+    alice.add_message("assistant", "A1")
+    # 另一实例（另一个 worker）写入新的一轮：alice 的影子缓存里没有它
+    bob.add_message("user", "Q2")
+    bob.add_message("assistant", "A2")
+
+    client.fail = True
+    assert alice.truncate_last_turn("Q1") == 2
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in alice.get_recent_context()]
+    assert contents == ["Q2", "A2"], "恢复重放不能丢掉其它实例写入的轮次"
+    print("✓ 故障期截断只精确删除本对象删掉的消息")
+
+
+def test_outage_transient_truncate_queues_conditional_delete(monkeypatch):
+    """临时对象影子缓存为空时，故障期截断也要记录，恢复后条件删除仍生效。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    owner = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    owner.add_message("user", "Q1")
+    owner.add_message("assistant", "A1")
+    # 新建同键对象模拟临时实例（重启 / 会话缓存未命中）：影子缓存为空
+    transient = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+
+    client.fail = True
+    assert transient.truncate_last_turn("Q1") == 0, "影子缓存为空，内存里删不掉"
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert transient.get_recent_context() == [], "恢复后条件删除应清掉 Redis 里的最后一轮"
+    print("✓ 临时对象故障期截断在恢复后条件删除")
 
 
 def test_outage_clear_rewrites_on_recovery(monkeypatch):
-    """故障期间清空的会话不能在恢复后从 Redis 复活。"""
+    """故障期间清空的会话不能在恢复后从 Redis 复活（重放一次删除）。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -447,7 +522,22 @@ if __name__ == "__main__":
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()
     try:
-        test_outage_truncate_rewrites_on_recovery(_mp)
+        test_outage_truncate_replays_on_recovery(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_add_then_truncate_replays_in_order(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_truncate_keeps_other_instance_messages(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_transient_truncate_queues_conditional_delete(_mp)
     finally:
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()
