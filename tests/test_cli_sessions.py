@@ -5,6 +5,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import sys
 
@@ -78,7 +79,7 @@ def _sessions_store() -> _FakeStore:
     )
 
 
-def _run_list(user_id, archived=False, include_all=False, query=""):
+def _run_list(user_id, archived=False, include_all=False, query="", as_json=False):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_sessions_list_standalone(
@@ -86,6 +87,7 @@ def _run_list(user_id, archived=False, include_all=False, query=""):
             archived_only=archived,
             include_all=include_all,
             query=query,
+            as_json=as_json,
         )
     return code, buf.getvalue()
 
@@ -138,6 +140,30 @@ def test_list_filters_by_query(monkeypatch):
     code, out = _run_list("u1", query="回答 C", include_all=True)
     assert code == 0 and "s-archived" in out
     print("✓ sessions --query 按标题 / 内容过滤并附带片段")
+
+
+def test_list_json_output(monkeypatch):
+    """--json 输出会话摘要（含命中片段），空结果也是合法 JSON。"""
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_list("u1", as_json=True)
+    assert code == 0
+    data = json.loads(out)
+    assert data["total"] == 2 and data["archived_total"] == 1
+    ids = {item["session_id"] for item in data["sessions"]}
+    assert ids == {"s-active", "s-pinned"}
+    pinned = next(item for item in data["sessions"] if item["session_id"] == "s-pinned")
+    assert pinned["pinned"] is True and pinned["archived"] is False
+    assert "_parts" not in pinned
+
+    code, out = _run_list("u1", query="行程", as_json=True)
+    data = json.loads(out)
+    assert data["total"] == 1
+    assert data["sessions"][0]["snippet"].startswith("行程")
+
+    code, out = _run_list("u1", query="不存在", as_json=True)
+    assert code == 0 and json.loads(out)["sessions"] == []
+    print("✓ sessions --json 输出摘要 / 片段 / 空列表")
 
 
 def test_session_list_converts_utc_timestamps(monkeypatch):
@@ -241,11 +267,22 @@ def test_pg_fallback_refused(monkeypatch):
 
 
 def test_flag_parsing_helpers():
-    assert cli._parse_sessions_flags([]) == (False, False, "")
-    assert cli._parse_sessions_flags(["--archived"]) == (True, False, "")
-    assert cli._parse_sessions_flags(["--ALL"]) == (False, True, "")
-    assert cli._parse_sessions_flags(["--query", "住宿"]) == (False, False, "住宿")
-    assert cli._parse_sessions_flags(["--query=住宿"]) == (False, False, "住宿")
+    assert cli._parse_sessions_flags([]) == (False, False, "", False)
+    assert cli._parse_sessions_flags(["--archived"]) == (True, False, "", False)
+    assert cli._parse_sessions_flags(["--ALL"]) == (False, True, "", False)
+    assert cli._parse_sessions_flags(["--query", "住宿"]) == (
+        False,
+        False,
+        "住宿",
+        False,
+    )
+    assert cli._parse_sessions_flags(["--query=住宿", "--json"]) == (
+        False,
+        False,
+        "住宿",
+        True,
+    )
+    assert cli._parse_sessions_flags(["--json"]) == (False, False, "", True)
     assert cli._parse_sessions_flags(["--query"]) is None
     assert cli._parse_sessions_flags(["--query="]) is None
     assert cli._parse_sessions_flags(["--query", "--all"]) is None

@@ -5,6 +5,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import sys
 
@@ -38,6 +39,52 @@ def _run_list(monkeypatch, store):
     with contextlib.redirect_stdout(out):
         code = cli.run_preferences_list_standalone("u-prefs")
     return code, out.getvalue()
+
+
+def test_preferences_list_json(monkeypatch):
+    """--json 输出原始偏好值（列表 / 布尔 / 0 保持原类型）。"""
+    store = _FakeStore(
+        {
+            "home_location": "北京",
+            "hotel_brands": ["汉庭", "如家"],
+            "eco_mode": True,
+            "budget_level": 0,
+        }
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preferences_list_standalone("u-prefs", as_json=True)
+    assert code == 0
+    data = json.loads(out.getvalue())
+    assert data["user_id"] == "u-prefs" and data["count"] == 4
+    assert data["preferences"]["hotel_brands"] == ["汉庭", "如家"]
+    assert data["preferences"]["eco_mode"] is True
+    assert data["preferences"]["budget_level"] == 0
+    print("✓ preferences --json 保留原始类型")
+
+
+def test_preferences_dispatch_json_and_bad_args(monkeypatch):
+    store = _FakeStore({"home_location": "北京"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    monkeypatch.setattr(sys, "argv", ["cli.py", "preferences", "u1", "--json"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0 and '"home_location"' in buf.getvalue()
+
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "preferences", "u1", "--json", "x"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2 and "用法" in buf.getvalue()
+    print("✓ dispatch 层 preferences --json / 多余参数拒绝")
 
 
 def test_preferences_list_output(monkeypatch):
@@ -99,7 +146,9 @@ def test_preferences_rejects_bad_user_id(monkeypatch):
 def test_preferences_dispatch_strict(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        cli, "run_preferences_list_standalone", lambda user: calls.append(user) or 0
+        cli,
+        "run_preferences_list_standalone",
+        lambda user, **kwargs: calls.append(user) or 0,
     )
     monkeypatch.setattr(sys, "argv", ["cli.py", "preferences", "u1"])
     with pytest.raises(SystemExit) as exc:
