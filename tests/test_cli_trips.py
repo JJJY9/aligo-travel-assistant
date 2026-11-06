@@ -8,6 +8,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -35,6 +36,38 @@ class _FakeStore:
 
     def close(self):
         self.closed = True
+
+
+def test_trips_list_json(monkeypatch):
+    """--json 输出原始行程（含状态标签与冲突列表）。"""
+    trips = [
+        _trip("上海", "2020-01-01", "2020-01-02", trip_id="trip_a"),
+        _trip("上海", "2020-01-02", "2020-01-03", trip_id="trip_b"),
+    ]
+    store = _FakeStore(trips)
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u-trips", as_json=True)
+    assert code == 0
+    data = json.loads(out.getvalue())
+    assert data["user_id"] == "u-trips" and data["count"] == 2
+    first = next(item for item in data["trips"] if item["trip_id"] == "trip_a")
+    assert first["destination"] == "上海"
+    assert first["state"] == "已结束"
+    assert first.get("conflicts"), "重叠行程应带冲突列表"
+
+    empty = _FakeStore([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: empty
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u-trips", as_json=True)
+    assert code == 0 and json.loads(out.getvalue())["trips"] == []
+    print("✓ trips --json 输出状态 / 冲突 / 空列表")
 
 
 def _trip(destination, start, end=None, origin="北京", purpose="出差", trip_id=None):
@@ -181,7 +214,9 @@ def test_trips_list_rejects_bad_user_id(monkeypatch):
 def test_trips_dispatch_strict(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        cli, "run_trips_list_standalone", lambda user: calls.append(user) or 0
+        cli,
+        "run_trips_list_standalone",
+        lambda user, **kwargs: calls.append(user) or 0,
     )
     monkeypatch.setattr(sys, "argv", ["cli.py", "trips", "u1"])
     with pytest.raises(SystemExit) as exc:

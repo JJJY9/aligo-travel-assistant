@@ -1925,10 +1925,12 @@ def run_sessions_list_standalone(
     archived_only: bool = False,
     include_all: bool = False,
     query: str = "",
+    as_json: bool = False,
 ) -> int:
-    """列出用户会话（`python cli.py sessions <user_id> [--archived|--all] [--query 关键词]`）。
+    """列出用户会话（`python cli.py sessions <user_id> [--archived|--all] [--query 关键词] [--json]`）。
 
-    ``query`` 在标题与消息内容中做不区分大小写的包含匹配，命中时附带片段。
+    ``query`` 在标题与消息内容中做不区分大小写的包含匹配，命中时附带片段；
+    ``as_json`` 输出机器可读的会话摘要列表（含命中片段）。
 
     Returns:
         0 列出成功（含无会话）；1 参数 / 读取失败
@@ -1980,6 +1982,35 @@ def run_sessions_list_standalone(
         visible.sort(key=lambda item: not item["pinned"])
 
     keyword = f"（关键词：{query.strip()}）" if needle else ""
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "user_id": user_id,
+                    "total": len(visible),
+                    "archived_total": archived_total,
+                    "sessions": [
+                        {
+                            "session_id": item["session_id"],
+                            "title": item["title"],
+                            "messages": item["messages"],
+                            "updated_at": item["updated_at"],
+                            "pinned": item["pinned"],
+                            "archived": item["archived"],
+                            **(
+                                {"snippet": item["_snippet"]}
+                                if item.get("_snippet")
+                                else {}
+                            ),
+                        }
+                        for item in visible
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if not visible:
         if needle:
             print(
@@ -2058,14 +2089,15 @@ def run_session_archive_standalone(
     return 0
 
 
-def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str] | None:
-    """解析 sessions 的 --archived / --all / --query 关键词。
+def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str, bool] | None:
+    """解析 sessions 的 --archived / --all / --query 关键词 / --json。
 
     未知参数、同时使用 --archived 与 --all、或 --query 缺少非空值
     时返回 None。
     """
     archived_only = include_all = False
     query = ""
+    as_json = False
     index = 0
     while index < len(args):
         flag = args[index].lower()
@@ -2073,6 +2105,8 @@ def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str] | None:
             archived_only = True
         elif flag == "--all":
             include_all = True
+        elif flag == "--json":
+            as_json = True
         elif flag == "--query" or flag.startswith("--query="):
             if flag == "--query":
                 index += 1
@@ -2089,7 +2123,7 @@ def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str] | None:
         index += 1
     if archived_only and include_all:
         return None
-    return archived_only, include_all, query
+    return archived_only, include_all, query, as_json
 
 
 def _parse_archive_flags(args: list[str]) -> bool | None:
@@ -2315,8 +2349,10 @@ def run_trips_export_standalone(
     return 0
 
 
-def run_trips_list_standalone(user_id: str) -> int:
-    """列出用户行程（用于 `python cli.py trips <user_id>`）。
+def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
+    """列出用户行程（`python cli.py trips <user_id> [--json]`）。
+
+    ``as_json`` 输出原始行程（含冲突列表与状态标签）。
 
     Returns:
         0 列出成功（含无行程）；1 参数 / 读取失败
@@ -2345,11 +2381,36 @@ def run_trips_list_standalone(user_id: str) -> int:
             close()
 
     if not trips:
+        if as_json:
+            print(
+                json.dumps(
+                    {"user_id": user_id, "count": 0, "trips": []},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
         print(f"用户 {user_id}：还没有行程记录")
         return 0
 
     # 与 Web 记忆面板一致：新→旧展示，并标注状态与日期重叠
     views = trips_with_conflicts(trips)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "user_id": user_id,
+                    "count": len(views),
+                    "trips": [
+                        {"state": trip_state_label(trip), **trip}
+                        for trip in views
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     print(f"用户 {user_id}：共 {len(views)} 条行程（新→旧）")
     for trip in reversed(views):
         start = trip.get("start_date") or "日期未记录"
@@ -2373,8 +2434,10 @@ def run_trips_list_standalone(user_id: str) -> int:
     return 0
 
 
-def run_preferences_list_standalone(user_id: str) -> int:
-    """列出用户偏好（用于 `python cli.py preferences <user_id>`）。
+def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
+    """列出用户偏好（`python cli.py preferences <user_id> [--json]`）。
+
+    ``as_json`` 输出机器可读的原始偏好值（列表 / 布尔值保持原类型）。
 
     Returns:
         0 列出成功（含无偏好）；1 参数 / 读取失败
@@ -2402,6 +2465,21 @@ def run_preferences_list_standalone(user_id: str) -> int:
         if callable(close):
             close()
 
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "user_id": user_id,
+                    "count": len(preferences),
+                    "preferences": {
+                        key: preferences[key] for key in sorted(preferences)
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if not preferences:
         print(f"用户 {user_id}：还没有偏好记录")
         return 0
@@ -2641,15 +2719,33 @@ def main():
                 limit = parsed
             sys.exit(run_knowledge_duplicates_standalone(limit))
         if arg == "preferences":
-            if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
-                print("用法：python cli.py preferences <user_id>")
+            rest = sys.argv[3:]
+            if (
+                len(sys.argv) < 3
+                or sys.argv[2].startswith("-")
+                or len(rest) > 1
+                or any(item.lower() != "--json" for item in rest)
+            ):
+                print("用法：python cli.py preferences <user_id> [--json]")
                 sys.exit(2)
-            sys.exit(run_preferences_list_standalone(sys.argv[2]))
+            sys.exit(
+                run_preferences_list_standalone(
+                    sys.argv[2], as_json=bool(rest)
+                )
+            )
         if arg == "trips":
-            if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
-                print("用法：python cli.py trips <user_id>")
+            rest = sys.argv[3:]
+            if (
+                len(sys.argv) < 3
+                or sys.argv[2].startswith("-")
+                or len(rest) > 1
+                or any(item.lower() != "--json" for item in rest)
+            ):
+                print("用法：python cli.py trips <user_id> [--json]")
                 sys.exit(2)
-            sys.exit(run_trips_list_standalone(sys.argv[2]))
+            sys.exit(
+                run_trips_list_standalone(sys.argv[2], as_json=bool(rest))
+            )
         if arg == "trips-dedupe":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py trips-dedupe <user_id> [--dry-run]")
@@ -2666,7 +2762,7 @@ def main():
         if arg == "sessions":
             usage = (
                 "用法：python cli.py sessions <user_id> "
-                "[--archived|--all] [--query 关键词]"
+                "[--archived|--all] [--query 关键词] [--json]"
             )
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print(usage)
@@ -2675,13 +2771,14 @@ def main():
             if parsed is None:
                 print(usage)
                 sys.exit(2)
-            archived_only, include_all, query = parsed
+            archived_only, include_all, query, sessions_json = parsed
             sys.exit(
                 run_sessions_list_standalone(
                     sys.argv[2],
                     archived_only=archived_only,
                     include_all=include_all,
                     query=query,
+                    as_json=sessions_json,
                 )
             )
         if arg == "session-archive":
