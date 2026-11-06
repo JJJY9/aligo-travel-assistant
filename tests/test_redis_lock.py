@@ -251,6 +251,76 @@ def test_stale_renewal_does_not_mark_new_hold_lost():
     print("✓ 旧续期返回 0 不污染新的持有点")
 
 
+class _OutageRenewRedis:
+    """SET 成功后续期一直抛异常（Redis 断连，无法用「返回 0」发现易主）。"""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    def set(self, key, value, nx=False, ex=None):
+        self.store[key] = value
+        return True
+
+    def eval(self, script, numkeys, key, *args):
+        if "EXPIRE" in script:
+            raise ConnectionError("redis down")
+        if "DEL" in script:
+            self.store.pop(key, None)
+            return 1
+        return 0
+
+
+def test_heartbeat_marks_lost_after_renew_outage():
+    """续期连续失败超过 TTL：键必然已过期，保守标记互斥丢失。"""
+    client = _OutageRenewRedis()
+    lock = DistributedLock(client, "aligo:test:outage", ttl_sec=1)
+    token = lock.acquire()
+    assert token
+    assert lock.lost is False
+
+    time.sleep(1.6)
+    assert lock.lost is True, "连续续期失败超过 TTL 应标记 lost"
+    lock.release(token)
+    print("✓ 续期持续失败超过 TTL 时标记锁已丢失")
+
+
+class _TransientOutageRedis:
+    """第一次续期抛异常（瞬时抖动），之后恢复正常。"""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.renew_calls = 0
+
+    def set(self, key, value, nx=False, ex=None):
+        self.store[key] = value
+        return True
+
+    def eval(self, script, numkeys, key, *args):
+        if "EXPIRE" in script:
+            self.renew_calls += 1
+            if self.renew_calls == 1:
+                raise ConnectionError("redis blip")
+            return 1
+        if "DEL" in script:
+            self.store.pop(key, None)
+            return 1
+        return 0
+
+
+def test_transient_renew_failure_keeps_lock():
+    """一次续期抖动（未超过 TTL）不标记丢失，恢复后续期继续生效。"""
+    client = _TransientOutageRedis()
+    lock = DistributedLock(client, "aligo:test:blip", ttl_sec=3)
+    token = lock.acquire()
+    assert token
+
+    time.sleep(2.4)  # t≈1.0 第一次续期抖动，t≈2.0 恢复成功
+    assert client.renew_calls >= 2
+    assert lock.lost is False, "TTL 内的续期抖动不能标记丢失"
+    lock.release(token)
+    print("✓ 瞬时续期抖动不标记丢失")
+
+
 if __name__ == "__main__":
     test_fallback_when_redis_unavailable()
     test_local_mutex_blocks_even_if_redis_errors()
@@ -258,5 +328,7 @@ if __name__ == "__main__":
     test_release_cleans_key_after_set_timeout()
     test_heartbeat_renews_lock_ttl()
     test_heartbeat_detects_lost_lock()
+    test_heartbeat_marks_lost_after_renew_outage()
+    test_transient_renew_failure_keeps_lock()
     test_stale_renewal_does_not_mark_new_hold_lost()
     print("\n全部通过（Redis 集成用例需 TEST_REDIS_URL）")

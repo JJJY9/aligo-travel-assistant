@@ -12,6 +12,7 @@
 """
 import logging
 import threading
+import time
 import uuid
 from typing import Any, Callable
 
@@ -121,9 +122,29 @@ class DistributedLock:
         stop = threading.Event()
 
         def _renew() -> None:
+            last_ok = time.monotonic()
+
+            def _mark_lost_if_expired() -> bool:
+                """连续续期失败达到一个 TTL：键可能已过期被其它实例取得。
+
+                Redis 不可达时无法用「续期返回 0」发现锁已易主，只能按时间
+                保守判断：最后一次成功续期后已过整个 TTL，键必然已过期。
+                """
+                if stop.is_set() or time.monotonic() - last_ok < self._ttl_sec:
+                    return False
+                self.lost = True
+                logger.warning(
+                    "Redis 互斥锁连续续期失败超过 TTL（%s），互斥保护可能已丢失",
+                    self._key,
+                )
+                stop.set()
+                return True
+
             while not stop.wait(interval):
                 client = self._get_client()
                 if client is None:
+                    if _mark_lost_if_expired():
+                        return
                     continue
                 try:
                     renewed = client.eval(
@@ -131,6 +152,8 @@ class DistributedLock:
                     )
                 except Exception as exc:  # noqa: BLE001 - 续期失败下次再试
                     logger.warning("续期 Redis 互斥锁失败：%s", exc)
+                    if _mark_lost_if_expired():
+                        return
                     continue
                 # EXPIRE 返回 0：键已过期（被其它实例重新获取）或 token 已不匹配。
                 # 此时本进程已不是唯一持有者，继续执行会与另一个实例并发。
@@ -145,6 +168,7 @@ class DistributedLock:
                     )
                     stop.set()
                     return
+                last_ok = time.monotonic()
 
         thread = threading.Thread(
             target=_renew, name=f"aligo-lock-{self._key}", daemon=True
