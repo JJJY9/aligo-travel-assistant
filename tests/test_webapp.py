@@ -4464,6 +4464,72 @@ def test_knowledge_transfer_api(monkeypatch):
     print("✓ /api/knowledge/export 与 /api/knowledge/import")
 
 
+def test_kb_import_error_mapping(monkeypatch):
+    """知识导入 / 预览的错误映射：库未初始化 503、后端异常 503、超限 400。"""
+    from webapp import server as server_module
+
+    client = _client()
+
+    def missing(documents, dry_run=False):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "import_documents", missing)
+    for path in ("/api/knowledge/import", "/api/knowledge/import/preview"):
+        response = client.post(path, json={"documents": [{"content": "x"}]})
+        assert response.status_code == 503, path
+        assert "先运行初始化脚本" in response.json()["detail"]
+
+    def backend_boom(documents, dry_run=False):
+        raise RuntimeError("milvus down")
+
+    monkeypatch.setattr(server_module, "import_documents", backend_boom)
+    imported = client.post(
+        "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+    )
+    assert imported.status_code == 503
+    assert "导入失败" in imported.json()["detail"]
+    preview = client.post(
+        "/api/knowledge/import/preview", json={"documents": [{"content": "x"}]}
+    )
+    assert preview.status_code == 503
+    assert "预览失败" in preview.json()["detail"]
+
+    def invalid(documents, dry_run=False):
+        raise ValueError("备份中的文档不完整")
+
+    monkeypatch.setattr(server_module, "import_documents", invalid)
+    response = client.post(
+        "/api/knowledge/import/preview", json={"documents": [{"content": "x"}]}
+    )
+    assert response.status_code == 400
+    assert "不完整" in response.json()["detail"]
+    print("✓ 知识导入 / 预览错误映射（503 / 400）")
+
+
+def test_kb_group_error_mapping(monkeypatch):
+    """整篇回填接口的错误映射：库未初始化 / 读取失败都返回 503。"""
+    from webapp import server as server_module
+
+    client = _client()
+
+    def missing(doc_id):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "get_document_group", missing)
+    response = client.get("/api/knowledge/documents/1/group")
+    assert response.status_code == 503
+    assert "先运行初始化脚本" in response.json()["detail"]
+
+    def boom(doc_id):
+        raise RuntimeError("milvus down")
+
+    monkeypatch.setattr(server_module, "get_document_group", boom)
+    response = client.get("/api/knowledge/documents/1/group")
+    assert response.status_code == 503
+    assert "读取失败" in response.json()["detail"]
+    print("✓ 知识整篇回填错误映射（503）")
+
+
 def test_next_trip_from_full_history():
     from datetime import datetime, timedelta
 
@@ -4578,6 +4644,16 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_knowledge_transfer_api(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_kb_import_error_mapping(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_kb_group_error_mapping(_mp)
     finally:
         _mp.undo()
     test_status_endpoint()
