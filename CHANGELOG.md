@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.6.0] - 2026-11-06
 
 ### 新增
 - CLI 新增 `python cli.py weather <城市> [--json]`：输出当前天气与未来几天预报（复用 `utils/weather` 的缓存与 stale 降级），城市不存在或接口不可用时退出码 1，`--json` 附带 `ok`
@@ -10,6 +10,12 @@
 - Prometheus 文本指标端点 `GET /metrics`：请求总数 / 状态 / 方法 / 路径 / 耗时分位 / 熔断器 / 缓存会话 / 限流后端与降级状态，`text/plain; version=0.0.4`，多实例需分别采集；README 补抓取配置示例
 - 会话删除墓碑在配置 `REDIS_URL` 时写入 Redis（`aligo:deleted:*`，TTL 与本地一致），其它实例的新请求会被拒绝；Redis 故障时回退进程内墓碑
 - 侧栏「即将出行」显示目的地天气：新增 `GET /api/weather`（Open-Meteo，无 Key，实时 + 未来 3 天，10 分钟进程内缓存），前端异步展示，失败时静默隐藏
+- 多分片知识记录带 `group` 标识：超过 400 字的拆分统一写入 `part` / `parts` / `group`；新增 `DELETE /api/knowledge/documents/{id}?group=1` 与 `python cli.py kb-delete <id> --group` 整组删除
+- 面板支持编辑整份文档：任一分片「编辑」回填整篇（`GET /api/knowledge/documents/{id}/group`，≤20000 字），保存按整组替换（先写新分片 → 覆盖首片 → 删旧分片，失败不丢旧内容）；旧数据无 `group` 仍拒绝单条编辑
+- 导入预览：`python cli.py kb-import <file> --dry-run`、`POST /api/knowledge/import?dry_run=1` 与 `POST /api/knowledge/import/preview`（整份备份一次校验，≤20000 条），面板导入确认框显示「将导入 N 条（跳过 M 条已存在 / 无效内容）」
+- `python cli.py kb-duplicates [limit]`：只读扫描内容完全相同的独立片段（多分片记录内部相同段落不计入）
+- `python cli.py kb-list` 显示「分片 i/n」
+- 检索评测共享锁失效 / 降级时结果附 `warning`，面板高亮展示
 
 ### 变更
 - 侧栏「即将出行」天气优先展示出发日预报：行程开始日期在 3 天窗口内时显示「出发日 5°C~16°C」，窗口外退回「今日」；上游故障沿用旧数据时标注「（较早）」
@@ -51,6 +57,17 @@
 - 侧栏天气：缺失温度不再显示为「0°C」；切换行程时在途请求会失效并清空文本，避免上一个城市的天气落到新卡片上；移除前端重复的 10 分钟缓存，统一由服务端缓存负责，避免最长约 20 分钟的过期展示
 - `query-info` 技能：天气与联网搜索都失败时返回具体的天气失败原因（如城市名拼错），不再被「搜索库未安装 / 未找到相关结果」覆盖
 
+### 修复（回归评审）
+- 会话删除墓碑并发安全（字典加锁）、改为先落墓碑再查存在性（堵住存在性检查窗口内的写回）、重复删除补写共享墓碑；存在性检查失败的回滚区分进程内 / 共享墓碑
+- Redis 短期记忆故障期补写：队列与滑动窗口同界、恢复补写按已提交内容去重；成功截断 / 清空同步镜像影子缓存
+- PostgreSQL advisory lock 重连按重入计数恢复；重复置顶 / 归档幂等返回成功
+- 编排 `partial_failure` 不再计入 LLM 熔断；前序批次 `append` 偏好列表逐项合并、`0` / `False` 合法假值保留；跨会话总结窗口固定 50 条且不入缓存指纹（CLI / 对话 / 技能共享缓存）
+- RAG strict 检索失败返回顶层 `error` / `message`（前端不再显示「未知错误」）
+- Redis 互斥锁：释放期间卡住的旧续期不污染新持有、`acquire` 重置 `lost`
+- 知识整组替换顺序与失败补偿、派生分片元数据不受用户元数据 10 键上限约束、组内分片 / 列表 / 导出 / 导入去重改全量扫描（突破单页 16384 上限，列表翻页与分类统计覆盖全量）、CLI 新进程导入先加载集合
+- `text_chunker` 短标题并入正文首段（不再产生纯标题片段）
+- 前端：Ctrl+K / 「/」展开折叠侧栏再聚焦搜索；Escape 关闭记忆面板且 IME 组合键不误触；会话加载期间隐藏编辑入口并守卫编辑重发 / 重新生成 / 重试；偏好保存即时显示新值、取消编辑不重建列表吞点击；整组删除 / 缩小为单条时表单状态正确复位
+
 ### 测试
 - 新增 `tests/test_redis_lock.py`：Redis 故障回退进程内互斥、两个实例通过 Redis 共享同一把锁；补瞬时故障下进程内互斥、故障恢复后重新走 Redis、SET 超时后释放清理锁键、持有期间自动续期用例
 - `tests/test_metrics.py` 覆盖 Prometheus 渲染与标签转义（含无样本不输出耗时、单调时钟 uptime）；`test_webapp.py` 覆盖 `/metrics` 端点与路由模板聚合
@@ -67,6 +84,7 @@
 - 新增 `tests/test_tombstone_redis.py`（真实 Redis 跨实例墓碑，断言 TTL）；`test_webapp.py` 补假 Redis 共享墓碑用例（含 TTL、撤销、故障回退与恢复、启动后接入、过期墓碑清理、删除失败回滚）
 - 新增 `tests/test_weather.py`（查询 / 缓存 / 未知城市 / 接口故障 / 地点时区 / 429 映射 / 响应形状异常 / 缓存上限与过期清理 / 同城并发合并 / 失败短时缓存与键归一化 / stale-while-error）；`test_webapp.py` 补 `/api/weather` 用例与独立限流用例
 - `test_query_info_fallback.py` / `test_skill_agents.py` 天气用例改为校验技能委托 `utils.weather.fetch_weather`，不再模拟内部 HTTP；补天气与搜索都失败时返回天气原因的用例
+- 回归评审新增用例：会话墓碑并发与共享墓碑补写、短期记忆故障补写有界 / 去重、PG 重入锁、知识整组替换失败路径 / 全量扫描 / 导入预览 / 重复扫描、标题并入正文、偏好假值、RAG 错误字段；前端行为用浏览器实测（保存即时显示、取消不吞点击、整组回填与删除复位）；本地全量 564 passed
 
 ## [1.5.0] - 2026-11-05
 

@@ -5,4 +5,4 @@
 - 本文件的 ``APP_VERSION``
 - ``webapp/static/index.html`` 中静态资源的 ``?v=`` 查询参数
 """
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
