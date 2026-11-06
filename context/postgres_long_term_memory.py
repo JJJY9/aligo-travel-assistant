@@ -666,24 +666,26 @@ class PostgresLongTermMemory:
         destination = merged.get("destination")
         start_date = str(merged.get("start_date") or "")
         if destination and start_date:
+            # 与 save_trip_history / JSON 后端 _find_same_trip 的去重口径一致：
+            # 出发地为空按 ''、缺返程按出发日归一后比较
             same = self._fetchone(
                 """
                 SELECT id FROM aligo_trips
                 WHERE user_id = %s
                   AND id <> %s
                   AND destination = %s
-                  AND origin IS NOT DISTINCT FROM %s
+                  AND COALESCE(origin, '') = %s
                   AND start_date = %s
-                  AND end_date IS NOT DISTINCT FROM %s
+                  AND COALESCE(end_date, start_date) = %s
                 LIMIT 1
                 """,
                 (
                     self.user_id,
                     row[0],
                     destination,
-                    merged.get("origin"),
+                    str(merged.get("origin") or ""),
                     start_date,
-                    merged.get("end_date"),
+                    str(merged.get("end_date") or start_date),
                 ),
             )
             if same:

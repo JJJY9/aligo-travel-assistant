@@ -71,7 +71,14 @@ if check == '1' then
   -- Python 端用 str.strip()（含全角空格 U+3000 / 不间断空格 U+00A0），
   -- Lua 的 %s 只覆盖 ASCII；两侧必须按同一字符集裁剪，否则带全角空格的
   -- 提问会被误判为不一致（长期记忆删了、短期记忆还留着旧一轮）
-  if string.match(content, '^[%s\\194\\160\\227\\128\\128]*(.-)[%s\\194\\160\\227\\128\\128]*$') ~= expected then return 0 end
+  -- 归一半角空白：Lua 的 %s 只覆盖 ASCII；NBSP（U+00A0，字节 0xC2 0xA0）
+  -- 与全角空格（U+3000，字节 0xE3 0x80 0x80）按精确字节序列替换成空格
+  -- 再裁剪。不能写进字符类：字符类里的每个转义只匹配单字节，会把以
+  -- 0x80 / 0xA0 等字节结尾的汉字误裁成非法 UTF-8，导致内容明明一致却
+  -- 被判为不一致
+  content = string.gsub(content, '\\194\\160', ' ')
+  content = string.gsub(content, '\\227\\128\\128', ' ')
+  if string.match(content, '^%s*(.-)%s*$') ~= expected then return 0 end
 end
 if count >= n then
   redis.call('DEL', key)
@@ -234,14 +241,32 @@ class RedisShortTermMemory:
         self._fallback = ShortTermMemory(max_turns=max_turns)
         # Redis 故障期间新增的消息（JSON 列表项），恢复后补写进 Redis
         self._pending: list[str] = []
+        # 故障期间执行过清空 / 截断：这些删除操作无法只靠「补写」复原
+        # （Redis 里仍留着旧内容），恢复后按影子缓存整体重写
+        self._pending_rewrite = False
 
     def _flush_pending(self) -> None:
-        """把故障期间新增的消息补写进 Redis（保持最近窗口与 TTL）。
+        """Redis 恢复后的第一次调用：把故障期间的变更同步进 Redis。
 
-        补写是至少一次语义：写入已在服务端生效但响应超时（或连接中断）时，
-        同一条消息会留在待补写列表里。补写前与 Redis 末尾窗口去重，
-        避免恢复后对话轮次重复。
+        - 执行过清空 / 截断：影子缓存是唯一权威，删除并重写整个键
+        - 只有新增：把待补写消息追加进窗口（与已提交内容去重，至少一次
+          语义下不会重复对话轮次）
         """
+        if self._pending_rewrite:
+            messages = self._fallback.get_recent_context()
+            rewrite_payloads = [
+                json.dumps(message, ensure_ascii=False) for message in messages
+            ]
+            pipe = self.client.pipeline()
+            pipe.delete(self.key)
+            if rewrite_payloads:
+                pipe.rpush(self.key, *rewrite_payloads)
+                pipe.ltrim(self.key, -self.max_turns * 2, -1)
+            pipe.expire(self.key, self.ttl_sec)
+            pipe.execute()
+            self._pending_rewrite = False
+            self._pending.clear()
+            return
         if not self._pending:
             return
         window = self.max_turns * 2
@@ -336,7 +361,12 @@ class RedisShortTermMemory:
         return "\n".join(lines)
 
     def clear(self) -> None:
-        self._call_redis(lambda: self.client.delete(self.key), lambda: None)
+        _, via_redis = self._call_redis(
+            lambda: self.client.delete(self.key), lambda: None
+        )
+        if not via_redis:
+            # 故障期间删不掉 Redis 里的旧内容：恢复后按影子（已清空）重写
+            self._pending_rewrite = True
         # 无论 Redis 是否可用都清空影子缓存与待补写消息，否则故障切换后
         # 已清空的对话会从内存里“复活”
         self._fallback.clear()
@@ -365,6 +395,10 @@ class RedisShortTermMemory:
             # Redis 删除成功时同步镜像缓存，避免 Redis 再故障时把已删除的
             # 一轮从影子缓存读回来
             self._fallback.truncate_last_turn(expect)
+        if not via_redis and count:
+            # 故障期间只在影子缓存里删除了这一轮：Redis 里仍留着旧内容，
+            # 恢复后按影子整体重写（补写队列无法表达删除）
+            self._pending_rewrite = True
         if count:
             # 故障期间的消息可能还没补写进 Redis，同样要从待补写列表移除
             self._pending = (

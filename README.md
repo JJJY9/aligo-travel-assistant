@@ -45,7 +45,7 @@
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
-- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`；长内容自动按语义边界拆分并带 `group` 标识，任一分片可**编辑整份文档**或**整组删除**），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），并可运行**检索评测**（`/api/knowledge/eval`，14 个问题计算 hit@1/3/5 与 MRR，不调用大模型，同一时间只允许一个评测：配置 `REDIS_URL` 时通过 Redis 锁跨实例共享，未配置或 Redis 故障时回退进程内），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 200 条，Web 导入自动分批、CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
+- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`；长内容自动按语义边界拆分并带 `group` 标识，任一分片可**编辑整份文档**或**整组删除**），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），并可运行**检索评测**（`/api/knowledge/eval`，14 个问题计算 hit@1/3/5 与 MRR，不调用大模型，同一时间只允许一个评测：配置 `REDIS_URL` 时通过 Redis 锁跨实例共享，未配置或 Redis 故障时回退进程内），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 300 条（面板按 200 条分批、多分片组整组同批），CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归；Web 知识库维护面板也可直接「检索评测」
 
 ### ⚡ 优先级并行调度
@@ -348,7 +348,7 @@ aligo-web        # 启动 Web 界面（也可用 python -m webapp.server）
 aligo            # 启动交互式 CLI
 ```
 
-安装后可访问 `/api/health` 确认 `skills.count` 为 6（或运行 `python cli.py skills` / `python cli.py doctor` 查看「技能目录」检查）；若为 0，用环境变量 `ALIGO_SKILLS_DIR` 指向技能目录。
+安装后可访问 `/api/health` 确认 `skills.count` 为 6（或运行 `aligo skills` / `aligo doctor` 查看「技能目录」检查；源码目录下等价命令为 `python cli.py skills` / `python cli.py doctor`）；若为 0，用环境变量 `ALIGO_SKILLS_DIR` 指向技能目录。
 
 RAG 知识库文档、嵌入模型与记忆数据属于运行时数据，不随安装包分发，需要按「知识库初始化」自行准备；技能目录可用环境变量 `ALIGO_SKILLS_DIR` 覆盖。
 
@@ -493,7 +493,7 @@ python cli.py
 
 知识库检索评测（不进入交互、不调用大模型）：`python cli.py eval`，对 14 个差旅问题计算 hit@1 / hit@3 / hit@5 与 MRR（当前基线：hit@5 100%，MRR 0.80），hit@5 低于 80% 时退出码 1；知识库未初始化时提示跳过。`--json` 输出完整指标对象（`ok` / `skipped` / `threshold` / `hit@K` / `mrr` / `rows`），便于 CI 或脚本回归。
 
-知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path] [--force]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`，已存在时需 `--force` 覆盖）；`python cli.py kb-import <file.json> [--dry-run]` 批量导入（`--dry-run` 只校验 / 去重并报告将导入的数量，不加载嵌入模型；CLI 不限条数，Web 接口单次最多 200 条），适合备份、换机与批量补充知识。
+知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path] [--force]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`，已存在时需 `--force` 覆盖）；`python cli.py kb-import <file.json> [--dry-run]` 批量导入（`--dry-run` 只校验 / 去重并报告将导入的数量，不加载嵌入模型；CLI 不限条数，Web 接口单次最多 300 条（多分片组整组同批）），适合备份、换机与批量补充知识。
 
 知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 分片序号 + 60 字预览）；`python cli.py kb-delete <id> [--group]` 删除指定片段（`--group` 时连同同一拆分组的其余分片）；`python cli.py kb-duplicates [limit]` 只读扫描内容完全相同的**独立**片段组（`limit=0` 显示全部，多分片记录不参与，需整份维护）。
 
@@ -605,7 +605,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/knowledge/eval` | 离线检索评测（14 个问题，hit@1/3/5 与 MRR；不调用大模型） |
 | DELETE | `/api/knowledge/documents/{id}` | 删除知识片段；`group=1` 时连同同一拆分组的其余分片一起删除 |
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
-| POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 200 条；`dry_run=1` 只返回 `would_import` 不写库） |
+| POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 300 条；`dry_run=1` 只返回 `would_import` 不写库） |
 | POST | `/api/knowledge/import/preview` | 预览整个备份（一次最多 20000 条）：校验 / 去重后返回将导入 / 跳过的数量，不写库 |
 | GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程数 / 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
 | GET | `/api/weather` | 目的地天气（Open-Meteo，无 API Key；实时 + 未来 3 天，成功结果 10 分钟进程内缓存、失败结果 60 秒；上游故障时 1 小时内沿用最近成功数据并标记 `stale`；按客户端 IP 限流，默认 30 次 / 分钟） |

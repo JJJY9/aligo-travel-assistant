@@ -125,6 +125,47 @@ def test_delete_error(monkeypatch):
     print("✓ kb-delete 删除失败返回 1")
 
 
+def test_knowledge_dispatch_rejects_unicode_digits(monkeypatch):
+    """kb-delete / kb-duplicates 的 id / limit 必须是 ASCII 十进制整数。"""
+    import contextlib
+    import io
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_delete_standalone",
+        lambda doc_id, whole_group=False: calls.append((doc_id, whole_group)) or 0,
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_duplicates_standalone",
+        lambda limit=20: calls.append(("dup", limit)) or 0,
+    )
+    for argv in (
+        ["cli.py", "kb-delete", "²"],
+        ["cli.py", "kb-delete", "1" * 5000],
+        ["cli.py", "kb-delete"],
+        ["cli.py", "kb-duplicates", "²"],
+        ["cli.py", "kb-duplicates", "1", "2"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "用法：" in out.getvalue(), argv
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-delete", "7", "--group"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0 and calls[-1] == (7, True)
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-duplicates", "0"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0 and calls[-1] == ("dup", 0)
+    print("✓ kb-delete / kb-duplicates 拒绝 Unicode 数字与超长参数")
+
+
 def test_duplicates_reports_groups(monkeypatch):
     monkeypatch.setattr(
         knowledge_admin,
@@ -171,6 +212,7 @@ if __name__ == "__main__":
         test_delete_success,
         test_delete_not_found,
         test_delete_error,
+        test_knowledge_dispatch_rejects_unicode_digits,
         test_duplicates_reports_groups,
         test_duplicates_none_and_error,
     ):

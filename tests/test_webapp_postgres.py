@@ -306,5 +306,37 @@ def test_advisory_lock_reentrant_reacquire_after_reconnect():
         store.close()
 
 
+def test_update_trip_dedupe_normalizes_single_day_end_date():
+    """update_trip 的重复检查与 save_trip_history 同口径（缺返程按出发日）。"""
+    user_id = f"pgtrip-{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        first = store.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-02",
+                "end_date": "2026-12-02",
+                "purpose": "出差",
+            }
+        )
+        second = store.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-02",
+                "purpose": "出差",
+            }
+        )
+        # 无返程日期的行程改成与第一条同路线同日期：应视为重复（与保存同口径）
+        with pytest.raises(ValueError, match="已存在相同行程"):
+            store.update_trip(second, {"destination": "上海"})
+        assert store.update_trip(first, {"purpose": "会议"}) is True
+        print("✓ update_trip 单日行程去重口径与保存一致")
+    finally:
+        store.delete_all()
+        store.close()
+
+
 if __name__ == "__main__":
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")

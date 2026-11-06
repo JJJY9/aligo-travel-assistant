@@ -2046,10 +2046,14 @@ async function sendMessage(text, options = {}) {
     els.health.className = terminal === "error" ? "health err" : "health ok";
   } catch (error) {
     if (error.name === "AbortError") {
-      mutate(() => {
-        assistant.trace.fail("已停止");
-        assistant.fail("已停止生成。");
-      });
+      // 服务端已发过 done / error 后再中止（停止按钮晚点、切换会话）：
+      // 保留已完成的回答，不能改成「已停止」
+      if (!terminal) {
+        mutate(() => {
+          assistant.trace.fail("已停止");
+          assistant.fail("已停止生成。");
+        });
+      }
     } else if (!terminal) {
       mutate(() => {
         assistant.trace.fail(error.message || "请求失败");
@@ -3595,7 +3599,9 @@ async function startEditKnowledge(doc) {
   state.kbEditingGroupParts = groupParts;
   // 保留完整 metadata：PUT 会整体覆盖，只回填分类会丢掉 title / source 等字段
   state.kbEditingMetadata = { ...(doc.metadata || {}) };
-  els.kbContent.maxLength = groupParts > 1 ? 20500 : 2000;
+  // 与后端 JOINED_MAX_CHARS（文档 20000 字 + 分片分隔符余量 100）对齐，
+  // 超出的内容会被 PUT 以 422 拒绝
+  els.kbContent.maxLength = groupParts > 1 ? 20100 : 2000;
   els.kbContent.placeholder =
     groupParts > 1
       ? `正在编辑整份文档（${groupParts} 片），保存后整组替换`
@@ -3746,9 +3752,29 @@ async function importKnowledgeFile() {
     if (!window.confirm(confirmText)) return;
 
     els.kbImport.textContent = "导入中…";
-    // 接口单次最多 200 条；导出文件可能更大，按批上传保证备份可完整恢复
-    for (let start = 0; start < documents.length; start += 200) {
-      const batch = documents.slice(start, start + 200);
+    // 接口单次最多 200 条（成组时最多放宽到 300）；导出文件可能更大，按批
+    // 上传保证备份可完整恢复。多分片文档的 group 必须整组落在同一批——
+    // 服务端按请求重组，拆到两批会把一篇文档拆成几段分别导入（内容截断）
+    const batches = [];
+    let batch = [];
+    let batchGroups = new Set();
+    for (const doc of documents) {
+      const group =
+        doc && doc.metadata && doc.metadata.group
+          ? String(doc.metadata.group)
+          : "";
+      if (batch.length >= 200 && !batchGroups.has(group)) {
+        batches.push(batch);
+        batch = [];
+        batchGroups = new Set();
+      }
+      batch.push(doc);
+      if (group) batchGroups.add(group);
+    }
+    if (batch.length) batches.push(batch);
+
+    let done = 0;
+    for (const batch of batches) {
       const result = await getJSON("/api/knowledge/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3756,10 +3782,8 @@ async function importKnowledgeFile() {
       });
       imported += result.imported || 0;
       skipped += result.skipped || 0;
-      els.kbImport.textContent = `导入中… ${Math.min(
-        start + batch.length,
-        documents.length,
-      )}/${documents.length}`;
+      done += batch.length;
+      els.kbImport.textContent = `导入中… ${done}/${documents.length}`;
     }
     toast(`已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}`);
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
