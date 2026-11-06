@@ -416,11 +416,16 @@ def _regroup_exported_documents(
             merged.append(key)
             continue
         pieces = sorted(grouped.get(key, []), key=lambda pair: pair[0])
+        declared = 0
         contents: list[str] = []
         base_meta: dict[str, Any] = {}
         for index, (_, piece) in enumerate(pieces):
             metadata = piece.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
+            try:
+                declared = max(declared, int(metadata.get("parts") or 0))
+            except (TypeError, ValueError):
+                pass
             content = piece.get("content")
             if isinstance(content, str):
                 contents.append(content)
@@ -432,6 +437,13 @@ def _regroup_exported_documents(
                 }
         if not contents:
             continue
+        if declared > 1 and len(pieces) < declared:
+            # 分片不全的组不能按残片重组（会把一篇文档拆成几段分别导入），
+            # 直接报错让调用方把整组放在同一批 / 同一文件里
+            raise ValueError(
+                f"备份中的多分片文档不完整（group={key}，收到 {len(pieces)}/{declared} 片）："
+                "请整组一起导入"
+            )
         stripped_contents = [content.strip() for content in contents]
         if all(stripped in existing for stripped in stripped_contents):
             # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分

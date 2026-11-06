@@ -3752,24 +3752,45 @@ async function importKnowledgeFile() {
     if (!window.confirm(confirmText)) return;
 
     els.kbImport.textContent = "导入中…";
-    // 接口单次最多 200 条（成组时最多放宽到 300）；导出文件可能更大，按批
-    // 上传保证备份可完整恢复。多分片文档的 group 必须整组落在同一批——
-    // 服务端按请求重组，拆到两批会把一篇文档拆成几段分别导入（内容截断）
-    const batches = [];
-    let batch = [];
-    let batchGroups = new Set();
+    // 服务端按请求重组多分片文档：同组的全部片段必须落在同一个请求里，
+    // 否则一篇文档会被拆成几段分别导入（内容截断）。同组片段在导出中
+    // 不一定相邻（整份编辑后首片保留原 id、其余分片是新 id），因此先按
+    // group 聚合为不可拆分的单元，再把单元打包进每批，单批不超过 20000 条
+    const MAX_BATCH = 20000;
+    const units = [];
+    const groupUnits = new Map();
     for (const doc of documents) {
       const group =
         doc && doc.metadata && doc.metadata.group
           ? String(doc.metadata.group)
           : "";
-      if (batch.length >= 200 && !batchGroups.has(group)) {
+      if (!group) {
+        units.push([doc]);
+        continue;
+      }
+      let unit = groupUnits.get(group);
+      if (!unit) {
+        unit = [];
+        groupUnits.set(group, unit);
+        units.push(unit);
+      }
+      unit.push(doc);
+    }
+    const batches = [];
+    let batch = [];
+    for (const unit of units) {
+      if (unit.length > MAX_BATCH) {
+        toast(`存在超过 ${MAX_BATCH} 片的文档组，无法导入；请先拆分该文档`);
+        return;
+      }
+      if (
+        batch.length &&
+        (batch.length >= 200 || batch.length + unit.length > MAX_BATCH)
+      ) {
         batches.push(batch);
         batch = [];
-        batchGroups = new Set();
       }
-      batch.push(doc);
-      if (group) batchGroups.add(group);
+      batch.push(...unit);
     }
     if (batch.length) batches.push(batch);
 
