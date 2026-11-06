@@ -1052,6 +1052,14 @@ async function addTrip(event) {
     end_date: els.tripEnd.value || null,
     purpose: els.tripPurpose.value.trim() || "出差",
   };
+  const submitted = {
+    editingId,
+    origin: payload.origin,
+    destination,
+    startDate,
+    endDate: els.tripEnd.value || "",
+    purpose: els.tripPurpose.value.trim(),
+  };
   els.tripSubmit.disabled = true;
   try {
     let message = "行程已更新";
@@ -1073,8 +1081,19 @@ async function addTrip(event) {
       message += conflictNote(result.conflicts);
     }
     toast(message);
-    els.tripForm.hidden = true;
-    resetTripForm();
+    // 请求期间用户可能已开始编辑另一条行程 / 录入下一条：不能把正在
+    // 填写的表单关掉并清空
+    const unchanged =
+      state.tripEditingId === submitted.editingId &&
+      els.tripDestination.value.trim() === submitted.destination &&
+      els.tripOrigin.value.trim() === submitted.origin &&
+      els.tripStart.value === submitted.startDate &&
+      (els.tripEnd.value || "") === submitted.endDate &&
+      els.tripPurpose.value.trim() === submitted.purpose;
+    if (unchanged) {
+      els.tripForm.hidden = true;
+      resetTripForm();
+    }
     await refreshStatus();
   } catch (error) {
     toast(error.message);
@@ -1584,6 +1603,15 @@ function renderHistory() {
           action: focused.dataset.action || "",
         }
       : null;
+  // 有正在重命名的输入框时记录 id 与已输入内容，重建列表后恢复：
+  // 置顶 / 归档 / 删除 / 加载更多等操作触发的刷新不能吞掉正在输入的标题
+  const renameInput = els.history.querySelector(".hi-input");
+  const renameSnapshot = renameInput
+    ? {
+        id: renameInput.closest(".history-item")?.dataset.id || "",
+        value: renameInput.value,
+      }
+    : null;
   els.history.innerHTML = "";
 
   const appendArchivedHint = () => {
@@ -1650,6 +1678,19 @@ function renderHistory() {
   }
   appendArchivedHint();
   restoreHistoryFocus(focusInfo);
+  restoreRenameSnapshot(renameSnapshot);
+}
+
+function restoreRenameSnapshot(snapshot) {
+  if (!snapshot || !snapshot.id) return;
+  const item = els.history.querySelector(
+    `.history-item[data-id="${CSS.escape(snapshot.id)}"]`,
+  );
+  const session = state.sessions.find(
+    (entry) => entry.session_id === snapshot.id,
+  );
+  if (!item || !session) return;
+  startRenameSession(item, session, snapshot.value);
 }
 
 function restoreHistoryFocus(info) {
@@ -1870,9 +1911,10 @@ async function openSession(sessionId, options = {}) {
   } catch (error) {
     if (!options.silent) {
       toast(`加载会话失败：${error.message}`);
-    } else if (token === sessionLoadToken) {
+    } else if (!options.keepOnError && token === sessionLoadToken) {
       // 启动恢复失败（服务重启 / 网络抖动）：丢弃旧会话 ID，避免下一条消息
-      // 被写进界面从未展示过的隐藏会话
+      // 被写进界面从未展示过的隐藏会话。后台静默刷新（停止生成后的同步）
+      // 传 keepOnError，临时失败不能把已知存在的会话从界面上清掉
       state.sessionId = null;
       sessionStorage.removeItem("aligo.sessionId");
       syncSessionControls();
@@ -1887,7 +1929,7 @@ async function openSession(sessionId, options = {}) {
   }
 }
 
-function startRenameSession(item, session) {
+function startRenameSession(item, session, initialValue) {
   if (item.querySelector(".hi-input")) return;
   const titleEl = item.querySelector(".hi-title");
   if (!titleEl) return;
@@ -1895,10 +1937,15 @@ function startRenameSession(item, session) {
   const input = document.createElement("input");
   input.className = "hi-input";
   input.maxLength = 60;
-  input.value = session.title || "";
+  input.value =
+    initialValue === undefined ? session.title || "" : initialValue;
   titleEl.replaceWith(input);
   input.focus();
-  input.select();
+  if (initialValue === undefined) {
+    input.select();
+  } else {
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
   let settled = false;
 
   const cancel = () => {
@@ -1918,6 +1965,9 @@ function startRenameSession(item, session) {
         body: JSON.stringify({ user_id: state.userId, title: value }),
       });
       toast(value ? "会话已重命名" : "已恢复自动标题");
+      // 先移除输入框再刷新：否则 renderHistory 会把「正在重命名」的
+      // 快照恢复出来，已保存的输入框重新出现
+      if (input.isConnected) input.remove();
       await loadSessions();
       if (state.sessionId === session.session_id) {
         const updated = state.sessions.find((s) => s.session_id === session.session_id);
@@ -2032,7 +2082,14 @@ async function sendMessage(text, options = {}) {
       signal: state.controller.signal,
     });
     if (!response.ok) {
-      throw new Error(await errorMessage(response));
+      const detail = await errorMessage(response);
+      if (response.status === 404) {
+        // 删除发生在流建立之前：错误事件分支不会触发，这里同样要切回
+        // 新对话状态，否则之后每条消息都会 404，界面还停留在已删除会话上
+        resetDeletedSessionState();
+        toast("会话已被删除，下一条消息将开始新对话");
+      }
+      throw new Error(detail);
     }
     await readEventStream(response.body, (event) => {
       // 已收到 done / error 后忽略后续事件：连接错误不能覆盖已完成的回答
@@ -2116,6 +2173,13 @@ async function readEventStream(body, onEvent) {
   }
 }
 
+function resetDeletedSessionState() {
+  state.sessionId = null;
+  sessionStorage.removeItem("aligo.sessionId");
+  syncSessionControls();
+  setConversationTitle("新对话");
+}
+
 function handleStreamEvent(assistant, event) {
   switch (event.type) {
     case "phase":
@@ -2168,10 +2232,7 @@ function handleStreamEvent(assistant, event) {
       // 会话在其它标签页 / CLI 被删除后，继续用旧 id 发送只会反复失败，
       // 墓碑过期后还会复活该会话；这里直接切回新对话状态
       if (message.includes("会话已删除")) {
-        state.sessionId = null;
-        sessionStorage.removeItem("aligo.sessionId");
-        syncSessionControls();
-        setConversationTitle("新对话");
+        resetDeletedSessionState();
         toast("会话已被删除，下一条消息将开始新对话");
       }
       mutate(() => {
@@ -2884,7 +2945,10 @@ async function addPreference(event) {
       }),
     });
     toast("偏好已保存");
-    resetPreferenceForm();
+    // 请求期间用户可能已在填写下一条偏好：输入已变化时不重置表单
+    if (els.prefType.value === type && els.prefValue.value.trim() === text) {
+      resetPreferenceForm();
+    }
     await refreshStatus();
   } catch (error) {
     toast(error.message);
@@ -3204,6 +3268,8 @@ async function refreshKnowledgeDocuments() {
   els.kbList.textContent = "加载中…";
   state.kbItems = [];
   state.kbTotal = 0;
+  // 刷新期间隐藏「加载更多」：否则点击会以 offset=0 请求第一页
+  updateKnowledgeMore();
   refreshKnowledgeCategories();
   try {
     const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
@@ -3219,7 +3285,8 @@ async function refreshKnowledgeDocuments() {
 
 async function loadMoreKnowledgeDocuments() {
   if (!els.kbList || state.kbSemanticMode) return;
-  const seq = kbListSeq;
+  // 自增序号：翻页与刷新互相作废对方响应，避免第一页被追加两次
+  const seq = ++kbListSeq;
   els.kbMore.disabled = true;
   try {
     const data = await getJSON(
@@ -4069,7 +4136,24 @@ function bindEvents() {
   });
 
   els.stopBtn.addEventListener("click", () => {
-    if (state.controller) state.controller.abort();
+    if (!state.controller) return;
+    const sessionId = state.sessionId;
+    const token = sessionLoadToken;
+    state.controller.abort();
+    // 服务端可能在 done 帧到达前就已把回答写入历史：中止只中断读取，
+    // 无法撤销写入。稍后重拉当前会话，若回答已落库就同步到界面，避免
+    // 出现「界面已停止、服务端却已保存」的不一致
+    if (sessionId) {
+      setTimeout(() => {
+        if (
+          sessionId === state.sessionId &&
+          !state.busy &&
+          token === sessionLoadToken
+        ) {
+          openSession(sessionId, { silent: true, keepOnError: true });
+        }
+      }, 600);
+    }
   });
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);
