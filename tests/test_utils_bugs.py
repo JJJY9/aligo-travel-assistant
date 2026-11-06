@@ -209,6 +209,24 @@ def test_robust_json_parse_fallback_after_braces():
     )
 
 
+def test_delete_all_does_not_resurrect_data():
+    """delete_all 之后同一实例的写入不能把已删除的数据写回。"""
+    d = tempfile.mkdtemp(prefix="chailv_delete_")
+    user = f"delete-all-{uuid.uuid4().hex[:8]}"
+    memory = LongTermMemory(user, d)
+    memory.save_preference("home_location", "北京")
+    memory.add_chat_message("user", "hi", "s1")
+    memory.delete_all()
+    assert memory.get_preference() == {}
+    assert memory.get_chat_history() == []
+
+    memory.save_preference("hotel_brands", ["汉庭"])
+    fresh = LongTermMemory(user, d)
+    assert fresh.get_preference() == {"hotel_brands": ["汉庭"]}
+    assert fresh.get_chat_history() == []
+    print("✓ delete_all 后数据不会被后续写入复活")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_json_parse_fallback()
@@ -224,4 +242,5 @@ if __name__ == "__main__":
     test_extract_first_json_object_empty_text()
     test_increment_query_count_fresh_data()
     test_increment_query_count_legacy_data()
+    test_delete_all_does_not_resurrect_data()
     print("\n全部通过")

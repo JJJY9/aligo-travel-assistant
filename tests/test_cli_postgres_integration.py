@@ -101,10 +101,63 @@ def test_cli_commands_with_postgres(monkeypatch):
         storage.reset_failure_cache()
 
 
+def test_postgres_trip_dedupe_empty_end_date():
+    """end_date 为空串与 NULL 同为「无返程」：重复保存更新而不是新增。"""
+    memory = PostgresLongTermMemory(
+        f"trips-empty-{uuid.uuid4().hex[:8]}", TEST_POSTGRES_DSN
+    )
+    try:
+        first = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "",
+                "purpose": "出差",
+            }
+        )
+        second = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "",
+                "purpose": "会议",
+            }
+        )
+        assert second == first, "空串返程应同样按出发日归一后去重"
+        trips = memory.get_trip_history(limit=None)
+        assert len(trips) == 1 and trips[0]["purpose"] == "会议"
+
+        other = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-06",
+                "purpose": "出差",
+            }
+        )
+        with pytest.raises(ValueError, match="已存在相同行程"):
+            memory.update_trip(
+                other,
+                {
+                    "destination": "上海",
+                    "start_date": "2026-12-01",
+                    "end_date": "",
+                },
+            )
+        print("✓ PostgreSQL 空串返程按出发日归一（保存去重 / 更新冲突）")
+    finally:
+        memory.delete_all()
+        memory.close()
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_cli_commands_with_postgres(mp)
     finally:
         mp.undo()
+    test_postgres_trip_dedupe_empty_end_date()
     print("\n全部通过")

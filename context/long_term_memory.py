@@ -118,33 +118,46 @@ class LongTermMemory:
                         return data
                 except Exception as e:
                     logger.error(f"Failed to load long-term memory: {e}")
-                    # 复核时持锁：错误与加锁之间其它线程可能已写入新的有效文件，
-                    # 不能把刚写入的数据当成损坏文件移走
+                    # 复核与备份都必须持有跨进程文件锁：其它进程的写操作在
+                    # 同一把锁内用原子替换提交，不持锁的 os.replace 可能把
+                    # 对方刚写入的有效文件当作损坏文件移走
                     try:
-                        with open(self.db_path, 'r', encoding='utf-8') as f:
-                            latest = json.load(f)
-                        # 与首次读取一致：合法 JSON 但不是对象 / 字段结构异常
-                        # 同样视为损坏，必须进入备份分支，不能让异常逃逸
-                        if not isinstance(latest, dict):
-                            raise ValueError("记忆文件内容不是 JSON 对象")
-                        latest = self._migrate_data(latest)
-                    except FileNotFoundError:
-                        return self._init_data()
-                    except Exception:
-                        # 备份名带微秒与进程号，同一秒内的多次损坏不会互相覆盖
-                        backup = (
-                            f"{self.db_path}.corrupt-"
-                            f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-                            f"-{os.getpid()}"
+                        with file_lock(self.db_path):
+                            try:
+                                with open(self.db_path, 'r', encoding='utf-8') as f:
+                                    latest = json.load(f)
+                                # 与首次读取一致：合法 JSON 但不是对象 /
+                                # 字段结构异常同样视为损坏，不能逃逸
+                                if not isinstance(latest, dict):
+                                    raise ValueError("记忆文件内容不是 JSON 对象")
+                                latest = self._migrate_data(latest)
+                            except FileNotFoundError:
+                                return self._init_data()
+                            except Exception:
+                                # 备份名带微秒与进程号，同一秒内多次损坏
+                                # 不会互相覆盖
+                                backup = (
+                                    f"{self.db_path}.corrupt-"
+                                    f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                                    f"-{os.getpid()}"
+                                )
+                                try:
+                                    os.replace(self.db_path, backup)
+                                    logger.warning("损坏的记忆文件已备份到 %s", backup)
+                                except OSError as backup_error:
+                                    logger.error(
+                                        "备份损坏的记忆文件失败: %s", backup_error
+                                    )
+                                return self._init_data()
+                            logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
+                            return latest
+                    except TimeoutError as lock_error:
+                        # 等锁超时：不能把可能有效的数据当损坏文件移走，
+                        # 以空快照启动（写操作前会重载磁盘最新内容）
+                        logger.error(
+                            "加载损坏记忆文件时等待文件锁超时: %s", lock_error
                         )
-                        try:
-                            os.replace(self.db_path, backup)
-                            logger.warning("损坏的记忆文件已备份到 %s", backup)
-                        except OSError as backup_error:
-                            logger.error("备份损坏的记忆文件失败: %s", backup_error)
                         return self._init_data()
-                    logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
-                    return latest
             else:
                 logger.info("No existing long-term memory, creating new")
                 return self._init_data()
@@ -814,7 +827,16 @@ class LongTermMemory:
 
     @_locked_mutation
     def delete_all(self):
-        """删除所有数据（包括文件）"""
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-            logger.warning(f"Deleted long-term memory file: {self.db_path}")
+        """删除所有数据（包括文件）。
+
+        删除后必须重置内存快照：``_reload_latest`` 把「文件不存在」当作
+        无需更新，不清空快照的话，同一实例的下一次写入会把已删除的数据
+        整份写回。
+        """
+        with self._write_lock:
+            try:
+                os.remove(self.db_path)
+                logger.warning(f"Deleted long-term memory file: {self.db_path}")
+            except FileNotFoundError:
+                pass
+            self.data = self._init_data()
