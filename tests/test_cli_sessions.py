@@ -402,6 +402,109 @@ def test_session_title_dispatch(monkeypatch):
     print("✓ session-title dispatch 参数")
 
 
+class _PinStore(_FakeStore):
+    """支持 set_session_pinned 的假存储（session-pin 用例）。"""
+
+    def __init__(self, messages, pinned=None, fail_set=False):
+        super().__init__(messages, pinned=pinned)
+        self.fail_set = fail_set
+        self.pin_calls = []
+
+    def set_session_pinned(self, session_id, pinned):
+        if self.fail_set:
+            raise RuntimeError("disk full")
+        self.pin_calls.append((session_id, pinned))
+        if pinned and session_id not in self.pinned:
+            self.pinned.append(session_id)
+        elif not pinned and session_id in self.pinned:
+            self.pinned.remove(session_id)
+        return True
+
+
+def test_session_pin_set_and_unset(monkeypatch):
+    import json as _json
+
+    store = _PinStore([_message("user", "内容", "s-active")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_pin_standalone("u1", "s-active")
+    assert code == 0 and "已置顶会话 s-active" in out.getvalue()
+    assert store.pin_calls == [("s-active", True)] and store.closed
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_pin_standalone(
+            "u1", "s-active", pinned=False, as_json=True
+        )
+    data = _json.loads(out.getvalue())
+    assert code == 0 and data["pinned"] is False
+    assert store.pin_calls[-1] == ("s-active", False)
+    print("✓ session-pin 置顶 / 取消 / JSON")
+
+
+def test_session_pin_validation_and_failures(monkeypatch):
+    store = _PinStore([_message("user", "内容", "s-active")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_pin_standalone("u1", "s-missing")
+    assert code == 1 and "不存在" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_pin_standalone("bad id", "s1")
+    assert code == 1 and "用户 ID" in out.getvalue()
+
+    store.fail_set = True
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_pin_standalone("u1", "s-active", as_json=True)
+    data = json.loads(out.getvalue())
+    assert code == 1 and "操作失败" in data["error"]
+    print("✓ session-pin 校验与写入失败")
+
+
+def test_session_pin_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_session_pin_standalone",
+        lambda user_id, session_id, pinned=True, as_json=False: (
+            calls.append((user_id, session_id, pinned, as_json)) or 0
+        ),
+    )
+    for argv, expected in (
+        (["cli.py", "session-pin", "u1", "s1"], ("u1", "s1", True, False)),
+        (
+            ["cli.py", "session-pin", "u1", "s1", "--off", "--json"],
+            ("u1", "s1", False, True),
+        ),
+        (
+            ["cli.py", "session-pin", "u1", "s1", "--JSON"],
+            ("u1", "s1", True, True),
+        ),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert calls[-1] == expected, argv
+    for argv in (
+        ["cli.py", "session-pin"],
+        ["cli.py", "session-pin", "u1"],
+        ["cli.py", "session-pin", "u1", "s1", "extra"],
+        ["cli.py", "session-pin", "u1", "s1", "--bad"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "session-pin" in out.getvalue()
+    print("✓ session-pin dispatch 参数")
+
+
 def test_read_failure(monkeypatch):
     fake = _sessions_store()
     fake.fail_history = True
@@ -721,6 +824,9 @@ if __name__ == "__main__":
         test_session_title_set_and_reset,
         test_session_title_validation_and_failures,
         test_session_title_dispatch,
+        test_session_pin_set_and_unset,
+        test_session_pin_validation_and_failures,
+        test_session_pin_dispatch,
         test_session_export_to_file,
         test_session_export_to_stdout,
         test_session_export_missing_and_invalid,
