@@ -2130,20 +2130,44 @@ def run_knowledge_duplicates_standalone(
     return 0
 
 
-def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
-    """清理历史行程中的完全重复记录（用于 `python cli.py trips-dedupe <user_id> [--dry-run]`）。
+def run_trips_dedupe_standalone(
+    user_id: str, dry_run: bool = False, as_json: bool = False
+) -> int:
+    """清理历史行程中的完全重复记录
+    （`python cli.py trips-dedupe <user_id> [--dry-run] [--json]`）。
 
     同路线 + 同起止日期视为重复：保留最早一条，删除其余记录（统计同步更新）。
-    ``dry_run`` 仅列出将被删除的记录，不做修改。
+    ``dry_run`` 仅列出将被删除的记录，不做修改；``--json`` 输出结构化结果
+    （将删除 / 已删除条目与无法自动处理的 trip_id）。
 
     Returns:
         0 清理完成（含无重复 / dry-run）；1 参数 / 读取 / 删除失败
     """
     import re
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    def _fail(message: str, **extra: Any) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message, **extra},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
         return 1
+
+    def _emit(payload: dict[str, Any]) -> None:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": True, **payload}, ensure_ascii=False, indent=2
+                )
+            )
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
 
     from config import STORAGE_CONFIG
     from context.long_term_memory import LongTermMemory
@@ -2152,21 +2176,21 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
     try:
         store = create_long_term_memory(user_id, "data/memory")
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _fail(f"打开长期记忆失败：{exc}")
 
     try:
         # PostgreSQL 配置了但连接失败时，工厂会静默回退本地 JSON；维护命令
         # 必须确保清理的是目标后端，避免对过期本地数据“成功”而真实库未处理
         if STORAGE_CONFIG.get("postgres_dsn") and isinstance(store, LongTermMemory):
-            print("PostgreSQL 已配置但连接失败（已回退本地 JSON），未执行去重；请检查数据库后重试")
-            return 1
+            return _fail(
+                "PostgreSQL 已配置但连接失败（已回退本地 JSON），"
+                "未执行去重；请检查数据库后重试"
+            )
 
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取行程失败：{exc}")
-            return 1
+            return _fail(f"读取行程失败：{exc}")
 
         groups: dict[tuple[str, str, str, str], list[str]] = {}
         for trip in trips:
@@ -2180,9 +2204,31 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
                 str(trip.get("end_date") or start_date),
             )
             groups.setdefault(key, []).append(str(trip.get("trip_id") or ""))
+        by_id = {str(trip.get("trip_id") or ""): trip for trip in trips}
+
+        def _entry(trip_id: str) -> dict[str, Any]:
+            trip = by_id.get(trip_id, {})
+            return {
+                "trip_id": trip_id,
+                "origin": str(trip.get("origin") or ""),
+                "destination": str(trip.get("destination") or ""),
+                "start_date": str(trip.get("start_date") or ""),
+                "end_date": str(trip.get("end_date") or ""),
+            }
 
         if all(len(ids) <= 1 for ids in groups.values()):
-            print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
+            _emit(
+                {
+                    "user_id": user_id,
+                    "dry_run": dry_run,
+                    "total_trips": len(trips),
+                    "duplicates": [],
+                    "ambiguous_ids": [],
+                    "removed": 0,
+                }
+            )
+            if not as_json:
+                print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
             return 0
 
         # 同一 trip_id 出现在多条不同行程里时，delete_trip 可能删错行：
@@ -2192,7 +2238,7 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
             for trip_id in ids:
                 id_groups.setdefault(trip_id, set()).add(key)
         ambiguous = {trip_id for trip_id, keys in id_groups.items() if len(keys) > 1}
-        if ambiguous:
+        if ambiguous and not as_json:
             print(
                 "警告：以下 trip_id 同时属于多条不同行程，无法安全自动删除，"
                 "请人工处理：" + "、".join(sorted(ambiguous))
@@ -2210,8 +2256,7 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
                 for trip in store.get_trip_history(limit=None)
             }
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取行程失败：{exc}")
-            return 1
+            return _fail(f"读取行程失败：{exc}")
 
         duplicates = [
             trip_id
@@ -2221,10 +2266,22 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
         ]
 
         if dry_run:
+            _emit(
+                {
+                    "user_id": user_id,
+                    "dry_run": True,
+                    "total_trips": len(trips),
+                    "would_remove": len(duplicates),
+                    "duplicates": [_entry(trip_id) for trip_id in duplicates],
+                    "ambiguous_ids": sorted(ambiguous),
+                    "removed": 0,
+                }
+            )
+            if as_json:
+                return 0
             if not duplicates:
                 print(f"用户 {user_id}：没有需要删除的重复行程（共 {len(trips)} 条）")
                 return 0
-            by_id = {str(trip.get("trip_id") or ""): trip for trip in trips}
             print(
                 f"用户 {user_id}：发现 {len(duplicates)} 条重复行程（--dry-run，不删除）："
             )
@@ -2244,12 +2301,33 @@ def run_trips_dedupe_standalone(user_id: str, dry_run: bool = False) -> int:
             return 0
 
         removed = 0
+        failure: str | None = None
         try:
             for trip_id in duplicates:
                 if trip_id and store.delete_trip(trip_id):
                     removed += 1
         except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
-            print(f"删除过程中失败：{exc}（已删除 {removed} 条）")
+            failure = str(exc)
+        if as_json:
+            if failure is not None:
+                return _fail(
+                    f"删除过程中失败：{failure}（已删除 {removed} 条）",
+                    removed=removed,
+                    duplicates=[_entry(trip_id) for trip_id in duplicates],
+                )
+            _emit(
+                {
+                    "user_id": user_id,
+                    "dry_run": False,
+                    "total_trips": len(trips),
+                    "removed": removed,
+                    "duplicates": [_entry(trip_id) for trip_id in duplicates],
+                    "ambiguous_ids": sorted(ambiguous),
+                }
+            )
+            return 1 if ambiguous else 0
+        if failure is not None:
+            print(f"删除过程中失败：{failure}（已删除 {removed} 条）")
             return 1
         if duplicates:
             print(f"用户 {user_id}：删除 {removed} 条重复行程（保留最早记录）")
@@ -3241,15 +3319,30 @@ def main():
             )
         if arg == "trips-dedupe":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                print("用法：python cli.py trips-dedupe <user_id> [--dry-run]")
+                print(
+                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]"
+                )
                 sys.exit(2)
-            flags = [item.lower() for item in sys.argv[3:]]
-            if any(flag != "--dry-run" for flag in flags):
-                print("用法：python cli.py trips-dedupe <user_id> [--dry-run]")
+            dry_run = False
+            as_json = False
+            valid = True
+            for item in sys.argv[3:]:
+                lowered = item.lower()
+                if lowered == "--dry-run":
+                    dry_run = True
+                elif lowered == "--json":
+                    as_json = True
+                else:
+                    valid = False
+                    break
+            if not valid:
+                print(
+                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]"
+                )
                 sys.exit(2)
             sys.exit(
                 run_trips_dedupe_standalone(
-                    sys.argv[2], dry_run="--dry-run" in flags
+                    sys.argv[2], dry_run=dry_run, as_json=as_json
                 )
             )
         if arg == "sessions":
