@@ -27,6 +27,24 @@ def _main_exit(monkeypatch, argv):
     return exc.value.code, buf.getvalue()
 
 
+def test_commands_hint_matches_dispatch(monkeypatch):
+    """帮助里的命令清单与 main() 的分支必须一一对应（新增命令漏改一边会失配）。"""
+    import re
+
+    source = Path(__file__).resolve().parent.parent.joinpath("cli.py").read_text(
+        encoding="utf-8"
+    )
+    commands = [
+        item.strip() for item in cli._COMMANDS_HINT.split("：", 1)[1].split("/")
+    ]
+    branches = set(re.findall(r'arg == "([^"]+)"', source))
+    assert set(commands) == branches, (
+        f"提示缺少：{sorted(branches - set(commands))}；"
+        f"提示多余：{sorted(set(commands) - branches)}"
+    )
+    print("✓ 帮助命令清单与 dispatch 分支一一对应")
+
+
 def test_unknown_command_exits_2(monkeypatch):
     code, output = _main_exit(monkeypatch, ["cli.py", "frobnicate"])
     assert code == 2
@@ -155,6 +173,7 @@ def test_doctor_falls_back_without_rich(monkeypatch):
 if __name__ == "__main__":
     for case in (
         test_unknown_command_exits_2,
+        test_commands_hint_matches_dispatch,
         test_help_exits_0,
         test_kb_delete_rejects_extra_flags,
         test_kb_import_and_list_reject_extra_args,
