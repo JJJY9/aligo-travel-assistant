@@ -677,6 +677,122 @@ def test_trip_panel_accepts_long_fields_from_chat():
         _cleanup(user_id)
 
 
+def test_trip_update_validation_and_errors(monkeypatch):
+    """行程更新的校验与错误映射：400 / 422（多种）/ 404 / 409（冲突与歧义）/ 503。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def __init__(self, trips, update_error=None):
+            self.trips = trips
+            self.update_error = update_error
+
+        def get_trip_history(self, limit=None):
+            return list(self.trips)
+
+        def update_trip(self, trip_id, fields):
+            if self.update_error == "conflict":
+                raise ValueError("与已有行程冲突")
+            if self.update_error == "boom":
+                raise RuntimeError("disk full")
+            return True
+
+        def close(self):
+            pass
+
+    def _trip(destination="上海"):
+        return {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": destination,
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+
+    client = _client()
+    valid = _Store([_trip()])
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: valid)
+
+    response = client.put("/api/trips/trip_1", json={"user_id": "u-trip-v"})
+    assert response.status_code == 400
+    assert "没有需要更新的字段" in response.json()["detail"]
+
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "destination": ""}
+    )
+    assert response.status_code == 422
+
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "start_date": None}
+    )
+    assert response.status_code == 422
+    assert "出发日期不能为空" in response.json()["detail"]
+
+    # 格式不符合 YYYY-MM-DD 由模型校验挡下
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "start_date": "2026/12/01"}
+    )
+    assert response.status_code == 422
+
+    # 格式正确但日期不存在（2026-13-01）
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "start_date": "2026-13-01"}
+    )
+    assert response.status_code == 422
+    assert "YYYY-MM-DD" in response.json()["detail"]
+
+    # 结束日期早于出发日期
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "end_date": "2026-11-01"}
+    )
+    assert response.status_code == 422
+    assert "不能早于" in response.json()["detail"]
+
+    # 旧行程没有出发日期时不能单独设置返程
+    dateless = _Store([{"trip_id": "trip_1", "origin": "北京", "destination": "上海"}])
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: dateless)
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "end_date": "2026-12-05"}
+    )
+    assert response.status_code == 422
+    assert "先设置出发日期" in response.json()["detail"]
+
+    # 行程不存在
+    empty = _Store([])
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: empty)
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
+    )
+    assert response.status_code == 404
+
+    # trip_id 歧义（历史数据异常）
+    duplicate = _Store([_trip(), _trip("杭州")])
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: duplicate)
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
+    )
+    assert response.status_code == 409
+    assert "多条行程" in response.json()["detail"]
+
+    # update_trip 抛 ValueError → 409；其它异常 → 503
+    conflict = _Store([_trip()], update_error="conflict")
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: conflict)
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
+    )
+    assert response.status_code == 409
+    assert "冲突" in response.json()["detail"]
+
+    broken = _Store([_trip()], update_error="boom")
+    monkeypatch.setattr(server_module, "_open_long_term", lambda uid: broken)
+    response = client.put(
+        "/api/trips/trip_1", json={"user_id": "u-trip-v", "purpose": "会议"}
+    )
+    assert response.status_code == 503
+    assert "更新行程失败" in response.json()["detail"]
+    print("✓ 行程更新校验与错误映射（400/422/404/409/503）")
+
+
 def test_preference_panel_accepts_long_value():
     """面板偏好值上限应与对话写入路径一致，而不是 200 字。"""
     client = _client()
@@ -4558,6 +4674,11 @@ if __name__ == "__main__":
     test_session_pin()
     test_export_markdown()
     test_trip_calendar_export()
+    _mp_trip_update = pytest.MonkeyPatch()
+    try:
+        test_trip_update_validation_and_errors(_mp_trip_update)
+    finally:
+        _mp_trip_update.undo()
     test_next_trip_from_full_history()
     test_usage_by_day_local_date()
     test_invalid_user_id_rejected()
