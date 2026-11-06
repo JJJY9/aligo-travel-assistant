@@ -52,7 +52,14 @@ class EventCollectionAgent(AgentBase):
             try:
                 data = json.loads(content)
                 context = data.get("context", {})
-                user_query = context.get("rewritten_query", "") or str(data)
+                # 与其它技能一致：优先用户本轮原话，其次改写查询；都没有时
+                # 才退回整段上下文（含 recent_dialogue / previous_results，
+                # 直接当作事项描述会带进大量无关上下文）
+                user_query = (
+                    context.get("user_query")
+                    or context.get("rewritten_query", "")
+                    or str(data)
+                )
                 user_preferences = context.get("user_preferences", {})
             except json.JSONDecodeError:
                 user_query = content

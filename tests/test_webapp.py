@@ -743,6 +743,32 @@ def test_session_lru_closes_evicted_session():
     print("✓ LRU 淘汰时关闭会话（释放连接）")
 
 
+def test_session_cache_is_thread_safe():
+    """会话缓存会被线程池（drop_session）与事件循环（get_session）并发修改。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    errors: list[BaseException] = []
+
+    def worker(n: int) -> None:
+        try:
+            for index in range(300):
+                state.get_session(f"u{n}", f"s{n}-{index % 30}")
+                state.drop_session(f"u{n}", f"s{n}-{index % 30}")
+                state.get_session(f"u{9 - n}", f"shared-{index % 5}")
+        except BaseException as exc:  # noqa: BLE001 - 收集线程内异常
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors[:1]
+    assert len(state.sessions) <= state.max_sessions
+    state.close_all()
+    print("✓ 会话缓存并发安全")
+
+
 def test_streaming_releases_user_lock():
     """SSE 流结束后必须释放用户锁，否则同一用户后续请求全部卡死。"""
     import json as json_module
@@ -1290,6 +1316,27 @@ def test_trips_calendar_api():
         print("✓ /api/trips/calendar 导出全部行程")
     finally:
         _cleanup(user_id)
+
+
+def test_trip_calendar_storage_failure_maps_503(monkeypatch):
+    """行程日历导出的存储故障应映射 503（与 CSV / 会话导出一致）。"""
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def get_trip_history(self, limit=None):
+            raise RuntimeError("disk down")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _BrokenStore()
+    )
+    client = _client()
+    for path in ("/api/trips/calendar", "/api/trips/trip_1/calendar"):
+        response = client.get(path, params={"user_id": "u-ics"})
+        assert response.status_code == 503, path
+    print("✓ 行程日历导出存储失败 → 503")
 
 
 def test_create_trip_api():
@@ -2344,6 +2391,47 @@ def test_chat_rate_limit():
     finally:
         _cleanup(user_id)
         _cleanup(other_id)
+
+
+def test_rate_limit_race_rejects_over_limit():
+    """peek 与 check 之间额度被并发请求抢走时，按 check 的结果拒绝。"""
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    real = RateLimiter(limit=5, window_sec=60)
+
+    class _RaceLimiter:
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        @property
+        def limit(self):
+            return self._delegate.limit
+
+        def peek(self, key):
+            # 模拟 peek 时仍有额度
+            return None
+
+        def check(self, key):
+            # 模拟 check 时额度已被并发请求抢走
+            return 7.2
+
+        def status(self, key):
+            return self._delegate.status(key)
+
+    state.rate_limiter = _RaceLimiter(real)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_limit_race")
+    response = client.post(
+        "/api/chat",
+        json={"message": "你好", "user_id": user_id, "session_id": "s-race"},
+    )
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "8"
+    assert response.headers["x-ratelimit-limit"] == "5"
+    assert response.headers["x-ratelimit-remaining"] == "0"
+    print("✓ 限流 peek/check 竞态按 check 结果拒绝")
 
 
 def test_chat_rate_limit_rejected_request_does_not_consume_other_bucket():
@@ -4037,11 +4125,17 @@ if __name__ == "__main__":
     test_ics_escape_handles_lone_cr()
     test_build_trips_ics_multiple_events()
     test_trips_calendar_api()
+    _mp_ics = pytest.MonkeyPatch()
+    try:
+        test_trip_calendar_storage_failure_maps_503(_mp_ics)
+    finally:
+        _mp_ics.undo()
     test_trips_csv_export()
     test_session_markdown_export()
     test_export_filename_is_ascii()
     test_session_lru_eviction()
     test_session_lru_closes_evicted_session()
+    test_session_cache_is_thread_safe()
     test_streaming_releases_user_lock()
     test_delete_last_turn_clears_cached_short_term()
     test_session_cache_is_user_scoped()
@@ -4060,6 +4154,7 @@ if __name__ == "__main__":
     test_docs_csp_allows_cdn()
     test_unhandled_error_returns_500_with_headers()
     test_chat_rate_limit()
+    test_rate_limit_race_rejects_over_limit()
     test_rate_limit_headers()
     test_chat_rate_limit_ip_bucket()
     test_chat_rate_limit_rejected_request_does_not_consume_other_bucket()
