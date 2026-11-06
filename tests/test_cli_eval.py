@@ -158,7 +158,7 @@ def test_min_hit5_flag_changes_threshold(monkeypatch):
     print("✓ --min-hit5 调整达标阈值（文本 / JSON）")
 
 
-def test_parse_eval_args():
+def test_parse_eval_args(monkeypatch):
     assert cli._parse_eval_args([]) == (False, 0.8)
     assert cli._parse_eval_args(["--json"]) == (True, 0.8)
     assert cli._parse_eval_args(["--min-hit5", "0.5"]) == (False, 0.5)
