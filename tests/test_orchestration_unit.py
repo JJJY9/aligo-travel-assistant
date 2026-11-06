@@ -472,7 +472,181 @@ def test_memory_update_legacy_preferences_and_custom_backend():
         ],
     )
     assert same.long_term.get_preference("seat_preference") == ["靠窗"]
+
+    # 列表形式的 append 值要逐项展开，不能整体塞进列表
+    flat = _StubMemory()
+    flat.long_term = _CustomLongTerm()
+    flat.long_term.save_preference("airlines", ["东航"])
+    OrchestrationAgent(agent_registry={}, memory_manager=flat)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "airlines",
+                                "value": ["国航", "东航"],
+                                "action": "append",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert flat.long_term.get_preference("airlines") == ["东航", "国航"]
     print("✓ 旧格式偏好字典 / 无原子追加后端兜底")
+
+
+def test_failed_preference_result_not_persisted():
+    """status=error 的偏好结果不得落库（与行程分支同一防护）。"""
+    memory = _StubMemory()
+    OrchestrationAgent(agent_registry={}, memory_manager=memory)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "error",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "home_location",
+                                "value": "上海",
+                                "action": "replace",
+                            }
+                        ],
+                        "error": "partial failure",
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference() == {}
+    print("✓ 失败的偏好结果不落库")
+
+
+def test_trip_destination_list_saved_as_text():
+    """事项收集给出列表型目的地（多城市）时拼成文本落库，不能让整轮失败。"""
+    memory = _StubMemory()
+    OrchestrationAgent(agent_registry={}, memory_manager=memory)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "origin": "北京",
+                        "destination": ["上海", "杭州"],
+                        "start_date": "2026-11-09",
+                    },
+                },
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "沪杭行程", "daily_plans": []}},
+                },
+            },
+        ],
+    )
+    trips = memory.long_term.get_trip_history(limit=5)
+    assert trips[-1]["destination"] == "上海、杭州"
+    assert trips[-1]["origin"] == "北京"
+    print("✓ 列表型目的地拼成文本落库")
+
+
+def test_transient_error_json_triggers_retry(monkeypatch):
+    """技能把瞬时错误吞成 error JSON 时，仍然触发一次退避重试。"""
+    from agents import orchestration_agent as module
+
+    monkeypatch.setattr(module, "_AGENT_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr(module, "_AGENT_RETRY_MAX_DELAY", 0.02)
+
+    class _FlakyAgent:
+        name = "flaky"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def reply(self, message):
+            self.calls += 1
+            if self.calls == 1:
+                return Msg(
+                    name="flaky",
+                    content=json.dumps(
+                        {"error": "HTTP 503 service unavailable"},
+                        ensure_ascii=False,
+                    ),
+                    role="assistant",
+                )
+            return Msg(
+                name="flaky",
+                content=json.dumps(
+                    {"answer": "ok"},
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    flaky = _FlakyAgent()
+    orchestrator = OrchestrationAgent(agent_registry={"flaky": flaky})
+    result = asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "flaky", "priority": 1}]))
+    )
+    assert flaky.calls == 2, "瞬时 error JSON 应触发重试"
+    assert '"success"' in result.content
+    print("✓ 瞬时 error JSON 触发逐智能体重试")
+
+
+def test_memory_io_runs_off_event_loop():
+    """编排器的记忆读写不能在事件循环线程上执行（会卡住所有 SSE）。"""
+    import threading
+
+    threads: dict[str, int] = {}
+    memory = _StubMemory()
+    inner = memory.long_term
+
+    class _RecordingLongTerm:
+        def get_preference(self, pref_type=None):
+            threads["read"] = threading.get_ident()
+            return inner.get_preference(pref_type)
+
+        def save_preference(self, pref_type, value):
+            threads["write"] = threading.get_ident()
+            return inner.save_preference(pref_type, value)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    memory.long_term = _RecordingLongTerm()
+    agent = _StubAgent(
+        "preference",
+        {
+            "preferences": [
+                {"type": "home_location", "value": "上海", "action": "replace"}
+            ]
+        },
+    )
+    orchestrator = OrchestrationAgent(
+        agent_registry={"preference": agent}, memory_manager=memory
+    )
+    loop_thread = threading.get_ident()
+    asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "preference", "priority": 1}]))
+    )
+    assert threads["read"] != loop_thread, "记忆读取应在工作线程"
+    assert threads["write"] != loop_thread, "记忆写入应在工作线程"
+    print("✓ 编排器记忆读写离开事件循环线程")
 
 
 def test_prepare_context_includes_user_query():
@@ -866,6 +1040,14 @@ if __name__ == "__main__":
     test_skill_folder_names_are_canonicalized()
     test_memory_update_preference_and_trip()
     test_memory_update_legacy_preferences_and_custom_backend()
+    test_failed_preference_result_not_persisted()
+    test_trip_destination_list_saved_as_text()
+    _mp_retry = pytest.MonkeyPatch()
+    try:
+        test_transient_error_json_triggers_retry(_mp_retry)
+    finally:
+        _mp_retry.undo()
+    test_memory_io_runs_off_event_loop()
     test_prepare_context_includes_user_query()
     test_planning_runs_after_collection_and_sees_new_preferences()
     test_preference_append_action_variants()

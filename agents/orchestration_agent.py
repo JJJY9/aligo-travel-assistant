@@ -38,6 +38,57 @@ _AGENT_RETRY_MAX_DELAY = 5.0
 # 行程规划依赖事项收集与偏好抽取的结果：两者同批时规划拿不到这些上下文
 _PLANNING_DEPENDENCIES = {"event_collection", "preference"}
 
+# 技能智能体通常把 LLM / 网络异常吞成 {"error": ...} 返回，外层重试等不到
+# 异常；识别这些瞬时错误标记并重新抛出，走与真实异常相同的退避重试
+_TRANSIENT_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "deadline exceeded",
+    "connection",
+    "rate limit",
+    "too many requests",
+    "unavailable",
+    "overloaded",
+    "429",
+    "502",
+    "503",
+    "504",
+    "超时",
+    "连接",
+    "限流",
+    "暂时不可用",
+)
+
+
+def _as_text(value: Any) -> str:
+    """把模型输出（可能为列表 / 数字 / None）转为可持久化的单行文本。"""
+    if isinstance(value, (list, tuple)):
+        return "、".join(
+            text for text in (str(item).strip() for item in value) if text
+        )
+    return str(value or "").strip()
+
+
+def _transient_agent_error(response: Any) -> str | None:
+    """技能返回的 error JSON 若像瞬时故障，返回错误文本以触发重试。"""
+    content = getattr(response, "content", None)
+    if not isinstance(content, str):
+        return None
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if not error:
+        return None
+    text = str(error)
+    lowered = text.lower()
+    if any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS):
+        return text
+    return None
+
 # 注册器同时接受技能目录名与旧智能体名（plan-trip / event-collection 等）；
 # 下游的聚合、记忆写入与前端展示统一使用旧名称
 _SKILL_AGENT_NAMES = {
@@ -194,8 +245,9 @@ class OrchestrationAgent(AgentBase):
 
         logger.info(f"Orchestrating {len(sorted_schedule)} agents")
 
-        # 准备上下文信息
-        context = self._prepare_context(intention_data)
+        # 准备上下文信息（短期 / 长期记忆读取是阻塞 IO，放到线程池，
+        # 避免配置 Redis / PostgreSQL 时卡住共享事件循环）
+        context = await asyncio.to_thread(self._prepare_context, intention_data)
 
         # 并行执行智能体（按优先级分组）
         results: list[dict[str, Any]] = []
@@ -234,9 +286,9 @@ class OrchestrationAgent(AgentBase):
         # 聚合结果
         final_result = self._aggregate_results(results, intention_data)
 
-        # 更新记忆
+        # 更新记忆（长期 / 短期写入是阻塞 IO，放到线程池）
         if self.memory_manager:
-            self._update_memory(intention_data, results)
+            await asyncio.to_thread(self._update_memory, intention_data, results)
 
         return Msg(
             name=self.name,
@@ -521,9 +573,19 @@ class OrchestrationAgent(AgentBase):
                 agent = await asyncio.get_running_loop().run_in_executor(
                     None, self.agent_registry.__getitem__, agent_name
                 )
-                # 调用智能体：瞬时 LLM / 网络错误重试一次
+
+                async def _reply_once() -> Any:
+                    # 调用智能体：瞬时 LLM / 网络错误重试一次。技能智能体
+                    # 会把异常吞成 error JSON 返回，这里识别瞬时标记后重新
+                    # 抛出（ConnectionError 属可重试类型），让退避重试生效
+                    response = await agent.reply(input_msg)
+                    error_text = _transient_agent_error(response)
+                    if error_text is not None:
+                        raise ConnectionError(f"瞬时错误：{error_text}")
+                    return response
+
                 return await retry_with_backoff(
-                    lambda: agent.reply(input_msg),
+                    _reply_once,
                     max_retries=_AGENT_RETRY_MAX,
                     base_delay_sec=_AGENT_RETRY_BASE_DELAY,
                     max_delay_sec=_AGENT_RETRY_MAX_DELAY,
@@ -646,6 +708,11 @@ class OrchestrationAgent(AgentBase):
 
             # 如果是偏好智能体，保存偏好信息到长期记忆
             if agent_name == "preference" and isinstance(data, dict):
+                # 抽取失败（status=error）的结果不能落库：界面与聚合已把它
+                # 标为失败，携带的 preferences 可能是残缺 / 错误的（与下方
+                # 行程分支同一防护）
+                if result["result"].get("status") != "success":
+                    continue
                 preferences_data = data.get("preferences", {})
 
                 # 新格式：preferences 是列表，包含 {type, value, action}
@@ -676,26 +743,21 @@ class OrchestrationAgent(AgentBase):
                                     f"Appended to {pref_type}: {pref_value}, total: {merged}"
                                 )
                                 continue
-                            # 旧实现 / 自定义后端没有原子追加时的兜底
+                            # 旧实现 / 自定义后端没有原子追加时的兜底：与
+                            # 持久化 / 上下文路径一致，用 merge_preference_value
+                            # 逐项合并（列表值整体 append 会形成嵌套列表）
                             current_prefs = self.memory_manager.long_term.get_preference()
                             existing_value = current_prefs.get(pref_type)
-
-                            # 如果现有值是列表，追加
-                            if isinstance(existing_value, list):
-                                if pref_value not in existing_value:
-                                    existing_value.append(pref_value)
-                                self.memory_manager.long_term.save_preference(pref_type, existing_value)
-                                logger.info(f"Appended to {pref_type}: {pref_value}, total: {existing_value}")
-                            else:
-                                # 如果现有值不是列表，创建新列表（同值不重复）
-                                if existing_value == pref_value:
-                                    new_list = [pref_value]
-                                elif existing_value:
-                                    new_list = [existing_value, pref_value]
-                                else:
-                                    new_list = [pref_value]
-                                self.memory_manager.long_term.save_preference(pref_type, new_list)
-                                logger.info(f"Created list for {pref_type}: {new_list}")
+                            merged_value = merge_preference_value(
+                                existing_value, pref_value
+                            )
+                            self.memory_manager.long_term.save_preference(
+                                pref_type, merged_value
+                            )
+                            logger.info(
+                                f"Appended to {pref_type}: {pref_value}, "
+                                f"total: {merged_value}"
+                            )
                         else:
                             # 覆盖模式：直接保存新值
                             self.memory_manager.long_term.save_preference(pref_type, pref_value)
@@ -728,12 +790,14 @@ class OrchestrationAgent(AgentBase):
                             event_data = r["result"].get("data", {})
                             break
 
-                    # 从 event_data 获取行程信息
-                    origin = event_data.get("origin")
-                    destination = event_data.get("destination")
-                    start_date = event_data.get("start_date")
-                    end_date = event_data.get("end_date")
-                    purpose = event_data.get("trip_purpose", "旅游")
+                    # 从 event_data 获取行程信息；模型可能给出列表（多目的地）
+                    # 或数字，统一转成单行文本再落库（不可哈希值会让统计
+                    # 更新抛 TypeError，整轮回复作废）
+                    origin = _as_text(event_data.get("origin"))
+                    destination = _as_text(event_data.get("destination"))
+                    start_date = _as_text(event_data.get("start_date"))
+                    end_date = _as_text(event_data.get("end_date"))
+                    purpose = _as_text(event_data.get("trip_purpose")) or "旅游"
 
                     # 保存到长期记忆（只要有目的地就保存）
                     if destination:
