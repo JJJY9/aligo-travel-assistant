@@ -143,7 +143,7 @@ def test_webapp_with_redis_short_term(monkeypatch):
             assert probe.truncate_last_turn("Q1") == 2
             assert client.exists(probe.key) == 0
         finally:
-            client.delete(probe.key)
+            client.delete(probe.key, applied_key(probe.key))
 
         # UTF-8 空白归一：全角空格 / 不间断空格视为一致（Python strip 与
         # Lua 裁剪必须同一字符集）；以 0xA0 / 0x80 等字节结尾的汉字不能被
@@ -187,7 +187,7 @@ def test_webapp_with_redis_short_term(monkeypatch):
             assert utf8_probe.truncate_last_turn("混合空白结尾") == 2
             assert client.exists(utf8_probe.key) == 0
         finally:
-            client.delete(utf8_probe.key)
+            client.delete(utf8_probe.key, applied_key(utf8_probe.key))
 
         # 同一 session_id 的不同用户使用不同键，互不影响
         shared_session = f"redis-shared-{uuid.uuid4().hex[:8]}"
@@ -202,7 +202,7 @@ def test_webapp_with_redis_short_term(monkeypatch):
             assert client.exists(alice.key) == 0
             assert client.llen(bob.key) == 1, "不应清理其它用户的会话"
         finally:
-            client.delete(alice.key, bob.key)
+            client.delete(alice.key, applied_key(alice.key), bob.key, applied_key(bob.key))
 
         # 删除会话 → 同时清理 Redis 短期记忆
         deleted = http.delete(
@@ -212,7 +212,12 @@ def test_webapp_with_redis_short_term(monkeypatch):
         assert client.exists(key) == 0
         print("✓ Web API 在 Redis 短期记忆下的读写与清理")
     finally:
-        client.delete(session_key(session_id), session_key(session_id, user_id))
+        client.delete(
+            session_key(session_id),
+            applied_key(session_key(session_id)),
+            session_key(session_id, user_id),
+            applied_key(session_key(session_id, user_id)),
+        )
         memory_file.unlink(missing_ok=True)
         storage.reset_failure_cache()
 
