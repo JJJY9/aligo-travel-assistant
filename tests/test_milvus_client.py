@@ -138,6 +138,51 @@ def test_large_collection_paginates_beyond_query_limit():
     print("✓ 超过 16384 条时分页扫描最大 id")
 
 
+def test_next_entity_id_stops_without_progress():
+    """查询反复返回同一批 id（无进展）时停止，不死循环。"""
+
+    class _StuckClient:
+        def load_collection(self, name):
+            pass
+
+        def query(self, collection_name, filter="", output_fields=None, limit=16384):
+            return [{"id": 5}, {"id": 5}]
+
+    assert next_entity_id(_StuckClient(), "knowledge", max_scan=2) == 6
+
+
+def test_reset_and_shutdown_clients():
+    """客户端注册表的 peek / reset / shutdown（close 异常被吞掉）。"""
+    from utils import milvus_client as module
+
+    closed = []
+
+    class _TrackedClient:
+        def __init__(self, name, fail=False):
+            self.name = name
+            self.fail = fail
+
+        def close(self):
+            if self.fail:
+                raise RuntimeError("close boom")
+            closed.append(self.name)
+
+    module._CLIENTS.clear()
+    module._CLIENTS["a.db"] = _TrackedClient("a")
+    module._CLIENTS["b.db"] = _TrackedClient("b", fail=True)
+
+    assert module.peek_milvus_client("a.db") is not None
+    assert module.peek_milvus_client("missing.db") is None
+
+    module.reset_milvus_client("a.db")
+    assert "a.db" not in module._CLIENTS and closed == ["a"]
+    module.reset_milvus_client("missing.db")  # 不存在时是空操作
+
+    module.shutdown_milvus_clients()
+    assert module._CLIENTS == {}
+    assert closed == ["a"], "close 抛异常不能阻止清空注册表"
+
+
 if __name__ == "__main__":
     for plain_case in (
         test_uses_max_id_not_row_count,
@@ -145,6 +190,8 @@ if __name__ == "__main__":
         test_query_failure_propagates,
         test_load_failure_still_queries,
         test_large_collection_paginates_beyond_query_limit,
+        test_next_entity_id_stops_without_progress,
+        test_reset_and_shutdown_clients,
     ):
         plain_case()
     for patched_case in (
