@@ -34,7 +34,15 @@ class SkillLoader:
                 if os.path.exists(md_file):
                     skill_info = self._parse_skill_md(md_file)
                     if skill_info:
-                        self.skills[skill_info.get("name", skill_name)] = skill_info
+                        # name 必须是字符串：frontmatter 写错类型时退回目录名，
+                        # 不能拿列表等不可哈希值当字典键
+                        info_name = skill_info.get("name")
+                        key = (
+                            info_name
+                            if isinstance(info_name, str) and info_name
+                            else skill_name
+                        )
+                        self.skills[key] = skill_info
                         
         return self.skills
 
@@ -51,9 +59,17 @@ class SkillLoader:
                     yaml_content = content[3:end_idx]
                     try:
                         data = yaml.safe_load(yaml_content)
-                        return data
                     except yaml.YAMLError as e:
                         print(f"Error parsing YAML in {file_path}: {e}")
+                        return None
+                    # frontmatter 不是映射（如整段是字符串 / 列表）时跳过，
+                    # 否则后续 .get() 会抛 AttributeError 让所有技能加载失败
+                    if not isinstance(data, dict):
+                        print(
+                            f"Warning: frontmatter of {file_path} is not a mapping, skipped."
+                        )
+                        return None
+                    return data
             return None
         except Exception as e:
             print(f"Error reading {file_path}: {e}")
@@ -84,7 +100,8 @@ class SkillLoader:
                 # 尝试反向查找：如果name是目录名，也试试看有没有在mapping里
                 pass
                 
-            desc = info.get("description", "").replace("\n", " ")
+            desc = str(info.get("description") or "")
+            desc = desc.replace(chr(10), " ")
             prompt_lines.append(f"{index}. {display_name} - {desc}")
             index += 1
             
