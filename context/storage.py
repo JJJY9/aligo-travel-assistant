@@ -19,6 +19,8 @@ from context.postgres_long_term_memory import PostgresLongTermMemory
 from context.short_term_memory import (
     RedisShortTermMemory,
     ShortTermMemory,
+    applied_key,
+    discard_pending_ops,
     redis_short_term_degraded,
     session_key,
 )
@@ -153,18 +155,22 @@ def describe_backends() -> dict[str, Any]:
 def clear_short_term_session(session_id: str, user_id: str = "") -> None:
     """删除某个会话的 Redis 短期记忆（未启用 Redis 时为空操作）。
 
-    同时清理旧格式键（``aligo:session:{id}:messages``），便于升级后回收遗留数据。
+    同时清理旧格式键（``aligo:session:{id}:messages``），便于升级后回收遗留
+    数据；并丢弃本进程内该键排队的故障期操作——删除会话后同一 session_id
+    再被使用时，旧会话排队的消息 / 删除动作不能重放进新会话。
     """
+    keys = {session_key(session_id)}
+    if user_id:
+        keys.add(session_key(session_id, user_id))
+    for key in keys:
+        discard_pending_ops(key)
     url = STORAGE_CONFIG.get("redis_url") or ""
     if not url:
         return
     client = _get_redis_client(url)
     if client is None:
         return
-    keys = {session_key(session_id)}
-    if user_id:
-        keys.add(session_key(session_id, user_id))
     try:
-        client.delete(*keys)
+        client.delete(*keys, *[applied_key(key) for key in keys])
     except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程
         logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)
