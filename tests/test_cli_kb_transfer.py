@@ -84,25 +84,54 @@ def test_kb_export_dispatch_strict(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_knowledge_export_standalone",
-        lambda target, force=False: calls.append((target, force)) or 0,
+        lambda target, force=False, to_stdout=False: (
+            calls.append((target, force, to_stdout)) or 0
+        ),
     )
     monkeypatch.setattr(sys, "argv", ["cli.py", "kb-export", "a.json", "--force"])
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls == [("a.json", True)]
+    assert calls == [("a.json", True, False)]
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-export", "--stdout"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == (None, False, True)
 
     for argv in (
         ["cli.py", "kb-export", "--unknown"],
         ["cli.py", "kb-export", "a.json", "b.json"],
+        ["cli.py", "kb-export", "a.json", "--stdout"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 2, argv
-        assert "用法：python cli.py kb-export [path] [--force]" in out.getvalue()
-    print("✓ kb-export 严格参数解析")
+        assert "用法：python cli.py kb-export" in out.getvalue()
+    print("✓ kb-export 严格参数解析（含 --stdout 互斥）")
+
+
+def test_export_to_stdout_writes_no_file(monkeypatch):
+    """--stdout 直接打印 JSON，不写入任何文件。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "export_documents",
+        lambda: [{"content": "住宿标准", "metadata": {"category": "住宿"}}],
+    )
+    code, out = _capture(
+        cli.run_knowledge_export_standalone,
+        None,
+        to_stdout=True,
+    )
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["version"] == 1
+    assert payload["documents"][0]["content"] == "住宿标准"
+    print("✓ kb-export --stdout 打印 JSON 且不写文件")
 
 
 def test_import_rejects_non_utf8_file(monkeypatch):
@@ -381,6 +410,7 @@ if __name__ == "__main__":
         test_export_writes_json,
         test_export_refuses_overwrite_without_force,
         test_kb_export_dispatch_strict,
+        test_export_to_stdout_writes_no_file,
         test_export_unavailable_or_failure,
         test_import_success,
         test_import_plain_array,
