@@ -2579,8 +2579,11 @@ function renderOverview() {
   renderUpcoming(status.next_trip || pickUpcomingTrip(trips));
   updateArchivedToggle(Number(status.archived_count || 0));
 
+  const travel = status.travel_summary || {};
   const stats = [
     ["历史行程", status.trip_count || 0],
+    ["出行天数", Number(travel.total_days || 0)],
+    ["到访城市", Number(travel.cities || 0)],
     ["对话消息", status.chat_count || 0],
     ["偏好条目", preferences.length],
   ];
