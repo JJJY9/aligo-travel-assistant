@@ -160,6 +160,12 @@ def test_webapp_with_redis_short_term(monkeypatch):
             utf8_probe.add_message("user", "提问丠")
             utf8_probe.add_message("assistant", "A")
             assert utf8_probe.truncate_last_turn("提问丠") == 2
+
+            # 提问内部的全角空格必须原样保留：只裁两端空白，不能把内部
+            # U+3000 归一半角，否则与 Python strip() 后的 expected 对不上
+            utf8_probe.add_message("user", "明天去上海　还是后天")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("明天去上海　还是后天") == 2
             assert client.exists(utf8_probe.key) == 0
         finally:
             client.delete(utf8_probe.key)
