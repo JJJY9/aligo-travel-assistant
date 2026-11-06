@@ -144,34 +144,55 @@ class _FlakyRedis:
 
     def __init__(self):
         self.fail = False
+        self.fail_after_apply = False
         self.data: list[str] = []
+        self.markers: dict[str, str] = {}
+        self.pipeline_calls = 0
 
     def _check(self):
         if self.fail:
             raise ConnectionError("redis down")
 
+    def _apply(self, commands):
+        for command in commands:
+            if command[0] == "rpush":
+                self.data.extend(command[1])
+            elif command[0] == "ltrim":
+                start, end = command[1:]
+                if end == -1 and start < 0:
+                    self.data = self.data[-abs(start):]
+            elif command[0] == "delete":
+                self.data.clear()
+
     def pipeline(self):
+        self.pipeline_calls += 1
         client = self
 
         class _Pipe:
+            def __init__(self):
+                self.commands: list[tuple] = []
+
             def rpush(self, key, *values):
-                client._check()
-                client.data.extend(values)
+                self.commands.append(("rpush", values))
 
             def ltrim(self, key, start, end):
-                client._check()
-                if end == -1 and start < 0:
-                    client.data = client.data[-abs(start):]
+                self.commands.append(("ltrim", start, end))
 
             def expire(self, key, ttl):
-                client._check()
+                self.commands.append(("expire", ttl))
 
             def delete(self, key):
-                client._check()
-                client.data.clear()
+                self.commands.append(("delete",))
 
             def execute(self):
+                # 与真实 pipeline 一致：execute 时才检查连接并统一生效；
+                # fail_after_apply 模拟「已提交但响应丢失」
                 client._check()
+                client._apply(self.commands)
+                self.commands = []
+                if client.fail_after_apply:
+                    client.fail_after_apply = False
+                    raise ConnectionError("response lost after commit")
 
         return _Pipe()
 
@@ -186,20 +207,66 @@ class _FlakyRedis:
         self.data.clear()
         return 1
 
-    def eval(self, script, numkeys, key, *args):
+    def eval(self, script, numkeys, *keys_and_args):
+        """按 redis-py 的 eval(script, numkeys, *keys_and_args) 解析。"""
         self._check()
+        keys = list(keys_and_args[:numkeys])
+        args = list(keys_and_args[numkeys:]) or [""]
         if "LREM" in script:
+            removed = 0
             for payload in args:
-                self.data = [item for item in self.data if item != payload]
-            return 1
+                kept = []
+                for item in self.data:
+                    if item == payload:
+                        removed += 1
+                    else:
+                        kept.append(item)
+                self.data = kept
+            return removed
+        # 截断脚本：角色判断、内容校验、一次性标记与 cutoff 与 Lua 对应
+        marker = keys[1] if len(keys) > 1 else None
         check = args[0] if args else "0"
         expected = args[1] if len(args) > 1 else ""
+        marker_ttl = args[2] if len(args) > 2 else ""
+        cutoff = args[3] if len(args) > 3 else ""
+        if marker is not None:
+            if marker in self.markers:
+                return -1
+            self.markers[marker] = marker_ttl
         if not self.data:
             return 0
-        count = 2 if len(self.data) >= 2 else 1
-        if check == "1" and expected:
-            user_raw = self.data[-2] if count == 2 else self.data[-1]
-            if str(json.loads(user_raw).get("content", "")).strip() != expected:
+        count = 1
+        user_raw = None
+        try:
+            last = json.loads(self.data[-1])
+        except json.JSONDecodeError:
+            last = None
+        if isinstance(last, dict) and last.get("role") == "assistant" and len(self.data) >= 2:
+            try:
+                prev = json.loads(self.data[-2])
+            except json.JSONDecodeError:
+                prev = None
+            if isinstance(prev, dict) and prev.get("role") == "user":
+                count = 2
+                user_raw = self.data[-2]
+        elif isinstance(last, dict) and last.get("role") == "user":
+            user_raw = self.data[-1]
+        if check == "1":
+            if user_raw is None:
+                return 0
+            try:
+                user = json.loads(user_raw)
+            except json.JSONDecodeError:
+                return 0
+            if not isinstance(user, dict) or user.get("role") != "user":
+                return 0
+            content = user.get("content")
+            if not isinstance(content, str):
+                return 0
+            timestamp = user.get("timestamp")
+            if cutoff and isinstance(timestamp, str) and timestamp > cutoff:
+                return 0
+            if content.strip() != expected:
                 return 0
         del self.data[-count:]
         return count
@@ -279,39 +346,22 @@ def test_outage_writes_replayed_after_recovery(monkeypatch):
     print("✓ 故障期消息在恢复后补写")
 
 
-class _ApplyThenFailRedis(_FlakyRedis):
-    """写入已生效但响应丢失：execute 在数据写入后抛连接错误。"""
+class _EvalApplyThenFailRedis(_FlakyRedis):
+    """截断脚本已执行但响应丢失：eval 生效后抛连接错误（只丢一次）。"""
 
-    def __init__(self):
-        super().__init__()
-        self.fail_after_apply = False
+    def eval(self, script, numkeys, *keys_and_args):
+        result = super().eval(script, numkeys, *keys_and_args)
+        if self.fail_after_apply:
+            self.fail_after_apply = False
+            raise ConnectionError("response lost after script")
+        return result
 
-    def pipeline(self):
-        client = self
 
-        class _Pipe:
-            def rpush(self, key, *values):
-                client._check()
-                client.data.extend(values)
-
-            def ltrim(self, key, start, end):
-                client._check()
-                if end == -1 and start < 0:
-                    client.data = client.data[-abs(start):]
-
-            def expire(self, key, ttl):
-                client._check()
-
-            def delete(self, key):
-                client._check()
-                client.data.clear()
-
-            def execute(self):
-                client._check()
-                if client.fail_after_apply:
-                    raise ConnectionError("response lost after commit")
-
-        return _Pipe()
+def _message(role: str, content: str, timestamp: str) -> str:
+    return json.dumps(
+        {"role": role, "content": content, "timestamp": timestamp, "metadata": {}},
+        ensure_ascii=False,
+    )
 
 
 def test_outage_backlog_is_bounded(monkeypatch):
@@ -340,7 +390,7 @@ def test_replay_dedupes_committed_payload(monkeypatch):
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
-    client = _ApplyThenFailRedis()
+    client = _FlakyRedis()
     memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
     memory.add_message("user", "Q1")
     memory.add_message("assistant", "A1")
@@ -456,6 +506,212 @@ def test_outage_transient_truncate_queues_conditional_delete(monkeypatch):
     print("✓ 临时对象故障期截断在恢复后条件删除")
 
 
+def test_transient_object_truncate_replays_after_discard(monkeypatch):
+    """临时对象用完即弃（生产路径）：排队的删除由后续实例重放，旧轮不会复活。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    owner = module.RedisShortTermMemory(client, "s-discard", max_turns=5, user_id="u1")
+    owner.add_message("user", "Q1")
+    owner.add_message("assistant", "A1")
+
+    transient = module.RedisShortTermMemory(
+        client, "s-discard", max_turns=5, user_id="u1"
+    )
+    client.fail = True
+    assert transient.truncate_last_turn("Q1") == 0
+    # webapp 对未命中会话缓存的会话：create_short_term_memory(...) 调用后即丢弃。
+    # 操作日志按会话键共享，后续任何实例都能重放
+    del transient
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    reader = module.RedisShortTermMemory(client, "s-discard", max_turns=5, user_id="u1")
+    assert reader.get_recent_context() == [], "丢弃临时对象后，排队的删除仍要生效"
+    print("✓ 临时对象丢弃后删除操作由后续实例重放")
+
+
+def test_truncate_replay_marker_prevents_double_delete(monkeypatch):
+    """截断已执行但响应丢失时，重试凭一次性标记跳过，不会删掉上一轮同文本对话。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _EvalApplyThenFailRedis()
+    client.data = [
+        _message("user", "同一个问题", "2000-01-01T10:00:00"),
+        _message("assistant", "回答一", "2000-01-01T10:00:01"),
+        _message("user", "同一个问题", "2000-01-01T10:01:00"),
+        _message("assistant", "回答二", "2000-01-01T10:01:01"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-marker", max_turns=5, user_id="u1")
+    client.fail = True
+    assert memory.truncate_last_turn("同一个问题") == 0  # 影子为空，记入共享日志
+
+    client.fail = False
+    client.fail_after_apply = True
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    reader = module.RedisShortTermMemory(client, "s-marker", max_turns=5, user_id="u1")
+    reader.get_recent_context()  # 首次重放：脚本已生效，响应丢失
+    assert [json.loads(item)["content"] for item in client.data] == [
+        "同一个问题",
+        "回答一",
+    ]
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    reader.get_recent_context()  # 冷却后重试：标记命中，不再删第二轮
+    assert [json.loads(item)["content"] for item in client.data] == [
+        "同一个问题",
+        "回答一",
+    ]
+    assert reader._pending_ops == []
+    print("✓ 截断重放凭一次性标记避免重复删除")
+
+
+def test_truncate_replay_cutoff_skips_newer_same_text_turn(monkeypatch):
+    """故障期间其它实例写入的同文本新轮次晚于 cutoff，重放不能误删。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "同一个问题", "2026-11-06T10:00:00"),
+        _message("assistant", "回答一", "2026-11-06T10:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-cutoff", max_turns=5, user_id="u1")
+    client.fail = True
+    assert memory.truncate_last_turn("同一个问题") == 0  # cutoff = 当前时刻
+
+    # 故障期间另一实例写入同文本的新一轮：时间戳晚于 cutoff
+    client.data.extend(
+        [
+            _message("user", "同一个问题", "2099-01-01T00:00:00"),
+            _message("assistant", "回答二", "2099-01-01T00:00:01"),
+        ]
+    )
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["同一个问题", "回答一", "同一个问题", "回答二"], (
+        "cutoff 之后写入的同文本轮次不能被重放误删"
+    )
+    print("✓ 截断重放用 cutoff 排除故障期新写入的同文本轮次")
+
+
+def test_truncate_replay_mismatch_logs_warning(monkeypatch, caplog):
+    """条件截断重放未匹配时不能静默丢弃，要留下日志便于排查。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [_message("user", "旧问题", "2026-11-06T10:00:00")]
+    memory = module.RedisShortTermMemory(client, "s-warn", max_turns=5, user_id="u1")
+    client.fail = True
+    assert memory.truncate_last_turn("旧问题") == 0
+    # 恢复前列表末尾已换成别的提问（时间早于 cutoff）：内容校验不成立
+    client.data = [_message("user", "新问题", "2000-01-01T00:00:00")]
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert [item["content"] for item in memory.get_recent_context()] == ["新问题"]
+    assert "截断重放未匹配" in caplog.text
+    print("✓ 截断重放未匹配时记录日志")
+
+
+def test_delete_ops_cap_does_not_drop_new_adds(monkeypatch):
+    """删除类操作占满上限时，新的新增消息仍要能入队（不能把消息静默丢掉）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-cap", max_turns=2, user_id="u1")
+    try:
+        client.fail = True
+        for _ in range(300):
+            memory.truncate_last_turn("同一提问")
+        memory.add_message("user", "关键消息")
+        ops = memory._pending_ops
+        assert sum(1 for kind, _ in ops if kind == "add") == 1, (
+            "新增消息不能被删除类操作挤掉"
+        )
+        assert sum(1 for kind, _ in ops if kind == "truncate") <= 256
+    finally:
+        with module._PENDING_JOURNALS_LOCK:
+            module._PENDING_JOURNALS.pop(memory.key, None)
+    print("✓ 删除类操作占满上限时新增消息仍能入队")
+
+
+def test_replay_batches_adds_in_one_pipeline(monkeypatch):
+    """恢复重放把连续新增合并为一次 pipeline，不随积压条数放大往返次数。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-batch", max_turns=10, user_id="u1")
+    client.fail = True
+    for index in range(10):
+        memory.add_message("user" if index % 2 == 0 else "assistant", f"m{index}")
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    before = client.pipeline_calls
+    messages = memory.get_recent_context()
+    assert client.pipeline_calls - before == 1
+    assert [item["content"] for item in messages] == [f"m{i}" for i in range(10)]
+    print("✓ 连续新增合并为一次 pipeline")
+
+
+def test_replay_skips_stale_add_pushed_out_by_newer_messages(monkeypatch):
+    """响应丢失的消息若在重放前已被新消息挤出窗口，不能以旧消息身份重新追加。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-stale", max_turns=2, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    client.fail_after_apply = True
+    memory.add_message("user", "Q2")  # 已写入 Redis，但响应丢失
+    assert len(memory._pending_ops) == 1
+
+    # 模拟另一实例在其后写入 4 条更新的消息：Q2 被挤出 4 条滑动窗口
+    client.data = [
+        _message("user", "B1", "2099-01-01T00:00:00"),
+        _message("assistant", "B1a", "2099-01-01T00:00:01"),
+        _message("user", "B2", "2099-01-01T00:00:02"),
+        _message("assistant", "B2a", "2099-01-01T00:00:03"),
+    ]
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["B1", "B1a", "B2", "B2a"], (
+        "已被更新的内容挤出窗口的旧消息不能以最新身份复活"
+    )
+    assert memory._pending_ops == []
+    print("✓ 重放跳过已被更新消息挤出窗口的过期新增")
+
+
+def test_replay_batch_failure_retries_without_duplicates(monkeypatch):
+    """重放批次已生效但响应丢失：重试按已提交内容去重，不重复追加。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-retry", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "Q2")
+    memory.add_message("assistant", "A2")
+
+    client.fail = False
+    client.fail_after_apply = True
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory.get_recent_context()  # 重放已写入，响应丢失
+    assert len(client.data) == 2
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["Q2", "A2"]
+    assert len(client.data) == 2, "重试不能重复追加"
+    assert memory._pending_ops == []
+    print("✓ 重放批次响应丢失后重试不重复")
+
+
 def test_outage_clear_rewrites_on_recovery(monkeypatch):
     """故障期间清空的会话不能在恢复后从 Redis 复活（重放一次删除）。"""
     from context import short_term_memory as module
@@ -538,6 +794,36 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_outage_transient_truncate_queues_conditional_delete(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_transient_object_truncate_replays_after_discard(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_truncate_replay_marker_prevents_double_delete(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_truncate_replay_cutoff_skips_newer_same_text_turn(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_delete_ops_cap_does_not_drop_new_adds(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_replay_batches_adds_in_one_pipeline(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_replay_batch_failure_retries_without_duplicates(_mp)
     finally:
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()

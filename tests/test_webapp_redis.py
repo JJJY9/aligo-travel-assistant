@@ -166,6 +166,21 @@ def test_webapp_with_redis_short_term(monkeypatch):
             utf8_probe.add_message("user", "明天去上海　还是后天")
             utf8_probe.add_message("assistant", "A")
             assert utf8_probe.truncate_last_turn("明天去上海　还是后天") == 2
+
+            # 内部 NBSP 同样保留
+            utf8_probe.add_message("user", "内部 空格")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("内部 空格") == 2
+
+            # 两端其它 Unicode 空白（U+2003 与 U+202F）与 Python strip() 同集合
+            utf8_probe.add_message("user", "窄空格结尾 ")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("窄空格结尾") == 2
+
+            # 混合、多轮剥离：半角空格 + NBSP + 全角空格叠加
+            utf8_probe.add_message("user", "　  混合空白结尾　")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("混合空白结尾") == 2
             assert client.exists(utf8_probe.key) == 0
         finally:
             client.delete(utf8_probe.key)
@@ -196,6 +211,102 @@ def test_webapp_with_redis_short_term(monkeypatch):
         client.delete(session_key(session_id), session_key(session_id, user_id))
         memory_file.unlink(missing_ok=True)
         storage.reset_failure_cache()
+
+
+class _OutageProxy:
+    """包装真实 Redis 客户端：按开关模拟连接故障，恢复后透传。"""
+
+    def __init__(self, client):
+        self._client = client
+        self.fail = False
+
+    def __getattr__(self, name):
+        if self.fail:
+            raise ConnectionError("redis down")
+        return getattr(self._client, name)
+
+
+def test_redis_short_term_replays_after_outage(monkeypatch):
+    """真实 Redis：故障期新增 / 截断 / 清空在恢复后按序重放（执行真实 Lua）。"""
+    from context import short_term_memory as short_term_module
+
+    try:
+        import redis
+
+        client = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+        client.ping()
+    except Exception as exc:  # noqa: BLE001 - 测试环境无 Redis 时跳过
+        pytest.skip(f"Redis 不可用: {exc}")
+
+    session_id = f"redis-outage-{uuid.uuid4().hex[:8]}"
+    user_id = f"redis-outage-user-{uuid.uuid4().hex[:8]}"
+    key = session_key(session_id, user_id)
+    client.delete(key)
+    proxy = _OutageProxy(client)
+
+    def reset_degraded():
+        monkeypatch.setattr(short_term_module, "_redis_degraded_until", 0.0)
+
+    def contents(memory):
+        return [item["content"] for item in memory.get_recent_context()]
+
+    try:
+        memory = RedisShortTermMemory(
+            proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+        )
+        for role, content in [
+            ("user", "Q1"),
+            ("assistant", "A1"),
+            ("user", "Q2"),
+            ("assistant", "A2"),
+        ]:
+            memory.add_message(role, content)
+        assert client.llen(key) == 4
+
+        # 故障期新增 + 截断：重放后 Redis 只保留第一轮（去掉故障期那轮）
+        proxy.fail = True
+        reset_degraded()
+        memory.add_message("user", "Q3")
+        reset_degraded()
+        assert memory.truncate_last_turn("Q3") == 2
+        assert contents(memory) == ["Q1", "A1", "Q2", "A2"]
+
+        proxy.fail = False
+        reset_degraded()
+        assert contents(memory) == ["Q1", "A1", "Q2", "A2"]
+        assert client.llen(key) == 4
+
+        # 未命中会话缓存的临时对象：排队后即丢弃，后续实例用真实 Lua 重放
+        proxy.fail = True
+        reset_degraded()
+        transient = RedisShortTermMemory(
+            proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+        )
+        assert transient.truncate_last_turn("Q2") == 0
+        del transient
+
+        proxy.fail = False
+        reset_degraded()
+        follower = RedisShortTermMemory(
+            proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+        )
+        assert contents(follower) == ["Q1", "A1"], "丢弃临时对象后排队的截断仍要生效"
+
+        # 故障期清空：恢复后由后续实例重放删除
+        proxy.fail = True
+        reset_degraded()
+        follower.clear()
+        proxy.fail = False
+        reset_degraded()
+        assert contents(
+            RedisShortTermMemory(
+                proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+            )
+        ) == []
+        print("✓ 真实 Redis 上故障期变更恢复后按序重放")
+    finally:
+        proxy.fail = False
+        client.delete(key)
 
 
 if __name__ == "__main__":
