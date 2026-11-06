@@ -475,6 +475,141 @@ def test_trip_add_args_and_dispatch(monkeypatch):
     print("✓ trip-add 参数解析与 dispatch")
 
 
+class _DeleteStore(_FakeStore):
+    """支持 delete_trip 的假存储（trip-delete 用例）。"""
+
+    def __init__(self, trips=(), fail_delete=False):
+        super().__init__(trips)
+        self.fail_delete = fail_delete
+        self.deleted = []
+
+    def delete_trip(self, trip_id):
+        if self.fail_delete:
+            raise RuntimeError("disk error")
+        for index, trip in enumerate(self.trips):
+            if str(trip.get("trip_id")) == trip_id:
+                self.deleted.append(trip_id)
+                self.trips.pop(index)
+                return True
+        return False
+
+
+def _run_trip_delete(*args, **kwargs):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trip_delete_standalone(*args, **kwargs)
+    return code, out.getvalue()
+
+
+def test_trip_delete_success_and_json(monkeypatch):
+    store = _DeleteStore(
+        [
+            _trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1"),
+            _trip("杭州", "2026-12-05", trip_id="trip_2"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_delete("u1", "trip_1")
+    assert code == 0
+    assert "已删除行程 #trip_1" in out and "北京 → 上海" in out
+    assert "2026-12-01 ~ 2026-12-03" in out
+    assert store.deleted == ["trip_1"] and store.closed
+
+    store2 = _DeleteStore([_trip("上海", "2026-12-01", trip_id="trip_9")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store2
+    )
+    code, out = _run_trip_delete("u1", "trip_9", as_json=True)
+    data = json.loads(out)
+    assert code == 0 and data["deleted"] is True and data["trip_id"] == "trip_9"
+    assert data["destination"] == "上海"
+    print("✓ trip-delete 文本 / JSON 删除")
+
+
+def test_trip_delete_not_found_and_ambiguous(monkeypatch):
+    store = _DeleteStore([_trip("上海", "2026-12-01", trip_id="trip_1")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_delete("u1", "trip_missing")
+    assert code == 1 and "不存在" in out and store.deleted == []
+
+    ambiguous = _DeleteStore(
+        [
+            _trip("上海", "2026-12-01", trip_id="trip_dup"),
+            _trip("杭州", "2026-12-02", trip_id="trip_dup"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: ambiguous
+    )
+    code, out = _run_trip_delete("u1", "trip_dup")
+    assert code == 1 and "trips-dedupe" in out
+    assert ambiguous.deleted == [], "歧义 id 不能删除"
+    print("✓ trip-delete 不存在 / 歧义 id")
+
+
+def test_trip_delete_failures(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("open down")
+
+    monkeypatch.setattr(storage, "create_long_term_memory", boom)
+    code, out = _run_trip_delete("u1", "trip_1", as_json=True)
+    data = json.loads(out)
+    assert code == 1 and "打开长期记忆失败" in data["error"]
+
+    read_fail = _DeleteStore([])
+    read_fail.fail_history = True
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: read_fail
+    )
+    code, out = _run_trip_delete("u1", "trip_1")
+    assert code == 1 and "读取行程失败" in out
+
+    fail_delete = _DeleteStore(
+        [_trip("上海", "2026-12-01", trip_id="trip_1")], fail_delete=True
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: fail_delete
+    )
+    code, out = _run_trip_delete("u1", "trip_1")
+    assert code == 1 and "删除行程失败" in out
+    print("✓ trip-delete 打开 / 读取 / 删除失败")
+
+
+def test_trip_delete_args_and_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_trip_delete_standalone",
+        lambda user_id, trip_id, as_json=False: (
+            calls.append((user_id, trip_id, as_json)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trip-delete", "u1", "trip_1", "--json"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "trip_1", True)
+    for argv in (
+        ["cli.py", "trip-delete"],
+        ["cli.py", "trip-delete", "u1"],
+        ["cli.py", "trip-delete", "u1", "trip_1", "extra"],
+        ["cli.py", "trip-delete", "u1", "trip_1", "--bad"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "trip-delete" in out.getvalue()
+    print("✓ trip-delete dispatch 参数")
+
+
 if __name__ == "__main__":
     for case in (
         test_trip_interval_and_state,
@@ -493,6 +628,10 @@ if __name__ == "__main__":
         test_trip_add_validation_errors,
         test_trip_add_store_failures,
         test_trip_add_args_and_dispatch,
+        test_trip_delete_success_and_json,
+        test_trip_delete_not_found_and_ambiguous,
+        test_trip_delete_failures,
+        test_trip_delete_args_and_dispatch,
     ):
         mp = pytest.MonkeyPatch()
         try:

@@ -3071,6 +3071,96 @@ def run_trip_add_standalone(
     return 0
 
 
+def run_trip_delete_standalone(
+    user_id: str, trip_id: str, as_json: bool = False
+) -> int:
+    """删除一条行程（`python cli.py trip-delete <user_id> <trip_id> [--json]`）。
+
+    与 Web 面板同一保护：同一 trip_id 对应多条行程（历史数据异常）时拒绝
+    自动删除，提示先运行 trips-dedupe 清理。
+
+    Returns:
+        0 删除成功；1 参数 / 读取 / 删除失败（含行程不存在）
+    """
+    import re
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", trip_id) or trip_id.startswith("-"):
+        return _fail("行程 ID 只能包含中文、字母、数字、下划线和短横线")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+        matches = [trip for trip in trips if str(trip.get("trip_id")) == trip_id]
+        if len(matches) > 1:
+            return _fail(
+                "该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理"
+            )
+        if not matches:
+            return _fail(f"行程 {trip_id} 不存在")
+        try:
+            deleted = store.delete_trip(trip_id)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"删除行程失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+    if not deleted:
+        return _fail(f"行程 {trip_id} 不存在")
+
+    trip = matches[0]
+    origin = str(trip.get("origin") or "") or "—"
+    destination = str(trip.get("destination") or "") or "—"
+    start_date = str(trip.get("start_date") or "")
+    end_date = str(trip.get("end_date") or "")
+    dates = (
+        start_date
+        if not end_date or end_date == start_date
+        else f"{start_date} ~ {end_date}"
+    ) or "日期未记录"
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "trip_id": trip_id,
+                    "deleted": True,
+                    "origin": "" if origin == "—" else origin,
+                    "destination": "" if destination == "—" else destination,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    print(f"已删除行程 #{trip_id}（{origin} → {destination}，{dates}）")
+    return 0
+
+
 def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
     """列出用户行程（`python cli.py trips <user_id> [--json]`）。
 
@@ -3280,7 +3370,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / "
     "preferences / "
-    "trips / trip-add / trips-dedupe / sessions / session-archive / session-export / "
+    "trips / trip-add / trip-delete / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export / user-export"
 )
 
@@ -3535,6 +3625,27 @@ def main():
                     trip_values.get("purpose", "出差"),
                     as_json=parsed_trip_add["as_json"],
                 )
+            )
+        if arg == "trip-delete":
+            target = None
+            other = None
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                if item.lower() == "--json":
+                    as_json = True
+                elif item.startswith("-") or other is not None:
+                    valid = False
+                    break
+                elif target is None:
+                    target = item
+                else:
+                    other = item
+            if not valid or target is None or other is None:
+                print("用法：python cli.py trip-delete <user_id> <trip_id> [--json]")
+                sys.exit(2)
+            sys.exit(
+                run_trip_delete_standalone(target, other, as_json=as_json)
             )
         if arg == "trips":
             parsed_trips_list = _parse_user_and_json_args(sys.argv[2:])
