@@ -455,6 +455,71 @@ def test_rag_snippet_truncation_and_skip_non_dict():
     print("✓ RAG 片段截断 / 非字典文档跳过")
 
 
+def test_preference_append_variants_and_legacy_dict():
+    """Append / add / 追加 都渲染为「追加」；旧格式 {type: value} 字典不再渲染为空。"""
+    for action in ("Append", "add", "追加", "append"):
+        data = _wrap([
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "hotel_brands", "value": ["如家"], "action": action}
+                    ]
+                },
+            }
+        ])
+        md = result_to_markdown(data)
+        assert "追加" in md, f"action={action} 应渲染为追加"
+        assert "['如家']" not in md and "如家" in md
+
+    legacy = _wrap([
+        {
+            "agent_name": "preference",
+            "priority": 1,
+            "status": "success",
+            "data": {
+                "preferences": {
+                    "hotel_brands": ["汉庭", "如家"],
+                    "home_location": "上海",
+                }
+            },
+        }
+    ])
+    md = result_to_markdown(legacy)
+    assert "汉庭" in md and "如家" in md and "上海" in md
+    assert "['汉庭'" not in md
+    print("✓ 偏好追加变体与旧格式字典渲染")
+
+
+def test_event_collection_type_tolerance():
+    """missing_info 为字符串不能拆成单字；列表字段不输出 Python repr。"""
+    data = _wrap([
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "status": "success",
+            "data": {"destination": ["上海", "杭州"], "missing_info": "出发日期"},
+        }
+    ])
+    md = result_to_markdown(data)
+    assert "上海、杭州" in md
+    assert "['上海'" not in md
+    assert "出发日期" in md and "出、发、日、期" not in md
+
+    nested_bad = _wrap([
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "status": "success",
+            "data": {"data": "not-a-dict", "origin": "北京"},
+        }
+    ])
+    assert "北京" in result_to_markdown(nested_bad)
+    print("✓ 事项收集字段类型容错")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -471,4 +536,6 @@ if __name__ == "__main__":
     test_itinerary_string_and_notes_variants()
     test_agent_specific_empty_payloads_render_placeholder()
     test_rag_snippet_truncation_and_skip_non_dict()
+    test_preference_append_variants_and_legacy_dict()
+    test_event_collection_type_tolerance()
     print("\n全部通过")

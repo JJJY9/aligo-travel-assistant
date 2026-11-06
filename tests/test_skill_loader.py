@@ -97,6 +97,51 @@ def test_get_skill_content_missing_dir_returns_none():
     print("✓ 技能目录缺失时按名查找返回 None")
 
 
+def test_frontmatter_description_with_dashes():
+    """描述值里出现 --- 时仍按整段 YAML 解析，残余 frontmatter 不能混进正文。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "dash", "SKILL.md"),
+        "---\nname: dash-skill\ndescription: 含 --- 描述的技能\n---\n正文A\n---\n正文B",
+    )
+    loader = SkillLoader(root)
+    skills = loader.load_skills()
+    assert "dash-skill" in skills
+    assert skills["dash-skill"]["description"] == "含 --- 描述的技能"
+    assert loader.get_skill_content("dash") == "正文A\n---\n正文B"
+    print("✓ 描述含 --- 时 frontmatter 正确解析")
+
+
+def test_bom_skill_md_is_loaded_not_skipped():
+    """带 UTF-8 BOM 的 SKILL.md 不能被静默跳过，正文不能带 BOM。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    os.makedirs(os.path.join(root, "bom"))
+    with open(
+        os.path.join(root, "bom", "SKILL.md"), "w", encoding="utf-8-sig"
+    ) as handle:
+        handle.write("---\nname: bom-skill\ndescription: BOM 技能\n---\nBOM 正文")
+    loader = SkillLoader(root)
+    skills = loader.load_skills()
+    assert "bom-skill" in skills
+    content = loader.get_skill_content("bom")
+    assert content == "BOM 正文"
+    assert not content.startswith("﻿")
+    print("✓ 带 BOM 的技能正常加载且正文无 BOM")
+
+
+def test_unreadable_skills_dir_returns_empty(monkeypatch):
+    """目录不可读（PermissionError）时返回空而不是崩溃。"""
+    loader = SkillLoader(tempfile.mkdtemp(prefix="chailv_skills_"))
+
+    def denied(path):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "listdir", denied)
+    assert loader.load_skills() == {}
+    assert loader.get_skill_content("anything") is None
+    print("✓ 技能目录不可读时返回空")
+
+
 if __name__ == "__main__":
     test_load_skills_tolerates_malformed_entries()
     test_get_skill_prompt_sorted_and_mapped()
@@ -104,4 +149,11 @@ if __name__ == "__main__":
     test_get_skill_content_by_dir_and_metadata_name()
     test_get_skill_content_without_frontmatter()
     test_get_skill_content_missing_dir_returns_none()
+    test_frontmatter_description_with_dashes()
+    test_bom_skill_md_is_loaded_not_skipped()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_unreadable_skills_dir_returns_empty(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")

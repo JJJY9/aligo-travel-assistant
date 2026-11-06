@@ -5,6 +5,43 @@ import yaml
 from utils.skill_paths import resolve_skills_root
 
 
+def _frontmatter_bounds(content: str) -> tuple[int, int] | None:
+    """定位 markdown frontmatter 的 YAML 区间；没有 frontmatter 时返回 None。
+
+    结束标记必须是独立的一行 ``---``（允许行尾空白）：描述值里出现
+    ``---`` 时，裸 ``find('---', 3)`` 会在这里提前截断，把残余 frontmatter
+    混进技能正文。
+    """
+    if not content.startswith("---"):
+        return None
+    first_newline = content.find("\n")
+    if first_newline < 0:
+        return None
+    yaml_start = first_newline + 1
+    index = yaml_start
+    while index <= len(content):
+        newline = content.find("\n", index)
+        line = content[index:] if newline < 0 else content[index:newline]
+        if line.strip() == "---":
+            return yaml_start, index
+        if newline < 0:
+            return None
+        index = newline + 1
+    return None
+
+
+def _strip_frontmatter(content: str) -> str:
+    """去掉 frontmatter，返回技能正文（没有 frontmatter 时原样返回）。"""
+    bounds = _frontmatter_bounds(content)
+    if bounds is None:
+        return content.strip()
+    closing_start = bounds[1]
+    newline = content.find("\n", closing_start)
+    if newline < 0:
+        return ""
+    return content[newline + 1:].strip()
+
+
 class SkillLoader:
     """加载 .claude/skills 下的技能描述"""
     
@@ -26,8 +63,15 @@ class SkillLoader:
         if not os.path.exists(self.skills_dir):
             print(f"Warning: Skills directory {self.skills_dir} not found.")
             return {}
-            
-        for skill_name in os.listdir(self.skills_dir):
+
+        try:
+            entries = os.listdir(self.skills_dir)
+        except OSError as exc:
+            # 目录不可读（权限 / 磁盘故障）：技能清单为空而不是抛 PermissionError
+            print(f"Warning: cannot list skills directory {self.skills_dir}: {exc}")
+            return {}
+
+        for skill_name in entries:
             skill_path = os.path.join(self.skills_dir, skill_name)
             if os.path.isdir(skill_path):
                 md_file = os.path.join(skill_path, "SKILL.md")
@@ -49,27 +93,27 @@ class SkillLoader:
     def _parse_skill_md(self, file_path: str) -> dict | None:
         """解析 markdown 文件的 yaml frontmatter"""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            # utf-8-sig：带 BOM 的 SKILL.md 此前 content.startswith('---')
+            # 失败而被静默跳过
+            with open(file_path, 'r', encoding='utf-8-sig') as f:
                 content = f.read()
-                
-            # 简单的 frontmatter 解析
-            if content.startswith('---'):
-                end_idx = content.find('---', 3)
-                if end_idx != -1:
-                    yaml_content = content[3:end_idx]
-                    try:
-                        data = yaml.safe_load(yaml_content)
-                    except yaml.YAMLError as e:
-                        print(f"Error parsing YAML in {file_path}: {e}")
-                        return None
-                    # frontmatter 不是映射（如整段是字符串 / 列表）时跳过，
-                    # 否则后续 .get() 会抛 AttributeError 让所有技能加载失败
-                    if not isinstance(data, dict):
-                        print(
-                            f"Warning: frontmatter of {file_path} is not a mapping, skipped."
-                        )
-                        return None
-                    return data
+
+            bounds = _frontmatter_bounds(content)
+            if bounds is not None:
+                yaml_content = content[bounds[0]:bounds[1]]
+                try:
+                    data = yaml.safe_load(yaml_content)
+                except yaml.YAMLError as e:
+                    print(f"Error parsing YAML in {file_path}: {e}")
+                    return None
+                # frontmatter 不是映射（如整段是字符串 / 列表）时跳过，
+                # 否则后续 .get() 会抛 AttributeError 让所有技能加载失败
+                if not isinstance(data, dict):
+                    print(
+                        f"Warning: frontmatter of {file_path} is not a mapping, skipped."
+                    )
+                    return None
+                return data
             return None
         except Exception as e:
             print(f"Error reading {file_path}: {e}")
@@ -126,7 +170,14 @@ class SkillLoader:
         if not target_path:
             if not os.path.isdir(self.skills_dir):
                 return None
-            for dirname in os.listdir(self.skills_dir):
+            try:
+                entries = os.listdir(self.skills_dir)
+            except OSError as exc:
+                print(
+                    f"Warning: cannot list skills directory {self.skills_dir}: {exc}"
+                )
+                return None
+            for dirname in entries:
                 skill_dir = os.path.join(self.skills_dir, dirname)
                 if not os.path.isdir(skill_dir):
                     continue
@@ -143,15 +194,10 @@ class SkillLoader:
             return None
             
         try:
-            with open(target_path, 'r', encoding='utf-8') as f:
+            # utf-8-sig：BOM 既不能让技能被跳过，也不能原样混进注入的正文
+            with open(target_path, 'r', encoding='utf-8-sig') as f:
                 content = f.read()
-            
-            # 去除 frontmatter
-            if content.startswith('---'):
-                end_idx = content.find('---', 3)
-                if end_idx != -1:
-                    content = content[end_idx+3:].strip()
-            return content
+            return _strip_frontmatter(content)
         except Exception as e:
             print(f"Error reading skill content {target_path}: {e}")
             return None

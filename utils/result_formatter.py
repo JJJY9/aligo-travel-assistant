@@ -41,6 +41,17 @@ def preference_label(pref_type: str) -> str:
     return _PREF_NAMES.get(pref_type, pref_type)
 
 
+def _pref_value_text(value: Any) -> str:
+    """偏好 / 事项字段的可读文本：列表逐项连接，不再输出 Python repr。"""
+    if isinstance(value, (list, tuple)):
+        return "、".join(_pref_value_text(item) for item in value)
+    if isinstance(value, dict):
+        return "、".join(
+            f"{key}：{_pref_value_text(item)}" for key, item in value.items()
+        )
+    return str(value)
+
+
 def result_to_markdown(result_data: dict[str, Any]) -> str:
     """把编排结果转换为 Markdown 文本。"""
     results = result_data.get("results") or []
@@ -157,8 +168,23 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
 
     if agent_name == "preference":
         preferences = data.get("preferences")
+        legacy_preferences: dict[str, Any] | None = None
         if isinstance(preferences, dict):
-            preferences = preferences.get("preferences", [])
+            if isinstance(preferences.get("preferences"), list):
+                preferences = preferences["preferences"]
+            else:
+                # 旧格式：{type: value} 的偏好字典（历史模型输出）。此前按
+                # 嵌套列表解包，dict 没有 "preferences" 键时渲染成空
+                legacy_preferences = preferences
+                preferences = None
+        if legacy_preferences:
+            lines = ["### ✅ 已更新偏好"]
+            for pref_type, value in legacy_preferences.items():
+                if pref_type in {"has_preferences", "error"} or value is None:
+                    continue
+                name = preference_label(pref_type)
+                lines.append(f"- {name} **设置为** {_pref_value_text(value)}")
+            return "\n".join(lines) if len(lines) > 1 else ""
         if isinstance(preferences, list) and preferences:
             lines = ["### ✅ 已更新偏好"]
             for pref in preferences:
@@ -166,9 +192,11 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                     continue
                 pref_type = pref.get("type", "")
                 value = pref.get("value", "")
-                action = "追加" if pref.get("action") == "append" else "设置为"
+                # 与落库路径一致的 action 变体（Append / add / 追加）
+                action_raw = str(pref.get("action") or "replace").strip().lower()
+                action = "追加" if action_raw in {"append", "add", "追加"} else "设置为"
                 name = preference_label(pref_type)
-                lines.append(f"- {name} **{action}** {value}")
+                lines.append(f"- {name} **{action}** {_pref_value_text(value)}")
             return "\n".join(lines)
         return ""
 
@@ -180,16 +208,25 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
             ("end_date", "返程日期"),
             ("trip_purpose", "出行目的"),
         ]
+        raw_nested = data.get("data")
+        nested: dict[Any, Any] = raw_nested if isinstance(raw_nested, dict) else {}
         parts = []
         for key, label in fields:
-            value = data.get(key) or (data.get("data") or {}).get(key)
+            value = data.get(key) or nested.get(key)
             if value:
-                parts.append(f"- {label}：{value}")
+                parts.append(f"- {label}：{_pref_value_text(value)}")
         missing = data.get("missing_info") or []
+        # 模型可能返回单个字符串：直接迭代会被拆成单字
+        if isinstance(missing, str):
+            missing = [missing]
+        if not isinstance(missing, list):
+            missing = []
         if parts:
             text = "### ✅ 已收集行程信息\n" + "\n".join(parts)
             if missing:
-                text += "\n\n💡 还需要补充：" + "、".join(str(item) for item in missing)
+                text += "\n\n💡 还需要补充：" + "、".join(
+                    str(item) for item in missing
+                )
             return text
         if missing:
             return "💡 还需要补充：" + "、".join(str(item) for item in missing)

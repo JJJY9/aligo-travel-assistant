@@ -184,6 +184,22 @@ def check_skills() -> CheckResult:
     )
 
 
+def _versions_equal(left: str, right: str) -> bool:
+    """按 PEP 440 规范化比较版本：1.6.0-rc1 与 1.6.0rc1 视为同一版本。
+
+    版本号本身不是合法 PEP 440（如带后缀的自定义字符串）时退回严格字符串
+    比较，避免规范化异常把「一致的版本」误报成不一致。
+    """
+    if left == right:
+        return True
+    try:
+        from packaging.version import Version
+
+        return Version(left) == Version(right)
+    except Exception:  # noqa: BLE001 - 非法版本号退回字符串比较
+        return False
+
+
 def check_version_consistency() -> CheckResult:
     """检查 pyproject/安装元数据、静态资源版本与 ``APP_VERSION`` 是否一致。"""
     from utils.version import APP_VERSION
@@ -201,7 +217,7 @@ def check_version_consistency() -> CheckResult:
             match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
             if match:
                 checked.append("pyproject")
-                if match.group(1) != APP_VERSION:
+                if not _versions_equal(match.group(1), APP_VERSION):
                     problems.append(f"pyproject.toml 为 {match.group(1)}")
             else:
                 problems.append("pyproject.toml 中未找到 version")
@@ -217,7 +233,7 @@ def check_version_consistency() -> CheckResult:
             installed = None
         if installed:
             checked.append("wheel 元数据")
-            if installed != APP_VERSION:
+            if not _versions_equal(installed, APP_VERSION):
                 problems.append(f"wheel 元数据为 {installed}")
 
     index_html = PROJECT_ROOT / "webapp" / "static" / "index.html"
@@ -230,7 +246,11 @@ def check_version_consistency() -> CheckResult:
             versions = set(re.findall(r"\?v=([0-9][0-9A-Za-z.\-]*)", html))
             if versions:
                 checked.append("静态资源")
-                mismatched = sorted(version for version in versions if version != APP_VERSION)
+                mismatched = sorted(
+                    version
+                    for version in versions
+                    if not _versions_equal(version, APP_VERSION)
+                )
                 if mismatched:
                     problems.append(f"index.html 静态资源为 {', '.join(mismatched)}")
             else:
@@ -253,9 +273,35 @@ def check_version_consistency() -> CheckResult:
     )
 
 
+def _default_model_dir() -> Path:
+    """按 RAG 技能的同一口径解析嵌入模型目录。
+
+    锚点取技能目录所在的安装根（源码安装 = 仓库根；wheel 安装 = sys.prefix，
+    技能装在 ``<root>/.claude/skills``），再拼 ``RAG_CONFIG["embedding_model"]``。
+    此前固定用本文件上两级的 ``data/models``：wheel 安装时不指向实际路径，
+    必然误报「未下载」。
+    """
+    from utils.skill_paths import resolve_skills_root
+
+    anchor = Path(resolve_skills_root()).parent.parent
+    configured = ""
+    try:
+        from config import RAG_CONFIG
+
+        configured = str(RAG_CONFIG.get("embedding_model") or "")
+    except Exception:  # noqa: BLE001 - 配置缺失时退回默认目录名
+        configured = ""
+    if configured:
+        candidate = Path(configured).expanduser()
+        if not candidate.is_absolute():
+            candidate = anchor / candidate
+        return candidate
+    return anchor / "data" / "models" / "bge-small-zh-v1.5"
+
+
 def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
     """检查本地嵌入模型文件完整性。"""
-    model_path = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
+    model_path = Path(model_dir) if model_dir else _default_model_dir()
     required = ["config.json", "model.safetensors", "tokenizer.json"]
     recommended = ["modules.json", "1_Pooling/config.json", "vocab.txt"]
 
