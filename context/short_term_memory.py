@@ -190,7 +190,7 @@ if cut == '' then
   return n
 end
 local stale = {}
-for i = 1, n do
+for i = 0, n - 1 do
   local raw = redis.call('LINDEX', key, i)
   local ok, msg = pcall(cjson.decode, raw)
   if ok and type(msg) == 'table' and type(msg['timestamp']) == 'string'

@@ -343,13 +343,11 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
         follower.clear()
         proxy.fail = False
         reset_degraded()
-        debug_probe = RedisShortTermMemory(
-            proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
-        )
-        print("DEBUG pending:", debug_probe._pending_ops)
-        print("DEBUG before:", client.lrange(key, 0, -1))
-        assert contents(debug_probe) == []
-        print("DEBUG after:", client.lrange(key, 0, -1))
+        assert contents(
+            RedisShortTermMemory(
+                proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+            )
+        ) == []
         print("✓ 真实 Redis 上故障期变更恢复后按序重放")
     finally:
         proxy.fail = False
