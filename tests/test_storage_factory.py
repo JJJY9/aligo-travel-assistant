@@ -65,6 +65,25 @@ def test_bad_redis_falls_back():
     print("✓ Redis 不可用时仍使用 Redis 实现并走故障路径")
 
 
+def test_describe_backends_reports_long_term_degraded(monkeypatch):
+    """配置了 PostgreSQL 但已回退 JSON 时，后端描述带 long_term_degraded 标记。"""
+    _set("redis_url", "")
+    _set("postgres_dsn", "postgresql://user:pass@db.example/aligo")
+    monkeypatch.setattr(
+        storage,
+        "_failed_recently",
+        lambda key: key.startswith("postgres:"),
+    )
+    backends = storage.describe_backends()
+    assert backends["long_term"] == "json"
+    assert backends["long_term_configured"] is True
+    assert backends["long_term_degraded"] is True
+
+    monkeypatch.setattr(storage, "_failed_recently", lambda key: False)
+    assert storage.describe_backends()["long_term_degraded"] is False
+    print("✓ describe_backends 标记长期记忆回退")
+
+
 def test_bad_postgres_falls_back():
     _set("redis_url", "")
     _set("postgres_dsn", "postgresql://user:pass@127.0.0.1:1/db")
