@@ -1033,13 +1033,9 @@ def _safe_filename(value: str, fallback: str = "aligo") -> str:
 
 def _json_safe_value(value: Any) -> Any:
     """把历史遗留的 NaN / Infinity 归一为 None，避免 JSON 响应序列化失败。"""
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if isinstance(value, list):
-        return [_json_safe_value(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _json_safe_value(item) for key, item in value.items()}
-    return value
+    from utils.json_safe import sanitize_json
+
+    return sanitize_json(value)
 
 
 def _ambiguous_trip_id(trips: list[dict[str, Any]], trip_id: str) -> bool:

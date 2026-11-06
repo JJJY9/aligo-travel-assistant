@@ -590,12 +590,16 @@ def import_documents(
             continue
         valid.append(item)
     if not valid:
-        return {
+        payload: dict[str, Any] = {
             "imported": 0,
             "skipped": invalid,
             "skipped_invalid": invalid,
             "skipped_duplicate": 0,
         }
+        if dry_run:
+            # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
+            payload["would_import"] = 0
+        return payload
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 

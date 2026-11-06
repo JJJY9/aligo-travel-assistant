@@ -143,6 +143,26 @@ def test_preferences_rejects_bad_user_id(monkeypatch):
     print("✓ preferences 非法用户 ID")
 
 
+def test_preferences_dispatch_json_flexible(monkeypatch):
+    """--json 位置灵活、大小写不敏感、可重复（与 stats/sessions 一致）。"""
+    store = _FakeStore({"home_location": "北京"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for argv in (
+        ["cli.py", "preferences", "--json", "u1"],
+        ["cli.py", "preferences", "u1", "--json", "--json"],
+        ["cli.py", "preferences", "u1", "--JSON"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert '"home_location"' in buf.getvalue(), argv
+    print("✓ dispatch 层 preferences --json 位置 / 大小写 / 重复")
+
+
 def test_preferences_dispatch_strict(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -159,6 +179,7 @@ def test_preferences_dispatch_strict(monkeypatch):
     for argv in (
         ["cli.py", "preferences"],
         ["cli.py", "preferences", "-u1"],
+        ["cli.py", "preferences", "bad id"],
         ["cli.py", "preferences", "u1", "extra"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
@@ -178,6 +199,7 @@ if __name__ == "__main__":
         test_preferences_list_open_failure,
         test_preferences_rejects_bad_user_id,
         test_preferences_dispatch_strict,
+        test_preferences_dispatch_json_flexible,
     ):
         mp = pytest.MonkeyPatch()
         try:

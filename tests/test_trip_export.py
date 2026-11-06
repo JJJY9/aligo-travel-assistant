@@ -60,13 +60,6 @@ def test_empty_trips():
     print("✓ 空列表仅表头")
 
 
-if __name__ == "__main__":
-    test_header_and_rows()
-    test_formula_prefix_neutralized()
-    test_empty_trips()
-    print("\n全部通过")
-
-
 def test_ics_single_trip():
     """单条行程：全天事件、排他结束日期、全天事件前一天提醒。"""
     trip = {
@@ -110,3 +103,13 @@ def test_ics_escape_and_multiple_events():
     assert text.count("BEGIN:VEVENT") == 2
     assert text.count("UID:") == 2
     print("✓ ICS 文本转义与多事件组合")
+
+
+if __name__ == "__main__":
+    test_header_and_rows()
+    test_formula_prefix_neutralized()
+    test_empty_trips()
+    test_ics_single_trip()
+    test_ics_missing_or_invalid_dates()
+    test_ics_escape_and_multiple_events()
+    print("\n全部通过")

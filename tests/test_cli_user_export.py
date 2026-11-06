@@ -39,6 +39,15 @@ class _FakeStore:
     def get_statistics(self):
         return {"total_trips": 1, "total_messages": 2, "total_queries": 1}
 
+    def get_session_titles(self):
+        return {"s1": "出差规划"}
+
+    def get_pinned_sessions(self):
+        return ["s1"]
+
+    def get_archived_sessions(self):
+        return []
+
     def get_chat_history(self, limit=None, session_id=None):
         return [
             {"role": "user", "content": "你好", "timestamp": "2026-11-06T10:00:00"},
@@ -75,6 +84,9 @@ def test_user_export_writes_json_and_markdown(monkeypatch):
     assert data["user_id"] == "u-export"
     assert data["preferences"]["home_location"] == "北京"
     assert data["trip_history"][0]["destination"] == "上海"
+    assert data["session_titles"] == {"s1": "出差规划"}, "导出需包含会话标题"
+    assert data["pinned_sessions"] == ["s1"]
+    assert data["archived_sessions"] == []
     markdown = md_path.read_text(encoding="utf-8")
     assert "## 用户偏好" in markdown and "## 历史行程" in markdown
     assert "你好" in markdown
@@ -99,6 +111,22 @@ def test_user_export_default_dir_and_failures(monkeypatch):
 
     assert cli.run_user_export_standalone("-bad") == 1
 
+    store.fail = True
+    code, out = _run("u-fail", workdir)
+    assert code == 1 and "读取用户数据失败" in out
+
+    # 写入失败：目标目录的父级是一个普通文件（mkdir 抛 OSError）
+    store.fail = False
+    blocker = os.path.join(workdir, "blocker")
+    with open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("x")
+    code, out = _run("u-write-fail", os.path.join(blocker, "sub"))
+    assert code == 1 and "写入失败" in out
+
+    store = _FakeStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
     store.fail = True
     code, out = _run("u-fail", workdir)
     assert code == 1 and "读取用户数据失败" in out

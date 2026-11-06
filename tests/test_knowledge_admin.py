@@ -1010,6 +1010,17 @@ def test_import_dry_run_reports_skip_reasons(monkeypatch):
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"已有内容"})
+    invalid_only = knowledge_admin.import_documents(
+        [None, {"content": "  "}], dry_run=True
+    )
+    assert invalid_only == {
+        "imported": 0,
+        "skipped": 2,
+        "skipped_invalid": 2,
+        "skipped_duplicate": 0,
+        "would_import": 0,
+    }
+
     result = knowledge_admin.import_documents(
         [
             {"content": "已有内容"},

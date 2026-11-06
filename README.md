@@ -481,8 +481,6 @@ python cli.py
 | `status` | 查看当前状态和记忆 |
 | `health` | 检查 LLM 服务是否可用并显示熔断器状态 |
 | `doctor` | 环境自检：依赖 / API Key / 记忆存储后端 / 嵌入模型文件 / 知识库 / LLM 连通性 |
-| `user-export` | 全部数据导出：`python cli.py user-export <user_id> [dir]`（JSON + Markdown） |
-| `stats` | 用户数据概览：`python cli.py stats <user_id> [--json]`（偏好 / 行程统计 / 会话消息数，与记忆面板同口径） |
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
 | `preferences` | 查看用户偏好 |
@@ -499,9 +497,9 @@ python cli.py
 
 知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 分片序号 + 60 字预览）；`python cli.py kb-categories [--json]` 按数量倒序统计分类分布；`python cli.py kb-search <关键词> [--top-k N] [--json]` 语义检索（与 Web 面板、RAG 问答同一条链路）；`python cli.py kb-show <id> [--json]` 查看片段（多分片按整篇拼接，与面板「编辑整份」同一实现）；`python cli.py kb-delete <id> [--group]` 删除指定片段（`--group` 时连同同一拆分组的其余分片）；`python cli.py kb-duplicates [limit]` 只读扫描内容完全相同的**独立**片段组（`limit=0` 显示全部，多分片记录不参与，需整份维护）。
 
-偏好列表（不进入交互）：`python cli.py preferences <user_id>` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否）。
+偏好列表（不进入交互）：`python cli.py preferences <user_id> [--json]` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否；`--json` 输出原始值）。
 
-行程列表（不进入交互）：`python cli.py trips <user_id>` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
+行程列表（不进入交互）：`python cli.py trips <user_id> [--json]` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示）；`--json` 输出原始行程（含状态与冲突）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id> [--dry-run]` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），`--dry-run` 只列出将被删除的记录；同一 trip_id 出现在多条不同行程里（历史数据异常）时拒绝自动删除并提示人工处理；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
@@ -509,7 +507,9 @@ python cli.py
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部、`--query <关键词>` 按标题与消息内容过滤并附命中片段、`--json` 输出机器可读列表；`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复会话；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
 
-全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir]` 把偏好、历史行程、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令同一实现）。
+全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir]` 把偏好、历史行程、会话标题 / 置顶 / 归档、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令字段一致）。
+
+用户数据概览（不进入交互）：`python cli.py stats <user_id> [--json]` 汇总偏好条数、行程统计（总行程 / 出行天数 / 到访城市 / 进行中 / 即将出行）与会话 / 消息 / 归档数量，与 Web 记忆面板同口径。
 
 全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`；中文或超长用户名会追加短哈希避免重名；按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
 

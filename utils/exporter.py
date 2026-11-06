@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from utils.json_safe import sanitize_json
+
 
 def render_markdown(data: dict[str, Any]) -> str:
     """把导出数据渲染为 Markdown 文本。"""
@@ -88,6 +90,9 @@ def export_files(
 
     json_path = out / f"{stem}.json"
     md_path = out / f"{stem}.md"
-    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(sanitize_json(data), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     md_path.write_text(render_markdown(data), encoding="utf-8")
     return [json_path, md_path]
