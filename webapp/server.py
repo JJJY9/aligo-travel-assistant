@@ -849,33 +849,9 @@ def _enforce_rate_limit(
     """
     client = _client_host(request)
     user_key = f"{client}:{user_id}"
-    # 先用 peek 检查两个桶，都有额度才记录：否则被 429 的请求会消耗
-    # 另一个桶的配额，一个客户端的重试循环会把同 IP 的其它客户端一起锁死
-    retry_after = state.rate_limiter.peek(user_key)
-    ip_retry_after = state.ip_limiter.peek(client)
-    if retry_after is not None or ip_retry_after is not None:
-        # 429 的额度头描述真正触发限制的桶（等待更久的那个）
-        if (retry_after or 0.0) >= (ip_retry_after or 0.0):
-            limit = state.rate_limiter.limit
-        else:
-            limit = state.ip_limiter.limit
-        # HTTP Retry-After 需要整数秒，向上取整并至少 1 秒
-        wait_seconds = max(
-            1, math.ceil(max(retry_after or 0.0, ip_retry_after or 0.0))
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
-        )
-    # peek 与 check 之间额度可能被并发请求抢走：check 返回非 None 时请求已
-    # 超额，必须按它的结果拒绝，否则会放行超出额度的请求
+
     def _over_limit(limit: int, retry_after: float) -> HTTPException:
+        """429 响应：Retry-After 取整数秒（向上取整、至少 1 秒）。"""
         wait_seconds = max(1, math.ceil(retry_after))
         return HTTPException(
             status_code=429,
@@ -888,6 +864,19 @@ def _enforce_rate_limit(
             },
         )
 
+    # 先用 peek 检查两个桶，都有额度才记录：否则被 429 的请求会消耗
+    # 另一个桶的配额，一个客户端的重试循环会把同 IP 的其它客户端一起锁死
+    retry_after = state.rate_limiter.peek(user_key)
+    ip_retry_after = state.ip_limiter.peek(client)
+    if retry_after is not None or ip_retry_after is not None:
+        # 429 的额度头描述真正触发限制的桶（等待更久的那个）
+        if (retry_after or 0.0) >= (ip_retry_after or 0.0):
+            limit = state.rate_limiter.limit
+        else:
+            limit = state.ip_limiter.limit
+        raise _over_limit(limit, max(retry_after or 0.0, ip_retry_after or 0.0))
+    # peek 与 check 之间额度可能被并发请求抢走：check 返回非 None 时请求已
+    # 超额，必须按它的结果拒绝，否则会放行超出额度的请求
     user_retry = state.rate_limiter.check(user_key)
     if user_retry is not None:
         raise _over_limit(state.rate_limiter.limit, user_retry)
