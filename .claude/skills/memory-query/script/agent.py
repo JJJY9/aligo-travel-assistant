@@ -13,6 +13,7 @@
 - 用户询问："我之前说过什么偏好？"
 - 用户询问："我上次去北京是什么时候？"
 """
+import asyncio
 import json
 import logging
 import os
@@ -119,11 +120,11 @@ class MemoryQueryAgent(AgentBase):
         chat_summary = ""
 
         if self.memory_manager:
-            # 取全部行程：截断会让「我去过昆明吗」在超过 50 条时误答没有记录
-            trip_history = self.memory_manager.long_term.get_trip_history(limit=None)
-
-            # 获取用户偏好
-            preferences = self.memory_manager.long_term.get_preference()
+            # 行程 / 偏好是阻塞查询（JSON 文件、PostgreSQL 网络往返）：
+            # 放到线程池执行，留在事件循环线程会冻结同进程所有 SSE 流
+            trip_history, preferences = await asyncio.to_thread(
+                self._load_long_term_context
+            )
 
             # 获取历史对话摘要（如果有LLM的话）
             try:
@@ -209,6 +210,16 @@ class MemoryQueryAgent(AgentBase):
                 }),
                 role="assistant"
             )
+
+    def _load_long_term_context(self) -> tuple[list[dict], dict]:
+        """同步读取行程与偏好（供 ``asyncio.to_thread`` 调用）。
+
+        取全部行程：截断会让「我去过昆明吗」在超过 50 条时误答没有记录。
+        """
+        return (
+            self.memory_manager.long_term.get_trip_history(limit=None),
+            self.memory_manager.long_term.get_preference(),
+        )
 
     def _format_trip_history(self, trip_history: list[dict]) -> str:
         """格式化旅行历史"""

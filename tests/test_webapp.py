@@ -463,6 +463,148 @@ def test_chat_stream_failure_event():
     print("✓ 流式对话失败推送 error 事件（先推送会话 ID）")
 
 
+def _stream_error_message(monkeypatch, exc):
+    """注入一个必然失败的运行时，返回 SSE 最后的 error 事件文案。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+
+    class _Runtime:
+        async def ask(self, message, on_event=None):
+            raise exc
+
+    class _Session:
+        session_id = "s-inject"
+        runtime = _Runtime()
+
+        def begin_turn(self):
+            pass
+
+        def end_turn(self):
+            pass
+
+        def in_use(self):
+            return False
+
+        def long_in_use(self, *_):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        state, "get_session", lambda user, sid, mark=False: _Session()
+    )
+    client = TestClient(app)
+    with client.stream(
+        "POST",
+        "/api/chat/stream",
+        json={
+            "message": "你好",
+            "user_id": f"u-inject-{uuid.uuid4().hex[:8]}",
+            "session_id": "s-inject",
+        },
+    ) as response:
+        assert response.status_code == 200
+        events = [
+            json.loads(line[5:].strip())
+            for line in response.iter_lines()
+            if line.startswith("data:")
+        ]
+    assert events and events[-1]["type"] == "error"
+    return events[-1]["message"]
+
+
+def test_chat_stream_error_event_redacts_internal_details(monkeypatch):
+    """未预期异常的原始文本可能含 SQL / 路径 / 上游响应，不能透给客户端。"""
+    message = _stream_error_message(
+        monkeypatch, RuntimeError("数据库密码=secret123 文件 /opt/data/full")
+    )
+    assert "secret123" not in message
+    assert "/opt/data" not in message
+    assert "服务器内部错误" in message and "请求 ID" in message
+    print("✓ SSE 错误事件脱敏内部异常文本")
+
+
+def test_chat_stream_user_facing_error_keeps_curated_message(monkeypatch):
+    """UserFacingError 是给用户看的固定文案，应原样返回。"""
+    from utils.errors import UserFacingError
+
+    message = _stream_error_message(
+        monkeypatch, UserFacingError("意图识别结果解析失败，请重试")
+    )
+    assert "意图识别结果解析失败" in message
+    print("✓ SSE 返回 UserFacingError 的用户提示")
+
+
+def test_chat_stream_storage_error_maps_friendly_message(monkeypatch):
+    """存储故障按「存储暂时不可用」返回，不泄露内部细节。"""
+    from utils.errors import MemoryPersistenceError
+
+    message = _stream_error_message(
+        monkeypatch, MemoryPersistenceError("disk /data/full")
+    )
+    assert "存储暂时不可用" in message
+    assert "/data/full" not in message
+    print("✓ SSE 存储故障返回友好提示")
+
+
+def test_get_session_constructs_outside_lock(monkeypatch):
+    """并发首请求各自在锁外构造；后到者关闭自己新建的运行时回收连接。"""
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 10
+
+    barrier = threading.Barrier(2, timeout=10)
+    created = []
+    closed = []
+
+    class _SlowSession:
+        def __init__(self, user_id, session_id, model, breaker):
+            created.append(session_id)
+            # 两个线程都必须先完成第一次锁检查、进入构造
+            barrier.wait()
+            self.session_id = session_id
+            self._turns = 0
+
+        def begin_turn(self):
+            self._turns += 1
+
+        def end_turn(self):
+            self._turns -= 1
+
+        def in_use(self):
+            return False
+
+        def long_in_use(self, *_):
+            return False
+
+        def close(self):
+            closed.append(self.session_id)
+
+    monkeypatch.setattr(server_module, "_WebSession", _SlowSession)
+
+    results = []
+
+    def worker():
+        results.append(state.get_session("u-conc", "s-conc", True))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created) == 2, "两个线程都应在缓存锁外完成构造"
+    assert len({id(item) for item in results}) == 1, "最终应返回同一实例"
+    assert closed == ["s-conc"], "竞争失败的实例必须关闭"
+    key = state._session_key("u-conc", "s-conc")
+    assert state.sessions[key] is results[0]
+    assert results[0]._turns == 2, "两个并发请求各自登记一次占用"
+    print("✓ 会话构造移出缓存锁且竞争失败实例被关闭")
+
+
 def test_sessions_listing_and_delete():
     client = _client()
     user_id = _unique_user("web_test_hist")
@@ -4883,6 +5025,17 @@ if __name__ == "__main__":
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
+    for case in (
+        test_chat_stream_error_event_redacts_internal_details,
+        test_chat_stream_user_facing_error_keeps_curated_message,
+        test_chat_stream_storage_error_maps_friendly_message,
+        test_get_session_constructs_outside_lock,
+    ):
+        mp = pytest.MonkeyPatch()
+        try:
+            case(mp)
+        finally:
+            mp.undo()
     _mp = pytest.MonkeyPatch()
     try:
         test_knowledge_documents_api(_mp)

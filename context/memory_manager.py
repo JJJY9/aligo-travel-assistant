@@ -2,6 +2,7 @@
 记忆管理器 (Memory Manager)
 统一管理两层记忆，提供简单的API
 """
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -207,6 +208,26 @@ class MemoryManager:
         self.short_term.clear()
         logger.info(f"Session ended: {self.session_id}")
 
+    def _summary_inputs(self) -> tuple[list[dict], list[dict]]:
+        """同步读取跨会话总结的输入（聊天窗口 + 行程），供 ``to_thread`` 调用。
+
+        只取最后固定窗口条会被当前会话自身占满（长会话几十轮后其它会话
+        历史永远为空），因此按「当前会话消息数 + 窗口」取数，保证至少有
+        窗口条其它会话的消息。
+        """
+        own_messages = len(
+            self.long_term.get_chat_history(session_id=self.session_id)
+        )
+        all_history = self.long_term.get_chat_history(
+            limit=_SUMMARY_WINDOW_MESSAGES + own_messages
+        )
+        history_from_other_sessions = [
+            msg for msg in all_history
+            if msg.get("session_id") != self.session_id
+        ]
+        trip_history = self.long_term.get_trip_history(limit=20)
+        return history_from_other_sessions, trip_history
+
     async def get_long_term_summary_async(self, max_messages: int = 50) -> str:
         """
         使用LLM总结长期聊天历史（异步版本）
@@ -222,27 +243,20 @@ class MemoryManager:
         if not self.llm_model:
             return ""
 
-        # 获取长期聊天历史（排除当前会话）。只取最后固定窗口条会被
-        # 当前会话自身占满（长会话几十轮后其它会话历史永远为空），因此按
-        # 「当前会话消息数 + 窗口」取数，保证至少有窗口条其它会话的消息。
-        own_messages = len(
-            self.long_term.get_chat_history(session_id=self.session_id)
-        )
-        all_history = self.long_term.get_chat_history(
-            limit=_SUMMARY_WINDOW_MESSAGES + own_messages
-        )
-        history_from_other_sessions = [
-            msg for msg in all_history
-            if msg.get("session_id") != self.session_id
-        ]
+        # 失败冷却先检查：冷却期内直接返回，避免每轮都为了几秒后必然
+        # 被丢弃的结果做一遍阻塞查询
+        if time.monotonic() < self._summary_failure_until:
+            return ""
 
-        # 获取行程历史
-        trip_history = self.long_term.get_trip_history(limit=20)
+        # 聊天窗口 / 行程查询是阻塞 IO（JSON 文件、PostgreSQL 网络往返），
+        # 放到线程池执行：留在事件循环线程会冻结同进程所有 SSE 流，
+        # 即使随后命中总结缓存或走空历史提前返回
+        history_from_other_sessions, trip_history = await asyncio.to_thread(
+            self._summary_inputs
+        )
 
         # 如果既没有聊天记录也没有行程记录，直接返回
         if not history_from_other_sessions and not trip_history:
-            return ""
-        if time.monotonic() < self._summary_failure_until:
             return ""
 
         # 指纹要能感知「其它会话的消息被删除后由更旧消息补位」：
@@ -372,8 +386,6 @@ class MemoryManager:
         Returns:
             总结后的文本
         """
-        import asyncio
-
         # 检查是否在事件循环中
         try:
             asyncio.get_running_loop()

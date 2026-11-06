@@ -152,6 +152,83 @@ def test_access_log_strips_control_characters():
     print("✓ 访问日志清理 CR/LF 与转义字符")
 
 
+def test_release_probe_returns_half_open_slot(monkeypatch):
+    """归还半开名额：试探被取消后其它请求可立即重试；已记录后不再放行。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=2
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+    assert breaker.allow_call() is True
+    assert breaker.allow_call() is False
+    breaker.release_probe()
+    assert breaker.allow_call() is True, "归还名额后应立即允许新的试探"
+
+    breaker.record_failure()
+    assert breaker.allow_call() is False
+    breaker.release_probe()
+    assert breaker.allow_call() is False, "已记录失败后 release_probe 不应放行"
+    print("✓ 半开试探名额可归还且不会绕过失败")
+
+
+def test_conversation_ask_releases_probe_on_cancel(monkeypatch):
+    """半开试探请求被取消（用户停止 / 断网）：名额必须归还，否则其它用户被拒。"""
+    from agents.conversation import ConversationRuntime
+
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 161.0
+
+    runtime = object.__new__(ConversationRuntime)
+    runtime.user_id = "u-probe"
+    runtime.session_id = "s-probe"
+    runtime.model = None
+    runtime.circuit_breaker = breaker
+    runtime._probe_recorded = False
+
+    class _Memory:
+        def __init__(self):
+            self.long_term = self
+            self.short_term = self
+
+        def reload_long_term(self):
+            pass
+
+        def get_preference(self):
+            return {}
+
+        def get_recent_context(self, n_turns=5):
+            return []
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+        def add_message(self, role, content, metadata=None):
+            pass
+
+    class _Intention:
+        async def reply(self, context):
+            raise asyncio.CancelledError
+
+    runtime.memory = _Memory()
+    runtime.intention_agent = _Intention()
+    runtime.orchestrator = object()
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await runtime.ask("你好")
+
+    asyncio.run(scenario())
+    assert breaker.allow_call() is True, "取消后应归还半开试探名额"
+    print("✓ 半开试探在被取消时归还名额")
+
+
 def test_memory_persistence_error_does_not_trip_breaker():
     """记忆写盘失败不能计入熔断器（磁盘故障与 LLM 健康无关）。"""
     from agents.conversation import ConversationRuntime
@@ -198,6 +275,8 @@ if __name__ == "__main__":
         test_failure_after_recovery_timeout_reopens(_mp)
         test_build_turn_meta_tolerates_non_list_shapes()
         test_access_log_strips_control_characters()
+        test_release_probe_returns_half_open_slot(_mp)
+        test_conversation_ask_releases_probe_on_cancel(_mp)
         test_memory_persistence_error_does_not_trip_breaker()
     finally:
         _mp.undo()

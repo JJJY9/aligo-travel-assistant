@@ -13,6 +13,7 @@ import logging
 import re
 from typing import Any
 
+from utils.errors import MemoryPersistenceError
 from utils.preference_values import merge_preference_value
 
 logger = logging.getLogger(__name__)
@@ -165,12 +166,22 @@ class PostgresLongTermMemory:
         logger.info("PostgreSQL 连接已重建（user=%s）", self.user_id)
 
     def _run_with_retry(self, operation):
-        """执行一次数据库操作；连接级错误时重连并重试一次。"""
+        """执行一次数据库操作；连接级错误时重连并重试一次。
+
+        重试后仍失败统一包装为 ``MemoryPersistenceError``：调用方按「存储
+        暂时不可用」降级（Web 返回 503、对话运行时不计入 LLM 熔断器），
+        而不是把裸 ``psycopg.OperationalError`` 当成未知 500 或 LLM 故障。
+        """
         try:
             return operation()
         except self._retry_errors:
-            self._reconnect()
-            return operation()
+            try:
+                self._reconnect()
+                return operation()
+            except self._retry_errors as retry_exc:
+                raise MemoryPersistenceError(
+                    f"PostgreSQL 操作失败：{retry_exc}"
+                ) from retry_exc
 
     @staticmethod
     def _json(value: Any) -> Any:

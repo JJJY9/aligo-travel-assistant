@@ -595,6 +595,37 @@ def test_pg_reconnects_after_connection_error():
     print("✓ PostgreSQL 连接失效后重连重试")
 
 
+def test_pg_failed_retry_wrapped_as_memory_error():
+    """重连后仍失败：包装为 MemoryPersistenceError（按存储不可用降级）。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    class _Boom(Exception):
+        pass
+
+    class _BrokenConn:
+        def cursor(self):
+            raise _Boom("server closed the connection")
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store.dsn = "postgresql://example/db"
+    store._conn = _BrokenConn()
+    store._retry_errors = (_Boom,)
+
+    def broken_reconnect():
+        raise _Boom("connection refused")
+
+    store._reconnect = broken_reconnect
+    try:
+        store._fetchall("SELECT 1")
+    except MemoryPersistenceError as exc:
+        assert "PostgreSQL" in str(exc)
+    else:
+        raise AssertionError("重试后仍失败应包装为 MemoryPersistenceError")
+    print("✓ PostgreSQL 重试失败包装为存储不可用")
+
+
 def test_falsey_preferences_included_in_context():
     """0 / False 是合法偏好，必须进入 Agent 上下文；空串视为未设置。"""
     from context.memory_manager import MemoryManager
@@ -1205,6 +1236,7 @@ if __name__ == "__main__":
     test_migrate_fills_statistics_defaults()
     test_migrate_drops_non_object_entries()
     test_pg_reconnects_after_connection_error()
+    test_pg_failed_retry_wrapped_as_memory_error()
     test_falsey_preferences_included_in_context()
     test_path_locks_do_not_grow_unbounded()
     test_load_holds_path_lock()

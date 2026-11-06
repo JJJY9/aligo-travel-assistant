@@ -11,6 +11,8 @@ import os
 import sys
 import threading
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -140,7 +142,101 @@ def test_ask_survives_memory_snapshot_shape():
     print("✓ 空记忆快照时上下文只有当前输入")
 
 
+def test_ask_releases_half_open_probe_on_early_failure(monkeypatch):
+    """半开试探在调用 LLM 前失败（如写锁超时）：名额必须归还。"""
+    from utils.circuit_breaker import CircuitBreaker
+    from utils.errors import MemoryPersistenceError
+
+    times = {"now": 100.0}
+    monkeypatch.setattr("utils.circuit_breaker.time.monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=2
+    )
+    breaker.record_failure()
+    times["now"] = 161.0
+
+    runtime, memory = _make_runtime()
+    runtime.circuit_breaker = breaker
+
+    def boom():
+        raise MemoryPersistenceError("磁盘已满")
+
+    memory.reload_long_term = boom  # type: ignore[method-assign]
+    with pytest.raises(MemoryPersistenceError):
+        asyncio.run(runtime.ask("你好"))
+    assert breaker.allow_call() is True, "提前失败后应归还半开试探名额"
+    print("✓ 半开试探在提前失败时归还名额")
+
+
+def test_parse_failure_is_user_facing_error():
+    """意图 / 编排解析失败使用 UserFacingError（仅这类文案可原样透出）。"""
+    from utils.errors import UserFacingError
+
+    runtime, _ = _make_runtime()
+
+    class _BadIntention:
+        async def reply(self, context):
+            return _Response("这不是 JSON")
+
+    runtime.intention_agent = _BadIntention()
+    with pytest.raises(UserFacingError):
+        asyncio.run(runtime.ask("你好"))
+    print("✓ 解析失败使用 UserFacingError")
+
+
+def test_summary_inputs_off_event_loop():
+    """跨会话总结的聊天 / 行程查询不能在事件循环线程执行。"""
+    from context.memory_manager import MemoryManager
+
+    class _FakeLongTerm:
+        def __init__(self):
+            self.threads: list[int] = []
+
+        def get_chat_history(self, session_id=None, limit=None):
+            self.threads.append(threading.get_ident())
+            return [
+                {
+                    "session_id": "other",
+                    "role": "user",
+                    "content": "另一会话的消息",
+                    "timestamp": "t1",
+                }
+            ]
+
+        def get_trip_history(self, limit=None):
+            self.threads.append(threading.get_ident())
+            return []
+
+    class _FakeModel:
+        async def __call__(self, messages, **kwargs):
+            return {"content": [{"type": "text", "text": "历史摘要"}]}
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.user_id = "u-summary"
+    manager.session_id = "s-summary"
+    manager.llm_model = _FakeModel()
+    manager.long_term = _FakeLongTerm()
+    manager._summary_cache = None
+    manager._summary_failure_until = 0.0
+
+    loop_thread = threading.get_ident()
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    assert summary
+    assert manager.long_term.threads, "应查询聊天历史 / 行程"
+    assert all(tid != loop_thread for tid in manager.long_term.threads), (
+        "总结的同步查询在事件循环线程执行，会冻结所有 SSE 流"
+    )
+    print("✓ 总结查询离开事件循环线程")
+
+
 if __name__ == "__main__":
-    test_ask_runs_memory_io_off_event_loop()
-    test_ask_survives_memory_snapshot_shape()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_ask_runs_memory_io_off_event_loop()
+        test_ask_survives_memory_snapshot_shape()
+        test_ask_releases_half_open_probe_on_early_failure(mp)
+    finally:
+        mp.undo()
+    test_parse_failure_is_user_facing_error()
+    test_summary_inputs_off_event_loop()
     print("\n全部通过")
