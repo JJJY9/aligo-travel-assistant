@@ -190,6 +190,98 @@ def test_itinerary_malformed_shapes_do_not_crash():
     print("✓ 非标准行程结构 / 非对象 data 不崩溃")
 
 
+def test_event_collection_and_memory_query():
+    """事项收集（字段 / 缺失提示）与记忆查询的渲染。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "event_collection",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {
+                        "origin": "北京",
+                        "destination": "杭州",
+                        "start_date": "2026-12-01",
+                        "missing_info": ["返程日期", "出行目的"],
+                    },
+                },
+                {
+                    "agent_name": "memory_query",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {"answer": "你上次去过上海"},
+                },
+            ]
+        )
+    )
+    assert "已收集行程信息" in md
+    assert "出发地：北京" in md and "目的地：杭州" in md
+    assert "还需要补充：返程日期、出行目的" in md
+    assert "你上次去过上海" in md
+
+    # 只有缺失提示、没有已收集字段
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "event_collection",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {"missing_info": ["出发地"]},
+                }
+            ]
+        )
+    )
+    assert md == "💡 还需要补充：出发地"
+    print("✓ 事项收集 / 记忆查询渲染")
+
+
+def test_information_query_variants_and_fallback_agent():
+    """信息查询的字符串来源 / 扁平结果，以及未知智能体的通用兜底。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "information_query",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {
+                        "summary": "杭州明天小雨",
+                        "sources": ["https://example.com/a", {"url": "https://example.com/b"}],
+                    },
+                },
+                {
+                    "agent_name": "travel_tips",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {"summary": "建议提前订票"},
+                },
+            ]
+        )
+    )
+    assert "杭州明天小雨" in md
+    assert "1. https://example.com/a" in md
+    assert "2. https://example.com/b" in md
+    assert "建议提前订票" in md
+
+    # preferences 被包成 {"preferences": [...]} 的形态
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {"preferences": {"preferences": [{"type": "home_location", "value": "上海", "action": "append"}]}},
+                }
+            ]
+        )
+    )
+    assert "常驻地 **追加** 上海" in md
+    print("✓ 信息查询来源变体 / 未知智能体兜底 / 偏好包一层")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -199,4 +291,6 @@ if __name__ == "__main__":
     test_error_result()
     test_no_agents()
     test_itinerary_malformed_shapes_do_not_crash()
+    test_event_collection_and_memory_query()
+    test_information_query_variants_and_fallback_agent()
     print("\n全部通过")
