@@ -89,7 +89,7 @@ def test_kb_import_and_list_reject_extra_args(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_knowledge_list_standalone",
-        lambda query="": calls.__setitem__("list", calls["list"] + 1) or 0,
+        lambda query="", as_json=False: calls.__setitem__("list", calls["list"] + 1) or 0,
     )
 
     code, _ = _main_exit(monkeypatch, ["cli.py", "kb-import", "a.json", "extra"])

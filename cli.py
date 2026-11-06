@@ -1515,8 +1515,13 @@ def run_knowledge_import_standalone(
     return 0
 
 
-def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
-    """列出知识片段（用于 `python cli.py kb-list [关键词]`）。
+def run_knowledge_list_standalone(
+    query: str = "", limit: int = 50, as_json: bool = False
+) -> int:
+    """列出知识片段（`python cli.py kb-list [关键词] [--json]`）。
+
+    ``--json`` 输出 ``{ok, query, total, count, items}``（items 为原始
+    id / content / metadata）。
 
     Returns:
         0 列出成功；1 知识库不可用或读取失败
@@ -1526,16 +1531,54 @@ def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
 
     status = knowledge_status()
     if not status.get("available"):
-        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        reason = status.get("reason", "未知原因")
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"知识库不可用：{reason}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"知识库不可用：{reason}")
         return 1
     try:
         data = list_documents(limit=limit, offset=0, query=query)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"读取失败：{exc}")
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"读取失败：{exc}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"读取失败：{exc}")
         return 1
 
     items = data.get("items") or []
     total = data.get("total", len(items))
+    if as_json:
+        from utils.json_safe import sanitize_json
+
+        print(
+            json.dumps(
+                sanitize_json(
+                    {
+                        "ok": True,
+                        "query": query,
+                        "total": total,
+                        "count": len(items),
+                        "items": items,
+                    }
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     suffix = f"（关键词：{query}）" if query else ""
     print(f"共 {total} 条{suffix}，显示前 {len(items)} 条（按 id 倒序）")
     for item in items:
@@ -4302,13 +4345,25 @@ def main():
                 )
             )
         if arg == "kb-list":
-            if len(sys.argv) > 3 or (
-                len(sys.argv) == 3 and sys.argv[2].startswith("-")
-            ):
-                print("用法：python cli.py kb-list [关键词]")
+            positional: list[str] = []
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                if item.lower() == "--json":
+                    as_json = True
+                elif item.startswith("-") or len(positional) >= 1:
+                    valid = False
+                    break
+                else:
+                    positional.append(item)
+            if not valid:
+                print("用法：python cli.py kb-list [关键词] [--json]")
                 sys.exit(2)
-            keywords = sys.argv[2] if len(sys.argv) > 2 else ""
-            sys.exit(run_knowledge_list_standalone(keywords))
+            sys.exit(
+                run_knowledge_list_standalone(
+                    positional[0] if positional else "", as_json=as_json
+                )
+            )
         if arg == "kb-search":
             parsed_search = _parse_kb_search_args(sys.argv[2:])
             if parsed_search is None:
