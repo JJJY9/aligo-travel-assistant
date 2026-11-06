@@ -324,6 +324,108 @@ def test_kb_show_dispatch(monkeypatch):
     print("✓ dispatch 层 kb-show 正常执行 / 多余参数拒绝")
 
 
+def test_add_from_file(monkeypatch):
+    import tempfile
+    from pathlib import Path
+
+    calls = {}
+
+    def fake_add(content, metadata=None):
+        calls.update(content=content, metadata=metadata)
+        return {"status": "success", "id": 42, "total_count": 3, "parts": 2}
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "add_document", fake_add)
+    path = Path(tempfile.mkdtemp()) / "doc.txt"
+    path.write_text("\ufeff新的知识内容", encoding="utf-8")
+    code, out = _capture(
+        cli.run_knowledge_add_standalone,
+        str(path),
+        {"category": "住宿"},
+    )
+    assert code == 0
+    assert calls["content"] == "新的知识内容", "应容忍 UTF-8 BOM"
+    assert calls["metadata"] == {"category": "住宿"}
+    assert "已添加知识片段 #42（共 3 条，拆分为 2 片）" in out
+    print("✓ kb-add 从文件新增（BOM / 元数据 / 分片提示）")
+
+
+def test_add_and_update_failures(monkeypatch):
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    missing = str(Path(tempfile.mkdtemp()) / "missing.txt")
+    code, out = _capture(cli.run_knowledge_add_standalone, missing)
+    assert code == 1 and "读取文件失败" in out
+
+    empty = Path(tempfile.mkdtemp()) / "empty.txt"
+    empty.write_text("   ", encoding="utf-8")
+    code, out = _capture(cli.run_knowledge_add_standalone, str(empty))
+    assert code == 1 and "不能为空" in out
+
+    def boom(content, metadata=None):
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "add_document", boom)
+    doc = Path(tempfile.mkdtemp()) / "doc.txt"
+    doc.write_text("内容", encoding="utf-8")
+    code, out = _capture(cli.run_knowledge_add_standalone, str(doc))
+    assert code == 1 and "添加失败" in out
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "update_document",
+        lambda doc_id, content, metadata=None: (_ for _ in ()).throw(
+            ValueError("旧数据没有 group")
+        ),
+    )
+    code, out = _capture(cli.run_knowledge_update_standalone, 7, str(doc))
+    assert code == 1 and "旧数据没有 group" in out
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "update_document",
+        lambda doc_id, content, metadata=None: {"status": "success", "id": doc_id},
+    )
+    code, out = _capture(
+        cli.run_knowledge_update_standalone, 7, str(doc), {"title": "标题"}
+    )
+    assert code == 0 and "已更新知识片段 #7" in out
+    print("✓ kb-add / kb-update 失败路径与更新成功")
+
+
+def test_kb_write_args_and_dispatch(monkeypatch):
+    assert cli._parse_kb_write_args(["a.txt"]) == (["a.txt"], {})
+    assert cli._parse_kb_write_args(
+        ["a.txt", "--category", "住宿", "--title=标题"]
+    ) == (["a.txt"], {"category": "住宿", "title": "标题"})
+    assert cli._parse_kb_write_args(["a.txt", "--category"]) is None
+    assert cli._parse_kb_write_args(["--bad", "a.txt"]) is None
+
+    calls = {}
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_add_standalone",
+        lambda path, meta=None: calls.update(path=path, meta=meta) or 0,
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "kb-add", "a.txt", "--title", "标题"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls == {"path": "a.txt", "meta": {"title": "标题"}}
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-update", "7"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2 and "用法" in buf.getvalue()
+    print("✓ kb-add / kb-update 参数解析与 dispatch")
+
+
 def test_delete_success(monkeypatch):
     calls = []
 
@@ -470,6 +572,9 @@ if __name__ == "__main__":
         test_show_success_and_json,
         test_show_missing_and_error,
         test_kb_show_dispatch,
+        test_add_from_file,
+        test_add_and_update_failures,
+        test_kb_write_args_and_dispatch,
     ):
         mp = pytest.MonkeyPatch()
         try:
