@@ -219,6 +219,86 @@ def test_concurrent_misses_share_upstream_request(monkeypatch):
     print("✓ 同城并发未命中合并为一次上游请求")
 
 
+def test_leader_recheck_uses_result_written_by_other_thread(monkeypatch):
+    """登记在途后、请求上游前，其它线程刚好写入了缓存：直接复用并释放在途登记。"""
+    cache_hits = {"n": 0}
+    cached_value = {"city": "北京", "current": {"description": "晴"}}
+
+    def fake_cache_hit(key):
+        cache_hits["n"] += 1
+        return None if cache_hits["n"] == 1 else cached_value
+
+    monkeypatch.setattr(weather, "_cache_hit", fake_cache_hit)
+    monkeypatch.setattr(weather, "_failure_hit", lambda key: None)
+    events = []
+
+    def fake_claim(key):
+        event = threading.Event()
+        events.append(event)
+        return True, event
+
+    monkeypatch.setattr(weather, "_claim_fetch", fake_claim)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("命中缓存后不应请求上游")
+
+    monkeypatch.setattr(weather, "_fetch_weather_uncached", boom)
+    result = weather.fetch_weather("北京")
+    assert result is cached_value
+    assert events[0].is_set(), "返回前应释放在途登记"
+
+
+def test_leader_recheck_raises_failure_written_by_other_thread(monkeypatch):
+    """登记在途后别的线程记录了失败：直接抛出并释放在途登记。"""
+    failures = {"n": 0}
+
+    def fake_failure(key):
+        failures["n"] += 1
+        return None if failures["n"] == 1 else "天气接口暂时不可用：boom"
+
+    monkeypatch.setattr(weather, "_cache_hit", lambda key: None)
+    monkeypatch.setattr(weather, "_failure_hit", fake_failure)
+    events = []
+
+    def fake_claim(key):
+        event = threading.Event()
+        events.append(event)
+        return True, event
+
+    monkeypatch.setattr(weather, "_claim_fetch", fake_claim)
+    with pytest.raises(weather.WeatherError, match="暂时不可用"):
+        weather.fetch_weather("北京")
+    assert events[0].is_set()
+
+
+def test_follower_uses_cached_result_or_failure(monkeypatch):
+    """等待领先线程后：缓存命中直接复用；失败缓存则抛出。"""
+    event = threading.Event()
+    event.set()
+    monkeypatch.setattr(weather, "_claim_fetch", lambda key: (False, event))
+
+    cache_hits = {"n": 0}
+
+    def fake_cache(key):
+        cache_hits["n"] += 1
+        return None if cache_hits["n"] == 1 else {"city": "北京"}
+
+    monkeypatch.setattr(weather, "_cache_hit", fake_cache)
+    monkeypatch.setattr(weather, "_failure_hit", lambda key: None)
+    assert weather.fetch_weather("北京")["city"] == "北京"
+
+    failure_hits = {"n": 0}
+
+    def fake_failure(key):
+        failure_hits["n"] += 1
+        return None if failure_hits["n"] == 1 else "boom"
+
+    monkeypatch.setattr(weather, "_cache_hit", lambda key: None)
+    monkeypatch.setattr(weather, "_failure_hit", fake_failure)
+    with pytest.raises(weather.WeatherError, match="boom"):
+        weather.fetch_weather("北京")
+
+
 def test_cache_key_ignores_case_and_extra_space(monkeypatch):
     calls = []
 
@@ -380,6 +460,9 @@ if __name__ == "__main__":
         test_malformed_payload_raises,
         test_cache_is_bounded_and_prunes_expired,
         test_concurrent_misses_share_upstream_request,
+        test_leader_recheck_uses_result_written_by_other_thread,
+        test_leader_recheck_raises_failure_written_by_other_thread,
+        test_follower_uses_cached_result_or_failure,
         test_cache_key_ignores_case_and_extra_space,
         test_failure_cache_prevents_repeat_requests,
         test_failure_cache_expires,
