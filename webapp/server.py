@@ -549,6 +549,14 @@ class _WebSession:
         self.runtime.close()
 
 
+_UNMARK_TOMBSTONE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
 class AligoWebApp:
     """应用状态：共享模型 / 熔断器 / 会话表。"""
 
@@ -574,7 +582,7 @@ class AligoWebApp:
         )
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
-        self._deleted_sessions: OrderedDict[str, float] = OrderedDict()
+        self._deleted_sessions: OrderedDict[str, tuple[float, str]] = OrderedDict()
         # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
         # 不同 user_id 的请求互不串行：OrderedDict 的迭代 + 删除必须加锁
         self._tombstone_lock = threading.Lock()
@@ -694,23 +702,24 @@ class AligoWebApp:
             self.tombstone_retry_sec,
         )
 
-    def mark_deleted(self, user_id: str, session_id: str) -> None:
-        """记录短时墓碑，阻止在途对话把刚删除的会话写回。
+    def mark_deleted(self, user_id: str, session_id: str) -> str:
+        """记录短时墓碑，阻止在途对话把刚删除的会话写回，返回本请求的 token。
 
-        配置 Redis 时同时写入共享墓碑（TTL 与本地一致），其它实例的新请求
-        也能看到该会话已删除；运行中 Redis 故障时本实例回退进程内墓碑，
-        并在冷却后自动重试共享墓碑。
+        配置 Redis 时同时写入共享墓碑（TTL 与本地一致；``SET NX`` 不覆盖
+        其它实例已有的墓碑），其它实例的新请求也能看到该会话已删除。
+        删除失败回滚时用 token 只撤销本请求写入的墓碑。
         """
+        token = uuid.uuid4().hex
         key = self._session_key(user_id, session_id)
         now = time.monotonic()
         with self._tombstone_lock:
-            self._deleted_sessions[key] = now
+            self._deleted_sessions[key] = (now, token)
             self._deleted_sessions.move_to_end(key)
             # 先清掉已过期的墓碑，避免仍有效的墓碑被容量上限淘汰
             expired = [
                 candidate
                 for candidate, at in self._deleted_sessions.items()
-                if now - at > self.tombstone_ttl_sec
+                if now - at[0] > self.tombstone_ttl_sec
             ]
             for candidate in expired:
                 del self._deleted_sessions[candidate]
@@ -719,26 +728,49 @@ class AligoWebApp:
         client = self._shared_tombstones()
         if client is not None:
             try:
-                client.setex(
+                # NX：不覆盖其它实例已有的墓碑（否则回滚时会误删对方的保护）
+                client.set(
                     self._deleted_key(user_id, session_id),
-                    int(self.tombstone_ttl_sec),
-                    "1",
+                    token,
+                    nx=True,
+                    ex=int(self.tombstone_ttl_sec),
                 )
             except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
                 self._tombstone_failed(exc, "写入")
             else:
                 self._tombstones_shared = True
                 self._tombstone_retry_at = 0.0
+        return token
 
-    def unmark_deleted(self, user_id: str, session_id: str) -> None:
-        """撤销墓碑（删除失败时使用），避免把仍存在的会话误判为已删除。"""
+    def unmark_deleted(
+        self, user_id: str, session_id: str, token: str | None = None
+    ) -> None:
+        """撤销墓碑（删除失败时使用）。
+
+        传入 token 时只撤销本请求写入的那条（本地条目 token 匹配、共享
+        墓碑值等于 token 才删除）；不传时保持旧的整条撤销语义。
+        """
+        key = self._session_key(user_id, session_id)
         with self._tombstone_lock:
-            self._deleted_sessions.pop(self._session_key(user_id, session_id), None)
+            if token is None:
+                self._deleted_sessions.pop(key, None)
+            else:
+                current = self._deleted_sessions.get(key)
+                if current is not None and current[1] == token:
+                    self._deleted_sessions.pop(key, None)
         client = self._shared_tombstones()
         if client is None:
             return
         try:
-            client.delete(self._deleted_key(user_id, session_id))
+            if token is None:
+                client.delete(self._deleted_key(user_id, session_id))
+            else:
+                client.eval(
+                    _UNMARK_TOMBSTONE_LUA,
+                    1,
+                    self._deleted_key(user_id, session_id),
+                    token,
+                )
         except Exception as exc:  # noqa: BLE001 - 留着墓碑由 TTL 过期更安全
             self._tombstone_failed(exc, "撤销")
 
@@ -751,9 +783,11 @@ class AligoWebApp:
             return False
         key = self._session_key(user_id, session_id)
         remaining: float | None = None
+        token = ""
         with self._tombstone_lock:
-            created = self._deleted_sessions.get(key)
-            if created is not None:
+            entry = self._deleted_sessions.get(key)
+            if entry is not None:
+                created, token = entry
                 elapsed = time.monotonic() - created
                 if elapsed <= self.tombstone_ttl_sec:
                     remaining = self.tombstone_ttl_sec - elapsed
@@ -764,11 +798,13 @@ class AligoWebApp:
             try:
                 if remaining is not None:
                     # 本地墓碑仍有效：顺带补写共享墓碑（首次写入失败后的
-                    # 自愈）。TTL 用剩余时长，不延长删除窗口
-                    client.setex(
+                    # 自愈）。TTL 用剩余时长，不延长删除窗口；NX 不覆盖
+                    # 其它实例已有的墓碑
+                    client.set(
                         self._deleted_key(user_id, session_id),
-                        max(1, int(remaining)),
-                        "1",
+                        token,
+                        nx=True,
+                        ex=max(1, int(remaining)),
                     )
                     self._tombstones_shared = True
                     self._tombstone_retry_at = 0.0
@@ -2068,19 +2104,23 @@ def create_app(model: Any = None) -> FastAPI:
             # 不会在存在性检查期间把已删除的会话写回。重复删除（之前已有
             # 墓碑）也要重新写一次：上一次的共享墓碑可能因 Redis 故障没写
             # 成功，这里顺带修复；从未存在的 id 在确认后撤销本地墓碑。
+            # token 标记本请求写入的墓碑，回滚时只撤销自己写的那条
+            # （共享墓碑可能属于其它实例，不能代为删除）。
             already_marked = await asyncio.to_thread(
                 state.is_recently_deleted, user_id, session_id
             )
-            await asyncio.to_thread(state.mark_deleted, user_id, session_id)
+            token = await asyncio.to_thread(
+                state.mark_deleted, user_id, session_id
+            )
 
             try:
                 existed = await asyncio.to_thread(_exists)
             except Exception as exc:  # noqa: BLE001 - 读失败统一提示
-                if not already_marked and not state.shared_tombstones_active():
-                    # 进程内墓碑可以撤销（允许该 id 继续使用）；共享墓碑可能
-                    # 被其它实例的同一删除依赖，读失败时保守保留
+                if not already_marked:
+                    # 没读到存在性：撤销本请求的墓碑（允许该 id 继续使用），
+                    # 若共享墓碑属于其它实例，token 不匹配会保留对方的保护
                     await asyncio.to_thread(
-                        state.unmark_deleted, user_id, session_id
+                        state.unmark_deleted, user_id, session_id, token
                     )
                 logger.warning("检查会话是否存在失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
@@ -2105,29 +2145,23 @@ def create_app(model: Any = None) -> FastAPI:
                     if still_exists:
                         # 删除失败但会话仍存在：撤销本请求落的墓碑，恢复正常对话
                         await asyncio.to_thread(
-                            state.unmark_deleted, user_id, session_id
+                            state.unmark_deleted, user_id, session_id, token
                         )
-                    elif (
-                        still_exists is False
-                        and not existed
-                        and not state.shared_tombstones_active()
-                    ):
+                    elif still_exists is False and not existed:
                         # 读到了「确实不存在」且删除前也不存在（从未存在的 id）：
-                        # 撤销进程内墓碑，允许该 id 新开对话
+                        # 撤销本请求的墓碑，允许该 id 新开对话；属于其它实例
+                        # 的共享墓碑因 token 不匹配而保留
                         await asyncio.to_thread(
-                            state.unmark_deleted, user_id, session_id
+                            state.unmark_deleted, user_id, session_id, token
                         )
                 logger.warning("删除会话失败: %s", exc)
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
-            if (
-                removed == 0
-                and not existed
-                and not already_marked
-                and not state.shared_tombstones_active()
-            ):
-                # 从未存在的 id：只有进程内墓碑时才撤销，允许用该 id 新开
-                # 对话；共享墓碑可能属于其它实例的同一次删除，不能代为删除
-                await asyncio.to_thread(state.unmark_deleted, user_id, session_id)
+            if removed == 0 and not existed and not already_marked:
+                # 从未存在的 id：撤销本请求的墓碑，允许用该 id 新开对话；
+                # 属于其它实例的共享墓碑因 token 不匹配而保留
+                await asyncio.to_thread(
+                    state.unmark_deleted, user_id, session_id, token
+                )
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}
