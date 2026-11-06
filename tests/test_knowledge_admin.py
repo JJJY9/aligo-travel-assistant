@@ -967,6 +967,12 @@ def test_import_dry_run_skips_writes(monkeypatch):
         [{"content": "已有内容"}, {"content": "新内容"}], dry_run=True
     )
     assert result2 == {"imported": 0, "skipped": 1, "would_import": 1}
+
+    # 全部已存在：预览返回稳定结构（would_import = 0）
+    result3 = knowledge_admin.import_documents(
+        [{"content": "已有内容"}], dry_run=True
+    )
+    assert result3 == {"imported": 0, "skipped": 1, "would_import": 0}
     print("✓ 导入 dry-run 只统计不写入")
 
 

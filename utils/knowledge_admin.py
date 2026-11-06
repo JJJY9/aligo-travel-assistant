@@ -624,7 +624,11 @@ def import_documents(
             existing.add(item["content"])
             unique.append(item)
         if not unique:
-            return {"imported": 0, "skipped": skipped}
+            result: dict[str, Any] = {"imported": 0, "skipped": skipped}
+            if dry_run:
+                # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
+                result["would_import"] = 0
+            return result
         if dry_run:
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
             return {
