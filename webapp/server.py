@@ -1556,6 +1556,22 @@ def create_app(model: Any = None) -> FastAPI:
             "# TYPE aligo_sessions_cached gauge\n"
             f"aligo_sessions_cached {len(state.sessions)}\n"
         )
+        backends = describe_backends()
+        body += (
+            "# HELP aligo_storage_backend Current storage backend (one-hot).\n"
+            "# TYPE aligo_storage_backend gauge\n"
+            f'aligo_storage_backend{{short_term="{backends["short_term"]}",'
+            f'long_term="{backends["long_term"]}"}} 1\n'
+            "# HELP aligo_short_term_degraded 1 if short-term backend fell back.\n"
+            "# TYPE aligo_short_term_degraded gauge\n"
+            f"aligo_short_term_degraded {1 if backends.get('short_term_degraded') else 0}\n"
+            "# HELP aligo_long_term_degraded 1 if long-term backend fell back.\n"
+            "# TYPE aligo_long_term_degraded gauge\n"
+            f"aligo_long_term_degraded {1 if backends.get('long_term_degraded') else 0}\n"
+            "# HELP aligo_tombstones_shared 1 if shared deletion tombstones are active.\n"
+            "# TYPE aligo_tombstones_shared gauge\n"
+            f"aligo_tombstones_shared {1 if state.shared_tombstones_active() else 0}\n"
+        )
         return Response(
             content=body,
             media_type="text/plain; version=0.0.4; charset=utf-8",
