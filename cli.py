@@ -3732,13 +3732,64 @@ def run_trip_update_standalone(
     return 0
 
 
-def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
-    """列出用户行程（`python cli.py trips <user_id> [--json]`）。
+def _parse_trips_list_args(
+    args: list[str],
+) -> tuple[str, str, bool] | None:
+    """解析 trips 的 ``<user_id> [--query 关键词] [--json]``。
 
-    ``as_json`` 输出原始行程（含冲突列表与状态标签）。
+    ``--query`` 支持 ``--query 值`` / ``--query=值``，``--json`` 不限位置；
+    未知参数、缺值、非法用户 ID 或位置参数过多返回 None。
+    """
+    import re
+
+    user_id: str | None = None
+    query = ""
+    as_json = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+            index += 1
+            continue
+        if lowered == "--query" or lowered.startswith("--query="):
+            if "=" in item:
+                value = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            if not value.strip():
+                return None
+            query = value.strip()
+            index += 1
+            continue
+        if item.startswith("-") or user_id is not None:
+            return None
+        user_id = item
+        index += 1
+    if (
+        user_id is None
+        or not re.fullmatch(r"[\w-]{1,64}", user_id)
+        or user_id.startswith("-")
+    ):
+        return None
+    return user_id, query, as_json
+
+
+def run_trips_list_standalone(
+    user_id: str, as_json: bool = False, query: str = ""
+) -> int:
+    """列出用户行程（`python cli.py trips <user_id> [--query 关键词] [--json]`）。
+
+    ``query`` 按路线 / 起止日期 / 目的做不区分大小写的过滤（与面板关键词
+    筛选一致，冲突提示仍按完整历史计算）；``as_json`` 输出原始行程（含
+    冲突列表与状态标签）。
 
     Returns:
-        0 列出成功（含无行程）；1 参数 / 读取失败
+        0 列出成功（含无行程 / 无匹配）；1 参数 / 读取失败
     """
     import re
 
@@ -3780,12 +3831,46 @@ def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
     from utils.json_safe import sanitize_json
 
     views = trips_with_conflicts(trips)
+    needle = query.strip().casefold()
+    if needle:
+        views = [
+            trip
+            for trip in views
+            if any(
+                needle in str(trip.get(key) or "").casefold()
+                for key in (
+                    "origin",
+                    "destination",
+                    "start_date",
+                    "end_date",
+                    "purpose",
+                )
+            )
+        ]
+        if not views:
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "user_id": user_id,
+                            "query": query.strip(),
+                            "count": 0,
+                            "trips": [],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 0
+            print(f"用户 {user_id}：没有匹配「{query.strip()}」的行程")
+            return 0
     if as_json:
         print(
             json.dumps(
                 sanitize_json(
                     {
                         "user_id": user_id,
+                        "query": query.strip(),
                         "count": len(views),
                         "trips": [
                             {"state": trip_state_label(trip), **trip}
@@ -3798,7 +3883,12 @@ def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
             )
         )
         return 0
-    print(f"用户 {user_id}：共 {len(views)} 条行程（新→旧）")
+    header = (
+        f"用户 {user_id}：共 {len(views)} 条匹配「{query.strip()}」的行程（新→旧）"
+        if needle
+        else f"用户 {user_id}：共 {len(views)} 条行程（新→旧）"
+    )
+    print(header)
     for trip in reversed(views):
         start = trip.get("start_date") or "日期未记录"
         end = trip.get("end_date") or ""
@@ -4465,13 +4555,19 @@ def main():
                 run_trip_delete_standalone(target, other, as_json=as_json)
             )
         if arg == "trips":
-            parsed_trips_list = _parse_user_and_json_args(sys.argv[2:])
+            parsed_trips_list = _parse_trips_list_args(sys.argv[2:])
             if parsed_trips_list is None:
-                print("用法：python cli.py trips <user_id> [--json]")
+                print(
+                    "用法：python cli.py trips <user_id> [--query 关键词] [--json]"
+                )
                 sys.exit(2)
-            trips_user, trips_list_json = parsed_trips_list
+            trips_user, trips_query, trips_list_json = parsed_trips_list
             sys.exit(
-                run_trips_list_standalone(trips_user, as_json=trips_list_json)
+                run_trips_list_standalone(
+                    trips_user,
+                    as_json=trips_list_json,
+                    query=trips_query,
+                )
             )
         if arg == "trips-dedupe":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):

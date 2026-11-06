@@ -782,6 +782,81 @@ def test_trip_update_args_and_dispatch(monkeypatch):
     print("✓ trip-update 参数解析与 dispatch")
 
 
+def test_trips_query_filter_text_and_json(monkeypatch):
+    trips = [
+        _trip("上海", "2026-12-01", "2026-12-03", trip_id="t1", purpose="出差"),
+        _trip("杭州", "2026-12-05", "2026-12-06", trip_id="t2", purpose="会议"),
+        _trip("上海", "2026-12-02", "2026-12-02", trip_id="t3", purpose="培训"),
+    ]
+    store = _FakeStore(trips)
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u1", query="上海")
+    text = out.getvalue()
+    assert code == 0
+    assert "共 2 条匹配「上海」的行程" in text
+    assert "杭州" not in text
+    assert "重叠" in text, "过滤后冲突提示仍按完整历史计算"
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u1", as_json=True, query="会议")
+    data = json.loads(out.getvalue())
+    assert code == 0 and data["query"] == "会议" and data["count"] == 1
+    assert data["trips"][0]["destination"] == "杭州"
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u1", query="不存在")
+    assert code == 0 and "没有匹配「不存在」的行程" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u1", as_json=True, query="不存在")
+    data = json.loads(out.getvalue())
+    assert data["count"] == 0 and data["trips"] == []
+    print("✓ trips --query 过滤（文本 / JSON / 无匹配）")
+
+
+def test_trips_query_args_and_dispatch(monkeypatch):
+    assert cli._parse_trips_list_args([]) is None
+    assert cli._parse_trips_list_args(["-u1"]) is None
+    assert cli._parse_trips_list_args(["u1", "extra"]) is None
+    assert cli._parse_trips_list_args(["u1", "--query"]) is None
+    assert cli._parse_trips_list_args(["u1", "--query", " "]) is None
+    assert cli._parse_trips_list_args(["u1", "--bad"]) is None
+    assert cli._parse_trips_list_args(["u1"]) == ("u1", "", False)
+    assert cli._parse_trips_list_args(
+        ["--json", "u1", "--query=上海"]
+    ) == ("u1", "上海", True)
+    assert cli._parse_trips_list_args(["u1", "--query", "会 议"]) == (
+        "u1",
+        "会 议",
+        False,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_trips_list_standalone",
+        lambda user_id, as_json=False, query="": (
+            calls.append((user_id, as_json, query)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips", "u1", "--query", "上海", "--json"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", True, "上海")
+    print("✓ trips --query 参数解析与 dispatch")
+
+
 if __name__ == "__main__":
     for case in (
         test_trip_interval_and_state,
@@ -794,6 +869,8 @@ if __name__ == "__main__":
         test_trips_list_rejects_bad_user_id,
         test_trips_dispatch_strict,
         test_trips_dispatch_json_flexible,
+        test_trips_query_filter_text_and_json,
+        test_trips_query_args_and_dispatch,
         test_trip_add_saves_and_reports_conflicts,
         test_trip_add_json_output,
         test_trip_add_dedupes_same_route_and_dates,
