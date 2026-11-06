@@ -5,6 +5,7 @@ Aligo 商旅助手 - CLI 交互界面
 """
 import asyncio
 import os
+import re
 import sys
 from typing import Any
 
@@ -1068,13 +1069,37 @@ def run_doctor_standalone(
 
 
 def _parse_json_flag(args: list[str], usage: str) -> bool | None:
-    """解析可选 ``--json``；参数非法时打印用法并返回 None（调用方退出码 2）。"""
-    if not args:
-        return False
-    if args == ["--json"]:
-        return True
+    """解析可选 ``--json``（大小写不敏感、可重复）；非法参数打印用法并返回 None。"""
+    if all(item.lower() == "--json" for item in args):
+        return bool(args)
     print(f"用法：{usage}")
     return None
+
+
+def _valid_user_id(value: str) -> bool:
+    """用户 ID 规则与 API 一致：中文 / 字母 / 数字 / 下划线 / 短横线，1..64 字符。"""
+    return (
+        bool(re.fullmatch(r"[\w-]{1,64}", value))
+        and not value.startswith("-")
+    )
+
+
+def _parse_user_and_json_args(args: list[str]) -> tuple[str, bool] | None:
+    """解析 ``<user_id> [--json]``（位置不限、大小写不敏感、可重复）。"""
+    user_id = None
+    as_json = False
+    for item in args:
+        if item.lower() == "--json":
+            as_json = True
+        elif item.startswith("-"):
+            return None
+        elif user_id is None:
+            user_id = item
+        else:
+            return None
+    if user_id is None or not _valid_user_id(user_id):
+        return None
+    return user_id, as_json
 
 
 def _parse_eval_args(args: list[str]) -> tuple[bool, float] | None:
@@ -1098,10 +1123,10 @@ def _parse_eval_args(args: list[str]) -> tuple[bool, float] | None:
                 value = args[index]
             else:
                 value = item[len("--min-hit5="):]
-            try:
-                parsed = float(value)
-            except ValueError:
+            if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", value):
+                # 与 _parse_cli_int 一致：拒绝 Unicode 数字 / 下划线 / 空白
                 return None
+            parsed = float(value)
             if not 0.0 <= parsed <= 1.0:
                 return None
             min_hit5 = parsed
@@ -1503,12 +1528,31 @@ def run_knowledge_categories_standalone(as_json: bool = False) -> int:
 
     status = knowledge_status()
     if not status.get("available"):
-        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        reason = status.get("reason", "未知原因")
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"知识库不可用：{reason}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"知识库不可用：{reason}")
         return 1
     try:
         categories = list_categories()
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"读取失败：{exc}")
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"读取失败：{exc}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"读取失败：{exc}")
         return 1
 
     total = sum(int(item.get("count") or 0) for item in categories)
@@ -1543,18 +1587,28 @@ def run_knowledge_search_standalone(
     from utils.knowledge_admin import search_documents
     from utils.knowledge_stats import knowledge_status
 
+    def _fail(error: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": error},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(error)
+        return 1
+
     status = knowledge_status()
     if not status.get("available"):
-        print(f"知识库不可用：{status.get('reason', '未知原因')}")
-        return 1
+        return _fail(f"知识库不可用：{status.get('reason', '未知原因')}")
     try:
         results = search_documents(query, top_k=top_k)
     except FileNotFoundError:
-        print("知识库未初始化")
-        return 1
+        return _fail("知识库未初始化")
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"检索失败：{exc}")
-        return 1
+        return _fail(f"检索失败：{exc}")
 
     if as_json:
         print(
@@ -1603,18 +1657,28 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
     from utils.knowledge_admin import get_document_group
     from utils.knowledge_stats import knowledge_status
 
+    def _fail(error: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": error},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(error)
+        return 1
+
     status = knowledge_status()
     if not status.get("available"):
-        print(f"知识库不可用：{status.get('reason', '未知原因')}")
-        return 1
+        return _fail(f"知识库不可用：{status.get('reason', '未知原因')}")
     try:
         document = get_document_group(doc_id)
     except FileNotFoundError:
-        print("知识库未初始化")
-        return 1
+        return _fail("知识库未初始化")
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"读取失败：{exc}")
-        return 1
+        return _fail(f"读取失败：{exc}")
     if document is None:
         print(f"知识点 #{doc_id} 不存在")
         return 1
@@ -1729,11 +1793,15 @@ def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> i
         try:
             data = {
                 "user_id": user_id,
+                "session_id": "",
                 "exported_at": datetime.now().isoformat(timespec="seconds"),
                 "preferences": store.get_preference(),
                 "trip_history": store.get_trip_history(limit=None),
-                "statistics": store.get_statistics(),
                 "chat_history": store.get_chat_history(),
+                "session_titles": store.get_session_titles(),
+                "pinned_sessions": store.get_pinned_sessions(),
+                "archived_sessions": store.get_archived_sessions(),
+                "statistics": store.get_statistics(),
             }
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             print(f"读取用户数据失败：{exc}")
@@ -2118,7 +2186,9 @@ def run_sessions_list_standalone(
                 (part for part in item["_parts"] if needle in part.lower()), None
             )
             if hit is not None:
-                item["_snippet"] = hit[:40]
+                position = hit.lower().find(needle)
+                start = max(0, position - 20)
+                item["_snippet"] = hit[start : start + 40]
                 matched.append(item)
         summaries = matched
     if include_all:
@@ -2476,14 +2546,28 @@ def run_trips_export_standalone(
         if callable(close):
             close()
 
+    skipped = 0
     if ics:
         text = render_trips_ics(trips, user_id)
         default_name = "aligo_trips.ics"
+        exported = text.count("BEGIN:VEVENT")
+        skipped = max(0, len(trips) - exported)
     else:
         text = render_trips_csv(trips)
         default_name = "aligo_trips.csv"
+        exported = len(trips)
     if to_stdout:
-        _print_stdout(text, end="")
+        if ics:
+            # ICS 行尾已是 \r\n：文本模式在 Windows 会再次翻译；优先写字节
+            buffer = getattr(sys.stdout, "buffer", None)
+            if buffer is not None:
+                sys.stdout.flush()
+                buffer.write(text.encode("utf-8"))
+                buffer.flush()
+            else:
+                _print_stdout(text, end="")
+        else:
+            _print_stdout(text, end="")
         return 0
 
     path = Path(target) if target else Path("exports") / default_name
@@ -2492,12 +2576,16 @@ def run_trips_export_standalone(
         return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        if ics:
+            path.write_bytes(text.encode("utf-8"))
+        else:
+            path.write_text(text, encoding="utf-8")
     except OSError as exc:
         print(f"写入失败：{exc}")
         return 1
     suffix = "（iCalendar）" if ics else ""
-    print(f"已导出 {len(trips)} 条行程到 {path}{suffix}")
+    skipped_note = f"，跳过 {skipped} 条缺少出发日期" if skipped else ""
+    print(f"已导出 {exported} 条行程到 {path}{suffix}{skipped_note}")
     return 0
 
 
@@ -2546,18 +2634,22 @@ def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
         return 0
 
     # 与 Web 记忆面板一致：新→旧展示，并标注状态与日期重叠
+    from utils.json_safe import sanitize_json
+
     views = trips_with_conflicts(trips)
     if as_json:
         print(
             json.dumps(
-                {
-                    "user_id": user_id,
-                    "count": len(views),
-                    "trips": [
-                        {"state": trip_state_label(trip), **trip}
-                        for trip in views
-                    ],
-                },
+                sanitize_json(
+                    {
+                        "user_id": user_id,
+                        "count": len(views),
+                        "trips": [
+                            {"state": trip_state_label(trip), **trip}
+                            for trip in views
+                        ],
+                    }
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -2618,15 +2710,19 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
             close()
 
     if as_json:
+        from utils.json_safe import sanitize_json
+
         print(
             json.dumps(
-                {
-                    "user_id": user_id,
-                    "count": len(preferences),
-                    "preferences": {
-                        key: preferences[key] for key in sorted(preferences)
-                    },
-                },
+                sanitize_json(
+                    {
+                        "user_id": user_id,
+                        "count": len(preferences),
+                        "preferences": {
+                            key: preferences[key] for key in sorted(preferences)
+                        },
+                    }
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -2877,45 +2973,29 @@ def main():
                 limit = parsed
             sys.exit(run_knowledge_duplicates_standalone(limit))
         if arg == "stats":
-            stats_args = sys.argv[3:]
-            if (
-                len(sys.argv) < 3
-                or sys.argv[2].startswith("-")
-                or len(stats_args) > 1
-                or any(item.lower() != "--json" for item in stats_args)
-            ):
+            parsed_stats = _parse_user_and_json_args(sys.argv[2:])
+            if parsed_stats is None:
                 print("用法：python cli.py stats <user_id> [--json]")
                 sys.exit(2)
-            sys.exit(
-                run_stats_standalone(sys.argv[2], as_json=bool(stats_args))
-            )
+            stats_user, stats_json = parsed_stats
+            sys.exit(run_stats_standalone(stats_user, as_json=stats_json))
         if arg == "preferences":
-            rest = sys.argv[3:]
-            if (
-                len(sys.argv) < 3
-                or sys.argv[2].startswith("-")
-                or len(rest) > 1
-                or any(item.lower() != "--json" for item in rest)
-            ):
+            parsed_pref = _parse_user_and_json_args(sys.argv[2:])
+            if parsed_pref is None:
                 print("用法：python cli.py preferences <user_id> [--json]")
                 sys.exit(2)
+            pref_user, pref_json = parsed_pref
             sys.exit(
-                run_preferences_list_standalone(
-                    sys.argv[2], as_json=bool(rest)
-                )
+                run_preferences_list_standalone(pref_user, as_json=pref_json)
             )
         if arg == "trips":
-            rest = sys.argv[3:]
-            if (
-                len(sys.argv) < 3
-                or sys.argv[2].startswith("-")
-                or len(rest) > 1
-                or any(item.lower() != "--json" for item in rest)
-            ):
+            parsed_trips_list = _parse_user_and_json_args(sys.argv[2:])
+            if parsed_trips_list is None:
                 print("用法：python cli.py trips <user_id> [--json]")
                 sys.exit(2)
+            trips_user, trips_list_json = parsed_trips_list
             sys.exit(
-                run_trips_list_standalone(sys.argv[2], as_json=bool(rest))
+                run_trips_list_standalone(trips_user, as_json=trips_list_json)
             )
         if arg == "trips-dedupe":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
@@ -3026,7 +3106,7 @@ def main():
             export_args = sys.argv[2:]
             if (
                 not 1 <= len(export_args) <= 2
-                or export_args[0].startswith("-")
+                or not _valid_user_id(export_args[0])
                 or (len(export_args) == 2 and export_args[1].startswith("-"))
             ):
                 print("用法：python cli.py user-export <user_id> [dir]")
@@ -3040,7 +3120,8 @@ def main():
         if arg == "trips-export":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print(
-                    "用法：python cli.py trips-export <user_id> [path] [--stdout] [--force]"
+                    "用法：python cli.py trips-export <user_id> [path] "
+                    "[--stdout] [--force] [--ics]"
                 )
                 sys.exit(2)
             parsed_export = _parse_export_args(sys.argv[3:], allow_ics=True)

@@ -211,6 +211,26 @@ def test_trips_list_rejects_bad_user_id(monkeypatch):
     print("✓ trips 非法用户 ID")
 
 
+def test_trips_dispatch_json_flexible(monkeypatch):
+    """--json 位置灵活、大小写不敏感、可重复。"""
+    fake = _FakeStore([_trip("上海", "2026-12-05", "2026-12-07")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: fake
+    )
+    for argv in (
+        ["cli.py", "trips", "--json", "u1"],
+        ["cli.py", "trips", "u1", "--json", "--json"],
+        ["cli.py", "trips", "u1", "--JSON"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert '"trips"' in buf.getvalue(), argv
+    print("✓ dispatch 层 trips --json 位置 / 大小写 / 重复")
+
+
 def test_trips_dispatch_strict(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -227,6 +247,7 @@ def test_trips_dispatch_strict(monkeypatch):
     for argv in (
         ["cli.py", "trips"],
         ["cli.py", "trips", "-u1"],
+        ["cli.py", "trips", "bad id"],
         ["cli.py", "trips", "u1", "extra"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
@@ -248,6 +269,7 @@ if __name__ == "__main__":
         test_trips_list_open_failure,
         test_trips_list_rejects_bad_user_id,
         test_trips_dispatch_strict,
+        test_trips_dispatch_json_flexible,
     ):
         mp = pytest.MonkeyPatch()
         try:

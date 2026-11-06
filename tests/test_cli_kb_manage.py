@@ -89,7 +89,10 @@ def test_categories_unavailable(monkeypatch):
     )
     code, out = _capture(cli.run_knowledge_categories_standalone)
     assert code == 1 and "不可用" in out
-    print("✓ kb-categories 知识库不可用时返回 1")
+    code, out = _capture(cli.run_knowledge_categories_standalone, as_json=True)
+    data = json.loads(out)
+    assert code == 1 and data["ok"] is False
+    print("✓ kb-categories 知识库不可用时返回 1（文本 / JSON）")
 
 
 def test_categories_prints(monkeypatch):
@@ -122,7 +125,11 @@ def test_categories_json_and_empty(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "list_categories", lambda: [])
     code, out = _capture(cli.run_knowledge_categories_standalone)
     assert code == 0 and "暂无分类信息" in out
-    print("✓ kb-categories JSON 输出与空分类")
+
+    assert cli._parse_json_flag(["--JSON"], "x") is True, "大小写不敏感"
+    assert cli._parse_json_flag(["--json", "--json"], "x") is True, "可重复"
+    assert cli._parse_json_flag(["--json", "x"], "x") is None
+    print("✓ kb-categories JSON 输出与空分类 / --json 大小写与重复")
 
 
 def test_categories_error(monkeypatch):
@@ -143,7 +150,12 @@ def test_search_unavailable(monkeypatch):
     )
     code, out = _capture(cli.run_knowledge_search_standalone, "住宿")
     assert code == 1 and "不可用" in out
-    print("✓ kb-search 知识库不可用时返回 1")
+    code, out = _capture(
+        cli.run_knowledge_search_standalone, "住宿", as_json=True
+    )
+    data = json.loads(out)
+    assert code == 1 and data["ok"] is False and "不可用" in data["error"]
+    print("✓ kb-search 知识库不可用时返回 1（文本 / JSON）")
 
 
 def test_search_success_and_json(monkeypatch):
@@ -240,7 +252,10 @@ def test_show_unavailable(monkeypatch):
     )
     code, out = _capture(cli.run_knowledge_show_standalone, 7)
     assert code == 1 and "不可用" in out
-    print("✓ kb-show 知识库不可用时返回 1")
+    code, out = _capture(cli.run_knowledge_show_standalone, 7, as_json=True)
+    data = json.loads(out)
+    assert code == 1 and data["ok"] is False
+    print("✓ kb-show 知识库不可用时返回 1（文本 / JSON）")
 
 
 def test_show_success_and_json(monkeypatch):

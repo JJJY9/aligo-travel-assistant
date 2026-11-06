@@ -130,9 +130,23 @@ def test_stats_dispatch(monkeypatch):
     assert exc.value.code == 0
     assert json.loads(buf.getvalue())["user_id"] == "u1"
 
+    # 灵活解析：--json 位置不限、大小写不敏感、可重复
+    for argv in (
+        ["cli.py", "stats", "--json", "u1"],
+        ["cli.py", "stats", "u1", "--json", "--json"],
+        ["cli.py", "stats", "u1", "--JSON"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert json.loads(buf.getvalue())["user_id"] == "u1"
+
     for argv in (
         ["cli.py", "stats"],
         ["cli.py", "stats", "-u1"],
+        ["cli.py", "stats", "bad id"],
         ["cli.py", "stats", "u1", "--json", "x"],
     ):
         monkeypatch.setattr(sys, "argv", argv)

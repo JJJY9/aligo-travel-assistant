@@ -163,7 +163,16 @@ def test_list_json_output(monkeypatch):
 
     code, out = _run_list("u1", query="不存在", as_json=True)
     assert code == 0 and json.loads(out)["sessions"] == []
-    print("✓ sessions --json 输出摘要 / 片段 / 空列表")
+
+    # 关键词在消息后段时，片段应围绕命中位置（而不是只取前 40 字）
+    fake = _FakeStore(
+        [_message("user", "x" * 60 + "后段关键词", "s-long")]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_list("u1", query="后段关键词", as_json=True)
+    snippet = json.loads(out)["sessions"][0]["snippet"]
+    assert "后段关键词" in snippet, snippet
+    print("✓ sessions --json 输出摘要 / 片段 / 空列表 / 命中窗口")
 
 
 def test_session_list_converts_utc_timestamps(monkeypatch):
