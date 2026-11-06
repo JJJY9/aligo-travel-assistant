@@ -181,6 +181,34 @@ def test_extract_response_text_remaining_shapes():
     print("✓ 响应文本提取的对象兜底形态")
 
 
+def test_extract_response_text_object_text_block():
+    """非 dict 对象形态的文本块（type/text 属性）也参与拼接。"""
+    from utils.json_parser import extract_response_text
+
+    class _TextBlock:
+        type = "text"
+        text = "块"
+
+    class _Other:
+        type = "image"
+
+    response = {"content": [_TextBlock(), {"type": "image"}, _Other()]}
+    assert extract_response_text(response) == "块"
+
+    class _ObjContentList:
+        content = [_TextBlock()]
+
+    assert extract_response_text(_ObjContentList()) == "块"
+
+
+def test_robust_json_parse_fallback_after_braces():
+    """有花括号但所有解析尝试都失败时，fallback 生效。"""
+    assert (
+        robust_json_parse("示例 {不是JSON} 结束", fallback={"ok": True})
+        == {"ok": True}
+    )
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_json_parse_fallback()
@@ -190,6 +218,8 @@ if __name__ == "__main__":
     test_json_parse_no_json_without_fallback()
     test_extract_response_text_shapes()
     test_extract_response_text_remaining_shapes()
+    test_extract_response_text_object_text_block()
+    test_robust_json_parse_fallback_after_braces()
     test_extract_first_json_object_ignores_prose_braces()
     test_extract_first_json_object_empty_text()
     test_increment_query_count_fresh_data()
