@@ -193,36 +193,67 @@ class RedisRateLimiter:
 
     backend = "redis"
 
-    def __init__(self, client: Any, name: str, limit: int, window_sec: float) -> None:
+    def __init__(
+        self,
+        client: Any,
+        name: str,
+        limit: int,
+        window_sec: float,
+        client_factory: Any = None,
+    ) -> None:
         self._client = client
+        # 启动时 Redis 不可用时通过工厂在后续请求中重试接入，避免整个
+        # 生命周期固化为进程内限流（多实例额度会被放大）
+        self._client_factory = client_factory
         self.name = name
         self.limit = max(1, int(limit))
         self.window_sec = max(0.01, float(window_sec))
         self._fallback = RateLimiter(limit=self.limit, window_sec=self.window_sec)
         self._degraded_until = 0.0
+        # 是否正处于回退状态：失败后置 True，只有一次成功的 Redis 调用
+        # 才会清除。不能用冷却窗口判断——冷却到期但从未重试成功时仍是降级
+        self._degraded = client is None
 
     @property
     def degraded(self) -> bool:
-        """Redis 故障后是否正处于进程内回退冷却期。"""
-        return time.monotonic() < self._degraded_until
+        """是否处于进程内回退（启动不可达 / 运行中故障且尚未恢复）。"""
+        return self._degraded
+
+    def _get_client(self) -> Any:
+        """返回 Redis 客户端；启动时不可用则通过工厂重试获取。"""
+        if self._client is None and self._client_factory is not None:
+            try:
+                self._client = self._client_factory()
+            except Exception as exc:  # noqa: BLE001 - 工厂失败按不可用处理
+                logger.warning("获取 Redis 限流客户端失败：%s", exc)
+                self._client = None
+        return self._client
 
     def _key(self, key: str) -> str:
         return f"{REDIS_KEY_PREFIX}:{self.name}:{key}"
 
     def _eval(self, script: str, key: str, *args: Any) -> Any:
         """执行 Lua 脚本；Redis 不可用时返回 None 表示应使用回退实现。"""
+        client = self._get_client()
+        if client is None:
+            self._degraded = True
+            return None
         if time.monotonic() < self._degraded_until:
             return None
         try:
-            return self._client.eval(script, 1, self._key(key), *args)
+            result = client.eval(script, 1, self._key(key), *args)
         except Exception as exc:  # noqa: BLE001 - 限流后端故障不能影响请求
             self._degraded_until = time.monotonic() + REDIS_FAILURE_COOLDOWN_SEC
+            self._degraded = True
             logger.warning(
                 "Redis 限流不可用（%s），%d 秒内回退为进程内限流",
                 exc,
                 REDIS_FAILURE_COOLDOWN_SEC,
             )
             return None
+        self._degraded = False
+        self._degraded_until = 0.0
+        return result
 
     @staticmethod
     def _as_float(value: Any) -> float:
@@ -268,14 +299,18 @@ class RedisRateLimiter:
         """清空该实例的进程内回退状态，并删除 Redis 中同名桶的全部键。"""
         self._fallback.reset()
         self._degraded_until = 0.0
+        self._degraded = self._get_client() is None
+        client = self._client
+        if client is None:
+            return
         try:
             keys = list(
-                self._client.scan_iter(
+                client.scan_iter(
                     match=f"{REDIS_KEY_PREFIX}:{self.name}:*", count=500
                 )
             )
             if keys:
-                self._client.delete(*keys)
+                client.delete(*keys)
         except Exception as exc:  # noqa: BLE001 - 清理失败不影响服务
             logger.warning("清理 Redis 限流键失败：%s", exc)
 
@@ -285,8 +320,16 @@ def create_rate_limiter(
     limit: int,
     window_sec: float,
     redis_client: Any = None,
+    client_factory: Any = None,
 ) -> RateLimiter | RedisRateLimiter:
-    """优先创建 Redis 共享限流器；未提供客户端时使用进程内实现。"""
-    if redis_client is not None:
-        return RedisRateLimiter(redis_client, name, limit, window_sec)
+    """优先创建 Redis 共享限流器；未提供客户端 / 工厂时使用进程内实现。
+
+    配置了 ``REDIS_URL`` 但启动时不可达时传 ``client_factory``（如
+    ``get_shared_redis_client``）：先回退进程内计数，工厂可用后自动重新
+    接入共享计数，而不是整个进程生命周期固化为本地限流。
+    """
+    if redis_client is not None or client_factory is not None:
+        return RedisRateLimiter(
+            redis_client, name, limit, window_sec, client_factory=client_factory
+        )
     return RateLimiter(limit=limit, window_sec=window_sec)

@@ -4389,17 +4389,30 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
         lambda content, metadata: {"status": "success", "id": 1, "total_count": 1},
     )
     monkeypatch.setattr(server_module, "search_documents", lambda q, top_k: [])
+    monkeypatch.setattr(
+        server_module,
+        "list_documents",
+        lambda **kwargs: {"total": 0, "items": []},
+    )
+    monkeypatch.setattr(server_module, "list_categories", lambda: [])
 
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
-    state.kb_limiter = RateLimiter(limit=1, window_sec=60)
+    state.kb_limiter = RateLimiter(limit=2, window_sec=60)
     client = TestClient(app)
     user_id = _unique_user("web_test_kb_limit")
     try:
+        listed = client.get("/api/knowledge/documents")
+        assert listed.status_code == 200, "列表也应使用知识库限流桶（带额度头）"
+        assert listed.headers["x-ratelimit-limit"] == "2"
+        assert listed.headers["x-ratelimit-remaining"] == "1"
+
         first = client.post("/api/knowledge/documents", json={"content": "测试知识"})
         assert first.status_code == 201
-        assert first.headers["x-ratelimit-limit"] == "1"
         assert first.headers["x-ratelimit-remaining"] == "0"
+
+        categories = client.get("/api/knowledge/categories")
+        assert categories.status_code == 429, "分类统计应共享知识库桶"
 
         second = client.post("/api/knowledge/documents", json={"content": "第二条"})
         assert second.status_code == 429
@@ -4417,7 +4430,7 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
             json={"message": "你好", "user_id": user_id, "session_id": "kb-limit"},
         )
         assert chat.status_code == 200, "知识库限流不应影响对话额度"
-        print("✓ 知识库接口独立限流（写入 / 检索共享，不影响对话）")
+        print("✓ 知识库接口独立限流（列表 / 分类 / 写入 / 检索共享，不影响对话）")
     finally:
         _cleanup(user_id)
 

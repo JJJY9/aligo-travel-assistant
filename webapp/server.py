@@ -663,11 +663,17 @@ class AligoWebApp:
         # 配置 REDIS_URL 且可用时，两个桶都使用 Redis 共享计数，多实例共享额度；
         # 未配置或 Redis 不可用时回退进程内滑动窗口（单个实例内仍然有效）
         redis_client = get_shared_redis_client()
+        # 配置了 REDIS_URL 但启动时不可达：保留客户端工厂，Redis 恢复后
+        # 限流器自动重新接入共享计数，不会整个生命周期固化为进程内限流
+        redis_factory = (
+            get_shared_redis_client if STORAGE_CONFIG.get("redis_url") else None
+        )
         self.rate_limiter = create_rate_limiter(
             "user",
             RATE_LIMIT_CONFIG.get("chat_requests", 30),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
+            client_factory=redis_factory,
         )
         # 用户 ID 由请求方提供、可以轮换；再按纯客户端 IP 限流，防止换 ID 绕过
         self.ip_limiter = create_rate_limiter(
@@ -675,6 +681,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("ip_requests", 120),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
+            client_factory=redis_factory,
         )
         # 知识库写入 / 导入 / 语义检索会触发嵌入模型推理，单独按客户端 IP 限流，
         # 不占用对话额度（Web 批量导入每批 200 条，60 次/分钟足够）
@@ -683,6 +690,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("kb_requests", 60),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
+            client_factory=redis_factory,
         )
         # 天气接口每次未命中会上游发两次请求；按客户端 IP 限流，
         # 保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度
@@ -691,6 +699,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("weather_requests", 30),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
+            client_factory=redis_factory,
         )
         # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内；
         # 工厂让启动时 Redis 不可用的实例在恢复后重新参与共享锁
@@ -1035,13 +1044,15 @@ def _enforce_rate_limit(
             limit = state.ip_limiter.limit
         raise _over_limit(limit, max(retry_after or 0.0, ip_retry_after or 0.0))
     # peek 与 check 之间额度可能被并发请求抢走：check 返回非 None 时请求已
-    # 超额，必须按它的结果拒绝，否则会放行超出额度的请求
-    user_retry = state.rate_limiter.check(user_key)
-    if user_retry is not None:
-        raise _over_limit(state.rate_limiter.limit, user_retry)
+    # 超额，必须按它的结果拒绝，否则会放行超出额度的请求。先记 IP 桶再记
+    # 用户桶：IP 桶拒绝时不消耗用户额度（并发下也不会）；反过来用户桶迟到
+    # 拒绝只会浪费共享 IP 桶的一个名额，影响面更小
     ip_retry = state.ip_limiter.check(client)
     if ip_retry is not None:
         raise _over_limit(state.ip_limiter.limit, ip_retry)
+    user_retry = state.rate_limiter.check(user_key)
+    if user_retry is not None:
+        raise _over_limit(state.rate_limiter.limit, user_retry)
     remaining_user, reset_user = state.rate_limiter.status(user_key)
     remaining_ip, reset_ip = state.ip_limiter.status(client)
     # 额度头取自当前更紧的桶（剩余更少；剩余相同时取重置更晚的），
@@ -1541,7 +1552,9 @@ def create_app(model: Any = None) -> FastAPI:
         name = city.strip()
         if not name:
             raise HTTPException(status_code=422, detail="城市不能为空")
-        headers = _enforce_weather_rate_limit(state, request)
+        headers = await asyncio.to_thread(
+            _enforce_weather_rate_limit, state, request
+        )
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(
@@ -1638,12 +1651,19 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/knowledge/documents")
     def knowledge_documents(
+        request: Request,
+        response: Response,
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
         category: str = Query(default="", max_length=200),
     ) -> dict[str, Any]:
-        """列出知识片段（记忆面板的知识库维护）。"""
+        """列出知识片段（记忆面板的知识库维护）。
+
+        每页都在写锁内全量扫描整个集合，按 IP 走知识库限流桶，避免单个
+        客户端循环调用把 CPU / 写锁占满。
+        """
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return list_documents(limit=limit, offset=offset, query=q, category=category)
         except FileNotFoundError as exc:
@@ -1656,8 +1676,12 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
 
     @app.get("/api/knowledge/categories")
-    def knowledge_categories() -> dict[str, Any]:
-        """知识片段分类统计（维护面板筛选下拉框）。"""
+    def knowledge_categories(request: Request, response: Response) -> dict[str, Any]:
+        """知识片段分类统计（维护面板筛选下拉框）。
+
+        统计会全量读取整库，同样按 IP 走知识库限流桶。
+        """
+        response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return {"categories": list_categories()}
         except FileNotFoundError as exc:
@@ -2344,7 +2368,9 @@ def create_app(model: Any = None) -> FastAPI:
     async def chat(
         request: Request, payload: ChatRequest, response: Response
     ) -> dict[str, Any]:
-        rate_headers = _enforce_rate_limit(state, payload.user_id, request)
+        rate_headers = await asyncio.to_thread(
+            _enforce_rate_limit, state, payload.user_id, request
+        )
         async with state.lock_for(payload.user_id):
             if await asyncio.to_thread(
                 state.is_recently_deleted, payload.user_id, payload.session_id
@@ -2409,7 +2435,9 @@ def create_app(model: Any = None) -> FastAPI:
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
-        rate_headers = _enforce_rate_limit(state, payload.user_id, request)
+        rate_headers = await asyncio.to_thread(
+            _enforce_rate_limit, state, payload.user_id, request
+        )
         rid = _request_id(request)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
