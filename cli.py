@@ -1822,6 +1822,131 @@ def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> i
     return 0
 
 
+def _parse_kb_write_args(
+    args: list[str],
+) -> tuple[list[str], dict[str, str]] | None:
+    """解析 kb-add / kb-update 的 ``<file> [--category X] [--title Y]``。
+
+    返回 (位置参数, 元数据)；未知参数、缺值或位置参数数量不符由调用方检查。
+    """
+    positional: list[str] = []
+    metadata: dict[str, str] = {}
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered in ("--category", "--title") or lowered.startswith(
+            ("--category=", "--title=")
+        ):
+            key = "category" if lowered.startswith("--category") else "title"
+            if "=" in item:
+                value = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            if not value.strip() or value.startswith("-"):
+                return None
+            metadata[key] = value.strip()
+        elif item.startswith("-"):
+            return None
+        else:
+            positional.append(item)
+        index += 1
+    return positional, metadata
+
+
+def _read_kb_file(path: str) -> str | None:
+    from pathlib import Path
+
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        print(f"读取文件失败：{exc}")
+        return None
+    if not text.strip():
+        print("知识内容不能为空")
+        return None
+    return text
+
+
+def run_knowledge_add_standalone(
+    path: str, metadata: dict[str, str] | None = None
+) -> int:
+    """从文件新增知识片段（`python cli.py kb-add <file> [--category X] [--title Y]`）。
+
+    长内容与 Web / 导入一致按语义边界自动拆分（返回 id 为最后一片）。
+
+    Returns:
+        0 添加成功；1 文件 / 知识库 / 写入失败
+    """
+    from utils.knowledge_admin import add_document
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        return 1
+    text = _read_kb_file(path)
+    if text is None:
+        return 1
+    try:
+        result = add_document(text, metadata)
+    except FileNotFoundError:
+        print("知识库未初始化")
+        return 1
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"添加失败：{exc}")
+        return 1
+    parts = int(result.get("parts") or 1)
+    total = result.get("total_count")
+    suffix = f"，拆分为 {parts} 片" if parts > 1 else ""
+    count = f"（共 {total} 条{suffix}）" if total is not None else ""
+    print(f"已添加知识片段 #{result.get('id')}{count}")
+    return 0
+
+
+def run_knowledge_update_standalone(
+    doc_id: int, path: str, metadata: dict[str, str] | None = None
+) -> int:
+    """从文件覆盖更新知识片段（`python cli.py kb-update <id> <file> [--category X] [--title Y]`）。
+
+    带 group 的多分片记录按整组替换（与面板「编辑整份」同一实现）。
+
+    Returns:
+        0 更新成功；1 文件 / 知识库 / 更新失败
+    """
+    from utils.knowledge_admin import update_document
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        return 1
+    text = _read_kb_file(path)
+    if text is None:
+        return 1
+    try:
+        result = update_document(doc_id, text, metadata)
+    except FileNotFoundError:
+        print("知识库未初始化")
+        return 1
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"更新失败：{exc}")
+        return 1
+    parts = int(result.get("parts") or 1)
+    suffix = f"，拆分为 {parts} 片" if parts > 1 else ""
+    print(f"已更新知识片段 #{doc_id}{suffix}")
+    return 0
+
+
 def _parse_cli_int(value: str) -> int | None:
     """ASCII 十进制整数解析（用于 <id> / limit 参数）。
 
@@ -2795,8 +2920,8 @@ def _parse_export_args(
 
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / stats / kb / eval / kb-export / "
-    "kb-import / kb-list / kb-search / kb-show / kb-categories / kb-delete / "
-    "kb-duplicates / "
+    "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
+    "kb-categories / kb-delete / kb-duplicates / "
     "preferences / "
     "trips / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export / user-export"
@@ -2938,6 +3063,30 @@ def main():
                 print("用法：python cli.py kb-show <id> [--json]")
                 sys.exit(2)
             sys.exit(run_knowledge_show_standalone(doc_id, as_json=show_json))
+        if arg in ("kb-add", "kb-update"):
+            usage = (
+                "用法：python cli.py kb-add <file> [--category X] [--title Y]"
+                "；kb-update <id> <file> [--category X] [--title Y]"
+            )
+            parsed_write = _parse_kb_write_args(sys.argv[2:])
+            if parsed_write is None:
+                print(usage)
+                sys.exit(2)
+            write_pos, write_meta = parsed_write
+            if arg == "kb-add" and len(write_pos) == 1:
+                sys.exit(
+                    run_knowledge_add_standalone(write_pos[0], write_meta or None)
+                )
+            if arg == "kb-update" and len(write_pos) == 2:
+                write_id = _parse_cli_int(write_pos[0])
+                if write_id is not None:
+                    sys.exit(
+                        run_knowledge_update_standalone(
+                            write_id, write_pos[1], write_meta or None
+                        )
+                    )
+            print(usage)
+            sys.exit(2)
         if arg == "kb-categories":
             kb_categories_json = _parse_json_flag(
                 sys.argv[2:], "python cli.py kb-categories [--json]"
