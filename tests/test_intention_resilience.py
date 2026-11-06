@@ -160,6 +160,81 @@ def test_long_input_is_truncated():
     print("✓ 超长输入在意图 prompt 中截断")
 
 
+class _FragmentBeforeFullModel:
+    """说明文字里先出现一个合法片段，完整的意图对象在后面。"""
+
+    async def __call__(self, messages):
+        return (
+            '分析：用户提到 {"destination": "北京"}，最终：'
+            '{"reasoning": "规划", "intents": [{"type": "plan_trip"}], '
+            '"key_entities": {"destination": "北京"}, '
+            '"agent_schedule": [{"agent_name": "itinerary_planning", "priority": 1}]}'
+        )
+
+
+class _TemplateEchoModel:
+    """先回显带占位名的调度模板，再给出真实结果：应取最后一个。"""
+
+    async def __call__(self, messages):
+        return (
+            '{"agent_schedule": [{"agent_name": "子智能体名称", "priority": 1}]}\n'
+            '{"reasoning": "r", "intents": [], '
+            '"agent_schedule": [{"agent_name": "information_query", "priority": 1}]}'
+        )
+
+
+def test_fragment_before_full_object_keeps_real_schedule():
+    """说明文字里的片段不能抢在完整意图结果之前（否则调度整体降级）。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_FragmentBeforeFullModel())
+    data = json.loads(asyncio.run(agent.reply(_user_msg())).content)
+    assert data["agent_schedule"][0]["agent_name"] == "itinerary_planning"
+    assert "意图识别出错" not in data.get("reasoning", "")
+    print("✓ 片段在前、完整意图在后时采用完整结果")
+
+
+def test_template_echo_before_real_result_uses_last():
+    """回显的占位调度模板在前时，应取后面真实结果而不是占位名。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_TemplateEchoModel())
+    data = json.loads(asyncio.run(agent.reply(_user_msg())).content)
+    assert data["agent_schedule"][0]["agent_name"] == "information_query"
+    print("✓ 多次出现 agent_schedule 时采用最后一个")
+
+
+def test_single_msg_call_does_not_leak_previous_history():
+    """同一实例混用列表与单条 Msg 输入时，上一轮历史不能串进本次 prompt。"""
+    model = _CaptureModel()
+    agent = IntentionAgent(name="IntentionAgent", model=model)
+    stale = "上一轮的独特历史短语ABC"
+    asyncio.run(
+        agent.reply(
+            [
+                Msg(name="user", content=stale, role="user"),
+                Msg(name="user", content="帮我规划", role="user"),
+            ]
+        )
+    )
+    asyncio.run(agent.reply(_user_msg()))
+    second_prompt = str(model.prompts[1])
+    assert stale not in second_prompt, "单条 Msg 调用不能带上一轮历史"
+    print("✓ 单条 Msg 调用不串上一轮历史")
+
+
+def test_content_block_list_is_rendered_as_text():
+    """Msg.content 为 agentscope content block 列表时按纯文本进 prompt。"""
+    model = _CaptureModel()
+    agent = IntentionAgent(name="IntentionAgent", model=model)
+    msg = Msg(
+        name="user",
+        content=[{"type": "text", "text": "帮我规划去上海的行程"}],
+        role="user",
+    )
+    asyncio.run(agent.reply(msg))
+    prompt = str(model.prompts[0])
+    assert "帮我规划去上海的行程" in prompt
+    assert "[{'type'" not in prompt and "{'type'" not in prompt
+    print("✓ content block 列表按纯文本渲染")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
@@ -168,4 +243,8 @@ if __name__ == "__main__":
     test_non_object_json_falls_back()
     test_nested_fragment_falls_back_to_default_schedule()
     test_long_input_is_truncated()
+    test_fragment_before_full_object_keeps_real_schedule()
+    test_template_echo_before_real_result_uses_last()
+    test_single_msg_call_does_not_leak_previous_history()
+    test_content_block_list_is_rendered_as_text()
     print("\n全部通过")
