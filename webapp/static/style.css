@@ -1018,9 +1018,13 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 }
 
 .trip-list { display: flex; flex-direction: column; gap: 6px; }
-.trip { position: relative; padding: 8px 62px 8px 10px; border-radius: 9px; background: var(--bg); font-size: 12.5px; }
+/* 右侧预留「编辑 / 日历 / 删除」三个按钮的宽度（3×24 + 2×2 间距 + 6 右边距），
+   触屏设备上按钮常显，预留不足会盖住日期文本 */
+.trip { position: relative; padding: 8px 86px 8px 10px; border-radius: 9px; background: var(--bg); font-size: 12.5px; }
 .trip-route { display: flex; justify-content: space-between; gap: 10px; font-weight: 600; }
-.trip-route span:last-child { color: var(--ink-3); font-size: 11.5px; font-weight: 500; }
+/* 窄屏：路线不折行（否则「杭 / 州」被拆断），长用途 / 描述在右侧换行 */
+.trip-route span:first-child { white-space: nowrap; }
+.trip-route span:last-child { color: var(--ink-3); font-size: 11.5px; font-weight: 500; text-align: right; overflow-wrap: anywhere; }
 .trip-meta { margin-top: 2px; color: var(--ink-3); font-size: 11.5px; }
 .trip-status {
   display: inline-block;
