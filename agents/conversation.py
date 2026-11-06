@@ -24,7 +24,7 @@ from agents.orchestration_agent import OrchestrationAgent, canonical_agent_name
 from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.errors import MemoryPersistenceError
+from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import has_preference_value
 from utils.result_formatter import result_to_markdown
@@ -49,6 +49,8 @@ class ConversationRuntime:
         self.session_id = session_id
         self.model = model
         self.circuit_breaker = circuit_breaker
+        # 本轮流式请求是否已向熔断器记录过成功 / 失败（归还半开名额用）
+        self._probe_recorded = False
 
         self.memory = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
         self.intention_agent = IntentionAgent(name="IntentionAgent", model=model)
@@ -84,9 +86,30 @@ class ConversationRuntime:
         start = time.time()
         usage_before = self._usage_snapshot()
 
+        # 半开状态下 raise_if_open 会占用唯一的试探名额。本轮若在真正调用
+        # LLM 之前失败或被取消（用户点停止 / 断网），成功与失败都没有记录，
+        # 名额会一直占到 recovery_timeout 之后，期间其它用户全部被拒绝；
+        # finally 中归还（记录过成功 / 失败时 release_probe 不产生效果）
+        self._probe_recorded = False
         if self.circuit_breaker:
             self.circuit_breaker.raise_if_open()
+        try:
+            return await self._execute_turn(
+                user_input, on_event, rc, start, usage_before
+            )
+        finally:
+            if self.circuit_breaker and not self._probe_recorded:
+                self.circuit_breaker.release_probe()
 
+    async def _execute_turn(
+        self,
+        user_input: str,
+        on_event: ProgressCallback | None,
+        rc: Any,
+        start: float,
+        usage_before: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         self._emit(on_event, {"type": "phase", "phase": "context", "label": "整理记忆与上下文"})
 
         # 多会话写入后保持长期记忆最新（避免覆盖其它会话刚写入的数据）。
@@ -107,9 +130,9 @@ class ConversationRuntime:
         try:
             intention_data = json.loads(intention.content)
         except json.JSONDecodeError as exc:
-            raise ValueError("意图识别结果解析失败，请重试") from exc
+            raise UserFacingError("意图识别结果解析失败，请重试") from exc
         if not isinstance(intention_data, dict):
-            raise ValueError("意图识别结果格式错误，请重试")
+            raise UserFacingError("意图识别结果格式错误，请重试")
 
         schedule = intention_data.get("agent_schedule")
         if not isinstance(schedule, list):
@@ -142,9 +165,9 @@ class ConversationRuntime:
         try:
             result_data = json.loads(orchestration.content)
         except json.JSONDecodeError as exc:
-            raise ValueError("编排结果解析失败，请重试") from exc
+            raise UserFacingError("编排结果解析失败，请重试") from exc
         if not isinstance(result_data, dict):
-            raise ValueError("编排结果格式错误，请重试")
+            raise UserFacingError("编排结果格式错误，请重试")
 
         agents = [
             {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
@@ -272,6 +295,7 @@ class ConversationRuntime:
             )
             if self.circuit_breaker:
                 self.circuit_breaker.record_success()
+                self._probe_recorded = True
             return result
         except CircuitOpenError:
             raise
@@ -282,6 +306,7 @@ class ConversationRuntime:
         except Exception:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure()
+                self._probe_recorded = True
             raise
 
     def _usage_snapshot(self) -> dict[str, Any] | None:

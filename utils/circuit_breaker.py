@@ -96,6 +96,18 @@ class CircuitBreaker:
         elif state == CircuitState.CLOSED:
             self._failure_count = 0
 
+    def release_probe(self) -> None:
+        """归还半开试探名额：调用在真正发出 LLM 请求之前就失败或被取消时。
+
+        半开状态只放行一个试探请求；若该请求被取消（用户点停止 / 断网）或
+        在调用 LLM 前抛错，成功 / 失败都没记录，名额会一直占用到
+        ``recovery_timeout_sec`` 之后，期间其它用户的请求全部被拒绝。
+        归还后下一个请求可以立即试探；已记录成功 / 失败（名额已消费）时
+        本方法不产生任何效果。
+        """
+        if self.state == CircuitState.HALF_OPEN:
+            self._half_open_probe_at = None
+
     def record_failure(self) -> None:
         """记录一次失败调用"""
         self._last_failure_time = time.monotonic()

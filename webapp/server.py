@@ -54,7 +54,7 @@ from context.storage import (
     get_shared_redis_client,
 )
 from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
-from utils.errors import MemoryPersistenceError
+from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.doctor import run_doctor
@@ -722,9 +722,14 @@ class AligoWebApp:
     ) -> _WebSession:
         """获取（或新建）会话；``mark_in_use`` 时先登记占用再返回。
 
-        占用（``begin_turn``）在缓存锁内完成，LRU 淘汰不会在「刚取到会话、
-        还没开始对话」的间隙把它 close 掉；调用方必须在结束（含异常）后
-        调用 ``end_turn``。
+        ``_WebSession`` 构造包含 Redis ping / PostgreSQL 连接等阻塞网络 IO，
+        不能持有 ``_sessions_lock``：一次慢构造会把所有用户（包括已有会话）
+        的会话查找一起串行阻塞。因此在锁外构造、锁内二次检查插入；并发
+        重复构造时后到者关闭自己新建的运行时回收连接。
+
+        ``begin_turn`` 仍在缓存锁内完成：LRU 淘汰不会在「刚取到会话、还没
+        开始对话」的间隙把它 close 掉。调用方必须在结束（含异常）后调用
+        ``end_turn``。
         """
         if not session_id:
             session_id = uuid.uuid4().hex[:12]
@@ -732,38 +737,55 @@ class AligoWebApp:
         # 互不覆盖，也不会因为别人关闭同名会话而丢掉自己在进程内的短期记忆
         key = self._session_key(user_id, session_id)
         evicted: list[_WebSession] = []
+        session: _WebSession | None = None
         with self._sessions_lock:
             session = self.sessions.get(key)
-            if session is None:
-                # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
-                session = _WebSession(
-                    user_id, session_id, wrap_usage_tracking(self.model), self.breaker
-                )
-                self.sessions[key] = session
-                # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
-                # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
-                # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
-                # 等后续请求再回收
-                while len(self.sessions) > self.max_sessions:
-                    victim = next(
-                        (
-                            candidate
-                            for candidate, item in self.sessions.items()
-                            if candidate != key
-                            and (
-                                not item.in_use()
-                                or item.long_in_use(self.session_turn_leak_sec)
-                            )
-                        ),
-                        None,
-                    )
-                    if victim is None:
-                        break
-                    evicted.append(self.sessions.pop(victim))
-            else:
+            if session is not None:
                 self.sessions.move_to_end(key)
-            if mark_in_use:
-                session.begin_turn()
+                if mark_in_use:
+                    session.begin_turn()
+        if session is None:
+            # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
+            candidate = _WebSession(
+                user_id, session_id, wrap_usage_tracking(self.model), self.breaker
+            )
+            with self._sessions_lock:
+                found = self.sessions.get(key)
+                if found is not None:
+                    # 并发首请求：另一线程已抢先插入，使用已有实例
+                    session = found
+                    self.sessions.move_to_end(key)
+                    if mark_in_use:
+                        session.begin_turn()
+                else:
+                    session = candidate
+                    self.sessions[key] = candidate
+                    # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
+                    # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
+                    # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
+                    # 等后续请求再回收
+                    while len(self.sessions) > self.max_sessions:
+                        victim = next(
+                            (
+                                candidate_key
+                                for candidate_key, item in self.sessions.items()
+                                if candidate_key != key
+                                and (
+                                    not item.in_use()
+                                    or item.long_in_use(self.session_turn_leak_sec)
+                                )
+                            ),
+                            None,
+                        )
+                        if victim is None:
+                            break
+                        evicted.append(self.sessions.pop(victim))
+                    if mark_in_use:
+                        session.begin_turn()
+            if session is not candidate:
+                # 竞争失败：自己新建的运行时从未暴露给调用方，关闭回收
+                # PostgreSQL 连接等资源
+                candidate.close()
         # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求
         for stale in evicted:
             stale.close()
@@ -2496,14 +2518,37 @@ def create_app(model: Any = None) -> FastAPI:
                                 "message": f"服务暂时不可用，请稍后再试（请求 ID：{rid}）",
                             }
                         )
-                    except Exception as exc:  # noqa: BLE001 - 通过事件返回友好错误
-                        # 流式响应已发出 200，异常只能通过 error 事件返回；
-                        # 同时写日志，避免客户端断开后失败完全无痕
-                        logger.warning("流式对话失败（%s）: %s", rid, exc, exc_info=True)
+                    except MemoryPersistenceError as exc:
+                        logger.warning("流式对话存储失败（%s）: %s", rid, exc)
+                        await queue.put(
+                            {
+                                "type": "error",
+                                "message": f"存储暂时不可用，请稍后再试（请求 ID：{rid}）",
+                            }
+                        )
+                    except UserFacingError as exc:
+                        # 异常消息是给用户看的固定文案（如「意图识别结果解析
+                        # 失败，请重试」），可以原样返回
+                        logger.warning("流式对话失败（%s）: %s", rid, exc)
                         await queue.put(
                             {
                                 "type": "error",
                                 "message": f"处理失败：{exc}（请求 ID：{rid}）",
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 通过事件返回友好错误
+                        # 流式响应已发出 200，异常只能通过 error 事件返回。
+                        # 原始异常文本可能含内部细节（SQL / 文件路径 / 上游
+                        # 响应体），只写日志，不返回给客户端；请求 ID 用于
+                        # 与服务端日志对照
+                        logger.warning("流式对话失败（%s）: %s", rid, exc, exc_info=True)
+                        await queue.put(
+                            {
+                                "type": "error",
+                                "message": (
+                                    "处理失败：服务器内部错误，请稍后再试"
+                                    f"（请求 ID：{rid}）"
+                                ),
                             }
                         )
 

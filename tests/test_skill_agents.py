@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -179,6 +180,90 @@ def test_memory_query_includes_current_dialogue():
     print("✓ memory-query 带上当前会话对话")
 
 
+def test_memory_query_reads_memory_off_event_loop():
+    """行程 / 偏好读取不能在事件循环线程执行（会冻结所有 SSE 流）。"""
+    agent_class = _load_skill("memory-query", "MemoryQueryAgent")
+    threads = []
+
+    class _LongTerm:
+        def get_trip_history(self, limit=None):
+            threads.append(threading.get_ident())
+            return []
+
+        def get_preference(self):
+            threads.append(threading.get_ident())
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    class _SkillLoader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return "好的"
+
+    agent = agent_class(
+        name="MemoryQueryAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _SkillLoader()
+    loop_thread = threading.get_ident()
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content='{"context": {"rewritten_query": "我去过哪些地方"}}',
+                role="user",
+            )
+        )
+    )
+    assert len(threads) == 2, "应分别读取行程与偏好"
+    assert all(tid != loop_thread for tid in threads), (
+        "长期记忆读取在事件循环线程执行，会冻结其它连接"
+    )
+    print("✓ memory-query 的记忆读取离开事件循环线程")
+
+
+def test_preference_reads_memory_off_event_loop():
+    """偏好智能体读取已保存偏好同样不能在事件循环线程执行。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+    threads = []
+
+    class _LongTerm:
+        def get_preference(self):
+            threads.append(threading.get_ident())
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _SkillLoader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return '{"has_preferences": false, "preferences": []}'
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _SkillLoader()
+    loop_thread = threading.get_ident()
+    asyncio.run(
+        agent.reply(Msg(name="orchestrator", content="我喜欢住汉庭", role="user"))
+    )
+    assert threads and all(tid != loop_thread for tid in threads), (
+        "偏好读取在事件循环线程执行，会冻结其它连接"
+    )
+    print("✓ preference 的偏好读取离开事件循环线程")
+
+
 def test_rag_search_top_k_bounds():
     """top_k=0 / 负数返回空，None 使用默认值，不能把非法 limit 传给 Milvus。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
@@ -289,6 +374,8 @@ if __name__ == "__main__":
         test_memory_query_formats_null_trip_fields()
         test_memory_query_formats_falsey_preferences()
         test_memory_query_includes_current_dialogue()
+        test_memory_query_reads_memory_off_event_loop()
+        test_preference_reads_memory_off_event_loop()
         test_rag_search_top_k_bounds()
         test_rag_dimension_mismatch_warns(_mp)
     finally:
