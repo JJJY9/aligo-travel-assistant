@@ -435,17 +435,10 @@ def test_rag_search_top_k_bounds():
     print("✓ search_knowledge top_k 边界")
 
 
-def test_rag_dimension_mismatch_warns(monkeypatch):
-    """集合向量维度与当前嵌入模型不一致时给出告警（否则检索静默为空）。"""
+def test_rag_dimension_mismatch_fails_init():
+    """集合维度与嵌入模型不一致时初始化直接失败（否则每问都抛底层 matmul 异常）。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
     check = agent_class._check_embedding_dimension
-    logger = check.__globals__["logger"]
-    warnings = []
-    monkeypatch.setattr(
-        logger,
-        "warning",
-        lambda msg, *args: warnings.append(msg % args if args else msg),
-    )
 
     class _Client:
         def describe_collection(self, name):
@@ -455,9 +448,173 @@ def test_rag_dimension_mismatch_warns(monkeypatch):
         collection_name = "kb"
         embedding_dim = 512
 
-    check(_Self(), _Client())
-    assert any("不一致" in message for message in warnings)
-    print("✓ 知识库向量维度不一致时告警")
+    try:
+        check(_Self(), _Client())
+    except RuntimeError as exc:
+        assert "不一致" in str(exc) and "init_knowledge_base" in str(exc)
+    else:
+        raise AssertionError("维度不一致应抛 RuntimeError")
+    print("✓ 知识库向量维度不一致时初始化失败")
+
+
+class _RagFakeEmbedding:
+    def get_sentence_embedding_dimension(self):
+        return 512
+
+
+class _RagFakeClient:
+    def __init__(self):
+        self.exists = False
+        self.created = []
+
+    def has_collection(self, name):
+        return self.exists
+
+    def create_collection(self, collection_name, dimension, metric_type, auto_id):
+        self.created.append(collection_name)
+        self.exists = True
+
+    def describe_collection(self, name):
+        return {"fields": [{"name": "vector", "params": {"dim": 512}}]}
+
+
+def test_rag_requires_initialized_knowledge_base(monkeypatch, tmp_path):
+    """知识库未初始化时不创建空库，回复明确错误（此前回答「没有找到相关信息」）。"""
+    module = _load_skill_module("ask-question")
+    # CI 未安装 RAG 可选依赖：构造函数会在依赖分支提前返回，这里按已安装处理
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
+    monkeypatch.setattr(
+        module, "get_embedding_model", lambda name: _RagFakeEmbedding()
+    )
+    monkeypatch.setattr(
+        module, "get_milvus_client", lambda path: _RagFakeClient()
+    )
+    agent = module.RAGKnowledgeAgent(name="x", knowledge_base_path=str(tmp_path))
+    assert agent.initialized is False
+    assert "尚未初始化" in agent.init_error
+    assert not (tmp_path / "milvus_lite.db").exists(), "检索路径不能创建空库"
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="住宿标准", role="user"))
+    )
+    payload = json.loads(out.content)
+    assert payload["status"] == "error"
+    assert "尚未初始化" in payload["message"]
+    print("✓ 未初始化的知识库明确报错")
+
+
+def test_rag_explicit_embedding_model_id_not_replaced(monkeypatch, tmp_path):
+    """HuggingFace 模型 ID（含 /）不能被当成缺失路径替换成默认模型。"""
+    module = _load_skill_module("ask-question")
+    # CI 未安装 RAG 可选依赖：构造函数会在依赖分支提前返回，这里按已安装处理
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
+    (tmp_path / "milvus_lite.db").write_bytes(b"")
+    captured = {}
+
+    def fake_get_embedding_model(name):
+        captured["name"] = name
+        return _RagFakeEmbedding()
+
+    monkeypatch.setattr(module, "get_embedding_model", fake_get_embedding_model)
+    monkeypatch.setattr(
+        module, "get_milvus_client", lambda path: _RagFakeClient()
+    )
+    module.RAGKnowledgeAgent(
+        name="x",
+        knowledge_base_path=str(tmp_path),
+        embedding_model="BAAI/bge-base-zh-v1.5",
+    )
+    assert captured["name"] == "BAAI/bge-base-zh-v1.5"
+    assert module.RAGKnowledgeAgent._looks_like_filesystem_path(
+        "data/models/bge"
+    ) is False
+    assert module.RAGKnowledgeAgent._looks_like_filesystem_path(
+        "./missing-model"
+    ) is True
+    assert module.RAGKnowledgeAgent._looks_like_filesystem_path(
+        "D:/models/x"
+    ) is True
+    print("✓ 显式嵌入模型 ID 不被 RAG_CONFIG 覆盖")
+
+
+def test_rag_reply_filters_low_score_documents():
+    """低分片段不能当知识注入（无关问题应回答没有找到相关信息）。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+
+    class _Agent(agent_class):
+        def __init__(self):
+            # 直接初始化 AgentBase（跳过 Milvus 构造），保留 hook 机制
+            from agentscope.agent import AgentBase
+
+            AgentBase.__init__(self)
+            self.name = "RAGKnowledgeAgent"
+            self.initialized = True
+            self.model = None
+
+    agent = _Agent()
+    docs = [{"id": "1", "content": "无关片段", "metadata": {}, "distance": 0.3}]
+    agent.search_knowledge = lambda q, k=None, s=False: list(docs)
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="今天适合吃什么水果", role="user"))
+    )
+    payload = json.loads(out.content)
+    assert payload["status"] == "no_knowledge", payload["status"]
+
+    docs[0]["distance"] = 0.7
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="住宿标准是多少", role="user"))
+    )
+    payload = json.loads(out.content)
+    assert payload["status"] == "success"
+    print("✓ 低分片段按阈值过滤")
+
+
+def test_rag_grouped_documents_assembled():
+    """多分片文档按 group/part 拼回整篇，重复 part 取高分者。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+    grouped = agent._assemble_grouped_documents(
+        [
+            {"id": "p2", "content": "B", "metadata": {"group": "g1", "part": 2}, "distance": 0.6},
+            {"id": "p1a", "content": "A-旧", "metadata": {"group": "g1", "part": 1}, "distance": 0.5},
+            {"id": "p1b", "content": "A-新", "metadata": {"group": "g1", "part": 1}, "distance": 0.55},
+            {"id": "s", "content": "单独片段", "metadata": {}, "distance": 0.9},
+        ]
+    )
+    by_id = {item["id"]: item for item in grouped}
+    assert by_id["g1"]["content"] == "A-新B"
+    assert by_id["g1"]["distance"] == 0.6
+    assert grouped[0]["id"] == "s", "按最佳分数排序"
+    print("✓ 多分片文档按组拼装")
+
+
+def test_rag_collection_created_once(monkeypatch, tmp_path):
+    """首次构造创建集合；已有集合不再重复创建；初始化路径允许无库文件创建。"""
+    module = _load_skill_module("ask-question")
+    # CI 未安装 RAG 可选依赖：构造函数会在依赖分支提前返回，这里按已安装处理
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
+    (tmp_path / "milvus_lite.db").write_bytes(b"")
+    client = _RagFakeClient()
+    monkeypatch.setattr(
+        module, "get_embedding_model", lambda name: _RagFakeEmbedding()
+    )
+    monkeypatch.setattr(module, "get_milvus_client", lambda path: client)
+    module.RAGKnowledgeAgent(name="x", knowledge_base_path=str(tmp_path))
+    module.RAGKnowledgeAgent(name="y", knowledge_base_path=str(tmp_path))
+    assert client.created == ["business_travel_knowledge"]
+
+    # 初始化脚本路径：库文件不存在时允许创建（create_if_missing=True）
+    empty = tmp_path / "fresh"
+    empty.mkdir()
+    fresh_client = _RagFakeClient()
+    monkeypatch.setattr(
+        module, "get_milvus_client", lambda path: fresh_client
+    )
+    agent = module.RAGKnowledgeAgent(
+        name="z", knowledge_base_path=str(empty), create_if_missing=True
+    )
+    assert agent.initialized is True
+    assert fresh_client.created == ["business_travel_knowledge"]
+    print("✓ 集合只创建一次（初始化路径允许创建）")
 
 
 def test_extract_user_query_fallback():
@@ -514,7 +671,24 @@ if __name__ == "__main__":
             test_all_search_backends_fail_reports_error(_mp_search)
         finally:
             _mp_search.undo()
-        test_rag_dimension_mismatch_warns(_mp)
+        test_rag_dimension_mismatch_fails_init()
+        test_rag_reply_filters_low_score_documents()
+        test_rag_grouped_documents_assembled()
+        for case in (
+            test_rag_requires_initialized_knowledge_base,
+            test_rag_explicit_embedding_model_id_not_replaced,
+            test_rag_collection_created_once,
+        ):
+            _case_mp = pytest.MonkeyPatch()
+            try:
+                case(
+                    _case_mp,
+                    __import__("pathlib").Path(
+                        __import__("tempfile").mkdtemp()
+                    ),
+                )
+            finally:
+                _case_mp.undo()
     finally:
         _mp.undo()
     print("\n全部通过")

@@ -62,7 +62,10 @@ def _get_agent() -> Any:
         if _agent is None:
             from agents.rag_knowledge_agent import RAGKnowledgeAgent
 
-            _agent = RAGKnowledgeAgent(collection_name=COLLECTION_NAME)
+            # 写入 / 管理路径负责创建知识库；检索路径默认不创建空库
+            _agent = RAGKnowledgeAgent(
+                collection_name=COLLECTION_NAME, create_if_missing=True
+            )
     return _agent
 
 

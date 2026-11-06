@@ -20,6 +20,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import threading
 
 # Add project root to sys.path
 import sys
@@ -59,6 +61,10 @@ except ImportError as e:
 from utils.embedding_model import get_embedding_model
 from utils.user_query import extract_user_query
 
+# 进程内集合初始化互斥：并发的首次构造都会看到 has_collection=False，
+# 同时 create_collection 会让其中一个抛 MilvusException
+_COLLECTION_INIT_LOCK = threading.Lock()
+
 
 class RAGKnowledgeAgent(AgentBase):
     """RAG知识库智能体"""
@@ -69,8 +75,9 @@ class RAGKnowledgeAgent(AgentBase):
         model=None,
         knowledge_base_path: str | None = None,
         collection_name: str = "business_travel_knowledge",
-        embedding_model: str = "BAAI/bge-small-zh-v1.5",
+        embedding_model: str | None = None,
         top_k: int = 5,
+        create_if_missing: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -94,12 +101,18 @@ class RAGKnowledgeAgent(AgentBase):
             self.initialized = False
             return
 
-        # 优先使用 config 中的配置（支持本地路径，避免连 HuggingFace）
+        # 配置只作为默认值：调用方显式传入的模型优先，否则系统永远是
+        # RAG_CONFIG 里的那一个，无法选择其它嵌入模型
         try:
             from config import RAG_CONFIG
-            embedding_model = RAG_CONFIG.get("embedding_model", embedding_model)
+            if not embedding_model:
+                embedding_model = RAG_CONFIG.get(
+                    "embedding_model", "BAAI/bge-small-zh-v1.5"
+                )
         except Exception:
             pass
+        if not embedding_model:
+            embedding_model = "BAAI/bge-small-zh-v1.5"
 
         # 若配置的是本地路径且存在，则从本地加载，否则按模型 ID 使用（会联网）
         model_path_or_id = embedding_model
@@ -111,12 +124,14 @@ class RAGKnowledgeAgent(AgentBase):
         if path_obj.exists():
             model_path_or_id = str(path_obj.resolve())
             logger.info(f"Using local embedding model: {model_path_or_id}")
-        else:
-            if "/" in embedding_model or "\\" in embedding_model or embedding_model.startswith("."):
-                logger.warning(
-                    f"Configured embedding path does not exist: {embedding_model}，将使用 BAAI/bge-small-zh-v1.5 并尝试联网下载。"
-                )
-                model_path_or_id = "BAAI/bge-small-zh-v1.5"
+        elif self._looks_like_filesystem_path(embedding_model):
+            # 只把「看起来是文件路径」的值当作缺失的本地模型：HuggingFace
+            # 模型 ID（如 BAAI/bge-small-zh-v1.5）里的 / 不是路径分隔符，
+            # 不能替换成默认模型（会违背调用方的显式选择）
+            logger.warning(
+                f"Configured embedding path does not exist: {embedding_model}，将使用 BAAI/bge-small-zh-v1.5 并尝试联网下载。"
+            )
+            model_path_or_id = "BAAI/bge-small-zh-v1.5"
         logger.info(f"Loading embedding model: {model_path_or_id}")
         # 进程内共享同一份嵌入模型：每个会话各建一份会重复占用 ~90 MB
         self.embedding_model = get_embedding_model(model_path_or_id)
@@ -126,24 +141,44 @@ class RAGKnowledgeAgent(AgentBase):
         milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
 
+        # 检索路径不创建知识库（create_if_missing=False）：Milvus Lite 打开
+        # 不存在的库会静默新建空库，把「未初始化」回答成「没有找到相关信息」。
+        # 初始化脚本与知识管理写入路径显式传 True（它们负责创建 / 写入）
+        if not Path(milvus_db_path).exists() and not create_if_missing:
+            self.initialized = False
+            self.init_error = (
+                "知识库尚未初始化（找不到 milvus_lite.db），请先运行 "
+                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+            )
+            logger.error(self.init_error)
+            return
+
         self._milvus_db_path = milvus_db_path
         self._client_created_at = None  # 用于追踪客户端创建时间
         client = self.milvus_client
 
-        # 检查collection是否存在
-        if client.has_collection(collection_name):
-            logger.info(f"Loaded existing collection: {collection_name}")
+        # 检查collection是否存在。并发首次构造需要互斥：两个线程同时看到
+        # 不存在再同时 create_collection，其中一个会抛 MilvusException；
+        # 即使竞争仍发生（多实例 / 客户端重连），以「创建后再确认存在」兜底
+        with _COLLECTION_INIT_LOCK:
+            if client.has_collection(collection_name):
+                logger.info(f"Loaded existing collection: {collection_name}")
+            else:
+                # 创建新collection
+                logger.info(f"Creating new collection: {collection_name}")
+                try:
+                    client.create_collection(
+                        collection_name=collection_name,
+                        dimension=self.embedding_dim,
+                        metric_type="COSINE",  # 余弦相似度
+                        auto_id=False,
+                    )
+                    logger.info(f"Created new collection: {collection_name}")
+                except Exception:
+                    # 另一进程可能刚建好同名集合：确认存在即视为成功
+                    if not client.has_collection(collection_name):
+                        raise
             self._check_embedding_dimension(client)
-        else:
-            # 创建新collection
-            logger.info(f"Creating new collection: {collection_name}")
-            client.create_collection(
-                collection_name=collection_name,
-                dimension=self.embedding_dim,
-                metric_type="COSINE",  # 余弦相似度
-                auto_id=False,
-            )
-            logger.info(f"Created new collection: {collection_name}")
 
         self.initialized = True
         logger.info("RAG Knowledge Agent (Milvus Lite) initialized successfully")
@@ -153,8 +188,22 @@ class RAGKnowledgeAgent(AgentBase):
         """每次从共享注册表取当前客户端，避免重连后其它会话持有已关闭句柄。"""
         return get_milvus_client(self._milvus_db_path)
 
+    @staticmethod
+    def _looks_like_filesystem_path(value: str) -> bool:
+        """区分本地路径与 HuggingFace 模型 ID（如 BAAI/bge-small-zh-v1.5）。"""
+        return (
+            value.startswith((".", "/", "\\"))
+            or "\\" in value
+            or re.match(r"^[A-Za-z]:", value) is not None
+        )
+
     def _check_embedding_dimension(self, client) -> None:
-        """集合向量维度与当前嵌入模型不一致时给出明确警告（检索会静默为空）。"""
+        """集合向量维度与当前嵌入模型不一致时明确报错。
+
+        继续运行只会让每个问题在检索时抛底层 matmul 异常（或被静默吞成
+        空结果），而 doctor / 知识库状态仍显示可用——必须在初始化阶段
+        失败并提示重新初始化。
+        """
         try:
             description = client.describe_collection(self.collection_name)
         except Exception as exc:  # noqa: BLE001 - 仅诊断，不影响初始化
@@ -174,11 +223,10 @@ class RAGKnowledgeAgent(AgentBase):
                 dim = field["type_params"].get("dim")
             try:
                 if dim is not None and int(dim) != int(self.embedding_dim):
-                    logger.warning(
-                        "知识库向量维度 %s 与嵌入模型 %s 不一致，检索会为空；"
-                        "请重新初始化知识库",
-                        dim,
-                        self.embedding_dim,
+                    raise RuntimeError(
+                        "知识库向量维度"
+                        f" {dim} 与嵌入模型 {self.embedding_dim} 不一致，"
+                        "请重新运行 python init_knowledge_base.py 重建知识库"
                     )
             except (TypeError, ValueError):
                 return
@@ -317,7 +365,9 @@ class RAGKnowledgeAgent(AgentBase):
         """
         if not self.initialized:
             if strict:
-                raise RuntimeError("知识库未初始化")
+                raise RuntimeError(
+                    getattr(self, "init_error", "") or "知识库未初始化"
+                )
             return []
 
         # 空查询会返回任意 top-k 片段（答非所问），直接视为无结果
@@ -387,6 +437,61 @@ class RAGKnowledgeAgent(AgentBase):
                 raise
             return []
 
+    def _assemble_grouped_documents(self, docs: list[dict]) -> list[dict]:
+        """把检索到的多分片文档按 group 拼回整篇，再按最佳分数排序。
+
+        - 同组片段按 part 升序拼回完整内容（同名 part 的重复项取高分者，
+          防止整组替换窗口内新旧分片共存时重复注入）；
+        - 单篇片段保持原样；
+        - 拼接后的文档以组内最高分参与后续排序。
+        """
+        grouped: dict[str, list[tuple[int, dict]]] = {}
+        assembled: list[dict] = []
+        for doc in docs:
+            metadata = doc.get("metadata")
+            group = metadata.get("group") if isinstance(metadata, dict) else None
+            if not group:
+                assembled.append(doc)
+                continue
+            try:
+                part = int(metadata.get("part") or 0)
+            except (TypeError, ValueError):
+                part = 0
+            grouped.setdefault(str(group), []).append((part, doc))
+
+        for group_id, parts in grouped.items():
+            # 同名 part 的重复项取高分者（整组替换窗口内新旧分片可能共存）
+            parts.sort(
+                key=lambda item: (
+                    item[0],
+                    -float(item[1].get("distance") or 0.0),
+                )
+            )
+            seen_parts: set[int] = set()
+            texts: list[str] = []
+            best_score = 0.0
+            for part, doc in parts:
+                if part in seen_parts:
+                    continue
+                seen_parts.add(part)
+                texts.append(str(doc.get("content") or ""))
+                best_score = max(
+                    best_score, float(doc.get("distance") or 0.0)
+                )
+            assembled.append(
+                {
+                    "id": group_id,
+                    "content": "".join(texts),
+                    "metadata": {"group": group_id, "parts": len(seen_parts)},
+                    "distance": best_score,
+                }
+            )
+
+        assembled.sort(
+            key=lambda item: float(item.get("distance") or 0.0), reverse=True
+        )
+        return assembled
+
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         """
         RAG问答主流程
@@ -395,12 +500,15 @@ class RAGKnowledgeAgent(AgentBase):
         3. 结合知识生成答案
         """
         if not self.initialized:
+            message = getattr(self, "init_error", "") or (
+                "RAG Agent not initialized. Please install dependencies: pip install pymilvus sentence-transformers"
+            )
             return Msg(
                 name=self.name,
                 content=json.dumps({
                     "status": "error",
-                    "message": "RAG Agent not initialized. Please install dependencies: pip install pymilvus sentence-transformers"
-                }),
+                    "message": message
+                }, ensure_ascii=False),
                 role="assistant"
             )
 
@@ -441,6 +549,24 @@ class RAGKnowledgeAgent(AgentBase):
                 content=json.dumps(result, ensure_ascii=False),
                 role="assistant",
             )
+
+        # 低分片段（与商旅知识无关的问题）不能当知识注入：实测无关查询的
+        # top 分通常 <0.5、相关命中 >0.6；阈值可由 RAG_CONFIG["min_score"]
+        # 调整（评测 / 管理接口走 search_knowledge 原始结果，不受影响）
+        min_score = 0.5
+        try:
+            from config import RAG_CONFIG
+            min_score = float(RAG_CONFIG.get("min_score", min_score))
+        except Exception:
+            pass
+        retrieved_docs = [
+            doc
+            for doc in retrieved_docs
+            if float(doc.get("distance") or 0.0) >= min_score
+        ]
+        # 多分片文档按 group/part 拼回整篇：相似度排序会把整篇拆散、
+        # 低分分片被阈值过滤后还会缺片，直接逐条注入可能重复或乱序
+        retrieved_docs = self._assemble_grouped_documents(retrieved_docs)
 
         if not retrieved_docs:
             result = {

@@ -154,7 +154,8 @@ def main() -> int:
             model=model,
             knowledge_base_path=str(knowledge_base_path),
             collection_name="business_travel_knowledge",
-            top_k=5
+            top_k=5,
+            create_if_missing=True,
         )
 
         if not rag_agent.initialized:
