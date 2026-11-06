@@ -1454,6 +1454,47 @@ def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
     return 0
 
 
+def run_knowledge_categories_standalone(as_json: bool = False) -> int:
+    """打印知识片段分类统计（用于 `python cli.py kb-categories`）。
+
+    Args:
+        as_json: 输出机器可读的 JSON（便于监控 / 脚本）
+
+    Returns:
+        0 读取成功；1 知识库不可用或读取失败
+    """
+    from utils.knowledge_admin import list_categories
+    from utils.knowledge_stats import knowledge_status
+
+    status = knowledge_status()
+    if not status.get("available"):
+        print(f"知识库不可用：{status.get('reason', '未知原因')}")
+        return 1
+    try:
+        categories = list_categories()
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"读取失败：{exc}")
+        return 1
+
+    total = sum(int(item.get("count") or 0) for item in categories)
+    if as_json:
+        print(
+            json.dumps(
+                {"categories": categories, "total": total},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if not categories:
+        print("暂无分类信息（知识片段未设置 category 元数据）")
+        return 0
+    print(f"知识分类：{len(categories)} 个分类，共 {total} 片")
+    for item in categories:
+        print(f"  · {item['category']}  {item['count']} 片")
+    return 0
+
+
 def _parse_cli_int(value: str) -> int | None:
     """ASCII 十进制整数解析（用于 <id> / limit 参数）。
 
@@ -2211,8 +2252,9 @@ def _parse_export_args(
 
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / kb / eval / kb-export / "
-    "kb-import / kb-list / kb-delete / kb-duplicates / preferences / trips / trips-dedupe / "
-    "sessions / session-archive / session-export / sessions-export / trips-export"
+    "kb-import / kb-list / kb-categories / kb-delete / kb-duplicates / preferences / "
+    "trips / trips-dedupe / sessions / session-archive / session-export / "
+    "sessions-export / trips-export"
 )
 
 
@@ -2319,6 +2361,13 @@ def main():
                 sys.exit(2)
             keywords = sys.argv[2] if len(sys.argv) > 2 else ""
             sys.exit(run_knowledge_list_standalone(keywords))
+        if arg == "kb-categories":
+            kb_categories_json = _parse_json_flag(
+                sys.argv[2:], "python cli.py kb-categories [--json]"
+            )
+            if kb_categories_json is None:
+                sys.exit(2)
+            sys.exit(run_knowledge_categories_standalone(as_json=kb_categories_json))
         if arg == "kb-delete":
             args = sys.argv[2:]
             doc_id = _parse_cli_int(args[0]) if args else None

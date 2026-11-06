@@ -5,6 +5,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import sys
 
@@ -80,6 +81,60 @@ def test_list_error(monkeypatch):
     code, out = _capture(cli.run_knowledge_list_standalone)
     assert code == 1 and "读取失败" in out
     print("✓ kb-list 读取失败返回 1")
+
+
+def test_categories_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
+    )
+    code, out = _capture(cli.run_knowledge_categories_standalone)
+    assert code == 1 and "不可用" in out
+    print("✓ kb-categories 知识库不可用时返回 1")
+
+
+def test_categories_prints(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_categories",
+        lambda: [{"category": "住宿", "count": 3}, {"category": "交通", "count": 1}],
+    )
+    code, out = _capture(cli.run_knowledge_categories_standalone)
+    assert code == 0
+    assert "知识分类：2 个分类，共 4 片" in out
+    assert "· 住宿  3 片" in out and "· 交通  1 片" in out
+    print("✓ kb-categories 输出分类分布")
+
+
+def test_categories_json_and_empty(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_categories",
+        lambda: [{"category": "住宿", "count": 2}],
+    )
+    code, out = _capture(cli.run_knowledge_categories_standalone, as_json=True)
+    assert code == 0
+    data = json.loads(out)
+    assert data["categories"] == [{"category": "住宿", "count": 2}]
+    assert data["total"] == 2
+
+    monkeypatch.setattr(knowledge_admin, "list_categories", lambda: [])
+    code, out = _capture(cli.run_knowledge_categories_standalone)
+    assert code == 0 and "暂无分类信息" in out
+    print("✓ kb-categories JSON 输出与空分类")
+
+
+def test_categories_error(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+
+    def boom():
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "list_categories", boom)
+    code, out = _capture(cli.run_knowledge_categories_standalone)
+    assert code == 1 and "读取失败" in out
+    print("✓ kb-categories 读取失败返回 1")
 
 
 def test_delete_success(monkeypatch):
@@ -215,6 +270,10 @@ if __name__ == "__main__":
         test_knowledge_dispatch_rejects_unicode_digits,
         test_duplicates_reports_groups,
         test_duplicates_none_and_error,
+        test_categories_unavailable,
+        test_categories_prints,
+        test_categories_json_and_empty,
+        test_categories_error,
     ):
         mp = pytest.MonkeyPatch()
         try:
