@@ -610,6 +610,178 @@ def test_trip_delete_args_and_dispatch(monkeypatch):
     print("✓ trip-delete dispatch 参数")
 
 
+class _UpdateStore(_FakeStore):
+    """支持 update_trip 的假存储（trip-update 用例）。"""
+
+    def __init__(self, trips=(), update_error=None):
+        super().__init__(trips)
+        self.update_error = update_error
+        self.updates = []
+
+    def update_trip(self, trip_id, fields):
+        if self.update_error == "conflict":
+            raise ValueError("与已有行程冲突")
+        if self.update_error == "boom":
+            raise RuntimeError("disk error")
+        for trip in self.trips:
+            if str(trip.get("trip_id")) == trip_id:
+                trip.update(fields)
+                self.updates.append((trip_id, dict(fields)))
+                return True
+        return False
+
+
+def _run_trip_update(*args, **kwargs):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trip_update_standalone(*args, **kwargs)
+    return code, out.getvalue()
+
+
+def test_trip_update_fields_and_json(monkeypatch):
+    store = _UpdateStore(
+        [
+            _trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1"),
+            _trip("杭州", "2026-12-02", trip_id="trip_2"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"purpose": "会议"})
+    assert code == 0
+    assert "已更新行程 #trip_1" in out and "北京 → 上海" in out
+    assert "与 1 条行程日期重叠：#trip_2" in out
+    assert store.updates[-1] == ("trip_1", {"purpose": "会议"})
+
+    code, out = _run_trip_update(
+        "u1",
+        "trip_1",
+        {"start": "2026-12-01", "end": "2026-12-02"},
+        as_json=True,
+    )
+    data = json.loads(out)
+    assert code == 0 and data["updated"] is True
+    assert data["start_date"] == "2026-12-01" and data["end_date"] == "2026-12-02"
+    assert data["conflicts"][0]["trip_id"] == "trip_2"
+    print("✓ trip-update 字段更新 / JSON")
+
+
+def test_trip_update_validation_errors(monkeypatch):
+    store = _UpdateStore([_trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    cases = [
+        (("u1", "trip_1", {}), "没有需要更新的字段"),
+        (("u1", "trip_1", {"start": "2026/12/01"}), "出发日期格式"),
+        (("u1", "trip_1", {"end": "2026-13-01"}), "返程日期格式"),
+        (("u1", "trip_1", {"end": "2026-11-01"}), "不能早于"),
+        (("u1", "trip_missing", {"purpose": "x"}), "不存在"),
+        (("bad id", "trip_1", {"purpose": "x"}), "用户 ID"),
+    ]
+    for args, needle in cases:
+        code, out = _run_trip_update(*args)
+        assert code == 1 and needle in out, (args, out)
+    assert store.updates == []
+
+    dateless = _UpdateStore([{"trip_id": "trip_1", "destination": "上海"}])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: dateless
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"end": "2026-12-05"})
+    assert code == 1 and "先设置出发日期" in out
+
+    ambiguous = _UpdateStore(
+        [
+            _trip("上海", "2026-12-01", trip_id="trip_dup"),
+            _trip("杭州", "2026-12-02", trip_id="trip_dup"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: ambiguous
+    )
+    code, out = _run_trip_update("u1", "trip_dup", {"purpose": "x"})
+    assert code == 1 and "trips-dedupe" in out and ambiguous.updates == []
+    print("✓ trip-update 校验（字段 / 日期 / 不存在 / 歧义）")
+
+
+def test_trip_update_store_failures(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("open down")
+
+    monkeypatch.setattr(storage, "create_long_term_memory", boom)
+    code, out = _run_trip_update(
+        "u1", "trip_1", {"purpose": "x"}, as_json=True
+    )
+    data = json.loads(out)
+    assert code == 1 and "打开长期记忆失败" in data["error"]
+
+    conflict = _UpdateStore(
+        [_trip("上海", "2026-12-01", trip_id="trip_1")], update_error="conflict"
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: conflict
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"purpose": "x"})
+    assert code == 1 and "冲突" in out
+
+    broken = _UpdateStore(
+        [_trip("上海", "2026-12-01", trip_id="trip_1")], update_error="boom"
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: broken
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"purpose": "x"})
+    assert code == 1 and "更新行程失败" in out
+    print("✓ trip-update 打开 / 冲突 / 其它失败")
+
+
+def test_trip_update_args_and_dispatch(monkeypatch):
+    assert cli._parse_trip_update_args([]) is None
+    assert cli._parse_trip_update_args(["u1", "trip_1"]) is None
+    assert cli._parse_trip_update_args(["u1", "--purpose", "x"]) is None
+    assert cli._parse_trip_update_args(["u1", "trip_1", "--bad"]) is None
+    parsed = cli._parse_trip_update_args(
+        ["u1", "trip_1", "--purpose=会议", "--start", "2026-12-01", "--json"]
+    )
+    assert parsed == {
+        "user_id": "u1",
+        "trip_id": "trip_1",
+        "values": {"purpose": "会议", "start": "2026-12-01"},
+        "as_json": True,
+    }
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_trip_update_standalone",
+        lambda user_id, trip_id, fields, as_json=False: (
+            calls.append((user_id, trip_id, fields, as_json)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "trip-update", "u1", "trip_1", "--purpose", "x", "--json"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "trip_1", {"purpose": "x"}, True)
+    for argv in (
+        ["cli.py", "trip-update"],
+        ["cli.py", "trip-update", "u1", "trip_1"],
+        ["cli.py", "trip-update", "u1", "trip_1", "--bad"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "trip-update" in out.getvalue()
+    print("✓ trip-update 参数解析与 dispatch")
+
+
 if __name__ == "__main__":
     for case in (
         test_trip_interval_and_state,
@@ -632,6 +804,10 @@ if __name__ == "__main__":
         test_trip_delete_not_found_and_ambiguous,
         test_trip_delete_failures,
         test_trip_delete_args_and_dispatch,
+        test_trip_update_fields_and_json,
+        test_trip_update_validation_errors,
+        test_trip_update_store_failures,
+        test_trip_update_args_and_dispatch,
     ):
         mp = pytest.MonkeyPatch()
         try:
