@@ -6,6 +6,7 @@ Aligo 商旅助手 - CLI 交互界面
 import asyncio
 import os
 import sys
+from typing import Any
 
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -1602,6 +1603,71 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
     return 0
 
 
+def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
+    """用户数据概览（`python cli.py stats <user_id> [--json]`）。
+
+    只读汇总：偏好条数、行程统计（总数 / 出行天数 / 到访城市 / 进行中 /
+    即将出行）、会话与消息数（含归档数），与 Web 记忆面板同口径。
+
+    Returns:
+        0 汇总成功；1 参数 / 读取失败
+    """
+    import re
+
+    from utils.travel_stats import summarize_travel
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            preferences = store.get_preference()
+            trips = store.get_trip_history(limit=None)
+            history = store.get_chat_history()
+            archived = store.get_archived_sessions() or []
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取数据失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    sessions = {str(item.get("session_id")) for item in history if item.get("session_id")}
+    travel = summarize_travel(trips)
+    payload: dict[str, Any] = {
+        "user_id": user_id,
+        "preferences": len(preferences),
+        "travel": travel,
+        "sessions": {
+            "total": len(sessions),
+            "messages": len(history),
+            "archived": len(archived),
+        },
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"用户 {user_id} 概览")
+    print(f"  · 偏好 {payload['preferences']} 条")
+    print(
+        f"  · 行程 {travel['total_trips']} 条（出行 {travel['total_days']} 天 / "
+        f"到访 {travel['cities']} 个城市 / 进行中 {travel['active']} / "
+        f"即将出行 {travel['upcoming']}）"
+    )
+    print(
+        f"  · 会话 {payload['sessions']['total']} 个"
+        f"（消息 {payload['sessions']['messages']} 条，"
+        f"归档 {payload['sessions']['archived']}）"
+    )
+    return 0
+
+
 def _parse_cli_int(value: str) -> int | None:
     """ASCII 十进制整数解析（用于 <id> / limit 参数）。
 
@@ -2546,7 +2612,7 @@ def _parse_export_args(
 
 
 _COMMANDS_HINT = (
-    "可用命令：health / doctor / skills / weather / kb / eval / kb-export / "
+    "可用命令：health / doctor / skills / weather / stats / kb / eval / kb-export / "
     "kb-import / kb-list / kb-search / kb-show / kb-categories / kb-delete / "
     "kb-duplicates / "
     "preferences / "
@@ -2718,6 +2784,19 @@ def main():
                     sys.exit(2)
                 limit = parsed
             sys.exit(run_knowledge_duplicates_standalone(limit))
+        if arg == "stats":
+            stats_args = sys.argv[3:]
+            if (
+                len(sys.argv) < 3
+                or sys.argv[2].startswith("-")
+                or len(stats_args) > 1
+                or any(item.lower() != "--json" for item in stats_args)
+            ):
+                print("用法：python cli.py stats <user_id> [--json]")
+                sys.exit(2)
+            sys.exit(
+                run_stats_standalone(sys.argv[2], as_json=bool(stats_args))
+            )
         if arg == "preferences":
             rest = sys.argv[3:]
             if (

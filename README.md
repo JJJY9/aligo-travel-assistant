@@ -481,6 +481,7 @@ python cli.py
 | `status` | 查看当前状态和记忆 |
 | `health` | 检查 LLM 服务是否可用并显示熔断器状态 |
 | `doctor` | 环境自检：依赖 / API Key / 记忆存储后端 / 嵌入模型文件 / 知识库 / LLM 连通性 |
+| `stats` | 用户数据概览：`python cli.py stats <user_id> [--json]`（偏好 / 行程统计 / 会话消息数，与记忆面板同口径） |
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
 | `preferences` | 查看用户偏好 |
