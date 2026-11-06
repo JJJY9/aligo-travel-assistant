@@ -196,7 +196,7 @@ def test_search_empty_and_error(monkeypatch):
     print("✓ kb-search 无结果 / 检索失败")
 
 
-def test_kb_search_args():
+def test_kb_search_args(monkeypatch):
     assert cli._parse_kb_search_args(["住宿"]) == ("住宿", 5, False)
     assert cli._parse_kb_search_args(["住宿", "标准", "--top-k", "3"]) == (
         "住宿 标准",
