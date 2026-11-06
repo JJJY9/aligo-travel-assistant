@@ -2544,45 +2544,67 @@ def run_sessions_list_standalone(
 
 
 def run_session_archive_standalone(
-    user_id: str, session_id: str, archived: bool = True
+    user_id: str, session_id: str, archived: bool = True, as_json: bool = False
 ) -> int:
-    """归档 / 恢复一个会话（用于 `python cli.py session-archive <user> <session> [--restore]`）。
+    """归档 / 恢复一个会话
+    （`python cli.py session-archive <user> <session> [--restore] [--json]`）。
 
     Returns:
         0 操作成功；1 参数 / 读取 / 写入失败
     """
     import re
 
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
-        print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
             exists = bool(store.get_chat_history(session_id=session_id))
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取会话失败：{exc}")
-            return 1
+            return _fail(f"读取会话失败：{exc}")
         if not exists:
-            print(f"会话 {session_id} 不存在或没有消息")
-            return 1
+            return _fail(f"会话 {session_id} 不存在或没有消息")
         try:
             store.set_session_archived(session_id, archived)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"操作失败：{exc}")
-            return 1
+            return _fail(f"操作失败：{exc}")
     finally:
         close = getattr(store, "close", None)
         if callable(close):
             close()
-    print(f"已{'归档' if archived else '恢复'}会话 {session_id}")
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "archived": archived,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(f"已{'归档' if archived else '恢复'}会话 {session_id}")
     return 0
 
 
@@ -2623,12 +2645,19 @@ def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str, bool] | Non
     return archived_only, include_all, query, as_json
 
 
-def _parse_archive_flags(args: list[str]) -> bool | None:
-    """解析 session-archive 的 --restore；未知参数返回 None。"""
-    flags = [item.lower() for item in args]
-    if any(flag != "--restore" for flag in flags):
-        return None
-    return "--restore" in flags
+def _parse_archive_flags(args: list[str]) -> tuple[bool, bool] | None:
+    """解析 session-archive 的 --restore / --json；未知参数返回 None。"""
+    restore = False
+    as_json = False
+    for item in args:
+        lowered = item.lower()
+        if lowered == "--restore":
+            restore = True
+        elif lowered == "--json":
+            as_json = True
+        else:
+            return None
+    return restore, as_json
 
 
 def run_session_export_standalone(
@@ -3374,20 +3403,24 @@ def main():
                 or sys.argv[3].startswith("-")
             ):
                 print(
-                    "用法：python cli.py session-archive <user_id> <session_id> [--restore]"
+                    "用法：python cli.py session-archive <user_id> <session_id> "
+                    "[--restore] [--json]"
                 )
                 sys.exit(2)
-            restore = _parse_archive_flags(sys.argv[4:])
-            if restore is None:
+            parsed_archive = _parse_archive_flags(sys.argv[4:])
+            if parsed_archive is None:
                 print(
-                    "用法：python cli.py session-archive <user_id> <session_id> [--restore]"
+                    "用法：python cli.py session-archive <user_id> <session_id> "
+                    "[--restore] [--json]"
                 )
                 sys.exit(2)
+            restore, as_json = parsed_archive
             sys.exit(
                 run_session_archive_standalone(
                     sys.argv[2],
                     sys.argv[3],
                     archived=not restore,
+                    as_json=as_json,
                 )
             )
         if arg == "session-export":

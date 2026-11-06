@@ -237,6 +237,57 @@ def test_archive_missing_session(monkeypatch):
     print("✓ 不存在的会话返回 1")
 
 
+def test_archive_json_output(monkeypatch):
+    import json as _json
+
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_session_archive_standalone(
+            "u1", "s-active", archived=True, as_json=True
+        )
+    payload = _json.loads(buf.getvalue())
+    assert code == 0
+    assert payload == {
+        "ok": True,
+        "user_id": "u1",
+        "session_id": "s-active",
+        "archived": True,
+    }
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_session_archive_standalone(
+            "u1", "s-missing", archived=False, as_json=True
+        )
+    payload = _json.loads(buf.getvalue())
+    assert code == 1 and payload["ok"] is False
+    assert "不存在或没有消息" in payload["error"]
+    print("✓ session-archive --json 成功 / 错误输出")
+
+
+def test_archive_dispatch_json(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_session_archive_standalone",
+        lambda user_id, session_id, archived=True, as_json=False: (
+            calls.append((user_id, session_id, archived, as_json)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "session-archive", "u1", "s1", "--restore", "--json"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "s1", False, True)
+    print("✓ session-archive dispatch --json")
+
+
 def test_read_failure(monkeypatch):
     fake = _sessions_store()
     fake.fail_history = True
@@ -298,8 +349,9 @@ def test_flag_parsing_helpers():
     assert cli._parse_sessions_flags(["--archived=true"]) is None
     assert cli._parse_sessions_flags(["--archivd"]) is None
     assert cli._parse_sessions_flags(["--archived", "--all"]) is None
-    assert cli._parse_archive_flags([]) is False
-    assert cli._parse_archive_flags(["--restore"]) is True
+    assert cli._parse_archive_flags([]) == (False, False)
+    assert cli._parse_archive_flags(["--restore"]) == (True, False)
+    assert cli._parse_archive_flags(["--json", "--RESTORE"]) == (True, True)
     assert cli._parse_archive_flags(["--restore=1"]) is None
     print("✓ 未知 / 冲突参数被拒绝（--restore=1 不会误归档）")
 
@@ -550,6 +602,8 @@ if __name__ == "__main__":
         test_main_accepts_valid_flags,
         test_archive_and_restore,
         test_archive_missing_session,
+        test_archive_json_output,
+        test_archive_dispatch_json,
         test_session_export_to_file,
         test_session_export_to_stdout,
         test_session_export_missing_and_invalid,
