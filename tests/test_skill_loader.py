@@ -63,8 +63,45 @@ def test_missing_skills_dir_returns_empty():
     print("✓ 技能目录缺失时返回空")
 
 
+def test_get_skill_content_by_dir_and_metadata_name():
+    """get_skill_content：目录名直配、metadata name 回退、缺失返回 None。"""
+    loader = SkillLoader(_make_skills_dir())
+    assert loader.get_skill_content("good") == "正文"
+
+    root = _make_skills_dir()
+    _write(
+        os.path.join(root, "folder-b", "SKILL.md"),
+        "---\nname: custom-name\ndescription: 目录名与 name 不同\n---\n自定义正文",
+    )
+    loader2 = SkillLoader(root)
+    assert loader2.get_skill_content("custom-name") == "自定义正文"
+    assert loader.get_skill_content("missing-skill") is None
+    print("✓ 技能正文读取（目录名 / metadata name 回退 / 缺失）")
+
+
+def test_get_skill_content_without_frontmatter():
+    """无 frontmatter / frontmatter 未闭合时原样返回正文。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(os.path.join(root, "plain", "SKILL.md"), "没有 frontmatter 的正文")
+    _write(os.path.join(root, "unclosed", "SKILL.md"), "---\n没有结束标记")
+    loader = SkillLoader(root)
+    assert loader.get_skill_content("plain") == "没有 frontmatter 的正文"
+    assert loader.get_skill_content("unclosed") == "---\n没有结束标记"
+    print("✓ 无 frontmatter / 未闭合 frontmatter 的正文读取")
+
+
+def test_get_skill_content_missing_dir_returns_none():
+    """技能目录不存在时按名回退不能抛 FileNotFoundError。"""
+    loader = SkillLoader(os.path.join(tempfile.mkdtemp(), "missing"))
+    assert loader.get_skill_content("anything") is None
+    print("✓ 技能目录缺失时按名查找返回 None")
+
+
 if __name__ == "__main__":
     test_load_skills_tolerates_malformed_entries()
     test_get_skill_prompt_sorted_and_mapped()
     test_missing_skills_dir_returns_empty()
+    test_get_skill_content_by_dir_and_metadata_name()
+    test_get_skill_content_without_frontmatter()
+    test_get_skill_content_missing_dir_returns_none()
     print("\n全部通过")
