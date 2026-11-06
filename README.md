@@ -481,6 +481,7 @@ python cli.py
 | `status` | 查看当前状态和记忆 |
 | `health` | 检查 LLM 服务是否可用并显示熔断器状态 |
 | `doctor` | 环境自检：依赖 / API Key / 记忆存储后端 / 嵌入模型文件 / 知识库 / LLM 连通性 |
+| `user-export` | 全部数据导出：`python cli.py user-export <user_id> [dir]`（JSON + Markdown） |
 | `stats` | 用户数据概览：`python cli.py stats <user_id> [--json]`（偏好 / 行程统计 / 会话消息数，与记忆面板同口径） |
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
@@ -507,6 +508,8 @@ python cli.py
 行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`）或 iCalendar（`--ics`，与 Web 的 `/api/trips/calendar` 同一实现，默认 `exports/aligo_trips.ics`；已存在时需 `--force` 覆盖）。
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部、`--query <关键词>` 按标题与消息内容过滤并附命中片段、`--json` 输出机器可读列表；`python cli.py session-archive <user_id> <session_id> [--restore]` 归档 / 恢复会话；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
+
+全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir]` 把偏好、历史行程、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令同一实现）。
 
 全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`；中文或超长用户名会追加短哈希避免重名；按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
 

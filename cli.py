@@ -1668,6 +1668,58 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     return 0
 
 
+def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> int:
+    """把用户长期记忆导出为 JSON + Markdown（`python cli.py user-export <user_id> [dir]`）。
+
+    与交互模式的 export 命令输出同两份文件（utils.exporter.export_files）：
+    偏好、历史行程、统计与全部对话历史；默认写入 `exports/`。
+
+    Returns:
+        0 导出成功；1 参数 / 读取 / 写入失败
+    """
+    import re
+    from datetime import datetime
+    from pathlib import Path
+
+    from utils.exporter import export_files
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            data = {
+                "user_id": user_id,
+                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "preferences": store.get_preference(),
+                "trip_history": store.get_trip_history(limit=None),
+                "statistics": store.get_statistics(),
+                "chat_history": store.get_chat_history(),
+            }
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取用户数据失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    out_dir = Path(target_dir) if target_dir else Path("exports")
+    try:
+        paths = export_files(data, out_dir)
+    except OSError as exc:
+        print(f"写入失败：{exc}")
+        return 1
+    for path in paths:
+        print(f"已导出：{path}")
+    return 0
+
+
 def _parse_cli_int(value: str) -> int | None:
     """ASCII 十进制整数解析（用于 <id> / limit 参数）。
 
@@ -2617,7 +2669,7 @@ _COMMANDS_HINT = (
     "kb-duplicates / "
     "preferences / "
     "trips / trips-dedupe / sessions / session-archive / session-export / "
-    "sessions-export / trips-export"
+    "sessions-export / trips-export / user-export"
 )
 
 
@@ -2928,6 +2980,21 @@ def main():
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
+                )
+            )
+        if arg == "user-export":
+            export_args = sys.argv[2:]
+            if (
+                not 1 <= len(export_args) <= 2
+                or export_args[0].startswith("-")
+                or (len(export_args) == 2 and export_args[1].startswith("-"))
+            ):
+                print("用法：python cli.py user-export <user_id> [dir]")
+                sys.exit(2)
+            sys.exit(
+                run_user_export_standalone(
+                    export_args[0],
+                    export_args[1] if len(export_args) == 2 else None,
                 )
             )
         if arg == "trips-export":
