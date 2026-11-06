@@ -47,6 +47,42 @@ def test_json_parse_success_paths_unchanged():
     print("✓ 正常解析路径不受影响")
 
 
+def test_json_parse_empty_dict_and_prose_braces():
+    """空字典原样返回；前后说明文字带花括号时取第一个完整对象。"""
+    assert robust_json_parse({}) == {}
+    prose = '结果如下：{"a": 1, "b": [2, 3]}，如 {日期} 未提供可默认明天'
+    assert robust_json_parse(prose) == {"a": 1, "b": [2, 3]}
+    print("✓ 空字典与夹带花括号的说明文字")
+
+
+def test_extract_response_text_shapes():
+    """响应文本提取兼容 dict / 列表块 / 对象 / 其他类型。"""
+    from utils.json_parser import extract_response_text
+
+    assert extract_response_text(None) == ""
+    assert extract_response_text("hello") == "hello"
+    assert extract_response_text({"content": "abc"}) == "abc"
+    assert (
+        extract_response_text(
+            {"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        )
+        == "ab"
+    )
+    assert extract_response_text({"content": None}) == ""
+    assert extract_response_text({"content": 3}) == "3"
+
+    class _Obj:
+        text = "obj-text"
+
+    assert extract_response_text(_Obj()) == "obj-text"
+
+    class _ContentList:
+        content = ["x", {"type": "text", "text": "y"}]
+
+    assert extract_response_text(_ContentList()) == "xy"
+    print("✓ 响应文本提取的各形态")
+
+
 def test_increment_query_count_fresh_data():
     """新建数据上 increment_query_count 可用（修复前 KeyError）"""
     d = tempfile.mkdtemp(prefix="chailv_stats_")

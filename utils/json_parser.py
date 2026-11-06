@@ -50,14 +50,13 @@ def robust_json_parse(text: str, fallback=None) -> dict:
     Raises:
         ValueError: 如果所有解析尝试都失败且没有提供 fallback
     """
+    # 如果已经是字典，直接返回（空字典 {} 也要原样返回，不能当作空文本）
+    if isinstance(text, dict):
+        return text
     if not text:
         if fallback is not None:
             return fallback
         raise ValueError("Empty text provided")
-
-    # 如果已经是字典，直接返回
-    if isinstance(text, dict):
-        return text
 
     # 清理文本，移除 markdown 代码块标记
     text = text.strip()
@@ -188,6 +187,16 @@ def robust_json_parse(text: str, fallback=None) -> dict:
     except Exception as e:
         last_error = e
         logger.warning(f"JSON5 parse failed: {e}")
+
+    # 尝试7: 文本前后夹带说明文字、或结尾说明里还有花括号时，取第一个
+    # 能完整解析的对象（与 extract_first_json_object 相同的策略）
+    try:
+        value = extract_first_json_object(text)
+        logger.info("JSON parsed successfully by extracting the first object")
+        return value
+    except ValueError as e:
+        last_error = e
+        logger.warning(f"First-object extraction failed: {e}")
 
     # 所有尝试都失败
     logger.error(f"All JSON parsing attempts failed. Full JSON:\n{json_str}")
