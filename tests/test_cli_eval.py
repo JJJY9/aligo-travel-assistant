@@ -18,6 +18,8 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
+import pytest
+
 import cli
 from agents import rag_knowledge_agent
 from utils import knowledge_stats, rag_eval
@@ -30,11 +32,11 @@ def _status(available, reason=None, collection="business_travel_knowledge"):
     return data
 
 
-def _run(monkeypatch, as_json=False):
+def _run(monkeypatch, as_json=False, min_hit5=0.8):
     """执行评测并捕获 stdout（pytest 与脚本直跑均可）。"""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = cli.run_rag_eval_standalone(as_json=as_json)
+        code = cli.run_rag_eval_standalone(as_json=as_json, min_hit5=min_hit5)
     return code, buf.getvalue()
 
 
@@ -135,6 +137,65 @@ def test_pass_and_fail_thresholds(monkeypatch):
     print("✓ 达标 / 未达标退出码正确")
 
 
+def test_min_hit5_flag_changes_threshold(monkeypatch):
+    """--min-hit5 可调阈值：同一结果 0.5 达标记 0、默认 0.8 时退出 1。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
+    monkeypatch.setattr(
+        rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent()
+    )
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda fn: _fake_result(0.5))
+
+    code, out = _run(monkeypatch, min_hit5=0.5)
+    assert code == 0, out
+    code, out = _run(monkeypatch)
+    assert code == 1 and "低于阈值 hit@5 >= 80%" in out
+
+    code, out = _run(monkeypatch, as_json=True, min_hit5=0.6)
+    payload = json.loads(out)
+    assert payload["threshold"] == 0.6 and payload["ok"] is False
+    code, out = _run(monkeypatch, as_json=True, min_hit5=0.4)
+    assert json.loads(out)["ok"] is True
+    print("✓ --min-hit5 调整达标阈值（文本 / JSON）")
+
+
+def test_parse_eval_args(monkeypatch):
+    assert cli._parse_eval_args([]) == (False, 0.8)
+    assert cli._parse_eval_args(["--json"]) == (True, 0.8)
+    assert cli._parse_eval_args(["--min-hit5", "0.5"]) == (False, 0.5)
+    assert cli._parse_eval_args(["--min-hit5=1"]) == (False, 1.0)
+    assert cli._parse_eval_args(["--json", "--min-hit5=0"]) == (True, 0.0)
+    assert cli._parse_eval_args(["--min-hit5"]) is None
+    assert cli._parse_eval_args(["--min-hit5", "1.1"]) is None
+    assert cli._parse_eval_args(["--min-hit5", "-0.1"]) is None
+    assert cli._parse_eval_args(["--min-hit5", "abc"]) is None
+    assert cli._parse_eval_args(["--bad"]) is None
+    print("✓ eval 参数解析（阈值范围 / 缺值 / 未知参数）")
+
+
+def test_eval_dispatch_passes_threshold(monkeypatch):
+    calls = {}
+
+    def fake_eval(**kwargs):
+        calls.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run_rag_eval_standalone", fake_eval)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "eval", "--json", "--min-hit5", "0.5"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls == {"as_json": True, "min_hit5": 0.5}
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "eval", "--min-hit5", "2"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2 and "用法" in buf.getvalue()
+    print("✓ dispatch 层 eval 传递阈值 / 越界拒绝")
+
+
 def test_hint_when_all_miss(monkeypatch):
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
     monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent())
@@ -190,8 +251,11 @@ if __name__ == "__main__":
         test_failure_when_agent_init_raises,
         test_failure_when_search_backend_raises,
         test_pass_and_fail_thresholds,
+        test_min_hit5_flag_changes_threshold,
+        test_eval_dispatch_passes_threshold,
         test_hint_when_all_miss,
         test_json_output,
+        test_parse_eval_args,
     ):
         mp = pytest.MonkeyPatch()
         try:
