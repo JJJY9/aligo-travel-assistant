@@ -7,10 +7,26 @@ import json
 import os
 import sys
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from context.short_term_memory import ShortTermMemory
+
+
+@pytest.fixture(autouse=True)
+def _isolated_short_term_state():
+    """隔离进程级状态：注册表与降级冷却不能跨用例泄漏。"""
+    from context import short_term_memory as module
+
+    with module._PENDING_JOURNALS_LOCK:
+        module._PENDING_JOURNALS.clear()
+    module._redis_degraded_until = 0.0
+    yield
+    with module._PENDING_JOURNALS_LOCK:
+        module._PENDING_JOURNALS.clear()
+    module._redis_degraded_until = 0.0
 
 
 def _seeded() -> ShortTermMemory:
@@ -148,55 +164,11 @@ class _FlakyRedis:
         self.data: list[str] = []
         self.applied: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
-        self.pipeline_calls = 0
         self.eval_calls = 0
 
     def _check(self):
         if self.fail:
             raise ConnectionError("redis down")
-
-    def _apply(self, commands):
-        for command in commands:
-            if command[0] == "rpush":
-                self.data.extend(command[1])
-            elif command[0] == "ltrim":
-                start, end = command[1:]
-                if end == -1 and start < 0:
-                    self.data = self.data[-abs(start):]
-            elif command[0] == "delete":
-                self.data.clear()
-
-    def pipeline(self):
-        self.pipeline_calls += 1
-        client = self
-
-        class _Pipe:
-            def __init__(self):
-                self.commands: list[tuple] = []
-
-            def rpush(self, key, *values):
-                self.commands.append(("rpush", values))
-
-            def ltrim(self, key, start, end):
-                self.commands.append(("ltrim", start, end))
-
-            def expire(self, key, ttl):
-                self.commands.append(("expire", ttl))
-
-            def delete(self, key):
-                self.commands.append(("delete",))
-
-            def execute(self):
-                # 与真实 pipeline 一致：execute 时才检查连接并统一生效；
-                # fail_after_apply 模拟「已提交但响应丢失」
-                client._check()
-                client._apply(self.commands)
-                self.commands = []
-                if client.fail_after_apply:
-                    client.fail_after_apply = False
-                    raise ConnectionError("response lost after commit")
-
-        return _Pipe()
 
     def lrange(self, key, start, end):
         # Redis 的 end 是闭区间，-1 表示最后一条（Python 切片 end 是开区间）
@@ -310,6 +282,16 @@ class _FlakyRedis:
                 user_raw = self.data[-2]
         elif isinstance(last, dict) and last.get("role") == "user":
             user_raw = self.data[-1]
+        # cutoff 对有无内容校验的删除都生效（与真实脚本一致）
+        if cutoff and user_raw is not None:
+            try:
+                cut_user = json.loads(user_raw)
+            except json.JSONDecodeError:
+                cut_user = None
+            if isinstance(cut_user, dict):
+                timestamp = cut_user.get("timestamp")
+                if isinstance(timestamp, str) and timestamp > cutoff:
+                    return 0
         if check == "1":
             if user_raw is None:
                 return 0
@@ -321,9 +303,6 @@ class _FlakyRedis:
                 return 0
             content = user.get("content")
             if not isinstance(content, str):
-                return 0
-            timestamp = user.get("timestamp")
-            if cutoff and isinstance(timestamp, str) and timestamp > cutoff:
                 return 0
             if content.strip() != expected:
                 return 0
@@ -1054,6 +1033,124 @@ def test_clear_short_term_session_without_client_queues_clear(monkeypatch):
         "旧格式键没有重放者，不应登记"
     )
     print("✓ 客户端不可用时删除会话登记整键删除")
+
+
+def test_read_hydrates_shadow_from_redis(monkeypatch):
+    """读路径用 Redis 的真实内容校正影子缓存：重启 / LRU 淘汰后的新实例
+    在 Redis 再次故障时不会丢掉既有对话。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "历史问题", "2000-01-01T00:00:00"),
+        _message("assistant", "历史回答", "2000-01-01T00:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-hydrate", max_turns=5, user_id="u1")
+    assert [item["content"] for item in memory.get_recent_context()] == [
+        "历史问题",
+        "历史回答",
+    ]
+    assert [item["content"] for item in memory._fallback.messages] == [
+        "历史问题",
+        "历史回答",
+    ]
+    client.fail = True
+    assert [item["content"] for item in memory.get_recent_context()] == [
+        "历史问题",
+        "历史回答",
+    ]
+    print("✓ 读路径校正影子缓存")
+
+
+def test_read_skips_unparsable_entries(monkeypatch):
+    """列表中的坏元素不能把整次读取升级为 Redis 故障（进程级冷却）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        "not-json",
+        _message("user", "正常消息", "2000-01-01T00:00:00"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-badjson", max_turns=5, user_id="u1")
+    assert [item["content"] for item in memory.get_recent_context()] == ["正常消息"]
+    assert module.redis_short_term_degraded() is False
+    print("✓ 读取跳过无法解析的条目")
+
+
+def test_outage_truncate_without_expect_replays(monkeypatch):
+    """未提供 expect 的最后一轮删除在故障期也要登记，恢复后补删。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "Q1", "2000-01-01T00:00:00"),
+        _message("assistant", "A1", "2000-01-01T00:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-noexpect", max_turns=5, user_id="u1")
+    client.fail = True
+    assert memory.truncate_last_turn() == 0
+    assert [kind for kind, _ in memory._pending_ops] == ["truncate"]
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == []
+    print("✓ 无 expect 的故障期删除在恢复后补删")
+
+
+def test_unconditional_truncate_replay_respects_cutoff(monkeypatch):
+    """无条件删除的重放同样受 cutoff 保护：不误删故障期新写入的轮次。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "旧问题", "2000-01-01T00:00:00"),
+        _message("assistant", "旧回答", "2000-01-01T00:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-nocut", max_turns=5, user_id="u1")
+    client.fail = True
+    assert memory.truncate_last_turn() == 0  # cutoff = 当前时刻
+
+    client.data = [
+        _message("user", "新问题", "2099-01-01T00:00:00"),
+        _message("assistant", "新回答", "2099-01-01T00:00:01"),
+    ]
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["新问题", "新回答"]
+    print("✓ 无条件删除重放受 cutoff 保护")
+
+
+def test_poison_op_dropped_after_repeated_failures(monkeypatch):
+    """确定性失败的操作连续三次后丢弃，后续操作仍能重放（日志不会卡死）。"""
+    from context import short_term_memory as module
+
+    class _PoisonRedis(_FlakyRedis):
+        def eval(self, script, numkeys, *keys_and_args):
+            if any("POISON" in str(arg) for arg in keys_and_args):
+                raise ConnectionError("deterministic failure")
+            return super().eval(script, numkeys, *keys_and_args)
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _PoisonRedis()
+    memory = module.RedisShortTermMemory(client, "s-poison", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "POISON")
+    memory.add_message("assistant", "正常回复")
+    assert [kind for kind, _ in memory._pending_ops] == ["add", "add"]
+
+    client.fail = False
+    for _ in range(3):
+        monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+        memory.get_recent_context()
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["正常回复"], "毒操作应被丢弃，正常操作继续重放"
+    assert memory._pending_ops == []
+    print("✓ 连续失败的毒操作最终被丢弃")
 
 
 def test_replay_failure_still_registers_current_add(monkeypatch):

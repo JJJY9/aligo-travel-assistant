@@ -84,18 +84,21 @@ if last_ok and type(last) == 'table' and last['role'] == 'assistant' then
 elseif last_ok and type(last) == 'table' and last['role'] == 'user' then
   user_raw = last_raw
 end
+-- 只删除「发起时刻之前」的末尾轮次：迟到的重放（含无内容校验的无条件
+-- 删除）不会误删故障期间其它实例新写入的轮次。cutoff 与消息时间戳都是
+-- 各实例本地时钟的 ISO 字符串，前提是同一部署内各实例时钟基本同步
+-- （容器部署通常为 UTC）；时钟偏差超过故障窗口时不保证判断正确
+if cutoff and cutoff ~= '' and user_raw ~= nil then
+  local cut_ok, cut_msg = pcall(cjson.decode, user_raw)
+  if cut_ok and type(cut_msg) == 'table' and type(cut_msg['timestamp']) == 'string'
+     and cut_msg['timestamp'] > cutoff then return 0 end
+end
 if check == '1' then
   if user_raw == nil then return 0 end
   local msg_ok, msg = pcall(cjson.decode, user_raw)
   if not msg_ok or type(msg) ~= 'table' or msg['role'] ~= 'user' then return 0 end
   local content = msg['content']
   if type(content) ~= 'string' then return 0 end
-  -- 重放删除只在「故障发生时的那一轮」上生效：故障期间其它实例新写入的
-  -- 同文本轮次时间戳晚于 cutoff，不能误删。cutoff 与消息时间戳都是各实例
-  -- 本地时钟的 ISO 字符串，此保护前提是同一部署内各实例时钟基本同步
-  -- （容器部署通常为 UTC）；时钟偏差超过故障窗口时不保证判断正确
-  local ts = msg['timestamp']
-  if cutoff and cutoff ~= '' and type(ts) == 'string' and ts > cutoff then return 0 end
   -- Python 端用 str.strip()（全 Unicode 空白），Lua 的 %s 只覆盖 ASCII。
   -- 两侧必须按同一字符集裁剪两端空白，否则带全角空格的提问会被误判为
   -- 不一致（长期记忆删了、短期记忆还留着旧一轮）。多字节空白只按精确
@@ -242,11 +245,14 @@ class _PendingJournal:
     期间无法得知这些变更（Redis 不可用），恢复后由本进程的下一次访问补上。
     """
 
-    __slots__ = ("lock", "ops")
+    __slots__ = ("lock", "ops", "stuck")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.ops: list[tuple[str, Any]] = []
+        # 队首操作的连续失败计数：确定性错误（键类型损坏 / 载荷无法编码
+        # 等）每次重试都会失败，连续三次后丢弃该操作，避免整本日志卡死
+        self.stuck: tuple[str, int] = ("", 0)
 
 
 _PENDING_JOURNALS: dict[str, _PendingJournal] = {}
@@ -566,70 +572,96 @@ class RedisShortTermMemory:
         """截断脚本的一次性标记键（与删除在同一脚本里原子写入）。"""
         return f"{self.key}:op:{op_id}"
 
-    def _replay_ops(self, ops: list[tuple[str, Any]]) -> None:
+    def _replay_ops(self, journal: _PendingJournal) -> None:
+        ops = journal.ops
         window = self.max_turns * 2
         while ops:
-            kind, payload = ops[0]
-            if kind == "add":
-                # 连续新增合并为一次脚本调用（最多 100 条）：脚本按 op_id
-                # 幂等，逐条往返会把恢复后的首次调用拖成几十次网络往返
-                batch: list[tuple[str, str]] = []
-                consumed = 0
-                for op_kind, op_payload in ops:
-                    if op_kind != "add" or len(batch) >= 100:
-                        break
-                    consumed += 1
-                    batch.append(op_payload)
-                arguments: list[str] = [str(window), str(self.ttl_sec)]
-                for op_payload, op_id in batch:
-                    arguments.extend([op_id, op_payload])
-                self.client.eval(
-                    _ADD_MESSAGES_LUA, 2, self.key, applied_key(self.key), *arguments
-                )
-                # 这些操作已成功出队、不会再重放，回收对应的去重记录；
-                # 回收失败只是多留几条无用记录（集合带 TTL），不回调错误
-                try:
-                    self.client.srem(
-                        applied_key(self.key), *[op_id for _, op_id in batch]
-                    )
-                except Exception:  # noqa: BLE001 - 清理失败不影响重放结果
-                    logger.debug("清理已重放 applied 记录失败：%s", self.key)
-                del ops[:consumed]
-                continue
-            if kind == "truncate":
-                expect, op_id, cutoff = payload
-                result = int(
-                    self.client.eval(
-                        _TRUNCATE_LAST_TURN_LUA,
-                        2,
-                        self.key,
-                        self._op_marker_key(op_id),
-                        "1" if expect is not None else "0",
-                        (expect or "").strip(),
-                        str(self.ttl_sec),
-                        cutoff or "",
-                    )
-                    or 0
-                )
-                if result == 0:
+            signature = repr(ops[0])
+            try:
+                self._replay_head(ops, window)
+            except Exception:
+                if journal.stuck[0] == signature:
+                    journal.stuck = (signature, journal.stuck[1] + 1)
+                else:
+                    journal.stuck = (signature, 1)
+                if journal.stuck[1] >= 3:
                     logger.warning(
-                        "短期记忆故障期截断重放未匹配（列表末尾已变化），已跳过：%s",
-                        self.key,
+                        "短期记忆重放操作连续失败 %s 次，丢弃：%s",
+                        journal.stuck[1],
+                        signature[:200],
                     )
-                # 拿到脚本响应后标记不会再被使用，删除避免残留到 TTL
-                try:
-                    self.client.delete(self._op_marker_key(op_id))
-                except Exception:  # noqa: BLE001 - 标记带 TTL，删除失败也会过期
-                    logger.debug("清理截断标记失败：%s", self.key)
-                ops.pop(0)
-            elif kind == "remove":
-                if payload:
-                    self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
-                ops.pop(0)
-            else:  # clear
-                cutoff = payload if isinstance(payload, str) else ""
-                self.client.eval(_CLEAR_BEFORE_LUA, 1, self.key, cutoff)
-                ops.pop(0)
+                    if ops:
+                        ops.pop(0)
+                    journal.stuck = ("", 0)
+                    continue
+                raise
+            journal.stuck = ("", 0)
+
+    def _replay_head(
+        self, ops: list[tuple[str, Any]], window: int
+    ) -> None:
+        """执行队首的一条（或一批连续的新增）操作，成功后从日志移除。"""
+        kind, payload = ops[0]
+        if kind == "add":
+            # 连续新增合并为一次脚本调用（最多 100 条）：脚本按 op_id
+            # 幂等，逐条往返会把恢复后的首次调用拖成几十次网络往返
+            batch: list[tuple[str, str]] = []
+            consumed = 0
+            for op_kind, op_payload in ops:
+                if op_kind != "add" or len(batch) >= 100:
+                    break
+                consumed += 1
+                batch.append(op_payload)
+            arguments: list[str] = [str(window), str(self.ttl_sec)]
+            for op_payload, op_id in batch:
+                arguments.extend([op_id, op_payload])
+            self.client.eval(
+                _ADD_MESSAGES_LUA, 2, self.key, applied_key(self.key), *arguments
+            )
+            # 这些操作已成功出队、不会再重放，回收对应的去重记录；
+            # 回收失败只是多留几条无用记录（集合带 TTL），不回调错误
+            try:
+                self.client.srem(
+                    applied_key(self.key), *[op_id for _, op_id in batch]
+                )
+            except Exception:  # noqa: BLE001 - 清理失败不影响重放结果
+                logger.debug("清理已重放 applied 记录失败：%s", self.key)
+            del ops[:consumed]
+            return
+        if kind == "truncate":
+            expect, op_id, cutoff = payload
+            result = int(
+                self.client.eval(
+                    _TRUNCATE_LAST_TURN_LUA,
+                    2,
+                    self.key,
+                    self._op_marker_key(op_id),
+                    "1" if expect is not None else "0",
+                    (expect or "").strip(),
+                    str(self.ttl_sec),
+                    cutoff or "",
+                )
+                or 0
+            )
+            if result == 0:
+                logger.warning(
+                    "短期记忆故障期截断重放未匹配（列表末尾已变化），已跳过：%s",
+                    self.key,
+                )
+            # 拿到脚本响应后标记不会再被使用，删除避免残留到 TTL
+            try:
+                self.client.delete(self._op_marker_key(op_id))
+            except Exception:  # noqa: BLE001 - 标记带 TTL，删除失败也会过期
+                logger.debug("清理截断标记失败：%s", self.key)
+            ops.pop(0)
+        elif kind == "remove":
+            if payload:
+                self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
+            ops.pop(0)
+        else:  # clear
+            cutoff = payload if isinstance(payload, str) else ""
+            self.client.eval(_CLEAR_BEFORE_LUA, 1, self.key, cutoff)
+            ops.pop(0)
 
     def _call_redis(self, operation, fallback, on_failure=None):
         """执行 Redis 操作；返回 (结果, 是否走了 Redis)，故障时回退影子缓存。
@@ -650,7 +682,7 @@ class RedisShortTermMemory:
         try:
             with _pending_journal(self.key) as journal:
                 try:
-                    self._replay_ops(journal.ops)
+                    self._replay_ops(journal)
                     result = operation()
                 except Exception:
                     # 先执行回退（截断需要知道影子缓存里具体删了哪些消息），
@@ -731,12 +763,28 @@ class RedisShortTermMemory:
             logger.debug("清理截断标记失败：%s", self.key)
 
     def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:
+        window = self.max_turns * 2
+
         def op() -> list[dict[str, Any]]:
+            # 总是读取整个窗口：既要返回调用方要的轮数，也要用 Redis 的
+            # 真实内容校正影子缓存（重启 / LRU 淘汰后的新实例、其它实例
+            # 的写入、已过期的旧消息都以这里为准）
+            raw = self.client.lrange(self.key, -window, -1)
+            messages: list[dict[str, Any]] = []
+            for item in raw:
+                try:
+                    message = json.loads(item)
+                except (TypeError, json.JSONDecodeError):
+                    # 坏元素（旧版本或人工修复写入）不能让整次读取失败，
+                    # 否则数据错误会被当作「Redis 不可用」触发进程级冷却
+                    logger.warning("跳过无法解析的短期记忆条目：%s", self.key)
+                    continue
+                if isinstance(message, dict):
+                    messages.append(message)
+            self._fallback.messages = messages[-window:]
             if n_turns is None:
-                raw = self.client.lrange(self.key, 0, -1)
-            else:
-                raw = self.client.lrange(self.key, -n_turns * 2, -1)
-            return [json.loads(item) for item in raw]
+                return messages
+            return messages[-n_turns * 2:]
 
         return self._redis(op, lambda: self._fallback.get_recent_context(n_turns))
 
@@ -802,11 +850,11 @@ class RedisShortTermMemory:
                     "remove",
                     [json.dumps(m, ensure_ascii=False) for m in removed],
                 )
-            elif expect is not None:
-                # 影子缓存里没有这一轮（临时对象 / 重启后未命中缓存），
-                # 但调用方给出了内容校验：恢复后仍可条件式删除——只在
-                # Redis 末尾仍是该提问、且时间戳不晚于本次删除发起时刻
-                # （cutoff）时生效
+            else:
+                # 影子缓存里没有这一轮（临时对象 / 重启后未命中缓存）：
+                # 恢复后按「发起时刻之前」条件删除末尾轮次——有内容校验时
+                # 还需内容一致；没有校验时只靠 cutoff，迟到的重放不会误删
+                # 故障期间其它实例新写入的轮次
                 self._append_op(journal, "truncate", (expect, op_id, cutoff))
 
         raw, via_redis = self._call_redis(
