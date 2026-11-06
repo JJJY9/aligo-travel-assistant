@@ -543,6 +543,35 @@ class _WebSession:
             model=model,
             circuit_breaker=breaker,
         )
+        # 正在处理对话的请求数：LRU 淘汰必须跳过在用会话，否则会在
+        # runtime 执行中途 close（PostgreSQL 连接被抽走）
+        self._turn_lock = threading.Lock()
+        self._active_turns = 0
+        self._turn_started_at = 0.0
+
+    def begin_turn(self) -> None:
+        with self._turn_lock:
+            if self._active_turns == 0:
+                self._turn_started_at = time.monotonic()
+            self._active_turns += 1
+
+    def end_turn(self) -> None:
+        with self._turn_lock:
+            self._active_turns = max(0, self._active_turns - 1)
+            if self._active_turns == 0:
+                self._turn_started_at = 0.0
+
+    def in_use(self) -> bool:
+        with self._turn_lock:
+            return self._active_turns > 0
+
+    def long_in_use(self, limit_sec: float) -> bool:
+        """占用时间是否已超过上限（防止标记泄漏把会话永久钉在缓存里）。"""
+        with self._turn_lock:
+            return (
+                self._active_turns > 0
+                and time.monotonic() - self._turn_started_at > limit_sec
+            )
 
     def close(self) -> None:
         """释放会话资源（PostgreSQL 连接等）。"""
@@ -563,6 +592,9 @@ class AligoWebApp:
     # 进程内缓存的会话上限（超出后按最久未使用淘汰，避免长时间运行内存与连接增长）。
     # 每个会话在 PostgreSQL 后端下持有 1 个连接，保守取 50，避免撞上数据库连接上限。
     max_sessions = 50
+    # 占用标记超过该时长仍未解除（例如 SSE 在响应开始前客户端断开，生成器
+    # 从未启动导致 finally 不执行）视为标记泄漏，允许 LRU 回收
+    session_turn_leak_sec = 3600.0
     # 用户锁表同样有上限：用户 ID 由请求方提供，未命中时淘汰未持有的锁
     max_locks = 1000
     # 已删除会话的短时墓碑：在途 / 重连的对话不能把刚删除的会话写回（复活）
@@ -640,7 +672,15 @@ class AligoWebApp:
     def _session_key(user_id: str, session_id: str) -> str:
         return f"{user_id}\n{session_id}"
 
-    def get_session(self, user_id: str, session_id: str | None) -> _WebSession:
+    def get_session(
+        self, user_id: str, session_id: str | None, mark_in_use: bool = False
+    ) -> _WebSession:
+        """获取（或新建）会话；``mark_in_use`` 时先登记占用再返回。
+
+        占用（``begin_turn``）在缓存锁内完成，LRU 淘汰不会在「刚取到会话、
+        还没开始对话」的间隙把它 close 掉；调用方必须在结束（含异常）后
+        调用 ``end_turn``。
+        """
         if not session_id:
             session_id = uuid.uuid4().hex[:12]
         # 缓存键包含用户：同一 session_id 被不同用户使用时各有独立运行时，
@@ -655,11 +695,30 @@ class AligoWebApp:
                     user_id, session_id, wrap_usage_tracking(self.model), self.breaker
                 )
                 self.sessions[key] = session
+                # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
+                # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
+                # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
+                # 等后续请求再回收
                 while len(self.sessions) > self.max_sessions:
-                    _, stale = self.sessions.popitem(last=False)
-                    evicted.append(stale)
+                    victim = next(
+                        (
+                            candidate
+                            for candidate, item in self.sessions.items()
+                            if candidate != key
+                            and (
+                                not item.in_use()
+                                or item.long_in_use(self.session_turn_leak_sec)
+                            )
+                        ),
+                        None,
+                    )
+                    if victim is None:
+                        break
+                    evicted.append(self.sessions.pop(victim))
             else:
                 self.sessions.move_to_end(key)
+            if mark_in_use:
+                session.begin_turn()
         # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求
         for stale in evicted:
             stale.close()
@@ -834,7 +893,12 @@ class AligoWebApp:
         if lock is None:
             if len(self.locks) >= self.max_locks:
                 for key, candidate in list(self.locks.items()):
-                    if not candidate.locked():
+                    # 除「已持有」外还要排除「有等待者」：持有者刚 release、
+                    # 等待者尚未恢复执行时 locked() 为 False，此时淘汰会让
+                    # 等待者拿到已脱离锁表的锁，与新请求的锁并行
+                    if not candidate.locked() and not getattr(
+                        candidate, "_waiters", None
+                    ):
                         del self.locks[key]
                         break
             if len(self.locks) >= self.max_locks:
@@ -2228,10 +2292,11 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
-            # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池
+            # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池；
+            # mark_in_use 阻止会话在 ask 期间被 LRU 淘汰 close
             try:
                 session = await asyncio.to_thread(
-                    state.get_session, payload.user_id, payload.session_id
+                    state.get_session, payload.user_id, payload.session_id, True
                 )
             except MemoryPersistenceError as exc:
                 logger.warning(
@@ -2276,6 +2341,8 @@ def create_app(model: Any = None) -> FastAPI:
                         f"（请求 ID：{_request_id(request)}）"
                     ),
                 ) from exc
+            finally:
+                session.end_turn()
         response.headers.update(rate_headers)
         return {"session_id": session.session_id, **result}
 
@@ -2301,7 +2368,7 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             try:
                 session = await asyncio.to_thread(
-                    state.get_session, payload.user_id, payload.session_id
+                    state.get_session, payload.user_id, payload.session_id, True
                 )
             except MemoryPersistenceError as exc:
                 logger.warning("打开会话失败（%s）: %s", rid, exc)
@@ -2382,6 +2449,8 @@ def create_app(model: Any = None) -> FastAPI:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
+                # 先解除在用标记，再释放用户锁：之后该会话才可以被 LRU 淘汰
+                session.end_turn()
                 lock.release()
 
         return StreamingResponse(
