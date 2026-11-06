@@ -3430,13 +3430,28 @@ async function runKbEval() {
     const pct = (value) => `${Math.round(Number(value || 0) * 100)}%`;
     const hit5 = Number(data.hit5 || 0);
     const warning = String(data.warning || "").trim();
+    // 未命中的问题（rank 为 0）直接列出前 3 个，便于定位要补充的知识
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    const missed = rows
+      .filter((row) => row && !Number(row.rank))
+      .map((row) => String(row.query || "").trim())
+      .filter(Boolean);
+    let missedText = "";
+    if (missed.length) {
+      const shown = missed
+        .slice(0, 3)
+        .map((query) => `「${sliceCodePoints(query, 20)}」`)
+        .join("、");
+      missedText = ` · 未命中 ${missed.length} 个：${shown}${missed.length > 3 ? " 等" : ""}`;
+    }
     if (els.kbEvalResult) {
       els.kbEvalResult.textContent =
         `检索评测：${data.total} 个问题 · hit@1 ${pct(data.hit1)}` +
         ` · hit@3 ${pct(data.hit3)} · hit@5 ${pct(data.hit5)}` +
         ` · MRR ${Number(data.mrr || 0).toFixed(2)}` +
         (hit5 < 0.8 ? " · 低于 80% 基线" : "") +
-        (warning ? ` · ${warning}` : "");
+        (warning ? ` · ${warning}` : "") +
+        missedText;
       els.kbEvalResult.classList.toggle("warn", hit5 < 0.8 || Boolean(warning));
     }
   } catch (error) {
