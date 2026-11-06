@@ -77,6 +77,7 @@ from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
 from utils.session_markdown import render_all_sessions_markdown
 from utils.skill_paths import resolve_skills_root, skill_scripts
+from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
@@ -2549,24 +2550,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"读取行程失败：{exc}") from exc
         finally:
             _close_long_term(store)
-        trips = all_trips
-        needle = q.strip().casefold()
-        if needle:
-            trips = [
-                trip
-                for trip in trips
-                if needle
-                in " ".join(
-                    str(trip.get(key) or "")
-                    for key in (
-                        "origin",
-                        "destination",
-                        "purpose",
-                        "start_date",
-                        "end_date",
-                    )
-                ).casefold()
-            ]
+        trips = _filter_trips_by_query(all_trips, q)
         total = len(trips)
         ordered = trips[::-1] if order == "desc" else trips
         page = ordered[offset : offset + limit]
@@ -2730,8 +2714,12 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/trips/export")
     def export_trips_csv(
         user_id: str = Query(..., pattern=_ID_PATTERN),
+        q: str = Query(default="", max_length=100),
     ) -> Response:
-        """导出全部历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）。"""
+        """导出历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）。
+
+        ``q`` 与列表接口同一口径过滤后再导出。
+        """
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
@@ -2741,7 +2729,7 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         return Response(
-            content=render_trips_csv(trips),
+            content=render_trips_csv(_filter_trips_by_query(trips, q)),
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="aligo_trips.csv"'},
         )

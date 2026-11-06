@@ -3244,11 +3244,13 @@ def run_trips_export_standalone(
     to_stdout: bool = False,
     force: bool = False,
     ics: bool = False,
+    query: str = "",
 ) -> int:
-    """导出全部行程（`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics]`）。
+    """导出全部行程
+    （`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics] [--query 关键词]`）。
 
     ``ics=True`` 时导出 iCalendar（与 Web 的 /api/trips/calendar 同一实现），
-    否则导出带 BOM 的 CSV。
+    否则导出带 BOM 的 CSV；``query`` 先按面板口径过滤再导出。
 
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败
@@ -3256,6 +3258,7 @@ def run_trips_export_standalone(
     import re
     from pathlib import Path
 
+    from utils.trip_conflicts import filter_trips_by_query
     from utils.trip_export import render_trips_csv, render_trips_ics
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3276,6 +3279,10 @@ def run_trips_export_standalone(
         close = getattr(store, "close", None)
         if callable(close):
             close()
+
+    needle = query.strip()
+    if needle:
+        trips = filter_trips_by_query(trips, needle)
 
     skipped = 0
     if ics:
@@ -3315,8 +3322,9 @@ def run_trips_export_standalone(
         print(f"写入失败：{exc}")
         return 1
     suffix = "（iCalendar）" if ics else ""
+    filter_note = f"，筛选「{needle}」" if needle else ""
     skipped_note = f"，跳过 {skipped} 条缺少出发日期" if skipped else ""
-    print(f"已导出 {exported} 条行程到 {path}{suffix}{skipped_note}")
+    print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}{skipped_note}")
     return 0
 
 
@@ -3854,7 +3862,11 @@ def run_trips_list_standalone(
     """
     import re
 
-    from utils.trip_conflicts import trip_state_label, trips_with_conflicts
+    from utils.trip_conflicts import (
+        filter_trips_by_query,
+        trip_state_label,
+        trips_with_conflicts,
+    )
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -3892,24 +3904,9 @@ def run_trips_list_standalone(
     from utils.json_safe import sanitize_json
 
     views = trips_with_conflicts(trips)
-    needle = query.strip().casefold()
+    needle = query.strip()
     if needle:
-        # 与面板筛选一致：五个字段用空格拼接后整体包含匹配（支持跨字段多词）
-        views = [
-            trip
-            for trip in views
-            if needle
-            in " ".join(
-                str(trip.get(key) or "")
-                for key in (
-                    "origin",
-                    "destination",
-                    "purpose",
-                    "start_date",
-                    "end_date",
-                )
-            ).casefold()
-        ]
+        views = filter_trips_by_query(views, needle)
         if not views:
             if as_json:
                 print(
@@ -4211,17 +4208,20 @@ def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool, bool] | No
 
 def _parse_export_args(
     args: list[str], allow_ics: bool = False
-) -> tuple[str | None, bool, bool, bool] | None:
-    """解析导出命令的 [path] [--stdout] [--force] [--ics]。
+) -> tuple[str | None, bool, bool, bool, str] | None:
+    """解析导出命令的 [path] [--stdout] [--force] [--ics] [--query 关键词]。
 
-    ``--ics`` 只在 ``allow_ics=True``（trips-export）时接受；冲突 / 未知
-    参数返回 None。
+    ``--ics`` / ``--query`` 只在 ``allow_ics=True``（trips-export）时接受；
+    冲突 / 未知参数返回 None。
     """
     to_stdout = False
     force = False
     ics = False
+    query = ""
     paths: list[str] = []
-    for item in args:
+    index = 0
+    while index < len(args):
+        item = args[index]
         lowered = item.lower()
         if lowered == "--stdout":
             to_stdout = True
@@ -4229,13 +4229,27 @@ def _parse_export_args(
             force = True
         elif lowered == "--ics" and allow_ics:
             ics = True
+        elif allow_ics and (
+            lowered == "--query" or lowered.startswith("--query=")
+        ):
+            if "=" in item:
+                value = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            if not value.strip() or value.startswith("-"):
+                return None
+            query = value.strip()
         elif item.startswith("-"):
             return None
         else:
             paths.append(item)
+        index += 1
     if len(paths) > 1 or (to_stdout and paths):
         return None
-    return (paths[0] if paths else None), to_stdout, force, ics
+    return (paths[0] if paths else None), to_stdout, force, ics, query
 
 
 _COMMANDS_HINT = (
@@ -4822,7 +4836,7 @@ def main():
                     "用法：python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            target, to_stdout, force, _ = parsed_export
+            target, to_stdout, force, _, _ = parsed_export
             sys.exit(
                 run_session_export_standalone(
                     sys.argv[2],
@@ -4844,7 +4858,7 @@ def main():
                     "用法：python cli.py sessions-export <user_id> [path] [--stdout] [--force]"
                 )
                 sys.exit(2)
-            target, to_stdout, force, _ = parsed_export
+            target, to_stdout, force, _, _ = parsed_export
             sys.exit(
                 run_sessions_export_standalone(
                     sys.argv[2],
@@ -4872,17 +4886,17 @@ def main():
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print(
                     "用法：python cli.py trips-export <user_id> [path] "
-                    "[--stdout] [--force] [--ics]"
+                    "[--stdout] [--force] [--ics] [--query 关键词]"
                 )
                 sys.exit(2)
             parsed_export = _parse_export_args(sys.argv[3:], allow_ics=True)
             if parsed_export is None:
                 print(
                     "用法：python cli.py trips-export <user_id> [path] "
-                    "[--stdout] [--force] [--ics]"
+                    "[--stdout] [--force] [--ics] [--query 关键词]"
                 )
                 sys.exit(2)
-            target, to_stdout, force, ics = parsed_export
+            target, to_stdout, force, ics, export_query = parsed_export
             sys.exit(
                 run_trips_export_standalone(
                     sys.argv[2],
@@ -4890,6 +4904,7 @@ def main():
                     to_stdout=to_stdout,
                     force=force,
                     ics=ics,
+                    query=export_query,
                 )
             )
         if arg in {"help", "--help", "-h"}:
