@@ -1427,10 +1427,13 @@ def run_knowledge_export_standalone(
     return 0
 
 
-def run_knowledge_import_standalone(source: str, dry_run: bool = False) -> int:
-    """从 JSON 文件批量导入知识片段（用于 `python cli.py kb-import <file> [--dry-run]`）。
+def run_knowledge_import_standalone(
+    source: str, dry_run: bool = False, as_json: bool = False
+) -> int:
+    """从 JSON 文件批量导入知识片段（`python cli.py kb-import <file> [--dry-run] [--json]`）。
 
     ``--dry-run`` 只校验 / 去重并报告将导入的数量，不加载嵌入模型、不写入。
+    ``--json`` 输出结构化结果（含跳过原因），供脚本消费。
 
     Returns:
         0 导入成功；1 文件 / 格式 / 知识库错误
@@ -1439,15 +1442,26 @@ def run_knowledge_import_standalone(source: str, dry_run: bool = False) -> int:
 
     from utils.knowledge_admin import import_documents
 
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
     path = Path(source)
     if not path.exists():
-        print(f"文件不存在：{path}")
-        return 1
+        return _fail(f"文件不存在：{path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        print(f"读取失败：{exc}（文件需为 UTF-8 编码的 JSON）")
-        return 1
+        return _fail(f"读取失败：{exc}（文件需为 UTF-8 编码的 JSON）")
 
     documents = (
         data
@@ -1457,21 +1471,41 @@ def run_knowledge_import_standalone(source: str, dry_run: bool = False) -> int:
         else None
     )
     if not isinstance(documents, list) or not documents:
-        print("文件中没有知识片段（需要 documents 数组或纯数组）")
-        return 1
+        return _fail("文件中没有知识片段（需要 documents 数组或纯数组）")
 
     try:
         result = import_documents(documents, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"导入失败：{exc}")
-        return 1
+        return _fail(f"导入失败：{exc}")
+    invalid = int(result.get("skipped_invalid", 0) or 0)
+    duplicate = int(result.get("skipped_duplicate", 0) or 0)
+    skipped = int(result.get("skipped", invalid + duplicate) or 0)
+    if as_json:
+        payload: dict[str, Any] = {
+            "ok": True,
+            "dry_run": dry_run,
+            "imported": int(result.get("imported", 0) or 0),
+            "skipped": skipped,
+            "skipped_invalid": invalid,
+            "skipped_duplicate": duplicate,
+        }
+        if dry_run:
+            payload["would_import"] = int(result.get("would_import", 0) or 0)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    detail_parts = []
+    if duplicate:
+        detail_parts.append(f"{duplicate} 条已存在")
+    if invalid:
+        detail_parts.append(f"{invalid} 条无效")
+    detail = f"（{' / '.join(detail_parts)}）" if detail_parts else ""
     if dry_run:
         print(
             f"预览：将导入 {result.get('would_import', 0)} 条知识片段，"
-            f"跳过 {result['skipped']} 条（未写入）"
+            f"跳过 {skipped} 条{detail}（未写入）"
         )
         return 0
-    print(f"已导入 {result['imported']} 条知识片段，跳过 {result['skipped']} 条")
+    print(f"已导入 {result['imported']} 条知识片段，跳过 {skipped} 条{detail}")
     return 0
 
 
@@ -3019,18 +3053,27 @@ def main():
             kb_target, kb_force = parsed_kb_export
             sys.exit(run_knowledge_export_standalone(kb_target, force=kb_force))
         if arg == "kb-import":
-            args = sys.argv[2:]
-            if (
-                not args
-                or args[0].startswith("-")
-                or len(args) > 2
-                or any(extra != "--dry-run" for extra in args[1:])
-            ):
-                print("用法：python cli.py kb-import <file.json> [--dry-run]")
+            target = None
+            dry_run = False
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                lowered = item.lower()
+                if lowered == "--dry-run":
+                    dry_run = True
+                elif lowered == "--json":
+                    as_json = True
+                elif item.startswith("-") or target is not None:
+                    valid = False
+                    break
+                else:
+                    target = item
+            if not valid or target is None:
+                print("用法：python cli.py kb-import <file.json> [--dry-run] [--json]")
                 sys.exit(2)
             sys.exit(
                 run_knowledge_import_standalone(
-                    args[0], dry_run="--dry-run" in args[1:]
+                    target, dry_run=dry_run, as_json=as_json
                 )
             )
         if arg == "kb-list":
