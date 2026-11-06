@@ -2871,6 +2871,103 @@ def run_session_pin_standalone(
     return 0
 
 
+def run_session_show_standalone(
+    user_id: str, session_id: str, as_json: bool = False
+) -> int:
+    """查看单个会话的消息与状态
+    （`python cli.py session-show <user> <session> [--json]`）。
+
+    文本输出按时间顺序列出消息（角色 + 本地时间 + 内容预览，助手消息先
+    重新渲染为 Markdown），``--json`` 输出原始消息与标题 / 置顶 / 归档状态。
+
+    Returns:
+        0 查看成功；1 参数 / 读取失败（含会话不存在）
+    """
+    import re
+
+    from utils.stored_message import render_stored_message
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+        return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            messages = store.get_chat_history(session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取会话失败：{exc}")
+        if not messages:
+            return _fail(f"会话 {session_id} 不存在或没有消息")
+        title = str((store.get_session_titles() or {}).get(session_id) or "")
+        pinned = session_id in [
+            str(item) for item in store.get_pinned_sessions() or []
+        ]
+        archived = session_id in [
+            str(item) for item in store.get_archived_sessions() or []
+        ]
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if as_json:
+        from utils.json_safe import sanitize_json
+
+        print(
+            json.dumps(
+                sanitize_json(
+                    {
+                        "ok": True,
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "title": title,
+                        "pinned": pinned,
+                        "archived": archived,
+                        "messages": messages,
+                    }
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    label = title or "（自动标题）"
+    flags = [
+        part
+        for part in (("置顶" if pinned else ""), ("已归档" if archived else ""))
+        if part
+    ]
+    suffix = f"（{' / '.join(flags)}）" if flags else ""
+    print(
+        f"会话 {session_id}：{label}{suffix} · {len(messages)} 条消息"
+    )
+    for message in messages:
+        role = str(message.get("role") or "assistant")
+        time_text = _local_timestamp_text(str(message.get("timestamp") or ""))
+        content = " ".join(render_stored_message(message).split())
+        preview = content[:80] + ("…" if len(content) > 80 else "")
+        print(f"  [{time_text}] {role}: {preview}")
+    return 0
+
+
 def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str, bool] | None:
     """解析 sessions 的 --archived / --all / --query 关键词 / --json。
 
@@ -3982,7 +4079,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
-    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-pin / session-export / "
+    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-pin / session-show / session-export / "
     "sessions-export / trips-export / user-export"
 )
 
@@ -4497,6 +4594,28 @@ def main():
                     positional[1],
                     pinned=not unpin,
                     as_json=as_json,
+                )
+            )
+        if arg == "session-show":
+            positional = []
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                if item.lower() == "--json":
+                    as_json = True
+                elif item.startswith("-") or len(positional) >= 2:
+                    valid = False
+                    break
+                else:
+                    positional.append(item)
+            if not valid or len(positional) != 2:
+                print(
+                    "用法：python cli.py session-show <user_id> <session_id> [--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_session_show_standalone(
+                    positional[0], positional[1], as_json=as_json
                 )
             )
         if arg == "session-export":
