@@ -124,6 +124,8 @@ class SkillLoader:
         
         # 2. 如果没找到，尝试按 metadata 中的 name 匹配 (遍历)
         if not target_path:
+            if not os.path.isdir(self.skills_dir):
+                return None
             for dirname in os.listdir(self.skills_dir):
                 skill_dir = os.path.join(self.skills_dir, dirname)
                 if not os.path.isdir(skill_dir):
