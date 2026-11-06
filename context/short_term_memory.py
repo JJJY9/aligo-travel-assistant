@@ -41,6 +41,11 @@ def session_key(session_id: str, user_id: str = "") -> str:
     return f"aligo:session:{session_id}:messages"
 
 
+def applied_key(key: str) -> str:
+    """会话消息键对应的「已追加 op_id」集合键（幂等重放用，TTL 同消息）。"""
+    return f"{key}:applied"
+
+
 # 原子地删除最后一轮（助手 + 用户）消息。ARGV[1] 为 "1" 时校验最后一条
 # 用户提问的内容是否等于 ARGV[2]（不一致则不删除），避免与并发写入交错。
 _TRUNCATE_LAST_TURN_LUA = """
@@ -85,16 +90,21 @@ if check == '1' then
   local content = msg['content']
   if type(content) ~= 'string' then return 0 end
   -- 重放删除只在「故障发生时的那一轮」上生效：故障期间其它实例新写入的
-  -- 同文本轮次时间戳晚于 cutoff，不能误删
+  -- 同文本轮次时间戳晚于 cutoff，不能误删。cutoff 与消息时间戳都是各实例
+  -- 本地时钟的 ISO 字符串，此保护前提是同一部署内各实例时钟基本同步
+  -- （容器部署通常为 UTC）；时钟偏差超过故障窗口时不保证判断正确
   local ts = msg['timestamp']
   if cutoff and cutoff ~= '' and type(ts) == 'string' and ts > cutoff then return 0 end
   -- Python 端用 str.strip()（全 Unicode 空白），Lua 的 %s 只覆盖 ASCII。
   -- 两侧必须按同一字符集裁剪两端空白，否则带全角空格的提问会被误判为
   -- 不一致（长期记忆删了、短期记忆还留着旧一轮）。多字节空白只按精确
-  -- 字节序列用 string.sub 比对、逐个剥离，绝不写进字符类或加量词——
-  -- 那会匹配到汉字（如「丠」= E4 B8 A0）的末尾字节，裁出非法 UTF-8；
-  -- 也不能全局替换，否则提问内部的空白被改掉，与 expected 对不上。
-  -- ws 与 Python str.isspace() 的多字节部分一致（0x1C-0x1F 用字符类处理）。
+  -- 字节序列用 string.sub 比对，绝不写进字符类或加量词——那会匹配到
+  -- 汉字（如「丠」= E4 B8 A0）的末尾字节，裁出非法 UTF-8；也不能全局
+  -- 替换，否则提问内部的空白被改掉，与 expected 对不上。
+  -- ws 与 Python str.isspace() 的多字节部分一致（ASCII 空白与 0x1C-0x1F
+  -- 在 ws_at 里按字节判断）。用「逐字节前进 / 回退」的线性扫描，而不是
+  -- 每轮 gsub 整串：4000 字的纯空白提问在 Redis 单线程里不会退化到
+  -- O(n^2) 的长阻塞。
   local ws = {
     '\\194\\133', '\\194\\160', '\\225\\154\\128',
     '\\226\\128\\128', '\\226\\128\\129', '\\226\\128\\130',
@@ -104,26 +114,43 @@ if check == '1' then
     '\\226\\128\\169', '\\226\\128\\175', '\\226\\129\\159',
     '\\227\\128\\128'
   }
-  local function strip_ends(s)
-    local prev
-    repeat
-      prev = s
-      s = string.gsub(s, '^%s+', '')
-      s = string.gsub(s, '%s+$', '')
-      s = string.gsub(s, '^[\\28-\\31]+', '')
-      s = string.gsub(s, '[\\28-\\31]+$', '')
-      for _, w in ipairs(ws) do
-        local size = #w
-        if string.sub(s, 1, size) == w then
-          s = string.sub(s, size + 1)
-        end
-        local last_at = #s
-        if last_at >= size and string.sub(s, last_at - size + 1) == w then
-          s = string.sub(s, 1, last_at - size)
-        end
+  local function ascii_ws(byte)
+    if byte == nil then return false end
+    return byte == 32 or (byte >= 9 and byte <= 13) or (byte >= 28 and byte <= 31)
+  end
+  local function ws_at(s, pos)
+    if ascii_ws(string.byte(s, pos)) then return 1 end
+    for _, w in ipairs(ws) do
+      if string.sub(s, pos, pos + #w - 1) == w then return #w end
+    end
+    return 0
+  end
+  local function ws_before(s, pos)
+    if ascii_ws(string.byte(s, pos)) then return 1 end
+    for _, w in ipairs(ws) do
+      local size = #w
+      if pos >= size and string.sub(s, pos - size + 1, pos) == w then
+        return size
       end
-    until s == prev
-    return s
+    end
+    return 0
+  end
+  local function strip_ends(s)
+    local total = #s
+    local head = 1
+    while head <= total do
+      local size = ws_at(s, head)
+      if size == 0 then break end
+      head = head + size
+    end
+    local tail = total
+    while tail >= head do
+      local size = ws_before(s, tail)
+      if size == 0 then break end
+      tail = tail - size
+    end
+    if tail < head then return '' end
+    return string.sub(s, head, tail)
   end
   if strip_ends(content) ~= expected then return 0 end
 end
@@ -148,6 +175,34 @@ end
 return 1
 """
 
+# 幂等追加消息：以 op_id 在 applied 集合中记账，与 RPUSH 在同一脚本里原子
+# 完成。故障期重放时同一条消息（同 op_id）不会重复追加；而只按消息列表
+# 去重无法区分「已追加但被新消息挤出窗口」与「从未写入」——前者应跳过，
+# 后者必须补写，靠窗口内容判断会静默丢消息。
+# ARGV: 窗口大小、TTL、然后每两条为一组 (op_id, payload)。
+_ADD_MESSAGES_LUA = """
+local key = KEYS[1]
+local applied = KEYS[2]
+local window = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local pushed = 0
+for i = 3, #ARGV, 2 do
+  local op_id = ARGV[i]
+  local payload = ARGV[i + 1]
+  if redis.call('SISMEMBER', applied, op_id) == 0 then
+    redis.call('SADD', applied, op_id)
+    redis.call('RPUSH', key, payload)
+    pushed = pushed + 1
+  end
+end
+if pushed > 0 then
+  redis.call('LTRIM', key, -window, -1)
+  redis.call('EXPIRE', key, ttl)
+  redis.call('EXPIRE', applied, ttl)
+end
+return pushed
+"""
+
 
 class _PendingJournal:
     """进程内按会话键共享的故障期操作日志。
@@ -167,6 +222,29 @@ class _PendingJournal:
 
 _PENDING_JOURNALS: dict[str, _PendingJournal] = {}
 _PENDING_JOURNALS_LOCK = threading.Lock()
+# 注册表总量上限：正常路径下日志在重放后立即移除，只有长时间故障且不断
+# 出现新会话时才会积累；超过上限时优先淘汰已空的最旧日志，其次丢弃最旧
+# 会话的待重放操作（记录警告），避免进程内存无界增长
+_PENDING_JOURNALS_MAX = 2048
+
+
+def _evict_journal_locked() -> None:
+    """注册表满时淘汰一条日志（调用方持有注册表锁）。"""
+    for stale_key, stale in _PENDING_JOURNALS.items():
+        if not stale.ops and stale.lock.acquire(blocking=False):
+            stale.lock.release()
+            del _PENDING_JOURNALS[stale_key]
+            return
+    for stale_key, stale in list(_PENDING_JOURNALS.items()):
+        if stale.lock.acquire(blocking=False):
+            dropped = len(stale.ops)
+            stale.lock.release()
+            del _PENDING_JOURNALS[stale_key]
+            logger.warning(
+                "短期记忆故障操作日志过多，丢弃最旧会话的 %s 条待重放操作",
+                dropped,
+            )
+            return
 
 
 @contextmanager
@@ -176,6 +254,8 @@ def _pending_journal(key: str) -> Iterator[_PendingJournal]:
         with _PENDING_JOURNALS_LOCK:
             journal = _PENDING_JOURNALS.get(key)
             if journal is None:
+                if len(_PENDING_JOURNALS) >= _PENDING_JOURNALS_MAX:
+                    _evict_journal_locked()
                 journal = _PendingJournal()
                 _PENDING_JOURNALS[key] = journal
         journal.lock.acquire()
@@ -187,7 +267,7 @@ def _pending_journal(key: str) -> Iterator[_PendingJournal]:
             finally:
                 journal.lock.release()
             return
-        # 取锁期间日志已被清理（只有空日志会被移除）：重新从注册表解析
+        # 取锁期间日志已被清理或淘汰：重新从注册表解析
         journal.lock.release()
 
 
@@ -198,26 +278,21 @@ def _drop_idle_journal(key: str, journal: _PendingJournal) -> None:
             del _PENDING_JOURNALS[key]
 
 
-def _message_timestamp(payload: str) -> str | None:
-    """从一条消息 JSON 中取时间戳（无法解析时返回 None）。"""
-    try:
-        message = json.loads(payload)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(message, dict):
-        return None
-    timestamp = message.get("timestamp")
-    return timestamp if isinstance(timestamp, str) else None
+def discard_pending_ops(key: str) -> int:
+    """丢弃某个会话键排队的故障期操作（会话删除 / 清空时调用）。
 
-
-def _newest_timestamp(payloads: list[str]) -> str | None:
-    """取一组消息 JSON 中最新的时间戳。"""
-    newest = None
-    for payload in payloads:
-        timestamp = _message_timestamp(payload)
-        if timestamp is not None and (newest is None or timestamp > newest):
-            newest = timestamp
-    return newest
+    返回被丢弃的操作条数。删除会话后复用的同一 session_id 不能把旧会话
+    排队的消息或删除动作重放进新会话。
+    """
+    with _PENDING_JOURNALS_LOCK:
+        journal = _PENDING_JOURNALS.get(key)
+    if journal is None:
+        return 0
+    with journal.lock:
+        dropped = len(journal.ops)
+        journal.ops.clear()
+    _drop_idle_journal(key, journal)
+    return dropped
 
 
 class ShortTermMemory:
@@ -385,97 +460,49 @@ class RedisShortTermMemory:
             journal = _PENDING_JOURNALS.get(self.key)
         return list(journal.ops) if journal is not None else []
 
-    def _queue_op(self, kind: str, payload: Any = None) -> None:
-        """记录一条故障期操作，并把日志限制在有界范围内。"""
-        with _pending_journal(self.key) as journal:
-            if kind == "clear":
-                # 清空会覆盖之前所有变更，旧操作不再需要重放
-                journal.ops.clear()
-            journal.ops.append((kind, payload))
-            self._trim_journal(journal.ops)
-
-    def _trim_journal(self, ops: list[tuple[str, Any]]) -> None:
-        """日志有界：新增项与删除项分别限额，互不挤占。"""
+    def _append_op(
+        self, journal: _PendingJournal, kind: str, payload: Any = None
+    ) -> None:
+        """在已持锁的日志里登记一条操作，并把新增项限制在有界范围内。"""
+        if kind == "clear":
+            # 清空会覆盖之前所有变更，旧操作不再需要重放
+            journal.ops.clear()
+        journal.ops.append((kind, payload))
         add_cap = max(64, self.max_turns * 8)
-        add_indexes = [i for i, (kind, _) in enumerate(ops) if kind == "add"]
+        add_indexes = [
+            i for i, (op_kind, _) in enumerate(journal.ops) if op_kind == "add"
+        ]
         excess = len(add_indexes) - add_cap
-        if excess > 0:
-            # 只丢最旧的新增项：恢复后窗口内容仍与全程在线写入一致
-            for index in reversed(add_indexes[:excess]):
-                del ops[index]
-        delete_cap = add_cap * 4
-        delete_indexes = [i for i, (kind, _) in enumerate(ops) if kind != "add"]
-        excess = len(delete_indexes) - delete_cap
-        if excess > 0:
-            logger.warning(
-                "短期记忆故障操作日志过多，丢弃 %s 条最早的删除操作", excess
-            )
-            for index in reversed(delete_indexes[:excess]):
-                del ops[index]
+        # 只丢最旧的新增项：恢复后的窗口内容仍与全程在线写入一致。删除类
+        # 操作（clear / truncate / remove）不能丢，否则恢复后会复活已清空
+        # 或已删除的轮次；注册表总量由 _PENDING_JOURNALS_MAX 兜底
+        for index in reversed(add_indexes[: max(excess, 0)]):
+            del journal.ops[index]
 
-    def _replay_pending(self) -> None:
-        """Redis 恢复后的第一次调用：按顺序重放故障期间的变更。
-
-        每条操作成功后立即从日志移除：重放中途再次失败时，已完成的部分
-        不会重复执行。新增项按完整消息（含时间戳）与 Redis 已有内容去重，
-        覆盖「写入已在服务端生效但响应丢失」的至少一次语义；截断类操作带
-        一次性标记与故障时刻 cutoff，重试与故障期间新写入的同文本轮次都
-        不会被误删。
-        """
-        with _pending_journal(self.key) as journal:
-            if not journal.ops:
-                _drop_idle_journal(self.key, journal)
-                return
-            try:
-                self._replay_ops(journal.ops)
-            finally:
-                if not journal.ops:
-                    _drop_idle_journal(self.key, journal)
+    def _op_marker_key(self, op_id: str) -> str:
+        """截断脚本的一次性标记键（与删除在同一脚本里原子写入）。"""
+        return f"{self.key}:op:{op_id}"
 
     def _replay_ops(self, ops: list[tuple[str, Any]]) -> None:
         window = self.max_turns * 2
-        seen: set[str] | None = None
-        newest: str | None = None
         while ops:
             kind, payload = ops[0]
             if kind == "add":
-                if seen is None:
-                    existing = self.client.lrange(self.key, -window, -1) or []
-                    seen = set(existing)
-                    newest = _newest_timestamp(existing)
-                # 连续新增合并为一次 pipeline：故障期可能积压几十条，
-                # 逐条 MULTI/EXEC 会把恢复后的首次调用拖成几十次往返
-                batch: list[str] = []
+                # 连续新增合并为一次脚本调用（最多 100 条）：脚本按 op_id
+                # 幂等，逐条往返会把恢复后的首次调用拖成几十次网络往返
+                batch: list[tuple[str, str]] = []
                 consumed = 0
                 for op_kind, op_payload in ops:
-                    if op_kind != "add" or consumed >= 100:
+                    if op_kind != "add" or len(batch) >= 100:
                         break
                     consumed += 1
-                    if op_payload in seen:
-                        continue
-                    timestamp = _message_timestamp(op_payload)
-                    if (
-                        timestamp is not None
-                        and newest is not None
-                        and timestamp < newest
-                    ):
-                        # 已在 Redis 生效、又被其它实例的新消息挤出窗口：
-                        # 再追加会以旧消息身份挤掉更新的内容
-                        logger.debug("短期记忆重放跳过已过期的故障期消息")
-                        continue
                     batch.append(op_payload)
-                if batch:
-                    pipe = self.client.pipeline()
-                    pipe.rpush(self.key, *batch)
-                    pipe.ltrim(self.key, -window, -1)
-                    pipe.expire(self.key, self.ttl_sec)
-                    pipe.execute()
-                    seen.update(batch)
-                    batch_newest = _newest_timestamp(batch)
-                    if batch_newest is not None and (
-                        newest is None or batch_newest > newest
-                    ):
-                        newest = batch_newest
+                arguments: list[str] = [str(window), str(self.ttl_sec)]
+                for op_payload, op_id in batch:
+                    arguments.extend([op_id, op_payload])
+                self.client.eval(
+                    _ADD_MESSAGES_LUA, 2, self.key, applied_key(self.key), *arguments
+                )
                 del ops[:consumed]
                 continue
             if kind == "truncate":
@@ -485,7 +512,7 @@ class RedisShortTermMemory:
                         _TRUNCATE_LAST_TURN_LUA,
                         2,
                         self.key,
-                        f"{self.key}:op:{op_id}",
+                        self._op_marker_key(op_id),
                         "1" if expect is not None else "0",
                         (expect or "").strip(),
                         str(self.ttl_sec),
@@ -504,21 +531,42 @@ class RedisShortTermMemory:
                     self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
                 ops.pop(0)
             else:  # clear
-                self.client.delete(self.key)
+                self.client.delete(self.key, applied_key(self.key))
                 ops.pop(0)
-            seen = None
-            newest = None
 
-    def _call_redis(self, operation, fallback):
-        """执行 Redis 操作；返回 (结果, 是否走了 Redis)，故障时回退影子缓存。"""
+    def _call_redis(self, operation, fallback, on_failure=None):
+        """执行 Redis 操作；返回 (结果, 是否走了 Redis)，故障时回退影子缓存。
+
+        重放故障期变更、本次操作与失败登记在同一把按会话键的锁内完成：
+        日志顺序始终与真实调用顺序一致（并发的清空不会让更早的失败新增
+        排到清空之后）。``on_failure(journal)`` 在锁内登记失败操作。
+        """
         global _redis_degraded_until
         if time.monotonic() < _redis_degraded_until:
-            return fallback(), False
+            fallback_result = fallback()
+            if on_failure is not None:
+                with _pending_journal(self.key) as journal:
+                    on_failure(journal)
+            return fallback_result, False
+        fallback_result: Any = None
+        fallback_done = False
+        failure_recorded = False
         try:
-            # 恢复后的第一次 Redis 调用先重放故障期间的变更，
-            # 否则刚恢复时读到的上下文会缺少最近几轮或复活已删除轮次
-            self._replay_pending()
-            result = operation()
+            with _pending_journal(self.key) as journal:
+                self._replay_ops(journal.ops)
+                try:
+                    result = operation()
+                except Exception:
+                    # 先执行回退（截断需要知道影子缓存里具体删了哪些消息），
+                    # 再在锁内登记失败操作，最后交给外层统一冷却与返回
+                    fallback_result = fallback()
+                    fallback_done = True
+                    if on_failure is not None:
+                        on_failure(journal)
+                        failure_recorded = True
+                    raise
+                if not journal.ops:
+                    _drop_idle_journal(self.key, journal)
         except Exception as exc:  # noqa: BLE001 - 短期缓存故障不能中断对话
             _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
             logger.warning(
@@ -526,7 +574,16 @@ class RedisShortTermMemory:
                 exc,
                 int(_REDIS_RETRY_COOLDOWN_SEC),
             )
-            return fallback(), False
+            if not fallback_done:
+                # 重放中途失败时本次操作还没发出，但影子缓存仍需回退
+                fallback_result = fallback()
+                fallback_done = True
+            if on_failure is not None and not failure_recorded:
+                # 重放失败导致本次操作未执行也要登记：否则影子缓存里已删掉
+                # 的轮次永远不会从 Redis 删除（恢复后照样复活）
+                with _pending_journal(self.key) as journal:
+                    on_failure(journal)
+            return fallback_result, False
         _redis_degraded_until = 0.0
         return result, True
 
@@ -542,21 +599,30 @@ class RedisShortTermMemory:
             "metadata": metadata or {},
         }
         payload = json.dumps(message, ensure_ascii=False)
+        op_id = uuid.uuid4().hex
         # 影子缓存复用同一个消息对象：时间戳与 Redis 中的 JSON 完全一致，
         # 故障期截断时才能按完整消息项精确删除 Redis 里的对应项
         self._fallback._append_message(message)
 
         def op() -> None:
-            pipe = self.client.pipeline()
-            pipe.rpush(self.key, payload)
-            pipe.ltrim(self.key, -self.max_turns * 2, -1)
-            pipe.expire(self.key, self.ttl_sec)
-            pipe.execute()
+            # 幂等追加：op_id 写入 applied 集合与 RPUSH 在同一脚本里完成，
+            # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）
+            self.client.eval(
+                _ADD_MESSAGES_LUA,
+                2,
+                self.key,
+                applied_key(self.key),
+                str(self.max_turns * 2),
+                str(self.ttl_sec),
+                op_id,
+                payload,
+            )
 
-        _, via_redis = self._call_redis(op, lambda: None)
-        if not via_redis:
-            # 故障期间的消息记入操作日志，Redis 恢复后按顺序补写
-            self._queue_op("add", payload)
+        self._call_redis(
+            op,
+            lambda: None,
+            lambda journal: self._append_op(journal, "add", (payload, op_id)),
+        )
         logger.debug("Added message to Redis short-term memory: %s", role)
 
     def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:
@@ -580,13 +646,16 @@ class RedisShortTermMemory:
         return "\n".join(lines)
 
     def clear(self) -> None:
-        _, via_redis = self._call_redis(
-            lambda: self.client.delete(self.key), lambda: None
-        )
-        if not via_redis:
+        def on_failure(journal: _PendingJournal) -> None:
             # 故障期间删不掉 Redis 里的旧内容：恢复后重放一次删除（该操作
-            # 会覆盖日志中更早的变更，_queue_op 已按此合并）
-            self._queue_op("clear")
+            # 会覆盖日志中更早的变更，_append_op 已按此合并）
+            self._append_op(journal, "clear")
+
+        self._call_redis(
+            lambda: self.client.delete(self.key, applied_key(self.key)),
+            lambda: None,
+            on_failure,
+        )
         # 无论 Redis 是否可用都清空影子缓存，否则故障切换后
         # 已清空的对话会从内存里“复活”
         self._fallback.clear()
@@ -597,9 +666,13 @@ class RedisShortTermMemory:
 
         使用 Lua 脚本把「读取最后两条 → 判断 → 裁剪」放在一次原子调用里，
         避免与其它进程 / worker 追加消息的写入交错后裁错条目；``expect`` 不为
-        None 时内容不一致则不修改。
+        None 时内容不一致则不修改。在线调用与故障重放使用同一个一次性标记
+        （op_id）：脚本已在服务端执行但响应丢失时，重放会凭标记直接跳过，
+        不会把上一轮同文本的对话再删一次。
         """
         removed: list[dict[str, Any]] = []
+        op_id = uuid.uuid4().hex
+        cutoff = datetime.now().isoformat()
 
         def fallback() -> int:
             tail = self._fallback.messages[-2:]
@@ -609,22 +682,7 @@ class RedisShortTermMemory:
                 removed[:] = tail[len(tail) - count:]
             return count
 
-        raw, via_redis = self._call_redis(
-            lambda: self.client.eval(
-                _TRUNCATE_LAST_TURN_LUA,
-                1,
-                self.key,
-                "1" if expect is not None else "0",
-                (expect or "").strip(),
-            ),
-            fallback,
-        )
-        count = int(raw or 0)
-        if via_redis and count:
-            # Redis 删除成功时同步镜像缓存，避免 Redis 再故障时把已删除的
-            # 一轮从影子缓存读回来
-            self._fallback.truncate_last_turn(expect)
-        if not via_redis:
+        def on_failure(journal: _PendingJournal) -> None:
             if removed:
                 # 故障期间在影子缓存里删掉了这一轮：恢复后按完整消息项精确
                 # 删除。不能用「删除列表末尾一轮」——重放发生在本进程冷却
@@ -632,18 +690,37 @@ class RedisShortTermMemory:
                 # 已不是这一轮，条件删除会失效、把已删除的轮次留在 Redis。
                 # 影子缓存可能没见过其它实例写入的更新轮次：此处只删本对象
                 # 确实写入过的消息，宁可少删也不误删别人的轮次。
-                self._queue_op(
-                    "remove", [json.dumps(m, ensure_ascii=False) for m in removed]
+                self._append_op(
+                    journal,
+                    "remove",
+                    [json.dumps(m, ensure_ascii=False) for m in removed],
                 )
             elif expect is not None:
                 # 影子缓存里没有这一轮（临时对象 / 重启后未命中缓存），
                 # 但调用方给出了内容校验：恢复后仍可条件式删除——只在
-                # Redis 末尾仍是该提问、且时间戳不晚于本次故障期删除
-                # （cutoff）时生效；一次性标记保证响应丢失重试不会删两次
-                self._queue_op(
-                    "truncate",
-                    (expect, uuid.uuid4().hex, datetime.now().isoformat()),
-                )
+                # Redis 末尾仍是该提问、且时间戳不晚于本次删除发起时刻
+                # （cutoff）时生效
+                self._append_op(journal, "truncate", (expect, op_id, cutoff))
+
+        raw, via_redis = self._call_redis(
+            lambda: self.client.eval(
+                _TRUNCATE_LAST_TURN_LUA,
+                2,
+                self.key,
+                self._op_marker_key(op_id),
+                "1" if expect is not None else "0",
+                (expect or "").strip(),
+                str(self.ttl_sec),
+                "",
+            ),
+            fallback,
+            on_failure,
+        )
+        count = int(raw or 0)
+        if via_redis and count:
+            # Redis 删除成功时同步镜像缓存，避免 Redis 再故障时把已删除的
+            # 一轮从影子缓存读回来
+            self._fallback.truncate_last_turn(expect)
         logger.info(
             "Truncated last turn from Redis memory: %s (%s messages)", self.key, count
         )

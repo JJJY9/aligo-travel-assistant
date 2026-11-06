@@ -24,7 +24,11 @@ from fastapi.testclient import TestClient
 
 from config_agentscope import UsageTrackingModel
 from context import storage
-from context.short_term_memory import RedisShortTermMemory, session_key
+from context.short_term_memory import (
+    RedisShortTermMemory,
+    applied_key,
+    session_key,
+)
 from webapp.server import MEMORY_DIR, create_app
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "")
@@ -214,16 +218,26 @@ def test_webapp_with_redis_short_term(monkeypatch):
 
 
 class _OutageProxy:
-    """包装真实 Redis 客户端：按开关模拟连接故障，恢复后透传。"""
+    """包装真实 Redis 客户端：模拟连接故障与「脚本已执行但响应丢失」。"""
 
     def __init__(self, client):
         self._client = client
         self.fail = False
+        self.lose_eval_response = False
 
     def __getattr__(self, name):
         if self.fail:
             raise ConnectionError("redis down")
         return getattr(self._client, name)
+
+    def eval(self, *args, **kwargs):
+        if self.fail:
+            raise ConnectionError("redis down")
+        result = self._client.eval(*args, **kwargs)
+        if self.lose_eval_response:
+            self.lose_eval_response = False
+            raise ConnectionError("response lost after script")
+        return result
 
 
 def test_redis_short_term_replays_after_outage(monkeypatch):
@@ -292,6 +306,32 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
         )
         assert contents(follower) == ["Q1", "A1"], "丢弃临时对象后排队的截断仍要生效"
 
+        # 追加消息的脚本已执行但响应丢失：重放凭 applied 集合去重，不重复追加
+        proxy.lose_eval_response = True
+        reset_degraded()
+        memory.add_message("user", "Q4")
+        assert client.llen(key) == 3, "消息已在服务端写入"
+        proxy.lose_eval_response = False
+        reset_degraded()
+        after_lost_add = [item["content"] for item in follower.get_recent_context()]
+        assert after_lost_add == ["Q1", "A1", "Q4"], "响应丢失后重放不能重复追加"
+        assert client.llen(key) == 3
+
+        # 在线截断已执行但响应丢失：重放用同一 op_id，凭一次性标记跳过
+        proxy.lose_eval_response = True
+        reset_degraded()
+        transient2 = RedisShortTermMemory(
+            proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+        )
+        assert transient2.truncate_last_turn("Q4") == 0
+        assert client.llen(key) == 2, "在线截断已在服务端生效（只剩第一轮）"
+        proxy.lose_eval_response = False
+        reset_degraded()
+        follower = RedisShortTermMemory(
+            proxy, session_id, max_turns=5, user_id=user_id, ttl_sec=60
+        )
+        assert contents(follower) == ["Q1", "A1"], "重放凭标记跳过，不会重复删除"
+
         # 故障期清空：恢复后由后续实例重放删除
         proxy.fail = True
         reset_degraded()
@@ -306,7 +346,7 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
         print("✓ 真实 Redis 上故障期变更恢复后按序重放")
     finally:
         proxy.fail = False
-        client.delete(key)
+        client.delete(key, applied_key(key))
 
 
 if __name__ == "__main__":
