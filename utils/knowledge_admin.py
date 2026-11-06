@@ -498,9 +498,11 @@ def _regroup_exported_documents(
         merged.append(
             {
                 "__restored_group__": True,
-                # 还原上限按分片总长度判断；拼接用换行分隔（分片边界处原文
-                # 可能是段落 / 标题，空串拼接会把两段文字粘在一起）
-                "__restored_size__": sum(len(text) for text in stripped_contents),
+                # 还原上限按分片原始长度之和判断（含首尾空白）：空白也会被
+                # 拼接并写入正文，用 strip 后的长度计会让人借空白绕过
+                # DOC_MAX_CHARS；拼接用换行分隔（分片边界处原文可能是
+                # 段落 / 标题，空串拼接会把两段文字粘在一起）
+                "__restored_size__": sum(len(text) for text in contents),
                 "content": "\n".join(contents),
                 "metadata": base_meta,
             }
@@ -655,6 +657,14 @@ def import_documents(
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
+    # 先做与库内容无关的备份完整性校验（残缺组直接报错），避免为坏备份
+    # 加载嵌入模型（首次可能下载 bge-small-zh）；库快照相关处理仍在锁内
+    _regroup_exported_documents(valid, set())
+
+    # 嵌入模型加载放在写锁外：导入期间其它知识库接口不应因为模型初始化
+    # 而全部阻塞；dry-run 不加载模型
+    agent = None if dry_run else _get_agent()
+
     imported: list[int] = []
     with _WRITE_LOCK:
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
@@ -662,7 +672,7 @@ def import_documents(
         existing = _existing_contents()
         merged_items, group_skipped = _regroup_exported_documents(valid, existing)
         duplicate = group_skipped
-        cleaned: list[dict[str, Any]] = []
+        document_chunks: list[list[dict[str, Any]]] = []
         for item in merged_items:
             restored = bool(item.pop("__restored_group__", False))
             restored_size = int(item.pop("__restored_size__", 0) or 0)
@@ -696,15 +706,24 @@ def import_documents(
                     raise ValueError(
                         "备份中的文档拼接后过长（分片过多或含大量空白），请拆分后导入"
                     )
-            cleaned.extend(_chunk_documents(content[:limit], sanitized_meta))
+            document_chunks.append(
+                _chunk_documents(content[:limit], sanitized_meta)
+            )
 
         unique: list[dict[str, Any]] = []
-        for item in cleaned:
-            if item["content"] in existing:
-                duplicate += 1
+        for chunks in document_chunks:
+            # existing 存的是 strip 后的内容；分片内容可能带切分残留的
+            # 换行，必须同样 strip 后比较，否则重复导入不幂等
+            keys = [chunk["content"].strip() for chunk in chunks]
+            if any(key in existing for key in keys):
+                # 任一分片已存在：整组跳过。只补缺失分片会在库里留下
+                # 「parts 声明大于实际成员」的残缺组，整份编辑 / 备份恢复
+                # 都会失效
+                duplicate += len(chunks)
                 continue
-            existing.add(item["content"])
-            unique.append(item)
+            for key in keys:
+                existing.add(key)
+            unique.extend(chunks)
         if not unique:
             result: dict[str, Any] = {
                 "imported": 0,
@@ -726,8 +745,8 @@ def import_documents(
                 "would_import": len(unique),
             }
 
-        agent = _get_agent()
         # 分块嵌入 / 插入，控制大文件（CLI 导入）的峰值内存
+        assert agent is not None  # dry-run 已在上面提前返回
         for start in range(0, len(unique), _IMPORT_CHUNK):
             batch_no = start // _IMPORT_CHUNK + 1
             try:
@@ -755,8 +774,11 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
 
     ``whole_group=True`` 时，如果该片段属于带 group 标识的多分片记录，
     同时删除同组的其余分片（旧数据没有 group 时只删除当前片段，返回 1）。
+    ``whole_group=False`` 时拒绝对多分片记录的单条删除：只删一片会留下
+    「parts 声明大于实际成员」的残缺组，整份编辑 / 备份恢复都会失效。
 
     Raises:
+        ValueError: 对多分片记录做单条删除
         FileNotFoundError: 知识库未初始化
         Exception: Milvus 查询 / 删除失败（由上层映射为 503，不能误报为 404）
     """
@@ -770,6 +792,13 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
             _, group = _document_info(client, int(doc_id))
             if group:
                 ids = sorted(set(_group_member_ids(client, group)) | {int(doc_id)})
+        else:
+            _, group = _document_info(client, int(doc_id))
+            if group:
+                raise ValueError(
+                    "该片段属于多分片知识内容，不能单条删除：请整组删除"
+                    "（CLI 加 --group / 接口加 group=1）"
+                )
         client.delete(collection_name=COLLECTION_NAME, ids=ids)
         return len(ids)
 
