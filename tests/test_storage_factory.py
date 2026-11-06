@@ -453,10 +453,14 @@ class _CountingModel:
 
 def test_pg_delete_trip_deletes_single_row():
     """PostgreSQL 删除行程按主键：历史库重复 trip_id 时不能整批删除。"""
+    import contextlib
+
     from context.postgres_long_term_memory import PostgresLongTermMemory
 
     store = object.__new__(PostgresLongTermMemory)
     store.user_id = "u1"
+    # advisory lock 需要真实连接；单元测试只关注按主键删除的 SQL
+    store._advisory_lock = lambda name: contextlib.nullcontext()
     calls: dict[str, list[tuple[str, object]]] = {"fetch": [], "exec": []}
 
     def fake_fetch(sql, params):
