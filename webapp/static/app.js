@@ -3686,15 +3686,22 @@ async function addKnowledgeDocument(event) {
     );
     state.kbSaving = false;
     const parts = Number((data && data.parts) || 0);
+    let message;
     if (editingId && editingGroupParts > 1) {
       // 内容缩短成单条时服务端不再返回 parts：提示按实际（1 片）展示
       const resultParts = parts > 1 ? parts : 1;
-      toast(`整份文档已更新（${resultParts} 片）`);
+      message = `整份文档已更新（${resultParts} 片）`;
     } else if (parts > 1) {
-      toast(`长内容已拆分为 ${parts} 条片段（编辑任一分片会整份替换）`);
+      message = `长内容已拆分为 ${parts} 条片段（编辑任一分片会整份替换）`;
     } else {
-      toast(editingId ? "知识片段已更新" : "知识片段已添加");
+      message = editingId ? "知识片段已更新" : "知识片段已添加";
     }
+    const leftover = Array.isArray(data && data.leftover_ids) ? data.leftover_ids : [];
+    if (leftover.length) {
+      // 整组替换逐条删旧分片：失败项由服务端报告，提示用户稍后清理
+      message += `；${leftover.length} 个旧分片未删除，请稍后重试或手动删除`;
+    }
+    toast(message);
     // 提交期间用户可能继续输入下一条，只清空仍是本次提交内容的输入框
     if (els.kbContent.value.trim() === content) els.kbContent.value = "";
     if (els.kbCategory.value.trim() === category) els.kbCategory.value = "";
