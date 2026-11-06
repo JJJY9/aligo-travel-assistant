@@ -481,6 +481,8 @@ class _RagFakeClient:
 def test_rag_requires_initialized_knowledge_base(monkeypatch, tmp_path):
     """知识库未初始化时不创建空库，回复明确错误（此前回答「没有找到相关信息」）。"""
     module = _load_skill_module("ask-question")
+    # CI 未安装 RAG 可选依赖：构造函数会在依赖分支提前返回，这里按已安装处理
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
     monkeypatch.setattr(
         module, "get_embedding_model", lambda name: _RagFakeEmbedding()
     )
@@ -503,6 +505,8 @@ def test_rag_requires_initialized_knowledge_base(monkeypatch, tmp_path):
 def test_rag_explicit_embedding_model_id_not_replaced(monkeypatch, tmp_path):
     """HuggingFace 模型 ID（含 /）不能被当成缺失路径替换成默认模型。"""
     module = _load_skill_module("ask-question")
+    # CI 未安装 RAG 可选依赖：构造函数会在依赖分支提前返回，这里按已安装处理
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
     (tmp_path / "milvus_lite.db").write_bytes(b"")
     captured = {}
 
@@ -586,6 +590,8 @@ def test_rag_grouped_documents_assembled():
 def test_rag_collection_created_once(monkeypatch, tmp_path):
     """首次构造创建集合；已有集合不再重复创建；初始化路径允许无库文件创建。"""
     module = _load_skill_module("ask-question")
+    # CI 未安装 RAG 可选依赖：构造函数会在依赖分支提前返回，这里按已安装处理
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
     (tmp_path / "milvus_lite.db").write_bytes(b"")
     client = _RagFakeClient()
     monkeypatch.setattr(
