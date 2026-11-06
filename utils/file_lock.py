@@ -60,12 +60,21 @@ def _release(handle) -> None:
 
 @contextmanager
 def file_lock(path: str, timeout: float = DEFAULT_TIMEOUT_SEC) -> Iterator[None]:
-    """独占锁定 ``<path>.lock``；超时抛 ``TimeoutError``。"""
+    """独占锁定 ``<path>.lock``；拿不到锁（含权限 / 路径故障）抛 ``TimeoutError``。"""
     lock_path = Path(f"{path}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+b")
     try:
-        _ensure_lockable(handle)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+    except OSError as exc:
+        # 契约只承诺 TimeoutError：权限不足 / 路径不可写等 OSError 也要按
+        # 「拿不到锁」处理，调用方（长期记忆）统一转成 MemoryPersistenceError；
+        # 裸 OSError 会被重试层当成可重试的网络错误
+        raise TimeoutError(f"无法获取文件锁：{lock_path}（{exc}）") from exc
+    try:
+        try:
+            _ensure_lockable(handle)
+        except OSError as exc:
+            raise TimeoutError(f"无法获取文件锁：{lock_path}（{exc}）") from exc
         _acquire(handle, timeout)
         try:
             yield
