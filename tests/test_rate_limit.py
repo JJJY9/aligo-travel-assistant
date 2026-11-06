@@ -145,7 +145,45 @@ def test_create_rate_limiter_backends():
     shared = create_rate_limiter("unit", 1, 60, redis_client=object())
     assert isinstance(shared, RedisRateLimiter)
     assert shared.backend == "redis"
-    print("✓ 限流器工厂按是否提供 Redis 客户端选择后端")
+
+    # 只有工厂（配置了 Redis 但启动时不可达）：先回退，恢复后自动接入
+    pending = create_rate_limiter("unit", 1, 60, client_factory=lambda: None)
+    assert isinstance(pending, RedisRateLimiter)
+    assert pending.degraded is True
+    print("✓ 限流器工厂按是否提供 Redis 客户端 / 工厂选择后端")
+
+
+class _RecoverableRedis:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def eval(self, *args, **kwargs):
+        self.calls += 1
+        return "-1"
+
+
+def test_redis_limiter_reconnects_via_factory():
+    """启动时没有客户端：工厂可用后限流器自动重新接入共享计数。"""
+    client = _RecoverableRedis()
+    limiter = RedisRateLimiter(
+        None, "unit-late", limit=2, window_sec=60, client_factory=lambda: client
+    )
+    assert limiter.degraded is True
+    assert limiter.check("k") is None
+    assert client.calls == 1
+    assert limiter.degraded is False, "成功调用一次后应恢复共享计数"
+    print("✓ Redis 恢复后限流器通过工厂重新接入")
+
+
+def test_degraded_survives_cooldown_without_success():
+    """冷却到期但从未成功重试成功时仍应报告降级（监控不能误报健康）。"""
+    client = _UnavailableRedis()
+    limiter = RedisRateLimiter(client, "unit-persist", limit=2, window_sec=60)
+    assert limiter.check("k") is None
+    assert limiter.degraded is True
+    limiter._degraded_until = 0.0  # noqa: SLF001 - 模拟冷却到期
+    assert limiter.degraded is True, "没有一次成功调用前应保持降级"
+    print("✓ 冷却到期未恢复时仍报告降级")
 
 
 class _BytesRedis:
@@ -181,5 +219,7 @@ if __name__ == "__main__":
     test_thread_safe_checks()
     test_redis_limiter_falls_back_when_unavailable()
     test_create_rate_limiter_backends()
+    test_redis_limiter_reconnects_via_factory()
+    test_degraded_survives_cooldown_without_success()
     test_redis_limiter_handles_bytes_replies()
     print("\n全部通过")
