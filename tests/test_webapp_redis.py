@@ -263,12 +263,12 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
             memory.add_message(role, content)
         assert client.llen(key) == 4
 
-        # 故障期新增 + 截断：重放后 Redis 只保留第一轮（去掉故障期那轮）
+        # 故障期新增（孤立的用户消息）+ 截断：重放后 Redis 与影子缓存一致
         proxy.fail = True
         reset_degraded()
         memory.add_message("user", "Q3")
         reset_degraded()
-        assert memory.truncate_last_turn("Q3") == 2
+        assert memory.truncate_last_turn("Q3") == 1
         assert contents(memory) == ["Q1", "A1", "Q2", "A2"]
 
         proxy.fail = False
