@@ -288,6 +288,120 @@ def test_archive_dispatch_json(monkeypatch):
     print("✓ session-archive dispatch --json")
 
 
+class _TitleStore(_FakeStore):
+    """支持 set_session_title 的假存储（session-title 用例）。"""
+
+    def __init__(self, messages, titles=None, fail_set=False):
+        super().__init__(messages, titles=titles)
+        self.fail_set = fail_set
+        self.title_calls = []
+
+    def set_session_title(self, session_id, title):
+        if self.fail_set:
+            raise RuntimeError("disk full")
+        self.title_calls.append((session_id, title))
+        if title:
+            self.titles[session_id] = title
+        else:
+            self.titles.pop(session_id, None)
+        return True
+
+
+def test_session_title_set_and_reset(monkeypatch):
+    import json as _json
+
+    store = _TitleStore(
+        [_message("user", "内容", "s-active")], titles={"s-active": "旧标题"}
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone("u1", "s-active", "新标题")
+    assert code == 0 and "已设置会话 s-active 标题：新标题" in out.getvalue()
+    assert store.title_calls == [("s-active", "新标题")] and store.closed
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone("u1", "s-active", "", as_json=True)
+    data = _json.loads(out.getvalue())
+    assert code == 0 and data["title"] == ""
+    assert store.title_calls[-1] == ("s-active", "")
+    print("✓ session-title 设置 / 重置 / JSON")
+
+
+def test_session_title_validation_and_failures(monkeypatch):
+    store = _TitleStore([_message("user", "内容", "s-active")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone("u1", "s-active", "长" * 61)
+    assert code == 1 and "最多 60" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone("u1", "s-missing", "x")
+    assert code == 1 and "不存在" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone("bad id", "s1", "x")
+    assert code == 1 and "用户 ID" in out.getvalue()
+
+    store.fail_set = True
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone(
+            "u1", "s-active", "x", as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and "操作失败" in data["error"]
+    print("✓ session-title 校验与写入失败")
+
+
+def test_session_title_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_session_title_standalone",
+        lambda user_id, session_id, title, as_json=False: (
+            calls.append((user_id, session_id, title, as_json)) or 0
+        ),
+    )
+    for argv, expected in (
+        (
+            ["cli.py", "session-title", "u1", "s1", "新标题"],
+            ("u1", "s1", "新标题", False),
+        ),
+        (
+            ["cli.py", "session-title", "u1", "s1", "--reset", "--json"],
+            ("u1", "s1", "", True),
+        ),
+        (
+            ["cli.py", "session-title", "u1", "s1", "标题", "--JSON"],
+            ("u1", "s1", "标题", True),
+        ),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert calls[-1] == expected, argv
+    for argv in (
+        ["cli.py", "session-title"],
+        ["cli.py", "session-title", "u1"],
+        ["cli.py", "session-title", "u1", "s1"],
+        ["cli.py", "session-title", "u1", "s1", "--reset", "标题"],
+        ["cli.py", "session-title", "u1", "s1", "标题", "多余"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "session-title" in out.getvalue()
+    print("✓ session-title dispatch 参数")
+
+
 def test_read_failure(monkeypatch):
     fake = _sessions_store()
     fake.fail_history = True
@@ -604,6 +718,9 @@ if __name__ == "__main__":
         test_archive_missing_session,
         test_archive_json_output,
         test_archive_dispatch_json,
+        test_session_title_set_and_reset,
+        test_session_title_validation_and_failures,
+        test_session_title_dispatch,
         test_session_export_to_file,
         test_session_export_to_stdout,
         test_session_export_missing_and_invalid,
