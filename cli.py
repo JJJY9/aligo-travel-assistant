@@ -1379,9 +1379,12 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
 
 
 def run_knowledge_export_standalone(
-    target: str | None = None, force: bool = False
+    target: str | None = None, force: bool = False, to_stdout: bool = False
 ) -> int:
-    """导出知识库为 JSON 文件（用于 `python cli.py kb-export [path] [--force]`）。
+    """导出知识库为 JSON（`python cli.py kb-export [path] [--stdout] [--force]`）。
+
+    ``--stdout`` 把 JSON 直接打到标准输出（便于管道给 jq 等），与指定路径
+    互斥；默认写入 ``exports/knowledge-export.json``。
 
     Returns:
         0 导出成功；1 参数 / 知识库不可用 / 文件已存在 / 写入失败
@@ -1409,6 +1412,9 @@ def run_knowledge_export_standalone(
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "documents": documents,
     }
+    if to_stdout:
+        _print_stdout(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     path = Path(target) if target else Path("exports") / "knowledge-export.json"
     # 与 trips-export / session-export 一致：默认不覆盖已有文件，
     # 避免把用户数据（如误把 data/memory/*.json 当作导出路径）静默替换
@@ -4028,21 +4034,26 @@ def run_preference_delete_standalone(
     return 0
 
 
-def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool] | None:
-    """解析 kb-export 的 [path] [--force]；冲突 / 未知参数返回 None。"""
+def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool, bool] | None:
+    """解析 kb-export 的 [path] [--stdout] [--force]；冲突 / 未知参数返回 None。"""
     target: str | None = None
     force = False
+    to_stdout = False
     for item in args:
         lowered = item.lower()
         if lowered == "--force":
             force = True
+        elif lowered == "--stdout":
+            to_stdout = True
         elif item.startswith("-"):
             return None
         elif target is None:
             target = item
         else:
             return None
-    return target, force
+    if to_stdout and target is not None:
+        return None
+    return target, force, to_stdout
 
 
 def _parse_export_args(
@@ -4166,10 +4177,16 @@ def main():
         if arg == "kb-export":
             parsed_kb_export = _parse_kb_export_args(sys.argv[2:])
             if parsed_kb_export is None:
-                print("用法：python cli.py kb-export [path] [--force]")
+                print(
+                    "用法：python cli.py kb-export [path] [--stdout] [--force]"
+                )
                 sys.exit(2)
-            kb_target, kb_force = parsed_kb_export
-            sys.exit(run_knowledge_export_standalone(kb_target, force=kb_force))
+            kb_target, kb_force, kb_stdout = parsed_kb_export
+            sys.exit(
+                run_knowledge_export_standalone(
+                    kb_target, force=kb_force, to_stdout=kb_stdout
+                )
+            )
         if arg == "kb-import":
             target = None
             dry_run = False
