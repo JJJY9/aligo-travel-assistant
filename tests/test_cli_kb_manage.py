@@ -71,6 +71,67 @@ def test_list_prints_items(monkeypatch):
     print("✓ kb-list 输出总数、分类、分片序号与预览")
 
 
+def test_list_json_output(monkeypatch):
+    import json as _json
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset, query: {
+            "total": 2,
+            "items": [
+                {"id": 7, "content": "住宿标准", "metadata": {"category": "住宿"}},
+                {"id": 6, "content": "交通标准", "metadata": {}},
+            ],
+        },
+    )
+    code, out = _capture(cli.run_knowledge_list_standalone, "住宿", as_json=True)
+    data = _json.loads(out)
+    assert code == 0 and data["query"] == "住宿"
+    assert data["total"] == 2 and data["count"] == 2
+    assert data["items"][0]["id"] == 7
+
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
+    )
+    code, out = _capture(cli.run_knowledge_list_standalone, as_json=True)
+    data = _json.loads(out)
+    assert code == 1 and data["ok"] is False and "不可用" in data["error"]
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+
+    def boom(**kwargs):
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "list_documents", boom)
+    code, out = _capture(cli.run_knowledge_list_standalone, as_json=True)
+    data = _json.loads(out)
+    assert code == 1 and "读取失败" in data["error"]
+    print("✓ kb-list --json 正常 / 不可用 / 读取失败")
+
+
+def test_list_dispatch_json(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_list_standalone",
+        lambda query="", as_json=False: calls.append((query, as_json)) or 0,
+    )
+    for argv, expected in (
+        (["cli.py", "kb-list"], ("", False)),
+        (["cli.py", "kb-list", "住宿"], ("住宿", False)),
+        (["cli.py", "kb-list", "--json", "住宿"], ("住宿", True)),
+        (["cli.py", "kb-list", "住宿", "--JSON"], ("住宿", True)),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert calls[-1] == expected, argv
+    print("✓ kb-list dispatch --json")
+
+
 def test_list_error(monkeypatch):
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
 
@@ -741,6 +802,8 @@ if __name__ == "__main__":
     for case in (
         test_list_unavailable,
         test_list_prints_items,
+        test_list_json_output,
+        test_list_dispatch_json,
         test_list_error,
         test_delete_success,
         test_delete_not_found,
