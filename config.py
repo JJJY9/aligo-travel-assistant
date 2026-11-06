@@ -46,6 +46,9 @@ class SystemConfig(TypedDict):
 
 class RAGConfig(TypedDict):
     embedding_model: str
+    # 问答检索的最低余弦相似度：低于该分的片段视为「与知识库无关」，
+    # 不再注入回答提示词（无关问题得分通常 <0.5，相关命中 >0.6）
+    min_score: float
 
 
 class StorageConfig(TypedDict):
@@ -93,6 +96,7 @@ SYSTEM_CONFIG: SystemConfig = {
 # RAG 知识库：嵌入模型（本地路径，无需连 HuggingFace）
 RAG_CONFIG: RAGConfig = {
     "embedding_model": "data/models/bge-small-zh-v1.5",
+    "min_score": 0.5,
 }
 
 # 存储后端（生产模式可选；未配置或连接失败时自动回退本地实现）：
