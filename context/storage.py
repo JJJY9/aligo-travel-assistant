@@ -149,10 +149,9 @@ def describe_backends() -> dict[str, Any]:
         "long_term": long_term,
         "short_term_configured": bool(url),
         "long_term_configured": bool(dsn),
-        # 配置了 Redis 但运行中故障、短期记忆已回退进程内缓存
+        # 配置了 Redis 但当前用不上（启动时不可达 / 运行中故障回退进程内）
         "short_term_degraded": bool(url)
-        and short_term == "redis"
-        and redis_short_term_degraded(),
+        and (short_term != "redis" or redis_short_term_degraded()),
         # 配置了 PostgreSQL 但连接失败、长期记忆已回退本地 JSON
         "long_term_degraded": bool(dsn) and long_term == "json",
     }

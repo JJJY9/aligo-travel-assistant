@@ -383,6 +383,7 @@ def test_describe_backends_configured_flags(monkeypatch):
         storage.reset_failure_cache()
     assert info["short_term_configured"] is True
     assert info["short_term"] == "memory", "连接失败时回退进程内"
+    assert info["short_term_degraded"] is True, "配置 Redis 但取不到客户端也要报降级"
 
     monkeypatch.setattr(storage, "_get_redis_client", lambda url: object())
     monkeypatch.setattr(storage, "redis_short_term_degraded", lambda: True)

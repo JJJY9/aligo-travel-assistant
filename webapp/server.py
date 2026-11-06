@@ -578,6 +578,41 @@ class _WebSession:
         self.runtime.close()
 
 
+class _SessionTurnLease:
+    """SSE 响应生命周期内的用户锁 + 会话占用租约（幂等释放）。
+
+    响应体可能在首次迭代前就被取消（客户端在响应开始前断开），此时异步
+    生成器的 ``finally`` 不会执行；由 :class:`_LeasedStreamingResponse` 在
+    ``__call__`` 的 finally 中兜底释放，避免用户锁与会话占用永久泄漏。
+    """
+
+    def __init__(self, lock: asyncio.Lock, session: _WebSession) -> None:
+        self._lock = lock
+        self._session = session
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._session.end_turn()
+        self._lock.release()
+
+
+class _LeasedStreamingResponse(StreamingResponse):
+    """响应结束（含未开始迭代即被取消）时释放租约。"""
+
+    def __init__(self, content: Any, lease: _SessionTurnLease, **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._lease = lease
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._lease.release()
+
+
 _UNMARK_TOMBSTONE_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
@@ -890,6 +925,11 @@ class AligoWebApp:
     def lock_for(self, user_id: str) -> asyncio.Lock:
         """同一用户的请求串行处理，避免长期记忆并发写覆盖。"""
         lock = self.locks.get(user_id)
+        if lock is None and self.overflow_lock.locked():
+            # 兜底锁仍被占用（锁表曾满）：新请求继续共用兜底锁。否则锁表
+            # 腾出空位后，同一用户的上一个请求还持着兜底锁，这里会新建
+            # 私有锁与之并行，按用户串行失效
+            return self.overflow_lock
         if lock is None:
             if len(self.locks) >= self.max_locks:
                 for key, candidate in list(self.locks.items()):
@@ -2375,6 +2415,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 空流。锁在流结束时释放。
         lock = state.lock_for(payload.user_id)
         await lock.acquire()
+        lease: _SessionTurnLease | None = None
         try:
             if await asyncio.to_thread(
                 state.is_recently_deleted, payload.user_id, payload.session_id
@@ -2392,8 +2433,12 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=503,
                     detail=f"存储暂时不可用，请稍后再试（请求 ID：{rid}）",
                 ) from exc
+            lease = _SessionTurnLease(lock, session)
         except BaseException:
-            lock.release()
+            if lease is not None:
+                lease.release()
+            else:
+                lock.release()
             raise
 
         async def event_stream() -> Any:
@@ -2466,11 +2511,13 @@ def create_app(model: Any = None) -> FastAPI:
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
                 # 先解除在用标记，再释放用户锁：之后该会话才可以被 LRU 淘汰
-                session.end_turn()
-                lock.release()
+                # （响应若在首次迭代前就被取消，生成器不会执行到这里，
+                # 由 _LeasedStreamingResponse 兜底释放同一租约）
+                lease.release()
 
-        return StreamingResponse(
+        return _LeasedStreamingResponse(
             event_stream(),
+            lease,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
