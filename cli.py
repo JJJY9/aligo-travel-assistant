@@ -2690,6 +2690,78 @@ def run_session_title_standalone(
     return 0
 
 
+def run_session_pin_standalone(
+    user_id: str, session_id: str, pinned: bool = True, as_json: bool = False
+) -> int:
+    """置顶 / 取消置顶会话
+    （`python cli.py session-pin <user> <session> [--off] [--json]`）。
+
+    Returns:
+        0 操作成功；1 参数 / 读取 / 写入失败（含会话不存在）
+    """
+    import re
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+        return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            exists = bool(store.get_chat_history(session_id=session_id))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取会话失败：{exc}")
+        if not exists:
+            return _fail(f"会话 {session_id} 不存在或没有消息")
+        try:
+            store.set_session_pinned(session_id, pinned)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"操作失败：{exc}")
+        try:
+            current = [str(item) for item in store.get_pinned_sessions() or []]
+            saved = session_id in current
+        except Exception:  # noqa: BLE001 - 读回失败时按提交值展示
+            saved = pinned
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "pinned": saved,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    print(f"已{'置顶' if saved else '取消置顶'}会话 {session_id}")
+    return 0
+
+
 def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str, bool] | None:
     """解析 sessions 的 --archived / --all / --query 关键词 / --json。
 
@@ -3801,7 +3873,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / "
     "preferences / pref-set / pref-delete / "
-    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-export / "
+    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-pin / session-export / "
     "sessions-export / trips-export / user-export"
 )
 
@@ -4262,6 +4334,36 @@ def main():
             sys.exit(
                 run_session_title_standalone(
                     positional[0], positional[1], title, as_json=as_json
+                )
+            )
+        if arg == "session-pin":
+            positional = []
+            as_json = False
+            unpin = False
+            valid = True
+            for item in sys.argv[2:]:
+                lowered = item.lower()
+                if lowered == "--json":
+                    as_json = True
+                elif lowered == "--off":
+                    unpin = True
+                elif item.startswith("-") or len(positional) >= 2:
+                    valid = False
+                    break
+                else:
+                    positional.append(item)
+            if not valid or len(positional) != 2:
+                print(
+                    "用法：python cli.py session-pin <user_id> <session_id> "
+                    "[--off] [--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_session_pin_standalone(
+                    positional[0],
+                    positional[1],
+                    pinned=not unpin,
+                    as_json=as_json,
                 )
             )
         if arg == "session-export":
