@@ -299,6 +299,136 @@ def test_one_day_trips_use_start_as_end(monkeypatch):
     print("✓ 单日行程的两种返程写法按重复处理")
 
 
+def test_json_output_delete_and_dry_run(monkeypatch):
+    """--json：预览列出将删除条目，执行后报告实际删除数与条目详情。"""
+    import json as _json
+
+    fake = _FakeStore(
+        [_trip("trip_1"), _trip("trip_2"), _trip("trip_3", destination="杭州")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", dry_run=True, as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 0
+    assert payload["ok"] is True and payload["dry_run"] is True
+    assert payload["would_remove"] == 1
+    assert payload["duplicates"][0]["trip_id"] == "trip_2"
+    assert payload["duplicates"][0]["origin"] == "北京"
+    assert payload["duplicates"][0]["destination"] == "上海"
+    assert fake.deleted == []
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 0
+    assert payload["dry_run"] is False and payload["removed"] == 1
+    assert payload["duplicates"][0]["trip_id"] == "trip_2"
+    assert payload["ambiguous_ids"] == []
+    assert fake.deleted == ["trip_2"]
+
+
+def test_json_output_no_duplicates(monkeypatch):
+    import json as _json
+
+    fake = _FakeStore([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 0
+    assert payload == {
+        "ok": True,
+        "user_id": "u1",
+        "dry_run": False,
+        "total_trips": 0,
+        "duplicates": [],
+        "ambiguous_ids": [],
+        "removed": 0,
+    }
+
+
+def test_json_output_errors_and_ambiguous(monkeypatch):
+    import json as _json
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("../bad", as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 1 and payload["ok"] is False and "用户 ID" in payload["error"]
+
+    fake = _FakeStore(
+        [_trip("trip_1"), _trip("trip_2"), _trip("trip_2", destination="杭州")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", dry_run=True, as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert payload["ambiguous_ids"] == ["trip_2"]
+    assert payload["would_remove"] == 0
+    assert fake.deleted == []
+
+    def boom(user_id, path):
+        raise RuntimeError("cannot open")
+
+    monkeypatch.setattr(storage, "create_long_term_memory", boom)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 1 and "打开长期记忆失败" in payload["error"]
+    print("✓ trips-dedupe --json 错误 / 歧义 id")
+
+
+def test_dispatch_json_flag(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_trips_dedupe_standalone",
+        lambda user_id, dry_run=False, as_json=False: (
+            calls.append((user_id, dry_run, as_json)) or 0
+        ),
+    )
+    for argv, expected in (
+        (["cli.py", "trips-dedupe", "u1"], ("u1", False, False)),
+        (
+            ["cli.py", "trips-dedupe", "u1", "--json", "--dry-run"],
+            ("u1", True, True),
+        ),
+        (
+            ["cli.py", "trips-dedupe", "u1", "--dry-run", "--JSON"],
+            ("u1", True, True),
+        ),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert calls[-1] == expected, argv
+    for argv in (
+        ["cli.py", "trips-dedupe"],
+        ["cli.py", "trips-dedupe", "--json"],
+        ["cli.py", "trips-dedupe", "u1", "--bad"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "--json" in buf.getvalue()
+    print("✓ trips-dedupe dispatch --json / --dry-run 参数")
+
+
 if __name__ == "__main__":
     for case in (
         test_dedupes_and_keeps_first,
@@ -315,6 +445,10 @@ if __name__ == "__main__":
         test_main_rejects_unknown_flags,
         test_ambiguous_trip_id_is_not_deleted,
         test_one_day_trips_use_start_as_end,
+        test_json_output_delete_and_dry_run,
+        test_json_output_no_duplicates,
+        test_json_output_errors_and_ambiguous,
+        test_dispatch_json_flag,
     ):
         mp = pytest.MonkeyPatch()
         try:
