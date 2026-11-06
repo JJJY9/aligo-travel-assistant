@@ -3161,6 +3161,211 @@ def run_trip_delete_standalone(
     return 0
 
 
+def _parse_trip_update_args(args: list[str]) -> dict[str, Any] | None:
+    """解析 trip-update 参数：``<user_id> <trip_id> [--origin X ...] [--json]``。
+
+    至少提供一个可更新字段；未知参数、缺值或位置参数数量不符返回 None。
+    """
+    values: dict[str, str] = {}
+    positional: list[str] = []
+    as_json = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+            index += 1
+            continue
+        flag = next(
+            (
+                name
+                for name in _TRIP_ADD_FLAGS
+                if lowered == name or lowered.startswith(name + "=")
+            ),
+            None,
+        )
+        if flag is None:
+            if item.startswith("-"):
+                return None
+            positional.append(item)
+            index += 1
+            continue
+        if "=" in item:
+            value = item.split("=", 1)[1]
+        else:
+            index += 1
+            if index >= len(args):
+                return None
+            value = args[index]
+        if not value.strip():
+            return None
+        values[flag[2:]] = value.strip()
+        index += 1
+    if len(positional) != 2 or not values:
+        return None
+    return {
+        "user_id": positional[0],
+        "trip_id": positional[1],
+        "values": values,
+        "as_json": as_json,
+    }
+
+
+def run_trip_update_standalone(
+    user_id: str,
+    trip_id: str,
+    fields: dict[str, str],
+    as_json: bool = False,
+) -> int:
+    """按字段更新一条行程（`python cli.py trip-update ... [--json]`）。
+
+    与 Web 面板同一语义：只修改提供的字段；日期按合并后的行程校验；更新后
+    提示与其它行程的日期重叠；同一 trip_id 对应多条行程时拒绝操作。
+
+    Returns:
+        0 更新成功；1 参数 / 读取 / 写入失败（含行程不存在）
+    """
+    import re
+    from datetime import datetime
+
+    from utils.trip_conflicts import trip_conflicts
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", trip_id) or trip_id.startswith("-"):
+        return _fail("行程 ID 只能包含中文、字母、数字、下划线和短横线")
+    mapped = {
+        {"start": "start_date", "end": "end_date"}.get(key, key): value
+        for key, value in fields.items()
+    }
+    if not mapped:
+        return _fail("没有需要更新的字段")
+    if "destination" in mapped and not mapped["destination"].strip():
+        return _fail("目的地不能为空")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+        matches = [trip for trip in trips if str(trip.get("trip_id")) == trip_id]
+        if len(matches) > 1:
+            return _fail(
+                "该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理"
+            )
+        if not matches:
+            return _fail(f"行程 {trip_id} 不存在")
+        merged = {**matches[0], **mapped}
+
+        start_dt = end_dt = None
+        for key, label in (("start_date", "出发日期"), ("end_date", "返程日期")):
+            raw = str(merged.get(key) or "")
+            if not raw:
+                continue
+            try:
+                parsed = datetime.strptime(raw, "%Y-%m-%d")
+            except ValueError:
+                return _fail(f"{label}格式应为 YYYY-MM-DD：{raw}")
+            if key == "start_date":
+                start_dt = parsed
+            else:
+                end_dt = parsed
+        if start_dt is None and "end_date" in mapped:
+            return _fail("填写返程日期前请先设置出发日期")
+        if start_dt is not None and end_dt is not None and end_dt < start_dt:
+            return _fail("结束日期不能早于出发日期")
+
+        try:
+            updated = store.update_trip(trip_id, mapped)
+        except ValueError as exc:
+            return _fail(str(exc))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"更新行程失败：{exc}")
+        if not updated:
+            return _fail(f"行程 {trip_id} 不存在")
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    saved = next(
+        (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
+        {"trip_id": trip_id, **merged},
+    )
+    conflicts = (
+        trip_conflicts(trips, start_dt, end_dt or start_dt, exclude_id=trip_id)
+        if start_dt is not None
+        else []
+    )
+    origin = str(saved.get("origin") or "")
+    destination = str(saved.get("destination") or "")
+    start_text = str(saved.get("start_date") or "")
+    end_text = str(saved.get("end_date") or "")
+    dates = (
+        start_text
+        if not end_text or end_text == start_text
+        else f"{start_text} ~ {end_text}"
+    ) or "日期未记录"
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "trip_id": trip_id,
+                    "updated": True,
+                    "origin": origin,
+                    "destination": destination,
+                    "start_date": start_text,
+                    "end_date": end_text,
+                    "conflicts": [
+                        {
+                            "trip_id": str(trip.get("trip_id") or ""),
+                            "origin": str(trip.get("origin") or ""),
+                            "destination": str(trip.get("destination") or ""),
+                            "start_date": str(trip.get("start_date") or ""),
+                            "end_date": str(trip.get("end_date") or ""),
+                        }
+                        for trip in conflicts
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    print(
+        f"已更新行程 #{trip_id}"
+        f"（{origin or '—'} → {destination or '—'}，{dates}）"
+    )
+    if conflicts:
+        ids = "、".join(f"#{str(item.get('trip_id') or '')}" for item in conflicts)
+        print(f"注意：与 {len(conflicts)} 条行程日期重叠：{ids}")
+    return 0
+
+
 def run_trips_list_standalone(user_id: str, as_json: bool = False) -> int:
     """列出用户行程（`python cli.py trips <user_id> [--json]`）。
 
@@ -3370,7 +3575,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / "
     "preferences / "
-    "trips / trip-add / trip-delete / trips-dedupe / sessions / session-archive / session-export / "
+    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export / user-export"
 )
 
@@ -3624,6 +3829,23 @@ def main():
                     trip_values.get("end"),
                     trip_values.get("purpose", "出差"),
                     as_json=parsed_trip_add["as_json"],
+                )
+            )
+        if arg == "trip-update":
+            parsed_trip_update = _parse_trip_update_args(sys.argv[2:])
+            if parsed_trip_update is None:
+                print(
+                    "用法：python cli.py trip-update <user_id> <trip_id> "
+                    "[--origin X] [--destination X] [--start YYYY-MM-DD] "
+                    "[--end YYYY-MM-DD] [--purpose X] [--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_trip_update_standalone(
+                    parsed_trip_update["user_id"],
+                    parsed_trip_update["trip_id"],
+                    parsed_trip_update["values"],
+                    as_json=parsed_trip_update["as_json"],
                 )
             )
         if arg == "trip-delete":
