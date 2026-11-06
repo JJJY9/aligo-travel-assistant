@@ -1394,16 +1394,30 @@ def run_knowledge_export_standalone(
     from utils.knowledge_admin import export_documents
     from utils.knowledge_stats import knowledge_status
 
+    def _fail(message: str) -> int:
+        # --stdout 是机器可读通道：失败也用 JSON，避免下游拿到非 JSON 文本
+        if to_stdout:
+            _print_stdout(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
     status = knowledge_status()
     if not status.get("available"):
-        print(f"导出失败：知识库不可用（{status.get('reason', '未知原因')}）")
-        return 1
+        return _fail(
+            f"导出失败：知识库不可用（{status.get('reason', '未知原因')}）"
+        )
 
     try:
         documents = export_documents()
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"导出失败：{exc}")
-        return 1
+        return _fail(f"导出失败：{exc}")
 
     from datetime import datetime, timezone
 
@@ -1413,7 +1427,11 @@ def run_knowledge_export_standalone(
         "documents": documents,
     }
     if to_stdout:
-        _print_stdout(json.dumps(payload, ensure_ascii=False, indent=2))
+        _print_stdout(
+            json.dumps(
+                {"ok": True, **payload}, ensure_ascii=False, indent=2
+            )
+        )
         return 0
     path = Path(target) if target else Path("exports") / "knowledge-export.json"
     # 与 trips-export / session-export 一致：默认不覆盖已有文件，
@@ -3343,7 +3361,7 @@ def _parse_trip_add_args(args: list[str]) -> dict[str, Any] | None:
             if index >= len(args):
                 return None
             value = args[index]
-        if not value.strip():
+        if not value.strip() or value.startswith("-"):
             return None
         values[flag[2:]] = value.strip()
         index += 1
@@ -3607,7 +3625,7 @@ def _parse_trip_update_args(args: list[str]) -> dict[str, Any] | None:
             if index >= len(args):
                 return None
             value = args[index]
-        if not value.strip():
+        if not value.strip() or value.startswith("-"):
             return None
         values[flag[2:]] = value.strip()
         index += 1
@@ -3804,7 +3822,7 @@ def _parse_trips_list_args(
                 if index >= len(args):
                     return None
                 value = args[index]
-            if not value.strip():
+            if not value.strip() or value.startswith("-"):
                 return None
             query = value.strip()
             index += 1
@@ -3876,19 +3894,21 @@ def run_trips_list_standalone(
     views = trips_with_conflicts(trips)
     needle = query.strip().casefold()
     if needle:
+        # 与面板筛选一致：五个字段用空格拼接后整体包含匹配（支持跨字段多词）
         views = [
             trip
             for trip in views
-            if any(
-                needle in str(trip.get(key) or "").casefold()
+            if needle
+            in " ".join(
+                str(trip.get(key) or "")
                 for key in (
                     "origin",
                     "destination",
+                    "purpose",
                     "start_date",
                     "end_date",
-                    "purpose",
                 )
-            )
+            ).casefold()
         ]
         if not views:
             if as_json:

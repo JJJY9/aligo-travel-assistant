@@ -382,6 +382,20 @@ def test_trip_add_args_and_dispatch(monkeypatch):
     assert cli._parse_trip_add_args(["u1"]) is None
     assert cli._parse_trip_add_args(["u1", "--destination", "上海"]) is None
     assert (
+        cli._parse_trip_add_args(
+            [
+                "u1",
+                "--destination",
+                "上海",
+                "--start",
+                "2026-12-01",
+                "--purpose",
+                "--json",
+            ]
+        )
+        is None
+    ), "以 - 开头的值（疑似下一个参数）必须拒绝，不能存成 purpose"
+    assert (
         cli._parse_trip_add_args(["u1", "--destination", "上海", "--start"])
         is None
     )
@@ -742,6 +756,10 @@ def test_trip_update_args_and_dispatch(monkeypatch):
     assert cli._parse_trip_update_args(["u1", "trip_1"]) is None
     assert cli._parse_trip_update_args(["u1", "--purpose", "x"]) is None
     assert cli._parse_trip_update_args(["u1", "trip_1", "--bad"]) is None
+    assert (
+        cli._parse_trip_update_args(["u1", "trip_1", "--purpose", "--json"])
+        is None
+    ), "以 - 开头的值必须拒绝，避免把 --json 存成 purpose"
     parsed = cli._parse_trip_update_args(
         ["u1", "trip_1", "--purpose=会议", "--start", "2026-12-01", "--json"]
     )
@@ -819,7 +837,20 @@ def test_trips_query_filter_text_and_json(monkeypatch):
         code = cli.run_trips_list_standalone("u1", as_json=True, query="不存在")
     data = json.loads(out.getvalue())
     assert data["count"] == 0 and data["trips"] == []
-    print("✓ trips --query 过滤（文本 / JSON / 无匹配）")
+
+    # 跨字段多词查询（与面板一致：五个字段空格拼接后整体包含）
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u1", as_json=True, query="北京 上海")
+    data = json.loads(out.getvalue())
+    assert code == 0 and data["count"] == 2, "「北京 上海」应命中两条上海行程"
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_list_standalone("u1", as_json=True, query="上海 出差")
+    data = json.loads(out.getvalue())
+    assert data["count"] == 1 and data["trips"][0]["trip_id"] == "t1"
+    print("✓ trips --query 过滤（文本 / JSON / 无匹配 / 跨字段多词）")
 
 
 def test_trips_query_args_and_dispatch(monkeypatch):
@@ -828,6 +859,9 @@ def test_trips_query_args_and_dispatch(monkeypatch):
     assert cli._parse_trips_list_args(["u1", "extra"]) is None
     assert cli._parse_trips_list_args(["u1", "--query"]) is None
     assert cli._parse_trips_list_args(["u1", "--query", " "]) is None
+    assert (
+        cli._parse_trips_list_args(["u1", "--query", "--json"]) is None
+    ), "缺值的 --query 不能把 --json 当成关键词"
     assert cli._parse_trips_list_args(["u1", "--bad"]) is None
     assert cli._parse_trips_list_args(["u1"]) == ("u1", "", False)
     assert cli._parse_trips_list_args(

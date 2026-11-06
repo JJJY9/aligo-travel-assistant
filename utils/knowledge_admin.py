@@ -569,8 +569,9 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
 def find_duplicate_contents() -> list[tuple[str, list[int]]]:
     """返回内容完全相同的**独立**片段组（按首次出现顺序），供人工清理。
 
-    只统计不带 ``group`` 的独立片段：多分片记录内部出现相同段落是正常的，
-    而且必须通过整份编辑 / 整组删除维护，按单条重复删除会破坏整篇文档。
+    只统计可单删的独立片段：带 ``group`` 的新版多分片记录，以及旧版
+    多分片记录（``parts > 1`` 但没有 group）内部出现相同段落都是正常的，
+    必须通过整份编辑 / 整组删除维护，按单条重复删除会破坏整篇文档。
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
@@ -580,7 +581,12 @@ def find_duplicate_contents() -> list[tuple[str, list[int]]]:
         if not content:
             continue
         meta = _parse_metadata(row.get("metadata"))
-        grouped = bool(meta.get("group"))
+        try:
+            parts = int(meta.get("parts") or 1)
+        except (TypeError, ValueError):
+            parts = 1
+        # 旧数据可能只有 parts 没有 group：同样是多分片文档，不能按单条处理
+        grouped = bool(meta.get("group")) or parts > 1
         seen.setdefault(content, []).append(
             (int(row.get("id", 0) or 0), grouped)
         )
