@@ -80,6 +80,7 @@ from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
 from utils.trip_export import render_trip_ics, render_trips_csv, render_trips_ics
+from utils.travel_stats import summarize_travel
 from utils.turn_meta import extract_turn_meta
 from utils.version import APP_VERSION
 from utils.weather import WeatherError, fetch_weather
@@ -1767,19 +1768,14 @@ def create_app(model: Any = None) -> FastAPI:
             if value is not None and value != "" and value != [] and value != {}
         }
         today = datetime.now().date()
+        travel_summary = summarize_travel(data["trip_history"], today=today)
         active_trips: list[tuple[datetime, dict[str, Any]]] = []
         upcoming_trips: list[tuple[datetime, dict[str, Any]]] = []
-        travel_days = 0
-        travel_cities: set[str] = set()
         for trip in data["trip_history"]:
             interval = _trip_interval(trip)
             if interval is None:
                 continue
             start_dt, end_dt = interval
-            travel_days += (end_dt.date() - start_dt.date()).days + 1
-            destination = str(trip.get("destination") or "").strip()
-            if destination:
-                travel_cities.add(destination)
             if start_dt.date() <= today <= end_dt.date():
                 active_trips.append((end_dt, trip))
             elif start_dt.date() > today:
@@ -1803,13 +1799,7 @@ def create_app(model: Any = None) -> FastAPI:
             "user_id": user_id,
             "preferences": preferences,
             "trip_count": len(data["trip_history"]),
-            "travel_summary": {
-                "total_trips": len(data["trip_history"]),
-                "total_days": travel_days,
-                "cities": len(travel_cities),
-                "active": len(active_trips),
-                "upcoming": len(upcoming_trips),
-            },
+            "travel_summary": travel_summary,
             "trips": trips_view,
             "next_trip": featured_trip,
             "chat_count": len(data["chat_history"]),
