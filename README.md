@@ -495,7 +495,7 @@ python cli.py
 
 知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path] [--force]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`，已存在时需 `--force` 覆盖）；`python cli.py kb-import <file.json> [--dry-run]` 批量导入（`--dry-run` 只校验 / 去重并报告将导入的数量，不加载嵌入模型；CLI 不限条数，Web 接口单次最多 20000 条（多分片组整组同批，请求体 2 MB 上限）），适合备份、换机与批量补充知识。
 
-知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 分片序号 + 60 字预览）；`python cli.py kb-categories [--json]` 按数量倒序统计分类分布；`python cli.py kb-search <关键词> [--top-k N] [--json]` 语义检索（与 Web 面板、RAG 问答同一条链路）；`python cli.py kb-show <id> [--json]` 查看片段（多分片按整篇拼接，与面板「编辑整份」同一实现）；`python cli.py kb-add <file> [--category X] [--title Y]` / `kb-update <id> <file> [--category X] [--title Y]` 从文件新增 / 覆盖更新片段（长内容自动拆分、整组替换与面板同一实现）；`python cli.py kb-delete <id> [--group]` 删除指定片段（`--group` 时连同同一拆分组的其余分片）；`python cli.py kb-duplicates [limit]` 只读扫描内容完全相同的**独立**片段组（`limit=0` 显示全部，多分片记录不参与，需整份维护）。
+知识片段查看 / 删除（不进入交互）：`python cli.py kb-list [关键词]` 按 id 倒序列出片段（分类 + 分片序号 + 60 字预览）；`python cli.py kb-categories [--json]` 按数量倒序统计分类分布；`python cli.py kb-search <关键词> [--top-k N] [--json]` 语义检索（与 Web 面板、RAG 问答同一条链路）；`python cli.py kb-show <id> [--json]` 查看片段（多分片按整篇拼接，与面板「编辑整份」同一实现）；`python cli.py kb-add <file> [--category X] [--title Y]` / `kb-update <id> <file> [--category X] [--title Y]` 从文件新增 / 覆盖更新片段（长内容自动拆分、整组替换与面板同一实现；单篇上限 20000 字，超长请拆分后分次添加）；`python cli.py kb-delete <id> [--group]` 删除指定片段（`--group` 时连同同一拆分组的其余分片）；`python cli.py kb-duplicates [limit]` 只读扫描内容完全相同的**独立**片段组（`limit=0` 显示全部，多分片记录不参与，需整份维护）。
 
 偏好列表（不进入交互）：`python cli.py preferences <user_id> [--json]` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否；`--json` 输出原始值）。
 
@@ -859,7 +859,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
 - **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。
 - **天气缓存是进程内缓存**：`/api/weather` 的 10 分钟缓存与同城并发合并都在单个进程内，多实例 / 多 worker 部署时各进程分别请求上游、缓存不共享（限流配置 `REDIS_URL` 后仍跨实例共享）。
-- **知识片段长度**：嵌入模型（BGE-small-zh）只编码前 512 token（约 400 个汉字）；Web / API 单条上限 2000 字，超过 400 字的内容在新增 / 更新 / 导入时会自动按语义边界拆成多条片段（列表中各占一行）。每次拆分带 `group` / `part` / `parts` 元数据：面板点击任一分片的「编辑」会回填**整份文档**（`GET …/group`，整篇 ≤20000 字），保存后按**整组替换**（先写新分片、再覆盖首片、最后删除同组旧分片，中途失败不丢旧内容）；也可**整组删除**（`DELETE …?group=1`）。导出的备份再导入时会按 `group` 拼回整篇重新拆分（超出 20000 字会报错提示拆分后导入）。旧数据没有 `group` 标识，单条编辑仍返回 400，请删除后重新添加。
+- **知识片段长度**：嵌入模型（BGE-small-zh）只编码前 512 token（约 400 个汉字）；Web / API 单条上限 2000 字，整份文档上限 20000 字（CLI `kb-add` 同样检查），超过 400 字的内容在新增 / 更新 / 导入时会自动按语义边界拆成多条片段（列表中各占一行）。每次拆分带 `group` / `part` / `parts` 元数据：面板点击任一分片的「编辑」会回填**整份文档**（`GET …/group`，整篇 ≤20000 字），保存后按**整组替换**（先写新分片、再覆盖首片、最后删除同组旧分片，中途失败不丢旧内容）；也可**整组删除**（`DELETE …?group=1`）。导出的备份再导入时会按 `group` 拼回整篇重新拆分（超出 20000 字会报错提示拆分后导入）。旧数据没有 `group` 标识，单条编辑仍返回 400，请删除后重新添加。
 - **本地 JSON 长期记忆**：同进程写入已加锁并在修改前重载；CLI 与 Web 同时修改**同一用户**时通过 `<data>.json.lock` 文件锁串行化（Windows / Unix 均支持，等待上限 2 秒；超时按写盘失败处理）。网络文件系统（NFS / SMB）上的锁语义取决于挂载方式，演示时仍建议只保留一个写入端。
 - **存储后端故障回退**：配置的 PostgreSQL 连接失败时自动回退本地 JSON；故障期间新会话写入 JSON 的消息 / 偏好不会在恢复后自动合并到 PostgreSQL（文件保留在 `data/memory/`，恢复时日志会给出警告），需要时请手动迁移。
 - **Redis 短期记忆的故障重放**：运行中 Redis 故障时短期记忆回退进程内影子缓存，故障期的消息与删除操作记入**进程内**日志，恢复后由同一进程的下一次访问按顺序重放（多进程部署下各进程各自补写；限流与删除墓碑仍跨实例共享）。截断 / 清空按消息时间戳判断新旧，前提是同一部署内各实例时钟基本同步（容器部署通常为 UTC）。

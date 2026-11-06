@@ -30,10 +30,13 @@ _MAX_CONTENT_CHARS = 400
 # 因此允许的拼接文本长度略高（每 400 字一片，20000 字最多 50 片）
 DOC_MAX_CHARS = 20000
 JOINED_MAX_CHARS = DOC_MAX_CHARS + 100
+# 导入备份时的拼接上限：旧数据可能有很多极短的分片（每片 1 字时 20000 字
+# 文档拼接后接近 40000 字），按分片数放宽；文档大小仍以 DOC_MAX_CHARS 为准，
+# 该上限只拦住用空白撑大拼接文本的异常备份
+_RESTORE_JOINED_MAX_CHARS = DOC_MAX_CHARS * 2 + 100
 # 导入时单条内容上限（用户输入 / 任意备份的安全边界）；从导出备份还原的
-# 多分片记录是完整文档，用拼接上限避免备份恢复被截断
+# 多分片记录是完整文档，用上面的拼接上限避免备份恢复被截断
 _IMPORT_CONTENT_MAX_CHARS = 2000
-_RESTORE_CONTENT_MAX_CHARS = JOINED_MAX_CHARS
 # 元数据最多 10 个键（与导入清洗保持一致），分片标记只在放得下时添加
 _METADATA_MAX_KEYS = 10
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
@@ -99,6 +102,8 @@ def list_documents(
 
     全量扫描（``query_iterator``）后在内存中排序 / 过滤 / 分页：单次 query
     受 16384 条上限约束，直接用 offset 翻页在更大的集合上会翻不到后面的行。
+    扫描与写锁互斥：整组替换分多步写库，读到中间状态会出现「只看到部分
+    分片」的列表；单机部署下让读等待写完成即可。
 
     Returns:
         {"total": int, "items": [{"id", "content", "metadata"}]}
@@ -107,9 +112,17 @@ def list_documents(
         FileNotFoundError: 知识库未初始化
         Exception: Milvus 查询失败（由上层映射为 503，不能伪装成空库）
     """
+    # 集合加载（首次冷启动可能耗时数百毫秒到数秒）放在写锁外：
+    # Milvus Lite 的 load_collection 会阻塞等待加载完成，不应占用写锁
     client = _client()
     _load_collection(client, COLLECTION_NAME)
+    with _WRITE_LOCK:
+        return _list_documents(client, limit, offset, query, category)
 
+
+def _list_documents(
+    client: Any, limit: int, offset: int, query: str, category: str
+) -> dict[str, Any]:
     documents: list[dict[str, Any]] = [
         {
             "id": int(row.get("id", 0) or 0),
@@ -200,6 +213,12 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     text = content.strip()
     if not text:
         raise ValueError("知识内容不能为空")
+    if len(text) > DOC_MAX_CHARS:
+        # Web / CLI / 导入共用同一文档大小上限：超长内容按 400 字拆片后
+        # 会变成数百次嵌入调用，必须让调用方先拆分
+        raise ValueError(
+            f"知识内容超过上限（{DOC_MAX_CHARS} 字），请拆分后分多次添加"
+        )
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
     documents = _chunk_documents(text, metadata)
@@ -294,6 +313,13 @@ def update_document(
     text = content.strip()
     if not text:
         raise ValueError("知识内容不能为空")
+    if len(text) > JOINED_MAX_CHARS:
+        # 整份编辑提交的是分片拼接文本（每片之间多一个分隔符）：20000 字
+        # 文档最多 50 片，拼接后 20049 字，JOINED_MAX_CHARS 已留余量
+        raise ValueError(
+            f"知识内容超过上限（{DOC_MAX_CHARS} 字，整份编辑含分片分隔符最多 "
+            f"{JOINED_MAX_CHARS} 字），请拆分后重试"
+        )
     client = _client()
     _load_collection(client, COLLECTION_NAME)
     agent = _get_agent()
@@ -332,22 +358,33 @@ def update_document(
                 except Exception:  # noqa: BLE001 - 补偿失败不覆盖原始错误
                     logger.warning("更新失败后补偿删除新分片失败：%s", extra_ids)
             raise
-        # 目标已换成新内容后再删旧分片（旧组仅此时失去定位目标）
+        # 目标已换成新内容后再删旧分片（旧组仅此时失去定位目标）。
+        # 逐条删除：某一片失败不应连累其余旧分片，失败项在响应里报告，
+        # 调用方可按 leftover_ids 重试清理
         removed_ids: list[int] = []
+        leftover_ids: list[int] = []
         if group:
-            removed_ids = [
+            old_ids = [
                 member
                 for member in _group_member_ids(client, group)
                 if member != int(doc_id)
             ]
-            if removed_ids:
-                client.delete(collection_name=COLLECTION_NAME, ids=removed_ids)
+            for member in old_ids:
+                try:
+                    client.delete(collection_name=COLLECTION_NAME, ids=[member])
+                except Exception as exc:  # noqa: BLE001 - 保留其余分片继续清理
+                    logger.warning("删除旧分片 %s 失败：%s", member, exc)
+                    leftover_ids.append(member)
+                else:
+                    removed_ids.append(member)
     payload: dict[str, Any] = {"status": "success", "id": int(doc_id)}
     if len(documents) > 1:
         payload["parts"] = len(documents)
         payload["extra_ids"] = extra_ids
     if removed_ids:
         payload["removed_ids"] = removed_ids
+    if leftover_ids:
+        payload["leftover_ids"] = leftover_ids
     return payload
 
 
@@ -355,9 +392,16 @@ def export_documents() -> list[dict[str, Any]]:
     """导出全部知识片段（按 id 升序，便于备份 / 迁移；不含 id）。
 
     全量扫描（query_iterator），集合超过单页 16384 条时也不会截断。
+    与写锁互斥：避免导到整组替换的中间状态（备份里分片缺失或新旧混杂）。
     """
+    # 集合加载放在写锁外（load_collection 会阻塞等待加载完成）
     client = _client()
     _load_collection(client, COLLECTION_NAME)
+    with _WRITE_LOCK:
+        return _export_documents(client)
+
+
+def _export_documents(client: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = [
         {
             "id": int(row.get("id", 0) or 0),
@@ -387,6 +431,7 @@ def _regroup_exported_documents(
     """
     grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     order: list[tuple[str, Any]] = []
+    ordered_groups: set[str] = set()
     for item in documents:
         if not isinstance(item, dict):
             order.append(("single", item))
@@ -404,7 +449,8 @@ def _regroup_exported_documents(
             except (TypeError, ValueError):
                 part_no = 0
             grouped.setdefault(group, []).append((part_no, item))
-            if not any(kind == "group" and key == group for kind, key in order):
+            if group not in ordered_groups:
+                ordered_groups.add(group)
                 order.append(("group", group))
         else:
             order.append(("single", item))
@@ -471,11 +517,11 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
     拼接用换行分隔（分片边界处原文可能是段落 / 标题，空串拼接会把
     两段文字粘在一起）；文档大小（``size``，各片长度之和）才是上限判断
     依据，拼接文本长度上限另留余量。读取在写锁内进行，避免读到整组
-    替换过程中的中间状态。
+    替换过程中的中间状态；集合加载（可能阻塞等待）放在写锁外。
     """
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
     with _WRITE_LOCK:
-        client = _client()
-        _load_collection(client, COLLECTION_NAME)
         parts, group = _document_info(client, int(doc_id))
         if parts == 0:
             return None
@@ -630,15 +676,19 @@ def import_documents(
             }
             # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索
             limit = (
-                _RESTORE_CONTENT_MAX_CHARS if restored else _IMPORT_CONTENT_MAX_CHARS
+                _RESTORE_JOINED_MAX_CHARS if restored else _IMPORT_CONTENT_MAX_CHARS
             )
             if restored:
-                # 还原上限按文档大小（分片长度之和）判断；拼接文本允许略长
-                # （分片间的分隔符不计入文档大小），超出则整批报错不静默截断
+                # 语义上限按文档大小（分片长度之和）判断；拼接文本允许更长
+                # （分片间的分隔符 / 旧数据的极短分片），超出物理上限才报错
                 doc_size = restored_size or len(content)
-                if doc_size > DOC_MAX_CHARS or len(content) > limit:
+                if doc_size > DOC_MAX_CHARS:
                     raise ValueError(
                         f"备份中的文档超过还原上限（{DOC_MAX_CHARS} 字），请拆分后导入"
+                    )
+                if len(content) > limit:
+                    raise ValueError(
+                        "备份中的文档拼接后过长（分片过多或含大量空白），请拆分后导入"
                     )
             cleaned.extend(_chunk_documents(content[:limit], sanitized_meta))
 

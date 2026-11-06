@@ -838,6 +838,169 @@ def test_import_restore_over_limit_raises(monkeypatch):
     print("✓ 超限备份还原明确报错（不静默截断）")
 
 
+def test_add_document_enforces_doc_size_limit(monkeypatch):
+    """kb-add / Web 新增与导入共用文档大小上限，超长内容明确报错。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 50)
+
+    class _Agent:
+        def add_documents(self, documents):
+            raise AssertionError("超长内容不应进入写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(ValueError, match="超过上限"):
+        knowledge_admin.add_document("长" * 51)
+
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    result = knowledge_admin.add_document("字" * 50)
+    assert result["id"] == 1, "恰好等于上限仍应可写入"
+    print("✓ 新增知识片段强制文档大小上限")
+
+
+def test_update_document_enforces_joined_size_limit(monkeypatch):
+    """kb-update / 整份编辑超过拼接上限时明确报错（不进写入流程）。"""
+    with pytest.raises(ValueError, match="超过上限"):
+        knowledge_admin.update_document(1, "长" * (knowledge_admin.JOINED_MAX_CHARS + 1))
+    print("✓ 更新知识片段强制整份拼接上限")
+
+
+def test_import_restore_many_short_parts_not_rejected(monkeypatch):
+    """旧数据的极短分片：拼接长度超过 JOINED_MAX_CHARS 也要能还原。
+
+    还原的语义上限是文档大小（分片长度之和），拼接长度只受物理上限约束；
+    每片 1 字时 20000 字文档拼接近 40000 字，不能因此拒绝合法备份。
+    """
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    pieces = [f"{index:04d}" for index in range(4021)]
+    joined_len = sum(len(piece) for piece in pieces) + len(pieces) - 1
+    assert joined_len > knowledge_admin.JOINED_MAX_CHARS
+    assert sum(len(piece) for piece in pieces) <= knowledge_admin.DOC_MAX_CHARS
+    documents = [
+        {
+            "content": piece,
+            "metadata": {"group": "g-tiny", "part": str(index + 1), "parts": str(len(pieces))},
+        }
+        for index, piece in enumerate(pieces)
+    ]
+    result = knowledge_admin.import_documents(documents)
+    assert result["imported"] >= 1
+    restored = "".join(doc["content"] for doc in agent.calls[0]).replace("\n", "")
+    assert restored == "".join(pieces), "极短分片的整篇内容应完整还原"
+    print("✓ 极短分片备份拼接超限仍可还原（语义上限为文档大小）")
+
+
+def test_import_restore_rejects_padded_join(monkeypatch):
+    """分片内空白撑大拼接文本时仍拒绝（物理上限只拦异常备份）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 100)
+    monkeypatch.setattr(knowledge_admin, "_RESTORE_JOINED_MAX_CHARS", 300)
+
+    class _Agent:
+        def add_documents(self, documents):
+            raise AssertionError("异常备份不应进入写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    pieces = ["x" + " " * 30 for _ in range(30)]
+    documents = [
+        {
+            "content": piece,
+            "metadata": {"group": "g-pad", "part": str(index + 1), "parts": str(len(pieces))},
+        }
+        for index, piece in enumerate(pieces)
+    ]
+    with pytest.raises(ValueError, match="拼接后过长"):
+        knowledge_admin.import_documents(documents)
+    print("✓ 空白撑大的备份拼接文本被物理上限拒绝")
+
+
+def test_list_and_export_hold_write_lock(monkeypatch):
+    """列表 / 导出与写入互斥，避免读到整组替换的中间状态。"""
+
+    class _TrackingLock:
+        def __init__(self):
+            self.entries = 0
+            self.exits = 0
+
+        def __enter__(self):
+            self.entries += 1
+            return self
+
+        def __exit__(self, *exc_info):
+            self.exits += 1
+            return False
+
+    lock = _TrackingLock()
+    monkeypatch.setattr(knowledge_admin, "_WRITE_LOCK", lock)
+    fake = _FakeMilvusClient([{"id": 1, "content": "内容", "metadata": "{}"}])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    knowledge_admin.list_documents()
+    knowledge_admin.export_documents()
+    assert lock.entries == 2 and lock.exits == 2
+    print("✓ 列表 / 导出持有写锁")
+
+
+def test_update_group_leftover_reported_when_delete_fails(monkeypatch):
+    """整组替换逐条删旧分片：某片失败时其余照常删除，失败项单独报告。"""
+    from pathlib import Path
+
+    def _meta(part):
+        return json.dumps({"part": str(part), "parts": "3", "group": "g-old"})
+
+    rows = [
+        {"id": 1, "content": "第一段", "metadata": _meta(1)},
+        {"id": 2, "content": "第二段", "metadata": _meta(2)},
+        {"id": 3, "content": "第三段", "metadata": _meta(3)},
+    ]
+
+    class _FlakyClient(_FakeMilvusClient):
+        def delete(self, collection_name, ids):
+            if 3 in ids:
+                raise RuntimeError("delete boom")
+            super().delete(collection_name, ids)
+
+    fake_client = _FlakyClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def update_document(self, doc_id, content, metadata):
+            return {"status": "success", "id": doc_id}
+
+        def add_documents(self, documents):
+            return {"status": "success", "ids": [10], "total_count": 1}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    result = knowledge_admin.update_document(2, "长" * 1000)
+    assert result["removed_ids"] == [1], "其余旧分片应照常删除"
+    assert result["leftover_ids"] == [3], "删除失败的旧分片要单独报告"
+    assert fake_client.deleted == [1]
+    print("✓ 整组替换删除失败的旧分片单独报告")
+
+
 def test_get_document_group_returns_joined_content(monkeypatch):
     """整组回填：按 part 顺序拼接整篇文档；单条返回自身；不存在返回 None。"""
     rows = [
@@ -1208,6 +1371,12 @@ if __name__ == "__main__":
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_raises,
+        test_add_document_enforces_doc_size_limit,
+        test_update_document_enforces_joined_size_limit,
+        test_import_restore_many_short_parts_not_rejected,
+        test_import_restore_rejects_padded_join,
+        test_list_and_export_hold_write_lock,
+        test_update_group_leftover_reported_when_delete_fails,
         test_import_rejects_incomplete_group,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,

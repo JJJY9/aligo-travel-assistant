@@ -395,6 +395,28 @@ def test_add_and_update_failures(monkeypatch):
     print("✓ kb-add / kb-update 失败路径与更新成功")
 
 
+def test_update_reports_leftover_parts(monkeypatch):
+    """整组替换有旧分片没删掉时，CLI 要把残留 id 提示出来。"""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "update_document",
+        lambda doc_id, content, metadata=None: {
+            "status": "success",
+            "id": doc_id,
+            "leftover_ids": [8, 9],
+        },
+    )
+    doc = Path(tempfile.mkdtemp()) / "doc.txt"
+    doc.write_text("新内容", encoding="utf-8")
+    code, out = _capture(cli.run_knowledge_update_standalone, 7, str(doc))
+    assert code == 0 and "已更新知识片段 #7" in out
+    assert "2 个旧分片删除失败" in out and "8, 9" in out
+
+
 def test_kb_write_args_and_dispatch(monkeypatch):
     assert cli._parse_kb_write_args(["a.txt"]) == (["a.txt"], {})
     assert cli._parse_kb_write_args(

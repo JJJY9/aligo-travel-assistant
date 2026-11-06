@@ -1944,6 +1944,10 @@ def run_knowledge_update_standalone(
     parts = int(result.get("parts") or 1)
     suffix = f"，拆分为 {parts} 片" if parts > 1 else ""
     print(f"已更新知识片段 #{doc_id}{suffix}")
+    leftover = result.get("leftover_ids") or []
+    if leftover:
+        ids = ", ".join(str(item) for item in leftover)
+        print(f"注意：{len(leftover)} 个旧分片删除失败（id：{ids}），可稍后重试删除")
     return 0
 
 
