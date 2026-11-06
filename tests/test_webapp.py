@@ -2514,9 +2514,39 @@ def test_prometheus_metrics_endpoint():
         assert "aligo_sessions_cached" in text
         assert "aligo_rate_limit_degraded 0" in text
         assert 'aligo_rate_limit_backend{backend="memory"} 1' in text
+        assert 'aligo_storage_backend{short_term="memory",long_term="json"} 1' in text
+        assert "aligo_short_term_degraded 0" in text
+        assert "aligo_long_term_degraded 0" in text
+        assert "aligo_tombstones_shared 0" in text
         print("✓ /metrics Prometheus 文本指标")
     finally:
         REQUEST_METRICS.reset()
+
+
+def test_prometheus_storage_gauges_reflect_state(monkeypatch):
+    """存储后端 / 降级 / 共享墓碑状态要反映实际值，而不是固定 0。"""
+    from webapp import server as server_module
+
+    client = _client()
+    monkeypatch.setattr(
+        server_module,
+        "describe_backends",
+        lambda: {
+            "short_term": "redis",
+            "long_term": "json",
+            "short_term_configured": True,
+            "long_term_configured": True,
+            "short_term_degraded": True,
+            "long_term_degraded": True,
+        },
+    )
+    client.app.state.aligo._tombstones_shared = True
+    text = client.get("/metrics").text
+    assert 'aligo_storage_backend{short_term="redis",long_term="json"} 1' in text
+    assert "aligo_short_term_degraded 1" in text
+    assert "aligo_long_term_degraded 1" in text
+    assert "aligo_tombstones_shared 1" in text
+    print("✓ /metrics 存储后端 / 降级 / 墓碑指标反映实际状态")
 
 
 def test_metrics_endpoint_not_in_snapshot_before_recording():
@@ -4716,6 +4746,12 @@ if __name__ == "__main__":
     test_ics_handles_overflow_end_date()
     test_request_id_header()
     test_metrics_api()
+    test_prometheus_metrics_endpoint()
+    _mp_metrics_gauges = pytest.MonkeyPatch()
+    try:
+        test_prometheus_storage_gauges_reflect_state(_mp_metrics_gauges)
+    finally:
+        _mp_metrics_gauges.undo()
     test_metrics_endpoint_not_in_snapshot_before_recording()
     test_security_headers()
     test_lock_table_is_bounded()

@@ -597,7 +597,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态 |
 | GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态）与限流后端信息 |
-| GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话；多实例分别采集） |
+| GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
