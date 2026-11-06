@@ -229,17 +229,31 @@ _PENDING_JOURNALS_MAX = 2048
 
 
 def _evict_journal_locked() -> None:
-    """注册表满时淘汰一条日志（调用方持有注册表锁）。"""
+    """注册表满时淘汰一条日志（调用方持有注册表锁）。
+
+    按「空日志 → 只含新增的日志 → 任意日志」的顺序淘汰：删除类操作丢失会
+    让已清空 / 已删除的轮次在恢复后复活，放到最后才牺牲。
+    """
     for stale_key, stale in _PENDING_JOURNALS.items():
-        if not stale.ops and stale.lock.acquire(blocking=False):
+        if stale.lock.acquire(blocking=False):
+            if not stale.ops:
+                del _PENDING_JOURNALS[stale_key]
+                stale.lock.release()
+                return
             stale.lock.release()
-            del _PENDING_JOURNALS[stale_key]
-            return
+    for stale_key, stale in list(_PENDING_JOURNALS.items()):
+        if stale.lock.acquire(blocking=False):
+            only_adds = all(kind == "add" for kind, _ in stale.ops)
+            if only_adds:
+                del _PENDING_JOURNALS[stale_key]
+                stale.lock.release()
+                return
+            stale.lock.release()
     for stale_key, stale in list(_PENDING_JOURNALS.items()):
         if stale.lock.acquire(blocking=False):
             dropped = len(stale.ops)
-            stale.lock.release()
             del _PENDING_JOURNALS[stale_key]
+            stale.lock.release()
             logger.warning(
                 "短期记忆故障操作日志过多，丢弃最旧会话的 %s 条待重放操作",
                 dropped,
@@ -291,8 +305,20 @@ def discard_pending_ops(key: str) -> int:
     with journal.lock:
         dropped = len(journal.ops)
         journal.ops.clear()
-    _drop_idle_journal(key, journal)
+        # 持锁时判空并移除：释放锁后再移除会把并发追加的操作一起丢掉
+        _drop_idle_journal(key, journal)
     return dropped
+
+
+def queue_clear(key: str) -> None:
+    """登记一次整键删除（会话删除时 Redis 清理失败的后备）。
+
+    与 ``clear()`` 的故障路径一致：清空覆盖此前所有变更，恢复后由该会话
+    的下一次访问重放；墓碑过期后复用同一 session_id 不会读到旧对话。
+    """
+    with _pending_journal(key) as journal:
+        journal.ops.clear()
+        journal.ops.append(("clear", None))
 
 
 class ShortTermMemory:
@@ -468,16 +494,27 @@ class RedisShortTermMemory:
             # 清空会覆盖之前所有变更，旧操作不再需要重放
             journal.ops.clear()
         journal.ops.append((kind, payload))
-        add_cap = max(64, self.max_turns * 8)
+        cap = max(64, self.max_turns * 8)
         add_indexes = [
             i for i, (op_kind, _) in enumerate(journal.ops) if op_kind == "add"
         ]
-        excess = len(add_indexes) - add_cap
-        # 只丢最旧的新增项：恢复后的窗口内容仍与全程在线写入一致。删除类
-        # 操作（clear / truncate / remove）不能丢，否则恢复后会复活已清空
-        # 或已删除的轮次；注册表总量由 _PENDING_JOURNALS_MAX 兜底
-        for index in reversed(add_indexes[: max(excess, 0)]):
+        # 只丢最旧的新增项：恢复后的窗口内容仍与全程在线写入一致
+        for index in reversed(add_indexes[: max(len(add_indexes) - cap, 0)]):
             del journal.ops[index]
+        # 删除类操作单独限额（clear 是「覆盖此前全部变更」的单条记录，不参与
+        # 裁剪）：极端情况下丢一条最旧的删除可能复活一轮已删除对话，但没有
+        # 上限会让单个会话在长时间故障中无界占用内存
+        delete_indexes = [
+            i for i, (op_kind, _) in enumerate(journal.ops)
+            if op_kind in ("truncate", "remove")
+        ]
+        excess = len(delete_indexes) - cap
+        if excess > 0:
+            logger.warning(
+                "短期记忆故障操作日志过多，丢弃 %s 条最早的删除操作", excess
+            )
+            for index in reversed(delete_indexes[:excess]):
+                del journal.ops[index]
 
     def _op_marker_key(self, op_id: str) -> str:
         """截断脚本的一次性标记键（与删除在同一脚本里原子写入）。"""
@@ -550,20 +587,19 @@ class RedisShortTermMemory:
             return fallback_result, False
         fallback_result: Any = None
         fallback_done = False
-        failure_recorded = False
         try:
             with _pending_journal(self.key) as journal:
-                self._replay_ops(journal.ops)
                 try:
+                    self._replay_ops(journal.ops)
                     result = operation()
                 except Exception:
                     # 先执行回退（截断需要知道影子缓存里具体删了哪些消息），
-                    # 再在锁内登记失败操作，最后交给外层统一冷却与返回
+                    # 再在锁内登记失败操作；重放中途失败时本次操作还没发出，
+                    # 但影子缓存里已删除的轮次同样必须登记，否则恢复后复活
                     fallback_result = fallback()
                     fallback_done = True
                     if on_failure is not None:
                         on_failure(journal)
-                        failure_recorded = True
                     raise
                 if not journal.ops:
                     _drop_idle_journal(self.key, journal)
@@ -575,14 +611,7 @@ class RedisShortTermMemory:
                 int(_REDIS_RETRY_COOLDOWN_SEC),
             )
             if not fallback_done:
-                # 重放中途失败时本次操作还没发出，但影子缓存仍需回退
                 fallback_result = fallback()
-                fallback_done = True
-            if on_failure is not None and not failure_recorded:
-                # 重放失败导致本次操作未执行也要登记：否则影子缓存里已删掉
-                # 的轮次永远不会从 Redis 删除（恢复后照样复活）
-                with _pending_journal(self.key) as journal:
-                    on_failure(journal)
             return fallback_result, False
         _redis_degraded_until = 0.0
         return result, True
@@ -618,12 +647,28 @@ class RedisShortTermMemory:
                 payload,
             )
 
-        self._call_redis(
+        _, via_redis = self._call_redis(
             op,
             lambda: None,
             lambda journal: self._append_op(journal, "add", (payload, op_id)),
         )
+        if via_redis:
+            # 成功拿到响应后 op_id 不会再被重放，从 applied 集合移除：集合
+            # 只保留「写入结果不确定」的少量条目，不随消息总量增长
+            self._forget_applied(op_id)
         logger.debug("Added message to Redis short-term memory: %s", role)
+
+    def _forget_applied(self, op_id: str) -> None:
+        try:
+            self.client.srem(applied_key(self.key), op_id)
+        except Exception:  # noqa: BLE001 - 清理失败只留下一条无用记录
+            logger.debug("清理 applied 记录失败：%s", self.key)
+
+    def _forget_marker(self, op_id: str) -> None:
+        try:
+            self.client.delete(self._op_marker_key(op_id))
+        except Exception:  # noqa: BLE001 - 标记带 TTL，清理失败也会自动过期
+            logger.debug("清理截断标记失败：%s", self.key)
 
     def get_recent_context(self, n_turns: int | None = None) -> list[dict[str, Any]]:
         def op() -> list[dict[str, Any]]:
@@ -717,6 +762,10 @@ class RedisShortTermMemory:
             on_failure,
         )
         count = int(raw or 0)
+        if via_redis:
+            # 已拿到响应，标记不会再被重放使用；删除后键空间只保留失败
+            # 场景的少量标记（未删除的成功会随 TTL 过期）
+            self._forget_marker(op_id)
         if via_redis and count:
             # Redis 删除成功时同步镜像缓存，避免 Redis 再故障时把已删除的
             # 一轮从影子缓存读回来

@@ -146,7 +146,7 @@ class _FlakyRedis:
         self.fail = False
         self.fail_after_apply = False
         self.data: list[str] = []
-        self.applied: set[str] = set()
+        self.applied: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
         self.pipeline_calls = 0
         self.eval_calls = 0
@@ -206,9 +206,28 @@ class _FlakyRedis:
 
     def delete(self, *keys):
         self._check()
-        self.data.clear()
-        self.applied.clear()
+        for key in keys:
+            if key.endswith(":applied"):
+                self.applied.pop(key, None)
+            elif ":op:" in key:
+                self.markers.pop(key, None)
+            else:
+                self.data.clear()
         return len(keys)
+
+    def srem(self, key, *members):
+        self._check()
+        bucket = self.applied.get(key)
+        if bucket is None:
+            return 0
+        removed = 0
+        for member in members:
+            if member in bucket:
+                bucket.remove(member)
+                removed += 1
+        if not bucket:
+            self.applied.pop(key, None)
+        return removed
 
     def eval(self, script, numkeys, *keys_and_args):
         """按 redis-py 的 eval(script, numkeys, *keys_and_args) 解析。"""
@@ -218,13 +237,14 @@ class _FlakyRedis:
         args = list(keys_and_args[numkeys:]) or [""]
         if "SADD" in script:
             # 幂等追加：按 op_id 去重后 RPUSH，窗口裁剪与 TTL 略去
+            applied = self.applied.setdefault(keys[1], set())
             window = int(args[0])
             pushed = 0
             for index in range(2, len(args) - 1, 2):
                 op_id, payload = args[index], args[index + 1]
-                if op_id in self.applied:
+                if op_id in applied:
                     continue
-                self.applied.add(op_id)
+                applied.add(op_id)
                 self.data.append(payload)
                 pushed += 1
             if pushed:
@@ -650,8 +670,8 @@ def test_delete_ops_cap_does_not_drop_new_adds(monkeypatch):
         assert sum(1 for kind, _ in ops if kind == "add") == 1, (
             "新增消息不能被删除类操作挤掉"
         )
-        assert sum(1 for kind, _ in ops if kind == "truncate") == 300, (
-            "删除类操作不能丢（丢了会复活已删除的轮次）"
+        assert sum(1 for kind, _ in ops if kind == "truncate") == 64, (
+            "删除类操作应有独立上限（默认 max(64, max_turns*8)）"
         )
     finally:
         with module._PENDING_JOURNALS_LOCK:
@@ -804,6 +824,149 @@ def test_discard_pending_ops_clears_shared_journal(monkeypatch):
     print("✓ discard_pending_ops 清空会话排队操作")
 
 
+def test_applied_set_does_not_grow_with_normal_adds(monkeypatch):
+    """成功写入后 op_id 从 applied 集合移除，集合大小不随正常消息量增长。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _EvalApplyThenFailRedis()
+    memory = module.RedisShortTermMemory(client, "s-applied", max_turns=5, user_id="u1")
+    for index in range(20):
+        memory.add_message("user" if index % 2 == 0 else "assistant", f"m{index}")
+    bucket = client.applied.get(module.applied_key(memory.key), set())
+    assert bucket == set(), "成功写入的 op_id 应立即清理"
+
+    client.fail_after_apply = True
+    memory.add_message("user", "响应丢失")
+    bucket = client.applied.get(module.applied_key(memory.key), set())
+    assert len(bucket) == 1, "响应丢失的 op_id 需要保留用于去重"
+    print("✓ applied 集合只保留不确定结果的消息")
+
+
+def test_truncate_marker_cleaned_after_success(monkeypatch):
+    """成功截断后一次性标记被删除；响应丢失时标记保留供重放使用。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-marker2", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    assert memory.truncate_last_turn("Q1") == 2
+    assert client.markers == {}, "成功截断后标记应被清理"
+
+    memory.add_message("user", "Q2")
+    memory.add_message("assistant", "A2")
+    client = _EvalApplyThenFailRedis()
+    memory = module.RedisShortTermMemory(client, "s-marker3", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    client.fail_after_apply = True
+    assert memory.truncate_last_turn("Q1") == 2  # 回退到影子缓存删除
+    assert len(client.markers) == 1, "响应丢失时标记保留（只在拿到响应后清理）"
+    print("✓ 截断标记成功即清理、失败时保留")
+
+
+def test_queue_clear_replays_on_next_access(monkeypatch):
+    """会话删除时 Redis 清理失败会登记整键删除，下次访问先重放它。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-qclear", max_turns=5, user_id="u1")
+    memory.add_message("user", "旧对话")
+    module.queue_clear(memory.key)
+    reader = module.RedisShortTermMemory(client, "s-qclear", max_turns=5, user_id="u1")
+    assert reader.get_recent_context() == []
+    print("✓ queue_clear 在下次访问时重放删除")
+
+
+def test_clear_short_term_session_discards_and_clears_applied(monkeypatch):
+    """删除会话丢弃排队操作并清理 applied 集合（复用 session_id 不重放旧内容）。"""
+    from context import short_term_memory as module
+    from context import storage
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "redis_url", "redis://fake")
+    monkeypatch.setattr(storage, "_get_redis_client", lambda url: client)
+    key = module.session_key("s-storage", "u-storage")
+    client.applied[module.applied_key(key)] = {"x"}
+    memory = module.RedisShortTermMemory(client, "s-storage", user_id="u-storage")
+    client.fail = True
+    memory.add_message("user", "待删除会话的内容")
+    assert memory._pending_ops
+
+    client.fail = False
+    storage.clear_short_term_session("s-storage", "u-storage")
+    assert memory._pending_ops == []
+    assert module.applied_key(key) not in client.applied
+    print("✓ 会话删除清理排队操作与 applied 集合")
+
+
+def test_clear_short_term_session_failure_queues_clear(monkeypatch):
+    """会话删除时 Redis 不可用：登记整键删除，恢复后旧对话不会复活。"""
+    from context import short_term_memory as module
+    from context import storage
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [_message("user", "旧对话", "2000-01-01T00:00:00")]
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "redis_url", "redis://fake")
+    monkeypatch.setattr(storage, "_get_redis_client", lambda url: client)
+    client.fail = True
+    storage.clear_short_term_session("s-fail", "u-fail")
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    reader = module.RedisShortTermMemory(client, "s-fail", user_id="u-fail")
+    assert reader.get_recent_context() == []
+    print("✓ 会话删除失败时登记整键删除")
+
+
+def test_eviction_prefers_add_only_journals(monkeypatch):
+    """注册表满额时优先淘汰只含新增的日志，含删除操作的日志留到最后。"""
+    from context import short_term_memory as module
+
+    saved = dict(module._PENDING_JOURNALS)
+    try:
+        with module._PENDING_JOURNALS_LOCK:
+            module._PENDING_JOURNALS.clear()
+        with module._pending_journal("del-keep") as journal:
+            journal.ops.append(("clear", None))
+        for index in range(module._PENDING_JOURNALS_MAX - 1):
+            with module._pending_journal(f"adds-{index}") as journal:
+                journal.ops.append(("add", ("payload", "id")))
+        with module._pending_journal("newcomer"):
+            pass
+        assert "del-keep" in module._PENDING_JOURNALS, "含删除的日志应最后淘汰"
+        assert len(module._PENDING_JOURNALS) <= module._PENDING_JOURNALS_MAX
+    finally:
+        with module._PENDING_JOURNALS_LOCK:
+            module._PENDING_JOURNALS.clear()
+            module._PENDING_JOURNALS.update(saved)
+    print("✓ 淘汰优先选择只含新增的日志")
+
+
+def test_replay_failure_still_registers_current_add(monkeypatch):
+    """重放中途失败时本次新增也要登记，恢复后按顺序补写。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-replayfail", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "M1")
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory.add_message("user", "M2")
+    assert [kind for kind, _ in memory._pending_ops] == ["add", "add"]
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["M1", "M2"]
+    print("✓ 重放失败时本次操作仍登记")
+
+
 def test_pending_journal_registry_is_bounded(monkeypatch):
     """进程级日志注册表有总量上限，不会随会话数无界增长。"""
     from context import short_term_memory as module
@@ -831,7 +994,7 @@ def test_replay_batch_failure_retries_without_duplicates(monkeypatch):
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
-    client = _FlakyRedis()
+    client = _EvalApplyThenFailRedis()
     memory = module.RedisShortTermMemory(client, "s-retry", max_turns=5, user_id="u1")
     client.fail = True
     memory.add_message("user", "Q2")
