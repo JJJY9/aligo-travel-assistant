@@ -438,13 +438,15 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
 
 
 class KnowledgeImportPayload(BaseModel):
-    """批量导入知识片段（单次最多 200 条）。
+    """批量导入知识片段（单次最多 300 条）。
 
-    条目放宽为任意 JSON 值：非对象 / 空内容 / 超长字段由 import_documents
-    统一跳过或截断，避免一条不合规就让整个备份无法恢复（与 CLI 行为一致）。
+    面板按 200 条分批；多分片文档的 group 必须整组落在同一批，成组批次
+    最多放宽到 300（单组 ≤50 片）。条目放宽为任意 JSON 值：非对象 / 空
+    内容 / 超长字段由 import_documents 统一跳过或截断，避免一条不合规就
+    让整个备份无法恢复（与 CLI 行为一致）。
     """
 
-    documents: list[Any] = Field(min_length=1, max_length=200)
+    documents: list[Any] = Field(min_length=1, max_length=300)
 
 
 class KnowledgeImportPreviewPayload(BaseModel):

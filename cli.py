@@ -13,17 +13,9 @@ sys.path.insert(0, project_root)
 
 import json
 
-# 导入系统组件
-from rich.console import Console
-from rich.markup import escape
-from rich.prompt import Prompt
-from rich.table import Table
-
-from agents.intention_agent import IntentionAgent
-from agents.orchestration_agent import OrchestrationAgent
+# 轻量组件直接导入；运行时组件（agentscope / rich / 模型）单独保护：
+# doctor / skills 等诊断命令必须在这些依赖缺失时仍能启动并如实报告缺失项
 from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
-from config_agentscope import create_chat_model, init_agentscope
-from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.llm_resilience import retry_with_backoff
@@ -32,6 +24,24 @@ from utils.preference_values import has_preference_value
 from utils.progress import format_progress_event
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.version import APP_VERSION
+
+_RUNTIME_IMPORT_ERROR: Exception | None = None
+try:
+    from rich.console import Console
+    from rich.markup import escape
+    from rich.prompt import Prompt
+    from rich.table import Table
+
+    from agents.intention_agent import IntentionAgent
+    from agents.orchestration_agent import OrchestrationAgent
+    from config_agentscope import create_chat_model, init_agentscope
+    from context.memory_manager import MemoryManager
+except Exception as exc:  # noqa: BLE001 - 依赖缺失时诊断命令仍要能运行
+    _RUNTIME_IMPORT_ERROR = exc
+    Console = escape = Prompt = Table = None  # type: ignore[assignment,misc]
+    IntentionAgent = OrchestrationAgent = None  # type: ignore[assignment,misc]
+    create_chat_model = init_agentscope = None  # type: ignore[assignment]
+    MemoryManager = None  # type: ignore[assignment,misc]
 
 # 移除其他智能体的导入，改用懒加载
 
@@ -1043,9 +1053,16 @@ def run_doctor_standalone(
             )
         )
         return 1 if failed else 0
-    Console().print(build_report_table(results))
-    text, style = summarize(results)
-    Console().print(text, style=style)
+    if Console is not None:
+        Console().print(build_report_table(results))
+        text, style = summarize(results)
+        Console().print(text, style=style)
+    else:
+        # rich 缺失时退回纯文本：依赖缺失本身也要能被如实看到
+        for item in results:
+            print(f"[{item.status}] {item.name}: {item.detail}")
+        text, _style = summarize(results)
+        print(text)
     return 1 if failed else 0
 
 
@@ -1435,6 +1452,20 @@ def run_knowledge_list_standalone(query: str = "", limit: int = 50) -> int:
             chunk = f" · 分片 {meta.get('part') or '?'}/{parts}"
         print(f"  #{item['id']}{tag}{chunk}  {preview}")
     return 0
+
+
+def _parse_cli_int(value: str) -> int | None:
+    """ASCII 十进制整数解析（用于 <id> / limit 参数）。
+
+    ``str.isdigit()`` 对 '²' 等 Unicode 数字返回 True，直接 int() 会抛
+    ValueError；超长数字串（>4300 位）在 Python 3.12 也会被拒绝。
+    """
+    if not value.isascii() or not value.isdigit():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> int:
@@ -2290,9 +2321,9 @@ def main():
             sys.exit(run_knowledge_list_standalone(keywords))
         if arg == "kb-delete":
             args = sys.argv[2:]
+            doc_id = _parse_cli_int(args[0]) if args else None
             if (
-                not args
-                or not args[0].isdigit()
+                doc_id is None
                 or len(args) > 2
                 or any(extra != "--group" for extra in args[1:])
             ):
@@ -2300,17 +2331,21 @@ def main():
                 sys.exit(2)
             sys.exit(
                 run_knowledge_delete_standalone(
-                    int(args[0]), whole_group="--group" in args[1:]
+                    doc_id, whole_group="--group" in args[1:]
                 )
             )
         if arg == "kb-duplicates":
             args = sys.argv[2:]
-            if len(args) > 1 or (args and not args[0].isdigit()):
-                print("用法：python cli.py kb-duplicates [limit]（0 显示全部，默认 20）")
-                sys.exit(2)
-            sys.exit(
-                run_knowledge_duplicates_standalone(int(args[0]) if args else 20)
-            )
+            limit = 20
+            if args:
+                parsed = _parse_cli_int(args[0])
+                if parsed is None or len(args) > 1:
+                    print(
+                        "用法：python cli.py kb-duplicates [limit]（0 显示全部，默认 20）"
+                    )
+                    sys.exit(2)
+                limit = parsed
+            sys.exit(run_knowledge_duplicates_standalone(limit))
         if arg == "preferences":
             if len(sys.argv) != 3 or sys.argv[2].startswith("-"):
                 print("用法：python cli.py preferences <user_id>")
@@ -2449,6 +2484,12 @@ def main():
         print(_COMMANDS_HINT)
         print("不带参数进入交互模式；--version 查看版本")
         sys.exit(2)
+    # 交互模式需要完整运行时依赖（agentscope / rich / 模型配置）
+    if _RUNTIME_IMPORT_ERROR is not None:
+        print(f"缺少运行时依赖：{_RUNTIME_IMPORT_ERROR}")
+        print("请先安装依赖（pip install -r requirements.txt 或 pip install -e .）后重试")
+        sys.exit(1)
+
     cli = AligoCLI()
     try:
         asyncio.run(cli.run())

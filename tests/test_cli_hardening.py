@@ -130,6 +130,28 @@ def test_kb_import_accepts_utf8_bom(monkeypatch):
     print("✓ kb-import 兼容 UTF-8 BOM")
 
 
+def test_doctor_falls_back_without_rich(monkeypatch):
+    """rich 缺失时 doctor 退回纯文本输出（诊断命令不依赖渲染库）。"""
+    from utils import doctor as doctor_module
+
+    async def fake_run(include_network=True):
+        return [
+            doctor_module.CheckResult("Python 版本", doctor_module.STATUS_OK, "3.12"),
+            doctor_module.CheckResult("rich", doctor_module.STATUS_FAIL, "缺失"),
+        ]
+
+    monkeypatch.setattr(doctor_module, "run_doctor", fake_run)
+    monkeypatch.setattr(cli, "Console", None)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_doctor_standalone(as_json=False)
+    text = out.getvalue()
+    assert code == 1
+    assert "[fail] rich: 缺失" in text
+    assert "存在必须处理的问题" in text
+    print("✓ rich 缺失时 doctor 退回纯文本")
+
+
 if __name__ == "__main__":
     for case in (
         test_unknown_command_exits_2,
@@ -139,6 +161,7 @@ if __name__ == "__main__":
         test_safe_export_user_is_unique,
         test_print_stdout_swallows_broken_pipe,
         test_kb_import_accepts_utf8_bom,
+        test_doctor_falls_back_without_rich,
     ):
         mp = pytest.MonkeyPatch()
         try:

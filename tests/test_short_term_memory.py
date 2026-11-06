@@ -166,6 +166,10 @@ class _FlakyRedis:
             def expire(self, key, ttl):
                 client._check()
 
+            def delete(self, key):
+                client._check()
+                client.data.clear()
+
             def execute(self):
                 client._check()
 
@@ -292,6 +296,10 @@ class _ApplyThenFailRedis(_FlakyRedis):
             def expire(self, key, ttl):
                 client._check()
 
+            def delete(self, key):
+                client._check()
+                client.data.clear()
+
             def execute(self):
                 client._check()
                 if client.fail_after_apply:
@@ -344,6 +352,56 @@ def test_replay_dedupes_committed_payload(monkeypatch):
     print("✓ 补写按已提交内容去重（至少一次语义不重复）")
 
 
+def test_outage_truncate_rewrites_on_recovery(monkeypatch):
+    """故障期间删除的轮次不能在恢复后从 Redis 复活（按影子整体重写）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    for role, content in [
+        ("user", "Q1"),
+        ("assistant", "A1"),
+        ("user", "Q2"),
+        ("assistant", "A2"),
+    ]:
+        memory.add_message(role, content)
+
+    client.fail = True
+    assert memory.truncate_last_turn("Q2") == 2
+    assert [item["content"] for item in memory.get_recent_context()] == ["Q1", "A1"]
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    messages = memory.get_recent_context()
+    assert [item["content"] for item in messages] == ["Q1", "A1"], (
+        "恢复后已删除的轮次不能从 Redis 复活"
+    )
+    assert len(client.data) == 2
+    print("✓ 故障期截断在恢复后整体重写")
+
+
+def test_outage_clear_rewrites_on_recovery(monkeypatch):
+    """故障期间清空的会话不能在恢复后从 Redis 复活。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    client.fail = True
+    memory.clear()
+    assert client.data, "故障期内 Redis 里的旧内容无法删除"
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == []
+    assert client.data == []
+    print("✓ 故障期清空在恢复后整体重写")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
@@ -385,6 +443,16 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_replay_dedupes_committed_payload(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_truncate_rewrites_on_recovery(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_clear_rewrites_on_recovery(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")

@@ -141,6 +141,29 @@ def test_webapp_with_redis_short_term(monkeypatch):
         finally:
             client.delete(probe.key)
 
+        # UTF-8 空白归一：全角空格 / 不间断空格视为一致（Python strip 与
+        # Lua 裁剪必须同一字符集）；以 0xA0 / 0x80 等字节结尾的汉字不能被
+        # 误裁（旧实现把字节写进 Lua 字符类，会截断最后一个字节）
+        utf8_probe = RedisShortTermMemory(
+            client, f"redis-utf8-{uuid.uuid4().hex[:8]}", user_id=user_id
+        )
+        try:
+            utf8_probe.add_message("user", "全角空格结尾　")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("全角空格结尾") == 2
+
+            utf8_probe.add_message("user", "不间断空格结尾 ")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("不间断空格结尾") == 2
+
+            # 丠 U+4E20 → UTF-8 E4 B8 A0（以 0xA0 结尾）
+            utf8_probe.add_message("user", "提问丠")
+            utf8_probe.add_message("assistant", "A")
+            assert utf8_probe.truncate_last_turn("提问丠") == 2
+            assert client.exists(utf8_probe.key) == 0
+        finally:
+            client.delete(utf8_probe.key)
+
         # 同一 session_id 的不同用户使用不同键，互不影响
         shared_session = f"redis-shared-{uuid.uuid4().hex[:8]}"
         alice = RedisShortTermMemory(client, shared_session, user_id="alice")
