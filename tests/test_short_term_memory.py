@@ -155,6 +155,57 @@ def test_redis_recovery_resets_degraded(monkeypatch):
     print("✓ Redis 恢复后清除降级标记")
 
 
+def test_none_client_recovers_via_factory(monkeypatch):
+    """构造时拿不到客户端（工厂冷却）：恢复后自动重新接入共享 Redis。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = object()
+    state = {"calls": 0}
+
+    def factory():
+        state["calls"] += 1
+        return client if state["calls"] >= 2 else None
+
+    memory = module.RedisShortTermMemory(
+        None, "s-factory", user_id="u-factory", client_factory=factory
+    )
+    result, used = memory._call_redis(lambda: "ok", lambda: "fb")
+    assert (result, used) == ("fb", False), "工厂未恢复：走影子缓存"
+    assert module.redis_short_term_degraded() is False, (
+        "没有客户端不应置位进程级降级标志（会拖累其它健康会话）"
+    )
+    result, used = memory._call_redis(lambda: "ok", lambda: "fb")
+    assert (result, used) == ("ok", True)
+    assert memory.client is client
+    print("✓ client=None 的实例在工厂恢复后重新接入")
+
+
+def test_broken_client_re_resolved_after_failure(monkeypatch):
+    """有工厂时操作失败丢弃坏客户端：冷却结束经由工厂拿到健康客户端。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    healthy = object()
+    memory = module.RedisShortTermMemory(
+        _BrokenRedis(),
+        "s-heal",
+        user_id="u-heal",
+        client_factory=lambda: healthy,
+    )
+
+    def broken_op():
+        raise ConnectionError("redis down")
+
+    memory._call_redis(broken_op, lambda: "fb")
+    assert memory.client is None, "失败后应丢弃坏客户端"
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    result, used = memory._call_redis(lambda: "ok", lambda: "fb")
+    assert (result, used) == ("ok", True)
+    assert memory.client is healthy
+    print("✓ 故障后经工厂重新解析客户端")
+
+
 class _FlakyRedis:
     """可切换故障的假 Redis（实现短期记忆用到的最小命令集）。"""
 
@@ -1338,4 +1389,13 @@ if __name__ == "__main__":
         test_outage_clear_rewrites_on_recovery(_mp)
     finally:
         _mp.undo()
+    for case in (
+        test_none_client_recovers_via_factory,
+        test_broken_client_re_resolved_after_failure,
+    ):
+        _case_mp = __import__("pytest").MonkeyPatch()
+        try:
+            case(_case_mp)
+        finally:
+            _case_mp.undo()
     print("\n全部通过")

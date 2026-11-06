@@ -1176,18 +1176,28 @@ def _get_weather_executor() -> ThreadPoolExecutor:
 # ---------- 长期记忆读取 ----------
 
 
-def _open_long_term(user_id: str) -> Any:
+def _open_long_term(user_id: str, strict: bool = False) -> Any:
     """按当前配置打开长期记忆（JSON 或 PostgreSQL）。
 
-    注意：PostgreSQL 连接失败时存储工厂会按既有降级策略回退到本地 JSON，
-    不会走到这里的异常分支；这里兜住的是其余打开失败（文件损坏 / 依赖缺失
-    等），统一映射为可重试的 503，避免所有调用点都抛裸 500。调用点仍负责
-    关闭返回的 store。
+    ``strict=True`` 用于删除等破坏性操作：配置了 PostgreSQL 但当前不可用
+    （连接失败 / 失败冷却期）时工厂抛 ``MemoryPersistenceError``（不回退
+    JSON），这里映射为可重试的 503——在回退库上「删除成功」会留下
+    PostgreSQL 里的数据，恢复后会话 / 消息重新出现。
+
+    非 strict 时 PostgreSQL 连接失败按既有降级策略回退本地 JSON，不会走到
+    这里的异常分支；这里兜住的是其余打开失败（文件损坏 / 依赖缺失等），
+    统一映射为可重试的 503，避免所有调用点都抛裸 500。调用点仍负责关闭
+    返回的 store。
     """
     try:
-        return create_long_term_memory(user_id, str(MEMORY_DIR))
+        return create_long_term_memory(user_id, str(MEMORY_DIR), strict=strict)
     except HTTPException:
         raise
+    except MemoryPersistenceError as exc:
+        logger.warning("打开长期记忆失败（%s，strict）：%s", user_id, exc)
+        raise HTTPException(
+            status_code=503, detail="存储暂时不可用，请稍后再试"
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
         logger.warning("打开长期记忆失败（%s）：%s", user_id, exc)
         raise HTTPException(status_code=503, detail=f"存储暂不可用：{exc}") from exc
@@ -2039,7 +2049,10 @@ def create_app(model: Any = None) -> FastAPI:
         pref_type: str = ApiPath(..., pattern=_PREF_TYPE_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
-        store = _open_long_term(user_id)
+        """删除一条用户偏好（记忆面板的手动维护入口）。"""
+        # 删除是破坏性操作：PostgreSQL 不可用时不能静默作用在回退 JSON 上
+        # （恢复后偏好会「复活」），strict 打开会返回 503
+        store = _open_long_term(user_id, strict=True)
         try:
             removed = store.delete_preference(pref_type)
         except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
@@ -2264,7 +2277,9 @@ def create_app(model: Any = None) -> FastAPI:
         """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
         async with state.lock_for(user_id):
             def _exists() -> bool:
-                store = _open_long_term(user_id)
+                # 破坏性操作：PostgreSQL 不可用时 strict 打开返回 503，
+                # 不能在回退 JSON 上判断「不存在」并撤销墓碑
+                store = _open_long_term(user_id, strict=True)
                 try:
                     return bool(store.get_chat_history(session_id=session_id))
                 finally:
@@ -2296,7 +2311,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
 
             def _delete() -> int:
-                store = _open_long_term(user_id)
+                store = _open_long_term(user_id, strict=True)
                 try:
                     return store.delete_chat_session(session_id)
                 finally:
@@ -2349,7 +2364,9 @@ def create_app(model: Any = None) -> FastAPI:
         """
         async with state.lock_for(user_id):
             def _remove_last_turn() -> int:
-                store = _open_long_term(user_id)
+                # 破坏性操作：PostgreSQL 不可用时 strict 打开返回 503，
+                # 不能在回退 JSON 上删除并谎报成功
+                store = _open_long_term(user_id, strict=True)
                 try:
                     return store.delete_last_turn(session_id, expect)
                 finally:
@@ -2854,7 +2871,9 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """删除一条历史行程（清理误记录）。"""
-        store = _open_long_term(user_id)
+        # 破坏性操作：PostgreSQL 不可用时不能静默作用在回退 JSON 上
+        # （恢复后行程会「复活」），strict 打开会返回 503
+        store = _open_long_term(user_id, strict=True)
         try:
             trips = store.get_trip_history(limit=None)
             if _ambiguous_trip_id(trips, trip_id):
