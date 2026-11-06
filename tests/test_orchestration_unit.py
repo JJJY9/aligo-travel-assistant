@@ -354,6 +354,127 @@ def test_memory_update_preference_and_trip():
     print("✓ 偏好覆盖/追加与行程写入正常")
 
 
+def test_memory_update_legacy_preferences_and_custom_backend():
+    """旧字典格式偏好，以及后端没有原子追加时的兜底合并。"""
+
+    class _CustomLongTerm:
+        """模拟没有 append_preference 的自定义后端。"""
+
+        def __init__(self):
+            self.preferences: dict[str, object] = {}
+
+        def get_preference(self, pref_type=None):
+            if pref_type is None:
+                return dict(self.preferences)
+            return self.preferences.get(pref_type)
+
+        def save_preference(self, pref_type, value):
+            self.preferences[pref_type] = value
+
+    memory = _StubMemory()
+    memory.long_term = _CustomLongTerm()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+    # 旧格式：preferences 是字典，跳过 has_preferences / error / 空值
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": {
+                            "home_location": "上海",
+                            "has_preferences": True,
+                            "error": "x",
+                            "empty": "",
+                        }
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference() == {"home_location": "上海"}
+
+    # 无原子追加：字符串 + 新值 → 列表
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "home_location",
+                                "value": "北京",
+                                "action": "append",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference("home_location") == ["上海", "北京"]
+
+    # 追加已存在的值不产生重复
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "home_location",
+                                "value": "北京",
+                                "action": "add",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference("home_location") == ["上海", "北京"]
+
+    # 字符串与新值相同：生成单元素列表而不是重复
+    same = _StubMemory()
+    same.long_term = _CustomLongTerm()
+    same.long_term.save_preference("seat_preference", "靠窗")
+    OrchestrationAgent(agent_registry={}, memory_manager=same)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "seat_preference",
+                                "value": "靠窗",
+                                "action": "append",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert same.long_term.get_preference("seat_preference") == ["靠窗"]
+    print("✓ 旧格式偏好字典 / 无原子追加后端兜底")
+
+
 def test_prepare_context_includes_user_query():
     """上下文携带用户本轮原话，供偏好等抽取使用。"""
     memory = _StubMemory()
@@ -744,6 +865,7 @@ if __name__ == "__main__":
     test_failed_itinerary_is_not_saved_as_trip()
     test_skill_folder_names_are_canonicalized()
     test_memory_update_preference_and_trip()
+    test_memory_update_legacy_preferences_and_custom_backend()
     test_prepare_context_includes_user_query()
     test_planning_runs_after_collection_and_sees_new_preferences()
     test_preference_append_action_variants()
