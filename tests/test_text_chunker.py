@@ -140,6 +140,28 @@ def test_heading_attached_to_unpunctuated_body():
     print("✓ 标题并入无句读长段落首块")
 
 
+def test_empty_and_whitespace_text():
+    assert split_text("") == []
+    assert split_text("   \n\n  ") == []
+
+
+def test_unpunctuated_sentence_hard_split():
+    """没有句读的超长单句按硬切分，长度受控且不丢字。"""
+    chunks = split_text("住" * 950, max_chars=100)
+    assert len(chunks) >= 9
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert "".join(chunks) == "住" * 950
+
+
+def test_title_only_text_becomes_single_chunk():
+    """整篇都是标题行时，合并结果仍是一块且内容完整。"""
+    chunks = split_text("商务差旅\n\n报销规定\n\n住宿标准")
+    assert len(chunks) == 1
+    joined = chunks[0]
+    for token in ("商务差旅", "报销规定", "住宿标准"):
+        assert token in joined
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -150,4 +172,7 @@ if __name__ == "__main__":
     test_title_only_run_respects_max_chars()
     test_heading_attached_to_long_body()
     test_heading_attached_to_unpunctuated_body()
+    test_empty_and_whitespace_text()
+    test_unpunctuated_sentence_hard_split()
+    test_title_only_text_becomes_single_chunk()
     print("\n全部通过")
