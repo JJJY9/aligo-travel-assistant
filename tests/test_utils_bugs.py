@@ -131,11 +131,67 @@ def test_extract_first_json_object_ignores_prose_braces():
     print("✓ extract_first_json_object 忽略说明文字中的花括号")
 
 
+def test_json_parse_repair_attempts():
+    """各修复尝试：控制字符 / 单引号 / 尾部逗号 / 字符串内换行 / 组合问题。"""
+    assert robust_json_parse('{"a": "bad\x01char"}') == {"a": "badchar"}
+    assert robust_json_parse("{'a': 'b'}") == {"a": "b"}
+    assert robust_json_parse('{"a": 1, "b": [2,],}') == {"a": 1, "b": [2]}
+    # 字符串里的裸换行属于控制字符：第 2 步清理会先把它删掉（保留拼接后的文本）
+    assert robust_json_parse('{"a": "line1\nline2"}') == {"a": "line1line2"}
+    # 组合问题：单引号 + 尾部逗号需要连续两步修复
+    assert robust_json_parse("{'a': 1, 'b': 2,}") == {"a": 1, "b": 2}
+    print("✓ JSON 多级修复尝试")
+
+
+def test_json_parse_no_json_without_fallback():
+    """没有花括号且未提供 fallback 时抛「No JSON found」。"""
+    try:
+        robust_json_parse("完全不是 JSON")
+    except ValueError as exc:
+        assert "No JSON found" in str(exc)
+    else:
+        raise AssertionError("应抛 ValueError")
+
+
+def test_extract_first_json_object_empty_text():
+    from utils.json_parser import extract_first_json_object
+
+    try:
+        extract_first_json_object("")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("空文本应抛 ValueError")
+
+
+def test_extract_response_text_remaining_shapes():
+    """对象形态的 content 为数字 / 无属性对象兜底。"""
+    from utils.json_parser import extract_response_text
+
+    class _NumericContent:
+        content = 7
+
+    assert extract_response_text(_NumericContent()) == "7"
+
+    class _Plain:
+        def __str__(self):
+            return "plain"
+
+    assert extract_response_text(_Plain()) == "plain"
+    print("✓ 响应文本提取的对象兜底形态")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_json_parse_fallback()
     test_json_parse_success_paths_unchanged()
+    test_json_parse_empty_dict_and_prose_braces()
+    test_json_parse_repair_attempts()
+    test_json_parse_no_json_without_fallback()
+    test_extract_response_text_shapes()
+    test_extract_response_text_remaining_shapes()
     test_extract_first_json_object_ignores_prose_braces()
+    test_extract_first_json_object_empty_text()
     test_increment_query_count_fresh_data()
     test_increment_query_count_legacy_data()
     print("\n全部通过")
