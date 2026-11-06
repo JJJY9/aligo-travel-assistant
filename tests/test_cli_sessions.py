@@ -78,11 +78,14 @@ def _sessions_store() -> _FakeStore:
     )
 
 
-def _run_list(user_id, archived=False, include_all=False):
+def _run_list(user_id, archived=False, include_all=False, query=""):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_sessions_list_standalone(
-            user_id, archived_only=archived, include_all=include_all
+            user_id,
+            archived_only=archived,
+            include_all=include_all,
+            query=query,
         )
     return code, buf.getvalue()
 
@@ -117,6 +120,24 @@ def test_lists_archived_and_all(monkeypatch):
     for sid in ("s-active", "s-pinned", "s-archived"):
         assert sid in out_all
     print("✓ --archived / --all 视图正确过滤")
+
+
+def test_list_filters_by_query(monkeypatch):
+    """--query 在标题与消息内容中匹配，命中时附带片段；归档范围遵循视图。"""
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_list("u1", query="行程")
+    assert code == 0
+    assert "s-pinned" in out and "s-active" not in out
+    assert "关键词：行程" in out
+    assert "> 行程规划问题" in out, "命中内容应附带片段"
+
+    code, out = _run_list("u1", query="回答 C")  # 只在归档会话里
+    assert code == 0 and "没有匹配" in out, out
+
+    code, out = _run_list("u1", query="回答 C", include_all=True)
+    assert code == 0 and "s-archived" in out
+    print("✓ sessions --query 按标题 / 内容过滤并附带片段")
 
 
 def test_session_list_converts_utc_timestamps(monkeypatch):
@@ -220,9 +241,14 @@ def test_pg_fallback_refused(monkeypatch):
 
 
 def test_flag_parsing_helpers():
-    assert cli._parse_sessions_flags([]) == (False, False)
-    assert cli._parse_sessions_flags(["--archived"]) == (True, False)
-    assert cli._parse_sessions_flags(["--ALL"]) == (False, True)
+    assert cli._parse_sessions_flags([]) == (False, False, "")
+    assert cli._parse_sessions_flags(["--archived"]) == (True, False, "")
+    assert cli._parse_sessions_flags(["--ALL"]) == (False, True, "")
+    assert cli._parse_sessions_flags(["--query", "住宿"]) == (False, False, "住宿")
+    assert cli._parse_sessions_flags(["--query=住宿"]) == (False, False, "住宿")
+    assert cli._parse_sessions_flags(["--query"]) is None
+    assert cli._parse_sessions_flags(["--query="]) is None
+    assert cli._parse_sessions_flags(["--query", "--all"]) is None
     assert cli._parse_sessions_flags(["--archived=true"]) is None
     assert cli._parse_sessions_flags(["--archivd"]) is None
     assert cli._parse_sessions_flags(["--archived", "--all"]) is None
@@ -327,6 +353,22 @@ def _run_export(user_id, session_id, target=None, to_stdout=False, force=False):
             force=force,
         )
     return code, buf.getvalue()
+
+
+def test_main_accepts_query_flag(monkeypatch):
+    """dispatch 层接受 --query 关键词并传给列表函数。"""
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "sessions", "u1", "--query", "住宿"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert "s-active" in buf.getvalue()
+    assert "s-pinned" not in buf.getvalue()
+    print("✓ dispatch 层 --query 正常执行")
 
 
 def test_session_export_to_file(monkeypatch):

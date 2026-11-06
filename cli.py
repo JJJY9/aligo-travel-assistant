@@ -1761,19 +1761,29 @@ def _session_summaries(store) -> list[dict]:
             title = " ".join(str(message.get("content", "")).split())
             if title:
                 entry["title"] = title[:40]
+        content = " ".join(str(message.get("content", "")).split())
+        if content:
+            entry.setdefault("_parts", []).append(content)
     for entry in grouped.values():
         entry["title"] = str(
             titles.get(entry["session_id"]) or entry["title"] or "新对话"
         )
         entry["pinned"] = entry["session_id"] in pinned
         entry["archived"] = entry["session_id"] in archived
+        # 标题 + 消息内容（已归一空白）供 --query 关键词过滤与命中片段
+        entry["_parts"] = [entry["title"], *entry.pop("_parts", [])]
     return sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
 
 
 def run_sessions_list_standalone(
-    user_id: str, archived_only: bool = False, include_all: bool = False
+    user_id: str,
+    archived_only: bool = False,
+    include_all: bool = False,
+    query: str = "",
 ) -> int:
-    """列出用户会话（用于 `python cli.py sessions <user_id> [--archived|--all]`）。
+    """列出用户会话（`python cli.py sessions <user_id> [--archived|--all] [--query 关键词]`）。
+
+    ``query`` 在标题与消息内容中做不区分大小写的包含匹配，命中时附带片段。
 
     Returns:
         0 列出成功（含无会话）；1 参数 / 读取失败
@@ -1800,6 +1810,18 @@ def run_sessions_list_standalone(
             close()
 
     archived_total = sum(1 for item in summaries if item["archived"])
+    total_all = len(summaries)
+    needle = query.strip().lower()
+    if needle:
+        matched = []
+        for item in summaries:
+            hit = next(
+                (part for part in item["_parts"] if needle in part.lower()), None
+            )
+            if hit is not None:
+                item["_snippet"] = hit[:40]
+                matched.append(item)
+        summaries = matched
     if include_all:
         visible = summaries
         scope = "全部"
@@ -1812,16 +1834,23 @@ def run_sessions_list_standalone(
         # 与 Web 侧栏一致：置顶会话排在前面
         visible.sort(key=lambda item: not item["pinned"])
 
+    keyword = f"（关键词：{query.strip()}）" if needle else ""
     if not visible:
-        print(
-            f"用户 {user_id}：没有{scope}会话"
-            f"（共 {len(summaries)} 个，归档 {archived_total} 个）"
-        )
+        if needle:
+            print(
+                f"用户 {user_id}：没有匹配{keyword}的{scope}会话"
+                f"（共 {total_all} 个，归档 {archived_total} 个）"
+            )
+        else:
+            print(
+                f"用户 {user_id}：没有{scope}会话"
+                f"（共 {total_all} 个，归档 {archived_total} 个）"
+            )
         return 0
 
     print(
-        f"用户 {user_id}：{len(visible)} 个{scope}会话"
-        f"（共 {len(summaries)} 个，归档 {archived_total} 个）"
+        f"用户 {user_id}：{len(visible)} 个{scope}会话{keyword}"
+        f"（共 {total_all} 个，归档 {archived_total} 个）"
     )
     for item in visible:
         if item["archived"]:
@@ -1836,6 +1865,8 @@ def run_sessions_list_standalone(
             f"  [{status}] {item['session_id']:<16} {title:<32}"
             f" {item['messages']:>3} 条  {updated}"
         )
+        if item.get("_snippet"):
+            print(f"       > {item['_snippet']}")
     return 0
 
 
@@ -1882,14 +1913,38 @@ def run_session_archive_standalone(
     return 0
 
 
-def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool] | None:
-    """解析 sessions 的 --archived / --all；未知参数或同时使用返回 None。"""
-    flags = [item.lower() for item in args]
-    if any(flag not in {"--archived", "--all"} for flag in flags):
+def _parse_sessions_flags(args: list[str]) -> tuple[bool, bool, str] | None:
+    """解析 sessions 的 --archived / --all / --query 关键词。
+
+    未知参数、同时使用 --archived 与 --all、或 --query 缺少非空值
+    时返回 None。
+    """
+    archived_only = include_all = False
+    query = ""
+    index = 0
+    while index < len(args):
+        flag = args[index].lower()
+        if flag == "--archived":
+            archived_only = True
+        elif flag == "--all":
+            include_all = True
+        elif flag == "--query" or flag.startswith("--query="):
+            if flag == "--query":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = args[index][len("--query="):]
+            if not value.strip() or value.startswith("-"):
+                return None
+            query = value
+        else:
+            return None
+        index += 1
+    if archived_only and include_all:
         return None
-    if "--archived" in flags and "--all" in flags:
-        return None
-    return "--archived" in flags, "--all" in flags
+    return archived_only, include_all, query
 
 
 def _parse_archive_flags(args: list[str]) -> bool | None:
@@ -2419,19 +2474,24 @@ def main():
                 )
             )
         if arg == "sessions":
+            usage = (
+                "用法：python cli.py sessions <user_id> "
+                "[--archived|--all] [--query 关键词]"
+            )
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                print("用法：python cli.py sessions <user_id> [--archived|--all]")
+                print(usage)
                 sys.exit(2)
             parsed = _parse_sessions_flags(sys.argv[3:])
             if parsed is None:
-                print("用法：python cli.py sessions <user_id> [--archived|--all]")
+                print(usage)
                 sys.exit(2)
-            archived_only, include_all = parsed
+            archived_only, include_all, query = parsed
             sys.exit(
                 run_sessions_list_standalone(
                     sys.argv[2],
                     archived_only=archived_only,
                     include_all=include_all,
+                    query=query,
                 )
             )
         if arg == "session-archive":
