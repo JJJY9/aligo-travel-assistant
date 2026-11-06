@@ -161,8 +161,11 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
     再被使用时，旧会话排队的消息 / 删除动作不能重放进新会话。
     """
     keys = {session_key(session_id)}
+    # 排队操作只登记给「后续实例会使用」的键：带 user_id 时实例一律使用
+    # 用户维度键，旧格式键没有任何重放者，登记只会占用注册表槽位
+    replay_key = session_key(session_id, user_id) if user_id else session_key(session_id)
     if user_id:
-        keys.add(session_key(session_id, user_id))
+        keys.add(replay_key)
     for key in keys:
         discard_pending_ops(key)
     url = STORAGE_CONFIG.get("redis_url") or ""
@@ -173,8 +176,7 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
         # 启动 / 重连失败时客户端尚不可用（工厂 60 秒冷却）：同样要登记
         # 整键删除，否则冷却结束、会话 ID 被复用后会读到已删除的旧对话
         logger.warning("Redis 客户端不可用，登记会话清理（%s）", session_id)
-        for key in keys:
-            queue_clear(key)
+        queue_clear(replay_key)
         return
     try:
         client.delete(*keys, *[applied_key(key) for key in keys])
@@ -182,5 +184,4 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
         logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)
         # 删除失败时登记整键删除：墓碑（300 秒）过期后复用同一
         # session_id 时，下一次访问会先重放它，不会读到旧对话
-        for key in keys:
-            queue_clear(key)
+        queue_clear(replay_key)
