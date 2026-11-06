@@ -2533,28 +2533,50 @@ def create_app(model: Any = None) -> FastAPI:
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
+        q: str = Query(default="", max_length=100),
     ) -> dict[str, Any]:
         """列出历史行程（默认记录顺序，支持分页；附带日期重叠信息）。
 
-        ``order=desc`` 返回从最新记录开始的顺序，供记忆面板展示「最近 N 条」。
+        ``order=desc`` 返回从最新记录开始的顺序，供记忆面板展示「最近 N 条」；
+        ``q`` 按路线 / 日期 / 目的过滤（与面板、CLI ``trips --query`` 同一
+        口径：五个字段空格拼接后整体包含），日期重叠仍按完整历史计算。
         """
         store = _open_long_term(user_id)
         try:
-            trips = store.get_trip_history(limit=None)
+            all_trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("列出历史行程失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"读取行程失败：{exc}") from exc
         finally:
             _close_long_term(store)
+        trips = all_trips
+        needle = q.strip().casefold()
+        if needle:
+            trips = [
+                trip
+                for trip in trips
+                if needle
+                in " ".join(
+                    str(trip.get(key) or "")
+                    for key in (
+                        "origin",
+                        "destination",
+                        "purpose",
+                        "start_date",
+                        "end_date",
+                    )
+                ).casefold()
+            ]
         total = len(trips)
         ordered = trips[::-1] if order == "desc" else trips
         page = ordered[offset : offset + limit]
         return {
-            "trips": _trips_with_conflicts(page, trips),
+            "trips": _trips_with_conflicts(page, all_trips),
             "total": total,
             "offset": offset,
             "limit": limit,
             "order": order,
+            "query": q.strip(),
         }
 
     @app.post("/api/trips", status_code=201)

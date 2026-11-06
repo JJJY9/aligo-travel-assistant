@@ -1970,6 +1970,68 @@ def test_next_trip_prefers_ongoing():
         _cleanup(user_id)
 
 
+def test_trips_query_filter_api():
+    """GET /api/trips?q=：与面板 / CLI 同一口径过滤，冲突按完整历史计算。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trip_query")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            for destination, start, end, purpose in [
+                ("上海", "2026-12-01", "2026-12-03", "出差"),
+                ("杭州", "2026-12-05", "2026-12-06", "会议"),
+                ("上海", "2026-12-02", "2026-12-02", "培训"),
+            ]:
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": destination,
+                        "start_date": start,
+                        "end_date": end,
+                        "purpose": purpose,
+                    }
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        filtered = client.get(
+            "/api/trips", params={"user_id": user_id, "q": "上海"}
+        ).json()
+        assert filtered["total"] == 2 and filtered["query"] == "上海"
+        assert {trip["destination"] for trip in filtered["trips"]} == {"上海"}
+        assert all(trip["conflicts"] for trip in filtered["trips"]), (
+            "过滤后重叠信息仍按完整历史计算"
+        )
+
+        cross = client.get(
+            "/api/trips", params={"user_id": user_id, "q": "北京 上海"}
+        ).json()
+        assert cross["total"] == 2, "跨字段多词查询应命中"
+
+        by_purpose = client.get(
+            "/api/trips", params={"user_id": user_id, "q": "会议"}
+        ).json()
+        assert by_purpose["total"] == 1
+        assert by_purpose["trips"][0]["destination"] == "杭州"
+
+        empty = client.get(
+            "/api/trips", params={"user_id": user_id, "q": "不存在"}
+        ).json()
+        assert empty["total"] == 0 and empty["trips"] == []
+
+        too_long = client.get(
+            "/api/trips", params={"user_id": user_id, "q": "x" * 101}
+        )
+        assert too_long.status_code == 422
+        print("✓ /api/trips q 过滤（路线 / 跨字段 / 目的 / 无匹配）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_status_trips_include_conflicts():
     from context.storage import create_long_term_memory
 
@@ -4793,6 +4855,7 @@ if __name__ == "__main__":
     test_preferences_api()
     test_preference_storage_failure_maps_503(pytest.MonkeyPatch())
     test_status_trips()
+    test_trips_query_filter_api()
     test_delete_trip_api()
     test_create_trip_api()
     test_update_trip_api()
