@@ -313,8 +313,8 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
         assert client.llen(key) == 3, "消息已在服务端写入"
         proxy.lose_eval_response = False
         reset_degraded()
-        contents = [item["content"] for item in follower.get_recent_context()]
-        assert contents == ["Q1", "A1", "Q4"], "响应丢失后重放不能重复追加"
+        after_lost_add = [item["content"] for item in follower.get_recent_context()]
+        assert after_lost_add == ["Q1", "A1", "Q4"], "响应丢失后重放不能重复追加"
         assert client.llen(key) == 3
 
         # 在线截断已执行但响应丢失：重放用同一 op_id，凭一次性标记跳过
