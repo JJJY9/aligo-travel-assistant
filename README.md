@@ -606,7 +606,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | DELETE | `/api/knowledge/documents/{id}` | 删除知识片段；`group=1` 时连同同一拆分组的其余分片一起删除 |
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 20000 条；`dry_run=1` 只返回 `would_import` 不写库） |
-| POST | `/api/knowledge/import/preview` | 预览整个备份（一次最多 20000 条）：校验 / 去重后返回将导入 / 跳过的数量，不写库 |
+| POST | `/api/knowledge/import/preview` | 预览整个备份（一次最多 20000 条）：校验 / 去重后返回将导入 / 跳过的数量（`skipped_invalid` 无效内容 / `skipped_duplicate` 已存在分别统计），不写库 |
 | GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程数 / 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
 | GET | `/api/weather` | 目的地天气（Open-Meteo，无 API Key；实时 + 未来 3 天，成功结果 10 分钟进程内缓存、失败结果 60 秒；上游故障时 1 小时内沿用最近成功数据并标记 `stale`；按客户端 IP 限流，默认 30 次 / 分钟） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |

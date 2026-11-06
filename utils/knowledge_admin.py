@@ -569,23 +569,33 @@ def import_documents(
     """
     items = list(documents)
     if not items:
-        return {"imported": 0, "skipped": 0}
+        return {
+            "imported": 0,
+            "skipped": 0,
+            "skipped_invalid": 0,
+            "skipped_duplicate": 0,
+        }
 
     # 与数据库无关的校验先做：全部为空 / 非法时不需要知识库，直接返回
     valid: list[Any] = []
-    skipped = 0
+    invalid = 0
     for item in items:
         if not isinstance(item, dict):
-            skipped += 1
+            invalid += 1
             continue
         raw_content = item.get("content")
         # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
         if not isinstance(raw_content, str) or not raw_content.strip():
-            skipped += 1
+            invalid += 1
             continue
         valid.append(item)
     if not valid:
-        return {"imported": 0, "skipped": skipped}
+        return {
+            "imported": 0,
+            "skipped": invalid,
+            "skipped_invalid": invalid,
+            "skipped_duplicate": 0,
+        }
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
@@ -595,18 +605,18 @@ def import_documents(
         # 插入同一批内容；快照走全量扫描，集合超过单页规模时也不会重复导入
         existing = _existing_contents()
         merged_items, group_skipped = _regroup_exported_documents(valid, existing)
-        skipped += group_skipped
+        duplicate = group_skipped
         cleaned: list[dict[str, Any]] = []
         for item in merged_items:
             restored = bool(item.pop("__restored_group__", False))
             restored_size = int(item.pop("__restored_size__", 0) or 0)
             raw_content = item.get("content")
             if not isinstance(raw_content, str):
-                skipped += 1
+                invalid += 1
                 continue
             content = raw_content.strip()
             if not content:
-                skipped += 1
+                invalid += 1
                 continue
             metadata = item.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
@@ -631,12 +641,17 @@ def import_documents(
         unique: list[dict[str, Any]] = []
         for item in cleaned:
             if item["content"] in existing:
-                skipped += 1
+                duplicate += 1
                 continue
             existing.add(item["content"])
             unique.append(item)
         if not unique:
-            result: dict[str, Any] = {"imported": 0, "skipped": skipped}
+            result: dict[str, Any] = {
+                "imported": 0,
+                "skipped": invalid + duplicate,
+                "skipped_invalid": invalid,
+                "skipped_duplicate": duplicate,
+            }
             if dry_run:
                 # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
                 result["would_import"] = 0
@@ -645,7 +660,9 @@ def import_documents(
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
             return {
                 "imported": 0,
-                "skipped": skipped,
+                "skipped": invalid + duplicate,
+                "skipped_invalid": invalid,
+                "skipped_duplicate": duplicate,
                 "would_import": len(unique),
             }
 
@@ -665,7 +682,12 @@ def import_documents(
                     f"{result.get('message') or '导入知识片段失败'}"
                 )
             imported.extend(int(doc_id) for doc_id in (result.get("ids") or []))
-    return {"imported": len(imported), "skipped": skipped}
+    return {
+        "imported": len(imported),
+        "skipped": invalid + duplicate,
+        "skipped_invalid": invalid,
+        "skipped_duplicate": duplicate,
+    }
 
 
 def delete_document(doc_id: int, whole_group: bool = False) -> int:

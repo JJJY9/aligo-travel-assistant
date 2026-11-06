@@ -148,9 +148,12 @@ def test_export_import_roundtrip_is_idempotent():
     assert documents, "本地知识库应有片段"
     before = list_documents(limit=1)["total"]
     result = import_documents(documents)
-    assert result == {"imported": 0, "skipped": len(documents)}, (
-        "重复导入同一备份应全部跳过"
-    )
+    assert result == {
+        "imported": 0,
+        "skipped": len(documents),
+        "skipped_invalid": 0,
+        "skipped_duplicate": len(documents),
+    }, "重复导入同一备份应全部跳过"
     assert list_documents(limit=1)["total"] == before
     print(f"✓ 导出→导入幂等（{len(documents)} 条全部跳过）")
 

@@ -386,7 +386,12 @@ def test_import_documents_sanitizes(monkeypatch):
             },
         ]
     )
-    assert result == {"imported": 2, "skipped": 5}
+    assert result == {
+        "imported": 2,
+        "skipped": 5,
+        "skipped_invalid": 5,
+        "skipped_duplicate": 0,
+    }
     sent = agent.calls[0]
     assert sent[0]["content"] == "a"
     assert all(len(item["content"]) <= 400 for item in sent)
@@ -741,7 +746,12 @@ def test_import_skips_fully_existing_group(monkeypatch):
             {"content": part2, "metadata": {"group": "g", "part": "2", "parts": "2"}},
         ]
     )
-    assert result == {"imported": 0, "skipped": 2}
+    assert result == {
+        "imported": 0,
+        "skipped": 2,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 2,
+    }
     assert agent.calls == []
     print("✓ 已存在的整组分片导入时整组跳过")
 
@@ -957,7 +967,13 @@ def test_import_dry_run_skips_writes(monkeypatch):
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
     result = knowledge_admin.import_documents([{"content": "新内容"}], dry_run=True)
-    assert result == {"imported": 0, "skipped": 0, "would_import": 1}
+    assert result == {
+        "imported": 0,
+        "skipped": 0,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 0,
+        "would_import": 1,
+    }
 
     # 已有内容仍计入跳过
     monkeypatch.setattr(
@@ -966,14 +982,48 @@ def test_import_dry_run_skips_writes(monkeypatch):
     result2 = knowledge_admin.import_documents(
         [{"content": "已有内容"}, {"content": "新内容"}], dry_run=True
     )
-    assert result2 == {"imported": 0, "skipped": 1, "would_import": 1}
+    assert result2 == {
+        "imported": 0,
+        "skipped": 1,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 1,
+        "would_import": 1,
+    }
 
     # 全部已存在：预览返回稳定结构（would_import = 0）
     result3 = knowledge_admin.import_documents(
         [{"content": "已有内容"}], dry_run=True
     )
-    assert result3 == {"imported": 0, "skipped": 1, "would_import": 0}
+    assert result3 == {
+        "imported": 0,
+        "skipped": 1,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 1,
+        "would_import": 0,
+    }
     print("✓ 导入 dry-run 只统计不写入")
+
+
+def test_import_dry_run_reports_skip_reasons(monkeypatch):
+    """预览分别统计跳过原因：已存在（重复）与无效内容。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"已有内容"})
+    result = knowledge_admin.import_documents(
+        [
+            {"content": "已有内容"},
+            {"content": "  "},
+            None,
+            {"content": "新内容"},
+        ],
+        dry_run=True,
+    )
+    assert result["would_import"] == 1
+    assert result["skipped"] == 3
+    assert result["skipped_duplicate"] == 1
+    assert result["skipped_invalid"] == 2
+    print("✓ 导入预览区分已存在 / 无效的跳过原因")
 
 
 def test_import_rejects_incomplete_group(monkeypatch):
@@ -1032,7 +1082,12 @@ def test_import_skips_existing_and_duplicate_content(monkeypatch):
     result = knowledge_admin.import_documents(
         [{"content": "已有内容"}, {"content": "新内容"}, {"content": "新内容"}]
     )
-    assert result == {"imported": 1, "skipped": 2}
+    assert result == {
+        "imported": 1,
+        "skipped": 2,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 2,
+    }
     assert [item["content"] for item in agent.calls[0]] == ["新内容"]
     print("✓ 导入按内容去重（已有 / 同批次重复）")
 
@@ -1071,7 +1126,12 @@ def test_import_empty_and_missing_db(monkeypatch):
     from pathlib import Path
 
     result = knowledge_admin.import_documents([{"content": "  "}, None])
-    assert result == {"imported": 0, "skipped": 2}
+    assert result == {
+        "imported": 0,
+        "skipped": 2,
+        "skipped_invalid": 2,
+        "skipped_duplicate": 0,
+    }
 
     monkeypatch.setattr(
         knowledge_admin, "knowledge_db_path", lambda: Path("missing/milvus_lite.db")
@@ -1105,7 +1165,12 @@ def test_import_chunks_large_documents(monkeypatch):
 
     documents = [{"content": f"item-{i}"} for i in range(1200)]
     result = knowledge_admin.import_documents(documents)
-    assert result == {"imported": 1200, "skipped": 0}
+    assert result == {
+        "imported": 1200,
+        "skipped": 0,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 0,
+    }
     assert [len(batch) for batch in agent.calls] == [500, 500, 200]
     print("✓ 大文件导入按 500 条分块嵌入 / 插入")
 
