@@ -4608,6 +4608,22 @@ def test_knowledge_metadata_limits():
     print("✓ 知识片段 metadata 键数 / 长度受限")
 
 
+def test_kb_delete_grouped_fragment_maps_400(monkeypatch):
+    """带 group 的分片不能单条删除：服务端 ValueError 映射为 400。"""
+    from webapp import server as server_module
+
+    def grouped(doc_id, whole_group=False):
+        raise ValueError(
+            "该片段属于多分片知识内容，不能单条删除：请整组删除"
+        )
+
+    monkeypatch.setattr(server_module, "delete_document", grouped)
+    response = _client().delete("/api/knowledge/documents/1")
+    assert response.status_code == 400
+    assert "整组删除" in response.json()["detail"]
+    print("✓ 多分片片段单条删除 → 400（提示整组删除）")
+
+
 def test_knowledge_transfer_api(monkeypatch):
     """知识库导出 / 导入接口：下载头、参数校验与导入数量映射。"""
     from webapp import server as server_module
@@ -4880,6 +4896,11 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_knowledge_metadata_limits()
+    _mp_kb_del = pytest.MonkeyPatch()
+    try:
+        test_kb_delete_grouped_fragment_maps_400(_mp_kb_del)
+    finally:
+        _mp_kb_del.undo()
     _mp = pytest.MonkeyPatch()
     try:
         test_knowledge_transfer_api(_mp)

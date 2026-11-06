@@ -1834,6 +1834,9 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             removed = delete_document(doc_id, whole_group=group)
+        except ValueError as exc:
+            # 多分片记录不允许单条删除（须整组删除），属于客户端用法错误
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
