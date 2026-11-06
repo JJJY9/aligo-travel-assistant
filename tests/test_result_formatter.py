@@ -282,6 +282,179 @@ def test_information_query_variants_and_fallback_agent():
     print("✓ 信息查询来源变体 / 未知智能体兜底 / 偏好包一层")
 
 
+def test_empty_and_malformed_results():
+    """空 / 脏结果：占位提示、非字典条目跳过、无可渲染内容占位。"""
+    assert result_to_markdown({"results": []}) == "未能获取有效结果，请重新描述您的需求。"
+    assert (
+        result_to_markdown({"status": "completed"})
+        == "未能获取有效结果，请重新描述您的需求。"
+    )
+    md = result_to_markdown(
+        _wrap(
+            [
+                None,
+                "bad",
+                {
+                    "agent_name": "memory_query",
+                    "status": "success",
+                    "data": {"answer": "记起来了"},
+                },
+            ]
+        )
+    )
+    assert md == "记起来了"
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {"preferences": []},
+                }
+            ]
+        )
+    )
+    assert md == "已处理您的请求。"
+    print("✓ 空结果 / 非字典条目 / 无可渲染内容")
+
+
+def test_render_failure_falls_back_to_text():
+    """渲染器抛错时兜底提取文本；兜底无文本时返回占位。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {
+                        # 不可哈希的 type 让 preference_label 抛 TypeError
+                        "preferences": [{"type": {"bad": 1}}],
+                        "message": "已更新偏好（降级展示）",
+                    },
+                }
+            ]
+        )
+    )
+    assert md == "已更新偏好（降级展示）"
+
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {"preferences": [{"type": {"bad": 1}}]},
+                }
+            ]
+        )
+    )
+    assert md == "已处理您的请求。"
+
+    from utils.result_formatter import _fallback_text
+
+    assert _fallback_text("  文本  ") == "文本"
+    assert _fallback_text({"summary": "S"}) == "S"
+    assert _fallback_text({}) == ""
+    print("✓ 渲染失败兜底文本")
+
+
+def test_itinerary_string_and_notes_variants():
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {"itinerary": " 北京三日游 "},
+                }
+            ]
+        )
+    )
+    assert "北京三日游" in md
+
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {
+                        "itinerary": {
+                            "notes": "带伞",
+                            "daily_plans": [{"day": 1, "meals": {"dinner": "火锅"}}],
+                        }
+                    },
+                }
+            ]
+        )
+    )
+    assert "带伞" in md and "火锅" in md
+
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {"error": "缺少目的地"},
+                }
+            ]
+        )
+    )
+    assert "缺少目的地" in md
+    print("✓ 行程字符串 / 字符串 notes / 行程 error 渲染")
+
+
+def test_agent_specific_empty_payloads_render_placeholder():
+    cases = [
+        {"agent_name": "event_collection", "status": "success", "data": {}},
+        {"agent_name": "information_query", "status": "success", "data": {}},
+        {"agent_name": "rag_knowledge", "status": "success", "data": {"answer": ""}},
+        {"agent_name": "memory_query", "status": "success", "data": {}},
+    ]
+    assert result_to_markdown(_wrap(cases)) == "已处理您的请求。"
+    # 非字典偏好项被跳过，只保留标题行（非空结果）
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {"preferences": [None]},
+                }
+            ]
+        )
+    )
+    assert md == "### ✅ 已更新偏好"
+    print("✓ 各智能体空载荷渲染占位")
+
+
+def test_rag_snippet_truncation_and_skip_non_dict():
+    long_text = "标准" * 100  # 200 字，超过 140 字截断阈值
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "rag_knowledge",
+                    "status": "success",
+                    "data": {
+                        "answer": "答案",
+                        "retrieved_documents": [
+                            "坏文档",
+                            {"content": ""},
+                            {"content": long_text, "metadata": {"title": "制度.txt"}},
+                        ],
+                    },
+                }
+            ]
+        )
+    )
+    assert "制度.txt" in md
+    assert "…" in md, "超长片段应截断并加省略号"
+    assert "坏文档" not in md, "非字典文档不参与渲染"
+    print("✓ RAG 片段截断 / 非字典文档跳过")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -293,4 +466,9 @@ if __name__ == "__main__":
     test_itinerary_malformed_shapes_do_not_crash()
     test_event_collection_and_memory_query()
     test_information_query_variants_and_fallback_agent()
+    test_empty_and_malformed_results()
+    test_render_failure_falls_back_to_text()
+    test_itinerary_string_and_notes_variants()
+    test_agent_specific_empty_payloads_render_placeholder()
+    test_rag_snippet_truncation_and_skip_non_dict()
     print("\n全部通过")
