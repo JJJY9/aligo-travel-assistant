@@ -210,6 +210,44 @@ def test_status_endpoint():
     print("✓ /api/status 正常")
 
 
+def test_status_travel_summary():
+    """行程统计：总行程 / 出行天数（含首尾）/ 到访城市 / 进行中 / 即将出行。"""
+    client = _client()
+    user_id = _unique_user("web_test_travel_summary")
+    try:
+        trips = [
+            ("北京", "上海", "2099-01-01", "2099-01-03"),  # 3 天
+            ("北京", "杭州", "2099-02-01", "2099-02-01"),  # 1 天（当天往返）
+        ]
+        for origin, destination, start, end in trips:
+            created = client.post(
+                "/api/trips",
+                json={
+                    "user_id": user_id,
+                    "origin": origin,
+                    "destination": destination,
+                    "start_date": start,
+                    "end_date": end,
+                    "purpose": "出差",
+                },
+            )
+            assert created.status_code == 201, created.text
+
+        summary = client.get(
+            "/api/status", params={"user_id": user_id}
+        ).json()["travel_summary"]
+        assert summary == {
+            "total_trips": 2,
+            "total_days": 4,
+            "cities": 2,
+            "active": 0,
+            "upcoming": 2,
+        }, summary
+        print("✓ /api/status 行程统计（天数含首尾 / 城市去重 / 即将出行）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_chat_returns_reply_and_usage():
     client = _client()
     response = client.post(
