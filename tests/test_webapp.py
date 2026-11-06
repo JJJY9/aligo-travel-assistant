@@ -3523,6 +3523,99 @@ def test_lock_eviction_skips_waiting_lock():
     print("✓ 用户锁淘汰跳过有等待者的锁")
 
 
+def test_lock_for_overflow_user_keeps_shared_lock_while_held():
+    """兜底锁被占用期间，同一用户的新请求必须继续共用它，不能新建私有锁并行。"""
+    import asyncio
+
+    async def scenario():
+        state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+        state.max_locks = 1
+        state.locks.clear()
+        blocker = state.lock_for("holder")
+        await blocker.acquire()
+        overflow = state.lock_for("u-overflow")
+        assert overflow is state.overflow_lock, "锁表满时应使用兜底锁"
+        await overflow.acquire()  # 模拟该用户的 R1 正持有兜底锁
+        blocker.release()  # 锁表腾出空位
+        again = state.lock_for("u-overflow")
+        assert again is state.overflow_lock, "兜底锁仍被占用时不能给同一用户新建私有锁"
+        overflow.release()
+        fresh = state.lock_for("u-overflow")
+        assert fresh is not state.overflow_lock
+        assert "u-overflow" in state.locks
+
+    asyncio.run(scenario())
+    print("✓ 兜底锁占用期间同用户继续共用兜底锁")
+
+
+def test_session_turn_lease_releases_once():
+    """租约幂等释放：锁只 release 一次，会话占用只解除一次。"""
+    import asyncio
+
+    from webapp.server import _SessionTurnLease
+
+    class _Session:
+        def __init__(self):
+            self.ended = 0
+
+        def end_turn(self):
+            self.ended += 1
+
+    async def scenario():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        session = _Session()
+        lease = _SessionTurnLease(lock, session)
+        lease.release()
+        lease.release()
+        assert lock.locked() is False
+        assert session.ended == 1
+
+    asyncio.run(scenario())
+    print("✓ SSE 租约幂等释放锁与会话占用")
+
+
+def test_leased_streaming_response_releases_even_if_body_never_starts():
+    """响应在首次迭代前就失败（客户端提前断开）时，锁与会话占用也必须释放。"""
+    import asyncio
+    from typing import Any
+
+    from webapp.server import _LeasedStreamingResponse, _SessionTurnLease
+
+    class _Session:
+        def __init__(self):
+            self.ended = 0
+
+        def end_turn(self):
+            self.ended += 1
+
+    async def scenario():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        session = _Session()
+        lease = _SessionTurnLease(lock, session)
+
+        async def body():
+            raise AssertionError("不应进入迭代")
+            yield ""  # pragma: no cover
+
+        async def send(message):
+            raise OSError("client gone")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        scope: Any = {"type": "http", "asgi": {"spec_version": "2.4"}}
+        response = _LeasedStreamingResponse(body(), lease)
+        with pytest.raises(Exception):
+            await response(scope, receive, send)
+        assert lock.locked() is False, "响应未开始迭代也不能泄漏用户锁"
+        assert session.ended == 1
+
+    asyncio.run(scenario())
+    print("✓ 响应未开始迭代即失败时租约兜底释放")
+
+
 def test_session_lru_skips_in_use_sessions():
     """LRU 淘汰不能关闭正在对话的会话，也不能淘汰本次要返回的会话。"""
     state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
@@ -4757,6 +4850,9 @@ if __name__ == "__main__":
     test_lock_table_is_bounded()
     test_lock_table_overflow_uses_shared_lock()
     test_lock_eviction_skips_waiting_lock()
+    test_lock_for_overflow_user_keeps_shared_lock_while_held()
+    test_session_turn_lease_releases_once()
+    test_leased_streaming_response_releases_even_if_body_never_starts()
     test_session_lru_skips_in_use_sessions()
     test_chat_releases_session_in_use_mark()
     test_request_body_too_large()
