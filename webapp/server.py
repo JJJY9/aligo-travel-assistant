@@ -54,6 +54,7 @@ from context.storage import (
     get_shared_redis_client,
 )
 from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
+from utils.errors import MemoryPersistenceError
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
 from utils.doctor import run_doctor
@@ -1483,7 +1484,7 @@ def create_app(model: Any = None) -> FastAPI:
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
-        category: str = Query(default="", max_length=20),
+        category: str = Query(default="", max_length=200),
     ) -> dict[str, Any]:
         """列出知识片段（记忆面板的知识库维护）。"""
         try:
@@ -1516,9 +1517,14 @@ def create_app(model: Any = None) -> FastAPI:
         top_k: int = Query(default=5, ge=1, le=10),
     ) -> dict[str, Any]:
         """语义检索知识片段（向量相似度排序；首次调用会加载嵌入模型）。"""
+        query = q.strip()
+        if not query:
+            # 纯空白是客户端输入错误，不能被后面的「查询内容为空」映射成 503
+            # 服务端故障；校验放在限流之前，避免无效请求消耗知识库额度
+            raise HTTPException(status_code=422, detail="查询内容不能为空")
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            results = search_documents(q, top_k=top_k)
+            results = search_documents(query, top_k=top_k)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
@@ -1526,7 +1532,7 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
             logger.warning("语义检索知识片段失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"检索失败：{exc}") from exc
-        return {"query": q, "results": results}
+        return {"query": query, "results": results}
 
     @app.get("/api/knowledge/eval")
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
@@ -2189,9 +2195,21 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
             # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池
-            session = await asyncio.to_thread(
-                state.get_session, payload.user_id, payload.session_id
-            )
+            try:
+                session = await asyncio.to_thread(
+                    state.get_session, payload.user_id, payload.session_id
+                )
+            except MemoryPersistenceError as exc:
+                logger.warning(
+                    "打开会话失败（%s）: %s", _request_id(request), exc
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "存储暂时不可用，请稍后再试"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                ) from exc
             try:
                 result = await session.runtime.ask(payload.message)
             except CircuitOpenError as exc:
@@ -2199,10 +2217,30 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=503,
                     detail=f"服务暂时不可用，请稍后再试（请求 ID：{_request_id(request)}）",
                 ) from exc
+            except MemoryPersistenceError as exc:
+                logger.warning(
+                    "对话存储失败（%s）: %s", _request_id(request), exc
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "存储暂时不可用，请稍后再试"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                ) from exc
             except Exception as exc:  # noqa: BLE001 - 对外返回友好错误
+                logger.warning(
+                    "对话处理失败（%s）: %s",
+                    _request_id(request),
+                    exc,
+                    exc_info=True,
+                )
                 raise HTTPException(
                     status_code=500,
-                    detail=f"处理失败：{exc}（请求 ID：{_request_id(request)}）",
+                    detail=(
+                        "服务器内部错误，请稍后重试"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
                 ) from exc
         response.headers.update(rate_headers)
         return {"session_id": session.session_id, **result}
@@ -2214,30 +2252,37 @@ def create_app(model: Any = None) -> FastAPI:
         rid = _request_id(request)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
-        async def event_stream() -> Any:
-            # 在推送第一个事件前拿到用户锁：删除会话会等待本轮结束。
-            # 若像以前那样在 get_session 之后才加锁，流已返回、run 尚未开始时
-            # 到达的删除会让本轮结束时把已删除的会话重新写回。
-            lock = state.lock_for(payload.user_id)
-            await lock.acquire()
-            task: asyncio.Task[None] | None = None
-            heartbeat: asyncio.Task[None] | None = None
+        # 用户锁与会话构造放在返回 StreamingResponse 之前：此时 200 响应头
+        # 尚未发出，会话已删除返回 404、存储故障返回 503，客户端能拿到明确
+        # 的状态码；此前异常发生在首个事件之前，只能得到一个已建立又中断的
+        # 空流。锁在流结束时释放。
+        lock = state.lock_for(payload.user_id)
+        await lock.acquire()
+        try:
+            if await asyncio.to_thread(
+                state.is_recently_deleted, payload.user_id, payload.session_id
+            ):
+                raise HTTPException(
+                    status_code=404, detail="会话已删除，请开始新对话"
+                )
             try:
-                if await asyncio.to_thread(
-                    state.is_recently_deleted, payload.user_id, payload.session_id
-                ):
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {"type": "error", "message": "会话已删除，请开始新对话"},
-                            ensure_ascii=False,
-                        )
-                        + "\n\n"
-                    )
-                    return
                 session = await asyncio.to_thread(
                     state.get_session, payload.user_id, payload.session_id
                 )
+            except MemoryPersistenceError as exc:
+                logger.warning("打开会话失败（%s）: %s", rid, exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"存储暂时不可用，请稍后再试（请求 ID：{rid}）",
+                ) from exc
+        except BaseException:
+            lock.release()
+            raise
+
+        async def event_stream() -> Any:
+            task: asyncio.Task[None] | None = None
+            heartbeat: asyncio.Task[None] | None = None
+            try:
 
                 async def run() -> None:
                     try:
@@ -2250,6 +2295,7 @@ def create_app(model: Any = None) -> FastAPI:
                     except asyncio.CancelledError:
                         raise
                     except CircuitOpenError:
+                        logger.warning("流式对话触发熔断（%s）", rid)
                         await queue.put(
                             {
                                 "type": "error",
@@ -2257,6 +2303,9 @@ def create_app(model: Any = None) -> FastAPI:
                             }
                         )
                     except Exception as exc:  # noqa: BLE001 - 通过事件返回友好错误
+                        # 流式响应已发出 200，异常只能通过 error 事件返回；
+                        # 同时写日志，避免客户端断开后失败完全无痕
+                        logger.warning("流式对话失败（%s）: %s", rid, exc, exc_info=True)
                         await queue.put(
                             {
                                 "type": "error",

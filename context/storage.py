@@ -153,6 +153,8 @@ def describe_backends() -> dict[str, Any]:
         "short_term_degraded": bool(url)
         and short_term == "redis"
         and redis_short_term_degraded(),
+        # 配置了 PostgreSQL 但连接失败、长期记忆已回退本地 JSON
+        "long_term_degraded": bool(dsn) and long_term == "json",
     }
 
 

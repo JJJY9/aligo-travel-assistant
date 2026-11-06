@@ -358,9 +358,71 @@ def test_chat_failure_returns_500():
 
     assert response.status_code == 500
     detail = response.json()["detail"]
-    assert "处理失败" in detail and "fail-test" in detail
+    assert "服务器内部错误" in detail and "fail-test" in detail
+    assert "connection reset" not in detail, "内部异常文本不应泄露给客户端"
     assert response.headers["x-request-id"] == "fail-test"
     print("✓ 对话失败返回 500 与请求 ID")
+
+
+def test_knowledge_category_filter_accepts_long_values(monkeypatch):
+    """分类筛选上限与写入一致：21..200 字的分类可以被筛选（此前 422）。"""
+    from webapp import server as server_module
+
+    calls = {}
+
+    def fake_list(limit, offset, query, category):
+        calls["category"] = category
+        return {"total": 0, "items": []}
+
+    monkeypatch.setattr(server_module, "list_documents", fake_list)
+    long_category = "长分类" * 10  # 30 字，超过旧的 20 字上限
+    response = _client().get(
+        "/api/knowledge/documents", params={"category": long_category}
+    )
+    assert response.status_code == 200, response.text
+    assert calls["category"] == long_category
+    print("✓ 分类筛选接受与写入上限一致的 200 字分类")
+
+
+def test_chat_stream_rejects_deleted_session_with_404(monkeypatch):
+    """SSE 预检：会话已删除时在建立流之前返回 404，而不是断开的空流。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    monkeypatch.setattr(state, "is_recently_deleted", lambda user, sid: True)
+    client = TestClient(app)
+    response = client.post(
+        "/api/chat/stream",
+        json={"message": "你好", "user_id": "u-del-stream", "session_id": "s-del"},
+    )
+    assert response.status_code == 404
+    assert "已删除" in response.json()["detail"]
+    print("✓ SSE 预检在首个事件前返回 404")
+
+
+def test_chat_storage_failure_maps_503(monkeypatch):
+    """会话构造遇到持久化错误时 /api/chat 与 /api/chat/stream 都返回 503。"""
+    from utils.errors import MemoryPersistenceError
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+
+    def boom(user, session):
+        raise MemoryPersistenceError("disk full")
+
+    monkeypatch.setattr(state, "get_session", boom)
+    client = TestClient(app)
+    chat = client.post(
+        "/api/chat",
+        json={"message": "你好", "user_id": "u-503", "session_id": "s-503"},
+    )
+    assert chat.status_code == 503
+    stream = client.post(
+        "/api/chat/stream",
+        json={"message": "你好", "user_id": "u-503", "session_id": "s-503"},
+    )
+    assert stream.status_code == 503
+    assert "存储暂时不可用" in chat.json()["detail"]
+    print("✓ 存储故障在对话与流式接口统一映射 503")
 
 
 def test_chat_stream_failure_event():
@@ -3700,6 +3762,10 @@ def test_knowledge_search_api(monkeypatch):
     assert payload["results"][0]["distance"] == 0.87
 
     assert client.get("/api/knowledge/search", params={"q": ""}).status_code == 422
+    calls.clear()
+    blank = client.get("/api/knowledge/search", params={"q": "   "})
+    assert blank.status_code == 422, "纯空白应判为客户端输入错误（422）"
+    assert calls == {}, "空白查询不应触发检索（也不应消耗限流额度）"
     assert (
         client.get(
             "/api/knowledge/search", params={"q": "住宿", "top_k": 0}
