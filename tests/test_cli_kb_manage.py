@@ -624,6 +624,119 @@ def test_duplicates_none_and_error(monkeypatch):
     print("✓ kb-duplicates 无重复 / 读取失败")
 
 
+def test_kb_dedupe_dry_run_and_delete(monkeypatch):
+    groups = [("重复甲", [9, 3, 7]), ("重复乙", [5, 6])]
+    deleted = []
+
+    def fake_delete(doc_id, whole_group=False):
+        deleted.append(doc_id)
+        return 1
+
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: groups)
+    monkeypatch.setattr(knowledge_admin, "delete_document", fake_delete)
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_knowledge_dedupe_standalone(dry_run=True)
+    text = out.getvalue()
+    assert code == 0 and deleted == []
+    assert "将删除 3 条" in text and "保留 #3，删除 #7、#9" in text
+    assert "保留 #5，删除 #6" in text
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_knowledge_dedupe_standalone()
+    assert code == 0 and deleted == [7, 9, 6]
+    assert "已删除 3 条重复知识片段" in out.getvalue()
+    print("✓ kb-dedupe 预览 / 按最小 id 保留并删除")
+
+
+def test_kb_dedupe_json_and_empty(monkeypatch):
+    import json as _json
+
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: [])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_knowledge_dedupe_standalone(as_json=True)
+    data = _json.loads(out.getvalue())
+    assert code == 0 and data["groups"] == [] and data["would_remove"] == 0
+
+    monkeypatch.setattr(
+        knowledge_admin, "find_duplicate_contents", lambda: [("甲", [1, 2])]
+    )
+    monkeypatch.setattr(
+        knowledge_admin,
+        "delete_document",
+        lambda doc_id, whole_group=False: 1,
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_knowledge_dedupe_standalone(dry_run=True, as_json=True)
+    data = _json.loads(out.getvalue())
+    assert data["dry_run"] is True and data["would_remove"] == 1
+    assert data["groups"][0]["keep"] == 1
+    assert data["groups"][0]["remove"] == [2]
+    print("✓ kb-dedupe --json 空结果 / 预览")
+
+
+def test_kb_dedupe_failures(monkeypatch):
+    def boom():
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", boom)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_knowledge_dedupe_standalone()
+    assert code == 1 and "读取知识库失败" in out.getvalue()
+
+    monkeypatch.setattr(
+        knowledge_admin, "find_duplicate_contents", lambda: [("甲", [1, 2, 3])]
+    )
+
+    def flaky(doc_id, whole_group=False):
+        if doc_id == 3:
+            raise RuntimeError("delete boom")
+        return 1
+
+    monkeypatch.setattr(knowledge_admin, "delete_document", flaky)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_knowledge_dedupe_standalone()
+    text = out.getvalue()
+    assert code == 1 and "删除 #3 失败" in text and "已删除 1 条" in text
+    print("✓ kb-dedupe 读取 / 部分删除失败")
+
+
+def test_kb_dedupe_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_dedupe_standalone",
+        lambda dry_run=False, as_json=False: calls.append((dry_run, as_json)) or 0,
+    )
+    for argv, expected in (
+        (["cli.py", "kb-dedupe"], (False, False)),
+        (["cli.py", "kb-dedupe", "--dry-run"], (True, False)),
+        (["cli.py", "kb-dedupe", "--JSON"], (False, True)),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        assert calls[-1] == expected, argv
+    for argv in (
+        ["cli.py", "kb-dedupe", "--bad"],
+        ["cli.py", "kb-dedupe", "extra"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "kb-dedupe" in out.getvalue()
+    print("✓ kb-dedupe dispatch 参数")
+
+
 if __name__ == "__main__":
     for case in (
         test_list_unavailable,
@@ -637,6 +750,10 @@ if __name__ == "__main__":
         test_duplicates_none_and_error,
         test_duplicates_json_output,
         test_duplicates_dispatch_json_flag,
+        test_kb_dedupe_dry_run_and_delete,
+        test_kb_dedupe_json_and_empty,
+        test_kb_dedupe_failures,
+        test_kb_dedupe_dispatch,
         test_categories_unavailable,
         test_categories_prints,
         test_categories_json_and_empty,

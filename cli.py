@@ -2064,6 +2064,115 @@ def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> i
     return 0
 
 
+def run_knowledge_dedupe_standalone(
+    dry_run: bool = False, as_json: bool = False
+) -> int:
+    """清理内容完全相同的独立知识片段组（`python cli.py kb-dedupe [--dry-run] [--json]`）。
+
+    每组保留最小的 id，删除其余记录。只处理不带 group 的独立片段：多分片
+    记录内部的相同段落是正常的，必须通过整份编辑 / 整组删除维护，按单条
+    删除会破坏整篇文档。
+
+    Returns:
+        0 清理完成（含无重复 / dry-run）；1 读取 / 删除失败
+    """
+    from utils.knowledge_admin import delete_document, find_duplicate_contents
+
+    def _fail(message: str, **extra: Any) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message, **extra},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    try:
+        groups = find_duplicate_contents()
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"读取知识库失败：{exc}")
+
+    plan: list[dict[str, Any]] = []
+    for content, ids in groups:
+        keep = min(ids)
+        remove = sorted(doc_id for doc_id in ids if doc_id != keep)
+        if remove:
+            plan.append({"content": content, "keep": keep, "remove": remove})
+    total_remove = sum(len(item["remove"]) for item in plan)
+
+    if dry_run or not plan:
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "dry_run": dry_run,
+                        "groups": plan,
+                        "would_remove": total_remove,
+                        "removed": 0,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if not plan:
+            print("没有重复内容的独立知识片段")
+            return 0
+        print(
+            f"发现 {len(plan)} 组重复内容，将删除 {total_remove} 条"
+            "（保留每组最小 id）："
+        )
+        for item in plan:
+            preview = " ".join(item["content"].split())[:60]
+            id_text = "、".join(f"#{doc_id}" for doc_id in item["remove"])
+            print(f"  保留 #{item['keep']}，删除 {id_text}  {preview}")
+        print("去掉 --dry-run 即可执行删除")
+        return 0
+
+    removed = 0
+    failure: str | None = None
+    removed_ids: list[int] = []
+    for item in plan:
+        for doc_id in item["remove"]:
+            try:
+                count = delete_document(doc_id)
+            except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
+                failure = f"删除 #{doc_id} 失败：{exc}（已删除 {removed} 条）"
+                break
+            removed += int(count or 0)
+            removed_ids.append(doc_id)
+        if failure:
+            break
+    if as_json:
+        if failure is not None:
+            return _fail(failure, removed=removed, removed_ids=removed_ids)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": False,
+                    "groups": plan,
+                    "would_remove": total_remove,
+                    "removed": removed,
+                    "removed_ids": removed_ids,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if failure is not None:
+        print(failure)
+        return 1
+    print(f"已删除 {removed} 条重复知识片段（{len(plan)} 组，保留每组最小 id）")
+    return 0
+
+
 def run_knowledge_duplicates_standalone(
     limit: int = 20, as_json: bool = False
 ) -> int:
@@ -3871,7 +3980,7 @@ def _parse_export_args(
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / stats / kb / eval / kb-export / "
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
-    "kb-categories / kb-delete / kb-duplicates / "
+    "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
     "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-pin / session-export / "
     "sessions-export / trips-export / user-export"
@@ -4091,6 +4200,30 @@ def main():
                 sys.exit(2)
             sys.exit(
                 run_knowledge_duplicates_standalone(limit, as_json=as_json)
+            )
+        if arg == "kb-dedupe":
+            dry_run = False
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                lowered = item.lower()
+                if lowered == "--dry-run":
+                    dry_run = True
+                elif lowered == "--json":
+                    as_json = True
+                else:
+                    valid = False
+                    break
+            if not valid:
+                print(
+                    "用法：python cli.py kb-dedupe [--dry-run] [--json]"
+                    "（每组保留最小 id）"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_knowledge_dedupe_standalone(
+                    dry_run=dry_run, as_json=as_json
+                )
             )
         if arg == "stats":
             parsed_stats = _parse_user_and_json_args(sys.argv[2:])
