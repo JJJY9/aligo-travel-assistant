@@ -499,7 +499,7 @@ python cli.py
 
 偏好列表（不进入交互）：`python cli.py preferences <user_id> [--json]` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否；`--json` 输出原始值）。
 
-行程列表（不进入交互）：`python cli.py trips <user_id> [--json]` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示）；`--json` 输出原始行程（含状态与冲突）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
+行程列表（不进入交互）：`python cli.py trips <user_id> [--json]` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示）；`--json` 输出原始行程（含状态与冲突）；`python cli.py trip-add <user_id> --destination X --start YYYY-MM-DD [--origin X] [--end YYYY-MM-DD] [--purpose X] [--json]` 保存一条行程（与面板 / 对话同一存储路径：同路线同日期更新既有记录，并提示日期重叠）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id> [--dry-run] [--json]` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），`--dry-run` 只列出将被删除的记录，`--json` 输出结构化结果（将删除 / 已删除条目与歧义 id）；同一 trip_id 出现在多条不同行程里（历史数据异常）时拒绝自动删除并提示人工处理；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
