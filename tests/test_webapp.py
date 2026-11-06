@@ -2732,6 +2732,46 @@ def test_tombstone_redis_retry_after_failure():
     print("✓ 共享墓碑故障回退并在冷却后恢复")
 
 
+def test_shared_tombstone_healed_on_read(monkeypatch):
+    """共享墓碑首次写入失败后，命中本地墓碑的读取会顺带补写（自愈）。"""
+
+    class _FlakySharedRedis:
+        def __init__(self):
+            self.data = {}
+            self.fail = True
+            self.setex_calls = 0
+
+        def setex(self, key, ttl, value):
+            if self.fail:
+                raise ConnectionError("redis down")
+            self.data[key] = value
+            self.setex_calls += 1
+
+        def exists(self, key):
+            if self.fail:
+                raise ConnectionError("redis down")
+            return int(key in self.data)
+
+        def delete(self, key):
+            self.data.pop(key, None)
+
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    client = _FlakySharedRedis()
+    state._redis_client = client
+    state._tombstones_shared = False
+
+    state.mark_deleted("u-heal", "s-heal")
+    assert "aligo:deleted:u-heal:s-heal" not in client.data, "首次写入失败"
+    assert state.is_recently_deleted("u-heal", "s-heal") is True
+
+    client.fail = False
+    state._tombstone_retry_at = 0.0  # 冷却结束
+    assert state.is_recently_deleted("u-heal", "s-heal") is True
+    assert "aligo:deleted:u-heal:s-heal" in client.data, "命中本地墓碑时应补写共享墓碑"
+    assert client.setex_calls == 1
+    print("✓ 共享墓碑在读取时自愈")
+
+
 def test_tombstone_reconnects_when_redis_appears_later(monkeypatch):
     """启动时没有 Redis 客户端，恢复后通过共享客户端工厂重新接入。"""
     from webapp import server as server_module

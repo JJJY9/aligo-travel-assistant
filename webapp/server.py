@@ -749,15 +749,29 @@ class AligoWebApp:
         if not session_id:
             return False
         key = self._session_key(user_id, session_id)
+        remaining: float | None = None
         with self._tombstone_lock:
             created = self._deleted_sessions.get(key)
             if created is not None:
-                if time.monotonic() - created <= self.tombstone_ttl_sec:
-                    return True
-                self._deleted_sessions.pop(key, None)
+                elapsed = time.monotonic() - created
+                if elapsed <= self.tombstone_ttl_sec:
+                    remaining = self.tombstone_ttl_sec - elapsed
+                else:
+                    self._deleted_sessions.pop(key, None)
         client = self._shared_tombstones()
         if client is not None:
             try:
+                if remaining is not None:
+                    # 本地墓碑仍有效：顺带补写共享墓碑（首次写入失败后的
+                    # 自愈）。TTL 用剩余时长，不延长删除窗口
+                    client.setex(
+                        self._deleted_key(user_id, session_id),
+                        max(1, int(remaining)),
+                        "1",
+                    )
+                    self._tombstones_shared = True
+                    self._tombstone_retry_at = 0.0
+                    return True
                 exists = bool(
                     client.exists(self._deleted_key(user_id, session_id))
                 )
@@ -767,7 +781,7 @@ class AligoWebApp:
                 self._tombstones_shared = True
                 self._tombstone_retry_at = 0.0
                 return exists
-        return False
+        return remaining is not None
 
     def close_all(self) -> None:
         """关闭所有会话（进程退出时调用）。"""
