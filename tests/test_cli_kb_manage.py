@@ -137,6 +137,103 @@ def test_categories_error(monkeypatch):
     print("✓ kb-categories 读取失败返回 1")
 
 
+def test_search_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
+    )
+    code, out = _capture(cli.run_knowledge_search_standalone, "住宿")
+    assert code == 1 and "不可用" in out
+    print("✓ kb-search 知识库不可用时返回 1")
+
+
+def test_search_success_and_json(monkeypatch):
+    calls = {}
+
+    def fake_search(query, top_k=5):
+        calls.update(query=query, top_k=top_k)
+        return [
+            {
+                "id": 7,
+                "content": "一线城市住宿不超过 500 元/晚",
+                "metadata": {"category": "住宿"},
+                "distance": 0.1234,
+            },
+            {"id": 3, "content": "交通标准", "metadata": {}},
+        ]
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "search_documents", fake_search)
+    code, out = _capture(cli.run_knowledge_search_standalone, "住宿标准", top_k=3)
+    assert code == 0
+    assert calls == {"query": "住宿标准", "top_k": 3}
+    assert "语义检索「住宿标准」：2 条结果" in out
+    assert "#7 · 住宿 · 相似度 0.123" in out
+    assert "一线城市住宿不超过" in out
+    assert "#3" in out and "交通标准" in out
+
+    code, out = _capture(
+        cli.run_knowledge_search_standalone, "住宿", as_json=True
+    )
+    assert code == 0
+    data = json.loads(out)
+    assert data["query"] == "住宿" and data["top_k"] == 5
+    assert len(data["results"]) == 2
+    print("✓ kb-search 文本 / JSON 输出")
+
+
+def test_search_empty_and_error(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "search_documents", lambda q, top_k=5: [])
+    code, out = _capture(cli.run_knowledge_search_standalone, "不存在的内容")
+    assert code == 0 and "没有与「不存在的内容」相关的内容" in out
+
+    def boom(q, top_k=5):
+        raise RuntimeError("Milvus 故障")
+
+    monkeypatch.setattr(knowledge_admin, "search_documents", boom)
+    code, out = _capture(cli.run_knowledge_search_standalone, "住宿")
+    assert code == 1 and "检索失败" in out
+    print("✓ kb-search 无结果 / 检索失败")
+
+
+def test_kb_search_args(monkeypatch):
+    assert cli._parse_kb_search_args(["住宿"]) == ("住宿", 5, False)
+    assert cli._parse_kb_search_args(["住宿", "标准", "--top-k", "3"]) == (
+        "住宿 标准",
+        3,
+        False,
+    )
+    assert cli._parse_kb_search_args(["--top-k=10", "住宿", "--json"]) == (
+        "住宿",
+        10,
+        True,
+    )
+    assert cli._parse_kb_search_args(["--top-k"]) is None
+    assert cli._parse_kb_search_args(["--top-k", "0", "x"]) is None
+    assert cli._parse_kb_search_args(["--top-k", "61", "x"]) is None
+    assert cli._parse_kb_search_args(["--json"]) is None, "缺关键词"
+    assert cli._parse_kb_search_args(["x", "-y"]) is None, "未知参数"
+    print("✓ kb-search 参数解析")
+
+
+def test_kb_search_dispatch(monkeypatch):
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "search_documents",
+        lambda q, top_k=5: [{"id": 1, "content": "内容", "metadata": {}}],
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "kb-search", "住宿", "--top-k", "2"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert "语义检索「住宿」" in buf.getvalue()
+    print("✓ dispatch 层 kb-search 正常执行")
+
+
 def test_delete_success(monkeypatch):
     calls = []
 
@@ -274,6 +371,11 @@ if __name__ == "__main__":
         test_categories_prints,
         test_categories_json_and_empty,
         test_categories_error,
+        test_search_unavailable,
+        test_search_success_and_json,
+        test_search_empty_and_error,
+        test_kb_search_args,
+        test_kb_search_dispatch,
     ):
         mp = pytest.MonkeyPatch()
         try:
