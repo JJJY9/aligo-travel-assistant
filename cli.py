@@ -3524,6 +3524,150 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
     return 0
 
 
+def run_preference_set_standalone(
+    user_id: str, pref_type: str, value: str, as_json: bool = False
+) -> int:
+    """新增 / 覆盖一条偏好（`python cli.py pref-set <user_id> <type> <value> [--json]`）。
+
+    与 Web 面板的 PUT ``/api/preferences/{type}`` 同一存储语义：值按原样
+    保存；列表类偏好可重复设置（对话侧按合并语义追加去重）。
+
+    Returns:
+        0 保存成功；1 参数 / 读写失败
+    """
+    import re
+
+    from utils.result_formatter import preference_label
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
+        return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
+    text_value = value.strip()
+    if not text_value:
+        return _fail("偏好值不能为空")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            store.save_preference(pref_type, text_value)
+            saved = store.get_preference(pref_type)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"保存偏好失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if as_json:
+        from utils.json_safe import sanitize_json
+
+        print(
+            json.dumps(
+                sanitize_json(
+                    {
+                        "ok": True,
+                        "user_id": user_id,
+                        "type": pref_type,
+                        "value": saved,
+                    }
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if isinstance(saved, list):
+        display = "、".join(str(item) for item in saved) or "—"
+    elif isinstance(saved, bool):
+        display = "是" if saved else "否"
+    elif saved is None or saved == "":
+        display = "—"
+    else:
+        display = str(saved)
+    print(f"已设置偏好 {preference_label(pref_type)}：{display}")
+    return 0
+
+
+def run_preference_delete_standalone(
+    user_id: str, pref_type: str, as_json: bool = False
+) -> int:
+    """删除一条偏好（`python cli.py pref-delete <user_id> <type> [--json]`）。
+
+    Returns:
+        0 删除成功；1 参数 / 读写失败（含偏好未设置）
+    """
+    import re
+
+    from utils.result_formatter import preference_label
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
+        return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            removed = store.delete_preference(pref_type)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"删除偏好失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+    if not removed:
+        return _fail(f"偏好 {pref_type} 未设置或已删除")
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "type": pref_type,
+                    "deleted": True,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    print(f"已删除偏好 {preference_label(pref_type)}")
+    return 0
+
+
 def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool] | None:
     """解析 kb-export 的 [path] [--force]；冲突 / 未知参数返回 None。"""
     target: str | None = None
@@ -3574,7 +3718,7 @@ _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / stats / kb / eval / kb-export / "
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / "
-    "preferences / "
+    "preferences / pref-set / pref-delete / "
     "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-export / "
     "sessions-export / trips-export / user-export"
 )
@@ -3809,6 +3953,56 @@ def main():
             pref_user, pref_json = parsed_pref
             sys.exit(
                 run_preferences_list_standalone(pref_user, as_json=pref_json)
+            )
+        if arg == "pref-set":
+            target = other = value = None
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                if item.lower() == "--json":
+                    as_json = True
+                elif item.startswith("-") or value is not None:
+                    valid = False
+                    break
+                elif target is None:
+                    target = item
+                elif other is None:
+                    other = item
+                else:
+                    value = item
+            if not valid or value is None:
+                print(
+                    "用法：python cli.py pref-set <user_id> <偏好类型> <值> [--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_preference_set_standalone(
+                    target, other, value, as_json=as_json
+                )
+            )
+        if arg == "pref-delete":
+            target = other = None
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                if item.lower() == "--json":
+                    as_json = True
+                elif item.startswith("-") or other is not None:
+                    valid = False
+                    break
+                elif target is None:
+                    target = item
+                else:
+                    other = item
+            if not valid or other is None:
+                print(
+                    "用法：python cli.py pref-delete <user_id> <偏好类型> [--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_preference_delete_standalone(
+                    target, other, as_json=as_json
+                )
             )
         if arg == "trip-add":
             parsed_trip_add = _parse_trip_add_args(sys.argv[2:])
