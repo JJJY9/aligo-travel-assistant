@@ -1169,6 +1169,66 @@ def test_statistics_tolerates_non_object_entries(monkeypatch):
     print("✓ 统计口径容忍非对象条目且不触发降级")
 
 
+def test_read_corrects_shadow_cache_with_external_writes(monkeypatch):
+    """读路径用 Redis 全窗口校正影子缓存：外部实例新写入的消息要进入影子。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [_message("user", "A", "2000-01-01T00:00:00")]
+    memory = module.RedisShortTermMemory(client, "s-correct", max_turns=10, user_id="u1")
+    assert [item["content"] for item in memory.get_recent_context()] == ["A"]
+    client.data.append(_message("assistant", "B", "2000-01-01T00:00:01"))
+    assert [item["content"] for item in memory.get_recent_context()] == ["A", "B"]
+    assert [item["content"] for item in memory._fallback.get_recent_context()] == [
+        "A",
+        "B",
+    ]
+    print("✓ 读路径校正影子缓存（外部写入可见）")
+
+
+def test_pending_journal_eviction_tiers(monkeypatch):
+    """注册表淘汰优先级：空日志 → 只含新增 → 任意（含删除类）最后牺牲。"""
+    import threading
+
+    from context import short_term_memory as module
+
+    class _Journal:
+        def __init__(self, ops):
+            self.lock = threading.Lock()
+            self.ops = list(ops)
+
+    saved = dict(module._PENDING_JOURNALS)
+    try:
+        module._PENDING_JOURNALS.clear()
+        module._PENDING_JOURNALS["empty"] = _Journal([])
+        assert module._evict_journal_locked() is None
+        assert "empty" not in module._PENDING_JOURNALS
+
+        module._PENDING_JOURNALS["adds"] = _Journal([("add", ("x", "op1"))])
+        assert module._evict_journal_locked() == ("adds", 1, "消息")
+
+        module._PENDING_JOURNALS["dels"] = _Journal(
+            [("truncate", ("q", "op2", "cut"))]
+        )
+        assert module._evict_journal_locked() == ("dels", 1, "操作")
+
+        # 被占用的日志跳过，优先淘汰可拿锁的
+        locked = _Journal([("add", ("y", "op3"))])
+        module._PENDING_JOURNALS["locked"] = locked
+        module._PENDING_JOURNALS["free"] = _Journal([("add", ("z", "op4"))])
+        locked.lock.acquire()
+        try:
+            assert module._evict_journal_locked() == ("free", 1, "消息")
+            assert "locked" in module._PENDING_JOURNALS
+        finally:
+            locked.lock.release()
+    finally:
+        module._PENDING_JOURNALS.clear()
+        module._PENDING_JOURNALS.update(saved)
+    print("✓ 延迟操作日志淘汰优先级")
+
+
 def test_outage_truncate_without_expect_replays(monkeypatch):
     """未提供 expect 的最后一轮删除在故障期也要登记，恢复后补删。"""
     from context import short_term_memory as module
