@@ -61,12 +61,25 @@ _TRANSIENT_ERROR_MARKERS = (
 )
 
 
+_TEXT_SCALAR_KEYS = ("city", "name", "destination", "value", "text", "label")
+
+
 def _as_text(value: Any) -> str:
-    """把模型输出（可能为列表 / 数字 / None）转为可持久化的单行文本。"""
+    """把模型输出（可能为列表 / 对象 / 数字 / None）转为可持久化的单行文本。
+
+    对象不能直接 str()：Python repr 是单引号伪 JSON，会污染行程历史与
+    ``frequent_destinations`` 统计键并让去重永远失配；优先取常见标量字段
+    （``{"city": "杭州"}`` → ``杭州``），否则输出合法 JSON 文本。
+    """
     if isinstance(value, (list, tuple)):
-        return "、".join(
-            text for text in (str(item).strip() for item in value) if text
-        )
+        return "、".join(text for text in (_as_text(item) for item in value) if text)
+    if isinstance(value, dict):
+        for key in _TEXT_SCALAR_KEYS:
+            if key in value:
+                text = _as_text(value.get(key))
+                if text:
+                    return text
+        return json.dumps(value, ensure_ascii=False)
     return str(value or "").strip()
 
 
@@ -369,7 +382,12 @@ class OrchestrationAgent(AgentBase):
                         continue
                     pref_type = item.get("type")
                     value = item.get("value")
-                    if not pref_type or not has_preference_value(value):
+                    if not isinstance(pref_type, str) or not pref_type.strip():
+                        # 模型可能把 type 包成数组 / 对象：不可哈希值当偏好键
+                        # 会抛 TypeError（上下文合并）或污染长期记忆
+                        continue
+                    pref_type = pref_type.strip()
+                    if not has_preference_value(value):
                         continue
                     action = str(item.get("action") or "replace").strip().lower()
                     if action in {"append", "add", "追加"}:
@@ -734,7 +752,12 @@ class OrchestrationAgent(AgentBase):
                         pref_value = pref_item.get("value")
                         pref_action = str(pref_item.get("action") or "replace").strip().lower()
 
-                        if not pref_type or not has_preference_value(pref_value):
+                        if not isinstance(pref_type, str) or not pref_type.strip():
+                            # 不可哈希的 type（数组 / 对象）会作为偏好键写入
+                            # 长期记忆，此后每次 get_preference 都抛 TypeError
+                            continue
+                        pref_type = pref_type.strip()
+                        if not has_preference_value(pref_value):
                             continue
 
                         # 根据 action 决定操作（模型可能返回 Append / add / 追加 等变体）
@@ -808,8 +831,10 @@ class OrchestrationAgent(AgentBase):
                     end_date = _as_text(event_data.get("end_date"))
                     purpose = _as_text(event_data.get("trip_purpose")) or "旅游"
 
-                    # 保存到长期记忆（只要有目的地就保存）
-                    if destination:
+                    # 保存到长期记忆：必须有出发日期——没有日期的行程无法参与
+                    # 去重（_find_same_trip 对缺 start_date 直接跳过），复述或
+                    # 「重新生成」会让同一条无日期行程被反复写入、统计累加
+                    if destination and start_date:
                         self.memory_manager.long_term.save_trip_history({
                             "origin": origin,
                             "destination": destination,

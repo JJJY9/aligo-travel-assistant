@@ -1106,6 +1106,118 @@ def test_failed_preference_not_merged_into_later_context():
     print("✓ 失败偏好不进入后续批次上下文")
 
 
+def test_preference_non_string_type_skipped():
+    """模型把偏好 type 包成数组 / 对象 / 空白串：跳过不落库，不抛 TypeError。"""
+    memory = _StubMemory()
+    OrchestrationAgent(agent_registry={}, memory_manager=memory)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": ["hotel_brands"], "value": "汉庭"},
+                            {"type": {"key": "airlines"}, "value": "东航"},
+                            {"type": "   ", "value": "如家"},
+                            {"type": "airlines", "value": "国航"},
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert memory.long_term.get_preference() == {"airlines": "国航"}
+    print("✓ 非字符串偏好 type 不落库")
+
+
+def test_context_merge_skips_non_string_pref_type():
+    """上下文合并路径同样跳过非字符串 type（不可哈希值会抛 TypeError）。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    context = orchestrator._context_with_previous_preferences(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": ["hotel_brands"], "value": "汉庭"},
+                            {"type": " airlines ", "value": "国航"},
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert context["user_preferences"] == {"airlines": "国航"}, context
+    print("✓ 上下文合并跳过非字符串 type 并 strip")
+
+
+def test_trip_without_start_date_not_saved():
+    """无出发日期的行程无法参与去重，不落库（复述 / 重新生成不再重复累加）。"""
+    memory = _StubMemory()
+    OrchestrationAgent(agent_registry={}, memory_manager=memory)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {"destination": "杭州", "start_date": None},
+                },
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "杭州行程", "daily_plans": []}},
+                },
+            },
+        ],
+    )
+    assert memory.long_term.get_trip_history(limit=5) == []
+    print("✓ 无出发日期的行程不落库")
+
+
+def test_trip_destination_dict_uses_scalar_field():
+    """对象型目的地取标量字段（{"city": "杭州"} → 杭州），不用 Python repr。"""
+    memory = _StubMemory()
+    OrchestrationAgent(agent_registry={}, memory_manager=memory)._update_memory(
+        {},
+        [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "destination": {"city": "杭州"},
+                        "start_date": "2026-12-01",
+                    },
+                },
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "杭州行程", "daily_plans": []}},
+                },
+            },
+        ],
+    )
+    trips = memory.long_term.get_trip_history(limit=5)
+    assert trips and trips[-1]["destination"] == "杭州", trips
+    assert "{" not in trips[-1]["destination"]
+    print("✓ 对象型目的地取标量字段落库")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -1136,6 +1248,10 @@ if __name__ == "__main__":
     test_schedule_names_are_trimmed()
     test_duplicate_schedule_agents_deduped()
     test_failed_preference_not_merged_into_later_context()
+    test_preference_non_string_type_skipped()
+    test_context_merge_skips_non_string_pref_type()
+    test_trip_without_start_date_not_saved()
+    test_trip_destination_dict_uses_scalar_field()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)

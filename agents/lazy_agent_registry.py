@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import sys
 from pathlib import Path
+from typing import Any
 
 from agentscope.agent import AgentBase
 from rich.console import Console
@@ -40,6 +41,8 @@ class LazyAgentRegistry:
         
         # 技能映射表: skill_name -> agent_script_path
         self._skill_map: dict[str, Path] = {}
+        # frontmatter name -> 技能目录名（意图 prompt 展示的是前者）
+        self._name_aliases: dict[str, str] = {}
         
         # 发现技能
         self._discover_skills()
@@ -61,14 +64,33 @@ class LazyAgentRegistry:
             return
 
         self._skill_map.update(skill_scripts(self.skills_root))
+        # 意图 prompt 展示的是 SKILL.md frontmatter 的 name；注册器必须也能
+        # 解析它，否则自定义技能（name != 目录名）被模型调度时永远「未注册」
+        try:
+            from utils.skill_loader import SkillLoader
+
+            loader = SkillLoader(str(self.skills_root))
+            for directory, script_path in self._skill_map.items():
+                skill_md = Path(script_path).parent.parent / "SKILL.md"
+                info = loader._parse_skill_md(str(skill_md)) or {}
+                name = info.get("name")
+                if isinstance(name, str) and name and name != directory:
+                    self._name_aliases[name] = directory
+        except Exception as exc:  # noqa: BLE001 - 别名只是加分项，失败不影响发现
+            self.console.print(f"[dim]读取技能 frontmatter 名称失败: {exc}[/dim]")
 
     def _resolve_agent_name(self, agent_name: str) -> str | None:
         """解析智能体名称到技能目录名"""
         # 1. 直接匹配技能名
         if agent_name in self._skill_map:
             return agent_name
-            
-        # 2. 尝试遗留映射
+
+        # 2. SKILL.md frontmatter name（意图 prompt 展示的可调度名）
+        alias = self._name_aliases.get(agent_name)
+        if alias in self._skill_map:
+            return alias
+
+        # 3. 尝试遗留映射
         if agent_name in self._legacy_mapping:
             skill_name = self._legacy_mapping[agent_name]
             if skill_name in self._skill_map:
@@ -145,6 +167,17 @@ class LazyAgentRegistry:
             import traceback
             traceback.print_exc()
             raise
+
+    def __setitem__(self, agent_name: str, agent: Any) -> None:
+        """注册自定义智能体（与 dict 注册表同一语义）：写入缓存直接命中。"""
+        self.cache[agent_name] = agent
+
+    def __delitem__(self, agent_name: str) -> None:
+        """注销智能体：移除缓存实例；未加载过的技能从发现表里移除。"""
+        if self.cache.pop(agent_name, None) is None:
+            skill_name = self._resolve_agent_name(agent_name)
+            if skill_name is not None:
+                self.cache.pop(skill_name, None)
 
     def __contains__(self, agent_name: str) -> bool:
         return self._resolve_agent_name(agent_name) is not None or agent_name in self.cache

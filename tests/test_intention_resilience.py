@@ -235,6 +235,38 @@ def test_content_block_list_is_rendered_as_text():
     print("✓ content block 列表按纯文本渲染")
 
 
+class _NonListScheduleModel:
+    """把 agent_schedule 误写成字符串 / 对象的模型输出。"""
+
+    def __init__(self, schedule):
+        self.schedule = schedule
+
+    async def __call__(self, messages):
+        return json.dumps(
+            {
+                "reasoning": "x",
+                "intents": [],
+                "key_entities": {},
+                "rewritten_query": "q",
+                "agent_schedule": self.schedule,
+            },
+            ensure_ascii=False,
+        )
+
+
+def test_non_list_schedule_falls_back_to_default():
+    """agent_schedule 为字符串 / null 时降级为默认调度，不能静默 no_agents。"""
+    for schedule in ("itinerary_planning", None, {"agent_name": "x"}):
+        agent = IntentionAgent(
+            name="IntentionAgent", model=_NonListScheduleModel(schedule)
+        )
+        result = json.loads(asyncio.run(agent.reply(_user_msg())).content)
+        planned = result.get("agent_schedule")
+        assert isinstance(planned, list) and planned, (schedule, planned)
+        assert planned[0]["agent_name"] == "information_query", (schedule, planned)
+    print("✓ 非列表 agent_schedule 降级为默认信息查询")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
@@ -247,4 +279,5 @@ if __name__ == "__main__":
     test_template_echo_before_real_result_uses_last()
     test_single_msg_call_does_not_leak_previous_history()
     test_content_block_list_is_rendered_as_text()
+    test_non_list_schedule_falls_back_to_default()
     print("\n全部通过")

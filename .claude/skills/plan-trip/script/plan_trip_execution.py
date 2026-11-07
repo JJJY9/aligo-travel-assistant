@@ -84,7 +84,18 @@ async def plan_trip(user_query: str):
     intention_result = await intention_agent.reply(user_msg)
     intention_data = json.loads(intention_result.content)
 
-    print(f"✓ 识别到意图: {', '.join([i['type'] for i in intention_data.get('intents', [])])}")
+    # intents 的元素可能是字符串（模型把对象数组写成了字符串列表）
+    raw_intents = intention_data.get("intents")
+    intent_names = (
+        [
+            str(item.get("type"))
+            for item in raw_intents
+            if isinstance(item, dict) and item.get("type")
+        ]
+        if isinstance(raw_intents, list)
+        else []
+    )
+    print(f"✓ 识别到意图: {', '.join(intent_names) or '（未识别）'}")
     print(f"✓ 改写后的查询: {intention_data.get('rewritten_query', user_query)}")
 
     # 2. 加载子智能体

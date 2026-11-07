@@ -130,6 +130,35 @@ def test_keys_include_legacy_names(monkeypatch):
     print("✓ keys 包含已安装技能的遗留名称")
 
 
+def test_frontmatter_name_alias_resolves(monkeypatch):
+    """意图 prompt 展示 frontmatter name：注册器必须能解析它（name≠目录名）。"""
+    root = Path(tempfile.mkdtemp())
+    _write_skill(root, "foo", _AGENT_SOURCE)
+    (root / "foo" / "SKILL.md").write_text(
+        "---\nname: Foo Travel Helper\ndescription: 自定义技能\n---\n正文",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(lazy_agent_registry, "resolve_skills_root", lambda: root)
+    registry = LazyAgentRegistry(model="fake-model", cache={})
+    assert "foo" in registry
+    assert "Foo Travel Helper" in registry, "frontmatter name 也要能解析"
+    agent = registry["Foo Travel Helper"]
+    assert getattr(agent, "name", "") == "Foo Travel Helper"
+
+
+def test_setitem_and_delitem_support(monkeypatch):
+    """注册 / 注销自定义智能体：与 dict 注册表同一语义，不再抛 TypeError。"""
+    registry = _registry(monkeypatch, {"demo": _AGENT_SOURCE})
+    marker = object()
+    registry["custom"] = marker
+    assert registry["custom"] is marker and "custom" in registry
+    del registry["custom"]
+    assert "custom" not in registry
+    # 已发现但未加载的技能：注销不抛错（发现表保留）
+    del registry["demo"]
+    assert "demo" in registry
+
+
 if __name__ == "__main__":
     for case in (
         test_uninitialized_agents_not_cached,
@@ -138,6 +167,8 @@ if __name__ == "__main__":
         test_import_failure_propagates,
         test_missing_agent_class,
         test_keys_include_legacy_names,
+        test_frontmatter_name_alias_resolves,
+        test_setitem_and_delitem_support,
     ):
         mp = pytest.MonkeyPatch()
         try:
