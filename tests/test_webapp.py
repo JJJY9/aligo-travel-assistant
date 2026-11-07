@@ -5626,8 +5626,6 @@ def test_early_413_metrics_labeled_as_import(monkeypatch):
 
 def test_doctor_rate_limited(monkeypatch):
     """未鉴权的自检接口接入知识库桶限流。"""
-    import types as _types
-
     from webapp import server as server_module
 
     async def fake_run_doctor(include_network=False):
