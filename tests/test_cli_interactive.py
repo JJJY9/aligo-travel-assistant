@@ -284,7 +284,7 @@ def _make_cli_stub():
     """构造可跑 process_query 的轻量 CLI 桩（假记忆 / 假意图 / 假编排）。"""
     agent = cli.AligoCLI()
     agent.console = Console(file=io.StringIO(), force_terminal=False, width=100)
-    events = {"reload": 0, "messages": []}
+    events = {"reload": 0, "messages": [], "staged": [], "persisted": []}
 
     class _Memory:
         def __init__(self):
@@ -293,8 +293,15 @@ def _make_cli_stub():
         def reload_long_term(self):
             events["reload"] += 1
 
+        def persist_message(self, role, content):
+            events["persisted"].append(role)
+
+        def stage_message(self, role, content, metadata=None):
+            events["staged"].append(content)
+
         def add_message(self, role, content, metadata=None):
-            events["messages"].append(role)
+            self.persist_message(role, content)
+            self.stage_message(role, content, metadata)
 
         def get_recent_context(self, n_turns=5):
             return []
@@ -325,8 +332,41 @@ def test_process_query_reloads_long_term_each_turn():
     agent, events = _make_cli_stub()
     asyncio.run(agent.process_query("你好"))
     assert events["reload"] == 1, "每轮对话前必须重载长期记忆"
-    assert events["messages"] == ["user", "assistant"]
+    assert events["persisted"] == ["user", "assistant"]
+    assert events["staged"][0] == "你好", "编排前暂存本轮提问"
+    assert len(events["staged"]) == 2, "用户只能暂存一次（不能重复），助手回复正常进短期"
     print("✓ CLI 每轮对话前重载长期记忆")
+
+
+def test_process_query_stages_user_message_before_orchestration():
+    """编排期间短期记忆必须已含本轮提问（_prepare_context 读取用户本轮原话）。"""
+    agent, events = _make_cli_stub()
+    seen = {}
+
+    class _InspectingOrchestrator:
+        async def reply(self, intention, on_event=None):
+            seen["staged"] = list(events["staged"])
+            return _TextMessage(json.dumps({"results": []}))
+
+    agent.orchestrator = _InspectingOrchestrator()
+    asyncio.run(agent.process_query("我搬家到上海了"))
+    assert seen["staged"] == ["我搬家到上海了"], seen
+
+
+def test_process_query_failure_leaves_no_long_term_user_turn():
+    """编排失败时长期记忆不落孤儿用户轮，但短期上下文保留本轮提问。"""
+
+    class _FailingOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise RuntimeError("gateway down")
+
+    agent, events = _make_cli_stub()
+    agent.orchestrator = _FailingOrchestrator()
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.process_query("你好"))
+    assert events["persisted"] == [], "失败时不得写长期记忆"
+    assert events["staged"] == ["你好"], "短期记忆应保留本轮提问供下一轮上下文"
+    print("✓ 编排失败不落孤儿用户轮")
 
 
 def test_process_query_memory_failure_not_counted_by_breaker():
@@ -367,6 +407,8 @@ if __name__ == "__main__":
         test_read_commands_reload_snapshot()
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
         test_process_query_reloads_long_term_each_turn()
+        test_process_query_stages_user_message_before_orchestration()
+        test_process_query_failure_leaves_no_long_term_user_turn()
         test_process_query_memory_failure_not_counted_by_breaker()
         test_process_query_releases_probe_on_early_failure(_mp)
     finally:

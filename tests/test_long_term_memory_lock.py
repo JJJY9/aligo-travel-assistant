@@ -121,6 +121,26 @@ def test_file_lock_normalizes_oserror(monkeypatch, tmp_path):
     print("✓ 文件锁把 OSError 归一为 TimeoutError")
 
 
+def test_file_lock_close_error_does_not_mask_timeout(monkeypatch, tmp_path):
+    """初始字节写盘失败时 close 重抛的 OSError 不能覆盖 TimeoutError 契约。"""
+    from utils import file_lock as lock_module
+
+    class _FailingHandle:
+        def close(self):
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: _FailingHandle())
+
+    def fail_write(handle):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lock_module, "_ensure_lockable", fail_write)
+    with pytest.raises(TimeoutError):
+        with lock_module.file_lock(str(tmp_path / "demo.json")):
+            pass
+    print("✓ close 重抛 OSError 不覆盖 TimeoutError 契约")
+
+
 def _first_lock_timeout(monkeypatch):
     """让第一次 file_lock 抛 TimeoutError（模拟加载时等锁超时）。"""
     from context import long_term_memory as lt

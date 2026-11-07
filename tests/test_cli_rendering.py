@@ -244,6 +244,40 @@ def test_repl_cancelled_error_returns_to_prompt(monkeypatch):
     print("✓ Ctrl-C（CancelledError）回到提示符")
 
 
+def test_repl_memory_failure_keeps_session(monkeypatch):
+    """记忆写盘失败（MemoryPersistenceError 是 RuntimeError 子类）只报错，不退出会话。"""
+    from utils.errors import MemoryPersistenceError
+
+    instance = _new_cli()
+    calls = {"prompt": 0}
+
+    async def fake_initialize(self):
+        return None
+
+    def fake_prompt(*args, **kwargs):
+        calls["prompt"] += 1
+        if calls["prompt"] == 1:
+            return "你好"
+        raise EOFError
+
+    async def broken_query(self, text):
+        raise MemoryPersistenceError("disk full")
+
+    monkeypatch.setattr(cli_module.AligoCLI, "initialize_system", fake_initialize)
+    monkeypatch.setattr(cli_module.AligoCLI, "process_query", broken_query)
+    monkeypatch.setattr(
+        cli_module, "Prompt", type("P", (), {"ask": staticmethod(fake_prompt)})
+    )
+    monkeypatch.setattr(instance, "print_banner", lambda: None)
+    asyncio.run(instance.run())
+    output = instance._buffer.getvalue()
+    assert calls["prompt"] == 2, "写盘失败后必须回到提示符（不能被当成 stdin 故障退出）"
+    assert "无法读取输入" not in output
+    assert "错误: disk full" in output
+    assert "未检测到输入" in output
+    print("✓ 一轮记忆写盘失败不终止 REPL")
+
+
 def test_repl_input_unavailable_exits(monkeypatch):
     instance = _new_cli()
 
@@ -302,6 +336,7 @@ if __name__ == "__main__":
         test_model_init_failure_exits_cleanly(mp)
         test_print_stdout_swallows_pipe_errors_only(mp)
         test_repl_cancelled_error_returns_to_prompt(mp)
+        test_repl_memory_failure_keeps_session(mp)
         test_repl_input_unavailable_exits(mp)
     finally:
         mp.undo()
