@@ -5876,6 +5876,52 @@ def test_knowledge_import_uses_dedicated_limiter(monkeypatch):
     print("✓ 备份导入走独立限流桶")
 
 
+def test_user_data_import_api_with_knowledge(monkeypatch):
+    """一体化备份：/api/import 同时恢复知识片段；知识库失败不影响用户数据。"""
+    from utils import knowledge_admin as admin_module
+
+    target = _unique_user("web_test_import_kb")
+    calls = []
+
+    def fake_import(documents):
+        calls.append(documents)
+        return {
+            "imported": len(documents),
+            "skipped": 0,
+            "skipped_invalid": 0,
+            "skipped_duplicate": 0,
+        }
+
+    monkeypatch.setattr(admin_module, "import_documents", fake_import)
+    try:
+        client = _client()
+        backup = {
+            "backup": {
+                "user_id": "src",
+                "knowledge": [{"content": "知识一", "metadata": {}}],
+            }
+        }
+        response = client.post(
+            "/api/import", params={"user_id": target}, json=backup
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["knowledge_imported"] == 1
+        assert calls and calls[0][0]["content"] == "知识一"
+
+        def missing(documents):
+            raise FileNotFoundError("知识库未初始化")
+
+        monkeypatch.setattr(admin_module, "import_documents", missing)
+        response = client.post(
+            "/api/import", params={"user_id": target}, json=backup
+        )
+        assert response.status_code == 200
+        assert "knowledge_error" in response.json()
+        print("✓ /api/import 一体化备份（知识片段恢复 / 失败上报）")
+    finally:
+        _cleanup(target)
+
 if __name__ == "__main__":
     test_index_page()
     test_route_path_normalization()
@@ -5894,6 +5940,7 @@ if __name__ == "__main__":
         test_get_session_constructs_outside_lock,
         test_destructive_endpoints_503_while_pg_cooling_down,
         test_import_with_root_path_uses_extended_limit,
+        test_user_data_import_api_with_knowledge,
         test_import_trailing_slash_redirects,
         test_early_413_metrics_labeled_as_import,
         test_doctor_rate_limited,

@@ -58,10 +58,12 @@ class _FakeStore:
         self.closed = True
 
 
-def _run(user_id, target=None):
+def _run(user_id, target=None, with_knowledge=False):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = cli.run_user_export_standalone(user_id, target)
+        code = cli.run_user_export_standalone(
+            user_id, target, with_knowledge=with_knowledge
+        )
     return code, buf.getvalue()
 
 
@@ -171,6 +173,53 @@ def test_user_export_dispatch(monkeypatch):
     print("✓ dispatch 层 user-export 正常执行 / 严格参数")
 
 
+def test_user_export_with_knowledge(monkeypatch):
+    """--with-knowledge：知识库片段写入同一份 JSON；导出失败则中止。"""
+    import tempfile
+    from pathlib import Path
+
+    from utils import knowledge_admin as admin_module
+
+    store = _FakeStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    docs = [{"content": "知识片段", "metadata": {"category": "住宿"}}]
+    monkeypatch.setattr(admin_module, "export_documents", lambda: docs)
+    out_dir = Path(tempfile.mkdtemp())
+    code, out = _run("u-kb", str(out_dir), with_knowledge=True)
+    assert code == 0
+    json_path = next(path for path in out_dir.iterdir() if path.suffix == ".json")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert data["knowledge"] == docs
+
+    def boom():
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(admin_module, "export_documents", boom)
+    code, out = _run("u-kb", str(Path(tempfile.mkdtemp())), with_knowledge=True)
+    assert code == 1 and "读取知识库失败" in out, "导出失败不得产出缺知识段的备份"
+    print("✓ user-export --with-knowledge 一体化备份")
+
+
+def test_user_export_with_knowledge_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_user_export_standalone",
+        lambda user_id, target_dir=None, with_knowledge=False: (
+            calls.append((user_id, target_dir, with_knowledge)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "user-export", "u1", "--with-knowledge"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", None, True)
+    print("✓ user-export dispatch --with-knowledge")
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -181,6 +230,8 @@ if __name__ == "__main__":
         mp.undo()
         mp = pytest.MonkeyPatch()
         test_user_export_dispatch(mp)
+        test_user_export_with_knowledge(mp)
+        test_user_export_with_knowledge_dispatch(mp)
     finally:
         mp.undo()
     print("\n全部通过")
