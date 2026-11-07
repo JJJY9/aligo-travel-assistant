@@ -296,6 +296,12 @@ def _make_cli_stub():
         def persist_message(self, role, content):
             events["persisted"].append(role)
 
+        def persist_turn(self, user_content, assistant_content):
+            # 整轮问答一次提交：用户 + 助手两条都在同一次调用里落库
+            self.persist_message("user", user_content)
+            self.persist_message("assistant", assistant_content)
+            self.stage_message("assistant", assistant_content)
+
         def stage_message(self, role, content, metadata=None):
             events["staged"].append(content)
 

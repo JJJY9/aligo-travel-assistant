@@ -662,6 +662,35 @@ class _SessionTurnLease:
         self._lock = lock
         self._session = session
         self._released = False
+        self._turn_task: asyncio.Task[Any] | None = None
+
+    def bind_turn(self, task: asyncio.Task[Any]) -> None:
+        """登记本回合的协程任务：释放租约前先由 :meth:`stop_turn` 收尾。"""
+        self._turn_task = task
+
+    async def stop_turn(self) -> None:
+        """取消在途回合并等待落库线程结束（幂等）。
+
+        取消只中断协程，``asyncio.to_thread`` 里的记忆写线程会继续执行；
+        释放用户锁之前旧回合必须停稳，否则随后的删除 / 新一轮对话会与
+        迟到的写入并发（已删除的会话被写回复活）。
+
+        注意：生成器可能处在 Starlette 的 anyio 取消作用域内，作用域取消
+        后其中任何 await 都会立即再次抛 CancelledError——真正的等待由
+        作用域外的 :class:`_LeasedStreamingResponse` 兜底执行，这里在
+        作用域内被取消时直接向上抛，仍由兜底路径完成。
+        """
+        task = self._turn_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        try:
+            await self._session.runtime.drain_pending_persist()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 落库失败已由回合自身映射
+            logger.debug("等待记忆落库失败", exc_info=True)
 
     def release(self) -> None:
         if self._released:
@@ -672,7 +701,7 @@ class _SessionTurnLease:
 
 
 class _LeasedStreamingResponse(StreamingResponse):
-    """响应结束（含未开始迭代即被取消）时释放租约。"""
+    """响应结束（含未开始迭代即被取消）时停稳回合并释放租约。"""
 
     def __init__(self, content: Any, lease: _SessionTurnLease, **kwargs: Any) -> None:
         super().__init__(content, **kwargs)
@@ -682,6 +711,8 @@ class _LeasedStreamingResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._lease.stop_turn()
             self._lease.release()
 
 
@@ -2831,7 +2862,13 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                 ) from exc
             finally:
-                session.end_turn()
+                # 取消 / 出错只中断协程：在途的落库线程仍会写完，先等它
+                # 结束再释放用户锁，否则删除会话 / 下一轮对话会与迟到的
+                # 写入并发（已删除的会话被写回复活）
+                try:
+                    await session.runtime.drain_pending_persist()
+                finally:
+                    session.end_turn()
         response.headers.update(rate_headers)
         return {"session_id": session.session_id, **result}
 
@@ -2943,6 +2980,7 @@ def create_app(model: Any = None) -> FastAPI:
                     + "\n\n"
                 )
                 task = asyncio.create_task(run())
+                lease.bind_turn(task)
 
                 async def send_heartbeat() -> None:
                     while True:
@@ -2967,14 +3005,17 @@ def create_app(model: Any = None) -> FastAPI:
                     heartbeat.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await heartbeat
+                # 取消在途回合并等待落库线程结束。生成器可能处在 Starlette
+                # 的 anyio 取消作用域内，作用域取消后这里的 await 会立刻
+                # 再次抛 CancelledError：同步的 task.cancel() 必须在这里
+                # 做，等待落库线程由作用域外的 _LeasedStreamingResponse 兜底
                 if task is not None and not task.done():
                     task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-                # 先解除在用标记，再释放用户锁：之后该会话才可以被 LRU 淘汰
-                # （响应若在首次迭代前就被取消，生成器不会执行到这里，
-                # 由 _LeasedStreamingResponse 兜底释放同一租约）
-                lease.release()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await lease.stop_turn()
+                # 释放租约统一由 _LeasedStreamingResponse 在取消作用域外执行：
+                # 本轮在作用域内被取消时上面的等待无法完成，这里提前 release
+                # 会让删除 / 新一轮请求在落库线程结束前拿到用户锁
 
         return _LeasedStreamingResponse(
             event_stream(),

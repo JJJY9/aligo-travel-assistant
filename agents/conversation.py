@@ -52,6 +52,9 @@ class ConversationRuntime:
         self.circuit_breaker = circuit_breaker
         # 本轮流式请求是否已向熔断器记录过成功 / 失败（归还半开名额用）
         self._probe_recorded = False
+        # 在途的记忆落库任务：取消 ask() 只取消协程，执行器线程仍会写完；
+        # Web 入口在释放用户锁前先 drain 它（见 drain_pending_persist）
+        self._pending_persist: asyncio.Future | None = None
 
         self.memory = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
         self.intention_agent = IntentionAgent(name="IntentionAgent", model=model)
@@ -179,20 +182,58 @@ class ConversationRuntime:
         usage = self._usage_delta(usage_before)
         elapsed = round(time.time() - start, 2)
         meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
-        # 编排成功：用户消息补写长期记忆（短期副本已在编排前暂存），
-        # 助手消息同时写长期 + 短期
-        await asyncio.to_thread(self.memory.persist_message, "user", user_input)
-        await asyncio.to_thread(
-            self.memory.add_message,
-            "assistant",
-            json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
+        # 编排成功：整轮问答在一次线程调用里原子提交（用户 + 助手）。
+        # 分成两次提交时，两次之间被取消 / 第二次写失败会在长期记忆留下
+        # 没有回答的孤儿提问。落库任务独立于 ask 协程：取消只让这里抛出，
+        # 写线程会继续完成，调用方用 drain_pending_persist() 等它结束。
+        assistant_payload = json.dumps(
+            attach_turn_meta(result_data, meta), ensure_ascii=False
         )
+        pending = asyncio.ensure_future(
+            asyncio.to_thread(
+                self.memory.persist_turn, user_input, assistant_payload
+            )
+        )
+        self._pending_persist = pending
+        pending.add_done_callback(self._clear_pending_persist)
+        await asyncio.shield(pending)
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
             "usage": usage,
             "elapsed": elapsed,
         }
+
+    def _clear_pending_persist(self, pending: asyncio.Future) -> None:
+        if self._pending_persist is pending:
+            self._pending_persist = None
+        if not pending.cancelled():
+            # 取消后没人再 await 这个任务：取走异常，避免
+            # 「Task exception was never retrieved」的告警
+            pending.exception()
+
+    async def drain_pending_persist(self, timeout_sec: float = 10.0) -> bool:
+        """等待在途的记忆落库线程结束，返回是否在超时前完成。
+
+        取消 ``ask()`` 只中断协程，``asyncio.to_thread`` 里的写线程不受影响。
+        Web 入口在释放用户锁 / 会话占用标记前先等它结束，否则同一用户随后
+        的删除会话 / 新一轮对话会与迟到的写入并发（已删除的会话被写回）。
+        """
+        pending = getattr(self, "_pending_persist", None)
+        if pending is None:
+            return True
+        try:
+            await asyncio.wait_for(asyncio.shield(pending), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "等待记忆落库超过 %.1fs，写入线程仍在后台继续", timeout_sec
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 落库失败已由 ask() 调用方处理
+            return True
+        return True
 
     def close(self) -> None:
         """释放会话占用的资源（PostgreSQL 连接等）。"""

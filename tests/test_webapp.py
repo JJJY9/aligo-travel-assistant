@@ -401,6 +401,72 @@ def test_stream_forwards_agent_progress_events(monkeypatch):
     print("✓ SSE 转发 agent_start / agent_done 进度事件")
 
 
+def test_stream_abort_waits_for_pending_persist(monkeypatch):
+    """SSE 中断时：落库线程未结束前不得释放用户锁（否则删除 / 新回合并发）。"""
+    import contextlib
+
+    import httpx
+
+    from context.memory_manager import MemoryManager
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    user_id = _unique_user("web_abort_persist")
+    started = threading.Event()
+    release = threading.Event()
+    original_persist = MemoryManager.persist_turn
+
+    def blocked_persist(self, user_content, assistant_content):
+        started.set()
+        release.wait(10)
+        original_persist(self, user_content, assistant_content)
+
+    monkeypatch.setattr(MemoryManager, "persist_turn", blocked_persist)
+    lock = state.lock_for(user_id)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+
+            async def consume():
+                async with client.stream(
+                    "POST",
+                    "/api/chat/stream",
+                    json={
+                        "message": "你好",
+                        "user_id": user_id,
+                        "session_id": "sess-abort",
+                    },
+                ) as response:
+                    async for _ in response.aiter_raw():
+                        pass
+
+            task = asyncio.create_task(consume())
+            assert await asyncio.to_thread(started.wait, 10), "未进入落库阶段"
+            task.cancel()
+            # 落库线程仍被阻塞：用户锁必须保持持有（响应收尾不得提前放锁）
+            for _ in range(25):
+                await asyncio.sleep(0.02)
+            assert lock.locked(), "落库未完成前释放了用户锁"
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if not lock.locked():
+                    break
+            assert not lock.locked(), "落库完成后应释放用户锁"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        _cleanup(user_id)
+    print("✓ SSE 中断等待在途落库线程结束后才释放用户锁")
+
+
 def test_stream_heartbeat():
     import webapp.server as server_module
 
