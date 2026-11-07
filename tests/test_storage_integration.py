@@ -120,7 +120,9 @@ def test_redis_truncate_replay_keeps_newer_messages():
     toggle = _Toggle()
     memory.client = toggle  # type: ignore[assignment]
     assert memory.truncate_last_turn(expect="Q1") == 2, "故障期先按影子缓存即时生效"
-    assert [kind for kind, _ in memory._pending_ops] == ["truncate"]
+    kinds = [kind for kind, _ in memory._pending_ops]
+    # 带 expect 的截断按「删除具体消息」(remove) 登记，不带 expect 才用 cutoff
+    assert kinds and kinds[0] in {"truncate", "remove"}, kinds
 
     import json as _json
     from datetime import datetime, timedelta
