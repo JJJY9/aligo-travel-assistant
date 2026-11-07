@@ -606,8 +606,8 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 |------|------|------|
 | POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
-| GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态 |
-| GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态）与限流后端信息 |
+| GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开时 `status` 为 `degraded` 并附 `circuit_breaker` |
+| GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors`）与限流后端信息；SSE 长连接只计请求数、不计入延迟分位 |
 | GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
@@ -848,12 +848,12 @@ python -m webapp.server --port 8001
 python -m webapp.server --port 8002   # 另一个进程 / 机器
 ```
 
-- **限流**：两个实例的用户桶、IP 桶、知识库桶与天气桶计数都在 Redis（`aligo:ratelimit:*`），总额度按实例集合共享；`/api/health` 应返回 `rate_limit: redis`、`rate_limit_configured: true`、`rate_limit_degraded: false`。配置了 Redis 但限流器显示 `memory` 时 `rate_limit_degraded` 为 `true`（进程启动时 Redis 不可用，该进程重启后恢复共享）；运行中 Redis 故障则临时回退进程内实现，60 秒后自动重试。
+- **限流**：两个实例的用户桶、IP 桶、知识库桶与天气桶计数都在 Redis（`aligo:ratelimit:*`），总额度按实例集合共享；`/api/health` 应返回 `rate_limit: redis`、`rate_limit_configured: true`、`rate_limit_degraded: false`。配置了 Redis 时 `rate_limit` 恒为 `redis`，降级由 `rate_limit_degraded` 标记：为 `true` 表示该进程当前回退进程内实现（启动时不可用或运行中故障），恢复共享后自动变回 `false`（60 秒冷却重试）。
 - **知识库评测**：同一时间只允许一个评测；配置 Redis 后通过 `aligo:lock:kb_eval` 跨实例共享互斥（TTL 300 秒，token 比对释放，持有期间按 TTL/3 自动续期），进程内也会先互斥再尝试 Redis，因此 Redis 抖动不会让同一实例并发评测；Redis 故障只回退本次加锁并在下次请求重试，恢复后重新参与跨实例互斥。
 - **会话**：Redis 短期记忆按「用户 + 会话」共享，同一会话在任一实例都能继续；每个实例的运行时缓存（上限 50）互相独立，同一会话的并发请求建议用会话粘滞（session affinity）保持消息顺序。会话删除的防复活墓碑在配置 Redis 后通过 `aligo:deleted:*` 跨实例共享（TTL 300 秒与本地一致），删除请求先写墓碑再删库，删除进行中其它实例的新请求即被拒绝，删除失败会回滚墓碑；Redis 读写失败只回退本次并在 60 秒后自动重试共享墓碑，启动时未拿到 Redis 的实例也会在客户端可用后重新接入。但删除与另一实例上**正在生成**的同一会话并发时，生成结束后仍可能写回消息，删除前请先停止生成，或用会话粘滞把同一会话固定到同一实例。
 - **持久化**：长期记忆、偏好、行程与会话标题 / 置顶 / 归档都在 PostgreSQL；不要在多实例下使用默认 JSON 后端（文件在各实例本地，跨进程写会互相覆盖）。
 - **反向代理**：前面有 Nginx / 负载均衡时设置 `TRUST_PROXY_HEADERS=1`，并按代理实际行为覆盖写入 `X-Forwarded-For`；否则所有用户共用代理地址的 IP 桶，默认不信任该头是为了防止客户端伪造。
-- **观测**：请求指标（`/api/metrics`）是进程内统计，需要分别采集每个实例；`/api/health` 可用于实例级健康检查。
+- **观测**：请求指标（`/api/metrics`）是进程内统计，需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；`/api/health` 在熔断打开时返回 `status: degraded`，可用于实例级健康检查。
 - **知识库**：Milvus Lite 是本地单进程文件锁，多个实例无法共享同一个向量库文件；这里的多实例共享适用于无 RAG 或各实例独立知识库的场景，需要共享向量库时请替换为 Milvus 服务端部署。
 
 ### 知识库初始化

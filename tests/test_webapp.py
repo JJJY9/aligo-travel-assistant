@@ -5527,8 +5527,329 @@ def test_update_trip_invalid_legacy_end_date_keeps_conflicts():
     print("✓ 历史非法返程日期不清空更新响应的冲突")
 
 
+def test_route_path_normalization():
+    from webapp.server import _route_path
+
+    assert _route_path({"path": "/aligo/api/import", "root_path": "/aligo"}) == "/api/import"
+    assert _route_path({"path": "/api/import/"}) == "/api/import"
+    assert _route_path({"path": "/aligo/", "root_path": "/aligo"}) == "/"
+    assert _route_path({"path": "/"}) == "/"
+    print("✓ 路由视角路径归一（root_path / 尾斜杠）")
+
+
+def test_rate_identity_ipv6_aggregation():
+    from webapp.server import _rate_identity
+
+    assert _rate_identity("2001:db8:1:2::1") == "2001:db8:1:2::/64"
+    assert _rate_identity("2001:db8:1:2::9") == _rate_identity("2001:db8:1:2::1")
+    assert _rate_identity("192.0.2.1") == "192.0.2.1"
+    assert _rate_identity("unknown") == "unknown"
+    print("✓ IPv6 限流身份按 /64 聚合")
+
+
+def test_import_with_root_path_uses_extended_limit(monkeypatch):
+    """子路径部署：/aligo/api/import 仍拿 64MB 上限，no-store 与文档 CSP 正常。"""
+    target = _unique_user("web_test_rootpath")
+    try:
+        app = create_app(model=UsageTrackingModel(_FakeModel()))
+        client = TestClient(app, root_path="/aligo")
+        backup = {
+            "backup": {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "x" * 2_500_000,
+                        "session_id": "sess-root",
+                    }
+                ]
+            }
+        }
+        response = client.post(
+            "/aligo/api/import", params={"user_id": target}, json=backup
+        )
+        assert response.status_code == 200, response.text[:200]
+        status = client.get("/aligo/api/status", params={"user_id": target})
+        assert status.headers.get("cache-control") == "no-store"
+        docs = client.get("/aligo/docs")
+        assert docs.status_code == 200
+        assert "cdn.jsdelivr.net" in docs.headers.get(
+            "content-security-policy", ""
+        )
+        print("✓ root_path 下 /api/import 上限、no-store、文档 CSP")
+    finally:
+        _cleanup(target)
+
+
+def test_import_trailing_slash_redirects(monkeypatch):
+    """/api/import/ 应先 307 归一，而不是被 2MB 预检直接 413。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app, follow_redirects=False)
+    small = {
+        "backup": {
+            "chat_history": [
+                {"role": "user", "content": "hi", "session_id": "sess-slash"}
+            ]
+        }
+    }
+    response = client.post(
+        "/api/import/",
+        params={"user_id": _unique_user("web_test_slash")},
+        json=small,
+    )
+    assert response.status_code == 307, response.text[:200]
+    print("✓ 尾斜杠 /api/import/ 正常 307 重定向")
+
+
+def test_early_413_metrics_labeled_as_import(monkeypatch):
+    """路由前 413 与 chunked 超限的指标口径一致（记录为 /api/import）。"""
+    from utils.metrics import REQUEST_METRICS
+    from webapp import server as server_module
+
+    REQUEST_METRICS.reset()
+    monkeypatch.setitem(server_module._BODY_LIMIT_OVERRIDES, "/api/import", 1024)
+    client = _client()
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": _unique_user("web_test_413")},
+            content=b"x" * 2048,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 413
+        by_path = REQUEST_METRICS.snapshot()["by_path"]
+        assert "/api/import" in by_path, by_path
+        assert "__unmatched__" not in by_path
+        print("✓ 路由前 413 的指标标签与路由模板一致")
+    finally:
+        REQUEST_METRICS.reset()
+
+
+def test_doctor_rate_limited(monkeypatch):
+    """未鉴权的自检接口接入知识库桶限流。"""
+    from webapp import server as server_module
+
+    async def fake_run_doctor(include_network=False):
+        return []
+
+    monkeypatch.setattr(server_module, "run_doctor", fake_run_doctor)
+    client = _client()
+    first = client.get("/api/doctor")
+    assert first.status_code == 200
+    limit = first.headers.get("x-ratelimit-limit")
+    remaining = first.headers.get("x-ratelimit-remaining")
+    assert limit is not None and remaining is not None
+    second = client.get("/api/doctor")
+    assert int(second.headers["x-ratelimit-remaining"]) < int(remaining)
+    print("✓ /api/doctor 接入限流桶")
+
+
+def test_session_build_slots_bound_concurrent_connections(monkeypatch):
+    """并发新会话的「连接构造」数量必须受会话上限约束。"""
+    import threading as _threading
+    import time as _time
+
+    from webapp import server as server_module
+
+    class _SlowSession:
+        lock = _threading.Lock()
+        active = 0
+        peak = 0
+
+        def __init__(self, user_id, session_id, model, breaker):
+            with _SlowSession.lock:
+                _SlowSession.active += 1
+                _SlowSession.peak = max(_SlowSession.peak, _SlowSession.active)
+            _time.sleep(0.01)
+            with _SlowSession.lock:
+                _SlowSession.active -= 1
+            self.turns = 0
+
+        def begin_turn(self):
+            self.turns += 1
+
+        def end_turn(self):
+            self.turns = max(0, self.turns - 1)
+
+        def in_use(self):
+            return self.turns > 0
+
+        def long_in_use(self, seconds):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server_module, "_WebSession", _SlowSession)
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 5
+    state._session_build_slots = _threading.BoundedSemaphore(5)
+    errors = []
+
+    def worker(index):
+        try:
+            state.get_session("u-slots", f"s{index}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [_threading.Thread(target=worker, args=(i,)) for i in range(30)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    assert _SlowSession.peak <= 5, _SlowSession.peak
+    state.close_all()
+    print(f"✓ 并发会话构造峰值 {_SlowSession.peak} ≤ 上限 5")
+
+
+def test_lock_for_overflow_waiters(monkeypatch):
+    """兜底锁有等待者时，同一用户也必须继续共用兜底锁。"""
+    import types as _types
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    fake_overflow = _types.SimpleNamespace(
+        locked=lambda: False, _waiters=[object()]
+    )
+    monkeypatch.setattr(state, "overflow_lock", fake_overflow)
+    assert state.lock_for("u-waiters") is fake_overflow
+    print("✓ 兜底锁等待者期间保持按用户串行")
+
+
+def test_metrics_streaming_and_sse_errors():
+    """SSE 长连接不计入延迟分位；error 收尾的流有独立计数。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    try:
+        REQUEST_METRICS.record(
+            "POST", "/api/chat/stream", 200, 30000.0, streaming=True
+        )
+        data = REQUEST_METRICS.snapshot()
+        assert data["requests_total"] == 1
+        assert data["duration_samples"] == 0, "流式请求不应进入延迟样本"
+        assert data["avg_duration_ms"] == 0.0 and data["max_duration_ms"] == 0.0
+
+        REQUEST_METRICS.record_sse_error()
+        assert REQUEST_METRICS.snapshot()["sse_errors"] == 1
+        assert "aligo_sse_errors_total 1" in REQUEST_METRICS.render_prometheus()
+        print("✓ SSE 不计延迟分位 / error 收尾独立计数")
+    finally:
+        REQUEST_METRICS.reset()
+
+
+def test_health_reports_degraded_when_breaker_open(monkeypatch):
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    try:
+        for _ in range(state.breaker.failure_threshold):
+            state.breaker.record_failure()
+        client = TestClient(app)
+        data = client.get("/api/health").json()
+        assert data["status"] == "degraded", data
+        assert data["circuit_breaker"] == "open"
+    finally:
+        state.close_all()
+    print("✓ 熔断打开时健康检查报 degraded")
+
+
+def test_sse_error_increments_metrics(monkeypatch):
+    """流式回合以 error 事件收尾时 sse_errors 计数增加。"""
+    from utils.metrics import REQUEST_METRICS
+    from agents.orchestration_agent import OrchestrationAgent
+
+    async def boom(self, intention, on_event=None):
+        raise RuntimeError("编排失败")
+
+    monkeypatch.setattr(OrchestrationAgent, "reply", boom)
+    REQUEST_METRICS.reset()
+    client = _client()
+    user_id = _unique_user("web_test_sse_err")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "你好", "user_id": user_id, "session_id": "sse-err"},
+        ) as response:
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+        assert events[-1]["type"] == "error"
+        assert REQUEST_METRICS.snapshot()["sse_errors"] == 1, [e["type"] for e in events]
+        # 路由前 413 之外，SSE 请求本身仍计入请求数
+        assert (
+            REQUEST_METRICS.snapshot()["by_path"].get("/api/chat/stream", 0) == 1
+        )
+    finally:
+        _cleanup(user_id)
+        REQUEST_METRICS.reset()
+    print("✓ SSE error 收尾计入独立指标")
+
+
+def test_circuit_breaker_probe_owner_is_async_task(monkeypatch):
+    """同一线程的不同 asyncio task 不能互相消费半开试探名额。"""
+    import asyncio
+
+    from utils.circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=0.01, half_open_successes=1
+    )
+    breaker.record_failure()  # CLOSED -> OPEN
+    time_module = __import__("time")
+    breaker._opened_at = time_module.monotonic() - 1.0  # noqa: SLF001
+
+    async def scenario():
+        assert breaker.allow_call() is True  # 当前 task 持有试探
+
+        async def other_task():
+            breaker.record_success()  # 其它 task：不得消费名额
+
+        await asyncio.create_task(other_task())
+        assert breaker.state.value == "half_open", "其它任务的成功不能关闭熔断"
+        breaker.record_success()  # 持有者：计数并关闭
+        assert breaker.state.value == "closed"
+
+    asyncio.run(scenario())
+    print("✓ 半开试探按 asyncio task 认属主")
+
+
+def test_half_open_failure_freezes_failure_count(monkeypatch):
+    """半开失败回到 OPEN 时失败数冻结在阈值（/metrics 与 HELP 文案一致）。"""
+    from utils.circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        failure_threshold=2, recovery_timeout_sec=0.0, half_open_successes=1
+    )
+    breaker.record_failure()
+    breaker.record_failure()
+    breaker._maybe_half_open()  # noqa: SLF001
+    assert breaker.allow_call() is True
+    breaker.record_failure()
+    assert breaker.get_status()["failure_count"] == 2
+    print("✓ 半开失败后失败数冻结在阈值")
+
+
+def test_import_uses_dedicated_executor(monkeypatch):
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    try:
+        executor = getattr(state, "import_executor", None)
+        assert executor is not None
+        assert executor._max_workers == 1
+    finally:
+        state.close_all()
+    print("✓ 备份恢复使用专用执行器")
+
+
 if __name__ == "__main__":
     test_index_page()
+    test_route_path_normalization()
+    test_metrics_streaming_and_sse_errors()
+    test_rate_identity_ipv6_aggregation()
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
@@ -5540,6 +5861,17 @@ if __name__ == "__main__":
         test_chat_stream_storage_error_maps_friendly_message,
         test_get_session_constructs_outside_lock,
         test_destructive_endpoints_503_while_pg_cooling_down,
+        test_import_with_root_path_uses_extended_limit,
+        test_import_trailing_slash_redirects,
+        test_early_413_metrics_labeled_as_import,
+        test_doctor_rate_limited,
+        test_session_build_slots_bound_concurrent_connections,
+        test_lock_for_overflow_waiters,
+        test_health_reports_degraded_when_breaker_open,
+        test_sse_error_increments_metrics,
+        test_circuit_breaker_probe_owner_is_async_task,
+        test_half_open_failure_freezes_failure_count,
+        test_import_uses_dedicated_executor,
     ):
         mp = pytest.MonkeyPatch()
         try:

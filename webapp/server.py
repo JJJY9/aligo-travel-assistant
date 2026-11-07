@@ -105,6 +105,23 @@ def body_limit_for(path: str, default: int = MAX_REQUEST_BODY_BYTES) -> int:
     """路径级请求体上限。"""
     return _BODY_LIMIT_OVERRIDES.get(str(path or ""), default)
 
+
+def _route_path(scope: dict[str, Any]) -> str:
+    """路由视角的请求路径：剥离 root_path（子路径部署）并归一尾斜杠。
+
+    中间件在路由之前执行，看到的 ``scope["path"]`` 在 uvicorn ``--root-path``
+    或父级 Mount 部署下带前缀，且 ``/api/import/``（尾斜杠）会在 Starlette
+    307 归一之前就到达这里——不归一会让路径级上限 / no-store / 文档 CSP /
+    访问日志与请求指标同时失配。
+    """
+    raw = str(scope.get("path", "") or "/")
+    root = str(scope.get("root_path", "") or "")
+    if root and raw.startswith(root):
+        raw = raw[len(root):] or "/"
+    if raw != "/":
+        raw = raw.rstrip("/") or "/"
+    return raw
+
 # 只有环回地址视为「仅本机」；其它地址启动时提示需要反向代理做认证 / HTTPS
 def _is_loopback_host(host: str) -> bool:
     value = host.strip().lower()
@@ -188,7 +205,8 @@ class RequestContextMiddleware:
         status_code = 0
         response_started = False
         path = str(scope.get("path", ""))
-        response_headers = _security_headers_for(path)
+        route_path = _route_path(scope)
+        response_headers = _security_headers_for(route_path)
 
         async def send_wrapper(message: dict[str, Any]) -> None:
             nonlocal status_code, response_started
@@ -198,10 +216,15 @@ class RequestContextMiddleware:
                 headers_list = list(message.get("headers") or [])
                 # 用户数据接口不进入浏览器 / 代理缓存；响应自己声明了 Cache-Control
                 # （如导出接口的 no-cache）时保持原样，避免重复头
-                if path.startswith("/api/") and not any(
+                if not any(
                     key.lower() == b"cache-control" for key, _ in headers_list
                 ):
-                    headers_list.append((b"cache-control", b"no-store"))
+                    if route_path.startswith("/api/"):
+                        headers_list.append((b"cache-control", b"no-store"))
+                    elif route_path.startswith("/static/"):
+                        # 静态资源每次重新验证：ETag 命中只回 304；避免
+                        # 新版 app.js 与旧 index.html 之类的混合缓存
+                        headers_list.append((b"cache-control", b"no-cache"))
                 message["headers"] = (
                     headers_list
                     + response_headers
@@ -216,7 +239,7 @@ class RequestContextMiddleware:
                     body_size = int(content_length)
                 except ValueError:
                     body_size = 0
-                limit = body_limit_for(path)
+                limit = body_limit_for(route_path)
                 if body_size > limit:
                     detail = f"请求体过大（上限 {limit // (1024 * 1024)} MB）"
                     await send_wrapper(
@@ -263,7 +286,7 @@ class RequestContextMiddleware:
             except Exception:  # noqa: BLE001 - 客户端可能已断开
                 raise exc from None
         finally:
-            if path.startswith("/api/"):
+            if route_path.startswith("/api/"):
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 logger.info(
                     "%s",
@@ -279,8 +302,21 @@ class RequestContextMiddleware:
                 # 会话 ID 等动态段不会撑爆基数，未匹配的 404 统一归入 __unmatched__
                 route = scope.get("route")
                 metric_path = getattr(route, "path", None) or _UNMATCHED_METRIC_PATH
+                # 路由前就被 413 拒绝的请求没有 route：备份恢复接口用归一化
+                # 路径作为指标标签，与 chunked 超限（记录到路由模板）口径一致
+                if (
+                    getattr(route, "path", None) is None
+                    and status_code == 413
+                    and route_path == "/api/import"
+                ):
+                    metric_path = "/api/import"
                 REQUEST_METRICS.record(
-                    scope.get("method", ""), metric_path, status_code, elapsed_ms
+                    scope.get("method", ""),
+                    metric_path,
+                    status_code,
+                    elapsed_ms,
+                    # SSE 长连接的整段持续时间不能计入延迟分位
+                    streaming=metric_path == "/api/chat/stream",
                 )
 
 
@@ -308,7 +344,7 @@ class BodySizeLimitMiddleware:
         received = 0
         exceeded = False
         sent_413 = False
-        limit = body_limit_for(scope.get("path", ""), self.max_bytes)
+        limit = body_limit_for(_route_path(scope), self.max_bytes)
         payload = json.dumps(
             {"detail": f"请求体过大（上限 {limit // (1024 * 1024)} MB）"},
             ensure_ascii=False,
@@ -372,7 +408,7 @@ class SelectiveGZipMiddleware:
         self.compressed_app = GZipMiddleware(app, minimum_size=minimum_size)
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") == "http" and scope.get("path") == "/api/chat/stream":
+        if scope.get("type") == "http" and _route_path(scope) == "/api/chat/stream":
             await self.app(scope, receive, send)
             return
         await self.compressed_app(scope, receive, send)
@@ -674,6 +710,16 @@ class AligoWebApp:
         # 会话缓存同样会被线程池里的 drop_session 与事件循环里的 get_session
         # 并发修改（插入 / move_to_end / popitem），需要独立互斥
         self._sessions_lock = threading.Lock()
+        # 构造 _WebSession 会新建 Redis / PostgreSQL 连接：并发构造数量限制
+        # 在会话上限以内，否则一批并发新会话会同时打爆数据库连接数
+        self._session_build_slots = threading.BoundedSemaphore(
+            max(1, int(self.max_sessions))
+        )
+        # 备份恢复专用执行器：单 worker 串行化导入，且不占用 asyncio 默认
+        # 线程池——分钟级的大导入会让所有对话 / SSE / 删除的 to_thread 排队
+        self.import_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="aligo-import"
+        )
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
@@ -763,46 +809,50 @@ class AligoWebApp:
                     session.begin_turn()
         if session is None:
             # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
-            candidate = _WebSession(
-                user_id, session_id, wrap_usage_tracking(self.model), self.breaker
-            )
-            with self._sessions_lock:
-                found = self.sessions.get(key)
-                if found is not None:
-                    # 并发首请求：另一线程已抢先插入，使用已有实例
-                    session = found
-                    self.sessions.move_to_end(key)
-                    if mark_in_use:
-                        session.begin_turn()
-                else:
-                    session = candidate
-                    self.sessions[key] = candidate
-                    # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
-                    # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
-                    # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
-                    # 等后续请求再回收
-                    while len(self.sessions) > self.max_sessions:
-                        victim = next(
-                            (
-                                candidate_key
-                                for candidate_key, item in self.sessions.items()
-                                if candidate_key != key
-                                and (
-                                    not item.in_use()
-                                    or item.long_in_use(self.session_turn_leak_sec)
-                                )
-                            ),
-                            None,
-                        )
-                        if victim is None:
-                            break
-                        evicted.append(self.sessions.pop(victim))
-                    if mark_in_use:
-                        session.begin_turn()
-            if session is not candidate:
-                # 竞争失败：自己新建的运行时从未暴露给调用方，关闭回收
-                # PostgreSQL 连接等资源
-                candidate.close()
+            self._session_build_slots.acquire()
+            try:
+                candidate = _WebSession(
+                    user_id, session_id, wrap_usage_tracking(self.model), self.breaker
+                )
+                with self._sessions_lock:
+                    found = self.sessions.get(key)
+                    if found is not None:
+                        # 并发首请求：另一线程已抢先插入，使用已有实例
+                        session = found
+                        self.sessions.move_to_end(key)
+                        if mark_in_use:
+                            session.begin_turn()
+                    else:
+                        session = candidate
+                        self.sessions[key] = candidate
+                        # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
+                        # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
+                        # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
+                        # 等后续请求再回收
+                        while len(self.sessions) > self.max_sessions:
+                            victim = next(
+                                (
+                                    candidate_key
+                                    for candidate_key, item in self.sessions.items()
+                                    if candidate_key != key
+                                    and (
+                                        not item.in_use()
+                                        or item.long_in_use(self.session_turn_leak_sec)
+                                    )
+                                ),
+                                None,
+                            )
+                            if victim is None:
+                                break
+                            evicted.append(self.sessions.pop(victim))
+                        if mark_in_use:
+                            session.begin_turn()
+                if session is not candidate:
+                    # 竞争失败：自己新建的运行时从未暴露给调用方，关闭回收
+                    # PostgreSQL 连接等资源
+                    candidate.close()
+            finally:
+                self._session_build_slots.release()
         # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求
         for stale in evicted:
             stale.close()
@@ -974,7 +1024,10 @@ class AligoWebApp:
     def lock_for(self, user_id: str) -> asyncio.Lock:
         """同一用户的请求串行处理，避免长期记忆并发写覆盖。"""
         lock = self.locks.get(user_id)
-        if lock is None and self.overflow_lock.locked():
+        overflow_busy = self.overflow_lock.locked() or bool(
+            getattr(self.overflow_lock, "_waiters", None)
+        )
+        if lock is None and overflow_busy:
             # 兜底锁仍被占用（锁表曾满）：新请求继续共用兜底锁。否则锁表
             # 腾出空位后，同一用户的上一个请求还持着兜底锁，这里会新建
             # 私有锁与之并行，按用户串行失效
@@ -1018,6 +1071,24 @@ def _client_host(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _rate_identity(host: str) -> str:
+    """限流桶的客户端标识：IPv6 按 /64 聚合。
+
+    同一 /64 子网内可以随意轮换源地址；按完整地址做 key 时每次轮换都是
+    新桶，IP 维度限流被直接绕过。
+    """
+    text = str(host or "").strip()
+    try:
+        import ipaddress
+
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return text
+    if address.version == 6:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return text
+
+
 def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """限流后端与状态（健康检查与指标接口共用）。
 
@@ -1054,7 +1125,7 @@ def _enforce_rate_limit(
     Returns:
         供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
     """
-    client = _client_host(request)
+    client = _rate_identity(_client_host(request))
     user_key = f"{client}:{user_id}"
 
     def _over_limit(limit: int, retry_after: float) -> HTTPException:
@@ -1113,7 +1184,7 @@ def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, st
     Returns:
         供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
     """
-    client = _client_host(request)
+    client = _rate_identity(_client_host(request))
     # 单桶直接 check：内存实现内部加锁、Redis 实现 Lua 原子，避免 peek/check
     # 之间被并发请求插队导致超发；check 超限时本身不会记录事件
     retry_after = state.kb_limiter.check(client)
@@ -1146,7 +1217,7 @@ def _enforce_weather_rate_limit(
     Returns:
         供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
     """
-    client = _client_host(request)
+    client = _rate_identity(_client_host(request))
     retry_after = state.weather_limiter.check(client)
     if retry_after is not None:
         wait_seconds = max(1, math.ceil(retry_after))
@@ -1267,7 +1338,7 @@ def _load_user_data(user_id: str) -> dict[str, Any]:
         raise
     except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
         logger.warning("读取用户数据失败（%s）：%s", user_id, exc)
-        raise HTTPException(status_code=503, detail=f"读取用户数据失败：{exc}") from exc
+        raise HTTPException(status_code=503, detail="读取用户数据失败，请稍后重试") from exc
 
 
 def _archived_count(data: dict[str, Any]) -> int:
@@ -1550,6 +1621,7 @@ def create_app(model: Any = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         yield
         state.close_all()
+        state.import_executor.shutdown(wait=False)
 
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
@@ -1564,10 +1636,20 @@ def create_app(model: Any = None) -> FastAPI:
     async def _validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        # 校验错误的 input 可能包含 NaN（JSON 解析允许），直接返回会序列化失败
+        # 校验错误的 input 可能包含 NaN（JSON 解析允许），直接返回会序列化失败；
+        # /api/import 的 64MB 上限下还会把整份备份回显进 422 响应（内存与
+        # 响应体积都被放大）——input 统一截断为 200 字符
+        def _trim_item(item: dict[str, Any]) -> dict[str, Any]:
+            trimmed = dict(item)
+            if "input" in trimmed and trimmed["input"] is not None:
+                text = repr(trimmed["input"])
+                trimmed["input"] = text if len(text) <= 200 else text[:200] + "…"
+            return trimmed
+
+        errors = [_trim_item(dict(item)) for item in exc.errors()]
         return JSONResponse(
             status_code=422,
-            content={"detail": _json_safe_value(jsonable_encoder(exc.errors()))},
+            content={"detail": _json_safe_value(jsonable_encoder(errors))},
         )
 
     if STATIC_DIR.is_dir():
@@ -1586,8 +1668,11 @@ def create_app(model: Any = None) -> FastAPI:
     def health() -> dict[str, Any]:
         rate = _rate_limit_info(state)
         skills_root = resolve_skills_root()
+        breaker_state = state.breaker.get_status()["state"]
         return {
-            "status": "ok",
+            # 熔断打开说明服务已无法正常对话：健康检查不能继续报 ok
+            "status": "degraded" if breaker_state == "open" else "ok",
+            "circuit_breaker": breaker_state,
             "version": APP_VERSION,
             "model": LLM_CONFIG.get("model_name", ""),
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
@@ -1691,8 +1776,17 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/doctor")
-    async def doctor(network: bool = Query(default=False)) -> dict[str, Any]:
+    async def doctor(
+        request: Request,
+        response: Response,
+        network: bool = Query(default=False),
+    ) -> dict[str, Any]:
         """环境自检（默认不做网络请求；network=true 时检查 LLM 连通性）。"""
+        # network=true 每次都会真实调用一次 LLM：未鉴权的自检接口同样
+        # 需要限流（与知识库高开销接口共用桶）
+        response.headers.update(
+            await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
+        )
         results = await run_doctor(include_network=network)
         return {
             "status": "fail" if any(item.status == "fail" for item in results) else "ok",
@@ -2618,6 +2712,9 @@ def create_app(model: Any = None) -> FastAPI:
                     if event.get("type") == "heartbeat":
                         yield ": keep-alive\n\n"
                         continue
+                    if event.get("type") == "error":
+                        # HTTP 已发出 200：对话错误率需要独立口径
+                        REQUEST_METRICS.record_sse_error()
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     if event["type"] in ("done", "error"):
                         break
@@ -3004,8 +3101,15 @@ def create_app(model: Any = None) -> FastAPI:
             preview_user_import,
         )
 
-        response.headers.update(_enforce_kb_rate_limit(state, request))
-        sections, errors = parse_user_export_data(payload.backup)
+        # 限流与整份备份解析都走线程池：Redis eval 与 20 万条消息的归一化
+        # 不能阻塞事件循环（大备份会让所有请求与 SSE 进度/心跳停摆）
+        response.headers.update(
+            await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
+        )
+        loop = asyncio.get_running_loop()
+        sections, errors = await loop.run_in_executor(
+            state.import_executor, parse_user_export_data, payload.backup
+        )
         if not sections:
             detail = "；".join(errors[:3]) or "没有可恢复的数据"
             raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
@@ -3013,16 +3117,26 @@ def create_app(model: Any = None) -> FastAPI:
         async with state.lock_for(user_id):
             # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
             # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）
-            deleted_sessions: set[str] = set()
-            for message in sections["messages"]:
-                session_id = message["session_id"]
-                if not session_id or session_id in deleted_sessions:
-                    continue
-                if await asyncio.to_thread(
-                    state.is_recently_deleted, user_id, session_id
-                ):
-                    deleted_sessions.add(session_id)
-                    errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
+            unique_sessions = {
+                message["session_id"]
+                for message in sections["messages"]
+                if message["session_id"]
+            }
+            if unique_sessions:
+                # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
+                # 意味着数十万次线程跳转与网络往返），且整批放在一次
+                # to_thread 里完成
+                deleted_sessions = await asyncio.to_thread(
+                    lambda: {
+                        session_id
+                        for session_id in unique_sessions
+                        if state.is_recently_deleted(user_id, session_id)
+                    }
+                )
+            else:
+                deleted_sessions = set()
+            for session_id in sorted(deleted_sessions):
+                errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
             if deleted_sessions:
                 sections["messages"] = [
                     message
@@ -3058,7 +3172,7 @@ def create_app(model: Any = None) -> FastAPI:
                     _close_long_term(store)
 
             try:
-                counts = await asyncio.to_thread(_run_import)
+                counts = await loop.run_in_executor(state.import_executor, _run_import)
             except MemoryPersistenceError as exc:
                 logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                 raise HTTPException(
@@ -3128,6 +3242,10 @@ def main() -> None:
         host=args.host,
         port=args.port,
         log_level="info",
+        # SSE 心跳让长回合连接持续活跃：不给优雅退出设上限会让
+        # Ctrl+C / SIGTERM 无限等待在途回合，被 SIGKILL 时 lifespan 的
+        # close_all() 不会执行
+        timeout_graceful_shutdown=5,
         # h11 默认 16 KB 的请求行上限放不下长中文提问的 expect 查询串
         # （4000 字 × 9 字节 percent-encoding），编辑 / 重发会被协议层拒绝
         h11_max_incomplete_event_size=64 * 1024,

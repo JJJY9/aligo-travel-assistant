@@ -3,6 +3,7 @@
 在连续失败后暂停调用 LLM，避免雪崩；一段时间后半开试探恢复。
 """
 import logging
+import asyncio
 import threading
 import time
 from enum import Enum
@@ -19,6 +20,22 @@ class CircuitState(Enum):
 
 class CircuitOpenError(Exception):
     """熔断器打开时抛出的异常，表示当前不执行 LLM 调用"""
+
+
+def _owner_identity() -> object:
+    """半开试探的归属标识。
+
+    Web 端所有请求都跑在同一个事件循环线程里，只用线程 ident 认属主会让
+    任意迟到请求被当成试探持有者；有运行中的 asyncio task 时用 task 对象
+    本身（身份唯一、随请求隔离），否则退回线程 ident（CLI / 同步代码）。
+    """
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is not None:
+        return task
+    return ("thread", threading.get_ident())
 
 
 class CircuitBreaker:
@@ -52,7 +69,7 @@ class CircuitBreaker:
         self._half_open_probe_at: float | None = None
         # 试探名额的持有线程：只有它能把结果计入半开 / 归还名额，
         # 熔断打开前放行的慢请求迟到返回时不能清掉别人的名额
-        self._probe_owner: int | None = None
+        self._probe_owner: object | None = None
         # /metrics 等线程池端点会并发读取状态与迁移 OPEN→HALF_OPEN：
         # 所有状态读写都在锁内，避免清空别的线程刚占用的试探名额
         self._lock = threading.RLock()
@@ -95,7 +112,7 @@ class CircuitBreaker:
             ):
                 return False
             self._half_open_probe_at = now
-            self._probe_owner = threading.get_ident()
+            self._probe_owner = _owner_identity()
             return True
 
     def record_success(self) -> None:
@@ -107,7 +124,7 @@ class CircuitBreaker:
                 # 只有持试探名额的调用能把成功计入半开：熔断打开前放行的
                 # 慢请求迟到返回时不能清掉别人的名额、更不能凑够关闭计数
                 # （两个迟到成功会在没有任何真实试探完成时关闭熔断器）
-                if self._probe_owner != threading.get_ident():
+                if self._probe_owner != _owner_identity():
                     return
                 self._half_open_probe_at = None
                 self._probe_owner = None
@@ -135,7 +152,7 @@ class CircuitBreaker:
             # 会把别的线程正在使用的名额释放掉（恢复期直接放量）
             if (
                 self._state == CircuitState.HALF_OPEN
-                and self._probe_owner == threading.get_ident()
+                and self._probe_owner == _owner_identity()
             ):
                 self._half_open_probe_at = None
                 self._probe_owner = None
@@ -155,7 +172,11 @@ class CircuitBreaker:
                 self._opened_at = time.monotonic()
                 self._half_open_probe_at = None
                 self._probe_owner = None
-                self._failure_count = 0
+                # 冻结在阈值：/metrics 的 HELP 文案承诺 open/half_open 期间
+                # 失败数停在阈值，清零会让熔断期间的失败数误显示为 0
+                self._failure_count = max(
+                    self._failure_count, self.failure_threshold
+                )
                 return
 
             if state == CircuitState.CLOSED:
