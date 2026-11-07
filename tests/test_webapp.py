@@ -1807,6 +1807,179 @@ def test_rate_limit_info_reports_import_bucket_degraded():
     print("✓ 导入限流桶降级计入健康汇总")
 
 
+def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
+    """/api/chat 的 CircuitOpenError / MemoryPersistenceError 都映射 503。"""
+    from utils.circuit_breaker import CircuitOpenError
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_chat_errors")
+
+    async def open_ask(self, message):
+        raise CircuitOpenError()
+
+    monkeypatch.setattr(server_module.ConversationRuntime, "ask", open_ask)
+    response = client.post(
+        "/api/chat", json={"message": "你好", "user_id": user_id}
+    )
+    assert response.status_code == 503
+    assert "服务暂时不可用" in response.json()["detail"]
+
+    async def broken_ask(self, message):
+        raise MemoryPersistenceError("disk full")
+
+    monkeypatch.setattr(server_module.ConversationRuntime, "ask", broken_ask)
+    response = client.post(
+        "/api/chat", json={"message": "你好", "user_id": user_id}
+    )
+    assert response.status_code == 503
+    assert "存储暂时不可用" in response.json()["detail"]
+    print("✓ /api/chat 熔断 / 存储错误映射 503")
+
+
+def test_import_strict_open_and_failure_mappings(monkeypatch):
+    """/api/import 以 strict=True 打开存储；失败分别映射两条 503 文案。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_import_fail")
+    strict_flags = []
+
+    def failing_open(target_user, strict=False):
+        strict_flags.append(strict)
+        raise MemoryPersistenceError("disk full")
+
+    monkeypatch.setattr(server_module, "_open_long_term", failing_open)
+    response = client.post(
+        "/api/import",
+        params={"user_id": user_id},
+        json={"backup": {"preferences": {"home_location": "北京"}}},
+    )
+    assert response.status_code == 503
+    assert "存储暂时不可用" in response.json()["detail"]
+    assert strict_flags == [True], "恢复必须 strict 打开（不写回退 JSON）"
+
+    def boom_open(target_user, strict=False):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(server_module, "_open_long_term", boom_open)
+    response = client.post(
+        "/api/import",
+        params={"user_id": user_id},
+        json={"backup": {"preferences": {"home_location": "北京"}}},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "恢复失败，请稍后重试"
+    print("✓ /api/import strict 打开与失败映射")
+
+
+def test_create_trip_write_failure_maps_503(monkeypatch):
+    """POST /api/trips 写入失败映射 503（与更新 / 删除一致）。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    class _BrokenStore:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def save_trip_history(self, trip):
+            raise MemoryPersistenceError("disk full")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+    )
+    client = _client()
+    response = client.post(
+        "/api/trips",
+        json={
+            "user_id": _unique_user("web_test_trip_fail"),
+            "destination": "上海",
+            "start_date": "2026-12-01",
+        },
+    )
+    assert response.status_code == 503
+    assert "添加行程失败" in response.json()["detail"]
+    print("✓ POST /api/trips 写入失败 503")
+
+
+def test_knowledge_update_error_mappings(monkeypatch):
+    """PUT /api/knowledge/documents 的 400 / 503 映射。"""
+    from webapp import server as server_module
+
+    client = _client()
+
+    def raise_value(doc_id, content, metadata=None):
+        raise ValueError("旧数据没有 group")
+
+    monkeypatch.setattr(server_module, "update_document", raise_value)
+    response = client.put(
+        "/api/knowledge/documents/1", json={"content": "新内容"}
+    )
+    assert response.status_code == 400
+    assert "旧数据没有 group" in response.json()["detail"]
+
+    def raise_missing(doc_id, content, metadata=None):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "update_document", raise_missing)
+    response = client.put(
+        "/api/knowledge/documents/1", json={"content": "新内容"}
+    )
+    assert response.status_code == 503
+    assert "init_knowledge_base.py" in response.json()["detail"]
+
+    def raise_boom(doc_id, content, metadata=None):
+        raise RuntimeError("embed down")
+
+    monkeypatch.setattr(server_module, "update_document", raise_boom)
+    response = client.put(
+        "/api/knowledge/documents/1", json={"content": "新内容"}
+    )
+    assert response.status_code == 503
+    assert "更新失败" in response.json()["detail"]
+    print("✓ PUT 知识片段 400 / 503 映射")
+
+
+def test_static_assets_no_cache_header():
+    """/static/ 响应必须带 Cache-Control: no-cache（发版后不能吃到旧脚本）。"""
+    response = _client().get("/static/app.js")
+    assert response.status_code == 200
+    assert "no-cache" in response.headers.get("cache-control", "")
+    print("✓ 静态资源 no-cache 头")
+
+
+def test_import_skips_recently_deleted_sessions(monkeypatch):
+    """墓碑期内被删除的会话：恢复时其消息与元数据整体跳过并在 skipped 说明。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_tomb")
+    state = client.app.state.aligo
+    monkeypatch.setattr(
+        state,
+        "is_recently_deleted",
+        lambda uid, sid: uid == user_id and sid == "s-del",
+    )
+    backup = {
+        "chat_history": [
+            {"role": "user", "content": "已删会话", "session_id": "s-del"},
+            {"role": "user", "content": "正常会话", "session_id": "s-ok"},
+        ],
+        "session_titles": {"s-del": "旧标题", "s-ok": "新标题"},
+    }
+    response = client.post(
+        "/api/import", params={"user_id": user_id}, json={"backup": backup}
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["messages_added"] == 1
+    assert any("最近被删除" in item for item in payload["skipped"])
+    print("✓ /api/import 跳过墓碑期内的已删除会话")
+
+
 def test_preference_storage_failure_maps_503(monkeypatch):
     """偏好写盘失败应返回 503（与其它存储接口一致），而不是通用 500。"""
     from utils.errors import MemoryPersistenceError
@@ -5906,10 +6079,27 @@ def test_session_cache_evicts_on_hit_path(monkeypatch):
     state.max_sessions = 1
     first = state.get_session("u-lru", "s-a")
     second = state.get_session("u-lru", "s-b")
-    # 再次命中 s-b：不能因为走过命中分支就跳过容量检查
+    assert len(state.sessions) == 1
+
+    # 人为制造「命中时已超限」：缓存里多出一个空闲旧会话，命中 s-b 应淘汰它
+    closed = []
+
+    class _Victim:
+        def in_use(self):
+            return False
+
+        def long_in_use(self, limit_sec):
+            return False
+
+        def close(self):
+            closed.append(1)
+
+    with state._sessions_lock:
+        state.sessions["u-lru" + chr(10) + "s-victim"] = _Victim()
     third = state.get_session("u-lru", "s-b")
     assert third is second
-    assert len(state.sessions) <= 1, "命中路径也必须回收超限会话"
+    assert len(state.sessions) == 1, "命中路径必须回收超限会话"
+    assert closed == [1], "被淘汰会话应被关闭"
     assert first.runtime.closed >= 1
     print("✓ 会话缓存命中路径执行 LRU 回收")
 
@@ -5958,6 +6148,57 @@ def test_import_with_root_path_uses_extended_limit(monkeypatch):
         print("✓ root_path 下 /api/import 上限、no-store、文档 CSP")
     finally:
         _cleanup(target)
+
+
+def test_gzip_middleware_excludes_sse_under_root_path():
+    """root_path 子路径部署下 SSE 仍按归一化路径排除 gzip。"""
+    import asyncio as _asyncio
+
+    from webapp.server import SelectiveGZipMiddleware
+
+    calls = []
+
+    async def inner(scope, receive, send):
+        calls.append("inner")
+
+    async def compressed(scope, receive, send):
+        calls.append("gzip")
+
+    middleware = SelectiveGZipMiddleware(inner, minimum_size=1024)
+    middleware.compressed_app = compressed  # type: ignore[assignment]
+    scope = {"type": "http", "path": "/aligo/api/chat/stream", "root_path": "/aligo"}
+    _asyncio.run(middleware(scope, None, None))
+    assert calls == ["inner"], "SSE 在子路径部署下也必须跳过 gzip"
+
+    calls.clear()
+    scope = {"type": "http", "path": "/aligo/api/status", "root_path": "/aligo"}
+    _asyncio.run(middleware(scope, None, None))
+    assert calls == ["gzip"]
+    print("✓ root_path 下 SSE 排除 gzip")
+
+
+def test_root_path_chunked_413_metric_label(monkeypatch):
+    """子路径部署下 chunked 超限仍按路由模板记 413 指标（不带前缀）。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app, root_path="/aligo")
+
+    def body_chunks():
+        chunk = b"x" * 65536
+        for _ in range(40):  # 2.5MB，超过 2MB 通用上限
+            yield chunk
+
+    response = client.post(
+        "/aligo/api/chat",
+        content=body_chunks(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413, response.text[:200]
+    by_path = REQUEST_METRICS.snapshot()["by_path"]
+    assert by_path.get("/api/chat", 0) >= 1, by_path
+    print("✓ root_path chunked 413 指标标签归一")
 
 
 def test_import_trailing_slash_redirects(monkeypatch):
