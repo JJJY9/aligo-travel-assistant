@@ -23,6 +23,29 @@ def default_db_path() -> Path:
     return default_knowledge_dir() / "milvus_lite.db"
 
 
+def _collection_dimension(client: Any, collection: str) -> int | None:
+    """集合向量字段的维度；不可读取（旧客户端 / 异常）返回 None。"""
+    try:
+        description = client.describe_collection(collection)
+        for field in description.get("fields") or []:
+            params = field.get("params") or {}
+            if "dim" in params:
+                return int(params["dim"])
+    except Exception as exc:  # noqa: BLE001 - 维度探测失败不影响状态主体
+        logger.debug("读取集合维度失败: %s", exc)
+    return None
+
+
+def _loaded_embedding_dim() -> int | None:
+    """当前进程已加载嵌入模型的维度（不触发加载）。"""
+    try:
+        from utils.embedding_model import peek_embedding_dim
+
+        return peek_embedding_dim()
+    except Exception:  # noqa: BLE001 - 可选依赖缺失时按未知处理
+        return None
+
+
 def knowledge_status(
     db_path: str | Path | None = None,
     collection: str = DEFAULT_COLLECTION,
@@ -51,11 +74,18 @@ def knowledge_status(
             if not client.has_collection(collection):
                 return {**base, "available": False, "reason": "集合不存在"}
             stats = client.get_collection_stats(collection)
-        return {
+            dimension = _collection_dimension(client, collection)
+        payload = {
             **base,
             "available": True,
             "documents": int(stats.get("row_count", 0) or 0),
         }
+        if dimension is not None:
+            payload["dimension"] = dimension
+        expected = _loaded_embedding_dim()
+        if expected is not None and dimension is not None:
+            payload["dimension_mismatch"] = int(dimension) != int(expected)
+        return payload
     except Exception as exc:  # noqa: BLE001 - 状态查询失败不影响主流程
         logger.warning("获取知识库状态失败: %s", exc)
         return {**base, "available": False, "reason": str(exc)}
