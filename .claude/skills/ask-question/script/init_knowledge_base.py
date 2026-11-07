@@ -9,8 +9,11 @@
 """
 import contextlib
 import importlib.util
+import json
+import os
 import sys
 import uuid
+from datetime import datetime
 from typing import Any
 from pathlib import Path
 
@@ -217,10 +220,113 @@ def _collect_preserved_documents() -> tuple[list[dict], list[str]]:
     return preserved + singles, warnings
 
 
+_BACKUP_NAME = "preserved_backup.json"
+
+
+def _preserved_backup_path(knowledge_base_path: Path) -> Path:
+    """重建前的保留片段备份文件（与 milvus 目录同级，不随集合重建被清）。"""
+    return Path(knowledge_base_path).with_name(
+        Path(knowledge_base_path).name + "." + _BACKUP_NAME
+    )
+
+
+def _dedupe_preserved(docs: list[dict]) -> list[dict]:
+    """保留片段去重：单条按 strip 内容、多分片组按（组, part, 内容）。"""
+    seen_single: set[str] = set()
+    seen_parts: set[tuple[str, str, str]] = set()
+    merged: list[dict] = []
+    for doc in docs:
+        content = str(doc.get("content") or "")
+        key = content.strip()
+        if not key:
+            continue
+        metadata = doc.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        group = str(metadata.get("group") or "")
+        if group:
+            marker = (group, str(metadata.get("part") or ""), key)
+            if marker in seen_parts:
+                continue
+            seen_parts.add(marker)
+        else:
+            if key in seen_single:
+                continue
+            seen_single.add(key)
+        merged.append({"content": content, "metadata": metadata})
+    return merged
+
+
+def _merge_preserved_backup(
+    knowledge_base_path: Path, preserved: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """把上次中断留下的备份并入本次保留片段（重跑即可补齐丢失部分）。"""
+    path = _preserved_backup_path(knowledge_base_path)
+    if not path.exists():
+        return preserved, []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return preserved, [f"上次重建的保留片段备份不可读（{exc}）：{path}"]
+    docs = payload.get("documents") if isinstance(payload, dict) else None
+    if not isinstance(docs, list):
+        return preserved, [f"上次重建的保留片段备份格式异常：{path}"]
+    previous = [
+        {
+            "content": str(item.get("content") or ""),
+            "metadata": item.get("metadata")
+            if isinstance(item.get("metadata"), dict)
+            else {},
+        }
+        for item in docs
+        if isinstance(item, dict)
+    ]
+    return _dedupe_preserved(previous + preserved), [
+        f"已并入上次未完成重建留下的 {len(previous)} 个片段（{path}）"
+    ]
+
+
+def _write_preserved_backup(
+    knowledge_base_path: Path, preserved: list[dict]
+) -> Path | None:
+    """删库前把保留片段落盘：写入阶段被中断 / 失败也能在重跑时找回。"""
+    if not preserved:
+        return None
+    path = _preserved_backup_path(knowledge_base_path)
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "documents": preserved,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def _batch_by_group(rows: list[dict], size: int) -> list[list[dict]]:
+    """按组分界切批：多分片文档整组进同一批（与 knowledge_admin 同口径）。"""
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_group = ""
+    for row in rows:
+        metadata = row.get("metadata")
+        group = str(metadata.get("group") or "") if isinstance(metadata, dict) else ""
+        same_group = group == current_group and group != ""
+        # 达到批上限后，只有在「不是同一个多分片组」时才真正切批
+        if current and len(current) >= size and not same_group:
+            batches.append(current)
+            current = []
+        current.append(row)
+        current_group = group
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _add_in_batches(rag_agent, rows: list[dict], label: str) -> None:
     """分批写入（每批失败重试一次）；失败抛 RuntimeError 并带进度。"""
-    for start in range(0, len(rows), _PRESERVED_BATCH):
-        batch = rows[start : start + _PRESERVED_BATCH]
+    written = 0
+    for index, batch in enumerate(_batch_by_group(rows, _PRESERVED_BATCH), 1):
         last_error: Exception | None = None
         for _ in range(2):
             try:
@@ -235,12 +341,10 @@ def _add_in_batches(rag_agent, rows: list[dict], label: str) -> None:
                 last_error = exc
         if last_error is not None:
             raise RuntimeError(
-                f"{label}失败（第 {start // _PRESERVED_BATCH + 1} 批，"
-                f"已补 {start} 条）：{last_error}"
+                f"{label}失败（第 {index} 批，已补 {written} 条）：{last_error}"
             )
-        print(
-            f"   ✓ {label}进度 {min(start + _PRESERVED_BATCH, len(rows))}/{len(rows)}"
-        )
+        written += len(batch)
+        print(f"   ✓ {label}进度 {written}/{len(rows)}")
 
 
 def _build_agent(model, knowledge_base_path: Path):
@@ -305,6 +409,7 @@ def main() -> int:
         print(f"   知识库路径: {knowledge_base_path}")
         preserved: list[dict] = []
         preserved_ready = False
+        backup_path: Path | None = None
         try:
             rag_agent = _build_agent(model, knowledge_base_path)
         except RuntimeError as exc:
@@ -321,6 +426,12 @@ def main() -> int:
                 return 1
             for warning in warnings:
                 print(f"   ⚠️  {warning}")
+            preserved, backup_notes = _merge_preserved_backup(
+                knowledge_base_path, preserved
+            )
+            for note in backup_notes:
+                print(f"   ⚠️  {note}")
+            backup_path = _write_preserved_backup(knowledge_base_path, preserved)
             print(
                 f"   已导出 {len(preserved)} 个片段，删除旧集合并按当前嵌入模型重建..."
             )
@@ -352,6 +463,14 @@ def main() -> int:
                     return 1
                 for warning in warnings:
                     print(f"   ⚠️  {warning}")
+                preserved, backup_notes = _merge_preserved_backup(
+                    knowledge_base_path, preserved
+                )
+                for note in backup_notes:
+                    print(f"   ⚠️  {note}")
+                backup_path = _write_preserved_backup(
+                    knowledge_base_path, preserved
+                )
                 if preserved:
                     print(f"   已导出 {len(preserved)} 个库内已有片段（重建后补写）")
                 print("   ⚠️  正在删除旧 Collection 并重建...")
@@ -375,9 +494,12 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - 写入失败反映在退出码
             print(f"❌ 添加文档失败: {exc}")
             if preserved:
+                hint = (
+                    f"已备份到 {backup_path}，" if backup_path is not None else ""
+                )
                 print(
-                    "   已写入的部分请重跑脚本补齐；面板 / CLI 添加的片段"
-                    "本次未能全部补写，请勿在补写成功前清理知识库"
+                    "   面板 / CLI 添加的片段本次未能全部补写，"
+                    f"{hint}重跑脚本会自动并入并补齐"
                 )
             return 1
         print(f"✓ 成功写入 {len(documents)} 个内置片段")
@@ -433,6 +555,12 @@ def main() -> int:
             print("❌ 自检检索全部未命中，知识库可能不可用")
             return 1
 
+        # 全部写入与自检都成功：保留片段备份已完成使命，清理掉
+        if backup_path is not None and backup_path.exists():
+            try:
+                backup_path.unlink()
+            except OSError as exc:
+                print(f"   ⚠️  清理保留片段备份失败：{exc}")
         print()
         print("=" * 70)
         print("知识库初始化完成！")
