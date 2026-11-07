@@ -313,10 +313,88 @@ def test_knowledge_base_reason_variants(monkeypatch):
     assert result.status == STATUS_OK and "3 个知识片段" in result.detail
 
 
-def test_config_and_dependencies_branches(monkeypatch):
-    """缺少 API Key / 缺少核心依赖时的失败分支。"""
-    import importlib.util as ilu
+def test_redact_secret_masks_passwords():
+    """doctor 输出里的连接串密码必须被遮蔽（psycopg 异常会回显 DSN）。"""
+    from utils.doctor import _redact_secret
 
+    masked = _redact_secret("postgresql://aligo:s3cret@db:5432/aligo")
+    assert "s3cret" not in masked and "://aligo:***@" in masked
+    keyword = _redact_secret("host=db password=s3cret user=aligo")
+    assert "s3cret" not in keyword and "password=***" in keyword
+    print("✓ doctor 遮蔽连接串密码")
+
+
+def test_model_files_accepts_huggingface_id(monkeypatch):
+    """配置为 HuggingFace 模型 ID（BAAI/xxx）时不误报「未下载」。"""
+    from config import RAG_CONFIG
+    from utils import doctor as doctor_module
+
+    monkeypatch.setitem(RAG_CONFIG, "embedding_model", "BAAI/bge-small-zh-v1.5")
+    result = doctor_module.check_model_files()
+    assert result.status == STATUS_OK, result.detail
+    assert "HuggingFace" in result.detail
+    print("✓ 嵌入模型 HF ID 不误报未下载")
+
+
+def test_knowledge_base_dimension_mismatch_warns(monkeypatch):
+    """集合维度与当前嵌入模型不一致时报警告（检索会静默返回空）。"""
+    from utils import knowledge_stats
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda path=None: {
+            "collection": "c",
+            "available": True,
+            "documents": 3,
+            "dimension": 1024,
+            "dimension_mismatch": True,
+        },
+    )
+    result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_WARN
+    assert "不一致" in result.detail and "1024" in result.detail
+    print("✓ 知识库维度不一致 → 警告")
+
+
+def test_storage_probe_sets_statement_timeout(monkeypatch):
+    """PostgreSQL 自检探测必须给 DDL / 查询设 statement_timeout。"""
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+    from context import postgres_long_term_memory as pg_module
+    from utils import doctor as doctor_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@h/db")
+    monkeypatch.setattr(
+        storage_module,
+        "describe_backends",
+        lambda: {
+            "short_term": "memory",
+            "long_term": "postgres",
+            "short_term_configured": False,
+            "long_term_configured": True,
+            "short_term_degraded": False,
+        },
+    )
+    captured = {}
+
+    class _Probe:
+        def __init__(self, user_id, dsn, statement_timeout_ms=None):
+            captured["timeout"] = statement_timeout_ms
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pg_module, "PostgresLongTermMemory", _Probe)
+    result = doctor_module.check_storage()
+    assert captured.get("timeout") == 3000
+    assert result.status == STATUS_OK, result.detail
+    print("✓ PostgreSQL 探测设置语句超时")
+
+
+def test_config_and_dependencies_branches(monkeypatch):
+    """缺少 API Key / 核心依赖 import 失败时的失败分支。"""
     from config import LLM_CONFIG
     from utils import doctor as doctor_module
 
@@ -324,14 +402,16 @@ def test_config_and_dependencies_branches(monkeypatch):
     result = doctor_module.check_config()
     assert result.status == STATUS_FAIL and "未配置 API Key" in result.detail
 
-    real_find_spec = ilu.find_spec
+    real_import = doctor_module.importlib.import_module
 
-    def fake_find_spec(name, *args, **kwargs):
+    def fake_import(name, *args, **kwargs):
         if name == "agentscope":
-            return None
-        return real_find_spec(name, *args, **kwargs)
+            raise ImportError("broken install")
+        return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(ilu, "find_spec", fake_find_spec)
+    # find_spec 只证明找得到包：装坏（缺子依赖 / 二进制不匹配）必须实际
+    # import 才发现，这里直接让 agentscope 导入失败
+    monkeypatch.setattr(doctor_module.importlib, "import_module", fake_import)
     results = doctor_module.check_dependencies()
     core = next(item for item in results if item.name == "核心依赖")
     assert core.status == STATUS_FAIL and "agentscope" in core.detail
@@ -476,6 +556,7 @@ if __name__ == "__main__":
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
     test_knowledge_base_missing()
+    test_redact_secret_masks_passwords()
     test_report_and_summary_statuses()
     for case in (
         test_storage_defaults,
@@ -483,6 +564,9 @@ if __name__ == "__main__":
         test_storage_runtime_degraded_warns,
         test_knowledge_base_reason_variants,
         test_config_and_dependencies_branches,
+        test_model_files_accepts_huggingface_id,
+        test_knowledge_base_dimension_mismatch_warns,
+        test_storage_probe_sets_statement_timeout,
         test_llm_connectivity_branches,
     ):
         mp = pytest.MonkeyPatch()

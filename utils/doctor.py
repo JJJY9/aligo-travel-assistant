@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import os
 import re
@@ -67,12 +68,19 @@ def check_dependencies() -> list[CheckResult]:
         "milvus_lite": "milvus-lite",
     }
 
-    missing_core = [pkg for mod, pkg in core.items() if importlib.util.find_spec(mod) is None]
-    if missing_core:
+    # find_spec 只能证明「找得到包」，装坏（缺子依赖 / 二进制不匹配）时 import
+    # 会失败但 doctor 仍报「已安装」——核心依赖必须实际导入才算可用
+    broken_core: list[str] = []
+    for mod, pkg in core.items():
+        try:
+            importlib.import_module(mod)
+        except Exception as exc:  # noqa: BLE001 - 断依赖包同样算不可用
+            broken_core.append(f"{pkg}（{str(exc)[:60]}）")
+    if broken_core:
         core_result = CheckResult(
             "核心依赖",
             STATUS_FAIL,
-            "缺少: " + ", ".join(missing_core) + "（pip install -r requirements.txt）",
+            "无法导入: " + "、".join(broken_core) + "（pip install -r requirements.txt）",
         )
     else:
         core_result = CheckResult("核心依赖", STATUS_OK, "agentscope / rich / PyYAML / ddgs 已安装")
@@ -88,6 +96,19 @@ def check_dependencies() -> list[CheckResult]:
         rag_result = CheckResult("RAG 依赖", STATUS_OK, "pymilvus / sentence-transformers / milvus-lite 已安装")
 
     return [core_result, rag_result]
+
+
+_DSN_PASSWORD_RE = re.compile(r"(://[^:/@\s]+:)[^@/\s]+(@)")
+
+
+def _redact_secret(text: object) -> str:
+    """遮蔽连接串里的密码。
+
+    psycopg / redis 的异常会回显完整 DSN，doctor 输出常被粘贴到工单或
+    聊天里，凭据不能跟着带出去。
+    """
+    value = _DSN_PASSWORD_RE.sub(r"\1***\2", str(text))
+    return re.sub(r"(?i)(password\s*=\s*)\S+", r"\1***", value)
 
 
 def check_config() -> CheckResult:
@@ -138,7 +159,7 @@ def check_storage() -> CheckResult:
                 client.ping()
                 parts.append("短期记忆 · Redis 可用")
             except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
-                failures.append(f"Redis 不可用：{str(exc)[:80]}")
+                failures.append(f"Redis 不可用：{_redact_secret(exc)[:120]}")
     else:
         parts.append("短期记忆 · 进程内")
         if redis_url:
@@ -148,11 +169,15 @@ def check_storage() -> CheckResult:
         try:
             from context.postgres_long_term_memory import PostgresLongTermMemory
 
-            memory = PostgresLongTermMemory("__doctor_probe__", dsn)
+            # 自检探测给 DDL / 查询设上限：只有 connect_timeout 挡不住
+            # _ensure_schema 在网络半通时无限等待
+            memory = PostgresLongTermMemory(
+                "__doctor_probe__", dsn, statement_timeout_ms=3000
+            )
             memory.close()
             parts.append("长期记忆 · PostgreSQL 可用")
         except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
-            failures.append(f"PostgreSQL 不可用：{str(exc)[:80]}")
+            failures.append(f"PostgreSQL 不可用：{_redact_secret(exc)[:120]}")
     else:
         parts.append("长期记忆 · JSON 文件")
         if dsn:
@@ -299,9 +324,33 @@ def _default_model_dir() -> Path:
     return anchor / "data" / "models" / "bge-small-zh-v1.5"
 
 
+_HF_MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
 def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
     """检查本地嵌入模型文件完整性。"""
+    configured = ""
+    try:
+        from config import RAG_CONFIG
+
+        configured = str(RAG_CONFIG.get("embedding_model") or "")
+    except Exception:  # noqa: BLE001 - 配置缺失按默认目录处理
+        configured = ""
     model_path = Path(model_dir) if model_dir else _default_model_dir()
+    if (
+        model_dir is None
+        and configured
+        and not model_path.exists()
+        and configured.count("/") == 1
+        and not configured.startswith((".", "/"))
+        and _HF_MODEL_ID_RE.match(configured)
+    ):
+        # RAG 技能支持 HuggingFace 模型 ID：本地无缓存是首次下载，不是缺文件
+        return CheckResult(
+            "嵌入模型文件",
+            STATUS_OK,
+            f"使用 HuggingFace 模型 {configured}（本地无缓存时首次运行自动下载）",
+        )
     required = ["config.json", "model.safetensors", "tokenizer.json"]
     recommended = ["modules.json", "1_Pooling/config.json", "vocab.txt"]
 
@@ -352,6 +401,14 @@ def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
     count = int(status.get("documents", 0))
     if count <= 0:
         return CheckResult("RAG 知识库", STATUS_WARN, "知识集合为空（请运行初始化脚本）")
+    if status.get("dimension_mismatch"):
+        # 换嵌入模型后集合维度与当前模型不一致：检索会静默返回空，比未初始化更隐蔽
+        return CheckResult(
+            "RAG 知识库",
+            STATUS_WARN,
+            f"已初始化 {count} 个片段，但集合维度（{status.get('dimension')}）"
+            "与当前嵌入模型不一致，请重新初始化知识库",
+        )
     return CheckResult("RAG 知识库", STATUS_OK, f"已初始化，{count} 个知识片段")
 
 
