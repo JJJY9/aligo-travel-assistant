@@ -4017,21 +4017,23 @@ def _parse_trips_list_args(
 
 
 def run_trips_import_standalone(
-    user_id: str, csv_path: str, as_json: bool = False
+    user_id: str, csv_path: str, as_json: bool = False, as_ics: bool = False
 ) -> int:
-    """从 CSV 导入行程（`python cli.py trips-import <user_id> <csv_path> [--json]`）。
+    """从 CSV / iCalendar 导入行程
+    （`python cli.py trips-import <user_id> <path> [--ics] [--json]`）。
 
-    解析 ``trips-export`` 导出的 CSV（UTF-8 BOM，中英文字段名均可），逐行
-    校验；重复行程沿用存储层去重语义（同路线 + 同起止日期更新目的）。
-    非法行收集后在输出里列出，不中断其余行。
+    解析 ``trips-export`` 导出的 CSV（UTF-8 BOM，中英文字段名均可）或
+    ``trips-export --ics`` 导出的事件（``--ics`` 或内容以 BEGIN:VCALENDAR
+    开头时自动识别），逐条校验；重复行程沿用存储层去重语义（同路线 +
+    同起止日期更新目的）。非法行 / 事件收集后在输出里列出，不中断其余项。
 
     Returns:
-        0 至少导入一行（含部分行被跳过）；1 参数 / 读取 / 写入失败或没有可导入行
+        0 至少导入一行（含部分项被跳过）；1 参数 / 读取 / 写入失败或没有可导入行
     """
     import io
     import re
 
-    from utils.trip_import import parse_trips_csv
+    from utils.trip_import import parse_trips_csv, parse_trips_ics
 
     def _fail(message: str) -> int:
         if as_json:
@@ -4049,19 +4051,29 @@ def run_trips_import_standalone(
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not csv_path or csv_path.startswith("-"):
-        return _fail("请提供 CSV 文件路径")
+        return _fail("请提供 CSV / ICS 文件路径")
     try:
         text = io.open(csv_path, "r", encoding="utf-8-sig").read()
     except FileNotFoundError:
         return _fail(f"文件不存在：{csv_path}")
     except UnicodeDecodeError as exc:
-        return _fail(f"读取 CSV 失败：{exc}（文件需为 UTF-8 编码）")
+        return _fail(f"读取导入文件失败：{exc}（文件需为 UTF-8 编码）")
     except OSError as exc:
-        return _fail(f"读取 CSV 失败：{exc}")
+        return _fail(f"读取导入文件失败：{exc}")
 
-    rows, errors = parse_trips_csv(text)
+    is_ics = as_ics or text.lstrip("﻿ \t\r\n").upper().startswith("BEGIN:VCALENDAR")
+    if is_ics:
+        rows, errors = parse_trips_ics(text)
+    else:
+        rows, errors = parse_trips_csv(text)
     if not rows:
-        detail = "；".join(f"第{line}行：{reason}" for line, reason in errors[:5])
+        if is_ics:
+            detail = "；".join(
+                reason if index == 0 else f"事件{index}：{reason}"
+                for index, reason in errors[:5]
+            )
+        else:
+            detail = "；".join(f"第{line}行：{reason}" for line, reason in errors[:5])
         return _fail(f"没有可导入的行程{f'（{detail}）' if detail else ''}")
 
     try:
@@ -4096,6 +4108,7 @@ def run_trips_import_standalone(
                     "ok": True,
                     "user_id": user_id,
                     "path": csv_path,
+                    "format": "ics" if is_ics else "csv",
                     "rows": len(rows),
                     "created": created,
                     "updated": updated,
@@ -4109,12 +4122,15 @@ def run_trips_import_standalone(
             )
         )
     else:
+        unit = "个事件" if is_ics else "行"
+        skipped_note = f"，跳过 {len(errors)} 项" if errors else ""
         print(
-            f"已从 {csv_path} 导入 {len(rows)} 行：新增 {created} 条，"
-            f"更新 {updated} 条"
+            f"已从 {csv_path} 导入 {len(rows)} {unit}：新增 {created} 条，"
+            f"更新 {updated} 条{skipped_note}"
         )
         for line, reason in errors:
-            print(f"  跳过第{line}行：{reason}")
+            label = f"事件{line}" if is_ics else f"第{line}行"
+            print(f"  跳过{label}：{reason}")
     return 0
 
 
@@ -5202,18 +5218,27 @@ def main():
                 )
             )
         if arg == "trips-import":
-            import_args = [a for a in sys.argv[2:] if a != "--json"]
+            import_args = [
+                a for a in sys.argv[2:] if a not in {"--json", "--ics"}
+            ]
             want_json = "--json" in sys.argv[2:]
+            want_ics = "--ics" in sys.argv[2:]
             if (
                 len(import_args) != 2
                 or not _valid_user_id(import_args[0])
                 or import_args[1].startswith("-")
             ):
-                print("用法：python cli.py trips-import <user_id> <csv_path> [--json]")
+                print(
+                    "用法：python cli.py trips-import <user_id> <csv_path> "
+                    "[--ics] [--json]"
+                )
                 sys.exit(2)
             sys.exit(
                 run_trips_import_standalone(
-                    import_args[0], import_args[1], as_json=want_json
+                    import_args[0],
+                    import_args[1],
+                    as_json=want_json,
+                    as_ics=want_ics,
                 )
             )
         if arg in {"help", "--help", "-h"}:
