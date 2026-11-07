@@ -345,9 +345,8 @@ class AligoCLI:
                 usage=usage_delta,
                 elapsed=elapsed,
             )
-            self.memory_manager.persist_message("user", user_input)
-            self.memory_manager.add_message(
-                "assistant",
+            self.memory_manager.persist_turn(
+                user_input,
                 json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
             )
         finally:

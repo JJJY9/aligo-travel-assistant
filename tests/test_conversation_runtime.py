@@ -56,6 +56,13 @@ class _FakeMemory:
         self.threads[f"persist-{role}"] = threading.get_ident()
         self.events.append((role, content))
 
+    def persist_turn(self, user_content, assistant_content):
+        # 整轮问答在同一次线程调用里提交（用户 + 助手），不能分两次
+        self.threads["persist-user"] = threading.get_ident()
+        self.threads["add-assistant"] = threading.get_ident()
+        self.events.append(("user", user_content))
+        self.events.append(("assistant", assistant_content))
+
     def add_message(self, role, content, metadata=None):
         self.threads[f"add-{role}"] = threading.get_ident()
         self.events.append((role, content))

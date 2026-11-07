@@ -97,6 +97,22 @@ class MemoryManager:
             self._rebuild_long_term()
         self.long_term.add_chat_message(role, content, self.session_id)
 
+    def persist_turn(self, user_content: str, assistant_content: str) -> None:
+        """一次性提交整轮问答（用户 + 助手）到长期记忆。
+
+        ``persist_message("user")`` 与 ``add_message("assistant")`` 分两次
+        调用时，两次之间被取消（用户停止 / 断网）或第二次写失败会在长期
+        记忆留下没有回答的孤儿提问。这里委托给后端在同一把写锁 / 同一个
+        事务里写入两条消息，短期记忆只补助手副本（用户消息已在编排前
+        通过 :meth:`stage_message` 暂存）。
+        """
+        if getattr(self.long_term, "snapshot_based", True):
+            self._rebuild_long_term()
+        self.long_term.add_chat_turn(
+            user_content, assistant_content, self.session_id
+        )
+        self.stage_message("assistant", assistant_content)
+
     def stage_message(
         self, role: str, content: str, metadata: dict | None = None
     ) -> None:

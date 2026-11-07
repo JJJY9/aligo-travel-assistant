@@ -638,6 +638,48 @@ class LongTermMemory:
         logger.info("Bulk imported %d chat messages", added)
         return added
 
+    @_locked_mutation
+    def add_chat_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        session_id: str | None = None,
+    ) -> None:
+        """原子追加一轮完整问答（用户 + 助手两条消息）。
+
+        分成两次 ``add_chat_message`` 时，两次写回之间被取消 / 第二次写盘
+        失败会把「有提问没有回答」的半轮落盘；这里合并为单次写锁 + 单次
+        写回，写回失败时同时回滚内存中的两条追加（磁盘保持原状）。
+        """
+        now = datetime.now().isoformat()
+        history = self.data["chat_history"]
+        start = len(history)
+        total_before = int(self.data["statistics"].get("total_messages") or 0)
+        history.append(
+            {
+                "role": "user",
+                "content": user_content,
+                "timestamp": now,
+                "session_id": session_id,
+            }
+        )
+        history.append(
+            {
+                "role": "assistant",
+                "content": assistant_content,
+                "timestamp": now,
+                "session_id": session_id,
+            }
+        )
+        self.data["statistics"]["total_messages"] = total_before + 2
+        try:
+            self._persist()
+        except BaseException:
+            del history[start:]
+            self.data["statistics"]["total_messages"] = total_before
+            raise
+        logger.debug("Added chat turn to long-term memory")
+
     def get_chat_history(self, limit: int | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
         """
         获取聊天历史

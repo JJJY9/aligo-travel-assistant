@@ -343,6 +343,33 @@ class PostgresLongTermMemory:
             (self.user_id, role, content, session_id),
         )
 
+    def add_chat_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        session_id: str | None = None,
+    ) -> None:
+        """同一事务写入一轮完整问答（用户 + 助手两条消息）。
+
+        分开两次 INSERT 时，两次之间被取消 / 第二次失败会留下没有回答的
+        孤儿提问；单事务保证两条一起提交或一起回滚。连接错误后不重放
+        （无法区分事务是否已提交，重放会产生重复问答）。
+        """
+
+        def run() -> None:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO aligo_chat_messages "
+                    "(user_id, role, content, session_id) "
+                    "VALUES (%s, %s, %s, %s)",
+                    [
+                        (self.user_id, "user", user_content, session_id),
+                        (self.user_id, "assistant", assistant_content, session_id),
+                    ],
+                )
+
+        self._run_with_retry(run, replay_safe=False)
+
     def add_chat_messages(
         self, messages: list[dict[str, Any]], dedupe: bool = False
     ) -> int:

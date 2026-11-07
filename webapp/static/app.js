@@ -85,8 +85,6 @@ const state = {
   busy: false,
   controller: null,
   lastUserText: "",
-  // 本轮是否已收到 plan 事件：之前中止意味着提问尚未写入服务端历史
-  turnSawPlan: false,
   kbItems: [],
   // 服务端分页游标：以「已向服务端取回的条数」为准，而不是去重后的已显示
   // 条数——并发插入会让按显示数计算的 offset 永远追不上，加载更多失效
@@ -2347,7 +2345,6 @@ async function sendMessage(text, options = {}) {
   cancelPendingEdits();
   sessionLoadToken += 1;
   state.lastUserText = message;
-  state.turnSawPlan = false;
   state.controller = new AbortController();
   setBusy(true);
   trimRegenButtons();
@@ -2397,7 +2394,6 @@ async function sendMessage(text, options = {}) {
       // 已收到 done / error 后忽略后续事件：连接错误不能覆盖已完成的回答
       if (terminal) return;
       if (event.type === "done" || event.type === "error") terminal = event.type;
-      if (event.type === "plan") state.turnSawPlan = true;
       handleStreamEvent(assistant, event, message);
     });
     if (!terminal) {
@@ -2409,16 +2405,22 @@ async function sendMessage(text, options = {}) {
       // 服务端已发过 done / error 后再中止（停止按钮晚点、切换会话）：
       // 保留已完成的回答，不能改成「已停止」
       if (!terminal) {
-        // plan 事件之前中止：提问没有写入服务端历史，把原文放回输入框，
-        // 避免「停止」把刚输入的内容永久丢掉
-        if (!state.turnSawPlan && !els.input.value.trim()) {
-          els.input.value = message;
-          resizeInput();
-        }
         mutate(() => {
           assistant.trace.fail("已停止");
           assistant.fail("已停止生成。");
         });
+        // 是否落库不能以 plan 事件为准：服务端在 plan 之后才执行编排，
+        // 编排成功就会把提问与回答一起写入历史（即使客户端已停止读取）。
+        // 有会话 ID 时稍后与服务端历史对账，按结果决定重渲染还是回填输入；
+        // 没有会话 ID 说明首帧之前就中止，提问肯定没有落库，直接回填。
+        const sessionId = state.sessionId;
+        if (sessionId) {
+          const token = sessionLoadToken;
+          setTimeout(() => reconcileStoppedTurn(sessionId, message, token), 600);
+        } else if (!els.input.value.trim()) {
+          els.input.value = message;
+          resizeInput();
+        }
       }
     } else if (!terminal) {
       mutate(() => {
@@ -2460,6 +2462,71 @@ async function sendMessage(text, options = {}) {
     if (!document.querySelector(".hi-input")) await loadSessions();
     // refreshStatus 内部会在偏好编辑框存在时跳过渲染（编辑结束后补刷新）
     refreshStatus();
+  }
+}
+
+/* 停止 / 中断后对账：服务端可能在停止前已完成编排并把整轮问答写入历史，
+   也可能什么都没写。以服务端历史上的「最后两条消息」为准（原子落库保证
+   用户 + 助手成对出现）：已落库就按服务端状态重渲染；连续几次都没出现，
+   说明提问没有保存，重渲染旧历史后把原文放回输入框，避免永久丢失。 */
+async function reconcileStoppedTurn(sessionId, message, token) {
+  if (!message) return;
+  const canSync = () =>
+    sessionId === state.sessionId &&
+    !state.busy &&
+    token === sessionLoadToken &&
+    !document.querySelector(".user-edit-input") &&
+    !document.querySelector(".pref-input") &&
+    !document.querySelector(".hi-input");
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (!canSync()) return;
+    let data = null;
+    try {
+      data = await getJSON(
+        `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+      );
+    } catch (_) {
+      data = null;
+    }
+    if (!canSync()) return;
+    if (data && Array.isArray(data.messages)) {
+      const messages = data.messages;
+      const last = messages[messages.length - 1];
+      const prev = messages[messages.length - 2];
+      const persisted =
+        last &&
+        prev &&
+        prev.role === "user" &&
+        String(prev.content) === message &&
+        last.role === "assistant";
+      if (persisted) {
+        await openSession(sessionId, {
+          silent: true,
+          keepOnError: true,
+          preserveOnEmpty: true,
+        });
+        return;
+      }
+      if (attempt === 3) {
+        await openSession(sessionId, {
+          silent: true,
+          keepOnError: true,
+          preserveOnEmpty: true,
+        });
+        if (!els.input.value.trim()) {
+          els.input.value = message;
+          resizeInput();
+        }
+        toast("已停止，这条提问没有保存");
+        return;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 700));
+  }
+  // 连续请求失败（服务不可达）：保留本地「已停止」气泡，至少把原文还回输入框
+  if (!els.input.value.trim()) {
+    els.input.value = message;
+    resizeInput();
   }
 }
 
@@ -4629,38 +4696,9 @@ function bindEvents() {
 
   els.stopBtn.addEventListener("click", () => {
     if (!state.controller) return;
-    const sessionId = state.sessionId;
-    const token = sessionLoadToken;
-    const sawPlan = state.turnSawPlan;
+    // 中止后的对账（是否已落库 → 重渲染或回填输入）在 sendMessage 的
+    // AbortError 分支统一处理：超时中断与服务端已落库的情况走同一路径
     state.controller.abort();
-    // 服务端可能在 done 帧到达前就已把回答写入历史：中止只中断读取，
-    // 无法撤销写入。稍后重拉当前会话，若回答已落库就同步到界面，避免
-    // 出现「界面已停止、服务端却已保存」的不一致。
-    // 但在 plan 事件之前中止意味着提问尚未写入，重拉只会用旧历史覆盖
-    // 界面（新会话还会被重置成欢迎页）——此时跳过同步，输入内容在
-    // sendMessage 的 AbortError 分支放回输入框
-    if (sessionId && sawPlan) {
-      setTimeout(() => {
-        // 用户可能已打开提问编辑框 / 偏好编辑 / 重命名：整体重渲染会销毁
-        // 正在编辑的内容，跳过本次同步（可手动刷新）
-        const editing =
-          document.querySelector(".user-edit-input") ||
-          document.querySelector(".pref-input") ||
-          document.querySelector(".hi-input");
-        if (
-          sessionId === state.sessionId &&
-          !state.busy &&
-          token === sessionLoadToken &&
-          !editing
-        ) {
-          openSession(sessionId, {
-            silent: true,
-            keepOnError: true,
-            preserveOnEmpty: true,
-          });
-        }
-      }, 600);
-    }
   });
 
   els.kbForm.addEventListener("submit", addKnowledgeDocument);

@@ -172,6 +172,22 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
         memory.close()
 
 
+def test_pg_add_chat_turn_writes_pair_in_one_transaction():
+    """PG add_chat_turn：用户 + 助手同一事务写入，会话历史完整成对。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        memory.add_chat_turn("去北京出差", "已为你规划行程", "s-turn")
+        history = memory.get_chat_history(session_id="s-turn")
+        assert [item["role"] for item in history] == ["user", "assistant"]
+        assert [item["content"] for item in history] == [
+            "去北京出差",
+            "已为你规划行程",
+        ]
+        print("✓ PG add_chat_turn 整轮事务写入")
+    finally:
+        memory.close()
+
+
 def test_pg_save_trip_histories_counts_mixed_batch():
     """PG 批量保存：同批「已存在 + 新建」的 created/updated 计数正确。"""
     memory, _ = _pg_memory_or_skip()
