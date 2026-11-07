@@ -269,11 +269,49 @@ def test_runner_dispatch(monkeypatch):
     print("✓ user-import dispatch 与用法错误")
 
 
+def test_parse_tolerates_bad_timestamps_and_rows():
+    payload = {
+        "preferences": {"k" * 65: "太长键", "ok": "值"},
+        "trip_history": [
+            "不是对象",
+            {"destination": "上海", "start_date": "2026-12-01", "end_date": "2026-12-32"},
+        ],
+        "chat_history": [
+            "不是对象",
+            {"role": "user", "content": "时间戳非法", "session_id": "s1", "timestamp": "not-a-date"},
+            {"role": "assistant", "content": "数字时间", "session_id": "s1", "timestamp": 123},
+            {"role": "user", "content": "空时间", "session_id": "s1", "timestamp": ""},
+        ],
+        "session_titles": {"s1": "  ", "missing": "悬空"},
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert sections["preferences"] == {"ok": "值"}
+    assert sections["trips"] == [], "非法返程日期应整条跳过"
+    assert [m["timestamp"] for m in sections["messages"]] == [None, None, None]
+    assert sections["titles"] == {}
+    joined = "；".join(errors)
+    assert "键名非法" in joined
+    assert "不是对象" in joined
+    assert "返程日期格式" in joined
+    print("✓ 非法时间戳 / 行类型 / 超长键名逐条容忍")
+
+
+def test_parse_limits_preferences():
+    payload = {"preferences": {f"k{i}": i for i in range(205)}}
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert len(sections["preferences"]) == 200
+    assert any("偏好超过 200 个" in e for e in errors)
+    print("✓ 偏好数量上限")
+
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
     test_parse_export_skips_invalid_rows()
     test_exporter_json_is_importable()
+    test_parse_tolerates_bad_timestamps_and_rows()
+    test_parse_limits_preferences()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (
