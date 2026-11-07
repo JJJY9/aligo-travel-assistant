@@ -5739,7 +5739,7 @@ def test_metrics_streaming_and_sse_errors():
         REQUEST_METRICS.reset()
 
 
-def test_health_reports_degraded_when_breaker_open():
+def test_health_reports_degraded_when_breaker_open(monkeypatch):
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
     try:
@@ -5789,7 +5789,7 @@ def test_sse_error_increments_metrics(monkeypatch):
     print("✓ SSE error 收尾计入独立指标")
 
 
-def test_circuit_breaker_probe_owner_is_async_task():
+def test_circuit_breaker_probe_owner_is_async_task(monkeypatch):
     """同一线程的不同 asyncio task 不能互相消费半开试探名额。"""
     import asyncio
 
@@ -5817,7 +5817,7 @@ def test_circuit_breaker_probe_owner_is_async_task():
     print("✓ 半开试探按 asyncio task 认属主")
 
 
-def test_half_open_failure_freezes_failure_count():
+def test_half_open_failure_freezes_failure_count(monkeypatch):
     """半开失败回到 OPEN 时失败数冻结在阈值（/metrics 与 HELP 文案一致）。"""
     from utils.circuit_breaker import CircuitBreaker
 
@@ -5833,7 +5833,7 @@ def test_half_open_failure_freezes_failure_count():
     print("✓ 半开失败后失败数冻结在阈值")
 
 
-def test_import_uses_dedicated_executor():
+def test_import_uses_dedicated_executor(monkeypatch):
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
     try:
