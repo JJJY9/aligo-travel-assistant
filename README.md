@@ -859,7 +859,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - 存储连接复用：PostgreSQL 后端不再每轮对话重建连接；Web 会话缓存按 LRU 淘汰（上限 50）并在服务关闭时释放
 
 ### 已知限制
-- **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。
+- **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。`reset_milvus_client` 会关闭并重建共享客户端（关闭在锁内，避免并发拿到正在关闭的对象），但 milvus-lite 的本地 server / 数据库句柄不一定随 `close()` 释放，文件锁可能保持到进程退出；连接损坏后重建也可能复用旧 server——重连仍失败时请重启进程（Web 服务）。
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
 - **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。
 - **天气缓存是进程内缓存**：`/api/weather` 的 10 分钟缓存与同城并发合并都在单个进程内，多实例 / 多 worker 部署时各进程分别请求上游、缓存不共享（限流配置 `REDIS_URL` 后仍跨实例共享）。

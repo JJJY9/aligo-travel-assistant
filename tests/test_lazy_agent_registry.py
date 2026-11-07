@@ -51,6 +51,32 @@ def _registry(monkeypatch, skills: dict[str, str]) -> LazyAgentRegistry:
     return LazyAgentRegistry(model="fake-model", cache={})
 
 
+_UNINITIALIZED_SOURCE = '''
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
+
+
+class BrokenInitAgent(AgentBase):
+    def __init__(self, name="BrokenInitAgent", model=None, **kwargs):
+        super().__init__()
+        self.name = name
+        self.initialized = False
+
+    async def reply(self, x=None):
+        return Msg(name=self.name, content="", role="assistant")
+'''
+
+
+def test_uninitialized_agents_not_cached(monkeypatch):
+    """初始化失败的实例不缓存：补跑初始化后下一次调用重新加载。"""
+    registry = _registry(monkeypatch, {"ask-question": _UNINITIALIZED_SOURCE})
+    first = registry["rag_knowledge"]
+    assert first.initialized is False
+    second = registry["rag_knowledge"]
+    assert second is not first, "initialized=False 的实例不能进入缓存"
+    print("✓ 初始化失败的智能体不缓存")
+
+
 def test_discovers_and_caches_agents(monkeypatch):
     registry = _registry(monkeypatch, {"query-info": _AGENT_SOURCE})
     assert "query-info" in registry
@@ -106,6 +132,7 @@ def test_keys_include_legacy_names(monkeypatch):
 
 if __name__ == "__main__":
     for case in (
+        test_uninitialized_agents_not_cached,
         test_discovers_and_caches_agents,
         test_unknown_agent,
         test_import_failure_propagates,

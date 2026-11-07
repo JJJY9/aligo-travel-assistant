@@ -526,7 +526,7 @@ def test_rag_explicit_embedding_model_id_not_replaced(monkeypatch, tmp_path):
     assert captured["name"] == "BAAI/bge-base-zh-v1.5"
     assert module.RAGKnowledgeAgent._looks_like_filesystem_path(
         "data/models/bge"
-    ) is False
+    ) is True, "多级相对路径（RAG_CONFIG 默认值形态）应按路径处理"
     assert module.RAGKnowledgeAgent._looks_like_filesystem_path(
         "./missing-model"
     ) is True
@@ -534,6 +534,23 @@ def test_rag_explicit_embedding_model_id_not_replaced(monkeypatch, tmp_path):
         "D:/models/x"
     ) is True
     print("✓ 显式嵌入模型 ID 不被 RAG_CONFIG 覆盖")
+
+
+def test_rag_existing_db_without_collection_not_created(monkeypatch, tmp_path):
+    """库文件存在但集合缺失：检索路径不再顺手建集合（按未初始化提示）。"""
+    module = _load_skill_module("ask-question")
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
+    monkeypatch.setattr(
+        module, "get_embedding_model", lambda name: _RagFakeEmbedding()
+    )
+    client = _RagFakeClient()
+    monkeypatch.setattr(module, "get_milvus_client", lambda path: client)
+    (tmp_path / "milvus_lite.db").write_bytes(b"")
+    agent = module.RAGKnowledgeAgent(name="x", knowledge_base_path=str(tmp_path))
+    assert agent.initialized is False
+    assert "缺少集合" in agent.init_error
+    assert client.created == [], "检索路径不能创建集合"
+    print("✓ 库在集合缺时不创建、按未初始化提示")
 
 
 def test_rag_reply_filters_low_score_documents():
@@ -598,8 +615,12 @@ def test_rag_collection_created_once(monkeypatch, tmp_path):
         module, "get_embedding_model", lambda name: _RagFakeEmbedding()
     )
     monkeypatch.setattr(module, "get_milvus_client", lambda path: client)
-    module.RAGKnowledgeAgent(name="x", knowledge_base_path=str(tmp_path))
-    module.RAGKnowledgeAgent(name="y", knowledge_base_path=str(tmp_path))
+    module.RAGKnowledgeAgent(
+        name="x", knowledge_base_path=str(tmp_path), create_if_missing=True
+    )
+    module.RAGKnowledgeAgent(
+        name="y", knowledge_base_path=str(tmp_path), create_if_missing=True
+    )
     assert client.created == ["business_travel_knowledge"]
 
     # 初始化脚本路径：库文件不存在时允许创建（create_if_missing=True）
@@ -678,6 +699,7 @@ if __name__ == "__main__":
             test_rag_requires_initialized_knowledge_base,
             test_rag_explicit_embedding_model_id_not_replaced,
             test_rag_collection_created_once,
+            test_rag_existing_db_without_collection_not_created,
         ):
             _case_mp = pytest.MonkeyPatch()
             try:

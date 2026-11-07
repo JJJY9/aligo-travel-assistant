@@ -144,7 +144,8 @@ class RAGKnowledgeAgent(AgentBase):
         # 检索路径不创建知识库（create_if_missing=False）：Milvus Lite 打开
         # 不存在的库会静默新建空库，把「未初始化」回答成「没有找到相关信息」。
         # 初始化脚本与知识管理写入路径显式传 True（它们负责创建 / 写入）
-        if not Path(milvus_db_path).exists() and not create_if_missing:
+        db_existed = Path(milvus_db_path).exists()
+        if not db_existed and not create_if_missing:
             self.initialized = False
             self.init_error = (
                 "知识库尚未初始化（找不到 milvus_lite.db），请先运行 "
@@ -163,6 +164,17 @@ class RAGKnowledgeAgent(AgentBase):
         with _COLLECTION_INIT_LOCK:
             if client.has_collection(collection_name):
                 logger.info(f"Loaded existing collection: {collection_name}")
+            elif db_existed and not create_if_missing:
+                # 库文件存在但集合缺失（空库 / 初始化中断）：检索路径不应该
+                # 顺手创建集合把「集合不存在」回答成「没有找到相关信息」
+                self.initialized = False
+                self.init_error = (
+                    "知识库缺少集合（milvus_lite.db 存在但尚未初始化知识），"
+                    "请运行 python .claude/skills/ask-question/script/"
+                    "init_knowledge_base.py 或先导入知识文档"
+                )
+                logger.error(self.init_error)
+                return
             else:
                 # 创建新collection
                 logger.info(f"Creating new collection: {collection_name}")
@@ -190,12 +202,17 @@ class RAGKnowledgeAgent(AgentBase):
 
     @staticmethod
     def _looks_like_filesystem_path(value: str) -> bool:
-        """区分本地路径与 HuggingFace 模型 ID（如 BAAI/bge-small-zh-v1.5）。"""
-        return (
-            value.startswith((".", "/", "\\"))
-            or "\\" in value
-            or re.match(r"^[A-Za-z]:", value) is not None
-        )
+        """区分本地路径与 HuggingFace 模型 ID（如 BAAI/bge-small-zh-v1.5）。
+
+        路径：以 . / ~ / 盘符 / 斜杠开头、含反斜杠，或含多于一个 ``/``
+        （例如 RAG_CONFIG 默认的 ``data/models/bge-small-zh-v1.5``）；
+        HuggingFace ID 恰好是 ``组织/名称`` 两段。
+        """
+        if value.startswith((".", "/", "\\", "~")):
+            return True
+        if "\\" in value or re.match(r"^[A-Za-z]:", value) is not None:
+            return True
+        return value.count("/") >= 2
 
     def _check_embedding_dimension(self, client) -> None:
         """集合向量维度与当前嵌入模型不一致时明确报错。
