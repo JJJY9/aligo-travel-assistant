@@ -22,14 +22,17 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import reprlib
 import logging
 import math
 import re
 import threading
 import time
+import weakref
 import uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.thread import _threads_queues, _worker
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -689,6 +692,40 @@ return 0
 """
 
 
+class _DaemonImportExecutor(ThreadPoolExecutor):
+    """导入专用执行器：工作线程为守护线程。
+
+    ThreadPoolExecutor 默认创建非守护线程：lifespan 里 wait=False 之后，
+    进程退出仍要 join 正在跑的分钟级导入，服务停不下来。这里沿用 CPython
+    的内部线程创建逻辑（3.10-3.12 稳定），只把线程标记为 daemon。
+    """
+
+    def _adjust_thread_count(self) -> None:  # type: ignore[override]
+        if self._idle_semaphore.acquire(timeout=0):  # type: ignore[attr-defined]
+            return
+
+        def weakref_cb(_: Any, q: Any = self._work_queue) -> None:  # type: ignore[attr-defined]
+            q.put(None)
+
+        num_threads = len(self._threads)  # type: ignore[attr-defined]
+        if num_threads < self._max_workers:  # type: ignore[attr-defined]
+            thread_name = f"{self._thread_name_prefix or self}_{num_threads}"
+            thread = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,  # type: ignore[attr-defined]
+                    self._initializer,  # type: ignore[attr-defined]
+                    self._initargs,  # type: ignore[attr-defined]
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.add(thread)  # type: ignore[attr-defined]
+            _threads_queues[thread] = self._work_queue  # type: ignore[index, attr-defined]
+
+
 class AligoWebApp:
     """应用状态：共享模型 / 熔断器 / 会话表。"""
 
@@ -731,7 +768,7 @@ class AligoWebApp:
         )
         # 备份恢复专用执行器：单 worker 串行化导入，且不占用 asyncio 默认
         # 线程池——分钟级的大导入会让所有对话 / SSE / 删除的 to_thread 排队
-        self.import_executor = ThreadPoolExecutor(
+        self.import_executor = _DaemonImportExecutor(
             max_workers=1, thread_name_prefix="aligo-import"
         )
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
@@ -850,6 +887,24 @@ class AligoWebApp:
                         # 并发首请求：另一线程已抢先插入，使用已有实例
                         session = found
                         self.sessions.move_to_end(key)
+                        # 命中路径同样要执行容量回收：只在新建分支淘汰时，
+                        # sessions 会先被并发首请求推过上限再永远超限
+                        while len(self.sessions) > self.max_sessions:
+                            victim = next(
+                                (
+                                    candidate_key
+                                    for candidate_key, item in self.sessions.items()
+                                    if candidate_key != key
+                                    and (
+                                        not item.in_use()
+                                        or item.long_in_use(self.session_turn_leak_sec)
+                                    )
+                                ),
+                                None,
+                            )
+                            if victim is None:
+                                break
+                            evicted.append(self.sessions.pop(victim))
                         if mark_in_use:
                             session.begin_turn()
                     else:
@@ -1115,6 +1170,11 @@ def _rate_identity(host: str) -> str:
     except ValueError:
         return text
     if address.version == 6:
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            # IPv4 映射地址（::ffff:1.2.3.4）：按真实 IPv4 聚合，否则所有
+            # IPv4 客户端都会落进 ::/64 同一个桶
+            return str(mapped)
         return str(ipaddress.ip_network(f"{address}/64", strict=False))
     return text
 
@@ -1446,7 +1506,12 @@ def _strip_markdown_for_snippet(text: str) -> str:
 
 def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     """截取命中位置附近的片段（用于会话搜索结果的预览）。"""
-    cleaned = _strip_markdown_for_snippet(text)
+    haystack = str(text)
+    # 先做廉价的原文包含判断：整条消息做 Markdown 剥离（多条正则）在超长
+    # 行上有回溯开销，没命中的消息根本不需要清理
+    if not needle or needle.lower() not in haystack.lower():
+        return ""
+    cleaned = _strip_markdown_for_snippet(haystack)
     index = cleaned.lower().find(needle)
     if index < 0:
         # 关键字本身含被剥离的记号时回退到原文匹配
@@ -1649,12 +1714,21 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _md_inline(value: object) -> str:
+    """导出 Markdown 的单行内联文本：折叠空白 + 尖括号转义（与 CLI 同口径）。"""
+    return (
+        " ".join(str(value if value is not None else "").split())
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     """把用户长期记忆整理为便于阅读的 Markdown（偏好 / 行程 / 统计 / 最近会话）。"""
     lines = [
         "# Aligo 用户数据导出",
         "",
-        f"- 用户：{user_id}",
+        f"- 用户：{_md_inline(user_id)}",
         f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
         "",
     ]
@@ -1663,8 +1737,12 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     lines.extend(["## 用户偏好", ""])
     if preferences:
         for key, value in preferences.items():
-            text = "、".join(str(item) for item in value) if isinstance(value, list) else str(value)
-            lines.append(f"- {key}：{text}")
+            text = (
+                "、".join(str(item) for item in value)
+                if isinstance(value, list)
+                else str(value)
+            )
+            lines.append(f"- {_md_inline(key)}：{_md_inline(text)}")
     else:
         lines.append("- （暂无）")
 
@@ -1672,11 +1750,17 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     trips = data.get("trip_history") or []
     if trips:
         for trip in trips[-10:]:
-            route = f"{trip.get('origin') or '—'} → {trip.get('destination') or '—'}"
+            route = (
+                f"{_md_inline(trip.get('origin') or '—')} → "
+                f"{_md_inline(trip.get('destination') or '—')}"
+            )
             dates = " ~ ".join(
                 part for part in (trip.get("start_date"), trip.get("end_date")) if part
             ) or "日期未记录"
-            lines.append(f"- {route}（{dates}，{trip.get('purpose') or '出行'}）")
+            lines.append(
+                f"- {route}（{_md_inline(dates)}，"
+                f"{_md_inline(trip.get('purpose') or '出行')}）"
+            )
     else:
         lines.append("- （暂无）")
 
@@ -1705,7 +1789,8 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
         for session in sessions:
             suffix = "（已归档）" if session["session_id"] in archived_ids else ""
             lines.append(
-                f"- {session['title']}（{session['message_count']} 条消息）{suffix}"
+                f"- {_md_inline(session['title'])}"
+                f"（{session['message_count']} 条消息）{suffix}"
             )
     else:
         lines.append("- （暂无）")
@@ -1721,7 +1806,8 @@ def create_app(model: Any = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         yield
         state.close_all()
-        state.import_executor.shutdown(wait=False)
+        # 取消排队未执行的导入；正在执行的线程是 daemon，不阻塞进程退出
+        state.import_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
@@ -1741,8 +1827,14 @@ def create_app(model: Any = None) -> FastAPI:
         # 响应体积都被放大）——input 统一截断为 200 字符
         def _trim_item(item: dict[str, Any]) -> dict[str, Any]:
             trimmed = dict(item)
-            if "input" in trimmed and trimmed["input"] is not None:
-                text = repr(trimmed["input"])
+            raw = trimmed.get("input")
+            if raw is not None:
+                # 先按原始值截断再看 repr：对大请求体（64MB 备份）做完整
+                # repr 会在事件循环上把整份 input 物化成字符串
+                if isinstance(raw, str):
+                    text = raw
+                else:
+                    text = reprlib.repr(raw)
                 trimmed["input"] = text if len(text) <= 200 else text[:200] + "…"
             return trimmed
 
@@ -2716,6 +2808,16 @@ def create_app(model: Any = None) -> FastAPI:
                         "存储暂时不可用，请稍后再试"
                         f"（请求 ID：{_request_id(request)}）"
                     ),
+                ) from exc
+            except UserFacingError as exc:
+                # 该类异常的消息是给用户看的固定文案（流式路径同样原样返回），
+                # 不能吞成通用 500 丢失「重试」提示
+                logger.warning(
+                    "对话失败（%s）: %s", _request_id(request), exc
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{exc}（请求 ID：{_request_id(request)}）",
                 ) from exc
             except Exception as exc:  # noqa: BLE001 - 对外返回友好错误
                 logger.warning(
