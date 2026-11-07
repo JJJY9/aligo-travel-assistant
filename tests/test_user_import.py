@@ -161,6 +161,23 @@ def test_import_roundtrip_and_idempotent():
     print("✓ 恢复往返保真且重复导入幂等")
 
 
+def test_exporter_json_is_importable():
+    """user-export 实际写出的 JSON 必须能被 user-import 解析（防 schema 漂移）。"""
+    from utils.exporter import export_files
+
+    payload = _export_payload()
+    with tempfile.TemporaryDirectory(prefix="chailv_uimport_export_") as tmp:
+        paths = export_files(payload, tmp)
+        json_path = next(p for p in paths if str(p).endswith(".json"))
+        sections, errors = parse_user_export(json_path.read_text(encoding="utf-8"))
+    assert errors == [], errors
+    assert sections["preferences"] == {"home_location": "北京", "hotel_brands": ["汉庭", "如家"]}
+    assert len(sections["trips"]) == 2 and len(sections["messages"]) == 2
+    assert sections["titles"] == {"s1": "上海出差"}
+    assert sections["pinned"] == ["s1"]
+    print("✓ user-export 实际输出可直接被 user-import 解析")
+
+
 def test_import_duplicate_message_counts():
     """同一会话里重复的相同提问：按出现次数补齐，不多也不少。"""
     payload = {
@@ -256,6 +273,7 @@ if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
     test_parse_export_skips_invalid_rows()
+    test_exporter_json_is_importable()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (
