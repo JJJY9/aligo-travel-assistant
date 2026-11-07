@@ -151,7 +151,7 @@ def test_redis_truncate_replay_keeps_newer_messages():
 
 
 def test_pg_delete_last_turn_expect_and_archived_cleanup():
-    """PG delete_last_turn：expect 不匹配不删；删空会话清理归档标记。"""
+    """PG delete_last_turn：expect 不匹配不删；删空会话清理标题 / 置顶 / 归档。"""
     memory, _ = _pg_memory_or_skip()
     try:
         memory.add_chat_messages(
@@ -161,13 +161,18 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
             ]
         )
         assert memory.set_session_archived("s-lt", True)
+        assert memory.set_session_title("s-lt", "旧标题")
+        assert memory.set_session_pinned("s-lt", True)
         assert memory.delete_last_turn("s-lt", expect="不匹配") == 0
         assert len(memory.get_chat_history(session_id="s-lt")) == 2
         assert "s-lt" in memory.get_archived_sessions()
         assert memory.delete_last_turn("s-lt", expect="Q1") == 2
         assert memory.get_chat_history(session_id="s-lt") == []
         assert "s-lt" not in memory.get_archived_sessions()
-        print("✓ PG delete_last_turn expect 校验与归档清理")
+        # 删空会话必须同步清理标题 / 置顶，否则同 ID 重启的新会话沿用旧元数据
+        assert "s-lt" not in memory.get_session_titles()
+        assert "s-lt" not in memory.get_pinned_sessions()
+        print("✓ PG delete_last_turn expect 校验与标题 / 置顶 / 归档清理")
     finally:
         memory.close()
 

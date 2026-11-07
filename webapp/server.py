@@ -80,7 +80,7 @@ from utils.rate_limit import create_rate_limiter
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
 from utils.session_html import render_all_sessions_html
-from utils.session_markdown import render_all_sessions_markdown
+from utils.session_markdown import render_all_sessions_markdown, sanitize_title
 from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
 from utils.trip_conflicts import trip_state_label as _trip_state_label
@@ -145,6 +145,9 @@ def _is_loopback_host(host: str) -> bool:
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
+# 与静态路由冲突的会话 ID：GET /api/sessions/export 永远命中导出接口，
+# 这类会话无法查看 / 继续（聊天请求与备份恢复都必须拒绝）
+_RESERVED_SESSION_IDS = frozenset({"export"})
 # 偏好类型可由模型 / 面板自定义（可能含空格等），只限制长度与非空
 _PREF_TYPE_PATTERN = r"^[^/]{1,64}$"
 # 会话删除墓碑在 Redis 中的 key 前缀（配置 REDIS_URL 时跨实例共享）
@@ -434,8 +437,8 @@ class ChatRequest(BaseModel):
     @classmethod
     def _session_id_not_reserved(cls, value: str | None) -> str | None:
         # /api/sessions/export 是静态路由，名为 export 的会话永远打不开
-        if value == "export":
-            raise ValueError("session_id 不能使用保留字 export")
+        if value in _RESERVED_SESSION_IDS:
+            raise ValueError(f"session_id 不能使用保留字 {value}")
         return value
 
     @field_validator("message")
@@ -2606,6 +2609,9 @@ def create_app(model: Any = None) -> FastAPI:
                 if message.get("role") == "user":
                     title = " ".join(str(message.get("content", "")).split())[:40] or title
                     break
+        # 自定义标题允许含换行与尖括号：不折叠会伪造导出的段落结构，
+        # 不转义则 <script> 原样落盘（与合集导出、CLI 单会话导出同一口径）
+        title = sanitize_title(title)
 
         lines = [
             f"# {title}",
@@ -3452,31 +3458,41 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             else:
                 deleted_sessions = set()
+            # 保留字会话（如 export）在 Web 端永远打不开：备份恢复时与墓碑
+            # 同一处理，跳过其消息与元数据，避免导入一个无法查看的会话
+            reserved_sessions = {
+                session_id
+                for session_id in unique_sessions
+                if session_id in _RESERVED_SESSION_IDS
+            }
+            skipped_sessions = deleted_sessions | reserved_sessions
             for session_id in sorted(deleted_sessions):
                 errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
-            if deleted_sessions:
+            for session_id in sorted(reserved_sessions):
+                errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
+            if skipped_sessions:
                 sections["messages"] = [
                     message
                     for message in sections["messages"]
-                    if message["session_id"] not in deleted_sessions
+                    if message["session_id"] not in skipped_sessions
                 ]
                 sections["titles"] = {
                     session_id: title
                     for session_id, title in sections["titles"].items()
-                    if session_id not in deleted_sessions
+                    if session_id not in skipped_sessions
                 }
                 sections["pinned"] = [
                     session_id
                     for session_id in sections["pinned"]
-                    if session_id not in deleted_sessions
+                    if session_id not in skipped_sessions
                 ]
                 sections["archived"] = [
                     session_id
                     for session_id in sections["archived"]
-                    if session_id not in deleted_sessions
+                    if session_id not in skipped_sessions
                 ]
                 for trip in sections["trips"]:
-                    if trip.get("session_id") in deleted_sessions:
+                    if trip.get("session_id") in skipped_sessions:
                         trip["session_id"] = None
 
             def _run_import() -> dict[str, Any]:

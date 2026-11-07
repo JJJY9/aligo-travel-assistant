@@ -550,16 +550,23 @@ class PostgresLongTermMemory:
 
         removed = self._run_with_retry(_delete_rows)
         if removed:
-            # 会话消息已被删空时同步清理归档标记，避免幽灵归档
-            self._execute(
-                "DELETE FROM aligo_archived_sessions "
-                "WHERE user_id = %s AND session_id = %s "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM aligo_chat_messages "
-                "  WHERE user_id = %s AND session_id = %s"
-                ")",
-                (self.user_id, session_id, self.user_id, session_id),
-            )
+            # 会话消息已被删空时同步清理标题 / 置顶 / 归档标记：留下这些
+            # 元数据会让之后用同一 session_id 重新开始的新会话沿用旧标题与
+            # 置顶状态（JSON 后端的同一操作会全部清理）
+            for table in (
+                "aligo_session_titles",
+                "aligo_pinned_sessions",
+                "aligo_archived_sessions",
+            ):
+                self._execute(
+                    f"DELETE FROM {table} "
+                    "WHERE user_id = %s AND session_id = %s "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM aligo_chat_messages "
+                    "  WHERE user_id = %s AND session_id = %s"
+                    ")",
+                    (self.user_id, session_id, self.user_id, session_id),
+                )
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
