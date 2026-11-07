@@ -108,6 +108,34 @@ def test_preferences_list_output(monkeypatch):
     print("✓ preferences 列表（中文标签 / 列表拼接 / 布尔）")
 
 
+def test_preferences_hides_blank_and_null_items(monkeypatch):
+    """文本与 --json 口径同面板：null / 空白串 / 全空列表不列出，列表内空项剔除。"""
+    store = _FakeStore(
+        {
+            "hotel_brands": ["东航", None, "  "],
+            "home_location": "   ",
+            "airlines": [""],
+            "budget_level": 0,
+        }
+    )
+    code, out = _run_list(monkeypatch, store)
+    assert code == 0
+    assert "2 条偏好" in out, out
+    assert "东航" in out and "None" not in out
+    assert "home_location" not in out and "airlines" not in out
+    assert "0" in out, "0 是合法偏好值"
+
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_preferences_list_standalone("u-prefs", as_json=True)
+    payload = json.loads(buf.getvalue())
+    assert payload["count"] == 2
+    assert set(payload["preferences"]) == {"hotel_brands", "budget_level"}
+    assert payload["preferences"]["budget_level"] == 0
+    print("✓ preferences 隐藏空白 / null 项（文本与 JSON 同口径）")
+
+
 def test_preferences_list_empty(monkeypatch):
     code, out = _run_list(monkeypatch, _FakeStore({}))
     assert code == 0 and "还没有偏好记录" in out

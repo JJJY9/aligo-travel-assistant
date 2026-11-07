@@ -55,9 +55,10 @@ _agent_lock = threading.Lock()
 
 def reset_knowledge_agent() -> None:
     """丢弃缓存的 RAG Agent（测试或知识库重建后使用）。"""
-    global _agent
+    global _agent, _read_agent
     with _agent_lock:
         _agent = None
+        _read_agent = None
 
 
 def _get_agent() -> Any:
@@ -82,13 +83,19 @@ def _get_read_agent() -> Any:
     if _read_agent is not None:
         return _read_agent
     with _agent_lock:
-        if _read_agent is None:
-            from agents.rag_knowledge_agent import RAGKnowledgeAgent
+        if _read_agent is not None:
+            return _read_agent
+        from agents.rag_knowledge_agent import RAGKnowledgeAgent
 
-            _read_agent = RAGKnowledgeAgent(
-                collection_name=COLLECTION_NAME, create_if_missing=False
-            )
-    return _read_agent
+        agent = RAGKnowledgeAgent(
+            collection_name=COLLECTION_NAME, create_if_missing=False
+        )
+        # initialized=False（集合缺失 / 依赖未装）的实例不能缓存：用户随后
+        # 通过面板导入或初始化脚本补齐集合后，检索应自动恢复而不是永久
+        # 报「知识库缺少集合」直到进程重启（LazyAgentRegistry 同款守卫）
+        if getattr(agent, "initialized", True) is not False:
+            _read_agent = agent
+        return agent
 
 
 def _client() -> Any:
@@ -1092,8 +1099,10 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
             if group:
                 ids = sorted(set(_group_member_ids(client, group)) | {int(doc_id)})
         else:
-            _, group = _document_info(client, int(doc_id))
-            if group:
+            parts, group = _document_info(client, int(doc_id))
+            # 旧版多分片记录可能只有 parts>1 没有 group：单条删除同样会留下
+            # 「parts 声明大于实际成员」的残缺组，必须按整组语义处理
+            if group or parts > 1:
                 raise ValueError(
                     "该片段属于多分片知识内容，不能单条删除：请整组删除"
                     "（CLI 加 --group / 接口加 group=1）"

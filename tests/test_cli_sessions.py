@@ -262,6 +262,25 @@ def test_archive_missing_session(monkeypatch):
     print("✓ 不存在的会话返回 1")
 
 
+def test_sessions_updated_at_uses_max_timestamp(monkeypatch):
+    """updated_at 取转录最大时间戳：恢复备份把旧消息追加到末尾后不回拨。"""
+    store = _FakeStore(
+        [
+            _message("user", "新问题", "s-max", "2026-11-04T12:00:00"),
+            _message("assistant", "回答", "s-max", "2026-11-04T12:01:00"),
+            _message("user", "旧消息追加", "s-max", "2026-11-03T08:00:00"),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    code, out = _run_list("u1", as_json=True)
+    payload = json.loads(out)
+    entry = next(
+        item for item in payload["sessions"] if item["session_id"] == "s-max"
+    )
+    assert entry["updated_at"] == "2026-11-04T12:01:00"
+    print("✓ sessions updated_at 取最大时间戳")
+
+
 def test_archive_json_output(monkeypatch):
     import json as _json
 

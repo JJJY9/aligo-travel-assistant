@@ -248,6 +248,19 @@ def test_import_accepts_z_suffix_timestamps():
     print("✓ 导入接受 Z 后缀时间戳并按真实时刻排序")
 
 
+def test_runner_skip_knowledge_only_backup_fails(monkeypatch):
+    """只含 knowledge 段的备份在 --skip-knowledge 后没有可恢复数据：退出 1。"""
+    payload = {"knowledge": [{"content": "面板片段"}]}
+    path = _write_json(payload)
+    store = _real_store("u-skip-kb")
+    code, out = _run_import(
+        monkeypatch, "u-skip-kb", path, store, skip_knowledge=True
+    )
+    assert code == 1
+    assert "没有可恢复的数据" in out and "只含知识片段" in out
+    print("✓ --skip-knowledge 只含知识段的备份不再误报成功")
+
+
 def test_preview_does_not_write_and_matches_import():
     from utils.user_import import preview_user_import
 

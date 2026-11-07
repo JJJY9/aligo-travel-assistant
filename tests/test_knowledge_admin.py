@@ -1450,6 +1450,50 @@ def test_import_rejects_incomplete_group(monkeypatch):
     print("✓ 不完整的分片组导入报错")
 
 
+def test_read_agent_not_cached_when_uninitialized(monkeypatch):
+    """initialized=False 的只读 Agent 不缓存：集合补齐后检索自动恢复。"""
+    import agents.rag_knowledge_agent as rag_module
+
+    calls = []
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.initialized = len(calls) > 1
+
+    monkeypatch.setattr(rag_module, "RAGKnowledgeAgent", _Agent)
+    monkeypatch.setattr(knowledge_admin, "_read_agent", None)
+    first = knowledge_admin._get_read_agent()
+    assert first.initialized is False
+    second = knowledge_admin._get_read_agent()
+    assert second.initialized is True and len(calls) == 2, "未初始化实例不能缓存"
+    knowledge_admin.reset_knowledge_agent()
+    assert knowledge_admin._read_agent is None
+    print("✓ 只读 Agent 未初始化时不缓存、reset 同时清理")
+
+
+def test_delete_document_old_parts_without_group_rejected(monkeypatch):
+    """旧版 parts>1 且无 group 的多分片记录同样拒绝单条删除。"""
+    rows = [
+        {
+            "id": 1,
+            "content": "第一片",
+            "metadata": json.dumps({"part": "1", "parts": "2"}),
+        },
+        {
+            "id": 2,
+            "content": "第二片",
+            "metadata": json.dumps({"part": "2", "parts": "2"}),
+        },
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    with pytest.raises(ValueError, match="多分片"):
+        knowledge_admin.delete_document(1)
+    assert fake.deleted == [], "拒绝删除时不能动库"
+    print("✓ 旧版无 group 的多分片记录拒绝单条删除")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
