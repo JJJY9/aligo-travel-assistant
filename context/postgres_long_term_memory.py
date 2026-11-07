@@ -508,6 +508,49 @@ class PostgresLongTermMemory:
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
+    def save_trip_histories(self, trips: list[dict[str, Any]]) -> tuple[int, int]:
+        """批量保存行程（备份恢复）：返回 ``(新增数, 更新数)``。
+
+        PostgreSQL 单条保存已是一次小事务；批量入口复用单条实现以保持
+        去重 / 计数语义与 JSON 后端一致。
+        """
+        created = 0
+        updated = 0
+        before_total = int(self.get_statistics().get("total_trips") or 0)
+        for row in trips:
+            self.save_trip_history(row)
+        after_total = int(self.get_statistics().get("total_trips") or 0)
+        created = max(0, after_total - before_total)
+        updated = len(trips) - created
+        return created, updated
+
+    def set_session_titles(self, titles: dict[str, str]) -> int:
+        """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""
+        applied = 0
+        for session_id, title in titles.items():
+            cleaned = str(title).strip()
+            if cleaned and self.set_session_title(session_id, cleaned):
+                applied += 1
+        return applied
+
+    def set_sessions_pinned(self, session_ids: list[str], pinned: bool = True) -> int:
+        """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。"""
+        applied = 0
+        for session_id in session_ids:
+            if session_id and self.set_session_pinned(session_id, pinned):
+                applied += 1
+        return applied
+
+    def set_sessions_archived(
+        self, session_ids: list[str], archived: bool = True
+    ) -> int:
+        """批量归档 / 恢复（备份恢复）：返回实际生效数。"""
+        applied = 0
+        for session_id in session_ids:
+            if session_id and self.set_session_archived(session_id, archived):
+                applied += 1
+        return applied
+
     def _session_exists(self, session_id: str) -> bool:
         row = self._fetchone(
             "SELECT 1 FROM aligo_chat_messages "

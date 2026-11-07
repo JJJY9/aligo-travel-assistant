@@ -762,12 +762,58 @@ class LongTermMemory:
         return list(self.data.get("archived_sessions") or [])
 
     @_locked_mutation
-    def save_trip_history(self, trip_info: dict[str, Any]) -> str:
-        """保存行程历史，返回 trip_id。
+    def set_session_titles(self, titles: dict[str, str]) -> int:
+        """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""
+        applied = 0
+        stored = self.data.setdefault("session_titles", {})
+        for session_id, title in titles.items():
+            cleaned = str(title).strip()
+            if not cleaned or not self._session_exists(session_id):
+                continue
+            stored[session_id] = cleaned[:60]
+            applied += 1
+        if applied:
+            self._persist()
+        return applied
 
-        同路线 + 同起止日期的行程视为重复记录（多次对话规划同一趟行程），
-        更新既有记录而不是追加，避免行程 / 统计 / 日历重复。
-        """
+    @_locked_mutation
+    def set_sessions_pinned(self, session_ids: list[str], pinned: bool = True) -> int:
+        """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。"""
+        applied = 0
+        pinned_sessions = self.data.setdefault("pinned_sessions", [])
+        for session_id in session_ids:
+            if not session_id or not self._session_exists(session_id):
+                continue
+            if pinned and session_id not in pinned_sessions:
+                pinned_sessions.append(session_id)
+            elif not pinned and session_id in pinned_sessions:
+                pinned_sessions.remove(session_id)
+            applied += 1
+        if applied:
+            self._persist()
+        return applied
+
+    @_locked_mutation
+    def set_sessions_archived(
+        self, session_ids: list[str], archived: bool = True
+    ) -> int:
+        """批量归档 / 恢复（备份恢复）：返回实际生效数。"""
+        applied = 0
+        archived_sessions = self.data.setdefault("archived_sessions", [])
+        for session_id in session_ids:
+            if not session_id or not self._session_exists(session_id):
+                continue
+            if archived and session_id not in archived_sessions:
+                archived_sessions.append(session_id)
+            elif not archived and session_id in archived_sessions:
+                archived_sessions.remove(session_id)
+            applied += 1
+        if applied:
+            self._persist()
+        return applied
+
+    def _apply_trip_locked(self, trip_info: dict[str, Any]) -> tuple[str, bool]:
+        """在写锁内保存一条行程，返回 ``(trip_id, 是否新建)``（不落盘）。"""
         existing = self._find_same_trip(trip_info)
         if existing is not None:
             for key in ("purpose", "session_id"):
@@ -775,9 +821,7 @@ class LongTermMemory:
                 if value is not None:
                     existing[key] = value
             existing["timestamp"] = datetime.now().isoformat()
-            self._persist()
-            logger.info(f"Updated existing trip history: {existing.get('trip_id')}")
-            return str(existing.get("trip_id") or "")
+            return str(existing.get("trip_id") or ""), False
 
         trip_record = {
             "trip_id": self._next_trip_id(),
@@ -795,10 +839,42 @@ class LongTermMemory:
         if destination:
             freq = self.data["statistics"]["frequent_destinations"]
             freq[destination] = freq.get(destination, 0) + 1
+        return str(trip_record["trip_id"]), True
 
+    @_locked_mutation
+    def save_trip_history(self, trip_info: dict[str, Any]) -> str:
+        """保存行程历史，返回 trip_id。
+
+        同路线 + 同起止日期的行程视为重复记录（多次对话规划同一趟行程），
+        更新既有记录而不是追加，避免行程 / 统计 / 日历重复。
+        """
+        trip_id, created = self._apply_trip_locked(trip_info)
         self._persist()
-        logger.info(f"Saved trip history: {trip_record['trip_id']}")
-        return str(trip_record["trip_id"])
+        if created:
+            logger.info(f"Saved trip history: {trip_id}")
+        else:
+            logger.info(f"Updated existing trip history: {trip_id}")
+        return trip_id
+
+    @_locked_mutation
+    def save_trip_histories(self, trips: list[dict[str, Any]]) -> tuple[int, int]:
+        """批量保存行程（备份恢复）：一次重载 + 一次原子写回。
+
+        逐条 ``save_trip_history`` 每次都要整文件重载 / 重写（O(n²)），
+        几千条行程会把恢复拖成分钟级。返回 ``(新增数, 更新数)``。
+        """
+        created = 0
+        updated = 0
+        for row in trips:
+            _, is_new = self._apply_trip_locked(row)
+            if is_new:
+                created += 1
+            else:
+                updated += 1
+        if created or updated:
+            self._persist()
+        logger.info("Bulk saved %d trips (%d new)", created + updated, created)
+        return created, updated
 
     def _find_same_trip(self, trip_info: dict[str, Any]) -> dict[str, Any] | None:
         """查找同路线、同起止日期的既有行程（无出发日期时不参与去重）。"""
