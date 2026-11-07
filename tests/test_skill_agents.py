@@ -57,6 +57,13 @@ def test_weather_city_extraction():
         "深圳和广州天气": "深圳",
         "杭州明天天气怎么样": "杭州",
         "纽约天气": "纽约",
+        "从北京去纽约，天气怎么样": "纽约",
+        "从上海到伦敦，明天天气如何": "伦敦",
+        "我下周一从深圳飞新加坡，天气如何": "新加坡",
+        "去东京的天气怎么样": "东京",
+        "东京明天会下雨吗": "东京",
+        "后天去大阪出差，天气如何": "大阪",
+        "从北京去纽约那边天气怎么样": "纽约",
     }
     for query, expected in cases.items():
         assert agent._extract_city_from_query(query) == expected, query
@@ -283,7 +290,72 @@ def test_suspicious_url_uses_registrable_domain():
     assert module._is_suspicious_url("https://documentation.example.com/page") is False
     assert module._is_suspicious_url("https://www.randomdomain123.com/a") is True
     assert module._is_suspicious_url("https://randomdomain123.com/a") is True
+    # 真实品牌名是普通英文单词（含元音、无数字），不能当随机域名误杀
+    assert module._is_suspicious_url("https://www.skyscanner.net/x") is False
+    assert module._is_suspicious_url("https://www.tripadvisor.com/x") is False
+    assert module._is_suspicious_url("https://www.hotelscombined.com/x") is False
+    # 纯字母且无元音的长串仍视为随机域名
+    assert module._is_suspicious_url("https://xqzwmfpklt.com/a") is True
     print("✓ 可疑域名按主域名主体判断")
+
+
+def test_skill_agents_tolerate_non_object_payloads():
+    """顶层非对象 / content block 列表 / reply(None)：技能智能体不再崩溃或静默丢弃。"""
+    class _JsonModel:
+        def __init__(self, payload):
+            self.payload = payload
+            self.prompts = []
+
+        async def __call__(self, messages, **kwargs):
+            self.prompts.append(str(messages))
+            return self.payload
+
+    class _Memory:
+        def __init__(self):
+            class _LongTerm:
+                def get_trip_history(self, limit=None):
+                    return []
+
+                def get_preference(self):
+                    return {}
+
+            self.long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    memory_query = _load_skill("memory-query", "MemoryQueryAgent")
+    for content in ("[1,2]", "null", "42", '{"context": null}', '{"context": "x"}'):
+        agent = memory_query(model=_JsonModel("暂无相关记忆"), memory_manager=_Memory())
+        agent = memory_query(model=_JsonModel("暂无相关记忆"), memory_manager=_Memory())
+        agent.skill_loader = type(
+            "L", (), {"get_skill_content": staticmethod(lambda _n: "")}
+        )()
+        asyncio.run(agent.reply(Msg(name="user", content=content, role="user")))
+
+    plan_trip = _load_skill("plan-trip", "ItineraryPlanningAgent")
+    model = _JsonModel('{"itinerary": {"title": "行程"}, "planning_complete": true}')
+    agent = plan_trip(model=model)
+    agent.skill_loader = type(
+        "L", (), {"get_skill_content": staticmethod(lambda _n: "")}
+    )()
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="user",
+                content=[{"type": "text", "text": "帮我规划从北京去杭州的行程"}],
+                role="user",
+            )
+        )
+    )
+    assert "北京" in model.prompts[-1] and "杭州" in model.prompts[-1], (
+        "content block 列表必须进入规划提示词"
+    )
+
+    event_collection = _load_skill("event-collection", "EventCollectionAgent")
+    reply = asyncio.run(event_collection(model=None).reply(None))
+    assert isinstance(reply.content, str) and json.loads(reply.content) == {}
+    print("✓ 技能智能体容忍非对象 payload / content block / None 输入")
 
 
 def test_weather_city_prefers_destination_side():
@@ -721,6 +793,7 @@ if __name__ == "__main__":
         test_memory_query_reads_memory_off_event_loop()
         test_preference_reads_memory_off_event_loop()
         test_suspicious_url_uses_registrable_domain()
+        test_skill_agents_tolerate_non_object_payloads()
         test_weather_city_prefers_destination_side()
         test_plan_trip_null_rewritten_query_falls_back()
         test_plan_trip_rejects_non_object_result()

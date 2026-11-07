@@ -42,7 +42,9 @@ class EventCollectionAgent(AgentBase):
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
-            return Msg(name=self.name, content={}, role="assistant")
+            # Msg.content 必须是 str 或 content block 列表（agentscope 断言）；
+            # 传 {} 会让 reply(None) 直接 AssertionError
+            return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
         content = x.content if not isinstance(x, list) else x[-1].content
