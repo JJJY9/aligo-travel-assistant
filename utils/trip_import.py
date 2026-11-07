@@ -25,6 +25,17 @@ def _normalize_header(cell: str) -> str:
     return str(cell or "").strip().lstrip("﻿")
 
 
+def trip_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    """存储层「同路线 + 同起止日期」去重键（返程为空视为与出发同日）。"""
+    start = str(row.get("start_date") or "")
+    return (
+        str(row.get("destination") or ""),
+        str(row.get("origin") or ""),
+        start,
+        str(row.get("end_date") or start),
+    )
+
+
 def _strict_date(value: str) -> "datetime | None":
     """严格 YYYY-MM-DD：不补零写法（2026-1-1）视为非法，避免绕过去重。"""
     try:

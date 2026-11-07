@@ -4141,10 +4141,16 @@ def _parse_trips_list_args(
 
 
 def run_trips_import_standalone(
-    user_id: str, csv_path: str, as_json: bool = False, as_ics: bool = False
+    user_id: str,
+    csv_path: str,
+    as_json: bool = False,
+    as_ics: bool = False,
+    dry_run: bool = False,
 ) -> int:
     """从 CSV / iCalendar 导入行程
-    （`python cli.py trips-import <user_id> <path> [--ics] [--json]`）。
+    （`python cli.py trips-import <user_id> <path> [--ics] [--dry-run] [--json]`）。
+
+    ``dry_run=True`` 只预览将新增 / 更新 / 跳过的数量，不写库。
 
     解析 ``trips-export`` 导出的 CSV（UTF-8 BOM，中英文字段名均可）或
     ``trips-export --ics`` 导出的事件（``--ics`` 或内容以 BEGIN:VCALENDAR
@@ -4157,7 +4163,11 @@ def run_trips_import_standalone(
     import io
     import re
 
-    from utils.trip_import import parse_trips_csv, parse_trips_ics
+    from utils.trip_import import (
+        parse_trips_csv,
+        parse_trips_ics,
+        trip_identity,
+    )
 
     def _fail(message: str) -> int:
         if as_json:
@@ -4205,26 +4215,33 @@ def run_trips_import_standalone(
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"打开长期记忆失败：{exc}")
     try:
-        try:
-            before = len(store.get_trip_history(limit=None))
-        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"读取行程失败：{exc}")
-        try:
+        if dry_run:
+            # 预览：按存储层同一去重键模拟新增 / 更新，不写库
+            try:
+                pending_keys = {
+                    trip_identity(trip)
+                    for trip in store.get_trip_history(limit=None)
+                }
+            except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+                return _fail(f"读取行程失败：{exc}")
+            created = 0
+            updated = 0
             for row in rows:
-                store.save_trip_history(row)
-        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"写入行程失败：{exc}")
-        try:
-            after = len(store.get_trip_history(limit=None))
-        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"读取行程失败：{exc}")
+                key = trip_identity(row)
+                if key in pending_keys:
+                    updated += 1
+                else:
+                    created += 1
+                    pending_keys.add(key)
+        else:
+            try:
+                created, updated = store.save_trip_histories(rows)
+            except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+                return _fail(f"写入行程失败：{exc}")
     finally:
         close = getattr(store, "close", None)
         if callable(close):
             close()
-
-    created = max(0, after - before)
-    updated = len(rows) - created
     if as_json:
         print(
             json.dumps(
@@ -4233,6 +4250,7 @@ def run_trips_import_standalone(
                     "user_id": user_id,
                     "path": csv_path,
                     "format": "ics" if is_ics else "csv",
+                    "dry_run": dry_run,
                     "rows": len(rows),
                     "created": created,
                     "updated": updated,
@@ -4248,10 +4266,12 @@ def run_trips_import_standalone(
     else:
         unit = "个事件" if is_ics else "行"
         skipped_note = f"，跳过 {len(errors)} 项" if errors else ""
-        print(
-            f"已从 {csv_path} 导入 {len(rows)} {unit}：新增 {created} 条，"
-            f"更新 {updated} 条{skipped_note}"
+        head = (
+            f"预览（未写入）：将从 {csv_path} 导入 {len(rows)} {unit}"
+            if dry_run
+            else f"已从 {csv_path} 导入 {len(rows)} {unit}"
         )
+        print(f"{head}：新增 {created} 条，更新 {updated} 条{skipped_note}")
         for line, reason in errors:
             label = f"事件{line}" if is_ics else f"第{line}行"
             print(f"  跳过{label}：{reason}")
@@ -5399,10 +5419,13 @@ def main():
             )
         if arg == "trips-import":
             import_args = [
-                a for a in sys.argv[2:] if a not in {"--json", "--ics"}
+                a
+                for a in sys.argv[2:]
+                if a not in {"--json", "--ics", "--dry-run"}
             ]
             want_json = "--json" in sys.argv[2:]
             want_ics = "--ics" in sys.argv[2:]
+            want_dry_run = "--dry-run" in sys.argv[2:]
             if (
                 len(import_args) != 2
                 or not _valid_user_id(import_args[0])
@@ -5410,7 +5433,7 @@ def main():
             ):
                 print(
                     "用法：python cli.py trips-import <user_id> <csv_path> "
-                    "[--ics] [--json]"
+                    "[--ics] [--dry-run] [--json]"
                 )
                 sys.exit(2)
             sys.exit(
@@ -5419,6 +5442,7 @@ def main():
                     import_args[1],
                     as_json=want_json,
                     as_ics=want_ics,
+                    dry_run=want_dry_run,
                 )
             )
         if arg in {"help", "--help", "-h"}:
