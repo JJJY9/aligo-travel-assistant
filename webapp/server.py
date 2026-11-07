@@ -848,6 +848,31 @@ class AligoWebApp:
     def _session_key(user_id: str, session_id: str) -> str:
         return f"{user_id}\n{session_id}"
 
+    def _evict_over_limit_locked(
+        self, keep_key: str, evicted: list["_WebSession"]
+    ) -> None:
+        """缓存超限时淘汰空闲旧会话（调用方必须持有 _sessions_lock）。
+
+        三条取会话路径（缓存命中 / 并发竞态命中 / 新建插入）都要调用：
+        只在新建分支淘汰时，并发首请求或命中路径会把缓存推过上限后永不回收。
+        """
+        while len(self.sessions) > self.max_sessions:
+            victim = next(
+                (
+                    candidate_key
+                    for candidate_key, item in self.sessions.items()
+                    if candidate_key != keep_key
+                    and (
+                        not item.in_use()
+                        or item.long_in_use(self.session_turn_leak_sec)
+                    )
+                ),
+                None,
+            )
+            if victim is None:
+                break
+            evicted.append(self.sessions.pop(victim))
+
     def get_session(
         self, user_id: str, session_id: str | None, mark_in_use: bool = False
     ) -> _WebSession:
@@ -875,6 +900,7 @@ class AligoWebApp:
                 self.sessions.move_to_end(key)
                 if mark_in_use:
                     session.begin_turn()
+                self._evict_over_limit_locked(key, evicted)
         if session is None:
             # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
             self._session_build_slots.acquire()
@@ -890,22 +916,7 @@ class AligoWebApp:
                         self.sessions.move_to_end(key)
                         # 命中路径同样要执行容量回收：只在新建分支淘汰时，
                         # sessions 会先被并发首请求推过上限再永远超限
-                        while len(self.sessions) > self.max_sessions:
-                            victim = next(
-                                (
-                                    candidate_key
-                                    for candidate_key, item in self.sessions.items()
-                                    if candidate_key != key
-                                    and (
-                                        not item.in_use()
-                                        or item.long_in_use(self.session_turn_leak_sec)
-                                    )
-                                ),
-                                None,
-                            )
-                            if victim is None:
-                                break
-                            evicted.append(self.sessions.pop(victim))
+                        self._evict_over_limit_locked(key, evicted)
                         if mark_in_use:
                             session.begin_turn()
                     else:
@@ -915,22 +926,7 @@ class AligoWebApp:
                         # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
                         # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
                         # 等后续请求再回收
-                        while len(self.sessions) > self.max_sessions:
-                            victim = next(
-                                (
-                                    candidate_key
-                                    for candidate_key, item in self.sessions.items()
-                                    if candidate_key != key
-                                    and (
-                                        not item.in_use()
-                                        or item.long_in_use(self.session_turn_leak_sec)
-                                    )
-                                ),
-                                None,
-                            )
-                            if victim is None:
-                                break
-                            evicted.append(self.sessions.pop(victim))
+                        self._evict_over_limit_locked(key, evicted)
                         if mark_in_use:
                             session.begin_turn()
                 if session is not candidate:
