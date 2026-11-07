@@ -376,6 +376,136 @@ def test_ics_external_summary_fallback():
     print("✓ ICS 外部事件 SUMMARY 回退")
 
 
+def test_ics_empty_origin_roundtrip():
+    """空出发地按原值写入 DESCRIPTION：往返后不能变成「出发地」占位行程。"""
+    trips = [
+        {
+            "trip_id": "t1",
+            "origin": "",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-01",
+            "purpose": "出差",
+        }
+    ]
+    text = render_trips_ics(trips, "u1")
+    assert "Aligo 行程： → 上海" in text, "DESCRIPTION 保留空出发地"
+    assert "出发地 → 上海" in text, "SUMMARY 仍是给人看的占位文案"
+    rows, errors = parse_trips_ics(text)
+    assert errors == []
+    assert rows[0]["origin"] == "", rows[0]
+    assert rows[0]["destination"] == "上海"
+    print("✓ ICS 空出发地往返保真（不产生「出发地」占位）")
+
+
+def test_ics_datetime_offset_converts_local_date():
+    """Z / ±HHMM 的 DATE-TIME 先换算本机时区再取日期，不能直接截前 8 位。"""
+    from datetime import datetime, timedelta, timezone
+
+    text = (
+        "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+        "DTSTART:20261110T233000-0500\n"
+        "DTEND:20261111T013000-0500\n"
+        "SUMMARY:越洋航班\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert errors == []
+    start_local = datetime(2026, 11, 10, 23, 30, tzinfo=timezone(-timedelta(hours=5)))
+    start_local = start_local.astimezone()
+    end_local = datetime(2026, 11, 11, 1, 30, tzinfo=timezone(-timedelta(hours=5)))
+    end_local = end_local.astimezone()
+    assert rows[0]["start_date"] == start_local.strftime("%Y-%m-%d"), rows[0]
+    expected_end = end_local.date()
+    if expected_end < start_local.date():
+        expected_end = start_local.date()
+    assert rows[0]["end_date"] == expected_end.strftime("%Y-%m-%d"), rows[0]
+
+    zulu = (
+        "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+        "DTSTART:20261110T233000Z\n"
+        "SUMMARY:UTC 事件\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(zulu)
+    assert errors == []
+    expected = datetime(2026, 11, 10, 23, 30, tzinfo=timezone.utc).astimezone()
+    assert rows[0]["start_date"] == expected.strftime("%Y-%m-%d")
+    print("✓ ICS 带时区 DATE-TIME 按本机日期导入")
+
+
+def test_ics_timed_end_inclusive_except_midnight():
+    """DATE-TIME 的 DTEND 是含尾时刻：只有恰好 00:00 才按排他日期减一天。"""
+    def event(start: str, end: str) -> str:
+        return (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\n"
+            f"DTSTART:{start}\nDTEND:{end}\n"
+            "SUMMARY:客户会议\n"
+            "END:VEVENT\nEND:VCALENDAR\n"
+        )
+
+    rows, _ = parse_trips_ics(event("20261110T090000", "20261112T180000"))
+    assert rows[0]["end_date"] == "2026-11-12", "跨日定时事件不能被减一天"
+
+    rows, _ = parse_trips_ics(event("20261110T230000", "20261111T060000"))
+    assert rows[0]["end_date"] == "2026-11-11", "红眼航班按落地日结束"
+
+    rows, _ = parse_trips_ics(event("20261110T090000", "20261110T180000"))
+    assert rows[0]["end_date"] == "2026-11-10", "同日定时事件当天结束"
+
+    rows, _ = parse_trips_ics(event("20261110T090000", "20261111T000000"))
+    assert rows[0]["end_date"] == "2026-11-10", "恰为 00:00 仍按排他日期处理"
+    print("✓ ICS DATE-TIME 结束时刻含尾，仅 00:00 排他")
+
+
+def test_csv_formula_guard_roundtrip():
+    """公式注入防护前导引号在导入端还原，含已有引号的值也可逆。"""
+    from utils.trip_export import render_trips_csv
+
+    trips = [
+        {
+            "origin": "-北京",
+            "destination": "@上海",
+            "start_date": "2026-12-01",
+            "end_date": "",
+            "purpose": "=1+1",
+        },
+        {
+            "origin": "'@已有引号",
+            "destination": "+86 广州",
+            "start_date": "2026-12-02",
+            "end_date": "",
+            "purpose": "\t制表符开头",
+        },
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-03",
+            "end_date": "",
+            "purpose": "普通行程",
+        },
+    ]
+    rows, errors = parse_trips_csv(render_trips_csv(trips))
+    assert errors == []
+    for original, restored in zip(trips, rows):
+        for field in ("origin", "destination", "start_date", "end_date", "purpose"):
+            assert restored[field] == original[field], (field, restored, original)
+    print("✓ CSV 公式防护前缀往返还原（含已有引号）")
+
+
+def test_csv_error_line_numbers_physical():
+    """引号包裹的多行字段之后，报错行号必须是物理行号。"""
+    text = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        '北京,上海,2026-12-01,,"第一行\n第二行"\n'
+        "北京,广州,2026-13-01,,\n"
+    )
+    rows, errors = parse_trips_csv(text)
+    assert len(rows) == 1
+    assert errors == [(4, "出发日期格式应为 YYYY-MM-DD：2026-13-01")], errors
+    print("✓ CSV 报错行号为物理行号")
+
+
 def test_runner_imports_ics_and_dedupes(monkeypatch):
     store = _ImportStore()
     monkeypatch.setattr(
@@ -460,6 +590,11 @@ if __name__ == "__main__":
     test_ics_unfold_and_lf_only()
     test_ics_collects_invalid_events()
     test_ics_external_summary_fallback()
+    test_ics_empty_origin_roundtrip()
+    test_ics_datetime_offset_converts_local_date()
+    test_ics_timed_end_inclusive_except_midnight()
+    test_csv_formula_guard_roundtrip()
+    test_csv_error_line_numbers_physical()
     for case in (
         test_runner_imports_and_dedupes,
         test_runner_dry_run_preview,
