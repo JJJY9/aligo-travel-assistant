@@ -518,7 +518,7 @@ python cli.py
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部、`--query <关键词>` 按标题与消息内容过滤并附命中片段、`--json` 输出机器可读列表；`python cli.py session-archive <user_id> <session_id> [--restore] [--json]` 归档 / 恢复会话（`--json` 输出结构化结果）；`python cli.py session-delete <user_id> <session_id> [--json]` 删除会话的全部消息并同步清理短期记忆（Redis 会话键），不可恢复；`python cli.py session-title <user_id> <session_id> <标题|--reset> [--json]` 设置 / 重置会话标题（上限 60 字，`--reset` 恢复自动标题）；`python cli.py session-pin <user_id> <session_id> [--off] [--json]` 置顶 / 取消置顶会话；`python cli.py session-show <user_id> <session_id> [--json]` 查看单个会话（标题 / 置顶 / 归档状态与按时间排序的消息，助手消息重新渲染，`--json` 输出原始消息）；`python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force] [--html]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`）或独立 HTML（`--html`，单文件内嵌样式，默认 `.html` 后缀，所有内容转义）；助手消息按编排结果重新渲染。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
 
-全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir]` 把偏好、历史行程、会话标题 / 置顶 / 归档、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令字段一致）。备份恢复（`--dry-run` 只预览将新增 / 更新 / 跳过的数量、不写库）：`python cli.py user-import <user_id> <json_path> [--dry-run] [--json]` 从 `user-export` 的 JSON 恢复偏好、行程、聊天消息与会话标题 / 置顶 / 归档（单份备份上限 50 MB；时间戳归一为带时区 ISO 后保真写入，naive 时间按本机时区解释；消息按时间升序批量写入（恢复到已存在的会话时旧消息追加在当前转录末尾）；重复导入幂等——行程按路线+日期去重、消息按「会话/角色/内容」多重集去重；无法识别的日期原样保留，非法条目逐条跳过并在 `--json` 的 `skipped` 中列出；恢复按条目写入、非原子，失败后重复执行可补齐剩余部分；统计字段由存储层累计，不直接覆盖）。
+全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir] [--with-knowledge]` 把偏好、历史行程、会话标题 / 置顶 / 归档、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令字段一致）；`--with-knowledge` 把全局知识库片段一并写入 JSON（一体化备份，导出知识库失败时中止）。备份恢复（`--dry-run` 只预览将新增 / 更新 / 跳过的数量、不写库）：`python cli.py user-import <user_id> <json_path> [--dry-run] [--skip-knowledge] [--json]` 从 `user-export` 的 JSON 恢复偏好、行程、聊天消息与会话标题 / 置顶 / 归档，备份含 `knowledge` 段时一并恢复全局知识库片段（`--skip-knowledge` 可跳过；知识库未初始化时用户数据仍恢复、退出码 1 并提示重跑）。（单份备份上限 50 MB；时间戳归一为带时区 ISO 后保真写入，naive 时间按本机时区解释；消息按时间升序批量写入（恢复到已存在的会话时旧消息追加在当前转录末尾）；重复导入幂等——行程按路线+日期去重、消息按「会话/角色/内容」多重集去重；无法识别的日期原样保留，非法条目逐条跳过并在 `--json` 的 `skipped` 中列出；恢复按条目写入、非原子，失败后重复执行可补齐剩余部分；统计字段由存储层累计，不直接覆盖）。
 
 用户数据概览（不进入交互）：`python cli.py stats <user_id> [--json]` 汇总偏好条数、行程统计（总行程 / 出行天数 / 到访城市 / 进行中 / 即将出行）与会话 / 消息 / 归档数量，与 Web 记忆面板同口径。
 
@@ -575,7 +575,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
   ![即将出行：出发日天气](docs/screenshots/webui-trip-weather.jpg)
 - **对话深链接**：地址栏同步 `user` / `session` 参数（例如 `/?user=alice&session=abc123`），打开链接即可恢复会话；顶栏提供「复制链接」，无效链接会自动清理参数并回到新对话
 - **主题与布局**：浅色 / 深色主题跟随系统并可切换；窄屏下侧栏变为抽屉
-- **记忆与用量面板**：在线编辑 / 删除偏好、手动添加常用偏好（常住地 / 交通 / 酒店 / 航司 / 座位 / 餐食 / 预算，多个值用「、」分隔）、查看最近 5 条行程（超过 5 条可「查看全部」展开最近 200 条，展开后可输入关键词按路线 / 日期 / 目的筛选；带「进行中 / 即将出行 / 已结束」状态标签，与其它行程日期重叠时显示「重叠」徽标，新记录可点击回到对应对话、可导出 .ics 日历（含前一天提醒）或 CSV 报销台账）与常去目的地、统计、存储后端、技能数量（用户卡片显示，安装后技能缺失可看到「技能 0」）、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体）与近 7 天 tokens 趋势图、运行指标（请求总数 / 平均与最大耗时 / P95 耗时 / 熔断器状态 / 运行时长与缓存会话 / 限流后端，来自 `/api/metrics`），修改用户 ID，导出长期记忆 JSON / Markdown、一键导出全部会话 Markdown、从 `user-export` 的 JSON 备份恢复偏好 / 行程 / 聊天记录（单份备份上限 50 MB，重复恢复幂等，最近被删除的会话会被跳过）；补录 / 编辑行程时若与已有行程日期重叠会提示
+- **记忆与用量面板**：在线编辑 / 删除偏好、手动添加常用偏好（常住地 / 交通 / 酒店 / 航司 / 座位 / 餐食 / 预算，多个值用「、」分隔）、查看最近 5 条行程（超过 5 条可「查看全部」展开最近 200 条，展开后可输入关键词按路线 / 日期 / 目的筛选；带「进行中 / 即将出行 / 已结束」状态标签，与其它行程日期重叠时显示「重叠」徽标，新记录可点击回到对应对话、可导出 .ics 日历（含前一天提醒）或 CSV 报销台账）与常去目的地、统计、存储后端、技能数量（用户卡片显示，安装后技能缺失可看到「技能 0」）、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体）与近 7 天 tokens 趋势图、运行指标（请求总数 / 平均与最大耗时 / P95 耗时 / 熔断器状态 / 运行时长与缓存会话 / 限流后端，来自 `/api/metrics`），修改用户 ID，导出长期记忆 JSON / Markdown、一键导出全部会话 Markdown、从 `user-export` 的 JSON 备份恢复偏好 / 行程 / 聊天记录与知识片段（知识片段进入共享知识库；单份备份上限 50 MB，重复恢复幂等，最近被删除的会话会被跳过）；补录 / 编辑行程时若与已有行程日期重叠会提示
 - **消息操作**：复制、重新生成；最后一条提问可就地编辑并重新发送（`Ctrl/⌘ + Enter` 保存、`Esc` 取消）；Markdown 支持标题、列表、引用、表格与代码块（带复制按钮）；会话可导出为 Markdown
 - **跟进建议**：回答完成后根据本轮执行的智能体推荐 2–3 个下一步（如导出行程、查出发当天天气、调整行程），点击即可继续对话
 - **打印 / 导出 PDF**：顶栏打印按钮调用浏览器打印；打印样式隐藏侧栏、输入区、执行路线与操作按钮，适合打印行程单
@@ -636,7 +636,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | DELETE | `/api/sessions/{id}/last-turn` | 删除最后一轮对话（用户提问 + 助手回答；`expect` 内容不一致时不删除，供编辑后重新发送） |
 | GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载） |
-| POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
+| POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过，备份含 `knowledge` 段时一并恢复知识片段（失败时 `knowledge_error` 字段说明）；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
 | POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id`、`created` 与日期重叠的 `conflicts`） |
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；与其它行程完全重复时返回 409，返回日期重叠的 `conflicts`） |
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件，含出行前一天 09:00 提醒 |

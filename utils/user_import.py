@@ -21,6 +21,7 @@ from utils.trip_import import _strict_date, trip_identity
 _MAX_PREFERENCES = 200
 _MAX_TRIPS = 5000
 _MAX_MESSAGES = 200000
+_MAX_KNOWLEDGE = 50000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
 
@@ -251,9 +252,37 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     sections["pinned"] = _session_list("pinned_sessions")
     sections["archived"] = _session_list("archived_sessions")
 
+    knowledge: list[dict[str, Any]] = []
+    raw_knowledge = data.get("knowledge")
+    if raw_knowledge is not None and not isinstance(raw_knowledge, list):
+        errors.append("knowledge 段不是数组，已忽略")
+    elif isinstance(raw_knowledge, list):
+        for index, item in enumerate(raw_knowledge[:_MAX_KNOWLEDGE], start=1):
+            if not isinstance(item, dict):
+                errors.append(f"跳过第 {index} 个知识片段：不是对象")
+                continue
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip():
+                errors.append(f"跳过第 {index} 个知识片段：内容为空或非法")
+                continue
+            metadata = item.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            knowledge.append(
+                {
+                    "content": content,
+                    "metadata": {
+                        str(key)[:32]: str(value)[:200]
+                        for key, value in list(metadata.items())[:_MAX_PREFERENCES]
+                    },
+                }
+            )
+        if len(raw_knowledge) > _MAX_KNOWLEDGE:
+            errors.append(f"知识片段超过 {_MAX_KNOWLEDGE} 条，多余条目已跳过")
+    sections["knowledge"] = knowledge
+
     recoverable = any(
         sections[key]
-        for key in ("preferences", "trips", "messages")
+        for key in ("preferences", "trips", "messages", "knowledge")
     )
     if not recoverable:
         errors.append(
@@ -267,6 +296,7 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     """预览恢复结果（只读）：返回与 import_user_data 相同键的计数，不写库。"""
     result: dict[str, Any] = {
         "preferences": len(sections.get("preferences", {})),
+        "knowledge": len(sections.get("knowledge", [])),
         "trips_created": 0,
         "trips_updated": 0,
         "messages_added": 0,
@@ -322,6 +352,8 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         "titles": 0,
         "pinned": 0,
         "archived": 0,
+        "knowledge_imported": 0,
+        "knowledge_skipped": 0,
     }
 
     for key, value in sections.get("preferences", {}).items():
@@ -355,4 +387,20 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     archived = sections.get("archived", [])
     if archived:
         result["archived"] = int(store.set_sessions_archived(archived, True))
+    knowledge = sections.get("knowledge", [])
+    if knowledge:
+        # 知识片段是全局知识库（不随用户隔离）：失败时用户数据已恢复，
+        # 记录错误由调用方决定退出码 / 提示，重跑可补齐（导入幂等）
+        try:
+            from utils.knowledge_admin import import_documents
+
+            kb_result = import_documents(knowledge)
+            result["knowledge_imported"] = int(kb_result.get("imported", 0))
+            result["knowledge_skipped"] = int(kb_result.get("skipped", 0))
+        except FileNotFoundError:
+            result["knowledge_error"] = (
+                "知识库未初始化（先运行初始化脚本再恢复知识片段）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 知识库失败不回滚用户数据
+            result["knowledge_error"] = f"知识片段恢复失败：{exc}"
     return result

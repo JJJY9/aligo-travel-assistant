@@ -1930,8 +1930,14 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     return 0
 
 
-def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> int:
-    """把用户长期记忆导出为 JSON + Markdown（`python cli.py user-export <user_id> [dir]`）。
+def run_user_export_standalone(
+    user_id: str, target_dir: str | None = None, with_knowledge: bool = False
+) -> int:
+    """把用户长期记忆导出为 JSON + Markdown
+    （`python cli.py user-export <user_id> [dir] [--with-knowledge]`）。
+
+    ``--with-knowledge`` 把全局知识库片段一并写入 JSON（一体化备份，便于
+    迁移到另一台机器后一次恢复）。
 
     与交互模式的 export 命令输出同两份文件（utils.exporter.export_files）：
     偏好、历史行程、统计与全部对话历史；默认写入 `exports/`。
@@ -1975,6 +1981,15 @@ def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> i
         if callable(close):
             close()
 
+    if with_knowledge:
+        from utils.knowledge_admin import export_documents
+
+        try:
+            data["knowledge"] = export_documents()
+        except Exception as exc:  # noqa: BLE001 - 备份不完整时中止而不是静默
+            print(f"读取知识库失败：{exc}")
+            return 1
+
     out_dir = Path(target_dir) if target_dir else Path("exports")
     try:
         paths = export_files(data, out_dir)
@@ -1987,7 +2002,11 @@ def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> i
 
 
 def run_user_import_standalone(
-    user_id: str, json_path: str, as_json: bool = False, dry_run: bool = False
+    user_id: str,
+    json_path: str,
+    as_json: bool = False,
+    dry_run: bool = False,
+    skip_knowledge: bool = False,
 ) -> int:
     """从 user-export 的 JSON 备份恢复用户数据
     （`python cli.py user-import <user_id> <json_path> [--dry-run] [--json]`）。
@@ -2044,6 +2063,8 @@ def run_user_import_standalone(
         return _fail(f"读取备份失败：{exc}")
 
     sections, errors = parse_user_export(text)
+    if skip_knowledge:
+        sections.pop("knowledge", None)
     if not sections:
         detail = "；".join(errors[:5])
         return _fail(f"没有可恢复的数据{f'（{detail}）' if detail else ''}")
@@ -2066,15 +2087,18 @@ def run_user_import_standalone(
         if callable(close):
             close()
 
+    knowledge_error = str(counts.pop("knowledge_error", "") or "")
     if as_json:
         print(
             json.dumps(
                 {
-                    "ok": True,
+                    "ok": not knowledge_error,
                     "user_id": user_id,
                     "path": json_path,
                     "dry_run": dry_run,
+                    "skip_knowledge": skip_knowledge,
                     **counts,
+                    **({"knowledge_error": knowledge_error} if knowledge_error else {}),
                     "skipped": errors,
                 },
                 ensure_ascii=False,
@@ -2091,10 +2115,19 @@ def run_user_import_standalone(
             f"{counts['titles']} 个，置顶 {counts['pinned']} 个，归档 "
             f"{counts['archived']} 个"
         )
+        if dry_run:
+            summary += f"，知识片段 {counts.get('knowledge', 0)} 条"
+        elif "knowledge_imported" in counts:
+            summary += (
+                f"，知识片段新增 {counts['knowledge_imported']} 条"
+                f"（跳过 {counts['knowledge_skipped']} 条）"
+            )
         print(summary)
+        if knowledge_error:
+            print(f"❌ {knowledge_error}（用户数据已恢复，可稍后重跑补齐知识片段）")
         for error in errors[:10]:
             print(f"  跳过：{error}")
-    return 0
+    return 1 if knowledge_error else 0
 
 
 def _parse_kb_write_args(
@@ -5372,24 +5405,35 @@ def main():
                 )
             )
         if arg == "user-export":
-            export_args = sys.argv[2:]
+            with_knowledge = "--with-knowledge" in sys.argv[2:]
+            export_args = [
+                item
+                for item in sys.argv[2:]
+                if item != "--with-knowledge"
+            ]
             if (
                 not 1 <= len(export_args) <= 2
                 or not _valid_user_id(export_args[0])
                 or (len(export_args) == 2 and export_args[1].startswith("-"))
+                or any(item.startswith("-") for item in export_args)
             ):
-                print("用法：python cli.py user-export <user_id> [dir]")
+                print(
+                    "用法：python cli.py user-export <user_id> [dir] "
+                    "[--with-knowledge]"
+                )
                 sys.exit(2)
             sys.exit(
                 run_user_export_standalone(
                     export_args[0],
                     export_args[1] if len(export_args) == 2 else None,
+                    with_knowledge=with_knowledge,
                 )
             )
         if arg == "user-import":
             positional = []
             as_json = False
             dry_run = False
+            skip_knowledge = False
             valid = True
             for item in sys.argv[2:]:
                 lowered = item.lower()
@@ -5397,6 +5441,8 @@ def main():
                     as_json = True
                 elif lowered == "--dry-run":
                     dry_run = True
+                elif lowered == "--skip-knowledge":
+                    skip_knowledge = True
                 elif item.startswith("-") or len(positional) >= 2:
                     valid = False
                     break
@@ -5405,7 +5451,7 @@ def main():
             if not valid or len(positional) != 2:
                 print(
                     "用法：python cli.py user-import <user_id> <json_path> "
-                    "[--dry-run] [--json]"
+                    "[--dry-run] [--skip-knowledge] [--json]"
                 )
                 sys.exit(2)
             sys.exit(
@@ -5414,6 +5460,7 @@ def main():
                     positional[1],
                     as_json=as_json,
                     dry_run=dry_run,
+                    skip_knowledge=skip_knowledge,
                 )
             )
         if arg == "trips-export":

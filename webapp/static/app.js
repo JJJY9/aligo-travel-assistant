@@ -1311,15 +1311,25 @@ async function importUserBackup() {
     preferences: Object.keys(backup.preferences || {}).length,
     trips: Array.isArray(backup.trip_history) ? backup.trip_history.length : 0,
     messages: Array.isArray(backup.chat_history) ? backup.chat_history.length : 0,
+    knowledge: Array.isArray(backup.knowledge) ? backup.knowledge.length : 0,
   };
-  if (!counts.preferences && !counts.trips && !counts.messages) {
+  if (
+    !counts.preferences &&
+    !counts.trips &&
+    !counts.messages &&
+    !counts.knowledge
+  ) {
     toast("备份中没有可恢复的数据");
     return;
   }
   const source = backup.user_id ? `（来自 ${backup.user_id}）` : "";
+  const knowledgeNote = counts.knowledge
+    ? `\n知识片段 ${counts.knowledge} 条将合并到共享知识库。`
+    : "";
   const confirmed = window.confirm(
     `恢复备份${source}？\n偏好 ${counts.preferences} 项、行程 ${counts.trips} 条、` +
-      `聊天消息 ${counts.messages} 条将合并到当前用户 ${state.userId}。`,
+      `聊天消息 ${counts.messages} 条将合并到当前用户 ${state.userId}。` +
+      knowledgeNote,
   );
   if (!confirmed) return;
   els.importData.disabled = true;
@@ -1334,12 +1344,20 @@ async function importUserBackup() {
       },
     );
     const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    const knowledgeNote =
+      result.knowledge_imported || result.knowledge_skipped
+        ? `，知识片段新增 ${result.knowledge_imported} / 跳过 ${result.knowledge_skipped} 条`
+        : "";
     toast(
       `已恢复：偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
         `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
+        knowledgeNote +
         (skipped ? `，跳过 ${skipped} 项` : ""),
     );
-    await Promise.all([refreshStatus(), loadSessions()]);
+    if (result.knowledge_error) {
+      toast(`知识片段未恢复：${result.knowledge_error}`);
+    }
+    await Promise.all([refreshStatus(), loadSessions(), refreshKnowledge()]);
     // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面。
     // 正在编辑提问 / 切换会话时跳过：整体重渲染会销毁编辑框并作废在途加载
     if (

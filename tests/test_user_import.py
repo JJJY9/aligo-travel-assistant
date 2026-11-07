@@ -271,12 +271,24 @@ def test_import_duplicate_message_counts():
     print("✓ 重复消息多重集去重")
 
 
-def _run_import(monkeypatch, user_id, path, store, as_json=False, dry_run=False):
+def _run_import(
+    monkeypatch,
+    user_id,
+    path,
+    store,
+    as_json=False,
+    dry_run=False,
+    skip_knowledge=False,
+):
     monkeypatch.setattr(cli, "_open_cli_store", lambda user_id: store)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_user_import_standalone(
-            user_id, path, as_json=as_json, dry_run=dry_run
+            user_id,
+            path,
+            as_json=as_json,
+            dry_run=dry_run,
+            skip_knowledge=skip_knowledge,
         )
     return code, buf.getvalue()
 
@@ -342,8 +354,8 @@ def test_runner_dispatch(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_user_import_standalone",
-        lambda user_id, path, as_json=False, dry_run=False: (
-            calls.append((user_id, path, as_json, dry_run)) or 0
+        lambda user_id, path, as_json=False, dry_run=False, skip_knowledge=False: (
+            calls.append((user_id, path, as_json, dry_run, skip_knowledge)) or 0
         ),
     )
     monkeypatch.setattr(
@@ -354,7 +366,7 @@ def test_runner_dispatch(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls[-1] == ("u1", "backup.json", True, True)
+    assert calls[-1] == ("u1", "backup.json", True, True, False)
 
     monkeypatch.setattr(sys, "argv", ["cli.py", "user-import", "u1"])
     with pytest.raises(SystemExit) as exc:
@@ -426,6 +438,94 @@ def test_parse_limits_preferences():
 
 
 
+def test_parse_knowledge_section_and_import(monkeypatch):
+    """备份的 knowledge 段：解析校验、预览计数、导入计数与错误上报。"""
+    from utils import knowledge_admin as admin_module
+
+    payload = {
+        "knowledge": [
+            {"content": "知识一", "metadata": {"category": "住宿"}},
+            {"content": "", "metadata": {}},
+            "不是对象",
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [item["content"] for item in sections["knowledge"]] == ["知识一"]
+    assert sum("知识片段" in error for error in errors) == 2
+    preview = None
+    store = _real_store("u-knowledge")
+    from utils.user_import import preview_user_import
+
+    preview = preview_user_import(store, sections)
+    assert preview["knowledge"] == 1
+
+    calls = []
+
+    def fake_import(documents):
+        calls.append(documents)
+        return {"imported": 1, "skipped": 0, "skipped_invalid": 0, "skipped_duplicate": 0}
+
+    monkeypatch.setattr(admin_module, "import_documents", fake_import)
+    counts = import_user_data(store, sections)
+    assert counts["knowledge_imported"] == 1 and counts["knowledge_skipped"] == 0
+    assert calls and calls[0][0]["content"] == "知识一"
+
+    def missing_db(documents):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(admin_module, "import_documents", missing_db)
+    counts = import_user_data(store, sections)
+    assert "knowledge_error" in counts and "未初始化" in counts["knowledge_error"]
+    print("✓ knowledge 段解析 / 预览 / 导入与错误上报")
+
+
+def test_parse_knowledge_section_wrong_type():
+    sections, errors = parse_user_export(json.dumps({"knowledge": {"a": 1}}))
+    assert sections == {}
+    assert any("knowledge 段不是数组" in error for error in errors)
+    print("✓ knowledge 段类型错误显式报告")
+
+def test_runner_knowledge_error_and_skip(monkeypatch):
+    """知识片段恢复失败：用户数据已恢复但退出码 1；--skip-knowledge 跳过。"""
+    from utils import knowledge_admin as admin_module
+
+    path = _write_json(
+        {"knowledge": [{"content": "知识一"}], "preferences": {"home_location": "北京"}}
+    )
+    store = _real_store("u-kb-cli")
+
+    def missing(documents):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(admin_module, "import_documents", missing)
+    code, out = _run_import(monkeypatch, "u-kb-cli", path, store, as_json=True)
+    payload = json.loads(out)
+    assert code == 1 and payload["ok"] is False
+    assert "knowledge_error" in payload
+    assert store.get_preference().get("home_location") == "北京", "用户数据仍应恢复"
+
+    calls = []
+
+    def fake_import(documents):
+        calls.append(documents)
+        return {"imported": 1, "skipped": 0, "skipped_invalid": 0, "skipped_duplicate": 0}
+
+    monkeypatch.setattr(admin_module, "import_documents", fake_import)
+    code, out = _run_import(
+        monkeypatch,
+        "u-kb-cli-skip",
+        path,
+        _real_store("u-kb-cli-skip"),
+        as_json=True,
+        skip_knowledge=True,
+    )
+    payload = json.loads(out)
+    assert code == 0 and payload["ok"] is True
+    assert payload["skip_knowledge"] is True
+    assert payload["knowledge_imported"] == 0
+    assert calls == [], "--skip-knowledge 不得触碰知识库"
+    print("✓ 知识片段失败上报 / --skip-knowledge 跳过")
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -437,6 +537,7 @@ if __name__ == "__main__":
     test_parse_tolerates_bad_timestamps_and_rows()
     test_parse_limits_preferences()
     test_bulk_storage_helpers()
+    test_parse_knowledge_section_wrong_type()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (
@@ -445,6 +546,8 @@ if __name__ == "__main__":
         test_runner_errors,
         test_runner_rejects_oversized_backup,
         test_runner_dispatch,
+        test_parse_knowledge_section_and_import,
+        test_runner_knowledge_error_and_skip,
     ):
         mp = pytest.MonkeyPatch()
         try:
