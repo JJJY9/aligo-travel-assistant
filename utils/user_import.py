@@ -339,13 +339,11 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
 
     trips = sections.get("trips", [])
     if trips:
-        before = len(store.get_trip_history(limit=None))
-        for row in trips:
-            store.save_trip_history(row)
-        after = len(store.get_trip_history(limit=None))
-        created = max(0, after - before)
-        result["trips_created"] = created
-        result["trips_updated"] = len(trips) - created
+        # 批量保存：JSON 后端一次重载 + 一次原子写回（逐条写是 O(n²)，
+        # 几千条行程会把恢复拖成分钟级）
+        created, updated = store.save_trip_histories(trips)
+        result["trips_created"] = int(created)
+        result["trips_updated"] = int(updated)
 
     messages = sections.get("messages", [])
     if messages:
@@ -357,13 +355,13 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         result["messages_added"] = added
         result["messages_skipped"] = len(messages) - added
 
-    for session_id, title in sections.get("titles", {}).items():
-        if store.set_session_title(session_id, title):
-            result["titles"] += 1
-    for session_id in sections.get("pinned", []):
-        if store.set_session_pinned(session_id, True):
-            result["pinned"] += 1
-    for session_id in sections.get("archived", []):
-        if store.set_session_archived(session_id, True):
-            result["archived"] += 1
+    titles = sections.get("titles", {})
+    if titles:
+        result["titles"] = int(store.set_session_titles(titles))
+    pinned = sections.get("pinned", [])
+    if pinned:
+        result["pinned"] = int(store.set_sessions_pinned(pinned, True))
+    archived = sections.get("archived", [])
+    if archived:
+        result["archived"] = int(store.set_sessions_archived(archived, True))
     return result

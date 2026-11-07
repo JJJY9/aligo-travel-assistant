@@ -363,6 +363,33 @@ def test_runner_dispatch(monkeypatch):
     print("✓ user-import dispatch 与用法错误")
 
 
+def test_bulk_storage_helpers():
+    """批量接口：行程去重计数、会话元数据只对存在的会话生效。"""
+    store = _real_store("u-bulk")
+    created, updated = store.save_trip_histories(
+        [
+            {"origin": "北京", "destination": "上海", "start_date": "2026-12-01"},
+            {"origin": "北京", "destination": "上海", "start_date": "2026-12-01", "purpose": "会议"},
+            {"origin": "杭州", "destination": "成都", "start_date": "2026-12-10"},
+        ]
+    )
+    assert (created, updated) == (2, 1), (created, updated)
+    trips = store.get_trip_history(limit=None)
+    assert len(trips) == 2
+    assert trips[0]["purpose"] == "会议", "批量内的重复行程应更新既有记录"
+    again = store.save_trip_histories(trips[:1])
+    assert again == (0, 1)
+
+    store.add_chat_message("user", "hi", "sess-bulk")
+    assert store.set_session_titles({"sess-bulk": "批量标题", "ghost": "悬空"}) == 1
+    assert store.set_sessions_pinned(["sess-bulk", "ghost"]) == 1
+    assert store.set_sessions_archived(["sess-bulk", "ghost"]) == 1
+    assert store.get_session_titles() == {"sess-bulk": "批量标题"}
+    assert store.get_pinned_sessions() == ["sess-bulk"]
+    assert store.get_archived_sessions() == ["sess-bulk"]
+    print("✓ 批量存储接口（行程去重 / 元数据仅存在会话）")
+
+
 def test_parse_tolerates_bad_timestamps_and_rows():
     payload = {
         "preferences": {"k" * 65: "太长键", "ok": "值"},
@@ -409,6 +436,7 @@ if __name__ == "__main__":
     test_preview_does_not_write_and_matches_import()
     test_parse_tolerates_bad_timestamps_and_rows()
     test_parse_limits_preferences()
+    test_bulk_storage_helpers()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (
