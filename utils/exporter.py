@@ -5,10 +5,21 @@
 两份文件，便于用户备份、迁移或查看自己的数据。
 """
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from utils.json_safe import sanitize_json
+from utils.stored_message import render_stored_message
+
+_CELL_BREAK = re.compile(r"[\r\n]+")
+
+
+def _md_cell(value: Any) -> str:
+    """导出表格 / 列表用的单行文本：竖线与换行会破坏 Markdown 结构，
+    尖括号转义避免把用户 / 模型可控内容当 HTML 落盘。"""
+    text = _CELL_BREAK.sub(" ", str(value if value is not None else "-"))
+    return text.replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def render_markdown(data: dict[str, Any]) -> str:
@@ -31,7 +42,7 @@ def render_markdown(data: dict[str, Any]) -> str:
         for key, value in preferences.items():
             if isinstance(value, list):
                 value = ", ".join(str(item) for item in value)
-            lines.append(f"| {key} | {value} |")
+            lines.append(f"| {_md_cell(key)} | {_md_cell(value)} |")
     else:
         lines.append("（暂无偏好）")
 
@@ -42,9 +53,12 @@ def render_markdown(data: dict[str, Any]) -> str:
         lines.append("| --- | --- | --- | --- | --- | --- |")
         for trip in trips:
             lines.append(
-                f"| {trip.get('trip_id', '')} | {trip.get('origin') or '-'} | "
-                f"{trip.get('destination') or '-'} | {trip.get('start_date') or '-'} | "
-                f"{trip.get('end_date') or '-'} | {trip.get('purpose') or '-'} |"
+                f"| {_md_cell(trip.get('trip_id', ''))} | "
+                f"{_md_cell(trip.get('origin') or '-')} | "
+                f"{_md_cell(trip.get('destination') or '-')} | "
+                f"{_md_cell(trip.get('start_date') or '-')} | "
+                f"{_md_cell(trip.get('end_date') or '-')} | "
+                f"{_md_cell(trip.get('purpose') or '-')} |"
             )
     else:
         lines.append("（暂无行程）")
@@ -57,16 +71,29 @@ def render_markdown(data: dict[str, Any]) -> str:
         lines.append(f"- 总查询数: {statistics.get('total_queries', 0)}")
         frequent = statistics.get("frequent_destinations") or {}
         if frequent:
-            lines.append("- 常去目的地: " + ", ".join(f"{city}({count}次)" for city, count in frequent.items()))
+            lines.append(
+                "- 常去目的地: "
+                + ", ".join(
+                    f"{_md_cell(city)}({_md_cell(count)}次)"
+                    for city, count in frequent.items()
+                )
+            )
 
     chats = data.get("chat_history") or []
     lines += ["", f"## 对话历史（{len(chats)} 条）", ""]
     if chats:
         for message in chats:
-            role = "用户" if message.get("role") == "user" else "助手"
-            content = str(message.get("content", ""))
-            if len(content) > 200:
-                content = content[:200] + "…"
+            is_user = message.get("role") == "user"
+            role = "用户" if is_user else "助手"
+            if is_user:
+                content = str(message.get("content", ""))
+                if len(content) > 200:
+                    content = content[:200] + "…"
+            else:
+                # 助手消息存的是编排结果 JSON：与 Web / session-export 共用
+                # render_stored_message 重新渲染（此前导出的是截断 200 字的
+                # 原始 JSON，回答正文完全不可读）
+                content = render_stored_message(message)
             lines.append(f"- **{role}**（{message.get('timestamp', '')}）：{content}")
     else:
         lines.append("（暂无对话记录）")

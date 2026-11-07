@@ -162,6 +162,22 @@ def test_title_only_text_becomes_single_chunk():
         assert token in joined
 
 
+def test_numbered_colon_headings_merged_with_body():
+    """带编号 / 结尾冒号的短标题不是正文：要并入下一段，不能成为纯标题块。"""
+    from utils.text_chunker import _is_title_like, split_text
+
+    assert _is_title_like("1. 一线城市住宿标准")
+    assert _is_title_like("3. 住宿标准：")
+    assert not _is_title_like("允许预订：二等座及以下")
+
+    chunks = split_text("1. 住宿标准：\n\n" + "正文内容" * 40 + "\n")
+    assert chunks
+    assert all("住宿标准" in chunk or "正文" in chunk for chunk in chunks)
+    assert chunks[0].startswith("1. 住宿标准："), "标题应并入正文块而不是独立成块"
+    assert "正文内容" in chunks[0]
+    print("✓ 编号 / 冒号标题并入正文")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -175,4 +191,5 @@ if __name__ == "__main__":
     test_empty_and_whitespace_text()
     test_unpunctuated_sentence_hard_split()
     test_title_only_text_becomes_single_chunk()
+    test_numbered_colon_headings_merged_with_body()
     print("\n全部通过")

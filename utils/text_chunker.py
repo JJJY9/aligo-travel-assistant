@@ -37,12 +37,25 @@ def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
     return pieces
 
 
+_TITLE_PREFIX = re.compile(
+    r"^(?:#+\s*|\d+[.、)）]\s*|[（(]\d+[)）]\s*|[一二三四五六七八九十]+[、.]\s*)"
+)
+
+
 def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
-    """判断块是否像「孤立标题」：单行、较短、且没有句读符号。"""
+    """判断块是否像「孤立标题」：单行、较短、且没有句读符号。
+
+    允许「1. 住宿标准：」这类带编号 / 结尾冒号的标题：去掉编号前缀与
+    结尾冒号后再看句读，否则它们会被判成正文、作为纯标题块留在索引里。
+    """
     stripped = chunk.strip()
     if "\n" in stripped or len(stripped) >= min_chars:
         return False
-    return not re.search(r"[。；！？!?.;:：]", stripped)
+    body = _TITLE_PREFIX.sub("", stripped).rstrip("：: ")
+    if "：" in body or ":" in body:
+        # 内部冒号说明是「标签：内容」的正文行，不是纯标题
+        return False
+    return not re.search(r"[。；！？!?.;]", body)
 
 
 def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
