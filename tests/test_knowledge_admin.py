@@ -1073,6 +1073,12 @@ def test_import_partial_group_repairs_missing_parts(monkeypatch):
     monkeypatch.setattr(
         knowledge_admin, "_existing_contents", lambda: {"甲" * 300}
     )
+    # 补齐前校验库内旧分片布局：同一篇文档中途失败时 part/parts 一致
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {"甲" * 300: ("g-part", 1, 2)},
+    )
     result = knowledge_admin.import_documents(documents)
     assert result["imported"] == 1
     assert result["skipped_duplicate"] == 1
@@ -1082,6 +1088,74 @@ def test_import_partial_group_repairs_missing_parts(monkeypatch):
     assert written[0]["metadata"]["part"] == "2"
     assert written[0]["metadata"]["parts"] == "2", "补齐后组声明与实际成员一致"
     print("✓ 残缺组只补缺失分片（不产生重复文档）")
+
+
+def test_import_skips_restore_group_with_layout_conflict(monkeypatch):
+    """编辑后重新导入（分片布局变化）不能补写半组：整组跳过并统计。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    old_first = "甲" * 300
+    old_second = "乙" * 300
+    new_pieces = ["甲" * 300, "乙" * 300, "丙" * 300, "丁" * 300]
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: {old_first, old_second}
+    )
+    # 库内旧文档 3 片；备份是编辑后的新文本 4 片，前两片内容相同
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {
+            old_first: ("g-edit", 1, 3),
+            old_second: ("g-edit", 2, 3),
+        },
+    )
+    documents = [
+        {
+            "content": piece,
+            "metadata": {"group": "g-edit", "part": str(i + 1), "parts": "4"},
+        }
+        for i, piece in enumerate(new_pieces)
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_duplicate"] == 4, result  # 2 片已存在 + 2 片随组跳过
+    print("✓ 布局冲突的还原组整组跳过")
+
+
+def test_import_invalid_group_member_skips_group_not_batch(monkeypatch):
+    """组内有一个无效分片：整组跳过，其它合法文档照常导入（备份不整体失败）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    documents = [
+        {"content": "普通文档", "metadata": {}},
+        {"content": "组片1", "metadata": {"group": "gx", "part": "1", "parts": "2"}},
+        {"content": "", "metadata": {"group": "gx", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 1, result
+    assert result["skipped_invalid"] == 2, result
+    print("✓ 组内无效分片整组跳过、不拖垮整份备份")
+
+
+def test_import_rejects_absurd_parts_declaration(monkeypatch):
+    """parts 声明过大（1e12）在构造缺失集合前就被拒绝，不能撑爆内存。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    with pytest.raises(ValueError, match="parts 声明异常"):
+        knowledge_admin.import_documents(
+            [
+                {
+                    "content": "x",
+                    "metadata": {"group": "g", "part": "1", "parts": str(10**12)},
+                }
+            ],
+            dry_run=True,
+        )
+    print("✓ 异常 parts 声明被拒绝")
 
 
 def test_import_dedupes_chunks_with_boundary_newline(monkeypatch):
@@ -1151,7 +1225,9 @@ def test_get_document_group_returns_joined_content(monkeypatch):
         "group": "g",
         "parts": 3,
         "size": 9,
-        "content": "第一段\n第二段\n第三段",
+        # 空串拼接与导入还原同口径：分片是原文的连续片段，换行分隔会把
+        # 分隔符带进编辑框并让长文档超提交上限
+        "content": "第一段第二段第三段",
     }
     single = knowledge_admin.get_document_group(4)
     assert single == {
@@ -1192,7 +1268,7 @@ def test_document_group_at_size_limit_roundtrip(monkeypatch):
     grouped = knowledge_admin.get_document_group(1)
     assert grouped["parts"] == len(parts)
     assert grouped["size"] == 20000, "文档大小按分片长度之和"
-    assert len(grouped["content"]) == 20000 + len(parts) - 1, "拼接只多出分片间分隔符"
+    assert len(grouped["content"]) == 20000, "空串拼接与还原口径一致，不带分隔符"
 
     # 备份还原：整篇仍是 20000 字，不应触发还原上限错误
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))

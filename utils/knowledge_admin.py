@@ -34,6 +34,10 @@ JOINED_MAX_CHARS = DOC_MAX_CHARS + 100
 # 文档拼接后接近 40000 字），按分片数放宽；文档大小仍以 DOC_MAX_CHARS 为准，
 # 该上限只拦住用空白撑大拼接文本的异常备份
 _RESTORE_JOINED_MAX_CHARS = DOC_MAX_CHARS * 2 + 100
+# 分片数硬上限：parts 声明来自备份元数据，无上限时 set(range(1, parts+1))
+# 会被 1e12 之类的声明直接撑爆内存（恶意 / 损坏备份即可触发）；旧备份
+# 可能有上千个极短分片（每片几个字），上限取 10 万留足正常空间
+_GROUP_PARTS_MAX = 100000
 # 导入时单条内容上限（用户输入 / 任意备份的安全边界）；从导出备份还原的
 # 多分片记录是完整文档，用上面的拼接上限避免备份恢复被截断
 _IMPORT_CONTENT_MAX_CHARS = 2000
@@ -397,10 +401,10 @@ def update_document(
     if not text:
         raise ValueError("知识内容不能为空")
     if len(text) > JOINED_MAX_CHARS:
-        # 整份编辑提交的是分片拼接文本（每片之间多一个分隔符）：20000 字
-        # 文档最多 50 片，拼接后 20049 字，JOINED_MAX_CHARS 已留余量
+        # 整份编辑提交的是分片空串拼接文本（与 get_document_group 同口径）：
+        # 留 100 字余量给边界场景，实际入库大小由下方 stored_size 校验
         raise ValueError(
-            f"知识内容超过上限（{DOC_MAX_CHARS} 字，整份编辑含分片分隔符最多 "
+            f"知识内容超过上限（{DOC_MAX_CHARS} 字，整份编辑最多 "
             f"{JOINED_MAX_CHARS} 字），请拆分后重试"
         )
     client = _client()
@@ -463,7 +467,9 @@ def update_document(
             if failed_compensation:
                 raise RuntimeError(
                     "更新失败且补偿删除未完成，残留分片 "
-                    f"{failed_compensation}：请稍后重试或运行 kb-dedupe 清理"
+                    f"{failed_compensation}：请稍后重试，或运行 "
+                    f"`python cli.py kb-delete <id> --group` 删除整组后重新添加"
+                    "（kb-dedupe 不处理组内分片）"
                 ) from original
             raise
         # 目标已换成新内容后再删旧分片（旧组仅此时失去定位目标）。
@@ -577,6 +583,11 @@ def _regroup_exported_documents(
                 declared = max(declared, int(metadata.get("parts") or 0))
             except (TypeError, ValueError):
                 part_no = 0
+            if declared > _GROUP_PARTS_MAX:
+                raise ValueError(
+                    f"备份中的多分片文档 parts 声明异常（group={key}，"
+                    f"parts={declared}）：请检查备份来源"
+                )
             if part_no:
                 if part_no in seen_parts:
                     # 重复 part 编号会把同一段内容叠进正文（内容变多、丢片）
@@ -640,9 +651,9 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
     不存在返回 None；单条 / 无 group 的旧分片返回其自身内容。供面板
     「编辑整份文档」回填：整组保存时由 ``update_document`` 整组替换。
 
-    拼接用换行分隔（分片边界处原文可能是段落 / 标题，空串拼接会把
-    两段文字粘在一起）；文档大小（``size``，各片长度之和）才是上限判断
-    依据，拼接文本长度上限另留余量。读取在写锁内进行，避免读到整组
+    拼接用空串（分片按 part 顺序原样拼接即原文，与导入还原同口径；用换行
+    分隔会把分隔符带进编辑框，长文档超过提交上限后原样保存也会失败）。
+    文档大小（``size``）即拼接文本长度，编辑回填与上限判断同一口径。读取在写锁内进行，避免读到整组
     替换过程中的中间状态；集合加载（可能阻塞等待）放在写锁外。
     """
     client = _client()
@@ -683,12 +694,15 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
                 part_no = 0
             pieces.append((part_no, str(rows[0].get("content", ""))))
         pieces.sort(key=lambda pair: pair[0])
+        # 空串拼接：分片是原文的连续片段（入库时 strip 后直接拼接），用换行
+        # 分隔会把分隔符带进编辑框——文档越大越超提交上限，原样保存都失败
+        joined = "".join(text for _, text in pieces)
         return {
             "id": int(doc_id),
             "group": group,
             "parts": len(pieces) or parts,
-            "size": sum(len(text) for _, text in pieces),
-            "content": "\n".join(text for _, text in pieces),
+            "size": len(joined),
+            "content": joined,
         }
 
 
@@ -735,6 +749,28 @@ def _existing_contents() -> set[str]:
     }
 
 
+def _existing_group_layout() -> dict[str, tuple[str, int, int]]:
+    """内容 → (group, part, parts)：补齐残缺组前校验新旧分片布局一致。"""
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    layout: dict[str, tuple[str, int, int]] = {}
+    for row in _iter_all_rows(client):
+        content = str(row.get("content", "")).strip()
+        if not content:
+            continue
+        meta = _parse_metadata(row.get("metadata"))
+        try:
+            parts = int(meta.get("parts") or 1)
+        except (TypeError, ValueError):
+            parts = 1
+        try:
+            part = int(meta.get("part") or 0)
+        except (TypeError, ValueError):
+            part = 0
+        layout[content] = (str(meta.get("group") or ""), part, parts)
+    return layout
+
+
 def import_documents(
     documents: list[dict[str, Any]], dry_run: bool = False
 ) -> dict[str, Any]:
@@ -757,6 +793,9 @@ def import_documents(
     # 与数据库无关的校验先做：全部为空 / 非法时不需要知识库，直接返回
     valid: list[Any] = []
     invalid = 0
+    # 组内出现无效成员（空内容 / 非字符串）时整组跳过：只剔除该成员会让
+    # 分组校验看到「缺片」并拒绝整份备份，其它合法文档也一起导入失败
+    invalid_groups: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             invalid += 1
@@ -764,6 +803,10 @@ def import_documents(
         raw_content = item.get("content")
         # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
         if not isinstance(raw_content, str) or not raw_content.strip():
+            meta = item.get("metadata")
+            group = str(meta.get("group") or "") if isinstance(meta, dict) else ""
+            if group:
+                invalid_groups.add(group)
             invalid += 1
             continue
         # 还原标记是内部记账字段：用户 JSON 自带同名键时一律剥离，
@@ -775,6 +818,24 @@ def import_documents(
             not in {"__restored_group__", "__restored_size__", "__restored_parts__"}
         }
         valid.append(cleaned)
+    if invalid_groups:
+        kept: list[Any] = []
+        removed = 0
+        for entry in valid:
+            meta = entry.get("metadata")
+            group = str(meta.get("group") or "") if isinstance(meta, dict) else ""
+            if group and group in invalid_groups:
+                removed += 1
+                continue
+            kept.append(entry)
+        if removed:
+            invalid += removed
+            logger.warning(
+                "备份中有 %d 个分片组含无效分片（空内容 / 非字符串），整组跳过：%s",
+                len(invalid_groups),
+                sorted(invalid_groups)[:5],
+            )
+        valid = kept
     if not valid:
         payload: dict[str, Any] = {
             "imported": 0,
@@ -805,6 +866,9 @@ def import_documents(
         merged_items, group_skipped = _regroup_exported_documents(valid, existing)
         duplicate = group_skipped
         document_chunks: list[list[dict[str, Any]]] = []
+        # 与 document_chunks 平行的还原组号（非还原文档为空串），用于识别
+        # 「备份组与库内片段部分重合」的布局冲突
+        document_groups: list[str] = []
         for item in merged_items:
             restored_group = str(item.pop("__restored_group__", "") or "")
             restored = bool(restored_group)
@@ -861,9 +925,10 @@ def import_documents(
             else:
                 chunks = _chunk_documents(content, sanitized_meta)
             document_chunks.append(chunks)
+            document_groups.append(restored_group)
 
         unique: list[dict[str, Any]] = []
-        for doc_chunks in document_chunks:
+        for doc_chunks, doc_group in zip(document_chunks, document_groups):
             # existing 存的是 strip 后的内容；分片内容可能带切分残留的
             # 换行，必须同样 strip 后比较，否则重复导入不幂等
             keys = [piece["content"].strip() for piece in doc_chunks]
@@ -875,6 +940,43 @@ def import_documents(
             duplicate += len(doc_chunks) - len(missing)
             if not missing:
                 continue
+            if len(missing) != len(doc_chunks) and doc_group:
+                # 备份组与库内片段部分重合：库内旧分片的 group/part/parts
+                # 必须与本次布局一致才能安全补齐（例如上次导入中途失败的
+                # 同一篇文档）；编辑后重新导入的文档分片布局已变化，补写会
+                # 留下 parts 声明与实际成员错位的半组，保守跳过并提示正确维护方式
+                layout: dict[str, tuple[str, int, int]] | None
+                try:
+                    layout = _existing_group_layout()
+                except Exception as exc:  # noqa: BLE001 - 无法校验布局时不冒险补写
+                    logger.warning("扫描库内分片布局失败（%s），跳过补写组 %s", exc, doc_group)
+                    layout = None
+                conflicts = []
+                if layout is None:
+                    conflicts.append(doc_group)
+                else:
+                    for chunk, key in zip(doc_chunks, keys):
+                        if key not in existing:
+                            continue
+                        old_group, old_part, old_parts = layout.get(key, ("", 0, 1))
+                        chunk_meta = chunk.get("metadata")
+                        want_part = int((chunk_meta or {}).get("part") or 0)
+                        want_parts = int((chunk_meta or {}).get("parts") or 1)
+                        if (
+                            old_group != doc_group
+                            or old_parts != want_parts
+                            or (want_part and old_part != want_part)
+                        ):
+                            conflicts.append(key[:20])
+                            break
+                if conflicts:
+                    logger.warning(
+                        "备份中的文档组 %s 与库内已有片段布局不一致，已跳过该组："
+                        "请整份编辑或 kb-delete --group 后重新导入",
+                        doc_group,
+                    )
+                    duplicate += len(missing)
+                    continue
             # 部分分片已存在（上次导入中途失败 / 组内重复）：只补缺失分片，
             # 补写后组内成员按内容齐全——整组跳过会把残缺组永久留在库里
             if len(missing) != len(doc_chunks):
