@@ -20,7 +20,8 @@ from agentscope.message import Msg
 
 from agents.intention_agent import IntentionAgent
 from agents.lazy_agent_registry import LazyAgentRegistry
-from agents.orchestration_agent import OrchestrationAgent, canonical_agent_name
+from agents.orchestration_agent import OrchestrationAgent
+from utils.agent_names import canonical_agent_name
 from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError

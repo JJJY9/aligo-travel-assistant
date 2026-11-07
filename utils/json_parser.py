@@ -14,22 +14,61 @@ def reject_json_constant(value: str):
     raise ValueError(f"非法 JSON 数值: {value}")
 
 
+def _top_level_object_starts(text: str):
+    """产出文本中处于「顶层」的 ``{`` 位置（不在任何未闭合的 {}/[] 内）。
+
+    追踪括号深度与双引号字符串（含转义）：嵌套在外层畸形对象 / 数组里的
+    子对象不再是候选——``extract_first_json_object`` 此前会把它当作完整
+    结果返回（尾逗号 / 截断的外层对象 → 只拿到其中一个 preferences 片段）。
+    说明文字里的花括号通常成对出现，深度回到 0 后继续产出后面的候选。
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                yield index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            if depth > 0:
+                depth -= 1
+
+
 def extract_first_json_object(text: str) -> dict:
-    """返回文本中第一个能完整解析的 JSON 对象，忽略前后的说明文字。
+    """返回文本中第一个完整解析出的**顶层** JSON 对象，忽略说明文字。
 
     ``find('{')`` / ``rfind('}')`` 会把结尾说明里的花括号（例如「如 {日期}
-    未提供可默认明天」）一起截进 JSON，导致合法输出解析失败。这里逐个尝试
-    每个 ``{`` 的 ``raw_decode``，只接受完整解析出的 dict。
+    未提供可默认明天」）一起截进 JSON，导致合法输出解析失败。这里对顶层
+    每个 ``{`` 尝试 ``raw_decode``，只接受完整解析出的 dict：
+
+    - 嵌套在外层畸形对象 / 数组里的子对象不算（否则尾逗号 / 截断的外层
+      对象会返回其中一个片段，调用方误当完整结果）；
+    - NaN / Infinity（``reject_json_constant`` 抛 ValueError）只跳过当前
+      候选，不能中止整个扫描——后面可能还有合法的结果对象。
     """
     if not text:
         raise ValueError("Empty text provided")
     decoder = json.JSONDecoder(parse_constant=reject_json_constant)
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
+    for index in _top_level_object_starts(text):
         try:
             value, _ = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(value, dict):
             return value
@@ -110,7 +149,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
 
     # 尝试1: 直接解析
     try:
-        return json.loads(json_str)
+        return json.loads(json_str, parse_constant=reject_json_constant)
     except json.JSONDecodeError as e:
         last_error = e
         logger.warning(f"Direct JSON parse failed: {e}")
@@ -123,7 +162,9 @@ def robust_json_parse(text: str, fallback=None) -> dict:
     # 尝试2: 移除控制字符后解析
     try:
         json_str_cleaned = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_str)
-        result = json.loads(json_str_cleaned)
+        result = json.loads(
+            json_str_cleaned, parse_constant=reject_json_constant
+        )
         logger.info("JSON parsed successfully after removing control characters")
         return result
     except json.JSONDecodeError as e:
@@ -136,7 +177,9 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         # 这个正则会匹配键名和值周围的单引号
         json_str_fixed = re.sub(r"'([^']*)'(\s*:\s*)", r'"\1"\2', json_str)  # 键名
         json_str_fixed = re.sub(r':\s*\'([^\']*)\'', r': "\1"', json_str_fixed)  # 字符串值
-        result = json.loads(json_str_fixed)
+        result = json.loads(
+            json_str_fixed, parse_constant=reject_json_constant
+        )
         logger.info("JSON parsed successfully after fixing quotes")
         return result
     except json.JSONDecodeError as e:
@@ -147,7 +190,9 @@ def robust_json_parse(text: str, fallback=None) -> dict:
     try:
         # 移除对象和数组中的尾部逗号
         json_str_fixed = re.sub(r',(\s*[}\]])', r'\1', json_str)
-        result = json.loads(json_str_fixed)
+        result = json.loads(
+            json_str_fixed, parse_constant=reject_json_constant
+        )
         logger.info("JSON parsed successfully after removing trailing commas")
         return result
     except json.JSONDecodeError as e:
@@ -193,7 +238,9 @@ def robust_json_parse(text: str, fallback=None) -> dict:
             return ''.join(result)
 
         json_str_fixed = escape_newlines_in_strings(json_str)
-        result = json.loads(json_str_fixed)
+        result = json.loads(
+            json_str_fixed, parse_constant=reject_json_constant
+        )
         logger.info("JSON parsed successfully after smart escaping")
         return result
     except json.JSONDecodeError as e:

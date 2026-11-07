@@ -227,6 +227,101 @@ def test_delete_all_does_not_resurrect_data():
     print("✓ delete_all 后数据不会被后续写入复活")
 
 
+def test_extract_first_json_object_rejects_nested_fragments():
+    """嵌套在畸形外层对象 / 数组里的子对象不能当作完整结果。"""
+    from utils.json_parser import extract_first_json_object
+
+    malformed_outer = '{"preferences": [{"type": "x", "value": "y"}], "ok": true,}'
+    try:
+        extract_first_json_object(malformed_outer)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("尾逗号外层对象的子片段不应被返回")
+
+    try:
+        extract_first_json_object('[{"origin": "北京"}, {"origin": "上海"}]')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("数组里的元素不应被当作完整对象")
+
+    # 说明文字里的成对花括号之后，合法对象仍能取到
+    prose = '分析：{不是JSON}，最终：{"ok": 1}'
+    assert extract_first_json_object(prose) == {"ok": 1}
+    print("✓ 首个对象扫描拒绝嵌套片段")
+
+
+def test_extract_first_json_object_skips_nan_candidate():
+    """NaN 候选只跳过当前对象，不能中止扫描（后面还有合法结果）。"""
+    from utils.json_parser import extract_first_json_object
+
+    text = '推理：{"score": NaN}\n最终：{"has_preferences": true}'
+    assert extract_first_json_object(text) == {"has_preferences": True}
+    print("✓ NaN 候选被跳过而不是中止扫描")
+
+
+def test_robust_json_parse_rejects_nan():
+    """robust_json_parse 与其它入口一致：NaN / Infinity 不是合法数值。"""
+    from utils.json_parser import robust_json_parse
+
+    try:
+        robust_json_parse('{"a": NaN}')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("NaN 应解析失败")
+    try:
+        robust_json_parse('{"a": Infinity}')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Infinity 应解析失败")
+    print("✓ robust_json_parse 拒绝 NaN / Infinity")
+
+
+def test_merge_preference_value_empty_list():
+    """append 空列表返回 []，不能产生嵌套列表 [[]]。"""
+    from utils.preference_values import merge_preference_value
+
+    assert merge_preference_value(None, []) == []
+    assert merge_preference_value([], []) == []
+    assert merge_preference_value(["东航"], []) == ["东航"]
+    assert merge_preference_value(None, ["国航"]) == ["国航"]
+    assert merge_preference_value(["东航"], ["国航"]) == ["东航", "国航"]
+    assert merge_preference_value(None, 0) == [0], "0 是合法偏好"
+    print("✓ 空列表 append 不产生嵌套列表")
+
+
+def test_append_preference_empty_list_not_persisted_as_nested():
+    d = tempfile.mkdtemp(prefix="chailv_pref_empty_")
+    memory = LongTermMemory(f"pref-empty-{uuid.uuid4().hex[:8]}", d)
+    assert memory.append_preference("airlines", []) == []
+    assert memory.get_preference().get("airlines") in (None, [])
+    merged = memory.append_preference("airlines", "国航")
+    assert merged == ["国航"]
+    print("✓ 空列表 append 不落库为嵌套列表")
+
+
+def test_extract_user_query_handles_structured_inputs():
+    """dict / content block 列表输入不再变成 Python repr。"""
+    from utils.user_query import extract_user_query
+
+    assert (
+        extract_user_query({"context": {"rewritten_query": "住宿标准"}})
+        == "住宿标准"
+    )
+    assert (
+        extract_user_query({"content": [{"type": "text", "text": "杭州天气"}]})
+        == "杭州天气"
+    )
+    assert (
+        extract_user_query([{"type": "text", "text": "报销流程"}]) == "报销流程"
+    )
+    assert extract_user_query({"context": {"user_query": "出差申请"}}) == "出差申请"
+    print("✓ 结构化用户提问输入归一为纯文本")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_json_parse_fallback()
@@ -240,6 +335,12 @@ if __name__ == "__main__":
     test_robust_json_parse_fallback_after_braces()
     test_extract_first_json_object_ignores_prose_braces()
     test_extract_first_json_object_empty_text()
+    test_extract_first_json_object_rejects_nested_fragments()
+    test_extract_first_json_object_skips_nan_candidate()
+    test_robust_json_parse_rejects_nan()
+    test_merge_preference_value_empty_list()
+    test_append_preference_empty_list_not_persisted_as_nested()
+    test_extract_user_query_handles_structured_inputs()
     test_increment_query_count_fresh_data()
     test_increment_query_count_legacy_data()
     test_delete_all_does_not_resurrect_data()
