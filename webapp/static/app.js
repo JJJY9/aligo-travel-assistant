@@ -37,22 +37,44 @@ const PREF_NAMES = {
   budget_level: "预算等级",
 };
 
-function safeStorageGet(storage, key) {
-  // 浏览器禁用网站数据（隐私设置 / 沙箱 iframe）时 getItem 抛 SecurityError：
-  // 顶层状态初始化不能因此中断整个脚本（否则页面所有交互都失效）
+// 存储访问一律按「种类」取对象：隐私设置 / 沙箱 iframe 下访问
+// window.sessionStorage 这个属性本身就会抛 SecurityError——把对象作为
+// 实参传入时，异常发生在调用之前，helper 里的 try 根本接不住
+function _storage(kind) {
+  return kind === "local" ? window.localStorage : window.sessionStorage;
+}
+
+function safeStorageGet(kind, key) {
   try {
-    return storage.getItem(key);
+    return _storage(kind).getItem(key);
   } catch {
     return null;
   }
 }
 
+function safeStorageSet(kind, key, value) {
+  try {
+    _storage(kind).setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safeStorageRemove(kind, key) {
+  try {
+    _storage(kind).removeItem(key);
+  } catch {
+    /* 隐私模式 / 禁用存储：忽略 */
+  }
+}
+
 const state = {
   userId:
-    safeStorageGet(sessionStorage, "aligo.userId") ||
-    safeStorageGet(localStorage, "aligo.userId") ||
+    safeStorageGet("session", "aligo.userId") ||
+    safeStorageGet("local", "aligo.userId") ||
     "web_user",
-  sessionId: safeStorageGet(sessionStorage, "aligo.sessionId") || null,
+  sessionId: safeStorageGet("session", "aligo.sessionId") || null,
   // 初始化请求完成前不允许发送：此时页面还没展示已保存会话的历史，
   // 发送会把消息写进一个界面从未展示过的旧会话
   ready: false,
@@ -99,7 +121,15 @@ const state = {
 };
 
 function isValidId(value) {
-  return /^[A-Za-z0-9_一-龥-]{1,64}$/.test(String(value || ""));
+  // 与服务端 _ID_PATTERN（Python \w，含任意 Unicode 字母数字）同一集合：
+  // CLI / API 建出的 accented / 其它语种用户 ID 在面板里也要能切换
+  const text = String(value || "");
+  if (!text || text.length > 64) return false;
+  try {
+    return /^[\p{L}\p{N}_-]+$/u.test(text);
+  } catch {
+    return /^[A-Za-z0-9_一-龥-]{1,64}$/.test(text);
+  }
 }
 
 /* 深链接：?user=...&session=... 可直接打开某个会话 */
@@ -110,12 +140,12 @@ function isValidId(value) {
     if (urlUser && isValidId(urlUser)) {
       state.userId = urlUser;
       // 分享链接只作为当前标签页的临时身份，不覆盖本地长期身份
-      sessionStorage.setItem("aligo.userId", urlUser);
+      safeStorageSet("session", "aligo.userId", urlUser);
     }
     const urlSession = params.get("session");
     if (urlSession && isValidId(urlSession)) {
       state.sessionId = urlSession;
-      sessionStorage.setItem("aligo.sessionId", urlSession);
+      safeStorageSet("session", "aligo.sessionId", urlSession);
     }
   } catch {
     /* 忽略非法的 URL 参数 */
@@ -252,7 +282,10 @@ function escapeHtml(text) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+    .replace(/'/g, "&#39;")
+    // 行内代码占位符使用私用区 U+E000/U+E001：用户内容里出现同样字符时
+    // 会被占位恢复步骤替换成代码内容（注入），必须在这里替换掉
+    .replace(/[\uE000\uE001]/g, "\uFFFD");
 }
 
 function highlightSnippet(text, query) {
@@ -260,18 +293,22 @@ function highlightSnippet(text, query) {
   const needle = String(query || "").trim();
   if (!needle) return escapeHtml(source);
 
-  const lowerSource = source.toLowerCase();
-  const lowerNeedle = needle.toLowerCase();
-  let cursor = 0;
-  let found = lowerSource.indexOf(lowerNeedle, cursor);
-  if (found < 0) return escapeHtml(source);
-
+  // 大小写不敏感匹配直接在原文上做：toLowerCase 可能改变字符串长度
+  // （如 İ → i̇ 变成两个码点），用它算出的下标去切原文会错位
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(escaped, "gi");
   const parts = [];
-  while (found >= 0) {
+  let cursor = 0;
+  let match = pattern.exec(source);
+  if (!match) return escapeHtml(source);
+  while (match) {
+    const found = match.index;
     parts.push(escapeHtml(source.slice(cursor, found)));
-    parts.push(`<mark>${escapeHtml(source.slice(found, found + needle.length))}</mark>`);
-    cursor = found + needle.length;
-    found = lowerSource.indexOf(lowerNeedle, cursor);
+    parts.push(
+      `<mark>${escapeHtml(source.slice(found, found + match[0].length))}</mark>`,
+    );
+    cursor = found + match[0].length;
+    match = pattern.exec(source);
   }
   parts.push(escapeHtml(source.slice(cursor)));
   return parts.join("");
@@ -395,8 +432,10 @@ function renderInline(raw) {
   });
   text = text
     // URL 允许一层嵌套括号（维基百科 / Microsoft Learn 等常见）
+    // 链接文字限定 1-500 字且内部不允许再出现 [：超长行里每个 '[' 都
+    // 让 [^]]+ 扫到行尾（二次方回溯），渲染大回答时卡住主线程
     .replace(
-      /\[([^\]]+)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g,
+      /\[([^\[\]\n]{1,500})\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
     )
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -430,12 +469,15 @@ function renderMarkdown(text) {
   while (index < lines.length) {
     const line = lines[index];
 
-    const fence = line.match(/^```([\w+-]*)\s*$/);
+    const fence = line.match(/^(`{3,})([\w+-]*)\s*$/);
     if (fence) {
       flushParagraph();
+      const fenceLength = fence[1].length;
+      // 闭围栏必须至少同样长：四反引号围栏里可以安全包含三反引号代码块
+      const closing = new RegExp("^`{" + fenceLength + ",}" + "\\s*$");
       const code = [];
       index += 1;
-      while (index < lines.length && !/^```/.test(lines[index])) {
+      while (index < lines.length && !closing.test(lines[index])) {
         code.push(lines[index]);
         index += 1;
       }
@@ -1676,7 +1718,7 @@ function newSession() {
   state.sessionLoading = false;
   state.sessionLoadingId = null;
   state.sessionId = null;
-  sessionStorage.removeItem("aligo.sessionId");
+  safeStorageRemove("session", "aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
   showWelcome();
@@ -2101,7 +2143,7 @@ async function openSession(sessionId, options = {}) {
       return;
     }
     state.sessionId = sessionId;
-    sessionStorage.setItem("aligo.sessionId", sessionId);
+    safeStorageSet("session", "aligo.sessionId", sessionId);
     syncSessionControls();
 
     const session = state.sessions.find((item) => item.session_id === sessionId);
@@ -2151,7 +2193,7 @@ async function openSession(sessionId, options = {}) {
       // 被写进界面从未展示过的隐藏会话。后台静默刷新（停止生成后的同步）
       // 传 keepOnError，临时失败不能把已知存在的会话从界面上清掉
       state.sessionId = null;
-      sessionStorage.removeItem("aligo.sessionId");
+      safeStorageRemove("session", "aligo.sessionId");
       syncSessionControls();
       showWelcome();
     }
@@ -2262,7 +2304,7 @@ async function deleteSession(sessionId) {
       // 不用 newSession()：它会自增会话加载序号，把正在进行的其它会话
       // 切换一并作废
       state.sessionId = null;
-      sessionStorage.removeItem("aligo.sessionId");
+      safeStorageRemove("session", "aligo.sessionId");
       syncSessionControls();
       setConversationTitle("新对话");
       showWelcome();
@@ -2449,7 +2491,7 @@ async function readEventStream(body, onEvent) {
 
 function resetDeletedSessionState(restoreText) {
   state.sessionId = null;
-  sessionStorage.removeItem("aligo.sessionId");
+  safeStorageRemove("session", "aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
   // 会话被删除后必须清空消息区：否则旧对话继续显示，后续消息写进全新
@@ -2486,7 +2528,7 @@ function handleStreamEvent(assistant, event, userText) {
     case "session": {
       if (event.session_id) {
         state.sessionId = event.session_id;
-        sessionStorage.setItem("aligo.sessionId", event.session_id);
+        safeStorageSet("session", "aligo.sessionId", event.session_id);
         syncSessionControls();
         if (els.convTitle.textContent === "新对话") {
           setConversationTitle(clampText(state.lastUserText, 40));
@@ -2497,7 +2539,7 @@ function handleStreamEvent(assistant, event, userText) {
     case "done": {
       if (event.session_id) {
         state.sessionId = event.session_id;
-        sessionStorage.setItem("aligo.sessionId", event.session_id);
+        safeStorageSet("session", "aligo.sessionId", event.session_id);
         syncSessionControls();
       }
       if (els.convTitle.textContent === "新对话") {
@@ -3453,7 +3495,7 @@ function currentTheme() {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   try {
-    localStorage.setItem("aligo.theme", theme);
+    safeStorageSet("local", "aligo.theme", theme);
   } catch {
     /* 隐私模式下忽略 */
   }
@@ -3478,7 +3520,7 @@ function focusSearch() {
     // 折叠的侧栏带 inert，里面的搜索框无法聚焦：先展开再聚焦
     els.app.classList.remove("side-collapsed");
     try {
-      localStorage.setItem("aligo.sideCollapsed", "0");
+      safeStorageSet("local", "aligo.sideCollapsed", "0");
     } catch {
       /* 忽略 */
     }
@@ -3508,7 +3550,7 @@ function toggleSidebar() {
   } else {
     const collapsed = els.app.classList.toggle("side-collapsed");
     try {
-      localStorage.setItem("aligo.sideCollapsed", collapsed ? "1" : "0");
+      safeStorageSet("local", "aligo.sideCollapsed", collapsed ? "1" : "0");
     } catch {
       /* 忽略 */
     }
@@ -3538,7 +3580,7 @@ function closeMobileSidebar() {
 }
 
 function restoreSidebar() {
-  if (!isMobile() && localStorage.getItem("aligo.sideCollapsed") === "1") {
+  if (!isMobile() && safeStorageGet("local", "aligo.sideCollapsed") === "1") {
     els.app.classList.add("side-collapsed");
   }
   syncSidebarA11y();
@@ -4408,7 +4450,16 @@ function trapShortcutFocus(event) {
 }
 
 function openMemorySheet() {
-  memorySheetOpener = document.activeElement;
+  // 打开者是 body / 弹层内部控件时记住它没有意义：关闭时 focus 会落回
+  // body 或已被隐藏的元素，回退按钮才是稳定落点（与 openShortcuts 同款）
+  const active = document.activeElement;
+  memorySheetOpener =
+    active &&
+    active !== document.body &&
+    active !== document.documentElement &&
+    !els.memorySheet.contains(active)
+      ? active
+      : els.memoryBtn || null;
   els.userIdInput.value = state.userId;
   els.memorySheet.hidden = false;
   els.closeMemory.focus();
@@ -4487,13 +4538,13 @@ async function saveUser() {
     state.searchQuery = "";
     clearTimeout(searchTimer);
     try {
-      localStorage.setItem("aligo.userId", value);
-      sessionStorage.setItem("aligo.userId", value);
+      safeStorageSet("local", "aligo.userId", value);
+      safeStorageSet("session", "aligo.userId", value);
     } catch {
       /* 忽略 */
     }
     state.sessionId = null;
-    sessionStorage.removeItem("aligo.sessionId");
+    safeStorageRemove("session", "aligo.sessionId");
     syncSessionControls();
     setConversationTitle("新对话");
     showWelcome();
