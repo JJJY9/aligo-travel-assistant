@@ -42,6 +42,7 @@ _SUSPICIOUS_DOMAIN_PATTERN = re.compile(
 )
 # 域名主体若为长随机字母（无明显词），则过滤
 _RANDOM_DOMAIN_PATTERN = re.compile(r"^[a-z0-9]{10,}$", re.IGNORECASE)
+_VOWELS = set("aeiou")
 
 
 def _is_suspicious_url(url: str) -> bool:
@@ -64,7 +65,11 @@ def _is_suspicious_url(url: str) -> bool:
         # 带 www 的随机域名反而漏过
         labels = [label for label in host.split(".") if label]
         name = labels[-2] if len(labels) >= 2 else (labels[0] if labels else "")
-        return bool(len(name) >= 10 and _RANDOM_DOMAIN_PATTERN.match(name))
+        if len(name) >= 10 and _RANDOM_DOMAIN_PATTERN.match(name):
+            # 长随机串通常含数字或没有元音字母；skyscanner / tripadvisor
+            # 这类真实站点名是普通英文单词，不能一律判为随机域名
+            return any(ch.isdigit() for ch in name) or not (set(name) & _VOWELS)
+        return False
     except Exception:
         return False
 
@@ -223,6 +228,32 @@ class InformationQueryAgent(AgentBase):
         ]
         q = (query or "").strip()
 
+        _CITY_PUNCT = "，。、！？；：,.!?;:…—-~～（）()《》\"'“”‘’ \t"
+
+        def _clean_city_head(text: str) -> str:
+            """去掉方向动词 / 时间词 / 助词 / 标点：'去东京，' → '东京'。"""
+            value = text.strip(_CITY_PUNCT)
+            value = re.sub(
+                r"^(?:请问|请|麻烦|帮我|帮忙|我想|想知道|查一下|查查|查询|看看|看一下|一下)+",
+                "",
+                value,
+            )
+            value = re.sub(r"^(?:去|到|飞往|飞|往|在|从|至)+", "", value)
+            value = re.sub(
+                r"(?:明天|今天|后天|昨天|大后天|周[一二三四五六日末]|下周|这周|本周|"
+                r"未来|这几天|近期|\d+天|几天|三天|两天|一周)",
+                "",
+                value,
+            )
+            value = value.strip(_CITY_PUNCT)
+            value = re.sub(
+                r"(?:这两天|这几天|那几天|几天|那边|这边|当地|出差|旅行|旅游|"
+                r"开会|办事|会|这|那|呢|吗|啊|呀|的)+$",
+                "",
+                value,
+            )
+            return value.strip(_CITY_PUNCT)
+
         def _destination_city(dest_text: str) -> str:
             """从目的地一侧的文本提取城市；提不到返回空串。"""
             hits_ = [
@@ -234,13 +265,11 @@ class InformationQueryAgent(AgentBase):
                 hits_.sort()
                 return hits_[0][2]
             # 非内置常见城市（如「纽约」）：截到 的 / 天气 / 气温 之前的
-            # 2~6 个连续中文字，并去掉出行目的后缀
+            # 2~6 个连续中文字，并去掉方向动词、助词与出行目的后缀
             head = re.split(
                 r"(?:的|天气|气温|怎么样|如何)", dest_text, maxsplit=1
             )[0]
-            for suffix in ("出差", "旅行", "旅游", "开会", "办事"):
-                head = head.removesuffix(suffix)
-            head = head.strip()
+            head = _clean_city_head(head)
             if 2 <= len(head) <= 6 and re.fullmatch(r"[一-龥]+", head):
                 return head
             return ""
@@ -283,6 +312,7 @@ class InformationQueryAgent(AgentBase):
             "",
             head,
         )
+        head = _clean_city_head(head)
         match = re.search(r"[一-龥]{2,4}", head)
         return match.group(0).strip() if match else ""
 

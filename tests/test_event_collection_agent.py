@@ -140,10 +140,19 @@ def test_non_object_payload_does_not_crash():
     print("✓ 非对象 payload 不崩溃")
 
 
+def test_reply_none_returns_valid_content():
+    """reply(None) 的返回内容必须是 agentscope 合法类型，且为空结果。"""
+    reply = asyncio.run(_load_agent_class()(model=None).reply(None))
+    assert isinstance(reply.content, str)
+    assert json.loads(reply.content) == {}
+    print("✓ reply(None) 返回合法空 JSON")
+
+
 if __name__ == "__main__":
     test_string_preference_not_split()
     test_list_preference_joined()
     test_result_parsed()
     test_user_query_preferred_over_whole_context()
     test_non_object_payload_does_not_crash()
+    test_reply_none_returns_valid_content()
     print("\n全部通过")

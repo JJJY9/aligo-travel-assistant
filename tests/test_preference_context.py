@@ -87,7 +87,36 @@ def test_falls_back_to_rewritten_query():
     print("✓ 缺少 user_query 时回退 rewritten_query")
 
 
+def test_non_object_payload_does_not_crash():
+    """顶层非对象与 context 非对象按纯文本处理，不能 AttributeError。"""
+    for content in (
+        "[1,2]",
+        "null",
+        "42",
+        '"我喜欢住汉庭"',
+        '{"context": null}',
+        '{"context": "x"}',
+        '{"context": [1]}',
+    ):
+        model = _FakeModel()
+        agent = PreferenceAgent(model=model, memory_manager=_FakeMemory())
+        asyncio.run(agent.reply(Msg(name="user", content=content, role="user")))
+        assert model.prompts, f"{content} 未调用模型"
+    print("✓ 非对象 payload 按纯文本处理")
+
+
+def test_reply_none_returns_valid_content():
+    """reply(None) 的返回内容必须是 agentscope 合法类型（str / block 列表）。"""
+    agent = PreferenceAgent(model=_FakeModel(), memory_manager=_FakeMemory())
+    reply = asyncio.run(agent.reply(None))
+    assert isinstance(reply.content, str)
+    assert json.loads(reply.content) == {}
+    print("✓ reply(None) 返回合法空 JSON")
+
+
 if __name__ == "__main__":
     test_prefers_user_query_over_rewritten()
     test_falls_back_to_rewritten_query()
+    test_non_object_payload_does_not_crash()
+    test_reply_none_returns_valid_content()
     print("\n全部通过")

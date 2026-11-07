@@ -71,18 +71,29 @@ class MemoryQueryAgent(AgentBase):
             input_data = json.loads(input_content) if isinstance(input_content, str) else input_content
         except json.JSONDecodeError:
             input_data = {"context": {"rewritten_query": str(input_content)}}
+        if not isinstance(input_data, dict):
+            # 顶层数组 / 数字 / null（含 JSON 编码过的纯文本）：按原文处理，
+            # 直接 .get 会 AttributeError
+            input_data = {"context": {"rewritten_query": str(input_content)}}
 
         # 获取用户查询
-        context = input_data.get("context", {})
+        context = input_data.get("context")
+        if not isinstance(context, dict):
+            context = {}
         user_query = context.get("rewritten_query", "")
-        if not user_query:
+        if not isinstance(user_query, str) or not user_query.strip():
+            user_query = ""
             # 尝试从 recent_dialogue 获取最后一条用户消息
-            recent_dialogue = context.get("recent_dialogue", [])
-            if recent_dialogue:
-                for msg in reversed(recent_dialogue):
-                    if msg.get("role") == "user":
-                        user_query = msg.get("content", "")
-                        break
+            recent_dialogue = context.get("recent_dialogue")
+            if not isinstance(recent_dialogue, list):
+                recent_dialogue = []
+            for msg in reversed(recent_dialogue):
+                if not isinstance(msg, dict) or msg.get("role") != "user":
+                    continue
+                content_text = msg.get("content")
+                if isinstance(content_text, str) and content_text.strip():
+                    user_query = content_text
+                    break
 
         # 同会话追问需要当前会话的最近对话，不能只看其它会话的长期摘要
         raw_dialogue = context.get("recent_dialogue")

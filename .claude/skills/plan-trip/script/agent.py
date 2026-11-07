@@ -70,7 +70,9 @@ class ItineraryPlanningAgent(AgentBase):
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
-            return Msg(name=self.name, content={}, role="assistant")
+            # Msg.content 必须是 str 或 content block 列表（agentscope 断言）；
+            # 传 {} 会让 reply(None) 直接 AssertionError
+            return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
         content = x.content if not isinstance(x, list) else x[-1].content
@@ -117,6 +119,12 @@ class ItineraryPlanningAgent(AgentBase):
             user_preferences = content.get("user_preferences")
             if not isinstance(user_preferences, dict):
                 user_preferences = {}
+        else:
+            # agentscope content block 列表（Msg.content 的合法类型）：拼出
+            # 文本块作为用户需求，不能静默丢弃让规划基于空需求生成
+            from utils.user_query import extract_user_query
+
+            user_query = extract_user_query(content)
 
         # 整合所有可用信息
         all_info = {

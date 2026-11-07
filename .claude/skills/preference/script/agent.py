@@ -33,7 +33,9 @@ class PreferenceAgent(AgentBase):
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
-            return Msg(name=self.name, content={}, role="assistant")
+            # Msg.content 必须是 str 或 content block 列表（agentscope 断言）；
+            # 传 {} 会让 reply(None) 直接 AssertionError
+            return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
         content = x.content if not isinstance(x, list) else x[-1].content
@@ -42,7 +44,14 @@ class PreferenceAgent(AgentBase):
         if isinstance(content, str):
             try:
                 data = json.loads(content)
-                context = data.get("context", {})
+            except json.JSONDecodeError:
+                data = None
+            # 顶层 / context 可能不是对象（数组 / 数字 / null）：直接 .get 会
+            # AttributeError 绕过上面的兜底，按纯文本输入处理
+            if isinstance(data, dict):
+                context = data.get("context")
+                if not isinstance(context, dict):
+                    context = {}
                 # 优先使用用户本轮原话：只从用户自己的表述中抽取偏好，
                 # 避免把上下文或助手建议（如行程里提到的舱位）误记为用户偏好
                 user_query = (
@@ -50,7 +59,7 @@ class PreferenceAgent(AgentBase):
                     or context.get("rewritten_query", "")
                     or str(data)
                 )
-            except json.JSONDecodeError:
+            else:
                 user_query = content
         else:
             user_query = str(content)
