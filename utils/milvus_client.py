@@ -108,23 +108,34 @@ def next_entity_id(
 
 
 def reset_milvus_client(db_path: str) -> None:
-    """关闭并移除某个数据库路径的共享客户端（重连时使用）。"""
+    """关闭并移除某个数据库路径的共享客户端（重连时使用）。
+
+    关闭放在锁内：并发 reset / get 时，不会有线程在 pop 之后、close 之前
+    拿到新建客户端，也不会把正在被关闭的对象再发给调用方。已经持有旧
+    客户端的在途请求无法阻止（Milvus Lite 不支持事务性替换）——调用方
+    失败后由 ``_ensure_connection`` 重试。
+    """
     with _LOCK:
         client = _CLIENTS.pop(db_path, None)
-    if client is not None:
-        try:
-            client.close()
-        except Exception:  # noqa: BLE001 - 关闭失败不影响重连
-            pass
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响重连
+                pass
 
 
 def shutdown_milvus_clients() -> None:
-    """关闭并清空所有共享客户端（测试或进程退出前使用）。"""
+    """关闭并清空所有共享客户端（测试或进程退出前使用）。
+
+    关闭同样放在锁内，避免与并发的 ``get_milvus_client`` 交错。注意
+    milvus-lite 的本地 server / 数据库句柄不一定随 ``close()`` 释放，
+    数据库文件锁可能保持到进程退出（README 已知限制）。
+    """
     with _LOCK:
         clients = list(_CLIENTS.values())
         _CLIENTS.clear()
-    for client in clients:
-        try:
-            client.close()
-        except Exception:  # noqa: BLE001 - 关闭失败不影响退出
-            pass
+        for client in clients:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响退出
+                pass

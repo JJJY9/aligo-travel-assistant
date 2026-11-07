@@ -107,6 +107,42 @@ def test_skill_scripts_handles_permission_error(monkeypatch):
     print("✓ 技能目录不可读时安全返回空")
 
 
+def test_sysconfig_data_dir_fallback(monkeypatch):
+    """sys.prefix 下没有技能时按 sysconfig 的 data 目录解析（系统级 Python）。"""
+    monkeypatch.delenv(skill_paths.ENV_SKILLS_DIR, raising=False)
+    with (
+        tempfile.TemporaryDirectory() as fake_pkg,
+        tempfile.TemporaryDirectory() as prefix,
+        tempfile.TemporaryDirectory() as data_dir,
+    ):
+        monkeypatch.setattr(
+            skill_paths, "__file__", str(Path(fake_pkg) / "utils" / "skill_paths.py")
+        )
+        monkeypatch.setattr(sys, "prefix", prefix)
+        installed = Path(data_dir) / ".claude" / "skills"
+        (installed / "plan-trip").mkdir(parents=True)
+        monkeypatch.setattr(
+            skill_paths, "_data_scheme_skills", lambda: installed
+        )
+        assert skill_paths.resolve_skills_root() == installed
+    print("✓ sys.prefix 无技能时回退 sysconfig data 目录")
+
+
+def test_permission_error_degrades_to_empty(monkeypatch):
+    """权限受限（EACCES）时技能解析降级为空，健康检查不崩。"""
+    monkeypatch.delenv(skill_paths.ENV_SKILLS_DIR, raising=False)
+
+    def denied(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "is_dir", denied)
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    root = skill_paths.resolve_skills_root()
+    assert isinstance(root, Path)
+    assert skill_paths.skill_scripts(root) == {}
+    print("✓ 权限受限时技能解析降级为空")
+
+
 def test_wheel_data_files_cover_skill_code():
     """pyproject 的 data-files 必须覆盖全部技能代码与声明，且不包含运行时数据。"""
     if tomllib is None:
@@ -158,4 +194,14 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     test_wheel_data_files_cover_skill_code()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_sysconfig_data_dir_fallback(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_permission_error_degrades_to_empty(mp)
+    finally:
+        mp.undo()
     print("\n全部通过")

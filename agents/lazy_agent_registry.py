@@ -129,11 +129,15 @@ class LazyAgentRegistry:
                 init_params["memory_manager"] = self.memory_manager
                 
             agent_instance = agent_class(**init_params)
-            
-            # 4. 缓存
-            self.cache[agent_name] = agent_instance
+
+            # 4. 缓存（初始化失败的实例不缓存）
+            # 知识库未初始化等场景会构造出 initialized=False 的实例：
+            # 用户补跑初始化脚本后，下一次调用应重新加载，而不是在同一
+            # 进程 / 会话里永远返回旧的「知识库尚未初始化」错误
+            if getattr(agent_instance, "initialized", True) is not False:
+                self.cache[agent_name] = agent_instance
             self.console.print(f"[dim]✓ {agent_name} 加载完成[/dim]")
-            
+
             return agent_instance
             
         except Exception as e:
