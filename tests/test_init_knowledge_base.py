@@ -219,6 +219,10 @@ def test_dimension_mismatch_rebuilds(monkeypatch):
         _prepare_dirs(module, tmp)
         monkeypatch.setattr(module, "create_chat_model", lambda: None)
         monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        import utils.knowledge_admin as admin_module
+
+        # 维度重建前会先导出库内片段：单测环境没有真实知识库，导出空集
+        monkeypatch.setattr(admin_module, "export_documents", lambda: [])
         import utils.milvus_client as milvus_module
 
         monkeypatch.setattr(
@@ -258,6 +262,102 @@ def test_multi_chunk_documents_carry_group_metadata():
         assert single and "group" not in single[0]["metadata"]
     print("✓ 多分片文档带 group 元数据")
 
+def test_preserved_semantics_by_source(monkeypatch):
+    """保留片段按来源判定：受管旧分片丢弃、用户组整组保留、残缺组丢弃。"""
+    module = _load_init_module()
+    rows = [
+        {
+            "content": "旧版内置内容",
+            "metadata": {"source": "商旅知识库文档", "file_path": "01.txt"},
+        },
+        {"content": "面板加的片段", "metadata": {"category": "住宿"}},
+        {"content": "面板加的片段 ", "metadata": {"category": "住宿"}},
+        {"content": "重复段", "metadata": {"group": "u1", "part": 1, "parts": 2}},
+        {"content": "重复段", "metadata": {"group": "u1", "part": 2, "parts": 2}},
+        {"content": "残片1", "metadata": {"group": "u2", "part": 1, "parts": 3}},
+        {"content": "残片2", "metadata": {"group": "u2", "part": 2, "parts": 3}},
+    ]
+    import utils.knowledge_admin as admin_module
+
+    monkeypatch.setattr(admin_module, "export_documents", lambda: rows)
+    preserved, warnings = module._collect_preserved_documents()
+    contents = [piece["content"] for piece in preserved]
+    assert "旧版内置内容" not in contents, "受管旧分片必须丢弃（源文件已改动）"
+    assert contents.count("面板加的片段") == 1, "单条按 strip 内容去重"
+    assert contents.count("重复段") == 2, "用户组内相同内容不得合并"
+    assert all("残片" not in content for content in contents)
+    assert warnings and "残缺" in warnings[0]
+    print("✓ 保留片段按来源判定（受管旧分片丢弃 / 组完整保留）")
+
+
+def test_export_failure_aborts_before_drop(monkeypatch):
+    """重建前导出失败必须中止：不得先删集合（面板/CLI 知识会丢失）。"""
+    module = _load_init_module()
+    calls = {"n": 0}
+    dropped = []
+
+    class FakeAgent(_RebuildAgent):
+        def __init__(self, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("知识库向量维度 1024 与嵌入模型 512 不一致")
+            super().__init__(**kwargs)
+
+    class _Client:
+        def drop_collection(self, name):
+            dropped.append(name)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        import utils.knowledge_admin as admin_module
+        import utils.milvus_client as milvus_module
+
+        def boom():
+            raise RuntimeError("db locked")
+
+        monkeypatch.setattr(admin_module, "export_documents", boom)
+        monkeypatch.setattr(
+            milvus_module, "get_milvus_client", lambda path: _Client()
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 1
+        assert dropped == [], "导出失败时不得删除集合"
+        assert calls["n"] == 1
+    print("✓ 导出失败先于删库中止")
+
+
+def test_add_in_batches_retries_and_reports(monkeypatch):
+    """分批补写：单批失败重试一次；恒失败报出批号与已补数量。"""
+    module = _load_init_module()
+    monkeypatch.setattr(module, "_PRESERVED_BATCH", 2)
+
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def add_documents(self, batch):
+            self.calls += 1
+            if self.calls == 1:
+                return {"status": "error", "message": "embed down"}
+            return {"status": "success"}
+
+    flaky = Flaky()
+    rows = [{"content": f"c{index}"} for index in range(5)]
+    module._add_in_batches(flaky, rows, "补写")
+    assert flaky.calls == 4, "首批失败一次、重试一次，共 3 批"
+
+    class Broken:
+        def add_documents(self, batch):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="第 1 批"):
+        module._add_in_batches(Broken(), rows, "补写")
+    print("✓ 分批补写重试与失败进度")
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -267,7 +367,10 @@ if __name__ == "__main__":
         test_load_failure_aborts_before_agent(_mp)
         test_self_check_failure_returns_1(_mp)
         test_dimension_mismatch_rebuilds(_mp)
+        test_preserved_semantics_by_source(_mp)
+        test_export_failure_aborts_before_drop(_mp)
     finally:
         _mp.undo()
     test_multi_chunk_documents_carry_group_metadata()
+    test_add_in_batches_retries_and_reports(pytest.MonkeyPatch())
     print("\n全部通过")
