@@ -160,6 +160,8 @@ const els = {
   exportData: byId("exportData"),
   exportDataMd: byId("exportDataMd"),
   exportSessions: byId("exportSessions"),
+  importData: byId("importData"),
+  importDataFile: byId("importDataFile"),
   overview: byId("overview"),
   addPrefBtn: byId("addPrefBtn"),
   prefForm: byId("prefForm"),
@@ -1276,6 +1278,78 @@ function exportSessionHtml() {
   // 下载是异步读取 Blob 的，稍后再释放，避免 Firefox / Safari 取消下载
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   toast("HTML 已导出");
+}
+
+const USER_IMPORT_MAX_BYTES = 50 * 1024 * 1024;
+
+async function importUserBackup() {
+  if (state.busy) {
+    toast("请等待当前回复完成");
+    return;
+  }
+  const file = els.importDataFile.files && els.importDataFile.files[0];
+  els.importDataFile.value = "";
+  if (!file) return;
+  if (file.size > USER_IMPORT_MAX_BYTES) {
+    toast("备份文件不能超过 50 MB");
+    return;
+  }
+  let backup;
+  try {
+    backup = JSON.parse(await file.text());
+  } catch {
+    toast("无法解析备份 JSON");
+    return;
+  }
+  if (!backup || typeof backup !== "object" || Array.isArray(backup)) {
+    toast("备份文件格式不正确");
+    return;
+  }
+  const counts = {
+    preferences: Object.keys(backup.preferences || {}).length,
+    trips: Array.isArray(backup.trip_history) ? backup.trip_history.length : 0,
+    messages: Array.isArray(backup.chat_history) ? backup.chat_history.length : 0,
+  };
+  if (!counts.preferences && !counts.trips && !counts.messages) {
+    toast("备份中没有可恢复的数据");
+    return;
+  }
+  const source = backup.user_id ? `（来自 ${backup.user_id}）` : "";
+  const confirmed = window.confirm(
+    `恢复备份${source}？\n偏好 ${counts.preferences} 项、行程 ${counts.trips} 条、` +
+      `聊天消息 ${counts.messages} 条将合并到当前用户 ${state.userId}。`,
+  );
+  if (!confirmed) return;
+  els.importData.disabled = true;
+  els.importData.textContent = "恢复中…";
+  try {
+    const result = await getJSON(
+      `/api/import?user_id=${encodeURIComponent(state.userId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backup }),
+      },
+    );
+    toast(
+      `已恢复：偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
+        `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条`,
+    );
+    await Promise.all([refreshStatus(), loadSessions()]);
+    if (state.sessionId) {
+      // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面
+      await openSession(state.sessionId, {
+        silent: true,
+        keepOnError: true,
+        preserveOnEmpty: true,
+      });
+    }
+  } catch (error) {
+    toast(`恢复失败：${error.message}`);
+  } finally {
+    els.importData.disabled = false;
+    els.importData.textContent = "恢复备份";
+  }
 }
 
 /* ---------- 执行路线 ---------- */
@@ -4511,6 +4585,10 @@ function bindEvents() {
       `aligo_sessions_${exportSafeName(state.userId)}.md`,
     );
   });
+  if (els.importData && els.importDataFile) {
+    els.importData.addEventListener("click", () => els.importDataFile.click());
+    els.importDataFile.addEventListener("change", importUserBackup);
+  }
 
   els.themeToggle.addEventListener("click", () => {
     applyTheme(currentTheme() === "dark" ? "light" : "dark");

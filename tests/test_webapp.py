@@ -68,6 +68,8 @@ def test_index_page():
     assert response.status_code == 200
     assert "Aligo" in response.text
     assert "下一站，去哪里" in response.text
+    # 入口页必须每次重新验证：缓存的旧 index.html 搭配新 app.js 会让整页脚本中止
+    assert response.headers.get("cache-control") == "no-cache"
     print("✓ 首页可访问（新版界面）")
 
 
@@ -4353,6 +4355,93 @@ def test_export_markdown():
         print("✓ 用户数据导出 Markdown（JSON 仍为默认）")
     finally:
         _cleanup(user_id)
+
+
+def test_user_data_import_api():
+    from context.storage import create_long_term_memory
+
+    source = _unique_user("web_test_import_src")
+    target = _unique_user("web_test_import_dst")
+    try:
+        store = create_long_term_memory(source, str(MEMORY_DIR))
+        try:
+            store.save_preference("home_location", "上海")
+            store.save_trip_history(
+                {
+                    "origin": "上海",
+                    "destination": "深圳",
+                    "start_date": "2026-12-05",
+                    "end_date": "2026-12-07",
+                    "purpose": "展会",
+                }
+            )
+            store.add_chat_message(
+                "user", "帮我安排深圳的行程", "sess-imp", timestamp="2026-11-02T08:30:00"
+            )
+            store.add_chat_message(
+                "assistant",
+                '{"reply":"好的，已安排"}',
+                "sess-imp",
+                timestamp="2026-11-02T08:30:06",
+            )
+            store.set_session_title("sess-imp", "深圳展会")
+            store.set_session_pinned("sess-imp", True)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        backup = client.get("/api/export", params={"user_id": source}).json()
+        response = client.post(
+            "/api/import", params={"user_id": target}, json={"backup": backup}
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["preferences"] == 1
+        assert payload["trips_created"] == 1 and payload["trips_updated"] == 0
+        assert payload["messages_added"] == 2 and payload["messages_skipped"] == 0
+        assert payload["titles"] == 1 and payload["pinned"] == 1
+        assert payload["skipped"] == []
+
+        # 会话可读、标题/置顶生效、时间戳保真
+        sessions = client.get("/api/sessions", params={"user_id": target}).json()
+        restored = next(
+            (s for s in sessions["sessions"] if s["session_id"] == "sess-imp"), None
+        )
+        assert restored is not None, sessions
+        assert restored["title"] == "深圳展会" and restored["pinned"] is True
+        detail = client.get("/api/sessions/sess-imp", params={"user_id": target}).json()
+        stamps = [m["timestamp"] for m in detail["messages"]]
+        assert stamps[0].startswith("2026-11-02T08:30:00"), stamps
+        assert stamps[1].startswith("2026-11-02T08:30:06")
+        status = client.get("/api/status", params={"user_id": target}).json()
+        assert status["preferences"]["home_location"] == "上海"
+
+        # 重复导入幂等
+        again = client.post(
+            "/api/import", params={"user_id": target}, json={"backup": backup}
+        ).json()
+        assert again["messages_added"] == 0 and again["messages_skipped"] == 2
+        assert again["trips_created"] == 0 and again["trips_updated"] == 1
+
+        # 没有可恢复数据 / 非法用户
+        empty = client.post(
+            "/api/import",
+            params={"user_id": target},
+            json={"backup": {"preferences": {}}},
+        )
+        assert empty.status_code == 400
+        assert "没有可恢复的数据" in empty.json()["detail"]
+        bad_user = client.post(
+            "/api/import", params={"user_id": "bad id!"}, json={"backup": backup}
+        )
+        assert bad_user.status_code == 422
+        print("✓ /api/import 恢复备份（会话/时间戳/幂等/错误路径）")
+    finally:
+        _cleanup(source)
+        _cleanup(target)
 
 
 def test_session_pin():
