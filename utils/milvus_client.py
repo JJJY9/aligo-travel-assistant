@@ -10,12 +10,16 @@ import logging
 import os
 import threading
 import time
+import weakref
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# 已发放的最大实体 id（按 客户端/集合/字段）：见 next_entity_id 的单调语义
-_LAST_IDS: dict[tuple[int, str, str], int] = {}
+# 已发放的最大实体 id（客户端对象 → (集合, 字段) → id）：弱引用键，避免
+# 不同测试 / 重连的新客户端因 CPython 复用 id() 而共享旧计数
+_LAST_IDS: "weakref.WeakKeyDictionary[Any, dict[tuple[str, str], int]]" = (
+    weakref.WeakKeyDictionary()
+)
 _ID_LOCK = threading.Lock()
 
 # gRPC 使用的 int32 上限，约 24.8 天；保持长连接避免空闲被断开
@@ -110,10 +114,14 @@ def next_entity_id(
             break
     # 进程内单调递增：删除当前最大 id 后也不复用——否则持有旧 id 的客户端
     # 会把删改操作落到另一条新知识上；客户端重连（缓存重建）后重新起算
-    state_key = (id(client), collection_name, id_field)
     with _ID_LOCK:
-        candidate = max(max_id + 1, _LAST_IDS.get(state_key, 0) + 1)
-        _LAST_IDS[state_key] = candidate
+        per_client = _LAST_IDS.get(client)
+        if per_client is None:
+            per_client = {}
+            _LAST_IDS[client] = per_client
+        state_key = (collection_name, id_field)
+        candidate = max(max_id + 1, per_client.get(state_key, 0) + 1)
+        per_client[state_key] = candidate
     return candidate
 
 

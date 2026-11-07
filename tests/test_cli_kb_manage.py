@@ -560,6 +560,11 @@ def test_update_reports_leftover_parts(monkeypatch):
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
     monkeypatch.setattr(
         knowledge_admin,
+        "get_document",
+        lambda doc_id: {"id": doc_id, "content": "旧", "metadata": {}},
+    )
+    monkeypatch.setattr(
+        knowledge_admin,
         "update_document",
         lambda doc_id, content, metadata=None: {
             "status": "success",

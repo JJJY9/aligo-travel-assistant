@@ -4935,7 +4935,7 @@ def test_knowledge_eval_api(monkeypatch):
             runs.append(strict)
             return [{"content": query}]
 
-    def fake_evaluate(search):
+    def fake_evaluate(search, **kwargs):
         search("测试", 5)
         return {
             "total": 14,
