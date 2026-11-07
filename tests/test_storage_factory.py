@@ -1479,6 +1479,42 @@ def test_trip_update_and_conflict():
     print("✓ 行程更新（字段 / 统计 / 清空日期 / 冲突拒绝）")
 
 
+def test_reload_rejects_non_object_json():
+    """磁盘文件是合法 JSON 但非对象（[] / null）：重载报错而不是沿用旧快照。"""
+    from utils.errors import MemoryPersistenceError
+
+    from context.long_term_memory import LongTermMemory
+
+    root = tempfile.mkdtemp()
+    memory = LongTermMemory("u-reload-list", root)
+    path = Path(root) / "u-reload-list.json"
+    for payload in ("[]", "null", chr(34) + "text" + chr(34)):
+        path.write_text(payload, encoding="utf-8")
+        try:
+            memory.add_chat_message("user", "Q", "s1")
+        except MemoryPersistenceError:
+            pass
+        else:
+            raise AssertionError(f"非对象 JSON 必须报错：{payload}")
+    print("✓ 非对象 JSON 重载报错")
+
+
+def test_add_chat_messages_dedupe_sees_external_writes():
+    """批量去重前在锁内重载：其它进程刚写入的相同消息会被跳过。"""
+    from context.long_term_memory import LongTermMemory
+
+    root = tempfile.mkdtemp()
+    writer = LongTermMemory("u-batch-race", root)
+    reader = LongTermMemory("u-batch-race", root)
+    writer.add_chat_message("user", "X", "s1")
+    added = reader.add_chat_messages(
+        [{"role": "user", "content": "X", "session_id": "s1"}], dedupe=True
+    )
+    assert added == 0, "外部写入的相同消息必须被去重"
+    assert len(writer.get_chat_history(session_id="s1")) == 1
+    print("✓ 批量去重感知外部写入")
+
+
 def test_pg_retry_does_not_replay_non_idempotent_write():
     """连接级错误后，非幂等写入（不去重的批量插入）不得自动重放。"""
     import psycopg

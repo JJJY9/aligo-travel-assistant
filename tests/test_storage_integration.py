@@ -75,6 +75,167 @@ def test_redis_short_term_memory():
     print("✓ Redis 短期记忆（滑动窗口 / TTL / 清空 / 全角空格裁剪）")
 
 
+def _pg_memory_or_skip():
+    if not TEST_POSTGRES_DSN:
+        pytest.skip("未设置 TEST_POSTGRES_DSN")
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    user_id = f"pytest-{uuid.uuid4().hex[:8]}"
+    try:
+        return PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN), user_id
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"PostgreSQL 不可用: {exc}")
+
+
+def test_redis_truncate_replay_keeps_newer_messages():
+    """故障期截断按 cutoff 重放：发起时刻之后其它实例写入的消息不能误删。"""
+    client = _redis_client_or_skip()
+    from context import short_term_memory as module
+
+    session_id = f"pytest-{uuid.uuid4().hex[:8]}"
+    memory = module.RedisShortTermMemory(
+        client, session_id, max_turns=10, ttl_sec=60, user_id="pytest-user"
+    )
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    real_client = memory.client
+
+    class _Toggle:
+        def __init__(self):
+            self.fail = True
+
+        def __getattr__(self, name):
+            attr = getattr(real_client, name)
+            if not callable(attr):
+                return attr
+
+            def wrapper(*args, **kwargs):
+                if self.fail:
+                    raise ConnectionError("redis down")
+                return attr(*args, **kwargs)
+
+            return wrapper
+
+    toggle = _Toggle()
+    memory.client = toggle  # type: ignore[assignment]
+    assert memory.truncate_last_turn(expect="Q1") == 0, "故障期只登记延迟操作"
+    assert [kind for kind, _ in memory._pending_ops] == ["truncate"]
+
+    import json as _json
+    from datetime import datetime, timedelta
+
+    future = (datetime.now() + timedelta(minutes=1)).isoformat()
+
+    real_client.lpush(
+        memory.key,
+        _json.dumps(
+            {
+                "role": "user",
+                "content": "C-new",
+                "timestamp": future,
+                "metadata": {},
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    toggle.fail = False
+    module._redis_degraded_until = 0.0
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["C-new"], contents
+    assert memory.get_statistics()["total_messages"] == 1
+    print("✓ Redis 截断重放保留 cutoff 之后的新消息")
+
+
+def test_pg_delete_last_turn_expect_and_archived_cleanup():
+    """PG delete_last_turn：expect 不匹配不删；删空会话清理归档标记。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        memory.add_chat_messages(
+            [
+                {"role": "user", "content": "Q1", "session_id": "s-lt"},
+                {"role": "assistant", "content": "A1", "session_id": "s-lt"},
+            ]
+        )
+        assert memory.set_session_archived("s-lt", True)
+        assert memory.delete_last_turn("s-lt", expect="不匹配") == 0
+        assert len(memory.get_chat_history(session_id="s-lt")) == 2
+        assert "s-lt" in memory.get_archived_sessions()
+        assert memory.delete_last_turn("s-lt", expect="Q1") == 2
+        assert memory.get_chat_history(session_id="s-lt") == []
+        assert "s-lt" not in memory.get_archived_sessions()
+        print("✓ PG delete_last_turn expect 校验与归档清理")
+    finally:
+        memory.close()
+
+
+def test_pg_save_trip_histories_counts_mixed_batch():
+    """PG 批量保存：同批「已存在 + 新建」的 created/updated 计数正确。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        base = {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+        }
+        memory.save_trip_history(dict(base))
+        created, updated = memory.save_trip_histories(
+            [
+                dict(base),
+                {**base, "destination": "杭州", "start_date": "2026-12-02"},
+            ]
+        )
+        assert (created, updated) == (1, 1), (created, updated)
+        assert memory.get_statistics()["total_trips"] == 2
+        print("✓ PG 批量保存 created/updated 计数")
+    finally:
+        memory.close()
+
+
+def test_pg_update_trip_concurrent_instances():
+    """两个连接并发更新同一条行程的不同字段：advisory lock 下都生效。"""
+    memory_a, user_id = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory_b = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        trip_id = memory_a.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "purpose": "出差",
+            }
+        )
+        errors = []
+
+        def _update(memory, fields):
+            try:
+                memory.update_trip(trip_id, fields)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_update, args=(memory_a, {"purpose": "会议"})),
+            threading.Thread(
+                target=_update, args=(memory_b, {"end_date": "2026-12-03"})
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not errors, errors
+        trip = memory_a.get_trip_history(limit=None)[0]
+        assert trip["purpose"] == "会议" and trip["end_date"] == "2026-12-03"
+        print("✓ PG 并发更新不同字段都生效")
+    finally:
+        memory_a.close()
+        memory_b.close()
+
+
 def test_postgres_long_term_memory():
     if not TEST_POSTGRES_DSN:
         pytest.skip("未设置 TEST_POSTGRES_DSN")

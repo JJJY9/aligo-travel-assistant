@@ -226,8 +226,14 @@ class LongTermMemory:
             raise MemoryPersistenceError(
                 f"长期记忆重载失败（{self.db_path}）：{exc}"
             ) from exc
-        if isinstance(data, dict):
-            self.data = self._migrate_data(data)
+        if not isinstance(data, dict):
+            # 合法 JSON 但不是对象（[] / null / 字符串）：与解析失败同等对待，
+            # 静默沿用旧快照会把下一次写入建立在错误的磁盘状态上
+            logger.warning("长期记忆重载失败：内容不是 JSON 对象")
+            raise MemoryPersistenceError(
+                f"长期记忆重载失败（{self.db_path}）：内容不是 JSON 对象"
+            )
+        self.data = self._migrate_data(data)
 
     def _backup_before_migration(self) -> None:
         """迁移会丢弃 / 重置坏数据前把原始文件另存一份（每个文件只留首份）。
