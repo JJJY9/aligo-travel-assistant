@@ -28,6 +28,7 @@ class _FakeMemory:
     def __init__(self):
         self.threads: dict[str, int] = {}
         self.events: list[tuple[str, str]] = []
+        self.staged: list[tuple[str, str]] = []
         self.long_term = self
         self.short_term = self
 
@@ -46,6 +47,14 @@ class _FakeMemory:
     async def get_long_term_summary_async(self, max_messages=30):
         assert max_messages == 30
         return "历史总结"
+
+    def stage_message(self, role, content, metadata=None):
+        self.threads[f"stage-{role}"] = threading.get_ident()
+        self.staged.append((role, content))
+
+    def persist_message(self, role, content):
+        self.threads[f"persist-{role}"] = threading.get_ident()
+        self.events.append((role, content))
 
     def add_message(self, role, content, metadata=None):
         self.threads[f"add-{role}"] = threading.get_ident()
@@ -109,12 +118,13 @@ def test_ask_runs_memory_io_off_event_loop():
 
     assert result["reply"]
     assert result["elapsed"] >= 0
-    for name in ("reload", "preferences", "recent", "add-user", "add-assistant"):
+    for name in ("reload", "preferences", "recent", "stage-user", "persist-user", "add-assistant"):
         assert name in memory.threads, f"{name} 未被调用"
         assert memory.threads[name] != loop_thread, (
             f"{name} 在事件循环线程执行，会阻塞其它连接"
         )
     assert [role for role, _ in memory.events] == ["user", "assistant"]
+    assert memory.staged and memory.staged[0] == ("user", "你好"), "编排前先暂存本轮提问"
     # 偏好进了系统提示，最近对话按顺序跟在后面
     system_msg = runtime.intention_agent.context[0]
     assert system_msg.role == "system"
@@ -123,6 +133,42 @@ def test_ask_runs_memory_io_off_event_loop():
     roles = [msg.role for msg in runtime.intention_agent.context]
     assert roles[-2:] == ["user", "user"]
     print("✓ ask 的记忆读写全部离开事件循环线程")
+
+
+def test_failed_orchestration_leaves_no_long_term_user_turn():
+    """编排失败时长期记忆不留孤儿用户提问，短期上下文保留本轮提问。"""
+    runtime, memory = _make_runtime()
+
+    async def _direct(factory, max_retries=0, base_delay=0.0, max_delay=0.0):
+        return await factory()
+
+    runtime._call_with_resilience = _direct  # type: ignore[method-assign]
+
+    class _BoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise RuntimeError("gateway down")
+
+    runtime.orchestrator = _BoomOrchestrator()
+    with pytest.raises(RuntimeError):
+        asyncio.run(runtime.ask("你好"))
+    assert memory.events == [], "失败时不得写长期记忆"
+    assert memory.staged == [("user", "你好")], "短期上下文保留本轮提问"
+    print("✓ 编排失败不落孤儿用户轮（Web 与 CLI 同契约）")
+
+
+def test_malformed_recent_context_entries_are_skipped():
+    """可解析但形状不对的短期条目不能让 _build_context 抛 KeyError。"""
+    runtime, memory = _make_runtime()
+    memory.get_recent_context = lambda n_turns=5: [  # type: ignore[method-assign]
+        {"foo": 1},
+        {"role": "user"},
+        {"role": "user", "content": "正常消息"},
+    ]
+    result = asyncio.run(runtime.ask("你好"))
+    assert result["reply"]
+    contents = [msg.content for msg in runtime.intention_agent.context]
+    assert "正常消息" in contents
+    print("✓ 形状非法的短期条目被跳过")
 
 
 def test_ask_survives_memory_snapshot_shape():
@@ -233,6 +279,8 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_ask_runs_memory_io_off_event_loop()
+        test_failed_orchestration_leaves_no_long_term_user_turn()
+        test_malformed_recent_context_entries_are_skipped()
         test_ask_survives_memory_snapshot_shape()
         test_ask_releases_half_open_probe_on_early_failure(mp)
     finally:

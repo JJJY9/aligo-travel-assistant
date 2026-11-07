@@ -1130,6 +1130,45 @@ def test_read_skips_unparsable_entries(monkeypatch):
     print("✓ 读取跳过无法解析的条目")
 
 
+def test_read_skips_malformed_message_objects(monkeypatch):
+    """可解析但缺 role/content 的条目同样跳过（否则下游 KeyError 每轮 500）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        '{"foo": 1}',
+        '{"role": "user"}',
+        _message("user", "正常消息", "2000-01-01T00:00:00"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-badshape", max_turns=5, user_id="u1")
+    assert [item["content"] for item in memory.get_recent_context()] == ["正常消息"]
+    assert module.redis_short_term_degraded() is False
+    print("✓ 读取跳过形状非法的条目")
+
+
+def test_statistics_tolerates_non_object_entries(monkeypatch):
+    """可解析但非对象的条目不能让 get_statistics 误判 Redis 故障（进程级冷却）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = ["null", _message("user", "正常", "2000-01-01T00:00:00")]
+
+    def lindex(key, index):
+        client._check()
+        return client.data[index]
+
+    client.lindex = lindex  # type: ignore[method-assign]
+    memory = module.RedisShortTermMemory(client, "s-stat", max_turns=5, user_id="u1")
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 2
+    assert stats["oldest_message_time"] is None
+    assert stats["newest_message_time"] == "2000-01-01T00:00:00"
+    assert module.redis_short_term_degraded() is False
+    print("✓ 统计口径容忍非对象条目且不触发降级")
+
+
 def test_outage_truncate_without_expect_replays(monkeypatch):
     """未提供 expect 的最后一轮删除在故障期也要登记，恢复后补删。"""
     from context import short_term_memory as module
