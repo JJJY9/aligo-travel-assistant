@@ -59,7 +59,9 @@ _USAGE = {
 def test_build_and_roundtrip():
     meta = build_turn_meta(_INTENTION, _RESULT, usage=_USAGE, elapsed=3.14159)
     assert meta["schedule"][0]["agent_name"] == "preference"
-    assert meta["agents"] == [{"name": "preference", "status": "success", "duration": 1.23}]
+    assert meta["agents"] == [
+        {"name": "preference", "status": "success", "duration": 1.23}
+    ]
     assert meta["elapsed"] == 3.14
     assert meta["usage"] == _USAGE
 
@@ -71,6 +73,22 @@ def test_build_and_roundtrip():
     assert "results" in json.loads(strip_turn_meta(stored))
     assert "_meta" not in json.loads(strip_turn_meta(stored))
     print("✓ 元数据构建 / 附加 / 提取 / 剥离")
+
+
+def test_schedule_names_are_canonicalized():
+    """技能目录名在元数据里归一为标准名：执行路线匹配不到 results 时会误显示成功。"""
+    intention = {
+        "agent_schedule": [
+            {"agent_name": "plan-trip", "priority": 2, "reason": "规划"},
+            {"agent_name": " ask-question ", "priority": 1, "reason": "查询"},
+        ]
+    }
+    meta = build_turn_meta(intention, {"results": []})
+    assert [item["agent_name"] for item in meta["schedule"]] == [
+        "itinerary_planning",
+        "rag_knowledge",
+    ], "技能目录名（含空白）归一为标准名"
+    print("✓ 执行路线的调度名按标准名归一")
 
 
 def test_markdown_ignores_meta():
@@ -92,4 +110,5 @@ if __name__ == "__main__":
     test_build_and_roundtrip()
     test_markdown_ignores_meta()
     test_invalid_content()
+    test_schedule_names_are_canonicalized()
     print("\n全部通过")

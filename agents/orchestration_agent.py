@@ -23,6 +23,7 @@ from typing import Any
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
+from utils.agent_names import SKILL_AGENT_NAMES as _SKILL_AGENT_NAMES
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import has_preference_value, merge_preference_value
 
@@ -90,19 +91,8 @@ def _transient_agent_error(response: Any) -> str | None:
     return None
 
 # 注册器同时接受技能目录名与旧智能体名（plan-trip / event-collection 等）；
-# 下游的聚合、记忆写入与前端展示统一使用旧名称
-_SKILL_AGENT_NAMES = {
-    "plan-trip": "itinerary_planning",
-    "event-collection": "event_collection",
-    "ask-question": "rag_knowledge",
-    "memory-query": "memory_query",
-    "query-info": "information_query",
-}
-
-
-def canonical_agent_name(agent_name: str) -> str:
-    """把技能目录名统一为标准智能体名（未知名称原样返回）。"""
-    return _SKILL_AGENT_NAMES.get(agent_name, agent_name)
+# 下游的聚合、记忆写入与前端展示统一使用旧名称。映射放在
+# utils.agent_names，供轮次元数据等模块共用
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 

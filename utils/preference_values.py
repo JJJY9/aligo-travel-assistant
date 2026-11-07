@@ -28,6 +28,8 @@ def merge_preference_value(current: Any, value: Any) -> list[Any]:
     for item in incoming:
         if item not in merged:
             merged.append(item)
-    if not merged:
+    # 兜底只在「新值本身有意义」时启用：value 为空列表时按未设置返回 []，
+    # 否则会把 [] 塞进列表得到 [[]]（正是本函数要避免的嵌套列表）
+    if not merged and has_preference_value(value):
         merged = [value]
     return merged

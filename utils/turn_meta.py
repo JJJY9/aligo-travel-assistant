@@ -14,6 +14,8 @@
 import json
 from typing import Any
 
+from utils.agent_names import canonical_agent_name
+
 META_KEY = "_meta"
 
 
@@ -35,9 +37,12 @@ def build_turn_meta(
     for item in schedule_source:
         if not isinstance(item, dict):
             continue
+        # 与调度器同一口径归一：历史执行路线用标准名去匹配 results，
+        # 技能目录名（plan-trip 等）不归一会查不到、状态默认显示「成功」
+        name = str(item.get("agent_name") or "").strip()
         schedule.append(
             {
-                "agent_name": item.get("agent_name", ""),
+                "agent_name": canonical_agent_name(name),
                 "priority": item.get("priority", 0),
                 "reason": item.get("reason", ""),
             }
