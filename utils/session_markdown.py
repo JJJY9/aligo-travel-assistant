@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.stored_message import render_stored_message
+from utils.timestamps import chronological_key
 
 
 def sanitize_title(title: str) -> str:
@@ -37,7 +38,7 @@ def group_sessions(
         grouped.setdefault(session_id, []).append(message)
     ordered = sorted(
         grouped.items(),
-        key=lambda item: str(item[1][-1].get("timestamp") or ""),
+        key=lambda item: chronological_key(item[1][-1].get("timestamp")),
         reverse=True,
     )
     return ordered

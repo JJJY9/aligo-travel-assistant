@@ -84,6 +84,7 @@ from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
 from utils.trip_export import render_trip_ics, render_trips_csv, render_trips_ics
 from utils.travel_stats import summarize_travel
+from utils.timestamps import chronological_key
 from utils.turn_meta import extract_turn_meta
 from utils.version import APP_VERSION
 from utils.weather import WeatherError, fetch_weather
@@ -94,6 +95,15 @@ logger = logging.getLogger(__name__)
 SSE_HEARTBEAT_SEC = 15.0
 # 请求体大小上限（JSON 接口都是小请求；防止超大 body 在 Pydantic 校验前耗尽内存）
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+# /api/import 要一次性接收整份备份（面板文件上限 50 MB，JSON 包装 / 转义
+# 还有额外开销）；其它路径维持 2 MB
+IMPORT_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+_BODY_LIMIT_OVERRIDES = {"/api/import": IMPORT_REQUEST_BODY_BYTES}
+
+
+def body_limit_for(path: str, default: int = MAX_REQUEST_BODY_BYTES) -> int:
+    """路径级请求体上限。"""
+    return _BODY_LIMIT_OVERRIDES.get(str(path or ""), default)
 
 # 只有环回地址视为「仅本机」；其它地址启动时提示需要反向代理做认证 / HTTPS
 def _is_loopback_host(host: str) -> bool:
@@ -206,10 +216,9 @@ class RequestContextMiddleware:
                     body_size = int(content_length)
                 except ValueError:
                     body_size = 0
-                if body_size > MAX_REQUEST_BODY_BYTES:
-                    detail = (
-                        f"请求体过大（上限 {MAX_REQUEST_BODY_BYTES // (1024 * 1024)} MB）"
-                    )
+                limit = body_limit_for(path)
+                if body_size > limit:
+                    detail = f"请求体过大（上限 {limit // (1024 * 1024)} MB）"
                     await send_wrapper(
                         {
                             "type": "http.response.start",
@@ -299,8 +308,9 @@ class BodySizeLimitMiddleware:
         received = 0
         exceeded = False
         sent_413 = False
+        limit = body_limit_for(scope.get("path", ""), self.max_bytes)
         payload = json.dumps(
-            {"detail": f"请求体过大（上限 {self.max_bytes // (1024 * 1024)} MB）"},
+            {"detail": f"请求体过大（上限 {limit // (1024 * 1024)} MB）"},
             ensure_ascii=False,
         ).encode("utf-8")
 
@@ -323,7 +333,7 @@ class BodySizeLimitMiddleware:
             message = await receive()
             if message.get("type") == "http.request":
                 received += len(message.get("body") or b"")
-                if received > self.max_bytes:
+                if received > limit:
                     exceeded = True
                     raise _BodyTooLarge()
             return message
@@ -1364,7 +1374,11 @@ def _group_sessions(
                 # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
                 entry["match_index"] = entry["message_count"] - 1
 
-    sessions = sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
+    sessions = sorted(
+        grouped.values(),
+        key=lambda item: chronological_key(item["updated_at"]),
+        reverse=True,
+    )
     custom_titles = titles or {}
     for entry in sessions:
         custom = custom_titles.get(entry["session_id"])
@@ -2963,7 +2977,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.post("/api/import")
-    def user_data_import(
+    async def user_data_import(
         payload: UserImportPayload,
         request: Request,
         response: Response,
@@ -2973,9 +2987,13 @@ def create_app(model: Any = None) -> FastAPI:
 
         恢复偏好 / 行程 / 聊天消息 / 会话标题与置顶归档；重复导入幂等
         （行程按路线+日期去重、消息按「会话/角色/内容」多重集去重）。
-        PostgreSQL 配置但不可用时用 strict 打开返回 503——恢复不能写进
-        回退的本地 JSON，否则数据库恢复后数据"消失"。
+        整个恢复持有该用户锁（与对话 / 删除串行，避免在途回合把删除的会话
+        写回或并发导入重复插入）；墓碑期（最近被删除）的会话消息会被跳过，
+        恢复不能复活已删除的会话。PostgreSQL 配置但不可用时用 strict 打开
+        返回 503——恢复不能写进回退的本地 JSON。
         """
+        import asyncio
+
         from utils.user_import import import_user_data, parse_user_export_data
 
         response.headers.update(_enforce_kb_rate_limit(state, request))
@@ -2983,17 +3001,66 @@ def create_app(model: Any = None) -> FastAPI:
         if not sections:
             detail = "；".join(errors[:3]) or "没有可恢复的数据"
             raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
-        store = _open_long_term(user_id, strict=True)
-        try:
-            counts = import_user_data(store, sections)
-        except MemoryPersistenceError as exc:
-            logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
-            raise HTTPException(status_code=503, detail="存储暂时不可用，请稍后重试") from exc
-        except Exception as exc:  # noqa: BLE001 - 写入失败统一可重试提示
-            logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
-            raise HTTPException(status_code=503, detail=f"恢复失败：{exc}") from exc
-        finally:
-            _close_long_term(store)
+
+        async with state.lock_for(user_id):
+            # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
+            # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）
+            deleted_sessions: set[str] = set()
+            for message in sections["messages"]:
+                session_id = message["session_id"]
+                if not session_id or session_id in deleted_sessions:
+                    continue
+                if await asyncio.to_thread(
+                    state.is_recently_deleted, user_id, session_id
+                ):
+                    deleted_sessions.add(session_id)
+                    errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
+            if deleted_sessions:
+                sections["messages"] = [
+                    message
+                    for message in sections["messages"]
+                    if message["session_id"] not in deleted_sessions
+                ]
+                sections["titles"] = {
+                    session_id: title
+                    for session_id, title in sections["titles"].items()
+                    if session_id not in deleted_sessions
+                }
+                sections["pinned"] = [
+                    session_id
+                    for session_id in sections["pinned"]
+                    if session_id not in deleted_sessions
+                ]
+                sections["archived"] = [
+                    session_id
+                    for session_id in sections["archived"]
+                    if session_id not in deleted_sessions
+                ]
+                for trip in sections["trips"]:
+                    if trip.get("session_id") in deleted_sessions:
+                        trip["session_id"] = None
+
+            def _run_import() -> dict[str, Any]:
+                store = _open_long_term(user_id, strict=True)
+                try:
+                    return import_user_data(store, sections)
+                finally:
+                    _close_long_term(store)
+
+            try:
+                counts = await asyncio.to_thread(_run_import)
+            except MemoryPersistenceError as exc:
+                logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+                raise HTTPException(
+                    status_code=503, detail="存储暂时不可用，请稍后重试"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - 写入失败统一可重试提示
+                # 恢复可能部分成功（按条目写入）：详情只写日志，避免把
+                # 底层存储异常文本暴露给客户端；重复导入可补齐剩余部分
+                logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+                raise HTTPException(
+                    status_code=503, detail="恢复失败，请稍后重试"
+                ) from exc
         return {"ok": True, **counts, "skipped": errors}
 
     return app

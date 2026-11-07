@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import weakref
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -535,6 +536,56 @@ class LongTermMemory:
         self.data["statistics"]["total_messages"] += 1
         self._persist()
         logger.debug(f"Added chat message to long-term memory: {role}")
+
+    @_locked_mutation
+    def add_chat_messages(
+        self, messages: list[dict[str, Any]], dedupe: bool = False
+    ) -> int:
+        """批量追加聊天消息（备份恢复）：一次重载 + 一次原子写回。
+
+        逐条调用 ``add_chat_message`` 时每次都要重载并重写整个文件
+        （O(n²)，几千条消息就会阻塞数分钟），这里合并为单次写锁。
+        ``dedupe=True`` 在写锁内按（会话, 角色, 内容）多重集去重——
+        并发导入不会因为锁外快照过期而重复插入。返回实际写入的条数。
+        """
+        now = datetime.now().isoformat()
+        existing: Counter | None = None
+        if dedupe:
+            existing = Counter(
+                (
+                    item.get("session_id"),
+                    item.get("role"),
+                    str(item.get("content") or ""),
+                )
+                for item in self.data["chat_history"]
+            )
+        added = 0
+        for message in messages:
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(message.get("content") or "")
+            if existing is not None:
+                key = (message.get("session_id"), role, content)
+                if existing[key] > 0:
+                    existing[key] -= 1
+                    continue
+            self.data["chat_history"].append(
+                {
+                    "role": role,
+                    "content": content,
+                    "timestamp": message.get("timestamp") or now,
+                    "session_id": message.get("session_id"),
+                }
+            )
+            added += 1
+        if not added:
+            return 0
+        statistics = self.data.setdefault("statistics", {})
+        statistics["total_messages"] = int(statistics.get("total_messages") or 0) + added
+        self._persist()
+        logger.info("Bulk imported %d chat messages", added)
+        return added
 
     def get_chat_history(self, limit: int | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
         """

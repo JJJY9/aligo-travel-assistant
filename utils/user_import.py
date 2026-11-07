@@ -4,18 +4,27 @@
 存储层在写入时自行累计，不直接覆盖；非法条目收集为错误而不是中断整个
 文件。重复恢复幂等：行程按存储层「同路线 + 同起止日期」去重，聊天消息按
 （会话, 角色, 内容）多重集去重（重复导入同一备份不会追加重复消息）。
+
+时间戳统一归一成带时区 ISO（naive 按本机时区解释），写入 TIMESTAMPTZ 不会
+发生时区偏移；消息按时间升序批量写入（单次存储层写锁 / 单事务），导入
+到已存在的会话时旧消息追加在当前转录末尾（存储层按追加顺序保存）。
 """
 import json
-from collections import Counter
+import re
 from datetime import datetime
 from typing import Any
 
+from utils.timestamps import chronological_key
 from utils.trip_import import _strict_date
 
 _MAX_PREFERENCES = 200
+_MAX_TRIPS = 5000
 _MAX_MESSAGES = 200000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
+
+_SESSION_ID_RE = re.compile(r"^[\w-]{1,64}$")
+_USAGE_NUMBER_FIELDS = ("calls", "input_tokens", "output_tokens", "total_tokens")
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -26,15 +35,79 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-def _clean_iso_timestamp(value: Any) -> str | None:
-    """合法 ISO 时间戳原样保留；非法 / 缺失返回 None（按恢复时间落库）。"""
+def _local_timezone():
+    return datetime.now().astimezone().tzinfo
+
+
+def _normalize_timestamp(value: Any) -> str | None:
+    """合法 ISO 时间戳归一成带时区形式；非法 / 缺失返回 None（按恢复时间落库）。"""
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value.strip())
     except ValueError:
         return None
-    return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_local_timezone())
+    return parsed.isoformat()
+
+
+def _clean_session_id(value: Any) -> tuple[str | None, bool]:
+    """返回 ``(session_id, 是否合法)``；缺失 / 空白按无会话处理。"""
+    if value is None:
+        return None, True
+    text = str(value).strip()
+    if not text:
+        return None, True
+    if text.startswith("-") or not _SESSION_ID_RE.fullmatch(text):
+        return None, False
+    return text, True
+
+
+def _normalize_trip_date(value: str) -> str:
+    """补零 YYYY-M-D 形态；其它格式原样保留（备份保真优先于格式严格）。"""
+    if _strict_date(value) is not None:
+        return value
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", value)
+    if not match:
+        return value
+    month = int(match.group(2))
+    day = int(match.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return value
+    return f"{match.group(1)}-{month:02d}-{day:02d}"
+
+
+def _assistant_content_problem(content: str) -> str | None:
+    """assistant 消息里的 _meta.usage 若存在则必须是数字字段。
+
+    非数字会让 /api/status 与导出的 int() 解析在之后每次请求时报 500，
+    且数据持久存在——在导入时拒绝比事后修复便宜。
+    """
+    text = content.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or "_meta" not in data:
+        return None
+    meta = data.get("_meta")
+    if not isinstance(meta, dict):
+        return "消息元数据不是对象"
+    usage = meta.get("usage")
+    if usage is None:
+        return None
+    if not isinstance(usage, dict):
+        return "消息用量不是对象"
+    for key in _USAGE_NUMBER_FIELDS:
+        value = usage.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "消息用量字段不是数字"
+    return None
 
 
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
@@ -58,7 +131,10 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     sections: dict[str, Any] = {}
 
-    preferences = _as_dict(data.get("preferences"))
+    raw_preferences = data.get("preferences")
+    if raw_preferences is not None and not isinstance(raw_preferences, dict):
+        errors.append("preferences 段不是对象，已忽略")
+    preferences = raw_preferences if isinstance(raw_preferences, dict) else {}
     cleaned_preferences: dict[str, Any] = {}
     for index, (key, value) in enumerate(preferences.items(), start=1):
         name = str(key or "").strip()
@@ -72,36 +148,37 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     sections["preferences"] = cleaned_preferences
 
     trips: list[dict[str, Any]] = []
-    for index, row in enumerate(_as_list(data.get("trip_history")), start=1):
+    raw_trips = _as_list(data.get("trip_history"))
+    if len(raw_trips) > _MAX_TRIPS:
+        errors.append(f"行程超过 {_MAX_TRIPS} 条，多余条目已跳过")
+        raw_trips = raw_trips[:_MAX_TRIPS]
+    for index, row in enumerate(raw_trips, start=1):
         if not isinstance(row, dict):
             errors.append(f"跳过第 {index} 条行程：不是对象")
             continue
         destination = str(row.get("destination") or "").strip()
-        start_date = str(row.get("start_date") or "").strip()
-        end_date = str(row.get("end_date") or "").strip()
         if not destination:
             errors.append(f"跳过第 {index} 条行程：目的地为空")
             continue
-        start_dt = _strict_date(start_date)
-        if start_dt is None:
-            errors.append(f"跳过第 {index} 条行程：出发日期格式应为 YYYY-MM-DD")
+        start_date = _normalize_trip_date(str(row.get("start_date") or "").strip())
+        if not start_date:
+            errors.append(f"跳过第 {index} 条行程：出发日期为空")
             continue
-        end_dt = None
-        if end_date:
-            end_dt = _strict_date(end_date)
-            if end_dt is None:
-                errors.append(f"跳过第 {index} 条行程：返程日期格式应为 YYYY-MM-DD")
-                continue
-            if end_dt < start_dt:
-                errors.append(f"跳过第 {index} 条行程：结束日期不能早于出发日期")
-                continue
-        session_id = str(row.get("session_id") or "").strip() or None
+        end_date = _normalize_trip_date(str(row.get("end_date") or "").strip())
+        start_dt = _strict_date(start_date)
+        end_dt = _strict_date(end_date) if end_date else None
+        if start_dt is not None and end_dt is not None and end_dt < start_dt:
+            errors.append(f"跳过第 {index} 条行程：结束日期不能早于出发日期")
+            continue
+        session_id, ok = _clean_session_id(row.get("session_id"))
+        if not ok:
+            errors.append(f"第 {index} 条行程：会话 ID 非法，已忽略会话关联")
         trips.append(
             {
                 "origin": str(row.get("origin") or "").strip(),
                 "destination": destination,
                 "start_date": start_date,
-                "end_date": end_date if end_dt else "",
+                "end_date": end_date,
                 "purpose": str(row.get("purpose") or "").strip() or "出差",
                 "session_id": session_id,
             }
@@ -122,15 +199,31 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if role not in {"user", "assistant"} or not isinstance(content, str):
             errors.append(f"跳过第 {index} 条消息：角色或内容非法")
             continue
-        session_id = str(row.get("session_id") or "").strip() or None
+        session_id, ok = _clean_session_id(row.get("session_id"))
+        if not ok:
+            errors.append(f"跳过第 {index} 条消息：会话 ID 非法")
+            continue
+        if role == "assistant":
+            problem = _assistant_content_problem(content)
+            if problem:
+                errors.append(f"跳过第 {index} 条消息：{problem}")
+                continue
         messages.append(
             {
                 "role": role,
                 "content": content,
                 "session_id": session_id,
-                "timestamp": _clean_iso_timestamp(row.get("timestamp")),
+                "timestamp": _normalize_timestamp(row.get("timestamp")),
             }
         )
+    # 按时间升序写入（无时间戳的排最后）：多会话恢复后转录顺序与会话
+    # updated_at 都保持与备份一致
+    messages.sort(
+        key=lambda message: (
+            message["timestamp"] is None,
+            chronological_key(message["timestamp"]),
+        )
+    )
     sections["messages"] = messages
     session_ids = {m["session_id"] for m in messages if m["session_id"]}
 
@@ -170,7 +263,7 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
 
 
 def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
-    """把解析后的数据写入长期记忆；返回各类计数（供 CLI 输出）。"""
+    """把解析后的数据写入长期记忆；返回各类计数（供 CLI / Web 输出）。"""
     result: dict[str, Any] = {
         "preferences": 0,
         "trips_created": 0,
@@ -198,29 +291,13 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
 
     messages = sections.get("messages", [])
     if messages:
-        # （会话, 角色, 内容）多重集去重：同一备份重复导入幂等，同一会话里
-        # 重复出现的相同提问仍按出现次数补回
-        existing = Counter(
-            (
-                message.get("session_id"),
-                message.get("role"),
-                str(message.get("content") or ""),
-            )
-            for message in store.get_chat_history(limit=None)
-        )
-        for message in messages:
-            key = (message["session_id"], message["role"], message["content"])
-            if existing[key] > 0:
-                existing[key] -= 1
-                result["messages_skipped"] += 1
-                continue
-            store.add_chat_message(
-                message["role"],
-                message["content"],
-                message["session_id"],
-                timestamp=message["timestamp"],
-            )
-            result["messages_added"] += 1
+        # 批量写入 + 存储层写锁内去重：JSON 后端一次重载一次原子写回
+        # （逐条写是 O(n²)，大备份会跑几分钟到数小时）；去重放在写锁内
+        # 使并发导入也不会因锁外快照过期而重复插入
+        added = store.add_chat_messages(messages, dedupe=True)
+        added = int(added if added is not None else len(messages))
+        result["messages_added"] = added
+        result["messages_skipped"] = len(messages) - added
 
     for session_id, title in sections.get("titles", {}).items():
         if store.set_session_title(session_id, title):

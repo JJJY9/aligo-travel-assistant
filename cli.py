@@ -25,6 +25,7 @@ from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import has_preference_value
 from utils.progress import format_progress_event
+from utils.timestamps import chronological_key
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.version import APP_VERSION
 
@@ -2759,7 +2760,11 @@ def _session_summaries(store) -> list[dict]:
         entry["archived"] = entry["session_id"] in archived
         # 标题 + 消息内容（已归一空白）供 --query 关键词过滤与命中片段
         entry["_parts"] = [entry["title"], *entry.pop("_parts", [])]
-    return sorted(grouped.values(), key=lambda item: item["updated_at"], reverse=True)
+    return sorted(
+        grouped.values(),
+        key=lambda item: chronological_key(item["updated_at"]),
+        reverse=True,
+    )
 
 
 def run_sessions_list_standalone(
