@@ -216,6 +216,18 @@ def test_runner_errors(monkeypatch):
     print("✓ 非法用户 / 文件不存在 / 空备份失败")
 
 
+def test_runner_rejects_oversized_backup(monkeypatch):
+    from utils import user_import as user_import_module
+
+    path = _write_json(_export_payload())
+    store = _real_store("u-big")
+    monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", 1)
+    code, out = _run_import(monkeypatch, "u-big", path, store, as_json=True)
+    payload = json.loads(out)
+    assert code == 1 and "50 MB" in payload["error"]
+    print("✓ 超大备份文件被拒绝")
+
+
 def test_runner_dispatch(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -249,6 +261,7 @@ if __name__ == "__main__":
     for case in (
         test_runner_json_output,
         test_runner_errors,
+        test_runner_rejects_oversized_backup,
         test_runner_dispatch,
     ):
         mp = pytest.MonkeyPatch()

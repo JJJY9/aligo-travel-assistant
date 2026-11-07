@@ -14,6 +14,8 @@ from utils.trip_import import _strict_date
 
 _MAX_PREFERENCES = 200
 _MAX_MESSAGES = 200000
+# 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
+MAX_BACKUP_BYTES = 50 * 1024 * 1024
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

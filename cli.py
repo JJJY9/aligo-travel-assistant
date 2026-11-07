@@ -1997,7 +1997,11 @@ def run_user_import_standalone(
     import io
     import re
 
-    from utils.user_import import import_user_data, parse_user_export
+    from utils.user_import import (
+        MAX_BACKUP_BYTES,
+        import_user_data,
+        parse_user_export,
+    )
 
     def _fail(message: str) -> int:
         if as_json:
@@ -2016,6 +2020,12 @@ def run_user_import_standalone(
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not json_path or json_path.startswith("-"):
         return _fail("请提供 JSON 备份文件路径")
+    try:
+        if os.path.getsize(json_path) > MAX_BACKUP_BYTES:
+            return _fail("备份文件超过 50 MB，请拆分后恢复")
+    except OSError:
+        # 不存在 / 不可读交给下面的读取步骤给出具体原因
+        pass
     try:
         text = io.open(json_path, "r", encoding="utf-8-sig").read()
     except FileNotFoundError:
