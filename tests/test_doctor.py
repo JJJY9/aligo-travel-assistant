@@ -111,10 +111,12 @@ def test_model_dir_follows_rag_config(monkeypatch):
     from utils.doctor import _default_model_dir
     from utils.skill_paths import resolve_skills_root
 
+    # 用与 doctor 硬编码 fallback 不同的值：删掉「读取 RAG_CONFIG」分支
+    # 后回退到默认目录，断言必然失败
     monkeypatch.setitem(
-        RAG_CONFIG, "embedding_model", "data/models/bge-small-zh-v1.5"
+        RAG_CONFIG, "embedding_model", "data/models/custom-test-embed"
     )
-    expected = Path(resolve_skills_root()).parent.parent / "data/models/bge-small-zh-v1.5"
+    expected = Path(resolve_skills_root()).parent.parent / "data/models/custom-test-embed"
     assert _default_model_dir() == expected
     print("✓ 嵌入模型目录与 RAG 技能同一解析口径")
 

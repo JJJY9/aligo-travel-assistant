@@ -122,7 +122,9 @@ class DistributedLock:
 
     def _start_heartbeat(self, token: str) -> None:
         """持有期间按 TTL/3 续期，避免长任务在 TTL 到期后失去锁。"""
-        interval = max(1.0, self._ttl_sec / 3)
+        # 续期间隔取 TTL/3：不能用 1 秒下限——TTL ≤ 3 秒时首次续期会落在
+        # 过期之后（短 TTL 的锁会静默丢失）
+        interval = max(0.1, self._ttl_sec / 3)
         stop = threading.Event()
 
         def _renew() -> None:

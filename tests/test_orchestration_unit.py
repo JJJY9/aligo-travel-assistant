@@ -160,9 +160,15 @@ def test_failure_aggregated_as_partial_failure():
 
 
 def test_agent_duration_and_progress_events():
-    """agent_done 事件与聚合结果都带上单个智能体耗时"""
+    """agent_done 事件与聚合结果都带上单个智能体耗时（非恒 0）"""
     events: list[dict] = []
-    orchestrator = OrchestrationAgent(agent_registry={"a": _StubAgent("a", {"answer": "ok"})})
+
+    class _SlowAgent(_StubAgent):
+        async def reply(self, x):
+            await asyncio.sleep(0.05)
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    orchestrator = OrchestrationAgent(agent_registry={"a": _SlowAgent("a")})
     message = asyncio.run(
         orchestrator.reply(
             _intent([{"agent_name": "a", "priority": 1}]),
@@ -170,9 +176,12 @@ def test_agent_duration_and_progress_events():
         )
     )
     result = json.loads(message.content)
-    assert result["results"][0]["duration"] >= 0
+    # 桩智能体实际休眠 50ms：duration 恒 0 / 未计时都会在此失败
+    assert result["results"][0]["duration"] >= 0.04, (
+        f"聚合结果耗时异常：{result['results'][0]['duration']}"
+    )
     done_events = [event for event in events if event["type"] == "agent_done"]
-    assert done_events and done_events[0]["duration"] >= 0
+    assert done_events and done_events[0]["duration"] >= 0.04
     print("✓ 智能体耗时写入进度事件与聚合结果")
 
 

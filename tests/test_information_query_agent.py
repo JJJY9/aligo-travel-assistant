@@ -129,6 +129,20 @@ async def test_information_query_agent():
             query_success = result_data.get('query_success', False)
             query_results = result_data.get('results', {})
 
+            if not query_success and query_type == "网络搜索":
+                # 网络搜索受上游限流影响会偶发失败：最多重试两次，最终仍
+                # 失败才计入 failed（汇总断言保证恒失败的实现必失败）
+                for _ in range(2):
+                    retry_started = time.time()
+                    result = await agent.reply(user_msg)
+                    result_data = json.loads(result.content)
+                    elapsed += time.time() - retry_started
+                    query_type = result_data.get('query_type', '')
+                    query_success = result_data.get('query_success', False)
+                    query_results = result_data.get('results', {})
+                    if query_success:
+                        break
+
             print(f"查询类型: {query_type}")
             print(f"查询状态: {'✓ 成功' if query_success else '✗ 失败'}")
 
@@ -197,6 +211,9 @@ async def test_information_query_agent():
     print(f"总测试数: {len(test_cases)}")
     print(f"✓ 通过: {passed} ({passed/len(test_cases)*100:.0f}%)")
     print(f"✗ 失败: {failed} ({failed/len(test_cases)*100:.0f}%)")
+    # 汇总即结论：失败计数必须让测试失败（此前只打印，全部失败也判通过）
+    assert failed == 0, f"{failed}/{len(test_cases)} 个信息查询用例失败"
+    assert passed == len(test_cases)
     print(f"平均响应时间: {total_time/len(test_cases):.1f}秒")
     print(f"总耗时: {total_time:.1f}秒")
     print("="*70)
