@@ -55,6 +55,23 @@ def test_export_writes_json(monkeypatch):
     print("✓ kb-export 写入 JSON（自动创建目录）")
 
 
+def test_export_write_failure_reports(monkeypatch):
+    """目标父路径是文件（不可创建目录）：写入失败明确报错并退出 1。"""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "export_documents", lambda: [])
+    blocker = Path(tempfile.mkdtemp(prefix="chailv_kb_")) / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    target = blocker / "out.json"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_knowledge_export_standalone(str(target))
+    assert code == 1 and "写入失败" in buf.getvalue()
+    print("✓ kb-export 写入失败友好报错")
+
+
 def test_export_refuses_overwrite_without_force(monkeypatch):
     """kb-export 默认不覆盖已有文件（与 trips-export / session-export 一致）。"""
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())

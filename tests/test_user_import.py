@@ -261,6 +261,58 @@ def test_runner_skip_knowledge_only_backup_fails(monkeypatch):
     print("✓ --skip-knowledge 只含知识段的备份不再误报成功")
 
 
+def test_runner_text_summary_and_knowledge_error(monkeypatch):
+    """非 --json 摘要含各计数；知识片段失败时打印 ❌ 并退出 1（用户数据已恢复）。"""
+    from utils import user_import as import_module
+
+    counts = {
+        "preferences": 2,
+        "trips_created": 1,
+        "trips_updated": 0,
+        "messages_added": 3,
+        "messages_skipped": 1,
+        "titles": 1,
+        "pinned": 0,
+        "archived": 0,
+        "knowledge_imported": 4,
+        "knowledge_skipped": 0,
+    }
+    monkeypatch.setattr(
+        import_module, "import_user_data", lambda store, sections: dict(counts)
+    )
+    path = _write_json(_export_payload())
+    store = _real_store("u-text-summary")
+    code, out = _run_import(monkeypatch, "u-text-summary", path, store)
+    assert code == 0
+    assert "已恢复：偏好 2 项" in out
+    assert "知识片段新增 4 条（跳过 0 条）" in out
+
+    counts_err = dict(counts, knowledge_error="知识库未初始化")
+    monkeypatch.setattr(
+        import_module, "import_user_data", lambda store, sections: dict(counts_err)
+    )
+    code, out = _run_import(monkeypatch, "u-text-summary", path, store)
+    assert code == 1
+    assert "❌ 知识库未初始化" in out and "用户数据已恢复" in out
+    print("✓ user-import 文本摘要与知识片段失败提示")
+
+
+def test_runner_rejects_gbk_backup_and_directory(monkeypatch):
+    """非 UTF-8 备份与目录路径分别命中解码 / IO 错误分支。"""
+    store = _real_store("u-badfile")
+    gbk_path = os.path.join(
+        tempfile.mkdtemp(prefix="chailv_import_"), "gbk.json"
+    )
+    with io.open(gbk_path, "wb") as handle:
+        handle.write("{\"a\": \"中文\"}".encode("gbk"))
+    code, out = _run_import(monkeypatch, "u-badfile", gbk_path, store)
+    assert code == 1 and "UTF-8" in out
+
+    code, out = _run_import(monkeypatch, "u-badfile", tempfile.mkdtemp(), store)
+    assert code == 1 and "读取备份失败" in out
+    print("✓ user-import GBK 备份与目录路径友好报错")
+
+
 def test_preview_does_not_write_and_matches_import():
     from utils.user_import import preview_user_import
 

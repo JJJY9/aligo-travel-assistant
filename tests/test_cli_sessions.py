@@ -407,6 +407,31 @@ def test_session_delete_missing_session(monkeypatch):
     print("✓ session-delete 不存在的会话返回 1")
 
 
+def test_archive_and_pin_report_when_vanished_concurrently(monkeypatch):
+    """预检后会话被并发删除（set_session_* 返回 False）：报「操作未生效」退出 1。"""
+
+    class _VanishingStore(_FakeStore):
+        def set_session_archived(self, session_id, archived):
+            return False
+
+    store = _VanishingStore([_message("user", "问题", "s-gone")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    code, out = _run_archive("u1", "s-gone", archived=True)
+    assert code == 1 and "操作未生效" in out
+
+    class _VanishingPin(_PinStore):
+        def set_session_pinned(self, session_id, pinned):
+            return False
+
+    pin_store = _VanishingPin([_message("user", "问题", "s-gone")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: pin_store)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_session_pin_standalone("u1", "s-gone")
+    assert code == 1 and "操作未生效" in buf.getvalue()
+    print("✓ archive/pin 并发删除后报操作未生效")
+
+
 def test_session_delete_json_output(monkeypatch):
     fake = _sessions_store()
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
@@ -1140,6 +1165,20 @@ def test_session_export_html_dispatch(monkeypatch):
     assert exc.value.code == 0
     assert calls[-1] == ("u1", "s1", "out.html", False, False, True)
     print("✓ session-export dispatch --html")
+
+
+def test_session_export_write_failure_reports(monkeypatch):
+    """父路径被文件占用时 session-export 写入失败明确报错。"""
+    import tempfile
+
+    fake = _FakeStore([_message("user", "问题", "s-exp")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    blocker = os.path.join(tempfile.mkdtemp(), "blocker")
+    with io.open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("x")
+    code, out = _run_export("u1", "s-exp", target=os.path.join(blocker, "out.md"))
+    assert code == 1 and "写入失败" in out
+    print("✓ session-export 写入失败友好报错")
 
 
 def test_session_export_refuses_overwrite(monkeypatch):

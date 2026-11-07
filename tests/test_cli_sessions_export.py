@@ -130,6 +130,17 @@ def test_export_html_bundle(monkeypatch):
     print("✓ sessions-export --html 合集导出与单次转义")
 
 
+def test_export_write_failure_reports(monkeypatch):
+    """父路径被文件占用时写入失败明确报错并退出 1。"""
+    import tempfile
+
+    blocker = Path(tempfile.mkdtemp(prefix="chailv_sessions_")) / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    code, out = _run(monkeypatch, _store(), "u-export", str(blocker / "out.md"))
+    assert code == 1 and "写入失败" in out
+    print("✓ sessions-export 写入失败友好报错")
+
+
 def test_export_without_sessions(monkeypatch):
     code, out = _run(monkeypatch, _FakeStore([]), "u-export")
     assert code == 1 and "没有可导出的会话" in out

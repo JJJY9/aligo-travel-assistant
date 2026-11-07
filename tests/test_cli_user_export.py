@@ -142,6 +142,21 @@ def test_user_export_default_dir_and_failures(monkeypatch):
     print("✓ user-export 默认目录 / 非法用户 / 读取与打开失败")
 
 
+def test_user_export_write_failure_reports(monkeypatch):
+    """输出目录被文件占用：写入失败明确报错并退出 1。"""
+    import os
+    import tempfile
+
+    store = _FakeStore()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: store)
+    blocker = os.path.join(tempfile.mkdtemp(), "blocker")
+    with io.open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("x")
+    code, out = _run("u1", target=blocker)
+    assert code == 1 and "写入失败" in out
+    print("✓ user-export 写入失败友好报错")
+
+
 def test_user_export_dispatch(monkeypatch):
     import tempfile
 
