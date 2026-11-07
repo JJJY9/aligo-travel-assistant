@@ -2,6 +2,32 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+- `python cli.py sessions-export --html`：全部会话导出为独立 HTML 合集（单文件内嵌样式、标题与正文单次转义、按最近更新排序、默认 `.html` 后缀），与单会话 `session-export --html` 同一渲染口径
+- 一体化备份：`user-export --with-knowledge` 把知识库片段与用户数据放进同一 JSON；`user-import` 识别 `knowledge` 段一并恢复（失败不改用户数据、`knowledge_error` + 退出码 1；`--skip-knowledge` / `--dry-run`）；Web 面板「恢复备份」同路径
+- `trips-import --ics` 与 `--dry-run`：接受 iCalendar（按 `BEGIN:VCALENDAR` 自动识别）并预览将新增 / 更新 / 跳过的数量而不写库
+- `session-delete`：删除会话全部消息并同步清理短期记忆（与面板删除对齐）
+- Web 健康检查与指标：健康端点返回熔断器降级状态；SSE 失败独立计数（`sse_errors`），streaming 请求不再计入延迟分位
+
+### 变更
+- 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin
+- 知识库导入 / 预览使用独立限流桶（`kb_import`，1200 次 / 分钟），面板分批导入不再必然 429
+- 知识库状态附带向量维度与 `dimension_mismatch`（嵌入模型已加载时对比），换模型后状态不再假装健康
+
+### 修复
+- 交互式 CLI：缺 API Key / 模型初始化失败干净退出；Ctrl-C（CancelledError）回到提示符；记忆写盘失败（`MemoryPersistenceError`）不再被误判成 stdin 故障终止会话；偏好 / 事项 / 行程渲染对 null、非对象条目与旧格式输入容错；管道提前关闭（`| head`）不再抛 traceback
+- 行程导入导出往返：ICS 空出发地不再写成占位符「出发地」导致重复新增；CSV 公式注入防护前缀在导入端还原（含已有引号的值可逆）；`Z` / `±HHMM` 的 DATE-TIME 先换算本机时区再取日期；DATE-TIME 的结束时刻含尾（仅恰为 00:00 按排他日期减一天）；跳过行号按物理行
+- 会话导出：HTML 标题只转义一次（不再显示字面量 `&lt;`）；无自定义标题时的回退标题与自定义标题同一清洗口径
+- 时间戳：naive 按「该时刻」的本机时区解释（夏令时地区跨季节排序不再差一小时）；兼容 `Z` 后缀 UTC 写法（Python 3.10 上备份恢复不再丢失时间）
+- 日志：`LOG_FORMAT=json` 下任意日志消息里的 U+2028/U+2029/C1 控制符不再把单条记录拆成多行
+- 偏好：模型输出的 `null` / 空白项不再落库或回显成「设置为 None」；行程规划结果 `title` / `day` / `time` 为 null 时回退默认文案
+- 知识库：文本切分不再产生纯空白分片（空白向量会占用检索名额）；状态接口的维度探测不再等待首次模型加载；技能 frontmatter 结束符必须顶格（块标量内缩进的 `---` 不再截断描述）
+- 天气：上游故障沿用旧数据时 `stale` 窗口按「最近一次成功」计时、1 小时封顶，不会被反复降级刷新；并发等待者复用同一份降级结果（单飞语义保持）
+- 文件锁：初始字节写盘失败（磁盘满 / 配额）时 `close()` 重抛的 `OSError` 不再覆盖 `TimeoutError` 契约（Web 保持 503、重试层不再把磁盘故障当网络错误）
+- 其他：会话列表 / 全量导出按真实时刻排序（`chronological_key`）；`sessions-export` 默认文件名对中文 / 超长用户追加短哈希
+
 ## [1.6.0] - 2026-11-06
 
 ### 新增
