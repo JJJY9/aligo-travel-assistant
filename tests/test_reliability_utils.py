@@ -370,6 +370,64 @@ def test_response_text_dict_and_scalar_shapes():
     print("✓ _response_text 的 dict / 列表 / 标量形状")
 
 
+def test_retry_error_edges_and_response_shapes():
+    """retry 的保留分支：CircuitOpenError 不重试、负重试次数、status_code 属性。"""
+    from utils.circuit_breaker import CircuitOpenError
+
+    calls = {"n": 0}
+
+    async def open_breaker():
+        calls["n"] += 1
+        raise CircuitOpenError("open")
+
+    with pytest.raises(CircuitOpenError):
+        asyncio.run(
+            retry_with_backoff(
+                open_breaker, max_retries=3, base_delay_sec=0.0
+            )
+        )
+    assert calls["n"] == 1, "熔断开启时不应重试"
+
+    async def never_called():
+        raise AssertionError("不应执行")
+
+    with pytest.raises(RuntimeError, match="retry loop ended"):
+        asyncio.run(
+            retry_with_backoff(never_called, max_retries=-1, base_delay_sec=0.0)
+        )
+
+    class WithResponse(Exception):
+        def __init__(self):
+            self.response = types.SimpleNamespace(status_code=503)
+
+    assert is_retriable_error(WithResponse()) is True
+
+    from utils.llm_resilience import _response_text
+
+    assert _response_text("纯文本") == "纯文本"
+    assert _response_text([types.SimpleNamespace(text="甲")]) == "甲"
+    assert _response_text({"other": 1}) == ""
+    print("✓ retry 保留分支与 _response_text 形状")
+
+
+def test_health_check_error_paths(monkeypatch):
+    # AgentScope 未安装：import 失败分支
+    monkeypatch.setitem(sys.modules, "config_agentscope", None)
+    ok, message = asyncio.run(run_health_check("http://x", "k", "m"))
+    assert ok is False and "AgentScope not installed" in message
+
+    # 模型调用抛异常：返回异常文本（不抛出）
+    def boom(**kwargs):
+        raise ConnectionError("gateway down")
+
+    fake_module = types.ModuleType("config_agentscope")
+    fake_module.create_chat_model = boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "config_agentscope", fake_module)
+    ok, message = asyncio.run(run_health_check("http://x", "k", "m"))
+    assert ok is False and "gateway down" in message
+    print("✓ 健康检查的 ImportError 与异常路径")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -385,6 +443,8 @@ if __name__ == "__main__":
         test_late_success_cannot_close_breaker(_mp)
         test_retry_jitter_respects_max_delay(_mp)
         test_response_text_dict_and_scalar_shapes()
+        test_retry_error_edges_and_response_shapes()
+        test_health_check_error_paths(_mp)
         test_conversation_ask_releases_probe_on_cancel(_mp)
         test_memory_persistence_error_does_not_trip_breaker()
     finally:
