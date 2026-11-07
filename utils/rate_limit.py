@@ -276,6 +276,32 @@ class RedisRateLimiter:
             return self._fallback.peek(key)
         return self._retry_after(result)
 
+    def probe(self) -> bool:
+        """主动探测 Redis 是否已恢复；未降级时直接返回 True。
+
+        ``degraded`` 只会在「同一个桶」的 Redis 调用成功时清除；weather /
+        import 等低频桶在 Redis 恢复后可能很久没有请求，健康检查若只看
+        标记会永远报降级。冷却期内沿用上次失败的结论，冷却到期后用一次
+        PING 刷新状态（失败则重新进入冷却）。
+        """
+        if not self._degraded:
+            return True
+        if time.monotonic() < self._degraded_until:
+            return False
+        client = self._get_client()
+        if client is None:
+            return False
+        try:
+            client.ping()
+        except Exception as exc:  # noqa: BLE001 - 探测失败继续按降级处理
+            self._degraded_until = time.monotonic() + REDIS_FAILURE_COOLDOWN_SEC
+            self._degraded = True
+            logger.warning("Redis 限流健康探测失败（%s）：%s", self.name, exc)
+            return False
+        self._degraded = False
+        self._degraded_until = 0.0
+        return True
+
     def check(self, key: str) -> float | None:
         """记录一次请求；放行返回 None，超限返回建议的 Retry-After 秒数。"""
         result = self._eval(

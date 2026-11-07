@@ -9,6 +9,12 @@ import logging
 import os
 import re
 
+# 单条访问日志里用户可控字段的上限：uvicorn 允许约 64KB 的请求行（长查询
+# 串），未匹配路径的 404 不受限流——不截断时一个请求就能写入接近 64KB 的
+# 日志行（放大上千倍）。指标里的路径同样截到 200 字符、方法截到 16。
+MAX_LOG_TEXT = 200
+MAX_METHOD_TEXT = 16
+
 
 def _safe_log_text(value: object) -> str:
     """去掉控制字符：uvicorn 会 percent-decode 路径，%0A 可伪造整行日志。
@@ -35,12 +41,14 @@ def format_access_log(
 ) -> str:
     """格式化一条访问日志（调用方以单个字符串参数传给 logger）。"""
     mode = (fmt or access_log_format()).strip().lower()
+    safe_method = _safe_log_text(method)[:MAX_METHOD_TEXT]
+    safe_path = _safe_log_text(path)[:MAX_LOG_TEXT]
     if mode == "json":
         return json.dumps(
             {
                 "event": "http_request",
-                "method": _safe_log_text(method),
-                "path": _safe_log_text(path),
+                "method": safe_method,
+                "path": safe_path,
                 "status": int(status),
                 "duration_ms": round(float(elapsed_ms), 1),
                 "request_id": _safe_log_text(request_id),
@@ -48,7 +56,7 @@ def format_access_log(
             ensure_ascii=False,
         )
     return (
-        f"{_safe_log_text(method)} {_safe_log_text(path)} -> {status} "
+        f"{safe_method} {safe_path} -> {status} "
         f"({float(elapsed_ms):.0f}ms) [{_safe_log_text(request_id)}]"
     )
 

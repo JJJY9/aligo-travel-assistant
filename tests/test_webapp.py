@@ -401,6 +401,27 @@ def test_stream_forwards_agent_progress_events(monkeypatch):
     print("✓ SSE 转发 agent_start / agent_done 进度事件")
 
 
+def test_limiter_degraded_uses_probe_for_idle_buckets():
+    """健康检查对降级桶走 probe：低频桶不需要再收到请求也能恢复上报。"""
+    from webapp.server import _limiter_degraded
+
+    class _Probed:
+        def probe(self):
+            return True
+
+    class _ProbedDown:
+        def probe(self):
+            return False
+
+    class _Legacy:
+        degraded = True
+
+    assert _limiter_degraded(_Probed()) is False
+    assert _limiter_degraded(_ProbedDown()) is True
+    assert _limiter_degraded(_Legacy()) is True, "无 probe 的实现回退到 degraded 标记"
+    print("✓ 健康检查对降级桶优先主动探测")
+
+
 def test_stream_abort_waits_for_pending_persist(monkeypatch):
     """SSE 中断时：落库线程未结束前不得释放用户锁（否则删除 / 新回合并发）。"""
     import contextlib

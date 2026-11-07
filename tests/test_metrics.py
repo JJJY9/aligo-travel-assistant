@@ -47,6 +47,23 @@ def test_percentiles_use_bounded_recent_samples():
     print("✓ P50 / P95 使用有界近期样本，max 保留历史")
 
 
+def test_average_duration_excludes_streaming_requests():
+    """平均耗时只除以真正计时的请求数：SSE 只计请求数、不进分母。"""
+    metrics = RequestMetrics()
+    metrics.record("POST", "/api/chat/stream", 200, 0.0, streaming=True)
+    metrics.record("GET", "/api/health", 200, 10.0)
+    metrics.record("POST", "/api/chat/stream", 200, 0.0, streaming=True)
+    metrics.record("GET", "/api/health", 200, 30.0)
+    snapshot = metrics.snapshot()
+    assert snapshot["requests_total"] == 4
+    assert snapshot["avg_duration_ms"] == 20.0, "流式请求不能稀释平均耗时"
+    prometheus = metrics.render_prometheus()
+    assert (
+        'aligo_request_duration_seconds{quantile="avg"} 0.020000' in prometheus
+    ), "Prometheus 的 avg 同样只按计时请求计算"
+    print("✓ 平均耗时不把 SSE 请求计入分母")
+
+
 def test_path_cardinality_is_bounded():
     metrics = RequestMetrics()
     for index in range(MAX_PATHS + 50):
@@ -130,6 +147,7 @@ if __name__ == "__main__":
     test_record_and_snapshot()
     test_percentiles_use_bounded_recent_samples()
     test_path_cardinality_is_bounded()
+    test_average_duration_excludes_streaming_requests()
     test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()
     test_prometheus_render()

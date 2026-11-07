@@ -166,6 +166,24 @@ def test_access_log_strips_control_characters():
     print("✓ 访问日志清理 CR/LF 与转义字符")
 
 
+def test_access_log_truncates_user_controlled_fields():
+    """超长路径 / 方法不能按请求放大写日志（404 路径不受限流）。"""
+    long_path = "/api/" + "a" * 60_000
+    line = format_access_log("GET", long_path, 404, 1.0, "rid", fmt="json")
+    parsed = json.loads(line)
+    assert len(parsed["path"]) == 200, "路径必须截断到 200 字符"
+    assert len(line) < 1000
+
+    text = format_access_log("GET", long_path, 404, 1.0, "rid", fmt="text")
+    assert len(text) < 300, "文本模式下同样不能透出超长路径"
+
+    parsed_method = json.loads(
+        format_access_log("M" * 1000, "/x", 200, 1.0, "rid", fmt="json")
+    )
+    assert len(parsed_method["method"]) == 16, "方法名与指标同一上限"
+    print("✓ 访问日志截断超长路径 / 方法")
+
+
 def test_json_formatter_sanitizes_any_message():
     """JsonLogFormatter 的普通消息同样不能把单条 JSON 记录拆成多行。"""
     poison = "北京" + chr(0x2028) + "X" + chr(0x85) + "Y"
@@ -510,6 +528,7 @@ if __name__ == "__main__":
         test_failure_after_recovery_timeout_reopens(_mp)
         test_build_turn_meta_tolerates_non_list_shapes()
         test_access_log_strips_control_characters()
+        test_access_log_truncates_user_controlled_fields()
         test_release_probe_returns_half_open_slot(_mp)
         test_probe_owner_only(_mp)
         test_late_success_cannot_close_breaker(_mp)

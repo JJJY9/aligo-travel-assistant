@@ -1210,6 +1210,19 @@ def _rate_identity(host: str) -> str:
     return text
 
 
+def _limiter_degraded(limiter: Any) -> bool:
+    """限流桶当前是否降级（降级且冷却已过时主动探测一次 Redis）。
+
+    桶的 ``degraded`` 标记只会在同一桶的成功 Redis 调用后清除；低频桶
+    （weather / import / kb_import）在 Redis 恢复后可能长期没有请求，
+    健康检查不能因此永远报降级（README 承诺恢复共享后自动变回 false）。
+    """
+    probe = getattr(limiter, "probe", None)
+    if callable(probe):
+        return not probe()
+    return bool(getattr(limiter, "degraded", False))
+
+
 def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """限流后端与状态（健康检查与指标接口共用）。
 
@@ -1218,15 +1231,17 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """
     backend = getattr(state.rate_limiter, "backend", "memory")
     configured = bool(STORAGE_CONFIG.get("redis_url"))
-    # 各桶独立回退：任一桶处于降级冷却期都应上报，不能只看用户桶
-    degradation_states = (
-        getattr(state.rate_limiter, "degraded", False),
-        getattr(state.ip_limiter, "degraded", False),
-        getattr(state.kb_limiter, "degraded", False),
-        getattr(state.weather_limiter, "degraded", False),
-        getattr(state.import_limiter, "degraded", False),
+    # 各桶独立回退：任一桶处于降级都上报，不能只看用户桶
+    limiters = (
+        state.rate_limiter,
+        state.ip_limiter,
+        state.kb_limiter,
+        state.weather_limiter,
+        state.import_limiter,
     )
-    degraded = any(degradation_states) or (backend == "memory" and configured)
+    degraded = any(_limiter_degraded(limiter) for limiter in limiters) or (
+        backend == "memory" and configured
+    )
     return {
         "backend": backend,
         "configured": configured,
