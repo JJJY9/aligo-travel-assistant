@@ -673,7 +673,7 @@ pytest tests/ -q
 | CLI 一次性命令与 JSON 输出 | `test_cli_skills.py`、`test_cli_json.py`、`test_doctor.py` |
 | CLI 知识库 / 行程 / 会话命令 | `test_cli_kb_manage.py`、`test_cli_kb_transfer.py`、`test_cli_trips.py`、`test_cli_trips_dedupe.py`、`test_cli_trips_export.py`、`test_cli_sessions.py`、`test_cli_preferences.py`、`test_cli_stats.py`、`test_cli_user_export.py` |
 | Milvus 客户端 | `test_milvus_client.py` |
-| 偏好抽取 / 历史消息渲染 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_stored_message.py`、`test_trip_export.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_rate_limit_redis.py`、`test_progress.py`、`test_result_formatter.py`、`test_text_chunker.py`、`test_weather.py`、`test_skill_loader.py`、`test_conversation_runtime.py`、`test_travel_stats.py` 等 |
+| 偏好抽取 / 历史消息渲染 / 短期记忆 / 访问日志 / 限流 / 进度等工具 | `test_preference_context.py`、`test_stored_message.py`、`test_trip_export.py`、`test_short_term_memory.py`、`test_access_log.py`、`test_rate_limit.py`、`test_rate_limit_redis.py`、`test_progress.py`、`test_result_formatter.py`、`test_text_chunker.py`、`test_weather.py`、`test_skill_loader.py`、`test_conversation_runtime.py`、`test_travel_stats.py`、`test_console.py`（stdin 编码与 read(size) 余量）、`test_exporter.py`、`test_config_env.py`（密钥清洗 / 回退 / 健康检查预算）、`test_timestamps.py`、`test_session_html.py`、`test_trip_conflicts.py` 等 |
 
 ### 端到端测试（需要真实大模型）
 
