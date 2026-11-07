@@ -83,6 +83,7 @@ from utils.session_html import render_all_sessions_html
 from utils.session_markdown import render_all_sessions_markdown
 from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
+from utils.trip_conflicts import trip_state_label as _trip_state_label
 from utils.trip_conflicts import find_saved_trip as _find_saved_trip
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
@@ -2998,13 +2999,15 @@ def create_app(model: Any = None) -> FastAPI:
         offset: int = Query(default=0, ge=0),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
         q: str = Query(default="", max_length=100),
+        status: Literal["active", "upcoming", "past"] | None = Query(default=None),
     ) -> dict[str, Any]:
         """列出历史行程（默认记录顺序，支持分页；附带日期重叠信息）。
 
         ``order=desc`` 返回从最新记录开始的顺序，供记忆面板展示「最近 N 条」；
         ``q`` 按路线 / 日期 / 目的过滤（与面板、CLI ``trips --query`` 同一
         口径：按空白拆词，全部词出现在五字段拼接文本中即命中，词序无关），
-        日期重叠仍按完整历史计算。
+        ``status`` 按面板状态徽标过滤（active / upcoming / past ↔
+        进行中 / 即将出行 / 已结束），日期重叠仍按完整历史计算。
         """
         store = _open_long_term(user_id)
         try:
@@ -3015,6 +3018,18 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         trips = _filter_trips_by_query(all_trips, q)
+        status_label = ""
+        if status is not None:
+            status_label = {
+                "active": "进行中",
+                "upcoming": "即将出行",
+                "past": "已结束",
+            }[status]
+            trips = [
+                trip
+                for trip in trips
+                if _trip_state_label(trip) == status_label
+            ]
         total = len(trips)
         ordered = trips[::-1] if order == "desc" else trips
         page = ordered[offset : offset + limit]
@@ -3025,6 +3040,7 @@ def create_app(model: Any = None) -> FastAPI:
             "limit": limit,
             "order": order,
             "query": q.strip(),
+            "status": status_label,
         }
 
     @app.post("/api/trips", status_code=201)

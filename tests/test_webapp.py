@@ -1166,6 +1166,43 @@ def test_post_last_turn_accepts_long_expect():
         _cleanup(user_id)
 
 
+def test_trips_api_status_filter():
+    """/api/trips?status= 与面板状态徽标同口径；非法值 422。"""
+    client = _client()
+    user_id = _unique_user("web_test_trips_status")
+    try:
+        for destination, start in (
+            ("past", "2000-01-01"),
+            ("future", "2099-01-01"),
+        ):
+            created = client.post(
+                "/api/trips",
+                json={
+                    "user_id": user_id,
+                    "destination": destination,
+                    "start_date": start,
+                },
+            )
+            assert created.status_code == 201, created.text
+        past = client.get(
+            "/api/trips", params={"user_id": user_id, "status": "past"}
+        ).json()
+        assert past["status"] == "已结束"
+        assert [trip["destination"] for trip in past["trips"]] == ["past"]
+        upcoming = client.get(
+            "/api/trips", params={"user_id": user_id, "status": "upcoming"}
+        ).json()
+        assert upcoming["status"] == "即将出行"
+        assert [trip["destination"] for trip in upcoming["trips"]] == ["future"]
+        bad = client.get(
+            "/api/trips", params={"user_id": user_id, "status": "someday"}
+        )
+        assert bad.status_code == 422
+        print("✓ /api/trips status 过滤")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ics_handles_overflow_end_date():
     """9999-12-31 的行程不能让日历导出 500（DTEND 无法再加一天）。"""
     client = _client()
