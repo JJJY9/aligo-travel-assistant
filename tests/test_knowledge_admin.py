@@ -820,8 +820,8 @@ def test_group_member_ids_scans_all_batches(monkeypatch):
     print("✓ 组内分片跨多个迭代批次扫描")
 
 
-def test_import_restore_over_limit_raises(monkeypatch):
-    """备份还原超过上限时报错而不是静默截断。"""
+def test_import_restore_over_limit_skips_document(monkeypatch):
+    """备份还原超过上限时按无效项跳过（不静默截断、也不阻断整份备份）。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -838,9 +838,10 @@ def test_import_restore_over_limit_raises(monkeypatch):
         {"content": part_text, "metadata": {"group": "g", "part": "1", "parts": "2"}},
         {"content": part_text, "metadata": {"group": "g", "part": "2", "parts": "2"}},
     ]
-    with pytest.raises(ValueError, match="还原上限"):
-        knowledge_admin.import_documents(documents)
-    print("✓ 超限备份还原明确报错（不静默截断）")
+    result = knowledge_admin.import_documents(documents)
+    assert result["imported"] == 0
+    assert result["skipped_invalid"] == 1
+    print("✓ 超限备份按无效项跳过（不静默截断、不阻断其余文档）")
 
 
 def test_add_document_enforces_doc_size_limit(monkeypatch):
@@ -915,21 +916,27 @@ def test_import_restore_many_short_parts_not_rejected(monkeypatch):
     print("✓ 极短分片备份拼接超限仍可还原（语义上限为文档大小）")
 
 
-def test_import_restore_counts_padding_toward_doc_size(monkeypatch):
-    """分片首尾空白也计入文档大小，不能借空白绕过 DOC_MAX_CHARS。"""
+def test_import_restore_strips_padding(monkeypatch):
+    """分片首尾空白在还原时被丢弃：不进入正文、不虚增文档大小。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
     monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 100)
 
+    calls = []
+
     class _Agent:
         def add_documents(self, documents):
-            raise AssertionError("异常备份不应进入写入")
+            calls.append(documents)
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
-    # 每片 strip 后仅 1 字、原始 31 字：strip 求和 30 ≤ 100，
-    # 但实际写入的是含空白的 930 字，必须按原始长度拒绝
+    # 每片 strip 后 1 字、原始 31 字：空白不进入正文，按实体内容计 30 字
     pieces = ["x" + " " * 30 for _ in range(30)]
     documents = [
         {
@@ -938,36 +945,38 @@ def test_import_restore_counts_padding_toward_doc_size(monkeypatch):
         }
         for index, piece in enumerate(pieces)
     ]
-    with pytest.raises(ValueError, match="还原上限"):
-        knowledge_admin.import_documents(documents)
-    print("✓ 空白计入文档大小（不能绕过还原上限）")
+    result = knowledge_admin.import_documents(documents)
+    assert result["imported"] >= 1
+    stored_total = sum(len(doc["content"]) for batch in calls for doc in batch)
+    assert stored_total == 30, "空白不应写入正文（既不虚增大小也不能借空白绕过上限）"
+    print("✓ 还原时空白被丢弃（文档大小按实体内容计）")
 
 
-def test_import_restore_rejects_over_physical_join(monkeypatch):
-    """拼接长度超过物理上限（分片过多）时仍拒绝。"""
+def test_import_restore_oversize_document_skipped_not_aborting(monkeypatch):
+    """超限的还原文档计入 invalid 并跳过，不再让整份备份导入失败。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
     monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 100)
-    monkeypatch.setattr(knowledge_admin, "_RESTORE_JOINED_MAX_CHARS", 150)
 
     class _Agent:
         def add_documents(self, documents):
-            raise AssertionError("异常备份不应进入写入")
+            raise AssertionError("超限文档不应进入写入")
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
-    pieces = ["x"] * 100  # 原始 100 字 = 上限；拼接 199 字 > 物理上限 150
+    pieces = ["x"] * 101  # 实体内容 101 字 > 上限 100
     documents = [
         {
             "content": piece,
-            "metadata": {"group": "g-many", "part": str(index + 1), "parts": "100"},
+            "metadata": {"group": "g-many", "part": str(index + 1), "parts": "101"},
         }
         for index, piece in enumerate(pieces)
     ]
-    with pytest.raises(ValueError, match="拼接后过长"):
-        knowledge_admin.import_documents(documents)
-    print("✓ 分片过多导致拼接超物理上限被拒绝")
+    result = knowledge_admin.import_documents(documents)
+    assert result["imported"] == 0
+    assert result["skipped_invalid"] == 1, result
+    print("✓ 超限还原文档跳过并计数（不中断整份备份）")
 
 
 def test_list_and_export_hold_write_lock(monkeypatch):
@@ -1034,15 +1043,22 @@ def test_update_group_leftover_reported_when_delete_fails(monkeypatch):
     print("✓ 整组替换删除失败的旧分片单独报告")
 
 
-def test_import_partial_group_skipped_entirely(monkeypatch):
-    """部分分片已存在时整组跳过，不能只补缺失分片留下残缺组。"""
+def test_import_partial_group_repairs_missing_parts(monkeypatch):
+    """部分分片已存在时只补缺失分片：残缺组被补齐而不是永久残留。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
 
+    calls = []
+
     class _Agent:
         def add_documents(self, documents):
-            raise AssertionError("部分存在的组不应写入任何分片")
+            calls.append(documents)
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
     first = "甲" * 300
@@ -1051,14 +1067,19 @@ def test_import_partial_group_skipped_entirely(monkeypatch):
         {"content": first, "metadata": {"group": "g-part", "part": "1", "parts": "2"}},
         {"content": second, "metadata": {"group": "g-part", "part": "2", "parts": "2"}},
     ]
-    # 重组整篇后重新分片为 ["甲"*300+"\n", "乙"*300]；其中一片已在库中
+    # 第一片已在库中（上次导入中途失败）：只补第二片，组号与编号保持
     monkeypatch.setattr(
         knowledge_admin, "_existing_contents", lambda: {"甲" * 300}
     )
     result = knowledge_admin.import_documents(documents)
-    assert result["imported"] == 0
-    assert result["skipped_duplicate"] == 2
-    print("✓ 部分分片已存在时整组跳过（不产生残缺组）")
+    assert result["imported"] == 1
+    assert result["skipped_duplicate"] == 1
+    written = [doc for batch in calls for doc in batch]
+    assert [doc["content"] for doc in written] == [second]
+    assert written[0]["metadata"]["group"] == "g-part"
+    assert written[0]["metadata"]["part"] == "2"
+    assert written[0]["metadata"]["parts"] == "2", "补齐后组声明与实际成员一致"
+    print("✓ 残缺组只补缺失分片（不产生重复文档）")
 
 
 def test_import_dedupes_chunks_with_boundary_newline(monkeypatch):
@@ -1196,9 +1217,25 @@ def test_document_group_at_size_limit_roundtrip(monkeypatch):
     result = knowledge_admin.import_documents(exported)
     assert result["imported"] >= 1
     assert agent.calls, "20000 字整组备份应能还原"
-    restored = "".join(doc["content"] for doc in agent.calls[0]).replace("\n", "")
+    stored_docs = [doc for batch in agent.calls for doc in batch]
+    restored = "".join(doc["content"] for doc in stored_docs).replace("\n", "")
     assert restored == text, "还原后的整篇内容必须完整（不截断、不丢内容）"
-    print("✓ 上限大小整组文档可回填、可还原")
+    assert sum(len(doc["content"]) for doc in stored_docs) == 20000, (
+        "还原后的文档大小不得膨胀（导出→导入必须闭合）"
+    )
+
+    # 第二轮：把还原结果再导出→导入到空库，仍应完整且总长不变
+    agent2 = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent2)
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    exported2 = [
+        {"content": doc["content"], "metadata": doc["metadata"]} for doc in stored_docs
+    ]
+    result2 = knowledge_admin.import_documents(exported2)
+    assert result2["imported"] >= 1 and agent2.calls
+    second_total = sum(len(doc["content"]) for batch in agent2.calls for doc in batch)
+    assert second_total == 20000, "二次导出→导入后文档大小仍须保持 20000"
+    print("✓ 上限大小整组文档可回填、可还原（多轮导出→导入不膨胀）")
 
 
 def test_find_duplicate_contents(monkeypatch):
@@ -1516,13 +1553,13 @@ if __name__ == "__main__":
         test_import_skips_fully_existing_group,
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
-        test_import_restore_over_limit_raises,
+        test_import_restore_over_limit_skips_document,
         test_add_document_enforces_doc_size_limit,
         test_update_document_enforces_joined_size_limit,
         test_import_restore_many_short_parts_not_rejected,
-        test_import_restore_counts_padding_toward_doc_size,
-        test_import_restore_rejects_over_physical_join,
-        test_import_partial_group_skipped_entirely,
+        test_import_restore_strips_padding,
+        test_import_restore_oversize_document_skipped_not_aborting,
+        test_import_partial_group_repairs_missing_parts,
         test_import_dedupes_chunks_with_boundary_newline,
         test_delete_grouped_fragment_requires_whole_group,
         test_list_and_export_hold_write_lock,
