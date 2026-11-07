@@ -11,6 +11,7 @@
 - `session-delete`：删除会话全部消息并同步清理短期记忆（与面板删除对齐）
 - Web 健康检查与指标：健康端点返回熔断器降级状态；SSE 失败独立计数（`sse_errors`），streaming 请求不再计入延迟分位
 - Web 面板「导出全部会话 HTML」与 `GET /api/sessions/export?format=html`：与 CLI `sessions-export --html` 同一渲染口径，单文件可分享 / 打印
+- 行程台账 HTML 导出：CLI `trips-export --html` 与 `GET /api/trips/export?format=html`（与 CSV / ICS 同一过滤口径，按出发日期倒序、全字段转义、可打印），记忆面板行程区新增「导出台账 HTML」按钮
 
 ### 变更
 - 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin
