@@ -91,6 +91,10 @@ def _assistant_content_problem(content: str) -> str | None:
     meta = data.get("_meta")
     if not isinstance(meta, dict):
         return "消息元数据不是对象"
+    agents = meta.get("agents")
+    if agents is not None and not isinstance(agents, list):
+        # 汇总接口会迭代该字段：非列表（5 / true）落库后 /api/status 永久 500
+        return "消息智能体列表不是数组"
     usage = meta.get("usage")
     if usage is None:
         return None

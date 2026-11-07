@@ -1649,6 +1649,111 @@ def test_import_rejects_non_finite_usage():
         _cleanup(user_id)
 
 
+def test_status_survives_hostile_turn_meta():
+    """坏 _meta（NaN total_tokens / agents 非列表 / 超大数）不能让状态与导出 500。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_bad_meta")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "hi", "s-meta")
+            store.add_chat_message(
+                "assistant",
+                '{"reply": "x", "_meta": {"usage": {"calls": 1, "total_tokens": NaN}, "agents": 5}}',
+                "s-meta",
+            )
+            store.add_chat_message(
+                "assistant",
+                '{"reply": "y", "_meta": {"usage": {"calls": 1, "total_tokens": Infinity}, "agents": true, "elapsed": 10}}',
+                "s-meta",
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        status = client.get("/api/status", params={"user_id": user_id})
+        assert status.status_code == 200, status.text
+        usage = status.json()["usage"]
+        assert usage["calls"] == 2 and usage["total_tokens"] == 0, usage
+        markdown = client.get(
+            "/api/export", params={"user_id": user_id, "format": "md"}
+        )
+        assert markdown.status_code == 200, markdown.text
+        print("✓ 坏 _meta 不再让状态 / Markdown 导出 500")
+    finally:
+        _cleanup(user_id)
+
+
+def test_import_rejects_non_list_agents():
+    """备份 _meta.agents 非列表：该消息被跳过并在错误中说明。"""
+    client = _client()
+    user_id = _unique_user("web_test_bad_agents")
+    try:
+        backup = {
+            "chat_history": [
+                {"role": "user", "content": "hi", "session_id": "s-ag"},
+                {
+                    "role": "assistant",
+                    "content": '{"reply": "x", "_meta": {"agents": 5}}',
+                    "session_id": "s-ag",
+                },
+            ]
+        }
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        errors = response.json().get("skipped") or []
+        assert any("智能体列表" in error for error in errors), response.json()
+        status = client.get("/api/status", params={"user_id": user_id})
+        assert status.status_code == 200
+        print("✓ 备份非列表 agents 被拒绝且状态保持可用")
+    finally:
+        _cleanup(user_id)
+
+
+def test_import_parse_exception_maps_400(monkeypatch):
+    """备份解析抛非预期异常（如越界年份）时返回 400 而不是 500。"""
+    from utils import user_import as import_module
+
+    def boom(_payload):
+        raise OverflowError("year out of range")
+
+    monkeypatch.setattr(import_module, "parse_user_export_data", boom)
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_parse_boom")},
+        json={"backup": {"chat_history": []}},
+    )
+    assert response.status_code == 400, response.text
+    assert "解析失败" in response.json()["detail"]
+    print("✓ 备份解析异常映射 400")
+
+
+def test_rate_limit_info_reports_import_bucket_degraded():
+    """导入限流桶回退时 /api/health 的 rate_limit_degraded 必须为 True。"""
+    import types
+
+    from webapp import server as server_module
+
+    state = types.SimpleNamespace(
+        rate_limiter=types.SimpleNamespace(
+            backend="redis", limit=1, degraded=False, window_sec=60
+        ),
+        ip_limiter=types.SimpleNamespace(limit=2, degraded=False),
+        kb_limiter=types.SimpleNamespace(limit=3, degraded=False),
+        weather_limiter=types.SimpleNamespace(limit=4, degraded=False),
+        import_limiter=types.SimpleNamespace(limit=5, degraded=True),
+    )
+    info = server_module._rate_limit_info(state)
+    assert info["degraded"] is True
+    assert info["kb_import_limit"] == 5
+    print("✓ 导入限流桶降级计入健康汇总")
+
+
 def test_preference_storage_failure_maps_503(monkeypatch):
     """偏好写盘失败应返回 503（与其它存储接口一致），而不是通用 500。"""
     from utils.errors import MemoryPersistenceError

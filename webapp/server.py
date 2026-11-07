@@ -1127,6 +1127,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         getattr(state.ip_limiter, "degraded", False),
         getattr(state.kb_limiter, "degraded", False),
         getattr(state.weather_limiter, "degraded", False),
+        getattr(state.import_limiter, "degraded", False),
     )
     degraded = any(degradation_states) or (backend == "memory" and configured)
     return {
@@ -1541,7 +1542,8 @@ def _safe_usage_int(value: Any) -> int:
     """
     try:
         number = float(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # 超大整数（10**400）转 float 会 OverflowError：同样按坏数据归零
         return 0
     if not math.isfinite(number):
         return 0
@@ -1597,20 +1599,29 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
                     # PostgreSQL timestamptz 序列化为 UTC；统一转到本地时区再取日期
                     parsed_timestamp = parsed_timestamp.astimezone()
                 message_day = parsed_timestamp.date().isoformat()
-            except ValueError:
+            except (ValueError, OSError, OverflowError):
+                # Windows 上 astimezone() 对越界年份还会抛 OSError/OverflowError
                 message_day = ""
             if message_day:
                 bucket = by_day.setdefault(message_day, {"calls": 0, "tokens": 0})
                 bucket["calls"] += message_calls
-                bucket["tokens"] += int(usage.get("total_tokens") or 0)
+                bucket["tokens"] += _safe_usage_int(usage.get("total_tokens"))
 
         elapsed = meta.get("elapsed")
         if isinstance(elapsed, (int, float)):
-            elapsed_total += float(elapsed)
-            elapsed_count += 1
-        for agent in meta.get("agents") or []:
-            if isinstance(agent, dict) and agent.get("name"):
-                agent_counts[str(agent["name"])] += 1
+            try:
+                elapsed_total += float(elapsed)
+            except OverflowError:
+                pass
+            else:
+                elapsed_count += 1
+        agents = meta.get("agents")
+        # 备份导入可能带入非列表 agents（如 5 / true）：直接迭代会 TypeError，
+        # 让状态接口 / Markdown 导出对这条坏数据永久 500
+        if isinstance(agents, list):
+            for agent in agents:
+                if isinstance(agent, dict) and agent.get("name"):
+                    agent_counts[str(agent["name"])] += 1
 
     today = datetime.now().date()
     recent_days = []
@@ -3217,9 +3228,15 @@ def create_app(model: Any = None) -> FastAPI:
             await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
         )
         loop = asyncio.get_running_loop()
-        sections, errors = await loop.run_in_executor(
-            state.import_executor, parse_user_export_data, payload.backup
-        )
+        try:
+            sections, errors = await loop.run_in_executor(
+                state.import_executor, parse_user_export_data, payload.backup
+            )
+        except Exception as exc:  # noqa: BLE001 - 边界年份 / 畸形条目等解析异常
+            logger.warning("备份解析失败：%s", exc)
+            raise HTTPException(
+                status_code=400, detail=f"备份解析失败：{exc}"
+            ) from exc
         if not sections:
             detail = "；".join(errors[:3]) or "没有可恢复的数据"
             raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
