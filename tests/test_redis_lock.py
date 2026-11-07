@@ -139,15 +139,30 @@ def test_release_cleans_key_after_set_timeout():
 def test_heartbeat_renews_lock_ttl():
     client = _FlakyRedis()
     lock = DistributedLock(client, "aligo:test:renew", ttl_sec=1)
+
+    renew_times = []
+    real_eval = client.eval
+
+    def timed_eval(script, *args, **kwargs):
+        if "EXPIRE" in script or "expire" in script.lower():
+            renew_times.append(time.monotonic())
+        return real_eval(script, *args, **kwargs)
+
+    client.eval = timed_eval
+    acquired_at = time.monotonic()
     token = lock.acquire()
     assert token
 
     time.sleep(1.5)
-    assert any("EXPIRE" in script for script in client.eval_scripts), "持有期间应续期"
+    assert renew_times, "持有期间应续期"
+    # 首次续期必须发生在 TTL 到期之前——「锁过期后才续期」的变异会在此失败
+    first_gap = renew_times[0] - acquired_at
+    assert first_gap < 1.0, f"首次续期应早于 TTL（实际 {first_gap:.2f}s）"
+    assert lock.lost is False, "正常续期期间锁不应被标记丢失"
 
     lock.release(token)
     assert "aligo:test:renew" not in client.store
-    print("✓ 长任务持有期间自动续期")
+    print("✓ 长任务持有期间在 TTL 到期前自动续期")
 
 
 @pytest.mark.skipif(not TEST_REDIS_URL, reason="未设置 TEST_REDIS_URL")

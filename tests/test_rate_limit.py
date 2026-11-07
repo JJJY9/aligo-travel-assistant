@@ -80,12 +80,19 @@ def test_peek_does_not_record():
 
 
 def test_thread_safe_checks():
-    """线程池并发调用时严格放行 limit 次（内部锁保护 deque）。"""
+    """线程池并发调用时严格放行 limit 次，且不同键之间不串额度。
+
+    barrier 让所有线程同时进入 check，最大化读写交错窗口；额外用第二个键
+    验证「一个键打满不影响另一个键」。GIL 下 deque 的追加本身是原子的，
+    这里的核心目标是把「读写交错导致误计 / 串桶」这类逻辑错误暴露出来。
+    """
     limiter = RateLimiter(limit=50, window_sec=60)
     allowed: list[bool] = []
     result_lock = threading.Lock()
+    barrier = threading.Barrier(10, timeout=10)
 
     def worker():
+        barrier.wait()
         local = [limiter.check("k") is None for _ in range(20)]
         with result_lock:
             allowed.extend(local)
@@ -95,9 +102,12 @@ def test_thread_safe_checks():
         thread.start()
     for thread in threads:
         thread.join()
-    assert sum(allowed) == 50
+    assert sum(allowed) == 50, f"应恰好放行 50 次，实际 {sum(allowed)}"
     assert limiter.status("k")[0] == 0
-    print("✓ 并发 check 严格按额度放行（内存桶线程安全）")
+    # 不同键的桶互不影响：另一个键仍然满额
+    assert limiter.check("other") is None
+    assert limiter.status("other")[0] == 49
+    print("✓ 并发 check 严格按额度放行（栅栏并发 + 桶隔离）")
 
 
 class _UnavailableRedis:

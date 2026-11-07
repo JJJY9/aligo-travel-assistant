@@ -309,16 +309,19 @@ class InformationQueryAgent(AgentBase):
         try:
             import asyncio
 
-            ddgs = DDGS()
-            # 开启安全搜索，优先 bing 后端（质量更稳定），多取几条再过滤
+            # 开启安全搜索，多取几条再过滤
             search_results = []
             backend_errors: list[str] = []
             loop = asyncio.get_running_loop()
-            for backend in ("bing", "duckduckgo", "auto"):
+            # ddgs 新版本已移除 bing 后端（调用会告警并必然失败）；
+            # duckduckgo / google 覆盖主流结果，auto 兜底
+            for backend in ("duckduckgo", "google", "auto"):
                 try:
                     def _search(backend_name: str = backend) -> list:
+                        # 每个后端用全新 DDGS 实例：共享实例在前两个后端失败后
+                        # 会让 auto 兜底直接报网络错误（实测），逐一新建可恢复
                         return list(
-                            ddgs.text(
+                            DDGS().text(
                                 query,
                                 max_results=10,
                                 safesearch="on",

@@ -62,9 +62,7 @@ async def test_rag_agent():
     )
 
     if not agent.initialized:
-        print("❌ RAG Agent未正确初始化")
-        print("   请先运行: python scripts/init_knowledge_base.py")
-        return
+        pytest.skip("RAG Agent 未初始化（请先运行初始化脚本）")
 
     print("✓ RAG Agent创建成功")
     stats = agent.get_stats()
@@ -201,6 +199,9 @@ async def test_rag_agent():
     print(f"总测试数: {len(test_cases)}")
     print(f"✓ 通过: {passed} ({passed/len(test_cases)*100:.0f}%)")
     print(f"✗ 失败: {failed} ({failed/len(test_cases)*100:.0f}%)")
+    # 汇总即结论：失败计数必须让测试失败（此前只打印，全部失败也判通过）
+    assert failed == 0, f"{failed}/{len(test_cases)} 个 RAG 用例失败"
+    assert passed == len(test_cases)
     print(f"平均响应时间: {total_time/len(test_cases):.1f}秒")
     print(f"总耗时: {total_time:.1f}秒")
     print("="*70)

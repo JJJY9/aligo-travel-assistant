@@ -121,9 +121,21 @@ def test_runner_imports_and_dedupes(monkeypatch):
     assert code == 0
     assert len(store.trips) == 2
     assert store.closed
-    # 重复导入：全部命中去重，只更新目的
-    code = cli.run_trips_import_standalone("u-import", path, as_json=True)
+    # 重复导入：全部命中去重，只更新目的（统计字段必须真实反映）
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone("u-import", path, as_json=True)
+    finally:
+        sys.stdout = real_stdout
     assert code == 0
+    payload = json.loads(captured.getvalue())
+    assert payload["created"] == 0 and payload["updated"] == 2, payload
+    assert len(store.trips) == 2, "重复导入不能新增行程"
+    # 字段保真：返程日期不能被导入路径丢掉
+    assert store.saved[-2]["end_date"] == "2026-12-03"
+    assert store.saved[-1]["end_date"] == ""
     print("✓ 导入与重复导入去重")
 
 

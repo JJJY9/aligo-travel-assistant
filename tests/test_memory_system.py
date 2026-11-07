@@ -246,12 +246,16 @@ async def test_memory_system():
     print("📝 验证短期记忆已清空:")
     recent_context = memory_manager.short_term.get_recent_context(n_turns=3)
     print(f"  - 剩余消息数: {len(recent_context)}")
+    assert recent_context == [], "end_session 必须清空短期记忆"
 
     print("\n📝 验证长期记忆仍然保留:")
     preferences = memory_manager.long_term.get_preference()
     print(f"  - 偏好项数: {len([v for v in preferences.values() if v])}")
+    # 关键断言：结束会话只清短期记忆，长期偏好 / 行程必须仍在
+    assert preferences.get("budget") == "经济型，每晚酒店预算500元以内"
     trip_history = memory_manager.long_term.get_trip_history(limit=5)
     print(f"  - 行程历史数: {len(trip_history)}")
+    assert len(trip_history) >= 3, "结束会话不能删除长期记忆里的行程"
 
     # ========== 测试跨会话持久化 ==========
     print_section("测试10: 跨会话持久化（新建会话，验证长期记忆保留）")
@@ -280,6 +284,12 @@ async def test_memory_system():
     for i, trip in enumerate(trip_history, 1):
         print(f"    {i}. {trip['origin']} → {trip['destination']} ({trip.get('start_date', '未知')})")
 
+    # 关键断言：新会话必须能读到上一会话写入的偏好与行程
+    assert preferences.get("accommodation") == "喜欢连锁酒店，如家、汉庭"
+    destinations = {str(trip.get("destination") or "") for trip in trip_history}
+    assert {"北京", "杭州", "成都"} <= destinations, (
+        f"跨会话必须能读到之前保存的行程，实际 {destinations}"
+    )
     print("\n✓ 跨会话持久化验证成功！")
 
     # ========== 完成 ==========

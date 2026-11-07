@@ -86,18 +86,38 @@ def test_health_endpoint():
 
 
 def test_health_marks_configured_redis_fallback_degraded(monkeypatch):
-    """配置 REDIS_URL 但限流器为进程内（启动时 Redis 不可用）时标记降级。"""
-    from context import storage
+    """配置 REDIS_URL 但限流器为进程内（启动时 Redis 不可用）时标记降级。
 
-    client = _client()
+    在 create_app 之前写入配置，构造出真正的「启动即配置了 Redis」状态；
+    并断言限流器仍是 Redis 实现且带工厂（换成纯内存实现会在类型断言失败）。
+    """
+    from context import storage
+    from utils.rate_limit import RedisRateLimiter
+    from webapp import server as server_module
+
     monkeypatch.setitem(
         storage.STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0"
     )
-    data = client.get("/api/health").json()
-    assert data["rate_limit"] == "memory"
-    assert data["rate_limit_configured"] is True
-    assert data["rate_limit_degraded"] is True
-    print("✓ 配置 Redis 但回退进程内限流时 health 标记降级")
+    reset = getattr(server_module, "reset_shared_redis_state", None)
+    if callable(reset):
+        reset()
+    storage.reset_failure_cache()
+    try:
+        client = _client()
+        state = client.app.state.aligo
+        assert isinstance(state.rate_limiter, RedisRateLimiter), (
+            "配置了 Redis 时桶应保留 Redis 实现（仅降级回退）"
+        )
+        assert state.rate_limiter.degraded is True
+        data = client.get("/api/health").json()
+        assert data["rate_limit"] == "redis", (
+            "限流器保留 Redis 实现时 backend 应报告 redis（回退由 degraded 表示）"
+        )
+        assert data["rate_limit_configured"] is True
+        assert data["rate_limit_degraded"] is True
+    finally:
+        storage.reset_failure_cache()
+    print("✓ 配置 Redis 但回退进程内限流时 health 标记降级（限流器仍为 Redis 实现）")
 
 
 def test_health_reports_any_degraded_limiter():
@@ -178,23 +198,30 @@ def test_weather_rate_limit(monkeypatch):
     print("✓ /api/weather 按 IP 独立限流（空白城市不耗额度）")
 
 
-def test_weather_endpoint_uses_dedicated_executor():
-    """天气端点改为异步 + 专用线程池：慢上游不会占满共享线程池。"""
-    import inspect
-    from concurrent.futures import ThreadPoolExecutor
+def test_weather_endpoint_uses_dedicated_executor(monkeypatch):
+    """天气请求必须真的跑在专用线程池里：慢上游不会阻塞事件循环。
+
+    行为断言：记录 fetch_weather 执行时的线程，要求不在主线程（同步调用）
+    且专用 executor 确实派生了线程（换成 asyncio.to_thread 共用默认池会失败）。
+    """
     from webapp import server as server_module
 
-    app = create_app(model=UsageTrackingModel(_FakeModel()))
-    routes = [
-        route for route in app.routes if getattr(route, "path", "") == "/api/weather"
-    ]
-    assert routes, "应存在 /api/weather 路由"
-    assert inspect.iscoroutinefunction(routes[0].endpoint), "天气端点应为异步函数"
+    executed: list[int] = []
 
+    def fake_fetch(city: str, timeout: float = 8.0) -> dict:
+        executed.append(threading.get_ident())
+        return {"city": city, "current": {}, "daily": [], "stale": False}
+
+    monkeypatch.setattr(server_module, "fetch_weather", fake_fetch)
+    client = TestClient(create_app(model=UsageTrackingModel(_FakeModel())))
+    response = client.get("/api/weather", params={"city": "北京"})
+    assert response.status_code == 200, response.text
+    assert executed and executed[0] != threading.get_ident(), (
+        "天气请求必须在工作线程执行（同步调用会阻塞事件循环）"
+    )
     executor = server_module._get_weather_executor()
-    assert isinstance(executor, ThreadPoolExecutor)
-    assert executor is server_module._get_weather_executor(), "线程池应复用同一实例"
-    print("✓ 天气端点使用专用线程池（异步执行）")
+    assert executor._threads, "请求应落在专用线程池（而非共享默认池）"
+    print("✓ 天气请求在专用线程池的工作线程执行")
 
 
 def test_status_endpoint():
@@ -307,6 +334,69 @@ def test_chat_stream_events():
         print("✓ /api/chat/stream 推送进度事件并以 done 结束")
     finally:
         _cleanup(user_id)
+
+
+def test_stream_forwards_agent_progress_events(monkeypatch):
+    """orchestrator 发出的 agent_start / agent_done 必须原样转发到 SSE。"""
+    from agents.orchestration_agent import OrchestrationAgent
+    from agentscope.message import Msg as _Msg
+
+    async def fake_reply(self, intention, on_event=None):
+        if on_event:
+            on_event({"type": "agent_start", "agent_name": "information_query"})
+            on_event(
+                {
+                    "type": "agent_done",
+                    "agent_name": "information_query",
+                    "status": "success",
+                    "duration": 0.1,
+                }
+            )
+        return _Msg(
+            name=self.name,
+            content=json.dumps(
+                {
+                    "status": "completed",
+                    "results": [
+                        {
+                            "agent_name": "information_query",
+                            "priority": 1,
+                            "status": "success",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            role="assistant",
+        )
+
+    monkeypatch.setattr(OrchestrationAgent, "reply", fake_reply)
+    client = TestClient(create_app(model=UsageTrackingModel(_FakeModel())))
+    user_id = _unique_user("web_test_agent_events")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "sess-agent-events",
+            },
+        ) as response:
+            assert response.status_code == 200
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+        types = [event["type"] for event in events]
+        assert "agent_start" in types, f"agent_start 未转发：{types}"
+        assert "agent_done" in types, f"agent_done 未转发：{types}"
+        done = events[-1]
+        assert done["type"] == "done"
+    finally:
+        _cleanup(user_id)
+    print("✓ SSE 转发 agent_start / agent_done 进度事件")
 
 
 def test_stream_heartbeat():
@@ -986,16 +1076,45 @@ def test_preference_panel_accepts_long_value():
 
 
 def test_last_turn_expect_accepts_long_message():
-    """CLI 写入的超长消息也应能通过 Web「编辑重发」删除。"""
+    """CLI 写入的超长消息也应能通过 Web「编辑重发」删除（并真的删掉）。"""
+    from context.storage import create_long_term_memory
+
     client = _client()
     user_id = _unique_user("web_test_long_expect")
+    long_text = "长" * 5000
     try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", long_text, "s-long")
+            store.add_chat_message("assistant", "收到", "s-long")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        mismatch = client.delete(
+            "/api/sessions/s-long/last-turn",
+            params={"user_id": user_id, "expect": "不匹配的提问"},
+        )
+        assert mismatch.status_code == 200
+        assert mismatch.json()["removed"] == 0 and mismatch.json()["mismatch"] is True
+
         response = client.delete(
             "/api/sessions/s-long/last-turn",
-            params={"user_id": user_id, "expect": "长" * 5000},
+            params={"user_id": user_id, "expect": long_text},
         )
         assert response.status_code == 200, response.text
-        print("✓ 编辑重发接受 4000 字以上的历史消息")
+        payload = response.json()
+        assert payload["removed"] >= 1, "超长 expect 必须能匹配并删除最后一轮"
+        assert payload["mismatch"] is False
+
+        detail = client.get(
+            "/api/sessions/s-long", params={"user_id": user_id}
+        ).json()
+        assert all(
+            message["content"] != long_text for message in detail["messages"]
+        ), "被删除的超长提问不应再出现在历史里"
+        print("✓ 编辑重发能删除 4000 字以上的历史消息")
     finally:
         _cleanup(user_id)
 
@@ -1143,14 +1262,18 @@ def test_session_cache_is_thread_safe():
     """会话缓存会被线程池（drop_session）与事件循环（get_session）并发修改。"""
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
+    # 小上限 + 共享键：让 LRU 淘汰在并发下真正执行（此前峰值 30 < 50，
+    # 淘汰分支从未跑过，删掉锁也照样通过）
+    state.max_sessions = 10
     errors: list[BaseException] = []
 
     def worker(n: int) -> None:
         try:
             for index in range(300):
+                state.get_session(f"u{n % 2}", f"shared-{index % 8}")
                 state.get_session(f"u{n}", f"s{n}-{index % 30}")
-                state.drop_session(f"u{n}", f"s{n}-{index % 30}")
-                state.get_session(f"u{9 - n}", f"shared-{index % 5}")
+                if index % 4 == 0:
+                    state.drop_session(f"u{n}", f"s{n}-{index % 30}")
         except BaseException as exc:  # noqa: BLE001 - 收集线程内异常
             errors.append(exc)
 
@@ -1160,9 +1283,13 @@ def test_session_cache_is_thread_safe():
     for thread in threads:
         thread.join()
     assert not errors, errors[:1]
-    assert len(state.sessions) <= state.max_sessions
+    assert len(state.sessions) <= state.max_sessions, (
+        f"缓存不能超上限，实际 {len(state.sessions)}"
+    )
+    # 共享键必须始终可用（并发淘汰不能把仍在用的键丢掉后返回 None）
+    assert state.get_session("u0", "shared-0") is not None
     state.close_all()
-    print("✓ 会话缓存并发安全")
+    print("✓ 会话缓存并发安全（小上限触发 LRU 淘汰）")
 
 
 def test_streaming_releases_user_lock():
@@ -2675,15 +2802,17 @@ def test_tombstone_helpers_are_thread_safe():
     """墓碑的 mark/unmark/读取会被线程池并发调用，OrderedDict 不能裸迭代。"""
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
+    # 小容量上限 + 共享用户前缀：让「清理过期 + 容量淘汰」在并发下频繁执行
+    state.max_tombstones = 50
     errors: list[BaseException] = []
 
     def worker(n: int) -> None:
         try:
             for i in range(1500):
-                state.mark_deleted(f"u{n}", f"s{i % 40}")
-                state.is_recently_deleted(f"u{n}", f"s{i % 40}")
+                state.mark_deleted(f"u{n % 3}", f"s{i % 40}")
+                state.is_recently_deleted(f"u{n % 3}", f"s{i % 40}")
                 if i % 3:
-                    state.unmark_deleted(f"u{n}", f"s{i % 40}")
+                    state.unmark_deleted(f"u{n % 3}", f"s{i % 40}")
         except BaseException as exc:  # noqa: BLE001 - 收集线程内异常
             errors.append(exc)
 
@@ -2693,8 +2822,10 @@ def test_tombstone_helpers_are_thread_safe():
     for thread in threads:
         thread.join()
     assert not errors, errors[:1]
-    assert len(state._deleted_sessions) <= state.max_tombstones
-    print("✓ 删除墓碑字典并发安全")
+    assert len(state._deleted_sessions) <= state.max_tombstones, (
+        f"墓碑数不能超上限，实际 {len(state._deleted_sessions)}"
+    )
+    print("✓ 删除墓碑字典并发安全（小上限触发淘汰）")
 
 
 def test_sessions_pagination():
@@ -2814,6 +2945,29 @@ def test_prometheus_metrics_endpoint():
         print("✓ /metrics Prometheus 文本指标")
     finally:
         REQUEST_METRICS.reset()
+
+
+def test_metrics_values_reflect_sessions_and_breaker():
+    """会话数 / 熔断失败计数 / 熔断状态的具体数值，而不是只有指标名。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.get_session("u-metrics", "s-metrics")
+    client = TestClient(app)
+    text = client.get("/metrics").text
+    assert f"aligo_sessions_cached {len(state.sessions)}" in text
+    assert "aligo_circuit_breaker_state 0" in text
+    assert "aligo_circuit_breaker_failures 0" in text
+
+    state.breaker.record_failure()
+    text = client.get("/metrics").text
+    assert "aligo_circuit_breaker_failures 1" in text
+    for _ in range(state.breaker.failure_threshold - 1):
+        state.breaker.record_failure()
+    text = client.get("/metrics").text
+    assert "aligo_circuit_breaker_state 2" in text, "阈值达到后应显示 open 状态"
+    state.breaker.record_success()  # 复位：避免影响同进程其它用例
+    state.close_all()
+    print("✓ /metrics 数值随会话与熔断状态变化")
 
 
 def test_prometheus_storage_gauges_reflect_state(monkeypatch):
@@ -3512,7 +3666,24 @@ def test_tombstone_expired_entries_pruned_before_eviction():
     assert "u\nold" not in state._deleted_sessions
     assert "u\nkeep" in state._deleted_sessions
     assert "u\nnew" in state._deleted_sessions
-    print("✓ 墓碑容量淘汰前先清理过期条目")
+    assert len(state._deleted_sessions) == 2, "清理过期后不应超过容量上限"
+
+    # 过期键比容量最早键「更新」：删掉过期清理分支时，容量淘汰会挤掉
+    # 仍有效的最旧墓碑 keep2，断言 keep2 存活即可区分两个分支
+    state._deleted_sessions.clear()
+    now = time.monotonic()
+    state._deleted_sessions["u\nkeep2"] = (now - 1, "keep2")
+    state._deleted_sessions["u\nexpired2"] = (
+        now - state.tombstone_ttl_sec - 1,
+        "expired2",
+    )
+    state.mark_deleted("u", "newer")
+    assert "u\nexpired2" not in state._deleted_sessions, "过期墓碑应先被清理"
+    assert "u\nkeep2" in state._deleted_sessions, (
+        "未被淘汰的有效墓碑不能因为缺少过期清理而被挤出"
+    )
+    assert state.is_recently_deleted("u", "newer") is True
+    print("✓ 墓碑容量淘汰前先清理过期条目（过期键非最旧）")
 
 
 def test_session_metadata_requires_existing_session():
@@ -5015,11 +5186,25 @@ def test_next_trip_from_full_history():
 
 
 def test_usage_by_day_local_date():
-    from datetime import datetime, timezone
+    """by_day 把 UTC 时间戳按本地日期分桶（固定时区 + 跨日时间戳）。
 
+    此前期望值用同一 astimezone 规则现算：UTC 的 CI 上删掉转换仍通过。
+    改为固定 TZ=Asia/Shanghai，喂「昨天 20:00 UTC」（= 东八区今天 04:00）：
+    正确实现把 5 tokens 记到今天，删掉转换会记到昨天——用桶内令牌数区分。
+    Windows 没有 time.tzset，跳过（CI 在 Linux 上校验）。
+    """
+    import time as time_module
+    from datetime import datetime, timedelta, timezone
+
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("当前平台不支持动态时区（time.tzset）")
     from webapp.server import _usage_summary
 
-    aware = datetime.now(timezone.utc).replace(microsecond=0)
+    utc_evening = datetime.now(timezone.utc).replace(
+        hour=20, minute=0, second=0, microsecond=0
+    ) - timedelta(days=1)
+    local_day = (utc_evening + timedelta(hours=8)).date().isoformat()
+    utc_day = utc_evening.date().isoformat()
     meta = {
         "usage": {"calls": 1, "input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
         "elapsed": 1.0,
@@ -5029,15 +5214,67 @@ def test_usage_by_day_local_date():
         {
             "role": "assistant",
             "content": json.dumps({"results": [], "_meta": meta}, ensure_ascii=False),
-            "timestamp": aware.isoformat(),
+            "timestamp": utc_evening.isoformat(),
             "session_id": "s",
         }
     ]
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time_module.tzset()
+    try:
+        usage = _usage_summary(history)
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time_module.tzset()
+    buckets = {day["date"]: day["tokens"] for day in usage["by_day"]}
+    assert buckets.get(local_day) == 5, f"应记到东八区日期 {local_day}: {buckets}"
+    assert buckets.get(utc_day) == 0, "UTC 日期桶不应计入（缺少时区转换）"
+    print("✓ by_day 使用本地日期（固定时区跨日时间戳）")
+
+
+def test_usage_summary_avg_and_top_agents_exact():
+    """avg_elapsed / top_agents 必须由元数据真实计算，而不是恒 0 / 空列表。"""
+    from webapp.server import _usage_summary
+
+    def _assistant(meta: dict) -> dict:
+        return {
+            "role": "assistant",
+            "content": json.dumps(
+                {"results": [], "_meta": meta}, ensure_ascii=False
+            ),
+            "timestamp": "2026-11-04T12:00:00+08:00",
+            "session_id": "s",
+        }
+
+    usage_meta = {
+        "calls": 1,
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "total_tokens": 5,
+    }
+    history = [
+        _assistant(
+            {
+                "usage": usage_meta,
+                "elapsed": 1.0,
+                "agents": [{"name": "x"}, {"name": "y"}],
+            }
+        ),
+        _assistant(
+            {"usage": usage_meta, "elapsed": 3.0, "agents": [{"name": "x"}]}
+        ),
+    ]
     usage = _usage_summary(history)
-    expected = aware.astimezone().date().isoformat()
-    bucket = next(day for day in usage["by_day"] if day["date"] == expected)
-    assert bucket["tokens"] == 5
-    print("✓ by_day 使用本地日期")
+    assert usage["avg_elapsed"] == 2.0, "平均耗时应为 (1+3)/2"
+    assert usage["top_agents"] == [
+        {"name": "x", "count": 2},
+        {"name": "y", "count": 1},
+    ], usage["top_agents"]
+    assert usage["calls"] == 2 and usage["total_tokens"] == 10
+    print("✓ usage 汇总的均值与 top_agents 为精确值")
 
 
 def test_invalid_user_id_rejected():

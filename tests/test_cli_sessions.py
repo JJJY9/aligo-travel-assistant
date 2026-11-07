@@ -176,21 +176,34 @@ def test_list_json_output(monkeypatch):
 
 
 def test_session_list_converts_utc_timestamps(monkeypatch):
-    """PostgreSQL 返回带时区的 UTC 时间，列表应按本地时区展示。"""
-    from datetime import datetime
+    """PostgreSQL 返回带时区的 UTC 时间，列表应按本地时区展示。
 
-    fake = _FakeStore(
-        [_message("user", "问题", "s-utc", "2026-11-04T12:00:00+00:00")]
-    )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
-    code, out = _run_list("u1")
-    expected = (
-        datetime.fromisoformat("2026-11-04T12:00:00+00:00")
-        .astimezone()
-        .strftime("%Y-%m-%d %H:%M")
-    )
-    assert code == 0 and expected in out
-    print("✓ UTC 时间戳按本地时区展示")
+    直接把 TZ 固定为 Asia/Shanghai 并给出字面量期望值：此前期望值用同一
+    astimezone 规则现算，在 UTC 的 CI 上删掉时区转换仍然通过。Windows 没有
+    time.tzset，跳过（CI 在 Linux 上做确定性校验）。
+    """
+    import time as time_module
+
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("当前平台不支持动态时区（time.tzset）")
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time_module.tzset()
+    try:
+        fake = _FakeStore(
+            [_message("user", "问题", "s-utc", "2026-11-04T12:00:00+00:00")]
+        )
+        monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+        code, out = _run_list("u1")
+        assert code == 0
+        assert "2026-11-04 20:00" in out, "UTC 12:00 应显示为东八区 20:00"
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time_module.tzset()
+    print("✓ UTC 时间戳按固定时区确定性展示")
 
 
 def test_empty_sessions(monkeypatch):

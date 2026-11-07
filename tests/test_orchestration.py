@@ -125,13 +125,18 @@ async def test_orchestration():
         print(f"✓ 提取实体: {intention_data.get('key_entities', {})}")
         print(f"✓ 调度计划: {len(intention_data.get('agent_schedule', []))} 个智能体")
         print()
+        assert intention_data.get("agent_schedule"), (
+            "行程场景必须调度至少一个智能体"
+        )
     except json.JSONDecodeError as e:
         print(f"✗ 意图识别失败: {e}")
-        return
+        raise AssertionError(f"意图识别结果不是合法 JSON：{e}") from e
 
-    # 智能体协调
+    # 智能体协调（与 CLI / Web 一致：先把用户消息写入记忆）
+    memory.add_message("user", user_query)
     print("步骤 2: 智能体协调执行")
     orchestration_result = await orchestrator.reply(intention_result)
+    memory.add_message("assistant", orchestration_result.content)
 
     try:
         result_data = json.loads(orchestration_result.content)
@@ -146,9 +151,11 @@ async def test_orchestration():
             print(f"  • {agent_name}: {status}")
 
         print()
+        assert result_data.get("results"), "编排结果必须包含子智能体执行记录"
+        assert int(result_data.get("agents_executed") or 0) >= 1
     except json.JSONDecodeError as e:
         print(f"✗ 协调执行失败: {e}")
-        return
+        raise AssertionError(f"编排结果不是合法 JSON：{e}") from e
 
     # ========== 测试场景 2: 信息查询 ==========
     print("[3] 测试场景 2: 信息查询")
@@ -166,21 +173,23 @@ async def test_orchestration():
         intention_data = json.loads(intention_result.content)
         print(f"✓ 识别意图: {[i['type'] for i in intention_data.get('intents', [])]}")
         print()
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         print("✗ 意图识别失败")
-        return
+        raise AssertionError(f"意图识别结果不是合法 JSON：{e}") from e
 
-    # 智能体协调
+    # 智能体协调（与 CLI / Web 一致：先把用户消息写入记忆）
+    memory.add_message("user", user_query)
     orchestration_result = await orchestrator.reply(intention_result)
+    memory.add_message("assistant", orchestration_result.content)
 
     try:
         result_data = json.loads(orchestration_result.content)
         print(f"✓ 执行状态: {result_data.get('status')}")
         print(f"✓ 执行智能体数: {result_data.get('agents_executed')}")
         print()
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         print("✗ 协调执行失败")
-        return
+        raise AssertionError(f"编排结果不是合法 JSON：{e}") from e
 
     # ========== 测试记忆更新 ==========
     print("[4] 测试记忆更新")
@@ -193,6 +202,9 @@ async def test_orchestration():
     recent = memory.short_term.get_recent_context(2)
     print(f"✓ 最近对话: {len(recent)} 条")
     print()
+    # 两轮对话各写入 user + assistant：记忆更新不能是空操作
+    assert short_stats["total_messages"] >= 4, "两轮对话应写入至少 4 条短期记忆"
+    assert recent, "短期记忆必须能读回最近的对话"
 
     # ========== 完成 ==========
     print("=" * 70)
