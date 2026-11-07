@@ -1018,6 +1018,39 @@ def test_filter_trips_by_query_multi_word_any_order(monkeypatch):
     print("✓ 多词筛选词序与空白无关")
 
 
+def test_trip_update_ignores_invalid_legacy_end(monkeypatch):
+    """历史行程的返程日期非法时，仅修改目的不应被日期校验拒绝。"""
+    store = _UpdateStore(
+        [
+            {
+                "trip_id": "trip_1",
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "未知",
+                "purpose": "出差",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"purpose": "会议"})
+    assert code == 0, out
+    assert store.updates[-1] == ("trip_1", {"purpose": "会议"})
+    print("✓ trip-update 历史脏日期不阻断其它字段更新")
+
+
+def test_trip_add_rejects_non_padded_date(monkeypatch):
+    """2026-1-1 这类非补零写法绕不过去重，必须按格式错误拒绝。"""
+    store = _UpdateStore([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_add("u1", "北京", "上海", "2026-1-1", None, "出差")
+    assert code == 1 and "YYYY-MM-DD" in out
+    print("✓ trip-add 拒绝非补零日期")
+
 if __name__ == "__main__":
     for case in (
         test_trip_conflicts_excludes_only_saved_record_with_duplicate_ids,
@@ -1056,4 +1089,6 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+        test_trip_update_ignores_invalid_legacy_end(mp)
+        test_trip_add_rejects_non_padded_date(mp)
     print("\n全部通过")

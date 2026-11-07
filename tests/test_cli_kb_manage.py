@@ -798,6 +798,34 @@ def test_kb_dedupe_dispatch(monkeypatch):
     print("✓ kb-dedupe dispatch 参数")
 
 
+def test_kb_add_gbk_file_friendly_error(monkeypatch):
+    """非 UTF-8 文件：友好报错并提示编码，不能抛 traceback。"""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    gbk = Path(tempfile.mkdtemp()) / "gbk.txt"
+    gbk.write_bytes("住宿标准：一线城市 500 元/晚".encode("gbk"))
+    code, out = _capture(cli.run_knowledge_add_standalone, str(gbk))
+    assert code == 1
+    assert "读取文件失败" in out and "UTF-8" in out
+    assert "Traceback" not in out
+    code, out = _capture(cli.run_knowledge_update_standalone, 7, str(gbk))
+    assert code == 1 and "读取文件失败" in out
+    print("✓ kb-add / kb-update 非 UTF-8 文件友好报错")
+
+
+def test_kb_show_json_missing_document(monkeypatch):
+    """--json 模式下不存在的片段也输出 JSON 而不是纯文本。"""
+    import json as json_module
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(knowledge_admin, "get_document_group", lambda doc_id: None)
+    code, out = _capture(cli.run_knowledge_show_standalone, 99, True)
+    payload = json_module.loads(out)
+    assert code == 1 and payload["ok"] is False and "不存在" in payload["error"]
+    print("✓ kb-show --json 缺失片段输出 JSON 错误")
+
 if __name__ == "__main__":
     for case in (
         test_list_unavailable,
@@ -840,4 +868,6 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+        test_kb_add_gbk_file_friendly_error(mp)
+        test_kb_show_json_missing_document(mp)
     print("\n全部通过")
