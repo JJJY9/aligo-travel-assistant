@@ -37,12 +37,25 @@ const PREF_NAMES = {
   budget_level: "预算等级",
 };
 
+function safeStorageGet(storage, key) {
+  // 浏览器禁用网站数据（隐私设置 / 沙箱 iframe）时 getItem 抛 SecurityError：
+  // 顶层状态初始化不能因此中断整个脚本（否则页面所有交互都失效）
+  try {
+    return storage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 const state = {
   userId:
-    sessionStorage.getItem("aligo.userId") ||
-    localStorage.getItem("aligo.userId") ||
+    safeStorageGet(sessionStorage, "aligo.userId") ||
+    safeStorageGet(localStorage, "aligo.userId") ||
     "web_user",
-  sessionId: sessionStorage.getItem("aligo.sessionId") || null,
+  sessionId: safeStorageGet(sessionStorage, "aligo.sessionId") || null,
+  // 初始化请求完成前不允许发送：此时页面还没展示已保存会话的历史，
+  // 发送会把消息写进一个界面从未展示过的旧会话
+  ready: false,
   sessions: [],
   searchQuery: "",
   status: null,
@@ -50,6 +63,8 @@ const state = {
   busy: false,
   controller: null,
   lastUserText: "",
+  // 本轮是否已收到 plan 事件：之前中止意味着提问尚未写入服务端历史
+  turnSawPlan: false,
   kbItems: [],
   kbTotal: 0,
   kbQuery: "",
@@ -74,6 +89,8 @@ const state = {
   archivedMatches: 0,
   sessionsLoading: false,
   sessionLoading: false,
+  // 正在进行加载的会话 id：删除其它会话时不能作废这次加载
+  sessionLoadingId: null,
   // 偏好编辑被取消时置位：刷新被有意跳过，面板关闭时补一次
   statusStale: false,
 };
@@ -626,6 +643,7 @@ function startEditUserNode(node, originalText) {
     restore();
   };
   const onKeydown = (event) => {
+    if (event.isComposing) return;
     if (event.key === "Escape") {
       event.stopPropagation();
       event.preventDefault();
@@ -677,9 +695,20 @@ function startEditUserNode(node, originalText) {
       return;
     }
     setBusy(false);
+    if (mismatch) {
+      // 服务端最后一轮与这条提问不一致：可能是历史被其它标签页 / CLI 修改，
+      // 也可能是本轮从未写入（服务端对两者返回相同结果）。与「重新生成」
+      // 保持同一保守语义：不删本地节点、不重发，避免历史出现重复问答
+      saving = false;
+      input.dataset.saving = "0";
+      save.disabled = false;
+      cancel.disabled = false;
+      save.textContent = "保存并重新发送";
+      toast("上一轮对话已变化，未重新发送；请刷新页面后重试");
+      return;
+    }
     input.removeEventListener("keydown", onKeydown);
-    // 本轮的用户提问与回答一并移除后重新发送；内容不一致说明这条提问
-    // 尚未写入历史，此时只清理界面并直接重发，不删除服务端上一轮
+    // 本轮的用户提问与回答一并移除后重新发送
     let next = node.nextElementSibling;
     while (next) {
       const following = next.nextElementSibling;
@@ -687,7 +716,6 @@ function startEditUserNode(node, originalText) {
       next = following;
     }
     node.remove();
-    if (mismatch) toast("这条提问还没有保存到历史，已直接重新发送");
     await sendMessage(text);
   }
 
@@ -880,6 +908,16 @@ async function regenerate(node, text) {
 function trimRegenButtons() {
   const buttons = [...els.messages.querySelectorAll('[data-action="regen"]')];
   buttons.slice(0, -1).forEach((button) => button.remove());
+  // 会话以「用户提问」结尾（提问已保存但没有回答：被停止 / 编排中断）时，
+  // 上一条回答的「重新生成」对应的已不是最后一轮：保留点击只会 mismatch，
+  // 甚至在两次提问文本相同时误删末尾提问
+  const messages = els.messages.querySelectorAll(".msg");
+  const last = messages[messages.length - 1];
+  if (last && last.classList.contains("user")) {
+    els.messages
+      .querySelectorAll('[data-action="regen"]')
+      .forEach((button) => button.remove());
+  }
 }
 
 const FOLLOW_UP_SETS = {
@@ -1015,16 +1053,25 @@ async function toggleTripsExpanded() {
 function resetTripForm() {
   state.tripEditingId = null;
   els.tripForm.reset();
+  els.tripEnd.dataset.hadInvalid = "";
   els.tripSubmit.textContent = "保存行程";
 }
 
 function startEditTrip(trip) {
   state.tripEditingId = trip.trip_id;
+  // 历史数据可能有未补零 / 带时间的日期：<input type=date> 会静默清空非法值，
+  // 若原样写入，用户保存其它字段时返程日期会被悄悄删掉
+  const startDate = normalizeISODate(trip.start_date);
+  const endDate = normalizeISODate(trip.end_date);
   els.tripOrigin.value = trip.origin || "";
   els.tripDestination.value = trip.destination || "";
-  els.tripStart.value = trip.start_date || "";
-  els.tripEnd.value = trip.end_date || "";
+  els.tripStart.value = startDate || "";
+  els.tripEnd.value = endDate || "";
   els.tripPurpose.value = trip.purpose || "";
+  els.tripEnd.dataset.hadInvalid = trip.end_date && !endDate ? "1" : "";
+  if (!startDate || (trip.end_date && !endDate)) {
+    toast("存在格式异常的日期，请核对后重新填写出发日期并确认返程日期");
+  }
   els.tripSubmit.textContent = "保存修改";
   els.tripForm.hidden = false;
   els.tripDestination.focus();
@@ -1048,6 +1095,14 @@ async function addTrip(event) {
     return;
   }
   const editingId = state.tripEditingId;
+  if (
+    editingId &&
+    !els.tripEnd.value &&
+    els.tripEnd.dataset.hadInvalid === "1" &&
+    !window.confirm("原返程日期格式异常，保存后将清除该返程日期。继续保存？")
+  ) {
+    return;
+  }
   const payload = {
     user_id: state.userId,
     origin: els.tripOrigin.value.trim(),
@@ -1464,6 +1519,7 @@ function newSession() {
   }
   sessionLoadToken += 1;
   state.sessionLoading = false;
+  state.sessionLoadingId = null;
   state.sessionId = null;
   sessionStorage.removeItem("aligo.sessionId");
   syncSessionControls();
@@ -1856,6 +1912,7 @@ async function openSession(sessionId, options = {}) {
   }
   const token = ++sessionLoadToken;
   state.sessionLoading = true;
+  state.sessionLoadingId = sessionId;
   // 加载期间隐藏旧会话的「编辑」入口，避免点击后无反馈
   refreshEditButtons();
   try {
@@ -1865,6 +1922,7 @@ async function openSession(sessionId, options = {}) {
     // 加载期间用户可能已开始新对话或切换会话，避免覆盖当前界面
     if (state.busy || token !== sessionLoadToken) return;
     if (!data.messages || !data.messages.length) {
+      if (options.preserveOnEmpty) return;
       if (!options.silent) toast("这个会话还没有消息");
       newSession();
       return;
@@ -1927,6 +1985,7 @@ async function openSession(sessionId, options = {}) {
   } finally {
     if (token === sessionLoadToken) {
       state.sessionLoading = false;
+      state.sessionLoadingId = null;
       // 加载期间 refreshEditButtons 被跳过，这里补回编辑入口
       refreshEditButtons();
     }
@@ -2007,16 +2066,21 @@ async function deleteSession(sessionId) {
     return;
   }
   if (!window.confirm("删除这个会话？聊天记录会从长期记忆中移除。")) return;
-  // 作废进行中的会话加载：否则删除后晚到的 GET 会把已删除的会话重新渲染出来，
-  // 后续消息还会以同一 session_id 复活它
-  sessionLoadToken += 1;
-  state.sessionLoading = false;
+  // 只在删除的正是「正在加载的会话」时作废这次加载；删除其它会话不能
+  // 把用户刚点击的会话切换静默丢弃（之后消息会写进错误的会话）
+  if (state.sessionLoadingId === sessionId) {
+    sessionLoadToken += 1;
+    state.sessionLoading = false;
+    state.sessionLoadingId = null;
+  }
   try {
     await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
       { method: "DELETE" },
     );
     if (state.sessionId === sessionId) {
+      // 不用 newSession()：它会自增会话加载序号，把正在进行的其它会话
+      // 切换一并作废
       state.sessionId = null;
       sessionStorage.removeItem("aligo.sessionId");
       syncSessionControls();
@@ -2041,6 +2105,11 @@ function setBusy(busy) {
 async function sendMessage(text, options = {}) {
   const message = String(text || "").trim();
   if (!message || state.busy) return;
+  if (!state.ready) {
+    // 初始化请求尚未完成：此时发送会把消息写进尚未展示历史记录的旧会话
+    toast("页面正在载入，请稍候…");
+    return;
+  }
   if (state.sessionLoading) {
     toast("会话正在加载，请稍候");
     return;
@@ -2050,6 +2119,7 @@ async function sendMessage(text, options = {}) {
   cancelPendingEdits();
   sessionLoadToken += 1;
   state.lastUserText = message;
+  state.turnSawPlan = false;
   state.controller = new AbortController();
   setBusy(true);
   trimRegenButtons();
@@ -2090,7 +2160,7 @@ async function sendMessage(text, options = {}) {
       if (response.status === 404) {
         // 删除发生在流建立之前：错误事件分支不会触发，这里同样要切回
         // 新对话状态，否则之后每条消息都会 404，界面还停留在已删除会话上
-        resetDeletedSessionState();
+        resetDeletedSessionState(message);
         toast("会话已被删除，下一条消息将开始新对话");
       }
       throw new Error(detail);
@@ -2099,7 +2169,8 @@ async function sendMessage(text, options = {}) {
       // 已收到 done / error 后忽略后续事件：连接错误不能覆盖已完成的回答
       if (terminal) return;
       if (event.type === "done" || event.type === "error") terminal = event.type;
-      handleStreamEvent(assistant, event);
+      if (event.type === "plan") state.turnSawPlan = true;
+      handleStreamEvent(assistant, event, message);
     });
     if (!terminal) {
       throw new Error("连接意外中断，回答可能不完整");
@@ -2110,6 +2181,12 @@ async function sendMessage(text, options = {}) {
       // 服务端已发过 done / error 后再中止（停止按钮晚点、切换会话）：
       // 保留已完成的回答，不能改成「已停止」
       if (!terminal) {
+        // plan 事件之前中止：提问没有写入服务端历史，把原文放回输入框，
+        // 避免「停止」把刚输入的内容永久丢掉
+        if (!state.turnSawPlan && !els.input.value.trim()) {
+          els.input.value = message;
+          resizeInput();
+        }
         mutate(() => {
           assistant.trace.fail("已停止");
           assistant.fail("已停止生成。");
@@ -2177,14 +2254,22 @@ async function readEventStream(body, onEvent) {
   }
 }
 
-function resetDeletedSessionState() {
+function resetDeletedSessionState(restoreText) {
   state.sessionId = null;
   sessionStorage.removeItem("aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
+  // 会话被删除后必须清空消息区：否则旧对话继续显示，后续消息写进全新
+  // 会话却追加在旧气泡下面，界面与真实历史前后不一致
+  showWelcome();
+  if (restoreText && !els.input.value.trim()) {
+    // 未能写入服务端的提问放回输入框，用户可以直接重发到新会话
+    els.input.value = restoreText;
+    resizeInput();
+  }
 }
 
-function handleStreamEvent(assistant, event) {
+function handleStreamEvent(assistant, event, userText) {
   switch (event.type) {
     case "phase":
       mutate(() => assistant.trace.phase(event.phase, event.label));
@@ -2236,7 +2321,7 @@ function handleStreamEvent(assistant, event) {
       // 会话在其它标签页 / CLI 被删除后，继续用旧 id 发送只会反复失败，
       // 墓碑过期后还会复活该会话；这里直接切回新对话状态
       if (message.includes("会话已删除")) {
-        resetDeletedSessionState();
+        resetDeletedSessionState(userText);
         toast("会话已被删除，下一条消息将开始新对话");
       }
       mutate(() => {
@@ -2368,7 +2453,12 @@ async function loadExpandedTrips() {
     // 保留旧列表：接口短暂失败不应把已展示的行程清空
     toast(`加载行程列表失败：${error.message || error}`);
   }
-  renderOverview();
+  if (preferenceEditActive()) {
+    // 记忆面板里正在编辑偏好：整体重渲染会销毁输入框，等保存 / 取消后的刷新补齐
+    state.statusStale = true;
+  } else {
+    renderOverview();
+  }
 }
 
 async function refreshStatus() {
@@ -2379,7 +2469,10 @@ async function refreshStatus() {
     // 丢弃过期响应：归档 / 切换用户后，旧请求可能晚到并覆盖新的归档计数
     if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = data;
-    if (state.tripsExpanded && Number(data.trip_count || 0) > 0) {
+    // 展开视图只在面板可见时重拉：面板关闭期间每条消息都重新请求 200 条
+    // 行程并重建两次列表纯属浪费；重新打开面板时 openMemorySheet 会再刷新
+    const sheetOpen = els.memorySheet && !els.memorySheet.hidden;
+    if (state.tripsExpanded && Number(data.trip_count || 0) > 0 && sheetOpen) {
       await loadExpandedTrips();
     } else if (!data.trip_count) {
       tripsRequestId += 1;
@@ -2389,6 +2482,12 @@ async function refreshStatus() {
     }
   } catch {
     if (requestId !== statusRequestId || userId !== state.userId) return;
+    if (state.status) {
+      // 存储故障 / 网络抖动：保留已渲染的数据概览，不能清空成「无法获取」
+      toast("刷新数据概览失败，已保留上次结果");
+      updateUserCard();
+      return;
+    }
     state.status = null;
   }
   updateUserCard();
@@ -2469,16 +2568,10 @@ function renderOverview() {
     : Array.isArray(status.trips)
       ? status.trips
       : [];
-  const filterText = state.tripsExpanded ? state.tripsFilter.trim().toLowerCase() : "";
-  const trips = filterText
-    ? allTrips.filter((trip) =>
-        [trip.origin, trip.destination, trip.purpose, trip.start_date, trip.end_date]
-          .map((value) => String(value || ""))
-          .join(" ")
-          .toLowerCase()
-          .includes(filterText),
-      )
-    : allTrips;
+  // 展开视图的筛选已由服务端完成（任意空白分词、词序无关、跨字段）：
+  // 这里不能再按整串 includes 二次过滤，否则多词查询会被误判为无匹配
+  const filterText = state.tripsExpanded ? state.tripsFilter.trim() : "";
+  const trips = allTrips;
   els.tripFilterRow.hidden = !state.tripsExpanded;
   if (state.tripsExpanded) {
     // 刷新状态时保留筛选框内容与光标位置
@@ -2486,7 +2579,11 @@ function renderOverview() {
       els.tripFilter.value = state.tripsFilter;
     }
     els.tripFilterCount.textContent = filterText
-      ? `匹配 ${trips.length} / ${allTrips.length} 条`
+      ? `匹配 ${state.tripsAllTotal || trips.length} 条${
+          state.tripsAllTotal > trips.length
+            ? `（已显示最近 ${trips.length} 条）`
+            : ""
+        }`
       : "";
   }
   els.trips.innerHTML = "";
@@ -3034,6 +3131,9 @@ function startEditPreference(row, type, currentValue) {
 
   const input = document.createElement("input");
   input.className = "pref-input";
+  // 与「添加偏好」表单和 PUT /api/preferences 的 500 字上限对齐：
+  // 超限时在输入阶段就截断，而不是提交后收到英文 422
+  input.maxLength = 500;
   input.value = preferenceInputValue(currentValue);
   valueEl.replaceWith(input);
   input.focus();
@@ -3380,7 +3480,13 @@ function renderKnowledgeDocuments(items, append) {
     els.kbList.appendChild(empty);
     return;
   }
+  // 分页期间库被其它标签页 / CLI 改动会让 offset 窗口整体后移：追加时按
+  // 已渲染 id 去重，否则同一片段出现两行，删除任一行会连带删除同一条记录
+  const seen = new Set(state.kbItems.map((id) => String(id)));
   for (const doc of items) {
+    const docKey = String(doc.id);
+    if (seen.has(docKey)) continue;
+    seen.add(docKey);
     const row = document.createElement("div");
     row.className = "pref-row kb-row";
     row.dataset.id = String(doc.id);
@@ -4100,6 +4206,7 @@ async function saveUser() {
     // 作废进行中的会话加载，并清掉 loading 标志：旧加载的 finally 会因
     // token 不匹配而跳过重置，否则之后一直提示「会话正在加载」
     state.sessionLoading = false;
+    state.sessionLoadingId = null;
     state.userId = value;
     els.historySearch.value = "";
     state.searchQuery = "";
@@ -4170,18 +4277,33 @@ function bindEvents() {
     if (!state.controller) return;
     const sessionId = state.sessionId;
     const token = sessionLoadToken;
+    const sawPlan = state.turnSawPlan;
     state.controller.abort();
     // 服务端可能在 done 帧到达前就已把回答写入历史：中止只中断读取，
     // 无法撤销写入。稍后重拉当前会话，若回答已落库就同步到界面，避免
-    // 出现「界面已停止、服务端却已保存」的不一致
-    if (sessionId) {
+    // 出现「界面已停止、服务端却已保存」的不一致。
+    // 但在 plan 事件之前中止意味着提问尚未写入，重拉只会用旧历史覆盖
+    // 界面（新会话还会被重置成欢迎页）——此时跳过同步，输入内容在
+    // sendMessage 的 AbortError 分支放回输入框
+    if (sessionId && sawPlan) {
       setTimeout(() => {
+        // 用户可能已打开提问编辑框 / 偏好编辑 / 重命名：整体重渲染会销毁
+        // 正在编辑的内容，跳过本次同步（可手动刷新）
+        const editing =
+          document.querySelector(".user-edit-input") ||
+          document.querySelector(".pref-input") ||
+          document.querySelector(".hi-input");
         if (
           sessionId === state.sessionId &&
           !state.busy &&
-          token === sessionLoadToken
+          token === sessionLoadToken &&
+          !editing
         ) {
-          openSession(sessionId, { silent: true, keepOnError: true });
+          openSession(sessionId, {
+            silent: true,
+            keepOnError: true,
+            preserveOnEmpty: true,
+          });
         }
       }, 600);
     }
@@ -4330,8 +4452,12 @@ function bindEvents() {
     );
   });
   els.exportTripsCsv.addEventListener("click", () => {
+    // 与列表同口径：展开视图下的筛选词随导出一起提交（服务端支持 q），
+    // 否则筛选后的「导出 CSV」会包含被筛掉的全部行程
+    const query = state.tripsExpanded ? state.tripsFilter.trim() : "";
+    const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
     downloadFromApi(
-      `/api/trips/export?user_id=${encodeURIComponent(state.userId)}`,
+      `/api/trips/export?user_id=${encodeURIComponent(state.userId)}${suffix}`,
       "aligo_trips.csv",
     );
   });
@@ -4461,7 +4587,13 @@ async function init() {
     showWelcome();
   }
   syncSessionControls();
-  els.input.focus();
+  state.ready = true;
+  // 初始化期间用户可能已打开记忆面板 / 在侧栏搜索框输入：此时抢焦点会把
+  // 输入内容送进被弹层遮住的聊天框，回车直接变成发送
+  const active = document.activeElement;
+  if (!isModalOpen() && (!active || active === document.body)) {
+    els.input.focus();
+  }
   requestAnimationFrame(resizeInput);
 }
 
