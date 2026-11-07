@@ -9,6 +9,7 @@
 import contextlib
 import io
 import json
+import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -918,8 +919,110 @@ def test_trips_query_args_and_dispatch(monkeypatch):
     print("✓ trips --query 参数解析与 dispatch")
 
 
+def test_trip_conflicts_excludes_only_saved_record_with_duplicate_ids(monkeypatch):
+    """重复 trip_id：按身份排除本次保存的那条，其它同 id 行程仍参与重叠判断。"""
+    from utils.trip_conflicts import find_saved_trip
+
+    record = {
+        "trip_id": "trip_1",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-03",
+    }
+    other = {
+        "trip_id": "trip_1",
+        "origin": "北京",
+        "destination": "广州",
+        "start_date": "2026-12-02",
+        "end_date": "2026-12-04",
+    }
+    third = {
+        "trip_id": "trip_2",
+        "origin": "北京",
+        "destination": "深圳",
+        "start_date": "2026-12-03",
+        "end_date": "2026-12-05",
+    }
+    trips = [record, other, third]
+    saved = find_saved_trip(trips, "trip_1", record)
+    assert saved is record
+    conflicts = trip_conflicts(
+        trips,
+        datetime(2026, 12, 1),
+        datetime(2026, 12, 3),
+        exclude_id="trip_1",
+        exclude_trip=saved,
+    )
+    destinations = [trip["destination"] for trip in conflicts]
+    assert "上海" not in destinations, "本次保存的记录应被排除"
+    assert "广州" in destinations and "深圳" in destinations
+    print("✓ 重复 trip_id 下按身份排除本次记录")
+
+
+def test_trip_conflicts_exclude_id_only_when_unique(monkeypatch):
+    """exclude_id 在 id 重复时不能整条排除（会隐藏其它行程的真实重叠）。"""
+    dup1 = {
+        "trip_id": "trip_1",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+    }
+    dup2 = dict(dup1)
+    conflicts = trip_conflicts(
+        [dup1, dup2],
+        datetime(2026, 12, 1),
+        datetime(2026, 12, 2),
+        exclude_id="trip_1",
+    )
+    assert len(conflicts) == 2, "重复 id 无法区分数本条时必须都参与重叠判断"
+    assert (
+        trip_conflicts(
+            [dup1],
+            datetime(2026, 12, 1),
+            datetime(2026, 12, 2),
+            exclude_id="trip_1",
+        )
+        == []
+    ), "唯一 id 时排除本条"
+    print("✓ exclude_id 仅在唯一时整条排除")
+
+
+def test_trip_interval_warns_on_invalid_end(caplog):
+    """返程日期非法（历史脏数据）时告警并按出发当日计算。"""
+    with caplog.at_level(logging.WARNING, logger="utils.trip_conflicts"):
+        interval = trip_interval(
+            {"trip_id": "t1", "start_date": "2026-12-01", "end_date": "未知"}
+        )
+    assert interval == (datetime(2026, 12, 1), datetime(2026, 12, 1))
+    assert any("无法解析" in record.message for record in caplog.records)
+    print("✓ 返程日期非法时告警并按出发当日计算")
+
+
+def test_filter_trips_by_query_multi_word_any_order(monkeypatch):
+    """多词筛选：任意空白（含全角）分隔、词序无关、全部命中才保留。"""
+    from utils.trip_conflicts import filter_trips_by_query
+
+    trips = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "purpose": "出差",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+        }
+    ]
+    assert filter_trips_by_query(trips, "上海 北京") == trips
+    assert filter_trips_by_query(trips, "北京　上海") == trips
+    assert filter_trips_by_query(trips, "上海  北京") == trips, "多空格应合并"
+    assert filter_trips_by_query(trips, "上海 广州") == []
+    print("✓ 多词筛选词序与空白无关")
+
+
 if __name__ == "__main__":
     for case in (
+        test_trip_conflicts_excludes_only_saved_record_with_duplicate_ids,
+        test_trip_conflicts_exclude_id_only_when_unique,
+        test_filter_trips_by_query_multi_word_any_order,
         test_trip_interval_and_state,
         test_filter_trips_by_query_helper,
         test_trips_with_conflicts_uses_pool_without_mutation,

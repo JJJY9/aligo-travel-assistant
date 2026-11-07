@@ -207,6 +207,7 @@ let statusRequestId = 0;
 // 行程列表（展开全部 / 状态刷新时的二次请求）共用序号：只应用最新一次结果，
 // 防止切换用户后旧用户的数据被渲染（行内删除按当前用户执行，会误删同名 trip_id）
 let tripsRequestId = 0;
+let tripFilterTimer = null;
 let searchTimer = null;
 let memorySheetOpener = null;
 let shortcutOpener = null;
@@ -991,9 +992,12 @@ async function toggleTripsExpanded() {
   const requestId = (tripsRequestId += 1);
   els.expandTrips.disabled = true;
   try {
-    // order=desc：取「最近 200 条」，而不是最早的 200 条
+    // order=desc：取「最近 200 条」，而不是最早的 200 条；保留筛选词
+    // （服务端按 q 过滤完整历史，避免重开面板后旧行程又"消失"）
+    const query = state.tripsFilter.trim();
+    const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
     const data = await getJSON(
-      `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc`,
+      `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
     );
     if (requestId !== tripsRequestId || userId !== state.userId) return;
     state.tripsAll = data.trips || [];
@@ -2345,6 +2349,28 @@ async function refreshMetrics() {
   }
 }
 
+async function loadExpandedTrips() {
+  // 展开视图按服务端 q 过滤完整历史（此前只过滤最近 200 条的本地缓存，
+  // 更早的行程会被误报为无匹配）；limit 仍是最近 200 条匹配
+  const userId = state.userId;
+  const requestId = (tripsRequestId += 1);
+  const query = state.tripsFilter.trim();
+  const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
+  try {
+    const tripsData = await getJSON(
+      `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
+    );
+    if (requestId !== tripsRequestId || userId !== state.userId) return;
+    state.tripsAll = tripsData.trips || [];
+    state.tripsAllTotal = Number(tripsData.total || state.tripsAll.length);
+  } catch (error) {
+    if (requestId !== tripsRequestId || userId !== state.userId) return;
+    // 保留旧列表：接口短暂失败不应把已展示的行程清空
+    toast(`加载行程列表失败：${error.message || error}`);
+  }
+  renderOverview();
+}
+
 async function refreshStatus() {
   const requestId = (statusRequestId += 1);
   const userId = state.userId;
@@ -2354,20 +2380,7 @@ async function refreshStatus() {
     if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = data;
     if (state.tripsExpanded && Number(data.trip_count || 0) > 0) {
-      const tripRequestId = (tripsRequestId += 1);
-      try {
-        const tripsData = await getJSON(
-          `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc`,
-        );
-        if (requestId !== statusRequestId || userId !== state.userId) return;
-        if (tripRequestId !== tripsRequestId) return;
-        state.tripsAll = tripsData.trips || [];
-        state.tripsAllTotal = Number(tripsData.total || state.tripsAll.length);
-      } catch (error) {
-        if (requestId !== statusRequestId || userId !== state.userId) return;
-        // 保留旧列表：接口短暂失败不应把已展示的行程清空
-        toast(`加载行程列表失败：${error.message || error}`);
-      }
+      await loadExpandedTrips();
     } else if (!data.trip_count) {
       tripsRequestId += 1;
       state.tripsExpanded = false;
@@ -2794,10 +2807,22 @@ function todayISO() {
   ).padStart(2, "0")}`;
 }
 
+function normalizeISODate(value) {
+  // 只接受 YYYY-M-D 形态并补零：历史数据可能未补零（2026-1-5），
+  // 字符串字典序会把它们排错；非日期文本返回 null
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!match) return null;
+  return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+}
+
 function tripStatus(trip) {
-  const start = String(trip.start_date || "");
+  const start = normalizeISODate(trip.start_date);
   if (!start) return null;
-  const end = String(trip.end_date || start);
+  const rawEnd = normalizeISODate(trip.end_date);
+  // 返程缺失 / 非法时按出发当日计算：此前任意非日期文本会让「今天 > end」
+  // 恒为假，行程永久显示「进行中」
+  const end = rawEnd && rawEnd >= start ? rawEnd : start;
   const today = todayISO();
   if (today < start) return { label: "即将出行", cls: "upcoming" };
   if (today > end) return { label: "已结束", cls: "past" };
@@ -2812,8 +2837,14 @@ function pickUpcomingTrip(trips) {
   const ongoing = candidates
     .filter((item) => item.status.cls === "active")
     .sort((a, b) =>
-      String(b.trip.end_date || b.trip.start_date).localeCompare(
-        String(a.trip.end_date || a.trip.start_date),
+      String(
+        normalizeISODate(b.trip.end_date) || normalizeISODate(b.trip.start_date) || "",
+      ).localeCompare(
+        String(
+          normalizeISODate(a.trip.end_date) ||
+            normalizeISODate(a.trip.start_date) ||
+            "",
+        ),
       ),
     );
   if (ongoing.length) return ongoing[0].trip;
@@ -4320,7 +4351,13 @@ function bindEvents() {
   els.expandTrips.addEventListener("click", toggleTripsExpanded);
   els.tripFilter.addEventListener("input", () => {
     state.tripsFilter = els.tripFilter.value;
-    renderOverview();
+    clearTimeout(tripFilterTimer);
+    if (state.tripsExpanded) {
+      // 关键词在服务端过滤完整历史（防抖，避免每次按键都请求）
+      tripFilterTimer = setTimeout(loadExpandedTrips, 250);
+    } else {
+      renderOverview();
+    }
   });
   els.addTripBtn.addEventListener("click", () => {    if (els.tripForm.hidden) {
       resetTripForm();
