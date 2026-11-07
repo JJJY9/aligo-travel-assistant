@@ -108,6 +108,8 @@ const state = {
   tripsAll: [],
   tripsAllTotal: 0,
   tripsFilter: "",
+  // 行程状态筛选（active / upcoming / past）：与面板状态徽标同一口径
+  tripsStatusFilter: "",
   sessionTotal: 0,
   showArchived: false,
   archivedCount: 0,
@@ -207,6 +209,7 @@ const els = {
   exportTrips: byId("exportTrips"),
   exportTripsCsv: byId("exportTripsCsv"),
   exportTripsHtml: byId("exportTripsHtml"),
+  tripStatusFilter: byId("tripStatusFilter"),
   addTripBtn: byId("addTripBtn"),
   expandTrips: byId("expandTrips"),
   tripFilterRow: byId("tripFilterRow"),
@@ -1122,7 +1125,10 @@ async function toggleTripsExpanded() {
     // order=desc：取「最近 200 条」，而不是最早的 200 条；保留筛选词
     // （服务端按 q 过滤完整历史，避免重开面板后旧行程又"消失"）
     const query = state.tripsFilter.trim();
-    const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
+    const status = state.tripsStatusFilter;
+    const suffix =
+      (query ? `&q=${encodeURIComponent(query)}` : "") +
+      (status ? `&status=${encodeURIComponent(status)}` : "");
     const data = await getJSON(
       `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
     );
@@ -2675,7 +2681,10 @@ async function loadExpandedTrips() {
   const userId = state.userId;
   const requestId = (tripsRequestId += 1);
   const query = state.tripsFilter.trim();
-  const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
+  const status = state.tripsStatusFilter;
+  const suffix =
+    (query ? `&q=${encodeURIComponent(query)}` : "") +
+    (status ? `&status=${encodeURIComponent(status)}` : "");
   try {
     const tripsData = await getJSON(
       `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
@@ -2821,20 +2830,38 @@ function renderOverview() {
   // 展开视图的筛选已由服务端完成（任意空白分词、词序无关、跨字段）：
   // 这里不能再按整串 includes 二次过滤，否则多词查询会被误判为无匹配
   const filterText = state.tripsExpanded ? state.tripsFilter.trim() : "";
-  const trips = allTrips;
+  // 收起视图只有最近 5 条（/api/status），状态筛选在本地按同一口径过滤；
+  // 展开视图由服务端 ?status= 过滤完整历史
+  const statusValue = state.tripsStatusFilter;
+  const trips =
+    !state.tripsExpanded && statusValue
+      ? allTrips.filter((trip) => {
+          const status = tripStatus(trip);
+          return status && status.cls === statusValue;
+        })
+      : allTrips;
   els.tripFilterRow.hidden = !state.tripsExpanded;
   if (state.tripsExpanded) {
     // 刷新状态时保留筛选框内容与光标位置
     if (els.tripFilter.value !== state.tripsFilter) {
       els.tripFilter.value = state.tripsFilter;
     }
-    els.tripFilterCount.textContent = filterText
+    if (els.tripStatusFilter && els.tripStatusFilter.value !== state.tripsStatusFilter) {
+      els.tripStatusFilter.value = state.tripsStatusFilter;
+    }
+    const statusText =
+      els.tripStatusFilter && statusValue
+        ? els.tripStatusFilter.options[els.tripStatusFilter.selectedIndex]?.textContent || ""
+        : "";
+    const countText = filterText
       ? `匹配 ${state.tripsAllTotal || trips.length} 条${
           state.tripsAllTotal > trips.length
             ? `（已显示最近 ${trips.length} 条）`
             : ""
         }`
       : "";
+    els.tripFilterCount.textContent =
+      statusText && !filterText ? statusText : countText;
   }
   els.trips.innerHTML = "";
   if (!trips.length) {
@@ -4561,6 +4588,7 @@ async function saveUser() {
     state.tripsAll = [];
     state.tripsAllTotal = 0;
     state.tripsFilter = "";
+    state.tripsStatusFilter = "";
     // 立即清空上一个用户的列表与面板：新用户的 /api/sessions、/api/status
     // 返回前旧行仍可点击，而删除 / 编辑按当前 user_id 执行，会误伤新用户的同名记录
     closeMemorySheet();
@@ -4825,6 +4853,17 @@ function bindEvents() {
       renderOverview();
     }
   });
+  if (els.tripStatusFilter) {
+    els.tripStatusFilter.addEventListener("change", () => {
+      state.tripsStatusFilter = els.tripStatusFilter.value;
+      if (state.tripsExpanded) {
+        // 展开视图交给服务端按状态过滤完整历史（与 CLI --status 同口径）
+        loadExpandedTrips();
+      } else {
+        renderOverview();
+      }
+    });
+  }
   els.addTripBtn.addEventListener("click", () => {    if (els.tripForm.hidden) {
       resetTripForm();
       els.tripForm.hidden = false;

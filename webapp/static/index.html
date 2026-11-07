@@ -394,6 +394,12 @@
             placeholder="筛选行程（路线 / 日期 / 目的）"
             aria-label="筛选行程"
           />
+          <select id="tripStatusFilter" class="trip-status-filter" aria-label="按状态筛选行程">
+            <option value="">全部状态</option>
+            <option value="active">进行中</option>
+            <option value="upcoming">即将出行</option>
+            <option value="past">已结束</option>
+          </select>
           <span class="empty" id="tripFilterCount" role="status"></span>
         </div>
         <div class="trip-list" id="trips"></div>
