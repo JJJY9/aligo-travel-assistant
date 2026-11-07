@@ -32,6 +32,8 @@ aligo_travel_assistant-*/
 .pytest_cache/
 .coverage
 .coverage.*
+.coverage*
+.tmp_verify/
 .mypy_cache/
 .ruff_cache/
 
