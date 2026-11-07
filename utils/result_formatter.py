@@ -43,12 +43,19 @@ def preference_label(pref_type: str) -> str:
 
 def _pref_value_text(value: Any) -> str:
     """偏好 / 事项字段的可读文本：列表逐项连接，不再输出 Python repr。"""
+    if value is None:
+        return ""
     if isinstance(value, (list, tuple)):
-        return "、".join(_pref_value_text(item) for item in value)
-    if isinstance(value, dict):
         return "、".join(
-            f"{key}：{_pref_value_text(item)}" for key, item in value.items()
+            text for text in (_pref_value_text(item) for item in value) if text
         )
+    if isinstance(value, dict):
+        rendered = []
+        for key, item in value.items():
+            text = _pref_value_text(item)
+            if text:
+                rendered.append(f"{key}：{text}")
+        return "、".join(rendered)
     return str(value)
 
 
@@ -102,7 +109,7 @@ def _render_itinerary(itinerary: Any) -> str:
         return f"## ✈️ 行程规划\n\n{itinerary}"
     if not isinstance(itinerary, dict):
         return f"## ✈️ 行程规划\n\n{itinerary}"
-    lines = [f"## ✈️ {itinerary.get('title', '行程规划')}"]
+    lines = [f"## ✈️ {itinerary.get('title') or '行程规划'}"]
     if itinerary.get("duration"):
         lines.append(f"**时长**：{itinerary['duration']}")
 
@@ -116,7 +123,8 @@ def _render_itinerary(itinerary: Any) -> str:
         if not isinstance(day_plan, dict):
             lines.append(f"### {day_plan}")
             continue
-        lines.append(f"### 第 {day_plan.get('day', '?')} 天")
+        day = day_plan.get("day")
+        lines.append(f"### 第 {'?' if day is None else day} 天")
         activities = day_plan.get("activities") or day_plan.get("time_slots") or []
         if isinstance(activities, dict):
             activities = list(activities.values())
@@ -126,7 +134,7 @@ def _render_itinerary(itinerary: Any) -> str:
             if not isinstance(slot, dict):
                 lines.append(f"- {slot}")
                 continue
-            time_text = slot.get("time", "")
+            time_text = slot.get("time") or ""
             activity = slot.get("activity") or slot.get("location") or ""
             description = slot.get("description", "")
             transport = slot.get("transport", "")
@@ -196,8 +204,13 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                 action_raw = str(pref.get("action") or "replace").strip().lower()
                 action = "追加" if action_raw in {"append", "add", "追加"} else "设置为"
                 name = preference_label(pref_type)
-                lines.append(f"- {name} **{action}** {_pref_value_text(value)}")
-            return "\n".join(lines)
+                text_value = _pref_value_text(value)
+                if not pref_type or not text_value:
+                    # 与落库路径一致：null / 空值不会写入偏好，回显同样跳过
+                    # （否则出现「已更新偏好 设置为 None」但实际未保存）
+                    continue
+                lines.append(f"- {name} **{action}** {text_value}")
+            return "\n".join(lines) if len(lines) > 1 else ""
         return ""
 
     if agent_name == "event_collection":

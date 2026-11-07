@@ -58,7 +58,25 @@ def test_custom_title_single_line_and_escaped():
     print("✓ 会话标题单行化并转义")
 
 
+def test_fallback_title_escaped_like_custom():
+    """无自定义标题时首条用户消息同样清洗：尖括号不能原样落进标题行。"""
+    lines = [
+        {
+            "role": "user",
+            "content": "<script>alert(1)</script> 你好",
+            "session_id": "s1",
+            "timestamp": "t0",
+        }
+    ]
+    markdown, count = render_all_sessions_markdown("u1", lines, {})
+    assert count == 1
+    assert "## &lt;script&gt;alert(1)&lt;/script&gt; 你好" in markdown
+    assert "## <script>" not in markdown, "回退标题必须与自定义标题同样转义"
+    print("✓ 回退标题与自定义标题同一清洗口径")
+
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
+    test_fallback_title_escaped_like_custom()
     print("\n全部通过")

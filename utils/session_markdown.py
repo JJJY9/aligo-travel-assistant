@@ -22,7 +22,9 @@ def _session_title(
         if message.get("role") == "user":
             text = " ".join(str(message.get("content", "")).split())
             if text:
-                return text[:40]
+                # 回退标题同样来自用户输入：与自定义标题一样清洗，
+                # 否则 <script> 之类会原样落进 `## ` 标题行
+                return sanitize_title(text[:40])
     return "Aligo 对话"
 
 

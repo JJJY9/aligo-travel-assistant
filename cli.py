@@ -3549,24 +3549,24 @@ def run_session_export_standalone(
         return 1
 
     title = str(titles.get(session_id) or "")
-    if title:
-        # 自定义标题来自用户：换行会伪造导出结构、尖括号会当 HTML 落盘
-        # （与 sessions-export / Web 导出同一清洗逻辑）
-        from utils.session_markdown import sanitize_title
-
-        title = sanitize_title(title)
     if not title:
         for message in messages:
             if message.get("role") == "user":
                 title = " ".join(str(message.get("content", "")).split())[:40]
                 break
-    title = title or "Aligo 对话"
+    # 换行会伪造导出结构：先折叠空白；尖括号的转义按出口区分——HTML 导出
+    # 由 render_session_html 统一 _escape（预转义会双重转义成 &amp;lt;），
+    # Markdown 导出用 sanitize_title
+    title = " ".join(title.split()) or "Aligo 对话"
 
     if html:
         from utils.session_html import render_session_html
 
         text = render_session_html(user_id, session_id, title, messages)
     else:
+        from utils.session_markdown import sanitize_title
+
+        title = sanitize_title(title)
         lines = [
             f"# {title}",
             "",
