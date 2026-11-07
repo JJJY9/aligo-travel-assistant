@@ -1080,6 +1080,16 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   margin-bottom: 8px;
 }
 .trip-filter .kb-search { flex: 1; }
+.trip-filter .trip-status-filter {
+  flex: none;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+}
 .trip-filter .empty { flex: none; font-size: 12px; }
 
 .empty { font-size: 12.5px; color: var(--ink-3); }
