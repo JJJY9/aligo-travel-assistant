@@ -183,8 +183,12 @@ class PostgresLongTermMemory:
                     )
         logger.info("PostgreSQL 连接已重建（user=%s）", self.user_id)
 
-    def _run_with_retry(self, operation):
+    def _run_with_retry(self, operation, replay_safe: bool = True):
         """执行一次数据库操作；连接级错误时重连并重试一次。
+
+        ``replay_safe=False`` 用于非幂等写入（如不带去重的批量插入）：
+        提交后的连接错误无法区分「是否已提交」，重放会产生重复数据，
+        直接按持久化失败上报，由调用方决定是否整体重试。
 
         重试后仍失败统一包装为 ``MemoryPersistenceError``：调用方按「存储
         暂时不可用」降级（Web 返回 503、对话运行时不计入 LLM 熔断器），
@@ -192,7 +196,11 @@ class PostgresLongTermMemory:
         """
         try:
             return operation()
-        except self._retry_errors:
+        except self._retry_errors as first_exc:
+            if not replay_safe:
+                raise MemoryPersistenceError(
+                    f"PostgreSQL 操作失败：{first_exc}"
+                ) from first_exc
             try:
                 self._reconnect()
                 return operation()
@@ -354,6 +362,13 @@ class PostgresLongTermMemory:
             with self._conn.transaction(), self._conn.cursor() as cursor:
                 kept = rows
                 if dedupe:
+                    # READ COMMITTED 下两个并发导入都能在 SELECT 里看不到对方
+                    # 尚未提交的行：先拿用户级事务锁串行化「查重 + 插入」，
+                    # 否则并发恢复同一备份会把消息插成两倍
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"aligo:chat_messages:{self.user_id}",),
+                    )
                     cursor.execute(
                         "SELECT session_id, role, content FROM aligo_chat_messages "
                         "WHERE user_id = %s",
@@ -381,7 +396,9 @@ class PostgresLongTermMemory:
                 )
                 return len(kept)
 
-        return int(self._run_with_retry(run) or 0)
+        # dedupe=True 的重放会在 SELECT 里看到已提交行并全部跳过，天然幂等；
+        # 不带去重的批量插入重放会产生重复消息，禁止自动重放
+        return int(self._run_with_retry(run, replay_safe=dedupe) or 0)
 
     def get_chat_history(
         self,
