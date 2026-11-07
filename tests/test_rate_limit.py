@@ -182,6 +182,53 @@ def test_redis_limiter_recovers_after_cooldown(monkeypatch):
     print("✓ Redis 限流冷却到期后自动恢复")
 
 
+def test_probe_recovers_idle_bucket_after_cooldown(monkeypatch):
+    """低频桶在冷却到期后由健康探测恢复（不需要该桶再收到请求）。"""
+    import utils.rate_limit as rate_limit_module
+
+    times = {"now": 1000.0}
+    monkeypatch.setattr(rate_limit_module.time, "monotonic", lambda: times["now"])
+
+    class _Pingable(_UnavailableRedis):
+        def __init__(self):
+            super().__init__()
+            self.up = False
+            self.pings = 0
+
+        def eval(self, *args, **kwargs):
+            self.eval_calls += 1
+            if not self.up:
+                raise ConnectionError("redis down")
+            return -1
+
+        def ping(self):
+            self.pings += 1
+            if not self.up:
+                raise ConnectionError("redis down")
+            return True
+
+    client = _Pingable()
+    limiter = RedisRateLimiter(client, "unit-probe", limit=2, window_sec=60)
+    assert limiter.check("k") is None
+    assert limiter.degraded is True
+
+    # 冷却期内不探测（沿用上次失败的结论）
+    assert limiter.probe() is False
+    assert client.pings == 0
+
+    times["now"] += 61
+    assert limiter.probe() is False, "探测失败继续报降级"
+    assert client.pings == 1
+    assert limiter.degraded is True
+
+    client.up = True
+    times["now"] += 61
+    assert limiter.probe() is True
+    assert limiter.degraded is False
+    assert limiter.check("k") is None, "恢复后重新走 Redis 共享计数"
+    print("✓ 冷却到期后健康探测恢复低频限流桶")
+
+
 def test_create_rate_limiter_backends():
     memory = create_rate_limiter("unit", 1, 60)
     assert isinstance(memory, RateLimiter)

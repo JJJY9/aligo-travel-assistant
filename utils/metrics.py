@@ -51,6 +51,9 @@ class RequestMetrics:
         self._duration_sum_ms = 0.0
         self._duration_max_ms = 0.0
         self._durations: deque[float] = deque(maxlen=MAX_DURATION_SAMPLES)
+        # 真正计时过的请求数：平均耗时只能用这个做分母——流式（SSE）请求
+        # 只加 requests_total，若用总请求数作分母，流式越多平均值越接近 0
+        self._duration_count = 0
         # SSE 长连接的耗时不计入延迟分位（详见 record 的 streaming 参数）；
         # 另有独立计数记录「HTTP 200 但以 error 事件收尾」的流式回合
         self._sse_errors = 0
@@ -85,6 +88,7 @@ class RequestMetrics:
                 self._by_path[_OTHER] += 1
             if not streaming:
                 self._duration_sum_ms += elapsed
+                self._duration_count += 1
                 self._duration_max_ms = max(self._duration_max_ms, elapsed)
                 self._durations.append(elapsed)
 
@@ -107,7 +111,11 @@ class RequestMetrics:
                 "by_status": {str(key): value for key, value in sorted(self._by_status.items())},
                 "by_method": dict(self._by_method.most_common(20)),
                 "by_path": dict(self._by_path.most_common(20)),
-                "avg_duration_ms": round(self._duration_sum_ms / total, 2) if total else 0.0,
+                "avg_duration_ms": (
+                    round(self._duration_sum_ms / self._duration_count, 2)
+                    if self._duration_count
+                    else 0.0
+                ),
                 "max_duration_ms": round(self._duration_max_ms, 2),
                 "p50_duration_ms": round(_percentile(samples, 0.50), 2),
                 "p95_duration_ms": round(_percentile(samples, 0.95), 2),
@@ -123,7 +131,9 @@ class RequestMetrics:
             methods = self._by_method.most_common()
             paths = self._by_path.most_common()
             avg_seconds = (
-                self._duration_sum_ms / total / 1000 if total else 0.0
+                self._duration_sum_ms / self._duration_count / 1000
+                if self._duration_count
+                else 0.0
             )
             max_seconds = self._duration_max_ms / 1000
             samples = sorted(self._durations)
@@ -206,6 +216,7 @@ class RequestMetrics:
             self._duration_sum_ms = 0.0
             self._duration_max_ms = 0.0
             self._durations.clear()
+            self._duration_count = 0
             self._sse_errors = 0
 
 
