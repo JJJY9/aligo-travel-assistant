@@ -162,6 +162,15 @@ def test_title_only_text_becomes_single_chunk():
         assert token in joined
 
 
+def test_whitespace_only_chunks_dropped():
+    """硬切产生的纯空白分片不能进索引（空白向量同样占用检索名额）。"""
+    chunks = split_text("a" + " " * 1000 + "b", max_chars=400)
+    assert chunks, "非空文档至少要有一块"
+    assert all(chunk.strip() for chunk in chunks), [repr(c) for c in chunks]
+    assert any("a" in chunk for chunk in chunks)
+    assert any("b" in chunk for chunk in chunks)
+
+
 def test_numbered_colon_headings_merged_with_body():
     """带编号 / 结尾冒号的短标题不是正文：要并入下一段，不能成为纯标题块。"""
     from utils.text_chunker import _is_title_like, split_text
@@ -214,5 +223,6 @@ if __name__ == "__main__":
     test_unpunctuated_sentence_hard_split()
     test_title_only_text_becomes_single_chunk()
     test_numbered_colon_headings_merged_with_body()
+    test_whitespace_only_chunks_dropped()
     test_merge_edge_branches()
     print("\n全部通过")
