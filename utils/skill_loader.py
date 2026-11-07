@@ -75,8 +75,15 @@ class SkillLoader:
             skill_path = os.path.join(self.skills_dir, skill_name)
             if os.path.isdir(skill_path):
                 md_file = os.path.join(skill_path, "SKILL.md")
+                if not os.path.exists(md_file):
+                    print(f"Warning: missing SKILL.md in {skill_path}, skipped.")
                 if os.path.exists(md_file):
                     skill_info = self._parse_skill_md(md_file)
+                    if not skill_info:
+                        print(
+                            f"Warning: SKILL.md of {skill_name} has no valid "
+                            "frontmatter, skipped."
+                        )
                     if skill_info:
                         # name 必须是字符串：frontmatter 写错类型时退回目录名，
                         # 不能拿列表等不可哈希值当字典键
