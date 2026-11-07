@@ -51,8 +51,23 @@ class RequestMetrics:
         self._duration_sum_ms = 0.0
         self._duration_max_ms = 0.0
         self._durations: deque[float] = deque(maxlen=MAX_DURATION_SAMPLES)
+        # SSE 长连接的耗时不计入延迟分位（详见 record 的 streaming 参数）；
+        # 另有独立计数记录「HTTP 200 但以 error 事件收尾」的流式回合
+        self._sse_errors = 0
 
-    def record(self, method: str, path: str, status: int, elapsed_ms: float) -> None:
+    def record(
+        self,
+        method: str,
+        path: str,
+        status: int,
+        elapsed_ms: float,
+        streaming: bool = False,
+    ) -> None:
+        """记录一次请求。
+
+        ``streaming=True``（SSE 长连接）时只计请求数与状态，不计入耗时
+        统计——流式会话的整段持续时间会把延迟分位完全支配。
+        """
         # 路径由 uvicorn percent-decode，可能含控制字符；指标 key 里清理掉
         safe_path = re.sub(r"[\x00-\x1f\x7f]", "?", str(path))[:200]
         elapsed = max(0.0, float(elapsed_ms))
@@ -68,9 +83,19 @@ class RequestMetrics:
                 self._by_path[safe_path] += 1
             else:
                 self._by_path[_OTHER] += 1
-            self._duration_sum_ms += elapsed
-            self._duration_max_ms = max(self._duration_max_ms, elapsed)
-            self._durations.append(elapsed)
+            if not streaming:
+                self._duration_sum_ms += elapsed
+                self._duration_max_ms = max(self._duration_max_ms, elapsed)
+                self._durations.append(elapsed)
+
+    def record_sse_error(self) -> None:
+        """记录一次以 error 事件收尾的流式回合（HTTP 已发出 200）。
+
+        访问日志与按状态码的指标只能看到 200，对话错误率需要一个独立
+        口径，否则永远为 0。
+        """
+        with self._lock:
+            self._sse_errors += 1
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -87,6 +112,7 @@ class RequestMetrics:
                 "p50_duration_ms": round(_percentile(samples, 0.50), 2),
                 "p95_duration_ms": round(_percentile(samples, 0.95), 2),
                 "duration_samples": len(samples),
+                "sse_errors": self._sse_errors,
             }
 
     def render_prometheus(self) -> str:
@@ -104,6 +130,7 @@ class RequestMetrics:
             p50_seconds = _percentile(samples, 0.50) / 1000
             p95_seconds = _percentile(samples, 0.95) / 1000
             sample_count = len(samples)
+            sse_errors = self._sse_errors
             uptime = time.monotonic() - self._started_at
 
         lines = [
@@ -112,6 +139,9 @@ class RequestMetrics:
             f"aligo_requests_total {total}",
             "# HELP aligo_requests_by_status_total Requests grouped by HTTP status.",
             "# TYPE aligo_requests_by_status_total counter",
+            "# HELP aligo_sse_errors_total Streaming turns that ended with an error event.",
+            "# TYPE aligo_sse_errors_total counter",
+            f"aligo_sse_errors_total {sse_errors}",
         ]
         for status, value in statuses:
             lines.append(
@@ -176,6 +206,7 @@ class RequestMetrics:
             self._duration_sum_ms = 0.0
             self._duration_max_ms = 0.0
             self._durations.clear()
+            self._sse_errors = 0
 
 
 REQUEST_METRICS = RequestMetrics()

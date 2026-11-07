@@ -311,7 +311,12 @@ class RequestContextMiddleware:
                 ):
                     metric_path = "/api/import"
                 REQUEST_METRICS.record(
-                    scope.get("method", ""), metric_path, status_code, elapsed_ms
+                    scope.get("method", ""),
+                    metric_path,
+                    status_code,
+                    elapsed_ms,
+                    # SSE 长连接的整段持续时间不能计入延迟分位
+                    streaming=metric_path == "/api/chat/stream",
                 )
 
 
@@ -709,6 +714,11 @@ class AligoWebApp:
         # 在会话上限以内，否则一批并发新会话会同时打爆数据库连接数
         self._session_build_slots = threading.BoundedSemaphore(
             max(1, int(self.max_sessions))
+        )
+        # 备份恢复专用执行器：单 worker 串行化导入，且不占用 asyncio 默认
+        # 线程池——分钟级的大导入会让所有对话 / SSE / 删除的 to_thread 排队
+        self.import_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="aligo-import"
         )
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
@@ -1611,6 +1621,7 @@ def create_app(model: Any = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         yield
         state.close_all()
+        state.import_executor.shutdown(wait=False)
 
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
@@ -1657,8 +1668,11 @@ def create_app(model: Any = None) -> FastAPI:
     def health() -> dict[str, Any]:
         rate = _rate_limit_info(state)
         skills_root = resolve_skills_root()
+        breaker_state = state.breaker.get_status()["state"]
         return {
-            "status": "ok",
+            # 熔断打开说明服务已无法正常对话：健康检查不能继续报 ok
+            "status": "degraded" if breaker_state == "open" else "ok",
+            "circuit_breaker": breaker_state,
             "version": APP_VERSION,
             "model": LLM_CONFIG.get("model_name", ""),
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
@@ -2698,6 +2712,9 @@ def create_app(model: Any = None) -> FastAPI:
                     if event.get("type") == "heartbeat":
                         yield ": keep-alive\n\n"
                         continue
+                    if event.get("type") == "error":
+                        # HTTP 已发出 200：对话错误率需要独立口径
+                        REQUEST_METRICS.record_sse_error()
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     if event["type"] in ("done", "error"):
                         break
@@ -3089,8 +3106,9 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(
             await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
         )
-        sections, errors = await asyncio.to_thread(
-            parse_user_export_data, payload.backup
+        loop = asyncio.get_running_loop()
+        sections, errors = await loop.run_in_executor(
+            state.import_executor, parse_user_export_data, payload.backup
         )
         if not sections:
             detail = "；".join(errors[:3]) or "没有可恢复的数据"
@@ -3154,7 +3172,7 @@ def create_app(model: Any = None) -> FastAPI:
                     _close_long_term(store)
 
             try:
-                counts = await asyncio.to_thread(_run_import)
+                counts = await loop.run_in_executor(state.import_executor, _run_import)
             except MemoryPersistenceError as exc:
                 logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                 raise HTTPException(

@@ -5717,9 +5717,138 @@ def test_lock_for_overflow_waiters(monkeypatch):
     print("✓ 兜底锁等待者期间保持按用户串行")
 
 
+def test_metrics_streaming_and_sse_errors():
+    """SSE 长连接不计入延迟分位；error 收尾的流有独立计数。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    try:
+        REQUEST_METRICS.record(
+            "POST", "/api/chat/stream", 200, 30000.0, streaming=True
+        )
+        data = REQUEST_METRICS.snapshot()
+        assert data["requests_total"] == 1
+        assert data["duration_samples"] == 0, "流式请求不应进入延迟样本"
+        assert data["avg_duration_ms"] == 0.0 and data["max_duration_ms"] == 0.0
+
+        REQUEST_METRICS.record_sse_error()
+        assert REQUEST_METRICS.snapshot()["sse_errors"] == 1
+        assert "aligo_sse_errors_total 1" in REQUEST_METRICS.render_prometheus()
+        print("✓ SSE 不计延迟分位 / error 收尾独立计数")
+    finally:
+        REQUEST_METRICS.reset()
+
+
+def test_health_reports_degraded_when_breaker_open():
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    try:
+        for _ in range(state.breaker.failure_threshold):
+            state.breaker.record_failure()
+        client = TestClient(app)
+        data = client.get("/api/health").json()
+        assert data["status"] == "degraded", data
+        assert data["circuit_breaker"] == "open"
+    finally:
+        state.close_all()
+    print("✓ 熔断打开时健康检查报 degraded")
+
+
+def test_sse_error_increments_metrics(monkeypatch):
+    """流式回合以 error 事件收尾时 sse_errors 计数增加。"""
+    from utils.metrics import REQUEST_METRICS
+    from agents.orchestration_agent import OrchestrationAgent
+
+    async def boom(self, intention, on_event=None):
+        raise RuntimeError("编排失败")
+
+    monkeypatch.setattr(OrchestrationAgent, "reply", boom)
+    REQUEST_METRICS.reset()
+    client = _client()
+    user_id = _unique_user("web_test_sse_err")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "你好", "user_id": user_id, "session_id": "sse-err"},
+        ) as response:
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+        assert events[-1]["type"] == "error"
+        assert REQUEST_METRICS.snapshot()["sse_errors"] == 1, [e["type"] for e in events]
+        # 路由前 413 之外，SSE 请求本身仍计入请求数
+        assert (
+            REQUEST_METRICS.snapshot()["by_path"].get("/api/chat/stream", 0) == 1
+        )
+    finally:
+        _cleanup(user_id)
+        REQUEST_METRICS.reset()
+    print("✓ SSE error 收尾计入独立指标")
+
+
+def test_circuit_breaker_probe_owner_is_async_task():
+    """同一线程的不同 asyncio task 不能互相消费半开试探名额。"""
+    import asyncio
+
+    from utils.circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=0.01, half_open_successes=1
+    )
+    breaker.record_failure()  # CLOSED -> OPEN
+    time_module = __import__("time")
+    breaker._opened_at = time_module.monotonic() - 1.0  # noqa: SLF001
+
+    async def scenario():
+        assert breaker.allow_call() is True  # 当前 task 持有试探
+
+        async def other_task():
+            breaker.record_success()  # 其它 task：不得消费名额
+
+        await asyncio.create_task(other_task())
+        assert breaker.state.value == "half_open", "其它任务的成功不能关闭熔断"
+        breaker.record_success()  # 持有者：计数并关闭
+        assert breaker.state.value == "closed"
+
+    asyncio.run(scenario())
+    print("✓ 半开试探按 asyncio task 认属主")
+
+
+def test_half_open_failure_freezes_failure_count():
+    """半开失败回到 OPEN 时失败数冻结在阈值（/metrics 与 HELP 文案一致）。"""
+    from utils.circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        failure_threshold=2, recovery_timeout_sec=0.0, half_open_successes=1
+    )
+    breaker.record_failure()
+    breaker.record_failure()
+    breaker._maybe_half_open()  # noqa: SLF001
+    assert breaker.allow_call() is True
+    breaker.record_failure()
+    assert breaker.get_status()["failure_count"] == 2
+    print("✓ 半开失败后失败数冻结在阈值")
+
+
+def test_import_uses_dedicated_executor():
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    try:
+        executor = getattr(state, "import_executor", None)
+        assert executor is not None
+        assert executor._max_workers == 1
+    finally:
+        state.close_all()
+    print("✓ 备份恢复使用专用执行器")
+
+
 if __name__ == "__main__":
     test_index_page()
     test_route_path_normalization()
+    test_metrics_streaming_and_sse_errors()
     test_rate_identity_ipv6_aggregation()
     test_health_endpoint()
     test_knowledge_endpoint()
@@ -5738,6 +5867,11 @@ if __name__ == "__main__":
         test_doctor_rate_limited,
         test_session_build_slots_bound_concurrent_connections,
         test_lock_for_overflow_waiters,
+        test_health_reports_degraded_when_breaker_open,
+        test_sse_error_increments_metrics,
+        test_circuit_breaker_probe_owner_is_async_task,
+        test_half_open_failure_freezes_failure_count,
+        test_import_uses_dedicated_executor,
     ):
         mp = pytest.MonkeyPatch()
         try:
