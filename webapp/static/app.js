@@ -328,14 +328,36 @@ async function copyText(text, message = "已复制") {
   }
 }
 
-async function getJSON(url, options) {
-  const response = await fetch(url, options);
-  if (!response.ok) {
-    const error = new Error(await errorMessage(response));
-    error.status = response.status;
-    throw error;
+async function getJSON(url, options, timeoutMs = 120000) {
+  // 普通 JSON 请求也要有兜底超时：服务端挂起 / 连接黑洞时 fetch 永不
+  // settle，「检索中 / 加载中」的文案与 disabled 状态就永远不复位
+  const controller = new AbortController();
+  const callerSignal = options && options.signal;
+  if (callerSignal) {
+    callerSignal.addEventListener("abort", () => controller.abort());
   }
-  return response.json();
+  let timedOut = false;
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs)
+      : null;
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (!response.ok) {
+      const error = new Error(await errorMessage(response));
+      error.status = response.status;
+      throw error;
+    }
+    return await response.json();
+  } catch (error) {
+    if (timedOut) throw new Error("请求超时，请稍后重试");
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function errorMessage(response) {
@@ -1661,6 +1683,8 @@ function renderHistory() {
       ? {
           id: focused.closest(".history-item")?.dataset.id || "",
           action: focused.dataset.action || "",
+          // 「加载更多」「归档匹配提示」不在 .history-item 内，用 key 定位
+          key: focused.dataset.focusKey || "",
         }
       : null;
   // 有正在重命名的输入框时记录 id 与已输入内容，重建列表后恢复：
@@ -1679,6 +1703,7 @@ function renderHistory() {
     const hint = document.createElement("button");
     hint.type = "button";
     hint.className = "history-more archived-hint";
+    hint.dataset.focusKey = "archived-hint";
     hint.textContent = `另有 ${state.archivedMatches} 条归档会话匹配`;
     hint.addEventListener("click", () => {
       state.showArchived = true;
@@ -1732,6 +1757,7 @@ function renderHistory() {
     const more = document.createElement("button");
     more.type = "button";
     more.className = "history-more";
+    more.dataset.focusKey = "more-sessions";
     more.textContent = `加载更多会话（已显示 ${state.sessions.length} / 共 ${state.sessionTotal}）`;
     more.addEventListener("click", loadMoreSessions);
     els.history.appendChild(more);
@@ -1754,7 +1780,17 @@ function restoreRenameSnapshot(snapshot) {
 }
 
 function restoreHistoryFocus(info) {
-  if (!info || !info.id) return;
+  if (!info) return;
+  if (info.key) {
+    const keyed = els.history.querySelector(
+      `[data-focus-key="${CSS.escape(info.key)}"]`,
+    );
+    if (keyed) {
+      keyed.focus();
+      return;
+    }
+  }
+  if (!info.id) return;
   const item = els.history.querySelector(
     `.history-item[data-id="${CSS.escape(info.id)}"]`,
   );
@@ -1829,7 +1865,7 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   if (state.showArchived) params.set("archived", "1");
   let archivedMatches = 0;
   try {
-    const data = await getJSON(`/api/sessions?${params}`);
+    const data = await getJSON(`/api/sessions?${params}`, undefined, 30000);
     if (requestId !== sessionsRequestId) return;
     state.sessions = data.sessions || [];
     state.sessionTotal = Number(data.total || state.sessions.length);
@@ -1846,7 +1882,11 @@ async function loadSessions(query = state.searchQuery, options = {}) {
         q: state.searchQuery,
       });
       try {
-        const archivedData = await getJSON(`/api/sessions?${archivedParams}`);
+        const archivedData = await getJSON(
+          `/api/sessions?${archivedParams}`,
+          undefined,
+          30000,
+        );
         if (requestId !== sessionsRequestId) return;
         archivedMatches = Number(archivedData.total || 0);
       } catch {
@@ -1888,7 +1928,7 @@ async function loadMoreSessions() {
   if (state.searchQuery) params.set("q", state.searchQuery);
   if (state.showArchived) params.set("archived", "1");
   try {
-    const data = await getJSON(`/api/sessions?${params}`);
+    const data = await getJSON(`/api/sessions?${params}`, undefined, 30000);
     if (requestId !== sessionsRequestId) return;
     if (viewQuery !== state.searchQuery || viewArchived !== state.showArchived) return;
     const seen = new Set(state.sessions.map((session) => session.session_id));
@@ -2015,6 +2055,8 @@ function startRenameSession(item, session, initialValue) {
     if (settled) return;
     settled = true;
     if (input.isConnected) input.replaceWith(titleEl);
+    // 取消移除了当前焦点输入框：把焦点还给会话条目，键盘用户不丢位置
+    if (item.isConnected) item.focus();
   };
 
   const save = async () => {
@@ -2032,6 +2074,11 @@ function startRenameSession(item, session, initialValue) {
       // 快照恢复出来，已保存的输入框重新出现
       if (input.isConnected) input.remove();
       await loadSessions();
+      // 保存路径同样移除了焦点输入框：列表重建后把焦点还给该会话条目
+      const refreshed = els.history.querySelector(
+        `.history-item[data-id="${CSS.escape(session.session_id)}"]`,
+      );
+      if (refreshed) refreshed.focus();
       if (state.sessionId === session.session_id) {
         const updated = state.sessions.find((s) => s.session_id === session.session_id);
         setConversationTitle(updated ? updated.title : value);
@@ -2465,7 +2512,11 @@ async function refreshStatus() {
   const requestId = (statusRequestId += 1);
   const userId = state.userId;
   try {
-    const data = await getJSON(`/api/status?user_id=${encodeURIComponent(userId)}`);
+    const data = await getJSON(
+      `/api/status?user_id=${encodeURIComponent(userId)}`,
+      undefined,
+      30000,
+    );
     // 丢弃过期响应：归档 / 切换用户后，旧请求可能晚到并覆盖新的归档计数
     if (requestId !== statusRequestId || userId !== state.userId) return;
     state.status = data;
@@ -3218,7 +3269,7 @@ async function deletePreference(type, label) {
 
 async function refreshHealth() {
   try {
-    const data = await getJSON("/api/health");
+    const data = await getJSON("/api/health", undefined, 30000);
     state.health = data;
     els.health.className = "health ok";
     els.healthText.textContent = "在线";
@@ -3280,10 +3331,22 @@ function focusSearch() {
 }
 
 function toggleSidebar() {
+  let focusTarget = null;
   if (isMobile()) {
     const open = !els.app.classList.contains("side-open");
     els.app.classList.toggle("side-open", open);
     els.scrim.hidden = !open;
+    if (open) {
+      // 打开抽屉后焦点必须进入抽屉：否则 Tab 会操作被抽屉与遮罩挡住的顶栏。
+      // 聚焦必须等到 syncSidebarA11y() 移除 inert 之后（inert 内的元素
+      // 无法获得焦点，先 focus 会静默失败）；窄屏下侧栏里的折叠按钮是
+      // display:none，必须挑第一个「可见」的可聚焦元素
+      focusTarget =
+        [...els.sidebar.querySelectorAll(
+          'button:not([disabled]), input:not([disabled]), ' +
+            'a[href], [tabindex]:not([tabindex="-1"])',
+        )].find((el) => el.offsetParent !== null) || null;
+    }
   } else {
     const collapsed = els.app.classList.toggle("side-collapsed");
     try {
@@ -3293,6 +3356,7 @@ function toggleSidebar() {
     }
   }
   syncSidebarA11y();
+  if (focusTarget) focusTarget.focus();
 }
 
 function syncSidebarA11y() {
@@ -3305,9 +3369,14 @@ function syncSidebarA11y() {
 }
 
 function closeMobileSidebar() {
+  const hadFocusInside =
+    document.activeElement instanceof HTMLElement &&
+    els.sidebar.contains(document.activeElement);
   els.app.classList.remove("side-open");
   els.scrim.hidden = true;
   syncSidebarA11y();
+  // 焦点还停在刚被隐藏（inert）的抽屉里：还给顶栏菜单按钮，避免掉到 body
+  if (hadFocusInside && isMobile()) els.menuBtn.focus();
 }
 
 function restoreSidebar() {
@@ -4132,6 +4201,35 @@ function trapMemorySheetFocus(event) {
   }
 }
 
+function shortcutFocusable() {
+  const scope = els.shortcutOverlay.querySelector(".shortcut-card") || els.shortcutOverlay;
+  return [
+    ...scope.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), ' +
+        'select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    ),
+  ].filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+function trapShortcutFocus(event) {
+  // 陷阱必须绑在 document 上：点击卡片内非可聚焦文字会把焦点送回 body，
+  // 绑在弹层上的 keydown 收不到后续 Tab，焦点会逃到 aria-modal 后面的页面
+  if (event.key !== "Tab" || els.shortcutOverlay.hidden) return;
+  const focusable = shortcutFocusable();
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  const inside = els.shortcutOverlay.contains(active);
+  if (event.shiftKey && (active === first || !inside)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (active === last || !inside)) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function openMemorySheet() {
   memorySheetOpener = document.activeElement;
   els.userIdInput.value = state.userId;
@@ -4423,12 +4521,7 @@ function bindEvents() {
   els.shortcutOverlay.addEventListener("click", (event) => {
     if (event.target === els.shortcutOverlay) closeShortcuts();
   });
-  els.shortcutOverlay.addEventListener("keydown", (event) => {
-    if (event.key === "Tab") {
-      event.preventDefault();
-      els.closeShortcuts.focus();
-    }
-  });
+  document.addEventListener("keydown", trapShortcutFocus);
 
   els.printChat.addEventListener("click", () => {
     if (!cancelPendingEdits()) {
