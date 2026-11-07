@@ -1982,14 +1982,15 @@ def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> i
 
 
 def run_user_import_standalone(
-    user_id: str, json_path: str, as_json: bool = False
+    user_id: str, json_path: str, as_json: bool = False, dry_run: bool = False
 ) -> int:
     """从 user-export 的 JSON 备份恢复用户数据
-    （`python cli.py user-import <user_id> <json_path> [--json]`）。
+    （`python cli.py user-import <user_id> <json_path> [--dry-run] [--json]`）。
 
     恢复偏好、行程、聊天消息与会话元数据（标题 / 置顶 / 归档）；统计字段
     由存储层在写入时自行累计。重复导入幂等：行程按存储层去重，聊天消息按
     （会话, 角色, 内容）多重集去重。非法条目逐条跳过并列出。
+    ``dry_run=True`` 只预览将新增 / 更新 / 跳过的数量，不写库。
 
     Returns:
         0 至少恢复一类数据（含部分条目被跳过）；1 参数 / 读取 / 写入失败
@@ -2002,6 +2003,7 @@ def run_user_import_standalone(
         MAX_BACKUP_BYTES,
         import_user_data,
         parse_user_export,
+        preview_user_import,
     )
 
     def _fail(message: str) -> int:
@@ -2047,9 +2049,13 @@ def run_user_import_standalone(
         return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
-            counts = import_user_data(store, sections)
+            if dry_run:
+                counts = preview_user_import(store, sections)
+            else:
+                counts = import_user_data(store, sections)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"写入失败：{exc}")
+            action = "预览" if dry_run else "写入"
+            return _fail(f"{action}失败：{exc}")
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -2062,6 +2068,7 @@ def run_user_import_standalone(
                     "ok": True,
                     "user_id": user_id,
                     "path": json_path,
+                    "dry_run": dry_run,
                     **counts,
                     "skipped": errors,
                 },
@@ -2070,8 +2077,9 @@ def run_user_import_standalone(
             )
         )
     else:
+        prefix = "预览（未写入）：" if dry_run else "已恢复："
         summary = (
-            f"已恢复：偏好 {counts['preferences']} 项，行程新增 "
+            f"{prefix}偏好 {counts['preferences']} 项，行程新增 "
             f"{counts['trips_created']} 条 / 更新 {counts['trips_updated']} 条，"
             f"聊天消息 {counts['messages_added']} 条"
             f"（跳过重复 {counts['messages_skipped']} 条），标题 "
@@ -5303,11 +5311,14 @@ def main():
         if arg == "user-import":
             positional = []
             as_json = False
+            dry_run = False
             valid = True
             for item in sys.argv[2:]:
                 lowered = item.lower()
                 if lowered == "--json":
                     as_json = True
+                elif lowered == "--dry-run":
+                    dry_run = True
                 elif item.startswith("-") or len(positional) >= 2:
                     valid = False
                     break
@@ -5315,12 +5326,16 @@ def main():
                     positional.append(item)
             if not valid or len(positional) != 2:
                 print(
-                    "用法：python cli.py user-import <user_id> <json_path> [--json]"
+                    "用法：python cli.py user-import <user_id> <json_path> "
+                    "[--dry-run] [--json]"
                 )
                 sys.exit(2)
             sys.exit(
                 run_user_import_standalone(
-                    positional[0], positional[1], as_json=as_json
+                    positional[0],
+                    positional[1],
+                    as_json=as_json,
+                    dry_run=dry_run,
                 )
             )
         if arg == "trips-export":

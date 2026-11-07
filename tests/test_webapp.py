@@ -4393,6 +4393,17 @@ def test_user_data_import_api():
 
         client = _client()
         backup = client.get("/api/export", params={"user_id": source}).json()
+
+        # 预览：计数与真实导入一致，且不写库
+        preview = client.post(
+            "/api/import",
+            params={"user_id": target, "dry_run": 1},
+            json={"backup": backup},
+        ).json()
+        assert preview["dry_run"] is True
+        assert preview["messages_added"] == 2 and preview["trips_created"] == 1
+        assert client.get("/api/sessions", params={"user_id": target}).json()["sessions"] == []
+
         response = client.post(
             "/api/import", params={"user_id": target}, json={"backup": backup}
         )

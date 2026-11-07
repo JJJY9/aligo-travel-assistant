@@ -2982,8 +2982,12 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
+        dry_run: bool = Query(default=False),
     ) -> dict[str, Any]:
         """从 ``/api/export`` 的 JSON 备份恢复用户数据（面板「恢复备份」）。
+
+        ``dry_run=1`` 只预览将新增 / 更新 / 跳过的数量，不写库（与知识库
+        导入预览同一语义）。
 
         恢复偏好 / 行程 / 聊天消息 / 会话标题与置顶归档；重复导入幂等
         （行程按路线+日期去重、消息按「会话/角色/内容」多重集去重）。
@@ -2994,7 +2998,11 @@ def create_app(model: Any = None) -> FastAPI:
         """
         import asyncio
 
-        from utils.user_import import import_user_data, parse_user_export_data
+        from utils.user_import import (
+            import_user_data,
+            parse_user_export_data,
+            preview_user_import,
+        )
 
         response.headers.update(_enforce_kb_rate_limit(state, request))
         sections, errors = parse_user_export_data(payload.backup)
@@ -3043,6 +3051,8 @@ def create_app(model: Any = None) -> FastAPI:
             def _run_import() -> dict[str, Any]:
                 store = _open_long_term(user_id, strict=True)
                 try:
+                    if dry_run:
+                        return preview_user_import(store, sections)
                     return import_user_data(store, sections)
                 finally:
                     _close_long_term(store)
@@ -3061,7 +3071,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503, detail="恢复失败，请稍后重试"
                 ) from exc
-        return {"ok": True, **counts, "skipped": errors}
+        return {"ok": True, "dry_run": dry_run, **counts, "skipped": errors}
 
     return app
 
