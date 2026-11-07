@@ -44,6 +44,44 @@ def test_idle_pipe_does_not_block_startup():
     print("✓ 空闲管道不会阻塞 configure_stdio")
 
 
+def test_pick_stdin_encoding_bom_and_ascii_prefix(monkeypatch):
+    """BOM 输入用 utf-8-sig；ASCII 前缀后的 UTF-8 中文不能被按 GBK 解码。"""
+    from utils import console as console_module
+
+    class _Stdin:
+        def __init__(self, payload, encoding="gbk"):
+            self.buffer = self
+
+            class _Inner:
+                pass
+
+            self._payload = payload
+            self.encoding = encoding
+
+        def peek(self, size):
+            return self._payload[:size]
+
+        def isatty(self):
+            return False
+
+    # 假流没有 fileno：直接视为「管道已有数据」
+    monkeypatch.setattr(
+        console_module, "_stdin_has_data", lambda stream, timeout_sec=0.1: True
+    )
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"\xef\xbb\xbf{}"))
+    assert console_module._pick_stdin_encoding("gbk") == "utf-8-sig"
+
+    # 前 64 字节全 ASCII、中文在后面的 UTF-8 管道
+    payload = b"abcd " + "中文输入".encode("utf-8")
+    monkeypatch.setattr(sys, "stdin", _Stdin(payload))
+    assert console_module._pick_stdin_encoding("gbk") == "utf-8"
+
+    # GBK 管道：出现 >=0x81 字节且不是合法 UTF-8 → 沿用 locale
+    monkeypatch.setattr(sys, "stdin", _Stdin("中文".encode("gbk")))
+    assert console_module._pick_stdin_encoding("gbk") == "gbk"
+    print("✓ stdin 编码探测：BOM / ASCII 前缀 / GBK")
+
+
 def test_probe_stdin_false_skips_probe(monkeypatch):
     """一次性命令可显式跳过 stdin 探测。"""
     calls = []
@@ -77,6 +115,7 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_probe_stdin_false_skips_probe(mp)
+        test_pick_stdin_encoding_bom_and_ascii_prefix(mp)
     finally:
         mp.undo()
     print("\n全部通过")

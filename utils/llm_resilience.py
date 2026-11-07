@@ -106,10 +106,14 @@ async def retry_with_backoff(
             last_exc = e
             if attempt == max_retries or not is_retriable_error(e):
                 raise
-            delay = min(base_delay_sec * (2 ** attempt), max_delay_sec)
+            delay = base_delay_sec * (2 ** attempt)
             if jitter:
                 import random
+
+                # 抖动在截断之前应用：先乘后截断保证实际退避不超过
+                # max_delay_sec（此前截断后再乘最多到声明上限的 1.5 倍）
                 delay = delay * (0.5 + random.random())
+            delay = min(delay, max_delay_sec)
             logger.warning(
                 "LLM call failed (attempt %d/%d), retry in %.1fs: %s",
                 attempt + 1, max_retries + 1, delay, e,

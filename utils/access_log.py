@@ -11,8 +11,13 @@ import re
 
 
 def _safe_log_text(value: object) -> str:
-    """去掉控制字符：uvicorn 会 percent-decode 路径，%0A 可伪造整行日志。"""
-    return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
+    """去掉控制字符：uvicorn 会 percent-decode 路径，%0A 可伪造整行日志。
+
+    C1 控制符（\x7f-\x9f，含 NEL）与 U+2028/U+2029 行分隔符在部分
+    日志采集器 / 终端里同样会断行或破坏 JSON 结构，一并替换。
+    """
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", str(value))
+    return text.replace("\u2028", "?").replace("\u2029", "?")
 
 
 def access_log_format() -> str:
@@ -34,11 +39,11 @@ def format_access_log(
         return json.dumps(
             {
                 "event": "http_request",
-                "method": str(method),
-                "path": str(path),
+                "method": _safe_log_text(method),
+                "path": _safe_log_text(path),
                 "status": int(status),
                 "duration_ms": round(float(elapsed_ms), 1),
-                "request_id": str(request_id),
+                "request_id": _safe_log_text(request_id),
             },
             ensure_ascii=False,
         )

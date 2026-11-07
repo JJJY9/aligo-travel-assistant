@@ -450,8 +450,55 @@ def test_unknown_city_does_not_use_stale_cache(monkeypatch):
     print("✓ 城市不存在时不使用旧缓存掩盖错误")
 
 
+def test_stale_fallback_merges_concurrent_requests(monkeypatch):
+    """上游故障沿用 stale 数据时并发等待者也复用同一份结果（单飞不失效）。"""
+
+    def ok_get(url, params=None, timeout=None, headers=None):
+        return _Response(_geo("北京") if "geocoding" in url else _forecast())
+
+    monkeypatch.setattr(weather.requests, "get", ok_get)
+    weather.clear_weather_cache()
+    weather.fetch_weather("北京")
+    key = weather._cache_key("北京")
+    at, result = weather._cache[key]
+    weather._cache[key] = (at - weather.CACHE_TTL_SEC - 1, result)
+
+    calls = []
+    calls_lock = threading.Lock()
+
+    def fail_get(url, params=None, timeout=None, headers=None):
+        with calls_lock:
+            calls.append(url)
+        time.sleep(0.05)
+        raise weather.requests.ConnectionError("network down")
+
+    monkeypatch.setattr(weather.requests, "get", fail_get)
+    barrier = threading.Barrier(6)
+
+    def worker(_):
+        barrier.wait(timeout=10)
+        return weather.fetch_weather("北京")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(worker, range(6)))
+    assert all(item.get("stale") is True for item in results)
+    assert len(calls) == 1, f"stale 降级也应单飞，实际请求上游 {len(calls)} 次"
+    # 后续请求直接复用回写的缓存，不再重打故障上游
+    weather.fetch_weather("北京")
+    assert len(calls) == 1
+    print("✓ stale 降级时并发请求合并为一次上游失败")
+
+
+def test_weather_codes_include_freezing_drizzle():
+    """Open-Meteo 的 56/57（冻毛毛雨）不能显示成「未知」。"""
+    assert weather._describe(56) == "冻毛毛雨"
+    assert weather._describe(57) == "强冻毛毛雨"
+    print("✓ 天气码 56/57 有中文描述")
+
+
 if __name__ == "__main__":
     for case in (
+        test_stale_fallback_merges_concurrent_requests,
         test_fetch_weather_and_cache,
         test_forecast_uses_location_timezone,
         test_unknown_city_raises,
@@ -477,4 +524,5 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_empty_city_raises()
+    test_weather_codes_include_freezing_drizzle()
     print("\n全部通过")

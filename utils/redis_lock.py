@@ -89,6 +89,10 @@ class DistributedLock:
             # 保留客户端，下次 acquire 会再次尝试 Redis
             logger.warning("Redis 互斥锁不可用（%s），回退进程内锁", exc)
             self.degraded = True
+            # SET 可能已在服务端生效：启动心跳（续期脚本按 token 校验归属，
+            # 未真正持有键时不会续期别人的锁），否则长任务超过 TTL 后共享
+            # 锁静默过期且 lost 永远为 False
+            self._start_heartbeat(token)
             return token
         if not acquired:
             self._local.release()
