@@ -976,6 +976,73 @@ def test_next_trip_id_not_reused_after_deleting_latest():
     print("✓ 删除最新行程后 trip_id 不复用")
 
 
+def test_delete_last_turn_cleans_session_metadata():
+    """删除最后一轮删空会话时，标题 / 置顶 / 归档标记一并清理。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-last-turn-meta", tempfile.mkdtemp())
+    memory.add_chat_message("user", "Q", "s-meta")
+    memory.add_chat_message("assistant", "A", "s-meta")
+    assert memory.set_session_title("s-meta", "标题")
+    assert memory.set_session_pinned("s-meta", True)
+    assert memory.set_session_archived("s-meta", True)
+    assert memory.delete_last_turn("s-meta", expect="Q") == 2
+    assert "s-meta" not in memory.get_session_titles()
+    assert "s-meta" not in memory.get_pinned_sessions()
+    assert "s-meta" not in memory.get_archived_sessions()
+    print("✓ 删空会话清理标题 / 置顶 / 归档")
+
+
+def test_migration_backs_up_and_resets_bad_destination_counts():
+    """frequent_destinations 计数为字符串时归零并保留城市键，且先备份原始文件。"""
+    from context.long_term_memory import LongTermMemory
+
+    root = tempfile.mkdtemp()
+    path = Path(root) / "u-dest-counts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": [],
+                "statistics": {
+                    "total_trips": "many",
+                    "frequent_destinations": {"杭州": "3", "上海": 2},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-dest-counts", root)
+    destinations = memory.get_frequent_destinations()
+    counts = dict(destinations)
+    assert counts.get("杭州") == 0 and counts.get("上海") == 2, counts
+    backup = Path(f"{path}.migrate-backup")
+    assert backup.exists(), "破坏性迁移前必须备份原始文件"
+    assert "many" in backup.read_text(encoding="utf-8")
+    print("✓ 目的地计数修复且迁移前备份")
+
+
+def test_reload_failure_raises_instead_of_stale_snapshot():
+    """磁盘文件在运行中损坏：写入前的重载失败要报错，不能静默沿用旧快照。"""
+    from utils.errors import MemoryPersistenceError
+
+    from context.long_term_memory import LongTermMemory
+
+    root = tempfile.mkdtemp()
+    memory = LongTermMemory("u-reload-bad", root)
+    path = Path(root) / "u-reload-bad.json"
+    path.write_text("not-json", encoding="utf-8")
+    try:
+        memory.add_chat_message("user", "Q", "s1")
+    except MemoryPersistenceError:
+        pass
+    else:
+        raise AssertionError("重载失败必须抛 MemoryPersistenceError")
+    print("✓ 重载失败不再静默沿用旧快照")
+
+
 def test_one_day_trip_dedupes_end_date_variants():
     from context.long_term_memory import LongTermMemory
 
