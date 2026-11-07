@@ -1517,6 +1517,93 @@ def test_preferences_api():
         _cleanup(user_id)
 
 
+def test_preference_put_rejects_blank_values():
+    """与 CLI pref-set / 面板口径一致：空值 PUT 返回 422（清空用 DELETE）。"""
+    client = _client()
+    user_id = _unique_user("web_test_blank_pref")
+    try:
+        for value in ("", "   ", [], ["  "], [None]):
+            response = client.put(
+                "/api/preferences/home_location",
+                json={"user_id": user_id, "value": value},
+            )
+            assert response.status_code == 422, (value, response.status_code)
+        # 0 / False 是合法偏好，仍可写入
+        assert (
+            client.put(
+                "/api/preferences/budget_level",
+                json={"user_id": user_id, "value": 0},
+            ).status_code
+            == 200
+        )
+        print("✓ 偏好 PUT 拒绝空值（0 / False 保留）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_status_and_export_hide_blank_preference_items():
+    """恢复备份带入的 [null] / 空白串不再出现在 /api/status 与 Markdown 导出。"""
+    client = _client()
+    user_id = _unique_user("web_test_pref_null")
+    try:
+        backup = {
+            "preferences": {
+                "hotel_brands": ["东航", None],
+                "home_location": "   ",
+                "airlines": [""],
+            }
+        }
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        preferences = client.get(
+            "/api/status", params={"user_id": user_id}
+        ).json()["preferences"]
+        assert preferences == {"hotel_brands": ["东航"]}, preferences
+        markdown = client.get(
+            "/api/export", params={"user_id": user_id, "format": "md"}
+        ).text
+        assert "东航" in markdown
+        assert "None" not in markdown
+        assert "、null" not in markdown
+        print("✓ 面板 / 导出隐藏空白与 null 偏好项")
+    finally:
+        _cleanup(user_id)
+
+
+def test_import_rejects_non_finite_usage():
+    """备份 _meta.usage 含 NaN / Infinity：消息被跳过，/api/status 不会永久 500。"""
+    client = _client()
+    user_id = _unique_user("web_test_nan_usage")
+    try:
+        backup = {
+            "chat_history": [
+                {"role": "user", "content": "正常提问", "session_id": "s-nan"},
+                {
+                    "role": "assistant",
+                    "content": '{"reply": "x", "_meta": {"usage": {"calls": 1, "input_tokens": NaN}}}',
+                    "session_id": "s-nan",
+                },
+                {
+                    "role": "assistant",
+                    "content": '{"reply": "y", "_meta": {"usage": {"output_tokens": Infinity}}}',
+                    "session_id": "s-nan",
+                },
+            ]
+        }
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        status = client.get("/api/status", params={"user_id": user_id})
+        assert status.status_code == 200, status.text
+        assert status.json()["usage"]["calls"] == 0
+        print("✓ 备份 NaN 用量被拒绝，状态接口保持可用")
+    finally:
+        _cleanup(user_id)
+
+
 def test_preference_storage_failure_maps_503(monkeypatch):
     """偏好写盘失败应返回 503（与其它存储接口一致），而不是通用 500。"""
     from utils.errors import MemoryPersistenceError

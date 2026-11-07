@@ -10,6 +10,7 @@
 到已存在的会话时旧消息追加在当前转录末尾（存储层按追加顺序保存）。
 """
 import json
+import math
 import re
 from collections import Counter
 from typing import Any
@@ -101,6 +102,10 @@ def _assistant_content_problem(content: str) -> str | None:
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return "消息用量字段不是数字"
+        # NaN / Infinity 也是 float：落库后 /api/status 的 int() 会 ValueError /
+        # OverflowError，且此后每次汇总都 500，必须在导入时拒绝
+        if isinstance(value, float) and not math.isfinite(value):
+            return "消息用量字段不是有限数"
     return None
 
 

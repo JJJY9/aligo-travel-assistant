@@ -173,6 +173,16 @@ def test_parse_validates_session_ids_and_usage():
             {"role": "user", "content": "坏会话", "session_id": "s 1\n注入"},
             {"role": "assistant", "content": '{"reply": "x", "_meta": {"usage": {"calls": "很多"}}}', "session_id": "s1"},
             {"role": "assistant", "content": '{"reply": "y", "_meta": "bad"}', "session_id": "s1"},
+            {
+                "role": "assistant",
+                "content": '{"reply": "z", "_meta": {"usage": {"calls": 1, "input_tokens": NaN}}}',
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": '{"reply": "w", "_meta": {"usage": {"output_tokens": Infinity}}}',
+                "session_id": "s1",
+            },
             {"role": "assistant", "content": "纯文本回答", "session_id": "s1"},
         ],
     }
@@ -183,6 +193,7 @@ def test_parse_validates_session_ids_and_usage():
     joined = "；".join(errors)
     assert "会话 ID 非法" in joined
     assert "消息用量字段不是数字" in joined
+    assert "消息用量字段不是有限数" in joined, errors
     assert "消息元数据不是对象" in joined
     print("✓ 会话 ID / 用量类型校验，偏好类型错误显式报告")
 
