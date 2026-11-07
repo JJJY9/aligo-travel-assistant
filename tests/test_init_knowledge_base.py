@@ -219,6 +219,10 @@ def test_dimension_mismatch_rebuilds(monkeypatch):
         _prepare_dirs(module, tmp)
         monkeypatch.setattr(module, "create_chat_model", lambda: None)
         monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        import utils.knowledge_admin as admin_module
+
+        # 维度重建前会先导出库内片段：单测环境没有真实知识库，导出空集
+        monkeypatch.setattr(admin_module, "export_documents", lambda: [])
         import utils.milvus_client as milvus_module
 
         monkeypatch.setattr(

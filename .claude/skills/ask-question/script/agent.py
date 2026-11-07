@@ -487,19 +487,53 @@ class RAGKnowledgeAgent(AgentBase):
             seen_parts: set[int] = set()
             texts: list[str] = []
             best_score = 0.0
+            base_meta: dict = {}
+            declared = 0
             for part, doc in parts:
                 if part in seen_parts:
                     continue
                 seen_parts.add(part)
-                texts.append(str(doc.get("content") or ""))
+                metadata = doc.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                try:
+                    declared = max(declared, int(metadata.get("parts") or 0))
+                except (TypeError, ValueError):
+                    pass
+                if not base_meta:
+                    # 保留首片的业务元数据（title/category/parent_doc…）：
+                    # 只留 group/parts 会让回答的「参考来源」消失或指错文档
+                    base_meta = {
+                        key: value
+                        for key, value in metadata.items()
+                        if key not in {"group", "part", "parts"}
+                    }
+                content_text = str(doc.get("content") or "").strip()
+                if content_text:
+                    texts.append(content_text)
                 best_score = max(
                     best_score, float(doc.get("distance") or 0.0)
+                )
+            # 用换行拼接：分片跳号 / 只有部分分片过阈值时直接相连会把两段
+            # 文字粘在一起；parts 保留原始声明，另记实际取回片数与缺片
+            total_parts = max(declared, max(seen_parts, default=0))
+            assembled_meta = dict(base_meta)
+            assembled_meta.update(
+                {
+                    "group": group_id,
+                    "parts": total_parts,
+                    "retrieved_parts": len(seen_parts),
+                }
+            )
+            missing = sorted(set(range(1, total_parts + 1)) - seen_parts)
+            if missing:
+                assembled_meta["missing_parts"] = ",".join(
+                    str(item) for item in missing
                 )
             assembled.append(
                 {
                     "id": group_id,
-                    "content": "".join(texts),
-                    "metadata": {"group": group_id, "parts": len(seen_parts)},
+                    "content": "\n".join(texts),
+                    "metadata": assembled_meta,
                     "distance": best_score,
                 }
             )

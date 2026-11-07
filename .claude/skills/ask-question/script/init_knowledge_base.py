@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import sys
 import uuid
+from typing import Any
 from pathlib import Path
 
 # 添加项目根目录到路径 (假设脚本在 .claude/skills/ask-question/script/)
@@ -114,7 +115,7 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
 
             for i, chunk_content in enumerate(chunks):
                 doc_id = f"{base_doc_id}_{i+1}"
-                metadata = {
+                metadata: dict[str, Any] = {
                     "category": category,
                     "title": f"{title} (Part {i+1})",
                     "source": "商旅知识库文档",
@@ -143,35 +144,103 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
     return documents, failures
 
 
-def _collect_preserved_documents(rag_agent, new_contents: set[str]) -> list[dict]:
-    """导出重建前集合里「不在本次文件集合中」的已有片段（面板 / CLI 添加）。
+_MANAGED_SOURCE = "商旅知识库文档"
+_PRESERVED_BATCH = 200
 
-    重建会删除整个集合；用户通过面板 / CLI 添加、只存在于 Milvus 的片段
-    必须先导出，重建后补写回来（同内容分片去重，保留原 group 等元数据）。
+
+def _is_managed_metadata(metadata: dict) -> bool:
+    """是否由本脚本写入的受管文档片段（带 file_path 的商旅知识库来源）。"""
+    return (
+        str(metadata.get("source") or "") == _MANAGED_SOURCE
+        and bool(metadata.get("file_path"))
+    )
+
+
+def _collect_preserved_documents() -> tuple[list[dict], list[str]]:
+    """导出重建前集合里「非受管」的已有片段（面板 / CLI 添加）。
+
+    - 受管文档（本脚本写入，含 file_path）的旧分片一律丢弃：源文件已修改 /
+      删除时它们是被替换的过期内容，不能当作面板知识补写回去；
+    - 非受管的单条片段按 strip 后内容去重；
+    - 带 group 的多分片文档整组保留且**不做内容去重**（组内相同内容合法），
+      parts 声明与实际分片不齐的残缺组整体丢弃并告警。
+
+    返回 ``(可补写片段, 告警列表)``；导出失败抛 RuntimeError，调用方必须在
+    删库之前中止（否则面板 / CLI 添加的知识会永久丢失）。
     """
     try:
         from utils.knowledge_admin import export_documents
 
         rows = export_documents()
-    except Exception as exc:  # noqa: BLE001 - 读取失败不阻断重建，但提示风险
-        print(f"   ⚠️  读取现有知识失败（{exc}），本次重建不会保留库中已有片段")
-        return []
-    preserved: list[dict] = []
-    seen: set[str] = set()
+    except Exception as exc:  # noqa: BLE001 - 导出失败必须中止重建
+        raise RuntimeError(f"读取现有知识失败：{exc}") from exc
+    groups: dict[str, list[dict]] = {}
+    singles: list[dict] = []
+    seen_singles: set[str] = set()
     for row in rows:
         content = str(row.get("content") or "")
         key = content.strip()
-        if not key or key in new_contents or key in seen:
+        if not key:
             continue
-        seen.add(key)
         metadata = row.get("metadata")
-        preserved.append(
-            {
-                "content": content,
-                "metadata": metadata if isinstance(metadata, dict) else {},
-            }
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if _is_managed_metadata(metadata):
+            # 受管文档的旧切分（文件已改动 / 删除）不能补写：否则新旧两版
+            # 长期共存，且旧分片会形成 parts 声明不符的残缺组
+            continue
+        entry = {"content": content, "metadata": metadata}
+        group = str(metadata.get("group") or "")
+        if group:
+            groups.setdefault(group, []).append(entry)
+        elif key not in seen_singles:
+            seen_singles.add(key)
+            singles.append(entry)
+    preserved: list[dict] = []
+    dropped_groups = 0
+    for pieces in groups.values():
+        declared = 0
+        parts: set[int] = set()
+        for piece in pieces:
+            meta = piece["metadata"]
+            try:
+                parts.add(int(meta.get("part") or 0))
+                declared = max(declared, int(meta.get("parts") or 0))
+            except (TypeError, ValueError):
+                parts.add(0)
+        if declared > 1 and parts != set(range(1, declared + 1)):
+            dropped_groups += 1
+            continue
+        preserved.extend(pieces)
+    warnings: list[str] = []
+    if dropped_groups:
+        warnings.append(f"丢弃 {dropped_groups} 个残缺分片组（parts 声明与实际不符）")
+    return preserved + singles, warnings
+
+
+def _add_in_batches(rag_agent, rows: list[dict], label: str) -> None:
+    """分批写入（每批失败重试一次）；失败抛 RuntimeError 并带进度。"""
+    for start in range(0, len(rows), _PRESERVED_BATCH):
+        batch = rows[start : start + _PRESERVED_BATCH]
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                result = rag_agent.add_documents(batch)
+                if result.get("status") == "success":
+                    last_error = None
+                    break
+                last_error = RuntimeError(
+                    str(result.get("message") or f"{label}失败")
+                )
+            except Exception as exc:  # noqa: BLE001 - 记录后重试一次
+                last_error = exc
+        if last_error is not None:
+            raise RuntimeError(
+                f"{label}失败（第 {start // _PRESERVED_BATCH + 1} 批，"
+                f"已补 {start} 条）：{last_error}"
+            )
+        print(
+            f"   ✓ {label}进度 {min(start + _PRESERVED_BATCH, len(rows))}/{len(rows)}"
         )
-    return preserved
 
 
 def _build_agent(model, knowledge_base_path: Path):
@@ -231,16 +300,31 @@ def main() -> int:
 
         knowledge_base_path.mkdir(parents=True, exist_ok=True)
 
-        # 3. 创建 RAG Agent：旧集合维度不一致时先删旧集合再重建
+        # 3. 创建 RAG Agent：旧集合维度不一致时先「导出保留片段」再删旧集合
         print("3. 初始化RAG Agent...")
         print(f"   知识库路径: {knowledge_base_path}")
+        preserved: list[dict] = []
+        preserved_ready = False
         try:
             rag_agent = _build_agent(model, knowledge_base_path)
         except RuntimeError as exc:
             if "维度" not in str(exc):
                 raise
             print(f"   ⚠️  {exc}")
-            print("   正在删除旧集合后按当前嵌入模型重建...")
+            # 顺序关键：先导出面板 / CLI 添加的片段，导出失败即中止——
+            # 先删集合后导出会让这些知识在换嵌入模型时永久丢失
+            print("   正在导出库内已有片段（维度重建前保留）...")
+            try:
+                preserved, warnings = _collect_preserved_documents()
+            except RuntimeError as export_error:
+                print(f"❌ {export_error}，已中止（知识库保持原样）")
+                return 1
+            for warning in warnings:
+                print(f"   ⚠️  {warning}")
+            print(
+                f"   已导出 {len(preserved)} 个片段，删除旧集合并按当前嵌入模型重建..."
+            )
+            preserved_ready = True
             _drop_collection_for_rebuild(knowledge_base_path)
             rag_agent = _build_agent(model, knowledge_base_path)
 
@@ -252,46 +336,53 @@ def main() -> int:
 
         # 4. 重建集合（先导出库中已有、文件之外添加的片段用于补写）
         print("4. 重建知识集合...")
-        collection_exists = rag_agent.milvus_client.has_collection(
-            rag_agent.collection_name
-        )
-        preserved: list[dict] = []
-        if collection_exists:
-            new_contents = {doc["content"].strip() for doc in documents}
-            preserved = _collect_preserved_documents(rag_agent, new_contents)
-            if preserved:
-                print(f"   已导出 {len(preserved)} 个库内已有片段（重建后补写）")
-            print("   ⚠️  正在删除旧 Collection 并重建...")
-            rag_agent.milvus_client.drop_collection(rag_agent.collection_name)
-            rag_agent.milvus_client.create_collection(
-                collection_name=rag_agent.collection_name,
-                dimension=rag_agent.embedding_dim,
-                metric_type="COSINE",
-                auto_id=False,
+        if preserved_ready:
+            print("   旧集合已在维度自愈时重建，直接进入写入")
+        else:
+            collection_exists = rag_agent.milvus_client.has_collection(
+                rag_agent.collection_name
             )
-            print("   ✓ Collection 重建完成")
+            if collection_exists:
+                # 导出失败必须在删库之前中止：库内面板 / CLI 添加的片段
+                # 只存在于 Milvus，先删后导会永久丢失
+                try:
+                    preserved, warnings = _collect_preserved_documents()
+                except RuntimeError as export_error:
+                    print(f"❌ {export_error}，已中止（知识库保持原样）")
+                    return 1
+                for warning in warnings:
+                    print(f"   ⚠️  {warning}")
+                if preserved:
+                    print(f"   已导出 {len(preserved)} 个库内已有片段（重建后补写）")
+                print("   ⚠️  正在删除旧 Collection 并重建...")
+                rag_agent.milvus_client.drop_collection(rag_agent.collection_name)
+                rag_agent.milvus_client.create_collection(
+                    collection_name=rag_agent.collection_name,
+                    dimension=rag_agent.embedding_dim,
+                    metric_type="COSINE",
+                    auto_id=False,
+                )
+                print("   ✓ Collection 重建完成")
 
         # 5. 写入文档（内置文件 + 重建前导出的已有片段）
         print("5. 将文档添加到RAG知识库...")
         try:
-            result = rag_agent.add_documents(documents)
-            if result.get("status") != "success":
-                raise RuntimeError(str(result.get("message") or "添加文档失败"))
+            # 分批写入（每批 200 条、失败重试一次）：一次性巨型调用在补写
+            # 失败时无法定位进度，失败即丢失面板 / CLI 添加的知识
+            _add_in_batches(rag_agent, documents, "内置文档写入")
             if preserved:
-                backfill = rag_agent.add_documents(preserved)
-                if backfill.get("status") != "success":
-                    raise RuntimeError(
-                        "库内已有片段补写失败："
-                        f"{backfill.get('message', 'Unknown error')}"
-                    )
-        except Exception as exc:  # noqa: BLE001 - 重建失败时尽力回滚已有片段
-            if preserved:
-                with contextlib.suppress(Exception):
-                    rag_agent.add_documents(preserved)
+                _add_in_batches(rag_agent, preserved, "库内已有片段补写")
+        except Exception as exc:  # noqa: BLE001 - 写入失败反映在退出码
             print(f"❌ 添加文档失败: {exc}")
+            if preserved:
+                print(
+                    "   已写入的部分请重跑脚本补齐；面板 / CLI 添加的片段"
+                    "本次未能全部补写，请勿在补写成功前清理知识库"
+                )
             return 1
-        print(f"✓ 成功添加 {result.get('added_count')} 个片段")
-        print(f"✓ 知识库总文档数: {result.get('total_count')}")
+        print(f"✓ 成功写入 {len(documents)} 个内置片段")
+        if preserved:
+            print(f"✓ 成功补写 {len(preserved)} 个库内已有片段")
         print()
 
         # 6. 统计信息

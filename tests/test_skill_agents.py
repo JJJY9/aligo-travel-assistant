@@ -598,10 +598,49 @@ def test_rag_grouped_documents_assembled():
         ]
     )
     by_id = {item["id"]: item for item in grouped}
-    assert by_id["g1"]["content"] == "A-新B"
+    assert by_id["g1"]["content"] == "A-新" + chr(10) + "B", "分片之间用换行分隔，不能直接粘连"
     assert by_id["g1"]["distance"] == 0.6
     assert grouped[0]["id"] == "s", "按最佳分数排序"
     print("✓ 多分片文档按组拼装")
+
+
+def test_rag_grouped_documents_keep_metadata():
+    """拼装保留业务元数据，parts 声明原值、记录实际取回与缺片。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+    grouped = agent._assemble_grouped_documents(
+        [
+            {
+                "id": "p1",
+                "content": "第一片",
+                "metadata": {
+                    "group": "g2",
+                    "part": 1,
+                    "parts": 3,
+                    "title": "报销流程",
+                    "category": "报销规定",
+                    "parent_doc": "02_reimbursement.txt",
+                },
+                "distance": 0.7,
+            },
+            {
+                "id": "p3",
+                "content": "第三片",
+                "metadata": {"group": "g2", "part": 3, "parts": 3},
+                "distance": 0.6,
+            },
+        ]
+    )
+    item = next(entry for entry in grouped if entry["id"] == "g2")
+    assert item["content"] == "第一片" + chr(10) + "第三片"
+    metadata = item["metadata"]
+    assert metadata["title"] == "报销流程", "参考来源标题不能丢"
+    assert metadata["category"] == "报销规定"
+    assert metadata["parent_doc"] == "02_reimbursement.txt"
+    assert metadata["parts"] == 3, "parts 保持原始声明"
+    assert metadata["retrieved_parts"] == 2
+    assert metadata["missing_parts"] == "2"
+    print("✓ 拼装保留业务元数据与缺片标记")
 
 
 def test_rag_collection_created_once(monkeypatch, tmp_path):
@@ -695,6 +734,7 @@ if __name__ == "__main__":
         test_rag_dimension_mismatch_fails_init()
         test_rag_reply_filters_low_score_documents()
         test_rag_grouped_documents_assembled()
+        test_rag_grouped_documents_keep_metadata()
         for case in (
             test_rag_requires_initialized_knowledge_base,
             test_rag_explicit_embedding_model_id_not_replaced,
