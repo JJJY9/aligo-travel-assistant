@@ -44,7 +44,7 @@
 - 按小节切分（Chunking，保留章节边界）+ 余弦相似度检索（Top-K=5）
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
-- 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪
+- 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪；接口同时返回集合向量维度，进程内已加载嵌入模型时附带 `dimension_mismatch`（换模型后不必等到问答报错才发现）
 - 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`；长内容自动按语义边界拆分并带 `group` 标识，任一分片可**编辑整份文档**或**整组删除**），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），并可运行**检索评测**（`/api/knowledge/eval`，14 个问题计算 hit@1/3/5 与 MRR，不调用大模型，同一时间只允许一个评测：配置 `REDIS_URL` 时通过 Redis 锁跨实例共享，未配置或 Redis 故障时回退进程内），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 20000 条（面板按 200 条分批、多分片组整组同批），CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归；Web 知识库维护面板也可直接「检索评测」
 
@@ -609,7 +609,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开时 `status` 为 `degraded` 并附 `circuit_breaker` |
 | GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors`）与限流后端信息；SSE 长连接只计请求数、不计入延迟分位 |
 | GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |
-| GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用） |
+| GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用 / 向量维度；进程已加载嵌入模型时附带 `dimension_mismatch` 标记换模型后的维度不一致） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |

@@ -14,6 +14,22 @@ _MODELS: dict[str, Any] = {}
 _LOCK = threading.Lock()
 
 
+def peek_embedding_dim() -> int | None:
+    """已加载（缓存中）嵌入模型的维度；未加载 / 多个模型时返回 None。
+
+    只读缓存、绝不触发模型加载：知识库状态接口据此 best-effort 判断
+    集合维度是否与当前进程的嵌入模型一致（换模型后状态不再假装健康）。
+    """
+    with _LOCK:
+        models = list(_MODELS.values())
+    if len(models) != 1:
+        return None
+    try:
+        return int(models[0].get_sentence_embedding_dimension())
+    except Exception:  # noqa: BLE001 - 维度探测失败按未知处理
+        return None
+
+
 def get_embedding_model(model_path: str) -> Any:
     """返回共享的 SentenceTransformer（首次调用时加载并缓存）。"""
     key = str(model_path)
