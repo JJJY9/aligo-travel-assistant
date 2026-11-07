@@ -462,6 +462,35 @@ def test_add_and_update_failures(monkeypatch):
     print("✓ kb-add / kb-update 失败路径与更新成功")
 
 
+def test_update_missing_or_unreadable_document(monkeypatch):
+    """kb-update 对不存在的 id / 读取异常给出明确消息并退出 1。"""
+    import tempfile
+    from pathlib import Path
+
+    doc = Path(tempfile.mkdtemp(prefix="chailv_kb_")) / "doc.txt"
+    doc.write_text("新内容", encoding="utf-8")
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+
+    monkeypatch.setattr(knowledge_admin, "get_document", lambda doc_id: None)
+    code, out = _capture(cli.run_knowledge_update_standalone, 404, str(doc))
+    assert code == 1 and "不存在" in out
+
+    def _raise_file_not_found(doc_id):
+        raise FileNotFoundError("milvus_lite.db")
+
+    monkeypatch.setattr(knowledge_admin, "get_document", _raise_file_not_found)
+    code, out = _capture(cli.run_knowledge_update_standalone, 1, str(doc))
+    assert code == 1 and "知识库未初始化" in out
+
+    def _raise_boom(doc_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(knowledge_admin, "get_document", _raise_boom)
+    code, out = _capture(cli.run_knowledge_update_standalone, 1, str(doc))
+    assert code == 1 and "读取片段失败" in out
+    print("✓ kb-update 不存在 / 读取异常分支")
+
+
 def test_update_merges_existing_metadata(monkeypatch):
     """kb-update 只传 --title 时保留库中 category/source 等既有元数据。"""
     import tempfile

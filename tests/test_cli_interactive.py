@@ -369,6 +369,91 @@ def test_process_query_failure_leaves_no_long_term_user_turn():
     print("✓ 编排失败不落孤儿用户轮")
 
 
+def test_process_query_counts_generic_orchestration_failure():
+    """编排阶段的一般异常计入熔断失败并向上抛出。"""
+    from utils.circuit_breaker import CircuitBreaker
+
+    agent, _ = _make_cli_stub()
+    breaker = CircuitBreaker(
+        failure_threshold=5, recovery_timeout_sec=60, half_open_successes=1
+    )
+    agent.circuit_breaker = breaker
+
+    class _BoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise RuntimeError("boom")
+
+    agent.orchestrator = _BoomOrchestrator()
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.process_query("你好"))
+    assert breaker.get_status()["failure_count"] == 1
+    print("✓ 编排一般异常计入熔断")
+
+
+def test_process_query_open_breaker_returns_quickly():
+    """熔断已打开：入口直接提示并返回，不再调用意图 / 编排。"""
+    from utils.circuit_breaker import CircuitBreaker
+
+    agent, events = _make_cli_stub()
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    breaker.record_failure()
+    agent.circuit_breaker = breaker
+    calls = []
+    agent.intention_agent.reply = lambda context: calls.append("intent")
+    asyncio.run(agent.process_query("你好"))
+    assert calls == []
+    assert "服务暂时不可用" in agent.console.file.getvalue()
+    print("✓ 熔断打开时入口快速返回")
+
+
+def test_process_query_filters_malformed_recent_context():
+    """短期记忆中的非法条目（非 dict / 非法角色 / 缺 content）不进入意图上下文。"""
+    agent, _ = _make_cli_stub()
+    captured = {}
+
+    class _CaptureIntention:
+        async def reply(self, context):
+            captured["context"] = list(context)
+            return _TextMessage(json.dumps({"agent_schedule": []}))
+
+    agent.intention_agent = _CaptureIntention()
+    agent.memory_manager.get_recent_context = lambda n_turns=5: [
+        "bad",
+        {"role": "user", "content": "有效消息"},
+        {"role": "tool", "content": "x"},
+        {"role": "assistant"},
+    ]
+    asyncio.run(agent.process_query("本轮提问"))
+    contents = [msg.content for msg in captured["context"]]
+    assert "有效消息" in contents and "本轮提问" in contents
+    assert all("有效消息" in c or "本轮提问" in c for c in contents)
+    print("✓ 非法短期条目被过滤后组装意图上下文")
+
+
+def test_process_query_unparsable_intention_returns():
+    """意图结果不是 JSON：提示无法理解并直接返回，不进入编排。"""
+    agent, events = _make_cli_stub()
+    orchestrated = []
+
+    class _BadIntention:
+        async def reply(self, context):
+            return _TextMessage("这不是 JSON")
+
+    class _CountingOrchestrator:
+        async def reply(self, intention, on_event=None):
+            orchestrated.append(1)
+            return _TextMessage(json.dumps({"results": []}))
+
+    agent.intention_agent = _BadIntention()
+    agent.orchestrator = _CountingOrchestrator()
+    asyncio.run(agent.process_query("你好"))
+    assert orchestrated == []
+    assert "无法理解您的需求" in agent.console.file.getvalue()
+    print("✓ 意图解析失败友好提示且不编排")
+
+
 def test_process_query_memory_failure_not_counted_by_breaker():
     """记忆写盘失败不计入熔断器（与 ConversationRuntime 一致）。"""
     from utils.circuit_breaker import CircuitBreaker

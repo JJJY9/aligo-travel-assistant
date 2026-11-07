@@ -75,6 +75,50 @@ def test_export_to_file(monkeypatch):
     print("✓ trips-export 写入 CSV 文件")
 
 
+def test_export_write_failure_reports(monkeypatch):
+    """父路径被文件占用时 trips-export 写入失败明确报错。"""
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    blocker = os.path.join(workdir, "blocker")
+    with io.open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("x")
+    fake = _FakeStore([_trip()])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    code, out = _run("u1", target=os.path.join(blocker, "trips.csv"))
+    assert code == 1 and "写入失败" in out
+    print("✓ trips-export 写入失败友好报错")
+
+
+def test_export_ics_stdout_writes_utf8_bytes(monkeypatch):
+    """--ics --stdout 走真实字节输出路径（sys.stdout.buffer），不丢行尾。"""
+
+    class _BytesStdout:
+        def __init__(self):
+            self.buffer = io.BytesIO()
+            self.flushes = 0
+
+        def flush(self):
+            self.flushes += 1
+
+        def fileno(self):
+            return 1
+
+    fake = _FakeStore([_trip()])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    real_stdout = sys.stdout
+    sink = _BytesStdout()
+    monkeypatch.setattr(sys, "stdout", sink)
+    code = cli.run_trips_export_standalone("u1", to_stdout=True, ics=True)
+    data = sink.buffer.getvalue().decode("utf-8")
+    flushes = sink.flushes
+    monkeypatch.setattr(sys, "stdout", real_stdout)
+    assert code == 0
+    assert data.startswith("BEGIN:VCALENDAR") and "BEGIN:VEVENT" in data
+    assert flushes >= 1
+    print("✓ trips-export --ics --stdout 字节输出")
+
+
 def test_export_stdout(monkeypatch):
     fake = _FakeStore([_trip()])
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
