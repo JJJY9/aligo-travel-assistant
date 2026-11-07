@@ -1,6 +1,7 @@
 """行程日期解析、重叠判断与状态标签（Web / CLI 共用）。"""
 import logging
 import re
+from bisect import bisect_right
 from collections import Counter
 from datetime import date, datetime
 from typing import Any
@@ -129,21 +130,32 @@ def trips_with_conflicts(
     """为每条行程附上与之日期重叠的其它行程（不会修改传入的字典）。
 
     ``pool`` 用于在一页行程之外计算重叠（如 Web 列表分页时以完整历史为基准）。
+
+    按开始日期排序后用二分定位候选（start ≤ 目标结束），再以结束日期过滤
+    ——全量行程的冲突计算是 O(n log n + 实际重叠对数)，此前逐对比较是
+    O(n²)（几千条历史行程时 CLI 列表 / --json 导出明显卡顿）。
     """
     context = pool if pool is not None else trips
-    intervals = [(trip, trip_interval(trip)) for trip in context]
+    entries: list[tuple[datetime, datetime, int, dict[str, Any]]] = []
+    for index, trip in enumerate(context):
+        interval = trip_interval(trip)
+        if interval is not None:
+            entries.append((interval[0], interval[1], index, trip))
+    entries.sort(key=lambda item: item[0])
+    starts = [item[0] for item in entries]
+
     views = []
     for trip in trips:
         interval = trip_interval(trip)
-        conflicts = []
+        conflicts: list[dict[str, Any]] = []
         if interval is not None:
             start_dt, end_dt = interval
-            for other, other_interval in intervals:
-                if other is trip or other_interval is None:
+            # 只有开始日期不晚于目标结束的行程才可能重叠；再按结束日期过滤
+            limit = bisect_right(starts, end_dt)
+            for other_start, other_end, _, other in entries[:limit]:
+                if other is trip or other_end < start_dt:
                     continue
-                other_start, other_end = other_interval
-                if other_start <= end_dt and start_dt <= other_end:
-                    conflicts.append(other)
+                conflicts.append(other)
             conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
         views.append({**trip, "conflicts": conflicts})
     return views
