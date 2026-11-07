@@ -119,13 +119,13 @@ def test_parse_export_skips_invalid_rows():
     }
     sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
     assert sections["preferences"] == {"home_location": "北京"}
-    assert len(sections["trips"]) == 1
+    # 未补零的日期归一后保真保留（备份恢复优先于格式严格）；倒置区间整条跳过
+    assert [t["start_date"] for t in sections["trips"]] == ["2026-01-01", "2026-12-01"]
     assert len(sections["messages"]) == 1
     assert any("目的地为空" in e for e in errors)
-    assert any("出发日期格式" in e for e in errors)
     assert any("结束日期不能早于出发日期" in e for e in errors)
     assert sum("角色或内容非法" in e for e in errors) == 2
-    print("✓ 非法偏好 / 行程 / 消息逐条跳过")
+    print("✓ 非法偏好 / 行程 / 消息逐条跳过（脏日期保真）")
 
 
 def test_import_roundtrip_and_idempotent():
@@ -143,8 +143,12 @@ def test_import_roundtrip_and_idempotent():
         assert len(trips) == 2 and trips[0]["destination"] == "上海"
         messages = store.get_chat_history(limit=None)
         assert len(messages) == 2
-        # 时间戳保真：恢复的消息保留备份里的原始时间
-        assert messages[0]["timestamp"] == "2026-11-01T09:00:00"
+        # 时间戳保真：归一成带时区的 ISO，墙钟时间与备份一致
+        from datetime import datetime
+
+        normalized = datetime.fromisoformat(messages[0]["timestamp"])
+        assert normalized.tzinfo is not None
+        assert normalized.replace(tzinfo=None).isoformat() == "2026-11-01T09:00:00"
         assert messages[0]["session_id"] == "s1"
         assert store.get_session_titles() == {"s1": "上海出差"}
         assert store.get_pinned_sessions() == ["s1"]
@@ -159,6 +163,43 @@ def test_import_roundtrip_and_idempotent():
     finally:
         store._close() if hasattr(store, "_close") else None
     print("✓ 恢复往返保真且重复导入幂等")
+
+
+def test_parse_validates_session_ids_and_usage():
+    payload = {
+        "preferences": ["不是对象"],  # 整段类型错误：记错误、按空处理
+        "chat_history": [
+            {"role": "user", "content": "合法", "session_id": "s1"},
+            {"role": "user", "content": "坏会话", "session_id": "s 1\n注入"},
+            {"role": "assistant", "content": '{"reply": "x", "_meta": {"usage": {"calls": "很多"}}}', "session_id": "s1"},
+            {"role": "assistant", "content": '{"reply": "y", "_meta": "bad"}', "session_id": "s1"},
+            {"role": "assistant", "content": "纯文本回答", "session_id": "s1"},
+        ],
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert sections["preferences"] == {}
+    assert any("preferences 段不是对象" in e for e in errors)
+    assert [m["content"] for m in sections["messages"]] == ["合法", "纯文本回答"]
+    joined = "；".join(errors)
+    assert "会话 ID 非法" in joined
+    assert "消息用量字段不是数字" in joined
+    assert "消息元数据不是对象" in joined
+    print("✓ 会话 ID / 用量类型校验，偏好类型错误显式报告")
+
+
+def test_import_sorts_messages_by_timestamp():
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "较晚", "session_id": "s1", "timestamp": "2026-11-02T10:00:00"},
+            {"role": "user", "content": "较早", "session_id": "s1", "timestamp": "2026-11-02T08:00:00"},
+        ]
+    }
+    sections, _ = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [m["content"] for m in sections["messages"]] == ["较早", "较晚"]
+    store = _real_store("u-order")
+    import_user_data(store, sections)
+    assert [m["content"] for m in store.get_chat_history(limit=None)] == ["较早", "较晚"]
+    print("✓ 恢复按时间升序写入")
 
 
 def test_exporter_json_is_importable():
@@ -286,13 +327,13 @@ def test_parse_tolerates_bad_timestamps_and_rows():
     }
     sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
     assert sections["preferences"] == {"ok": "值"}
-    assert sections["trips"] == [], "非法返程日期应整条跳过"
+    # 无法解析的返程日期原样保留（保真），不整条丢弃
+    assert [t["end_date"] for t in sections["trips"]] == ["2026-12-32"]
     assert [m["timestamp"] for m in sections["messages"]] == [None, None, None]
     assert sections["titles"] == {}
     joined = "；".join(errors)
     assert "键名非法" in joined
     assert "不是对象" in joined
-    assert "返程日期格式" in joined
     print("✓ 非法时间戳 / 行类型 / 超长键名逐条容忍")
 
 
@@ -310,6 +351,8 @@ if __name__ == "__main__":
     test_parse_export_rejects_invalid()
     test_parse_export_skips_invalid_rows()
     test_exporter_json_is_importable()
+    test_parse_validates_session_ids_and_usage()
+    test_import_sorts_messages_by_timestamp()
     test_parse_tolerates_bad_timestamps_and_rows()
     test_parse_limits_preferences()
     test_import_roundtrip_and_idempotent()

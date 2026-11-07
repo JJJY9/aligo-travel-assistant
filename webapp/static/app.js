@@ -1283,12 +1283,14 @@ function exportSessionHtml() {
 const USER_IMPORT_MAX_BYTES = 50 * 1024 * 1024;
 
 async function importUserBackup() {
+  // 先取走并清空选择：发送中提前返回时保留文件的话，之后再选同一文件
+  // 不会触发 change，导入看起来「没反应」
+  const file = els.importDataFile.files && els.importDataFile.files[0];
+  els.importDataFile.value = "";
   if (state.busy) {
     toast("请等待当前回复完成");
     return;
   }
-  const file = els.importDataFile.files && els.importDataFile.files[0];
-  els.importDataFile.value = "";
   if (!file) return;
   if (file.size > USER_IMPORT_MAX_BYTES) {
     toast("备份文件不能超过 50 MB");
@@ -1331,13 +1333,21 @@ async function importUserBackup() {
         body: JSON.stringify({ backup }),
       },
     );
+    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
     toast(
       `已恢复：偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
-        `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条`,
+        `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
+        (skipped ? `，跳过 ${skipped} 项` : ""),
     );
     await Promise.all([refreshStatus(), loadSessions()]);
-    if (state.sessionId) {
-      // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面
+    // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面。
+    // 正在编辑提问 / 切换会话时跳过：整体重渲染会销毁编辑框并作废在途加载
+    if (
+      state.sessionId &&
+      !state.sessionLoading &&
+      !document.querySelector(".user-edit-input") &&
+      !document.querySelector(".user-edit-form")
+    ) {
       await openSession(state.sessionId, {
         silent: true,
         keepOnError: true,

@@ -4444,6 +4444,42 @@ def test_user_data_import_api():
         _cleanup(target)
 
 
+def test_user_import_large_backup_over_2mb():
+    """回归：/api/import 必须能接收 2 MB 以上的合法备份（面板上限 50 MB）。
+
+    此前全局 2 MB 请求体上限会让正常规模备份（几百条消息）直接 413，
+    与面板预检 / README 的 50 MB 承诺矛盾。
+    """
+    target = _unique_user("web_test_import_big")
+    try:
+        payload = {
+            "backup": {
+                "user_id": "big-src",
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "x" * 2_500_000,
+                        "session_id": "sess-big",
+                        "timestamp": "2026-11-03T09:00:00",
+                    }
+                ],
+            }
+        }
+        client = _client()
+        response = client.post(
+            "/api/import", params={"user_id": target}, json=payload
+        )
+        assert response.status_code == 200, response.text[:200]
+        result = response.json()
+        assert result["messages_added"] == 1
+        detail = client.get("/api/sessions/sess-big", params={"user_id": target}).json()
+        assert len(detail["messages"]) == 1
+        assert len(detail["messages"][0]["content"]) == 2_500_000
+        print("✓ /api/import 支持 2 MB 以上的备份")
+    finally:
+        _cleanup(target)
+
+
 def test_session_pin():
     client = _client()
     user_id = _unique_user("web_test_pin")

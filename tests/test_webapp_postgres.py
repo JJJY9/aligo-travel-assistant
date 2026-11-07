@@ -338,5 +338,49 @@ def test_update_trip_dedupe_normalizes_single_day_end_date():
         store.close()
 
 
+def test_pg_import_preserves_timestamp_instant():
+    """备份恢复：naive 本地时间戳写入 TIMESTAMPTZ 后不能发生时区偏移。"""
+    from datetime import datetime
+
+    from utils.user_import import import_user_data, parse_user_export
+
+    user_id = f"pg_import_{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        payload = {
+            "chat_history": [
+                {
+                    "role": "user",
+                    "content": "历史消息",
+                    "session_id": "sess-pg-import",
+                    "timestamp": "2026-11-02T08:30:00",
+                }
+            ]
+        }
+        sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+        assert errors == []
+        counts = import_user_data(store, sections)
+        assert counts["messages_added"] == 1
+
+        messages = store.get_chat_history(limit=None, session_id="sess-pg-import")
+        assert len(messages) == 1
+        parsed = datetime.fromisoformat(messages[0]["timestamp"])
+        assert parsed.tzinfo is not None
+        # 墙钟时间按本机时区解释：换回本机后与原始 naive 时间一致
+        assert (
+            parsed.astimezone().replace(tzinfo=None).isoformat()
+            == "2026-11-02T08:30:00"
+        )
+
+        # 重复导入幂等
+        again = import_user_data(store, sections)
+        assert again["messages_added"] == 0 and again["messages_skipped"] == 1
+        assert len(store.get_chat_history(limit=None, session_id="sess-pg-import")) == 1
+        print("✓ PostgreSQL 备份恢复时间戳保真且幂等")
+    finally:
+        store.delete_chat_session("sess-pg-import")
+        store.close()
+
+
 if __name__ == "__main__":
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")

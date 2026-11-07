@@ -11,10 +11,28 @@ PostgreSQL 长期记忆后端
 import contextlib
 import logging
 import re
+from collections import Counter
+from datetime import datetime
 from typing import Any
 
 from utils.errors import MemoryPersistenceError
 from utils.preference_values import merge_preference_value
+
+
+def _pg_timestamp(value: str) -> str:
+    """naive 本地时间戳按本机时区解释后再写入 TIMESTAMPTZ。
+
+    PostgreSQL 对无时区输入按会话 TimeZone（容器默认 UTC）解释；JSON 后端
+    导出的 ``datetime.now().isoformat()`` 是本机时间，直接入库会整体偏移。
+    """
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed.isoformat()
 
 logger = logging.getLogger(__name__)
 
@@ -293,18 +311,77 @@ class PostgresLongTermMemory:
         timestamp: str | None = None,
     ) -> None:
         if timestamp:
-            # 备份恢复：保留原始时间戳（ISO 字符串由 PostgreSQL 解析）
+            # 备份恢复：保留原始时间戳（naive 按本机时区解释）
             self._execute(
                 "INSERT INTO aligo_chat_messages "
                 "(user_id, role, content, session_id, created_at) "
                 "VALUES (%s, %s, %s, %s, %s)",
-                (self.user_id, role, content, session_id, timestamp),
+                (self.user_id, role, content, session_id, _pg_timestamp(timestamp)),
             )
             return
         self._execute(
             "INSERT INTO aligo_chat_messages (user_id, role, content, session_id) VALUES (%s, %s, %s, %s)",
             (self.user_id, role, content, session_id),
         )
+
+    def add_chat_messages(
+        self, messages: list[dict[str, Any]], dedupe: bool = False
+    ) -> int:
+        """批量追加聊天消息（备份恢复）：单事务 executemany。
+
+        ``dedupe=True`` 在同一事务内先读出（会话, 角色, 内容）多重集再过滤，
+        重复导入同一备份不会追加重复消息。返回实际写入的条数。
+        """
+        rows: list[tuple] = []
+        fallback = datetime.now().isoformat()
+        for message in messages:
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            timestamp = message.get("timestamp") or fallback
+            rows.append(
+                (
+                    role,
+                    str(message.get("content") or ""),
+                    message.get("session_id"),
+                    _pg_timestamp(timestamp),
+                )
+            )
+        if not rows:
+            return 0
+
+        def run() -> int:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                kept = rows
+                if dedupe:
+                    cursor.execute(
+                        "SELECT session_id, role, content FROM aligo_chat_messages "
+                        "WHERE user_id = %s",
+                        (self.user_id,),
+                    )
+                    existing = Counter(
+                        (session_id, role, content)
+                        for session_id, role, content in cursor.fetchall()
+                    )
+                    filtered = []
+                    for role, content, session_id, timestamp in rows:
+                        key = (session_id, role, content)
+                        if existing[key] > 0:
+                            existing[key] -= 1
+                            continue
+                        filtered.append((role, content, session_id, timestamp))
+                    kept = filtered
+                if not kept:
+                    return 0
+                cursor.executemany(
+                    "INSERT INTO aligo_chat_messages "
+                    "(user_id, role, content, session_id, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    [(self.user_id, *row) for row in kept],
+                )
+                return len(kept)
+
+        return int(self._run_with_retry(run) or 0)
 
     def get_chat_history(
         self,
