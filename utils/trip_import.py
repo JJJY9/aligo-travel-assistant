@@ -3,14 +3,17 @@
 - CSV：解析 trips-export 导出的 CSV（UTF-8 BOM，中文或英文字段名），逐行
   校验日期与必填字段；非法行收集为错误而不是中断整个文件。
 - iCalendar：解析 trips-export --ics 导出的事件（RFC 5545 折行 / 转义、
-  排他 DTEND），同样尽最大努力收集错误。
+  排他 DTEND），Z / ±HHMM 的 DATE-TIME 先换算本机时区再取日期，同样尽最大
+  努力收集错误。
 重复行程沿用存储层的去重语义（同路线 + 同起止日期更新目的）。
 """
 import csv
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
+
+from utils.trip_export import _needs_quote_guard
 
 _HEADER_ALIASES = {
     "origin": {"出发地", "origin"},
@@ -70,11 +73,18 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         index = mapping.get(key)
         if index is None or index >= len(row):
             return ""
-        return str(row[index] or "").strip()
+        value = str(row[index] or "").strip()
+        # 反转 trips-export 为防 CSV 公式注入加的前导单引号
+        if value.startswith("'") and _needs_quote_guard(value[1:]):
+            value = value[1:]
+        return value
 
     rows: list[dict[str, Any]] = []
     errors: list[tuple[int, str]] = []
-    for line_no, row in enumerate(reader, start=2):
+    for row in reader:
+        # csv.reader 把带引号的多行字段算作一条记录：enumerate 的序号不是
+        # 物理行号，用 reader.line_num 才能让报错指向用户看到的行
+        line_no = reader.line_num
         if not row or all(not str(item or "").strip() for item in row):
             continue
         destination = cell(row, "destination")
@@ -139,15 +149,49 @@ def _ics_unescape(value: str) -> str:
     return "".join(out)
 
 
-def _ics_prop_date(value: str) -> "datetime | None":
-    """解析 DATE / DATE-TIME 属性值的前 8 位日期（YYYYMMDD）。"""
+_ICS_DT = re.compile(
+    r"^(?P<date>\d{8})"
+    r"(?:T(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})?)?"
+    r"(?P<tz>Z|[+-]\d{4})?$"
+)
+
+
+def _ics_local_datetime(value: str) -> "tuple[datetime, bool] | None":
+    """解析 DATE / DATE-TIME 属性值，返回 (本机墙钟时间, 是否含时间成分)。
+
+    Z / ±HHMM 的 DATE-TIME 先换算到本机时区再取日期：UTC 23:30 在东八区
+    已是第二天，只截前 8 位日期会把行程整体记错一天。
+    """
     text = str(value or "").strip()
-    if len(text) >= 8 and text[:8].isdigit():
-        try:
-            return datetime.strptime(text[:8], "%Y%m%d")
-        except ValueError:
-            return None
-    return None
+    match = _ICS_DT.match(text)
+    if match is None:
+        return None
+    has_time = match.group("hour") is not None
+    try:
+        if has_time:
+            parsed = datetime(
+                int(match.group("date")[:4]),
+                int(match.group("date")[4:6]),
+                int(match.group("date")[6:8]),
+                int(match.group("hour")),
+                int(match.group("minute")),
+                int(match.group("second") or 0),
+            )
+        else:
+            parsed = datetime.strptime(match.group("date"), "%Y%m%d")
+    except ValueError:
+        return None
+    tz = match.group("tz")
+    if tz and has_time:
+        if tz == "Z":
+            offset = timezone.utc
+        else:
+            sign = 1 if tz[0] == "+" else -1
+            offset = timezone(
+                sign * timedelta(hours=int(tz[1:3]), minutes=int(tz[3:5]))
+            )
+        parsed = parsed.replace(tzinfo=offset).astimezone().replace(tzinfo=None)
+    return parsed, has_time
 
 
 _ALIGO_DESCRIPTION = re.compile(
@@ -162,16 +206,32 @@ _ICS_SUMMARY = re.compile(
 
 def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
     """把一个 VEVENT 的属性映射为行程行；无法使用时返回 (None, 原因)。"""
-    start_dt = _ics_prop_date(props.get("DTSTART", ""))
-    if start_dt is None:
+    start_parsed = _ics_local_datetime(props.get("DTSTART", ""))
+    if start_parsed is None:
         return None, "缺少或非法的 DTSTART"
+    start_dt, _start_has_time = start_parsed
+    start_day = start_dt.date()
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = ""
-    end_dt = _ics_prop_date(props.get("DTEND", ""))
-    if end_dt is not None and end_dt >= start_dt:
-        # DTEND 是排他日期：单日行程 DTEND=DTSTART+1，记为同日开始结束
-        inclusive = end_dt - timedelta(days=1) if end_dt > start_dt else start_dt
-        end_date = start_date if inclusive == start_dt else inclusive.strftime("%Y-%m-%d")
+    end_parsed = _ics_local_datetime(props.get("DTEND", ""))
+    if end_parsed is not None:
+        end_dt, end_has_time = end_parsed
+        if end_dt >= start_dt:
+            if end_has_time:
+                # DATE-TIME 的结束时刻包含在内：只有恰好 00:00 才是
+                # 「排他日期」，按全天规则减一天会提前结束跨日定时事件
+                if end_dt.date() > start_day and end_dt.time() == time(0, 0):
+                    inclusive = end_dt.date() - timedelta(days=1)
+                else:
+                    inclusive = end_dt.date()
+            elif end_dt > start_dt:
+                # VALUE=DATE 的 DTEND 是排他日期：单日行程 DTEND=DTSTART+1
+                inclusive = end_dt.date() - timedelta(days=1)
+            else:
+                inclusive = start_day
+            if inclusive < start_day:
+                inclusive = start_day
+            end_date = inclusive.strftime("%Y-%m-%d")
 
     description = _ics_unescape(props.get("DESCRIPTION", "")).strip()
     summary = _ics_unescape(props.get("SUMMARY", "")).strip()

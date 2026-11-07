@@ -16,11 +16,19 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _needs_quote_guard(text: str) -> bool:
+    """以公式字符开头，或去掉一个前导引号后仍需防护（保证导入端可逆）。"""
+    if text.startswith(_FORMULA_PREFIXES):
+        return True
+    return text.startswith("'") and _needs_quote_guard(text[1:])
+
+
 def _csv_safe(value: object) -> str:
     text = str(value or "")
-    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
-        return "'" + text
-    return text
+    return "'" + text if _needs_quote_guard(text) else text
 
 
 def render_trips_csv(trips: list[dict[str, Any]]) -> str:
@@ -84,9 +92,14 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     destination = str(trip.get("destination") or "目的地")
     purpose = str(trip.get("purpose") or "出行")
     summary = f"{origin} → {destination}（{purpose}）"
+    # DESCRIPTION 是 trips-import 的机器可读来源：必须用原始值（占位符只
+    # 出现在给人看的 SUMMARY 里），否则空出发地在往返后会变成字面量「出发地」，
+    # 去重键随之改变并重复新增行程
     description = (
-        f"Aligo 行程：{origin} → {destination}，"
-        f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，{purpose}"
+        f"Aligo 行程：{str(trip.get('origin') or '')} → "
+        f"{str(trip.get('destination') or '')}，"
+        f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，"
+        f"{str(trip.get('purpose') or '')}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     # UID 同时包含行程内容：删除最新行程后 id 可能被复用，仅用 trip_id
