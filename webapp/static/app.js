@@ -66,6 +66,9 @@ const state = {
   // 本轮是否已收到 plan 事件：之前中止意味着提问尚未写入服务端历史
   turnSawPlan: false,
   kbItems: [],
+  // 服务端分页游标：以「已向服务端取回的条数」为准，而不是去重后的已显示
+  // 条数——并发插入会让按显示数计算的 offset 永远追不上，加载更多失效
+  kbOffset: 0,
   kbTotal: 0,
   kbQuery: "",
   kbCategory: "",
@@ -697,6 +700,12 @@ function startEditUserNode(node, originalText) {
       input.focus();
       return;
     }
+    if ([...text].length > CHAT_MESSAGE_MAX) {
+      // 先删上一轮再重发时超限必 422：删除成功、发送失败会让这一轮消失
+      toast(`提问超过 ${CHAT_MESSAGE_MAX} 字，无法重新发送；请先精简后再试`);
+      input.focus();
+      return;
+    }
     if (text === originalText) {
       close();
       return;
@@ -914,6 +923,10 @@ async function regenerate(node, text) {
     return;
   }
   trimRegenButtons();
+  if ([...text].length > CHAT_MESSAGE_MAX) {
+    toast(`提问超过 ${CHAT_MESSAGE_MAX} 字，无法重新发送；请先精简后再试`);
+    return;
+  }
   if (state.sessionId) {
     // 先删除服务端上一轮，避免重新生成在历史里叠加重复问答
     setBusy(true);
@@ -1055,7 +1068,7 @@ function triggerExport() {
 async function toggleTripsExpanded() {
   if (state.tripsExpanded) {
     state.tripsExpanded = false;
-    renderOverview();
+    renderOverviewUnlessEditing();
     return;
   }
   const userId = state.userId;
@@ -1073,7 +1086,7 @@ async function toggleTripsExpanded() {
     state.tripsAll = data.trips || [];
     state.tripsAllTotal = Number(data.total || state.tripsAll.length);
     state.tripsExpanded = true;
-    renderOverview();
+    renderOverviewUnlessEditing();
   } catch (error) {
     if (requestId !== tripsRequestId || userId !== state.userId) return;
     toast(error.message);
@@ -1365,7 +1378,15 @@ async function importUserBackup() {
     if (result.knowledge_error) {
       toast(`知识片段未恢复：${result.knowledge_error}`);
     }
-    await Promise.all([refreshStatus(), loadSessions(), refreshKnowledge()]);
+    await Promise.all([
+      refreshStatus(),
+      loadSessions(),
+      refreshKnowledge(),
+      // 备份可能带 knowledge 段：片段列表与分类同步刷新，否则库 chip 显示
+      // 新增数量、下方列表仍是恢复前的旧数据
+      refreshKnowledgeDocuments(),
+      refreshKnowledgeCategories(),
+    ]);
     // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面。
     // 正在编辑提问 / 切换会话时跳过：整体重渲染会销毁编辑框并作废在途加载
     if (
@@ -2679,6 +2700,16 @@ function preferenceEditActive() {
   return Boolean(input && input.getClientRects().length > 0);
 }
 
+function renderOverviewUnlessEditing() {
+  // 有进行中的偏好行内编辑：整体重渲染会销毁输入框且不触发 blur/cancel
+  // （已输入内容丢失），标记待刷新，等面板关闭或下次状态刷新再重建
+  if (preferenceEditActive()) {
+    state.statusStale = true;
+    return;
+  }
+  renderOverview();
+}
+
 function renderOverview() {
   const status = state.status;
   if (!status) {
@@ -3590,6 +3621,7 @@ async function refreshKnowledgeDocuments() {
   const seq = ++kbListSeq;
   els.kbList.textContent = "加载中…";
   state.kbItems = [];
+  state.kbOffset = 0;
   state.kbTotal = 0;
   // 刷新期间隐藏「加载更多」：否则点击会以 offset=0 请求第一页
   updateKnowledgeMore();
@@ -3598,6 +3630,7 @@ async function refreshKnowledgeDocuments() {
     const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
     if (seq !== kbListSeq) return;
     state.kbTotal = Number(data.total || 0);
+    state.kbOffset = (data.items || []).length;
     renderKnowledgeDocuments(data.items || [], false);
   } catch (error) {
     if (seq !== kbListSeq) return;
@@ -3613,11 +3646,14 @@ async function loadMoreKnowledgeDocuments() {
   els.kbMore.disabled = true;
   try {
     const data = await getJSON(
-      `/api/knowledge/documents?${knowledgeQueryParams(state.kbItems.length)}`,
+      `/api/knowledge/documents?${knowledgeQueryParams(state.kbOffset)}`,
     );
     // 语义检索可能在请求期间开始：不能再把关键词行追加进语义结果
     if (seq !== kbListSeq || state.kbSemanticMode) return;
     state.kbTotal = Number(data.total || 0);
+    // 游标按实际取回的条数前进（含被去重跳过的行），否则并发插入后
+    // 每次仍以同一个 offset 请求，加载更多永远只返回同一窗口
+    state.kbOffset += (data.items || []).length;
     renderKnowledgeDocuments(data.items || [], true);
     els.kbList.focus();
   } catch (error) {
@@ -3636,7 +3672,7 @@ function updateKnowledgeMore() {
     els.kbMore.hidden = true;
     return;
   }
-  els.kbMore.hidden = state.kbItems.length >= state.kbTotal;
+  els.kbMore.hidden = state.kbOffset >= state.kbTotal;
 }
 
 function knowledgePreview(content, query) {
@@ -4116,7 +4152,17 @@ async function addKnowledgeDocument(event) {
   }
 }
 
-const KB_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+// 服务端 /api/chat 的提问上限（Pydantic max_length=4000，按码点计）：
+// 重新生成 / 编辑重发会先删除服务端上一轮再发送，超过上限的重发必然
+// 422——必须在删除之前拦截，否则上一轮已被删、新提问又发不出去
+const CHAT_MESSAGE_MAX = 4000;
+// 与服务端 /api/import 同一上限；实际写入按 200 条/批发送，单批远小于
+// 请求体限制。旧版在文件解析前硬性拒绝 >2MB（与 CLI kb-import 不一致，
+// 大知识库导出无法通过面板恢复）
+const KB_IMPORT_MAX_BYTES = 50 * 1024 * 1024;
+// 预览接口一次提交整份文档（2MB 请求体上限）：超出的文件跳过预览，
+// 直接按条数确认后分批导入（重复项在导入时仍会被跳过）
+const KB_IMPORT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 
 async function importKnowledgeFile() {
   if (state.kbImporting) return;
@@ -4129,7 +4175,7 @@ async function importKnowledgeFile() {
     els.kbImportFile.value = "";
     if (!file) return;
     if (file.size > KB_IMPORT_MAX_BYTES) {
-      toast("JSON 文件不能超过 2 MB");
+      toast("JSON 文件不能超过 50 MB");
       return;
     }
     let data;
@@ -4148,13 +4194,14 @@ async function importKnowledgeFile() {
       toast("文件中没有知识片段（需要 documents 数组）");
       return;
     }
-    if (documents.length > 16384) {
-      toast("单次最多导入 16384 条知识片段");
+    if (documents.length > 20000) {
+      toast("单次最多导入 20000 条知识片段");
       return;
     }
     // 先预览（不写库）：告诉用户将导入 / 跳过多少条，再确认
     let confirmText = `导入 ${documents.length} 条知识片段？`;
-    try {
+    if (file.size <= KB_IMPORT_PREVIEW_MAX_BYTES) {
+      try {
       const preview = await getJSON("/api/knowledge/import/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4175,9 +4222,12 @@ async function importKnowledgeFile() {
           : `（跳过 ${skippedCount} 条已存在 / 无效内容）`
         : "";
       confirmText = `将导入 ${wouldImport} 条知识片段${skippedText}？`;
-    } catch (error) {
-      // 预览失败（如知识库暂不可用）不阻断：退回按文件条数确认
-      confirmText = `导入 ${documents.length} 条知识片段？`;
+      } catch (error) {
+        // 预览失败（如知识库暂不可用）不阻断：退回按文件条数确认
+        confirmText = `导入 ${documents.length} 条知识片段？`;
+      }
+    } else {
+      confirmText += "（文件较大，已跳过导入前预览；重复项会在导入时自动跳过）";
     }
     if (!window.confirm(confirmText)) return;
 
