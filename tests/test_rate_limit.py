@@ -220,6 +220,90 @@ def test_redis_limiter_handles_bytes_replies():
     print("✓ 兼容未解码（bytes）的 Redis 返回值")
 
 
+def test_peek_and_status_expired_events():
+    """peek / status 对未知 key 与过期事件的边界分支。"""
+    limiter = RateLimiter(limit=1, window_sec=0.25)
+    assert limiter.peek("unknown") is None
+    assert limiter.status("unknown") == (1, 0.0)
+
+    assert limiter.check("k1") is None
+    assert limiter.check("k2") is None
+    assert limiter.peek("k1") is not None, "已达上限应返回 Retry-After"
+
+    time.sleep(0.3)
+    # 两条路径分别在独立的 key 上覆盖「过期事件清理」：
+    # peek 的 while-pop 清理，以及 status 的 while-pop + 全空分支
+    assert limiter.peek("k1") is None, "事件过期后应清理并放行"
+    assert limiter.status("k2") == (1, 0.0)
+    print("✓ peek / status 的未知 key 与过期清理分支")
+
+
+def test_redis_factory_failure_degrades_then_reset_without_client():
+    """工厂抛异常 / 返回 None：限流器回退但不崩溃；reset 在无客户端时为空操作。"""
+
+    def broken_factory():
+        raise RuntimeError("factory boom")
+
+    broken = RedisRateLimiter(
+        None, "unit-broken", limit=2, window_sec=60, client_factory=broken_factory
+    )
+    assert broken.check("k") is None, "前端回退实现应放行"
+    assert broken.degraded is True
+    broken.reset()
+
+    no_client = RedisRateLimiter(
+        None, "unit-none", limit=2, window_sec=60, client_factory=lambda: None
+    )
+    no_client.reset()
+    assert no_client.degraded is True
+    print("✓ Redis 工厂失败回退与无客户端 reset")
+
+
+def test_redis_cooldown_short_circuit_and_scan_failure():
+    """冷却期内的请求不再打 Redis；reset 的扫描/删除失败被吞掉。"""
+
+    class _CountingDownRedis:
+        def __init__(self):
+            self.eval_calls = 0
+
+        def eval(self, *args, **kwargs):
+            self.eval_calls += 1
+            raise RuntimeError("down")
+
+        def scan_iter(self, *args, **kwargs):
+            raise RuntimeError("scan down")
+
+    client = _CountingDownRedis()
+    limiter = RedisRateLimiter(client, "unit-cooldown", limit=2, window_sec=60)
+    assert limiter.check("k") is None
+    assert client.eval_calls == 1
+    assert limiter.check("k") is None
+    assert client.eval_calls == 1, "冷却期内不应再次访问 Redis"
+    assert limiter.degraded is True
+
+    # scan_iter 抛异常：reset 不传播（清理失败不影响服务）
+    limiter.reset()
+
+    # 正常路径：扫描到键后逐个删除
+    class _ScannableRedis:
+        def __init__(self):
+            self.deleted = []
+
+        def eval(self, *args, **kwargs):
+            return 0
+
+        def scan_iter(self, *args, **kwargs):
+            return iter([b"aligo:rl:unit:unit-scan:k1", b"aligo:rl:unit:unit-scan:k2"])
+
+        def delete(self, *keys):
+            self.deleted.extend(keys)
+
+    scannable = _ScannableRedis()
+    RedisRateLimiter(scannable, "unit-scan", limit=2, window_sec=60).reset()
+    assert len(scannable.deleted) == 2, "reset 应删除扫描到的键"
+    print("✓ 冷却短路、reset 清理失败容错与正常删除")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
@@ -232,4 +316,7 @@ if __name__ == "__main__":
     test_redis_limiter_reconnects_via_factory()
     test_degraded_survives_cooldown_without_success()
     test_redis_limiter_handles_bytes_replies()
+    test_peek_and_status_expired_events()
+    test_redis_factory_failure_degrades_then_reset_without_client()
+    test_redis_cooldown_short_circuit_and_scan_failure()
     print("\n全部通过")
