@@ -507,7 +507,13 @@ class LongTermMemory:
         logger.info(f"Added airline preference: {airline}")
 
     @_locked_mutation
-    def add_chat_message(self, role: str, content: str, session_id: str | None = None):
+    def add_chat_message(
+        self,
+        role: str,
+        content: str,
+        session_id: str | None = None,
+        timestamp: str | None = None,
+    ):
         """
         添加聊天消息到长期记忆
 
@@ -515,11 +521,13 @@ class LongTermMemory:
             role: 角色 (user/assistant)
             content: 消息内容
             session_id: 会话ID（可选）
+            timestamp: ISO 时间戳（可选；备份恢复时保留原始时间，
+                缺省用当前时间）
         """
         message = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timestamp or datetime.now().isoformat(),
             "session_id": session_id
         }
 

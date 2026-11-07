@@ -518,7 +518,7 @@ python cli.py
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部、`--query <关键词>` 按标题与消息内容过滤并附命中片段、`--json` 输出机器可读列表；`python cli.py session-archive <user_id> <session_id> [--restore] [--json]` 归档 / 恢复会话（`--json` 输出结构化结果）；`python cli.py session-delete <user_id> <session_id> [--json]` 删除会话的全部消息并同步清理短期记忆（Redis 会话键），不可恢复；`python cli.py session-title <user_id> <session_id> <标题|--reset> [--json]` 设置 / 重置会话标题（上限 60 字，`--reset` 恢复自动标题）；`python cli.py session-pin <user_id> <session_id> [--off] [--json]` 置顶 / 取消置顶会话；`python cli.py session-show <user_id> <session_id> [--json]` 查看单个会话（标题 / 置顶 / 归档状态与按时间排序的消息，助手消息重新渲染，`--json` 输出原始消息）；`python cli.py session-export <user_id> <session_id> [path] [--stdout]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`，助手消息按编排结果重新渲染）。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
 
-全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir]` 把偏好、历史行程、会话标题 / 置顶 / 归档、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令字段一致）。
+全部数据导出（不进入交互）：`python cli.py user-export <user_id> [dir]` 把偏好、历史行程、会话标题 / 置顶 / 归档、统计与全部对话历史导出为 JSON + Markdown 两份文件（默认 `exports/`，与交互模式 `export` 命令字段一致）。备份恢复：`python cli.py user-import <user_id> <json_path> [--json]` 从 `user-export` 的 JSON 恢复偏好、行程、聊天消息与会话标题 / 置顶 / 归档（时间戳保真；重复导入幂等——行程按路线+日期去重、消息按「会话/角色/内容」多重集去重；非法条目逐条跳过并在 `--json` 的 `skipped` 中列出；统计字段由存储层累计，不直接覆盖）。
 
 用户数据概览（不进入交互）：`python cli.py stats <user_id> [--json]` 汇总偏好条数、行程统计（总行程 / 出行天数 / 到访城市 / 进行中 / 即将出行）与会话 / 消息 / 归档数量，与 Web 记忆面板同口径。
 

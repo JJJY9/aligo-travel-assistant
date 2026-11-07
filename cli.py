@@ -1980,6 +1980,99 @@ def run_user_export_standalone(user_id: str, target_dir: str | None = None) -> i
     return 0
 
 
+def run_user_import_standalone(
+    user_id: str, json_path: str, as_json: bool = False
+) -> int:
+    """从 user-export 的 JSON 备份恢复用户数据
+    （`python cli.py user-import <user_id> <json_path> [--json]`）。
+
+    恢复偏好、行程、聊天消息与会话元数据（标题 / 置顶 / 归档）；统计字段
+    由存储层在写入时自行累计。重复导入幂等：行程按存储层去重，聊天消息按
+    （会话, 角色, 内容）多重集去重。非法条目逐条跳过并列出。
+
+    Returns:
+        0 至少恢复一类数据（含部分条目被跳过）；1 参数 / 读取 / 写入失败
+        或没有可恢复的数据
+    """
+    import io
+    import re
+
+    from utils.user_import import import_user_data, parse_user_export
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not json_path or json_path.startswith("-"):
+        return _fail("请提供 JSON 备份文件路径")
+    try:
+        text = io.open(json_path, "r", encoding="utf-8-sig").read()
+    except FileNotFoundError:
+        return _fail(f"文件不存在：{json_path}")
+    except UnicodeDecodeError as exc:
+        return _fail(f"读取备份失败：{exc}（文件需为 UTF-8 编码）")
+    except OSError as exc:
+        return _fail(f"读取备份失败：{exc}")
+
+    sections, errors = parse_user_export(text)
+    if not sections:
+        detail = "；".join(errors[:5])
+        return _fail(f"没有可恢复的数据{f'（{detail}）' if detail else ''}")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            counts = import_user_data(store, sections)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"写入失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "path": json_path,
+                    **counts,
+                    "skipped": errors,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        summary = (
+            f"已恢复：偏好 {counts['preferences']} 项，行程新增 "
+            f"{counts['trips_created']} 条 / 更新 {counts['trips_updated']} 条，"
+            f"聊天消息 {counts['messages_added']} 条"
+            f"（跳过重复 {counts['messages_skipped']} 条），标题 "
+            f"{counts['titles']} 个，置顶 {counts['pinned']} 个，归档 "
+            f"{counts['archived']} 个"
+        )
+        print(summary)
+        for error in errors[:10]:
+            print(f"  跳过：{error}")
+    return 0
+
+
 def _parse_kb_write_args(
     args: list[str],
 ) -> tuple[list[str], dict[str, str]] | None:
@@ -4544,7 +4637,7 @@ _COMMANDS_HINT = (
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
     "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-delete / session-title / session-pin / session-show / session-export / "
-    "sessions-export / trips-export / trips-import / user-export"
+    "sessions-export / trips-export / trips-import / user-export / user-import"
 )
 
 
@@ -5190,6 +5283,29 @@ def main():
                 run_user_export_standalone(
                     export_args[0],
                     export_args[1] if len(export_args) == 2 else None,
+                )
+            )
+        if arg == "user-import":
+            positional = []
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                lowered = item.lower()
+                if lowered == "--json":
+                    as_json = True
+                elif item.startswith("-") or len(positional) >= 2:
+                    valid = False
+                    break
+                else:
+                    positional.append(item)
+            if not valid or len(positional) != 2:
+                print(
+                    "用法：python cli.py user-import <user_id> <json_path> [--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_user_import_standalone(
+                    positional[0], positional[1], as_json=as_json
                 )
             )
         if arg == "trips-export":
