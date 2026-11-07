@@ -269,8 +269,10 @@ class AligoCLI:
                     self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
                     return
 
-            # 4. 用户消息在本轮成功后再落库：编排失败 / Ctrl-C 时不留
-            # 无回复的孤儿用户轮，重试也不会在历史里重复同一条提问
+            # 4. 本轮提问先只进短期记忆：编排智能体从短期记忆读取「用户本轮
+            # 原话」（与 Web 的 ConversationRuntime 一致）；长期记忆仍在本轮
+            # 成功后落库，编排失败 / Ctrl-C 时不留无回复的孤儿用户轮
+            self.memory_manager.stage_message("user", user_input)
 
             # 5. 调度智能体（实时显示智能体进度）
             orchestration_result = None
@@ -329,14 +331,15 @@ class AligoCLI:
                         f"总耗时 {elapsed:.1f}s[/dim]"
                     )
 
-            # 9. 写入长期记忆（附带执行元数据，Web 端历史会话可回看执行路线）
+            # 9. 写入长期记忆（附带执行元数据，Web 端历史会话可回看执行路线）；
+            # 用户消息的短期副本已在编排前暂存，这里只补长期记忆，避免重复
             meta = build_turn_meta(
                 intention_data if isinstance(intention_data, dict) else {},
                 result_data,
                 usage=usage_delta,
                 elapsed=elapsed,
             )
-            self.memory_manager.add_message("user", user_input)
+            self.memory_manager.persist_message("user", user_input)
             self.memory_manager.add_message(
                 "assistant",
                 json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
@@ -1037,8 +1040,16 @@ class AligoCLI:
         # 主循环
         while True:
             try:
-                # 获取用户输入
-                user_input = Prompt.ask("\n[cyan]>[/cyan]")
+                # 获取用户输入。stdin 不可用只可能发生在 Prompt.ask 本身：
+                # 收窄在这里捕获；放到整个循环体会误伤 MemoryPersistenceError
+                # （RuntimeError 子类），一次记忆写盘失败就被当成 stdin 故障退出
+                try:
+                    user_input = Prompt.ask("\n[cyan]>[/cyan]")
+                except (RuntimeError, ValueError) as exc:
+                    self.console.print(
+                        f"\n无法读取输入（{exc}），已退出", style="dim"
+                    )
+                    break
 
                 if not user_input.strip():
                     continue
@@ -1087,11 +1098,6 @@ class AligoCLI:
                     while task.cancelling():
                         task.uncancel()
                 self.console.print("\n使用 'exit' 退出", style="dim")
-            except (RuntimeError, ValueError) as exc:
-                # stdin 不可用（IDE / 无控制台）时 Prompt.ask 抛 RuntimeError
-                # 或 ValueError：干净退出，避免 traceback 或满速刷屏
-                self.console.print(f"\n无法读取输入（{exc}），已退出", style="dim")
-                break
             except KeyboardInterrupt:
                 self.console.print("\n使用 'exit' 退出", style="dim")
             except CircuitOpenError:

@@ -86,6 +86,31 @@ class MemoryManager:
 
     # ========== 短期记忆操作 ==========
 
+    def persist_message(self, role: str, content: str) -> None:
+        """只写长期记忆（跨会话持久化）。
+
+        JSON 后端持有内存快照：写入前重新加载，避免本轮对话期间通过记忆
+        面板写入的标题 / 置顶 / 偏好被旧快照覆盖；PostgreSQL 直接查询，
+        无需重载。
+        """
+        if getattr(self.long_term, "snapshot_based", True):
+            self._rebuild_long_term()
+        self.long_term.add_chat_message(role, content, self.session_id)
+
+    def stage_message(
+        self, role: str, content: str, metadata: dict | None = None
+    ) -> None:
+        """只写短期记忆（上下文缓存，不落长期记忆）。
+
+        交互式 CLI 在编排前用它暂存本轮提问：编排智能体从短期记忆读取
+        「用户本轮原话」；编排失败时这条只是上下文缓存，长期记忆里不会
+        留下没有回复的孤儿用户轮。
+        """
+        try:
+            self.short_term.add_message(role, content, metadata)
+        except Exception as exc:  # noqa: BLE001 - 缓存失败降级为缺少本轮上下文
+            logger.warning("短期记忆写入失败（%s），本轮上下文可能缺少该消息", exc)
+
     def add_message(self, role: str, content: str, metadata: dict | None = None):
         """
         添加消息到短期记忆和长期记忆
@@ -94,20 +119,12 @@ class MemoryManager:
             role: 角色 (user/assistant)
             content: 消息内容
             metadata: 元数据
-        """
-        # 添加到长期记忆（跨会话持久化）：先写长期、再写短期，长期失败时
-        # 短期记忆不会留下一条永远不会被删除的孤立提问
-        # JSON 后端持有内存快照：写入前重新加载，避免本轮对话期间通过记忆面板
-        # 写入的标题 / 置顶 / 偏好被旧快照覆盖；PostgreSQL 直接查询，无需重载。
-        if getattr(self.long_term, "snapshot_based", True):
-            self._rebuild_long_term()
-        self.long_term.add_chat_message(role, content, self.session_id)
 
-        # 短期记忆只是上下文缓存：失败不影响已经持久化的消息
-        try:
-            self.short_term.add_message(role, content, metadata)
-        except Exception as exc:  # noqa: BLE001 - 缓存失败降级为缺少本轮上下文
-            logger.warning("短期记忆写入失败（%s），本轮上下文可能缺少该消息", exc)
+        先写长期、再写短期：长期失败时短期记忆不会留下一条永远不会被
+        删除的孤立提问。
+        """
+        self.persist_message(role, content)
+        self.stage_message(role, content, metadata)
 
     # ========== 长期记忆操作 ==========
     # 注意：大部分方法直接使用 self.short_term 和 self.long_term 即可，无需封装

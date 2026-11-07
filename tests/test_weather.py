@@ -407,6 +407,37 @@ def test_stale_cache_served_when_upstream_fails(monkeypatch):
     print("✓ 上游故障时沿用 stale 窗口内的成功数据")
 
 
+def test_stale_fallback_does_not_refresh_cache_timestamp(monkeypatch):
+    """降级沿用旧数据不能刷新成功缓存的时间戳：1 小时窗口只锚定最近一次成功。"""
+
+    def ok_get(url, params=None, timeout=None, headers=None):
+        return _Response(_geo("北京") if "geocoding" in url else _forecast())
+
+    monkeypatch.setattr(weather.requests, "get", ok_get)
+    weather.clear_weather_cache()
+    weather.fetch_weather("北京")
+
+    key = weather._cache_key("北京")
+    at, result = weather._cache[key]
+    shifted = at - weather.CACHE_TTL_SEC - 1
+    weather._cache[key] = (shifted, result)
+
+    def fail_get(url, params=None, timeout=None, headers=None):
+        raise weather.requests.ConnectionError("network down")
+
+    monkeypatch.setattr(weather.requests, "get", fail_get)
+    stale = weather.fetch_weather("北京")
+    assert stale["stale"] is True
+    assert weather._cache[key][0] == shifted, "降级回写不能刷新成功缓存的时间戳"
+
+    # 时间继续流逝：旧数据超出 1 小时窗口后必须报错（不能被反复回写续命）
+    weather._degraded.clear()
+    weather._cache[key] = (time.monotonic() - weather.STALE_TTL_SEC - 1, result)
+    with pytest.raises(weather.WeatherError, match="天气接口暂时不可用"):
+        weather.fetch_weather("北京")
+    print("✓ 反复降级不会滑动 stale 窗口")
+
+
 def test_stale_cache_expires(monkeypatch):
     def ok_get(url, params=None, timeout=None, headers=None):
         return _Response(_geo("北京") if "geocoding" in url else _forecast())
@@ -515,6 +546,7 @@ if __name__ == "__main__":
         test_failure_cache_expires,
         test_success_clears_cached_failure,
         test_stale_cache_served_when_upstream_fails,
+        test_stale_fallback_does_not_refresh_cache_timestamp,
         test_stale_cache_expires,
         test_unknown_city_does_not_use_stale_cache,
     ):

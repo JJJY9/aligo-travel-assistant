@@ -81,4 +81,10 @@ def file_lock(path: str, timeout: float = DEFAULT_TIMEOUT_SEC) -> Iterator[None]
         finally:
             _release(handle)
     finally:
-        handle.close()
+        try:
+            handle.close()
+        except OSError:
+            # close 会重新 flush 打开时写入的初始字节：写盘失败（磁盘满 /
+            # 配额）时这里会再次抛出 OSError 并覆盖已转换好的 TimeoutError，
+            # 违反本函数只抛 TimeoutError 的契约
+            pass

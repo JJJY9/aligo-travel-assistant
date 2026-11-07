@@ -20,6 +20,8 @@ CACHE_TTL_SEC = 600.0
 STALE_TTL_SEC = 3600.0
 # 失败结果（城市不存在 / 上游故障）短时缓存：避免侧栏每次刷新都重打上游
 FAILURE_TTL_SEC = 60.0
+# 降级结果（stale）在短窗内直接复用：不再重打已故障的上游
+_DEGRADED_REUSE_SEC = 60.0
 # 缓存条目上限：城市名来自请求参数，不能让缓存随查询过的城市无限增长
 _CACHE_MAX_ENTRIES = 256
 _USER_AGENT = "Mozilla/5.0 (compatible; AligoTravel/1.0)"
@@ -57,6 +59,8 @@ WEATHER_CODE_MAP: dict[int, str] = {
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _failures: dict[str, tuple[float, str]] = {}
+# 刚降级返回过的 stale 结果：短窗内复用，与成功缓存分开存（时间戳不混用）
+_degraded: dict[str, tuple[float, dict[str, Any]]] = {}
 _cache_lock = threading.Lock()
 # 同一城市并发未命中时，只让一个线程访问上游，其余线程等待它的结果
 _inflight: dict[str, threading.Event] = {}
@@ -67,10 +71,11 @@ class WeatherError(Exception):
 
 
 def clear_weather_cache() -> None:
-    """清空天气成功 / 失败缓存（测试或运维需要时使用）。"""
+    """清空天气成功 / 失败 / 降级缓存（测试或运维需要时使用）。"""
     with _cache_lock:
         _cache.clear()
         _failures.clear()
+        _degraded.clear()
 
 
 def _cache_key(name: str) -> str:
@@ -128,7 +133,7 @@ def _finish_fetch(name: str, event: threading.Event) -> None:
 
 
 def _store_cache(name: str, result: dict[str, Any]) -> None:
-    """写入缓存：顺带清掉过期条目，并按上限淘汰最旧的一条。"""
+    """写入成功缓存：顺带清掉过期条目，并按上限淘汰最旧的一条。"""
     now = time.monotonic()
     keep_sec = max(CACHE_TTL_SEC, STALE_TTL_SEC)
     with _cache_lock:
@@ -140,14 +145,44 @@ def _store_cache(name: str, result: dict[str, Any]) -> None:
             del _cache[oldest]
         _cache[name] = (now, result)
         _failures.pop(name, None)
+        # 新鲜数据到达后，短窗内的降级复用立即失效
+        _degraded.pop(name, None)
 
 
-def _stale_hit(key: str) -> dict[str, Any] | None:
-    """上游失败时的降级数据：STALE_TTL_SEC 内的旧结果，带 stale 标记。"""
+def _stale_entry(key: str) -> tuple[float, dict[str, Any]] | None:
+    """上游失败时的降级数据：(最近一次成功的时间戳, 带 stale 标记的结果)。"""
     with _cache_lock:
         cached = _cache.get(key)
         if cached is not None and time.monotonic() - cached[0] < STALE_TTL_SEC:
-            return {**cached[1], "stale": True}
+            return cached[0], {**cached[1], "stale": True}
+    return None
+
+
+def _store_degraded(key: str, stale: dict[str, Any]) -> None:
+    """登记「刚刚降级返回过」：短窗内后续请求直接复用，不再重打故障上游。
+
+    与成功缓存分开存储：降级结果不能拿当前时间去刷新新鲜度锚点，否则
+    上游长时间故障时过期数据会被无限期沿用。
+    """
+    now = time.monotonic()
+    with _cache_lock:
+        expired = [
+            name
+            for name, (at, _) in _degraded.items()
+            if now - at >= _DEGRADED_REUSE_SEC
+        ]
+        for name in expired:
+            del _degraded[name]
+        _degraded[key] = (now, stale)
+
+
+def _degraded_hit(key: str) -> dict[str, Any] | None:
+    """短窗内刚降级过的结果（单飞等待者 / 紧接着的请求直接复用）。"""
+    now = time.monotonic()
+    with _cache_lock:
+        entry = _degraded.get(key)
+        if entry is not None and now - entry[0] < _DEGRADED_REUSE_SEC:
+            return {**entry[1]}
     return None
 
 
@@ -196,6 +231,10 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     failed = _failure_hit(key)
     if failed is not None:
         raise WeatherError(failed)
+    # 刚降级返回过（60 秒内）：直接复用旧数据，不重打已故障的上游
+    degraded = _degraded_hit(key)
+    if degraded is not None:
+        return degraded
 
     leader, event = _claim_fetch(key)
     if leader:
@@ -217,18 +256,23 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
         failed = _failure_hit(key)
         if failed is not None:
             raise WeatherError(failed)
+        # 领先线程可能因上游故障降级：等待线程直接复用同一份结果，
+        # 不各自重打已故障的上游（并发单飞不失效）
+        degraded = _degraded_hit(key)
+        if degraded is not None:
+            return degraded
     try:
         return _fetch_weather_uncached(name, key, timeout)
     except WeatherError as exc:
         message = str(exc)
         # 上游抖动 / 格式异常时沿用最近一次成功数据；城市不存在没有旧数据可用
-        stale = None if message.startswith("未找到城市") else _stale_hit(key)
-        if stale is not None:
+        entry = None if message.startswith("未找到城市") else _stale_entry(key)
+        if entry is not None:
+            _stored_at, stale = entry
             logger.warning("天气接口失败（%s），沿用最近一次成功数据：%s", name, message)
-            # 把旧的降级结果回写为当前缓存：等待线程与后续请求直接复用这一份
-            # 结果（含 stale 标记），否则它们查不到任何共享状态、各自重打已
-            # 故障的上游，并发单飞失效（N 个请求 = N 次上游超时）
-            _store_cache(key, stale)
+            # 降级结果单独登记（不写成功缓存）：短窗内复用给并发等待者与后续
+            # 请求，但不会刷新「最近一次成功」的时间戳、把 1 小时窗口无限滑动
+            _store_degraded(key, stale)
             return stale
         _store_failure(key, message)
         raise
