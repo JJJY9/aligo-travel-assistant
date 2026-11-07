@@ -5055,11 +5055,112 @@ def test_export_attachment():
     print("✓ /api/export 返回可下载 JSON")
 
 
+def _seed_trip_file(user_id, trips):
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    path.write_text(
+        json.dumps({"trip_history": trips}, ensure_ascii=False), encoding="utf-8"
+    )
+    return path
+
+
+def _clean_trip_file(path):
+    path.unlink(missing_ok=True)
+    lock = Path(str(path) + ".lock")
+    lock.unlink(missing_ok=True)
+
+
+def test_create_trip_duplicate_ids_report_other_overlap():
+    """重复 trip_id 历史下，去重更新返回已有 id 时不隐藏同 id 其它行程的重叠。"""
+    user_id = _unique_user("web_trip_dup")
+    path = _seed_trip_file(
+        user_id,
+        [
+            {
+                "trip_id": "trip_9",
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+                "purpose": "出差",
+            },
+            {
+                "trip_id": "trip_9",
+                "origin": "北京",
+                "destination": "广州",
+                "start_date": "2026-12-02",
+                "end_date": "2026-12-05",
+                "purpose": "出差",
+            },
+        ],
+    )
+    try:
+        response = _client().post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+                "purpose": "会议",
+            },
+        )
+        assert response.status_code == 201, response.text
+        payload = response.json()
+        assert payload["created"] is False and payload["trip_id"] == "trip_9"
+        destinations = [item["destination"] for item in payload["conflicts"]]
+        assert "广州" in destinations, "同 id 的其它行程不能被连带排除"
+        assert "上海" not in destinations, "本次保存的记录应被排除"
+    finally:
+        _clean_trip_file(path)
+    print("✓ 重复 trip_id 下创建汇报其它行程重叠")
+
+
+def test_update_trip_invalid_legacy_end_date_keeps_conflicts():
+    """历史行程的返程日期非法时，更新响应不能把已解析的出发日期一并置空。"""
+    user_id = _unique_user("web_trip_legacy_end")
+    path = _seed_trip_file(
+        user_id,
+        [
+            {
+                "trip_id": "trip_1",
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "未知",
+                "purpose": "出差",
+            },
+            {
+                "trip_id": "trip_2",
+                "origin": "北京",
+                "destination": "广州",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+                "purpose": "出差",
+            },
+        ],
+    )
+    try:
+        response = _client().put(
+            "/api/trips/trip_1", json={"user_id": user_id, "destination": "杭州"}
+        )
+        assert response.status_code == 200, response.text
+        conflicts = response.json()["conflicts"]
+        assert [item["trip_id"] for item in conflicts] == ["trip_2"], (
+            "出发日期已解析，重叠不能被非法返程日期清空"
+        )
+    finally:
+        _clean_trip_file(path)
+    print("✓ 历史非法返程日期不清空更新响应的冲突")
+
+
 if __name__ == "__main__":
     test_index_page()
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
+    test_create_trip_duplicate_ids_report_other_overlap()
+    test_update_trip_invalid_legacy_end_date_keeps_conflicts()
     for case in (
         test_chat_stream_error_event_redacts_internal_details,
         test_chat_stream_user_facing_error_keeps_curated_message,

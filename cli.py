@@ -3415,7 +3415,7 @@ def run_trip_add_standalone(
     import re
     from datetime import datetime
 
-    from utils.trip_conflicts import trip_conflicts
+    from utils.trip_conflicts import find_saved_trip, trip_conflicts
 
     def _fail(message: str) -> int:
         if as_json:
@@ -3475,8 +3475,15 @@ def run_trip_add_standalone(
             close()
 
     created = len(trips) > before
+    # 按「id + 关键字段」定位本次保存的那条并按身份排除：历史里存在重复
+    # trip_id 时，按 id 整条排除会连带隐藏其它行程的真实重叠
+    saved_record = find_saved_trip(trips, trip_id, record)
     conflicts = trip_conflicts(
-        trips, start_dt, end_dt or start_dt, exclude_id=trip_id
+        trips,
+        start_dt,
+        end_dt or start_dt,
+        exclude_id=trip_id,
+        exclude_trip=saved_record,
     )
     if as_json:
         print(

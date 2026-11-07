@@ -78,6 +78,7 @@ from utils.stored_message import render_stored_message
 from utils.session_markdown import render_all_sessions_markdown
 from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
+from utils.trip_conflicts import find_saved_trip as _find_saved_trip
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
@@ -2633,7 +2634,8 @@ def create_app(model: Any = None) -> FastAPI:
 
         ``order=desc`` 返回从最新记录开始的顺序，供记忆面板展示「最近 N 条」；
         ``q`` 按路线 / 日期 / 目的过滤（与面板、CLI ``trips --query`` 同一
-        口径：五个字段空格拼接后整体包含），日期重叠仍按完整历史计算。
+        口径：按空白拆词，全部词出现在五字段拼接文本中即命中，词序无关），
+        日期重叠仍按完整历史计算。
         """
         store = _open_long_term(user_id)
         try:
@@ -2687,7 +2689,24 @@ def create_app(model: Any = None) -> FastAPI:
             )
             trips = store.get_trip_history(limit=None)
             created = len(trips) > before
-            conflicts = _trip_conflicts(trips, start, end or start, exclude_id=trip_id)
+            # 按「id + 关键字段」定位本次保存的那条并按身份排除：历史里存在
+            # 重复 trip_id 时，按 id 整条排除会连带隐藏其它行程的真实重叠
+            saved_record = _find_saved_trip(
+                trips,
+                trip_id,
+                {
+                    "start_date": payload.start_date,
+                    "end_date": payload.end_date,
+                    "destination": payload.destination.strip(),
+                },
+            )
+            conflicts = _trip_conflicts(
+                trips,
+                start,
+                end or start,
+                exclude_id=trip_id,
+                exclude_trip=saved_record,
+            )
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("添加行程失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"添加行程失败：{exc}") from exc
@@ -2742,14 +2761,20 @@ def create_app(model: Any = None) -> FastAPI:
                             status_code=422, detail="日期格式应为 YYYY-MM-DD"
                         ) from exc
 
-            start = end = None
-            try:
-                if merged.get("start_date"):
+            # 两个日期独立解析：返程日期非法（历史脏数据）时不能把已解析
+            # 的出发日期一并置空——否则响应里的 conflicts 被静默清空
+            start = None
+            end = None
+            if merged.get("start_date"):
+                try:
                     start = datetime.strptime(str(merged["start_date"]), "%Y-%m-%d")
-                if merged.get("end_date"):
+                except ValueError:
+                    start = None
+            if merged.get("end_date"):
+                try:
                     end = datetime.strptime(str(merged["end_date"]), "%Y-%m-%d")
-            except ValueError:
-                start = end = None
+                except ValueError:
+                    end = None
             if fields.get("end_date") and start is None:
                 raise HTTPException(status_code=422, detail="填写返程日期前请先设置出发日期")
             if start is not None and end is not None and end < start:
