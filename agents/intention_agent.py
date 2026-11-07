@@ -57,6 +57,31 @@ def _message_text(content) -> str:
     return str(content or "")
 
 
+def _default_intent_result(user_query: str, error: str) -> dict:
+    """意图识别失败 / 结果形状非法时的降级结果：默认走信息查询。"""
+    return {
+        "reasoning": f"意图识别出错，使用默认策略。错误: {error}",
+        "intents": [
+            {
+                "type": "information_query",
+                "confidence": 0.5,
+                "description": "默认查询意图",
+                "reason": "无法解析用户意图，使用默认策略",
+            }
+        ],
+        "key_entities": {},
+        "rewritten_query": user_query,
+        "agent_schedule": [
+            {
+                "agent_name": "information_query",
+                "priority": 1,
+                "reason": "默认查询",
+                "expected_output": "查询结果",
+            }
+        ],
+    }
+
+
 class IntentionAgent(AgentBase):
     """意图识别智能体（IntentionRecognitionAgent）"""
 
@@ -277,6 +302,11 @@ class IntentionAgent(AgentBase):
                     raise ValueError("意图识别结果不是 JSON 对象")
                 if "agent_schedule" not in result:
                     raise ValueError("意图识别结果缺少 agent_schedule")
+                if not isinstance(result["agent_schedule"], list):
+                    # 模型可能把列表误写成字符串 / null：与「缺少该键」走同一
+                    # 降级（默认 information_query），不能静默变成 no_agents
+                    # 让用户的规划 / 查询请求被当成「已记录」
+                    raise ValueError("意图识别结果 agent_schedule 不是列表")
             except json.JSONDecodeError as e1:
                 # 直接解析失败时扫描文本中的全部 JSON 对象：说明文字 / 推理
                 # 过程里可能先出现一个合法的小对象（如单个 key_entities
@@ -299,27 +329,13 @@ class IntentionAgent(AgentBase):
                 raise
             logger.error(f"Intent recognition failed: {e}")
             # 返回默认结果
-            result = {
-                "reasoning": f"意图识别出错，使用默认策略。错误: {e!s}",
-                "intents": [
-                    {
-                        "type": "information_query",
-                        "confidence": 0.5,
-                        "description": "默认查询意图",
-                        "reason": "无法解析用户意图，使用默认策略"
-                    }
-                ],
-                "key_entities": {},
-                "rewritten_query": user_query,
-                "agent_schedule": [
-                    {
-                        "agent_name": "information_query",
-                        "priority": 1,
-                        "reason": "默认查询",
-                        "expected_output": "查询结果"
-                    }
-                ]
-            }
+            result = _default_intent_result(user_query, str(e))
+
+        # JSONDecodeError 扫描分支选中的对象同样可能带非列表 schedule：
+        # 与缺键 / 类型非法一致，降级为默认 information_query 调度
+        if not isinstance(result.get("agent_schedule"), list):
+            logger.error("意图识别结果 agent_schedule 不是列表，降级为默认调度")
+            result = _default_intent_result(user_query, "agent_schedule 类型非法")
 
         # 将结果转换为JSON字符串，因为Msg的content必须是字符串
         return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
