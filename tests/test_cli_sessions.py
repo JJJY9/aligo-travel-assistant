@@ -340,6 +340,38 @@ def test_session_delete_removes_messages(monkeypatch):
     print("✓ session-delete 删除消息并清理短期记忆")
 
 
+def test_session_delete_writes_shared_tombstone(monkeypatch):
+    """配置 Redis 时写入与 Web 同键的共享删除墓碑（NX、TTL 300 秒）。"""
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+
+    class _Redis:
+        def __init__(self):
+            self.sets = []
+
+        def set(self, key, value, nx=False, ex=None):
+            self.sets.append((key, value, nx, ex))
+
+    redis = _Redis()
+    monkeypatch.setattr(storage, "get_shared_redis_client", lambda: redis)
+    code, out = _run_delete("u1", "s-active", as_json=True)
+    assert code == 0
+    assert json.loads(out)["shared_tombstone"] is True
+    assert redis.sets == [("aligo:deleted:u1:s-active", "cli", True, 300)]
+    print("✓ session-delete 写入共享删除墓碑")
+
+
+def test_session_delete_without_shared_tombstone_hints_refresh(monkeypatch):
+    """无共享 Redis 时提示刷新其它已打开的 Web 页面。"""
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+    code, out = _run_delete("u1", "s-active")
+    assert code == 0 and "请刷新" in out
+    print("✓ session-delete 无共享墓碑时提示刷新")
+
+
 def test_session_delete_missing_session(monkeypatch):
     fake = _sessions_store()
     cleared = []
@@ -368,6 +400,7 @@ def test_session_delete_json_output(monkeypatch):
         "user_id": "u1",
         "session_id": "s-active",
         "deleted": 2,
+        "shared_tombstone": False,
     }
 
     code, out = _run_delete("u1", "s-active", as_json=True)  # 已删干净

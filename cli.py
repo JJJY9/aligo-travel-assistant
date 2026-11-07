@@ -3139,7 +3139,9 @@ def run_session_delete_standalone(
     （`python cli.py session-delete <user> <session> [--json]`）。
 
     与面板 DELETE ``/api/sessions/{id}`` 同一语义：长期记忆中该会话的消息
-    全部删除，并清理短期记忆（Redis 会话键与故障期重放登记）。CLI 是单次
+    全部删除，并清理短期记忆（Redis 会话键与故障期重放登记）；配置
+    ``REDIS_URL`` 时同时写入共享删除墓碑（与 Web 相同的 ``aligo:deleted``
+    键，TTL 300 秒），其它实例的旧标签页下一次请求即 404。CLI 是单次
     进程、不持有在途对话；若 Web 服务正在同一会话上流式回复，请先停止再
     删除（与其它 CLI 破坏性命令一致）。
 
@@ -3188,6 +3190,12 @@ def run_session_delete_standalone(
             close()
     # 短期记忆清理失败不阻断：长期记忆已删除，残留由故障重放 / 过期回收兜底
     clear_short_term_session(session_id, user_id)
+    # 共享删除墓碑：配置 REDIS_URL 时其它 Web 实例 / 进程的旧标签页下一次
+    # 请求即 404，不会被进程内缓存把已删除内容写回；未配置 Redis 时不同
+    # 进程之间没有共享通道，提示用户在旧页面刷新
+    from utils.tombstones import mark_session_deleted
+
+    shared_tombstone = mark_session_deleted(user_id, session_id)
     if as_json:
         print(
             json.dumps(
@@ -3196,6 +3204,7 @@ def run_session_delete_standalone(
                     "user_id": user_id,
                     "session_id": session_id,
                     "deleted": removed,
+                    "shared_tombstone": shared_tombstone,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -3203,6 +3212,11 @@ def run_session_delete_standalone(
         )
     else:
         print(f"已删除会话 {session_id}（{removed} 条消息）")
+        if not shared_tombstone:
+            print(
+                "提示：未启用共享删除墓碑（REDIS_URL），其它已打开的 Web "
+                "页面请刷新，避免继续向该会话发送消息"
+            )
     return 0
 
 
