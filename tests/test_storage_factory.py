@@ -1412,6 +1412,44 @@ def test_trip_update_and_conflict():
     print("✓ 行程更新（字段 / 统计 / 清空日期 / 冲突拒绝）")
 
 
+def test_pg_retry_does_not_replay_non_idempotent_write():
+    """连接级错误后，非幂等写入（不去重的批量插入）不得自动重放。"""
+    import psycopg
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
+    calls = []
+
+    def op():
+        calls.append(1)
+        raise psycopg.OperationalError("lost after commit")
+
+    try:
+        memory._run_with_retry(op, replay_safe=False)
+    except MemoryPersistenceError:
+        pass
+    else:
+        raise AssertionError("非幂等写入应直接报持久化失败")
+    assert calls == [1], "非幂等写入不能被重放"
+
+    reconnects = []
+    memory._reconnect = lambda: reconnects.append(1)
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise psycopg.OperationalError("temporary")
+        return "ok"
+
+    assert memory._run_with_retry(flaky) == "ok"
+    assert reconnects == [1] and len(attempts) == 2, "幂等操作仍应重连重试一次"
+    print("✓ PG 非幂等写入不重放、幂等操作重试")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -1475,4 +1513,5 @@ if __name__ == "__main__":
     test_add_message_writes_long_term_first()
     test_reload_long_term_respects_backend()
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
+    test_pg_retry_does_not_replay_non_idempotent_write()
     print("\n全部通过")
