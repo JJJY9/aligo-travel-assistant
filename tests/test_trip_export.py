@@ -105,6 +105,49 @@ def test_ics_escape_and_multiple_events():
     print("✓ ICS 文本转义与多事件组合")
 
 
+def test_csv_uses_single_line_endings():
+    """CSV 行结束符固定 \\n：Windows 文本模式写入不再产生 \\r\\r\\n 与空记录。"""
+    text = render_trips_csv(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+                "purpose": "出差",
+            }
+        ]
+    )
+    body = text.lstrip("﻿")
+    assert "\r" not in body, "渲染结果不应含 CR（由写入侧统一翻译）"
+    rows = list(csv.reader(io.StringIO(body)))
+    assert len(rows) == 2 and all(row for row in rows), "不能出现空记录"
+    print("✓ CSV 行结束符不再二次翻译")
+
+
+def test_ics_lines_folded_at_75_bytes():
+    """长文本按 RFC 5545 折行：每个物理行 ≤75 字节，展开后内容完整。"""
+    long_purpose = "超长出行注意事项" * 12
+    ics = render_trip_ics(
+        {
+            "trip_id": "t1",
+            "origin": "北京",
+            "destination": "乌鲁木齐",
+            "start_date": "2026-12-01",
+            "purpose": long_purpose,
+        },
+        "u1",
+    )
+    assert ics is not None
+    physical = ics.split("\r\n")
+    over = [len(line.encode("utf-8")) for line in physical if len(line.encode("utf-8")) > 75]
+    assert not over, f"存在超过 75 字节的行: {over}"
+    unfolded = ics.replace("\r\n ", "")
+    assert "北京 → 乌鲁木齐" in unfolded
+    assert long_purpose[:18] in unfolded
+    print("✓ ICS 超过 75 字节的行折行")
+
+
 if __name__ == "__main__":
     test_header_and_rows()
     test_formula_prefix_neutralized()
@@ -112,4 +155,6 @@ if __name__ == "__main__":
     test_ics_single_trip()
     test_ics_missing_or_invalid_dates()
     test_ics_escape_and_multiple_events()
+    test_csv_uses_single_line_endings()
+    test_ics_lines_folded_at_75_bytes()
     print("\n全部通过")

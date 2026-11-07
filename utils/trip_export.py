@@ -26,7 +26,9 @@ def _csv_safe(value: object) -> str:
 def render_trips_csv(trips: list[dict[str, Any]]) -> str:
     """把行程列表渲染为带 BOM 的 CSV 文本（含表头）。"""
     buffer = io.StringIO()
-    writer = csv.writer(buffer)
+    # 固定用 \n 作行结束符：Windows 文本模式写文件时会把 \n 翻译成 \r\n，
+    # csv.writer 默认的 \r\n 会被二次翻译成 \r\r\n 并多出空记录
+    writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(["出发地", "目的地", "出发日期", "返程日期", "目的"])
     for trip in trips:
         writer.writerow(
@@ -120,6 +122,28 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     ]
 
 
+def _ics_fold(line: str) -> str:
+    """按 RFC 5545 把超过 75 字节的行折行（续行以单个空格开头）。
+
+    折行位置不能劈开 UTF-8 字符：回退到完整字符边界。中文 SUMMARY 等
+    长文本不折行会被部分日历客户端拒收或截断。
+    """
+    data = line.encode("utf-8")
+    if len(data) <= 75:
+        return line
+    chunks: list[bytes] = []
+    limit = 75
+    while len(data) > limit:
+        cut = limit
+        while cut > 0 and (data[cut] & 0xC0) == 0x80:
+            cut -= 1
+        chunks.append(data[:cut])
+        data = data[cut:]
+        limit = 74  # 续行开头的空格占 1 字节
+    chunks.append(data)
+    return "\r\n ".join(chunk.decode("utf-8") for chunk in chunks)
+
+
 def _ics_calendar(events: list[list[str]]) -> str:
     """把若干 VEVENT 行组合为完整的 iCalendar 文本。"""
     lines = [
@@ -131,7 +155,7 @@ def _ics_calendar(events: list[list[str]]) -> str:
     for event in events:
         lines.extend(event)
     lines.extend(["END:VCALENDAR", ""])
-    return "\r\n".join(lines)
+    return "\r\n".join(_ics_fold(line) for line in lines)
 
 
 def render_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:

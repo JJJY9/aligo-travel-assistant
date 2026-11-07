@@ -93,6 +93,32 @@ def test_python_ok():
     print("✓ Python 版本检查")
 
 
+def test_version_compare_normalizes_pep440():
+    """版本比较按 PEP 440：1.6.0-rc1 与 1.6.0rc1、1.6 与 1.6.0 视为一致。"""
+    from utils.doctor import _versions_equal
+
+    assert _versions_equal("1.6.0-rc1", "1.6.0rc1") is True
+    assert _versions_equal("1.6", "1.6.0") is True
+    assert _versions_equal("1.6.1", "1.6.0") is False
+    assert _versions_equal("自定义版本", "自定义版本") is True
+    assert _versions_equal("自定义版本", "1.6.0") is False
+    print("✓ 版本一致性按 PEP 440 规范化比较")
+
+
+def test_model_dir_follows_rag_config(monkeypatch):
+    """doctor 的嵌入模型目录与 RAG 同一口径（技能根上一级 + RAG_CONFIG）。"""
+    from config import RAG_CONFIG
+    from utils.doctor import _default_model_dir
+    from utils.skill_paths import resolve_skills_root
+
+    monkeypatch.setitem(
+        RAG_CONFIG, "embedding_model", "data/models/bge-small-zh-v1.5"
+    )
+    expected = Path(resolve_skills_root()).parent.parent / "data/models/bge-small-zh-v1.5"
+    assert _default_model_dir() == expected
+    print("✓ 嵌入模型目录与 RAG 技能同一解析口径")
+
+
 def test_version_consistency(monkeypatch):
     from utils import version as version_module
 
@@ -463,6 +489,12 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_run_doctor_without_network()
+    test_version_compare_normalizes_pep440()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_model_dir_follows_rag_config(mp)
+    finally:
+        mp.undo()
     mp = pytest.MonkeyPatch()
     try:
         test_version_consistency(mp)
