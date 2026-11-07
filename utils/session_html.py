@@ -1,4 +1,4 @@
-"""单个会话的独立 HTML 导出（CLI `session-export --html`）。
+"""会话 HTML 导出（CLI `session-export --html` / `sessions-export --html`）。
 
 与 Web 面板「导出 HTML」同一用途：单文件、内嵌样式，适合分享 / 打印 /
 离线查看。CLI 没有浏览器 DOM，这里把消息渲染为转义后的纯文本气泡
@@ -42,6 +42,7 @@ _TEMPLATE = """<!doctype html>
     .msg.assistant .bubble {{ border-color: #ddd; }}
     .msg, .bubble {{ break-inside: avoid; }}
   }}
+  {extra_style}
 </style>
 </head>
 <body>
@@ -74,24 +75,87 @@ def message_text(message: dict[str, Any]) -> str:
     return render_stored_message(message)
 
 
+def _message_block(message: dict[str, Any]) -> str:
+    is_user = message.get("role") == "user"
+    role = "用户" if is_user else "Aligo"
+    text = message_text(message).strip()
+    return (
+        f'<div class="msg {"user" if is_user else "assistant"}">'
+        f'<div class="role">{role}</div>'
+        f'<div class="bubble">{_escape(text)}</div></div>'
+    )
+
+
 def render_session_html(
     user_id: str, session_id: str, title: str, messages: list[dict[str, Any]]
 ) -> str:
     """渲染单会话独立 HTML（所有动态文本转义，结构不会被内容注入）。"""
-    blocks: list[str] = []
-    for message in messages:
-        is_user = message.get("role") == "user"
-        role = "用户" if is_user else "Aligo"
-        text = message_text(message).strip()
-        blocks.append(
-            f'<div class="msg {"user" if is_user else "assistant"}">'
-            f'<div class="role">{role}</div>'
-            f'<div class="bubble">{_escape(text)}</div></div>'
-        )
+    blocks = [_message_block(message) for message in messages]
     return _TEMPLATE.format(
         title=_escape(title),
         user_id=_escape(user_id),
         session_id=_escape(session_id),
         exported_at=_escape(datetime.now().isoformat(timespec="seconds")),
         body="\n".join(blocks),
+        extra_style="",
+    )
+
+
+def _bundle_title(
+    session_id: str, messages: list[dict[str, Any]], titles: dict[str, str]
+) -> str:
+    """会话在合集页里的标题：单行化后保留原始字符（出口统一 _escape）。"""
+    title = str(titles.get(session_id) or "").strip()
+    if title:
+        return " ".join(title.split())
+    for message in messages:
+        if message.get("role") == "user":
+            text = " ".join(str(message.get("content", "")).split())
+            if text:
+                return text[:40]
+    return "Aligo 对话"
+
+
+_BUNDLE_STYLE = """
+  .session {{ margin-top: 30px; }}
+  .session h2 {{ font-size: 18px; margin: 0 0 2px; }}
+  .session .meta {{ margin-bottom: 10px; }}
+"""
+
+
+def render_all_sessions_html(
+    user_id: str,
+    messages: list[dict[str, Any]],
+    titles: dict[str, str] | None = None,
+) -> tuple[str, int]:
+    """把全部会话渲染为一份独立 HTML，返回 (文本, 会话数)。
+
+    与 Markdown 合集同一分组 / 排序（最近更新的会话在前），所有动态文本
+    转义；标题在这里保持原始字符、出口统一转义一次（不能先 sanitize，
+    否则 HTML 里会显示字面量 ``&lt;``）。
+    """
+    from utils.session_markdown import group_sessions
+
+    titles = titles or {}
+    sessions = group_sessions(messages)
+    sections: list[str] = []
+    for session_id, session_messages in sessions:
+        title = _bundle_title(session_id, session_messages, titles)
+        blocks = "\n".join(_message_block(message) for message in session_messages)
+        sections.append(
+            f'<section class="session"><h2>{_escape(title)}</h2>'
+            f'<div class="meta">会话 {_escape(session_id)} · '
+            f"{len(session_messages)} 条消息</div>{blocks}</section>"
+        )
+    body = "\n".join(sections) if sections else '<p class="meta">（暂无会话）</p>'
+    return (
+        _TEMPLATE.format(
+            title=_escape("Aligo 会话导出"),
+            user_id=_escape(user_id),
+            session_id=_escape(f"全部会话（{len(sessions)} 个）"),
+            exported_at=_escape(datetime.now().isoformat(timespec="seconds")),
+            body=body,
+            extra_style=_BUNDLE_STYLE,
+        ),
+        len(sessions),
     )

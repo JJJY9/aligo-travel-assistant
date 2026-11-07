@@ -3616,16 +3616,19 @@ def run_sessions_export_standalone(
     target: str | None = None,
     to_stdout: bool = False,
     force: bool = False,
+    html: bool = False,
 ) -> int:
-    """导出全部会话为单个 Markdown（`python cli.py sessions-export <user> [path] [--stdout] [--force]`）。
+    """导出全部会话为单个 Markdown 或 HTML
+    （`python cli.py sessions-export <user> [path] [--stdout] [--force] [--html]`）。
+
+    ``html=True`` 时渲染为独立 HTML 合集（与单会话 `session-export --html`
+    同一转义口径），默认后缀改为 ``.html``。
 
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败或没有会话
     """
     import re
     from pathlib import Path
-
-    from utils.session_markdown import render_all_sessions_markdown
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -3651,14 +3654,27 @@ def run_sessions_export_standalone(
         print(f"用户 {user_id}：没有可导出的会话")
         return 1
 
-    text, count = render_all_sessions_markdown(user_id, messages, titles)
+    if html:
+        from utils.session_html import render_all_sessions_html
+
+        text, count = render_all_sessions_html(user_id, messages, titles)
+        suffix = ".html"
+    else:
+        from utils.session_markdown import render_all_sessions_markdown
+
+        text, count = render_all_sessions_markdown(user_id, messages, titles)
+        suffix = ".md"
 
     if to_stdout:
         _print_stdout(text)
         return 0
 
     safe_user = _safe_export_user(user_id)
-    path = Path(target) if target else Path("exports") / f"aligo_sessions_{safe_user}.md"
+    path = (
+        Path(target)
+        if target
+        else Path("exports") / f"aligo_sessions_{safe_user}{suffix}"
+    )
     if path.exists() and not force:
         print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
         return 1
@@ -5492,16 +5508,20 @@ def main():
                 )
             )
         if arg == "sessions-export":
+            usage = (
+                "用法：python cli.py sessions-export <user_id> [path] "
+                "[--stdout] [--force] [--html]"
+            )
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                print(
-                    "用法：python cli.py sessions-export <user_id> [path] [--stdout] [--force]"
-                )
+                print(usage)
                 sys.exit(2)
-            parsed_export = _parse_export_args(sys.argv[3:])
+            raw_export_args = sys.argv[3:]
+            export_args = [
+                item for item in raw_export_args if item.lower() != "--html"
+            ]
+            parsed_export = _parse_export_args(export_args)
             if parsed_export is None:
-                print(
-                    "用法：python cli.py sessions-export <user_id> [path] [--stdout] [--force]"
-                )
+                print(usage)
                 sys.exit(2)
             target, to_stdout, force, _, _ = parsed_export
             sys.exit(
@@ -5510,6 +5530,7 @@ def main():
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
+                    html=len(export_args) != len(raw_export_args),
                 )
             )
         if arg == "user-export":
