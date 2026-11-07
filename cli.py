@@ -3880,6 +3880,106 @@ def _parse_trips_list_args(
     return user_id, query, as_json
 
 
+def run_trips_import_standalone(
+    user_id: str, csv_path: str, as_json: bool = False
+) -> int:
+    """从 CSV 导入行程（`python cli.py trips-import <user_id> <csv_path> [--json]`）。
+
+    解析 ``trips-export`` 导出的 CSV（UTF-8 BOM，中英文字段名均可），逐行
+    校验；重复行程沿用存储层去重语义（同路线 + 同起止日期更新目的）。
+    非法行收集后在输出里列出，不中断其余行。
+
+    Returns:
+        0 至少导入一行（含部分行被跳过）；1 参数 / 读取 / 写入失败或没有可导入行
+    """
+    import io
+    import re
+
+    from utils.trip_import import parse_trips_csv
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not csv_path or csv_path.startswith("-"):
+        return _fail("请提供 CSV 文件路径")
+    try:
+        text = io.open(csv_path, "r", encoding="utf-8-sig").read()
+    except FileNotFoundError:
+        return _fail(f"文件不存在：{csv_path}")
+    except OSError as exc:
+        return _fail(f"读取 CSV 失败：{exc}")
+
+    rows, errors = parse_trips_csv(text)
+    if not rows:
+        detail = "；".join(f"第{line}行：{reason}" for line, reason in errors[:5])
+        return _fail(f"没有可导入的行程{f'（{detail}）' if detail else ''}")
+
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            before = len(store.get_trip_history(limit=None))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+        try:
+            for row in rows:
+                store.save_trip_history(row)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"写入行程失败：{exc}")
+        try:
+            after = len(store.get_trip_history(limit=None))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取行程失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    created = max(0, after - before)
+    updated = len(rows) - created
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "path": csv_path,
+                    "rows": len(rows),
+                    "created": created,
+                    "updated": updated,
+                    "skipped": [
+                        {"line": line, "reason": reason}
+                        for line, reason in errors
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"已从 {csv_path} 导入 {len(rows)} 行：新增 {created} 条，"
+            f"更新 {updated} 条"
+        )
+        for line, reason in errors:
+            print(f"  跳过第{line}行：{reason}")
+    return 0
+
+
 def run_trips_list_standalone(
     user_id: str, as_json: bool = False, query: str = ""
 ) -> int:
@@ -4290,7 +4390,7 @@ _COMMANDS_HINT = (
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
     "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-pin / session-show / session-export / "
-    "sessions-export / trips-export / user-export"
+    "sessions-export / trips-export / trips-import / user-export"
 )
 
 
@@ -4937,6 +5037,21 @@ def main():
                     force=force,
                     ics=ics,
                     query=export_query,
+                )
+            )
+        if arg == "trips-import":
+            import_args = [a for a in sys.argv[2:] if a != "--json"]
+            want_json = "--json" in sys.argv[2:]
+            if (
+                len(import_args) != 2
+                or not _valid_user_id(import_args[0])
+                or import_args[1].startswith("-")
+            ):
+                print("用法：python cli.py trips-import <user_id> <csv_path> [--json]")
+                sys.exit(2)
+            sys.exit(
+                run_trips_import_standalone(
+                    import_args[0], import_args[1], as_json=want_json
                 )
             )
         if arg in {"help", "--help", "-h"}:
