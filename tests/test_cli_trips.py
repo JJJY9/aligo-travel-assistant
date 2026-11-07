@@ -135,6 +135,47 @@ def test_trip_interval_and_state(monkeypatch):
     print("✓ trip_interval / trip_state_label")
 
 
+def test_trips_status_filter_text_and_json(monkeypatch):
+    """--status 按面板状态口径过滤：进行中 / 即将出行 / 已结束，无日期不出现。"""
+    from datetime import date
+
+    today = date.today().isoformat()
+    store = _FakeStore(
+        [
+            {"destination": "老行程", "start_date": "2000-01-01", "end_date": "2000-01-02"},
+            {"destination": "今天的行程", "start_date": today, "end_date": today},
+            {"destination": "未来的行程", "start_date": "2099-01-01", "end_date": "2099-01-02"},
+            {"destination": "无日期"},
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+
+    def _run(status, as_json=False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.run_trips_list_standalone(
+                "u-trips", as_json=as_json, status_filter=status
+            )
+        return code, buf.getvalue()
+
+    code, out = _run("past", as_json=True)
+    payload = json.loads(out)
+    assert code == 0
+    assert payload["status"] == "已结束"
+    assert [t["destination"] for t in payload["trips"]] == ["老行程"]
+
+    code, out = _run("active")
+    assert code == 0 and "今天的行程" in out and "老行程" not in out
+    assert "状态为「进行中」" in out
+
+    code, out = _run("即将出行", as_json=True)
+    payload = json.loads(out)
+    assert [t["destination"] for t in payload["trips"]] == ["未来的行程"]
+    assert all(t["destination"] != "无日期" for t in payload["trips"])
+
+    print("✓ trips --status 过滤（进行中 / 即将 / 已结束 / 无日期排除）")
+
+
 def test_filter_trips_by_query_helper(monkeypatch):
     """面板 / API / CLI 共用的关键词过滤口径。"""
     from utils.trip_conflicts import filter_trips_by_query
@@ -891,22 +932,38 @@ def test_trips_query_args_and_dispatch(monkeypatch):
         cli._parse_trips_list_args(["u1", "--query", "--json"]) is None
     ), "缺值的 --query 不能把 --json 当成关键词"
     assert cli._parse_trips_list_args(["u1", "--bad"]) is None
-    assert cli._parse_trips_list_args(["u1"]) == ("u1", "", False)
+    assert cli._parse_trips_list_args(["u1"]) == ("u1", "", False, "")
     assert cli._parse_trips_list_args(
         ["--json", "u1", "--query=上海"]
-    ) == ("u1", "上海", True)
+    ) == ("u1", "上海", True, "")
     assert cli._parse_trips_list_args(["u1", "--query", "会 议"]) == (
         "u1",
         "会 议",
         False,
+        "",
     )
+    assert cli._parse_trips_list_args(["u1", "--status", "active"]) == (
+        "u1",
+        "",
+        False,
+        "active",
+    )
+    assert cli._parse_trips_list_args(["u1", "--status=即将出行"]) == (
+        "u1",
+        "",
+        False,
+        "即将出行",
+    )
+    assert cli._parse_trips_list_args(["u1", "--status"]) is None
+    assert cli._parse_trips_list_args(["u1", "--status", "someday"]) is None
+    assert cli._parse_trips_list_args(["u1", "--status", "--json"]) is None
 
     calls = []
     monkeypatch.setattr(
         cli,
         "run_trips_list_standalone",
-        lambda user_id, as_json=False, query="": (
-            calls.append((user_id, as_json, query)) or 0
+        lambda user_id, as_json=False, query="", status_filter="": (
+            calls.append((user_id, as_json, query, status_filter)) or 0
         ),
     )
     monkeypatch.setattr(
@@ -915,8 +972,15 @@ def test_trips_query_args_and_dispatch(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls[-1] == ("u1", True, "上海")
-    print("✓ trips --query 参数解析与 dispatch")
+    assert calls[-1] == ("u1", True, "上海", "")
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips", "u1", "--status", "upcoming", "--json"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", True, "", "upcoming")
+    print("✓ trips --query / --status 参数解析与 dispatch")
 
 
 def test_trip_conflicts_excludes_only_saved_record_with_duplicate_ids(monkeypatch):
@@ -1058,6 +1122,7 @@ if __name__ == "__main__":
         test_filter_trips_by_query_multi_word_any_order,
         test_trip_interval_and_state,
         test_filter_trips_by_query_helper,
+        test_trips_status_filter_text_and_json,
         test_trips_with_conflicts_uses_pool_without_mutation,
         test_trips_list_json,
         test_trips_list_output,

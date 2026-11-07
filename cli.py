@@ -4334,18 +4334,30 @@ def run_trip_update_standalone(
     return 0
 
 
+# 行程状态过滤：英文键与面板标签都接受（active/upcoming/past ↔ 进行中/…）
+_TRIP_STATUS_FILTERS = {
+    "active": "进行中",
+    "upcoming": "即将出行",
+    "past": "已结束",
+    "进行中": "进行中",
+    "即将出行": "即将出行",
+    "已结束": "已结束",
+}
+
+
 def _parse_trips_list_args(
     args: list[str],
-) -> tuple[str, str, bool] | None:
-    """解析 trips 的 ``<user_id> [--query 关键词] [--json]``。
+) -> tuple[str, str, bool, str] | None:
+    """解析 trips 的 ``<user_id> [--query 关键词] [--status S] [--json]``。
 
-    ``--query`` 支持 ``--query 值`` / ``--query=值``，``--json`` 不限位置；
-    未知参数、缺值、非法用户 ID 或位置参数过多返回 None。
+    ``--query`` / ``--status`` 支持 ``--x 值`` 与 ``--x=值``，``--json``
+    不限位置；未知参数、缺值、非法用户 ID、非法状态或位置参数过多返回 None。
     """
     import re
 
     user_id: str | None = None
     query = ""
+    status = ""
     as_json = False
     index = 0
     while index < len(args):
@@ -4353,6 +4365,20 @@ def _parse_trips_list_args(
         lowered = item.lower()
         if lowered == "--json":
             as_json = True
+            index += 1
+            continue
+        if lowered == "--status" or lowered.startswith("--status="):
+            if "=" in item:
+                value = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            label = _TRIP_STATUS_FILTERS.get(value.strip())
+            if not label:
+                return None
+            status = value.strip()
             index += 1
             continue
         if lowered == "--query" or lowered.startswith("--query="):
@@ -4378,7 +4404,7 @@ def _parse_trips_list_args(
         or user_id.startswith("-")
     ):
         return None
-    return user_id, query, as_json
+    return user_id, query, as_json, status
 
 
 def run_trips_import_standalone(
@@ -4520,13 +4546,19 @@ def run_trips_import_standalone(
 
 
 def run_trips_list_standalone(
-    user_id: str, as_json: bool = False, query: str = ""
+    user_id: str,
+    as_json: bool = False,
+    query: str = "",
+    status_filter: str = "",
 ) -> int:
-    """列出用户行程（`python cli.py trips <user_id> [--query 关键词] [--json]`）。
+    """列出用户行程
+    （`python cli.py trips <user_id> [--query 关键词] [--status S] [--json]`）。
 
     ``query`` 按路线 / 起止日期 / 目的做不区分大小写的过滤（与面板关键词
-    筛选一致，冲突提示仍按完整历史计算）；``as_json`` 输出原始行程（含
-    冲突列表与状态标签）。
+    筛选一致，冲突提示仍按完整历史计算）；``status_filter`` 接受
+    active / upcoming / past（或面板标签 进行中 / 即将出行 / 已结束），
+    与面板状态徽标同一口径，无日期的行程在按状态过滤时不出现；
+    ``as_json`` 输出原始行程（含冲突列表与状态标签）。
 
     Returns:
         0 列出成功（含无行程 / 无匹配）；1 参数 / 读取失败
@@ -4576,6 +4608,11 @@ def run_trips_list_standalone(
 
     views = trips_with_conflicts(trips)
     needle = query.strip()
+    status_label = _TRIP_STATUS_FILTERS.get(status_filter.strip(), "")
+    if status_label:
+        views = [
+            trip for trip in views if trip_state_label(trip) == status_label
+        ]
     if needle:
         views = filter_trips_by_query(views, needle)
         if not views:
@@ -4585,6 +4622,7 @@ def run_trips_list_standalone(
                         {
                             "user_id": user_id,
                             "query": query.strip(),
+                            "status": status_label,
                             "count": 0,
                             "trips": [],
                         },
@@ -4593,7 +4631,12 @@ def run_trips_list_standalone(
                     )
                 )
                 return 0
-            print(f"用户 {user_id}：没有匹配「{query.strip()}」的行程")
+            notes = []
+            if status_label:
+                notes.append(f"状态为「{status_label}」")
+            if needle:
+                notes.append(f"匹配「{needle}」")
+            print(f"用户 {user_id}：没有{'且'.join(notes)}的行程")
             return 0
     if as_json:
         print(
@@ -4602,6 +4645,7 @@ def run_trips_list_standalone(
                     {
                         "user_id": user_id,
                         "query": query.strip(),
+                        "status": status_label,
                         "count": len(views),
                         "trips": [
                             {"state": trip_state_label(trip), **trip}
@@ -4614,11 +4658,17 @@ def run_trips_list_standalone(
             )
         )
         return 0
-    header = (
-        f"用户 {user_id}：共 {len(views)} 条匹配「{query.strip()}」的行程（新→旧）"
-        if needle
-        else f"用户 {user_id}：共 {len(views)} 条行程（新→旧）"
-    )
+    if needle or status_label:
+        notes = []
+        if status_label:
+            notes.append(f"状态为「{status_label}」")
+        if needle:
+            notes.append(f"匹配「{needle}」")
+        header = (
+            f"用户 {user_id}：共 {len(views)} 条{'且'.join(notes)}的行程（新→旧）"
+        )
+    else:
+        header = f"用户 {user_id}：共 {len(views)} 条行程（新→旧）"
     print(header)
     for trip in reversed(views):
         start = trip.get("start_date") or "日期未记录"
@@ -5369,15 +5419,22 @@ def main():
             parsed_trips_list = _parse_trips_list_args(sys.argv[2:])
             if parsed_trips_list is None:
                 print(
-                    "用法：python cli.py trips <user_id> [--query 关键词] [--json]"
+                    "用法：python cli.py trips <user_id> [--query 关键词] "
+                    "[--status active|upcoming|past] [--json]"
                 )
                 sys.exit(2)
-            trips_user, trips_query, trips_list_json = parsed_trips_list
+            (
+                trips_user,
+                trips_query,
+                trips_list_json,
+                trips_status,
+            ) = parsed_trips_list
             sys.exit(
                 run_trips_list_standalone(
                     trips_user,
                     as_json=trips_list_json,
                     query=trips_query,
+                    status_filter=trips_status,
                 )
             )
         if arg == "trips-dedupe":

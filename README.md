@@ -509,7 +509,7 @@ python cli.py
 
 偏好维护（不进入交互）：`python cli.py preferences <user_id> [--json]` 列出长期记忆中的偏好（中文类型名，酒店 / 航司等列表值用「、」拼接，布尔显示为是 / 否；`--json` 输出原始值）；`python cli.py pref-set <user_id> <偏好类型> <值> [--json]` 新增 / 覆盖一条偏好（与面板 PUT 同一存储语义）；`python cli.py pref-delete <user_id> <偏好类型> [--json]` 删除一条偏好（未设置返回 1）。
 
-行程列表（不进入交互）：`python cli.py trips <user_id> [--query 关键词] [--json]` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示；`--query` 按路线 / 日期 / 目的过滤，冲突仍按完整历史计算）；`--json` 输出原始行程（含状态与冲突）；`python cli.py trip-add <user_id> --destination X --start YYYY-MM-DD [--origin X] [--end YYYY-MM-DD] [--purpose X] [--json]` 保存一条行程（日期严格按 YYYY-MM-DD，`2026-1-1` 这类不补零写法会被拒绝，避免绕过去重生成重复行程）（与面板 / 对话同一存储路径：同路线同日期更新既有记录，并提示日期重叠）；`python cli.py trip-delete <user_id> <trip_id> [--json]` 删除指定行程（同一 trip_id 对应多条行程时拒绝并提示先运行 trips-dedupe）；`python cli.py trip-update <user_id> <trip_id> [--origin X] [--destination X] [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--purpose X] [--json]` 按字段更新行程（只改提供的字段，日期按合并结果校验，更新后提示日期重叠）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
+行程列表（不进入交互）：`python cli.py trips <user_id> [--query 关键词] [--status active|upcoming|past] [--json]` 按新→旧列出全部行程（路线 / 起止日期 / 目的 / 「进行中 / 即将出行 / 已结束」状态，与其他行程日期重叠时提示；`--query` 按路线 / 日期 / 目的过滤、`--status` 按面板状态徽标过滤（active / upcoming / past，或直接写中文标签；无日期行程在状态过滤时不出现），冲突仍按完整历史计算）；`--json` 输出原始行程（含状态与冲突、`status` 为过滤所用标签）；`python cli.py trip-add <user_id> --destination X --start YYYY-MM-DD [--origin X] [--end YYYY-MM-DD] [--purpose X] [--json]` 保存一条行程（日期严格按 YYYY-MM-DD，`2026-1-1` 这类不补零写法会被拒绝，避免绕过去重生成重复行程）（与面板 / 对话同一存储路径：同路线同日期更新既有记录，并提示日期重叠）；`python cli.py trip-delete <user_id> <trip_id> [--json]` 删除指定行程（同一 trip_id 对应多条行程时拒绝并提示先运行 trips-dedupe）；`python cli.py trip-update <user_id> <trip_id> [--origin X] [--destination X] [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--purpose X] [--json]` 按字段更新行程（只改提供的字段，日期按合并结果校验，更新后提示日期重叠）；与 Web 记忆面板共用 `utils/trip_conflicts.py` 的日期解析与重叠判断。
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id> [--dry-run] [--json]` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），`--dry-run` 只列出将被删除的记录，`--json` 输出结构化结果（将删除 / 已删除条目与歧义 id）；同一 trip_id 出现在多条不同行程里（历史数据异常）时拒绝自动删除并提示人工处理；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
@@ -642,7 +642,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件，含出行前一天 09:00 提醒 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过；每个事件含前一天 09:00 提醒） |
 | GET | `/api/trips/export` | 导出历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开）或 HTML 台账（`format=html`，可打印 / 分享）；`q` 与列表接口同一口径过滤后导出 |
-| GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，`order=asc\|desc` 切换记录顺序，`q` 按路线 / 日期 / 目的过滤，附带日期重叠信息） |
+| GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，`order=asc\|desc` 切换记录顺序，`q` 按路线 / 日期 / 目的过滤，`status=active\|upcoming\|past` 按面板状态徽标过滤，附带日期重叠信息） |
 | DELETE | `/api/trips/{id}` | 删除一条历史行程（同步统计与常去目的地） |
 
 > 说明：短期记忆按会话级管理——进程内实现随服务重启清空，配置 `REDIS_URL` 后由 Redis TTL 控制；长期记忆与历史会话在默认 JSON（`data/memory/`）或 PostgreSQL 中持久化。用户 / 会话 ID 限制为中文、字母、数字、下划线与短横线（避免路径穿越）。服务默认只监听 `127.0.0.1`，按单机演示用途设计。
