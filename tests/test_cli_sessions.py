@@ -35,6 +35,8 @@ class _FakeStore:
         self.archived = list(archived or [])
         self.archived_calls = []
         self.fail_history = False
+        self.fail_delete = False
+        self.deleted_sessions = []
         self.closed = False
 
     def get_chat_history(self, limit=None, session_id=None):
@@ -59,6 +61,16 @@ class _FakeStore:
             self.archived.append(session_id)
         elif not archived and session_id in self.archived:
             self.archived.remove(session_id)
+
+    def delete_chat_session(self, session_id):
+        if self.fail_delete:
+            raise RuntimeError("delete down")
+        before = len(self.messages)
+        self.messages = [
+            m for m in self.messages if m.get("session_id") != session_id
+        ]
+        self.deleted_sessions.append(session_id)
+        return before - len(self.messages)
 
     def close(self):
         self.closed = True
@@ -299,6 +311,110 @@ def test_archive_dispatch_json(monkeypatch):
     assert exc.value.code == 0
     assert calls[-1] == ("u1", "s1", False, True)
     print("✓ session-archive dispatch --json")
+
+
+def _run_delete(user_id, session_id, as_json=False):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_session_delete_standalone(user_id, session_id, as_json=as_json)
+    return code, buf.getvalue()
+
+
+def test_session_delete_removes_messages(monkeypatch):
+    fake = _sessions_store()
+    cleared = []
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(
+        storage,
+        "clear_short_term_session",
+        lambda sid, uid="": cleared.append((sid, uid)),
+    )
+    code, out = _run_delete("u1", "s-active")
+    assert code == 0 and "已删除会话 s-active" in out and "2 条消息" in out
+    assert fake.deleted_sessions == ["s-active"]
+    assert fake.messages and all(
+        m.get("session_id") != "s-active" for m in fake.messages
+    ), "其它会话的消息不能受影响"
+    assert cleared == [("s-active", "u1")], "短期记忆须同步清理（Redis 会话键）"
+    assert fake.closed
+    print("✓ session-delete 删除消息并清理短期记忆")
+
+
+def test_session_delete_missing_session(monkeypatch):
+    fake = _sessions_store()
+    cleared = []
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(
+        storage,
+        "clear_short_term_session",
+        lambda sid, uid="": cleared.append(sid),
+    )
+    code, out = _run_delete("u1", "s-missing")
+    assert code == 1 and "不存在或没有消息" in out
+    assert fake.deleted_sessions == []
+    assert cleared == [], "不存在的会话不应触发短期清理"
+    print("✓ session-delete 不存在的会话返回 1")
+
+
+def test_session_delete_json_output(monkeypatch):
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+    code, out = _run_delete("u1", "s-active", as_json=True)
+    payload = json.loads(out)
+    assert code == 0
+    assert payload == {
+        "ok": True,
+        "user_id": "u1",
+        "session_id": "s-active",
+        "deleted": 2,
+    }
+
+    code, out = _run_delete("u1", "s-active", as_json=True)  # 已删干净
+    payload = json.loads(out)
+    assert code == 1 and payload["ok"] is False
+    assert "不存在或没有消息" in payload["error"]
+    print("✓ session-delete --json 成功 / 错误输出")
+
+
+def test_session_delete_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_session_delete_standalone",
+        lambda user_id, session_id, as_json=False: (
+            calls.append((user_id, session_id, as_json)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "session-delete", "u1", "s1", "--json"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "s1", True)
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "session-delete", "u1"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    print("✓ session-delete dispatch 与用法错误")
+
+
+def test_session_delete_failures(monkeypatch):
+    fake = _sessions_store()
+    fake.fail_history = True
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_delete("u1", "s-active")
+    assert code == 1 and "读取会话失败" in out
+
+    fake = _sessions_store()
+    fake.fail_delete = True
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_delete("u1", "s-active")
+    assert code == 1 and "删除会话失败" in out
+    assert fake.closed
+    print("✓ session-delete 读取 / 删除失败返回 1")
 
 
 class _TitleStore(_FakeStore):

@@ -2854,6 +2854,80 @@ def run_session_archive_standalone(
     return 0
 
 
+def run_session_delete_standalone(
+    user_id: str, session_id: str, as_json: bool = False
+) -> int:
+    """删除一个会话的全部消息
+    （`python cli.py session-delete <user> <session> [--json]`）。
+
+    与面板 DELETE ``/api/sessions/{id}`` 同一语义：长期记忆中该会话的消息
+    全部删除，并清理短期记忆（Redis 会话键与故障期重放登记）。CLI 是单次
+    进程、不持有在途对话；若 Web 服务正在同一会话上流式回复，请先停止再
+    删除（与其它 CLI 破坏性命令一致）。
+
+    Returns:
+        0 删除成功；1 参数 / 读取 / 删除失败（含会话不存在）
+    """
+    import re
+
+    from context.storage import clear_short_term_session
+
+    def _fail(message: str) -> int:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(message)
+        return 1
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+        return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        return _fail(f"打开长期记忆失败：{exc}")
+    try:
+        try:
+            exists = bool(store.get_chat_history(session_id=session_id))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取会话失败：{exc}")
+        if not exists:
+            return _fail(f"会话 {session_id} 不存在或没有消息")
+        try:
+            removed = store.delete_chat_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"删除会话失败：{exc}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+    # 短期记忆清理失败不阻断：长期记忆已删除，残留由故障重放 / 过期回收兜底
+    clear_short_term_session(session_id, user_id)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "deleted": removed,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(f"已删除会话 {session_id}（{removed} 条消息）")
+    return 0
+
+
 def run_session_title_standalone(
     user_id: str,
     session_id: str,
@@ -4453,7 +4527,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
-    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-title / session-pin / session-show / session-export / "
+    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-delete / session-title / session-pin / session-show / session-export / "
     "sessions-export / trips-export / trips-import / user-export"
 )
 
@@ -4929,6 +5003,30 @@ def main():
                     sys.argv[3],
                     archived=not restore,
                     as_json=as_json,
+                )
+            )
+        if arg == "session-delete":
+            positional = []
+            as_json = False
+            valid = True
+            for item in sys.argv[2:]:
+                lowered = item.lower()
+                if lowered == "--json":
+                    as_json = True
+                elif item.startswith("-") or len(positional) >= 2:
+                    valid = False
+                    break
+                else:
+                    positional.append(item)
+            if not valid or len(positional) != 2:
+                print(
+                    "用法：python cli.py session-delete <user_id> <session_id> "
+                    "[--json]"
+                )
+                sys.exit(2)
+            sys.exit(
+                run_session_delete_standalone(
+                    positional[0], positional[1], as_json=as_json
                 )
             )
         if arg == "session-title":
