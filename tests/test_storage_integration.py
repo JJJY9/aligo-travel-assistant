@@ -119,7 +119,7 @@ def test_redis_truncate_replay_keeps_newer_messages():
 
     toggle = _Toggle()
     memory.client = toggle  # type: ignore[assignment]
-    assert memory.truncate_last_turn(expect="Q1") == 0, "故障期只登记延迟操作"
+    assert memory.truncate_last_turn(expect="Q1") == 2, "故障期先按影子缓存即时生效"
     assert [kind for kind, _ in memory._pending_ops] == ["truncate"]
 
     import json as _json
