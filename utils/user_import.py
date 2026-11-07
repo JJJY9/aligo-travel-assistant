@@ -12,10 +12,9 @@
 import json
 import re
 from collections import Counter
-from datetime import datetime
 from typing import Any
 
-from utils.timestamps import chronological_key
+from utils.timestamps import chronological_key, localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
 
 _MAX_PREFERENCES = 200
@@ -37,20 +36,13 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-def _local_timezone():
-    return datetime.now().astimezone().tzinfo
-
-
 def _normalize_timestamp(value: Any) -> str | None:
     """合法 ISO 时间戳归一成带时区形式；非法 / 缺失返回 None（按恢复时间落库）。"""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip())
-    except ValueError:
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_local_timezone())
+        parsed = localize_naive(parsed)
     return parsed.isoformat()
 
 

@@ -202,6 +202,35 @@ def test_import_sorts_messages_by_timestamp():
     print("✓ 恢复按时间升序写入")
 
 
+def test_import_accepts_z_suffix_timestamps():
+    """备份里的 ...Z（合法 UTC 写法，Python 3.10 的 fromisoformat 不支持）不能丢时间。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "UTC 时间",
+                "session_id": "s-z",
+                "timestamp": "2026-11-02T08:00:00Z",
+            },
+            {
+                "role": "user",
+                "content": "偏移时间",
+                "session_id": "s-z",
+                "timestamp": "2026-11-02T09:00:00+00:00",
+            },
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert errors == []
+    timestamps = [m["timestamp"] for m in sections["messages"]]
+    assert timestamps == [
+        "2026-11-02T08:00:00+00:00",
+        "2026-11-02T09:00:00+00:00",
+    ], timestamps
+    assert [m["content"] for m in sections["messages"]] == ["UTC 时间", "偏移时间"]
+    print("✓ 导入接受 Z 后缀时间戳并按真实时刻排序")
+
+
 def test_preview_does_not_write_and_matches_import():
     from utils.user_import import preview_user_import
 
@@ -533,6 +562,7 @@ if __name__ == "__main__":
     test_exporter_json_is_importable()
     test_parse_validates_session_ids_and_usage()
     test_import_sorts_messages_by_timestamp()
+    test_import_accepts_z_suffix_timestamps()
     test_preview_does_not_write_and_matches_import()
     test_parse_tolerates_bad_timestamps_and_rows()
     test_parse_limits_preferences()
