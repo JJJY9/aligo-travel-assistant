@@ -511,6 +511,13 @@ class PreferencePayload(BaseModel):
     value: PreferenceValue
 
 
+class LastTurnPayload(BaseModel):
+    """删除最后一轮的请求体（POST 形式，长提问的 expect 不再受查询串上限）。"""
+
+    user_id: str = Field(pattern=_ID_PATTERN)
+    expect: str | None = Field(default=None, max_length=200000)
+
+
 _DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
 
@@ -2552,17 +2559,10 @@ def create_app(model: Any = None) -> FastAPI:
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
         return {"session_id": session_id, "deleted": removed}
 
-    @app.delete("/api/sessions/{session_id}/last-turn")
-    async def delete_last_turn(
-        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
-        user_id: str = Query(..., pattern=_ID_PATTERN),
-        expect: str | None = Query(default=None, max_length=6000),
+    async def _delete_last_turn_impl(
+        user_id: str, session_id: str, expect: str | None
     ) -> dict[str, Any]:
-        """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。
-
-        ``expect`` 为待编辑提问的原文：与最后一轮用户提问不一致时不删除任何
-        内容（例如这条提问在意图识别阶段就失败、并未写入历史），避免误删上一轮。
-        """
+        """删除最后一轮的共享实现（DELETE 查询串 / POST body 两种入口）。"""
         async with state.lock_for(user_id):
             def _remove_last_turn() -> int:
                 # 破坏性操作：PostgreSQL 不可用时 strict 打开返回 503，
@@ -2603,6 +2603,35 @@ def create_app(model: Any = None) -> FastAPI:
             "removed": removed,
             "mismatch": removed == 0 and expect is not None,
         }
+
+    @app.delete("/api/sessions/{session_id}/last-turn")
+    async def delete_last_turn(
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+        expect: str | None = Query(default=None, max_length=6000),
+    ) -> dict[str, Any]:
+        """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。
+
+        ``expect`` 为待编辑提问的原文：与最后一轮用户提问不一致时不删除任何
+        内容（例如这条提问在意图识别阶段就失败、并未写入历史），避免误删上一轮。
+        查询串形式限制 6000 字（h11 请求行上限）；更长的提问用 POST body 形式。
+        """
+        return await _delete_last_turn_impl(user_id, session_id, expect)
+
+    @app.post("/api/sessions/{session_id}/last-turn")
+    async def delete_last_turn_post(
+        payload: LastTurnPayload,
+        session_id: str = ApiPath(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """同 DELETE，但 ``expect`` 走 JSON body。
+
+        CLI 交互 / 备份导入产生的长提问没有 4000 字上限，放进查询串会撞
+        FastAPI max_length 或 h11 请求行上限——面板的编辑 / 重新生成在长
+        提问上会必然失败。
+        """
+        return await _delete_last_turn_impl(
+            payload.user_id, session_id, payload.expect
+        )
 
     @app.post("/api/chat")
     async def chat(

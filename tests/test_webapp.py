@@ -1121,6 +1121,51 @@ def test_last_turn_expect_accepts_long_message():
         _cleanup(user_id)
 
 
+def test_post_last_turn_accepts_long_expect():
+    """POST body 形式的 expect 不受 6000 字查询上限：面板编辑 / 重新生成
+    能处理 CLI / 备份导入产生的超长提问。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_post_long")
+    long_text = "长" * 7000
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", long_text, "s-post-long")
+            store.add_chat_message("assistant", "收到", "s-post-long")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        # 查询串形式超 6000 被 FastAPI 拒绝（面板已改用 POST body）
+        too_long = client.delete(
+            "/api/sessions/s-post-long/last-turn",
+            params={"user_id": user_id, "expect": long_text},
+        )
+        assert too_long.status_code == 422
+
+        mismatch = client.post(
+            "/api/sessions/s-post-long/last-turn",
+            json={"user_id": user_id, "expect": "不匹配的提问"},
+        )
+        assert mismatch.status_code == 200
+        assert mismatch.json()["removed"] == 0
+        assert mismatch.json()["mismatch"] is True
+
+        response = client.post(
+            "/api/sessions/s-post-long/last-turn",
+            json={"user_id": user_id, "expect": long_text},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["removed"] == 2
+        assert response.json()["mismatch"] is False
+        print("✓ POST last-turn 支持超长 expect")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ics_handles_overflow_end_date():
     """9999-12-31 的行程不能让日历导出 500（DTEND 无法再加一天）。"""
     client = _client()
