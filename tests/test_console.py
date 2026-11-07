@@ -148,6 +148,62 @@ def test_readline_utf16_lines_and_size():
     assert shim2.readline() == "行\n"
     print("✓ UTF-16 逐行 readline 与 size 截断")
 
+def test_utf16_readline_is_incremental_not_read_to_eof():
+    """UTF-16 首行读取不能无界 read()：管道未 EOF 时 input() 必须立即返回。"""
+    from utils.console import _AutoDecodeInput
+
+    class _GuardedBytesIO(io.BytesIO):
+        def peek(self, size=2):
+            position = self.tell()
+            data = self.read(size)
+            self.seek(position)
+            return data
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                raise AssertionError("UTF-16 首行读取不能无界 read()")
+            return super().read(size)
+
+    payload = "alice\nbob\n".encode("utf-16")
+    shim = _AutoDecodeInput(_GuardedBytesIO(payload), "utf-8")
+    assert shim.readline() == "alice\n"
+    assert shim.readline() == "bob\n"
+    assert shim.readline() == ""
+
+    shim2 = _AutoDecodeInput(_GuardedBytesIO("甲\n".encode("utf-16")), "utf-8")
+    assert shim2.read(0) == "", "size=0 不消费输入、也不阻塞"
+    assert shim2.readline() == "甲\n"
+    print("✓ UTF-16 按块增量解码（readline 不再读到 EOF）")
+
+
+def test_pipe_safe_stdout_swallows_broken_pipe():
+    """`| head` 关闭管道后的写入静默丢弃；真实写失败照常抛出。"""
+    from utils.console import PipeSafeTextIO
+
+    class _Broken:
+        def write(self, text):
+            raise OSError(22, "Invalid argument")
+
+        def flush(self):
+            raise OSError(22, "Invalid argument")
+
+        def isatty(self):
+            return False
+
+    safe = PipeSafeTextIO(_Broken())
+    assert safe.write("hello") == 5
+    safe.flush()
+    assert safe.write("again") == 5, "管道关闭后后续写入静默丢弃"
+
+    class _DiskFull:
+        def write(self, text):
+            raise OSError(28, "No space left on device")
+
+    with pytest.raises(OSError):
+        PipeSafeTextIO(_DiskFull()).write("x")
+    print("✓ PipeSafeTextIO 只吞管道类写入错误")
+
+
 def test_probe_stdin_false_leaves_stream_untouched(monkeypatch):
     """一次性命令跳过 stdin：不包装、不触碰（也不会 peek 阻塞）。"""
 
@@ -215,6 +271,8 @@ if __name__ == "__main__":
         test_readline_size_preserves_unread_remainder()
         test_read_size_preserves_unread_remainder()
         test_readline_utf16_lines_and_size()
+        test_utf16_readline_is_incremental_not_read_to_eof()
+        test_pipe_safe_stdout_swallows_broken_pipe()
         test_probe_stdin_false_leaves_stream_untouched(mp)
         test_non_tty_pipe_is_wrapped(mp)
     finally:

@@ -4,8 +4,10 @@ Aligo 商旅助手 - CLI 交互界面
 使用 Rich 库实现美观的终端交互
 """
 import asyncio
+import contextlib
 import os
 import re
+import signal
 import sys
 from typing import Any
 
@@ -19,7 +21,7 @@ import json
 # doctor / skills 等诊断命令必须在这些依赖缺失时仍能启动并如实报告缺失项
 from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.console import configure_stdio
+from utils.console import PipeSafeTextIO, configure_stdio
 from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
@@ -55,7 +57,9 @@ class AligoCLI:
 
     def __init__(self):
         """初始化 CLI"""
-        self.console = Console()
+        # stdout 走管道安全包装：`| head` 提前关闭后 Rich 写入静默丢弃，
+        # 不再在错误分支二次抛错打出 traceback（退出时还原见 run()）
+        self.console = Console(file=PipeSafeTextIO(sys.stdout))
         self.user_id = None
         self.session_id = None
         self.memory_manager = None
@@ -661,9 +665,14 @@ class AligoCLI:
                     prefs_list = raw_prefs.get("preferences", [])
                 else:
                     prefs_list = raw_prefs if isinstance(raw_prefs, list) else []
-                # 模型可能返回字符串 / null 等非对象条目：跳过而不是整轮崩溃
+                # 模型可能返回字符串 / null 等非对象条目，或把 type 返回成
+                # 对象 / 数组：落库路径（orchestration_agent）只接受字符串
+                # type，这里同一口径过滤——否则把 dict/list 当字典键查询会
+                # 抛 TypeError，整轮回显（含落库）一起失败
                 prefs_items = [
-                    item for item in prefs_list if isinstance(item, dict)
+                    item
+                    for item in prefs_list
+                    if isinstance(item, dict) and isinstance(item.get("type"), str)
                 ]
 
                 if prefs_items:
@@ -1056,73 +1065,140 @@ class AligoCLI:
         # 初始化系统
         await self.initialize_system()
 
-        # 主循环
-        while True:
-            try:
-                # 获取用户输入。stdin 不可用只可能发生在 Prompt.ask 本身：
-                # 收窄在这里捕获；放到整个循环体会误伤 MemoryPersistenceError
-                # （RuntimeError 子类），一次记忆写盘失败就被当成 stdin 故障退出
+        # 自己接管 SIGINT：asyncio.run 的默认处理器只取消主任务，而「提示符
+        # 下按的 Ctrl-C」这个取消要等到下一条命令的第一个 await 才送达，会
+        # 把刚输入的命令静默取消；关闭阶段（Runner.close）对主任务的取消也
+        # 会被 REPL 当成用户中断吞掉，进程卡在提示符不退出。这里记录取消
+        # 来源：用户 Ctrl-C 才回提示符，关闭取消继续向上抛。
+        main_task = asyncio.current_task()
+        interrupt = {"count": 0, "user": False, "at_prompt": False}
+
+        def _on_sigint(signum, frame):
+            if main_task is None or main_task.done():
+                return
+            interrupt["count"] += 1
+            if interrupt["count"] > 1:
+                # 连按两次：强制退出（与 asyncio 默认处理器同一语义）。
+                # 关闭阶段还会取消主任务，先清掉用户标记让这次取消按关闭
+                # 处理（否则会被 REPL 吞掉、gather 永远等不到主任务）
+                interrupt["count"] = 0
+                interrupt["user"] = False
+                raise KeyboardInterrupt
+            if interrupt["at_prompt"]:
+                # 提示符处（同步 input）按 Ctrl-C：直接打断 input 回到新
+                # 提示符。不能改为取消任务——任务此刻在同步代码中，取消会
+                # 挂起到下一条命令的第一个 await 才送达，把刚输入的命令
+                # 静默取消（C 实现的 Task 也无法事后撤回挂起的取消）
+                interrupt["count"] = 0
+                interrupt["user"] = False
+                raise KeyboardInterrupt
+            interrupt["user"] = True
+            main_task.cancel()
+
+        previous_handler = None
+        try:
+            previous_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _on_sigint)
+        except (ValueError, OSError):
+            # 非主线程 / 受限环境：无法安装，沿用 asyncio 处理器
+            previous_handler = None
+
+        def _clear_pending_cancel() -> None:
+            task = asyncio.current_task()
+            if task is None:
+                return
+            if hasattr(task, "uncancel"):
+                # 取消已送达后回退计数，避免连锁取消（3.11+）
+                while task.cancelling():
+                    task.uncancel()
+
+        try:
+            # 主循环
+            while True:
                 try:
-                    user_input = Prompt.ask("\n[cyan]>[/cyan]")
-                except (RuntimeError, ValueError) as exc:
-                    self.console.print(
-                        f"\n无法读取输入（{exc}），已退出", style="dim"
-                    )
+                    # 获取用户输入。stdin 不可用只可能发生在 Prompt.ask 本身：
+                    # 收窄在这里捕获；放到整个循环体会误伤 MemoryPersistenceError
+                    # （RuntimeError 子类），一次记忆写盘失败就被当成 stdin 故障退出
+                    try:
+                        interrupt["at_prompt"] = True
+                        try:
+                            user_input = Prompt.ask("\n[cyan]>[/cyan]")
+                        finally:
+                            interrupt["at_prompt"] = False
+                    except (RuntimeError, ValueError) as exc:
+                        self.console.print(
+                            f"\n无法读取输入（{exc}），已退出", style="dim"
+                        )
+                        break
+
+                    if interrupt["count"]:
+                        # 提示符下按过 Ctrl-C：取消还挂在任务上，会在本命令
+                        # 的第一个 await 处才送达——先清掉，让输入的命令正常
+                        # 执行（回到提示符，而不是取消下一条命令）
+                        interrupt["count"] = 0
+                        interrupt["user"] = False
+                        _clear_pending_cancel()
+                        self.console.print("已取消上一步操作", style="dim")
+
+                    if not user_input.strip():
+                        continue
+
+                    # 处理命令
+                    command = user_input.strip().lower()
+
+                    if command == "exit":
+                        self.memory_manager.end_session()
+                        self.console.print("再见！", style="cyan")
+                        break
+                    elif command == "help":
+                        self.print_help()
+                    elif command == "status":
+                        self.show_status()
+                    elif command == "health":
+                        await self.run_health_check()
+                    elif command == "doctor":
+                        await self.run_doctor()
+                    elif command == "clear":
+                        self.memory_manager.short_term.clear()
+                        self.console.print("✓ 已清空短期记忆", style="green")
+                    elif command == "history":
+                        self.show_history()
+                    elif command == "preferences":
+                        self.show_preferences()
+                    elif command == "export":
+                        self.export_memory()
+                    else:
+                        # 处理自然语言查询
+                        await self.process_query(user_input)
+
+                except EOFError:
+                    # 管道 / IDE 末尾：退出，避免每次循环都报错刷屏
+                    self.console.print()
+                    self.console.print("未检测到输入，已退出", style="dim")
                     break
-
-                if not user_input.strip():
-                    continue
-
-                # 处理命令
-                command = user_input.strip().lower()
-
-                if command == "exit":
-                    self.memory_manager.end_session()
-                    self.console.print("再见！", style="cyan")
-                    break
-                elif command == "help":
-                    self.print_help()
-                elif command == "status":
-                    self.show_status()
-                elif command == "health":
-                    await self.run_health_check()
-                elif command == "doctor":
-                    await self.run_doctor()
-                elif command == "clear":
-                    self.memory_manager.short_term.clear()
-                    self.console.print("✓ 已清空短期记忆", style="green")
-                elif command == "history":
-                    self.show_history()
-                elif command == "preferences":
-                    self.show_preferences()
-                elif command == "export":
-                    self.export_memory()
-                else:
-                    # 处理自然语言查询
-                    await self.process_query(user_input)
-
-            except EOFError:
-                # 管道 / IDE 末尾：退出，避免每次循环都报错刷屏
-                self.console.print()
-                self.console.print("未检测到输入，已退出", style="dim")
-                break
-            except asyncio.CancelledError:
-                # 提示符下的 Ctrl-C 由 asyncio.run 的 SIGINT 处理器转成任务
-                # 取消（KeyboardInterrupt 分支永远收不到）：清除取消计数后
-                # 回到提示符，而不是静默取消下一条命令
-                import asyncio as _asyncio
-
-                task = _asyncio.current_task()
-                if task is not None and hasattr(task, "uncancel"):
-                    while task.cancelling():
-                        task.uncancel()
-                self.console.print("\n使用 'exit' 退出", style="dim")
-            except KeyboardInterrupt:
-                self.console.print("\n使用 'exit' 退出", style="dim")
-            except CircuitOpenError:
-                self.console.print("\n[bold yellow]⚠ 服务暂时不可用，请稍后再试。[/bold yellow]", style="dim")
-            except Exception as e:
-                self.console.print(f"\n错误: {e}", style="red")
+                except asyncio.CancelledError:
+                    # 只有 SIGINT 处理器自己发起的取消才回到提示符；
+                    # asyncio.run 关闭阶段对主任务的取消必须继续向上抛，
+                    # 否则 Runner.close() 的 gather 永远等不到主任务结束
+                    if not interrupt["user"]:
+                        raise
+                    interrupt["user"] = False
+                    interrupt["count"] = 0
+                    _clear_pending_cancel()
+                    self.console.print("\n使用 'exit' 退出", style="dim")
+                except KeyboardInterrupt:
+                    interrupt["user"] = False
+                    interrupt["count"] = 0
+                    _clear_pending_cancel()
+                    self.console.print("\n使用 'exit' 退出", style="dim")
+                except CircuitOpenError:
+                    self.console.print("\n[bold yellow]⚠ 服务暂时不可用，请稍后再试。[/bold yellow]", style="dim")
+                except Exception as e:
+                    self.console.print(f"\n错误: {e}", style="red")
+        finally:
+            if previous_handler is not None:
+                with contextlib.suppress(ValueError, OSError):
+                    signal.signal(signal.SIGINT, previous_handler)
 
 
 def run_health_check_standalone(as_json: bool = False) -> int:

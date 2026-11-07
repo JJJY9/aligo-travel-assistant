@@ -12,6 +12,7 @@ UnicodeEncodeError（cmd / PowerShell、未设置 PYTHONIOENCODING 时必现）�
   且不会因为管道暂时没有数据而拖慢或阻塞启动。
 """
 import codecs
+import os
 import sys
 from typing import Any
 
@@ -34,6 +35,11 @@ class _AutoDecodeInput:
         # None=尚未判定；"auto"=逐行判断；"utf-8-sig"=BOM；"utf-16"=行已拆好
         self._mode: str | None = None
         self._lines: list[str] = []
+        # UTF-16 输入按固定大小分块读取（无 size 的 read() 会一直阻塞到 EOF，
+        # 交互式管道下第一个 input() 等不到整行就死锁）；解码用增量解码器
+        # 处理跨块的多字节字符
+        self._utf16_text = ""
+        self._utf16_decoder: Any = None
         # readline(size) / read(size) 截断后剩余的文本：TextIO 契约要求
         # 未返回的部分留在流里供下一次读取，不能丢弃（输入会被静默截断）
         self._pending = ""
@@ -68,12 +74,12 @@ class _AutoDecodeInput:
             except Exception:  # noqa: BLE001 - peek 失败按逐行判断
                 head = b""
         if head[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
-            # UTF-16 的换行是两个字节：按字节 readline 会劈开字符，
-            # 这里一次性读入并按文本行拆分
-            data = self._buffer.read() or b""
-            text = data.decode("utf-16", errors="replace")
-            self._lines = text.splitlines(keepends=True)
+            # UTF-16 的换行是两个字节：按字节 readline 会劈开字符。这里只
+            # 标记模式，按块增量解码（不能无界 read()——那会阻塞到 EOF）
             self._mode = "utf-16"
+            self._utf16_decoder = codecs.getincrementaldecoder("utf-16")(
+                errors="replace"
+            )
             return
         if head[:3] == codecs.BOM_UTF8:
             self._mode = "utf-8-sig"
@@ -96,6 +102,30 @@ class _AutoDecodeInput:
     def flush(self) -> None:
         pass
 
+    # UTF-16 分块读取的字节数：小到不会长时间阻塞在未到齐的行上，
+    # 大到一次系统调用就能拿到常见的一行
+    _UTF16_CHUNK = 4096
+
+    def _read_utf16_more(self) -> bool:
+        """读一块 UTF-16 字节并解码追加到缓冲区；返回是否读到了数据。"""
+        data = self._buffer.read(self._UTF16_CHUNK) or b""
+        if not data:
+            return False
+        self._utf16_text += self._utf16_decoder.decode(data)
+        return True
+
+    def _next_utf16_line(self) -> str:
+        while True:
+            index = self._utf16_text.find("\n")
+            if index >= 0:
+                line = self._utf16_text[: index + 1]
+                self._utf16_text = self._utf16_text[index + 1 :]
+                return line
+            if not self._read_utf16_more():
+                line = self._utf16_text
+                self._utf16_text = ""
+                return line
+
     def readline(self, size: int | None = -1) -> str:
         self._ensure_mode()
         if self._pending:
@@ -103,6 +133,10 @@ class _AutoDecodeInput:
             self._pending = ""
         elif self._lines:
             line = self._lines.pop(0)
+        elif self._mode == "utf-16":
+            line = self._next_utf16_line()
+            if not line:
+                return ""
         else:
             raw = self._buffer.readline()
             if not raw:
@@ -118,19 +152,35 @@ class _AutoDecodeInput:
 
     def read(self, size: int | None = -1) -> str:
         self._ensure_mode()
+        if size == 0:
+            # TextIO 契约：size=0 不消费输入，也不能阻塞到 EOF
+            return ""
         parts: list[str] = []
         if self._pending:
             parts.append(self._pending)
             self._pending = ""
         parts.extend(self._lines)
         self._lines = []
-        read_all = getattr(self._buffer, "read", None)
-        if callable(read_all):
-            data = read_all() or b""
-            if data:
-                if self._mode == "utf-16":
-                    parts.append(data.decode("utf-16", errors="replace"))
-                else:
+        unlimited = size is None or size < 0
+        target = -1 if unlimited else int(size if size is not None else 0)
+        if self._mode == "utf-16":
+            if self._utf16_text:
+                parts.append(self._utf16_text)
+                self._utf16_text = ""
+            while (
+                target < 0
+                or sum(len(part) for part in parts) + len(self._utf16_text) < target
+            ):
+                if not self._read_utf16_more():
+                    break
+            if self._utf16_text:
+                parts.append(self._utf16_text)
+                self._utf16_text = ""
+        else:
+            read_all = getattr(self._buffer, "read", None)
+            if callable(read_all):
+                data = read_all() or b""
+                if data:
                     parts.append(self._decode_line(data))
         text = "".join(parts)
         if size is None or size < 0:
@@ -140,6 +190,82 @@ class _AutoDecodeInput:
             self._pending = text[size:]
             return text[:size]
         return text
+
+
+class PipeSafeTextIO:
+    """包裹 stdout：下游管道提前关闭（如 ``| head``）后写入静默丢弃。
+
+    Windows 上关闭的管道抛 ``OSError [Errno 22]`` 而不是 BrokenPipeError；
+    只有管道类错误被吞掉，真实写失败（磁盘满等）照常抛出。交互式 CLI 的
+    Rich 输出走这里，管道关闭后不再向 stderr 打 traceback。
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._broken = False
+
+    @staticmethod
+    def _is_pipe_error(exc: OSError) -> bool:
+        return (
+            isinstance(exc, BrokenPipeError)
+            or getattr(exc, "errno", None) in (22, 32)
+            or getattr(exc, "winerror", None) in (109, 232)
+        )
+
+    def _swallow(self, exc: OSError) -> bool:
+        if not self._is_pipe_error(exc):
+            return False
+        self._broken = True
+        # 把真实 stdout 的 fd 接到 devnull：否则解释器退出时 flush
+        # sys.stdout 还会再报一次 OSError（进程以 120 退出）
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, self._stream.fileno())
+            finally:
+                os.close(devnull)
+        except Exception:  # noqa: BLE001 - 重定向失败不影响「已损坏」判定
+            pass
+        return True
+
+    def write(self, text: str) -> int:
+        if self._broken:
+            return len(text)
+        try:
+            return self._stream.write(text)
+        except OSError as exc:
+            if not self._swallow(exc):
+                raise
+            return len(text)
+
+    def flush(self) -> None:
+        if self._broken:
+            return
+        try:
+            self._stream.flush()
+        except OSError as exc:
+            if not self._swallow(exc):
+                raise
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except Exception:  # noqa: BLE001 - 抽象流判断失败按非终端处理
+            return False
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._stream, "encoding", None) or "utf-8"
+
+    @property
+    def errors(self) -> str:
+        return getattr(self._stream, "errors", None) or "strict"
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
 
 
 def _reconfigure(stream_name: str, encoding: str) -> None:

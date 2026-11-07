@@ -486,6 +486,162 @@ def test_process_query_memory_failure_not_counted_by_breaker():
     print("✓ CLI 记忆写盘失败不计入熔断器")
 
 
+def _sigint_cli(monkeypatch, ask, process):
+    """构造接管 SIGINT 的 CLI 桩：假初始化 / 假输入 / 假查询。"""
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    monkeypatch.setattr(cli.Prompt, "ask", ask)
+    monkeypatch.setattr(agent, "process_query", process)
+    return agent, buffer
+
+
+def test_prompt_sigint_does_not_cancel_next_command(monkeypatch):
+    """提示符处按 Ctrl-C 只打断当前输入；随后输入的命令必须正常执行。"""
+    import signal as signal_module
+    import time as time_module
+
+    calls = {"ask": 0, "processed": []}
+
+    async def fake_process(user_input):
+        await asyncio.sleep(0)  # 第一个 await：悬挂的取消会在这里抛出
+        calls["processed"].append(user_input)
+
+    def fake_ask(prompt, **kwargs):
+        calls["ask"] += 1
+        if calls["ask"] == 1:
+            # 提示符（同步 input）期间按 Ctrl-C：处理器打断 input()
+            signal_module.raise_signal(signal_module.SIGINT)
+            time_module.sleep(0.05)  # 信号检查在这里派发处理器
+            return "被打断的输入不应生效"
+        if calls["ask"] == 2:
+            return "随便问点什么"
+        raise EOFError
+
+    agent, buffer = _sigint_cli(monkeypatch, fake_ask, fake_process)
+    asyncio.run(agent.run())
+    assert calls["ask"] >= 2, "Ctrl-C 后应回到提示符而不是退出"
+    assert calls["processed"] == ["随便问点什么"], "下一条命令不能被静默取消"
+    assert "使用 'exit' 退出" in buffer.getvalue()
+    print("✓ 提示符 Ctrl-C 不再取消下一条命令")
+
+
+def test_user_sigint_during_query_returns_to_prompt(monkeypatch):
+    """查询执行中按 Ctrl-C：取消当前查询并回到提示符，而不是退出 REPL。"""
+    import signal as signal_module
+
+    calls = {"ask": 0}
+
+    async def fake_process(user_input):
+        loop = asyncio.get_running_loop()
+        loop.call_soon(signal_module.raise_signal, signal_module.SIGINT)
+        await asyncio.sleep(10)  # 等待被取消
+
+    def fake_ask(prompt, **kwargs):
+        calls["ask"] += 1
+        if calls["ask"] == 1:
+            return "问题"
+        raise EOFError
+
+    agent, buffer = _sigint_cli(monkeypatch, fake_ask, fake_process)
+    asyncio.run(agent.run())
+    assert calls["ask"] == 2, "取消后应回到提示符继续读输入"
+    assert "使用 'exit' 退出" in buffer.getvalue()
+    print("✓ 查询中 Ctrl-C 回到提示符")
+
+
+def test_external_cancel_propagates_out_of_repl(monkeypatch):
+    """非 SIGINT 发起的取消（asyncio.run 关闭阶段）不能被 REPL 吞掉。"""
+
+    async def fake_process(user_input):
+        await asyncio.sleep(10)
+
+    def fake_ask(prompt, **kwargs):
+        return "问题"
+
+    agent, _ = _sigint_cli(monkeypatch, fake_ask, fake_process)
+
+    async def scenario():
+        task = asyncio.create_task(agent.run())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    print("✓ 关闭阶段的主任务取消继续向上抛（不再卡住退出）")
+
+
+def test_preference_display_tolerates_unhashable_type():
+    """偏好 type 为对象 / 数组时跳过（与落库路径一致），整轮不能崩。"""
+    agent, buffer = _capture_console()
+    shown = agent._generate_human_response(
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": {"name": "hotel_brands"}, "value": "汉庭"},
+                        {"type": ["airlines"], "value": "东航"},
+                        {
+                            "type": "hotel_brands",
+                            "value": "如家",
+                            "action": "append",
+                        },
+                    ]
+                },
+            }
+        ]
+    )
+    assert shown is True
+    text = buffer.getvalue()
+    assert "如家" in text
+    assert "汉庭" not in text, "落库会跳过的条目也不应回显"
+    print("✓ 偏好回显跳过非字符串 type（不再 TypeError）")
+
+
+def test_closed_stdout_pipe_does_not_traceback():
+    """`| head` 提前关闭 stdout：交互模式也不打 traceback / 非零退出。"""
+    proc = subprocess.Popen(
+        [sys.executable, "cli.py"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=project_root,
+    )
+    try:
+        assert proc.stdout is not None
+        proc.stdout.read(1)  # 等首屏输出后再关闭读端
+        proc.stdout.close()
+        if proc.stdin:
+            proc.stdin.close()
+        stderr = proc.stderr.read() if proc.stderr else b""
+        code = proc.wait(timeout=60)
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+    text = stderr.decode("utf-8", errors="replace")
+    assert "Traceback" not in text, text
+    assert "Exception ignored" not in text, text
+    # 无 API Key 的 CI 环境初始化失败退出码为 1；本机配置了 Key 时为 0
+    assert code in (0, 1), (code, text)
+    print("✓ stdout 管道提前关闭不再 traceback")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -502,6 +658,11 @@ if __name__ == "__main__":
         test_process_query_failure_leaves_no_long_term_user_turn()
         test_process_query_memory_failure_not_counted_by_breaker()
         test_process_query_releases_probe_on_early_failure(_mp)
+        test_prompt_sigint_does_not_cancel_next_command(_mp)
+        test_user_sigint_during_query_returns_to_prompt(_mp)
+        test_external_cancel_propagates_out_of_repl(_mp)
+        test_preference_display_tolerates_unhashable_type()
+        test_closed_stdout_pipe_does_not_traceback()
     finally:
         _mp.undo()
     print("\n全部通过")
