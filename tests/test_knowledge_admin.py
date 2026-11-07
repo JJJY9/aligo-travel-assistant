@@ -1494,6 +1494,73 @@ def test_delete_document_old_parts_without_group_rejected(monkeypatch):
     print("✓ 旧版无 group 的多分片记录拒绝单条删除")
 
 
+def test_update_group_to_single_part_replaces_old_members(monkeypatch):
+    """整份编辑成单片短内容：目标片更新后旧组其余分片被删除。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = []
+            self.batches = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated.append((doc_id, content, metadata))
+            return {"status": "success"}
+
+        def add_documents(self, documents):
+            self.batches.append(documents)
+            return {"status": "success", "ids": [99]}
+
+    agent = _Agent()
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "旧第一片", "metadata": "{}"},
+            {"id": 2, "content": "旧第二片", "metadata": "{}"},
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    monkeypatch.setattr(knowledge_admin, "_document_info", lambda client, doc_id: (2, "g-upd"))
+    monkeypatch.setattr(
+        knowledge_admin, "_group_member_ids", lambda client, group: [1, 2]
+    )
+
+    result = knowledge_admin.update_document(1, "新的短内容")
+    assert result.get("status") == "success"
+    assert agent.updated and agent.updated[0][1] == "新的短内容"
+    assert agent.batches == [], "单片内容不应追加新分片"
+    assert fake.deleted == [2], "旧组其余分片应被删除"
+    print("✓ 整组→单片编辑删除旧成员")
+
+
+def test_existing_group_layout_real_scan(monkeypatch):
+    """_existing_group_layout 的真实扫描实现：内容→(group, part, parts)。"""
+    import json as _json
+
+    rows = [
+        {
+            "id": 1,
+            "content": "分片一",
+            "metadata": _json.dumps({"group": "g-layout", "part": "1", "parts": "2"}),
+        },
+        {
+            "id": 2,
+            "content": "分片二",
+            "metadata": _json.dumps({"group": "g-layout", "part": "2", "parts": "2"}),
+        },
+        {"id": 3, "content": "独立片段", "metadata": "{}"},
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    layout = knowledge_admin._existing_group_layout()
+    assert layout["分片一"] == ("g-layout", 1, 2)
+    assert layout["分片二"] == ("g-layout", 2, 2)
+    assert layout["独立片段"] == ("", 0, 1)
+    print("✓ 库内分片布局真实扫描")
+
+
 def test_delete_document_whole_group(monkeypatch):
     """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
     def _meta(part, group="g-del"):
@@ -1587,6 +1654,60 @@ def test_import_empty_and_missing_db(monkeypatch):
     with pytest.raises(FileNotFoundError, match="知识库未初始化"):
         knowledge_admin.import_documents([{"content": "x"}])
     print("✓ 空导入返回 0；知识库缺失时报错")
+
+
+def test_import_raises_on_agent_error_status(monkeypatch):
+    """add_documents 返回 status=error（不抛异常）同样按批次失败上报。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _ErrorAgent:
+        def add_documents(self, documents):
+            return {"status": "error", "message": "milvus down"}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _ErrorAgent())
+    with pytest.raises(RuntimeError, match="第 1 批导入失败") as info:
+        knowledge_admin.import_documents([{"content": "片段"}])
+    assert "milvus down" in str(info.value)
+    print("✓ 导入批次的 status=error 上报")
+
+
+def test_import_batches_split_only_at_group_start(monkeypatch):
+    """按组分批：同一 group 的分片永远落在同一批，只在组起始处切批。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 4)
+
+    batches = []
+
+    class _Agent:
+        def add_documents(self, documents):
+            batches.append([doc["content"] for doc in documents])
+            return {"status": "success", "ids": [1] * len(documents)}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    documents = [{"content": f"single-{i}"} for i in range(5)]
+    documents += [
+        {
+            "content": f"group-{i}",
+            "metadata": {"group": "g-batch", "part": str(i), "parts": "3"},
+        }
+        for i in (1, 2, 3)
+    ]
+    documents += [{"content": "tail-1"}, {"content": "tail-2"}]
+    knowledge_admin.import_documents(documents)
+
+    group_batches = [
+        batch for batch in batches if any(c.startswith("group-") for c in batch)
+    ]
+    assert len(group_batches) == 1, batches
+    ordered = [c for c in group_batches[0] if c.startswith("group-")]
+    assert ordered == ["group-1", "group-2", "group-3"], group_batches
+    print("✓ 导入按组起始切批（组不跨批）")
 
 
 def test_import_chunks_large_documents(monkeypatch):

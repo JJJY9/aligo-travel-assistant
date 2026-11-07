@@ -147,6 +147,41 @@ def test_redis_limiter_falls_back_when_unavailable():
     print("✓ Redis 故障回退进程内限流并进入冷却")
 
 
+def test_redis_limiter_recovers_after_cooldown(monkeypatch):
+    """运行中故障 → 冷却期内走回退 → 冷却到期自动重试 Redis 并恢复。"""
+    import utils.rate_limit as rate_limit_module
+
+    times = {"now": 1000.0}
+    monkeypatch.setattr(rate_limit_module.time, "monotonic", lambda: times["now"])
+
+    class _Recoverable(_UnavailableRedis):
+        def __init__(self):
+            super().__init__()
+            self.fail = True
+
+        def eval(self, *args, **kwargs):
+            self.eval_calls += 1
+            if self.fail:
+                raise ConnectionError("redis down")
+            return -1  # 放行（Retry-After 为负 → None）
+
+    client = _Recoverable()
+    limiter = RedisRateLimiter(client, "unit-recover", limit=5, window_sec=60)
+    assert limiter.check("k") is None
+    assert limiter.degraded is True and client.eval_calls == 1
+
+    times["now"] += 59  # 冷却期内：不再碰 Redis
+    assert limiter.check("k") is None
+    assert client.eval_calls == 1
+
+    client.fail = False
+    times["now"] += 2  # 冷却到期：自动重试成功并恢复共享计数
+    assert limiter.check("k") is None
+    assert client.eval_calls == 2
+    assert limiter.degraded is False
+    print("✓ Redis 限流冷却到期后自动恢复")
+
+
 def test_create_rate_limiter_backends():
     memory = create_rate_limiter("unit", 1, 60)
     assert isinstance(memory, RateLimiter)

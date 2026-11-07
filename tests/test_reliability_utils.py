@@ -186,6 +186,29 @@ def test_json_formatter_sanitizes_any_message():
     print("✓ JSON 日志格式化器清洗任意日志消息")
 
 
+def test_json_formatter_includes_exc_info():
+    """带异常栈的日志记录输出 exc_info 字段（单行 JSON）。"""
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        exc_info = sys.exc_info()
+    record = logging.LogRecord(
+        "unit",
+        logging.ERROR,
+        __file__,
+        1,
+        "处理失败：%s",
+        ("boom",),
+        exc_info,
+    )
+    line = JsonLogFormatter().format(record)
+    assert len(line.splitlines()) == 1
+    parsed = json.loads(line)
+    assert "ZeroDivisionError" in parsed["exc_info"]
+    assert "Traceback" in parsed["exc_info"]
+    print("✓ JSON 日志包含异常栈且保持单行")
+
+
 def test_release_probe_returns_half_open_slot(monkeypatch):
     """归还半开名额：试探被取消后其它请求可立即重试；已记录后不再放行。"""
     times = {"now": 100.0}
