@@ -178,6 +178,28 @@ def test_numbered_colon_headings_merged_with_body():
     print("✓ 编号 / 冒号标题并入正文")
 
 
+def test_merge_edge_branches():
+    """合并器边界：先刷出缓冲再切长单元、超长标题块与挂起块、尾部挂起并入。"""
+    from utils.text_chunker import _merge_short_chunks, _split_long_paragraph
+
+    # 短句缓冲 + 超长无句读单元：缓冲先单独成块，长单元再硬切
+    pieces = _split_long_paragraph("短句。" + "长" * 25, 10)
+    assert pieces[0] == "短句。"
+    assert all(len(piece) <= 10 for piece in pieces[1:])
+
+    # 已挂起短标题时遇到「本身超长」的目录式标题块：挂起块先落下，
+    # 超长标题块按上限切开而不是整体挂起
+    oversized_titles = "\n".join(f"标题{i}" for i in range(20))
+    merged = _merge_short_chunks(["目录一", oversized_titles], min_chars=30, max_chars=10)
+    assert merged[0] == "目录一"
+    assert all(len(chunk) <= 10 for chunk in merged), max(len(c) for c in merged)
+
+    # 循环结束时仍有挂起标题：并入上一块
+    merged = _merge_short_chunks(["正文内容。", "尾部标题"], min_chars=30)
+    assert merged == ["正文内容。\n尾部标题"]
+    print("✓ 合并器边界分支（缓冲刷出 / 超长标题块 / 尾部挂起）")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -192,4 +214,5 @@ if __name__ == "__main__":
     test_unpunctuated_sentence_hard_split()
     test_title_only_text_becomes_single_chunk()
     test_numbered_colon_headings_merged_with_body()
+    test_merge_edge_branches()
     print("\n全部通过")
