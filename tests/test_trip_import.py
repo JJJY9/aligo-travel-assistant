@@ -11,9 +11,12 @@ import tempfile
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
+import pytest
+
 import cli
 from context import storage
-from utils.trip_import import parse_trips_csv
+from utils.trip_export import render_trips_ics
+from utils.trip_import import parse_trips_csv, parse_trips_ics
 
 
 class _ImportStore:
@@ -56,6 +59,12 @@ class _ImportStore:
 def _write_csv(text: str) -> str:
     path = os.path.join(tempfile.mkdtemp(prefix="chailv_import_"), "trips.csv")
     io.open(path, "w", encoding="utf-8-sig").write(text)
+    return path
+
+
+def _write_ics(text: str) -> str:
+    path = os.path.join(tempfile.mkdtemp(prefix="chailv_import_"), "trips.ics")
+    io.open(path, "w", encoding="utf-8-sig", newline="").write(text)
     return path
 
 
@@ -197,21 +206,201 @@ def test_runner_rejects_gbk_csv(monkeypatch):
     assert payload["ok"] is False and "UTF-8" in payload["error"]
     print("✓ GBK CSV 友好报错")
 
-if __name__ == "__main__":
-    import pytest
 
+def test_ics_roundtrip_matches_export():
+    trips = [
+        {
+            "trip_id": "t1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-11-10",
+            "end_date": "2026-11-12",
+            "purpose": "客户会议",
+        },
+        {
+            "trip_id": "t2",
+            "origin": "杭州",
+            "destination": "成都",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-01",
+            "purpose": "会议,对接",  # ASCII 逗号：导出转义、导入还原
+        },
+    ]
+    rows, errors = parse_trips_ics(render_trips_ics(trips, "u1"))
+    assert errors == []
+    assert rows == [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-11-10",
+            "end_date": "2026-11-12",
+            "purpose": "客户会议",
+        },
+        {
+            "origin": "杭州",
+            "destination": "成都",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-01",
+            "purpose": "会议,对接",
+        },
+    ], rows
+    print("✓ ICS 导出→导入往返保真（多日 / 单日 / 转义逗号）")
+
+
+def test_ics_unfold_and_lf_only():
+    purpose = "超长目的说明" * 12  # > 75 字节，SUMMARY / DESCRIPTION 必然折行
+    trips = [
+        {
+            "trip_id": "t1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-11-10",
+            "end_date": "2026-11-10",
+            "purpose": purpose,
+        }
+    ]
+    text = render_trips_ics(trips, "u1")
+    assert "\r\n " in text, "导出端应折行"
+    # LF-only 的日历文件（部分工具就是这样写出的）同样可解析
+    rows, errors = parse_trips_ics(text.replace("\r\n", "\n"))
+    assert errors == []
+    assert rows[0]["purpose"] == purpose, "折行拼接后文本必须完整"
+    assert rows[0]["destination"] == "上海"
+    print("✓ ICS 折行展开与 LF-only 文件")
+
+
+def test_ics_collects_invalid_events():
+    text = (
+        "BEGIN:VCALENDAR\nVERSION:2.0\n"
+        "BEGIN:VEVENT\n"
+        "DTSTART;VALUE=DATE:20261110\n"
+        "SUMMARY:北京 → 上海（出差）\n"
+        "END:VEVENT\n"
+        "BEGIN:VEVENT\n"
+        "SUMMARY:没有日期的会议\n"
+        "END:VEVENT\n"
+        "END:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert len(rows) == 1 and rows[0]["destination"] == "上海"
+    assert errors[0][0] == 2 and "DTSTART" in errors[0][1]
+
+    rows, errors = parse_trips_ics("BEGIN:VCALENDAR\nEND:VCALENDAR\n")
+    assert rows == [] and "未找到 VEVENT" in errors[0][1]
+    print("✓ ICS 非法事件收集错误而不中断")
+
+
+def test_ics_external_summary_fallback():
+    """外部日历的普通事件：无「出发地 → 目的地」结构时以 SUMMARY 为目的地。"""
+    text = (
+        "BEGIN:VCALENDAR\nVERSION:2.0\n"
+        "BEGIN:VEVENT\n"
+        "DTSTART;VALUE=DATE:20261110\n"
+        "DTEND;VALUE=DATE:20261111\n"
+        "SUMMARY:外部日历事件\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert errors == []
+    assert rows == [
+        {
+            "origin": "",
+            "destination": "外部日历事件",
+            "start_date": "2026-11-10",
+            "end_date": "2026-11-10",  # 排他 DTEND=次日 → 单日
+            "purpose": "出差",
+        }
+    ], rows
+    print("✓ ICS 外部事件 SUMMARY 回退")
+
+
+def test_runner_imports_ics_and_dedupes(monkeypatch):
+    store = _ImportStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    trips = [
+        {
+            "trip_id": "t1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        }
+    ]
+    path = _write_ics(render_trips_ics(trips, "u-ics"))
+
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone(
+            "u-ics", path, as_json=True, as_ics=True
+        )
+    finally:
+        sys.stdout = real_stdout
+    payload = json.loads(captured.getvalue())
+    assert code == 0 and payload["format"] == "ics"
+    assert payload["created"] == 1 and payload["skipped"] == []
+
+    # 不传 --ics 时按内容（BEGIN:VCALENDAR）自动识别；重复导入只更新
+    captured = io.StringIO()
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone("u-ics", path, as_json=True)
+    finally:
+        sys.stdout = real_stdout
+    payload = json.loads(captured.getvalue())
+    assert code == 0 and payload["format"] == "ics"
+    assert payload["created"] == 0 and payload["updated"] == 1
+    assert len(store.trips) == 1 and store.saved[-1]["end_date"] == "2026-12-03"
+    print("✓ ICS 导入 + 自动识别 + 去重")
+
+
+def test_runner_dispatch_ics(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_trips_import_standalone",
+        lambda user_id, path, as_json=False, as_ics=False: (
+            calls.append((user_id, path, as_json, as_ics)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips-import", "u1", "x.ics", "--ics", "--json"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "x.ics", True, True)
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "trips-import", "u1", "--ics"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    print("✓ trips-import dispatch --ics")
+
+
+if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
     test_parse_missing_columns_and_empty()
+    test_ics_roundtrip_matches_export()
+    test_ics_unfold_and_lf_only()
+    test_ics_collects_invalid_events()
+    test_ics_external_summary_fallback()
     for case in (
         test_runner_imports_and_dedupes,
         test_runner_json_output_and_skipped,
         test_runner_errors,
+        test_runner_rejects_gbk_csv,
+        test_runner_imports_ics_and_dedupes,
+        test_runner_dispatch_ics,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
-        test_runner_rejects_gbk_csv(mp)
     print("\n全部通过")
