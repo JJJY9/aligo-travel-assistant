@@ -597,6 +597,9 @@ function refreshEditButtons() {
   if (!last) return;
   const bubble = last.querySelector(".bubble");
   if (!bubble || bubble.querySelector(".user-edit-form")) return;
+  // 该轮提问没有成功写入服务端历史（停止 / 失败在成功落库之前）：
+  // 编辑会对服务端「上一轮已保存问答」发起删除，同文重复提问时误删旧问答
+  if (last.dataset.transient === "1") return;
   const foot = document.createElement("div");
   foot.className = "msg-foot user-edit";
   foot.appendChild(
@@ -876,11 +879,16 @@ function formatUsage(usage, elapsed) {
 }
 
 async function deleteLastTurn(expect) {
+  // expect 放在 JSON body：CLI / 备份导入产生的长提问没有 4000 字上限，
+  // 放进查询串会撞 FastAPI max_length（且 percent-encoding 会超过 h11
+  // 请求行上限）；DELETE + 查询串仍保留给外部 API 兼容
   const result = await getJSON(
-    `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn?user_id=${encodeURIComponent(
-      state.userId,
-    )}&expect=${encodeURIComponent(expect)}`,
-    { method: "DELETE" },
+    `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: state.userId, expect }),
+    },
   );
   return Boolean(result && result.mismatch);
 }
@@ -2350,6 +2358,19 @@ async function sendMessage(text, options = {}) {
     }
   } finally {
     state.controller = null;
+    // 成功完成（done）才把本轮提问视为已写入服务端历史；停止 / 失败 / 中断
+    // 的提问没有落库，标记后不再显示「编辑」入口
+    if (state.sessionId) {
+      const users = els.messages.querySelectorAll(".msg.user");
+      const lastUser = users[users.length - 1];
+      if (lastUser) {
+        if (terminal === "done") {
+          delete lastUser.dataset.transient;
+        } else {
+          lastUser.dataset.transient = "1";
+        }
+      }
+    }
     setBusy(false);
     refreshEditButtons();
     // 只保留最新一条回答的「重新生成」：旧按钮对应的已不是最后一轮，
