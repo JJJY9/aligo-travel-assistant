@@ -522,7 +522,7 @@ python cli.py
 
 用户数据概览（不进入交互）：`python cli.py stats <user_id> [--json]` 汇总偏好条数、行程统计（总行程 / 出行天数 / 到访城市 / 进行中 / 即将出行）与会话 / 消息 / 归档数量，与 Web 记忆面板同口径。
 
-全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`；中文或超长用户名会追加短哈希避免重名；按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1）。
+全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force] [--html]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`），`--html` 导出独立 HTML 合集（单文件内嵌样式、全部内容转义，默认 `.html` 后缀，与单会话 `session-export --html` 同一渲染口径）；中文或超长用户名会追加短哈希避免重名；按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1。
 
 环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）；`python cli.py doctor --json` 输出机器可读的 `status` / `checks`，便于监控脚本解析，退出码不变；`--offline`（或 `--no-network`）跳过 LLM 连通性检查，适合网络不可达或 CI 环境。
 

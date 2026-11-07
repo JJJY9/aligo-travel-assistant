@@ -95,6 +95,41 @@ def test_export_to_file_and_overwrite_protection(monkeypatch):
     print("✓ sessions-export 写入文件 / 默认拒绝覆盖 / --force")
 
 
+def test_export_html_bundle(monkeypatch):
+    """--html：全部会话渲染为独立 HTML，标题与正文只转义一次。"""
+    store = _FakeStore(
+        [
+            _msg(
+                "user",
+                "<script>alert(1)</script> 与 & 符号",
+                "exp-a",
+                "2026-11-01T10:00:00",
+            ),
+            _msg("assistant", "回答一", "exp-a", "2026-11-01T10:01:00"),
+            _msg("user", "第二问：杭州行程", "exp-b", "2026-11-02T10:00:00"),
+        ],
+        titles={"exp-b": "预算<5000 对比 A>B"},
+    )
+    code, out = _run(monkeypatch, store, "u-export", to_stdout=True, html=True)
+    assert code == 0
+    assert out.startswith("<!doctype html>")
+    assert "<title>Aligo 会话导出</title>" in out
+    assert "全部会话（2 个）" in out
+    assert "<h2>预算&lt;5000 对比 A&gt;B</h2>" in out
+    assert "&amp;lt;" not in out, "标题只应转义一次"
+    assert "&lt;script&gt;alert(1)&lt;/script&gt; 与 &amp; 符号" in out
+    assert "会话 exp-a · 2 条消息" in out
+
+    # 默认后缀：--html 时写 .html
+    import tempfile
+
+    monkeypatch.chdir(tempfile.mkdtemp())
+    code, out = _run(monkeypatch, store, "u-export", None, False, False, True)
+    assert code == 0 and "已导出 2 个会话" in out
+    assert os.path.exists(os.path.join("exports", "aligo_sessions_u-export.html"))
+    print("✓ sessions-export --html 合集导出与单次转义")
+
+
 def test_export_without_sessions(monkeypatch):
     code, out = _run(monkeypatch, _FakeStore([]), "u-export")
     assert code == 1 and "没有可导出的会话" in out
@@ -138,8 +173,8 @@ def test_export_rejects_bad_user_id(monkeypatch):
 def test_dispatch_strict(monkeypatch):
     calls = []
 
-    def fake(user, target=None, to_stdout=False, force=False):
-        calls.append((user, target, to_stdout, force))
+    def fake(user, target=None, to_stdout=False, force=False, html=False):
+        calls.append((user, target, to_stdout, force, html))
         return 0
 
     monkeypatch.setattr(cli, "run_sessions_export_standalone", fake)
@@ -154,7 +189,15 @@ def test_dispatch_strict(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls == [("u1", None, True, False)]
+    assert calls == [("u1", None, True, False, False)]
+
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "sessions-export", "u1", "out.html", "--html"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "out.html", False, False, True), "--html 必须传给导出实现"
 
     for argv in (
         ["cli.py", "sessions-export"],
@@ -174,6 +217,7 @@ if __name__ == "__main__":
     for case in (
         test_export_to_stdout,
         test_export_to_file_and_overwrite_protection,
+        test_export_html_bundle,
         test_export_without_sessions,
         test_export_failures,
         test_export_rejects_bad_user_id,
