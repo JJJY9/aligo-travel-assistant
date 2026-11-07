@@ -176,6 +176,7 @@ const els = {
   trips: byId("trips"),
   exportTrips: byId("exportTrips"),
   exportTripsCsv: byId("exportTripsCsv"),
+  exportTripsHtml: byId("exportTripsHtml"),
   addTripBtn: byId("addTripBtn"),
   expandTrips: byId("expandTrips"),
   tripFilterRow: byId("tripFilterRow"),
@@ -2720,6 +2721,7 @@ function renderOverview() {
     els.upcoming.hidden = true;
     els.exportTrips.hidden = true;
     els.exportTripsCsv.hidden = true;
+    els.exportTripsHtml.hidden = true;
     els.expandTrips.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
@@ -2930,6 +2932,7 @@ function renderOverview() {
 
   els.exportTrips.hidden = !trips.length;
   els.exportTripsCsv.hidden = !trips.length;
+  els.exportTripsHtml.hidden = !trips.length;
   const tripTotal = Number(status.trip_count || trips.length);
   els.expandTrips.hidden = !state.tripsExpanded && tripTotal <= 5;
   els.expandTrips.textContent = state.tripsExpanded
@@ -4729,15 +4732,23 @@ function bindEvents() {
       "aligo_trips.ics",
     );
   });
-  els.exportTripsCsv.addEventListener("click", () => {
+  const exportTripsWithQuery = (format, filename) => {
     // 与列表同口径：展开视图下的筛选词随导出一起提交（服务端支持 q），
-    // 否则筛选后的「导出 CSV」会包含被筛掉的全部行程
+    // 否则筛选后的导出会包含被筛掉的全部行程
     const query = state.tripsExpanded ? state.tripsFilter.trim() : "";
     const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
+    const formatParam = format ? `&format=${format}` : "";
     downloadFromApi(
-      `/api/trips/export?user_id=${encodeURIComponent(state.userId)}${suffix}`,
-      "aligo_trips.csv",
+      `/api/trips/export?user_id=${encodeURIComponent(state.userId)}${suffix}${formatParam}`,
+      filename,
     );
+  };
+  els.exportTripsCsv.addEventListener("click", () => {
+    exportTripsWithQuery("", "aligo_trips.csv");
+  });
+  els.exportTripsHtml.addEventListener("click", () => {
+    // 可打印 / 分享的报销台账（与 CLI trips-export --html 同一渲染口径）
+    exportTripsWithQuery("html", "aligo_trips.html");
   });
   if (els.kbExport) {
     els.kbExport.addEventListener("click", (event) => {

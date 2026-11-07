@@ -42,7 +42,9 @@ def _trip(destination="上海", start="2026-12-05", end="2026-12-07"):
     }
 
 
-def _run(user_id, target=None, to_stdout=False, force=False, ics=False, query=""):
+def _run(
+    user_id, target=None, to_stdout=False, force=False, ics=False, query="", html=False
+):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_trips_export_standalone(
@@ -52,6 +54,7 @@ def _run(user_id, target=None, to_stdout=False, force=False, ics=False, query=""
             force=force,
             ics=ics,
             query=query,
+            html=html,
         )
     return code, buf.getvalue()
 
@@ -270,6 +273,49 @@ def test_main_dispatch(monkeypatch):
     print("✓ dispatch 层 trips-export 正常执行")
 
 
+def test_export_html(monkeypatch):
+    """--html 导出台账：可打印页面、内容全部转义。"""
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    fake = _FakeStore([_trip(destination="<上海>")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    target = os.path.join(workdir, "trips.html")
+    code, out = _run("u1", target=target, html=True)
+    assert code == 0 and "（HTML）" in out
+    content = io.open(target, encoding="utf-8").read()
+    assert content.startswith("<!doctype html>")
+    assert "&lt;上海&gt;" in content and "<上海>" not in content
+    print("✓ trips-export --html 台账导出")
+
+
+def test_main_dispatch_html_and_conflict(monkeypatch):
+    """dispatch 层 --html 正常执行；与 --ics 互斥返回用法错误。"""
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    fake = _FakeStore([_trip()])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips-export", "u1", "--html", "--force"]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_trips.html"))
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips-export", "u1", "--html", "--ics"]
+    )
+    with contextlib.redirect_stdout(io.StringIO()), pytest.raises(
+        SystemExit
+    ) as conflict:
+        cli.main()
+    assert conflict.value.code == 2
+    print("✓ dispatch 层 --html 正常 / 与 --ics 互斥")
+
+
 def test_main_dispatch_query(monkeypatch):
     import tempfile
 
@@ -306,6 +352,8 @@ if __name__ == "__main__":
         test_parse_export_args_ics_flag,
         test_main_dispatch_ics,
         test_main_dispatch_query,
+        test_export_html,
+        test_main_dispatch_html_and_conflict,
     ):
         mp = pytest.MonkeyPatch()
         try:

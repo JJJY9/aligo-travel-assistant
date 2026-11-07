@@ -84,7 +84,12 @@ from utils.trip_conflicts import find_saved_trip as _find_saved_trip
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
-from utils.trip_export import render_trip_ics, render_trips_csv, render_trips_ics
+from utils.trip_export import (
+    render_trip_ics,
+    render_trips_csv,
+    render_trips_html,
+    render_trips_ics,
+)
 from utils.travel_stats import summarize_travel
 from utils.timestamps import chronological_key
 from utils.turn_meta import extract_turn_meta
@@ -3092,24 +3097,35 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/trips/export")
-    def export_trips_csv(
+    def export_trips_file(
         user_id: str = Query(..., pattern=_ID_PATTERN),
         q: str = Query(default="", max_length=100),
+        format: Literal["csv", "html"] = Query(default="csv"),
     ) -> Response:
-        """导出历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）。
+        """导出历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）或 HTML 台账。
 
-        ``q`` 与列表接口同一口径过滤后再导出。
+        ``q`` 与列表接口同一口径过滤后再导出；``format=html`` 与 CLI
+        ``trips-export --html`` 同一渲染口径（可打印 / 分享、内容转义）。
         """
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
-            logger.warning("导出行程 CSV 失败: %s", exc)
+            logger.warning("导出行程失败: %s", exc)
             raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
         finally:
             _close_long_term(store)
+        filtered = _filter_trips_by_query(trips, q)
+        if format == "html":
+            return Response(
+                content=render_trips_html(filtered, user_id),
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Content-Disposition": 'attachment; filename="aligo_trips.html"'
+                },
+            )
         return Response(
-            content=render_trips_csv(_filter_trips_by_query(trips, q)),
+            content=render_trips_csv(filtered),
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="aligo_trips.csv"'},
         )
