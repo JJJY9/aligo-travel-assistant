@@ -166,12 +166,19 @@ async def run_health_check(
             timeout=timeout_sec,
             temperature=0,
             max_tokens=8,
+            # 关掉 SDK 内建重试：timeout_sec 是本次健康检查的整体预算，
+            # 默认 max_retries=2 会让 10 秒检查实际阻塞 30 秒以上
+            max_retries=0,
         )
         # 最小请求：必须返回非空文本才算可用。部分兼容网关以 HTTP 200
         # 返回错误对象，SDK 不抛异常、choices 为空，只看“未抛错”会误报健康
-        reply = await model([{"role": "user", "content": "1"}])
+        reply = await asyncio.wait_for(
+            model([{"role": "user", "content": "1"}]), timeout=timeout_sec
+        )
         if not _response_text(reply).strip():
             return False, "模型返回空响应（请检查密钥 / 网关日志）"
         return True, "ok"
+    except asyncio.TimeoutError:
+        return False, f"健康检查超时（{timeout_sec:.1f}s）"
     except Exception as e:
         return False, str(e)
