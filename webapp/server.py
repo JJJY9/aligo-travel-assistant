@@ -755,6 +755,22 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
         )
+        # 备份导入的面板循环按 200 条/批调用导入接口：沿用知识库 60 次/分钟
+        # 会让数万条的备份在窗口内必然 429，且重试时前几十批都是快速跳过的
+        # 已存在内容、永远卡在同一位置——导入单独用更大的桶（6 批/秒）
+        raw_import_limit = RATE_LIMIT_CONFIG.get("kb_import_requests", 1200)
+        import_limit = (
+            int(raw_import_limit)
+            if isinstance(raw_import_limit, (int, float))
+            else 1200
+        )
+        self.import_limiter = create_rate_limiter(
+            "kb_import",
+            import_limit,
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
+            client_factory=redis_factory,
+        )
         # 天气接口每次未命中会上游发两次请求；按客户端 IP 限流，
         # 保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度
         self.weather_limiter = create_rate_limiter(
@@ -1112,6 +1128,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         "user_limit": state.rate_limiter.limit,
         "ip_limit": state.ip_limiter.limit,
         "kb_limit": state.kb_limiter.limit,
+        "kb_import_limit": state.import_limiter.limit,
         "weather_limit": state.weather_limiter.limit,
         "window_sec": state.rate_limiter.window_sec,
     }
@@ -1173,6 +1190,31 @@ def _enforce_rate_limit(
         limit, remaining, reset = state.rate_limiter.limit, remaining_user, reset_user
     return {
         "X-RateLimit-Limit": str(limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
+
+
+def _enforce_import_rate_limit(state: AligoWebApp, request: Request) -> dict[str, str]:
+    """备份导入接口的独立限流（比知识库维护接口更宽松，按客户端 IP）。"""
+    client = _rate_identity(_client_host(request))
+    retry_after = state.import_limiter.check(client)
+    if retry_after is not None:
+        wait_seconds = max(1, math.ceil(retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail=f"导入过于频繁，请约 {wait_seconds} 秒后重试"
+            f"（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(state.import_limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+    remaining, reset = state.import_limiter.status(client)
+    return {
+        "X-RateLimit-Limit": str(state.import_limiter.limit),
         "X-RateLimit-Remaining": str(remaining),
         "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
     }
@@ -2069,7 +2111,7 @@ def create_app(model: Any = None) -> FastAPI:
 
         ``dry_run=1`` 时只校验 / 去重并返回 ``would_import``，不写库。
         """
-        response.headers.update(_enforce_kb_rate_limit(state, request))
+        response.headers.update(_enforce_import_rate_limit(state, request))
         try:
             return import_documents(payload.documents, dry_run=dry_run)
         except FileNotFoundError as exc:
@@ -2087,7 +2129,7 @@ def create_app(model: Any = None) -> FastAPI:
         payload: KnowledgeImportPreviewPayload, request: Request, response: Response
     ) -> dict[str, Any]:
         """预览导入（不写库）：整个备份一次校验 / 去重，返回将导入 / 跳过的数量。"""
-        response.headers.update(_enforce_kb_rate_limit(state, request))
+        response.headers.update(_enforce_import_rate_limit(state, request))
         try:
             return import_documents(payload.documents, dry_run=True)
         except FileNotFoundError as exc:

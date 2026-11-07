@@ -2897,6 +2897,7 @@ def test_metrics_api():
         assert rate["degraded"] is False
         assert rate["user_limit"] >= 1 and rate["ip_limit"] >= 1
         assert rate["kb_limit"] >= 1
+        assert rate["kb_import_limit"] >= 60
         assert rate["weather_limit"] >= 1
         assert rate["window_sec"] > 0
         print("✓ /api/metrics 请求指标")
@@ -5845,9 +5846,40 @@ def test_import_uses_dedicated_executor(monkeypatch):
     print("✓ 备份恢复使用专用执行器")
 
 
+def test_knowledge_import_uses_dedicated_limiter(monkeypatch):
+    """备份导入使用更宽松的独立限流桶（面板分批循环不再必然 429）。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.import_limiter = RateLimiter(limit=1, window_sec=60)
+    monkeypatch.setattr(
+        server_module,
+        "import_documents",
+        lambda documents, dry_run=False: {
+            "imported": 0,
+            "skipped": 0,
+            "skipped_invalid": 0,
+            "skipped_duplicate": 0,
+            **({"would_import": 0} if dry_run else {}),
+        },
+    )
+    client = TestClient(app)
+    payload = {"documents": [{"content": "x"}]}
+    first = client.post("/api/knowledge/import/preview", json=payload)
+    assert first.status_code == 200
+    assert first.headers["x-ratelimit-limit"] == "1"
+    second = client.post("/api/knowledge/import/preview", json=payload)
+    assert second.status_code == 429
+    assert "导入过于频繁" in second.json()["detail"]
+    print("✓ 备份导入走独立限流桶")
+
+
 if __name__ == "__main__":
     test_index_page()
     test_route_path_normalization()
+    test_knowledge_import_uses_dedicated_limiter(pytest.MonkeyPatch())
     test_metrics_streaming_and_sse_errors()
     test_rate_identity_ipv6_aggregation()
     test_health_endpoint()
