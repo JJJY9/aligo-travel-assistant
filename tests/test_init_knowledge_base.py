@@ -358,6 +358,118 @@ def test_add_in_batches_retries_and_reports(monkeypatch):
         module._add_in_batches(Broken(), rows, "补写")
     print("✓ 分批补写重试与失败进度")
 
+def test_batch_by_group_keeps_groups_together():
+    """批大小达到上限时只在组边界切批：多分片文档整组进同一批。"""
+    module = _load_init_module()
+    singles = [{"content": f"s{i}", "metadata": {}} for i in range(200)]
+    group = [
+        {"content": f"g{i}", "metadata": {"group": "G", "part": i + 1, "parts": 3}}
+        for i in range(3)
+    ]
+    batches = module._batch_by_group(singles + group, 200)
+    assert [len(batch) for batch in batches] == [200, 3], batches
+    assert all(
+        batch["metadata"].get("group") == "G" for batch in batches[1]
+    ), "组不能跨批"
+    print("✓ 分批按组边界切分")
+
+
+def test_preserved_backup_helpers_roundtrip(monkeypatch):
+    """备份写入/并入/损坏容错：保留片段落盘后可原样读回并去重。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "data" / "rag_knowledge"
+        base.mkdir(parents=True)
+        docs = [
+            {"content": "面板片段", "metadata": {"category": "住宿"}},
+            {
+                "content": "分片",
+                "metadata": {"group": "G", "part": 1, "parts": 1},
+            },
+        ]
+        path = module._write_preserved_backup(base, docs)
+        assert path is not None and path.exists()
+        merged, notes = module._merge_preserved_backup(
+            base, [{"content": "面板片段 ", "metadata": {}}]
+        )
+        assert notes and "已并入" in notes[0]
+        contents = [doc["content"].strip() for doc in merged]
+        assert contents.count("面板片段") == 1, "单条按 strip 内容去重"
+        assert "分片" in contents
+
+        path.write_text("not-json", encoding="utf-8")
+        merged, notes = module._merge_preserved_backup(base, docs)
+        assert notes and "不可读" in notes[0]
+        assert merged == docs
+    print("✓ 保留片段备份写读与容错")
+
+
+def test_preserved_backup_survives_failed_restore(monkeypatch):
+    """写入失败时保留片段已落盘；重跑自动并入补写，成功后清理备份。"""
+    module = _load_init_module()
+    import utils.knowledge_admin as admin_module
+
+    monkeypatch.setattr(
+        admin_module,
+        "export_documents",
+        lambda: [{"content": "面板加的片段", "metadata": {"category": "住宿"}}],
+    )
+
+    class _ExistingMilvus(_FakeMilvus):
+        def __init__(self):
+            self.dropped = []
+
+        def has_collection(self, name):
+            return True
+
+        def drop_collection(self, name):
+            self.dropped.append(name)
+
+        def create_collection(self, **kwargs):
+            pass
+
+    class _FailingRestoreAgent(_RebuildAgent):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.milvus_client = _ExistingMilvus()
+
+        def add_documents(self, documents):
+            if any(
+                str(doc.get("content") or "").startswith("面板加的片段")
+                for doc in documents
+            ):
+                return {"status": "error", "message": "Milvus 故障"}
+            return super().add_documents(documents)
+
+    class _SuccessRestoreAgent(_RebuildAgent):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.milvus_client = _ExistingMilvus()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        backup = module._preserved_backup_path(
+            module.current_dir.parent / "data" / "rag_knowledge"
+        )
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", _FailingRestoreAgent)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 1, out.getvalue()
+        assert backup.exists(), "补写失败后保留片段必须留盘"
+        assert str(backup) in out.getvalue()
+
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", _SuccessRestoreAgent)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 0, out.getvalue()
+        assert "已并入上次" in out.getvalue()
+        assert not backup.exists(), "补写成功后应清理备份"
+    print("✓ 保留片段备份：失败留盘、重跑补齐、成功后清理")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -369,8 +481,11 @@ if __name__ == "__main__":
         test_dimension_mismatch_rebuilds(_mp)
         test_preserved_semantics_by_source(_mp)
         test_export_failure_aborts_before_drop(_mp)
+        test_preserved_backup_helpers_roundtrip(_mp)
+        test_preserved_backup_survives_failed_restore(_mp)
     finally:
         _mp.undo()
     test_multi_chunk_documents_carry_group_metadata()
+    test_batch_by_group_keeps_groups_together()
     test_add_in_batches_retries_and_reports(pytest.MonkeyPatch())
     print("\n全部通过")
