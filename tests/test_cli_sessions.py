@@ -896,7 +896,9 @@ def test_main_accepts_valid_flags(monkeypatch):
     print("✓ dispatch 层合法参数正常执行")
 
 
-def _run_export(user_id, session_id, target=None, to_stdout=False, force=False):
+def _run_export(
+    user_id, session_id, target=None, to_stdout=False, force=False, html=False
+):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_session_export_standalone(
@@ -905,6 +907,7 @@ def _run_export(user_id, session_id, target=None, to_stdout=False, force=False):
             target=target,
             to_stdout=to_stdout,
             force=force,
+            html=html,
         )
     return code, buf.getvalue()
 
@@ -985,6 +988,81 @@ def test_session_export_flag_parsing():
     assert cli._parse_export_args(["--ics"]) is None, "会话导出不接受 --ics"
     assert cli._parse_export_args(["--query", "x"]) is None, "会话导出不接受 --query"
     print("✓ session-export 参数解析（--stdout / --ics / --query 与路径冲突被拒绝）")
+
+
+def test_session_export_html(monkeypatch):
+    """--html：单文件 HTML、转义注入内容、默认后缀 .html。"""
+    import tempfile
+
+    class _HtmlStore(_FakeStore):
+        pass
+
+    fake = _HtmlStore(
+        [
+            _message("user", "<script>alert(1)</script> 与 & 符号", "s-html"),
+            _message("assistant", '{"reply": "回答 <b>加粗</b>"}', "s-html", "2026-11-04T10:02:00"),
+        ],
+        titles={"s-html": "HTML 导出"},
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    target = os.path.join(tempfile.mkdtemp(), "session.html")
+    code, out = _run_export("u1", "s-html", target=target, html=True)
+    assert code == 0 and "已导出会话 s-html" in out
+    with open(target, encoding="utf-8") as handle:
+        text = handle.read()
+    assert text.startswith("<!doctype html>")
+    assert "<title>HTML 导出</title>" in text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text, "用户内容必须转义"
+    assert "<script>alert(1)</script>" not in text
+    assert "回答 &lt;b&gt;加粗&lt;/b&gt;" in text
+    assert 'class="msg user"' in text and 'class="msg assistant"' in text
+
+    # 默认文件名后缀为 .html（在临时目录内验证）
+    monkeypatch.chdir(tempfile.mkdtemp())
+    code, out = _run_export("u1", "s-html", html=True)
+    assert code == 0
+    assert os.path.exists(os.path.join("exports", "aligo_s-html.html"))
+    print("✓ session-export --html 转义与默认后缀")
+
+
+def test_session_export_html_flag_parsing():
+    assert cli._parse_session_export_args([]) == (None, False, False, False)
+    assert cli._parse_session_export_args(["out.html"]) == (
+        "out.html",
+        False,
+        False,
+        False,
+    )
+    assert cli._parse_session_export_args(["--html"]) == (None, False, False, True)
+    assert cli._parse_session_export_args(["--stdout", "--html"]) == (
+        None,
+        True,
+        False,
+        True,
+    )
+    assert cli._parse_session_export_args(["out.html", "--stdout"]) is None
+    assert cli._parse_session_export_args(["a", "b"]) is None
+    assert cli._parse_session_export_args(["--bad"]) is None
+    print("✓ session-export --html 参数解析")
+
+
+def test_session_export_html_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_session_export_standalone",
+        lambda user_id, session_id, target=None, to_stdout=False, force=False, html=False: (
+            calls.append((user_id, session_id, target, to_stdout, force, html)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "session-export", "u1", "s1", "out.html", "--html"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "s1", "out.html", False, False, True)
+    print("✓ session-export dispatch --html")
 
 
 def test_session_export_refuses_overwrite(monkeypatch):
@@ -1123,6 +1201,7 @@ def test_sessions_query_matches_rendered_assistant_content(monkeypatch):
 if __name__ == "__main__":
     test_flag_parsing_helpers()
     test_session_export_flag_parsing()
+    test_session_export_html_flag_parsing()
     test_main_rejects_bad_usage(pytest.MonkeyPatch())
     for case in (
         test_lists_active_sessions,
@@ -1153,6 +1232,8 @@ if __name__ == "__main__":
         test_session_export_to_stdout,
         test_session_export_missing_and_invalid,
         test_session_export_refuses_overwrite,
+        test_session_export_html,
+        test_session_export_html_dispatch,
         test_session_export_default_path,
         test_main_session_export_dispatch,
         test_read_failure,
