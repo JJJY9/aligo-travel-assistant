@@ -533,6 +533,12 @@ class SessionArchivePayload(BaseModel):
     archived: bool
 
 
+class UserImportPayload(BaseModel):
+    """恢复用户备份：``/api/export`` 导出的 JSON 对象原样放在 backup 字段。"""
+
+    backup: dict[str, Any]
+
+
 class _WebSession:
     """一个浏览器会话（对应一个 ConversationRuntime）。"""
 
@@ -1555,7 +1561,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        # 入口页必须每次重新验证：缓存的旧 index.html 搭配新 app.js（新增
+        # DOM id）会让 bindEvents 找不到元素、整页脚本中止；ETag 命中时
+        # 重验证只回 304，开销可以忽略
+        return FileResponse(
+            STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"}
+        )
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -2950,6 +2961,40 @@ def create_app(model: Any = None) -> FastAPI:
                 "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"'
             },
         )
+
+    @app.post("/api/import")
+    def user_data_import(
+        payload: UserImportPayload,
+        request: Request,
+        response: Response,
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        """从 ``/api/export`` 的 JSON 备份恢复用户数据（面板「恢复备份」）。
+
+        恢复偏好 / 行程 / 聊天消息 / 会话标题与置顶归档；重复导入幂等
+        （行程按路线+日期去重、消息按「会话/角色/内容」多重集去重）。
+        PostgreSQL 配置但不可用时用 strict 打开返回 503——恢复不能写进
+        回退的本地 JSON，否则数据库恢复后数据"消失"。
+        """
+        from utils.user_import import import_user_data, parse_user_export_data
+
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        sections, errors = parse_user_export_data(payload.backup)
+        if not sections:
+            detail = "；".join(errors[:3]) or "没有可恢复的数据"
+            raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
+        store = _open_long_term(user_id, strict=True)
+        try:
+            counts = import_user_data(store, sections)
+        except MemoryPersistenceError as exc:
+            logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+            raise HTTPException(status_code=503, detail="存储暂时不可用，请稍后重试") from exc
+        except Exception as exc:  # noqa: BLE001 - 写入失败统一可重试提示
+            logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+            raise HTTPException(status_code=503, detail=f"恢复失败：{exc}") from exc
+        finally:
+            _close_long_term(store)
+        return {"ok": True, **counts, "skipped": errors}
 
     return app
 

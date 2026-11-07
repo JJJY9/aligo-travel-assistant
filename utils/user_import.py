@@ -38,15 +38,20 @@ def _clean_iso_timestamp(value: Any) -> str | None:
 
 
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
-    """解析并校验 user-export JSON，返回 ``(可恢复数据, 错误列表)``。
-
-    可恢复数据键：preferences / trips / messages / titles / pinned / archived。
-    没有任何可恢复数据时返回空 dict（错误列表说明原因）。
-    """
+    """解析并校验 user-export JSON 文本，返回 ``(可恢复数据, 错误列表)``。"""
     try:
         data = json.loads(text)
     except (TypeError, ValueError) as exc:
         return {}, [f"JSON 解析失败：{exc}"]
+    return parse_user_export_data(data)
+
+
+def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
+    """校验已解析的 user-export JSON 对象（CLI 文本路径与 Web API 共用）。
+
+    可恢复数据键：preferences / trips / messages / titles / pinned / archived。
+    没有任何可恢复数据时返回空 dict（错误列表说明原因）。
+    """
     if not isinstance(data, dict):
         return {}, ["文件内容不是 JSON 对象"]
 
