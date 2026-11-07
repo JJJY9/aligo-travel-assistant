@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -218,11 +219,30 @@ class LongTermMemory:
                 data = json.load(f)
         except FileNotFoundError:
             return
-        except Exception:  # noqa: BLE001 - 重载失败时沿用内存快照
-            logger.warning("重载长期记忆失败，沿用内存快照", exc_info=True)
-            return
+        except Exception as exc:  # noqa: BLE001 - 损坏文件不能静默沿用旧快照
+            # 沿用旧快照写回会覆盖磁盘上更新（或已损坏）的数据、把损坏掩盖成
+            # 「正常写入」；与载入路径一致按持久化失败处理，交给上层映射 503
+            logger.warning("重载长期记忆失败：%s", exc)
+            raise MemoryPersistenceError(
+                f"长期记忆重载失败（{self.db_path}）：{exc}"
+            ) from exc
         if isinstance(data, dict):
             self.data = self._migrate_data(data)
+
+    def _backup_before_migration(self) -> None:
+        """迁移会丢弃 / 重置坏数据前把原始文件另存一份（每个文件只留首份）。
+
+        这些修正是破坏性的（非对象消息被丢弃、非数字计数器归零），直接把
+        清理后的快照写回磁盘会让原始内容不可恢复；保留原始副本便于排查。
+        """
+        backup = f"{self.db_path}.migrate-backup"
+        if os.path.exists(backup):
+            return
+        try:
+            shutil.copyfile(self.db_path, backup)
+            logger.warning("迁移修复前已备份原始记忆文件到 %s", backup)
+        except OSError:
+            logger.warning("无法备份迁移前的记忆文件：%s", self.db_path)
 
     def _migrate_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """
@@ -248,6 +268,7 @@ class LongTermMemory:
         if not isinstance(data.get("statistics"), dict):
             data["statistics"] = {}
         stats = data["statistics"]
+        destructive = False
         # 计数器存在但为 null / 字符串 / 布尔时按 0 处理：这类文件是合法
         # JSON，不修复的话每次写入（+= 1）都会抛 TypeError，而且永远不会
         # 进入损坏备份 / 自愈路径
@@ -260,8 +281,26 @@ class LongTermMemory:
             value = stats.get(counter)
             if not isinstance(value, int) or isinstance(value, bool):
                 stats[counter] = 0
+                destructive = True
         if not isinstance(stats.get("frequent_destinations"), dict):
             stats["frequent_destinations"] = {}
+        else:
+            # 计数值被写成字符串 / null 时 += 1 同样 TypeError：归零并保留城市键
+            frequent = stats["frequent_destinations"]
+            cleaned_frequent: dict[str, int] = {}
+            frequent_changed = False
+            for city, count in frequent.items():
+                key = str(city)
+                if isinstance(count, int) and not isinstance(count, bool):
+                    cleaned_frequent[key] = count
+                else:
+                    cleaned_frequent[key] = 0
+                    frequent_changed = True
+                if key != city:
+                    frequent_changed = True
+            stats["frequent_destinations"] = cleaned_frequent
+            if frequent_changed:
+                destructive = True
         if "preferences" not in data:
             data["preferences"] = []
 
@@ -270,6 +309,7 @@ class LongTermMemory:
         for list_key in ("chat_history", "trip_history"):
             if not isinstance(data.get(list_key), list):
                 data[list_key] = []
+                destructive = True
                 continue
             cleaned = [item for item in data[list_key] if isinstance(item, dict)]
             if len(cleaned) != len(data[list_key]):
@@ -278,9 +318,14 @@ class LongTermMemory:
                     list_key,
                     len(data[list_key]) - len(cleaned),
                 )
+                destructive = True
             data[list_key] = cleaned
         if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []
+            destructive = True
+        if destructive:
+            # 上面是破坏性修正：写回磁盘前保留原始文件副本，丢弃的数据可追溯
+            self._backup_before_migration()
 
         # 2. 迁移旧格式：字典 → 列表
         if isinstance(data.get("preferences"), dict):
@@ -684,7 +729,7 @@ class LongTermMemory:
         ]
         stats = self.data["statistics"]
         stats["total_messages"] = max(0, stats.get("total_messages", 0) - count)
-        # 会话消息已被删空时同步清理归档标记，避免幽灵归档
+        # 会话消息已被删空时同步清理元数据，避免幽灵归档 / 幽灵标题 / 幽灵置顶
         if not any(
             message.get("session_id") == session_id
             for message in self.data["chat_history"]
@@ -692,6 +737,12 @@ class LongTermMemory:
             archived_sessions = self.data.get("archived_sessions") or []
             if session_id in archived_sessions:
                 archived_sessions.remove(session_id)
+            titles = self.data.get("session_titles")
+            if isinstance(titles, dict):
+                titles.pop(session_id, None)
+            pinned_sessions = self.data.get("pinned_sessions") or []
+            if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
+                pinned_sessions.remove(session_id)
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
