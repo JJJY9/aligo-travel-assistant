@@ -436,9 +436,15 @@ class AligoCLI:
                 if has_preference_value(pref_value):  # 0 / False 也是合法偏好
                     # 如果是列表，用逗号连接
                     if isinstance(pref_value, list):
-                        pref_lines.append(
-                            f"• {pref_key}: {', '.join(str(item) for item in pref_value)}"
-                        )
+                        items = [
+                            str(item)
+                            for item in pref_value
+                            if not (
+                                item is None
+                                or (isinstance(item, str) and not item.strip())
+                            )
+                        ]
+                        pref_lines.append(f"• {pref_key}: {', '.join(items)}")
                     else:
                         pref_lines.append(f"• {pref_key}: {pref_value}")
 
@@ -492,7 +498,15 @@ class AligoCLI:
     def _format_result_value(value: object) -> str:
         """结果字段的展示文本：列表「、」拼接、字典 JSON，其余 str。"""
         if isinstance(value, (list, tuple)):
-            return "、".join(str(item) for item in value)
+            items = [
+                str(item)
+                for item in value
+                if not (
+                    item is None
+                    or (isinstance(item, str) and not item.strip())
+                )
+            ]
+            return "、".join(items) or "—"
         if isinstance(value, dict):
             import json as _json
 
@@ -2007,9 +2021,15 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
 
     sessions = {str(item.get("session_id")) for item in history if item.get("session_id")}
     travel = summarize_travel(trips)
+    # 与面板 / 状态接口同口径：null / 空白 / 全空列表不计入偏好条数
+    visible_preferences = {
+        key: value
+        for key, value in preferences.items()
+        if has_preference_value(value)
+    }
     payload: dict[str, Any] = {
         "user_id": user_id,
-        "preferences": len(preferences),
+        "preferences": len(visible_preferences),
         "travel": travel,
         "sessions": {
             "total": len(sessions),
@@ -2170,9 +2190,22 @@ def run_user_import_standalone(
     sections, errors = parse_user_export(text)
     if skip_knowledge:
         sections.pop("knowledge", None)
-    if not sections:
+    # 只含 knowledge 段的备份在 --skip-knowledge 后没有用户数据可恢复：
+    # sections 里仍有空列表键（truthy），必须按「内容是否为空」判断
+    has_user_data = any(
+        sections.get(key)
+        for key in ("preferences", "trips", "messages", "titles", "pinned", "archived")
+    )
+    if not sections or not has_user_data:
+        hint = (
+            "（备份只含知识片段，已按 --skip-knowledge 跳过）"
+            if skip_knowledge
+            else ""
+        )
         detail = "；".join(errors[:5])
-        return _fail(f"没有可恢复的数据{f'（{detail}）' if detail else ''}")
+        return _fail(
+            f"没有可恢复的数据{hint}{f'（{detail}）' if detail else ''}"
+        )
 
     try:
         store = _open_cli_store(user_id)
@@ -2907,7 +2940,12 @@ def _session_summaries(store) -> list[dict]:
         )
         entry["messages"] += 1
         timestamp = str(message.get("timestamp") or "")
-        if timestamp:
+        if timestamp and (
+            not entry["updated_at"]
+            or chronological_key(timestamp) >= chronological_key(entry["updated_at"])
+        ):
+            # 取转录里「最大时间戳」而不是最后一条：恢复备份按时间升序追加，
+            # 旧消息排在末尾时最近更新会被错误回拨
             entry["updated_at"] = timestamp
         if not entry["title"] and message.get("role") == "user":
             title = " ".join(str(message.get("content", "")).split())
@@ -3761,7 +3799,11 @@ def run_trips_export_standalone(
     if ics:
         text = render_trips_ics(trips, user_id)
         default_name = "aligo_trips.ics"
-        exported = text.count("BEGIN:VEVENT")
+        # 按整行统计：行程字段（SUMMARY / DESCRIPTION）里出现的同名字符串
+        # 不能把导出条数放大、让"跳过 N 条"失真
+        exported = sum(
+            1 for line in text.splitlines() if line.strip() == "BEGIN:VEVENT"
+        )
         skipped = max(0, len(trips) - exported)
     elif html:
         text = render_trips_html(trips, user_id)
@@ -4631,6 +4673,23 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
         if callable(close):
             close()
 
+    # 与面板 / has_preference_value 同口径：null / 空白 / 全空列表不列出，
+    # 列表内的 null 与空白项逐项剔除（此前渲染成「东航、None」）
+    visible = {
+        key: value
+        for key, value in preferences.items()
+        if has_preference_value(value)
+    }
+
+    def _list_items(value: list) -> list[str]:
+        return [
+            str(item)
+            for item in value
+            if not (
+                item is None or (isinstance(item, str) and not item.strip())
+            )
+        ]
+
     if as_json:
         from utils.json_safe import sanitize_json
 
@@ -4639,9 +4698,9 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
                 sanitize_json(
                     {
                         "user_id": user_id,
-                        "count": len(preferences),
+                        "count": len(visible),
                         "preferences": {
-                            key: preferences[key] for key in sorted(preferences)
+                            key: visible[key] for key in sorted(visible)
                         },
                     }
                 ),
@@ -4650,15 +4709,15 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
             )
         )
         return 0
-    if not preferences:
+    if not visible:
         print(f"用户 {user_id}：还没有偏好记录")
         return 0
 
-    print(f"用户 {user_id}：{len(preferences)} 条偏好")
-    for pref_type in sorted(preferences, key=preference_label):
-        value = preferences[pref_type]
+    print(f"用户 {user_id}：{len(visible)} 条偏好")
+    for pref_type in sorted(visible, key=preference_label):
+        value = visible[pref_type]
         if isinstance(value, list):
-            text = "、".join(str(item) for item in value) or "—"
+            text = "、".join(_list_items(value)) or "—"
         elif value is None or value == "":
             text = "—"
         elif isinstance(value, bool):

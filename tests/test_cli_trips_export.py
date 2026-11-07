@@ -165,6 +165,22 @@ def test_pg_fallback_refused(monkeypatch):
     print("✓ PostgreSQL 回退时拒绝执行")
 
 
+def test_export_ics_count_ignores_field_text(monkeypatch):
+    """行程字段含 BEGIN:VEVENT 时导出条数按整行统计，不放大也不虚报跳过。"""
+    import tempfile
+
+    workdir = tempfile.mkdtemp()
+    fake = _FakeStore([_trip()])
+    fake.trips[0]["purpose"] = "会议 BEGIN:VEVENT 演练"
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    target = os.path.join(workdir, "trips.ics")
+    code, out = _run("u1", target=target, ics=True)
+    assert code == 0
+    assert "已导出 1 条行程" in out, out
+    assert "跳过" not in out, "不得虚报跳过"
+    print("✓ ICS 导出条数按整行统计")
+
+
 def test_export_ics(monkeypatch):
     import tempfile
 

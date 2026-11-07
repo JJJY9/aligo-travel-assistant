@@ -93,6 +93,29 @@ def test_stats_text_and_json(monkeypatch):
     print("✓ stats 文本 / JSON 输出")
 
 
+def test_stats_counts_only_visible_preferences(monkeypatch):
+    """偏好条数与面板 / has_preference_value 同口径：空值不计入。"""
+    store = _FakeStore(
+        preferences={
+            "home_location": "北京",
+            "empty": "",
+            "blank": "   ",
+            "null_list": [None],
+            "budget_level": 0,
+        },
+        trips=[],
+        history=[],
+        archived=[],
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 0
+    assert json.loads(out)["preferences"] == 2, out
+    print("✓ stats 偏好条数按可见口径")
+
+
 def test_stats_empty_and_failures(monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(
