@@ -709,9 +709,16 @@ def import_documents(
                     raise ValueError(
                         "备份中的文档拼接后过长（分片过多或含大量空白），请拆分后导入"
                     )
-            document_chunks.append(
-                _chunk_documents(content[:limit], sanitized_meta)
-            )
+            if not restored and len(content) > limit:
+                # 超过单条导入上限：计入 skipped_invalid 并记录警告，而不是
+                # 静默截断（截断会悄悄丢掉后半段、用户以为已完整入库）；
+                # 单条坏数据也不该让整批导入失败
+                invalid += 1
+                logger.warning(
+                    "导入内容超过上限（%d 字 > %d），已跳过", len(content), limit
+                )
+                continue
+            document_chunks.append(_chunk_documents(content, sanitized_meta))
 
         unique: list[dict[str, Any]] = []
         for chunks in document_chunks:
