@@ -285,7 +285,22 @@ class PostgresLongTermMemory:
 
     # ---------- 对话历史 ----------
 
-    def add_chat_message(self, role: str, content: str, session_id: str | None = None) -> None:
+    def add_chat_message(
+        self,
+        role: str,
+        content: str,
+        session_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        if timestamp:
+            # 备份恢复：保留原始时间戳（ISO 字符串由 PostgreSQL 解析）
+            self._execute(
+                "INSERT INTO aligo_chat_messages "
+                "(user_id, role, content, session_id, created_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (self.user_id, role, content, session_id, timestamp),
+            )
+            return
         self._execute(
             "INSERT INTO aligo_chat_messages (user_id, role, content, session_id) VALUES (%s, %s, %s, %s)",
             (self.user_id, role, content, session_id),
