@@ -72,6 +72,7 @@ from utils.knowledge_admin import (
 )
 from utils.knowledge_stats import knowledge_status
 from utils.metrics import REQUEST_METRICS
+from utils.preference_values import has_preference_value
 from utils.rate_limit import create_rate_limiter
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
@@ -1524,6 +1525,43 @@ def _group_sessions(
     return sessions[:limit]
 
 
+def _safe_usage_int(value: Any) -> int:
+    """_meta.usage 数字的防御性转换。
+
+    备份恢复可能带入 NaN / Infinity（Python json.loads 接受它们）或历史脏
+    数据：int(NaN) 会 ValueError、int(Infinity) 会 OverflowError，而
+    /api/status 依赖本函数汇总——一次坏数据不能让面板概览永久 500。
+    """
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number):
+        return 0
+    return int(number)
+
+
+def _visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
+    """面板 / 导出的偏好可见口径：与 CLI 的 has_preference_value 一致。
+
+    过滤 None / 空白串 / 空容器，列表内逐项剔除 null 与空白项；全空的
+    列表整体隐藏（此前 [null] / "   " 会原样返回，面板渲染成「东航、null」）。
+    """
+    visible: dict[str, Any] = {}
+    for key, value in preferences.items():
+        if isinstance(value, list):
+            items = [
+                item
+                for item in value
+                if not (item is None or (isinstance(item, str) and not item.strip()))
+            ]
+            if items:
+                visible[key] = items
+        elif has_preference_value(value):
+            visible[key] = value
+    return visible
+
+
 def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     """从历史消息的执行元数据汇总模型用量（旧消息没有 _meta，自动忽略）。"""
     calls = input_tokens = output_tokens = 0
@@ -1540,10 +1578,10 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         usage = meta.get("usage")
         if isinstance(usage, dict):
-            message_calls = int(usage.get("calls") or 0)
+            message_calls = _safe_usage_int(usage.get("calls"))
             calls += message_calls
-            input_tokens += int(usage.get("input_tokens") or 0)
-            output_tokens += int(usage.get("output_tokens") or 0)
+            input_tokens += _safe_usage_int(usage.get("input_tokens"))
+            output_tokens += _safe_usage_int(usage.get("output_tokens"))
 
             timestamp = str(message.get("timestamp") or "")
             try:
@@ -1597,11 +1635,7 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
         "",
     ]
 
-    preferences = {
-        key: value
-        for key, value in (data.get("preferences") or {}).items()
-        if value is not None and value != "" and value != [] and value != {}
-    }
+    preferences = _visible_preferences(data.get("preferences") or {})
     lines.extend(["## 用户偏好", ""])
     if preferences:
         for key, value in preferences.items():
@@ -2145,12 +2179,7 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/status")
     def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:
         data = _load_user_data(user_id)
-        preferences = {
-            key: value
-            for key, value in data["preferences"].items()
-            # 保留 0 / false 等合法值，仅过滤空值
-            if value is not None and value != "" and value != [] and value != {}
-        }
+        preferences = _visible_preferences(data["preferences"])
         today = datetime.now().date()
         travel_summary = summarize_travel(data["trip_history"], today=today)
         active_trips: list[tuple[datetime, dict[str, Any]]] = []
@@ -2199,6 +2228,12 @@ def create_app(model: Any = None) -> FastAPI:
         pref_type: str = ApiPath(..., pattern=_PREF_TYPE_PATTERN),
     ) -> dict[str, Any]:
         """新增或覆盖一条用户偏好（记忆面板的手动维护入口）。"""
+        # 与 CLI pref-set / 面板显示口径一致：空值 = 未设置，不能回显 200
+        # 却让偏好从 /api/status 消失（清空请用 DELETE）
+        if not has_preference_value(payload.value):
+            raise HTTPException(
+                status_code=422, detail="偏好值不能为空（清空请使用 DELETE 接口）"
+            )
         store = _open_long_term(payload.user_id)
         try:
             store.save_preference(pref_type, payload.value)
