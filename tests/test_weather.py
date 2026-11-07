@@ -438,6 +438,49 @@ def test_stale_fallback_does_not_refresh_cache_timestamp(monkeypatch):
     print("✓ 反复降级不会滑动 stale 窗口")
 
 
+def test_degraded_reuse_window_and_expiry(monkeypatch):
+    """降级结果 60 秒内直接复用（不再打上游），过期后重新尝试。"""
+    times = {"now": 1000.0}
+    monkeypatch.setattr(weather.time, "monotonic", lambda: times["now"])
+
+    calls = {"n": 0}
+
+    def ok_get(url, params=None, timeout=None, headers=None):
+        calls["n"] += 1
+        return _Response(_geo("北京") if "geocoding" in url else _forecast())
+
+    monkeypatch.setattr(weather.requests, "get", ok_get)
+    weather.clear_weather_cache()
+    fresh = weather.fetch_weather("北京")
+    assert "stale" not in fresh
+    key = weather._cache_key("北京")
+    at, result = weather._cache[key]
+    weather._cache[key] = (at - weather.CACHE_TTL_SEC - 1, result)
+    ok_calls = calls["n"]
+
+    def fail_get(url, params=None, timeout=None, headers=None):
+        calls["n"] += 1
+        raise weather.requests.ConnectionError("network down")
+
+    monkeypatch.setattr(weather.requests, "get", fail_get)
+    stale = weather.fetch_weather("北京")
+    assert stale["stale"] is True
+    failures = calls["n"]
+    assert failures > ok_calls
+
+    # 60 秒复用窗口内：直接返回上次降级结果，不再请求上游
+    times["now"] += 30
+    again = weather.fetch_weather("北京")
+    assert again["stale"] is True
+    assert calls["n"] == failures, "复用窗口内不应重打已故障的上游"
+
+    # 窗口过期：重新尝试上游（仍失败 → 再次降级，失败计数 +1）
+    times["now"] += 31
+    weather.fetch_weather("北京")
+    assert calls["n"] == failures + 1
+    print("✓ 降级结果复用窗口与过期重试")
+
+
 def test_stale_cache_expires(monkeypatch):
     def ok_get(url, params=None, timeout=None, headers=None):
         return _Response(_geo("北京") if "geocoding" in url else _forecast())

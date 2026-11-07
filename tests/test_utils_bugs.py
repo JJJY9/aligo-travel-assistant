@@ -1,3 +1,4 @@
+import pytest
 """
 工具类回归测试（无需 API Key）
 
@@ -151,6 +152,33 @@ def test_json_parse_no_json_without_fallback():
         assert "No JSON found" in str(exc)
     else:
         raise AssertionError("应抛 ValueError")
+
+
+def test_extract_first_json_object_escape_state_machine():
+    """字符串里的转义引号 / 花括号不能干扰对象边界识别。"""
+    from utils.json_parser import extract_first_json_object
+
+    bs = chr(92)
+    text = (
+        "前缀 {"
+        + chr(34) + "a" + chr(34) + ": " + chr(34)
+        + "含 } 与 " + bs + chr(34) + " 引号" + chr(34)
+        + ", " + chr(34) + "b" + chr(34) + ": {"
+        + chr(34) + "c" + chr(34) + ": 1}} 后缀"
+    )
+    obj = extract_first_json_object(text)
+    assert obj == {"a": "含 } 与 " + chr(34) + " 引号", "b": {"c": 1}}
+
+    # 未闭合字符串里的 { 不能开启新对象：状态机保持字符串态直到结尾，
+    # 不把后面的片段误当作可解析对象（整体报「未找到」）
+    text2 = (
+        "{" + chr(34) + "a" + chr(34) + ": "
+        + chr(34) + "未闭合 { 这里" + chr(10)
+        + "真正的 {" + chr(34) + "ok" + chr(34) + ": 1}"
+    )
+    with pytest.raises(ValueError, match="No JSON object"):
+        extract_first_json_object(text2)
+    print("✓ JSON 对象提取的转义 / 未闭合字符串状态机")
 
 
 def test_extract_first_json_object_empty_text():
