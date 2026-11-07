@@ -159,4 +159,8 @@ def split_text(text: str, max_chars: int = 400) -> list[str]:
         current = f"{current}\n{paragraph}" if current else paragraph
 
     flush()
-    return _merge_short_chunks(chunks, max_chars=max_chars)
+    merged = _merge_short_chunks(chunks, max_chars=max_chars)
+    # 定长硬切可能产生纯空白分片（整块空格或单独的换行）：没有内容就不该
+    # 进向量库——空白片段同样会编码成向量并占用检索名额；与
+    # knowledge_admin._chunk_documents 的过滤口径保持一致
+    return [chunk for chunk in merged if chunk.strip()]

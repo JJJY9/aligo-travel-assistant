@@ -15,13 +15,19 @@ _LOCK = threading.Lock()
 
 
 def peek_embedding_dim() -> int | None:
-    """已加载（缓存中）嵌入模型的维度；未加载 / 多个模型时返回 None。
+    """已加载（缓存中）嵌入模型的维度；未加载 / 正在加载 / 多个模型时返回 None。
 
-    只读缓存、绝不触发模型加载：知识库状态接口据此 best-effort 判断
-    集合维度是否与当前进程的嵌入模型一致（换模型后状态不再假装健康）。
+    只读缓存、绝不触发模型加载、也绝不等锁：知识库状态接口据此 best-effort
+    判断集合维度是否与当前进程的嵌入模型一致（换模型后状态不再假装健康）。
+    首次加载持锁数十秒（含下载更久），探测必须用非阻塞获取，否则状态接口
+    会跟着挂起。
     """
-    with _LOCK:
+    if not _LOCK.acquire(blocking=False):
+        return None
+    try:
         models = list(_MODELS.values())
+    finally:
+        _LOCK.release()
     if len(models) != 1:
         return None
     try:

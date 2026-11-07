@@ -293,6 +293,22 @@ def test_merge_preference_value_empty_list():
     print("✓ 空列表 append 不产生嵌套列表")
 
 
+def test_preference_blank_items_filtered():
+    """模型输出的 null / 空白项不能绕过门禁落库，也不能混进合并结果。"""
+    from utils.preference_values import has_preference_value, merge_preference_value
+
+    assert not has_preference_value([None])
+    assert not has_preference_value([""])
+    assert not has_preference_value(["  "])
+    assert not has_preference_value("   ")
+    assert has_preference_value(["东航", None])
+    assert has_preference_value(0) and has_preference_value(False)
+    assert merge_preference_value(["东航"], [None]) == ["东航"]
+    assert merge_preference_value(None, [""]) == []
+    assert merge_preference_value(["东航", None], ["国航"]) == ["东航", "国航"]
+    print("✓ 偏好空值门禁与合并过滤（null / 空白串）")
+
+
 def test_append_preference_empty_list_not_persisted_as_nested():
     d = tempfile.mkdtemp(prefix="chailv_pref_empty_")
     memory = LongTermMemory(f"pref-empty-{uuid.uuid4().hex[:8]}", d)
@@ -369,6 +385,7 @@ if __name__ == "__main__":
     test_robust_json_parse_fenced_inputs()
     test_extract_response_text_object_attribute()
     test_merge_preference_value_empty_list()
+    test_preference_blank_items_filtered()
     test_append_preference_empty_list_not_persisted_as_nested()
     test_extract_user_query_handles_structured_inputs()
     test_increment_query_count_fresh_data()

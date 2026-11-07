@@ -915,6 +915,49 @@ def test_embedding_model_shared(monkeypatch):
     print("✓ 嵌入模型进程内共享（按路径缓存）")
 
 
+def test_peek_embedding_dim_does_not_block_loading(monkeypatch):
+    """首次加载（可达数十秒）期间状态探测立即返回 None，不能跟着挂起。"""
+    import sys
+    import threading
+    import time
+    import types
+
+    from utils import embedding_model as embedding_module
+
+    embedding_module.reset_embedding_models()
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowSentenceTransformer:
+        def __init__(self, path):
+            started.set()
+            release.wait(timeout=10)
+
+        def get_sentence_embedding_dimension(self):
+            return 512
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = SlowSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+    try:
+        loader = threading.Thread(
+            target=lambda: embedding_module.get_embedding_model("slow-model"),
+            daemon=True,
+        )
+        loader.start()
+        assert started.wait(timeout=5), "加载线程未开始"
+        begin = time.monotonic()
+        assert embedding_module.peek_embedding_dim() is None
+        assert time.monotonic() - begin < 1.0, "探测不能等锁（会让状态接口挂起）"
+        release.set()
+        loader.join(timeout=5)
+        assert embedding_module.peek_embedding_dim() == 512
+    finally:
+        release.set()
+        embedding_module.reset_embedding_models()
+    print("✓ 首次加载期间 peek_embedding_dim 不阻塞")
+
+
 def test_next_trip_id_not_reused_after_deleting_latest():
     from context.long_term_memory import LongTermMemory
 
@@ -1387,6 +1430,7 @@ if __name__ == "__main__":
     test_append_preference_merges_atomically()
     test_summary_invalidated_by_trip_edit()
     test_embedding_model_shared(pytest.MonkeyPatch())
+    test_peek_embedding_dim_does_not_block_loading(pytest.MonkeyPatch())
     test_summary_cache_avoids_repeated_calls()
     test_summary_cache_shared_across_max_messages()
     test_summary_fingerprint_detects_history_replacement()

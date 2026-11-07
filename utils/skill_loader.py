@@ -22,7 +22,9 @@ def _frontmatter_bounds(content: str) -> tuple[int, int] | None:
     while index <= len(content):
         newline = content.find("\n", index)
         line = content[index:] if newline < 0 else content[index:newline]
-        if line.strip() == "---":
+        # 结束标记必须顶格（只允许行尾空白 / CR）：缩进的 `  ---` 是 YAML
+        # 块标量内的内容，按 strip() 判断会提前截断 frontmatter
+        if line.rstrip() == "---":
             return yaml_start, index
         if newline < 0:
             return None

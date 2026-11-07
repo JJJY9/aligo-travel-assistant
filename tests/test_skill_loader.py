@@ -112,6 +112,22 @@ def test_frontmatter_description_with_dashes():
     print("✓ 描述含 --- 时 frontmatter 正确解析")
 
 
+def test_indented_fence_inside_block_scalar_not_terminator():
+    """YAML 块标量内部缩进的 --- 不是结束标记：描述完整、正文不混入残余 frontmatter。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "block", "SKILL.md"),
+        "---\nname: block-skill\ndescription: |\n  第一行\n  ---\n  第三行\n---\n正文",
+    )
+    loader = SkillLoader(root)
+    skills = loader.load_skills()
+    assert "block-skill" in skills, "技能不能被跳过"
+    description = skills["block-skill"]["description"]
+    assert "第一行" in description and "第三行" in description, description
+    assert loader.get_skill_content("block") == "正文"
+    print("✓ 块标量内缩进的 --- 不截断 frontmatter")
+
+
 def test_bom_skill_md_is_loaded_not_skipped():
     """带 UTF-8 BOM 的 SKILL.md 不能被静默跳过，正文不能带 BOM。"""
     root = tempfile.mkdtemp(prefix="chailv_skills_")
@@ -150,6 +166,7 @@ if __name__ == "__main__":
     test_get_skill_content_without_frontmatter()
     test_get_skill_content_missing_dir_returns_none()
     test_frontmatter_description_with_dashes()
+    test_indented_fence_inside_block_scalar_not_terminator()
     test_bom_skill_md_is_loaded_not_skipped()
     _mp = __import__("pytest").MonkeyPatch()
     try:
