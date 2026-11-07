@@ -17,6 +17,7 @@ from typing import Any
 
 from utils.errors import MemoryPersistenceError
 from utils.preference_values import merge_preference_value
+from utils.timestamps import localize_naive, parse_iso_datetime
 
 
 def _pg_timestamp(value: str) -> str:
@@ -26,12 +27,11 @@ def _pg_timestamp(value: str) -> str:
     导出的 ``datetime.now().isoformat()`` 是本机时间，直接入库会整体偏移。
     """
     text = str(value)
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
+    parsed = parse_iso_datetime(text)
+    if parsed is None:
         return text
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        parsed = localize_naive(parsed)
     return parsed.isoformat()
 
 logger = logging.getLogger(__name__)

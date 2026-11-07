@@ -4,7 +4,7 @@
 """
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -36,15 +36,58 @@ def test_chronological_key_compares_by_instant():
 
 def test_naive_and_aware_same_instant_share_key():
     naive_key = chronological_key("2026-11-02T10:00:00")
-    aware = datetime.fromisoformat("2026-11-02T10:00:00").replace(
-        tzinfo=datetime.now().astimezone().tzinfo
+    naive_dt = datetime(2026, 11, 2, 10, 0)
+    utc_instant = datetime.fromtimestamp(naive_dt.timestamp(), tz=timezone.utc)
+    assert naive_key == utc_instant.isoformat(), "naive 键必须等于该墙钟时刻的真实 UTC"
+    print("✓ naive 与本机墙钟时刻的真实 UTC 键一致")
+
+
+def test_z_suffix_accepted():
+    """合法 UTC 写法 ...Z（Python 3.10 的 fromisoformat 不支持）也能解析。"""
+    assert to_aware("2026-11-02T10:00:00Z") == datetime(
+        2026, 11, 2, 10, 0, tzinfo=timezone.utc
     )
-    assert naive_key == chronological_key(aware.isoformat())
-    print("✓ naive 与本机时区的同一墙钟时刻键一致")
+    assert to_aware("2026-11-02T10:00:00z") == datetime(
+        2026, 11, 2, 10, 0, tzinfo=timezone.utc
+    )
+    assert chronological_key("2026-11-02T10:00:00Z") == chronological_key(
+        "2026-11-02T10:00:00+00:00"
+    )
+    print("✓ Z 后缀时间戳解析为 UTC")
+
+
+def test_naive_uses_dst_offset_of_that_moment():
+    """夏令时地区：冬季 naive 时间戳按冬季偏移解释，不能用当前（夏季）定值偏移。"""
+    if sys.platform == "win32":
+        print("✓ 跳过：Windows 没有 tzset（该场景由 Linux CI 覆盖）")
+        return
+    import time
+
+    old = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "Europe/Berlin"
+        time.tzset()
+        winter = to_aware("2026-01-15T12:00:00")
+        summer = to_aware("2026-07-15T12:00:00")
+        assert winter is not None and winter.utcoffset() == timedelta(hours=1), winter
+        assert summer is not None and summer.utcoffset() == timedelta(hours=2), summer
+        # 同一真实时刻的 naive 与 Z 写法键一致（冬季 12:00 本地 = 11:00Z）
+        assert chronological_key("2026-01-15T12:00:00") == chronological_key(
+            "2026-01-15T11:00:00Z"
+        )
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+    print("✓ naive 时间戳按当日 DST 偏移解释")
 
 
 if __name__ == "__main__":
     test_to_aware_parses_naive_and_aware()
     test_chronological_key_compares_by_instant()
     test_naive_and_aware_same_instant_share_key()
+    test_z_suffix_accepted()
+    test_naive_uses_dst_offset_of_that_moment()
     print("\n全部通过")
