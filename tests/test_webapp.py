@@ -2823,6 +2823,21 @@ def test_trips_csv_export():
         assert rows[2][1] == '\'=HYPERLINK("http://example.invalid")', "公式前缀应被转义"
         assert rows[2][4] == "'@SUM(1)"
 
+        html_export = _client().get(
+            "/api/trips/export", params={"user_id": user_id, "format": "html"}
+        )
+        assert html_export.status_code == 200
+        assert html_export.headers["content-type"].startswith("text/html")
+        assert ".html" in html_export.headers.get("content-disposition", "")
+        assert html_export.text.startswith("<!doctype html>")
+        assert "2026-12-05 ~ 2026-12-07" in html_export.text
+        assert "HYPERLINK(&quot;http://example.invalid&quot;)" in html_export.text
+        assert "<script" not in html_export.text
+        bad_format = _client().get(
+            "/api/trips/export", params={"user_id": user_id, "format": "pdf"}
+        )
+        assert bad_format.status_code == 422
+
         empty_user = _unique_user("web_test_trips_csv_empty")
         try:
             empty = _client().get(

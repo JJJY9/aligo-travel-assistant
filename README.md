@@ -513,7 +513,7 @@ python cli.py
 
 历史行程去重（不进入交互）：`python cli.py trips-dedupe <user_id> [--dry-run] [--json]` 删除同路线 + 同起止日期的重复行程（保留最早一条，统计与常去目的地同步更新），`--dry-run` 只列出将被删除的记录，`--json` 输出结构化结果（将删除 / 已删除条目与歧义 id）；同一 trip_id 出现在多条不同行程里（历史数据异常）时拒绝自动删除并提示人工处理；配置了 PostgreSQL 但连接失败（回退本地 JSON）时会拒绝执行，避免清理错库。
 
-行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics] [--query 关键词]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`）或 iCalendar（`--ics`，与 Web 的 `/api/trips/calendar` 同一实现，默认 `exports/aligo_trips.ics`；已存在时需 `--force` 覆盖；`--query` 与面板 / CLI 列表同一口径过滤后导出）。
+行程导出（不进入交互）：`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics|--html] [--query 关键词]` 导出全部行程为 CSV（UTF-8 BOM，默认 `exports/aligo_trips.csv`）、iCalendar（`--ics`，与 Web 的 `/api/trips/calendar` 同一实现，默认 `exports/aligo_trips.ics`）或可打印的 HTML 台账（`--html`，与 Web 的 `/api/trips/export?format=html` 同一实现，默认 `exports/aligo_trips.html`，内容全部转义；`--ics` 与 `--html` 互斥）；已存在时需 `--force` 覆盖；`--query` 与面板 / CLI 列表同一口径过滤后导出。
 行程导入（不进入交互）：`python cli.py trips-import <user_id> <path> [--ics] [--dry-run] [--json]` 读取 `trips-export` 导出的 CSV（UTF-8 BOM，中英文字段名均可；导出时为防公式注入加的前导单引号会被还原）或 `trips-export --ics` 导出的 iCalendar（`--ics` 指定，或以 `BEGIN:VCALENDAR` 开头时自动识别；支持 RFC 5545 折行与转义、排他 DTEND；带 `Z` / `±HHMM` 的 DATE-TIME 先换算本机时区再取日期，DATE-TIME 的结束时刻按含尾处理、仅恰为 00:00 时按排他日期减一天）逐条导入（批量写入，单次写盘）；同路线 + 同起止日期沿用存储层去重（更新目的），非法行 / 事件收集后列出并跳过（行号按物理行）、不中断其余项；`--dry-run` 只预览将新增 / 更新 / 跳过的数量、不写库；`--json` 输出 `{ok, path, format, rows, created, updated, skipped[{line, reason}]}`，没有可导入项时退出码 1。
 
 会话管理（不进入交互）：`python cli.py sessions <user_id>` 列出未归档会话（置顶优先，显示消息数与最近更新时间），`--archived` 只看归档会话、`--all` 查看全部、`--query <关键词>` 按标题与消息内容过滤并附命中片段、`--json` 输出机器可读列表；`python cli.py session-archive <user_id> <session_id> [--restore] [--json]` 归档 / 恢复会话（`--json` 输出结构化结果）；`python cli.py session-delete <user_id> <session_id> [--json]` 删除会话的全部消息并同步清理短期记忆（Redis 会话键），不可恢复（配置 `REDIS_URL` 时同时写入与 Web 共享的删除墓碑，其它实例的旧标签页下一次请求即 404；未配置时不同进程无法感知，请在旧页面刷新）；`python cli.py session-title <user_id> <session_id> <标题|--reset> [--json]` 设置 / 重置会话标题（上限 60 字，`--reset` 恢复自动标题）；`python cli.py session-pin <user_id> <session_id> [--off] [--json]` 置顶 / 取消置顶会话；`python cli.py session-show <user_id> <session_id> [--json]` 查看单个会话（标题 / 置顶 / 归档状态与按时间排序的消息，助手消息重新渲染，`--json` 输出原始消息）；`python cli.py session-export <user_id> <session_id> [path] [--stdout] [--force] [--html]` 导出单个会话为 Markdown（默认 `exports/aligo_<session>.md`）或独立 HTML（`--html`，单文件内嵌样式，默认 `.html` 后缀，所有内容转义）；助手消息按编排结果重新渲染。配置了 PostgreSQL 但连接失败（回退本地 JSON）时同样拒绝执行。
@@ -575,7 +575,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
   ![即将出行：出发日天气](docs/screenshots/webui-trip-weather.jpg)
 - **对话深链接**：地址栏同步 `user` / `session` 参数（例如 `/?user=alice&session=abc123`），打开链接即可恢复会话；顶栏提供「复制链接」，无效链接会自动清理参数并回到新对话
 - **主题与布局**：浅色 / 深色主题跟随系统并可切换；窄屏下侧栏变为抽屉
-- **记忆与用量面板**：在线编辑 / 删除偏好、手动添加常用偏好（常住地 / 交通 / 酒店 / 航司 / 座位 / 餐食 / 预算，多个值用「、」分隔）、查看最近 5 条行程（超过 5 条可「查看全部」展开最近 200 条，展开后可输入关键词按路线 / 日期 / 目的筛选；带「进行中 / 即将出行 / 已结束」状态标签，与其它行程日期重叠时显示「重叠」徽标，新记录可点击回到对应对话、可导出 .ics 日历（含前一天提醒）或 CSV 报销台账）与常去目的地、统计、存储后端、技能数量（用户卡片显示，安装后技能缺失可看到「技能 0」）、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体）与近 7 天 tokens 趋势图、运行指标（请求总数 / 平均与最大耗时 / P95 耗时 / 熔断器状态 / 运行时长与缓存会话 / 限流后端，来自 `/api/metrics`），修改用户 ID，导出长期记忆 JSON / Markdown、一键导出全部会话 Markdown 或 HTML（HTML 与 CLI `sessions-export --html` 同一渲染口径）、从 `user-export` 的 JSON 备份恢复偏好 / 行程 / 聊天记录与知识片段（知识片段进入共享知识库；单份备份上限 50 MB，重复恢复幂等，最近被删除的会话会被跳过）；补录 / 编辑行程时若与已有行程日期重叠会提示
+- **记忆与用量面板**：在线编辑 / 删除偏好、手动添加常用偏好（常住地 / 交通 / 酒店 / 航司 / 座位 / 餐食 / 预算，多个值用「、」分隔）、查看最近 5 条行程（超过 5 条可「查看全部」展开最近 200 条，展开后可输入关键词按路线 / 日期 / 目的筛选；带「进行中 / 即将出行 / 已结束」状态标签，与其它行程日期重叠时显示「重叠」徽标，新记录可点击回到对应对话、可导出 .ics 日历（含前一天提醒）、CSV 报销台账或可打印的 HTML 台账）与常去目的地、统计、存储后端、技能数量（用户卡片显示，安装后技能缺失可看到「技能 0」）、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体）与近 7 天 tokens 趋势图、运行指标（请求总数 / 平均与最大耗时 / P95 耗时 / 熔断器状态 / 运行时长与缓存会话 / 限流后端，来自 `/api/metrics`），修改用户 ID，导出长期记忆 JSON / Markdown、一键导出全部会话 Markdown 或 HTML（HTML 与 CLI `sessions-export --html` 同一渲染口径）、从 `user-export` 的 JSON 备份恢复偏好 / 行程 / 聊天记录与知识片段（知识片段进入共享知识库；单份备份上限 50 MB，重复恢复幂等，最近被删除的会话会被跳过）；补录 / 编辑行程时若与已有行程日期重叠会提示
 - **消息操作**：复制、重新生成；最后一条提问可就地编辑并重新发送（`Ctrl/⌘ + Enter` 保存、`Esc` 取消）；Markdown 支持标题、列表、引用、表格与代码块（带复制按钮）；会话可导出为 Markdown
 - **跟进建议**：回答完成后根据本轮执行的智能体推荐 2–3 个下一步（如导出行程、查出发当天天气、调整行程），点击即可继续对话
 - **打印 / 导出 PDF**：顶栏打印按钮调用浏览器打印；打印样式隐藏侧栏、输入区、执行路线与操作按钮，适合打印行程单
@@ -641,7 +641,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；与其它行程完全重复时返回 409，返回日期重叠的 `conflicts`） |
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件，含出行前一天 09:00 提醒 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过；每个事件含前一天 09:00 提醒） |
-| GET | `/api/trips/export` | 导出历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开；`q` 与列表接口同一口径过滤后导出） |
+| GET | `/api/trips/export` | 导出历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开）或 HTML 台账（`format=html`，可打印 / 分享）；`q` 与列表接口同一口径过滤后导出 |
 | GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，`order=asc\|desc` 切换记录顺序，`q` 按路线 / 日期 / 目的过滤，附带日期重叠信息） |
 | DELETE | `/api/trips/{id}` | 删除一条历史行程（同步统计与常去目的地） |
 

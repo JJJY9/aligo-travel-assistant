@@ -179,6 +179,78 @@ def render_trip_ics(trip: dict[str, Any], user_id: str) -> str | None:
     return _ics_calendar([event])
 
 
+def render_trips_html(trips: list[dict[str, Any]], user_id: str) -> str:
+    """把行程列表渲染为可打印 / 分享的独立 HTML 报销台账。
+
+    与 CSV / ICS 同一数据口径（全部行程，按出发日期倒序），所有动态文本
+    经 ``html.escape`` 转义；缺少出发日期的行程按「日期未记录」展示。
+    """
+    import html as _html
+
+    def esc(value: object) -> str:
+        return _html.escape(str(value if value is not None else ""))
+
+    def sort_key(trip: dict[str, Any]) -> tuple[str, str]:
+        # trip_id 是 "trip_N" 字符串：同一天内按 id 文本倒序即可，不能 int()
+        return (str(trip.get("start_date") or ""), str(trip.get("trip_id") or ""))
+
+    ordered = sorted(trips, key=sort_key, reverse=True)
+    rows: list[str] = []
+    for trip in ordered:
+        start = str(trip.get("start_date") or "") or "日期未记录"
+        end = str(trip.get("end_date") or "")
+        period = start if not end or end == start else f"{start} ~ {end}"
+        rows.append(
+            "<tr>"
+            f"<td>{esc(trip.get('origin') or '—')}</td>"
+            f"<td>{esc(trip.get('destination') or '—')}</td>"
+            f"<td>{esc(period)}</td>"
+            f"<td>{esc(trip.get('purpose') or '—')}</td>"
+            "</tr>"
+        )
+    table = (
+        "<table><thead><tr><th>出发地</th><th>目的地</th><th>日期</th>"
+        "<th>目的</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+        if rows
+        else '<p class="empty">（暂无行程记录）</p>'
+    )
+    exported_at = datetime.now().isoformat(timespec="seconds")
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aligo 行程台账</title>
+<style>
+  body {{ margin: 0; background: #f2f5f4; color: #14262e;
+    font: 15px/1.6 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }}
+  .page {{ max-width: 860px; margin: 24px auto; padding: 28px 32px;
+    background: #fff; border-radius: 14px; box-shadow: 0 10px 32px rgba(15,36,42,.08); }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  .meta {{ color: #7b8d93; font-size: 12.5px; margin-bottom: 16px; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e9e8; }}
+  th {{ font-size: 12.5px; color: #7b8d93; font-weight: 600; }}
+  .empty {{ color: #7b8d93; }}
+  @media print {{
+    body {{ background: #fff; }}
+    .page {{ margin: 0; padding: 0; box-shadow: none; }}
+  }}
+</style>
+</head>
+<body>
+<div class="page">
+<h1>Aligo 行程台账</h1>
+<div class="meta">用户 {esc(user_id)} · 共 {len(ordered)} 条 · 导出于 {esc(exported_at)}</div>
+{table}
+</div>
+</body>
+</html>
+"""
+
+
 def render_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
     """把全部行程渲染为一个 iCalendar 文件（缺少出发日期的行程跳过）。"""
     events = [

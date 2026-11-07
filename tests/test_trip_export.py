@@ -148,6 +148,40 @@ def test_ics_lines_folded_at_75_bytes():
     print("✓ ICS 超过 75 字节的行折行")
 
 
+def test_render_trips_html():
+    """HTML 台账：内容全部转义、按出发日期倒序、无日期行标注。"""
+    from utils.trip_export import render_trips_html
+
+    trips = [
+        {
+            "trip_id": "trip_2",
+            "origin": "<b>北京</b>",
+            "destination": "上海",
+            "start_date": "2026-12-03",
+            "end_date": "2026-12-05",
+            "purpose": "出差",
+        },
+        {
+            "trip_id": "trip_1",
+            "origin": "",
+            "destination": "杭州",
+            "start_date": "",
+            "end_date": "",
+            "purpose": "",
+        },
+    ]
+    html = render_trips_html(trips, "u<1>")
+    assert html.startswith("<!doctype html>")
+    assert "&lt;b&gt;北京&lt;/b&gt;" in html and "<b>北京</b>" not in html
+    assert "u&lt;1&gt;" in html
+    assert html.index("2026-12-03") < html.index("日期未记录"), "倒序、无日期在后"
+    assert "2026-12-03 ~ 2026-12-05" in html
+    assert "共 2 条" in html
+    empty = render_trips_html([], "u1")
+    assert "（暂无行程记录）" in empty
+    print("✓ HTML 台账渲染（转义 / 排序 / 空数据）")
+
+
 if __name__ == "__main__":
     test_header_and_rows()
     test_formula_prefix_neutralized()
@@ -157,4 +191,5 @@ if __name__ == "__main__":
     test_ics_escape_and_multiple_events()
     test_csv_uses_single_line_endings()
     test_ics_lines_folded_at_75_bytes()
+    test_render_trips_html()
     print("\n全部通过")

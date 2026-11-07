@@ -3715,12 +3715,15 @@ def run_trips_export_standalone(
     force: bool = False,
     ics: bool = False,
     query: str = "",
+    html: bool = False,
 ) -> int:
     """导出全部行程
-    （`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics] [--query 关键词]`）。
+    （`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics|--html] [--query 关键词]`）。
 
     ``ics=True`` 时导出 iCalendar（与 Web 的 /api/trips/calendar 同一实现），
-    否则导出带 BOM 的 CSV；``query`` 先按面板口径过滤再导出。
+    ``html=True`` 时导出可打印的 HTML 台账（与 Web 的 /api/trips/export?
+    format=html 同一实现），否则导出带 BOM 的 CSV；``query`` 先按面板口径
+    过滤再导出。
 
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败
@@ -3729,7 +3732,7 @@ def run_trips_export_standalone(
     from pathlib import Path
 
     from utils.trip_conflicts import filter_trips_by_query
-    from utils.trip_export import render_trips_csv, render_trips_ics
+    from utils.trip_export import render_trips_csv, render_trips_html, render_trips_ics
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -3760,6 +3763,10 @@ def run_trips_export_standalone(
         default_name = "aligo_trips.ics"
         exported = text.count("BEGIN:VEVENT")
         skipped = max(0, len(trips) - exported)
+    elif html:
+        text = render_trips_html(trips, user_id)
+        default_name = "aligo_trips.html"
+        exported = len(trips)
     else:
         text = render_trips_csv(trips)
         default_name = "aligo_trips.csv"
@@ -3799,7 +3806,7 @@ def run_trips_export_standalone(
     except OSError as exc:
         print(f"写入失败：{exc}")
         return 1
-    suffix = "（iCalendar）" if ics else ""
+    suffix = "（iCalendar）" if ics else ("（HTML）" if html else "")
     filter_note = f"，筛选「{needle}」" if needle else ""
     skipped_note = f"，跳过 {skipped} 条缺少出发日期" if skipped else ""
     print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}{skipped_note}")
@@ -5613,20 +5620,27 @@ def main():
                 )
             )
         if arg == "trips-export":
+            trips_usage = (
+                "用法：python cli.py trips-export <user_id> [path] "
+                "[--stdout] [--force] [--ics|--html] [--query 关键词]"
+            )
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                print(
-                    "用法：python cli.py trips-export <user_id> [path] "
-                    "[--stdout] [--force] [--ics] [--query 关键词]"
-                )
+                print(trips_usage)
                 sys.exit(2)
-            parsed_export = _parse_export_args(sys.argv[3:], allow_ics=True)
+            raw_export_args = sys.argv[3:]
+            export_args = [
+                item for item in raw_export_args if item.lower() != "--html"
+            ]
+            html_flag = len(export_args) != len(raw_export_args)
+            parsed_export = _parse_export_args(export_args, allow_ics=True)
             if parsed_export is None:
-                print(
-                    "用法：python cli.py trips-export <user_id> [path] "
-                    "[--stdout] [--force] [--ics] [--query 关键词]"
-                )
+                print(trips_usage)
                 sys.exit(2)
             target, to_stdout, force, ics, export_query = parsed_export
+            if html_flag and ics:
+                # 两种格式互斥：同时指定时不能静默只导一种
+                print(trips_usage)
+                sys.exit(2)
             sys.exit(
                 run_trips_export_standalone(
                     sys.argv[2],
@@ -5635,6 +5649,7 @@ def main():
                     force=force,
                     ics=ics,
                     query=export_query,
+                    html=html_flag,
                 )
             )
         if arg == "trips-import":
