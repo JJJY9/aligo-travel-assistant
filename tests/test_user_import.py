@@ -202,6 +202,40 @@ def test_import_sorts_messages_by_timestamp():
     print("✓ 恢复按时间升序写入")
 
 
+def test_preview_does_not_write_and_matches_import():
+    from utils.user_import import preview_user_import
+
+    sections, errors = parse_user_export(json.dumps(_export_payload(), ensure_ascii=False))
+    assert errors == []
+    store = _real_store("u-preview")
+    preview = preview_user_import(store, sections)
+    assert preview["preferences"] == 2
+    assert preview["trips_created"] == 2 and preview["trips_updated"] == 0
+    assert preview["messages_added"] == 2 and preview["messages_skipped"] == 0
+    assert preview["titles"] == 1 and preview["pinned"] == 1
+    # 预览不写库
+    assert store.get_preference() == {}
+    assert store.get_trip_history(limit=None) == []
+    assert store.get_chat_history(limit=None) == []
+
+    counts = import_user_data(store, sections)
+    for key in (
+        "preferences",
+        "trips_created",
+        "trips_updated",
+        "messages_added",
+        "messages_skipped",
+        "titles",
+        "pinned",
+        "archived",
+    ):
+        assert counts[key] == preview[key], key
+    again = preview_user_import(store, sections)
+    assert again["trips_created"] == 0 and again["trips_updated"] == 2
+    assert again["messages_added"] == 0 and again["messages_skipped"] == 2
+    print("✓ 预览只读且计数与真实恢复一致")
+
+
 def test_exporter_json_is_importable():
     """user-export 实际写出的 JSON 必须能被 user-import 解析（防 schema 漂移）。"""
     from utils.exporter import export_files
@@ -237,11 +271,13 @@ def test_import_duplicate_message_counts():
     print("✓ 重复消息多重集去重")
 
 
-def _run_import(monkeypatch, user_id, path, store, as_json=False):
+def _run_import(monkeypatch, user_id, path, store, as_json=False, dry_run=False):
     monkeypatch.setattr(cli, "_open_cli_store", lambda user_id: store)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = cli.run_user_import_standalone(user_id, path, as_json=as_json)
+        code = cli.run_user_import_standalone(
+            user_id, path, as_json=as_json, dry_run=dry_run
+        )
     return code, buf.getvalue()
 
 
@@ -256,6 +292,21 @@ def test_runner_json_output(monkeypatch):
     assert payload["messages_added"] == 2
     assert payload["skipped"] == []
     print("✓ user-import --json 输出")
+
+
+def test_runner_dry_run(monkeypatch):
+    path = _write_json(_export_payload())
+    store = _real_store("u-dry")
+    code, out = _run_import(
+        monkeypatch, "u-dry", path, store, as_json=True, dry_run=True
+    )
+    payload = json.loads(out)
+    assert code == 0 and payload["dry_run"] is True
+    assert payload["preferences"] == 2 and payload["messages_added"] == 2
+    assert payload["trips_created"] == 2
+    assert store.get_chat_history(limit=None) == []
+    assert store.get_trip_history(limit=None) == []
+    print("✓ user-import --dry-run 预览且不写库")
 
 
 def test_runner_errors(monkeypatch):
@@ -291,17 +342,19 @@ def test_runner_dispatch(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_user_import_standalone",
-        lambda user_id, path, as_json=False: (
-            calls.append((user_id, path, as_json)) or 0
+        lambda user_id, path, as_json=False, dry_run=False: (
+            calls.append((user_id, path, as_json, dry_run)) or 0
         ),
     )
     monkeypatch.setattr(
-        sys, "argv", ["cli.py", "user-import", "u1", "backup.json", "--json"]
+        sys,
+        "argv",
+        ["cli.py", "user-import", "u1", "backup.json", "--json", "--dry-run"],
     )
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls[-1] == ("u1", "backup.json", True)
+    assert calls[-1] == ("u1", "backup.json", True, True)
 
     monkeypatch.setattr(sys, "argv", ["cli.py", "user-import", "u1"])
     with pytest.raises(SystemExit) as exc:
@@ -353,12 +406,14 @@ if __name__ == "__main__":
     test_exporter_json_is_importable()
     test_parse_validates_session_ids_and_usage()
     test_import_sorts_messages_by_timestamp()
+    test_preview_does_not_write_and_matches_import()
     test_parse_tolerates_bad_timestamps_and_rows()
     test_parse_limits_preferences()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (
         test_runner_json_output,
+        test_runner_dry_run,
         test_runner_errors,
         test_runner_rejects_oversized_backup,
         test_runner_dispatch,

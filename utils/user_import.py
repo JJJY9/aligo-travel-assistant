@@ -11,6 +11,7 @@
 """
 import json
 import re
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -260,6 +261,63 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         )
         return {}, errors
     return sections, errors
+
+
+def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
+    """预览恢复结果（只读）：返回与 import_user_data 相同键的计数，不写库。"""
+    result: dict[str, Any] = {
+        "preferences": len(sections.get("preferences", {})),
+        "trips_created": 0,
+        "trips_updated": 0,
+        "messages_added": 0,
+        "messages_skipped": 0,
+        "titles": len(sections.get("titles", {})),
+        "pinned": len(sections.get("pinned", [])),
+        "archived": len(sections.get("archived", [])),
+    }
+
+    def _trip_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+        start = str(row.get("start_date") or "")
+        return (
+            str(row.get("destination") or ""),
+            str(row.get("origin") or ""),
+            start,
+            str(row.get("end_date") or start),
+        )
+
+    pending_keys = {
+        _trip_key(trip) for trip in store.get_trip_history(limit=None)
+    }
+    for row in sections.get("trips", []):
+        key = _trip_key(row)
+        if key in pending_keys:
+            result["trips_updated"] += 1
+        else:
+            result["trips_created"] += 1
+            pending_keys.add(key)
+
+    messages = sections.get("messages", [])
+    if messages:
+        existing = Counter(
+            (
+                message.get("session_id"),
+                message.get("role"),
+                str(message.get("content") or ""),
+            )
+            for message in store.get_chat_history(limit=None)
+        )
+        for message in messages:
+            message_key = (
+                message["session_id"],
+                message["role"],
+                message["content"],
+            )
+            if existing[message_key] > 0:
+                existing[message_key] -= 1
+                result["messages_skipped"] += 1
+            else:
+                result["messages_added"] += 1
+    return result
 
 
 def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
