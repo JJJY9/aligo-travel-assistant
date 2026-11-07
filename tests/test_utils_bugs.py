@@ -322,6 +322,33 @@ def test_extract_user_query_handles_structured_inputs():
     print("✓ 结构化用户提问输入归一为纯文本")
 
 
+def test_robust_json_parse_smart_escaping_control_chars():
+    # 字符串值里出现裸换行 / 裸制表符（非法 JSON）：清洗尝试会移除控制字符后
+    # 成功解析；合法的转义反斜杠（\\）必须原样保留
+    text = '{"reply": "第一行\n第二行", "note": "A\tB", "path": "x\\\\y"}'
+    result = robust_json_parse(text)
+    assert result["reply"] == "第一行第二行"
+    assert result["note"] == "AB"
+    assert result["path"] == "x\\y"
+    print("✓ 裸控制字符的清洗修复与转义反斜杠保真")
+
+
+def test_robust_json_parse_fenced_inputs():
+    assert robust_json_parse('```json\n{"a": 1}\n```') == {"a": 1}
+    assert robust_json_parse('```\n{"b": 2}\n```') == {"b": 2}
+    print("✓ Markdown 代码块包裹的 JSON")
+
+
+def test_extract_response_text_object_attribute():
+    from utils.json_parser import extract_response_text
+
+    class _Obj:
+        text = "对象文本"
+
+    assert extract_response_text(_Obj()) == "对象文本"
+    print("✓ extract_response_text 读取对象 text 属性")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_json_parse_fallback()
@@ -338,6 +365,9 @@ if __name__ == "__main__":
     test_extract_first_json_object_rejects_nested_fragments()
     test_extract_first_json_object_skips_nan_candidate()
     test_robust_json_parse_rejects_nan()
+    test_robust_json_parse_smart_escaping_control_chars()
+    test_robust_json_parse_fenced_inputs()
+    test_extract_response_text_object_attribute()
     test_merge_preference_value_empty_list()
     test_append_preference_empty_list_not_persisted_as_nested()
     test_extract_user_query_handles_structured_inputs()

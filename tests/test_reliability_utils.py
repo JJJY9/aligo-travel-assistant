@@ -359,6 +359,17 @@ def test_memory_persistence_error_does_not_trip_breaker():
     print("✓ 记忆写盘失败不计入熔断器")
 
 
+def test_response_text_dict_and_scalar_shapes():
+    from utils.llm_resilience import _response_text
+
+    assert _response_text({"text": "T"}) == "T"
+    assert _response_text({"content": "C"}) == "C"
+    assert _response_text([{"text": "甲"}, {"text": "乙"}]) == "甲乙"
+    assert _response_text(123) == "123"
+    assert _response_text(None) == ""
+    print("✓ _response_text 的 dict / 列表 / 标量形状")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -373,6 +384,7 @@ if __name__ == "__main__":
         test_probe_owner_only(_mp)
         test_late_success_cannot_close_breaker(_mp)
         test_retry_jitter_respects_max_delay(_mp)
+        test_response_text_dict_and_scalar_shapes()
         test_conversation_ask_releases_probe_on_cancel(_mp)
         test_memory_persistence_error_does_not_trip_breaker()
     finally:
