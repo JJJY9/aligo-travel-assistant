@@ -83,10 +83,91 @@ def test_export_files():
     md_path = next(path for path in paths if path.suffix == ".md")
     assert "用户偏好" in md_path.read_text(encoding="utf-8")
     print("✓ 导出文件写入与 JSON 回读正常")
+def test_render_markdown_renders_assistant_orchestration_json():
+    """助手消息的编排 JSON 要重新渲染为可读 Markdown，而不是截断的原始 JSON。"""
+    from utils.exporter import render_markdown
+
+    assistant = {
+        "role": "assistant",
+        "timestamp": "2026-11-03T15:13:43",
+        "content": json.dumps(
+            {
+                "status": "completed",
+                "results": [
+                    {
+                        "agent_name": "itinerary_planning",
+                        "priority": 1,
+                        "status": "success",
+                        "data": {
+                            "itinerary": {
+                                "title": "北京三日游",
+                                "duration": "3天",
+                                "daily_plans": [],
+                            }
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+    md = render_markdown(
+        {
+            "user_id": "u1",
+            "session_id": "s1",
+            "exported_at": "2026-11-03",
+            "chat_history": [
+                {"role": "user", "timestamp": "t0", "content": "去北京"},
+                assistant,
+            ],
+        }
+    )
+    assert "北京三日游" in md
+    assert '"status": "completed"' not in md, "不能导出原始编排 JSON"
+    print("✓ user-export 渲染助手编排 JSON")
+
+
+def test_render_markdown_escapes_table_cells():
+    """表格与列表里的竖线 / 换行 / 尖括号不能破坏导出结构。"""
+    from utils.exporter import render_markdown
+
+    md = render_markdown(
+        {
+            "user_id": "u1",
+            "session_id": "s1",
+            "exported_at": "2026-11-03",
+            "preferences": {"hotel_brands": "汉庭|如家\n<script>"},
+            "trip_history": [
+                {
+                    "trip_id": "trip_1",
+                    "origin": "北京",
+                    "destination": "上海|杭州",
+                    "start_date": "2026-12-01",
+                    "end_date": "2026-12-02",
+                    "purpose": "出差\n第二行",
+                }
+            ],
+            "statistics": {"frequent_destinations": {"上海|杭州": 2}},
+            "chat_history": [],
+        }
+    )
+    assert "汉庭\\|如家" in md
+    assert "<script>" not in md and "&lt;script&gt;" in md
+    table_rows = [
+        line
+        for line in md.splitlines()
+        if line.startswith("|") and "trip_1" in line
+    ]
+    assert len(table_rows) == 1, "换行不能把一行表格拆成两行"
+    assert "出差 第二行" in table_rows[0]
+    assert "上海\\|杭州" in md
+    print("✓ 导出表格转义竖线 / 换行 / 尖括号")
 
 
 if __name__ == "__main__":
     test_memory_manager_export_data()
     test_render_markdown()
+    test_render_markdown_renders_assistant_orchestration_json()
+    test_render_markdown_escapes_table_cells()
     test_export_files()
     print("\n全部通过")

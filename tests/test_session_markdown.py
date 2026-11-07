@@ -41,6 +41,24 @@ def test_group_sessions_orders_by_recent_update():
     print("✓ 全部会话分组 / 排序 / 标题回退")
 
 
+def test_custom_title_single_line_and_escaped():
+    """自定义会话标题的换行 / 尖括号不能伪造导出结构或落盘为 HTML。"""
+    from utils.session_markdown import render_all_sessions_markdown
+
+    lines = [
+        {"role": "user", "content": "你好", "session_id": "s1", "timestamp": "t0"}
+    ]
+    markdown, count = render_all_sessions_markdown(
+        "u1", lines, {"s1": "第一行\n## 伪造标题 <script>"}
+    )
+    assert count == 1
+    assert "## 第一行 ## 伪造标题 &lt;script&gt;" in markdown
+    assert "\n## 伪造标题" not in markdown, "换行不能再造一个新的二级标题"
+    assert "<script>" not in markdown
+    print("✓ 会话标题单行化并转义")
+
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
+    test_custom_title_single_line_and_escaped()
     print("\n全部通过")

@@ -20,9 +20,13 @@ def render_stored_message(message: dict[str, Any]) -> str:
         data = json.loads(content)
     except json.JSONDecodeError:
         return content
+    status = data.get("status") if isinstance(data, dict) else None
     if isinstance(data, dict) and (
         "results" in data
-        or data.get("status") in {"completed", "partial_failure", "no_agents"}
+        or (
+            isinstance(status, str)
+            and status in {"completed", "partial_failure", "no_agents"}
+        )
     ):
         try:
             return result_to_markdown(data)
