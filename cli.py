@@ -1019,6 +1019,23 @@ def run_health_check_standalone(as_json: bool = False) -> int:
     import contextlib
     import io
 
+    if init_agentscope is None:
+        message = (
+            "缺少运行时依赖，无法执行健康检查"
+            "（pip install -r requirements.txt 或 pip install -e .）"
+        )
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "message": message},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"FAIL: {message}")
+        return 1
+
     def _probe() -> tuple[bool, str]:
         init_agentscope()
         return asyncio.run(
@@ -1099,6 +1116,22 @@ def _parse_json_flag(args: list[str], usage: str) -> bool | None:
         return bool(args)
     print(f"用法：{usage}")
     return None
+
+
+def _parse_strict_date(value: str):
+    """严格解析 YYYY-MM-DD；不补零写法（2026-1-1）返回 None。
+
+    strptime 会接受未补零的日期，同一天换种写法即可绕过去重、生成重复行程。
+    """
+    from datetime import datetime
+
+    try:
+        parsed = datetime.strptime(str(value), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    if parsed.strftime("%Y-%m-%d") != str(value):
+        return None
+    return parsed
 
 
 def _valid_user_id(value: str) -> bool:
@@ -1806,8 +1839,7 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"读取失败：{exc}")
     if document is None:
-        print(f"知识点 #{doc_id} 不存在")
-        return 1
+        return _fail(f"知识点 #{doc_id} 不存在")
     if as_json:
         print(json.dumps(document, ensure_ascii=False, indent=2))
         return 0
@@ -1988,6 +2020,9 @@ def _read_kb_file(path: str) -> str | None:
 
     try:
         text = Path(path).read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        print(f"读取文件失败：{exc}（文件需为 UTF-8 编码）")
+        return None
     except OSError as exc:
         print(f"读取文件失败：{exc}")
         return None
@@ -2580,6 +2615,8 @@ def _local_timestamp_text(value: str) -> str:
 
 def _session_summaries(store) -> list[dict]:
     """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。"""
+    from utils.stored_message import render_stored_message
+
     history = store.get_chat_history()
     titles = store.get_session_titles() or {}
     pinned = {str(item) for item in (store.get_pinned_sessions() or [])}
@@ -2602,7 +2639,13 @@ def _session_summaries(store) -> list[dict]:
             title = " ".join(str(message.get("content", "")).split())
             if title:
                 entry["title"] = title[:40]
-        content = " ".join(str(message.get("content", "")).split())
+        # 助手消息存的是编排 JSON：用渲染后的正文做关键词匹配（与 Web
+        # 面板同口径），直接匹配原始 JSON 会把「回答里有没有某个词」判错
+        if message.get("role") == "user":
+            raw_text = str(message.get("content", ""))
+        else:
+            raw_text = render_stored_message(message)
+        content = " ".join(raw_text.split())
         if content:
             entry.setdefault("_parts", []).append(content)
     for entry in grouped.values():
@@ -2784,7 +2827,9 @@ def run_session_archive_standalone(
         if not exists:
             return _fail(f"会话 {session_id} 不存在或没有消息")
         try:
-            store.set_session_archived(session_id, archived)
+            applied = store.set_session_archived(session_id, archived)
+            if applied is False:
+                return _fail(f"会话 {session_id} 操作未生效（可能已被删除）")
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"操作失败：{exc}")
     finally:
@@ -2858,7 +2903,9 @@ def run_session_title_standalone(
         if not exists:
             return _fail(f"会话 {session_id} 不存在或没有消息")
         try:
-            store.set_session_title(session_id, cleaned)
+            applied = store.set_session_title(session_id, cleaned)
+            if applied is False:
+                return _fail(f"会话 {session_id} 操作未生效（可能已被删除）")
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"操作失败：{exc}")
         try:
@@ -2932,7 +2979,9 @@ def run_session_pin_standalone(
         if not exists:
             return _fail(f"会话 {session_id} 不存在或没有消息")
         try:
-            store.set_session_pinned(session_id, pinned)
+            applied = store.set_session_pinned(session_id, pinned)
+            if applied is False:
+                return _fail(f"会话 {session_id} 操作未生效（可能已被删除）")
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"操作失败：{exc}")
         try:
@@ -3158,6 +3207,12 @@ def run_session_export_standalone(
         return 1
 
     title = str(titles.get(session_id) or "")
+    if title:
+        # 自定义标题来自用户：换行会伪造导出结构、尖括号会当 HTML 落盘
+        # （与 sessions-export / Web 导出同一清洗逻辑）
+        from utils.session_markdown import sanitize_title
+
+        title = sanitize_title(title)
     if not title:
         for message in messages:
             if message.get("role") == "user":
@@ -3324,9 +3379,17 @@ def run_trips_export_standalone(
             # ICS 行尾已是 \r\n：文本模式在 Windows 会再次翻译；优先写字节
             buffer = getattr(sys.stdout, "buffer", None)
             if buffer is not None:
-                sys.stdout.flush()
-                buffer.write(text.encode("utf-8"))
-                buffer.flush()
+                try:
+                    sys.stdout.flush()
+                    buffer.write(text.encode("utf-8"))
+                    buffer.flush()
+                except BrokenPipeError:
+                    # 与 _print_stdout 一致：下游提前关闭（| head）时静默收尾
+                    try:
+                        devnull = os.open(os.devnull, os.O_WRONLY)
+                        os.dup2(devnull, sys.stdout.fileno())
+                    except Exception:
+                        pass
             else:
                 _print_stdout(text, end="")
         else:
@@ -3426,7 +3489,6 @@ def run_trip_add_standalone(
         0 保存成功；1 参数 / 读取 / 写入失败
     """
     import re
-    from datetime import datetime
 
     from utils.trip_conflicts import find_saved_trip, trip_conflicts
 
@@ -3445,15 +3507,13 @@ def run_trip_add_standalone(
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    except ValueError:
+    start_dt = _parse_strict_date(start_date)
+    if start_dt is None:
         return _fail(f"出发日期格式应为 YYYY-MM-DD：{start_date}")
     end_dt = None
     if end_date:
-        try:
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        except ValueError:
+        end_dt = _parse_strict_date(end_date)
+        if end_dt is None:
             return _fail(f"返程日期格式应为 YYYY-MM-DD：{end_date}")
         if end_dt < start_dt:
             return _fail("结束日期不能早于出发日期")
@@ -3694,7 +3754,6 @@ def run_trip_update_standalone(
         0 更新成功；1 参数 / 读取 / 写入失败（含行程不存在）
     """
     import re
-    from datetime import datetime
 
     from utils.trip_conflicts import trip_conflicts
 
@@ -3742,15 +3801,18 @@ def run_trip_update_standalone(
             return _fail(f"行程 {trip_id} 不存在")
         merged = {**matches[0], **mapped}
 
+        # 只严格校验本次提交的日期字段：合并结果里的历史脏日期不能阻断
+        # 仅修改目的 / 出发地等其它字段的请求（与 Web PUT 同口径）
         start_dt = end_dt = None
         for key, label in (("start_date", "出发日期"), ("end_date", "返程日期")):
             raw = str(merged.get(key) or "")
             if not raw:
                 continue
-            try:
-                parsed = datetime.strptime(raw, "%Y-%m-%d")
-            except ValueError:
-                return _fail(f"{label}格式应为 YYYY-MM-DD：{raw}")
+            parsed = _parse_strict_date(raw)
+            if parsed is None:
+                if key in mapped:
+                    return _fail(f"{label}格式应为 YYYY-MM-DD：{raw}")
+                continue
             if key == "start_date":
                 start_dt = parsed
             else:
@@ -3918,6 +3980,8 @@ def run_trips_import_standalone(
         text = io.open(csv_path, "r", encoding="utf-8-sig").read()
     except FileNotFoundError:
         return _fail(f"文件不存在：{csv_path}")
+    except UnicodeDecodeError as exc:
+        return _fail(f"读取 CSV 失败：{exc}（文件需为 UTF-8 编码）")
     except OSError as exc:
         return _fail(f"读取 CSV 失败：{exc}")
 

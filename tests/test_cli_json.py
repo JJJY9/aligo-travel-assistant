@@ -83,11 +83,23 @@ def test_kb_status_json(monkeypatch):
     print("✓ kb --json 不可用退出码 1")
 
 
+def test_health_missing_runtime_dependencies(monkeypatch):
+    """运行时依赖导入失败时给出提示而不是对 None 调用。"""
+    monkeypatch.setattr(cli, "init_agentscope", None)
+    code, out = _capture(cli.run_health_check_standalone, True)
+    payload = json.loads(out)
+    assert code == 1
+    assert payload["ok"] is False and "缺少运行时依赖" in payload["message"]
+    code, out = _capture(cli.run_health_check_standalone, False)
+    assert code == 1 and "FAIL" in out
+    print("✓ health 缺少运行时依赖时友好失败")
+
 if __name__ == "__main__":
     for case in (
         test_health_json_ok,
         test_health_json_failure,
         test_kb_status_json,
+        test_health_missing_runtime_dependencies,
     ):
         mp = pytest.MonkeyPatch()
         try:

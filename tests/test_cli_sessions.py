@@ -920,6 +920,77 @@ def test_interactive_user_id_validation(monkeypatch):
     print("✓ 交互式用户 ID 校验（拒绝路径穿越 / 短横线开头）")
 
 
+def test_session_title_ignores_stale_false(monkeypatch):
+    """存在性预检后会话被并发删除：set_session_* 返回 False 不能报成功。"""
+    store = _TitleStore(
+        [_message("user", "内容", "s-active")], titles={"s-active": "旧标题"}
+    )
+
+    def stale(self, session_id, title):
+        return False
+
+    monkeypatch.setattr(_TitleStore, "set_session_title", stale)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_title_standalone("u1", "s-active", "新标题")
+    assert code == 1 and "未生效" in out.getvalue()
+    print("✓ 会话操作检查 set_session_* 返回值")
+
+
+def test_session_export_sanitizes_custom_title(monkeypatch):
+    """自定义标题的换行 / HTML 不能伪造导出结构或原样落盘。"""
+    fake = _sessions_store()
+    fake.titles["s-active"] = "正常标题\n# 伪造标题 <script>"
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_export("u1", "s-active", to_stdout=True)
+    assert code == 0
+    assert "# 正常标题 # 伪造标题 &lt;script&gt;" in out
+    assert "\n# 伪造标题" not in out
+    assert "<script>" not in out
+    print("✓ session-export 标题单行化并转义")
+
+
+def test_sessions_query_matches_rendered_assistant_content(monkeypatch):
+    """--query 用渲染后的助手正文匹配：原始 JSON 的字段名不算命中。"""
+    import json as json_module
+
+    fake = _sessions_store()
+    rendered = json_module.dumps(
+        {
+            "status": "completed",
+            "results": [
+                {
+                    "agent_name": "rag_knowledge",
+                    "priority": 1,
+                    "status": "success",
+                    "data": {"answer": "推荐入住汉庭酒店"},
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    fake.messages = [
+        {
+            "role": "user",
+            "content": "住哪里",
+            "session_id": "s-json",
+            "timestamp": "2026-11-01T00:00:00",
+        },
+        {
+            "role": "assistant",
+            "content": rendered,
+            "session_id": "s-json",
+            "timestamp": "2026-11-01T00:00:01",
+        },
+    ]
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_list("u1", query="汉庭")
+    assert code == 0 and "s-json" in out
+    code, out = _run_list("u1", query="status")
+    assert code == 0 and "没有匹配" in out, "原始 JSON 字段名不应算命中"
+    print("✓ sessions --query 匹配渲染后的助手正文")
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
     test_session_export_flag_parsing()
@@ -964,4 +1035,7 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+        test_session_title_ignores_stale_false(mp)
+        test_session_export_sanitizes_custom_title(mp)
+        test_sessions_query_matches_rendered_assistant_content(mp)
     print("\n全部通过")

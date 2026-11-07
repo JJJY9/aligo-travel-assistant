@@ -22,6 +22,17 @@ def _normalize_header(cell: str) -> str:
     return str(cell or "").strip().lstrip("﻿")
 
 
+def _strict_date(value: str) -> "datetime | None":
+    """严格 YYYY-MM-DD：不补零写法（2026-1-1）视为非法，避免绕过去重。"""
+    try:
+        parsed = datetime.strptime(str(value), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    if parsed.strftime("%Y-%m-%d") != str(value):
+        return None
+    return parsed
+
+
 def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
     """解析并校验行程 CSV，返回 ``(有效行程, [(行号, 原因)])``（行号从 2 起）。"""
     reader = csv.reader(io.StringIO(text))
@@ -58,15 +69,13 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         if not destination:
             errors.append((line_no, "目的地为空"))
             continue
-        try:
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        except ValueError:
+        start_dt = _strict_date(start_date)
+        if start_dt is None:
             errors.append((line_no, f"出发日期格式应为 YYYY-MM-DD：{start_date}"))
             continue
         if end_date:
-            try:
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-            except ValueError:
+            end_dt = _strict_date(end_date)
+            if end_dt is None:
                 errors.append((line_no, f"返程日期格式应为 YYYY-MM-DD：{end_date}"))
                 continue
             if end_dt < start_dt:

@@ -164,6 +164,27 @@ def test_runner_errors(monkeypatch):
     print("✓ 非法用户 / 文件不存在 / 无有效行均失败退出")
 
 
+def test_runner_rejects_gbk_csv(monkeypatch):
+    """GBK 编码的 CSV：友好报错（--json 也有结构化输出）。"""
+    store = _ImportStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    path = os.path.join(tempfile.mkdtemp(prefix="chailv_import_"), "gbk.csv")
+    with io.open(path, "wb") as handle:
+        handle.write("出发地,目的地,出发日期\n北京,上海,2026-12-01\n".encode("gbk"))
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone("u-gbk", path, as_json=True)
+    finally:
+        sys.stdout = real_stdout
+    assert code == 1
+    payload = json.loads(captured.getvalue())
+    assert payload["ok"] is False and "UTF-8" in payload["error"]
+    print("✓ GBK CSV 友好报错")
+
 if __name__ == "__main__":
     import pytest
 
@@ -180,4 +201,5 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+        test_runner_rejects_gbk_csv(mp)
     print("\n全部通过")

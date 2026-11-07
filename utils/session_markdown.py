@@ -5,15 +5,18 @@ from typing import Any
 from utils.stored_message import render_stored_message
 
 
+def sanitize_title(title: str) -> str:
+    """导出用标题清洗：换行会伪造导出结构，尖括号转义避免当 HTML 落盘。"""
+    text = " ".join(str(title or "").split())
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _session_title(
     session_id: str, messages: list[dict[str, Any]], titles: dict[str, str]
 ) -> str:
     title = str(titles.get(session_id) or "").strip()
     if title:
-        # 自定义标题来自用户：换行会伪造导出结构，尖括号转义避免当 HTML
-        # 落盘；保留首行前的内容为单行标题
-        title = " ".join(title.split())
-        return title.replace("<", "&lt;").replace(">", "&gt;")
+        return sanitize_title(title)
     for message in messages:
         if message.get("role") == "user":
             text = " ".join(str(message.get("content", "")).split())
