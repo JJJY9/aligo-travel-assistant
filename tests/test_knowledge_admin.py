@@ -368,7 +368,7 @@ def test_import_documents_sanitizes(monkeypatch):
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
-    agent = _FakeAgent({"status": "success", "ids": [1, 2], "total_count": 2})
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
 
     long_content = "".join(f"第{i}段。" for i in range(500))
@@ -380,29 +380,34 @@ def test_import_documents_sanitizes(monkeypatch):
             {"content": None},
             {"content": False},
             {"content": 0},
-            {
-                "content": long_content,
-                "metadata": {f"k{i}": "v" * 300 for i in range(15)},
-            },
+            {"content": long_content, "metadata": {}},
         ]
     )
     assert result == {
-        "imported": 2,
-        "skipped": 5,
-        "skipped_invalid": 5,
+        "imported": 1,
+        "skipped": 6,
+        "skipped_invalid": 6,
         "skipped_duplicate": 0,
-    }
+    }, "超长单条内容按无效项跳过（不再静默截断）"
     sent = agent.calls[0]
     assert sent[0]["content"] == "a"
-    assert all(len(item["content"]) <= 400 for item in sent)
-    assert "".join(item["content"] for item in sent[1:]) == long_content[:2000]
-    assert all(item["content"] not in ("None", "False", "0") for item in sent)
-    meta = sent[1]["metadata"]
+
+    # 元数据清洗与分片标记：用不超过上限的长内容单独验证
+    agent2 = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent2)
+    medium = "内容" * 300
+    knowledge_admin.import_documents(
+        [{"content": medium, "metadata": {f"k{i}": "v" * 300 for i in range(15)}}]
+    )
+    sent2 = agent2.calls[0]
+    assert all(len(item["content"]) <= 400 for item in sent2)
+    assert "".join(item["content"] for item in sent2) == medium
+    meta = sent2[0]["metadata"]
     user_keys = {key for key in meta if key not in {"part", "parts", "group"}}
     assert len(user_keys) == 10, "用户元数据仍按 10 键清洗"
     assert {"part", "parts", "group"} <= set(meta), "分片标记必须写入"
     assert max(len(meta[key]) for key in user_keys) == 200
-    print("✓ 导入知识片段（跳过空项 / 非字符串内容 / 截断超长字段 / 长内容拆分）")
+    print("✓ 导入知识片段（空项 / 非字符串跳过，超长按无效项，长内容拆分）")
 
 
 def test_add_document_splits_long_content(monkeypatch):
@@ -1459,6 +1464,37 @@ def test_import_chunks_large_documents(monkeypatch):
     print("✓ 大文件导入按 500 条分块嵌入 / 插入")
 
 
+def test_import_rejects_oversized_single_content(monkeypatch):
+    """单条导入内容超过上限：明确报错而不是静默截断。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _Agent:
+        def add_documents(self, documents):
+            return {"status": "success", "ids": [], "total_count": 0}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    oversized = "长" * (knowledge_admin._IMPORT_CONTENT_MAX_CHARS + 10)
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {"status": "success", "ids": [], "total_count": 0}
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.import_documents(
+        [{"content": oversized, "metadata": {}}]
+    )
+    assert result["imported"] == 0
+    assert result["skipped_invalid"] == 1, "超长内容按无效项跳过"
+    assert agent.calls == [], "超长内容不能被截断后写入"
+    print("✓ 单条导入超限按无效项跳过（不静默截断）")
+
 if __name__ == "__main__":
     for case in (
         test_list_documents_parses_sorts_and_filters,
@@ -1517,4 +1553,5 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+        test_import_rejects_oversized_single_content(mp)
     print("\n全部通过")
