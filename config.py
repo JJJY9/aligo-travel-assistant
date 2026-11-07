@@ -17,16 +17,29 @@ from typing import TypedDict
 #           LLM_MODEL_NAME=doubao-seed-1-6-flash-250828
 #   OpenAI: LLM_BASE_URL=https://api.openai.com/v1
 #           LLM_MODEL_NAME=gpt-4o-mini
-_api_key = os.environ.get("LLM_API_KEY", "")
+def _env_str(name: str, default: str) -> str:
+    """环境变量存在但为空 / 纯空白时回退默认值（Docker / K8s 常见空注入）。"""
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+# 密钥必须 strip：复制粘贴带尾随空格 / 换行时，httpx 会拒绝非法 header
+# 值（Bearer sk-xxx␠），所有请求变成「Connection error」且异常链带完整
+# 密钥进日志；纯空白值按未设置处理（否则会阻止回退 config_local.py）
+_api_key = os.environ.get("LLM_API_KEY", "").strip()
 if not _api_key:
     try:
         # 本地私有配置（已 gitignore）。注意不要用 import ... as _api_key 的写法：
         # config_local.py 不存在时 mypy 会报 "Name already defined [no-redef]"
         from config_local import API_KEY
 
-        _api_key = API_KEY
-    except ImportError:
-        pass
+        _api_key = str(API_KEY or "").strip()
+    except ImportError as exc:
+        # 只吞掉「config_local 不存在 / 没有 API_KEY」；文件里自身 import 失败
+        # （例如先 import 了未安装的模块再写密钥）必须暴露，否则有效密钥
+        # 被静默忽略、各处误报「未配置 API Key」
+        if getattr(exc, "name", "") != "config_local":
+            raise
 
 
 class LLMConfig(TypedDict):
@@ -79,8 +92,8 @@ class RateLimitConfig(TypedDict):
 
 LLM_CONFIG: LLMConfig = {
     "api_key": _api_key,
-    "model_name": os.environ.get("LLM_MODEL_NAME", "deepseek-chat"),
-    "base_url": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
+    "model_name": _env_str("LLM_MODEL_NAME", "deepseek-chat"),
+    "base_url": _env_str("LLM_BASE_URL", "https://api.deepseek.com"),
     "temperature": 0.7,
     "max_tokens": 8192,
 }

@@ -111,6 +111,7 @@ def create_chat_model(
     timeout: float | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    max_retries: int | None = None,
 ):
     """
     创建 OpenAI 兼容的聊天模型实例（默认 DeepSeek）。
@@ -136,6 +137,12 @@ def create_chat_model(
                 "base_url": base_url or LLM_CONFIG["base_url"],
                 "timeout": float(
                     timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
+                ),
+                # OpenAI SDK 默认 max_retries=2：健康检查等「单次请求」场景会
+                # 被放大成 3 次、整体耗时超出调用方给的 timeout；需要时由调用方
+                # 显式传 0（应用层的 retry_with_backoff 才是重试的唯一入口）
+                "max_retries": int(
+                    2 if max_retries is None else max_retries
                 ),
             },
             generate_kwargs={

@@ -450,6 +450,33 @@ def test_health_check_error_paths(monkeypatch):
     print("✓ 健康检查的 ImportError 与异常路径")
 
 
+def test_health_check_enforces_overall_timeout(monkeypatch):
+    """timeout_sec 是整体预算：慢模型被截断，且 SDK 内建重试关闭。"""
+    import time as _time
+
+    captured = {}
+
+    class _SlowModel:
+        async def __call__(self, messages):
+            await asyncio.sleep(5)
+            return "ok"
+
+    def fake_create(**kwargs):
+        captured["kwargs"] = kwargs
+        return _SlowModel()
+
+    fake_module = types.ModuleType("config_agentscope")
+    fake_module.create_chat_model = fake_create  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "config_agentscope", fake_module)
+    started = _time.monotonic()
+    ok, message = asyncio.run(run_health_check("http://x", "k", "m", timeout_sec=0.2))
+    elapsed = _time.monotonic() - started
+    assert ok is False and "超时" in message
+    assert elapsed < 2.0, elapsed
+    assert captured["kwargs"].get("max_retries") == 0, "健康检查必须关闭 SDK 重试"
+    print("✓ 健康检查整体超时与 SDK 重试关闭")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -467,6 +494,7 @@ if __name__ == "__main__":
         test_response_text_dict_and_scalar_shapes()
         test_retry_error_edges_and_response_shapes()
         test_health_check_error_paths(_mp)
+        test_health_check_enforces_overall_timeout(_mp)
         test_conversation_ask_releases_probe_on_cancel(_mp)
         test_memory_persistence_error_does_not_trip_breaker()
     finally:
