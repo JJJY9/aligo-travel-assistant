@@ -91,6 +91,63 @@ def test_readline_line_by_line():
     print("✓ 逐行读取自动解码")
 
 
+def test_readline_size_preserves_unread_remainder():
+    """readline(size) 截断后的余量留待下一次读取（TextIO 契约），size=0 不消费。"""
+    from utils.console import _AutoDecodeInput
+
+    payload = "第一行内容\n第二行\n".encode("gbk")
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.readline(3) == "第一行"
+    assert shim.readline() == "内容\n", "截断后的余量必须留给下一次 readline"
+    assert shim.readline() == "第二行\n"
+    assert shim.readline() == ""
+
+    shim2 = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim2.readline(0) == ""
+    assert shim2.readline() == "第一行内容\n", "size=0 不消费输入"
+    assert shim2.readline(10**6) == "第二行\n", "超大 size 返回整行"
+    print("✓ readline(size) 保留未读余量")
+
+
+def test_read_size_preserves_unread_remainder():
+    """read(size) 截断后的余量留待下一次读取；分块复制不丢内容。"""
+    import shutil
+
+    from utils.console import _AutoDecodeInput
+
+    payload = "第一行内容\n第二行\n".encode("gbk")
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.read(3) == "第一行"
+    assert shim.read() == "内容\n第二行\n", "截断后的余量必须留给下一次 read"
+    assert shim.read() == ""
+
+    shim2 = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim2.read(0) == ""
+    assert shim2.read() == "第一行内容\n第二行\n", "size=0 不消费"
+
+    # 分块复制的真实消费者（如 shutil.copyfileobj）不得截断输入
+    src = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    out = io.StringIO()
+    shutil.copyfileobj(src, out, length=8)
+    assert out.getvalue() == "第一行内容\n第二行\n"
+    print("✓ read(size) 保留未读余量（copyfileobj 不丢内容）")
+
+
+def test_readline_utf16_lines_and_size():
+    """UTF-16 输入的逐行 pop 路径与 size 截断都要覆盖。"""
+    from utils.console import _AutoDecodeInput
+
+    payload = "第一行\n第二行\n".encode("utf-16")
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.readline() == "第一行\n"
+    assert shim.readline() == "第二行\n"
+    assert shim.readline() == ""
+
+    shim2 = _AutoDecodeInput(_PipeBuffer("第一行\n".encode("utf-16")), "gbk")
+    assert shim2.readline(2) == "第一"
+    assert shim2.readline() == "行\n"
+    print("✓ UTF-16 逐行 readline 与 size 截断")
+
 def test_probe_stdin_false_leaves_stream_untouched(monkeypatch):
     """一次性命令跳过 stdin：不包装、不触碰（也不会 peek 阻塞）。"""
 
@@ -155,6 +212,9 @@ if __name__ == "__main__":
         test_auto_decode_utf8_and_gbk()
         test_auto_decode_bom_encodings()
         test_readline_line_by_line()
+        test_readline_size_preserves_unread_remainder()
+        test_read_size_preserves_unread_remainder()
+        test_readline_utf16_lines_and_size()
         test_probe_stdin_false_leaves_stream_untouched(mp)
         test_non_tty_pipe_is_wrapped(mp)
     finally:

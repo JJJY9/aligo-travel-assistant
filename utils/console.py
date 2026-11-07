@@ -34,6 +34,9 @@ class _AutoDecodeInput:
         # None=尚未判定；"auto"=逐行判断；"utf-8-sig"=BOM；"utf-16"=行已拆好
         self._mode: str | None = None
         self._lines: list[str] = []
+        # readline(size) / read(size) 截断后剩余的文本：TextIO 契约要求
+        # 未返回的部分留在流里供下一次读取，不能丢弃（输入会被静默截断）
+        self._pending = ""
 
     @property
     def encoding(self) -> str:
@@ -95,7 +98,10 @@ class _AutoDecodeInput:
 
     def readline(self, size: int | None = -1) -> str:
         self._ensure_mode()
-        if self._lines:
+        if self._pending:
+            line = self._pending
+            self._pending = ""
+        elif self._lines:
             line = self._lines.pop(0)
         else:
             raw = self._buffer.readline()
@@ -104,11 +110,19 @@ class _AutoDecodeInput:
             line = self._decode_line(raw)
         if size is None or size < 0:
             return line
-        return line[:size]
+        if size < len(line):
+            # 截断的剩余部分留待下次读取（size=0 时不消费任何输入）
+            self._pending = line[size:]
+            return line[:size]
+        return line
 
     def read(self, size: int | None = -1) -> str:
         self._ensure_mode()
-        parts: list[str] = list(self._lines)
+        parts: list[str] = []
+        if self._pending:
+            parts.append(self._pending)
+            self._pending = ""
+        parts.extend(self._lines)
         self._lines = []
         read_all = getattr(self._buffer, "read", None)
         if callable(read_all):
@@ -121,7 +135,11 @@ class _AutoDecodeInput:
         text = "".join(parts)
         if size is None or size < 0:
             return text
-        return text[:size]
+        if size < len(text):
+            # 截断后的余量保留，下一次 read/readline 继续返回（size=0 不消费）
+            self._pending = text[size:]
+            return text[:size]
+        return text
 
 
 def _reconfigure(stream_name: str, encoding: str) -> None:
