@@ -30,27 +30,37 @@ class _ImportStore:
     def get_trip_history(self, limit=None):
         return [dict(trip) for trip in self.trips]
 
-    def save_trip_history(self, trip):
-        self.saved.append(dict(trip))
-        key = (
+    @staticmethod
+    def _key(trip):
+        start = trip.get("start_date") or ""
+        return (
             trip.get("origin"),
             trip.get("destination"),
-            trip.get("start_date"),
-            trip.get("end_date"),
+            start,
+            trip.get("end_date") or start,
         )
+
+    def save_trip_history(self, trip):
+        self.saved.append(dict(trip))
+        key = self._key(trip)
         for existing in self.trips:
-            existing_key = (
-                existing.get("origin"),
-                existing.get("destination"),
-                existing.get("start_date"),
-                existing.get("end_date"),
-            )
-            if existing_key == key:
+            if self._key(existing) == key:
                 existing.update(trip)
                 return existing.get("trip_id")
         new = {**trip, "trip_id": f"trip_{len(self.trips) + 1}"}
         self.trips.append(new)
         return new["trip_id"]
+
+    def save_trip_histories(self, rows):
+        created = updated = 0
+        for row in rows:
+            hit = any(self._key(existing) == self._key(row) for existing in self.trips)
+            self.save_trip_history(row)
+            if hit:
+                updated += 1
+            else:
+                created += 1
+        return created, updated
 
     def close(self):
         self.closed = True
@@ -171,6 +181,58 @@ def test_runner_json_output_and_skipped(monkeypatch):
     assert payload["rows"] == 1 and payload["created"] == 1
     assert payload["skipped"][0]["line"] == 3
     print("✓ --json 输出与跳过清单")
+
+
+def test_runner_dry_run_preview(monkeypatch):
+    store = _ImportStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    rows_text = chr(10).join([
+        "出发地,目的地,出发日期,返程日期,目的",
+        "北京,上海,2026-12-01,2026-12-03,出差",
+        "北京,广州,2026-12-10,,培训",
+        "",
+    ])
+    path = _write_csv(rows_text)
+
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone(
+            "u-dry", path, as_json=True, dry_run=True
+        )
+    finally:
+        sys.stdout = real_stdout
+    payload = json.loads(captured.getvalue())
+    assert code == 0 and payload["dry_run"] is True
+    assert payload["created"] == 2 and payload["updated"] == 0
+    assert store.trips == [] and store.saved == [], "预览不得写库"
+
+    captured = io.StringIO()
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone("u-dry", path, as_json=True)
+    finally:
+        sys.stdout = real_stdout
+    real = json.loads(captured.getvalue())
+    assert real["dry_run"] is False
+    assert real["created"] == payload["created"]
+    assert real["updated"] == payload["updated"]
+    assert len(store.trips) == 2
+
+    captured = io.StringIO()
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone(
+            "u-dry", path, as_json=True, dry_run=True
+        )
+    finally:
+        sys.stdout = real_stdout
+    again = json.loads(captured.getvalue())
+    assert again["created"] == 0 and again["updated"] == 2
+    print("✓ trips-import --dry-run 预览且与真实导入一致")
 
 
 def test_runner_errors(monkeypatch):
@@ -363,8 +425,8 @@ def test_runner_dispatch_ics(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_trips_import_standalone",
-        lambda user_id, path, as_json=False, as_ics=False: (
-            calls.append((user_id, path, as_json, as_ics)) or 0
+        lambda user_id, path, as_json=False, as_ics=False, dry_run=False: (
+            calls.append((user_id, path, as_json, as_ics, dry_run)) or 0
         ),
     )
     monkeypatch.setattr(
@@ -373,13 +435,21 @@ def test_runner_dispatch_ics(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls[-1] == ("u1", "x.ics", True, True)
+    assert calls[-1] == ("u1", "x.ics", True, True, False)
+
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "trips-import", "u1", "x.ics", "--dry-run"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", "x.ics", False, False, True)
 
     monkeypatch.setattr(sys, "argv", ["cli.py", "trips-import", "u1", "--ics"])
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 2
-    print("✓ trips-import dispatch --ics")
+    print("✓ trips-import dispatch --ics / --dry-run")
 
 
 if __name__ == "__main__":
@@ -392,6 +462,7 @@ if __name__ == "__main__":
     test_ics_external_summary_fallback()
     for case in (
         test_runner_imports_and_dedupes,
+        test_runner_dry_run_preview,
         test_runner_json_output_and_skipped,
         test_runner_errors,
         test_runner_rejects_gbk_csv,

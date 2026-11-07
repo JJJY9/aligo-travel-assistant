@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.timestamps import chronological_key
-from utils.trip_import import _strict_date
+from utils.trip_import import _strict_date, trip_identity
 
 _MAX_PREFERENCES = 200
 _MAX_TRIPS = 5000
@@ -276,20 +276,11 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         "archived": len(sections.get("archived", [])),
     }
 
-    def _trip_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
-        start = str(row.get("start_date") or "")
-        return (
-            str(row.get("destination") or ""),
-            str(row.get("origin") or ""),
-            start,
-            str(row.get("end_date") or start),
-        )
-
     pending_keys = {
-        _trip_key(trip) for trip in store.get_trip_history(limit=None)
+        trip_identity(trip) for trip in store.get_trip_history(limit=None)
     }
     for row in sections.get("trips", []):
-        key = _trip_key(row)
+        key = trip_identity(row)
         if key in pending_keys:
             result["trips_updated"] += 1
         else:
