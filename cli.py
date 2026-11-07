@@ -4888,7 +4888,11 @@ def _print_stdout(text: str, end: str = "\n") -> None:
         # Windows 上关闭管道抛 OSError [Errno 22] 而不是 BrokenPipeError；
         # 仅吞掉管道类错误，真实的写失败（磁盘满等）照常抛出
         winerror = getattr(exc, "winerror", None)
-        if exc.errno not in (22, 32) and winerror not in (109, 232):
+        if (
+            not isinstance(exc, BrokenPipeError)
+            and exc.errno not in (22, 32)
+            and winerror not in (109, 232)
+        ):
             raise
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
