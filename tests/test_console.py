@@ -1,11 +1,13 @@
-"""
-configure_stdio 管道探测测试（无需 API Key、不访问网络）
+"""configure_stdio / stdin 自动解码测试（无需 API Key、不访问网络）。
 
 运行：python tests/test_console.py
 """
+import io
 import os
 import subprocess
 import sys
+
+import pytest
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -29,7 +31,6 @@ def test_idle_pipe_does_not_block_startup():
     )
     try:
         try:
-            # stdin 保持打开且不写入：旧实现会卡在 BufferedReader.peek
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -44,78 +45,118 @@ def test_idle_pipe_does_not_block_startup():
     print("✓ 空闲管道不会阻塞 configure_stdio")
 
 
-def test_pick_stdin_encoding_bom_and_ascii_prefix(monkeypatch):
-    """BOM 输入用 utf-8-sig；ASCII 前缀后的 UTF-8 中文不能被按 GBK 解码。"""
-    from utils import console as console_module
+class _PipeBuffer(io.BytesIO):
+    def peek(self, size=2):
+        position = self.tell()
+        data = self.read(size)
+        self.seek(position)
+        return data
+
+
+def _decode_all(payload: bytes, fallback: str = "gbk") -> str:
+    from utils.console import _AutoDecodeInput
+
+    shim = _AutoDecodeInput(_PipeBuffer(payload), fallback)
+    return shim.read()
+
+
+def test_auto_decode_utf8_and_gbk():
+    text = "我要去北京"
+    assert _decode_all(text.encode("utf-8")) == text
+    assert _decode_all(text.encode("gbk")) == text
+    # ASCII 前缀的 GBK 行：整行按 UTF-8 失败后退回 locale，不能变乱码
+    prefixed = "abc " + text
+    assert _decode_all(prefixed.encode("gbk")) == prefixed
+    # ASCII 前缀的 UTF-8 行：按 UTF-8 成功
+    assert _decode_all(prefixed.encode("utf-8")) == prefixed
+    print("✓ 管道自动解码：UTF-8 / GBK / ASCII 前缀")
+
+
+def test_auto_decode_bom_encodings():
+    text = "中文输入"
+    assert _decode_all(text.encode("utf-8-sig")) == text
+    assert _decode_all(text.encode("utf-16")) == text
+    assert _decode_all((text + "\n第二行\n").encode("utf-16")) == text + "\n第二行\n"
+    print("✓ BOM 输入（utf-8-sig / UTF-16）")
+
+
+def test_readline_line_by_line():
+    from utils.console import _AutoDecodeInput
+
+    payload = ("第一行\n第二行\n").encode("gbk")
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.readline() == "第一行\n"
+    assert shim.readline() == "第二行\n"
+    assert shim.readline() == ""
+    print("✓ 逐行读取自动解码")
+
+
+def test_probe_stdin_false_leaves_stream_untouched(monkeypatch):
+    """一次性命令跳过 stdin：不包装、不触碰（也不会 peek 阻塞）。"""
+
+    class _Buffer(io.BytesIO):
+        def peek(self, size=2):
+            raise AssertionError("probe_stdin=False 不应触碰 stdin")
 
     class _Stdin:
-        def __init__(self, payload, encoding="gbk"):
-            self.buffer = self
-
-            class _Inner:
-                pass
-
-            self._payload = payload
-            self.encoding = encoding
-
-        def peek(self, size):
-            return self._payload[:size]
-
-        def isatty(self):
-            return False
-
-    # 假流没有 fileno：直接视为「管道已有数据」
-    monkeypatch.setattr(
-        console_module, "_stdin_has_data", lambda stream, timeout_sec=0.1: True
-    )
-    monkeypatch.setattr(sys, "stdin", _Stdin(b"\xef\xbb\xbf{}"))
-    assert console_module._pick_stdin_encoding("gbk") == "utf-8-sig"
-
-    # 前 64 字节全 ASCII、中文在后面的 UTF-8 管道
-    payload = b"abcd " + "中文输入".encode("utf-8")
-    monkeypatch.setattr(sys, "stdin", _Stdin(payload))
-    assert console_module._pick_stdin_encoding("gbk") == "utf-8"
-
-    # GBK 管道：出现 >=0x81 字节且不是合法 UTF-8 → 沿用 locale
-    monkeypatch.setattr(sys, "stdin", _Stdin("中文".encode("gbk")))
-    assert console_module._pick_stdin_encoding("gbk") == "gbk"
-    print("✓ stdin 编码探测：BOM / ASCII 前缀 / GBK")
-
-
-def test_probe_stdin_false_skips_probe(monkeypatch):
-    """一次性命令可显式跳过 stdin 探测。"""
-    calls = []
-
-    class _Buffer:
-        def peek(self, size):
-            calls.append(size)
-            return b""
-
-    class _Stdin:
-        buffer = _Buffer()
+        buffer = _Buffer(b"x")
         encoding = "gbk"
 
         def isatty(self):
             return False
 
-        def reconfigure(self, **kwargs):
-            pass
+        def readline(self):
+            return "x"
 
-    monkeypatch.setattr(sys, "stdin", _Stdin())
+    stdin = _Stdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
     configure_stdio(probe_stdin=False)
-    configure_stdio()  # 抽象流没有 fileno：判断不了可用数据时不 peek
-    assert calls == []
-    print("✓ probe_stdin=False 跳过 stdin 探测")
+    assert sys.stdin is stdin
+
+    # 抽象流（无 buffer.readline）不包装，保持原样
+    class _Abstract:
+        encoding = "gbk"
+
+        def isatty(self):
+            return False
+
+    abstract = _Abstract()
+    monkeypatch.setattr(sys, "stdin", abstract)
+    configure_stdio()
+    assert sys.stdin is abstract
+    print("✓ probe_stdin=False / 不可包装流保持原样")
+
+
+def test_non_tty_pipe_is_wrapped(monkeypatch):
+    class _Stdin:
+        def __init__(self):
+            self.buffer = _PipeBuffer("中文".encode("gbk"))
+            self.encoding = "gbk"
+
+        def isatty(self):
+            return False
+
+    stdin = _Stdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    configure_stdio()
+    wrapper = sys.stdin
+    assert wrapper is not stdin, "非终端 stdin 应被自动解码包装"
+    assert wrapper.readline() == "中文"
+    # 重复调用不会二次包装
+    configure_stdio()
+    assert sys.stdin is wrapper
+    print("✓ 非终端管道自动包装（幂等）")
 
 
 if __name__ == "__main__":
     test_idle_pipe_does_not_block_startup()
-    import pytest
-
     mp = pytest.MonkeyPatch()
     try:
-        test_probe_stdin_false_skips_probe(mp)
-        test_pick_stdin_encoding_bom_and_ascii_prefix(mp)
+        test_auto_decode_utf8_and_gbk()
+        test_auto_decode_bom_encodings()
+        test_readline_line_by_line()
+        test_probe_stdin_false_leaves_stream_untouched(mp)
+        test_non_tty_pipe_is_wrapped(mp)
     finally:
         mp.undo()
     print("\n全部通过")
