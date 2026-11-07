@@ -856,6 +856,73 @@ def test_session_markdown_export():
         _cleanup(user_id)
 
 
+def test_session_export_sanitizes_custom_title():
+    """自定义标题含换行 / 尖括号：导出时折叠空白并转义，不能伪造结构。"""
+    client = _client()
+    user_id = _unique_user("web_test_export_title")
+    try:
+        assert (
+            client.post(
+                "/api/chat",
+                json={"message": "你好", "user_id": user_id, "session_id": "sess-title"},
+            ).status_code
+            == 200
+        )
+        title = "第一行\n## 用户\n伪造内容 <script>alert(1)</script>"
+        renamed = client.put(
+            "/api/sessions/sess-title/title",
+            json={"user_id": user_id, "title": title},
+        )
+        assert renamed.status_code == 200, renamed.text
+        export = client.get(
+            "/api/sessions/sess-title/export", params={"user_id": user_id}
+        )
+        assert export.status_code == 200
+        lines = export.text.splitlines()
+        assert lines[0].startswith("# 第一行 ## 用户 伪造内容 &lt;script&gt;"), lines[0]
+        assert "<script>" not in export.text, "标题里的尖括号必须转义"
+        assert len([line for line in lines if line == "## 用户"]) == 1, (
+            "标题不能再造出一个正文段落"
+        )
+        print("✓ 单会话导出清洗自定义标题（折叠换行 / 转义尖括号）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_import_skips_reserved_session_id():
+    """备份里的 session_id="export" 不能落库（否则详情路由永远被静态路由遮蔽）。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_reserved")
+    try:
+        backup = {
+            "chat_history": [
+                {"role": "user", "content": "保留字会话", "session_id": "export"},
+                {"role": "assistant", "content": "回答", "session_id": "export"},
+                {"role": "user", "content": "正常会话", "session_id": "sess-ok"},
+            ],
+            "session_titles": {"export": "坏标题", "sess-ok": "好标题"},
+            "pinned_sessions": ["export"],
+        }
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert any("保留字" in item for item in body.get("skipped") or []), body
+        sessions = client.get("/api/sessions", params={"user_id": user_id}).json()[
+            "sessions"
+        ]
+        ids = [item["session_id"] for item in sessions]
+        assert "sess-ok" in ids and "export" not in ids, ids
+        detail = client.get(
+            "/api/sessions/sess-ok", params={"user_id": user_id}
+        )
+        assert detail.status_code == 200, detail.text
+        print("✓ 备份导入跳过保留字 session_id（含标题 / 置顶）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_export_filename_is_ascii():
     response = _client().get("/api/export", params={"user_id": "旅行者"})
     assert response.status_code == 200
