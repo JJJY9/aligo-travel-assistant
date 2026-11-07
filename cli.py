@@ -107,6 +107,9 @@ class AligoCLI:
                 print()
                 print("未检测到输入，已退出")
                 raise SystemExit(0) from None
+            except (RuntimeError, ValueError, OSError) as exc:
+                print(f"无法读取输入（{exc}），请改用非交互子命令或接入终端后重试")
+                raise SystemExit(1) from None
             if re.fullmatch(r"[\w-]{1,64}", value) and not value.startswith("-"):
                 return value
             self.console.print(
@@ -132,8 +135,21 @@ class AligoCLI:
                     "[bold red]⚠ 未检测到 API Key，请设置环境变量 LLM_API_KEY，"
                     '或创建 config_local.py（内容：API_KEY = "sk-..."）[/bold red]'
                 )
+                # 空 api_key 构造模型会抛 OpenAIError（未捕获 traceback 把整个
+                # 进程打挂）：干净退出；无需模型的维护命令请直接用子命令
+                self.console.print(
+                    "[dim]未配置密钥无法进入交互模式；维护类命令请直接运行 "
+                    "python cli.py <命令>（如 doctor / sessions / trips）。[/dim]"
+                )
+                raise SystemExit(2)
             timeout_sec = SYSTEM_CONFIG.get("timeout", 60)
-            self.model = create_chat_model(timeout=timeout_sec)
+            try:
+                self.model = create_chat_model(timeout=timeout_sec)
+            except Exception as exc:  # noqa: BLE001 - 配置/网络问题给出清晰提示
+                self.console.print(
+                    f"[bold red]❌ 模型初始化失败：{exc}[/bold red]"
+                )
+                raise SystemExit(1) from None
 
             # 初始化记忆管理器（传入LLM模型用于总结）
             self.memory_manager = MemoryManager(
@@ -253,8 +269,8 @@ class AligoCLI:
                     self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
                     return
 
-            # 4. 添加用户输入到短期记忆（原逻辑不变）
-            self.memory_manager.add_message("user", user_input)
+            # 4. 用户消息在本轮成功后再落库：编排失败 / Ctrl-C 时不留
+            # 无回复的孤儿用户轮，重试也不会在历史里重复同一条提问
 
             # 5. 调度智能体（实时显示智能体进度）
             orchestration_result = None
@@ -320,6 +336,7 @@ class AligoCLI:
                 usage=usage_delta,
                 elapsed=elapsed,
             )
+            self.memory_manager.add_message("user", user_input)
             self.memory_manager.add_message(
                 "assistant",
                 json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
@@ -462,6 +479,17 @@ class AligoCLI:
 
         return "\n".join(summary_parts) if summary_parts else ""
 
+    @staticmethod
+    def _format_result_value(value: object) -> str:
+        """结果字段的展示文本：列表「、」拼接、字典 JSON，其余 str。"""
+        if isinstance(value, (list, tuple)):
+            return "、".join(str(item) for item in value)
+        if isinstance(value, dict):
+            import json as _json
+
+            return _json.dumps(value, ensure_ascii=False)
+        return str(value)
+
     def _generate_human_response(self, results: list) -> bool:
         """
         根据结果生成人性化的回复
@@ -472,11 +500,12 @@ class AligoCLI:
             agent_name = result.get("agent_name", "")
             status = result.get("status", "")
             data = result.get("data", {})
+            data = data if isinstance(data, dict) else {}
             current_agent_shown = False  # 标记当前Agent是否有内容展示
 
             # 处理失败的智能体
             if status == "error":
-                error_msg = data.get("error", "未知错误")
+                error_msg = data.get("error") or data.get("message") or "未知错误"
                 agent_display_name = self._get_agent_display_name(agent_name)
                 self.console.print(
                     f"❌ {escape(str(agent_display_name))}执行失败: {escape(str(error_msg))}",
@@ -590,17 +619,32 @@ class AligoCLI:
 
             # 偏好管理
             elif agent_name == "preference":
+                nested = data.get("data")
+                nested = nested if isinstance(nested, dict) else {}
                 raw_prefs = data.get("preferences")
                 # 增强：支持从 data.data.preferences 获取
-                if not raw_prefs and "data" in data and isinstance(data["data"], dict):
-                    raw_prefs = data["data"].get("preferences")
+                if not raw_prefs:
+                    raw_prefs = nested.get("preferences")
+                if isinstance(raw_prefs, dict) and "preferences" not in raw_prefs:
+                    # 旧版偏好智能体返回 {type: value} 字典：转成条目列表，
+                    # 否则回显为空、和实际已落库的内容不一致
+                    raw_prefs = {
+                        "preferences": [
+                            {"type": key, "value": value}
+                            for key, value in raw_prefs.items()
+                        ]
+                    }
 
                 if isinstance(raw_prefs, dict):
                     prefs_list = raw_prefs.get("preferences", [])
                 else:
                     prefs_list = raw_prefs if isinstance(raw_prefs, list) else []
+                # 模型可能返回字符串 / null 等非对象条目：跳过而不是整轮崩溃
+                prefs_items = [
+                    item for item in prefs_list if isinstance(item, dict)
+                ]
 
-                if prefs_list:
+                if prefs_items:
                     self.console.print("✓ [bold green]已更新您的偏好设置[/bold green]")
                     type_names = {
                         "home_location": "常驻地",
@@ -611,15 +655,22 @@ class AligoCLI:
                         "meal_preference": "餐食偏好",
                         "budget_level": "预算等级"
                     }
-                    for pref in prefs_list:
+                    for pref in prefs_items:
                         pref_type = pref.get("type", "")
                         pref_value = pref.get("value", "")
-                        action = pref.get("action", "replace")
+                        action = str(pref.get("action", "replace")).lower()
                         display_type = type_names.get(pref_type, pref_type)
-                        action_text = "追加" if action == "append" else "设置为"
+                        # 与落库路径（orchestration_agent）和 Web 渲染器同一
+                        # 口径：Append / add / 追加 都表示追加而不是覆盖
+                        action_text = (
+                            "追加"
+                            if action in {"append", "add", "追加"}
+                            else "设置为"
+                        )
                         self.console.print(
                             f"  • {escape(str(display_type))} {action_text} "
-                            f"[cyan]{escape(str(pref_value))}[/cyan]"
+                            f"[cyan]{escape(self._format_result_value(pref_value))}"
+                            "[/cyan]"
                         )
                     current_agent_shown = True
                     has_itinerary = any(r.get("agent_name") == "itinerary_planning" for r in results)
@@ -635,25 +686,40 @@ class AligoCLI:
 
             # 事项收集
             elif agent_name == "event_collection":
-                # 增强：支持从 data.data 获取
-                origin = data.get("origin") or data.get("data", {}).get("origin")
-                destination = data.get("destination") or data.get("data", {}).get("destination")
-                start_date = data.get("start_date") or data.get("data", {}).get("start_date")
-                end_date = data.get("end_date") or data.get("data", {}).get("end_date")
-                missing_info = data.get("missing_info") or data.get("data", {}).get("missing_info") or []
+                # 增强：支持从 data.data 获取（data.data 非对象时按空处理，
+                # 否则 .get 抛 AttributeError 让整轮回答丢失）
+                nested = data.get("data")
+                nested = nested if isinstance(nested, dict) else {}
+                origin = data.get("origin") or nested.get("origin")
+                destination = data.get("destination") or nested.get("destination")
+                start_date = data.get("start_date") or nested.get("start_date")
+                end_date = data.get("end_date") or nested.get("end_date")
+                missing_info = data.get("missing_info") or nested.get("missing_info") or []
 
                 has_itinerary = any(r.get("agent_name") == "itinerary_planning" for r in results)
                 info_shown = False
                 if not has_itinerary and (destination or origin):
                     self.console.print("✓ [bold green]已收集行程信息[/bold green]")
                     if origin:
-                        self.console.print(f"  • 出发地: [cyan]{escape(str(origin))}[/cyan]")
+                        self.console.print(
+                            "  • 出发地: [cyan]"
+                            f"{escape(self._format_result_value(origin))}[/cyan]"
+                        )
                     if destination:
-                        self.console.print(f"  • 目的地: [cyan]{escape(str(destination))}[/cyan]")
+                        self.console.print(
+                            "  • 目的地: [cyan]"
+                            f"{escape(self._format_result_value(destination))}[/cyan]"
+                        )
                     if start_date:
-                        self.console.print(f"  • 出发日期: [cyan]{escape(str(start_date))}[/cyan]")
+                        self.console.print(
+                            "  • 出发日期: [cyan]"
+                            f"{escape(self._format_result_value(start_date))}[/cyan]"
+                        )
                     if end_date:
-                        self.console.print(f"  • 返程日期: [cyan]{escape(str(end_date))}[/cyan]")
+                        self.console.print(
+                            "  • 返程日期: [cyan]"
+                            f"{escape(self._format_result_value(end_date))}[/cyan]"
+                        )
                     info_shown = True
 
                 if missing_info:
@@ -840,9 +906,15 @@ class AligoCLI:
             dialogue_table.add_column("内容", style="white", width=60)
             dialogue_table.add_column("时间", style="dim", width=12)
 
+            from utils.stored_message import render_stored_message
+
             for msg in recent_messages:
                 role_name = "👤 用户" if msg["role"] == "user" else "🤖 助手"
-                content = msg["content"]
+                content = (
+                    str(msg.get("content", ""))
+                    if msg.get("role") == "user"
+                    else render_stored_message(msg)
+                )
 
                 # 截断过长的内容
                 if len(content) > 100:
@@ -934,8 +1006,13 @@ class AligoCLI:
         table.add_column("值", style="white")
 
         for key, value in prefs.items():
-            if value:
-                table.add_row(escape(str(key)), escape(str(value)))
+            # 0 / False 是合法偏好值（预算为 0、不要靠窗）：真值判断会把
+            # 整行藏掉，与 standalone preferences 和 Web 面板不一致
+            if has_preference_value(value):
+                table.add_row(
+                    escape(str(key)),
+                    escape(self._format_result_value(value)),
+                )
 
         self.console.print(table)
 
@@ -998,6 +1075,22 @@ class AligoCLI:
                 # 管道 / IDE 末尾：退出，避免每次循环都报错刷屏
                 self.console.print()
                 self.console.print("未检测到输入，已退出", style="dim")
+                break
+            except asyncio.CancelledError:
+                # 提示符下的 Ctrl-C 由 asyncio.run 的 SIGINT 处理器转成任务
+                # 取消（KeyboardInterrupt 分支永远收不到）：清除取消计数后
+                # 回到提示符，而不是静默取消下一条命令
+                import asyncio as _asyncio
+
+                task = _asyncio.current_task()
+                if task is not None and hasattr(task, "uncancel"):
+                    while task.cancelling():
+                        task.uncancel()
+                self.console.print("\n使用 'exit' 退出", style="dim")
+            except (RuntimeError, ValueError) as exc:
+                # stdin 不可用（IDE / 无控制台）时 Prompt.ask 抛 RuntimeError
+                # 或 ValueError：干净退出，避免 traceback 或满速刷屏
+                self.console.print(f"\n无法读取输入（{exc}），已退出", style="dim")
                 break
             except KeyboardInterrupt:
                 self.console.print("\n使用 'exit' 退出", style="dim")
@@ -4791,7 +4884,12 @@ def _print_stdout(text: str, end: str = "\n") -> None:
     """输出导出内容；下游提前关闭（如 `| head`）时静默收尾，不抛 traceback。"""
     try:
         print(text, end=end)
-    except BrokenPipeError:
+    except OSError as exc:
+        # Windows 上关闭管道抛 OSError [Errno 22] 而不是 BrokenPipeError；
+        # 仅吞掉管道类错误，真实的写失败（磁盘满等）照常抛出
+        winerror = getattr(exc, "winerror", None)
+        if exc.errno not in (22, 32) and winerror not in (109, 232):
+            raise
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, sys.stdout.fileno())

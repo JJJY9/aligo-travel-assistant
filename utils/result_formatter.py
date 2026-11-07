@@ -289,7 +289,16 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         return str(answer) if answer else ""
 
     # 通用兜底：按常见字段名取文本
-    for key in ("answer", "content", "result", "message", "summary", "text", "description"):
+    for key in (
+        "answer",
+        "content",
+        "result",
+        "message",
+        "summary",
+        "text",
+        "description",
+        "output",
+    ):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
             return value
