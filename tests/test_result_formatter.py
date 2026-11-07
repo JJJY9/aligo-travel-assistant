@@ -413,19 +413,20 @@ def test_agent_specific_empty_payloads_render_placeholder():
         {"agent_name": "memory_query", "status": "success", "data": {}},
     ]
     assert result_to_markdown(_wrap(cases)) == "已处理您的请求。"
-    # 非字典偏好项被跳过，只保留标题行（非空结果）
-    md = result_to_markdown(
-        _wrap(
-            [
-                {
-                    "agent_name": "preference",
-                    "status": "success",
-                    "data": {"preferences": [None]},
-                }
-            ]
+    # 空偏好条目（非 dict / value 为 null）不会落库，回显也不能假装「已更新」
+    for empty_prefs in ([None], [{"type": "hotel_brands", "value": None}]):
+        md = result_to_markdown(
+            _wrap(
+                [
+                    {
+                        "agent_name": "preference",
+                        "status": "success",
+                        "data": {"preferences": empty_prefs},
+                    }
+                ]
+            )
         )
-    )
-    assert md == "### ✅ 已更新偏好"
+        assert md == "已处理您的请求。", (empty_prefs, md)
     print("✓ 各智能体空载荷渲染占位")
 
 
@@ -520,6 +521,53 @@ def test_event_collection_type_tolerance():
     print("✓ 事项收集字段类型容错")
 
 
+def test_null_values_render_defaults_not_none():
+    """模型输出显式 null：偏好跳过（不会落库）、行程回退默认文案，不出现字面量 None。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": "hotel_brands", "value": ["汉庭", None]},
+                            {"type": "budget_level", "value": None},
+                        ]
+                    },
+                }
+            ]
+        )
+    )
+    assert "汉庭" in md and "None" not in md, md
+
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {
+                        "itinerary": {
+                            "title": None,
+                            "daily_plans": [
+                                {
+                                    "day": None,
+                                    "activities": [{"time": None, "activity": "出发"}],
+                                }
+                            ],
+                        }
+                    },
+                }
+            ]
+        )
+    )
+    assert "## ✈️ 行程规划" in md, md
+    assert "第 ? 天" in md, md
+    assert "None" not in md, md
+    print("✓ 显式 null 渲染回退（偏好跳过 / 行程默认文案）")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -538,4 +586,5 @@ if __name__ == "__main__":
     test_rag_snippet_truncation_and_skip_non_dict()
     test_preference_append_variants_and_legacy_dict()
     test_event_collection_type_tolerance()
+    test_null_values_render_defaults_not_none()
     print("\n全部通过")

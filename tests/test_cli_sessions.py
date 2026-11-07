@@ -1025,6 +1025,31 @@ def test_session_export_html(monkeypatch):
     print("✓ session-export --html 转义与默认后缀")
 
 
+def test_session_export_html_title_not_double_escaped(monkeypatch):
+    """自定义标题含尖括号：HTML 导出只转义一次（不能出现 &amp;lt;）。"""
+    import tempfile
+
+    fake = _FakeStore(
+        [_message("user", "你好", "s-title")],
+        titles={"s-title": "预算<5000 对比 A>B"},
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    target = os.path.join(tempfile.mkdtemp(), "session.html")
+    code, out = _run_export("u1", "s-title", target=target, html=True)
+    assert code == 0
+    with open(target, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "<title>预算&lt;5000 对比 A&gt;B</title>" in text
+    assert "&amp;lt;" not in text and "&amp;gt;" not in text, "标题只应转义一次"
+
+    # Markdown 导出仍按单次转义显示（与 sessions-export / Web 同口径）
+    code, out = _run_export("u1", "s-title", to_stdout=True)
+    assert code == 0
+    assert "# 预算&lt;5000 对比 A&gt;B" in out
+    assert "预算<5000" not in out
+    print("✓ session-export HTML 标题单次转义 / Markdown 保持转义")
+
+
 def test_session_export_html_flag_parsing():
     assert cli._parse_session_export_args([]) == (None, False, False, False)
     assert cli._parse_session_export_args(["out.html"]) == (
@@ -1233,6 +1258,7 @@ if __name__ == "__main__":
         test_session_export_missing_and_invalid,
         test_session_export_refuses_overwrite,
         test_session_export_html,
+        test_session_export_html_title_not_double_escaped,
         test_session_export_html_dispatch,
         test_session_export_default_path,
         test_main_session_export_dispatch,

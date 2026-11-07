@@ -7,6 +7,8 @@
 运行：python tests/test_reliability_utils.py
 """
 import asyncio
+import json
+import logging
 import os
 import sys
 import threading
@@ -18,7 +20,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from utils import circuit_breaker as cb_module
-from utils.access_log import format_access_log
+from utils.access_log import JsonLogFormatter, format_access_log
 from utils.circuit_breaker import CircuitBreaker
 from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import is_retriable_error, retry_with_backoff, run_health_check
@@ -162,6 +164,26 @@ def test_access_log_strips_control_characters():
     assert "\u2028" not in json_line
     assert len(json_line.splitlines()) == 1, "JSON 日志不能被行分隔符拆断"
     print("✓ 访问日志清理 CR/LF 与转义字符")
+
+
+def test_json_formatter_sanitizes_any_message():
+    """JsonLogFormatter 的普通消息同样不能把单条 JSON 记录拆成多行。"""
+    poison = "北京" + chr(0x2028) + "X" + chr(0x85) + "Y"
+    record = logging.LogRecord(
+        "weather",
+        logging.WARNING,
+        __file__,
+        1,
+        "天气查询失败（%s）：%s",
+        (poison, "上游不可达"),
+        None,
+    )
+    line = JsonLogFormatter().format(record)
+    assert chr(0x2028) not in line and chr(0x85) not in line
+    assert len(line.splitlines()) == 1, "单条记录必须保持一行合法 JSON"
+    parsed = json.loads(line)
+    assert "北京" in parsed["message"] and "上游不可达" in parsed["message"]
+    print("✓ JSON 日志格式化器清洗任意日志消息")
 
 
 def test_release_probe_returns_half_open_slot(monkeypatch):

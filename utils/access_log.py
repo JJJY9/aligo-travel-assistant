@@ -73,4 +73,7 @@ class JsonLogFormatter(logging.Formatter):
             payload["message"] = message
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+        # 序列化后再清洗：json.dumps 已转义 \x00-\x1f（作为 \uXXXX 文本），
+        # 但 ensure_ascii=False 会原样输出 U+2028/U+2029 与 C1 控制符，按行
+        # 切分的采集器会把单条记录拆成多行、后续行不再是合法 JSON
+        return _safe_log_text(json.dumps(payload, ensure_ascii=False))
