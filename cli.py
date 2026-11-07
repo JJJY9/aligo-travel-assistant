@@ -1397,11 +1397,16 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             print("评测失败：RAG 依赖未安装（pip install -r requirements.txt）")
         return 1
 
+    from config import RAG_CONFIG
+
     try:
         result = evaluate_retrieval(
             lambda query, top_k: agent.search_knowledge(
                 query, top_k=top_k, strict=True
             ),
+            # 与问答链路同一相似度阈值：低于阈值的命中不计入（否则评测
+            # 可以 100% 通过而真实回答全是「没有找到相关信息」）
+            min_score=float(RAG_CONFIG.get("min_score", 0.5)),
         )
     except Exception as exc:  # noqa: BLE001 - 检索后端故障不能报成 0% 命中
         if as_json:
@@ -2193,7 +2198,7 @@ def run_knowledge_update_standalone(
     Returns:
         0 更新成功；1 文件 / 知识库 / 更新失败
     """
-    from utils.knowledge_admin import update_document
+    from utils.knowledge_admin import get_document, update_document
     from utils.knowledge_stats import knowledge_status
 
     status = knowledge_status()
@@ -2203,8 +2208,27 @@ def run_knowledge_update_standalone(
     text = _read_kb_file(path)
     if text is None:
         return 1
+    # 只传 --category/--title 时 update_document 会整体重建 metadata：
+    # 先读出现有记录，把库中已有的 category/title/source/parent_doc 等
+    # 字段并入（本次显式提供的值覆盖），与面板整份编辑的语义一致
     try:
-        result = update_document(doc_id, text, metadata)
+        existing = get_document(doc_id)
+    except FileNotFoundError:
+        print("知识库未初始化")
+        return 1
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"读取片段失败：{exc}")
+        return 1
+    if existing is None:
+        print(f"知识片段 {doc_id} 不存在")
+        return 1
+    merged_metadata = {
+        str(key)[:32]: str(value)[:200]
+        for key, value in (existing.get("metadata") or {}).items()
+    }
+    merged_metadata.update(metadata or {})
+    try:
+        result = update_document(doc_id, text, merged_metadata)
     except FileNotFoundError:
         print("知识库未初始化")
         return 1

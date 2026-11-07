@@ -5,6 +5,7 @@
 只读取集合统计，不加载 embedding 模型；客户端与知识库维护接口共享
 （Milvus Lite 的 data-dir 锁在整个进程生命周期内保持，见 README 已知限制）。
 """
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -35,11 +36,21 @@ def knowledge_status(
         return {**base, "available": False, "reason": "知识库未初始化"}
 
     client = None
+    # 与知识库写锁互斥：整组替换是多步写入，期间读到中间行数会让面板
+    # chip 与列表 total 不一致
+    lock_ctx: Any
+    try:
+        from utils.knowledge_admin import _WRITE_LOCK
+
+        lock_ctx = _WRITE_LOCK
+    except Exception:  # noqa: BLE001 - 维护模块不可用时保持原行为
+        lock_ctx = contextlib.nullcontext()
     try:
         client = get_milvus_client(str(db))
-        if not client.has_collection(collection):
-            return {**base, "available": False, "reason": "集合不存在"}
-        stats = client.get_collection_stats(collection)
+        with lock_ctx:
+            if not client.has_collection(collection):
+                return {**base, "available": False, "reason": "集合不存在"}
+            stats = client.get_collection_stats(collection)
         return {
             **base,
             "available": True,

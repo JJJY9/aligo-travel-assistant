@@ -45,22 +45,32 @@ def evaluate_retrieval(
     search: Callable[[str, int], list[dict[str, Any]]],
     cases: tuple[EvalCase, ...] = EVAL_CASES,
     top_k: int = 5,
+    min_score: float | None = None,
 ) -> dict[str, Any]:
     """运行评测。
 
     Args:
-        search: ``search(query, top_k) -> [{"content": ...}, ...]``
+        search: ``search(query, top_k) -> [{"content": ..., "distance": ...}, ...]``
         cases: 评测用例
         top_k: 每个问题检索的片段数（同时决定 hit@K 的上限）
+        min_score: 与问答链路一致的相似度阈值；给定时低于阈值的结果不参与
+            命中判定（否则评测能 100% 通过而真实回答全是「没有找到」）
 
     Returns:
-        {"total", "hit1", "hit3", "hit5", "mrr", "rows": [{"query", "rank"}]}
+        {"total", "hit1", "hit3", "hit5", "mrr", "rows": [{"query", "rank"}],
+         "warning": 可选}
     """
     ranks: list[int | None] = []
     rows: list[dict[str, Any]] = []
 
     for case in cases:
         documents = search(case.query, top_k) or []
+        if min_score is not None:
+            documents = [
+                document
+                for document in documents
+                if float(document.get("distance") or 0.0) >= min_score
+            ]
         rank: int | None = None
         for index, document in enumerate(documents[:top_k], start=1):
             text = str(document.get("content", "")).lower()
@@ -78,7 +88,7 @@ def evaluate_retrieval(
         return sum(1 for rank in ranks if rank is not None and rank <= k) / total
 
     mrr = sum(1.0 / rank for rank in ranks if rank) / total if total else 0.0
-    return {
+    payload: dict[str, Any] = {
         "total": total,
         "hit1": hit_at(1),
         "hit3": hit_at(3),
@@ -86,3 +96,9 @@ def evaluate_retrieval(
         "mrr": mrr,
         "rows": rows,
     }
+    if total and hit_at(5) == 0:
+        # 固定题库与当前知识库完全不匹配时给出明确告警，避免被当作质量回退
+        payload["warning"] = (
+            "没有命中任何评测题：题库可能不适用于当前知识库，请核对知识内容或更换题库"
+        )
+    return payload

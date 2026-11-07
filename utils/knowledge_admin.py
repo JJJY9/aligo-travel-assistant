@@ -43,6 +43,9 @@ _METADATA_MAX_KEYS = 10
 _DERIVED_CHUNK_KEYS = {"part", "parts", "group"}
 _WRITE_LOCK = threading.Lock()
 _agent: Any = None
+# 检索路径专用的只读 Agent（create_if_missing=False）：语义检索不会在
+# 「库存在但集合缺失」时静默创建空集合、把未初始化伪装成 0 结果
+_read_agent: Any = None
 _agent_lock = threading.Lock()
 
 
@@ -67,6 +70,21 @@ def _get_agent() -> Any:
                 collection_name=COLLECTION_NAME, create_if_missing=True
             )
     return _agent
+
+
+def _get_read_agent() -> Any:
+    """只读检索用的 Agent：不创建空库 / 空集合。"""
+    global _read_agent
+    if _read_agent is not None:
+        return _read_agent
+    with _agent_lock:
+        if _read_agent is None:
+            from agents.rag_knowledge_agent import RAGKnowledgeAgent
+
+            _read_agent = RAGKnowledgeAgent(
+                collection_name=COLLECTION_NAME, create_if_missing=False
+            )
+    return _read_agent
 
 
 def _client() -> Any:
@@ -174,22 +192,82 @@ def list_categories() -> list[dict[str, Any]]:
     ]
 
 
+def _restore_pieces(parts: Any, fallback: str) -> list[str]:
+    """还原分片：优先使用备份里的原始分片（保持边界），否则按拼接文本重切。
+
+    分片数量超过单批上限时，无分隔合并相邻分片（内容不变）以减少批内条目；
+    单个分片超过 400 字（旧数据）按语义边界切开。
+    """
+    raw: list[str] = []
+    if isinstance(parts, list):
+        raw = [
+            str(piece).strip()
+            for piece in parts
+            if isinstance(piece, str) and str(piece).strip()
+        ]
+    if not raw:
+        text = fallback.strip()
+        if not text:
+            return []
+        if len(text) <= _MAX_CONTENT_CHARS:
+            return [text]
+        return [
+            piece.strip()
+            for piece in split_text(text, _MAX_CONTENT_CHARS)
+            if piece.strip()
+        ]
+    pieces: list[str] = []
+    for piece in raw:
+        if len(piece) <= _MAX_CONTENT_CHARS:
+            pieces.append(piece)
+        else:
+            pieces.extend(
+                sub.strip()
+                for sub in split_text(piece, _MAX_CONTENT_CHARS)
+                if sub.strip()
+            )
+    if len(pieces) > _IMPORT_CHUNK:
+        merged: list[str] = []
+        buffer = ""
+        for piece in pieces:
+            if buffer and len(buffer) + len(piece) > _MAX_CONTENT_CHARS:
+                merged.append(buffer)
+                buffer = piece
+            else:
+                buffer += piece
+        if buffer:
+            merged.append(buffer)
+        pieces = merged
+    return pieces
+
+
 def _chunk_documents(
-    text: str, metadata: dict[str, str] | None
+    text: str,
+    metadata: dict[str, str] | None,
+    group_override: str = "",
 ) -> list[dict[str, Any]]:
     """长内容按语义边界拆成 ≤400 字的片段（嵌入模型 512 token 截断）。
 
     多分片结果带 ``part`` / ``parts`` / ``group`` 元数据：group 是本次拆分的
     稳定标识，编辑 / 删除整组时靠它定位其余分片；旧数据没有 group 时仍按
     单条处理（编辑被拒绝，避免留下无法定位的旧分片）。
+
+    分片一律 strip：备份还原先把分片用换行拼回整篇再重新切分，切分残留
+    的行首 / 行尾换行若原样入库，会把文档撑过 20000 字上限（导出→导入
+    不再闭合）。``group_override`` 供备份还原沿用原组号，重试补齐残缺组
+    时能按内容与编号续写。
     """
     chunks = (
-        [text]
+        [text.strip()]
         if len(text) <= _MAX_CONTENT_CHARS
-        else [chunk for chunk in split_text(text, max_chars=_MAX_CONTENT_CHARS) if chunk.strip()]
+        else [
+            chunk.strip()
+            for chunk in split_text(text, max_chars=_MAX_CONTENT_CHARS)
+            if chunk.strip()
+        ]
     )
     if not chunks:
-        chunks = [text]
+        chunks = [text.strip()]
     # 分片标记是派生字段：调用方回传的旧 part/parts/group 必须丢弃，
     # 否则编辑后会沿用旧编号 / 旧组。派生标记是内部记账字段，不受用户
     # 元数据 10 键上限约束（该上限只约束输入 / 导入），否则用户元数据
@@ -199,7 +277,9 @@ def _chunk_documents(
         for key, value in (metadata or {}).items()
         if key not in _DERIVED_CHUNK_KEYS
     }
-    group_id = uuid.uuid4().hex[:12] if len(chunks) > 1 else ""
+    group_id = (
+        (group_override or uuid.uuid4().hex[:12]) if len(chunks) > 1 else ""
+    )
     documents: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks):
         meta = dict(base_meta)
@@ -327,6 +407,14 @@ def update_document(
     _load_collection(client, COLLECTION_NAME)
     agent = _get_agent()
     documents = _chunk_documents(text, metadata)
+    stored_size = sum(len(document["content"]) for document in documents)
+    if stored_size > DOC_MAX_CHARS:
+        # 提交文本含分片分隔符时可能略超上限，但重新分片后的实际入库总长
+        # 才是文档大小：原样保存一次不能再把文档撑过上限
+        raise ValueError(
+            f"重新分片后的文档大小超过上限（{stored_size} 字 > {DOC_MAX_CHARS}），"
+            "请拆分后重试"
+        )
     with _WRITE_LOCK:
         existing_parts, group = _document_info(client, int(doc_id))
         if existing_parts == 0:
@@ -336,6 +424,15 @@ def update_document(
                 f"该片段属于多分片知识内容（共 {existing_parts} 段），"
                 "暂不支持单条编辑：请删除整组后重新添加，避免旧分片残留"
             )
+        # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
+        # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
+        old_ids: list[int] = []
+        if group:
+            old_ids = [
+                member
+                for member in _group_member_ids(client, group)
+                if member != int(doc_id)
+            ]
         # 先写其余新分片：失败时目标分片与旧分片原样保留，可直接重试
         extra_ids: list[int] = []
         if len(documents) > 1:
@@ -353,13 +450,21 @@ def update_document(
             )
             if result.get("status") != "success":
                 raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
-        except Exception:
-            # 补偿：删除本次已插入的其余分片，保持原记录可重试
-            if extra_ids:
+        except Exception as original:
+            # 补偿：删除本次已插入的其余分片，保持原记录可重试。逐条删除，
+            # 失败项随异常一起报出（只写日志会让孤儿分片参与检索且无主可查）
+            failed_compensation: list[int] = []
+            for item_id in extra_ids:
                 try:
-                    client.delete(collection_name=COLLECTION_NAME, ids=extra_ids)
-                except Exception:  # noqa: BLE001 - 补偿失败不覆盖原始错误
-                    logger.warning("更新失败后补偿删除新分片失败：%s", extra_ids)
+                    client.delete(collection_name=COLLECTION_NAME, ids=[item_id])
+                except Exception as exc:  # noqa: BLE001 - 汇总后随原始错误抛出
+                    logger.warning("更新失败后补偿删除分片 %s 失败：%s", item_id, exc)
+                    failed_compensation.append(item_id)
+            if failed_compensation:
+                raise RuntimeError(
+                    "更新失败且补偿删除未完成，残留分片 "
+                    f"{failed_compensation}：请稍后重试或运行 kb-dedupe 清理"
+                ) from original
             raise
         # 目标已换成新内容后再删旧分片（旧组仅此时失去定位目标）。
         # 逐条删除：某一片失败不应连累其余旧分片，失败项在响应里报告，
@@ -367,11 +472,6 @@ def update_document(
         removed_ids: list[int] = []
         leftover_ids: list[int] = []
         if group:
-            old_ids = [
-                member
-                for member in _group_member_ids(client, group)
-                if member != int(doc_id)
-            ]
             for member in old_ids:
                 try:
                     client.delete(collection_name=COLLECTION_NAME, ids=[member])
@@ -467,14 +567,24 @@ def _regroup_exported_documents(
         pieces = sorted(grouped.get(key, []), key=lambda pair: pair[0])
         declared = 0
         contents: list[str] = []
+        seen_parts: set[int] = set()
         base_meta: dict[str, Any] = {}
         for index, (_, piece) in enumerate(pieces):
             metadata = piece.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
             try:
+                part_no = int(metadata.get("part") or 0)
                 declared = max(declared, int(metadata.get("parts") or 0))
             except (TypeError, ValueError):
-                pass
+                part_no = 0
+            if part_no:
+                if part_no in seen_parts:
+                    # 重复 part 编号会把同一段内容叠进正文（内容变多、丢片）
+                    raise ValueError(
+                        f"备份中的多分片文档 part 编号重复（group={key}，part={part_no}）："
+                        "请检查导出源后重新导出"
+                    )
+                seen_parts.add(part_no)
             content = piece.get("content")
             if isinstance(content, str):
                 contents.append(content)
@@ -486,13 +596,20 @@ def _regroup_exported_documents(
                 }
         if not contents:
             continue
-        if declared > 1 and len(pieces) < declared:
-            # 分片不全的组不能按残片重组（会把一篇文档拆成几段分别导入），
-            # 直接报错让调用方把整组放在同一批 / 同一文件里
-            raise ValueError(
-                f"备份中的多分片文档不完整（group={key}，收到 {len(pieces)}/{declared} 片）："
-                "请整组一起导入"
-            )
+        if declared > 1:
+            missing = set(range(1, declared + 1)) - seen_parts
+            if len(pieces) < declared or missing:
+                # 分片不全 / 编号跳号：按残片重组会把一篇文档拆成几段分别导入
+                detail = (
+                    "，缺少 part "
+                    + "、".join(str(item) for item in sorted(missing))
+                    if missing
+                    else ""
+                )
+                raise ValueError(
+                    f"备份中的多分片文档不完整（group={key}，收到 {len(pieces)}/{declared} 片{detail}）："
+                    "请整组一起导入"
+                )
         stripped_contents = [content.strip() for content in contents]
         if all(stripped in existing for stripped in stripped_contents):
             # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
@@ -500,13 +617,17 @@ def _regroup_exported_documents(
             continue
         merged.append(
             {
-                "__restored_group__": True,
-                # 还原上限按分片原始长度之和判断（含首尾空白）：空白也会被
-                # 拼接并写入正文，用 strip 后的长度计会让人借空白绕过
-                # DOC_MAX_CHARS；拼接用换行分隔（分片边界处原文可能是
-                # 段落 / 标题，空串拼接会把两段文字粘在一起）
-                "__restored_size__": sum(len(text) for text in contents),
-                "content": "\n".join(contents),
+                # 沿用原组号：重试补齐残缺组时能按内容续写而不会产生第二份文档
+                "__restored_group__": key,
+                # 还原上限按 strip 后的分片长度之和判断：分片入库前会 strip，
+                # 空白不会进入正文，按含空白长度计会误伤旧备份 / 被空白绕过
+                "__restored_size__": sum(len(text) for text in stripped_contents),
+                # 原始分片直接作为入库分片：避免「拼回整篇再重切」改变分片
+                # 边界（会让残缺组补齐时按内容对不上、产生重复文档）
+                "__restored_parts__": stripped_contents,
+                # 空串拼接：分片是原文的连续片段，拼接即原文；用换行分隔会把
+                # 分隔符写进正文（文档越还原越大、导出→导入不再闭合）
+                "content": "".join(stripped_contents),
                 "metadata": base_meta,
             }
         )
@@ -645,7 +766,15 @@ def import_documents(
         if not isinstance(raw_content, str) or not raw_content.strip():
             invalid += 1
             continue
-        valid.append(item)
+        # 还原标记是内部记账字段：用户 JSON 自带同名键时一律剥离，
+        # 否则可以伪造标记绕过单条 / 文档大小上限
+        cleaned = {
+            key: value
+            for key, value in item.items()
+            if key
+            not in {"__restored_group__", "__restored_size__", "__restored_parts__"}
+        }
+        valid.append(cleaned)
     if not valid:
         payload: dict[str, Any] = {
             "imported": 0,
@@ -677,7 +806,8 @@ def import_documents(
         duplicate = group_skipped
         document_chunks: list[list[dict[str, Any]]] = []
         for item in merged_items:
-            restored = bool(item.pop("__restored_group__", False))
+            restored_group = str(item.pop("__restored_group__", "") or "")
+            restored = bool(restored_group)
             restored_size = int(item.pop("__restored_size__", 0) or 0)
             raw_content = item.get("content")
             if not isinstance(raw_content, str):
@@ -693,22 +823,9 @@ def import_documents(
                 str(key)[:32]: str(value)[:200]
                 for key, value in list(metadata.items())[:_METADATA_MAX_KEYS]
             }
-            # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索
-            limit = (
-                _RESTORE_JOINED_MAX_CHARS if restored else _IMPORT_CONTENT_MAX_CHARS
-            )
-            if restored:
-                # 语义上限按文档大小（分片长度之和）判断；拼接文本允许更长
-                # （分片间的分隔符 / 旧数据的极短分片），超出物理上限才报错
-                doc_size = restored_size or len(content)
-                if doc_size > DOC_MAX_CHARS:
-                    raise ValueError(
-                        f"备份中的文档超过还原上限（{DOC_MAX_CHARS} 字），请拆分后导入"
-                    )
-                if len(content) > limit:
-                    raise ValueError(
-                        "备份中的文档拼接后过长（分片过多或含大量空白），请拆分后导入"
-                    )
+            # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索；
+            # 备份还原的拼接长度等于 strip 后总长，交给下面的 DOC_MAX_CHARS 校验
+            limit = _IMPORT_CONTENT_MAX_CHARS
             if not restored and len(content) > limit:
                 # 超过单条导入上限：计入 skipped_invalid 并记录警告，而不是
                 # 静默截断（截断会悄悄丢掉后半段、用户以为已完整入库）；
@@ -718,22 +835,58 @@ def import_documents(
                     "导入内容超过上限（%d 字 > %d），已跳过", len(content), limit
                 )
                 continue
-            document_chunks.append(_chunk_documents(content, sanitized_meta))
+            if restored:
+                restored_parts = item.pop("__restored_parts__", None)
+                pieces = _restore_pieces(restored_parts, content)
+                stored_size = sum(len(piece) for piece in pieces)
+                if not pieces or stored_size > DOC_MAX_CHARS or (
+                    restored_size and restored_size > DOC_MAX_CHARS
+                ):
+                    invalid += 1
+                    logger.warning(
+                        "备份中的文档超过还原上限（%d 字 > %d），已跳过",
+                        max(stored_size, restored_size),
+                        DOC_MAX_CHARS,
+                    )
+                    continue
+                total_parts = len(pieces)
+                chunks: list[dict[str, Any]] = []
+                for index, piece in enumerate(pieces, start=1):
+                    meta = dict(sanitized_meta)
+                    if total_parts > 1:
+                        meta["part"] = str(index)
+                        meta["parts"] = str(total_parts)
+                        meta["group"] = restored_group
+                    chunks.append({"content": piece, "metadata": meta})
+            else:
+                chunks = _chunk_documents(content, sanitized_meta)
+            document_chunks.append(chunks)
 
         unique: list[dict[str, Any]] = []
-        for chunks in document_chunks:
+        for doc_chunks in document_chunks:
             # existing 存的是 strip 后的内容；分片内容可能带切分残留的
             # 换行，必须同样 strip 后比较，否则重复导入不幂等
-            keys = [chunk["content"].strip() for chunk in chunks]
-            if any(key in existing for key in keys):
-                # 任一分片已存在：整组跳过。只补缺失分片会在库里留下
-                # 「parts 声明大于实际成员」的残缺组，整份编辑 / 备份恢复
-                # 都会失效
-                duplicate += len(chunks)
+            keys = [piece["content"].strip() for piece in doc_chunks]
+            missing = [
+                piece
+                for piece, key in zip(doc_chunks, keys)
+                if key not in existing
+            ]
+            duplicate += len(doc_chunks) - len(missing)
+            if not missing:
                 continue
+            # 部分分片已存在（上次导入中途失败 / 组内重复）：只补缺失分片，
+            # 补写后组内成员按内容齐全——整组跳过会把残缺组永久留在库里
+            if len(missing) != len(doc_chunks):
+                total_parts = max(
+                    int(piece["metadata"].get("parts") or 1)
+                    for piece in doc_chunks
+                )
+                for missing_piece in missing:
+                    missing_piece["metadata"]["parts"] = str(total_parts)
             for key in keys:
                 existing.add(key)
-            unique.extend(chunks)
+            unique.extend(missing)
         if not unique:
             result: dict[str, Any] = {
                 "imported": 0,
@@ -755,12 +908,25 @@ def import_documents(
                 "would_import": len(unique),
             }
 
-        # 分块嵌入 / 插入，控制大文件（CLI 导入）的峰值内存
+        # 按「文档」分批：同一 group 的分片必须落在同一批（批间失败会在库
+        # 中留下 parts 声明大于实际成员的残缺组）。只在组起始处切批
         assert agent is not None  # dry-run 已在上面提前返回
-        for start in range(0, len(unique), _IMPORT_CHUNK):
-            batch_no = start // _IMPORT_CHUNK + 1
+        batches: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for entry in unique:
+            meta = entry["metadata"]
+            starts_group = str(meta.get("part") or "") == "1" or not str(
+                meta.get("group") or ""
+            )
+            if starts_group and len(current) >= _IMPORT_CHUNK:
+                batches.append(current)
+                current = []
+            current.append(entry)
+        if current:
+            batches.append(current)
+        for batch_no, batch in enumerate(batches, start=1):
             try:
-                result = agent.add_documents(unique[start : start + _IMPORT_CHUNK])
+                result = agent.add_documents(batch)
             except Exception as exc:  # noqa: BLE001 - 保留已导入数量供上层展示
                 raise RuntimeError(
                     f"第 {batch_no} 批导入失败（已导入 {len(imported)} 条）：{exc}"
@@ -776,6 +942,27 @@ def import_documents(
         "skipped": invalid + duplicate,
         "skipped_invalid": invalid,
         "skipped_duplicate": duplicate,
+    }
+
+
+def get_document(doc_id: int) -> dict[str, Any] | None:
+    """按 id 读取单个片段（含完整 metadata）；不存在返回 None。"""
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    with _WRITE_LOCK:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f"id == {int(doc_id)}",
+            output_fields=["id", "content", "metadata"],
+            limit=1,
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "id": int(row.get("id", 0) or 0),
+        "content": str(row.get("content", "")),
+        "metadata": _parse_metadata(row.get("metadata")),
     }
 
 
@@ -824,7 +1011,7 @@ def search_documents(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     # 否则一次语义检索会把缺失的知识库悄悄建成空库并返回 200 无结果
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
-    agent = _get_agent()
+    agent = _get_read_agent()
     return agent.search_knowledge(query, top_k=top_k, strict=True)
 
 

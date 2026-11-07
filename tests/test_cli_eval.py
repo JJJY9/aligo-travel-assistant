@@ -125,12 +125,12 @@ def test_pass_and_fail_thresholds(monkeypatch):
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
     monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent())
 
-    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(1.0))
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search, **kwargs: _fake_result(1.0))
     code, out = _run(monkeypatch)
     assert code == 0
     assert "hit@5 100%" in out
 
-    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(0.5))
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search, **kwargs: _fake_result(0.5))
     code, out = _run(monkeypatch)
     assert code == 1
     assert "低于阈值" in out
@@ -143,7 +143,7 @@ def test_min_hit5_flag_changes_threshold(monkeypatch):
     monkeypatch.setattr(
         rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent()
     )
-    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda fn: _fake_result(0.5))
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda fn, **kwargs: _fake_result(0.5))
 
     code, out = _run(monkeypatch, min_hit5=0.5)
     assert code == 0, out
@@ -199,7 +199,7 @@ def test_eval_dispatch_passes_threshold(monkeypatch):
 def test_hint_when_all_miss(monkeypatch):
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
     monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent())
-    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(0.0))
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search, **kwargs: _fake_result(0.0))
     code, out = _run(monkeypatch)
     assert code == 1
     assert "索引未加载" in out, "全部未命中时应提示可能是索引故障，而不是切分策略"
@@ -210,7 +210,7 @@ def test_json_output(monkeypatch):
     """eval --json：成功 / 未达标 / 跳过 / 基础设施故障四种状态。"""
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
     monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent())
-    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(1.0))
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search, **kwargs: _fake_result(1.0))
 
     code, out = _run(monkeypatch, as_json=True)
     payload = json.loads(out)
@@ -218,7 +218,7 @@ def test_json_output(monkeypatch):
     assert payload["ok"] is True and payload["skipped"] is False
     assert payload["hit5"] == 1.0 and payload["threshold"] == 0.8
 
-    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search: _fake_result(0.5))
+    monkeypatch.setattr(rag_eval, "evaluate_retrieval", lambda search, **kwargs: _fake_result(0.5))
     code, out = _run(monkeypatch, as_json=True)
     payload = json.loads(out)
     assert code == 1

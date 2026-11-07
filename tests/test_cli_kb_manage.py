@@ -434,6 +434,12 @@ def test_add_and_update_failures(monkeypatch):
     code, out = _capture(cli.run_knowledge_add_standalone, str(doc))
     assert code == 1 and "添加失败" in out
 
+    # kb-update 会先读取现有片段合并 metadata：测试环境不依赖真实知识库
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document",
+        lambda doc_id: {"id": doc_id, "content": "旧", "metadata": {}},
+    )
     monkeypatch.setattr(
         knowledge_admin,
         "update_document",
@@ -454,6 +460,42 @@ def test_add_and_update_failures(monkeypatch):
     )
     assert code == 0 and "已更新知识片段 #7" in out
     print("✓ kb-add / kb-update 失败路径与更新成功")
+
+
+def test_update_merges_existing_metadata(monkeypatch):
+    """kb-update 只传 --title 时保留库中 category/source 等既有元数据。"""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document",
+        lambda doc_id: {
+            "id": doc_id,
+            "content": "旧内容",
+            "metadata": {"category": "住宿", "title": "旧标题", "source": "policy.md"},
+        },
+    )
+    captured = {}
+
+    def fake_update(doc_id, content, metadata=None):
+        captured["metadata"] = metadata
+        return {"status": "success", "id": doc_id}
+
+    monkeypatch.setattr(knowledge_admin, "update_document", fake_update)
+    doc = Path(tempfile.mkdtemp()) / "doc.txt"
+    doc.write_text("新内容", encoding="utf-8")
+    code, out = _capture(
+        cli.run_knowledge_update_standalone, 7, str(doc), {"title": "新标题"}
+    )
+    assert code == 0
+    assert captured["metadata"] == {
+        "category": "住宿",
+        "title": "新标题",
+        "source": "policy.md",
+    }, "既有元数据必须保留，显式字段覆盖"
+    print("✓ kb-update 合并既有元数据（不整体重建）")
 
 
 def test_duplicates_json_output(monkeypatch):
@@ -516,6 +558,11 @@ def test_update_reports_leftover_parts(monkeypatch):
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document",
+        lambda doc_id: {"id": doc_id, "content": "旧", "metadata": {}},
+    )
     monkeypatch.setattr(
         knowledge_admin,
         "update_document",
@@ -860,6 +907,7 @@ if __name__ == "__main__":
         test_kb_show_dispatch,
         test_add_from_file,
         test_add_and_update_failures,
+        test_update_merges_existing_metadata,
         test_update_reports_leftover_parts,
         test_kb_write_args_and_dispatch,
     ):
