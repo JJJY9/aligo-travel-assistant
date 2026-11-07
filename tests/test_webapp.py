@@ -5806,6 +5806,77 @@ def test_route_path_normalization():
     print("✓ 路由视角路径归一（root_path / 尾斜杠）")
 
 
+def test_validation_error_truncates_large_input():
+    """422 回显的 input 截断在 200 字内：大请求体不被完整 repr 物化。"""
+    client = _client()
+    big = "x" * 500_000
+    response = client.post(
+        "/api/knowledge/import", json={"documents": big}
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    text = str(detail)
+    assert len(text) < 5000, "422 响应不应回显整份请求体"
+    print("✓ 422 大输入截断")
+
+
+def test_chat_maps_user_facing_error_to_400(monkeypatch):
+    """UserFacingError 的消息可原样返回（400），不能吞成通用 500。"""
+    from utils.errors import UserFacingError
+    from webapp import server as server_module
+
+    async def broken_ask(self, message):
+        raise UserFacingError("意图识别结果解析失败，请重试")
+
+    monkeypatch.setattr(
+        server_module.ConversationRuntime, "ask", broken_ask
+    )
+    client = _client()
+    user_id = _unique_user("web_test_userfacing")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "s-uf"},
+        )
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "意图识别结果解析失败，请重试" in detail
+        assert "请求 ID" in detail
+        print("✓ UserFacingError 映射 400 并原样透出文案")
+    finally:
+        _cleanup(user_id)
+
+
+def test_session_cache_evicts_on_hit_path(monkeypatch):
+    """命中已有会话时同样执行容量回收：并发首请求不能把缓存推过上限。"""
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    created = []
+
+    class _Runtime:
+        def __init__(self, user_id, session_id, model=None, circuit_breaker=None, **kwargs):
+            self.user_id = user_id
+            self.session_id = session_id
+            self.closed = 0
+            created.append(self)
+
+        def close(self):
+            self.closed += 1
+
+    monkeypatch.setattr(server_module, "ConversationRuntime", _Runtime)
+    state.max_sessions = 1
+    first = state.get_session("u-lru", "s-a")
+    second = state.get_session("u-lru", "s-b")
+    # 再次命中 s-b：不能因为走过命中分支就跳过容量检查
+    third = state.get_session("u-lru", "s-b")
+    assert third is second
+    assert len(state.sessions) <= 1, "命中路径也必须回收超限会话"
+    assert first.runtime.closed >= 1
+    print("✓ 会话缓存命中路径执行 LRU 回收")
+
+
 def test_rate_identity_ipv6_aggregation():
     from webapp.server import _rate_identity
 
@@ -5813,6 +5884,9 @@ def test_rate_identity_ipv6_aggregation():
     assert _rate_identity("2001:db8:1:2::9") == _rate_identity("2001:db8:1:2::1")
     assert _rate_identity("192.0.2.1") == "192.0.2.1"
     assert _rate_identity("unknown") == "unknown"
+    # IPv4 映射的 IPv6 地址按真实 IPv4 聚合，不能都落进 ::/64 同一个桶
+    assert _rate_identity("::ffff:203.0.113.5") == "203.0.113.5"
+    assert _rate_identity("::ffff:203.0.113.5") != _rate_identity("::ffff:203.0.113.9")
     print("✓ IPv6 限流身份按 /64 聚合")
 
 
@@ -6196,6 +6270,8 @@ if __name__ == "__main__":
     test_knowledge_import_uses_dedicated_limiter(pytest.MonkeyPatch())
     test_metrics_streaming_and_sse_errors()
     test_rate_identity_ipv6_aggregation()
+    test_validation_error_truncates_large_input()
+    test_session_cache_evicts_on_hit_path(pytest.MonkeyPatch())
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
