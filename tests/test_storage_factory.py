@@ -1121,6 +1121,41 @@ def test_summary_failure_cooldown():
     print("✓ 总结失败进入冷却，冷却后重试")
 
 
+def test_empty_summary_enters_cooldown():
+    """模型返回 200 但内容为空：与失败同样冷却，不能每轮重复调用。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    class _EmptyModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, messages):
+            self.calls += 1
+
+            async def _empty_chunks():
+                if False:  # pragma: no cover - 仅声明为异步生成器
+                    yield ""
+
+            return _empty_chunks()
+
+    model = _EmptyModel()
+    manager = MemoryManager(
+        "u-empty", "s-cur", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    manager.long_term = _FakeLongTerm(
+        [{"role": "user", "content": "A", "timestamp": "t1", "session_id": "s1"}]
+    )
+    assert asyncio.run(manager.get_long_term_summary_async()) == ""
+    assert asyncio.run(manager.get_long_term_summary_async()) == ""
+    assert model.calls == 1, "空响应后冷却期内不应重复调用"
+    manager._summary_failure_until = 0.0
+    asyncio.run(manager.get_long_term_summary_async())
+    assert model.calls == 2
+    print("✓ 空总结响应进入冷却")
+
+
 def test_add_message_writes_long_term_first():
     """长期记忆写入失败时，短期记忆不能留下孤立提问。"""
     from context.memory_manager import MemoryManager
@@ -1436,6 +1471,7 @@ if __name__ == "__main__":
     test_summary_fingerprint_detects_history_replacement()
     test_summary_prompt_is_budgeted_and_formats_nulls()
     test_summary_failure_cooldown()
+    test_empty_summary_enters_cooldown()
     test_add_message_writes_long_term_first()
     test_reload_long_term_respects_backend()
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())

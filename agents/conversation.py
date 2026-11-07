@@ -154,8 +154,10 @@ class ConversationRuntime:
         logger.info("Plan: %s agents", len(schedule))
 
         # 长期 / 短期记忆写入是阻塞 IO（JSON 文件、PostgreSQL、Redis），
-        # 放到线程池执行，避免阻塞事件循环
-        await asyncio.to_thread(self.memory.add_message, "user", user_input)
+        # 放到线程池执行，避免阻塞事件循环。本轮提问先只进短期记忆：
+        # 编排智能体从短期记忆读取「用户本轮原话」，编排失败 / 用户停止时
+        # 长期记忆里不会留下没有回复的孤儿提问（CLI 同款时序）
+        await asyncio.to_thread(self.memory.stage_message, "user", user_input)
         orchestration = await self._call_with_resilience(
             lambda: self.orchestrator.reply(intention, on_event=on_event),
             max_retries=int(rc.get("max_retries", 3)),
@@ -177,6 +179,9 @@ class ConversationRuntime:
         usage = self._usage_delta(usage_before)
         elapsed = round(time.time() - start, 2)
         meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
+        # 编排成功：用户消息补写长期记忆（短期副本已在编排前暂存），
+        # 助手消息同时写长期 + 短期
+        await asyncio.to_thread(self.memory.persist_message, "user", user_input)
         await asyncio.to_thread(
             self.memory.add_message,
             "assistant",
@@ -266,7 +271,17 @@ class ConversationRuntime:
         if memory_parts:
             messages.append(Msg(name="system", content="\n\n".join(memory_parts), role="system"))
         for message in recent_context:
-            messages.append(Msg(name=message["role"], content=message["content"], role=message["role"]))
+            # 短期记忆可能含可解析但形状不对的条目（人工修复 / 外部写入）：
+            # 直接下标会让该会话每轮都 KeyError 500，这里同样跳过
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if role not in ("user", "assistant", "system"):
+                continue
+            if not isinstance(content, str):
+                continue
+            messages.append(Msg(name=role, content=content, role=role))
         messages.append(Msg(name="user", content=user_input, role="user"))
         return messages
 

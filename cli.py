@@ -236,7 +236,13 @@ class AligoCLI:
                 if long_term_summary:
                     context_messages.append(Msg(name="system", content=long_term_summary, role="system"))
                 for msg in recent_context:
-                    context_messages.append(Msg(name=msg["role"], content=msg["content"], role=msg["role"]))
+                    role = msg.get("role") if isinstance(msg, dict) else None
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if role not in ("user", "assistant", "system"):
+                        continue
+                    if not isinstance(content, str):
+                        continue
+                    context_messages.append(Msg(name=role, content=content, role=role))
                 context_messages.append(Msg(name="user", content=user_input, role="user"))
 
                 # 2. 意图识别（仅此调用加重试，原逻辑不变）

@@ -806,8 +806,17 @@ class RedisShortTermMemory:
                     # 否则数据错误会被当作「Redis 不可用」触发进程级冷却
                     logger.warning("跳过无法解析的短期记忆条目：%s", self.key)
                     continue
-                if isinstance(message, dict):
+                if (
+                    isinstance(message, dict)
+                    and isinstance(message.get("role"), str)
+                    and isinstance(message.get("content"), str)
+                ):
                     messages.append(message)
+                elif isinstance(message, dict):
+                    # 可解析但形状不对（缺 role/content）：同样跳过，否则
+                    # 下游 _build_context 的 message["role"] 会让整个会话
+                    # 每轮都 KeyError（比无法解析的条目更隐蔽）
+                    logger.warning("跳过形状非法的短期记忆条目：%s", self.key)
             self._fallback.messages = messages[-window:]
             if n_turns is None:
                 return messages
@@ -821,8 +830,12 @@ class RedisShortTermMemory:
             return "无历史对话"
         lines = []
         for message in messages:
-            role_name = "用户" if message["role"] == "user" else "助手"
-            lines.append(f"{role_name}: {message['content']}")
+            role = message.get("role")
+            content = message.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            role_name = "用户" if role == "user" else "助手"
+            lines.append(f"{role_name}: {content}")
         return "\n".join(lines)
 
     def clear(self) -> None:
@@ -916,12 +929,25 @@ class RedisShortTermMemory:
         def op() -> dict[str, Any]:
             total = int(self.client.llen(self.key) or 0)
             oldest = newest = None
+
+            def _timestamp(raw: Any) -> Any:
+                if not raw:
+                    return None
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                # 可解析但非对象（null / 数字 / 列表）：不能让 .get 的
+                # AttributeError 逃进 _call_redis 被误判为 Redis 故障、
+                # 触发 60 秒进程级短期记忆降级
+                return parsed.get("timestamp") if isinstance(parsed, dict) else None
+
             if total:
                 try:
                     first = self.client.lindex(self.key, 0)
                     last = self.client.lindex(self.key, -1)
-                    oldest = json.loads(first).get("timestamp") if first else None
-                    newest = json.loads(last).get("timestamp") if last else None
+                    oldest = _timestamp(first)
+                    newest = _timestamp(last)
                 except (TypeError, json.JSONDecodeError):
                     pass
             return {

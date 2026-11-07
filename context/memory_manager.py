@@ -381,6 +381,13 @@ class MemoryManager:
             if summary:
                 self._summary_cache = (fingerprint, summary)
                 self._summary_failure_until = 0.0
+            else:
+                # 网关 HTTP 200 但 choices 为空 / 纯空白：与异常同样进入冷却，
+                # 否则每个回合都会重复调用一次总结 LLM，且跨会话总结始终为空
+                self._summary_failure_until = (
+                    time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SEC
+                )
+                logger.warning("Long-term summary is empty; cooldown applied")
             logger.info(f"Generated long-term memory summary ({len(summary)} chars)")
             return summary
 
