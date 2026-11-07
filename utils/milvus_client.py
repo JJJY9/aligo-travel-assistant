@@ -14,6 +14,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# 已发放的最大实体 id（按 客户端/集合/字段）：见 next_entity_id 的单调语义
+_LAST_IDS: dict[tuple[int, str, str], int] = {}
+_ID_LOCK = threading.Lock()
+
 # gRPC 使用的 int32 上限，约 24.8 天；保持长连接避免空闲被断开
 _GRPC_MAX_MS = "2147483647"
 os.environ.setdefault("GRPC_KEEPALIVE_TIME_MS", _GRPC_MAX_MS)
@@ -73,7 +77,7 @@ def next_entity_id(
     id_field: str = "id",
     max_scan: int = 16384,
 ) -> int:
-    """返回集合内最大 ``id`` + 1（空集合从 1 开始）。
+    """返回集合内下一个可用 ``id``（空集合从 1 开始；进程内单调不复用）。
 
     先 ``load_collection``：Milvus Lite 3.x 新进程中集合默认 released，
     未加载时 query 会直接报错。查询失败时向上抛出，而不是退回行数兜底——
@@ -104,7 +108,13 @@ def next_entity_id(
         max_id = batch_max
         if len(rows) < max_scan:
             break
-    return max_id + 1
+    # 进程内单调递增：删除当前最大 id 后也不复用——否则持有旧 id 的客户端
+    # 会把删改操作落到另一条新知识上；客户端重连（缓存重建）后重新起算
+    state_key = (id(client), collection_name, id_field)
+    with _ID_LOCK:
+        candidate = max(max_id + 1, _LAST_IDS.get(state_key, 0) + 1)
+        _LAST_IDS[state_key] = candidate
+    return candidate
 
 
 def reset_milvus_client(db_path: str) -> None:

@@ -43,6 +43,9 @@ _METADATA_MAX_KEYS = 10
 _DERIVED_CHUNK_KEYS = {"part", "parts", "group"}
 _WRITE_LOCK = threading.Lock()
 _agent: Any = None
+# 检索路径专用的只读 Agent（create_if_missing=False）：语义检索不会在
+# 「库存在但集合缺失」时静默创建空集合、把未初始化伪装成 0 结果
+_read_agent: Any = None
 _agent_lock = threading.Lock()
 
 
@@ -67,6 +70,21 @@ def _get_agent() -> Any:
                 collection_name=COLLECTION_NAME, create_if_missing=True
             )
     return _agent
+
+
+def _get_read_agent() -> Any:
+    """只读检索用的 Agent：不创建空库 / 空集合。"""
+    global _read_agent
+    if _read_agent is not None:
+        return _read_agent
+    with _agent_lock:
+        if _read_agent is None:
+            from agents.rag_knowledge_agent import RAGKnowledgeAgent
+
+            _read_agent = RAGKnowledgeAgent(
+                collection_name=COLLECTION_NAME, create_if_missing=False
+            )
+    return _read_agent
 
 
 def _client() -> Any:
@@ -389,6 +407,14 @@ def update_document(
     _load_collection(client, COLLECTION_NAME)
     agent = _get_agent()
     documents = _chunk_documents(text, metadata)
+    stored_size = sum(len(document["content"]) for document in documents)
+    if stored_size > DOC_MAX_CHARS:
+        # 提交文本含分片分隔符时可能略超上限，但重新分片后的实际入库总长
+        # 才是文档大小：原样保存一次不能再把文档撑过上限
+        raise ValueError(
+            f"重新分片后的文档大小超过上限（{stored_size} 字 > {DOC_MAX_CHARS}），"
+            "请拆分后重试"
+        )
     with _WRITE_LOCK:
         existing_parts, group = _document_info(client, int(doc_id))
         if existing_parts == 0:
@@ -398,6 +424,15 @@ def update_document(
                 f"该片段属于多分片知识内容（共 {existing_parts} 段），"
                 "暂不支持单条编辑：请删除整组后重新添加，避免旧分片残留"
             )
+        # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
+        # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
+        old_ids: list[int] = []
+        if group:
+            old_ids = [
+                member
+                for member in _group_member_ids(client, group)
+                if member != int(doc_id)
+            ]
         # 先写其余新分片：失败时目标分片与旧分片原样保留，可直接重试
         extra_ids: list[int] = []
         if len(documents) > 1:
@@ -415,13 +450,21 @@ def update_document(
             )
             if result.get("status") != "success":
                 raise RuntimeError(str(result.get("message") or "更新知识片段失败"))
-        except Exception:
-            # 补偿：删除本次已插入的其余分片，保持原记录可重试
-            if extra_ids:
+        except Exception as original:
+            # 补偿：删除本次已插入的其余分片，保持原记录可重试。逐条删除，
+            # 失败项随异常一起报出（只写日志会让孤儿分片参与检索且无主可查）
+            failed_compensation: list[int] = []
+            for item_id in extra_ids:
                 try:
-                    client.delete(collection_name=COLLECTION_NAME, ids=extra_ids)
-                except Exception:  # noqa: BLE001 - 补偿失败不覆盖原始错误
-                    logger.warning("更新失败后补偿删除新分片失败：%s", extra_ids)
+                    client.delete(collection_name=COLLECTION_NAME, ids=[item_id])
+                except Exception as exc:  # noqa: BLE001 - 汇总后随原始错误抛出
+                    logger.warning("更新失败后补偿删除分片 %s 失败：%s", item_id, exc)
+                    failed_compensation.append(item_id)
+            if failed_compensation:
+                raise RuntimeError(
+                    "更新失败且补偿删除未完成，残留分片 "
+                    f"{failed_compensation}：请稍后重试或运行 kb-dedupe 清理"
+                ) from original
             raise
         # 目标已换成新内容后再删旧分片（旧组仅此时失去定位目标）。
         # 逐条删除：某一片失败不应连累其余旧分片，失败项在响应里报告，
@@ -429,11 +472,6 @@ def update_document(
         removed_ids: list[int] = []
         leftover_ids: list[int] = []
         if group:
-            old_ids = [
-                member
-                for member in _group_member_ids(client, group)
-                if member != int(doc_id)
-            ]
             for member in old_ids:
                 try:
                     client.delete(collection_name=COLLECTION_NAME, ids=[member])
@@ -907,6 +945,27 @@ def import_documents(
     }
 
 
+def get_document(doc_id: int) -> dict[str, Any] | None:
+    """按 id 读取单个片段（含完整 metadata）；不存在返回 None。"""
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
+    with _WRITE_LOCK:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f"id == {int(doc_id)}",
+            output_fields=["id", "content", "metadata"],
+            limit=1,
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "id": int(row.get("id", 0) or 0),
+        "content": str(row.get("content", "")),
+        "metadata": _parse_metadata(row.get("metadata")),
+    }
+
+
 def delete_document(doc_id: int, whole_group: bool = False) -> int:
     """按 id 删除知识片段；返回实际删除的分片数（不存在返回 0）。
 
@@ -952,7 +1011,7 @@ def search_documents(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     # 否则一次语义检索会把缺失的知识库悄悄建成空库并返回 200 无结果
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
-    agent = _get_agent()
+    agent = _get_read_agent()
     return agent.search_knowledge(query, top_k=top_k, strict=True)
 
 

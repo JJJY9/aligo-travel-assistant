@@ -86,7 +86,27 @@ def test_empty_cases():
     print("✓ 空用例集不报错")
 
 
+def test_min_score_filters_low_similarity_and_warns():
+    """评测应用问答链路的相似度阈值；全未命中时给出题库不匹配告警。"""
+    cases = (EvalCase("问题一", ("关键词",)),)
+
+    def search_low(query, top_k):
+        return [{"content": "关键词", "distance": 0.2}]
+
+    result = evaluate_retrieval(search_low, cases=cases, top_k=5, min_score=0.5)
+    assert result["hit5"] == 0.0 and result["mrr"] == 0.0
+    assert "warning" in result and "题库" in result["warning"]
+
+    def search_high(query, top_k):
+        return [{"content": "关键词", "distance": 0.8}]
+
+    ok = evaluate_retrieval(search_high, cases=cases, top_k=5, min_score=0.5)
+    assert ok["hit5"] == 1.0 and "warning" not in ok
+    print("✓ 评测阈值过滤与题库不匹配告警")
+
+
 if __name__ == "__main__":
+    test_min_score_filters_low_similarity_and_warns()
     test_all_hits_at_one()
     test_mixed_ranks_and_misses()
     test_top_k_truncation()

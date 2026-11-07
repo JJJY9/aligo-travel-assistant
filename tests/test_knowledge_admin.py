@@ -285,7 +285,9 @@ def test_search_documents_delegates_to_agent(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: db)
 
     agent = _SearchAgent()
-    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    # 检索路径使用只读 Agent（create_if_missing=False），不在集合缺失时
+    # 静默创建空集合
+    monkeypatch.setattr(knowledge_admin, "_get_read_agent", lambda: agent)
     result = knowledge_admin.search_documents("住宿标准", top_k=3)
     assert result == [{"content": "命中"}]
     # strict=True：后端故障要抛出（映射 503），不能伪装成“没有相关内容”
@@ -1532,7 +1534,99 @@ def test_import_rejects_oversized_single_content(monkeypatch):
     assert agent.calls == [], "超长内容不能被截断后写入"
     print("✓ 单条导入超限按无效项跳过（不静默截断）")
 
+def test_next_entity_id_monotonic_after_delete():
+    """删除当前最大 id 后不复用（进程内单调），避免旧句柄误伤新记录。"""
+    from utils.milvus_client import next_entity_id
+
+    class _Client:
+        def __init__(self):
+            self.rows = [{"id": 5}]
+
+        def load_collection(self, name):
+            pass
+
+        def query(self, collection_name, filter="", output_fields=None, limit=10):
+            return list(self.rows)
+
+    client = _Client()
+    assert next_entity_id(client, "kb-monotonic", max_scan=10) == 6
+    client.rows = []  # 删除最大 id 后集合为空
+    assert next_entity_id(client, "kb-monotonic", max_scan=10) == 7, "不得复用已删除的 id"
+    print("✓ 实体 id 进程内单调（删除后不复用）")
+
+
+def test_update_document_rejects_post_chunk_oversize(monkeypatch):
+    monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 100)
+    monkeypatch.setattr(knowledge_admin, "JOINED_MAX_CHARS", 210)
+    fake = _FakeMilvusClient([{"id": 1, "content": "x", "metadata": "{}"}])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_get_agent",
+        lambda: _FakeAgent({"status": "success", "ids": [1]}),
+    )
+    with pytest.raises(ValueError, match="重新分片后的文档大小超过上限"):
+        knowledge_admin.update_document(1, "长" * 150)
+    print("✓ 整份编辑校验重新分片后的实际大小")
+
+
+def test_update_document_scans_old_group_before_writes(monkeypatch):
+    """旧组扫描失败时不得写入任何新分片（否则留下无主的新 group）。"""
+    calls = []
+
+    class _Agent:
+        def add_documents(self, documents):
+            calls.append("add")
+            return {"status": "success", "ids": [9]}
+
+        def update_document(self, doc_id, content, metadata):
+            calls.append("update")
+            return {"status": "success"}
+
+    client = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "甲", "metadata": '{"group": "g1", "part": "1", "parts": "2"}'},
+            {"id": 2, "content": "乙", "metadata": '{"group": "g1", "part": "2", "parts": "2"}'},
+        ]
+    )
+    def failing_iterator(*args, **kwargs):
+        raise RuntimeError("scan down")
+
+    # 旧组成员是遍历全表的（query_iterator）：模拟扫描失败
+    client.query_iterator = failing_iterator
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: client)
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(RuntimeError, match="scan down"):
+        knowledge_admin.update_document(1, "长" * 900)
+    assert calls == [], "旧组扫描失败时不得写入任何分片"
+    print("✓ 旧组扫描在写入之前（失败不留孤儿组）")
+
+
+def test_update_compensation_failure_reported(monkeypatch):
+    """补偿删除失败时把残留分片 id 报给调用方，而不是只写日志。"""
+
+    class _Agent:
+        def add_documents(self, documents):
+            return {"status": "success", "ids": [9, 10]}
+
+        def update_document(self, doc_id, content, metadata):
+            return {"status": "error", "message": "boom"}
+
+    client = _FakeMilvusClient([{"id": 1, "content": "x", "metadata": "{}"}])
+
+    def booming_delete(collection_name, ids):
+        raise RuntimeError("delete down")
+
+    client.delete = booming_delete
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: client)
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(RuntimeError, match=r"残留分片 \[9, 10\]"):
+        knowledge_admin.update_document(1, "长" * 900)
+    print("✓ 补偿删除失败的残留分片随异常报出")
+
+
 if __name__ == "__main__":
+    test_next_entity_id_monotonic_after_delete()
     for case in (
         test_list_documents_parses_sorts_and_filters,
         test_list_documents_pages_full_scan,
@@ -1560,6 +1654,9 @@ if __name__ == "__main__":
         test_import_restore_strips_padding,
         test_import_restore_oversize_document_skipped_not_aborting,
         test_import_partial_group_repairs_missing_parts,
+        test_update_document_rejects_post_chunk_oversize,
+        test_update_document_scans_old_group_before_writes,
+        test_update_compensation_failure_reported,
         test_import_dedupes_chunks_with_boundary_newline,
         test_delete_grouped_fragment_requires_whole_group,
         test_list_and_export_hold_write_lock,

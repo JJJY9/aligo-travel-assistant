@@ -1907,10 +1907,14 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=503, detail="RAG 依赖未安装")
             try:
                 # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
+                from config import RAG_CONFIG
+
                 result = evaluate_retrieval(
                     lambda query, top_k: agent.search_knowledge(
                         query, top_k=top_k, strict=True
-                    )
+                    ),
+                    # 与问答链路同一相似度阈值：低于阈值的命中不计入
+                    min_score=float(RAG_CONFIG.get("min_score", 0.5)),
                 )
                 # 心跳续期发现共享锁已失效（过期后被其它实例拿走），或配置了
                 # Redis 但加锁时回退到进程内（共享锁实际不存在）：本次评测
