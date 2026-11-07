@@ -113,12 +113,15 @@ class PostgresLongTermMemory:
     # 直接查询数据库，无内存快照，无需在多轮对话前重建
     snapshot_based = False
 
-    def __init__(self, user_id: str, dsn: str):
+    def __init__(self, user_id: str, dsn: str, statement_timeout_ms: int | None = None):
         import psycopg
 
         self.user_id = user_id
         self.dsn = dsn
-        self._conn = psycopg.connect(dsn, autocommit=True, connect_timeout=3)
+        # 连接级 statement_timeout（毫秒）：为 None 时沿用服务端默认；自检
+        # 探测等最坏场景需要给 DDL / 查询设上限，避免网络半通时无限等待
+        self._statement_timeout_ms = statement_timeout_ms
+        self._conn = self._connect()
         self._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
         # 当前连接持有的会话级 advisory lock（锁名 -> 重入计数）。advisory lock
         # 随连接失效由服务端释放，重连后必须重新获取，否则读改写失去互斥。
@@ -127,6 +130,16 @@ class PostgresLongTermMemory:
         logger.info("PostgreSQL long-term memory initialized for user: %s", user_id)
 
     # ---------- 内部工具 ----------
+
+    def _connect(self):
+        import psycopg
+
+        kwargs: dict[str, Any] = {"autocommit": True, "connect_timeout": 3}
+        if self._statement_timeout_ms:
+            kwargs["options"] = (
+                f"-c statement_timeout={int(self._statement_timeout_ms)}"
+            )
+        return psycopg.connect(self.dsn, **kwargs)
 
     def _ensure_schema(self) -> None:
         with self._conn.cursor() as cursor:
@@ -165,11 +178,9 @@ class PostgresLongTermMemory:
 
     def _reconnect(self) -> None:
         """连接失效（数据库重启 / 被服务端终止）时重建连接并确保表结构。"""
-        import psycopg
-
         with contextlib.suppress(Exception):
             self._conn.close()
-        self._conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=3)
+        self._conn = self._connect()
         self._ensure_schema()
         # 旧连接上的 advisory lock 已被服务端释放：在新的连接上按重入计数
         # 重新获取，否则重试的读改写会在没有互斥保护的情况下执行（trip_N /

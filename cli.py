@@ -1472,12 +1472,12 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             print(f"评测失败：知识库不可用（{reason}）")
         return 1
 
-    from agents.rag_knowledge_agent import RAGKnowledgeAgent
-    from utils.rag_eval import evaluate_retrieval
-
     try:
+        from agents.rag_knowledge_agent import RAGKnowledgeAgent
+        from utils.rag_eval import evaluate_retrieval
+
         agent = RAGKnowledgeAgent(collection_name=status["collection"])
-    except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
+    except Exception as exc:  # noqa: BLE001 - 依赖 / 技能加载失败与 Agent 初始化同口径
         if as_json:
             print(
                 json.dumps(
@@ -1502,9 +1502,9 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             print("评测失败：RAG 依赖未安装（pip install -r requirements.txt）")
         return 1
 
-    from config import RAG_CONFIG
-
     try:
+        from config import RAG_CONFIG
+
         result = evaluate_retrieval(
             lambda query, top_k: agent.search_knowledge(
                 query, top_k=top_k, strict=True

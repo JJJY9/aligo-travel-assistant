@@ -76,6 +76,18 @@ def test_failure_when_agent_init_raises(monkeypatch):
     print("✓ RAG Agent 初始化失败 → 失败（退出码 1）")
 
 
+def test_failure_when_agent_import_breaks(monkeypatch):
+    """agents.rag_knowledge_agent 导入失败（依赖装坏）→ 友好失败而非 traceback。"""
+    import sys as _sys
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
+    monkeypatch.setitem(_sys.modules, "agents.rag_knowledge_agent", None)
+    code, out = _run(monkeypatch)
+    assert code == 1
+    assert "无法初始化 RAG Agent" in out
+    print("✓ 智能体模块导入失败 → 友好失败（退出码 1）")
+
+
 class _FakeAgent:
     initialized = True
 
@@ -249,6 +261,7 @@ if __name__ == "__main__":
         test_skip_when_uninitialized,
         test_failure_on_infra_error,
         test_failure_when_agent_init_raises,
+        test_failure_when_agent_import_breaks,
         test_failure_when_search_backend_raises,
         test_pass_and_fail_thresholds,
         test_min_hit5_flag_changes_threshold,
