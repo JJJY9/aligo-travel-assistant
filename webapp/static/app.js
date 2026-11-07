@@ -163,6 +163,7 @@ const els = {
   exportData: byId("exportData"),
   exportDataMd: byId("exportDataMd"),
   exportSessions: byId("exportSessions"),
+  exportSessionsHtml: byId("exportSessionsHtml"),
   importData: byId("importData"),
   importDataFile: byId("importDataFile"),
   overview: byId("overview"),
@@ -4682,6 +4683,13 @@ function bindEvents() {
     downloadFromApi(
       `/api/sessions/export?user_id=${encodeURIComponent(state.userId)}`,
       `aligo_sessions_${exportSafeName(state.userId)}.md`,
+    );
+  });
+  els.exportSessionsHtml.addEventListener("click", () => {
+    // 与 CLI sessions-export --html 同一渲染口径：单文件内嵌样式、可分享 / 打印
+    downloadFromApi(
+      `/api/sessions/export?user_id=${encodeURIComponent(state.userId)}&format=html`,
+      `aligo_sessions_${exportSafeName(state.userId)}.html`,
     );
   });
   if (els.importData && els.importDataFile) {

@@ -1221,6 +1221,22 @@ def test_export_all_sessions_api():
         assert "杭州行程" in exported.text and "第一问" in exported.text
         assert "### 用户" in exported.text and "### Aligo" in exported.text
 
+        # format=html：与 CLI sessions-export --html 同一渲染口径
+        html_export = client.get(
+            "/api/sessions/export", params={"user_id": user_id, "format": "html"}
+        )
+        assert html_export.status_code == 200
+        disposition = html_export.headers.get("content-disposition", "")
+        assert "attachment" in disposition and ".html" in disposition
+        assert html_export.text.startswith("<!doctype html>")
+        assert "<title>Aligo 会话导出</title>" in html_export.text
+        assert "杭州行程" in html_export.text
+        assert "&amp;lt;" not in html_export.text, "标题只应转义一次"
+        bad_format = client.get(
+            "/api/sessions/export", params={"user_id": user_id, "format": "pdf"}
+        )
+        assert bad_format.status_code == 422
+
         # 静态路由优先于 /api/sessions/{session_id}
         detail = client.get("/api/sessions/s-a", params={"user_id": user_id})
         assert detail.status_code == 200 and detail.json()["messages"]

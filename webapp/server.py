@@ -76,6 +76,7 @@ from utils.preference_values import has_preference_value
 from utils.rate_limit import create_rate_limiter
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
+from utils.session_html import render_all_sessions_html
 from utils.session_markdown import render_all_sessions_markdown
 from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
@@ -2313,8 +2314,14 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.get("/api/sessions/export")
-    def export_sessions(user_id: str = Query(..., pattern=_ID_PATTERN)) -> Response:
-        """导出全部会话为单个 Markdown 文件（按最近更新排序，含归档会话）。
+    def export_sessions(
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+        format: Literal["md", "html"] = Query(default="md"),
+    ) -> Response:
+        """导出全部会话为单个文件（按最近更新排序，含归档会话）。
+
+        ``format=html`` 与 CLI ``sessions-export --html`` 同一渲染口径
+        （单文件内嵌样式、全部内容单次转义）。
 
         必须声明在 ``/api/sessions/{session_id}`` 之前，否则会被动态路由捕获。
         """
@@ -2329,8 +2336,20 @@ def create_app(model: Any = None) -> FastAPI:
             _close_long_term(store)
         if not messages:
             raise HTTPException(status_code=404, detail="没有可导出的会话")
+        safe_user = _safe_filename(user_id, "user")
+        if format == "html":
+            html, count = render_all_sessions_html(user_id, messages, titles)
+            filename = f"aligo_sessions_{safe_user}.html"
+            logger.info("Exported %s sessions (html) for %s", count, user_id)
+            return Response(
+                content=html,
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"'
+                },
+            )
         markdown, count = render_all_sessions_markdown(user_id, messages, titles)
-        filename = f"aligo_sessions_{_safe_filename(user_id, 'user')}.md"
+        filename = f"aligo_sessions_{safe_user}.md"
         logger.info("Exported %s sessions for %s", count, user_id)
         return Response(
             content=markdown,
