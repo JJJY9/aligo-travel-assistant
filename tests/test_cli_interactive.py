@@ -246,6 +246,35 @@ def test_summary_tolerates_legacy_nested_preference_and_trip_fields():
     print("✓ 嵌套偏好 / 非字符串行程字段不崩溃")
 
 
+def test_process_query_releases_probe_on_early_failure(monkeypatch):
+    """LLM 调用前失败（如记忆写盘错误）：半开试探名额必须归还。"""
+    from utils import circuit_breaker as cb_module
+    from utils.circuit_breaker import CircuitBreaker
+    from utils.errors import MemoryPersistenceError
+
+    agent, _ = _make_cli_stub()
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    breaker.record_failure()
+    real_monotonic = cb_module.time.monotonic
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: real_monotonic() + 61)
+    agent.circuit_breaker = breaker
+
+    async def boom(user_input=""):
+        raise MemoryPersistenceError("disk full")
+
+    agent._get_long_term_summary = boom
+    try:
+        asyncio.run(agent.process_query("你好"))
+    except MemoryPersistenceError:
+        pass
+    else:
+        raise AssertionError("应抛出 MemoryPersistenceError")
+    assert breaker.allow_call() is True, "提前失败后应归还半开名额"
+    print("✓ CLI 提前失败时归还半开名额")
+
+
 class _TextMessage:
     def __init__(self, content):
         self.content = content
@@ -339,6 +368,7 @@ if __name__ == "__main__":
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
         test_process_query_reloads_long_term_each_turn()
         test_process_query_memory_failure_not_counted_by_breaker()
+        test_process_query_releases_probe_on_early_failure(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")

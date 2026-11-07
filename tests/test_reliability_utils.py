@@ -9,6 +9,7 @@
 import asyncio
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -149,6 +150,17 @@ def test_access_log_strips_control_characters():
     assert "2026-01-01" in line  # 内容保留但被压成同一行
     escaped = format_access_log("GET", "/x\x1b[31m", 200, 1.0, "rid", fmt="text")
     assert "\x1b" not in escaped
+    # C1 控制符（含 NEL）与 U+2028/U+2029 行分隔符同样不能透出
+    poisoned = format_access_log(
+        "GET", "/a\x85b\u2028c\u2029d", 200, 1.0, "rid", fmt="text"
+    )
+    assert "\x85" not in poisoned
+    assert "\u2028" not in poisoned and "\u2029" not in poisoned
+    json_line = format_access_log(
+        "GET", "/a\x85b\u2028c", 200, 1.0, "rid", fmt="json"
+    )
+    assert "\u2028" not in json_line
+    assert len(json_line.splitlines()) == 1, "JSON 日志不能被行分隔符拆断"
     print("✓ 访问日志清理 CR/LF 与转义字符")
 
 
@@ -229,6 +241,88 @@ def test_conversation_ask_releases_probe_on_cancel(monkeypatch):
     print("✓ 半开试探在被取消时归还名额")
 
 
+def test_probe_owner_only(monkeypatch):
+    """半开名额归持有线程：其它线程的归还 / 迟到成功都不能消费或清除。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+    assert breaker.allow_call() is True, "主线程占用试探名额"
+
+    done = {}
+
+    def other_thread():
+        breaker.release_probe()
+        breaker.record_success()
+        done["ran"] = True
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    thread.join()
+    assert done["ran"]
+    assert breaker.state.value == "half_open", "迟到成功不能关闭熔断器"
+    assert breaker.allow_call() is False, "名额仍归持有线程"
+
+    breaker.record_success()  # 持有者成功：half_open_successes=1 → CLOSED
+    assert breaker.state.value == "closed"
+    print("✓ 半开名额只归持有线程")
+
+
+def test_late_success_cannot_close_breaker(monkeypatch):
+    """熔断打开前放行的慢调用迟到返回时，不能凑够半开成功计数关闭熔断器。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=2
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+    assert breaker.allow_call() is True
+
+    def late_successes():
+        breaker.record_success()
+        breaker.record_success()
+
+    thread = threading.Thread(target=late_successes)
+    thread.start()
+    thread.join()
+    assert breaker.state.value == "half_open", "没有任何真实试探完成时不能关闭"
+    assert breaker.allow_call() is False
+    print("✓ 迟到成功不能关闭熔断器")
+
+
+def test_retry_jitter_respects_max_delay(monkeypatch):
+    """抖动在截断之前应用：实际退避不超过 max_delay_sec。"""
+    import utils.llm_resilience as resilience_module
+
+    delays: list[float] = []
+
+    async def fake_sleep(sec):
+        delays.append(sec)
+
+    monkeypatch.setattr(resilience_module.asyncio, "sleep", fake_sleep)
+
+    async def always_fail():
+        raise ConnectionError("boom")
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(
+            resilience_module.retry_with_backoff(
+                always_fail,
+                max_retries=5,
+                base_delay_sec=2.0,
+                max_delay_sec=2.0,
+                jitter=True,
+            )
+        )
+    assert delays, "应发生重试退避"
+    assert all(delay <= 2.0 + 1e-9 for delay in delays), delays
+    print("✓ 抖动不会突破最大退避上限")
+
+
 def test_memory_persistence_error_does_not_trip_breaker():
     """记忆写盘失败不能计入熔断器（磁盘故障与 LLM 健康无关）。"""
     from agents.conversation import ConversationRuntime
@@ -276,6 +370,9 @@ if __name__ == "__main__":
         test_build_turn_meta_tolerates_non_list_shapes()
         test_access_log_strips_control_characters()
         test_release_probe_returns_half_open_slot(_mp)
+        test_probe_owner_only(_mp)
+        test_late_success_cannot_close_breaker(_mp)
+        test_retry_jitter_respects_max_delay(_mp)
         test_conversation_ask_releases_probe_on_cancel(_mp)
         test_memory_persistence_error_does_not_trip_breaker()
     finally:

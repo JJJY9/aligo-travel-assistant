@@ -127,6 +127,9 @@ def test_release_cleans_key_after_set_timeout():
     token = lock.acquire()
     assert token and token != "__local__"
     assert "aligo:test:ambiguous" in client.store, "SET 可能已在服务端生效"
+    # SET 抛异常但可能已生效：必须启动心跳，否则长任务超过 TTL 后共享锁
+    # 静默过期且 lost 永远为 False
+    assert lock._heartbeat_thread is not None, "异常路径也要启动续期"
 
     lock.release(token)
     assert "aligo:test:ambiguous" not in client.store, "释放应尽力清理已生效的锁键"

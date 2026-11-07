@@ -77,14 +77,20 @@ def _pick_stdin_encoding(default: str) -> str:
     if not _stdin_has_data(stream):
         return default
     try:
-        head = bytes(peek(4)[:4])
+        head = bytes(peek(64)[:64])
     except Exception:
         return default
-    if not head or head in (_UTF8_BOM[: len(head)],):
+    if not head:
         return "utf-8"
+    if head.startswith(_UTF8_BOM):
+        # BOM 输入按 utf-8-sig 解码：否则 U+FEFF 残留在首行
+        return "utf-8-sig"
     if head.isascii():
-        # ASCII 在两种编码下相同，沿用默认
-        return default
+        # 前 64 字节全 ASCII 只是 UTF-8 的有效前缀（ASCII 子集），
+        # 中文可能出现在后面；按 locale 处理 UTF-8 管道会把中文解成乱码。
+        # 真正的 GBK 管道通常很快出现 >=0x81 字节，会走下面的判定
+        return "utf-8"
+
     try:
         head.decode("utf-8")
     except UnicodeDecodeError as exc:

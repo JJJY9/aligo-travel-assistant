@@ -195,38 +195,85 @@ class AligoCLI:
                 )
                 return
 
-        rc = RESILIENCE_CONFIG
-        max_retries = int(rc.get("max_retries", 3))
+        # 半开试探名额是否已被本轮消费（记录过成功 / 失败）。真正调用 LLM
+        # 之前失败或 Ctrl-C（CancelledError 不经过 record_*）时在 finally 里
+        # 归还名额，否则后续查询会被熔断拒绝最多 recovery_timeout 秒
+        probe_recorded = False
 
-        # 每轮对话前重载长期记忆（与 Web 端一致）：记忆面板 / 其它进程刚写入的
-        # 标题、偏好、行程必须进入本轮上下文，本进程的旧快照也不能在写回时
-        # 覆盖它们
-        await asyncio.to_thread(self.memory_manager.reload_long_term)
+        try:
+            rc = RESILIENCE_CONFIG
+            max_retries = int(rc.get("max_retries", 3))
 
-        with self.console.status("正在理解需求…", spinner="dots"):
-            from agentscope.message import Msg
+            # 每轮对话前重载长期记忆（与 Web 端一致）：记忆面板 / 其它进程刚写入的
+            # 标题、偏好、行程必须进入本轮上下文，本进程的旧快照也不能在写回时
+            # 覆盖它们
+            await asyncio.to_thread(self.memory_manager.reload_long_term)
 
-            # 1. 获取长期记忆摘要与上下文（原逻辑不变）
-            long_term_summary = await self._get_long_term_summary(user_input)
-            recent_context = self.memory_manager.short_term.get_recent_context(n_turns=5)
-            context_messages = []
-            if long_term_summary:
-                context_messages.append(Msg(name="system", content=long_term_summary, role="system"))
-            for msg in recent_context:
-                context_messages.append(Msg(name=msg["role"], content=msg["content"], role=msg["role"]))
-            context_messages.append(Msg(name="user", content=user_input, role="user"))
+            with self.console.status("正在理解需求…", spinner="dots"):
+                from agentscope.message import Msg
 
-            # 2. 意图识别（仅此调用加重试，原逻辑不变）
-            intention_result = None
+                # 1. 获取长期记忆摘要与上下文（原逻辑不变）
+                long_term_summary = await self._get_long_term_summary(user_input)
+                recent_context = self.memory_manager.short_term.get_recent_context(n_turns=5)
+                context_messages = []
+                if long_term_summary:
+                    context_messages.append(Msg(name="system", content=long_term_summary, role="system"))
+                for msg in recent_context:
+                    context_messages.append(Msg(name=msg["role"], content=msg["content"], role=msg["role"]))
+                context_messages.append(Msg(name="user", content=user_input, role="user"))
+
+                # 2. 意图识别（仅此调用加重试，原逻辑不变）
+                intention_result = None
+                try:
+                    intention_result = await retry_with_backoff(
+                        lambda: self.intention_agent.reply(context_messages),
+                        max_retries=max_retries,
+                        base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
+                        max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
+                    )
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_success()
+                        probe_recorded = True
+                except CircuitOpenError:
+                    raise
+                except MemoryPersistenceError:
+                    # 记忆写盘失败与 LLM 健康无关，不计入熔断（与 ConversationRuntime 一致）
+                    raise
+                except Exception:
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_failure()
+                        probe_recorded = True
+                    raise
+
+                # 3. 解析意图识别结果（原逻辑不变：解析失败则友好提示并 return）
+                try:
+                    intention_data = json.loads(intention_result.content)
+                except json.JSONDecodeError:
+                    self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
+                    return
+
+            # 4. 添加用户输入到短期记忆（原逻辑不变）
+            self.memory_manager.add_message("user", user_input)
+
+            # 5. 调度智能体（实时显示智能体进度）
+            orchestration_result = None
             try:
-                intention_result = await retry_with_backoff(
-                    lambda: self.intention_agent.reply(context_messages),
-                    max_retries=max_retries,
-                    base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
-                    max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
-                )
+                with self.console.status("正在调度智能体…", spinner="dots") as orchestration_status:
+
+                    def on_progress(event: dict) -> None:
+                        text = format_progress_event(event, self._get_agent_display_name)
+                        if text:
+                            orchestration_status.update(text)
+
+                    orchestration_result = await retry_with_backoff(
+                        lambda: self.orchestrator.reply(intention_result, on_event=on_progress),
+                        max_retries=max_retries,
+                        base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
+                        max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
+                    )
                 if self.circuit_breaker:
                     self.circuit_breaker.record_success()
+                    probe_recorded = True
             except CircuitOpenError:
                 raise
             except MemoryPersistenceError:
@@ -235,84 +282,50 @@ class AligoCLI:
             except Exception:
                 if self.circuit_breaker:
                     self.circuit_breaker.record_failure()
+                    probe_recorded = True
                 raise
 
-            # 3. 解析意图识别结果（原逻辑不变：解析失败则友好提示并 return）
+            # 6. 解析执行结果（原逻辑不变）
             try:
-                intention_data = json.loads(intention_result.content)
+                result_data = json.loads(orchestration_result.content)
             except json.JSONDecodeError:
-                self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
-                return
+                result_data = {"error": "解析结果失败"}
 
-        # 4. 添加用户输入到短期记忆（原逻辑不变）
-        self.memory_manager.add_message("user", user_input)
+            # 7. 显示调用的智能体与最终结果（原逻辑不变）
+            self._display_agents_called(result_data)
+            self.console.print()
+            self._display_results(result_data)
 
-        # 5. 调度智能体（实时显示智能体进度）
-        orchestration_result = None
-        try:
-            with self.console.status("正在调度智能体…", spinner="dots") as orchestration_status:
+            # 8. 本次查询的 LLM 用量与耗时（模型层统一统计）
+            usage_delta = None
+            elapsed = time.time() - start_time
+            if usage_before is not None:
+                after = self.model.usage.snapshot()
+                usage_delta = {key: after[key] - usage_before[key] for key in usage_before}
+                delta_calls = usage_delta["calls"]
+                if delta_calls > 0:
+                    self.console.print(
+                        f"[dim]📊 本次调用 LLM {delta_calls} 次 · "
+                        f"tokens {usage_delta['total_tokens']}"
+                        f"（输入 {usage_delta['input_tokens']} / "
+                        f"输出 {usage_delta['output_tokens']}）· "
+                        f"总耗时 {elapsed:.1f}s[/dim]"
+                    )
 
-                def on_progress(event: dict) -> None:
-                    text = format_progress_event(event, self._get_agent_display_name)
-                    if text:
-                        orchestration_status.update(text)
-
-                orchestration_result = await retry_with_backoff(
-                    lambda: self.orchestrator.reply(intention_result, on_event=on_progress),
-                    max_retries=max_retries,
-                    base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
-                    max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
-                )
-            if self.circuit_breaker:
-                self.circuit_breaker.record_success()
-        except CircuitOpenError:
-            raise
-        except MemoryPersistenceError:
-            # 记忆写盘失败与 LLM 健康无关，不计入熔断（与 ConversationRuntime 一致）
-            raise
-        except Exception:
-            if self.circuit_breaker:
-                self.circuit_breaker.record_failure()
-            raise
-
-        # 6. 解析执行结果（原逻辑不变）
-        try:
-            result_data = json.loads(orchestration_result.content)
-        except json.JSONDecodeError:
-            result_data = {"error": "解析结果失败"}
-
-        # 7. 显示调用的智能体与最终结果（原逻辑不变）
-        self._display_agents_called(result_data)
-        self.console.print()
-        self._display_results(result_data)
-
-        # 8. 本次查询的 LLM 用量与耗时（模型层统一统计）
-        usage_delta = None
-        elapsed = time.time() - start_time
-        if usage_before is not None:
-            after = self.model.usage.snapshot()
-            usage_delta = {key: after[key] - usage_before[key] for key in usage_before}
-            delta_calls = usage_delta["calls"]
-            if delta_calls > 0:
-                self.console.print(
-                    f"[dim]📊 本次调用 LLM {delta_calls} 次 · "
-                    f"tokens {usage_delta['total_tokens']}"
-                    f"（输入 {usage_delta['input_tokens']} / "
-                    f"输出 {usage_delta['output_tokens']}）· "
-                    f"总耗时 {elapsed:.1f}s[/dim]"
-                )
-
-        # 9. 写入长期记忆（附带执行元数据，Web 端历史会话可回看执行路线）
-        meta = build_turn_meta(
-            intention_data if isinstance(intention_data, dict) else {},
-            result_data,
-            usage=usage_delta,
-            elapsed=elapsed,
-        )
-        self.memory_manager.add_message(
-            "assistant",
-            json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
-        )
+            # 9. 写入长期记忆（附带执行元数据，Web 端历史会话可回看执行路线）
+            meta = build_turn_meta(
+                intention_data if isinstance(intention_data, dict) else {},
+                result_data,
+                usage=usage_delta,
+                elapsed=elapsed,
+            )
+            self.memory_manager.add_message(
+                "assistant",
+                json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
+            )
+        finally:
+            if self.circuit_breaker and not probe_recorded:
+                self.circuit_breaker.release_probe()
 
     def _display_agents_called(self, result_data: dict):
         """显示调用的智能体列表"""

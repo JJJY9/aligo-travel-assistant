@@ -34,6 +34,8 @@ WEATHER_CODE_MAP: dict[int, str] = {
     51: "小毛毛雨",
     53: "毛毛雨",
     55: "大毛毛雨",
+    56: "冻毛毛雨",
+    57: "强冻毛毛雨",
     61: "小雨",
     63: "中雨",
     65: "大雨",
@@ -223,6 +225,10 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
         stale = None if message.startswith("未找到城市") else _stale_hit(key)
         if stale is not None:
             logger.warning("天气接口失败（%s），沿用最近一次成功数据：%s", name, message)
+            # 把旧的降级结果回写为当前缓存：等待线程与后续请求直接复用这一份
+            # 结果（含 stale 标记），否则它们查不到任何共享状态、各自重打已
+            # 故障的上游，并发单飞失效（N 个请求 = N 次上游超时）
+            _store_cache(key, stale)
             return stale
         _store_failure(key, message)
         raise
