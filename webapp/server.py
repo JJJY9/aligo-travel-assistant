@@ -431,6 +431,39 @@ class SelectiveGZipMiddleware:
         await self.compressed_app(scope, receive, send)
 
 
+def _text_write_problem(value: object, depth: int = 0) -> str | None:
+    """实时写入路径的文本校验（与备份恢复 utils/user_import 同一口径）。
+
+    PostgreSQL 的 text 列拒绝 NUL（0x00），JSONB 里的 ``\\u0000`` 也会被拒，
+    孤立代理项在 UTF-8 写盘时编码失败——两后端行为分叉且都不可恢复，
+    在入口按 422 拒绝比写库后永久失败便宜。
+    """
+    if depth > 16:
+        return "嵌套过深"
+    if isinstance(value, str):
+        if "\x00" in value:
+            return "包含 NUL 字符"
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return "包含无法编码的字符（孤立代理项）"
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            problem = _text_write_problem(item, depth + 1)
+            if problem:
+                return problem
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            problem = _text_write_problem(str(key), depth + 1) or _text_write_problem(
+                item, depth + 1
+            )
+            if problem:
+                return problem
+    return None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     user_id: str = Field(default="web_user", pattern=_ID_PATTERN)
@@ -453,6 +486,9 @@ class ChatRequest(BaseModel):
         # min_length 在 strip 之前校验，"   " 会通过并浪费一次 LLM 调用
         if not value.strip():
             raise ValueError("消息不能为空")
+        problem = _text_write_problem(value)
+        if problem:
+            raise ValueError(f"消息{problem}")
         return value
 
 
@@ -530,6 +566,14 @@ class PreferencePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
     value: PreferenceValue
 
+    @field_validator("value")
+    @classmethod
+    def _value_text_is_writable(cls, value: object) -> object:
+        problem = _text_write_problem(value)
+        if problem:
+            raise ValueError(f"偏好值{problem}")
+        return value
+
 
 class LastTurnPayload(BaseModel):
     """删除最后一轮的请求体（POST 形式，长提问的 expect 不再受查询串上限）。"""
@@ -558,12 +602,19 @@ class TripPayload(BaseModel):
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("目的地不能为空")
+        problem = _text_write_problem(cleaned)
+        if problem:
+            raise ValueError(f"目的地{problem}")
         return cleaned
 
     @field_validator("origin", "purpose")
     @classmethod
     def _strip_text(cls, value: str) -> str:
-        return value.strip()
+        cleaned = value.strip()
+        problem = _text_write_problem(cleaned)
+        if problem:
+            raise ValueError(f"行程字段{problem}")
+        return cleaned
 
 
 class TripUpdatePayload(BaseModel):
@@ -584,17 +635,34 @@ class TripUpdatePayload(BaseModel):
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("目的地不能为空")
+        problem = _text_write_problem(cleaned)
+        if problem:
+            raise ValueError(f"目的地{problem}")
         return cleaned
 
     @field_validator("origin", "purpose")
     @classmethod
     def _strip_optional_text(cls, value: str | None) -> str | None:
-        return value.strip() if value is not None else None
+        if value is None:
+            return None
+        cleaned = value.strip()
+        problem = _text_write_problem(cleaned)
+        if problem:
+            raise ValueError(f"行程字段{problem}")
+        return cleaned
 
 
 class SessionTitlePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
     title: str = Field(max_length=60)
+
+    @field_validator("title")
+    @classmethod
+    def _title_text_is_writable(cls, value: str) -> str:
+        problem = _text_write_problem(value)
+        if problem:
+            raise ValueError(f"标题{problem}")
+        return value
 
 
 class SessionPinPayload(BaseModel):
@@ -2079,7 +2147,14 @@ def create_app(model: Any = None) -> FastAPI:
                     text = raw
                 else:
                     text = reprlib.repr(raw)
-                trimmed["input"] = text if len(text) <= 200 else text[:200] + "…"
+                text = text if len(text) <= 200 else text[:200] + "…"
+                try:
+                    text.encode("utf-8")
+                except UnicodeEncodeError:
+                    # 孤立代理项等无法编码的字符会让 422 响应自身序列化失败
+                    # （响应编码成 500）：转成等价的转义文本
+                    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+                trimmed["input"] = text
             return trimmed
 
         errors = [_trim_item(dict(item)) for item in exc.errors()]

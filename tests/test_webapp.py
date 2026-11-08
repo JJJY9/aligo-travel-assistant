@@ -7187,8 +7187,46 @@ def test_chat_maps_session_capacity_to_503(monkeypatch):
     print("✓ 会话容量拒绝映射 503（普通与流式）")
 
 
+def test_write_endpoints_reject_unwritable_text():
+    """实时写接口拒绝 NUL / 孤立代理项（PG text/JSONB 与 UTF-8 写盘都会失败）。"""
+    client = _client()
+    user = _unique_user("web_text_guard")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "a\u0000b", "user_id": user, "session_id": "s1"},
+        )
+        assert response.status_code == 422
+        response = client.put(
+            "/api/preferences/home_location",
+            json={"user_id": user, "value": "a\u0000b"},
+        )
+        assert response.status_code == 422
+        response = client.put(
+            "/api/trips/trip_1",
+            json={"user_id": user, "origin": "a\u0000b"},
+        )
+        assert response.status_code == 422
+        response = client.put(
+            "/api/sessions/s1/title",
+            json={"user_id": user, "title": "a\u0000b"},
+        )
+        assert response.status_code == 422
+        # 孤立代理项（JSON 里以 \ud800 转义提交）同样拒绝
+        response = client.post(
+            "/api/chat",
+            content=b'{"message": "a\\ud800b", "user_id": "u1", "session_id": "s1"}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422
+    finally:
+        _cleanup(user)
+    print("✓ 实时写接口拒绝 NUL / 孤立代理项")
+
+
 if __name__ == "__main__":
     test_index_page()
+    test_write_endpoints_reject_unwritable_text()
     test_web_session_persist_guard_tracks_deletions()
     test_route_path_normalization()
     test_knowledge_import_uses_dedicated_limiter(pytest.MonkeyPatch())

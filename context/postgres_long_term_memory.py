@@ -223,7 +223,18 @@ class PostgresLongTermMemory:
         重试后仍失败统一包装为 ``MemoryPersistenceError``：调用方按「存储
         暂时不可用」降级（Web 返回 503、对话运行时不计入 LLM 熔断器），
         而不是把裸 ``psycopg.OperationalError`` 当成未知 500 或 LLM 故障。
+        确定性数据错误（DataError：文本含 NUL、JSONB 拒绝的 \u0000 等）
+        重试不会成功，同样包装为持久化失败，而不是裸 500。
         """
+        import psycopg
+
+        def _wrap(exc: Exception) -> None:
+            if isinstance(exc, psycopg.Error):
+                raise MemoryPersistenceError(
+                    f"PostgreSQL 操作失败：{exc}"
+                ) from exc
+            raise exc
+
         try:
             return operation()
         except self._retry_errors as first_exc:
@@ -238,6 +249,11 @@ class PostgresLongTermMemory:
                 raise MemoryPersistenceError(
                     f"PostgreSQL 操作失败：{retry_exc}"
                 ) from retry_exc
+            except Exception as exc:  # noqa: BLE001 - 数据错误按持久化失败上报
+                _wrap(exc)
+        except Exception as exc:  # noqa: BLE001 - 数据错误按持久化失败上报
+            _wrap(exc)
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _json(value: Any) -> Any:
@@ -385,6 +401,13 @@ class PostgresLongTermMemory:
 
         def run() -> bool:
             with self._conn.transaction(), self._conn.cursor() as cursor:
+                # 与 delete_chat_session / delete_last_turn 的会话元数据锁同一个
+                # 键：「墓碑判定 + 插入」与并发删除串行化，避免守卫通过后删除
+                # 先提交、写入再把已删除会话的两条消息写回
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:session_meta:{self.user_id}",),
+                )
                 if should_commit is not None and not should_commit():
                     return False
                 cursor.executemany(
@@ -618,17 +641,21 @@ class PostgresLongTermMemory:
         """批量保存行程（备份恢复）：返回 ``(新增数, 更新数)``。
 
         PostgreSQL 单条保存已是一次小事务；批量入口复用单条实现以保持
-        去重 / 计数语义与 JSON 后端一致。
+        去重 / 计数语义与 JSON 后端一致。整批在同一把 advisory lock 内执行
+        并在锁内统计：批次前后总数差在锁外读取时会被并发写入（另一实例 /
+        不持用户锁的 POST /api/trips）穿插，created 可能超过批次条数、
+        updated 变成负数。
         """
-        created = 0
-        updated = 0
-        before_total = int(self.get_statistics().get("total_trips") or 0)
-        for row in trips:
-            self.save_trip_history(row)
-        after_total = int(self.get_statistics().get("total_trips") or 0)
-        created = max(0, after_total - before_total)
-        updated = len(trips) - created
-        return created, updated
+        count = len(trips)
+        if not count:
+            return 0, 0
+        with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+            before_total = int(self.get_statistics().get("total_trips") or 0)
+            for row in trips:
+                self.save_trip_history(row)
+            after_total = int(self.get_statistics().get("total_trips") or 0)
+        created = min(max(0, after_total - before_total), count)
+        return created, count - created
 
     def set_session_titles(self, titles: dict[str, str]) -> int:
         """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""

@@ -1001,6 +1001,15 @@ def test_parse_survives_extreme_timestamp():
     assert errors == [], errors
     assert len(sections["messages"]) == 1
     print("✓ 极端年份时间戳的备份可正常解析")
+def test_parse_rejects_non_finite_preference_values():
+    """偏好值里的 NaN / Infinity 在导入时拒绝（PG JSONB 确定性失败）。"""
+    text = '{"preferences": {"x": NaN, "y": [1.0, Infinity], "ok": 1}}'
+    sections, errors = parse_user_export(text)
+    prefs = sections.get("preferences", {})
+    assert "x" not in prefs and "y" not in prefs, prefs
+    assert prefs.get("ok") == 1, prefs
+    assert sum("非有限数" in error for error in errors) == 2, errors
+    print("✓ 非有限数偏好值被拒绝")
 
 
 if __name__ == "__main__":
@@ -1029,6 +1038,7 @@ if __name__ == "__main__":
     test_parse_rejects_deeply_nested_preference_value()
     test_parse_rejects_huge_integer_literal_content()
     test_parse_survives_extreme_timestamp()
+    test_parse_rejects_non_finite_preference_values()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,
