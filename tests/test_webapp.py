@@ -8535,7 +8535,11 @@ if __name__ == "__main__":
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
     test_tombstone_ttl_covers_inflight_turn_lease()
-    test_stream_and_chat_sanitize_model_surrogates()
+    _mp_surrogate = pytest.MonkeyPatch()
+    try:
+        test_stream_and_chat_sanitize_model_surrogates(_mp_surrogate)
+    finally:
+        _mp_surrogate.undo()
     test_stream_heartbeat()
     test_chat_failure_returns_500()
     test_chat_stream_failure_event()
