@@ -118,6 +118,32 @@ def test_knowledge_duplicates_panel_states():
     print("✓ 知识库重复检查面板状态")
 
 
+def test_knowledge_dedupe_panel_states():
+    """「清理重复」按钮：无重复 / 取消 / 执行（部分失败）/ 接口失败四种状态。"""
+    results = _run_harness("dedupe")
+    empty = results["empty"]
+    assert empty["text"] == "没有重复片段可清理"
+    assert empty["requests"] == 1, "无可清理项时只发 dry-run，不弹确认"
+    assert empty["confirm_calls"] == 0
+
+    cancel = results["cancel"]
+    assert cancel["text"] == "已取消清理"
+    assert cancel["confirm_calls"] == 1
+    assert cancel["requests"] == 2, "取消后不能再发删除请求"
+
+    applied = results["applied"]
+    assert applied["text"] == "已清理 1 条重复片段 · 1 条删除失败：#11"
+    assert applied["warn"] is True, "有失败条目必须标黄"
+    assert applied["requests"] == 4, "dry-run + 删除各一次"
+    assert applied["button"] == "清理重复"
+
+    error = results["error"]
+    assert error["text"] == "清理重复失败：boom"
+    assert error["button"] == "清理重复"
+    assert error["disabled"] is False, "失败后按钮必须恢复可点"
+    print("✓ 知识库重复清理面板状态")
+
+
 def test_knowledge_eval_panel_states():
     """「检索评测」按钮：达标 / 低基线+告警 / 失败三种状态与标黄逻辑。"""
     results = _run_harness("eval")
@@ -144,5 +170,6 @@ if __name__ == "__main__":
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()
     test_knowledge_duplicates_panel_states()
+    test_knowledge_dedupe_panel_states()
     test_knowledge_eval_panel_states()
     print("\n全部通过")

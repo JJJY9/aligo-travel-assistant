@@ -459,6 +459,71 @@ async function scenarioEval(source) {
   return results;
 }
 
+async function scenarioDedupe(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run("refreshKnowledgeDocuments = async () => {};");
+  run(
+    "__confirmResult = true; __confirmCalls = 0; confirm = () => { __confirmCalls += 1; return __confirmResult; };"
+  );
+  const results = {};
+
+  // 没有可清理的重复：不弹确认、不发删除请求
+  let promise = run("runKbDedupe()");
+  await tick();
+  env.__requests[0].resolve({ planned: 0, groups: 0, removed: 0, failed: [] });
+  await promise;
+  results.empty = {
+    text: run("els.kbEvalResult.textContent"),
+    requests: run("__requests.length"),
+    confirm_calls: run("__confirmCalls"),
+  };
+
+  // 取消确认：只发 dry-run，不执行删除
+  run("__confirmResult = false; __confirmCalls = 0;");
+  promise = run("runKbDedupe()");
+  await tick();
+  env.__requests[1].resolve({ planned: 2, groups: 1, removed: 0, failed: [] });
+  await promise;
+  results.cancel = {
+    text: run("els.kbEvalResult.textContent"),
+    requests: run("__requests.length"),
+    confirm_calls: run("__confirmCalls"),
+  };
+
+  // 确认执行：dry-run + 删除，部分失败标黄
+  run("__confirmResult = true; __confirmCalls = 0;");
+  promise = run("runKbDedupe()");
+  await tick();
+  env.__requests[2].resolve({ planned: 2, groups: 1, removed: 0, failed: [] });
+  await tick();
+  env.__requests[3].resolve({
+    planned: 2,
+    groups: 1,
+    removed: 1,
+    failed: [{ id: 11, error: "x" }],
+  });
+  await promise;
+  results.applied = {
+    text: run("els.kbEvalResult.textContent"),
+    warn: run("els.kbEvalResult.classList.contains('warn')"),
+    requests: run("__requests.length"),
+    button: run("els.kbDedupe.textContent"),
+  };
+
+  // 接口失败：提示并复位按钮
+  promise = run("runKbDedupe()");
+  await tick();
+  env.__requests[4].reject(new Error("boom"));
+  await promise;
+  results.error = {
+    text: run("els.kbEvalResult.textContent"),
+    button: run("els.kbDedupe.textContent"),
+    disabled: run("els.kbDedupe.disabled"),
+  };
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -477,6 +542,8 @@ async function main() {
     payload = await scenarioDuplicates(source);
   } else if (scenario === "eval") {
     payload = await scenarioEval(source);
+  } else if (scenario === "dedupe") {
+    payload = await scenarioDedupe(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
