@@ -412,8 +412,8 @@ def test_import_documents_sanitizes(monkeypatch):
     print("✓ 导入知识片段（空项 / 非字符串跳过，超长按无效项，长内容拆分）")
 
 
-def test_import_partial_dedupe_skips_doc_instead_of_orphan_group(monkeypatch):
-    """普通导入部分分片命中去重：不能把缺失分片写成没有 part 1 的残缺组。"""
+def test_import_cross_group_share_keeps_unique_pieces(monkeypatch):
+    """共享片段属于别的组时，独特分片以独立片段入库而不是整篇静默丢弃。"""
     from pathlib import Path
 
     shared = "一、共同条款：" + "甲" * 290
@@ -430,9 +430,43 @@ def test_import_partial_dedupe_skips_doc_instead_of_orphan_group(monkeypatch):
 
     result = knowledge_admin.import_documents([{"content": full, "metadata": {}}])
 
-    assert result["imported"] == 0, "缺失分片不能以新 group 单独入库"
-    assert agent.calls == [], "不应写入任何残缺组"
-    print("✓ 普通导入部分命中去重不再产生残缺组")
+    assert result["imported"] == 1, "独特分片不能静默丢失"
+    sent = [doc for batch in agent.calls for doc in batch]
+    assert len(sent) == 1, sent
+    assert "二、独有段落" in sent[0]["content"]
+    assert "group" not in sent[0]["metadata"], "独立片段不能带组标记"
+    assert "part" not in sent[0]["metadata"]
+    print("✓ 跨组共享片段时独特分片以独立片段入库")
+
+
+def test_import_batch_shared_paragraph_keeps_unique_pieces(monkeypatch):
+    """同一批两篇文档共享一段：第二篇的独特分片不能被假布局冲突丢弃。"""
+    from pathlib import Path
+
+    shared = "一、共同条款：" + "甲" * 290
+    doc1 = shared + "\n\n" + "二、第一篇：" + "乙" * 290
+    doc2 = shared + "\n\n" + "三、第二篇：" + "丙" * 290
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    # 空库：初始没有同组旧分片（第二篇命中的共享片段来自本批第一篇）
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
+    agent = _FakeAgent(
+        {"status": "success", "ids": list(range(3)), "total_count": 3}
+    )
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    result = knowledge_admin.import_documents(
+        [{"content": doc1, "metadata": {}}, {"content": doc2, "metadata": {}}]
+    )
+
+    assert result["imported"] == 3, result
+    assert result["skipped_duplicate"] == 1, result
+    sent = [doc for batch in agent.calls for doc in batch]
+    joined = "\n".join(doc["content"] for doc in sent)
+    assert "三、第二篇" in joined, "第二篇的独特分片必须入库"
+    standalone = next(doc for doc in sent if "三、第二篇" in doc["content"])
+    assert "group" not in standalone["metadata"], "共享片段的组无法成立：独特分片按独立片段入库"
+    print("✓ 同批共享段落时第二篇的独特分片入库")
 
 
 def test_import_completes_group_with_duplicate_pieces(monkeypatch):
@@ -2021,7 +2055,8 @@ if __name__ == "__main__":
         test_import_regroups_exported_chunks,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
-        test_import_partial_dedupe_skips_doc_instead_of_orphan_group,
+        test_import_cross_group_share_keeps_unique_pieces,
+        test_import_batch_shared_paragraph_keeps_unique_pieces,
         test_import_completes_group_with_duplicate_pieces,
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
