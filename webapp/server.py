@@ -3803,7 +3803,14 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
         format: Literal["json", "md"] = Query(default="json"),
+        with_knowledge: bool = Query(default=False),
     ) -> Response:
+        """导出用户数据（JSON 备份或 Markdown 摘要）。
+
+        ``with_knowledge=1``（仅 JSON）把全局知识库片段一并写入备份的
+        ``knowledge`` 字段（与 CLI ``user-export --with-knowledge`` 同一
+        字段），可由 ``/api/import`` 一体化恢复；``format=md`` 忽略该参数。
+        """
         rate_headers = _enforce_read_rate_limit(state, request)
         data = _load_user_data(user_id)
         safe_user = _safe_filename(user_id)
@@ -3817,15 +3824,25 @@ def create_app(model: Any = None) -> FastAPI:
                 },
             )
 
-        payload = json.dumps(
-            {
-                "user_id": user_id,
-                "exported_at": datetime.now().isoformat(),
-                **data,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        backup: dict[str, Any] = {
+            "user_id": user_id,
+            "exported_at": datetime.now().isoformat(),
+            **data,
+        }
+        if with_knowledge:
+            try:
+                backup["knowledge"] = export_documents()
+            except FileNotFoundError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"知识库导出失败：{exc}（先运行初始化脚本）",
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
+                logger.warning("导出知识片段失败: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail=f"知识库导出失败：{exc}"
+                ) from exc
+        payload = json.dumps(backup, ensure_ascii=False, indent=2)
         return Response(
             content=payload,
             media_type="application/json",

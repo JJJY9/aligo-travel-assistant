@@ -641,7 +641,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/sessions/export` | 导出全部会话为单个附件（按最近更新排序，含归档会话；默认 Markdown，`format=html` 导出与 CLI `sessions-export --html` 同口径的独立 HTML） |
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | DELETE | `/api/sessions/{id}/last-turn` | 删除最后一轮对话（用户提问 + 助手回答；`expect` 内容不一致时不删除，供编辑后重新发送） |
-| GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载） |
+| GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载）；`with_knowledge=1`（仅 JSON）把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段，可由 `/api/import` 一体化恢复） |
 | POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过，备份含 `knowledge` 段时一并恢复知识片段（失败时 `knowledge_error` 字段说明）；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
 | POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id`、`created` 与日期重叠的 `conflicts`） |
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；与其它行程完全重复时返回 409，返回日期重叠的 `conflicts`） |
