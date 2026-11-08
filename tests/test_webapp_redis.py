@@ -219,6 +219,7 @@ def test_webapp_with_redis_short_term(monkeypatch):
             applied_key(session_key(session_id, user_id)),
         )
         memory_file.unlink(missing_ok=True)
+        Path(f"{memory_file}.lock").unlink(missing_ok=True)
         storage.reset_failure_cache()
 
 

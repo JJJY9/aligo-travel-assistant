@@ -202,7 +202,8 @@ def test_webapp_uses_redis_rate_limit_across_instances(monkeypatch):
         _cleanup("ip", client)
         storage.reset_failure_cache()
         if memory_file.exists():
-            memory_file.unlink()
+            memory_file.unlink(missing_ok=True)
+            Path(f"{memory_file}.lock").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

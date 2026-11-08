@@ -57,6 +57,11 @@ def _cleanup(user_id: str) -> None:
     path = Path(MEMORY_DIR) / f"{user_id}.json"
     if path.exists():
         path.unlink()
+    # filelock 每次写入都会创建 <user>.json.lock：不清理的话几百个用例
+    # 会把 data/memory 堆成数万个零字节文件（长期运行后拖慢目录操作）
+    lock_path = Path(MEMORY_DIR) / f"{user_id}.json.lock"
+    if lock_path.exists():
+        lock_path.unlink()
 
 
 def _unique_user(prefix: str) -> str:
