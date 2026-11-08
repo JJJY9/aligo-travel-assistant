@@ -137,11 +137,25 @@ def test_json_parse_repair_attempts():
     assert robust_json_parse('{"a": "bad\x01char"}') == {"a": "badchar"}
     assert robust_json_parse("{'a': 'b'}") == {"a": "b"}
     assert robust_json_parse('{"a": 1, "b": [2,],}') == {"a": 1, "b": [2]}
+    # 尾逗号修复只处理字符串之外：字符串值里的 ",}"/",]" 必须原样保留，
+    # 否则引用 JSON / 代码片段的正文字段会被静默改写
+    assert robust_json_parse('{"a": "x,}", "b": [1,],}') == {
+        "a": "x,}",
+        "b": [1],
+    }
+    assert robust_json_parse('{"note": "use [1,]", "b": [1,],}') == {
+        "note": "use [1,]",
+        "b": [1],
+    }
+    assert robust_json_parse('{"code": "if (a, b) { return, }", "b": 1,}') == {
+        "code": "if (a, b) { return, }",
+        "b": 1,
+    }
     # 字符串里的裸换行属于控制字符：第 2 步清理会先把它删掉（保留拼接后的文本）
     assert robust_json_parse('{"a": "line1\nline2"}') == {"a": "line1line2"}
     # 组合问题：单引号 + 尾部逗号需要连续两步修复
     assert robust_json_parse("{'a': 1, 'b': 2,}") == {"a": 1, "b": 2}
-    print("✓ JSON 多级修复尝试")
+    print("✓ JSON 多级修复尝试（字符串内的 ,} / ,] 保持原样）")
 
 
 def test_json_parse_no_json_without_fallback():

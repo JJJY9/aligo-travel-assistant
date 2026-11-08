@@ -967,6 +967,42 @@ def test_runner_skips_reserved_and_deleted_sessions(monkeypatch):
     print("✓ user-import 跳过保留字 / 墓碑期会话")
 
 
+def test_parse_rejects_huge_integer_literal_content():
+    """含超 4300 位整数字面量的助手消息在导入时拒绝（否则汇总/查看永久 500）。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": '{"n": ' + "1" * 5000 + "}",
+                "timestamp": "2026-11-01T09:00:00",
+                "session_id": "s1",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert sections == {} or sections.get("messages") == [], sections
+    assert any("超长数字字面量" in error for error in errors), errors
+    print("✓ 超长整数字面量的助手消息被拒绝")
+
+
+def test_parse_survives_extreme_timestamp():
+    """极端年份时间戳（.NET DateTime.MinValue）不再让整份备份解析崩溃。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "hi",
+                "timestamp": "0001-01-01T00:00:00",
+                "session_id": "s1",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert errors == [], errors
+    assert len(sections["messages"]) == 1
+    print("✓ 极端年份时间戳的备份可正常解析")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -991,6 +1027,8 @@ if __name__ == "__main__":
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     test_parse_rejects_deeply_nested_preference_value()
+    test_parse_rejects_huge_integer_literal_content()
+    test_parse_survives_extreme_timestamp()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,

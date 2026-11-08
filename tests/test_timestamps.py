@@ -84,10 +84,20 @@ def test_naive_uses_dst_offset_of_that_moment():
     print("✓ naive 时间戳按当日 DST 偏移解释")
 
 
+def test_chronological_key_extreme_years_do_not_raise():
+    """极端年份换算 UTC 越界：返回空键（排在最前），不能抛 OverflowError。"""
+    assert chronological_key("0001-01-01T00:00:00+08:00") == ""
+    assert chronological_key("9999-12-31T23:59:59-05:00") == ""
+    # 正常日期不受影响（+08:00 换算到前一天 16:00Z）
+    assert chronological_key("2026-01-01T00:00:00+08:00").startswith("2025-12-31")
+    print("✓ 极端年份的排序键安全返回")
+
+
 if __name__ == "__main__":
     test_to_aware_parses_naive_and_aware()
     test_chronological_key_compares_by_instant()
     test_naive_and_aware_same_instant_share_key()
     test_z_suffix_accepted()
     test_naive_uses_dst_offset_of_that_moment()
+    test_chronological_key_extreme_years_do_not_raise()
     print("\n全部通过")

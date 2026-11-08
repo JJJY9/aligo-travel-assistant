@@ -14,6 +14,48 @@ def reject_json_constant(value: str):
     raise ValueError(f"非法 JSON 数值: {value}")
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """移除对象 / 数组的尾部逗号，只处理字符串之外的逗号。
+
+    逐字符扫描并跟踪字符串 / 转义状态：正则 ``,(\\s*[}\\]])`` 会把字符串值
+    里的 ",}"/",]"（例如引用 JSON 片段的行程序内容）一起删掉，静默篡改
+    解析结果；字符串内的字节原样保留。
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < length and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead < length and text[lookahead] in "}]":
+                # 丢弃尾逗号；其后的空白由后续循环原样输出
+                index += 1
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _top_level_object_starts(text: str):
     """产出文本中处于「顶层」的 ``{`` 位置（不在任何未闭合的 {}/[] 内）。
 
@@ -188,8 +230,8 @@ def robust_json_parse(text: str, fallback=None) -> dict:
 
     # 尝试4: 修复常见的尾部逗号问题
     try:
-        # 移除对象和数组中的尾部逗号
-        json_str_fixed = re.sub(r',(\s*[}\]])', r'\1', json_str)
+        # 移除对象和数组中的尾部逗号（字符串值内的 ",}"/",]" 原样保留）
+        json_str_fixed = _strip_trailing_commas(json_str)
         result = json.loads(
             json_str_fixed, parse_constant=reject_json_constant
         )

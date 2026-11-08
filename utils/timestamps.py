@@ -61,4 +61,9 @@ def chronological_key(value: Any) -> str:
     aware = to_aware(value)
     if aware is None:
         return ""
-    return aware.astimezone(timezone.utc).isoformat()
+    try:
+        return aware.astimezone(timezone.utc).isoformat()
+    except (OverflowError, ValueError, OSError):
+        # 极端年份（如 0001-01-01+08:00）换算 UTC 会越出 datetime 范围：
+        # 与解析失败同一口径排在最前，不能让排序键把整份导出 / 导入打崩
+        return ""
