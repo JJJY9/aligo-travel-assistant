@@ -3867,10 +3867,15 @@ function knowledgePreview(content, query) {
   if (!needle) {
     return sliceCodePoints(text, 140);
   }
-  const index = text.toLowerCase().indexOf(needle.toLowerCase());
-  if (index < 0) {
+  // 大小写不敏感匹配直接在原文上做：toLowerCase 可能改变字符串长度
+  // （İ → i̇ 变成两个码点），用 lower 串的下标切原文会让窗口整体错位，
+  // 预览里既看不到关键词也没有高亮（与服务端 _ci_find 同一口径）
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(escaped, "i").exec(text);
+  if (!match) {
     return sliceCodePoints(text, 140);
   }
+  const index = match.index;
   // UTF-16 下标换算成码点下标，避免窗口边界劈开 emoji 代理对
   const startIndex = Math.max(0, Array.from(text.slice(0, index)).length - 48);
   const end = Math.min(chars.length, startIndex + 140);
