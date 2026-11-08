@@ -158,6 +158,17 @@ def test_json_parse_repair_attempts():
     print("✓ JSON 多级修复尝试（字符串内的 ,} / ,] 保持原样）")
 
 
+def test_strip_trailing_commas_preserves_escaped_quoted_strings():
+    """剥离器跟踪转义状态：两个转义引号之间的 ,} 原样保留，字符串外尾逗号删除。"""
+    from utils.json_parser import _strip_trailing_commas
+
+    raw = '{"a": "say \\" ,} x \\" end", "b": [1,],}'
+    stripped = _strip_trailing_commas(raw)
+    assert stripped == '{"a": "say \\" ,} x \\" end", "b": [1]}'
+    assert robust_json_parse(raw) == {"a": 'say " ,} x " end', "b": [1]}
+    print("✓ 尾逗号剥离保留转义引号之间的 ,} 内容")
+
+
 def test_json_parse_no_json_without_fallback():
     """没有花括号且未提供 fallback 时抛「No JSON found」。"""
     try:
@@ -428,6 +439,7 @@ if __name__ == "__main__":
     test_json_parse_success_paths_unchanged()
     test_json_parse_empty_dict_and_prose_braces()
     test_json_parse_repair_attempts()
+    test_strip_trailing_commas_preserves_escaped_quoted_strings()
     test_json_parse_no_json_without_fallback()
     test_extract_response_text_shapes()
     test_extract_response_text_remaining_shapes()

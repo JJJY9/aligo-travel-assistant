@@ -814,6 +814,30 @@ def test_import_regroups_exported_chunks(monkeypatch):
     print("✓ 导入按 group 重新合并导出分片")
 
 
+def test_import_tolerates_non_finite_part_metadata(monkeypatch):
+    """metadata.part 为非有限数（Infinity）时该文档退化为单条，不拖垮整批导入。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    documents = [
+        {
+            "content": "坏分片",
+            "metadata": {"group": "g-inf-part", "part": float("inf"), "parts": "2"},
+        },
+        {"content": "正常文档", "metadata": {}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 2, result
+
+    merged, skipped = knowledge_admin._regroup_exported_documents(documents, set())
+    assert skipped == 0, skipped
+    assert len(merged) == 2, merged
+    assert any(doc.get("content") == "正常文档" for doc in merged), merged
+    print("✓ 非有限 part 元数据不再让整批导入抛错")
+
+
 def test_regroup_requires_multiset_coverage(monkeypatch):
     """组内两片同文、库里只有一份：不能算整组已存在（多重集语义）。"""
     from pathlib import Path
@@ -2053,6 +2077,7 @@ if __name__ == "__main__":
         test_update_grouped_update_failure_rolls_back_extras,
         test_chunk_documents_marks_even_with_full_metadata,
         test_import_regroups_exported_chunks,
+        test_import_tolerates_non_finite_part_metadata,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_cross_group_share_keeps_unique_pieces,
