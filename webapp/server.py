@@ -893,6 +893,9 @@ class AligoWebApp:
         self.import_executor = _DaemonImportExecutor(
             max_workers=1, thread_name_prefix="aligo-import"
         )
+        # 导入排队上限（1 执行 + 1 等待）：执行器队列无界，并发大备份
+        # （各可达 64MB）会在排队期间常驻内存直到 OOM，排队已满时按 503 背压
+        self.import_queue_slots = threading.BoundedSemaphore(2)
         # 知识库批量导入同样可能一次编码上万条分片并长时间持有写锁：放专用
         # 单 worker 执行器，避免 40 个并发导入占满 Starlette 共享线程池后把
         # /api/status、/api/sessions 等同步端点全部排队拖死
@@ -1039,6 +1042,20 @@ class AligoWebApp:
                     session.begin_turn()
                 self._evict_over_limit_locked(key, evicted)
         if session is None:
+            # 构造前预检：_WebSession 构造会打开一条 PostgreSQL 连接并跑建表
+            # DDL，全部槽位都在用时不该为注定 503 的请求白付这部分代价。
+            # 预检与插入之间仍有竞态，构造后的复检（下方 reject_capacity）
+            # 负责把并发下的上界收回到 max_sessions
+            with self._sessions_lock:
+                can_admit = len(self.sessions) < self.max_sessions or any(
+                    (not item.in_use())
+                    or item.long_in_use(self.session_turn_leak_sec)
+                    for item in self.sessions.values()
+                )
+            if not can_admit:
+                raise SessionCapacityError(
+                    f"并发会话过多（上限 {self.max_sessions}），请稍后再试"
+                )
             # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
             self._session_build_slots.acquire()
             reject_capacity = False
@@ -1654,6 +1671,31 @@ def _json_safe_value(value: Any) -> Any:
     return sanitize_json(value)
 
 
+def _trim_validation_item(item: dict[str, Any]) -> dict[str, Any]:
+    """422 错误条目：input 截断为 200 字符并转义无法编码的字符。
+
+    /api/import 的 64MB 上限下，完整回显 input 会把 422 响应放大到同尺寸
+    （内存 / 响应体积双放大）；孤立代理项会让响应自身编码失败（500）。
+    全局 RequestValidationError 处理器与 /api/import 的手工解析错误都走它。
+    """
+    trimmed = dict(item)
+    raw = trimmed.get("input")
+    if raw is not None:
+        # 先按原始值截断再看 repr：对大请求体（64MB 备份）做完整
+        # repr 会在事件循环上把整份 input 物化成字符串
+        if isinstance(raw, str):
+            text = raw
+        else:
+            text = reprlib.repr(raw)
+        text = text if len(text) <= 200 else text[:200] + "…"
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+        trimmed["input"] = text
+    return trimmed
+
+
 def _ambiguous_trip_id(trips: list[dict[str, Any]], trip_id: str) -> bool:
     """历史数据里同一 trip_id 可能对应多条不同行程，这类 id 不能按 id 操作。"""
     return sum(1 for trip in trips if str(trip.get("trip_id")) == trip_id) > 1
@@ -2136,28 +2178,9 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> JSONResponse:
         # 校验错误的 input 可能包含 NaN（JSON 解析允许），直接返回会序列化失败；
         # /api/import 的 64MB 上限下还会把整份备份回显进 422 响应（内存与
-        # 响应体积都被放大）——input 统一截断为 200 字符
-        def _trim_item(item: dict[str, Any]) -> dict[str, Any]:
-            trimmed = dict(item)
-            raw = trimmed.get("input")
-            if raw is not None:
-                # 先按原始值截断再看 repr：对大请求体（64MB 备份）做完整
-                # repr 会在事件循环上把整份 input 物化成字符串
-                if isinstance(raw, str):
-                    text = raw
-                else:
-                    text = reprlib.repr(raw)
-                text = text if len(text) <= 200 else text[:200] + "…"
-                try:
-                    text.encode("utf-8")
-                except UnicodeEncodeError:
-                    # 孤立代理项等无法编码的字符会让 422 响应自身序列化失败
-                    # （响应编码成 500）：转成等价的转义文本
-                    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
-                trimmed["input"] = text
-            return trimmed
-
-        errors = [_trim_item(dict(item)) for item in exc.errors()]
+        # 响应体积都被放大）——input 统一截断为 200 字符（见
+        # _trim_validation_item，/api/import 的手工解析错误共用同一实现）
+        errors = [_trim_validation_item(dict(item)) for item in exc.errors()]
         return JSONResponse(
             status_code=422,
             content={"detail": _json_safe_value(jsonable_encoder(errors))},
@@ -2825,9 +2848,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/sessions/{session_id}")
     def get_session_messages(
+        request: Request,
+        response: Response,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
+        response.headers.update(_enforce_read_rate_limit(state, request))
         store = _open_long_term(user_id)
         try:
             messages = store.get_chat_history(session_id=session_id)
@@ -2924,10 +2950,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/sessions/{session_id}/export")
     def export_session(
+        request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> Response:
         """把一个会话导出为 Markdown（便于保存或分享行程）。"""
+        rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
         try:
             messages = store.get_chat_history(session_id=session_id)
@@ -2973,7 +3001,10 @@ def create_app(model: Any = None) -> FastAPI:
         return Response(
             content="\n".join(lines),
             media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                **rate_headers,
+            },
         )
 
     @app.delete("/api/sessions/{session_id}")
@@ -3595,9 +3626,11 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/trips/calendar")
     def export_trips_calendar(
+        request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> Response:
         """导出全部历史行程为一个 iCalendar 文件。"""
+        rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
@@ -3609,11 +3642,15 @@ def create_app(model: Any = None) -> FastAPI:
         return Response(
             content=render_trips_ics(trips, user_id),
             media_type="text/calendar; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="aligo_trips.ics"'},
+            headers={
+                "Content-Disposition": 'attachment; filename="aligo_trips.ics"',
+                **rate_headers,
+            },
         )
 
     @app.get("/api/trips/export")
     def export_trips_file(
+        request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
         q: str = Query(default="", max_length=100),
         status: Literal["active", "upcoming", "past"] | None = Query(default=None),
@@ -3625,6 +3662,7 @@ def create_app(model: Any = None) -> FastAPI:
         CLI ``trips-export --status`` 保持一致）；``format=html`` 与 CLI
         ``trips-export --html`` 同一渲染口径（可打印 / 分享、内容转义）。
         """
+        rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
@@ -3639,21 +3677,27 @@ def create_app(model: Any = None) -> FastAPI:
                 content=render_trips_html(filtered, user_id),
                 media_type="text/html; charset=utf-8",
                 headers={
-                    "Content-Disposition": 'attachment; filename="aligo_trips.html"'
+                    "Content-Disposition": 'attachment; filename="aligo_trips.html"',
+                    **rate_headers,
                 },
             )
         return Response(
             content=render_trips_csv(filtered),
             media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="aligo_trips.csv"'},
+            headers={
+                "Content-Disposition": 'attachment; filename="aligo_trips.csv"',
+                **rate_headers,
+            },
         )
 
     @app.get("/api/trips/{trip_id}/calendar")
     def export_trip_calendar(
+        request: Request,
         trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> Response:
         """导出一条行程为 iCalendar（.ics）全天事件。"""
+        rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
         try:
             trips = store.get_trip_history(limit=None)
@@ -3682,7 +3726,8 @@ def create_app(model: Any = None) -> FastAPI:
             headers={
                 "Content-Disposition": (
                     f'attachment; filename="aligo_{_safe_filename(trip_id, "trip")}.ics"'
-                )
+                ),
+                **rate_headers,
             },
         )
 
@@ -3785,96 +3830,143 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(
             await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
         )
-        loop = asyncio.get_running_loop()
-        raw_body = await request.body()
-        try:
-            payload = await loop.run_in_executor(
-                state.import_executor, UserImportPayload.model_validate_json, raw_body
-            )
-        except ValidationError as exc:
+        # 排队背压：单 worker + 无界队列会让并发大备份（各 64MB）全部
+        # 驻留内存直到 OOM；已有一个导入在跑 / 排队时直接 503，不读请求体
+        if not state.import_queue_slots.acquire(blocking=False):
             raise HTTPException(
-                status_code=422, detail=jsonable_encoder(exc.errors())
-            ) from exc
-        try:
-            sections, errors = await loop.run_in_executor(
-                state.import_executor, parse_user_export_data, payload.backup
+                status_code=503,
+                detail=(
+                    "已有导入任务在处理，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
             )
-        except Exception as exc:  # noqa: BLE001 - 边界年份 / 畸形条目等解析异常
-            logger.warning("备份解析失败：%s", exc)
-            raise HTTPException(
-                status_code=400, detail=f"备份解析失败：{exc}"
-            ) from exc
-        if not sections:
-            detail = "；".join(errors[:3]) or "没有可恢复的数据"
-            raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
-
-        async with state.lock_for(user_id):
-            # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
-            # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
-            # 行程里引用的会话同样计入：只有行程、没有消息的保留字会话
-            # 也要清掉关联，否则面板里出现一条永远打不开的行程会话链接
-            unique_sessions = {
-                message["session_id"]
-                for message in sections["messages"]
-                if message["session_id"]
-            } | {
-                trip.get("session_id")
-                for trip in sections["trips"]
-                if trip.get("session_id")
-            }
-            if unique_sessions:
-                # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
-                # 意味着数十万次线程跳转与网络往返），且整批放在一次
-                # to_thread 里完成
-                deleted_sessions = await asyncio.to_thread(
-                    lambda: {
-                        session_id
-                        for session_id in unique_sessions
-                        if state.is_recently_deleted(user_id, session_id)
-                    }
-                )
-            else:
-                deleted_sessions = set()
-            # 保留字会话（如 export）在 Web 端永远打不开：备份恢复时与墓碑
-            # 同一处理，跳过其消息与元数据，避免导入一个无法查看的会话
-            reserved_sessions = {
-                session_id
-                for session_id in unique_sessions
-                if session_id in _RESERVED_SESSION_IDS
-            }
-            skipped_sessions = deleted_sessions | reserved_sessions
-            for session_id in sorted(deleted_sessions):
-                errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
-            for session_id in sorted(reserved_sessions):
-                errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
-            # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
-            # 共用同一实现，两条恢复路径不再有语义差）
-            drop_sessions(sections, skipped_sessions)
-
-            def _run_import() -> dict[str, Any]:
-                store = _open_long_term(user_id, strict=True)
-                try:
-                    if dry_run:
-                        return preview_user_import(store, sections)
-                    return import_user_data(store, sections)
-                finally:
-                    _close_long_term(store)
-
+        try:
+            loop = asyncio.get_running_loop()
+            raw_body = await request.body()
             try:
-                counts = await loop.run_in_executor(state.import_executor, _run_import)
-            except MemoryPersistenceError as exc:
-                logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+                payload = await loop.run_in_executor(
+                    state.import_executor, UserImportPayload.model_validate_json, raw_body
+                )
+            except ValidationError as exc:
+                # 与全局 RequestValidationError 处理器同一口径：input 截断为
+                # 200 字符并归一 NaN——手工解析路径直接回显整份 body 会把 64MB
+                # 备份放大进 422 响应（内存 / 响应体积双放大），NaN 还会让响应
+                # 序列化失败变 500
                 raise HTTPException(
-                    status_code=503, detail="存储暂时不可用，请稍后重试"
+                    status_code=422,
+                    detail=_json_safe_value(
+                        jsonable_encoder(
+                            [_trim_validation_item(dict(item)) for item in exc.errors()]
+                        )
+                    ),
                 ) from exc
-            except Exception as exc:  # noqa: BLE001 - 写入失败统一可重试提示
-                # 恢复可能部分成功（按条目写入）：详情只写日志，避免把
-                # 底层存储异常文本暴露给客户端；重复导入可补齐剩余部分
-                logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+            try:
+                sections, errors = await loop.run_in_executor(
+                    state.import_executor, parse_user_export_data, payload.backup
+                )
+            except Exception as exc:  # noqa: BLE001 - 边界年份 / 畸形条目等解析异常
+                logger.warning("备份解析失败：%s", exc)
                 raise HTTPException(
-                    status_code=503, detail="恢复失败，请稍后重试"
+                    status_code=400, detail=f"备份解析失败：{exc}"
                 ) from exc
-        return {"ok": True, "dry_run": dry_run, **counts, "skipped": errors}
+            if not sections:
+                detail = "；".join(errors[:3]) or "没有可恢复的数据"
+                raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
+
+            async with state.lock_for(user_id):
+                # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
+                # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
+                # 行程里引用的会话同样计入：只有行程、没有消息的保留字会话
+                # 也要清掉关联，否则面板里出现一条永远打不开的行程会话链接
+                unique_sessions = {
+                    message["session_id"]
+                    for message in sections["messages"]
+                    if message["session_id"]
+                } | {
+                    trip.get("session_id")
+                    for trip in sections["trips"]
+                    if trip.get("session_id")
+                }
+                if unique_sessions:
+                    # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
+                    # 意味着数十万次线程跳转与网络往返），且整批放在一次
+                    # to_thread 里完成
+                    deleted_sessions = await asyncio.to_thread(
+                        lambda: {
+                            session_id
+                            for session_id in unique_sessions
+                            if state.is_recently_deleted(user_id, session_id)
+                        }
+                    )
+                else:
+                    deleted_sessions = set()
+                # 保留字会话（如 export）在 Web 端永远打不开：备份恢复时与墓碑
+                # 同一处理，跳过其消息与元数据，避免导入一个无法查看的会话
+                reserved_sessions = {
+                    session_id
+                    for session_id in unique_sessions
+                    if session_id in _RESERVED_SESSION_IDS
+                }
+                skipped_sessions = deleted_sessions | reserved_sessions
+                for session_id in sorted(deleted_sessions):
+                    errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
+                for session_id in sorted(reserved_sessions):
+                    errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
+                # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
+                # 共用同一实现，两条恢复路径不再有语义差）
+                drop_sessions(sections, skipped_sessions)
+
+                def _run_import() -> dict[str, Any]:
+                    if not dry_run:
+                        # 排队期间（单 worker 可能等数分钟）会话可能被其它
+                        # 实例删除：快照与写库之间必须复查墓碑，避免把已删除
+                        # 会话写回
+                        recheck_sessions = {
+                            message["session_id"]
+                            for message in sections["messages"]
+                            if message["session_id"]
+                        } | {
+                            trip.get("session_id")
+                            for trip in sections["trips"]
+                            if trip.get("session_id")
+                        }
+                        late_deleted = {
+                            session_id
+                            for session_id in recheck_sessions
+                            if state.is_recently_deleted(user_id, session_id)
+                        }
+                        if late_deleted:
+                            for session_id in sorted(late_deleted):
+                                errors.append(
+                                    f"会话 {session_id} 在恢复排队期间被删除，"
+                                    "已跳过其消息"
+                                )
+                            drop_sessions(sections, late_deleted)
+                    store = _open_long_term(user_id, strict=True)
+                    try:
+                        if dry_run:
+                            return preview_user_import(store, sections)
+                        return import_user_data(store, sections)
+                    finally:
+                        _close_long_term(store)
+
+                try:
+                    counts = await loop.run_in_executor(state.import_executor, _run_import)
+                except MemoryPersistenceError as exc:
+                    logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+                    raise HTTPException(
+                        status_code=503, detail="存储暂时不可用，请稍后重试"
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001 - 写入失败统一可重试提示
+                    # 恢复可能部分成功（按条目写入）：详情只写日志，避免把
+                    # 底层存储异常文本暴露给客户端；重复导入可补齐剩余部分
+                    logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
+                    raise HTTPException(
+                        status_code=503, detail="恢复失败，请稍后重试"
+                    ) from exc
+            return {"ok": True, "dry_run": dry_run, **counts, "skipped": errors}
+        finally:
+            state.import_queue_slots.release()
 
     return app
 
