@@ -4111,8 +4111,8 @@ async function runKbDuplicates() {
           const ids = (Array.isArray(group.ids) ? group.ids : [])
             .map((docId) => `#${docId}`)
             .join("、");
-          const preview = sliceCodePoints(String(group.preview || ""), 24);
-          return `${ids}（${preview}）`;
+          const preview = sliceCodePoints(String(group.preview || "").trim(), 24);
+          return preview ? `${ids}（${preview}）` : ids;
         });
         const suffix =
           totalGroups > groups.length
