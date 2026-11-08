@@ -4923,34 +4923,41 @@ def test_leased_streaming_response_releases_even_if_body_never_starts():
 
 
 def test_session_lru_skips_in_use_sessions():
-    """LRU 淘汰不能关闭正在对话的会话，也不能淘汰本次要返回的会话。"""
+    """LRU 淘汰不能关闭正在对话的会话；全部在用时不新建（容量拒绝）。"""
+    from webapp.server import SessionCapacityError
+
     state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
-    state.max_sessions = 1
+    state.max_sessions = 2
     closed = []
 
     busy = state.get_session("u-lru", "busy", True)
     busy.close = lambda: closed.append(busy)  # 实例属性覆盖 close
 
     idle = state.get_session("u-lru", "idle")
-    assert len(state.sessions) == 2, "在用会话不能被淘汰（暂时超限）"
+    assert len(state.sessions) == 2
     assert idle not in closed and busy not in closed, "本次返回的会话也不能被淘汰"
 
-    busy.end_turn()
-    state.get_session("u-lru", "next")
-    assert closed == [busy], "请求结束后最久未用的会话可被淘汰"
-    assert len(state.sessions) == 1, "超出上限的其它空闲会话应继续回收"
+    # 空闲会话可被淘汰给新会话腾位
+    third = state.get_session("u-lru", "third", True)
+    assert state._session_key("u-lru", "idle") not in state.sessions, (
+        "最久未用的空闲会话应被淘汰"
+    )
+    assert len(state.sessions) == 2
+    assert busy not in closed, "在用会话不能被淘汰"
 
-    only = state.sessions[state._session_key("u-lru", "next")]
-    only.begin_turn()
-    state.get_session("u-lru", "third")
-    assert len(state.sessions) == 2, "全部在用时应暂时超限而不是关闭"
+    # 全部会话都在用：不再无限新建（每个会话常驻一条数据库连接），
+    # 本次请求收到可重试的容量错误
+    with pytest.raises(SessionCapacityError):
+        state.get_session("u-lru", "fourth", True)
+    assert len(state.sessions) == 2
 
     # 占用标记泄漏（如 SSE 响应未启动就断开）：超过上限时长后允许回收
-    only._turn_started_at -= state.session_turn_leak_sec + 1
-    state.get_session("u-lru", "fourth")
-    assert state._session_key("u-lru", "next") not in state.sessions
-    only.end_turn()
-    print("✓ 会话 LRU 跳过在用会话 / 本次返回的会话")
+    busy._turn_started_at -= state.session_turn_leak_sec + 1
+    state.get_session("u-lru", "fourth", True)
+    assert state._session_key("u-lru", "busy") not in state.sessions
+    assert busy in closed, "泄漏占用的会话被回收时同样要 close"
+    third.end_turn()
+    print("✓ 会话 LRU 跳过在用会话 / 全部在用容量拒绝 / 泄漏回收")
 
 
 def test_chat_releases_session_in_use_mark():
@@ -7115,6 +7122,57 @@ def test_web_session_persist_guard_tracks_deletions():
     print("✓ Web 会话落库守卫跟随墓碑状态")
 
 
+def test_session_capacity_rejects_when_all_in_use():
+    """全部会话都在用时不再新建会话（每个会话常驻一条数据库连接）。"""
+    from webapp.server import SessionCapacityError
+
+    client = _client()
+    state = client.app.state.aligo
+    state.max_sessions = 2
+    user = _unique_user("web_capacity")
+    first = state.get_session(user, "s1", True)
+    state.get_session(user, "s2", True)
+    try:
+        with pytest.raises(SessionCapacityError):
+            state.get_session(user, "s3", True)
+        # 有会话结束（空闲可淘汰）后可以继续新建
+        first.end_turn()
+        third = state.get_session(user, "s3", True)
+        assert third is not None and third.session_id == "s3"
+    finally:
+        state.close_all()
+        _cleanup(user)
+    print("✓ 会话容量上限：全部在用拒绝、有空闲即恢复")
+
+
+def test_chat_maps_session_capacity_to_503(monkeypatch):
+    """/api/chat 与 SSE 把会话容量拒绝映射为可重试的 503。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user = _unique_user("web_capacity_api")
+
+    def capacity(*args, **kwargs):
+        raise server_module.SessionCapacityError("并发会话过多（上限 2）")
+
+    monkeypatch.setattr(state, "get_session", capacity)
+    response = client.post(
+        "/api/chat",
+        json={"message": "你好", "user_id": user, "session_id": "s1"},
+    )
+    assert response.status_code == 503
+    assert "并发会话过多" in response.json()["detail"]
+    stream = client.post(
+        "/api/chat/stream",
+        json={"message": "你好", "user_id": user, "session_id": "s1"},
+    )
+    assert stream.status_code == 503
+    assert "并发会话过多" in stream.json()["detail"]
+    _cleanup(user)
+    print("✓ 会话容量拒绝映射 503（普通与流式）")
+
+
 if __name__ == "__main__":
     test_index_page()
     test_web_session_persist_guard_tracks_deletions()
@@ -7338,4 +7396,10 @@ if __name__ == "__main__":
         test_weather_city_rejects_control_characters(_mp_round22c)
     finally:
         _mp_round22c.undo()
+    test_session_capacity_rejects_when_all_in_use()
+    _mp_capacity = pytest.MonkeyPatch()
+    try:
+        test_chat_maps_session_capacity_to_503(_mp_capacity)
+    finally:
+        _mp_capacity.undo()
     print("\n全部通过")

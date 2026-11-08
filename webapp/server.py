@@ -613,6 +613,10 @@ class UserImportPayload(BaseModel):
     backup: dict[str, Any]
 
 
+class SessionCapacityError(RuntimeError):
+    """会话槽位全部在用、无法为新会话腾位（每个会话常驻一条数据库连接）。"""
+
+
 class _WebSession:
     """一个浏览器会话（对应一个 ConversationRuntime）。"""
 
@@ -969,6 +973,7 @@ class AligoWebApp:
         if session is None:
             # 每个会话独立的用量跟踪计数，避免并发会话之间的 token 增量互相污染
             self._session_build_slots.acquire()
+            reject_capacity = False
             try:
                 candidate = _WebSession(
                     user_id,
@@ -993,24 +998,45 @@ class AligoWebApp:
                         if mark_in_use:
                             session.begin_turn()
                     else:
-                        session = candidate
-                        self.sessions[key] = candidate
-                        # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
-                        # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
-                        # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
-                        # 等后续请求再回收
-                        self._evict_over_limit_locked(key, evicted)
-                        if mark_in_use:
-                            session.begin_turn()
+                        # 容量守卫：缓存上限只淘汰空闲会话；全部会话都在用的
+                        # 突发（同一 IP 突发 120 个并发对话即可）此前会无限
+                        # 新建会话——每个 _WebSession 常驻一条 PostgreSQL
+                        # 连接，超过数据库 max_connections 后新建失败会触发
+                        # 进程级 JSON 回退（读写分叉）。没有可淘汰的空闲会话
+                        # 时拒绝本次新建（可重试的 503），连接数量因此有界。
+                        evictable = any(
+                            (not item.in_use())
+                            or item.long_in_use(self.session_turn_leak_sec)
+                            for item in self.sessions.values()
+                        )
+                        if len(self.sessions) >= self.max_sessions and not evictable:
+                            reject_capacity = True
+                        else:
+                            session = candidate
+                            self.sessions[key] = candidate
+                            # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
+                            # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
+                            # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
+                            # 等后续请求再回收
+                            self._evict_over_limit_locked(key, evicted)
+                            if mark_in_use:
+                                session.begin_turn()
+                if reject_capacity:
+                    session = None
                 if session is not candidate:
                     # 竞争失败：自己新建的运行时从未暴露给调用方，关闭回收
                     # PostgreSQL 连接等资源
                     candidate.close()
             finally:
                 self._session_build_slots.release()
+            if reject_capacity:
+                raise SessionCapacityError(
+                    f"并发会话过多（上限 {self.max_sessions}），请稍后再试"
+                )
         # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求
         for stale in evicted:
             stale.close()
+        assert session is not None  # 容量拒绝已在上面抛出
         return session
 
     def drop_session(self, user_id: str, session_id: str) -> None:
@@ -3049,6 +3075,14 @@ def create_app(model: Any = None) -> FastAPI:
                         f"（请求 ID：{_request_id(request)}）"
                     ),
                 ) from exc
+            except SessionCapacityError as exc:
+                logger.warning(
+                    "会话容纳上限（%s）: %s", _request_id(request), exc
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"{exc}（请求 ID：{_request_id(request)}）",
+                ) from exc
             try:
                 result = await session.runtime.ask(
                     payload.message, turn_id=payload.client_turn_id or ""
@@ -3136,6 +3170,12 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503,
                     detail=f"存储暂时不可用，请稍后再试（请求 ID：{rid}）",
+                ) from exc
+            except SessionCapacityError as exc:
+                logger.warning("会话容纳上限（%s）: %s", rid, exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"{exc}（请求 ID：{rid}）",
                 ) from exc
             lease = _SessionTurnLease(lock, session)
         except BaseException:
