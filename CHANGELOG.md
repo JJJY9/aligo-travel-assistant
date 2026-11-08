@@ -17,6 +17,7 @@
 - 健康与指标暴露并发会话容量：`/api/health` 新增 `sessions.cached` / `sessions.max`，`/api/metrics` 新增 `sessions_max`，Prometheus 新增 `aligo_sessions_max`（配合并发会话上限的 503 拒绝，运维可观察当前占用）
 - Web 单会话导出 HTML：`GET /api/sessions/{id}/export?format=html` 与 CLI `session-export --html` 同一渲染口径（单文件内嵌样式、标题单次转义、可分享 / 打印），默认仍为 Markdown
 - Web 备份导出携带知识库：`GET /api/export?with_knowledge=1` 把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段、同一导入恢复路径），知识库未初始化 / 导出失败返回 503
+- 记忆面板新增「备份（含知识库）」按钮：一键下载用户数据 + 知识库片段的一体化 JSON（恢复仍走「恢复备份」同一入口）
 
 ### 变更
 - 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin
