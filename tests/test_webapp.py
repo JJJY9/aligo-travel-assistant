@@ -1555,6 +1555,26 @@ def test_trips_import_rate_limited(monkeypatch):
     print("✓ /api/trips/import 导入限流 429")
 
 
+def test_trips_import_maps_strict_store_failure(monkeypatch):
+    """配置存储不可用（strict）时导入返回 503 存储暂时不可用，而不是被包装。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    def boom(*args, **kwargs):
+        raise MemoryPersistenceError("postgres down")
+
+    monkeypatch.setattr(server_module, "create_long_term_memory", boom)
+    client = _client()
+    user = _unique_user("web_trip_strict")
+    response = client.post(
+        f"/api/trips/import?user_id={user}", json={"content": "x"}
+    )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail == "存储暂时不可用，请稍后再试", detail
+    print("✓ /api/trips/import 存储 strict 失败映射 503")
+
+
 def test_trip_update_validation_and_errors(monkeypatch):
     """行程更新的校验与错误映射：400 / 422（多种）/ 404 / 409（冲突与歧义）/ 503。"""
     from webapp import server as server_module
