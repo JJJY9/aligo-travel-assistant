@@ -324,25 +324,37 @@ def test_pg_delete_all_resets_trip_counters():
 
 
 def test_pg_save_trip_histories_counts_mixed_batch():
-    """PG 批量保存：同批「已存在 + 新建」的 created/updated 计数正确。"""
+    """PG 批量保存：created/updated 计数正确，批内去重且缺省目的保留原值。"""
     memory, _ = _pg_memory_or_skip()
     try:
         base = {
             "origin": "北京",
             "destination": "上海",
             "start_date": "2026-12-01",
-            "purpose": "出差",
+            "purpose": "客户会议",
         }
         memory.save_trip_history(dict(base))
+        without_purpose = {key: value for key, value in base.items() if key != "purpose"}
+        new_trip = {
+            **base,
+            "destination": "杭州",
+            "start_date": "2026-12-02",
+            "purpose": "会议",
+        }
+        new_without_purpose = {
+            key: value for key, value in new_trip.items() if key != "purpose"
+        }
         created, updated = memory.save_trip_histories(
-            [
-                dict(base),
-                {**base, "destination": "杭州", "start_date": "2026-12-02"},
-            ]
+            [without_purpose, new_trip, new_without_purpose]
         )
-        assert (created, updated) == (1, 1), (created, updated)
+        assert (created, updated) == (1, 2), (created, updated)
+        trips = {
+            trip["destination"]: trip for trip in memory.get_trip_history(limit=None)
+        }
+        assert trips["上海"]["purpose"] == "客户会议", "缺省目的不能覆盖已有目的"
+        assert trips["杭州"]["purpose"] == "会议", "批内重复命中刚插入的行并保留目的"
         assert memory.get_statistics()["total_trips"] == 2
-        print("✓ PG 批量保存 created/updated 计数")
+        print("✓ PG 批量保存 created/updated 计数与批内去重")
     finally:
         memory.close()
 

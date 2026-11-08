@@ -1773,69 +1773,99 @@ def test_pg_add_chat_turn_locks_before_guard():
     print("✓ PG add_chat_turn 先锁会话元数据、再守卫、再写入")
 
 
-def test_pg_save_trip_histories_locked_and_clamped():
-    """批量保存：统计与写入都在用户锁内，计数钳制在 0..批次条数。"""
+def test_pg_save_trip_histories_batches_with_one_index():
+    """PG 批量保存：一次读历史建索引，锁内逐条更新/插入，编号水位一次写。"""
     import contextlib as contextlib_module
 
     from context.postgres_long_term_memory import PostgresLongTermMemory
 
-    def build_store(totals):
-        store = object.__new__(PostgresLongTermMemory)
-        store.user_id = "u-trip-lock"
-        state = {"locked": False, "events": []}
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-pg-bulk"
+    state = {"locked": False, "events": []}
 
-        @contextlib_module.contextmanager
-        def fake_lock(name):
-            assert state["locked"] is False, "同一用户锁不应嵌套获取"
-            state["locked"] = True
-            state["events"].append(("lock", name))
-            try:
-                yield
-            finally:
-                state["locked"] = False
-                state["events"].append(("unlock", name))
+    @contextlib_module.contextmanager
+    def fake_lock(name):
+        assert state["locked"] is False, "同一用户锁不应嵌套获取"
+        state["locked"] = True
+        state["events"].append(("lock", name))
+        try:
+            yield
+        finally:
+            state["locked"] = False
+            state["events"].append(("unlock", name))
 
-        store._advisory_lock = fake_lock
-        pending = iter(totals)
+    store._advisory_lock = fake_lock
+    history = [
+        (1, "trip_1", "北京", "上海", "2026-12-01", "2026-12-03"),
+        (2, "trip_2", "北京", "广州", "2026-12-10", "2026-12-11"),
+    ]
+    executed = []
+    inserted_params = []
+    next_id = [10]
 
-        def get_statistics():
-            assert state["locked"] is True, "统计读取必须在锁内"
-            state["events"].append(("stats",))
-            return {"total_trips": next(pending)}
+    def fetchall(sql, params=None):
+        assert state["locked"] is True, "读历史必须在锁内"
+        assert "FROM aligo_trips WHERE user_id" in sql
+        return list(history)
 
-        def save_trip_history(row):
-            assert state["locked"] is True, "行程写入必须在锁内"
-            state["events"].append(("save", row["destination"]))
+    def fetchone(sql, params=None):
+        assert state["locked"] is True
+        if sql.startswith("SELECT last_number"):
+            return (2,)
+        if sql.startswith("INSERT INTO aligo_trips"):
+            inserted_params.append(params)
+            next_id[0] += 1
+            return (next_id[0],)
+        raise AssertionError(sql)
 
-        store.get_statistics = get_statistics
-        store.save_trip_history = save_trip_history
-        return store, state
+    def execute(sql, params=None):
+        assert state["locked"] is True, "写入必须在锁内"
+        executed.append((" ".join(sql.split()), params))
+
+    store._fetchall = fetchall
+    store._fetchone = fetchone
+    store._execute = execute
 
     trips = [
-        {"destination": "北京"},
-        {"destination": "上海"},
-        {"destination": "广州"},
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-21",
+            "purpose": "会议",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-21",
+        },
     ]
-    lock_name = "aligo-trip-u-trip-lock"
-    store, state = build_store([0, 2])
-    assert store.save_trip_histories(trips) == (2, 1)
-    assert state["events"] == [
-        ("lock", lock_name),
-        ("stats",),
-        ("save", "北京"),
-        ("save", "上海"),
-        ("save", "广州"),
-        ("stats",),
-        ("unlock", lock_name),
-    ], "统计与整批写入必须在同一把用户锁内、按顺序执行"
-
-    # 锁外并发写入让总数差超过批次条数：created 钳制到批次条数
-    store, _ = build_store([0, 10])
-    assert store.save_trip_histories(trips) == (3, 0)
-    # 锁外并发删除让总数下降：updated 不超过批次条数
-    store, _ = build_store([5, 1])
-    assert store.save_trip_histories(trips) == (0, 3)
-    print("✓ PG save_trip_histories 锁内统计并钳制 created/updated")
+    assert store.save_trip_histories(trips) == (1, 2)
+    updates = [
+        params for sql, params in executed if sql.startswith("UPDATE aligo_trips")
+    ]
+    assert updates[0] == (None, None, 1), "缺省目的 / 会话保留原值"
+    assert updates[1] == (None, None, 11), "批内重复命中刚插入的行"
+    inserts = inserted_params
+    assert len(inserts) == 1
+    assert inserts[0][1] == "trip_3"
+    assert inserts[0][2] == "北京" and inserts[0][4] == "2026-12-20"
+    assert inserts[0][6] == "会议"
+    counters = [
+        params
+        for sql, params in executed
+        if sql.startswith("INSERT INTO aligo_trip_counters")
+    ]
+    assert counters == [("u-pg-bulk", 3)], "编号水位一次写入"
+    assert state["events"][0][0] == "lock" and state["events"][-1][0] == "unlock"
+    print("✓ PG 批量保存一次索引 / 批内去重 / 编号水位")
 
 
 def test_json_add_chat_turn_guard_runs_under_write_lock():
@@ -2120,7 +2150,7 @@ if __name__ == "__main__":
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
     test_pg_retry_does_not_replay_non_idempotent_write()
     test_pg_add_chat_turn_locks_before_guard()
-    test_pg_save_trip_histories_locked_and_clamped()
+    test_pg_save_trip_histories_batches_with_one_index()
     test_json_add_chat_turn_guard_runs_under_write_lock()
     test_json_add_chat_turn_guard_sees_concurrent_delete()
     test_json_get_chat_history_excludes_session_before_limit()
