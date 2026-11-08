@@ -18,7 +18,9 @@ def render_stored_message(message: dict[str, Any]) -> str:
         return content
     try:
         data = json.loads(content)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
+        # 深度嵌套的历史内容（旧数据）让 json.loads 抛 RecursionError：
+        # 只捕获解析错误会让会话查看 / 搜索 / 导出永久 500
         return content
     status = data.get("status") if isinstance(data, dict) else None
     if isinstance(data, dict) and (

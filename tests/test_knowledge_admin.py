@@ -412,6 +412,29 @@ def test_import_documents_sanitizes(monkeypatch):
     print("✓ 导入知识片段（空项 / 非字符串跳过，超长按无效项，长内容拆分）")
 
 
+def test_import_partial_dedupe_skips_doc_instead_of_orphan_group(monkeypatch):
+    """普通导入部分分片命中去重：不能把缺失分片写成没有 part 1 的残缺组。"""
+    from pathlib import Path
+
+    shared = "一、共同条款：" + "甲" * 290
+    unique = "二、独有段落：" + "乙" * 290
+    full = shared + "\n\n" + unique
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {shared})
+    # 库内已有同内容 part1，属于另一篇文档（组 GA，parts=2）
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_group_layout", lambda: {shared: ("GA", 1, 2)}
+    )
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    result = knowledge_admin.import_documents([{"content": full, "metadata": {}}])
+
+    assert result["imported"] == 0, "缺失分片不能以新 group 单独入库"
+    assert agent.calls == [], "不应写入任何残缺组"
+    print("✓ 普通导入部分命中去重不再产生残缺组")
+
+
 def test_add_document_splits_long_content(monkeypatch):
     """长内容按语义边界拆成 ≤400 字片段，返回分片数。"""
     from pathlib import Path
@@ -1886,6 +1909,7 @@ if __name__ == "__main__":
         test_import_regroups_exported_chunks,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
+        test_import_partial_dedupe_skips_doc_instead_of_orphan_group,
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_skips_document,

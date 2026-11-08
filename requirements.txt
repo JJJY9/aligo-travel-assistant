@@ -19,6 +19,9 @@ sentence-transformers==5.2.3
 # CLI 界面
 rich==13.9.4
 
+# 时区数据库：Windows 没有系统 tzdata，ICS 导入的 TZID（zoneinfo）需要它
+tzdata==2026.5
+
 # 网络搜索（DDGS）
 ddgs==9.10.0
 

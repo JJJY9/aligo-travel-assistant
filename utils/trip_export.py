@@ -20,10 +20,15 @@ _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _needs_quote_guard(text: str) -> bool:
-    """以公式字符开头，或去掉一个前导引号后仍需防护（保证导入端可逆）。"""
-    if text.startswith(_FORMULA_PREFIXES):
-        return True
-    return text.startswith("'") and _needs_quote_guard(text[1:])
+    """以公式字符开头，或去掉任意个前导引号后仍需防护（保证导入端可逆）。
+
+    逐字符递归在字段包含上千个前导单引号时会触发 RecursionError（导入 /
+    导出都会崩溃），这里改为迭代剥离。
+    """
+    index = 0
+    while index < len(text) and text[index] == "'":
+        index += 1
+    return text[index:].startswith(_FORMULA_PREFIXES)
 
 
 def _csv_safe(value: object) -> str:

@@ -87,7 +87,9 @@ def extract_turn_meta(message_content: str) -> dict[str, Any] | None:
     """从已存储的助手消息中取出执行元数据（无则返回 None）。"""
     try:
         data = json.loads(message_content)
-    except (TypeError, json.JSONDecodeError):
+    except (TypeError, json.JSONDecodeError, RecursionError):
+        # 深度嵌套的历史内容（旧数据）会抛 RecursionError：只捕获解析错误
+        # 会让 /api/status 等汇总路径永久 500
         return None
     if not isinstance(data, dict):
         return None
