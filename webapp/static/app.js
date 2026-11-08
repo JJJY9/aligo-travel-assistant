@@ -193,6 +193,7 @@ const els = {
   kbExport: byId("kbExport"),
   exportData: byId("exportData"),
   exportDataMd: byId("exportDataMd"),
+  exportDataKnowledge: byId("exportDataKnowledge"),
   exportSessions: byId("exportSessions"),
   exportSessionsHtml: byId("exportSessionsHtml"),
   importData: byId("importData"),
@@ -4862,6 +4863,14 @@ function bindEvents() {
     downloadFromApi(
       `/api/export?user_id=${encodeURIComponent(state.userId)}&format=md`,
       `aligo_${exportSafeName(state.userId)}.md`,
+    );
+  });
+  els.exportDataKnowledge.addEventListener("click", () => {
+    // 一体化备份：用户数据 + 全局知识库片段（与 CLI user-export
+    // --with-knowledge 同一 JSON 形状，恢复走同一个「恢复备份」按钮）
+    downloadFromApi(
+      `/api/export?user_id=${encodeURIComponent(state.userId)}&with_knowledge=1`,
+      `aligo_${exportSafeName(state.userId)}_with_knowledge.json`,
     );
   });
   els.exportSessions.addEventListener("click", () => {
