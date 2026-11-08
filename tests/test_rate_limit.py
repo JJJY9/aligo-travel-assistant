@@ -57,6 +57,19 @@ def test_key_eviction_bounds_memory():
     print("✓ key 数量有上限且过期 key 会被清理")
 
 
+def test_capacity_is_fail_closed_without_resetting_victims():
+    """容量满时拒绝新 key，不能淘汰活跃桶把受害者的限流计数清零。"""
+    limiter = RateLimiter(limit=1, window_sec=60, max_keys=2)
+    assert limiter.check("victim-a") is None
+    assert limiter.check("victim-a") is not None, "a 已被限流"
+    assert limiter.check("victim-b") is None
+    assert limiter.check("attacker-new") is not None, "满员时新 key 直接拒绝"
+    assert len(limiter) == 2
+    # 受害者的限流状态必须保留（旧实现淘汰最旧事件会把 a 的计数清零）
+    assert limiter.check("victim-a") is not None
+    print("✓ 容量满时 fail-closed，不重置受害桶")
+
+
 def test_status_reports_remaining():
     limiter = RateLimiter(limit=2, window_sec=60)
     assert limiter.status("k") == (2, 0.0)
@@ -390,6 +403,7 @@ if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
     test_key_eviction_bounds_memory()
+    test_capacity_is_fail_closed_without_resetting_victims()
     test_status_reports_remaining()
     test_peek_does_not_record()
     test_thread_safe_checks()
