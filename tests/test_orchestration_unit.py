@@ -853,6 +853,135 @@ def test_wrapped_preferences_dict_unpacked_on_save_and_context():
     print("✓ 包裹形态偏好被解包（落库与上下文）")
 
 
+def test_data_data_nested_preferences_unpacked():
+    """{"data": {"data": {"preferences": ...}}} 再包一层时偏好照常落库与进上下文。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    double_wrapped = {
+        "data": {"preferences": [{"type": "airlines", "value": "东航"}]}
+    }
+    result = {
+        "agent_name": "preference",
+        "priority": 1,
+        "result": {"status": "success", "data": double_wrapped},
+    }
+    orchestrator._update_memory({}, [result])
+    prefs = memory.long_term.get_preference()
+    assert prefs == {"airlines": "东航"}, prefs
+    assert "data" not in prefs and "preferences" not in prefs
+
+    ctx = orchestrator._context_with_previous_preferences({}, [result])
+    assert ctx["user_preferences"] == {"airlines": "东航"}, ctx
+
+    # 旧版 {type: value} 字典嵌套在 data.data 里同样解包
+    legacy_memory = _StubMemory()
+    legacy_orchestrator = OrchestrationAgent(
+        agent_registry={}, memory_manager=legacy_memory
+    )
+    legacy_orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {"data": {"preferences": {"home_location": "上海"}}},
+                },
+            }
+        ],
+    )
+    assert legacy_memory.long_term.get_preference() == {"home_location": "上海"}
+    print("✓ data.data 嵌套偏好被解包（落库与上下文）")
+
+
+def test_unmanageable_preference_types_skipped_everywhere():
+    """含 "/" / 65 字符 / 非字符串的偏好键在落库与上下文合并处统一丢弃。"""
+    from utils.preference_values import is_manageable_pref_type
+
+    assert is_manageable_pref_type("k" * 64) is True
+    assert is_manageable_pref_type("k" * 65) is False
+    assert is_manageable_pref_type("a/b") is False
+    assert is_manageable_pref_type(123) is False
+    assert is_manageable_pref_type("") is False
+
+    entries = [
+        {"type": "a/b", "value": "x"},
+        {"type": "k" * 65, "value": "y"},
+        {"type": "k" * 64, "value": "z"},
+        {"type": "hotel_brands", "value": "汉庭"},
+    ]
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    list_result = {
+        "agent_name": "preference",
+        "priority": 1,
+        "result": {"status": "success", "data": {"preferences": entries}},
+    }
+    orchestrator._update_memory({}, [list_result])
+    assert memory.long_term.get_preference() == {
+        "k" * 64: "z",
+        "hotel_brands": "汉庭",
+    }
+
+    # 旧版字典分支同样过滤
+    legacy_memory = _StubMemory()
+    legacy_orchestrator = OrchestrationAgent(
+        agent_registry={}, memory_manager=legacy_memory
+    )
+    dict_result = {
+        "agent_name": "preference",
+        "priority": 1,
+        "result": {
+            "status": "success",
+            "data": {
+                "preferences": {
+                    "a/b": "x",
+                    "k" * 65: "y",
+                    "k" * 64: "z",
+                    "hotel_brands": "汉庭",
+                }
+            },
+        },
+    }
+    legacy_orchestrator._update_memory({}, [dict_result])
+    assert legacy_memory.long_term.get_preference() == {
+        "k" * 64: "z",
+        "hotel_brands": "汉庭",
+    }
+
+    # 后续批次上下文：列表与字典形态都不携带非法键
+    ctx = orchestrator._context_with_previous_preferences({}, [list_result])
+    assert ctx["user_preferences"] == {"k" * 64: "z", "hotel_brands": "汉庭"}
+    ctx_dict = legacy_orchestrator._context_with_previous_preferences({}, [dict_result])
+    assert ctx_dict["user_preferences"] == {
+        "k" * 64: "z",
+        "hotel_brands": "汉庭",
+    }
+    print("✓ 非法偏好键在落库 / 上下文 / 边界判定处同口径过滤")
+
+
+def test_agent_load_runs_in_dedicated_executor():
+    """子智能体懒加载在 aligo-agent-load 专用线程执行，不占默认 asyncio 线程池。"""
+    import threading
+
+    records: list[str] = []
+
+    class RecordingRegistry(dict):
+        def __getitem__(self, key):
+            records.append(threading.current_thread().name)
+            return super().__getitem__(key)
+
+    orchestrator = OrchestrationAgent(
+        agent_registry=RecordingRegistry({"a": _StubAgent("a", {"reply": "ok"})})
+    )
+    asyncio.run(orchestrator.reply(_intent([{"agent_name": "a", "priority": 1}])))
+    assert records, "懒加载必须经过注册表 __getitem__"
+    assert records[0].startswith("aligo-agent-load"), records
+    assert records[0] != threading.main_thread().name
+    print("✓ 子智能体懒加载在专用执行器线程执行")
+
+
 def test_preference_render_skips_unmanageable_keys():
     """回显与落库同口径：含 "/" 的键不出现「已更新偏好」。"""
     from utils.result_formatter import result_to_markdown
@@ -1458,6 +1587,9 @@ if __name__ == "__main__":
     test_context_merge_skips_non_string_pref_type()
     test_trip_without_start_date_not_saved()
     test_trip_destination_dict_uses_scalar_field()
+    test_data_data_nested_preferences_unpacked()
+    test_unmanageable_preference_types_skipped_everywhere()
+    test_agent_load_runs_in_dedicated_executor()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)

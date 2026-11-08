@@ -102,6 +102,9 @@ class _BlockingMemory:
         self.started = threading.Event()
         self.release = threading.Event()
         self.messages = []
+        self.staged = []
+        self.rolled_back = []
+        self.rollback_seen = threading.Event()
         self.threads = {}
 
     def reload_long_term(self):
@@ -117,7 +120,17 @@ class _BlockingMemory:
         return ""
 
     def stage_message(self, role, content, metadata=None):
-        self.messages.append((role, content))
+        self.staged.append((role, content))
+
+    def rollback_staged_message(self, content):
+        self.rolled_back.append(content)
+        self.rollback_seen.set()
+        for index in range(len(self.staged) - 1, -1, -1):
+            role, staged_content = self.staged[index]
+            if role == "user" and staged_content == content:
+                del self.staged[index]
+                return True
+        return False
 
     def persist_turn(self, user_content, assistant_content, should_commit=None):
         self.threads["persist"] = threading.get_ident()
@@ -193,6 +206,34 @@ def test_cancel_during_persist_drains_with_both_messages():
     print("✓ 取消落在落库阶段：drain 等待整轮写完")
 
 
+def test_cancel_during_persist_does_not_rollback_staged():
+    """取消落在在途落库时：不回滚暂存提问，写线程继续提交整轮问答。"""
+    memory = _BlockingMemory()
+    runtime = _make_runtime(memory)
+
+    async def scenario():
+        task = asyncio.create_task(runtime.ask("你好"))
+        await asyncio.to_thread(memory.started.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # 落库线程仍在途（done callback 还没清空引用）：回滚必须被跳过，
+        # 否则写线程提交的整轮会与回滚线程互相竞态
+        assert runtime._pending_persist is not None
+        assert memory.rollback_seen.wait(0.2) is False, "在途落库期间不得触发回滚"
+        assert memory.rolled_back == []
+        assert ("user", "你好") in memory.staged, "暂存提问必须保留给写线程提交"
+        memory.release.set()
+        assert await runtime.drain_pending_persist(timeout_sec=10) is True
+        assert memory.rolled_back == []
+
+    asyncio.run(scenario())
+    assert [role for role, _ in memory.messages[-2:]] == ["user", "assistant"], (
+        "整轮问答必须由写线程完整提交"
+    )
+    print("✓ 取消落在在途落库时回滚被跳过")
+
+
 def test_json_add_chat_turn_guard_vetoes_write():
     """落库守卫返回 False（会话刚被删除）：整轮不写入。"""
     memory = LongTermMemory("u-guard", tempfile.mkdtemp(prefix="chailv_turn_"))
@@ -232,6 +273,7 @@ if __name__ == "__main__":
         test_memory_manager_persist_turn_delegates_and_stages_assistant()
         test_persist_turn_veto_skips_assistant_stage()
         test_cancel_during_persist_drains_with_both_messages()
+        test_cancel_during_persist_does_not_rollback_staged()
         test_drain_without_pending_returns_immediately()
     finally:
         _mp.undo()
