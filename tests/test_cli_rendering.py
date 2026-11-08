@@ -220,28 +220,28 @@ def test_print_stdout_swallows_pipe_errors_only(monkeypatch):
     print("✓ --stdout 仅吞管道类 OSError")
 
 
-def test_repl_cancelled_error_returns_to_prompt(monkeypatch):
-    """以 CancelledError 到达的 Ctrl-C 不取消下一条命令，提示后继续/退出。"""
+def test_repl_foreign_cancelled_error_propagates(monkeypatch):
+    """非 SIGINT 发起的 CancelledError（如关闭阶段）不能被 REPL 吞掉。
+
+    用户 Ctrl-C 的「回到提示符」路径由 run() 自装的 SIGINT 处理器标记
+    （见 test_cli_interactive 的 Ctrl-C 用例）；从 Prompt 逃逸出的外来
+    取消必须向上抛——否则 asyncio.run 关闭阶段的 gather 永远等不到主
+    任务，进程会卡在提示符上无法退出。
+    """
     instance = _new_cli()
-    calls = {"n": 0}
 
     async def fake_initialize(self):
         return None
 
     def fake_prompt(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise asyncio.CancelledError()
-        raise EOFError
+        raise asyncio.CancelledError()
 
     monkeypatch.setattr(cli_module.AligoCLI, "initialize_system", fake_initialize)
     monkeypatch.setattr(cli_module, "Prompt", type("P", (), {"ask": staticmethod(fake_prompt)}))
     monkeypatch.setattr(instance, "print_banner", lambda: None)
-    asyncio.run(instance.run())
-    output = instance._buffer.getvalue()
-    assert "使用 'exit' 退出" in output, "CancelledError 应转换为提示而不是静默退出"
-    assert "未检测到输入" in output, "随后 EOF 正常退出"
-    print("✓ Ctrl-C（CancelledError）回到提示符")
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(instance.run())
+    print("✓ 外来 CancelledError 从 REPL 向上抛出")
 
 
 def test_repl_memory_failure_keeps_session(monkeypatch):
@@ -335,7 +335,7 @@ if __name__ == "__main__":
         test_missing_api_key_exits_cleanly(mp)
         test_model_init_failure_exits_cleanly(mp)
         test_print_stdout_swallows_pipe_errors_only(mp)
-        test_repl_cancelled_error_returns_to_prompt(mp)
+        test_repl_foreign_cancelled_error_propagates(mp)
         test_repl_memory_failure_keeps_session(mp)
         test_repl_input_unavailable_exits(mp)
     finally:
