@@ -135,6 +135,15 @@ def test_apply_uses_duplicate_deleter_for_same_kept_id():
     print("✓ 同 id 副本使用 delete_duplicate_trip")
 
 
+def test_apply_removes_and_skips_empty_ids():
+    """正常删除计 1；trip_id 为空的条目跳过（防御历史脏计划）。"""
+    store = _Store([_trip("t1"), _trip("t2")])
+    removed, failure = apply_trip_dedupe(store, [("", ""), ("t1", "t2")])
+    assert (removed, failure) == (1, None)
+    assert store.deleted == ["t2"]
+    print("✓ 删除计数与空 id 跳过")
+
+
 def test_apply_reports_partial_failure():
     """删除中途失败：如实返回已删除数与原因。"""
     store = _Store([_trip("t1"), _trip("t2")], fail_delete_at=1)
@@ -150,5 +159,6 @@ if __name__ == "__main__":
     test_plan_reports_ambiguous_ids_separately()
     test_plan_ignores_rows_without_start_date()
     test_apply_uses_duplicate_deleter_for_same_kept_id()
+    test_apply_removes_and_skips_empty_ids()
     test_apply_reports_partial_failure()
     print("\n全部通过")
