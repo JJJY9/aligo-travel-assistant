@@ -2216,6 +2216,36 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def _get_session_marked(
+    state: AligoWebApp, user_id: str, session_id: str | None
+) -> _WebSession:
+    """在线程池打开会话并标记占用；等待期间被取消时由完成回调补 end_turn。
+
+    ``asyncio.to_thread`` 里的会话构造不受协程取消影响：客户端断开 / 进程
+    停机时线程仍会 ``begin_turn``，而被取消的调用方拿不到会话对象、无法
+    ``end_turn``——占用标记会一直钉住会话（1h 租约兜底才回收），累计到
+    并发上限后新会话全部 503。这里 shield 内层任务，取消时挂完成回调。
+    """
+    future = asyncio.ensure_future(
+        asyncio.to_thread(state.get_session, user_id, session_id, True)
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+
+        def _release_late(task: asyncio.Future) -> None:
+            if task.cancelled():
+                return
+            try:
+                late_session = task.result()
+            except Exception:  # noqa: BLE001 - 构造失败没有占用可释放
+                return
+            late_session.end_turn()
+
+        future.add_done_callback(_release_late)
+        raise
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -3355,10 +3385,11 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
             # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池；
-            # mark_in_use 阻止会话在 ask 期间被 LRU 淘汰 close
+            # mark_in_use 阻止会话在 ask 期间被 LRU 淘汰 close；请求在等待
+            # 期间被取消时，_get_session_marked 负责在构造完成后补 end_turn
             try:
-                session = await asyncio.to_thread(
-                    state.get_session, payload.user_id, payload.session_id, True
+                session = await _get_session_marked(
+                    state, payload.user_id, payload.session_id
                 )
             except MemoryPersistenceError as exc:
                 logger.warning(
@@ -3460,8 +3491,8 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
             try:
-                session = await asyncio.to_thread(
-                    state.get_session, payload.user_id, payload.session_id, True
+                session = await _get_session_marked(
+                    state, payload.user_id, payload.session_id
                 )
             except MemoryPersistenceError as exc:
                 logger.warning("打开会话失败（%s）: %s", rid, exc)
