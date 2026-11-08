@@ -586,6 +586,43 @@ async function scenarioDecode(source) {
   });
   results.oversize_toasts = run("__toasts.slice()");
   results.oversize_requests = run("__requests.length");
+  results.oversize_button = {
+    text: run("els.tripImport.textContent"),
+    disabled: run("els.tripImport.disabled"),
+  };
+
+  // 导入进行中：按钮禁用并显示「导入中…」，完成后复位；重复选择被忽略
+  run("refreshStatus = async () => {};");
+  run("__importCalls = 0;");
+  run(
+    "getJSON = () => { __importCalls += 1; return new Promise((resolve) => { __resolveImport = resolve; }); };"
+  );
+  let pendingError = null;
+  const pending = importFile({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  }).catch((error) => {
+    pendingError = String((error && error.stack) || error);
+  });
+  await tick();
+  results.pending_error = pendingError;
+  results.busy = {
+    text: run("els.tripImport.textContent"),
+    disabled: run("els.tripImport.disabled"),
+  };
+  await importFile({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  });
+  results.busy_requests = run("__importCalls");
+  run("__resolveImport({ created: 1, updated: 0, skipped: [] })");
+  await pending;
+  await tick();
+  results.after_import = {
+    text: run("els.tripImport.textContent"),
+    disabled: run("els.tripImport.disabled"),
+    toasts: run("__toasts.slice()"),
+  };
   return results;
 }
 

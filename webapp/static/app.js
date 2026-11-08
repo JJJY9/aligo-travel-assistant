@@ -1176,41 +1176,58 @@ async function decodeImportFile(file) {
 
 async function importTripsFromFile(file) {
   if (!file) return;
-  if (file.size > 2 * 1024 * 1024) {
-    toast("文件过大（上限 2 MB），请拆分后再导入");
-    return;
-  }
-  let text;
-  try {
-    text = await decodeImportFile(file);
-  } catch (error) {
-    toast(`读取文件失败：${error.message}`);
-    return;
-  }
-  if (!String(text || "").trim()) {
-    toast("文件为空，没有可导入的行程");
-    return;
+  const button = els.tripImport;
+  if (button) {
+    if (button.disabled) return; // 导入进行中：忽略重复选择
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = "导入中…";
   }
   try {
-    const result = await getJSON(
-      `/api/trips/import?user_id=${encodeURIComponent(state.userId)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: text }),
-      },
-    );
-    const created = Number(result.created || 0);
-    const updated = Number(result.updated || 0);
-    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
-    toast(
-      `已导入 ${created} 条行程` +
-        (updated ? `，更新 ${updated} 条` : "") +
-        (skipped ? `，跳过 ${skipped} 条` : ""),
-    );
-    await refreshStatus();
-  } catch (error) {
-    toast(`导入行程失败：${error.message}`);
+    if (file.size > 2 * 1024 * 1024) {
+      toast("文件过大（上限 2 MB），请拆分后再导入");
+      return;
+    }
+    let text;
+    try {
+      text = await decodeImportFile(file);
+    } catch (error) {
+      toast(`读取文件失败：${error.message}`);
+      return;
+    }
+    if (!String(text || "").trim()) {
+      toast("文件为空，没有可导入的行程");
+      return;
+    }
+    try {
+      const result = await getJSON(
+        `/api/trips/import?user_id=${encodeURIComponent(state.userId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: text }),
+        },
+      );
+      const created = Number(result.created || 0);
+      const updated = Number(result.updated || 0);
+      const skipped = Array.isArray(result.skipped)
+        ? result.skipped.length
+        : 0;
+      toast(
+        `已导入 ${created} 条行程` +
+          (updated ? `，更新 ${updated} 条` : "") +
+          (skipped ? `，跳过 ${skipped} 条` : ""),
+      );
+      await refreshStatus();
+    } catch (error) {
+      toast(`导入行程失败：${error.message}`);
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.textContent = "导入行程";
+    }
   }
 }
 

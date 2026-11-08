@@ -21,7 +21,7 @@
 - 知识库重复检查：`GET /api/knowledge/duplicates` 与面板「查重复」按钮列出内容完全相同的独立片段组（与 CLI `kb-duplicates` 同一实现，`limit=0` 全量；带 `group` / `parts>1` 的多分片记录内部重复不计为重复），旧备份多次导入后可直接定位要清理的片段
 - 知识库重复清理：面板「清理重复」按钮与 `POST /api/knowledge/duplicates/cleanup`（默认 `dry_run=1` 只返回计划；确认后每组保留最小 id 删除其余，逐条汇报删除失败，与 CLI `kb-dedupe` 同一语义）
 - CLI `trip-calendar <user_id> <trip_id> [path] [--stdout] [--force]`：单条行程导出 iCalendar（与 Web `GET /api/trips/{trip_id}/calendar` 同一渲染口径与 VALARM 提醒；歧义 trip_id / 缺少出发日期返回 1，默认 `exports/aligo_<用户>_<trip_id>.ics`、覆盖需 `--force`）
-- 记忆面板「导入行程」：选择 CSV / iCalendar 文件导入（自动识别格式，与 CLI `trips-import` 同一解析与去重语义；`POST /api/trips/import` 支持 `dry_run=1` 预览，无有效行返回 400 并附行号原因；文件按 UTF-8 严格解码失败时回退 GB18030（Excel 导出的中文 CSV），超过 2 MB 直接提示不读取）
+- 记忆面板「导入行程」：选择 CSV / iCalendar 文件导入（自动识别格式，与 CLI `trips-import` 同一解析与去重语义；`POST /api/trips/import` 支持 `dry_run=1` 预览，无有效行返回 400 并附行号原因；文件按 UTF-8 严格解码失败时回退 GB18030（Excel 导出的中文 CSV），超过 2 MB 直接提示不读取；导入期间按钮禁用并忽略重复选择）
 
 ### 变更
 - 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin

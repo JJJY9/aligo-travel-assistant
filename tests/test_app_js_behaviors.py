@@ -163,7 +163,7 @@ def test_knowledge_actions_arbitrate_shared_result_bar():
 
 
 def test_trip_import_file_decoding_and_size_guard():
-    """行程导入文件：UTF-8 / GBK（Excel 导出）自动解码，超大文件不读取不发请求。"""
+    """行程导入文件：UTF-8 / GBK 解码、超大文件不读取、导入中防重复提交。"""
     results = _run_harness("decode")
     assert results["utf8"] == "目的地,杭州"
     assert results["gbk"] == "目的地,上海", "GBK CSV 必须回退 gb18030 解码"
@@ -171,7 +171,14 @@ def test_trip_import_file_decoding_and_size_guard():
         "文件过大（上限 2 MB），请拆分后再导入"
     ]
     assert results["oversize_requests"] == 0, "超大文件不应读取或发请求"
-    print("✓ 行程导入文件解码与大小限制")
+    assert results["oversize_button"] == {"text": "导入行程", "disabled": False}
+    assert results["pending_error"] is None
+    assert results["busy"] == {"text": "导入中…", "disabled": True}
+    assert results["busy_requests"] == 1, "导入进行中必须忽略重复选择"
+    assert results["after_import"]["text"] == "导入行程"
+    assert results["after_import"]["disabled"] is False
+    assert results["after_import"]["toasts"][-1] == "已导入 1 条行程"
+    print("✓ 行程导入文件解码 / 大小限制 / 防重复提交")
 
 
 def test_knowledge_eval_panel_states():
