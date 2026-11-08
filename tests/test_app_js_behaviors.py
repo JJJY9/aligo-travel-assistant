@@ -181,19 +181,36 @@ def test_trip_import_file_decoding_and_size_guard():
     assert results["busy_requests"] == 1, "导入进行中必须忽略重复选择"
     assert results["after_import"]["text"] == "导入行程"
     assert results["after_import"]["disabled"] is False
-    assert results["after_import"]["toasts"][-1] == "已导入 1 条行程"
+    assert results["after_import"]["toasts"][-1] == "已导入 1 条行程，跳过 60 条", (
+        "结果 toast 的跳过数量同样要用 skipped_total"
+    )
     assert results["after_import"]["confirm"] == (
         "将新增 1 条、更新 0 条行程，跳过 73 条。继续？"
     ), "确认框的跳过数量必须用 skipped_total（列表最多 50 条）"
+    urls = results["after_import"]["urls"]
+    assert len(urls) == 2 and urls[0].endswith("dry_run=1"), urls
+    assert "dry_run" not in urls[1], "正式写入不能带 dry_run"
+    assert results["after_import"]["refresh_options"] == {"silentFailure": True}
+    assert results["after_import"]["refresh_calls"] == 1, "成功后刷新一次概览"
+
+    closed = results["closed"]
+    assert closed["confirm_calls"] == 0, "面板关闭后不能再弹确认"
+    assert closed["calls"] == 1 and closed["urls"][0].endswith("dry_run=1"), closed
+
     assert results["pinned_url"].endswith("user_id=user-a"), (
         "解码 / 请求期间切换用户，导入仍落在选择文件时的用户"
     )
+    pinned_urls = results["pinned_urls"]
+    assert len(pinned_urls) == 2
+    assert pinned_urls[0].endswith("dry_run=1") and "user_id=user-a" in pinned_urls[0]
+    assert "dry_run" not in pinned_urls[1] and "user_id=user-a" in pinned_urls[1]
     assert results["user_after"] == "user-b"
-    assert results["cancel"] == {
-        "calls": 1,
-        "confirm_calls": 1,
-        "last_toast": "已取消导入",
-    }, "预览后取消只发 dry-run，不写入"
+    assert results["cancel"]["calls"] == 1
+    assert results["cancel"]["confirm_calls"] == 1
+    assert results["cancel"]["last_toast"] == "已取消导入"
+    assert results["cancel"]["urls"][0].endswith("dry_run=1"), (
+        "取消场景只发过一次 dry-run 预览，不能已经写入"
+    )
     assert results["char_limit"]["last_toast"] == (
         "文件过大（超过 50 万字符），请拆分后再导入"
     ), "字符数上限必须与服务端 50 万字符一致"

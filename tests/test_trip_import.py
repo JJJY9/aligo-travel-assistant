@@ -1,7 +1,6 @@
 """行程 CSV 导入测试（无需 API Key、不访问网络）。
 
-运行：python tests/test_trip_import.py
-"""
+运行：python tests/test_trip_import.py\n"""
 import io
 import json
 import os
@@ -869,6 +868,48 @@ def test_ics_regex_scan_is_bounded():
     print("✓ ICS 超长 SUMMARY / DESCRIPTION 解析有界")
 
 
+def test_import_force_ics_and_purpose_precedence():
+    """--ics 强制按 iCalendar 解析；同文件内空白目的不覆盖前一行给出的目的。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_import import import_trips_from_text
+
+    csv_text = (
+        "origin,destination,start_date,end_date\n"
+        "北京,上海,2026-12-01,2026-12-03\n"
+    )
+    forced = import_trips_from_text(
+        _ImportStore(), csv_text, dry_run=True, force_ics=True
+    )
+    assert forced["format"] == "ics"
+    assert forced["rows"] == 0, "--ics 必须按 iCalendar 解析（CSV 文本没有 VEVENT）"
+
+    store = LongTermMemory("u-import-purpose-order", tempfile.mkdtemp())
+    text = (
+        "origin,destination,start_date,end_date,purpose\n"
+        "北京,上海,2026-12-01,2026-12-03,客户会议\n"
+        "北京,上海,2026-12-01,2026-12-03,\n"
+    )
+    result = import_trips_from_text(store, text)
+    assert (result["created"], result["updated"]) == (1, 1)
+    trip = store.get_trip_history(limit=None)[0]
+    assert trip["purpose"] == "客户会议", (
+        "后一行空白目的不能覆盖本批前一行显式给出的目的"
+    )
+    print("✓ 导入 --ics 强制格式 / 批内目的优先级")
+
+
+def test_import_rejects_oversized_raw_text(monkeypatch):
+    """解析前先拒绝超过原始文本上限的文件（CLI 无请求体上限）。"""
+    import utils.trip_import as trip_import
+
+    monkeypatch.setattr(trip_import, "_MAX_IMPORT_CHARS", 100)
+    with pytest.raises(ValueError, match="导入文件过大"):
+        trip_import.import_trips_from_text(_ImportStore(), "x" * 101)
+    print("✓ 导入原始文本上限")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -888,6 +929,7 @@ if __name__ == "__main__":
     test_import_trips_from_text_csv_and_ics()
     test_import_rejects_oversized_bad_text_and_caps_skipped()
     test_import_preserves_existing_purpose()
+    test_import_force_ics_and_purpose_precedence()
     test_ics_regex_scan_is_bounded()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()
@@ -899,6 +941,7 @@ if __name__ == "__main__":
         test_runner_rejects_gbk_csv,
         test_runner_imports_ics_and_dedupes,
         test_runner_dispatch_ics,
+        test_import_rejects_oversized_raw_text,
     ):
         mp = pytest.MonkeyPatch()
         try:

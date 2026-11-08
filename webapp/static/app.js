@@ -1252,6 +1252,8 @@ async function importTripsFromFile(file) {
         preview.skipped_total ??
           (Array.isArray(preview.skipped) ? preview.skipped.length : 0),
       );
+      // 扫描期间关闭面板：不再弹确认，更不能在看不见的界面里写入
+      if (!isModalOpen()) return;
       const ok = window.confirm(
         `将新增 ${Number(preview.created || 0)} 条、更新 ${Number(
           preview.updated || 0,
@@ -1266,9 +1268,10 @@ async function importTripsFromFile(file) {
       const result = await postImport(false);
       const created = Number(result.created || 0);
       const updated = Number(result.updated || 0);
-      const skipped = Array.isArray(result.skipped)
-        ? result.skipped.length
-        : 0;
+      const skipped = Number(
+        result.skipped_total ??
+          (Array.isArray(result.skipped) ? result.skipped.length : 0),
+      );
       toast(
         `已导入 ${created} 条行程` +
           (updated ? `，更新 ${updated} 条` : "") +
@@ -1287,7 +1290,9 @@ async function importTripsFromFile(file) {
   }
   // 状态刷新可能等待慢接口：放在按钮复位之后，成功提示不会被「导入中…」卡住
   if (imported) {
-    await refreshStatus();
+    // 刷新失败由这里静默处理：否则「刷新数据概览失败」会覆盖导入成功提示，
+    // 用户会误以为行程没写进去
+    await refreshStatus({ silentFailure: true });
   }
 }
 
@@ -2917,7 +2922,7 @@ async function refreshMetrics() {
   }
 }
 
-async function loadExpandedTrips() {
+async function loadExpandedTrips(options = {}) {
   // 展开视图按服务端 q 过滤完整历史（此前只过滤最近 200 条的本地缓存，
   // 更早的行程会被误报为无匹配）；limit 仍是最近 200 条匹配
   const userId = state.userId;
@@ -2937,7 +2942,9 @@ async function loadExpandedTrips() {
   } catch (error) {
     if (requestId !== tripsRequestId || userId !== state.userId) return;
     // 保留旧列表：接口短暂失败不应把已展示的行程清空
-    toast(`加载行程列表失败：${error.message || error}`);
+    if (!options.silentFailure) {
+      toast(`加载行程列表失败：${error.message || error}`);
+    }
   }
   if (preferenceEditActive()) {
     // 记忆面板里正在编辑偏好：整体重渲染会销毁输入框，等保存 / 取消后的刷新补齐
@@ -2947,7 +2954,7 @@ async function loadExpandedTrips() {
   }
 }
 
-async function refreshStatus() {
+async function refreshStatus(options = {}) {
   const requestId = (statusRequestId += 1);
   const userId = state.userId;
   try {
@@ -2963,7 +2970,7 @@ async function refreshStatus() {
     // 行程并重建两次列表纯属浪费；重新打开面板时 openMemorySheet 会再刷新
     const sheetOpen = els.memorySheet && !els.memorySheet.hidden;
     if (state.tripsExpanded && Number(data.trip_count || 0) > 0 && sheetOpen) {
-      await loadExpandedTrips();
+      await loadExpandedTrips(options);
     } else if (!data.trip_count) {
       tripsRequestId += 1;
       state.tripsExpanded = false;
@@ -2974,7 +2981,9 @@ async function refreshStatus() {
     if (requestId !== statusRequestId || userId !== state.userId) return;
     if (state.status) {
       // 存储故障 / 网络抖动：保留已渲染的数据概览，不能清空成「无法获取」
-      toast("刷新数据概览失败，已保留上次结果");
+      if (!options.silentFailure) {
+        toast("刷新数据概览失败，已保留上次结果");
+      }
       updateUserCard();
       return;
     }

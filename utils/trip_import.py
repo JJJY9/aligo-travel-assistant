@@ -375,6 +375,9 @@ _MAX_IMPORT_ROWS = 5000
 # 解析错误只在结果里保留前 50 条（HTTP 400 只用前 5 条原因）：一个 1MB
 # 的坏文件可能有数十万条错误，全量物化会占用上百 MB 内存。
 _MAX_SKIPPED = 50
+# 原始文本上限：Web 端有 50 万字符的 content 上限，但 CLI 直接读文件；
+# 解析前先拒绝超大文本，避免几十 MB 文件在解析 / 错误列表上占满内存。
+_MAX_IMPORT_CHARS = 5_000_000
 
 
 def _bad_import_text(value: Any) -> bool:
@@ -408,8 +411,12 @@ def import_trips_from_text(
         ``{"dry_run", "format": "ics"|"csv", "rows", "created", "updated",
         "skipped": [{"line", "reason"}]（最多 50 条）, "skipped_total"}``。
     """
+    if len(str(text or "")) > _MAX_IMPORT_CHARS:
+        raise ValueError(
+            f"导入文件过大（超过 {_MAX_IMPORT_CHARS} 字符），请拆分后再导入"
+        )
     normalized = str(text or "").lstrip("﻿ \t\r\n")
-    is_ics = normalized.upper().startswith("BEGIN:VCALENDAR")
+    is_ics = force_ics or normalized.upper().startswith("BEGIN:VCALENDAR")
     if is_ics:
         rows, errors = parse_trips_ics(text)
     else:
@@ -436,13 +443,19 @@ def import_trips_from_text(
             if _bad_import_text(row.get(field)):
                 raise ValueError("行程内容包含 NUL 或非法 Unicode 字符，已拒绝导入")
 
+    # 新建行程才补默认目的；已存在（含本批前一行刚新建）的行程保留原目的。
+    # 只在写入前扫一次库；批内同身份行必须按顺序加入 pending，否则后一行
+    # 会被误判为「新行程」补默认值，覆盖前一行显式给出的目的。
     existing_keys = {
         trip_identity(trip) for trip in store.get_trip_history(limit=None)
     }
-    # 新建行程才补默认目的；已存在的行程保留原目的（存储层对 None 不覆盖）
+    pending_keys = set(existing_keys)
     for row in rows:
-        if row.get("purpose") is None and trip_identity(row) not in existing_keys:
+        key = trip_identity(row)
+        if row.get("purpose") is None and (key is None or key not in pending_keys):
             row["purpose"] = "出差"
+        if key is not None:
+            pending_keys.add(key)
 
     if dry_run:
         pending = set(existing_keys)

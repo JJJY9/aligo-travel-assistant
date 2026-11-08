@@ -3730,7 +3730,9 @@ def create_app(model: Any = None) -> FastAPI:
         try:
 
             def work() -> dict[str, Any]:
-                store = _open_long_term(user_id)
+                # 与备份恢复一致：配置了 PostgreSQL 但不可用时拒绝写入回退的
+                # JSON 库，否则导入「成功」的数据在恢复后凭空消失
+                store = _open_long_term(user_id, strict=True)
                 try:
                     return import_trips_from_text(
                         store, payload.content, dry_run=dry_run

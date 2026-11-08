@@ -604,13 +604,16 @@ async function scenarioDecode(source) {
   };
 
   // 导入进行中：按钮禁用并显示「导入中…」，完成后复位；重复选择被忽略
-  run("refreshStatus = async () => {};");
+  run("__refreshCalls = 0;");
+  run(
+    "refreshStatus = async (options = {}) => { __refreshCalls += 1; __refreshOptions = options; if (!options.silentFailure) { __toasts.push('刷新数据概览失败'); } };"
+  );
   run(
     "__lastConfirm = null; confirm = (message) => { __lastConfirm = message; return true; };"
   );
-  run("__importCalls = 0;");
+  run("__importCalls = 0; __urls = [];");
   run(
-    "getJSON = () => { __importCalls += 1; return new Promise((resolve) => { __resolveImport = resolve; }); };"
+    "getJSON = (url) => { __importCalls += 1; __urls.push(url); return new Promise((resolve) => { __resolveImport = resolve; }); };"
   );
   let pendingError = null;
   const pending = importFile({
@@ -634,7 +637,9 @@ async function scenarioDecode(source) {
     "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 73 })"
   );
   await tick();
-  run("__resolveImport({ created: 1, updated: 0, skipped: [] })");
+  run(
+    "__resolveImport({ created: 1, updated: 0, skipped: [], skipped_total: 60 })"
+  );
   await pending;
   await tick();
   results.after_import = {
@@ -642,12 +647,37 @@ async function scenarioDecode(source) {
     disabled: run("els.tripImport.disabled"),
     toasts: run("__toasts.slice()"),
     confirm: run("__lastConfirm"),
+    urls: run("__urls.slice()"),
+    refresh_calls: run("__refreshCalls"),
+    refresh_options: run("__refreshOptions"),
   };
 
-  // 解码 / 请求期间切换用户：导入仍落在选择文件时的用户
-  run("state.userId = 'user-a'; __lastUrl = null; __importCalls = 0;");
+  // 预览期间关闭面板：不弹确认，也不写入
   run(
-    "getJSON = (url) => { __importCalls += 1; __lastUrl = url; return new Promise((resolve) => { __resolveImport = resolve; }); };"
+    "els.memorySheet.hidden = true; els.shortcutOverlay.hidden = true; __confirmCalls = 0; __importCalls = 0; __urls = [];"
+  );
+  run("confirm = () => { __confirmCalls += 1; return true; };");
+  const closed = importFile({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  });
+  await tick();
+  run(
+    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 0 })"
+  );
+  await closed;
+  await tick();
+  results.closed = {
+    confirm_calls: run("__confirmCalls"),
+    calls: run("__importCalls"),
+    urls: run("__urls.slice()"),
+  };
+  run("els.memorySheet.hidden = false; els.shortcutOverlay.hidden = false;");
+
+  // 解码 / 请求期间切换用户：导入仍落在选择文件时的用户
+  run("state.userId = 'user-a'; __lastUrl = null; __importCalls = 0; __urls = [];");
+  run(
+    "getJSON = (url) => { __importCalls += 1; __lastUrl = url; __urls.push(url); return new Promise((resolve) => { __resolveImport = resolve; }); };"
   );
   const pinned = importFile({
     size: utf8Bytes.length,
@@ -663,10 +693,11 @@ async function scenarioDecode(source) {
   await pinned;
   await tick();
   results.pinned_url = run("__lastUrl");
+  results.pinned_urls = run("__urls.slice()");
   results.user_after = run("state.userId");
 
   // 预览后取消：只发 dry-run，不写库
-  run("state.userId = 'user-c'; __confirmResult = false; __confirmCalls = 0; __importCalls = 0;");
+  run("state.userId = 'user-c'; __confirmResult = false; __confirmCalls = 0; __importCalls = 0; __urls = [];");
   run(
     "confirm = () => { __confirmCalls += 1; return __confirmResult; };"
   );
@@ -684,6 +715,7 @@ async function scenarioDecode(source) {
     calls: run("__importCalls"),
     confirm_calls: run("__confirmCalls"),
     last_toast: run("__toasts.slice()").slice(-1)[0],
+    urls: run("__urls.slice()"),
   };
 
   // 字符数上限（与 POST /api/trips/import 的 content 上限一致）

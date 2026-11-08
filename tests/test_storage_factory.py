@@ -1781,6 +1781,7 @@ def test_pg_save_trip_histories_batches_with_one_index():
 
     store = object.__new__(PostgresLongTermMemory)
     store.user_id = "u-pg-bulk"
+    store._conn = object()
     state = {"locked": False, "events": []}
 
     @contextlib_module.contextmanager
@@ -1808,11 +1809,12 @@ def test_pg_save_trip_histories_batches_with_one_index():
         assert "FROM aligo_trips WHERE user_id" in sql
         return list(history)
 
-    def fetchone(sql, params=None):
+    def fetchone(sql, params=None, replay_safe=True):
         assert state["locked"] is True
         if sql.startswith("SELECT last_number"):
             return (2,)
         if sql.startswith("INSERT INTO aligo_trips"):
+            assert replay_safe is False, "批量 INSERT 不能自动重放"
             inserted_params.append(params)
             next_id[0] += 1
             return (next_id[0],)
@@ -2084,6 +2086,54 @@ def test_bulk_save_trips_scales_and_dedupes():
     print("✓ 批量行程保存一次建索引（去重 / 编号 / 统计语义一致）")
 
 
+def test_pg_batch_aborts_when_connection_reconnects():
+    """批量保存中途连接重建：索引 / 编号水位已过期，必须中止而不是继续生成 id。"""
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-pg-reconnect"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib_module.nullcontext()
+    executed = []
+
+    def fetchall(sql, params=None):
+        return []
+
+    def fetchone(sql, params=None, replay_safe=True):
+        if sql.startswith("SELECT last_number"):
+            return (0,)
+        if sql.startswith("INSERT INTO aligo_trips"):
+            # 模拟 INSERT 期间连接失效并被 _run_with_retry 重连
+            store._conn = object()
+            return (5,)
+        raise AssertionError(sql)
+
+    def execute(sql, params=None):
+        executed.append(" ".join(sql.split()))
+
+    store._fetchall = fetchall
+    store._fetchone = fetchone
+    store._execute = execute
+
+    with pytest.raises(MemoryPersistenceError, match="连接在批量保存中被重建"):
+        store.save_trip_histories(
+            [
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-12-01",
+                }
+            ]
+        )
+    assert not any("aligo_trip_counters" in sql for sql in executed), (
+        "连接重建后不能再用过期编号水位写计数器"
+    )
+    print("✓ PG 批量保存连接重建时中止")
+
+
 def test_frequent_destinations_tie_order_is_deterministic():
     """同数量的常去目的地按城市名排序（与 PostgreSQL ORDER BY 同口径）。"""
     memory = LongTermMemory("u-freq-order", tempfile.mkdtemp())
@@ -2267,5 +2317,6 @@ if __name__ == "__main__":
     test_pg_get_chat_history_excludes_session_in_sql()
     test_bulk_save_trips_scales_and_dedupes()
     test_frequent_destinations_tie_order_is_deterministic()
+    test_pg_batch_aborts_when_connection_reconnects()
     test_bulk_save_trips_matches_sequential_saves()
     print("\n全部通过")

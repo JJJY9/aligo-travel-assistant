@@ -1364,7 +1364,7 @@ def test_trips_import_api(monkeypatch):
         "北京,上海,2026-12-01,2026-12-03,出差\n"
     )
     store = _Store()
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, **kwargs: store)
     url = f"/api/trips/import?user_id={user}"
     response = client.post(url, json={"content": csv_text})
     assert response.status_code == 200, response.text
@@ -1387,7 +1387,7 @@ def test_trips_import_api(monkeypatch):
             }
         ]
     )
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, **kwargs: store)
     preview = client.post(f"{url}&dry_run=1", json={"content": csv_text})
     assert preview.status_code == 200
     preview_data = preview.json()
@@ -1410,7 +1410,7 @@ def test_trips_import_api(monkeypatch):
         ]
     )
     store = _Store()
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, **kwargs: store)
     ics_response = client.post(url, json={"content": ics})
     assert ics_response.status_code == 200
     assert ics_response.json()["format"] == "ics"
@@ -1418,7 +1418,7 @@ def test_trips_import_api(monkeypatch):
 
     # 没有可导入项：400 带具体原因
     store = _Store()
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, **kwargs: store)
     empty = client.post(url, json={"content": "不是行程"})
     assert empty.status_code == 400
     assert "没有可导入的行程" in empty.json()["detail"]
@@ -1429,7 +1429,7 @@ def test_trips_import_api(monkeypatch):
             raise RuntimeError("db down")
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id: _Boom()
+        server_module, "_open_long_term", lambda user_id, **kwargs: _Boom()
     )
     failed = client.post(url, json={"content": csv_text})
     assert failed.status_code == 503
@@ -1470,7 +1470,7 @@ def test_trips_import_runs_in_import_executor_and_maps_errors(monkeypatch):
         }
 
     monkeypatch.setattr(server_module, "import_trips_from_text", fake_import)
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, **kwargs: _Store())
     client = _client()
     state = client.app.state.aligo
     user = _unique_user("web_trip_exec")
@@ -1535,7 +1535,7 @@ def test_trips_import_rate_limited(monkeypatch):
         }
 
     monkeypatch.setattr(server_module, "import_trips_from_text", fake_import)
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, **kwargs: _Store())
     client = _client()
     state = client.app.state.aligo
     state.import_limiter = RateLimiter(limit=1, window_sec=60)
