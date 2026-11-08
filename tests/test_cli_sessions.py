@@ -1160,7 +1160,7 @@ def test_session_export_html(monkeypatch):
     monkeypatch.chdir(tempfile.mkdtemp())
     code, out = _run_export("u1", "s-html", html=True)
     assert code == 0
-    assert os.path.exists(os.path.join("exports", "aligo_s-html.html"))
+    assert os.path.exists(os.path.join("exports", "aligo_u1_s-html.html"))
     print("✓ session-export --html 转义与默认后缀")
 
 
@@ -1273,9 +1273,9 @@ def test_session_export_default_path(monkeypatch):
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
     code, out = _run_export("u1", "s-active")
     assert code == 0
-    path = os.path.join(workdir, "exports", "aligo_s-active.md")
+    path = os.path.join(workdir, "exports", "aligo_u1_s-active.md")
     assert os.path.exists(path)
-    print("✓ 未指定路径时写入 exports/aligo_<session>.md")
+    print("✓ 未指定路径时写入 exports/aligo_<user>_<session>.md")
 
 
 def test_main_session_export_dispatch(monkeypatch):
@@ -1292,7 +1292,7 @@ def test_main_session_export_dispatch(monkeypatch):
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert os.path.exists(os.path.join(workdir, "exports", "aligo_s-active.md"))
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_u1_s-active.md"))
     print("✓ dispatch 层 session-export 正常执行")
 
 

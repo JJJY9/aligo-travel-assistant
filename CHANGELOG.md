@@ -26,6 +26,8 @@
 - 记忆面板「导入行程」：选择 CSV / iCalendar 文件导入（自动识别格式，与 CLI `trips-import` 同一解析与去重语义；`POST /api/trips/import` 支持 `dry_run=1` 预览，无有效行返回 400 并附行号原因；文件按 UTF-8 严格解码失败时回退 GB18030（Excel 导出的中文 CSV），超过 2 MB 直接提示不读取；导入期间按钮禁用并忽略重复选择；写入前先 dry-run 预览并在确认框显示新增 / 更新 / 跳过数量，取消不写库）
 
 ### 变更
+- CLI `trips-export` / `session-export` 默认文件名带上用户（`exports/aligo_<用户>_trips.*` / `aligo_<用户>_<会话>.*`）：不同用户同名会话 / 同目录导出不再互相覆盖（`--force`）
+- `trips-dedupe --dry-run` 存在无法自动处理的歧义 id 时退出码 1（与正式执行一致），`--json` 增加 `needs_attention`
 - 行程导入确认框展示前 3 条跳过原因（行号 + 原因），只报数量时用户无法判断是否选错文件格式
 - 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin
 - 知识库导入 / 预览使用独立限流桶（`kb_import`，1200 次 / 分钟），面板分批导入不再必然 429
@@ -35,6 +37,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 行程导出：历史未补零日期（2026-1-5）导出时补零，CSV 回导不再被严格校验跳过、ICS 不再丢事件（`normalize_identity_date` 移到 `utils/trip_export` 供导入复用）
 - 安全：`POST /api/trips/dedupe` 改为 JSON body（`user_id` / `dry_run`）并接入读取限流桶——跨站表单无法再静默触发全量去重删除
 - 安全：`/api/import` 仅接受 `application/json`（`text/plain` 属 CORS 简单请求，任意网页可跨站向任意 `user_id` 写入备份；现在返回 415）
 - 请求体超限（`Content-Length` 与分块两条路径）的 413 响应带 `Connection: close`：未读取的剩余 body 不再被 keep-alive 当成下一个请求解析（连接挂死 / 协议错误）

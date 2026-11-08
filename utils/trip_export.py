@@ -10,6 +10,7 @@ import csv
 import hashlib
 import io
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -17,6 +18,25 @@ logger = logging.getLogger(__name__)
 
 
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def normalize_identity_date(value: Any) -> str:
+    """日期归一：YYYY-M-D 补零到 YYYY-MM-DD（其它格式原样返回）。
+
+    历史数据可能保留未补零写法（如 2026-1-5），存储去重与导入端都按补零
+    后的日期比对；导出（CSV / ICS）也用它，否则导出文件再导入时严格格式
+    校验会跳过这些行，造成静默丢行程。放在本模块供 trip_import 反向复用，
+    避免循环导入。
+    """
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if not match:
+        return text
+    month = int(match.group(2))
+    day = int(match.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return text
+    return f"{match.group(1)}-{month:02d}-{day:02d}"
 
 
 def _needs_quote_guard(text: str) -> bool:
@@ -48,8 +68,8 @@ def render_trips_csv(trips: list[dict[str, Any]]) -> str:
             [
                 _csv_safe(trip.get("origin")),
                 _csv_safe(trip.get("destination")),
-                _csv_safe(trip.get("start_date")),
-                _csv_safe(trip.get("end_date")),
+                _csv_safe(normalize_identity_date(trip.get("start_date"))),
+                _csv_safe(normalize_identity_date(trip.get("end_date"))),
                 _csv_safe(trip.get("purpose")),
             ]
         )
@@ -57,9 +77,14 @@ def render_trips_csv(trips: list[dict[str, Any]]) -> str:
 
 
 def _ics_date(value: str) -> str | None:
-    """把 YYYY-MM-DD 转为 iCalendar 日期（YYYYMMDD）；非法值返回 None。"""
+    """把 YYYY-MM-DD 转为 iCalendar 日期（YYYYMMDD）；非法值返回 None。
+
+    未补零的历史日期（2026-1-5）先归一：否则整条事件被跳过，导出「少行程」。
+    """
     try:
-        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%Y%m%d")
+        return datetime.strptime(
+            normalize_identity_date(value), "%Y-%m-%d"
+        ).strftime("%Y%m%d")
     except (TypeError, ValueError):
         return None
 
@@ -103,7 +128,8 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     description = (
         f"Aligo 行程：{str(trip.get('origin') or '')} → "
         f"{str(trip.get('destination') or '')}，"
-        f"{trip.get('start_date')} ~ {trip.get('end_date') or trip.get('start_date')}，"
+        f"{normalize_identity_date(trip.get('start_date'))} ~ "
+        f"{normalize_identity_date(trip.get('end_date') or trip.get('start_date'))}，"
         f"{str(trip.get('purpose') or '')}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

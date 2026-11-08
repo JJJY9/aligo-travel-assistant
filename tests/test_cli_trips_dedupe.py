@@ -369,6 +369,7 @@ def test_json_output_no_duplicates(monkeypatch):
         "total_trips": 0,
         "duplicates": [],
         "ambiguous_ids": [],
+        "needs_attention": False,
         "removed": 0,
     }
 
@@ -392,7 +393,10 @@ def test_json_output_errors_and_ambiguous(monkeypatch):
     with contextlib.redirect_stdout(out):
         code = cli.run_trips_dedupe_standalone("u1", dry_run=True, as_json=True)
     payload = _json.loads(out.getvalue())
+    # dry-run 与正式执行同语义：歧义 id 需要人工处理 → 退出码 1
+    assert code == 1
     assert payload["ambiguous_ids"] == ["trip_2"]
+    assert payload["needs_attention"] is True
     assert payload["would_remove"] == 0
     assert fake.deleted == []
 
