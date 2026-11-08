@@ -985,6 +985,7 @@ def import_documents(
                     logger.warning("扫描库内分片布局失败（%s），跳过补写组 %s", exc, doc_group)
                     layout = None
                 conflicts = []
+                cross_group = False
                 if layout is None:
                     conflicts.append(doc_group)
                 else:
@@ -998,12 +999,39 @@ def import_documents(
                         want_part = int((chunk_meta or {}).get("part") or 0)
                         want_parts = int((chunk_meta or {}).get("parts") or 1)
                         if (
-                            old_group != doc_group
-                            or old_parts != want_parts
-                            or (want_part and old_part != want_part)
+                            old_group == doc_group
+                            and old_parts == want_parts
+                            and (not want_part or old_part == want_part)
                         ):
+                            continue
+                        if not old_group or old_group != doc_group:
+                            # 命中的片段属于其它组（库内另一篇文档）或本批
+                            # 前一文档尚未落库的同文分片：本组无法按原布局
+                            # 补齐（补写会缺 part 1 / 与别人共享同一片）
+                            cross_group = True
+                        else:
                             conflicts.append(key[:20])
-                            break
+                        break
+                if cross_group and not conflicts:
+                    # 组结构无法成立，但独特分片不能静默丢失：去掉派生分片
+                    # 标记，以独立片段入库（整篇编辑退化为逐片段维护，内容
+                    # 仍可检索；共享片段已在库中 / 本批写入，不重复落库）
+                    logger.warning(
+                        "文档组 %s 的共享片段属于其它组，缺失分片将以独立片段入库",
+                        doc_group,
+                    )
+                    for chunk in missing:
+                        meta = dict(chunk.get("metadata") or {})
+                        for derived in ("part", "parts", "group"):
+                            meta.pop(derived, None)
+                        unique.append(
+                            {"content": chunk["content"], "metadata": meta}
+                        )
+                        existing_counts[chunk["content"].strip()] += 1
+                    existing_counts.update(consumed)
+                    # 命中片段的重复计数已在上面统一 +1（971 行），这里只
+                    # 登记新入库的独立片段供后续文档判重
+                    continue
                 if conflicts:
                     logger.warning(
                         "备份中的文档组 %s 与库内已有片段布局不一致，已跳过该组："
