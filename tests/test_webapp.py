@@ -648,7 +648,7 @@ def _stream_error_message(monkeypatch, exc):
     state = app.state.aligo
 
     class _Runtime:
-        async def ask(self, message, on_event=None):
+        async def ask(self, message, on_event=None, turn_id=""):
             raise exc
 
     class _Session:
@@ -940,6 +940,104 @@ def test_import_skips_reserved_session_id():
         )
         assert detail.status_code == 200, detail.text
         print("✓ 备份导入跳过保留字 session_id（含标题 / 置顶）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_chat_stream_persists_client_turn_id():
+    """客户端回合标识写进助手消息 _meta（停止后前端精确对账用）。"""
+    client = _client()
+    user_id = _unique_user("web_test_turn_id")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "sess-turn",
+                "client_turn_id": "turn-abc123",
+            },
+        ) as response:
+            assert response.status_code == 200
+            for _ in response.iter_lines():
+                pass
+        detail = client.get(
+            "/api/sessions/sess-turn", params={"user_id": user_id}
+        ).json()
+        assistants = [
+            message for message in detail["messages"] if message["role"] == "assistant"
+        ]
+        assert assistants and assistants[-1]["meta"]["client_turn_id"] == "turn-abc123"
+
+        bad = client.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "client_turn_id": "含 空格",
+            },
+        )
+        assert bad.status_code == 422, "非法回合标识应被拒绝"
+        print("✓ 流式对话把 client_turn_id 写入助手消息元数据")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trips_export_respects_status_filter():
+    """导出（CSV / HTML）与列表同口径应用状态过滤。"""
+    import csv
+    import io
+    from datetime import date, timedelta
+
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_trips_status_export")
+    today = date.today()
+    past = (today - timedelta(days=30)).isoformat()
+    active_start = (today - timedelta(days=1)).isoformat()
+    future = (today + timedelta(days=30)).isoformat()
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {"origin": "北京", "destination": "上海", "start_date": past, "end_date": past}
+            )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "广州",
+                    "start_date": active_start,
+                    "end_date": future,
+                }
+            )
+            store.save_trip_history(
+                {"origin": "北京", "destination": "成都", "start_date": future}
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        client = _client()
+        active = client.get(
+            "/api/trips/export", params={"user_id": user_id, "status": "active"}
+        )
+        rows = list(csv.reader(io.StringIO(active.content.decode("utf-8-sig"))))
+        assert len(rows) == 2 and rows[1][1] == "广州", rows
+
+        past_html = client.get(
+            "/api/trips/export",
+            params={"user_id": user_id, "status": "past", "format": "html"},
+        )
+        assert "上海" in past_html.text
+        assert "广州" not in past_html.text and "成都" not in past_html.text
+
+        bad = client.get(
+            "/api/trips/export", params={"user_id": user_id, "status": "bogus"}
+        )
+        assert bad.status_code == 422
+        print("✓ 行程导出（CSV / HTML）应用状态过滤")
     finally:
         _cleanup(user_id)
 
@@ -1970,7 +2068,7 @@ def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
     client = _client()
     user_id = _unique_user("web_test_chat_errors")
 
-    async def open_ask(self, message):
+    async def open_ask(self, message, on_event=None, turn_id=""):
         raise CircuitOpenError()
 
     monkeypatch.setattr(server_module.ConversationRuntime, "ask", open_ask)
@@ -1980,7 +2078,7 @@ def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
     assert response.status_code == 503
     assert "服务暂时不可用" in response.json()["detail"]
 
-    async def broken_ask(self, message):
+    async def broken_ask(self, message, on_event=None, turn_id=""):
         raise MemoryPersistenceError("disk full")
 
     monkeypatch.setattr(server_module.ConversationRuntime, "ask", broken_ask)
@@ -6189,7 +6287,7 @@ def test_chat_maps_user_facing_error_to_400(monkeypatch):
     from utils.errors import UserFacingError
     from webapp import server as server_module
 
-    async def broken_ask(self, message):
+    async def broken_ask(self, message, on_event=None, turn_id=""):
         raise UserFacingError("意图识别结果解析失败，请重试")
 
     monkeypatch.setattr(

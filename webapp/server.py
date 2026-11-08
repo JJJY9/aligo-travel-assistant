@@ -432,6 +432,9 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     user_id: str = Field(default="web_user", pattern=_ID_PATTERN)
     session_id: str | None = Field(default=None, pattern=_ID_PATTERN)
+    # 客户端生成的回合标识：写入助手消息的 _meta，停止 / 断网后的前端
+    # 对账用它精确判断这一轮是否已落库（文本比较会把重复提问误判成已保存）
+    client_turn_id: str | None = Field(default=None, pattern=_ID_PATTERN)
 
     @field_validator("session_id")
     @classmethod
@@ -1208,6 +1211,20 @@ def _rate_identity(host: str) -> str:
             return str(mapped)
         return str(ipaddress.ip_network(f"{address}/64", strict=False))
     return text
+
+
+def _filter_trips_by_status(
+    trips: list[dict[str, Any]], status: str | None
+) -> list[dict[str, Any]]:
+    """按面板状态徽标过滤行程（列表与导出同一口径）。"""
+    if status is None:
+        return trips
+    label = {
+        "active": "进行中",
+        "upcoming": "即将出行",
+        "past": "已结束",
+    }[status]
+    return [trip for trip in trips if _trip_state_label(trip) == label]
 
 
 def _limiter_degraded(limiter: Any) -> bool:
@@ -2841,7 +2858,9 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                 ) from exc
             try:
-                result = await session.runtime.ask(payload.message)
+                result = await session.runtime.ask(
+                    payload.message, turn_id=payload.client_turn_id or ""
+                )
             except CircuitOpenError as exc:
                 raise HTTPException(
                     status_code=503,
@@ -2942,7 +2961,9 @@ def create_app(model: Any = None) -> FastAPI:
                 async def run() -> None:
                     try:
                         result = await session.runtime.ask(
-                            payload.message, on_event=queue.put_nowait
+                            payload.message,
+                            on_event=queue.put_nowait,
+                            turn_id=payload.client_turn_id or "",
                         )
                         await queue.put(
                             {"type": "done", "session_id": session.session_id, **result}
@@ -3076,6 +3097,7 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         trips = _filter_trips_by_query(all_trips, q)
+        trips = _filter_trips_by_status(trips, status)
         status_label = ""
         if status is not None:
             status_label = {
@@ -3083,11 +3105,6 @@ def create_app(model: Any = None) -> FastAPI:
                 "upcoming": "即将出行",
                 "past": "已结束",
             }[status]
-            trips = [
-                trip
-                for trip in trips
-                if _trip_state_label(trip) == status_label
-            ]
         total = len(trips)
         ordered = trips[::-1] if order == "desc" else trips
         page = ordered[offset : offset + limit]
@@ -3276,11 +3293,13 @@ def create_app(model: Any = None) -> FastAPI:
     def export_trips_file(
         user_id: str = Query(..., pattern=_ID_PATTERN),
         q: str = Query(default="", max_length=100),
+        status: Literal["active", "upcoming", "past"] | None = Query(default=None),
         format: Literal["csv", "html"] = Query(default="csv"),
     ) -> Response:
         """导出历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）或 HTML 台账。
 
-        ``q`` 与列表接口同一口径过滤后再导出；``format=html`` 与 CLI
+        ``q`` / ``status`` 与列表接口同一口径过滤后再导出（与面板筛选、
+        CLI ``trips-export --status`` 保持一致）；``format=html`` 与 CLI
         ``trips-export --html`` 同一渲染口径（可打印 / 分享、内容转义）。
         """
         store = _open_long_term(user_id)
@@ -3291,7 +3310,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
         finally:
             _close_long_term(store)
-        filtered = _filter_trips_by_query(trips, q)
+        filtered = _filter_trips_by_status(_filter_trips_by_query(trips, q), status)
         if format == "html":
             return Response(
                 content=render_trips_html(filtered, user_id),
