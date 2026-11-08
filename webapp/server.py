@@ -896,9 +896,14 @@ class AligoWebApp:
     session_turn_leak_sec = 3600.0
     # 用户锁表同样有上限：用户 ID 由请求方提供，未命中时淘汰未持有的锁
     max_locks = 1000
-    # 已删除会话的短时墓碑：在途 / 重连的对话不能把刚删除的会话写回（复活）
+    # 已删除会话的短时墓碑：在途 / 重连的对话不能把刚删除的会话写回（复活）。
+    # TTL 必须覆盖「删除发生时仍在途的回合」的最长生命周期：回合在删除前
+    # 开始、落库在删除后完成时，persist_guard 靠墓碑否决写入；多智能体 +
+    # 重试的回合可能超过 5 分钟，旧值 300s 过期后迟到落库会把已删除会话
+    # 写回（多实例下删除发生在别的实例，用户锁不覆盖）。与
+    # session_turn_leak_sec 同值：任何在途回合都不会比这个窗更长。
     max_tombstones = 1000
-    tombstone_ttl_sec = 300.0
+    tombstone_ttl_sec = 3600.0
     # 共享墓碑故障后的重试冷却：期间只用进程内墓碑，避免每个请求都等 Redis 超时
     tombstone_retry_sec = 60.0
 
@@ -3427,7 +3432,9 @@ def create_app(model: Any = None) -> FastAPI:
                 finally:
                     session.end_turn()
         response.headers.update(rate_headers)
-        return {"session_id": session.session_id, **result}
+        # reply / agents 来自模型输出：孤立代理项（截断 emoji 的转义）会让
+        # JSONResponse 的 UTF-8 编码抛 UnicodeEncodeError（500），响应前统一转义
+        return {"session_id": session.session_id, **_json_safe_value(result)}
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
@@ -3562,7 +3569,13 @@ def create_app(model: Any = None) -> FastAPI:
                     if event.get("type") == "error":
                         # HTTP 已发出 200：对话错误率需要独立口径
                         REQUEST_METRICS.record_sse_error()
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    # SSE 帧按 UTF-8 传输：事件里的模型输出若含孤立代理项，
+                    # json.dumps(ensure_ascii=False) 之后编码即抛错、200 流
+                    # 无 error/done 直接中断；发送前统一转义
+                    yield (
+                        f"data: {json.dumps(_json_safe_value(event), ensure_ascii=False)}"
+                        "\n\n"
+                    )
                     if event["type"] in ("done", "error"):
                         break
             finally:

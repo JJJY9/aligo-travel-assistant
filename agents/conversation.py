@@ -26,6 +26,7 @@ from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError, UserFacingError
+from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import has_preference_value
 from utils.result_formatter import result_to_markdown
@@ -150,6 +151,10 @@ class ConversationRuntime:
             raise UserFacingError("意图识别结果解析失败，请重试") from exc
         if not isinstance(intention_data, dict):
             raise UserFacingError("意图识别结果格式错误，请重试")
+        # 模型输出可能含孤立代理项（如截断的 emoji 被转义成 \ud800）：事件
+        # 序列化（SSE 帧 UTF-8）、落库（JSON 文件 / PostgreSQL）都会编码
+        # 失败——在进入下游之前统一转义，整轮对话不再因此中断
+        intention_data = sanitize_json(intention_data)
 
         schedule = intention_data.get("agent_schedule")
         if not isinstance(schedule, list):
@@ -196,6 +201,8 @@ class ConversationRuntime:
                 raise UserFacingError("编排结果解析失败，请重试") from exc
             if not isinstance(result_data, dict):
                 raise UserFacingError("编排结果格式错误，请重试")
+            # 同上：先转义孤立代理项，避免事件 / 落库 / 响应序列化失败
+            result_data = sanitize_json(result_data)
 
             agents = [
                 {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
