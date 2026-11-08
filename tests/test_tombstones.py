@@ -148,6 +148,63 @@ def test_unmark_only_removes_own_source(monkeypatch):
     print("✓ 撤销墓碑只删本进程写入的值")
 
 
+def test_client_factory_failure_sets_cooldown(monkeypatch):
+    """获取 Redis 客户端本身失败：按未删除处理，冷却期内不再重试工厂。"""
+    tombstones.reset_failure_cache()
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("client factory down")
+
+    monkeypatch.setattr(storage, "get_shared_redis_client", boom)
+    assert tombstones.is_session_deleted("u1", "s1") is False
+    assert len(calls) == 1
+    assert tombstones.mark_session_deleted("u1", "s1") is False
+    assert len(calls) == 1, "冷却期内不应再次调用客户端工厂"
+    print("✓ 客户端工厂失败进入冷却")
+
+
+def test_mark_failure_sets_cooldown(monkeypatch):
+    """写入失败：返回 False 并进入冷却，后续调用不再触达 Redis。"""
+    client = _FakeRedis(fail=True)
+    _use_client(monkeypatch, client)
+    assert tombstones.mark_session_deleted("u1", "s1") is False
+    assert len(client.set_calls) == 1
+    assert tombstones.mark_session_deleted("u2", "s2") is False
+    assert len(client.set_calls) == 1, "冷却期内不应再调用 Redis"
+    print("✓ 墓碑写入失败进入冷却")
+
+
+def test_unmark_failure_paths(monkeypatch):
+    """撤销墓碑的提前返回与故障回退：不抛异常、故障后冷却生效。"""
+    # Redis 未配置
+    _use_client(monkeypatch, None)
+    assert tombstones.unmark_session_deleted("u1", "s1", source="cli") is False
+    # 键不存在
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    assert tombstones.unmark_session_deleted("u1", "s1", source="cli") is False
+    assert not client.values
+    # Redis 故障：返回 False 并进入冷却（写入也不再触达）
+    failing = _FakeRedis(fail=True)
+    _use_client(monkeypatch, failing)
+    assert tombstones.unmark_session_deleted("u1", "s1", source="cli") is False
+    assert tombstones.mark_session_deleted("u2", "s2") is False
+    assert failing.set_calls == [], "冷却期内写入也不应触达 Redis"
+    print("✓ 撤销墓碑的未配置 / 不存在 / 故障路径")
+
+
+def test_unmark_accepts_bytes_value(monkeypatch):
+    """生产 Redis 返回 bytes：撤销时按字节解码后与 source 比较。"""
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    client.values["aligo:deleted:u1:s1"] = "cli".encode()
+    assert tombstones.unmark_session_deleted("u1", "s1", source="cli") is True
+    assert not client.values
+    print("✓ 撤销墓碑兼容 bytes 值")
+
+
 if __name__ == "__main__":
     test_deleted_key_matches_web_contract()
     for case in (
@@ -157,6 +214,10 @@ if __name__ == "__main__":
         test_redis_errors_are_swallowed,
         test_failure_cooldown_skips_redis,
         test_unmark_only_removes_own_source,
+        test_mark_failure_sets_cooldown,
+        test_client_factory_failure_sets_cooldown,
+        test_unmark_failure_paths,
+        test_unmark_accepts_bytes_value,
     ):
         mp = pytest.MonkeyPatch()
         try:
