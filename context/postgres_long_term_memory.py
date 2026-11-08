@@ -12,6 +12,7 @@ import contextlib
 import functools
 import logging
 import re
+import threading
 from collections import Counter
 from collections.abc import Callable
 from datetime import datetime
@@ -140,6 +141,11 @@ class PostgresLongTermMemory:
         # 连接级 statement_timeout（毫秒）：为 None 时沿用服务端默认；自检
         # 探测等最坏场景需要给 DDL / 查询设上限，避免网络半通时无限等待
         self._statement_timeout_ms = statement_timeout_ms
+        # psycopg 连接不是线程安全的：Web 的落库走 asyncio.to_thread，用户锁
+        # 过期 / drain 超时后旧线程可能与新回合同时使用同一实例的连接。
+        # 实例级 RLock 串行化所有数据库操作（含整个事务块），跨实例仍由
+        # advisory lock 保证互斥
+        self._conn_lock = threading.RLock()
         self._conn = self._connect()
         self._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
         # 当前连接持有的会话级 advisory lock（锁名 -> 重入计数）。advisory lock
@@ -230,6 +236,15 @@ class PostgresLongTermMemory:
         确定性数据错误（DataError：文本含 NUL、JSONB 拒绝的 \u0000 等）
         重试不会成功，同样包装为持久化失败，而不是裸 500。
         """
+        lock = getattr(self, "_conn_lock", None)
+        if lock is None:
+            # 部分构造的实例（测试替身）没有初始化锁：惰性补齐
+            lock = threading.RLock()
+            self._conn_lock = lock
+        with lock:
+            return self._run_with_retry_locked(operation, replay_safe)
+
+    def _run_with_retry_locked(self, operation, replay_safe: bool) -> Any:
         import psycopg
 
         def _wrap(exc: Exception) -> None:
