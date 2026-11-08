@@ -141,6 +141,45 @@ def test_build_turn_meta_filters_unexecuted_schedule():
     print("✓ 执行路线过滤未执行 / 重复的调度项")
 
 
+def test_build_turn_meta_tolerates_non_list_sources():
+    """results / agent_schedule 非列表、条目非对象、重复调度项都不抛异常。"""
+    meta = build_turn_meta(
+        {
+            "agent_schedule": [
+                "坏条目",
+                {"agent_name": ""},
+                {"agent_name": "ask-question", "priority": 1},
+                {"agent_name": " ask-question "},
+            ]
+        },
+        {
+            "results": [
+                "坏条目",
+                {"agent_name": "rag_knowledge", "status": "success"},
+            ]
+        },
+    )
+    assert [item["agent_name"] for item in meta["schedule"]] == ["rag_knowledge"], (
+        "重复调度项归一后只保留一条"
+    )
+    assert meta["agents"] == [
+        {"name": "rag_knowledge", "status": "success", "duration": None}
+    ]
+
+    meta = build_turn_meta({"agent_schedule": {"a": 1}}, {"results": 5})
+    assert meta["schedule"] == [] and meta["agents"] == [], (
+        "非列表来源按空处理（真值非可迭代此前会 TypeError）"
+    )
+    print("✓ 非列表 / 非对象来源与重复调度项容错")
+
+
+def test_strip_turn_meta_non_mapping_returns_original():
+    """非对象 JSON / 不含 _meta 的对象：strip 原样返回（旧数据兼容）。"""
+    assert strip_turn_meta("[1, 2]") == "[1, 2]"
+    assert strip_turn_meta('{"reply": "x"}') == '{"reply": "x"}'
+    print("✓ strip_turn_meta 对无元数据内容原样返回")
+
+
 if __name__ == "__main__":
     test_build_and_roundtrip()
     test_markdown_ignores_meta()
@@ -148,4 +187,6 @@ if __name__ == "__main__":
     test_schedule_names_are_canonicalized()
     test_huge_integer_literal_tolerated()
     test_build_turn_meta_filters_unexecuted_schedule()
+    test_build_turn_meta_tolerates_non_list_sources()
+    test_strip_turn_meta_non_mapping_returns_original()
     print("\n全部通过")
