@@ -209,6 +209,8 @@ const els = {
   exportTrips: byId("exportTrips"),
   exportTripsCsv: byId("exportTripsCsv"),
   exportTripsHtml: byId("exportTripsHtml"),
+  tripImport: byId("tripImport"),
+  tripImportFile: byId("tripImportFile"),
   tripStatusFilter: byId("tripStatusFilter"),
   addTripBtn: byId("addTripBtn"),
   expandTrips: byId("expandTrips"),
@@ -1158,6 +1160,42 @@ async function toggleTripsExpanded() {
     toast(error.message);
   } finally {
     els.expandTrips.disabled = false;
+  }
+}
+
+async function importTripsFromFile(file) {
+  if (!file) return;
+  let text;
+  try {
+    text = await file.text();
+  } catch (error) {
+    toast(`读取文件失败：${error.message}`);
+    return;
+  }
+  if (!String(text || "").trim()) {
+    toast("文件为空，没有可导入的行程");
+    return;
+  }
+  try {
+    const result = await getJSON(
+      `/api/trips/import?user_id=${encodeURIComponent(state.userId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: text }),
+      },
+    );
+    const created = Number(result.created || 0);
+    const updated = Number(result.updated || 0);
+    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    toast(
+      `已导入 ${created} 条行程` +
+        (updated ? `，更新 ${updated} 条` : "") +
+        (skipped ? `，跳过 ${skipped} 条` : ""),
+    );
+    await refreshStatus();
+  } catch (error) {
+    toast(`导入行程失败：${error.message}`);
   }
 }
 
@@ -5085,6 +5123,18 @@ function bindEvents() {
     // 可打印 / 分享的报销台账（与 CLI trips-export --html 同一渲染口径）
     exportTripsWithQuery("html", "aligo_trips.html");
   });
+  if (els.tripImport) {
+    els.tripImport.addEventListener("click", () => {
+      if (els.tripImportFile) els.tripImportFile.click();
+    });
+  }
+  if (els.tripImportFile) {
+    els.tripImportFile.addEventListener("change", async () => {
+      const file = els.tripImportFile.files && els.tripImportFile.files[0];
+      els.tripImportFile.value = "";
+      await importTripsFromFile(file);
+    });
+  }
   if (els.kbExport) {
     els.kbExport.addEventListener("click", (event) => {
       event.preventDefault();
