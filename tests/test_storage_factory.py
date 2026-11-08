@@ -1988,6 +1988,72 @@ def test_pg_get_chat_history_excludes_session_in_sql():
     print("✓ PG 会话历史排除 SQL 保留 NULL 会话消息")
 
 
+def test_bulk_save_trips_scales_and_dedupes():
+    """批量保存行程：一次建索引（O(N)）且去重 / 编号 / 统计语义与单条一致。"""
+    import time
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-bulk-trips", storage_dir)
+    rows = [
+        {
+            "origin": "北京",
+            "destination": f"D{index}",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+        for index in range(2000)
+    ]
+    started = time.perf_counter()
+    created, updated = memory.save_trip_histories(rows)
+    elapsed = time.perf_counter() - started
+    assert (created, updated) == (2000, 0)
+    assert elapsed < 2.0, f"批量保存 2000 条耗时 {elapsed:.2f}s，疑似仍是逐条重扫历史"
+    trips = memory.get_trip_history(limit=None)
+    assert len(trips) == 2000
+    assert len({trip["trip_id"] for trip in trips}) == 2000
+    assert memory.get_statistics()["total_trips"] == 2000
+
+    # 同一批再存一次：全部命中既有记录（更新），不新增、不重复计数
+    created, updated = memory.save_trip_histories(rows)
+    assert (created, updated) == (0, 2000)
+    assert len(memory.get_trip_history(limit=None)) == 2000
+
+    # 未提供的目的 / 会话保留原值（与单条保存同一契约）
+    created, updated = memory.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "D0",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+            }
+        ]
+    )
+    assert (created, updated) == (0, 1)
+    kept = next(trip for trip in trips if trip["destination"] == "D0")
+    assert kept["purpose"] == "出差"
+
+    # 还原备份自带 trip_id 时编号水位按实际 id 抬高
+    restored = [
+        {"origin": "上海", "destination": "R1", "start_date": "2026-12-05"}
+    ]
+    restored[0]["trip_id"] = "trip_9001"
+    created, updated = memory.save_trip_histories(restored)
+    assert (created, updated) == (1, 0)
+    assert memory.get_statistics()["last_trip_number"] == 9001
+    added = memory.save_trip_histories(
+        [{"origin": "上海", "destination": "R2", "start_date": "2026-12-06"}]
+    )
+    assert added == (1, 0)
+    newest = memory.get_trip_history(limit=1)[0]
+    assert newest["trip_id"] == "trip_9002"
+
+    reopened = LongTermMemory("u-bulk-trips", storage_dir)
+    assert len(reopened.get_trip_history(limit=None)) == 2002
+    print("✓ 批量行程保存一次建索引（去重 / 编号 / 统计语义一致）")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -2059,4 +2125,5 @@ if __name__ == "__main__":
     test_json_add_chat_turn_guard_sees_concurrent_delete()
     test_json_get_chat_history_excludes_session_before_limit()
     test_pg_get_chat_history_excludes_session_in_sql()
+    test_bulk_save_trips_scales_and_dedupes()
     print("\n全部通过")
