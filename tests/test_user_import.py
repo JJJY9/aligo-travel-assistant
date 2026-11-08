@@ -896,9 +896,14 @@ def test_import_matches_unpadded_stored_trip_dates():
 
 
 def test_parse_rejects_deeply_nested_preference_value():
-    """近递归上限的嵌套偏好值按非法值拒绝，不能以 RecursionError 崩溃 CLI。"""
+    """近递归上限的嵌套偏好值按非法值拒绝，不能以 RecursionError 崩溃 CLI。
+
+    深度取 200：Python 3.10 的 json 编码器在约 1000 层就会自身抛
+    RecursionError（用例本身无法构造 payload）；200 层同样超过合法偏好
+    应支持的层级，足以覆盖「递归解析先于 json 护栏溢出」的路径。
+    """
     value: object = "x"
-    for _ in range(1200):
+    for _ in range(200):
         value = [value]
     payload = {"preferences": {"hotel_brands": value}}
     sections, errors = parse_user_export(json.dumps(payload))
