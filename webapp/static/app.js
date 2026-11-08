@@ -805,8 +805,14 @@ function startEditUserNode(node, originalText) {
 }
 
 function renderHistoryTrace(meta) {
-  const schedule = Array.isArray(meta.schedule) ? meta.schedule : [];
-  const agents = Array.isArray(meta.agents) ? meta.agents : [];
+  // 历史数据可能带非对象条目（旧导入的 null / 数字）：直接取 agent_name
+  // 会 TypeError，让该会话永久打不开
+  const schedule = (Array.isArray(meta.schedule) ? meta.schedule : []).filter(
+    (item) => item && typeof item === "object",
+  );
+  const agents = (Array.isArray(meta.agents) ? meta.agents : []).filter(
+    (agent) => agent && typeof agent === "object",
+  );
   const agentStatuses = new Map();
   const agentDurations = new Map();
   agents.forEach((agent) => {
@@ -885,9 +891,11 @@ function renderAssistantNode(markdown, options = {}) {
   foot.className = "msg-foot";
 
   if (meta) {
-    (Array.isArray(meta.agents) ? meta.agents : []).forEach((agent) => {
-      foot.appendChild(makeBadge(agent.name, agent.status));
-    });
+    (Array.isArray(meta.agents) ? meta.agents : [])
+      .filter((agent) => agent && typeof agent === "object")
+      .forEach((agent) => {
+        foot.appendChild(makeBadge(agent.name, agent.status));
+      });
   }
   foot.appendChild(chipButton("copy", "复制", () => copyText(markdown || "")));
   if (meta) {
@@ -4116,7 +4124,9 @@ async function removeKnowledgeDocument(doc) {
   const docId = Number(typeof doc === "object" && doc ? doc.id : doc);
   const metadata = (typeof doc === "object" && doc && doc.metadata) || {};
   const parts = Number(metadata.parts);
-  const wholeGroup = parts > 1 && Boolean(metadata.group);
+  // 旧版多分片记录只有 parts 没有 group：服务端同样拒绝单条删除，
+  // 必须按整组语义提交（group=1），否则面板永远删不掉这类片段
+  const wholeGroup = parts > 1;
   if (state.kbSaving) {
     toast("正在保存知识片段，请稍候");
     return;
