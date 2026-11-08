@@ -333,10 +333,16 @@ python .claude/skills/ask-question/script/init_knowledge_base.py
 # 使用 requirements.txt 安装所有依赖
 pip install -r requirements.txt
 
-# 或者手动安装核心依赖
+# 或者手动安装核心依赖（Windows 用户注意下方向量数据库的平台差异）
 pip install "setuptools>=69.0.0,<82"  # milvus_lite 依赖
 pip install agentscope==1.0.16        # 多智能体框架
-pip install "pymilvus[milvus_lite]==2.6.9"  # 向量数据库
+# agentscope 1.0.16 的元数据未声明以下隐含依赖（缺失会导致 import 失败）：
+# mcp 必须保持 <2（2.x 移除了 streamablehttp_client），greenlet 供 SQLAlchemy asyncio 使用
+pip install mcp==1.30.0 tqdm==4.70.1 greenlet==3.5.6
+# 向量数据库（macOS / Linux）：milvus-lite 2.x 没有 Windows wheel
+pip install "pymilvus[milvus_lite]==2.6.9"
+# 向量数据库（Windows）：改用 pymilvus 3.x + milvus-lite 3.x（与 requirements.txt 一致）
+pip install "pymilvus==3.0.2" "milvus-lite==3.2.2"
 pip install sentence-transformers==5.2.3    # Embedding模型
 pip install rich==13.9.4                    # CLI界面
 pip install ddgs==9.10.0                    # 网络搜索
@@ -597,7 +603,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
       static_configs:
         - targets: ["127.0.0.1:8000"]
   ```
-- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试；启动时不可达的实例会在 Redis 恢复后通过客户端工厂自动重新接入共享计数（限流降级标志只有在下一次调用成功后才清除，冷却到期不视为恢复）。知识库写入 / 导入 / 导出 / 列表 / 分类统计 / 语义检索 / 整篇回填都会触发嵌入模型推理或整库读取，按客户端 IP 单独限流（默认 **60 次 / 分钟**，`KB_RATE_LIMIT` 调整），与对话额度互不影响，429 同样附带额度头；单 IP 单桶直接原子记录，不会在并发下超发。天气接口每次未命中缓存会向上游发两次请求，也按客户端 IP 单独限流（默认 **30 次 / 分钟**，`WEATHER_RATE_LIMIT` 调整），保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度。部署在反向代理后面时设置 `TRUST_PROXY_HEADERS=1`，限流按 `X-Forwarded-For` 第一个地址计算客户端 IP（默认关闭以防客户端伪造，代理需覆盖写入该头）。
+- 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试；启动时不可达的实例会在 Redis 恢复后通过客户端工厂自动重新接入共享计数（限流降级标志只有在下一次调用成功后才清除，冷却到期不视为恢复）。知识库写入 / 导出 / 列表 / 分类统计 / 语义检索 / 整篇回填都会触发嵌入模型推理或整库读取，按客户端 IP 单独限流（默认 **60 次 / 分钟**，`KB_RATE_LIMIT` 调整），与对话额度互不影响，429 同样附带额度头；知识库导入与导入预览使用独立桶（默认 **1200 次 / 分钟**，`KB_IMPORT_RATE_LIMIT` 调整——面板分批导入需要远高于普通操作的额度）；单 IP 单桶直接原子记录，不会在并发下超发。天气接口每次未命中缓存会向上游发两次请求，也按客户端 IP 单独限流（默认 **30 次 / 分钟**，`WEATHER_RATE_LIMIT` 调整），保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度。部署在反向代理后面时设置 `TRUST_PROXY_HEADERS=1`，限流按 `X-Forwarded-For` 第一个地址计算客户端 IP（默认关闭以防客户端伪造，代理需覆盖写入该头）。
 - 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc` 使用仅对文档页放宽的 CSP（允许 CDN 资源）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`；`/api/` 响应默认带 `Cache-Control: no-store`（用户数据不进入浏览器 / 代理缓存，导出接口保留自身的 `no-cache`）。
 
 **接口**

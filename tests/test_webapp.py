@@ -445,6 +445,43 @@ def test_status_survives_overflowing_elapsed_history():
         _cleanup(user_id)
 
 
+def test_session_updated_at_uses_max_timestamp():
+    """会话 updated_at 取消息最大时间戳：恢复旧备份不会让排序回拨。"""
+    from webapp.server import _group_sessions
+
+    history = [
+        {
+            "session_id": "s1",
+            "role": "user",
+            "content": "一",
+            "timestamp": "2026-11-05T10:00:00",
+        },
+        {
+            "session_id": "s1",
+            "role": "assistant",
+            "content": "二",
+            "timestamp": "2026-11-05T10:01:00",
+        },
+        {
+            "session_id": "s1",
+            "role": "user",
+            "content": "恢复的旧消息",
+            "timestamp": "2026-11-01T09:00:00",
+        },
+        {
+            "session_id": "s2",
+            "role": "user",
+            "content": "另一个会话",
+            "timestamp": "2026-11-04T09:00:00",
+        },
+    ]
+    sessions = _group_sessions(history, 1_000_000)
+    by_id = {item["session_id"]: item for item in sessions}
+    assert by_id["s1"]["updated_at"] == "2026-11-05T10:01:00"
+    assert sessions[0]["session_id"] == "s1", "按最大时间戳倒序排列"
+    print("✓ 会话 updated_at 取最大时间戳（恢复旧备份不回拨排序）")
+
+
 def test_limiter_degraded_uses_probe_for_idle_buckets():
     """健康检查对降级桶走 probe：低频桶不需要再收到请求也能恢复上报。"""
     from webapp.server import _limiter_degraded

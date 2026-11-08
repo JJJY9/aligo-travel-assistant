@@ -915,7 +915,6 @@ if __name__ == "__main__":
     test_parse_accepts_leading_dash_session_ids()
     test_parse_rejects_bad_preference_text()
     test_parse_rejects_non_object_agent_entries()
-    test_parse_truncation_drops_split_knowledge_group()
     test_import_matches_unpadded_stored_trip_dates()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
@@ -929,6 +928,7 @@ if __name__ == "__main__":
         test_runner_knowledge_error_and_skip,
         test_runner_recovers_knowledge_only_backup,
         test_parse_user_export_tolerates_recursion_error,
+        test_parse_truncation_drops_split_knowledge_group,
     ):
         mp = pytest.MonkeyPatch()
         try:
