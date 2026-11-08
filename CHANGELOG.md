@@ -14,6 +14,7 @@
 - 行程台账 HTML 导出：CLI `trips-export --html` 与 `GET /api/trips/export?format=html`（与 CSV / ICS 同一过滤口径，按出发日期倒序、全字段转义、可打印），记忆面板行程区新增「导出台账 HTML」按钮
 - 行程列表状态过滤：CLI `trips --status active|upcoming|past`（接受中文标签）与 `GET /api/trips?status=`，与面板「进行中 / 即将出行 / 已结束」徽标同一口径，可组合关键词过滤
 - 记忆面板行程筛选新增状态维度（全部 / 进行中 / 即将出行 / 已结束）：展开视图交服务端过滤完整历史、收起视图本地同口径过滤，可与关键词组合
+- 健康与指标暴露并发会话容量：`/api/health` 新增 `sessions.cached` / `sessions.max`，`/api/metrics` 新增 `sessions_max`，Prometheus 新增 `aligo_sessions_max`（配合并发会话上限的 503 拒绝，运维可观察当前占用）
 
 ### 变更
 - 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin

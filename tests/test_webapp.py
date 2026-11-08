@@ -82,6 +82,8 @@ def test_health_endpoint():
     assert data["rate_limit"] in {"memory", "redis"}
     assert data["rate_limit_configured"] is False
     assert data["rate_limit_degraded"] is False
+    assert data["sessions"]["cached"] >= 0
+    assert data["sessions"]["max"] == 50, "健康信息要能看到并发会话上限"
     assert data["skills"]["count"] >= 6
     assert data["skills"]["dir_found"] is True
     print("✓ /api/health 返回版本 / 模型 / 存储后端")
@@ -3738,6 +3740,7 @@ def test_metrics_api():
         assert requests["duration_samples"] >= 2
         assert data["circuit_breaker"]["state"] in ("closed", "open", "half_open")
         assert isinstance(data["sessions_cached"], int)
+        assert data["sessions_max"] >= 1
         rate = data["rate_limit"]
         assert rate["backend"] in {"memory", "redis"}
         assert rate["configured"] is False
@@ -3787,6 +3790,7 @@ def test_prometheus_metrics_endpoint():
         assert "aligo_requests_total" in text
         assert "aligo_circuit_breaker_state" in text
         assert "aligo_sessions_cached" in text
+        assert "aligo_sessions_max" in text
         assert "aligo_rate_limit_degraded 0" in text
         assert 'aligo_rate_limit_backend{backend="memory"} 1' in text
         assert 'aligo_storage_backend{short_term="memory",long_term="json"} 1' in text
@@ -3806,6 +3810,7 @@ def test_metrics_values_reflect_sessions_and_breaker():
     client = TestClient(app)
     text = client.get("/metrics").text
     assert f"aligo_sessions_cached {len(state.sessions)}" in text
+    assert f"aligo_sessions_max {state.max_sessions}" in text
     assert "aligo_circuit_breaker_state 0" in text
     assert "aligo_circuit_breaker_failures 0" in text
 
