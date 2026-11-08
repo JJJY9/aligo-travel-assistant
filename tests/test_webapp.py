@@ -7222,11 +7222,172 @@ def test_write_endpoints_reject_unwritable_text():
     finally:
         _cleanup(user)
     print("✓ 实时写接口拒绝 NUL / 孤立代理项")
+def test_read_rate_limit_covers_export_and_detail_endpoints():
+    """行程导出 / 日历 / 会话详情同样计入读接口限流桶。"""
+    from utils.rate_limit import create_rate_limiter
+
+    client = _client()
+    state = client.app.state.aligo
+    state.read_limiter = create_rate_limiter("read", 3, 60, None)
+    user = _unique_user("web_read_more")
+    try:
+        first = client.get("/api/trips/export", params={"user_id": user})
+        assert first.status_code == 200
+        assert first.headers.get("x-ratelimit-limit") == "3"
+        second = client.get("/api/trips/calendar", params={"user_id": user})
+        assert second.status_code == 200
+        assert second.headers.get("x-ratelimit-limit") == "3"
+        third = client.get("/api/sessions/sess-read", params={"user_id": user})
+        assert third.status_code == 200
+        rejected = client.get(
+            "/api/sessions/sess-read/export", params={"user_id": user}
+        )
+        assert rejected.status_code == 429
+        assert rejected.headers.get("retry-after")
+    finally:
+        _cleanup(user)
+    print("✓ 读接口限流覆盖行程导出 / 日历 / 会话详情")
+
+
+def test_import_validation_error_is_trimmed():
+    """手工解析的 422 与全局处理器同口径：input 截断，NaN 不变成 500。"""
+    client = _client()
+    user = _unique_user("web_import_trim")
+    try:
+        big = {"data": "x" * 2_000_000}  # 无 backup 键：校验失败
+        response = client.post("/api/import", params={"user_id": user}, json=big)
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert isinstance(detail, list) and detail
+        assert len(response.content) < 5000, len(response.content)
+        raw = detail[0].get("input", "")
+        assert len(raw) <= 201, len(raw)
+        nan = client.post(
+            "/api/import",
+            params={"user_id": user},
+            content=b'{"backup": NaN}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert nan.status_code == 422, nan.text
+    finally:
+        _cleanup(user)
+    print("✓ /api/import 校验错误截断且 NaN 不 500")
+
+
+def test_import_backpressure_rejects_when_busy(monkeypatch):
+    """导入排队已满时返回 503 背压，不再读入整份请求体。"""
+    import threading as _threading
+
+    client = _client()
+    state = client.app.state.aligo
+    state.import_queue_slots = _threading.BoundedSemaphore(1)
+    assert state.import_queue_slots.acquire(blocking=False)
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": _unique_user("web_import_bp")},
+            json={"backup": {}},
+        )
+        assert response.status_code == 503
+        assert "已有导入任务" in response.json()["detail"]
+    finally:
+        state.import_queue_slots.release()
+    print("✓ 导入排队已满返回 503 背压")
+
+
+def test_import_rechecks_tombstone_before_write(monkeypatch):
+    """排队期间的删除在写库前复查：已删除会话不会被恢复写回。"""
+    client = _client()
+    state = client.app.state.aligo
+    user = _unique_user("web_import_recheck")
+    calls = {"n": 0}
+
+    def fake_deleted(uid, sid):
+        if sid != "s-late":
+            return False
+        calls["n"] += 1
+        return calls["n"] >= 2  # 快照放行，写库前的复查拒绝
+
+    monkeypatch.setattr(state, "is_recently_deleted", fake_deleted)
+    backup = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "迟到删除",
+                "timestamp": "2026-11-01T09:00:00",
+                "session_id": "s-late",
+            },
+            {
+                "role": "user",
+                "content": "正常",
+                "timestamp": "2026-11-01T09:01:00",
+                "session_id": "s-ok",
+            },
+        ]
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert any("排队期间被删除" in item for item in body.get("skipped") or []), body
+        sessions = client.get("/api/sessions", params={"user_id": user}).json()[
+            "sessions"
+        ]
+        ids = [item["session_id"] for item in sessions]
+        assert "s-ok" in ids and "s-late" not in ids, ids
+    finally:
+        _cleanup(user)
+    print("✓ 导入写库前复查墓碑")
+
+
+def test_session_capacity_precheck_skips_construction(monkeypatch):
+    """容量拒绝在构造会话之前判定（不再为注定 503 的请求建数据库连接）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    state.max_sessions = 1
+
+    class _Busy:
+        def in_use(self):
+            return True
+
+        def long_in_use(self, seconds):
+            return False
+
+    state.sessions[state._session_key("u-pre", "s1")] = _Busy()  # type: ignore[assignment]
+
+    def explode(*args, **kwargs):
+        raise AssertionError("容量拒绝前不应构造会话")
+
+    monkeypatch.setattr(server_module, "_WebSession", explode)
+    with pytest.raises(server_module.SessionCapacityError):
+        state.get_session("u-pre", "s2", True)
+    print("✓ 容量拒绝在构造会话之前判定")
 
 
 if __name__ == "__main__":
     test_index_page()
     test_write_endpoints_reject_unwritable_text()
+    test_read_rate_limit_covers_export_and_detail_endpoints()
+    test_import_validation_error_is_trimmed()
+    _mp_import = pytest.MonkeyPatch()
+    try:
+        test_import_backpressure_rejects_when_busy(_mp_import)
+    finally:
+        _mp_import.undo()
+    _mp_import2 = pytest.MonkeyPatch()
+    try:
+        test_import_rechecks_tombstone_before_write(_mp_import2)
+    finally:
+        _mp_import2.undo()
+    _mp_import3 = pytest.MonkeyPatch()
+    try:
+        test_session_capacity_precheck_skips_construction(_mp_import3)
+    finally:
+        _mp_import3.undo()
     test_web_session_persist_guard_tracks_deletions()
     test_route_path_normalization()
     test_knowledge_import_uses_dedicated_limiter(pytest.MonkeyPatch())
