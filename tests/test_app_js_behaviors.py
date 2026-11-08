@@ -110,7 +110,7 @@ def test_knowledge_duplicates_panel_states():
     results = _run_harness("duplicates")
     assert results["empty"] == "没有重复内容的独立知识片段"
     assert results["groups"] == (
-        "重复检查：3 组（共 7 条）：#3、#7（完全相同的内容）；#9（）"
+        "重复检查：3 组（共 7 条）：#3、#7（完全相同的内容）；#9"
         " · 其余 1 组未显示 · 确认后可在列表删除多余片段"
     ), results["groups"]
     assert results["error"] == "重复检查失败：网络抖动"

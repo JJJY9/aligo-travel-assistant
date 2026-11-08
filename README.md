@@ -673,6 +673,7 @@ pytest tests/ -q
 | 范围 | 文件 |
 |------|------|
 | Web API / SSE / 会话 / 导出 / 知识库接口 / 自检 | `test_webapp.py` |
+| 前端行为（Node `node:vm`，无 node 时跳过） | `test_app_js_behaviors.py` + `app_js_harness.js`（会话请求竞态守卫、知识库预览 / 重复检查面板、渲染与转义基线） |
 | 编排调度与记忆更新 | `test_orchestration_unit.py`、`test_orchestration.py` |
 | 存储一致性与回退（JSON / Redis / PostgreSQL） | `test_storage_factory.py`、`test_storage_integration.py`、`test_webapp_postgres.py`、`test_webapp_redis.py`、`test_cli_postgres_integration.py`、`test_long_term_memory_lock.py`（跨进程写锁） |
 | 知识库维护与状态 | `test_knowledge_admin*.py`、`test_knowledge_stats.py` |
