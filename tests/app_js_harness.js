@@ -82,6 +82,7 @@ function makeNode() {
     value: "",
     checked: false,
     disabled: false,
+    hidden: false,
     scrollTop: 0,
     scrollHeight: 0,
     clientHeight: 0,
@@ -479,7 +480,7 @@ async function scenarioDedupe(source) {
     confirm_calls: run("__confirmCalls"),
   };
 
-  // 取消确认：只发 dry-run，不执行删除
+  // 取消确认：只发 dry-run，不执行删除，也不覆盖之前的结果
   run("__confirmResult = false; __confirmCalls = 0;");
   promise = run("runKbDedupe()");
   await tick();
@@ -491,22 +492,24 @@ async function scenarioDedupe(source) {
     confirm_calls: run("__confirmCalls"),
   };
 
-  // 确认执行：dry-run + 删除，部分失败标黄
+  // 确认执行：dry-run + 删除；期间库内变化（计划 2 → 3）+ 跳过 + 失败
   run("__confirmResult = true; __confirmCalls = 0;");
   promise = run("runKbDedupe()");
   await tick();
   env.__requests[2].resolve({ planned: 2, groups: 1, removed: 0, failed: [] });
   await tick();
   env.__requests[3].resolve({
-    planned: 2,
+    planned: 3,
     groups: 1,
     removed: 1,
+    skipped: [{ id: 12, reason: "片段不存在或已被删除" }],
     failed: [{ id: 11, error: "x" }],
   });
   await promise;
   results.applied = {
     text: run("els.kbEvalResult.textContent"),
     warn: run("els.kbEvalResult.classList.contains('warn')"),
+    hidden: run("els.kbEvalResult.hidden"),
     requests: run("__requests.length"),
     button: run("els.kbDedupe.textContent"),
   };
@@ -522,6 +525,41 @@ async function scenarioDedupe(source) {
     disabled: run("els.kbDedupe.disabled"),
   };
   return results;
+}
+
+async function scenarioArbitrate(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+
+  // 评测先发起（慢），随后查重复先返回；评测的迟到响应不能覆盖重复列表
+  const evalPromise = run("runKbEval()");
+  await tick();
+  const duplicatePromise = run("runKbDuplicates()");
+  await tick();
+  env.__requests[1].resolve({
+    total_groups: 1,
+    total_fragments: 2,
+    shown: 1,
+    groups: [{ ids: [3, 7], preview: "重复内容" }],
+  });
+  await duplicatePromise;
+  const afterDuplicates = run("els.kbEvalResult.textContent");
+
+  env.__requests[0].resolve({
+    total: 14,
+    hit1: 0.6,
+    hit3: 0.9,
+    hit5: 1.0,
+    mrr: 0.8,
+    rows: [],
+  });
+  await evalPromise;
+  return {
+    after_duplicates: afterDuplicates,
+    final_text: run("els.kbEvalResult.textContent"),
+    eval_button: run("els.kbEval.textContent"),
+    duplicates_button: run("els.kbDuplicates.textContent"),
+  };
 }
 
 async function main() {
@@ -544,6 +582,8 @@ async function main() {
     payload = await scenarioEval(source);
   } else if (scenario === "dedupe") {
     payload = await scenarioDedupe(source);
+  } else if (scenario === "arbitrate") {
+    payload = await scenarioArbitrate(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

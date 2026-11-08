@@ -268,6 +268,9 @@ let statusRequestId = 0;
 let tripsRequestId = 0;
 let tripFilterTimer = null;
 let searchTimer = null;
+// 知识库工具栏动作（评测 / 查重复 / 清理重复）共用同一结果条：序号仲裁，
+// 只有最新发起的动作可以写入结果，迟到的旧响应不能覆盖新结果
+let kbActionResultSeq = 0;
 let memorySheetOpener = null;
 let shortcutOpener = null;
 
@@ -4045,6 +4048,7 @@ async function runSemanticSearch({ silent = false } = {}) {
 
 async function runKbEval() {
   if (!els.kbEval) return;
+  const seq = (kbActionResultSeq += 1);
   els.kbEval.disabled = true;
   els.kbEval.setAttribute("aria-busy", "true");
   els.kbEval.textContent = "评测中…";
@@ -4071,6 +4075,7 @@ async function runKbEval() {
         .join("、");
       missedText = ` · 未命中 ${missed.length} 个：${shown}${missed.length > 3 ? " 等" : ""}`;
     }
+    if (seq !== kbActionResultSeq) return;
     if (els.kbEvalResult) {
       els.kbEvalResult.textContent =
         `检索评测：${data.total} 个问题 · hit@1 ${pct(data.hit1)}` +
@@ -4082,7 +4087,9 @@ async function runKbEval() {
       els.kbEvalResult.classList.toggle("warn", hit5 < 0.8 || Boolean(warning));
     }
   } catch (error) {
-    if (els.kbEvalResult) els.kbEvalResult.textContent = `评测失败：${error.message}`;
+    if (seq === kbActionResultSeq && els.kbEvalResult) {
+      els.kbEvalResult.textContent = `评测失败：${error.message}`;
+    }
   } finally {
     els.kbEval.disabled = false;
     els.kbEval.removeAttribute("aria-busy");
@@ -4092,6 +4099,7 @@ async function runKbEval() {
 
 async function runKbDuplicates() {
   if (!els.kbDuplicates) return;
+  const seq = (kbActionResultSeq += 1);
   els.kbDuplicates.disabled = true;
   els.kbDuplicates.setAttribute("aria-busy", "true");
   els.kbDuplicates.textContent = "检查中…";
@@ -4102,6 +4110,7 @@ async function runKbDuplicates() {
   }
   try {
     const data = await getJSON("/api/knowledge/duplicates?limit=20");
+    if (seq !== kbActionResultSeq) return;
     const groups = Array.isArray(data.groups) ? data.groups : [];
     const totalGroups = Number(data.total_groups || 0);
     if (els.kbEvalResult) {
@@ -4128,7 +4137,7 @@ async function runKbDuplicates() {
       }
     }
   } catch (error) {
-    if (els.kbEvalResult) {
+    if (seq === kbActionResultSeq && els.kbEvalResult) {
       els.kbEvalResult.textContent = `重复检查失败：${error.message}`;
     }
   } finally {
@@ -4140,13 +4149,17 @@ async function runKbDuplicates() {
 
 async function runKbDedupe() {
   if (!els.kbDedupe) return;
+  const seq = (kbActionResultSeq += 1);
   els.kbDedupe.disabled = true;
   els.kbDedupe.setAttribute("aria-busy", "true");
   els.kbDedupe.textContent = "检查中…";
   try {
-    const preview = await getJSON("/api/knowledge/duplicates/cleanup?dry_run=1", {
+    const preview = await getJSON("/api/knowledge/duplicates/cleanup", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dry_run: true }),
     });
+    if (seq !== kbActionResultSeq) return;
     const planned = Number(preview.planned || 0);
     if (!planned) {
       if (els.kbEvalResult) {
@@ -4156,29 +4169,40 @@ async function runKbDedupe() {
       }
       return;
     }
+    // 面板在扫描期间被关闭：不再弹确认，更不能在看不见的界面里执行删除
+    if (!isModalOpen()) return;
     const ok = window.confirm(
       `将删除 ${planned} 条重复片段（${Number(preview.groups || 0)} 组，每组保留最早一条）。继续？`,
     );
-    if (!ok) {
-      if (els.kbEvalResult) els.kbEvalResult.textContent = "已取消清理";
-      return;
-    }
+    if (!ok) return; // 取消不覆盖之前的结果（用户可能正在看重复列表）
     els.kbDedupe.textContent = "清理中…";
-    const result = await getJSON("/api/knowledge/duplicates/cleanup?dry_run=0", {
+    const result = await getJSON("/api/knowledge/duplicates/cleanup", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dry_run: false }),
     });
+    if (seq !== kbActionResultSeq) return;
     const removed = Number(result.removed || 0);
     const failed = Array.isArray(result.failed) ? result.failed : [];
+    const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+    const actualPlanned = Number(result.planned || 0);
+    const drift =
+      actualPlanned !== planned
+        ? `（库内已有变化：计划 ${planned} → ${actualPlanned}）`
+        : "";
     if (els.kbEvalResult) {
+      els.kbEvalResult.hidden = false;
       els.kbEvalResult.classList.toggle("warn", failed.length > 0);
       const failedIds = failed.map((item) => `#${item && item.id}`).join("、");
       els.kbEvalResult.textContent =
         `已清理 ${removed} 条重复片段` +
-        (failed.length ? ` · ${failed.length} 条删除失败：${failedIds}` : "");
+        (skipped.length ? ` · ${skipped.length} 条已跳过（期间已删除或内容变化）` : "") +
+        (failed.length ? ` · ${failed.length} 条删除失败：${failedIds}` : "") +
+        drift;
     }
     await refreshKnowledgeDocuments({ refreshCategories: true });
   } catch (error) {
-    if (els.kbEvalResult) {
+    if (seq === kbActionResultSeq && els.kbEvalResult) {
       els.kbEvalResult.hidden = false;
       els.kbEvalResult.textContent = `清理重复失败：${error.message}`;
     }
