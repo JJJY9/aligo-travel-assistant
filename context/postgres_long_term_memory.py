@@ -187,13 +187,15 @@ class PostgresLongTermMemory:
 
         return self._run_with_retry(run)
 
-    def _fetchone(self, sql: str, params: tuple | None = None):
+    def _fetchone(
+        self, sql: str, params: tuple | None = None, replay_safe: bool = True
+    ):
         def run():
             with self._conn.cursor() as cursor:
                 cursor.execute(sql, params)
                 return cursor.fetchone()
 
-        return self._run_with_retry(run)
+        return self._run_with_retry(run, replay_safe=replay_safe)
 
     def _reconnect(self) -> None:
         """连接失效（数据库重启 / 被服务端终止）时重建连接并确保表结构。"""
@@ -662,6 +664,17 @@ class PostgresLongTermMemory:
             return (str(destination), str(origin or ""), start_key, end_key)
 
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+            # 连接中途重建会换掉同一把 advisory lock 的持有者：快照（索引 /
+            # 编号水位）来自旧连接，期间其它实例可能已写入，继续用过期水位
+            # 会生成重复 trip_id。检测到重建就中止本批（已写入部分按去重更新）。
+            start_conn = self._conn
+
+            def _abort_if_reconnected() -> None:
+                if self._conn is not start_conn:
+                    raise MemoryPersistenceError(
+                        "PostgreSQL 连接在批量保存中被重建，请重试导入"
+                    )
+
             rows = self._fetchall(
                 "SELECT id, trip_id, origin, destination, start_date, end_date "
                 "FROM aligo_trips WHERE user_id = %s ORDER BY id",
@@ -680,6 +693,7 @@ class PostgresLongTermMemory:
                 "SELECT last_number FROM aligo_trip_counters WHERE user_id = %s",
                 (self.user_id,),
             )
+            _abort_if_reconnected()
             if counter is not None:
                 max_number = max(max_number, int(counter[0] or 0))
 
@@ -701,6 +715,7 @@ class PostgresLongTermMemory:
                         "WHERE id = %s",
                         (trip.get("purpose"), trip.get("session_id"), existing_id),
                     )
+                    _abort_if_reconnected()
                     updated += 1
                     continue
                 max_number += 1
@@ -718,11 +733,16 @@ class PostgresLongTermMemory:
                         trip.get("purpose") or "旅游",
                         trip.get("session_id"),
                     ),
+                    # 非幂等写入：连接在提交后丢失时无法区分是否已写入，重放会
+                    # 产生重复行程 / 重复 trip_id，直接按持久化失败上报
+                    replay_safe=False,
                 )
+                _abort_if_reconnected()
                 if key is not None and inserted is not None:
                     index[key] = int(inserted[0])
                 created += 1
             if created:
+                _abort_if_reconnected()
                 self._execute(
                     "INSERT INTO aligo_trip_counters (user_id, last_number) "
                     "VALUES (%s, %s) "
