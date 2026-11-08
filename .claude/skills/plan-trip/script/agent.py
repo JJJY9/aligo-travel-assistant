@@ -14,7 +14,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 # project_root = Path(__file__).parent.parent # Removed old logic
 # sys.path.insert(0, str(project_root))
 
-from utils.json_parser import extract_json_from_async_response, robust_json_parse
+from utils.json_parser import (
+    extract_json_from_async_response,
+    iter_json_objects,
+    last_json_object_with_keys,
+    robust_json_parse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +232,11 @@ class ItineraryPlanningAgent(AgentBase):
             if _starts_with_json_array(text):
                 raise ValueError("行程规划结果顶层是 JSON 数组，不是行程对象")
 
+            # 模型可能先回显 prompt 里的输出示例 / 片段再给正式结果：记录
+            # 顶层对象个数，解析完成后若存在多个对象则改取「最后一个行程
+            # 形状的对象」，避免把示例行程当成本次规划结果
+            multi_objects = list(iter_json_objects(text))
+
             # 解析结果
             result = None
             
@@ -265,6 +275,14 @@ class ItineraryPlanningAgent(AgentBase):
                     "行程规划结果不是 JSON 对象"
                     f"（实际类型：{type(result).__name__}）"
                 )
+
+            if len(multi_objects) > 1:
+                candidate = last_json_object_with_keys(
+                    text,
+                    ("itinerary", "daily_plans", "duration", "schedule", "title"),
+                )
+                if candidate is not None:
+                    result = candidate
 
             # 模型可能省略 SKILL.md 要求的 itinerary 包装、直接返回裸行程
             # 对象：按成功返回会让回答为空、行程也不写长期记忆——补齐包装

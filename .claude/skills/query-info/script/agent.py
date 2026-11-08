@@ -303,8 +303,9 @@ class InformationQueryAgent(AgentBase):
                     return destination
         else:
             # 「北京到上海的天气」：只有前半段确实是城市时才按目的地解释，
-            # 避免「去哪里玩天气」之类的问句被截出假城市
-            hop = re.split(r"到|去|飞往", q, maxsplit=1)
+            # 避免「去哪里玩天气」之类的问句被截出假城市。裸「飞」也算
+            # 目的地连接词（「明天北京飞上海天气」），与「从/自」分支一致
+            hop = re.split(r"到|去|飞往|飞", q, maxsplit=1)
             if len(hop) == 2 and any(city in hop[0] for city in common_cities):
                 destination = _destination_city(hop[1])
                 if destination:

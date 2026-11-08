@@ -15,7 +15,11 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
-from utils.json_parser import extract_first_json_object, extract_json_from_async_response
+from utils.json_parser import (
+    extract_first_json_object,
+    extract_json_from_async_response,
+    last_json_object_with_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +115,15 @@ class PreferenceAgent(AgentBase):
             text = text.removesuffix('```')
             text = text.strip()
 
-            # 提取JSON：扫描第一个完整对象，避免结尾说明 / 示例中的
-            # 花括号被 find/rfind 一起截进来导致合法输出解析失败
-            result = extract_first_json_object(text)
+            # 模型可能先复述【当前已保存的偏好】或输出示例再给正式结果：
+            # 优先取最后一个形如结果（has_preferences / preferences）的
+            # 顶层对象，避免把回显的示例值写进长期记忆
+            result = last_json_object_with_keys(
+                text, ("has_preferences", "preferences")
+            )
+            if result is None:
+                # 回退：扫描第一个完整对象，避免结尾说明中的花括号被误截
+                result = extract_first_json_object(text)
         except Exception as e:
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}
