@@ -638,24 +638,99 @@ class PostgresLongTermMemory:
         return removed
 
     def save_trip_histories(self, trips: list[dict[str, Any]]) -> tuple[int, int]:
-        """批量保存行程（备份恢复）：返回 ``(新增数, 更新数)``。
+        """批量保存行程（备份恢复 / 导入）：返回 ``(新增数, 更新数)``。
 
-        PostgreSQL 单条保存已是一次小事务；批量入口复用单条实现以保持
-        去重 / 计数语义与 JSON 后端一致。整批在同一把 advisory lock 内执行
-        并在锁内统计：批次前后总数差在锁外读取时会被并发写入（另一实例 /
-        不持用户锁的 POST /api/trips）穿插，created 可能超过批次条数、
-        updated 变成负数。
+        逐条调用单条保存时，每条都要按路线查候选、并全量扫描 ``trip_id``
+        生成下一个编号（O(行数 × 历史条数)），整批还持着用户 advisory lock，
+        几千条导入会把并发的行程写入阻塞数秒到数十秒。这里在锁内一次读出
+        历史行程构建「去重键 → 行 id」索引与编号水位，再逐条 UPDATE / INSERT；
+        语义与单条保存一致（未补零日期归一、未提供的目的 / 会话保留原值、
+        编号不复用）。计数直接来自本批操作，不再用锁外总数差推算。
         """
         count = len(trips)
         if not count:
             return 0, 0
+        from utils.trip_import import normalize_identity_date
+
+        def _key(
+            destination: Any, origin: Any, start_date: Any, end_date: Any
+        ) -> tuple[str, str, str, str] | None:
+            if not destination or not start_date:
+                return None
+            start_key = normalize_identity_date(start_date)
+            end_key = normalize_identity_date(end_date) or start_key
+            return (str(destination), str(origin or ""), start_key, end_key)
+
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
-            before_total = int(self.get_statistics().get("total_trips") or 0)
-            for row in trips:
-                self.save_trip_history(row)
-            after_total = int(self.get_statistics().get("total_trips") or 0)
-        created = min(max(0, after_total - before_total), count)
-        return created, count - created
+            rows = self._fetchall(
+                "SELECT id, trip_id, origin, destination, start_date, end_date "
+                "FROM aligo_trips WHERE user_id = %s ORDER BY id",
+                (self.user_id,),
+            )
+            index: dict[tuple[str, str, str, str], int] = {}
+            max_number = 0
+            for row_id, trip_id, origin, destination, start, end in rows:
+                match = re.fullmatch(r"trip_(\d+)", str(trip_id or ""))
+                if match:
+                    max_number = max(max_number, int(match.group(1)))
+                key = _key(destination, origin, start, end)
+                if key is not None:
+                    index.setdefault(key, int(row_id))
+            counter = self._fetchone(
+                "SELECT last_number FROM aligo_trip_counters WHERE user_id = %s",
+                (self.user_id,),
+            )
+            if counter is not None:
+                max_number = max(max_number, int(counter[0] or 0))
+
+            created = 0
+            updated = 0
+            for trip in trips:
+                destination = trip.get("destination")
+                start_date = str(trip.get("start_date") or "")
+                origin = trip.get("origin")
+                end_date = trip.get("end_date") or start_date
+                key = _key(destination, origin, start_date, end_date)
+                existing_id = index.get(key) if key is not None else None
+                if existing_id is not None:
+                    # 与单条保存一致：未提供的字段（None）保留原值
+                    self._execute(
+                        "UPDATE aligo_trips SET "
+                        "purpose = COALESCE(%s, purpose), "
+                        "session_id = COALESCE(%s, session_id) "
+                        "WHERE id = %s",
+                        (trip.get("purpose"), trip.get("session_id"), existing_id),
+                    )
+                    updated += 1
+                    continue
+                max_number += 1
+                inserted = self._fetchone(
+                    "INSERT INTO aligo_trips "
+                    "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        self.user_id,
+                        f"trip_{max_number}",
+                        trip.get("origin"),
+                        destination,
+                        trip.get("start_date"),
+                        trip.get("end_date"),
+                        trip.get("purpose") or "旅游",
+                        trip.get("session_id"),
+                    ),
+                )
+                if key is not None and inserted is not None:
+                    index[key] = int(inserted[0])
+                created += 1
+            if created:
+                self._execute(
+                    "INSERT INTO aligo_trip_counters (user_id, last_number) "
+                    "VALUES (%s, %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET last_number = GREATEST("
+                    "aligo_trip_counters.last_number, EXCLUDED.last_number)",
+                    (self.user_id, max_number),
+                )
+        return created, updated
 
     def set_session_titles(self, titles: dict[str, str]) -> int:
         """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""
