@@ -1337,6 +1337,112 @@ def test_trip_panel_accepts_long_fields_from_chat():
         _cleanup(user_id)
 
 
+def test_trips_import_api(monkeypatch):
+    """POST /api/trips/import：CSV / ICS 文本导入、dry-run、错误映射与 JSON body 要求。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def __init__(self, existing=None):
+            self.existing = list(existing or [])
+            self.saved = None
+            self.closed = False
+
+        def get_trip_history(self, limit=None):
+            return list(self.existing)
+
+        def save_trip_histories(self, rows):
+            self.saved = list(rows)
+            return (len(rows), 0)
+
+        def close(self):
+            self.closed = True
+
+    client = _client()
+    user = _unique_user("web_trip_import")
+    csv_text = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        "北京,上海,2026-12-01,2026-12-03,出差\n"
+    )
+    store = _Store()
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    url = f"/api/trips/import?user_id={user}"
+    response = client.post(url, json={"content": csv_text})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["format"] == "csv"
+    assert data["dry_run"] is False
+    assert (data["rows"], data["created"], data["updated"]) == (1, 1, 0)
+    assert store.saved and store.saved[0]["destination"] == "上海"
+    assert store.closed
+
+    # dry-run：按已存在行程模拟更新，不写库
+    store = _Store(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+                "purpose": "出差",
+            }
+        ]
+    )
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    preview = client.post(f"{url}&dry_run=1", json={"content": csv_text})
+    assert preview.status_code == 200
+    preview_data = preview.json()
+    assert preview_data["dry_run"] is True
+    assert (preview_data["created"], preview_data["updated"]) == (0, 1)
+    assert store.saved is None, "dry-run 不能写库"
+
+    # ICS 自动识别
+    ics = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:web-import-api",
+            "SUMMARY:北京 → 广州（出差）",
+            "DTSTART:20261210T090000",
+            "DTEND:20261211T180000",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]
+    )
+    store = _Store()
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    ics_response = client.post(url, json={"content": ics})
+    assert ics_response.status_code == 200
+    assert ics_response.json()["format"] == "ics"
+    assert store.saved and store.saved[0]["destination"] == "广州"
+
+    # 没有可导入项：400 带具体原因
+    store = _Store()
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: store)
+    empty = client.post(url, json={"content": "不是行程"})
+    assert empty.status_code == 400
+    assert "没有可导入的行程" in empty.json()["detail"]
+
+    # 写入失败：503
+    class _Boom(_Store):
+        def save_trip_histories(self, rows):
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id: _Boom()
+    )
+    failed = client.post(url, json={"content": csv_text})
+    assert failed.status_code == 503
+    assert "导入行程失败" in failed.json()["detail"]
+
+    # 表单 POST 不能触发导入（必须是 JSON body）
+    form = client.post(url, data={"content": csv_text})
+    assert form.status_code == 422
+
+    assert 'id="tripImport"' in client.get("/").text, "面板必须提供「导入行程」入口"
+    print("✓ /api/trips/import 文本导入（CSV / dry-run / ICS / 400 / 503 / 422）")
+
+
 def test_trip_update_validation_and_errors(monkeypatch):
     """行程更新的校验与错误映射：400 / 422（多种）/ 404 / 409（冲突与歧义）/ 503。"""
     from webapp import server as server_module

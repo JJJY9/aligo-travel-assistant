@@ -718,6 +718,58 @@ def test_ics_extreme_year_tzid_datetime_skipped():
     print("✓ TZID 极端年份的 ICS 事件按非法事件跳过、其余照常导入")
 
 
+def test_import_trips_from_text_csv_and_ics():
+    """CSV / ICS 文本导入：解析、去重模拟（dry-run）与格式自动识别。"""
+    from utils.trip_import import import_trips_from_text
+
+    csv_text = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        "北京,上海,2026-12-01,2026-12-03,出差\n"
+    )
+    store = _ImportStore()
+    result = import_trips_from_text(store, csv_text)
+    assert result["format"] == "csv"
+    assert (result["rows"], result["created"], result["updated"]) == (1, 1, 0)
+    assert store.saved and store.saved[0]["destination"] == "上海"
+
+    store = _ImportStore()
+    store.trips.append(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        }
+    )
+    dry = import_trips_from_text(store, csv_text, dry_run=True)
+    assert (dry["rows"], dry["created"], dry["updated"]) == (1, 0, 1)
+    assert store.saved == [], "dry-run 不能写库"
+
+    ics = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:web-import-1",
+            "SUMMARY:北京 → 广州（出差）",
+            "DTSTART:20261210T090000",
+            "DTEND:20261211T180000",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]
+    )
+    store = _ImportStore()
+    ics_result = import_trips_from_text(store, ics)
+    assert ics_result["format"] == "ics"
+    assert ics_result["rows"] == 1
+    assert store.saved and store.saved[0]["destination"] == "广州"
+
+    empty = import_trips_from_text(_ImportStore(), "不是行程")
+    assert empty["rows"] == 0 and empty["skipped"]
+    print("✓ 行程文本导入（CSV / dry-run 去重 / ICS 自动识别 / 无可导入项）")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -734,6 +786,7 @@ if __name__ == "__main__":
     test_csv_oversized_field_returns_error_and_keeps_rows()
     test_ics_timed_end_inclusive_except_midnight()
     test_ics_extreme_year_tzid_datetime_skipped()
+    test_import_trips_from_text_csv_and_ics()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()
     for case in (

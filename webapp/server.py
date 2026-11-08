@@ -99,6 +99,7 @@ from utils.trip_export import (
     render_trips_html,
     render_trips_ics,
 )
+from utils.trip_import import import_trips_from_text
 from utils.travel_stats import summarize_travel
 from utils.timestamps import chronological_key
 from utils.turn_meta import extract_turn_meta
@@ -640,6 +641,15 @@ class TripPayload(BaseModel):
         if problem:
             raise ValueError(f"行程字段{problem}")
         return cleaned
+
+
+class TripImportPayload(BaseModel):
+    """从 CSV / iCalendar 文本导入行程（记忆面板文件选择）。
+
+    必须走 JSON body：文本可达 1MB，且跨站表单无法发送 application/json。
+    """
+
+    content: str = Field(min_length=1, max_length=1_000_000)
 
 
 class TripUpdatePayload(BaseModel):
@@ -3692,6 +3702,43 @@ def create_app(model: Any = None) -> FastAPI:
             "created": created,
             "conflicts": conflicts,
         }
+
+    @app.post("/api/trips/import")
+    def import_trips_endpoint(
+        payload: TripImportPayload,
+        request: Request,
+        response: Response,
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+        dry_run: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        """从 CSV / iCalendar 文本导入行程（与 CLI ``trips-import`` 同语义）。"""
+        response.headers.update(_enforce_import_rate_limit(state, request))
+        store = _open_long_term(user_id)
+        try:
+            result = import_trips_from_text(
+                store, payload.content, dry_run=dry_run
+            )
+        except Exception as exc:  # noqa: BLE001 - 读取 / 写入失败统一提示
+            logger.warning("导入行程失败: %s", exc)
+            raise HTTPException(
+                status_code=503, detail=f"导入行程失败：{exc}"
+            ) from exc
+        finally:
+            _close_long_term(store)
+        if not result["rows"]:
+            reasons = "；".join(
+                (
+                    f"第{item['line']}行：{item['reason']}"
+                    if result["format"] == "csv"
+                    else str(item["reason"])
+                )
+                for item in result["skipped"][:5]
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"没有可导入的行程{f'（{reasons}）' if reasons else ''}",
+            )
+        return result
 
     @app.put("/api/trips/{trip_id}")
     def update_trip(

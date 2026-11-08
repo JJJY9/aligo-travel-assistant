@@ -359,3 +359,51 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
     if not rows and not errors:
         return [], [(0, "未找到 VEVENT 事件")]
     return rows, errors
+
+
+def import_trips_from_text(
+    store: Any, text: str, dry_run: bool = False
+) -> dict[str, Any]:
+    """解析 CSV / iCalendar 文本并写入行程（与 CLI ``trips-import`` 同语义）。
+
+    - 内容以 ``BEGIN:VCALENDAR`` 开头（容忍 BOM / 空白）时按 ICS 解析，否则按 CSV；
+    - 重复行程沿用存储层去重（同路线 + 同起止日期更新目的）；
+    - ``dry_run=True`` 只按同一去重键模拟新增 / 更新，不写库。
+
+    Returns:
+        ``{"format": "ics"|"csv", "rows", "created", "updated",
+        "skipped": [{"line", "reason"}]}``；``rows`` 为可导入条数。
+    """
+    normalized = str(text or "").lstrip("﻿ \t\r\n")
+    is_ics = normalized.upper().startswith("BEGIN:VCALENDAR")
+    if is_ics:
+        rows, errors = parse_trips_ics(text)
+    else:
+        rows, errors = parse_trips_csv(text)
+    result: dict[str, Any] = {
+        "dry_run": dry_run,
+        "format": "ics" if is_ics else "csv",
+        "rows": len(rows),
+        "created": 0,
+        "updated": 0,
+        "skipped": [{"line": line, "reason": reason} for line, reason in errors],
+    }
+    if not rows:
+        return result
+    if dry_run:
+        pending = {
+            trip_identity(trip) for trip in store.get_trip_history(limit=None)
+        }
+        created = updated = 0
+        for row in rows:
+            key = trip_identity(row)
+            if key in pending:
+                updated += 1
+            else:
+                created += 1
+                pending.add(key)
+        result["created"], result["updated"] = created, updated
+        return result
+    created, updated = store.save_trip_histories(rows)
+    result["created"], result["updated"] = int(created), int(updated)
+    return result
