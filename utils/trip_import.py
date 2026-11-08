@@ -12,6 +12,7 @@ import io
 import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from utils.trip_export import _needs_quote_guard
 
@@ -156,11 +157,14 @@ _ICS_DT = re.compile(
 )
 
 
-def _ics_local_datetime(value: str) -> "tuple[datetime, bool] | None":
+def _ics_local_datetime(
+    value: str, tzid: str = ""
+) -> "tuple[datetime, bool] | None":
     """解析 DATE / DATE-TIME 属性值，返回 (本机墙钟时间, 是否含时间成分)。
 
-    Z / ±HHMM 的 DATE-TIME 先换算到本机时区再取日期：UTC 23:30 在东八区
-    已是第二天，只截前 8 位日期会把行程整体记错一天。
+    Z / ±HHMM / ``TZID`` 的 DATE-TIME 先换算到本机时区再取日期：UTC 23:30
+    在东八区已是第二天，只截前 8 位日期会把行程整体记错一天；带 TZID 的
+    浮动写法（Outlook）与同一时刻的 UTC 写法（Google）必须得到同一天。
     """
     text = str(value or "").strip()
     match = _ICS_DT.match(text)
@@ -186,11 +190,22 @@ def _ics_local_datetime(value: str) -> "tuple[datetime, bool] | None":
         if tz == "Z":
             offset = timezone.utc
         else:
+            hours = int(tz[1:3])
+            minutes = int(tz[3:5])
+            if hours > 23 or minutes > 59:
+                # RFC 5545 偏移最大 ±23:59：timezone() 对 ≥24 小时直接抛
+                # ValueError，一个坏事件会让整份 ICS 导入崩溃；按浮动时间处理
+                return parsed, has_time
             sign = 1 if tz[0] == "+" else -1
-            offset = timezone(
-                sign * timedelta(hours=int(tz[1:3]), minutes=int(tz[3:5]))
-            )
+            offset = timezone(sign * timedelta(hours=hours, minutes=minutes))
         parsed = parsed.replace(tzinfo=offset).astimezone().replace(tzinfo=None)
+    elif tzid and has_time:
+        try:
+            zone = ZoneInfo(tzid)
+        except (KeyError, ValueError, OSError):
+            # 未安装的时区库 / 非法 TZID：按浮动时间处理（不中断整份导入）
+            return parsed, has_time
+        parsed = parsed.replace(tzinfo=zone).astimezone().replace(tzinfo=None)
     return parsed, has_time
 
 
@@ -206,14 +221,18 @@ _ICS_SUMMARY = re.compile(
 
 def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
     """把一个 VEVENT 的属性映射为行程行；无法使用时返回 (None, 原因)。"""
-    start_parsed = _ics_local_datetime(props.get("DTSTART", ""))
+    start_parsed = _ics_local_datetime(
+        props.get("DTSTART", ""), props.get("DTSTART_TZID", "")
+    )
     if start_parsed is None:
         return None, "缺少或非法的 DTSTART"
     start_dt, _start_has_time = start_parsed
     start_day = start_dt.date()
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = ""
-    end_parsed = _ics_local_datetime(props.get("DTEND", ""))
+    end_parsed = _ics_local_datetime(
+        props.get("DTEND", ""), props.get("DTEND_TZID", "")
+    )
     if end_parsed is not None:
         end_dt, end_has_time = end_parsed
         if end_dt >= start_dt:
@@ -286,10 +305,19 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
             continue
         if not in_event or ":" not in line:
             continue
-        name = line.partition(":")[0].split(";", 1)[0].strip().upper()
+        left, _, raw_value = line.partition(":")
+        params = left.split(";")
+        name = params[0].strip().upper()
         if name in {"DTSTART", "DTEND", "SUMMARY", "DESCRIPTION"}:
             # VALARM 里也有 DESCRIPTION：setdefault 保留事件级（先出现）的值
-            props.setdefault(name, line.partition(":")[2].strip())
+            props.setdefault(name, raw_value.strip())
+            if name in {"DTSTART", "DTEND"}:
+                # 属性参数里的 TZID 决定 DATE-TIME 的时区（Outlook 导出
+                # 常见）；丢弃它会把同一时刻记成不同的日期
+                for param in params[1:]:
+                    key, _, param_value = param.partition("=")
+                    if key.strip().upper() == "TZID":
+                        props.setdefault(f"{name}_TZID", param_value.strip())
     if not rows and not errors:
         return [], [(0, "未找到 VEVENT 事件")]
     return rows, errors

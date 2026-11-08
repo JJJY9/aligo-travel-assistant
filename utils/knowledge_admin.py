@@ -935,7 +935,16 @@ def import_documents(
             document_groups.append(restored_group)
 
         unique: list[dict[str, Any]] = []
-        for doc_chunks, doc_group in zip(document_chunks, document_groups):
+        for doc_chunks, restored_group in zip(document_chunks, document_groups):
+            doc_group = restored_group
+            if not doc_group and len(doc_chunks) > 1:
+                # 普通导入的多分片文档同样带本次生成的 group：部分分片命中
+                # 内容去重时必须校验布局，否则缺失分片会以「全新 group、
+                # part=2/parts=2」单独入库——一个没有 part 1 的残缺组会让
+                # 之后整份知识备份的导入 / 编辑永远失败
+                doc_group = str(
+                    (doc_chunks[0].get("metadata") or {}).get("group") or ""
+                )
             # existing 存的是 strip 后的内容；分片内容可能带切分残留的
             # 换行，必须同样 strip 后比较，否则重复导入不幂等
             keys = [piece["content"].strip() for piece in doc_chunks]

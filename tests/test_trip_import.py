@@ -331,6 +331,53 @@ def test_ics_unfold_and_lf_only():
     print("✓ ICS 折行展开与 LF-only 文件")
 
 
+def test_ics_invalid_utc_offset_does_not_abort():
+    """偏移超出 ±23:59（timezone() 会 ValueError）按浮动时间处理，不中断导入。"""
+    text = (
+        "BEGIN:VCALENDAR\n"
+        "BEGIN:VEVENT\n"
+        "DTSTART:20261110T090000+9999\n"
+        "SUMMARY:坏偏移事件\n"
+        "END:VEVENT\n"
+        "BEGIN:VEVENT\n"
+        "DTSTART;VALUE=DATE:20261112\n"
+        "SUMMARY:杭州 → 成都（会议）\n"
+        "END:VEVENT\n"
+        "END:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert [row["start_date"] for row in rows] == ["2026-11-10", "2026-11-12"]
+    print("✓ ICS 非法 UTC 偏移不再中断整份导入")
+
+
+def test_ics_tzid_parameter_matches_utc_representation():
+    """TZID 参数必须参与换算：Outlook 写法与同一时刻的 UTC 写法同一天。"""
+    template = (
+        "BEGIN:VCALENDAR\nBEGIN:VEVENT\n{line}\n"
+        "SUMMARY:北京 → 上海（出差）\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+    utc_rows, utc_errors = parse_trips_ics(
+        template.format(line="DTSTART:20261111T043000Z")
+    )
+    tz_rows, tz_errors = parse_trips_ics(
+        template.format(line="DTSTART;TZID=America/New_York:20261110T233000")
+    )
+    assert utc_errors == [] and tz_errors == []
+    assert tz_rows[0]["start_date"] == utc_rows[0]["start_date"], (
+        "同一时刻的 TZID 写法与 UTC 写法必须换算到同一天"
+    )
+
+    # 未知 TZID 按浮动时间处理，不中断解析
+    bad_rows, bad_errors = parse_trips_ics(
+        template.format(line="DTSTART;TZID=Not/AZone:20261110T233000")
+    )
+    assert bad_errors == []
+    assert bad_rows[0]["start_date"] == "2026-11-10"
+    print("✓ ICS TZID 参数参与时区换算")
+
+
 def test_ics_collects_invalid_events():
     text = (
         "BEGIN:VCALENDAR\nVERSION:2.0\n"
@@ -592,6 +639,8 @@ if __name__ == "__main__":
     test_ics_external_summary_fallback()
     test_ics_empty_origin_roundtrip()
     test_ics_datetime_offset_converts_local_date()
+    test_ics_invalid_utc_offset_does_not_abort()
+    test_ics_tzid_parameter_matches_utc_representation()
     test_ics_timed_end_inclusive_except_midnight()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()

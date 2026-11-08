@@ -637,6 +637,46 @@ def test_runner_knowledge_error_and_skip(monkeypatch):
     assert calls == [], "--skip-knowledge 不得触碰知识库"
     print("✓ 知识片段失败上报 / --skip-knowledge 跳过")
 
+def test_parse_drops_whole_knowledge_group_with_invalid_part():
+    """组内有无效分片时整组丢弃：只删坏分片会让知识恢复因缺片整体失败。"""
+    payload = {
+        "knowledge": [
+            {
+                "content": "第一片",
+                "metadata": {"group": "gX", "part": "1", "parts": "2"},
+            },
+            {
+                "content": "",
+                "metadata": {"group": "gX", "part": "2", "parts": "2"},
+            },
+            {"content": "完整文档", "metadata": {}},
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [item["content"] for item in sections["knowledge"]] == ["完整文档"]
+    assert any("同组含无效分片" in error for error in errors), errors
+    print("✓ knowledge 组内坏分片整组跳过（不拖垮其它文档）")
+
+
+def test_parse_rejects_deep_nested_assistant_content():
+    """`[` 开头的深嵌套 JSON 会在展示 / 摘要路径抛 RecursionError，导入时拒绝。"""
+    deep = "[" * 5000 + "]" * 5000
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "assistant", "content": deep, "session_id": "s1"},
+                    {"role": "user", "content": "正常提问", "session_id": "s1"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert [message["role"] for message in sections["messages"]] == ["user"]
+    assert any("嵌套过深" in error for error in errors), errors
+    print("✓ 深嵌套 assistant 内容在导入时被拒绝")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -650,6 +690,8 @@ if __name__ == "__main__":
     test_parse_limits_preferences()
     test_bulk_storage_helpers()
     test_parse_knowledge_section_wrong_type()
+    test_parse_drops_whole_knowledge_group_with_invalid_part()
+    test_parse_rejects_deep_nested_assistant_content()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (

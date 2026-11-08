@@ -182,6 +182,26 @@ def test_render_trips_html():
     print("✓ HTML 台账渲染（转义 / 排序 / 空数据）")
 
 
+def test_many_leading_quotes_do_not_recurse():
+    """上千个前导单引号不能触发 RecursionError（导入 / 导出共用该判定）。"""
+    from utils.trip_import import parse_trips_csv
+
+    tricky = "'" * 1200 + "=1+1"
+    text = render_trips_csv(
+        [
+            {
+                "origin": "北京",
+                "destination": tricky,
+                "start_date": "2026-01-01",
+            }
+        ]
+    )
+    rows, errors = parse_trips_csv(text)
+    assert errors == []
+    assert rows[0]["destination"] == tricky, "往返必须保真"
+    print("✓ 超多前导单引号不再递归溢出")
+
+
 if __name__ == "__main__":
     test_header_and_rows()
     test_formula_prefix_neutralized()
@@ -192,4 +212,5 @@ if __name__ == "__main__":
     test_csv_uses_single_line_endings()
     test_ics_lines_folded_at_75_bytes()
     test_render_trips_html()
+    test_many_leading_quotes_do_not_recurse()
     print("\n全部通过")

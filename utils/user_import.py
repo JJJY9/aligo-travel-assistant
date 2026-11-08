@@ -73,6 +73,40 @@ def _normalize_trip_date(value: str) -> str:
     return f"{match.group(1)}-{month:02d}-{day:02d}"
 
 
+_MAX_JSON_DEPTH = 256
+
+
+def _json_nesting_too_deep(text: str, limit: int = _MAX_JSON_DEPTH) -> bool:
+    """括号/对象嵌套是否超过上限（字符串内的括号不计）。
+
+    深度嵌套内容会让展示 / 摘要路径的 json.loads 抛 RecursionError，而
+    C 扫描器的递归预算随解释器与编译选项而异（同一 5000 层数组在部分
+    3.12 构建上直接解析成功）——按文本深度预检，与解释器无关。
+    合法历史消息的嵌套只有个位数层，256 层上限没有误伤面。
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif char in "]}":
+            depth -= 1
+    return False
+
+
 def _assistant_content_problem(content: str) -> str | None:
     """assistant 消息里的 _meta.usage 若存在则必须是数字字段。
 
@@ -80,10 +114,16 @@ def _assistant_content_problem(content: str) -> str | None:
     且数据持久存在——在导入时拒绝比事后修复便宜。
     """
     text = content.strip()
-    if not text.startswith("{"):
+    if not text.startswith(("{", "[")):
         return None
+    if _json_nesting_too_deep(text):
+        return "消息内容嵌套过深"
     try:
         data = json.loads(text)
+    except RecursionError:
+        # 深度嵌套（如 5000 层数组）会让展示 / 摘要路径的 json.loads 抛
+        # RecursionError，而那些路径只捕获解析错误——落库后每次请求 500
+        return "消息内容嵌套过深"
     except ValueError:
         return None
     if not isinstance(data, dict) or "_meta" not in data:
@@ -255,6 +295,7 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
 
     knowledge: list[dict[str, Any]] = []
     raw_knowledge = data.get("knowledge")
+    invalid_groups: set[str] = set()
     if raw_knowledge is not None and not isinstance(raw_knowledge, list):
         errors.append("knowledge 段不是数组，已忽略")
     elif isinstance(raw_knowledge, list):
@@ -263,11 +304,14 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
                 errors.append(f"跳过第 {index} 个知识片段：不是对象")
                 continue
             content = item.get("content")
-            if not isinstance(content, str) or not content.strip():
-                errors.append(f"跳过第 {index} 个知识片段：内容为空或非法")
-                continue
             metadata = item.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
+            group = str(metadata.get("group") or "")
+            if not isinstance(content, str) or not content.strip():
+                errors.append(f"跳过第 {index} 个知识片段：内容为空或非法")
+                if group:
+                    invalid_groups.add(group)
+                continue
             knowledge.append(
                 {
                     "content": content,
@@ -279,6 +323,21 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             )
         if len(raw_knowledge) > _MAX_KNOWLEDGE:
             errors.append(f"知识片段超过 {_MAX_KNOWLEDGE} 条，多余条目已跳过")
+    if invalid_groups:
+        # 同组的其它分片一并丢弃：只删坏分片会让 import_documents 的分组
+        # 完整性校验看到「缺片」而拒绝整份知识恢复，连无关的合法文档也
+        # 一起导入失败（坏组整组跳过，其余文档照常恢复）
+        remaining = [
+            entry
+            for entry in knowledge
+            if str(entry["metadata"].get("group") or "") not in invalid_groups
+        ]
+        if len(remaining) != len(knowledge):
+            errors.append(
+                f"跳过 {len(knowledge) - len(remaining)} 个知识分片："
+                f"同组含无效分片（{', '.join(sorted(invalid_groups)[:3])}）"
+            )
+        knowledge = remaining
     sections["knowledge"] = knowledge
 
     recoverable = any(
