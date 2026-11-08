@@ -1163,11 +1163,26 @@ async function toggleTripsExpanded() {
   }
 }
 
+async function decodeImportFile(file) {
+  const buffer = await file.arrayBuffer();
+  try {
+    // fatal：非法 UTF-8 直接抛错，避免把 GBK 中文静默解成乱码
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    // Excel 导出的中文 CSV 常见 GBK / GB18030：UTF-8 解不了时按超集回退
+    return new TextDecoder("gb18030").decode(buffer);
+  }
+}
+
 async function importTripsFromFile(file) {
   if (!file) return;
+  if (file.size > 2 * 1024 * 1024) {
+    toast("文件过大（上限 2 MB），请拆分后再导入");
+    return;
+  }
   let text;
   try {
-    text = await file.text();
+    text = await decodeImportFile(file);
   } catch (error) {
     toast(`读取文件失败：${error.message}`);
     return;
