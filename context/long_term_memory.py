@@ -1168,14 +1168,22 @@ class LongTermMemory:
         ``delete_trip`` 删除最早一条：旧版本可能给两条不同行程生成同一个
         trip_id，去重命令要保留组内第一条、删掉后面的副本，用它会把要
         保留的那条删掉、留下后来的重复行。
+
+        只剩一条同 id 行时返回 False（不删除）：两个并发的去重请求
+        （双标签页 / CLI+Web）各自的计划都会执行一次本方法，第二次必须
+        不能把仅剩的保留行删光。
         """
         trips = self.data.get("trip_history", [])
-        for index in range(len(trips) - 1, -1, -1):
-            if str(trips[index].get("trip_id", "")) == str(trip_id):
-                self._drop_trip_row(trips, index)
-                logger.info(f"Deleted duplicate trip history: {trip_id}")
-                return True
-        return False
+        indices = [
+            index
+            for index, trip in enumerate(trips)
+            if str(trip.get("trip_id", "")) == str(trip_id)
+        ]
+        if len(indices) < 2:
+            return False
+        self._drop_trip_row(trips, indices[-1])
+        logger.info(f"Deleted duplicate trip history: {trip_id}")
+        return True
 
     @_locked_mutation
     def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:

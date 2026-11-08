@@ -2932,15 +2932,22 @@ def run_trips_dedupe_standalone(
                     "total_trips": plan["total_trips"],
                     "duplicates": [],
                     "ambiguous_ids": sorted(ambiguous),
-                    "needs_attention": False,
+                    # 没有重复组也可能存在同 id 多行程（歧义）：同样要提醒
+                    "needs_attention": bool(ambiguous),
                     "removed": 0,
                 }
             )
             if not as_json:
+                if ambiguous:
+                    print(
+                        "警告：以下 trip_id 同时属于多条不同行程，"
+                        "无法安全自动删除，请人工处理："
+                        + "、".join(sorted(ambiguous))
+                    )
                 print(
                     f"用户 {user_id}：没有重复行程（共 {plan['total_trips']} 条）"
                 )
-            return 0
+            return 1 if ambiguous else 0
 
         if ambiguous and not as_json:
             print(
@@ -3774,7 +3781,7 @@ def run_session_export_standalone(
 
         text = render_session_html(user_id, session_id, title, messages)
     else:
-        from utils.session_markdown import sanitize_title
+        from utils.session_markdown import sanitize_body, sanitize_title
 
         title = sanitize_title(title)
         lines = [
@@ -3793,7 +3800,9 @@ def run_session_export_standalone(
                 if is_user
                 else render_stored_message(message)
             )
-            lines.extend([f"## {role}", "", content.strip(), ""])
+            lines.extend(
+                [f"## {role}", "", sanitize_body(content.strip()), ""]
+            )
         text = "\n".join(lines)
 
     if to_stdout:
@@ -4525,9 +4534,11 @@ def run_trip_update_standalone(
             if not raw:
                 continue
             parsed = _parse_strict_date(raw)
-            if parsed is None:
+            if parsed is None and key not in mapped:
                 # 存量未补零日期（2026-1-5）：按归一日历解析用于冲突判断，
-                # 不能因历史写法让 --end 被误拒、或仅改目的时 conflicts 恒空
+                # 不能因历史写法让 --end 被误拒、或仅改目的时 conflicts 恒空。
+                # 本次提交的新日期仍严格校验：接受未补零写法会让后续状态 /
+                # 冲突解析失败
                 try:
                     parsed = datetime.strptime(
                         normalize_identity_date(raw), "%Y-%m-%d"

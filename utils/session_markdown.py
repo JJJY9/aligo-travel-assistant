@@ -12,6 +12,12 @@ def sanitize_title(title: str) -> str:
     return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
+def sanitize_body(text: str) -> str:
+    """导出正文的尖括号转义：<script> 等标签不能在允许 HTML 的 Markdown
+    预览器里执行 / 伪造结构（正文里的正常对比符按实体显示，渲染器下不变）。"""
+    return str(text).replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _session_title(
     session_id: str, messages: list[dict[str, Any]], titles: dict[str, str]
 ) -> str:
@@ -101,5 +107,5 @@ def render_all_sessions_markdown(
                 if is_user
                 else render_stored_message(message)
             )
-            lines.extend([f"### {role}", "", content.strip(), ""])
+            lines.extend([f"### {role}", "", sanitize_body(content.strip()), ""])
     return "\n".join(lines), len(sessions)

@@ -11,7 +11,13 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.trip_export import _ics_escape, render_trip_ics, render_trips_csv, render_trips_ics
+from utils.trip_export import (
+    _ics_escape,
+    render_trip_ics,
+    render_trips_csv,
+    render_trips_html,
+    render_trips_ics,
+)
 
 
 def test_header_and_rows():
@@ -202,6 +208,25 @@ def test_many_leading_quotes_do_not_recurse():
     print("✓ 超多前导单引号不再递归溢出")
 
 
+def test_trips_html_normalizes_unpadded_dates():
+    """台账按归一日期倒序、显示补零，与 CSV / ICS 同一口径。"""
+    html = render_trips_html(
+        [
+            {"trip_id": "t1", "destination": "上海", "start_date": "2026-1-5"},
+            {
+                "trip_id": "t2",
+                "destination": "杭州",
+                "start_date": "2026-01-06",
+            },
+        ],
+        "u1",
+    )
+    assert "2026-01-05" in html and "2026-1-5" not in html
+    # 倒序：1-06 的行必须排在 1-05 之前
+    assert html.index("杭州") < html.index("上海")
+    print("✓ 台账日期归一与排序")
+
+
 def test_unpadded_dates_normalized_in_exports():
     """历史未补零日期导出时补零：CSV 回导不被严格校验跳过、ICS 不再丢事件。"""
     trip = {
@@ -238,4 +263,5 @@ if __name__ == "__main__":
     test_render_trips_html()
     test_many_leading_quotes_do_not_recurse()
     test_unpadded_dates_normalized_in_exports()
+    test_trips_html_normalizes_unpadded_dates()
     print("\n全部通过")

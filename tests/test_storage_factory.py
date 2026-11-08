@@ -469,6 +469,32 @@ class _CountingModel:
         }
 
 
+def test_pg_delete_duplicate_trip_keeps_last_copy():
+    """PG delete_duplicate_trip：同 id 行只剩一条时拒绝删除（并发去重安全）。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    executed: list[tuple[str, object]] = []
+
+    def fetch_many(sql, params):
+        return (2,) if "COUNT(*)" in sql else (42,)
+
+    store._fetchone = fetch_many
+    store._execute = lambda sql, params: executed.append((sql, params))
+    assert store.delete_duplicate_trip("trip_9") is True
+    assert executed and executed[-1][1] == ("u1", 42)
+
+    executed.clear()
+    store._fetchone = lambda sql, params: (1,) if "COUNT(*)" in sql else (42,)
+    assert store.delete_duplicate_trip("trip_9") is False
+    assert executed == [], "只剩一条同 id 行时不能再删"
+    print("✓ PostgreSQL delete_duplicate_trip 只剩一条时拒绝删除")
+
+
 def test_pg_delete_trip_deletes_single_row():
     """PostgreSQL 删除行程按主键：历史库重复 trip_id 时不能整批删除。"""
     import contextlib
@@ -1827,6 +1853,53 @@ def test_pg_operations_serialized_across_threads():
     print("✓ PG 同实例操作跨线程串行化")
 
 
+def test_pg_close_waits_for_inflight_operation():
+    """close() 与数据库操作共用实例锁：不能关闭仍在执行的连接。"""
+    import threading
+    import time
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory._retry_errors = ()
+    active: list[int] = []
+    overlapped: list[int] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def execute(self, sql, params=None):
+            active.append(1)
+            time.sleep(0.05)
+            active.pop()
+
+    class _Conn:
+        closed = False
+
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            if active:
+                overlapped.append(1)
+            self.closed = True
+
+    conn = _Conn()
+    memory._conn = conn
+    worker = threading.Thread(target=lambda: memory._execute("SELECT 1"))
+    worker.start()
+    time.sleep(0.01)
+    memory.close()
+    worker.join()
+    assert overlapped == [], "close 在操作执行中关闭了连接"
+    assert conn.closed is True
+    print("✓ PG close 等待在途操作结束")
+
+
 def test_pg_add_chat_turn_locks_before_guard():
     """add_chat_turn 在同一事务内先锁会话元数据、再调守卫、最后插入。
 
@@ -2396,6 +2469,7 @@ if __name__ == "__main__":
     test_path_locks_do_not_grow_unbounded()
     test_load_holds_path_lock()
     test_pg_delete_trip_deletes_single_row()
+    test_pg_delete_duplicate_trip_keeps_last_copy()
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()
@@ -2432,6 +2506,7 @@ if __name__ == "__main__":
     test_pg_retry_does_not_replay_non_idempotent_write()
     test_pg_non_idempotent_call_sites_disable_replay()
     test_pg_operations_serialized_across_threads()
+    test_pg_close_waits_for_inflight_operation()
     test_pg_add_chat_turn_locks_before_guard()
     test_pg_save_trip_histories_batches_with_one_index()
     test_json_add_chat_turn_guard_runs_under_write_lock()

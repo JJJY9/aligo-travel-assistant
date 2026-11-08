@@ -360,7 +360,7 @@ def test_session_delete_removes_messages(monkeypatch):
 
 
 def test_session_delete_writes_shared_tombstone(monkeypatch):
-    """配置 Redis 时写入与 Web 同键的共享删除墓碑（NX、TTL 300 秒）。"""
+    """配置 Redis 时写入与 Web 同键的共享删除墓碑（NX、TTL 与 Web 一致 1 小时）。"""
     fake = _sessions_store()
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
@@ -377,7 +377,7 @@ def test_session_delete_writes_shared_tombstone(monkeypatch):
     code, out = _run_delete("u1", "s-active", as_json=True)
     assert code == 0
     assert json.loads(out)["shared_tombstone"] is True
-    assert redis.sets == [("aligo:deleted:u1:s-active", "cli", True, 300)]
+    assert redis.sets == [("aligo:deleted:u1:s-active", "cli", True, 3600)]
     print("✓ session-delete 写入共享删除墓碑")
 
 

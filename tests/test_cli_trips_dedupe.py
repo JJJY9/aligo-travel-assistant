@@ -374,6 +374,28 @@ def test_json_output_no_duplicates(monkeypatch):
     }
 
 
+def test_ambiguous_without_duplicate_groups(monkeypatch):
+    """同 id 多行程、但没有任何重复组：不能静默返回 0（需人工处理）。"""
+    import json as _json
+
+    fake = _FakeStore(
+        [_trip("dup", destination="上海"), _trip("dup", destination="杭州")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", dry_run=True, as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 1, out.getvalue()
+    assert payload["ambiguous_ids"] == ["dup"]
+    assert payload["needs_attention"] is True
+    assert payload["duplicates"] == []
+    assert fake.deleted == []
+    print("✓ 无重复组的歧义 id 仍需提醒（退出码 1）")
+
+
 def test_json_output_errors_and_ambiguous(monkeypatch):
     import json as _json
 
@@ -517,7 +539,13 @@ def test_delete_duplicate_trip_json_backend_keeps_earliest(tmp_path):
     stats = store.get_statistics()
     assert stats["total_trips"] == 1
     assert stats["frequent_destinations"] == {"上海": 1}
-    print("✓ JSON delete_duplicate_trip 删除最后一条并同步统计")
+
+    # 只剩一条同 id 行：并发去重的第二次调用不能再删（否则保留行被删光）
+    assert store.delete_duplicate_trip("trip_9") is False
+    assert [item["purpose"] for item in store.get_trip_history(limit=None)] == [
+        "最早"
+    ]
+    print("✓ JSON delete_duplicate_trip 删除最后一条并同步统计（仅剩一条时拒绝）")
 
 
 if __name__ == "__main__":
@@ -540,6 +568,7 @@ if __name__ == "__main__":
         test_json_output_delete_and_dry_run,
         test_json_output_no_duplicates,
         test_json_output_errors_and_ambiguous,
+        test_ambiguous_without_duplicate_groups,
         test_dispatch_json_flag,
         test_same_trip_id_duplicates_keep_earliest_row,
     ):

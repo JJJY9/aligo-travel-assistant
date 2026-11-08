@@ -90,6 +90,33 @@ def test_markdown_chat_history_rendering():
     assert "## 对话历史（2 条）" in md
 
 
+def test_markdown_chat_body_escapes_html_and_backslash_cells():
+    """正文尖括号转义（防 Markdown 预览器执行 HTML）；反斜杠先于竖线转义。"""
+    data = _base_data()
+    data["chat_history"] = [
+        {
+            "role": "user",
+            "content": "<script>alert(1)</script>",
+            "timestamp": "t1",
+        }
+    ]
+    data["trip_history"] = [
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "",
+            "purpose": "a\\|b",
+        }
+    ]
+    md = render_markdown(data)
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in md
+    assert "<script>" not in md
+    assert "a\\\\\\|b" in md, "反斜杠必须先转义，竖线才不会切列"
+    print("✓ 导出正文尖括号转义与反斜杠单元格")
+
+
 def test_export_files_json_is_nan_safe_and_md_written():
     data = _base_data()
     data["preferences"] = {"score": float("nan")}
