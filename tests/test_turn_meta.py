@@ -110,9 +110,22 @@ def test_invalid_content():
     print("✓ 非 JSON / 空内容 / 深嵌套内容安全兜底")
 
 
+def test_huge_integer_literal_tolerated():
+    """超 4300 位整数字面量：json.loads 抛普通 ValueError，不能逃逸为 500。"""
+    from utils.stored_message import render_stored_message
+
+    content = '{"n": ' + "1" * 5000 + "}"
+    assert extract_turn_meta(content) is None
+    assert strip_turn_meta(content) == content
+    message = {"role": "assistant", "content": content}
+    assert render_stored_message(message) == content
+    print("✓ 超长整数字面量按旧文本兜底")
+
+
 if __name__ == "__main__":
     test_build_and_roundtrip()
     test_markdown_ignores_meta()
     test_invalid_content()
     test_schedule_names_are_canonicalized()
+    test_huge_integer_literal_tolerated()
     print("\n全部通过")

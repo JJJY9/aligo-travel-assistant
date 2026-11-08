@@ -26,19 +26,20 @@ class _FakeRedis:
         self.exists_calls = []
 
     def set(self, key, value, nx=False, ex=None):
+        self.set_calls.append((key, value, nx, ex))
         if self.fail:
             raise ConnectionError("redis down")
-        self.set_calls.append((key, value, nx, ex))
         return True
 
     def exists(self, key):
+        self.exists_calls.append(key)
         if self.fail:
             raise ConnectionError("redis down")
-        self.exists_calls.append(key)
         return 1 if self.exists_result else 0
 
 
 def _use_client(monkeypatch, client):
+    tombstones.reset_failure_cache()
     monkeypatch.setattr(storage, "get_shared_redis_client", lambda: client)
 
 
@@ -98,6 +99,27 @@ def test_redis_errors_are_swallowed(monkeypatch):
     print("✓ Redis 故障时保守回退且不抛异常")
 
 
+def test_failure_cooldown_skips_redis(monkeypatch):
+    """操作失败后进入冷却：逐会话的墓碑检查不再各等满 socket 超时。"""
+    client = _FakeRedis(fail=True)
+    _use_client(monkeypatch, client)
+    assert tombstones.is_session_deleted("u1", "s1") is False
+    calls_after_failure = len(client.exists_calls) + len(client.set_calls)
+    assert calls_after_failure == 1, "失败调用本身要记录一次尝试"
+    # 冷却期内不再触达 Redis（黑洞时每会话各一次 1.5s 超时会拖垮恢复）
+    assert tombstones.is_session_deleted("u2", "s2") is False
+    assert tombstones.mark_session_deleted("u2", "s2") is False
+    assert (
+        len(client.exists_calls) + len(client.set_calls) == calls_after_failure
+    ), "冷却期内不应再调用 Redis"
+    # 清空冷却后恢复尝试
+    tombstones.reset_failure_cache()
+    client.fail = False
+    assert tombstones.is_session_deleted("u2", "s2") is False
+    assert len(client.exists_calls) == calls_after_failure + 1
+    print("✓ 墓碑失败冷却与恢复")
+
+
 if __name__ == "__main__":
     test_deleted_key_matches_web_contract()
     for case in (
@@ -105,6 +127,7 @@ if __name__ == "__main__":
         test_is_session_deleted_reads_shared_key,
         test_missing_redis_means_not_deleted,
         test_redis_errors_are_swallowed,
+        test_failure_cooldown_skips_redis,
     ):
         mp = pytest.MonkeyPatch()
         try:

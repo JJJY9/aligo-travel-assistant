@@ -96,6 +96,36 @@ class _AutoDecodeInput:
                 continue
         return raw.decode("utf-8", errors="replace")
 
+    def _try_decode(self, raw: bytes) -> str | None:
+        """严格解码（不做替换）；用来判断字节块末尾是否切断了多字节字符。"""
+        if self._mode == "utf-8-sig":
+            try:
+                return raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return None
+        for candidate in ("utf-8", self._fallback):
+            try:
+                return raw.decode(candidate)
+            except UnicodeDecodeError:
+                continue
+        return None
+
+    def _read_sized(self, read_all: Any, needed: int) -> bytes:
+        """按字节读至少 needed 个字符；块尾切断多字节字符时补读（最多 4 字节）。
+
+        直接 `read(needed)` 在 GBK / UTF-8 管道上可能切在多字节字符中间，
+        严格解码失败后退回替换字符，会把分块读取变成乱码。
+        """
+        chunk = read_all(needed) or b""
+        extra = 0
+        while chunk and extra < 4 and self._try_decode(chunk) is None:
+            more = read_all(1) or b""
+            if not more:
+                break
+            chunk += more
+            extra += 1
+        return chunk
+
     def close(self) -> None:
         pass
 
@@ -126,11 +156,27 @@ class _AutoDecodeInput:
                 self._utf16_text = ""
                 return line
 
+    def _next_pending_line(self) -> str:
+        """从截断余量里取一行；余量里没有换行时继续从底层补读。
+
+        只把余量整段返回会让 `read(2)` 之后的第一次 `readline()` 一次
+        返回两行（TextIO 契约应按换行拆分）。
+        """
+        pending = self._pending
+        newline = pending.find("\n")
+        if newline >= 0:
+            self._pending = pending[newline + 1 :]
+            return pending[: newline + 1]
+        self._pending = ""
+        if self._mode == "utf-16":
+            return pending + self._next_utf16_line()
+        raw = self._buffer.readline()
+        return pending + (self._decode_line(raw) if raw else "")
+
     def readline(self, size: int | None = -1) -> str:
         self._ensure_mode()
         if self._pending:
-            line = self._pending
-            self._pending = ""
+            line = self._next_pending_line()
         elif self._lines:
             line = self._lines.pop(0)
         elif self._mode == "utf-16":
@@ -179,9 +225,22 @@ class _AutoDecodeInput:
         else:
             read_all = getattr(self._buffer, "read", None)
             if callable(read_all):
-                data = read_all() or b""
-                if data:
-                    parts.append(self._decode_line(data))
+                if unlimited:
+                    data = read_all() or b""
+                    if data:
+                        parts.append(self._decode_line(data))
+                else:
+                    # size 必须传给底层：无参 read() 会阻塞到 EOF，活动管道
+                    # 上分块读取（如 shutil.copyfileobj）会死等。可能要多读
+                    # 几块才能凑够字符数（多字节编码），最终由下方统一截断
+                    needed = target - sum(len(part) for part in parts)
+                    while needed > 0:
+                        chunk = self._read_sized(read_all, needed)
+                        if not chunk:
+                            break
+                        text_chunk = self._decode_line(chunk)
+                        parts.append(text_chunk)
+                        needed -= len(text_chunk)
         text = "".join(parts)
         if size is None or size < 0:
             return text

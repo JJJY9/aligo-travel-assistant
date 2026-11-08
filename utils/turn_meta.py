@@ -87,9 +87,10 @@ def extract_turn_meta(message_content: str) -> dict[str, Any] | None:
     """从已存储的助手消息中取出执行元数据（无则返回 None）。"""
     try:
         data = json.loads(message_content)
-    except (TypeError, json.JSONDecodeError, RecursionError):
-        # 深度嵌套的历史内容（旧数据）会抛 RecursionError：只捕获解析错误
-        # 会让 /api/status 等汇总路径永久 500
+    except (TypeError, ValueError, RecursionError):
+        # 深度嵌套（RecursionError）与超 4300 位整数字面量（普通 ValueError，
+        # 不是 JSONDecodeError）的历史内容也会抛：只捕获解析错误会让
+        # /api/status 等汇总路径永久 500
         return None
     if not isinstance(data, dict):
         return None
@@ -101,9 +102,9 @@ def strip_turn_meta(message_content: str) -> str:
     """去掉助手消息中的元数据，用于 LLM 总结等场景。"""
     try:
         data = json.loads(message_content)
-    except (TypeError, json.JSONDecodeError, RecursionError):
-        # 深度嵌套的历史内容会抛 RecursionError：不兜底会让每轮查询在
-        # 构建总结输入时失败（CLI 直接报错、Web 静默丢历史总结）
+    except (TypeError, ValueError, RecursionError):
+        # 深度嵌套 / 超长整数字面量会让每轮总结构建输入时失败
+        # （CLI 直接报错、Web 静默丢历史总结）
         return message_content
     if not isinstance(data, dict) or META_KEY not in data:
         return message_content

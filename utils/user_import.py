@@ -165,8 +165,14 @@ def _assistant_content_problem(content: str) -> str | None:
         # 深度嵌套（如 5000 层数组）会让展示 / 摘要路径的 json.loads 抛
         # RecursionError，而那些路径只捕获解析错误——落库后每次请求 500
         return "消息内容嵌套过深"
-    except ValueError:
+    except json.JSONDecodeError:
+        # 不是合法 JSON 的普通文本：按旧格式原样保留
         return None
+    except ValueError:
+        # 超 4300 位整数字面量等在解析阶段抛普通 ValueError（不是
+        # JSONDecodeError）：落库后 /api/status、会话查看 / 导出 / 总结
+        # 对该消息永久失败，必须拒绝
+        return "消息内容含超长数字字面量"
     if not isinstance(data, dict) or "_meta" not in data:
         return None
     meta = data.get("_meta")

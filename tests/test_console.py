@@ -133,6 +133,29 @@ def test_read_size_preserves_unread_remainder():
     print("✓ read(size) 保留未读余量（copyfileobj 不丢内容）")
 
 
+def test_read_size_does_not_read_to_eof():
+    """read(size) 必须把 size 传给底层，不能无参读到 EOF（活动管道会死等）。"""
+    from utils.console import _AutoDecodeInput
+
+    class _RecordingBuffer(_PipeBuffer):
+        def __init__(self, payload: bytes):
+            super().__init__(payload)
+            self.read_sizes: list[int] = []
+
+        def read(self, size=-1):
+            self.read_sizes.append(size)
+            return super().read(size)
+
+    buffer = _RecordingBuffer("abcdef\nghij\n".encode("utf-8"))
+    shim = _AutoDecodeInput(buffer, "utf-8")
+    assert shim.read(2) == "ab"
+    assert -1 not in buffer.read_sizes, "read(size) 不能退化成无参读到 EOF"
+    # 截断余量里的多行文本也必须按行拆分（不能一次 readline 返回两行）
+    assert shim.readline() == "cdef\n"
+    assert shim.read() == "ghij\n"
+    print("✓ read(size) 不读到 EOF，readline 按行拆分余量")
+
+
 def test_readline_utf16_lines_and_size():
     """UTF-16 输入的逐行 pop 路径与 size 截断都要覆盖。"""
     from utils.console import _AutoDecodeInput
