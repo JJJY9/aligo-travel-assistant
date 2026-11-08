@@ -440,6 +440,12 @@ def _text_write_problem(value: object, depth: int = 0) -> str | None:
     """
     if depth > 16:
         return "嵌套过深"
+    if isinstance(value, float):
+        # 非有限数写进 JSONB 会被 PostgreSQL 确定性拒绝、JSON 后端写出
+        # 非标准文件：与 PUT /api/preferences 的既有护栏保持一致
+        if not math.isfinite(value):
+            return "包含非有限数（NaN / Infinity）"
+        return None
     if isinstance(value, str):
         if "\x00" in value:
             return "包含 NUL 字符"
@@ -492,15 +498,11 @@ class ChatRequest(BaseModel):
         return value
 
 
-_ShortText = Annotated[str, Field(max_length=500)]
-_FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
-PreferenceValue = (
-    _ShortText
-    | Annotated[list[_ShortText], Field(max_length=50)]
-    | int
-    | _FiniteFloat
-    | bool
-)
+# 偏好值可以是任意 JSON（与 /api/status 回显、备份恢复落库的形状一致）：
+# 历史上导入 / 模型写入过对象、数值列表等，面板未修改直接保存不能 422。
+# 具体约束（文本可写、非有限数、序列化大小上限）在 PreferencePayload 的
+# 校验器里执行。
+_PREFERENCE_VALUE_MAX_JSON = 10000
 
 
 _KnowledgeMetaKey = Annotated[str, Field(max_length=32)]
@@ -564,14 +566,24 @@ class KnowledgeImportPreviewPayload(BaseModel):
 
 class PreferencePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
-    value: PreferenceValue
+    # 任意 JSON：与 /api/status 能回显、备份恢复能落库的形状一致（对象 /
+    # 数值列表 / 长文本），面板对存量值「未修改直接保存」不能 422
+    value: Any
 
     @field_validator("value")
     @classmethod
-    def _value_text_is_writable(cls, value: object) -> object:
+    def _value_is_writable(cls, value: object) -> object:
         problem = _text_write_problem(value)
         if problem:
             raise ValueError(f"偏好值{problem}")
+        try:
+            size = len(json.dumps(value, ensure_ascii=False))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("偏好值不是可序列化的 JSON") from exc
+        if size > _PREFERENCE_VALUE_MAX_JSON:
+            raise ValueError(
+                f"偏好值过大（序列化后超过 {_PREFERENCE_VALUE_MAX_JSON} 字符）"
+            )
         return value
 
 
