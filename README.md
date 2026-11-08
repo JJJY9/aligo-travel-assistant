@@ -637,7 +637,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | PUT | `/api/sessions/{id}/title` | 设置或清除会话自定义标题（空字符串恢复自动标题） |
 | PUT | `/api/sessions/{id}/pin` | 置顶 / 取消置顶会话 |
 | PUT | `/api/sessions/{id}/archive` | 归档 / 恢复会话（归档只从列表隐藏，不删除消息） |
-| GET | `/api/sessions/{id}/export` | 把会话导出为 Markdown 附件 |
+| GET | `/api/sessions/{id}/export` | 把会话导出为附件：默认 Markdown（`format=md`），`format=html` 导出与 CLI `session-export --html` 同口径的独立 HTML（单文件内嵌样式、标题单次转义、可分享 / 打印） |
 | GET | `/api/sessions/export` | 导出全部会话为单个附件（按最近更新排序，含归档会话；默认 Markdown，`format=html` 导出与 CLI `sessions-export --html` 同口径的独立 HTML） |
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | DELETE | `/api/sessions/{id}/last-turn` | 删除最后一轮对话（用户提问 + 助手回答；`expect` 内容不一致时不删除，供编辑后重新发送） |

@@ -82,7 +82,7 @@ from utils.rate_limit import create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
-from utils.session_html import render_all_sessions_html
+from utils.session_html import render_all_sessions_html, render_session_html
 from utils.session_markdown import render_all_sessions_markdown, sanitize_title
 from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
@@ -2970,8 +2970,13 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
+        format: Literal["md", "html"] = Query(default="md"),
     ) -> Response:
-        """把一个会话导出为 Markdown（便于保存或分享行程）。"""
+        """把一个会话导出为 Markdown 或独立 HTML（便于保存或分享行程）。
+
+        ``format=html`` 与 CLI ``session-export --html`` 同一渲染口径
+        （单文件内嵌样式、全部动态文本单次转义，可分享 / 打印）。
+        """
         rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
         try:
@@ -2985,16 +2990,33 @@ def create_app(model: Any = None) -> FastAPI:
         if not messages:
             raise HTTPException(status_code=404, detail="会话不存在或没有消息")
 
-        title = str(titles.get(session_id) or "")
-        if not title:
-            title = "Aligo 对话"
+        raw_title = str(titles.get(session_id) or "")
+        if not raw_title:
+            raw_title = "Aligo 对话"
             for message in messages:
                 if message.get("role") == "user":
-                    title = " ".join(str(message.get("content", "")).split())[:40] or title
+                    raw_title = (
+                        " ".join(str(message.get("content", "")).split())[:40]
+                        or raw_title
+                    )
                     break
+        filename_base = _safe_filename(session_id, "conversation")
+        if format == "html":
+            # 标题传原文：render_session_html 在出口统一转义（预转义会变成
+            # 字面量 &lt;b&gt;，与 CLI session-export --html 同一口径）
+            return Response(
+                content=render_session_html(user_id, session_id, raw_title, messages),
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="aligo_{filename_base}.html"'
+                    ),
+                    **rate_headers,
+                },
+            )
         # 自定义标题允许含换行与尖括号：不折叠会伪造导出的段落结构，
         # 不转义则 <script> 原样落盘（与合集导出、CLI 单会话导出同一口径）
-        title = sanitize_title(title)
+        title = sanitize_title(raw_title)
 
         lines = [
             f"# {title}",
@@ -3014,7 +3036,7 @@ def create_app(model: Any = None) -> FastAPI:
             )
             lines.extend([f"## {role}", "", content.strip(), ""])
 
-        filename = f"aligo_{_safe_filename(session_id, 'conversation')}.md"
+        filename = f"aligo_{filename_base}.md"
         return Response(
             content="\n".join(lines),
             media_type="text/markdown; charset=utf-8",
