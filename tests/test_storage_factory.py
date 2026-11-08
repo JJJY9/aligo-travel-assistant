@@ -1782,6 +1782,51 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     print("✓ PG 非幂等写路径全部禁止自动重放")
 
 
+def test_pg_operations_serialized_across_threads():
+    """同一实例的连接不能被两个线程同时使用（drain 超时后的旧落库线程）。"""
+    import threading
+    import time
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory._retry_errors = ()
+    active: list[int] = []
+    overlaps: list[int] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def execute(self, sql, params=None):
+            active.append(1)
+            if len(active) > 1:
+                overlaps.append(1)
+            time.sleep(0.01)
+            active.pop()
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    memory._conn = _Conn()
+
+    def work():
+        for _ in range(5):
+            memory._execute("SELECT 1")
+
+    threads = [threading.Thread(target=work) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert overlaps == [], "同一连接被并发使用（psycopg 非线程安全）"
+    print("✓ PG 同实例操作跨线程串行化")
+
+
 def test_pg_add_chat_turn_locks_before_guard():
     """add_chat_turn 在同一事务内先锁会话元数据、再调守卫、最后插入。
 
@@ -2386,6 +2431,7 @@ if __name__ == "__main__":
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
     test_pg_retry_does_not_replay_non_idempotent_write()
     test_pg_non_idempotent_call_sites_disable_replay()
+    test_pg_operations_serialized_across_threads()
     test_pg_add_chat_turn_locks_before_guard()
     test_pg_save_trip_histories_batches_with_one_index()
     test_json_add_chat_turn_guard_runs_under_write_lock()
