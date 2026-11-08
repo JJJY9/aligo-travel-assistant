@@ -228,14 +228,22 @@ def _ics_local_datetime(
                 return parsed, has_time
             sign = 1 if tz[0] == "+" else -1
             offset = timezone(sign * timedelta(hours=hours, minutes=minutes))
-        parsed = parsed.replace(tzinfo=offset).astimezone().replace(tzinfo=None)
+        try:
+            parsed = parsed.replace(tzinfo=offset).astimezone().replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            # 极端年份（如 0001-01-01+14:00）换算本机时区越界：按非法
+            # 时间跳过该事件，整份导入不中断
+            return None
     elif tzid and has_time:
         try:
             zone = ZoneInfo(tzid)
         except (KeyError, ValueError, OSError):
             # 未安装的时区库 / 非法 TZID：按浮动时间处理（不中断整份导入）
             return parsed, has_time
-        parsed = parsed.replace(tzinfo=zone).astimezone().replace(tzinfo=None)
+        try:
+            parsed = parsed.replace(tzinfo=zone).astimezone().replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            return None
     return parsed, has_time
 
 

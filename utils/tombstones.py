@@ -97,3 +97,33 @@ def is_session_deleted(user_id: str, session_id: str) -> bool:
         logger.warning("读取共享删除墓碑失败：%s", exc)
         return False
 
+
+def unmark_session_deleted(
+    user_id: str, session_id: str, source: str = ""
+) -> bool:
+    """撤销本进程写入的墓碑（仅当值等于 ``source`` 时删除）。
+
+    与 :func:`mark_session_deleted` 的 SET NX 配对：删除失败（会话仍存在）
+    时恢复可写，但不撤销其它实例先写的墓碑（它们代表先发生的删除；Web 端
+    的墓碑值是请求 token，CLI 是 "cli"，互不误删）。
+    """
+    global _failure_until
+    client = _shared_client()
+    if client is None:
+        return False
+    key = deleted_key(user_id, session_id)
+    try:
+        current = client.get(key)
+        if current is None:
+            return False
+        if source:
+            value = current.decode() if isinstance(current, bytes) else str(current)
+            if value != source:
+                return False
+        client.delete(key)
+        return True
+    except Exception as exc:  # noqa: BLE001 - 撤销失败只影响可写性一会儿
+        _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
+        logger.warning("撤销共享删除墓碑失败：%s", exc)
+        return False
+

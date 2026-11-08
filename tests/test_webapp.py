@@ -7368,8 +7368,39 @@ def test_session_capacity_precheck_skips_construction(monkeypatch):
     print("✓ 容量拒绝在构造会话之前判定")
 
 
+def test_session_detail_sanitizes_legacy_nan_meta():
+    """旧数据 _meta 里的 NaN 不再让会话详情 500（归一为 null）。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user = _unique_user("web_meta_nan")
+    try:
+        store = create_long_term_memory(user, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "hi", "s-nan")
+            # 直接落库一条含 NaN usage.time 的助手消息（绕过导入校验，
+            # 模拟旧版本 / 手写记忆文件）
+            store.add_chat_message(
+                "assistant",
+                '{"results": [], "_meta": {"usage": {"time": NaN}}}',
+                "s-nan",
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        response = client.get("/api/sessions/s-nan", params={"user_id": user})
+        assert response.status_code == 200, response.text
+        meta = response.json()["messages"][-1]["meta"]
+        assert meta is None or meta.get("usage", {}).get("time") is None
+    finally:
+        _cleanup(user)
+    print("✓ 会话详情对旧数据 NaN _meta 归一")
+
+
 if __name__ == "__main__":
     test_index_page()
+    test_session_detail_sanitizes_legacy_nan_meta()
     test_write_endpoints_reject_unwritable_text()
     test_read_rate_limit_covers_export_and_detail_endpoints()
     test_import_validation_error_is_trimmed()

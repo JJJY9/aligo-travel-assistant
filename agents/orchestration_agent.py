@@ -783,6 +783,11 @@ class OrchestrationAgent(AgentBase):
                             # 长期记忆，此后每次 get_preference 都抛 TypeError
                             continue
                         pref_type = pref_type.strip()
+                        if len(pref_type) > 64 or "/" in pref_type:
+                            # 与 Web / CLI 偏好管理接口同一约束：含 "/" 或
+                            # 超长的键在面板（路径段被拆开）/ CLI 都无法
+                            # 编辑或删除，只能手工改库
+                            continue
                         if not has_preference_value(pref_value):
                             continue
 

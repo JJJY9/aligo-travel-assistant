@@ -24,18 +24,33 @@ class _FakeRedis:
         self.fail = fail
         self.set_calls = []
         self.exists_calls = []
+        self.values: dict[str, str] = {}
 
     def set(self, key, value, nx=False, ex=None):
         self.set_calls.append((key, value, nx, ex))
         if self.fail:
             raise ConnectionError("redis down")
+        if nx and key in self.values:
+            return None
+        self.values[key] = value
         return True
 
     def exists(self, key):
         self.exists_calls.append(key)
         if self.fail:
             raise ConnectionError("redis down")
-        return 1 if self.exists_result else 0
+        return 1 if self.exists_result or key in self.values else 0
+
+    def get(self, key):
+        if self.fail:
+            raise ConnectionError("redis down")
+        return self.values.get(key)
+
+    def delete(self, key):
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.values.pop(key, None)
+        return 1
 
 
 def _use_client(monkeypatch, client):
@@ -120,6 +135,19 @@ def test_failure_cooldown_skips_redis(monkeypatch):
     print("✓ 墓碑失败冷却与恢复")
 
 
+def test_unmark_only_removes_own_source(monkeypatch):
+    """撤销墓碑只删本进程写的值：其它实例（Web token）的墓碑保留。"""
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    client.values["aligo:deleted:u1:s1"] = "web-token"
+    assert tombstones.unmark_session_deleted("u1", "s1", source="cli") is False
+    assert client.values, "他人墓碑不能被撤销"
+    client.values["aligo:deleted:u1:s1"] = "cli"
+    assert tombstones.unmark_session_deleted("u1", "s1", source="cli") is True
+    assert not client.values
+    print("✓ 撤销墓碑只删本进程写入的值")
+
+
 if __name__ == "__main__":
     test_deleted_key_matches_web_contract()
     for case in (
@@ -128,6 +156,7 @@ if __name__ == "__main__":
         test_missing_redis_means_not_deleted,
         test_redis_errors_are_swallowed,
         test_failure_cooldown_skips_redis,
+        test_unmark_only_removes_own_source,
     ):
         mp = pytest.MonkeyPatch()
         try:

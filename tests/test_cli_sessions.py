@@ -391,6 +391,63 @@ def test_session_delete_without_shared_tombstone_hints_refresh(monkeypatch):
     print("✓ session-delete 无共享墓碑时提示刷新")
 
 
+def test_session_delete_marks_tombstone_before_deleting(monkeypatch):
+    """先写共享墓碑再删库：删库与写墓碑之间其它实例的守卫不能漏看。"""
+    fake = _sessions_store()
+    order = []
+    original_delete = fake.delete_chat_session
+
+    def tracked_delete(session_id):
+        order.append("delete")
+        return original_delete(session_id)
+
+    fake.delete_chat_session = tracked_delete
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+
+    from utils import tombstones
+
+    monkeypatch.setattr(
+        tombstones,
+        "mark_session_deleted",
+        lambda uid, sid, **kwargs: (order.append("mark"), True)[1],
+    )
+    code, out = _run_delete("u1", "s-active")
+    assert code == 0
+    assert order == ["mark", "delete"], order
+    print("✓ session-delete 先写墓碑再删库")
+
+
+def test_session_delete_failure_revokes_cli_tombstone(monkeypatch):
+    """删除失败、会话仍在：撤销本进程写的墓碑恢复可写。"""
+    fake = _sessions_store()
+
+    def boom(session_id):
+        raise RuntimeError("db down")
+
+    fake.delete_chat_session = boom
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+
+    from utils import tombstones
+
+    calls = []
+    monkeypatch.setattr(
+        tombstones,
+        "mark_session_deleted",
+        lambda uid, sid, **kwargs: (calls.append("mark"), True)[1],
+    )
+    monkeypatch.setattr(
+        tombstones,
+        "unmark_session_deleted",
+        lambda uid, sid, **kwargs: (calls.append("unmark"), True)[1],
+    )
+    code, out = _run_delete("u1", "s-active")
+    assert code == 1 and "删除会话失败" in out
+    assert calls == ["mark", "unmark"], calls
+    print("✓ 删除失败撤销 CLI 墓碑")
+
+
 def test_session_delete_missing_session(monkeypatch):
     fake = _sessions_store()
     cleared = []

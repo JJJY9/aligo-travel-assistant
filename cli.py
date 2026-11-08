@@ -3360,9 +3360,18 @@ def run_session_delete_standalone(
             return _fail(f"读取会话失败：{exc}")
         if not exists:
             return _fail(f"会话 {session_id} 不存在或没有消息")
+        # 先写共享墓碑再删库（与 Web DELETE 同一顺序）：删库与写墓碑之间
+        # 其它实例的在途落库守卫看不到墓碑，会把已删除的会话写回
+        from utils.tombstones import mark_session_deleted, unmark_session_deleted
+
+        shared_tombstone = mark_session_deleted(user_id, session_id)
         try:
             removed = store.delete_chat_session(session_id)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            if shared_tombstone:
+                # 删除失败、会话仍在：撤销本进程写的墓碑恢复可写
+                # （其它实例先写的墓碑值不是 "cli"，不会被误删）
+                unmark_session_deleted(user_id, session_id, source="cli")
             return _fail(f"删除会话失败：{exc}")
     finally:
         close = getattr(store, "close", None)
@@ -3370,12 +3379,6 @@ def run_session_delete_standalone(
             close()
     # 短期记忆清理失败不阻断：长期记忆已删除，残留由故障重放 / 过期回收兜底
     clear_short_term_session(session_id, user_id)
-    # 共享删除墓碑：配置 REDIS_URL 时其它 Web 实例 / 进程的旧标签页下一次
-    # 请求即 404，不会被进程内缓存把已删除内容写回；未配置 Redis 时不同
-    # 进程之间没有共享通道，提示用户在旧页面刷新
-    from utils.tombstones import mark_session_deleted
-
-    shared_tombstone = mark_session_deleted(user_id, session_id)
     if as_json:
         print(
             json.dumps(
