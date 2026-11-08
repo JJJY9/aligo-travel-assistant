@@ -133,6 +133,12 @@ def _bad_text_in_value(value: Any, depth: int = 0) -> str | None:
     """
     if depth > 64:
         return "嵌套过深"
+    if isinstance(value, float):
+        # 非有限数写进 JSONB 会被 PostgreSQL 确定性拒绝（整份恢复 503），
+        # JSON 后端则落盘成非标准写法；PUT /api/preferences 已拒绝同类值
+        if not math.isfinite(value):
+            return "包含非有限数（NaN / Infinity）"
+        return None
     if isinstance(value, str):
         return _text_problem(value)
     if isinstance(value, (list, tuple)):

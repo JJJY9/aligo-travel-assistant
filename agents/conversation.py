@@ -169,6 +169,7 @@ class ConversationRuntime:
         # 编排智能体从短期记忆读取「用户本轮原话」，编排失败 / 用户停止时
         # 长期记忆里不会留下没有回复的孤儿提问（CLI 同款时序）
         persist_started = False
+        committed: bool | None = None
         try:
             await asyncio.to_thread(self.memory.stage_message, "user", user_input)
             orchestration = await self._call_with_resilience(
@@ -212,7 +213,7 @@ class ConversationRuntime:
             self._pending_persist = pending
             pending.add_done_callback(self._clear_pending_persist)
             persist_started = True
-            await asyncio.shield(pending)
+            committed = await asyncio.shield(pending)
         except BaseException:
             # 编排失败 / 取消：暂存的用户提问必须跟着回滚——保留的话，重试
             # 同一问题会在上下文里出现两条重复提问，而长期记忆里没有对应
@@ -221,6 +222,11 @@ class ConversationRuntime:
             if not persist_started or self._pending_persist is None:
                 await self._rollback_staged_user_message(user_input)
             raise
+        if committed is False:
+            # 存储层在写入锁内判定会话已删除（墓碑否决整轮）：暂存的提问也
+            # 按删除语义回滚，避免墓碑随后被撤销（删除失败）时上下文里留下
+            # 一条永远不会落库、也没有回答的孤立提问
+            await self._rollback_staged_user_message(user_input)
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,

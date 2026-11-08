@@ -174,6 +174,21 @@ def test_failed_orchestration_leaves_no_long_term_user_turn():
     print("✓ 编排失败不落孤儿用户轮（暂存提问回滚，Web 与 CLI 同契约）")
 
 
+def test_persist_veto_rolls_back_staged_question():
+    """落库守卫否决（会话已删除）后暂存提问也回滚，不留孤立提问。"""
+    runtime, memory = _make_runtime()
+
+    def _veto(user_content, assistant_content, should_commit=None):
+        return False
+
+    memory.persist_turn = _veto  # type: ignore[method-assign]
+    result = asyncio.run(runtime.ask("你好"))
+    assert result["reply"]
+    assert memory.rolled_back == ["你好"], "被否决的整轮不能留下孤立提问"
+    assert memory.staged == []
+    print("✓ 落库守卫否决后回滚暂存提问")
+
+
 def test_persist_guard_reaches_memory_write():
     """落库守卫必须原样传给存储层（写入锁内判定会话是否已删除）。"""
 
@@ -344,6 +359,7 @@ if __name__ == "__main__":
         mp.undo()
     test_parse_failure_is_user_facing_error()
     test_persist_guard_reaches_memory_write()
+    test_persist_veto_rolls_back_staged_question()
     test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()
     print("\n全部通过")

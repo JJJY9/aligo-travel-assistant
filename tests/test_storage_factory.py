@@ -601,6 +601,84 @@ def test_migrate_drops_non_object_entries():
     print("✓ 非对象历史记录在迁移时被丢弃")
 
 
+def test_migrate_missing_last_trip_number_is_not_destructive():
+    """缺少 last_trip_number 是正常初始状态：不产生 .migrate-backup 与告警。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-fresh.json"
+    # 新建用户第一轮落盘后的典型形状（没有 last_trip_number）
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "hi", "session_id": "s1"}
+                ],
+                "trip_history": [],
+                "preferences": [],
+                "statistics": {
+                    "total_messages": 1,
+                    "total_queries": 0,
+                    "total_trips": 0,
+                    "frequent_destinations": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-fresh", storage_dir)
+    memory.add_chat_message("user", "again", "s1")
+    assert not (Path(storage_dir) / "u-fresh.json.migrate-backup").exists(), (
+        "正常文件不应触发破坏性迁移备份"
+    )
+    print("✓ 缺失 last_trip_number 不再误报破坏性迁移")
+
+
+def test_migrate_sanitizes_invalid_preferences():
+    """type 非字符串 / 缺 value 的偏好记录在迁移时丢弃（否则整文件被隔离）。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-bad-pref.json"
+    path.write_text(
+        json.dumps(
+            {
+                "preferences": [
+                    {"type": ["hotel_brands"], "value": "汉庭"},
+                    {"type": "home_location"},
+                    {"type": "airlines", "value": "东航"},
+                    {
+                        "type": "preferences",
+                        "value": [{"type": "hotel_brands"}, "x"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-bad-pref", storage_dir)
+    assert memory.get_preference() == {"airlines": "东航"}
+    # 破坏性清洗必须留备份
+    assert (Path(storage_dir) / "u-bad-pref.json.migrate-backup").exists()
+    print("✓ 非法偏好记录在迁移时清洗并备份")
+
+
+def test_pg_data_error_wrapped_as_persistence_failure():
+    """psycopg DataError（NUL 文本等）包装为 MemoryPersistenceError（503 而非 500）。"""
+    import psycopg
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    memory = PostgresLongTermMemory.__new__(PostgresLongTermMemory)
+    memory._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
+
+    def _fail():
+        raise psycopg.DataError(
+            "PostgreSQL text fields cannot contain NUL (0x00) bytes"
+        )
+
+    with pytest.raises(MemoryPersistenceError):
+        memory._run_with_retry(_fail)
+    print("✓ psycopg DataError 包装为持久化失败")
+
+
 def test_pg_reconnects_after_connection_error():
     """连接被服务端终止后自动重连并重试一次。"""
     from context.postgres_long_term_memory import PostgresLongTermMemory

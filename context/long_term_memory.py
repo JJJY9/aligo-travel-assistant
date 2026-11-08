@@ -285,13 +285,18 @@ class LongTermMemory:
         destructive = False
         # 计数器存在但为 null / 字符串 / 布尔时按 0 处理：这类文件是合法
         # JSON，不修复的话每次写入（+= 1）都会抛 TypeError，而且永远不会
-        # 进入损坏备份 / 自愈路径
+        # 进入损坏备份 / 自愈路径。缺失键（新建用户第一轮落盘后缺
+        # last_trip_number）是正常初始状态：静默补 0，不算破坏性修正，
+        # 不能为此把整份正常文件复制成 .migrate-backup
         for counter in (
             "total_messages",
             "total_queries",
             "total_trips",
             "last_trip_number",
         ):
+            if counter not in stats:
+                stats[counter] = 0
+                continue
             value = stats.get(counter)
             if not isinstance(value, int) or isinstance(value, bool):
                 stats[counter] = 0
@@ -337,9 +342,6 @@ class LongTermMemory:
         if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []
             destructive = True
-        if destructive:
-            # 上面是破坏性修正：写回磁盘前保留原始文件副本，丢弃的数据可追溯
-            self._backup_before_migration()
 
         # 2. 迁移旧格式：字典 → 列表
         if isinstance(data.get("preferences"), dict):
@@ -349,24 +351,59 @@ class LongTermMemory:
                 if pref_value is not None:
                     new_prefs.append({"type": pref_type, "value": pref_value})
             data["preferences"] = new_prefs
+            destructive = True
             logger.info(f"Migrated: Converted preferences from dict to list ({len(new_prefs)} items)")
 
-        # 3. 修复嵌套 bug（旧代码产生的错误数据）
+        # 3. 修复嵌套 bug（旧代码产生的错误数据）并清洗非法偏好条目：
+        #    - type 非字符串（旧版本把数组 / 对象写进 type）会让 get_preference
+        #      以不可哈希值作字典键抛 TypeError（状态 / 会话接口永久 503，
+        #      删除接口永远删不掉），必须丢弃
+        #    - 缺 "value" 的条目会让嵌套迁移下标取值抛 KeyError，整份文件
+        #      被误判为损坏并隔离为空数据，必须丢弃
         if isinstance(data.get("preferences"), list):
             fixed_prefs = []
             for pref in data["preferences"]:
-                if isinstance(pref, dict):
-                    # 错误的嵌套：{"type": "preferences", "value": [...]}
-                    if pref.get("type") == "preferences" and isinstance(pref.get("value"), list):
-                        for nested_pref in pref["value"]:
-                            if isinstance(nested_pref, dict) and "type" in nested_pref:
-                                fixed_prefs.append({"type": nested_pref["type"], "value": nested_pref["value"]})
-                        logger.info("Migrated: Fixed nested preferences bug")
-                    else:
-                        fixed_prefs.append(pref)
+                if not isinstance(pref, dict):
+                    logger.warning("丢弃非对象的偏好记录：%r", pref)
+                    destructive = True
+                    continue
+                if not isinstance(pref.get("type"), str):
+                    logger.warning("丢弃 type 非字符串的偏好记录：%r", pref.get("type"))
+                    destructive = True
+                    continue
+                if "value" not in pref:
+                    logger.warning("丢弃缺少 value 的偏好记录：%s", pref.get("type"))
+                    destructive = True
+                    continue
+                # 错误的嵌套：{"type": "preferences", "value": [...]}
+                if pref.get("type") == "preferences" and isinstance(pref.get("value"), list):
+                    for nested_pref in pref["value"]:
+                        if (
+                            isinstance(nested_pref, dict)
+                            and isinstance(nested_pref.get("type"), str)
+                            and "value" in nested_pref
+                        ):
+                            fixed_prefs.append(
+                                {
+                                    "type": nested_pref["type"],
+                                    "value": nested_pref["value"],
+                                }
+                            )
+                        else:
+                            logger.warning(
+                                "丢弃嵌套偏好中的非法条目：%r", nested_pref
+                            )
+                            destructive = True
+                    logger.info("Migrated: Fixed nested preferences bug")
+                else:
+                    fixed_prefs.append(pref)
 
             if fixed_prefs != data["preferences"]:
                 data["preferences"] = fixed_prefs
+
+        if destructive:
+            # 以上是破坏性修正：写回磁盘前保留原始文件副本，丢弃的数据可追溯
+            self._backup_before_migration()
 
         # 迁移结果在下次写入时落盘：读取路径不再无条件重写文件，
         # 避免搜索/状态等只读请求与对话写入互相覆盖。
