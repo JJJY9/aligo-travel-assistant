@@ -471,7 +471,10 @@ function renderMarkdown(text) {
   while (index < lines.length) {
     const line = lines[index];
 
-    const fence = line.match(/^(`{3,})([\w+-]*)\s*$/);
+    // 开围栏允许任意 info string（```c# / ``` python / ```js title="a" 都是
+    // 合法写法）；闭围栏仍只认「纯反引号 + 空白」，否则会先把正文吞进代码块、
+    // 直到下一个 ``` 才「闭合」——开围栏识别过窄时闭合行会被误当成新的开围栏
+    const fence = line.match(/^(`{3,})(.*)$/);
     if (fence) {
       flushParagraph();
       const fenceLength = fence[1].length;
@@ -2928,16 +2931,11 @@ function renderOverview() {
   // 展开视图的筛选已由服务端完成（任意空白分词、词序无关、跨字段）：
   // 这里不能再按整串 includes 二次过滤，否则多词查询会被误判为无匹配
   const filterText = state.tripsExpanded ? state.tripsFilter.trim() : "";
-  // 收起视图只有最近 5 条（/api/status），状态筛选在本地按同一口径过滤；
-  // 展开视图由服务端 ?status= 过滤完整历史
-  const statusValue = state.tripsStatusFilter;
-  const trips =
-    !state.tripsExpanded && statusValue
-      ? allTrips.filter((trip) => {
-          const status = tripStatus(trip);
-          return status && status.cls === statusValue;
-        })
-      : allTrips;
+  // 收起视图只有最近 5 条（/api/status）且筛选控件随收起隐藏：此时不应用
+  // 状态筛选，否则列表被不可见的条件裁剪（还可能空态误报、连「查看全部」
+  // 入口都随条数减少消失，用户无从清除）；展开视图由服务端 ?status= 过滤
+  const statusValue = state.tripsExpanded ? state.tripsStatusFilter : "";
+  const trips = allTrips;
   els.tripFilterRow.hidden = !state.tripsExpanded;
   if (state.tripsExpanded) {
     // 刷新状态时保留筛选框内容与光标位置
@@ -3474,12 +3472,17 @@ function formatPreferenceValue(value) {
 }
 
 function preferenceInputValue(value) {
-  if (Array.isArray(value)) return value.join("、");
+  // 数组项可能是对象：直接 join 会渲染成 "[object Object]"，保存时回写的
+  // 就是一串字面量。与概览显示共用同一格式化（对象项按 JSON 文本展示）
+  if (Array.isArray(value)) return formatPreferenceValue(value);
   if (value !== null && typeof value === "object") return JSON.stringify(value);
   return String(value ?? "");
 }
 
 function preferenceOutputValue(original, text) {
+  // 未做修改（输入框内容与回填一致）时沿用原值：对象 / 对象数组不会被
+  // 字面量化成字符串（从对象变成 JSON 字符串同样是数据损坏）
+  if (text === preferenceInputValue(original)) return original;
   if (Array.isArray(original)) {
     // 与「添加偏好」保持一致：ASCII 逗号同样视为分隔符
     return text
@@ -3781,12 +3784,15 @@ async function refreshKnowledgeCategories() {
   }
 }
 
-async function refreshKnowledgeDocuments() {
+async function refreshKnowledgeDocuments({ refreshCategories = true } = {}) {
   if (!els.kbList) return;
   if (state.kbSemanticMode) {
     // 保持在语义检索模式：删除 / 编辑 / 导入后刷新的是当前语义结果，
     // 而不是悄悄切回关键词列表
     await runSemanticSearch({ silent: true });
+    // 语义结果不随分类筛选变化，但删除 / 编辑 / 导入会改变分类计数：
+    // 之前这里直接 return，分类下拉一直显示旧计数
+    if (refreshCategories) refreshKnowledgeCategories();
     return;
   }
   const seq = ++kbListSeq;
@@ -3796,7 +3802,9 @@ async function refreshKnowledgeDocuments() {
   state.kbTotal = 0;
   // 刷新期间隐藏「加载更多」：否则点击会以 offset=0 请求第一页
   updateKnowledgeMore();
-  refreshKnowledgeCategories();
+  // 分类计数只随库内容变化：关键词搜索的每次防抖刷新都重扫整库会白白
+  // 消耗知识库限流额度（与片段列表共用 60 次/分钟桶）
+  if (refreshCategories) refreshKnowledgeCategories();
   try {
     const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
     if (seq !== kbListSeq) return;
@@ -4124,16 +4132,21 @@ async function removeKnowledgeDocument(doc) {
   const docId = Number(typeof doc === "object" && doc ? doc.id : doc);
   const metadata = (typeof doc === "object" && doc && doc.metadata) || {};
   const parts = Number(metadata.parts);
-  // 旧版多分片记录只有 parts 没有 group：服务端同样拒绝单条删除，
-  // 必须按整组语义提交（group=1），否则面板永远删不掉这类片段
-  const wholeGroup = parts > 1;
+  const group = String(metadata.group || "");
+  // 旧版多分片记录只有 parts 没有 group：服务端单条删除会被拒绝，必须带
+  // group=1 提交，但实际只删除当前这一片（其余分片仍在库里）。界面文案
+  // 不能声称「整组已删除」，否则用户以为清干净了、检索里还有旧内容
+  const groupFlag = parts > 1;
+  const wholeGroup = groupFlag && Boolean(group);
   if (state.kbSaving) {
     toast("正在保存知识片段，请稍候");
     return;
   }
   const label = wholeGroup
     ? `整组分片（#${docId}，共 ${parts} 片）`
-    : `知识片段 #${docId}`;
+    : groupFlag
+      ? `旧版多分片记录中的这一片（#${docId}，共 ${parts} 片，其余分片需逐条删除）`
+      : `知识片段 #${docId}`;
   if (!window.confirm(`删除${label}？`)) return;
   if (state.kbDeleting.has(docId)) return;
   state.kbDeleting.add(docId);
@@ -4145,11 +4158,17 @@ async function removeKnowledgeDocument(doc) {
   let removed = false;
   try {
     await getJSON(
-      `/api/knowledge/documents/${docId}${wholeGroup ? "?group=1" : ""}`,
+      `/api/knowledge/documents/${docId}${groupFlag ? "?group=1" : ""}`,
       { method: "DELETE" },
     );
     removed = true;
-    toast(wholeGroup ? "已删除整组分片" : "知识片段已删除");
+    toast(
+      wholeGroup
+        ? "已删除整组分片"
+        : groupFlag
+          ? "已删除该分片（旧版多分片记录的其余分片仍在，可逐条删除）"
+          : "知识片段已删除",
+    );
   } catch (error) {
     if (error.status === 404) {
       removed = true;
@@ -4194,26 +4213,39 @@ async function startEditKnowledge(doc) {
   let docSize = 0;
   if (parts > 1) {
     // 整组编辑：回填整篇文档（按 part 拼接），保存时服务端整组替换
+    // /group 冷启动可能数百毫秒：记录发起时的输入与占位文案，回填前若
+    // 用户已开始键入就放弃，避免响应到达后静默覆盖刚输入的内容
+    const baseline = els.kbContent.value;
+    const previousPlaceholder = els.kbContent.placeholder;
+    els.kbContent.placeholder = "正在读取整份文档…";
     try {
       const data = await getJSON(
         `/api/knowledge/documents/${encodeURIComponent(doc.id)}/group`,
       );
       // 请求期间用户可能点了另一行的编辑或开始了保存：只认最后一次操作
       if (seq !== state.kbEditSeq || state.kbSaving) return;
+      if (els.kbContent.value !== baseline) {
+        els.kbContent.placeholder = previousPlaceholder;
+        toast("输入内容已变化，已取消整份编辑回填");
+        return;
+      }
       content = String(data.content || "");
       groupParts = Number(data.parts || parts);
       // 上限按文档大小（分片长度之和）判断；回填文本含分片间分隔符，略长
       docSize = Number(data.size || content.length);
     } catch (error) {
       if (seq !== state.kbEditSeq || state.kbSaving) return;
+      els.kbContent.placeholder = previousPlaceholder;
       toast(`读取整份文档失败：${error.message}`);
       return;
     }
     if (!content) {
+      els.kbContent.placeholder = previousPlaceholder;
       toast("整份文档为空，无法编辑");
       return;
     }
     if (docSize > 20000) {
+      els.kbContent.placeholder = previousPlaceholder;
       toast("整份文档超过 20000 字，请拆分后维护");
       return;
     }
@@ -4745,7 +4777,7 @@ function bindEvents() {
     kbSearchTimer = setTimeout(() => {
       exitKbSemanticMode();
       state.kbQuery = els.kbSearch.value.trim();
-      refreshKnowledgeDocuments();
+      refreshKnowledgeDocuments({ refreshCategories: false });
     }, 250);
   });
   els.kbSearch.addEventListener("keydown", (event) => {
@@ -4754,7 +4786,7 @@ function bindEvents() {
       clearTimeout(kbSearchTimer);
       exitKbSemanticMode();
       state.kbQuery = els.kbSearch.value.trim();
-      refreshKnowledgeDocuments();
+      refreshKnowledgeDocuments({ refreshCategories: false });
     }
   });
   els.kbCategoryFilter.addEventListener("change", () => {
