@@ -900,7 +900,7 @@ def test_load_holds_path_lock():
 
 
 def test_summary_not_starved_by_long_current_session():
-    """当前会话很长时，跨会话总结仍应包含其它会话的历史。"""
+    """当前会话超过总结窗口时，跨会话总结仍含其它会话与 NULL 会话历史。"""
     import asyncio
 
     from context.memory_manager import MemoryManager
@@ -910,13 +910,16 @@ def test_summary_not_starved_by_long_current_session():
         "u-starve", "s-current", storage_path=tempfile.mkdtemp(), llm_model=model
     )
     manager.long_term.add_chat_message("user", "较早的其它会话内容", "s-other")
-    for index in range(40):
+    manager.long_term.add_chat_message("user", "无会话归属的旧消息", None)
+    for index in range(60):
         manager.long_term.add_chat_message("user", f"当前会话第 {index} 条", "s-current")
     summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
     assert summary, "长会话不应让跨会话总结为空"
     assert model.calls == 1
     prompt_text = str(model.prompts[0])
     assert "较早的其它会话内容" in prompt_text, "总结提示词必须包含其它会话的历史"
+    assert "无会话归属的旧消息" in prompt_text, "session_id 为空的旧消息仍应进入总结"
+    assert "当前会话第" not in prompt_text, "当前会话的消息不应出现在跨会话总结里"
     print("✓ 长当前会话不会饿死跨会话总结（提示词含其它会话）")
 
 
@@ -1704,6 +1707,287 @@ def test_pg_retry_does_not_replay_non_idempotent_write():
     print("✓ PG 非幂等写入不重放、幂等操作重试")
 
 
+def test_pg_add_chat_turn_locks_before_guard():
+    """add_chat_turn 在同一事务内先锁会话元数据、再调守卫、最后插入。
+
+    锁键必须与 delete_chat_session / _session_meta_guard 一致：
+    「墓碑判定 + 插入」与并发删除串行化，守卫通过后删除不能抢先提交。
+    """
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    events = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+        def executemany(self, sql, rows):
+            events.append(("executemany", str(sql), list(rows)))
+
+    class _Conn:
+        def transaction(self):
+            return contextlib_module.nullcontext()
+
+        def cursor(self):
+            return _Cursor()
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-order"
+    memory._conn = _Conn()
+    memory._retry_errors = ()
+
+    def guard():
+        events.append(("guard",))
+        return True
+
+    assert memory.add_chat_turn("问", "答", "s-lock", should_commit=guard) is True
+    assert events[0][0] == "execute"
+    assert "pg_advisory_xact_lock(hashtext(%s))" in events[0][1]
+    assert events[0][2] == ("aligo:session_meta:u-order",)
+    assert events[1] == ("guard",), "守卫必须在拿到会话锁之后调用"
+    assert events[2][0] == "executemany"
+    rows = events[2][2]
+    assert [row[1] for row in rows] == ["user", "assistant"]
+    assert [row[2] for row in rows] == ["问", "答"]
+
+    # 守卫否决：拿到锁后直接结束，不插入任何消息
+    events.clear()
+    assert (
+        memory.add_chat_turn(
+            "问",
+            "答",
+            "s-lock",
+            should_commit=lambda: (events.append(("guard",)), False)[1],
+        )
+        is False
+    )
+    assert [event[0] for event in events] == ["execute", "guard"]
+    print("✓ PG add_chat_turn 先锁会话元数据、再守卫、再写入")
+
+
+def test_pg_save_trip_histories_locked_and_clamped():
+    """批量保存：统计与写入都在用户锁内，计数钳制在 0..批次条数。"""
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    def build_store(totals):
+        store = object.__new__(PostgresLongTermMemory)
+        store.user_id = "u-trip-lock"
+        state = {"locked": False, "events": []}
+
+        @contextlib_module.contextmanager
+        def fake_lock(name):
+            assert state["locked"] is False, "同一用户锁不应嵌套获取"
+            state["locked"] = True
+            state["events"].append(("lock", name))
+            try:
+                yield
+            finally:
+                state["locked"] = False
+                state["events"].append(("unlock", name))
+
+        store._advisory_lock = fake_lock
+        pending = iter(totals)
+
+        def get_statistics():
+            assert state["locked"] is True, "统计读取必须在锁内"
+            state["events"].append(("stats",))
+            return {"total_trips": next(pending)}
+
+        def save_trip_history(row):
+            assert state["locked"] is True, "行程写入必须在锁内"
+            state["events"].append(("save", row["destination"]))
+
+        store.get_statistics = get_statistics
+        store.save_trip_history = save_trip_history
+        return store, state
+
+    trips = [
+        {"destination": "北京"},
+        {"destination": "上海"},
+        {"destination": "广州"},
+    ]
+    lock_name = "aligo-trip-u-trip-lock"
+    store, state = build_store([0, 2])
+    assert store.save_trip_histories(trips) == (2, 1)
+    assert state["events"] == [
+        ("lock", lock_name),
+        ("stats",),
+        ("save", "北京"),
+        ("save", "上海"),
+        ("save", "广州"),
+        ("stats",),
+        ("unlock", lock_name),
+    ], "统计与整批写入必须在同一把用户锁内、按顺序执行"
+
+    # 锁外并发写入让总数差超过批次条数：created 钳制到批次条数
+    store, _ = build_store([0, 10])
+    assert store.save_trip_histories(trips) == (3, 0)
+    # 锁外并发删除让总数下降：updated 不超过批次条数
+    store, _ = build_store([5, 1])
+    assert store.save_trip_histories(trips) == (0, 3)
+    print("✓ PG save_trip_histories 锁内统计并钳制 created/updated")
+
+
+def test_json_add_chat_turn_guard_runs_under_write_lock():
+    """JSON add_chat_turn 的守卫在 @_locked_mutation 写锁内调用。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-turn-lock", storage_dir)
+    owned = []
+
+    def guard():
+        owned.append(bool(getattr(memory._write_lock, "_is_owned")()))
+        return True
+
+    assert memory.add_chat_turn("问", "答", "s-lock", should_commit=guard) is True
+    assert owned == [True], "守卫与写入必须在同一临界区（含重载）内"
+    reopened = LongTermMemory("u-turn-lock", storage_dir)
+    assert [m["content"] for m in reopened.get_chat_history(session_id="s-lock")] == [
+        "问",
+        "答",
+    ]
+    print("✓ JSON add_chat_turn 守卫在写锁内执行")
+
+
+def test_json_add_chat_turn_guard_sees_concurrent_delete():
+    """两实例并发：删除持锁期间落库阻塞，守卫在锁内看到删除后的历史。"""
+    import threading
+
+    storage_dir = tempfile.mkdtemp()
+    memory_a = LongTermMemory("u-turn-race", storage_dir)
+    assert memory_a.add_chat_turn("旧问", "旧答", "s-race") is True
+    memory_b = LongTermMemory("u-turn-race", storage_dir)
+    # A 的快照里仍有一轮：守卫若在锁外读取会误判为「会话仍存在」
+    assert memory_a.get_chat_history(session_id="s-race"), "A 应持有删除前的快照"
+
+    lock_held = threading.Event()
+    allow_delete = threading.Event()
+    delete_done = threading.Event()
+    worker_started = threading.Event()
+    order: list[str] = []
+    guard_calls: list[bool] = []
+    result: list[bool] = []
+
+    def deleter():
+        with memory_b._write_lock:
+            lock_held.set()
+            assert allow_delete.wait(10)
+            memory_b.delete_chat_session("s-race")
+            order.append("delete")
+        delete_done.set()
+
+    def guard():
+        guard_calls.append(True)
+        order.append("guard")
+        # 会话仍存在（历史非空）才允许写入；读到旧快照会误判为 True
+        return bool(memory_a.get_chat_history(session_id="s-race"))
+
+    def writer():
+        worker_started.set()
+        result.append(
+            memory_a.add_chat_turn("新问", "新答", "s-race", should_commit=guard)
+        )
+
+    delete_thread = threading.Thread(target=deleter)
+    delete_thread.start()
+    assert lock_held.wait(10), "删除线程未能持锁"
+    write_thread = threading.Thread(target=writer)
+    write_thread.start()
+    assert worker_started.wait(10)
+    # 删除线程仍持锁：落库必须阻塞在写锁上，守卫不能被提前调用
+    assert not delete_done.wait(0.5)
+    assert guard_calls == [], "删除持锁期间落库不能进入临界区"
+
+    allow_delete.set()
+    write_thread.join(10)
+    delete_thread.join(10)
+    assert not write_thread.is_alive() and not delete_thread.is_alive()
+    assert guard_calls == [True]
+    assert order == ["delete", "guard"], "守卫必须等删除提交后在锁内执行"
+    assert result == [False], "会话已删除，在途落库必须被否决"
+
+    reopened = LongTermMemory("u-turn-race", storage_dir)
+    assert reopened.get_chat_history(session_id="s-race") == [], "被否决的一轮不能写回"
+    assert reopened.get_statistics()["total_messages"] == 0
+    print("✓ JSON add_chat_turn 与并发删除串行化，守卫看到删除后的历史")
+
+
+def test_json_get_chat_history_excludes_session_before_limit():
+    """JSON get_chat_history：先排除会话再取最近 limit 条（含 NULL 会话旧消息）。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-exclude", storage_dir)
+    memory.add_chat_message("user", "无会话旧消息", None)
+    for index in range(3):
+        memory.add_chat_message("user", f"其它会话 {index}", "s-other")
+    for index in range(60):
+        memory.add_chat_message("user", f"当前会话 {index}", "s-cur")
+
+    window = memory.get_chat_history(limit=10, exclude_session_id="s-cur")
+    assert [m["content"] for m in window] == [
+        "无会话旧消息",
+        "其它会话 0",
+        "其它会话 1",
+        "其它会话 2",
+    ], "limit 必须作用在排除后的集合上，不能先切片再过滤"
+    assert all(m.get("session_id") != "s-cur" for m in window)
+
+    tail = memory.get_chat_history(limit=2, exclude_session_id="s-cur")
+    assert [m["content"] for m in tail] == ["其它会话 1", "其它会话 2"]
+
+    # 同时给出 session_id 与 exclude_session_id：session_id 优先（文档语义）
+    only_cur = memory.get_chat_history(
+        limit=2, session_id="s-cur", exclude_session_id="s-cur"
+    )
+    assert [m["content"] for m in only_cur] == ["当前会话 58", "当前会话 59"]
+    print("✓ JSON 会话历史排除查询与 limit 顺序")
+
+
+def test_pg_get_chat_history_excludes_session_in_sql():
+    """PG get_chat_history：排除用 IS DISTINCT FROM 保留 NULL 会话旧消息。"""
+    from datetime import datetime as datetime_cls
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-excl"
+    calls = []
+
+    def fake_fetchall(sql, params=None):
+        calls.append((" ".join(str(sql).split()), params))
+        return [("assistant", "无会话旧消息", None, datetime_cls(2026, 1, 1, 10, 0, 0))]
+
+    store._fetchall = fake_fetchall
+    history = store.get_chat_history(limit=10, exclude_session_id="s-cur")
+    sql, params = calls[0]
+    assert "session_id IS DISTINCT FROM %s" in sql, "NULL 会话旧消息必须保留（!= 会漏掉）"
+    assert "ORDER BY id DESC LIMIT %s" in sql
+    assert params == ("u-excl", "s-cur", 10)
+    assert history == [
+        {
+            "role": "assistant",
+            "content": "无会话旧消息",
+            "session_id": None,
+            "timestamp": "2026-01-01T10:00:00",
+        }
+    ]
+
+    calls.clear()
+    store.get_chat_history(limit=5, session_id="s-1", exclude_session_id="s-2")
+    sql, params = calls[0]
+    assert "session_id = %s" in sql and "DISTINCT" not in sql
+    assert params == ("u-excl", "s-1", 5), "session_id 优先，排除参数被忽略"
+    print("✓ PG 会话历史排除 SQL 保留 NULL 会话消息")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -1769,4 +2053,10 @@ if __name__ == "__main__":
     test_reload_long_term_respects_backend()
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
     test_pg_retry_does_not_replay_non_idempotent_write()
+    test_pg_add_chat_turn_locks_before_guard()
+    test_pg_save_trip_histories_locked_and_clamped()
+    test_json_add_chat_turn_guard_runs_under_write_lock()
+    test_json_add_chat_turn_guard_sees_concurrent_delete()
+    test_json_get_chat_history_excludes_session_before_limit()
+    test_pg_get_chat_history_excludes_session_in_sql()
     print("\n全部通过")

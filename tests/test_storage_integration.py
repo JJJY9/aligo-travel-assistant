@@ -243,6 +243,68 @@ def test_pg_add_chat_turn_writes_pair_in_one_transaction():
         memory.close()
 
 
+def test_pg_add_chat_turn_waits_for_session_meta_lock():
+    """并发删除持会话元数据锁时，add_chat_turn 阻塞到删除提交后才判守卫。"""
+    memory_a, user_id = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory_b = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    lock_key = f"aligo:session_meta:{user_id}"
+    session_id = "s-lock-order"
+    try:
+        assert memory_a.add_chat_turn("旧问", "旧答", session_id) is True
+
+        b_locked = threading.Event()
+        allow_delete = threading.Event()
+        a_done = threading.Event()
+        state = {"deleted": False}
+        result: list[bool] = []
+
+        def delete_with_lock():
+            with memory_b._conn.transaction(), memory_b._conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,)
+                )
+                b_locked.set()
+                assert allow_delete.wait(10)
+                cursor.execute(
+                    "DELETE FROM aligo_chat_messages "
+                    "WHERE user_id = %s AND session_id = %s",
+                    (user_id, session_id),
+                )
+                state["deleted"] = True
+            # 事务在此提交：会话元数据锁释放，阻塞的 add_chat_turn 才能继续
+
+        def guard():
+            return not state["deleted"]
+
+        def write_turn():
+            result.append(
+                memory_a.add_chat_turn(
+                    "新问", "新答", session_id, should_commit=guard
+                )
+            )
+            a_done.set()
+
+        delete_thread = threading.Thread(target=delete_with_lock)
+        delete_thread.start()
+        assert b_locked.wait(10), "删除线程未拿到会话元数据锁"
+        write_thread = threading.Thread(target=write_turn)
+        write_thread.start()
+        # 删除事务持锁期间落库必须阻塞：守卫不能在删除提交前执行
+        assert not a_done.wait(0.5), "add_chat_turn 必须在会话元数据锁上等待"
+        allow_delete.set()
+        write_thread.join(10)
+        delete_thread.join(10)
+        assert not write_thread.is_alive() and not delete_thread.is_alive()
+        assert result == [False], "会话已删除，在途落库必须被否决"
+        assert memory_a.get_chat_history(session_id=session_id) == []
+        print("✓ PG add_chat_turn 阻塞到并发删除提交后")
+    finally:
+        memory_a.close()
+        memory_b.close()
+
+
 def test_pg_delete_all_resets_trip_counters():
     """PG delete_all：行程编号计数器一并删除（重新从 trip_1 开始）。"""
     memory, _ = _pg_memory_or_skip()
@@ -441,11 +503,18 @@ def test_postgres_long_term_memory():
         assert newest["trip_id"] == "trip_3", "删除后新增按现有最大 id（trip_2）递增"
         assert memory.get_statistics()["total_trips"] == 2
 
+        # 旧版本写入的消息 session_id 为 NULL：排除某会话时必须保留
+        memory.add_chat_message("user", "无会话旧消息", None)
+        excluded = memory.get_chat_history(limit=10, exclude_session_id="s1")
+        assert [item["content"] for item in excluded] == ["其他会话", "无会话旧消息"], (
+            "IS DISTINCT FROM 才会保留 NULL 会话旧消息（!= 会漏掉）"
+        )
+
         assert memory.delete_chat_session("s1") == 2
         assert memory.get_chat_history(session_id="s1") == []
         assert memory.get_session_titles() == {}
         assert memory.get_pinned_sessions() == []
-        assert len(memory.get_chat_history()) == 1
+        assert len(memory.get_chat_history()) == 2
 
         memory.set_session_title("s2", "残留标题")
         memory.set_session_pinned("s2", True)
