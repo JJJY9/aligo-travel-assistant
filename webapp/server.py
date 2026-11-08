@@ -1907,7 +1907,11 @@ def _group_sessions(
 
     ``archived_mode``：``exclude`` 只返回未归档会话，``only`` 只返回归档会话。
     """
-    needle = query.strip().lower()
+    # 片段 / 标题匹配都用原文查询：_ci_find 自己处理大小写（lower() 改变
+    # 长度时改在原文上用正则定位）。先把查询 lower 会让含 İ 的关键字在
+    # 原文里完全匹配不到——仅助手消息命中「İstanbul」的会话被整条过滤，
+    # 仅标题命中的会话也拿不到 snippet / match_index
+    raw_query = query.strip()
     grouped: dict[str, dict[str, Any]] = {}
     # 每条消息的行内时间戳只解析一次：/api/sessions 每次请求都重新聚合全量
     # 历史，原实现对同一个最新时间戳反复 fromisoformat，几十万条消息时 CPU
@@ -1935,8 +1939,8 @@ def _group_sessions(
             title = " ".join(str(message.get("content", "")).split())
             if title:
                 entry["title"] = title[:40]
-        if needle and "snippet" not in entry:
-            snippet = _match_snippet(_message_search_text(message), needle)
+        if raw_query and "snippet" not in entry:
+            snippet = _match_snippet(_message_search_text(message), raw_query)
             if snippet:
                 entry["snippet"] = snippet
                 # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
@@ -1967,11 +1971,12 @@ def _group_sessions(
         # 稳定排序：置顶会话在前，其余保持最近更新时间倒序
         sessions.sort(key=lambda entry: not entry["pinned"])
 
-    if needle:
+    if raw_query:
         sessions = [
             entry
             for entry in sessions
-            if entry.get("snippet") or needle in str(entry.get("title", "")).lower()
+            if entry.get("snippet")
+            or _ci_find(str(entry.get("title", "")), raw_query) >= 0
         ]
     for entry in sessions:
         if not entry["title"]:

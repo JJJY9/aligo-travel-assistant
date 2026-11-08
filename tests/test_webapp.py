@@ -1216,6 +1216,48 @@ def test_session_search_snippet_strips_markdown():
         _cleanup(user_id)
 
 
+def test_session_search_handles_dotted_capital_i():
+    """搜索含 İ 的关键字：助手消息 / 标题命中的会话都不能丢，片段不错位。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_search_i")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        # A：用户提问不含关键字，仅助手消息命中
+        store.add_chat_message("user", "帮我规划下周出差", "s-assistant")
+        store.add_chat_message("assistant", "推荐顺路去 İstanbul 看看", "s-assistant")
+        # B：首条用户消息命中（默认标题同样来自它）
+        store.add_chat_message("user", "İstanbul 天气怎么样", "s-user")
+        store.add_chat_message("assistant", "当地多云", "s-user")
+        # C：仅自定义标题命中，消息本身不含关键字
+        store.add_chat_message("user", "随便聊聊", "s-title")
+        assert store.set_session_title("s-title", "İstanbul 计划")
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        client = _client()
+        data = client.get(
+            "/api/sessions", params={"user_id": user_id, "q": "İstanbul"}
+        ).json()
+        sessions = {item["session_id"]: item for item in data["sessions"]}
+        assert set(sessions) == {"s-assistant", "s-user", "s-title"}, sessions
+        assert "İstanbul" in sessions["s-assistant"]["snippet"], "助手消息命中要有片段"
+        assert sessions["s-assistant"]["match_index"] == 1, "命中在助手消息上"
+        assert "İstanbul" in sessions["s-user"]["snippet"]
+        assert sessions["s-user"]["match_index"] == 0
+
+        # 小写查询同样命中三个会话（大小写不敏感不能因修复而收窄）
+        lower = client.get(
+            "/api/sessions", params={"user_id": user_id, "q": "istanbul"}
+        ).json()
+        lower_sessions = {item["session_id"]: item for item in lower["sessions"]}
+        assert set(lower_sessions) == {"s-assistant", "s-user", "s-title"}, lower_sessions
+        assert "İstanbul" in lower_sessions["s-assistant"]["snippet"]
+        print("✓ 会话搜索兼容 İ 的大小写与标题命中")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ambiguous_trip_id_operations_return_409():
     """历史数据里同一 trip_id 对应多条行程时，改 / 删 / 单条日历都不能猜行。"""
     user_id = _unique_user("web_test_dup_trip")
@@ -5001,6 +5043,43 @@ def test_session_lru_skips_in_use_sessions():
     print("✓ 会话 LRU 跳过在用会话 / 全部在用容量拒绝 / 泄漏回收")
 
 
+def test_session_capacity_postcheck_rejects_after_construction(monkeypatch):
+    """预检放行后构造期间槽位被并发占满：复检拒绝、缓存不污染并回收候选。"""
+    from webapp import server as server_module
+    from webapp.server import SessionCapacityError
+
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state.max_sessions = 2
+    busy = state.get_session("u-post", "busy", True)
+    idle = state.get_session("u-post", "idle")
+    closed = []
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs):
+            # 模拟构造期间最后一个空闲槽被其它并发请求占用
+            idle.begin_turn()
+
+        def close(self):
+            closed.append(self)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(server_module, "_WebSession", _FakeSession)
+        with pytest.raises(SessionCapacityError):
+            state.get_session("u-post", "s-new", True)
+    assert idle.in_use() and busy.in_use()
+    assert state._session_key("u-post", "s-new") not in state.sessions
+    assert len(state.sessions) == 2, "拒绝时缓存不能被候选污染"
+    assert len(closed) == 1, "构造后的候选会话必须被关闭回收"
+
+    idle.end_turn()
+    busy.end_turn()
+    # 释放占用后正常新建（构建槽没有泄漏）
+    fresh = state.get_session("u-post", "s-new", True)
+    assert fresh is not None
+    fresh.end_turn()
+    print("✓ 会话容量复检拒绝并回收候选")
+
+
 def test_chat_releases_session_in_use_mark():
     """对话结束后必须解除在用标记，否则会话永远不会被回收。"""
     client = _client()
@@ -7043,6 +7122,48 @@ def test_read_rate_limit_headers_and_rejection():
     print("✓ 面板读接口独立限流与额度头")
 
 
+def test_read_rate_limit_covers_list_and_export_endpoints():
+    """列表 / 导出接口共享同一读额度桶：任一漏掉限流第 5 次请求就会 200。"""
+    from context.storage import create_long_term_memory
+    from utils.rate_limit import create_rate_limiter
+
+    client = _client()
+    state = client.app.state.aligo
+    state.read_limiter = create_rate_limiter("read_cover", 4, 60, None)
+    user = _unique_user("web_read_cover")
+    try:
+        store = create_long_term_memory(user, str(MEMORY_DIR))
+        store.add_chat_message("user", "查天气", "s-read")
+        trip_id = store.save_trip_history(
+            {"origin": "北京", "destination": "上海", "start_date": "2026-12-01"}
+        )
+        assert trip_id
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+        remaining = []
+        for path, params in (
+            ("/api/sessions", {"user_id": user}),
+            ("/api/trips", {"user_id": user}),
+            ("/api/sessions/export", {"user_id": user}),
+            (f"/api/trips/{trip_id}/calendar", {"user_id": user}),
+        ):
+            response = client.get(path, params=params)
+            assert response.status_code == 200, (path, response.text)
+            assert response.headers.get("x-ratelimit-limit") == "4", path
+            remaining.append(response.headers.get("x-ratelimit-remaining"))
+        assert remaining == ["3", "2", "1", "0"], remaining
+
+        rejected = client.get("/api/sessions", params={"user_id": user})
+        assert rejected.status_code == 429
+        assert rejected.headers.get("retry-after")
+        assert rejected.headers.get("x-ratelimit-remaining") == "0"
+    finally:
+        _cleanup(user)
+    print("✓ 列表 / 导出接口共享读限流额度")
+
+
 def test_kb_import_runs_in_dedicated_executor(monkeypatch):
     """知识库导入在专用执行器里跑，不占用面板接口共享的线程池。"""
     from webapp import server as server_module
@@ -7061,6 +7182,26 @@ def test_kb_import_runs_in_dedicated_executor(monkeypatch):
     assert response.status_code == 200
     assert names and names[0].startswith("aligo-kb-import"), names
     print("✓ 知识库导入在专用执行器执行")
+
+
+def test_kb_import_write_runs_in_dedicated_executor(monkeypatch):
+    """非预览的知识库写库端点同样在 kb-import 专用执行器里跑。"""
+    from webapp import server as server_module
+
+    names: list[str] = []
+
+    def fake_import(documents, dry_run=False):
+        names.append(threading.current_thread().name)
+        return {"imported": len(documents), "skipped": 0, "would_import": len(documents)}
+
+    monkeypatch.setattr(server_module, "import_documents", fake_import)
+    client = _client()
+    response = client.post(
+        "/api/knowledge/import", json={"documents": [{"content": "知识"}]}
+    )
+    assert response.status_code == 200, response.text
+    assert names and names[0].startswith("aligo-kb-import"), names
+    print("✓ 知识库写库导入在专用执行器执行")
 
 
 def test_import_body_parsed_off_event_loop(monkeypatch):
@@ -7101,6 +7242,49 @@ def test_import_body_parsed_off_event_loop(monkeypatch):
     finally:
         _cleanup(user)
     print("✓ /api/import 请求体解析在导入执行器线程完成")
+
+
+def test_import_rate_limited_before_body_parsing(monkeypatch):
+    """/api/import 先限流再读 / 解析请求体：超限风暴不付出备份解析代价。"""
+    from utils.rate_limit import create_rate_limiter
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    state.kb_limiter = create_rate_limiter("kb_import_order_test", 1, 60, None)
+    user = _unique_user("web_import_rate")
+    backup = {
+        "backup": {
+            "chat_history": [
+                {"role": "user", "content": "hi", "session_id": "s-rate"}
+            ]
+        }
+    }
+    try:
+        allowed = client.post(
+            "/api/import", params={"user_id": user, "dry_run": "1"}, json=backup
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert allowed.headers.get("x-ratelimit-remaining") == "0"
+
+        class _NeverParse:
+            @staticmethod
+            def model_validate_json(raw):  # noqa: ANN001 - 测试桩
+                raise AssertionError("超限请求不应读取 / 解析请求体")
+
+        monkeypatch.setattr(server_module, "UserImportPayload", _NeverParse)
+        rejected = client.post(
+            "/api/import",
+            params={"user_id": user},
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert rejected.status_code == 429, rejected.text
+        assert rejected.headers.get("retry-after")
+        assert rejected.headers.get("x-ratelimit-remaining") == "0"
+    finally:
+        _cleanup(user)
+    print("✓ /api/import 限流先于请求体解析")
 
 
 def test_import_rejects_malformed_body_with_422():
@@ -7511,6 +7695,45 @@ def test_export_with_knowledge(monkeypatch):
     print("✓ 备份导出可携带知识库片段")
 
 
+def test_export_with_knowledge_failure_modes(monkeypatch):
+    """知识库导出异常映射 503（无初始化提示）；format=md 提前返回不扫描知识库。"""
+    from webapp import server as server_module
+
+    client = _client()
+    user = _unique_user("web_export_kb_fail")
+    try:
+        def boom():
+            raise RuntimeError("milvus down")
+
+        monkeypatch.setattr(server_module, "export_documents", boom)
+        failed = client.get(
+            "/api/export", params={"user_id": user, "with_knowledge": "1"}
+        )
+        assert failed.status_code == 503, failed.text
+        detail = failed.json()["detail"]
+        assert "知识库导出失败" in detail
+        assert "先运行初始化脚本" not in detail, "非未初始化异常不应提示初始化脚本"
+
+        calls = []
+
+        def counting_boom():
+            calls.append(1)
+            raise RuntimeError("不该被调用")
+
+        monkeypatch.setattr(server_module, "export_documents", counting_boom)
+        markdown = client.get(
+            "/api/export",
+            params={"user_id": user, "format": "md", "with_knowledge": "1"},
+        )
+        assert markdown.status_code == 200, markdown.text
+        assert markdown.headers["content-type"].startswith("text/markdown")
+        assert ".md" in markdown.headers["content-disposition"]
+        assert calls == [], "format=md 必须在知识库扫描之前返回"
+    finally:
+        _cleanup(user)
+    print("✓ 知识库导出失败映射与非 JSON 格式提前返回")
+
+
 def test_export_with_knowledge_round_trips(monkeypatch):
     """导出的 knowledge 段可直接被 /api/import 一体化恢复。"""
     from utils import knowledge_admin as admin_module
@@ -7847,12 +8070,34 @@ if __name__ == "__main__":
         _mp_open.undo()
     test_snippet_stripping_is_linear_and_link_equivalent()
     test_read_rate_limit_headers_and_rejection()
+    test_read_rate_limit_covers_list_and_export_endpoints()
+    test_session_search_handles_dotted_capital_i()
     test_import_rejects_malformed_body_with_422()
     _mp_round22 = pytest.MonkeyPatch()
     try:
         test_kb_import_runs_in_dedicated_executor(_mp_round22)
     finally:
         _mp_round22.undo()
+    _mp_round22w = pytest.MonkeyPatch()
+    try:
+        test_kb_import_write_runs_in_dedicated_executor(_mp_round22w)
+    finally:
+        _mp_round22w.undo()
+    _mp_round22r = pytest.MonkeyPatch()
+    try:
+        test_import_rate_limited_before_body_parsing(_mp_round22r)
+    finally:
+        _mp_round22r.undo()
+    _mp_round22x = pytest.MonkeyPatch()
+    try:
+        test_export_with_knowledge_failure_modes(_mp_round22x)
+    finally:
+        _mp_round22x.undo()
+    _mp_round22y = pytest.MonkeyPatch()
+    try:
+        test_session_capacity_postcheck_rejects_after_construction(_mp_round22y)
+    finally:
+        _mp_round22y.undo()
     _mp_round22b = pytest.MonkeyPatch()
     try:
         test_import_body_parsed_off_event_loop(_mp_round22b)
