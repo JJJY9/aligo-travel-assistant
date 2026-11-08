@@ -14,7 +14,11 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from utils.trip_export import _needs_quote_guard, normalize_identity_date
+from utils.trip_export import (
+    _needs_quote_guard,
+    normalize_identity_date,
+    unescape_ics_machine_field,
+)
 
 _HEADER_ALIASES = {
     "origin": {"出发地", "origin"},
@@ -286,16 +290,22 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
     # 自己的格式。
     match = _ALIGO_DESCRIPTION.match(description[:2000])
     if match:
-        origin = match.group("origin").strip()
-        destination = match.group("destination").strip()
+        # 导出端把出发地 / 目的地里的箭头与全角逗号转义成 \uXXXX：
+        # 还原后才能得到原始字段（否则含「→」的出发地被误拆成两段）
+        origin = unescape_ics_machine_field(match.group("origin").strip())
+        destination = unescape_ics_machine_field(
+            match.group("destination").strip()
+        )
         purpose = match.group("purpose").strip()
         # 日期以 DTSTART / DTEND 为准：DESCRIPTION 里的时间段可能被外部日历
         # 手工编辑过，与实际事件不一致
     else:
         match = _ICS_SUMMARY.match(summary[:400])
         if match:
-            origin = match.group("origin").strip()
-            destination = match.group("destination").strip()
+            origin = unescape_ics_machine_field(match.group("origin").strip())
+            destination = unescape_ics_machine_field(
+                match.group("destination").strip()
+            )
             purpose = match.group("purpose").strip()
         else:
             destination = summary[:400]

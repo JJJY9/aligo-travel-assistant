@@ -85,7 +85,11 @@ from utils.session_ids import RESERVED_SESSION_IDS
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
 from utils.session_html import render_all_sessions_html, render_session_html
-from utils.session_markdown import render_all_sessions_markdown, sanitize_title
+from utils.session_markdown import (
+    render_all_sessions_markdown,
+    sanitize_body,
+    sanitize_title,
+)
 from utils.skill_paths import resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
 from utils.trip_conflicts import trip_state_label as _trip_state_label
@@ -3225,7 +3229,9 @@ def create_app(model: Any = None) -> FastAPI:
                 if is_user
                 else _render_stored_message(message)
             )
-            lines.extend([f"## {role}", "", content.strip(), ""])
+            lines.extend(
+                [f"## {role}", "", sanitize_body(content.strip()), ""]
+            )
 
         filename = f"aligo_{filename_base}.md"
         return Response(
@@ -4014,7 +4020,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.post("/api/trips/dedupe")
-    def dedupe_trips_endpoint(
+    async def dedupe_trips_endpoint(
         payload: TripDedupePayload, request: Request, response: Response
     ) -> dict[str, Any]:
         """清理重复行程（与 CLI ``trips-dedupe`` 同语义）。
@@ -4024,30 +4030,34 @@ def create_app(model: Any = None) -> FastAPI:
         两条入口不会漂移。破坏性操作走 strict 打开：PostgreSQL 配置了但
         不可用时 503，不在回退 JSON 上「清理成功」；全量扫描按读取限流桶
         限速（与列表 / 导出同额度）。
+
+        整个「计划 + 执行」持用户锁：并发的两个去重请求（双标签页 / 超时
+        重试）不能各自基于同一快照各删一次（同 id 副本会被删光）。
         """
         user_id = payload.user_id
         dry_run = payload.dry_run
         response.headers.update(_enforce_read_rate_limit(state, request))
-        store = _open_long_term(user_id, strict=True)
-        try:
+
+        def _run() -> dict[str, Any]:
+            store = _open_long_term(user_id, strict=True)
             try:
-                plan = plan_trip_dedupe(store)
-            except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
-                logger.warning("读取行程失败（去重，%s）: %s", user_id, exc)
-                raise HTTPException(
-                    status_code=503, detail=f"读取行程失败：{exc}"
-                ) from exc
-            if dry_run:
-                result: dict[str, Any] = {
-                    "user_id": user_id,
-                    "dry_run": True,
-                    "total_trips": plan["total_trips"],
-                    "would_remove": len(plan["duplicates"]),
-                    "duplicates": plan["duplicates"],
-                    "ambiguous_ids": plan["ambiguous_ids"],
-                    "removed": 0,
-                }
-            else:
+                try:
+                    plan = plan_trip_dedupe(store)
+                except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+                    logger.warning("读取行程失败（去重，%s）: %s", user_id, exc)
+                    raise HTTPException(
+                        status_code=503, detail=f"读取行程失败：{exc}"
+                    ) from exc
+                if dry_run:
+                    return {
+                        "user_id": user_id,
+                        "dry_run": True,
+                        "total_trips": plan["total_trips"],
+                        "would_remove": len(plan["duplicates"]),
+                        "duplicates": plan["duplicates"],
+                        "ambiguous_ids": plan["ambiguous_ids"],
+                        "removed": 0,
+                    }
                 removed, failure = apply_trip_dedupe(
                     store, plan["duplicate_entries"]
                 )
@@ -4060,7 +4070,7 @@ def create_app(model: Any = None) -> FastAPI:
                             "可重试）"
                         ),
                     )
-                result = {
+                return {
                     "user_id": user_id,
                     "dry_run": False,
                     "total_trips": plan["total_trips"],
@@ -4068,9 +4078,11 @@ def create_app(model: Any = None) -> FastAPI:
                     "duplicates": plan["duplicates"],
                     "ambiguous_ids": plan["ambiguous_ids"],
                 }
-        finally:
-            _close_long_term(store)
-        return result
+            finally:
+                _close_long_term(store)
+
+        async with state.lock_for(user_id):
+            return await asyncio.to_thread(_run)
 
     @app.get("/api/trips/{trip_id}/calendar")
     def export_trip_calendar(

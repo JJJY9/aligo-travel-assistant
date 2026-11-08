@@ -102,6 +102,33 @@ def _ics_escape(value: str) -> str:
     )
 
 
+def escape_ics_machine_field(value: str) -> str:
+    """DESCRIPTION 机器可读段的字段转义：把会破坏 ``origin → destination，
+    start ~ end，purpose`` 结构的分隔符（反斜杠 / 箭头 / 全角逗号）编码成
+    ``\\uXXXX`` 文本，导入端再还原。
+
+    例：出发地「北京 → 天津」不再被导入端按第一个箭头误拆成
+    origin=北京、destination=天津 → 上海（去重键变化导致重复导入）。
+    """
+    return (
+        str(value)
+        .replace("\\", "\\u005c")
+        .replace("→", "\\u2192")
+        .replace("，", "\\uff0c")
+    )
+
+
+def unescape_ics_machine_field(value: str) -> str:
+    """``escape_ics_machine_field`` 的逆操作（先还原箭头 / 逗号，再还原
+    反斜杠，避免把 ``\\u005cu2192`` 误还原成箭头）。"""
+    return (
+        str(value)
+        .replace("\\u2192", "→")
+        .replace("\\uff0c", "，")
+        .replace("\\u005c", "\\")
+    )
+
+
 def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | None:
     """单条行程的 VEVENT 行；缺少出发日期时返回 None。"""
     start = _ics_date(trip.get("start_date") or "")
@@ -126,8 +153,8 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     # 出现在给人看的 SUMMARY 里），否则空出发地在往返后会变成字面量「出发地」，
     # 去重键随之改变并重复新增行程
     description = (
-        f"Aligo 行程：{str(trip.get('origin') or '')} → "
-        f"{str(trip.get('destination') or '')}，"
+        f"Aligo 行程：{escape_ics_machine_field(str(trip.get('origin') or ''))} → "
+        f"{escape_ics_machine_field(str(trip.get('destination') or ''))}，"
         f"{normalize_identity_date(trip.get('start_date'))} ~ "
         f"{normalize_identity_date(trip.get('end_date') or trip.get('start_date'))}，"
         f"{str(trip.get('purpose') or '')}"
@@ -222,14 +249,19 @@ def render_trips_html(trips: list[dict[str, Any]], user_id: str) -> str:
         return _html.escape(str(value if value is not None else ""))
 
     def sort_key(trip: dict[str, Any]) -> tuple[str, str]:
-        # trip_id 是 "trip_N" 字符串：同一天内按 id 文本倒序即可，不能 int()
-        return (str(trip.get("start_date") or ""), str(trip.get("trip_id") or ""))
+        # trip_id 是 "trip_N" 字符串：同一天内按 id 文本倒序即可，不能 int()。
+        # 出发日期先归一再排序：未补零的历史日期（2026-1-5）按字典序会排到
+        # 2026-01-06 之后
+        return (
+            normalize_identity_date(trip.get("start_date")),
+            str(trip.get("trip_id") or ""),
+        )
 
     ordered = sorted(trips, key=sort_key, reverse=True)
     rows: list[str] = []
     for trip in ordered:
-        start = str(trip.get("start_date") or "") or "日期未记录"
-        end = str(trip.get("end_date") or "")
+        start = normalize_identity_date(trip.get("start_date")) or "日期未记录"
+        end = normalize_identity_date(trip.get("end_date"))
         period = start if not end or end == start else f"{start} ~ {end}"
         rows.append(
             "<tr>"

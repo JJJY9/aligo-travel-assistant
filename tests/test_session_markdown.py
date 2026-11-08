@@ -75,6 +75,31 @@ def test_fallback_title_escaped_like_custom():
     print("✓ 回退标题与自定义标题同一清洗口径")
 
 
+def test_message_body_escaped_in_export():
+    """正文里的 <script> 不能原样落盘（允许 HTML 的预览器会执行）。"""
+    from utils.session_markdown import render_all_sessions_markdown
+
+    lines = [
+        {
+            "role": "user",
+            "content": "<script>alert(1)</script>",
+            "session_id": "s1",
+            "timestamp": "t0",
+        },
+        {
+            "role": "assistant",
+            "content": "回答 <b>加粗</b>",
+            "session_id": "s1",
+            "timestamp": "t1",
+        },
+    ]
+    markdown, _ = render_all_sessions_markdown("u1", lines, {})
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markdown
+    assert "回答 &lt;b&gt;加粗&lt;/b&gt;" in markdown
+    assert "<script>" not in markdown
+    print("✓ 导出正文尖括号转义")
+
+
 def test_group_sessions_uses_max_timestamp_within_session():
     """恢复旧备份后转录末尾不是最新消息：排序与「最近更新」必须用会话内最大值。"""
     messages = [

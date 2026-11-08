@@ -1056,8 +1056,18 @@ class PostgresLongTermMemory:
 
         ``delete_trip`` 删除最早一条：去重命令要保留组内第一条、删掉后面
         的副本，用它会把要保留的那条删掉、留下后来的重复行。
+
+        只剩一条同 id 行时返回 False（不删除）：并发的两个去重请求
+        （双标签页 / CLI+Web 各自计划）都会调用一次，计数与删除在同一把
+        advisory lock 内完成，第二次不能再把仅剩的保留行删光。
         """
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+            count_row = self._fetchone(
+                "SELECT COUNT(*) FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
+                (self.user_id, trip_id),
+            )
+            if not count_row or int(count_row[0] or 0) < 2:
+                return False
             row = self._fetchone(
                 "SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s "
                 "ORDER BY id DESC LIMIT 1",

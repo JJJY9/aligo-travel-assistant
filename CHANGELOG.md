@@ -38,6 +38,12 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 行程去重并发安全：`POST /api/trips/dedupe` 持用户锁执行「计划 + 删除」；`delete_duplicate_trip` 在 JSON / PostgreSQL 后端只剩一条同 id 行时拒绝删除——双标签页 / 超时重试 / CLI+Web 并发不再把同 id 副本删光
+- 会话删除墓碑：CLI 共享墓碑默认 TTL 300s → 3600s（与 Web 同一值），CLI 删除的会话同样挡住长回合的迟到落库
+- `trip-update`：仅对存量历史日期做归一回退，本次提交的新日期仍严格校验 YYYY-MM-DD（未补零写法不再被接受并落库）
+- `trips-dedupe`：只有歧义 id、没有重复组时同样提醒并退出 1（`--json` 的 `needs_attention` 同步）
+- 导出：会话 / 用户备份 Markdown 正文尖括号转义（`<script>` 不能在允许 HTML 的预览器中执行）；导出表格单元格先转义反斜杠（`a\|b` 不再切列）；行程台账按归一日期排序 / 显示
+- 行程 ICS 往返：DESCRIPTION 机器段对字段中的反斜杠 / 箭头 / 全角逗号做转义，出发地「北京 → 天津」这类内容不再被导入端误拆（兼容旧导出文件）
 - PostgreSQL：同一实例的连接加实例级 RLock 串行化所有操作（Web `drain_pending_persist` 超时后旧落库线程与新回合不再并发使用同一条 psycopg 连接；跨实例仍由 advisory lock 互斥）
 - PostgreSQL：消息 / 查询计数 / 单条行程的 INSERT 与 `delete_last_turn` 的 DELETE 改为不可重放（提交后断连不再自动重放）——消息与计数不再重复、行程不再「已写入却报持久化失败」、删除最后一轮不会误删期间新到的同文本回合；`add_chat_turn` 与批量去重导入的既有保护不变
 - JSON 迁移：丢弃 `chat_history` / `trip_history` 中的非对象条目后重算 `total_messages` / `total_trips`（旧总数让统计永久偏大）

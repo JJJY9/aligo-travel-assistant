@@ -19,7 +19,10 @@ def _md_cell(value: Any) -> str:
     """导出表格 / 列表用的单行文本：竖线与换行会破坏 Markdown 结构，
     尖括号转义避免把用户 / 模型可控内容当 HTML 落盘。"""
     text = _CELL_BREAK.sub(" ", str(value if value is not None else "-"))
-    return text.replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
+    # 反斜杠必须先转义：值里的 `\` 与随后的 `|` 会被 Markdown 当成
+    # 「转义后的竖线」，单元格行仍按 `|` 切列而错位
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def render_markdown(data: dict[str, Any]) -> str:
@@ -94,6 +97,9 @@ def render_markdown(data: dict[str, Any]) -> str:
                 # render_stored_message 重新渲染（此前导出的是截断 200 字的
                 # 原始 JSON，回答正文完全不可读）
                 content = render_stored_message(message)
+            # 尖括号转义：Markdown 中原样落盘的 <script> 在允许 HTML 的
+            # 预览器里会执行 / 伪造结构
+            content = content.replace("<", "&lt;").replace(">", "&gt;")
             lines.append(f"- **{role}**（{message.get('timestamp', '')}）：{content}")
     else:
         lines.append("（暂无对话记录）")

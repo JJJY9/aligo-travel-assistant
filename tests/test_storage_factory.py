@@ -469,6 +469,32 @@ class _CountingModel:
         }
 
 
+def test_pg_delete_duplicate_trip_keeps_last_copy():
+    """PG delete_duplicate_trip：同 id 行只剩一条时拒绝删除（并发去重安全）。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    executed: list[tuple[str, object]] = []
+
+    def fetch_many(sql, params):
+        return (2,) if "COUNT(*)" in sql else (42,)
+
+    store._fetchone = fetch_many
+    store._execute = lambda sql, params: executed.append((sql, params))
+    assert store.delete_duplicate_trip("trip_9") is True
+    assert executed and executed[-1][1] == ("u1", 42)
+
+    executed.clear()
+    store._fetchone = lambda sql, params: (1,) if "COUNT(*)" in sql else (42,)
+    assert store.delete_duplicate_trip("trip_9") is False
+    assert executed == [], "只剩一条同 id 行时不能再删"
+    print("✓ PostgreSQL delete_duplicate_trip 只剩一条时拒绝删除")
+
+
 def test_pg_delete_trip_deletes_single_row():
     """PostgreSQL 删除行程按主键：历史库重复 trip_id 时不能整批删除。"""
     import contextlib
@@ -2396,6 +2422,7 @@ if __name__ == "__main__":
     test_path_locks_do_not_grow_unbounded()
     test_load_holds_path_lock()
     test_pg_delete_trip_deletes_single_row()
+    test_pg_delete_duplicate_trip_keeps_last_copy()
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()

@@ -326,6 +326,26 @@ def test_ics_roundtrip_matches_export():
     print("✓ ICS 导出→导入往返保真（多日 / 单日 / 转义逗号）")
 
 
+def test_ics_roundtrip_escapes_machine_delimiters():
+    """出发地 / 目的地含箭头或全角逗号时，DESCRIPTION 机器段仍可原样回导。"""
+    trip = {
+        "trip_id": "t1",
+        "origin": "北京 → 天津",
+        "destination": "上海，浦东",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+        "purpose": "出差",
+    }
+    text = render_trips_ics([trip], "u1")
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert len(rows) == 1
+    assert rows[0]["origin"] == "北京 → 天津", rows[0]
+    assert rows[0]["destination"] == "上海，浦东", rows[0]
+    assert rows[0]["start_date"] == "2026-12-01"
+    print("✓ ICS 往返：字段中的箭头 / 全角逗号不再被拆错")
+
+
 def test_ics_unfold_and_lf_only():
     purpose = "超长目的说明" * 12  # > 75 字节，SUMMARY / DESCRIPTION 必然折行
     trips = [
@@ -934,6 +954,7 @@ if __name__ == "__main__":
     test_parse_missing_columns_and_empty()
     test_csv_malformed_quote_reports_error_instead_of_merging()
     test_ics_roundtrip_matches_export()
+    test_ics_roundtrip_escapes_machine_delimiters()
     test_ics_unfold_and_lf_only()
     test_ics_collects_invalid_events()
     test_ics_external_summary_fallback()

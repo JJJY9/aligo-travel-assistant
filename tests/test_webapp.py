@@ -348,6 +348,18 @@ def test_tombstone_ttl_covers_inflight_turn_lease():
     print("✓ 墓碑 TTL 覆盖在途回合生命周期")
 
 
+def test_cli_tombstone_default_ttl_matches_web():
+    """CLI 共享墓碑默认 TTL 必须与 Web 一致：CLI 删除同样要挡住迟到落库。"""
+    from utils import tombstones
+    from webapp.server import AligoWebApp
+
+    assert (
+        tombstones.DEFAULT_TOMBSTONE_TTL_SEC
+        == AligoWebApp.tombstone_ttl_sec
+    ), "两端墓碑 TTL 漂移会让 CLI 删除只保护 5 分钟"
+    print("✓ CLI 与 Web 墓碑默认 TTL 一致")
+
+
 def test_stream_and_chat_sanitize_model_surrogates(monkeypatch):
     """模型输出含孤立代理项：SSE 帧与 JSON 响应都必须转义后才能编码。
 
@@ -4216,6 +4228,67 @@ def test_destructive_endpoints_require_json_body():
     assert plain.status_code == 415, plain.text
     assert "application/json" in plain.json()["detail"]
     print("✓ 破坏性接口拒绝跨站简单请求（JSON body + Content-Type 门禁）")
+
+
+def test_trips_dedupe_concurrent_requests_keep_one(monkeypatch):
+    """两个并发去重请求：用户锁 + 存储层计数守卫，同 id 副本只删一次。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from webapp import server as server_module
+
+    class _Store:
+        def __init__(self):
+            self.trips = [
+                {
+                    "trip_id": "dup",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-01-05",
+                },
+                {
+                    "trip_id": "dup",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-01-05",
+                },
+            ]
+
+        def get_trip_history(self, limit=None):
+            return [dict(trip) for trip in self.trips]
+
+        def reload(self):
+            pass
+
+        def delete_duplicate_trip(self, trip_id):
+            matches = [
+                index
+                for index, trip in enumerate(self.trips)
+                if trip["trip_id"] == trip_id
+            ]
+            if len(matches) < 2:
+                return False
+            self.trips.pop(matches[-1])
+            return True
+
+        def close(self):
+            pass
+
+    store = _Store()
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda uid, **kwargs: store
+    )
+    clients = [_client(), _client()]
+
+    def call(client):
+        return client.post(
+            "/api/trips/dedupe", json={"user_id": "u-race"}
+        ).json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(call, clients))
+    assert sorted(item["removed"] for item in results) == [0, 1], results
+    assert len(store.trips) == 1, "并发去重不能把同 id 副本删光"
+    print("✓ 并发去重请求只删一次（保留一条）")
 
 
 def test_trips_csv_storage_failure_maps_503(monkeypatch):
@@ -8803,6 +8876,7 @@ if __name__ == "__main__":
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
     test_tombstone_ttl_covers_inflight_turn_lease()
+    test_cli_tombstone_default_ttl_matches_web()
     _mp_surrogate = pytest.MonkeyPatch()
     try:
         test_stream_and_chat_sanitize_model_surrogates(_mp_surrogate)
@@ -8841,6 +8915,7 @@ if __name__ == "__main__":
     try:
         test_trips_dedupe_endpoint_dry_run_and_apply(_mp_dedupe)
         test_trips_dedupe_endpoint_errors_and_ambiguous(_mp_dedupe)
+        test_trips_dedupe_concurrent_requests_keep_one(_mp_dedupe)
     finally:
         _mp_dedupe.undo()
     test_sessions_pagination()

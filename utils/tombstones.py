@@ -14,7 +14,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DELETED_KEY_PREFIX = "aligo:deleted"
-DEFAULT_TOMBSTONE_TTL_SEC = 300.0
+# 与 Web 的 AligoWebApp.tombstone_ttl_sec 同值（1 小时）：墓碑必须覆盖
+# 「删除发生时仍在途的回合」的最长生命周期，CLI 删除的会话才能挡住多实例 /
+# 长回合的迟到落库（旧值 300s 在多智能体重试超过 5 分钟时失效）
+DEFAULT_TOMBSTONE_TTL_SEC = 3600.0
 
 # 操作级失败冷却：客户端已缓存后 Redis 中途变成黑洞（丢包不复位）时，
 # 每次 EXISTS / SET 都要等满 socket 超时；CLI 的备份恢复逐会话调用读取
