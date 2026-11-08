@@ -22,6 +22,10 @@ _MAX_PREFERENCES = 200
 _MAX_TRIPS = 5000
 _MAX_MESSAGES = 200000
 _MAX_KNOWLEDGE = 50000
+# 分片数硬上限（与 knowledge_admin._GROUP_PARTS_MAX 同一口径）：parts 声明
+# 来自备份元数据，无上限时 set(range(1, parts + 1)) 会被 1e9 声明直接撑爆
+# 内存（百字节备份即可触发 OOM）
+_MAX_KNOWLEDGE_PARTS = 100000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
 
@@ -136,6 +140,31 @@ def _text_problem(value: str) -> str | None:
     return None
 
 
+def _json_text_problem(value: Any, depth: int = 0) -> str | None:
+    """递归检查已解析 JSON 的键与字符串值中的 NUL / 孤立代理项。
+
+    assistant 消息的原文门禁看到的是转义写法（``\\ud800`` 是若干 ASCII
+    字符，UTF-8 可编码），解析后才是真正的孤立代理项：渲染 / 导出 / 总结
+    路径对该消息每次编码都失败（会话查看永久 500）。转义形态必须在导入时
+    按解析结果再查一遍。
+    """
+    if depth > _MAX_JSON_DEPTH:
+        return "消息内容嵌套过深"
+    if isinstance(value, str):
+        return _text_problem(value)
+    if isinstance(value, list):
+        for item in value:
+            problem = _json_text_problem(item, depth + 1)
+            if problem:
+                return problem
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            problem = _text_problem(str(key)) or _json_text_problem(item, depth + 1)
+            if problem:
+                return problem
+    return None
+
+
 def _bad_text_in_value(value: Any, depth: int = 0) -> str | None:
     """递归检查偏好值里的字符串（列表 / 对象内的字符串同样会落库）。
 
@@ -217,6 +246,11 @@ def _assistant_content_problem(content: str) -> str | None:
         # JSONDecodeError）：落库后 /api/status、会话查看 / 导出 / 总结
         # 对该消息永久失败，必须拒绝
         return "消息内容含超长数字字面量"
+    # 转义形态（"\ud800" / "\u0000"）的 NUL / 孤立代理项在原文门禁里是
+    # 可编码的 ASCII，只有解析后才暴露：渲染 / 导出 / 总结都会编码失败
+    problem = _json_text_problem(data)
+    if problem:
+        return problem
     if not isinstance(data, dict) or "_meta" not in data:
         return None
     meta = data.get("_meta")
@@ -542,6 +576,7 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     # 否则 import_documents 的分组完整性校验会抛 ValueError，整份知识段
     # （包括无关的合法文档）都恢复不了。
     broken_groups: set[str] = set()
+    oversized_groups: set[str] = set()
     group_declared: dict[str, int] = {}
     group_parts: dict[str, list[int]] = {}
     for entry in knowledge:
@@ -562,6 +597,12 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             part = 0
         group_parts.setdefault(group, []).append(part)
     for group, declared_parts in group_declared.items():
+        if declared_parts > _MAX_KNOWLEDGE_PARTS:
+            # 声明数异常（损坏 / 恶意备份）：不能先构造 range 再判断，
+            # 1e9 的 parts 会让 set(range(...)) 分配数十 GB 内存
+            oversized_groups.add(group)
+            broken_groups.add(group)
+            continue
         seen = group_parts.get(group, [])
         if len(seen) != len(set(seen)) or set(seen) != set(
             range(1, declared_parts + 1)
@@ -573,9 +614,16 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             for entry in knowledge
             if str(entry["metadata"].get("group") or "") not in broken_groups
         ]
-        errors.append(
-            f"跳过 {len(broken_groups)} 个知识分片组：分片编号重复或缺失"
-        )
+        duplicate_or_missing = len(broken_groups) - len(oversized_groups)
+        if duplicate_or_missing:
+            errors.append(
+                f"跳过 {duplicate_or_missing} 个知识分片组：分片编号重复或缺失"
+            )
+        if oversized_groups:
+            errors.append(
+                f"跳过 {len(oversized_groups)} 个知识分片组：分片数声明异常"
+                f"（超过 {_MAX_KNOWLEDGE_PARTS}）"
+            )
 
     sections["knowledge"] = knowledge
 
