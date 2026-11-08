@@ -2134,7 +2134,7 @@ def test_import_parse_exception_maps_400(monkeypatch):
 
 
 def test_rate_limit_info_reports_import_bucket_degraded():
-    """导入限流桶回退时 /api/health 的 rate_limit_degraded 必须为 True。"""
+    """任一限流桶回退时 /api/health 的 rate_limit_degraded 必须为 True。"""
     import types
 
     from webapp import server as server_module
@@ -2147,11 +2147,19 @@ def test_rate_limit_info_reports_import_bucket_degraded():
         kb_limiter=types.SimpleNamespace(limit=3, degraded=False),
         weather_limiter=types.SimpleNamespace(limit=4, degraded=False),
         import_limiter=types.SimpleNamespace(limit=5, degraded=True),
+        read_limiter=types.SimpleNamespace(limit=6, degraded=False),
     )
     info = server_module._rate_limit_info(state)
     assert info["degraded"] is True
     assert info["kb_import_limit"] == 5
-    print("✓ 导入限流桶降级计入健康汇总")
+    assert info["read_limit"] == 6, "读接口桶的额度也要在健康信息里可见"
+
+    # 单独读接口桶回退同样计入汇总（此前 read_limiter 不在统计里）
+    state.import_limiter = types.SimpleNamespace(limit=5, degraded=False)
+    state.read_limiter = types.SimpleNamespace(limit=6, degraded=True)
+    info = server_module._rate_limit_info(state)
+    assert info["degraded"] is True
+    print("✓ 导入 / 读接口限流桶降级计入健康汇总")
 
 
 def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
@@ -3738,6 +3746,7 @@ def test_metrics_api():
         assert rate["kb_limit"] >= 1
         assert rate["kb_import_limit"] >= 60
         assert rate["weather_limit"] >= 1
+        assert rate["read_limit"] >= 60
         assert rate["window_sec"] > 0
         print("✓ /api/metrics 请求指标")
     finally:
