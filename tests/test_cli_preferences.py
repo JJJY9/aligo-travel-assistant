@@ -382,8 +382,11 @@ def test_pref_write_dispatch(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_preference_set_standalone",
-        lambda user_id, pref_type, value, as_json=False: (
-            calls.append(("set", user_id, pref_type, value, as_json)) or 0
+        lambda user_id, pref_type, value, as_json=False, json_value=False: (
+            calls.append(
+                ("set", user_id, pref_type, value, as_json, json_value)
+            )
+            or 0
         ),
     )
     monkeypatch.setattr(
@@ -401,7 +404,17 @@ def test_pref_write_dispatch(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls[-1] == ("set", "u1", "home_location", "上海", True)
+    assert calls[-1] == ("set", "u1", "home_location", "上海", True, False)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "pref-set", "u1", "hotel_brands", '["汉庭"]', "--json-value"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("set", "u1", "hotel_brands", '["汉庭"]', False, True)
 
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "pref-delete", "u1", "home_location"]
@@ -426,6 +439,57 @@ def test_pref_write_dispatch(monkeypatch):
         assert exc.value.code == 2, argv
         assert "用法" in out.getvalue()
     print("✓ pref-set / pref-delete dispatch")
+
+
+def test_pref_set_json_value_types(monkeypatch):
+    """--json-value 写入带类型值（列表 / 数字 / 布尔），非法 JSON 拒绝。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "hotel_brands", '["汉庭", "如家"]', json_value=True
+        )
+    assert code == 0 and store.saved[-1] == ("hotel_brands", ["汉庭", "如家"])
+    assert "汉庭、如家" in out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "budget_level", "3", json_value=True, as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 0 and data["value"] == 3
+    assert isinstance(data["value"], int), "数字不能被存成字符串"
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "eco_mode", "false", json_value=True
+        )
+    assert code == 0 and store.saved[-1] == ("eco_mode", False)
+    assert "否" in out.getvalue()
+
+    saved_before = list(store.saved)
+    for raw, needle in (("[x", "合法的 JSON"), ("null", "不能为空")):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.run_preference_set_standalone(
+                "u1", "memo", raw, json_value=True
+            )
+        assert code == 1 and needle in out.getvalue(), (raw, out.getvalue())
+    oversized = json.dumps("长" * 10001)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "memo", oversized, json_value=True
+        )
+    assert code == 1 and "10000" in out.getvalue()
+    assert store.saved == saved_before, "非法值不应落库"
+    print("✓ pref-set --json-value 类型值 / 校验")
 
 
 def test_pref_set_rejects_oversized_value(monkeypatch):
@@ -458,6 +522,7 @@ if __name__ == "__main__":
         test_preferences_dispatch_strict,
         test_preferences_dispatch_json_flexible,
         test_pref_set_text_and_json,
+        test_pref_set_json_value_types,
         test_pref_delete_text_and_json,
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
