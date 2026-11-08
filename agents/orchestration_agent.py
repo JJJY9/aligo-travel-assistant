@@ -48,6 +48,20 @@ _AGENT_RETRY_MAX_DELAY = 5.0
 _AGENT_LOAD_EXECUTOR = ThreadPoolExecutor(
     max_workers=2, thread_name_prefix="aligo-agent-load"
 )
+# RAG 知识库的冷加载（import torch + 嵌入模型加载 / 联网下载）可能持续
+# 数十秒到数分钟，且嵌入模型本身有全局加载锁：与轻量技能共用小池时两路
+# 冷启动就会占满线程，其它会话的技能加载全部排队吃「执行超时」。单独
+# 隔离一个 worker——模型锁已串行化，多个 RAG 实例同时加载没有收益。
+_RAG_LOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="aligo-rag-load"
+)
+
+
+def _load_executor_for(agent_name: str) -> ThreadPoolExecutor:
+    """RAG 知识库技能用隔离执行器，其余技能用通用加载池。"""
+    if canonical_agent_name(agent_name).casefold() == "rag_knowledge":
+        return _RAG_LOAD_EXECUTOR
+    return _AGENT_LOAD_EXECUTOR
 
 # 行程规划依赖事项收集与偏好抽取的结果：两者同批时规划拿不到这些上下文
 _PLANNING_DEPENDENCIES = {"event_collection", "preference"}
@@ -676,7 +690,7 @@ class OrchestrationAgent(AgentBase):
             # 约束，卡在导入 / 模型加载上也不会无限占用整轮与该用户的会话锁
             async def _load_and_reply() -> Any:
                 agent = await asyncio.get_running_loop().run_in_executor(
-                    _AGENT_LOAD_EXECUTOR,
+                    _load_executor_for(agent_name),
                     self.agent_registry.__getitem__,
                     agent_name,
                 )

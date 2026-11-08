@@ -1053,6 +1053,43 @@ def test_agent_load_runs_in_dedicated_executor():
     print("✓ 子智能体懒加载在专用执行器线程执行")
 
 
+def test_rag_load_uses_isolated_executor():
+    """RAG 冷加载独占执行器：模型加载不把其它技能加载排到超时。"""
+    import threading
+
+    records: list[str] = []
+
+    class RecordingRegistry(dict):
+        def __getitem__(self, key):
+            records.append(threading.current_thread().name)
+            return super().__getitem__(key)
+
+    orchestrator = OrchestrationAgent(
+        agent_registry=RecordingRegistry(
+            {"ask-question": _StubAgent("ask-question", {"answer": "ok"})}
+        )
+    )
+    asyncio.run(
+        orchestrator.reply(
+            _intent([{"agent_name": "ask-question", "priority": 1}])
+        )
+    )
+    assert records and records[0].startswith("aligo-rag-load"), records
+    print("✓ RAG 知识库加载在隔离执行器线程执行")
+
+
+def test_rag_load_executor_accepts_standard_name():
+    """兼容标准名 / 大小写写法都路由到 RAG 专用执行器。"""
+    from agents import orchestration_agent as module
+    from agents.orchestration_agent import _load_executor_for
+
+    for name in ("ask-question", "rag_knowledge", "ASK-QUESTION", "RAG_KNOWLEDGE"):
+        assert _load_executor_for(name) is module._RAG_LOAD_EXECUTOR, name
+    for name in ("preference", "event-collection", "memory-query"):
+        assert _load_executor_for(name) is module._AGENT_LOAD_EXECUTOR, name
+    print("✓ 执行器路由覆盖技能目录名 / 标准名 / 大小写")
+
+
 def test_preference_render_skips_unmanageable_keys():
     """回显与落库同口径：含 "/" 的键不出现「已更新偏好」。"""
     from utils.result_formatter import result_to_markdown
@@ -1663,6 +1700,8 @@ if __name__ == "__main__":
     test_data_data_nested_preferences_unpacked()
     test_unmanageable_preference_types_skipped_everywhere()
     test_agent_load_runs_in_dedicated_executor()
+    test_rag_load_uses_isolated_executor()
+    test_rag_load_executor_accepts_standard_name()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)
