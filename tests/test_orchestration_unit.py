@@ -713,6 +713,93 @@ def test_agent_status_error_and_null_error():
     print("✓ status=error / error=null 判定正确")
 
 
+def test_nested_query_failure_is_reported_as_error():
+    """query_success=false 嵌在 results 里的失败必须聚合为 error 而不是成功。"""
+
+    class NestedError(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "query_type": "网络搜索",
+                        "query_success": False,
+                        "results": {"error": "搜索失败: 403 Forbidden"},
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class NestedMessage(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "query_type": "网络搜索",
+                        "query_success": False,
+                        "results": {"message": "搜索库未安装"},
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={"search": NestedError("search"), "kb": NestedMessage("kb")}
+    )
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(
+                _intent(
+                    [
+                        {"agent_name": "search", "priority": 1},
+                        {"agent_name": "kb", "priority": 1},
+                    ]
+                )
+            )
+        ).content
+    )
+    assert result["status"] == "partial_failure"
+    by_name = {item["agent_name"]: item["status"] for item in result["results"]}
+    assert by_name == {"search": "error", "kb": "error"}, by_name
+    payload = json.dumps(result, ensure_ascii=False)
+    assert "搜索失败: 403" in payload and "搜索库未安装" in payload
+    print("✓ 嵌套 results 的查询失败聚合为 error")
+
+
+def test_transient_nested_error_triggers_retry():
+    """嵌套在 results 里的瞬时错误（timeout / connection）也要触发重试。"""
+    from agents import orchestration_agent as module
+
+    class _Reply:
+        def __init__(self, content):
+            self.content = content
+
+    assert (
+        module._transient_agent_error(
+            _Reply(
+                json.dumps(
+                    {"query_success": False, "results": {"error": "搜索失败: timeout"}}
+                )
+            )
+        )
+        == "搜索失败: timeout"
+    )
+    assert (
+        module._transient_agent_error(
+            _Reply(
+                json.dumps(
+                    {"query_success": False, "results": {"message": "未找到相关结果"}}
+                )
+            )
+        )
+        is None
+    )
+    print("✓ 嵌套瞬时错误触发重试、永久错误不重试")
+
+
 def test_malformed_schedule_is_sanitized():
     """字符串项 / 非法 priority 的调度计划不应让整轮对话崩溃"""
     orchestrator = OrchestrationAgent(
@@ -1225,6 +1312,8 @@ if __name__ == "__main__":
     test_agent_duration_and_progress_events()
     test_unregistered_agent_reports_error()
     test_agent_status_error_and_null_error()
+    test_nested_query_failure_is_reported_as_error()
+    test_transient_nested_error_triggers_retry()
     test_malformed_schedule_is_sanitized()
     test_registry_load_failure_reports_agent_error()
     test_failed_itinerary_is_not_saved_as_trip()

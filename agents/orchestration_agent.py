@@ -83,8 +83,34 @@ def _as_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _agent_error_text(data: dict[str, Any]) -> str:
+    """汇总技能返回 JSON 里的错误文本（顶层 / 嵌套 results 两种形状）。
+
+    query-info 等技能把失败信息放在 ``results`` 里并用 ``query_success``
+    标记结果（``{"query_success": false, "results": {"message": "搜索库未安装"}}``
+    或 ``{"results": {"error": "搜索失败: timeout"}}``）；只看顶层 ``error``
+    会把它当成成功（前端显示 ✓、元数据记为 success、瞬时故障也不会重试）。
+    """
+    if data.get("error"):
+        return str(data.get("error"))
+    state = str(data.get("status") or "").lower()
+    if state == "error":
+        return str(data.get("message") or "智能体返回错误状态")
+    nested = data.get("results")
+    nested_error = ""
+    nested_message = ""
+    if isinstance(nested, dict):
+        nested_error = str(nested.get("error") or "")
+        nested_message = str(nested.get("message") or "")
+    if nested_error:
+        return nested_error
+    if data.get("query_success") is False:
+        return nested_message or str(data.get("message") or "查询失败")
+    return ""
+
+
 def _transient_agent_error(response: Any) -> str | None:
-    """技能返回的 error JSON 若像瞬时故障，返回错误文本以触发重试。"""
+    """技能返回的错误 JSON 若像瞬时故障，返回错误文本以触发重试。"""
     content = getattr(response, "content", None)
     if not isinstance(content, str):
         return None
@@ -94,10 +120,9 @@ def _transient_agent_error(response: Any) -> str | None:
         return None
     if not isinstance(data, dict):
         return None
-    error = data.get("error")
-    if not error:
+    text = _agent_error_text(data)
+    if not text:
         return None
-    text = str(error)
     lowered = text.lower()
     if any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS):
         return text
@@ -631,17 +656,12 @@ class OrchestrationAgent(AgentBase):
             else:
                 result = response.content
 
-            # 智能体可能用 error 字段或 status=error 表示失败；
+            # 智能体可能用顶层 error / status=error 表示失败，也可能把失败
+            # 嵌套在 results 里并标记 query_success=false（query-info 等技能）；
             # error 为 null / 空串时是正常输出，不能当作失败
             if isinstance(result, dict):
-                error_value = result.get("error")
-                state = str(result.get("status") or "").lower()
-                if error_value or state == "error":
-                    error_msg = (
-                        error_value
-                        or result.get("message")
-                        or "智能体返回错误状态"
-                    )
+                error_msg = _agent_error_text(result)
+                if error_msg:
                     return {
                         "status": "error",
                         "agent_name": agent_name,
