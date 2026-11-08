@@ -6101,7 +6101,13 @@ def test_knowledge_duplicates_api(monkeypatch):
 
     invalid = client.get("/api/knowledge/duplicates", params={"limit": 999})
     assert invalid.status_code == 422
-    print("✓ /api/knowledge/duplicates 重复检查（分组 / limit / 503 / 422）")
+
+    # 额度 5 已在上面用尽（422 不消耗）：再请求直接 429
+    rejected = client.get("/api/knowledge/duplicates")
+    assert rejected.status_code == 429
+    assert rejected.headers.get("retry-after")
+    assert rejected.headers.get("x-ratelimit-remaining") == "0"
+    print("✓ /api/knowledge/duplicates 重复检查（分组 / limit / 503 / 422 / 429）")
 
 
 def test_knowledge_eval_import_failure(monkeypatch):
