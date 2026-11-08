@@ -6038,6 +6038,72 @@ def test_knowledge_eval_api(monkeypatch):
     print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429 不耗额度）")
 
 
+def test_knowledge_duplicates_api(monkeypatch):
+    """重复知识片段接口：与 CLI 同口径分组，limit=0 全量，存储失败 503。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    groups = [
+        ("完全相同的内容", [3, 7]),
+        ("另一组重复", [9, 10, 11]),
+    ]
+    monkeypatch.setattr(
+        server_module, "find_duplicate_contents", lambda: list(groups)
+    )
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.kb_limiter = RateLimiter(limit=5, window_sec=60)
+    client = TestClient(app)
+    assert 'id="kbDuplicates"' in client.get("/").text, "面板必须提供「查重复」入口"
+
+    response = client.get("/api/knowledge/duplicates", params={"limit": 1})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["total_groups"] == 2
+    assert data["total_fragments"] == 5, "总数按全量组统计，不受 limit 影响"
+    assert data["shown"] == 1
+    assert data["groups"][0]["ids"] == [3, 7]
+    assert data["groups"][0]["content"] == "完全相同的内容"
+    assert data["groups"][0]["preview"] == "完全相同的内容"
+    assert "x-ratelimit-limit" in response.headers
+
+    all_groups = client.get(
+        "/api/knowledge/duplicates", params={"limit": 0}
+    ).json()
+    assert all_groups["shown"] == 2
+    assert all_groups["groups"][1]["ids"] == [9, 10, 11]
+
+    monkeypatch.setattr(server_module, "find_duplicate_contents", lambda: [])
+    empty = client.get("/api/knowledge/duplicates")
+    assert empty.status_code == 200
+    assert empty.json() == {
+        "total_groups": 0,
+        "total_fragments": 0,
+        "shown": 0,
+        "groups": [],
+    }
+
+    def boom():
+        raise RuntimeError("milvus down")
+
+    monkeypatch.setattr(server_module, "find_duplicate_contents", boom)
+    failed = client.get("/api/knowledge/duplicates")
+    assert failed.status_code == 503
+    assert "读取失败" in failed.json()["detail"]
+
+    def missing():
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "find_duplicate_contents", missing)
+    missing_response = client.get("/api/knowledge/duplicates")
+    assert missing_response.status_code == 503
+    assert "先运行初始化脚本" in missing_response.json()["detail"]
+
+    invalid = client.get("/api/knowledge/duplicates", params={"limit": 999})
+    assert invalid.status_code == 422
+    print("✓ /api/knowledge/duplicates 重复检查（分组 / limit / 503 / 422）")
+
+
 def test_knowledge_eval_import_failure(monkeypatch):
     """技能文件缺失时评测依赖 import 失败，应返回 503 而不是 500。"""
     import sys

@@ -67,6 +67,7 @@ from utils.knowledge_admin import (
     add_document,
     delete_document,
     export_documents,
+    find_duplicate_contents,
     get_document,
     get_document_group,
     import_documents,
@@ -2521,6 +2522,42 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
         finally:
             state.eval_lock.release(token)
+
+    @app.get("/api/knowledge/duplicates")
+    def knowledge_duplicates(
+        request: Request,
+        response: Response,
+        limit: int = Query(default=20, ge=0, le=200),
+    ) -> dict[str, Any]:
+        """列出内容完全相同的独立知识片段组（与 CLI ``kb-duplicates`` 同一实现）。
+
+        ``limit=0`` 返回全部组。只统计可单删的独立片段：带 ``group`` 或
+        旧版 ``parts > 1`` 的多分片记录内部重复属于同一篇文档，不算重复。
+        """
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        try:
+            groups = find_duplicate_contents()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("读取重复知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"读取失败：{exc}") from exc
+        shown = groups if limit <= 0 else groups[:limit]
+        return {
+            "total_groups": len(groups),
+            "total_fragments": sum(len(ids) for _, ids in groups),
+            "shown": len(shown),
+            "groups": [
+                {
+                    "content": content,
+                    "preview": " ".join(content.split())[:60],
+                    "ids": list(ids),
+                }
+                for content, ids in shown
+            ],
+        }
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(

@@ -105,10 +105,22 @@ def test_frontend_render_helpers():
     assert results["pref_object"] == '{"a":1}', "对象偏好显示 JSON"
     assert results["pref_list"] == '汉庭、{"b":2}', "列表偏好用「、」拼接并保留对象 JSON"
     print("✓ 前端渲染 / 高亮 / 截断 / 偏好格式化基线")
+def test_knowledge_duplicates_panel_states():
+    """「查重复」按钮：无重复 / 有重复（截断提示）/ 失败三种状态文案。"""
+    results = _run_harness("duplicates")
+    assert results["empty"] == "没有重复内容的独立知识片段"
+    assert results["groups"] == (
+        "重复检查：3 组（共 7 条）：#3、#7（完全相同的内容）；#9（）"
+        " · 其余 1 组未显示 · 确认后可在列表删除多余片段"
+    ), results["groups"]
+    assert results["error"] == "重复检查失败：网络抖动"
+    assert results["button"] == "查重复", "结束后按钮文案必须复位"
+    print("✓ 知识库重复检查面板状态")
 
 
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()
+    test_knowledge_duplicates_panel_states()
     print("\n全部通过")

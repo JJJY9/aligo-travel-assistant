@@ -242,6 +242,7 @@ const els = {
   kbImportFile: byId("kbImportFile"),
   kbSemantic: byId("kbSemantic"),
   kbEval: byId("kbEval"),
+  kbDuplicates: byId("kbDuplicates"),
   kbEvalResult: byId("kbEvalResult"),
   kbForm: byId("kbForm"),
   kbContent: byId("kbContent"),
@@ -4088,6 +4089,54 @@ async function runKbEval() {
   }
 }
 
+async function runKbDuplicates() {
+  if (!els.kbDuplicates) return;
+  els.kbDuplicates.disabled = true;
+  els.kbDuplicates.setAttribute("aria-busy", "true");
+  els.kbDuplicates.textContent = "检查中…";
+  if (els.kbEvalResult) {
+    els.kbEvalResult.hidden = false;
+    els.kbEvalResult.classList.remove("warn");
+    els.kbEvalResult.textContent = "正在检查重复知识片段…";
+  }
+  try {
+    const data = await getJSON("/api/knowledge/duplicates?limit=20");
+    const groups = Array.isArray(data.groups) ? data.groups : [];
+    const totalGroups = Number(data.total_groups || 0);
+    if (els.kbEvalResult) {
+      if (!totalGroups) {
+        els.kbEvalResult.textContent = "没有重复内容的独立知识片段";
+      } else {
+        const parts = groups.map((group) => {
+          const ids = (Array.isArray(group.ids) ? group.ids : [])
+            .map((docId) => `#${docId}`)
+            .join("、");
+          const preview = sliceCodePoints(String(group.preview || ""), 24);
+          return `${ids}（${preview}）`;
+        });
+        const suffix =
+          totalGroups > groups.length
+            ? ` · 其余 ${totalGroups - groups.length} 组未显示`
+            : "";
+        els.kbEvalResult.textContent =
+          `重复检查：${totalGroups} 组（共 ${Number(data.total_fragments || 0)} 条）：` +
+          parts.join("；") +
+          suffix +
+          " · 确认后可在列表删除多余片段";
+        els.kbEvalResult.classList.toggle("warn", true);
+      }
+    }
+  } catch (error) {
+    if (els.kbEvalResult) {
+      els.kbEvalResult.textContent = `重复检查失败：${error.message}`;
+    }
+  } finally {
+    els.kbDuplicates.disabled = false;
+    els.kbDuplicates.removeAttribute("aria-busy");
+    els.kbDuplicates.textContent = "查重复";
+  }
+}
+
 function renderSemanticResults(query, results) {  els.kbList.innerHTML = "";
   els.kbMore.hidden = true;
   const note = document.createElement("p");
@@ -4781,6 +4830,9 @@ function bindEvents() {
   els.kbCancel.addEventListener("click", () => resetKnowledgeForm());
   els.kbSemantic.addEventListener("click", () => runSemanticSearch());
   if (els.kbEval) els.kbEval.addEventListener("click", () => runKbEval());
+  if (els.kbDuplicates) {
+    els.kbDuplicates.addEventListener("click", () => runKbDuplicates());
+  }
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
   els.kbSearch.addEventListener("input", () => {
