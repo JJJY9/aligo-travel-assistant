@@ -2085,8 +2085,136 @@ def test_update_compensation_failure_reported(monkeypatch):
     print("✓ 补偿删除失败的残留分片随异常报出")
 
 
+def test_write_agent_cached_with_create_if_missing(monkeypatch):
+    """写入 Agent 懒加载后复用，构造时 create_if_missing=True。"""
+    import agents.rag_knowledge_agent as rag_module
+
+    calls = []
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(rag_module, "RAGKnowledgeAgent", _Agent)
+    knowledge_admin.reset_knowledge_agent()
+    try:
+        first = knowledge_admin._get_agent()
+        second = knowledge_admin._get_agent()
+        assert first is second, "同一实例必须被复用"
+        assert len(calls) == 1
+        assert calls[0] == {
+            "collection_name": knowledge_admin.COLLECTION_NAME,
+            "create_if_missing": True,
+        }
+    finally:
+        knowledge_admin.reset_knowledge_agent()
+    print("✓ 写入 Agent 懒加载创建并复用")
+
+
+def test_load_collection_failure_is_non_fatal():
+    """load_collection 失败（2.x 无该调用 / 已加载）只记调试日志，不向上抛。"""
+
+    class _Client:
+        def load_collection(self, name):
+            raise RuntimeError("load not supported")
+
+    knowledge_admin._load_collection(_Client(), knowledge_admin.COLLECTION_NAME)
+    print("✓ load_collection 失败不阻断读写")
+
+
+def test_get_document_reads_single_row(monkeypatch):
+    """按 id 读取片段：命中返回内容 + 解析后的元数据，缺失返回 None。"""
+    fake = _FakeMilvusClient(
+        [
+            {"id": 3, "content": "住宿标准 600 元", "metadata": '{"category": "住宿"}'},
+            {"id": 4, "content": "坏元数据", "metadata": "not-json"},
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    assert knowledge_admin.get_document(3) == {
+        "id": 3,
+        "content": "住宿标准 600 元",
+        "metadata": {"category": "住宿"},
+    }
+    assert knowledge_admin.get_document(404) is None
+    bad = knowledge_admin.get_document(4)
+    assert bad is not None and bad["metadata"] == {}
+    print("✓ get_document 命中 / 缺失 / 坏元数据")
+
+
+def test_existing_group_layout_tolerates_bad_numbers(monkeypatch):
+    """库内分片布局扫描：非法 part / parts 按 0 / 1 处理，空内容跳过。"""
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "甲", "metadata": '{"group": "g", "part": "x", "parts": "y"}'},
+            {"id": 2, "content": "乙", "metadata": '{"group": "g", "part": "2", "parts": "3"}'},
+            {"id": 3, "content": "   ", "metadata": "{}"},
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    assert knowledge_admin._existing_group_layout() == {
+        "甲": ("g", 0, 1),
+        "乙": ("g", 2, 3),
+    }
+    print("✓ 分片布局扫描容忍非法 part / parts")
+
+
+def test_restore_pieces_fallbacks():
+    """还原分片：无原始分片时短文本原样、长文本按语义边界重切。"""
+    assert knowledge_admin._restore_pieces(None, "短文本") == ["短文本"]
+    assert knowledge_admin._restore_pieces([], "   ") == []
+    assert knowledge_admin._restore_pieces([" 甲 ", "", 1], "回退") == ["甲"]
+
+    text = "字" * 1000
+    pieces = knowledge_admin._restore_pieces(None, text)
+    assert "".join(pieces) == text, "重切不能丢字符"
+    assert len(pieces) > 1
+    assert all(len(piece) <= knowledge_admin._MAX_CONTENT_CHARS for piece in pieces)
+    print("✓ 还原分片的短文本 / 空 / 长文本回退")
+
+
+def test_iter_all_rows_closes_iterator_even_on_error():
+    """全量遍历在提前结束 / close 抛错时都尽力关闭迭代器。"""
+
+    closed = []
+
+    class _Iterator:
+        def __init__(self):
+            self.batches = [[{"id": 1}], []]
+
+        def next(self):
+            return self.batches.pop(0)
+
+        def close(self):
+            closed.append(True)
+            raise RuntimeError("close boom")
+
+    class _Client:
+        def query_iterator(self, **kwargs):
+            return _Iterator()
+
+    rows = list(knowledge_admin._iter_all_rows(_Client()))
+    assert rows == [{"id": 1}]
+    assert closed == [True], "迭代结束后必须关闭（close 异常被吞）"
+    print("✓ 全量遍历关闭迭代器且吞掉 close 异常")
+
+
+def test_regroup_keeps_non_dict_items():
+    """重组只按 group 合并字典条目，非对象条目原样保留。"""
+    merged, skipped = knowledge_admin._regroup_exported_documents(
+        [None, "纯文本", {"content": "片段"}], set()
+    )
+    assert merged == [None, "纯文本", {"content": "片段"}]
+    assert skipped == 0
+    print("✓ 重组保留非对象条目")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
+    test_load_collection_failure_is_non_fatal()
+    test_iter_all_rows_closes_iterator_even_on_error()
+    test_restore_pieces_fallbacks()
+    test_regroup_keeps_non_dict_items()
     for case in (
         test_list_documents_parses_sorts_and_filters,
         test_list_documents_pages_full_scan,
@@ -2105,6 +2233,9 @@ if __name__ == "__main__":
         test_import_regroups_exported_chunks,
         test_import_tolerates_non_finite_part_metadata,
         test_find_duplicate_contents_ignores_grouped_fragments,
+        test_write_agent_cached_with_create_if_missing,
+        test_get_document_reads_single_row,
+        test_existing_group_layout_tolerates_bad_numbers,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_cross_group_share_keeps_unique_pieces,
