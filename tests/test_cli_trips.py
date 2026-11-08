@@ -820,6 +820,24 @@ def test_trip_update_validation_errors(monkeypatch):
     print("✓ trip-update 校验（字段 / 日期 / 不存在 / 歧义）")
 
 
+def test_trip_update_legacy_unpadded_dates(monkeypatch):
+    """存量未补零出发日期：仅改目的时冲突照常计算，补填返程不被误拒。"""
+    legacy = _trip("上海", "2026-1-5", purpose="出差", trip_id="trip_legacy")
+    store = _UpdateStore(
+        [legacy, _trip("杭州", "2026-01-05", "2026-01-06", trip_id="trip_2")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_update("u1", "trip_legacy", {"purpose": "会议"})
+    assert code == 0 and "重叠" in out, out
+
+    code, out = _run_trip_update("u1", "trip_legacy", {"end": "2026-01-07"})
+    assert code == 0, out
+    assert store.updates and store.updates[-1][0] == "trip_legacy"
+    print("✓ 存量未补零日期的更新与冲突判断")
+
+
 def test_trip_update_store_failures(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("open down")
@@ -1178,6 +1196,7 @@ if __name__ == "__main__":
         test_trip_delete_args_and_dispatch,
         test_trip_update_fields_and_json,
         test_trip_update_validation_errors,
+        test_trip_update_legacy_unpadded_dates,
         test_trip_update_rejects_oversized_fields,
         test_trip_update_store_failures,
         test_trip_update_args_and_dispatch,

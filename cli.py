@@ -2080,6 +2080,25 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
     return 0
 
 
+def _cli_fail(message: str, as_json: bool) -> int:
+    """维护命令的统一失败输出：``--json`` 模式下输出 ``{ok: false, error}``。
+
+    只打纯文本会让脚本的 JSON 解析直接失败——同一命令其它输出都是 JSON，
+    失败也必须保持同一契约（与 trips-dedupe / kb-* 的 ``_fail`` 一致）。
+    """
+    if as_json:
+        print(
+            json.dumps(
+                {"ok": False, "error": message},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(message)
+    return 1
+
+
 def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     """用户数据概览（`python cli.py stats <user_id> [--json]`）。
 
@@ -2094,13 +2113,14 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     from utils.travel_stats import summarize_travel
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _cli_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线",
+            as_json,
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
         try:
             preferences = store.get_preference()
@@ -2108,8 +2128,7 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
             history = store.get_chat_history()
             archived = store.get_archived_sessions() or []
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取数据失败：{exc}")
-            return 1
+            return _cli_fail(f"读取数据失败：{exc}", as_json)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -3113,19 +3132,19 @@ def run_sessions_list_standalone(
     import re
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _cli_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线",
+            as_json,
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
         try:
             summaries = _session_summaries(store)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取会话失败：{exc}")
-            return 1
+            return _cli_fail(f"读取会话失败：{exc}", as_json)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -4485,12 +4504,25 @@ def run_trip_update_standalone(
 
         # 只严格校验本次提交的日期字段：合并结果里的历史脏日期不能阻断
         # 仅修改目的 / 出发地等其它字段的请求（与 Web PUT 同口径）
+        from datetime import datetime
+
+        from utils.trip_import import normalize_identity_date
+
         start_dt = end_dt = None
         for key, label in (("start_date", "出发日期"), ("end_date", "返程日期")):
             raw = str(merged.get(key) or "")
             if not raw:
                 continue
             parsed = _parse_strict_date(raw)
+            if parsed is None:
+                # 存量未补零日期（2026-1-5）：按归一日历解析用于冲突判断，
+                # 不能因历史写法让 --end 被误拒、或仅改目的时 conflicts 恒空
+                try:
+                    parsed = datetime.strptime(
+                        normalize_identity_date(raw), "%Y-%m-%d"
+                    )
+                except ValueError:
+                    parsed = None
             if parsed is None:
                 if key in mapped:
                     return _fail(f"{label}格式应为 YYYY-MM-DD：{raw}")
@@ -4799,19 +4831,19 @@ def run_trips_list_standalone(
     )
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _cli_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线",
+            as_json,
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取行程失败：{exc}")
-            return 1
+            return _cli_fail(f"读取行程失败：{exc}", as_json)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -4932,19 +4964,19 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
     from utils.result_formatter import preference_label
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _cli_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线",
+            as_json,
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
         try:
             preferences = store.get_preference()
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取偏好失败：{exc}")
-            return 1
+            return _cli_fail(f"读取偏好失败：{exc}", as_json)
     finally:
         close = getattr(store, "close", None)
         if callable(close):

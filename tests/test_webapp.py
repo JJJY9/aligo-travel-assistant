@@ -1768,6 +1768,61 @@ def test_trip_update_validation_and_errors(monkeypatch):
     print("✓ 行程更新校验与错误映射（400/422/404/409/503）")
 
 
+def test_trip_update_legacy_unpadded_dates(monkeypatch):
+    """存量未补零出发日期：仅改目的时冲突照常计算、补填返程不被误拒。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def __init__(self):
+            self.trips = [
+                {
+                    "trip_id": "trip_legacy",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-1-5",
+                    "purpose": "出差",
+                },
+                {
+                    "trip_id": "trip_2",
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-01-05",
+                    "end_date": "2026-01-06",
+                },
+            ]
+            self.updates = []
+
+        def get_trip_history(self, limit=None):
+            return list(self.trips)
+
+        def update_trip(self, trip_id, fields):
+            self.updates.append((trip_id, fields))
+            return True
+
+        def close(self):
+            pass
+
+    store = _Store()
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda uid, strict=False: store
+    )
+    client = _client()
+    updated = client.put(
+        "/api/trips/trip_legacy",
+        json={"user_id": "u-legacy", "purpose": "会议"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert [item["trip_id"] for item in updated.json()["conflicts"]] == [
+        "trip_2"
+    ], updated.json()
+    filled = client.put(
+        "/api/trips/trip_legacy",
+        json={"user_id": "u-legacy", "end_date": "2026-01-07"},
+    )
+    assert filled.status_code == 200, filled.text
+    print("✓ 存量未补零日期的 Web 更新与冲突判断")
+
+
 def test_preference_panel_accepts_long_value():
     """面板偏好值上限应与对话写入路径一致，而不是 200 字。"""
     client = _client()
@@ -8865,6 +8920,7 @@ if __name__ == "__main__":
     _mp_trip_update = pytest.MonkeyPatch()
     try:
         test_trip_update_validation_and_errors(_mp_trip_update)
+        test_trip_update_legacy_unpadded_dates(_mp_trip_update)
     finally:
         _mp_trip_update.undo()
     test_next_trip_from_full_history()
