@@ -127,13 +127,19 @@ def test_knowledge_dedupe_panel_states():
     assert empty["confirm_calls"] == 0
 
     cancel = results["cancel"]
-    assert cancel["text"] == "已取消清理"
+    assert cancel["text"] == "没有重复片段可清理", (
+        "取消确认不应覆盖之前的结果（此前是重复列表 / 空态）"
+    )
     assert cancel["confirm_calls"] == 1
     assert cancel["requests"] == 2, "取消后不能再发删除请求"
 
     applied = results["applied"]
-    assert applied["text"] == "已清理 1 条重复片段 · 1 条删除失败：#11"
+    assert applied["text"] == (
+        "已清理 1 条重复片段 · 1 条已跳过（期间已删除或内容变化）"
+        " · 1 条删除失败：#11（库内已有变化：计划 2 → 3）"
+    )
     assert applied["warn"] is True, "有失败条目必须标黄"
+    assert applied["hidden"] is False, "清理结果必须真实可见（结果条此前可能是 hidden）"
     assert applied["requests"] == 4, "dry-run + 删除各一次"
     assert applied["button"] == "清理重复"
 
@@ -142,6 +148,18 @@ def test_knowledge_dedupe_panel_states():
     assert error["button"] == "清理重复"
     assert error["disabled"] is False, "失败后按钮必须恢复可点"
     print("✓ 知识库重复清理面板状态")
+
+
+def test_knowledge_actions_arbitrate_shared_result_bar():
+    """评测 / 查重复共用结果条：迟到的旧响应不能覆盖新结果。"""
+    results = _run_harness("arbitrate")
+    assert results["after_duplicates"].startswith("重复检查：1 组"), results
+    assert results["final_text"] == results["after_duplicates"], (
+        "先发起、后返回的评测不能覆盖后发起的查重复结果"
+    )
+    assert results["eval_button"] == "检索评测"
+    assert results["duplicates_button"] == "查重复"
+    print("✓ 知识库工具栏动作结果条序号仲裁")
 
 
 def test_knowledge_eval_panel_states():
@@ -171,5 +189,6 @@ if __name__ == "__main__":
     test_frontend_render_helpers()
     test_knowledge_duplicates_panel_states()
     test_knowledge_dedupe_panel_states()
+    test_knowledge_actions_arbitrate_shared_result_bar()
     test_knowledge_eval_panel_states()
     print("\n全部通过")

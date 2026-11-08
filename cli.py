@@ -4099,7 +4099,13 @@ def run_trip_calendar_standalone(
             _print_stdout(text, end="")
         return 0
 
-    path = Path(target) if target else Path("exports") / f"aligo_{trip_id}.ics"
+    # 不同用户的 trip_id 都是 trip_1 起步：默认文件名带上（清洗后的）用户 ID，
+    # 与 sessions-export 同一做法，避免跨用户同名导出互相覆盖 / 误报已存在
+    path = (
+        Path(target)
+        if target
+        else Path("exports") / f"aligo_{_safe_export_user(user_id)}_{trip_id}.ics"
+    )
     if path.exists() and not force:
         print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
         return 1

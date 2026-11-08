@@ -840,6 +840,99 @@ def test_find_duplicate_contents_ignores_grouped_fragments(monkeypatch):
     print("✓ 重复扫描只统计独立片段（多分片 / 空内容不计）")
 
 
+def test_cleanup_duplicate_contents_dry_run(monkeypatch):
+    """dry-run 只返回计划（每组保留最小 id），不删除。"""
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "重复内容", "metadata": "{}"},
+            {"id": 2, "content": "重复内容", "metadata": "{}"},
+            {"id": 3, "content": "单条", "metadata": "{}"},
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=True)
+    assert result["dry_run"] is True
+    assert (result["groups"], result["planned"], result["removed"]) == (1, 1, 0)
+    assert result["plan"][0]["keep"] == 1
+    assert result["plan"][0]["remove"] == [2]
+    assert fake.deleted == []
+    print("✓ 重复清理 dry-run 只返回计划")
+
+
+def test_cleanup_duplicate_contents_deletes_verified_only(monkeypatch):
+    """删除前逐条复核：保留片段缺失 / 内容被改 / 变成多分片都跳过不删。"""
+    # 保留片段已不存在：整组跳过
+    fake = _FakeMilvusClient([{"id": 2, "content": "C", "metadata": "{}"}])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(
+        knowledge_admin, "find_duplicate_contents", lambda: [("C", [1, 2])]
+    )
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert result["removed"] == 0
+    assert result["skipped"] == [
+        {"id": 2, "reason": "保留片段已不存在或内容已变化"}
+    ]
+    assert fake.deleted == []
+
+    # 待删片段内容已被并发修改：跳过
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "C", "metadata": "{}"},
+            {"id": 2, "content": "D", "metadata": "{}"},
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert result["removed"] == 0
+    assert result["skipped"] == [{"id": 2, "reason": "内容已被修改，已跳过"}]
+    assert fake.deleted == []
+
+    # 期间变成多分片记录：跳过
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "C", "metadata": "{}"},
+            {
+                "id": 2,
+                "content": "C",
+                "metadata": '{"group": "g", "part": "1", "parts": "2"}',
+            },
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert result["removed"] == 0
+    assert result["skipped"] == [
+        {"id": 2, "reason": "已变为多分片记录，已跳过"}
+    ]
+    assert fake.deleted == []
+    print("✓ 重复清理删除前复核（保留缺失 / 内容变化 / 多分片）")
+
+
+def test_cleanup_duplicate_contents_deletes_and_reports_failure(monkeypatch):
+    """正常删除保留最小 id；删除异常记入 failed 且不中断其它条目。"""
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "C", "metadata": "{}"},
+            {"id": 2, "content": "C", "metadata": "{}"},
+            {"id": 7, "content": "C", "metadata": "{}"},
+        ]
+    )
+    real_delete = fake.delete
+
+    def flaky_delete(*args, **kwargs):
+        if 7 in kwargs.get("ids", []):
+            raise RuntimeError("milvus write failed")
+        return real_delete(*args, **kwargs)
+
+    fake.delete = flaky_delete
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert result["removed"] == 1, result  # 只删掉了 2
+    assert fake.deleted == [2]
+    assert result["failed"] == [{"id": 7, "error": "milvus write failed"}]
+    print("✓ 重复清理逐条删除并汇报失败")
+
+
 def test_import_tolerates_non_finite_part_metadata(monkeypatch):
     """metadata.part 为非有限数（Infinity）时该文档退化为单条，不拖垮整批导入。"""
     from pathlib import Path
@@ -2301,6 +2394,9 @@ if __name__ == "__main__":
         test_import_regroups_exported_chunks,
         test_import_tolerates_non_finite_part_metadata,
         test_find_duplicate_contents_ignores_grouped_fragments,
+        test_cleanup_duplicate_contents_dry_run,
+        test_cleanup_duplicate_contents_deletes_verified_only,
+        test_cleanup_duplicate_contents_deletes_and_reports_failure,
         test_write_agent_cached_with_create_if_missing,
         test_get_document_reads_single_row,
         test_existing_group_layout_tolerates_bad_numbers,

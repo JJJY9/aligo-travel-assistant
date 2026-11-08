@@ -65,6 +65,7 @@ from utils.doctor import run_doctor
 from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
     add_document,
+    cleanup_duplicate_contents,
     delete_document,
     export_documents,
     find_duplicate_contents,
@@ -563,6 +564,17 @@ class KnowledgeImportPreviewPayload(BaseModel):
     """预览导入（不写库）：可一次提交整个备份文件，条目规则与导入一致。"""
 
     documents: list[Any] = Field(min_length=1, max_length=20000)
+
+
+class KnowledgeDedupePayload(BaseModel):
+    """重复片段清理请求。
+
+    ``dry_run`` 默认 True（只预览）。必须走 JSON body 而不是 URL 参数：
+    跨站表单发不出 application/json（会先触发 CORS 预检并被拒绝），
+    破坏性接口不能被第三方页面用无预检的简单 POST 触发。
+    """
+
+    dry_run: bool = True
 
 
 class PreferencePayload(BaseModel):
@@ -2561,64 +2573,26 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.post("/api/knowledge/duplicates/cleanup")
     def knowledge_duplicates_cleanup(
+        payload: KnowledgeDedupePayload,
         request: Request,
         response: Response,
-        dry_run: bool = Query(default=True),
     ) -> dict[str, Any]:
         """清理内容完全相同的独立片段（每组保留最小 id；默认只预览）。
 
-        与 CLI ``kb-dedupe`` 同一语义：``dry_run=0`` 才真正删除；多分片
-        记录内部的相同段落不会被当成重复，删除时仍走 ``delete_document``
-        的单条保护（期间变成多分片记录会拒删）。
+        与 CLI ``kb-dedupe`` 同一语义：``dry_run=false`` 才真正删除。扫描
+        与删除在同一把写锁内完成、逐条复核内容未变化（并发编辑 / 删除不会
+        被按过期 id 误删），已消失 / 已变化的条目记入 ``skipped``。
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            groups = find_duplicate_contents()
+            return cleanup_duplicate_contents(dry_run=payload.dry_run)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
             ) from exc
-        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
-            logger.warning("读取重复知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"读取失败：{exc}") from exc
-        plan: list[dict[str, Any]] = []
-        for content, ids in groups:
-            keep = min(ids)
-            remove = sorted(doc_id for doc_id in ids if doc_id != keep)
-            if not remove:
-                continue
-            plan.append(
-                {
-                    "preview": " ".join(content.split())[:60],
-                    "content": content,
-                    "keep": keep,
-                    "remove": remove,
-                }
-            )
-        planned = sum(len(item["remove"]) for item in plan)
-        removed = 0
-        failed: list[dict[str, Any]] = []
-        if not dry_run:
-            for item in plan:
-                for doc_id in item["remove"]:
-                    try:
-                        count = int(delete_document(doc_id) or 0)
-                    except Exception as exc:  # noqa: BLE001 - 单条失败不影响其它组
-                        logger.warning("删除重复知识片段 %s 失败: %s", doc_id, exc)
-                        failed.append({"id": doc_id, "error": str(exc)})
-                        continue
-                    if count:
-                        removed += count
-                    else:
-                        failed.append({"id": doc_id, "error": "片段不存在或已被删除"})
-        return {
-            "dry_run": dry_run,
-            "groups": len(plan),
-            "planned": planned,
-            "removed": removed,
-            "failed": failed,
-            "plan": plan,
-        }
+        except Exception as exc:  # noqa: BLE001 - 读取 / 删除失败统一提示
+            logger.warning("清理重复知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"清理失败：{exc}") from exc
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(

@@ -762,6 +762,105 @@ def _existing_contents() -> set[str]:
     }
 
 
+def _row_content(client: Any, doc_id: int) -> str | None:
+    """按 id 读取片段内容（不存在返回 None）。"""
+    rows = client.query(
+        collection_name=COLLECTION_NAME,
+        filter=f"id == {int(doc_id)}",
+        output_fields=["content"],
+        limit=1,
+    )
+    if not rows:
+        return None
+    return str(rows[0].get("content", ""))
+
+
+def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
+    """扫描并（可选）删除内容完全相同的独立片段，每组保留最小 id。
+
+    与 ``kb-duplicates`` / ``kb-dedupe`` 同一判定口径。真正删除时扫描与
+    删除在同一把写锁内完成，并在删除前逐条复核「保留片段仍在、内容仍与
+    计划一致、不是多分片记录」，避免按过期 id 删掉并发编辑后的新内容；
+    并发下已消失 / 已变化的片段记入 ``skipped``，删除异常记入 ``failed``。
+    """
+    plan: list[dict[str, Any]] = []
+
+    def _build_plan() -> None:
+        plan.clear()
+        for content, ids in find_duplicate_contents():
+            keep = min(ids)
+            remove = sorted(doc_id for doc_id in ids if doc_id != keep)
+            if not remove:
+                continue
+            plan.append(
+                {
+                    "preview": " ".join(content.split())[:60],
+                    "content": content,
+                    "keep": keep,
+                    "remove": remove,
+                }
+            )
+
+    if dry_run:
+        _build_plan()
+        return {
+            "dry_run": True,
+            "groups": len(plan),
+            "planned": sum(len(item["remove"]) for item in plan),
+            "removed": 0,
+            "skipped": [],
+            "failed": [],
+            "plan": plan,
+        }
+
+    with _WRITE_LOCK:
+        _build_plan()
+        client = _client()
+        _load_collection(client, COLLECTION_NAME)
+        removed = 0
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for item in plan:
+            expected = item["content"].strip()
+            keep_content = _row_content(client, item["keep"])
+            if keep_content is None or keep_content.strip() != expected:
+                for doc_id in item["remove"]:
+                    skipped.append(
+                        {"id": doc_id, "reason": "保留片段已不存在或内容已变化"}
+                    )
+                continue
+            for doc_id in item["remove"]:
+                current = _row_content(client, doc_id)
+                if current is None:
+                    skipped.append({"id": doc_id, "reason": "片段不存在或已被删除"})
+                    continue
+                if current.strip() != expected:
+                    skipped.append({"id": doc_id, "reason": "内容已被修改，已跳过"})
+                    continue
+                try:
+                    parts, group = _document_info(client, doc_id)
+                    if group or parts > 1:
+                        skipped.append(
+                            {"id": doc_id, "reason": "已变为多分片记录，已跳过"}
+                        )
+                        continue
+                    client.delete(collection_name=COLLECTION_NAME, ids=[int(doc_id)])
+                except Exception as exc:  # noqa: BLE001 - 单条失败不影响其它组
+                    logger.warning("删除重复知识片段 %s 失败: %s", doc_id, exc)
+                    failed.append({"id": doc_id, "error": str(exc)})
+                    continue
+                removed += 1
+        return {
+            "dry_run": False,
+            "groups": len(plan),
+            "planned": sum(len(item["remove"]) for item in plan),
+            "removed": removed,
+            "skipped": skipped,
+            "failed": failed,
+            "plan": plan,
+        }
+
+
 def _existing_group_layout() -> dict[str, tuple[str, int, int]]:
     """内容 → (group, part, parts)：补齐残缺组前校验新旧分片布局一致。"""
     client = _client()

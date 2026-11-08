@@ -155,11 +155,32 @@ def test_main_dispatch_trip_calendar(monkeypatch):
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0, buf.getvalue()
-    path = os.path.join(workdir, "exports", "aligo_trip_1.ics")
+    path = os.path.join(workdir, "exports", "aligo_u1_trip_1.ics")
     assert os.path.exists(path)
     with open(path, encoding="utf-8") as handle:
         assert "BEGIN:VEVENT" in handle.read()
     print("✓ main() 分发 trip-calendar（默认导出路径）")
+
+
+def test_default_path_includes_safe_user(monkeypatch):
+    """默认文件名带（清洗后的）用户 ID：不同用户的同名 trip_id 不互相覆盖。"""
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    store = _FakeStore([_trip()])
+    monkeypatch.setattr(cli, "_open_cli_store", lambda uid: store)
+    for user in ("alice", "bob", "中文用户"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.run_trip_calendar_standalone(user, "trip_1")
+        assert code == 0, (user, buf.getvalue())
+    exports = os.path.join(workdir, "exports")
+    names = sorted(name for name in os.listdir(exports) if name.endswith(".ics"))
+    assert len(names) == 3, names
+    assert "aligo_alice_trip_1.ics" in names
+    assert "aligo_bob_trip_1.ics" in names
+    assert any(name.startswith("aligo_") and name.endswith("_trip_1.ics") for name in names)
+    assert not any("中文用户" in name for name in names), "文件名必须是 ASCII 安全字符"
+    print("✓ trip-calendar 默认文件名按用户隔离")
 
 
 def test_main_dispatch_rejects_html_and_bad_args(monkeypatch):
@@ -187,6 +208,7 @@ if __name__ == "__main__":
         test_stdout_and_overwrite_protection(mp)
         test_invalid_ids_and_store_failure(mp)
         test_main_dispatch_trip_calendar(mp)
+        test_default_path_includes_safe_user(mp)
         test_main_dispatch_rejects_html_and_bad_args(mp)
     finally:
         mp.undo()
