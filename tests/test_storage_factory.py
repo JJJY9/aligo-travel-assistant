@@ -2084,6 +2084,96 @@ def test_bulk_save_trips_scales_and_dedupes():
     print("✓ 批量行程保存一次建索引（去重 / 编号 / 统计语义一致）")
 
 
+def test_bulk_save_trips_matches_sequential_saves():
+    """批量保存与逐条保存的最终结果一致（去重 / 未补零日期 / 缺省目的 / 会话）。"""
+    storage_dir = tempfile.mkdtemp()
+    batch = LongTermMemory("u-eq-batch", storage_dir)
+    sequential = LongTermMemory("u-eq-single", storage_dir)
+    rows = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        },
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-1",
+            "end_date": "2026-12-3",
+            "purpose": "客户会议",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-10",
+            "purpose": "培训",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-10",
+            "end_date": "2026-12-10",
+        },
+        {
+            "origin": "",
+            "destination": "广州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-22",
+            "purpose": "会议",
+            "session_id": "s-1",
+        },
+        {
+            "origin": "",
+            "destination": "广州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-22",
+        },
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        },
+    ]
+    batch_counts = batch.save_trip_histories([dict(row) for row in rows])
+    sequential_counts = [0, 0]
+    for row in rows:
+        before = len(sequential.get_trip_history(limit=None))
+        sequential.save_trip_history(dict(row))
+        created = int(len(sequential.get_trip_history(limit=None)) > before)
+        sequential_counts[created == 0] += 1
+
+    def snapshot(store):
+        keys = (
+            "trip_id",
+            "origin",
+            "destination",
+            "start_date",
+            "end_date",
+            "purpose",
+            "session_id",
+        )
+        return [
+            {key: trip.get(key) for key in keys}
+            for trip in store.get_trip_history(limit=None)
+        ]
+
+    assert batch_counts == tuple(sequential_counts), (
+        batch_counts,
+        sequential_counts,
+    )
+    assert snapshot(batch) == snapshot(sequential)
+    assert (
+        batch.get_statistics()["total_trips"]
+        == sequential.get_statistics()["total_trips"]
+    )
+    assert batch.get_frequent_destinations(10) == sequential.get_frequent_destinations(10)
+    print("✓ 批量保存与逐条保存结果一致")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -2156,4 +2246,5 @@ if __name__ == "__main__":
     test_json_get_chat_history_excludes_session_before_limit()
     test_pg_get_chat_history_excludes_session_in_sql()
     test_bulk_save_trips_scales_and_dedupes()
+    test_bulk_save_trips_matches_sequential_saves()
     print("\n全部通过")
