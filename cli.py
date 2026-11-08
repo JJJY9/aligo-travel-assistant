@@ -4022,6 +4022,97 @@ def run_trips_export_standalone(
 _TRIP_ADD_FLAGS = ("--origin", "--destination", "--start", "--end", "--purpose")
 
 
+def run_trip_calendar_standalone(
+    user_id: str,
+    trip_id: str,
+    target: str | None = None,
+    to_stdout: bool = False,
+    force: bool = False,
+) -> int:
+    """导出一条行程为 iCalendar
+    （`python cli.py trip-calendar <user_id> <trip_id> [path] [--stdout] [--force]`）。
+
+    与 Web `GET /api/trips/{trip_id}/calendar` 同一渲染口径；历史重复
+    trip_id 拒绝猜行（先 trips-dedupe），缺少出发日期的行程无法生成事件。
+
+    Returns:
+        0 导出成功；1 参数 / 读取 / 写入失败、行程不存在 / 歧义 / 缺出发日期
+    """
+    import re
+    from pathlib import Path
+
+    from utils.trip_export import render_trips_ics
+
+    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    if not re.fullmatch(r"[\w-]{1,64}", trip_id) or trip_id.startswith("-"):
+        print("行程 ID 只能包含中文、字母、数字、下划线和短横线")
+        return 1
+    try:
+        store = _open_cli_store(user_id)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        print(f"打开长期记忆失败：{exc}")
+        return 1
+    try:
+        try:
+            trips = store.get_trip_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            print(f"读取行程失败：{exc}")
+            return 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    matches = [trip for trip in trips if str(trip.get("trip_id")) == trip_id]
+    if len(matches) > 1:
+        print("该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理")
+        return 1
+    if not matches:
+        print(f"行程 {trip_id} 不存在")
+        return 1
+    text = render_trips_ics(matches, user_id)
+    exported = sum(
+        1 for line in text.splitlines() if line.strip() == "BEGIN:VEVENT"
+    )
+    if not exported:
+        print(f"行程 {trip_id} 缺少出发日期，无法导出日历")
+        return 1
+    if to_stdout:
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            try:
+                sys.stdout.flush()
+                buffer.write(text.encode("utf-8"))
+                buffer.flush()
+            except OSError as exc:
+                # 与 trips-export 一致：下游提前关闭（| head）时静默收尾
+                if not is_pipe_error(exc):
+                    raise
+                try:
+                    devnull = os.open(os.devnull, os.O_WRONLY)
+                    os.dup2(devnull, sys.stdout.fileno())
+                except Exception:
+                    pass
+        else:
+            _print_stdout(text, end="")
+        return 0
+
+    path = Path(target) if target else Path("exports") / f"aligo_{trip_id}.ics"
+    if path.exists() and not force:
+        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+        return 1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode("utf-8"))
+    except OSError as exc:
+        print(f"写入失败：{exc}")
+        return 1
+    print(f"已导出行程 {trip_id} 的日历到 {path}（iCalendar）")
+    return 0
+
+
 def _parse_trip_add_args(args: list[str]) -> dict[str, Any] | None:
     """解析 trip-add 参数：``<user_id> --destination X --start YYYY-MM-DD [...]``。
 
@@ -5215,7 +5306,7 @@ _COMMANDS_HINT = (
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
-    "trips / trip-add / trip-update / trip-delete / trips-dedupe / sessions / session-archive / session-delete / session-title / session-pin / session-show / session-export / "
+    "trips / trip-add / trip-update / trip-delete / trip-calendar / trips-dedupe / sessions / session-archive / session-delete / session-title / session-pin / session-show / session-export / "
     "sessions-export / trips-export / trips-import / user-export / user-import"
 )
 
@@ -5814,6 +5905,32 @@ def main():
             sys.exit(
                 run_session_show_standalone(
                     positional[0], positional[1], as_json=as_json
+                )
+            )
+        if arg == "trip-calendar":
+            usage = (
+                "用法：python cli.py trip-calendar <user_id> <trip_id> "
+                "[path] [--stdout] [--force]"
+            )
+            if (
+                len(sys.argv) < 4
+                or sys.argv[2].startswith("-")
+                or sys.argv[3].startswith("-")
+            ):
+                print(usage)
+                sys.exit(2)
+            parsed_calendar = _parse_session_export_args(sys.argv[4:])
+            if parsed_calendar is None or parsed_calendar[3]:
+                print(usage)
+                sys.exit(2)
+            target, to_stdout, force, _html = parsed_calendar
+            sys.exit(
+                run_trip_calendar_standalone(
+                    sys.argv[2],
+                    sys.argv[3],
+                    target=target,
+                    to_stdout=to_stdout,
+                    force=force,
                 )
             )
         if arg == "session-export":
