@@ -23,6 +23,7 @@ from utils.json_parser import (
     extract_json_from_async_response,
     iter_json_objects,
     reject_json_constant,
+    robust_json_parse,
 )
 from utils.llm_resilience import is_retriable_error
 from utils.skill_loader import SkillLoader
@@ -317,6 +318,15 @@ class IntentionAgent(AgentBase):
                 for candidate in iter_json_objects(text):
                     if "agent_schedule" in candidate:
                         result = candidate
+                if result is None:
+                    # 尾逗号 / 裸控制字符等小瑕疵：走修复解析再试一次，
+                    # 否则规划请求会被整体降级成 information_query 搜索
+                    try:
+                        repaired = robust_json_parse(text, fallback=None)
+                    except ValueError:
+                        repaired = None
+                    if isinstance(repaired, dict) and "agent_schedule" in repaired:
+                        result = repaired
                 if result is None:
                     logger.error(f"JSON parse failed. Text sample: {text[:100]}")
                     raise ValueError(f"Failed to parse JSON. Error: {e1}") from e1

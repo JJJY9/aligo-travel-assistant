@@ -555,6 +555,89 @@ def test_preference_prefers_last_result_object():
     print("✓ 偏好抽取取最后一个结果对象（回显在前）")
 
 
+def test_event_collection_result_without_meta_keys_beats_echo():
+    """回显示例含 missing_info/extracted_count、真实结果省略时，仍取真实结果。"""
+    agent_class = _load_skill("event-collection", "EventCollectionAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '格式示例：{"origin": "北京", "destination": "北京", '
+                '"start_date": "2026-02-27", "missing_info": [], '
+                '"extracted_count": 7}\n'
+                '结果：{"origin": "北京", "destination": "杭州", '
+                '"start_date": "2026-12-01", "return_location": "北京"}'
+            )
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    agent = agent_class(name="EventCollectionAgent", model=_Model())
+    agent.skill_loader = _Loader()
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="我去杭州", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("destination") == "杭州", data
+    print("✓ 真实结果省略 meta 键时仍胜过回显示例")
+
+
+def test_skill_result_with_trailing_comma_is_repaired():
+    """尾逗号输出：事项 / 偏好提取都要修复解析，不能整轮丢结果。"""
+    event_class = _load_skill("event-collection", "EventCollectionAgent")
+    pref_class = _load_skill("preference", "PreferenceAgent")
+
+    class _EventModel:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '{"origin": "北京", "destination": "杭州", '
+                '"start_date": "2026-12-01",}'
+            )
+
+    class _PrefModel:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '{"has_preferences": true, "preferences": '
+                '[{"type": "airlines", "value": "东航"},],}'
+            )
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    event_agent = event_class(name="EventCollectionAgent", model=_EventModel())
+    event_agent.skill_loader = _Loader()
+    event_out = json.loads(
+        asyncio.run(
+            event_agent.reply(Msg(name="x", content="我去杭州", role="user"))
+        ).content
+    )
+    assert event_out.get("destination") == "杭州", event_out
+
+    pref_agent = pref_class(
+        name="PreferenceAgent", model=_PrefModel(), memory_manager=_Memory()
+    )
+    pref_agent.skill_loader = _Loader()
+    pref_out = json.loads(
+        asyncio.run(
+            pref_agent.reply(Msg(name="user", content="我常坐东航", role="user"))
+        ).content
+    )
+    assert pref_out.get("has_preferences") is True, pref_out
+    assert pref_out.get("preferences") == [
+        {"type": "airlines", "value": "东航"}
+    ], pref_out
+    print("✓ 尾逗号 JSON 修复后事项 / 偏好结果保留")
+
+
 def test_documented_agent_imports_resolve():
     """SKILL.md 示例路径 agents.memory_query_agent / preference_agent 可用。"""
     from agents.memory_query_agent import MemoryQueryAgent
@@ -841,6 +924,26 @@ def test_rag_grouped_documents_keep_metadata():
     print("✓ 拼装保留业务元数据与缺片标记")
 
 
+def test_rag_grouped_documents_absurd_parts_capped():
+    """parts 声明 1e9 时不能展开 range（OOM）：按实际取回片数收尾。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+    grouped = agent._assemble_grouped_documents(
+        [
+            {
+                "id": "p1",
+                "content": "唯一分片",
+                "metadata": {"group": "gBoom", "part": 1, "parts": 10**9},
+                "distance": 0.5,
+            }
+        ]
+    )
+    item = next(entry for entry in grouped if entry["id"] == "gBoom")
+    assert item["metadata"]["parts"] == 1
+    assert "missing_parts" not in item["metadata"]
+    print("✓ 异常 parts 声明不展开巨型 range")
+
+
 def test_rag_collection_created_once(monkeypatch, tmp_path):
     """首次构造创建集合；已有集合不再重复创建；初始化路径允许无库文件创建。"""
     module = _load_skill_module("ask-question")
@@ -924,6 +1027,8 @@ if __name__ == "__main__":
         test_plan_trip_null_rewritten_query_falls_back()
         test_plan_trip_rejects_non_object_result()
         test_plan_trip_accepts_object_with_array_fields()
+        test_event_collection_result_without_meta_keys_beats_echo()
+        test_skill_result_with_trailing_comma_is_repaired()
         test_rag_search_top_k_bounds()
         _mp_search = pytest.MonkeyPatch()
         try:
@@ -934,6 +1039,7 @@ if __name__ == "__main__":
         test_rag_reply_filters_low_score_documents()
         test_rag_grouped_documents_assembled()
         test_rag_grouped_documents_keep_metadata()
+        test_rag_grouped_documents_absurd_parts_capped()
         for case in (
             test_rag_requires_initialized_knowledge_base,
             test_rag_explicit_embedding_model_id_not_replaced,

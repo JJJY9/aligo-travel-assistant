@@ -158,6 +158,24 @@ def last_json_object_with_keys(
     return selected
 
 
+def robust_first_json_object(text: str) -> dict:
+    """解析模型输出里的第一个完整 JSON 对象；严格扫描失败时尝试修复。
+
+    ``extract_first_json_object`` 只接受无瑕疵的顶层对象：模型偶尔输出尾逗号
+    （``"agent_schedule": [...],}``）或裸控制字符时整段放弃，调用方会把整轮
+    提取降级 / 丢结果。修复交给 ``robust_json_parse``（代码块 / 控制字符 /
+    尾逗号 / 单引号），仍不是对象才报错。
+    """
+    try:
+        return extract_first_json_object(text)
+    except ValueError:
+        pass
+    repaired = robust_json_parse(text, fallback=None)
+    if not isinstance(repaired, dict):
+        raise ValueError("No JSON object found in response")
+    return repaired
+
+
 def robust_json_parse(text: str, fallback=None) -> dict:
     """
     鲁棒的 JSON 解析函数

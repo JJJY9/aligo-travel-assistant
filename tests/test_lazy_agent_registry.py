@@ -130,6 +130,23 @@ def test_keys_include_legacy_names(monkeypatch):
     print("✓ keys 包含已安装技能的遗留名称")
 
 
+def test_names_resolve_case_insensitively(monkeypatch):
+    """模型偶尔输出 Plan-Trip / EVENT-COLLECTION：不能当成未注册。"""
+    registry = _registry(
+        monkeypatch,
+        {"plan-trip": _AGENT_SOURCE, "event-collection": _AGENT_SOURCE},
+    )
+    assert registry._resolve_agent_name("Plan-Trip") == "plan-trip"
+    assert registry._resolve_agent_name("EVENT-COLLECTION") == "event-collection"
+    assert registry._resolve_agent_name("Itinerary_Planning") == "plan-trip", (
+        "遗留标准名同样大小写不敏感"
+    )
+    assert "Plan-Trip" in registry
+    agent = registry["PLAN-TRIP"]
+    assert agent is not None
+    print("✓ 智能体名称大小写不敏感解析")
+
+
 def test_frontmatter_name_alias_resolves(monkeypatch):
     """意图 prompt 展示 frontmatter name：注册器必须能解析它（name≠目录名）。"""
     root = Path(tempfile.mkdtemp())
@@ -167,6 +184,7 @@ if __name__ == "__main__":
         test_import_failure_propagates,
         test_missing_agent_class,
         test_keys_include_legacy_names,
+        test_names_resolve_case_insensitively,
         test_frontmatter_name_alias_resolves,
         test_setitem_and_delitem_support,
     ):

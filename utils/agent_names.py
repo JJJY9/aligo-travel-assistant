@@ -14,5 +14,11 @@ SKILL_AGENT_NAMES = {
 
 
 def canonical_agent_name(agent_name: str) -> str:
-    """把技能目录名统一为标准智能体名（未知名称原样返回）。"""
-    return SKILL_AGENT_NAMES.get(agent_name, agent_name)
+    """把技能目录名统一为标准智能体名（大小写不敏感；未知名称原样返回）。
+
+    模型偶尔输出 ``Plan-Trip`` / ``EVENT-COLLECTION``：只做精确匹配会当成
+    未注册名称，整轮调度失败。目录名与标准名都是 ASCII，casefold 足够。
+    """
+    name = str(agent_name or "").strip()
+    mapped = SKILL_AGENT_NAMES.get(name.casefold())
+    return mapped if mapped is not None else name
