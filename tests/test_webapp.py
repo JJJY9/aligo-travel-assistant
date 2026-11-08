@@ -6110,6 +6110,68 @@ def test_knowledge_duplicates_api(monkeypatch):
     print("✓ /api/knowledge/duplicates 重复检查（分组 / limit / 503 / 422 / 429）")
 
 
+def test_knowledge_duplicates_cleanup_api(monkeypatch):
+    """重复片段清理：默认 dry-run 只返回计划，dry_run=0 逐条删除并报告失败。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    groups = [("重复内容", [3, 7]), ("另一组", [9, 10, 11])]
+    deleted = []
+
+    def fake_delete(doc_id):
+        deleted.append(doc_id)
+        if doc_id == 11:
+            raise RuntimeError("milvus write failed")
+        if doc_id == 10:
+            return 0
+        return 1
+
+    monkeypatch.setattr(
+        server_module, "find_duplicate_contents", lambda: list(groups)
+    )
+    monkeypatch.setattr(server_module, "delete_document", fake_delete)
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.kb_limiter = RateLimiter(limit=10, window_sec=60)
+    client = TestClient(app)
+    assert 'id="kbDedupe"' in client.get("/").text, "面板必须提供「清理重复」入口"
+
+    preview = client.post("/api/knowledge/duplicates/cleanup")
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["dry_run"] is True
+    assert data["groups"] == 2
+    assert data["planned"] == 3
+    assert data["removed"] == 0
+    assert deleted == [], "默认 dry-run 不能删除"
+    assert [item["keep"] for item in data["plan"]] == [3, 9], "每组保留最小 id"
+    assert data["plan"][0]["remove"] == [7]
+    assert data["plan"][1]["remove"] == [10, 11]
+    assert "x-ratelimit-limit" in preview.headers
+
+    applied = client.post(
+        "/api/knowledge/duplicates/cleanup", params={"dry_run": 0}
+    )
+    assert applied.status_code == 200, applied.text
+    result = applied.json()
+    assert result["dry_run"] is False
+    assert deleted == [7, 10, 11], "按计划逐条删除"
+    assert result["removed"] == 1, "7 成功、10 返回 0、11 抛错"
+    failed = {item["id"]: item["error"] for item in result["failed"]}
+    assert set(failed) == {10, 11}, failed
+    assert "不存在" in failed[10]
+    assert "milvus" in failed[11]
+
+    def boom():
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(server_module, "find_duplicate_contents", boom)
+    missing = client.post("/api/knowledge/duplicates/cleanup")
+    assert missing.status_code == 503
+    assert "先运行初始化脚本" in missing.json()["detail"]
+    print("✓ /api/knowledge/duplicates/cleanup 预览 / 删除 / 部分失败 / 503")
+
+
 def test_knowledge_eval_import_failure(monkeypatch):
     """技能文件缺失时评测依赖 import 失败，应返回 503 而不是 500。"""
     import sys
