@@ -2845,7 +2845,8 @@ def run_trips_dedupe_standalone(
 
     同路线 + 同起止日期视为重复：保留最早一条，删除其余记录（统计同步更新）。
     ``dry_run`` 仅列出将被删除的记录，不做修改；``--json`` 输出结构化结果
-    （将删除 / 已删除条目与无法自动处理的 trip_id）。
+    （将删除 / 已删除条目与无法自动处理的 trip_id）。判定与执行与 Web
+    ``POST /api/trips/dedupe`` 共用 ``utils.trip_dedupe``。
 
     Returns:
         0 清理完成（含无重复 / dry-run）；1 参数 / 读取 / 删除失败
@@ -2869,7 +2870,9 @@ def run_trips_dedupe_standalone(
         if as_json:
             print(
                 json.dumps(
-                    {"ok": True, **payload}, ensure_ascii=False, indent=2
+                    {"ok": True, **payload},
+                    ensure_ascii=False,
+                    indent=2,
                 )
             )
 
@@ -2879,6 +2882,7 @@ def run_trips_dedupe_standalone(
     from config import STORAGE_CONFIG
     from context.long_term_memory import LongTermMemory
     from context.storage import create_long_term_memory
+    from utils.trip_dedupe import apply_trip_dedupe, plan_trip_dedupe
 
     try:
         store = create_long_term_memory(user_id, "data/memory")
@@ -2895,96 +2899,43 @@ def run_trips_dedupe_standalone(
             )
 
         try:
-            trips = store.get_trip_history(limit=None)
+            plan = plan_trip_dedupe(store)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
 
-        from utils.trip_import import normalize_identity_date
-
-        groups: dict[tuple[str, str, str, str], list[str]] = {}
-        for trip in trips:
-            # 与存储层去重同一口径：历史未补零日期（2026-1-5）先归一，
-            # 否则同一行程的两种写法不会被识别为重复
-            start_date = normalize_identity_date(trip.get("start_date"))
-            if not start_date:
-                continue
-            key = (
-                str(trip.get("origin") or ""),
-                str(trip.get("destination") or ""),
-                start_date,
-                normalize_identity_date(trip.get("end_date") or start_date),
-            )
-            groups.setdefault(key, []).append(str(trip.get("trip_id") or ""))
-        by_id = {str(trip.get("trip_id") or ""): trip for trip in trips}
-
-        def _entry(trip_id: str) -> dict[str, Any]:
-            trip = by_id.get(trip_id, {})
-            return {
-                "trip_id": trip_id,
-                "origin": str(trip.get("origin") or ""),
-                "destination": str(trip.get("destination") or ""),
-                "start_date": str(trip.get("start_date") or ""),
-                "end_date": str(trip.get("end_date") or ""),
-            }
-
-        if all(len(ids) <= 1 for ids in groups.values()):
+        duplicates = [entry["trip_id"] for entry in plan["duplicates"]]
+        ambiguous = set(plan["ambiguous_ids"])
+        if plan["groups_with_duplicates"] == 0:
             _emit(
                 {
                     "user_id": user_id,
                     "dry_run": dry_run,
-                    "total_trips": len(trips),
+                    "total_trips": plan["total_trips"],
                     "duplicates": [],
-                    "ambiguous_ids": [],
+                    "ambiguous_ids": sorted(ambiguous),
                     "removed": 0,
                 }
             )
             if not as_json:
-                print(f"用户 {user_id}：没有重复行程（共 {len(trips)} 条）")
+                print(
+                    f"用户 {user_id}：没有重复行程（共 {plan['total_trips']} 条）"
+                )
             return 0
 
-        # 同一 trip_id 出现在多条不同行程里时，delete_trip 可能删错行：
-        # 这类 id 不自动处理，提示人工清理
-        id_groups: dict[str, set[tuple[str, str, str, str]]] = {}
-        for key, ids in groups.items():
-            for trip_id in ids:
-                id_groups.setdefault(trip_id, set()).add(key)
-        ambiguous = {trip_id for trip_id, keys in id_groups.items() if len(keys) > 1}
         if ambiguous and not as_json:
             print(
                 "警告：以下 trip_id 同时属于多条不同行程，无法安全自动删除，"
                 "请人工处理：" + "、".join(sorted(ambiguous))
             )
 
-        # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，
-        # 避免把仅剩的副本也删掉。JSON 后端的 get_trip_history 返回进程启动时
-        # 的快照，必须先 reload，否则复核永远是“未变化”
-        reload = getattr(store, "reload", None)
-        if callable(reload):
-            reload()
-        try:
-            fresh_ids = {
-                str(trip.get("trip_id") or "")
-                for trip in store.get_trip_history(limit=None)
-            }
-        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"读取行程失败：{exc}")
-
-        duplicate_entries = [
-            (ids[0], trip_id)
-            for ids in groups.values()
-            for trip_id in ids[1:]
-            if ids[0] in fresh_ids and trip_id not in ambiguous
-        ]
-        duplicates = [trip_id for _, trip_id in duplicate_entries]
-
         if dry_run:
             _emit(
                 {
                     "user_id": user_id,
                     "dry_run": True,
-                    "total_trips": len(trips),
+                    "total_trips": plan["total_trips"],
                     "would_remove": len(duplicates),
-                    "duplicates": [_entry(trip_id) for trip_id in duplicates],
+                    "duplicates": plan["duplicates"],
                     "ambiguous_ids": sorted(ambiguous),
                     "removed": 0,
                 }
@@ -2992,59 +2943,44 @@ def run_trips_dedupe_standalone(
             if as_json:
                 return 0
             if not duplicates:
-                print(f"用户 {user_id}：没有需要删除的重复行程（共 {len(trips)} 条）")
+                print(
+                    f"用户 {user_id}：没有需要删除的重复行程（共 {plan['total_trips']} 条）"
+                )
                 return 0
             print(
                 f"用户 {user_id}：发现 {len(duplicates)} 条重复行程（--dry-run，不删除）："
             )
-            for trip_id in duplicates:
-                trip = by_id.get(trip_id, {})
-                route = f"{trip.get('origin') or '—'} → {trip.get('destination') or '—'}"
+            for entry in plan["duplicates"]:
+                route = (
+                    f"{entry['origin'] or '—'} → {entry['destination'] or '—'}"
+                )
                 dates = (
                     " ~ ".join(
                         part
-                        for part in (trip.get("start_date"), trip.get("end_date"))
+                        for part in (entry["start_date"], entry["end_date"])
                         if part
                     )
                     or "日期未记录"
                 )
-                print(f"  将删除 {trip_id}（{route}，{dates}）")
+                print(f"  将删除 {entry['trip_id']}（{route}，{dates}）")
             print("去掉 --dry-run 即可执行删除")
             return 0
 
-        removed = 0
-        failure: str | None = None
-        try:
-            for kept_id, trip_id in duplicate_entries:
-                if not trip_id:
-                    continue
-                # 与组内保留项同 id 的副本（旧版给两条行程生成过同一个
-                # trip_id）：delete_trip 删最早一条，会把要保留的记录删掉、
-                # 留下后来的重复行——同 id 时必须删除最后插入的一条
-                deleter = (
-                    store.delete_duplicate_trip
-                    if trip_id == kept_id
-                    and hasattr(store, "delete_duplicate_trip")
-                    else store.delete_trip
-                )
-                if deleter(trip_id):
-                    removed += 1
-        except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
-            failure = str(exc)
+        removed, failure = apply_trip_dedupe(store, plan["duplicate_entries"])
         if as_json:
             if failure is not None:
                 return _fail(
                     f"删除过程中失败：{failure}（已删除 {removed} 条）",
                     removed=removed,
-                    duplicates=[_entry(trip_id) for trip_id in duplicates],
+                    duplicates=plan["duplicates"],
                 )
             _emit(
                 {
                     "user_id": user_id,
                     "dry_run": False,
-                    "total_trips": len(trips),
+                    "total_trips": plan["total_trips"],
                     "removed": removed,
-                    "duplicates": [_entry(trip_id) for trip_id in duplicates],
+                    "duplicates": plan["duplicates"],
                     "ambiguous_ids": sorted(ambiguous),
                 }
             )
@@ -3055,7 +2991,9 @@ def run_trips_dedupe_standalone(
         if duplicates:
             print(f"用户 {user_id}：删除 {removed} 条重复行程（保留最早记录）")
         else:
-            print(f"用户 {user_id}：没有需要删除的重复行程（共 {len(trips)} 条）")
+            print(
+                f"用户 {user_id}：没有需要删除的重复行程（共 {plan['total_trips']} 条）"
+            )
         return 1 if ambiguous else 0
     finally:
         close = getattr(store, "close", None)

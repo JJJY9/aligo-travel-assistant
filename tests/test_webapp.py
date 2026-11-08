@@ -4006,6 +4006,139 @@ def test_trips_csv_export_query_filter():
         _cleanup(user_id)
 
 
+def test_trips_dedupe_endpoint_dry_run_and_apply(monkeypatch):
+    """POST /api/trips/dedupe：dry-run 只预览，正式执行保留最早一条。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def __init__(self):
+            self.trips = [
+                {
+                    "trip_id": "t1",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-1-5",
+                    "end_date": "2026-1-6",
+                },
+                {
+                    "trip_id": "t2",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-01-05",
+                    "end_date": "2026-01-06",
+                },
+                {
+                    "trip_id": "t3",
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-02-01",
+                    "end_date": "2026-02-02",
+                },
+            ]
+            self.deleted = []
+
+        def get_trip_history(self, limit=None):
+            return list(self.trips)
+
+        def reload(self):
+            pass
+
+        def delete_trip(self, trip_id):
+            for index, trip in enumerate(self.trips):
+                if str(trip.get("trip_id")) == trip_id:
+                    self.trips.pop(index)
+                    self.deleted.append(trip_id)
+                    return True
+            return False
+
+        def close(self):
+            pass
+
+    store = _Store()
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id, **kwargs: store
+    )
+    client = _client()
+    preview = client.post(
+        "/api/trips/dedupe", params={"user_id": "u-dedupe", "dry_run": 1}
+    )
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["dry_run"] is True and data["would_remove"] == 1
+    assert [entry["trip_id"] for entry in data["duplicates"]] == ["t2"]
+    assert store.deleted == [], "预览不能删除任何行程"
+
+    applied = client.post("/api/trips/dedupe", params={"user_id": "u-dedupe"})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["removed"] == 1
+    assert [trip["trip_id"] for trip in store.trips] == ["t1", "t3"]
+    print("✓ /api/trips/dedupe 预览与执行")
+
+
+def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
+    """读取失败映射 503；同 id 多行程只报告不删除。"""
+    from webapp import server as server_module
+
+    class _Boom:
+        def get_trip_history(self, limit=None):
+            raise RuntimeError("disk gone")
+
+        def reload(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id, **kwargs: _Boom()
+    )
+    response = _client().post(
+        "/api/trips/dedupe", params={"user_id": "u-dedupe"}
+    )
+    assert response.status_code == 503
+    assert "读取行程失败" in response.json()["detail"]
+
+    class _Ambiguous:
+        def __init__(self):
+            self.trips = [
+                {
+                    "trip_id": "dup",
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-01-05",
+                },
+                {
+                    "trip_id": "dup",
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-01-05",
+                },
+            ]
+
+        def get_trip_history(self, limit=None):
+            return list(self.trips)
+
+        def reload(self):
+            pass
+
+        def delete_trip(self, trip_id):
+            raise AssertionError("歧义 id 不应被删除")
+
+        def close(self):
+            pass
+
+    ambiguous = _Ambiguous()
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id, **kwargs: ambiguous
+    )
+    data = _client().post(
+        "/api/trips/dedupe", params={"user_id": "u-dedupe"}
+    ).json()
+    assert data["removed"] == 0
+    assert data["ambiguous_ids"] == ["dup"]
+    print("✓ /api/trips/dedupe 错误映射与歧义 id")
+
+
 def test_trips_csv_storage_failure_maps_503(monkeypatch):
     from webapp import server as server_module
 
@@ -8619,6 +8752,12 @@ if __name__ == "__main__":
         test_delete_session_storage_failure_maps_503(_mp_storage)
     finally:
         _mp_storage.undo()
+    _mp_dedupe = pytest.MonkeyPatch()
+    try:
+        test_trips_dedupe_endpoint_dry_run_and_apply(_mp_dedupe)
+        test_trips_dedupe_endpoint_errors_and_ambiguous(_mp_dedupe)
+    finally:
+        _mp_dedupe.undo()
     test_sessions_pagination()
     _mp = pytest.MonkeyPatch()
     try:

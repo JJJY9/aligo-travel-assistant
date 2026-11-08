@@ -775,6 +775,52 @@ function scenarioTripsExport(source) {
   return { filtered, collapsed };
 }
 
+async function scenarioTripsDedupe(source) {
+  const runScenario = async (preview, confirmResult, applyResult) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      __requests = [];
+      __toasts = [];
+      __confirmCalls = 0;
+      __confirmMessage = "";
+      __refreshed = 0;
+      confirm = (message) => { __confirmCalls += 1; __confirmMessage = message; return ${confirmResult}; };
+      refreshStatus = async () => { __refreshed += 1; };
+      getJSON = (url, options) => {
+        __requests.push({ url, options: options || {} });
+        const data = url.includes("dry_run=1") ? ${JSON.stringify(preview)} : ${JSON.stringify(applyResult)};
+        return Promise.resolve(data);
+      };
+      state.userId = "u-dedupe";
+      bindEvents();
+    `);
+    run("els.tripsDedupe.click();");
+    for (let i = 0; i < 50; i += 1) {
+      await tick();
+      // 按钮在 finally 复位：等待它从「检查中…」恢复即表示整段流程结束
+      if (!run("els.tripsDedupe.disabled")) break;
+    }
+    return run(`({
+      urls: __requests.map((item) => item.url),
+      methods: __requests.map((item) => (item.options || {}).method || ""),
+      toasts: __toasts.slice(),
+      confirmCalls: __confirmCalls,
+      confirmMessage: __confirmMessage,
+      refreshed: __refreshed,
+      button: {
+        text: els.tripsDedupe.textContent,
+        disabled: els.tripsDedupe.disabled,
+      },
+    })`);
+  };
+  return {
+    empty: await runScenario({ would_remove: 0 }, "true", { removed: 0 }),
+    cancel: await runScenario({ would_remove: 2 }, "false", { removed: 2 }),
+    applied: await runScenario({ would_remove: 2 }, "true", { removed: 2 }),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -801,6 +847,8 @@ async function main() {
     payload = await scenarioDecode(source);
   } else if (scenario === "tripsExport") {
     payload = scenarioTripsExport(source);
+  } else if (scenario === "tripsDedupe") {
+    payload = await scenarioTripsDedupe(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

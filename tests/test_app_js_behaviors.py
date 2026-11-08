@@ -264,6 +264,39 @@ def test_trips_export_button_uses_filtered_ics_endpoint():
     print("✓ 导出行程按钮按筛选走 format=ics")
 
 
+def test_trips_dedupe_panel_flow():
+    """面板「清理重复」：空 / 取消 / 执行三种路径的请求与提示。"""
+    results = _run_harness("tripsDedupe")
+
+    empty = results["empty"]
+    assert empty["urls"] == [
+        "/api/trips/dedupe?user_id=u-dedupe&dry_run=1"
+    ], empty
+    assert empty["confirmCalls"] == 0, "没有重复时不弹确认"
+    assert empty["toasts"] == ["没有重复行程可清理"]
+    assert empty["refreshed"] == 0
+    assert empty["button"] == {"text": "清理重复", "disabled": False}
+
+    cancel = results["cancel"]
+    assert len(cancel["urls"]) == 1, "取消确认后不能再发删除请求"
+    assert cancel["urls"][0].endswith("dry_run=1")
+    assert cancel["confirmCalls"] == 1
+    assert "2 条重复行程" in cancel["confirmMessage"]
+    assert cancel["toasts"] == ["已取消清理重复行程"]
+    assert cancel["refreshed"] == 0
+    assert cancel["button"] == {"text": "清理重复", "disabled": False}
+
+    applied = results["applied"]
+    assert len(applied["urls"]) == 2, applied
+    assert applied["urls"][0].endswith("dry_run=1")
+    assert "dry_run" not in applied["urls"][1]
+    assert applied["methods"] == ["POST", "POST"]
+    assert applied["toasts"] == ["已清理 2 条重复行程"]
+    assert applied["refreshed"] == 1, "执行成功后刷新一次数据概览"
+    assert applied["button"] == {"text": "清理重复", "disabled": False}
+    print("✓ 行程去重面板（空 / 取消 / 执行）")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -273,5 +306,6 @@ if __name__ == "__main__":
     test_knowledge_actions_arbitrate_shared_result_bar()
     test_trip_import_file_decoding_and_size_guard()
     test_trips_export_button_uses_filtered_ics_endpoint()
+    test_trips_dedupe_panel_flow()
     test_knowledge_eval_panel_states()
     print("\n全部通过")
