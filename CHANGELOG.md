@@ -37,6 +37,8 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- CLI `sessions` / `trips` / `preferences` / `stats --json` 的失败路径统一输出 `{ok: false, error}`（此前纯文本，脚本解析 JSON 直接失败；非 `--json` 模式保持原提示）
+- `trip-update`（CLI 与 Web PUT）对存量未补零日期（`2026-1-5`）按归一日期解析：仅改目的时冲突照常计算、补填返程日期不再被误拒「先设置出发日期」
 - 行程导出：历史未补零日期（2026-1-5）导出时补零，CSV 回导不再被严格校验跳过、ICS 不再丢事件（`normalize_identity_date` 移到 `utils/trip_export` 供导入复用）
 - 安全：`POST /api/trips/dedupe` 改为 JSON body（`user_id` / `dry_run`）并接入读取限流桶——跨站表单无法再静默触发全量去重删除
 - 安全：`/api/import` 仅接受 `application/json`（`text/plain` 属 CORS 简单请求，任意网页可跨站向任意 `user_id` 写入备份；现在返回 415）

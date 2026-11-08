@@ -100,7 +100,7 @@ from utils.trip_export import (
     render_trips_html,
     render_trips_ics,
 )
-from utils.trip_import import import_trips_from_text
+from utils.trip_import import import_trips_from_text, normalize_identity_date
 from utils.travel_stats import summarize_travel
 from utils.timestamps import chronological_key
 from utils.turn_meta import extract_turn_meta
@@ -3885,12 +3885,19 @@ def create_app(model: Any = None) -> FastAPI:
             end = None
             if merged.get("start_date"):
                 try:
-                    start = datetime.strptime(str(merged["start_date"]), "%Y-%m-%d")
+                    # 存量未补零日期（2026-1-5）先归一：否则仅改其它字段时
+                    # conflicts 恒空、补填返程日期被误拒「先设置出发日期」
+                    start = datetime.strptime(
+                        normalize_identity_date(merged["start_date"]),
+                        "%Y-%m-%d",
+                    )
                 except ValueError:
                     start = None
             if merged.get("end_date"):
                 try:
-                    end = datetime.strptime(str(merged["end_date"]), "%Y-%m-%d")
+                    end = datetime.strptime(
+                        normalize_identity_date(merged["end_date"]), "%Y-%m-%d"
+                    )
                 except ValueError:
                     end = None
             if fields.get("end_date") and start is None:
