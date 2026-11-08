@@ -125,6 +125,27 @@ def next_entity_id(
     return candidate
 
 
+def record_used_entity_id(
+    client: Any,
+    collection_name: str,
+    last_used: int,
+    id_field: str = "id",
+) -> None:
+    """登记一批插入实际占用的最大 id：批量插入后水位要越过整批。
+
+    ``next_entity_id`` 只把返回的「下一个」登记为水位；一次插入 N 条时
+    其余 N-1 个 id 不在水位里，删除整批后新增会复用这些已删除的 id，
+    持有旧 id 的标签页 / 脚本会把改删静默落到新知识上。
+    """
+    with _ID_LOCK:
+        per_client = _LAST_IDS.get(client)
+        if per_client is None:
+            per_client = {}
+            _LAST_IDS[client] = per_client
+        state_key = (collection_name, id_field)
+        per_client[state_key] = max(per_client.get(state_key, 0), int(last_used))
+
+
 def reset_milvus_client(db_path: str) -> None:
     """关闭并移除某个数据库路径的共享客户端（重连时使用）。
 

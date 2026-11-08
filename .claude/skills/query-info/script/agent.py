@@ -229,6 +229,15 @@ class InformationQueryAgent(AgentBase):
         q = (query or "").strip()
 
         _CITY_PUNCT = "，。、！？；：,.!?;:…—-~～（）()《》\"'“”‘’ \t"
+        # 兜底截出的常见非城市词：当成城市送去地理编码只会得到无意义结果
+        # （或把「我要 / 出差」当城市名），必须按「未识别到城市」处理
+        _CITY_STOPWORDS = frozenset({
+            "我要", "我想", "我们", "你们", "咱们", "出差", "旅行", "旅游",
+            "出行", "上班", "下班", "最近", "现在", "目前", "今天", "明天",
+            "后天", "昨天", "周末", "这周", "下周", "什么", "怎么", "哪里",
+            "这边", "那边", "这里", "那里", "附近", "情况", "天气", "气温",
+            "预报", "活动", "安排", "计划", "准备", "一下", "请问", "帮我",
+        })
 
         def _clean_city_head(text: str) -> str:
             """去掉方向动词 / 时间词 / 助词 / 标点：'去东京，' → '东京'。"""
@@ -238,6 +247,13 @@ class InformationQueryAgent(AgentBase):
                 "",
                 value,
             )
+            value = re.sub(
+                r"^(?:我|我们|咱们|你|您|他|她|他们)(?:们|还|也|要|想|准备|"
+                r"计划|打算|即将|马上)?",
+                "",
+                value,
+            )
+            value = re.sub(r"^(?:最近|现在|目前)", "", value)
             value = re.sub(r"^(?:去|到|飞往|飞|往|在|从|至)+", "", value)
             value = re.sub(
                 r"(?:明天|今天|后天|昨天|大后天|周[一二三四五六日末]|下周|这周|本周|"
@@ -271,6 +287,8 @@ class InformationQueryAgent(AgentBase):
             )[0]
             head = _clean_city_head(head)
             if 2 <= len(head) <= 6 and re.fullmatch(r"[一-龥]+", head):
+                if head in _CITY_STOPWORDS:
+                    return ""
                 return head
             return ""
 
@@ -314,7 +332,12 @@ class InformationQueryAgent(AgentBase):
         )
         head = _clean_city_head(head)
         match = re.search(r"[一-龥]{2,4}", head)
-        return match.group(0).strip() if match else ""
+        if not match:
+            return ""
+        candidate = match.group(0).strip()
+        if candidate in _CITY_STOPWORDS:
+            return ""
+        return candidate
 
     async def _web_search(self, query: str) -> dict[str, Any]:
         """
