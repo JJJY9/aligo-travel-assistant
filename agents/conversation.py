@@ -176,14 +176,11 @@ class ConversationRuntime:
         persist_started = False
         committed: bool | None = None
         turn_state = {"rollback_requested": False}
-        # 上一轮失败后的回滚可能还在后台线程里：先等它结束再暂存本轮提问，
-        # 否则内容相同时回滚会把本轮刚暂存的提问当成上一轮孤儿删掉
-        pending_rollback = getattr(self, "_pending_rollback", None)
-        if pending_rollback is not None and not pending_rollback.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(pending_rollback), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("等待上一轮回滚超时，继续本轮")
+        # 上一轮落库 / 回滚可能仍在途（用户停止后 drain 超时、后台回滚线程
+        # 未结束）：先等它收尾，失败 / 否决时在这里补回滚，再暂存本轮提问。
+        # 否则旧回调的回滚按内容匹配可能删掉本轮刚暂存的同一文本提问。
+        # 落库线程超时仍未结束时只能继续（用户锁已在上一轮入口释放）。
+        await self.drain_pending_persist()
         try:
             await asyncio.to_thread(self.memory.stage_message, "user", user_input)
             orchestration = await self._call_with_resilience(
@@ -275,7 +272,7 @@ class ConversationRuntime:
             return
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout_sec)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except asyncio.TimeoutError:
             logger.debug("等待回滚暂存提问未在限时内完成，后台线程继续执行")
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
             logger.warning("回滚暂存提问失败", exc_info=True)
@@ -317,14 +314,16 @@ class ConversationRuntime:
             # 取消后没人再 await 这个任务：取走异常，避免
             # 「Task exception was never retrieved」的告警
             return
+        failed = object()
         try:
             outcome = pending.result()
         except Exception:  # noqa: BLE001 - 落库失败由回滚兜底
-            outcome = None
+            outcome = failed
         if turn_state is None:
             return
-        if outcome is True:
-            # 整轮已提交：不需要回滚（标记后主路径 / drain 也不会再回滚）
+        if outcome is not False and outcome is not failed:
+            # True（已提交）或 None（旧实现无返回值按成功处理）：
+            # 不需要回滚（标记后主路径 / drain 也不会再回滚）
             turn_state["rollback_requested"] = True
             return
         # 写入失败 / 守卫否决（会话已删除）：取消时跳过的回滚在这里补上
@@ -348,7 +347,8 @@ class ConversationRuntime:
             # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它
             await self._await_pending_rollback()
             return True
-        outcome: bool | None = None
+        failed = object()
+        outcome: object = None
         try:
             outcome = await asyncio.wait_for(
                 asyncio.shield(pending), timeout=timeout_sec
@@ -361,9 +361,9 @@ class ConversationRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 落库失败由回滚兜底
-            outcome = None
+            outcome = failed
         last_turn = getattr(self, "_last_persist_turn", None)
-        if last_turn is not None and outcome is not True:
+        if last_turn is not None and (outcome is False or outcome is failed):
             # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
             # 结束，保证释放用户锁前回滚已落地）
             await self._request_staged_rollback(*last_turn)

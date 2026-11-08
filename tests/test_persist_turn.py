@@ -140,11 +140,11 @@ class _BlockingMemory:
         self.rollback_started.set()
         if self.block_rollback:
             self.allow_rollback.wait(5)
-        for index in range(len(self.staged) - 1, -1, -1):
-            role, staged_content = self.staged[index]
-            if role == "user" and staged_content == content:
-                del self.staged[index]
-                return True
+        # 与生产 MemoryManager.rollback_staged_message 同语义：仅当末尾仍是
+        # 这条未回答的用户提问时才删除（不向前搜索，否则会掩盖串轮缺陷）
+        if self.staged and self.staged[-1] == ("user", content):
+            self.staged.pop()
+            return True
         return False
 
     def persist_turn(self, user_content, assistant_content, should_commit=None):
@@ -297,8 +297,13 @@ def test_cancel_with_failed_persist_rolls_back_staged():
         with pytest.raises(asyncio.CancelledError):
             await task
         memory.release.set()
+        # 先只等完成回调补回滚（不调用 drain），确认回调路径独立生效；
+        # 回滚线程在 set() 之后才移除暂存项，落地断言放到 drain 之后
+        assert await asyncio.to_thread(memory.rollback_seen.wait, 5)
+        assert memory.rolled_back == ["你好"]
+        # drain 只确认在途落库 / 回滚结束；回滚已由回调完成，不得重复回滚
         assert await runtime.drain_pending_persist(timeout_sec=10) is True
-        await asyncio.to_thread(memory.rollback_seen.wait, 5)
+        assert ("user", "你好") not in memory.staged, "drain 返回前回滚必须已落地"
 
     asyncio.run(scenario())
     assert memory.rolled_back == ["你好"]
@@ -319,8 +324,10 @@ def test_cancel_with_vetoed_persist_rolls_back_staged():
         with pytest.raises(asyncio.CancelledError):
             await task
         memory.release.set()
+        assert await asyncio.to_thread(memory.rollback_seen.wait, 5)
+        assert memory.rolled_back == ["你好"]
         assert await runtime.drain_pending_persist(timeout_sec=10) is True
-        await asyncio.to_thread(memory.rollback_seen.wait, 5)
+        assert ("user", "你好") not in memory.staged, "drain 返回前回滚必须已落地"
 
     asyncio.run(scenario())
     assert memory.rolled_back == ["你好"]
@@ -359,6 +366,40 @@ def test_next_turn_waits_for_previous_rollback():
     print("✓ 新回合等待上一轮回滚完成")
 
 
+def test_next_turn_waits_for_inflight_persist_after_drain_timeout():
+    """drain 超时（Web 入口随后释放用户锁）后旧落库仍在途：
+
+    下一轮开始前必须先等它收尾并补回滚，再暂存本轮提问——否则旧回滚按
+    内容匹配会删掉新一轮同一文本的暂存提问。
+    """
+    memory = _BlockingMemory(veto=True)
+    runtime = _make_runtime(memory)
+
+    async def scenario():
+        first = asyncio.create_task(runtime.ask("同一个问题"))
+        await asyncio.to_thread(memory.started.wait, 10)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # 落库线程仍被挡住：drain 只能超时返回 False（模拟 Web 入口丢弃返回值）
+        assert await runtime.drain_pending_persist(timeout_sec=0.05) is False
+        second = asyncio.create_task(runtime.ask("同一个问题"))
+        await asyncio.sleep(0.2)
+        assert memory.stage_calls == 1, "上一轮落库未收尾前不能暂存新提问"
+        memory.release.set()
+        await second
+
+    asyncio.run(scenario())
+    stages = [i for i, event in enumerate(memory.events) if event[0] == "stage"]
+    rollbacks = [
+        i for i, event in enumerate(memory.events) if event[0] == "rollback"
+    ]
+    assert len(stages) == 2, memory.events
+    assert rollbacks and rollbacks[0] < stages[1], "旧回滚必须在新暂存之前完成"
+    assert ("user", "同一个问题") not in memory.staged
+    print("✓ drain 超时后下一轮仍等待旧落库 / 回滚")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -372,6 +413,7 @@ if __name__ == "__main__":
         test_cancel_with_failed_persist_rolls_back_staged()
         test_cancel_with_vetoed_persist_rolls_back_staged()
         test_next_turn_waits_for_previous_rollback()
+        test_next_turn_waits_for_inflight_persist_after_drain_timeout()
         test_drain_without_pending_returns_immediately()
     finally:
         _mp.undo()
