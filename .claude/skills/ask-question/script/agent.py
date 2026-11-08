@@ -36,6 +36,7 @@ from utils.json_parser import extract_json_from_async_response
 from utils.milvus_client import (  # noqa: F401 - shutdown_milvus_clients 供外部清理
     get_milvus_client,
     next_entity_id,
+    record_used_entity_id,
     reset_milvus_client,
     shutdown_milvus_clients,
 )
@@ -114,6 +115,21 @@ class RAGKnowledgeAgent(AgentBase):
         if not embedding_model:
             embedding_model = "BAAI/bge-small-zh-v1.5"
 
+        # 初始化 Milvus Lite（本地文件存储）。先检查库是否存在再加载嵌入
+        # 模型：检索路径不创建知识库（create_if_missing=False），未初始化
+        # 时必须直接返回专用提示——先加载 / 联网下载模型会白耗资源，下载
+        # 错误还会把真正的「知识库未初始化」提示盖掉
+        milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
+        db_existed = Path(milvus_db_path).exists()
+        if not db_existed and not create_if_missing:
+            self.initialized = False
+            self.init_error = (
+                "知识库尚未初始化（找不到 milvus_lite.db），请先运行 "
+                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+            )
+            logger.error(self.init_error)
+            return
+
         # 若配置的是本地路径且存在，则从本地加载，否则按模型 ID 使用（会联网）
         model_path_or_id = embedding_model
         path_obj = Path(embedding_model).expanduser()
@@ -138,21 +154,7 @@ class RAGKnowledgeAgent(AgentBase):
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
         # 初始化 Milvus Lite（本地文件存储）
-        milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
-
-        # 检索路径不创建知识库（create_if_missing=False）：Milvus Lite 打开
-        # 不存在的库会静默新建空库，把「未初始化」回答成「没有找到相关信息」。
-        # 初始化脚本与知识管理写入路径显式传 True（它们负责创建 / 写入）
-        db_existed = Path(milvus_db_path).exists()
-        if not db_existed and not create_if_missing:
-            self.initialized = False
-            self.init_error = (
-                "知识库尚未初始化（找不到 milvus_lite.db），请先运行 "
-                "python .claude/skills/ask-question/script/init_knowledge_base.py"
-            )
-            logger.error(self.init_error)
-            return
 
         self._milvus_db_path = milvus_db_path
         self._client_created_at = None  # 用于追踪客户端创建时间
@@ -312,6 +314,12 @@ class RAGKnowledgeAgent(AgentBase):
                 collection_name=self.collection_name,
                 data=data_to_insert
             )
+            # 水位要越过整批：只登记「下一个」会让其余 id 在整批删除后
+            # 被复用，持有旧 id 的标签页 / 脚本会把改删落到新知识上
+            if inserted_ids:
+                record_used_entity_id(
+                    self.milvus_client, self.collection_name, inserted_ids[-1]
+                )
 
             # 获取总数（仅用于展示；统计失败不能把已成功的写入报成失败）
             try:
@@ -635,6 +643,7 @@ class RAGKnowledgeAgent(AgentBase):
         ])
 
         # 如果有LLM，使用LLM生成答案
+        answer_error = ""
         if self.model:
             # 动态读取 Prompt 指令 (Progressive Disclosure)
             skill_instruction = self.skill_loader.get_skill_content("ask-question")
@@ -671,6 +680,7 @@ class RAGKnowledgeAgent(AgentBase):
 
                 if not answer:
                     answer = "无法生成答案"
+                    answer_error = "模型未返回答案内容"
                 
                 # 清理 LLM 可能输出的 JSON 格式
                 answer_str = answer.strip()
@@ -686,12 +696,15 @@ class RAGKnowledgeAgent(AgentBase):
             except Exception as e:
                 logger.error(f"Error generating answer with LLM: {e}")
                 answer = f"知识库中找到相关信息，但生成答案时出错：{e!s}"
+                # 生成失败不能被当成正常回答：编排层要能标记失败并按
+                # 瞬时错误（timeout / connection）触发一次退避重试
+                answer_error = str(e) or type(e).__name__
         else:
             # 如果没有LLM，直接返回检索到的知识
             answer = "以下是知识库中的相关信息：\n\n" + knowledge_context
 
         result = {
-            "status": "success",
+            "status": "error" if answer_error else "success",
             "query": user_query,
             "answer": answer,
             "retrieved_documents": [
@@ -702,6 +715,8 @@ class RAGKnowledgeAgent(AgentBase):
                 for doc in retrieved_docs
             ]
         }
+        if answer_error:
+            result["error"] = f"生成答案失败：{answer_error}"
 
         return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
 

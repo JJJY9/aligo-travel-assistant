@@ -78,7 +78,14 @@ def result_to_markdown(result_data: dict[str, Any]) -> str:
             # 智能体可能返回字符串 / 列表 / null：包一层，渲染器不再崩溃
             data = {"result": data}
         if status == "error":
-            error = data.get("error") or data.get("message") or "未知错误"
+            # 聚合结果里的 message 是编排层提取的失败原因（code 可能在
+            # 嵌套的 results 里）；优先展示它，避免退化成「未知错误」
+            error = (
+                item.get("message")
+                or data.get("error")
+                or data.get("message")
+                or "未知错误"
+            )
             blocks.append(f"> ⚠️ **{display_name(agent_name)}** 执行失败：{error}")
             continue
         try:

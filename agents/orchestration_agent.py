@@ -721,13 +721,19 @@ class OrchestrationAgent(AgentBase):
 
         # 收集每个智能体的结果
         for result in results:
-            aggregated["results"].append({
+            entry = {
                 "agent_name": result["agent_name"],
                 "priority": result["priority"],
                 "status": result["result"].get("status", "unknown"),
                 "data": result["result"].get("data", {}),
                 "duration": result["result"].get("duration"),
-            })
+            }
+            # 失败原因（_run_agent 已从嵌套 results / query_success 提取）：
+            # 不带上会在回复 / 历史重渲染里退化成「未知错误」
+            message = result["result"].get("message")
+            if message:
+                entry["message"] = message
+            aggregated["results"].append(entry)
 
         # 检查是否有错误
         errors = [r for r in results if r["result"].get("status") == "error"]

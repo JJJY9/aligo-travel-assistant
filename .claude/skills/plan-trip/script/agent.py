@@ -45,11 +45,27 @@ def _starts_with_json_array(text: str) -> bool:
         if first_object != -1 and first_object < index:
             return False
         try:
-            value, _ = decoder.raw_decode(text, index)
+            value, end = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
             index = text.find("[", index + 1)
             continue
-        return isinstance(value, list)
+        if not isinstance(value, list):
+            return False
+        # 前言里可整体解析的小数组（引用标记 [1]、Markdown 待办「- [ ]」）
+        # 后面若还跟着可解析的 JSON 对象（中间可能隔着说明文字），那是
+        # 前言，不能当成顶层输出、把紧随其后的合法行程丢掉
+        rest = text[end:]
+        probe = rest.find("{")
+        while probe != -1:
+            try:
+                nested, _ = decoder.raw_decode(rest, probe)
+            except json.JSONDecodeError:
+                probe = rest.find("{", probe + 1)
+                continue
+            if isinstance(nested, dict):
+                return False
+            probe = rest.find("{", probe + 1)
+        return True
     return False
 
 
@@ -249,6 +265,14 @@ class ItineraryPlanningAgent(AgentBase):
                     "行程规划结果不是 JSON 对象"
                     f"（实际类型：{type(result).__name__}）"
                 )
+
+            # 模型可能省略 SKILL.md 要求的 itinerary 包装、直接返回裸行程
+            # 对象：按成功返回会让回答为空、行程也不写长期记忆——补齐包装
+            if "itinerary" not in result and any(
+                key in result
+                for key in ("title", "daily_plans", "duration", "schedule")
+            ):
+                result = {"itinerary": result}
 
         except Exception as e:
             logger.error(f"Itinerary planning failed: {e}")
