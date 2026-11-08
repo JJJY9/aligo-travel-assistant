@@ -1259,7 +1259,14 @@ class PostgresLongTermMemory:
             self._execute(f"DELETE FROM {table} WHERE user_id = %s", (self.user_id,))
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        # 与所有数据库操作共用同一把实例锁：drain 超时后旧落库线程仍可能
+        # 在用连接，drop_session / 会话关闭不能把它从下面关掉
+        lock = getattr(self, "_conn_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._conn_lock = lock
+        with lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass

@@ -1853,6 +1853,53 @@ def test_pg_operations_serialized_across_threads():
     print("✓ PG 同实例操作跨线程串行化")
 
 
+def test_pg_close_waits_for_inflight_operation():
+    """close() 与数据库操作共用实例锁：不能关闭仍在执行的连接。"""
+    import threading
+    import time
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory._retry_errors = ()
+    active: list[int] = []
+    overlapped: list[int] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def execute(self, sql, params=None):
+            active.append(1)
+            time.sleep(0.05)
+            active.pop()
+
+    class _Conn:
+        closed = False
+
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            if active:
+                overlapped.append(1)
+            self.closed = True
+
+    conn = _Conn()
+    memory._conn = conn
+    worker = threading.Thread(target=lambda: memory._execute("SELECT 1"))
+    worker.start()
+    time.sleep(0.01)
+    memory.close()
+    worker.join()
+    assert overlapped == [], "close 在操作执行中关闭了连接"
+    assert conn.closed is True
+    print("✓ PG close 等待在途操作结束")
+
+
 def test_pg_add_chat_turn_locks_before_guard():
     """add_chat_turn 在同一事务内先锁会话元数据、再调守卫、最后插入。
 
@@ -2459,6 +2506,7 @@ if __name__ == "__main__":
     test_pg_retry_does_not_replay_non_idempotent_write()
     test_pg_non_idempotent_call_sites_disable_replay()
     test_pg_operations_serialized_across_threads()
+    test_pg_close_waits_for_inflight_operation()
     test_pg_add_chat_turn_locks_before_guard()
     test_pg_save_trip_histories_batches_with_one_index()
     test_json_add_chat_turn_guard_runs_under_write_lock()
