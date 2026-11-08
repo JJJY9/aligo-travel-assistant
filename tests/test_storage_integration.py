@@ -278,6 +278,92 @@ def test_pg_batch_save_matches_sequential():
         sequential.close()
 
 
+def test_pg_and_json_trip_saves_match():
+    """同一批行程在 PostgreSQL 与 JSON 后端的批量保存结果一致。"""
+    memory, _ = _pg_memory_or_skip()
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    json_store = LongTermMemory("json-parity", tempfile.mkdtemp())
+    rows = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        },
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-1",
+            "end_date": "2026-12-3",
+            "purpose": "客户会议",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-10",
+            "purpose": "培训",
+        },
+        {
+            "origin": "",
+            "destination": "广州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-22",
+            "purpose": "会议",
+            "session_id": "s-1",
+        },
+        {
+            "origin": "",
+            "destination": "广州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-22",
+            "purpose": "会议",
+            "session_id": "s-1",
+        },
+    ]
+    try:
+        pg_counts = memory.save_trip_histories([dict(row) for row in rows])
+        json_counts = json_store.save_trip_histories([dict(row) for row in rows])
+        assert pg_counts == json_counts, (pg_counts, json_counts)
+
+        keys = (
+            "trip_id",
+            "origin",
+            "destination",
+            "start_date",
+            "end_date",
+            "purpose",
+            "session_id",
+        )
+
+        def snapshot(store):
+            return [
+                {key: trip.get(key) for key in keys}
+                for trip in store.get_trip_history(limit=None)
+            ]
+
+        assert snapshot(memory) == snapshot(json_store)
+        assert (
+            memory.get_statistics()["total_trips"]
+            == json_store.get_statistics()["total_trips"]
+        )
+        # 同数量的城市顺序取决于数据库排序规则：按语义（城市 → 次数）比较
+        assert dict(memory.get_frequent_destinations(10)) == dict(
+            json_store.get_frequent_destinations(10)
+        )
+        # JSON 后端同数量按城市名排序（与 PostgreSQL ORDER BY 同口径）
+        json_frequent = json_store.get_frequent_destinations(10)
+        assert json_frequent == sorted(
+            json_frequent, key=lambda item: (-item[1], item[0])
+        ), json_frequent
+        print("✓ JSON / PG 批量保存结果一致")
+    finally:
+        memory.close()
+
+
 def test_pg_update_trip_normalizes_unpadded_dates():
     """update_trip 的重复检测与 save_trip_history 同一口径（未补零日期）。"""
     memory, _ = _pg_memory_or_skip()
