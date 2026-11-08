@@ -1617,7 +1617,12 @@ def _group_sessions(
         )
         entry["message_count"] += 1
         timestamp = str(message.get("timestamp") or "")
-        if timestamp:
+        if timestamp and (
+            not entry["updated_at"]
+            or chronological_key(timestamp) > chronological_key(entry["updated_at"])
+        ):
+            # 取会话内最大时间戳：恢复早于现有会话的备份后，消息按导出
+            # 顺序（时间升序）追加，直接覆盖会让 updated_at 回拨、排序错位
             entry["updated_at"] = timestamp
         if not entry["title"] and message.get("role") == "user":
             title = " ".join(str(message.get("content", "")).split())

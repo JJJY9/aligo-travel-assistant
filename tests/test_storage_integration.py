@@ -3,12 +3,13 @@ Redis / PostgreSQL 后端集成测试（需要真实服务）
 
 本地运行（先启动服务）：
     docker compose up -d
-    REDIS_URL=redis://localhost:6379/0 \\
-    DATABASE_URL=postgresql://aligo:aligo@localhost:5432/aligo \\
+    TEST_REDIS_URL=redis://localhost:6379/0 \\
+    TEST_POSTGRES_DSN=postgresql://aligo:aligo@localhost:5432/aligo \\
     pytest tests/test_storage_integration.py -q
 
 CI 中通过 service 容器 + TEST_REDIS_URL / TEST_POSTGRES_DSN 自动启用；
-未提供环境变量时相关用例自动跳过。
+未提供环境变量时相关用例自动跳过。测试只认 TEST_* 变量：不会误连
+开发 / 生产环境里配置的 REDIS_URL / DATABASE_URL（用例会清空用户数据）。
 
 运行：python tests/test_storage_integration.py
 """

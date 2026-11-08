@@ -117,9 +117,46 @@ def test_create_chat_model_max_retries_param():
     print("✓ create_chat_model 支持 max_retries")
 
 
+def test_kb_import_rate_limit_env():
+    """KB_IMPORT_RATE_LIMIT 控制知识库导入的独立限流桶（默认 1200）。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.RATE_LIMIT_CONFIG['kb_import_requests'])"
+    )
+    env = dict(os.environ)
+    env.pop("KB_IMPORT_RATE_LIMIT", None)
+    default = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert default.returncode == 0, default.stderr
+    assert default.stdout.strip() == "1200"
+    env["KB_IMPORT_RATE_LIMIT"] = "7"
+    configured = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert configured.returncode == 0, configured.stderr
+    assert configured.stdout.strip() == "7"
+    print("✓ KB_IMPORT_RATE_LIMIT 可配置（默认 1200）")
+
+
 if __name__ == "__main__":
     test_api_key_is_stripped_and_blank_falls_back()
     test_broken_config_local_import_is_not_swallowed()
     test_empty_env_model_and_base_url_fall_back()
     test_create_chat_model_max_retries_param()
+    test_kb_import_rate_limit_env()
     print("\n全部通过")
