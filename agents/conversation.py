@@ -45,11 +45,15 @@ class ConversationRuntime:
         session_id: str,
         model: Any,
         circuit_breaker: CircuitBreaker | None = None,
+        persist_guard: Callable[[], bool] | None = None,
     ) -> None:
         self.user_id = user_id
         self.session_id = session_id
         self.model = model
         self.circuit_breaker = circuit_breaker
+        # 落库守卫：存储层在写入锁 / 事务内调用，返回 False（会话刚被删除）
+        # 时整轮不落库，避免在途落库与删除并发时把已删除会话写回
+        self._persist_guard = persist_guard
         # 本轮流式请求是否已向熔断器记录过成功 / 失败（归还半开名额用）
         self._probe_recorded = False
         # 在途的记忆落库任务：取消 ask() 只取消协程，执行器线程仍会写完；
@@ -199,7 +203,10 @@ class ConversationRuntime:
             )
             pending = asyncio.ensure_future(
                 asyncio.to_thread(
-                    self.memory.persist_turn, user_input, assistant_payload
+                    self.memory.persist_turn,
+                    user_input,
+                    assistant_payload,
+                    should_commit=self._persist_guard,
                 )
             )
             self._pending_persist = pending

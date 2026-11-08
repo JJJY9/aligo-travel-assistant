@@ -64,10 +64,11 @@ class _FakeMemory:
         self.threads[f"persist-{role}"] = threading.get_ident()
         self.events.append((role, content))
 
-    def persist_turn(self, user_content, assistant_content):
+    def persist_turn(self, user_content, assistant_content, should_commit=None):
         # 整轮问答在同一次线程调用里提交（用户 + 助手），不能分两次
         self.threads["persist-user"] = threading.get_ident()
         self.threads["add-assistant"] = threading.get_ident()
+        self.persist_guard = should_commit
         self.events.append(("user", user_content))
         self.events.append(("assistant", assistant_content))
 
@@ -116,6 +117,7 @@ def _make_runtime():
     runtime.session_id = "s-ctx"
     runtime.model = None
     runtime.circuit_breaker = None
+    runtime._persist_guard = None
     runtime.intention_agent = _FakeIntention()
     runtime.orchestrator = _FakeOrchestrator()
     runtime.agent_cache = {}
@@ -172,13 +174,27 @@ def test_failed_orchestration_leaves_no_long_term_user_turn():
     print("✓ 编排失败不落孤儿用户轮（暂存提问回滚，Web 与 CLI 同契约）")
 
 
+def test_persist_guard_reaches_memory_write():
+    """落库守卫必须原样传给存储层（写入锁内判定会话是否已删除）。"""
+
+    def guard():
+        return False
+
+    runtime, memory = _make_runtime()
+    runtime._persist_guard = guard
+    result = asyncio.run(runtime.ask("你好"))
+    assert result["reply"]
+    assert memory.persist_guard is guard
+    print("✓ 落库守卫传递到记忆写入")
+
+
 def test_persist_failure_rolls_back_staged_user_message():
     """落库失败（长期记忆未写入）时暂存提问同样要回滚，两层记忆保持一致。"""
     from utils.errors import MemoryPersistenceError
 
     runtime, memory = _make_runtime()
 
-    def _boom(user_content, assistant_content):
+    def _boom(user_content, assistant_content, should_commit=None):
         raise MemoryPersistenceError("磁盘已满")
 
     memory.persist_turn = _boom  # type: ignore[method-assign]
@@ -327,5 +343,7 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     test_parse_failure_is_user_facing_error()
+    test_persist_guard_reaches_memory_write()
+    test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()
     print("\n全部通过")

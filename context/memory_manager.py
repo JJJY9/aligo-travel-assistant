@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -97,7 +98,12 @@ class MemoryManager:
             self._rebuild_long_term()
         self.long_term.add_chat_message(role, content, self.session_id)
 
-    def persist_turn(self, user_content: str, assistant_content: str) -> None:
+    def persist_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        should_commit: Callable[[], bool] | None = None,
+    ) -> bool:
         """一次性提交整轮问答（用户 + 助手）到长期记忆。
 
         ``persist_message("user")`` 与 ``add_message("assistant")`` 分两次
@@ -105,13 +111,28 @@ class MemoryManager:
         记忆留下没有回答的孤儿提问。这里委托给后端在同一把写锁 / 同一个
         事务里写入两条消息，短期记忆只补助手副本（用户消息已在编排前
         通过 :meth:`stage_message` 暂存）。
+
+        ``should_commit`` 由存储层在写入锁 / 事务内调用（会话刚被删除时
+        返回 False）：整轮被跳过时助手副本也不再进短期记忆。
+
+        Returns:
+            是否真的写入长期记忆
         """
         if getattr(self.long_term, "snapshot_based", True):
             self._rebuild_long_term()
-        self.long_term.add_chat_turn(
-            user_content, assistant_content, self.session_id
+        committed = self.long_term.add_chat_turn(
+            user_content,
+            assistant_content,
+            self.session_id,
+            should_commit=should_commit,
         )
+        if committed is False:
+            logger.info(
+                "会话在落库前被删除，跳过本轮写入：%s", self.session_id
+            )
+            return False
         self.stage_message("assistant", assistant_content)
+        return True
 
     def stage_message(
         self, role: str, content: str, metadata: dict | None = None

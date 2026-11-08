@@ -13,6 +13,7 @@ import threading
 import time
 import weakref
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -651,13 +652,23 @@ class LongTermMemory:
         user_content: str,
         assistant_content: str,
         session_id: str | None = None,
-    ) -> None:
+        should_commit: Callable[[], bool] | None = None,
+    ) -> bool:
         """原子追加一轮完整问答（用户 + 助手两条消息）。
 
         分成两次 ``add_chat_message`` 时，两次写回之间被取消 / 第二次写盘
         失败会把「有提问没有回答」的半轮落盘；这里合并为单次写锁 + 单次
         写回，写回失败时同时回滚内存中的两条追加（磁盘保持原状）。
+
+        ``should_commit`` 在持有写锁时调用：会话刚被删除（墓碑有效）时返回
+        False，整轮不写入——在途落库与删除并发时，检查与写入在同一把锁内
+        完成，不会把已删除的会话写回。
+
+        Returns:
+            是否真的写入
         """
+        if should_commit is not None and not should_commit():
+            return False
         now = datetime.now().isoformat()
         history = self.data["chat_history"]
         start = len(history)
@@ -686,6 +697,7 @@ class LongTermMemory:
             self.data["statistics"]["total_messages"] = total_before
             raise
         logger.debug("Added chat turn to long-term memory")
+        return True
 
     def get_chat_history(
         self,

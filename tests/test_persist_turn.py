@@ -73,8 +73,11 @@ def test_memory_manager_persist_turn_delegates_and_stages_assistant():
         def __init__(self):
             self.turns = []
 
-        def add_chat_turn(self, user_content, assistant_content, session_id=None):
+        def add_chat_turn(
+            self, user_content, assistant_content, session_id=None, should_commit=None
+        ):
             self.turns.append((user_content, assistant_content, session_id))
+            return True
 
     manager = MemoryManager("u1", "s1", storage_path=tempfile.mkdtemp())
     store = _TurnStore()
@@ -116,7 +119,7 @@ class _BlockingMemory:
     def stage_message(self, role, content, metadata=None):
         self.messages.append((role, content))
 
-    def persist_turn(self, user_content, assistant_content):
+    def persist_turn(self, user_content, assistant_content, should_commit=None):
         self.threads["persist"] = threading.get_ident()
         self.started.set()
         self.release.wait(10)
@@ -132,6 +135,7 @@ def _make_runtime(memory):
     runtime.circuit_breaker = None
     runtime._probe_recorded = False
     runtime._pending_persist = None
+    runtime._persist_guard = None
     runtime.agent_cache = {}
 
     class _Intention:
@@ -189,6 +193,29 @@ def test_cancel_during_persist_drains_with_both_messages():
     print("✓ 取消落在落库阶段：drain 等待整轮写完")
 
 
+def test_json_add_chat_turn_guard_vetoes_write():
+    """落库守卫返回 False（会话刚被删除）：整轮不写入。"""
+    memory = LongTermMemory("u-guard", tempfile.mkdtemp(prefix="chailv_turn_"))
+    assert (
+        memory.add_chat_turn("问题", "回答", "s-del", should_commit=lambda: False)
+        is False
+    )
+    assert memory.get_chat_history(limit=None) == []
+    assert memory.get_statistics()["total_messages"] == 0
+    print("✓ 落库守卫否决时整轮不写入（JSON）")
+
+
+def test_persist_turn_veto_skips_assistant_stage():
+    """守卫否决时不补暂存助手副本（短期记忆不留孤立回答）。"""
+    manager = MemoryManager("u-guard2", "s-del", storage_path=tempfile.mkdtemp())
+    assert (
+        manager.persist_turn("问题", "回答", should_commit=lambda: False) is False
+    )
+    assert manager.long_term.get_chat_history(limit=None) == []
+    assert manager.short_term.get_recent_context() == []
+    print("✓ 守卫否决时短期记忆不补助手副本")
+
+
 def test_drain_without_pending_returns_immediately():
     memory = _BlockingMemory()
     runtime = _make_runtime(memory)
@@ -201,7 +228,9 @@ if __name__ == "__main__":
     try:
         test_json_add_chat_turn_writes_pair_once()
         test_json_add_chat_turn_rolls_back_pair_on_persist_failure(_mp)
+        test_json_add_chat_turn_guard_vetoes_write()
         test_memory_manager_persist_turn_delegates_and_stages_assistant()
+        test_persist_turn_veto_skips_assistant_stage()
         test_cancel_during_persist_drains_with_both_messages()
         test_drain_without_pending_returns_immediately()
     finally:

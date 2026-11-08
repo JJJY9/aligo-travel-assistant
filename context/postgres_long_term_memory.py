@@ -13,6 +13,7 @@ import functools
 import logging
 import re
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -366,16 +367,26 @@ class PostgresLongTermMemory:
         user_content: str,
         assistant_content: str,
         session_id: str | None = None,
-    ) -> None:
+        should_commit: Callable[[], bool] | None = None,
+    ) -> bool:
         """同一事务写入一轮完整问答（用户 + 助手两条消息）。
 
         分开两次 INSERT 时，两次之间被取消 / 第二次失败会留下没有回答的
         孤儿提问；单事务保证两条一起提交或一起回滚。连接错误后不重放
         （无法区分事务是否已提交，重放会产生重复问答）。
+
+        ``should_commit`` 在事务内、写入前调用：会话刚被删除（墓碑有效）
+        时返回 False，整轮不写入——删除与在途落库并发时不会把已删除的
+        会话写回。
+
+        Returns:
+            是否真的写入
         """
 
-        def run() -> None:
+        def run() -> bool:
             with self._conn.transaction(), self._conn.cursor() as cursor:
+                if should_commit is not None and not should_commit():
+                    return False
                 cursor.executemany(
                     "INSERT INTO aligo_chat_messages "
                     "(user_id, role, content, session_id) "
@@ -385,8 +396,9 @@ class PostgresLongTermMemory:
                         (self.user_id, "assistant", assistant_content, session_id),
                     ],
                 )
+            return True
 
-        self._run_with_retry(run, replay_safe=False)
+        return bool(self._run_with_retry(run, replay_safe=False))
 
     def add_chat_messages(
         self, messages: list[dict[str, Any]], dedupe: bool = False
