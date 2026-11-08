@@ -2559,6 +2559,67 @@ def create_app(model: Any = None) -> FastAPI:
             ],
         }
 
+    @app.post("/api/knowledge/duplicates/cleanup")
+    def knowledge_duplicates_cleanup(
+        request: Request,
+        response: Response,
+        dry_run: bool = Query(default=True),
+    ) -> dict[str, Any]:
+        """清理内容完全相同的独立片段（每组保留最小 id；默认只预览）。
+
+        与 CLI ``kb-dedupe`` 同一语义：``dry_run=0`` 才真正删除；多分片
+        记录内部的相同段落不会被当成重复，删除时仍走 ``delete_document``
+        的单条保护（期间变成多分片记录会拒删）。
+        """
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        try:
+            groups = find_duplicate_contents()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"{exc}（先运行初始化脚本）"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+            logger.warning("读取重复知识片段失败: %s", exc)
+            raise HTTPException(status_code=503, detail=f"读取失败：{exc}") from exc
+        plan: list[dict[str, Any]] = []
+        for content, ids in groups:
+            keep = min(ids)
+            remove = sorted(doc_id for doc_id in ids if doc_id != keep)
+            if not remove:
+                continue
+            plan.append(
+                {
+                    "preview": " ".join(content.split())[:60],
+                    "content": content,
+                    "keep": keep,
+                    "remove": remove,
+                }
+            )
+        planned = sum(len(item["remove"]) for item in plan)
+        removed = 0
+        failed: list[dict[str, Any]] = []
+        if not dry_run:
+            for item in plan:
+                for doc_id in item["remove"]:
+                    try:
+                        count = int(delete_document(doc_id) or 0)
+                    except Exception as exc:  # noqa: BLE001 - 单条失败不影响其它组
+                        logger.warning("删除重复知识片段 %s 失败: %s", doc_id, exc)
+                        failed.append({"id": doc_id, "error": str(exc)})
+                        continue
+                    if count:
+                        removed += count
+                    else:
+                        failed.append({"id": doc_id, "error": "片段不存在或已被删除"})
+        return {
+            "dry_run": dry_run,
+            "groups": len(plan),
+            "planned": planned,
+            "removed": removed,
+            "failed": failed,
+            "plan": plan,
+        }
+
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
         payload: KnowledgeDocumentPayload, request: Request, response: Response

@@ -243,6 +243,7 @@ const els = {
   kbSemantic: byId("kbSemantic"),
   kbEval: byId("kbEval"),
   kbDuplicates: byId("kbDuplicates"),
+  kbDedupe: byId("kbDedupe"),
   kbEvalResult: byId("kbEvalResult"),
   kbForm: byId("kbForm"),
   kbContent: byId("kbContent"),
@@ -4137,6 +4138,57 @@ async function runKbDuplicates() {
   }
 }
 
+async function runKbDedupe() {
+  if (!els.kbDedupe) return;
+  els.kbDedupe.disabled = true;
+  els.kbDedupe.setAttribute("aria-busy", "true");
+  els.kbDedupe.textContent = "检查中…";
+  try {
+    const preview = await getJSON("/api/knowledge/duplicates/cleanup?dry_run=1", {
+      method: "POST",
+    });
+    const planned = Number(preview.planned || 0);
+    if (!planned) {
+      if (els.kbEvalResult) {
+        els.kbEvalResult.hidden = false;
+        els.kbEvalResult.classList.remove("warn");
+        els.kbEvalResult.textContent = "没有重复片段可清理";
+      }
+      return;
+    }
+    const ok = window.confirm(
+      `将删除 ${planned} 条重复片段（${Number(preview.groups || 0)} 组，每组保留最早一条）。继续？`,
+    );
+    if (!ok) {
+      if (els.kbEvalResult) els.kbEvalResult.textContent = "已取消清理";
+      return;
+    }
+    els.kbDedupe.textContent = "清理中…";
+    const result = await getJSON("/api/knowledge/duplicates/cleanup?dry_run=0", {
+      method: "POST",
+    });
+    const removed = Number(result.removed || 0);
+    const failed = Array.isArray(result.failed) ? result.failed : [];
+    if (els.kbEvalResult) {
+      els.kbEvalResult.classList.toggle("warn", failed.length > 0);
+      const failedIds = failed.map((item) => `#${item && item.id}`).join("、");
+      els.kbEvalResult.textContent =
+        `已清理 ${removed} 条重复片段` +
+        (failed.length ? ` · ${failed.length} 条删除失败：${failedIds}` : "");
+    }
+    await refreshKnowledgeDocuments({ refreshCategories: true });
+  } catch (error) {
+    if (els.kbEvalResult) {
+      els.kbEvalResult.hidden = false;
+      els.kbEvalResult.textContent = `清理重复失败：${error.message}`;
+    }
+  } finally {
+    els.kbDedupe.disabled = false;
+    els.kbDedupe.removeAttribute("aria-busy");
+    els.kbDedupe.textContent = "清理重复";
+  }
+}
+
 function renderSemanticResults(query, results) {  els.kbList.innerHTML = "";
   els.kbMore.hidden = true;
   const note = document.createElement("p");
@@ -4832,6 +4884,9 @@ function bindEvents() {
   if (els.kbEval) els.kbEval.addEventListener("click", () => runKbEval());
   if (els.kbDuplicates) {
     els.kbDuplicates.addEventListener("click", () => runKbDuplicates());
+  }
+  if (els.kbDedupe) {
+    els.kbDedupe.addEventListener("click", () => runKbDedupe());
   }
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
