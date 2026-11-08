@@ -103,7 +103,11 @@ def test_invalid_content():
     assert extract_turn_meta("[]") is None
     assert extract_turn_meta("") is None
     assert strip_turn_meta("普通文本") == "普通文本"
-    print("✓ 非 JSON / 空内容安全兜底")
+    # 深度嵌套的旧数据：json.loads 可能抛 RecursionError，必须原样返回
+    deep = "[" * 3000 + "]" * 3000
+    assert strip_turn_meta(deep) == deep
+    assert extract_turn_meta(deep) is None
+    print("✓ 非 JSON / 空内容 / 深嵌套内容安全兜底")
 
 
 if __name__ == "__main__":

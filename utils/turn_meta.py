@@ -101,7 +101,9 @@ def strip_turn_meta(message_content: str) -> str:
     """去掉助手消息中的元数据，用于 LLM 总结等场景。"""
     try:
         data = json.loads(message_content)
-    except (TypeError, json.JSONDecodeError):
+    except (TypeError, json.JSONDecodeError, RecursionError):
+        # 深度嵌套的历史内容会抛 RecursionError：不兜底会让每轮查询在
+        # 构建总结输入时失败（CLI 直接报错、Web 静默丢历史总结）
         return message_content
     if not isinstance(data, dict) or META_KEY not in data:
         return message_content

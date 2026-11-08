@@ -54,7 +54,9 @@ def _clean_session_id(value: Any) -> tuple[str | None, bool]:
     text = str(value).strip()
     if not text:
         return None, True
-    if text.startswith("-") or not _SESSION_ID_RE.fullmatch(text):
+    if not _SESSION_ID_RE.fullmatch(text):
+        # 与 Web 端 ChatRequest 的 ^[\w-]{1,64}$ 同一口径：Web 可以创建并
+        # 导出前导 "-" 的会话（深链接 / 默认生成），导入不能把它们丢掉
         return None, False
     return text, True
 
@@ -122,6 +124,23 @@ def _text_problem(value: str) -> str | None:
     return None
 
 
+def _bad_text_in_value(value: Any) -> str | None:
+    """递归检查偏好值里的字符串（列表 / 对象内的字符串同样会落库）。"""
+    if isinstance(value, str):
+        return _text_problem(value)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            problem = _bad_text_in_value(item)
+            if problem:
+                return problem
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            problem = _text_problem(str(key)) or _bad_text_in_value(item)
+            if problem:
+                return problem
+    return None
+
+
 def _assistant_content_problem(content: str) -> str | None:
     """assistant 消息里的 _meta.usage 若存在则必须是数字字段。
 
@@ -152,7 +171,8 @@ def _assistant_content_problem(content: str) -> str | None:
         return "消息智能体列表不是数组"
     for item in agents or []:
         if not isinstance(item, dict):
-            continue
+            # 面板渲染对 null / 数字取 agent.name 会 TypeError，会话永久打不开
+            return "消息智能体列表包含非法条目"
         duration = item.get("duration")
         if duration is None:
             continue
@@ -160,6 +180,12 @@ def _assistant_content_problem(content: str) -> str | None:
             return "智能体耗时不是数字"
         if isinstance(duration, float) and not math.isfinite(duration):
             return "智能体耗时不是有限数"
+    schedule = meta.get("schedule")
+    if schedule is not None and not isinstance(schedule, list):
+        return "消息执行路线不是数组"
+    for item in schedule or []:
+        if not isinstance(item, dict):
+            return "消息执行路线包含非法条目"
     elapsed = meta.get("elapsed")
     if elapsed is not None:
         if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
@@ -220,6 +246,10 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if index > _MAX_PREFERENCES:
             errors.append(f"偏好超过 {_MAX_PREFERENCES} 个，多余条目已跳过")
             break
+        problem = _text_problem(name) or _bad_text_in_value(value)
+        if problem:
+            errors.append(f"跳过第 {index} 个偏好：{problem}")
+            continue
         cleaned_preferences[name] = value
     sections["preferences"] = cleaned_preferences
 

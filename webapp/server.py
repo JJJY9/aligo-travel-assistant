@@ -1742,12 +1742,16 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
                 bucket["tokens"] += _safe_usage_int(usage.get("total_tokens"))
 
         elapsed = meta.get("elapsed")
-        if isinstance(elapsed, (int, float)):
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
             try:
-                elapsed_total += float(elapsed)
+                value = float(elapsed)
             except OverflowError:
-                pass
-            else:
+                value = float("nan")
+            # 历史数据可能含 NaN / Infinity（旧版本导入），或两条超大的
+            # 有限值相加溢出为 inf：非有限值会让 avg_elapsed 变成 inf，
+            # 状态接口的 JSON 序列化（allow_nan=False）每次 500
+            if math.isfinite(value):
+                elapsed_total += value
                 elapsed_count += 1
         agents = meta.get("agents")
         # 备份导入可能带入非列表 agents（如 5 / true）：直接迭代会 TypeError，
@@ -1769,7 +1773,11 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "avg_elapsed": round(elapsed_total / elapsed_count, 2) if elapsed_count else 0,
+        "avg_elapsed": (
+            round(elapsed_total / elapsed_count, 2)
+            if elapsed_count and math.isfinite(elapsed_total)
+            else 0
+        ),
         "top_agents": [
             {"name": name, "count": count} for name, count in agent_counts.most_common(5)
         ],

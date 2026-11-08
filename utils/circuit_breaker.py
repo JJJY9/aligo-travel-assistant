@@ -165,6 +165,13 @@ class CircuitBreaker:
             state = self._state
 
             if state == CircuitState.HALF_OPEN:
+                # 有其它调用持着试探名额时，熔断打开前放行的慢请求迟到失败
+                # 不能把半开重开、清掉当前试探（否则真正试探的成功被丢弃、
+                # 恢复再被推迟一个 recovery_timeout）；名额未占用 / 本调用
+                # 就是持试探者时，失败仍按原语义重开熔断
+                owner = self._probe_owner
+                if owner is not None and owner != _owner_identity():
+                    return
                 logger.warning(
                     "Circuit breaker: HALF_OPEN -> OPEN (failure in half-open)"
                 )

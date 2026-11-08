@@ -401,6 +401,50 @@ def test_stream_forwards_agent_progress_events(monkeypatch):
     print("✓ SSE 转发 agent_start / agent_done 进度事件")
 
 
+def test_status_survives_overflowing_elapsed_history():
+    """历史 _meta.elapsed 溢出 / NaN 时状态接口不能变 500（avg_elapsed 保持有限）。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_elapsed_overflow")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_messages(
+                [
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {"results": [], "_meta": {"elapsed": 1e308}}
+                        ),
+                        "session_id": "s-elapsed",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {"results": [], "_meta": {"elapsed": 1e308}}
+                        ),
+                        "session_id": "s-elapsed",
+                    },
+                    {
+                        "role": "assistant",
+                        # 旧版本导入的 NaN 历史数据（json.loads 接受 NaN 字面量）
+                        "content": '{"results": [], "_meta": {"elapsed": NaN}}',
+                        "session_id": "s-elapsed",
+                    },
+                ]
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        status = _client().get("/api/status", params={"user_id": user_id})
+        assert status.status_code == 200, status.text
+        assert status.json()["usage"]["avg_elapsed"] == 0
+        print("✓ 溢出 / NaN 的历史耗时不再让状态接口 500")
+    finally:
+        _cleanup(user_id)
+
+
 def test_limiter_degraded_uses_probe_for_idle_buckets():
     """健康检查对降级桶走 probe：低频桶不需要再收到请求也能恢复上报。"""
     from webapp.server import _limiter_degraded
