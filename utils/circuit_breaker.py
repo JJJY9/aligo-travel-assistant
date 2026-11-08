@@ -67,6 +67,11 @@ class CircuitBreaker:
         # 半开状态下同一时刻只放行一个试探请求（避免恢复瞬间全部放量），
         # 记录发起时间以防调用被取消后试探名额永久占用
         self._half_open_probe_at: float | None = None
+        # 试探名额租约：必须覆盖一次 LLM 调用（含 SDK 自带重试）的最长执行
+        # 时间。复用 recovery_timeout_sec（默认 60s）时，慢试探仍在跑第二个
+        # 请求就会覆盖归属，第一个的真实结果被静默丢弃（单飞失效、失败不
+        # 能重开熔断）。取恢复期的 5 倍且不少于 300s；超租约才视为卡死回收。
+        self._probe_lease_sec = max(recovery_timeout_sec * 5.0, 300.0)
         # 试探名额的持有线程：只有它能把结果计入半开 / 归还名额，
         # 熔断打开前放行的慢请求迟到返回时不能清掉别人的名额
         self._probe_owner: object | None = None
@@ -108,7 +113,7 @@ class CircuitBreaker:
             now = time.monotonic()
             if (
                 self._half_open_probe_at is not None
-                and now - self._half_open_probe_at < self.recovery_timeout_sec
+                and now - self._half_open_probe_at < self._probe_lease_sec
             ):
                 return False
             self._half_open_probe_at = now

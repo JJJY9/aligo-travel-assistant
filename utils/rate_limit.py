@@ -20,7 +20,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# key 数量上限：超过后清理过期 key；仍超限时按最旧事件淘汰，保证内存有界。
+# key 数量上限：超过后清理过期 key；仍满时拒绝新 key（fail-closed）。
+# 不能淘汰仍在窗口内的活跃桶：那会把正在被限流的 key 计数清零（额度重置），
+# 攻击者轮换 key 即可让受害者与自己的旧桶重新获得配额（限流绕过）。
 MAX_KEYS = 10000
 
 # Redis 限流键前缀（与其它 aligo: 键一致），name 区分用户桶 / IP 桶。
@@ -113,9 +115,11 @@ class RateLimiter:
             now = time.monotonic()
             events = self._events.get(key)
             if events is None:
+                # 容量已满时先清理过期桶；仍然满员则直接拒绝新 key：
+                # 淘汰活跃桶会重置其计数（本次被限流的请求重新获得额度）
+                self._sweep(now)
                 if len(self._events) >= self.max_keys:
-                    # 为新 key 预留一个位置，确保插入后总数不超过上限
-                    self._sweep(now, force=True, reserve=1)
+                    return round(self.window_sec, 1)
                 events = deque()
                 self._events[key] = events
 
@@ -159,22 +163,13 @@ class RateLimiter:
             reset = max(0.0, self.window_sec - (now - events[0]))
             return max(0, self.limit - len(events)), reset
 
-    def _sweep(self, now: float, force: bool = False, reserve: int = 0) -> None:
-        """清理已过期 / 空 key；force 时若仍超上限，淘汰事件最旧的 key。
-
-        ``reserve`` 为调用方即将新增的 key 数量，淘汰后保证还能放下。
-        """
+    def _sweep(self, now: float) -> None:
+        """清理已过期 / 空 key；活跃桶一律保留（容量满时由调用方拒绝新 key）。"""
         for key in list(self._events):
             events = self._events[key]
             while events and now - events[0] >= self.window_sec:
                 events.popleft()
             if not events:
-                del self._events[key]
-
-        overflow = len(self._events) - (self.max_keys - reserve)
-        if force and overflow > 0:
-            oldest = sorted(self._events, key=lambda k: self._events[k][0])[:overflow]
-            for key in oldest:
                 del self._events[key]
 
     def reset(self) -> None:

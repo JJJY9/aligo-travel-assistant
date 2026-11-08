@@ -546,6 +546,36 @@ def test_health_check_enforces_overall_timeout(monkeypatch):
     print("✓ 健康检查整体超时与 SDK 重试关闭")
 
 
+def test_half_open_probe_lease_covers_slow_probe(monkeypatch):
+    """慢试探仍在跑时不能放行第二个（旧的 60s 租约会被覆盖归属）。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+    assert breaker.allow_call() is True
+    # 超过 recovery_timeout（10s）但仍在试探租约内：不得覆盖归属
+    times["now"] = 150.0
+    assert breaker.allow_call() is False, "慢试探未结束前不能放行第二个"
+    # 试探完成（失败）才重新打开；结果来自原持有者
+    breaker.record_failure()
+    assert breaker.state.value == "open"
+
+    # 超过租约视为卡死回收：允许新的试探
+    breaker2 = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker2.record_failure()
+    times["now"] = 200.0
+    assert breaker2.allow_call() is True
+    breaker2._probe_lease_sec = 5.0
+    times["now"] = 206.0
+    assert breaker2.allow_call() is True, "超租约后才允许回收试探名额"
+    print("✓ 半开试探租约覆盖慢调用（60s 不再提前覆盖归属）")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -553,6 +583,7 @@ if __name__ == "__main__":
         test_retry_does_not_retry_parse_error_with_500()
         test_health_check_rejects_empty_response(_mp)
         test_half_open_single_probe_and_recovery(_mp)
+        test_half_open_probe_lease_covers_slow_probe(_mp)
         test_failure_after_recovery_timeout_reopens(_mp)
         test_build_turn_meta_tolerates_non_list_shapes()
         test_access_log_strips_control_characters()
