@@ -418,14 +418,17 @@ def test_webapp_trips_dedupe_postgres(monkeypatch):
         client = TestClient(app)
 
         preview = client.post(
-            "/api/trips/dedupe", params={"user_id": user_id, "dry_run": 1}
+            "/api/trips/dedupe",
+            json={"user_id": user_id, "dry_run": True},
         )
         assert preview.status_code == 200, preview.text
         data = preview.json()
         assert data["would_remove"] == 1, data
         assert [entry["trip_id"] for entry in data["duplicates"]] == ["dup-b"]
 
-        applied = client.post("/api/trips/dedupe", params={"user_id": user_id})
+        applied = client.post(
+            "/api/trips/dedupe", json={"user_id": user_id}
+        )
         assert applied.status_code == 200, applied.text
         assert applied.json()["removed"] == 1
 
