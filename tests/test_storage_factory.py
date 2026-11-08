@@ -2084,6 +2084,26 @@ def test_bulk_save_trips_scales_and_dedupes():
     print("✓ 批量行程保存一次建索引（去重 / 编号 / 统计语义一致）")
 
 
+def test_frequent_destinations_tie_order_is_deterministic():
+    """同数量的常去目的地按城市名排序（与 PostgreSQL ORDER BY 同口径）。"""
+    memory = LongTermMemory("u-freq-order", tempfile.mkdtemp())
+    memory.save_trip_history(
+        {"origin": "", "destination": "杭州", "start_date": "2026-12-01"}
+    )
+    memory.save_trip_history(
+        {"origin": "", "destination": "广州", "start_date": "2026-12-02"}
+    )
+    memory.save_trip_history(
+        {"origin": "", "destination": "上海", "start_date": "2026-12-03"}
+    )
+    assert memory.get_frequent_destinations(10) == [
+        ("上海", 1),
+        ("广州", 1),
+        ("杭州", 1),
+    ]
+    print("✓ 常去目的地同数量按城市名排序")
+
+
 def test_bulk_save_trips_matches_sequential_saves():
     """批量保存与逐条保存的最终结果一致（去重 / 未补零日期 / 缺省目的 / 会话）。"""
     storage_dir = tempfile.mkdtemp()
@@ -2246,5 +2266,6 @@ if __name__ == "__main__":
     test_json_get_chat_history_excludes_session_before_limit()
     test_pg_get_chat_history_excludes_session_in_sql()
     test_bulk_save_trips_scales_and_dedupes()
+    test_frequent_destinations_tie_order_is_deterministic()
     test_bulk_save_trips_matches_sequential_saves()
     print("\n全部通过")

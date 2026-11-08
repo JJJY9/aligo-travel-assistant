@@ -1228,7 +1228,11 @@ class LongTermMemory:
             [(destination, count), ...]
         """
         freq = self.data["statistics"]["frequent_destinations"]
-        sorted_dest = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+        # 同数量时按城市名排序：与 PostgreSQL 的 ORDER BY trip_count DESC,
+        # destination 同一口径，展示顺序不再随写入顺序变化
+        sorted_dest = sorted(
+            freq.items(), key=lambda item: (-int(item[1]), str(item[0]))
+        )
         return sorted_dest[:top_n]
 
     @_locked_mutation
