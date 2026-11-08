@@ -429,6 +429,75 @@ def test_dispatch_json_flag(monkeypatch):
     print("✓ trips-dedupe dispatch --json / --dry-run 参数")
 
 
+def test_same_trip_id_duplicates_keep_earliest_row(monkeypatch):
+    """旧版重复 trip_id 的两条行程：删除最后插入的一条、保留最早记录。"""
+
+    class _DupStore(_FakeStore):
+        def delete_duplicate_trip(self, trip_id):
+            for index in range(len(self.trips) - 1, -1, -1):
+                if self.trips[index]["trip_id"] == trip_id:
+                    self.trips.pop(index)
+                    self.deleted.append(trip_id)
+                    return True
+            return False
+
+    earliest = {**_trip("trip_1"), "purpose": "最早"}
+    later = {**_trip("trip_1"), "purpose": "后来"}
+    fake = _DupStore([earliest, later])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u-dup")
+    assert code == 0
+    assert fake.deleted == ["trip_1"]
+    assert len(fake.trips) == 1
+    assert fake.trips[0] == earliest, "必须保留最早记录，不能删掉它留下后改的重复行"
+    assert "删除 1 条重复行程" in out
+    print("✓ 同 trip_id 重复保留最早行（删除最后插入的一条）")
+
+
+def test_delete_duplicate_trip_json_backend_keeps_earliest(tmp_path):
+    """JSON 后端 delete_duplicate_trip：删除最后一条同 id 行、统计同步。"""
+    import json
+
+    from context.long_term_memory import LongTermMemory
+
+    path = tmp_path / "u-dup-real.json"
+    path.write_text(
+        json.dumps(
+            {
+                "trip_history": [
+                    {
+                        "trip_id": "trip_9",
+                        "origin": "北京",
+                        "destination": "上海",
+                        "start_date": "2026-12-01",
+                        "purpose": "最早",
+                    },
+                    {
+                        "trip_id": "trip_9",
+                        "origin": "北京",
+                        "destination": "上海",
+                        "start_date": "2026-12-01",
+                        "purpose": "后来",
+                    },
+                ],
+                "statistics": {"total_trips": 2, "frequent_destinations": {"上海": 2}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    store = LongTermMemory("u-dup-real", str(tmp_path))
+    assert store.delete_duplicate_trip("trip_9") is True
+    remaining = store.get_trip_history(limit=None)
+    assert [item["purpose"] for item in remaining] == ["最早"]
+    stats = store.get_statistics()
+    assert stats["total_trips"] == 1
+    assert stats["frequent_destinations"] == {"上海": 1}
+    print("✓ JSON delete_duplicate_trip 删除最后一条并同步统计")
+
+
 if __name__ == "__main__":
     for case in (
         test_dedupes_and_keeps_first,
@@ -449,6 +518,7 @@ if __name__ == "__main__":
         test_json_output_no_duplicates,
         test_json_output_errors_and_ambiguous,
         test_dispatch_json_flag,
+        test_same_trip_id_duplicates_keep_earliest_row,
     ):
         mp = pytest.MonkeyPatch()
         try:

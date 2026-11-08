@@ -21,7 +21,7 @@ import json
 # doctor / skills 等诊断命令必须在这些依赖缺失时仍能启动并如实报告缺失项
 from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.console import PipeSafeTextIO, configure_stdio
+from utils.console import PipeSafeTextIO, configure_stdio, is_pipe_error
 from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
@@ -1742,7 +1742,9 @@ def run_knowledge_import_standalone(
         return _fail(f"文件不存在：{path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError：结构性深层嵌套（如 '['*3000）不是 ValueError 子类，
+        # 不捕获会让 --json 模式打印 traceback、stdout 无结构化输出
         return _fail(f"读取失败：{exc}（文件需为 UTF-8 编码的 JSON）")
 
     documents = (
@@ -2269,7 +2271,15 @@ def run_user_import_standalone(
     # sections 里仍有空列表键（truthy），必须按「内容是否为空」判断
     has_user_data = any(
         sections.get(key)
-        for key in ("preferences", "trips", "messages", "titles", "pinned", "archived")
+        for key in (
+            "preferences",
+            "trips",
+            "messages",
+            "titles",
+            "pinned",
+            "archived",
+            "knowledge",
+        )
     )
     if not sections or not has_user_data:
         hint = (
@@ -2876,12 +2886,13 @@ def run_trips_dedupe_standalone(
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
 
-        duplicates = [
-            trip_id
+        duplicate_entries = [
+            (ids[0], trip_id)
             for ids in groups.values()
             for trip_id in ids[1:]
             if ids[0] in fresh_ids and trip_id not in ambiguous
         ]
+        duplicates = [trip_id for _, trip_id in duplicate_entries]
 
         if dry_run:
             _emit(
@@ -2921,8 +2932,19 @@ def run_trips_dedupe_standalone(
         removed = 0
         failure: str | None = None
         try:
-            for trip_id in duplicates:
-                if trip_id and store.delete_trip(trip_id):
+            for kept_id, trip_id in duplicate_entries:
+                if not trip_id:
+                    continue
+                # 与组内保留项同 id 的副本（旧版给两条行程生成过同一个
+                # trip_id）：delete_trip 删最早一条，会把要保留的记录删掉、
+                # 留下后来的重复行——同 id 时必须删除最后插入的一条
+                deleter = (
+                    store.delete_duplicate_trip
+                    if trip_id == kept_id
+                    and hasattr(store, "delete_duplicate_trip")
+                    else store.delete_trip
+                )
+                if deleter(trip_id):
                     removed += 1
         except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
             failure = str(exc)
@@ -3897,8 +3919,12 @@ def run_trips_export_standalone(
                     sys.stdout.flush()
                     buffer.write(text.encode("utf-8"))
                     buffer.flush()
-                except BrokenPipeError:
-                    # 与 _print_stdout 一致：下游提前关闭（| head）时静默收尾
+                except OSError as exc:
+                    # 与 _print_stdout 一致：下游提前关闭（| head / 读端未读
+                    # 即退出）时静默收尾——Windows 上是 Errno 22 而不是
+                    # BrokenPipeError，只认 BrokenPipeError 会漏掉并打 traceback
+                    if not is_pipe_error(exc):
+                        raise
                     try:
                         devnull = os.open(os.devnull, os.O_WRONLY)
                         os.dup2(devnull, sys.stdout.fileno())
@@ -5118,14 +5144,8 @@ def _print_stdout(text: str, end: str = "\n") -> None:
     try:
         print(text, end=end)
     except OSError as exc:
-        # Windows 上关闭管道抛 OSError [Errno 22] 而不是 BrokenPipeError；
         # 仅吞掉管道类错误，真实的写失败（磁盘满等）照常抛出
-        winerror = getattr(exc, "winerror", None)
-        if (
-            not isinstance(exc, BrokenPipeError)
-            and exc.errno not in (22, 32)
-            and winerror not in (109, 232)
-        ):
+        if not is_pipe_error(exc):
             raise
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
@@ -5138,6 +5158,10 @@ def main():
     """主函数"""
     # 一次性命令不读 stdin：跳过编码探测，避免已连接但无数据的管道卡住启动
     configure_stdio(probe_stdin=len(sys.argv) == 1)
+    if len(sys.argv) > 1 and not isinstance(sys.stdout, PipeSafeTextIO):
+        # 一次性命令同样可能被下游（| head）提前关闭：列表 / 导出 / JSON
+        # 输出全部走管道安全包装，不再打 traceback（与交互模式同一口径）
+        sys.stdout = PipeSafeTextIO(sys.stdout)
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip().lower()
         if arg in {"--version", "-v"}:

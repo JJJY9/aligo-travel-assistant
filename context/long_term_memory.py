@@ -1012,24 +1012,44 @@ class LongTermMemory:
         stats["last_trip_number"] = number
         return f"trip_{number}"
 
+    def _drop_trip_row(self, trips: list[dict], index: int) -> None:
+        """移除行程行并同步统计；写盘失败按持久化错误抛出。"""
+        removed = trips.pop(index)
+        stats = self.data.setdefault("statistics", {})
+        stats["total_trips"] = max(0, int(stats.get("total_trips", 0)) - 1)
+        destination = removed.get("destination")
+        frequent = stats.setdefault("frequent_destinations", {})
+        if destination and destination in frequent:
+            frequent[destination] = int(frequent[destination]) - 1
+            if frequent[destination] <= 0:
+                del frequent[destination]
+        if not self._save():
+            raise MemoryPersistenceError("写入长期记忆失败")
+
     @_locked_mutation
     def delete_trip(self, trip_id: str) -> bool:
         """删除一条历史行程并同步统计；返回是否删除。"""
         trips = self.data.get("trip_history", [])
         for index, trip in enumerate(trips):
             if str(trip.get("trip_id", "")) == str(trip_id):
-                removed = trips.pop(index)
-                stats = self.data.setdefault("statistics", {})
-                stats["total_trips"] = max(0, int(stats.get("total_trips", 0)) - 1)
-                destination = removed.get("destination")
-                frequent = stats.setdefault("frequent_destinations", {})
-                if destination and destination in frequent:
-                    frequent[destination] = int(frequent[destination]) - 1
-                    if frequent[destination] <= 0:
-                        del frequent[destination]
-                if not self._save():
-                    raise MemoryPersistenceError("写入长期记忆失败")
+                self._drop_trip_row(trips, index)
                 logger.info(f"Deleted trip history: {trip_id}")
+                return True
+        return False
+
+    @_locked_mutation
+    def delete_duplicate_trip(self, trip_id: str) -> bool:
+        """删除重复 trip_id 中最后插入的一条（去重时保留最早记录）。
+
+        ``delete_trip`` 删除最早一条：旧版本可能给两条不同行程生成同一个
+        trip_id，去重命令要保留组内第一条、删掉后面的副本，用它会把要
+        保留的那条删掉、留下后来的重复行。
+        """
+        trips = self.data.get("trip_history", [])
+        for index in range(len(trips) - 1, -1, -1):
+            if str(trips[index].get("trip_id", "")) == str(trip_id):
+                self._drop_trip_row(trips, index)
+                logger.info(f"Deleted duplicate trip history: {trip_id}")
                 return True
         return False
 

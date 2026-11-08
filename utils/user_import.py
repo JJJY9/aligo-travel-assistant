@@ -216,6 +216,10 @@ def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
     """解析并校验 user-export JSON 文本，返回 ``(可恢复数据, 错误列表)``。"""
     try:
         data = json.loads(text)
+    except RecursionError:
+        # 结构性深层嵌套（如 '['*3000）不是 ValueError：不捕获会让 CLI
+        # --json 模式打印 traceback 而不是结构化错误
+        return {}, ["JSON 嵌套过深，无法解析"]
     except (TypeError, ValueError) as exc:
         return {}, [f"JSON 解析失败：{exc}"]
     return parse_user_export_data(data)

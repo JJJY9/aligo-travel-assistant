@@ -58,6 +58,10 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         header = next(reader)
     except StopIteration:
         return [], [(1, "文件为空")]
+    except csv.Error as exc:
+        # 单字段超过 field_size_limit（默认 131072 字符）时 csv 直接抛错：
+        # 按解析错误返回，不能穿透成 traceback、让已解析行全部丢失
+        return [], [(1, f"CSV 解析失败：{exc}")]
 
     mapping: dict[str, int] = {}
     for index, header_cell in enumerate(header):
@@ -82,7 +86,16 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
 
     rows: list[dict[str, Any]] = []
     errors: list[tuple[int, str]] = []
-    for row in reader:
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            break
+        except csv.Error as exc:
+            # 超长字段 / 未闭合引号把余下内容吞成同一字段：保留已解析行，
+            # 记录错误后停止（与「非法行收集后列出并跳过」的既有契约一致）
+            errors.append((reader.line_num, f"CSV 解析失败：{exc}"))
+            break
         # csv.reader 把带引号的多行字段算作一条记录：enumerate 的序号不是
         # 物理行号，用 reader.line_num 才能让报错指向用户看到的行
         line_no = reader.line_num

@@ -192,6 +192,19 @@ class _AutoDecodeInput:
         return text
 
 
+def is_pipe_error(exc: OSError) -> bool:
+    """管道类写入错误：下游提前关闭（``| head``）在 Windows 上的两种表现。
+
+    Windows 关闭管道抛 ``OSError [Errno 22]`` / ``BrokenPipeError``（读端
+    未读取即退出），POSIX 为 EPIPE；其余 OSError（磁盘满等）必须照常抛出。
+    """
+    return (
+        isinstance(exc, BrokenPipeError)
+        or getattr(exc, "errno", None) in (22, 32)
+        or getattr(exc, "winerror", None) in (109, 232)
+    )
+
+
 class PipeSafeTextIO:
     """包裹 stdout：下游管道提前关闭（如 ``| head``）后写入静默丢弃。
 
@@ -206,11 +219,7 @@ class PipeSafeTextIO:
 
     @staticmethod
     def _is_pipe_error(exc: OSError) -> bool:
-        return (
-            isinstance(exc, BrokenPipeError)
-            or getattr(exc, "errno", None) in (22, 32)
-            or getattr(exc, "winerror", None) in (109, 232)
-        )
+        return is_pipe_error(exc)
 
     def _swallow(self, exc: OSError) -> bool:
         if not self._is_pipe_error(exc):
