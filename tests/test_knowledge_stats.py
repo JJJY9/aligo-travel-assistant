@@ -73,9 +73,107 @@ def test_dimension_mismatch_best_effort(monkeypatch):
         assert "dimension_mismatch" not in status, "模型未加载时不做判断"
     print("✓ 状态维度与嵌入模型 mismatch（best-effort）")
 
+def test_dimension_probe_and_collection_errors(monkeypatch):
+    """维度探测失败 / 集合不存在 / 统计失败都按可用性语义返回，不抛异常。"""
+    import utils.knowledge_stats as stats_module
+
+    class _NoDim:
+        def has_collection(self, name):
+            return True
+
+        def get_collection_stats(self, name):
+            return {"row_count": 2}
+
+        def describe_collection(self, name):
+            raise RuntimeError("old client")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "milvus_lite.db"
+        db.write_bytes(b"x")
+
+        monkeypatch.setattr(
+            stats_module, "get_milvus_client", lambda path: _NoDim()
+        )
+        status = knowledge_status(db)
+        assert status["available"] and status["documents"] == 2
+        assert "dimension" not in status, "维度读不到时状态照常返回"
+
+        class _NoCollection(_NoDim):
+            def has_collection(self, name):
+                return False
+
+        monkeypatch.setattr(
+            stats_module, "get_milvus_client", lambda path: _NoCollection()
+        )
+        status = knowledge_status(db)
+        assert status["available"] is False
+        assert status["reason"] == "集合不存在"
+
+        class _Boom(_NoDim):
+            def get_collection_stats(self, name):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            stats_module, "get_milvus_client", lambda path: _Boom()
+        )
+        status = knowledge_status(db)
+        assert status["available"] is False
+        assert "boom" in status["reason"]
+    print("✓ 维度探测 / 集合缺失 / 统计失败的状态语义")
+
+
+def test_write_lock_import_failure_falls_back(monkeypatch):
+    """维护模块不可用时状态查询退回无锁路径（不抛 ImportError）。"""
+    import sys
+
+    import utils.knowledge_stats as stats_module
+
+    class _Client:
+        def has_collection(self, name):
+            return True
+
+        def get_collection_stats(self, name):
+            return {"row_count": 1}
+
+        def describe_collection(self, name):
+            return {"fields": []}
+
+    monkeypatch.setattr(stats_module, "get_milvus_client", lambda path: _Client())
+    monkeypatch.setitem(sys.modules, "utils.knowledge_admin", None)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "milvus_lite.db"
+        db.write_bytes(b"x")
+        status = knowledge_status(db)
+    assert status["available"] is True and status["documents"] == 1
+    print("✓ 维护模块不可用时退回无锁状态查询")
+
+
+def test_loaded_dimension_probe_failure(monkeypatch):
+    """已加载嵌入模型维度探测失败时按未知处理（不影响状态主体）。"""
+    import utils.embedding_model as embedding_module
+    import utils.knowledge_stats as stats_module
+
+    def boom():
+        raise RuntimeError("model probe failed")
+
+    monkeypatch.setattr(embedding_module, "peek_embedding_dim", boom)
+    assert stats_module._loaded_embedding_dim() is None
+    print("✓ 嵌入维度探测失败按未知处理")
+
+
 if __name__ == "__main__":
     test_missing_database()
-    test_dimension_mismatch_best_effort(pytest.MonkeyPatch())
+    for case in (
+        test_dimension_mismatch_best_effort,
+        test_dimension_probe_and_collection_errors,
+        test_write_lock_import_failure_falls_back,
+        test_loaded_dimension_probe_failure,
+    ):
+        mp = pytest.MonkeyPatch()
+        try:
+            case(mp)
+        finally:
+            mp.undo()
     status = knowledge_status()
     if status["available"]:
         print(f"✓ 本地知识库：{status['documents']} 片段")
