@@ -574,6 +574,9 @@ def _regroup_exported_documents(
 
     merged: list[Any] = []
     skipped = 0
+    # 库内容计数只建一次：原实现每组重建 Counter(existing)，导入成本
+    # O(文档组数 × 库内容数)，大备份在写锁内会跑成分钟级
+    existing_counts_base = Counter(existing)
     for kind, key in order:
         if kind == "single":
             merged.append(key)
@@ -631,14 +634,8 @@ def _regroup_exported_documents(
                 )
         stripped_contents = [content.strip() for content in contents]
         # 多重集判定：一组里两片同文时，库里只存在一份不能算「整组已存在」
-        remaining_existing = Counter(existing)
-        group_exists = True
-        for stripped in stripped_contents:
-            if remaining_existing[stripped] <= 0:
-                group_exists = False
-                break
-            remaining_existing[stripped] -= 1
-        if group_exists:
+        # （Counter 相减只保留正差值：组内多重集必须是库内容多重集的子集）
+        if not (Counter(stripped_contents) - existing_counts_base):
             # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
             skipped += len(contents)
             continue
