@@ -357,6 +357,34 @@ def test_late_success_cannot_close_breaker(monkeypatch):
     print("✓ 迟到成功不能关闭熔断器")
 
 
+def test_late_failure_cannot_reopen_half_open(monkeypatch):
+    """熔断打开前放行的慢请求迟到失败时，不能重开半开或清掉当前试探名额。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+    assert breaker.allow_call() is True, "本线程占用试探名额"
+
+    done = {}
+
+    def late_failure():
+        breaker.record_failure()
+        done["ran"] = True
+
+    thread = threading.Thread(target=late_failure)
+    thread.start()
+    thread.join()
+    assert done["ran"]
+    assert breaker.state.value == "half_open", "迟到失败不能把半开重开为 open"
+    assert breaker.allow_call() is False, "名额仍归持有线程"
+    breaker.record_success()
+    assert breaker.state.value == "closed", "持试探者的成功仍能正常关闭熔断"
+    print("✓ 迟到失败不能重开半开熔断")
+
+
 def test_retry_jitter_respects_max_delay(monkeypatch):
     """抖动在截断之前应用：实际退避不超过 max_delay_sec。"""
     import utils.llm_resilience as resilience_module
@@ -532,6 +560,7 @@ if __name__ == "__main__":
         test_release_probe_returns_half_open_slot(_mp)
         test_probe_owner_only(_mp)
         test_late_success_cannot_close_breaker(_mp)
+        test_late_failure_cannot_reopen_half_open(_mp)
         test_retry_jitter_respects_max_delay(_mp)
         test_response_text_dict_and_scalar_shapes()
         test_retry_error_edges_and_response_shapes()

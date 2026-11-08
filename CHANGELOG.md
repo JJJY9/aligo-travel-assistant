@@ -58,6 +58,10 @@
 - 长期记忆（JSON）：写前损坏复核把「合法 JSON 非对象」（`[]` / `null`）与解析失败同一口径备份（锁超时启动的实例不再每次写入都失败且永不备份）
 - PostgreSQL：`delete_all` 一并删除行程编号计数器（删除全部数据后重新从 `trip_1` 开始，与 JSON 后端一致）；会话标题 / 置顶 / 归档写入与删除共用 advisory lock 串行化（并发删除不再残留幽灵元数据）；`delete_last_turn` 的元数据清理放入同一事务且无条件执行（连接中断重放后不再跳过清理）
 - 编排：技能把失败信息嵌套在 `results` 里（如 query-info 的 `query_success=false` + `results.error` / `results.message`）时聚合为 `error` / `partial_failure`（前端不再显示 ✓、历史元数据不再记为成功）；嵌套在 `results` 里的瞬时错误（timeout / connection）同样触发一次退避重试
+- 状态接口：历史 `_meta.elapsed` 为 NaN / Infinity（旧数据）或两条超大有限值相加溢出时按非有限值忽略（`avg_elapsed` 保持有限，`/api/status` 不再永久 500）
+- 备份恢复：会话 ID 与 Web API 同口径（允许前导 `-`，Web 端创建 / 导出的深链接会话恢复后不再整段丢失）；偏好键 / 值与 `_meta.agents` / `schedule` 的非对象条目同样拒绝（PostgreSQL 恢复不再因偏好 NUL 永久失败；`null` 智能体条目不再让面板打不开会话）
+- 熔断器：有其它调用持半开试探名额时，熔断前放行的慢请求迟到失败不再重开熔断、清掉名额（真正试探的成功不再被丢弃、恢复不再多推迟一个 `recovery_timeout`）
+- 总结输入：`strip_turn_meta` 对深度嵌套的历史内容兜底（旧数据不再让每轮对话丢失历史总结、CLI 不再报错）
 - 偏好接口：`PUT /api/preferences` 拒绝空值（与 CLI `pref-set` 一致）；`/api/status` 与导出统一隐藏空白 / null 项；备份含 NaN / Infinity 用量时拒绝该消息（不再让状态接口与 Markdown 导出永久 500）
 - 技能：非对象 payload / content block 列表 / `reply(None)` 统一容错；天气问句城市提取去掉方向词与标点（「从北京去纽约，天气怎么样」不再答成北京）；可疑域名过滤不再误杀 skyscanner / tripadvisor 等真实站点
 - 知识库初始化：重建前把保留片段落盘备份（写入失败 / 中断后重跑自动并入补齐），补写按分片组边界切批

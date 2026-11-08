@@ -737,6 +737,81 @@ def test_parse_rejects_deep_nested_assistant_content():
     print("✓ 深嵌套 assistant 内容在导入时被拒绝")
 
 
+def test_parse_accepts_leading_dash_session_ids():
+    """Web API 允许的 "-abc" 会话 ID 在导入时不能丢（否则自己的备份恢复不了）。"""
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "hi", "session_id": "-abc"},
+            {"role": "assistant", "content": "在", "session_id": "-abc"},
+        ],
+        "session_titles": {"-abc": "深链接会话"},
+        "pinned_sessions": ["-abc"],
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [m["session_id"] for m in sections["messages"]] == ["-abc", "-abc"]
+    assert sections["titles"] == {"-abc": "深链接会话"}
+    assert sections["pinned"] == ["-abc"]
+    assert errors == []
+    print("✓ 前导 - 的会话 ID 导入保留（与 Web API 同口径）")
+
+
+def test_parse_rejects_bad_preference_text():
+    """偏好键 / 值（含列表内字符串）里的 NUL / 孤立代理项必须拒绝。"""
+    payload = {
+        "preferences": {
+            "home_location": "a\x00b",
+            "hotel_brands": ["汉庭", "bad\ud800"],
+            "budget_level": "经济",
+        }
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=True))
+    assert sections["preferences"] == {"budget_level": "经济"}
+    assert any("NUL" in error for error in errors), errors
+    assert any("孤立代理项" in error for error in errors), errors
+    print("✓ 偏好里的 NUL / 孤立代理项在导入时拒绝")
+
+
+def test_parse_rejects_non_object_agent_entries():
+    """_meta.agents / schedule 里的非对象条目会让面板渲染 TypeError，导入拒绝。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": json.dumps({"results": [], "_meta": {"agents": [None]}}),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "results": [],
+                        "_meta": {"agents": [{"name": "x"}], "schedule": [1]},
+                    }
+                ),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "results": [],
+                        "_meta": {
+                            "agents": [{"name": "x"}],
+                            "schedule": [{"agent_name": "x"}],
+                        },
+                    }
+                ),
+                "session_id": "s1",
+            },
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=True))
+    assert len(sections["messages"]) == 1
+    assert any("消息智能体列表包含非法条目" in error for error in errors), errors
+    assert any("消息执行路线包含非法条目" in error for error in errors), errors
+    print("✓ agents / schedule 非对象条目在导入时拒绝")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -754,6 +829,9 @@ if __name__ == "__main__":
     test_parse_rejects_deep_nested_assistant_content()
     test_parse_rejects_nul_and_lone_surrogates()
     test_parse_rejects_non_finite_meta_durations()
+    test_parse_accepts_leading_dash_session_ids()
+    test_parse_rejects_bad_preference_text()
+    test_parse_rejects_non_object_agent_entries()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (
