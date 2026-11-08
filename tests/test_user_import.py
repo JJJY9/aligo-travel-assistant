@@ -1012,6 +1012,36 @@ def test_parse_rejects_non_finite_preference_values():
     print("✓ 非有限数偏好值被拒绝")
 
 
+def test_parse_rejects_non_finite_unknown_meta_keys():
+    """已知字段之外的 _meta 数值（usage.time 等）非有限数同样拒绝。"""
+    content = json.dumps({"results": [], "_meta": {"usage": {"time": float("nan")}}})
+    payload = {
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": content,
+                "timestamp": "2026-11-01T09:00:00",
+                "session_id": "s1",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert sections == {} or sections.get("messages") == [], sections
+    assert any("非有限数" in error for error in errors), errors
+    print("✓ _meta 任意键的非有限数被拒绝")
+
+
+def test_parse_rejects_slash_preference_keys():
+    """含 "/" 的偏好键落库后面板 / CLI 都无法编辑或删除，导入时拒绝。"""
+    payload = {"preferences": {"a/b": "x", "ok": 1}}
+    sections, errors = parse_user_export(json.dumps(payload))
+    prefs = sections.get("preferences", {})
+    assert "a/b" not in prefs, prefs
+    assert prefs.get("ok") == 1, prefs
+    assert any("键名非法" in error for error in errors), errors
+    print("✓ 含斜杠的偏好键被拒绝")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -1039,6 +1069,8 @@ if __name__ == "__main__":
     test_parse_rejects_huge_integer_literal_content()
     test_parse_survives_extreme_timestamp()
     test_parse_rejects_non_finite_preference_values()
+    test_parse_rejects_non_finite_unknown_meta_keys()
+    test_parse_rejects_slash_preference_keys()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,

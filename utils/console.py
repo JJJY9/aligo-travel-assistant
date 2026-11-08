@@ -138,7 +138,14 @@ class _AutoDecodeInput:
 
     def _read_utf16_more(self) -> bool:
         """读一块 UTF-16 字节并解码追加到缓冲区；返回是否读到了数据。"""
-        data = self._buffer.read(self._UTF16_CHUNK) or b""
+        read1 = getattr(self._buffer, "read1", None)
+        if callable(read1):
+            # read1 只做一次底层读：BufferedReader.read(n) 在活动管道上会
+            # 反复读到底层凑满 n 字节或 EOF——控制器写一行后保持管道打开的
+            # 场景下 input() 会阻塞到 EOF（与非 UTF-16 分支同一类问题）
+            data = read1(self._UTF16_CHUNK) or b""
+        else:
+            data = self._buffer.read(self._UTF16_CHUNK) or b""
         if not data:
             return False
         self._utf16_text += self._utf16_decoder.decode(data)

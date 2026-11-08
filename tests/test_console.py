@@ -156,6 +156,40 @@ def test_read_size_does_not_read_to_eof():
     print("✓ read(size) 不读到 EOF，readline 按行拆分余量")
 
 
+def test_utf16_readline_uses_single_chunk_reads():
+    """UTF-16 分支必须用 read1（一次底层读），活动管道上 read(n) 会阻塞到 EOF。"""
+    import codecs
+
+    from utils.console import _AutoDecodeInput
+
+    class _OnlyRead1Buffer(io.BytesIO):
+        def __init__(self, payload: bytes):
+            super().__init__(payload)
+            self.read1_calls: list[int] = []
+
+        def peek(self, size=2):
+            position = self.tell()
+            data = io.BytesIO.read(self, size)
+            self.seek(position)
+            return data
+
+        def read(self, size=-1):
+            raise AssertionError(
+                "UTF-16 分块读取必须用 read1（BufferedReader.read(n) 会凑满 n 字节）"
+            )
+
+        def read1(self, size=-1):
+            self.read1_calls.append(size)
+            return io.BytesIO.read(self, size)
+
+    payload = codecs.BOM_UTF16_LE + "第一行\n".encode("utf-16-le")
+    buffer = _OnlyRead1Buffer(payload)
+    shim = _AutoDecodeInput(buffer, "utf-8")
+    assert shim.readline() == "第一行\n"
+    assert buffer.read1_calls, "应通过 read1 读取 UTF-16 块"
+    print("✓ UTF-16 分块读取使用 read1")
+
+
 def test_readline_utf16_lines_and_size():
     """UTF-16 输入的逐行 pop 路径与 size 截断都要覆盖。"""
     from utils.console import _AutoDecodeInput

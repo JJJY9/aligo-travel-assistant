@@ -154,6 +154,32 @@ def _bad_text_in_value(value: Any, depth: int = 0) -> str | None:
     return None
 
 
+def _non_finite_in_value(value: Any, depth: int = 0) -> str | None:
+    """递归检查任意值里的非有限浮点数（NaN / Infinity）。
+
+    ``_meta`` 会原样返回给前端（会话详情），其中任意键（含 usage.time、
+    schedule 字段）是非有限数时，响应序列化（allow_nan=False）会失败，
+    该会话每次打开都 500。
+    """
+    if depth > 32:
+        return "消息元数据嵌套过深"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "消息元数据含非有限数（NaN / Infinity）"
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            problem = _non_finite_in_value(item, depth + 1)
+            if problem:
+                return problem
+    elif isinstance(value, dict):
+        for item in value.values():
+            problem = _non_finite_in_value(item, depth + 1)
+            if problem:
+                return problem
+    return None
+
+
 def _assistant_content_problem(content: str) -> str | None:
     """assistant 消息里的 _meta.usage 若存在则必须是数字字段。
 
@@ -228,7 +254,9 @@ def _assistant_content_problem(content: str) -> str | None:
         # OverflowError，且此后每次汇总都 500，必须在导入时拒绝
         if isinstance(value, float) and not math.isfinite(value):
             return "消息用量字段不是有限数"
-    return None
+    # 已知字段之外的任意键（usage.time、schedule 数值等）同样会原样返回给
+    # 前端：任何位置的 NaN / Infinity 都让会话详情响应序列化失败，最后兜底
+    return _non_finite_in_value(meta)
 
 
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
@@ -263,7 +291,10 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     cleaned_preferences: dict[str, Any] = {}
     for index, (key, value) in enumerate(preferences.items(), start=1):
         name = str(key or "").strip()
-        if not name or len(name) > 64:
+        # 与 Web /api/preferences/{type} 的 ^[^/]{1,64}$ 约束一致：含 "/"
+        # 的键落库后面板（路径段被拆开）与 CLI（字符集校验）都无法编辑或
+        # 删除，只能重新导入覆盖值
+        if not name or len(name) > 64 or "/" in name:
             errors.append(f"跳过第 {index} 个偏好：键名非法")
             continue
         if index > _MAX_PREFERENCES:

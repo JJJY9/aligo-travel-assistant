@@ -665,6 +665,29 @@ def test_runner_dispatch_ics(monkeypatch):
     print("✓ trips-import dispatch --ics / --dry-run")
 
 
+def test_ics_extreme_year_datetime_skipped():
+    """可解析但换算越界的 DATE-TIME（0001-01-01+1400）逐事件跳过不崩溃。"""
+    from utils.trip_import import parse_trips_ics
+
+    ics = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:extreme-1",
+            "SUMMARY:北京 → 上海（出差）",
+            "DTSTART:00010101T000000+1400",
+            "DTEND:00010102T000000+1400",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]
+    )
+    rows, errors = parse_trips_ics(ics)
+    assert rows == [], rows
+    assert errors, "越界时间要按非法事件报告而不是静默通过"
+    print("✓ 极端年份的 ICS 时间按非法事件跳过")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()

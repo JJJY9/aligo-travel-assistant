@@ -2890,7 +2890,12 @@ def create_app(model: Any = None) -> FastAPI:
                 {
                     "role": message.get("role", "assistant"),
                     "content": _render_stored_message(message),
-                    "meta": extract_turn_meta(str(message.get("content", "")))
+                    # 旧数据 / 手写记忆文件里的 _meta 可能含 NaN：原样放进
+                    # 响应会让 JSON 序列化（allow_nan=False）失败、该会话
+                    # 每次打开都 500，这里统一归一为 None
+                    "meta": _json_safe_value(
+                        extract_turn_meta(str(message.get("content", "")))
+                    )
                     if message.get("role") == "assistant"
                     else None,
                     "timestamp": message.get("timestamp", ""),
