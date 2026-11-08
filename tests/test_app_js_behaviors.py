@@ -185,8 +185,11 @@ def test_trip_import_file_decoding_and_size_guard():
         "结果 toast 的跳过数量同样要用 skipped_total"
     )
     assert results["after_import"]["confirm"] == (
-        "将新增 1 条、更新 0 条行程，跳过 73 条。继续？"
-    ), "确认框的跳过数量必须用 skipped_total（列表最多 50 条）"
+        "将新增 1 条、更新 0 条行程，跳过 73 条。继续？\n\n"
+        "跳过原因（前 2 条）：\n"
+        "第 3 行：目的地为空\n"
+        "第 7 行：出发日期格式应为 YYYY-MM-DD"
+    ), "确认框的跳过数量必须用 skipped_total（列表最多 50 条），并展示前几条原因"
     urls = results["after_import"]["urls"]
     assert len(urls) == 2 and urls[0].endswith("dry_run=1"), urls
     assert "dry_run" not in urls[1], "正式写入不能带 dry_run"

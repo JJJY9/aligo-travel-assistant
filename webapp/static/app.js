@@ -1255,12 +1255,22 @@ async function importTripsFromFile(file) {
       );
       // 扫描期间关闭面板：不再弹确认，更不能在看不见的界面里写入
       if (!isModalOpen()) return;
+      // 确认框里带上前几条跳过原因：只报数量时用户无法判断是不是选错格式
+      const skipPreview = Array.isArray(preview.skipped)
+        ? preview.skipped.slice(0, 3)
+        : [];
+      const skipReasons = skipPreview
+        .map((item) => `第 ${item.line} 行：${item.reason}`)
+        .join("\n");
       const ok = window.confirm(
         `将新增 ${Number(preview.created || 0)} 条、更新 ${Number(
           preview.updated || 0,
         )} 条行程` +
           (previewSkipped ? `，跳过 ${previewSkipped} 条` : "") +
-          "。继续？",
+          "。继续？" +
+          (skipReasons
+            ? `\n\n跳过原因（前 ${skipPreview.length} 条）：\n${skipReasons}`
+            : ""),
       );
       if (!ok) {
         toast("已取消导入");
