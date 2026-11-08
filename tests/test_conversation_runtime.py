@@ -71,6 +71,7 @@ class _FakeMemory:
         self.persist_guard = should_commit
         self.events.append(("user", user_content))
         self.events.append(("assistant", assistant_content))
+        return True
 
     def add_message(self, role, content, metadata=None):
         self.threads[f"add-{role}"] = threading.get_ident()
