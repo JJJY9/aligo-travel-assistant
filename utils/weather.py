@@ -261,6 +261,30 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
         degraded = _degraded_hit(key)
         if degraded is not None:
             return degraded
+        # 等待超时（领先线程在恶劣网络下可能远超 timeout*2+1 仍在途）：
+        # 重新登记单飞——抢到名额才发起新一轮（并重新检查缓存），否则继续
+        # 等待新的领先者，避免所有等待线程同时重打上游、放大成多轮请求
+        leader, event = _claim_fetch(key)
+        if leader:
+            cached = _cache_hit(key)
+            if cached is not None:
+                _finish_fetch(key, event)
+                return cached
+            failed = _failure_hit(key)
+            if failed is not None:
+                _finish_fetch(key, event)
+                raise WeatherError(failed)
+        else:
+            event.wait(timeout * 2 + 1)
+            cached = _cache_hit(key)
+            if cached is not None:
+                return cached
+            failed = _failure_hit(key)
+            if failed is not None:
+                raise WeatherError(failed)
+            degraded = _degraded_hit(key)
+            if degraded is not None:
+                return degraded
     try:
         return _fetch_weather_uncached(name, key, timeout)
     except WeatherError as exc:

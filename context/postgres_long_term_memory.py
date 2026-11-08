@@ -780,23 +780,28 @@ class PostgresLongTermMemory:
         origin = str(trip_info.get("origin") or "")
         end_date = str(trip_info.get("end_date") or start_date)
         if destination and start_date:
-            existing = self._fetchone(
-                """
-                SELECT id, trip_id FROM aligo_trips
-                WHERE user_id = %s
-                  AND destination = %s
-                  AND COALESCE(origin, '') = %s
-                  AND start_date = %s
-                  AND COALESCE(NULLIF(end_date, ''), start_date) = %s
-                LIMIT 1
-                """,
+            from utils.trip_import import normalize_identity_date
+
+            # 历史行可能是未补零日期（2026-1-5），SQL 等值比较会把补零后的
+            # 导入当成新行程：按路线取出候选行，在 Python 侧归一日期再比对
+            candidates = self._fetchall(
+                "SELECT id, trip_id, start_date, end_date FROM aligo_trips "
+                "WHERE user_id = %s AND destination = %s AND COALESCE(origin, '') = %s",
+                (self.user_id, destination, origin),
+            )
+            want_start = normalize_identity_date(start_date)
+            want_end = normalize_identity_date(end_date)
+            existing = next(
                 (
-                    self.user_id,
-                    destination,
-                    origin,
-                    start_date,
-                    end_date,
+                    row
+                    for row in candidates
+                    if normalize_identity_date(row[2]) == want_start
+                    and (
+                        normalize_identity_date(row[3]) or normalize_identity_date(row[2])
+                    )
+                    == want_end
                 ),
+                None,
             )
             if existing:
                 # 与 JSON 后端一致：未提供的字段（None）保留原值，不能被默认值

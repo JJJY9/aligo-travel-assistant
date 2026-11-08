@@ -414,6 +414,37 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             )
         if len(raw_knowledge) > _MAX_KNOWLEDGE:
             errors.append(f"知识片段超过 {_MAX_KNOWLEDGE} 条，多余条目已跳过")
+            # 截断点可能落在多分片 group 中间：残缺组会让 import_documents
+            # 的组完整性校验拒绝整份恢复——把被截断的组整组丢弃
+            kept_counts: Counter[str] = Counter()
+            declared: dict[str, int] = {}
+            for entry in knowledge:
+                meta = entry["metadata"]
+                group = str(meta.get("group") or "")
+                if not group:
+                    continue
+                kept_counts[group] += 1
+                try:
+                    declared[group] = max(
+                        declared.get(group, 1), int(meta.get("parts") or 1)
+                    )
+                except (TypeError, ValueError):
+                    declared[group] = declared.get(group, 1)
+            truncated_groups = {
+                group
+                for group, count in kept_counts.items()
+                if declared.get(group, count) > count
+            }
+            if truncated_groups:
+                knowledge = [
+                    entry
+                    for entry in knowledge
+                    if str(entry["metadata"].get("group") or "")
+                    not in truncated_groups
+                ]
+                errors.append(
+                    f"截断导致 {len(truncated_groups)} 个知识分片组不完整，已整组跳过"
+                )
     if invalid_groups:
         # 同组的其它分片一并丢弃：只删坏分片会让 import_documents 的分组
         # 完整性校验看到「缺片」而拒绝整份知识恢复，连无关的合法文档也

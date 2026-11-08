@@ -12,6 +12,7 @@ import json
 import logging
 import threading
 import uuid
+from collections import Counter
 from typing import Any
 
 from utils.knowledge_paths import COLLECTION_NAME, knowledge_db_path
@@ -629,7 +630,15 @@ def _regroup_exported_documents(
                     "请整组一起导入"
                 )
         stripped_contents = [content.strip() for content in contents]
-        if all(stripped in existing for stripped in stripped_contents):
+        # 多重集判定：一组里两片同文时，库里只存在一份不能算「整组已存在」
+        remaining_existing = Counter(existing)
+        group_exists = True
+        for stripped in stripped_contents:
+            if remaining_existing[stripped] <= 0:
+                group_exists = False
+                break
+            remaining_existing[stripped] -= 1
+        if group_exists:
             # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
             skipped += len(contents)
             continue
@@ -870,6 +879,9 @@ def import_documents(
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
         # 插入同一批内容；快照走全量扫描，集合超过单页规模时也不会重复导入
         existing = _existing_contents()
+        # 内容可能在同一 group 内重复（两段完全相同的正文各占一个 part）：
+        # 用多重集而不是集合计数，一份已存在只能抵消一个分片
+        existing_counts: Counter[str] = Counter(existing)
         merged_items, group_skipped = _regroup_exported_documents(valid, existing)
         duplicate = group_skipped
         document_chunks: list[list[dict[str, Any]]] = []
@@ -946,16 +958,24 @@ def import_documents(
                     (doc_chunks[0].get("metadata") or {}).get("group") or ""
                 )
             # existing 存的是 strip 后的内容；分片内容可能带切分残留的
-            # 换行，必须同样 strip 后比较，否则重复导入不幂等
+            # 换行，必须同样 strip 后比较，否则重复导入不幂等。组内重复
+            # 内容按多重集消费：一份已存在只抵消一个分片，缺失的同文分片
+            # 仍要补齐（整组跳过会让残缺组永久留在库里）。消费按「本篇」
+            # 归还——库内内容对后续文档仍然可用来判重
             keys = [piece["content"].strip() for piece in doc_chunks]
-            missing = [
-                piece
-                for piece, key in zip(doc_chunks, keys)
-                if key not in existing
-            ]
+            missing = []
+            consumed: Counter[str] = Counter()
+            for chunk, key in zip(doc_chunks, keys):
+                if existing_counts[key] > 0:
+                    existing_counts[key] -= 1
+                    consumed[key] += 1
+                    continue
+                missing.append(chunk)
             duplicate += len(doc_chunks) - len(missing)
             if not missing:
+                existing_counts.update(consumed)
                 continue
+            missing_keys = {id(piece) for piece in missing}
             if len(missing) != len(doc_chunks) and doc_group:
                 # 备份组与库内片段部分重合：库内旧分片的 group/part/parts
                 # 必须与本次布局一致才能安全补齐（例如上次导入中途失败的
@@ -972,7 +992,9 @@ def import_documents(
                     conflicts.append(doc_group)
                 else:
                     for chunk, key in zip(doc_chunks, keys):
-                        if key not in existing:
+                        if id(chunk) in missing_keys:
+                            # 缺失分片不参与布局比对（同文重复时第二片是
+                            # 待补写项，不对应库里已有的那一行）
                             continue
                         old_group, old_part, old_parts = layout.get(key, ("", 0, 1))
                         chunk_meta = chunk.get("metadata")
@@ -991,6 +1013,7 @@ def import_documents(
                         "请整份编辑或 kb-delete --group 后重新导入",
                         doc_group,
                     )
+                    existing_counts.update(consumed)
                     duplicate += len(missing)
                     continue
             # 部分分片已存在（上次导入中途失败 / 组内重复）：只补缺失分片，
@@ -1002,8 +1025,9 @@ def import_documents(
                 )
                 for missing_piece in missing:
                     missing_piece["metadata"]["parts"] = str(total_parts)
-            for key in keys:
-                existing.add(key)
+            existing_counts.update(consumed)
+            for missing_piece in missing:
+                existing_counts[missing_piece["content"].strip()] += 1
             unique.extend(missing)
         if not unique:
             result: dict[str, Any] = {

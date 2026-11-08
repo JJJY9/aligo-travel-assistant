@@ -570,6 +570,40 @@ def test_weather_codes_include_freezing_drizzle():
     print("✓ 天气码 56/57 有中文描述")
 
 
+def test_follower_reclaims_single_flight_after_timeout(monkeypatch):
+    """等待超时后：先重新登记单飞，抢到名额才发起新一轮上游请求。"""
+    claims = {"n": 0}
+    events = []
+
+    def fake_claim(key):
+        claims["n"] += 1
+        event = threading.Event()
+        events.append(event)
+        if claims["n"] == 1:
+            event.set()  # 第一次等待立即超时返回
+            return False, event
+        return True, event
+
+    monkeypatch.setattr(weather, "_claim_fetch", fake_claim)
+    monkeypatch.setattr(weather, "_cache_hit", lambda key: None)
+    monkeypatch.setattr(weather, "_failure_hit", lambda key: None)
+    monkeypatch.setattr(weather, "_degraded_hit", lambda key: None)
+    fetched = {"n": 0}
+
+    def fake_fetch(name, key, timeout):
+        fetched["n"] += 1
+        return {"city": name, "current": {}, "daily": []}
+
+    monkeypatch.setattr(weather, "_fetch_weather_uncached", fake_fetch)
+    monkeypatch.setattr(weather, "_finish_fetch", lambda key, event: event.set())
+    result = weather.fetch_weather("并发城", timeout=0.01)
+    assert result["city"] == "并发城"
+    assert claims["n"] == 2, "等待超时后必须重新登记单飞"
+    assert fetched["n"] == 1
+    assert events[-1].is_set(), "新一轮结束要释放登记"
+    print("✓ 等待超时后重新登记单飞（不放大上游请求）")
+
+
 if __name__ == "__main__":
     for case in (
         test_stale_fallback_merges_concurrent_requests,
@@ -584,6 +618,7 @@ if __name__ == "__main__":
         test_leader_recheck_uses_result_written_by_other_thread,
         test_leader_recheck_raises_failure_written_by_other_thread,
         test_follower_uses_cached_result_or_failure,
+        test_follower_reclaims_single_flight_after_timeout,
         test_cache_key_ignores_case_and_extra_space,
         test_failure_cache_prevents_repeat_requests,
         test_failure_cache_expires,

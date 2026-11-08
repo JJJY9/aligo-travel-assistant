@@ -393,6 +393,26 @@ def test_csv_oversized_field_returns_error_and_keeps_rows():
     assert any("CSV 解析失败" in message for _, message in errors), errors
     print("✓ 超长 CSV 字段按解析错误返回（不再整条命令 traceback）")
 
+def test_trip_identity_normalizes_unpadded_dates():
+    """去重键对 YYYY-M-D 补零：历史未补零行程与补零后的导入视为同一行程。"""
+    from utils.trip_import import trip_identity
+
+    unpadded = trip_identity(
+        {"origin": "北京", "destination": "上海", "start_date": "2026-1-5"}
+    )
+    padded = trip_identity(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-01-05",
+            "end_date": "2026-1-5",
+        }
+    )
+    assert unpadded == padded
+    # 非法数字形态（越界月日）保持原样，不做“修正”
+    assert trip_identity({"start_date": "2026-13-40"})[2] == "2026-13-40"
+    print("✓ 去重键归一未补零日期")
+
 
 def test_ics_collects_invalid_events():
     text = (
@@ -655,6 +675,7 @@ if __name__ == "__main__":
     test_ics_external_summary_fallback()
     test_ics_empty_origin_roundtrip()
     test_ics_datetime_offset_converts_local_date()
+    test_trip_identity_normalizes_unpadded_dates()
     test_ics_invalid_utc_offset_does_not_abort()
     test_ics_tzid_parameter_matches_utc_representation()
     test_csv_oversized_field_returns_error_and_keeps_rows()
