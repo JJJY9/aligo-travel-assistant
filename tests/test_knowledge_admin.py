@@ -2209,12 +2209,47 @@ def test_regroup_keeps_non_dict_items():
     print("✓ 重组保留非对象条目")
 
 
+def test_document_info_parses_parts_and_group():
+    """已有片段分片信息：非法 parts 按单片、缺失返回 (0, \"\")、单条不带组。"""
+    fake = _FakeMilvusClient(
+        [
+            {"id": 5, "content": "x", "metadata": '{"parts": "3", "group": "g5"}'},
+            {"id": 6, "content": "y", "metadata": '{"parts": "not-int"}'},
+            {"id": 7, "content": "z", "metadata": '{"parts": "1", "group": "g7"}'},
+        ]
+    )
+    assert knowledge_admin._document_info(fake, 5) == (3, "g5")
+    assert knowledge_admin._document_info(fake, 6) == (1, "")
+    assert knowledge_admin._document_info(fake, 7) == (1, ""), "单片记录不返回组 id"
+    assert knowledge_admin._document_info(fake, 999) == (0, "")
+    print("✓ _document_info 分片数 / 组 id / 缺失")
+
+
+def test_import_empty_documents_short_circuits(monkeypatch):
+    """空导入直接返回零计数，不访问知识库 / 加载嵌入模型。"""
+
+    def no_io():
+        raise AssertionError("空导入不应访问知识库")
+
+    monkeypatch.setattr(knowledge_admin, "_client", no_io)
+    expected = {
+        "imported": 0,
+        "skipped": 0,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 0,
+    }
+    assert knowledge_admin.import_documents([]) == expected
+    assert knowledge_admin.import_documents([], dry_run=True) == expected
+    print("✓ 空导入短路返回零计数")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
     test_iter_all_rows_closes_iterator_even_on_error()
     test_restore_pieces_fallbacks()
     test_regroup_keeps_non_dict_items()
+    test_document_info_parses_parts_and_group()
     for case in (
         test_list_documents_parses_sorts_and_filters,
         test_list_documents_pages_full_scan,
@@ -2236,6 +2271,7 @@ if __name__ == "__main__":
         test_write_agent_cached_with_create_if_missing,
         test_get_document_reads_single_row,
         test_existing_group_layout_tolerates_bad_numbers,
+        test_import_empty_documents_short_circuits,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_cross_group_share_keeps_unique_pieces,
