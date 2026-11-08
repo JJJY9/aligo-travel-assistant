@@ -4704,11 +4704,7 @@ def run_trips_import_standalone(
     import io
     import re
 
-    from utils.trip_import import (
-        parse_trips_csv,
-        parse_trips_ics,
-        trip_identity,
-    )
+    from utils.trip_import import import_trips_from_text
 
     def _fail(message: str) -> int:
         if as_json:
@@ -4736,53 +4732,43 @@ def run_trips_import_standalone(
     except OSError as exc:
         return _fail(f"读取导入文件失败：{exc}")
 
-    is_ics = as_ics or text.lstrip("﻿ \t\r\n").upper().startswith("BEGIN:VCALENDAR")
-    if is_ics:
-        rows, errors = parse_trips_ics(text)
-    else:
-        rows, errors = parse_trips_csv(text)
-    if not rows:
-        if is_ics:
-            detail = "；".join(
-                reason if index == 0 else f"事件{index}：{reason}"
-                for index, reason in errors[:5]
-            )
-        else:
-            detail = "；".join(f"第{line}行：{reason}" for line, reason in errors[:5])
-        return _fail(f"没有可导入的行程{f'（{detail}）' if detail else ''}")
-
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"打开长期记忆失败：{exc}")
     try:
-        if dry_run:
-            # 预览：按存储层同一去重键模拟新增 / 更新，不写库
-            try:
-                pending_keys = {
-                    trip_identity(trip)
-                    for trip in store.get_trip_history(limit=None)
-                }
-            except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-                return _fail(f"读取行程失败：{exc}")
-            created = 0
-            updated = 0
-            for row in rows:
-                key = trip_identity(row)
-                if key in pending_keys:
-                    updated += 1
-                else:
-                    created += 1
-                    pending_keys.add(key)
-        else:
-            try:
-                created, updated = store.save_trip_histories(rows)
-            except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-                return _fail(f"写入行程失败：{exc}")
+        try:
+            result = import_trips_from_text(
+                store, text, dry_run=dry_run, force_ics=as_ics
+            )
+        except ValueError as exc:
+            return _fail(str(exc))
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"导入行程失败：{exc}")
     finally:
         close = getattr(store, "close", None)
         if callable(close):
             close()
+
+    is_ics = result["format"] == "ics"
+    skipped = result["skipped"]
+    skipped_total = int(result.get("skipped_total", len(skipped)))
+    if not result["rows"]:
+        if is_ics:
+            detail = "；".join(
+                str(item["reason"])
+                if index == 0
+                else f"事件{item['line']}：{item['reason']}"
+                for index, item in enumerate(skipped[:5])
+            )
+        else:
+            detail = "；".join(
+                f"第{item['line']}行：{item['reason']}" for item in skipped[:5]
+            )
+        return _fail(f"没有可导入的行程{f'（{detail}）' if detail else ''}")
+
+    created = result["created"]
+    updated = result["updated"]
     if as_json:
         print(
             json.dumps(
@@ -4790,15 +4776,13 @@ def run_trips_import_standalone(
                     "ok": True,
                     "user_id": user_id,
                     "path": csv_path,
-                    "format": "ics" if is_ics else "csv",
+                    "format": result["format"],
                     "dry_run": dry_run,
-                    "rows": len(rows),
+                    "rows": result["rows"],
                     "created": created,
                     "updated": updated,
-                    "skipped": [
-                        {"line": line, "reason": reason}
-                        for line, reason in errors
-                    ],
+                    "skipped": skipped,
+                    "skipped_total": skipped_total,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -4806,16 +4790,16 @@ def run_trips_import_standalone(
         )
     else:
         unit = "个事件" if is_ics else "行"
-        skipped_note = f"，跳过 {len(errors)} 项" if errors else ""
+        skipped_note = f"，跳过 {skipped_total} 项" if skipped_total else ""
         head = (
-            f"预览（未写入）：将从 {csv_path} 导入 {len(rows)} {unit}"
+            f"预览（未写入）：将从 {csv_path} 导入 {result['rows']} {unit}"
             if dry_run
-            else f"已从 {csv_path} 导入 {len(rows)} {unit}"
+            else f"已从 {csv_path} 导入 {result['rows']} {unit}"
         )
         print(f"{head}：新增 {created} 条，更新 {updated} 条{skipped_note}")
-        for line, reason in errors:
-            label = f"事件{line}" if is_ics else f"第{line}行"
-            print(f"  跳过{label}：{reason}")
+        for item in skipped:
+            label = f"事件{item['line']}" if is_ics else f"第{item['line']}行"
+            print(f"  跳过{label}：{item['reason']}")
     return 0
 
 

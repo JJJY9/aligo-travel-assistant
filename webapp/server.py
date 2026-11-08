@@ -646,10 +646,12 @@ class TripPayload(BaseModel):
 class TripImportPayload(BaseModel):
     """从 CSV / iCalendar 文本导入行程（记忆面板文件选择）。
 
-    必须走 JSON body：文本可达 1MB，且跨站表单无法发送 application/json。
+    必须走 JSON body：跨站表单无法发送 application/json。``content`` 上限
+    50 万字符：JSON 序列化后中文约 1.5 MB、转义最多的 ASCII 约 1 MB，仍在
+    2 MB 请求体上限内（100 万字符的中文会超过 2 MB，永远无法送达）。
     """
 
-    content: str = Field(min_length=1, max_length=1_000_000)
+    content: str = Field(min_length=1, max_length=500_000)
 
 
 class TripUpdatePayload(BaseModel):
@@ -3711,20 +3713,42 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
         dry_run: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """从 CSV / iCalendar 文本导入行程（与 CLI ``trips-import`` 同语义）。"""
+        """从 CSV / iCalendar 文本导入行程（与 CLI ``trips-import`` 同语义）。
+
+        解析与批量写入在导入专用执行器里执行（单 worker + 背压），批量
+        保存是 O(N²) 且持用户锁：不能占用共享线程池，也不能并发跑多份。
+        """
         response.headers.update(_enforce_import_rate_limit(state, request))
-        store = _open_long_term(user_id)
-        try:
-            result = import_trips_from_text(
-                store, payload.content, dry_run=dry_run
-            )
-        except Exception as exc:  # noqa: BLE001 - 读取 / 写入失败统一提示
-            logger.warning("导入行程失败: %s", exc)
+        if not state.import_queue_slots.acquire(blocking=False):
             raise HTTPException(
-                status_code=503, detail=f"导入行程失败：{exc}"
-            ) from exc
+                status_code=503,
+                detail=(
+                    "已有导入任务在处理，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+            )
+        try:
+
+            def work() -> dict[str, Any]:
+                store = _open_long_term(user_id)
+                try:
+                    return import_trips_from_text(
+                        store, payload.content, dry_run=dry_run
+                    )
+                finally:
+                    _close_long_term(store)
+
+            try:
+                result = state.import_executor.submit(work).result()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001 - 读取 / 写入失败统一提示
+                logger.warning("导入行程失败: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail=f"导入行程失败：{exc}"
+                ) from exc
         finally:
-            _close_long_term(store)
+            state.import_queue_slots.release()
         if not result["rows"]:
             reasons = "；".join(
                 (

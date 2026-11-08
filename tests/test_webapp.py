@@ -1443,6 +1443,74 @@ def test_trips_import_api(monkeypatch):
     print("✓ /api/trips/import 文本导入（CSV / dry-run / ICS / 400 / 503 / 422）")
 
 
+def test_trips_import_runs_in_import_executor_and_maps_errors(monkeypatch):
+    """行程导入在专用执行器执行；ValueError 400 / 内容上限 422 / 背压 503。"""
+    import threading
+
+    from webapp import server as server_module
+
+    class _Store:
+        def close(self):
+            pass
+
+    names = []
+
+    def fake_import(store, text, dry_run=False, force_ics=False):
+        names.append(threading.current_thread().name)
+        if text == "row-cap":
+            raise ValueError("单次最多导入 5000 条行程，请拆分文件后再导入")
+        return {
+            "dry_run": dry_run,
+            "format": "csv",
+            "rows": 1,
+            "created": 1,
+            "updated": 0,
+            "skipped": [],
+            "skipped_total": 0,
+        }
+
+    monkeypatch.setattr(server_module, "import_trips_from_text", fake_import)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    client = _client()
+    state = client.app.state.aligo
+    user = _unique_user("web_trip_exec")
+
+    response = client.post(
+        f"/api/trips/import?user_id={user}", json={"content": "x"}
+    )
+    assert response.status_code == 200, response.text
+    assert names and names[0].startswith("aligo-import"), names
+
+    bad = client.post(
+        f"/api/trips/import?user_id={user}", json={"content": "row-cap"}
+    )
+    assert bad.status_code == 400
+    assert "5000" in bad.json()["detail"]
+
+    over = client.post(
+        f"/api/trips/import?user_id={user}",
+        json={"content": "a" * 500_001},
+    )
+    assert over.status_code == 422, "超过 50 万字符必须在校验层拒绝"
+
+    tokens = [
+        state.import_queue_slots.acquire(),
+        state.import_queue_slots.acquire(),
+    ]
+    assert all(tokens)
+    try:
+        busy = client.post(
+            f"/api/trips/import?user_id={user}", json={"content": "x"}
+        )
+        assert busy.status_code == 503
+        assert "已有导入任务" in busy.json()["detail"]
+    finally:
+        for _ in tokens:
+            state.import_queue_slots.release()
+    assert len(names) == 2, "背压 / 422 不应执行导入"
+    print("✓ /api/trips/import 专用执行器 / 400 / 422 / 背压 503")
+
+
 def test_trip_update_validation_and_errors(monkeypatch):
     """行程更新的校验与错误映射：400 / 422（多种）/ 404 / 409（冲突与歧义）/ 503。"""
     from webapp import server as server_module

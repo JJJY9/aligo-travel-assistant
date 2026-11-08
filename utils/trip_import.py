@@ -142,7 +142,8 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
                 "destination": destination,
                 "start_date": start_date,
                 "end_date": end_date,
-                "purpose": cell(row, "purpose") or "出差",
+                # 缺省 / 空白目的保留 None：去重更新时存储层保留原值
+                "purpose": cell(row, "purpose") or None,
             }
         )
     return rows, errors
@@ -293,7 +294,11 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
     description = _ics_unescape(props.get("DESCRIPTION", "")).strip()
     summary = _ics_unescape(props.get("SUMMARY", "")).strip()
     origin = destination = purpose = ""
-    match = _ALIGO_DESCRIPTION.match(description)
+    # 正则只扫描前缀：两个模式都含非贪婪 .*? 加尾部字面量，攻击者用大量
+    # 「 → 」/缺少闭合括号的文本可触发二次方回溯（1M 字符可卡住数十分钟）。
+    # 本工具生成的 DESCRIPTION / SUMMARY 都在数百字符内，超长前缀不可能是
+    # 自己的格式。
+    match = _ALIGO_DESCRIPTION.match(description[:2000])
     if match:
         origin = match.group("origin").strip()
         destination = match.group("destination").strip()
@@ -301,13 +306,13 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
         # 日期以 DTSTART / DTEND 为准：DESCRIPTION 里的时间段可能被外部日历
         # 手工编辑过，与实际事件不一致
     else:
-        match = _ICS_SUMMARY.match(summary)
+        match = _ICS_SUMMARY.match(summary[:400])
         if match:
             origin = match.group("origin").strip()
             destination = match.group("destination").strip()
             purpose = match.group("purpose").strip()
         else:
-            destination = summary
+            destination = summary[:400]
     if not destination:
         return None, "缺少目的地（SUMMARY 为空）"
     return {
@@ -315,7 +320,9 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
         "destination": destination,
         "start_date": start_date,
         "end_date": end_date,
-        "purpose": purpose or "出差",
+        # 未提供目的时保留 None：去重更新时存储层保留原值，不会把用户
+        # 手动改过的目的覆盖成默认「出差」
+        "purpose": purpose or None,
     }, None
 
 
@@ -361,18 +368,45 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
     return rows, errors
 
 
+# 单次导入行数上限：批量保存是 O(N²)（JSON 每条重扫历史 / PG 每条查候选
+# 并扫 trip_id），且整批持用户锁；5000 条在本地实测约 10 秒，与备份恢复
+# 的 _MAX_TRIPS 同一量级，避免一个文件把对话 / 行程写入阻塞数分钟。
+_MAX_IMPORT_ROWS = 5000
+# 解析错误只在结果里保留前 50 条（HTTP 400 只用前 5 条原因）：一个 1MB
+# 的坏文件可能有数十万条错误，全量物化会占用上百 MB 内存。
+_MAX_SKIPPED = 50
+
+
+def _bad_import_text(value: Any) -> bool:
+    """行程字段是否含不能入库的文本（NUL / 孤立代理项）。"""
+    if not isinstance(value, str):
+        return False
+    if "\x00" in value:
+        return True
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 def import_trips_from_text(
-    store: Any, text: str, dry_run: bool = False
+    store: Any,
+    text: str,
+    dry_run: bool = False,
+    force_ics: bool = False,
 ) -> dict[str, Any]:
     """解析 CSV / iCalendar 文本并写入行程（与 CLI ``trips-import`` 同语义）。
 
     - 内容以 ``BEGIN:VCALENDAR`` 开头（容忍 BOM / 空白）时按 ICS 解析，否则按 CSV；
-    - 重复行程沿用存储层去重（同路线 + 同起止日期更新目的）；
+    - 重复行程沿用存储层去重（同路线 + 同起止日期更新目的）；导入未提供目的
+      时不覆盖已有行程的目的，新建行程补默认「出差」；
+    - 单次最多 5000 行；字段含 NUL / 孤立代理项时整份拒绝（与其它写接口同口径）；
     - ``dry_run=True`` 只按同一去重键模拟新增 / 更新，不写库。
 
     Returns:
-        ``{"format": "ics"|"csv", "rows", "created", "updated",
-        "skipped": [{"line", "reason"}]}``；``rows`` 为可导入条数。
+        ``{"dry_run", "format": "ics"|"csv", "rows", "created", "updated",
+        "skipped": [{"line", "reason"}]（最多 50 条）, "skipped_total"}``。
     """
     normalized = str(text or "").lstrip("﻿ \t\r\n")
     is_ics = normalized.upper().startswith("BEGIN:VCALENDAR")
@@ -386,14 +420,32 @@ def import_trips_from_text(
         "rows": len(rows),
         "created": 0,
         "updated": 0,
-        "skipped": [{"line": line, "reason": reason} for line, reason in errors],
+        "skipped": [
+            {"line": line, "reason": reason} for line, reason in errors[:_MAX_SKIPPED]
+        ],
+        "skipped_total": len(errors),
     }
     if not rows:
         return result
+    if len(rows) > _MAX_IMPORT_ROWS:
+        raise ValueError(
+            f"单次最多导入 {_MAX_IMPORT_ROWS} 条行程，请拆分文件后再导入"
+        )
+    for row in rows:
+        for field in ("origin", "destination", "purpose"):
+            if _bad_import_text(row.get(field)):
+                raise ValueError("行程内容包含 NUL 或非法 Unicode 字符，已拒绝导入")
+
+    existing_keys = {
+        trip_identity(trip) for trip in store.get_trip_history(limit=None)
+    }
+    # 新建行程才补默认目的；已存在的行程保留原目的（存储层对 None 不覆盖）
+    for row in rows:
+        if row.get("purpose") is None and trip_identity(row) not in existing_keys:
+            row["purpose"] = "出差"
+
     if dry_run:
-        pending = {
-            trip_identity(trip) for trip in store.get_trip_history(limit=None)
-        }
+        pending = set(existing_keys)
         created = updated = 0
         for row in rows:
             key = trip_identity(row)
