@@ -269,17 +269,20 @@ def test_trips_dedupe_panel_flow():
     results = _run_harness("tripsDedupe")
 
     empty = results["empty"]
-    assert empty["urls"] == [
-        "/api/trips/dedupe?user_id=u-dedupe&dry_run=1"
-    ], empty
+    assert empty["urls"] == ["/api/trips/dedupe"], empty
+    assert empty["methods"] == ["POST"]
+    assert empty["bodies"] == [{"user_id": "u-dedupe", "dry_run": True}], empty
+    assert empty["contentTypes"] == ["application/json"], (
+        "去重是破坏性操作，必须走 JSON body（跨站表单发不出）"
+    )
     assert empty["confirmCalls"] == 0, "没有重复时不弹确认"
     assert empty["toasts"] == ["没有重复行程可清理"]
     assert empty["refreshed"] == 0
     assert empty["button"] == {"text": "清理重复", "disabled": False}
 
     cancel = results["cancel"]
-    assert len(cancel["urls"]) == 1, "取消确认后不能再发删除请求"
-    assert cancel["urls"][0].endswith("dry_run=1")
+    assert cancel["urls"] == ["/api/trips/dedupe"], "取消确认后不能再发删除请求"
+    assert cancel["bodies"][0]["dry_run"] is True
     assert cancel["confirmCalls"] == 1
     assert "2 条重复行程" in cancel["confirmMessage"]
     assert cancel["toasts"] == ["已取消清理重复行程"]
@@ -287,10 +290,13 @@ def test_trips_dedupe_panel_flow():
     assert cancel["button"] == {"text": "清理重复", "disabled": False}
 
     applied = results["applied"]
-    assert len(applied["urls"]) == 2, applied
-    assert applied["urls"][0].endswith("dry_run=1")
-    assert "dry_run" not in applied["urls"][1]
+    assert applied["urls"] == ["/api/trips/dedupe", "/api/trips/dedupe"], applied
     assert applied["methods"] == ["POST", "POST"]
+    assert applied["bodies"][0] == {"user_id": "u-dedupe", "dry_run": True}
+    assert applied["bodies"][1] == {"user_id": "u-dedupe"}, (
+        "正式执行不能带 dry_run"
+    )
+    assert applied["contentTypes"] == ["application/json", "application/json"]
     assert applied["toasts"] == ["已清理 2 条重复行程"]
     assert applied["refreshed"] == 1, "执行成功后刷新一次数据概览"
     assert applied["button"] == {"text": "清理重复", "disabled": False}

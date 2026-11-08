@@ -5235,10 +5235,11 @@ function bindEvents() {
       button.disabled = true;
       button.textContent = "检查中…";
       try {
-        const preview = await getJSON(
-          `/api/trips/dedupe?user_id=${encodeURIComponent(userId)}&dry_run=1`,
-          { method: "POST" },
-        );
+        const preview = await getJSON("/api/trips/dedupe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: userId, dry_run: true }),
+        });
         if (!isModalOpen()) return;
         const count = Number(preview.would_remove || 0);
         if (!count) {
@@ -5253,10 +5254,11 @@ function bindEvents() {
           toast("已取消清理重复行程");
           return;
         }
-        const result = await getJSON(
-          `/api/trips/dedupe?user_id=${encodeURIComponent(userId)}`,
-          { method: "POST" },
-        );
+        const result = await getJSON("/api/trips/dedupe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: userId }),
+        });
         toast(`已清理 ${Number(result.removed || 0)} 条重复行程`);
         await refreshStatus({ silentFailure: true });
       } catch (error) {

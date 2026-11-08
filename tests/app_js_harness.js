@@ -789,7 +789,14 @@ async function scenarioTripsDedupe(source) {
       refreshStatus = async () => { __refreshed += 1; };
       getJSON = (url, options) => {
         __requests.push({ url, options: options || {} });
-        const data = url.includes("dry_run=1") ? ${JSON.stringify(preview)} : ${JSON.stringify(applyResult)};
+        let isPreview = false;
+        try {
+          isPreview =
+            JSON.parse((options && options.body) || "{}").dry_run === true;
+        } catch (error) {
+          isPreview = false;
+        }
+        const data = isPreview ? ${JSON.stringify(preview)} : ${JSON.stringify(applyResult)};
         return Promise.resolve(data);
       };
       state.userId = "u-dedupe";
@@ -804,6 +811,16 @@ async function scenarioTripsDedupe(source) {
     return run(`({
       urls: __requests.map((item) => item.url),
       methods: __requests.map((item) => (item.options || {}).method || ""),
+      bodies: __requests.map((item) => {
+        try {
+          return JSON.parse((item.options && item.options.body) || "null");
+        } catch (error) {
+          return null;
+        }
+      }),
+      contentTypes: __requests.map(
+        (item) => ((item.options || {}).headers || {})["Content-Type"] || "",
+      ),
       toasts: __toasts.slice(),
       confirmCalls: __confirmCalls,
       confirmMessage: __confirmMessage,

@@ -268,7 +268,11 @@ class RequestContextMiddleware:
                             "type": "http.response.start",
                             "status": 413,
                             "headers": [
-                                (b"content-type", b"application/json; charset=utf-8")
+                                (b"content-type", b"application/json; charset=utf-8"),
+                                # 413 时没有读取请求体：keep-alive 复用会让
+                                # 后续请求被当成剩余 body 吞掉（连接卡死）。
+                                # 明确关闭连接，客户端重新建连重试
+                                (b"connection", b"close"),
                             ],
                         }
                     )
@@ -380,7 +384,13 @@ class BodySizeLimitMiddleware:
                 {
                     "type": "http.response.start",
                     "status": 413,
-                    "headers": [(b"content-type", b"application/json; charset=utf-8")],
+                    "headers": [
+                        (b"content-type", b"application/json; charset=utf-8"),
+                        # 分块流在中止处停止读取：keep-alive 复用会让剩余的
+                        # 请求体被当成后续请求解析（或触发 uvicorn 协议错误），
+                        # 关闭连接让客户端重新建连
+                        (b"connection", b"close"),
+                    ],
                 }
             )
             await send({"type": "http.response.body", "body": payload})
@@ -688,6 +698,18 @@ class TripUpdatePayload(BaseModel):
         if problem:
             raise ValueError(f"行程字段{problem}")
         return cleaned
+
+
+class TripDedupePayload(BaseModel):
+    """清理重复行程（破坏性操作必须走 JSON body）。
+
+    跨站表单只能发送 form / text-plain 等简单请求，发不出 application/json；
+    把 user_id 放进 body 让浏览器对跨站调用先做 CORS 预检。此前用 query
+    参数 + 无 body，任意网页都能静默触发一次全量去重删除。
+    """
+
+    user_id: str = Field(pattern=_ID_PATTERN)
+    dry_run: bool = False
 
 
 class SessionTitlePayload(BaseModel):
@@ -3986,16 +4008,19 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.post("/api/trips/dedupe")
     def dedupe_trips_endpoint(
-        user_id: str = Query(..., pattern=_ID_PATTERN),
-        dry_run: bool = Query(default=False),
+        payload: TripDedupePayload, request: Request, response: Response
     ) -> dict[str, Any]:
         """清理重复行程（与 CLI ``trips-dedupe`` 同语义）。
 
-        同路线 + 同起止日期视为重复，保留最早一条；``dry_run=1`` 只返回
+        同路线 + 同起止日期视为重复，保留最早一条；``dry_run`` 只返回
         将删除的条目。判定 / 复核 / 删除与 CLI 共用 ``utils.trip_dedupe``，
         两条入口不会漂移。破坏性操作走 strict 打开：PostgreSQL 配置了但
-        不可用时 503，不在回退 JSON 上「清理成功」。
+        不可用时 503，不在回退 JSON 上「清理成功」；全量扫描按读取限流桶
+        限速（与列表 / 导出同额度）。
         """
+        user_id = payload.user_id
+        dry_run = payload.dry_run
+        response.headers.update(_enforce_read_rate_limit(state, request))
         store = _open_long_term(user_id, strict=True)
         try:
             try:
@@ -4006,7 +4031,7 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=503, detail=f"读取行程失败：{exc}"
                 ) from exc
             if dry_run:
-                payload: dict[str, Any] = {
+                result: dict[str, Any] = {
                     "user_id": user_id,
                     "dry_run": True,
                     "total_trips": plan["total_trips"],
@@ -4028,7 +4053,7 @@ def create_app(model: Any = None) -> FastAPI:
                             "可重试）"
                         ),
                     )
-                payload = {
+                result = {
                     "user_id": user_id,
                     "dry_run": False,
                     "total_trips": plan["total_trips"],
@@ -4038,7 +4063,7 @@ def create_app(model: Any = None) -> FastAPI:
                 }
         finally:
             _close_long_term(store)
-        return payload
+        return result
 
     @app.get("/api/trips/{trip_id}/calendar")
     def export_trip_calendar(
@@ -4190,6 +4215,21 @@ def create_app(model: Any = None) -> FastAPI:
             parse_user_export_data,
             preview_user_import,
         )
+
+        # 破坏性写入接口只接受 application/json：text/plain / 表单属于
+        # CORS 简单请求（无预检），任意网页都能跨站提交备份、把会话与行程
+        # 写进任意 user_id；JSON 请求会先触发预检，浏览器会拦截跨站写入
+        content_type = (
+            (request.headers.get("content-type") or "")
+            .split(";")[0]
+            .strip()
+            .lower()
+        )
+        if content_type != "application/json":
+            raise HTTPException(
+                status_code=415,
+                detail="备份恢复只接受 application/json 请求体",
+            )
 
         # 限流先于解析，而且都走线程池：请求体可达 64MB，Pydantic body 参数
         # 会让 FastAPI 在事件循环上同步 json.loads（实测 64MB 约 3 秒），

@@ -4060,7 +4060,8 @@ def test_trips_dedupe_endpoint_dry_run_and_apply(monkeypatch):
     )
     client = _client()
     preview = client.post(
-        "/api/trips/dedupe", params={"user_id": "u-dedupe", "dry_run": 1}
+        "/api/trips/dedupe",
+        json={"user_id": "u-dedupe", "dry_run": True},
     )
     assert preview.status_code == 200, preview.text
     data = preview.json()
@@ -4068,7 +4069,9 @@ def test_trips_dedupe_endpoint_dry_run_and_apply(monkeypatch):
     assert [entry["trip_id"] for entry in data["duplicates"]] == ["t2"]
     assert store.deleted == [], "预览不能删除任何行程"
 
-    applied = client.post("/api/trips/dedupe", params={"user_id": "u-dedupe"})
+    applied = client.post(
+        "/api/trips/dedupe", json={"user_id": "u-dedupe"}
+    )
     assert applied.status_code == 200, applied.text
     assert applied.json()["removed"] == 1
     assert [trip["trip_id"] for trip in store.trips] == ["t1", "t3"]
@@ -4093,7 +4096,7 @@ def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
         server_module, "_open_long_term", lambda user_id, **kwargs: _Boom()
     )
     response = _client().post(
-        "/api/trips/dedupe", params={"user_id": "u-dedupe"}
+        "/api/trips/dedupe", json={"user_id": "u-dedupe"}
     )
     assert response.status_code == 503
     assert "读取行程失败" in response.json()["detail"]
@@ -4132,11 +4135,32 @@ def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
         server_module, "_open_long_term", lambda user_id, **kwargs: ambiguous
     )
     data = _client().post(
-        "/api/trips/dedupe", params={"user_id": "u-dedupe"}
+        "/api/trips/dedupe", json={"user_id": "u-dedupe"}
     ).json()
     assert data["removed"] == 0
     assert data["ambiguous_ids"] == ["dup"]
     print("✓ /api/trips/dedupe 错误映射与歧义 id")
+
+
+def test_destructive_endpoints_require_json_body():
+    """跨站简单请求（form / text-plain）不能触发去重删除与备份恢复写入。"""
+    client = _client()
+    form = client.post(
+        "/api/trips/dedupe",
+        data={"user_id": "u-csrf"},
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert form.status_code == 422, form.text
+
+    plain = client.post(
+        "/api/import",
+        params={"user_id": "u-csrf"},
+        content=b'{"backup": {"preferences": {"home_location": "beijing"}}}',
+        headers={"content-type": "text/plain"},
+    )
+    assert plain.status_code == 415, plain.text
+    assert "application/json" in plain.json()["detail"]
+    print("✓ 破坏性接口拒绝跨站简单请求（JSON body + Content-Type 门禁）")
 
 
 def test_trips_csv_storage_failure_maps_503(monkeypatch):
@@ -5697,7 +5721,10 @@ def test_request_body_too_large():
     assert "请求体过大" in response.json()["detail"]
     assert response.headers.get("x-request-id")
     assert response.headers["x-content-type-options"] == "nosniff"
-    print("✓ 超大请求体返回 413（带安全头 / 请求 ID）")
+    assert response.headers.get("connection") == "close", (
+        "413 未读请求体：必须关闭连接，避免 keep-alive 把后续请求吞进 body"
+    )
+    print("✓ 超大请求体返回 413（带安全头 / 请求 ID / 关闭连接）")
 
 
 def test_chunked_request_body_too_large():
@@ -5715,7 +5742,10 @@ def test_chunked_request_body_too_large():
     assert "请求体过大" in response.json()["detail"]
     assert response.headers.get("x-request-id")
     assert response.headers["x-content-type-options"] == "nosniff"
-    print("✓ 分块请求体超过 2 MB 同样返回 413")
+    assert response.headers.get("connection") == "close", (
+        "分块中止后必须关闭连接，避免剩余 body 被当成下一个请求"
+    )
+    print("✓ 分块请求体超过 2 MB 同样返回 413（并关闭连接）")
 
 
 def test_chunked_request_body_allowed_under_limit():
@@ -8806,6 +8836,7 @@ if __name__ == "__main__":
     test_chat_releases_session_in_use_mark()
     test_request_body_too_large()
     test_chunked_request_body_too_large()
+    test_destructive_endpoints_require_json_body()
     test_chunked_request_body_allowed_under_limit()
     test_gzip_compression_excludes_sse()
     test_docs_csp_allows_cdn()
