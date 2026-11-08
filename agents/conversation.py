@@ -59,6 +59,11 @@ class ConversationRuntime:
         # 在途的记忆落库任务：取消 ask() 只取消协程，执行器线程仍会写完；
         # Web 入口在释放用户锁前先 drain 它（见 drain_pending_persist）
         self._pending_persist: asyncio.Future | None = None
+        # 最近一次在途落库对应的提问 / 本轮回滚状态：落库失败或守卫否决时
+        # 由完成回调触发回滚；下一轮开始前先等这次回滚结束，避免迟到的
+        # 回滚删掉下一轮文本相同的提问
+        self._last_persist_turn: tuple[str, dict[str, bool]] | None = None
+        self._pending_rollback: asyncio.Future | None = None
 
         self.memory = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
         self.intention_agent = IntentionAgent(name="IntentionAgent", model=model)
@@ -170,6 +175,15 @@ class ConversationRuntime:
         # 长期记忆里不会留下没有回复的孤儿提问（CLI 同款时序）
         persist_started = False
         committed: bool | None = None
+        turn_state = {"rollback_requested": False}
+        # 上一轮失败后的回滚可能还在后台线程里：先等它结束再暂存本轮提问，
+        # 否则内容相同时回滚会把本轮刚暂存的提问当成上一轮孤儿删掉
+        pending_rollback = getattr(self, "_pending_rollback", None)
+        if pending_rollback is not None and not pending_rollback.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(pending_rollback), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("等待上一轮回滚超时，继续本轮")
         try:
             await asyncio.to_thread(self.memory.stage_message, "user", user_input)
             orchestration = await self._call_with_resilience(
@@ -211,7 +225,12 @@ class ConversationRuntime:
                 )
             )
             self._pending_persist = pending
-            pending.add_done_callback(self._clear_pending_persist)
+            self._last_persist_turn = (user_input, turn_state)
+            pending.add_done_callback(
+                lambda fut: self._clear_pending_persist(
+                    fut, user_input, turn_state
+                )
+            )
             persist_started = True
             committed = await asyncio.shield(pending)
         except BaseException:
@@ -220,19 +239,46 @@ class ConversationRuntime:
             # 轮次，两层记忆从此不一致。落库线程已在途（用户停止时常常如此）
             # 就跳过：它会把整轮问答完整写入长期记忆。
             if not persist_started or self._pending_persist is None:
-                await self._rollback_staged_user_message(user_input)
+                await self._request_staged_rollback(user_input, turn_state)
+            # 在途落库的完成回调会在写入失败 / 守卫否决时补回滚
             raise
         if committed is False:
             # 存储层在写入锁内判定会话已删除（墓碑否决整轮）：暂存的提问也
             # 按删除语义回滚，避免墓碑随后被撤销（删除失败）时上下文里留下
             # 一条永远不会落库、也没有回答的孤立提问
-            await self._rollback_staged_user_message(user_input)
+            await self._request_staged_rollback(user_input, turn_state)
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
             "usage": usage,
             "elapsed": elapsed,
         }
+
+    async def _request_staged_rollback(
+        self, user_input: str, turn_state: dict[str, bool]
+    ) -> None:
+        """本轮只回滚一次（主路径与落库完成回调可能同时请求）。
+
+        另一路径已在回滚时也做有限等待：调用方（``ask`` 返回前、drain 释放
+        用户锁前）依赖回滚已落地，不能因为回调抢先置位就提前返回。
+        """
+        if turn_state["rollback_requested"]:
+            await self._await_pending_rollback()
+            return
+        turn_state["rollback_requested"] = True
+        await self._rollback_staged_user_message(user_input)
+
+    async def _await_pending_rollback(self, timeout_sec: float = 2.0) -> None:
+        """等待在途回滚线程结束（有界；后台线程超时后自行完成）。"""
+        task = getattr(self, "_pending_rollback", None)
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_sec)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            logger.debug("等待回滚暂存提问未在限时内完成，后台线程继续执行")
+        except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
+            logger.warning("回滚暂存提问失败", exc_info=True)
 
     async def _rollback_staged_user_message(self, user_input: str) -> None:
         """移除编排前暂存的用户提问（尽力而为，不阻塞取消 / 错误上报）。
@@ -244,11 +290,14 @@ class ConversationRuntime:
         if not callable(rollback):
             return
         task = asyncio.ensure_future(asyncio.to_thread(rollback, user_input))
+        self._pending_rollback = task
         task.add_done_callback(self._consume_background_task)
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             logger.debug("回滚暂存提问未在限时内完成，后台线程继续执行")
+        except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
+            logger.warning("回滚暂存提问失败", exc_info=True)
 
     @staticmethod
     def _consume_background_task(task: asyncio.Future) -> None:
@@ -256,13 +305,36 @@ class ConversationRuntime:
             # 后台任务无人 await：取走异常，避免未检索告警
             task.exception()
 
-    def _clear_pending_persist(self, pending: asyncio.Future) -> None:
+    def _clear_pending_persist(
+        self,
+        pending: asyncio.Future,
+        user_input: str = "",
+        turn_state: dict[str, bool] | None = None,
+    ) -> None:
         if self._pending_persist is pending:
             self._pending_persist = None
-        if not pending.cancelled():
+        if pending.cancelled():
             # 取消后没人再 await 这个任务：取走异常，避免
             # 「Task exception was never retrieved」的告警
-            pending.exception()
+            return
+        try:
+            outcome = pending.result()
+        except Exception:  # noqa: BLE001 - 落库失败由回滚兜底
+            outcome = None
+        if turn_state is None:
+            return
+        if outcome is True:
+            # 整轮已提交：不需要回滚（标记后主路径 / drain 也不会再回滚）
+            turn_state["rollback_requested"] = True
+            return
+        # 写入失败 / 守卫否决（会话已删除）：取消时跳过的回滚在这里补上
+        task = asyncio.ensure_future(
+            self._request_staged_rollback(user_input, turn_state)
+        )
+        if getattr(self, "_pending_rollback", None) is None:
+            # 任务尚未开始执行时也让 drain 能看到它，保证释放用户锁前等待
+            self._pending_rollback = task
+        task.add_done_callback(self._consume_background_task)
 
     async def drain_pending_persist(self, timeout_sec: float = 10.0) -> bool:
         """等待在途的记忆落库线程结束，返回是否在超时前完成。
@@ -273,9 +345,14 @@ class ConversationRuntime:
         """
         pending = getattr(self, "_pending_persist", None)
         if pending is None:
+            # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它
+            await self._await_pending_rollback()
             return True
+        outcome: bool | None = None
         try:
-            await asyncio.wait_for(asyncio.shield(pending), timeout=timeout_sec)
+            outcome = await asyncio.wait_for(
+                asyncio.shield(pending), timeout=timeout_sec
+            )
         except asyncio.TimeoutError:
             logger.warning(
                 "等待记忆落库超过 %.1fs，写入线程仍在后台继续", timeout_sec
@@ -283,8 +360,13 @@ class ConversationRuntime:
             return False
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - 落库失败已由 ask() 调用方处理
-            return True
+        except Exception:  # noqa: BLE001 - 落库失败由回滚兜底
+            outcome = None
+        last_turn = getattr(self, "_last_persist_turn", None)
+        if last_turn is not None and outcome is not True:
+            # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
+            # 结束，保证释放用户锁前回滚已落地）
+            await self._request_staged_rollback(*last_turn)
         return True
 
     def close(self) -> None:

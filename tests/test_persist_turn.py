@@ -96,15 +96,24 @@ def test_memory_manager_persist_turn_delegates_and_stages_assistant():
 class _BlockingMemory:
     """persist_turn 阻塞在事件上，模拟落库线程仍在执行时协程被取消。"""
 
-    def __init__(self):
+    def __init__(self, fail=False, veto=False, block_rollback=False):
         self.long_term = self
         self.short_term = self
         self.started = threading.Event()
         self.release = threading.Event()
         self.messages = []
         self.staged = []
+        self.stage_calls = 0
+        self.events = []
         self.rolled_back = []
         self.rollback_seen = threading.Event()
+        self.rollback_started = threading.Event()
+        self.allow_rollback = threading.Event()
+        if not block_rollback:
+            self.rollback_started.set()
+        self.fail = fail
+        self.veto = veto
+        self.block_rollback = block_rollback
         self.threads = {}
 
     def reload_long_term(self):
@@ -120,11 +129,17 @@ class _BlockingMemory:
         return ""
 
     def stage_message(self, role, content, metadata=None):
+        self.stage_calls += 1
+        self.events.append(("stage", content))
         self.staged.append((role, content))
 
     def rollback_staged_message(self, content):
         self.rolled_back.append(content)
         self.rollback_seen.set()
+        self.events.append(("rollback", content))
+        self.rollback_started.set()
+        if self.block_rollback:
+            self.allow_rollback.wait(5)
         for index in range(len(self.staged) - 1, -1, -1):
             role, staged_content = self.staged[index]
             if role == "user" and staged_content == content:
@@ -136,8 +151,14 @@ class _BlockingMemory:
         self.threads["persist"] = threading.get_ident()
         self.started.set()
         self.release.wait(10)
+        self.events.append(("persist", user_content))
+        if self.fail:
+            raise MemoryPersistenceError("disk full")
+        if self.veto:
+            return False
         self.messages.append(("user", user_content))
         self.messages.append(("assistant", assistant_content))
+        return True
 
 
 def _make_runtime(memory):
@@ -264,6 +285,80 @@ def test_drain_without_pending_returns_immediately():
     print("✓ 无在途落库时 drain 立即返回")
 
 
+def test_cancel_with_failed_persist_rolls_back_staged():
+    """取消后在途落库失败：完成回调补回滚，不留下无回答的孤儿提问。"""
+    memory = _BlockingMemory(fail=True)
+    runtime = _make_runtime(memory)
+
+    async def scenario():
+        task = asyncio.create_task(runtime.ask("你好"))
+        await asyncio.to_thread(memory.started.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        memory.release.set()
+        assert await runtime.drain_pending_persist(timeout_sec=10) is True
+        await asyncio.to_thread(memory.rollback_seen.wait, 5)
+
+    asyncio.run(scenario())
+    assert memory.rolled_back == ["你好"]
+    assert ("user", "你好") not in memory.staged
+    assert memory.messages == []
+    print("✓ 取消 + 在途落库失败补回滚暂存提问")
+
+
+def test_cancel_with_vetoed_persist_rolls_back_staged():
+    """取消后在途落库被守卫否决（会话已删除）：同样回滚暂存提问。"""
+    memory = _BlockingMemory(veto=True)
+    runtime = _make_runtime(memory)
+
+    async def scenario():
+        task = asyncio.create_task(runtime.ask("你好"))
+        await asyncio.to_thread(memory.started.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        memory.release.set()
+        assert await runtime.drain_pending_persist(timeout_sec=10) is True
+        await asyncio.to_thread(memory.rollback_seen.wait, 5)
+
+    asyncio.run(scenario())
+    assert memory.rolled_back == ["你好"]
+    assert ("user", "你好") not in memory.staged
+    print("✓ 取消 + 落库守卫否决补回滚暂存提问")
+
+
+def test_next_turn_waits_for_previous_rollback():
+    """迟到的回滚不能删掉下一轮文本相同的提问：新回合先等上一轮回滚。"""
+    memory = _BlockingMemory(veto=True, block_rollback=True)
+    runtime = _make_runtime(memory)
+
+    async def scenario():
+        first = asyncio.create_task(runtime.ask("同一个问题"))
+        await asyncio.to_thread(memory.started.wait, 10)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        memory.release.set()
+        # 等完成回调触发的回滚真正开始（随后被 allow_rollback 挡住）
+        assert await asyncio.to_thread(memory.rollback_started.wait, 5)
+        second = asyncio.create_task(runtime.ask("同一个问题"))
+        await asyncio.sleep(0.2)
+        assert memory.stage_calls == 1, "上一轮回滚结束前不能暂存新提问"
+        memory.allow_rollback.set()
+        await second
+
+    asyncio.run(scenario())
+    stages = [i for i, event in enumerate(memory.events) if event[0] == "stage"]
+    rollbacks = [
+        i for i, event in enumerate(memory.events) if event[0] == "rollback"
+    ]
+    assert len(stages) == 2 and len(rollbacks) == 2, memory.events
+    assert rollbacks[0] < stages[1], "第二次暂存必须排在第一次回滚之后"
+    assert ("user", "同一个问题") not in memory.staged
+    print("✓ 新回合等待上一轮回滚完成")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -274,6 +369,9 @@ if __name__ == "__main__":
         test_persist_turn_veto_skips_assistant_stage()
         test_cancel_during_persist_drains_with_both_messages()
         test_cancel_during_persist_does_not_rollback_staged()
+        test_cancel_with_failed_persist_rolls_back_staged()
+        test_cancel_with_vetoed_persist_rolls_back_staged()
+        test_next_turn_waits_for_previous_rollback()
         test_drain_without_pending_returns_immediately()
     finally:
         _mp.undo()
