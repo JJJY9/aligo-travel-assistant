@@ -17,6 +17,7 @@ const scenario = process.argv[3];
 
 function makeNode() {
   const classes = new Set();
+  const listeners = {};
   const base = {
     classList: {
       add(name) {
@@ -53,11 +54,25 @@ function makeNode() {
       return null;
     },
     removeAttribute() {},
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, handler) {
+      (listeners[type] ||= []).push(handler);
+    },
+    removeEventListener(type, handler) {
+      const registered = listeners[type] || [];
+      const index = registered.indexOf(handler);
+      if (index >= 0) registered.splice(index, 1);
+    },
     focus() {},
     blur() {},
-    click() {},
+    click() {
+      for (const handler of listeners.click || []) {
+        handler.call(this, {
+          target: this,
+          preventDefault() {},
+          stopPropagation() {},
+        });
+      }
+    },
     cloneNode() {
       return makeNode();
     },
@@ -736,6 +751,30 @@ async function scenarioDecode(source) {
   return results;
 }
 
+function scenarioTripsExport(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __downloads = [];
+    downloadFromApi = async (url, filename) => {
+      __downloads.push({ url, filename });
+    };
+    state.userId = "u-trips";
+    state.tripsExpanded = true;
+    state.tripsFilter = "上海";
+    state.tripsStatusFilter = "past";
+    bindEvents();
+  `);
+  // 展开视图：关键词与状态筛选随导出 URL 提交
+  run("els.exportTrips.click()");
+  const filtered = run("__downloads.slice()");
+  // 收起视图：不带筛选，但仍走 /api/trips/export?format=ics
+  run("state.tripsExpanded = false;");
+  run("els.exportTrips.click()");
+  const collapsed = run("__downloads.slice()");
+  return { filtered, collapsed };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -760,6 +799,8 @@ async function main() {
     payload = await scenarioArbitrate(source);
   } else if (scenario === "decode") {
     payload = await scenarioDecode(source);
+  } else if (scenario === "tripsExport") {
+    payload = scenarioTripsExport(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

@@ -243,6 +243,27 @@ def test_knowledge_eval_panel_states():
     print("✓ 检索评测面板状态")
 
 
+def test_trips_export_button_uses_filtered_ics_endpoint():
+    """「导出行程」按展开视图的关键词 / 状态筛选走 format=ics。"""
+    results = _run_harness("tripsExport")
+    filtered = results["filtered"]
+    assert len(filtered) == 1, filtered
+    url = filtered[0]["url"]
+    assert url.startswith("/api/trips/export?"), url
+    assert "format=ics" in url, url
+    assert "q=%E4%B8%8A%E6%B5%B7" in url, "关键词筛选必须随导出提交"
+    assert "status=past" in url, "状态筛选必须随导出提交"
+    assert "user_id=u-trips" in url
+    assert filtered[0]["filename"] == "aligo_trips.ics"
+
+    collapsed = results["collapsed"][-1]
+    assert "format=ics" in collapsed["url"], collapsed
+    assert "q=" not in collapsed["url"] and "status=" not in collapsed["url"], (
+        "收起视图不带筛选（与 CSV / HTML 导出同口径）"
+    )
+    print("✓ 导出行程按钮按筛选走 format=ics")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -251,5 +272,6 @@ if __name__ == "__main__":
     test_knowledge_dedupe_panel_states()
     test_knowledge_actions_arbitrate_shared_result_bar()
     test_trip_import_file_decoding_and_size_guard()
+    test_trips_export_button_uses_filtered_ics_endpoint()
     test_knowledge_eval_panel_states()
     print("\n全部通过")

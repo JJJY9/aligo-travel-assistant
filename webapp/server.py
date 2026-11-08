@@ -3891,13 +3891,14 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
         q: str = Query(default="", max_length=100),
         status: Literal["active", "upcoming", "past"] | None = Query(default=None),
-        format: Literal["csv", "html"] = Query(default="csv"),
+        format: Literal["csv", "html", "ics"] = Query(default="csv"),
     ) -> Response:
-        """导出历史行程为 CSV（UTF-8 BOM，便于 Excel 直接打开）或 HTML 台账。
+        """导出历史行程为 CSV（UTF-8 BOM）/ HTML 台账 / iCalendar 合集。
 
         ``q`` / ``status`` 与列表接口同一口径过滤后再导出（与面板筛选、
         CLI ``trips-export --status`` 保持一致）；``format=html`` 与 CLI
-        ``trips-export --html`` 同一渲染口径（可打印 / 分享、内容转义）。
+        ``trips-export --html``、``format=ics`` 与 CLI ``trips-export --ics``
+        同一渲染口径（ics 缺少出发日期的行程按既有语义跳过）。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
@@ -3909,6 +3910,17 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         filtered = _filter_trips_by_status(_filter_trips_by_query(trips, q), status)
+        if format == "ics":
+            # 与 CLI `trips-export --ics` 同一渲染：过滤后的行程合成一个
+            # VCALENDAR（/api/trips/calendar 保留为不带筛选的旧入口）
+            return Response(
+                content=render_trips_ics(filtered, user_id),
+                media_type="text/calendar; charset=utf-8",
+                headers={
+                    "Content-Disposition": 'attachment; filename="aligo_trips.ics"',
+                    **rate_headers,
+                },
+            )
         if format == "html":
             return Response(
                 content=render_trips_html(filtered, user_id),

@@ -1130,11 +1130,19 @@ def test_trips_export_respects_status_filter():
         assert "上海" in past_html.text
         assert "广州" not in past_html.text and "成都" not in past_html.text
 
+        past_ics = client.get(
+            "/api/trips/export",
+            params={"user_id": user_id, "status": "past", "format": "ics"},
+        )
+        assert past_ics.headers["content-type"].startswith("text/calendar")
+        assert past_ics.text.count("BEGIN:VEVENT") == 1
+        assert "上海" in past_ics.text and "广州" not in past_ics.text
+
         bad = client.get(
             "/api/trips/export", params={"user_id": user_id, "status": "bogus"}
         )
         assert bad.status_code == 422
-        print("✓ 行程导出（CSV / HTML）应用状态过滤")
+        print("✓ 行程导出（CSV / HTML / ICS）应用状态过滤")
     finally:
         _cleanup(user_id)
 
@@ -3906,7 +3914,25 @@ def test_trips_csv_export_query_filter():
         assert empty.status_code == 200
         lines = [line for line in empty.text.strip().splitlines() if line]
         assert len(lines) == 1, "无匹配时只保留表头"
-        print("✓ /api/trips/export q 过滤")
+
+        ics = client.get(
+            "/api/trips/export",
+            params={"user_id": user_id, "q": "上海", "format": "ics"},
+        )
+        assert ics.status_code == 200
+        assert ics.headers["content-type"].startswith("text/calendar")
+        assert ".ics" in ics.headers.get("content-disposition", "")
+        assert ics.text.startswith("BEGIN:VCALENDAR")
+        assert ics.text.count("BEGIN:VEVENT") == 1, "过滤后的 ICS 只含命中行程"
+        assert "上海" in ics.text and "杭州" not in ics.text
+
+        ics_empty = client.get(
+            "/api/trips/export",
+            params={"user_id": user_id, "q": "不存在", "format": "ics"},
+        )
+        assert ics_empty.status_code == 200
+        assert ics_empty.text.count("BEGIN:VEVENT") == 0, "无匹配时 ICS 不含事件"
+        print("✓ /api/trips/export q 过滤（CSV / ICS）")
     finally:
         _cleanup(user_id)
 
