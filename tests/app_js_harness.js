@@ -326,6 +326,36 @@ function scenarioPreview(source) {
   };
 }
 
+function scenarioRender(source) {
+  const env = buildEnv(source);
+  const invoke = (name, ...args) =>
+    runIn(env, `${name}(...${JSON.stringify(args)})`);
+  return {
+    escape_html: invoke("escapeHtml", "<b>\"&'"),
+    highlight_dotted: invoke("highlightSnippet", "İstanbul 出差", "İstanbul"),
+    highlight_plain: invoke("highlightSnippet", "no match here", "istanbul"),
+    highlight_meta: invoke("highlightSnippet", "a+b (x)", "a+b"),
+    fence_info: invoke(
+      "renderMarkdown",
+      '```js title="a"\nconst x = "<>";\n```'
+    ),
+    fence_four: invoke("renderMarkdown", "````\n```inner\n````"),
+    inline_code: invoke("renderMarkdown", "`**[x]**`"),
+    link_paren: invoke(
+      "renderMarkdown",
+      "[wiki](https://en.wikipedia.org/wiki/Foo_(bar))"
+    ),
+    table: invoke(
+      "renderMarkdown",
+      "| 日期 | 天气 |\n| --- | --- |\n| 11-06 | 小雨 |"
+    ),
+    heading: invoke("renderMarkdown", "# 标题"),
+    slice_emoji: invoke("sliceCodePoints", "😀😀😀", 2),
+    pref_object: invoke("formatPreferenceValue", { a: 1 }),
+    pref_list: invoke("formatPreferenceValue", ["汉庭", { b: 2 }]),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -338,6 +368,8 @@ async function main() {
     payload = await scenarioRace(source);
   } else if (scenario === "preview") {
     payload = scenarioPreview(source);
+  } else if (scenario === "render") {
+    payload = scenarioRender(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
