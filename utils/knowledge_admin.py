@@ -13,6 +13,7 @@ import logging
 import threading
 import uuid
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 from utils.knowledge_paths import COLLECTION_NAME, knowledge_db_path
@@ -534,7 +535,7 @@ def _export_documents(client: Any) -> list[dict[str, Any]]:
 
 
 def _regroup_exported_documents(
-    documents: list[Any], existing: set[str]
+    documents: list[Any], existing: Iterable[str]
 ) -> tuple[list[Any], int]:
     """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
 
@@ -752,14 +753,18 @@ def find_duplicate_contents() -> list[tuple[str, list[int]]]:
     return duplicates
 
 
-def _existing_contents() -> set[str]:
-    """库中全部片段的内容集合（全量扫描，不受单页 16384 条限制）。"""
+def _existing_contents() -> list[str]:
+    """库中全部片段内容的多重集（全量扫描，不受单页 16384 条限制）。
+
+    返回列表而不是集合：同内容的重复分片要逐条计数——用集合会让
+    「组内两片同文且都已入库」的组被误判为缺片而重复补写。
+    """
     client = _client()
     # CLI 新进程里 collection 默认可能是 released 状态，先加载再迭代
     _load_collection(client, COLLECTION_NAME)
-    return {
+    return [
         str(row.get("content", "")).strip() for row in _iter_all_rows(client)
-    }
+    ]
 
 
 def _row_content(client: Any, doc_id: int) -> str | None:
@@ -973,7 +978,8 @@ def import_documents(
     imported: list[int] = []
     with _WRITE_LOCK:
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
-        # 插入同一批内容；快照走全量扫描，集合超过单页规模时也不会重复导入
+        # 插入同一批内容；快照走全量扫描（多重集），超过单页规模或同文
+        # 重复分片时判重都不会失真
         existing = _existing_contents()
         # 内容可能在同一 group 内重复（两段完全相同的正文各占一个 part）：
         # 用多重集而不是集合计数，一份已存在只能抵消一个分片

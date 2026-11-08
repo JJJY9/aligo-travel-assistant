@@ -412,6 +412,49 @@ def test_import_documents_sanitizes(monkeypatch):
     print("✓ 导入知识片段（空项 / 非字符串跳过，超长按无效项，长内容拆分）")
 
 
+def test_import_duplicate_content_group_is_idempotent(monkeypatch):
+    """组内两片同文且都已入库：整组跳过，不能因快照用集合而重复补写。"""
+    from pathlib import Path
+
+    content = "重复正文" * 20
+    fake = _FakeMilvusClient(
+        [
+            {
+                "id": 1,
+                "content": content,
+                "metadata": json.dumps(
+                    {"group": "G", "part": "1", "parts": "2"}
+                ),
+            },
+            {
+                "id": 2,
+                "content": content,
+                "metadata": json.dumps(
+                    {"group": "G", "part": "2", "parts": "2"}
+                ),
+            },
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    agent = _FakeAgent({"status": "success", "ids": [3], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    documents = [
+        {"content": content, "metadata": {"group": "G", "part": "1", "parts": "2"}},
+        {"content": content, "metadata": {"group": "G", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents)
+    assert result["imported"] == 0, result
+    assert result["skipped_duplicate"] == 2, result
+    assert agent.calls == [], "整组已存在时不得写库"
+    # 逆序导入同样幂等（regroup 按 part 排序，快照计数与行序无关）
+    reversed_result = knowledge_admin.import_documents(list(reversed(documents)))
+    assert reversed_result["imported"] == 0, reversed_result
+    assert agent.calls == [], "逆序重放也不得写库"
+    print("✓ 同文分片组重复导入幂等（多重集判重）")
+
+
 def test_import_cross_group_share_keeps_unique_pieces(monkeypatch):
     """共享片段属于别的组时，独特分片以独立片段入库而不是整篇静默丢弃。"""
     from pathlib import Path
@@ -760,9 +803,9 @@ def test_existing_contents_scans_all_rows(monkeypatch):
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
     monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 4)
-    assert knowledge_admin._existing_contents() == {
+    assert sorted(knowledge_admin._existing_contents()) == sorted(
         row["content"] for row in rows
-    }
+    )
     documents = knowledge_admin.export_documents()
     assert [item["content"] for item in documents] == [
         f"c{index}" for index in range(1, 26)
@@ -2404,6 +2447,7 @@ if __name__ == "__main__":
         test_import_layout_scan_failure_skips_group,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
+        test_import_duplicate_content_group_is_idempotent,
         test_import_cross_group_share_keeps_unique_pieces,
         test_import_batch_shared_paragraph_keeps_unique_pieces,
         test_import_completes_group_with_duplicate_pieces,
