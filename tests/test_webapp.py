@@ -5407,6 +5407,56 @@ def test_leased_streaming_response_releases_even_if_body_never_starts():
     print("✓ 响应未开始迭代即失败时租约兜底释放")
 
 
+def test_cancelled_session_open_releases_late_turn():
+    """等待会话构造期间被取消：迟到完成的线程必须补 end_turn。
+
+    asyncio.to_thread 不受协程取消影响；不补释放的话会话占用会钉住到
+    1h 租约兜底，累计到并发上限后新会话全部 503。
+    """
+    import asyncio
+    import threading
+
+    from webapp.server import _get_session_marked
+
+    class _Session:
+        def __init__(self):
+            self.ended = 0
+
+        def end_turn(self):
+            self.ended += 1
+
+    class _State:
+        def __init__(self):
+            self.gate = threading.Event()
+            self.session = _Session()
+            self.calls = 0
+
+        def get_session(self, user_id, session_id, mark_in_use=False):
+            self.calls += 1
+            assert mark_in_use is True
+            self.gate.wait(5)
+            return self.session
+
+    async def scenario():
+        state = _State()
+        task = asyncio.create_task(_get_session_marked(state, "u1", "s1"))
+        while state.calls == 0:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state.gate.set()
+        for _ in range(200):
+            if state.session.ended == 1:
+                return state
+            await asyncio.sleep(0.01)
+        raise AssertionError("迟到完成的会话占用未释放（会钉住到 1h 租约）")
+
+    state = asyncio.run(scenario())
+    assert state.session.ended == 1
+    print("✓ 取消会话构造后迟到占用被释放")
+
+
 def test_session_lru_skips_in_use_sessions():
     """LRU 淘汰不能关闭正在对话的会话；全部在用时不新建（容量拒绝）。"""
     from webapp.server import SessionCapacityError
@@ -8611,6 +8661,7 @@ if __name__ == "__main__":
     test_lock_eviction_skips_waiting_lock()
     test_lock_for_overflow_user_keeps_shared_lock_while_held()
     test_session_turn_lease_releases_once()
+    test_cancelled_session_open_releases_late_turn()
     test_leased_streaming_response_releases_even_if_body_never_starts()
     test_session_lru_skips_in_use_sessions()
     test_chat_releases_session_in_use_mark()
