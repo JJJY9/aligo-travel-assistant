@@ -800,6 +800,84 @@ def test_transient_nested_error_triggers_retry():
     print("✓ 嵌套瞬时错误触发重试、永久错误不重试")
 
 
+def test_all_invalid_schedule_degrades_to_default_query():
+    """调度项全部非法时降级为默认信息查询，不能静默 no_agents。"""
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "information_query": _StubAgent(
+                "information_query", {"answer": "ok"}
+            )
+        }
+    )
+    schedule = ["a", {"priority": 1}, None]
+    result = json.loads(asyncio.run(orchestrator.reply(_intent(schedule))).content)
+    assert result.get("status") != "no_agents", result
+    executed = [item["agent_name"] for item in result["results"]]
+    assert executed == ["information_query"], result
+    print("✓ 非法调度全部丢弃时降级默认信息查询")
+
+
+def test_wrapped_preferences_dict_unpacked_on_save_and_context():
+    """{"preferences": [...]} 包裹形态不能写成垃圾键，真实偏好照常落库与进上下文。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    wrapped = {
+        "preferences": {
+            "preferences": [{"type": "airlines", "value": "东航"}]
+        }
+    }
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {"status": "success", "data": wrapped},
+            }
+        ],
+    )
+    prefs = memory.long_term.get_preference()
+    assert prefs.get("airlines") == "东航", prefs
+    assert "preferences" not in prefs, prefs
+    ctx = orchestrator._context_with_previous_preferences(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "result": {"status": "success", "data": wrapped},
+            }
+        ],
+    )
+    assert ctx["user_preferences"].get("airlines") == "东航"
+    assert "preferences" not in ctx["user_preferences"]
+    print("✓ 包裹形态偏好被解包（落库与上下文）")
+
+
+def test_preference_render_skips_unmanageable_keys():
+    """回显与落库同口径：含 "/" 的键不出现「已更新偏好」。"""
+    from utils.result_formatter import result_to_markdown
+
+    text = result_to_markdown(
+        {
+            "results": [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": "a/b", "value": "x"},
+                            {"type": "airlines", "value": "东航"},
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+    assert "东航" in text
+    assert "a/b" not in text
+    print("✓ 偏好回显跳过不可管理的键")
+
+
 def test_malformed_schedule_is_sanitized():
     """字符串项 / 非法 priority 的调度计划不应让整轮对话崩溃"""
     orchestrator = OrchestrationAgent(

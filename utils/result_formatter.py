@@ -9,6 +9,8 @@ from typing import Any
 
 import logging
 
+from utils.preference_values import is_manageable_pref_type
+
 logger = logging.getLogger(__name__)
 
 _DISPLAY_NAMES = {
@@ -195,11 +197,22 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         if legacy_preferences:
             lines = ["### ✅ 已更新偏好"]
             for pref_type, value in legacy_preferences.items():
-                if pref_type in {"has_preferences", "error"} or value is None:
+                # 与落库路径同一口径：含 "/" / 超长 / 非字符串的键不会写入
+                # 长期记忆，回显不能宣称「已更新」
+                if (
+                    pref_type in {"has_preferences", "error"}
+                    or value is None
+                    or not is_manageable_pref_type(pref_type)
+                ):
                     continue
                 name = preference_label(pref_type)
                 lines.append(f"- {name} **设置为** {_pref_value_text(value)}")
-            return "\n".join(lines) if len(lines) > 1 else ""
+            if len(lines) > 1:
+                return "\n".join(lines)
+            # 全部条目都被过滤（不可管理键 / 空值）：有兜底 message 时用它
+            # （渲染器「降级展示」契约），否则交给外层占位
+            message = data.get("message")
+            return str(message) if isinstance(message, str) and message else ""
         if isinstance(preferences, list) and preferences:
             lines = ["### ✅ 已更新偏好"]
             for pref in preferences:
@@ -207,6 +220,9 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                     continue
                 pref_type = pref.get("type", "")
                 value = pref.get("value", "")
+                if not is_manageable_pref_type(pref_type):
+                    # 落库侧会跳过的键（不可哈希 / 含 "/" / 超长）不回显
+                    continue
                 # 与落库路径一致的 action 变体（Append / add / 追加）
                 action_raw = str(pref.get("action") or "replace").strip().lower()
                 action = "追加" if action_raw in {"append", "add", "追加"} else "设置为"
@@ -217,7 +233,10 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                     # （否则出现「已更新偏好 设置为 None」但实际未保存）
                     continue
                 lines.append(f"- {name} **{action}** {text_value}")
-            return "\n".join(lines) if len(lines) > 1 else ""
+            if len(lines) > 1:
+                return "\n".join(lines)
+            message = data.get("message")
+            return str(message) if isinstance(message, str) and message else ""
         return ""
 
     if agent_name == "event_collection":

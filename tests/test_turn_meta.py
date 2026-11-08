@@ -122,10 +122,30 @@ def test_huge_integer_literal_tolerated():
     print("✓ 超长整数字面量按旧文本兜底")
 
 
+def test_build_turn_meta_filters_unexecuted_schedule():
+    """执行路线只保留真正执行过的智能体（去重 / 丢弃 / 幽灵项不出现）。"""
+    meta = build_turn_meta(
+        {
+            "agent_schedule": [
+                {"agent_name": "a", "priority": 1},
+                {"agent_name": "plan-trip", "priority": 2},
+                {"agent_name": "plan-trip", "priority": 2},
+                {"agent_name": "", "priority": 3},
+                {"agent_name": "ghost", "priority": 4},
+            ]
+        },
+        {"results": [{"agent_name": "a", "status": "success"}]},
+    )
+    names = [item["agent_name"] for item in meta["schedule"]]
+    assert names == ["a"], meta["schedule"]
+    print("✓ 执行路线过滤未执行 / 重复的调度项")
+
+
 if __name__ == "__main__":
     test_build_and_roundtrip()
     test_markdown_ignores_meta()
     test_invalid_content()
     test_schedule_names_are_canonicalized()
     test_huge_integer_literal_tolerated()
+    test_build_turn_meta_filters_unexecuted_schedule()
     print("\n全部通过")

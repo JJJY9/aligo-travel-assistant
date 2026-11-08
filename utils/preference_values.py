@@ -57,3 +57,16 @@ def merge_preference_value(current: Any, value: Any) -> list[Any]:
     if not merged and has_preference_value(value):
         merged = [value]
     return merged
+
+
+def is_manageable_pref_type(pref_type: object) -> bool:
+    """偏好键是否能被面板 / CLI 管理（与 Web ``^[^/]{1,64}$`` 同一约束）。
+
+    含 "/" 的键在面板路径里会被拆成两段（404）、CLI 的字符集校验也会拒绝；
+    落库、上下文合并与回复渲染必须用同一口径过滤，否则界面宣称「已更新」
+    而长期记忆实际没有写入。
+    """
+    if not isinstance(pref_type, str):
+        return False
+    text = pref_type.strip()
+    return 0 < len(text) <= 64 and "/" not in text

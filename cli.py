@@ -25,7 +25,7 @@ from utils.console import PipeSafeTextIO, configure_stdio, is_pipe_error
 from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
-from utils.preference_values import has_preference_value
+from utils.preference_values import has_preference_value, is_manageable_pref_type
 from utils.progress import format_progress_event
 from utils.timestamps import chronological_key
 from utils.turn_meta import attach_turn_meta, build_turn_meta
@@ -676,13 +676,14 @@ class AligoCLI:
                 else:
                     prefs_list = raw_prefs if isinstance(raw_prefs, list) else []
                 # 模型可能返回字符串 / null 等非对象条目，或把 type 返回成
-                # 对象 / 数组：落库路径（orchestration_agent）只接受字符串
-                # type，这里同一口径过滤——否则把 dict/list 当字典键查询会
-                # 抛 TypeError，整轮回显（含落库）一起失败
+                # 对象 / 数组 / 含 "/" 的键：落库路径（orchestration_agent）
+                # 只接受可管理的字符串 type，这里同一口径过滤——否则回显
+                # 宣称「已更新」而长期记忆实际没有写入
                 prefs_items = [
                     item
                     for item in prefs_list
-                    if isinstance(item, dict) and isinstance(item.get("type"), str)
+                    if isinstance(item, dict)
+                    and is_manageable_pref_type(item.get("type"))
                 ]
 
                 if prefs_items:

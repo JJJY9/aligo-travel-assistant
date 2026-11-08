@@ -25,7 +25,11 @@ from agentscope.message import Msg
 
 from utils.agent_names import SKILL_AGENT_NAMES as _SKILL_AGENT_NAMES
 from utils.llm_resilience import retry_with_backoff
-from utils.preference_values import has_preference_value, merge_preference_value
+from utils.preference_values import (
+    has_preference_value,
+    is_manageable_pref_type,
+    merge_preference_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +262,22 @@ class OrchestrationAgent(AgentBase):
             seen_agents.add(canonical)
             deduped_schedule.append(task)
         agent_schedule = deduped_schedule
+        if not agent_schedule and raw_schedule:
+            # 调度项全部非法（字符串 / 缺 agent_name）：与「缺少
+            # agent_schedule」同一降级（默认信息查询），不能静默 no_agents
+            # 让用户的规划 / 查询请求被当成「已记录」而没有任何智能体执行
+            logger.warning(
+                "agent_schedule 条目全部无效，降级为默认信息查询：%r",
+                raw_schedule[:3],
+            )
+            agent_schedule = [
+                {
+                    "agent_name": "information_query",
+                    "priority": 1,
+                    "reason": "默认查询",
+                    "expected_output": "查询结果",
+                }
+            ]
 
         dependency_priorities = [
             task["priority"]
@@ -379,6 +399,26 @@ class OrchestrationAgent(AgentBase):
 
         return context
 
+    def _extract_preferences_payload(self, data: Any) -> Any:
+        """取出技能结果里的 preferences 段。
+
+        兼容三种历史形状：``data["preferences"]`` 直接是列表 / 字典、
+        结果整体是 ``{"has_preferences": ..., "preferences": ...}`` 被再包
+        一层（``data["preferences"]["preferences"]``）、以及 ``data.data``
+        嵌套。包一层时不能把外层字典当成 ``{type: value}`` 偏好表——会写入
+        一个垃圾键 "preferences" 并丢弃真实偏好。
+        """
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("preferences")
+        if raw is None and isinstance(data.get("data"), dict):
+            raw = data["data"].get("preferences")
+        if isinstance(raw, dict) and "preferences" in raw:
+            extras = set(raw) - {"preferences", "has_preferences", "error"}
+            if not extras:
+                return raw.get("preferences")
+        return raw
+
     def _context_with_previous_preferences(
         self, context: dict[str, Any], previous_results: list[dict[str, Any]]
     ) -> dict[str, Any]:
@@ -400,18 +440,18 @@ class OrchestrationAgent(AgentBase):
             data = (result.get("result") or {}).get("data") or {}
             if not isinstance(data, dict):
                 continue
-            raw = data.get("preferences")
+            raw = self._extract_preferences_payload(data)
             if isinstance(raw, list):
                 for item in raw:
                     if not isinstance(item, dict):
                         continue
                     pref_type = item.get("type")
                     value = item.get("value")
-                    if not isinstance(pref_type, str) or not pref_type.strip():
-                        # 模型可能把 type 包成数组 / 对象：不可哈希值当偏好键
-                        # 会抛 TypeError（上下文合并）或污染长期记忆
+                    if not is_manageable_pref_type(pref_type):
+                        # 不可哈希 / 含 "/" / 超长的 type 落库会被拒绝：
+                        # 上下文同样不能携带（与落库同一口径）
                         continue
-                    pref_type = pref_type.strip()
+                    pref_type = str(pref_type).strip()
                     if not has_preference_value(value):
                         continue
                     action = str(item.get("action") or "replace").strip().lower()
@@ -426,6 +466,8 @@ class OrchestrationAgent(AgentBase):
             elif isinstance(raw, dict):
                 for pref_type, value in raw.items():
                     if pref_type in {"has_preferences", "error"}:
+                        continue
+                    if not is_manageable_pref_type(pref_type):
                         continue
                     if has_preference_value(value):
                         preferences[pref_type] = value
@@ -766,7 +808,7 @@ class OrchestrationAgent(AgentBase):
                 # 行程分支同一防护）
                 if result["result"].get("status") != "success":
                     continue
-                preferences_data = data.get("preferences", {})
+                preferences_data = self._extract_preferences_payload(data)
 
                 # 新格式：preferences 是列表，包含 {type, value, action}
                 if isinstance(preferences_data, list):
@@ -778,16 +820,12 @@ class OrchestrationAgent(AgentBase):
                         pref_value = pref_item.get("value")
                         pref_action = str(pref_item.get("action") or "replace").strip().lower()
 
-                        if not isinstance(pref_type, str) or not pref_type.strip():
-                            # 不可哈希的 type（数组 / 对象）会作为偏好键写入
-                            # 长期记忆，此后每次 get_preference 都抛 TypeError
+                        if not is_manageable_pref_type(pref_type):
+                            # 不可哈希 / 含 "/" / 超长的 type 落库后会让
+                            # get_preference 抛错或面板 / CLI 无法管理：
+                            # 与 Web 请求模型同一约束，直接跳过
                             continue
-                        pref_type = pref_type.strip()
-                        if len(pref_type) > 64 or "/" in pref_type:
-                            # 与 Web / CLI 偏好管理接口同一约束：含 "/" 或
-                            # 超长的键在面板（路径段被拆开）/ CLI 都无法
-                            # 编辑或删除，只能手工改库
-                            continue
+                        pref_type = str(pref_type).strip()
                         if not has_preference_value(pref_value):
                             continue
 
@@ -832,6 +870,7 @@ class OrchestrationAgent(AgentBase):
                         if (
                             has_preference_value(value)
                             and pref_type not in {"has_preferences", "error"}
+                            and is_manageable_pref_type(pref_type)
                         ):
                             self.memory_manager.long_term.save_preference(pref_type, value)
                             logger.info(f"Updated {pref_type}: {value} (legacy format)")
