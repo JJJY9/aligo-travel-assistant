@@ -73,6 +73,7 @@ class ConversationRuntime:
         self,
         user_input: str,
         on_event: ProgressCallback | None = None,
+        turn_id: str = "",
     ) -> dict[str, Any]:
         """处理一条用户消息。
 
@@ -80,6 +81,8 @@ class ConversationRuntime:
             user_input: 用户输入
             on_event: 进度回调（可选）。事件类型：
                 phase / plan / agent_start / agent_done
+            turn_id: 客户端回合标识（可选）：写入助手消息的 _meta，供前端
+                在停止 / 断网后精确对账「这一轮是否已落库」
 
         Returns:
             {"reply": Markdown 文本, "agents": [{name, status}],
@@ -99,7 +102,7 @@ class ConversationRuntime:
             self.circuit_breaker.raise_if_open()
         try:
             return await self._execute_turn(
-                user_input, on_event, rc, start, usage_before
+                user_input, on_event, rc, start, usage_before, turn_id
             )
         finally:
             if self.circuit_breaker and not self._probe_recorded:
@@ -112,6 +115,7 @@ class ConversationRuntime:
         rc: Any,
         start: float,
         usage_before: dict[str, Any] | None,
+        turn_id: str = "",
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         self._emit(on_event, {"type": "phase", "phase": "context", "label": "整理记忆与上下文"})
@@ -182,6 +186,8 @@ class ConversationRuntime:
         usage = self._usage_delta(usage_before)
         elapsed = round(time.time() - start, 2)
         meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
+        if turn_id:
+            meta["client_turn_id"] = turn_id
         # 编排成功：整轮问答在一次线程调用里原子提交（用户 + 助手）。
         # 分成两次提交时，两次之间被取消 / 第二次写失败会在长期记忆留下
         # 没有回答的孤儿提问。落库任务独立于 ask 协程：取消只让这里抛出，

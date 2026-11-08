@@ -187,6 +187,7 @@ const els = {
   collapseSidebar: byId("collapseSidebar"),
   scrim: byId("scrim"),
   memorySheet: byId("memorySheet"),
+  memoryBtn: byId("openMemory"),
   closeMemory: byId("closeMemory"),
   saveUser: byId("saveUser"),
   kbExport: byId("kbExport"),
@@ -2368,6 +2369,12 @@ async function sendMessage(text, options = {}) {
   assistant.trace.start();
   mutate(() => els.messages.appendChild(assistant.root), true);
 
+  // 本轮唯一标识：服务端写进助手消息的 _meta，停止后对账用它精确判断
+  // 「这一轮是否已落库」（比较文本会把重复提问误判成已保存）
+  const turnId =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   let terminal = null;
   try {
     const response = await fetch("/api/chat/stream", {
@@ -2377,6 +2384,7 @@ async function sendMessage(text, options = {}) {
         message,
         user_id: state.userId,
         session_id: state.sessionId,
+        client_turn_id: turnId,
       }),
       signal: state.controller.signal,
     });
@@ -2416,7 +2424,10 @@ async function sendMessage(text, options = {}) {
         const sessionId = state.sessionId;
         if (sessionId) {
           const token = sessionLoadToken;
-          setTimeout(() => reconcileStoppedTurn(sessionId, message, token), 600);
+          setTimeout(
+            () => reconcileStoppedTurn(sessionId, message, token, turnId),
+            600,
+          );
         } else if (!els.input.value.trim()) {
           els.input.value = message;
           resizeInput();
@@ -2466,10 +2477,11 @@ async function sendMessage(text, options = {}) {
 }
 
 /* 停止 / 中断后对账：服务端可能在停止前已完成编排并把整轮问答写入历史，
-   也可能什么都没写。以服务端历史上的「最后两条消息」为准（原子落库保证
-   用户 + 助手成对出现）：已落库就按服务端状态重渲染；连续几次都没出现，
-   说明提问没有保存，重渲染旧历史后把原文放回输入框，避免永久丢失。 */
-async function reconcileStoppedTurn(sessionId, message, token) {
+   也可能什么都没写。以助手消息 _meta 里的 client_turn_id 为准（原子落库
+   保证用户 + 助手成对出现，回合标识精确到本次提问）：已落库就按服务端
+   状态重渲染；连续几次都没出现，说明提问没有保存，重渲染旧历史后把原文
+   放回输入框，避免永久丢失。 */
+async function reconcileStoppedTurn(sessionId, message, token, turnId) {
   if (!message) return;
   const canSync = () =>
     sessionId === state.sessionId &&
@@ -2478,6 +2490,25 @@ async function reconcileStoppedTurn(sessionId, message, token) {
     !document.querySelector(".user-edit-input") &&
     !document.querySelector(".pref-input") &&
     !document.querySelector(".hi-input");
+  const isPersisted = (messages) => {
+    if (turnId) {
+      // 精确匹配：助手消息的 _meta 带着本轮唯一的 client_turn_id。
+      // 只比较「最后两条是相同文本的 user + assistant」会把重复提问
+      // 误判成本轮已保存（实际上回答的是上一轮）
+      return messages.some(
+        (item) => item && item.meta && item.meta.client_turn_id === turnId,
+      );
+    }
+    const last = messages[messages.length - 1];
+    const prev = messages[messages.length - 2];
+    return Boolean(
+      last &&
+        prev &&
+        prev.role === "user" &&
+        String(prev.content) === message &&
+        last.role === "assistant",
+    );
+  };
   for (let attempt = 0; attempt < 4; attempt += 1) {
     if (!canSync()) return;
     let data = null;
@@ -2491,15 +2522,7 @@ async function reconcileStoppedTurn(sessionId, message, token) {
     if (!canSync()) return;
     if (data && Array.isArray(data.messages)) {
       const messages = data.messages;
-      const last = messages[messages.length - 1];
-      const prev = messages[messages.length - 2];
-      const persisted =
-        last &&
-        prev &&
-        prev.role === "user" &&
-        String(prev.content) === message &&
-        last.role === "assistant";
-      if (persisted) {
+      if (isPersisted(messages)) {
         await openSession(sessionId, {
           silent: true,
           keepOnError: true,
@@ -4850,10 +4873,13 @@ function bindEvents() {
     );
   });
   const exportTripsWithQuery = (format, filename) => {
-    // 与列表同口径：展开视图下的筛选词随导出一起提交（服务端支持 q），
-    // 否则筛选后的导出会包含被筛掉的全部行程
+    // 与列表同口径：展开视图下的关键词与状态筛选随导出一起提交（服务端
+    // 支持 q / status），否则筛选后的导出会包含被筛掉的全部行程
     const query = state.tripsExpanded ? state.tripsFilter.trim() : "";
-    const suffix = query ? `&q=${encodeURIComponent(query)}` : "";
+    const status = state.tripsExpanded ? state.tripsStatusFilter || "" : "";
+    const suffix =
+      (query ? `&q=${encodeURIComponent(query)}` : "") +
+      (status ? `&status=${encodeURIComponent(status)}` : "");
     const formatParam = format ? `&format=${format}` : "";
     downloadFromApi(
       `/api/trips/export?user_id=${encodeURIComponent(state.userId)}${suffix}${formatParam}`,
