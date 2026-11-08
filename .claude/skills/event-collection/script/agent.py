@@ -18,12 +18,26 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.json_parser import (
-    extract_first_json_object,
     extract_json_from_async_response,
     last_json_object_with_keys,
+    robust_first_json_object,
 )
 
 logger = logging.getLogger(__name__)
+
+# 形如「提取结果」的字段（任一命中即视为候选）。只用 missing_info /
+# extracted_count 会被 prompt 回显骗过：真实结果省略这两个键时，回显的
+# 示例对象（含全部字段）反而是最后一个命中项，被当成真实提取写库。
+_RESULT_KEYS = (
+    "missing_info",
+    "extracted_count",
+    "destination",
+    "origin",
+    "start_date",
+    "end_date",
+    "return_location",
+    "trip_purpose",
+)
 
 
 def _format_pref_value(value) -> str:
@@ -165,14 +179,14 @@ class EventCollectionAgent(AgentBase):
             text = text.strip()
 
             # 模型可能先回显 prompt 里的示例对象再给正式结果：优先取最后
-            # 一个形如结果（missing_info / extracted_count）的顶层对象，
-            # 避免把回显示例当成提取结果写成真实行程
-            result = last_json_object_with_keys(
-                text, ("missing_info", "extracted_count")
-            )
+            # 一个形如结果（任一提取字段命中）的顶层对象，避免把回显示例
+            # 当成提取结果写成真实行程。正式结果通常带 destination 等字段，
+            # 即使省略 missing_info / extracted_count 也会排在示例之后。
+            result = last_json_object_with_keys(text, _RESULT_KEYS)
             if result is None:
-                # 回退：扫描第一个完整对象，避免结尾说明中的花括号被误截
-                result = extract_first_json_object(text)
+                # 回退：扫描第一个完整对象（尾逗号等小瑕疵由修复路径兜底），
+                # 避免结尾说明中的花括号被误截
+                result = robust_first_json_object(text)
         except Exception as e:
             logger.error(f"Event collection failed: {e}")
             result = {

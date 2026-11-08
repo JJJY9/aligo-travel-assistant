@@ -568,6 +568,44 @@ def test_null_values_render_defaults_not_none():
     print("✓ 显式 null 渲染回退（偏好跳过 / 行程默认文案）")
 
 
+def test_preference_nested_data_and_empty_legacy_values():
+    """data.data 嵌套要回显；旧格式空值不能宣称已更新（与落库同口径）。"""
+    nested = _wrap(
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "status": "success",
+                "data": {
+                    "data": {
+                        "preferences": [{"type": "airlines", "value": "东航"}]
+                    }
+                },
+            }
+        ]
+    )
+    md = result_to_markdown(nested)
+    assert "东航" in md, md
+    assert "已处理您的请求" not in md, md
+
+    legacy = _wrap(
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "status": "success",
+                "data": {
+                    "preferences": {"airlines": "东航", "seat_preference": ""}
+                },
+            }
+        ]
+    )
+    md = result_to_markdown(legacy)
+    assert "东航" in md, md
+    assert "座位偏好" not in md, "空值不落库，回显也不能宣称已更新"
+    print("✓ 偏好嵌套与空值回显（与落库同口径）")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -585,6 +623,7 @@ if __name__ == "__main__":
     test_agent_specific_empty_payloads_render_placeholder()
     test_rag_snippet_truncation_and_skip_non_dict()
     test_preference_append_variants_and_legacy_dict()
+    test_preference_nested_data_and_empty_legacy_values()
     test_event_collection_type_tolerance()
     test_null_values_render_defaults_not_none()
     print("\n全部通过")

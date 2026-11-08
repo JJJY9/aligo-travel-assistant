@@ -16,9 +16,9 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.json_parser import (
-    extract_first_json_object,
     extract_json_from_async_response,
     last_json_object_with_keys,
+    robust_first_json_object,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,8 +122,9 @@ class PreferenceAgent(AgentBase):
                 text, ("has_preferences", "preferences")
             )
             if result is None:
-                # 回退：扫描第一个完整对象，避免结尾说明中的花括号被误截
-                result = extract_first_json_object(text)
+                # 回退：扫描第一个完整对象（尾逗号等小瑕疵由修复路径兜底），
+                # 避免结尾说明中的花括号被误截
+                result = robust_first_json_object(text)
         except Exception as e:
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}

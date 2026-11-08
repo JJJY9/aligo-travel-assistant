@@ -80,22 +80,37 @@ class LazyAgentRegistry:
             self.console.print(f"[dim]读取技能 frontmatter 名称失败: {exc}[/dim]")
 
     def _resolve_agent_name(self, agent_name: str) -> str | None:
-        """解析智能体名称到技能目录名"""
+        """解析智能体名称到技能目录名（大小写不敏感）。
+
+        模型偶尔输出 ``Plan-Trip`` / ``EVENT-COLLECTION``：精确匹配会当成
+        未注册名称让整轮调度失败；目录名与别名都是 ASCII，casefold 足够。
+        """
         # 1. 直接匹配技能名
         if agent_name in self._skill_map:
             return agent_name
+
+        lowered = agent_name.casefold()
+        for name in self._skill_map:
+            if name.casefold() == lowered:
+                return name
 
         # 2. SKILL.md frontmatter name（意图 prompt 展示的可调度名）
         alias = self._name_aliases.get(agent_name)
         if alias in self._skill_map:
             return alias
+        for alias_name, directory in self._name_aliases.items():
+            if alias_name.casefold() == lowered and directory in self._skill_map:
+                return directory
 
-        # 3. 尝试遗留映射
+        # 3. 尝试遗留映射（标准名，大小写不敏感）
         if agent_name in self._legacy_mapping:
             skill_name = self._legacy_mapping[agent_name]
             if skill_name in self._skill_map:
                 return skill_name
-                
+        for legacy_name, skill_name in self._legacy_mapping.items():
+            if legacy_name.casefold() == lowered and skill_name in self._skill_map:
+                return skill_name
+
         return None
 
     def __getitem__(self, agent_name: str):

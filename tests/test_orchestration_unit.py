@@ -268,6 +268,77 @@ def test_skill_folder_names_are_canonicalized():
     print("✓ 技能目录名规范化为标准智能体名并正常写入行程")
 
 
+class _CaseInsensitiveRegistry(dict):
+    """模拟 LazyAgentRegistry 的大小写不敏感名称解析。"""
+
+    def __contains__(self, key):
+        return super().__contains__(str(key).casefold())
+
+    def __getitem__(self, key):
+        return super().__getitem__(str(key).casefold())
+
+
+def test_skill_names_resolve_case_insensitively():
+    """模型输出 Plan-Trip / EVENT-COLLECTION 时不能当成未注册整轮失败。"""
+    memory = _StubMemory()
+
+    class PlanStub(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {"itinerary": {"title": "杭州行程"}}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    registry = _CaseInsensitiveRegistry({"plan-trip": PlanStub("plan-trip")})
+    orchestrator = OrchestrationAgent(
+        agent_registry=registry, memory_manager=memory
+    )
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(
+                _intent([{"agent_name": "Plan-Trip", "priority": 1}])
+            )
+        ).content
+    )
+    assert result["status"] == "completed", result
+    assert result["results"][0]["status"] == "success", result
+    assert [item["agent_name"] for item in result["results"]] == [
+        "itinerary_planning"
+    ]
+    print("✓ 大小写不同的调度名解析并规范化为标准名")
+
+
+def test_preference_payload_with_extra_keys_does_not_write_garbage():
+    """包裹层带 note 等说明键时，不能把 preferences/note 当偏好落库。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    result = {
+        "agent_name": "preference",
+        "priority": 1,
+        "result": {
+            "status": "success",
+            "data": {
+                "preferences": {
+                    "preferences": [{"type": "airlines", "value": "东航"}],
+                    "note": "模型说明",
+                }
+            },
+        },
+    }
+    orchestrator._update_memory({}, [result])
+    prefs = memory.long_term.get_preference()
+    assert prefs.get("airlines") == "东航", prefs
+    assert "preferences" not in prefs and "note" not in prefs, prefs
+
+    ctx = orchestrator._context_with_previous_preferences({}, [result])
+    assert ctx["user_preferences"].get("airlines") == "东航", ctx
+    assert "note" not in ctx["user_preferences"], ctx
+    print("✓ 偏好包裹层的说明键不落库也不进后续上下文")
+
+
 def test_memory_update_preference_and_trip():
     """偏好覆盖 / 追加与行程写入"""
     memory = _StubMemory()
@@ -1564,6 +1635,8 @@ if __name__ == "__main__":
     test_registry_load_failure_reports_agent_error()
     test_failed_itinerary_is_not_saved_as_trip()
     test_skill_folder_names_are_canonicalized()
+    test_skill_names_resolve_case_insensitively()
+    test_preference_payload_with_extra_keys_does_not_write_garbage()
     test_memory_update_preference_and_trip()
     test_memory_update_legacy_preferences_and_custom_backend()
     test_failed_preference_result_not_persisted()

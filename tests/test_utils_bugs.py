@@ -432,9 +432,24 @@ def test_sanitize_json_escapes_surrogates():
     print("✓ sanitize_json 转义孤立代理项并归一 NaN")
 
 
+def test_robust_first_json_object_repairs_small_faults():
+    """尾逗号等小瑕疵不能整段放弃：修复后仍取出首个对象。"""
+    from utils.json_parser import robust_first_json_object
+
+    assert robust_first_json_object('前缀 {"a": 1,} 后缀') == {"a": 1}
+    assert robust_first_json_object('{"a": [1, 2,], "b": 3}') == {
+        "a": [1, 2],
+        "b": 3,
+    }
+    with pytest.raises(ValueError):
+        robust_first_json_object("没有 JSON")
+    print("✓ 首个 JSON 对象修复解析（尾逗号）")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_sanitize_json_escapes_surrogates()
+    test_robust_first_json_object_repairs_small_faults()
     test_json_parse_fallback()
     test_json_parse_success_paths_unchanged()
     test_json_parse_empty_dict_and_prose_braces()

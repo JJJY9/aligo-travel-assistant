@@ -50,6 +50,11 @@ os.environ['GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS'] = _GRPC_MAX_MS
 
 logger = logging.getLogger(__name__)
 
+# 多分片文档的 parts 声明上限（与 knowledge_admin._GROUP_PARTS_MAX 同口径）：
+# 旧库 / 直调 add_documents 可能留下异常大的声明，missing 计算里的
+# set(range(1, parts + 1)) 会被 1e9 撑爆内存。
+_GROUP_PARTS_MAX = 100000
+
 try:
     import pymilvus  # noqa: F401 - 仅用于检测依赖是否安装
     from sentence_transformers import SentenceTransformer  # noqa: F401 - 依赖检测
@@ -538,6 +543,10 @@ class RAGKnowledgeAgent(AgentBase):
             # 用换行拼接：分片跳号 / 只有部分分片过阈值时直接相连会把两段
             # 文字粘在一起；parts 保留原始声明，另记实际取回片数与缺片
             total_parts = max(declared, max(seen_parts, default=0))
+            if total_parts > _GROUP_PARTS_MAX:
+                # 声明异常（损坏 / 恶意数据）：不展开 range，按实际取回片数
+                # 收尾，缺片信息放弃（检索上下文不承担修复职责）
+                total_parts = max(seen_parts, default=0)
             assembled_meta = dict(base_meta)
             assembled_meta.update(
                 {

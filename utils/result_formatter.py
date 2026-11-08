@@ -9,7 +9,7 @@ from typing import Any
 
 import logging
 
-from utils.preference_values import is_manageable_pref_type
+from utils.preference_values import has_preference_value, is_manageable_pref_type
 
 logger = logging.getLogger(__name__)
 
@@ -185,9 +185,13 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
 
     if agent_name == "preference":
         preferences = data.get("preferences")
+        if preferences is None and isinstance(data.get("data"), dict):
+            # 与落库 / 上下文合并同一口径：兼容 {"data": {"preferences": ...}}
+            # 的嵌套形状（此前只在持久化侧解包，回显退化为「已处理您的请求」）
+            preferences = data["data"].get("preferences")
         legacy_preferences: dict[str, Any] | None = None
         if isinstance(preferences, dict):
-            if isinstance(preferences.get("preferences"), list):
+            if isinstance(preferences.get("preferences"), (list, dict)):
                 preferences = preferences["preferences"]
             else:
                 # 旧格式：{type: value} 的偏好字典（历史模型输出）。此前按
@@ -198,10 +202,10 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
             lines = ["### ✅ 已更新偏好"]
             for pref_type, value in legacy_preferences.items():
                 # 与落库路径同一口径：含 "/" / 超长 / 非字符串的键不会写入
-                # 长期记忆，回显不能宣称「已更新」
+                # 长期记忆，回显不能宣称「已更新」；空值（""/[]/None）同理
                 if (
                     pref_type in {"has_preferences", "error"}
-                    or value is None
+                    or not has_preference_value(value)
                     or not is_manageable_pref_type(pref_type)
                 ):
                     continue

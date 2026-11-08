@@ -24,7 +24,7 @@ from typing import Any
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
-from utils.agent_names import SKILL_AGENT_NAMES as _SKILL_AGENT_NAMES
+from utils.agent_names import canonical_agent_name
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import (
     has_preference_value,
@@ -255,8 +255,7 @@ class OrchestrationAgent(AgentBase):
 
         # 行程规划必须在事项收集 / 偏好抽取之后一批执行，否则拿不到本轮结果
         def _canonical(task: dict[str, Any]) -> str:
-            name = str(task.get("agent_name") or "")
-            return _SKILL_AGENT_NAMES.get(name, name)
+            return canonical_agent_name(str(task.get("agent_name") or ""))
 
         # 同一智能体可能以「技能目录名 + 标准名」或重复条目出现：注册表同时
         # 接受两种写法，不去重会被并行执行多次（重复调用 LLM、偏好重复落库、
@@ -422,10 +421,13 @@ class OrchestrationAgent(AgentBase):
         raw = data.get("preferences")
         if raw is None and isinstance(data.get("data"), dict):
             raw = data["data"].get("preferences")
-        if isinstance(raw, dict) and "preferences" in raw:
-            extras = set(raw) - {"preferences", "has_preferences", "error"}
-            if not extras:
-                return raw.get("preferences")
+        if isinstance(raw, dict) and isinstance(
+            raw.get("preferences"), (list, dict)
+        ):
+            # 包裹层：正式偏好在内层。外层其余键（note 等说明元数据）不能
+            # 当偏好类型落库——此前只有在没有其它键时才解包，带 note 的
+            # 结果会把 "preferences" / "note" 写成垃圾偏好
+            return raw.get("preferences")
         return raw
 
     def _context_with_previous_preferences(
@@ -518,7 +520,7 @@ class OrchestrationAgent(AgentBase):
             )
             requested_name = str(task.get("agent_name") or "")
             return [{
-                "agent_name": _SKILL_AGENT_NAMES.get(requested_name, requested_name),
+                "agent_name": canonical_agent_name(requested_name),
                 "priority": task.get("priority", 0),
                 "result": result
             }]
@@ -556,7 +558,7 @@ class OrchestrationAgent(AgentBase):
         # 整理结果
         results: list[dict[str, Any]] = []
         for (agent_name, priority, _), exec_result in zip(parallel_coroutines, execution_results):
-            canonical_name = _SKILL_AGENT_NAMES.get(agent_name, agent_name)
+            canonical_name = canonical_agent_name(agent_name)
             if isinstance(exec_result, BaseException):
                 logger.error(f"Parallel agent execution failed: {agent_name}, error: {exec_result}")
                 result = {
@@ -597,7 +599,7 @@ class OrchestrationAgent(AgentBase):
     ) -> dict[str, Any]:
         """执行单个智能体，并在开始 / 结束时发出进度事件。"""
         # 注册器两种名称都接受，但事件与结果统一用标准名
-        canonical_name = _SKILL_AGENT_NAMES.get(agent_name, agent_name)
+        canonical_name = canonical_agent_name(agent_name)
         self._emit(on_event, {"type": "agent_start", "agent_name": canonical_name})
         started = time.perf_counter()
         result = await self._run_agent(
