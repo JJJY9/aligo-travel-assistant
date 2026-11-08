@@ -16,13 +16,23 @@ const appPath = process.argv[2];
 const scenario = process.argv[3];
 
 function makeNode() {
+  const classes = new Set();
   const base = {
     classList: {
-      add() {},
-      remove() {},
-      toggle() {},
-      contains() {
-        return false;
+      add(name) {
+        classes.add(name);
+      },
+      remove(name) {
+        classes.delete(name);
+      },
+      toggle(name, force) {
+        const enable = force === undefined ? !classes.has(name) : Boolean(force);
+        if (enable) classes.add(name);
+        else classes.delete(name);
+        return enable;
+      },
+      contains(name) {
+        return classes.has(name);
       },
     },
     style: {},
@@ -398,6 +408,57 @@ async function scenarioDuplicates(source) {
   return results;
 }
 
+async function scenarioEval(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+
+  // 达标：hit@5 = 100%，但有 1 个未命中问题
+  let promise = run("runKbEval()");
+  await tick();
+  env.__requests[0].resolve({
+    total: 14,
+    hit1: 0.64,
+    hit3: 0.93,
+    hit5: 1.0,
+    mrr: 0.8,
+    rows: [
+      { query: "住宿标准", rank: 0 },
+      { query: "报销时限", rank: 2 },
+    ],
+  });
+  await promise;
+  results.ok_text = run("els.kbEvalResult.textContent");
+  results.ok_warn = run("els.kbEvalResult.classList.contains('warn')");
+  results.ok_button = run("els.kbEval.textContent");
+
+  // 低于基线 + 告警：标黄并带提示
+  promise = run("runKbEval()");
+  await tick();
+  env.__requests[1].resolve({
+    total: 14,
+    hit1: 0.3,
+    hit3: 0.5,
+    hit5: 0.6,
+    mrr: 0.4,
+    rows: [],
+    warning: "评测期间共享锁不可用（可能存在并发评测），结果仅供参考",
+  });
+  await promise;
+  results.low_text = run("els.kbEvalResult.textContent");
+  results.low_warn = run("els.kbEvalResult.classList.contains('warn')");
+
+  // 失败
+  promise = run("runKbEval()");
+  await tick();
+  env.__requests[2].reject(new Error("服务暂不可用"));
+  await promise;
+  results.error = run("els.kbEvalResult.textContent");
+  results.error_button = run("els.kbEval.textContent");
+  results.error_busy = run("els.kbEval.getAttribute('aria-busy')");
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -414,6 +475,8 @@ async function main() {
     payload = scenarioRender(source);
   } else if (scenario === "duplicates") {
     payload = await scenarioDuplicates(source);
+  } else if (scenario === "eval") {
+    payload = await scenarioEval(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

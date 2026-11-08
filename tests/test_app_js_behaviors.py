@@ -118,9 +118,31 @@ def test_knowledge_duplicates_panel_states():
     print("✓ 知识库重复检查面板状态")
 
 
+def test_knowledge_eval_panel_states():
+    """「检索评测」按钮：达标 / 低基线+告警 / 失败三种状态与标黄逻辑。"""
+    results = _run_harness("eval")
+    assert results["ok_text"] == (
+        "检索评测：14 个问题 · hit@1 64% · hit@3 93% · hit@5 100% · MRR 0.80"
+        " · 未命中 1 个：「住宿标准」"
+    ), results["ok_text"]
+    assert results["ok_warn"] is False, "达标时不应标黄"
+    assert results["ok_button"] == "检索评测", "结束后按钮文案必须复位"
+
+    assert "hit@5 60%" in results["low_text"], results["low_text"]
+    assert "低于 80% 基线" in results["low_text"]
+    assert "共享锁不可用" in results["low_text"], "告警文案必须展示"
+    assert results["low_warn"] is True, "低于基线 / 有告警时必须标黄"
+
+    assert results["error"] == "评测失败：服务暂不可用"
+    assert results["error_button"] == "检索评测"
+    assert results["error_busy"] is None, "失败后 aria-busy 必须移除"
+    print("✓ 检索评测面板状态")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()
     test_knowledge_duplicates_panel_states()
+    test_knowledge_eval_panel_states()
     print("\n全部通过")
