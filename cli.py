@@ -2334,6 +2334,7 @@ def run_user_import_standalone(
         if session_id in RESERVED_SESSION_IDS
         or is_session_deleted(user_id, str(session_id))
     }
+    active_sessions = set(candidate_sessions) - skipped_sessions
     if skipped_sessions:
         for session_id in sorted(skipped_sessions):
             if session_id in RESERVED_SESSION_IDS:
@@ -2352,6 +2353,34 @@ def run_user_import_standalone(
                 counts = preview_user_import(store, sections)
             else:
                 counts = import_user_data(store, sections)
+                # 写库期间其它实例可能删除某个会话：最后再查一次共享墓碑
+                # 并整会话回滚，避免迟到的删除被恢复写回
+                late_deleted = {
+                    session_id
+                    for session_id in active_sessions
+                    if is_session_deleted(user_id, str(session_id))
+                }
+                removed_total = 0
+                for session_id in sorted(late_deleted):
+                    try:
+                        removed_total += int(
+                            store.delete_chat_session(str(session_id)) or 0
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 尽力回滚
+                        errors.append(
+                            f"会话 {session_id} 在恢复写入期间被删除，"
+                            f"回滚失败：{exc}"
+                        )
+                        continue
+                    errors.append(
+                        f"会话 {session_id} 在恢复写入期间被删除，"
+                        "已回滚其消息"
+                    )
+                if removed_total:
+                    counts["messages_added"] = max(
+                        0,
+                        int(counts.get("messages_added") or 0) - removed_total,
+                    )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             action = "预览" if dry_run else "写入"
             return _fail(f"{action}失败：{exc}")
@@ -3064,11 +3093,13 @@ def _local_timestamp_text(value: str) -> str:
         return ""
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        # 极端年份（0001 / 9999 带偏移）astimezone 会 OverflowError：
+        # 只回退到原字符串，不能让列表 / 详情整条命令崩溃
         return text[:19].replace("T", " ")
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone()
-    return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _session_summaries(store) -> list[dict]:
