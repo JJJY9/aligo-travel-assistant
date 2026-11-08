@@ -348,6 +348,63 @@ def test_summary_inputs_off_event_loop():
     print("✓ 总结查询离开事件循环线程")
 
 
+def test_model_output_with_lone_surrogate_is_sanitized():
+    """模型输出含转义孤立代理项（截断 emoji）：事件 / 回复 / 落库都必须可编码。
+
+    真实约束：SSE 帧与 JSONResponse 都按 UTF-8 编码，孤立代理项会让 200
+    流无 error/done 直接中断，或写入 JSON 文件时抛 UnicodeEncodeError。
+    """
+    lonely = chr(0xD800)
+    runtime, memory = _make_runtime()
+
+    class _SurrogateIntention:
+        async def reply(self, context):
+            return _Response(
+                json.dumps(
+                    {
+                        "reasoning": "推理" + lonely,
+                        "intents": ["greeting"],
+                        "agent_schedule": [{"agent_name": "GreetingAgent"}],
+                    }
+                )
+            )
+
+    class _SurrogateOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _Response(
+                json.dumps(
+                    {
+                        "answer": "回答" + lonely,
+                        "results": [
+                            {
+                                "agent_name": "GreetingAgent",
+                                "status": "success",
+                                "message": "细节" + lonely,
+                            }
+                        ],
+                    }
+                )
+            )
+
+    runtime.intention_agent = _SurrogateIntention()
+    runtime.orchestrator = _SurrogateOrchestrator()
+    events: list[dict] = []
+
+    result = asyncio.run(runtime.ask("你好", on_event=events.append))
+
+    for event in events:
+        json.dumps(event, ensure_ascii=False).encode("utf-8")
+    result["reply"].encode("utf-8")
+    assert lonely not in result["reply"], "回复里的孤立代理项必须已转义"
+    assistant_payloads = [
+        content for role, content in memory.events if role == "assistant"
+    ]
+    assert assistant_payloads, "整轮应已落库"
+    for payload in assistant_payloads:
+        payload.encode("utf-8")
+    print("✓ 模型输出的孤立代理项在事件 / 回复 / 落库前转义")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -363,4 +420,5 @@ if __name__ == "__main__":
     test_persist_veto_rolls_back_staged_question()
     test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()
+    test_model_output_with_lone_surrogate_is_sanitized()
     print("\n全部通过")

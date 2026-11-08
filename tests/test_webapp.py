@@ -340,6 +340,75 @@ def test_chat_stream_events():
         _cleanup(user_id)
 
 
+def test_tombstone_ttl_covers_inflight_turn_lease():
+    """墓碑有效期不短于回合占用租约：迟到的落库在整段租约内都被否决。"""
+    from webapp.server import AligoWebApp
+
+    assert AligoWebApp.tombstone_ttl_sec >= AligoWebApp.session_turn_leak_sec
+    print("✓ 墓碑 TTL 覆盖在途回合生命周期")
+
+
+def test_stream_and_chat_sanitize_model_surrogates(monkeypatch):
+    """模型输出含孤立代理项：SSE 帧与 JSON 响应都必须转义后才能编码。
+
+    SSE / JSONResponse 都按 UTF-8 传输：孤立代理项会让 200 流没有
+    error/done 直接中断（Starlette 编码抛 UnicodeEncodeError）。
+    """
+    from agents.conversation import ConversationRuntime
+
+    lonely = chr(0xD800)
+
+    async def _fake_ask(self, message, on_event=None, turn_id=""):
+        if on_event:
+            on_event(
+                {
+                    "type": "plan",
+                    "intents": [],
+                    "reasoning": "推理" + lonely,
+                    "schedule": [],
+                }
+            )
+        return {
+            "reply": "回答" + lonely,
+            "agents": [],
+            "usage": {},
+            "elapsed": 0.0,
+        }
+
+    monkeypatch.setattr(ConversationRuntime, "ask", _fake_ask)
+    client = _client()
+    user_id = _unique_user("web_test_surrogate")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-sur"},
+        ) as response:
+            assert response.status_code == 200
+            raw = b"".join(response.iter_bytes())
+        text = raw.decode("utf-8")  # 编码失败会在这里抛 UnicodeDecodeError
+        assert "ud800" in text, "孤立代理项必须转义成可传输文本"
+        events = [
+            json.loads(line[5:].strip())
+            for line in text.splitlines()
+            if line.startswith("data:")
+        ]
+        assert events[-1]["type"] == "done", events[-1]
+        assert lonely not in events[1]["reasoning"]
+        assert lonely not in events[-1]["reply"]
+
+        chat = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-sur2"},
+        )
+        assert chat.status_code == 200, chat.text
+        assert lonely not in chat.json()["reply"]
+        assert "ud800" in chat.json()["reply"]
+    finally:
+        _cleanup(user_id)
+    print("✓ SSE / JSON 响应转义模型输出的孤立代理项")
+
+
 def test_stream_forwards_agent_progress_events(monkeypatch):
     """orchestrator 发出的 agent_start / agent_done 必须原样转发到 SSE。"""
     from agents.orchestration_agent import OrchestrationAgent
@@ -8465,6 +8534,12 @@ if __name__ == "__main__":
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
+    test_tombstone_ttl_covers_inflight_turn_lease()
+    _mp_surrogate = pytest.MonkeyPatch()
+    try:
+        test_stream_and_chat_sanitize_model_surrogates(_mp_surrogate)
+    finally:
+        _mp_surrogate.undo()
     test_stream_heartbeat()
     test_chat_failure_returns_500()
     test_chat_stream_failure_event()
