@@ -1004,6 +1004,16 @@ def test_import_skips_reserved_session_id():
             ],
             "session_titles": {"export": "坏标题", "sess-ok": "好标题"},
             "pinned_sessions": ["export"],
+            "trip_history": [
+                # 只有行程、没有消息的保留字会话：关联也要清掉，否则面板
+                # 里出现一条永远打不开的行程会话链接
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2027-03-01",
+                    "session_id": "export",
+                }
+            ],
         }
         response = client.post(
             "/api/import", params={"user_id": user_id}, json={"backup": backup}
@@ -1016,11 +1026,13 @@ def test_import_skips_reserved_session_id():
         ]
         ids = [item["session_id"] for item in sessions]
         assert "sess-ok" in ids and "export" not in ids, ids
+        trips = client.get("/api/trips", params={"user_id": user_id}).json()["trips"]
+        assert trips and trips[0].get("session_id") in (None, ""), trips
         detail = client.get(
             "/api/sessions/sess-ok", params={"user_id": user_id}
         )
         assert detail.status_code == 200, detail.text
-        print("✓ 备份导入跳过保留字 session_id（含标题 / 置顶）")
+        print("✓ 备份导入跳过保留字 session_id（含标题 / 置顶 / 行程关联）")
     finally:
         _cleanup(user_id)
 
@@ -2245,8 +2257,21 @@ def test_knowledge_update_error_mappings(monkeypatch):
     from webapp import server as server_module
 
     client = _client()
+    # 请求省略 metadata 时会先读取现有记录合并（与 CLI kb-update 一致）；
+    # 这里注入存在的片段，错误映射测试不依赖本地知识库文件
+    monkeypatch.setattr(
+        server_module,
+        "get_document",
+        lambda doc_id: {
+            "id": doc_id,
+            "content": "旧内容",
+            "metadata": {"category": "交通"},
+        },
+    )
+    merged = {}
 
     def raise_value(doc_id, content, metadata=None):
+        merged["metadata"] = metadata
         raise ValueError("旧数据没有 group")
 
     monkeypatch.setattr(server_module, "update_document", raise_value)
@@ -2255,6 +2280,7 @@ def test_knowledge_update_error_mappings(monkeypatch):
     )
     assert response.status_code == 400
     assert "旧数据没有 group" in response.json()["detail"]
+    assert merged["metadata"] == {"category": "交通"}, "省略 metadata 应沿用库中现有值"
 
     def raise_missing(doc_id, content, metadata=None):
         raise FileNotFoundError("知识库未初始化")
@@ -5530,6 +5556,17 @@ def test_knowledge_document_write_api(monkeypatch):
         return {"status": "success", "id": doc_id}
 
     monkeypatch.setattr(server_module, "update_document", fake_update)
+
+    def fake_get_document(doc_id):
+        if doc_id != 7:
+            return None
+        return {
+            "id": doc_id,
+            "content": "旧内容",
+            "metadata": {"category": "交通", "title": "旧标题", "part": "1"},
+        }
+
+    monkeypatch.setattr(server_module, "get_document", fake_get_document)
     changed = client.put(
         "/api/knowledge/documents/7",
         json={"content": "更新后的知识", "metadata": {"category": "交通"}},
@@ -5543,6 +5580,23 @@ def test_knowledge_document_write_api(monkeypatch):
     )
     assert long_update.status_code == 200
     assert len(updated["call"][1]) == 15000
+    # 省略 metadata：沿用库中现有元数据（与 CLI kb-update 一致），不能清空
+    assert updated["call"][2] == {
+        "category": "交通",
+        "title": "旧标题",
+        "part": "1",
+    }, updated["call"][2]
+    # 显式提交空字典仍按提交值覆盖（清空用户元数据）
+    cleared = client.put(
+        "/api/knowledge/documents/7", json={"content": "x", "metadata": {}}
+    )
+    assert cleared.status_code == 200
+    assert updated["call"][2] == {}
+    # 片段不存在：省略 metadata 时的读取阶段直接 404
+    assert (
+        client.put("/api/knowledge/documents/8", json={"content": "x"}).status_code
+        == 404
+    )
     assert (
         client.post(
             "/api/knowledge/documents", json={"content": "长" * 2001}
@@ -6875,6 +6929,173 @@ def test_user_data_import_api_with_knowledge(monkeypatch):
     finally:
         _cleanup(target)
 
+def test_snippet_stripping_is_linear_and_link_equivalent():
+    """片段清洗：链接剥离与正则等价，未闭合的 [ 不再二次方回溯。"""
+    from webapp import server as server_module
+
+    def reference(text: str) -> str:
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+        return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+
+    cases = [
+        "见 [差旅标准](https://example.com/a) 与 ![图](img.png)",
+        "空链接 []() 与空图 ![](x)",
+        "[嵌套 [括号](u)](v) 收尾",
+        "[未闭合]( 说明与 [另一个",
+        "](先闭合) [再开",
+        "![说明](url) 普通文本 !x](y)",
+    ]
+    for text in cases:
+        assert server_module._strip_markdown_links(text) == reference(text), text
+
+    # 未闭合的 '[' 曾让正则在每个起点回溯到串尾（O(n²)）：20 万个也必须秒回
+    adversarial = "[" * 200_000 + "needle"
+    started = time.perf_counter()
+    snippet = server_module._match_snippet(adversarial, "needle")
+    elapsed = time.perf_counter() - started
+    assert "needle" in snippet
+    assert elapsed < 2.0, f"片段清洗耗时 {elapsed:.2f}s，疑似仍为二次方复杂度"
+
+    started = time.perf_counter()
+    server_module._strip_markdown_for_snippet("[" * 200_000 + "]" * 200_000)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0, f"整段清洗耗时 {elapsed:.2f}s，疑似仍为二次方复杂度"
+    print("✓ 搜索片段清洗与正则等价且线性耗时")
+
+
+def test_read_rate_limit_headers_and_rejection():
+    """面板数据读接口接入独立限流：额度头存在，超限 429 带 Retry-After。"""
+    from utils.rate_limit import create_rate_limiter
+
+    client = _client()
+    state = client.app.state.aligo
+    state.read_limiter = create_rate_limiter("read", 3, 60, None)
+    user = _unique_user("web_read")
+    try:
+        first = client.get("/api/status", params={"user_id": user})
+        assert first.status_code == 200
+        assert first.headers.get("x-ratelimit-limit") == "3"
+        assert int(first.headers.get("x-ratelimit-remaining", 3)) < 3
+        # 导出接口同样计入读额度，返回 Response 的路径也要带回额度头
+        exported = client.get(
+            "/api/export", params={"user_id": user, "format": "json"}
+        )
+        assert exported.status_code == 200
+        assert exported.headers.get("x-ratelimit-limit") == "3"
+        assert (
+            client.get("/api/status", params={"user_id": user}).status_code == 200
+        )
+        rejected = client.get("/api/status", params={"user_id": user})
+        assert rejected.status_code == 429
+        assert rejected.headers.get("retry-after")
+    finally:
+        _cleanup(user)
+    print("✓ 面板读接口独立限流与额度头")
+
+
+def test_kb_import_runs_in_dedicated_executor(monkeypatch):
+    """知识库导入在专用执行器里跑，不占用面板接口共享的线程池。"""
+    from webapp import server as server_module
+
+    names: list[str] = []
+
+    def fake_import(documents, dry_run=False):
+        names.append(threading.current_thread().name)
+        return {"imported": len(documents), "skipped": 0, "would_import": len(documents)}
+
+    monkeypatch.setattr(server_module, "import_documents", fake_import)
+    client = _client()
+    response = client.post(
+        "/api/knowledge/import/preview", json={"documents": [{"content": "知识"}]}
+    )
+    assert response.status_code == 200
+    assert names and names[0].startswith("aligo-kb-import"), names
+    print("✓ 知识库导入在专用执行器执行")
+
+
+def test_import_body_parsed_off_event_loop(monkeypatch):
+    """/api/import 的 64MB 请求体解析与校验不能在事件循环线程同步执行。"""
+    from utils import user_import as user_import_module
+    from webapp import server as server_module
+
+    threads: list[str] = []
+
+    class _StubPayload:
+        backup: dict = {}
+
+    class _StubImportPayload:
+        @staticmethod
+        def model_validate_json(raw):
+            threads.append(threading.current_thread().name)
+            return _StubPayload()
+
+    monkeypatch.setattr(server_module, "UserImportPayload", _StubImportPayload)
+    monkeypatch.setattr(
+        user_import_module,
+        "parse_user_export_data",
+        lambda backup: ({"messages": [], "titles": {}, "pinned": [], "archived": [], "trips": []}, []),
+    )
+    monkeypatch.setattr(
+        user_import_module,
+        "import_user_data",
+        lambda store, sections: {"imported": 0, "skipped": 0},
+    )
+    client = _client()
+    user = _unique_user("web_import_thread")
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user}, json={"backup": {}}
+        )
+        assert response.status_code == 200
+        assert threads and threads[0].startswith("aligo-import"), threads
+    finally:
+        _cleanup(user)
+    print("✓ /api/import 请求体解析在导入执行器线程完成")
+
+
+def test_import_rejects_malformed_body_with_422():
+    """手工解析请求体保持 422 语义：坏 JSON / 缺 backup 字段都不 500。"""
+    client = _client()
+    user = _unique_user("web_import_bad")
+    try:
+        bad = client.post(
+            "/api/import",
+            params={"user_id": user},
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert bad.status_code == 422
+        detail = bad.json()["detail"]
+        assert isinstance(detail, list) and detail
+        missing = client.post(
+            "/api/import", params={"user_id": user}, json={"other": 1}
+        )
+        assert missing.status_code == 422
+    finally:
+        _cleanup(user)
+    print("✓ /api/import 坏请求体返回 422")
+
+
+def test_weather_city_rejects_control_characters(monkeypatch):
+    """/api/weather 的 city 拒绝控制字符：%0A 不再能伪造日志行。"""
+    from webapp import server as server_module
+
+    client = _client()
+    rejected = client.get("/api/weather", params={"city": "北京\n伪造日志行"})
+    assert rejected.status_code == 422
+    called = {}
+
+    def fake_fetch(name):
+        called["name"] = name
+        return {"city": name}
+
+    monkeypatch.setattr(server_module, "fetch_weather", fake_fetch)
+    ok = client.get("/api/weather", params={"city": "北京"})
+    assert ok.status_code == 200
+    assert called["name"] == "北京"
+    print("✓ /api/weather 城市名拒绝控制字符")
+
+
 if __name__ == "__main__":
     test_index_page()
     test_route_path_normalization()
@@ -7079,4 +7300,22 @@ if __name__ == "__main__":
         test_open_long_term_failure_maps_503(_mp_open)
     finally:
         _mp_open.undo()
+    test_snippet_stripping_is_linear_and_link_equivalent()
+    test_read_rate_limit_headers_and_rejection()
+    test_import_rejects_malformed_body_with_422()
+    _mp_round22 = pytest.MonkeyPatch()
+    try:
+        test_kb_import_runs_in_dedicated_executor(_mp_round22)
+    finally:
+        _mp_round22.undo()
+    _mp_round22b = pytest.MonkeyPatch()
+    try:
+        test_import_body_parsed_off_event_loop(_mp_round22b)
+    finally:
+        _mp_round22b.undo()
+    _mp_round22c = pytest.MonkeyPatch()
+    try:
+        test_weather_city_rejects_control_characters(_mp_round22c)
+    finally:
+        _mp_round22c.undo()
     print("\n全部通过")

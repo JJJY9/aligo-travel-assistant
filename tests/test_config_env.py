@@ -153,10 +153,47 @@ def test_kb_import_rate_limit_env():
     print("✓ KB_IMPORT_RATE_LIMIT 可配置（默认 1200）")
 
 
+def test_read_rate_limit_env():
+    """READ_RATE_LIMIT 控制面板数据读接口的独立限流桶（默认 600）。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.RATE_LIMIT_CONFIG['read_requests'])"
+    )
+    env = dict(os.environ)
+    env.pop("READ_RATE_LIMIT", None)
+    default = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert default.returncode == 0, default.stderr
+    assert default.stdout.strip() == "600"
+    env["READ_RATE_LIMIT"] = "9"
+    configured = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert configured.returncode == 0, configured.stderr
+    assert configured.stdout.strip() == "9"
+    print("✓ READ_RATE_LIMIT 可配置（默认 600）")
+
+
 if __name__ == "__main__":
     test_api_key_is_stripped_and_blank_falls_back()
     test_broken_config_local_import_is_not_swallowed()
     test_empty_env_model_and_base_url_fall_back()
     test_create_chat_model_max_retries_param()
     test_kb_import_rate_limit_env()
+    test_read_rate_limit_env()
     print("\n全部通过")
