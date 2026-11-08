@@ -3742,6 +3742,10 @@ def create_app(model: Any = None) -> FastAPI:
 
             try:
                 result = state.import_executor.submit(work).result()
+            except HTTPException:
+                # _open_long_term(strict=True) 的 503（存储暂时不可用）原样
+                # 上抛，不能再包一层「导入行程失败」把状态 / 文案改掉
+                raise
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - 读取 / 写入失败统一提示
