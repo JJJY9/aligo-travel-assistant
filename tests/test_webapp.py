@@ -1954,11 +1954,38 @@ def test_preferences_api():
             "/api/preferences/" + "x" * 65, json={"user_id": user_id, "value": "x"}
         )
         assert invalid.status_code == 422
-        too_long = client.put(
+        long_value = client.put(
             "/api/preferences/home_location",
             json={"user_id": user_id, "value": "x" * 501},
         )
-        assert too_long.status_code == 422
+        assert long_value.status_code == 200, (
+            "存量 / 导入的长值必须能原样保存（与 /api/status 回显一致）"
+        )
+        # 面板未修改直接保存的对象 / 数值列表必须能原样写回，否则这些
+        # 存量偏好永远无法保存（此前对象一律 422）
+        obj = client.put(
+            "/api/preferences/profile",
+            json={"user_id": user_id, "value": {"seat": "window", "tier": 2}},
+        )
+        assert obj.status_code == 200, obj.text
+        assert obj.json()["value"] == {"seat": "window", "tier": 2}
+        numeric = client.put(
+            "/api/preferences/scores",
+            json={"user_id": user_id, "value": [1, 2, 3]},
+        )
+        assert numeric.status_code == 200, numeric.text
+        assert numeric.json()["value"] == [1, 2, 3]
+        oversize = client.put(
+            "/api/preferences/oversize",
+            json={"user_id": user_id, "value": "x" * 11000},
+        )
+        assert oversize.status_code == 422
+        nested_nan = client.put(
+            "/api/preferences/nested_nan",
+            content='{"user_id": "' + user_id + '", "value": {"a": NaN}}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert nested_nan.status_code == 422
         print("✓ 偏好新增 / 覆盖 / 删除 / 参数校验")
     finally:
         _cleanup(user_id)
