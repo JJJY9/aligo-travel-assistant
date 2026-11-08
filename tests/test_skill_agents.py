@@ -689,8 +689,11 @@ def test_rag_explicit_embedding_model_id_not_replaced(monkeypatch, tmp_path):
         return _RagFakeEmbedding()
 
     monkeypatch.setattr(module, "get_embedding_model", fake_get_embedding_model)
+    # 集合已存在：本例只验证模型 ID 不被替换，走完整的初始化路径
+    collection_client = _RagFakeClient()
+    collection_client.exists = True
     monkeypatch.setattr(
-        module, "get_milvus_client", lambda path: _RagFakeClient()
+        module, "get_milvus_client", lambda path: collection_client
     )
     module.RAGKnowledgeAgent(
         name="x",
@@ -725,6 +728,27 @@ def test_rag_existing_db_without_collection_not_created(monkeypatch, tmp_path):
     assert "缺少集合" in agent.init_error
     assert client.created == [], "检索路径不能创建集合"
     print("✓ 库在集合缺时不创建、按未初始化提示")
+
+
+def test_rag_missing_collection_skips_model_load(monkeypatch, tmp_path):
+    """库在集合缺时先给专用提示，不再加载 / 下载嵌入模型。"""
+    module = _load_skill_module("ask-question")
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
+    loaded = []
+
+    def _boom(name):
+        loaded.append(name)
+        raise RuntimeError("model download failed")
+
+    monkeypatch.setattr(module, "get_embedding_model", _boom)
+    client = _RagFakeClient()
+    monkeypatch.setattr(module, "get_milvus_client", lambda path: client)
+    (tmp_path / "milvus_lite.db").write_bytes(b"")
+    agent = module.RAGKnowledgeAgent(name="x", knowledge_base_path=str(tmp_path))
+    assert agent.initialized is False
+    assert "缺少集合" in agent.init_error
+    assert loaded == [], "集合缺失时不能加载（或联网下载）嵌入模型"
+    print("✓ 集合缺失时不加载嵌入模型")
 
 
 def test_rag_reply_filters_low_score_documents():

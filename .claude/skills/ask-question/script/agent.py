@@ -130,6 +130,21 @@ class RAGKnowledgeAgent(AgentBase):
             logger.error(self.init_error)
             return
 
+        # 库文件存在但集合缺失（空库 / 初始化中断 / 建集合前进程被杀）：
+        # 在加载（或联网下载）嵌入模型之前就给出专用提示——先加载会白耗
+        # 资源，模型不可用时还会把「缺少集合」盖成下载 / 连接错误
+        self._milvus_db_path = milvus_db_path
+        if db_existed and not create_if_missing:
+            if not self.milvus_client.has_collection(collection_name):
+                self.initialized = False
+                self.init_error = (
+                    "知识库缺少集合（milvus_lite.db 存在但尚未初始化知识），"
+                    "请运行 python .claude/skills/ask-question/script/"
+                    "init_knowledge_base.py 或先导入知识文档"
+                )
+                logger.error(self.init_error)
+                return
+
         # 若配置的是本地路径且存在，则从本地加载，否则按模型 ID 使用（会联网）
         model_path_or_id = embedding_model
         path_obj = Path(embedding_model).expanduser()
@@ -156,7 +171,6 @@ class RAGKnowledgeAgent(AgentBase):
         # 初始化 Milvus Lite（本地文件存储）
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
 
-        self._milvus_db_path = milvus_db_path
         self._client_created_at = None  # 用于追踪客户端创建时间
         client = self.milvus_client
 

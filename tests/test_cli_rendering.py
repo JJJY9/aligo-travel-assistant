@@ -128,6 +128,27 @@ def test_agent_error_message_fallback():
     print("✓ 失败智能体优先显示 message 字段")
 
 
+def test_agent_error_uses_aggregated_message():
+    """错误原因只在聚合条目的 message 上时也要显示，而不是「未知错误」。"""
+    instance = _new_cli()
+    instance._generate_human_response(
+        [
+            {
+                "agent_name": "query-info",
+                "status": "error",
+                "data": {
+                    "query_success": False,
+                    "results": {"error": "搜索失败: boom"},
+                },
+                "message": "搜索失败: boom",
+            }
+        ]
+    )
+    output = instance._buffer.getvalue()
+    assert "搜索失败: boom" in output and "未知错误" not in output
+    print("✓ 失败智能体使用聚合条目的 message")
+
+
 def test_status_renders_assistant_plaintext():
     class _ShortTerm:
         def get_recent_context(self, n_turns=5):
