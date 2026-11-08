@@ -186,6 +186,11 @@ def test_trip_import_file_decoding_and_size_guard():
         "解码 / 请求期间切换用户，导入仍落在选择文件时的用户"
     )
     assert results["user_after"] == "user-b"
+    assert results["cancel"] == {
+        "calls": 1,
+        "confirm_calls": 1,
+        "last_toast": "已取消导入",
+    }, "预览后取消只发 dry-run，不写入"
     assert results["char_limit"]["last_toast"] == (
         "文件过大（超过 50 万字符），请拆分后再导入"
     ), "字符数上限必须与服务端 50 万字符一致"
