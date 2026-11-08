@@ -6168,6 +6168,14 @@ def test_knowledge_duplicates_cleanup_api(monkeypatch):
     assert blocked.status_code == 422
     assert calls == []
 
+    # 跨站表单（application/x-www-form-urlencoded）同样 422：
+    # 浏览器表单发不出 application/json，破坏性清理不能被第三方页面触发
+    form_blocked = client.post(
+        "/api/knowledge/duplicates/cleanup", data={"dry_run": "false"}
+    )
+    assert form_blocked.status_code == 422
+    assert calls == [], "表单 POST 不能进入清理逻辑"
+
     preview = client.post("/api/knowledge/duplicates/cleanup", json={})
     assert preview.status_code == 200, preview.text
     data = preview.json()
