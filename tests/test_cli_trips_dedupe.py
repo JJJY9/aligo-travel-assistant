@@ -86,6 +86,24 @@ def test_undated_trips_not_deduped(monkeypatch):
     print("✓ 缺少出发日期的行程不参与去重")
 
 
+def test_unpadded_dates_group_with_padded(monkeypatch):
+    """历史未补零日期（2026-1-5）与补零写法视为同一行程，不再漏清理。"""
+    fake = _FakeStore(
+        [
+            _trip("trip_1", start="2026-1-5", end="2026-1-7"),
+            _trip("trip_2", start="2026-01-05", end="2026-01-07"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path: fake
+    )
+    code, out = _run("u1")
+    assert code == 0
+    assert fake.deleted == ["trip_2"], "未补零 / 补零的同行程必须识别为重复"
+    assert "删除 1 条重复行程" in out
+    print("✓ 未补零日期的重复行程被识别")
+
+
 def test_no_trips(monkeypatch):
     fake = _FakeStore([])
     monkeypatch.setattr(
@@ -501,6 +519,7 @@ def test_delete_duplicate_trip_json_backend_keeps_earliest(tmp_path):
 if __name__ == "__main__":
     for case in (
         test_dedupes_and_keeps_first,
+        test_unpadded_dates_group_with_padded,
         test_undated_trips_not_deduped,
         test_no_trips,
         test_invalid_user_id,

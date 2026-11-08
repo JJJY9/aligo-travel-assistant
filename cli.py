@@ -2302,6 +2302,37 @@ def run_user_import_standalone(
             f"没有可恢复的数据{hint}{f'（{detail}）' if detail else ''}"
         )
 
+    # 与 Web 面板的恢复路径同口径：墓碑期内刚被删除的会话不能在恢复里复活；
+    # 保留字会话（如 export）在面板永远打不开，也一并跳过。CLI 进程只能读取
+    # 共享 Redis 墓碑（Web 的进程内墓碑表不跨进程），未配置 REDIS_URL 时
+    # 无法感知其它进程刚删除的会话。
+    from utils.session_ids import RESERVED_SESSION_IDS
+    from utils.tombstones import is_session_deleted
+    from utils.user_import import drop_sessions
+
+    candidate_sessions = {
+        message.get("session_id")
+        for message in sections.get("messages") or []
+        if message.get("session_id")
+    } | {
+        trip.get("session_id")
+        for trip in sections.get("trips") or []
+        if trip.get("session_id")
+    }
+    skipped_sessions = {
+        session_id
+        for session_id in candidate_sessions
+        if session_id in RESERVED_SESSION_IDS
+        or is_session_deleted(user_id, str(session_id))
+    }
+    if skipped_sessions:
+        for session_id in sorted(skipped_sessions):
+            if session_id in RESERVED_SESSION_IDS:
+                errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
+            else:
+                errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
+        drop_sessions(sections, skipped_sessions)
+
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -2830,16 +2861,20 @@ def run_trips_dedupe_standalone(
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
 
+        from utils.trip_import import normalize_identity_date
+
         groups: dict[tuple[str, str, str, str], list[str]] = {}
         for trip in trips:
-            start_date = str(trip.get("start_date") or "")
+            # 与存储层去重同一口径：历史未补零日期（2026-1-5）先归一，
+            # 否则同一行程的两种写法不会被识别为重复
+            start_date = normalize_identity_date(trip.get("start_date"))
             if not start_date:
                 continue
             key = (
                 str(trip.get("origin") or ""),
                 str(trip.get("destination") or ""),
                 start_date,
-                str(trip.get("end_date") or start_date),
+                normalize_identity_date(trip.get("end_date") or start_date),
             )
             groups.setdefault(key, []).append(str(trip.get("trip_id") or ""))
         by_id = {str(trip.get("trip_id") or ""): trip for trip in trips}
@@ -3861,14 +3896,15 @@ def run_trips_export_standalone(
     ics: bool = False,
     query: str = "",
     html: bool = False,
+    status: str = "",
 ) -> int:
     """导出全部行程
-    （`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics|--html] [--query 关键词]`）。
+    （`python cli.py trips-export <user_id> [path] [--stdout] [--force] [--ics|--html] [--query 关键词] [--status S]`）。
 
     ``ics=True`` 时导出 iCalendar（与 Web 的 /api/trips/calendar 同一实现），
     ``html=True`` 时导出可打印的 HTML 台账（与 Web 的 /api/trips/export?
-    format=html 同一实现），否则导出带 BOM 的 CSV；``query`` 先按面板口径
-    过滤再导出。
+    format=html 同一实现），否则导出带 BOM 的 CSV；``query`` / ``status``
+    先按面板口径过滤再导出。
 
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败
@@ -3876,7 +3912,7 @@ def run_trips_export_standalone(
     import re
     from pathlib import Path
 
-    from utils.trip_conflicts import filter_trips_by_query
+    from utils.trip_conflicts import filter_trips_by_query, trip_state_label
     from utils.trip_export import render_trips_csv, render_trips_html, render_trips_ics
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3901,6 +3937,9 @@ def run_trips_export_standalone(
     needle = query.strip()
     if needle:
         trips = filter_trips_by_query(trips, needle)
+    status_label = _TRIP_STATUS_FILTERS.get(status.strip(), "")
+    if status_label:
+        trips = [trip for trip in trips if trip_state_label(trip) == status_label]
 
     skipped = 0
     if ics:
@@ -3961,6 +4000,8 @@ def run_trips_export_standalone(
         return 1
     suffix = "（iCalendar）" if ics else ("（HTML）" if html else "")
     filter_note = f"，筛选「{needle}」" if needle else ""
+    if status_label:
+        filter_note += f"，状态「{status_label}」"
     skipped_note = f"，跳过 {skipped} 条缺少出发日期" if skipped else ""
     print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}{skipped_note}")
     return 0
@@ -4057,6 +4098,15 @@ def run_trip_add_standalone(
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    # 与 Web 请求模型同一上限：超长字段落库后，面板任何一次编辑保存都会
+    # 因该记录确定 422，且无法从面板修正（只能改库）
+    for label, value in (
+        ("出发地", origin),
+        ("目的地", destination),
+        ("目的", purpose),
+    ):
+        if len(value) > 100:
+            return _fail(f"{label}不能超过 100 字（当前 {len(value)} 字）")
     start_dt = _parse_strict_date(start_date)
     if start_dt is None:
         return _fail(f"出发日期格式应为 YYYY-MM-DD：{start_date}")
@@ -4332,6 +4382,10 @@ def run_trip_update_standalone(
         return _fail("没有需要更新的字段")
     if "destination" in mapped and not mapped["destination"].strip():
         return _fail("目的地不能为空")
+    for label, key in (("出发地", "origin"), ("目的地", "destination"), ("目的", "purpose")):
+        value = mapped.get(key)
+        if value is not None and len(value) > 100:
+            return _fail(f"{label}不能超过 100 字（当前 {len(value)} 字）")
 
     try:
         store = _open_cli_store(user_id)
@@ -4924,6 +4978,10 @@ def run_preference_set_standalone(
     text_value = value.strip()
     if not text_value:
         return _fail("偏好值不能为空")
+    # 与 Web 的 PreferencePayload 同一上限（单值 500 字）：超长值落库后
+    # 面板保存任何修改都会对该记录 422
+    if len(text_value) > 500:
+        return _fail(f"偏好值不能超过 500 字（当前 {len(text_value)} 字）")
 
     try:
         store = _open_cli_store(user_id)
@@ -5082,16 +5140,17 @@ def _parse_session_export_args(
 
 def _parse_export_args(
     args: list[str], allow_ics: bool = False
-) -> tuple[str | None, bool, bool, bool, str] | None:
-    """解析导出命令的 [path] [--stdout] [--force] [--ics] [--query 关键词]。
+) -> tuple[str | None, bool, bool, bool, str, str] | None:
+    """解析导出命令的 [path] [--stdout] [--force] [--ics] [--query 关键词] [--status S]。
 
-    ``--ics`` / ``--query`` 只在 ``allow_ics=True``（trips-export）时接受；
-    冲突 / 未知参数返回 None。
+    ``--ics`` / ``--query`` / ``--status`` 只在 ``allow_ics=True``
+    （trips-export）时接受；冲突 / 未知参数 / 非法状态返回 None。
     """
     to_stdout = False
     force = False
     ics = False
     query = ""
+    status = ""
     paths: list[str] = []
     index = 0
     while index < len(args):
@@ -5116,6 +5175,19 @@ def _parse_export_args(
             if not value.strip() or value.startswith("-"):
                 return None
             query = value.strip()
+        elif allow_ics and (
+            lowered == "--status" or lowered.startswith("--status=")
+        ):
+            if "=" in item:
+                value = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            if value.strip() not in _TRIP_STATUS_FILTERS:
+                return None
+            status = value.strip()
         elif item.startswith("-"):
             return None
         else:
@@ -5123,7 +5195,7 @@ def _parse_export_args(
         index += 1
     if len(paths) > 1 or (to_stdout and paths):
         return None
-    return (paths[0] if paths else None), to_stdout, force, ics, query
+    return (paths[0] if paths else None), to_stdout, force, ics, query, status
 
 
 _COMMANDS_HINT = (
@@ -5775,7 +5847,7 @@ def main():
             if parsed_export is None:
                 print(usage)
                 sys.exit(2)
-            target, to_stdout, force, _, _ = parsed_export
+            target, to_stdout, force, _, _, _ = parsed_export
             sys.exit(
                 run_sessions_export_standalone(
                     sys.argv[2],
@@ -5847,7 +5919,8 @@ def main():
         if arg == "trips-export":
             trips_usage = (
                 "用法：python cli.py trips-export <user_id> [path] "
-                "[--stdout] [--force] [--ics|--html] [--query 关键词]"
+                "[--stdout] [--force] [--ics|--html] [--query 关键词] "
+                "[--status active|upcoming|past]"
             )
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
                 print(trips_usage)
@@ -5861,7 +5934,7 @@ def main():
             if parsed_export is None:
                 print(trips_usage)
                 sys.exit(2)
-            target, to_stdout, force, ics, export_query = parsed_export
+            target, to_stdout, force, ics, export_query, export_status = parsed_export
             if html_flag and ics:
                 # 两种格式互斥：同时指定时不能静默只导一种
                 print(trips_usage)
@@ -5875,6 +5948,7 @@ def main():
                     ics=ics,
                     query=export_query,
                     html=html_flag,
+                    status=export_status,
                 )
             )
         if arg == "trips-import":

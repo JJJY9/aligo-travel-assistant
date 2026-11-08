@@ -421,6 +421,24 @@ def test_trip_add_validation_errors(monkeypatch):
     print("✓ trip-add 校验错误（ID / 日期格式 / 结束早于开始）")
 
 
+def test_trip_add_rejects_oversized_fields(monkeypatch):
+    """与 Web 请求模型同一上限：超长字段直接拒绝，不落库。"""
+    store = _AddStore([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    cases = [
+        (("u1", "长" * 101, "上海", "2026-12-01"), "出发地"),
+        (("u1", "北京", "长" * 101, "2026-12-01"), "目的地"),
+        (("u1", "北京", "上海", "2026-12-01", None, "长" * 101), "目的"),
+    ]
+    for args, needle in cases:
+        code, out = _run_trip_add(*args)
+        assert code == 1 and needle in out, (args, out)
+    assert store.saved == [], "超长字段不应落库"
+    print("✓ trip-add 拒绝超过 100 字的字段")
+
+
 def test_trip_add_store_failures(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("open down")
@@ -719,6 +737,19 @@ def _run_trip_update(*args, **kwargs):
     with contextlib.redirect_stdout(out):
         code = cli.run_trip_update_standalone(*args, **kwargs)
     return code, out.getvalue()
+
+
+def test_trip_update_rejects_oversized_fields(monkeypatch):
+    """trip-update 同样限制 100 字，避免落库后面板保存必然 422。"""
+    store = _UpdateStore([_trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for field in ("origin", "destination", "purpose"):
+        code, out = _run_trip_update("u1", "trip_1", {field: "长" * 101})
+        assert code == 1 and "100" in out, (field, out)
+    assert store.updates == [], "超长字段不应落库"
+    print("✓ trip-update 拒绝超过 100 字的字段")
 
 
 def test_trip_update_fields_and_json(monkeypatch):
@@ -1138,6 +1169,7 @@ if __name__ == "__main__":
         test_trip_add_json_output,
         test_trip_add_dedupes_same_route_and_dates,
         test_trip_add_validation_errors,
+        test_trip_add_rejects_oversized_fields,
         test_trip_add_store_failures,
         test_trip_add_args_and_dispatch,
         test_trip_delete_success_and_json,
@@ -1146,6 +1178,7 @@ if __name__ == "__main__":
         test_trip_delete_args_and_dispatch,
         test_trip_update_fields_and_json,
         test_trip_update_validation_errors,
+        test_trip_update_rejects_oversized_fields,
         test_trip_update_store_failures,
         test_trip_update_args_and_dispatch,
     ):

@@ -50,3 +50,27 @@ def mark_session_deleted(
         logger.warning("写入共享删除墓碑失败：%s", exc)
         return False
     return True
+
+
+def is_session_deleted(user_id: str, session_id: str) -> bool:
+    """共享墓碑是否仍在有效期内；Redis 不可用 / 读取失败按「未删除」处理。
+
+    CLI 的备份恢复用它避免把刚被删除的会话写回（墓碑 TTL 与 Web 一致，
+    只覆盖删除后的短时间窗）。未配置 ``REDIS_URL`` 时进程之间没有共享通道，
+    返回 False——调用方应在提示里说明。
+    """
+    from context.storage import get_shared_redis_client
+
+    try:
+        client = get_shared_redis_client()
+    except Exception as exc:  # noqa: BLE001 - 墓碑读取失败按未删除处理
+        logger.warning("读取共享 Redis 失败，跳过删除墓碑检查：%s", exc)
+        return False
+    if client is None:
+        return False
+    try:
+        return bool(client.exists(deleted_key(user_id, session_id)))
+    except Exception as exc:  # noqa: BLE001 - 墓碑读取失败按未删除处理
+        logger.warning("读取共享删除墓碑失败：%s", exc)
+        return False
+

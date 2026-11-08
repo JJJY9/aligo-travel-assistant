@@ -428,6 +428,26 @@ def test_pref_write_dispatch(monkeypatch):
     print("✓ pref-set / pref-delete dispatch")
 
 
+def test_pref_set_rejects_oversized_value(monkeypatch):
+    """与 Web 的 PreferencePayload 同一上限：超过 500 字的值直接拒绝。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "memo", "长" * 501)
+    assert code == 1
+    assert "500" in out.getvalue()
+    assert store.saved == [], "超长偏好值不应落库"
+    # 500 字以内仍可保存
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "memo", "长" * 500)
+    assert code == 0 and store.saved == [("memo", "长" * 500)]
+    print("✓ pref-set 拒绝超过 500 字的值")
+
+
 if __name__ == "__main__":
     for case in (
         test_preferences_list_output,
@@ -441,6 +461,7 @@ if __name__ == "__main__":
         test_pref_delete_text_and_json,
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
+        test_pref_set_rejects_oversized_value,
     ):
         mp = pytest.MonkeyPatch()
         try:

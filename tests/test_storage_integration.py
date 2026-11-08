@@ -178,6 +178,39 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
         memory.close()
 
 
+def test_pg_update_trip_normalizes_unpadded_dates():
+    """update_trip 的重复检测与 save_trip_history 同一口径（未补零日期）。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        trip_1 = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "purpose": "出差",
+            }
+        )
+        trip_2 = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-05",
+                "purpose": "出差",
+            }
+        )
+        assert trip_1 and trip_2 and trip_1 != trip_2
+        # 历史行可能是未补零写法：写入后用补零写法更新另一条为同一天，
+        # 必须判重复（SQL 等值比较会漏掉这种写法差异）
+        assert memory.update_trip(trip_2, {"start_date": "2026-12-8"}) is True
+        with pytest.raises(ValueError):
+            memory.update_trip(
+                trip_1, {"destination": "杭州", "start_date": "2026-12-08"}
+            )
+        print("✓ PG update_trip 未补零日期的重复检测")
+    finally:
+        memory.close()
+
+
 def test_pg_add_chat_turn_writes_pair_in_one_transaction():
     """PG add_chat_turn：用户 + 助手同一事务写入，会话历史完整成对。"""
     memory, _ = _pg_memory_or_skip()

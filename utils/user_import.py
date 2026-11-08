@@ -124,18 +124,25 @@ def _text_problem(value: str) -> str | None:
     return None
 
 
-def _bad_text_in_value(value: Any) -> str | None:
-    """递归检查偏好值里的字符串（列表 / 对象内的字符串同样会落库）。"""
+def _bad_text_in_value(value: Any, depth: int = 0) -> str | None:
+    """递归检查偏好值里的字符串（列表 / 对象内的字符串同样会落库）。
+
+    带深度上限：偏好值只应为标量或一层列表，近乎递归上限的嵌套结构会让
+    这里的递归先于 json.loads 的护栏抛出 RecursionError（CLI user-import
+    直接崩溃、--json 也没有结构化输出），按非法值拒绝。
+    """
+    if depth > 64:
+        return "嵌套过深"
     if isinstance(value, str):
         return _text_problem(value)
     if isinstance(value, (list, tuple)):
         for item in value:
-            problem = _bad_text_in_value(item)
+            problem = _bad_text_in_value(item, depth + 1)
             if problem:
                 return problem
     elif isinstance(value, dict):
         for key, item in value.items():
-            problem = _text_problem(str(key)) or _bad_text_in_value(item)
+            problem = _text_problem(str(key)) or _bad_text_in_value(item, depth + 1)
             if problem:
                 return problem
     return None
@@ -521,6 +528,40 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
             else:
                 result["messages_added"] += 1
     return result
+
+
+def drop_sessions(sections: dict[str, Any], session_ids: set[str]) -> None:
+    """从备份 sections 中剔除给定会话（原位修改）。
+
+    消息 / 标题 / 置顶 / 归档一并删除，行程只清空关联的 ``session_id``
+    （行程本身是独立数据，保留）。Web 的 /api/import 与 CLI 的 user-import
+    用同一实现处理墓碑期已删除与保留字会话。
+    """
+    if not session_ids:
+        return
+    sections["messages"] = [
+        message
+        for message in sections.get("messages") or []
+        if message.get("session_id") not in session_ids
+    ]
+    sections["titles"] = {
+        session_id: title
+        for session_id, title in (sections.get("titles") or {}).items()
+        if session_id not in session_ids
+    }
+    sections["pinned"] = [
+        session_id
+        for session_id in sections.get("pinned") or []
+        if session_id not in session_ids
+    ]
+    sections["archived"] = [
+        session_id
+        for session_id in sections.get("archived") or []
+        if session_id not in session_ids
+    ]
+    for trip in sections.get("trips") or []:
+        if trip.get("session_id") in session_ids:
+            trip["session_id"] = None
 
 
 def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:

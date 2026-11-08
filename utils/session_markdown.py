@@ -28,10 +28,26 @@ def _session_title(
     return "Aligo 对话"
 
 
+def _latest_timestamp(messages: list[dict[str, Any]]) -> str:
+    """会话内最大消息时间戳（与 /api/sessions、cli sessions 同一口径）。"""
+    latest = ""
+    for message in messages:
+        timestamp = str(message.get("timestamp") or "")
+        if timestamp and (
+            not latest or chronological_key(timestamp) > chronological_key(latest)
+        ):
+            latest = timestamp
+    return latest
+
+
 def group_sessions(
     messages: list[dict[str, Any]],
 ) -> list[tuple[str, list[dict[str, Any]]]]:
-    """按 session_id 分组，保持会话内消息顺序；会话按最近消息时间倒序。"""
+    """按 session_id 分组，保持会话内消息顺序；会话按「会话内最大时间戳」倒序。
+
+    不能用转录最后一条消息的时间：恢复早于现有会话的备份后消息按导出顺序
+    追加，末尾不一定是会话内最新的那条，导出会把会话排到最旧。
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for message in messages:
         session_id = str(message.get("session_id") or "")
@@ -40,7 +56,7 @@ def group_sessions(
         grouped.setdefault(session_id, []).append(message)
     ordered = sorted(
         grouped.items(),
-        key=lambda item: chronological_key(item[1][-1].get("timestamp")),
+        key=lambda item: chronological_key(_latest_timestamp(item[1])),
         reverse=True,
     )
     return ordered
@@ -73,7 +89,7 @@ def render_all_sessions_markdown(
                 "",
                 f"- 会话：{session_id}",
                 f"- 消息数：{len(session_messages)}",
-                f"- 最近更新：{session_messages[-1].get('timestamp') or '—'}",
+                f"- 最近更新：{_latest_timestamp(session_messages) or '—'}",
                 "",
             ]
         )

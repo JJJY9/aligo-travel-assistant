@@ -79,6 +79,7 @@ from utils.knowledge_stats import knowledge_status
 from utils.metrics import REQUEST_METRICS
 from utils.preference_values import has_preference_value
 from utils.rate_limit import create_rate_limiter
+from utils.session_ids import RESERVED_SESSION_IDS
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
 from utils.session_html import render_all_sessions_html
@@ -147,9 +148,9 @@ def _is_loopback_host(host: str) -> bool:
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
-# 与静态路由冲突的会话 ID：GET /api/sessions/export 永远命中导出接口，
-# 这类会话无法查看 / 继续（聊天请求与备份恢复都必须拒绝）
-_RESERVED_SESSION_IDS = frozenset({"export"})
+# 与静态路由冲突的会话 ID（清单与 CLI 共用）：GET /api/sessions/export 永远
+# 命中导出接口，这类会话无法查看 / 继续（聊天请求与备份恢复都必须拒绝）
+_RESERVED_SESSION_IDS = RESERVED_SESSION_IDS
 # 偏好类型可由模型 / 面板自定义（可能含空格等），只限制长度与非空
 _PREF_TYPE_PATTERN = r"^[^/]{1,64}$"
 # 会话删除墓碑在 Redis 中的 key 前缀（配置 REDIS_URL 时跨实例共享）
@@ -3628,6 +3629,7 @@ def create_app(model: Any = None) -> FastAPI:
         import asyncio
 
         from utils.user_import import (
+            drop_sessions,
             import_user_data,
             parse_user_export_data,
             preview_user_import,
@@ -3701,30 +3703,9 @@ def create_app(model: Any = None) -> FastAPI:
                 errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
             for session_id in sorted(reserved_sessions):
                 errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
-            if skipped_sessions:
-                sections["messages"] = [
-                    message
-                    for message in sections["messages"]
-                    if message["session_id"] not in skipped_sessions
-                ]
-                sections["titles"] = {
-                    session_id: title
-                    for session_id, title in sections["titles"].items()
-                    if session_id not in skipped_sessions
-                }
-                sections["pinned"] = [
-                    session_id
-                    for session_id in sections["pinned"]
-                    if session_id not in skipped_sessions
-                ]
-                sections["archived"] = [
-                    session_id
-                    for session_id in sections["archived"]
-                    if session_id not in skipped_sessions
-                ]
-                for trip in sections["trips"]:
-                    if trip.get("session_id") in skipped_sessions:
-                        trip["session_id"] = None
+            # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
+            # 共用同一实现，两条恢复路径不再有语义差）
+            drop_sessions(sections, skipped_sessions)
 
             def _run_import() -> dict[str, Any]:
                 store = _open_long_term(user_id, strict=True)

@@ -895,6 +895,78 @@ def test_import_matches_unpadded_stored_trip_dates():
     print("✓ 未补零日期的既有行程不再被重复新增")
 
 
+def test_parse_rejects_deeply_nested_preference_value():
+    """近递归上限的嵌套偏好值按非法值拒绝，不能以 RecursionError 崩溃 CLI。
+
+    深度取 200：Python 3.10 的 json 编码器在约 1000 层就会自身抛
+    RecursionError（用例本身无法构造 payload）；200 层同样超过合法偏好
+    应支持的层级，足以覆盖「递归解析先于 json 护栏溢出」的路径。
+    """
+    value: object = "x"
+    for _ in range(200):
+        value = [value]
+    payload = {"preferences": {"hotel_brands": value}}
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert "hotel_brands" not in sections.get("preferences", {}), sections
+    assert any("嵌套过深" in error for error in errors), errors
+    print("✓ 深嵌套偏好值按非法值拒绝")
+
+
+def test_runner_skips_reserved_and_deleted_sessions(monkeypatch):
+    """CLI user-import 与 Web 同一口径：保留字 / 墓碑期会话不能被恢复写回。"""
+    from utils import tombstones
+
+    payload = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "保留字会话",
+                "timestamp": "2026-11-01T09:00:00",
+                "session_id": "export",
+            },
+            {
+                "role": "user",
+                "content": "刚删除的会话",
+                "timestamp": "2026-11-01T09:01:00",
+                "session_id": "s-del",
+            },
+            {
+                "role": "user",
+                "content": "正常会话",
+                "timestamp": "2026-11-01T09:02:00",
+                "session_id": "s-ok",
+            },
+        ],
+        "session_titles": {"export": "坏标题", "s-del": "删掉", "s-ok": "好标题"},
+        "pinned_sessions": ["export", "s-del"],
+        "trip_history": [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2027-01-01",
+                "session_id": "export",
+            }
+        ],
+    }
+    path = _write_json(payload)
+    store = _real_store("u-cli-skip")
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id: session_id == "s-del",
+    )
+    code, out = _run_import(monkeypatch, "u-cli-skip", path, store, as_json=True)
+    result = json.loads(out)
+    assert code == 0, out
+    assert any("保留字" in item for item in result["skipped"]), result
+    assert any("最近被删除" in item for item in result["skipped"]), result
+    ids = {msg.get("session_id") for msg in store.get_chat_history(limit=None)}
+    assert ids == {"s-ok"}, ids
+    trips = store.get_trip_history(limit=None)
+    assert trips and trips[0].get("session_id") in (None, ""), trips
+    print("✓ user-import 跳过保留字 / 墓碑期会话")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -918,6 +990,7 @@ if __name__ == "__main__":
     test_import_matches_unpadded_stored_trip_dates()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
+    test_parse_rejects_deeply_nested_preference_value()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,
@@ -929,6 +1002,7 @@ if __name__ == "__main__":
         test_runner_recovers_knowledge_only_backup,
         test_parse_user_export_tolerates_recursion_error,
         test_parse_truncation_drops_split_knowledge_group,
+        test_runner_skips_reserved_and_deleted_sessions,
     ):
         mp = pytest.MonkeyPatch()
         try:

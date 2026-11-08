@@ -75,8 +75,28 @@ def test_fallback_title_escaped_like_custom():
     print("✓ 回退标题与自定义标题同一清洗口径")
 
 
+def test_group_sessions_uses_max_timestamp_within_session():
+    """恢复旧备份后转录末尾不是最新消息：排序与「最近更新」必须用会话内最大值。"""
+    messages = [
+        _msg("user", "最新问题", "s1", "2026-11-05T10:00:00"),
+        _msg("assistant", "最新回答", "s1", "2026-11-05T10:01:00"),
+        # 恢复的旧消息按导出顺序追加在末尾（时间更早）
+        _msg("user", "旧问题", "s1", "2026-01-01T10:00:00"),
+        _msg("user", "中间会话", "s2", "2026-03-01T10:00:00"),
+    ]
+    grouped = group_sessions(messages)
+    assert [session_id for session_id, _ in grouped] == ["s1", "s2"], (
+        "按会话内最大时间戳排序，不能按转录最后一条"
+    )
+    text, count = render_all_sessions_markdown("u1", messages)
+    assert count == 2
+    assert "- 最近更新：2026-11-05T10:01:00" in text
+    print("✓ 会话排序与最近更新取会话内最大时间戳")
+
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
     test_fallback_title_escaped_like_custom()
+    test_group_sessions_uses_max_timestamp_within_session()
     print("\n全部通过")
