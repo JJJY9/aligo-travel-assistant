@@ -558,12 +558,12 @@ def _regroup_exported_documents(
         group = str(metadata.get("group") or "")
         try:
             parts = int(metadata.get("parts") or 1)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             parts = 1
         if group and parts > 1:
             try:
                 part_no = int(metadata.get("part") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 part_no = 0
             grouped.setdefault(group, []).append((part_no, item))
             if group not in ordered_groups:
@@ -589,7 +589,7 @@ def _regroup_exported_documents(
             try:
                 part_no = int(metadata.get("part") or 0)
                 declared = max(declared, int(metadata.get("parts") or 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 part_no = 0
             if declared > _GROUP_PARTS_MAX:
                 raise ValueError(
@@ -1016,6 +1016,33 @@ def import_documents(
                     existing_counts.update(consumed)
                     duplicate += len(missing)
                     continue
+                # 缺失分片同样要校验组内 part 号是否已被其它内容占用：
+                # 库里的同组旧分片内容被改过时其 part 号仍占着，直接补写
+                # 同号分片会产生重复 part 的畸形组（之后整份备份再也导不进去）
+                if layout is not None and doc_group:
+                    occupied_parts = {
+                        old_part
+                        for old_group, old_part, _ in layout.values()
+                        if old_group == doc_group and old_part
+                    }
+                    missing_parts: set[int] = set()
+                    for chunk in missing:
+                        chunk_meta = chunk.get("metadata") or {}
+                        try:
+                            want_part = int(chunk_meta.get("part") or 0)
+                        except (TypeError, ValueError, OverflowError):
+                            want_part = 0
+                        if want_part:
+                            missing_parts.add(want_part)
+                    if missing_parts & occupied_parts:
+                        logger.warning(
+                            "备份中的文档组 %s 缺失分片的 part 号已被库内其它内容"
+                            "占用，已跳过该组：请整份编辑或 kb-delete --group 后重新导入",
+                            doc_group,
+                        )
+                        existing_counts.update(consumed)
+                        duplicate += len(missing)
+                        continue
             # 部分分片已存在（上次导入中途失败 / 组内重复）：只补缺失分片，
             # 补写后组内成员按内容齐全——整组跳过会把残缺组永久留在库里
             if len(missing) != len(doc_chunks):

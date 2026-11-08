@@ -1174,6 +1174,62 @@ def test_import_skips_restore_group_with_layout_conflict(monkeypatch):
     print("✓ 布局冲突的还原组整组跳过")
 
 
+def test_import_tolerates_non_finite_parts_metadata(monkeypatch):
+    """备份 metadata 的 parts/part 为非有限数（Infinity）时不能 OverflowError。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    result = knowledge_admin.import_documents(
+        [
+            {
+                "content": "甲" * 100,
+                "metadata": {
+                    "group": "g-inf",
+                    "parts": float("inf"),
+                    "part": float("inf"),
+                },
+            }
+        ],
+        dry_run=True,
+    )
+    assert result["would_import"] == 1, result
+    print("✓ 非有限数分片声明按单条处理（不再 OverflowError）")
+
+
+def test_import_missing_part_conflict_skips_group(monkeypatch):
+    """同组旧分片内容被改过时，缺失分片的 part 号仍被占用：整组跳过不产生重复 part。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    first = "甲" * 300
+    modified = "乙改" * 200
+    backup_first = "甲" * 300
+    backup_second = "乙" * 300
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: {first, modified}
+    )
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {first: ("g-dup", 1, 2), modified: ("g-dup", 2, 2)},
+    )
+    documents = [
+        {
+            "content": backup_first,
+            "metadata": {"group": "g-dup", "part": "1", "parts": "2"},
+        },
+        {
+            "content": backup_second,
+            "metadata": {"group": "g-dup", "part": "2", "parts": "2"},
+        },
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_duplicate"] == 2, result
+    print("✓ 缺失分片 part 号被占用时整组跳过")
+
+
 def test_import_invalid_group_member_skips_group_not_batch(monkeypatch):
     """组内有一个无效分片：整组跳过，其它合法文档照常导入（备份不整体失败）。"""
     from pathlib import Path
