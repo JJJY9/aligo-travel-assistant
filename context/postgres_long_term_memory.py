@@ -942,29 +942,32 @@ class PostgresLongTermMemory:
             destination = merged.get("destination")
             start_date = str(merged.get("start_date") or "")
             if destination and start_date:
+                from utils.trip_import import normalize_identity_date
+
                 # 与 save_trip_history / JSON 后端 _find_same_trip 的去重口径
-                # 一致：出发地为空按 ''、缺返程（NULL 或空串）按出发日归一
-                same = self._fetchone(
-                    """
-                    SELECT id FROM aligo_trips
-                    WHERE user_id = %s
-                      AND id <> %s
-                      AND destination = %s
-                      AND COALESCE(origin, '') = %s
-                      AND start_date = %s
-                      AND COALESCE(NULLIF(end_date, ''), start_date) = %s
-                    LIMIT 1
-                    """,
-                    (
-                        self.user_id,
-                        row[0],
-                        destination,
-                        str(merged.get("origin") or ""),
-                        start_date,
-                        str(merged.get("end_date") or start_date),
-                    ),
+                # 一致：历史行可能是未补零日期（2026-1-5），SQL 等值比较会把
+                # 补零后的更新当成不重复；按路线取候选行后在 Python 侧归一比对
+                candidates = self._fetchall(
+                    "SELECT id, start_date, end_date FROM aligo_trips "
+                    "WHERE user_id = %s AND destination = %s "
+                    "AND COALESCE(origin, '') = %s",
+                    (self.user_id, destination, str(merged.get("origin") or "")),
                 )
-                if same:
+                want_start = normalize_identity_date(start_date)
+                want_end = normalize_identity_date(
+                    str(merged.get("end_date") or start_date)
+                )
+                duplicate = any(
+                    candidate[0] != row[0]
+                    and normalize_identity_date(candidate[1]) == want_start
+                    and (
+                        normalize_identity_date(candidate[2])
+                        or normalize_identity_date(candidate[1])
+                    )
+                    == want_end
+                    for candidate in candidates
+                )
+                if duplicate:
                     raise ValueError("已存在相同行程（同路线 + 同起止日期）")
 
             updates = {

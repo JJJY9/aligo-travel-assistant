@@ -43,7 +43,14 @@ def _trip(destination="上海", start="2026-12-05", end="2026-12-07"):
 
 
 def _run(
-    user_id, target=None, to_stdout=False, force=False, ics=False, query="", html=False
+    user_id,
+    target=None,
+    to_stdout=False,
+    force=False,
+    ics=False,
+    query="",
+    html=False,
+    status="",
 ):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -55,6 +62,7 @@ def _run(
             ics=ics,
             query=query,
             html=html,
+            status=status,
         )
     return code, buf.getvalue()
 
@@ -276,6 +284,7 @@ def test_parse_export_args_ics_flag(monkeypatch):
         False,
         True,
         "",
+        "",
     )
     assert cli._parse_export_args(["out.ics", "--ics"], allow_ics=True) == (
         "out.ics",
@@ -283,14 +292,15 @@ def test_parse_export_args_ics_flag(monkeypatch):
         False,
         True,
         "",
+        "",
     )
     assert cli._parse_export_args(["--ics"]) is None, "sessions-export 不接受 --ics"
     assert cli._parse_export_args(
         ["--ics", "--query", "上海"], allow_ics=True
-    ) == (None, False, False, True, "上海")
+    ) == (None, False, False, True, "上海", "")
     assert cli._parse_export_args(
         ["--query=会议"], allow_ics=True
-    ) == (None, False, False, False, "会议")
+    ) == (None, False, False, False, "会议", "")
     assert cli._parse_export_args(["--query", "--ics"], allow_ics=True) is None
     assert cli._parse_export_args(["--query"]) is None
     assert cli._parse_export_args(["--query", "x"]) is None, "sessions-export 不接受 --query"
@@ -397,6 +407,52 @@ def test_main_dispatch_query(monkeypatch):
     print("✓ dispatch 层 trips-export --query 过滤导出")
 
 
+def test_export_status_filter(monkeypatch):
+    """trips-export --status 与面板 / trips 列表同一口径过滤。"""
+    import datetime as dt
+    import tempfile
+
+    today = dt.date.today()
+
+    def _d(days):
+        return (today + dt.timedelta(days=days)).isoformat()
+
+    fake = _FakeStore(
+        [
+            _trip("上海", _d(-10), _d(-9)),  # 已结束
+            _trip("杭州", _d(-1), _d(1)),  # 进行中
+            _trip("广州", _d(10), _d(11)),  # 即将出行
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    target = os.path.join(tempfile.mkdtemp(), "trips.csv")
+    code, out = _run("u1", target=target, status="upcoming")
+    assert code == 0
+    assert "已导出 1 条行程" in out and "状态「即将出行」" in out
+    with open(target, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "广州" in text and "上海" not in text and "杭州" not in text
+    print("✓ trips-export 按状态过滤")
+
+
+def test_export_status_arg_parsing():
+    """--status 只对 trips-export 生效，非法状态按用法错误拒绝。"""
+    assert cli._parse_export_args(["--status", "past"], allow_ics=True) == (
+        None,
+        False,
+        False,
+        False,
+        "",
+        "past",
+    )
+    assert cli._parse_export_args(["--status=已结束"], allow_ics=True) is not None
+    assert cli._parse_export_args(["--status", "bogus"], allow_ics=True) is None
+    assert cli._parse_export_args(["--status", "past"]) is None, (
+        "其它导出命令不接受 --status"
+    )
+    print("✓ --status 参数解析")
+
+
 if __name__ == "__main__":
     for case in (
         test_export_to_file,
@@ -414,10 +470,12 @@ if __name__ == "__main__":
         test_main_dispatch_query,
         test_export_html,
         test_main_dispatch_html_and_conflict,
+        test_export_status_filter,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
+    test_export_status_arg_parsing()
     print("\n全部通过")
