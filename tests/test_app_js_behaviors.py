@@ -162,6 +162,18 @@ def test_knowledge_actions_arbitrate_shared_result_bar():
     print("✓ 知识库工具栏动作结果条序号仲裁")
 
 
+def test_trip_import_file_decoding_and_size_guard():
+    """行程导入文件：UTF-8 / GBK（Excel 导出）自动解码，超大文件不读取不发请求。"""
+    results = _run_harness("decode")
+    assert results["utf8"] == "目的地,杭州"
+    assert results["gbk"] == "目的地,上海", "GBK CSV 必须回退 gb18030 解码"
+    assert results["oversize_toasts"] == [
+        "文件过大（上限 2 MB），请拆分后再导入"
+    ]
+    assert results["oversize_requests"] == 0, "超大文件不应读取或发请求"
+    print("✓ 行程导入文件解码与大小限制")
+
+
 def test_knowledge_eval_panel_states():
     """「检索评测」按钮：达标 / 低基线+告警 / 失败三种状态与标黄逻辑。"""
     results = _run_harness("eval")
@@ -190,5 +202,6 @@ if __name__ == "__main__":
     test_knowledge_duplicates_panel_states()
     test_knowledge_dedupe_panel_states()
     test_knowledge_actions_arbitrate_shared_result_bar()
+    test_trip_import_file_decoding_and_size_guard()
     test_knowledge_eval_panel_states()
     print("\n全部通过")

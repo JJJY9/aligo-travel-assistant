@@ -562,6 +562,33 @@ async function scenarioArbitrate(source) {
   };
 }
 
+async function scenarioDecode(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const decode = runIn(env, "decodeImportFile");
+  const importFile = runIn(env, "importTripsFromFile");
+  const gbkBytes = [196, 191, 181, 196, 181, 216, 44, 201, 207, 186, 163];
+  const utf8Bytes = Array.from(Buffer.from("目的地,杭州", "utf8"));
+  const results = {};
+  results.gbk = await decode({
+    size: gbkBytes.length,
+    arrayBuffer: async () => new Uint8Array(gbkBytes).buffer,
+  });
+  results.utf8 = await decode({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  });
+  await importFile({
+    size: 2 * 1024 * 1024 + 1,
+    arrayBuffer: async () => {
+      throw new Error("超大文件不应读取");
+    },
+  });
+  results.oversize_toasts = run("__toasts.slice()");
+  results.oversize_requests = run("__requests.length");
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -584,6 +611,8 @@ async function main() {
     payload = await scenarioDedupe(source);
   } else if (scenario === "arbitrate") {
     payload = await scenarioArbitrate(source);
+  } else if (scenario === "decode") {
+    payload = await scenarioDecode(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
