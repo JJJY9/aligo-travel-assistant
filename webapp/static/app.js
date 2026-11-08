@@ -2133,6 +2133,9 @@ async function loadMoreSessions() {
     state.sessionTotal = Number(data.total || state.sessionTotal);
     renderHistory();
   } catch (error) {
+    // 已作废的分页请求（新搜索 / 归档切换 / 新刷新）失败不能弹在当前视图上
+    if (requestId !== sessionsRequestId) return;
+    if (viewQuery !== state.searchQuery || viewArchived !== state.showArchived) return;
     toast(error.message);
   }
 }
@@ -2203,9 +2206,11 @@ async function openSession(sessionId, options = {}) {
     }
     closeMobileSidebar();
   } catch (error) {
+    // 请求已被新对话 / 会话切换作废：过期的失败不能在当前界面弹提示
+    if (token !== sessionLoadToken || state.busy) return;
     if (!options.silent) {
       toast(`加载会话失败：${error.message}`);
-    } else if (!options.keepOnError && token === sessionLoadToken) {
+    } else if (!options.keepOnError) {
       // 启动恢复失败（服务重启 / 网络抖动）：丢弃旧会话 ID，避免下一条消息
       // 被写进界面从未展示过的隐藏会话。后台静默刷新（停止生成后的同步）
       // 传 keepOnError，临时失败不能把已知存在的会话从界面上清掉
