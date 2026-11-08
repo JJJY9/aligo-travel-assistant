@@ -125,6 +125,24 @@ def test_parse_missing_columns_and_empty():
     print("✓ 缺列 / 空文件报错")
 
 
+def test_csv_malformed_quote_reports_error_instead_of_merging():
+    """引号错位时非严格模式会把后续行静默合并成一条记录、零错误导入：
+
+    strict=True 必须改为带行号的解析错误，已解析的有效行保留。
+    """
+    text = (
+        "出发地,目的地,出发日期\n"
+        "北京,上海,2026-12-01\n"
+        'C,"D,2026-01-02\n'
+        'X,"Y,2026-01-03"\n'
+    )
+    rows, errors = parse_trips_csv(text)
+    assert [row["destination"] for row in rows] == ["上海"], rows
+    assert errors, "引号错位必须报错，不能把两行静默合并成一条行程"
+    assert "CSV 解析失败" in errors[0][1], errors
+    print("✓ CSV 引号错位报错而非静默合并")
+
+
 def test_runner_imports_and_dedupes(monkeypatch):
     store = _ImportStore()
     monkeypatch.setattr(
@@ -914,6 +932,7 @@ if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
     test_parse_missing_columns_and_empty()
+    test_csv_malformed_quote_reports_error_instead_of_merging()
     test_ics_roundtrip_matches_export()
     test_ics_unfold_and_lf_only()
     test_ics_collects_invalid_events()

@@ -70,7 +70,10 @@ def _strict_date(value: str) -> "datetime | None":
 
 def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
     """解析并校验行程 CSV，返回 ``(有效行程, [(行号, 原因)])``（行号从 2 起）。"""
-    reader = csv.reader(io.StringIO(text))
+    # strict=True：引号错位（如 `C,"D,2026-01-02` 后跟另一行带引号）时
+    # 非严格模式会把后续多行静默合并成一条记录、零错误地导入错数据；
+    # 严格模式走下面的 csv.Error 分支，保留已解析行并报出行号
+    reader = csv.reader(io.StringIO(text), strict=True)
     try:
         header = next(reader)
     except StopIteration:

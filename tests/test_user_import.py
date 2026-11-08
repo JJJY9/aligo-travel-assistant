@@ -1205,6 +1205,57 @@ def test_parse_drops_broken_knowledge_groups_and_bad_metadata():
     print("✓ 知识元数据文本门禁与残缺组整组丢弃")
 
 
+def test_parse_drops_knowledge_group_with_absurd_parts():
+    """parts 声明无上限时 set(range(1, parts+1)) 会被 1e9 撑爆内存：
+
+    百字节备份即可触发 OOM，必须在构造 range 之前按异常组整组丢弃。
+    """
+    payload = {
+        "knowledge": [
+            {
+                "content": "异常分片",
+                "metadata": {
+                    "group": "gBoom",
+                    "part": "1",
+                    "parts": "1000000000",
+                },
+            },
+            {"content": "正常文档", "metadata": {}},
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [item["content"] for item in sections["knowledge"]] == ["正常文档"]
+    assert any("分片数声明异常" in error for error in errors), errors
+    print("✓ 异常 parts 声明整组丢弃（不构造巨型 range）")
+
+
+def test_parse_rejects_escaped_surrogate_in_assistant_json():
+    """转义形态的孤立代理项 / NUL 绕过原文门禁：
+
+    assistant 内容里的 ``\\ud800`` 在原文中是 ASCII，解析后才是孤立代理项，
+    渲染 / 导出 / 总结每次编码都失败（会话永久 500），必须在导入时拒绝。
+    """
+    bad_surrogate = (
+        '{"results": [{"reply": "\\ud800"}], "_meta": {"agents": []}}'
+    )
+    bad_nul = (
+        '{"results": [{"reply": "a\\u0000b"}], "_meta": {"agents": []}}'
+    )
+    good = '{"results": [{"reply": "正常回答"}], "_meta": {"agents": []}}'
+    payload = {
+        "chat_history": [
+            {"role": "assistant", "content": bad_surrogate, "session_id": "s1"},
+            {"role": "assistant", "content": bad_nul, "session_id": "s1"},
+            {"role": "assistant", "content": good, "session_id": "s1"},
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [m["content"] for m in sections["messages"]] == [good]
+    assert any("孤立代理项" in error for error in errors), errors
+    assert any("NUL" in error for error in errors), errors
+    print("✓ 转义代理项 / NUL 的 assistant 内容在导入时被拒绝")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -1237,6 +1288,8 @@ if __name__ == "__main__":
     test_parse_rejects_bad_trip_date_text()
     test_extreme_timestamps_fall_back_to_restore_time()
     test_parse_drops_broken_knowledge_groups_and_bad_metadata()
+    test_parse_drops_knowledge_group_with_absurd_parts()
+    test_parse_rejects_escaped_surrogate_in_assistant_json()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,
