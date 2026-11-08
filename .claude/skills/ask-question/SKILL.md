@@ -39,15 +39,22 @@ async def ask_question(user_query: str):
         max_tokens=LLM_CONFIG.get("max_tokens", 2000),
     )
     # 嵌入模型路径从 config.RAG_CONFIG 读取，默认 data/models/bge-small-zh-v1.5
+    # 知识库目录默认解析为 .claude/skills/ask-question/data/rag_knowledge
+    # （Web / CLI / doctor 共用 utils.knowledge_paths.default_knowledge_dir，
+    # 只有需要自定义位置时才显式传 knowledge_base_path）
     rag_agent = RAGKnowledgeAgent(
         name="RAGKnowledgeAgent",
         model=model,
-        knowledge_base_path="./data/rag_knowledge",
         collection_name="business_travel_knowledge",
         top_k=3,
     )
     if not getattr(rag_agent, "initialized", True):
-        return {"error": "RAG 未初始化，请先运行 python scripts/init_knowledge_base.py"}
+        return {
+            "error": (
+                "RAG 未初始化，请先运行 "
+                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+            )
+        }
     user_msg = Msg(name="user", content=user_query, role="user")
     result = await rag_agent.reply(user_msg)
     return json.loads(result.content) if isinstance(result.content, str) else result.content

@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from agentscope.agent import AgentBase
@@ -39,6 +40,14 @@ _AGENT_TIMEOUT_SEC = 300.0
 _AGENT_RETRY_MAX = 1
 _AGENT_RETRY_BASE_DELAY = 1.0
 _AGENT_RETRY_MAX_DELAY = 5.0
+
+# 懒加载专用执行器：RAG 首次构造会在全局锁内 import torch 并加载（或联网
+# 下载）嵌入模型；放进默认线程池会在冷启动时占满 min(32, CPU+4) 个 token，
+# 把对话限流 / 记忆读写 / 会话构造等所有 asyncio.to_thread 一起阻塞。
+# 超时只中断等待、线程本身仍占着——隔离到小池后阻塞范围限定在加载自身。
+_AGENT_LOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="aligo-agent-load"
+)
 
 # 行程规划依赖事项收集与偏好抽取的结果：两者同批时规划拿不到这些上下文
 _PLANNING_DEPENDENCIES = {"event_collection", "preference"}
@@ -665,7 +674,9 @@ class OrchestrationAgent(AgentBase):
             # 约束，卡在导入 / 模型加载上也不会无限占用整轮与该用户的会话锁
             async def _load_and_reply() -> Any:
                 agent = await asyncio.get_running_loop().run_in_executor(
-                    None, self.agent_registry.__getitem__, agent_name
+                    _AGENT_LOAD_EXECUTOR,
+                    self.agent_registry.__getitem__,
+                    agent_name,
                 )
 
                 async def _reply_once() -> Any:
@@ -785,6 +796,21 @@ class OrchestrationAgent(AgentBase):
 
         return aggregated
 
+    @staticmethod
+    def _merged_skill_payload(data: Any) -> dict[str, Any]:
+        """技能结果的实际负载：兼容模型把字段再套一层 ``{"data": {...}}``。
+
+        展示层（result_formatter）与 CLI 都显式读取 ``data.data`` 里的
+        itinerary / 事项字段；落库路径只看顶层会让「界面显示完整行程、
+        trip_history 却没有记录」。
+        """
+        if not isinstance(data, dict):
+            return {}
+        nested = data.get("data")
+        merged: dict[str, Any] = dict(nested) if isinstance(nested, dict) else {}
+        merged.update({key: value for key, value in data.items() if key != "data"})
+        return merged
+
     def _update_memory(self, intention_data: dict[str, Any], results: list[dict]):
         """
         更新记忆系统
@@ -881,7 +907,8 @@ class OrchestrationAgent(AgentBase):
                 # 不能写入历史/统计/日历
                 if result["result"].get("status") != "success":
                     continue
-                itinerary = data.get("itinerary", {})
+                # 兼容 {"data": {"itinerary": ...}} 的嵌套形状（与展示层同口径）
+                itinerary = self._merged_skill_payload(data).get("itinerary", {})
 
                 # 只要有行程信息就保存（不管是否完全规划好）
                 if itinerary:
@@ -889,7 +916,9 @@ class OrchestrationAgent(AgentBase):
                     event_data = {}
                     for r in results:
                         if r["agent_name"] == "event_collection":
-                            event_data = r["result"].get("data", {})
+                            event_data = self._merged_skill_payload(
+                                r["result"].get("data", {})
+                            )
                             break
 
                     # 从 event_data 获取行程信息；模型可能给出列表（多目的地）

@@ -541,7 +541,15 @@ class AligoCLI:
 
             # 处理失败的智能体
             if status == "error":
-                error_msg = data.get("error") or data.get("message") or "未知错误"
+                # 聚合结果条目上的 message 携带真实原因（query-info 等把错误
+                # 嵌套在 data.results 里，_run_agent 已提取到条目 message），
+                # 与 Web / 历史渲染同一取值顺序
+                error_msg = (
+                    data.get("error")
+                    or data.get("message")
+                    or result.get("message")
+                    or "未知错误"
+                )
                 agent_display_name = self._get_agent_display_name(agent_name)
                 self.console.print(
                     f"❌ {escape(str(agent_display_name))}执行失败: {escape(str(error_msg))}",

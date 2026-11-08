@@ -878,6 +878,45 @@ def test_preference_render_skips_unmanageable_keys():
     print("✓ 偏好回显跳过不可管理的键")
 
 
+def test_trip_saved_from_nested_data_payload():
+    """{"data": {...}} 嵌套形状（展示层已兼容）同样写进行程历史。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "data": {
+                            "origin": "北京",
+                            "destination": "杭州",
+                            "start_date": "2026-12-01",
+                            "trip_purpose": "出差",
+                        }
+                    },
+                },
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "data": {"itinerary": {"title": "杭州行", "daily_plans": []}}
+                    },
+                },
+            },
+        ],
+    )
+    trips = memory.long_term.get_trip_history(limit=5)
+    assert trips and trips[-1]["destination"] == "杭州", trips
+    print("✓ data.data 嵌套的行程同样落库")
+
+
 def test_malformed_schedule_is_sanitized():
     """字符串项 / 非法 priority 的调度计划不应让整轮对话崩溃"""
     orchestrator = OrchestrationAgent(
