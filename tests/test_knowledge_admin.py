@@ -780,6 +780,34 @@ def test_import_regroups_exported_chunks(monkeypatch):
     print("✓ 导入按 group 重新合并导出分片")
 
 
+def test_regroup_requires_multiset_coverage(monkeypatch):
+    """组内两片同文、库里只有一份：不能算整组已存在（多重集语义）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"同文片段"})
+    # 库里那一份是上次导入中途失败留下的 part 1（同组、同布局）：允许补齐 part 2
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {"同文片段": ("g-multi", 1, 2)},
+    )
+    documents = [
+        {
+            "content": "同文片段",
+            "metadata": {"group": "g-multi", "part": "1", "parts": "2"},
+        },
+        {
+            "content": "同文片段",
+            "metadata": {"group": "g-multi", "part": "2", "parts": "2"},
+        },
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 1, result
+    assert result["skipped_duplicate"] == 1, result
+    print("✓ 整组跳过按多重集判定（同文缺片仍补齐）")
+
+
 def test_import_skips_fully_existing_group(monkeypatch):
     """整组已完整存在于库中时整组跳过，重复导入备份不产生新记录。"""
     from pathlib import Path
