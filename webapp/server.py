@@ -1317,6 +1317,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         state.kb_limiter,
         state.weather_limiter,
         state.import_limiter,
+        state.read_limiter,
     )
     degraded = any(_limiter_degraded(limiter) for limiter in limiters) or (
         backend == "memory" and configured
@@ -1330,6 +1331,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         "kb_limit": state.kb_limiter.limit,
         "kb_import_limit": state.import_limiter.limit,
         "weather_limit": state.weather_limiter.limit,
+        "read_limit": state.read_limiter.limit,
         "window_sec": state.rate_limiter.window_sec,
     }
 
