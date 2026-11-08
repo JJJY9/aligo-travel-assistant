@@ -596,9 +596,41 @@ def test_migrate_drops_non_object_entries():
     memory = LongTermMemory("u-bad-entry", storage_dir)
     assert len(memory.get_chat_history()) == 1
     assert memory.get_trip_history(limit=None) == []
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 1, "丢弃坏条目后计数与列表同步"
+    assert stats["total_trips"] == 0
     memory.add_chat_message("user", "again", "s1")
     assert len(memory.get_chat_history()) == 2
     print("✓ 非对象历史记录在迁移时被丢弃")
+
+
+def test_migrate_recomputes_counters_after_dropping_entries():
+    """坏条目被丢弃后旧总数不能保留（统计会永久偏大）。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-bad-count.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    None,
+                    {"role": "user", "content": "hi", "session_id": "s1"},
+                ],
+                "trip_history": [7],
+                "statistics": {
+                    "total_messages": 5,
+                    "total_trips": 3,
+                    "total_queries": 9,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-bad-count", storage_dir)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 1, stats
+    assert stats["total_trips"] == 0, stats
+    assert stats["total_queries"] == 9, "与列表无关的计数保持原值"
+    print("✓ 丢弃坏条目后重算 total_messages / total_trips")
 
 
 def test_migrate_missing_last_trip_number_is_not_destructive():
@@ -1707,6 +1739,49 @@ def test_pg_retry_does_not_replay_non_idempotent_write():
     print("✓ PG 非幂等写入不重放、幂等操作重试")
 
 
+def test_pg_non_idempotent_call_sites_disable_replay():
+    """消息 / 计数 / 行程 INSERT 与 delete_last_turn 的 DELETE 都禁止自动重放。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-replay"
+    recorded: list[tuple[str, bool]] = []
+    memory._execute = lambda sql, params=None, replay_safe=True: recorded.append(
+        (sql, replay_safe)
+    )
+    memory.add_chat_message("user", "hi", "s1")
+    memory.add_chat_message(
+        "user", "hi", "s1", timestamp="2026-01-01T00:00:00"
+    )
+    memory.increment_query_count()
+    for sql, flag in recorded:
+        assert flag is False, sql
+    assert len(recorded) == 3
+
+    memory._advisory_lock = lambda name: contextlib.nullcontext()
+    memory._next_trip_number = lambda: 7
+    memory._fetchall = lambda sql, params=None: []
+    memory.save_trip_history({"destination": "上海", "start_date": "2026-01-01"})
+    insert_calls = [
+        (sql, flag) for sql, flag in recorded if "INSERT INTO aligo_trips" in sql
+    ]
+    assert insert_calls and insert_calls[-1][1] is False, insert_calls
+
+    delete_calls: list[bool] = []
+    memory._fetchall = lambda sql, params=None: [
+        (2, "assistant", "a"),
+        (1, "user", "q"),
+    ]
+    memory._run_with_retry = (
+        lambda op, replay_safe=True: delete_calls.append(replay_safe) or 1
+    )
+    assert memory.delete_last_turn("s1", expect="q") == 1
+    assert delete_calls == [False], "delete_last_turn 的 DELETE 不能自动重放"
+    print("✓ PG 非幂等写路径全部禁止自动重放")
+
+
 def test_pg_add_chat_turn_locks_before_guard():
     """add_chat_turn 在同一事务内先锁会话元数据、再调守卫、最后插入。
 
@@ -2269,6 +2344,7 @@ if __name__ == "__main__":
     test_migrate_fills_statistics_defaults()
     test_migrate_repairs_bad_statistics_values()
     test_migrate_drops_non_object_entries()
+    test_migrate_recomputes_counters_after_dropping_entries()
     test_pg_reconnects_after_connection_error()
     test_pg_failed_retry_wrapped_as_memory_error()
     test_falsey_preferences_included_in_context()
@@ -2309,6 +2385,7 @@ if __name__ == "__main__":
     test_reload_long_term_respects_backend()
     test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
     test_pg_retry_does_not_replay_non_idempotent_write()
+    test_pg_non_idempotent_call_sites_disable_replay()
     test_pg_add_chat_turn_locks_before_guard()
     test_pg_save_trip_histories_batches_with_one_index()
     test_json_add_chat_turn_guard_runs_under_write_lock()

@@ -338,6 +338,12 @@ class LongTermMemory:
                     len(data[list_key]) - len(cleaned),
                 )
                 destructive = True
+                # 计数与列表同步：丢弃坏条目后各删除路径按差值扣减，
+                # 旧总数会让统计永久偏大（总数与列表长度必须一致）
+                if list_key == "chat_history":
+                    stats["total_messages"] = len(cleaned)
+                else:
+                    stats["total_trips"] = len(cleaned)
             data[list_key] = cleaned
         if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []

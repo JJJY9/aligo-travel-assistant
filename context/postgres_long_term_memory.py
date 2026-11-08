@@ -172,12 +172,14 @@ class PostgresLongTermMemory:
             except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
                 logger.warning("无法创建 trip_id 唯一索引: %s", exc)
 
-    def _execute(self, sql: str, params: tuple | None = None) -> None:
+    def _execute(
+        self, sql: str, params: tuple | None = None, replay_safe: bool = True
+    ) -> None:
         def run() -> None:
             with self._conn.cursor() as cursor:
                 cursor.execute(sql, params)
 
-        self._run_with_retry(run)
+        self._run_with_retry(run, replay_safe=replay_safe)
 
     def _fetchall(self, sql: str, params: tuple | None = None) -> list[tuple]:
         def run() -> list[tuple]:
@@ -367,17 +369,20 @@ class PostgresLongTermMemory:
         timestamp: str | None = None,
     ) -> None:
         if timestamp:
-            # 备份恢复：保留原始时间戳（naive 按本机时区解释）
+            # 备份恢复：保留原始时间戳（naive 按本机时区解释）。
+            # INSERT 非幂等：提交后响应丢失不能自动重放（会产生重复消息）
             self._execute(
                 "INSERT INTO aligo_chat_messages "
                 "(user_id, role, content, session_id, created_at) "
                 "VALUES (%s, %s, %s, %s, %s)",
                 (self.user_id, role, content, session_id, _pg_timestamp(timestamp)),
+                replay_safe=False,
             )
             return
         self._execute(
             "INSERT INTO aligo_chat_messages (user_id, role, content, session_id) VALUES (%s, %s, %s, %s)",
             (self.user_id, role, content, session_id),
+            replay_safe=False,
         )
 
     def add_chat_turn(
@@ -617,8 +622,7 @@ class PostgresLongTermMemory:
                 removed = cursor.rowcount or 0
                 # 会话消息已被删空时同步清理标题 / 置顶 / 归档标记。清理
                 # 无条件执行（语句自带 NOT EXISTS，会话仍有消息时是 no-op）：
-                # DELETE 在连接中断重放后 rowcount 可能为 0（实际已在服务端
-                # 删除），用 removed 做开关会让清理被永久跳过
+                # 即使 DELETE 影响 0 行（并发已删），标记也不该残留
                 for table in (
                     "aligo_session_titles",
                     "aligo_pinned_sessions",
@@ -635,7 +639,9 @@ class PostgresLongTermMemory:
                     )
                 return removed
 
-        removed = self._run_with_retry(_delete_rows)
+        # DELETE 匹配的是「当前最后一轮」：提交后响应丢失时重放可能删掉
+        # 期间新到的同文本回合，不能自动重放（按持久化失败上报）
+        removed = self._run_with_retry(_delete_rows, replay_safe=False)
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
@@ -956,6 +962,8 @@ class PostgresLongTermMemory:
 
         trip_number = self._next_trip_number()
         trip_id = f"trip_{trip_number}"
+        # INSERT 非幂等：提交后响应丢失自动重放会插出重复行（或撞唯一索引
+        # 报错却已写入），按持久化失败上报由调用方整体重试
         self._execute(
             """
             INSERT INTO aligo_trips
@@ -972,6 +980,7 @@ class PostgresLongTermMemory:
                 purpose,
                 trip_info.get("session_id"),
             ),
+            replay_safe=False,
         )
         return trip_id
 
@@ -1165,6 +1174,7 @@ class PostgresLongTermMemory:
     # ---------- 统计 ----------
 
     def increment_query_count(self) -> None:
+        # 计数自增非幂等：提交后响应丢失自动重放会重复计数
         self._execute(
             """
             INSERT INTO aligo_user_stats (user_id, total_queries) VALUES (%s, 1)
@@ -1172,6 +1182,7 @@ class PostgresLongTermMemory:
             DO UPDATE SET total_queries = aligo_user_stats.total_queries + 1
             """,
             (self.user_id,),
+            replay_safe=False,
         )
 
     def get_statistics(self) -> dict[str, Any]:
