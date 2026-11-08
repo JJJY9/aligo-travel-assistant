@@ -605,6 +605,9 @@ async function scenarioDecode(source) {
 
   // 导入进行中：按钮禁用并显示「导入中…」，完成后复位；重复选择被忽略
   run("refreshStatus = async () => {};");
+  run(
+    "__lastConfirm = null; confirm = (message) => { __lastConfirm = message; return true; };"
+  );
   run("__importCalls = 0;");
   run(
     "getJSON = () => { __importCalls += 1; return new Promise((resolve) => { __resolveImport = resolve; }); };"
@@ -628,7 +631,7 @@ async function scenarioDecode(source) {
   });
   results.busy_requests = run("__importCalls");
   run(
-    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 0 })"
+    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 73 })"
   );
   await tick();
   run("__resolveImport({ created: 1, updated: 0, skipped: [] })");
@@ -638,6 +641,7 @@ async function scenarioDecode(source) {
     text: run("els.tripImport.textContent"),
     disabled: run("els.tripImport.disabled"),
     toasts: run("__toasts.slice()"),
+    confirm: run("__lastConfirm"),
   };
 
   // 解码 / 请求期间切换用户：导入仍落在选择文件时的用户

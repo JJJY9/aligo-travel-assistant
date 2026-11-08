@@ -1247,9 +1247,11 @@ async function importTripsFromFile(file) {
     try {
       // 先预览：把将新增 / 更新 / 跳过的数量交给用户确认，避免选错文件直接写库
       const preview = await postImport(true);
-      const previewSkipped = Array.isArray(preview.skipped)
-        ? preview.skipped.length
-        : 0;
+      // 服务端 skipped 列表最多 50 条：确认框里的「跳过」数量要用总数
+      const previewSkipped = Number(
+        preview.skipped_total ??
+          (Array.isArray(preview.skipped) ? preview.skipped.length : 0),
+      );
       const ok = window.confirm(
         `将新增 ${Number(preview.created || 0)} 条、更新 ${Number(
           preview.updated || 0,
