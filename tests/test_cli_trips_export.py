@@ -147,14 +147,14 @@ def test_default_path_and_overwrite(monkeypatch):
 
     code, out = _run("u1")
     assert code == 0
-    path = os.path.join(workdir, "exports", "aligo_trips.csv")
+    path = os.path.join(workdir, "exports", "aligo_u1_trips.csv")
     assert os.path.exists(path)
 
     code, out = _run("u1")
     assert code == 1 and "文件已存在" in out
     code, out = _run("u1", force=True)
     assert code == 0
-    print("✓ 默认路径 exports/aligo_trips.csv 与覆盖保护")
+    print("✓ 默认路径 exports/aligo_u1_trips.csv 与覆盖保护")
 
 
 def test_empty_trips(monkeypatch):
@@ -245,7 +245,7 @@ def test_export_ics(monkeypatch):
 
     code, out = _run("u1", ics=True)
     assert code == 0 and "iCalendar" in out
-    path = os.path.join(workdir, "exports", "aligo_trips.ics")
+    path = os.path.join(workdir, "exports", "aligo_u1_trips.ics")
     assert os.path.exists(path)
     text = open(path, encoding="utf-8").read()
     assert text.startswith("BEGIN:VCALENDAR")
@@ -321,7 +321,7 @@ def test_main_dispatch_ics(monkeypatch):
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert os.path.exists(os.path.join(workdir, "exports", "aligo_trips.ics"))
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_u1_trips.ics"))
     print("✓ dispatch 层 trips-export --ics 正常执行")
 
 
@@ -339,7 +339,7 @@ def test_main_dispatch(monkeypatch):
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert os.path.exists(os.path.join(workdir, "exports", "aligo_trips.csv"))
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_u1_trips.csv"))
     print("✓ dispatch 层 trips-export 正常执行")
 
 
@@ -374,7 +374,7 @@ def test_main_dispatch_html_and_conflict(monkeypatch):
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert os.path.exists(os.path.join(workdir, "exports", "aligo_trips.html"))
+    assert os.path.exists(os.path.join(workdir, "exports", "aligo_u1_trips.html"))
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "trips-export", "u1", "--html", "--ics"]
     )
@@ -400,7 +400,7 @@ def test_main_dispatch_query(monkeypatch):
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    path = os.path.join(workdir, "exports", "aligo_trips.csv")
+    path = os.path.join(workdir, "exports", "aligo_u1_trips.csv")
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
     assert "上海" in text and "杭州" not in text

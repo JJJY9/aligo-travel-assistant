@@ -2932,6 +2932,7 @@ def run_trips_dedupe_standalone(
                     "total_trips": plan["total_trips"],
                     "duplicates": [],
                     "ambiguous_ids": sorted(ambiguous),
+                    "needs_attention": False,
                     "removed": 0,
                 }
             )
@@ -2956,11 +2957,13 @@ def run_trips_dedupe_standalone(
                     "would_remove": len(duplicates),
                     "duplicates": plan["duplicates"],
                     "ambiguous_ids": sorted(ambiguous),
+                    "needs_attention": bool(ambiguous),
                     "removed": 0,
                 }
             )
             if as_json:
-                return 0
+                # dry-run 与正式执行同一退出码语义：存在歧义 id 需人工处理
+                return 1 if ambiguous else 0
             if not duplicates:
                 print(
                     f"用户 {user_id}：没有需要删除的重复行程（共 {plan['total_trips']} 条）"
@@ -2983,7 +2986,7 @@ def run_trips_dedupe_standalone(
                 )
                 print(f"  将删除 {entry['trip_id']}（{route}，{dates}）")
             print("去掉 --dry-run 即可执行删除")
-            return 0
+            return 1 if ambiguous else 0
 
         removed, failure = apply_trip_dedupe(store, plan["duplicate_entries"])
         if as_json:
@@ -3001,6 +3004,7 @@ def run_trips_dedupe_standalone(
                     "removed": removed,
                     "duplicates": plan["duplicates"],
                     "ambiguous_ids": sorted(ambiguous),
+                    "needs_attention": bool(ambiguous),
                 }
             )
             return 1 if ambiguous else 0
@@ -3797,7 +3801,13 @@ def run_session_export_standalone(
         return 0
 
     suffix = ".html" if html else ".md"
-    path = Path(target) if target else Path("exports") / f"aligo_{session_id}{suffix}"
+    # 默认名带上用户：两个用户使用相同会话 ID 时不会互相覆盖（--force）
+    path = (
+        Path(target)
+        if target
+        else Path("exports")
+        / f"aligo_{_safe_export_user(user_id)}_{session_id}{suffix}"
+    )
     if path.exists() and not force:
         print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
         return 1
@@ -3942,9 +3952,10 @@ def run_trips_export_standalone(
         trips = [trip for trip in trips if trip_state_label(trip) == status_label]
 
     skipped = 0
+    safe_user = _safe_export_user(user_id)
     if ics:
         text = render_trips_ics(trips, user_id)
-        default_name = "aligo_trips.ics"
+        default_name = f"aligo_{safe_user}_trips.ics"
         # 按整行统计：行程字段（SUMMARY / DESCRIPTION）里出现的同名字符串
         # 不能把导出条数放大、让"跳过 N 条"失真
         exported = sum(
@@ -3953,11 +3964,11 @@ def run_trips_export_standalone(
         skipped = max(0, len(trips) - exported)
     elif html:
         text = render_trips_html(trips, user_id)
-        default_name = "aligo_trips.html"
+        default_name = f"aligo_{safe_user}_trips.html"
         exported = len(trips)
     else:
         text = render_trips_csv(trips)
-        default_name = "aligo_trips.csv"
+        default_name = f"aligo_{safe_user}_trips.csv"
         exported = len(trips)
     if to_stdout:
         if ics:
