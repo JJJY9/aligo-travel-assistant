@@ -2257,8 +2257,21 @@ def test_knowledge_update_error_mappings(monkeypatch):
     from webapp import server as server_module
 
     client = _client()
+    # 请求省略 metadata 时会先读取现有记录合并（与 CLI kb-update 一致）；
+    # 这里注入存在的片段，错误映射测试不依赖本地知识库文件
+    monkeypatch.setattr(
+        server_module,
+        "get_document",
+        lambda doc_id: {
+            "id": doc_id,
+            "content": "旧内容",
+            "metadata": {"category": "交通"},
+        },
+    )
+    merged = {}
 
     def raise_value(doc_id, content, metadata=None):
+        merged["metadata"] = metadata
         raise ValueError("旧数据没有 group")
 
     monkeypatch.setattr(server_module, "update_document", raise_value)
@@ -2267,6 +2280,7 @@ def test_knowledge_update_error_mappings(monkeypatch):
     )
     assert response.status_code == 400
     assert "旧数据没有 group" in response.json()["detail"]
+    assert merged["metadata"] == {"category": "交通"}, "省略 metadata 应沿用库中现有值"
 
     def raise_missing(doc_id, content, metadata=None):
         raise FileNotFoundError("知识库未初始化")
