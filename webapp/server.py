@@ -93,6 +93,7 @@ from utils.trip_conflicts import find_saved_trip as _find_saved_trip
 from utils.trip_conflicts import trip_conflicts as _trip_conflicts
 from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
+from utils.trip_dedupe import apply_trip_dedupe, plan_trip_dedupe
 from utils.trip_export import (
     render_trip_ics,
     render_trips_csv,
@@ -3982,6 +3983,62 @@ def create_app(model: Any = None) -> FastAPI:
                 **rate_headers,
             },
         )
+
+    @app.post("/api/trips/dedupe")
+    def dedupe_trips_endpoint(
+        user_id: str = Query(..., pattern=_ID_PATTERN),
+        dry_run: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        """清理重复行程（与 CLI ``trips-dedupe`` 同语义）。
+
+        同路线 + 同起止日期视为重复，保留最早一条；``dry_run=1`` 只返回
+        将删除的条目。判定 / 复核 / 删除与 CLI 共用 ``utils.trip_dedupe``，
+        两条入口不会漂移。破坏性操作走 strict 打开：PostgreSQL 配置了但
+        不可用时 503，不在回退 JSON 上「清理成功」。
+        """
+        store = _open_long_term(user_id, strict=True)
+        try:
+            try:
+                plan = plan_trip_dedupe(store)
+            except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
+                logger.warning("读取行程失败（去重，%s）: %s", user_id, exc)
+                raise HTTPException(
+                    status_code=503, detail=f"读取行程失败：{exc}"
+                ) from exc
+            if dry_run:
+                payload: dict[str, Any] = {
+                    "user_id": user_id,
+                    "dry_run": True,
+                    "total_trips": plan["total_trips"],
+                    "would_remove": len(plan["duplicates"]),
+                    "duplicates": plan["duplicates"],
+                    "ambiguous_ids": plan["ambiguous_ids"],
+                    "removed": 0,
+                }
+            else:
+                removed, failure = apply_trip_dedupe(
+                    store, plan["duplicate_entries"]
+                )
+                if failure is not None:
+                    # 部分删除已生效：如实报告已删除数，重试可继续清理剩余
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"删除过程中失败：{failure}（已删除 {removed} 条，"
+                            "可重试）"
+                        ),
+                    )
+                payload = {
+                    "user_id": user_id,
+                    "dry_run": False,
+                    "total_trips": plan["total_trips"],
+                    "removed": removed,
+                    "duplicates": plan["duplicates"],
+                    "ambiguous_ids": plan["ambiguous_ids"],
+                }
+        finally:
+            _close_long_term(store)
+        return payload
 
     @app.get("/api/trips/{trip_id}/calendar")
     def export_trip_calendar(

@@ -209,6 +209,7 @@ const els = {
   exportTrips: byId("exportTrips"),
   exportTripsCsv: byId("exportTripsCsv"),
   exportTripsHtml: byId("exportTripsHtml"),
+  tripsDedupe: byId("tripsDedupe"),
   tripImport: byId("tripImport"),
   tripImportFile: byId("tripImportFile"),
   tripStatusFilter: byId("tripStatusFilter"),
@@ -3024,6 +3025,7 @@ function renderOverview() {
     els.exportTrips.hidden = true;
     els.exportTripsCsv.hidden = true;
     els.exportTripsHtml.hidden = true;
+    if (els.tripsDedupe) els.tripsDedupe.hidden = true;
     els.expandTrips.hidden = true;
     els.stats.innerHTML = "";
     els.usageStats.innerHTML = "";
@@ -3248,6 +3250,7 @@ function renderOverview() {
   els.exportTrips.hidden = !trips.length;
   els.exportTripsCsv.hidden = !trips.length;
   els.exportTripsHtml.hidden = !trips.length;
+  if (els.tripsDedupe) els.tripsDedupe.hidden = !trips.length;
   const tripTotal = Number(status.trip_count || trips.length);
   els.expandTrips.hidden = !state.tripsExpanded && tripTotal <= 5;
   els.expandTrips.textContent = state.tripsExpanded
@@ -5223,6 +5226,47 @@ function bindEvents() {
     // 可打印 / 分享的报销台账（与 CLI trips-export --html 同一渲染口径）
     exportTripsWithQuery("html", "aligo_trips.html");
   });
+  if (els.tripsDedupe) {
+    els.tripsDedupe.addEventListener("click", async () => {
+      if (els.tripsDedupe.disabled) return;
+      const button = els.tripsDedupe;
+      // 固定发起时的用户：清理期间切换用户不能把去重打到另一个账号
+      const userId = state.userId;
+      button.disabled = true;
+      button.textContent = "检查中…";
+      try {
+        const preview = await getJSON(
+          `/api/trips/dedupe?user_id=${encodeURIComponent(userId)}&dry_run=1`,
+          { method: "POST" },
+        );
+        if (!isModalOpen()) return;
+        const count = Number(preview.would_remove || 0);
+        if (!count) {
+          toast("没有重复行程可清理");
+          return;
+        }
+        if (
+          !window.confirm(
+            `发现 ${count} 条重复行程（同路线 + 同起止日期），将保留最早一条。继续清理？`,
+          )
+        ) {
+          toast("已取消清理重复行程");
+          return;
+        }
+        const result = await getJSON(
+          `/api/trips/dedupe?user_id=${encodeURIComponent(userId)}`,
+          { method: "POST" },
+        );
+        toast(`已清理 ${Number(result.removed || 0)} 条重复行程`);
+        await refreshStatus({ silentFailure: true });
+      } catch (error) {
+        toast(`清理重复行程失败：${error.message || error}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = "清理重复";
+      }
+    });
+  }
   if (els.tripImport) {
     els.tripImport.addEventListener("click", () => {
       if (els.tripImportFile) els.tripImportFile.click();
