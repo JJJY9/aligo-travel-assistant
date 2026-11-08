@@ -76,6 +76,57 @@ class _ApplyThenTimeout:
         return 0
 
 
+def test_factory_failure_falls_back_to_local():
+    """客户端工厂自身失败：本次回退进程内锁，degraded 标记为 True。"""
+    from utils.redis_lock import _LOCAL_TOKEN
+
+    def boom():
+        raise RuntimeError("factory down")
+
+    lock = DistributedLock(None, "aligo:test:factory", ttl_sec=5, client_factory=boom)
+    token = lock.acquire()
+    assert token == _LOCAL_TOKEN
+    assert lock.degraded is True
+    assert lock.acquire() is None, "回退锁同样互斥"
+    lock.release(token)
+    again = lock.acquire()
+    assert again == _LOCAL_TOKEN
+    lock.release(again)
+    print("✓ 客户端工厂失败回退进程内锁")
+
+
+def test_contended_redis_lock_releases_local():
+    """Redis 键已被其它实例占用：返回 None，且不占着进程内锁。"""
+
+    class _Held:
+        def set(self, *args, **kwargs):
+            return False
+
+        def eval(self, *args, **kwargs):
+            return 0
+
+    lock = DistributedLock(_Held(), "aligo:test:held", ttl_sec=5)
+    assert lock.acquire() is None
+    assert lock.degraded is False
+    assert lock._local.locked() is False, "未拿到共享锁时必须归还进程内锁"
+    print("✓ 共享锁被占用时归还进程内锁")
+
+
+def test_release_none_and_local_token():
+    """release(None) 是 no-op；本地回退 token 释放后本地锁可再次获取。"""
+    from utils.redis_lock import _LOCAL_TOKEN
+
+    lock = DistributedLock(None, "aligo:test:local-release", ttl_sec=5)
+    lock.release(None)
+    token = lock.acquire()
+    assert token == _LOCAL_TOKEN
+    lock.release(token)
+    again = lock.acquire()
+    assert again == _LOCAL_TOKEN, "释放后必须能再次获取"
+    lock.release(again)
+    print("✓ release(None) 与本地 token 释放")
+
+
 def test_fallback_when_redis_unavailable():
     lock = DistributedLock(_BrokenRedis(), "aligo:test:fallback", ttl_sec=30)
     token = lock.acquire()
@@ -341,6 +392,9 @@ def test_transient_renew_failure_keeps_lock():
 
 if __name__ == "__main__":
     test_fallback_when_redis_unavailable()
+    test_factory_failure_falls_back_to_local()
+    test_contended_redis_lock_releases_local()
+    test_release_none_and_local_token()
     test_local_mutex_blocks_even_if_redis_errors()
     test_redis_path_recovers_after_transient_failure()
     test_release_cleans_key_after_set_timeout()
