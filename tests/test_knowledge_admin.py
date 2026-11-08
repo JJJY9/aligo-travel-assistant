@@ -814,6 +814,32 @@ def test_import_regroups_exported_chunks(monkeypatch):
     print("✓ 导入按 group 重新合并导出分片")
 
 
+def test_find_duplicate_contents_ignores_grouped_fragments(monkeypatch):
+    """重复扫描只统计可单删的独立片段：多分片（含旧版 parts>1）与空内容不计。"""
+    from utils import knowledge_admin as admin
+
+    rows = [
+        {"id": 1, "content": "重复内容", "metadata": {}},
+        {"id": 2, "content": "重复内容", "metadata": {}},
+        {
+            "id": 3,
+            "content": "重复内容",
+            "metadata": {"group": "g1", "part": "1", "parts": "2"},
+        },
+        {"id": 4, "content": "旧版多片", "metadata": {"part": "1", "parts": "2"}},
+        {"id": 5, "content": "旧版多片", "metadata": {"part": "2", "parts": "2"}},
+        {"id": 6, "content": "   ", "metadata": {}},
+        {"id": 7, "content": "单条", "metadata": {}},
+        {"id": 8, "content": " 重复内容 ", "metadata": {}},
+    ]
+    monkeypatch.setattr(admin, "_client", lambda: object())
+    monkeypatch.setattr(admin, "_load_collection", lambda client, name: None)
+    monkeypatch.setattr(admin, "_iter_all_rows", lambda client: rows)
+    groups = admin.find_duplicate_contents()
+    assert groups == [("重复内容", [1, 2, 8])], groups
+    print("✓ 重复扫描只统计独立片段（多分片 / 空内容不计）")
+
+
 def test_import_tolerates_non_finite_part_metadata(monkeypatch):
     """metadata.part 为非有限数（Infinity）时该文档退化为单条，不拖垮整批导入。"""
     from pathlib import Path
@@ -2078,6 +2104,7 @@ if __name__ == "__main__":
         test_chunk_documents_marks_even_with_full_metadata,
         test_import_regroups_exported_chunks,
         test_import_tolerates_non_finite_part_metadata,
+        test_find_duplicate_contents_ignores_grouped_fragments,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_cross_group_share_keeps_unique_pieces,
