@@ -7472,8 +7472,89 @@ def test_session_export_html_format():
     print("✓ 单会话导出支持 HTML（标题单次转义 / 格式校验）")
 
 
+def test_export_with_knowledge(monkeypatch):
+    """with_knowledge=1 把知识片段写入备份（与 CLI --with-knowledge 同字段）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    user = _unique_user("web_export_kb")
+    try:
+        monkeypatch.setattr(
+            server_module,
+            "export_documents",
+            lambda: [{"content": "差旅标准", "metadata": {"category": "制度"}}],
+        )
+        response = client.get(
+            "/api/export", params={"user_id": user, "with_knowledge": "1"}
+        )
+        assert response.status_code == 200
+        backup = response.json()
+        assert backup["knowledge"] == [
+            {"content": "差旅标准", "metadata": {"category": "制度"}}
+        ]
+        # 默认不带知识段（不触发全库扫描）
+        plain = client.get("/api/export", params={"user_id": user}).json()
+        assert "knowledge" not in plain
+
+        def boom():
+            raise FileNotFoundError("知识库未初始化")
+
+        monkeypatch.setattr(server_module, "export_documents", boom)
+        failed = client.get(
+            "/api/export",
+            params={"user_id": user, "with_knowledge": "1"},
+        )
+        assert failed.status_code == 503
+        assert "知识库导出失败" in failed.json()["detail"]
+    finally:
+        _cleanup(user)
+    print("✓ 备份导出可携带知识库片段")
+
+
+def test_export_with_knowledge_round_trips(monkeypatch):
+    """导出的 knowledge 段可直接被 /api/import 一体化恢复。"""
+    from utils import knowledge_admin as admin_module
+    from webapp import server as server_module
+
+    client = _client()
+    user = _unique_user("web_export_kb_rt")
+    try:
+        docs = [{"content": "差旅标准", "metadata": {"category": "制度"}}]
+        monkeypatch.setattr(server_module, "export_documents", lambda: docs)
+        backup = client.get(
+            "/api/export", params={"user_id": user, "with_knowledge": "1"}
+        ).json()
+        imported = []
+        monkeypatch.setattr(
+            admin_module,
+            "import_documents",
+            lambda documents: (
+                imported.extend(documents),
+                {"imported": len(documents), "skipped": 0},
+            )[1],
+        )
+        response = client.post(
+            "/api/import", params={"user_id": user}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        assert imported == docs, imported
+    finally:
+        _cleanup(user)
+    print("✓ 备份导出的知识段可一体化恢复")
+
+
 if __name__ == "__main__":
     test_index_page()
+    _mp_export = pytest.MonkeyPatch()
+    try:
+        test_export_with_knowledge(_mp_export)
+    finally:
+        _mp_export.undo()
+    _mp_export_rt = pytest.MonkeyPatch()
+    try:
+        test_export_with_knowledge_round_trips(_mp_export_rt)
+    finally:
+        _mp_export_rt.undo()
     test_session_detail_sanitizes_legacy_nan_meta()
     test_session_export_html_format()
     test_write_endpoints_reject_unwritable_text()
