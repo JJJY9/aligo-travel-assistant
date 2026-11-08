@@ -5198,10 +5198,9 @@ function bindEvents() {
   els.exportChat.addEventListener("click", triggerExport);
   els.exportHtml.addEventListener("click", exportSessionHtml);
   els.exportTrips.addEventListener("click", () => {
-    downloadFromApi(
-      `/api/trips/calendar?user_id=${encodeURIComponent(state.userId)}`,
-      "aligo_trips.ics",
-    );
+    // 与列表同口径：展开视图下的关键词 / 状态筛选随导出一起提交
+    // （服务端 format=ics 支持 q / status），与 CSV / HTML 导出一致
+    exportTripsWithQuery("ics", "aligo_trips.ics");
   });
   const exportTripsWithQuery = (format, filename) => {
     // 与列表同口径：展开视图下的关键词与状态筛选随导出一起提交（服务端

@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- `GET /api/trips/export?format=ics`：按 `q` / `status` 过滤导出行程日历合集（与 CSV / HTML 导出同一过滤口径、与 CLI `trips-export --ics --query/--status` 同一渲染）；面板「导出日历」按钮随展开视图的筛选提交（不再固定导出全部行程）
 - `python cli.py sessions-export --html`：全部会话导出为独立 HTML 合集（单文件内嵌样式、标题与正文单次转义、按最近更新排序、默认 `.html` 后缀），与单会话 `session-export --html` 同一渲染口径
 - 一体化备份：`user-export --with-knowledge` 把知识库片段与用户数据放进同一 JSON；`user-import` 识别 `knowledge` 段一并恢复（失败不改用户数据、`knowledge_error` + 退出码 1；`--skip-knowledge` / `--dry-run`）；Web 面板「恢复备份」同路径
 - `trips-import --ics` 与 `--dry-run`：接受 iCalendar（按 `BEGIN:VCALENDAR` 自动识别）并预览将新增 / 更新 / 跳过的数量而不写库
