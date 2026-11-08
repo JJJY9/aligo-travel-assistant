@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- CLI `pref-set --json-value`：按 JSON 解析偏好值，可写入列表（`'["汉庭","如家"]'`）/ 数字 / 布尔等带类型值（默认仍是字符串；序列化上限 10000 字符与 Web PUT 一致，非法 JSON / null / 超长值拒绝）
 - 行程去重（Web 面板）：记忆面板「清理重复」按钮与 `POST /api/trips/dedupe`（默认 `dry_run=1` 只预览；确认后按「同路线 + 同起止日期」保留最早一条、删除其余；同 id 多行程只提示不自动处理；判定 / 复核 / 删除与 CLI `trips-dedupe` 共用 `utils.trip_dedupe`，两条入口不再漂移）
 - `GET /api/trips/export?format=ics`：按 `q` / `status` 过滤导出行程日历合集（与 CSV / HTML 导出同一过滤口径、与 CLI `trips-export --ics --query/--status` 同一渲染）；面板「导出日历」按钮随展开视图的筛选提交（不再固定导出全部行程）
 - `python cli.py sessions-export --html`：全部会话导出为独立 HTML 合集（单文件内嵌样式、标题与正文单次转义、按最近更新排序、默认 `.html` 后缀），与单会话 `session-export --html` 同一渲染口径

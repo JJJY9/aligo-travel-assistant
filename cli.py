@@ -5049,12 +5049,20 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
 
 
 def run_preference_set_standalone(
-    user_id: str, pref_type: str, value: str, as_json: bool = False
+    user_id: str,
+    pref_type: str,
+    value: str,
+    as_json: bool = False,
+    json_value: bool = False,
 ) -> int:
-    """新增 / 覆盖一条偏好（`python cli.py pref-set <user_id> <type> <value> [--json]`）。
+    """新增 / 覆盖一条偏好
+    （`python cli.py pref-set <user_id> <type> <value|JSON> [--json-value] [--json]`）。
 
     与 Web 面板的 PUT ``/api/preferences/{type}`` 同一存储语义：值按原样
-    保存；列表类偏好可重复设置（对话侧按合并语义追加去重）。
+    保存；列表类偏好可重复设置（对话侧按合并语义追加去重）。默认按字符串
+    保存（``"3"`` 就是字符串）；``--json-value`` 按 JSON 解析，可写入列表
+    （``'["汉庭","如家"]'``）、数字（``3``）、布尔等带类型值（上限：序列化
+    后 10000 字符，与 Web 同一口径）。
 
     Returns:
         0 保存成功；1 参数 / 读写失败
@@ -5080,13 +5088,31 @@ def run_preference_set_standalone(
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
-    text_value = value.strip()
-    if not text_value:
+    saved_value: Any = value.strip()
+    if not saved_value:
         return _fail("偏好值不能为空")
     # 与 Web 的 PreferencePayload 同一上限（单值 500 字）：超长值落库后
     # 面板保存任何修改都会对该记录 422
-    if len(text_value) > 500:
-        return _fail(f"偏好值不能超过 500 字（当前 {len(text_value)} 字）")
+    if not json_value and len(saved_value) > 500:
+        return _fail(f"偏好值不能超过 500 字（当前 {len(saved_value)} 字）")
+    if json_value:
+        from utils.json_parser import reject_json_constant
+
+        try:
+            parsed = json.loads(value, parse_constant=reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return _fail(f"--json-value 需要合法的 JSON 值：{exc}")
+        if parsed is None:
+            return _fail("偏好值不能为空")
+        serialized = json.dumps(parsed, ensure_ascii=False)
+        # 与 Web PUT /api/preferences 同一序列化上限
+        if len(serialized) > 10000:
+            return _fail("偏好值过大（序列化后超过 10000 字符）")
+        try:
+            serialized.encode("utf-8")
+        except UnicodeEncodeError:
+            return _fail("偏好值包含无法编码的字符（孤立代理项）")
+        saved_value = parsed
 
     try:
         store = _open_cli_store(user_id)
@@ -5094,7 +5120,7 @@ def run_preference_set_standalone(
         return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
-            store.save_preference(pref_type, text_value)
+            store.save_preference(pref_type, saved_value)
             saved = store.get_preference(pref_type)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"保存偏好失败：{exc}")
@@ -5595,10 +5621,13 @@ def main():
         if arg == "pref-set":
             target = other = value = None
             as_json = False
+            json_value = False
             valid = True
             for item in sys.argv[2:]:
                 if item.lower() == "--json":
                     as_json = True
+                elif item.lower() == "--json-value":
+                    json_value = True
                 elif item.startswith("-") or value is not None:
                     valid = False
                     break
@@ -5610,12 +5639,17 @@ def main():
                     value = item
             if not valid or value is None:
                 print(
-                    "用法：python cli.py pref-set <user_id> <偏好类型> <值> [--json]"
+                    "用法：python cli.py pref-set <user_id> <偏好类型> <值> "
+                    "[--json-value] [--json]"
                 )
                 sys.exit(2)
             sys.exit(
                 run_preference_set_standalone(
-                    target, other, value, as_json=as_json
+                    target,
+                    other,
+                    value,
+                    as_json=as_json,
+                    json_value=json_value,
                 )
             )
         if arg == "pref-delete":
