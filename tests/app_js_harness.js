@@ -578,6 +578,18 @@ async function scenarioDecode(source) {
     size: utf8Bytes.length,
     arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
   });
+  const utf16Bytes = Array.from(Buffer.from("﻿目的地,上海", "utf16le"));
+  results.utf16_bom = await decode({
+    size: utf16Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf16Bytes).buffer,
+  });
+  const utf16NoBom = Array.from(
+    Buffer.from("origin,destination\n北京,上海\n", "utf16le")
+  );
+  results.utf16_nobom = await decode({
+    size: utf16NoBom.length,
+    arrayBuffer: async () => new Uint8Array(utf16NoBom).buffer,
+  });
   await importFile({
     size: 2 * 1024 * 1024 + 1,
     arrayBuffer: async () => {
@@ -622,6 +634,39 @@ async function scenarioDecode(source) {
     text: run("els.tripImport.textContent"),
     disabled: run("els.tripImport.disabled"),
     toasts: run("__toasts.slice()"),
+  };
+
+  // 解码 / 请求期间切换用户：导入仍落在选择文件时的用户
+  run("state.userId = 'user-a'; __lastUrl = null; __importCalls = 0;");
+  run(
+    "getJSON = (url) => { __importCalls += 1; __lastUrl = url; return new Promise((resolve) => { __resolveImport = resolve; }); };"
+  );
+  const pinned = importFile({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  });
+  await tick();
+  run("state.userId = 'user-b';");
+  run("__resolveImport({ created: 1, updated: 0, skipped: [] })");
+  await pinned;
+  await tick();
+  results.pinned_url = run("__lastUrl");
+  results.user_after = run("state.userId");
+
+  // 字符数上限（与 POST /api/trips/import 的 content 上限一致）
+  const bigText = Buffer.alloc(500_001, 97);
+  const beforeCalls = run("__importCalls");
+  await importFile({
+    size: bigText.length,
+    arrayBuffer: async () => new Uint8Array(bigText).buffer,
+  });
+  results.char_limit = {
+    last_toast: run("__toasts.slice()").slice(-1)[0],
+    calls_delta: run("__importCalls") - beforeCalls,
+    button: {
+      text: run("els.tripImport.textContent"),
+      disabled: run("els.tripImport.disabled"),
+    },
   };
   return results;
 }

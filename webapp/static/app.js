@@ -1165,6 +1165,32 @@ async function toggleTripsExpanded() {
 
 async function decodeImportFile(file) {
   const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  // UTF-16（Excel「Unicode 文本」）：BOM 或 ASCII 区规律出现的 NUL 字节。
+  // UTF-16 的 NUL 在 UTF-8 里是合法字符，不先识别会把整份文件解成乱码。
+  if (bytes.length >= 2) {
+    if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+      return new TextDecoder("utf-16le").decode(buffer);
+    }
+    if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+      return new TextDecoder("utf-16be").decode(buffer);
+    }
+  }
+  const sample = bytes.subarray(0, Math.min(bytes.length, 512));
+  let evenZeros = 0;
+  let oddZeros = 0;
+  for (let index = 0; index < sample.length; index += 1) {
+    if (sample[index] !== 0) continue;
+    if (index % 2 === 0) evenZeros += 1;
+    else oddZeros += 1;
+  }
+  const threshold = Math.max(8, Math.floor(sample.length / 8));
+  if (oddZeros >= threshold && oddZeros > evenZeros * 4) {
+    return new TextDecoder("utf-16le").decode(buffer);
+  }
+  if (evenZeros >= threshold && evenZeros > oddZeros * 4) {
+    return new TextDecoder("utf-16be").decode(buffer);
+  }
   try {
     // fatal：非法 UTF-8 直接抛错，避免把 GBK 中文静默解成乱码
     return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
@@ -1183,6 +1209,9 @@ async function importTripsFromFile(file) {
     button.setAttribute("aria-busy", "true");
     button.textContent = "导入中…";
   }
+  // 解码 / 网络等待期间用户可能切换用户：导入必须落在选择文件时所属的用户
+  const userId = state.userId;
+  let imported = false;
   try {
     if (file.size > 2 * 1024 * 1024) {
       toast("文件过大（上限 2 MB），请拆分后再导入");
@@ -1199,9 +1228,15 @@ async function importTripsFromFile(file) {
       toast("文件为空，没有可导入的行程");
       return;
     }
+    if (text.length > 500_000) {
+      // 与 POST /api/trips/import 的 content 上限一致（50 万字符：
+      // JSON 序列化后中文约 1.5 MB，仍在 2 MB 请求体上限内）
+      toast("文件过大（超过 50 万字符），请拆分后再导入");
+      return;
+    }
     try {
       const result = await getJSON(
-        `/api/trips/import?user_id=${encodeURIComponent(state.userId)}`,
+        `/api/trips/import?user_id=${encodeURIComponent(userId)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1218,7 +1253,7 @@ async function importTripsFromFile(file) {
           (updated ? `，更新 ${updated} 条` : "") +
           (skipped ? `，跳过 ${skipped} 条` : ""),
       );
-      await refreshStatus();
+      imported = true;
     } catch (error) {
       toast(`导入行程失败：${error.message}`);
     }
@@ -1228,6 +1263,10 @@ async function importTripsFromFile(file) {
       button.removeAttribute("aria-busy");
       button.textContent = "导入行程";
     }
+  }
+  // 状态刷新可能等待慢接口：放在按钮复位之后，成功提示不会被「导入中…」卡住
+  if (imported) {
+    await refreshStatus();
   }
 }
 

@@ -167,6 +167,10 @@ def test_trip_import_file_decoding_and_size_guard():
     results = _run_harness("decode")
     assert results["utf8"] == "目的地,杭州"
     assert results["gbk"] == "目的地,上海", "GBK CSV 必须回退 gb18030 解码"
+    assert results["utf16_bom"] == "目的地,上海", "UTF-16LE（BOM）必须按 UTF-16 解码"
+    assert results["utf16_nobom"] == "origin,destination\n北京,上海\n", (
+        "无 BOM 的 UTF-16 按 NUL 字节规律识别"
+    )
     assert results["oversize_toasts"] == [
         "文件过大（上限 2 MB），请拆分后再导入"
     ]
@@ -178,7 +182,19 @@ def test_trip_import_file_decoding_and_size_guard():
     assert results["after_import"]["text"] == "导入行程"
     assert results["after_import"]["disabled"] is False
     assert results["after_import"]["toasts"][-1] == "已导入 1 条行程"
-    print("✓ 行程导入文件解码 / 大小限制 / 防重复提交")
+    assert results["pinned_url"].endswith("user_id=user-a"), (
+        "解码 / 请求期间切换用户，导入仍落在选择文件时的用户"
+    )
+    assert results["user_after"] == "user-b"
+    assert results["char_limit"]["last_toast"] == (
+        "文件过大（超过 50 万字符），请拆分后再导入"
+    ), "字符数上限必须与服务端 50 万字符一致"
+    assert results["char_limit"]["calls_delta"] == 0
+    assert results["char_limit"]["button"] == {
+        "text": "导入行程",
+        "disabled": False,
+    }
+    print("✓ 行程导入文件解码 / 大小限制 / 用户固定 / 防重复提交")
 
 
 def test_knowledge_eval_panel_states():

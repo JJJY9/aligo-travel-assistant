@@ -647,7 +647,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载）；`with_knowledge=1`（仅 JSON）把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段，可由 `/api/import` 一体化恢复） |
 | POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过，备份含 `knowledge` 段时一并恢复知识片段（失败时 `knowledge_error` 字段说明）；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
 | POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id`、`created` 与日期重叠的 `conflicts`） |
-| POST | `/api/trips/import` | 从 CSV / iCalendar 文本导入行程（JSON body `{"content": ...}`，自动识别格式；与 CLI `trips-import` 同一解析与去重语义，`dry_run=1` 只预览；无有效行返回 400 并附行号原因） |
+| POST | `/api/trips/import` | 从 CSV / iCalendar 文本导入行程（JSON body `{"content": ...}`，自动识别格式；与 CLI `trips-import` 同一解析与去重语义，`dry_run=1` 只预览；在导入专用执行器 + 背压执行，单次最多 5000 行、`content` ≤ 50 万字符；缺省目的不覆盖已有行程；无有效行返回 400 并附行号原因） |
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；与其它行程完全重复时返回 409，返回日期重叠的 `conflicts`） |
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件，含出行前一天 09:00 提醒 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过；每个事件含前一天 09:00 提醒） |
@@ -880,6 +880,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - 存储连接复用：PostgreSQL 后端不再每轮对话重建连接；Web 会话缓存按 LRU 淘汰（上限 50）并在服务关闭时释放
 
 ### 已知限制
+- **行程导入编码**：面板读取 CSV / ICS 文件时识别 UTF-16（BOM 或无 BOM 的 NUL 规律）、严格 UTF-8，失败后回退 GB18030（Excel 中文 CSV）；Big5 等与 GB18030 字节重叠的编码无法可靠区分（可能解码为乱码），请先另存为 UTF-8。服务端 `content` 上限 50 万字符、单次最多 5000 行（JSON 中文序列化后仍在 2 MB 请求体内），面板同时限制文件 ≤ 2 MB；缺省目的不会覆盖已有行程的目的。
 - **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。`reset_milvus_client` 会关闭并重建共享客户端（关闭在锁内，避免并发拿到正在关闭的对象），但 milvus-lite 的本地 server / 数据库句柄不一定随 `close()` 释放，文件锁可能保持到进程退出；连接损坏后重建也可能复用旧 server——重连仍失败时请重启进程（Web 服务）。
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
 - **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。

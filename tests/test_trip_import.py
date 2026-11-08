@@ -453,7 +453,9 @@ def test_ics_external_summary_fallback():
             "destination": "外部日历事件",
             "start_date": "2026-11-10",
             "end_date": "2026-11-10",  # 排他 DTEND=次日 → 单日
-            "purpose": "出差",
+            # 外部事件没有目的：保留 None，去重更新时不覆盖已有目的，
+            # 新建行程由导入助手补默认「出差」
+            "purpose": None,
         }
     ], rows
     print("✓ ICS 外部事件 SUMMARY 回退")
@@ -770,6 +772,103 @@ def test_import_trips_from_text_csv_and_ics():
     print("✓ 行程文本导入（CSV / dry-run 去重 / ICS 自动识别 / 无可导入项）")
 
 
+def test_import_rejects_oversized_bad_text_and_caps_skipped():
+    """行数上限 / NUL 文本整份拒绝 / 解析错误列表有界。"""
+    import utils.trip_import as trip_import
+
+    header = "origin,destination,start_date,end_date,purpose\n"
+    big = header + "".join(
+        f"北京,D{i},2026-01-01,,出差\n" for i in range(5001)
+    )
+    with pytest.raises(ValueError, match="单次最多导入 5000 条"):
+        trip_import.import_trips_from_text(_ImportStore(), big)
+
+    # CSV 的 NUL 行为随 Python 版本不同（3.10 的 csv 直接报错整行），
+    # 用 iCalendar 验证同一字段校验分支
+    with pytest.raises(ValueError, match="NUL"):
+        trip_import.import_trips_from_text(
+            _ImportStore(),
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n"
+            "DTSTART;VALUE=DATE:20261201\nDTEND;VALUE=DATE:20261202\n"
+            "SUMMARY:北\x00京\nEND:VEVENT\nEND:VCALENDAR\n",
+        )
+
+    bad_rows = header + "".join("坏行\n" for _ in range(200))
+    result = trip_import.import_trips_from_text(_ImportStore(), bad_rows)
+    assert result["rows"] == 0
+    assert len(result["skipped"]) == trip_import._MAX_SKIPPED == 50
+    assert result["skipped_total"] == 200
+    print("✓ 行程导入行数上限 / NUL 拒绝 / 错误列表有界")
+
+
+def test_import_preserves_existing_purpose():
+    """缺省目的不覆盖已有行程的目的；新行程才补默认「出差」。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_import import import_trips_from_text
+
+    store = LongTermMemory("u-import-purpose", tempfile.mkdtemp())
+    assert store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "客户会议",
+        }
+    )
+    result = import_trips_from_text(
+        store,
+        "origin,destination,start_date,end_date\n"
+        "北京,上海,2026-12-01,2026-12-03\n",
+    )
+    assert result["updated"] == 1
+    existing = next(
+        trip
+        for trip in store.get_trip_history(limit=None)
+        if trip["destination"] == "上海"
+    )
+    assert existing["purpose"] == "客户会议", "缺省目的不能覆盖用户改过的目的"
+
+    result2 = import_trips_from_text(
+        store,
+        "origin,destination,start_date,end_date\n"
+        "北京,杭州,2026-12-10,2026-12-11\n",
+    )
+    assert result2["created"] == 1
+    created = next(
+        trip
+        for trip in store.get_trip_history(limit=None)
+        if trip["destination"] == "杭州"
+    )
+    assert created["purpose"] == "出差", "新行程缺省目的补「出差」"
+    print("✓ 行程导入缺省目的保留已有 / 新行程补默认")
+
+
+def test_ics_regex_scan_is_bounded():
+    """恶意超长 DESCRIPTION / SUMMARY 只扫描前缀，正则不会二次方回溯。"""
+    import time
+
+    from utils.trip_import import parse_trips_ics
+
+    evil = " → " * 40000
+    text = (
+        "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n"
+        "DTSTART;VALUE=DATE:20261110\nDTEND;VALUE=DATE:20261111\n"
+        f"DESCRIPTION:Aligo 行程：{evil}\n"
+        f"SUMMARY:{evil}\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+    started = time.perf_counter()
+    rows, errors = parse_trips_ics(text)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0, f"超长 SUMMARY/DESCRIPTION 解析耗时 {elapsed:.2f}s"
+    assert errors == []
+    assert len(rows) == 1
+    print("✓ ICS 超长 SUMMARY / DESCRIPTION 解析有界")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -787,6 +886,9 @@ if __name__ == "__main__":
     test_ics_timed_end_inclusive_except_midnight()
     test_ics_extreme_year_tzid_datetime_skipped()
     test_import_trips_from_text_csv_and_ics()
+    test_import_rejects_oversized_bad_text_and_caps_skipped()
+    test_import_preserves_existing_purpose()
+    test_ics_regex_scan_is_bounded()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()
     for case in (
