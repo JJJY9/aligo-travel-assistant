@@ -846,6 +846,54 @@ def test_runner_recovers_knowledge_only_backup(monkeypatch):
     assert calls and calls[0][0]["content"] == "知识一"
     print("✓ 只含知识片段的备份可正常恢复")
 
+def test_parse_truncation_drops_split_knowledge_group(monkeypatch):
+    """50000 条截断点落在多分片组中间时整组丢弃（不触发组完整性拒绝）。"""
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(user_import_module, "_MAX_KNOWLEDGE", 3)
+    payload = {
+        "knowledge": [
+            {"content": "甲", "metadata": {"group": "gX", "part": "1", "parts": "3"}},
+            {"content": "乙", "metadata": {"group": "gX", "part": "2", "parts": "3"}},
+            {"content": "完整文档", "metadata": {}},
+            {"content": "丙", "metadata": {"group": "gX", "part": "3", "parts": "3"}},
+        ]
+    }
+    sections, errors = user_import_module.parse_user_export(
+        json.dumps(payload, ensure_ascii=False)
+    )
+    assert [item["content"] for item in sections["knowledge"]] == ["完整文档"]
+    assert any("截断" in error for error in errors), errors
+    print("✓ 截断点落在分片组中间时整组丢弃")
+
+
+def test_import_matches_unpadded_stored_trip_dates():
+    """库内未补零日期（2026-1-5）与导入补零后的行程按同一键去重。"""
+    store = _real_store("u-unpadded")
+    store.data["trip_history"].append(
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-1-5",
+            "end_date": "",
+            "purpose": "出差",
+        }
+    )
+    store.data["statistics"]["total_trips"] = 1
+    store._save()
+    payload = {
+        "trip_history": [
+            {"origin": "北京", "destination": "上海", "start_date": "2026-1-5", "purpose": "出差"}
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert errors == []
+    counts = import_user_data(store, sections)
+    assert counts["trips_created"] == 0 and counts["trips_updated"] == 1, counts
+    assert len(store.get_trip_history(limit=None)) == 1
+    print("✓ 未补零日期的既有行程不再被重复新增")
+
 
 if __name__ == "__main__":
     test_parse_export_sections()
@@ -867,6 +915,8 @@ if __name__ == "__main__":
     test_parse_accepts_leading_dash_session_ids()
     test_parse_rejects_bad_preference_text()
     test_parse_rejects_non_object_agent_entries()
+    test_parse_truncation_drops_split_knowledge_group()
+    test_import_matches_unpadded_stored_trip_dates()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (

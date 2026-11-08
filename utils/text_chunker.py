@@ -58,10 +58,30 @@ def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
     return not re.search(r"[。；！？!?.;]", body)
 
 
+# 多行标题块里单行的长度上限：目录式标题很短；章节正文里的短清单行
+# （同样没有句读）通常更长或以项目符号开头
+_TITLE_LINE_MAX = 16
+
+
 def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
-    """判断块是否只由标题行组成（多行连续标题也算）。"""
-    lines = [line for line in chunk.splitlines() if line.strip()]
-    return bool(lines) and all(_is_title_like(line, min_chars) for line in lines)
+    """判断块是否只由标题行组成（多行连续标题也算）。
+
+    多行块对「标题行」更严格：每条都很短且不以项目符号开头。否则章节
+    正文里的短清单行（如「- 本标准自发布之日起施行」没有句读）会整节
+    被当成标题块，_merge_short_chunks 随后把相邻两个章节拼进同一块，
+    产出混主题向量。
+    """
+    lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if len(lines) == 1:
+        return _is_title_like(lines[0], min_chars)
+    return all(
+        len(line) <= _TITLE_LINE_MAX
+        and not line.startswith(("-", "*", "•", "·"))
+        and _is_title_like(line, min_chars)
+        for line in lines
+    )
 
 
 def _merge_short_chunks(

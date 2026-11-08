@@ -209,6 +209,27 @@ def test_merge_edge_branches():
     print("✓ 合并器边界分支（缓冲刷出 / 超长标题块 / 尾部挂起）")
 
 
+def test_repo_documents_do_not_mix_sections():
+    """仓库自带知识文档：任何块都不能同时出现两个章节标题。"""
+    import re
+    from pathlib import Path
+
+    docs_dir = (
+        Path(project_root) / ".claude" / "skills" / "ask-question" / "data" / "documents"
+    )
+    heading = re.compile(r"^[一二三四五六七八九十]+、", re.MULTILINE)
+    for name in (
+        "01_travel_standards.txt",
+        "05_emergency_procedures.txt",
+        "08_environmental_initiatives.txt",
+    ):
+        text = (docs_dir / name).read_text(encoding="utf-8")
+        for chunk in split_text(text, 400):
+            found = heading.findall(chunk)
+            assert len(found) <= 1, f"{name} 出现混章节块：{found} · {chunk[:60]!r}"
+    print("✓ 自带文档切分无混章节块")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -225,4 +246,5 @@ if __name__ == "__main__":
     test_numbered_colon_headings_merged_with_body()
     test_whitespace_only_chunks_dropped()
     test_merge_edge_branches()
+    test_repo_documents_do_not_mix_sections()
     print("\n全部通过")

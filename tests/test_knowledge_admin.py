@@ -435,6 +435,34 @@ def test_import_partial_dedupe_skips_doc_instead_of_orphan_group(monkeypatch):
     print("✓ 普通导入部分命中去重不再产生残缺组")
 
 
+def test_import_completes_group_with_duplicate_pieces(monkeypatch):
+    """组内两片内容相同、库内只存在一片：补齐缺失分片而不是整组跳过。"""
+    from pathlib import Path
+
+    para = "一、共同条款：" + "甲" * 280
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {para})
+    # 库内已有同组的 part1（同文分片的第二片未被写入）
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_group_layout", lambda: {para: ("G", 1, 2)}
+    )
+    agent = _FakeAgent({"status": "success", "ids": [2], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    result = knowledge_admin.import_documents(
+        [
+            {"content": para, "metadata": {"group": "G", "part": "1", "parts": "2"}},
+            {"content": para, "metadata": {"group": "G", "part": "2", "parts": "2"}},
+        ]
+    )
+
+    assert result["imported"] == 1, "缺失的同文分片必须补齐"
+    sent = agent.calls[0]
+    assert sent[0]["metadata"].get("part") == "2"
+    assert sent[0]["metadata"].get("group") == "G"
+    print("✓ 组内同文分片缺失时补齐（不再整组跳过）")
+
+
 def test_add_document_splits_long_content(monkeypatch):
     """长内容按语义边界拆成 ≤400 字片段，返回分片数。"""
     from pathlib import Path
@@ -1910,6 +1938,7 @@ if __name__ == "__main__":
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_partial_dedupe_skips_doc_instead_of_orphan_group,
+        test_import_completes_group_with_duplicate_pieces,
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
         test_import_restore_over_limit_skips_document,

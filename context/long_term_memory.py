@@ -984,18 +984,24 @@ class LongTermMemory:
 
     def _find_same_trip(self, trip_info: dict[str, Any]) -> dict[str, Any] | None:
         """查找同路线、同起止日期的既有行程（无出发日期时不参与去重）。"""
+        from utils.trip_import import normalize_identity_date
+
         destination = trip_info.get("destination")
-        start_date = str(trip_info.get("start_date") or "")
+        start_date = normalize_identity_date(trip_info.get("start_date"))
         if not destination or not start_date:
             return None
         origin = str(trip_info.get("origin") or "")
-        end_date = str(trip_info.get("end_date") or start_date)
+        end_date = normalize_identity_date(trip_info.get("end_date")) or start_date
         for trip in self.data.get("trip_history", []):
             if (
                 trip.get("destination") == destination
                 and str(trip.get("origin") or "") == origin
-                and str(trip.get("start_date") or "") == start_date
-                and str(trip.get("end_date") or trip.get("start_date") or "") == end_date
+                and normalize_identity_date(trip.get("start_date")) == start_date
+                and (
+                    normalize_identity_date(trip.get("end_date"))
+                    or normalize_identity_date(trip.get("start_date"))
+                )
+                == end_date
             ):
                 return trip
         return None
