@@ -19,6 +19,7 @@ Aligo Web 界面（FastAPI）
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import ipaddress
 import json
@@ -43,7 +44,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 
 from agents.conversation import ConversationRuntime
@@ -66,6 +67,7 @@ from utils.knowledge_admin import (
     add_document,
     delete_document,
     export_documents,
+    get_document,
     get_document_group,
     import_documents,
     list_categories,
@@ -473,9 +475,10 @@ class KnowledgeDocumentPayload(BaseModel):
 
     content: str = Field(min_length=1, max_length=2000)
     # 限制键数 / 键值长度：metadata 原样写入向量库并在列表接口返回，
-    # 不放任超大对象拖垮后续读取
-    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] = Field(
-        default_factory=dict, max_length=10
+    # 不放任超大对象拖垮后续读取。省略时为 None：更新接口据此沿用库中
+    # 现有元数据（与 CLI kb-update 一致），新增接口按「无元数据」处理
+    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = Field(
+        default=None, max_length=10
     )
 
 
@@ -809,6 +812,12 @@ class AligoWebApp:
         self.import_executor = _DaemonImportExecutor(
             max_workers=1, thread_name_prefix="aligo-import"
         )
+        # 知识库批量导入同样可能一次编码上万条分片并长时间持有写锁：放专用
+        # 单 worker 执行器，避免 40 个并发导入占满 Starlette 共享线程池后把
+        # /api/status、/api/sessions 等同步端点全部排队拖死
+        self.kb_import_executor = _DaemonImportExecutor(
+            max_workers=1, thread_name_prefix="aligo-kb-import"
+        )
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
@@ -865,6 +874,16 @@ class AligoWebApp:
         self.weather_limiter = create_rate_limiter(
             "weather",
             RATE_LIMIT_CONFIG.get("weather_requests", 30),
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
+            client_factory=redis_factory,
+        )
+        # 面板数据读接口（会话列表 / 状态 / 导出 / 台账）每次请求都全量读取
+        # 用户历史，且走共享线程池；不设额度时几十个并发读就能把线程池占满
+        # （额度远高于正常面板刷新频率）
+        self.read_limiter = create_rate_limiter(
+            "read",
+            RATE_LIMIT_CONFIG.get("read_requests", 600),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
@@ -1420,6 +1439,37 @@ def _enforce_weather_rate_limit(
     }
 
 
+def _enforce_read_rate_limit(
+    state: AligoWebApp, request: Request
+) -> dict[str, str]:
+    """面板数据读接口的独立限流（按客户端 IP）。
+
+    会话列表 / 状态 / 导出 / 台账每次请求都全量读取该用户历史；额度必须
+    远高于正常面板刷新频率，只用于挡住并发拉满线程池的脚本行为。
+    """
+    client = _rate_identity(_client_host(request))
+    retry_after = state.read_limiter.check(client)
+    if retry_after is not None:
+        wait_seconds = max(1, math.ceil(retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail=f"数据读取过于频繁，请约 {wait_seconds} 秒后重试"
+            f"（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(state.read_limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+    remaining, reset = state.read_limiter.status(client)
+    return {
+        "X-RateLimit-Limit": str(state.read_limiter.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
+
+
 _WEATHER_EXECUTOR_MAX_WORKERS = 8
 _weather_executor: ThreadPoolExecutor | None = None
 _weather_executor_lock = threading.Lock()
@@ -1550,6 +1600,63 @@ _MARKDOWN_SNIPPET_PREFIX = re.compile(
 _MARKDOWN_TABLE_SEPARATOR = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 
 
+def _strip_markdown_links(text: str) -> str:
+    """线性剥离 ``[文本](链接)`` / ``![说明](链接)``。
+
+    等价正则 ``\\[([^\\]]+)\\]\\([^)]*\\)`` 对未闭合的 ``[`` 会在每个起点
+    回溯到串尾（O(n²)），导入一条构造消息就能让会话搜索卡住事件循环数十
+    秒以上。这里改为单遍扫描：``]`` 的位置预排序后二分，``)`` 的失败搜索
+    以「该下标之后没有 ``)``」缓存，总代价与文本长度线性相关。
+    """
+    close_positions = [index for index, char in enumerate(text) if char == "]"]
+    if not close_positions:
+        return text
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    no_paren_from = length  # 该下标之后已确认没有 ")"，避免重复失败扫描
+    while index < length:
+        char = text[index]
+        if char == "!":
+            if index + 1 < length and text[index + 1] == "[":
+                open_index = index + 1
+                is_image = True
+            else:
+                out.append(char)
+                index += 1
+                continue
+        elif char == "[":
+            open_index = index
+            is_image = False
+        else:
+            out.append(char)
+            index += 1
+            continue
+        slot = bisect.bisect_right(close_positions, open_index)
+        if slot >= len(close_positions):
+            out.append(text[index:])
+            break
+        close = close_positions[slot]
+        # 正则要求普通链接的方括号内至少一个字（[]() 不匹配），图片说明可为空
+        if (is_image or close > open_index + 1) and (
+            close + 1 < length and text[close + 1] == "("
+        ):
+            if close + 2 >= no_paren_from:
+                paren = -1
+            else:
+                paren = text.find(")", close + 2)
+                if paren == -1:
+                    no_paren_from = close + 2
+            if paren != -1:
+                if not is_image:
+                    out.append(text[open_index + 1:close])
+                index = paren + 1
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _strip_markdown_for_snippet(text: str) -> str:
     """去掉常见 Markdown 记号（标题 / 列表 / 表格 / 引用 / 强调），供搜索预览使用。"""
     lines: list[str] = []
@@ -1561,8 +1668,7 @@ def _strip_markdown_for_snippet(text: str) -> str:
             line = line.replace("|", " ")
         lines.append(line)
     cleaned = " ".join(" ".join(lines).split())
-    cleaned = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", cleaned)
-    cleaned = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", cleaned)
+    cleaned = _strip_markdown_links(cleaned)
     cleaned = re.sub(r"\*\*|__|~~|`", "", cleaned)
     return cleaned.strip()
 
@@ -1570,24 +1676,35 @@ def _strip_markdown_for_snippet(text: str) -> str:
 def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     """截取命中位置附近的片段（用于会话搜索结果的预览）。"""
     haystack = str(text)
+    if not needle:
+        return ""
     # 先做廉价的原文包含判断：整条消息做 Markdown 剥离（多条正则）在超长
     # 行上有回溯开销，没命中的消息根本不需要清理
-    if not needle or needle.lower() not in haystack.lower():
+    lowered = haystack.lower()
+    needle_lower = needle.lower()
+    position = lowered.find(needle_lower)
+    if position < 0:
         return ""
-    cleaned = _strip_markdown_for_snippet(haystack)
-    index = cleaned.lower().find(needle)
+    # 只清理命中位置附近的窗口：单条消息可达数 MB（导入上限 64MB），整条
+    # 清理没有意义，超长单行还会放大任何正则的扫描范围
+    span = radius * 4 + len(needle)
+    window_start = max(0, position - span)
+    window_end = min(len(haystack), position + len(needle) + span)
+    window = haystack[window_start:window_end]
+    cleaned = _strip_markdown_for_snippet(window)
+    index = cleaned.lower().find(needle_lower)
     if index < 0:
         # 关键字本身含被剥离的记号时回退到原文匹配
-        cleaned = " ".join(str(text).split())
-        index = cleaned.lower().find(needle)
+        cleaned = " ".join(window.split())
+        index = cleaned.lower().find(needle_lower)
     if index < 0:
         return ""
     start = max(0, index - radius)
     end = min(len(cleaned), index + len(needle) + radius)
     snippet = " ".join(cleaned[start:end].split())
-    if start > 0:
+    if window_start > 0 or start > 0:
         snippet = "…" + snippet
-    if end < len(cleaned):
+    if window_end < len(haystack) or end < len(cleaned):
         snippet += "…"
     return snippet
 
@@ -1607,6 +1724,10 @@ def _group_sessions(
     """
     needle = query.strip().lower()
     grouped: dict[str, dict[str, Any]] = {}
+    # 每条消息的行内时间戳只解析一次：/api/sessions 每次请求都重新聚合全量
+    # 历史，原实现对同一个最新时间戳反复 fromisoformat，几十万条消息时 CPU
+    # 直接翻倍
+    updated_keys: dict[str, Any] = {}
     for message in history:
         session_id = message.get("session_id")
         if not session_id:
@@ -1617,13 +1738,14 @@ def _group_sessions(
         )
         entry["message_count"] += 1
         timestamp = str(message.get("timestamp") or "")
-        if timestamp and (
-            not entry["updated_at"]
-            or chronological_key(timestamp) > chronological_key(entry["updated_at"])
-        ):
-            # 取会话内最大时间戳：恢复早于现有会话的备份后，消息按导出
-            # 顺序（时间升序）追加，直接覆盖会让 updated_at 回拨、排序错位
-            entry["updated_at"] = timestamp
+        if timestamp:
+            parsed_key = chronological_key(timestamp)
+            current_key = updated_keys.get(str(session_id))
+            if current_key is None or parsed_key > current_key:
+                # 取会话内最大时间戳：恢复早于现有会话的备份后，消息按导出
+                # 顺序（时间升序）追加，直接覆盖会让 updated_at 回拨、排序错位
+                updated_keys[str(session_id)] = parsed_key
+                entry["updated_at"] = timestamp
         if not entry["title"] and message.get("role") == "user":
             title = " ".join(str(message.get("content", "")).split())
             if title:
@@ -1884,6 +2006,7 @@ def create_app(model: Any = None) -> FastAPI:
         state.close_all()
         # 取消排队未执行的导入；正在执行的线程是 daemon，不阻塞进程退出
         state.import_executor.shutdown(wait=False, cancel_futures=True)
+        state.kb_import_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
     app.state.aligo = state
@@ -1957,7 +2080,8 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/weather")
     async def weather(
-        request: Request, city: str = Query(..., min_length=1, max_length=50)
+        request: Request,
+        city: str = Query(..., min_length=1, max_length=50, pattern=r"^[^\x00-\x1F\x7F]*$"),
     ) -> JSONResponse:
         """目的地天气（Open-Meteo，无 API Key；专用线程池，进程内缓存 10 分钟）。"""
         name = city.strip()
@@ -2238,7 +2362,16 @@ def create_app(model: Any = None) -> FastAPI:
         """更新知识片段（内容重新向量化；片段不存在返回 404）。"""
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            return update_document(doc_id, payload.content, payload.metadata)
+            metadata = payload.metadata
+            if metadata is None:
+                # 请求省略 metadata：沿用库中现有元数据（与 CLI kb-update
+                # 一致），否则只改正文就会把 category / title / source
+                # 等一并清空
+                existing = get_document(doc_id)
+                if existing is None:
+                    raise LookupError("知识片段不存在")
+                metadata = dict(existing.get("metadata") or {})
+            return update_document(doc_id, payload.content, metadata)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LookupError as exc:
@@ -2327,7 +2460,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.post("/api/knowledge/import")
-    def knowledge_import(
+    async def knowledge_import(
         payload: KnowledgeImportPayload,
         request: Request,
         response: Response,
@@ -2336,10 +2469,19 @@ def create_app(model: Any = None) -> FastAPI:
         """批量导入知识片段（来自导出的 JSON；单次最多 200 条）。
 
         ``dry_run=1`` 时只校验 / 去重并返回 ``would_import``，不写库。
+
+        导入在知识库专用单 worker 执行器里执行：整批嵌入会在进程写锁内
+        串行跑分钟级，占用 Starlette 共享线程池会让面板数据接口一起排队。
         """
-        response.headers.update(_enforce_import_rate_limit(state, request))
+        response.headers.update(
+            await asyncio.to_thread(_enforce_import_rate_limit, state, request)
+        )
+        loop = asyncio.get_running_loop()
         try:
-            return import_documents(payload.documents, dry_run=dry_run)
+            return await loop.run_in_executor(
+                state.kb_import_executor,
+                lambda: import_documents(payload.documents, dry_run=dry_run),
+            )
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
@@ -2351,13 +2493,19 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"导入失败：{exc}") from exc
 
     @app.post("/api/knowledge/import/preview")
-    def knowledge_import_preview(
+    async def knowledge_import_preview(
         payload: KnowledgeImportPreviewPayload, request: Request, response: Response
     ) -> dict[str, Any]:
         """预览导入（不写库）：整个备份一次校验 / 去重，返回将导入 / 跳过的数量。"""
-        response.headers.update(_enforce_import_rate_limit(state, request))
+        response.headers.update(
+            await asyncio.to_thread(_enforce_import_rate_limit, state, request)
+        )
+        loop = asyncio.get_running_loop()
         try:
-            return import_documents(payload.documents, dry_run=True)
+            return await loop.run_in_executor(
+                state.kb_import_executor,
+                lambda: import_documents(payload.documents, dry_run=True),
+            )
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
@@ -2369,7 +2517,12 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"预览失败：{exc}") from exc
 
     @app.get("/api/status")
-    def status(user_id: str = Query(default="web_user", pattern=_ID_PATTERN)) -> dict[str, Any]:
+    def status(
+        request: Request,
+        response: Response,
+        user_id: str = Query(default="web_user", pattern=_ID_PATTERN),
+    ) -> dict[str, Any]:
+        response.headers.update(_enforce_read_rate_limit(state, request))
         data = _load_user_data(user_id)
         preferences = _visible_preferences(data["preferences"])
         today = datetime.now().date()
@@ -2457,12 +2610,15 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/sessions")
     def list_sessions(
+        request: Request,
+        response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
         archived: bool = Query(default=False),
     ) -> dict[str, Any]:
+        response.headers.update(_enforce_read_rate_limit(state, request))
         data = _load_user_data(user_id)
         titles = data.get("session_titles") or {}
         pinned = data.get("pinned_sessions") or []
@@ -2488,6 +2644,7 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/sessions/export")
     def export_sessions(
+        request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
         format: Literal["md", "html"] = Query(default="md"),
     ) -> Response:
@@ -2498,6 +2655,7 @@ def create_app(model: Any = None) -> FastAPI:
 
         必须声明在 ``/api/sessions/{session_id}`` 之前，否则会被动态路由捕获。
         """
+        rate_headers = _enforce_read_rate_limit(state, request)
         store = _open_long_term(user_id)
         try:
             messages = store.get_chat_history()
@@ -2518,7 +2676,8 @@ def create_app(model: Any = None) -> FastAPI:
                 content=html,
                 media_type="text/html; charset=utf-8",
                 headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"'
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    **rate_headers,
                 },
             )
         markdown, count = render_all_sessions_markdown(user_id, messages, titles)
@@ -2527,7 +2686,10 @@ def create_app(model: Any = None) -> FastAPI:
         return Response(
             content=markdown,
             media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                **rate_headers,
+            },
         )
 
     @app.get("/api/sessions/{session_id}")
@@ -3086,6 +3248,8 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/trips")
     def list_trips(
+        request: Request,
+        response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
@@ -3101,6 +3265,7 @@ def create_app(model: Any = None) -> FastAPI:
         ``status`` 按面板状态徽标过滤（active / upcoming / past ↔
         进行中 / 即将出行 / 已结束），日期重叠仍按完整历史计算。
         """
+        response.headers.update(_enforce_read_rate_limit(state, request))
         store = _open_long_term(user_id)
         try:
             all_trips = store.get_trip_history(limit=None)
@@ -3406,9 +3571,11 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/export")
     def export(
+        request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
         format: Literal["json", "md"] = Query(default="json"),
     ) -> Response:
+        rate_headers = _enforce_read_rate_limit(state, request)
         data = _load_user_data(user_id)
         safe_user = _safe_filename(user_id)
         if format == "md":
@@ -3416,7 +3583,8 @@ def create_app(model: Any = None) -> FastAPI:
                 content=_user_data_markdown(user_id, data),
                 media_type="text/markdown; charset=utf-8",
                 headers={
-                    "Content-Disposition": f'attachment; filename="aligo_{safe_user}.md"'
+                    "Content-Disposition": f'attachment; filename="aligo_{safe_user}.md"',
+                    **rate_headers,
                 },
             )
 
@@ -3433,13 +3601,13 @@ def create_app(model: Any = None) -> FastAPI:
             content=payload,
             media_type="application/json",
             headers={
-                "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"'
+                "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"',
+                **rate_headers,
             },
         )
 
     @app.post("/api/import")
     async def user_data_import(
-        payload: UserImportPayload,
         request: Request,
         response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -3465,12 +3633,22 @@ def create_app(model: Any = None) -> FastAPI:
             preview_user_import,
         )
 
-        # 限流与整份备份解析都走线程池：Redis eval 与 20 万条消息的归一化
-        # 不能阻塞事件循环（大备份会让所有请求与 SSE 进度/心跳停摆）
+        # 限流先于解析，而且都走线程池：请求体可达 64MB，Pydantic body 参数
+        # 会让 FastAPI 在事件循环上同步 json.loads（实测 64MB 约 3 秒），
+        # 所有 SSE 与请求一起停摆；超限的风暴请求也不该先付出解析代价
         response.headers.update(
             await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
         )
         loop = asyncio.get_running_loop()
+        raw_body = await request.body()
+        try:
+            payload = await loop.run_in_executor(
+                state.import_executor, UserImportPayload.model_validate_json, raw_body
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422, detail=jsonable_encoder(exc.errors())
+            ) from exc
         try:
             sections, errors = await loop.run_in_executor(
                 state.import_executor, parse_user_export_data, payload.backup
@@ -3486,11 +3664,17 @@ def create_app(model: Any = None) -> FastAPI:
 
         async with state.lock_for(user_id):
             # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
-            # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）
+            # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
+            # 行程里引用的会话同样计入：只有行程、没有消息的保留字会话
+            # 也要清掉关联，否则面板里出现一条永远打不开的行程会话链接
             unique_sessions = {
                 message["session_id"]
                 for message in sections["messages"]
                 if message["session_id"]
+            } | {
+                trip.get("session_id")
+                for trip in sections["trips"]
+                if trip.get("session_id")
             }
             if unique_sessions:
                 # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
