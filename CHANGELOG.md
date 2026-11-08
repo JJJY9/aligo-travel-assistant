@@ -19,6 +19,7 @@
 - Web 备份导出携带知识库：`GET /api/export?with_knowledge=1` 把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段、同一导入恢复路径），知识库未初始化 / 导出失败返回 503
 - 记忆面板新增「备份（含知识库）」按钮：一键下载用户数据 + 知识库片段的一体化 JSON（恢复仍走「恢复备份」同一入口）
 - 知识库重复检查：`GET /api/knowledge/duplicates` 与面板「查重复」按钮列出内容完全相同的独立片段组（与 CLI `kb-duplicates` 同一实现，`limit=0` 全量；带 `group` / `parts>1` 的多分片记录内部重复不计为重复），旧备份多次导入后可直接定位要清理的片段
+- CLI `trip-calendar <user_id> <trip_id> [path] [--stdout] [--force]`：单条行程导出 iCalendar（与 Web `GET /api/trips/{trip_id}/calendar` 同一渲染口径与 VALARM 提醒；歧义 trip_id / 缺少出发日期返回 1，默认 `exports/aligo_<trip_id>.ics`、覆盖需 `--force`）
 
 ### 变更
 - 交互式 CLI 输入管道按行权威解码（UTF-8 / GBK 不再靠字节前缀猜测；`utf-8-sig` / UTF-16 输入正确拆行），一次性命令不再探测 stdin
