@@ -2510,6 +2510,7 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
     client = _client()
     user_id = _unique_user("web_test_import_fail")
     strict_flags = []
+    original_open = server_module._open_long_term
 
     def failing_open(target_user, strict=False):
         strict_flags.append(strict)
@@ -2536,6 +2537,22 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
     )
     assert response.status_code == 503
     assert response.json()["detail"] == "恢复失败，请稍后重试"
+
+    # 真实的 _open_long_term(strict=True) 把 MemoryPersistenceError 转成
+    # HTTPException(503)；这条 503 必须原样上抛，不能被包装成「恢复失败」
+    monkeypatch.setattr(server_module, "_open_long_term", original_open)
+
+    def failing_factory(*args, **kwargs):
+        raise MemoryPersistenceError("postgres down")
+
+    monkeypatch.setattr(server_module, "create_long_term_memory", failing_factory)
+    strict_failed = client.post(
+        "/api/import",
+        params={"user_id": user_id},
+        json={"backup": {"preferences": {"home_location": "北京"}}},
+    )
+    assert strict_failed.status_code == 503
+    assert strict_failed.json()["detail"] == "存储暂时不可用，请稍后再试"
     print("✓ /api/import strict 打开与失败映射")
 
 
@@ -2656,6 +2673,58 @@ def test_import_skips_recently_deleted_sessions(monkeypatch):
     assert payload["messages_added"] == 1
     assert any("最近被删除" in item for item in payload["skipped"])
     print("✓ /api/import 跳过墓碑期内的已删除会话")
+
+
+def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
+    """恢复写库期间其它实例删除会话：写完后复查墓碑并整会话回滚。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_import_late")
+    state = client.app.state.aligo
+    flags = {"late": False}
+    monkeypatch.setattr(
+        state,
+        "is_recently_deleted",
+        lambda uid, sid: uid == user_id and sid == "s-late" and flags["late"],
+    )
+    from utils import user_import as user_import_module
+
+    original_import = user_import_module.import_user_data
+
+    def import_then_delete(store, sections):
+        counts = original_import(store, sections)
+        flags["late"] = True
+        return counts
+
+    monkeypatch.setattr(user_import_module, "import_user_data", import_then_delete)
+    backup = {
+        "chat_history": [
+            {"role": "user", "content": "恢复期间被删", "session_id": "s-late"}
+        ]
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["messages_added"] == 0, payload
+        assert any("写入期间被删除" in item for item in payload["skipped"]), payload[
+            "skipped"
+        ]
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            assert store.get_chat_history(session_id="s-late") == [], (
+                "恢复写库期间被删除的会话不能留下消息"
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+    finally:
+        _cleanup(user_id)
+    print("✓ /api/import 回滚恢复写入期间被删除的会话")
 
 
 def test_preference_storage_failure_maps_503(monkeypatch):

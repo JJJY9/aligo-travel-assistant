@@ -4162,6 +4162,7 @@ def create_app(model: Any = None) -> FastAPI:
                     if session_id in _RESERVED_SESSION_IDS
                 }
                 skipped_sessions = deleted_sessions | reserved_sessions
+                active_sessions = set(unique_sessions) - skipped_sessions
                 for session_id in sorted(deleted_sessions):
                     errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
                 for session_id in sorted(reserved_sessions):
@@ -4200,12 +4201,49 @@ def create_app(model: Any = None) -> FastAPI:
                     try:
                         if dry_run:
                             return preview_user_import(store, sections)
-                        return import_user_data(store, sections)
+                        counts = import_user_data(store, sections)
+                        # 写库期间（大备份可能数十秒）其它实例 / CLI 可能删除
+                        # 某个会话：最后再查一次墓碑并整会话回滚，避免迟到的
+                        # 删除被恢复写回。若删除发生在本次检查之后，它自己的
+                        # DELETE 会再次清掉已插入的行，不会被复活。
+                        late_deleted = {
+                            session_id
+                            for session_id in active_sessions
+                            if state.is_recently_deleted(user_id, session_id)
+                        }
+                        removed_total = 0
+                        for session_id in sorted(late_deleted):
+                            try:
+                                removed_total += int(
+                                    store.delete_chat_session(session_id) or 0
+                                )
+                            except Exception as exc:  # noqa: BLE001 - 尽力回滚
+                                logger.warning(
+                                    "回滚恢复期间被删除的会话 %s 失败：%s",
+                                    session_id,
+                                    exc,
+                                )
+                                continue
+                            errors.append(
+                                f"会话 {session_id} 在恢复写入期间被删除，"
+                                f"已回滚 {removed_total} 条消息"
+                            )
+                        if removed_total:
+                            counts["messages_added"] = max(
+                                0,
+                                int(counts.get("messages_added") or 0)
+                                - removed_total,
+                            )
+                        return counts
                     finally:
                         _close_long_term(store)
 
                 try:
                     counts = await loop.run_in_executor(state.import_executor, _run_import)
+                except HTTPException:
+                    # 存储打开失败的 503（_open_long_term strict）原样上抛，
+                    # 不再被下面的通用分支改成「恢复失败」丢掉原因
+                    raise
                 except MemoryPersistenceError as exc:
                     logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                     raise HTTPException(

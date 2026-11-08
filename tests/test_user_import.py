@@ -1012,6 +1012,41 @@ def test_runner_skips_trip_only_reserved_and_deleted_sessions(monkeypatch):
     print("✓ user-import 过滤仅被行程引用的保留字 / 墓碑期会话")
 
 
+def test_runner_rolls_back_session_deleted_during_write(monkeypatch):
+    """CLI 恢复写库期间会话被其它实例删除：写完复查共享墓碑并回滚。"""
+    from utils import tombstones
+    from utils import user_import as user_import_module
+
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "恢复期间被删", "session_id": "s-late"}
+        ]
+    }
+    path = _write_json(payload)
+    store = _real_store("u-cli-late")
+    flags = {"late": False}
+    original_import = user_import_module.import_user_data
+
+    def import_then_delete(store_obj, sections):
+        counts = original_import(store_obj, sections)
+        flags["late"] = True
+        return counts
+
+    monkeypatch.setattr(user_import_module, "import_user_data", import_then_delete)
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id: session_id == "s-late" and flags["late"],
+    )
+    code, out = _run_import(monkeypatch, "u-cli-late", path, store, as_json=True)
+    result = json.loads(out)
+    assert code == 0, out
+    assert result["messages_added"] == 0, result
+    assert any("写入期间被删除" in item for item in result["skipped"]), result
+    assert store.get_chat_history(session_id="s-late") == []
+    print("✓ CLI 恢复回滚写入期间被删除的会话")
+
+
 def test_parse_rejects_huge_integer_literal_content():
     """含超 4300 位整数字面量的助手消息在导入时拒绝（否则汇总/查看永久 500）。"""
     payload = {
@@ -1045,6 +1080,7 @@ def test_parse_survives_extreme_timestamp():
     sections, errors = parse_user_export(json.dumps(payload))
     assert errors == [], errors
     assert len(sections["messages"]) == 1
+    assert sections["messages"][0]["timestamp"] is None, "越界年份按缺失处理"
     print("✓ 极端年份时间戳的备份可正常解析")
 def test_parse_rejects_non_finite_preference_values():
     """偏好值里的 NaN / Infinity 在导入时拒绝（PG JSONB 确定性失败）。"""
@@ -1087,6 +1123,88 @@ def test_parse_rejects_slash_preference_keys():
     print("✓ 含斜杠的偏好键被拒绝")
 
 
+def test_parse_rejects_bad_trip_date_text():
+    """行程日期里的 NUL / 孤立代理项同样跳过该行（PG 整份恢复不再 503）。"""
+    payload = {
+        "trip_history": [
+            {"destination": "上海", "start_date": "2026-01-01\x00"},
+            {
+                "destination": "广州",
+                "start_date": "2026-01-02",
+                "end_date": "2026-01-01\ud800",
+            },
+            {"destination": "北京", "start_date": "2026-01-03"},
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert [trip["destination"] for trip in sections["trips"]] == ["北京"]
+    assert sum("NUL" in error for error in errors) == 1, errors
+    assert sum("孤立代理项" in error for error in errors) == 1, errors
+    print("✓ 行程日期文本门禁（NUL / 孤立代理项）")
+
+
+def test_extreme_timestamps_fall_back_to_restore_time():
+    """极端年份（含时区偏移越界）按缺失处理，不落库成 PG 不可读的时间。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "a",
+                "timestamp": "0001-01-01T00:00:00+08:00",
+                "session_id": "s1",
+            },
+            {
+                "role": "user",
+                "content": "b",
+                "timestamp": "9999-12-31T23:59:59-08:00",
+                "session_id": "s1",
+            },
+            {
+                "role": "user",
+                "content": "ok",
+                "timestamp": "2026-01-01T00:00:00",
+                "session_id": "s1",
+            },
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert errors == [], errors
+    timestamps = [message["timestamp"] for message in sections["messages"]]
+    assert sum(value is None for value in timestamps) == 2, timestamps
+    assert any(value is not None for value in timestamps)
+
+
+def test_parse_drops_broken_knowledge_groups_and_bad_metadata():
+    """知识元数据含坏文本 / 分片编号重复或缺失的组整组丢弃，其余照常恢复。"""
+    payload = {
+        "knowledge": [
+            {"content": "正常文档", "metadata": {}},
+            {"content": "坏元数据", "metadata": {"title": "x\x00"}},
+            {
+                "content": "组一号",
+                "metadata": {"group": "g", "part": "1", "parts": "2"},
+            },
+            {
+                "content": "组一号",
+                "metadata": {"group": "g", "part": "1", "parts": "2"},
+            },
+            {
+                "content": "缺号",
+                "metadata": {"group": "g2", "part": "2", "parts": "2"},
+            },
+            {"content": "独立片段", "metadata": {}},
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    contents = [entry["content"] for entry in sections["knowledge"]]
+    assert "坏元数据" not in contents
+    assert "组一号" not in contents and "缺号" not in contents
+    assert "正常文档" in contents and "独立片段" in contents
+    assert any("NUL" in error for error in errors), errors
+    assert any("分片编号重复或缺失" in error for error in errors), errors
+    print("✓ 知识元数据文本门禁与残缺组整组丢弃")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -1116,6 +1234,9 @@ if __name__ == "__main__":
     test_parse_rejects_non_finite_preference_values()
     test_parse_rejects_non_finite_unknown_meta_keys()
     test_parse_rejects_slash_preference_keys()
+    test_parse_rejects_bad_trip_date_text()
+    test_extreme_timestamps_fall_back_to_restore_time()
+    test_parse_drops_broken_knowledge_groups_and_bad_metadata()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,
@@ -1129,6 +1250,7 @@ if __name__ == "__main__":
         test_parse_truncation_drops_split_knowledge_group,
         test_runner_skips_reserved_and_deleted_sessions,
         test_runner_skips_trip_only_reserved_and_deleted_sessions,
+        test_runner_rolls_back_session_deleted_during_write,
     ):
         mp = pytest.MonkeyPatch()
         try:

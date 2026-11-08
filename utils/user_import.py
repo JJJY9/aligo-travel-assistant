@@ -37,13 +37,25 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+# 时间戳年份范围：PostgreSQL 的 timestamptz 读写器拒绝公元 1 年之前 /
+# 10000 年之后（带时区偏移的 0001 / 9999 换算后越界），会留下整用户不可读
+# 的消息行；JSON 后端在 CLI 展示时也会 OverflowError。超出范围的按缺失处理。
+_MIN_TIMESTAMP_YEAR = 1900
+_MAX_TIMESTAMP_YEAR = 2100
+
+
 def _normalize_timestamp(value: Any) -> str | None:
     """合法 ISO 时间戳归一成带时区形式；非法 / 缺失返回 None（按恢复时间落库）。"""
     parsed = parse_iso_datetime(value)
     if parsed is None:
         return None
-    if parsed.tzinfo is None:
-        parsed = localize_naive(parsed)
+    try:
+        if parsed.tzinfo is None:
+            parsed = localize_naive(parsed)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if not (_MIN_TIMESTAMP_YEAR <= parsed.year <= _MAX_TIMESTAMP_YEAR):
+        return None
     return parsed.isoformat()
 
 
@@ -320,11 +332,17 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if not destination:
             errors.append(f"跳过第 {index} 条行程：目的地为空")
             continue
-        start_date = _normalize_trip_date(str(row.get("start_date") or "").strip())
+        start_raw = str(row.get("start_date") or "").strip()
+        end_raw = str(row.get("end_date") or "").strip()
+        date_problem = _text_problem(start_raw) or _text_problem(end_raw)
+        if date_problem:
+            errors.append(f"跳过第 {index} 条行程：{date_problem}")
+            continue
+        start_date = _normalize_trip_date(start_raw)
         if not start_date:
             errors.append(f"跳过第 {index} 条行程：出发日期为空")
             continue
-        end_date = _normalize_trip_date(str(row.get("end_date") or "").strip())
+        end_date = _normalize_trip_date(end_raw)
         start_dt = _strict_date(start_date)
         end_dt = _strict_date(end_date) if end_date else None
         if start_dt is not None and end_dt is not None and end_dt < start_dt:
@@ -453,14 +471,24 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
                 if group:
                     invalid_groups.add(group)
                 continue
+            cleaned_meta: dict[str, str] = {}
+            meta_problem: str | None = ""
+            for key, value in list(metadata.items())[:_MAX_PREFERENCES]:
+                key_text = str(key)[:32]
+                value_text = str(value)[:200]
+                meta_problem = (
+                    meta_problem
+                    or _text_problem(key_text)
+                    or _text_problem(value_text)
+                )
+                cleaned_meta[key_text] = value_text
+            if meta_problem:
+                errors.append(f"跳过第 {index} 个知识片段：{meta_problem}")
+                if group:
+                    invalid_groups.add(group)
+                continue
             knowledge.append(
-                {
-                    "content": content,
-                    "metadata": {
-                        str(key)[:32]: str(value)[:200]
-                        for key, value in list(metadata.items())[:_MAX_PREFERENCES]
-                    },
-                }
+                {"content": content, "metadata": cleaned_meta}
             )
         if len(raw_knowledge) > _MAX_KNOWLEDGE:
             errors.append(f"知识片段超过 {_MAX_KNOWLEDGE} 条，多余条目已跳过")
@@ -510,6 +538,45 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
                 f"同组含无效分片（{', '.join(sorted(invalid_groups)[:3])}）"
             )
         knowledge = remaining
+    # 结构校验：part 编号重复 / 缺号 / 与 parts 声明不符的组整组丢弃。
+    # 否则 import_documents 的分组完整性校验会抛 ValueError，整份知识段
+    # （包括无关的合法文档）都恢复不了。
+    broken_groups: set[str] = set()
+    group_declared: dict[str, int] = {}
+    group_parts: dict[str, list[int]] = {}
+    for entry in knowledge:
+        meta = entry["metadata"]
+        group = str(meta.get("group") or "")
+        if not group:
+            continue
+        try:
+            parts = int(meta.get("parts") or 1)
+        except (TypeError, ValueError, OverflowError):
+            parts = 1
+        if parts <= 1:
+            continue
+        group_declared[group] = max(group_declared.get(group, 1), parts)
+        try:
+            part = int(meta.get("part") or 0)
+        except (TypeError, ValueError, OverflowError):
+            part = 0
+        group_parts.setdefault(group, []).append(part)
+    for group, declared_parts in group_declared.items():
+        seen = group_parts.get(group, [])
+        if len(seen) != len(set(seen)) or set(seen) != set(
+            range(1, declared_parts + 1)
+        ):
+            broken_groups.add(group)
+    if broken_groups:
+        knowledge = [
+            entry
+            for entry in knowledge
+            if str(entry["metadata"].get("group") or "") not in broken_groups
+        ]
+        errors.append(
+            f"跳过 {len(broken_groups)} 个知识分片组：分片编号重复或缺失"
+        )
+
     sections["knowledge"] = knowledge
 
     recoverable = any(

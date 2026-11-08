@@ -390,6 +390,23 @@ def test_skill_loader_warns_missing_manifest(tmp_path, capsys):
     print("✓ 技能缺 SKILL.md / frontmatter 时有警告")
 
 
+def test_local_timestamp_text_tolerates_extreme_years():
+    """极端年份 / 偏移的展示时间不抛 OverflowError（列表 / 详情不再整条崩溃）。"""
+    assert (
+        cli_module._local_timestamp_text("0001-01-01T00:00:00+08:00")
+        == "0001-01-01 00:00:00"
+    )
+    assert (
+        cli_module._local_timestamp_text("9999-12-31T23:59:59-08:00")
+        == "9999-12-31 23:59:59"
+    )
+    assert (
+        cli_module._local_timestamp_text("2026-01-01T00:00:00")
+        == "2026-01-01 00:00:00"
+    )
+    print("✓ 展示时间容忍极端年份")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -404,6 +421,7 @@ if __name__ == "__main__":
     test_preference_rendering_robust_and_consistent()
     test_preference_rendering_skips_unmanageable_types()
     test_preference_legacy_dict_and_nested_shapes()
+    test_local_timestamp_text_tolerates_extreme_years()
     test_agent_error_message_fallback()
     test_status_renders_assistant_plaintext()
     test_preferences_table_keeps_zero_and_lists()
