@@ -182,6 +182,9 @@ def test_trip_import_file_decoding_and_size_guard():
     assert results["after_import"]["text"] == "导入行程"
     assert results["after_import"]["disabled"] is False
     assert results["after_import"]["toasts"][-1] == "已导入 1 条行程"
+    assert results["after_import"]["confirm"] == (
+        "将新增 1 条、更新 0 条行程，跳过 73 条。继续？"
+    ), "确认框的跳过数量必须用 skipped_total（列表最多 50 条）"
     assert results["pinned_url"].endswith("user_id=user-a"), (
         "解码 / 请求期间切换用户，导入仍落在选择文件时的用户"
     )
