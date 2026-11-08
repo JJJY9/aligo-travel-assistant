@@ -356,6 +356,48 @@ function scenarioRender(source) {
   };
 }
 
+async function scenarioDuplicates(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+
+  // 无重复
+  let promise = run("runKbDuplicates()");
+  await tick();
+  env.__requests[0].resolve({
+    total_groups: 0,
+    total_fragments: 0,
+    shown: 0,
+    groups: [],
+  });
+  await promise;
+  results.empty = run("els.kbEvalResult.textContent");
+
+  // 有重复且超过展示上限
+  promise = run("runKbDuplicates()");
+  await tick();
+  env.__requests[1].resolve({
+    total_groups: 3,
+    total_fragments: 7,
+    shown: 2,
+    groups: [
+      { ids: [3, 7], preview: "完全相同的内容" },
+      { ids: [9], preview: "" },
+    ],
+  });
+  await promise;
+  results.groups = run("els.kbEvalResult.textContent");
+
+  // 失败
+  promise = run("runKbDuplicates()");
+  await tick();
+  env.__requests[2].reject(new Error("网络抖动"));
+  await promise;
+  results.error = run("els.kbEvalResult.textContent");
+  results.button = run("els.kbDuplicates.textContent");
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -370,6 +412,8 @@ async function main() {
     payload = scenarioPreview(source);
   } else if (scenario === "render") {
     payload = scenarioRender(source);
+  } else if (scenario === "duplicates") {
+    payload = await scenarioDuplicates(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
