@@ -106,6 +106,21 @@ def _json_nesting_too_deep(text: str, limit: int = _MAX_JSON_DEPTH) -> bool:
             depth -= 1
     return False
 
+def _text_problem(value: str) -> str | None:
+    """备份文本不能含 NUL 或孤立代理项：两后端行为分叉且都不可恢复。
+
+    PostgreSQL 的 text 列拒绝 0x00（psycopg DataError，不在重试错误元组
+    里，整份恢复 503）；孤立代理项在本机 UTF-8 写盘 / 编码时抛
+    UnicodeEncodeError（JSON 后端 json.dump 同样走 UTF-8）。
+    """
+    if "\x00" in value:
+        return "包含 NUL 字符"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "包含无法编码的字符（孤立代理项）"
+    return None
+
 
 def _assistant_content_problem(content: str) -> str | None:
     """assistant 消息里的 _meta.usage 若存在则必须是数字字段。
@@ -135,6 +150,24 @@ def _assistant_content_problem(content: str) -> str | None:
     if agents is not None and not isinstance(agents, list):
         # 汇总接口会迭代该字段：非列表（5 / true）落库后 /api/status 永久 500
         return "消息智能体列表不是数组"
+    for item in agents or []:
+        if not isinstance(item, dict):
+            continue
+        duration = item.get("duration")
+        if duration is None:
+            continue
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            return "智能体耗时不是数字"
+        if isinstance(duration, float) and not math.isfinite(duration):
+            return "智能体耗时不是有限数"
+    elapsed = meta.get("elapsed")
+    if elapsed is not None:
+        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+            return "消息耗时不是数字"
+        # 1e999 解析为 inf：/api/status 的 avg_elapsed 变 inf，JSON 序列化
+        # （allow_nan=False）直接 500，且故障随消息永久存在
+        if isinstance(elapsed, float) and not math.isfinite(elapsed):
+            return "消息耗时不是有限数"
     usage = meta.get("usage")
     if usage is None:
         return None
@@ -216,13 +249,23 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         session_id, ok = _clean_session_id(row.get("session_id"))
         if not ok:
             errors.append(f"第 {index} 条行程：会话 ID 非法，已忽略会话关联")
+        origin = str(row.get("origin") or "").strip()
+        purpose = str(row.get("purpose") or "").strip() or "出差"
+        problem = (
+            _text_problem(origin)
+            or _text_problem(destination)
+            or _text_problem(purpose)
+        )
+        if problem:
+            errors.append(f"跳过第 {index} 条行程：{problem}")
+            continue
         trips.append(
             {
-                "origin": str(row.get("origin") or "").strip(),
+                "origin": origin,
                 "destination": destination,
                 "start_date": start_date,
                 "end_date": end_date,
-                "purpose": str(row.get("purpose") or "").strip() or "出差",
+                "purpose": purpose,
                 "session_id": session_id,
             }
         )
@@ -245,6 +288,10 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         session_id, ok = _clean_session_id(row.get("session_id"))
         if not ok:
             errors.append(f"跳过第 {index} 条消息：会话 ID 非法")
+            continue
+        problem = _text_problem(content)
+        if problem:
+            errors.append(f"跳过第 {index} 条消息：{problem}")
             continue
         if role == "assistant":
             problem = _assistant_content_problem(content)
@@ -279,6 +326,10 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if session_id not in session_ids:
             # 悬空的会话元数据（导出源自身也会忽略）不阻断恢复
             continue
+        problem = _text_problem(title)
+        if problem:
+            errors.append(f"忽略会话 {session_id} 的标题：{problem}")
+            continue
         titles[session_id] = title[:60]
     sections["titles"] = titles
 
@@ -309,6 +360,12 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             group = str(metadata.get("group") or "")
             if not isinstance(content, str) or not content.strip():
                 errors.append(f"跳过第 {index} 个知识片段：内容为空或非法")
+                if group:
+                    invalid_groups.add(group)
+                continue
+            problem = _text_problem(content)
+            if problem:
+                errors.append(f"跳过第 {index} 个知识片段：{problem}")
                 if group:
                     invalid_groups.add(group)
                 continue

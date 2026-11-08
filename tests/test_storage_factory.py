@@ -329,6 +329,24 @@ def test_valid_json_non_object_memory_file_is_backed_up():
     print("✓ 非对象记忆文件备份重建；字段异常读取时修复")
 
 
+def test_corrupt_pending_non_object_file_backed_up_before_write():
+    """写前复核同样按损坏处理 [] / null（不能因「能解析」放行后永久写失败）。"""
+    from pathlib import Path
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-pending", storage_dir)
+    path = Path(storage_dir) / "u-pending.json"
+    path.write_text("[]", encoding="utf-8")
+    # 模拟 _load 因锁超时 / 备份失败以空快照启动：标记在、磁盘仍是坏文件
+    memory._corrupt_pending = True  # noqa: SLF001 - 复现故障注入前置状态
+    memory.save_preference("home_location", "北京")
+    assert memory.get_preference("home_location") == "北京"
+    backups = list(Path(storage_dir).glob("u-pending.json.corrupt-*"))
+    assert backups, "非对象损坏文件必须补备份"
+    assert backups[0].read_text(encoding="utf-8") == "[]"
+    print("✓ 写前复核把非对象文件按损坏备份（写入不再永久失败）")
+
+
 def test_memory_persistence_error_is_not_retriable():
     """写盘失败不能被当作可重试的网络错误（否则会重跑整轮对话、误开熔断器）。"""
     from utils.llm_resilience import is_retriable_error
@@ -1573,6 +1591,7 @@ if __name__ == "__main__":
     test_corrupt_memory_file_is_backed_up()
     test_corrupt_backup_does_not_move_concurrently_written_file(pytest.MonkeyPatch())
     test_valid_json_non_object_memory_file_is_backed_up()
+    test_corrupt_pending_non_object_file_backed_up_before_write()
     test_null_list_fields_are_repaired()
     test_migrate_fills_statistics_defaults()
     test_migrate_repairs_bad_statistics_values()

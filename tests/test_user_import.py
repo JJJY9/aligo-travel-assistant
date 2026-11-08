@@ -637,6 +637,66 @@ def test_runner_knowledge_error_and_skip(monkeypatch):
     assert calls == [], "--skip-knowledge 不得触碰知识库"
     print("✓ 知识片段失败上报 / --skip-knowledge 跳过")
 
+def test_parse_rejects_nul_and_lone_surrogates():
+    """NUL / 孤立代理项在 PostgreSQL / JSON 后端不可恢复，导入时拒绝。"""
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "a\x00b", "session_id": "s1"},
+            {"role": "user", "content": "bad\ud800", "session_id": "s1"},
+            {"role": "user", "content": "正常提问", "session_id": "s1"},
+        ],
+        "trip_history": [
+            {"destination": "上海\x00", "start_date": "2026-01-01"},
+        ],
+        "session_titles": {"s1": "标题\ud800"},
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=True))
+    assert [message["content"] for message in sections["messages"]] == ["正常提问"]
+    assert sections["trips"] == []
+    assert sections["titles"] == {}
+    assert any("NUL" in error for error in errors), errors
+    assert any("孤立代理项" in error for error in errors), errors
+    print("✓ NUL / 孤立代理项在导入时被拒绝")
+
+
+def test_parse_rejects_non_finite_meta_durations():
+    """_meta.elapsed / agents[].duration 非有限数会让状态接口永久 500。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    {"status": "completed", "results": [], "_meta": {"elapsed": float("inf")}}
+                ),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "status": "completed",
+                        "results": [],
+                        "_meta": {"agents": [{"name": "x", "duration": float("nan")}]},
+                    }
+                ),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    {"status": "completed", "results": [], "_meta": {"elapsed": 1.5}}
+                ),
+                "session_id": "s1",
+            },
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=True))
+    assert len(sections["messages"]) == 1, "只有合法耗时的消息可恢复"
+    assert any("消息耗时不是有限数" in error for error in errors), errors
+    assert any("智能体耗时不是有限数" in error for error in errors), errors
+    print("✓ 非有限耗时在导入时被拒绝")
+
+
 def test_parse_drops_whole_knowledge_group_with_invalid_part():
     """组内有无效分片时整组丢弃：只删坏分片会让知识恢复因缺片整体失败。"""
     payload = {
@@ -692,6 +752,8 @@ if __name__ == "__main__":
     test_parse_knowledge_section_wrong_type()
     test_parse_drops_whole_knowledge_group_with_invalid_part()
     test_parse_rejects_deep_nested_assistant_content()
+    test_parse_rejects_nul_and_lone_surrogates()
+    test_parse_rejects_non_finite_meta_durations()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     for case in (

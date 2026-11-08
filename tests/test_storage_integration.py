@@ -193,6 +193,24 @@ def test_pg_add_chat_turn_writes_pair_in_one_transaction():
         memory.close()
 
 
+def test_pg_delete_all_resets_trip_counters():
+    """PG delete_all：行程编号计数器一并删除（重新从 trip_1 开始）。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        first = memory.save_trip_history(
+            {"origin": "北京", "destination": "上海", "start_date": "2027-01-01"}
+        )
+        assert first, "首次保存应返回 trip_id"
+        memory.delete_all()
+        second = memory.save_trip_history(
+            {"origin": "北京", "destination": "上海", "start_date": "2027-01-05"}
+        )
+        assert second == first, "delete_all 后编号计数器必须清零（与 JSON 后端一致）"
+        print("✓ PG delete_all 清零行程编号计数器")
+    finally:
+        memory.close()
+
+
 def test_pg_save_trip_histories_counts_mixed_batch():
     """PG 批量保存：同批「已存在 + 新建」的 created/updated 计数正确。"""
     memory, _ = _pg_memory_or_skip()

@@ -9,6 +9,7 @@ PostgreSQL 长期记忆后端
 - 偏好值以 JSONB 存储（字符串 / 列表等类型原样保留）。
 """
 import contextlib
+import functools
 import logging
 import re
 from collections import Counter
@@ -102,6 +103,23 @@ CREATE TABLE IF NOT EXISTS aligo_archived_sessions (
     PRIMARY KEY (user_id, session_id)
 );
 """
+
+
+def _session_meta_guard(func):
+    """会话元数据写入装饰器：在用户级 advisory lock 内执行（与删除串行化）。
+
+    会话级锁（``_advisory_lock``）与删除路径事务内的
+    ``pg_advisory_xact_lock`` 使用同一 key、互相阻塞；选会话级是为了复用
+    ``_advisory_lock`` 的重连重获逻辑（写入语句在重试时会换连接，事务级
+    锁会随旧连接丢失）。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self._advisory_lock(f"aligo:session_meta:{self.user_id}"):
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class PostgresLongTermMemory:
@@ -479,6 +497,10 @@ class PostgresLongTermMemory:
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
                 cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:session_meta:{self.user_id}",),
+                )
+                cursor.execute(
                     "DELETE FROM aligo_chat_messages "
                     "WHERE user_id = %s AND session_id = %s",
                     (self.user_id, session_id),
@@ -536,7 +558,11 @@ class PostgresLongTermMemory:
                 )
                 return 0
         def _delete_rows() -> int:
-            with self._conn.cursor() as cursor:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:session_meta:{self.user_id}",),
+                )
                 cursor.execute(
                     "DELETE FROM aligo_chat_messages "
                     "WHERE user_id = %s AND id = ANY(%s) "
@@ -546,27 +572,28 @@ class PostgresLongTermMemory:
                     ")",
                     (self.user_id, ids, self.user_id, session_id, rows[0][0]),
                 )
-                return cursor.rowcount or 0
+                removed = cursor.rowcount or 0
+                # 会话消息已被删空时同步清理标题 / 置顶 / 归档标记。清理
+                # 无条件执行（语句自带 NOT EXISTS，会话仍有消息时是 no-op）：
+                # DELETE 在连接中断重放后 rowcount 可能为 0（实际已在服务端
+                # 删除），用 removed 做开关会让清理被永久跳过
+                for table in (
+                    "aligo_session_titles",
+                    "aligo_pinned_sessions",
+                    "aligo_archived_sessions",
+                ):
+                    cursor.execute(
+                        f"DELETE FROM {table} "
+                        "WHERE user_id = %s AND session_id = %s "
+                        "AND NOT EXISTS ("
+                        "  SELECT 1 FROM aligo_chat_messages "
+                        "  WHERE user_id = %s AND session_id = %s"
+                        ")",
+                        (self.user_id, session_id, self.user_id, session_id),
+                    )
+                return removed
 
         removed = self._run_with_retry(_delete_rows)
-        if removed:
-            # 会话消息已被删空时同步清理标题 / 置顶 / 归档标记：留下这些
-            # 元数据会让之后用同一 session_id 重新开始的新会话沿用旧标题与
-            # 置顶状态（JSON 后端的同一操作会全部清理）
-            for table in (
-                "aligo_session_titles",
-                "aligo_pinned_sessions",
-                "aligo_archived_sessions",
-            ):
-                self._execute(
-                    f"DELETE FROM {table} "
-                    "WHERE user_id = %s AND session_id = %s "
-                    "AND NOT EXISTS ("
-                    "  SELECT 1 FROM aligo_chat_messages "
-                    "  WHERE user_id = %s AND session_id = %s"
-                    ")",
-                    (self.user_id, session_id, self.user_id, session_id),
-                )
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
@@ -621,6 +648,7 @@ class PostgresLongTermMemory:
         )
         return row is not None
 
+    @_session_meta_guard
     def set_session_title(self, session_id: str, title: str) -> bool:
         """设置会话自定义标题；空标题表示恢复自动标题。返回会话是否存在。"""
         cleaned = title.strip()
@@ -656,6 +684,7 @@ class PostgresLongTermMemory:
         )
         return {session_id: title for session_id, title in rows}
 
+    @_session_meta_guard
     def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
         """置顶 / 取消置顶会话。返回会话是否存在。"""
         if pinned:
@@ -693,6 +722,7 @@ class PostgresLongTermMemory:
         )
         return [row[0] for row in rows]
 
+    @_session_meta_guard
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """归档 / 恢复会话；归档只影响会话列表展示，不删除消息。返回会话是否存在。"""
         if archived:
@@ -1016,6 +1046,7 @@ class PostgresLongTermMemory:
         for table in (
             "aligo_chat_messages",
             "aligo_trips",
+            "aligo_trip_counters",
             "aligo_preferences",
             "aligo_user_stats",
             "aligo_session_titles",

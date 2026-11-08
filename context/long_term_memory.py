@@ -185,13 +185,20 @@ class LongTermMemory:
         """
         if not self._corrupt_pending:
             return
+        corrupted = False
         try:
             with open(self.db_path, "r", encoding="utf-8") as f:
-                json.load(f)
+                data = json.load(f)
+            # 合法 JSON 但顶层不是对象（[] / null / 字符串）与解析失败同一
+            # 口径：_load / _reload_latest 都按损坏处理。只验证「能解析」
+            # 会清掉标记，随后每次写入都在 _reload_latest 抛错且永不备份
+            corrupted = not isinstance(data, dict)
         except FileNotFoundError:
             self._corrupt_pending = False
             return
-        except Exception:  # noqa: BLE001 - 仍是损坏文件：补备份
+        except Exception:  # noqa: BLE001 - 解析失败按损坏处理
+            corrupted = True
+        if corrupted:
             backup = (
                 f"{self.db_path}.corrupt-"
                 f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
