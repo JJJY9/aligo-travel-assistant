@@ -687,13 +687,20 @@ class LongTermMemory:
             raise
         logger.debug("Added chat turn to long-term memory")
 
-    def get_chat_history(self, limit: int | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
+    def get_chat_history(
+        self,
+        limit: int | None = None,
+        session_id: str | None = None,
+        exclude_session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """
         获取聊天历史
 
         Args:
             limit: 返回数量限制
             session_id: 会话ID（只返回特定会话的消息）
+            exclude_session_id: 排除该会话的消息（跨会话总结取「其它会话
+                的最近窗口」用，与 session_id 互斥，同时给出时忽略本参数）
 
         Returns:
             消息列表
@@ -702,6 +709,10 @@ class LongTermMemory:
 
         if session_id:
             messages = [m for m in messages if m.get("session_id") == session_id]
+        elif exclude_session_id:
+            messages = [
+                m for m in messages if m.get("session_id") != exclude_session_id
+            ]
 
         if limit:
             return messages[-limit:]

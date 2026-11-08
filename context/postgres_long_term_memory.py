@@ -460,12 +460,17 @@ class PostgresLongTermMemory:
         self,
         limit: int | None = None,
         session_id: str | None = None,
+        exclude_session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         where = "user_id = %s"
         params: list[Any] = [self.user_id]
         if session_id:
             where += " AND session_id = %s"
             params.append(session_id)
+        elif exclude_session_id:
+            # IS DISTINCT FROM 保留 session_id 为 NULL 的历史消息（旧版本写入）
+            where += " AND session_id IS DISTINCT FROM %s"
+            params.append(exclude_session_id)
 
         if limit:
             rows = self._fetchall(

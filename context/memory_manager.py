@@ -127,6 +127,32 @@ class MemoryManager:
         except Exception as exc:  # noqa: BLE001 - 缓存失败降级为缺少本轮上下文
             logger.warning("短期记忆写入失败（%s），本轮上下文可能缺少该消息", exc)
 
+    def rollback_staged_message(self, content: str) -> bool:
+        """编排失败 / 取消时移除编排前暂存的用户提问（尽力而为）。
+
+        仅当短期记忆末尾仍是这条未回答的用户消息时才删除：编排失败后
+        若保留，重试同一问题会在上下文里出现两条重复提问；长期记忆里
+        却没有对应轮次，两层记忆从此不一致。删除走与「删除最后一轮」
+        相同的实现（Redis 端原子脚本 + 故障期日志重放），不会误删其它
+        实例已写入的轮次。
+
+        Returns:
+            是否真的删除了暂存的提问
+        """
+        try:
+            recent = self.short_term.get_recent_context()
+            if not recent:
+                return False
+            last = recent[-1]
+            if not isinstance(last, dict):
+                return False
+            if last.get("role") != "user" or last.get("content") != content:
+                return False
+            return bool(self.short_term.truncate_last_turn(expect=content))
+        except Exception as exc:  # noqa: BLE001 - 回滚失败不能掩盖原始错误
+            logger.warning("回滚暂存提问失败（%s），短期上下文可能残留本轮提问", exc)
+            return False
+
     def add_message(self, role: str, content: str, metadata: dict | None = None):
         """
         添加消息到短期记忆和长期记忆
@@ -244,20 +270,15 @@ class MemoryManager:
     def _summary_inputs(self) -> tuple[list[dict], list[dict]]:
         """同步读取跨会话总结的输入（聊天窗口 + 行程），供 ``to_thread`` 调用。
 
-        只取最后固定窗口条会被当前会话自身占满（长会话几十轮后其它会话
-        历史永远为空），因此按「当前会话消息数 + 窗口」取数，保证至少有
-        窗口条其它会话的消息。
+        跨会话消息在存储层直接按「排除当前会话 + 固定窗口」取数：先取全部
+        历史再在 Python 里过滤会让每一步的查询量随当前会话长度线性增长
+        （PostgreSQL 每条消息都带完整 content），长会话几十轮后总结的每轮
+        开销越来越大。
         """
-        own_messages = len(
-            self.long_term.get_chat_history(session_id=self.session_id)
+        history_from_other_sessions = self.long_term.get_chat_history(
+            limit=_SUMMARY_WINDOW_MESSAGES,
+            exclude_session_id=self.session_id,
         )
-        all_history = self.long_term.get_chat_history(
-            limit=_SUMMARY_WINDOW_MESSAGES + own_messages
-        )
-        history_from_other_sessions = [
-            msg for msg in all_history
-            if msg.get("session_id") != self.session_id
-        ]
         trip_history = self.long_term.get_trip_history(limit=20)
         return history_from_other_sessions, trip_history
 

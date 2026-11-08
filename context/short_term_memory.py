@@ -23,6 +23,26 @@ logger = logging.getLogger(__name__)
 _REDIS_RETRY_COOLDOWN_SEC = 60.0
 _redis_degraded_until = 0.0
 
+# 截断脚本一次性标记的存活时间：标记要覆盖「脚本已执行、响应丢失、故障期
+# 操作日志排队等待重放」的整段时间。操作日志在进程内没有过期机制，会话可能
+# 隔很久才再次访问；标记若按消息 TTL（默认 1 小时）过期，迟到的重放会重新
+# 执行删除脚本，把同文本的下一轮对话再删一次。取 30 天，同时保证「响应丢失
+# 且操作日志被淘汰」时残留标记最终自动清理。
+_OP_MARKER_TTL_SEC = 30 * 24 * 3600
+
+# 第三方 SDK（redis-py）的连接 / 超时异常不是内置 ConnectionError /
+# TimeoutError 的子类，按类名识别（与 utils/llm_resilience 的做法一致）
+_TRANSIENT_REDIS_ERROR_NAMES = frozenset({"ConnectionError", "TimeoutError"})
+
+
+def _is_transient_redis_error(exc: BaseException) -> bool:
+    """是否为「Redis 暂时不可达」类故障（重试有意义，操作本身没问题）。"""
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return any(
+        cls.__name__ in _TRANSIENT_REDIS_ERROR_NAMES for cls in type(exc).__mro__
+    )
+
 
 
 def redis_short_term_degraded() -> bool:
@@ -590,7 +610,15 @@ class RedisShortTermMemory:
             signature = repr(ops[0])
             try:
                 self._replay_head(ops, window)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - 按异常类别决定是否计毒
+                if _is_transient_redis_error(exc):
+                    # 连接类故障只说明 Redis 暂时不可达，操作本身没有毒：
+                    # 保留队首等下次恢复后重放。若把它计入「连续失败」，
+                    # 每分钟一次的冷却重试会在长时间故障（约三分钟）后
+                    # 静默丢弃故障期新增 / 删除，恢复后消息永久缺失或
+                    # 已删除轮次复活。
+                    journal.stuck = ("", 0)
+                    raise
                 if journal.stuck[0] == signature:
                     journal.stuck = (signature, journal.stuck[1] + 1)
                 else:
@@ -649,7 +677,7 @@ class RedisShortTermMemory:
                     self._op_marker_key(op_id),
                     "1" if expect is not None else "0",
                     (expect or "").strip(),
-                    str(self.ttl_sec),
+                    str(_OP_MARKER_TTL_SEC),
                     cutoff or "",
                 )
                 or 0
@@ -801,9 +829,10 @@ class RedisShortTermMemory:
             for item in raw:
                 try:
                     message = json.loads(item)
-                except (TypeError, json.JSONDecodeError):
+                except (TypeError, json.JSONDecodeError, RecursionError):
                     # 坏元素（旧版本或人工修复写入）不能让整次读取失败，
-                    # 否则数据错误会被当作「Redis 不可用」触发进程级冷却
+                    # 否则数据错误会被当作「Redis 不可用」触发进程级冷却。
+                    # 深嵌套 JSON 解析抛 RecursionError，同样按坏条目跳过
                     logger.warning("跳过无法解析的短期记忆条目：%s", self.key)
                     continue
                 if (
@@ -905,7 +934,7 @@ class RedisShortTermMemory:
                 self._op_marker_key(op_id),
                 "1" if expect is not None else "0",
                 (expect or "").strip(),
-                str(self.ttl_sec),
+                str(_OP_MARKER_TTL_SEC),
                 "",
             ),
             fallback,
@@ -935,7 +964,7 @@ class RedisShortTermMemory:
                     return None
                 try:
                     parsed = json.loads(raw)
-                except (TypeError, json.JSONDecodeError):
+                except (TypeError, json.JSONDecodeError, RecursionError):
                     return None
                 # 可解析但非对象（null / 数字 / 列表）：不能让 .get 的
                 # AttributeError 逃进 _call_redis 被误判为 Redis 故障、

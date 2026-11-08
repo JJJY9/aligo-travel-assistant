@@ -215,6 +215,7 @@ class _FlakyRedis:
         self.data: list[str] = []
         self.applied: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
+        self.marker_ttls: list[str] = []
         self.eval_calls = 0
 
     def _check(self):
@@ -315,6 +316,7 @@ class _FlakyRedis:
             if marker in self.markers:
                 return -1
             self.markers[marker] = marker_ttl
+            self.marker_ttls.append(marker_ttl)
         if not self.data:
             return 0
         count = 1
@@ -1279,10 +1281,16 @@ def test_poison_op_dropped_after_repeated_failures(monkeypatch):
     """确定性失败的操作连续三次后丢弃，后续操作仍能重放（日志不会卡死）。"""
     from context import short_term_memory as module
 
+    class _PoisonError(Exception):
+        """确定性错误（对应 redis ResponseError / WRONGTYPE 之类）。
+
+        不能用 ConnectionError：连接类故障不代表操作有毒，必须保留重放。
+        """
+
     class _PoisonRedis(_FlakyRedis):
         def eval(self, script, numkeys, *keys_and_args):
             if any("POISON" in str(arg) for arg in keys_and_args):
-                raise ConnectionError("deterministic failure")
+                raise _PoisonError("deterministic failure")
             return super().eval(script, numkeys, *keys_and_args)
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -1321,6 +1329,76 @@ def test_replay_failure_still_registers_current_add(monkeypatch):
     contents = [item["content"] for item in memory.get_recent_context()]
     assert contents == ["M1", "M2"]
     print("✓ 重放失败时本次操作仍登记")
+
+
+def test_connection_failure_during_replay_keeps_queue(monkeypatch):
+    """连接类故障不消耗毒操作次数：长时间断连后故障期消息仍能重放。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-transient", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "故障期提问")
+    memory.add_message("assistant", "故障期回答")
+    assert [kind for kind, _ in memory._pending_ops] == ["add", "add"]
+
+    # 故障持续超过三轮冷却重试：每次重放都因连接失败，操作必须保留
+    for _ in range(6):
+        monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+        memory.get_recent_context()
+    assert [kind for kind, _ in memory._pending_ops] == ["add", "add"], (
+        "连接类故障不能计入连续失败次数，消息必须等恢复后重放"
+    )
+    assert module.redis_short_term_degraded() is True
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["故障期提问", "故障期回答"], "恢复后故障期消息不能永久缺失"
+    print("✓ 长时间连接故障后故障期消息仍被重放")
+
+
+def test_truncate_marker_outlives_message_ttl(monkeypatch):
+    """截断一次性标记的 TTL 必须远长于消息 TTL（操作日志在进程内不过期）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "问题", "2000-01-01T00:00:00"),
+        _message("assistant", "回答", "2000-01-01T00:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(
+        client, "s-marker-ttl", max_turns=5, ttl_sec=60, user_id="u1"
+    )
+    assert memory.truncate_last_turn("问题") == 2
+    ttl = [int(value) for value in client.marker_ttls if value]
+    assert ttl and ttl[0] >= 24 * 3600, (
+        f"标记 TTL={ttl} 不能短于故障重放的等待窗口（消息 TTL={memory.ttl_sec}s）"
+    )
+    print("✓ 截断标记 TTL 覆盖故障重放窗口")
+
+
+def test_read_skips_deeply_nested_entries(monkeypatch):
+    """深嵌套 JSON 条目的 RecursionError 按坏条目跳过，不能当成 Redis 故障。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        "[" * 3000 + "]" * 3000,
+        _message("user", "正常消息", "2026-01-01T00:00:00"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-deep", max_turns=5, user_id="u1")
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["正常消息"], "深嵌套坏条目不能拖垮整次读取"
+    assert module.redis_short_term_degraded() is False, (
+        "数据问题不能被当成 Redis 不可用触发进程级降级"
+    )
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 2, "统计信息同样要容忍深嵌套条目"
+    print("✓ 深嵌套短期记忆条目被跳过")
 
 
 def test_pending_journal_registry_is_bounded(monkeypatch):
@@ -1388,6 +1466,30 @@ def test_outage_clear_rewrites_on_recovery(monkeypatch):
     assert memory.get_recent_context() == []
     assert client.data == []
     print("✓ 故障期清空在恢复后整体重写")
+
+
+def test_rollback_staged_message_only_removes_matching_tail():
+    """暂存提问回滚只删未回答的同文本末条，带回答的轮次不受影响。"""
+    import tempfile
+
+    from context.memory_manager import MemoryManager
+
+    manager = MemoryManager(
+        "u-rollback", "s-rollback", storage_path=tempfile.mkdtemp()
+    )
+    manager.stage_message("user", "问题")
+    assert manager.rollback_staged_message("问题") is True
+    assert manager.short_term.get_recent_context() == []
+
+    manager.stage_message("user", "问题")
+    manager.stage_message("assistant", "回答")
+    assert manager.rollback_staged_message("问题") is False, "已回答的轮次不能删"
+    assert [m["content"] for m in manager.short_term.get_recent_context()] == [
+        "问题",
+        "回答",
+    ]
+    assert manager.rollback_staged_message("别的提问") is False
+    print("✓ 暂存提问回滚只删匹配的未回答末条")
 
 
 if __name__ == "__main__":
@@ -1491,10 +1593,14 @@ if __name__ == "__main__":
     for case in (
         test_none_client_recovers_via_factory,
         test_broken_client_re_resolved_after_failure,
+        test_connection_failure_during_replay_keeps_queue,
+        test_truncate_marker_outlives_message_ttl,
+        test_read_skips_deeply_nested_entries,
     ):
         _case_mp = __import__("pytest").MonkeyPatch()
         try:
             case(_case_mp)
         finally:
             _case_mp.undo()
+    test_rollback_staged_message_only_removes_matching_tail()
     print("\n全部通过")

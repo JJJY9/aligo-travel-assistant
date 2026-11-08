@@ -1096,12 +1096,18 @@ class _FakeLongTerm:
         self.history = list(history or [])
         self.trips = list(trips or [])
 
-    def get_chat_history(self, session_id=None, limit=None):
+    def get_chat_history(self, session_id=None, limit=None, exclude_session_id=None):
         if session_id is not None:
-            return [m for m in self.history if m.get("session_id") == session_id]
+            messages = [m for m in self.history if m.get("session_id") == session_id]
+        elif exclude_session_id is not None:
+            messages = [
+                m for m in self.history if m.get("session_id") != exclude_session_id
+            ]
+        else:
+            messages = list(self.history)
         if limit:
-            return self.history[-limit:]
-        return list(self.history)
+            return messages[-limit:]
+        return messages
 
     def get_trip_history(self, limit=None):
         return self.trips[:limit] if limit else list(self.trips)
@@ -1135,6 +1141,55 @@ def test_summary_fingerprint_detects_history_replacement():
     asyncio.run(manager.get_long_term_summary_async())
     assert model.calls == 2, "窗口内容变化必须使总结缓存失效"
     print("✓ 总结指纹感知窗口内容替换")
+
+
+def test_summary_inputs_use_single_bounded_query():
+    """跨会话总结在存储层一次取「排除当前会话的固定窗口」，不再全量数会话消息。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager, _SUMMARY_WINDOW_MESSAGES
+
+    class _RecordingLongTerm(_FakeLongTerm):
+        def __init__(self, history):
+            super().__init__(history)
+            self.calls: list[tuple[str | None, str | None, int | None]] = []
+
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
+            self.calls.append((session_id, exclude_session_id, limit))
+            return super().get_chat_history(
+                session_id=session_id,
+                limit=limit,
+                exclude_session_id=exclude_session_id,
+            )
+
+    history = [
+        {
+            "role": "user",
+            "content": f"自己的消息 {index}",
+            "timestamp": f"t{index}",
+            "session_id": "s-cur",
+        }
+        for index in range(200)
+    ] + [
+        {
+            "role": "user",
+            "content": "其它会话",
+            "timestamp": "tx",
+            "session_id": "s-other",
+        }
+    ]
+    store = _RecordingLongTerm(history)
+    manager = MemoryManager(
+        "u-window", "s-cur", storage_path=tempfile.mkdtemp(), llm_model=_CountingModel()
+    )
+    manager.long_term = store
+    asyncio.run(manager.get_long_term_summary_async())
+    assert store.calls == [(None, "s-cur", _SUMMARY_WINDOW_MESSAGES)], (
+        "应只发一次有界查询（limit=窗口），不能先拉全部历史再在 Python 过滤"
+    )
+    print("✓ 跨会话总结只发一次有界排除查询")
 
 
 def test_summary_prompt_is_budgeted_and_formats_nulls():
