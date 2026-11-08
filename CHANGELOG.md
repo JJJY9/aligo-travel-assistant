@@ -116,6 +116,7 @@
 - 全部会话导出（Markdown / HTML）：按会话内最大时间戳排序并显示「最近更新」（与 `/api/sessions`、`cli sessions` 同一口径，恢复旧备份后不再把会话排到最旧）
 - PostgreSQL：`update_trip` 的重复检测按归一日期在 Python 侧比对（未补零的历史日期不再能造出同身份重复行程）
 - 备份恢复：嵌套过深的偏好值按非法值拒绝（`RecursionError` 不再让 CLI `user-import` 崩溃、`--json` 无结构化输出）
+- Web 对话（删除竞态）：会话删除墓碑在存储层写入锁 / 事务内判定——在途落库超过 drain 等待仍未完成时，删除后不会被迟到的写入复活（被否决的整轮也不再补暂存助手副本）；落库守卫经 `ConversationRuntime` 原样传入，CLI 路径不受影响
 
 ## [1.6.0] - 2026-11-06
 

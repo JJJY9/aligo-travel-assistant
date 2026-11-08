@@ -211,6 +211,22 @@ def test_pg_update_trip_normalizes_unpadded_dates():
         memory.close()
 
 
+def test_pg_add_chat_turn_guard_vetoes_write():
+    """PG add_chat_turn：落库守卫返回 False（会话刚被删除）时整轮不写入。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        assert (
+            memory.add_chat_turn(
+                "已删除会话的提问", "回答", "s-veto", should_commit=lambda: False
+            )
+            is False
+        )
+        assert memory.get_chat_history(session_id="s-veto") == []
+        print("✓ PG add_chat_turn 落库守卫否决整轮写入")
+    finally:
+        memory.close()
+
+
 def test_pg_add_chat_turn_writes_pair_in_one_transaction():
     """PG add_chat_turn：用户 + 助手同一事务写入，会话历史完整成对。"""
     memory, _ = _pg_memory_or_skip()

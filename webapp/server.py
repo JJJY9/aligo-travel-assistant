@@ -37,7 +37,7 @@ from concurrent.futures.thread import _threads_queues, _worker
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -616,7 +616,14 @@ class UserImportPayload(BaseModel):
 class _WebSession:
     """一个浏览器会话（对应一个 ConversationRuntime）。"""
 
-    def __init__(self, user_id: str, session_id: str, model: Any, breaker: CircuitBreaker) -> None:
+    def __init__(
+        self,
+        user_id: str,
+        session_id: str,
+        model: Any,
+        breaker: CircuitBreaker,
+        persist_guard: Callable[[], bool] | None = None,
+    ) -> None:
         self.user_id = user_id
         self.session_id = session_id
         self.runtime = ConversationRuntime(
@@ -624,6 +631,7 @@ class _WebSession:
             session_id=session_id,
             model=model,
             circuit_breaker=breaker,
+            persist_guard=persist_guard,
         )
         # 正在处理对话的请求数：LRU 淘汰必须跳过在用会话，否则会在
         # runtime 执行中途 close（PostgreSQL 连接被抽走）
@@ -963,7 +971,15 @@ class AligoWebApp:
             self._session_build_slots.acquire()
             try:
                 candidate = _WebSession(
-                    user_id, session_id, wrap_usage_tracking(self.model), self.breaker
+                    user_id,
+                    session_id,
+                    wrap_usage_tracking(self.model),
+                    self.breaker,
+                    # 在途落库与删除并发：存储层写入前据此判断会话是否仍可写
+                    # （墓碑有效 = 已删除 → 返回 False，整轮不写回）
+                    persist_guard=lambda: not self.is_recently_deleted(
+                        user_id, session_id
+                    ),
                 )
                 with self._sessions_lock:
                     found = self.sessions.get(key)

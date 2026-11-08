@@ -518,10 +518,12 @@ def test_stream_abort_waits_for_pending_persist(monkeypatch):
     release = threading.Event()
     original_persist = MemoryManager.persist_turn
 
-    def blocked_persist(self, user_content, assistant_content):
+    def blocked_persist(self, user_content, assistant_content, should_commit=None):
         started.set()
         release.wait(10)
-        original_persist(self, user_content, assistant_content)
+        original_persist(
+            self, user_content, assistant_content, should_commit=should_commit
+        )
 
     monkeypatch.setattr(MemoryManager, "persist_turn", blocked_persist)
     lock = state.lock_for(user_id)
@@ -821,7 +823,7 @@ def test_get_session_constructs_outside_lock(monkeypatch):
     closed = []
 
     class _SlowSession:
-        def __init__(self, user_id, session_id, model, breaker):
+        def __init__(self, user_id, session_id, model, breaker, persist_guard=None):
             created.append(session_id)
             # 两个线程都必须先完成第一次锁检查、进入构造
             barrier.wait()
@@ -6663,7 +6665,7 @@ def test_session_build_slots_bound_concurrent_connections(monkeypatch):
         active = 0
         peak = 0
 
-        def __init__(self, user_id, session_id, model, breaker):
+        def __init__(self, user_id, session_id, model, breaker, persist_guard=None):
             with _SlowSession.lock:
                 _SlowSession.active += 1
                 _SlowSession.peak = max(_SlowSession.peak, _SlowSession.active)
@@ -7095,9 +7097,27 @@ def test_weather_city_rejects_control_characters(monkeypatch):
     assert called["name"] == "北京"
     print("✓ /api/weather 城市名拒绝控制字符")
 
+def test_web_session_persist_guard_tracks_deletions():
+    """Web 会话的落库守卫反映墓碑状态（写入锁内阻止写回已删除会话）。"""
+    client = _client()
+    state = client.app.state.aligo
+    user = _unique_user("web_guard")
+    session = state.get_session(user, "s-guard")
+    guard = session.runtime._persist_guard
+    assert callable(guard), "Web 会话必须注入落库守卫"
+    assert guard() is True, "未删除的会话应允许落库"
+    token = state.mark_deleted(user, "s-guard")
+    assert guard() is False, "墓碑生效后守卫必须否决落库"
+    state.unmark_deleted(user, "s-guard", token)
+    assert guard() is True
+    state.drop_session(user, "s-guard")
+    _cleanup(user)
+    print("✓ Web 会话落库守卫跟随墓碑状态")
+
 
 if __name__ == "__main__":
     test_index_page()
+    test_web_session_persist_guard_tracks_deletions()
     test_route_path_normalization()
     test_knowledge_import_uses_dedicated_limiter(pytest.MonkeyPatch())
     test_metrics_streaming_and_sse_errors()
