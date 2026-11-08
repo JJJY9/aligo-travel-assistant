@@ -7,6 +7,8 @@ import json
 import os
 import sys
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -36,7 +38,23 @@ def test_assistant_orchestration_json_rendered():
 def test_assistant_bad_json_falls_back():
     content = "{not-json"
     assert render_stored_message({"role": "assistant", "content": content}) == content
-    print("✓ 非法 JSON 安全回退原文")
+    # 合法 JSON 但不是编排结果（无 results / 状态不在白名单）：原样返回
+    other = json.dumps({"reply": "x"}, ensure_ascii=False)
+    assert render_stored_message({"role": "assistant", "content": other}) == other
+    print("✓ 非法 / 非编排 JSON 安全回退原文")
+
+
+def test_render_failure_falls_back_to_raw_content(monkeypatch):
+    """result_to_markdown 抛异常时退回原始内容（会话查看不能因此 500）。"""
+    import utils.stored_message as stored_module
+
+    def boom(_data):
+        raise RuntimeError("formatter crash")
+
+    monkeypatch.setattr(stored_module, "result_to_markdown", boom)
+    content = json.dumps({"results": [{"agent_name": "A"}]}, ensure_ascii=False)
+    assert render_stored_message({"role": "assistant", "content": content}) == content
+    print("✓ 渲染异常安全回退原文")
 
 
 if __name__ == "__main__":
@@ -44,4 +62,9 @@ if __name__ == "__main__":
     test_assistant_plain_text_is_raw()
     test_assistant_orchestration_json_rendered()
     test_assistant_bad_json_falls_back()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_render_failure_falls_back_to_raw_content(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")
