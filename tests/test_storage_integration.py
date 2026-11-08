@@ -178,6 +178,106 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
         memory.close()
 
 
+def test_pg_batch_save_matches_sequential():
+    """PG 批量保存与逐条保存的最终结果一致（去重 / 未补零日期 / 缺省目的）。"""
+    batch, _ = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    sequential_user = f"pytest-{uuid.uuid4().hex[:8]}"
+    try:
+        sequential = PostgresLongTermMemory(sequential_user, TEST_POSTGRES_DSN)
+    except Exception as exc:  # noqa: BLE001 - 无 PG 时跳过
+        batch.close()
+        pytest.skip(f"PostgreSQL 不可用: {exc}")
+    rows = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        },
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-1",
+            "end_date": "2026-12-3",
+            "purpose": "客户会议",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-10",
+            "purpose": "培训",
+        },
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-10",
+            "end_date": "2026-12-10",
+        },
+        {
+            "origin": "",
+            "destination": "广州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-22",
+            "purpose": "会议",
+            "session_id": "s-1",
+        },
+        {
+            "origin": "",
+            "destination": "广州",
+            "start_date": "2026-12-20",
+            "end_date": "2026-12-22",
+        },
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        },
+    ]
+    try:
+        batch_counts = batch.save_trip_histories([dict(row) for row in rows])
+        sequential_counts = [0, 0]
+        for row in rows:
+            before = len(sequential.get_trip_history(limit=None))
+            sequential.save_trip_history(dict(row))
+            created = len(sequential.get_trip_history(limit=None)) > before
+            sequential_counts[0 if created else 1] += 1
+
+        keys = (
+            "trip_id",
+            "origin",
+            "destination",
+            "start_date",
+            "end_date",
+            "purpose",
+            "session_id",
+        )
+
+        def snapshot(store):
+            return [
+                {key: trip.get(key) for key in keys}
+                for trip in store.get_trip_history(limit=None)
+            ]
+
+        assert batch_counts == tuple(sequential_counts), (
+            batch_counts,
+            sequential_counts,
+        )
+        assert snapshot(batch) == snapshot(sequential)
+        assert (
+            batch.get_statistics()["total_trips"]
+            == sequential.get_statistics()["total_trips"]
+        )
+        print("✓ PG 批量保存与逐条保存结果一致")
+    finally:
+        batch.close()
+        sequential.close()
+
+
 def test_pg_update_trip_normalizes_unpadded_dates():
     """update_trip 的重复检测与 save_trip_history 同一口径（未补零日期）。"""
     memory, _ = _pg_memory_or_skip()
