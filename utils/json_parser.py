@@ -142,6 +142,22 @@ def iter_json_objects(text: str):
         index = max(end, index + 1)
 
 
+def last_json_object_with_keys(
+    text: str, keys: "tuple[str, ...]"
+) -> "dict | None":
+    """返回文本中**最后一个**包含任一指定键的顶层对象（没有则 None）。
+
+    模型常在正式结果前复述 prompt 里的输出示例 / 当前数据：只取第一个
+    对象会把回显当成结果（示例行程 / 示例偏好被写库）。正式结果通常在
+    响应末尾，按「最后一个形如结果的对象」挑选更符合实际输出习惯。
+    """
+    selected = None
+    for value in iter_json_objects(text):
+        if any(key in value for key in keys):
+            selected = value
+    return selected
+
+
 def robust_json_parse(text: str, fallback=None) -> dict:
     """
     鲁棒的 JSON 解析函数

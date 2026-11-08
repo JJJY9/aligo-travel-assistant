@@ -366,6 +366,8 @@ def test_weather_city_prefers_destination_side():
     assert agent._extract_city_from_query("从北京去杭州出差，天气怎么样") == "杭州"
     assert agent._extract_city_from_query("北京明天天气怎么样") == "北京"
     assert agent._extract_city_from_query("上海和广州的天气对比") == "上海"
+    # 裸「飞」也按目的地连接词（「北京飞上海」问的是上海）
+    assert agent._extract_city_from_query("明天北京飞上海天气怎么样") == "上海"
     print("✓ 天气城市优先取目的地一侧")
 
 
@@ -461,6 +463,106 @@ def test_plan_trip_accepts_object_with_array_fields():
     assert data.get("itinerary", {}).get("title") == "杭州行"
     assert "error" not in data
     print("✓ 含数组字段的对象结果正常接受")
+
+
+def test_plan_trip_prefers_last_itinerary_object():
+    """模型先回显输出示例再给正式结果时，取最后一个行程形状的对象。"""
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '输出示例：{"itinerary": {"title": "示例行程"}}\n'
+                '正式结果：{"itinerary": {"title": "北京行"}}'
+            )
+
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=_Model()
+    )
+    agent.skill_loader = _PlanTripLoader()
+    payload = json.dumps({"context": {"rewritten_query": "测试出行"}}, ensure_ascii=False)
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content=payload, role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("itinerary", {}).get("title") == "北京行", data
+    print("✓ 行程规划取最后一个行程对象（回显示例在前）")
+
+
+def test_event_collection_prefers_last_result_object():
+    """示例对象在前时不能被当成提取结果（避免把示例写假行程）。"""
+    agent_class = _load_skill("event-collection", "EventCollectionAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '示例：{"missing_info": ["目的地"], "extracted_count": 0}\n'
+                '结果：{"missing_info": [], "extracted_count": 1, '
+                '"destination": "杭州"}'
+            )
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    agent = agent_class(name="EventCollectionAgent", model=_Model())
+    agent.skill_loader = _Loader()
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="我明天去杭州", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("destination") == "杭州", data
+    assert data.get("extracted_count") == 1, data
+    print("✓ 事项提取取最后一个结果对象（回显示例在前）")
+
+
+def test_preference_prefers_last_result_object():
+    """回显的『当前偏好』在前时，正式偏好不能被静默丢弃。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _LongTerm:
+        def get_preference(self):
+            return {"hotel_brands": ["汉庭"]}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '当前偏好：{"preferences": [{"type": "hotel_brands", '
+                '"value": "汉庭"}]}\n'
+                '结果：{"has_preferences": true, "preferences": '
+                '[{"type": "airlines", "value": "东航"}]}'
+            )
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _Loader()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我常坐东航", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is True, data
+    assert data.get("preferences") == [
+        {"type": "airlines", "value": "东航"}
+    ], data
+    print("✓ 偏好抽取取最后一个结果对象（回显在前）")
+
+
+def test_documented_agent_imports_resolve():
+    """SKILL.md 示例路径 agents.memory_query_agent / preference_agent 可用。"""
+    from agents.memory_query_agent import MemoryQueryAgent
+    from agents.preference_agent import PreferenceAgent
+
+    assert MemoryQueryAgent.__name__ == "MemoryQueryAgent"
+    assert PreferenceAgent.__name__ == "PreferenceAgent"
+    print("✓ 文档中的智能体导入路径可用")
 
 
 def test_rag_search_top_k_bounds():

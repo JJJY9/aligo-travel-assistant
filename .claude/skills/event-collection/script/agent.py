@@ -17,7 +17,11 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
-from utils.json_parser import extract_first_json_object, extract_json_from_async_response
+from utils.json_parser import (
+    extract_first_json_object,
+    extract_json_from_async_response,
+    last_json_object_with_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +164,15 @@ class EventCollectionAgent(AgentBase):
             text = text.removesuffix('```')
             text = text.strip()
 
-            # 提取JSON：扫描第一个完整对象，避免结尾说明 / 示例中的
-            # 花括号被 find/rfind 一起截进来导致合法输出解析失败
-            result = extract_first_json_object(text)
+            # 模型可能先回显 prompt 里的示例对象再给正式结果：优先取最后
+            # 一个形如结果（missing_info / extracted_count）的顶层对象，
+            # 避免把回显示例当成提取结果写成真实行程
+            result = last_json_object_with_keys(
+                text, ("missing_info", "extracted_count")
+            )
+            if result is None:
+                # 回退：扫描第一个完整对象，避免结尾说明中的花括号被误截
+                result = extract_first_json_object(text)
         except Exception as e:
             logger.error(f"Event collection failed: {e}")
             result = {
