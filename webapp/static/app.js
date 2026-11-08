@@ -1234,15 +1234,34 @@ async function importTripsFromFile(file) {
       toast("文件过大（超过 50 万字符），请拆分后再导入");
       return;
     }
-    try {
-      const result = await getJSON(
-        `/api/trips/import?user_id=${encodeURIComponent(userId)}`,
+    const postImport = (dryRun) =>
+      getJSON(
+        `/api/trips/import?user_id=${encodeURIComponent(userId)}` +
+          (dryRun ? "&dry_run=1" : ""),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ content: text }),
         },
       );
+    try {
+      // 先预览：把将新增 / 更新 / 跳过的数量交给用户确认，避免选错文件直接写库
+      const preview = await postImport(true);
+      const previewSkipped = Array.isArray(preview.skipped)
+        ? preview.skipped.length
+        : 0;
+      const ok = window.confirm(
+        `将新增 ${Number(preview.created || 0)} 条、更新 ${Number(
+          preview.updated || 0,
+        )} 条行程` +
+          (previewSkipped ? `，跳过 ${previewSkipped} 条` : "") +
+          "。继续？",
+      );
+      if (!ok) {
+        toast("已取消导入");
+        return;
+      }
+      const result = await postImport(false);
       const created = Number(result.created || 0);
       const updated = Number(result.updated || 0);
       const skipped = Array.isArray(result.skipped)

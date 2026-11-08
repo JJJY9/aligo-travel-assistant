@@ -627,6 +627,10 @@ async function scenarioDecode(source) {
     arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
   });
   results.busy_requests = run("__importCalls");
+  run(
+    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 0 })"
+  );
+  await tick();
   run("__resolveImport({ created: 1, updated: 0, skipped: [] })");
   await pending;
   await tick();
@@ -647,11 +651,36 @@ async function scenarioDecode(source) {
   });
   await tick();
   run("state.userId = 'user-b';");
+  run(
+    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 0 })"
+  );
+  await tick();
   run("__resolveImport({ created: 1, updated: 0, skipped: [] })");
   await pinned;
   await tick();
   results.pinned_url = run("__lastUrl");
   results.user_after = run("state.userId");
+
+  // 预览后取消：只发 dry-run，不写库
+  run("state.userId = 'user-c'; __confirmResult = false; __confirmCalls = 0; __importCalls = 0;");
+  run(
+    "confirm = () => { __confirmCalls += 1; return __confirmResult; };"
+  );
+  const cancelled = importFile({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  });
+  await tick();
+  run(
+    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 0 })"
+  );
+  await cancelled;
+  await tick();
+  results.cancel = {
+    calls: run("__importCalls"),
+    confirm_calls: run("__confirmCalls"),
+    last_toast: run("__toasts.slice()").slice(-1)[0],
+  };
 
   // 字符数上限（与 POST /api/trips/import 的 content 上限一致）
   const bigText = Buffer.alloc(500_001, 97);
