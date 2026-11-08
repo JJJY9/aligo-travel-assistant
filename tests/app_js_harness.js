@@ -649,7 +649,7 @@ async function scenarioDecode(source) {
   });
   results.busy_requests = run("__importCalls");
   run(
-    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [], skipped_total: 73 })"
+    "__resolveImport({ rows: 1, created: 1, updated: 0, skipped: [{ line: 3, reason: '目的地为空' }, { line: 7, reason: '出发日期格式应为 YYYY-MM-DD' }], skipped_total: 73 })"
   );
   await tick();
   run(
