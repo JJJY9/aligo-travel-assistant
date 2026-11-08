@@ -407,8 +407,23 @@ def test_extract_response_text_object_attribute():
     print("✓ extract_response_text 读取对象 text 属性")
 
 
+def test_sanitize_json_escapes_surrogates():
+    """孤立代理项与 NaN 都归一：响应序列化不再 UnicodeEncodeError。"""
+    from utils.json_safe import sanitize_json
+
+    cleaned = sanitize_json(
+        {"a": "x\ud800y", "b": [float("nan")], "k\ud800": 1}
+    )
+    dumped = json.dumps(cleaned)
+    assert "ud800" in dumped.lower()
+    assert cleaned["b"] == [None]
+    assert cleaned["a"] != "x\ud800y", "孤立代理项必须被转义"
+    print("✓ sanitize_json 转义孤立代理项并归一 NaN")
+
+
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
+    test_sanitize_json_escapes_surrogates()
     test_json_parse_fallback()
     test_json_parse_success_paths_unchanged()
     test_json_parse_empty_dict_and_prose_braces()

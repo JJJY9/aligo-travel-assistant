@@ -7543,8 +7543,76 @@ def test_export_with_knowledge_round_trips(monkeypatch):
     print("✓ 备份导出的知识段可一体化恢复")
 
 
+def test_match_snippet_handles_casefold_length_changes():
+    """İ 小写后长度 +1：命中下标必须仍按原文定位（窗口不错位成空片段）。"""
+    from webapp import server as server_module
+
+    text = "İ" * 500 + "needle"
+    snippet = server_module._match_snippet(text, "needle")
+    assert "needle" in snippet
+    # 常规大小写不敏感匹配不回归（片段保留原文大小写）
+    assert "needle" in server_module._match_snippet("Some NEEDLE here", "needle").lower()
+
+
+def test_session_detail_sanitizes_surrogate_meta():
+    """备份中以转义夹带的孤立代理项不再让会话详情 500。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user = _unique_user("web_meta_sur")
+    try:
+        store = create_long_term_memory(user, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "hi", "s-sur")
+            # 落库内容里的 \ud800 是 JSON 转义文本：读取侧 json.loads 会把它
+            # 解码成真正的孤立代理项，响应序列化必须转义而不是 500
+            store.add_chat_message(
+                "assistant",
+                '{"results": [], "_meta": {"note": "x\\ud800y"}}',
+                "s-sur",
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        response = client.get("/api/sessions/s-sur", params={"user_id": user})
+        assert response.status_code == 200, response.text
+        note = response.json()["messages"][-1]["meta"]["note"]
+        assert "ud800" in note.lower(), note
+    finally:
+        _cleanup(user)
+    print("✓ 会话详情对孤立代理项 _meta 转义")
+
+
+def test_kb_import_backpressure_rejects_when_busy():
+    """知识库导入排队已满时返回 503（无界队列不再无限驻留载荷）。"""
+    import threading as _threading
+
+    client = _client()
+    state = client.app.state.aligo
+    state.kb_import_queue_slots = _threading.BoundedSemaphore(1)
+    assert state.kb_import_queue_slots.acquire(blocking=False)
+    try:
+        response = client.post(
+            "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+        )
+        assert response.status_code == 503
+        assert "已有知识库导入" in response.json()["detail"]
+        preview = client.post(
+            "/api/knowledge/import/preview", json={"documents": [{"content": "x"}]}
+        )
+        assert preview.status_code == 503
+    finally:
+        state.kb_import_queue_slots.release()
+    print("✓ 知识库导入排队已满返回 503")
+
+
 if __name__ == "__main__":
     test_index_page()
+    test_match_snippet_handles_casefold_length_changes()
+    test_session_detail_sanitizes_surrogate_meta()
+    test_kb_import_backpressure_rejects_when_busy()
+    test_session_detail_sanitizes_legacy_nan_meta()
     _mp_export = pytest.MonkeyPatch()
     try:
         test_export_with_knowledge(_mp_export)
@@ -7555,7 +7623,6 @@ if __name__ == "__main__":
         test_export_with_knowledge_round_trips(_mp_export_rt)
     finally:
         _mp_export_rt.undo()
-    test_session_detail_sanitizes_legacy_nan_meta()
     test_session_export_html_format()
     test_write_endpoints_reject_unwritable_text()
     test_read_rate_limit_covers_export_and_detail_endpoints()

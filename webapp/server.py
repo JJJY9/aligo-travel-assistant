@@ -914,6 +914,9 @@ class AligoWebApp:
         self.kb_import_executor = _DaemonImportExecutor(
             max_workers=1, thread_name_prefix="aligo-kb-import"
         )
+        # 知识库导入排队上限（1 执行 + 1 等待）：执行器队列无界，并发导入
+        # （各 ≤2MB、最多 2 万条分片）排在单 worker 后面会一直持有载荷
+        self.kb_import_queue_slots = threading.BoundedSemaphore(2)
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
@@ -1840,6 +1843,23 @@ def _strip_markdown_for_snippet(text: str) -> str:
     return cleaned.strip()
 
 
+def _ci_find(haystack: str, needle: str) -> int:
+    """大小写不敏感查找，返回**原文**下标。
+
+    ``lower()`` 可能改变字符串长度（如土耳其语 ``İ`` 小写后是两个码点），
+    用 lower 串里的下标去切原文会让窗口整体错位；长度变化时改用正则
+    在原文上定位（re.IGNORECASE 返回的就是原文下标）。
+    """
+    if not needle:
+        return -1
+    lowered = haystack.lower()
+    index = lowered.find(needle.lower())
+    if index >= 0 and len(lowered) == len(haystack):
+        return index
+    match = re.search(re.escape(needle), haystack, re.IGNORECASE)
+    return match.start() if match else -1
+
+
 def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     """截取命中位置附近的片段（用于会话搜索结果的预览）。"""
     haystack = str(text)
@@ -1847,9 +1867,7 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
         return ""
     # 先做廉价的原文包含判断：整条消息做 Markdown 剥离（多条正则）在超长
     # 行上有回溯开销，没命中的消息根本不需要清理
-    lowered = haystack.lower()
-    needle_lower = needle.lower()
-    position = lowered.find(needle_lower)
+    position = _ci_find(haystack, needle)
     if position < 0:
         return ""
     # 只清理命中位置附近的窗口：单条消息可达数 MB（导入上限 64MB），整条
@@ -1859,11 +1877,11 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     window_end = min(len(haystack), position + len(needle) + span)
     window = haystack[window_start:window_end]
     cleaned = _strip_markdown_for_snippet(window)
-    index = cleaned.lower().find(needle_lower)
+    index = _ci_find(cleaned, needle)
     if index < 0:
         # 关键字本身含被剥离的记号时回退到原文匹配
         cleaned = " ".join(window.split())
-        index = cleaned.lower().find(needle_lower)
+        index = _ci_find(cleaned, needle)
     if index < 0:
         return ""
     start = max(0, index - radius)
@@ -2642,21 +2660,34 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(
             await asyncio.to_thread(_enforce_import_rate_limit, state, request)
         )
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(
-                state.kb_import_executor,
-                lambda: import_documents(payload.documents, dry_run=dry_run),
-            )
-        except FileNotFoundError as exc:
+        if not state.kb_import_queue_slots.acquire(blocking=False):
             raise HTTPException(
-                status_code=503, detail=f"{exc}（先运行初始化脚本）"
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
-            logger.warning("导入知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"导入失败：{exc}") from exc
+                status_code=503,
+                detail=(
+                    "已有知识库导入任务在处理，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+            )
+        try:
+            loop = asyncio.get_running_loop()
+            try:
+                return await loop.run_in_executor(
+                    state.kb_import_executor,
+                    lambda: import_documents(payload.documents, dry_run=dry_run),
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"{exc}（先运行初始化脚本）"
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
+                logger.warning("导入知识片段失败: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail=f"导入失败：{exc}"
+                ) from exc
+        finally:
+            state.kb_import_queue_slots.release()
 
     @app.post("/api/knowledge/import/preview")
     async def knowledge_import_preview(
@@ -2666,21 +2697,34 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(
             await asyncio.to_thread(_enforce_import_rate_limit, state, request)
         )
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(
-                state.kb_import_executor,
-                lambda: import_documents(payload.documents, dry_run=True),
-            )
-        except FileNotFoundError as exc:
+        if not state.kb_import_queue_slots.acquire(blocking=False):
             raise HTTPException(
-                status_code=503, detail=f"{exc}（先运行初始化脚本）"
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - 预览失败统一提示
-            logger.warning("预览导入知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"预览失败：{exc}") from exc
+                status_code=503,
+                detail=(
+                    "已有知识库导入任务在处理，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+            )
+        try:
+            loop = asyncio.get_running_loop()
+            try:
+                return await loop.run_in_executor(
+                    state.kb_import_executor,
+                    lambda: import_documents(payload.documents, dry_run=True),
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"{exc}（先运行初始化脚本）"
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001 - 预览失败统一提示
+                logger.warning("预览导入知识片段失败: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail=f"预览失败：{exc}"
+                ) from exc
+        finally:
+            state.kb_import_queue_slots.release()
 
     @app.get("/api/status")
     def status(
