@@ -378,6 +378,22 @@ def test_ics_tzid_parameter_matches_utc_representation():
     print("✓ ICS TZID 参数参与时区换算")
 
 
+def test_csv_oversized_field_returns_error_and_keeps_rows():
+    """单字段超过 csv 上限：按解析错误返回，已解析行保留而不是 traceback。"""
+    import csv as csv_module
+
+    huge = "x" * (csv_module.field_size_limit() + 10)
+    text = (
+        "出发地,目的地,出发日期\n"
+        "北京,上海,2026-01-01\n"
+        '北京,"' + huge + '",2026-01-02\n'
+    )
+    rows, errors = parse_trips_csv(text)
+    assert [row["destination"] for row in rows] == ["上海"], "已解析行必须保留"
+    assert any("CSV 解析失败" in message for _, message in errors), errors
+    print("✓ 超长 CSV 字段按解析错误返回（不再整条命令 traceback）")
+
+
 def test_ics_collects_invalid_events():
     text = (
         "BEGIN:VCALENDAR\nVERSION:2.0\n"
@@ -641,6 +657,7 @@ if __name__ == "__main__":
     test_ics_datetime_offset_converts_local_date()
     test_ics_invalid_utc_offset_does_not_abort()
     test_ics_tzid_parameter_matches_utc_representation()
+    test_csv_oversized_field_returns_error_and_keeps_rows()
     test_ics_timed_end_inclusive_except_midnight()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()

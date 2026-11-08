@@ -69,6 +69,10 @@
 - 行程规划：前言里的小数组（引用标记 `[1]` / Markdown 待办 `[ ]`）不再被误判为顶层数组；模型返回裸行程对象时自动补齐 `itinerary` 包装（回答与行程落库恢复正常）
 - 知识问答：生成答案失败 / 空响应返回 `status=error`（瞬时错误触发一次退避重试，前端与历史元数据不再把错误句记为成功回答）
 - 知识库：检索路径在检查 `milvus_lite.db` 是否存在之前不再加载 / 联网下载嵌入模型（未初始化提示不再被模型下载错误覆盖）；批量插入后 id 水位越过整批（整批删除后新增不再复用旧 id，旧标签页的改删不会落到新知识上）
+- CLI 一次性命令：stdout 统一走管道安全包装（`trips --json | head` 等列表输出被下游提前关闭时不再 traceback；ICS `--stdout` 在 Windows 上的 `Errno 22` 同样静默收尾）
+- CLI 备份恢复：只含 `knowledge` 段的备份不再被判为「没有可恢复的数据」（知识片段照常恢复）；`kb-import` / `user-import` 对结构性深嵌套 JSON 报结构化错误而不是 traceback
+- CLI 行程导入：单字段超长 / 未闭合引号的 CSV 按解析错误返回（已解析行保留，不再整条命令中断且 `--json` 无输出）
+- CLI 行程去重：同一 `trip_id` 的重复行程删除最后插入的一条、保留最早记录（此前 `delete_trip` 删最早一条，实际删掉要保留的记录并留下重复行）；JSON / PostgreSQL 后端新增 `delete_duplicate_trip`
 - 偏好接口：`PUT /api/preferences` 拒绝空值（与 CLI `pref-set` 一致）；`/api/status` 与导出统一隐藏空白 / null 项；备份含 NaN / Infinity 用量时拒绝该消息（不再让状态接口与 Markdown 导出永久 500）
 - 技能：非对象 payload / content block 列表 / `reply(None)` 统一容错；天气问句城市提取去掉方向词与标点（「从北京去纽约，天气怎么样」不再答成北京）；可疑域名过滤不再误杀 skyscanner / tripadvisor 等真实站点
 - 知识库初始化：重建前把保留片段落盘备份（写入失败 / 中断后重跑自动并入补齐），补写按分片组边界切批

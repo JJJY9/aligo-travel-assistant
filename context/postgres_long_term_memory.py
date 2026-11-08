@@ -883,6 +883,26 @@ class PostgresLongTermMemory:
             )
             return True
 
+    def delete_duplicate_trip(self, trip_id: str) -> bool:
+        """删除重复 trip_id 中最后插入的一条（去重时保留最早记录）。
+
+        ``delete_trip`` 删除最早一条：去重命令要保留组内第一条、删掉后面
+        的副本，用它会把要保留的那条删掉、留下后来的重复行。
+        """
+        with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+            row = self._fetchone(
+                "SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s "
+                "ORDER BY id DESC LIMIT 1",
+                (self.user_id, trip_id),
+            )
+            if not row:
+                return False
+            self._execute(
+                "DELETE FROM aligo_trips WHERE user_id = %s AND id = %s",
+                (self.user_id, row[0]),
+            )
+            return True
+
     def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:
         """更新一条行程的字段；返回是否存在。
 

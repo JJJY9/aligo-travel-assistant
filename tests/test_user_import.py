@@ -812,6 +812,41 @@ def test_parse_rejects_non_object_agent_entries():
     print("✓ agents / schedule 非对象条目在导入时拒绝")
 
 
+def test_parse_user_export_tolerates_recursion_error(monkeypatch):
+    """结构性深层嵌套的 JSON 解析抛 RecursionError 时按错误返回，不打 traceback。"""
+    from utils import user_import as user_import_module
+
+    def boom(text):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(user_import_module.json, "loads", boom)
+    sections, errors = user_import_module.parse_user_export("{}")
+    assert sections == {}
+    assert any("嵌套过深" in error for error in errors), errors
+    print("✓ 深嵌套备份解析报结构化错误（RecursionError 被捕获）")
+
+
+def test_runner_recovers_knowledge_only_backup(monkeypatch):
+    """只含 knowledge 段的备份（未加 --skip-knowledge）必须恢复知识片段。"""
+    from utils import knowledge_admin as admin_module
+
+    path = _write_json({"knowledge": [{"content": "知识一"}]})
+    store = _real_store("u-kb-only")
+    calls = []
+
+    def fake_import(documents):
+        calls.append(documents)
+        return {"imported": 1, "skipped": 0, "skipped_invalid": 0, "skipped_duplicate": 0}
+
+    monkeypatch.setattr(admin_module, "import_documents", fake_import)
+    code, out = _run_import(monkeypatch, "u-kb-only", path, store, as_json=True)
+    payload = json.loads(out)
+    assert code == 0, payload
+    assert payload["knowledge_imported"] == 1
+    assert calls and calls[0][0]["content"] == "知识一"
+    print("✓ 只含知识片段的备份可正常恢复")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -842,6 +877,8 @@ if __name__ == "__main__":
         test_runner_dispatch,
         test_parse_knowledge_section_and_import,
         test_runner_knowledge_error_and_skip,
+        test_runner_recovers_knowledge_only_backup,
+        test_parse_user_export_tolerates_recursion_error,
     ):
         mp = pytest.MonkeyPatch()
         try:
