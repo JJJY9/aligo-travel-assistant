@@ -14,7 +14,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from utils.trip_export import _needs_quote_guard
+from utils.trip_export import _needs_quote_guard, normalize_identity_date
 
 _HEADER_ALIASES = {
     "origin": {"出发地", "origin"},
@@ -27,23 +27,6 @@ _HEADER_ALIASES = {
 
 def _normalize_header(cell: str) -> str:
     return str(cell or "").strip().lstrip("﻿")
-
-
-def normalize_identity_date(value: Any) -> str:
-    """去重键里的日期归一：YYYY-M-D 补零到 YYYY-MM-DD。
-
-    历史数据可能保留未补零写法（如 2026-1-5），导入端会补零；不归一
-    比对会把同一行程当成新记录重复插入。其它格式原样保留。
-    """
-    text = str(value or "").strip()
-    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
-    if not match:
-        return text
-    month = int(match.group(2))
-    day = int(match.group(3))
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return text
-    return f"{match.group(1)}-{month:02d}-{day:02d}"
 
 
 def trip_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:

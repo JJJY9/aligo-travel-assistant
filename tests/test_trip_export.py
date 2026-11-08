@@ -202,6 +202,30 @@ def test_many_leading_quotes_do_not_recurse():
     print("✓ 超多前导单引号不再递归溢出")
 
 
+def test_unpadded_dates_normalized_in_exports():
+    """历史未补零日期导出时补零：CSV 回导不被严格校验跳过、ICS 不再丢事件。"""
+    trip = {
+        "trip_id": "t9",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-1-5",
+        "end_date": "2026-1-6",
+        "purpose": "出差",
+    }
+    csv_text = render_trips_csv([trip])
+    assert "2026-01-05" in csv_text and "2026-01-06" in csv_text
+    from utils.trip_import import parse_trips_csv
+
+    rows, errors = parse_trips_csv(csv_text)
+    assert errors == [], errors
+    assert rows[0]["start_date"] == "2026-01-05", rows
+    assert rows[0]["end_date"] == "2026-01-06", rows
+
+    ics = render_trip_ics(trip, "u1")
+    assert ics and "DTSTART;VALUE=DATE:20260105" in ics, "未补零日期不能丢掉事件"
+    print("✓ 未补零日期导出补零（CSV / ICS 往返不丢行程）")
+
+
 if __name__ == "__main__":
     test_header_and_rows()
     test_formula_prefix_neutralized()
@@ -213,4 +237,5 @@ if __name__ == "__main__":
     test_ics_lines_folded_at_75_bytes()
     test_render_trips_html()
     test_many_leading_quotes_do_not_recurse()
+    test_unpadded_dates_normalized_in_exports()
     print("\n全部通过")
