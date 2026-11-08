@@ -407,6 +407,45 @@ def test_main_dispatch_query(monkeypatch):
     print("✓ dispatch 层 trips-export --query 过滤导出")
 
 
+def test_main_dispatch_status(monkeypatch):
+    """main() 按 6 元组解包 --status 并传给 standalone（过滤 + 状态提示）。"""
+    import datetime as dt
+    import tempfile
+
+    today = dt.date.today()
+
+    def _d(days):
+        return (today + dt.timedelta(days=days)).isoformat()
+
+    workdir = tempfile.mkdtemp()
+    monkeypatch.chdir(workdir)
+    fake = _FakeStore(
+        [
+            _trip("上海", _d(-10), _d(-9)),  # 已结束
+            _trip("杭州", _d(-1), _d(1)),  # 进行中
+            _trip("广州", _d(10), _d(11)),  # 即将出行
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    target = os.path.join(workdir, "trips.csv")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "trips-export", "u1", target, "--status", "past", "--force"],
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    out = buf.getvalue()
+    assert "已导出 1 条行程" in out
+    assert "状态「已结束」" in out
+    with open(target, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "上海" in text and "杭州" not in text and "广州" not in text
+    print("✓ dispatch 层 trips-export --status 过滤导出")
+
+
 def test_export_status_filter(monkeypatch):
     """trips-export --status 与面板 / trips 列表同一口径过滤。"""
     import datetime as dt
@@ -468,6 +507,7 @@ if __name__ == "__main__":
         test_parse_export_args_ics_flag,
         test_main_dispatch_ics,
         test_main_dispatch_query,
+        test_main_dispatch_status,
         test_export_html,
         test_main_dispatch_html_and_conflict,
         test_export_status_filter,

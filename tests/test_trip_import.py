@@ -688,6 +688,36 @@ def test_ics_extreme_year_datetime_skipped():
     print("✓ 极端年份的 ICS 时间按非法事件跳过")
 
 
+def test_ics_extreme_year_tzid_datetime_skipped():
+    """TZID 换算越界（0001 年）逐事件跳过，同一 ICS 其余事件照常导入。"""
+    from utils.trip_import import parse_trips_ics
+
+    ics = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "BEGIN:VEVENT",
+            "UID:extreme-tzid",
+            "SUMMARY:北京 → 上海（出差）",
+            "DTSTART;TZID=Asia/Shanghai:00010101T000000",
+            "DTEND;TZID=Asia/Shanghai:00010102T000000",
+            "END:VEVENT",
+            "BEGIN:VEVENT",
+            "UID:valid-after",
+            "SUMMARY:北京 → 广州（出差）",
+            "DTSTART:20261110T090000",
+            "DTEND:20261111T180000",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]
+    )
+    rows, errors = parse_trips_ics(ics)
+    assert errors == [(1, "缺少或非法的 DTSTART")], errors
+    assert len(rows) == 1, rows
+    assert rows[0]["start_date"] == "2026-11-10"
+    print("✓ TZID 极端年份的 ICS 事件按非法事件跳过、其余照常导入")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -703,6 +733,7 @@ if __name__ == "__main__":
     test_ics_tzid_parameter_matches_utc_representation()
     test_csv_oversized_field_returns_error_and_keeps_rows()
     test_ics_timed_end_inclusive_except_midnight()
+    test_ics_extreme_year_tzid_datetime_skipped()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()
     for case in (

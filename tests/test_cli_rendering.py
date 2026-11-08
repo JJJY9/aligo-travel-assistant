@@ -91,6 +91,46 @@ def test_preference_rendering_robust_and_consistent():
     print("✓ 偏好回显：类型守卫 / Append 变体 / 列表拼接 / 0 值")
 
 
+def test_preference_rendering_skips_unmanageable_types():
+    """含 "/" / 超过 64 字符的 type 不回显「已更新」（与落库口径一致）。"""
+    instance = _new_cli()
+    long_key = "k" * 65
+    handled = instance._generate_human_response(
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "a/b", "value": "x"},
+                        {"type": long_key, "value": "y"},
+                        {"type": "airlines", "value": "东航"},
+                    ]
+                },
+            }
+        ]
+    )
+    output = instance._buffer.getvalue()
+    assert handled is True
+    assert "已更新您的偏好设置" in output
+    assert "东航" in output
+    assert "a/b" not in output, "含 / 的偏好键不能被宣称已保存"
+    assert long_key not in output, "超过 64 字符的偏好键不能被宣称已保存"
+
+    solo = _new_cli()
+    solo._generate_human_response(
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {"preferences": [{"type": "a/b", "value": "x"}]},
+            }
+        ]
+    )
+    assert "已更新" not in solo._buffer.getvalue()
+    print("✓ 偏好回显过滤含 / 与超长 type")
+
+
 def test_preference_legacy_dict_and_nested_shapes():
     instance = _new_cli()
     results = [
@@ -362,6 +402,7 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     test_preference_rendering_robust_and_consistent()
+    test_preference_rendering_skips_unmanageable_types()
     test_preference_legacy_dict_and_nested_shapes()
     test_agent_error_message_fallback()
     test_status_renders_assistant_plaintext()

@@ -967,6 +967,51 @@ def test_runner_skips_reserved_and_deleted_sessions(monkeypatch):
     print("✓ user-import 跳过保留字 / 墓碑期会话")
 
 
+def test_runner_skips_trip_only_reserved_and_deleted_sessions(monkeypatch):
+    """备份只有行程引用保留字 / 墓碑期会话（无消息）时同样清空关联。"""
+    from utils import tombstones
+
+    payload = {
+        "trip_history": [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2027-02-01",
+                "session_id": "export",
+            },
+            {
+                "origin": "北京",
+                "destination": "广州",
+                "start_date": "2027-02-05",
+                "session_id": "s-del",
+            },
+            {
+                "origin": "北京",
+                "destination": "深圳",
+                "start_date": "2027-02-09",
+                "session_id": "s-keep",
+            },
+        ]
+    }
+    path = _write_json(payload)
+    store = _real_store("u-cli-triponly")
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id: session_id == "s-del",
+    )
+    code, out = _run_import(monkeypatch, "u-cli-triponly", path, store, as_json=True)
+    result = json.loads(out)
+    assert code == 0, out
+    assert any("保留字" in item for item in result["skipped"]), result
+    assert any("最近被删除" in item for item in result["skipped"]), result
+    trips = {trip["destination"]: trip for trip in store.get_trip_history(limit=None)}
+    assert trips["上海"].get("session_id") in (None, ""), trips["上海"]
+    assert trips["广州"].get("session_id") in (None, ""), trips["广州"]
+    assert trips["深圳"].get("session_id") == "s-keep"
+    print("✓ user-import 过滤仅被行程引用的保留字 / 墓碑期会话")
+
+
 def test_parse_rejects_huge_integer_literal_content():
     """含超 4300 位整数字面量的助手消息在导入时拒绝（否则汇总/查看永久 500）。"""
     payload = {
@@ -1083,6 +1128,7 @@ if __name__ == "__main__":
         test_parse_user_export_tolerates_recursion_error,
         test_parse_truncation_drops_split_knowledge_group,
         test_runner_skips_reserved_and_deleted_sessions,
+        test_runner_skips_trip_only_reserved_and_deleted_sessions,
     ):
         mp = pytest.MonkeyPatch()
         try:
