@@ -382,5 +382,69 @@ def test_pg_import_preserves_timestamp_instant():
         store.close()
 
 
+def test_webapp_trips_dedupe_postgres(monkeypatch):
+    """真实 PG：去重接口清理历史重复行、只保留最早一条。"""
+    import psycopg
+
+    user_id = f"webpg-dedupe-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "postgres_dsn", TEST_POSTGRES_DSN)
+    storage.reset_failure_cache()
+    try:
+        with psycopg.connect(TEST_POSTGRES_DSN) as conn:
+            conn.execute("SELECT 1")
+    except Exception as exc:  # noqa: BLE001 - 测试环境无 PG 时跳过
+        pytest.skip(f"PostgreSQL 不可用: {exc}")
+
+    # save_trip_history 自身按路线 + 日期去重，历史重复只能来自旧版本 /
+    # 直接写入的库：这里直接插两行同路线 + 同起止日期模拟历史数据
+    with psycopg.connect(TEST_POSTGRES_DSN) as conn:
+        for trip_id in ("dup-a", "dup-b"):
+            conn.execute(
+                "INSERT INTO aligo_trips "
+                "(user_id, trip_id, origin, destination, start_date, end_date, purpose) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    user_id,
+                    trip_id,
+                    "北京",
+                    "上海",
+                    "2026-01-05",
+                    "2026-01-06",
+                    "出差",
+                ),
+            )
+    try:
+        app = create_app(model=UsageTrackingModel(_FakeModel()))
+        client = TestClient(app)
+
+        preview = client.post(
+            "/api/trips/dedupe", params={"user_id": user_id, "dry_run": 1}
+        )
+        assert preview.status_code == 200, preview.text
+        data = preview.json()
+        assert data["would_remove"] == 1, data
+        assert [entry["trip_id"] for entry in data["duplicates"]] == ["dup-b"]
+
+        applied = client.post("/api/trips/dedupe", params={"user_id": user_id})
+        assert applied.status_code == 200, applied.text
+        assert applied.json()["removed"] == 1
+
+        with psycopg.connect(TEST_POSTGRES_DSN) as conn:
+            rows = conn.execute(
+                "SELECT trip_id FROM aligo_trips WHERE user_id = %s ORDER BY id",
+                (user_id,),
+            ).fetchall()
+        assert [row[0] for row in rows] == ["dup-a"], "只保留最早插入的一条"
+        print("✓ PostgreSQL 行程去重（保留最早、只删重复行）")
+    finally:
+        with psycopg.connect(TEST_POSTGRES_DSN) as conn:
+            conn.execute(
+                "DELETE FROM aligo_trips WHERE user_id = %s", (user_id,)
+            )
+            conn.execute(
+                "DELETE FROM aligo_trip_counters WHERE user_id = %s", (user_id,)
+            )
+
+
 if __name__ == "__main__":
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")
