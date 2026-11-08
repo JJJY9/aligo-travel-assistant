@@ -1380,6 +1380,92 @@ def test_truncate_marker_outlives_message_ttl(monkeypatch):
     print("✓ 截断标记 TTL 覆盖故障重放窗口")
 
 
+def test_named_connection_error_is_transient():
+    """redis-py 的 ConnectionError / TimeoutError 不是内置异常子类，按类名归类。"""
+    from context import short_term_memory as module
+
+    class _PoisonError(Exception):
+        pass
+
+    named_conn = type("ConnectionError", (Exception,), {})("redis down")
+    named_timeout = type("TimeoutError", (Exception,), {})("read timeout")
+    assert module._is_transient_redis_error(named_conn) is True
+    assert module._is_transient_redis_error(named_timeout) is True
+    assert module._is_transient_redis_error(_PoisonError("bad payload")) is False
+
+    try:
+        import redis
+    except ImportError:  # pragma: no cover - requirements 固定安装 redis
+        pass
+    else:
+        # 真实 redis-py 异常走同一名字分支（继承 RedisError 而非内置异常）
+        assert module._is_transient_redis_error(redis.exceptions.ConnectionError("down"))
+        assert module._is_transient_redis_error(redis.exceptions.TimeoutError("slow"))
+    print("✓ redis-py 同名连接 / 超时异常按暂时故障处理")
+
+
+def test_named_connection_error_during_replay_keeps_queue(monkeypatch):
+    """重放遇到 redis-py 式连接异常：不计毒、队列保留，恢复后按序生效。"""
+    from context import short_term_memory as module
+
+    class _NamedDownRedis(_FlakyRedis):
+        def _check(self):
+            if self.fail:
+                raise type("ConnectionError", (Exception,), {})("redis down")
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _NamedDownRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-named-transient", max_turns=5, user_id="u1"
+    )
+    client.fail = True
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    # 影子缓存里删掉这一轮：排队按具体消息删除，恢复后重放不得复活
+    assert memory.truncate_last_turn("Q1") == 2
+    snapshot = memory._pending_ops
+    assert [kind for kind, _ in snapshot] == ["add", "add", "remove"]
+
+    # 连续 6 轮重试都因同名连接异常失败：超过毒操作阈值也不能丢队列
+    for _ in range(6):
+        monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+        memory.get_recent_context()
+        assert memory._pending_ops == snapshot, "暂时故障不能丢弃排队操作"
+        with module._PENDING_JOURNALS_LOCK:
+            journal = module._PENDING_JOURNALS[memory.key]
+        assert journal.stuck == ("", 0), "暂时故障不能计入毒操作"
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == [], "重放顺序：先补写故障期消息，再删除已截断轮次"
+    assert memory._pending_ops == []
+    assert client.data == []
+    print("✓ 重放中的 redis-py 连接异常保留队列且恢复后按序生效")
+
+
+def test_truncate_replay_marker_uses_long_ttl(monkeypatch):
+    """重放路径传给截断脚本的标记 TTL 与在线路径一致（30 天，非消息 TTL）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-marker-ttl-replay", max_turns=5, ttl_sec=60, user_id="u1"
+    )
+    client.fail = True
+    assert memory.truncate_last_turn("Q1") == 0
+    assert [kind for kind, _ in memory._pending_ops] == ["truncate"]
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory.get_recent_context()
+    assert client.marker_ttls == [str(module._OP_MARKER_TTL_SEC)]
+    assert int(client.marker_ttls[0]) >= 24 * 3600, "标记必须覆盖进程内日志的整个等待窗口"
+    assert client.marker_ttls[0] != "60", "不能用消息 TTL（本实例 60 秒）"
+    assert client.markers == {}, "重放（含未匹配）后标记要清理"
+    print("✓ 截断重放路径的标记 TTL 与在线路径一致")
+
+
 def test_read_skips_deeply_nested_entries(monkeypatch):
     """深嵌套 JSON 条目的 RecursionError 按坏条目跳过，不能当成 Redis 故障。"""
     from context import short_term_memory as module
@@ -1500,6 +1586,7 @@ if __name__ == "__main__":
     test_max_turns_evicts_oldest()
     test_recent_context_and_string()
     test_statistics_and_clear()
+    test_named_connection_error_is_transient()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_redis_failure_falls_back_to_memory(_mp)
@@ -1595,6 +1682,8 @@ if __name__ == "__main__":
         test_broken_client_re_resolved_after_failure,
         test_connection_failure_during_replay_keeps_queue,
         test_truncate_marker_outlives_message_ttl,
+        test_named_connection_error_during_replay_keeps_queue,
+        test_truncate_replay_marker_uses_long_ttl,
         test_read_skips_deeply_nested_entries,
     ):
         _case_mp = __import__("pytest").MonkeyPatch()
