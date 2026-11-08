@@ -7425,9 +7425,57 @@ def test_session_detail_sanitizes_legacy_nan_meta():
     print("✓ 会话详情对旧数据 NaN _meta 归一")
 
 
+def test_session_export_html_format():
+    """单会话导出支持 format=html（与 CLI session-export --html 同口径）。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user = _unique_user("web_session_html")
+    try:
+        store = create_long_term_memory(user, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "去北京出差", "s-html")
+            store.add_chat_message("assistant", "好的，已安排", "s-html")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        renamed = client.put(
+            "/api/sessions/s-html/title",
+            json={"user_id": user, "title": "<b>标题</b>"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        response = client.get(
+            "/api/sessions/s-html/export",
+            params={"user_id": user, "format": "html"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith("text/html")
+        assert ".html" in response.headers["content-disposition"]
+        # 标题在出口单次转义：不能原样落 <b>，也不能双重转义成 &amp;lt;
+        assert "&lt;b&gt;标题&lt;/b&gt;" in response.text
+        assert "<b>标题</b>" not in response.text
+        assert "去北京出差" in response.text
+        invalid = client.get(
+            "/api/sessions/s-html/export",
+            params={"user_id": user, "format": "pdf"},
+        )
+        assert invalid.status_code == 422
+        # 默认仍是 Markdown
+        markdown = client.get(
+            "/api/sessions/s-html/export", params={"user_id": user}
+        )
+        assert markdown.status_code == 200
+        assert markdown.headers["content-type"].startswith("text/markdown")
+    finally:
+        _cleanup(user)
+    print("✓ 单会话导出支持 HTML（标题单次转义 / 格式校验）")
+
+
 if __name__ == "__main__":
     test_index_page()
     test_session_detail_sanitizes_legacy_nan_meta()
+    test_session_export_html_format()
     test_write_endpoints_reject_unwritable_text()
     test_read_rate_limit_covers_export_and_detail_endpoints()
     test_import_validation_error_is_trimmed()
