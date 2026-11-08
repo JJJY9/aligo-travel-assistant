@@ -2243,12 +2243,45 @@ def test_import_empty_documents_short_circuits(monkeypatch):
     print("✓ 空导入短路返回零计数")
 
 
+def test_import_layout_scan_failure_skips_group(monkeypatch):
+    """库内布局扫描失败时保守跳过补写组，不冒产生残缺组的风险。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"甲"})
+
+    def boom():
+        raise RuntimeError("scan down")
+
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", boom)
+    documents = [
+        {"content": "甲", "metadata": {"group": "g-scan", "part": "1", "parts": "2"}},
+        {"content": "乙", "metadata": {"group": "g-scan", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_duplicate"] == 2, result  # 已存在的「甲」+ 保守跳过的「乙」
+    print("✓ 布局扫描失败时整组保守跳过")
+
+
+def test_regroup_rejects_duplicate_part_numbers():
+    """同组 part 编号重复会叠内容 / 丢片，重组直接报错。"""
+    documents = [
+        {"content": "同段", "metadata": {"group": "g-dup", "part": "1", "parts": "2"}},
+        {"content": "同段", "metadata": {"group": "g-dup", "part": "1", "parts": "2"}},
+    ]
+    with pytest.raises(ValueError, match="part 编号重复"):
+        knowledge_admin._regroup_exported_documents(documents, set())
+    print("✓ 重组拒绝重复 part 编号")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
     test_iter_all_rows_closes_iterator_even_on_error()
     test_restore_pieces_fallbacks()
     test_regroup_keeps_non_dict_items()
+    test_regroup_rejects_duplicate_part_numbers()
     test_document_info_parses_parts_and_group()
     for case in (
         test_list_documents_parses_sorts_and_filters,
@@ -2272,6 +2305,7 @@ if __name__ == "__main__":
         test_get_document_reads_single_row,
         test_existing_group_layout_tolerates_bad_numbers,
         test_import_empty_documents_short_circuits,
+        test_import_layout_scan_failure_skips_group,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_cross_group_share_keeps_unique_pieces,
