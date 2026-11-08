@@ -1024,19 +1024,71 @@ class LongTermMemory:
 
     @_locked_mutation
     def save_trip_histories(self, trips: list[dict[str, Any]]) -> tuple[int, int]:
-        """批量保存行程（备份恢复）：一次重载 + 一次原子写回。
+        """批量保存行程（备份恢复 / 导入）：一次重载 + 一次原子写回。
 
-        逐条 ``save_trip_history`` 每次都要整文件重载 / 重写（O(n²)），
-        几千条行程会把恢复拖成分钟级。返回 ``(新增数, 更新数)``。
+        逐条调用 ``_apply_trip_locked`` 时，每条都要全量扫描历史找重复、
+        再全量扫描生成下一个 id（O(行数 × 历史条数)），几千条导入会被拖成
+        分钟级。这里先建一次「去重键 → 记录」索引与最大编号，再逐条写入；
+        语义与单条保存一致（同路线 + 同起止日期更新既有记录、未提供的
+        目的 / 会话保留原值、删除后的编号不复用）。返回 ``(新增数, 更新数)``。
         """
+        from utils.trip_import import normalize_identity_date
+
+        def _identity(trip: dict[str, Any]) -> tuple[str, str, str, str] | None:
+            destination = trip.get("destination")
+            start = normalize_identity_date(trip.get("start_date"))
+            if not destination or not start:
+                return None
+            origin = str(trip.get("origin") or "")
+            end = normalize_identity_date(trip.get("end_date")) or start
+            return (destination, origin, start, end)
+
+        history = self.data.setdefault("trip_history", [])
+        stats = self.data.setdefault("statistics", {})
+        index: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        max_number = int(stats.get("last_trip_number") or 0)
+        for trip in history:
+            key = _identity(trip)
+            if key is not None:
+                index.setdefault(key, trip)
+            match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
+            if match:
+                max_number = max(max_number, int(match.group(1)))
+
         created = 0
         updated = 0
         for row in trips:
-            _, is_new = self._apply_trip_locked(row)
-            if is_new:
-                created += 1
-            else:
+            key = _identity(row)
+            existing = index.get(key) if key is not None else None
+            if existing is not None:
+                for field in ("purpose", "session_id"):
+                    value = row.get(field)
+                    if value is not None:
+                        existing[field] = value
+                existing["timestamp"] = datetime.now().isoformat()
                 updated += 1
+                continue
+            max_number += 1
+            record: dict[str, Any] = {
+                "trip_id": f"trip_{max_number}",
+                "timestamp": datetime.now().isoformat(),
+                **row,
+            }
+            # 备份恢复的行可能自带 trip_id：编号水位要按实际落库的 id 抬高，
+            # 否则同批后续记录可能与还原的旧编号冲突
+            match = re.fullmatch(r"trip_(\d+)", str(record.get("trip_id", "")))
+            if match:
+                max_number = max(max_number, int(match.group(1)))
+            stats["last_trip_number"] = max_number
+            history.append(record)
+            stats["total_trips"] = int(stats.get("total_trips", 0)) + 1
+            destination = record.get("destination")
+            if destination:
+                frequent = stats.setdefault("frequent_destinations", {})
+                frequent[destination] = int(frequent.get(destination, 0)) + 1
+            if key is not None:
+                index[key] = record
+            created += 1
         if created or updated:
             self._persist()
         logger.info("Bulk saved %d trips (%d new)", created + updated, created)
