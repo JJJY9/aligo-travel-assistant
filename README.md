@@ -70,7 +70,7 @@
 - **会话历史与搜索**：历史会话按日期分组、可恢复 / 删除，超过一页时提供「加载更多会话」（已显示 X / 共 Y），并支持按标题与消息内容全文检索（带命中片段）；点击搜索结果会定位并短暂高亮命中的那条消息；地址栏同步 `user` / `session` 参数，可直接打开或分享某个会话（顶栏「复制链接」）
 - **现代交互**：深浅主题、停止生成、重新生成、复制回答、Markdown 表格 / 代码块、移动端抽屉布局
 - **会话导出**：单个会话可导出 Markdown（附件）或单文件 HTML（内嵌样式，适合分享 / 打印 / 离线查看）
-- **记忆与用量面板**：在线编辑 / 删除偏好、查看最近行程与统计、手动补录与编辑行程（出发地 / 目的地 / 日期 / 目的）、导入 CSV / iCalendar 行程文件（UTF-8 / GBK 自动解码，2 MB 上限，先预览新增 / 更新数量再确认）、删除误记录的行程（同步更新统计与常去目的地；同一行程重复添加自动去重）、一键导出全部行程日历（`.ics`，单条行程也可单独加入日历）、存储后端、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体），一键导出 JSON / 从 JSON 备份恢复（可先预览）；单个会话可导出 Markdown
+- **记忆与用量面板**：在线编辑 / 删除偏好、查看最近行程与统计、手动补录与编辑行程（出发地 / 目的地 / 日期 / 目的）、导入 CSV / iCalendar 行程文件（UTF-8 / GBK 自动解码，2 MB 上限，先预览新增 / 更新数量再确认）、删除误记录的行程（同步更新统计与常去目的地；同一行程重复添加自动去重）、按关键词 / 状态筛选导出行程台账（CSV / HTML / 日历 `.ics`，与 CLI `trips-export` 同口径；单条行程也可单独加入日历）、一键清理重复行程（同路线 + 同起止日期保留最早一条，与 CLI `trips-dedupe` 同语义；先预览数量再确认）、存储后端、模型用量（调用次数 / tokens / 平均耗时 / 常用智能体），一键导出 JSON / 从 JSON 备份恢复（可先预览）；单个会话可导出 Markdown
 
 ---
 
@@ -645,13 +645,14 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录 |
 | DELETE | `/api/sessions/{id}/last-turn` | 删除最后一轮对话（用户提问 + 助手回答；`expect` 内容不一致时不删除，供编辑后重新发送） |
 | GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载）；`with_knowledge=1`（仅 JSON）把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段，可由 `/api/import` 一体化恢复） |
-| POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过，备份含 `knowledge` 段时一并恢复知识片段（失败时 `knowledge_error` 字段说明）；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
+| POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（只接受 `Content-Type: application/json`，body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过，备份含 `knowledge` 段时一并恢复知识片段（失败时 `knowledge_error` 字段说明）；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
 | POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id`、`created` 与日期重叠的 `conflicts`） |
+| POST | `/api/trips/dedupe` | 清理重复行程（JSON body `{"user_id": ..., "dry_run": true}`；同路线 + 同起止日期保留最早一条，与 CLI `trips-dedupe` 共用判定 / 复核 / 删除；同 id 多行程只列在 `ambiguous_ids` 不自动处理；`dry_run` 只预览 `would_remove` / `duplicates`；PostgreSQL 配置但不可用时 503） |
 | POST | `/api/trips/import` | 从 CSV / iCalendar 文本导入行程（JSON body `{"content": ...}`，自动识别格式；与 CLI `trips-import` 同一解析与去重语义，`dry_run=1` 只预览；在导入专用执行器 + 背压执行，单次最多 5000 行、`content` ≤ 50 万字符；缺省目的不覆盖已有行程；无有效行返回 400 并附行号原因） |
 | PUT | `/api/trips/{id}` | 更新行程（部分字段；与其它行程完全重复时返回 409，返回日期重叠的 `conflicts`） |
 | GET | `/api/trips/{id}/calendar` | 导出行程为 iCalendar（`.ics`）全天事件，含出行前一天 09:00 提醒 |
 | GET | `/api/trips/calendar` | 导出全部历史行程为一个 iCalendar 文件（缺出发日期的行程跳过；每个事件含前一天 09:00 提醒） |
-| GET | `/api/trips/export` | 导出历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开）或 HTML 台账（`format=html`，可打印 / 分享）；`q` 与列表接口同一口径过滤后导出 |
+| GET | `/api/trips/export` | 导出历史行程为 CSV（UTF-8 BOM，含表头，便于 Excel 打开）、HTML 台账（`format=html`，可打印 / 分享）或 iCalendar 合集（`format=ics`，与 CLI `trips-export --ics` 同一渲染）；`q` / `status` 与列表接口同一口径过滤后导出 |
 | GET | `/api/trips` | 历史行程列表（`limit` / `offset` 分页，`order=asc\|desc` 切换记录顺序，`q` 按路线 / 日期 / 目的过滤，`status=active\|upcoming\|past` 按面板状态徽标过滤，附带日期重叠信息） |
 | DELETE | `/api/trips/{id}` | 删除一条历史行程（同步统计与常去目的地） |
 
