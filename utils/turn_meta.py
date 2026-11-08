@@ -29,28 +29,46 @@ def build_turn_meta(
     intention = intention_data if isinstance(intention_data, dict) else {}
     result = result_data if isinstance(result_data, dict) else {}
 
+    results_source = result.get("results")
+    if not isinstance(results_source, list):
+        results_source = []
+    # 调度器实际执行的智能体（含失败）：执行路线只记录真正跑过的条目，
+    # 被去重 / 丢弃 / 不存在的名字不能按名字匹配成「成功」
+    executed_names = {
+        canonical_agent_name(str(item.get("agent_name") or "").strip())
+        for item in results_source
+        if isinstance(item, dict)
+    }
+
     schedule_source = intention.get("agent_schedule")
     if not isinstance(schedule_source, list):
         # 模型可能返回字符串 / 数字 / 对象；真值非可迭代会抛 TypeError
         schedule_source = []
     schedule = []
+    seen_schedule: set[str] = set()
     for item in schedule_source:
         if not isinstance(item, dict):
             continue
+        name = str(item.get("agent_name") or "").strip()
+        if not name:
+            continue
         # 与调度器同一口径归一：历史执行路线用标准名去匹配 results，
         # 技能目录名（plan-trip 等）不归一会查不到、状态默认显示「成功」
-        name = str(item.get("agent_name") or "").strip()
+        canonical = canonical_agent_name(name)
+        if canonical in seen_schedule:
+            continue
+        if executed_names and canonical not in executed_names:
+            # 调度器丢弃 / 去重的条目从未执行，不能出现在执行路线里
+            continue
+        seen_schedule.add(canonical)
         schedule.append(
             {
-                "agent_name": canonical_agent_name(name),
+                "agent_name": canonical,
                 "priority": item.get("priority", 0),
                 "reason": item.get("reason", ""),
             }
         )
 
-    results_source = result.get("results")
-    if not isinstance(results_source, list):
-        results_source = []
     agents = []
     for item in results_source:
         if not isinstance(item, dict):
