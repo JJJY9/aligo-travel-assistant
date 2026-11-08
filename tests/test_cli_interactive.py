@@ -284,7 +284,7 @@ def _make_cli_stub():
     """构造可跑 process_query 的轻量 CLI 桩（假记忆 / 假意图 / 假编排）。"""
     agent = cli.AligoCLI()
     agent.console = Console(file=io.StringIO(), force_terminal=False, width=100)
-    events = {"reload": 0, "messages": [], "staged": [], "persisted": []}
+    events = {"reload": 0, "messages": [], "staged": [], "persisted": [], "rolled_back": []}
 
     class _Memory:
         def __init__(self):
@@ -304,6 +304,12 @@ def _make_cli_stub():
 
         def stage_message(self, role, content, metadata=None):
             events["staged"].append(content)
+
+        def rollback_staged_message(self, content):
+            events["rolled_back"].append(content)
+            if events["staged"] and events["staged"][-1] == content:
+                events["staged"].pop()
+            return True
 
         def add_message(self, role, content, metadata=None):
             self.persist_message(role, content)
@@ -360,7 +366,7 @@ def test_process_query_stages_user_message_before_orchestration():
 
 
 def test_process_query_failure_leaves_no_long_term_user_turn():
-    """编排失败时长期记忆不落孤儿用户轮，但短期上下文保留本轮提问。"""
+    """编排失败时长期记忆不落孤儿用户轮，短期记忆的暂存提问同步回滚。"""
 
     class _FailingOrchestrator:
         async def reply(self, intention, on_event=None):
@@ -371,8 +377,9 @@ def test_process_query_failure_leaves_no_long_term_user_turn():
     with pytest.raises(RuntimeError):
         asyncio.run(agent.process_query("你好"))
     assert events["persisted"] == [], "失败时不得写长期记忆"
-    assert events["staged"] == ["你好"], "短期记忆应保留本轮提问供下一轮上下文"
-    print("✓ 编排失败不落孤儿用户轮")
+    assert events["staged"] == [], "失败后暂存提问必须从短期记忆回滚"
+    assert events["rolled_back"] == ["你好"]
+    print("✓ 编排失败不落孤儿用户轮，短期暂存提问回滚")
 
 
 def test_process_query_counts_generic_orchestration_failure():

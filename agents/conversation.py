@@ -164,51 +164,84 @@ class ConversationRuntime:
         # 放到线程池执行，避免阻塞事件循环。本轮提问先只进短期记忆：
         # 编排智能体从短期记忆读取「用户本轮原话」，编排失败 / 用户停止时
         # 长期记忆里不会留下没有回复的孤儿提问（CLI 同款时序）
-        await asyncio.to_thread(self.memory.stage_message, "user", user_input)
-        orchestration = await self._call_with_resilience(
-            lambda: self.orchestrator.reply(intention, on_event=on_event),
-            max_retries=int(rc.get("max_retries", 3)),
-            base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
-            max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
-        )
-
+        persist_started = False
         try:
-            result_data = json.loads(orchestration.content)
-        except json.JSONDecodeError as exc:
-            raise UserFacingError("编排结果解析失败，请重试") from exc
-        if not isinstance(result_data, dict):
-            raise UserFacingError("编排结果格式错误，请重试")
-
-        agents = [
-            {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
-            for item in result_data.get("results", [])
-        ]
-        usage = self._usage_delta(usage_before)
-        elapsed = round(time.time() - start, 2)
-        meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
-        if turn_id:
-            meta["client_turn_id"] = turn_id
-        # 编排成功：整轮问答在一次线程调用里原子提交（用户 + 助手）。
-        # 分成两次提交时，两次之间被取消 / 第二次写失败会在长期记忆留下
-        # 没有回答的孤儿提问。落库任务独立于 ask 协程：取消只让这里抛出，
-        # 写线程会继续完成，调用方用 drain_pending_persist() 等它结束。
-        assistant_payload = json.dumps(
-            attach_turn_meta(result_data, meta), ensure_ascii=False
-        )
-        pending = asyncio.ensure_future(
-            asyncio.to_thread(
-                self.memory.persist_turn, user_input, assistant_payload
+            await asyncio.to_thread(self.memory.stage_message, "user", user_input)
+            orchestration = await self._call_with_resilience(
+                lambda: self.orchestrator.reply(intention, on_event=on_event),
+                max_retries=int(rc.get("max_retries", 3)),
+                base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
+                max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
             )
-        )
-        self._pending_persist = pending
-        pending.add_done_callback(self._clear_pending_persist)
-        await asyncio.shield(pending)
+
+            try:
+                result_data = json.loads(orchestration.content)
+            except json.JSONDecodeError as exc:
+                raise UserFacingError("编排结果解析失败，请重试") from exc
+            if not isinstance(result_data, dict):
+                raise UserFacingError("编排结果格式错误，请重试")
+
+            agents = [
+                {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
+                for item in result_data.get("results", [])
+            ]
+            usage = self._usage_delta(usage_before)
+            elapsed = round(time.time() - start, 2)
+            meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
+            if turn_id:
+                meta["client_turn_id"] = turn_id
+            # 编排成功：整轮问答在一次线程调用里原子提交（用户 + 助手）。
+            # 分成两次提交时，两次之间被取消 / 第二次写失败会在长期记忆留下
+            # 没有回答的孤儿提问。落库任务独立于 ask 协程：取消只让这里抛出，
+            # 写线程会继续完成，调用方用 drain_pending_persist() 等它结束。
+            assistant_payload = json.dumps(
+                attach_turn_meta(result_data, meta), ensure_ascii=False
+            )
+            pending = asyncio.ensure_future(
+                asyncio.to_thread(
+                    self.memory.persist_turn, user_input, assistant_payload
+                )
+            )
+            self._pending_persist = pending
+            pending.add_done_callback(self._clear_pending_persist)
+            persist_started = True
+            await asyncio.shield(pending)
+        except BaseException:
+            # 编排失败 / 取消：暂存的用户提问必须跟着回滚——保留的话，重试
+            # 同一问题会在上下文里出现两条重复提问，而长期记忆里没有对应
+            # 轮次，两层记忆从此不一致。落库线程已在途（用户停止时常常如此）
+            # 就跳过：它会把整轮问答完整写入长期记忆。
+            if not persist_started or self._pending_persist is None:
+                await self._rollback_staged_user_message(user_input)
+            raise
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
             "usage": usage,
             "elapsed": elapsed,
         }
+
+    async def _rollback_staged_user_message(self, user_input: str) -> None:
+        """移除编排前暂存的用户提问（尽力而为，不阻塞取消 / 错误上报）。
+
+        回滚本身是阻塞 IO，放线程池执行；用户停止请求时当前任务已处于取消
+        状态，任何 await 都会被立即再次取消，因此只做有限等待，线程自行完成。
+        """
+        rollback = getattr(self.memory, "rollback_staged_message", None)
+        if not callable(rollback):
+            return
+        task = asyncio.ensure_future(asyncio.to_thread(rollback, user_input))
+        task.add_done_callback(self._consume_background_task)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            logger.debug("回滚暂存提问未在限时内完成，后台线程继续执行")
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Future) -> None:
+        if not task.cancelled():
+            # 后台任务无人 await：取走异常，避免未检索告警
+            task.exception()
 
     def _clear_pending_persist(self, pending: asyncio.Future) -> None:
         if self._pending_persist is pending:

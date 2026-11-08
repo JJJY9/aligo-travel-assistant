@@ -29,6 +29,7 @@ class _FakeMemory:
         self.threads: dict[str, int] = {}
         self.events: list[tuple[str, str]] = []
         self.staged: list[tuple[str, str]] = []
+        self.rolled_back: list[str] = []
         self.long_term = self
         self.short_term = self
 
@@ -51,6 +52,13 @@ class _FakeMemory:
     def stage_message(self, role, content, metadata=None):
         self.threads[f"stage-{role}"] = threading.get_ident()
         self.staged.append((role, content))
+
+    def rollback_staged_message(self, content):
+        self.threads["rollback"] = threading.get_ident()
+        self.rolled_back.append(content)
+        if self.staged and self.staged[-1] == ("user", content):
+            self.staged.pop()
+        return True
 
     def persist_message(self, role, content):
         self.threads[f"persist-{role}"] = threading.get_ident()
@@ -143,7 +151,7 @@ def test_ask_runs_memory_io_off_event_loop():
 
 
 def test_failed_orchestration_leaves_no_long_term_user_turn():
-    """编排失败时长期记忆不留孤儿用户提问，短期上下文保留本轮提问。"""
+    """编排失败时长期记忆不留孤儿用户提问，短期暂存提问同步回滚。"""
     runtime, memory = _make_runtime()
 
     async def _direct(factory, max_retries=0, base_delay=0.0, max_delay=0.0):
@@ -159,8 +167,26 @@ def test_failed_orchestration_leaves_no_long_term_user_turn():
     with pytest.raises(RuntimeError):
         asyncio.run(runtime.ask("你好"))
     assert memory.events == [], "失败时不得写长期记忆"
-    assert memory.staged == [("user", "你好")], "短期上下文保留本轮提问"
-    print("✓ 编排失败不落孤儿用户轮（Web 与 CLI 同契约）")
+    assert memory.staged == [], "暂存的用户提问必须随失败一起回滚"
+    assert memory.rolled_back == ["你好"]
+    print("✓ 编排失败不落孤儿用户轮（暂存提问回滚，Web 与 CLI 同契约）")
+
+
+def test_persist_failure_rolls_back_staged_user_message():
+    """落库失败（长期记忆未写入）时暂存提问同样要回滚，两层记忆保持一致。"""
+    from utils.errors import MemoryPersistenceError
+
+    runtime, memory = _make_runtime()
+
+    def _boom(user_content, assistant_content):
+        raise MemoryPersistenceError("磁盘已满")
+
+    memory.persist_turn = _boom  # type: ignore[method-assign]
+    with pytest.raises(MemoryPersistenceError):
+        asyncio.run(runtime.ask("你好"))
+    assert memory.events == []
+    assert memory.rolled_back == ["你好"], "整轮没有落库时暂存提问不能残留"
+    print("✓ 落库失败回滚暂存提问")
 
 
 def test_malformed_recent_context_entries_are_skipped():
@@ -244,10 +270,14 @@ def test_summary_inputs_off_event_loop():
     class _FakeLongTerm:
         def __init__(self):
             self.threads: list[int] = []
+            self.calls: list[tuple[str | None, str | None, int | None]] = []
 
-        def get_chat_history(self, session_id=None, limit=None):
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
             self.threads.append(threading.get_ident())
-            return [
+            self.calls.append((session_id, exclude_session_id, limit))
+            messages = [
                 {
                     "session_id": "other",
                     "role": "user",
@@ -255,6 +285,7 @@ def test_summary_inputs_off_event_loop():
                     "timestamp": "t1",
                 }
             ]
+            return messages[-limit:] if limit else messages
 
         def get_trip_history(self, limit=None):
             self.threads.append(threading.get_ident())
@@ -278,6 +309,9 @@ def test_summary_inputs_off_event_loop():
     assert manager.long_term.threads, "应查询聊天历史 / 行程"
     assert all(tid != loop_thread for tid in manager.long_term.threads), (
         "总结的同步查询在事件循环线程执行，会冻结所有 SSE 流"
+    )
+    assert manager.long_term.calls == [(None, "s-summary", 50)], (
+        "跨会话历史应在存储层按「排除当前会话 + 固定窗口」一次取回"
     )
     print("✓ 总结查询离开事件循环线程")
 

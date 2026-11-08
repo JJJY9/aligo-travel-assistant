@@ -220,6 +220,10 @@ class AligoCLI:
         # 之前失败或 Ctrl-C（CancelledError 不经过 record_*）时在 finally 里
         # 归还名额，否则后续查询会被熔断拒绝最多 recovery_timeout 秒
         probe_recorded = False
+        # 暂存 / 落库标记：编排失败或 Ctrl-C 时短期记忆里的暂存提问要在
+        # finally 里回滚，否则重试同一问题会在上下文里出现重复提问
+        staged = False
+        persisted = False
 
         try:
             rc = RESILIENCE_CONFIG
@@ -283,6 +287,7 @@ class AligoCLI:
             # 原话」（与 Web 的 ConversationRuntime 一致）；长期记忆仍在本轮
             # 成功后落库，编排失败 / Ctrl-C 时不留无回复的孤儿用户轮
             self.memory_manager.stage_message("user", user_input)
+            staged = True
 
             # 5. 调度智能体（实时显示智能体进度）
             orchestration_result = None
@@ -353,7 +358,12 @@ class AligoCLI:
                 user_input,
                 json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
             )
+            persisted = True
         finally:
+            if staged and not persisted:
+                rollback = getattr(self.memory_manager, "rollback_staged_message", None)
+                if callable(rollback):
+                    rollback(user_input)
             if self.circuit_breaker and not probe_recorded:
                 self.circuit_breaker.release_probe()
 
