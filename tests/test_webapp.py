@@ -1511,6 +1511,50 @@ def test_trips_import_runs_in_import_executor_and_maps_errors(monkeypatch):
     print("✓ /api/trips/import 专用执行器 / 400 / 422 / 背压 503")
 
 
+def test_trips_import_rate_limited(monkeypatch):
+    """/api/trips/import 计入导入限流桶：超额直接 429，不进入导入执行器。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    class _Store:
+        def close(self):
+            pass
+
+    calls = []
+
+    def fake_import(store, text, dry_run=False, force_ics=False):
+        calls.append(dry_run)
+        return {
+            "dry_run": dry_run,
+            "format": "csv",
+            "rows": 1,
+            "created": 1,
+            "updated": 0,
+            "skipped": [],
+            "skipped_total": 0,
+        }
+
+    monkeypatch.setattr(server_module, "import_trips_from_text", fake_import)
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id: _Store())
+    client = _client()
+    state = client.app.state.aligo
+    state.import_limiter = RateLimiter(limit=1, window_sec=60)
+    user = _unique_user("web_trip_rl")
+    url = f"/api/trips/import?user_id={user}"
+
+    allowed = client.post(url, json={"content": "x"})
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.headers.get("x-ratelimit-limit") == "1"
+    assert allowed.headers.get("x-ratelimit-remaining") == "0"
+
+    rejected = client.post(url, json={"content": "x"})
+    assert rejected.status_code == 429
+    assert rejected.headers.get("retry-after")
+    assert rejected.headers.get("x-ratelimit-remaining") == "0"
+    assert calls == [False], "被限流的请求不应进入导入逻辑"
+    print("✓ /api/trips/import 导入限流 429")
+
+
 def test_trip_update_validation_and_errors(monkeypatch):
     """行程更新的校验与错误映射：400 / 422（多种）/ 404 / 409（冲突与歧义）/ 503。"""
     from webapp import server as server_module
