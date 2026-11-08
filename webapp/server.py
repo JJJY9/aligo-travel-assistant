@@ -2116,6 +2116,12 @@ def create_app(model: Any = None) -> FastAPI:
             "rate_limit": rate["backend"],
             "rate_limit_configured": rate["configured"],
             "rate_limit_degraded": rate["degraded"],
+            # 并发会话容量：全部会话在用时的超额对话会收到 503（见
+            # SessionCapacityError），运维需要能看到当前占用与上限
+            "sessions": {
+                "cached": len(state.sessions),
+                "max": state.max_sessions,
+            },
             "skills": {
                 "count": len(skill_scripts(skills_root)),
                 "dir_found": skills_root.is_dir(),
@@ -2157,6 +2163,7 @@ def create_app(model: Any = None) -> FastAPI:
             "requests": REQUEST_METRICS.snapshot(),
             "circuit_breaker": state.breaker.get_status(),
             "sessions_cached": len(state.sessions),
+            "sessions_max": state.max_sessions,
             "rate_limit": _rate_limit_info(state),
         }
 
@@ -2189,6 +2196,10 @@ def create_app(model: Any = None) -> FastAPI:
             "# HELP aligo_sessions_cached Cached sessions in this process.\n"
             "# TYPE aligo_sessions_cached gauge\n"
             f"aligo_sessions_cached {len(state.sessions)}\n"
+            "# HELP aligo_sessions_max Concurrent session capacity "
+            "(excess chats get 503 while all sessions are in use).\n"
+            "# TYPE aligo_sessions_max gauge\n"
+            f"aligo_sessions_max {state.max_sessions}\n"
         )
         backends = describe_backends()
         body += (
