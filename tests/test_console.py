@@ -318,6 +318,157 @@ def test_non_tty_pipe_is_wrapped(monkeypatch):
     print("✓ 非终端管道自动包装（幂等）")
 
 
+def test_auto_decode_input_textio_properties(tmp_path):
+    """TextIO 契约属性：只读流、编码固定 utf-8、close/flush 为空操作。"""
+    from utils.console import _AutoDecodeInput
+
+    handle_path = tmp_path / "stdin.bin"
+    handle_path.write_bytes(b"")
+    handle = open(handle_path, "rb")
+    try:
+        shim = _AutoDecodeInput(handle)
+        assert shim.encoding == "utf-8"
+        assert shim.readable() is True
+        assert shim.writable() is False
+        assert shim.seekable() is False
+        assert shim.isatty() is False
+        assert isinstance(shim.fileno(), int)
+        shim.close()
+        shim.flush()
+    finally:
+        handle.close()
+    print("✓ 自动解码 stdin 的 TextIO 属性")
+
+
+def test_auto_decode_peek_failure_uses_auto_mode():
+    """底层 peek 抛异常时按逐行 auto 判断，readline 仍可正常工作。"""
+    from utils.console import _AutoDecodeInput
+
+    nl = chr(10)
+
+    class _PeekBoom(io.BytesIO):
+        def peek(self, size=2):
+            raise RuntimeError("peek unsupported")
+
+    shim = _AutoDecodeInput(_PeekBoom(("你好" + nl).encode("utf-8")))
+    assert shim.readline() == "你好" + nl
+    assert shim._mode == "auto"
+    print("✓ peek 失败按逐行 auto 判断")
+
+
+def test_read_merges_pending_line():
+    """readline(size) 截断的余量在下一次 read() 中继续返回。"""
+    from utils.console import _AutoDecodeInput
+
+    nl = chr(10)
+    shim = _AutoDecodeInput(_PipeBuffer(("第一行内容" + nl).encode("utf-8")))
+    assert shim.readline(2) == "第一"
+    assert shim.read() == "行内容" + nl
+    assert shim.read() == ""
+    print("✓ read() 合并 readline 的截断余量")
+
+
+def test_read_size_truncation_keeps_remainder_utf16():
+    """UTF-16 分块解码可能一次解出多字：read(size) 截断后的余量留给下次读取。"""
+    from utils.console import _AutoDecodeInput
+
+    nl = chr(10)
+    shim = _AutoDecodeInput(_PipeBuffer(("你好" + nl).encode("utf-16")))
+    assert shim.read(1) == "你"
+    assert shim.read() == "好" + nl
+    print("✓ UTF-16 read(size) 截断余量保留")
+
+
+def test_pipe_safe_textio_delegates_metadata():
+    """PipeSafeTextIO 的编码/错误策略/属性访问回退到被包装流。"""
+    from utils.console import PipeSafeTextIO
+
+    class _Abstract:
+        encoding = None
+
+        def isatty(self):
+            raise RuntimeError("no tty")
+
+        def write(self, text):
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def fileno(self):
+            return 3
+
+        custom_attr = "delegated"
+
+    safe = PipeSafeTextIO(_Abstract())
+    assert safe.encoding == "utf-8"
+    assert safe.errors == "strict"
+    assert safe.isatty() is False
+    assert safe.fileno() == 3
+    assert safe.custom_attr == "delegated"
+
+    # 未标记 broken 之前 flush 抛管道错误：同样静默吞掉
+    class _FlushBroken:
+        def write(self, text):
+            return len(text)
+
+        def flush(self):
+            raise OSError(22, "Invalid argument")
+
+    PipeSafeTextIO(_FlushBroken()).flush()
+    print("✓ PipeSafeTextIO 元数据与属性代理 / flush 容错")
+
+
+def test_reconfigure_failure_is_swallowed(monkeypatch):
+    """reconfigure 抛异常（已关闭 / 抽象流）不能影响启动。"""
+    from utils import console as console_module
+
+    class _Closed:
+        def reconfigure(self, **kwargs):
+            raise OSError("closed")
+
+    monkeypatch.setattr(sys, "stdout", _Closed())
+    console_module._reconfigure("stdout", "utf-8")
+    monkeypatch.undo()
+    print("✓ reconfigure 失败被吞掉")
+
+
+def test_configure_stdio_isatty_error_and_wrap_failure(monkeypatch):
+    """isatty 抛异常按非终端处理；包装失败保持原流不变。"""
+    from utils import console as console_module
+
+    class _Buffer(io.BytesIO):
+        def readline(self, *args):
+            return b""
+
+    class _Stdin:
+        def __init__(self):
+            self.buffer = _Buffer(b"")
+            self.encoding = "gbk"
+
+        def isatty(self):
+            raise RuntimeError("isatty broken")
+
+    stdin = _Stdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    configure_stdio()
+    assert isinstance(sys.stdin, console_module._AutoDecodeInput), (
+        "isatty 异常应按非终端处理并包装"
+    )
+
+    # 包装本身失败：保持原流，不中断启动
+    class _WrapBoom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("wrap failed")
+
+    stdin2 = _Stdin()
+    monkeypatch.setattr(sys, "stdin", stdin2)
+    monkeypatch.setattr(console_module, "_AutoDecodeInput", _WrapBoom)
+    configure_stdio()
+    assert sys.stdin is stdin2
+    print("✓ configure_stdio isatty 异常与包装失败")
+
+
 if __name__ == "__main__":
     test_idle_pipe_does_not_block_startup()
     mp = pytest.MonkeyPatch()
