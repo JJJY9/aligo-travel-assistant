@@ -176,6 +176,108 @@ def test_setitem_and_delitem_support(monkeypatch):
     assert "demo" in registry
 
 
+def test_alias_frontmatter_failure_is_ignored(monkeypatch):
+    """SKILL.md 解析失败只是没有别名，不影响技能发现。"""
+    from utils.skill_loader import SkillLoader
+
+    root = Path(tempfile.mkdtemp())
+    _write_skill(root, "foo", _AGENT_SOURCE)
+    (root / "foo" / "SKILL.md").write_text("---\nname: X\n---\n", encoding="utf-8")
+
+    def boom(self, path):
+        raise RuntimeError("bad frontmatter")
+
+    monkeypatch.setattr(SkillLoader, "_parse_skill_md", boom)
+    monkeypatch.setattr(lazy_agent_registry, "resolve_skills_root", lambda: root)
+    registry = LazyAgentRegistry(model="fake-model", cache={})
+    assert "foo" in registry, "frontmatter 解析失败不能影响技能发现"
+    assert registry._name_aliases == {}
+    print("✓ frontmatter 解析失败不影响技能发现")
+
+
+def test_alias_resolution_case_insensitive(monkeypatch):
+    """frontmatter 别名同样大小写不敏感。"""
+    root = Path(tempfile.mkdtemp())
+    _write_skill(root, "foo", _AGENT_SOURCE)
+    (root / "foo" / "SKILL.md").write_text(
+        "---\nname: Foo Travel Helper\n---\n正文", encoding="utf-8"
+    )
+    monkeypatch.setattr(lazy_agent_registry, "resolve_skills_root", lambda: root)
+    registry = LazyAgentRegistry(model="fake-model", cache={})
+    assert registry._resolve_agent_name("FOO TRAVEL HELPER") == "foo"
+    print("✓ frontmatter 别名大小写不敏感")
+
+
+def test_spec_loader_missing_raises(monkeypatch):
+    """spec_from_file_location 返回 None 时报明确错误。"""
+    registry = _registry(monkeypatch, {"demo": _AGENT_SOURCE})
+    monkeypatch.setattr(
+        lazy_agent_registry.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: None,
+    )
+    with pytest.raises(ImportError, match="Cannot load spec"):
+        registry["demo"]
+    print("✓ spec 无法创建时报 ImportError")
+
+
+def test_init_receives_memory_manager(monkeypatch):
+    """构造参数带 memory_manager 的智能体获得注入（不带的保持原构造）。"""
+    source = '''
+from agentscope.agent import AgentBase
+from agentscope.message import Msg
+
+
+class MemoAgent(AgentBase):
+    def __init__(self, name="MemoAgent", model=None, memory_manager=None, **kwargs):
+        super().__init__()
+        self.name = name
+        self.model = model
+        self.memory_manager = memory_manager
+
+    async def reply(self, x=None):
+        return Msg(name=self.name, content="ok", role="assistant")
+'''
+    root = Path(tempfile.mkdtemp())
+    _write_skill(root, "memo", source)
+    monkeypatch.setattr(lazy_agent_registry, "resolve_skills_root", lambda: root)
+    marker = object()
+    registry = LazyAgentRegistry(model="fake-model", cache={}, memory_manager=marker)
+    agent = registry["memo"]
+    assert agent.memory_manager is marker
+    print("✓ 需要 memory_manager 的智能体获得注入")
+
+
+def test_project_root_is_added_to_sys_path(monkeypatch):
+    """从非项目根目录启动（如 wheel 安装）时，加载技能前先补 sys.path。"""
+    registry = _registry(monkeypatch, {"demo": _AGENT_SOURCE})
+    root = str(Path(__file__).resolve().parent.parent)
+    kept = [
+        entry
+        for entry in sys.path
+        if os.path.normcase(os.path.abspath(entry or "."))
+        != os.path.normcase(os.path.abspath(root))
+    ]
+    monkeypatch.setattr(sys, "path", kept)
+    agent = registry["demo"]
+    assert agent is not None
+    assert any(
+        os.path.normcase(os.path.abspath(entry)) == os.path.normcase(os.path.abspath(root))
+        for entry in sys.path
+    ), "加载技能前必须把项目根目录补进 sys.path"
+    print("✓ 加载技能前补项目根目录到 sys.path")
+
+
+def test_loaded_agent_accessors(monkeypatch):
+    """values / items / get_loaded_agents 与缓存一致。"""
+    registry = _registry(monkeypatch, {"demo": _AGENT_SOURCE})
+    agent = registry["demo"]
+    assert list(registry.values()) == [agent]
+    assert dict(registry.items()) == {"demo": agent}
+    assert registry.get_loaded_agents() == ["demo"]
+    print("✓ values / items / get_loaded_agents")
+
+
 if __name__ == "__main__":
     for case in (
         test_uninitialized_agents_not_cached,
@@ -187,6 +289,12 @@ if __name__ == "__main__":
         test_names_resolve_case_insensitively,
         test_frontmatter_name_alias_resolves,
         test_setitem_and_delitem_support,
+        test_alias_frontmatter_failure_is_ignored,
+        test_alias_resolution_case_insensitive,
+        test_spec_loader_missing_raises,
+        test_init_receives_memory_manager,
+        test_project_root_is_added_to_sys_path,
+        test_loaded_agent_accessors,
     ):
         mp = pytest.MonkeyPatch()
         try:
