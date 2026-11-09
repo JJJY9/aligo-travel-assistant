@@ -1495,22 +1495,25 @@ def test_import_invalid_group_member_skips_group_not_batch(monkeypatch):
     print("✓ 组内无效分片整组跳过、不拖垮整份备份")
 
 
-def test_import_rejects_absurd_parts_declaration(monkeypatch):
-    """parts 声明过大（1e12）在构造缺失集合前就被拒绝，不能撑爆内存。"""
+def test_import_skips_absurd_parts_declaration(monkeypatch):
+    """parts 声明过大（1e12）的组整组跳过：不构造缺失集合（内存安全）。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
-    with pytest.raises(ValueError, match="parts 声明异常"):
-        knowledge_admin.import_documents(
-            [
-                {
-                    "content": "x",
-                    "metadata": {"group": "g", "part": "1", "parts": str(10**12)},
-                }
-            ],
-            dry_run=True,
-        )
-    print("✓ 异常 parts 声明被拒绝")
+    result = knowledge_admin.import_documents(
+        [
+            {
+                "content": "x",
+                "metadata": {"group": "g", "part": "1", "parts": str(10**12)},
+            }
+        ],
+        dry_run=True,
+    )
+    assert result["would_import"] == 0, result
+    assert result["skipped_invalid"] == 1, result
+    assert result["skipped_groups"][0]["group"] == "g"
+    assert "parts 声明异常" in result["skipped_groups"][0]["reason"]
+    print("✓ parts 声明异常按组跳过（不撑爆内存）")
 
 
 def test_import_dedupes_chunks_with_boundary_newline(monkeypatch):
@@ -1785,24 +1788,35 @@ def test_import_dry_run_reports_skip_reasons(monkeypatch):
     print("✓ 导入预览区分已存在 / 无效的跳过原因")
 
 
-def test_import_rejects_incomplete_group(monkeypatch):
-    """缺少分片的组必须报错，不能按残片重组（会造成文档被拆段导入）。"""
+def test_import_skips_incomplete_group_but_keeps_rest(monkeypatch):
+    """残缺分片组整组跳过并报告；其它合法文档照常导入（坏组不拖垮整份备份）。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
 
     def _no_agent():
-        raise AssertionError("不完整备份不应进入写入")
+        raise AssertionError("全部为坏组时不应加载嵌入模型")
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", _no_agent)
     documents = [
         {"content": "第一片", "metadata": {"group": "g", "part": "1", "parts": "3"}},
         {"content": "第二片", "metadata": {"group": "g", "part": "2", "parts": "3"}},
     ]
-    with pytest.raises(ValueError, match="多分片文档不完整"):
-        knowledge_admin.import_documents(documents)
-    print("✓ 不完整的分片组导入报错")
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_invalid"] == 2, result
+    assert len(result["skipped_groups"]) == 1, result
+    assert result["skipped_groups"][0]["group"] == "g"
+    assert "多分片文档不完整" in result["skipped_groups"][0]["reason"]
+
+    # 同批还有合法文档时：只跳过坏组，合法项照常进入预览
+    documents.append({"content": "正常文档", "metadata": {}})
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 1, result
+    assert result["skipped_invalid"] == 2, result
+    assert result["skipped_groups"][0]["group"] == "g"
+    print("✓ 残缺分片组按组跳过，合法文档照常导入")
 
 
 def test_read_agent_not_cached_when_uninitialized(monkeypatch):
@@ -2467,7 +2481,7 @@ if __name__ == "__main__":
         test_delete_grouped_fragment_requires_whole_group,
         test_list_and_export_hold_write_lock,
         test_update_group_leftover_reported_when_delete_fails,
-        test_import_rejects_incomplete_group,
+        test_import_skips_incomplete_group_but_keeps_rest,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,

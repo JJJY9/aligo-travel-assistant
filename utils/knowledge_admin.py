@@ -534,8 +534,94 @@ def _export_documents(client: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _merge_exported_group(
+    key: str, pieces: list[tuple[int, dict[str, Any]]], existing_counts: Counter[str]
+) -> tuple[dict[str, Any] | None, int]:
+    """合并一个 group 的分片；返回 (合并后的记录, 因整组已存在而跳过的分片数)。
+
+    ``None`` 表示整组已在库中（不导入）。结构非法的备份（parts 声明异常 /
+    part 编号重复 / 分片不全）抛 ValueError，由调用方决定整体报错还是
+    按组降级跳过。
+    """
+    declared = 0
+    contents: list[str] = []
+    seen_parts: set[int] = set()
+    base_meta: dict[str, Any] = {}
+    for index, (_, piece) in enumerate(pieces):
+        metadata = piece.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            part_no = int(metadata.get("part") or 0)
+            declared = max(declared, int(metadata.get("parts") or 0))
+        except (TypeError, ValueError, OverflowError):
+            part_no = 0
+        if declared > _GROUP_PARTS_MAX:
+            raise ValueError(
+                f"备份中的多分片文档 parts 声明异常（group={key}，"
+                f"parts={declared}）：请检查备份来源"
+            )
+        if part_no:
+            if part_no in seen_parts:
+                # 重复 part 编号会把同一段内容叠进正文（内容变多、丢片）
+                raise ValueError(
+                    f"备份中的多分片文档 part 编号重复（group={key}，part={part_no}）："
+                    "请检查导出源后重新导出"
+                )
+            seen_parts.add(part_no)
+        content = piece.get("content")
+        if isinstance(content, str):
+            contents.append(content)
+        if index == 0:
+            base_meta = {
+                meta_key: meta_value
+                for meta_key, meta_value in metadata.items()
+                if meta_key not in _DERIVED_CHUNK_KEYS
+            }
+    if not contents:
+        return None, 0
+    if declared > 1:
+        missing = set(range(1, declared + 1)) - seen_parts
+        if len(pieces) < declared or missing:
+            # 分片不全 / 编号跳号：按残片重组会把一篇文档拆成几段分别导入
+            detail = (
+                "，缺少 part "
+                + "、".join(str(item) for item in sorted(missing))
+                if missing
+                else ""
+            )
+            raise ValueError(
+                f"备份中的多分片文档不完整（group={key}，收到 {len(pieces)}/{declared} 片{detail}）："
+                "请整组一起导入"
+            )
+    stripped_contents = [content.strip() for content in contents]
+    # 多重集判定：一组里两片同文时，库里只存在一份不能算「整组已存在」
+    # （Counter 相减只保留正差值：组内多重集必须是库内容多重集的子集）
+    if not (Counter(stripped_contents) - existing_counts):
+        # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
+        return None, len(contents)
+    return (
+        {
+            # 沿用原组号：重试补齐残缺组时能按内容续写而不会产生第二份文档
+            "__restored_group__": key,
+            # 还原上限按 strip 后的分片长度之和判断：分片入库前会 strip，
+            # 空白不会进入正文，按含空白长度计会误伤旧备份 / 被空白绕过
+            "__restored_size__": sum(len(text) for text in stripped_contents),
+            # 原始分片直接作为入库分片：避免「拼回整篇再重切」改变分片
+            # 边界（会让残缺组补齐时按内容对不上、产生重复文档）
+            "__restored_parts__": stripped_contents,
+            # 空串拼接：分片是原文的连续片段，拼接即原文；用换行分隔会把
+            # 分隔符写进正文（文档越还原越大、导出→导入不再闭合）
+            "content": "".join(stripped_contents),
+            "metadata": base_meta,
+        },
+        0,
+    )
+
+
 def _regroup_exported_documents(
-    documents: list[Any], existing: Iterable[str]
+    documents: list[Any],
+    existing: Iterable[str],
+    problems: "list[dict[str, Any]] | None" = None,
 ) -> tuple[list[Any], int]:
     """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
 
@@ -546,6 +632,11 @@ def _regroup_exported_documents(
     整组的每个分片都已存在于库中时整组跳过（重复导入同一备份保持幂等）；
     合并后的记录带 ``__restored_group__`` 标记，导入时使用更大的内容上限。
     返回 (合并后的文档列表, 因整组已存在而跳过的分片数)。
+
+    ``problems`` 不为 None 时按组降级：结构非法的组（声明异常 / 重复
+    part / 分片不全）跳过并记入 problems（含组号、原因与片数），其它组
+    照常导入——一个坏组不能让整份备份永远无法恢复；为 None 时保持原
+    语义直接抛 ValueError（供严格调用方使用）。
     """
     grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     order: list[tuple[str, Any]] = []
@@ -583,79 +674,21 @@ def _regroup_exported_documents(
             merged.append(key)
             continue
         pieces = sorted(grouped.get(key, []), key=lambda pair: pair[0])
-        declared = 0
-        contents: list[str] = []
-        seen_parts: set[int] = set()
-        base_meta: dict[str, Any] = {}
-        for index, (_, piece) in enumerate(pieces):
-            metadata = piece.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            try:
-                part_no = int(metadata.get("part") or 0)
-                declared = max(declared, int(metadata.get("parts") or 0))
-            except (TypeError, ValueError, OverflowError):
-                part_no = 0
-            if declared > _GROUP_PARTS_MAX:
-                raise ValueError(
-                    f"备份中的多分片文档 parts 声明异常（group={key}，"
-                    f"parts={declared}）：请检查备份来源"
-                )
-            if part_no:
-                if part_no in seen_parts:
-                    # 重复 part 编号会把同一段内容叠进正文（内容变多、丢片）
-                    raise ValueError(
-                        f"备份中的多分片文档 part 编号重复（group={key}，part={part_no}）："
-                        "请检查导出源后重新导出"
-                    )
-                seen_parts.add(part_no)
-            content = piece.get("content")
-            if isinstance(content, str):
-                contents.append(content)
-            if index == 0:
-                base_meta = {
-                    meta_key: meta_value
-                    for meta_key, meta_value in metadata.items()
-                    if meta_key not in _DERIVED_CHUNK_KEYS
-                }
-        if not contents:
+        try:
+            entry, skipped_count = _merge_exported_group(
+                key, pieces, existing_counts_base
+            )
+        except ValueError as exc:
+            if problems is None:
+                raise
+            problems.append(
+                {"group": key, "reason": str(exc), "parts": len(pieces)}
+            )
             continue
-        if declared > 1:
-            missing = set(range(1, declared + 1)) - seen_parts
-            if len(pieces) < declared or missing:
-                # 分片不全 / 编号跳号：按残片重组会把一篇文档拆成几段分别导入
-                detail = (
-                    "，缺少 part "
-                    + "、".join(str(item) for item in sorted(missing))
-                    if missing
-                    else ""
-                )
-                raise ValueError(
-                    f"备份中的多分片文档不完整（group={key}，收到 {len(pieces)}/{declared} 片{detail}）："
-                    "请整组一起导入"
-                )
-        stripped_contents = [content.strip() for content in contents]
-        # 多重集判定：一组里两片同文时，库里只存在一份不能算「整组已存在」
-        # （Counter 相减只保留正差值：组内多重集必须是库内容多重集的子集）
-        if not (Counter(stripped_contents) - existing_counts_base):
-            # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
-            skipped += len(contents)
+        if entry is None:
+            skipped += skipped_count
             continue
-        merged.append(
-            {
-                # 沿用原组号：重试补齐残缺组时能按内容续写而不会产生第二份文档
-                "__restored_group__": key,
-                # 还原上限按 strip 后的分片长度之和判断：分片入库前会 strip，
-                # 空白不会进入正文，按含空白长度计会误伤旧备份 / 被空白绕过
-                "__restored_size__": sum(len(text) for text in stripped_contents),
-                # 原始分片直接作为入库分片：避免「拼回整篇再重切」改变分片
-                # 边界（会让残缺组补齐时按内容对不上、产生重复文档）
-                "__restored_parts__": stripped_contents,
-                # 空串拼接：分片是原文的连续片段，拼接即原文；用换行分隔会把
-                # 分隔符写进正文（文档越还原越大、导出→导入不再闭合）
-                "content": "".join(stripped_contents),
-                "metadata": base_meta,
-            }
-        )
+        merged.append(entry)
     return merged, skipped
 
 
@@ -967,9 +1000,27 @@ def import_documents(
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
-    # 先做与库内容无关的备份完整性校验（残缺组直接报错），避免为坏备份
-    # 加载嵌入模型（首次可能下载 bge-small-zh）；库快照相关处理仍在锁内
-    _regroup_exported_documents(valid, set())
+    # 先做与库内容无关的备份完整性校验，避免为坏备份加载嵌入模型（首次可能
+    # 下载 bge-small-zh）；结构非法的分片组（声明异常 / 重复 part / 分片不全）
+    # 按组降级跳过并计入 skipped_groups——一个坏组不能让整份备份永远无法
+    # 恢复（与组内无效分片整组跳过同一口径）。库快照相关处理仍在锁内。
+    pre_problems: list[dict[str, Any]] = []
+    pre_merged, _ = _regroup_exported_documents(
+        valid, set(), problems=pre_problems
+    )
+    if not pre_merged:
+        dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
+        payload = {
+            "imported": 0,
+            "skipped": invalid + dropped,
+            "skipped_invalid": invalid + dropped,
+            "skipped_duplicate": 0,
+        }
+        if pre_problems:
+            payload["skipped_groups"] = pre_problems
+        if dry_run:
+            payload["would_import"] = 0
+        return payload
 
     # 嵌入模型加载放在写锁外：导入期间其它知识库接口不应因为模型初始化
     # 而全部阻塞；dry-run 不加载模型
@@ -984,7 +1035,12 @@ def import_documents(
         # 内容可能在同一 group 内重复（两段完全相同的正文各占一个 part）：
         # 用多重集而不是集合计数，一份已存在只能抵消一个分片
         existing_counts: Counter[str] = Counter(existing)
-        merged_items, group_skipped = _regroup_exported_documents(valid, existing)
+        problems: list[dict[str, Any]] = []
+        merged_items, group_skipped = _regroup_exported_documents(
+            valid, existing, problems=problems
+        )
+        # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方
+        invalid += sum(int(item.get("parts") or 0) for item in problems)
         duplicate = group_skipped
         document_chunks: list[list[dict[str, Any]]] = []
         # 与 document_chunks 平行的还原组号（非还原文档为空串），用于识别
@@ -1193,19 +1249,24 @@ def import_documents(
                 "skipped_invalid": invalid,
                 "skipped_duplicate": duplicate,
             }
+            if problems:
+                result["skipped_groups"] = problems
             if dry_run:
                 # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
                 result["would_import"] = 0
             return result
         if dry_run:
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
-            return {
+            payload = {
                 "imported": 0,
                 "skipped": invalid + duplicate,
                 "skipped_invalid": invalid,
                 "skipped_duplicate": duplicate,
                 "would_import": len(unique),
             }
+            if problems:
+                payload["skipped_groups"] = problems
+            return payload
 
         # 按「文档」分批：同一 group 的分片必须落在同一批（批间失败会在库
         # 中留下 parts 声明大于实际成员的残缺组）。只在组起始处切批
@@ -1236,12 +1297,15 @@ def import_documents(
                     f"{result.get('message') or '导入知识片段失败'}"
                 )
             imported.extend(int(doc_id) for doc_id in (result.get("ids") or []))
-    return {
+    result = {
         "imported": len(imported),
         "skipped": invalid + duplicate,
         "skipped_invalid": invalid,
         "skipped_duplicate": duplicate,
     }
+    if problems:
+        result["skipped_groups"] = problems
+    return result
 
 
 def get_document(doc_id: int) -> dict[str, Any] | None:
