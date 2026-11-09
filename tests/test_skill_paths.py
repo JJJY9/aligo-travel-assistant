@@ -170,6 +170,46 @@ def test_wheel_data_files_cover_skill_code():
     print(f"✓ wheel data-files 覆盖 {len(packaged)} 个技能文件（无知识库数据）")
 
 
+def test_is_file_tolerates_oserror(monkeypatch):
+    """Path.is_file 抛 OSError（权限不足）按「不存在」处理。"""
+
+    def boom(self):
+        raise OSError("denied")
+
+    monkeypatch.setattr(Path, "is_file", boom)
+    assert skill_paths._is_file(Path("any")) is False
+    print("✓ _is_file 容错 OSError")
+
+
+def test_data_scheme_skills_fallbacks(monkeypatch):
+    """sysconfig 不可用 / 没有 data 目录时返回 None。"""
+    import sysconfig
+
+    def boom():
+        raise RuntimeError("no sysconfig")
+
+    monkeypatch.setattr(sysconfig, "get_paths", boom)
+    assert skill_paths._data_scheme_skills() is None
+
+    monkeypatch.setattr(sysconfig, "get_paths", lambda: {"data": ""})
+    assert skill_paths._data_scheme_skills() is None
+    print("✓ data scheme 技能目录回退 None")
+
+
+def test_user_base_skills_fallbacks(monkeypatch):
+    """取不到用户目录 / 目录为空时返回 None。"""
+
+    def boom():
+        raise RuntimeError("no user base")
+
+    monkeypatch.setattr("site.getuserbase", boom)
+    assert skill_paths._user_base_skills() is None
+
+    monkeypatch.setattr("site.getuserbase", lambda: "")
+    assert skill_paths._user_base_skills() is None
+    print("✓ 用户目录技能路径回退 None")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -204,4 +244,14 @@ if __name__ == "__main__":
         test_permission_error_degrades_to_empty(mp)
     finally:
         mp.undo()
+    for case in (
+        test_is_file_tolerates_oserror,
+        test_data_scheme_skills_fallbacks,
+        test_user_base_skills_fallbacks,
+    ):
+        mp = pytest.MonkeyPatch()
+        try:
+            case(mp)
+        finally:
+            mp.undo()
     print("\n全部通过")
