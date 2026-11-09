@@ -147,7 +147,13 @@ def test_knowledge_dedupe_panel_states():
     assert error["text"] == "清理重复失败：boom"
     assert error["button"] == "清理重复"
     assert error["disabled"] is False, "失败后按钮必须恢复可点"
-    print("✓ 知识库重复清理面板状态")
+
+    stale = results["stale"]
+    assert stale["refreshes"] == 1, (
+        "删除期间其它动作抢走结果条时，列表仍必须刷新（已删除项不能继续显示）"
+    )
+    assert any("已清理 1 条重复片段" in text for text in stale["toasts"]), stale
+    print("✓ 知识库重复清理面板状态（含并发动作占用结果条）")
 
 
 def test_knowledge_actions_arbitrate_shared_result_bar():
@@ -306,6 +312,21 @@ def test_trips_dedupe_panel_flow():
     print("✓ 行程去重面板（空 / 取消 / 执行）")
 
 
+def test_startup_does_not_override_user_session_click():
+    """初始化期间的会话恢复不能作废用户已点击打开的会话。"""
+    results = _run_harness("startup")
+    restore = results["restore"]
+    assert [item[0] for item in restore["opened"]] == ["saved-session"]
+    assert restore["ready"] is True
+
+    clicked = results["user_clicked"]
+    assert [item[0] for item in clicked["opened"]] == ["clicked-session"], (
+        "用户已在启动期间点开会话时，init 不能再按启动快照恢复旧会话"
+    )
+    assert clicked["ready"] is True
+    print("✓ 启动恢复不覆盖用户点击")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -316,5 +337,6 @@ if __name__ == "__main__":
     test_trip_import_file_decoding_and_size_guard()
     test_trips_export_button_uses_filtered_ics_endpoint()
     test_trips_dedupe_panel_flow()
+    test_startup_does_not_override_user_session_click()
     test_knowledge_eval_panel_states()
     print("\n全部通过")

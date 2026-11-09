@@ -478,7 +478,7 @@ async function scenarioEval(source) {
 async function scenarioDedupe(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
-  run("refreshKnowledgeDocuments = async () => {};");
+  run("__kbRefreshes = 0; refreshKnowledgeDocuments = async () => { __kbRefreshes += 1; };");
   run(
     "__confirmResult = true; __confirmCalls = 0; confirm = () => { __confirmCalls += 1; return __confirmResult; };"
   );
@@ -529,10 +529,31 @@ async function scenarioDedupe(source) {
     button: run("els.kbDedupe.textContent"),
   };
 
+  // 删除期间用户点了「查重复 / 评测」：结果条被新动作占用，但删除已发生，
+  // 列表仍必须刷新并用 toast 告知结果（否则已删除项还显示在列表里）
+  run("__confirmResult = true; __confirmCalls = 0; __refreshesBefore = __kbRefreshes;");
+  promise = run("runKbDedupe()");
+  await tick();
+  env.__requests[4].resolve({ planned: 1, groups: 1, removed: 0, failed: [] });
+  await tick();
+  run("kbActionResultSeq += 1;");
+  env.__requests[5].resolve({
+    planned: 1,
+    groups: 1,
+    removed: 1,
+    skipped: [],
+    failed: [],
+  });
+  await promise;
+  results.stale = {
+    refreshes: run("__kbRefreshes - __refreshesBefore"),
+    toasts: run("__toasts.slice()"),
+  };
+
   // 接口失败：提示并复位按钮
   promise = run("runKbDedupe()");
   await tick();
-  env.__requests[4].reject(new Error("boom"));
+  env.__requests[6].reject(new Error("boom"));
   await promise;
   results.error = {
     text: run("els.kbEvalResult.textContent"),
@@ -838,6 +859,40 @@ async function scenarioTripsDedupe(source) {
   };
 }
 
+async function scenarioStartup(source) {
+  const runScenario = async (userNavigates) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      __opened = [];
+      refreshHealth = async () => {};
+      refreshStatus = async () => {};
+      state.sessionId = "saved-session";
+      state.ready = false;
+      sessionLoadToken = 5;
+      openSession = async (sessionId, options) => {
+        sessionLoadToken += 1;
+        __opened.push([sessionId, options || {}]);
+      };
+      loadSessions = async () => {
+        if (${userNavigates}) {
+          await openSession("clicked-session", {});
+        }
+      };
+    `);
+    await run("init()");
+    return {
+      opened: run("__opened.slice()"),
+      ready: run("state.ready"),
+      sessionId: run("state.sessionId"),
+    };
+  };
+  return {
+    restore: await runScenario(false),
+    user_clicked: await runScenario(true),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -866,6 +921,8 @@ async function main() {
     payload = scenarioTripsExport(source);
   } else if (scenario === "tripsDedupe") {
     payload = await scenarioTripsDedupe(source);
+  } else if (scenario === "startup") {
+    payload = await scenarioStartup(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
