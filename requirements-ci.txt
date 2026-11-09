@@ -18,7 +18,7 @@ httpx==0.28.1
 
 # 存储后端集成测试（CI 使用 service 容器）
 redis==8.1.0
-psycopg[binary]==3.3.7
+psycopg[binary]==3.3.8
 
 # 测试与检查工具（锁定版本，保证本地与 CI 结果一致）
 pytest==9.2.0

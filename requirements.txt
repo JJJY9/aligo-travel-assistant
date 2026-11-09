@@ -39,4 +39,4 @@ uvicorn==0.54.0
 
 # 生产存储后端（可选；未配置 REDIS_URL / DATABASE_URL 时自动回退本地实现）
 redis==8.1.0
-psycopg[binary]==3.3.7
+psycopg[binary]==3.3.8
