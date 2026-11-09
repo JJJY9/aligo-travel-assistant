@@ -64,7 +64,7 @@ except ImportError as e:
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
 
-from utils.embedding_model import get_embedding_model
+from utils.embedding_model import embedding_dimension, get_embedding_model
 from utils.user_query import extract_user_query
 
 # 进程内集合初始化互斥：并发的首次构造都会看到 has_collection=False，
@@ -171,7 +171,11 @@ class RAGKnowledgeAgent(AgentBase):
         logger.info(f"Loading embedding model: {model_path_or_id}")
         # 进程内共享同一份嵌入模型：每个会话各建一份会重复占用 ~90 MB
         self.embedding_model = get_embedding_model(model_path_or_id)
-        self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+        # sentence-transformers 6.x 更名 get_embedding_dimension：统一走兼容 helper
+        dim = embedding_dimension(self.embedding_model)
+        if dim is None:
+            raise RuntimeError("无法读取嵌入模型维度")
+        self.embedding_dim = dim
 
         # 初始化 Milvus Lite（本地文件存储）
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")

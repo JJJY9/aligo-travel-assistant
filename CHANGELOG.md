@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 嵌入模型维度探测兼容 sentence-transformers 6.x：`get_embedding_dimension` 新名优先、`get_sentence_embedding_dimension` 旧名回退（升级依赖后不再产生 FutureWarning，也不依赖具体版本）
 - 熔断器：半开试探名额租约改为 `max(恢复期 × 5, 300s)`——慢试探（SDK 自带重试，最长数分钟）未结束前不再放行第二个请求，也不会覆盖归属、丢弃第一个试探的真实结果
 - 内存限流：key 容量（1 万）满时 fail-closed 拒绝新 key，不再淘汰仍在窗口内的活跃桶（避免正在被限流的桶计数清零、额度重置）
 - 行程去重并发安全：`POST /api/trips/dedupe` 持用户锁执行「计划 + 删除」；`delete_duplicate_trip` 在 JSON / PostgreSQL 后端只剩一条同 id 行时拒绝删除——双标签页 / 超时重试 / CLI+Web 并发不再把同 id 副本删光
