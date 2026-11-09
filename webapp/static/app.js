@@ -747,6 +747,12 @@ function startEditUserNode(node, originalText) {
 
   async function submit() {
     if (saving) return;
+    if (!state.ready) {
+      // 初始化未完成：此时 sendMessage 会直接拒绝，而本轮删除已经发生，
+      // 这一轮会从历史里消失。删除前先拦住
+      toast("页面正在载入，请稍候…");
+      return;
+    }
     if (state.sessionLoading) {
       // 会话还在加载就删上一轮，会删掉 / 重发到错误的会话
       toast("会话正在加载，请稍候");
@@ -970,6 +976,10 @@ async function deleteLastTurn(expect) {
 
 async function retryFailed(node, text) {
   if (state.busy) return;
+  if (!state.ready) {
+    toast("页面正在载入，请稍候…");
+    return;
+  }
   if (state.sessionLoading) {
     toast("会话正在加载，请稍候");
     return;
@@ -983,6 +993,11 @@ async function retryFailed(node, text) {
 
 async function regenerate(node, text) {
   if (state.busy) return;
+  if (!state.ready) {
+    // 初始化未完成时 sendMessage 会拒绝，先删后弃会让这一轮消失
+    toast("页面正在载入，请稍候…");
+    return;
+  }
   if (state.sessionLoading) {
     // 会话还没加载完就删上一轮，可能删掉 / 重发到错误的会话
     toast("会话正在加载，请稍候");
@@ -2714,7 +2729,9 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId) {
     }
     await new Promise((resolve) => setTimeout(resolve, 700));
   }
-  // 连续请求失败（服务不可达）：保留本地「已停止」气泡，至少把原文还回输入框
+  // 连续请求失败（服务不可达）：保留本地「已停止」气泡，至少把原文还回输入框。
+  // 但期间用户可能已切换会话 / 用户：不能再把旧提问写进新的输入框
+  if (!canSync()) return;
   if (!els.input.value.trim()) {
     els.input.value = message;
     resizeInput();
@@ -3238,10 +3255,14 @@ function renderOverview() {
             { method: "DELETE" },
           );
           toast("行程已删除");
+          // 先移除本地行：随后刷新若失败（旧数据保留策略），不能留下
+          // 一条删除按钮永久禁用的幽灵行程
+          row.remove();
           await refreshStatus();
         } catch (error) {
           if (error.status === 404) {
             toast("行程不存在，已刷新列表");
+            row.remove();
             await refreshStatus();
           } else {
             toast(error.message);
@@ -4299,6 +4320,10 @@ async function runKbDuplicates() {
   }
 }
 
+function failedIdsText(failed) {
+  return failed.map((item) => `#${item && item.id}`).join("、");
+}
+
 async function runKbDedupe() {
   if (!els.kbDedupe) return;
   const seq = (kbActionResultSeq += 1);
@@ -4333,7 +4358,9 @@ async function runKbDedupe() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ dry_run: false }),
     });
-    if (seq !== kbActionResultSeq) return;
+    // 删除已经发生：即使期间有其它动作占用了结果条（查重复 / 评测），
+    // 也必须刷新列表并提示结果，否则已删除的重复项仍显示在列表里
+    const stale = seq !== kbActionResultSeq;
     const removed = Number(result.removed || 0);
     const failed = Array.isArray(result.failed) ? result.failed : [];
     const skipped = Array.isArray(result.skipped) ? result.skipped : [];
@@ -4342,17 +4369,18 @@ async function runKbDedupe() {
       actualPlanned !== planned
         ? `（库内已有变化：计划 ${planned} → ${actualPlanned}）`
         : "";
-    if (els.kbEvalResult) {
+    const summary =
+      `已清理 ${removed} 条重复片段` +
+      (skipped.length ? ` · ${skipped.length} 条已跳过（期间已删除或内容变化）` : "") +
+      (failed.length ? ` · ${failed.length} 条删除失败：${failedIdsText(failed)}` : "") +
+      drift;
+    if (!stale && els.kbEvalResult) {
       els.kbEvalResult.hidden = false;
       els.kbEvalResult.classList.toggle("warn", failed.length > 0);
-      const failedIds = failed.map((item) => `#${item && item.id}`).join("、");
-      els.kbEvalResult.textContent =
-        `已清理 ${removed} 条重复片段` +
-        (skipped.length ? ` · ${skipped.length} 条已跳过（期间已删除或内容变化）` : "") +
-        (failed.length ? ` · ${failed.length} 条删除失败：${failedIds}` : "") +
-        drift;
+      els.kbEvalResult.textContent = summary;
     }
     await refreshKnowledgeDocuments({ refreshCategories: true });
+    if (stale) toast(summary);
   } catch (error) {
     if (seq === kbActionResultSeq && els.kbEvalResult) {
       els.kbEvalResult.hidden = false;
@@ -5420,12 +5448,18 @@ async function init() {
   updateUserCard();
   resizeInput();
 
+  const initToken = sessionLoadToken;
+  const initSessionId = state.sessionId;
   await Promise.all([refreshHealth(), loadSessions(), refreshStatus()]);
 
-  if (state.sessionId) {
-    await openSession(state.sessionId, { silent: true });
-  } else {
-    showWelcome();
+  // 初始化期间用户可能已点击会话 / 新建对话：此时不要再按启动快照恢复，
+  // 否则会作废用户的加载请求、甚至把正在编辑的内容重载掉
+  if (state.ready || (sessionLoadToken === initToken && state.sessionId === initSessionId)) {
+    if (state.sessionId) {
+      await openSession(state.sessionId, { silent: true });
+    } else {
+      showWelcome();
+    }
   }
   syncSessionControls();
   state.ready = true;
