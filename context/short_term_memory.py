@@ -935,7 +935,11 @@ class RedisShortTermMemory:
                 "1" if expect is not None else "0",
                 (expect or "").strip(),
                 str(_OP_MARKER_TTL_SEC),
-                "",
+                # 在线调用同样带发起时刻：另一实例在删除发起之后写入的
+                # 同文本新轮次（时间戳晚于 cutoff）不会被这次删除误删，
+                # 与故障重放的判定口径一致（此前在线传空串，跨实例并发
+                # 删除最后一轮可能删掉刚写入的新一轮）
+                cutoff,
             ),
             fallback,
             on_failure,
