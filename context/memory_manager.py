@@ -12,6 +12,7 @@ from typing import Any
 from .long_term_memory import LongTermMemory
 from .storage import create_long_term_memory, create_short_term_memory
 from config import STORAGE_CONFIG
+from utils import tombstones
 from utils.json_parser import extract_json_from_async_response
 from utils.preference_values import has_preference_value
 from utils.turn_meta import strip_turn_meta
@@ -113,13 +114,22 @@ class MemoryManager:
         通过 :meth:`stage_message` 暂存）。
 
         ``should_commit`` 由存储层在写入锁 / 事务内调用（会话刚被删除时
-        返回 False）：整轮被跳过时助手副本也不再进短期记忆。
+        返回 False）：整轮被跳过时助手副本也不再进短期记忆。调用方未注入
+        守卫时（CLI 直接调用，没有 ConversationRuntime 的注入点）默认回退
+        到共享删除墓碑——Web 面板删除的会话不会被 CLI 的在途轮次写回。
 
         Returns:
             是否真的写入长期记忆
         """
         if getattr(self.long_term, "snapshot_based", True):
             self._rebuild_long_term()
+        if should_commit is None:
+            # 无 Redis 共享通道时 is_session_deleted 快速返回 False（不同
+            # 进程之间没有共享通道，也就不存在跨实例删除），行为与此前一致
+            def should_commit() -> bool:
+                return not tombstones.is_session_deleted(
+                    self.user_id, self.session_id
+                )
         committed = self.long_term.add_chat_turn(
             user_content,
             assistant_content,
