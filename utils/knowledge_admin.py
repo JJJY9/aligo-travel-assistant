@@ -899,11 +899,16 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
         }
 
 
-def _existing_group_layout() -> dict[str, tuple[str, int, int]]:
-    """内容 → (group, part, parts)：补齐残缺组前校验新旧分片布局一致。"""
+def _existing_group_layout() -> dict[str, list[tuple[str, int, int]]]:
+    """内容 → [(group, part, parts), ...]：补齐残缺组前校验新旧分片布局一致。
+
+    同一内容在库里可能对应多行（组内两片同文是支持的数据形态，独立重复
+    副本也会产生同文行）：以内容为键只保留最后一行会让 occupied_parts 看
+    不到其它已被占用的 part，补写时写出重复 part 的畸形组。
+    """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    layout: dict[str, tuple[str, int, int]] = {}
+    layout: dict[str, list[tuple[str, int, int]]] = {}
     for row in _iter_all_rows(client):
         content = str(row.get("content", "")).strip()
         if not content:
@@ -917,7 +922,9 @@ def _existing_group_layout() -> dict[str, tuple[str, int, int]]:
             part = int(meta.get("part") or 0)
         except (TypeError, ValueError):
             part = 0
-        layout[content] = (str(meta.get("group") or ""), part, parts)
+        layout.setdefault(content, []).append(
+            (str(meta.get("group") or ""), part, parts)
+        )
     return layout
 
 
@@ -1139,7 +1146,7 @@ def import_documents(
                 # 必须与本次布局一致才能安全补齐（例如上次导入中途失败的
                 # 同一篇文档）；编辑后重新导入的文档分片布局已变化，补写会
                 # 留下 parts 声明与实际成员错位的半组，保守跳过并提示正确维护方式
-                layout: dict[str, tuple[str, int, int]] | None
+                layout: dict[str, list[tuple[str, int, int]]] | None
                 try:
                     layout = _existing_group_layout()
                 except Exception as exc:  # noqa: BLE001 - 无法校验布局时不冒险补写
@@ -1155,23 +1162,29 @@ def import_documents(
                             # 缺失分片不参与布局比对（同文重复时第二片是
                             # 待补写项，不对应库里已有的那一行）
                             continue
-                        old_group, old_part, old_parts = layout.get(key, ("", 0, 1))
+                        candidates = layout.get(key, [])
                         chunk_meta = chunk.get("metadata")
                         want_part = int((chunk_meta or {}).get("part") or 0)
                         want_parts = int((chunk_meta or {}).get("parts") or 1)
-                        if (
+                        # 同一内容可能对应库内多行（组内同文分片 / 独立副本）：
+                        # 任一行与本篇布局一致即可按原布局补齐
+                        if any(
                             old_group == doc_group
                             and old_parts == want_parts
                             and (not want_part or old_part == want_part)
+                            for old_group, old_part, old_parts in candidates
                         ):
                             continue
-                        if not old_group or old_group != doc_group:
+                        if any(
+                            old_group == doc_group
+                            for old_group, _, _ in candidates
+                        ):
+                            conflicts.append(key[:20])
+                        else:
                             # 命中的片段属于其它组（库内另一篇文档）或本批
                             # 前一文档尚未落库的同文分片：本组无法按原布局
                             # 补齐（补写会缺 part 1 / 与别人共享同一片）
                             cross_group = True
-                        else:
-                            conflicts.append(key[:20])
                         break
                 if cross_group and not conflicts:
                     # 组结构无法成立，但独特分片不能静默丢失：去掉派生分片
@@ -1208,7 +1221,8 @@ def import_documents(
                 if layout is not None and doc_group:
                     occupied_parts = {
                         old_part
-                        for old_group, old_part, _ in layout.values()
+                        for candidates in layout.values()
+                        for old_group, old_part, _ in candidates
                         if old_group == doc_group and old_part
                     }
                     missing_parts: set[int] = set()
