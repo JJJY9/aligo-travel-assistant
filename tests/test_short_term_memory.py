@@ -393,6 +393,32 @@ def test_shadow_cache_mirrors_truncate(monkeypatch):
     print("✓ 影子缓存镜像截断，故障时不复活已删除轮次")
 
 
+def test_truncate_last_turn_skips_turns_written_after_cutoff(monkeypatch):
+    """另一实例在删除发起之后写入的同文本新轮次不能被在线截断误删。"""
+    from datetime import datetime, timedelta
+
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q")
+    memory.add_message("assistant", "A")
+    # 模拟另一实例在本实例发起删除之后写入的新一轮（时间戳晚于 cutoff）
+    future = (datetime.now() + timedelta(minutes=5)).isoformat()
+    client.data.append(
+        json.dumps({"role": "user", "content": "Q", "timestamp": future},
+                   ensure_ascii=False)
+    )
+    client.data.append(
+        json.dumps({"role": "assistant", "content": "A2", "timestamp": future},
+                   ensure_ascii=False)
+    )
+    assert memory.truncate_last_turn("Q") == 0, "cutoff 之后写入的新轮次不能被删"
+    assert len(client.data) == 4, "新写入的一轮必须原样保留"
+    print("✓ 在线截断带 cutoff，不误删发起之后写入的同文本新轮次")
+
+
 def test_shadow_cache_mirrors_clear(monkeypatch):
     """清空对话后 Redis 故障回退，影子缓存不能把已清空的对话读回来。"""
     from context import short_term_memory as module
@@ -1600,6 +1626,11 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_shadow_cache_mirrors_truncate(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_truncate_last_turn_skips_turns_written_after_cutoff(_mp)
     finally:
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()
