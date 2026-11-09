@@ -22,6 +22,7 @@ from utils.doctor import (
     STATUS_OK,
     STATUS_SKIP,
     STATUS_WARN,
+    check_dependencies,
     check_knowledge_base,
     check_model_files,
     check_python,
@@ -550,11 +551,197 @@ def test_doctor_rejects_unknown_flag(monkeypatch, capsys):
     print("✓ doctor 未知参数退出码 2")
 
 
+def test_python_version_below_requirement(monkeypatch):
+    class _OldVersion(tuple):
+        major = 3
+        minor = 9
+        micro = 5
+
+    monkeypatch.setattr(sys, "version_info", _OldVersion((3, 9, 5)))
+    result = check_python()
+    assert result.status == STATUS_FAIL and ">= 3.10" in result.detail
+    print("✓ Python 版本低于要求 → 失败")
+
+
+def test_dependencies_missing_rag(monkeypatch):
+    import importlib.util
+
+    real = importlib.util.find_spec
+
+    def fake(name, *args, **kwargs):
+        if name in {"pymilvus", "sentence_transformers", "milvus_lite"}:
+            return None
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake)
+    results = check_dependencies()
+    rag = next(item for item in results if item.name == "RAG 依赖")
+    assert rag.status == STATUS_WARN and "缺少" in rag.detail
+    print("✓ RAG 依赖缺失 → 警告")
+
+
+def test_storage_redis_ping_failure(monkeypatch):
+    """describe_backends 报告 Redis 后端但 ping 失败 → 警告（不是静默可用）。"""
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "redis://127.0.0.1:1/0")
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    monkeypatch.setattr(
+        storage_module,
+        "describe_backends",
+        lambda: {
+            "short_term": "redis",
+            "long_term": "json",
+            "short_term_degraded": False,
+        },
+    )
+    result = check_storage()
+    assert result.status == STATUS_WARN and "Redis 不可用" in result.detail
+    print("✓ Redis 后端 ping 失败 → 警告")
+
+
+def test_storage_postgres_probe_failure(monkeypatch):
+    """describe_backends 报告 PostgreSQL 后端但连接探测失败 → 警告。"""
+    import context.postgres_long_term_memory as pg_module
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
+    monkeypatch.setitem(
+        STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
+    )
+    monkeypatch.setattr(
+        storage_module,
+        "describe_backends",
+        lambda: {
+            "short_term": "memory",
+            "long_term": "postgres",
+            "short_term_degraded": False,
+        },
+    )
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr(pg_module, "PostgresLongTermMemory", _Boom)
+    result = check_storage()
+    assert result.status == STATUS_WARN and "PostgreSQL 不可用" in result.detail
+    print("✓ PostgreSQL 探测失败 → 警告")
+
+
+def test_skills_root_without_scripts(monkeypatch):
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(skill_paths, "resolve_skills_root", lambda: Path(tmp))
+        monkeypatch.setattr(skill_paths, "skill_scripts", lambda root: [])
+        result = check_skills()
+    assert result.status == STATUS_FAIL and "没有可加载的技能" in result.detail
+    print("✓ 技能目录为空 → 失败并说明缺少 agent.py")
+
+
+def test_version_check_missing_version_and_static_tag(monkeypatch):
+    from utils import doctor as doctor_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "pyproject.toml").write_text(
+            "[project]" + chr(10) + 'name = "x"' + chr(10), encoding="utf-8"
+        )
+        static = root / "webapp" / "static"
+        static.mkdir(parents=True)
+        (static / "index.html").write_text("<html></html>", encoding="utf-8")
+        monkeypatch.setattr(doctor_module, "PROJECT_ROOT", root)
+        result = check_version_consistency()
+    assert result.status == STATUS_WARN
+    assert "未找到 version" in result.detail and "?v=" in result.detail
+    print("✓ pyproject 缺 version / index.html 缺静态版本 → 警告")
+
+
+def test_model_files_missing_required_fail():
+    with tempfile.TemporaryDirectory() as tmp:
+        # 只有推荐文件、缺必需文件（config/model/tokenizer）
+        (Path(tmp) / "modules.json").write_text("[]", encoding="utf-8")
+        result = check_model_files(Path(tmp))
+    assert result.status == STATUS_FAIL and "缺少关键文件" in result.detail
+    print("✓ 模型目录缺必需文件 → 失败")
+
+
+def test_run_doctor_includes_network_check(monkeypatch):
+    from utils import doctor as doctor_module
+    from utils.doctor import CheckResult
+
+    async def fake_connectivity():
+        return CheckResult("LLM 连通性", STATUS_SKIP, "测试跳过")
+
+    monkeypatch.setattr(doctor_module, "check_llm_connectivity", fake_connectivity)
+    results = asyncio.run(run_doctor(include_network=True))
+    llm = next(item for item in results if item.name == "LLM 连通性")
+    assert llm.detail == "测试跳过"
+    print("✓ include_network=True 时执行连通性检查")
+
+
+def test_storage_postgres_configured_but_json(monkeypatch):
+    """PostgreSQL 配置了但后端已回退 JSON → 明确提示，不假装可用。"""
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
+    monkeypatch.setitem(
+        STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
+    )
+    monkeypatch.setattr(
+        storage_module,
+        "describe_backends",
+        lambda: {
+            "short_term": "memory",
+            "long_term": "json",
+            "short_term_degraded": False,
+        },
+    )
+    result = check_storage()
+    assert result.status == STATUS_WARN and "已回退 JSON" in result.detail
+    print("✓ PostgreSQL 配置但回退 JSON → 警告")
+
+
+def test_version_check_unreadable_index(monkeypatch):
+    """index.html 无法解码时提示具体文件，而不是崩溃。"""
+    from utils import doctor as doctor_module
+    from utils.version import APP_VERSION
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "pyproject.toml").write_text(
+            f'version = "{APP_VERSION}"', encoding="utf-8"
+        )
+        static = root / "webapp" / "static"
+        static.mkdir(parents=True)
+        (static / "index.html").write_bytes(b"<html>" + bytes([255]) + b"</html>")
+        monkeypatch.setattr(doctor_module, "PROJECT_ROOT", root)
+        result = check_version_consistency()
+    assert result.status == STATUS_WARN and "无法读取 index.html" in result.detail
+    print("✓ index.html 无法读取 → 警告")
+
+
+def test_default_model_dir_falls_back(monkeypatch):
+    """未配置嵌入模型目录时使用默认的 bge-small-zh-v1.5。"""
+    from config import RAG_CONFIG
+    from utils import doctor as doctor_module
+
+    monkeypatch.setitem(RAG_CONFIG, "embedding_model", "")
+    path = doctor_module._default_model_dir()
+    assert path.name == "bge-small-zh-v1.5", path
+    print("✓ 默认嵌入模型目录回退")
+
+
 if __name__ == "__main__":
     test_python_ok()
     test_model_files_missing_dir()
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
+    test_model_files_missing_required_fail()
     test_knowledge_base_missing()
     test_redact_secret_masks_passwords()
     test_report_and_summary_statuses()
@@ -568,6 +755,16 @@ if __name__ == "__main__":
         test_knowledge_base_dimension_mismatch_warns,
         test_storage_probe_sets_statement_timeout,
         test_llm_connectivity_branches,
+        test_python_version_below_requirement,
+        test_dependencies_missing_rag,
+        test_storage_redis_ping_failure,
+        test_storage_postgres_probe_failure,
+        test_skills_root_without_scripts,
+        test_version_check_missing_version_and_static_tag,
+        test_run_doctor_includes_network_check,
+        test_storage_postgres_configured_but_json,
+        test_version_check_unreadable_index,
+        test_default_model_dir_falls_back,
     ):
         mp = pytest.MonkeyPatch()
         try:
