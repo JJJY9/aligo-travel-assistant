@@ -38,7 +38,11 @@ class _FakeMemory:
 
     def get_preference(self):
         self.threads["preferences"] = threading.get_ident()
-        return {"home_location": "北京", "empty_value": ""}
+        return {
+            "home_location": "北京",
+            "empty_value": "",
+            "airlines": ["国航", "东航"],
+        }
 
     def get_recent_context(self, n_turns=5):
         assert n_turns == 5
@@ -226,6 +230,7 @@ def test_malformed_recent_context_entries_are_skipped():
     runtime, memory = _make_runtime()
     memory.get_recent_context = lambda n_turns=5: [  # type: ignore[method-assign]
         {"foo": 1},
+        "不是字典的条目",
         {"role": "user"},
         {"role": "user", "content": "正常消息"},
     ]
@@ -405,6 +410,205 @@ def test_model_output_with_lone_surrogate_is_sanitized():
     print("✓ 模型输出的孤立代理项在事件 / 回复 / 落库前转义")
 
 
+def test_non_dict_model_outputs_are_user_facing_errors():
+    """意图 / 编排返回合法 JSON 但不是对象：UserFacingError 而不是崩溃。"""
+    from utils.errors import UserFacingError
+
+    runtime, _ = _make_runtime()
+
+    class _ListIntention:
+        async def reply(self, context):
+            return _Response('["greeting"]')
+
+    runtime.intention_agent = _ListIntention()
+    with pytest.raises(UserFacingError, match="意图识别结果格式错误"):
+        asyncio.run(runtime.ask("你好"))
+
+    class _BadJsonIntention:
+        async def reply(self, context):
+            return _Response("这不是 JSON")
+
+    runtime, _ = _make_runtime()
+    runtime.intention_agent = _BadJsonIntention()
+    with pytest.raises(UserFacingError, match="意图识别结果解析失败"):
+        asyncio.run(runtime.ask("你好"))
+
+    runtime, _ = _make_runtime()
+
+    class _ListOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _Response("[1, 2]")
+
+    runtime.orchestrator = _ListOrchestrator()
+    with pytest.raises(UserFacingError, match="编排结果格式错误"):
+        asyncio.run(runtime.ask("你好"))
+
+    runtime, _ = _make_runtime()
+
+    class _BadJsonOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _Response("这不是 JSON")
+
+    runtime.orchestrator = _BadJsonOrchestrator()
+    with pytest.raises(UserFacingError, match="编排结果解析失败"):
+        asyncio.run(runtime.ask("你好"))
+    print("✓ 非对象 / 非法 JSON 模型输出使用 UserFacingError")
+
+
+def test_non_list_schedule_does_not_crash():
+    """agent_schedule / intents 不是列表：plan 事件按空调度发出，对话继续。"""
+    runtime, _ = _make_runtime()
+
+    class _BadScheduleIntention:
+        async def reply(self, context):
+            return _Response(
+                json.dumps({"agent_schedule": 123, "intents": "greeting"})
+            )
+
+    runtime.intention_agent = _BadScheduleIntention()
+    events: list[dict] = []
+    result = asyncio.run(runtime.ask("你好", on_event=events.append))
+    assert result["reply"]
+    plan = next(event for event in events if event.get("type") == "plan")
+    assert plan["schedule"] == []
+    assert plan["intents"] == []
+    print("✓ 非列表 agent_schedule / intents 归一为空")
+
+
+def test_progress_callback_failure_does_not_break_ask():
+    """进度回调抛异常不影响对话主流程。"""
+    runtime, memory = _make_runtime()
+
+    def boom(event):
+        raise RuntimeError("SSE broken")
+
+    result = asyncio.run(runtime.ask("你好", on_event=boom))
+    assert result["reply"]
+    assert memory.events, "落库不受进度回调影响"
+    print("✓ 进度回调异常被吞掉")
+
+
+def test_close_swallows_backend_close_failure():
+    """长期记忆 close 抛异常不影响会话退出。"""
+    runtime, memory = _make_runtime()
+
+    def boom():
+        raise RuntimeError("connection gone")
+
+    memory.long_term = type("Backend", (), {"close": staticmethod(boom)})()
+    runtime.close()  # 不抛异常
+    print("✓ close 失败被吞掉")
+
+
+def test_summary_failure_degrades_to_empty():
+    """历史总结失败时上下文仍可构建（只缺总结段）。"""
+    runtime, memory = _make_runtime()
+
+    async def boom(max_messages=30):
+        raise RuntimeError("summary backend down")
+
+    memory.get_long_term_summary_async = boom  # type: ignore[method-assign]
+    result = asyncio.run(runtime.ask("你好"))
+    assert result["reply"]
+    print("✓ 历史总结失败时降级为空")
+
+
+def test_rollback_failure_does_not_mask_original_error():
+    """暂存回滚自身失败时保留原始错误（编排异常照常上抛）。"""
+    runtime, memory = _make_runtime()
+
+    def boom(content):
+        raise RuntimeError("rollback blew up")
+
+    memory.rollback_staged_message = boom  # type: ignore[method-assign]
+
+    class _BoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise RuntimeError("gateway down")
+
+    runtime.orchestrator = _BoomOrchestrator()
+    with pytest.raises(RuntimeError, match="gateway down"):
+        asyncio.run(runtime.ask("你好"))
+    print("✓ 回滚失败不掩盖原始错误")
+
+
+def test_memory_without_rollback_hook_is_tolerated():
+    """记忆实现没有 rollback_staged_message 时失败路径照常返回。"""
+    runtime, memory = _make_runtime()
+    memory.rollback_staged_message = None  # type: ignore[method-assign]
+
+    class _BoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise RuntimeError("gateway down")
+
+    runtime.orchestrator = _BoomOrchestrator()
+    with pytest.raises(RuntimeError, match="gateway down"):
+        asyncio.run(runtime.ask("你好"))
+    print("✓ 缺少回滚钩子的记忆实现兼容")
+
+
+def test_memory_persistence_error_not_counted_as_model_failure():
+    """记忆写盘错误不记入熔断（多次磁盘故障不能触发全局「服务不可用」）。"""
+    from utils.circuit_breaker import CircuitBreaker
+    from utils.errors import MemoryPersistenceError
+
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    runtime, _ = _make_runtime()
+    runtime.circuit_breaker = breaker
+
+    class _DiskBoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise MemoryPersistenceError("磁盘已满")
+
+    runtime.orchestrator = _DiskBoomOrchestrator()
+    with pytest.raises(MemoryPersistenceError):
+        asyncio.run(runtime.ask("你好"))
+    assert breaker.allow_call() is True, "磁盘错误不计入熔断"
+    print("✓ 记忆写盘错误不计入熔断")
+
+
+def test_open_circuit_short_circuits_ask():
+    """熔断打开时 ask 立即抛 CircuitOpenError（不再发起任何调用）。"""
+    from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
+
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    breaker.record_failure()
+    runtime, memory = _make_runtime()
+    runtime.circuit_breaker = breaker
+    with pytest.raises(CircuitOpenError):
+        asyncio.run(runtime.ask("你好"))
+    assert memory.events == []
+    print("✓ 熔断打开时快速失败")
+
+
+def test_model_call_failure_counts_towards_breaker(monkeypatch):
+    """模型调用失败要计入熔断（达到阈值后全局快速失败）。"""
+    from config import RESILIENCE_CONFIG
+    from utils.circuit_breaker import CircuitBreaker
+
+    monkeypatch.setitem(RESILIENCE_CONFIG, "max_retries", 0)
+    monkeypatch.setitem(RESILIENCE_CONFIG, "retry_base_delay_sec", 0.0)
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=60, half_open_successes=1
+    )
+    runtime, _ = _make_runtime()
+    runtime.circuit_breaker = breaker
+
+    class _BoomIntention:
+        async def reply(self, context):
+            raise RuntimeError("gateway down")
+
+    runtime.intention_agent = _BoomIntention()
+    with pytest.raises(RuntimeError):
+        asyncio.run(runtime.ask("你好"))
+    assert breaker.allow_call() is False, "模型调用失败要计入熔断"
+    print("✓ 模型调用失败计入熔断")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -421,4 +625,14 @@ if __name__ == "__main__":
     test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()
     test_model_output_with_lone_surrogate_is_sanitized()
+    test_non_dict_model_outputs_are_user_facing_errors()
+    test_non_list_schedule_does_not_crash()
+    test_progress_callback_failure_does_not_break_ask()
+    test_close_swallows_backend_close_failure()
+    test_summary_failure_degrades_to_empty()
+    test_rollback_failure_does_not_mask_original_error()
+    test_memory_without_rollback_hook_is_tolerated()
+    test_memory_persistence_error_not_counted_as_model_failure()
+    test_open_circuit_short_circuits_ask()
+    test_model_call_failure_counts_towards_breaker(mp)
     print("\n全部通过")
