@@ -606,6 +606,151 @@ def test_preference_nested_data_and_empty_legacy_values():
     print("✓ 偏好嵌套与空值回显（与落库同口径）")
 
 
+def test_preference_dict_value_and_legacy_message_fallback():
+    """偏好值为字典时逐键渲染；旧格式全部被过滤时用兜底 message。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "hotel_brands",
+                                "value": {"brand": "汉庭", "level": "舒适"},
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+    )
+    assert "汉庭" in md and "舒适" in md, md
+
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "preference",
+                    "status": "success",
+                    "data": {
+                        "preferences": {"home_location": ""},
+                        "message": "已更新偏好（降级展示）",
+                    },
+                }
+            ]
+        )
+    )
+    assert md == "已更新偏好（降级展示）"
+    print("✓ 偏好字典值渲染与旧格式 message 兜底")
+
+
+def test_render_agent_exception_falls_back(monkeypatch):
+    """单个智能体渲染抛异常：整轮回答降级为兜底文本，而不是 500。"""
+    from utils import result_formatter as module
+
+    def boom(agent_name, data):
+        raise RuntimeError("render blew up")
+
+    monkeypatch.setattr(module, "_render_agent", boom)
+    md = module.result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {"summary": "兜底行程文本"},
+                }
+            ]
+        )
+    )
+    assert md == "兜底行程文本"
+    print("✓ 渲染异常走兜底文本")
+
+
+def test_itinerary_tolerant_shapes_extra():
+    """daily_plans 非列表 / activities 字典 / 非字典环节 / notes 非列表都容错。"""
+    for payload in (
+        {"itinerary": {"daily_plans": "不是列表", "notes": 123}},
+        {},
+    ):
+        md = result_to_markdown(
+            _wrap(
+                [
+                    {
+                        "agent_name": "itinerary_planning",
+                        "status": "success",
+                        "data": payload,
+                    }
+                ]
+            )
+        )
+        assert isinstance(md, str), payload
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {
+                        "itinerary": {
+                            "daily_plans": [
+                                {
+                                    "day": 1,
+                                    "activities": {
+                                        "上午": {
+                                            "time": "09:00",
+                                            "activity": "出发",
+                                        }
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        )
+    )
+    assert "09:00" in md and "出发" in md, md
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "itinerary_planning",
+                    "status": "success",
+                    "data": {
+                        "itinerary": {
+                            "daily_plans": [
+                                {"day": 2, "activities": ["直接字符串环节", 3]}
+                            ]
+                        }
+                    },
+                }
+            ]
+        )
+    )
+    assert "直接字符串环节" in md, md
+    print("✓ 行程容错形状（非列表 / 字典 activities / 非字典环节）")
+
+
+def test_event_collection_missing_non_list():
+    """missing_info 非列表（数字）按空处理，其余字段照常渲染。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "event_collection",
+                    "status": "success",
+                    "data": {"origin": "北京", "missing_info": 123},
+                }
+            ]
+        )
+    )
+    assert "北京" in md and "还需要补充" not in md, md
+    print("✓ event_collection missing_info 非列表容错")
+
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -626,4 +771,12 @@ if __name__ == "__main__":
     test_preference_nested_data_and_empty_legacy_values()
     test_event_collection_type_tolerance()
     test_null_values_render_defaults_not_none()
+    test_preference_dict_value_and_legacy_message_fallback()
+    test_itinerary_tolerant_shapes_extra()
+    test_event_collection_missing_non_list()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_render_agent_exception_falls_back(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")
