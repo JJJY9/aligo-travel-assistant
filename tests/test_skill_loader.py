@@ -158,6 +158,37 @@ def test_unreadable_skills_dir_returns_empty(monkeypatch):
     print("✓ 技能目录不可读时返回空")
 
 
+def test_frontmatter_bounds_edge_cases():
+    """只有开头标记 / 结束标记在文件末尾（无换行）的边界。"""
+    from utils.skill_loader import _frontmatter_bounds, _strip_frontmatter
+
+    assert _frontmatter_bounds("---") is None, "只有开头标记没有换行"
+    assert _strip_frontmatter("---\nname: x\n---") == "", "结束标记后没有换行"
+    print("✓ frontmatter 边界（无换行 / 结尾标记在 EOF）")
+
+
+def test_read_errors_return_none(monkeypatch):
+    """SKILL.md / 正文读取失败返回 None，不让整个加载崩溃。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    loader = SkillLoader(os.path.join(root, "skills"))
+    assert loader._parse_skill_md(os.path.join(root, "missing", "SKILL.md")) is None
+
+    skill_dir = os.path.join(root, "skills", "broken")
+    target = os.path.join(skill_dir, "SKILL.md")
+    _write(target, "---\nname: broken\n---\n正文")
+
+    real_open = open
+
+    def denied(path, *args, **kwargs):
+        if str(path) == target:
+            raise PermissionError("denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", denied)
+    assert loader.get_skill_content("broken") is None
+    print("✓ SKILL.md / 正文读取失败返回 None")
+
+
 if __name__ == "__main__":
     test_load_skills_tolerates_malformed_entries()
     test_get_skill_prompt_sorted_and_mapped()
@@ -171,6 +202,12 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_unreadable_skills_dir_returns_empty(_mp)
+    finally:
+        _mp.undo()
+    test_frontmatter_bounds_edge_cases()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_read_errors_return_none(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")
