@@ -22,7 +22,7 @@ psycopg[binary]==3.3.7
 
 # 测试与检查工具（锁定版本，保证本地与 CI 结果一致）
 pytest==9.2.0
-pytest-asyncio==1.4.1
+pytest-asyncio==1.4.1.post1
 pytest-cov==7.1.0
 ruff==0.17.3
 mypy==2.4.1
