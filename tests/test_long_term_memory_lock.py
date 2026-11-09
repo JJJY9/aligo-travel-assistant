@@ -205,6 +205,57 @@ def test_corrupt_file_write_refused_when_backup_fails(monkeypatch, tmp_path):
     print("✓ 备份失败时拒绝覆盖损坏文件")
 
 
+def test_file_lock_times_out_while_held(tmp_path):
+    """锁被同一进程的另一个句柄持有时等待到超时；释放后可再次获取。"""
+    import time
+
+    from utils import file_lock as lock_module
+
+    target = str(tmp_path / "held.json")
+    with lock_module.file_lock(target):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with lock_module.file_lock(target, timeout=0.15):
+                pass
+        assert time.monotonic() - started >= 0.1, "应按 timeout 等待而不是立即失败"
+    # 释放（_release 正常路径）后可重新获取同一个锁文件
+    with lock_module.file_lock(target, timeout=0.5):
+        pass
+    print("✓ 锁竞争超时与释放后重入")
+
+
+def test_file_lock_unlock_failure_is_swallowed(monkeypatch, tmp_path):
+    """解锁失败只意味着句柄失效（关闭时由系统释放），不能覆盖业务异常。"""
+    from utils import file_lock as lock_module
+
+    if os.name == "nt":
+        target_module = lock_module.msvcrt
+        real_unlock = target_module.locking
+        unlock_flag = target_module.LK_UNLCK
+
+        def _flaky_locking(fd, mode, size):
+            if mode == unlock_flag:
+                raise OSError("handle gone")
+            return real_unlock(fd, mode, size)
+
+        monkeypatch.setattr(target_module, "locking", _flaky_locking)
+    else:
+        target_module = lock_module.fcntl
+        real_unlock = target_module.flock
+        unlock_flag = target_module.LOCK_UN
+
+        def _flaky_flock(fd, op):
+            if op & unlock_flag:
+                raise OSError("handle gone")
+            return real_unlock(fd, op)
+
+        monkeypatch.setattr(target_module, "flock", _flaky_flock)
+
+    with lock_module.file_lock(str(tmp_path / "unlock-fail.json")):
+        pass  # 退出上下文不得抛异常
+    print("✓ 解锁失败被吞掉（不会覆盖业务异常）")
+
+
 if __name__ == "__main__":
     test_cross_process_increments_are_not_lost()
     print("\n全部通过（monkeypatch 用例需 pytest）")

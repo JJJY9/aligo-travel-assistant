@@ -36,9 +36,9 @@ def _acquire(handle, timeout: float) -> None:
         try:
             handle.seek(0)
             if os.name == "nt":
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # pragma: no cover - Windows 专属
             else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]  # pragma: no cover - 非 Windows 专属
             return
         except OSError:
             if time.monotonic() >= deadline:
@@ -50,9 +50,9 @@ def _release(handle) -> None:
     try:
         handle.seek(0)
         if os.name == "nt":
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # pragma: no cover - Windows 专属
         else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]  # pragma: no cover - 非 Windows 专属
     except OSError:
         # 释放失败通常意味着句柄已失效；关闭句柄时操作系统仍会释放锁
         pass
