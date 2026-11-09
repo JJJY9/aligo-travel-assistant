@@ -278,6 +278,41 @@ def test_persist_turn_veto_skips_assistant_stage():
     print("✓ 守卫否决时短期记忆不补助手副本")
 
 
+def test_persist_turn_defaults_to_shared_tombstone_guard(monkeypatch):
+    """CLI 直接调用（未注入守卫）时默认查共享墓碑：已删除会话不写回。"""
+    from utils import tombstones
+
+    calls = []
+
+    def deleted(user_id, session_id):
+        calls.append((user_id, session_id))
+        return True
+
+    monkeypatch.setattr(tombstones, "is_session_deleted", deleted)
+    manager = MemoryManager("u-cli", "s-del", storage_path=tempfile.mkdtemp())
+    assert manager.persist_turn("在途提问", "在途回答") is False
+    assert calls and calls[0] == ("u-cli", "s-del"), (
+        "默认守卫必须用本会话的 user/session"
+    )
+    assert manager.long_term.get_chat_history(limit=None) == []
+    assert manager.short_term.get_recent_context() == []
+    print("✓ 默认回退共享墓碑：已删除会话不被 CLI 在途轮次写回")
+
+
+def test_persist_turn_default_guard_commits_when_not_deleted(monkeypatch):
+    """墓碑不存在时默认守卫放行，正常一次写入整轮。"""
+    from utils import tombstones
+
+    monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s: False)
+    manager = MemoryManager("u-ok", "s-ok", storage_path=tempfile.mkdtemp())
+    assert manager.persist_turn("问题", "回答") is True
+    assert [item["role"] for item in manager.long_term.get_chat_history()] == [
+        "user",
+        "assistant",
+    ]
+    print("✓ 默认守卫在未删除时正常写入")
+
+
 def test_drain_without_pending_returns_immediately():
     memory = _BlockingMemory()
     runtime = _make_runtime(memory)
@@ -408,6 +443,8 @@ if __name__ == "__main__":
         test_json_add_chat_turn_guard_vetoes_write()
         test_memory_manager_persist_turn_delegates_and_stages_assistant()
         test_persist_turn_veto_skips_assistant_stage()
+        test_persist_turn_defaults_to_shared_tombstone_guard(_mp)
+        test_persist_turn_default_guard_commits_when_not_deleted(_mp)
         test_cancel_during_persist_drains_with_both_messages()
         test_cancel_during_persist_does_not_rollback_staged()
         test_cancel_with_failed_persist_rolls_back_staged()
