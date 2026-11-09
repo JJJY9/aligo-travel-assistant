@@ -697,6 +697,71 @@ def test_parse_rejects_non_finite_meta_durations():
     print("✓ 非有限耗时在导入时被拒绝")
 
 
+def test_parse_rejects_bad_meta_shapes():
+    """_meta 内的类型错误、深嵌套与非有限数列表都被拒绝，旧文本消息保留。"""
+
+    def content(meta):
+        return json.dumps({"status": "completed", "results": [], "_meta": meta})
+
+    deep = []
+    cursor = deep
+    for _ in range(40):
+        nested = []
+        cursor.append(nested)
+        cursor = nested
+
+    payload = {
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": content({"agents": [{"duration": "5s"}]}),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": content({"schedule": 5}),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": content({"elapsed": "3s"}),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": content({"usage": 5}),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": content({"anything": deep}),
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": content({"list": [float("nan")]}),
+                "session_id": "s1",
+            },
+            # 以 { 开头但不是合法 JSON 的普通文本：按旧格式原样保留
+            {
+                "role": "assistant",
+                "content": "{这不是 JSON",
+                "session_id": "s1",
+            },
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert len(sections["messages"]) == 1, errors
+    assert sections["messages"][0]["content"].startswith("{这不是"), errors
+    assert any("智能体耗时不是数字" in error for error in errors), errors
+    assert any("消息执行路线不是数组" in error for error in errors), errors
+    assert any("消息耗时不是数字" in error for error in errors), errors
+    assert any("消息用量不是对象" in error for error in errors), errors
+    assert any("消息元数据嵌套过深" in error for error in errors), errors
+    assert any("消息元数据含非有限数" in error for error in errors), errors
+    print("✓ _meta 形状错误 / 深嵌套 / 非有限数列表被拒绝")
+
+
 def test_parse_drops_whole_knowledge_group_with_invalid_part():
     """组内有无效分片时整组丢弃：只删坏分片会让知识恢复因缺片整体失败。"""
     payload = {

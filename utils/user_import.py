@@ -286,22 +286,23 @@ def _assistant_content_problem(content: str) -> str | None:
         if isinstance(elapsed, float) and not math.isfinite(elapsed):
             return "消息耗时不是有限数"
     usage = meta.get("usage")
-    if usage is None:
-        return None
-    if not isinstance(usage, dict):
-        return "消息用量不是对象"
-    for key in _USAGE_NUMBER_FIELDS:
-        value = usage.get(key)
-        if value is None:
-            continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return "消息用量字段不是数字"
-        # NaN / Infinity 也是 float：落库后 /api/status 的 int() 会 ValueError /
-        # OverflowError，且此后每次汇总都 500，必须在导入时拒绝
-        if isinstance(value, float) and not math.isfinite(value):
-            return "消息用量字段不是有限数"
+    if usage is not None:
+        if not isinstance(usage, dict):
+            return "消息用量不是对象"
+        for key in _USAGE_NUMBER_FIELDS:
+            value = usage.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return "消息用量字段不是数字"
+            # NaN / Infinity 也是 float：落库后 /api/status 的 int() 会 ValueError /
+            # OverflowError，且此后每次汇总都 500，必须在导入时拒绝
+            if isinstance(value, float) and not math.isfinite(value):
+                return "消息用量字段不是有限数"
     # 已知字段之外的任意键（usage.time、schedule 数值等）同样会原样返回给
-    # 前端：任何位置的 NaN / Infinity 都让会话详情响应序列化失败，最后兜底
+    # 前端：任何位置的 NaN / Infinity 都让会话详情响应序列化失败，最后兜底。
+    # 无 usage 的消息同样要走这一步（此前 usage 缺失时提前 return，任意键的
+    # NaN 漏检，落库后该会话每次打开 500）
     return _non_finite_in_value(meta)
 
 
