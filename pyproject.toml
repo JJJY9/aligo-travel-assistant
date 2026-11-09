@@ -27,7 +27,7 @@ dependencies = [
     "pymilvus[milvus_lite]==2.6.9; sys_platform != 'win32'",
     "pymilvus==3.0.2; sys_platform == 'win32'",
     "milvus-lite==3.2.2; sys_platform == 'win32'",
-    "sentence-transformers==5.2.3",
+    "sentence-transformers==6.2.0",
     "rich==15.0.0",
     "ddgs==9.10.0",
     "greenlet==3.5.6",
