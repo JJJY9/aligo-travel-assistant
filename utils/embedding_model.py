@@ -14,6 +14,24 @@ _MODELS: dict[str, Any] = {}
 _LOCK = threading.Lock()
 
 
+def embedding_dimension(model: Any) -> int | None:
+    """嵌入模型的输出维度；不可探测（新旧接口均缺失或调用失败）返回 None。
+
+    sentence-transformers 6.0 把 ``get_sentence_embedding_dimension`` 更名为
+    ``get_embedding_dimension``（旧名暂时保留但会告警）：新名优先、旧名回退，
+    升级依赖后不再产生 FutureWarning，也不依赖具体版本。
+    """
+    getter = getattr(model, "get_embedding_dimension", None)
+    if not callable(getter):
+        getter = getattr(model, "get_sentence_embedding_dimension", None)
+    if not callable(getter):
+        return None
+    try:
+        return int(getter())
+    except Exception:  # noqa: BLE001 - 维度探测失败按未知处理
+        return None
+
+
 def peek_embedding_dim() -> int | None:
     """已加载（缓存中）嵌入模型的维度；未加载 / 正在加载 / 多个模型时返回 None。
 
@@ -30,10 +48,7 @@ def peek_embedding_dim() -> int | None:
         _LOCK.release()
     if len(models) != 1:
         return None
-    try:
-        return int(models[0].get_sentence_embedding_dimension())
-    except Exception:  # noqa: BLE001 - 维度探测失败按未知处理
-        return None
+    return embedding_dimension(models[0])
 
 
 def get_embedding_model(model_path: str) -> Any:
