@@ -90,6 +90,24 @@ def test_parse_export_sections():
     print("✓ 解析备份：偏好 / 行程 / 消息 / 会话元数据")
 
 
+def test_backup_limit_problem_checks_counts_and_size(monkeypatch):
+    """导出上限检查：条数与体积超出导入侧上限时给出具体原因。"""
+    from utils import user_import as module
+
+    assert module.backup_limit_problem({"chat_history": []}) is None
+    monkeypatch.setattr(module, "_MAX_TRIPS", 1)
+    assert "行程" in module.backup_limit_problem({"trip_history": [1, 2]})
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+    assert "消息" in module.backup_limit_problem({"chat_history": [1, 2]})
+    monkeypatch.setattr(module, "_MAX_PREFERENCES", 1)
+    assert "偏好" in module.backup_limit_problem({"preferences": {"a": 1, "b": 2}})
+    monkeypatch.setattr(module, "_MAX_KNOWLEDGE", 1)
+    assert "知识片段" in module.backup_limit_problem({"knowledge": [1, 2]})
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 10)
+    assert "MB" in module.backup_limit_problem({"preferences": {"a": "x" * 100}})
+    print("✓ backup_limit_problem 条数与体积上限")
+
+
 def test_parse_export_rejects_invalid():
     sections, errors = parse_user_export("not json")
     assert sections == {} and "JSON 解析失败" in errors[0]
@@ -1503,6 +1521,7 @@ if __name__ == "__main__":
         test_runner_rejects_oversized_backup,
         test_runner_dispatch,
         test_parse_knowledge_section_and_import,
+        test_backup_limit_problem_checks_counts_and_size,
         test_parse_limits_trips_messages_and_knowledge,
         test_import_restores_archived_and_reports_generic_knowledge_error,
         test_runner_knowledge_error_and_skip,

@@ -67,6 +67,26 @@ def _run(user_id, target=None, with_knowledge=False):
     return code, buf.getvalue()
 
 
+def test_user_export_refuses_oversized_backup(monkeypatch):
+    """超出导入上限的备份直接拒绝，不写出永远无法恢复的文件。"""
+    import tempfile
+    from pathlib import Path
+
+    store = _FakeStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+    target = tempfile.mkdtemp()
+    code, out = _run("u-oversize", target)
+    assert code == 1
+    assert "导出中止" in out and "导入上限" in out
+    assert list(Path(target).glob("*")) == []
+    print("✓ 超限备份拒绝导出")
+
+
 def test_user_export_writes_json_and_markdown(monkeypatch):
     import tempfile
     from pathlib import Path

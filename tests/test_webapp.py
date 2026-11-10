@@ -1090,6 +1090,27 @@ def test_export_sanitizes_surrogate_and_non_finite():
     print("✓ 导出清洗孤立代理项与 NaN（JSON / Markdown / 会话导出）")
 
 
+def test_export_refuses_backup_over_import_limits(monkeypatch):
+    """超出导入上限的备份返回 413（不产出永远无法恢复的文件）。"""
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+    client = _client()
+    user_id = _unique_user("web_export_oversize")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "s1"},
+        )
+        assert response.status_code == 200
+        response = client.get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 413, response.text[:300]
+        assert "导入上限" in response.json()["detail"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 超限备份返回 413")
+
+
 def test_export_filenames_disambiguate_non_ascii_ids():
     """中文 ID 清洗后追加短哈希；单会话导出文件名带用户维度。"""
     import re as re_module
