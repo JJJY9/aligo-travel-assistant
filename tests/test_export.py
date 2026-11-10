@@ -69,6 +69,32 @@ def test_render_markdown():
     print("✓ Markdown 渲染正常")
 
 
+def test_export_files_sanitizes_surrogates_in_markdown():
+    """孤立代理项：JSON 与 Markdown 都能写出（不再 JSON 成功、命令却报错）。"""
+    data = {
+        "user_id": "u-export",
+        "exported_at": "2026-01-01T00:00:00",
+        "preferences": {},
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "坏" + chr(0xD800) + "字",
+                "timestamp": "2026-01-01T00:00:00",
+            }
+        ],
+        "trip_history": [],
+        "statistics": {},
+    }
+    out = Path(tempfile.mkdtemp())
+    paths = export_files(data, out)
+    assert len(paths) == 2
+    json_text = paths[0].read_text(encoding="utf-8")
+    md_text = paths[1].read_text(encoding="utf-8")
+    assert "\\ud800" in json_text
+    assert "\\ud800" in md_text
+    print("✓ export_files 清洗孤立代理项（JSON 与 Markdown）")
+
+
 def test_export_files():
     out = Path(tempfile.mkdtemp())
     paths = export_files(SAMPLE, out)

@@ -1020,6 +1020,74 @@ def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
         response = client.put(path, json=payload)
         assert response.status_code == 503, (path, response.text)
     print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑；行程/偏好/会话元数据写入同样 503")
+    # 导出同样不能把回退 JSON（空 / 陈旧）当成功备份写出——恢复时才发现
+    # 备份里没有数据
+    for path in (
+        f"/api/export?user_id={user_id}",
+        f"/api/sessions/export?user_id={user_id}&format=html",
+        f"/api/sessions/s-cool/export?user_id={user_id}&format=md",
+    ):
+        response = client.get(path)
+        assert response.status_code == 503, (path, response.text)
+    print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑；行程新增/编辑与导出同样 503")
+
+
+def test_export_sanitizes_surrogate_and_non_finite():
+    """历史数据含孤立代理项 / NaN：各导出接口不 500、产物可解析。"""
+    import json as json_module
+
+    from webapp import server as server_module
+
+    user_id = _unique_user("web_export_sanitize")
+    memory_dir = Path(server_module.MEMORY_DIR)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    path = memory_dir / f"{user_id}.json"
+    data = {
+        "user_id": user_id,
+        "preferences": {},
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "正常",
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00",
+            },
+            {
+                "role": "assistant",
+                "content": "坏" + chr(0xD800) + "字符",
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01",
+            },
+        ],
+        "trip_history": [],
+        "statistics": {"total_messages": 2, "avg": float("inf")},
+    }
+    path.write_text(json_module.dumps(data), encoding="utf-8")
+    client = _client()
+    try:
+        response = client.get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        contents = [item["content"] for item in payload["chat_history"]]
+        assert any("\\ud800" in content for content in contents), contents
+        assert payload["statistics"]["avg"] is None
+
+        response = client.get(
+            "/api/export", params={"user_id": user_id, "format": "md"}
+        )
+        assert response.status_code == 200, response.text[:300]
+
+        response = client.get(
+            "/api/sessions/export", params={"user_id": user_id, "format": "md"}
+        )
+        assert response.status_code == 200, response.text[:300]
+        response = client.get(
+            f"/api/sessions/s1/export?user_id={user_id}&format=html"
+        )
+        assert response.status_code == 200, response.text[:300]
+    finally:
+        path.unlink(missing_ok=True)
+    print("✓ 导出清洗孤立代理项与 NaN（JSON / Markdown / 会话导出）")
 
 
 def test_sessions_listing_and_delete():

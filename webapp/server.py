@@ -1808,9 +1808,11 @@ def _ambiguous_trip_id(trips: list[dict[str, Any]], trip_id: str) -> bool:
     return sum(1 for trip in trips if str(trip.get("trip_id")) == trip_id) > 1
 
 
-def _load_user_data(user_id: str) -> dict[str, Any]:
+def _load_user_data(user_id: str, strict: bool = False) -> dict[str, Any]:
+    """读取导出数据；``strict=True`` 用于备份导出——PG 故障期不能把回退
+    JSON（空或陈旧）当成功备份写出（恢复时才发现没有数据）。"""
     try:
-        store = _open_long_term(user_id)
+        store = _open_long_term(user_id, strict=strict)
         try:
             return {
                 "preferences": {
@@ -3054,7 +3056,8 @@ def create_app(model: Any = None) -> FastAPI:
         必须声明在 ``/api/sessions/{session_id}`` 之前，否则会被动态路由捕获。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
-        store = _open_long_term(user_id)
+        # strict：PG 故障期不能把回退 JSON 当「没有可导出的会话」/空备份
+        store = _open_long_term(user_id, strict=True)
         try:
             messages = store.get_chat_history()
             titles = store.get_session_titles()
@@ -3063,6 +3066,10 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
         finally:
             _close_long_term(store)
+        from utils.json_safe import sanitize_json
+
+        messages = sanitize_json(messages)
+        titles = sanitize_json(titles)
         if not messages:
             raise HTTPException(status_code=404, detail="没有可导出的会话")
         safe_user = _safe_filename(user_id, "user")
@@ -3213,7 +3220,8 @@ def create_app(model: Any = None) -> FastAPI:
         （单文件内嵌样式、全部动态文本单次转义，可分享 / 打印）。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
-        store = _open_long_term(user_id)
+        # strict：同合集导出，PG 故障期不能误报「会话不存在」
+        store = _open_long_term(user_id, strict=True)
         try:
             messages = store.get_chat_history(session_id=session_id)
             titles = store.get_session_titles()
@@ -3222,6 +3230,10 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
         finally:
             _close_long_term(store)
+        from utils.json_safe import sanitize_json
+
+        messages = sanitize_json(messages)
+        titles = sanitize_json(titles)
         if not messages:
             raise HTTPException(status_code=404, detail="会话不存在或没有消息")
 
@@ -4210,8 +4222,11 @@ def create_app(model: Any = None) -> FastAPI:
         字段），可由 ``/api/import`` 一体化恢复；``format=md`` 忽略该参数。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
-        data = _load_user_data(user_id)
+        data = _load_user_data(user_id, strict=True)
         safe_user = _safe_filename(user_id)
+        from utils.json_safe import sanitize_json
+
+        data = sanitize_json(data)
         if format == "md":
             return Response(
                 content=_user_data_markdown(user_id, data),
@@ -4240,7 +4255,11 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503, detail=f"知识库导出失败：{exc}"
                 ) from exc
-        payload = json.dumps(backup, ensure_ascii=False, indent=2)
+        # 历史数据可能含孤立代理项 / 非有限数：清洗后再序列化，
+        # 否则响应 UTF-8 编码 500 或产出前端 JSON.parse 拒绝的非法备份
+        payload = json.dumps(
+            sanitize_json(backup), ensure_ascii=False, indent=2
+        )
         return Response(
             content=payload,
             media_type="application/json",
