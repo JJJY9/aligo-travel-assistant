@@ -4536,6 +4536,30 @@ def test_metrics_paths_use_route_templates():
         REQUEST_METRICS.reset()
 
 
+def test_content_length_413_metric_labels():
+    """Content-Length 413（路由前拒绝）按已知接口归一标签；未知路径归 __unmatched__。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = _client()
+    try:
+        for path in ("/api/chat", "/api/no-such-endpoint"):
+            client.post(
+                path,
+                content=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": "99999999",
+                },
+            )
+        by_path = REQUEST_METRICS.snapshot()["by_path"]
+        assert "/api/chat" in by_path, by_path
+        assert "__unmatched__" in by_path, by_path
+        print("✓ Content-Length 413 指标标签按接口归一")
+    finally:
+        REQUEST_METRICS.reset()
+
+
 def test_prometheus_metrics_endpoint():
     from utils.metrics import REQUEST_METRICS
 

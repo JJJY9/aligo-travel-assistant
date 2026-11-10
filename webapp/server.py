@@ -208,6 +208,43 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = PROJECT_ROOT / "data" / "memory"
 # 未匹配路由（404 / 405）的指标路径统一取值，避免任意路径撑爆指标基数
 _UNMATCHED_METRIC_PATH = "__unmatched__"
+# 路由前就被 413 拒绝（Content-Length 预检）的请求没有 route：已知允许
+# 请求体的接口按接口名归一标签（与 chunked 超限记录到路由模板的口径一致），
+# 未知路径仍归入 __unmatched__——任意路径不能撑爆指标基数
+_413_METRIC_PATHS = frozenset(
+    {
+        "/api/chat",
+        "/api/chat/stream",
+        "/api/import",
+        "/api/knowledge/import",
+        "/api/knowledge/import/preview",
+        "/api/knowledge/documents",
+        "/api/trips",
+        "/api/trips/import",
+        "/api/trips/dedupe",
+    }
+)
+_413_METRIC_PATTERNS = (
+    (
+        re.compile(r"^/api/knowledge/documents/\d+$"),
+        "/api/knowledge/documents/{doc_id}",
+    ),
+    (re.compile(r"^/api/trips/\d+$"), "/api/trips/{trip_id}"),
+    (
+        re.compile(r"^/api/sessions/[\w-]+/last-turn$"),
+        "/api/sessions/{session_id}/last-turn",
+    ),
+)
+
+
+def _metric_path_before_route(route_path: str) -> str:
+    """路由前 413 的指标标签：已知接口归一，未知路径归 __unmatched__。"""
+    if route_path in _413_METRIC_PATHS:
+        return route_path
+    for pattern, label in _413_METRIC_PATTERNS:
+        if pattern.fullmatch(route_path):
+            return label
+    return _UNMATCHED_METRIC_PATH
 
 
 class RequestContextMiddleware:
@@ -333,14 +370,10 @@ class RequestContextMiddleware:
                 # 会话 ID 等动态段不会撑爆基数，未匹配的 404 统一归入 __unmatched__
                 route = scope.get("route")
                 metric_path = getattr(route, "path", None) or _UNMATCHED_METRIC_PATH
-                # 路由前就被 413 拒绝的请求没有 route：备份恢复接口用归一化
-                # 路径作为指标标签，与 chunked 超限（记录到路由模板）口径一致
-                if (
-                    getattr(route, "path", None) is None
-                    and status_code == 413
-                    and route_path == "/api/import"
-                ):
-                    metric_path = "/api/import"
+                # 路由前就被 413 拒绝的请求没有 route：按已知接口归一标签，
+                # 未知路径归 __unmatched__（与 chunked 超限口径一致）
+                if getattr(route, "path", None) is None and status_code == 413:
+                    metric_path = _metric_path_before_route(route_path)
                 REQUEST_METRICS.record(
                     scope.get("method", ""),
                     metric_path,
