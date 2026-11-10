@@ -370,6 +370,71 @@ def test_legacy_name_variants_dedupe_and_planning_floor():
     print("✓ 遗留名大小写变体去重并保持规划依赖排序")
 
 
+def test_preference_name_variants_persist_and_dedupe():
+    """模型把偏好智能体写成 Preference：仍落库、参与去重与规划排序。"""
+    memory = _StubMemory()
+
+    class PrefStub(_StubAgent):
+        async def reply(self, x):
+            self.calls += 1
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "preferences": [
+                            {
+                                "type": "home_location",
+                                "value": "上海",
+                                "action": "replace",
+                            }
+                        ],
+                        "has_preferences": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class PlanStub(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {"itinerary": {"title": "杭州行程"}}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    pref = PrefStub("preference")
+    plan = PlanStub("itinerary_planning")
+    registry = _CaseInsensitiveRegistry(
+        {"preference": pref, "itinerary_planning": plan}
+    )
+    orchestrator = OrchestrationAgent(
+        agent_registry=registry, memory_manager=memory
+    )
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(
+                _intent(
+                    [
+                        {"agent_name": "Preference", "priority": 1},
+                        {"agent_name": "preference", "priority": 1},
+                        {"agent_name": "itinerary_planning", "priority": 1},
+                    ]
+                )
+            )
+        ).content
+    )
+    names = [item["agent_name"] for item in result["results"]]
+    assert names.count("preference") == 1, names
+    assert "Preference" not in names, names
+    assert names.index("preference") < names.index("itinerary_planning"), names
+    assert pref.calls == 1, "同一技能的两种拼写只应执行一次"
+    assert memory.long_term.get_preference("home_location") == "上海"
+    print("✓ Preference 大小写变体落库、去重并保持规划依赖排序")
+
+
 def test_preference_payload_with_extra_keys_does_not_write_garbage():
     """包裹层带 note 等说明键时，不能把 preferences/note 当偏好落库。"""
     memory = _StubMemory()
@@ -1853,6 +1918,7 @@ if __name__ == "__main__":
     test_skill_folder_names_are_canonicalized()
     test_skill_names_resolve_case_insensitively()
     test_legacy_name_variants_dedupe_and_planning_floor()
+    test_preference_name_variants_persist_and_dedupe()
     test_preference_payload_with_extra_keys_does_not_write_garbage()
     test_memory_update_preference_and_trip()
     test_memory_update_legacy_preferences_and_custom_backend()

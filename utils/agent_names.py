@@ -12,8 +12,14 @@ SKILL_AGENT_NAMES = {
     "query-info": "information_query",
 }
 # 标准名的大小写变体（模型常把标识符写成 Itinerary_Planning / RAG_Knowledge）：
-# 只归一目录名会让遗留名变体击穿去重与规划依赖排序
-_STANDARD_AGENT_NAMES = {value.casefold(): value for value in SKILL_AGENT_NAMES.values()}
+# 只归一目录名会让遗留名变体击穿去重与规划依赖排序。
+# preference 的技能目录名与标准名同形（不在上方映射里），但标准名本身同样
+# 要归一大小写：下游 _update_memory / 偏好合并 / 渲染都按精确的 "preference"
+# 匹配，模型写成 "Preference" 时偏好会静默不落库
+_STANDARD_AGENT_NAMES = {
+    value.casefold(): value
+    for value in (*SKILL_AGENT_NAMES.values(), "preference")
+}
 
 
 def canonical_agent_name(agent_name: str) -> str:
