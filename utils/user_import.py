@@ -381,8 +381,12 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         start_dt = _strict_date(start_date)
         end_dt = _strict_date(end_date) if end_date else None
         if start_dt is not None and end_dt is not None and end_dt < start_dt:
-            errors.append(f"跳过第 {index} 条行程：结束日期不能早于出发日期")
-            continue
+            # 备份恢复以保真为先：规划路径可能存下颠倒的日期（历史数据，
+            # Web PUT 也会拒绝编辑这类记录），整条丢弃等于备份静默丢行程；
+            # 按原样保留并提示，恢复后可用导出 / 删除处理
+            errors.append(
+                f"第 {index} 条行程：结束日期早于出发日期（按原样保留）"
+            )
         session_id, ok = _clean_session_id(row.get("session_id"))
         if not ok:
             errors.append(f"第 {index} 条行程：会话 ID 非法，已忽略会话关联")

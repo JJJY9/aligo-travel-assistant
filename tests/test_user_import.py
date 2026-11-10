@@ -119,13 +119,46 @@ def test_parse_export_skips_invalid_rows():
     }
     sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
     assert sections["preferences"] == {"home_location": "北京"}
-    # 未补零的日期归一后保真保留（备份恢复优先于格式严格）；倒置区间整条跳过
-    assert [t["start_date"] for t in sections["trips"]] == ["2026-01-01", "2026-12-01"]
+    # 未补零的日期归一后保真保留（备份恢复优先于格式严格）；倒置区间
+    # 同样按原样保留（整条丢弃会让备份静默丢行程），错误列表给出提示
+    assert [t["start_date"] for t in sections["trips"]] == [
+        "2026-01-01",
+        "2026-12-05",
+        "2026-12-01",
+    ]
+    inverted = [
+        t for t in sections["trips"] if t["start_date"] == "2026-12-05"
+    ]
+    assert inverted and inverted[0]["end_date"] == "2026-12-01"
     assert len(sections["messages"]) == 1
     assert any("目的地为空" in e for e in errors)
-    assert any("结束日期不能早于出发日期" in e for e in errors)
+    assert any("结束日期早于出发日期" in e and "保留" in e for e in errors)
     assert sum("角色或内容非法" in e for e in errors) == 2
-    print("✓ 非法偏好 / 行程 / 消息逐条跳过（脏日期保真）")
+    print("✓ 非法偏好 / 行程 / 消息逐条处理（脏日期保真、倒置保留）")
+
+
+def test_import_keeps_inverted_date_trip():
+    """倒置日期（结束早于出发）的行程随备份恢复，不再整条丢弃。"""
+    payload = {
+        "trip_history": [
+            {
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-01",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert any("按原样保留" in error for error in errors), errors
+    store = _real_store("u-inverted")
+    try:
+        counts = import_user_data(store, sections)
+        assert counts["trips_created"] == 1, counts
+        trips = store.get_trip_history(limit=None)
+        assert trips and trips[0]["end_date"] == "2026-12-01", trips
+    finally:
+        store._close() if hasattr(store, "_close") else None
+    print("✓ 倒置日期行程随备份恢复")
 
 
 def test_import_roundtrip_and_idempotent():
@@ -1448,6 +1481,7 @@ if __name__ == "__main__":
     test_parse_rejects_bad_preference_text()
     test_parse_rejects_non_object_agent_entries()
     test_import_matches_unpadded_stored_trip_dates()
+    test_import_keeps_inverted_date_trip()
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     test_parse_rejects_deeply_nested_preference_value()
