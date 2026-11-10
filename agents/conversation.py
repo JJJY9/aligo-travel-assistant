@@ -480,6 +480,20 @@ class ConversationRuntime:
         """同步读取记忆快照（偏好 + 最近对话），供 ``asyncio.to_thread`` 调用。"""
         preferences = self.memory.long_term.get_preference()
         recent = list(self.memory.short_term.get_recent_context(n_turns=5))
+        if not recent:
+            # 进程重启 / 会话被 LRU 淘汰后短期记忆为空，而长期总结又排除了
+            # 当前会话：从长期记忆补回本会话最近几轮，否则用户刷新页面看到
+            # 完整历史、追问「把刚才的行程改到周五」时模型侧没有任何上文
+            # （默认进程内短期记忆的部署必现）
+            try:
+                recent = list(
+                    self.memory.long_term.get_chat_history(
+                        limit=10, session_id=self.session_id
+                    )
+                )
+            except Exception:  # noqa: BLE001 - 回填失败按无历史继续
+                logger.debug("回填本会话历史失败", exc_info=True)
+                recent = []
         return preferences, recent
 
     async def _call_with_resilience(
