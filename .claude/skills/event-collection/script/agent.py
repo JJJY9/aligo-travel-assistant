@@ -19,8 +19,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from utils.json_parser import (
     extract_json_from_async_response,
-    last_json_object_with_keys,
-    robust_first_json_object,
+    first_json_object_with_keys,
+    last_json_object_with_keys_strict,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,11 +182,15 @@ class EventCollectionAgent(AgentBase):
             # 一个形如结果（任一提取字段命中）的顶层对象，避免把回显示例
             # 当成提取结果写成真实行程。正式结果通常带 destination 等字段，
             # 即使省略 missing_info / extracted_count 也会排在示例之后。
-            result = last_json_object_with_keys(text, _RESULT_KEYS)
+            result = last_json_object_with_keys_strict(text, _RESULT_KEYS)
             if result is None:
-                # 回退：扫描第一个完整对象（尾逗号等小瑕疵由修复路径兜底），
-                # 避免结尾说明中的花括号被误截
-                result = robust_first_json_object(text)
+                # 没有任何含提取字段的完整对象：退到第一个含提取字段的对象
+                # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
+                # 对象」——prompt 回显的示例排在最前，正式结果被截断时会把
+                # 示例（北京 / 2026-02-27）当成真实事项写成行程
+                result = first_json_object_with_keys(text, _RESULT_KEYS)
+            if result is None:
+                raise ValueError("模型输出中没有可解析的事项结果对象")
         except Exception as e:
             logger.error(f"Event collection failed: {e}")
             result = {

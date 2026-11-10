@@ -17,8 +17,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from utils.json_parser import (
     extract_json_from_async_response,
-    last_json_object_with_keys,
-    robust_first_json_object,
+    first_json_object_with_keys,
+    last_json_object_with_keys_strict,
     starts_with_json_array,
 )
 
@@ -136,13 +136,20 @@ class PreferenceAgent(AgentBase):
                     "has_preferences": bool(items),
                 }
             else:
-                result = last_json_object_with_keys(
+                result = last_json_object_with_keys_strict(
                     text, ("has_preferences", "preferences")
                 )
                 if result is None:
-                    # 回退：扫描第一个完整对象（尾逗号等小瑕疵由修复路径兜底），
-                    # 避免结尾说明中的花括号被误截
-                    result = robust_first_json_object(text)
+                    # 没有任何含结果键的完整对象：退到第一个含结果键的对象
+                    # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
+                    # 对象」——prompt 回显的示例通常排在最前，正式结果被
+                    # max_tokens 截断时会把示例偏好当成真实结果写库
+                    # （截断场景 strict 版本已提前抛错）。
+                    result = first_json_object_with_keys(
+                        text, ("has_preferences", "preferences")
+                    )
+                if result is None:
+                    raise ValueError("模型输出中没有可解析的偏好结果对象")
         except Exception as e:
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}
