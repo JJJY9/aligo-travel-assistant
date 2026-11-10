@@ -116,6 +116,21 @@ def test_stats_counts_only_visible_preferences(monkeypatch):
     print("✓ stats 偏好条数按可见口径")
 
 
+def test_stats_archived_counts_only_live_sessions(monkeypatch):
+    """幽灵归档（无消息的归档 ID）不计入统计，与面板 archived_count 一致。"""
+    store = _FakeStore(
+        history=[_message("s1")], archived=["ghost", "s1"]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 0
+    data = json.loads(out)
+    assert data["sessions"]["archived"] == 1, data
+    print("✓ stats 归档只统计仍有消息的会话")
+
+
 def test_stats_empty_and_failures(monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(

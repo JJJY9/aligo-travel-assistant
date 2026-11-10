@@ -74,9 +74,13 @@ class PreferenceAgent(AgentBase):
         if self.memory_manager:
             # 偏好查询是阻塞 IO（JSON 文件 / PostgreSQL 网络往返）：
             # 放到线程池执行，留在事件循环线程会冻结同进程所有 SSE 流
-            current_preferences = await asyncio.to_thread(
-                self.memory_manager.long_term.get_preference
-            )
+            try:
+                current_preferences = await asyncio.to_thread(
+                    self.memory_manager.long_term.get_preference
+                )
+            except Exception as e:  # noqa: BLE001 - 存储抖动按空偏好继续抽取
+                logger.warning(f"Failed to load current preferences: {e}")
+                current_preferences = {}
 
         # 格式化当前偏好，便于展示
         current_prefs_str = json.dumps(current_preferences, ensure_ascii=False, indent=2)
