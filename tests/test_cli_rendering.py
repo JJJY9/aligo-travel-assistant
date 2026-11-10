@@ -30,6 +30,9 @@ def _new_cli() -> cli_module.AligoCLI:
     console, buffer = _console_buffer()
     instance.console = console
     setattr(instance, "_buffer", buffer)
+    # run() 的 SIGINT 状态在 __init__ 里创建；这里绕过 __init__ 造实例，
+    # 补上同一结构（取消来源标记）
+    instance._interrupt = {"count": 0, "user": False, "at_prompt": False}
     return instance
 
 
