@@ -2401,9 +2401,15 @@ def create_app(model: Any = None) -> FastAPI:
         rate = _rate_limit_info(state)
         skills_root = resolve_skills_root()
         breaker_state = state.breaker.get_status()["state"]
+        scripts = skill_scripts(skills_root)
+        # 技能缺失时对话链路只剩空结果（doctor 的「技能目录」同为 fail）：
+        # 健康检查不能继续报 ok，否则监控全绿而线上无法对话
+        skills_ok = skills_root.is_dir() and bool(scripts)
         return {
             # 熔断打开说明服务已无法正常对话：健康检查不能继续报 ok
-            "status": "degraded" if breaker_state == "open" else "ok",
+            "status": (
+                "degraded" if breaker_state == "open" or not skills_ok else "ok"
+            ),
             "circuit_breaker": breaker_state,
             "version": APP_VERSION,
             "model": LLM_CONFIG.get("model_name", ""),
@@ -2419,8 +2425,9 @@ def create_app(model: Any = None) -> FastAPI:
                 "max": state.max_sessions,
             },
             "skills": {
-                "count": len(skill_scripts(skills_root)),
+                "count": len(scripts),
                 "dir_found": skills_root.is_dir(),
+                "ok": skills_ok,
             },
             "time": datetime.now().isoformat(timespec="seconds"),
         }

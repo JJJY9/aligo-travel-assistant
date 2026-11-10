@@ -190,6 +190,40 @@ def check_storage() -> CheckResult:
     return CheckResult("记忆存储", STATUS_OK, "；".join(parts))
 
 
+def _skill_md_problem(script_path: Path) -> str | None:
+    """校验技能的 SKILL.md；有问题返回原因，正常返回 None。
+
+    SkillLoader.load_skills 会静默跳过缺文件 / frontmatter 无效的技能，
+    意图提示里就看不到它们（模型无法按名调度）；doctor 只数 agent.py
+    会给出「技能目录 ok」的假象，这里按同一解析口径补上校验。
+    """
+    skill_md = script_path.parent.parent / "SKILL.md"
+    if not skill_md.is_file():
+        return "缺少 SKILL.md"
+    try:
+        text = skill_md.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"SKILL.md 无法读取（{str(exc)[:60]}）"
+    from utils.skill_loader import _frontmatter_bounds
+
+    bounds = _frontmatter_bounds(text)
+    if bounds is None:
+        return "SKILL.md 缺少 frontmatter"
+    yaml_text = text[bounds[0]:bounds[1]].strip()
+    if not yaml_text:
+        return "SKILL.md frontmatter 为空"
+    try:
+        import yaml
+
+        data = yaml.safe_load(yaml_text)
+    except Exception:  # noqa: BLE001 - 解析失败本身就是检查结果
+        return "SKILL.md frontmatter 不是合法 YAML"
+    if not isinstance(data, dict) or not data:
+        # 空映射 / 非映射在 SkillLoader 里同样是 falsy，会被静默跳过
+        return "SKILL.md frontmatter 不是有效映射"
+    return None
+
+
 def check_skills() -> CheckResult:
     """检查技能目录：源码运行 / wheel 安装后都应能发现技能脚本。"""
     from utils.skill_paths import resolve_skills_root, skill_scripts
@@ -197,6 +231,18 @@ def check_skills() -> CheckResult:
     root = resolve_skills_root()
     scripts = skill_scripts(root)
     if scripts:
+        problems = []
+        for name in sorted(scripts):
+            problem = _skill_md_problem(Path(scripts[name]))
+            if problem:
+                problems.append(f"{name}（{problem}）")
+        if problems:
+            return CheckResult(
+                "技能目录",
+                STATUS_WARN,
+                f"{len(scripts)} 个技能（{root}）；" + "、".join(problems)
+                + "：这些技能不会出现在意图提示中，模型可能无法调度",
+            )
         return CheckResult("技能目录", STATUS_OK, f"{len(scripts)} 个技能（{root}）")
     if not root.is_dir():
         return CheckResult(
