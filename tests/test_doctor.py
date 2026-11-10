@@ -319,10 +319,42 @@ def test_redact_secret_masks_passwords():
     from utils.doctor import _redact_secret
 
     masked = _redact_secret("postgresql://aligo:s3cret@db:5432/aligo")
-    assert "s3cret" not in masked and "://aligo:***@" in masked
+    assert "s3cret" not in masked and "://***@" in masked
+    # 缺 scheme 的粘贴错误（DATABASE_URL 少了 postgresql://）同样遮蔽
+    bare = _redact_secret("missing \"=\" after \"aligo:S3cretPw@db.internal:5432/aligo\"")
+    assert "S3cretPw" not in bare, bare
+    bare_only_pw = _redact_secret("redis://:S3cret@127.0.0.1:6379/0")
+    assert "S3cret" not in bare_only_pw
     keyword = _redact_secret("host=db password=s3cret user=aligo")
     assert "s3cret" not in keyword and "password=***" in keyword
-    print("✓ doctor 遮蔽连接串密码")
+    token = _redact_secret("call https://gw/v1?api_key=SECRET&x=1")
+    assert "SECRET" not in token and "?x=1" not in token
+    print("✓ doctor 遮蔽连接串密码（URI / 无 scheme / 关键字 / 查询串）")
+
+
+def test_check_config_key_source_strips_env(monkeypatch):
+    """LLM_API_KEY 为纯空白时按回退 config_local.py 报告来源。"""
+    from config import LLM_CONFIG
+    from utils import doctor as doctor_module
+
+    monkeypatch.setitem(LLM_CONFIG, "api_key", "sk-test")
+    monkeypatch.setenv("LLM_API_KEY", "   ")
+    result = doctor_module.check_config()
+    assert "config_local.py" in result.detail, result.detail
+    monkeypatch.setenv("LLM_API_KEY", "  sk-env  ")
+    result = doctor_module.check_config()
+    assert "环境变量" in result.detail, result.detail
+    print("✓ check_config 按 strip 后判断密钥来源")
+
+
+def test_parse_doctor_args_case_insensitive():
+    """doctor / weather 的 flag 与其他命令同一口径：大小写不敏感。"""
+    from cli import _parse_doctor_args
+
+    assert _parse_doctor_args(["--JSON", "--Offline"]) == (True, False)
+    assert _parse_doctor_args(["--NO-NETWORK"]) == (False, False)
+    assert _parse_doctor_args(["--bogus"]) is None
+    print("✓ doctor 参数大小写不敏感")
 
 
 def test_model_files_accepts_huggingface_id(monkeypatch):
@@ -762,6 +794,7 @@ if __name__ == "__main__":
         test_skills_root_without_scripts,
         test_version_check_missing_version_and_static_tag,
         test_run_doctor_includes_network_check,
+        test_check_config_key_source_strips_env,
         test_storage_postgres_configured_but_json,
         test_version_check_unreadable_index,
         test_default_model_dir_falls_back,

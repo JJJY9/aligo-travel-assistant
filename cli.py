@@ -1423,9 +1423,10 @@ def _parse_doctor_args(args: list[str]) -> tuple[bool, bool] | None:
     as_json = False
     include_network = True
     for item in args:
-        if item == "--json":
+        lowered = item.lower()
+        if lowered == "--json":
             as_json = True
-        elif item in {"--offline", "--no-network"}:
+        elif lowered in {"--offline", "--no-network"}:
             include_network = False
         else:
             return None
@@ -5501,8 +5502,14 @@ def main():
             sys.exit(run_skills_standalone(as_json=skills_json))
         if arg == "weather":
             weather_args = sys.argv[2:]
-            weather_json = "--json" in weather_args
-            cities = [item for item in weather_args if item != "--json"]
+            # 与 _parse_json_flag 同一口径：flag 大小写不敏感
+            lowered = [item.lower() for item in weather_args]
+            weather_json = "--json" in lowered
+            cities = [
+                item
+                for item, flag in zip(weather_args, lowered)
+                if flag != "--json"
+            ]
             if len(cities) != 1 or cities[0].startswith("-"):
                 print("用法：python cli.py weather <城市> [--json]")
                 sys.exit(2)

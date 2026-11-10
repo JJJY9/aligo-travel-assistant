@@ -108,6 +108,17 @@ def test_main_dispatch(monkeypatch):
     print("✓ cli.py weather 命令分发")
 
 
+def test_main_dispatch_uppercase_json(monkeypatch):
+    """--JSON 与 --json 同义（与 _parse_json_flag 的大小写口径一致）。"""
+    _patch_fetch(monkeypatch, result=dict(_FORECAST))
+    monkeypatch.setattr(sys, "argv", ["cli.py", "weather", "北京", "--JSON"])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert out.getvalue().lstrip().startswith("{")
+
+
 def test_main_dispatch_usage(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["cli.py", "weather"])
     with contextlib.redirect_stdout(io.StringIO()), pytest.raises(SystemExit) as exc:
@@ -124,6 +135,7 @@ if __name__ == "__main__":
         test_weather_failure_json,
         test_weather_stale_note,
         test_main_dispatch,
+        test_main_dispatch_uppercase_json,
         test_main_dispatch_usage,
     ):
         mp = pytest.MonkeyPatch()
