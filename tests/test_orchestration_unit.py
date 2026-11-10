@@ -1659,6 +1659,126 @@ def test_trip_destination_dict_uses_scalar_field():
     print("✓ 对象型目的地取标量字段落库")
 
 
+def test_reply_input_edges_and_registry_management():
+    """reply(None) / 非法意图输出 / 空调度容错；注册与注销；文本辅助函数。"""
+    from agents.orchestration_agent import _as_text, _transient_agent_error
+
+    orchestrator = OrchestrationAgent(agent_registry={})
+
+    assert json.loads(asyncio.run(orchestrator.reply(None)).content) == {
+        "error": "No input provided"
+    }
+
+    for bad in ("这不是 JSON", json.dumps([1, 2])):
+        out = asyncio.run(orchestrator.reply(Msg(name="i", content=bad, role="user")))
+        assert json.loads(out.content) == {"error": "Invalid intention format"}, bad
+
+    # 列表输入取最后一条；空调度返回空结果
+    out = asyncio.run(
+        orchestrator.reply(
+            [
+                Msg(name="i", content="{}", role="user"),
+                Msg(
+                    name="i",
+                    content=json.dumps({"agent_schedule": []}),
+                    role="user",
+                ),
+            ]
+        )
+    )
+    data = json.loads(out.content)
+    assert data.get("status") == "no_agents", data
+
+    # 调度项写成字符串 / null：归一为空调度；写成单个对象：按 1 项调度
+    for schedule in ("itinerary_planning", None):
+        out = asyncio.run(
+            orchestrator.reply(
+                Msg(
+                    name="i",
+                    content=json.dumps({"agent_schedule": schedule}),
+                    role="user",
+                )
+            )
+        )
+        assert json.loads(out.content).get("status") == "no_agents", schedule
+    out = asyncio.run(
+        orchestrator.reply(
+            Msg(
+                name="i",
+                content=json.dumps(
+                    {"agent_schedule": {"agent_name": "x", "priority": 1}}
+                ),
+                role="user",
+            )
+        )
+    )
+    data = json.loads(out.content)
+    assert data.get("status") != "no_agents", data
+    assert "x" in out.content, data
+
+    class _PlainAgent:
+        async def reply(self, x):
+            return Msg(name="a", content="{}", role="assistant")
+
+    agent = _PlainAgent()
+    orchestrator.register_agent("demo", agent)
+    assert orchestrator.agent_registry["demo"] is agent
+    orchestrator.unregister_agent("demo")
+    assert "demo" not in orchestrator.agent_registry
+    orchestrator.unregister_agent("missing")  # 注销不存在的智能体不抛异常
+
+    # 智能体返回非 JSON 文本：data 里保留原文（不丢回答）
+    class _TextAgent:
+        async def reply(self, x):
+            return Msg(name="t", content="直接文本回答", role="assistant")
+
+    orchestrator.register_agent("demo2", _TextAgent())
+    out = asyncio.run(
+        orchestrator.reply(
+            Msg(
+                name="i",
+                content=json.dumps(
+                    {"agent_schedule": [{"agent_name": "demo2", "priority": 1}]}
+                ),
+                role="user",
+            )
+        )
+    )
+    assert "直接文本回答" in out.content
+
+    # 智能体返回非字符串 content：原样作为 data
+    class _RawAgent:
+        async def reply(self, x):
+            return type("R", (), {"content": {"raw": True}})()
+
+    orchestrator.register_agent("demo3", _RawAgent())
+    out = asyncio.run(
+        orchestrator.reply(
+            Msg(
+                name="i",
+                content=json.dumps(
+                    {"agent_schedule": [{"agent_name": "demo3", "priority": 1}]}
+                ),
+                role="user",
+            )
+        )
+    )
+    assert '"raw": true' in out.content.replace("True", "true"), out.content
+
+    # _as_text：没有标量键的字典回退 JSON 文本
+    assert _as_text({"k": 1}) == json.dumps({"k": 1}, ensure_ascii=False)
+
+    # _transient_agent_error：非字符串 / 非法 JSON / 非对象内容返回 None
+    class _Resp:
+        def __init__(self, content):
+            self.content = content
+
+    assert _transient_agent_error(_Resp(None)) is None
+    assert _transient_agent_error(_Resp("不是 JSON")) is None
+    assert _transient_agent_error(_Resp(json.dumps([1]))) is None
+    print("✓ reply 输入边界 / 调度容错 / 注册注销 / 文本与瞬时错误辅助")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -1699,6 +1819,7 @@ if __name__ == "__main__":
     test_trip_destination_dict_uses_scalar_field()
     test_data_data_nested_preferences_unpacked()
     test_unmanageable_preference_types_skipped_everywhere()
+    test_reply_input_edges_and_registry_management()
     test_agent_load_runs_in_dedicated_executor()
     test_rag_load_uses_isolated_executor()
     test_rag_load_executor_accepts_standard_name()
