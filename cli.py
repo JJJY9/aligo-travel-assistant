@@ -2995,7 +2995,9 @@ def run_trips_dedupe_standalone(
             print("去掉 --dry-run 即可执行删除")
             return 1 if ambiguous else 0
 
-        removed, failure = apply_trip_dedupe(store, plan["duplicate_entries"])
+        removed, failure = apply_trip_dedupe(
+            store, plan["duplicate_entries"], plan.get("verify")
+        )
         if as_json:
             if failure is not None:
                 return _fail(
