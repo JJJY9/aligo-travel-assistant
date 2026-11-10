@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- doctor 凭据遮蔽覆盖更多粘贴形态：缺 scheme 的 `user:pass@host`、只有密码的 `redis://:pass@`、`password=` 关键字与 URL 查询串（psycopg 报错回显的完整连接串不再带出密码）；`LLM_API_KEY` 为纯空白时如实报告密钥来自 config_local.py；doctor / weather 的 `--JSON` / `--offline` 大小写与其它命令一致
 - Web 安全面收敛：/api/knowledge 不返回本机绝对路径、接入知识库限流并在导入持写锁时快速返回「正在写入」（不再把请求线程堆在写锁上打满线程池）；/api/doctor 详情脱敏（项目路径替换为 <项目>、上游 URL 去掉凭据与查询串）；存储 / 依赖类 503 统一为「…，请稍后再试」，异常细节只进日志
 - 日志脱敏：存储层失败日志与 strict 错误文本统一去掉 DSN / URL 的 userinfo 与查询串（新增 utils/log_redact；psycopg 异常的完整连接串不再进入日志 / 503 详情）；偏好值与会话标题不再写入 INFO 日志（只记类型 / 长度）
 - 带高开销副作用的伪 GET 接口（/api/doctor 含网络探测与 LLM 调用、知识库 search / eval、weather）拒绝浏览器跨站简单请求（Sec-Fetch-Site: cross-site/same-site → 403）——任意网页不再能用 <img> 偷跑这些接口消耗 API 额度与 CPU；脚本 / CLI 等无该头的客户端不受影响

@@ -98,17 +98,16 @@ def check_dependencies() -> list[CheckResult]:
     return [core_result, rag_result]
 
 
-_DSN_PASSWORD_RE = re.compile(r"(://[^:/@\s]+:)[^@/\s]+(@)")
-
-
 def _redact_secret(text: object) -> str:
     """遮蔽连接串里的密码。
 
     psycopg / redis 的异常会回显完整 DSN，doctor 输出常被粘贴到工单或
-    聊天里，凭据不能跟着带出去。
+    聊天里，凭据不能跟着带出去。覆盖 URI、缺 scheme 的 user:pass@ 粘贴
+    与 password= 关键字形态（见 utils.log_redact）。
     """
-    value = _DSN_PASSWORD_RE.sub(r"\1***\2", str(text))
-    return re.sub(r"(?i)(password\s*=\s*)\S+", r"\1***", value)
+    from utils.log_redact import redact_secret
+
+    return redact_secret(text)
 
 
 def check_config() -> CheckResult:
@@ -119,7 +118,10 @@ def check_config() -> CheckResult:
     model_name = LLM_CONFIG["model_name"]
     base_url = LLM_CONFIG["base_url"]
     if api_key:
-        source = "环境变量" if os.environ.get("LLM_API_KEY") else "config_local.py"
+        # 空 / 纯空白的环境变量在 config 里会回退 config_local.py：
+        # 这里按 strip 后判断，避免误报「密钥来自 环境变量」
+        env_key = os.environ.get("LLM_API_KEY", "").strip()
+        source = "环境变量" if env_key else "config_local.py"
         return CheckResult(
             "大模型配置",
             STATUS_OK,
