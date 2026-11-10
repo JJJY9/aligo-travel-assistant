@@ -68,6 +68,50 @@ def test_truncate_empty():
     print("✓ 空历史返回 0")
 
 
+def test_truncate_expect_without_user_message_returns_zero():
+    """末尾只有助手消息（无用户提问可校验）时 expect 截断返回 0。"""
+    memory = ShortTermMemory()
+    memory.add_message("assistant", "只有回答")
+    assert memory.truncate_last_turn("问") == 0
+    assert len(memory.messages) == 1
+    print("✓ 无用户提问时 expect 截断返回 0")
+
+
+def test_get_context_string_formats_and_skips_bad_entries(monkeypatch):
+    """上下文文本：空历史提示、角色格式化；Redis 路径跳过形状非法的条目。"""
+    memory = ShortTermMemory()
+    assert memory.get_context_string() == "无历史对话"
+    memory.add_message("user", "你好")
+    memory.add_message("assistant", "您好")
+    assert memory.get_context_string() == "用户: 你好\n助手: 您好"
+
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    redis_memory = module.RedisShortTermMemory(
+        client, "s-ctx", max_turns=5, user_id="u1"
+    )
+    assert redis_memory.get_context_string() == "无历史对话"
+    redis_memory.add_message("user", "你好")
+    redis_memory.add_message("assistant", "您好")
+    assert redis_memory.get_context_string() == "用户: 你好\n助手: 您好"
+    client.data.append("null")
+    client.data.append(json.dumps({"role": 1, "content": "x"}))
+    client.data.append(json.dumps({"role": "user", "content": None}))
+    assert redis_memory.get_context_string() == "用户: 你好\n助手: 您好"
+    print("✓ 上下文文本格式化与非法条目跳过")
+
+
+def test_reset_redis_degraded_clears_cooldown(monkeypatch):
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 12345.0)
+    module.reset_redis_degraded()
+    assert module._redis_degraded_until == 0.0
+    print("✓ reset_redis_degraded 清空降级冷却")
+
+
 def test_max_turns_evicts_oldest():
     memory = ShortTermMemory(max_turns=2)
     for index in range(3):
@@ -1609,6 +1653,12 @@ if __name__ == "__main__":
     test_truncate_expect_mismatch_keeps_history()
     test_truncate_trailing_user_only()
     test_truncate_empty()
+    test_truncate_expect_without_user_message_returns_zero()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_get_context_string_formats_and_skips_bad_entries(_mp)
+    finally:
+        _mp.undo()
     test_max_turns_evicts_oldest()
     test_recent_context_and_string()
     test_statistics_and_clear()
@@ -1636,6 +1686,11 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_shadow_cache_mirrors_clear(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_reset_redis_degraded_clears_cooldown(_mp)
     finally:
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()
