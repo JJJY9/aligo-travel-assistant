@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import contextlib
+import hashlib
 import ipaddress
 import json
 import reprlib
@@ -1766,9 +1767,18 @@ def _close_long_term(store: Any) -> None:
 
 
 def _safe_filename(value: str, fallback: str = "aligo") -> str:
-    """把用户 / 会话 ID 转为只含 ASCII 的安全下载文件名。"""
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", value)
-    return cleaned or fallback
+    """把用户 / 会话 ID 转为只含 ASCII 的安全下载文件名。
+
+    清洗后与原始值不同（中文 / 超长 ID）时追加短哈希：不同账号互相
+    撞名（``aligo____.json``）会在同一目录覆盖对方的备份（与 CLI
+    ``_safe_export_user`` 同一策略）。
+    """
+    original = str(value or "")
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", original)[:24] or fallback
+    if cleaned != original:
+        digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:6]
+        cleaned = f"{cleaned}_{digest}"
+    return cleaned
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -3248,6 +3258,9 @@ def create_app(model: Any = None) -> FastAPI:
                     )
                     break
         filename_base = _safe_filename(session_id, "conversation")
+        # 文件名带用户维度（与 CLI session-export 的 aligo_<用户>_<会话> 对齐）：
+        # 单会话导出不含用户时，同名会话在不同账号间互相覆盖
+        safe_user = _safe_filename(user_id, "user")
         if format == "html":
             # 标题传原文：render_session_html 在出口统一转义（预转义会变成
             # 字面量 &lt;b&gt;，与 CLI session-export --html 同一口径）
@@ -3256,7 +3269,7 @@ def create_app(model: Any = None) -> FastAPI:
                 media_type="text/html; charset=utf-8",
                 headers={
                     "Content-Disposition": (
-                        f'attachment; filename="aligo_{filename_base}.html"'
+                        f'attachment; filename="aligo_{safe_user}_{filename_base}.html"'
                     ),
                     **rate_headers,
                 },
@@ -3285,7 +3298,7 @@ def create_app(model: Any = None) -> FastAPI:
                 [f"## {role}", "", sanitize_body(content.strip()), ""]
             )
 
-        filename = f"aligo_{filename_base}.md"
+        filename = f"aligo_{safe_user}_{filename_base}.md"
         return Response(
             content="\n".join(lines),
             media_type="text/markdown; charset=utf-8",

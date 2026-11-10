@@ -39,6 +39,7 @@
 
 ### 修复
 - 备份恢复保留倒置日期的行程（结束早于出发，规划路径可能写入的历史数据）：此前恢复时整条丢弃、备份静默丢行程；现在按原样恢复并在错误列表提示
+- Web 下载文件名去撞名：非 ASCII 用户 / 会话 ID 清洗后追加短哈希（与 CLI 同一策略），单会话导出文件名带用户维度（同名会话不再跨账号互相覆盖）；README 已知限制补充 CLI 对前导 `-` ID 的限制
 - 偏好设置与会话标题 / 置顶 / 归档在 PostgreSQL 故障期同样返回 503（不再静默写回退 JSON 或误报会话不存在），与删除 / 行程写入 / CLI 的严格语义一致；README 已知限制同步
 - CLI `pref-set` 校验对齐 Web：`--json-value` 的空值形状（[] / "" / 空白串 / {}）不再静默清除偏好；拒绝 1e999 产生的 Infinity 与 >16 层嵌套（含 RecursionError 的结构化报错）；文本与 JSON 模式统一 10000 字符序列化上限（旧 500 字上限与 Web 不一致且可被 --json-value 绕过）
 - 导出加固：/api/export 与两个会话导出接口在 PostgreSQL 故障期返回 503（不再把回退 JSON 的空 / 陈旧内容当成功备份写出）；导出前统一 sanitize_json（孤立代理项转义、NaN/Infinity 归 null），Web 全部导出接口与 CLI user-export 的 Markdown 不再 500 / 写出非法 JSON
