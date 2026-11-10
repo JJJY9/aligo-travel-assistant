@@ -4,8 +4,10 @@ RAG 智能体会为每个会话构造一次；若每个实例都加载一份 BGE
 （约 92 MB），内存会随会话数增长。模型推理是只读的，可以安全地在
 多个会话 / 线程之间共享同一实例。
 """
+import json
 import logging
 import threading
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,31 @@ def peek_embedding_dim() -> int | None:
     if len(models) != 1:
         return None
     return embedding_dimension(models[0])
+
+
+def configured_model_dimension(model_path: str | Path) -> int | None:
+    """从本地模型目录配置读取输出维度（不加载模型 / 不 import torch）。
+
+    sentence-transformers 导出的模型目录在 ``1_Pooling/config.json`` 记录
+    ``word_embedding_dimension``（BGE 等常用模型都有）：换嵌入模型但未
+    重建知识库时，doctor 在未加载模型的进程里也能发现维度不一致。
+    HuggingFace 模型 ID（未下载到本地）或目录缺配置时返回 None。
+    """
+    try:
+        root = Path(model_path).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if not root.is_dir():
+        return None
+    path = root / "1_Pooling" / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    dimension = data.get("word_embedding_dimension") if isinstance(data, dict) else None
+    if isinstance(dimension, int) and dimension > 0:
+        return dimension
+    return None
 
 
 def get_embedding_model(model_path: str) -> Any:

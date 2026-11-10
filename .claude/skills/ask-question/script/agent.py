@@ -155,7 +155,18 @@ class RAGKnowledgeAgent(AgentBase):
         path_obj = Path(embedding_model).expanduser()
         if not path_obj.is_absolute():
             # 相对路径锚定到项目根目录，避免依赖运行时 CWD（Issue #5）
-            project_root = Path(__file__).resolve().parents[4]
+            try:
+                project_root = Path(__file__).resolve().parents[4]
+            except IndexError:
+                # ALIGO_SKILLS_DIR 指向仓库外（如 /skills）：技能目录的
+                # parents[4] 不存在，改用 config 模块位置 / CWD 兜底，
+                # 不再抛只有一个「4」的 IndexError
+                try:
+                    import config as _config
+
+                    project_root = Path(_config.__file__).resolve().parent
+                except Exception:  # noqa: BLE001 - 独立运行时退回 CWD
+                    project_root = Path.cwd()
             path_obj = project_root / path_obj
         if path_obj.exists():
             model_path_or_id = str(path_obj.resolve())
