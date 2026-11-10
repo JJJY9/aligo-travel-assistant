@@ -147,6 +147,34 @@ def test_last_object_with_keys_still_picks_last_valid():
     print("✓ 无瑕疵时仍取最后一个对象")
 
 
+def test_strict_and_first_object_with_keys_helpers():
+    """strict 版本把「末尾截断」与「没有含键对象」区分开；first 只兜底含键对象。"""
+    from utils.json_parser import (
+        first_json_object_with_keys,
+        last_json_object_with_keys_strict,
+    )
+
+    truncated = (
+        '示例：{"preferences":[{"type":"hotel_brands","value":"汉庭"}]}\n'
+        '正式：{"preferences":[{"type":"hotel_brands","value":"如家"'
+    )
+    with pytest.raises(ValueError):
+        last_json_object_with_keys_strict(truncated, ("preferences",))
+
+    # 没有截断、也没有含目标键的完整对象：strict 返回 None（调用方可再兜底）
+    text = '{"note": "x"} {"other": 1}'
+    assert last_json_object_with_keys_strict(text, ("preferences",)) is None
+    assert first_json_object_with_keys(text, ("other",)) == {"other": 1}
+    assert first_json_object_with_keys(text, ("preferences",)) is None
+
+    # 第一个含键对象优先（尾逗号等小瑕疵由修复路径兜底）
+    echo_then = '{"preferences": [{"type": "a"}],} 说明 {"note": 1}'
+    assert first_json_object_with_keys(echo_then, ("preferences",)) == {
+        "preferences": [{"type": "a"}]
+    }
+    print("✓ strict / first 辅助函数（截断抛错、首个含键对象兜底）")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -163,6 +191,7 @@ if __name__ == "__main__":
         test_last_object_with_keys_repairs_trailing_comma()
         test_last_object_with_keys_refuses_unparsable_tail()
         test_last_object_with_keys_still_picks_last_valid()
+        test_strict_and_first_object_with_keys_helpers()
     finally:
         mp.undo()
     print("\n全部通过")

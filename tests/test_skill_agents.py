@@ -398,6 +398,80 @@ def test_preference_tolerates_current_preference_read_failure():
     print("✓ 当前偏好读取失败继续抽取")
 
 
+def test_preference_truncated_result_not_replaced_by_echoed_example():
+    """回显示例 + 正式结果被截断：必须错误降级，不能把示例偏好当真实结果。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "汉庭"}, '
+        '{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    truncated = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "如家"'
+    )
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return f"示例：{example}\n正式：{truncated}"
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _Loader()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我还喜欢如家", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is False, data
+    assert data.get("error"), data
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "汉庭" not in rendered and "上海浦东新区" not in rendered, rendered
+    print("✓ 偏好：截断结果不回落为回显示例")
+
+
+def test_event_collection_truncated_result_not_replaced_by_echoed_example():
+    """事项收集同一缺陷：截断时不能用 prompt 示例（北京 / 2026-02-27）写库。"""
+    agent_class = _load_skill("event-collection", "EventCollectionAgent")
+
+    example = (
+        '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"end_date": "2026-02-27", "duration_days": 1, '
+        '"return_location": "北京", "trip_purpose": "旅游", '
+        '"missing_info": [], "extracted_count": 7}'
+    )
+    truncated = (
+        '{"origin": "上海", "destination": "杭州", '
+        '"start_date": "2026-12-01", "trip_purpose": "出差'
+    )
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return f"示例：{example}\n正式：{truncated}"
+
+    agent = agent_class(name="EventCollectionAgent", model=_Model())
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="12 月 1 日去杭州出差", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("error"), data
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, rendered
+    print("✓ 事项收集：截断结果不回落为回显示例")
+
+
 def test_suspicious_url_uses_registrable_domain():
     """随机域名按主域名主体（倒数第二段）判断：正规站长首标签不误杀、www 前缀不漏过。"""
     module = _load_skill_module("query-info")
@@ -1194,6 +1268,8 @@ if __name__ == "__main__":
         test_memory_query_tolerates_long_term_read_failure()
         test_memory_query_filters_blank_list_items()
         test_preference_tolerates_current_preference_read_failure()
+        test_preference_truncated_result_not_replaced_by_echoed_example()
+        test_event_collection_truncated_result_not_replaced_by_echoed_example()
         test_suspicious_url_uses_registrable_domain()
         test_skill_agents_tolerate_non_object_payloads()
         test_weather_city_prefers_destination_side()

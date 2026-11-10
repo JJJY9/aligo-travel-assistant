@@ -213,6 +213,31 @@ def starts_with_json_array(text: str) -> bool:
     return False
 
 
+def _scan_last_json_object_with_keys(
+    text: str, keys: "tuple[str, ...]", *, warn: bool = True
+) -> "tuple[dict | None, bool]":
+    """扫描最后一个含目标键的顶层对象，返回 ``(对象, 是否因末尾截断放弃)``。"""
+    selected: dict | None = None
+    selected_end = -1
+    for value, end in _iter_objects_with_repair(text):
+        if any(key in value for key in keys):
+            selected = value
+            selected_end = end
+    if selected is None:
+        return None, False
+    tail = text[selected_end:]
+    if "{" in tail:
+        for key in keys:
+            if f'"{key}"' in tail:
+                if warn:
+                    logger.warning(
+                        "末尾仍有含 %s 的对象但无法解析（可能被截断），放弃更早的候选",
+                        key,
+                    )
+                return None, True
+    return selected, False
+
+
 def last_json_object_with_keys(
     text: str, keys: "tuple[str, ...]"
 ) -> "dict | None":
@@ -227,24 +252,37 @@ def last_json_object_with_keys(
     文本仍出现目标键（说明末尾还有一个无法解析的结果对象，如被截断），
     返回 None 让调用方走错误降级，而不是把示例当真实数据。
     """
-    selected: dict | None = None
-    selected_end = -1
-    for value, end in _iter_objects_with_repair(text):
-        if any(key in value for key in keys):
-            selected = value
-            selected_end = end
-    if selected is None:
-        return None
-    tail = text[selected_end:]
-    if "{" in tail:
-        for key in keys:
-            if f'"{key}"' in tail:
-                logger.warning(
-                    "末尾仍有含 %s 的对象但无法解析（可能被截断），放弃更早的候选",
-                    key,
-                )
-                return None
+    return _scan_last_json_object_with_keys(text, keys)[0]
+
+
+def last_json_object_with_keys_strict(
+    text: str, keys: "tuple[str, ...]"
+) -> "dict | None":
+    """同 :func:`last_json_object_with_keys`，但末尾截断时抛 ``ValueError``。
+
+    调用方用它把「没有任何含目标键的对象」与「正式结果被截断」区分开：
+    前者可以回退到第一个含目标键的对象，后者必须错误降级——回退会取回
+    prompt 回显的示例对象，把示例偏好 / 示例行程当成真实结果写库。
+    """
+    selected, truncated = _scan_last_json_object_with_keys(text, keys)
+    if truncated:
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     return selected
+
+
+def first_json_object_with_keys(
+    text: str, keys: "tuple[str, ...]"
+) -> "dict | None":
+    """返回文本中第一个完整解析且含任一目标键的顶层对象（没有则 None）。
+
+    只用于「不存在任何含目标键的完整对象」时的兜底扫描；若模型回显了
+    prompt 示例（通常含全部目标键），它同样命中——调用方必须先用
+    :func:`last_json_object_with_keys_strict` 排除截断场景。
+    """
+    for value, _ in _iter_objects_with_repair(text):
+        if any(key in value for key in keys):
+            return value
+    return None
 
 
 def robust_first_json_object(text: str) -> dict:
