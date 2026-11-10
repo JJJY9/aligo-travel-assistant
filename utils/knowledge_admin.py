@@ -415,6 +415,54 @@ def _group_member_ids(client: Any, group: str) -> list[int]:
     return members
 
 
+def _locked_user_snapshot(
+    client: Any, doc_id: int, group: str
+) -> tuple[str, dict[str, str]] | None:
+    """锁内读取文档当前拼接正文与用户元数据（调用方已持 _WRITE_LOCK，不得再取锁）。"""
+
+    def _user_meta(raw: Any) -> dict[str, str]:
+        meta = _parse_metadata(raw)
+        return {
+            str(key): str(value)
+            for key, value in meta.items()
+            if key not in _DERIVED_CHUNK_KEYS
+        }
+
+    if not group:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f"id == {int(doc_id)}",
+            output_fields=["content", "metadata"],
+            limit=1,
+        )
+        if not rows:
+            return None
+        return str(rows[0].get("content", "")), _user_meta(rows[0].get("metadata"))
+    pieces: list[tuple[int, str]] = []
+    user_meta: dict[str, str] | None = None
+    for member in _group_member_ids(client, group):
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=f"id == {member}",
+            output_fields=["content", "metadata"],
+            limit=1,
+        )
+        if not rows:
+            continue
+        meta = _parse_metadata(rows[0].get("metadata"))
+        try:
+            part_no = int(meta.get("part") or 0)
+        except (TypeError, ValueError):
+            part_no = 0
+        pieces.append((part_no, str(rows[0].get("content", ""))))
+        if user_meta is None:
+            user_meta = _user_meta(rows[0].get("metadata"))
+    if user_meta is None:
+        return None
+    pieces.sort(key=lambda pair: pair[0])
+    return "".join(text for _, text in pieces), user_meta
+
+
 def update_document(
     doc_id: int, content: str, metadata: dict[str, str] | None = None
 ) -> dict[str, Any]:
@@ -457,6 +505,23 @@ def update_document(
                 f"该片段属于多分片知识内容（共 {existing_parts} 段），"
                 "暂不支持单条编辑：请删除整组后重新添加，避免旧分片残留"
             )
+        # 原样保存（内容与回填完全一致、元数据未变）直接返回：重新切片会把
+        # 空行 / 换行合并（排版逐渐劣化、分片边界变化），还白白重建分片与
+        # 向量；面板「不做修改直接保存」应是 no-op
+        snapshot = _locked_user_snapshot(client, int(doc_id), group)
+        if snapshot is not None:
+            current_text, current_meta = snapshot
+            wanted_meta = {
+                str(key): str(value)
+                for key, value in (metadata or {}).items()
+                if key not in _DERIVED_CHUNK_KEYS
+            }
+            if text == current_text and wanted_meta == current_meta:
+                return {
+                    "status": "success",
+                    "id": int(doc_id),
+                    "unchanged": True,
+                }
         # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
         # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
         old_ids: list[int] = []
