@@ -306,6 +306,35 @@ def _assistant_content_problem(content: str) -> str | None:
     return _non_finite_in_value(meta)
 
 
+def backup_limit_problem(backup: dict[str, Any]) -> str | None:
+    """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
+
+    口径与 ``parse_user_export`` / ``import_user_data`` 的硬上限一致：
+    条数与备份文件字节上限。返回具体原因或 None。
+    """
+    if not isinstance(backup, dict):
+        return None
+    messages = backup.get("chat_history")
+    if isinstance(messages, list) and len(messages) > _MAX_MESSAGES:
+        return f"消息 {len(messages)} 条超过导入上限 {_MAX_MESSAGES}"
+    trips = backup.get("trip_history")
+    if isinstance(trips, list) and len(trips) > _MAX_TRIPS:
+        return f"行程 {len(trips)} 条超过导入上限 {_MAX_TRIPS}"
+    preferences = backup.get("preferences")
+    if isinstance(preferences, (dict, list)) and len(preferences) > _MAX_PREFERENCES:
+        return f"偏好 {len(preferences)} 条超过导入上限 {_MAX_PREFERENCES}"
+    knowledge = backup.get("knowledge")
+    if isinstance(knowledge, list) and len(knowledge) > _MAX_KNOWLEDGE:
+        return f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}"
+    size = len(json.dumps(backup, ensure_ascii=False).encode("utf-8"))
+    if size > MAX_BACKUP_BYTES:
+        return (
+            f"约 {size / (1024 * 1024):.1f} MB 超过导入上限 "
+            f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
+        )
+    return None
+
+
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
     """解析并校验 user-export JSON 文本，返回 ``(可恢复数据, 错误列表)``。"""
     try:

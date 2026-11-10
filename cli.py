@@ -1071,8 +1071,17 @@ class AligoCLI:
         """把当前用户的长期记忆导出为 JSON 与 Markdown（exports/ 目录）"""
         from utils.exporter import export_files
 
+        from utils.user_import import backup_limit_problem
+
         self.memory_manager.reload_long_term()
         data = self.memory_manager.export_data()
+        problem = backup_limit_problem(data)
+        if problem:
+            self.console.print(
+                f"[red]导出中止：{problem}（该文件将无法再导入恢复，"
+                "请先清理部分旧会话 / 行程后重试）[/red]"
+            )
+            return
         paths = export_files(data, "exports")
         for path in paths:
             self.console.print(f"✓ 已导出: {path}", style="green")
@@ -2230,6 +2239,16 @@ def run_user_export_standalone(
         except Exception as exc:  # noqa: BLE001 - 备份不完整时中止而不是静默
             print(f"读取知识库失败：{exc}")
             return 1
+
+    from utils.user_import import backup_limit_problem
+
+    problem = backup_limit_problem(data)
+    if problem:
+        print(
+            f"导出中止：{problem}（该文件将无法再导入恢复，"
+            "请先清理部分旧会话 / 行程后重试）"
+        )
+        return 1
 
     out_dir = Path(target_dir) if target_dir else Path("exports")
     try:

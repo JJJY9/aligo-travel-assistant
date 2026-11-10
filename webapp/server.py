@@ -4268,6 +4268,19 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503, detail=f"知识库导出失败：{exc}"
                 ) from exc
+        # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
+        # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
+        from utils.user_import import backup_limit_problem
+
+        limit_problem = backup_limit_problem(backup)
+        if limit_problem:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"备份超过导入上限：{limit_problem}。"
+                    "该文件无法再导入恢复，请先删除部分旧会话 / 行程后重试"
+                ),
+            )
         # 历史数据可能含孤立代理项 / 非有限数：清洗后再序列化，
         # 否则响应 UTF-8 编码 500 或产出前端 JSON.parse 拒绝的非法备份
         payload = json.dumps(
