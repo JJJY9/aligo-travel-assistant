@@ -394,6 +394,62 @@ class _PlanTripLoader:
         return ""
 
 
+def test_preference_bare_array_is_wrapped_not_dropped():
+    """偏好裸数组（省略 preferences 包裹）按数组载荷包装，不再静默丢失。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return '[{"type": "hotel_brands", "value": "如家", "action": "append"}]'
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _Loader()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我还喜欢如家", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is True, data
+    assert data.get("preferences") == [
+        {"type": "hotel_brands", "value": "如家", "action": "append"}
+    ], data
+    print("✓ 偏好裸数组按数组载荷包装（不再静默丢失）")
+
+
+def test_plan_trip_rejects_non_itinerary_object():
+    """可解析但不是行程形状的对象按解析失败处理（不再空回复）。"""
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return '{"status": "ok", "notes": "没有具体行程"}'
+
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=_Model()
+    )
+    agent.skill_loader = _PlanTripLoader()
+    payload = json.dumps(
+        {"context": {"rewritten_query": "测试出行"}}, ensure_ascii=False
+    )
+    out = asyncio.run(agent.reply(Msg(name="x", content=payload, role="user")))
+    data = json.loads(out.content)
+    assert data.get("planning_complete") is False, data
+    assert "error" in data, data
+    print("✓ 非行程对象按解析失败处理（不再空回复）")
+
+
 def test_plan_trip_null_rewritten_query_falls_back():
     """rewritten_query 为 null 时回退用户原话，需求不能变空或字面量 None。"""
     module = _load_skill_module("plan-trip")
@@ -1026,6 +1082,8 @@ if __name__ == "__main__":
         test_weather_city_prefers_destination_side()
         test_plan_trip_null_rewritten_query_falls_back()
         test_plan_trip_rejects_non_object_result()
+        test_plan_trip_rejects_non_itinerary_object()
+        test_preference_bare_array_is_wrapped_not_dropped()
         test_plan_trip_accepts_object_with_array_fields()
         test_event_collection_result_without_meta_keys_beats_echo()
         test_skill_result_with_trailing_comma_is_repaired()

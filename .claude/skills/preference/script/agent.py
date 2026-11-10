@@ -19,6 +19,7 @@ from utils.json_parser import (
     extract_json_from_async_response,
     last_json_object_with_keys,
     robust_first_json_object,
+    starts_with_json_array,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,13 +119,26 @@ class PreferenceAgent(AgentBase):
             # 模型可能先复述【当前已保存的偏好】或输出示例再给正式结果：
             # 优先取最后一个形如结果（has_preferences / preferences）的
             # 顶层对象，避免把回显的示例值写进长期记忆
-            result = last_json_object_with_keys(
-                text, ("has_preferences", "preferences")
-            )
-            if result is None:
-                # 回退：扫描第一个完整对象（尾逗号等小瑕疵由修复路径兜底），
-                # 避免结尾说明中的花括号被误截
-                result = robust_first_json_object(text)
+            if starts_with_json_array(text):
+                # 裸数组（省略 {"preferences": [...]} 包裹）：直接交给
+                # robust_first_json_object 会把数组截成第一个元素、当成
+                # 成功但没有 preferences 键——偏好静默丢失且无错误提示。
+                # 这里按数组载荷包装，元素形状交给落库侧校验
+                array_start = text.find("[")
+                decoded, _ = json.JSONDecoder().raw_decode(text[array_start:])
+                items = [item for item in decoded if isinstance(item, dict)]
+                result = {
+                    "preferences": items,
+                    "has_preferences": bool(items),
+                }
+            else:
+                result = last_json_object_with_keys(
+                    text, ("has_preferences", "preferences")
+                )
+                if result is None:
+                    # 回退：扫描第一个完整对象（尾逗号等小瑕疵由修复路径兜底），
+                    # 避免结尾说明中的花括号被误截
+                    result = robust_first_json_object(text)
         except Exception as e:
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}

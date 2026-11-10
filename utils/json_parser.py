@@ -173,6 +173,44 @@ def _iter_objects_with_repair(text: str):
             index = max(end, index + 1)
         else:
             index += 1
+def starts_with_json_array(text: str) -> bool:
+    """文本中第一个完整的 JSON 值是数组（而不是对象）。
+
+    ``robust_json_parse`` 会把 ``[{...}]`` 截成第一个元素返回 dict，单看最终
+    类型无法发现「模型输出了数组」；这里按原始文本判定，数组输出必须按
+    解析失败处理（或由调用方包装），不能把数组元素当成功结果。说明文字
+    里的 ``[注]`` 之类因无法整体解析为 JSON 不会被误判；对象在数组之前
+    出现时以对象为准（对象内部的数组字段不影响判定）。
+    """
+    decoder = json.JSONDecoder()
+    first_object = text.find("{")
+    index = text.find("[")
+    while index != -1:
+        if first_object != -1 and first_object < index:
+            return False
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("[", index + 1)
+            continue
+        if not isinstance(value, list):
+            return False
+        # 前言里可整体解析的小数组（引用标记 [1]、Markdown 待办「- [ ]」）
+        # 后面若还跟着可解析的 JSON 对象（中间可能隔着说明文字），那是
+        # 前言，不能当成顶层输出、把紧随其后的合法结果丢掉
+        rest = text[end:]
+        probe = rest.find("{")
+        while probe != -1:
+            try:
+                nested, _ = decoder.raw_decode(rest, probe)
+            except json.JSONDecodeError:
+                probe = rest.find("{", probe + 1)
+                continue
+            if isinstance(nested, dict):
+                return False
+            probe = rest.find("{", probe + 1)
+        return True
+    return False
 
 
 def last_json_object_with_keys(

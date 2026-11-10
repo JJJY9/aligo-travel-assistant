@@ -45,6 +45,19 @@ def test_top_level_scan_skips_broken_prefix():
     print("✓ 损坏前缀后的顶层对象扫描（转义引号 / 数组）")
 
 
+def test_starts_with_json_array_detection():
+    """顶层数组判定：数组 / 对象优先 / 前言小数组后跟对象 / 非 JSON 括号。"""
+    from utils.json_parser import starts_with_json_array
+
+    assert starts_with_json_array('[{"a": 1}]') is True
+    assert starts_with_json_array('结果：[{"a": 1}]') is True
+    assert starts_with_json_array('{"a": [1, 2]}') is False
+    assert starts_with_json_array('示例 {"a": 1} 然后 [1, 2]') is False
+    assert starts_with_json_array('引用标记 [1] 后面是 {"a": 1}') is False
+    assert starts_with_json_array('说明 [注] 不是 JSON') is False
+    print("✓ 顶层数组判定")
+
+
 def test_iter_json_objects_empty_text():
     assert list(iter_json_objects("")) == []
     assert list(iter_json_objects("没有对象")) == []
@@ -138,6 +151,8 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_escaped_quotes_in_string_do_not_break_scan()
+        test_top_level_scan_skips_broken_prefix()
+        test_starts_with_json_array_detection()
         test_iter_json_objects_empty_text()
         test_robust_first_json_object_without_object()
         test_robust_json_parse_empty_text()

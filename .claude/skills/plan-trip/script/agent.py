@@ -19,6 +19,7 @@ from utils.json_parser import (
     iter_json_objects,
     last_json_object_with_keys,
     robust_json_parse,
+    starts_with_json_array,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,46 +33,6 @@ def _format_pref_value(value) -> str:
     if isinstance(value, (list, tuple)):
         return ", ".join(str(v) for v in value)
     return str(value)
-
-
-def _starts_with_json_array(text: str) -> bool:
-    """文本中第一个完整的 JSON 值是数组（而不是对象）。
-
-    ``robust_json_parse`` 会把 ``[{...}]`` 截成第一个元素返回 dict，单看最终
-    类型无法发现「模型输出了数组」；这里按原始文本判定，数组输出必须按
-    解析失败处理，不能把数组元素当成功行程。说明文字里的 ``[注]`` 之类
-    因无法整体解析为 JSON 不会被误判；对象在数组之前出现时以对象为准
-    （对象内部的数组字段不影响判定）。
-    """
-    decoder = json.JSONDecoder()
-    first_object = text.find("{")
-    index = text.find("[")
-    while index != -1:
-        if first_object != -1 and first_object < index:
-            return False
-        try:
-            value, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
-            index = text.find("[", index + 1)
-            continue
-        if not isinstance(value, list):
-            return False
-        # 前言里可整体解析的小数组（引用标记 [1]、Markdown 待办「- [ ]」）
-        # 后面若还跟着可解析的 JSON 对象（中间可能隔着说明文字），那是
-        # 前言，不能当成顶层输出、把紧随其后的合法行程丢掉
-        rest = text[end:]
-        probe = rest.find("{")
-        while probe != -1:
-            try:
-                nested, _ = decoder.raw_decode(rest, probe)
-            except json.JSONDecodeError:
-                probe = rest.find("{", probe + 1)
-                continue
-            if isinstance(nested, dict):
-                return False
-            probe = rest.find("{", probe + 1)
-        return True
-    return False
 
 
 class ItineraryPlanningAgent(AgentBase):
@@ -229,7 +190,7 @@ class ItineraryPlanningAgent(AgentBase):
 
             # 数组输出会被 robust_json_parse 截成第一个元素仍按成功返回：
             # 必须在解析前按原始文本判定顶层结构
-            if _starts_with_json_array(text):
+            if starts_with_json_array(text):
                 raise ValueError("行程规划结果顶层是 JSON 数组，不是行程对象")
 
             # 模型可能先回显 prompt 里的输出示例 / 片段再给正式结果：记录
@@ -291,6 +252,11 @@ class ItineraryPlanningAgent(AgentBase):
                 for key in ("title", "daily_plans", "duration", "schedule")
             ):
                 result = {"itinerary": result}
+            if "itinerary" not in result:
+                # 可解析但不是行程形状（{"route": ...} / {"status": "ok"} 等）：
+                # 按成功返回会让编排状态 completed、渲染为空，用户既没有
+                # 行程也没有错误提示——按解析失败处理
+                raise ValueError("行程规划结果缺少行程字段（itinerary）")
 
         except Exception as e:
             logger.error(f"Itinerary planning failed: {e}")
