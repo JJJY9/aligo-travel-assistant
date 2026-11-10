@@ -604,6 +604,20 @@ def test_follower_reclaims_single_flight_after_timeout(monkeypatch):
     print("✓ 等待超时后重新登记单飞（不放大上游请求）")
 
 
+def test_helpers_tolerate_bad_shapes(monkeypatch):
+    """_describe 非数字 / _get_json 非对象 / _parse_weather 非对象都按异常数据处理。"""
+    assert weather._describe(None) == "未知"
+    assert weather._describe("abc") == "未知"
+
+    monkeypatch.setattr(weather.requests, "get", lambda *a, **k: _Response([1, 2]))
+    with pytest.raises(weather.WeatherError):
+        weather._get_json("http://example.invalid", {}, 1.0)
+
+    with pytest.raises(weather.WeatherError):
+        weather._parse_weather("北京", {"name": "北京"}, ["不是对象"])
+    print("✓ 天气辅助函数对非法形状的容错")
+
+
 if __name__ == "__main__":
     for case in (
         test_stale_fallback_merges_concurrent_requests,
@@ -627,6 +641,7 @@ if __name__ == "__main__":
         test_stale_fallback_does_not_refresh_cache_timestamp,
         test_stale_cache_expires,
         test_unknown_city_does_not_use_stale_cache,
+        test_helpers_tolerate_bad_shapes,
     ):
         mp = pytest.MonkeyPatch()
         try:
