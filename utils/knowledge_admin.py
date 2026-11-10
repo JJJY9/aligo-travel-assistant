@@ -45,6 +45,11 @@ _GROUP_PARTS_MAX = 100000
 _IMPORT_CONTENT_MAX_CHARS = 2000
 # 元数据最多 10 个键（与导入清洗保持一致），分片标记只在放得下时添加
 _METADATA_MAX_KEYS = 10
+# 元数据键 / 值长度上限（与 Web 接口 schema 同一口径）。CLI 与导入此前
+# 不受限制：写进去的超长 category 在面板按分类筛选时撞查询参数
+# max_length=200 → 422，该分类下的知识永远无法筛选；备份往返也会被截断
+METADATA_KEY_MAX_CHARS = 32
+METADATA_VALUE_MAX_CHARS = 200
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
 _DERIVED_CHUNK_KEYS = {"part", "parts", "group"}
 _WRITE_LOCK = threading.Lock()
@@ -254,6 +259,20 @@ def _restore_pieces(parts: Any, fallback: str) -> list[str]:
     return pieces
 
 
+def _validate_metadata_lengths(metadata: dict[str, Any]) -> None:
+    """元数据键 / 值长度与 Web 接口共享同一上限，超长直接拒绝（不静默截断）。"""
+    for meta_key, meta_value in metadata.items():
+        key_text = str(meta_key)
+        if len(key_text) > METADATA_KEY_MAX_CHARS:
+            raise ValueError(
+                f"元数据键不能超过 {METADATA_KEY_MAX_CHARS} 字：{key_text[:20]}…"
+            )
+        if len(str(meta_value)) > METADATA_VALUE_MAX_CHARS:
+            raise ValueError(
+                f"元数据值不能超过 {METADATA_VALUE_MAX_CHARS} 字（键 {key_text}）"
+            )
+
+
 def _chunk_documents(
     text: str,
     metadata: dict[str, str] | None,
@@ -290,6 +309,7 @@ def _chunk_documents(
         for key, value in (metadata or {}).items()
         if key not in _DERIVED_CHUNK_KEYS
     }
+    _validate_metadata_lengths(base_meta)
     group_id = (
         (group_override or uuid.uuid4().hex[:12]) if len(chunks) > 1 else ""
     )
@@ -1102,7 +1122,7 @@ def import_documents(
             metadata = item.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
             sanitized_meta = {
-                str(key)[:32]: str(value)[:200]
+                str(key)[:METADATA_KEY_MAX_CHARS]: str(value)[:METADATA_VALUE_MAX_CHARS]
                 for key, value in list(metadata.items())[:_METADATA_MAX_KEYS]
             }
             # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索；

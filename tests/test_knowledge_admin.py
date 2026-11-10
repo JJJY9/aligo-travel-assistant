@@ -227,6 +227,30 @@ def test_update_document_error_propagates(monkeypatch):
     print("✓ 知识片段更新失败向上抛出（不静默成功）")
 
 
+def test_add_update_reject_overlong_metadata(monkeypatch):
+    """元数据键 / 值长度与 Web 同一上限：超长直接拒绝（不写入无法筛选的分类）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    with pytest.raises(ValueError, match="元数据值不能超过 200 字"):
+        knowledge_admin.add_document("内容", {"category": "长" * 201})
+    with pytest.raises(ValueError, match="元数据键不能超过 32 字"):
+        knowledge_admin.add_document("内容", {"键" * 33: "值"})
+
+    fake_client = _FakeMilvusClient([{"id": 7, "content": "旧内容", "metadata": "{}"}])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+
+    class _Agent:
+        def update_document(self, doc_id, content, metadata):
+            return {"status": "success", "id": doc_id}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(ValueError, match="元数据值不能超过 200 字"):
+        knowledge_admin.update_document(7, "内容", {"category": "长" * 201})
+    print("✓ 超长元数据键值在新增 / 更新时直接拒绝")
+
+
 def test_delete_document_checks_existence(monkeypatch):
     fake = _FakeMilvusClient([{"id": 5, "content": "x", "metadata": "{}"}])
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
@@ -2573,6 +2597,7 @@ if __name__ == "__main__":
         test_delete_document_checks_existence,
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,
+        test_add_update_reject_overlong_metadata,
         test_search_documents_delegates_to_agent,
         test_search_documents_requires_initialized_db,
         test_rag_agent_strict_search_raises_when_uninitialized,
