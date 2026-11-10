@@ -493,23 +493,87 @@ def test_pref_set_json_value_types(monkeypatch):
 
 
 def test_pref_set_rejects_oversized_value(monkeypatch):
-    """与 Web 的 PreferencePayload 同一上限：超过 500 字的值直接拒绝。"""
+    """与 Web PUT 同一序列化上限（10000 字符），文本与 JSON 模式同口径。"""
     store = _WriteStore({})
     monkeypatch.setattr(
         storage, "create_long_term_memory", lambda *args, **kwargs: store
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = cli.run_preference_set_standalone("u1", "memo", "长" * 501)
+        code = cli.run_preference_set_standalone("u1", "memo", "长" * 10001)
     assert code == 1
-    assert "500" in out.getvalue()
+    assert "10000" in out.getvalue()
     assert store.saved == [], "超长偏好值不应落库"
-    # 500 字以内仍可保存
+    # 600 字（旧 500 上限）按 Web 口径可以保存
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = cli.run_preference_set_standalone("u1", "memo", "长" * 500)
-    assert code == 0 and store.saved == [("memo", "长" * 500)]
-    print("✓ pref-set 拒绝超过 500 字的值")
+        code = cli.run_preference_set_standalone("u1", "memo", "长" * 600)
+    assert code == 0 and store.saved == [("memo", "长" * 600)]
+    print("✓ pref-set 统一 10000 字符序列化上限（文本 / JSON 同口径）")
+
+
+def test_pref_set_json_value_rejects_empty_shapes(monkeypatch):
+    """--json-value 的空值（[] / \"\" / 空白串 / {}）不能静默清除偏好。"""
+    store = _WriteStore({"hotel_brands": ["汉庭"]})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for raw in ("[]", '""', '"   "', "{}"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.run_preference_set_standalone(
+                "u1", "hotel_brands", raw, json_value=True, as_json=True
+            )
+        data = json.loads(out.getvalue())
+        assert code == 1 and data["ok"] is False, (raw, data)
+        assert "不能为空" in data["error"], (raw, data)
+    assert store.saved == [], "空值不得落库"
+    print("✓ --json-value 拒绝空值形状")
+
+
+def test_pref_set_json_value_rejects_non_finite(monkeypatch):
+    """1e999 溢出为 Infinity：直接拒绝（不能写非标准 JSON）。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "budget", "1e999", json_value=True, as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and data["ok"] is False, data
+    assert "非有限数" in data["error"], data
+    assert store.saved == []
+    print("✓ --json-value 拒绝 Infinity（1e999）")
+
+
+def test_pref_set_json_value_depth_guard(monkeypatch):
+    """过深嵌套（>16 层）与触发 RecursionError 的输入都结构化报错。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    deep_ok = "[" * 40 + "1" + "]" * 40
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "memo", deep_ok, json_value=True, as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and "嵌套过深" in data["error"], data
+
+    too_deep = "[" * 3000 + "]" * 3000
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "memo", too_deep, json_value=True, as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and data["ok"] is False and "嵌套过深" in data["error"], data
+    assert store.saved == []
+    print("✓ --json-value 嵌套深度护栏（含 RecursionError）")
 
 
 if __name__ == "__main__":
@@ -523,6 +587,9 @@ if __name__ == "__main__":
         test_preferences_dispatch_json_flexible,
         test_pref_set_text_and_json,
         test_pref_set_json_value_types,
+        test_pref_set_json_value_rejects_empty_shapes,
+        test_pref_set_json_value_rejects_non_finite,
+        test_pref_set_json_value_depth_guard,
         test_pref_delete_text_and_json,
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
