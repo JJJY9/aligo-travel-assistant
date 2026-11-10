@@ -27,6 +27,7 @@ from context.short_term_memory import (
     session_key,
 )
 from utils.errors import MemoryPersistenceError
+from utils.log_redact import redact_secret
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,9 @@ def _get_redis_client(url: str):
         return client
     except Exception as exc:  # noqa: BLE001 - 连接失败回退
         _mark_failed(f"redis:{url}")
-        logger.warning("Redis 不可用（%s），短期记忆回退为进程内实现", exc)
+        logger.warning(
+            "Redis 不可用（%s），短期记忆回退为进程内实现", redact_secret(exc)
+        )
         return None
 
 
@@ -149,10 +152,13 @@ def create_long_term_memory(
             return memory
         except Exception as exc:  # noqa: BLE001 - 连接失败回退
             _mark_failed(f"postgres:{dsn}")
-            logger.warning("PostgreSQL 不可用（%s），长期记忆回退为 JSON 文件", exc)
+            logger.warning(
+                "PostgreSQL 不可用（%s），长期记忆回退为 JSON 文件",
+                redact_secret(exc),
+            )
             if strict:
                 raise MemoryPersistenceError(
-                    f"PostgreSQL 不可用：{exc}"
+                    f"PostgreSQL 不可用：{redact_secret(exc)}"
                 ) from exc
     elif dsn and strict:
         raise MemoryPersistenceError(

@@ -904,7 +904,7 @@ class OrchestrationAgent(AgentBase):
                         else:
                             # 覆盖模式：直接保存新值
                             self.memory_manager.long_term.save_preference(pref_type, pref_value)
-                            logger.info(f"Replaced {pref_type}: {pref_value}")
+                            logger.info(f"Replaced preference: {pref_type}")
 
                 # 旧格式兼容：preferences 是字典
                 elif isinstance(preferences_data, dict):
@@ -915,7 +915,7 @@ class OrchestrationAgent(AgentBase):
                             and is_manageable_pref_type(pref_type)
                         ):
                             self.memory_manager.long_term.save_preference(pref_type, value)
-                            logger.info(f"Updated {pref_type}: {value} (legacy format)")
+                            logger.info(f"Updated preference: {pref_type} (legacy format)")
 
             # 如果是行程规划智能体，保存行程到长期记忆
             if agent_name == "itinerary_planning" and isinstance(data, dict):
@@ -958,6 +958,6 @@ class OrchestrationAgent(AgentBase):
                             "purpose": purpose,
                             "session_id": getattr(self.memory_manager, "session_id", None),
                         })
-                        logger.info(f"Saved trip to long-term memory: {origin} -> {destination}")
+                        logger.info("Saved trip to long-term memory")
 
         logger.info("Memory updated after orchestration")
