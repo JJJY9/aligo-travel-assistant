@@ -229,7 +229,7 @@ _413_METRIC_PATTERNS = (
         re.compile(r"^/api/knowledge/documents/\d+$"),
         "/api/knowledge/documents/{doc_id}",
     ),
-    (re.compile(r"^/api/trips/\d+$"), "/api/trips/{trip_id}"),
+    (re.compile(r"^/api/trips/trip_\d+$"), "/api/trips/{trip_id}"),
     (
         re.compile(r"^/api/sessions/[\w-]+/last-turn$"),
         "/api/sessions/{session_id}/last-turn",

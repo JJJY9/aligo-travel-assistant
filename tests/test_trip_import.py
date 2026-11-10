@@ -1007,6 +1007,54 @@ def test_parse_errors_materialization_is_bounded():
     assert len(errors) == 1000
     assert errors.total == 2000
     print("✓ 解析错误列表有界（total 精确）")
+def test_ics_roundtrip_dirty_dates_closed():
+    """end<start / 9999-12-31 的脏日期导出再导入仍按同一身份（不新增重复）。"""
+    from utils.trip_export import render_trips_ics
+    from utils.trip_import import parse_trips_ics, trip_identity
+
+    cases = [
+        {
+            "trip_id": "t1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-01",
+            "purpose": "出差",
+        },
+        {
+            "trip_id": "t2",
+            "origin": "北京",
+            "destination": "广州",
+            "start_date": "9999-12-31",
+            "end_date": "9999-12-31",
+            "purpose": "出差",
+        },
+    ]
+    rows, errors = parse_trips_ics(render_trips_ics(cases, "u1"))
+    assert errors == [], errors
+    by_destination = {row["destination"]: row for row in rows}
+    for case in cases:
+        row = by_destination[case["destination"]]
+        assert trip_identity(row) == trip_identity(case), case
+    print("✓ ICS 脏日期往返身份闭合")
+
+
+def test_ics_roundtrip_linebreak_identity_closed():
+    """字段内 CR / CRLF 导出往返后身份不变（不再重复新增）。"""
+    from utils.trip_export import render_trips_ics
+    from utils.trip_import import parse_trips_ics, trip_identity
+
+    trip = {
+        "trip_id": "t3",
+        "origin": "北京",
+        "destination": "a\rb\r\nc",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-06",
+    }
+    rows, errors = parse_trips_ics(render_trips_ics([trip], "u1"))
+    assert errors == [], errors
+    assert trip_identity(rows[0]) == trip_identity(trip)
+    print("✓ ICS 换行归一后身份闭合")
 
 
 if __name__ == "__main__":
@@ -1053,4 +1101,6 @@ if __name__ == "__main__":
     test_parse_rejects_overlong_fields()
     test_parse_row_cap_fails_fast()
     test_parse_errors_materialization_is_bounded()
+    test_ics_roundtrip_dirty_dates_closed()
+    test_ics_roundtrip_linebreak_identity_closed()
     print("\n全部通过")

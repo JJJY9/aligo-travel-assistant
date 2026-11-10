@@ -54,12 +54,22 @@ def _normalize_header(cell: str) -> str:
     return str(cell or "").strip().lstrip("﻿")
 
 
+def _normalize_trip_text(value: Any) -> str:
+    """行程字段的行分隔符归一（``\r\n`` / ``\r`` → ``\n``）。
+
+    ICS 导出把换行转义成 ``\n`` 再还原成 ``\n``：身份键用原始字符串时，
+    含 CR 的行程回导后被当成新行程（重复新增）；CSV 路径保留 CRLF，两条
+    路径必须同一口径。
+    """
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def trip_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
     """存储层「同路线 + 同起止日期」去重键（返程为空视为与出发同日）。"""
     start = normalize_identity_date(row.get("start_date"))
     return (
-        str(row.get("destination") or ""),
-        str(row.get("origin") or ""),
+        _normalize_trip_text(row.get("destination")),
+        _normalize_trip_text(row.get("origin")),
         start,
         normalize_identity_date(row.get("end_date")) or start,
     )
@@ -338,8 +348,19 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
             match.group("destination").strip()
         )
         purpose = match.group("purpose").strip()
-        # 日期以 DTSTART / DTEND 为准：DESCRIPTION 里的时间段可能被外部日历
-        # 手工编辑过，与实际事件不一致
+        # 日期默认以 DTSTART / DTEND 为准：DESCRIPTION 里的时间段可能被外部
+        # 日历手工编辑过，与实际事件不一致。例外：机器段的 start 与 DTSTART
+        # 一致而 end 与 DTEND 推导结果不同——本工具导出的脏数据（end<start
+        # 被压成单日、9999-12-31 无法 +1 天）会在这里改写结束日，身份变化
+        # 导致重导新增重复行程；以机器段 end 为准才能闭合往返
+        machine_start = normalize_identity_date(match.group("start"))
+        machine_end = normalize_identity_date(match.group("end"))
+        if (
+            machine_start == start_date
+            and machine_end
+            and machine_end != end_date
+        ):
+            end_date = machine_end
     else:
         match = _ICS_SUMMARY.match(summary[:400])
         if match:
