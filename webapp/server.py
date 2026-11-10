@@ -1615,6 +1615,21 @@ def _enforce_import_rate_limit(state: AligoWebApp, request: Request) -> dict[str
     }
 
 
+def _reject_cross_site_side_effect(request: Request) -> None:
+    """带高开销副作用（真实 LLM 调用 / 嵌入推理 / DB 探测 / 上游请求）的
+    伪 GET 接口拒绝浏览器跨站简单请求。
+
+    现代浏览器对 <img>/<link>/<script> 发起的请求会带 ``Sec-Fetch-Site``
+    （同源页面为 same-origin；脚本 / CLI 等非浏览器客户端不带该头）。
+    只拦明确跨站的浏览器来源：写接口的 JSON body 防护覆盖不到「GET 但
+    有副作用」的接口（任意网页可用 <img> 偷跑 doctor / eval / search /
+    weather，消耗 API 额度与 CPU）。
+    """
+    site = (request.headers.get("sec-fetch-site") or "").lower()
+    if site in {"cross-site", "same-site"}:
+        raise HTTPException(status_code=403, detail="跨站请求被拒绝")
+
+
 def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, str]:
     """知识库高开销接口的独立限流（按客户端 IP，与对话额度互不影响）。
 
@@ -2416,6 +2431,7 @@ def create_app(model: Any = None) -> FastAPI:
         city: str = Query(..., min_length=1, max_length=50, pattern=r"^[^\x00-\x1F\x7F]*$"),
     ) -> JSONResponse:
         """目的地天气（Open-Meteo，无 API Key；专用线程池，进程内缓存 10 分钟）。"""
+        _reject_cross_site_side_effect(request)
         name = city.strip()
         if not name:
             raise HTTPException(status_code=422, detail="城市不能为空")
@@ -2511,8 +2527,9 @@ def create_app(model: Any = None) -> FastAPI:
         network: bool = Query(default=False),
     ) -> dict[str, Any]:
         """环境自检（默认不做网络请求；network=true 时检查 LLM 连通性）。"""
-        # network=true 每次都会真实调用一次 LLM：未鉴权的自检接口同样
-        # 需要限流（与知识库高开销接口共用桶）
+        # network=true 每次都会真实调用一次 LLM（离线检查也会探测数据库）：
+        # 未鉴权的自检接口同样需要限流，并拒绝浏览器跨站简单 GET
+        _reject_cross_site_side_effect(request)
         response.headers.update(
             await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
         )
@@ -2592,6 +2609,7 @@ def create_app(model: Any = None) -> FastAPI:
         top_k: int = Query(default=5, ge=1, le=10),
     ) -> dict[str, Any]:
         """语义检索知识片段（向量相似度排序；首次调用会加载嵌入模型）。"""
+        _reject_cross_site_side_effect(request)
         query = q.strip()
         if not query:
             # 纯空白是客户端输入错误，不能被后面的「查询内容为空」映射成 503
@@ -2612,6 +2630,7 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/knowledge/eval")
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
         """离线检索评测：14 个差旅问题计算 hit@1/3/5 与 MRR（不调用大模型）。"""
+        _reject_cross_site_side_effect(request)
         token = state.eval_lock.acquire()
         if token is None:
             raise HTTPException(

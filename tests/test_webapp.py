@@ -1194,6 +1194,22 @@ def test_doctor_detail_redacts_paths_and_tokens():
     assert str(server_module.PROJECT_ROOT) not in cleaned
     assert "<项目>" in cleaned and "llm.example" in cleaned
     print("✓ doctor 详情脱敏（路径 / 凭据 / 查询串）")
+def test_side_effect_get_rejects_cross_site():
+    """带副作用 GET（doctor / search / eval / weather）拒绝浏览器跨站请求。"""
+    client = _client()
+    headers = {"Sec-Fetch-Site": "cross-site"}
+    for path in (
+        "/api/doctor",
+        "/api/knowledge/search?q=test",
+        "/api/knowledge/eval",
+        "/api/weather?city=北京",
+    ):
+        response = client.get(path, headers=headers)
+        assert response.status_code == 403, (path, response.text[:200])
+        assert response.json()["detail"] == "跨站请求被拒绝", path
+    # 非浏览器客户端（脚本 / CLI）不带 Sec-Fetch-Site：不受影响
+    assert client.get("/api/metrics").status_code == 200
+    print("✓ 带副作用 GET 拒绝跨站请求")
 
 
 def test_sessions_listing_and_delete():
