@@ -264,6 +264,28 @@ def test_runner_errors(monkeypatch):
     print("✓ 非法用户 / 文件不存在 / 无有效行均失败退出")
 
 
+def test_runner_rejects_oversized_file_before_read(monkeypatch):
+    """读入前按文件大小拒绝：误选大文件不先占满内存再报错。"""
+    store = _ImportStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    monkeypatch.setattr(cli.os.path, "getsize", lambda path: 26 * 1024 * 1024)
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone(
+            "u-big", "/tmp/whatever.csv", as_json=True
+        )
+    finally:
+        sys.stdout = real_stdout
+    assert code == 1
+    payload = json.loads(captured.getvalue())
+    assert payload["ok"] is False and "过大" in payload["error"]
+    print("✓ 超限文件在读入前拒绝")
+
+
 def test_runner_rejects_gbk_csv(monkeypatch):
     """GBK 编码的 CSV：友好报错（--json 也有结构化输出）。"""
     store = _ImportStore()
@@ -901,9 +923,10 @@ def test_ics_regex_scan_is_bounded():
     rows, errors = parse_trips_ics(text)
     elapsed = time.perf_counter() - started
     assert elapsed < 2.0, f"超长 SUMMARY/DESCRIPTION 解析耗时 {elapsed:.2f}s"
-    assert errors == []
-    assert len(rows) == 1
-    print("✓ ICS 超长 SUMMARY / DESCRIPTION 解析有界")
+    # 超长字段按行跳过（与 Web / CLI 的 100 字上限一致），解析本身仍有界
+    assert rows == []
+    assert any("超过 100 字" in reason for _, reason in errors), errors
+    print("✓ ICS 超长 SUMMARY / DESCRIPTION 解析有界且按行拒绝")
 
 
 def test_import_force_ics_and_purpose_precedence():
@@ -948,6 +971,44 @@ def test_import_rejects_oversized_raw_text(monkeypatch):
     print("✓ 导入原始文本上限")
 
 
+def test_parse_rejects_overlong_fields():
+    """字段超过 100 字按行跳过（与 Web / CLI 写入口径一致）。"""
+    from utils.trip_import import parse_trips_csv
+
+    long_dest = "目" * 101
+    rows, errors = parse_trips_csv(
+        "出发地,目的地,出发日期\n北京,%s,2026-01-05\n上海,%s,2026-01-06\n"
+        % (long_dest, "目" * 100)
+    )
+    assert [row["destination"] for row in rows] == ["目" * 100]
+    assert any("字段 destination 超过 100 字" in reason for _, reason in errors)
+    print("✓ 超长字段按行跳过（100 字边界保留）")
+
+
+def test_parse_row_cap_fails_fast():
+    """超过 5000 行的文件在解析阶段就报错（不先物化全部行 / 错误）。"""
+    from utils.trip_import import parse_trips_csv
+
+    body = "出发地,目的地,出发日期\n" + "".join(
+        f"北京,城市{i},2026-01-05\n" for i in range(5001)
+    )
+    with pytest.raises(ValueError, match="单次最多导入 5000 条"):
+        parse_trips_csv(body)
+    print("✓ 超 5000 行在解析阶段快速失败")
+
+
+def test_parse_errors_materialization_is_bounded():
+    """大量坏行的错误列表有界：只物化前 1000 条，total 精确计数。"""
+    from utils.trip_import import parse_trips_csv
+
+    body = "出发地,目的地,出发日期\n" + "北京,,2026-01-05\n" * 2000
+    rows, errors = parse_trips_csv(body)
+    assert rows == []
+    assert len(errors) == 1000
+    assert errors.total == 2000
+    print("✓ 解析错误列表有界（total 精确）")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -978,6 +1039,7 @@ if __name__ == "__main__":
         test_runner_dry_run_preview,
         test_runner_json_output_and_skipped,
         test_runner_errors,
+        test_runner_rejects_oversized_file_before_read,
         test_runner_rejects_gbk_csv,
         test_runner_imports_ics_and_dedupes,
         test_runner_dispatch_ics,
@@ -988,4 +1050,7 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+    test_parse_rejects_overlong_fields()
+    test_parse_row_cap_fails_fast()
+    test_parse_errors_materialization_is_bounded()
     print("\n全部通过")

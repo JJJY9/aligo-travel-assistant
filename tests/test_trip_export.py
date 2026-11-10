@@ -189,7 +189,11 @@ def test_render_trips_html():
 
 
 def test_many_leading_quotes_do_not_recurse():
-    """上千个前导单引号不能触发 RecursionError（导入 / 导出共用该判定）。"""
+    """上千个前导单引号不能触发 RecursionError（导入 / 导出共用该判定）。
+
+    超长字段在新口径下按行跳过（100 字上限）：关键是解析有界返回，
+    不能抛 RecursionError / 崩溃。
+    """
     from utils.trip_import import parse_trips_csv
 
     tricky = "'" * 1200 + "=1+1"
@@ -203,9 +207,9 @@ def test_many_leading_quotes_do_not_recurse():
         ]
     )
     rows, errors = parse_trips_csv(text)
-    assert errors == []
-    assert rows[0]["destination"] == tricky, "往返必须保真"
-    print("✓ 超多前导单引号不再递归溢出")
+    assert rows == []
+    assert any("超过 100 字" in reason for _, reason in errors), errors
+    print("✓ 超多前导单引号不再递归溢出（超长行按行拒绝）")
 
 
 def test_trips_html_normalizes_unpadded_dates():
