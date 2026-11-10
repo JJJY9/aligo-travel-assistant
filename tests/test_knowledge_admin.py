@@ -249,6 +249,72 @@ def test_add_update_reject_overlong_metadata(monkeypatch):
     with pytest.raises(ValueError, match="元数据值不能超过 200 字"):
         knowledge_admin.update_document(7, "内容", {"category": "长" * 201})
     print("✓ 超长元数据键值在新增 / 更新时直接拒绝")
+def test_update_document_skips_unchanged_save(monkeypatch):
+    """原样保存（内容与回填一致、元数据未变）不重切、不写入。"""
+    from pathlib import Path
+
+    rows = [{"id": 7, "content": "旧内容", "metadata": '{"category": "住宿"}'}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _NoWriteAgent:
+        def update_document(self, *args, **kwargs):
+            raise AssertionError("原样保存不应写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _NoWriteAgent())
+    result = knowledge_admin.update_document(7, "旧内容", {"category": "住宿"})
+    assert result == {"status": "success", "id": 7, "unchanged": True}
+    print("✓ 原样保存 no-op（不重切不写入）")
+
+    # 只改元数据：照常走更新
+    class _UpdateAgent:
+        def __init__(self):
+            self.calls = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.calls.append((doc_id, content, metadata))
+            return {"status": "success", "id": doc_id}
+
+    agent = _UpdateAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.update_document(7, "旧内容", {"category": "交通"})
+    assert result["status"] == "success" and result.get("id") == 7
+    assert agent.calls, "元数据变更必须真正更新"
+    print("✓ 元数据变更仍正常更新")
+
+
+def test_update_document_skips_unchanged_group_save(monkeypatch):
+    """整份编辑原样保存（多分片拼接一致）同样 no-op。"""
+    from pathlib import Path
+
+    rows = [
+        {
+            "id": 7,
+            "content": "前半",
+            "metadata": '{"group": "g-noop", "part": "1", "parts": "2", "category": "交通"}',
+        },
+        {
+            "id": 8,
+            "content": "后半",
+            "metadata": '{"group": "g-noop", "part": "2", "parts": "2", "category": "交通"}',
+        },
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _NoWriteAgent:
+        def update_document(self, *args, **kwargs):
+            raise AssertionError("原样保存不应写入")
+
+        def add_documents(self, *args, **kwargs):
+            raise AssertionError("原样保存不应写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _NoWriteAgent())
+    result = knowledge_admin.update_document(7, "前半后半", {"category": "交通"})
+    assert result == {"status": "success", "id": 7, "unchanged": True}, result
+    print("✓ 多分片整份原样保存同样 no-op")
 
 
 def test_delete_document_checks_existence(monkeypatch):
@@ -2644,6 +2710,8 @@ if __name__ == "__main__":
         test_find_duplicate_contents,
         test_delete_document_whole_group,
         test_update_document_error_propagates,
+        test_update_document_skips_unchanged_save,
+        test_update_document_skips_unchanged_group_save,
         test_delete_document_checks_existence,
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,
