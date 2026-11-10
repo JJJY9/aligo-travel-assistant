@@ -16,6 +16,7 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 import json
+import math
 
 # 轻量组件直接导入；运行时组件（agentscope / rich / 模型）单独保护：
 # doctor / skills 等诊断命令必须在这些依赖缺失时仍能启动并如实报告缺失项
@@ -5071,6 +5072,27 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
     return 0
 
 
+def _pref_value_problem(value: Any, depth: int = 0) -> str | None:
+    """CLI 偏好值的形状门禁：空值 / 非有限数 / 过深嵌套（与 Web PUT 对齐）。"""
+    if depth > 16:
+        return "偏好值嵌套过深（超过 16 层）"
+    if not has_preference_value(value):
+        return "偏好值不能为空（清空请使用 pref-delete）"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "偏好值不能包含 NaN / Infinity（非有限数）"
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            problem = _pref_value_problem(item, depth + 1)
+            if problem:
+                return problem
+    elif isinstance(value, dict):
+        for item in value.values():
+            problem = _pref_value_problem(item, depth + 1)
+            if problem:
+                return problem
+    return None
+
+
 def run_preference_set_standalone(
     user_id: str,
     pref_type: str,
@@ -5112,30 +5134,33 @@ def run_preference_set_standalone(
     if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
     saved_value: Any = value.strip()
-    if not saved_value:
-        return _fail("偏好值不能为空")
-    # 与 Web 的 PreferencePayload 同一上限（单值 500 字）：超长值落库后
-    # 面板保存任何修改都会对该记录 422
-    if not json_value and len(saved_value) > 500:
-        return _fail(f"偏好值不能超过 500 字（当前 {len(saved_value)} 字）")
+    if not has_preference_value(saved_value):
+        return _fail("偏好值不能为空（清空请使用 pref-delete）")
     if json_value:
         from utils.json_parser import reject_json_constant
 
         try:
             parsed = json.loads(value, parse_constant=reject_json_constant)
+        except RecursionError:
+            return _fail("偏好值嵌套过深")
         except (json.JSONDecodeError, ValueError) as exc:
             return _fail(f"--json-value 需要合法的 JSON 值：{exc}")
-        if parsed is None:
-            return _fail("偏好值不能为空")
-        serialized = json.dumps(parsed, ensure_ascii=False)
-        # 与 Web PUT /api/preferences 同一序列化上限
-        if len(serialized) > 10000:
-            return _fail("偏好值过大（序列化后超过 10000 字符）")
-        try:
-            serialized.encode("utf-8")
-        except UnicodeEncodeError:
-            return _fail("偏好值包含无法编码的字符（孤立代理项）")
+        problem = _pref_value_problem(parsed)
+        if problem:
+            return _fail(problem)
         saved_value = parsed
+    # 与 Web PUT /api/preferences 同一序列化上限（10000 字符）：文本模式
+    # 同样按序列化长度判断，--json-value 不能成为绕过通道
+    try:
+        serialized = json.dumps(saved_value, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        return _fail(f"偏好值无法序列化：{exc}")
+    if len(serialized) > 10000:
+        return _fail("偏好值过大（序列化后超过 10000 字符）")
+    try:
+        serialized.encode("utf-8")
+    except UnicodeEncodeError:
+        return _fail("偏好值包含无法编码的字符（孤立代理项）")
 
     try:
         store = _open_cli_store(user_id)
