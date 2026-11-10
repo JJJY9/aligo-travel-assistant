@@ -64,6 +64,8 @@ from utils.console import configure_stdio
 from utils.doctor import run_doctor
 from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
+    METADATA_KEY_MAX_CHARS,
+    METADATA_VALUE_MAX_CHARS,
     add_document,
     cleanup_duplicate_contents,
     delete_document,
@@ -523,8 +525,8 @@ class ChatRequest(BaseModel):
 _PREFERENCE_VALUE_MAX_JSON = 10000
 
 
-_KnowledgeMetaKey = Annotated[str, Field(max_length=32)]
-_KnowledgeMetaValue = Annotated[str, Field(max_length=200)]
+_KnowledgeMetaKey = Annotated[str, Field(max_length=METADATA_KEY_MAX_CHARS)]
+_KnowledgeMetaValue = Annotated[str, Field(max_length=METADATA_VALUE_MAX_CHARS)]
 
 
 class KnowledgeDocumentPayload(BaseModel):
@@ -2476,7 +2478,7 @@ def create_app(model: Any = None) -> FastAPI:
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
-        category: str = Query(default="", max_length=200),
+        category: str = Query(default="", max_length=METADATA_VALUE_MAX_CHARS),
     ) -> dict[str, Any]:
         """列出知识片段（记忆面板的知识库维护）。
 
