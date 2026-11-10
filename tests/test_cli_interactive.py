@@ -588,6 +588,53 @@ def test_external_cancel_propagates_out_of_repl(monkeypatch):
     print("✓ 关闭阶段的主任务取消继续向上抛（不再卡住退出）")
 
 
+def test_sigint_at_user_id_prompt_exits_cleanly(monkeypatch):
+    """用户ID 提示符处按 Ctrl-C：立即干净退出，不把取消挂到主任务上。"""
+    import signal as signal_module
+    import time as time_module
+
+    def fake_ask(prompt, **kwargs):
+        signal_module.raise_signal(signal_module.SIGINT)
+        time_module.sleep(0.05)  # 信号检查在这里派发处理器
+        return "never_used"  # 处理器应已打断 input，不会走到这里
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+    monkeypatch.setattr(cli.Prompt, "ask", fake_ask)
+    with pytest.raises(SystemExit) as excinfo:
+        asyncio.run(agent.run())
+    assert excinfo.value.code == 130
+    assert "已取消，退出" in buffer.getvalue()
+    assert agent._interrupt["at_prompt"] is False
+    print("✓ 用户ID 提示符 Ctrl-C 干净退出")
+
+
+def test_sigint_during_initialization_does_not_poison_first_command(monkeypatch):
+    """初始化期间按 Ctrl-C：不进入 REPL，第一条命令不被悬挂的取消吞掉。"""
+    import signal as signal_module
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+
+    async def fake_init():
+        # 同步初始化期间按 Ctrl-C：处理器只能取消主任务，取消在下一个
+        # await 才送达——run() 必须在进入 REPL 前消化掉
+        signal_module.raise_signal(signal_module.SIGINT)
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+
+    def fail_ask(prompt, **kwargs):
+        raise AssertionError("初始化被取消后不应进入 REPL")
+
+    monkeypatch.setattr(cli.Prompt, "ask", fail_ask)
+    asyncio.run(agent.run())
+    assert "已取消，退出" in buffer.getvalue()
+    print("✓ 初始化期间 Ctrl-C 不再毒化第一条命令")
+
+
 def test_preference_display_tolerates_unhashable_type():
     """偏好 type 为对象 / 数组时跳过（与落库路径一致），整轮不能崩。"""
     agent, buffer = _capture_console()
@@ -668,6 +715,8 @@ if __name__ == "__main__":
         test_prompt_sigint_does_not_cancel_next_command(_mp)
         test_user_sigint_during_query_returns_to_prompt(_mp)
         test_external_cancel_propagates_out_of_repl(_mp)
+        test_sigint_at_user_id_prompt_exits_cleanly(_mp)
+        test_sigint_during_initialization_does_not_poison_first_command(_mp)
         test_preference_display_tolerates_unhashable_type()
         test_closed_stdout_pipe_does_not_traceback()
     finally:

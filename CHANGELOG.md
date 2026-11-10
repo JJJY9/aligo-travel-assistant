@@ -40,6 +40,7 @@
 ### 修复
 - doctor 凭据遮蔽覆盖更多粘贴形态：缺 scheme 的 `user:pass@host`、只有密码的 `redis://:pass@`、`password=` 关键字与 URL 查询串（psycopg 报错回显的完整连接串不再带出密码）；`LLM_API_KEY` 为纯空白时如实报告密钥来自 config_local.py；doctor / weather 的 `--JSON` / `--offline` 大小写与其它命令一致
 - RAG 自检不再假绿：全新 CLI 进程未加载嵌入模型时，doctor 按模型目录 `1_Pooling/config.json` 配置推断维度（新增 `configured_model_dimension`，不加载 torch）并与集合维度比对，换模型后直接提示重新初始化；ask-question 技能在技能目录位于仓库外（`ALIGO_SKILLS_DIR`）时不再因 `parents[4]` 越界报错，改用 config 模块目录 / 当前目录兜底
+- 交互式 CLI 启动阶段 Ctrl-C 不再「毒化」第一条命令：SIGINT 处理器提前到初始化之前安装，用户ID 提示符处按 Ctrl-C 立即干净退出（退出码 130）；初始化过程中按 Ctrl-C 由进入 REPL 前的检查点消化并退出——此前 asyncio 默认处理器把取消挂在主任务上，提示符照常继续读输入，进入 REPL 后第一条命令的第一个 await 才收到取消（命令被静默吞掉、进程带着 traceback 退出）
 - Web 安全面收敛：/api/knowledge 不返回本机绝对路径、接入知识库限流并在导入持写锁时快速返回「正在写入」（不再把请求线程堆在写锁上打满线程池）；/api/doctor 详情脱敏（项目路径替换为 <项目>、上游 URL 去掉凭据与查询串）；存储 / 依赖类 503 统一为「…，请稍后再试」，异常细节只进日志
 - 日志脱敏：存储层失败日志与 strict 错误文本统一去掉 DSN / URL 的 userinfo 与查询串（新增 utils/log_redact；psycopg 异常的完整连接串不再进入日志 / 503 详情）；偏好值与会话标题不再写入 INFO 日志（只记类型 / 长度）
 - 带高开销副作用的伪 GET 接口（/api/doctor 含网络探测与 LLM 调用、知识库 search / eval、weather）拒绝浏览器跨站简单请求（Sec-Fetch-Site: cross-site/same-site → 403）——任意网页不再能用 <img> 偷跑这些接口消耗 API 额度与 CPU；脚本 / CLI 等无该头的客户端不受影响

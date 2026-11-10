@@ -69,6 +69,10 @@ class AligoCLI:
         self.model = None
         self._agent_cache = {}  # 智能体缓存
         self.circuit_breaker = None  # 在 initialize_system 中从 RESILIENCE_CONFIG 初始化
+        # SIGINT 来源标记（run() 的处理器读写）：count 连按计数、user 是否由
+        # 用户 Ctrl-C 发起、at_prompt 是否停在同步 input 上。初始化阶段也要
+        # 用（用户ID 提示符），所以放在实例上而不是 run() 的局部变量。
+        self._interrupt = {"count": 0, "user": False, "at_prompt": False}
 
     def print_banner(self):
         """打印欢迎横幅"""
@@ -103,10 +107,21 @@ class AligoCLI:
 
         while True:
             try:
-                value = (
-                    Prompt.ask("用户ID", default="default_user").strip()
-                    or "default_user"
-                )
+                self._interrupt["at_prompt"] = True
+                try:
+                    value = (
+                        Prompt.ask("用户ID", default="default_user").strip()
+                        or "default_user"
+                    )
+                finally:
+                    self._interrupt["at_prompt"] = False
+            except KeyboardInterrupt:
+                # 启动提示符处按 Ctrl-C：立即干净退出。若不在这里接管，
+                # asyncio 默认处理器只把取消挂在主任务上，输入照常继续，
+                # 进入 REPL 后第一条命令的第一个 await 才收到取消（命令
+                # 被静默吞掉，进程退出）
+                self.console.print("\n已取消，退出", style="dim")
+                raise SystemExit(130) from None
             except EOFError:
                 # 管道 / IDE 运行到末尾：退出而不是抛出 traceback 后死循环
                 print()
@@ -1091,16 +1106,18 @@ class AligoCLI:
         # 打印横幅
         self.print_banner()
 
-        # 初始化系统
-        await self.initialize_system()
-
-        # 自己接管 SIGINT：asyncio.run 的默认处理器只取消主任务，而「提示符
-        # 下按的 Ctrl-C」这个取消要等到下一条命令的第一个 await 才送达，会
-        # 把刚输入的命令静默取消；关闭阶段（Runner.close）对主任务的取消也
-        # 会被 REPL 当成用户中断吞掉，进程卡在提示符不退出。这里记录取消
-        # 来源：用户 Ctrl-C 才回提示符，关闭取消继续向上抛。
+        # 自己接管 SIGINT（必须在初始化之前安装）：asyncio.run 的默认
+        # 处理器只取消主任务，而「提示符下按的 Ctrl-C」这个取消要等到下
+        # 一条命令的第一个 await 才送达，会把刚输入的命令静默取消；关闭
+        # 阶段（Runner.close）对主任务的取消也会被 REPL 当成用户中断吞掉，
+        # 进程卡在提示符不退出。初始化阶段同理：用户ID 提示符处按 Ctrl-C
+        # 若不接管，取消会一直挂到进入 REPL 后毒化第一条命令。这里记录取消
+        # 来源：用户 Ctrl-C 才回提示符 / 干净退出，关闭取消继续向上抛。
         main_task = asyncio.current_task()
-        interrupt = {"count": 0, "user": False, "at_prompt": False}
+        interrupt = self._interrupt
+        interrupt["count"] = 0
+        interrupt["user"] = False
+        interrupt["at_prompt"] = False
 
         def _on_sigint(signum, frame):
             if main_task is None or main_task.done():
@@ -1141,7 +1158,29 @@ class AligoCLI:
                 while task.cancelling():
                     task.uncancel()
 
+        def _abort_startup(message: str) -> None:
+            interrupt["user"] = False
+            interrupt["count"] = 0
+            _clear_pending_cancel()
+            self.console.print(message, style="dim")
+
         try:
+            # 初始化系统。用户ID 提示符在 _prompt_user_id 里由处理器直接
+            # 打断并退出；初始化其余部分是同步代码，期间按 Ctrl-C 只会取消
+            # 主任务，取消要到下面的检查点才送达——必须在进入 REPL 前消化
+            # 掉，否则会取消刚输入的第一条命令。
+            try:
+                await self.initialize_system()
+                await asyncio.sleep(0)  # 取消派发检查点
+            except KeyboardInterrupt:
+                _abort_startup("\n已取消，退出")
+                return
+            except asyncio.CancelledError:
+                if not interrupt["user"]:
+                    raise
+                _abort_startup("\n已取消，退出")
+                return
+
             # 主循环
             while True:
                 try:
