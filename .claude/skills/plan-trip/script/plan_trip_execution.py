@@ -17,7 +17,6 @@ if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
 
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
 
 import config
 
@@ -28,6 +27,7 @@ from agents.orchestration_agent import OrchestrationAgent
 
 LLM_CONFIG = config.LLM_CONFIG
 init_agentscope = config_agentscope.init_agentscope
+create_chat_model = config_agentscope.create_chat_model
 
 # Import agents
 import importlib.util
@@ -51,6 +51,28 @@ def load_agent_module(skill_name, agent_class_name):
     return getattr(module, agent_class_name)
 
 
+def _extract_itinerary(result_data):
+    """从编排结果中提取成功的行程（不依赖聚合状态）。
+
+    ``partial_failure`` 时行程本身仍可能成功——例如调度里出现未注册技能、
+    或信息查询类子任务失败；整体降级不能把已经拿到的行程一并丢掉。
+    """
+    if not isinstance(result_data, dict):
+        return None
+    results = result_data.get("results")
+    if not isinstance(results, list):
+        return None
+    for agent_result in results:
+        if not isinstance(agent_result, dict):
+            continue
+        if agent_result.get("agent_name") != "itinerary_planning":
+            continue
+        data = agent_result.get("data")
+        if isinstance(data, dict) and data.get("itinerary"):
+            return data
+    return None
+
+
 async def plan_trip(user_query: str):
     """
     行程规划主流程
@@ -64,14 +86,10 @@ async def plan_trip(user_query: str):
     # 初始化 AgentScope
     init_agentscope()
 
-    # 创建模型
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 8192),
-    )
+    # 创建模型：与 Web / CLI 共用同一工厂（stream=False + generate_kwargs）。
+    # 直接构造 OpenAIChatModel 默认走流式，当前依赖组合下首个流块即崩；
+    # temperature / max_tokens 作为构造顶层参数也会被静默忽略
+    model = create_chat_model()
 
     print("✓ 模型初始化完成")
 
@@ -131,15 +149,8 @@ async def plan_trip(user_query: str):
 
     print("✓ 行程规划完成")
 
-    # 4. 提取并返回行程规划
-    if result_data.get("status") == "completed":
-        # 从结果中提取行程规划
-        for agent_result in result_data.get("results", []):
-            if agent_result.get("agent_name") == "itinerary_planning":
-                itinerary_data = agent_result.get("data", {})
-                return itinerary_data
-
-    return result_data
+    extracted = _extract_itinerary(result_data)
+    return extracted if extracted is not None else result_data
 
 
 async def main():
@@ -159,10 +170,12 @@ async def main():
         print("=" * 60)
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
-        # 格式化输出行程
-        if "itinerary" in result:
-            itinerary = result["itinerary"]
-            print("\n" + "=" * 60)
+        # 格式化输出行程（模型可能返回非标准形状：逐层做类型防御，
+        # 不能让展示逻辑的 KeyError / TypeError 把成功结果报成「规划失败」）
+        itinerary = result.get("itinerary")
+        if isinstance(itinerary, dict):
+            print()
+            print("=" * 60)
             print(f"【{itinerary.get('title', '行程规划')}】")
             print("=" * 60)
             print(f"总行程: {itinerary.get('duration', 'N/A')}")
@@ -170,12 +183,29 @@ async def main():
             print()
 
             # 每日行程
-            for day_plan in itinerary.get("daily_plans", []):
-                print(f"Day {day_plan['day']} - {day_plan.get('date', 'N/A')} ({day_plan.get('city', 'N/A')})")
+            daily_plans = itinerary.get("daily_plans") or []
+            if isinstance(daily_plans, dict):
+                daily_plans = list(daily_plans.values())
+            if not isinstance(daily_plans, list):
+                daily_plans = []
+            for day_plan in daily_plans:
+                if not isinstance(day_plan, dict):
+                    continue
+                print(
+                    f"Day {day_plan.get('day', '?')} - {day_plan.get('date', 'N/A')} "
+                    f"({day_plan.get('city', 'N/A')})"
+                )
                 print(f"主题: {day_plan.get('theme', 'N/A')}")
                 print()
 
-                for activity in day_plan.get("activities", []):
+                activities = day_plan.get("activities") or []
+                if isinstance(activities, dict):
+                    activities = list(activities.values())
+                if not isinstance(activities, list):
+                    activities = []
+                for activity in activities:
+                    if not isinstance(activity, dict):
+                        continue
                     print(f"  [{activity.get('time', 'N/A')}] {activity.get('location', 'N/A')}")
                     print(f"  {activity.get('description', 'N/A')}")
                     if activity.get("transport"):
@@ -183,7 +213,8 @@ async def main():
                     print()
 
                 # 用餐信息
-                meals = day_plan.get("meals", {})
+                meals = day_plan.get("meals")
+                meals = meals if isinstance(meals, dict) else {}
                 if meals:
                     print("  用餐:")
                     if meals.get("lunch"):
@@ -193,7 +224,11 @@ async def main():
                     print()
 
             # 注意事项
-            notes = itinerary.get("notes", [])
+            notes = itinerary.get("notes") or []
+            if isinstance(notes, str):
+                notes = [notes]
+            if not isinstance(notes, list):
+                notes = []
             if notes:
                 print("注意事项:")
                 for note in notes:
