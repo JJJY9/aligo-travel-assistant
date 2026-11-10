@@ -4572,6 +4572,13 @@ def test_content_length_413_metric_labels():
         by_path = REQUEST_METRICS.snapshot()["by_path"]
         assert "/api/chat" in by_path, by_path
         assert "__unmatched__" in by_path, by_path
+        from webapp.server import _metric_path_before_route
+
+        assert (
+            _metric_path_before_route("/api/trips/trip_1")
+            == "/api/trips/{trip_id}"
+        )
+        assert _metric_path_before_route("/api/trips/123") == "__unmatched__"
         print("✓ Content-Length 413 指标标签按接口归一")
     finally:
         REQUEST_METRICS.reset()
