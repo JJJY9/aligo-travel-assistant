@@ -1788,6 +1788,43 @@ def test_import_dry_run_reports_skip_reasons(monkeypatch):
     print("✓ 导入预览区分已存在 / 无效的跳过原因")
 
 
+def test_import_skips_unencodable_content_and_metadata(monkeypatch):
+    """孤立代理项（内容 / 元数据键值）按无效项跳过，预览与正式导入结论一致。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    lonely = chr(0xD800)
+    documents = [
+        {"content": "正常内容", "metadata": {}},
+        {"content": f"坏内容{lonely}", "metadata": {}},
+        {"content": "元数据坏值", "metadata": {"title": f"标题{lonely}"}},
+        {"content": "正常二", "metadata": {f"键{lonely}": "值"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 1, result
+    assert result["skipped_invalid"] == 3, result
+    print("✓ 孤立代理项（内容 / 元数据键值）按无效项跳过")
+
+    # 组内成员不可编码：整组跳过（只剔除该成员会让分组校验看到缺片，
+    # 把整份备份按「不完整组」处理）
+    grouped = [
+        {
+            "content": "组片一",
+            "metadata": {"group": "g-enc", "part": "1", "parts": "2"},
+        },
+        {
+            "content": f"组片二{lonely}",
+            "metadata": {"group": "g-enc", "part": "2", "parts": "2"},
+        },
+        {"content": "独占文档", "metadata": {}},
+    ]
+    result = knowledge_admin.import_documents(grouped, dry_run=True)
+    assert result["would_import"] == 1, result
+    assert result["skipped_invalid"] == 2, result
+    print("✓ 组内不可编码成员整组跳过")
+
+
 def test_import_skips_incomplete_group_but_keeps_rest(monkeypatch):
     """残缺分片组整组跳过并报告；其它合法文档照常导入（坏组不拖垮整份备份）。"""
     from pathlib import Path
@@ -2525,6 +2562,7 @@ if __name__ == "__main__":
         test_list_and_export_hold_write_lock,
         test_update_group_leftover_reported_when_delete_fails,
         test_import_skips_incomplete_group_but_keeps_rest,
+        test_import_skips_unencodable_content_and_metadata,
         test_import_detects_occupied_part_hidden_by_identical_content,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,

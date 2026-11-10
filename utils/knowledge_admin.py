@@ -928,6 +928,29 @@ def _existing_group_layout() -> dict[str, list[tuple[str, int, int]]]:
     return layout
 
 
+def _encoding_problem(value: str) -> str | None:
+    """文本能否按 UTF-8 编码：孤立代理项（``"\\ud800"``）能通过 JSON 解析，
+    但嵌入模型 / Milvus 序列化阶段会抛 UnicodeEncodeError，让整批导入失败。"""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "包含无法编码的字符（孤立代理项）"
+    return None
+
+
+def _metadata_encoding_problem(metadata: Any) -> str | None:
+    """元数据键 / 字符串值同样参与序列化：任意一项不可编码即整条无效。"""
+    if not isinstance(metadata, dict):
+        return None
+    for meta_key, meta_value in metadata.items():
+        for candidate in (meta_key, meta_value):
+            if isinstance(candidate, str):
+                problem = _encoding_problem(candidate)
+                if problem:
+                    return f"元数据{problem}"
+    return None
+
+
 def import_documents(
     documents: list[dict[str, Any]], dry_run: bool = False
 ) -> dict[str, Any]:
@@ -958,13 +981,24 @@ def import_documents(
             invalid += 1
             continue
         raw_content = item.get("content")
+        meta = item.get("metadata")
+        group = str(meta.get("group") or "") if isinstance(meta, dict) else ""
         # 只接受字符串内容：JSON null / false / 0 不能变成 "None" / "False" / "0"
         if not isinstance(raw_content, str) or not raw_content.strip():
-            meta = item.get("metadata")
-            group = str(meta.get("group") or "") if isinstance(meta, dict) else ""
             if group:
                 invalid_groups.add(group)
             invalid += 1
+            continue
+        # 内容 / 元数据必须能按 UTF-8 编码：孤立代理项能通过 JSON 解析与
+        # 预览（dry-run 不编码），但正式导入在嵌入 / 序列化阶段整批失败
+        # （503，且预览与导入结论相反）。单条坏数据不该让整批导入失败，
+        # 这里与空内容同一口径按无效项跳过（组内成员整组跳过）。
+        problem = _encoding_problem(raw_content) or _metadata_encoding_problem(meta)
+        if problem:
+            if group:
+                invalid_groups.add(group)
+            invalid += 1
+            logger.warning("导入内容%s，已跳过", problem)
             continue
         # 还原标记是内部记账字段：用户 JSON 自带同名键时一律剥离，
         # 否则可以伪造标记绕过单条 / 文档大小上限
