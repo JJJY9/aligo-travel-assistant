@@ -1004,7 +1004,22 @@ def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
         json={"user_id": user_id, "purpose": "出差"},
     )
     assert response.status_code == 503, response.text
-    print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑；行程新增/编辑同样 503")
+
+    # 偏好与会话元数据写入同样不能作用在回退 JSON 上（恢复后偏好消失、
+    # 标题/置顶/归档被写到看不到的库）
+    response = client.put(
+        "/api/preferences/home_location",
+        json={"user_id": user_id, "value": "北京"},
+    )
+    assert response.status_code == 503, response.text
+    for path, payload in (
+        ("/api/sessions/s-cool/title", {"user_id": user_id, "title": "标题"}),
+        ("/api/sessions/s-cool/pin", {"user_id": user_id, "pinned": True}),
+        ("/api/sessions/s-cool/archive", {"user_id": user_id, "archived": True}),
+    ):
+        response = client.put(path, json=payload)
+        assert response.status_code == 503, (path, response.text)
+    print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑；行程/偏好/会话元数据写入同样 503")
 
 
 def test_sessions_listing_and_delete():
