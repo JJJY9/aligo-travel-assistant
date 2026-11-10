@@ -91,7 +91,28 @@ def test_health_endpoint():
     assert data["sessions"]["max"] == 50, "健康信息要能看到并发会话上限"
     assert data["skills"]["count"] >= 6
     assert data["skills"]["dir_found"] is True
+    assert data["skills"]["ok"] is True
     print("✓ /api/health 返回版本 / 模型 / 存储后端")
+
+
+def test_health_degraded_when_skills_missing(monkeypatch):
+    """/api/health 与 doctor 同口径：技能目录不可用时 status 必须 degraded。"""
+    from pathlib import Path
+
+    from webapp import server as server_module
+
+    client = _client()
+    monkeypatch.setattr(
+        server_module,
+        "resolve_skills_root",
+        lambda: Path("definitely-missing-skills-dir"),
+    )
+    data = client.get("/api/health").json()
+    assert data["status"] == "degraded"
+    assert data["skills"]["ok"] is False
+    assert data["skills"]["count"] == 0
+    assert data["skills"]["dir_found"] is False
+    print("✓ 技能缺失时 health 标记 degraded")
 
 
 def test_health_marks_configured_redis_fallback_degraded(monkeypatch):
@@ -9073,6 +9094,7 @@ if __name__ == "__main__":
         test_session_build_slots_bound_concurrent_connections,
         test_lock_for_overflow_waiters,
         test_health_reports_degraded_when_breaker_open,
+        test_health_degraded_when_skills_missing,
         test_sse_error_increments_metrics,
         test_circuit_breaker_probe_owner_is_async_task,
         test_half_open_failure_freezes_failure_count,

@@ -815,6 +815,38 @@ def test_default_model_dir_falls_back(monkeypatch):
     print("✓ 默认嵌入模型目录回退")
 
 
+def test_skills_check_warns_on_broken_skill_md(monkeypatch):
+    """SKILL.md 缺失 / frontmatter 无效的技能会从意图提示消失：doctor 要警告。"""
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def add_skill(name, skill_md):
+            script_dir = root / name / "script"
+            script_dir.mkdir(parents=True)
+            (script_dir / "agent.py").write_text("x", encoding="utf-8")
+            if skill_md is not None:
+                (root / name / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+        add_skill("good", "---\nname: good\ndescription: d\n---\n")
+        add_skill("missing", None)
+        add_skill("empty", "---\n---\n")
+        add_skill("badyaml", "---\nname: [\n---\n")
+        # 只有 name 的 frontmatter 在 SkillLoader 里仍可加载（按目录名展示），
+        # 不应被误报
+        add_skill("nameonly", "---\nname: nameonly\n---\n")
+        monkeypatch.setattr(skill_paths, "resolve_skills_root", lambda: root)
+        result = check_skills()
+    assert result.status == STATUS_WARN, result
+    assert "missing（缺少 SKILL.md）" in result.detail, result.detail
+    assert "empty（SKILL.md frontmatter 为空）" in result.detail, result.detail
+    assert "badyaml（SKILL.md frontmatter 不是合法 YAML）" in result.detail, result.detail
+    assert "good" not in result.detail
+    assert "nameonly" not in result.detail
+    print("✓ 技能 SKILL.md 校验（缺失 / 空 / 非法 frontmatter）")
+
+
 if __name__ == "__main__":
     test_python_ok()
     test_model_files_missing_dir()
@@ -834,6 +866,7 @@ if __name__ == "__main__":
         test_knowledge_base_dimension_mismatch_warns,
         test_configured_model_dimension_reads_pooling_config,
         test_knowledge_base_config_dimension_mismatch_warns,
+        test_skills_check_warns_on_broken_skill_md,
         test_storage_probe_sets_statement_timeout,
         test_llm_connectivity_branches,
         test_python_version_below_requirement,
