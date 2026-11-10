@@ -57,10 +57,17 @@ class LazyAgentRegistry:
             "event_collection": "event-collection"
         }
 
+    def _say(self, text: str) -> None:
+        """装饰性输出：控制台编码不兼容 / 输出流异常时忽略，绝不能因此让技能加载失败。"""
+        try:
+            self.console.print(text)
+        except Exception:  # noqa: BLE001 - 日志输出不参与加载语义
+            pass
+
     def _discover_skills(self):
         """扫描 .claude/skills 目录寻找可用的 Agent"""
         if not self.skills_root.exists():
-            self.console.print(f"[yellow]Warning: Skills directory {self.skills_root} not found[/yellow]")
+            self._say(f"[yellow]Warning: Skills directory {self.skills_root} not found[/yellow]")
             return
 
         self._skill_map.update(skill_scripts(self.skills_root))
@@ -77,7 +84,7 @@ class LazyAgentRegistry:
                 if isinstance(name, str) and name and name != directory:
                     self._name_aliases[name] = directory
         except Exception as exc:  # noqa: BLE001 - 别名只是加分项，失败不影响发现
-            self.console.print(f"[dim]读取技能 frontmatter 名称失败: {exc}[/dim]")
+            self._say(f"[dim]读取技能 frontmatter 名称失败: {exc}[/dim]")
 
     def _resolve_agent_name(self, agent_name: str) -> str | None:
         """解析智能体名称到技能目录名（大小写不敏感）。
@@ -124,7 +131,7 @@ class LazyAgentRegistry:
 
         script_path = self._skill_map[skill_name]
         
-        self.console.print(f"[dim]🔄 正在加载 {agent_name} (from {skill_name})...[/dim]")
+        self._say(f"[dim]🔄 正在加载 {agent_name} (from {skill_name})...[/dim]")
         
         try:
             # 1. 动态加载模块
@@ -173,12 +180,12 @@ class LazyAgentRegistry:
             # 进程 / 会话里永远返回旧的「知识库尚未初始化」错误
             if getattr(agent_instance, "initialized", True) is not False:
                 self.cache[agent_name] = agent_instance
-            self.console.print(f"[dim]✓ {agent_name} 加载完成[/dim]")
+            self._say(f"[dim]✓ {agent_name} 加载完成[/dim]")
 
             return agent_instance
             
         except Exception as e:
-            self.console.print(f"[red]✗ 加载 {agent_name} 失败: {e}[/red]")
+            self._say(f"[red]✗ 加载 {agent_name} 失败: {e}[/red]")
             import traceback
             traceback.print_exc()
             raise
