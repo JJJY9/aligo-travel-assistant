@@ -13,7 +13,11 @@
 """
 from typing import Any
 
+import logging
+
 from utils.trip_import import normalize_identity_date
+
+logger = logging.getLogger(__name__)
 
 
 def _identity(trip: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -85,6 +89,21 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
         for trip_id in ids[1:]
         if ids[0] in fresh_ids and trip_id not in ambiguous
     ]
+    # 执行时按「计划时的身份」复核：计划生成后条目被编辑成别的行程
+    # （或保留项被删除）时不能再按 id 盲删
+    verify: list[dict[str, str]] = []
+    for kept_id, trip_id in duplicate_entries:
+        ident = _identity(by_id.get(trip_id) or {})
+        verify.append(
+            {
+                "kept_id": kept_id,
+                "trip_id": trip_id,
+                "origin": ident[0] if ident else "",
+                "destination": ident[1] if ident else "",
+                "start_date": ident[2] if ident else "",
+                "end_date": ident[3] if ident else "",
+            }
+        )
     return {
         "total_trips": len(trips),
         "groups_with_duplicates": sum(
@@ -94,23 +113,66 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
             _entry(trip_id, by_id) for _, trip_id in duplicate_entries
         ],
         "duplicate_entries": duplicate_entries,
+        "verify": verify,
         "ambiguous_ids": sorted(ambiguous),
     }
 
 
 def apply_trip_dedupe(
-    store: Any, duplicate_entries: list[tuple[str, str]]
+    store: Any,
+    duplicate_entries: list[tuple[str, str]],
+    verify: list[dict[str, str]] | None = None,
 ) -> tuple[int, str | None]:
     """执行去重计划，返回 ``(已删除数, 失败原因或 None)``。
 
     部分删除后失败要如实返回已删除数（数据已部分变更，调用方不能谎报
     完全失败）。
+
+    ``verify``（来自 ``plan_trip_dedupe()["verify"]``）非空时，删除前逐条
+    重新读取并把「保留项」与「待删项」的身份（路线 + 起止日期）与计划时
+    比对：计划生成后被编辑成别的行程、或保留项已被删除的条目跳过不删。
+    否则计划与执行之间的编辑会被按 id 盲删（Web 与 CLI 不共享用户锁，
+    窗口可达秒级）。
     """
+    expected_by_target: dict[str, tuple[str, str, str, str]] = {}
+    if verify:
+        for item in verify:
+            trip_id = str(item.get("trip_id") or "")
+            if not trip_id:
+                continue
+            expected_by_target[trip_id] = (
+                str(item.get("origin") or ""),
+                str(item.get("destination") or ""),
+                str(item.get("start_date") or ""),
+                str(item.get("end_date") or ""),
+            )
     removed = 0
     try:
         for kept_id, trip_id in duplicate_entries:
             if not trip_id:
                 continue
+            expected = expected_by_target.get(trip_id)
+            if expected is not None:
+                reload = getattr(store, "reload", None)
+                if callable(reload):
+                    reload()
+                fresh = {
+                    str(trip.get("trip_id") or ""): trip
+                    for trip in store.get_trip_history(limit=None)
+                }
+                kept_row = fresh.get(kept_id)
+                target_row = fresh.get(trip_id)
+                if (
+                    kept_row is None
+                    or target_row is None
+                    or _identity(kept_row) != expected
+                    or _identity(target_row) != expected
+                ):
+                    logger.warning(
+                        "去重跳过 %s：计划生成后行程已变更或保留项已删除",
+                        trip_id,
+                    )
+                    continue
             # 与组内保留项同 id 的副本：delete_trip 删最早一条，会把要保留
             # 的记录删掉、留下后来的重复行——同 id 时必须删除最后插入的一条
             deleter = (

@@ -4094,7 +4094,7 @@ def create_app(model: Any = None) -> FastAPI:
                         "removed": 0,
                     }
                 removed, failure = apply_trip_dedupe(
-                    store, plan["duplicate_entries"]
+                    store, plan["duplicate_entries"], plan.get("verify")
                 )
                 if failure is not None:
                     # 部分删除已生效：如实报告已删除数，重试可继续清理剩余

@@ -153,6 +153,59 @@ def test_apply_reports_partial_failure():
     print("✓ 部分删除失败如实返回")
 
 
+def test_apply_skips_trip_edited_after_plan():
+    """计划生成后待删项被编辑成别的行程：按 id 盲删会丢用户刚改的数据。"""
+    store = _Store([_trip("t1"), _trip("t2")])
+    plan = plan_trip_dedupe(store)
+    assert plan["duplicate_entries"] == [("t1", "t2")]
+    # 计划后、执行前：t2 被改成杭州
+    store.trips[1]["destination"] = "杭州"
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (0, None)
+    assert store.deleted == []
+    assert any(
+        trip["trip_id"] == "t2" and trip["destination"] == "杭州"
+        for trip in store.trips
+    )
+    print("✓ 计划后被编辑的行程不被盲删")
+
+
+def test_apply_skips_group_when_kept_changed():
+    """保留项被并发删除 / 改成别的行程：整组跳过，仅剩副本不能删。"""
+    store = _Store([_trip("t1"), _trip("t2")])
+    plan = plan_trip_dedupe(store)
+    store.trips = [_trip("t2")]
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (0, None)
+    assert [trip["trip_id"] for trip in store.trips] == ["t2"]
+
+    store = _Store([_trip("t1"), _trip("t2")])
+    plan = plan_trip_dedupe(store)
+    store.trips[0]["destination"] = "广州"
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert removed == 0
+    assert len(store.trips) == 2
+    print("✓ 计划后保留项变更整组跳过")
+
+
+def test_apply_removes_when_unchanged_with_verify():
+    """计划与执行之间无变化：verify 复核通过，正常删除。"""
+    store = _Store([_trip("t1"), _trip("t2")])
+    plan = plan_trip_dedupe(store)
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (1, None)
+    assert store.deleted == ["t2"]
+    print("✓ 未变更时正常删除（verify 通过）")
+
+
 if __name__ == "__main__":
     test_plan_keeps_earliest_and_normalizes_dates()
     test_plan_skips_group_when_kept_row_vanished()
@@ -161,4 +214,7 @@ if __name__ == "__main__":
     test_apply_uses_duplicate_deleter_for_same_kept_id()
     test_apply_removes_and_skips_empty_ids()
     test_apply_reports_partial_failure()
+    test_apply_skips_trip_edited_after_plan()
+    test_apply_skips_group_when_kept_changed()
+    test_apply_removes_when_unchanged_with_verify()
     print("\n全部通过")
