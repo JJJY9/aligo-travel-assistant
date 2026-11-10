@@ -397,9 +397,15 @@ def main() -> int:
         print()
 
         # 2. 创建模型（知识库导入阶段不会调用模型，仅保持 Agent 接口一致）
+        #    无密钥 / 离线环境同样要能初始化：模型创建失败按 None 继续，
+        #    问答阶段另行报「缺少 API Key」即可
         print("2. 创建模型...")
-        model = create_chat_model()
-        print("✓ 模型创建成功")
+        try:
+            model = create_chat_model()
+            print("✓ 模型创建成功")
+        except Exception as exc:  # noqa: BLE001 - 导入与自检不需要模型
+            model = None
+            print(f"⚠️ 模型不可用（{exc}），导入与自检继续（问答阶段需配置 API Key）")
         print()
 
         knowledge_base_path.mkdir(parents=True, exist_ok=True)

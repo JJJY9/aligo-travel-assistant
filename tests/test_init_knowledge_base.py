@@ -121,6 +121,26 @@ class _RebuildAgent:
         self.closed = True
 
 
+def test_main_succeeds_without_chat_model(monkeypatch):
+    """模型创建失败（无 API Key / 离线）时导入与自检照常成功。"""
+    module = _load_init_module()
+
+    def _missing_credentials():
+        raise RuntimeError("Missing credentials")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        monkeypatch.setattr(module, "create_chat_model", _missing_credentials)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", _RebuildAgent)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 0, out.getvalue()
+        assert "模型不可用" in out.getvalue()
+        assert "知识库初始化完成" in out.getvalue()
+    print("✓ 无模型也能完成导入与自检")
+
+
 def test_empty_documents_fail_before_agent(monkeypatch):
     """文档目录为空：在构造 Agent 之前退出 1，不留下空集合。"""
     module = _load_init_module()
@@ -475,6 +495,7 @@ if __name__ == "__main__":
     try:
         test_main_returns_1_when_agent_not_initialized(_mp)
         test_main_returns_1_when_add_documents_fails(_mp)
+        test_main_succeeds_without_chat_model(_mp)
         test_empty_documents_fail_before_agent(_mp)
         test_load_failure_aborts_before_agent(_mp)
         test_self_check_failure_returns_1(_mp)
