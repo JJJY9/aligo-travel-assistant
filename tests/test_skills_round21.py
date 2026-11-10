@@ -45,16 +45,16 @@ def test_weather_city_extraction_rejects_pronoun_fragments():
 
 def test_starts_with_json_array_ignores_preamble_arrays():
     mod = _load_skill(os.path.join("plan-trip", "script", "agent.py"), "skill_plan_r21")
-    assert mod._starts_with_json_array('[{"title": "x"}]') is True
+    assert mod.starts_with_json_array('[{"title": "x"}]') is True
     assert (
-        mod._starts_with_json_array('根据[1]的说明：\n{"itinerary": {"title": "x"}}')
+        mod.starts_with_json_array('根据[1]的说明：\n{"itinerary": {"title": "x"}}')
         is False
     )
     assert (
-        mod._starts_with_json_array('- [ ] 待办\n{"itinerary": {"title": "x"}}')
+        mod.starts_with_json_array('- [ ] 待办\n{"itinerary": {"title": "x"}}')
         is False
     )
-    assert mod._starts_with_json_array('[{"a": 1}] 以上是行程') is True
+    assert mod.starts_with_json_array('[{"a": 1}] 以上是行程') is True
     print("✓ 前言小数组不再被误判为顶层数组")
 
 
