@@ -311,6 +311,65 @@ def test_skill_names_resolve_case_insensitively():
     print("✓ 大小写不同的调度名解析并规范化为标准名")
 
 
+def test_legacy_name_variants_dedupe_and_planning_floor():
+    """遗留标准名的大小写变体：同一技能只执行一次，且规划排到事项收集之后。"""
+    memory = _StubMemory()
+
+    class EventStub(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "origin": "北京",
+                        "destination": "杭州",
+                        "start_date": "2026-12-01",
+                        "purpose": "出差",
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class PlanStub(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {"itinerary": {"title": "杭州行程"}}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    registry = _CaseInsensitiveRegistry(
+        {
+            "itinerary_planning": PlanStub("itinerary_planning"),
+            "event_collection": EventStub("event_collection"),
+        }
+    )
+    orchestrator = OrchestrationAgent(
+        agent_registry=registry, memory_manager=memory
+    )
+    result = json.loads(
+        asyncio.run(
+            orchestrator.reply(
+                _intent(
+                    [
+                        {"agent_name": "Itinerary_Planning", "priority": 1},
+                        {"agent_name": "itinerary_planning", "priority": 1},
+                        {"agent_name": "Event_Collection", "priority": 1},
+                    ]
+                )
+            )
+        ).content
+    )
+    names = [item["agent_name"] for item in result["results"]]
+    assert names.count("itinerary_planning") == 1, names
+    assert "Itinerary_Planning" not in names and "Event_Collection" not in names, names
+    assert names.index("event_collection") < names.index("itinerary_planning"), names
+    print("✓ 遗留名大小写变体去重并保持规划依赖排序")
+
+
 def test_preference_payload_with_extra_keys_does_not_write_garbage():
     """包裹层带 note 等说明键时，不能把 preferences/note 当偏好落库。"""
     memory = _StubMemory()
@@ -1793,6 +1852,7 @@ if __name__ == "__main__":
     test_failed_itinerary_is_not_saved_as_trip()
     test_skill_folder_names_are_canonicalized()
     test_skill_names_resolve_case_insensitively()
+    test_legacy_name_variants_dedupe_and_planning_floor()
     test_preference_payload_with_extra_keys_does_not_write_garbage()
     test_memory_update_preference_and_trip()
     test_memory_update_legacy_preferences_and_custom_backend()
