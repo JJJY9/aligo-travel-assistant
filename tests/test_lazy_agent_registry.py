@@ -268,6 +268,22 @@ def test_project_root_is_added_to_sys_path(monkeypatch):
     print("✓ 加载技能前补项目根目录到 sys.path")
 
 
+def test_console_output_failure_does_not_break_loading(monkeypatch):
+    """控制台编码错误（GBK 重定向遇 emoji）不能让技能加载失败。"""
+    registry = _registry(monkeypatch, {"demo": _AGENT_SOURCE})
+
+    class _BrokenConsole:
+        def print(self, *args, **kwargs):
+            raise UnicodeEncodeError(
+                "gbk", chr(0x1F504), 0, 1, "illegal multibyte sequence"
+            )
+
+    registry.console = _BrokenConsole()
+    agent = registry["demo"]
+    assert agent is not None
+    print("✓ 控制台输出失败不影响技能加载")
+
+
 def test_loaded_agent_accessors(monkeypatch):
     """values / items / get_loaded_agents 与缓存一致。"""
     registry = _registry(monkeypatch, {"demo": _AGENT_SOURCE})
@@ -295,6 +311,7 @@ if __name__ == "__main__":
         test_init_receives_memory_manager,
         test_project_root_is_added_to_sys_path,
         test_loaded_agent_accessors,
+        test_console_output_failure_does_not_break_loading,
     ):
         mp = pytest.MonkeyPatch()
         try:
