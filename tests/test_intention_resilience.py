@@ -267,6 +267,86 @@ def test_non_list_schedule_falls_back_to_default():
     print("✓ 非列表 agent_schedule 降级为默认信息查询")
 
 
+def test_message_text_and_none_input_edges():
+    """_message_text 的字符串列表 / 非容器形态；None 输入直接返回空对象。"""
+    from agents.intention_agent import _message_text
+
+    assert _message_text(["a", "b"]) == "ab"
+    assert _message_text(None) == ""
+    assert _message_text(3) == "3"
+
+    model = _CaptureModel()
+    agent = IntentionAgent(name="IntentionAgent", model=model)
+    out = asyncio.run(agent.reply(None))
+    assert out.content == "{}"
+    assert model.prompts == [], "None 输入不应调用模型"
+    print("✓ _message_text 边界形态与 None 输入")
+
+
+def test_long_history_content_is_truncated_in_prompt():
+    """历史消息超过 800 字时在 prompt 中截断并标注省略。"""
+    model = _CaptureModel()
+    agent = IntentionAgent(name="IntentionAgent", model=model)
+    history = [
+        Msg(name="assistant", content="旧" * 1000, role="assistant"),
+        Msg(name="user", content="继续规划", role="user"),
+    ]
+    asyncio.run(agent.reply(history))
+    prompt = str(model.prompts[0])
+    assert "..." in prompt, "超长历史应截断并标注省略"
+    assert "旧" * 900 not in prompt, "历史内容必须被截到 800 字以内"
+    print("✓ 超长历史内容在 prompt 中截断")
+
+
+def test_system_memory_entry_kept_in_prompt():
+    """system 角色的历史（长期记忆）完整保留并作为上下文首段。"""
+    model = _CaptureModel()
+    agent = IntentionAgent(name="IntentionAgent", model=model)
+    history = [
+        Msg(name="system", content="长期记忆：用户常住北京", role="system"),
+        Msg(name="user", content="帮我规划", role="user"),
+        Msg(name="user", content="顺便查下天气", role="user"),
+    ]
+    asyncio.run(agent.reply(history))
+    prompt = str(model.prompts[0])
+    assert "[系统记忆]" in prompt and "用户常住北京" in prompt
+    assert "用户: 帮我规划" in prompt, "对话历史按角色进入上下文"
+    assert prompt.index("[系统记忆]") < prompt.index("用户: 帮我规划"), (
+        "长期记忆应排在对话历史之前"
+    )
+    print("✓ system 记忆注入 prompt")
+
+
+class _MissingScheduleModel:
+    async def __call__(self, messages):
+        return '{"reasoning": "r", "intents": []}'
+
+
+def test_missing_agent_schedule_falls_back():
+    """合法 JSON 但缺 agent_schedule：降级为默认调度，不能当成空调度。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_MissingScheduleModel())
+    data = json.loads(asyncio.run(agent.reply(_user_msg())).content)
+    assert "意图识别出错" in data.get("reasoning", "")
+    assert data["agent_schedule"][0]["agent_name"] == "information_query"
+    print("✓ 缺少 agent_schedule 降级为默认调度")
+
+
+class _RepairedBadScheduleModel:
+    async def __call__(self, messages):
+        # 尾逗号让直接解析与对象扫描都失败；修复解析能拿到对象，但
+        # agent_schedule 是数字——应走「类型非法」降级而不是原样返回
+        return '说明：{"reasoning": "r", "agent_schedule": 5,}'
+
+
+def test_repaired_json_with_non_list_schedule_falls_back():
+    """修复解析得到的对象里 agent_schedule 非列表同样降级为默认调度。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_RepairedBadScheduleModel())
+    data = json.loads(asyncio.run(agent.reply(_user_msg())).content)
+    assert "意图识别出错" in data.get("reasoning", "")
+    assert data["agent_schedule"][0]["agent_name"] == "information_query"
+    print("✓ 修复解析后的非列表调度同样降级")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_unparsable_output_falls_back()
@@ -280,4 +360,9 @@ if __name__ == "__main__":
     test_single_msg_call_does_not_leak_previous_history()
     test_content_block_list_is_rendered_as_text()
     test_non_list_schedule_falls_back_to_default()
+    test_message_text_and_none_input_edges()
+    test_system_memory_entry_kept_in_prompt()
+    test_long_history_content_is_truncated_in_prompt()
+    test_missing_agent_schedule_falls_back()
+    test_repaired_json_with_non_list_schedule_falls_back()
     print("\n全部通过")
