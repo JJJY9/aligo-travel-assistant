@@ -1729,6 +1729,54 @@ def test_find_duplicate_contents(monkeypatch):
     print("✓ 重复内容扫描（去空白后相同 / 排除多分片记录与旧版 parts>1）")
 
 
+def test_import_all_duplicates_skips_embedding_model(monkeypatch):
+    """全重复导入（幂等重试）不加载嵌入模型：模型不可用时也不再 503。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"已存在内容"})
+
+    def _no_agent():
+        raise AssertionError("全部已存在时不应加载嵌入模型")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", _no_agent)
+    result = knowledge_admin.import_documents([{"content": "已存在内容"}])
+    assert result["imported"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert result["skipped_invalid"] == 0, result
+
+    # 多分片备份（还原组）逐片判重同样生效
+    documents = [
+        {"content": "片一", "metadata": {"group": "g", "part": "1", "parts": "2"}},
+        {"content": "片二", "metadata": {"group": "g", "part": "2", "parts": "2"}},
+    ]
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: {"片一", "片二"}
+    )
+    result = knowledge_admin.import_documents(documents)
+    assert result["imported"] == 0, result
+    assert result["skipped_duplicate"] == 2, result
+    print("✓ 全重复导入不加载嵌入模型（幂等重试）")
+
+
+def test_import_with_new_content_still_loads_model(monkeypatch):
+    """存在新内容时照常加载模型并写入（快判不能误跳）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: {"已存在内容"}
+    )
+    agent = _FakeAgent({"status": "success", "ids": [9], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.import_documents(
+        [{"content": "已存在内容"}, {"content": "新内容"}]
+    )
+    assert result["imported"] == 1, result
+    assert agent.calls and agent.calls[0][0]["content"] == "新内容"
+    print("✓ 有新内容时照常加载模型写入")
+
+
 def test_import_dry_run_skips_writes(monkeypatch):
     """dry-run 只统计将导入 / 跳过的数量，不加载嵌入模型、不写入。"""
     from pathlib import Path
@@ -2588,6 +2636,8 @@ if __name__ == "__main__":
         test_import_skips_incomplete_group_but_keeps_rest,
         test_import_skips_unencodable_content_and_metadata,
         test_import_detects_occupied_part_hidden_by_identical_content,
+        test_import_all_duplicates_skips_embedding_model,
+        test_import_with_new_content_still_loads_model,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,

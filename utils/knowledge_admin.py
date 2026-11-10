@@ -971,6 +971,31 @@ def _metadata_encoding_problem(metadata: Any) -> str | None:
     return None
 
 
+def _merged_piece_contents(merged: list[Any]) -> list[str]:
+    """重组后每条记录最终会按哪些「片段内容」与库判重。"""
+    pieces: list[str] = []
+    for item in merged:
+        if not isinstance(item, dict):
+            pieces.append(str(item or "").strip())
+            continue
+        restored_parts = item.get("__restored_parts__")
+        if isinstance(restored_parts, list):
+            pieces.extend(str(piece).strip() for piece in restored_parts)
+        else:
+            pieces.append(str(item.get("content") or "").strip())
+    return pieces
+
+
+def _backup_fully_existing(merged: list[Any], existing: Iterable[str]) -> bool:
+    """全部片段内容是否都已存在于库中（按重数比较，组内同文分片同样计数）。
+
+    只用于「全重复导入跳过嵌入模型加载」的保守快判：返回 True 表示重复
+    导入必然没有任何需要写入的内容；返回 False 不代表一定有新内容（长
+    文档会重新切片，需完整规划才知道）。
+    """
+    return not (Counter(_merged_piece_contents(merged)) - Counter(existing))
+
+
 def import_documents(
     documents: list[dict[str, Any]], dry_run: bool = False
 ) -> dict[str, Any]:
@@ -1082,6 +1107,29 @@ def import_documents(
         if dry_run:
             payload["would_import"] = 0
         return payload
+
+    # 全部已存在的重复导入不需要嵌入模型：此前先加载模型再判重，模型不可用
+    # （离线首启 / 文件损坏）时幂等重试直接 503，正常情况下也要白等首次加载
+    # 数十秒。按当前快照快速判重，命中即返回幂等结果；未命中 / 扫描失败走
+    # 完整流程（锁内仍以权威快照重算，不依赖这次快照的时效性）。
+    if not dry_run:
+        try:
+            snapshot = _existing_contents()
+        except Exception as exc:  # noqa: BLE001 - 扫描失败按需要模型处理
+            logger.warning("导入前判重扫描失败（%s），按完整流程处理", exc)
+            snapshot = None
+        if snapshot is not None and _backup_fully_existing(pre_merged, snapshot):
+            dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
+            duplicate = len(_merged_piece_contents(pre_merged))
+            payload = {
+                "imported": 0,
+                "skipped": invalid + dropped + duplicate,
+                "skipped_invalid": invalid + dropped,
+                "skipped_duplicate": duplicate,
+            }
+            if pre_problems:
+                payload["skipped_groups"] = pre_problems
+            return payload
 
     # 嵌入模型加载放在写锁外：导入期间其它知识库接口不应因为模型初始化
     # 而全部阻塞；dry-run 不加载模型
