@@ -20,6 +20,27 @@ from utils.trip_export import (
     unescape_ics_machine_field,
 )
 
+# 行程字段上限（与 Web / CLI 写入口径一致）：超长字段导入后无法从面板保存
+# （PUT 全字段 422），ICS 往返还会被 DESCRIPTION / SUMMARY 截断成另一条行程
+_MAX_TRIP_FIELD_CHARS = 100
+# 解析期错误列表物化上限：一个 5M 字符的坏文件可能有上百万条错误，全量
+# 物化会占用上百 MB 内存；总数仍由 total 精确统计，展示只取前 50 条
+_PARSE_ERRORS_CAP = 1000
+
+
+class _BoundedErrors(list):
+    """只物化前 ``_PARSE_ERRORS_CAP`` 条解析错误，``total`` 记录真实数量。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.total = 0
+
+    def add(self, item: tuple[int, str]) -> None:
+        self.total += 1
+        if len(self) < _PARSE_ERRORS_CAP:
+            self.append(item)
+
+
 _HEADER_ALIASES = {
     "origin": {"出发地", "origin"},
     "destination": {"目的地", "destination"},
@@ -92,7 +113,7 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         return value
 
     rows: list[dict[str, Any]] = []
-    errors: list[tuple[int, str]] = []
+    errors = _BoundedErrors()
     while True:
         try:
             row = next(reader)
@@ -101,7 +122,7 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         except csv.Error as exc:
             # 超长字段 / 未闭合引号把余下内容吞成同一字段：保留已解析行，
             # 记录错误后停止（与「非法行收集后列出并跳过」的既有契约一致）
-            errors.append((reader.line_num, f"CSV 解析失败：{exc}"))
+            errors.add((reader.line_num, f"CSV 解析失败：{exc}"))
             break
         # csv.reader 把带引号的多行字段算作一条记录：enumerate 的序号不是
         # 物理行号，用 reader.line_num 才能让报错指向用户看到的行
@@ -112,20 +133,36 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         start_date = cell(row, "start_date")
         end_date = cell(row, "end_date")
         if not destination:
-            errors.append((line_no, "目的地为空"))
+            errors.add((line_no, "目的地为空"))
             continue
         start_dt = _strict_date(start_date)
         if start_dt is None:
-            errors.append((line_no, f"出发日期格式应为 YYYY-MM-DD：{start_date}"))
+            errors.add((line_no, f"出发日期格式应为 YYYY-MM-DD：{start_date}"))
             continue
         if end_date:
             end_dt = _strict_date(end_date)
             if end_dt is None:
-                errors.append((line_no, f"返程日期格式应为 YYYY-MM-DD：{end_date}"))
+                errors.add((line_no, f"返程日期格式应为 YYYY-MM-DD：{end_date}"))
                 continue
             if end_dt < start_dt:
-                errors.append((line_no, "结束日期不能早于出发日期"))
+                errors.add((line_no, "结束日期不能早于出发日期"))
                 continue
+        purpose = cell(row, "purpose")
+        oversize = next(
+            (
+                field
+                for field, value in (
+                    ("origin", cell(row, "origin")),
+                    ("destination", destination),
+                    ("purpose", purpose),
+                )
+                if len(str(value or "")) > _MAX_TRIP_FIELD_CHARS
+            ),
+            None,
+        )
+        if oversize:
+            errors.add((line_no, f"字段 {oversize} 超过 {_MAX_TRIP_FIELD_CHARS} 字"))
+            continue
         rows.append(
             {
                 "origin": cell(row, "origin"),
@@ -133,9 +170,13 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
                 "start_date": start_date,
                 "end_date": end_date,
                 # 缺省 / 空白目的保留 None：去重更新时存储层保留原值
-                "purpose": cell(row, "purpose") or None,
+                "purpose": purpose or None,
             }
         )
+        if len(rows) > _MAX_IMPORT_ROWS:
+            raise ValueError(
+                f"单次最多导入 {_MAX_IMPORT_ROWS} 条行程，请拆分文件后再导入"
+            )
     return rows, errors
 
 
@@ -311,6 +352,13 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
             destination = summary[:400]
     if not destination:
         return None, "缺少目的地（SUMMARY 为空）"
+    for field, value in (
+        ("origin", origin),
+        ("destination", destination),
+        ("purpose", purpose),
+    ):
+        if len(str(value or "")) > _MAX_TRIP_FIELD_CHARS:
+            return None, f"字段 {field} 超过 {_MAX_TRIP_FIELD_CHARS} 字"
     return {
         "origin": origin,
         "destination": destination,
@@ -326,7 +374,7 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
     """解析 iCalendar 文本，返回 ``(有效行程, [(事件序号, 原因)])``（序从 1 起）。"""
     props: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
-    errors: list[tuple[int, str]] = []
+    errors = _BoundedErrors()
     in_event = False
     index = 0
     for line in _unfold_ics(text):
@@ -340,9 +388,13 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
             index += 1
             row, reason = _ics_event_row(props)
             if reason:
-                errors.append((index, reason))
+                errors.add((index, reason))
             elif row is not None:
                 rows.append(row)
+                if len(rows) > _MAX_IMPORT_ROWS:
+                    raise ValueError(
+                        f"单次最多导入 {_MAX_IMPORT_ROWS} 条行程，请拆分文件后再导入"
+                    )
             continue
         if not in_event or ":" not in line:
             continue
@@ -426,7 +478,7 @@ def import_trips_from_text(
         "skipped": [
             {"line": line, "reason": reason} for line, reason in errors[:_MAX_SKIPPED]
         ],
-        "skipped_total": len(errors),
+        "skipped_total": getattr(errors, "total", len(errors)),
     }
     if not rows:
         return result

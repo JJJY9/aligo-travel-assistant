@@ -4748,6 +4748,16 @@ def run_trips_import_standalone(
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not csv_path or csv_path.startswith("-"):
         return _fail("请提供 CSV / ICS 文件路径")
+    # 大小预检在读入之前：误选大文件时不能让整个文件先占满内存再报错
+    try:
+        file_size = os.path.getsize(csv_path)
+    except OSError:
+        file_size = 0
+    max_bytes = 25 * 1024 * 1024
+    if file_size > max_bytes:
+        return _fail(
+            f"导入文件过大（{file_size} 字节 > {max_bytes}），请拆分后再导入"
+        )
     try:
         text = io.open(csv_path, "r", encoding="utf-8-sig").read()
     except FileNotFoundError:
