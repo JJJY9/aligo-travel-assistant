@@ -127,5 +127,7 @@ def export_files(
         json.dumps(sanitize_json(data), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    md_path.write_text(render_markdown(data), encoding="utf-8")
+    # 渲染同样用清洗后的数据：孤立代理项 / NaN 会让 write_text 抛
+    # UnicodeEncodeError（JSON 已写出、命令却报失败并留下半截 Markdown）
+    md_path.write_text(render_markdown(sanitize_json(data)), encoding="utf-8")
     return [json_path, md_path]

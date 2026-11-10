@@ -3764,6 +3764,13 @@ def run_session_export_standalone(
         if callable(close):
             close()
 
+    # 历史数据可能含孤立代理项 / 非有限数：渲染与写盘前统一清洗，
+    # 否则 write_text 抛 UnicodeEncodeError（半截文件 + traceback）
+    from utils.json_safe import sanitize_json
+
+    messages = sanitize_json(messages)
+    titles = sanitize_json(titles)
+
     if not messages:
         print(f"会话 {session_id} 不存在或没有消息")
         return 1
@@ -3871,6 +3878,11 @@ def run_sessions_export_standalone(
         close = getattr(store, "close", None)
         if callable(close):
             close()
+
+    from utils.json_safe import sanitize_json
+
+    messages = sanitize_json(messages)
+    titles = sanitize_json(titles)
 
     if not messages:
         print(f"用户 {user_id}：没有可导出的会话")
