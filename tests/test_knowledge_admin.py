@@ -466,7 +466,7 @@ def test_import_cross_group_share_keeps_unique_pieces(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {shared})
     # 库内已有同内容 part1，属于另一篇文档（组 GA，parts=2）
     monkeypatch.setattr(
-        knowledge_admin, "_existing_group_layout", lambda: {shared: ("GA", 1, 2)}
+        knowledge_admin, "_existing_group_layout", lambda: {shared: [("GA", 1, 2)]}
     )
     agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
@@ -521,7 +521,7 @@ def test_import_completes_group_with_duplicate_pieces(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {para})
     # 库内已有同组的 part1（同文分片的第二片未被写入）
     monkeypatch.setattr(
-        knowledge_admin, "_existing_group_layout", lambda: {para: ("G", 1, 2)}
+        knowledge_admin, "_existing_group_layout", lambda: {para: [("G", 1, 2)]}
     )
     agent = _FakeAgent({"status": "success", "ids": [2], "total_count": 2})
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
@@ -1010,7 +1010,7 @@ def test_regroup_requires_multiset_coverage(monkeypatch):
     monkeypatch.setattr(
         knowledge_admin,
         "_existing_group_layout",
-        lambda: {"同文片段": ("g-multi", 1, 2)},
+        lambda: {"同文片段": [("g-multi", 1, 2)]},
     )
     documents = [
         {
@@ -1376,7 +1376,7 @@ def test_import_partial_group_repairs_missing_parts(monkeypatch):
     monkeypatch.setattr(
         knowledge_admin,
         "_existing_group_layout",
-        lambda: {"甲" * 300: ("g-part", 1, 2)},
+        lambda: {"甲" * 300: [("g-part", 1, 2)]},
     )
     result = knowledge_admin.import_documents(documents)
     assert result["imported"] == 1
@@ -1405,8 +1405,8 @@ def test_import_skips_restore_group_with_layout_conflict(monkeypatch):
         knowledge_admin,
         "_existing_group_layout",
         lambda: {
-            old_first: ("g-edit", 1, 3),
-            old_second: ("g-edit", 2, 3),
+            old_first: [("g-edit", 1, 3)],
+            old_second: [("g-edit", 2, 3)],
         },
     )
     documents = [
@@ -1460,7 +1460,7 @@ def test_import_missing_part_conflict_skips_group(monkeypatch):
     monkeypatch.setattr(
         knowledge_admin,
         "_existing_group_layout",
-        lambda: {first: ("g-dup", 1, 2), modified: ("g-dup", 2, 2)},
+        lambda: {first: [("g-dup", 1, 2)], modified: [("g-dup", 2, 2)]},
     )
     documents = [
         {
@@ -1924,10 +1924,53 @@ def test_existing_group_layout_real_scan(monkeypatch):
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
     layout = knowledge_admin._existing_group_layout()
-    assert layout["分片一"] == ("g-layout", 1, 2)
-    assert layout["分片二"] == ("g-layout", 2, 2)
-    assert layout["独立片段"] == ("", 0, 1)
+    assert layout["分片一"] == [("g-layout", 1, 2)]
+    assert layout["分片二"] == [("g-layout", 2, 2)]
+    assert layout["独立片段"] == [("", 0, 1)]
     print("✓ 库内分片布局真实扫描")
+
+
+def test_import_detects_occupied_part_hidden_by_identical_content(monkeypatch):
+    """库内同组两片同文时，布局仍要看到被第一行掩盖的 part 号，不能写出重复 part。"""
+    import json as _json
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"同一段内容"})
+    # 同组两片内容相同（受支持的数据形态）：part2 的行先出现、part1 后出现，
+    # 以内容为键的旧实现只保留 part1，occupied_parts 漏掉 part2
+    rows = [
+        {
+            "id": 1,
+            "content": "同一段内容",
+            "metadata": _json.dumps(
+                {"group": "g-col", "part": "2", "parts": "2"}
+            ),
+        },
+        {
+            "id": 2,
+            "content": "同一段内容",
+            "metadata": _json.dumps(
+                {"group": "g-col", "part": "1", "parts": "2"}
+            ),
+        },
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    documents = [
+        {
+            "content": "同一段内容",
+            "metadata": {"group": "g-col", "part": "1", "parts": "2"},
+        },
+        {
+            "content": "新内容",
+            "metadata": {"group": "g-col", "part": "2", "parts": "2"},
+        },
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_duplicate"] == 2, result  # 命中 1 片 + 缺片随组跳过
+    print("✓ 同文多行不掩盖已占用的 part 号")
 
 
 def test_delete_document_whole_group(monkeypatch):
@@ -2303,8 +2346,8 @@ def test_existing_group_layout_tolerates_bad_numbers(monkeypatch):
     )
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
     assert knowledge_admin._existing_group_layout() == {
-        "甲": ("g", 0, 1),
-        "乙": ("g", 2, 3),
+        "甲": [("g", 0, 1)],
+        "乙": [("g", 2, 3)],
     }
     print("✓ 分片布局扫描容忍非法 part / parts")
 
@@ -2482,6 +2525,7 @@ if __name__ == "__main__":
         test_list_and_export_hold_write_lock,
         test_update_group_leftover_reported_when_delete_fails,
         test_import_skips_incomplete_group_but_keeps_rest,
+        test_import_detects_occupied_part_hidden_by_identical_content,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,
