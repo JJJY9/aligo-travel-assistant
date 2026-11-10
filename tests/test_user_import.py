@@ -549,6 +549,112 @@ def test_parse_limits_preferences():
 
 
 
+def test_parse_trip_and_knowledge_edge_rows():
+    """行程空出发日期 / 非法会话 ID、知识片段 NUL 与坏 parts 元数据逐条处理。"""
+    from utils.user_import import drop_sessions
+
+    payload = {
+        "trip_history": [
+            {"destination": "上海", "start_date": "", "end_date": ""},
+            {"destination": "杭州", "start_date": "2026-01-01", "session_id": "bad id!"},
+        ],
+        "knowledge": [
+            {
+                "content": "含NUL" + chr(0) + "内容",
+                "metadata": {"group": "g1", "part": "1", "parts": "2"},
+            },
+            {
+                "content": "元数据坏",
+                "metadata": {
+                    "group": "g2",
+                    "part": "1",
+                    "parts": "2",
+                    "category": "坏" + chr(0) + "值",
+                },
+            },
+            {"content": "坏parts", "metadata": {"group": "g3", "part": "1", "parts": "abc"}},
+            {"content": "坏part号", "metadata": {"group": "g4", "part": "x", "parts": "2"}},
+        ],
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert [trip["destination"] for trip in sections["trips"]] == ["杭州"]
+    assert any("出发日期为空" in error for error in errors), errors
+    assert any("会话 ID 非法" in error for error in errors), errors
+    # 内容与元数据各一条 NUL：都按「包含 NUL 字符」逐条跳过
+    assert sum("包含 NUL 字符" in error for error in errors) == 2, errors
+    # part 非数字按 0 处理 → 组校验按分片编号问题报出该组
+    assert any("知识分片组" in error for error in errors), errors
+
+    # 空集合直接返回（Web / CLI 墓碑剔除路径）
+    sections_before = {"messages": [{"content": "x"}]}
+    drop_sessions(sections_before, set())
+    assert sections_before["messages"] == [{"content": "x"}]
+    print("✓ 行程空日期 / 坏会话 ID、知识片段 NUL 与坏 parts 元数据")
+
+
+def test_import_restores_archived_and_reports_generic_knowledge_error(monkeypatch):
+    """归档会话随备份恢复；知识库导入的通用异常计入 knowledge_error 而非中断。"""
+    from utils import knowledge_admin as admin_module
+
+    payload = {
+        "archived_sessions": ["s-arch"],
+        "chat_history": [
+            {"role": "user", "content": "旧消息", "session_id": "s-arch"}
+        ],
+        "knowledge": [{"content": "知识", "metadata": {}}],
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert errors == [], errors
+    store = _real_store("u-arch")
+    try:
+
+        def boom(documents):
+            raise RuntimeError("milvus down")
+
+        monkeypatch.setattr(admin_module, "import_documents", boom)
+        counts = import_user_data(store, sections)
+        assert counts.get("archived") == 1, counts
+        assert "知识片段恢复失败" in counts.get("knowledge_error", ""), counts
+        assert "s-arch" in store.get_archived_sessions()
+    finally:
+        store._close() if hasattr(store, "_close") else None
+    print("✓ 归档恢复与知识库通用错误上报")
+
+
+def test_parse_limits_trips_messages_and_knowledge(monkeypatch):
+    """行程 / 消息 / 知识片段超出上限时截断并报错（含坏 parts 声明）。"""
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "_MAX_TRIPS", 1)
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+    monkeypatch.setattr(module, "_MAX_KNOWLEDGE", 1)
+    payload = {
+        "trip_history": [
+            {"destination": "甲", "start_date": "2026-01-01"},
+            {"destination": "乙", "start_date": "2026-01-02"},
+        ],
+        "chat_history": [
+            {"role": "user", "content": "一", "session_id": "s1"},
+            {"role": "user", "content": "二", "session_id": "s1"},
+        ],
+        "knowledge": [
+            {
+                "content": "组片",
+                "metadata": {"group": "g-cap", "part": "1", "parts": "abc"},
+            },
+            {"content": "多出来了", "metadata": {}},
+        ],
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert any("行程超过" in error for error in errors), errors
+    assert any("聊天消息超过" in error for error in errors), errors
+    assert any("知识片段超过" in error for error in errors), errors
+    assert [trip["destination"] for trip in sections["trips"]] == ["甲"]
+    assert len(sections["messages"]) == 1
+    assert [item["content"] for item in sections["knowledge"]] == ["组片"]
+    print("✓ 行程 / 消息 / 知识片段超限截断（含坏 parts 声明）")
+
+
 def test_parse_knowledge_section_and_import(monkeypatch):
     """备份的 knowledge 段：解析校验、预览计数、导入计数与错误上报。"""
     from utils import knowledge_admin as admin_module
@@ -1355,6 +1461,7 @@ if __name__ == "__main__":
     test_parse_drops_broken_knowledge_groups_and_bad_metadata()
     test_parse_drops_knowledge_group_with_absurd_parts()
     test_parse_rejects_escaped_surrogate_in_assistant_json()
+    test_parse_trip_and_knowledge_edge_rows()
     for case in (
         test_runner_json_output,
         test_runner_dry_run,
@@ -1362,6 +1469,8 @@ if __name__ == "__main__":
         test_runner_rejects_oversized_backup,
         test_runner_dispatch,
         test_parse_knowledge_section_and_import,
+        test_parse_limits_trips_messages_and_knowledge,
+        test_import_restores_archived_and_reports_generic_knowledge_error,
         test_runner_knowledge_error_and_skip,
         test_runner_recovers_knowledge_only_backup,
         test_parse_user_export_tolerates_recursion_error,
