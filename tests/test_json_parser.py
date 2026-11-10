@@ -92,6 +92,48 @@ def test_extract_response_text_object_with_content_string():
     print("✓ 非 dict 对象的 content 字符串")
 
 
+def test_last_object_with_keys_repairs_trailing_comma():
+    """正式结果带尾逗号时不能被严格扫描跳过（否则更早的示例对象被当结果）。"""
+    from utils.json_parser import last_json_object_with_keys
+
+    text = (
+        '示例：{"preferences":[{"type":"hotel_brands","value":"汉庭"}],'
+        '"has_preferences":true}\n正式：{"preferences":[{"type":"hotel_brands",'
+        '"value":"如家","action":"append"}],"has_preferences":true,}'
+    )
+    selected = last_json_object_with_keys(text, ("preferences",))
+    assert selected is not None
+    assert selected["preferences"] == [
+        {"type": "hotel_brands", "value": "如家", "action": "append"}
+    ], selected
+    print("✓ 尾逗号正式结果经修复后胜出（示例不被写库）")
+
+
+def test_last_object_with_keys_refuses_unparsable_tail():
+    """末尾结果被截断无法解析时返回 None（走错误降级，不回退到示例）。"""
+    from utils.json_parser import last_json_object_with_keys
+
+    text = (
+        '示例：{"preferences":[{"type":"hotel_brands","value":"汉庭"}]}\n'
+        '正式：{"preferences":[{"type":"hotel_brands","value":"如家"'
+    )
+    assert last_json_object_with_keys(text, ("preferences",)) is None
+    print("✓ 截断的正式结果不回落为示例")
+
+
+def test_last_object_with_keys_still_picks_last_valid():
+    """无小瑕疵时行为不变：取最后一个含目标键的对象。"""
+    from utils.json_parser import last_json_object_with_keys
+
+    text = (
+        '{"answer": "先回显", "preferences": [{"type": "a"}]}\n'
+        '{"answer": "真实结果", "preferences": [{"type": "b"}]}'
+    )
+    selected = last_json_object_with_keys(text, ("preferences",))
+    assert selected["answer"] == "真实结果", selected
+    print("✓ 无瑕疵时仍取最后一个对象")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -102,6 +144,10 @@ if __name__ == "__main__":
         test_robust_json_parse_without_json5(mp)
         test_robust_json_parse_uses_json5_when_available()
         test_extract_response_text_object_with_content_string()
+        test_top_level_scan_skips_broken_prefix()
+        test_last_object_with_keys_repairs_trailing_comma()
+        test_last_object_with_keys_refuses_unparsable_tail()
+        test_last_object_with_keys_still_picks_last_valid()
     finally:
         mp.undo()
     print("\n全部通过")

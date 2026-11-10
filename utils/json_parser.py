@@ -5,6 +5,7 @@ JSON 解析辅助工具
 import json
 import logging
 import re
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,38 @@ def iter_json_objects(text: str):
         index = max(end, index + 1)
 
 
+def _iter_objects_with_repair(text: str):
+    """按位置产出文本中的顶层对象，严格解析失败时按小瑕疵修复后再试。
+
+    产出 ``(value, end)``，``end`` 为对象结束位置（用于判断其后是否还有
+    目标对象）。修复只覆盖「尾逗号」这类小瑕疵（复用
+    :func:`_strip_trailing_commas`）：模型输出被 max_tokens 截断等无法
+    修复的形态不产出，由调用方决定降级。
+    """
+    decoder = json.JSONDecoder(parse_constant=reject_json_constant)
+    index = 0
+    while True:
+        index = text.find("{", index)
+        if index < 0:
+            return
+        value: Any = None
+        end = index
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except (json.JSONDecodeError, ValueError):
+            repaired = _strip_trailing_commas(text[index:])
+            try:
+                value, end_rel = decoder.raw_decode(repaired, 0)
+                end = index + end_rel
+            except (json.JSONDecodeError, ValueError):
+                value = None
+        if isinstance(value, dict):
+            yield value, end
+            index = max(end, index + 1)
+        else:
+            index += 1
+
+
 def last_json_object_with_keys(
     text: str, keys: "tuple[str, ...]"
 ) -> "dict | None":
@@ -150,11 +183,29 @@ def last_json_object_with_keys(
     模型常在正式结果前复述 prompt 里的输出示例 / 当前数据：只取第一个
     对象会把回显当成结果（示例行程 / 示例偏好被写库）。正式结果通常在
     响应末尾，按「最后一个形如结果的对象」挑选更符合实际输出习惯。
+
+    候选按小瑕疵修复后再解码（尾逗号等），避免「正式结果带尾逗号 → 严格
+    扫描跳过 → 更早的示例对象被当成结果」污染长期记忆。若正式结果之后的
+    文本仍出现目标键（说明末尾还有一个无法解析的结果对象，如被截断），
+    返回 None 让调用方走错误降级，而不是把示例当真实数据。
     """
-    selected = None
-    for value in iter_json_objects(text):
+    selected: dict | None = None
+    selected_end = -1
+    for value, end in _iter_objects_with_repair(text):
         if any(key in value for key in keys):
             selected = value
+            selected_end = end
+    if selected is None:
+        return None
+    tail = text[selected_end:]
+    if "{" in tail:
+        for key in keys:
+            if f'"{key}"' in tail:
+                logger.warning(
+                    "末尾仍有含 %s 的对象但无法解析（可能被截断），放弃更早的候选",
+                    key,
+                )
+                return None
     return selected
 
 
