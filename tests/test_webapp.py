@@ -956,7 +956,7 @@ def test_get_session_constructs_outside_lock(monkeypatch):
 
 
 def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
-    """PG 冷却期：删除类接口必须 503，不能静默作用在 JSON 回退库上。"""
+    """PG 冷却期：删除类与行程新增/编辑必须 503，不能静默作用在 JSON 回退库上。"""
     import time as time_module
 
     from config import STORAGE_CONFIG
@@ -987,7 +987,24 @@ def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
 
     response = client.delete(f"/api/preferences/home_location?user_id={user_id}")
     assert response.status_code == 503, response.text
-    print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑")
+
+    # 新增 / 编辑行程同样不能静默写进回退 JSON：PG 恢复后读 PG，行程会
+    # 「凭空消失」（与删除 / 导入 / CLI 的严格语义一致）
+    response = client.post(
+        "/api/trips",
+        json={
+            "user_id": user_id,
+            "destination": "杭州",
+            "start_date": "2026-12-01",
+        },
+    )
+    assert response.status_code == 503, response.text
+    response = client.put(
+        "/api/trips/trip_1",
+        json={"user_id": user_id, "purpose": "出差"},
+    )
+    assert response.status_code == 503, response.text
+    print("✓ PG 冷却期删除类接口统一 503 且不撤销墓碑；行程新增/编辑同样 503")
 
 
 def test_sessions_listing_and_delete():
