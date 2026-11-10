@@ -218,6 +218,9 @@ class AligoCLI:
         处理用户查询（原逻辑保留；仅在入口加熔断检查、对 LLM 调用加重试）
         """
         import time
+
+        from utils.json_safe import sanitize_json
+
         start_time = time.time()
         usage_before = self.model.usage.snapshot() if hasattr(self.model, "usage") else None
 
@@ -298,6 +301,10 @@ class AligoCLI:
                 except json.JSONDecodeError:
                     self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
                     return
+                # 模型输出可能含孤立代理项（截断 emoji 的 \ud800）：这里的数据
+                # 会进入显示、轮次元数据与持久化，先统一转义，避免 UTF-8 写入
+                # 抛 MemoryPersistenceError（Web 端 ConversationRuntime 已做）
+                intention_data = sanitize_json(intention_data)
 
             # 4. 本轮提问先只进短期记忆：编排智能体从短期记忆读取「用户本轮
             # 原话」（与 Web 的 ConversationRuntime 一致）；长期记忆仍在本轮
@@ -340,6 +347,8 @@ class AligoCLI:
                 result_data = json.loads(orchestration_result.content)
             except json.JSONDecodeError:
                 result_data = {"error": "解析结果失败"}
+            # 同上：先转义孤立代理项，再做显示与落库
+            result_data = sanitize_json(result_data)
 
             # 7. 显示调用的智能体与最终结果（原逻辑不变）
             self._display_agents_called(result_data)

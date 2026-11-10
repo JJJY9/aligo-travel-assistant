@@ -188,8 +188,17 @@ class ConversationRuntime:
         await self.drain_pending_persist()
         try:
             await asyncio.to_thread(self.memory.stage_message, "user", user_input)
+            # 用清洗后的意图数据重建 Msg 再交给编排器：原始 Msg 仍可能带
+            # 孤立代理项，会进入编排 prompt / _update_memory 落库路径
+            sanitized_intention = Msg(
+                name="IntentionAgent",
+                content=json.dumps(intention_data, ensure_ascii=False),
+                role="assistant",
+            )
             orchestration = await self._call_with_resilience(
-                lambda: self.orchestrator.reply(intention, on_event=on_event),
+                lambda: self.orchestrator.reply(
+                    sanitized_intention, on_event=on_event
+                ),
                 max_retries=int(rc.get("max_retries", 3)),
                 base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
                 max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
