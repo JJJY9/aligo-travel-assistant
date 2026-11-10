@@ -637,6 +637,58 @@ def test_normalized_schedule_filters_invalid_entries():
     print("✓ 调度计划过滤非法条目")
 
 
+def test_empty_short_term_backfills_current_session_history():
+    """重启 / LRU 淘汰后短期记忆为空：从长期记忆补回本会话最近几轮。"""
+    runtime, memory = _make_runtime()
+
+    class _EmptyShortTerm:
+        def get_recent_context(self, n_turns=5):
+            return []
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+        def get_chat_history(
+            self, limit=None, session_id=None, exclude_session_id=None
+        ):
+            assert limit == 10
+            assert session_id == runtime.session_id
+            return [
+                {"role": "user", "content": "帮我把行程改到周五"},
+                {"role": "assistant", "content": "已改到周五"},
+            ]
+
+    memory.short_term = _EmptyShortTerm()
+    memory.long_term = _LongTerm()
+    asyncio.run(runtime.ask("那住宿呢"))
+    contents = "\n".join(
+        m.content for m in runtime.intention_agent.context
+    )
+    assert "帮我把行程改到周五" in contents, contents
+    assert "已改到周五" in contents, contents
+    print("✓ 短期记忆为空时从长期记忆回填本会话上下文")
+
+
+def test_non_empty_short_term_skips_long_term_backfill():
+    """短期记忆有内容时不额外读长期历史（不放大每轮记忆 IO）。"""
+    runtime, memory = _make_runtime()
+    calls = {"history": 0}
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+        def get_chat_history(self, **kwargs):
+            calls["history"] += 1
+            return []
+
+    memory.long_term = _LongTerm()
+    asyncio.run(runtime.ask("你好"))
+    assert calls["history"] == 0
+    print("✓ 短期记忆非空时不回填长期历史")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -658,6 +710,8 @@ if __name__ == "__main__":
     test_progress_callback_failure_does_not_break_ask()
     test_close_swallows_backend_close_failure()
     test_summary_failure_degrades_to_empty()
+    test_empty_short_term_backfills_current_session_history()
+    test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
     test_memory_without_rollback_hook_is_tolerated()
     test_memory_persistence_error_not_counted_as_model_failure()
