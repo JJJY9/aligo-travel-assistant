@@ -847,6 +847,35 @@ def test_strict_long_term_raises_during_cooldown():
     print("✓ 冷却期 strict 创建失败、非 strict 回退 JSON")
 
 
+def test_pg_success_marks_actual_backend(monkeypatch):
+    """PG 创建成功：记录实际后端为 postgres（describe_backends 同口径）。"""
+    _set("redis_url", "")
+    _set("postgres_dsn", "postgresql://user:pass@db.example/aligo")
+    try:
+
+        class _FakePg:
+            def __init__(self, user_id, dsn):
+                self.user_id = user_id
+                self.dsn = dsn
+
+        monkeypatch.setattr(storage, "PostgresLongTermMemory", _FakePg)
+        memory = storage.create_long_term_memory("u-pg-ok", tempfile.mkdtemp())
+        assert isinstance(memory, _FakePg)
+        assert storage.describe_backends()["long_term"] == "postgres"
+    finally:
+        _restore_local()
+    print("✓ PG 创建成功时记录实际后端")
+
+
+def test_redis_import_failure_falls_back(monkeypatch):
+    """redis 包未安装：短期记忆回退进程内实现（返回 None，不抛出）。"""
+    monkeypatch.setattr(storage, "_redis_client", None)
+    storage.reset_failure_cache()
+    monkeypatch.setitem(sys.modules, "redis", None)
+    assert storage._get_redis_client("redis://localhost:1/0") is None
+    print("✓ redis 未安装时回退 None")
+
+
 def test_redact_url_masks_query_password():
     """redis-py 接受查询串里的 password 参数，日志脱敏必须覆盖。"""
     redacted = storage._redact_url(
@@ -2517,4 +2546,14 @@ if __name__ == "__main__":
     test_frequent_destinations_tie_order_is_deterministic()
     test_pg_batch_aborts_when_connection_reconnects()
     test_bulk_save_trips_matches_sequential_saves()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_pg_success_marks_actual_backend(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_redis_import_failure_falls_back(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")
