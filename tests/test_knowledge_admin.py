@@ -1841,6 +1841,62 @@ def test_import_with_new_content_still_loads_model(monkeypatch):
     assert result["imported"] == 1, result
     assert agent.calls and agent.calls[0][0]["content"] == "新内容"
     print("✓ 有新内容时照常加载模型写入")
+def test_import_restores_per_part_metadata(monkeypatch):
+    """导出→导入往返保留逐片元数据：title 的 …(Part N) 不再全部写成 Part 1。"""
+    from pathlib import Path
+
+    documents = [
+        {
+            "content": "第一片",
+            "metadata": {
+                "group": "g-meta",
+                "part": "1",
+                "parts": "2",
+                "category": "交通",
+                "title": "标准 (Part 1)",
+            },
+        },
+        {
+            "content": "第二片",
+            "metadata": {
+                "group": "g-meta",
+                "part": "2",
+                "parts": "2",
+                "category": "交通",
+                "title": "标准 (Part 2)",
+            },
+        },
+    ]
+    merged, _ = knowledge_admin._regroup_exported_documents(documents, set())
+    assert merged[0]["__restored_metas__"] == [
+        {"category": "交通", "title": "标准 (Part 1)"},
+        {"category": "交通", "title": "标准 (Part 2)"},
+    ], merged[0]["__restored_metas__"]
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, docs):
+            self.calls.append(docs)
+            return {
+                "status": "success",
+                "ids": list(range(100, 100 + len(docs))),
+                "total_count": len(docs),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.import_documents([dict(doc) for doc in documents])
+    assert result["imported"] == 2, result
+    batch = agent.calls[0]
+    titles = [doc["metadata"].get("title") for doc in batch]
+    assert titles == ["标准 (Part 1)", "标准 (Part 2)"], titles
+    assert all(doc["metadata"].get("group") for doc in batch)
+    print("✓ 导入保留逐片元数据（title 不再全变 Part 1）")
 
 
 def test_import_dry_run_skips_writes(monkeypatch):
@@ -2704,6 +2760,7 @@ if __name__ == "__main__":
         test_import_detects_occupied_part_hidden_by_identical_content,
         test_import_all_duplicates_skips_embedding_model,
         test_import_with_new_content_still_loads_model,
+        test_import_restores_per_part_metadata,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
         test_document_group_at_size_limit_roundtrip,

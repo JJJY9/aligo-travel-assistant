@@ -632,9 +632,17 @@ def _merge_exported_group(
     contents: list[str] = []
     seen_parts: set[int] = set()
     base_meta: dict[str, Any] = {}
+    piece_metas: list[dict[str, Any]] = []
     for index, (_, piece) in enumerate(pieces):
         metadata = piece.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
+        piece_metas.append(
+            {
+                meta_key: meta_value
+                for meta_key, meta_value in metadata.items()
+                if meta_key not in _DERIVED_CHUNK_KEYS
+            }
+        )
         try:
             part_no = int(metadata.get("part") or 0)
             declared = max(declared, int(metadata.get("parts") or 0))
@@ -694,6 +702,9 @@ def _merge_exported_group(
             # 原始分片直接作为入库分片：避免「拼回整篇再重切」改变分片
             # 边界（会让残缺组补齐时按内容对不上、产生重复文档）
             "__restored_parts__": stripped_contents,
+            # 逐片用户元数据（与分片一一对应）：导出时每片带自己的 title
+            # （…(Part N)）等字段，还原时按片恢复，不再全部写成 part 1 的
+            "__restored_metas__": piece_metas,
             # 空串拼接：分片是原文的连续片段，拼接即原文；用换行分隔会把
             # 分隔符写进正文（文档越还原越大、导出→导入不再闭合）
             "content": "".join(stripped_contents),
@@ -1116,7 +1127,12 @@ def import_documents(
             key: value
             for key, value in item.items()
             if key
-            not in {"__restored_group__", "__restored_size__", "__restored_parts__"}
+            not in {
+                "__restored_group__",
+                "__restored_size__",
+                "__restored_parts__",
+                "__restored_metas__",
+            }
         }
         valid.append(cleaned)
     if invalid_groups:
@@ -1252,6 +1268,7 @@ def import_documents(
                 continue
             if restored:
                 restored_parts = item.pop("__restored_parts__", None)
+                restored_metas = item.pop("__restored_metas__", None)
                 pieces = _restore_pieces(restored_parts, content)
                 stored_size = sum(len(piece) for piece in pieces)
                 if not pieces or stored_size > DOC_MAX_CHARS or (
@@ -1265,9 +1282,29 @@ def import_documents(
                     )
                     continue
                 total_parts = len(pieces)
+                per_piece_metas: list[dict[str, Any] | None] = [None] * total_parts
+                if (
+                    isinstance(restored_metas, list)
+                    and len(restored_metas) == total_parts
+                ):
+                    per_piece_metas = [
+                        meta if isinstance(meta, dict) else None
+                        for meta in restored_metas
+                    ]
                 chunks: list[dict[str, Any]] = []
                 for index, piece in enumerate(pieces, start=1):
-                    meta = dict(sanitized_meta)
+                    # 逐片恢复各自的用户元数据（title 的 …(Part N) 等）；
+                    # 与分片数对不上（旧备份 / 重新切分）时退回基元数据
+                    extra_meta = per_piece_metas[index - 1]
+                    if extra_meta is not None:
+                        meta = {
+                            str(meta_key)[:32]: str(meta_value)[:200]
+                            for meta_key, meta_value in list(extra_meta.items())[
+                                :_METADATA_MAX_KEYS
+                            ]
+                        }
+                    else:
+                        meta = dict(sanitized_meta)
                     if total_parts > 1:
                         meta["part"] = str(index)
                         meta["parts"] = str(total_parts)
