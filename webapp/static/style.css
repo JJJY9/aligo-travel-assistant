@@ -1108,6 +1108,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   left: 50%;
   bottom: 96px;
   z-index: 50;
+  /* 浮在面板之上但只作提示：不能吞掉下方按钮的点击 */
+  pointer-events: none;
   transform: translateX(-50%);
   padding: 8px 16px;
   border-radius: 999px;

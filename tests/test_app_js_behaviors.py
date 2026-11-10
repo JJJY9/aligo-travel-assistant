@@ -327,6 +327,38 @@ def test_startup_does_not_override_user_session_click():
     print("✓ 启动恢复不覆盖用户点击")
 
 
+def test_panel_fixes_cursor_stale_session_and_import_batches():
+    """会话游标前进、幽灵会话移除、知识导入分批与字节预算。"""
+    data = _run_harness("panelFixes")
+
+    cursor = data["sessions_cursor"]
+    assert "offset=50" in cursor["first_url"], cursor
+    assert "offset=100" in cursor["second_url"], cursor
+    assert cursor["offset"] == 100, cursor
+    assert cursor["count"] == 75, cursor
+
+    stale = data["stale_session"]
+    assert stale["sessions"] == 0, stale
+    assert stale["sessionId"] == "keep", stale
+    assert any("已不存在" in item for item in stale["toasts"]), stale
+
+    batches = data["kb_batches"]
+    assert batches["total"] == 25000, batches
+    assert batches["batch_count"] > 1, batches
+    assert batches["max_batch"] <= 200, batches
+
+    group_batches = data["kb_group_batches"]
+    assert sum(len(batch) for batch in group_batches) == 4, group_batches
+    for batch in group_batches:
+        if "a" in batch:
+            assert "c" in batch and "d" in batch, group_batches
+
+    errors = data["kb_errors"]
+    assert errors["oversize"], errors
+    assert errors["huge_group"], errors
+    print("✓ 面板修复：会话游标 / 幽灵会话 / 知识导入分批")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -339,4 +371,5 @@ if __name__ == "__main__":
     test_trips_dedupe_panel_flow()
     test_startup_does_not_override_user_session_click()
     test_knowledge_eval_panel_states()
+    test_panel_fixes_cursor_stale_session_and_import_batches()
     print("\n全部通过")
