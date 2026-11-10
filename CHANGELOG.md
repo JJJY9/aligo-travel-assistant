@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 熔断半开试探不再被慢回合「换人」：此前名额只看墙钟租约（默认 300s），一个回合（意图 + 编排 + 全部子智能体，单次 LLM 调用还叠加应用层 4 次 × SDK 3 次重试 × 60s 超时）可能远超租约；到期后 `allow_call` 会放行第二个试探并覆盖归属，原试探的真实成功 / 失败因 owner 不匹配被静默丢弃，单飞失效、慢故障期间每隔几分钟就放行一轮新的重试风暴，熔断可能一直停在 half_open。现在 asyncio Task 归属按 `done()` 判断：任务仍在跑时任何租约都不覆盖；任务已结束（取消 / 异常退出）名额立即回收；线程归属（CLI）无活性信号，仍按租约兜底回收
 - 偏好智能体名称大小写归一：`canonical_agent_name("Preference"/"PREFERENCE")` 现在返回 `preference`——此前标准名集合只由「目录名 → 标准名」映射的值构造，preference 目录名与标准名同形被漏掉；模型输出大小写变体时偏好智能体照常执行，但落库、偏好上下文合并、结果渲染与「偏好 / 事项 → 行程规划」依赖排序都按精确小写匹配而静默失效（偏好不落库、同技能重复执行、规划先于偏好）
 - 健康检查与 doctor 同口径：`/api/health` 在技能目录缺失 / 无可加载技能时 `status` 报 `degraded`（`skills` 新增 `ok`），不再监控全绿而对话只能返回空结果；doctor 的「技能目录」逐项校验 SKILL.md（缺失 / 空 / 非法 frontmatter 时警告并点名技能）——SkillLoader 会静默跳过这些技能、意图提示里看不到它们，此前 doctor 只数 `agent.py` 仍报 ok
 - doctor 凭据遮蔽覆盖更多粘贴形态：缺 scheme 的 `user:pass@host`、只有密码的 `redis://:pass@`、`password=` 关键字与 URL 查询串（psycopg 报错回显的完整连接串不再带出密码）；`LLM_API_KEY` 为纯空白时如实报告密钥来自 config_local.py；doctor / weather 的 `--JSON` / `--offline` 大小写与其它命令一致

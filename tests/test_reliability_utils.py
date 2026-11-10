@@ -576,6 +576,64 @@ def test_half_open_probe_lease_covers_slow_probe(monkeypatch):
     print("✓ 半开试探租约覆盖慢调用（60s 不再提前覆盖归属）")
 
 
+def test_live_probe_task_not_preempted_after_lease(monkeypatch):
+    """租约到期但试探任务仍在跑：不得覆盖归属（长回合可能远超租约）。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+
+    async def scenario():
+        assert breaker.allow_call() is True  # 本任务（任务 A）持有试探
+        # 远超租约：任务 A 仍在跑
+        times["now"] = 111.0 + breaker._probe_lease_sec + 1
+
+        async def other():
+            return breaker.allow_call()
+
+        allowed = await asyncio.create_task(other())
+        assert allowed is False, "持有试探的任务仍存活时不能放行第二个"
+        # 原试探的真实失败仍计入并重开熔断
+        breaker.record_failure()
+        assert breaker.state.value == "open"
+
+    asyncio.run(scenario())
+    print("✓ 租约到期但试探任务仍存活时不覆盖归属")
+
+
+def test_finished_probe_task_reclaimed_within_lease(monkeypatch):
+    """试探任务已结束（取消 / 异常退出）时名额立即回收，不必等租约到期。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+
+    async def scenario():
+        holder = {}
+
+        async def stale_probe():
+            holder["allowed"] = breaker.allow_call()
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(stale_probe())
+        await asyncio.sleep(0)
+        assert holder.get("allowed") is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # 任务已结束、租约仍远未到期：允许新试探回收名额
+        assert breaker.allow_call() is True
+
+    asyncio.run(scenario())
+    print("✓ 试探任务结束后名额立即回收")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -584,6 +642,8 @@ if __name__ == "__main__":
         test_health_check_rejects_empty_response(_mp)
         test_half_open_single_probe_and_recovery(_mp)
         test_half_open_probe_lease_covers_slow_probe(_mp)
+        test_live_probe_task_not_preempted_after_lease(_mp)
+        test_finished_probe_task_reclaimed_within_lease(_mp)
         test_failure_after_recovery_timeout_reopens(_mp)
         test_build_turn_meta_tolerates_non_list_shapes()
         test_access_log_strips_control_characters()

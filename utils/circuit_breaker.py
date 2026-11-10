@@ -38,6 +38,26 @@ def _owner_identity() -> object:
     return ("thread", threading.get_ident())
 
 
+def _probe_owner_alive(owner: object) -> bool | None:
+    """半开试探归属者是否仍在运行：True=运行中，False=已结束，None=无法判断。
+
+    Web 端每个请求一个 asyncio Task：任务还在跑时即使试探租约到期也不能
+    覆盖名额——长回合（意图 + 编排 + 全部子智能体，单次 LLM 调用还可能
+    叠加应用层与 SDK 重试）可能远超租约，覆盖后它的真实成功 / 失败会因
+    归属不匹配被丢弃，单飞与「失败重开」判定失效。线程归属（CLI /
+    同步代码）没有可靠的活性信号，返回 None 交给租约兜底回收。
+    """
+    if owner is None:
+        return False
+    done = getattr(owner, "done", None)
+    if not callable(done):
+        return None
+    try:
+        return not done()
+    except Exception:  # noqa: BLE001 - 活性判断失败按未知处理（交给租约）
+        return None
+
+
 class CircuitBreaker:
     """
     熔断器：连续失败 N 次后打开，拒绝一段时间后进入半开，半开成功 M 次后关闭。
@@ -67,10 +87,12 @@ class CircuitBreaker:
         # 半开状态下同一时刻只放行一个试探请求（避免恢复瞬间全部放量），
         # 记录发起时间以防调用被取消后试探名额永久占用
         self._half_open_probe_at: float | None = None
-        # 试探名额租约：必须覆盖一次 LLM 调用（含 SDK 自带重试）的最长执行
-        # 时间。复用 recovery_timeout_sec（默认 60s）时，慢试探仍在跑第二个
-        # 请求就会覆盖归属，第一个的真实结果被静默丢弃（单飞失效、失败不
-        # 能重开熔断）。取恢复期的 5 倍且不少于 300s；超租约才视为卡死回收。
+        # 试探名额租约：只用于「无法判断归属者活性」的场景（线程 / 同步
+        # 代码，如 CLI）。asyncio Task 归属按 done() 判断：任务在跑时即使
+        # 超过租约也不覆盖——长回合（意图 + 编排 + 子智能体，单次调用还
+        # 叠加应用层与 SDK 重试）可能远超任何固定租约，覆盖后原试探的
+        # 真实成功 / 失败会因归属不匹配被丢弃。线程归属在租约到期后视为
+        # 卡死回收（恢复期的 5 倍且不少于 300s）。
         self._probe_lease_sec = max(recovery_timeout_sec * 5.0, 300.0)
         # 试探名额的持有线程：只有它能把结果计入半开 / 归还名额，
         # 熔断打开前放行的慢请求迟到返回时不能清掉别人的名额
@@ -111,11 +133,19 @@ class CircuitBreaker:
             if s == CircuitState.OPEN:
                 return False
             now = time.monotonic()
-            if (
-                self._half_open_probe_at is not None
-                and now - self._half_open_probe_at < self._probe_lease_sec
-            ):
-                return False
+            if self._half_open_probe_at is not None:
+                alive = _probe_owner_alive(self._probe_owner)
+                expired = (
+                    now - self._half_open_probe_at >= self._probe_lease_sec
+                )
+                if alive is True:
+                    # 归属任务仍在跑：任何情况下都不能覆盖（慢回合可能
+                    # 远超租约，覆盖后它的真实结果会被 owner 检查丢弃）
+                    return False
+                if alive is None and not expired:
+                    # 线程归属无法判断活性：租约内不放行，过期才回收
+                    return False
+                # 归属任务已结束（不可能再记录结果）或线程租约已过：回收
             self._half_open_probe_at = now
             self._probe_owner = _owner_identity()
             return True
