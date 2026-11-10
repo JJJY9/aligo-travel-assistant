@@ -350,6 +350,48 @@ def test_process_query_reloads_long_term_each_turn():
     print("✓ CLI 每轮对话前重载长期记忆")
 
 
+def test_process_query_sanitizes_surrogates_before_persist():
+    """模型输出含孤立代理项：显示 / 轮次元数据 / 落库前统一转义，不再丢整轮。"""
+    agent, _events = _make_cli_stub()
+    lonely = chr(0xD800)
+
+    class _SurrogateIntention:
+        async def reply(self, context):
+            return _TextMessage(
+                json.dumps(
+                    {
+                        "reasoning": "推理" + lonely,
+                        "intents": ["greeting"],
+                        "agent_schedule": [],
+                    }
+                )
+            )
+
+    class _SurrogateOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _TextMessage(
+                json.dumps({"answer": "回答" + lonely, "results": []})
+            )
+
+    agent.intention_agent = _SurrogateIntention()
+    agent.orchestrator = _SurrogateOrchestrator()
+
+    persisted = []
+    original_persist = agent.memory_manager.persist_turn
+
+    def strict_persist(user_content, assistant_content):
+        # 未转义的孤立代理项在这里抛 UnicodeEncodeError（真实 JSON 后端同款）
+        assistant_content.encode("utf-8")
+        persisted.append(assistant_content)
+        original_persist(user_content, assistant_content)
+
+    agent.memory_manager.persist_turn = strict_persist
+    asyncio.run(agent.process_query("你好"))
+    assert persisted, "整轮必须成功落库"
+    assert lonely not in persisted[0], "落库文本必须已转义"
+    print("✓ CLI 模型输出代理项在落库前转义")
+
+
 def test_process_query_stages_user_message_before_orchestration():
     """编排期间短期记忆必须已含本轮提问（_prepare_context 读取用户本轮原话）。"""
     agent, events = _make_cli_stub()
@@ -709,6 +751,7 @@ if __name__ == "__main__":
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
         test_process_query_reloads_long_term_each_turn()
         test_process_query_stages_user_message_before_orchestration()
+        test_process_query_sanitizes_surrogates_before_persist()
         test_process_query_failure_leaves_no_long_term_user_turn()
         test_process_query_memory_failure_not_counted_by_breaker()
         test_process_query_releases_probe_on_early_failure(_mp)

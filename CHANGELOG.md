@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 模型输出的孤立代理项在入库前统一转义：编排器在解析意图结果与每个技能结果后立即 `sanitize_json`（此前只在 ConversationRuntime 出口转义，偏好 / 行程在编排器内部落库时仍会因 `\ud800` 抛 UnicodeEncodeError → MemoryPersistenceError，整轮在 LLM 调用完成后作废）；ConversationRuntime 用清洗后的意图数据重建 Msg 再交给编排器；CLI `process_query` 解析意图 / 编排结果后同样转义再显示与落库——模型截断 emoji 不再导致整轮回答丢失（Web 与 CLI 同口径）
 - 熔断半开试探不再被慢回合「换人」：此前名额只看墙钟租约（默认 300s），一个回合（意图 + 编排 + 全部子智能体，单次 LLM 调用还叠加应用层 4 次 × SDK 3 次重试 × 60s 超时）可能远超租约；到期后 `allow_call` 会放行第二个试探并覆盖归属，原试探的真实成功 / 失败因 owner 不匹配被静默丢弃，单飞失效、慢故障期间每隔几分钟就放行一轮新的重试风暴，熔断可能一直停在 half_open。现在 asyncio Task 归属按 `done()` 判断：任务仍在跑时任何租约都不覆盖；任务已结束（取消 / 异常退出）名额立即回收；线程归属（CLI）无活性信号，仍按租约兜底回收
 - 技能结果解析不再被回显示例污染：模型先复述 prompt 示例、正式结果又被 max_tokens 截断时，preference / event-collection / plan-trip 此前会回退到「第一个完整对象」即示例，把示例偏好（汉庭 / 上海浦东新区）和示例行程（北京 / 2026-02-27）当真写入长期记忆；新增 `last_json_object_with_keys_strict` 区分「末尾结果被截断」并直接错误降级，兜底只接受含结果键的对象（`first_json_object_with_keys`），截断场景绝不回退
 - 偏好智能体名称大小写归一：`canonical_agent_name("Preference"/"PREFERENCE")` 现在返回 `preference`——此前标准名集合只由「目录名 → 标准名」映射的值构造，preference 目录名与标准名同形被漏掉；模型输出大小写变体时偏好智能体照常执行，但落库、偏好上下文合并、结果渲染与「偏好 / 事项 → 行程规划」依赖排序都按精确小写匹配而静默失效（偏好不落库、同技能重复执行、规划先于偏好）

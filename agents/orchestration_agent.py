@@ -25,6 +25,7 @@ from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.agent_names import canonical_agent_name
+from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import (
     has_preference_value,
@@ -243,6 +244,10 @@ class OrchestrationAgent(AgentBase):
                 content=json.dumps({"error": "Invalid intention format"}),
                 role="assistant",
             )
+        # 模型输出可能含孤立代理项（截断 emoji 的 \ud800）：意图数据会进入
+        # 智能体 prompt、进度事件与 _update_memory 落库，先在入口统一转义，
+        # 避免 UTF-8 编码失败让整轮在 LLM 调用后作废
+        intention_data = sanitize_json(intention_data)
         # 规范化调度计划：LLM 可能返回字符串项 / 单对象 / 非法 priority，
         # 直接 sorted 会抛 TypeError 让整轮对话 500
         raw_schedule = intention_data.get("agent_schedule", [])
@@ -724,6 +729,11 @@ class OrchestrationAgent(AgentBase):
                     result = {"output": response.content}
             else:
                 result = response.content
+
+            # 技能结果会直接进入 _update_memory 落库（偏好 / 行程）与聚合
+            # 回复：孤立代理项必须在写库前转义，否则 UTF-8 写入抛
+            # MemoryPersistenceError，整轮在技能 LLM 调用完成后作废
+            result = sanitize_json(result)
 
             # 智能体可能用顶层 error / status=error 表示失败，也可能把失败
             # 嵌套在 results 里并标记 query_success=false（query-info 等技能）；

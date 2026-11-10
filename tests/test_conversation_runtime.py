@@ -375,7 +375,11 @@ def test_model_output_with_lone_surrogate_is_sanitized():
             )
 
     class _SurrogateOrchestrator:
+        def __init__(self):
+            self.intention = None
+
         async def reply(self, intention, on_event=None):
+            self.intention = intention
             return _Response(
                 json.dumps(
                     {
@@ -407,7 +411,13 @@ def test_model_output_with_lone_surrogate_is_sanitized():
     assert assistant_payloads, "整轮应已落库"
     for payload in assistant_payloads:
         payload.encode("utf-8")
-    print("✓ 模型输出的孤立代理项在事件 / 回复 / 落库前转义")
+    passed_intention = runtime.orchestrator.intention
+    assert passed_intention is not None, "意图结果应传给编排器"
+    passed_intention.content.encode("utf-8")
+    assert lonely not in passed_intention.content, (
+        "传给编排器的意图 Msg 必须已转义（否则落库 / prompt 编码失败）"
+    )
+    print("✓ 模型输出的孤立代理项在事件 / 回复 / 落库 / 编排输入前转义")
 
 
 def test_non_dict_model_outputs_are_user_facing_errors():

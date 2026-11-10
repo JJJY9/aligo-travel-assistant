@@ -435,6 +435,45 @@ def test_preference_name_variants_persist_and_dedupe():
     print("✓ Preference 大小写变体落库、去重并保持规划依赖排序")
 
 
+def test_agent_result_surrogates_sanitized_before_persist():
+    """技能结果含孤立代理项：编排器入口转义后偏好仍能落库（不瘫整轮）。"""
+    memory = _StubMemory()
+
+    class _SurrogateStub(_StubAgent):
+        async def reply(self, x):
+            payload = {
+                "preferences": [
+                    {
+                        "type": "hotel_brands",
+                        "value": "汉庭" + chr(0xD800),
+                        "action": "replace",
+                    }
+                ],
+                "has_preferences": True,
+            }
+            return Msg(
+                name=self.name,
+                content=json.dumps(payload, ensure_ascii=False),
+                role="assistant",
+            )
+
+    registry = _CaseInsensitiveRegistry(
+        {"preference": _SurrogateStub("preference")}
+    )
+    orchestrator = OrchestrationAgent(
+        agent_registry=registry, memory_manager=memory
+    )
+    content = asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "preference", "priority": 1}]))
+    ).content
+    result = json.loads(content)
+    assert result["results"][0]["status"] == "success", result
+    saved = memory.long_term.get_preference("hotel_brands")
+    assert "汉庭" in saved and "\\ud800" in saved, saved
+    saved.encode("utf-8")
+    print("✓ 技能结果的孤立代理项在落库前转义")
+
+
 def test_preference_payload_with_extra_keys_does_not_write_garbage():
     """包裹层带 note 等说明键时，不能把 preferences/note 当偏好落库。"""
     memory = _StubMemory()
@@ -1919,6 +1958,7 @@ if __name__ == "__main__":
     test_skill_names_resolve_case_insensitively()
     test_legacy_name_variants_dedupe_and_planning_floor()
     test_preference_name_variants_persist_and_dedupe()
+    test_agent_result_surrogates_sanitized_before_persist()
     test_preference_payload_with_extra_keys_does_not_write_garbage()
     test_memory_update_preference_and_trip()
     test_memory_update_legacy_preferences_and_custom_backend()
