@@ -16,6 +16,53 @@ sys.path.insert(0, project_root)
 from utils.knowledge_stats import DEFAULT_COLLECTION, knowledge_status
 
 
+def test_status_options_mask_path_and_details(monkeypatch):
+    """include_path=False / detail_errors=False：不返回绝对路径与异常原文。"""
+    import utils.knowledge_stats as module
+
+    def boom(path):
+        raise RuntimeError("pymilvus failed at /tmp/secret/milvus_lite.db")
+
+    monkeypatch.setattr(module, "get_milvus_client", boom)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "milvus_lite.db"
+        db.mkdir()
+        status = module.knowledge_status(
+            db, include_path=False, detail_errors=False
+        )
+        assert "path" not in status
+        assert status["available"] is False
+        assert "milvus_lite.db" not in status["reason"]
+        # 默认（CLI / doctor）仍带路径与错误细节
+        status = module.knowledge_status(db)
+        assert status["path"] == str(db)
+
+
+def test_status_lock_timeout_reports_busy(monkeypatch):
+    """导入持写锁期间：带 lock_timeout 的状态查询快速返回「正在写入」。"""
+    import threading
+
+    import utils.knowledge_admin as admin_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "milvus_lite.db"
+        db.mkdir()
+        holder = threading.Thread(target=lambda: admin_module._WRITE_LOCK.acquire())
+        holder.start()
+        holder.join()
+        try:
+            import utils.knowledge_stats as module
+
+            monkeypatch.setattr(
+                module, "get_milvus_client", lambda path: object()
+            )
+            status = module.knowledge_status(db, lock_timeout=0.2)
+        finally:
+            admin_module._WRITE_LOCK.release()
+        assert status["available"] is False
+        assert "正在写入" in status["reason"]
+
+
 def test_missing_database():
     with tempfile.TemporaryDirectory() as tmp:
         status = knowledge_status(Path(tmp) / "missing.db")

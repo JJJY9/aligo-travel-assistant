@@ -975,7 +975,8 @@ def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
 
     response = client.delete(f"/api/sessions/s-cool?user_id={user_id}")
     assert response.status_code == 503, response.text
-    assert "存储暂时不可用" in response.json()["detail"]
+    # 错误文案统一为「…，请稍后再试」：异常细节只进日志，不回显内部信息
+    assert "请稍后再试" in response.json()["detail"]
     # 删除失败：墓碑必须撤销，同一 id 仍可继续对话
     assert app.state.aligo.is_recently_deleted(user_id, "s-cool") is False
 
@@ -1150,6 +1151,49 @@ def test_export_filenames_disambiguate_non_ascii_ids():
     finally:
         _cleanup(user_id)
     print("✓ 导出文件名去撞名（短哈希 + 用户维度）")
+
+
+def test_knowledge_status_masks_path_and_rate_limits():
+    """/api/knowledge 不返回本机路径；挂起写锁期间快速返回「正在写入」。"""
+    import threading
+
+    import utils.knowledge_admin as admin_module
+
+    client = _client()
+    data = client.get("/api/knowledge").json()
+    assert "path" not in data, data
+    assert data.get("available") in (True, False)
+
+    if not data.get("available"):
+        print("✓ /api/knowledge 脱敏（本环境知识库未初始化，跳过写锁繁忙断言）")
+        return
+
+    holder = threading.Thread(target=lambda: admin_module._WRITE_LOCK.acquire())
+    holder.start()
+    holder.join()
+    try:
+        busy = client.get("/api/knowledge").json()
+    finally:
+        admin_module._WRITE_LOCK.release()
+    assert busy.get("available") is False, busy
+    assert "正在写入" in busy.get("reason", ""), busy
+    print("✓ /api/knowledge 脱敏且写锁繁忙时快速返回")
+
+
+def test_doctor_detail_redacts_paths_and_tokens():
+    """/api/doctor 详情脱敏：项目绝对路径 / URL 凭据与查询串不回显。"""
+    from webapp import server as server_module
+
+    detail = (
+        f"技能目录 {server_module.PROJECT_ROOT}/.claude/skills；"
+        "网关 https://user:secret@llm.example/v1?api-key=SECRET"
+    )
+    cleaned = server_module._redact_doctor_detail(detail)
+    assert "user:secret" not in cleaned
+    assert "api-key" not in cleaned and "SECRET" not in cleaned
+    assert str(server_module.PROJECT_ROOT) not in cleaned
+    assert "<项目>" in cleaned and "llm.example" in cleaned
+    print("✓ doctor 详情脱敏（路径 / 凭据 / 查询串）")
 
 
 def test_sessions_listing_and_delete():

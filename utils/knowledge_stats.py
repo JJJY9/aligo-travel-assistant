@@ -49,10 +49,20 @@ def _loaded_embedding_dim() -> int | None:
 def knowledge_status(
     db_path: str | Path | None = None,
     collection: str = DEFAULT_COLLECTION,
+    include_path: bool = True,
+    detail_errors: bool = True,
+    lock_timeout: float | None = None,
 ) -> dict[str, Any]:
-    """返回知识库状态：是否可用、集合名、片段数与数据库路径。"""
+    """返回知识库状态：是否可用、集合名、片段数与数据库路径。
+
+    Web 调用方传 ``include_path=False``（不泄露本机绝对路径）、
+    ``detail_errors=False``（错误只进日志）、``lock_timeout``（导入持写锁
+    期间快速返回「正在写入」而不是把请求线程堆在锁上）。
+    """
     db = Path(db_path) if db_path is not None else default_db_path()
-    base: dict[str, Any] = {"collection": collection, "path": str(db)}
+    base: dict[str, Any] = {"collection": collection}
+    if include_path:
+        base["path"] = str(db)
 
     # Milvus Lite 2.x 为单文件，3.x 为目录，两者都视为已初始化
     if not db.exists():
@@ -68,13 +78,11 @@ def knowledge_status(
         lock_ctx = _WRITE_LOCK
     except Exception:  # noqa: BLE001 - 维护模块不可用时保持原行为
         lock_ctx = contextlib.nullcontext()
-    try:
-        client = get_milvus_client(str(db))
-        with lock_ctx:
-            if not client.has_collection(collection):
-                return {**base, "available": False, "reason": "集合不存在"}
-            stats = client.get_collection_stats(collection)
-            dimension = _collection_dimension(client, collection)
+    def _snapshot(client: Any) -> dict[str, Any]:
+        if not client.has_collection(collection):
+            return {**base, "available": False, "reason": "集合不存在"}
+        stats = client.get_collection_stats(collection)
+        dimension = _collection_dimension(client, collection)
         payload = {
             **base,
             "available": True,
@@ -86,6 +94,24 @@ def knowledge_status(
         if expected is not None and dimension is not None:
             payload["dimension_mismatch"] = int(dimension) != int(expected)
         return payload
+
+    try:
+        client = get_milvus_client(str(db))
+        if lock_timeout is not None:
+            acquired = lock_ctx.acquire(timeout=lock_timeout)
+            if not acquired:
+                return {
+                    **base,
+                    "available": False,
+                    "reason": "知识库正在写入（导入进行中），请稍后刷新",
+                }
+            try:
+                return _snapshot(client)
+            finally:
+                lock_ctx.release()
+        with lock_ctx:
+            return _snapshot(client)
     except Exception as exc:  # noqa: BLE001 - 状态查询失败不影响主流程
         logger.warning("获取知识库状态失败: %s", exc)
-        return {**base, "available": False, "reason": str(exc)}
+        reason = str(exc) if detail_errors else "状态查询失败，请稍后再试（详见服务端日志）"
+        return {**base, "available": False, "reason": reason}

@@ -1756,7 +1756,21 @@ def _open_long_term(user_id: str, strict: bool = False) -> Any:
         ) from exc
     except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
         logger.warning("打开长期记忆失败（%s）：%s", user_id, exc)
-        raise HTTPException(status_code=503, detail=f"存储暂不可用：{exc}") from exc
+        raise _storage_failure("存储暂不可用", exc) from exc
+
+
+def _redact_doctor_detail(text: str) -> str:
+    """诊断输出脱敏：项目绝对路径替换为 <项目>，URL 去掉凭据与查询串。"""
+    cleaned = str(text).replace(str(PROJECT_ROOT), "<项目>")
+    cleaned = re.sub(r"(https?://)[^\s/@]+@", r"\1***@", cleaned)
+    cleaned = re.sub(r"(https?://[^\s?#]+)[?#][^\s]*", r"\1", cleaned)
+    return cleaned
+
+
+def _storage_failure(action: str, exc: Exception) -> HTTPException:
+    """存储 / 依赖类失败的统一 503：细节只进日志，响应不回显内部路径 / SQL。"""
+    logger.warning("%s失败: %s", action, exc)
+    return HTTPException(status_code=503, detail=f"{action}，请稍后再试")
 
 
 def _close_long_term(store: Any) -> None:
@@ -2506,15 +2520,28 @@ def create_app(model: Any = None) -> FastAPI:
         return {
             "status": "fail" if any(item.status == "fail" for item in results) else "ok",
             "checks": [
-                {"name": item.name, "status": item.status, "detail": item.detail}
+                {
+                    "name": item.name,
+                    "status": item.status,
+                    # 脱敏：项目绝对路径 / 上游 URL 的凭据与查询串不回显给客户端
+                    "detail": _redact_doctor_detail(item.detail),
+                }
                 for item in results
             ],
         }
 
     @app.get("/api/knowledge")
-    def knowledge() -> dict[str, Any]:
-        """知识库状态（集合 / 片段数 / 是否可用）。"""
-        return knowledge_status()
+    def knowledge(request: Request, response: Response) -> dict[str, Any]:
+        """知识库状态（集合 / 片段数 / 是否可用）。
+
+        接入知识库限流桶；不返回本机绝对路径、错误细节只进日志；导入持写
+        锁期间快速返回「正在写入」，不把请求线程堆在写锁上（防止用未限流
+        的只读接口打满线程池）。
+        """
+        response.headers.update(_enforce_kb_rate_limit(state, request))
+        return knowledge_status(
+            include_path=False, detail_errors=False, lock_timeout=0.5
+        )
 
     @app.get("/api/knowledge/documents")
     def knowledge_documents(
@@ -2540,7 +2567,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503，避免泄露内部堆栈
             logger.warning("列出知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
+            raise _storage_failure("知识库暂不可用", exc) from exc
 
     @app.get("/api/knowledge/categories")
     def knowledge_categories(request: Request, response: Response) -> dict[str, Any]:
@@ -2555,7 +2582,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503
             logger.warning("统计知识分类失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"知识库暂不可用：{exc}") from exc
+            raise _storage_failure("知识库暂不可用", exc) from exc
 
     @app.get("/api/knowledge/search")
     def knowledge_search(
@@ -2579,7 +2606,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
             logger.warning("语义检索知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"检索失败：{exc}") from exc
+            raise _storage_failure("检索失败", exc) from exc
         return {"query": query, "results": results}
 
     @app.get("/api/knowledge/eval")
@@ -2607,17 +2634,13 @@ def create_app(model: Any = None) -> FastAPI:
                 from utils.rag_eval import evaluate_retrieval
             except ImportError as exc:
                 logger.warning("检索评测依赖不可用: %s", exc)
-                raise HTTPException(
-                    status_code=503, detail=f"评测依赖不可用：{exc}"
-                ) from exc
+                raise _storage_failure("评测依赖不可用", exc) from exc
 
             try:
                 agent = RAGKnowledgeAgent(collection_name=status["collection"])
             except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
                 logger.warning("检索评测初始化失败: %s", exc)
-                raise HTTPException(
-                    status_code=503, detail=f"评测初始化失败：{exc}"
-                ) from exc
+                raise _storage_failure("评测初始化失败", exc) from exc
             if not agent.initialized:
                 raise HTTPException(status_code=503, detail="RAG 依赖未安装")
             try:
@@ -2652,7 +2675,7 @@ def create_app(model: Any = None) -> FastAPI:
                 return result
             except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
                 logger.warning("检索评测失败: %s", exc)
-                raise HTTPException(status_code=503, detail=f"评测失败：{exc}") from exc
+                raise _storage_failure("评测失败", exc) from exc
         finally:
             state.eval_lock.release(token)
 
@@ -2676,7 +2699,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取重复知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"读取失败：{exc}") from exc
+            raise _storage_failure("读取失败", exc) from exc
         shown = groups if limit <= 0 else groups[:limit]
         return {
             "total_groups": len(groups),
@@ -2713,7 +2736,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 读取 / 删除失败统一提示
             logger.warning("清理重复知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"清理失败：{exc}") from exc
+            raise _storage_failure("清理失败", exc) from exc
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
@@ -2732,7 +2755,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("添加知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"添加失败：{exc}") from exc
+            raise _storage_failure("添加失败", exc) from exc
 
     @app.put("/api/knowledge/documents/{doc_id}")
     def knowledge_update(
@@ -2765,7 +2788,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("更新知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"更新失败：{exc}") from exc
+            raise _storage_failure("更新失败", exc) from exc
 
     @app.get("/api/knowledge/documents/{doc_id}/group")
     def knowledge_document_group(
@@ -2781,7 +2804,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取整组知识文档失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"读取失败：{exc}") from exc
+            raise _storage_failure("读取失败", exc) from exc
         if result is None:
             raise HTTPException(status_code=404, detail="知识片段不存在")
         return result
@@ -2804,7 +2827,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
             logger.warning("删除知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            raise _storage_failure("删除失败", exc) from exc
         if not removed:
             raise HTTPException(status_code=404, detail="知识片段不存在")
         return {
@@ -2826,7 +2849,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
             logger.warning("导出知识片段失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
+            raise _storage_failure("导出失败", exc) from exc
         payload = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -2881,9 +2904,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
                 logger.warning("导入知识片段失败: %s", exc)
-                raise HTTPException(
-                    status_code=503, detail=f"导入失败：{exc}"
-                ) from exc
+                raise _storage_failure("导入失败", exc) from exc
         finally:
             state.kb_import_queue_slots.release()
 
@@ -2918,9 +2939,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - 预览失败统一提示
                 logger.warning("预览导入知识片段失败: %s", exc)
-                raise HTTPException(
-                    status_code=503, detail=f"预览失败：{exc}"
-                ) from exc
+                raise _storage_failure("预览失败", exc) from exc
         finally:
             state.kb_import_queue_slots.release()
 
@@ -2995,7 +3014,7 @@ def create_app(model: Any = None) -> FastAPI:
             value = store.get_preference(pref_type)
         except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
             logger.warning("保存偏好失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
+            raise _storage_failure("保存失败", exc) from exc
         finally:
             _close_long_term(store)
         return {"type": pref_type, "value": value}
@@ -3013,7 +3032,7 @@ def create_app(model: Any = None) -> FastAPI:
             removed = store.delete_preference(pref_type)
         except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
             logger.warning("删除偏好失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            raise _storage_failure("删除失败", exc) from exc
         finally:
             _close_long_term(store)
         return {"type": pref_type, "deleted": removed}
@@ -3073,7 +3092,7 @@ def create_app(model: Any = None) -> FastAPI:
             titles = store.get_session_titles()
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("导出全部会话失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
+            raise _storage_failure("读取会话失败", exc) from exc
         finally:
             _close_long_term(store)
         from utils.json_safe import sanitize_json
@@ -3122,7 +3141,7 @@ def create_app(model: Any = None) -> FastAPI:
             archived_ids = set(store.get_archived_sessions())
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取会话失败（%s）：%s", session_id, exc)
-            raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
+            raise _storage_failure("读取会话失败", exc) from exc
         finally:
             _close_long_term(store)
         title = str(titles.get(session_id) or "")
@@ -3171,7 +3190,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="会话不存在") from exc
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("设置会话标题失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
+            raise _storage_failure("保存失败", exc) from exc
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "title": saved}
@@ -3192,7 +3211,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="会话不存在") from exc
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("设置会话置顶失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"保存失败：{exc}") from exc
+            raise _storage_failure("保存失败", exc) from exc
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "pinned": session_id in pinned}
@@ -3212,7 +3231,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("归档会话失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"操作失败：{exc}") from exc
+            raise _storage_failure("操作失败", exc) from exc
         finally:
             _close_long_term(store)
         return {"session_id": session_id, "archived": payload.archived}
@@ -3237,7 +3256,7 @@ def create_app(model: Any = None) -> FastAPI:
             titles = store.get_session_titles()
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("导出会话失败（%s）：%s", session_id, exc)
-            raise HTTPException(status_code=503, detail=f"读取会话失败：{exc}") from exc
+            raise _storage_failure("读取会话失败", exc) from exc
         finally:
             _close_long_term(store)
         from utils.json_safe import sanitize_json
@@ -3347,7 +3366,7 @@ def create_app(model: Any = None) -> FastAPI:
                         state.unmark_deleted, user_id, session_id, token
                     )
                 logger.warning("检查会话是否存在失败: %s", exc)
-                raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+                raise _storage_failure("删除失败", exc) from exc
 
             def _delete() -> int:
                 store = _open_long_term(user_id, strict=True)
@@ -3379,7 +3398,7 @@ def create_app(model: Any = None) -> FastAPI:
                             state.unmark_deleted, user_id, session_id, token
                         )
                 logger.warning("删除会话失败: %s", exc)
-                raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+                raise _storage_failure("删除失败", exc) from exc
             if removed == 0 and not existed and not already_marked:
                 # 从未存在的 id：撤销本请求的墓碑，允许用该 id 新开对话；
                 # 属于其它实例的共享墓碑因 token 不匹配而保留
@@ -3409,7 +3428,7 @@ def create_app(model: Any = None) -> FastAPI:
                 removed = await asyncio.to_thread(_remove_last_turn)
             except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
                 logger.warning("删除最后一轮对话失败: %s", exc)
-                raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+                raise _storage_failure("删除失败", exc) from exc
 
             if removed > 0:
                 def _truncate_short_term() -> None:
@@ -3757,7 +3776,7 @@ def create_app(model: Any = None) -> FastAPI:
             all_trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("列出历史行程失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"读取行程失败：{exc}") from exc
+            raise _storage_failure("读取行程失败", exc) from exc
         finally:
             _close_long_term(store)
         trips = _filter_trips_by_query(all_trips, q)
@@ -3835,7 +3854,7 @@ def create_app(model: Any = None) -> FastAPI:
             )
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("添加行程失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"添加行程失败：{exc}") from exc
+            raise _storage_failure("添加行程失败", exc) from exc
         finally:
             _close_long_term(store)
         return {
@@ -3890,9 +3909,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - 读取 / 写入失败统一提示
                 logger.warning("导入行程失败: %s", exc)
-                raise HTTPException(
-                    status_code=503, detail=f"导入行程失败：{exc}"
-                ) from exc
+                raise _storage_failure("导入行程失败", exc) from exc
         finally:
             state.import_queue_slots.release()
         if not result["rows"]:
@@ -3999,7 +4016,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("更新行程失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"更新行程失败：{exc}") from exc
+            raise _storage_failure("更新行程失败", exc) from exc
         finally:
             _close_long_term(store)
         return {
@@ -4021,7 +4038,7 @@ def create_app(model: Any = None) -> FastAPI:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("导出行程日历失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
+            raise _storage_failure("导出失败", exc) from exc
         finally:
             _close_long_term(store)
         return Response(
@@ -4054,7 +4071,7 @@ def create_app(model: Any = None) -> FastAPI:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("导出行程失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
+            raise _storage_failure("导出失败", exc) from exc
         finally:
             _close_long_term(store)
         filtered = _filter_trips_by_status(_filter_trips_by_query(trips, q), status)
@@ -4113,9 +4130,7 @@ def create_app(model: Any = None) -> FastAPI:
                     plan = plan_trip_dedupe(store)
                 except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
                     logger.warning("读取行程失败（去重，%s）: %s", user_id, exc)
-                    raise HTTPException(
-                        status_code=503, detail=f"读取行程失败：{exc}"
-                    ) from exc
+                    raise _storage_failure("读取行程失败", exc) from exc
                 if dry_run:
                     return {
                         "user_id": user_id,
@@ -4165,7 +4180,7 @@ def create_app(model: Any = None) -> FastAPI:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("导出行程日历失败（%s）：%s", trip_id, exc)
-            raise HTTPException(status_code=503, detail=f"导出失败：{exc}") from exc
+            raise _storage_failure("导出失败", exc) from exc
         finally:
             _close_long_term(store)
         if _ambiguous_trip_id(trips, trip_id):
@@ -4214,7 +4229,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise
         except Exception as exc:  # noqa: BLE001 - 存储写入失败要显式返回 503
             logger.warning("删除行程失败: %s", exc)
-            raise HTTPException(status_code=503, detail=f"删除失败：{exc}") from exc
+            raise _storage_failure("删除失败", exc) from exc
         finally:
             _close_long_term(store)
         if not removed:
@@ -4265,9 +4280,7 @@ def create_app(model: Any = None) -> FastAPI:
                 ) from exc
             except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
                 logger.warning("导出知识片段失败: %s", exc)
-                raise HTTPException(
-                    status_code=503, detail=f"知识库导出失败：{exc}"
-                ) from exc
+                raise _storage_failure("知识库导出失败", exc) from exc
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
         from utils.user_import import backup_limit_problem
