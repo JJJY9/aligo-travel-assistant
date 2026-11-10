@@ -618,6 +618,158 @@ def test_helpers_tolerate_bad_shapes(monkeypatch):
     print("✓ 天气辅助函数对非法形状的容错")
 
 
+def _patch_reclaim_env(monkeypatch, claim_sequence, cache_values, failure_values,
+                      degraded_values):
+    """按调用顺序返回预设值的单飞辅助桩（覆盖「等待超时后再次登记」路径）。"""
+    state = {"claims": 0, "cache": 0, "failure": 0, "degraded": 0}
+    finished = []
+
+    def fake_claim(key):
+        index = state["claims"]
+        state["claims"] += 1
+        event = threading.Event()
+        event.set()
+        return (claim_sequence[index] if index < len(claim_sequence) else False, event)
+
+    def _next(kind, values):
+        def fake(key):
+            index = state[kind]
+            state[kind] += 1
+            return values[index] if index < len(values) else values[-1]
+        return fake
+
+    monkeypatch.setattr(weather, "_claim_fetch", fake_claim)
+    monkeypatch.setattr(weather, "_cache_hit", _next("cache", cache_values))
+    monkeypatch.setattr(weather, "_failure_hit", _next("failure", failure_values))
+    monkeypatch.setattr(weather, "_degraded_hit", _next("degraded", degraded_values))
+    monkeypatch.setattr(
+        weather, "_finish_fetch", lambda key, event: finished.append(key)
+    )
+
+    def _no_upstream(*args):
+        raise AssertionError("命中缓存 / 失败 / 降级时不能再打上游")
+
+    monkeypatch.setattr(weather, "_fetch_weather_uncached", _no_upstream)
+    return state, finished
+
+
+def test_reclaim_leader_reuses_cached_result(monkeypatch):
+    """等待超时后再次抢到单飞：其它线程已写入缓存时直接复用。"""
+    cached = {"temperature": 20, "source": "cache"}
+    state, finished = _patch_reclaim_env(
+        monkeypatch,
+        claim_sequence=[False, True],
+        cache_values=[None, None, cached],
+        failure_values=[None],
+        degraded_values=[None],
+    )
+    assert weather.fetch_weather("北京", timeout=0.01) is cached
+    assert state["claims"] == 2, "第二次必须重新登记单飞"
+    assert finished, "复用缓存后要释放单飞名额"
+    print("✓ 再抢占比：复用缓存结果")
+
+
+def test_reclaim_leader_raises_failure_written_by_others(monkeypatch):
+    """再抢到单飞后发现其它线程已登记失败：直接抛同一失败，不打上游。"""
+    state, finished = _patch_reclaim_env(
+        monkeypatch,
+        claim_sequence=[False, True],
+        cache_values=[None],
+        failure_values=[None, None, "天气接口暂时不可用"],
+        degraded_values=[None],
+    )
+    with pytest.raises(weather.WeatherError, match="天气接口暂时不可用"):
+        weather.fetch_weather("上海", timeout=0.01)
+    assert state["claims"] == 2 and finished
+    print("✓ 再抢占比：复用其它线程登记的失败")
+
+
+def test_second_reclaim_follower_reuses_failure(monkeypatch):
+    """第二次仍等待：超时后其它线程已登记失败 → 同样直接抛出。"""
+    _patch_reclaim_env(
+        monkeypatch,
+        claim_sequence=[False, False],
+        cache_values=[None],
+        failure_values=[None, None, "上游故障"],
+        degraded_values=[None],
+    )
+    with pytest.raises(weather.WeatherError, match="上游故障"):
+        weather.fetch_weather("深圳", timeout=0.01)
+    print("✓ 二次等待：复用失败结果")
+
+
+def test_fetch_uncached_wraps_missing_location_fields(monkeypatch):
+    """地理编码结果缺少经纬度：KeyError 包装为 WeatherError（不再裸抛）。"""
+    incomplete = {"results": [{"name": "北京", "timezone": "Asia/Shanghai"}]}
+    monkeypatch.setattr(
+        weather.requests, "get", lambda *a, **k: _Response(incomplete)
+    )
+    with pytest.raises(weather.WeatherError, match="格式异常"):
+        weather.fetch_weather("北京", timeout=0.5)
+    print("✓ 缺少经纬度包装为 WeatherError")
+
+
+def test_parse_weather_tolerates_none_daily_entries():
+    """daily 列表里的 None 条目被跳过而不是抛异常（宽容形状）。"""
+    data = {
+        "current": {
+            "temperature_2m": 10,
+            "relative_humidity_2m": 40,
+            "weather_code": 0,
+        },
+        "daily": {
+            "time": ["2026-12-01"],
+            "weather_code": [None],
+            "temperature_2m_min": [None],
+            "temperature_2m_max": [None],
+        },
+    }
+    result = weather._parse_weather("北京", {"name": "北京"}, data)
+    assert isinstance(result, dict) and "daily" in result
+    print("✓ daily 非法条目被宽容跳过")
+
+
+def test_second_wait_follower_reuses_cached(monkeypatch):
+    """第二次仍等待：超时后缓存已被写入 → 直接复用缓存结果。"""
+    cached = {"temperature": 9}
+    _patch_reclaim_env(
+        monkeypatch,
+        claim_sequence=[False, False],
+        cache_values=[None, None, cached],
+        failure_values=[None],
+        degraded_values=[None],
+    )
+    assert weather.fetch_weather("重庆", timeout=0.01) is cached
+    print("✓ 二次等待：复用缓存结果")
+
+
+def test_failure_cache_evicts_oldest_when_full(monkeypatch):
+    """失败缓存满后淘汰最早一条（新 key 仍能登记）。"""
+    monkeypatch.setattr(weather, "_CACHE_MAX_ENTRIES", 2)
+    weather.clear_weather_cache()
+    weather._store_failure("k1", "err-1")
+    weather._store_failure("k2", "err-2")
+    weather._store_failure("k3", "err-3")
+    assert weather._failure_hit("k1") is None
+    assert weather._failure_hit("k2") == "err-2"
+    assert weather._failure_hit("k3") == "err-3"
+    print("✓ 失败缓存满时淘汰最早条目")
+
+
+def test_second_reclaim_follower_reuses_degraded(monkeypatch):
+    """第二次仍等待：领先线程已降级（沿用旧数据）时复用同一份结果。"""
+    degraded = {"temperature": 5, "stale": True}
+    _patch_reclaim_env(
+        monkeypatch,
+        claim_sequence=[False, False],
+        cache_values=[None],
+        failure_values=[None],
+        degraded_values=[None, None, degraded],
+    )
+    assert weather.fetch_weather("广州", timeout=0.01) is degraded
+    print("✓ 二次等待：复用降级旧数据")
+
+
 if __name__ == "__main__":
     for case in (
         test_stale_fallback_merges_concurrent_requests,
@@ -642,6 +794,13 @@ if __name__ == "__main__":
         test_stale_cache_expires,
         test_unknown_city_does_not_use_stale_cache,
         test_helpers_tolerate_bad_shapes,
+        test_reclaim_leader_reuses_cached_result,
+        test_reclaim_leader_raises_failure_written_by_others,
+        test_second_reclaim_follower_reuses_failure,
+        test_second_reclaim_follower_reuses_degraded,
+        test_second_wait_follower_reuses_cached,
+        test_fetch_uncached_wraps_missing_location_fields,
+        test_failure_cache_evicts_oldest_when_full,
     ):
         mp = pytest.MonkeyPatch()
         try:
@@ -649,5 +808,6 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_empty_city_raises()
+    test_parse_weather_tolerates_none_daily_entries()
     test_weather_codes_include_freezing_drizzle()
     print("\n全部通过")
