@@ -825,6 +825,29 @@ def test_strict_long_term_raises_when_unreachable():
     print("✓ strict 创建在 PG 不可用时直接失败")
 
 
+def test_strict_error_message_redacts_dsn(monkeypatch):
+    """strict 失败的错误文本与日志不带 DSN 凭据（userinfo / 查询串被清除）。"""
+    dsn = "postgresql://user:SECRET@127.0.0.1:1/db?password=SECRET"
+    _set("redis_url", "")
+    _set("postgres_dsn", dsn)
+    try:
+
+        def boom(user_id, dsn_arg):
+            raise RuntimeError(f"could not connect to {dsn_arg}")
+
+        monkeypatch.setattr(storage, "PostgresLongTermMemory", boom)
+        with pytest.raises(MemoryPersistenceError) as info:
+            storage.create_long_term_memory(
+                "u-redact", tempfile.mkdtemp(), strict=True
+            )
+        message = str(info.value)
+        assert "SECRET" not in message, message
+        assert "***@" in message
+    finally:
+        _restore_local()
+    print("✓ strict 错误文本脱敏 DSN 凭据")
+
+
 def test_strict_long_term_raises_during_cooldown():
     """冷却期内 strict 创建直接失败；非 strict 仍回退 JSON 保持可用。"""
     dsn = "postgresql://user:pass@db.example/aligo"
@@ -2554,6 +2577,11 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_redis_import_failure_falls_back(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_strict_error_message_redacts_dsn(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")

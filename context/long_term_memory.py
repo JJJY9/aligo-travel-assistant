@@ -491,7 +491,8 @@ class LongTermMemory:
         else:
             preferences.append({"type": pref_type, "value": merged})
         self._persist()
-        logger.info(f"Appended preference {pref_type}: {value} (total {len(merged)})")
+        # 偏好值可能是用户隐私内容（证件 / 航班等）：日志只记类型与数量
+        logger.info(f"Appended preference {pref_type} (total {len(merged)})")
         return merged
 
     @_locked_mutation
@@ -518,7 +519,7 @@ class LongTermMemory:
             preferences.append({"type": pref_type, "value": value})
 
         self._persist()
-        logger.info(f"Saved preference: {pref_type} = {value}")
+        logger.info(f"Saved preference: {pref_type}")
 
     def get_preference(self, pref_type: str | None = None) -> Any:
         """
@@ -889,7 +890,7 @@ class LongTermMemory:
             titles.pop(session_id, None)
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
-        logger.info(f"Set session title: {session_id} -> {cleaned or '(auto)'}")
+        logger.info(f"Set session title: {session_id} (len={len(cleaned)})")
         return True
 
     def get_session_titles(self) -> dict[str, str]:
