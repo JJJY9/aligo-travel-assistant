@@ -19,6 +19,10 @@ def test_canonical_agent_name_cases():
     assert canonical_agent_name("Itinerary_Planning") == "itinerary_planning"
     assert canonical_agent_name("RAG_Knowledge") == "rag_knowledge"
     assert canonical_agent_name("Event_Collection") == "event_collection"
+    # preference 目录名与标准名同形：标准名变体同样要归一（否则偏好不落库）
+    assert canonical_agent_name("Preference") == "preference"
+    assert canonical_agent_name("PREFERENCE") == "preference"
+    assert canonical_agent_name(" preference ") == "preference"
     # 已是标准名保持原样，首尾空白剥离
     assert canonical_agent_name(" information_query ") == "information_query"
     # 未知名称原样保留

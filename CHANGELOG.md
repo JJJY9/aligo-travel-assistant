@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 偏好智能体名称大小写归一：`canonical_agent_name("Preference"/"PREFERENCE")` 现在返回 `preference`——此前标准名集合只由「目录名 → 标准名」映射的值构造，preference 目录名与标准名同形被漏掉；模型输出大小写变体时偏好智能体照常执行，但落库、偏好上下文合并、结果渲染与「偏好 / 事项 → 行程规划」依赖排序都按精确小写匹配而静默失效（偏好不落库、同技能重复执行、规划先于偏好）
 - 健康检查与 doctor 同口径：`/api/health` 在技能目录缺失 / 无可加载技能时 `status` 报 `degraded`（`skills` 新增 `ok`），不再监控全绿而对话只能返回空结果；doctor 的「技能目录」逐项校验 SKILL.md（缺失 / 空 / 非法 frontmatter 时警告并点名技能）——SkillLoader 会静默跳过这些技能、意图提示里看不到它们，此前 doctor 只数 `agent.py` 仍报 ok
 - doctor 凭据遮蔽覆盖更多粘贴形态：缺 scheme 的 `user:pass@host`、只有密码的 `redis://:pass@`、`password=` 关键字与 URL 查询串（psycopg 报错回显的完整连接串不再带出密码）；`LLM_API_KEY` 为纯空白时如实报告密钥来自 config_local.py；doctor / weather 的 `--JSON` / `--offline` 大小写与其它命令一致
 - RAG 自检不再假绿：全新 CLI 进程未加载嵌入模型时，doctor 按模型目录 `1_Pooling/config.json` 配置推断维度（新增 `configured_model_dimension`，不加载 torch）并与集合维度比对，换模型后直接提示重新初始化；ask-question 技能在技能目录位于仓库外（`ALIGO_SKILLS_DIR`）时不再因 `parents[4]` 越界报错，改用 config 模块目录 / 当前目录兜底
