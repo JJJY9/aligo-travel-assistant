@@ -800,7 +800,6 @@ if __name__ == "__main__":
         test_second_reclaim_follower_reuses_degraded,
         test_second_wait_follower_reuses_cached,
         test_fetch_uncached_wraps_missing_location_fields,
-        test_parse_weather_tolerates_none_daily_entries,
         test_failure_cache_evicts_oldest_when_full,
     ):
         mp = pytest.MonkeyPatch()
@@ -809,5 +808,6 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_empty_city_raises()
+    test_parse_weather_tolerates_none_daily_entries()
     test_weather_codes_include_freezing_drizzle()
     print("\n全部通过")
