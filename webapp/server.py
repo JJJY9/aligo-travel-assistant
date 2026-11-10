@@ -2975,7 +2975,9 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(
                 status_code=422, detail="偏好值不能为空（清空请使用 DELETE 接口）"
             )
-        store = _open_long_term(payload.user_id)
+        # strict：PG 故障期间不能把偏好静默写进回退 JSON（恢复后读 PG，
+        # 偏好「凭空消失」；与删除 / 行程写入 / CLI 的严格语义一致）
+        store = _open_long_term(payload.user_id, strict=True)
         try:
             store.save_preference(pref_type, payload.value)
             value = store.get_preference(pref_type)
@@ -3140,7 +3142,8 @@ def create_app(model: Any = None) -> FastAPI:
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """设置或清除会话自定义标题（空标题恢复自动标题）。"""
-        store = _open_long_term(payload.user_id)
+        # strict：回退 JSON 里没有该会话时会误报 404；元数据也不能写错库
+        store = _open_long_term(payload.user_id, strict=True)
         try:
             # 存在性检查与写入在存储层的同一把写锁内完成：
             # 并发 DELETE 落在两者之间时不会写入幽灵标题
@@ -3162,7 +3165,8 @@ def create_app(model: Any = None) -> FastAPI:
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """置顶 / 取消置顶会话。"""
-        store = _open_long_term(payload.user_id)
+        # strict：同标题接口，PG 故障期不能作用在回退 JSON 上
+        store = _open_long_term(payload.user_id, strict=True)
         try:
             if not store.set_session_pinned(session_id, payload.pinned):
                 raise LookupError("会话不存在")
@@ -3182,7 +3186,8 @@ def create_app(model: Any = None) -> FastAPI:
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """归档 / 恢复会话（归档只从列表隐藏，不删除消息）。"""
-        store = _open_long_term(payload.user_id)
+        # strict：同标题接口，PG 故障期不能作用在回退 JSON 上
+        store = _open_long_term(payload.user_id, strict=True)
         try:
             if not store.set_session_archived(session_id, payload.archived):
                 raise HTTPException(status_code=404, detail="会话不存在或没有消息")
