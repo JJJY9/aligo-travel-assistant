@@ -390,6 +390,53 @@ def test_knowledge_base_dimension_mismatch_warns(monkeypatch):
     print("✓ 知识库维度不一致 → 警告")
 
 
+def test_configured_model_dimension_reads_pooling_config(monkeypatch):
+    """模型目录 1_Pooling 配置可推出维度（不加载 torch）；缺失/损坏返回 None。"""
+    from utils.embedding_model import configured_model_dimension
+
+    with tempfile.TemporaryDirectory() as tmp:
+        model_dir = Path(tmp) / "model"
+        (model_dir / "1_Pooling").mkdir(parents=True)
+        (model_dir / "1_Pooling" / "config.json").write_text(
+            '{"word_embedding_dimension": 768}', encoding="utf-8"
+        )
+        assert configured_model_dimension(model_dir) == 768
+        assert configured_model_dimension(Path(tmp) / "missing") is None
+        broken = Path(tmp) / "broken"
+        (broken / "1_Pooling").mkdir(parents=True)
+        (broken / "1_Pooling" / "config.json").write_text("not-json", encoding="utf-8")
+        assert configured_model_dimension(broken) is None
+    print("✓ 模型目录配置维度推断（不加载模型）")
+
+
+def test_knowledge_base_config_dimension_mismatch_warns(monkeypatch):
+    """未加载嵌入模型的进程：按模型目录配置推断维度，换模型后 doctor 不假绿。"""
+    from config import RAG_CONFIG
+    from utils import knowledge_stats
+
+    with tempfile.TemporaryDirectory() as tmp:
+        model_dir = Path(tmp) / "model"
+        (model_dir / "1_Pooling").mkdir(parents=True)
+        (model_dir / "1_Pooling" / "config.json").write_text(
+            '{"word_embedding_dimension": 768}', encoding="utf-8"
+        )
+        monkeypatch.setitem(RAG_CONFIG, "embedding_model", str(model_dir))
+        monkeypatch.setattr(
+            knowledge_stats,
+            "knowledge_status",
+            lambda path=None: {
+                "collection": "c",
+                "available": True,
+                "documents": 3,
+                "dimension": 512,
+            },
+        )
+        result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_WARN, result
+    assert "768" in result.detail and "不一致" in result.detail, result.detail
+    print("✓ 未加载模型时按配置维度发现不一致")
+
+
 def test_storage_probe_sets_statement_timeout(monkeypatch):
     """PostgreSQL 自检探测必须给 DDL / 查询设 statement_timeout。"""
     from config import STORAGE_CONFIG
@@ -785,6 +832,8 @@ if __name__ == "__main__":
         test_config_and_dependencies_branches,
         test_model_files_accepts_huggingface_id,
         test_knowledge_base_dimension_mismatch_warns,
+        test_configured_model_dimension_reads_pooling_config,
+        test_knowledge_base_config_dimension_mismatch_warns,
         test_storage_probe_sets_statement_timeout,
         test_llm_connectivity_branches,
         test_python_version_below_requirement,

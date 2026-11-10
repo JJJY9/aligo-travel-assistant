@@ -321,7 +321,20 @@ def _default_model_dir() -> Path:
     if configured:
         candidate = Path(configured).expanduser()
         if not candidate.is_absolute():
-            candidate = anchor / candidate
+            anchored = anchor / candidate
+            if anchored.exists():
+                return anchored
+            # 技能目录在仓库外（ALIGO_SKILLS_DIR）时锚点不是项目根：
+            # 再用 config 模块位置（项目代码所在目录）兜底
+            try:
+                import config as _config
+
+                fallback = Path(_config.__file__).resolve().parent / candidate
+                if fallback.exists():
+                    return fallback
+            except Exception:  # noqa: BLE001 - 兜底不可用时保持原锚点
+                pass
+            return anchored
         return candidate
     return anchor / "data" / "models" / "bge-small-zh-v1.5"
 
@@ -411,6 +424,23 @@ def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
             f"已初始化 {count} 个片段，但集合维度（{status.get('dimension')}）"
             "与当前嵌入模型不一致，请重新初始化知识库",
         )
+    collection_dim = status.get("dimension")
+    if collection_dim:
+        # 全新 CLI 进程没有已加载的嵌入模型（peek 恒为 None）：改读模型
+        # 目录的配置推断维度（不加载 torch），换模型后 doctor 不再假绿
+        try:
+            from utils.embedding_model import configured_model_dimension
+
+            configured_dim = configured_model_dimension(_default_model_dir())
+        except Exception:  # noqa: BLE001 - 可选依赖缺失按未知处理
+            configured_dim = None
+        if configured_dim is not None and configured_dim != int(collection_dim):
+            return CheckResult(
+                "RAG 知识库",
+                STATUS_WARN,
+                f"已初始化 {count} 个片段，但集合维度（{collection_dim}）"
+                f"与当前嵌入模型配置（{configured_dim}）不一致，请重新初始化知识库",
+            )
     return CheckResult("RAG 知识库", STATUS_OK, f"已初始化，{count} 个知识片段")
 
 
