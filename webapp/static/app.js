@@ -37,6 +37,11 @@ const PREF_NAMES = {
   budget_level: "预算等级",
 };
 
+// 偏好类型 → 最近一次已知值。渲染和保存成功后都更新：编辑按钮若只用
+// 渲染时闭包里的旧值，刷新失败后再点编辑会回填旧值、再次保存把刚成功
+// 的新值静默覆盖回去
+const preferenceLatest = new Map();
+
 // 存储访问一律按「种类」取对象：隐私设置 / 沙箱 iframe 下访问
 // window.sessionStorage 这个属性本身就会抛 SecurityError——把对象作为
 // 实参传入时，异常发生在调用之前，helper 里的 try 根本接不住
@@ -109,6 +114,9 @@ const state = {
   // 行程状态筛选（active / upcoming / past）：与面板状态徽标同一口径
   tripsStatusFilter: "",
   sessionTotal: 0,
+  // 会话分页游标：与 kbOffset 同一口径，按「已向服务端取回的条数」前进；
+  // 用「已显示条数」在头部并发插入整页时会永远卡在同一个窗口
+  sessionsOffset: 0,
   showArchived: false,
   archivedCount: 0,
   archivedMatches: 0,
@@ -225,6 +233,7 @@ const els = {
   tripEnd: byId("tripEnd"),
   tripPurpose: byId("tripPurpose"),
   tripSubmit: byId("tripSubmit"),
+  tripCancel: byId("tripCancel"),
   destinations: byId("destinations"),
   stats: byId("stats"),
   usageStats: byId("usageStats"),
@@ -1330,6 +1339,19 @@ function resetTripForm() {
 }
 
 function startEditTrip(trip) {
+  // 表单里已有未提交的新增 / 编辑草稿时先确认：直接覆盖会让用户以为
+  // 刚才填写的内容被保存了
+  if (state.tripEditingId !== trip.trip_id) {
+    const draft =
+      els.tripDestination.value.trim() ||
+      els.tripOrigin.value.trim() ||
+      els.tripStart.value ||
+      els.tripEnd.value ||
+      els.tripPurpose.value.trim();
+    if (draft && !window.confirm("表单里有未提交的内容，编辑将覆盖，继续？")) {
+      return;
+    }
+  }
   state.tripEditingId = trip.trip_id;
   // 历史数据可能有未补零 / 带时间的日期：<input type=date> 会静默清空非法值，
   // 若原样写入，用户保存其它字段时返程日期会被悄悄删掉
@@ -2226,6 +2248,7 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     const data = await getJSON(`/api/sessions?${params}`, undefined, 30000);
     if (requestId !== sessionsRequestId) return;
     state.sessions = data.sessions || [];
+    state.sessionsOffset = state.sessions.length;
     state.sessionTotal = Number(data.total || state.sessions.length);
     if (data.archived_count !== undefined) {
       updateArchivedToggle(Number(data.archived_count));
@@ -2281,7 +2304,7 @@ async function loadMoreSessions() {
   const params = new URLSearchParams({
     user_id: state.userId,
     limit: "50",
-    offset: String(state.sessions.length),
+    offset: String(state.sessionsOffset),
   });
   if (state.searchQuery) params.set("q", state.searchQuery);
   if (state.showArchived) params.set("archived", "1");
@@ -2296,6 +2319,9 @@ async function loadMoreSessions() {
         state.sessions.push(session);
       }
     }
+    // 游标按「取回的条数」前进：头部并发插入时本页可能与已显示内容重叠
+    // （去重跳过），但窗口必须继续向前，否则「加载更多」永远停在原地
+    state.sessionsOffset += (data.sessions || []).length;
     state.sessionTotal = Number(data.total || state.sessionTotal);
     renderHistory();
   } catch (error) {
@@ -2324,6 +2350,21 @@ async function openSession(sessionId, options = {}) {
     if (state.busy || token !== sessionLoadToken) return;
     if (!data.messages || !data.messages.length) {
       if (options.preserveOnEmpty) return;
+      const known = state.sessions.some(
+        (item) => item.session_id === sessionId,
+      );
+      if (known) {
+        // 列表里的会话已无消息：多半是其它标签页 / CLI 已删除。不能按
+        // 「新会话」处理（会把用户当前正在看的对话切走），移除幽灵行并提示
+        state.sessions = state.sessions.filter(
+          (item) => item.session_id !== sessionId,
+        );
+        state.sessionTotal = Math.max(0, state.sessionTotal - 1);
+        state.sessionsOffset = Math.max(0, state.sessionsOffset - 1);
+        renderHistory();
+        toast("这个会话已不存在，已从列表移除");
+        return;
+      }
       if (!options.silent) toast("这个会话还没有消息");
       newSession();
       return;
@@ -2497,6 +2538,14 @@ async function deleteSession(sessionId) {
       setConversationTitle("新对话");
       showWelcome();
     }
+    // 先本地移除会话行：随后刷新若失败（旧数据保留策略），不能留下
+    // 一条点击后切到「新对话」的幽灵会话
+    state.sessions = state.sessions.filter(
+      (item) => item.session_id !== sessionId,
+    );
+    state.sessionTotal = Math.max(0, state.sessionTotal - 1);
+    state.sessionsOffset = Math.max(0, state.sessionsOffset - 1);
+    renderHistory();
     await loadSessions();
     toast("会话已删除");
   } catch (error) {
@@ -3083,12 +3132,19 @@ function renderOverview() {
 
       const actions = document.createElement("span");
       actions.className = "pref-actions";
+      preferenceLatest.set(key, value);
       const edit = document.createElement("button");
       edit.type = "button";
       edit.title = "编辑偏好";
       edit.setAttribute("aria-label", "编辑偏好");
       edit.innerHTML = icon("edit");
-      edit.addEventListener("click", () => startEditPreference(row, key, value));
+      edit.addEventListener("click", () =>
+        startEditPreference(
+          row,
+          key,
+          preferenceLatest.has(key) ? preferenceLatest.get(key) : value,
+        ),
+      );
       const remove = document.createElement("button");
       remove.type = "button";
       remove.title = "删除偏好";
@@ -3255,6 +3311,9 @@ function renderOverview() {
             { method: "DELETE" },
           );
           toast("行程已删除");
+          // 正在编辑的就是这条行程：先退出编辑态，否则「保存修改」
+          // 永远 404 且表单没有取消入口
+          if (state.tripEditingId === trip.trip_id) resetTripForm();
           // 先移除本地行：随后刷新若失败（旧数据保留策略），不能留下
           // 一条删除按钮永久禁用的幽灵行程
           row.remove();
@@ -3262,6 +3321,7 @@ function renderOverview() {
         } catch (error) {
           if (error.status === 404) {
             toast("行程不存在，已刷新列表");
+            if (state.tripEditingId === trip.trip_id) resetTripForm();
             row.remove();
             await refreshStatus();
           } else {
@@ -3736,7 +3796,9 @@ function startEditPreference(row, type, currentValue) {
       });
       toast("偏好已更新");
       // 先把行内显示改成新值再撤掉编辑框：状态请求慢时不能长时间显示旧值，
-      // 否则用户以为没保存成功，再次编辑会把旧值 PUT 回去
+      // 否则用户以为没保存成功，再次编辑会把旧值 PUT 回去。最新值同时写入
+      // preferenceLatest：刷新失败时再次点「编辑」也必须回填新值
+      preferenceLatest.set(type, value);
       valueEl.textContent = formatPreferenceValue(value);
       if (input.isConnected) input.replaceWith(valueEl);
       await refreshStatus();
@@ -4517,6 +4579,11 @@ async function startEditKnowledge(doc) {
     toast("正在保存知识片段，请稍候");
     return;
   }
+  // 表单里已有未提交的新增 / 编辑草稿时先确认：点行内「编辑」会直接
+  // 覆盖，用户会以为刚输入的内容被保存了
+  if (els.kbContent.value.trim() && state.kbEditingId !== doc.id) {
+    if (!window.confirm("表单里有未提交的内容，编辑将覆盖，继续？")) return;
+  }
   const seq = (state.kbEditSeq += 1);
   const parts = Number(doc.metadata && doc.metadata.parts);
   const group = String((doc.metadata && doc.metadata.group) || "");
@@ -4685,6 +4752,62 @@ const KB_IMPORT_MAX_BYTES = 50 * 1024 * 1024;
 // 直接按条数确认后分批导入（重复项在导入时仍会被跳过）
 const KB_IMPORT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 
+// 服务端按请求重组多分片文档：同组的全部片段必须落在同一个请求里，
+// 否则一篇文档会被拆成几段分别导入（内容截断）。同组片段在导出中
+// 不一定相邻（整份编辑后首片保留原 id、其余分片是新 id），因此先按
+// group 聚合为不可拆分的单元，再把单元打包进每批。纯函数便于单测。
+function buildKnowledgeImportBatches(documents) {
+  const MAX_BATCH = 20000;
+  // 服务端单次请求体上限 2 MB：按 JSON 序列化长度的 UTF-8 上界（×3）
+  // 控制每批字节数，避免「200 条 × 长内容 / 大元数据」的批次被 413
+  const MAX_BATCH_BYTES = 1536 * 1024;
+  const units = [];
+  const groupUnits = new Map();
+  for (const doc of documents) {
+    const group =
+      doc && doc.metadata && doc.metadata.group
+        ? String(doc.metadata.group)
+        : "";
+    if (!group) {
+      units.push([doc]);
+      continue;
+    }
+    let unit = groupUnits.get(group);
+    if (!unit) {
+      unit = [];
+      groupUnits.set(group, unit);
+      units.push(unit);
+    }
+    unit.push(doc);
+  }
+  const batches = [];
+  let batch = [];
+  let batchBytes = 0;
+  for (const unit of units) {
+    if (unit.length > MAX_BATCH) {
+      return { error: `存在超过 ${MAX_BATCH} 片的文档组，无法导入；请先拆分该文档` };
+    }
+    const unitBytes = JSON.stringify(unit).length * 3;
+    if (unitBytes > MAX_BATCH_BYTES) {
+      return { error: "存在单条（或分片组）过大的知识片段，无法分批上传；请拆分后重试" };
+    }
+    if (
+      batch.length &&
+      (batch.length >= 200 ||
+        batch.length + unit.length > MAX_BATCH ||
+        batchBytes + unitBytes > MAX_BATCH_BYTES)
+    ) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+    batch.push(...unit);
+    batchBytes += unitBytes;
+  }
+  if (batch.length) batches.push(batch);
+  return { batches };
+}
+
 async function importKnowledgeFile() {
   if (state.kbImporting) return;
   state.kbImporting = true;
@@ -4713,10 +4836,6 @@ async function importKnowledgeFile() {
         : null;
     if (!documents || !documents.length) {
       toast("文件中没有知识片段（需要 documents 数组）");
-      return;
-    }
-    if (documents.length > 20000) {
-      toast("单次最多导入 20000 条知识片段");
       return;
     }
     // 先预览（不写库）：告诉用户将导入 / 跳过多少条，再确认
@@ -4750,50 +4869,17 @@ async function importKnowledgeFile() {
     } else {
       confirmText += "（文件较大，已跳过导入前预览；重复项会在导入时自动跳过）";
     }
+    // 预览期间面板被关闭：不再弹确认，更不能在看不见的界面里写库
+    if (!isModalOpen()) return;
     if (!window.confirm(confirmText)) return;
 
     els.kbImport.textContent = "导入中…";
-    // 服务端按请求重组多分片文档：同组的全部片段必须落在同一个请求里，
-    // 否则一篇文档会被拆成几段分别导入（内容截断）。同组片段在导出中
-    // 不一定相邻（整份编辑后首片保留原 id、其余分片是新 id），因此先按
-    // group 聚合为不可拆分的单元，再把单元打包进每批，单批不超过 20000 条
-    const MAX_BATCH = 20000;
-    const units = [];
-    const groupUnits = new Map();
-    for (const doc of documents) {
-      const group =
-        doc && doc.metadata && doc.metadata.group
-          ? String(doc.metadata.group)
-          : "";
-      if (!group) {
-        units.push([doc]);
-        continue;
-      }
-      let unit = groupUnits.get(group);
-      if (!unit) {
-        unit = [];
-        groupUnits.set(group, unit);
-        units.push(unit);
-      }
-      unit.push(doc);
+    const planned = buildKnowledgeImportBatches(documents);
+    if (planned.error) {
+      toast(planned.error);
+      return;
     }
-    const batches = [];
-    let batch = [];
-    for (const unit of units) {
-      if (unit.length > MAX_BATCH) {
-        toast(`存在超过 ${MAX_BATCH} 片的文档组，无法导入；请先拆分该文档`);
-        return;
-      }
-      if (
-        batch.length &&
-        (batch.length >= 200 || batch.length + unit.length > MAX_BATCH)
-      ) {
-        batches.push(batch);
-        batch = [];
-      }
-      batch.push(...unit);
-    }
-    if (batch.length) batches.push(batch);
+    const batches = planned.batches;
 
     let done = 0;
     for (const batch of batches) {
@@ -5297,7 +5383,10 @@ function bindEvents() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: userId }),
         });
-        toast(`已清理 ${Number(result.removed || 0)} 条重复行程`);
+        const removedCount = Number(result.removed || 0);
+        toast(`已清理 ${removedCount} 条重复行程`);
+        // 去重可能删掉正在编辑的行程：退出编辑态，避免「保存修改」永远 404
+        if (removedCount > 0 && state.tripEditingId) resetTripForm();
         await refreshStatus({ silentFailure: true });
       } catch (error) {
         toast(`清理重复行程失败：${error.message || error}`);
@@ -5364,6 +5453,12 @@ function bindEvents() {
     }
   });
   els.tripForm.addEventListener("submit", addTrip);
+  if (els.tripCancel) {
+    els.tripCancel.addEventListener("click", () => {
+      els.tripForm.hidden = true;
+      resetTripForm();
+    });
+  }
 
   els.menuBtn.addEventListener("click", toggleSidebar);
   els.collapseSidebar.addEventListener("click", toggleSidebar);

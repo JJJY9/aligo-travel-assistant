@@ -893,6 +893,99 @@ async function scenarioStartup(source) {
   };
 }
 
+async function scenarioPanelFixes(source) {
+  const results = {};
+
+  // (a) 会话分页游标：头部插入一整页导致本页与已显示完全重叠时仍向前推进
+  {
+    const env = buildEnv(source);
+    runIn(
+      env,
+      "state.sessions = Array.from({length: 50}, (_, i) => ({session_id: 'old' + i, title: 't' + i}));" +
+        "state.sessionsOffset = 50; state.sessionsLoading = false; state.sessionTotal = 110;",
+    );
+    const promise = runIn(env, "loadMoreSessions()");
+    await tick();
+    const url = String(env.__requests[0].args[0]);
+    const overlap = [];
+    for (let i = 0; i < 25; i += 1) overlap.push({ session_id: "old" + i, title: "t" + i });
+    for (let i = 0; i < 25; i += 1) overlap.push({ session_id: "new" + i, title: "n" + i });
+    env.__requests[0].resolve({ sessions: overlap, total: 110 });
+    await promise;
+    const second = runIn(env, "loadMoreSessions()");
+    await tick();
+    const secondUrl = String(env.__requests[1].args[0]);
+    env.__requests[1].resolve({ sessions: [], total: 110 });
+    await second;
+    results.sessions_cursor = {
+      first_url: url,
+      second_url: secondUrl,
+      offset: runIn(env, "state.sessionsOffset"),
+      count: runIn(env, "state.sessions.length"),
+    };
+  }
+
+  // (b) 列表中的会话服务端已无消息：移除幽灵行、不切到新对话
+  {
+    const env = buildEnv(source);
+    runIn(
+      env,
+      "state.sessions = [{session_id: 's1', title: 'x'}];" +
+        "state.sessionTotal = 1; state.sessionsOffset = 1; state.sessionId = 'keep';",
+    );
+    const promise = runIn(env, 'openSession("s1")');
+    await tick();
+    env.__requests[0].resolve({ messages: [] });
+    await promise;
+    results.stale_session = {
+      sessions: runIn(env, "state.sessions.length"),
+      sessionId: runIn(env, "state.sessionId"),
+      toasts: runIn(env, "__toasts.slice()"),
+    };
+  }
+
+  // (c) 知识导入分批：整份文件不再按条数拒绝，批次受条数与字节预算约束
+  {
+    const env = buildEnv(source);
+    const plain = runIn(
+      env,
+      "buildKnowledgeImportBatches(Array.from({length: 25000}, (_, i) => ({content: 'c' + i, metadata: {}})))",
+    );
+    const sizes = plain.batches.map((batch) => batch.length);
+    results.kb_batches = {
+      batch_count: plain.batches.length,
+      total: sizes.reduce((sum, n) => sum + n, 0),
+      max_batch: Math.max(...sizes),
+    };
+    const grouped = runIn(
+      env,
+      "buildKnowledgeImportBatches([" +
+        "{content: 'a', metadata: {group: 'g1', part: '1', parts: '3'}}," +
+        "{content: 'b', metadata: {}}," +
+        "{content: 'c', metadata: {group: 'g1', part: '2', parts: '3'}}," +
+        "{content: 'd', metadata: {group: 'g1', part: '3', parts: '3'}}" +
+        "])",
+    );
+    results.kb_group_batches = grouped.batches.map((batch) =>
+      batch.map((doc) => String((doc.metadata || {}).content || doc.content)),
+    );
+    const oversize = runIn(
+      env,
+      "buildKnowledgeImportBatches([{content: 'x'.repeat(600000), metadata: {}}])",
+    );
+    const huge_group = runIn(
+      env,
+      "buildKnowledgeImportBatches(Array.from({length: 20001}, (_, i) => ({content: 'p' + i, metadata: {group: 'big', part: String(i + 1), parts: '20001'}})))",
+    );
+    results.kb_errors = {
+      oversize: oversize.error || "",
+      huge_group: huge_group.error || "",
+    };
+  }
+
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -921,6 +1014,8 @@ async function main() {
     payload = scenarioTripsExport(source);
   } else if (scenario === "tripsDedupe") {
     payload = await scenarioTripsDedupe(source);
+  } else if (scenario === "panelFixes") {
+    payload = await scenarioPanelFixes(source);
   } else if (scenario === "startup") {
     payload = await scenarioStartup(source);
   } else {
