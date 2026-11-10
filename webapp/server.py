@@ -3767,7 +3767,9 @@ def create_app(model: Any = None) -> FastAPI:
         if end is not None and end < start:
             raise HTTPException(status_code=422, detail="结束日期不能早于出发日期")
 
-        store = _open_long_term(payload.user_id)
+        # strict：PostgreSQL 故障期间不能把新增行程静默写进回退 JSON
+        # （恢复后读 PG，行程「凭空消失」，与导入 / 删除的严格语义一致）
+        store = _open_long_term(payload.user_id, strict=True)
         created = False
         conflicts: list[dict[str, Any]] = []
         try:
@@ -3893,7 +3895,8 @@ def create_app(model: Any = None) -> FastAPI:
         if "start_date" in fields and not fields["start_date"]:
             raise HTTPException(status_code=422, detail="出发日期不能为空")
 
-        store = _open_long_term(payload.user_id)
+        # strict：同 create_trip，编辑不能写进回退 JSON 后静默消失
+        store = _open_long_term(payload.user_id, strict=True)
         conflicts: list[dict[str, Any]] = []
         try:
             trips = store.get_trip_history(limit=None)
