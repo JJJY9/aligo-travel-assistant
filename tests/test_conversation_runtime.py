@@ -609,6 +609,24 @@ def test_model_call_failure_counts_towards_breaker(monkeypatch):
     print("✓ 模型调用失败计入熔断")
 
 
+def test_normalized_schedule_filters_invalid_entries():
+    """plan 事件的调度计划：跳过非对象 / 空名称，非法优先级归 0。"""
+    runtime, _ = _make_runtime()
+    schedule = runtime._normalized_schedule(
+        [
+            "不是对象",
+            {"agent_name": "  "},
+            {"agent_name": "Plan-Trip", "priority": "high"},
+            {"agent_name": "query-info", "priority": 2, "reason": "查询"},
+        ]
+    )
+    assert len(schedule) == 2, schedule
+    assert [item["priority"] for item in schedule] == [0, 2], schedule
+    assert all(item["agent_name"] for item in schedule)
+    assert schedule[1]["reason"] == "查询"
+    print("✓ 调度计划过滤非法条目")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -635,4 +653,5 @@ if __name__ == "__main__":
     test_memory_persistence_error_not_counted_as_model_failure()
     test_open_circuit_short_circuits_ask()
     test_model_call_failure_counts_towards_breaker(mp)
+    test_normalized_schedule_filters_invalid_entries()
     print("\n全部通过")
