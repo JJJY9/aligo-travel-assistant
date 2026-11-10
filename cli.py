@@ -2145,6 +2145,9 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
             close()
 
     sessions = {str(item.get("session_id")) for item in history if item.get("session_id")}
+    # 与面板 archived_count 同口径：只统计仍有消息的归档会话，幽灵归档
+    # （会话已删 / 从未落库）不计入，否则统计永久偏大且 CLI 无法清理
+    archived_alive = [sid for sid in archived if str(sid) in sessions]
     travel = summarize_travel(trips)
     # 与面板 / 状态接口同口径：null / 空白 / 全空列表不计入偏好条数
     visible_preferences = {
@@ -2159,7 +2162,7 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
         "sessions": {
             "total": len(sessions),
             "messages": len(history),
-            "archived": len(archived),
+            "archived": len(archived_alive),
         },
     }
     if as_json:
@@ -5065,6 +5068,24 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
             )
         ]
 
+    # --json 与文本同口径：列表里的 null / 空白项逐项剔除（机器消费方
+    # 不应拿到空项，模型 prompt 也不会把 None 拼进偏好值）
+    payload_preferences = {
+        key: (
+            [
+                item
+                for item in visible[key]
+                if not (
+                    item is None
+                    or (isinstance(item, str) and not item.strip())
+                )
+            ]
+            if isinstance(visible[key], list)
+            else visible[key]
+        )
+        for key in sorted(visible)
+    }
+
     if as_json:
         from utils.json_safe import sanitize_json
 
@@ -5074,9 +5095,7 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
                     {
                         "user_id": user_id,
                         "count": len(visible),
-                        "preferences": {
-                            key: visible[key] for key in sorted(visible)
-                        },
+                        "preferences": payload_preferences,
                     }
                 ),
                 ensure_ascii=False,

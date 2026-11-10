@@ -187,6 +187,86 @@ def test_memory_query_includes_current_dialogue():
     print("✓ memory-query 带上当前会话对话")
 
 
+def test_memory_query_tolerates_long_term_read_failure():
+    """长记忆读取抛异常：按空记忆继续回答，而不是整题失败。"""
+    agent_class = _load_skill("memory-query", "MemoryQueryAgent")
+
+    class _LongTerm:
+        def get_trip_history(self, limit=None):
+            raise RuntimeError("db down")
+
+        def get_preference(self):
+            raise RuntimeError("db down")
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    class _SkillLoader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return "好的"
+
+    agent = agent_class(
+        name="MemoryQueryAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _SkillLoader()
+    result = asyncio.run(
+        agent.reply(
+            Msg(name="orchestrator", content="我去过哪些地方", role="user")
+        )
+    )
+    assert json.loads(result.content)["status"] == "success"
+    print("✓ 长记忆读取失败按空记忆回答")
+
+
+def test_memory_query_filters_blank_list_items():
+    """偏好列表里的 null / 空白项不能拼进 prompt（"None" 不是偏好值）。"""
+    agent_class = _load_skill("memory-query", "MemoryQueryAgent")
+
+    class _LongTerm:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_preference(self):
+            return {"hotel_brands": ["汉庭", None, "  "]}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    class _SkillLoader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _Model:
+        def __init__(self):
+            self.prompts = []
+
+        async def __call__(self, messages, **kwargs):
+            self.prompts.append(messages)
+            return "好的"
+
+    agent = agent_class(
+        name="MemoryQueryAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _SkillLoader()
+    asyncio.run(
+        agent.reply(Msg(name="orchestrator", content="我的偏好", role="user"))
+    )
+    prompt = str(agent.model.prompts[0])
+    assert "汉庭" in prompt
+    assert "None" not in prompt
+    print("✓ memory-query 过滤偏好列表空项")
+
+
 def test_memory_query_reads_memory_off_event_loop():
     """行程 / 偏好读取不能在事件循环线程执行（会冻结所有 SSE 流）。"""
     agent_class = _load_skill("memory-query", "MemoryQueryAgent")
@@ -282,6 +362,40 @@ def _load_skill_module(skill: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_preference_tolerates_current_preference_read_failure():
+    """当前偏好读取抛异常：按空偏好继续抽取，而不是整题失败。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _LongTerm:
+        def get_preference(self):
+            raise RuntimeError("db down")
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '{"has_preferences": true, "preferences": '
+                '[{"type": "airlines", "value": "东航"}]}'
+            )
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent.skill_loader = _Loader()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我常坐东航", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is True, data
+    print("✓ 当前偏好读取失败继续抽取")
 
 
 def test_suspicious_url_uses_registrable_domain():
@@ -1077,6 +1191,9 @@ if __name__ == "__main__":
         test_memory_query_includes_current_dialogue()
         test_memory_query_reads_memory_off_event_loop()
         test_preference_reads_memory_off_event_loop()
+        test_memory_query_tolerates_long_term_read_failure()
+        test_memory_query_filters_blank_list_items()
+        test_preference_tolerates_current_preference_read_failure()
         test_suspicious_url_uses_registrable_domain()
         test_skill_agents_tolerate_non_object_payloads()
         test_weather_city_prefers_destination_side()

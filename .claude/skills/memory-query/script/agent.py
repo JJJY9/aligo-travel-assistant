@@ -133,9 +133,13 @@ class MemoryQueryAgent(AgentBase):
         if self.memory_manager:
             # 行程 / 偏好是阻塞查询（JSON 文件、PostgreSQL 网络往返）：
             # 放到线程池执行，留在事件循环线程会冻结同进程所有 SSE 流
-            trip_history, preferences = await asyncio.to_thread(
-                self._load_long_term_context
-            )
+            try:
+                trip_history, preferences = await asyncio.to_thread(
+                    self._load_long_term_context
+                )
+            except Exception as e:  # noqa: BLE001 - 存储抖动按空记忆继续回答
+                logger.warning(f"Failed to load long-term memory: {e}")
+                trip_history, preferences = [], {}
 
             # 获取历史对话摘要（如果有LLM的话）
             try:
@@ -281,7 +285,11 @@ class MemoryQueryAgent(AgentBase):
             # 未知/自定义偏好类型不再丢弃，直接使用原始类型名
             name = pref_names.get(key, key)
             if isinstance(value, (list, tuple)):
-                value = ", ".join(str(v) for v in value)
+                # 历史数据可能含 [null] / ["  "]（旧版本写入）：逐项过滤，
+                # 不能让 "None" 作为偏好值拼进 prompt
+                value = ", ".join(
+                    str(v) for v in value if has_preference_value(v)
+                )
             lines.append(f"- {name}: {value}")
 
         return "\n".join(lines) if lines else "（暂无偏好记录）"

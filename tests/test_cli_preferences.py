@@ -66,6 +66,24 @@ def test_preferences_list_json(monkeypatch):
     print("✓ preferences --json 保留原始类型")
 
 
+def test_preferences_json_filters_blank_list_items(monkeypatch):
+    """--json 与文本同口径：列表里的 null / 空白项逐项剔除。"""
+    store = _FakeStore(
+        {"hotel_brands": ["汉庭", None, "  "], "home_location": "北京"}
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preferences_list_standalone("u-prefs", as_json=True)
+    assert code == 0
+    data = json.loads(out.getvalue())
+    assert data["preferences"]["hotel_brands"] == ["汉庭"]
+    assert data["count"] == 2
+    print("✓ preferences --json 剔除列表空项")
+
+
 def test_preferences_dispatch_json_and_bad_args(monkeypatch):
     store = _FakeStore({"home_location": "北京"})
     monkeypatch.setattr(
@@ -590,6 +608,7 @@ if __name__ == "__main__":
         test_pref_set_json_value_rejects_empty_shapes,
         test_pref_set_json_value_rejects_non_finite,
         test_pref_set_json_value_depth_guard,
+        test_preferences_json_filters_blank_list_items,
         test_pref_delete_text_and_json,
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
