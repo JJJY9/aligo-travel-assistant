@@ -1090,6 +1090,47 @@ def test_export_sanitizes_surrogate_and_non_finite():
     print("✓ 导出清洗孤立代理项与 NaN（JSON / Markdown / 会话导出）")
 
 
+def test_export_filenames_disambiguate_non_ascii_ids():
+    """中文 ID 清洗后追加短哈希；单会话导出文件名带用户维度。"""
+    import re as re_module
+
+    from webapp.server import _safe_filename
+
+    first = _safe_filename("张三")
+    second = _safe_filename("李四")
+    assert first != second, (first, second)
+    assert re_module.fullmatch(r"_+_[0-9a-f]{6}", first), first
+    assert _safe_filename("alice") == "alice"
+    long_id = "a" * 40
+    cleaned = _safe_filename(long_id)
+    assert len(cleaned) == 24 + 1 + 6 and cleaned.startswith("a" * 24), cleaned
+
+    client = _client()
+    user_id = _unique_user("张三")
+    try:
+        chat = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "s1"},
+        )
+        assert chat.status_code == 200
+
+        response = client.get("/api/export", params={"user_id": user_id})
+        disposition = response.headers["content-disposition"]
+        assert re_module.search(r"_[0-9a-f]{6}\.json", disposition), disposition
+
+        response = client.get(
+            f"/api/sessions/s1/export?user_id={user_id}&format=md"
+        )
+        assert response.status_code == 200, response.text[:200]
+        disposition = response.headers["content-disposition"]
+        assert re_module.search(r"aligo_.+_[0-9a-f]{6}_s1\.md", disposition), (
+            disposition
+        )
+    finally:
+        _cleanup(user_id)
+    print("✓ 导出文件名去撞名（短哈希 + 用户维度）")
+
+
 def test_sessions_listing_and_delete():
     client = _client()
     user_id = _unique_user("web_test_hist")
