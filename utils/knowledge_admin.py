@@ -13,7 +13,7 @@ import logging
 import threading
 import uuid
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from utils.knowledge_paths import COLLECTION_NAME, knowledge_db_path
@@ -624,13 +624,18 @@ def _export_documents(client: Any) -> list[dict[str, Any]]:
 
 
 def _merge_exported_group(
-    key: str, pieces: list[tuple[int, dict[str, Any]]], existing_counts: Counter[str]
+    key: str,
+    pieces: list[tuple[int, dict[str, Any]]],
+    existing_counts: Counter[str],
+    existing_group_texts: "Callable[[], set[str] | None] | None" = None,
 ) -> tuple[dict[str, Any] | None, int]:
     """合并一个 group 的分片；返回 (合并后的记录, 因整组已存在而跳过的分片数)。
 
     ``None`` 表示整组已在库中（不导入）。结构非法的备份（parts 声明异常 /
     part 编号重复 / 分片不全）抛 ValueError，由调用方决定整体报错还是
-    按组降级跳过。
+    按组降级跳过。``existing_group_texts`` 提供库内各 group 的有序整篇
+    文本：提供时「内容多重集已齐全」还要求顺序一致才算重复，顺序不同
+    抛 ValueError（否则重排过的备份会被静默当成已存在）。
     """
     declared = 0
     contents: list[str] = []
@@ -704,6 +709,16 @@ def _merge_exported_group(
     # 多重集判定：一组里两片同文时，库里只存在一份不能算「整组已存在」
     # （Counter 相减只保留正差值：组内多重集必须是库内容多重集的子集）
     if not (Counter(stripped_contents) - existing_counts):
+        joined_text = "".join(stripped_contents)
+        if existing_group_texts is not None:
+            texts = existing_group_texts()
+            if texts is not None and joined_text not in texts:
+                # 内容齐全但 part 顺序与库内任何组都不同：静默跳过会让
+                # 恢复后的文档仍是旧顺序，备份里的版本从未入库
+                raise ValueError(
+                    f"备份中的文档组内容与库内分片相同但顺序不同（group={key}）："
+                    "请整份编辑后重新导入"
+                )
         # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
         return None, len(contents)
     return (
@@ -732,6 +747,7 @@ def _regroup_exported_documents(
     documents: list[Any],
     existing: Iterable[str],
     problems: "list[dict[str, Any]] | None" = None,
+    existing_group_texts: "Callable[[], set[str] | None] | None" = None,
 ) -> tuple[list[Any], int]:
     """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
 
@@ -788,7 +804,7 @@ def _regroup_exported_documents(
         pieces = sorted(grouped.get(key, []), key=lambda pair: pair[0])
         try:
             entry, skipped_count = _merge_exported_group(
-                key, pieces, existing_counts_base
+                key, pieces, existing_counts_base, existing_group_texts
             )
         except ValueError as exc:
             if problems is None:
@@ -1071,6 +1087,38 @@ def _existing_group_layout() -> dict[str, list[tuple[str, int, int]]]:
     return layout
 
 
+def _group_texts_from_layout(
+    layout: dict[str, list[tuple[str, int, int]]],
+) -> set[str]:
+    """库内每个 group 按 part 顺序拼接后的整篇文本（顺序感知判重用）。"""
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    for content, entries in layout.items():
+        for group, part, _parts in entries:
+            if group:
+                grouped.setdefault(group, []).append((part, content))
+    return {
+        "".join(text for _, text in sorted(items)) for items in grouped.values()
+    }
+
+
+def _restored_group_texts(merged: list[Any]) -> set[str]:
+    """备份中多分片组按 part 顺序拼接后的文本。
+
+    「整组已存在」的快判只比较内容多重集，忽略 part 顺序：分片相同但
+    顺序不同的备份会被静默跳过、恢复后的文档顺序仍是旧的。这里取出备份
+    组的顺序文本供调用方与库内布局比较。
+    """
+    texts: set[str] = set()
+    for item in merged:
+        if not isinstance(item, dict):
+            continue
+        group = str(item.get("__restored_group__") or "")
+        parts = item.get("__restored_parts__")
+        if group and isinstance(parts, list) and len(parts) > 1:
+            texts.add("".join(str(piece).strip() for piece in parts))
+    return texts
+
+
 def _encoding_problem(value: str) -> str | None:
     """文本能否按 UTF-8 编码：孤立代理项（``"\\ud800"``）能通过 JSON 解析，
     但嵌入模型 / Milvus 序列化阶段会抛 UnicodeEncodeError，让整批导入失败。"""
@@ -1250,18 +1298,38 @@ def import_documents(
             logger.warning("导入前判重扫描失败（%s），按完整流程处理", exc)
             snapshot = None
         if snapshot is not None and _backup_fully_existing(pre_merged, snapshot):
-            dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
-            duplicate = len(_merged_piece_contents(pre_merged))
-            payload = {
-                "imported": 0,
-                "skipped": invalid + dropped + duplicate,
-                "skipped_invalid": invalid + dropped,
-                "skipped_duplicate": duplicate,
-                "skipped_conflict": 0,
-            }
-            if pre_problems:
-                payload["skipped_groups"] = pre_problems
-            return payload
+            # 内容多重集齐全不代表顺序一致：分片相同但重排过的备份必须
+            # 走完整流程按布局冲突提示，不能被快判静默当成已存在
+            order_ok = True
+            restored_texts = _restored_group_texts(pre_merged)
+            if restored_texts:
+                try:
+                    existing_texts = _group_texts_from_layout(
+                        _existing_group_layout()
+                    )
+                except Exception as exc:  # noqa: BLE001 - 扫描失败按已存在处理
+                    logger.warning(
+                        "导入前布局扫描失败（%s），按已存在处理", exc
+                    )
+                    existing_texts = None
+                if (
+                    existing_texts is not None
+                    and not restored_texts <= existing_texts
+                ):
+                    order_ok = False
+            if order_ok:
+                dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
+                duplicate = len(_merged_piece_contents(pre_merged))
+                payload = {
+                    "imported": 0,
+                    "skipped": invalid + dropped + duplicate,
+                    "skipped_invalid": invalid + dropped,
+                    "skipped_duplicate": duplicate,
+                    "skipped_conflict": 0,
+                }
+                if pre_problems:
+                    payload["skipped_groups"] = pre_problems
+                return payload
 
     # 嵌入模型加载放在写锁外：导入期间其它知识库接口不应因为模型初始化
     # 而全部阻塞；dry-run 不加载模型
@@ -1277,8 +1345,28 @@ def import_documents(
         # 用多重集而不是集合计数，一份已存在只能抵消一个分片
         existing_counts: Counter[str] = Counter(existing)
         problems: list[dict[str, Any]] = []
+        texts_cache: dict[str, set[str] | None] = {}
+
+        def _existing_group_texts() -> set[str] | None:
+            # 只在「整组内容多重集已齐全」时按需扫描一次：布局扫描失败
+            # 按已存在处理（与旧行为一致，不因扫描问题阻断幂等重导）
+            if "value" not in texts_cache:
+                try:
+                    texts_cache["value"] = _group_texts_from_layout(
+                        _existing_group_layout()
+                    )
+                except Exception as exc:  # noqa: BLE001 - 扫描失败按已存在处理
+                    logger.warning(
+                        "扫描库内分片布局失败（%s），按已存在处理", exc
+                    )
+                    texts_cache["value"] = None
+            return texts_cache["value"]
+
         merged_items, group_skipped = _regroup_exported_documents(
-            valid, existing, problems=problems
+            valid,
+            existing,
+            problems=problems,
+            existing_group_texts=_existing_group_texts,
         )
         # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方
         invalid += sum(int(item.get("parts") or 0) for item in problems)

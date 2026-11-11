@@ -1126,6 +1126,11 @@ def test_import_skips_fully_existing_group(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     part1, part2 = "第一片内容", "第二片内容"
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {part1, part2})
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {part1: [("g", 1, 2)], part2: [("g", 2, 2)]},
+    )
 
     class _Agent:
         def __init__(self):
@@ -1152,6 +1157,62 @@ def test_import_skips_fully_existing_group(monkeypatch):
     }
     assert agent.calls == []
     print("✓ 已存在的整组分片导入时整组跳过")
+
+
+def test_import_reordered_group_is_conflict_not_duplicate(monkeypatch):
+    """分片相同但顺序不同的备份不能被当成「已存在」静默跳过。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    first, second = "甲段内容", "乙段内容"
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {first, second})
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {first: [("g-old", 1, 2)], second: [("g-old", 2, 2)]},
+    )
+
+    class _Agent:
+        def add_documents(self, documents):
+            raise AssertionError("顺序冲突的备份不应进入写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    documents = [
+        {"content": second, "metadata": {"group": "g-new", "part": "1", "parts": "2"}},
+        {"content": first, "metadata": {"group": "g-new", "part": "2", "parts": "2"}},
+    ]
+    for dry_run in (True, False):
+        result = knowledge_admin.import_documents(documents, dry_run=dry_run)
+        assert result["imported"] == 0, result
+        assert result["skipped_duplicate"] == 0, result
+        assert result["skipped_invalid"] == 2, result
+        assert any(
+            "顺序不同" in str(item.get("reason", ""))
+            for item in result.get("skipped_groups", [])
+        ), result
+    print("✓ 分片顺序不同的备份按冲突提示（不住当已存在）")
+
+
+def test_import_same_order_group_still_duplicate(monkeypatch):
+    """顺序一致的多分片备份仍按幂等重导跳过。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    first, second = "甲段内容", "乙段内容"
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {first, second})
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_group_layout",
+        lambda: {first: [("g-old", 1, 2)], second: [("g-old", 2, 2)]},
+    )
+    documents = [
+        {"content": first, "metadata": {"group": "g-new", "part": "1", "parts": "2"}},
+        {"content": second, "metadata": {"group": "g-new", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["skipped_duplicate"] == 2, result
+    assert result["skipped_invalid"] == 0
+    print("✓ 顺序一致的多分片备份仍按重复跳过")
 
 
 def test_import_restores_large_group_without_truncation(monkeypatch):
@@ -2866,6 +2927,8 @@ if __name__ == "__main__":
         test_import_layout_scan_failure_skips_group,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
+        test_import_reordered_group_is_conflict_not_duplicate,
+        test_import_same_order_group_still_duplicate,
         test_import_duplicate_content_group_is_idempotent,
         test_import_cross_group_share_keeps_unique_pieces,
         test_import_batch_shared_paragraph_keeps_unique_pieces,
