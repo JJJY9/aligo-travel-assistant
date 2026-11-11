@@ -638,6 +638,48 @@ def test_plan_trip_rejects_non_itinerary_object():
     print("✓ 非行程对象按解析失败处理（不再空回复）")
 
 
+def _plan_trip_reply(payload_text):
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return payload_text
+
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=_Model()
+    )
+    agent.skill_loader = _PlanTripLoader()
+    payload = json.dumps(
+        {"context": {"rewritten_query": "测试出行"}}, ensure_ascii=False
+    )
+    out = asyncio.run(agent.reply(Msg(name="x", content=payload, role="user")))
+    return json.loads(out.content)
+
+
+def test_plan_trip_rejects_empty_itinerary_values():
+    """itinerary 键存在但值为 null / {} / [] / 字符串：按解析失败处理。"""
+    for payload_text in (
+        '{"itinerary": null}',
+        '{"itinerary": {}}',
+        '{"itinerary": []}',
+        '{"itinerary": "文字"}',
+    ):
+        data = _plan_trip_reply(payload_text)
+        assert data.get("planning_complete") is False, (payload_text, data)
+        assert data.get("error"), (payload_text, data)
+    print("✓ 空行程 / null / 数组按解析失败处理")
+
+
+def test_plan_trip_accepts_non_empty_itinerary():
+    """非空行程对象照常成功返回。"""
+    data = _plan_trip_reply(
+        '{"itinerary": {"title": "杭州行", "daily_plans": [{"day": 1}]}}'
+    )
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州行"
+    print("✓ 非空行程照常成功")
+
+
 def test_plan_trip_null_rewritten_query_falls_back():
     """rewritten_query 为 null 时回退用户原话，需求不能变空或字面量 None。"""
     module = _load_skill_module("plan-trip")
@@ -1276,6 +1318,8 @@ if __name__ == "__main__":
         test_plan_trip_null_rewritten_query_falls_back()
         test_plan_trip_rejects_non_object_result()
         test_plan_trip_rejects_non_itinerary_object()
+        test_plan_trip_rejects_empty_itinerary_values()
+        test_plan_trip_accepts_non_empty_itinerary()
         test_preference_bare_array_is_wrapped_not_dropped()
         test_plan_trip_accepts_object_with_array_fields()
         test_event_collection_result_without_meta_keys_beats_echo()

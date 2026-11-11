@@ -300,6 +300,12 @@ class ItineraryPlanningAgent(AgentBase):
                 # 按成功返回会让编排状态 completed、渲染为空，用户既没有
                 # 行程也没有错误提示——按解析失败处理
                 raise ValueError("行程规划结果缺少行程字段（itinerary）")
+            itinerary_value = result.get("itinerary")
+            if not isinstance(itinerary_value, dict) or not itinerary_value:
+                # 键存在但值为 null / {} / [] / 字符串：同样按解析失败处理。
+                # 只看键存在会让空 result 以 success 返回——编排 completed、
+                # 回复渲染为空、行程也不落库，用户拿不到任何提示
+                raise ValueError("行程规划结果缺少有效行程（itinerary 为空）")
 
         except Exception as e:
             logger.error(f"Itinerary planning failed: {e}")
