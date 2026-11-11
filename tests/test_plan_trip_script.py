@@ -55,6 +55,50 @@ def test_extract_itinerary_from_partial_failure():
     print("✓ partial_failure 时仍提取成功行程")
 
 
+def test_extract_itinerary_skips_failed_fallback():
+    """失败条目的兜底 itinerary 不能被当成成功行程（主流程会打印「规划完成」）。"""
+    module = _load_module()
+    failed = {
+        "status": "partial_failure",
+        "results": [
+            {
+                "agent_name": "itinerary_planning",
+                "status": "error",
+                "data": {
+                    "itinerary": {
+                        "title": "行程规划",
+                        "duration": "待完善",
+                        "daily_plans": [],
+                    },
+                    "planning_complete": False,
+                    "error": "模型返回的数据格式有误",
+                },
+            }
+        ],
+    }
+    assert module._extract_itinerary(failed) is None
+
+    # 状态为 success 但 data 自带 error 的旧形状同样不提取
+    inconsistent = {
+        "results": [
+            {
+                "agent_name": "itinerary_planning",
+                "status": "success",
+                "data": {"itinerary": {"title": "x"}, "error": "上游超时"},
+            }
+        ]
+    }
+    assert module._extract_itinerary(inconsistent) is None
+    print("✓ 失败条目的兜底行程不被当作成功结果")
+
+
+def test_plan_trip_script_project_root():
+    """脚本把仓库根（第 5 层父目录）加入 sys.path，可直接运行。"""
+    module = _load_module()
+    assert Path(module.project_root).resolve() == Path(project_root).resolve()
+    print("✓ 行程脚本 project_root 指向仓库根")
+
+
 def test_plan_trip_uses_shared_model_factory():
     """模型必须经 create_chat_model 工厂创建（stream=False + generate_kwargs）。"""
     import inspect
@@ -69,5 +113,7 @@ def test_plan_trip_uses_shared_model_factory():
 
 if __name__ == "__main__":
     test_extract_itinerary_from_partial_failure()
+    test_extract_itinerary_skips_failed_fallback()
+    test_plan_trip_script_project_root()
     test_plan_trip_uses_shared_model_factory()
     print("\n全部通过")
