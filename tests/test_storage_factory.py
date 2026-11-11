@@ -295,10 +295,10 @@ def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
     storage_dir = tempfile.mkdtemp()
     path = Path(storage_dir) / "u-race.json"
     path.write_text("{bad json", encoding="utf-8")
-    real_load = json_module.load
+    real_load = json_module.loads
     calls = {"count": 0}
 
-    def flaky_load(handle, *args, **kwargs):
+    def flaky_load(text, *args, **kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             # 模拟另一线程在首次解析失败后完成了新的原子写入（带可区分的偏好）
@@ -314,9 +314,9 @@ def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
                 encoding="utf-8",
             )
             raise ValueError("Expecting property name enclosed in double quotes")
-        return real_load(handle, *args, **kwargs)
+        return real_load(text, *args, **kwargs)
 
-    monkeypatch.setattr(json_module, "load", flaky_load)
+    monkeypatch.setattr(json_module, "loads", flaky_load)
     memory = LongTermMemory("u-race", storage_dir)
     # 必须真正采用并发写入的内容，而不是丢弃后返回空数据
     assert memory.get_preference("home_location") == "杭州"
@@ -1114,16 +1114,16 @@ def test_load_holds_path_lock():
     path = Path(storage_dir) / "u-lock.json"
     path.write_text(json_module.dumps({"chat_history": []}), encoding="utf-8")
     lock = lt._lock_for_path(str(path))
-    real_load = json_module.load
+    real_load = json_module.loads
     checked = {"n": 0}
 
-    def load_inside_lock(handle, *args, **kwargs):
+    def load_inside_lock(text, *args, **kwargs):
         checked["n"] += 1
         assert getattr(lock, "_is_owned")(), "读取应在按路径锁内进行"
-        return real_load(handle, *args, **kwargs)
+        return real_load(text, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(json_module, "load", load_inside_lock)
+        mp.setattr(json_module, "loads", load_inside_lock)
         LongTermMemory("u-lock", storage_dir)
     assert checked["n"] >= 1
     print("✓ 记忆文件读取全程持锁")
