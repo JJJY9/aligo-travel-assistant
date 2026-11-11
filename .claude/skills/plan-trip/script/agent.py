@@ -34,6 +34,39 @@ def _format_pref_value(value) -> str:
     return str(value)
 
 
+def _compact_recent_dialogue(messages, max_chars: int = 4000):
+    """压缩最近对话：助手消息常是整轮结果 JSON（含 daily_plans / 各技能
+    data / _meta），原样再嵌进规划 prompt 会让一次追问膨胀数万字符。
+
+    只保留最近 4 条；可解析为 JSON 对象的助手消息只取 answer / summary /
+    reply 摘要字段（没有摘要就省略内容），普通文本截断到 max_chars。
+    """
+    if not isinstance(messages, list):
+        return []
+    compacted = []
+    for message in messages[-4:]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = str(message.get("content") or "")
+        parsed = None
+        if content.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+        if isinstance(parsed, dict):
+            summary = (
+                parsed.get("answer")
+                or parsed.get("summary")
+                or parsed.get("reply")
+                or ""
+            )
+            content = str(summary) if summary else "（上一轮完整结果已省略）"
+        compacted.append({"role": role, "content": content[:max_chars]})
+    return compacted
+
+
 class ItineraryPlanningAgent(AgentBase):
     """
     行程规划智能体（主协调）
@@ -106,6 +139,13 @@ class ItineraryPlanningAgent(AgentBase):
             from utils.user_query import extract_user_query
 
             user_query = extract_user_query(content)
+
+        # 最近对话里的助手消息是整轮结果 JSON：压缩后再进入 prompt
+        if isinstance(context_info, dict) and context_info.get("recent_dialogue"):
+            context_info = dict(context_info)
+            context_info["recent_dialogue"] = _compact_recent_dialogue(
+                context_info.get("recent_dialogue")
+            )
 
         # 整合所有可用信息
         all_info = {
