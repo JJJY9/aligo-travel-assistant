@@ -39,6 +39,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 停止对账的静默重载不再抢占阅读位置：停止生成后约 600ms 对账会整段重建消息区并强制滚到底，用户刚向上翻到的历史位置被夺走（长会话还伴随一次整段重渲染卡顿）；现在静默重载保留重载前的滚动位置，仅在原本就在底部时继续跟随到底
 - CLI 管道输入编码回退修正：`PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8` 时 `sys.stdin.encoding` 已是 utf-8，此前拿它当 GBK 管道字节的 fallback 等于没有回退——中文被替换成乱码、用户 ID 校验一路失败；现在回退改用 `locale.getpreferredencoding(False)`（Windows 常见 cp936）
 - CLI 管道输入剔除 NUL 并识别 BOM-less UTF-16LE：`exit\0` 此前不等于 `exit`（被当作自然语言发给模型）、Node / .NET 写出的无 BOM UTF-16LE 行全部变成 NUL 乱码；现在按可打印性识别 UTF-16LE 并剔除残留 NUL
 - CLI 提示符的 stdin 读取失败（控制台句柄失效 / pty 断开）直接干净退出：此前 OSError 落到外层通用处理，打印错误后立即重新提示——无退避的热循环刷屏、CPU 打满且永远到不了 EOF

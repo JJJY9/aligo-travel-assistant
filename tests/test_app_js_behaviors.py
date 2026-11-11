@@ -121,6 +121,15 @@ def test_frontend_render_helpers():
     print("✓ 前端渲染 / 高亮 / 截断 / 偏好格式化基线")
 
 
+def test_silent_reload_preserves_scroll():
+    """静默重载（停止对账）不抢占阅读位置，普通切换仍滚到底。"""
+    data = _run_harness("scrollPreserve")
+    assert data["silent"] == {"scrollTop": 100, "calls": 0}, data
+    assert data["normal"]["calls"] == 1, data
+    assert data["normal"]["scrollTop"] == 1000, data
+    print("✓ 静默重载保留滚动位置")
+
+
 def test_delete_last_turn_sends_turn_id():
     """删除最后一轮携带 client_turn_id：服务端据此精确匹配本轮。"""
     data = _run_harness("deleteTurn")
