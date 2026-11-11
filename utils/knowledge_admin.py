@@ -1310,15 +1310,30 @@ def import_documents(
                 restored_metas = item.pop("__restored_metas__", None)
                 pieces = _restore_pieces(restored_parts, content)
                 stored_size = sum(len(piece) for piece in pieces)
-                if not pieces or stored_size > DOC_MAX_CHARS or (
+                if not pieces:
+                    invalid += 1
+                    logger.warning("备份中的文档没有可还原的分片，已跳过")
+                    continue
+                if stored_size > DOC_MAX_CHARS or (
                     restored_size and restored_size > DOC_MAX_CHARS
                 ):
-                    invalid += 1
+                    # 不再整篇按无效跳过：导出成功的备份在缺少该文档的目标库
+                    # 恢复后整篇永久缺失（导出侧并不校验可还原性）。按
+                    # DOC_MAX_CHARS 分段后照常切片入库，内容完整保留——分段
+                    # 会改变分组边界，但备份恢复优先于分组保真
+                    oversize = max(stored_size, restored_size)
                     logger.warning(
-                        "备份中的文档超过还原上限（%d 字 > %d），已跳过",
-                        max(stored_size, restored_size),
+                        "备份中的文档超过单篇上限（%d 字 > %d），已按 %d 字分段导入",
+                        oversize,
+                        DOC_MAX_CHARS,
                         DOC_MAX_CHARS,
                     )
+                    for offset in range(0, len(content), DOC_MAX_CHARS):
+                        segment = content[offset : offset + DOC_MAX_CHARS]
+                        document_chunks.append(
+                            _chunk_documents(segment, sanitized_meta)
+                        )
+                        document_groups.append("")
                     continue
                 total_parts = len(pieces)
                 per_piece_metas: list[dict[str, Any] | None] = [None] * total_parts
