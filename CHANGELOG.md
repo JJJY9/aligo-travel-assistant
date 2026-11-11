@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 会话详情 / 列表 / 导出统一转义渲染输出：旧记忆或手写文件里的 assistant 内容若是 JSON 文本且内部带 `\ud800`，`render_stored_message` 的 `json.loads` 会把它还原成真代理项——`GET /api/sessions/{id}` 与导出在 UTF-8 序列化时抛 UnicodeEncodeError，该会话永久 500（停止后的前端对账会因此误判「未落库」并把原文塞回输入框，重发产生重复问答）；现在渲染出口统一 `sanitize_json`，会话详情与列表响应整体转义，Markdown / HTML / 合集导出同一口径
 - PostgreSQL 单条读改写补跨重连防护：`update_trip` 的「冲突检查 + UPDATE」、单条行程保存的「候选检查 + INSERT」与 `append_preference` 的「读 + 合并 + 写」都在 advisory lock 内先读后写；连接闪断时 `_reconnect` 只重放失败语句并重新获取锁，释放到重获的空档里其它实例可完成自己的读改写，本调用按过期快照写入会造出重复行程 / 覆盖别人的偏好更新。现在捕获连接身份，读快照后检测到重建即按持久化失败中止（与批量保存同一口径），由调用方重试
 - Redis 在线截断后影子缓存按 Redis 整体刷新：此前成功后按 `expect` 在本地影子缓存再删一次——多实例部署下影子可能缺少其它实例写入的最新轮次，用户重复提问时（文本与 expect 相同）会把仍在 Redis 的旧轮次从影子删掉，或删不掉已删除的轮次；Redis 故障切到影子后模型上下文缺失仍存在的轮次 / 含已删除内容。现在读取 Redis 窗口整体替换影子（删除是低频操作，多一次读取可接受），读取失败时保持影子不动、绝不盲删；`get_recent_context` 的解析逻辑抽出 `_parse_window` 复用
 - PostgreSQL 连接默认有界：新增 `lock_timeout=3000ms` 与 TCP keepalive（30s/10s/3）——此前生产连接只有 `connect_timeout=3`，语句等表锁 / advisory lock 或网络半开时 `_ensure_schema`、查询与重连后的重新加锁都可能无限阻塞（旧连接要等系统默认约 2 小时的 keepalive 才被回收），占满 Web 线程池与会话构造槽，且不抛异常所以失败冷却与 `degraded` 标记都不会触发；`statement_timeout` 仍只按显式传入设置，大备份导入等合法长事务不受默认语句上限影响
