@@ -219,8 +219,15 @@ class ConversationRuntime:
             if callable(guard_factory)
             else self._persist_guard
         )
+        stage_future: "asyncio.Future | None" = None
         try:
-            await asyncio.to_thread(self.memory.stage_message, "user", user_input)
+            # 保存暂存任务：取消可能落在写入线程执行期间，回滚前必须等它
+            # 落地，否则回滚读到的窗口里还没有这条提问、内容不匹配直接
+            # 返回 False，随后写入落地留下无回答的孤儿提问
+            stage_future = asyncio.ensure_future(
+                asyncio.to_thread(self.memory.stage_message, "user", user_input)
+            )
+            await asyncio.shield(stage_future)
             # 用清洗后的意图数据重建 Msg 再交给编排器：原始 Msg 仍可能带
             # 孤立代理项，会进入编排 prompt / _update_memory 落库路径
             sanitized_intention = Msg(
@@ -309,6 +316,7 @@ class ConversationRuntime:
             # 轮次，两层记忆从此不一致。落库线程已在途（用户停止时常常如此）
             # 就跳过：它会把整轮问答完整写入长期记忆。
             if not persist_started or self._pending_persist is None:
+                await self._settle_staged_write(stage_future)
                 await self._request_staged_rollback(user_input, turn_state)
             # 本轮用量没有写进任何持久化消息：记账到下一轮成功回合，否则
             # 下一轮的增量会把它们一起减掉，面板 / 趋势永久少记。取消时写
@@ -330,6 +338,9 @@ class ConversationRuntime:
             # 暂存的提问按删除语义回滚，避免墓碑随后被撤销（删除失败）时
             # 上下文里留下一条永远不会落库、也没有回答的孤立提问。
             self._accumulate_unsettled_usage(usage_value)
+            # 立即置位：回滚等待期间若再被取消，ask() 外层兜底不会把同一
+            # 回合用量重复记账（此前 done 在回滚之后才置位）
+            settlement["done"] = True
             await self._request_staged_rollback(user_input, turn_state)
         if committed is not False and defer_supported:
             # 整轮问答已成功落库：现在才提交偏好 / 行程；取消与墓碑否决
@@ -365,6 +376,26 @@ class ConversationRuntime:
         turn_state["rollback_requested"] = True
         await self._rollback_staged_user_message(user_input)
 
+    async def _settle_staged_write(
+        self, stage_future: "asyncio.Future | None"
+    ) -> None:
+        """取消发生在暂存写入线程期间：先等写入可见再回滚（有界）。
+
+        ``stage_message`` 的 Redis / 文件写入在池线程执行，取消协程不会
+        取消线程；写入尚未可见时回滚按末尾内容匹配会直接失败且不再重试，
+        短期记忆留下无回答的孤儿提问。
+        """
+        if stage_future is None or stage_future.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(stage_future), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.debug("等待暂存写入未在限时内完成，回滚可能跳过该条")
+        except asyncio.CancelledError:
+            logger.debug("等待暂存写入时被取消，回滚交给后台线程")
+        except Exception:  # noqa: BLE001 - stage_message 自身吞异常，兜底
+            logger.debug("暂存写入失败，回滚无需等待", exc_info=True)
+
     async def _await_pending_rollback(self, timeout_sec: float = 2.0) -> None:
         """等待在途回滚线程结束（有界；后台线程超时后自行完成）。"""
         task = getattr(self, "_pending_rollback", None)
@@ -375,6 +406,10 @@ class ConversationRuntime:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout_sec)
         except asyncio.TimeoutError:
             logger.debug("等待回滚暂存提问未在限时内完成，后台线程继续执行")
+        except asyncio.CancelledError:
+            # 调用方（except 处理器）的取消不能顶掉后续用量结算 / 状态置位：
+            # 回滚线程自行完成，这里吞掉取消继续收尾
+            logger.debug("等待回滚时被取消，回滚由后台线程完成")
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
             logger.warning("回滚暂存提问失败", exc_info=True)
 

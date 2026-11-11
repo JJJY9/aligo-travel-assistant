@@ -775,10 +775,13 @@ class RAGKnowledgeAgent(AgentBase):
 
             except Exception as e:
                 logger.error(f"Error generating answer with LLM: {e}")
-                answer = f"知识库中找到相关信息，但生成答案时出错：{e!s}"
+                # 用户可见的错误信息不能带本机路径 / 上游 URL（模型缓存
+                # 路径、HuggingFace 链接会随回答与备份导出）
+                safe_error = redact_paths(e)
+                answer = f"知识库中找到相关信息，但生成答案时出错：{safe_error}"
                 # 生成失败不能被当成正常回答：编排层要能标记失败并按
                 # 瞬时错误（timeout / connection）触发一次退避重试
-                answer_error = str(e) or type(e).__name__
+                answer_error = redact_paths(str(e) or type(e).__name__)
         else:
             # 如果没有LLM，直接返回检索到的知识
             answer = "以下是知识库中的相关信息：\n\n" + knowledge_context
