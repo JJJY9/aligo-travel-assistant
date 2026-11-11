@@ -897,6 +897,21 @@ def test_status_survives_overflowing_elapsed_history():
         _cleanup(user_id)
 
 
+def test_aware_timestamp_text_normalizes_backends():
+    """JSON naive 与 PG aware 时间戳都输出为同一绝对时刻的 aware ISO。"""
+    from utils.timestamps import to_aware
+    from webapp.server import _aware_timestamp_text
+
+    naive = _aware_timestamp_text("2026-11-05T10:01:00")
+    assert to_aware(naive).tzinfo is not None
+    assert to_aware(naive) == to_aware("2026-11-05T10:01:00")
+    aware = _aware_timestamp_text("2026-11-05T10:01:00+00:00")
+    assert aware == "2026-11-05T10:01:00+00:00"
+    assert _aware_timestamp_text("t") == "t"
+    assert _aware_timestamp_text(None) is None
+    print("✓ 会话时间戳归一为 aware ISO")
+
+
 def test_session_updated_at_uses_max_timestamp():
     """会话 updated_at 取消息最大时间戳：恢复旧备份不会让排序回拨。"""
     from webapp.server import _group_sessions
@@ -929,7 +944,14 @@ def test_session_updated_at_uses_max_timestamp():
     ]
     sessions = _group_sessions(history, 1_000_000)
     by_id = {item["session_id"]: item for item in sessions}
-    assert by_id["s1"]["updated_at"] == "2026-11-05T10:01:00"
+    # 输出归一为 aware ISO：naive 本地时间补上服务器偏移（前端 new Date()
+    # 才能按绝对时刻换算到浏览器时区）
+    from utils.timestamps import to_aware
+
+    updated = by_id["s1"]["updated_at"]
+    assert updated.startswith("2026-11-05T10:01:00"), updated
+    assert to_aware(updated) == to_aware("2026-11-05T10:01:00")
+    assert to_aware(updated).tzinfo is not None
     assert sessions[0]["session_id"] == "s1", "按最大时间戳倒序排列"
     print("✓ 会话 updated_at 取最大时间戳（恢复旧备份不回拨排序）")
 

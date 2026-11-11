@@ -1227,7 +1227,14 @@ class LongTermMemory:
         stats["total_trips"] = max(0, int(stats.get("total_trips", 0)) - 1)
         destination = removed.get("destination")
         frequent = stats.setdefault("frequent_destinations", {})
-        if destination and destination in frequent:
+        # 与保存 / 迁移重建同口径：只有出发日期可解析的行程计入常去目的地。
+        # 备份恢复可能保真保留 ``2026/03/12`` 这类旧格式日期，它们在保存
+        # 时不计数；删除时不做同样的过滤会把合法城市的计数误清零
+        if (
+            destination
+            and destination in frequent
+            and _trip_date_is_valid(removed.get("start_date"))
+        ):
             frequent[destination] = int(frequent[destination]) - 1
             if frequent[destination] <= 0:
                 del frequent[destination]
