@@ -35,8 +35,13 @@ async def ask_question(user_query: str):
         model_name=LLM_CONFIG["model_name"],
         api_key=LLM_CONFIG["api_key"],
         client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
+        # agentscope 1.0.16：temperature / max_tokens 必须走 generate_kwargs，
+        # 作为构造顶层参数会被静默忽略（只告警）；仓库内推荐直接用
+        # config_agentscope.create_chat_model(...) 统一口径
+        generate_kwargs={
+            "temperature": LLM_CONFIG.get("temperature", 0.7),
+            "max_tokens": LLM_CONFIG.get("max_tokens", 2000),
+        },
     )
     # 嵌入模型路径从 config.RAG_CONFIG 读取，默认 data/models/bge-small-zh-v1.5
     # 知识库目录默认解析为 .claude/skills/ask-question/data/rag_knowledge
@@ -73,9 +78,9 @@ data = asyncio.run(ask_question("北京的住宿标准是多少？"))
 
 ## 知识库
 
-- 路径：`data/rag_knowledge/`（Milvus Lite）
+- 路径：默认 `.claude/skills/ask-question/data/rag_knowledge/`（Milvus Lite；旧部署的 `rag_knowledge/` 仍作为回退），由 `utils.knowledge_paths.default_knowledge_dir` 统一解析
 - 源文档：`data/documents/`，共 8 类（差旅标准、报销、预订、FAQ、紧急处理、平台指南、城市指南、环保）
-- 首次使用前需执行：`python scripts/init_knowledge_base.py`
+- 首次使用前需执行：`python .claude/skills/ask-question/script/init_knowledge_base.py`
 
 
 ## 回答生成指南
