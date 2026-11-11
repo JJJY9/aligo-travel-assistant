@@ -117,14 +117,17 @@ def test_mark_bumps_epoch_and_unmark_keeps_it(monkeypatch):
     _use_client(monkeypatch, client)
     token = "cli-token-1"
     assert tombstones.mark_session_deleted("u1", "s1", source=token) is True
-    assert tombstones.get_session_epoch("u1", "s1") == "1"
+    assert tombstones.get_session_epoch_state("u1", "s1") == (True, "1")
     assert client.ttls[tombstones.epoch_key("u1", "s1")] == int(
         tombstones.EPOCH_TTL_SEC
     )
     tombstones.unmark_session_deleted("u1", "s1", source=token)
-    assert tombstones.get_session_epoch("u1", "s1") == "1", "撤销墓碑不回退纪元"
+    assert tombstones.get_session_epoch_state("u1", "s1") == (
+        True,
+        "1",
+    ), "撤销墓碑不回退纪元"
     tombstones.mark_session_deleted("u1", "s1", source="cli-token-2")
-    assert tombstones.get_session_epoch("u1", "s1") == "2"
+    assert tombstones.get_session_epoch_state("u1", "s1") == (True, "2")
     print("✓ 删除递增会话纪元且不回退")
 
 
@@ -154,6 +157,17 @@ def test_force_bypasses_failure_cooldown(monkeypatch):
     assert tombstones.is_session_deleted("u1", "s1", force=True) is True
     assert calls == [True]
     print("✓ force 跳过墓碑失败冷却")
+
+
+def test_epoch_state_distinguishes_unavailable(monkeypatch):
+    """(True, None)=从未删除；(False, None)=读不到（故障/冷却）。"""
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    assert tombstones.get_session_epoch_state("u1", "s1") == (True, None)
+    client.fail = True
+    tombstones.reset_failure_cache()
+    assert tombstones.get_session_epoch_state("u1", "s1") == (False, None)
+    print("✓ 纪元状态区分「未删除」与「读不到」")
 
 
 def test_is_session_deleted_reads_shared_key(monkeypatch):
@@ -291,6 +305,7 @@ if __name__ == "__main__":
         test_mark_reports_ownership_when_nx_lost,
         test_mark_bumps_epoch_and_unmark_keeps_it,
         test_force_bypasses_failure_cooldown,
+        test_epoch_state_distinguishes_unavailable,
         test_is_session_deleted_reads_shared_key,
         test_missing_redis_means_not_deleted,
         test_redis_errors_are_swallowed,

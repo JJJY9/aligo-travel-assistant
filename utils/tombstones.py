@@ -96,21 +96,27 @@ def bump_session_epoch(
         logger.warning("写入会话纪元失败：%s", exc)
 
 
-def get_session_epoch(user_id: str, session_id: str) -> str | None:
-    """读取会话纪元；无纪元（从未删除）/ Redis 不可用时返回 None。"""
+def get_session_epoch_state(user_id: str, session_id: str) -> tuple[bool, str | None]:
+    """读取会话纪元，返回 ``(是否读到, 纪元值)``。
+
+    ``(True, None)`` 表示「确实从未删除」；``(False, None)`` 表示 Redis
+    未配置 / 失败冷却中 / 读取故障——调用方不能把两者都当成「没变化」或
+    都当成「被删除」，否则一次瞬时故障会误否决未删除回合的落库（或让
+    删除保护静默失效）。
+    """
     global _failure_until
     client = _shared_client()
     if client is None:
-        return None
+        return False, None
     try:
         value = client.get(epoch_key(user_id, session_id))
-    except Exception as exc:  # noqa: BLE001 - 读取失败按「无纪元」处理
+    except Exception as exc:  # noqa: BLE001 - 读取失败按「读不到」处理
         _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
         logger.warning("读取会话纪元失败：%s", exc)
-        return None
+        return False, None
     if value is None:
-        return None
-    return value.decode() if isinstance(value, bytes) else str(value)
+        return True, None
+    return True, value.decode() if isinstance(value, bytes) else str(value)
 
 
 def mark_session_deleted(

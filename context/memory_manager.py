@@ -99,13 +99,17 @@ class MemoryManager:
             self._rebuild_long_term()
         self.long_term.add_chat_message(role, content, self.session_id)
 
-    def session_epoch(self) -> str | None:
-        """当前会话纪元（删除时单调递增）；无共享 Redis / 从未删除时为 None。"""
-        return tombstones.get_session_epoch(self.user_id, self.session_id)
+    def session_epoch(self) -> tuple[bool, str | None]:
+        """当前会话纪元快照 ``(是否读到, 值)``（删除时单调递增）。
+
+        ``(False, None)`` 表示 Redis 未配置 / 失败冷却 / 读取故障——不能与
+        「确实未删除」(True, None) 混为一谈。
+        """
+        return tombstones.get_session_epoch_state(self.user_id, self.session_id)
 
     def persist_guard(
         self,
-        epoch_at_start: str | None,
+        epoch_at_start: tuple[bool, str | None] | None,
         base: Callable[[], bool] | None = None,
     ) -> Callable[[], bool]:
         """组合落库守卫：墓碑（base / 默认共享墓碑）与「纪元未变」同时成立。
@@ -114,6 +118,11 @@ class MemoryManager:
         启动的长回合可能在墓碑撤销后才落库。纪元在每次删除时单调递增且
         不回退：回合开始时记下的值与提交时不同即说明本轮开始后会话被删过，
         无论墓碑是否还在都否决写入。
+
+        纪元只有「两次都读到了」时才有比较意义：一次瞬时 Redis 故障会让
+        读值不可得，按相等与否硬判会误否决未删除回合（用户看到「本轮未
+        保存」）或误放行已删除会话。读不到时退回墓碑守卫的结论（与引入
+        纪元前的行为一致），并把「无法校验」留在日志里。
         """
 
         def guard() -> bool:
@@ -122,10 +131,21 @@ class MemoryManager:
                     return False
             elif tombstones.is_session_deleted(self.user_id, self.session_id):
                 return False
-            return (
-                tombstones.get_session_epoch(self.user_id, self.session_id)
-                == epoch_at_start
+            if epoch_at_start is None:
+                return True
+            start_available, start_value = epoch_at_start
+            now_available, now_value = tombstones.get_session_epoch_state(
+                self.user_id, self.session_id
             )
+            if not start_available or not now_available:
+                logger.warning(
+                    "会话纪元不可读（开始=%s/提交=%s），本轮按墓碑结果放行：%s",
+                    start_available,
+                    now_available,
+                    self.session_id,
+                )
+                return True
+            return start_value == now_value
 
         return guard
 
