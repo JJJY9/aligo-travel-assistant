@@ -65,6 +65,25 @@ def test_bad_redis_falls_back():
     print("✓ Redis 不可用时仍使用 Redis 实现并走故障路径")
 
 
+def test_short_term_ttl_non_positive_clamped(monkeypatch):
+    """REDIS_TTL_SEC=0（「永不过期」的误配置）：EXPIRE 非正数会删键，必须钳制。"""
+    from context import storage as storage_module
+
+    monkeypatch.setitem(
+        storage_module.STORAGE_CONFIG, "redis_url", "redis://localhost:6379/0"
+    )
+    monkeypatch.setitem(storage_module.STORAGE_CONFIG, "redis_ttl_sec", 0)
+    monkeypatch.setitem(
+        storage_module._ACTUAL_BACKEND,
+        "short_term",
+        storage_module._ACTUAL_BACKEND.get("short_term"),
+    )
+    monkeypatch.setattr(storage_module, "_get_redis_client", lambda url: object())
+    memory = storage_module.create_short_term_memory("s-ttl-zero")
+    assert memory.ttl_sec == 1
+    print("✓ 非正 REDIS_TTL_SEC 被钳制")
+
+
 def test_describe_backends_reports_long_term_degraded(monkeypatch):
     """配置了 PostgreSQL 但已回退 JSON 时，后端描述带 long_term_degraded 标记。"""
     _set("redis_url", "")

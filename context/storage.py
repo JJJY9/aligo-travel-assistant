@@ -114,6 +114,13 @@ def create_short_term_memory(
     if url:
         client = _get_redis_client(url)
         ttl = int(STORAGE_CONFIG.get("redis_ttl_sec", 3600))
+        if ttl < 1:
+            # 常见误解「0 = 永不过期」：Redis 的 EXPIRE 收到非正数会直接
+            # 删键，短期记忆会静默全空。这里显式告警并按 1 秒生效。
+            logger.warning(
+                "REDIS_TTL_SEC=%s 非法（必须 >= 1），已按 1 秒处理", ttl
+            )
+            ttl = 1
         # 连接暂不可用（启动失败 / 工厂 60 秒冷却）时仍返回 Redis 实现：
         # 调用会走故障路径（影子缓存 + 操作日志），恢复后由后续实例重放。
         # 回退纯内存实现会让故障期的删除 / 清空彻底丢失（与

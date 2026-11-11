@@ -535,8 +535,8 @@ class ShortTermMemory:
         return {
             "total_messages": len(self.messages),
             "max_turns": self.max_turns,
-            "oldest_message_time": self.messages[0]["timestamp"] if self.messages else None,
-            "newest_message_time": self.messages[-1]["timestamp"] if self.messages else None
+            "oldest_message_time": self.messages[0].get("timestamp") if self.messages else None,
+            "newest_message_time": self.messages[-1].get("timestamp") if self.messages else None
         }
 
 
@@ -564,7 +564,10 @@ class RedisShortTermMemory:
         self._client_factory = client_factory
         self.session_id = session_id
         self.max_turns = max_turns
-        self.ttl_sec = ttl_sec
+        # TTL 必须 >= 1：Redis 的 EXPIRE 在超时非正数时直接删除键，配置成
+        # 0（「永不过期」的常见写法）会让每次写入推入消息后立刻整体删除，
+        # 短期记忆静默为空且无任何错误
+        self.ttl_sec = max(1, int(ttl_sec))
         self.user_id = user_id
         self.key = session_key(session_id, user_id)
         # Redis 故障时的进程内影子缓存：对话继续可用（跨实例共享暂时失效）。
@@ -620,6 +623,19 @@ class RedisShortTermMemory:
     def _replay_ops(self, journal: _PendingJournal) -> None:
         ops = journal.ops
         window = self.max_turns * 2
+        if ops and self.user_id and self.session_id:
+            # 跨进程删除墓碑：其它实例 / CLI 已删除该会话时，本进程日志里
+            # 排队的新增会把已删除对话重新写回 Redis 并注入模型上下文
+            # （进程内日志各管各的，删除方只能清掉自己的队列）。命中墓碑
+            # 即整体丢弃，并清空影子缓存，避免故障期继续从影子回放旧对话。
+            from utils.tombstones import is_session_deleted
+
+            if is_session_deleted(self.user_id, self.session_id):
+                logger.warning("会话已删除，丢弃短期记忆重放队列：%s", self.key)
+                ops.clear()
+                journal.stuck = ("", 0)
+                self._fallback.messages = []
+                return
         while ops:
             signature = repr(ops[0])
             try:
@@ -638,10 +654,14 @@ class RedisShortTermMemory:
                 else:
                     journal.stuck = (signature, 1)
                 if journal.stuck[1] >= 3:
+                    # 只记录操作类型与队列长度：签名 repr 里含消息正文 /
+                    # 用户提问原文，写进日志会把聊天内容泄露到日志采集
                     logger.warning(
-                        "短期记忆重放操作连续失败 %s 次，丢弃：%s",
+                        "短期记忆重放操作连续失败 %s 次，丢弃队首 %s 操作"
+                        "（队列剩余 %s 条）",
                         journal.stuck[1],
-                        signature[:200],
+                        ops[0][0] if ops else "?",
+                        max(0, len(ops) - 1),
                     )
                     if ops:
                         ops.pop(0)
@@ -858,8 +878,10 @@ class RedisShortTermMemory:
         for item in raw:
             try:
                 message = json.loads(item)
-            except (TypeError, json.JSONDecodeError, RecursionError):
-                # 深嵌套 JSON 解析抛 RecursionError，同样按坏条目跳过
+            except (TypeError, ValueError, RecursionError):
+                # 深嵌套 JSON 解析抛 RecursionError、超 4300 位整数字面量
+                # 抛普通 ValueError（不是 JSONDecodeError）：都按坏条目跳过，
+                # 不能被 _call_redis 当成 Redis 故障触发进程级降级
                 logger.warning("跳过无法解析的短期记忆条目：%s", self.key)
                 continue
             if (
@@ -1003,7 +1025,9 @@ class RedisShortTermMemory:
                     return None
                 try:
                     parsed = json.loads(raw)
-                except (TypeError, json.JSONDecodeError, RecursionError):
+                except (TypeError, ValueError, RecursionError):
+                    # 含 ValueError：超 4300 位整数字面量抛的是普通
+                    # ValueError，漏捕会把统计读取误判为 Redis 故障
                     return None
                 # 可解析但非对象（null / 数字 / 列表）：不能让 .get 的
                 # AttributeError 逃进 _call_redis 被误判为 Redis 故障、
@@ -1016,7 +1040,7 @@ class RedisShortTermMemory:
                     last = self.client.lindex(self.key, -1)
                     oldest = _timestamp(first)
                     newest = _timestamp(last)
-                except (TypeError, json.JSONDecodeError):
+                except (TypeError, ValueError):
                     pass
             return {
                 "total_messages": total,
