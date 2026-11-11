@@ -124,6 +124,32 @@ def test_rag_reply_marks_excerpt_and_neutralizes_markers(monkeypatch):
     print("✓ RAG 上下文标注节选并中和内容里的 prompt 结构标记")
 
 
+def test_rag_error_message_redacts_paths_and_urls():
+    """检索失败回流给用户的文本遮蔽内部路径 / URL，保留瞬时错误关键词。"""
+    agent = _rag_agent()
+
+    def _boom(*args, **kwargs):
+        raise OSError(
+            "加载失败: C:\\Users\\alice\\.cache\\model\\config.json 与 "
+            "/home/alice/.cache/huggingface/models--bge "
+            "https://huggingface.co/BAAI/bge/resolve/model (Connection refused)"
+        )
+
+    agent.search_knowledge = _boom
+    reply_impl = RAGKnowledgeAgent.reply.__wrapped__
+    message = asyncio.run(
+        reply_impl(agent, Msg(name="user", content="住宿标准是多少", role="user"))
+    )
+    payload = json.loads(message.content)
+    assert payload["status"] == "error"
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "alice" not in text
+    assert "huggingface.co" not in text
+    assert "<路径>" in text and "http(s)://***" in text
+    assert "Connection refused" in text
+    print("✓ RAG 错误文本脱敏且保留瞬时错误关键词")
+
+
 def _query_agent() -> InformationQueryAgent:
     return object.__new__(InformationQueryAgent)
 

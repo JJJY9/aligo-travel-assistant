@@ -11,7 +11,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from context.long_term_memory import LongTermMemory
-from utils.log_redact import redact_secret
+from utils.log_redact import redact_paths, redact_secret
 
 
 def test_redact_secret_strips_userinfo_and_query():
@@ -39,6 +39,25 @@ def test_preference_and_title_values_not_logged(caplog):
     print("✓ 偏好值 / 标题不进日志")
 
 
+def test_redact_paths_hides_internal_paths_and_urls():
+    """技能错误文本回流给用户：路径 / 上游 URL / 凭据都要遮蔽，瞬时限关键词保留。"""
+    raw = (
+        r"加载失败: C:\Users\alice\.cache\model\1_Pooling\config.json "
+        "与 /home/alice/.cache/huggingface/models--bge (Connection refused, timeout=8) "
+        "https://huggingface.co/BAAI/bge/resolve/main/model.safetensors?token=SECRET"
+    )
+    cleaned = redact_paths(raw)
+    assert "alice" not in cleaned
+    assert "huggingface.co" not in cleaned
+    assert "token=SECRET" not in cleaned
+    assert "<路径>" in cleaned and "http(s)://***" in cleaned
+    # 编排层据此判定瞬时错误并重试：关键词不能被抹掉
+    assert "Connection refused" in cleaned and "timeout=8" in cleaned
+    assert redact_paths("plain error") == "plain error"
+    print("✓ redact_paths 遮蔽内部路径 / URL 且保留瞬时限关键词")
+
+
 if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
+    test_redact_paths_hides_internal_paths_and_urls()
     print("caplog 用例需 pytest 运行")

@@ -66,6 +66,7 @@ except ImportError as e:
     DEPENDENCIES_AVAILABLE = False
 
 from utils.embedding_model import embedding_dimension, get_embedding_model
+from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
 # 进程内集合初始化互斥：并发的首次构造都会看到 has_collection=False，
@@ -654,14 +655,17 @@ class RAGKnowledgeAgent(AgentBase):
             logger.warning("知识库检索失败: %s", exc)
             # 顶层 error / message 供编排聚合与前端展示使用：聚合器按
             # result["error"] / result["message"] 提取原因，只放在
-            # answer / data.error 里会被丢弃渲染成「智能体返回错误状态」
+            # answer / data.error 里会被丢弃渲染成「智能体返回错误状态」。
+            # 文本回流给终端用户：先遮蔽内部路径 / 上游 URL（保留
+            # timeout / connection 等关键词供编排层判定瞬时错误）
+            detail = redact_paths(exc)
             result = {
                 "status": "error",
+                "error": f"知识库查询失败：{detail}",
                 "query": user_query,
-                "error": str(exc),
-                "message": f"知识库检索失败：{exc}",
-                "answer": f"知识库暂时不可用，请稍后再试（{exc}）",
-                "data": {"error": str(exc)},
+                "message": f"知识库检索失败：{detail}",
+                "answer": f"知识库暂时不可用，请稍后再试（{detail}）",
+                "data": {"error": detail},
             }
             return Msg(
                 name=self.name,
