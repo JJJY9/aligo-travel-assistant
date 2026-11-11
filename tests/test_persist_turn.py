@@ -444,21 +444,27 @@ def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
     manager.user_id = "u1"
     manager.session_id = "s1"
 
-    epochs = {"value": "2"}
+    epochs = {"state": (True, "2")}
     monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s, force=False: False)
     monkeypatch.setattr(
-        tombstones, "get_session_epoch", lambda u, s: epochs["value"]
+        tombstones, "get_session_epoch_state", lambda u, s: epochs["state"]
     )
-    assert manager.persist_guard("1", None)() is False, (
+    assert manager.persist_guard((True, "1"), None)() is False, (
         "回合开始后会话被删除（纪元变化）必须否决"
     )
-    assert manager.persist_guard("2", None)() is True
+    assert manager.persist_guard((True, "2"), None)() is True
     # Web 注入的 base 守卫仍然优先
-    assert manager.persist_guard("2", lambda: False)() is False
-    # 无 Redis（纪元一直 None）：行为与旧版一致
-    epochs["value"] = None
-    assert manager.persist_guard(None, None)() is True
-    print("✓ 落库守卫按会话纪元变化否决")
+    assert manager.persist_guard((True, "2"), lambda: False)() is False
+    # 两次都读到「无纪元」：正常放行
+    epochs["state"] = (True, None)
+    assert manager.persist_guard((True, None), None)() is True
+    # 瞬时故障读不到纪元：不能误否决未删除回合（退回墓碑结论放行）
+    epochs["state"] = (False, None)
+    assert manager.persist_guard((True, "1"), None)() is True, (
+        "读不到纪元时按墓碑结果放行，不能把瞬时故障当成删除"
+    )
+    assert manager.persist_guard((False, None), None)() is True
+    print("✓ 落库守卫按会话纪元变化否决（读不到时不误否决）")
 
 
 if __name__ == "__main__":
