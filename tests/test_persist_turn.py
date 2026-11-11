@@ -435,6 +435,32 @@ def test_next_turn_waits_for_inflight_persist_after_drain_timeout():
     print("✓ drain 超时后下一轮仍等待旧落库 / 回滚")
 
 
+def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
+    """删除递增的会话纪元：删除前启动的回合即使墓碑已撤销也不能落库。"""
+    from context.memory_manager import MemoryManager
+    from utils import tombstones
+
+    manager = object.__new__(MemoryManager)
+    manager.user_id = "u1"
+    manager.session_id = "s1"
+
+    epochs = {"value": "2"}
+    monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s: False)
+    monkeypatch.setattr(
+        tombstones, "get_session_epoch", lambda u, s: epochs["value"]
+    )
+    assert manager.persist_guard("1", None)() is False, (
+        "回合开始后会话被删除（纪元变化）必须否决"
+    )
+    assert manager.persist_guard("2", None)() is True
+    # Web 注入的 base 守卫仍然优先
+    assert manager.persist_guard("2", lambda: False)() is False
+    # 无 Redis（纪元一直 None）：行为与旧版一致
+    epochs["value"] = None
+    assert manager.persist_guard(None, None)() is True
+    print("✓ 落库守卫按会话纪元变化否决")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -445,6 +471,7 @@ if __name__ == "__main__":
         test_persist_turn_veto_skips_assistant_stage()
         test_persist_turn_defaults_to_shared_tombstone_guard(_mp)
         test_persist_turn_default_guard_commits_when_not_deleted(_mp)
+        test_memory_manager_persist_guard_vetoes_on_epoch_change(_mp)
         test_cancel_during_persist_drains_with_both_messages()
         test_cancel_during_persist_does_not_rollback_staged()
         test_cancel_with_failed_persist_rolls_back_staged()

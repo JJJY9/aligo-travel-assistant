@@ -3702,17 +3702,24 @@ def run_session_delete_standalone(
         if not exists:
             return _fail(f"会话 {session_id} 不存在或没有消息")
         # 先写共享墓碑再删库（与 Web DELETE 同一顺序）：删库与写墓碑之间
-        # 其它实例的在途落库守卫看不到墓碑，会把已删除的会话写回
+        # 其它实例的在途落库守卫看不到墓碑，会把已删除的会话写回。
+        # 墓碑值用本进程唯一 token：并发 CLI 删除（脚本重试 / 双开）时，
+        # SET NX 落败的一方不能把成功删除方的墓碑当成自己的回滚掉
+        import uuid
+
         from utils.tombstones import mark_session_deleted, unmark_session_deleted
 
-        shared_tombstone = mark_session_deleted(user_id, session_id)
+        tombstone_token = f"cli-{uuid.uuid4().hex}"
+        shared_tombstone = mark_session_deleted(
+            user_id, session_id, source=tombstone_token
+        )
         try:
             removed = store.delete_chat_session(session_id)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             if shared_tombstone:
                 # 删除失败、会话仍在：撤销本进程写的墓碑恢复可写
-                # （其它实例先写的墓碑值不是 "cli"，不会被误删）
-                unmark_session_deleted(user_id, session_id, source="cli")
+                # （其它实例 / 进程写的墓碑值不是本 token，不会被误删）
+                unmark_session_deleted(user_id, session_id, source=tombstone_token)
             return _fail(f"删除会话失败：{exc}")
     finally:
         close = getattr(store, "close", None)
@@ -3738,8 +3745,8 @@ def run_session_delete_standalone(
         print(f"已删除会话 {session_id}（{removed} 条消息）")
         if not shared_tombstone:
             print(
-                "提示：未启用共享删除墓碑（REDIS_URL），其它已打开的 Web "
-                "页面请刷新，避免继续向该会话发送消息"
+                "提示：共享删除墓碑未由本进程写入（REDIS_URL 未配置或已有其它"
+                "墓碑），其它已打开的 Web 页面请刷新，避免继续向该会话发送消息"
             )
     return 0
 

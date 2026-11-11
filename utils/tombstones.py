@@ -14,6 +14,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DELETED_KEY_PREFIX = "aligo:deleted"
+# 会话纪元键：每次删除单调递增，不被墓碑撤销回退。墓碑只剩 1 小时记忆，
+# 而删除前已在途的长回合（多智能体串行 + 重试可达数分钟）与「从未存在」
+# 删除都会撤销墓碑——落库守卫依靠纪元在删除前后是否变化来判断「这一轮
+# 是不是删除前启动的」，不依赖墓碑是否还在。TTL 比墓碑长得多，覆盖长
+# 回合与故障重放窗口。
+EPOCH_KEY_PREFIX = "aligo:session-epoch"
+EPOCH_TTL_SEC = 86400.0
 # 与 Web 的 AligoWebApp.tombstone_ttl_sec 同值（1 小时）：墓碑必须覆盖
 # 「删除发生时仍在途的回合」的最长生命周期，CLI 删除的会话才能挡住多实例 /
 # 长回合的迟到落库（旧值 300s 在多智能体重试超过 5 分钟时失效）
@@ -54,23 +61,71 @@ def deleted_key(user_id: str, session_id: str) -> str:
     return f"{DELETED_KEY_PREFIX}:{user_id}:{session_id}"
 
 
+def epoch_key(user_id: str, session_id: str) -> str:
+    """会话纪元键；Web 端写入使用同一键约定。"""
+    return f"{EPOCH_KEY_PREFIX}:{user_id}:{session_id}"
+
+
+def bump_session_epoch(
+    user_id: str, session_id: str, ttl_sec: float = EPOCH_TTL_SEC
+) -> None:
+    """删除会话时递增会话纪元（单调，撤销墓碑也不会回退）。
+
+    落库守卫在回合开始时记下纪元、提交前比对：值不同说明这一轮开始之后
+    会话被删除过，即使是「从未存在 → 撤销墓碑」或并发删除后墓碑被撤销的
+    路径也不能把已删除会话写回。
+    """
+    global _failure_until
+    client = _shared_client()
+    if client is None:
+        return
+    key = epoch_key(user_id, session_id)
+    try:
+        client.incr(key)
+        client.expire(key, max(int(ttl_sec), 1))
+    except Exception as exc:  # noqa: BLE001 - 纪元失败由墓碑兜底
+        _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
+        logger.warning("写入会话纪元失败：%s", exc)
+
+
+def get_session_epoch(user_id: str, session_id: str) -> str | None:
+    """读取会话纪元；无纪元（从未删除）/ Redis 不可用时返回 None。"""
+    global _failure_until
+    client = _shared_client()
+    if client is None:
+        return None
+    try:
+        value = client.get(epoch_key(user_id, session_id))
+    except Exception as exc:  # noqa: BLE001 - 读取失败按「无纪元」处理
+        _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
+        logger.warning("读取会话纪元失败：%s", exc)
+        return None
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
 def mark_session_deleted(
     user_id: str,
     session_id: str,
     ttl_sec: float = DEFAULT_TOMBSTONE_TTL_SEC,
     source: str = "cli",
 ) -> bool:
-    """写入共享删除墓碑；Redis 不可用 / 写入失败时返回 False（不抛异常）。
+    """写入共享删除墓碑；返回本次调用是否成为墓碑的所有者。
 
-    ``SET NX``：不覆盖其它实例已有的墓碑（它们的删除先发生，以先写者为准）。
+    Redis 不可用 / 写入失败时返回 False（不抛异常）。``SET NX`` 不覆盖其它
+    进程已有的墓碑——未写入时只有值恰好等于 ``source``（本进程先前的写入 /
+    带唯一 token 的幂等重试）才算自己拥有，否则返回 False，调用方回滚时
+    不能删除别人的保护。无论写入归属如何，删除都会递增会话纪元。
     """
     global _failure_until
     client = _shared_client()
     if client is None:
         return False
+    key = deleted_key(user_id, session_id)
     try:
-        client.set(
-            deleted_key(user_id, session_id),
+        written = client.set(
+            key,
             source,
             nx=True,
             ex=max(int(ttl_sec), 1),
@@ -79,7 +134,17 @@ def mark_session_deleted(
         _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
         logger.warning("写入共享删除墓碑失败：%s", exc)
         return False
-    return True
+    bump_session_epoch(user_id, session_id)
+    if written:
+        return True
+    try:
+        current = client.get(key)
+    except Exception:  # noqa: BLE001 - 读失败按非所有者处理
+        return False
+    if current is None:
+        return False
+    value = current.decode() if isinstance(current, bytes) else str(current)
+    return value == source
 
 
 def is_session_deleted(user_id: str, session_id: str) -> bool:

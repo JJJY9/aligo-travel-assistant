@@ -371,14 +371,30 @@ def test_session_delete_writes_shared_tombstone(monkeypatch):
 
         def set(self, key, value, nx=False, ex=None):
             self.sets.append((key, value, nx, ex))
+            return True
+
+        def incr(self, key):
+            return 1
+
+        def expire(self, key, ttl):
+            return 1
+
+        def get(self, key):
+            return None
 
     redis = _Redis()
     monkeypatch.setattr(storage, "get_shared_redis_client", lambda: redis)
     code, out = _run_delete("u1", "s-active", as_json=True)
     assert code == 0
     assert json.loads(out)["shared_tombstone"] is True
-    assert redis.sets == [("aligo:deleted:u1:s-active", "cli", True, 3600)]
-    print("✓ session-delete 写入共享删除墓碑")
+    assert len(redis.sets) == 1
+    key, value, nx, ex = redis.sets[0]
+    assert key == "aligo:deleted:u1:s-active"
+    assert value.startswith("cli-") and len(value) > len("cli-"), (
+        "墓碑值必须是本进程唯一 token（并发 CLI 删除时归属可区分）"
+    )
+    assert nx is True and ex == 3600
+    print("✓ session-delete 写入共享删除墓碑（唯一 token）")
 
 
 def test_session_delete_without_shared_tombstone_hints_refresh(monkeypatch):
