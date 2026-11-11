@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.stored_message import render_stored_message
+from utils.console import strip_terminal_controls
 
 _TEMPLATE = """<!doctype html>
 <html lang="zh-CN">
@@ -59,7 +60,7 @@ _TEMPLATE = """<!doctype html>
 
 def _escape(text: str) -> str:
     return (
-        str(text)
+        strip_terminal_controls(str(text))
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
