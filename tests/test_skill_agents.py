@@ -616,6 +616,46 @@ def test_preference_bare_array_is_wrapped_not_dropped():
     print("✓ 偏好裸数组按数组载荷包装（不再静默丢失）")
 
 
+def test_preference_array_after_prose_brackets_is_parsed():
+    """前言里的 [注] / 参考[1] 不能让合法的裸数组偏好被误判解析失败。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    payloads = [
+        '提取到以下偏好[共1条]：\n[{"type": "hotel_brands", "value": "汉庭"}]',
+        '参考[1]\n[{"type": "hotel_brands", "value": "如家"}]',
+    ]
+    for payload in payloads:
+
+        class _Model:
+            reply_text = payload
+
+            async def __call__(self, messages, **kwargs):
+                return self.reply_text
+
+        agent = agent_class(
+            name="PreferenceAgent", model=_Model(), memory_manager=_Memory()
+        )
+        agent.skill_loader = _Loader()
+        out = asyncio.run(
+            agent.reply(Msg(name="user", content="我喜欢住酒店", role="user"))
+        )
+        data = json.loads(out.content)
+        assert data.get("has_preferences") is True, (payload, data)
+        assert data["preferences"][0]["type"] == "hotel_brands", data
+    print("✓ 前言方括号不影响裸数组偏好解析")
+
+
 def test_plan_trip_rejects_non_itinerary_object():
     """可解析但不是行程形状的对象按解析失败处理（不再空回复）。"""
     module = _load_skill_module("plan-trip")

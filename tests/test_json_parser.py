@@ -193,6 +193,50 @@ def test_truncation_detected_before_result_keys():
     print("✓ 正式结果在写出键之前被截断也能识别（不回退示例）")
 
 
+def test_result_with_raw_newlines_beats_echoed_example():
+    """正式结果字符串含裸换行也能修复并选中，不回退到 prompt 示例。"""
+    from utils.json_parser import last_json_object_with_keys_strict
+
+    text = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", "duration_days": 1}\n'
+        '正式结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-03-11", '
+        '"summary": "3月11日出发\n3月18日返回", "missing_info": []}'
+    )
+    selected = last_json_object_with_keys_strict(text, ("destination",))
+    assert selected is not None and selected["destination"] == "杭州", selected
+    print("✓ 裸控制字符结果修复后胜出")
+
+
+def test_unrepairable_result_does_not_fall_back_to_example():
+    """含 NaN 的正式结果无法修复：严格扫描拒绝回退到示例对象。"""
+    import pytest
+
+    from utils.json_parser import last_json_object_with_keys_strict
+
+    text = (
+        '示例：{"destination": "北京", "start_date": "2026-02-27"}\n'
+        '正式：{"destination": "杭州", "start_date": "2026-03-11", "score": NaN}'
+    )
+    with pytest.raises(ValueError):
+        last_json_object_with_keys_strict(text, ("destination",))
+    print("✓ 不可修复结果不回退示例")
+
+
+def test_json_array_start_skips_prose_and_prefixed_brackets():
+    """裸数组定位跳过前言方括号；引用标记前缀的数组可由键扫描找回。"""
+    from utils.json_parser import first_json_array_with_keys, json_array_start
+
+    prose = '提取到以下偏好[共1条]：\n[{"type": "hotel_brands", "value": "汉庭"}]'
+    start = json_array_start(prose)
+    assert start is not None, "前言里的 [共1条] 不能阻断数组定位"
+    assert prose[start:] == '[{"type": "hotel_brands", "value": "汉庭"}]'
+    prefixed = '参考[1]\n[{"type": "hotel_brands", "value": "如家"}]'
+    assert json_array_start(prefixed) is None, "前言小数组后跟对象块按对象输出处理"
+    items = first_json_array_with_keys(prefixed, ("type", "value"))
+    assert items and items[0]["value"] == "如家"
+    print("✓ 裸数组定位跳过前言方括号")
+
+
 def test_balanced_explanation_after_result_is_not_truncation():
     """完整结果后的平衡说明片段（带键名）不再误判截断。"""
     from utils.json_parser import last_json_object_with_keys_strict
@@ -260,6 +304,9 @@ if __name__ == "__main__":
         test_top_level_scan_skips_broken_prefix()
         test_last_object_with_keys_repairs_trailing_comma()
         test_last_object_with_keys_refuses_unparsable_tail()
+        test_result_with_raw_newlines_beats_echoed_example()
+        test_unrepairable_result_does_not_fall_back_to_example()
+        test_json_array_start_skips_prose_and_prefixed_brackets()
         test_last_object_with_keys_still_picks_last_valid()
         test_strict_and_first_object_with_keys_helpers()
         test_truncation_detected_before_result_keys()
