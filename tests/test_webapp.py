@@ -423,6 +423,28 @@ def test_health_reports_any_degraded_limiter():
     print("✓ 任一限流桶降级都会上报 degraded")
 
 
+def test_health_reports_degraded_write_limiter():
+    """写桶单独降级（只被写接口触发）也必须上报 degraded 与指标。"""
+
+    class _DegradedLimiter:
+        backend = "redis"
+        limit = 240
+        window_sec = 60
+        degraded = True
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.write_limiter = _DegradedLimiter()
+    client = TestClient(app)
+    data = client.get("/api/health").json()
+    assert data["rate_limit_degraded"] is True
+    info = client.get("/api/metrics").json()
+    assert info["rate_limit"]["write_limit"] == 240
+    metrics = client.get("/metrics").text
+    assert "aligo_rate_limit_degraded 1" in metrics
+    print("✓ 写限流桶降级会上报健康与指标")
+
+
 def test_weather_api(monkeypatch):
     from utils.weather import WeatherError
     from webapp import server as server_module
@@ -3240,18 +3262,26 @@ def test_rate_limit_info_reports_import_bucket_degraded():
         weather_limiter=types.SimpleNamespace(limit=4, degraded=False),
         import_limiter=types.SimpleNamespace(limit=5, degraded=True),
         read_limiter=types.SimpleNamespace(limit=6, degraded=False),
+        write_limiter=types.SimpleNamespace(limit=7, degraded=False),
     )
     info = server_module._rate_limit_info(state)
     assert info["degraded"] is True
     assert info["kb_import_limit"] == 5
     assert info["read_limit"] == 6, "读接口桶的额度也要在健康信息里可见"
+    assert info["write_limit"] == 7, "写接口桶的额度也要在健康信息里可见"
 
     # 单独读接口桶回退同样计入汇总（此前 read_limiter 不在统计里）
     state.import_limiter = types.SimpleNamespace(limit=5, degraded=False)
     state.read_limiter = types.SimpleNamespace(limit=6, degraded=True)
     info = server_module._rate_limit_info(state)
     assert info["degraded"] is True
-    print("✓ 导入 / 读接口限流桶降级计入健康汇总")
+
+    # 只有写桶降级（Redis 故障只被写接口触发）也必须计入
+    state.read_limiter = types.SimpleNamespace(limit=6, degraded=False)
+    state.write_limiter = types.SimpleNamespace(limit=7, degraded=True)
+    info = server_module._rate_limit_info(state)
+    assert info["degraded"] is True, "写桶单独降级不能被健康汇总漏掉"
+    print("✓ 导入 / 读 / 写接口限流桶降级计入健康汇总")
 
 
 def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
