@@ -286,19 +286,107 @@ def test_parse_validates_session_ids_and_usage():
     print("✓ 会话 ID / 用量类型校验，偏好类型错误显式报告")
 
 
-def test_import_sorts_messages_by_timestamp():
+def test_import_preserves_message_order():
+    """恢复保持备份里的消息顺序：无时间戳旧消息不再被排到回答之后。"""
     payload = {
         "chat_history": [
-            {"role": "user", "content": "较晚", "session_id": "s1", "timestamp": "2026-11-02T10:00:00"},
-            {"role": "user", "content": "较早", "session_id": "s1", "timestamp": "2026-11-02T08:00:00"},
+            {"role": "user", "content": "无时间戳提问", "session_id": "s1"},
+            {
+                "role": "assistant",
+                "content": "有时间戳回答",
+                "session_id": "s1",
+                "timestamp": "2020-06-01T10:00:00",
+            },
+            {"role": "user", "content": "较晚", "session_id": "s2", "timestamp": "2026-11-02T10:00:00"},
+            {"role": "user", "content": "较早", "session_id": "s2", "timestamp": "2026-11-02T08:00:00"},
         ]
     }
     sections, _ = parse_user_export(json.dumps(payload, ensure_ascii=False))
-    assert [m["content"] for m in sections["messages"]] == ["较早", "较晚"]
+    assert [m["content"] for m in sections["messages"]] == [
+        "无时间戳提问",
+        "有时间戳回答",
+        "较晚",
+        "较早",
+    ], "全局排序会打乱会话内提问 / 回答顺序"
     store = _real_store("u-order")
     import_user_data(store, sections)
-    assert [m["content"] for m in store.get_chat_history(limit=None)] == ["较早", "较晚"]
-    print("✓ 恢复按时间升序写入")
+    s1 = store.get_chat_history(session_id="s1")
+    assert [m["role"] for m in s1] == ["user", "assistant"], s1
+    assert [m["content"] for m in s1] == ["无时间戳提问", "有时间戳回答"]
+    print("✓ 恢复保持备份消息顺序")
+
+
+def test_import_preserves_trip_id_and_timestamp():
+    """备份里的 trip_id / timestamp 原样保留，新行程编号从水位继续。"""
+    payload = {
+        "trip_history": [
+            {
+                "trip_id": "trip_37",
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+                "purpose": "出差",
+                "timestamp": "2020-06-01T10:00:00",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert errors == [], errors
+    trip = sections["trips"][0]
+    assert trip["trip_id"] == "trip_37"
+    assert trip["timestamp"].startswith("2020-06-01"), trip["timestamp"]
+    store = _real_store("u-trip-id")
+    import_user_data(store, sections)
+    restored = store.get_trip_history(limit=None)[0]
+    assert restored["trip_id"] == "trip_37", restored
+    assert str(restored["timestamp"]).startswith("2020-06-01"), restored
+    next_id = store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-12-03",
+            "purpose": "出差",
+        }
+    )
+    assert next_id == "trip_38", "编号水位要按还原的旧编号抬高"
+    print("✓ 恢复保留 trip_id / timestamp 且编号水位继续")
+
+
+def test_import_drop_sessions_clears_trip_link():
+    """drop_sessions 显式清除的会话关联在恢复时写回（不复活死链接）。"""
+    from utils.user_import import drop_sessions
+
+    store = _real_store("u-drop-link")
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+            "session_id": "s-gone",
+        }
+    )
+    payload = {
+        "trip_history": [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+                "purpose": "出差",
+                "session_id": "s-gone",
+            }
+        ]
+    }
+    sections, _ = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    drop_sessions(sections, {"s-gone"})
+    import_user_data(store, sections)
+    restored = store.get_trip_history(limit=None)
+    assert len(restored) == 1, restored
+    assert restored[0].get("session_id") is None, restored
+    print("✓ drop_sessions 的会话关联清除在恢复时生效")
 
 
 def test_import_accepts_z_suffix_timestamps():
@@ -1515,7 +1603,9 @@ if __name__ == "__main__":
     test_parse_export_skips_invalid_rows()
     test_exporter_json_is_importable()
     test_parse_validates_session_ids_and_usage()
-    test_import_sorts_messages_by_timestamp()
+    test_import_preserves_message_order()
+    test_import_preserves_trip_id_and_timestamp()
+    test_import_drop_sessions_clears_trip_link()
     test_import_accepts_z_suffix_timestamps()
     test_preview_does_not_write_and_matches_import()
     test_parse_tolerates_bad_timestamps_and_rows()
