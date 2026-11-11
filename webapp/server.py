@@ -2349,6 +2349,34 @@ async def _get_session_marked(
         raise
 
 
+async def _ask_cancellable_on_disconnect(
+    coro: Any, request: Request, poll_interval: float = 0.2
+) -> tuple[Any, bool]:
+    """等待对话回合完成；客户端断开时取消它，返回 ``(结果, 是否断开)``。
+
+    非流式端点在 ASGI 栈上不会自动收到 ``http.disconnect``（uvicorn 只把
+    连接标记为已断开，不会取消 ASGI 任务；Starlette 的断连监听只存在于
+    流式响应体阶段）。不主动探测的话，客户端超时 / 关闭后整轮 LLM 调用
+    仍会跑完并写入长期记忆：额度被浪费，客户端重试还会产生重复问答。
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=poll_interval)
+            if task.done():
+                break
+            if await request.is_disconnected():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                return None, True
+        return await task, False
+    except asyncio.CancelledError:
+        # 端点自身被取消（服务关闭 / 上层取消）：回合不能留在后台继续跑
+        task.cancel()
+        raise
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -3556,9 +3584,22 @@ def create_app(model: Any = None) -> FastAPI:
                     detail=f"{exc}（请求 ID：{_request_id(request)}）",
                 ) from exc
             try:
-                result = await session.runtime.ask(
-                    payload.message, turn_id=payload.client_turn_id or ""
+                result, disconnected = await _ask_cancellable_on_disconnect(
+                    session.runtime.ask(
+                        payload.message, turn_id=payload.client_turn_id or ""
+                    ),
+                    request,
                 )
+                if disconnected:
+                    # 客户端已断开：回合已取消、暂存提问已回滚；drain /
+                    # end_turn 仍由 finally 完成，响应无人接收
+                    logger.info(
+                        "客户端断连，已取消在途回合（%s）", _request_id(request)
+                    )
+                    return {
+                        "session_id": session.session_id,
+                        "cancelled": True,
+                    }
             except CircuitOpenError as exc:
                 raise HTTPException(
                     status_code=503,

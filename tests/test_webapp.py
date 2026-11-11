@@ -447,6 +447,48 @@ def test_stream_and_chat_sanitize_model_surrogates(monkeypatch):
     print("✓ SSE / JSON 响应转义模型输出的孤立代理项")
 
 
+def test_ask_cancellable_on_disconnect():
+    """非流式回合在客户端断开后取消；正常完成返回结果。"""
+    import asyncio
+
+    from webapp.server import _ask_cancellable_on_disconnect
+
+    class _Req:
+        def __init__(self, disconnect_after):
+            self.calls = 0
+            self.disconnect_after = disconnect_after
+
+        async def is_disconnected(self):
+            self.calls += 1
+            return self.calls >= self.disconnect_after
+
+    async def scenario():
+        cancelled = {"v": False}
+
+        async def slow():
+            try:
+                await asyncio.sleep(10)
+                return {"reply": "late"}
+            except asyncio.CancelledError:
+                cancelled["v"] = True
+                raise
+
+        result, disconnected = await _ask_cancellable_on_disconnect(
+            slow(), _Req(2), poll_interval=0.01
+        )
+        assert (result, disconnected) == (None, True), (result, disconnected)
+        assert cancelled["v"] is True, "断连后必须在途回合被取消"
+
+        async def quick():
+            return {"reply": "ok"}
+
+        result, disconnected = await _ask_cancellable_on_disconnect(
+            quick(), _Req(999), poll_interval=0.01
+        )
+        assert result == {"reply": "ok"} and disconnected is False
+
+    asyncio.run(scenario())
+    print("✓ 非流式回合在客户端断开后取消")
 def test_stream_and_chat_report_unpersisted_turn(monkeypatch):
     """墓碑否决的回合：done / 响应必须带 persisted=false，不能伪装成功。"""
     from agents.conversation import ConversationRuntime
@@ -9225,6 +9267,7 @@ if __name__ == "__main__":
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
+    test_ask_cancellable_on_disconnect()
     test_tombstone_ttl_covers_inflight_turn_lease()
     test_cli_tombstone_default_ttl_matches_web()
     _mp_surrogate = pytest.MonkeyPatch()

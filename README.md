@@ -611,7 +611,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`；响应含 `persisted`，会话在其它进程被删除时整轮不落库并返回 `persisted: false`） |
+| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`；响应含 `persisted`，会话在其它进程被删除时整轮不落库并返回 `persisted: false`；客户端断开连接后服务端取消在途回合，不再继续消耗模型额度或写入历史） |
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果；`done` 事件同样携带 `persisted`） |
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开或技能目录不可用（`skills.ok` 为 `false`）时 `status` 为 `degraded` 并附 `circuit_breaker` / `skills` |
 | GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors`）与限流后端信息；SSE 长连接只计请求数、不计入延迟分位 |
