@@ -556,6 +556,46 @@ def test_pg_chat_summary_does_not_fetch_message_bodies():
     print("✓ PostgreSQL 会话概览只查计数（不读正文）")
 
 
+def test_pg_delete_trips_verified_checks_identity_in_lock():
+    """PG 批量去重：锁内按身份复核后按主键删除，身份不符不删。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    rows = [
+        (1, "trip_1", "北京", "上海", "2026-12-01", "2026-12-02"),
+        (2, "trip_1", "北京", "上海", "2026-12-01", "2026-12-02"),
+        (3, "trip_2", "北京", "杭州", "2026-12-05", None),
+    ]
+    store._fetchall = lambda sql, params=None: list(rows)
+    deleted: list[object] = []
+    store._execute = lambda sql, params=None, **kwargs: deleted.append(params[1])
+
+    target = {
+        "trip_id": "trip_1",
+        "kept_id": "trip_1",
+        "prefer_last": True,
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+    }
+    removed, failure = store.delete_trips_verified([target])
+    assert (removed, failure) == (1, None)
+    assert deleted == [2], "同 id 副本删最后一条"
+
+    deleted.clear()
+    removed, failure = store.delete_trips_verified(
+        [{**target, "destination": "广州"}]
+    )
+    assert removed == 0 and failure is None and deleted == []
+    print("✓ PostgreSQL 批量去重在锁内按身份复核")
+
+
 def test_pg_delete_trip_deletes_single_row():
     """PostgreSQL 删除行程按主键：历史库重复 trip_id 时不能整批删除。"""
     import contextlib
@@ -1340,6 +1380,60 @@ def test_trip_save_matches_linebreak_variants():
     assert len(trips) == 1
     assert trips[0]["purpose"] == "会议", "未提供目的时保留原值"
     print("✓ 换行 / 未补零日期不同的同一趟行程命中存储去重")
+
+
+def test_delete_trips_verified_batches_single_write():
+    """批量复核删除：同一把锁内按身份复核，只落盘一次（去重写放大修复）。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch", storage_dir)
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+    )
+    # 手工注入同 id 同身份的重复副本（正常写入口径会去重，模拟历史脏数据）
+    path = Path(storage_dir) / "u-batch.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    duplicate = dict(data["trip_history"][0])
+    duplicate["purpose"] = "培训"
+    data["trip_history"].append(duplicate)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    fresh = LongTermMemory("u-batch", storage_dir)
+    saves = []
+    real_save = fresh._save
+
+    def counting_save():
+        saves.append(1)
+        return real_save()
+
+    fresh._save = counting_save
+    target = {
+        "trip_id": "trip_1",
+        "kept_id": "trip_1",
+        "prefer_last": True,
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+    }
+    removed, failure = fresh.delete_trips_verified([target])
+    assert (removed, failure) == (1, None)
+    assert len(saves) == 1, "批量删除必须只落盘一次"
+    remaining = fresh.get_trip_history(limit=None)
+    assert len(remaining) == 1 and remaining[0]["purpose"] == "出差"
+
+    # 身份不一致：跳过不删
+    removed, failure = fresh.delete_trips_verified(
+        [{**target, "destination": "广州"}]
+    )
+    assert removed == 0 and failure is None
+    assert len(fresh.get_trip_history(limit=None)) == 1
+    print("✓ 批量复核删除一次落盘 / 身份不符跳过")
 
 
 def test_one_day_trip_dedupes_end_date_variants():
@@ -2955,6 +3049,7 @@ if __name__ == "__main__":
     test_stale_snapshot_does_not_resurrect_trip()
     test_trip_save_deduplicates_same_trip()
     test_trip_save_matches_linebreak_variants()
+    test_delete_trips_verified_batches_single_write()
     test_trip_update_and_conflict()
     test_next_trip_id_not_reused_after_deleting_latest()
     test_one_day_trip_dedupes_end_date_variants()
@@ -2987,6 +3082,7 @@ if __name__ == "__main__":
     test_pg_delete_duplicate_trip_keeps_last_copy()
     test_pg_trip_lookup_normalizes_identity_fields()
     test_pg_chat_summary_does_not_fetch_message_bodies()
+    test_pg_delete_trips_verified_checks_identity_in_lock()
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()

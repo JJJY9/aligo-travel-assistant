@@ -146,6 +146,34 @@ def apply_trip_dedupe(
                 str(item.get("start_date") or ""),
                 str(item.get("end_date") or ""),
             )
+    # 存储层支持批量复核删除时优先走批量：一次重载 + 一次落盘，复核与
+    # 删除在同一把写锁内完成（逐条 delete_trip 是 O(重复数 × 文件大小)
+    # 的全量写回，且 verify 与 delete 之间的窗口里被编辑的行程仍会被删）
+    batch_delete = getattr(store, "delete_trips_verified", None)
+    if callable(batch_delete) and verify and duplicate_entries:
+        targets: list[dict[str, Any]] = []
+        for kept_id, trip_id in duplicate_entries:
+            if not trip_id:
+                continue
+            expected = expected_by_target.get(trip_id)
+            if expected is None:
+                continue
+            origin, destination, start_date, end_date = expected
+            targets.append(
+                {
+                    "trip_id": trip_id,
+                    "kept_id": kept_id,
+                    "prefer_last": trip_id == kept_id,
+                    "origin": origin,
+                    "destination": destination,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                }
+            )
+        try:
+            return batch_delete(targets)
+        except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
+            return 0, str(exc)
     removed = 0
     try:
         for kept_id, trip_id in duplicate_entries:

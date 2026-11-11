@@ -1216,6 +1216,75 @@ class PostgresLongTermMemory:
             )
             return deleted > 0
 
+    def delete_trips_verified(
+        self, targets: list[dict[str, Any]]
+    ) -> tuple[int, str | None]:
+        """批量按身份复核删除（去重专用）。
+
+        在一次 advisory lock 内取出全部行程的身份快照，逐条复核后按主键
+        删除：并发去重 / 编辑被同一把锁串行化，复核与删除之间不存在可
+        穿插的写者（此前 verify 与 delete 分两次加锁，被编辑后的行程仍会
+        被按 id 删掉）。连接中途重建时中止本批（已删除的保留），调用方
+        重试即可。返回 ``(删除数, 失败原因或 None)``。
+        """
+        from utils.trip_import import trip_identity
+
+        if not targets:
+            return 0, None
+        removed = 0
+        try:
+            with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+                start_conn = getattr(self, "_conn", None)
+                rows = self._fetchall(
+                    "SELECT id, trip_id, origin, destination, start_date, end_date "
+                    "FROM aligo_trips WHERE user_id = %s ORDER BY id",
+                    (self.user_id,),
+                )
+                self._abort_if_reconnected(start_conn)
+                working = [
+                    {
+                        "id": int(row[0]),
+                        "trip_id": str(row[1] or ""),
+                        "origin": row[2],
+                        "destination": row[3],
+                        "start_date": row[4],
+                        "end_date": row[5],
+                    }
+                    for row in rows
+                ]
+                for target in targets:
+                    trip_id = str(target.get("trip_id") or "")
+                    if not trip_id:
+                        continue
+                    want = trip_identity(target)
+                    matches = [
+                        row
+                        for row in working
+                        if row["trip_id"] == trip_id and trip_identity(row) == want
+                    ]
+                    if not matches:
+                        continue
+                    kept_id = str(target.get("kept_id") or "")
+                    if kept_id and not any(
+                        row["trip_id"] == kept_id and trip_identity(row) == want
+                        for row in working
+                    ):
+                        continue
+                    prefer_last = bool(target.get("prefer_last"))
+                    if prefer_last and len(matches) < 2:
+                        continue
+                    chosen = matches[-1] if prefer_last else matches[0]
+                    self._execute(
+                        "DELETE FROM aligo_trips WHERE user_id = %s AND id = %s",
+                        (self.user_id, chosen["id"]),
+                    )
+                    self._abort_if_reconnected(start_conn)
+                    working.remove(chosen)
+                    removed += 1
+        except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
+            return removed, str(exc)
+        return removed, None
+
     def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:
         """更新一条行程的字段；返回是否存在。
 

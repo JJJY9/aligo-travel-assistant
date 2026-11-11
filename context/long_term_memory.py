@@ -1220,8 +1220,8 @@ class LongTermMemory:
         stats["last_trip_number"] = number
         return f"trip_{number}"
 
-    def _drop_trip_row(self, trips: list[dict], index: int) -> None:
-        """移除行程行并同步统计；写盘失败按持久化错误抛出。"""
+    def _remove_trip_row(self, trips: list[dict], index: int) -> None:
+        """从内存快照移除行程行并同步统计（不落盘）。"""
         removed = trips.pop(index)
         stats = self.data.setdefault("statistics", {})
         stats["total_trips"] = max(0, int(stats.get("total_trips", 0)) - 1)
@@ -1231,6 +1231,10 @@ class LongTermMemory:
             frequent[destination] = int(frequent[destination]) - 1
             if frequent[destination] <= 0:
                 del frequent[destination]
+
+    def _drop_trip_row(self, trips: list[dict], index: int) -> None:
+        """移除行程行并同步统计；写盘失败按持久化错误抛出。"""
+        self._remove_trip_row(trips, index)
         if not self._save():
             raise MemoryPersistenceError("写入长期记忆失败")
 
@@ -1268,6 +1272,64 @@ class LongTermMemory:
         self._drop_trip_row(trips, indices[-1])
         logger.info(f"Deleted duplicate trip history: {trip_id}")
         return True
+
+    @_locked_mutation
+    def delete_trips_verified(
+        self, targets: list[dict[str, Any]]
+    ) -> tuple[int, str | None]:
+        """批量按身份复核删除（去重专用）：一次重载 + 一次原子写回。
+
+        ``targets`` 每项含 ``trip_id`` 与计划身份（``origin`` /
+        ``destination`` / ``start_date`` / ``end_date``），可选 ``kept_id``
+        （保留项须仍以该身份存在）与 ``prefer_last``（同 id 副本删最后
+        一条）。身份与当前记录不一致、行或保留项已消失时跳过并计数告警。
+
+        逐条调用 ``delete_trip`` 时每次都会整文件重载 + 整文件写回
+        （O(重复数 × 文件大小)），这里在同一把写锁内完成复核与删除、只
+        落盘一次；复核与删除也因此不可被并发写者穿插（verify→delete 的
+        TOCTOU 窗口关闭）。返回 ``(删除数, 失败原因或 None)``。
+        """
+        from utils.trip_import import trip_identity
+
+        trips = self.data.get("trip_history", [])
+        removed = 0
+        skipped = 0
+        for target in targets:
+            trip_id = str(target.get("trip_id") or "")
+            if not trip_id:
+                continue
+            want = trip_identity(target)
+            matches = [
+                index
+                for index, trip in enumerate(trips)
+                if str(trip.get("trip_id") or "") == trip_id
+                and trip_identity(trip) == want
+            ]
+            if not matches:
+                skipped += 1
+                continue
+            kept_id = str(target.get("kept_id") or "")
+            if kept_id and not any(
+                str(trip.get("trip_id") or "") == kept_id
+                and trip_identity(trip) == want
+                for trip in trips
+            ):
+                skipped += 1
+                continue
+            prefer_last = bool(target.get("prefer_last"))
+            if prefer_last and len(matches) < 2:
+                # 同 id 只剩一条身份副本：并发去重已清过，不能再删仅剩的保留行
+                skipped += 1
+                continue
+            self._remove_trip_row(trips, matches[-1] if prefer_last else matches[0])
+            removed += 1
+        if removed and not self._save():
+            raise MemoryPersistenceError("写入长期记忆失败")
+        if skipped:
+            logger.warning(
+                "去重跳过 %d 条：计划生成后行程已变更或保留项已删除", skipped
+            )
+        return removed, None
 
     @_locked_mutation
     def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:

@@ -1039,6 +1039,26 @@ def test_ics_roundtrip_dirty_dates_closed():
     print("✓ ICS 脏日期往返身份闭合")
 
 
+def test_ics_unfold_long_line_is_linear():
+    """超长折行展开必须线性完成（旧实现逐段拼接字符串是 O(n²)，5M 要 20+ 秒）。"""
+    import time
+
+    from utils.trip_import import _unfold_ics
+
+    payload = "A" * 3_000_000
+    folded = "\r\n ".join(
+        payload[index : index + 75] for index in range(0, len(payload), 75)
+    )
+    text = "BEGIN:VEVENT\r\nX:" + folded + "\r\nEND:VEVENT"
+    started = time.monotonic()
+    lines = _unfold_ics(text)
+    elapsed = time.monotonic() - started
+    assert lines[0] == "BEGIN:VEVENT"
+    assert lines[1] == "X:" + payload
+    assert elapsed < 5.0, f"展开 3M 字符折行耗时 {elapsed:.1f}s（疑似恢复 O(n²)）"
+    print("✓ 超长 ICS 折行线性展开")
+
+
 def test_ics_roundtrip_linebreak_identity_closed():
     """字段内 CR / CRLF 导出往返后身份不变（不再重复新增）。"""
     from utils.trip_export import render_trips_ics
@@ -1065,6 +1085,7 @@ if __name__ == "__main__":
     test_ics_roundtrip_matches_export()
     test_ics_roundtrip_escapes_machine_delimiters()
     test_ics_unfold_and_lf_only()
+    test_ics_unfold_long_line_is_linear()
     test_ics_collects_invalid_events()
     test_ics_external_summary_fallback()
     test_ics_empty_origin_roundtrip()

@@ -45,6 +45,8 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 去重执行改为存储层批量复核删除：此前逐条 `delete_trip` 每次整文件重载 + 整文件写回（99 条重复 / 4.5MB 记忆约 10 秒；按此 30MB 文件、1000 条重复要重写约 30GB），且 verify 与 delete 分两次加锁——复核后被并发编辑的行程仍会被按 id 静默删除。新增 `delete_trips_verified`：JSON 后端一次重载、一次原子落盘，身份复核与删除在同一把写锁内；PostgreSQL 后端在 advisory lock 内取快照复核后按主键删除，连接中途重建时如实报告已删除数
+- ICS 折行展开线性化：`_unfold_ics` 此前用不断变长的字符串逐段拼接（O(n²) 字符复制），单条 5M 字符的超长折行要 20 多秒且无任何输出，用户以为程序卡死；改为按逻辑行累积片段再一次 join
 - `stats` 对损坏的记忆文件显式失败：记忆文件损坏被隔离后存储以空快照启动，此前 `stats` 按空账号报告成功（JSON 全 0、退出码 0），备份 / 清理脚本会把损坏当成「没有数据」。现在存储层记录本次启动隔离的备份路径，`stats` 报告「记忆文件损坏，已隔离备份到 …」并退出 1（`--json` 为 `ok:false` + `corrupt_backup`）
 - `stats` 改用轻量会话概览：此前用 `get_chat_history()` 整表取回全部消息正文，只为数条数与会话集合——PostgreSQL 用户几十万条历史时峰值内存超过 1GB，小内存机器直接 OOM。新增 `get_chat_summary()`：JSON 后端遍历内存快照，PostgreSQL 后端只查 `COUNT(*)` 与 `DISTINCT session_id`，不再读取正文
 - 行程导出与列表输出统一清洗不可信字段：`trips` / `trips-export` / `trip-calendar` 的终端文本与 `--stdout` 输出此前原样携带 ESC / OSC 序列（可写剪贴板、伪造链接），历史 JSON 里的孤立代理项还会让导出在编码时抛 `UnicodeEncodeError`（CSV 目标文件被截成 0 字节）。现在 CSV / ICS / HTML 渲染与列表输出都在写出前剥离控制序列、转义孤立代理项并归一行分隔符（与身份口径一致，往返不改变去重键）
