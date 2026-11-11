@@ -416,7 +416,7 @@ python -m webapp.server           # Web 界面：http://127.0.0.1:8000
 python -m webapp.server --version # 显示 Web 版本后退出
 ```
 
-Web 服务默认只监听本机，可用 `--host` / `--port` 调整（例如 `--port 8001`）。使用非环回地址（如 `--host 0.0.0.0`）启动时会输出安全警告：请通过反向代理提供认证与 HTTPS（见 [SECURITY.md](SECURITY.md)）。
+Web 服务默认只监听本机，可用 `--host` / `--port` 调整（例如 `--port 8001`）。使用非环回地址（如 `--host 0.0.0.0`）启动时会输出安全警告：请通过反向代理提供认证与 HTTPS（见 [SECURITY.md](SECURITY.md)）。服务端默认只接受回环地址、`*.localhost` 与 IP 字面量形式的 `Host`；通过域名访问（反向代理 / 内网 DNS）时需设置 `ALIGO_ALLOWED_HOSTS=aligo.example.com,*.example.com`（逗号分隔，默认不信任任何外部域名）——未列入的 `Host` 一律返回 400，防止 DNS rebinding 把攻击者域名解析到本机后同源读写数据。
 
 ---
 
