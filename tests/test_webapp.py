@@ -5675,9 +5675,12 @@ def test_host_rejection_is_secured_and_counted():
         assert response.status_code == 400, response.text[:200]
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["cache-control"] == "no-store"
+        # 扫描器直接打 / 也要计入（非 /api 路径平时不记访问日志）
+        root = client.get("/", headers={"Host": "evil.example.com"})
+        assert root.status_code == 400
         snapshot = REQUEST_METRICS.snapshot()
-        assert snapshot["by_status"].get("400") == 1, snapshot
-        assert snapshot["by_path"].get("__host_rejected__") == 1, snapshot
+        assert snapshot["by_status"].get("400") == 2, snapshot
+        assert snapshot["by_path"].get("__host_rejected__") == 2, snapshot
         print("✓ Host 拒绝 400 计入指标且带安全头")
     finally:
         REQUEST_METRICS.reset()

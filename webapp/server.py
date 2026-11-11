@@ -483,7 +483,9 @@ class RequestContextMiddleware:
             except Exception:  # noqa: BLE001 - 客户端可能已断开
                 raise exc from None
         finally:
-            if route_path.startswith("/api/"):
+            # 被 Host 白名单拒绝的请求无论打哪个路径都要可观测（DNS rebinding
+            # 扫描常直接探测 /），其余非 /api 路径保持不记访问日志
+            if route_path.startswith("/api/") or host_rejected:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 logger.info(
                     "%s",
