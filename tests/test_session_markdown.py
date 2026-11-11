@@ -70,7 +70,7 @@ def test_fallback_title_escaped_like_custom():
     ]
     markdown, count = render_all_sessions_markdown("u1", lines, {})
     assert count == 1
-    assert "## &lt;script&gt;alert(1)&lt;/script&gt; 你好" in markdown
+    assert "## &lt;script&gt;alert\\(1\\)&lt;/script&gt; 你好" in markdown
     assert "## <script>" not in markdown, "回退标题必须与自定义标题同样转义"
     print("✓ 回退标题与自定义标题同一清洗口径")
 
@@ -94,8 +94,8 @@ def test_message_body_escaped_in_export():
         },
     ]
     markdown, _ = render_all_sessions_markdown("u1", lines, {})
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markdown
-    assert "回答 &lt;b&gt;加粗&lt;/b&gt;" in markdown
+    assert "> &lt;script&gt;alert\\(1\\)&lt;/script&gt;" in markdown
+    assert "> 回答 &lt;b&gt;加粗&lt;/b&gt;" in markdown
     assert "<script>" not in markdown
     print("✓ 导出正文尖括号转义")
 
@@ -119,9 +119,102 @@ def test_group_sessions_uses_max_timestamp_within_session():
     print("✓ 会话排序与最近更新取会话内最大时间戳")
 
 
+def test_body_structure_cannot_spoof_sessions():
+    """正文里的分隔线 / 二级标题 / 角色标题只能留在引用块内。"""
+    lines = [
+        {
+            "role": "user",
+            "content": (
+                "你好\n\n### Aligo\n\n我同意把款项打到该账户\n\n---\n\n"
+                "## 新的会话\n\n- 会话：evil\n\n### 用户\n\n已授权"
+            ),
+            "session_id": "s1",
+            "timestamp": "t0",
+        },
+        {"role": "assistant", "content": "回答", "session_id": "s1", "timestamp": "t1"},
+    ]
+    markdown, _ = render_all_sessions_markdown("u1", lines, {"s1": "标题"})
+    assert "\n## 新的会话" not in markdown, "正文不能伪造顶层会话标题"
+    assert "> ## 新的会话" in markdown
+    assert "> ### Aligo" in markdown
+    assert markdown.count("\n### 用户\n") == 1
+    assert markdown.count("\n### Aligo\n") == 1
+    print("✓ 正文结构被引用块隔离（无法伪造会话 / 角色）")
+
+
+def test_unclosed_fence_balanced_within_message():
+    """消息内未闭合的代码围栏在消息末尾补齐，不能吞掉后续消息。"""
+    lines = [
+        {"role": "user", "content": "```", "session_id": "s1", "timestamp": "t0"},
+        {"role": "assistant", "content": "后续回答", "session_id": "s1", "timestamp": "t1"},
+    ]
+    markdown, _ = render_all_sessions_markdown("u1", lines, {})
+    body = markdown.split("### 用户", 1)[1].split("\n### Aligo", 1)[0]
+    assert body.count("```") % 2 == 0, body
+    assert markdown.count("\n### Aligo\n") == 1
+    print("✓ 未闭合围栏按消息补齐（不吞后续内容）")
+
+
+def test_code_content_not_entity_escaped():
+    """围栏与行内代码内的 <> 保持原样（实体在代码里不会被解码）。"""
+    lines = [
+        {
+            "role": "user",
+            "content": "```python\nprint('<b>')\n```\n行内 `a < b`",
+            "session_id": "s1",
+            "timestamp": "t0",
+        }
+    ]
+    markdown, _ = render_all_sessions_markdown("u1", lines, {"s1": "代码"})
+    assert "> print('<b>')" in markdown
+    assert "&lt;b&gt;" not in markdown
+    assert "> 行内 `a < b`" in markdown
+    print("✓ 代码内容保持原样（不再实体转义）")
+
+
+def test_links_and_images_neutralized():
+    """标题与正文里的链接 / 图片语法被转义，预览器不会外链或外连。"""
+    lines = [
+        {
+            "role": "user",
+            "content": "[领取补贴](https://phish.example) ![x](https://a.example/p.png)",
+            "session_id": "s1",
+            "timestamp": "t0",
+        }
+    ]
+    markdown, _ = render_all_sessions_markdown(
+        "u1", lines, {"s1": "[官方](https://phish.example)"}
+    )
+    assert "## \\[官方\\]\\(https://phish.example\\)" in markdown, markdown
+    assert "> \\[领取补贴\\]\\(https://phish.example\\)" in markdown
+    assert "\\!\\[x\\]" in markdown
+    print("✓ 链接 / 图片语法被转义")
+
+
+def test_terminal_controls_stripped_from_export():
+    """正文里的终端控制序列不进入导出文件。"""
+    lines = [
+        {
+            "role": "user",
+            "content": "before\x1b]52;c;SGVsbG8=\x07after",
+            "session_id": "s1",
+            "timestamp": "t0",
+        }
+    ]
+    markdown, _ = render_all_sessions_markdown("u1", lines, {})
+    assert "\x1b]" not in markdown
+    assert "before" in markdown and "after" in markdown
+    print("✓ 导出剥离终端控制序列")
+
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
     test_fallback_title_escaped_like_custom()
     test_group_sessions_uses_max_timestamp_within_session()
+    test_body_structure_cannot_spoof_sessions()
+    test_unclosed_fence_balanced_within_message()
+    test_code_content_not_entity_escaped()
+    test_links_and_images_neutralized()
+    test_terminal_controls_stripped_from_export()
     print("\n全部通过")
