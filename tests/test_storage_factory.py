@@ -480,18 +480,23 @@ def test_pg_delete_duplicate_trip_keeps_last_copy():
     store._advisory_lock = lambda name: contextlib.nullcontext()
     executed: list[tuple[str, object]] = []
 
-    def fetch_many(sql, params):
-        return (2,) if "COUNT(*)" in sql else (42,)
+    def rowcount(sql, params=None):
+        executed.append((sql, params))
+        return 1
 
-    store._fetchone = fetch_many
-    store._execute = lambda sql, params: executed.append((sql, params))
+    store._execute_rowcount = rowcount
     assert store.delete_duplicate_trip("trip_9") is True
-    assert executed and executed[-1][1] == ("u1", 42)
+    delete_sql, delete_params = executed[-1]
+    assert "DELETE FROM aligo_trips" in delete_sql
+    assert "COUNT(*)" in delete_sql and ">= 2" in delete_sql
+    assert delete_params == ("u1", "u1", "trip_9", "u1", "trip_9")
 
     executed.clear()
-    store._fetchone = lambda sql, params: (1,) if "COUNT(*)" in sql else (42,)
+    store._execute_rowcount = lambda sql, params=None: (
+        executed.append((sql, params)) or 0
+    )
     assert store.delete_duplicate_trip("trip_9") is False
-    assert executed == [], "只剩一条同 id 行时不能再删"
+    assert len(executed) == 1, "只剩一条同 id 行时语句匹配 0 行（不删除）"
     print("✓ PostgreSQL delete_duplicate_trip 只剩一条时拒绝删除")
 
 
@@ -2447,6 +2452,55 @@ def test_pg_schema_tolerates_concurrent_create_race():
     print("✓ 并发建表竞争被容忍并补齐")
 
 
+def test_pg_delete_duplicate_trip_is_single_atomic_statement():
+    """去重删除必须是单条 SQL：重连重放时计数在服务端重新求值，不删光保留行。"""
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    executed = []
+
+    class _Cursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((" ".join(str(sql).split()), params))
+
+    def make_store(rowcount):
+        cursor = _Cursor()
+        cursor.rowcount = rowcount
+        store = object.__new__(PostgresLongTermMemory)
+        store.user_id = "u-dedupe"
+        store._conn = type("_Conn", (), {"cursor": lambda self: cursor})()
+        store._retry_errors = (ConnectionError,)
+        store._advisory_lock = lambda name: contextlib_module.nullcontext()
+        return store
+
+    assert make_store(1).delete_duplicate_trip("trip_1") is True
+    sql, params = executed[0]
+    assert sql.startswith("DELETE FROM aligo_trips"), sql
+    assert "ORDER BY id DESC LIMIT 1" in sql and "COUNT(*)" in sql, sql
+    assert len(executed) == 1, "计数 / 选行 / 删除必须是一条语句"
+    assert params == (
+        "u-dedupe",
+        "u-dedupe",
+        "trip_1",
+        "u-dedupe",
+        "trip_1",
+    ), params
+
+    executed.clear()
+    assert make_store(0).delete_duplicate_trip("trip_1") is False
+    assert len(executed) == 1
+    print("✓ PG 去重删除为单条原子语句")
+
+
 def test_pg_batch_aborts_when_connection_reconnects():
     """批量保存中途连接重建：索引 / 编号水位已过期，必须中止而不是继续生成 id。"""
     import contextlib as contextlib_module
@@ -2686,6 +2740,7 @@ if __name__ == "__main__":
     test_bulk_save_trips_scales_and_dedupes()
     test_frequent_destinations_tie_order_is_deterministic()
     test_pg_batch_aborts_when_connection_reconnects()
+    test_pg_delete_duplicate_trip_is_single_atomic_statement()
     test_bulk_save_trips_matches_sequential_saves()
     _mp = pytest.MonkeyPatch()
     try:

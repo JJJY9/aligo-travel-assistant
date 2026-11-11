@@ -243,6 +243,16 @@ class PostgresLongTermMemory:
 
         self._run_with_retry(run, replay_safe=replay_safe)
 
+    def _execute_rowcount(self, sql: str, params: tuple | None = None) -> int:
+        """执行写语句并返回受影响行数（重连重放语义与 _execute 一致）。"""
+
+        def run() -> int:
+            with self._conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                return int(cursor.rowcount)
+
+        return self._run_with_retry(run)
+
     def _fetchall(self, sql: str, params: tuple | None = None) -> list[tuple]:
         def run() -> list[tuple]:
             with self._conn.cursor() as cursor:
@@ -1114,28 +1124,26 @@ class PostgresLongTermMemory:
         的副本，用它会把要保留的那条删掉、留下后来的重复行。
 
         只剩一条同 id 行时返回 False（不删除）：并发的两个去重请求
-        （双标签页 / CLI+Web 各自计划）都会调用一次，计数与删除在同一把
-        advisory lock 内完成，第二次不能再把仅剩的保留行删光。
+        （双标签页 / CLI+Web 各自计划）都会调用一次，计数与删除必须原子，
+        第二次不能再把仅剩的保留行删光。
+
+        计数、选行与删除在同一条 SQL 里完成：连接闪断时 _run_with_retry
+        会重连并重放这条语句，计数子查询在重放时重新求值——先用 COUNT 读
+        出计数、再 SELECT/DELETE 的写法会在重连空档里用过期计数删掉并发
+        去重实例刚留下的保留行（同一 trip_id 全部消失）。
         """
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
-            count_row = self._fetchone(
-                "SELECT COUNT(*) FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
-                (self.user_id, trip_id),
+            deleted = self._execute_rowcount(
+                "DELETE FROM aligo_trips WHERE user_id = %s AND id = ("
+                "    SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s"
+                "    ORDER BY id DESC LIMIT 1"
+                ") AND ("
+                "    SELECT COUNT(*) FROM aligo_trips"
+                "    WHERE user_id = %s AND trip_id = %s"
+                ") >= 2",
+                (self.user_id, self.user_id, trip_id, self.user_id, trip_id),
             )
-            if not count_row or int(count_row[0] or 0) < 2:
-                return False
-            row = self._fetchone(
-                "SELECT id FROM aligo_trips WHERE user_id = %s AND trip_id = %s "
-                "ORDER BY id DESC LIMIT 1",
-                (self.user_id, trip_id),
-            )
-            if not row:
-                return False
-            self._execute(
-                "DELETE FROM aligo_trips WHERE user_id = %s AND id = %s",
-                (self.user_id, row[0]),
-            )
-            return True
+            return deleted > 0
 
     def update_trip(self, trip_id: str, fields: dict[str, Any]) -> bool:
         """更新一条行程的字段；返回是否存在。
