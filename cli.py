@@ -30,6 +30,7 @@ from utils.preference_values import has_preference_value, is_manageable_pref_typ
 from utils.progress import format_progress_event
 from utils.timestamps import chronological_key
 from utils.turn_meta import attach_turn_meta, build_turn_meta
+from utils.usage import add_usage
 from utils.version import APP_VERSION
 
 _RUNTIME_IMPORT_ERROR: Exception | None = None
@@ -73,6 +74,8 @@ class AligoCLI:
         # 用户 Ctrl-C 发起、at_prompt 是否停在同步 input 上。初始化阶段也要
         # 用（用户ID 提示符），所以放在实例上而不是 run() 的局部变量。
         self._interrupt = {"count": 0, "user": False, "at_prompt": False}
+        # 失败 / 未落库回合的用量账目：并入下一轮成功回合的展示与 _meta
+        self._unsettled_usage = None
 
     def print_banner(self):
         """打印欢迎横幅"""
@@ -243,6 +246,10 @@ class AligoCLI:
         # finally 里回滚，否则重试同一问题会在上下文里出现重复提问
         staged = False
         persisted = False
+        # 本轮用量增量与「是否已写入持久化消息」：失败 / 未落库回合在 finally
+        # 记账到下一轮，否则下一轮的增量快照会把它们减掉（永久少记）
+        usage_delta = None
+        usage_settled = False
 
         try:
             rc = RESILIENCE_CONFIG
@@ -355,12 +362,13 @@ class AligoCLI:
             self.console.print()
             self._display_results(result_data)
 
-            # 8. 本次查询的 LLM 用量与耗时（模型层统一统计）
-            usage_delta = None
+            # 8. 本次查询的 LLM 用量与耗时（模型层统一统计；含之前失败回合
+            # 暂存未结算的用量）
+            usage_delta = self._drain_unsettled_usage(
+                self._usage_delta(usage_before)
+            )
             elapsed = time.time() - start_time
-            if usage_before is not None:
-                after = self.model.usage.snapshot()
-                usage_delta = {key: after[key] - usage_before[key] for key in usage_before}
+            if usage_delta is not None:
                 delta_calls = usage_delta["calls"]
                 if delta_calls > 0:
                     self.console.print(
@@ -394,13 +402,47 @@ class AligoCLI:
             else:
                 # None（旧实现无返回值）按成功处理，与 ConversationRuntime 一致
                 persisted = True
+                usage_settled = True
         finally:
             if staged and not persisted:
                 rollback = getattr(self.memory_manager, "rollback_staged_message", None)
                 if callable(rollback):
                     rollback(user_input)
+            if not usage_settled:
+                # 本轮用量没有写进任何持久化消息：并入下一轮成功回合展示与
+                # _meta（落库失败 / 取消 / 编排失败都适用）
+                self._accumulate_unsettled_usage(
+                    usage_delta
+                    if usage_delta is not None
+                    else self._usage_delta(usage_before)
+                )
             if self.circuit_breaker and not probe_recorded:
                 self.circuit_breaker.release_probe()
+
+    def _usage_delta(self, before: dict | None) -> dict | None:
+        """本轮模型调用的用量增量（模型层统一统计）。"""
+        after = (
+            self.model.usage.snapshot() if hasattr(self.model, "usage") else None
+        )
+        if before is None or after is None:
+            return None
+        return {key: after[key] - before[key] for key in before}
+
+    def _accumulate_unsettled_usage(self, usage: dict | None) -> None:
+        """失败 / 未落库回合的用量记账：并入下一轮成功回合展示与 _meta。"""
+        if not usage:
+            return
+        self._unsettled_usage = add_usage(
+            getattr(self, "_unsettled_usage", None), usage
+        )
+
+    def _drain_unsettled_usage(self, usage: dict | None) -> dict | None:
+        """把之前未结算的用量并入本轮用量并清空账目。"""
+        pending = getattr(self, "_unsettled_usage", None)
+        if not pending:
+            return usage
+        self._unsettled_usage = None
+        return add_usage(pending, usage)
 
     def _display_agents_called(self, result_data: dict):
         """显示调用的智能体列表"""
