@@ -1299,6 +1299,14 @@ def test_main_session_export_dispatch(monkeypatch):
 def test_interactive_user_id_validation(monkeypatch):
     answers = iter(["../etc/passwd", "-bad", "alice"])
     monkeypatch.setattr(cli.Prompt, "ask", lambda *args, **kwargs: next(answers))
+
+    # 模拟交互终端：非 TTY（管道 / pytest 捕获）下首个非法行会直接退出，
+    # 不再把后续行当作重试输入（避免把管道里的查询数据当成用户 ID）
+    class _TTY:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TTY())
     instance = cli.AligoCLI()
     with contextlib.redirect_stdout(io.StringIO()):
         assert instance._prompt_user_id() == "alice"

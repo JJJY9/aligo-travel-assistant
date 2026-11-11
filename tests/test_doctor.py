@@ -552,6 +552,25 @@ def test_report_and_summary_statuses():
     assert table.row_count == 5
 
 
+def test_report_table_escapes_markup_and_controls():
+    """详情里的 [/red] 与 ESC 序列不能让整张表渲染失败或注入终端。"""
+    from rich.console import Console
+
+    from utils.doctor import CheckResult, build_report_table
+
+    poisoned = CheckResult(
+        "LLM", STATUS_FAIL, "网关错误 [/red] \x1b]52;c;ZWNobyBwd25lZA==\x1b\\"
+    )
+    buffer = io.StringIO()
+    Console(file=buffer, force_terminal=False, width=160).print(
+        build_report_table([poisoned])
+    )
+    text = buffer.getvalue()
+    assert "[/red]" in text
+    assert "\x1b]" not in text, "OSC 序列必须被剥离"
+    print("✓ doctor 表格转义标记并剥离终端控制序列")
+
+
 def test_run_doctor_without_network():
     results = asyncio.run(run_doctor(include_network=False))
     names = [r.name for r in results]

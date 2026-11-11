@@ -39,6 +39,10 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- CLI 终端注入与 REPL 崩溃加固：动态文本（助手回答、行程 / 偏好 / 对话表格、doctor 详情、上游异常）中的终端控制序列统一剥离（新增 `utils.console.strip_terminal_controls`，交互 Console 对所有字符串输出生效，表格单元格单独清洗）——存储或模型文本里的 OSC 52 写入剪贴板、CSI 清屏 / 隐藏光标、OSC 8 伪造链接不再送达终端；REPL 兜底错误分支改为先剥控制字符再转义 rich 标记，异常文本含 `[/red]` 时不再于 except 处理器内二次抛 MarkupError 终止整个会话；doctor 自检表格同样转义（网关错误原文 / base_url 含方括号时整表渲染不再失败）
+- CLI 用户 ID 提示符的退出路径改走管道安全输出：此前 EOF / 读取失败分支用裸 `print()` 写原始 stdout，下游管道关闭时错误只进缓冲、解释器退出 flush 才抛 OSError（退出码 120 + `Exception ignored`）；现在走 `PipeSafeTextIO`，`test_closed_stdout_pipe_does_not_traceback` 稳定通过
+- CLI 非交互管道的用户 ID 校验：首个非法行直接报错退出（此前继续读取会把后续查询当作 ID 接受，「北京天气」之类的真实查询被静默吞掉且以 0 退出）
+- CLI 取消语义修正：初始化阶段按 Ctrl-C 退出码为 130（此前按成功返回 0）；同步命令执行期间按 Ctrl-C 后循环因 EOF / exit 结束时会消化挂起的取消，不再以未处理 CancelledError（traceback、退出码 1）收尾
 - 停止对账的最终确认恢复生效：对账函数自己调用 `openSession` 会自增会话加载 token，而判定一直比对启动时捕获的旧 token——openSession 之后「再确认一次是否已落库」与「未保存则回填输入框」整段是死代码，停止的提问在消息区被清空后没有任何副本。现在 openSession 后改用新 token 判定，迟到的落库不再被误报未保存
 - 流在 done / error 之前中断（代理超时 / 断网 / 后端重启）同样触发落库对账：此前只有主动停止（AbortError）会核对历史，服务端已原子落库时用户点「重试」会在历史里留下两条相同问答；对账提示区分为「连接中断」
 - 「重试」前按 client_turn_id 精确确认本轮是否已落库：已保存则按服务端历史刷新并提示，不再重发产生重复问答（对账被快速点击绕过时同样生效）

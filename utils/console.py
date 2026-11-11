@@ -13,8 +13,19 @@ UnicodeEncodeError（cmd / PowerShell、未设置 PYTHONIOENCODING 时必现）�
 """
 import codecs
 import os
+import re
 import sys
 from typing import Any
+
+# 终端控制字符（C0 除 \t \n、DEL 与 C1 区）：存储的用户内容与模型输出都不
+# 可信，原样打印会让终端执行 OSC 52（写剪贴板）、CSI 清屏 / 隐藏光标、
+# OSC 8 伪造链接等序列（rich 的 escape 只转义方括号，不处理 ESC）
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_terminal_controls(text: object) -> str:
+    """去除文本中的终端控制序列（保留换行与制表符）。"""
+    return _TERMINAL_CONTROLS.sub("", str(text))
 
 
 class _AutoDecodeInput:

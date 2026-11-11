@@ -22,7 +22,12 @@ import math
 # doctor / skills 等诊断命令必须在这些依赖缺失时仍能启动并如实报告缺失项
 from config import LLM_CONFIG, RESILIENCE_CONFIG, SYSTEM_CONFIG
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.console import PipeSafeTextIO, configure_stdio, is_pipe_error
+from utils.console import (
+    PipeSafeTextIO,
+    configure_stdio,
+    is_pipe_error,
+    strip_terminal_controls,
+)
 from utils.errors import MemoryPersistenceError
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
@@ -51,6 +56,28 @@ except Exception as exc:  # noqa: BLE001 - 依赖缺失时诊断命令仍要能�
     create_chat_model = init_agentscope = None  # type: ignore[assignment]
     MemoryManager = None  # type: ignore[assignment,misc]
 
+
+def _terminal_safe(value: object) -> str:
+    """动态文本打印前先剥终端控制字符，再转义 rich 标记。
+
+    用户内容（行程 / 偏好 / 消息）与上游异常文本都可能带 ESC 序列或
+    ``[/red]`` 之类的标记：原样打印可执行 OSC 52 剪贴板写入 / 清屏，
+    或在 except 处理器里二次抛 MarkupError 终止整个 REPL。
+    """
+    text = strip_terminal_controls(value)
+    return escape(text) if escape is not None else text
+
+
+class _SanitizedConsole(Console):  # type: ignore[misc,valid-type]
+    """所有 str 输出先剥终端控制字符（表格单元格由调用方另行处理）。"""
+
+    def print(self, *objects, **kwargs):  # type: ignore[override]
+        safe = tuple(
+            strip_terminal_controls(obj) if isinstance(obj, str) else obj
+            for obj in objects
+        )
+        super().print(*safe, **kwargs)
+
 # 移除其他智能体的导入，改用懒加载
 
 
@@ -61,7 +88,7 @@ class AligoCLI:
         """初始化 CLI"""
         # stdout 走管道安全包装：`| head` 提前关闭后 Rich 写入静默丢弃，
         # 不再在错误分支二次抛错打出 traceback（退出时还原见 run()）
-        self.console = Console(file=PipeSafeTextIO(sys.stdout))
+        self.console = _SanitizedConsole(file=PipeSafeTextIO(sys.stdout))
         self.user_id = None
         self.session_id = None
         self.memory_manager = None
@@ -126,15 +153,29 @@ class AligoCLI:
                 self.console.print("\n已取消，退出", style="dim")
                 raise SystemExit(130) from None
             except EOFError:
-                # 管道 / IDE 运行到末尾：退出而不是抛出 traceback 后死循环
-                print()
-                print("未检测到输入，已退出")
+                # 管道 / IDE 运行到末尾：退出而不是抛出 traceback 后死循环。
+                # 走 console（PipeSafeTextIO）：stdout 管道已关闭时静默丢弃，
+                # 不再等到解释器退出 flush 才抛 OSError（退出码 120）
+                self.console.print()
+                self.console.print("未检测到输入，已退出")
                 raise SystemExit(0) from None
             except (RuntimeError, ValueError, OSError) as exc:
-                print(f"无法读取输入（{exc}），请改用非交互子命令或接入终端后重试")
+                self.console.print(
+                    f"无法读取输入（{_terminal_safe(exc)}），"
+                    "请改用非交互子命令或接入终端后重试"
+                )
                 raise SystemExit(1) from None
             if re.fullmatch(r"[\w-]{1,64}", value) and not value.startswith("-"):
                 return value
+            if not getattr(sys.stdin, "isatty", lambda: True)():
+                # 非交互管道里下一行是查询数据而不是身份重试：继续循环会把
+                # 「北京天气」之类的查询当作 ID 接受、真实查询被吞掉且以 0
+                # 退出——首个非法行直接报错，由用户显式修正输入
+                self.console.print(
+                    "[red]用户 ID 只能包含中文、字母、数字、下划线和短横线；"
+                    "当前输入不是终端，首行必须是合法的用户 ID[/red]"
+                )
+                raise SystemExit(1)
             self.console.print(
                 "[red]用户 ID 只能包含中文、字母、数字、下划线和短横线[/red]"
             )
@@ -968,7 +1009,10 @@ class AligoCLI:
                 else:
                     # 实在啥也没有，打印个成功标记，避免完全静默
                     agent_display_name = self._get_agent_display_name(agent_name)
-                    self.console.print(f"✓ {agent_display_name}已完成", style="green")
+                    self.console.print(
+                        f"✓ {_terminal_safe(agent_display_name)}已完成",
+                        style="green",
+                    )
                     current_agent_shown = True
 
             if current_agent_shown:
@@ -1060,7 +1104,9 @@ class AligoCLI:
                     time_str = ""
 
                 dialogue_table.add_row(
-                    escape(str(role_name)), escape(str(content)), escape(str(time_str))
+                    _terminal_safe(role_name),
+                    _terminal_safe(content),
+                    _terminal_safe(time_str),
                 )
 
             self.console.print(dialogue_table)
@@ -1113,12 +1159,14 @@ class AligoCLI:
         table.add_column("目的", style="white")
 
         for trip in history:
+            # Table 单元格不经过 Console.print 的字符串清洗：存储内容里的
+            # ESC 序列（OSC 52 / OSC 8）必须在这里剥掉
             table.add_row(
-                escape(str(trip.get("trip_id", ""))),
-                escape(str(trip.get("origin", ""))),
-                escape(str(trip.get("destination", ""))),
-                escape(str(trip.get("start_date", ""))),
-                escape(str(trip.get("purpose", ""))),
+                _terminal_safe(trip.get("trip_id", "")),
+                _terminal_safe(trip.get("origin", "")),
+                _terminal_safe(trip.get("destination", "")),
+                _terminal_safe(trip.get("start_date", "")),
+                _terminal_safe(trip.get("purpose", "")),
             )
 
         self.console.print(table)
@@ -1137,8 +1185,8 @@ class AligoCLI:
             # 整行藏掉，与 standalone preferences 和 Web 面板不一致
             if has_preference_value(value):
                 table.add_row(
-                    escape(str(key)),
-                    escape(self._format_result_value(value)),
+                    _terminal_safe(key),
+                    _terminal_safe(self._format_result_value(value)),
                 )
 
         self.console.print(table)
@@ -1235,12 +1283,14 @@ class AligoCLI:
                 await asyncio.sleep(0)  # 取消派发检查点
             except KeyboardInterrupt:
                 _abort_startup("\n已取消，退出")
-                return
+                raise SystemExit(130) from None
             except asyncio.CancelledError:
                 if not interrupt["user"]:
                     raise
                 _abort_startup("\n已取消，退出")
-                return
+                # 取消启动是用户主动中止：退出码与提示符处 Ctrl-C 一致（130），
+                # 不能以 0 汇报成功
+                raise SystemExit(130) from None
 
             # 主循环
             while True:
@@ -1323,11 +1373,29 @@ class AligoCLI:
                 except CircuitOpenError:
                     self.console.print("\n[bold yellow]⚠ 服务暂时不可用，请稍后再试。[/bold yellow]", style="dim")
                 except Exception as e:
-                    self.console.print(f"\n错误: {e}", style="red")
+                    # 异常文本常含上游响应体：不转义会在 except 里二次抛
+                    # MarkupError 终止整个交互会话；再兜一层 suppress 保证
+                    # 错误处理本身绝不打断 REPL
+                    with contextlib.suppress(Exception):
+                        self.console.print(
+                            f"\n错误: {_terminal_safe(e)}", style="red"
+                        )
         finally:
             if previous_handler is not None:
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(signal.SIGINT, previous_handler)
+
+        # 循环因 EOF / exit 结束时，同步命令期间挂起的用户取消（Ctrl-C）
+        # 必须在这里消化：否则主任务以已取消状态收尾，asyncio.run 抛
+        # CancelledError（traceback、退出码 1）而不是干净退出
+        if interrupt["user"]:
+            _clear_pending_cancel()
+            # 3.12 的 uncancel 不保证清掉已排队的取消：主动让出一次把
+            # CancelledError 送达并吞掉（用户已要求退出，不需要回到提示符）
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                _clear_pending_cancel()
 
 
 def run_health_check_standalone(as_json: bool = False) -> int:

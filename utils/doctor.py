@@ -548,7 +548,15 @@ def has_failures(results: list[CheckResult]) -> bool:
 
 def build_report_table(results: list[CheckResult]):
     """构建自检结果表格（rich.Table）。"""
+    from rich.markup import escape
     from rich.table import Table
+
+    from utils.console import strip_terminal_controls
+
+    def _safe(value: object) -> str:
+        # 详情常含上游错误原文 / base_url / 本机路径：方括号标记会让整张表
+        # 渲染时抛 MarkupError，ESC 序列会直接送达终端
+        return escape(strip_terminal_controls(value))
 
     icons = {
         STATUS_OK: ("✓", "green"),
@@ -563,7 +571,7 @@ def build_report_table(results: list[CheckResult]):
 
     for result in results:
         icon, color = icons.get(result.status, ("?", "white"))
-        table.add_row(result.name, f"[{color}]{icon}[/{color}]", result.detail)
+        table.add_row(_safe(result.name), f"[{color}]{icon}[/{color}]", _safe(result.detail))
     return table
 
 

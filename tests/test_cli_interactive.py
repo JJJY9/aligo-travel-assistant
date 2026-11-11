@@ -65,6 +65,101 @@ def test_eof_at_main_prompt_breaks_loop(monkeypatch):
     print("✓ 主循环 EOF 正常退出（不再刷屏）")
 
 
+def test_repl_error_markup_is_escaped(monkeypatch):
+    """命令异常文本含 [/red] / link 标记时按原文显示，不能二次抛错终止 REPL。"""
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=200)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    async def boom(text):
+        raise RuntimeError(
+            "[/red] boom [link=https://evil.example]点我[/link]"
+        )
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    monkeypatch.setattr(agent, "process_query", boom)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("触发错误\nexit\n"))
+    asyncio.run(agent.run())
+    text = buffer.getvalue()
+    assert "[/red] boom" in text, "关闭标签必须按原文显示"
+    assert "[link=" in text
+    assert "\x1b]8;" not in text, "不能把异常文本渲染成终端超链接"
+    print("✓ 主循环兜底错误按原文显示（不再二次 MarkupError）")
+
+
+def test_history_table_strips_terminal_controls():
+    """存储的行程字段含 OSC 序列时不能原样送达终端（剪贴板/伪链接注入）。"""
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=200)
+    poisoned = "上海\x1b]52;c;ZWNobyBwd25lZA==\x1b\\"
+    trip = {
+        "trip_id": "t1",
+        "origin": "北京",
+        "destination": poisoned,
+        "start_date": "2026-11-11",
+        "purpose": "出差",
+    }
+    agent.memory_manager = types.SimpleNamespace(
+        reload_long_term=lambda: None,
+        long_term=types.SimpleNamespace(
+            get_trip_history=lambda n: [trip],
+        ),
+    )
+    agent.show_history()
+    text = buffer.getvalue()
+    assert "上海" in text
+    assert "\x1b]" not in text, "OSC 序列必须被剥离"
+    print("✓ 历史行程表格剥离终端控制序列")
+
+
+def test_sanitized_console_strips_controls_from_print():
+    """所有经 Console.print 的 str 都剥离终端控制序列（模型输出 / 上游错误）。"""
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = cli._SanitizedConsole(file=buffer, force_terminal=False)
+    agent.console.print("前缀\x1b]8;;https://evil.example\x1b\\点我\x1b]8;;\x1b\\后缀")
+    text = buffer.getvalue()
+    assert "前缀" in text and "后缀" in text
+    assert "\x1b]" not in text
+    print("✓ Console 输出统一剥离终端控制序列")
+
+
+def test_pending_cancel_cleared_when_loop_ends_by_eof(monkeypatch):
+    """同步命令期间按 Ctrl-C 后 stdin EOF：主任务不能带着挂起取消收尾。"""
+    import signal as signal_module
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    def fake_history():
+        # 同步命令不让出事件循环：取消只挂在主任务上，随后 stdin 直接 EOF
+        signal_module.raise_signal(signal_module.SIGINT)
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    monkeypatch.setattr(agent, "show_history", fake_history)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("history\n"))
+    asyncio.run(agent.run())  # 不得抛 CancelledError / traceback
+    assert "未检测到输入" in buffer.getvalue()
+    print("✓ 循环结束时挂起的用户取消被消化")
+
+
 @pytest.mark.skipif(
     sys.platform != "win32", reason="GBK 管道只在 Windows 中文 locale 下有区分度"
 )
@@ -733,7 +828,9 @@ def test_sigint_during_initialization_does_not_poison_first_command(monkeypatch)
         raise AssertionError("初始化被取消后不应进入 REPL")
 
     monkeypatch.setattr(cli.Prompt, "ask", fail_ask)
-    asyncio.run(agent.run())
+    with pytest.raises(SystemExit) as excinfo:
+        asyncio.run(agent.run())
+    assert excinfo.value.code == 130, "取消启动不能以 0 汇报成功"
     assert "已取消，退出" in buffer.getvalue()
     print("✓ 初始化期间 Ctrl-C 不再毒化第一条命令")
 
