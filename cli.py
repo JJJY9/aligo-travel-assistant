@@ -1893,18 +1893,57 @@ def run_knowledge_import_standalone(
         return _fail(f"导入失败：{exc}")
     invalid = int(result.get("skipped_invalid", 0) or 0)
     duplicate = int(result.get("skipped_duplicate", 0) or 0)
-    skipped = int(result.get("skipped", invalid + duplicate) or 0)
+    conflict = int(result.get("skipped_conflict", 0) or 0)
+    skipped = int(result.get("skipped", invalid + duplicate + conflict) or 0)
+    imported = int(result.get("imported", 0) or 0)
+    would_import = int(result.get("would_import", 0) or 0)
+    problems = result.get("skipped_groups") or []
+    reached = would_import if dry_run else imported
+    if reached == 0 and (invalid or conflict) and duplicate == 0:
+        # 没有导入任何内容、也没有因「已存在」跳过：备份并没有恢复，不能
+        # 以成功状态退出（迁移 / CI 脚本按退出码判定会把知识库当已恢复）
+        reason = "、".join(
+            part
+            for part in (
+                f"{invalid} 条无效" if invalid else "",
+                f"{conflict} 条布局冲突" if conflict else "",
+            )
+            if part
+        )
+        message = f"没有可导入的知识片段（{reason}）：备份未能恢复"
+        if as_json:
+            payload = {
+                "ok": False,
+                "dry_run": dry_run,
+                "error": message,
+                "imported": imported,
+                "skipped": skipped,
+                "skipped_invalid": invalid,
+                "skipped_duplicate": duplicate,
+                "skipped_conflict": conflict,
+                "skipped_groups": problems[:100],
+            }
+            if dry_run:
+                payload["would_import"] = would_import
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 1
+        print(message)
+        return 1
     if as_json:
-        payload: dict[str, Any] = {
+        payload = {
             "ok": True,
             "dry_run": dry_run,
-            "imported": int(result.get("imported", 0) or 0),
+            "imported": imported,
             "skipped": skipped,
             "skipped_invalid": invalid,
             "skipped_duplicate": duplicate,
+            "skipped_conflict": conflict,
         }
+        if problems:
+            # 跳过的坏组明细此前被 CLI 丢弃，脚本只能看到计数
+            payload["skipped_groups"] = problems[:100]
         if dry_run:
-            payload["would_import"] = int(result.get("would_import", 0) or 0)
+            payload["would_import"] = would_import
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     detail_parts = []
@@ -1912,14 +1951,18 @@ def run_knowledge_import_standalone(
         detail_parts.append(f"{duplicate} 条已存在")
     if invalid:
         detail_parts.append(f"{invalid} 条无效")
+    if conflict:
+        detail_parts.append(
+            f"{conflict} 条因布局冲突未导入（请整份编辑或 kb-delete --group 后重试）"
+        )
     detail = f"（{' / '.join(detail_parts)}）" if detail_parts else ""
     if dry_run:
         print(
-            f"预览：将导入 {result.get('would_import', 0)} 条知识片段，"
+            f"预览：将导入 {would_import} 条知识片段，"
             f"跳过 {skipped} 条{detail}（未写入）"
         )
         return 0
-    print(f"已导入 {result['imported']} 条知识片段，跳过 {skipped} 条{detail}")
+    print(f"已导入 {imported} 条知识片段，跳过 {skipped} 条{detail}")
     return 0
 
 

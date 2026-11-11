@@ -1121,6 +1121,7 @@ def import_documents(
             "skipped": 0,
             "skipped_invalid": 0,
             "skipped_duplicate": 0,
+            "skipped_conflict": 0,
         }
 
     # 与数据库无关的校验先做：全部为空 / 非法时不需要知识库，直接返回
@@ -1191,6 +1192,7 @@ def import_documents(
             "skipped": invalid,
             "skipped_invalid": invalid,
             "skipped_duplicate": 0,
+            "skipped_conflict": 0,
         }
         if dry_run:
             # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
@@ -1214,6 +1216,7 @@ def import_documents(
             "skipped": invalid + dropped,
             "skipped_invalid": invalid + dropped,
             "skipped_duplicate": 0,
+            "skipped_conflict": 0,
         }
         if pre_problems:
             payload["skipped_groups"] = pre_problems
@@ -1239,6 +1242,7 @@ def import_documents(
                 "skipped": invalid + dropped + duplicate,
                 "skipped_invalid": invalid + dropped,
                 "skipped_duplicate": duplicate,
+                "skipped_conflict": 0,
             }
             if pre_problems:
                 payload["skipped_groups"] = pre_problems
@@ -1264,6 +1268,9 @@ def import_documents(
         # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方
         invalid += sum(int(item.get("parts") or 0) for item in problems)
         duplicate = group_skipped
+        # 布局冲突（缺失分片的 part 号被旧内容占用 / 布局校验失败）：内容
+        # 没有导入，不能计成「已存在」——否则用户会把备份当作已恢复
+        conflict = 0
         document_chunks: list[list[dict[str, Any]]] = []
         # 与 document_chunks 平行的还原组号（非还原文档为空串），用于识别
         # 「备份组与库内片段部分重合」的布局冲突
@@ -1449,7 +1456,19 @@ def import_documents(
                         doc_group,
                     )
                     existing_counts.update(consumed)
-                    duplicate += len(missing)
+                    conflict += len(missing)
+                    problems.append(
+                        {
+                            "group": doc_group,
+                            "reason": (
+                                "布局校验失败，缺失分片未导入；请重试或整份编辑后重新导入"
+                                if layout is None
+                                else "布局冲突：缺失分片的布局与库内已有片段不一致，"
+                                "未导入；请整份编辑或 kb-delete --group 后重新导入"
+                            ),
+                            "parts": len(missing),
+                        }
+                    )
                     continue
                 # 缺失分片同样要校验组内 part 号是否已被其它内容占用：
                 # 库里的同组旧分片内容被改过时其 part 号仍占着，直接补写
@@ -1477,7 +1496,17 @@ def import_documents(
                             doc_group,
                         )
                         existing_counts.update(consumed)
-                        duplicate += len(missing)
+                        conflict += len(missing)
+                        problems.append(
+                            {
+                                "group": doc_group,
+                                "reason": (
+                                    "布局冲突：缺失分片的 part 号已被库内其它内容占用，"
+                                    "未导入；请整份编辑或 kb-delete --group 后重新导入"
+                                ),
+                                "parts": len(missing),
+                            }
+                        )
                         continue
             # 部分分片已存在（上次导入中途失败 / 组内重复）：只补缺失分片，
             # 补写后组内成员按内容齐全——整组跳过会把残缺组永久留在库里
@@ -1495,9 +1524,10 @@ def import_documents(
         if not unique:
             result: dict[str, Any] = {
                 "imported": 0,
-                "skipped": invalid + duplicate,
+                "skipped": invalid + duplicate + conflict,
                 "skipped_invalid": invalid,
                 "skipped_duplicate": duplicate,
+                "skipped_conflict": conflict,
             }
             if problems:
                 result["skipped_groups"] = problems
@@ -1509,9 +1539,10 @@ def import_documents(
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
             payload = {
                 "imported": 0,
-                "skipped": invalid + duplicate,
+                "skipped": invalid + duplicate + conflict,
                 "skipped_invalid": invalid,
                 "skipped_duplicate": duplicate,
+                "skipped_conflict": conflict,
                 "would_import": len(unique),
             }
             if problems:
@@ -1549,9 +1580,10 @@ def import_documents(
             imported.extend(int(doc_id) for doc_id in (result.get("ids") or []))
     result = {
         "imported": len(imported),
-        "skipped": invalid + duplicate,
+        "skipped": invalid + duplicate + conflict,
         "skipped_invalid": invalid,
         "skipped_duplicate": duplicate,
+        "skipped_conflict": conflict,
     }
     if problems:
         result["skipped_groups"] = problems

@@ -390,6 +390,18 @@ def test_chat_done_persisted_signal():
     print("✓ 聊天 done 事件透传落库状态（未保存 / 正常）")
 
 
+def test_knowledge_import_skip_summary_distinguishes_conflicts():
+    """导入跳过摘要区分「已存在 / 无效 / 布局冲突未导入」。"""
+    data = _run_harness("kbImportSummary")
+    assert data["conflict"] == "（跳过 2 条：2 条布局冲突未导入）", data
+    mixed = data["mixed"]
+    assert "1 条已存在" in mixed and "2 条无效" in mixed, mixed
+    assert "3 条布局冲突未导入" in mixed, mixed
+    assert data["none"] == "", data
+    assert data["legacy"] == "（跳过 2 条：2 条已存在）", data
+    print("✓ 知识导入跳过摘要区分布局冲突")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -404,5 +416,6 @@ if __name__ == "__main__":
     test_knowledge_eval_panel_states()
     test_panel_fixes_cursor_stale_session_and_import_batches()
     test_reconcile_confirms_after_open_session()
+    test_knowledge_import_skip_summary_distinguishes_conflicts()
     test_chat_done_persisted_signal()
     print("\n全部通过")

@@ -153,6 +153,7 @@ def test_export_import_roundtrip_is_idempotent():
         "skipped": len(documents),
         "skipped_invalid": 0,
         "skipped_duplicate": len(documents),
+        "skipped_conflict": 0,
     }, "重复导入同一备份应全部跳过"
     assert list_documents(limit=1)["total"] == before
     print(f"✓ 导出→导入幂等（{len(documents)} 条全部跳过）")

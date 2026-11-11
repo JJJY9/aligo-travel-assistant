@@ -480,6 +480,7 @@ def test_import_documents_sanitizes(monkeypatch):
         "skipped": 6,
         "skipped_invalid": 6,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
     }, "超长单条内容按无效项跳过（不再静默截断）"
     sent = agent.calls[0]
     assert sent[0]["content"] == "a"
@@ -1147,6 +1148,7 @@ def test_import_skips_fully_existing_group(monkeypatch):
         "skipped": 2,
         "skipped_invalid": 0,
         "skipped_duplicate": 2,
+        "skipped_conflict": 0,
     }
     assert agent.calls == []
     print("✓ 已存在的整组分片导入时整组跳过")
@@ -1508,7 +1510,9 @@ def test_import_skips_restore_group_with_layout_conflict(monkeypatch):
     ]
     result = knowledge_admin.import_documents(documents, dry_run=True)
     assert result["would_import"] == 0, result
-    assert result["skipped_duplicate"] == 4, result  # 2 片已存在 + 2 片随组跳过
+    assert result["skipped_duplicate"] == 2, result  # 2 片已存在
+    assert result["skipped_conflict"] == 2, result  # 2 片因布局冲突未导入
+    assert any("布局冲突" in item.get("reason", "") for item in result["skipped_groups"])
     print("✓ 布局冲突的还原组整组跳过")
 
 
@@ -1564,7 +1568,8 @@ def test_import_missing_part_conflict_skips_group(monkeypatch):
     ]
     result = knowledge_admin.import_documents(documents, dry_run=True)
     assert result["would_import"] == 0, result
-    assert result["skipped_duplicate"] == 2, result
+    assert result["skipped_duplicate"] == 1, result  # 命中 1 片
+    assert result["skipped_conflict"] == 1, result  # 缺片因布局冲突未导入
     print("✓ 缺失分片 part 号被占用时整组跳过")
 
 
@@ -1917,6 +1922,7 @@ def test_import_dry_run_skips_writes(monkeypatch):
         "skipped": 0,
         "skipped_invalid": 0,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
         "would_import": 1,
     }
 
@@ -1932,6 +1938,7 @@ def test_import_dry_run_skips_writes(monkeypatch):
         "skipped": 1,
         "skipped_invalid": 0,
         "skipped_duplicate": 1,
+        "skipped_conflict": 0,
         "would_import": 1,
     }
 
@@ -1944,6 +1951,7 @@ def test_import_dry_run_skips_writes(monkeypatch):
         "skipped": 1,
         "skipped_invalid": 0,
         "skipped_duplicate": 1,
+        "skipped_conflict": 0,
         "would_import": 0,
     }
     print("✓ 导入 dry-run 只统计不写入")
@@ -1963,6 +1971,7 @@ def test_import_dry_run_reports_skip_reasons(monkeypatch):
         "skipped": 2,
         "skipped_invalid": 2,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
         "would_import": 0,
     }
 
@@ -2200,7 +2209,8 @@ def test_import_detects_occupied_part_hidden_by_identical_content(monkeypatch):
     ]
     result = knowledge_admin.import_documents(documents, dry_run=True)
     assert result["would_import"] == 0, result
-    assert result["skipped_duplicate"] == 2, result  # 命中 1 片 + 缺片随组跳过
+    assert result["skipped_duplicate"] == 1, result  # 命中 1 片
+    assert result["skipped_conflict"] == 1, result  # 缺片因 part 号被占用未导入
     print("✓ 同文多行不掩盖已占用的 part 号")
 
 
@@ -2245,6 +2255,7 @@ def test_import_skips_existing_and_duplicate_content(monkeypatch):
         "skipped": 2,
         "skipped_invalid": 0,
         "skipped_duplicate": 2,
+        "skipped_conflict": 0,
     }
     assert [item["content"] for item in agent.calls[0]] == ["新内容"]
     print("✓ 导入按内容去重（已有 / 同批次重复）")
@@ -2289,6 +2300,7 @@ def test_import_empty_and_missing_db(monkeypatch):
         "skipped": 2,
         "skipped_invalid": 2,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
     }
 
     monkeypatch.setattr(
@@ -2382,6 +2394,7 @@ def test_import_chunks_large_documents(monkeypatch):
         "skipped": 0,
         "skipped_invalid": 0,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
     }
     assert [len(batch) for batch in agent.calls] == [500, 500, 200]
     print("✓ 大文件导入按 500 条分块嵌入 / 插入")
@@ -2661,6 +2674,7 @@ def test_import_empty_documents_short_circuits(monkeypatch):
         "skipped": 0,
         "skipped_invalid": 0,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
     }
     assert knowledge_admin.import_documents([]) == expected
     assert knowledge_admin.import_documents([], dry_run=True) == expected
@@ -2684,7 +2698,8 @@ def test_import_layout_scan_failure_skips_group(monkeypatch):
     ]
     result = knowledge_admin.import_documents(documents, dry_run=True)
     assert result["would_import"] == 0, result
-    assert result["skipped_duplicate"] == 2, result  # 已存在的「甲」+ 保守跳过的「乙」
+    assert result["skipped_duplicate"] == 1, result  # 已存在的「甲」
+    assert result["skipped_conflict"] == 1, result  # 保守跳过的「乙」
     print("✓ 布局扫描失败时整组保守跳过")
 
 

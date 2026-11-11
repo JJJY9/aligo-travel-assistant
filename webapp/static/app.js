@@ -4847,6 +4847,23 @@ function buildKnowledgeImportBatches(documents) {
   return { batches };
 }
 
+/* 知识导入的跳过摘要（预览用）：布局冲突的片段并没有导入，不能只报
+   「已存在」——否则用户会把备份当作已恢复。 */
+function knowledgeImportSkipSummary(preview) {
+  const skippedCount = Number((preview && preview.skipped) || 0);
+  if (!skippedCount) return "";
+  const reasonParts = [];
+  const duplicateCount = Number((preview && preview.skipped_duplicate) || 0);
+  const invalidCount = Number((preview && preview.skipped_invalid) || 0);
+  const conflictCount = Number((preview && preview.skipped_conflict) || 0);
+  if (duplicateCount) reasonParts.push(`${duplicateCount} 条已存在`);
+  if (invalidCount) reasonParts.push(`${invalidCount} 条无效`);
+  if (conflictCount) reasonParts.push(`${conflictCount} 条布局冲突未导入`);
+  return reasonParts.length
+    ? `（跳过 ${skippedCount} 条：${reasonParts.join(" / ")}）`
+    : `（跳过 ${skippedCount} 条已存在 / 无效内容）`;
+}
+
 async function importKnowledgeFile() {
   if (state.kbImporting) return;
   state.kbImporting = true;
@@ -4887,19 +4904,7 @@ async function importKnowledgeFile() {
         body: JSON.stringify({ documents }),
       });
       const wouldImport = Number(preview.would_import || 0);
-      const skippedCount = Number(preview.skipped || 0);
-      const duplicateCount = Number(preview.skipped_duplicate || 0);
-      const invalidCount = Number(preview.skipped_invalid || 0);
-      // 跳过原因由服务端分别统计（已存在 / 无效内容）；旧服务端只返回
-      // 总数时退回笼统文案
-      const reasonParts = [];
-      if (duplicateCount) reasonParts.push(`${duplicateCount} 条已存在`);
-      if (invalidCount) reasonParts.push(`${invalidCount} 条无效`);
-      const skippedText = skippedCount
-        ? reasonParts.length
-          ? `（跳过 ${skippedCount} 条：${reasonParts.join(" / ")}）`
-          : `（跳过 ${skippedCount} 条已存在 / 无效内容）`
-        : "";
+      const skippedText = knowledgeImportSkipSummary(preview);
       confirmText = `将导入 ${wouldImport} 条知识片段${skippedText}？`;
       } catch (error) {
         // 预览失败（如知识库暂不可用）不阻断：退回按文件条数确认
@@ -4921,6 +4926,7 @@ async function importKnowledgeFile() {
     const batches = planned.batches;
 
     let done = 0;
+    let conflictSkipped = 0;
     for (const batch of batches) {
       const result = await getJSON("/api/knowledge/import", {
         method: "POST",
@@ -4929,10 +4935,16 @@ async function importKnowledgeFile() {
       });
       imported += result.imported || 0;
       skipped += result.skipped || 0;
+      conflictSkipped += Number(result.skipped_conflict || 0);
       done += batch.length;
       els.kbImport.textContent = `导入中… ${done}/${documents.length}`;
     }
-    toast(`已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}`);
+    toast(
+      `已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}` +
+        (conflictSkipped
+          ? `（其中 ${conflictSkipped} 条因布局冲突未导入，请整份编辑或删除整组后重试）`
+          : ""),
+    );
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
     if (imported > 0) {
