@@ -7,12 +7,18 @@ RAG 智能体会为每个会话构造一次；若每个实例都加载一份 BGE
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _MODELS: dict[str, Any] = {}
+# 加载失败短时记忆：模型未下载 / 网络不可达时，每个请求都重跑一次完整的
+# 加载（含带内部重试的下载，数十秒到分钟级）会把请求线程持续钉住——
+# 冷却窗口内直接按上次的失败快速报错
+_FAILURES: dict[str, tuple[float, Exception]] = {}
+_LOAD_FAILURE_COOLDOWN_SEC = 30.0
 _LOCK = threading.Lock()
 
 
@@ -79,7 +85,11 @@ def configured_model_dimension(model_path: str | Path) -> int | None:
 
 
 def get_embedding_model(model_path: str) -> Any:
-    """返回共享的 SentenceTransformer（首次调用时加载并缓存）。"""
+    """返回共享的 SentenceTransformer（首次调用时加载并缓存）。
+
+    加载失败在冷却窗口（30 秒）内直接按上次错误快速失败，避免每个请求
+    都重跑一次完整的加载 / 下载。
+    """
     key = str(model_path)
     model = _MODELS.get(key)
     if model is not None:
@@ -87,10 +97,22 @@ def get_embedding_model(model_path: str) -> Any:
     with _LOCK:
         model = _MODELS.get(key)
         if model is None:
+            failed = _FAILURES.get(key)
+            if failed is not None:
+                failed_at, error = failed
+                if time.monotonic() - failed_at < _LOAD_FAILURE_COOLDOWN_SEC:
+                    raise RuntimeError(
+                        f"嵌入模型加载失败（{error}），请稍后重试"
+                    ) from error
+                del _FAILURES[key]
             from sentence_transformers import SentenceTransformer
 
             logger.info("Loading shared embedding model: %s", key)
-            model = SentenceTransformer(key)
+            try:
+                model = SentenceTransformer(key)
+            except Exception as exc:
+                _FAILURES[key] = (time.monotonic(), exc)
+                raise
             _MODELS[key] = model
         return model
 
@@ -99,3 +121,4 @@ def reset_embedding_models() -> None:
     """清空缓存（测试或运维需要时使用）。"""
     with _LOCK:
         _MODELS.clear()
+        _FAILURES.clear()

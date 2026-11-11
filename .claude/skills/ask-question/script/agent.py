@@ -17,6 +17,7 @@ RAG知识库智能体 RAGKnowledgeAgent
 pip install milvus sentence-transformers
 """
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -461,13 +462,25 @@ class RAGKnowledgeAgent(AgentBase):
             # 生成查询向量
             query_embedding = self.embedding_model.encode(query).tolist()
 
+            # 与知识库维护写操作互斥：整组替换（插入新分片 → 删旧分片）
+            # 是多步写入，不取锁的检索会同时命中同一文档的新旧两版分片。
+            # 有界等待（0.5s）：导入 / 更新持锁期间快速失败，不把聊天线程
+            # 堆在锁上（Web 层映射为「知识库暂不可用」）
+            try:
+                from utils.knowledge_admin import _read_lock
+
+                lock_ctx = _read_lock()
+            except Exception:  # noqa: BLE001 - 维护模块不可用时保持原行为
+                lock_ctx = contextlib.nullcontext()
+
             # 在 Milvus 中检索
-            results = self.milvus_client.search(
-                collection_name=self.collection_name,
-                data=[query_embedding],
-                limit=k,
-                output_fields=["id", "content", "metadata"]
-            )
+            with lock_ctx:
+                results = self.milvus_client.search(
+                    collection_name=self.collection_name,
+                    data=[query_embedding],
+                    limit=k,
+                    output_fields=["id", "content", "metadata"]
+                )
 
             # 格式化结果
             retrieved_docs = []

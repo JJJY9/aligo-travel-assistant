@@ -14,6 +14,7 @@ import threading
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 from utils.knowledge_paths import COLLECTION_NAME, knowledge_db_path
@@ -80,6 +81,17 @@ _agent: Any = None
 # 「库存在但集合缺失」时静默创建空集合、把未初始化伪装成 0 结果
 _read_agent: Any = None
 _agent_lock = threading.Lock()
+# 等待另一个线程完成 Agent / 嵌入模型构造的上限：首载（import torch +
+# 模型下载）可达分钟级，无界等待会把 anyio 共享线程池的 worker 全部钉在
+# 这把锁上，/api/health、/api/status 等同步接口一起排队超时
+_AGENT_LOCK_TIMEOUT_SEC = 2.0
+
+
+def _acquire_agent_lock() -> None:
+    if not _agent_lock.acquire(timeout=_AGENT_LOCK_TIMEOUT_SEC):
+        raise KnowledgeBusyError(
+            "知识库正在加载（首次使用需加载嵌入模型），请稍后重试"
+        )
 
 
 def reset_knowledge_agent() -> None:
@@ -95,7 +107,8 @@ def _get_agent() -> Any:
     global _agent
     if _agent is not None:
         return _agent
-    with _agent_lock:
+    _acquire_agent_lock()
+    try:
         if _agent is None:
             from agents.rag_knowledge_agent import RAGKnowledgeAgent
 
@@ -103,6 +116,8 @@ def _get_agent() -> Any:
             _agent = RAGKnowledgeAgent(
                 collection_name=COLLECTION_NAME, create_if_missing=True
             )
+    finally:
+        _agent_lock.release()
     return _agent
 
 
@@ -111,7 +126,8 @@ def _get_read_agent() -> Any:
     global _read_agent
     if _read_agent is not None:
         return _read_agent
-    with _agent_lock:
+    _acquire_agent_lock()
+    try:
         if _read_agent is not None:
             return _read_agent
         from agents.rag_knowledge_agent import RAGKnowledgeAgent
@@ -125,10 +141,20 @@ def _get_read_agent() -> Any:
         if getattr(agent, "initialized", True) is not False:
             _read_agent = agent
         return agent
+    finally:
+        _agent_lock.release()
 
 
 def _client() -> Any:
     db = knowledge_db_path()
+    if not db.exists():
+        raise FileNotFoundError("知识库未初始化")
+    return get_milvus_client(str(db))
+
+
+def _client_for(directory: str | Path) -> Any:
+    """按显式目录取 Milvus 客户端（初始化脚本读取旧部署的来源库）。"""
+    db = knowledge_db_path(directory)
     if not db.exists():
         raise FileNotFoundError("知识库未初始化")
     return get_milvus_client(str(db))
@@ -613,14 +639,18 @@ def update_document(
     return payload
 
 
-def export_documents() -> list[dict[str, Any]]:
+def export_documents(directory: str | Path | None = None) -> list[dict[str, Any]]:
     """导出全部知识片段（按 id 升序，便于备份 / 迁移；不含 id）。
 
     全量扫描（query_iterator），集合超过单页 16384 条时也不会截断。
     与写锁互斥：避免导到整组替换的中间状态（备份里分片缺失或新旧混杂）。
+
+    ``directory`` 指定知识库目录（默认按 skill → 项目根的解析顺序）；
+    初始化脚本重建旧部署位于项目根的库时必须显式传入，避免默认解析被
+    刚建出的空 skill 库抢先。
     """
     # 集合加载放在写锁外（load_collection 会阻塞等待加载完成）
-    client = _client()
+    client = _client_for(directory) if directory is not None else _client()
     _load_collection(client, COLLECTION_NAME)
     with _read_lock():
         return _export_documents(client)

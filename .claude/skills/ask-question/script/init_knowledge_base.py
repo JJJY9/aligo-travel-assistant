@@ -149,6 +149,10 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
 
 _MANAGED_SOURCE = "商旅知识库文档"
 _PRESERVED_BATCH = 200
+# 分片声明上限（与 ask-question agent / knowledge_admin 同口径）：旧库 /
+# 直调 add_documents 可能留下 parts=10^12 之类的脏声明，展开 set(range)
+# 会直接打爆内存——超限组整体丢弃并告警
+_GROUP_PARTS_MAX = 100000
 
 
 def _is_managed_metadata(metadata: dict) -> bool:
@@ -159,8 +163,15 @@ def _is_managed_metadata(metadata: dict) -> bool:
     )
 
 
-def _collect_preserved_documents() -> tuple[list[dict], list[str]]:
+def _collect_preserved_documents(
+    source_dir: Path,
+) -> tuple[list[dict], list[str]]:
     """导出重建前集合里「非受管」的已有片段（面板 / CLI 添加）。
+
+    ``source_dir`` 是收集来源的知识库目录：初始化脚本第 3 步会在 skill
+    目录建出空库、把默认解析翻转过去，必须由调用方在创建之前确定来源
+    （旧部署可能仍在项目根 ``rag_knowledge/``），否则旧库内容导出成 0 条、
+    重建后永久留在旧文件里。
 
     - 受管文档（本脚本写入，含 file_path）的旧分片一律丢弃：源文件已修改 /
       删除时它们是被替换的过期内容，不能当作面板知识补写回去；
@@ -174,7 +185,10 @@ def _collect_preserved_documents() -> tuple[list[dict], list[str]]:
     try:
         from utils.knowledge_admin import export_documents
 
-        rows = export_documents()
+        rows = export_documents(source_dir)
+    except FileNotFoundError:
+        # 来源库尚未初始化：没有可保留的内容，不视为失败
+        rows = []
     except Exception as exc:  # noqa: BLE001 - 导出失败必须中止重建
         raise RuntimeError(f"读取现有知识失败：{exc}") from exc
     groups: dict[str, list[dict]] = {}
@@ -210,6 +224,9 @@ def _collect_preserved_documents() -> tuple[list[dict], list[str]]:
                 declared = max(declared, int(meta.get("parts") or 0))
             except (TypeError, ValueError):
                 parts.add(0)
+        if declared > _GROUP_PARTS_MAX:
+            dropped_groups += 1
+            continue
         if declared > 1 and parts != set(range(1, declared + 1)):
             dropped_groups += 1
             continue
@@ -380,6 +397,15 @@ def main() -> int:
         skill_root = current_dir.parent
         knowledge_base_path = skill_root / "data" / "rag_knowledge"
         documents_dir = skill_root / "data" / "documents"
+        # 重建前的来源库必须赶在第 3 步建出新库之前确定：旧部署的知识库
+        # 可能在项目根 rag_knowledge/（default_knowledge_dir 的回退路径），
+        # 新建空 skill 库后默认解析会翻转过去，旧库内容将导出成 0 条
+        try:
+            from utils.knowledge_paths import default_knowledge_dir
+
+            source_knowledge_dir = default_knowledge_dir()
+        except Exception:  # noqa: BLE001 - 解析失败时退回脚本自身目录
+            source_knowledge_dir = knowledge_base_path
 
         # 1. 先加载文档：任一文件失败在触碰知识库之前中止
         print(f"1. 从 {documents_dir} 加载文档...")
@@ -419,14 +445,20 @@ def main() -> int:
         try:
             rag_agent = _build_agent(model, knowledge_base_path)
         except RuntimeError as exc:
-            if "维度" not in str(exc):
-                raise
+            # 只对「集合向量维度与嵌入模型不一致」做自愈：模型维度探测失败
+            # 抛出的「无法读取嵌入模型维度」同样包含「维度」，误判会先删
+            # 集合、重试仍抛同一错误，把可用的知识库删成未初始化状态
+            if "不一致" not in str(exc):
+                print(f"❌ 初始化失败：{exc}（知识库保持原样）")
+                return 1
             print(f"   ⚠️  {exc}")
             # 顺序关键：先导出面板 / CLI 添加的片段，导出失败即中止——
             # 先删集合后导出会让这些知识在换嵌入模型时永久丢失
             print("   正在导出库内已有片段（维度重建前保留）...")
             try:
-                preserved, warnings = _collect_preserved_documents()
+                preserved, warnings = _collect_preserved_documents(
+                    source_knowledge_dir
+                )
             except RuntimeError as export_error:
                 print(f"❌ {export_error}，已中止（知识库保持原样）")
                 return 1
@@ -463,7 +495,9 @@ def main() -> int:
                 # 导出失败必须在删库之前中止：库内面板 / CLI 添加的片段
                 # 只存在于 Milvus，先删后导会永久丢失
                 try:
-                    preserved, warnings = _collect_preserved_documents()
+                    preserved, warnings = _collect_preserved_documents(
+                        source_knowledge_dir
+                    )
                 except RuntimeError as export_error:
                     print(f"❌ {export_error}，已中止（知识库保持原样）")
                     return 1
