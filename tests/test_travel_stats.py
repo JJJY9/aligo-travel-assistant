@@ -10,7 +10,7 @@ from utils.travel_stats import summarize_travel
 
 
 def test_summarize_mixed_trips():
-    """天数含首尾、城市去重、无日期只计总数。"""
+    """天数含首尾、城市去重；无日期行程只计入总行程数。"""
     trips = [
         {"destination": "上海", "start_date": "2099-01-01", "end_date": "2099-01-03"},
         {"destination": "杭州", "start_date": "2099-02-01", "end_date": "2099-02-01"},
@@ -40,8 +40,20 @@ def test_summarize_active_and_past():
     summary = summarize_travel(trips, today=today)
     assert summary["active"] == 2, "进行中：跨今天 + 当天往返"
     assert summary["upcoming"] == 1
-    assert summary["total_days"] == 3 + 1 + 2 + 2
+    assert summary["total_days"] == 3 + 2 + 2, "重叠日只计一次"
     print("✓ 进行中 / 已结束 / 即将出行判断")
+
+
+def test_summarize_overlapping_days_counted_once():
+    """重叠行程的同一天不能重复计入出行天数。"""
+    trips = [
+        {"destination": "上海", "start_date": "2026-01-01", "end_date": "2026-01-10"},
+        {"destination": "北京", "start_date": "2026-01-05", "end_date": "2026-01-06"},
+        {"destination": "杭州", "start_date": "2026-01-10", "end_date": "2026-01-11"},
+    ]
+    summary = summarize_travel(trips, today=date(2026, 1, 7))
+    assert summary["total_days"] == 11, summary
+    print("✓ 重叠行程按日期并集计天数")
 
 
 def test_summarize_empty_and_invalid():
@@ -61,5 +73,6 @@ def test_summarize_empty_and_invalid():
 if __name__ == "__main__":
     test_summarize_mixed_trips()
     test_summarize_active_and_past()
+    test_summarize_overlapping_days_counted_once()
     test_summarize_empty_and_invalid()
     print("\n全部通过")

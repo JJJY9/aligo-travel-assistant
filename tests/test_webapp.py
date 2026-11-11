@@ -8166,6 +8166,32 @@ def test_usage_summary_cached_per_user(monkeypatch):
     print("✓ /api/status 用量汇总按用户缓存且封顶")
 
 
+
+def test_usage_cache_fingerprint_rolls_with_day(monkeypatch):
+    """跨过午夜后指纹必须变化：近 7 天窗口要向前滚动。"""
+    from webapp import server as server_module
+
+    real_datetime = server_module.datetime
+
+    class _FixedDatetime(real_datetime):
+        fixed = real_datetime(2026, 11, 10, 23, 59)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fixed
+
+    monkeypatch.setattr(server_module, "datetime", _FixedDatetime)
+    history = [
+        {"role": "assistant", "content": "{}", "timestamp": "t", "session_id": "s"}
+    ]
+    first = server_module._usage_history_fingerprint(history)
+    _FixedDatetime.fixed = real_datetime(2026, 11, 11, 0, 1)
+    second = server_module._usage_history_fingerprint(history)
+    assert first[0] == "2026-11-10", first
+    assert second[0] == "2026-11-11", second
+    assert first != second
+    print("✓ 用量缓存指纹包含当天日期（跨午夜自动失效）")
+
 def test_knowledge_eval_bounded_lock_and_masked_status(monkeypatch):
     """评测端点查状态必须带写锁超时、屏蔽路径与原始异常。"""
     from webapp import server as server_module

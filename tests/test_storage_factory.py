@@ -2778,6 +2778,87 @@ def test_bulk_save_trips_matches_sequential_saves():
     print("✓ 批量保存与逐条保存结果一致")
 
 
+def test_migrate_resets_counters_when_lists_cleared():
+    """列表整体损坏被清空时，计数与常去目的地同步归零。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-clear.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": {},
+                "trip_history": [7],
+                "statistics": {
+                    "total_messages": 7,
+                    "total_trips": 3,
+                    "frequent_destinations": {"上海": 3},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-clear", storage_dir)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 0, stats
+    assert stats["total_trips"] == 0, stats
+    assert stats["frequent_destinations"] == {}, stats
+    print("✓ 列表清空后计数与常去目的地归零")
+
+
+def test_migrate_rebuilds_statistics_when_missing():
+    """统计段整体缺失（极老格式）时按现有列表重建，而不是补 0。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-no-stats.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "hi", "session_id": "s"}
+                ],
+                "trip_history": [
+                    {
+                        "destination": "上海",
+                        "start_date": "2026-01-01",
+                        "end_date": "2026-01-02",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-no-stats", storage_dir)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 1, stats
+    assert stats["total_trips"] == 1, stats
+    assert stats["frequent_destinations"] == {"上海": 1}, stats
+    print("✓ 统计段缺失时按列表重建")
+
+
+def test_migrate_dedupes_preference_types():
+    """重复 type 的偏好保留最后一条（与 get_preference 字典取最后一致）。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-dupe-pref.json"
+    path.write_text(
+        json.dumps(
+            {
+                "preferences": [
+                    {"type": "home_location", "value": "A"},
+                    {"type": "home_location", "value": "B"},
+                    {"type": "airlines", "value": "东航"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-dupe-pref", storage_dir)
+    prefs = memory.get_preference()
+    assert prefs["home_location"] == "B", prefs
+    assert prefs["airlines"] == "东航", prefs
+    # 写路径也只保留一份：覆盖后字典里仍只有一条同类型
+    memory.save_preference("home_location", "C")
+    assert memory.get_preference()["home_location"] == "C"
+    print("✓ 重复类型偏好迁移去重（保留最后一条）")
+
+
 if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
@@ -2884,4 +2965,7 @@ if __name__ == "__main__":
         test_strict_error_message_redacts_dsn(_mp)
     finally:
         _mp.undo()
+    test_migrate_resets_counters_when_lists_cleared()
+    test_migrate_rebuilds_statistics_when_missing()
+    test_migrate_dedupes_preference_types()
     print("\n全部通过")

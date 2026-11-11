@@ -2424,11 +2424,15 @@ _usage_summary_cache_lock = threading.Lock()
 
 
 def _usage_history_fingerprint(history: list[dict[str, Any]]) -> tuple[Any, ...]:
+    # 指纹包含当天日期：进程跨过午夜后「近 7 天」窗口要向前滚动，
+    # 历史没变也必须重新汇总（否则会把第 8 天的 bucket 继续算进 7 天合计）
+    today = datetime.now().date().isoformat()
     if not history:
-        return (0,)
+        return (today, 0)
     first = history[0]
     last = history[-1]
     return (
+        today,
         len(history),
         str(first.get("timestamp") or ""),
         len(str(first.get("content") or "")),

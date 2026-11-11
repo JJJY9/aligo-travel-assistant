@@ -24,6 +24,15 @@ from utils.preference_values import merge_preference_value
 
 logger = logging.getLogger(__name__)
 
+
+def _trip_date_is_valid(value: object) -> bool:
+    """行程出发日期是否为可解析的 YYYY-MM-DD（常去目的地统计口径）。"""
+    try:
+        datetime.strptime(str(value or ""), "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
 # 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
 # MemoryManager 还会重建实例），按路径共享一把进程内可重入锁，避免并发
 # 读改写互相覆盖。弱引用：实例释放后锁自动移除，不随用户数无限增长。
@@ -279,7 +288,8 @@ class LongTermMemory:
             data["archived_sessions"] = []
         if "trip_history" not in data:
             data["trip_history"] = []
-        if not isinstance(data.get("statistics"), dict):
+        stats_missing = not isinstance(data.get("statistics"), dict)
+        if stats_missing:
             data["statistics"] = {}
         stats = data["statistics"]
         destructive = False
@@ -325,10 +335,15 @@ class LongTermMemory:
 
         # 字段存在但为 null / 类型错误时按空集合处理：这类文件是合法 JSON，
         # 若不在读取时修复，每次 get_* / 写入都会抛 TypeError，且永远不会备份
+        chats_changed = trips_changed = False
         for list_key in ("chat_history", "trip_history"):
             if not isinstance(data.get(list_key), list):
                 data[list_key] = []
                 destructive = True
+                if list_key == "chat_history":
+                    chats_changed = True
+                else:
+                    trips_changed = True
                 continue
             cleaned = [item for item in data[list_key] if isinstance(item, dict)]
             if len(cleaned) != len(data[list_key]):
@@ -342,9 +357,29 @@ class LongTermMemory:
                 # 旧总数会让统计永久偏大（总数与列表长度必须一致）
                 if list_key == "chat_history":
                     stats["total_messages"] = len(cleaned)
+                    chats_changed = True
                 else:
                     stats["total_trips"] = len(cleaned)
+                    trips_changed = True
             data[list_key] = cleaned
+        if stats_missing:
+            # 统计段整体缺失（极老格式）：按现有列表重建，而不是把计数器
+            # 补 0 后与列表长度永久脱节
+            chats_changed = trips_changed = True
+        if chats_changed:
+            stats["total_messages"] = len(data["chat_history"])
+        if trips_changed:
+            stats["total_trips"] = len(data["trip_history"])
+            # 行程被清空 / 丢弃后，常去目的地必须按当前列表重建：
+            # 否则面板「常去目的地」会继续显示已不存在的城市
+            stats["frequent_destinations"] = Counter(
+                str(trip.get("destination") or "")
+                for trip in data["trip_history"]
+                if isinstance(trip, dict)
+                and trip.get("destination")
+                and _trip_date_is_valid(trip.get("start_date"))
+            )
+
         if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []
             destructive = True
@@ -413,6 +448,23 @@ class LongTermMemory:
 
         # 迁移结果在下次写入时落盘：读取路径不再无条件重写文件，
         # 避免搜索/状态等只读请求与对话写入互相覆盖。
+        # 同一 type 的重复偏好（旧迁移 bug 产物）：存储写路径只更新第一条、
+        # 而 get_preference()（状态 / 上下文 / 导出）取最后一条——写后仍读到
+        # 旧值。保留最后一条并按首次出现的位置排序
+        if isinstance(data.get("preferences"), list):
+            by_type: dict[str, dict[str, Any]] = {}
+            for pref in data["preferences"]:
+                if isinstance(pref, dict) and isinstance(pref.get("type"), str):
+                    by_type[str(pref["type"])] = pref
+            if len(by_type) != len(data["preferences"]):
+                logger.warning(
+                    "偏好存在重复类型，保留最后一条（%d -> %d）",
+                    len(data["preferences"]),
+                    len(by_type),
+                )
+                data["preferences"] = list(by_type.values())
+                destructive = True
+
         return data
 
     def _init_data(self) -> dict[str, Any]:
@@ -1096,7 +1148,9 @@ class LongTermMemory:
             history.append(record)
             stats["total_trips"] = int(stats.get("total_trips", 0)) + 1
             destination = record.get("destination")
-            if destination:
+            if destination and _trip_date_is_valid(record.get("start_date")):
+                # 与面板「到访城市」同口径：日期不可解析的僵尸行程只计入
+                # 总行程数，不累计常去目的地
                 frequent = stats.setdefault("frequent_destinations", {})
                 frequent[destination] = int(frequent.get(destination, 0)) + 1
             if key is not None:
