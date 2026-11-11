@@ -1375,6 +1375,19 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   cursor: pointer;
 }
 .history-more:hover { color: var(--sidebar-ink); }
+/* 会话内「显示更早消息」：大历史窗口化后补一批，阅读位置保持不变 */
+.earlier-more {
+  display: block;
+  margin: 4px auto 10px;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.earlier-more:hover { color: var(--ink); border-color: var(--ink-2); }
 .archived-hint { color: #e28a6c; border-color: rgba(224, 85, 43, 0.35); }
 .archived-hint:hover { color: #ffb29a; border-color: rgba(224, 85, 43, 0.6); }
 
