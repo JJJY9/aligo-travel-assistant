@@ -7459,6 +7459,7 @@ def test_knowledge_transfer_api(monkeypatch):
         "skipped": 1,
         "skipped_invalid": 1,
         "skipped_duplicate": 0,
+        "skipped_conflict": 0,
     }
 
     calls = {}

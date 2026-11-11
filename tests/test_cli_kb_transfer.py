@@ -336,6 +336,104 @@ def test_import_reports_skip_reasons(monkeypatch):
     print("✓ kb-import 文本输出区分跳过原因")
 
 
+def test_import_all_invalid_or_conflict_exits_nonzero(monkeypatch):
+    """全部无效 / 全部布局冲突（且无「已存在」）时备份并未恢复：退出 1。"""
+    cases = [
+        (
+            {"imported": 0, "skipped": 1, "skipped_invalid": 1},
+            "1 条无效",
+        ),
+        (
+            {
+                "imported": 0,
+                "skipped": 2,
+                "skipped_conflict": 2,
+                "skipped_groups": [
+                    {"group": "g", "reason": "布局冲突：缺失分片", "parts": 2}
+                ],
+            },
+            "2 条布局冲突",
+        ),
+    ]
+    for result, needle in cases:
+        monkeypatch.setattr(
+            knowledge_admin,
+            "import_documents",
+            lambda documents, dry_run=False, _r=result: _r,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_json(tmp, {"documents": [{"content": "a"}]})
+            code, out = _capture(
+                cli.run_knowledge_import_standalone, str(path)
+            )
+            assert code == 1, out
+            assert "没有可导入的知识片段" in out and needle in out, out
+
+            code, out = _capture(
+                cli.run_knowledge_import_standalone,
+                str(path),
+                as_json=True,
+            )
+            payload = json.loads(out)
+            assert code == 1 and payload["ok"] is False, payload
+            assert "没有可导入的知识片段" in payload["error"], payload
+            assert payload["skipped_conflict"] == int(
+                result.get("skipped_conflict", 0) or 0
+            )
+    print("✓ kb-import 全无效 / 全冲突以非零退出")
+
+
+def test_import_all_duplicate_still_succeeds(monkeypatch):
+    """全重复（幂等重导）保持成功：没有新内容但备份内容确实都已存在。"""
+    monkeypatch.setattr(
+        knowledge_admin,
+        "import_documents",
+        lambda documents, dry_run=False: {
+            "imported": 0,
+            "skipped": 2,
+            "skipped_duplicate": 2,
+        },
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_json(tmp, {"documents": [{"content": "a"}]})
+        code, out = _capture(cli.run_knowledge_import_standalone, str(path))
+    assert code == 0 and "跳过 2 条（2 条已存在）" in out, out
+    print("✓ kb-import 全重复仍按成功处理")
+
+
+def test_import_reports_conflict_and_groups_json(monkeypatch):
+    """部分成功时 --json 带上布局冲突计数与坏组明细，文本点名冲突。"""
+    result = {
+        "imported": 1,
+        "skipped": 3,
+        "skipped_invalid": 0,
+        "skipped_duplicate": 1,
+        "skipped_conflict": 2,
+        "skipped_groups": [
+            {"group": "g1", "reason": "布局冲突：缺失分片", "parts": 2}
+        ],
+    }
+    monkeypatch.setattr(
+        knowledge_admin,
+        "import_documents",
+        lambda documents, dry_run=False: result,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_json(tmp, {"documents": [{"content": "a"}]})
+        code, out = _capture(cli.run_knowledge_import_standalone, str(path))
+        assert code == 0
+        assert "2 条因布局冲突未导入" in out, out
+
+        code, out = _capture(
+            cli.run_knowledge_import_standalone, str(path), as_json=True
+        )
+    payload = json.loads(out)
+    assert code == 0 and payload["ok"] is True, payload
+    assert payload["skipped_conflict"] == 2, payload
+    assert payload["skipped_groups"][0]["group"] == "g1", payload
+    print("✓ kb-import 布局冲突计数与坏组明细透出")
+
+
 def test_import_json_output(monkeypatch):
     """--json 输出结构化结果（正常 / 预览两种形态）。"""
     results = [
@@ -369,6 +467,7 @@ def test_import_json_output(monkeypatch):
             "skipped": 3,
             "skipped_invalid": 1,
             "skipped_duplicate": 2,
+            "skipped_conflict": 0,
         }
 
         code, out = _capture(
@@ -466,6 +565,9 @@ if __name__ == "__main__":
         test_import_large_file_not_capped,
         test_import_dry_run,
         test_import_reports_skip_reasons,
+        test_import_all_invalid_or_conflict_exits_nonzero,
+        test_import_all_duplicate_still_succeeds,
+        test_import_reports_conflict_and_groups_json,
         test_import_json_output,
         test_import_json_errors,
         test_kb_import_dispatch_flags,

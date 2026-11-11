@@ -1113,6 +1113,23 @@ function scenarioChatPersisted(source) {
   return results;
 }
 
+function scenarioKbImportSummary(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  return {
+    conflict: run(
+      "knowledgeImportSkipSummary({skipped: 2, skipped_conflict: 2})",
+    ),
+    mixed: run(
+      "knowledgeImportSkipSummary({skipped: 6, skipped_duplicate: 1, skipped_invalid: 2, skipped_conflict: 3})",
+    ),
+    none: run("knowledgeImportSkipSummary({skipped: 0})"),
+    legacy: run(
+      "knowledgeImportSkipSummary({skipped: 2, skipped_duplicate: 2})",
+    ),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1149,6 +1166,8 @@ async function main() {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
     payload = scenarioChatPersisted(source);
+  } else if (scenario === "kbImportSummary") {
+    payload = scenarioKbImportSummary(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
