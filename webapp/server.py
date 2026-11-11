@@ -126,6 +126,9 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 否则写接口可以无限追加，把用户记忆撑到永远无法导出的状态
 MAX_PREFERENCE_ENTRIES = 200
 MAX_TRIP_ENTRIES = 5000
+# 「删除最后一轮」等待用户锁的上限：长回合（单智能体上限 300 秒）期间
+# 无限排队会让前端超时后仍被迟到的删除改掉历史
+_DELETE_LOCK_TIMEOUT_SEC = 10.0
 
 # 备份导入在读取 64MB 请求体前就先占用导入名额：客户端只发请求头、
 # 不发 body 时不能让名额被无限期占住（两个连接即可让所有导入 503）
@@ -734,6 +737,9 @@ class LastTurnPayload(BaseModel):
 
     user_id: str = Field(pattern=_ID_PATTERN)
     expect: str | None = Field(default=None, max_length=200000)
+    # 本轮唯一标识（助手消息 _meta.client_turn_id）：带它时只有「最后一轮
+    # 确实是这一轮」才删除，另一标签页 / CLI 并发追加同文提问时不会误删
+    turn_id: str | None = Field(default=None, max_length=64)
 
 
 _DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
@@ -3736,15 +3742,58 @@ def create_app(model: Any = None) -> FastAPI:
         return {"session_id": session_id, "deleted": removed}
 
     async def _delete_last_turn_impl(
-        user_id: str, session_id: str, expect: str | None
+        user_id: str,
+        session_id: str,
+        expect: str | None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
-        """删除最后一轮的共享实现（DELETE 查询串 / POST body 两种入口）。"""
-        async with state.lock_for(user_id):
+        """删除最后一轮的共享实现（DELETE 查询串 / POST body 两种入口）。
+
+        用户锁有界等待：同一用户的长回合（单智能体上限 300 秒）期间，删除
+        请求此前会无限排队——前端 120 秒超时后已提示失败并解锁，但排队的
+        请求在回合结束后仍照常删除，界面与服务端历史不一致。超过 10 秒
+        直接返回 409「正在生成回复」，不再排队执行。
+
+        ``turn_id`` 为助手消息 _meta.client_turn_id：带了它时还要确认
+        「最后一轮确实是这一轮」，另一标签页 / CLI 并发追加同文提问时
+        不会误删对方刚写入的问答。
+        """
+        lock = state.lock_for(user_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_DELETE_LOCK_TIMEOUT_SEC)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise HTTPException(
+                status_code=409, detail="会话正在生成回复，请稍后再试"
+            ) from None
+        try:
+
             def _remove_last_turn() -> int:
                 # 破坏性操作：PostgreSQL 不可用时 strict 打开返回 503，
                 # 不能在回退 JSON 上删除并谎报成功
                 store = _open_long_term(user_id, strict=True)
                 try:
+                    if turn_id:
+                        history = store.get_chat_history(session_id=session_id)
+                        last_assistant = next(
+                            (
+                                item
+                                for item in reversed(history)
+                                if item.get("role") == "assistant"
+                            ),
+                            None,
+                        )
+                        meta = (
+                            extract_turn_meta(
+                                str(last_assistant.get("content") or "")
+                            )
+                            if last_assistant is not None
+                            else None
+                        )
+                        if (
+                            not isinstance(meta, dict)
+                            or str(meta.get("client_turn_id") or "") != turn_id
+                        ):
+                            return -1
                     return store.delete_last_turn(session_id, expect)
                 finally:
                     _close_long_term(store)
@@ -3755,6 +3804,9 @@ def create_app(model: Any = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
                 logger.warning("删除最后一轮对话失败: %s", exc)
                 raise _storage_failure("删除失败", exc) from exc
+
+            if removed < 0:
+                return {"session_id": session_id, "removed": 0, "mismatch": True}
 
             if removed > 0:
                 def _truncate_short_term() -> None:
@@ -3774,6 +3826,8 @@ def create_app(model: Any = None) -> FastAPI:
                     await asyncio.to_thread(_truncate_short_term)
                 except Exception as exc:  # noqa: BLE001 - 缓存清理失败只记录
                     logger.warning("清理短期记忆失败（%s）: %s", session_id, exc)
+        finally:
+            lock.release()
         return {
             "session_id": session_id,
             "removed": removed,
@@ -3786,6 +3840,7 @@ def create_app(model: Any = None) -> FastAPI:
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
         expect: str | None = Query(default=None, max_length=6000),
+        turn_id: str | None = Query(default=None, max_length=64),
     ) -> dict[str, Any]:
         """删除会话最后一轮对话（供「编辑上一条提问」后重新发送使用）。
 
@@ -3794,7 +3849,7 @@ def create_app(model: Any = None) -> FastAPI:
         查询串形式限制 6000 字（h11 请求行上限）；更长的提问用 POST body 形式。
         """
         await asyncio.to_thread(_enforce_write_rate_limit, state, request)
-        return await _delete_last_turn_impl(user_id, session_id, expect)
+        return await _delete_last_turn_impl(user_id, session_id, expect, turn_id)
 
     @app.post("/api/sessions/{session_id}/last-turn")
     async def delete_last_turn_post(
@@ -3810,7 +3865,7 @@ def create_app(model: Any = None) -> FastAPI:
         """
         await asyncio.to_thread(_enforce_write_rate_limit, state, request)
         return await _delete_last_turn_impl(
-            payload.user_id, session_id, payload.expect
+            payload.user_id, session_id, payload.expect, payload.turn_id
         )
 
     @app.post("/api/chat")

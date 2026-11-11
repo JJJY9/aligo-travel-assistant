@@ -4179,6 +4179,95 @@ def test_delete_last_turn_api():
         _cleanup(user_id)
 
 
+def test_delete_last_turn_turn_identity():
+    """同文提问并发追加时按 client_turn_id 精确删除，不误删对方的新回合。"""
+    import json as json_module
+
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_last_turn_id")
+    session_id = "edit-turn-id"
+
+    def _assistant(turn_id: str) -> str:
+        return json_module.dumps(
+            {"results": [], "_meta": {"client_turn_id": turn_id}},
+            ensure_ascii=False,
+        )
+
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "问题 A", session_id)
+            store.add_chat_message("assistant", _assistant("turn-A"), session_id)
+            store.add_chat_message("user", "问题 A", session_id)
+            store.add_chat_message("assistant", _assistant("turn-B"), session_id)
+        finally:
+            closer = getattr(store, "close", None)
+            if callable(closer):
+                closer()
+
+        stale = client.delete(
+            f"/api/sessions/{session_id}/last-turn",
+            params={"user_id": user_id, "expect": "问题 A", "turn_id": "turn-A"},
+        )
+        assert stale.status_code == 200
+        assert stale.json()["removed"] == 0
+        assert stale.json()["mismatch"] is True
+
+        stale_post = client.post(
+            f"/api/sessions/{session_id}/last-turn",
+            json={"user_id": user_id, "expect": "问题 A", "turn_id": "turn-A"},
+        )
+        assert stale_post.json()["removed"] == 0
+
+        ok = client.post(
+            f"/api/sessions/{session_id}/last-turn",
+            json={"user_id": user_id, "expect": "问题 A", "turn_id": "turn-B"},
+        )
+        assert ok.json()["removed"] == 2
+
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            assert len(store.get_chat_history(session_id=session_id)) == 2
+        finally:
+            closer = getattr(store, "close", None)
+            if callable(closer):
+                closer()
+        print("✓ 删除最后一轮按 turn_id 精确匹配（同文提问不误删）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_delete_last_turn_busy_lock_refused(monkeypatch):
+    """用户锁被长回合占用时有界返回 409，而不是排队到前端超时后仍执行。"""
+    import asyncio as asyncio_module
+
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    client = TestClient(app)
+
+    class _StuckLock:
+        async def acquire(self):
+            await asyncio_module.sleep(30)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(state, "lock_for", lambda user_id: _StuckLock())
+    monkeypatch.setattr(server_module, "_DELETE_LOCK_TIMEOUT_SEC", 0.05)
+    user_id = _unique_user("web_test_last_turn_busy")
+    response = client.delete(
+        "/api/sessions/s-busy/last-turn",
+        params={"user_id": user_id, "expect": "问题"},
+    )
+    assert response.status_code == 409
+    assert "正在生成回复" in response.json()["detail"]
+    print("✓ 删除最后一轮在用户锁忙碌时有界返回 409")
+
+
 def test_next_trip_prefers_ongoing():
     from datetime import datetime, timedelta
 

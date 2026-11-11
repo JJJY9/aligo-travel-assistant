@@ -1220,6 +1220,21 @@ async function scenarioCopy(source) {
   };
 }
 
+async function scenarioDeleteTurn(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run('state.userId = "u1"; state.sessionId = "s1";');
+  const promise = run('deleteLastTurn("问题", "turn-1")');
+  const request = await waitRequest(env);
+  const body = JSON.parse(request.args[1].body);
+  request.resolve({ removed: 2 });
+  return {
+    turn_id: body.turn_id,
+    expect: body.expect,
+    removed: await promise,
+  };
+}
+
 function scenarioChatPersisted(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1341,6 +1356,8 @@ async function main() {
     payload = await scenarioPanelFixes(source);
   } else if (scenario === "startup") {
     payload = await scenarioStartup(source);
+  } else if (scenario === "deleteTurn") {
+    payload = await scenarioDeleteTurn(source);
   } else if (scenario === "retryGuard") {
     payload = await scenarioRetryGuard(source);
   } else if (scenario === "sessionRefresh") {
