@@ -13,6 +13,20 @@ class MemoryPersistenceError(RuntimeError):
     """
 
 
+class PartialImportError(MemoryPersistenceError):
+    """批量写入中途失败：``created`` / ``updated`` 为失败前已提交的条数。
+
+    PostgreSQL 后端逐行 autocommit，中途失败时已写入的行保留：调用方必须
+    如实报告「部分已提交」，否则用户以为整份文件未导入，换文件或丢弃备份
+    重试后数据就永久停留在半份状态。
+    """
+
+    def __init__(self, message: str, created: int, updated: int) -> None:
+        super().__init__(message)
+        self.created = created
+        self.updated = updated
+
+
 class UserFacingError(RuntimeError):
     """消息本身就是给用户看的提示（固定文案，不含内部异常细节）。
 
