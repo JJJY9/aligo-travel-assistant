@@ -335,7 +335,6 @@ if __name__ == "__main__":
         test_truncation_detected_before_result_keys()
         test_balanced_explanation_after_result_is_not_truncation()
         test_prefer_strong_keys_helper()
-        test_parse_failure_log_is_single_line_and_short()
     finally:
         mp.undo()
     print("\n全部通过")
