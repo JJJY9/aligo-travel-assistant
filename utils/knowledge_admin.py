@@ -841,14 +841,23 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
             rows = client.query(
                 collection_name=COLLECTION_NAME,
                 filter=f"id == {int(doc_id)}",
-                output_fields=["content"],
+                output_fields=["content", "metadata"],
                 limit=1,
             )
-            content = str(rows[0].get("content", "")) if rows else ""
+            row = rows[0] if rows else {}
+            content = str(row.get("content", ""))
+            meta = _parse_metadata(row.get("metadata"))
+            try:
+                part_no = int(meta.get("part") or 0)
+            except (TypeError, ValueError):
+                part_no = 0
             return {
                 "id": int(doc_id),
                 "group": "",
                 "parts": parts,
+                # 旧版多分片记录没有 group：只能取到当前这一片，不能冒充整篇
+                "part": part_no,
+                "partial": parts > 1,
                 "size": len(content),
                 "content": content,
             }
@@ -872,10 +881,16 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
         # 空串拼接：分片是原文的连续片段（入库时 strip 后直接拼接），用换行
         # 分隔会把分隔符带进编辑框——文档越大越超提交上限，原样保存都失败
         joined = "".join(text for _, text in pieces)
+        found_parts = {part for part, _ in pieces if part}
+        present = sum(1 for part in found_parts if 1 <= part <= parts)
+        missing_parts = max(0, parts - present) if parts > 1 else 0
         return {
             "id": int(doc_id),
             "group": group,
-            "parts": len(pieces) or parts,
+            "parts": parts or len(pieces),
+            # 声明片数与实际成员不符时明确标出：不能把缺片当「整篇」
+            "missing_parts": missing_parts,
+            "partial": missing_parts > 0,
             "size": len(joined),
             "content": joined,
         }
@@ -1630,9 +1645,11 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
     """按 id 删除知识片段；返回实际删除的分片数（不存在返回 0）。
 
     ``whole_group=True`` 时，如果该片段属于带 group 标识的多分片记录，
-    同时删除同组的其余分片（旧数据没有 group 时只删除当前片段，返回 1）。
-    ``whole_group=False`` 时拒绝对多分片记录的单条删除：只删一片会留下
-    「parts 声明大于实际成员」的残缺组，整份编辑 / 备份恢复都会失效。
+    同时删除同组的其余分片；旧版无 group 的多分片记录无法确定其余分片，
+    拒绝整组删除并提示按 id 逐个删除。
+    ``whole_group=False`` 时拒绝对带 group 的多分片记录单条删除（只删一片
+    会留下「parts 声明大于实际成员」的残缺组）；旧版无 group 的分片没有
+    整组可删，允许单条删除。
 
     Raises:
         ValueError: 对多分片记录做单条删除
@@ -1645,18 +1662,30 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
         if not _exists(client, int(doc_id)):
             return 0
         ids = [int(doc_id)]
+        parts, group = _document_info(client, int(doc_id))
         if whole_group:
-            _, group = _document_info(client, int(doc_id))
             if group:
                 ids = sorted(set(_group_member_ids(client, group)) | {int(doc_id)})
+            elif parts > 1:
+                # 旧版多分片记录没有 group：无法确定其余分片，静默只删一片
+                # 会让用户以为整篇已删除、残余分片继续参与检索
+                raise ValueError(
+                    f"该片段属于旧版多分片记录（共 {parts} 片，无 group 标识），"
+                    "无法确定其余分片：请按 id 逐个删除（kb-list 可查看同标题分片）"
+                )
         else:
-            parts, group = _document_info(client, int(doc_id))
-            # 旧版多分片记录可能只有 parts>1 没有 group：单条删除同样会留下
-            # 「parts 声明大于实际成员」的残缺组，必须按整组语义处理
-            if group or parts > 1:
+            if group:
                 raise ValueError(
                     "该片段属于多分片知识内容，不能单条删除：请整组删除"
                     "（CLI 加 --group / 接口加 group=1）"
+                )
+            if parts > 1:
+                # 旧版无 group 的多分片记录没有「整组」可删：允许按 id 逐片
+                # 清理（kb-show / kb-list 会标注旧数据状态）
+                logger.warning(
+                    "删除旧版多分片记录的单片 #%s（声明共 %s 片，无 group）",
+                    doc_id,
+                    parts,
                 )
         client.delete(collection_name=COLLECTION_NAME, ids=ids)
         return len(ids)

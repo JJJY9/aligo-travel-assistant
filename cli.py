@@ -2224,7 +2224,16 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
     size = int(document.get("size") or len(content))
     meta = [f"#{doc_id}"]
     if parts > 1:
-        meta.append(f"整篇 {parts} 片")
+        if group:
+            meta.append(f"整篇 {parts} 片")
+            missing = int(document.get("missing_parts") or 0)
+            if missing:
+                meta.append(f"缺少 {missing} 片")
+        else:
+            # 旧版多分片记录没有 group：这里只有当前一片，不能标成「整篇」
+            part_no = int(document.get("part") or 0)
+            label = f"分片 {part_no}/{parts}" if part_no else f"分片（共 {parts} 片）"
+            meta.append(f"{label}（旧数据无 group，无法拼接整篇）")
     if group:
         meta.append(f"group {group}")
     meta.append(f"{size} 字")
@@ -2845,7 +2854,7 @@ def run_knowledge_delete_standalone(doc_id: int, whole_group: bool = False) -> i
     if whole_group and removed > 1:
         print(f"已删除整组分片 #{doc_id}（共 {removed} 片）")
     elif whole_group:
-        print(f"未找到同组分片，已删除单个片段 #{doc_id}")
+        print(f"该片段不是多分片记录，已删除单个片段 #{doc_id}")
     else:
         print(f"已删除知识片段 #{doc_id}")
     return 0
