@@ -1619,7 +1619,8 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """
     backend = getattr(state.rate_limiter, "backend", "memory")
     configured = bool(STORAGE_CONFIG.get("redis_url"))
-    # 各桶独立回退：任一桶处于降级都上报，不能只看用户桶
+    # 各桶独立回退：任一桶处于降级都上报，不能只看用户桶；写桶也只由写
+    # 接口触发，遗漏它会让 Redis 故障期间的写限流退化完全不可见
     limiters = (
         state.rate_limiter,
         state.ip_limiter,
@@ -1627,6 +1628,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         state.weather_limiter,
         state.import_limiter,
         state.read_limiter,
+        state.write_limiter,
     )
     degraded = any(_limiter_degraded(limiter) for limiter in limiters) or (
         backend == "memory" and configured
@@ -1641,6 +1643,7 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         "kb_import_limit": state.import_limiter.limit,
         "weather_limit": state.weather_limiter.limit,
         "read_limit": state.read_limiter.limit,
+        "write_limit": state.write_limiter.limit,
         "window_sec": state.rate_limiter.window_sec,
     }
 
