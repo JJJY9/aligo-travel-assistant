@@ -2699,6 +2699,54 @@ def test_regroup_rejects_duplicate_part_numbers():
     print("✓ 重组拒绝重复 part 编号")
 
 
+def test_regroup_bounds_missing_part_detail():
+    """parts=100000 的畸形组只构造有界文本（不再 join 十万个编号）。"""
+    import time as time_module
+
+    documents = [
+        {
+            "content": "x",
+            "metadata": {"group": "g-huge", "part": "1", "parts": "100000"},
+        }
+    ]
+    started = time_module.perf_counter()
+    with pytest.raises(ValueError) as excinfo:
+        knowledge_admin._regroup_exported_documents(documents, set())
+    elapsed = time_module.perf_counter() - started
+    message = str(excinfo.value)
+    assert "缺少 99999 片" in message, message
+    assert len(message) < 500, len(message)
+    assert elapsed < 0.5, elapsed
+    print("✓ 畸形 parts 声明的缺失明细有界")
+
+
+def test_regroup_caps_problem_details():
+    """大量坏组：明细最多 _PROBLEMS_MAX 条 + 一条汇总，坏片总数仍准确。"""
+    documents = []
+    groups = knowledge_admin._PROBLEMS_MAX + 20
+    for index in range(groups):
+        documents.append(
+            {
+                "content": "x",
+                "metadata": {
+                    "group": f"bad-{index}",
+                    "part": "1",
+                    "parts": "2",
+                },
+            }
+        )
+    problems: list[dict] = []
+    merged, skipped = knowledge_admin._regroup_exported_documents(
+        documents, set(), problems=problems
+    )
+    assert merged == [] and skipped == 0
+    assert len(problems) == knowledge_admin._PROBLEMS_MAX + 1, len(problems)
+    assert problems[-1]["group"] == ""
+    assert "另有 20 个" in problems[-1]["reason"], problems[-1]
+    assert sum(int(item.get("parts") or 0) for item in problems) == groups
+    print("✓ 坏组明细有界且坏片总数准确")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
@@ -2706,6 +2754,8 @@ if __name__ == "__main__":
     test_restore_pieces_fallbacks()
     test_regroup_keeps_non_dict_items()
     test_regroup_rejects_duplicate_part_numbers()
+    test_regroup_bounds_missing_part_detail()
+    test_regroup_caps_problem_details()
     test_document_info_parses_parts_and_group()
     for case in (
         test_list_documents_parses_sorts_and_filters,

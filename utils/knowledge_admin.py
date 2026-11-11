@@ -40,6 +40,10 @@ _RESTORE_JOINED_MAX_CHARS = DOC_MAX_CHARS * 2 + 100
 # 会被 1e12 之类的声明直接撑爆内存（恶意 / 损坏备份即可触发）；旧备份
 # 可能有上千个极短分片（每片几个字），上限取 10 万留足正常空间
 _GROUP_PARTS_MAX = 100000
+# 导入时逐组保留的结构问题明细上限：一份 2 万条的恶意备份可以全是坏组，
+# 每组一条 reason 会让响应与内存随组数线性放大；超出后只保留汇总（片数
+# 仍准确累计），明细过多本身也无法逐条阅读
+_PROBLEMS_MAX = 100
 # 导入时单条内容上限（用户输入 / 任意备份的安全边界）；从导出备份还原的
 # 多分片记录是完整文档，用上面的拼接上限避免备份恢复被截断
 _IMPORT_CONTENT_MAX_CHARS = 2000
@@ -673,15 +677,25 @@ def _merge_exported_group(
     if not contents:
         return None, 0
     if declared > 1:
-        missing = set(range(1, declared + 1)) - seen_parts
-        if len(pieces) < declared or missing:
-            # 分片不全 / 编号跳号：按残片重组会把一篇文档拆成几段分别导入
-            detail = (
-                "，缺少 part "
-                + "、".join(str(item) for item in sorted(missing))
-                if missing
-                else ""
-            )
+        # 只统计缺失数量并给出少量样例：set(range(1, declared+1)) 与全量
+        # join 在 parts=100000 的畸形组上会构造数十万项的集合 / 文本，
+        # 多组叠加可让导入请求占满 CPU 与内存（一份 1.5MB 的备份即可）
+        present = sum(1 for part_no in seen_parts if 1 <= part_no <= declared)
+        missing_count = max(0, declared - present)
+        if len(pieces) < declared or missing_count:
+            detail = ""
+            if missing_count:
+                samples: list[str] = []
+                candidate = 1
+                while len(samples) < 10 and candidate <= declared:
+                    if candidate not in seen_parts:
+                        samples.append(str(candidate))
+                    candidate += 1
+                detail = (
+                    f"，缺少 {missing_count} 片（如 part "
+                    + "、".join(samples)
+                    + "…）"
+                )
             raise ValueError(
                 f"备份中的多分片文档不完整（group={key}，收到 {len(pieces)}/{declared} 片{detail}）："
                 "请整组一起导入"
@@ -765,6 +779,8 @@ def _regroup_exported_documents(
     # 库内容计数只建一次：原实现每组重建 Counter(existing)，导入成本
     # O(文档组数 × 库内容数)，大备份在写锁内会跑成分钟级
     existing_counts_base = Counter(existing)
+    overflow_groups = 0
+    overflow_parts = 0
     for kind, key in order:
         if kind == "single":
             merged.append(key)
@@ -777,14 +793,30 @@ def _regroup_exported_documents(
         except ValueError as exc:
             if problems is None:
                 raise
-            problems.append(
-                {"group": key, "reason": str(exc), "parts": len(pieces)}
-            )
+            if len(problems) < _PROBLEMS_MAX:
+                problems.append(
+                    {"group": key, "reason": str(exc), "parts": len(pieces)}
+                )
+            else:
+                overflow_groups += 1
+                overflow_parts += len(pieces)
             continue
         if entry is None:
             skipped += skipped_count
             continue
         merged.append(entry)
+    if overflow_groups and problems is not None:
+        # 汇总条目沿用 parts 字段，调用方按 parts 求和统计坏片总数不受影响
+        problems.append(
+            {
+                "group": "",
+                "reason": (
+                    f"另有 {overflow_groups} 个分片组结构非法，已跳过"
+                    "（明细过多未逐条展开）"
+                ),
+                "parts": overflow_parts,
+            }
+        )
     return merged, skipped
 
 
