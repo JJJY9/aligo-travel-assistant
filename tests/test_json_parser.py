@@ -175,6 +175,76 @@ def test_strict_and_first_object_with_keys_helpers():
     print("✓ strict / first 辅助函数（截断抛错、首个含键对象兜底）")
 
 
+def test_truncation_detected_before_result_keys():
+    """正式结果在写出任何结果键之前被截断：不能回退到 prompt 回显示例。"""
+    from utils.json_parser import (
+        last_json_object_with_keys,
+        last_json_object_with_keys_strict,
+    )
+
+    example = (
+        '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"missing_info": [], "extracted_count": 7}'
+    )
+    text = example + '\n正式结果：{"summary": "下周一从北京去杭州'
+    with pytest.raises(ValueError):
+        last_json_object_with_keys_strict(text, ("destination", "missing_info"))
+    assert last_json_object_with_keys(text, ("destination", "missing_info")) is None
+    print("✓ 正式结果在写出键之前被截断也能识别（不回退示例）")
+
+
+def test_balanced_explanation_after_result_is_not_truncation():
+    """完整结果后的平衡说明片段（带键名）不再误判截断。"""
+    from utils.json_parser import last_json_object_with_keys_strict
+
+    full = (
+        '{"destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 1}'
+    )
+    text = full + '\n返回 {"destination": 城市名} 字段'
+    result = last_json_object_with_keys_strict(text, ("destination",))
+    assert result == {
+        "destination": "杭州",
+        "start_date": "2026-12-01",
+        "extracted_count": 1,
+    }, result
+    print("✓ 完整结果后的平衡说明片段不再误判截断")
+
+
+def test_prefer_strong_keys_helper():
+    """强键（itinerary/daily_plans）优先，弱键仅在无强键时兜底。"""
+    import pytest as pytest_module
+
+    from utils.json_parser import last_json_object_prefer_keys_strict
+
+    full = '{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    weak = '{"duration": "3天", "note": "可调整"}'
+    result = last_json_object_prefer_keys_strict(
+        full + '\n备注：' + weak,
+        ("itinerary", "daily_plans"),
+        ("duration", "schedule", "title"),
+    )
+    assert result == {
+        "itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}
+    }, result
+
+    bare = '{"title": "北京3日游", "duration": "3天", "daily_plans": []}'
+    assert last_json_object_prefer_keys_strict(
+        bare, ("itinerary", "daily_plans"), ("duration", "schedule", "title")
+    ) == {"title": "北京3日游", "duration": "3天", "daily_plans": []}
+
+    weak_only = '{"title": "故宫", "duration": "3天"}'
+    assert last_json_object_prefer_keys_strict(
+        weak_only, ("itinerary", "daily_plans"), ("duration", "schedule", "title")
+    ) == {"title": "故宫", "duration": "3天"}
+
+    with pytest_module.raises(ValueError):
+        last_json_object_prefer_keys_strict(
+            full + '\n正式：{"notes', ("itinerary",), ("title",)
+        )
+    print("✓ 强键优先、弱键回退、末尾未闭合仍判截断")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -192,6 +262,9 @@ if __name__ == "__main__":
         test_last_object_with_keys_refuses_unparsable_tail()
         test_last_object_with_keys_still_picks_last_valid()
         test_strict_and_first_object_with_keys_helpers()
+        test_truncation_detected_before_result_keys()
+        test_balanced_explanation_after_result_is_not_truncation()
+        test_prefer_strong_keys_helper()
     finally:
         mp.undo()
     print("\n全部通过")

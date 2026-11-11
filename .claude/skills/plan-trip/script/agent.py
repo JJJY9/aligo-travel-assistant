@@ -16,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from utils.json_parser import (
     extract_json_from_async_response,
-    last_json_object_with_keys_strict,
+    last_json_object_prefer_keys_strict,
     robust_json_parse,
     starts_with_json_array,
 )
@@ -236,11 +236,14 @@ class ItineraryPlanningAgent(AgentBase):
                     f"（实际类型：{type(result).__name__}）"
                 )
 
-            # strict：末尾还有含行程字段但无法解析的对象（截断）时抛错，
-            # 不能继续沿用更早解析出的对象（可能只是 prompt 回显示例）
-            candidate = last_json_object_with_keys_strict(
+            # strict：末尾还有未闭合对象（截断）时抛错，不能继续沿用更早
+            # 解析出的对象（可能只是 prompt 回显示例）。强键（itinerary /
+            # daily_plans）优先于弱键（duration / schedule / title）：尾注里
+            # 的 {"duration": "3天", "note": ...} 不能顶掉完整行程
+            candidate = last_json_object_prefer_keys_strict(
                 text,
-                ("itinerary", "daily_plans", "duration", "schedule", "title"),
+                ("itinerary", "daily_plans"),
+                ("duration", "schedule", "title"),
             )
             if candidate is not None:
                 result = candidate
