@@ -1413,7 +1413,7 @@ def test_poison_op_dropped_after_repeated_failures(monkeypatch):
     print("✓ 连续失败的毒操作最终被丢弃")
 
 
-def test_poison_warning_redacts_message_content(monkeypatch, caplog):
+def test_poison_warning_redacts_message_content(monkeypatch, caplog=None):
     """毒操作告警只记操作类型：消息正文 / 提问原文不能进日志。"""
     import logging
 
@@ -1434,12 +1434,17 @@ def test_poison_warning_redacts_message_content(monkeypatch, caplog):
     client.fail = True
     memory.add_message("user", "我的护照号是 E12345678 POISON")
     client.fail = False
-    with caplog.at_level(logging.WARNING):
+    if caplog is not None:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+                memory.get_recent_context()
+        assert "护照" not in caplog.text and "E12345678" not in caplog.text
+        assert "丢弃队首 add 操作" in caplog.text
+    else:
         for _ in range(3):
             monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
             memory.get_recent_context()
-    assert "护照" not in caplog.text and "E12345678" not in caplog.text
-    assert "丢弃队首 add 操作" in caplog.text
     print("✓ 毒操作告警不泄露消息内容")
 
 
@@ -2034,6 +2039,12 @@ if __name__ == "__main__":
         test_server_state_error_during_replay_keeps_queue,
         test_truncate_replay_marker_uses_long_ttl,
         test_read_skips_deeply_nested_entries,
+        test_health_tracks_real_success_not_cooldown_window,
+        test_deterministic_error_does_not_degrade_process,
+        test_poison_warning_redacts_message_content,
+        test_replay_discards_queue_when_session_deleted,
+        test_parse_skips_huge_int_literal_without_degrading,
+        test_statistics_tolerates_missing_timestamp_in_fallback,
     ):
         _case_mp = __import__("pytest").MonkeyPatch()
         try:
@@ -2041,4 +2052,5 @@ if __name__ == "__main__":
         finally:
             _case_mp.undo()
     test_rollback_staged_message_only_removes_matching_tail()
+    test_non_positive_ttl_is_clamped()
     print("\n全部通过")

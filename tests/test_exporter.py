@@ -196,6 +196,28 @@ def test_backup_sanitize_nested_nonfinite_and_nul():
     print("✓ 备份清洗嵌套非有限数与 NUL（可被导入端接受）")
 
 
+def test_export_files_cleans_backup_before_write():
+    """export_files 接线必须使用 sanitize_backup_data：脏备份写出即可恢复。"""
+    from utils.user_import import parse_user_export
+
+    data = _base_data()
+    data["chat_history"] = [
+        {
+            "role": "assistant",
+            "content": '{"status":"completed","_meta":{"usage":{"calls":NaN}}}',
+            "timestamp": "t1",
+        },
+        {"role": "user", "content": "含\x00NUL", "timestamp": "t2"},
+    ]
+    out = Path(tempfile.mkdtemp())
+    export_files(data, out, stem="dirty")
+    payload = (out / "dirty.json").read_text(encoding="utf-8")
+    assert "NaN" not in payload and "\x00" not in payload
+    sections, errors = parse_user_export(payload)
+    assert not errors, errors
+    print("✓ export_files 写出前清洗嵌套 NaN / NUL")
+
+
 if __name__ == "__main__":
     test_markdown_escapes_cells_and_joins_lists()
     test_markdown_null_fields_and_statistics()
@@ -203,5 +225,6 @@ if __name__ == "__main__":
     test_markdown_chat_body_isolated_in_blockquote()
     test_markdown_strips_terminal_controls_everywhere()
     test_backup_sanitize_nested_nonfinite_and_nul()
+    test_export_files_cleans_backup_before_write()
     test_export_files_json_is_nan_safe_and_md_written()
     print("\n全部通过")

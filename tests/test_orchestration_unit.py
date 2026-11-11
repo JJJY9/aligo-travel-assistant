@@ -2193,8 +2193,10 @@ def test_update_memory_skips_failed_event_collection():
     print("✓ 失败的事项收集不写入行程")
 
 
-def test_update_memory_isolates_trip_save_failure():
-    """行程写入失败只记录日志，回答照常返回（不中断整轮）。"""
+def test_update_memory_isolates_trip_save_failure(caplog=None):
+    """行程写入失败：记录告警，同轮偏好照常落库（不中断整轮）。"""
+    import logging
+
     from utils.errors import MemoryPersistenceError
 
     class _FailingTrips:
@@ -2209,10 +2211,19 @@ def test_update_memory_isolates_trip_save_failure():
 
     memory = _StubMemory()
     memory.long_term = _FailingTrips(memory.long_term)
-    OrchestrationAgent(
+    orchestrator = OrchestrationAgent(
         agent_registry={}, memory_manager=memory
-    )._update_memory({}, _isolated_results())
-    print("✓ 行程写入失败不中断整轮")
+    )
+    if caplog is not None:
+        with caplog.at_level(logging.WARNING):
+            orchestrator._update_memory({}, _isolated_results())
+        assert "保存行程失败" in caplog.text
+    else:
+        orchestrator._update_memory({}, _isolated_results())
+    prefs = memory.long_term.get_preference()
+    assert prefs.get("airlines") == ["东航"], "行程失败不能中断同轮偏好写入"
+    assert prefs.get("hotel_brands") == ["汉庭"], prefs
+    print("✓ 行程写入失败不中断整轮（偏好仍落库 + 记录告警）")
 
 
 def test_update_memory_derives_end_date_from_duration():

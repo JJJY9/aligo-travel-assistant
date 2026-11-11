@@ -988,6 +988,8 @@ if __name__ == "__main__":
         mp.undo()
     test_parse_failure_is_user_facing_error()
     test_persist_guard_reaches_memory_write()
+    test_deferred_memory_committed_after_successful_persist()
+    test_deferred_memory_skipped_when_persist_vetoed()
     test_persist_veto_rolls_back_staged_question()
     test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()

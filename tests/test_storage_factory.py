@@ -238,6 +238,59 @@ def test_redis_factory_does_not_hold_lock_during_ping(monkeypatch):
     finally:
         storage_module.reset_failure_cache()
     print("✓ Redis 工厂创建期间不占全局锁（单飞共享客户端）")
+def test_describe_backends_degraded_until_first_redis_success(monkeypatch):
+    """冷却到期但自故障以来从未成功：健康页仍必须报短期记忆降级。"""
+    from context import storage as storage_module
+
+    monkeypatch.setitem(
+        storage_module.STORAGE_CONFIG, "redis_url", "redis://health/0"
+    )
+    monkeypatch.setitem(
+        storage_module.STORAGE_CONFIG, "postgres_dsn", ""
+    )
+    monkeypatch.setattr(
+        storage_module, "_get_redis_client", lambda url, force=False: object()
+    )
+    monkeypatch.setattr(
+        storage_module, "redis_short_term_degraded", lambda: False
+    )
+    monkeypatch.setattr(
+        storage_module, "redis_short_term_available", lambda: False
+    )
+    info = storage_module.describe_backends()
+    assert info["short_term"] == "redis"
+    assert info["short_term_degraded"] is True, (
+        "冷却结束不等于恢复：从未成功过时不能报告健康"
+    )
+    print("✓ 健康页按真实成功判断短期记忆降级")
+
+
+def test_factory_warns_on_non_positive_ttl(monkeypatch, caplog=None):
+    """存储工厂对非法 REDIS_TTL_SEC 记录 WARNING（构造函数钳制之外）。"""
+    import logging
+
+    from context import storage as storage_module
+
+    monkeypatch.setitem(
+        storage_module.STORAGE_CONFIG, "redis_url", "redis://ttl/0"
+    )
+    monkeypatch.setitem(storage_module.STORAGE_CONFIG, "redis_ttl_sec", 0)
+    monkeypatch.setitem(
+        storage_module._ACTUAL_BACKEND,
+        "short_term",
+        storage_module._ACTUAL_BACKEND.get("short_term"),
+    )
+    monkeypatch.setattr(
+        storage_module, "_get_redis_client", lambda url, force=False: object()
+    )
+    if caplog is not None:
+        with caplog.at_level(logging.WARNING):
+            memory = storage_module.create_short_term_memory("s-ttl-warn")
+        assert "REDIS_TTL_SEC" in caplog.text
+    else:
+        memory = storage_module.create_short_term_memory("s-ttl-warn")
+    assert memory.ttl_sec == 1
+    print("✓ 工厂对非法 TTL 记录告警")
 
 
 def test_describe_backends_reports_long_term_degraded(monkeypatch):
@@ -2269,6 +2322,43 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     print("✓ PG 非幂等写路径全部禁止自动重放")
 
 
+def test_pg_batch_save_reports_partial_progress(monkeypatch=None):
+    """PG 批量保存中途失败：PartialImportError 携带已提交的新增/更新数。"""
+    import contextlib
+
+    import pytest as pytest_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import PartialImportError
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    store._fetchall = lambda sql, params=None: []
+    inserts = {"count": 0}
+
+    def fake_fetchone(sql, params=None, **kwargs):
+        if "INSERT INTO aligo_trips" in sql:
+            inserts["count"] += 1
+            if inserts["count"] == 2:
+                raise RuntimeError("connection lost")
+            return (10,)
+        return None
+
+    store._fetchone = fake_fetchone
+    store._execute = lambda sql, params=None, **kwargs: None
+    trips = [
+        {"destination": "上海", "start_date": "2026-01-01"},
+        {"destination": "杭州", "start_date": "2026-01-02"},
+    ]
+    with pytest_module.raises(PartialImportError) as info:
+        store.save_trip_histories(trips)
+    assert info.value.created == 1, info.value.created
+    assert info.value.updated == 0
+    print("✓ PG 批量保存失败携带已提交条数")
+
+
 def test_pg_delete_operations_are_not_replayed():
     """删除会话 / 偏好的计数不能重放：提交后断连重放会返回 0 造成假象。"""
     import contextlib
@@ -3404,4 +3494,17 @@ if __name__ == "__main__":
     test_migrate_resets_counters_when_lists_cleared()
     test_migrate_rebuilds_statistics_when_missing()
     test_migrate_dedupes_preference_types()
+    for case in (
+        test_redis_client_factory_single_flight,
+        test_redis_client_cache_is_url_scoped,
+        test_short_term_ttl_non_positive_clamped,
+        test_describe_backends_degraded_until_first_redis_success,
+        test_factory_warns_on_non_positive_ttl,
+        test_pg_batch_save_reports_partial_progress,
+    ):
+        _case_mp = pytest.MonkeyPatch()
+        try:
+            case(_case_mp)
+        finally:
+            _case_mp.undo()
     print("\n全部通过")

@@ -924,7 +924,11 @@ def test_aware_timestamp_text_normalizes_backends():
     from utils.timestamps import to_aware
     from webapp.server import _aware_timestamp_text
 
+    import re
+
     naive = _aware_timestamp_text("2026-11-05T10:01:00")
+    assert naive != "2026-11-05T10:01:00", "naive 输入必须补上偏移"
+    assert re.search(r"[+-]\d{2}:\d{2}$", naive), naive
     assert to_aware(naive).tzinfo is not None
     assert to_aware(naive) == to_aware("2026-11-05T10:01:00")
     aware = _aware_timestamp_text("2026-11-05T10:01:00+00:00")
@@ -970,8 +974,13 @@ def test_session_updated_at_uses_max_timestamp():
     # 才能按绝对时刻换算到浏览器时区）
     from utils.timestamps import to_aware
 
+    import re
+
     updated = by_id["s1"]["updated_at"]
     assert updated.startswith("2026-11-05T10:01:00"), updated
+    assert re.search(r"[+-]\d{2}:\d{2}$", updated), (
+        "输出必须带时区偏移（恒等实现不能通过）"
+    )
     assert to_aware(updated) == to_aware("2026-11-05T10:01:00")
     assert to_aware(updated).tzinfo is not None
     assert sessions[0]["session_id"] == "s1", "按最大时间戳倒序排列"
@@ -4347,6 +4356,51 @@ def test_sessions_export_rejects_messages_without_session():
     finally:
         _cleanup(user_id)
     print("✓ 会话导出按渲染条数判断空")
+
+
+def test_api_export_cleans_dirty_backup():
+    """GET /api/export 的备份必须能被 /api/import 直接恢复（脏数据先清洗）。"""
+    from utils.user_import import parse_user_export
+
+    user_id = _unique_user("web_test_export_clean")
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            '{"status":"completed",'
+                            '"_meta":{"usage":{"calls":NaN}}}'
+                        ),
+                        "session_id": "s-dirty",
+                        "timestamp": "2026-01-01T00:00:00",
+                    },
+                    {
+                        "role": "user",
+                        "content": "含\x00NUL",
+                        "session_id": "s-dirty",
+                        "timestamp": "2026-01-01T00:00:01",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _client()
+    try:
+        response = client.get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 200, response.text
+        payload = response.text
+        assert "NaN" not in payload and "\x00" not in payload
+        sections, errors = parse_user_export(payload)
+        assert not errors, errors
+        assert len(sections["messages"]) == 2
+    finally:
+        _cleanup(user_id)
+    print("✓ /api/export 备份清洗脏数据后可恢复")
 
 
 def test_session_detail_tolerates_deep_meta():
