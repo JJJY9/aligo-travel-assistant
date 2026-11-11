@@ -856,7 +856,12 @@ function startEditUserNode(node, originalText) {
     setBusy(true);
     let mismatch = false;
     try {
-      mismatch = await deleteLastTurn(originalText);
+      const assistants = els.messages.querySelectorAll(".msg.assistant");
+      const lastAssistant = assistants[assistants.length - 1];
+      const turnId =
+        (lastAssistant && lastAssistant.dataset && lastAssistant.dataset.turnId) ||
+        "";
+      mismatch = await deleteLastTurn(originalText, turnId);
     } catch (error) {
       saving = false;
       input.dataset.saving = "0";
@@ -1032,16 +1037,20 @@ function formatUsage(usage, elapsed) {
   return parts.join(" · ");
 }
 
-async function deleteLastTurn(expect) {
+async function deleteLastTurn(expect, turnId = "") {
   // expect 放在 JSON body：CLI / 备份导入产生的长提问没有 4000 字上限，
   // 放进查询串会撞 FastAPI max_length（且 percent-encoding 会超过 h11
-  // 请求行上限）；DELETE + 查询串仍保留给外部 API 兼容
+  // 请求行上限）；DELETE + 查询串仍保留给外部 API 兼容。
+  // turn_id：服务端确认「最后一轮确实是本轮」才删除——另一标签页 / CLI
+  // 并发追加同文提问时，只按提问原文匹配会误删对方刚写入的问答
+  const body = { user_id: state.userId, expect };
+  if (turnId) body.turn_id = turnId;
   const result = await getJSON(
     `/api/sessions/${encodeURIComponent(state.sessionId)}/last-turn`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: state.userId, expect }),
+      body: JSON.stringify(body),
     },
   );
   return Boolean(result && result.mismatch);
@@ -1126,7 +1135,9 @@ async function regenerate(node, text) {
     setBusy(true);
     let mismatched = false;
     try {
-      mismatched = await deleteLastTurn(text);
+      const turnId =
+        (node && node.dataset && node.dataset.turnId) || "";
+      mismatched = await deleteLastTurn(text, turnId);
     } catch (error) {
       setBusy(false);
       toast(`重新生成失败：${error.message}`);

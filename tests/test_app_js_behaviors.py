@@ -121,6 +121,15 @@ def test_frontend_render_helpers():
     print("✓ 前端渲染 / 高亮 / 截断 / 偏好格式化基线")
 
 
+def test_delete_last_turn_sends_turn_id():
+    """删除最后一轮携带 client_turn_id：服务端据此精确匹配本轮。"""
+    data = _run_harness("deleteTurn")
+    assert data["turn_id"] == "turn-1", data
+    assert data["expect"] == "问题", data
+    assert data["removed"] is False, data
+    print("✓ 删除最后一轮请求携带 turn_id")
+
+
 def test_sse_stream_parsing_robustness():
     """CRLF 分帧、多行 data 与 data: null 都不能让流解析失效。"""
     events = _run_harness("sse")
