@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -109,6 +110,46 @@ def _as_text(value: Any) -> str:
                     return text
         return json.dumps(value, ensure_ascii=False)
     return str(value or "").strip()
+
+
+# 与 Web 手动写入 / 行程导入同一字段上限：超长字段会让面板编辑 422、
+# CSV 导出再导入整行跳过（这条行程永远无法再编辑或往返）
+_TRIP_FIELD_MAX_CHARS = 100
+
+
+def _trip_field(value: Any) -> str:
+    """行程文本字段：单行化并截断到 100 字（超长时告警）。"""
+    text = _as_text(value)
+    if len(text) > _TRIP_FIELD_MAX_CHARS:
+        logger.warning(
+            "行程字段超过 %s 字，已截断（防止面板无法编辑 / 往返失败）",
+            _TRIP_FIELD_MAX_CHARS,
+        )
+        text = text[:_TRIP_FIELD_MAX_CHARS]
+    return text
+
+
+def _trip_date(value: Any) -> str:
+    """行程日期的宽松归一：不可解析为真实日历日时返回空串。
+
+    模型偶尔输出 ``2026/03/11``、``2026-02-30``、带时间的 ISO 串或
+    「下周一」：原样落库后 trip_interval 的 strptime 失败直接跳过，该行程
+    在冲突提示 / 状态徽标 / 日历导出 / 统计中全部静默消失，且去重身份
+    与补零写法不同会重复建档。ISO 日期与 ISO 时间戳归一为日期，其余丢弃。
+    """
+    text = _as_text(value).strip()
+    if not text:
+        return ""
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        logger.warning("忽略无法解析的行程日期：%r", text[:40])
+        return ""
+    return parsed.date().isoformat()
 
 
 def _agent_error_text(data: dict[str, Any]) -> str:
@@ -663,8 +704,16 @@ class OrchestrationAgent(AgentBase):
         Returns:
             执行结果
         """
-        # 检查智能体是否注册
-        if agent_name not in self.agent_registry:
+        # 检查智能体是否注册。纯 dict 注册表（如 plan_trip_execution）只注册
+        # 标准名：模型输出的 Itinerary_Planning / plan-trip 等变体此前被误判
+        # 「未注册」，与同轮去重 / 依赖排序已按 canonical 名处理的口径不一致
+        canonical_name = canonical_agent_name(agent_name)
+        lookup_name = (
+            canonical_name
+            if canonical_name in self.agent_registry
+            else agent_name
+        )
+        if lookup_name not in self.agent_registry:
             logger.warning(f"Agent not registered: {agent_name}")
             error_message = f"智能体未注册: {agent_name}"
             return {
@@ -695,9 +744,9 @@ class OrchestrationAgent(AgentBase):
             # 约束，卡在导入 / 模型加载上也不会无限占用整轮与该用户的会话锁
             async def _load_and_reply() -> Any:
                 agent = await asyncio.get_running_loop().run_in_executor(
-                    _load_executor_for(agent_name),
+                    _load_executor_for(lookup_name),
                     self.agent_registry.__getitem__,
-                    agent_name,
+                    lookup_name,
                 )
 
                 async def _reply_once() -> Any:
@@ -891,10 +940,10 @@ class OrchestrationAgent(AgentBase):
                             if callable(append_pref):
                                 # 存储层在锁内重新读取再合并，避免覆盖本轮
                                 # LLM 调用期间用户在记忆面板写入的偏好
-                                merged = append_pref(pref_type, pref_value)
-                                logger.info(
-                                    f"Appended to {pref_type}: {pref_value}, total: {merged}"
-                                )
+                                append_pref(pref_type, pref_value)
+                                # 偏好值可能是证件号 / 住址等隐私内容：
+                                # 只记录类型（与存储层日志约定一致）
+                                logger.info("Appended to %s", pref_type)
                                 continue
                             # 旧实现 / 自定义后端没有原子追加时的兜底：与
                             # 持久化 / 上下文路径一致，用 merge_preference_value
@@ -907,10 +956,7 @@ class OrchestrationAgent(AgentBase):
                             self.memory_manager.long_term.save_preference(
                                 pref_type, merged_value
                             )
-                            logger.info(
-                                f"Appended to {pref_type}: {pref_value}, "
-                                f"total: {merged_value}"
-                            )
+                            logger.info("Appended to %s", pref_type)
                         else:
                             # 覆盖模式：直接保存新值
                             self.memory_manager.long_term.save_preference(pref_type, pref_value)
@@ -950,11 +996,11 @@ class OrchestrationAgent(AgentBase):
                     # 从 event_data 获取行程信息；模型可能给出列表（多目的地）
                     # 或数字，统一转成单行文本再落库（不可哈希值会让统计
                     # 更新抛 TypeError，整轮回复作废）
-                    origin = _as_text(event_data.get("origin"))
-                    destination = _as_text(event_data.get("destination"))
-                    start_date = _as_text(event_data.get("start_date"))
-                    end_date = _as_text(event_data.get("end_date"))
-                    purpose = _as_text(event_data.get("trip_purpose")) or "旅游"
+                    origin = _trip_field(event_data.get("origin"))
+                    destination = _trip_field(event_data.get("destination"))
+                    start_date = _trip_date(event_data.get("start_date"))
+                    end_date = _trip_date(event_data.get("end_date"))
+                    purpose = _trip_field(event_data.get("trip_purpose")) or "旅游"
 
                     # 保存到长期记忆：必须有出发日期——没有日期的行程无法参与
                     # 去重（_find_same_trip 对缺 start_date 直接跳过），复述或
