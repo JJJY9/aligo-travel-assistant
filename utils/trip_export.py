@@ -332,7 +332,8 @@ def render_trips_html(trips: list[dict[str, Any]], user_id: str) -> str:
   h1 {{ font-size: 20px; margin: 0 0 4px; }}
   .meta {{ color: #7b8d93; font-size: 12.5px; margin-bottom: 16px; }}
   table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e9e8; }}
+  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e9e8;
+    overflow-wrap: anywhere; word-break: break-word; }}
   th {{ font-size: 12.5px; color: #7b8d93; font-weight: 600; }}
   .empty {{ color: #7b8d93; }}
   @media print {{
