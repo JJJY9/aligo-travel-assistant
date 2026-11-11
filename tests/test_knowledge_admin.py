@@ -1461,13 +1461,12 @@ def test_list_and_export_hold_write_lock(monkeypatch):
             self.entries = 0
             self.exits = 0
 
-        def __enter__(self):
+        def acquire(self, timeout=None):
             self.entries += 1
-            return self
+            return True
 
-        def __exit__(self, *exc_info):
+        def release(self):
             self.exits += 1
-            return False
 
     lock = _TrackingLock()
     monkeypatch.setattr(knowledge_admin, "_WRITE_LOCK", lock)
@@ -2889,6 +2888,27 @@ def test_regroup_caps_problem_details():
     print("✓ 坏组明细有界且坏片总数准确")
 
 
+def test_read_lock_times_out_when_write_in_progress():
+    """只读路径拿不到写锁时快速失败，不能无限期阻塞请求线程。"""
+    import time as time_module
+
+    assert knowledge_admin._WRITE_LOCK.acquire(timeout=1)
+    try:
+        started = time_module.perf_counter()
+        with pytest.raises(knowledge_admin.KnowledgeBusyError, match="正在写入"):
+            with knowledge_admin._read_lock(timeout=0.05):
+                pass  # pragma: no cover - 不应进入
+        elapsed = time_module.perf_counter() - started
+        assert elapsed < 0.5, elapsed
+    finally:
+        knowledge_admin._WRITE_LOCK.release()
+
+    # 锁释放后同一个上下文可正常使用
+    with knowledge_admin._read_lock(timeout=0.5):
+        pass
+    print("✓ 只读路径写锁有界等待")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
@@ -2898,6 +2918,7 @@ if __name__ == "__main__":
     test_regroup_rejects_duplicate_part_numbers()
     test_regroup_bounds_missing_part_detail()
     test_regroup_caps_problem_details()
+    test_read_lock_times_out_when_write_in_progress()
     test_document_info_parses_parts_and_group()
     for case in (
         test_list_documents_parses_sorts_and_filters,

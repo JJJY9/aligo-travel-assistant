@@ -57,6 +57,24 @@ METADATA_VALUE_MAX_CHARS = 200
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
 _DERIVED_CHUNK_KEYS = {"part", "parts", "group"}
 _WRITE_LOCK = threading.Lock()
+# 只读路径等待写锁的上限：导入 / 更新会在锁内逐条嵌入（分钟级甚至更久），
+# Web 请求线程无超时地排队会把 anyio 共享线程池占满、冻结所有同步接口。
+_READ_LOCK_TIMEOUT_SEC = 0.5
+
+
+class KnowledgeBusyError(RuntimeError):
+    """知识库写锁在限时内未释放（导入 / 更新正在进行）。"""
+
+
+@contextlib.contextmanager
+def _read_lock(timeout: float = _READ_LOCK_TIMEOUT_SEC):
+    """只读路径的有界写锁：拿不到立即失败，由调用方快速返回「正在写入」。"""
+    if not _WRITE_LOCK.acquire(timeout=timeout):
+        raise KnowledgeBusyError("知识库正在写入（导入进行中），请稍后重试")
+    try:
+        yield
+    finally:
+        _WRITE_LOCK.release()
 _agent: Any = None
 # 检索路径专用的只读 Agent（create_if_missing=False）：语义检索不会在
 # 「库存在但集合缺失」时静默创建空集合、把未初始化伪装成 0 结果
@@ -159,7 +177,7 @@ def list_documents(
     # Milvus Lite 的 load_collection 会阻塞等待加载完成，不应占用写锁
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    with _WRITE_LOCK:
+    with _read_lock():
         return _list_documents(client, limit, offset, query, category)
 
 
@@ -604,7 +622,7 @@ def export_documents() -> list[dict[str, Any]]:
     # 集合加载放在写锁外（load_collection 会阻塞等待加载完成）
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    with _WRITE_LOCK:
+    with _read_lock():
         return _export_documents(client)
 
 
@@ -849,7 +867,7 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    with _WRITE_LOCK:
+    with _read_lock():
         parts, group = _document_info(client, int(doc_id))
         if parts == 0:
             return None
@@ -1712,7 +1730,7 @@ def get_document(doc_id: int) -> dict[str, Any] | None:
     """按 id 读取单个片段（含完整 metadata）；不存在返回 None。"""
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    with _WRITE_LOCK:
+    with _read_lock():
         rows = client.query(
             collection_name=COLLECTION_NAME,
             filter=f"id == {int(doc_id)}",

@@ -446,7 +446,9 @@ def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
     """检查 RAG 知识库是否已初始化（复用 knowledge_status，避免重复实现）。"""
     from utils.knowledge_stats import knowledge_status
 
-    status = knowledge_status(db_path)
+    # 写锁有界等待：导入进行中时快速返回「正在写入」而不是让探针线程
+    # 无限期挂在写锁上（Web /api/doctor 会并发触发本检查）
+    status = knowledge_status(db_path, lock_timeout=0.5)
     if not status["available"]:
         reason = str(status.get("reason", "未知原因"))
         if reason == "知识库未初始化":

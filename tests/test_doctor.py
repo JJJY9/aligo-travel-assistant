@@ -282,7 +282,7 @@ def test_knowledge_base_reason_variants(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats,
         "knowledge_status",
-        lambda path=None: _status("集合不存在"),
+        lambda path=None, **kwargs: _status("集合不存在"),
     )
     result = check_knowledge_base(Path("x"))
     assert result.status == STATUS_WARN and "缺少知识集合" in result.detail
@@ -290,7 +290,7 @@ def test_knowledge_base_reason_variants(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats,
         "knowledge_status",
-        lambda path=None: _status("连接被拒绝" * 60),
+        lambda path=None, **kwargs: _status("连接被拒绝" * 60),
     )
     result = check_knowledge_base(Path("x"))
     assert result.status == STATUS_WARN
@@ -300,7 +300,7 @@ def test_knowledge_base_reason_variants(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats,
         "knowledge_status",
-        lambda path=None: _status(None, 0),
+        lambda path=None, **kwargs: _status(None, 0),
     )
     result = check_knowledge_base(Path("x"))
     assert result.status == STATUS_WARN and "知识集合为空" in result.detail
@@ -308,7 +308,7 @@ def test_knowledge_base_reason_variants(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats,
         "knowledge_status",
-        lambda path=None: _status(None, 3),
+        lambda path=None, **kwargs: _status(None, 3),
     )
     result = check_knowledge_base(Path("x"))
     assert result.status == STATUS_OK and "3 个知识片段" in result.detail
@@ -376,7 +376,7 @@ def test_knowledge_base_dimension_mismatch_warns(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats,
         "knowledge_status",
-        lambda path=None: {
+        lambda path=None, **kwargs: {
             "collection": "c",
             "available": True,
             "documents": 3,
@@ -424,7 +424,7 @@ def test_knowledge_base_config_dimension_mismatch_warns(monkeypatch):
         monkeypatch.setattr(
             knowledge_stats,
             "knowledge_status",
-            lambda path=None: {
+            lambda path=None, **kwargs: {
                 "collection": "c",
                 "available": True,
                 "documents": 3,
