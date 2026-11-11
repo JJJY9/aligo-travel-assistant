@@ -1384,6 +1384,75 @@ def test_sessions_query_matches_rendered_assistant_content(monkeypatch):
     assert code == 0 and "没有匹配" in out, "原始 JSON 字段名不应算命中"
     print("✓ sessions --query 匹配渲染后的助手正文")
 
+def test_sessions_export_counts_only_rendered_messages(monkeypatch, tmp_path):
+    """消息数按实际渲染条数统计（无 session_id 的旧消息不计入、不导出）。"""
+    from pathlib import Path
+
+    fake = _sessions_store()
+    fake.messages.append(_message("user", "旧版无会话消息", ""))
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    buf = io.StringIO()
+    path = Path(tmp_path) / "all.md"
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_sessions_export_standalone("u1", str(path), force=True)
+    assert code == 0, buf.getvalue()
+    out = buf.getvalue()
+    assert "已导出 3 个会话" in out, out
+    assert "（6 条消息）" in out, out
+    content = path.read_text(encoding="utf-8")
+    assert "旧版无会话消息" not in content
+    print("✓ sessions-export 消息数与导出内容一致")
+
+
+def test_sessions_export_without_sessions_returns_1(monkeypatch, tmp_path):
+    """只有无 session_id 的旧消息：不写空文件、返回 1（README 约定）。"""
+    from pathlib import Path
+
+    fake = _FakeStore([_message("user", "旧版无会话消息", "")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    buf = io.StringIO()
+    path = Path(tmp_path) / "empty.md"
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_sessions_export_standalone("u1", str(path), force=True)
+    assert code == 1, buf.getvalue()
+    assert "没有可导出的会话" in buf.getvalue()
+    assert not path.exists()
+    print("✓ 只有无会话旧消息时返回 1 且不写空文件")
+
+
+def test_session_export_stdout_strips_terminal_controls(monkeypatch):
+    """单会话 --stdout 不把存储内容里的 ESC / OSC 序列送达终端。"""
+    fake = _FakeStore(
+        [
+            _message("user", "before\x1b]52;c;SGVsbG8=\x07after", "s-esc"),
+            _message("assistant", "回答", "s-esc"),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    code, out = _run_export("u1", "s-esc", to_stdout=True)
+    assert code == 0
+    assert "\x1b]" not in out
+    assert "before" in out and "after" in out
+    print("✓ session-export --stdout 剥离终端控制序列")
+
+
+def test_sessions_export_stdout_strips_terminal_controls(monkeypatch):
+    """全部会话 --stdout 同样剥离终端控制序列。"""
+    fake = _FakeStore(
+        [
+            _message("user", "before\x1b]52;c;SGVsbG8=\x07after", "s-esc"),
+            _message("assistant", "回答", "s-esc"),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_sessions_export_standalone("u1", to_stdout=True)
+    assert code == 0
+    assert "\x1b]" not in buf.getvalue()
+    print("✓ sessions-export --stdout 剥离终端控制序列")
+
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
     test_session_export_flag_parsing()

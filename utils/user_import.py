@@ -17,6 +17,7 @@ from typing import Any
 
 from utils.timestamps import chronological_key, localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
+import os
 
 _MAX_PREFERENCES = 200
 _MAX_TRIPS = 5000
@@ -326,7 +327,18 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     knowledge = backup.get("knowledge")
     if isinstance(knowledge, list) and len(knowledge) > _MAX_KNOWLEDGE:
         return f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}"
-    size = len(json.dumps(backup, ensure_ascii=False).encode("utf-8"))
+    # 与导出实际写出的格式对齐：孤立代理项先转义（否则 encode 直接抛
+    # UnicodeEncodeError），体积按 indent=2（以及 Windows 换行翻译）估算——
+    # 紧凑 JSON 的估算会让 1.3-1.6 倍体积的备份通过自检、写盘后却被导入侧
+    # 「超过 50 MB」拒绝，导出器产出自己声明可恢复、实际无法导入的备份
+    from utils.json_safe import sanitize_json
+
+    serialized = json.dumps(
+        sanitize_json(backup), ensure_ascii=False, indent=2
+    )
+    size = len(serialized.encode("utf-8"))
+    if os.linesep != "\n":
+        size += serialized.count("\n")
     if size > MAX_BACKUP_BYTES:
         return (
             f"约 {size / (1024 * 1024):.1f} MB 超过导入上限 "

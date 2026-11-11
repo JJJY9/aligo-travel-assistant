@@ -4065,7 +4065,7 @@ def run_session_export_standalone(
         text = "\n".join(lines)
 
     if to_stdout:
-        _print_stdout(text)
+        _print_stdout(strip_terminal_controls(text))
         return 0
 
     suffix = ".html" if html else ".md"
@@ -4133,9 +4133,15 @@ def run_sessions_export_standalone(
     messages = sanitize_json(messages)
     titles = sanitize_json(titles)
 
-    if not messages:
+    from utils.session_markdown import group_sessions
+
+    grouped = group_sessions(messages)
+    if not grouped:
+        # 旧版本写入的消息没有 session_id：渲染器会跳过它们，不能写出
+        # 「会话数 0」的空文件并谎报成功（README 约定无会话返回 1）
         print(f"用户 {user_id}：没有可导出的会话")
         return 1
+    exported_messages = sum(len(items) for _, items in grouped)
 
     if html:
         from utils.session_html import render_all_sessions_html
@@ -4149,7 +4155,9 @@ def run_sessions_export_standalone(
         suffix = ".md"
 
     if to_stdout:
-        _print_stdout(text)
+        # --stdout 也要经过终端清洗：正文里的 ESC / OSC 序列会在支持的
+        # 终端里写剪贴板 / 清屏 / 伪造链接（交互 REPL 已统一处理）
+        _print_stdout(strip_terminal_controls(text))
         return 0
 
     safe_user = _safe_export_user(user_id)
@@ -4167,7 +4175,7 @@ def run_sessions_export_standalone(
     except OSError as exc:
         print(f"写入失败：{exc}")
         return 1
-    print(f"已导出 {count} 个会话到 {path}（{len(messages)} 条消息）")
+    print(f"已导出 {count} 个会话到 {path}（{exported_messages} 条消息）")
     return 0
 
 

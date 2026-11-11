@@ -108,6 +108,37 @@ def test_backup_limit_problem_checks_counts_and_size(monkeypatch):
     print("✓ backup_limit_problem 条数与体积上限")
 
 
+
+def test_backup_limit_problem_matches_export_indent_and_surrogates(monkeypatch):
+    """体积按导出实际写出的 indent=2 估算；孤立代理项不再让检查崩溃。"""
+    import json as json_module
+
+    from utils import user_import as module
+
+    messages = [
+        {"role": "user", "content": "x" * 50, "session_id": "s"} for _ in range(50)
+    ]
+    backup = {"chat_history": messages}
+    compact = len(
+        json_module.dumps(backup, ensure_ascii=False).encode("utf-8")
+    )
+    indented = len(
+        json_module.dumps(backup, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+    assert indented > compact
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", compact + 1)
+    assert module.backup_limit_problem(backup) is not None, "缩进后体积超限必须判出"
+
+    # 孤立代理项（旧数据）：先转义再估算，不能抛 UnicodeEncodeError
+    surrogate = "bad " + chr(92) + "ud800"
+    assert (
+        module.backup_limit_problem(
+            {"chat_history": [{"role": "assistant", "content": surrogate}]}
+        )
+        is None
+    )
+    print("✓ backup_limit_problem 与导出体积口径一致且耐受孤立代理项")
+
 def test_parse_export_rejects_invalid():
     sections, errors = parse_user_export("not json")
     assert sections == {} and "JSON 解析失败" in errors[0]
