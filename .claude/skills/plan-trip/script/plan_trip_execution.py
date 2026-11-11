@@ -7,14 +7,12 @@ import json
 import sys
 from pathlib import Path
 
-# Add project root to sys.path
-project_root = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-# Also add parent directory to ensure module imports work
-parent_dir = Path(__file__).parent.parent.parent.parent
-if str(parent_dir) not in sys.path:
-    sys.path.insert(0, str(parent_dir))
+# Add project root to sys.path：脚本位于 .claude/skills/plan-trip/script/，
+# 仓库根是第 5 层父目录（parents[0] 是 script 目录）；此前后退 4 层得到的是
+# .claude，直接运行脚本会在 import config 处 ModuleNotFoundError
+project_root = Path(__file__).resolve().parents[4]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 from agentscope.message import Msg
 
@@ -67,8 +65,18 @@ def _extract_itinerary(result_data):
             continue
         if agent_result.get("agent_name") != "itinerary_planning":
             continue
+        # 该条被判失败时 data 里仍可能有兜底的「行程规划/待完善」空行程：
+        # 只看 itinerary 真值会把失败包装成成功（main 打印「规划完成」并
+        # 渲染空行程），必须按条目状态过滤。缺 status 的旧形状按成功兼容
+        status = str(agent_result.get("status") or "success").lower()
+        if status != "success":
+            continue
         data = agent_result.get("data")
-        if isinstance(data, dict) and data.get("itinerary"):
+        if (
+            isinstance(data, dict)
+            and data.get("itinerary")
+            and not data.get("error")
+        ):
             return data
     return None
 
