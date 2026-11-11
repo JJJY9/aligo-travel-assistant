@@ -642,7 +642,8 @@ def test_postgres_long_term_memory():
         assert trips[0]["trip_id"] == "trip_1"
         assert trips[0]["session_id"] == "sess-pg"
         assert trips[1]["session_id"] is None
-        assert memory.get_frequent_destinations(1) == [("上海", 2)]
+        # 无出发日期的行程不计入常去目的地（与 JSON 保存 / 迁移口径一致）
+        assert memory.get_frequent_destinations(1) == [("上海", 1)]
 
         # 同路线 + 同起止日期的重复保存：更新会话关联，不新增记录
         dedup_id = memory.save_trip_history(
@@ -691,11 +692,12 @@ def test_postgres_long_term_memory():
         assert stats["total_trips"] == 2
         assert stats["total_messages"] == 3
         assert stats["total_queries"] == 2
-        assert stats["frequent_destinations"] == {"上海": 2}
+        assert stats["frequent_destinations"] == {"上海": 1}
 
         assert memory.delete_trip("trip_1") is True
         assert memory.delete_trip("trip_1") is False
-        assert memory.get_frequent_destinations(1) == [("上海", 1)]
+        # 仅剩无日期行程：与 JSON 同口径不计入常去目的地
+        assert memory.get_frequent_destinations(1) == []
         memory.save_trip_history({"origin": "上海", "destination": "杭州", "purpose": "出差"})
         newest = memory.get_trip_history(1)[0]
         assert newest["trip_id"] == "trip_3", "删除后新增按现有最大 id（trip_2）递增"
