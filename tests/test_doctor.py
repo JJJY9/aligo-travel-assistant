@@ -552,6 +552,33 @@ def test_report_and_summary_statuses():
     assert table.row_count == 5
 
 
+def test_doctor_redacts_base_url_credentials(monkeypatch):
+    """大模型配置与连通性详情不回显 base_url 的凭据 / 查询串。"""
+    import asyncio
+
+    import utils.doctor as doctor_module
+    import utils.llm_resilience as resilience_module
+    from config import LLM_CONFIG
+
+    monkeypatch.setitem(
+        LLM_CONFIG,
+        "base_url",
+        "https://user:sk-secret@gw.example.com/v1?api_key=sk-secret",
+    )
+    monkeypatch.setitem(LLM_CONFIG, "api_key", "sk-test")
+    config_result = doctor_module.check_config()
+    assert "sk-secret" not in config_result.detail, config_result.detail
+    assert "user:" not in config_result.detail, config_result.detail
+
+    async def _fail(**kwargs):
+        return False, "connect https://user:sk-secret@gw.example.com/v1?x=1 failed"
+
+    monkeypatch.setattr(resilience_module, "run_health_check", _fail)
+    result = asyncio.run(doctor_module.check_llm_connectivity())
+    assert "sk-secret" not in result.detail, result.detail
+    print("✓ doctor 的 base_url / 连通性错误已脱敏")
+
+
 def test_report_table_escapes_markup_and_controls():
     """详情里的 [/red] 与 ESC 序列不能让整张表渲染失败或注入终端。"""
     from rich.console import Console

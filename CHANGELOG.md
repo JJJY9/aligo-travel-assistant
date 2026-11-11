@@ -49,6 +49,10 @@
 - JSON 长期记忆迁移的统计一致性：`chat_history` / `trip_history` 整体类型损坏被清空、或统计段整体缺失时，此前只把计数器补 0（或保留旧值）而不按列表重建——面板同时显示「历史 0 条」与「消息 120 / 上海 ×9」。现在列表被清空 / 丢弃坏条目时同步重算 `total_messages` / `total_trips` 并按当前行程重建 `frequent_destinations`；统计段缺失时按现有列表重建；同一 type 的重复偏好迁移时保留最后一条（此前写路径只更新第一条、`get_preference()` 取最后一条，覆盖后仍读到旧值）
 - 出行天数按日期区间并集：同一长差旅中顺路加一趟、历史重复行程等重叠数据的同一天此前被重复计数（面板 / `cli stats` 的出行天数大于实际离家天数）；现在按并集统计。到访城市与 `statistics.frequent_destinations` 口径对齐：两者都只统计出发日期可解析的行程（此前「常去目的地」把日期非法的僵尸行程也算成到访城市，而概览 `cities=0` 忽略它们）
 - `/api/status` 用量缓存跨午夜失效：缓存指纹加入当天日期——进程跨过午夜后历史未变时，此前继续返回前一天的近 7 天窗口（把第 8 天的 bucket 算进 7 天合计），直到产生新消息才重建
+- 运行时依赖缺失时 CLI 仍能启动诊断命令：`except` 分支把 `Console` 置为 None 后，模块级 `class _SanitizedConsole(Console)` 仍在导入阶段执行，未装 rich / agentscope 的机器运行 `python cli.py doctor` 直接 `TypeError: NoneType takes no arguments`——恰好在最需要自检的场景崩溃。现在仅在 Console 可用时定义子类，否则用占位类；doctor / health / skills / stats 等一次性命令在依赖缺失时正常启动并报告缺失项
+- 一次性命令 Ctrl-C 干净退出：dispatch 没有 KeyboardInterrupt 处理，去重 / 导入 / stats 读取大历史时按 Ctrl-C 直接打印 traceback（去重已删除的部分也不再汇总输出）。现在 `main()` 包装为捕获 KeyboardInterrupt 后以 130 退出（交互 REPL 的 Ctrl-C 语义不变）
+- doctor 的 base_url 与连通性错误脱敏：`大模型配置` 详情原样回显 `LLM_BASE_URL`（含 userinfo / 查询串凭据），LLM 连通性失败消息也未脱敏，与 Web `/api/doctor` 的脱敏输出不一致；现在两处都经 `redact_secret` 处理
+- `eval` 对「集合不存在」按故障退出：数据库文件存在但集合缺失（初始化中断）此前与「未初始化」一起当作成功跳过并退出 0——`python cli.py eval || exit 1` 质量门禁直接放行，而同一状态 Web 评测返回 503、doctor 提示需要重新初始化。现在仅「未初始化」跳过（0），集合缺失按失败返回 1（`--json` 为 ok:false）
 - 备份恢复保持消息顺序：此前按时间戳全局重排，缺失 / 非法时间戳的消息被排到最后——备份里「无时间戳提问 + 有时间戳回答」恢复后会话先显示回答再显示提问。现在按备份顺序写入（导出按存储顺序写出，会话内本就有序），逐会话顺序原样追加
 - 备份恢复保留行程 `trip_id` 与 `timestamp`：此前解析时丢弃这两个字段，恢复后全部重新编号并把创建时间写成恢复时刻；现在原样保留（编号水位按还原的旧编号抬高，后续新行程从 `trip_N+1` 继续），`drop_sessions` 显式清除的会话关联也会写回（只清空关联，行程本身保留）
 - CLI 会话导出的计数与退出码：`sessions-export` 的提示消息此前按读到的全部消息计数，而渲染器会跳过没有 `session_id` 的旧版消息——提示「3 条消息」实际只写出 1 条、只有旧消息时还写出「会话数 0」的空文件并退出 0。现在按实际渲染条数统计，没有任何会话时提示「没有可导出的会话」并返回 1（README 约定）
