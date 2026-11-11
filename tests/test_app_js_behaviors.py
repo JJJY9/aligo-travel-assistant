@@ -408,6 +408,39 @@ def test_reconcile_confirms_after_open_session():
     print("✓ 停止对账按最终确认结果判定是否保存")
 
 
+def test_retry_checks_turn_persisted_first():
+    """重试前按 client_turn_id 确认已落库：已保存则刷新历史、不再重发。"""
+    data = _run_harness("retryGuard")
+    persisted = data["persisted"]
+    assert persisted["sent"] == [], persisted
+    assert persisted["opened"] == 1 and persisted["removed"] == 1, persisted
+    assert any("已保存" in item for item in persisted["toasts"]), persisted
+
+    missing = data["missing"]
+    assert missing["sent"] == ["你好"], missing
+    assert missing["opened"] == 0, missing
+    print("✓ 重试前检查本轮是否已落库（避免重复问答）")
+
+
+def test_session_refresh_keeps_expanded_list():
+    """刷新会话列表不能把「加载更多」展开的条数截回单页上限。"""
+    data = _run_harness("sessionRefresh")
+    assert data["count"] == 250, data
+    assert data["offset"] == 250, data
+    assert "limit=200" in data["first_url"], data
+    assert "offset=200" in data["second_url"], data
+    print("✓ 会话列表刷新按原数量续页合并")
+
+
+def test_open_session_confirms_pending_edit():
+    """切换会话时正在编辑的草稿要确认；取消则不发请求。"""
+    data = _run_harness("editGuard")
+    assert data["blocked"]["asked"] == 1, data
+    assert data["blocked"]["queued"] == 0, data
+    assert data["allowedQueued"] == 1, data
+    print("✓ 切换会话前确认丢弃编辑草稿")
+
+
 def test_chat_done_persisted_signal():
     """落库被墓碑否决：done(persisted=false) 标记提问为临时并切回新对话。"""
     data = _run_harness("chatPersisted")
