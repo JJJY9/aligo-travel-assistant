@@ -403,6 +403,38 @@ def test_trip_add_dedupes_same_route_and_dates(monkeypatch):
     print("✓ trip-add 同路线同日期更新既有记录")
 
 
+def test_trip_add_without_purpose_preserves_existing(monkeypatch):
+    """未提供 --purpose 时不上报目的字段：命中既有行程保留用户改过的目的。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    store = LongTermMemory("u-trip-purpose", tempfile.mkdtemp())
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, _ = _run_trip_add(
+        "u-trip-purpose", "北京", "上海", "2026-12-01", None, "会议"
+    )
+    assert code == 0
+    code, out = _run_trip_add("u-trip-purpose", "北京", "上海", "2026-12-01")
+    assert code == 0 and "已更新行程" in out
+    trips = store.get_trip_history(limit=None)
+    assert len(trips) == 1
+    assert trips[0]["purpose"] == "会议", "未提交的目的不能被默认值覆盖"
+    # 新建行程未提供目的时也不臆造字段（展示层有「出行」兜底）
+    code, _ = _run_trip_add("u-trip-purpose", "北京", "杭州", "2026-12-05")
+    assert code == 0
+    created = [
+        trip
+        for trip in store.get_trip_history(limit=None)
+        if trip.get("destination") == "杭州"
+    ]
+    assert len(created) == 1
+    assert "purpose" not in created[0]
+    print("✓ trip-add 未提供目的时保留既有目的 / 不臆造字段")
+
+
 def test_trip_add_validation_errors(monkeypatch):
     store = _AddStore([])
     monkeypatch.setattr(
@@ -529,7 +561,7 @@ def test_trip_add_args_and_dispatch(monkeypatch):
     monkeypatch.setattr(
         cli,
         "run_trip_add_standalone",
-        lambda user_id, origin, destination, start, end=None, purpose="出差", as_json=False: (
+        lambda user_id, origin, destination, start, end=None, purpose=None, as_json=False: (
             calls.append((user_id, origin, destination, start, end, purpose, as_json))
             or 0
         ),
@@ -551,7 +583,7 @@ def test_trip_add_args_and_dispatch(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 0
-    assert calls[-1] == ("u1", "", "上海", "2026-12-01", None, "出差", True)
+    assert calls[-1] == ("u1", "", "上海", "2026-12-01", None, None, True)
 
     for argv in (
         ["cli.py", "trip-add"],
@@ -1186,6 +1218,7 @@ if __name__ == "__main__":
         test_trip_add_saves_and_reports_conflicts,
         test_trip_add_json_output,
         test_trip_add_dedupes_same_route_and_dates,
+        test_trip_add_without_purpose_preserves_existing,
         test_trip_add_validation_errors,
         test_trip_add_rejects_oversized_fields,
         test_trip_add_store_failures,

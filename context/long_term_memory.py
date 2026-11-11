@@ -1091,16 +1091,16 @@ class LongTermMemory:
         语义与单条保存一致（同路线 + 同起止日期更新既有记录、未提供的
         目的 / 会话保留原值、删除后的编号不复用）。返回 ``(新增数, 更新数)``。
         """
-        from utils.trip_import import normalize_identity_date
+        from utils.trip_import import normalize_identity_date, normalize_identity_text
 
         def _identity(trip: dict[str, Any]) -> tuple[str, str, str, str] | None:
             destination = trip.get("destination")
             start = normalize_identity_date(trip.get("start_date"))
             if not destination or not start:
                 return None
-            origin = str(trip.get("origin") or "")
+            origin = normalize_identity_text(trip.get("origin"))
             end = normalize_identity_date(trip.get("end_date")) or start
-            return (destination, origin, start, end)
+            return (normalize_identity_text(destination), origin, start, end)
 
         history = self.data.setdefault("trip_history", [])
         stats = self.data.setdefault("statistics", {})
@@ -1163,18 +1163,19 @@ class LongTermMemory:
 
     def _find_same_trip(self, trip_info: dict[str, Any]) -> dict[str, Any] | None:
         """查找同路线、同起止日期的既有行程（无出发日期时不参与去重）。"""
-        from utils.trip_import import normalize_identity_date
+        from utils.trip_import import normalize_identity_date, normalize_identity_text
 
         destination = trip_info.get("destination")
         start_date = normalize_identity_date(trip_info.get("start_date"))
         if not destination or not start_date:
             return None
-        origin = str(trip_info.get("origin") or "")
+        destination_key = normalize_identity_text(destination)
+        origin = normalize_identity_text(trip_info.get("origin"))
         end_date = normalize_identity_date(trip_info.get("end_date")) or start_date
         for trip in self.data.get("trip_history", []):
             if (
-                trip.get("destination") == destination
-                and str(trip.get("origin") or "") == origin
+                normalize_identity_text(trip.get("destination")) == destination_key
+                and normalize_identity_text(trip.get("origin")) == origin
                 and normalize_identity_date(trip.get("start_date")) == start_date
                 and (
                     normalize_identity_date(trip.get("end_date"))

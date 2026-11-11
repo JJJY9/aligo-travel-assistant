@@ -61,26 +61,37 @@ def find_saved_trip(
     """在重新读取的行程列表里定位「本次保存的那条」。
 
     历史数据可能存在多条同 trip_id 的记录：按 id 整条排除会连带隐藏其它
-    行程的真实重叠，按「id + 关键字段」匹配才是精确的。
+    行程的真实重叠，按「id + 关键字段」匹配才是精确的。关键字段按存储去重
+    同一口径归一（未补零日期 / CRLF 换行），否则命中未补零的历史行时定位
+    不到本次记录，刚保存的行程会被报成与自己重叠。
     """
+    from utils.trip_export import normalize_identity_date, normalize_identity_text
+
+    want_start = normalize_identity_date(record.get("start_date"))
+    want_end = (
+        normalize_identity_date(record.get("end_date")) or want_start
+    )
+    want_destination = normalize_identity_text(record.get("destination"))
+    want_origin = normalize_identity_text(record.get("origin"))
     for trip in trips:
+        if str(trip.get("trip_id")) != str(trip_id):
+            continue
+        trip_start = normalize_identity_date(trip.get("start_date"))
+        trip_end = normalize_identity_date(trip.get("end_date")) or trip_start
         if (
-            str(trip.get("trip_id")) == str(trip_id)
-            and str(trip.get("start_date") or "")
-            == str(record.get("start_date") or "")
-            and str(trip.get("end_date") or "")
-            == str(record.get("end_date") or "")
-            and str(trip.get("destination") or "")
-            == str(record.get("destination") or "")
-            and (
-                # 调用方未提供 origin 时保持旧口径（不参与匹配）；提供时
-                # 用于区分「同 id / 同日 / 同目的地但出发地不同」的历史副本
-                "origin" not in record
-                or str(trip.get("origin") or "")
-                == str(record.get("origin") or "")
-            )
+            trip_start != want_start
+            or trip_end != want_end
+            or normalize_identity_text(trip.get("destination")) != want_destination
         ):
-            return trip
+            continue
+        if (
+            # 调用方未提供 origin 时保持旧口径（不参与匹配）；提供时
+            # 用于区分「同 id / 同日 / 同目的地但出发地不同」的历史副本
+            "origin" in record
+            and normalize_identity_text(trip.get("origin")) != want_origin
+        ):
+            continue
+        return trip
     return None
 
 

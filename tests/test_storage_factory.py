@@ -500,6 +500,40 @@ def test_pg_delete_duplicate_trip_keeps_last_copy():
     print("✓ PostgreSQL delete_duplicate_trip 只剩一条时拒绝删除")
 
 
+def test_pg_trip_lookup_normalizes_identity_fields():
+    """PG 单条保存的去重查询按身份口径归一路线（CRLF / CR → LF）。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    calls: list[tuple[str, object]] = []
+    store._fetchall = lambda sql, params: (calls.append((sql, params)) or [])
+    store._next_trip_number = lambda: 1
+    store._execute = lambda sql, params=None, **kwargs: calls.append((sql, params))
+
+    trip_id = store._save_trip_history_locked(
+        {
+            "origin": "北京\r\n西城",
+            "destination": "a\rb\r\nc",
+            "start_date": "2026-1-5",
+            "end_date": "2026-1-6",
+            "purpose": "会议",
+        },
+        "会议",
+        "a\rb\r\nc",
+    )
+    sql, params = calls[0]
+    assert "REPLACE(REPLACE(destination" in sql
+    assert "REPLACE(REPLACE(COALESCE(origin" in sql
+    assert params == ("u1", "a\nb\nc", "北京\n西城")
+    assert trip_id == "trip_1"
+    print("✓ PostgreSQL 行程去重按身份口径归一路线")
+
+
 def test_pg_delete_trip_deletes_single_row():
     """PostgreSQL 删除行程按主键：历史库重复 trip_id 时不能整批删除。"""
     import contextlib
@@ -1255,6 +1289,35 @@ def test_reload_failure_raises_instead_of_stale_snapshot():
     else:
         raise AssertionError("重载失败必须抛 MemoryPersistenceError")
     print("✓ 重载失败不再静默沿用旧快照")
+
+
+def test_trip_save_matches_linebreak_variants():
+    """仅 CRLF 换行写法不同的同路线行程视为同一趟（导入 / 去重同一口径）。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-dup-crlf", tempfile.mkdtemp())
+    first = memory.save_trip_history(
+        {
+            "origin": "北京\r\n西城",
+            "destination": "a\rb\r\nc",
+            "start_date": "2026-1-5",
+            "end_date": "2026-1-6",
+            "purpose": "会议",
+        }
+    )
+    second = memory.save_trip_history(
+        {
+            "origin": "北京\n西城",
+            "destination": "a\nb\nc",
+            "start_date": "2026-01-05",
+            "end_date": "2026-01-06",
+        }
+    )
+    assert first == second
+    trips = memory.get_trip_history(limit=None)
+    assert len(trips) == 1
+    assert trips[0]["purpose"] == "会议", "未提供目的时保留原值"
+    print("✓ 换行 / 未补零日期不同的同一趟行程命中存储去重")
 
 
 def test_one_day_trip_dedupes_end_date_variants():
@@ -2869,6 +2932,7 @@ if __name__ == "__main__":
     test_trip_history_delete_and_ids()
     test_stale_snapshot_does_not_resurrect_trip()
     test_trip_save_deduplicates_same_trip()
+    test_trip_save_matches_linebreak_variants()
     test_trip_update_and_conflict()
     test_next_trip_id_not_reused_after_deleting_latest()
     test_one_day_trip_dedupes_end_date_variants()
@@ -2899,6 +2963,7 @@ if __name__ == "__main__":
     test_load_holds_path_lock()
     test_pg_delete_trip_deletes_single_row()
     test_pg_delete_duplicate_trip_keeps_last_copy()
+    test_pg_trip_lookup_normalizes_identity_fields()
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()
