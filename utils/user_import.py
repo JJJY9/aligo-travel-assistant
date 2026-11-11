@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from typing import Any
 
+from utils.identifiers import is_valid_web_id
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
 import os
@@ -30,9 +31,7 @@ _MAX_KNOWLEDGE_PARTS = 100000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
 
-_SESSION_ID_RE = re.compile(r"^[\w-]{1,64}$")
 _USAGE_NUMBER_FIELDS = ("calls", "input_tokens", "output_tokens", "total_tokens")
-
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -71,9 +70,10 @@ def _clean_session_id(value: Any) -> tuple[str | None, bool]:
     text = str(value).strip()
     if not text:
         return None, True
-    if not _SESSION_ID_RE.fullmatch(text):
-        # 与 Web 端 ChatRequest 的 ^[\w-]{1,64}$ 同一口径：Web 可以创建并
-        # 导出前导 "-" 的会话（深链接 / 默认生成），导入不能把它们丢掉
+    if not is_valid_web_id(text):
+        # 与 Web 路径参数（pydantic-core 的 Rust 正则 ^[\w-]{1,64}$）同一
+        # 字符集：Web 可以创建并导出含零宽连接符 / 组合符的会话，导入不能
+        # 把它们丢掉；反过来也不能恢复出 Web 端点 422 打不开的 ID
         return None, False
     return text, True
 

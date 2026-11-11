@@ -129,12 +129,13 @@ const state = {
 };
 
 function isValidId(value) {
-  // 与服务端 _ID_PATTERN（Python \w，含任意 Unicode 字母数字）同一集合：
-  // CLI / API 建出的 accented / 其它语种用户 ID 在面板里也要能切换
+  // 与服务端 _ID_PATTERN（pydantic-core 的 Rust \w：Alphabetic + Mark +
+  // Nd + Pc + Join_Control）同一集合：CLI / API 建出的含组合符 / 零宽
+  // 连接符的 ID 在面板里也要能切换，上标数字这类 No 则两端都拒绝
   const text = String(value || "");
   if (!text || text.length > 64) return false;
   try {
-    return /^[\p{L}\p{N}_-]+$/u.test(text);
+    return /^[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u200c\u200d-]+$/u.test(text);
   } catch {
     return /^[A-Za-z0-9_一-龥-]{1,64}$/.test(text);
   }
