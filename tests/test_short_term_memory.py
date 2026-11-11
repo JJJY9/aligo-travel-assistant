@@ -1513,6 +1513,83 @@ def test_named_connection_error_during_replay_keeps_queue(monkeypatch):
     print("✓ 重放中的 redis-py 连接异常保留队列且恢复后按序生效")
 
 
+def _server_state_error(name: str, message: str):
+    """真实的 redis-py 服务端状态错误；未安装时退回同名异常。"""
+    try:
+        import redis
+    except ImportError:  # pragma: no cover - requirements 固定安装 redis
+        return type(name, (Exception,), {})(message)
+    return getattr(redis.exceptions, name)(message)
+
+
+def test_server_state_errors_are_transient():
+    """READONLY / OOM / 集群下线等服务端状态错误按暂时故障处理。"""
+    from context import short_term_memory as module
+
+    for name, message in (
+        ("ReadOnlyError", "READONLY You can't write against a read only replica."),
+        ("OutOfMemoryError", "OOM command not allowed when used memory > 'maxmemory'."),
+        ("ClusterDownError", "CLUSTERDOWN The cluster is down"),
+        ("MasterDownError", "MASTERDOWN Link with MASTER is down"),
+        ("TryAgainError", "TRYAGAIN Multiple keys request during rehashing"),
+    ):
+        assert module._is_transient_redis_error(
+            _server_state_error(name, message)
+        ), name
+
+    # 载荷 / 命令错误仍是永久毒操作（重放不会成功）
+    assert (
+        module._is_transient_redis_error(
+            _server_state_error("ResponseError", "WRONGTYPE Operation against a key")
+        )
+        is False
+    )
+    print("✓ READONLY / OOM / CLUSTERDOWN 等按暂时故障处理")
+
+
+def test_server_state_error_during_replay_keeps_queue(monkeypatch):
+    """重放遇到 READONLY：不计毒、队列保留，恢复后按序生效。"""
+    from context import short_term_memory as module
+
+    error = _server_state_error(
+        "ReadOnlyError", "READONLY You can't write against a read only replica."
+    )
+
+    class _ReadOnlyRedis(_FlakyRedis):
+        def _check(self):
+            if self.fail:
+                raise error
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _ReadOnlyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-readonly-replay", max_turns=5, user_id="u1"
+    )
+    client.fail = True
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    # 影子缓存里删掉这一轮：排队按具体消息删除，恢复后重放不得复活
+    assert memory.truncate_last_turn("Q1") == 2
+    snapshot = memory._pending_ops
+    assert [kind for kind, _ in snapshot] == ["add", "add", "remove"]
+
+    # 连续 6 轮重试都因 READONLY 失败：超过毒操作阈值也不能丢队列
+    for _ in range(6):
+        monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+        memory.get_recent_context()
+        assert memory._pending_ops == snapshot, "服务端状态错误不能丢弃排队操作"
+        with module._PENDING_JOURNALS_LOCK:
+            journal = module._PENDING_JOURNALS[memory.key]
+        assert journal.stuck == ("", 0), "服务端状态错误不能计入毒操作"
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == [], "重放顺序：先补写故障期消息，再删除已截断轮次"
+    assert memory._pending_ops == []
+    assert client.data == []
+    print("✓ 重放中的 READONLY 错误保留队列且恢复后按序生效")
+
+
 def test_truncate_replay_marker_uses_long_ttl(monkeypatch):
     """重放路径传给截断脚本的标记 TTL 与在线路径一致（30 天，非消息 TTL）。"""
     from context import short_term_memory as module
@@ -1663,6 +1740,7 @@ if __name__ == "__main__":
     test_recent_context_and_string()
     test_statistics_and_clear()
     test_named_connection_error_is_transient()
+    test_server_state_errors_are_transient()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_redis_failure_falls_back_to_memory(_mp)
@@ -1769,6 +1847,7 @@ if __name__ == "__main__":
         test_connection_failure_during_replay_keeps_queue,
         test_truncate_marker_outlives_message_ttl,
         test_named_connection_error_during_replay_keeps_queue,
+        test_server_state_error_during_replay_keeps_queue,
         test_truncate_replay_marker_uses_long_ttl,
         test_read_skips_deeply_nested_entries,
     ):
