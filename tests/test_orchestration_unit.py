@@ -2055,6 +2055,133 @@ def test_preference_values_not_logged(caplog):
     print("✓ 偏好值不写入 INFO 日志")
 
 
+def _isolated_results():
+    return [
+        {
+            "agent_name": "preference",
+            "status": "success",
+            "result": {
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "home_location", "value": "上海", "action": "append"},
+                        {"type": "airlines", "value": "东航", "action": "append"},
+                        {"type": "hotel_brands", "value": "汉庭", "action": "append"},
+                    ]
+                },
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        },
+        {
+            "agent_name": "event_collection",
+            "status": "success",
+            "result": {
+                "status": "success",
+                "data": {
+                    "destination": "杭州",
+                    "start_date": "2026-12-01",
+                    "end_date": "2026-12-02",
+                },
+            },
+        },
+    ]
+
+
+def test_update_memory_isolates_preference_failures(caplog=None):
+    """单条偏好写入失败只跳过该条，其余偏好与同一轮行程照常落库。"""
+    import logging
+
+    from utils.errors import MemoryPersistenceError
+
+    class _FailingPrefs:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def save_preference(self, pref_type, value):
+            if pref_type == "airlines":
+                raise MemoryPersistenceError("disk full")
+            return self.inner.save_preference(pref_type, value)
+
+        def append_preference(self, pref_type, value):
+            if pref_type == "airlines":
+                raise MemoryPersistenceError("disk full")
+            return self.inner.append_preference(pref_type, value)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    memory = _StubMemory()
+    memory.long_term = _FailingPrefs(memory.long_term)
+    if caplog is not None:
+        with caplog.at_level(logging.WARNING):
+            OrchestrationAgent(
+                agent_registry={}, memory_manager=memory
+            )._update_memory({}, _isolated_results())
+        assert "保存偏好失败" in caplog.text
+    else:
+        OrchestrationAgent(
+            agent_registry={}, memory_manager=memory
+        )._update_memory({}, _isolated_results())
+
+    prefs = memory.long_term.inner.get_preference()
+    assert prefs.get("home_location") == ["上海"]
+    assert prefs.get("hotel_brands") == ["汉庭"]
+    assert "airlines" not in prefs
+    assert len(memory.long_term.inner.get_trip_history()) == 1
+    print("✓ 单条偏好失败不影响其余偏好与行程落库")
+
+
+def test_update_memory_skips_failed_event_collection():
+    """被判失败的事项抽取不能作为行程信息来源落库。"""
+    memory = _StubMemory()
+    results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        },
+        {
+            "agent_name": "event_collection",
+            "status": "error",
+            "result": {
+                "status": "error",
+                "data": {"destination": "杭州", "start_date": "2026-12-01"},
+            },
+        },
+    ]
+    OrchestrationAgent(
+        agent_registry={}, memory_manager=memory
+    )._update_memory({}, results)
+    assert memory.long_term.get_trip_history() == []
+    print("✓ 失败的事项收集不写入行程")
+
+
+def test_update_memory_isolates_trip_save_failure():
+    """行程写入失败只记录日志，回答照常返回（不中断整轮）。"""
+    from utils.errors import MemoryPersistenceError
+
+    class _FailingTrips:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def save_trip_history(self, trip):
+            raise MemoryPersistenceError("disk full")
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    memory = _StubMemory()
+    memory.long_term = _FailingTrips(memory.long_term)
+    OrchestrationAgent(
+        agent_registry={}, memory_manager=memory
+    )._update_memory({}, _isolated_results())
+    print("✓ 行程写入失败不中断整轮")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -2102,6 +2229,9 @@ if __name__ == "__main__":
     test_agent_load_runs_in_dedicated_executor()
     test_rag_load_uses_isolated_executor()
     test_rag_load_executor_accepts_standard_name()
+    test_update_memory_isolates_preference_failures()
+    test_update_memory_skips_failed_event_collection()
+    test_update_memory_isolates_trip_save_failure()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)

@@ -886,6 +886,35 @@ class OrchestrationAgent(AgentBase):
         merged.update({key: value for key, value in data.items() if key != "data"})
         return merged
 
+    def _apply_single_preference(
+        self, pref_type: str, pref_value: Any, pref_action: str
+    ) -> None:
+        """写入一条偏好：append 优先走存储层的原子追加，否则覆盖保存。"""
+        if pref_action in {"append", "add", "追加"}:
+            append_pref = getattr(
+                self.memory_manager.long_term,
+                "append_preference",
+                None,
+            )
+            if callable(append_pref):
+                # 存储层在锁内重新读取再合并，避免覆盖本轮 LLM 调用期间
+                # 用户在记忆面板写入的偏好
+                append_pref(pref_type, pref_value)
+                # 偏好值可能是证件号 / 住址等隐私内容：只记录类型
+                logger.info("Appended to %s", pref_type)
+                return
+            # 旧实现 / 自定义后端没有原子追加时的兜底：与持久化 / 上下文
+            # 路径一致，用 merge_preference_value 逐项合并（列表值整体
+            # append 会形成嵌套列表）
+            current_prefs = self.memory_manager.long_term.get_preference()
+            existing_value = current_prefs.get(pref_type)
+            merged_value = merge_preference_value(existing_value, pref_value)
+            self.memory_manager.long_term.save_preference(pref_type, merged_value)
+            logger.info("Appended to %s", pref_type)
+            return
+        self.memory_manager.long_term.save_preference(pref_type, pref_value)
+        logger.info("Replaced preference: %s", pref_type)
+
     def _update_memory(self, intention_data: dict[str, Any], results: list[dict]):
         """
         更新记忆系统
@@ -930,37 +959,20 @@ class OrchestrationAgent(AgentBase):
                         if not has_preference_value(pref_value):
                             continue
 
-                        # 根据 action 决定操作（模型可能返回 Append / add / 追加 等变体）
-                        if pref_action in {"append", "add", "追加"}:
-                            append_pref = getattr(
-                                self.memory_manager.long_term,
-                                "append_preference",
-                                None,
+                        # 根据 action 决定操作（模型可能返回 Append / add / 追加 等变体）。
+                        # 单条写入失败（磁盘满 / 锁超时 / PG 抖动）只跳过该条：
+                        # 此前异常会中断整个循环，后续偏好与同一轮行程永不落库，
+                        # 整轮回答也因异常穿出 reply 而作废
+                        try:
+                            self._apply_single_preference(
+                                pref_type, pref_value, pref_action
                             )
-                            if callable(append_pref):
-                                # 存储层在锁内重新读取再合并，避免覆盖本轮
-                                # LLM 调用期间用户在记忆面板写入的偏好
-                                append_pref(pref_type, pref_value)
-                                # 偏好值可能是证件号 / 住址等隐私内容：
-                                # 只记录类型（与存储层日志约定一致）
-                                logger.info("Appended to %s", pref_type)
-                                continue
-                            # 旧实现 / 自定义后端没有原子追加时的兜底：与
-                            # 持久化 / 上下文路径一致，用 merge_preference_value
-                            # 逐项合并（列表值整体 append 会形成嵌套列表）
-                            current_prefs = self.memory_manager.long_term.get_preference()
-                            existing_value = current_prefs.get(pref_type)
-                            merged_value = merge_preference_value(
-                                existing_value, pref_value
+                        except Exception as exc:  # noqa: BLE001 - 单条失败继续
+                            logger.warning(
+                                "保存偏好失败（%s，类型 %s），继续处理其余结果",
+                                type(exc).__name__,
+                                pref_type,
                             )
-                            self.memory_manager.long_term.save_preference(
-                                pref_type, merged_value
-                            )
-                            logger.info("Appended to %s", pref_type)
-                        else:
-                            # 覆盖模式：直接保存新值
-                            self.memory_manager.long_term.save_preference(pref_type, pref_value)
-                            logger.info(f"Replaced preference: {pref_type}")
 
                 # 旧格式兼容：preferences 是字典
                 elif isinstance(preferences_data, dict):
@@ -970,8 +982,20 @@ class OrchestrationAgent(AgentBase):
                             and pref_type not in {"has_preferences", "error"}
                             and is_manageable_pref_type(pref_type)
                         ):
-                            self.memory_manager.long_term.save_preference(pref_type, value)
-                            logger.info(f"Updated preference: {pref_type} (legacy format)")
+                            try:
+                                self.memory_manager.long_term.save_preference(
+                                    pref_type, value
+                                )
+                                logger.info(
+                                    "Updated preference: %s (legacy format)",
+                                    pref_type,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - 单条失败继续
+                                logger.warning(
+                                    "保存偏好失败（%s，类型 %s），继续处理其余结果",
+                                    type(exc).__name__,
+                                    pref_type,
+                                )
 
             # 如果是行程规划智能体，保存行程到长期记忆
             if agent_name == "itinerary_planning" and isinstance(data, dict):
@@ -985,13 +1009,23 @@ class OrchestrationAgent(AgentBase):
                 # 只要有行程信息就保存（不管是否完全规划好）
                 if itinerary:
                     # 提取事项收集的信息（出发地、目的地等）
-                    event_data = {}
+                    event_data: dict[str, Any] = {}
                     for r in results:
-                        if r["agent_name"] == "event_collection":
-                            event_data = self._merged_skill_payload(
-                                r["result"].get("data", {})
+                        if r["agent_name"] != "event_collection":
+                            continue
+                        if r["result"].get("status") != "success":
+                            # 被判失败的事项抽取（如上游超时）不能作为行程
+                            # 信息来源落库：偏好 / 规划分支已有同一守卫
+                            logger.warning(
+                                "事项收集失败（%s），跳过本轮行程落库",
+                                r["result"].get("status"),
                             )
+                            event_data = {}
                             break
+                        event_data = self._merged_skill_payload(
+                            r["result"].get("data", {})
+                        )
+                        break
 
                     # 从 event_data 获取行程信息；模型可能给出列表（多目的地）
                     # 或数字，统一转成单行文本再落库（不可哈希值会让统计
@@ -1006,14 +1040,22 @@ class OrchestrationAgent(AgentBase):
                     # 去重（_find_same_trip 对缺 start_date 直接跳过），复述或
                     # 「重新生成」会让同一条无日期行程被反复写入、统计累加
                     if destination and start_date:
-                        self.memory_manager.long_term.save_trip_history({
-                            "origin": origin,
-                            "destination": destination,
-                            "start_date": start_date,
-                            "end_date": end_date,
-                            "purpose": purpose,
-                            "session_id": getattr(self.memory_manager, "session_id", None),
-                        })
-                        logger.info("Saved trip to long-term memory")
+                        try:
+                            self.memory_manager.long_term.save_trip_history({
+                                "origin": origin,
+                                "destination": destination,
+                                "start_date": start_date,
+                                "end_date": end_date,
+                                "purpose": purpose,
+                                "session_id": getattr(
+                                    self.memory_manager, "session_id", None
+                                ),
+                            })
+                            logger.info("Saved trip to long-term memory")
+                        except Exception as exc:  # noqa: BLE001 - 行程写入失败不阻断回复
+                            logger.warning(
+                                "保存行程失败（%s），本轮回答照常返回",
+                                type(exc).__name__,
+                            )
 
         logger.info("Memory updated after orchestration")
