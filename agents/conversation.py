@@ -67,6 +67,9 @@ class ConversationRuntime:
         # 回滚删掉下一轮文本相同的提问
         self._last_persist_turn: tuple[str, dict[str, bool]] | None = None
         self._pending_rollback: asyncio.Future | None = None
+        # 延迟记忆写入（偏好 / 行程）的提交任务：取消落在落库线程期间时由
+        # 落库完成回调补提交，drain 释放用户锁前等待它结束
+        self._pending_memory_commit: asyncio.Future | None = None
         # 失败 / 被墓碑否决回合的用量账目：这些回合没有消息可承载 _meta.usage，
         # 累计到下一轮成功回合一起写入，否则面板与趋势永久少记
         self._unsettled_usage: dict[str, Any] | None = None
@@ -308,6 +311,8 @@ class ConversationRuntime:
                     fut, user_input, turn_state
                 )
             )
+            if defer_supported:
+                pending.add_done_callback(self._commit_deferred_after_persist)
             persist_started = True
             committed = await asyncio.shield(pending)
         except BaseException:
@@ -432,6 +437,39 @@ class ConversationRuntime:
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
             logger.warning("回滚暂存提问失败", exc_info=True)
 
+    def _commit_deferred_after_persist(self, fut: asyncio.Future) -> None:
+        """落库完成回调：提交成功时补做延迟的偏好 / 行程写入。
+
+        取消落在落库线程执行期间时，``ask()`` 的正常收尾路径不会执行，但
+        整轮问答会被写线程完整提交——延迟的偏好 / 行程不能因此丢失（下一轮
+        defer 会覆盖暂存负载）。否决（False）与写入失败不提交。
+        """
+        if fut.cancelled():
+            return
+        try:
+            outcome = fut.result()
+        except Exception:  # noqa: BLE001 - 落库失败走回滚，不提交记忆
+            return
+        if outcome is False:
+            return
+        self._schedule_deferred_commit()
+
+    def _schedule_deferred_commit(self) -> None:
+        commit = getattr(self.orchestrator, "commit_deferred_memory", None)
+        if not callable(commit):
+            return
+        task = asyncio.ensure_future(commit())
+        self._pending_memory_commit = task
+        task.add_done_callback(self._consume_memory_commit)
+
+    def _consume_memory_commit(self, task: asyncio.Future) -> None:
+        if getattr(self, "_pending_memory_commit", None) is task:
+            self._pending_memory_commit = None
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("提交延迟记忆写入失败", exc_info=exc)
+
     def _consume_background_task(self, task: asyncio.Future) -> None:
         # 完成即清空槽位：陈旧任务会让后续新调度的回滚无法登记，drain
         # 看到旧任务已完成就提前放行用户锁（回滚线程其实还没跑）
@@ -508,6 +546,20 @@ class ConversationRuntime:
             # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
             # 结束，保证释放用户锁前回滚已落地）
             await self._request_staged_rollback(*last_turn)
+        commit_task = getattr(self, "_pending_memory_commit", None)
+        if commit_task is not None and not commit_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(commit_task), timeout=timeout_sec
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "等待延迟记忆写入超过 %.1fs，后台继续", timeout_sec
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 写入失败已逐条吞掉
+                pass
         return True
 
     def close(self) -> None:

@@ -222,12 +222,17 @@ def test_deferred_memory_committed_after_successful_persist():
         def __init__(self):
             self.deferred = None
             self.commits = 0
+            self.pending = False
 
         async def reply(self, intention, on_event=None, defer_memory=False):
             self.deferred = defer_memory
+            self.pending = bool(defer_memory)
             return _Response(json.dumps({"results": []}, ensure_ascii=False))
 
         async def commit_deferred_memory(self):
+            if not self.pending:
+                return False
+            self.pending = False
             self.commits += 1
             return True
 
@@ -262,6 +267,60 @@ def test_deferred_memory_skipped_when_persist_vetoed():
     assert result["persisted"] is False
     assert orch.commits == 0, "被否决的回合不能写偏好 / 行程"
     print("✓ 否决回合跳过延迟记忆写入")
+
+
+def test_deferred_memory_commits_after_cancel_during_persist():
+    """取消落在落库线程期间：写线程仍提交整轮，延迟记忆写入必须补提交。"""
+    import threading
+
+    runtime, base_memory = _make_runtime()
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowMemory(_FakeMemory):
+        def persist_turn(self, user_content, assistant_content, should_commit=None):
+            started.set()
+            release.wait(10)
+            return True
+
+    runtime.memory = _SlowMemory()
+
+    class _DeferredOrch:
+        def __init__(self):
+            self.commits = 0
+            self.pending = False
+
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            self.pending = bool(defer_memory)
+            return _Response(json.dumps({"results": []}, ensure_ascii=False))
+
+        async def commit_deferred_memory(self):
+            if not self.pending:
+                return False
+            self.pending = False
+            self.commits += 1
+            return True
+
+    orch = _DeferredOrch()
+    runtime.orchestrator = orch
+
+    async def scenario():
+        task = asyncio.ensure_future(runtime.ask("你好"))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        for _ in range(200):
+            if orch.commits:
+                break
+            await asyncio.sleep(0.02)
+
+    asyncio.run(scenario())
+    assert orch.commits == 1, "落库成功后的延迟记忆写入不能因取消而丢失"
+    print("✓ 取消落在落库线程期间仍补提交延迟记忆")
 
 
 def test_persist_failure_rolls_back_staged_user_message():

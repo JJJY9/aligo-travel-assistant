@@ -182,6 +182,64 @@ def test_redis_client_cache_is_url_scoped(monkeypatch):
     print("✓ Redis 客户端缓存按 URL 隔离且 reset 竞态安全")
 
 
+def test_redis_factory_does_not_hold_lock_during_ping(monkeypatch):
+    """创建 / ping 不占全局锁：慢 URL 建立期间命中缓存 / 其它 URL 不被阻塞。"""
+    import threading
+    import time as time_module
+
+    import redis as redis_module
+
+    from context import storage as storage_module
+
+    class _Client:
+        def __init__(self, slow):
+            self.slow = slow
+
+        def ping(self):
+            if self.slow:
+                time_module.sleep(0.4)
+            return True
+
+    slow_started = threading.Event()
+
+    def fake_from_url(url, **kwargs):
+        slow = "slow" in url
+        if slow:
+            slow_started.set()
+        return _Client(slow)
+
+    storage_module.reset_failure_cache()
+    monkeypatch.setattr(redis_module.Redis, "from_url", fake_from_url)
+    try:
+        fast = storage_module._get_redis_client("redis://fast/0")
+        results: list[object] = []
+        leader = threading.Thread(
+            target=lambda: results.append(
+                storage_module._get_redis_client("redis://slow/0")
+            )
+        )
+        waiter = threading.Thread(
+            target=lambda: results.append(
+                storage_module._get_redis_client("redis://slow/0")
+            )
+        )
+        leader.start()
+        assert slow_started.wait(2)
+        waiter.start()
+        begin = time_module.monotonic()
+        cached = storage_module._get_redis_client("redis://fast/0")
+        elapsed = time_module.monotonic() - begin
+        leader.join(5)
+        waiter.join(5)
+        assert elapsed < 0.2, "慢 URL 的 ping 不能阻塞缓存命中的其它 URL"
+        assert cached is fast
+        assert len(results) == 2 and all(item is not None for item in results)
+        assert results[0] is results[1], "同一 URL 的并发创建应共享同一客户端"
+    finally:
+        storage_module.reset_failure_cache()
+    print("✓ Redis 工厂创建期间不占全局锁（单飞共享客户端）")
+
+
 def test_describe_backends_reports_long_term_degraded(monkeypatch):
     """配置了 PostgreSQL 但已回退 JSON 时，后端描述带 long_term_degraded 标记。"""
     _set("redis_url", "")
