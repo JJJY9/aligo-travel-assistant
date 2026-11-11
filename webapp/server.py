@@ -27,6 +27,7 @@ import json
 import reprlib
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -248,9 +249,52 @@ def _metric_path_before_route(route_path: str) -> str:
     return _UNMATCHED_METRIC_PATH
 
 
+# Host 白名单：默认只接受回环 / IP 字面量（LAN 演示一般用 IP 访问）；
+# 通过域名（反向代理 / 内网 DNS）访问时用 ALIGO_ALLOWED_HOSTS 配置，
+# 逗号分隔，支持 *.example.com。拒绝未知域名可阻止 DNS rebinding：
+# 公网域名重新解析到 127.0.0.1 后，浏览器以同源身份读写本机数据。
+_ALLOWED_HOSTS_ENV = "ALIGO_ALLOWED_HOSTS"
+
+
+def _normalized_request_host(host_header: str) -> str:
+    host = (host_header or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 0:
+            return ""
+        return host[1:end]
+    if host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    return host
+
+
+def _host_allowed(host_header: str) -> bool:
+    host = _normalized_request_host(host_header)
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host in {"localhost", "testserver"} or host.endswith(".localhost"):
+        return True
+    configured = os.environ.get(_ALLOWED_HOSTS_ENV, "")
+    for item in configured.split(","):
+        pattern = item.strip().lower().rstrip(".")
+        if not pattern:
+            continue
+        if pattern.startswith("*.") and host.endswith(pattern[1:]):
+            return True
+        if host == pattern:
+            return True
+    return False
+
+
 class RequestContextMiddleware:
     """为每个 HTTP 请求生成 / 透传 X-Request-ID，并记录 /api/ 请求耗时。"""
-
     def __init__(self, app: Any) -> None:
         self.app = app
 
@@ -265,6 +309,30 @@ class RequestContextMiddleware:
             re.sub(r"[^A-Za-z0-9._-]", "", incoming)[:64] or uuid.uuid4().hex[:12]
         )
         scope.setdefault("state", {})["request_id"] = request_id
+
+        if not _host_allowed(headers.get(b"host", b"").decode("latin-1")):
+            body = json.dumps(
+                {
+                    "detail": (
+                        "Host 不在允许列表（如需通过域名访问，请设置 "
+                        "ALIGO_ALLOWED_HOSTS）"
+                    )
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 400,
+                    "headers": [
+                        (b"content-type", b"application/json; charset=utf-8"),
+                        (b"cache-control", b"no-store"),
+                        (b"x-request-id", request_id.encode("latin-1")),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
 
         started = time.perf_counter()
         status_code = 0

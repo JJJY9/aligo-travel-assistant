@@ -78,6 +78,60 @@ def test_index_page():
     print("✓ 首页可访问（新版界面）")
 
 
+def test_host_header_allowlist_blocks_rebinding():
+    """未知 Host 一律 400：DNS rebinding 不能以同源身份读写本机数据。"""
+    client = _client()
+    assert client.get("/api/health").status_code == 200
+
+    evil = client.get("/api/health", headers={"Host": "evil.example:8000"})
+    assert evil.status_code == 400, evil.text
+    assert "Host 不在允许列表" in evil.text
+
+    # 尾斜杠的 307 重定向之前就拒绝，不能回显攻击者控制的 Host
+    redirect = client.get(
+        "/api/health/",
+        headers={"Host": "evil.example:8000"},
+        follow_redirects=False,
+    )
+    assert redirect.status_code == 400, redirect.text
+
+    # LAN 演示用 IP 字面量 / localhost 子域直接放行
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "192.168.1.5:8000"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get("/api/health", headers={"Host": "app.localhost"}).status_code
+        == 200
+    )
+    print("✓ Host 白名单拒绝未知域名（防 DNS rebinding）")
+
+
+def test_host_allowlist_env(monkeypatch):
+    """ALIGO_ALLOWED_HOSTS 支持精确域名与 *.example.com 通配。"""
+    monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", "*.example.com, aligo.lan")
+    client = _client()
+    assert (
+        client.get("/api/health", headers={"Host": "box.example.com"}).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "aligo.lan:8000"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "other.example.net"}
+        ).status_code
+        == 400
+    )
+    print("✓ ALIGO_ALLOWED_HOSTS 域名白名单")
+
+
 def test_health_endpoint():
     data = _client().get("/api/health").json()
     assert data["status"] == "ok"
@@ -726,7 +780,7 @@ def test_stream_abort_waits_for_pending_persist(monkeypatch):
     async def scenario():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
+            transport=transport, base_url="http://testserver"
         ) as client:
 
             async def consume():
@@ -9188,6 +9242,12 @@ if __name__ == "__main__":
     test_rate_identity_ipv6_aggregation()
     test_validation_error_truncates_large_input()
     test_session_cache_evicts_on_hit_path(pytest.MonkeyPatch())
+    test_host_header_allowlist_blocks_rebinding()
+    _mp_host = pytest.MonkeyPatch()
+    try:
+        test_host_allowlist_env(_mp_host)
+    finally:
+        _mp_host.undo()
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
