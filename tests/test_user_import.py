@@ -286,6 +286,74 @@ def test_parse_validates_session_ids_and_usage():
     print("✓ 会话 ID / 用量类型校验，偏好类型错误显式报告")
 
 
+def test_session_id_matches_web_word_semantics():
+    """导入的会话 ID 校验与 Web 路径参数（pydantic-core 的 Rust \\w）逐字符一致。"""
+    from typing import Annotated
+
+    from pydantic import Field, TypeAdapter, ValidationError
+    from utils.identifiers import is_valid_web_id
+
+    adapter = TypeAdapter(Annotated[str, Field(pattern=r"^[\w-]{1,64}$")])
+    samples = [
+        "s1",
+        "用户-1",
+        "αβγ",
+        "١٢٣",
+        "a_b",
+        "-lead",
+        "a b",
+        "a\nb",
+        "é",
+        "e" + chr(0x301),
+        "a" + chr(0x200D) + "b",
+        "a" + chr(0x200C) + "b",
+        "a" + chr(0xB2),
+        "a" * 64,
+        "a" * 65,
+        "",
+        "..",
+        "/x",
+    ]
+    for sample in samples:
+        try:
+            adapter.validate_python(sample)
+            web_ok = True
+        except ValidationError:
+            web_ok = False
+        assert is_valid_web_id(sample) == web_ok, repr(sample)
+    print("✓ 导入的会话 ID 校验与 Web 路径一致")
+
+
+def test_import_session_id_roundtrip_with_web_charset():
+    """Web 可创建的零宽连接符会话能恢复；上标数字这类 Web 422 的 ID 被拒绝。"""
+    join_id = "a" + chr(0x200D) + "b"
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "连接符会话", "session_id": join_id}
+                ]
+            }
+        )
+    )
+    assert errors == [], errors
+    assert [m["content"] for m in sections["messages"]] == ["连接符会话"]
+
+    superscript = "a" + chr(0xB2)
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "上标会话", "session_id": superscript}
+                ]
+            }
+        )
+    )
+    assert not sections.get("messages"), sections
+    assert any("会话 ID 非法" in error for error in errors), errors
+    print("✓ 会话 ID 往返字符集与 Web 一致")
+
+
 def test_import_preserves_message_order():
     """恢复保持备份里的消息顺序：无时间戳旧消息不再被排到回答之后。"""
     payload = {
@@ -1603,6 +1671,8 @@ if __name__ == "__main__":
     test_parse_export_skips_invalid_rows()
     test_exporter_json_is_importable()
     test_parse_validates_session_ids_and_usage()
+    test_session_id_matches_web_word_semantics()
+    test_import_session_id_roundtrip_with_web_charset()
     test_import_preserves_message_order()
     test_import_preserves_trip_id_and_timestamp()
     test_import_drop_sessions_clears_trip_link()
