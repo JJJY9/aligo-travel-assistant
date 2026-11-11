@@ -2211,6 +2211,30 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     print("✓ PG 非幂等写路径全部禁止自动重放")
 
 
+def test_pg_delete_operations_are_not_replayed():
+    """删除会话 / 偏好的计数不能重放：提交后断连重放会返回 0 造成假象。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u1"
+    calls: list[bool] = []
+
+    def fake_retry(op, replay_safe=True):
+        calls.append(replay_safe)
+        return 3
+
+    memory._run_with_retry = fake_retry  # type: ignore[method-assign]
+    assert memory.delete_chat_session("s1") == 3
+    assert calls == [False], "delete_chat_session 不能自动重放"
+
+    memory._preference_lock = lambda pref_type: contextlib.nullcontext()
+    assert memory.delete_preference("hotel") is True
+    assert calls == [False, False], "delete_preference 不能自动重放"
+    print("✓ PG 删除操作禁止自动重放（计数可信）")
+
+
 def test_pg_operations_serialized_across_threads():
     """同一实例的连接不能被两个线程同时使用（drain 超时后的旧落库线程）。"""
     import threading
@@ -3252,6 +3276,7 @@ if __name__ == "__main__":
     test_pg_trip_lookup_normalizes_identity_fields()
     test_pg_chat_summary_does_not_fetch_message_bodies()
     test_pg_delete_trips_verified_checks_identity_in_lock()
+    test_pg_delete_operations_are_not_replayed()
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()

@@ -4291,6 +4291,138 @@ def test_delete_last_turn_turn_identity():
         _cleanup(user_id)
 
 
+def test_delete_session_busy_lock_refused(monkeypatch):
+    """删除会话在用户锁忙碌时有界返回 409，不再排队到前端超时后仍执行。"""
+    import asyncio as asyncio_module
+
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    client = TestClient(app)
+
+    class _StuckLock:
+        async def acquire(self):
+            await asyncio_module.sleep(30)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(state, "lock_for", lambda user_id: _StuckLock())
+    monkeypatch.setattr(server_module, "_DELETE_LOCK_TIMEOUT_SEC", 0.05)
+    user_id = _unique_user("web_test_delete_busy")
+    response = client.delete("/api/sessions/s-busy", params={"user_id": user_id})
+    assert response.status_code == 409
+    assert "正在生成回复" in response.json()["detail"]
+    print("✓ 删除会话在用户锁忙碌时有界返回 409")
+
+
+def test_sessions_export_rejects_messages_without_session():
+    """只有无 session_id 的旧消息时按渲染条数 404，不返回空台账。"""
+    user_id = _unique_user("web_test_export_empty_render")
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "旧消息",
+                        "timestamp": "2025-01-01T00:00:00",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _client()
+    try:
+        for fmt in ("md", "html"):
+            response = client.get(
+                "/api/sessions/export",
+                params={"user_id": user_id, "format": fmt},
+            )
+            assert response.status_code == 404, (fmt, response.text)
+    finally:
+        _cleanup(user_id)
+    print("✓ 会话导出按渲染条数判断空")
+
+
+def test_null_session_id_is_not_a_ghost_session():
+    """session_id 为 None 的旧消息不能被当成名为 None 的会话。"""
+    user_id = _unique_user("web_test_null_session")
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "无归属旧消息",
+                        "session_id": None,
+                        "timestamp": "2025-01-01T00:00:00",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _client()
+    try:
+        renamed = client.put(
+            "/api/sessions/None/title",
+            json={"user_id": user_id, "title": "幽灵标题"},
+        )
+        assert renamed.status_code == 404, renamed.text
+        exported = client.get("/api/export", params={"user_id": user_id}).json()
+        assert "None" not in (exported.get("session_titles") or {})
+    finally:
+        _cleanup(user_id)
+    print("✓ None 不是幽灵会话")
+
+
+def test_integer_session_id_is_manageable():
+    """旧数据里非字符串 session_id：列表、详情、改标题、删除按字符串口径一致。"""
+    user_id = _unique_user("web_test_int_session")
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "整数会话",
+                        "session_id": 42,
+                        "timestamp": "2026-01-01T00:00:00",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _client()
+    try:
+        listed = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert "42" in [item["session_id"] for item in listed["sessions"]]
+        detail = client.get(
+            "/api/sessions/42", params={"user_id": user_id}
+        )
+        assert detail.status_code == 200 and detail.json()["session_id"] == "42"
+        renamed = client.put(
+            "/api/sessions/42/title",
+            json={"user_id": user_id, "title": "整数标题"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        deleted = client.delete("/api/sessions/42", params={"user_id": user_id})
+        assert deleted.status_code == 200 and deleted.json()["deleted"] == 1
+    finally:
+        _cleanup(user_id)
+    print("✓ 整数会话 ID 可打开 / 改标题 / 删除")
+
+
 def test_delete_last_turn_busy_lock_refused(monkeypatch):
     """用户锁被长回合占用时有界返回 409，而不是排队到前端超时后仍执行。"""
     import asyncio as asyncio_module

@@ -33,6 +33,19 @@ def _trip_date_is_valid(value: object) -> bool:
         return False
     return True
 
+
+def _session_id_matches(message: dict[str, Any], session_id: str) -> bool:
+    """消息是否属于该会话：跳过无归属的旧消息（None），其余按字符串比较。
+
+    旧数据里 session_id 可能是 None（无会话归属）或非字符串：``str(None)
+    == "None"`` 会造出名为 None 的幽灵会话（标题 / 置顶 / 归档接口对
+    ``PUT /api/sessions/None/...`` 返回 200 并落库），纯粹相等比较又让整数
+    id 的会话「列表可见、详情为空、无法删除」。字符串化并跳过 None 同时
+    解决两者，与 PostgreSQL（TEXT 列）口径一致。
+    """
+    value = message.get("session_id")
+    return value is not None and str(value) == session_id
+
 # 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
 # MemoryManager 还会重建实例），按路径共享一把进程内可重入锁，避免并发
 # 读改写互相覆盖。弱引用：实例释放后锁自动移除，不随用户数无限增长。
@@ -831,10 +844,12 @@ class LongTermMemory:
         messages = self.data["chat_history"]
 
         if session_id:
-            messages = [m for m in messages if m.get("session_id") == session_id]
+            messages = [m for m in messages if _session_id_matches(m, session_id)]
         elif exclude_session_id:
             messages = [
-                m for m in messages if m.get("session_id") != exclude_session_id
+                m
+                for m in messages
+                if not _session_id_matches(m, exclude_session_id)
             ]
 
         if limit:
@@ -863,7 +878,9 @@ class LongTermMemory:
     def delete_chat_session(self, session_id: str) -> int:
         """删除某个会话的全部聊天记录，返回删除条数。"""
         messages = self.data["chat_history"]
-        remaining = [m for m in messages if m.get("session_id") != session_id]
+        remaining = [
+            m for m in messages if not _session_id_matches(m, session_id)
+        ]
         removed = len(messages) - len(remaining)
         titles = self.data.get("session_titles") or {}
         pinned_sessions = self.data.get("pinned_sessions") or []
@@ -906,7 +923,7 @@ class LongTermMemory:
         indexes = [
             index
             for index, message in enumerate(history)
-            if message.get("session_id") == session_id
+            if _session_id_matches(message, session_id)
         ]
         if not indexes:
             return 0
@@ -938,7 +955,7 @@ class LongTermMemory:
         stats["total_messages"] = max(0, stats.get("total_messages", 0) - count)
         # 会话消息已被删空时同步清理元数据，避免幽灵归档 / 幽灵标题 / 幽灵置顶
         if not any(
-            message.get("session_id") == session_id
+            _session_id_matches(message, session_id)
             for message in self.data["chat_history"]
         ):
             archived_sessions = self.data.get("archived_sessions") or []
@@ -958,7 +975,7 @@ class LongTermMemory:
     def _session_exists(self, session_id: str) -> bool:
         """当前快照里是否还有该会话的消息（写元数据前的存在性检查）。"""
         return any(
-            str(message.get("session_id")) == session_id
+            _session_id_matches(message, session_id)
             for message in self.data.get("chat_history", [])
         )
 
