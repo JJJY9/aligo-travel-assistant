@@ -2336,6 +2336,44 @@ def test_bulk_save_trips_scales_and_dedupes():
     print("✓ 批量行程保存一次建索引（去重 / 编号 / 统计语义一致）")
 
 
+def test_pg_connect_sets_lock_timeout_and_keepalives(monkeypatch):
+    """生产连接默认带 lock_timeout + TCP keepalive；statement_timeout 按需。"""
+    import psycopg
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    captured = {}
+
+    class _Conn:
+        pass
+
+    def fake_connect(dsn, **kwargs):
+        captured["dsn"] = dsn
+        captured["kwargs"] = kwargs
+        return _Conn()
+
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+    store = object.__new__(PostgresLongTermMemory)
+    store.dsn = "postgresql://example/db"
+    store._statement_timeout_ms = None
+    store._connect()
+    kwargs = captured["kwargs"]
+    assert "-c lock_timeout=3000" in kwargs["options"], kwargs["options"]
+    assert "statement_timeout" not in kwargs["options"], kwargs["options"]
+    assert kwargs["keepalives"] == 1
+    assert kwargs["keepalives_idle"] == 30
+    assert kwargs["keepalives_interval"] == 10
+    assert kwargs["keepalives_count"] == 3
+
+    captured.clear()
+    store._statement_timeout_ms = 3000
+    store._connect()
+    options = captured["kwargs"]["options"]
+    assert "-c lock_timeout=3000" in options, options
+    assert "-c statement_timeout=3000" in options, options
+    print("✓ PG 连接默认 lock_timeout + keepalive，statement_timeout 按需")
+
+
 def test_pg_schema_initialized_once_per_process():
     """每个 DSN 只在进程内建表一次；并发的构造不重复执行 DDL。"""
     import threading as threading_module
@@ -2687,6 +2725,7 @@ if __name__ == "__main__":
     test_migrate_recomputes_counters_after_dropping_entries()
     test_pg_reconnects_after_connection_error()
     test_pg_schema_initialized_once_per_process()
+    test_pg_connect_sets_lock_timeout_and_keepalives()
     test_pg_schema_tolerates_concurrent_create_race()
     test_pg_failed_retry_wrapped_as_memory_error()
     test_falsey_preferences_included_in_context()
