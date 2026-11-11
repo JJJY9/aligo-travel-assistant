@@ -1942,6 +1942,119 @@ def test_reply_input_edges_and_registry_management():
     print("✓ reply 输入边界 / 调度容错 / 注册注销 / 文本与瞬时错误辅助")
 
 
+def test_dict_registry_resolves_name_variants():
+    """纯 dict 注册表存标准名时，模型输出的别名 / 大小写变体也能调度。"""
+    agent = _StubAgent("itinerary_planning", {"itinerary": {"title": "T"}})
+    orchestrator = OrchestrationAgent(
+        agent_registry={"itinerary_planning": agent}
+    )
+    result = asyncio.run(
+        orchestrator._run_agent(
+            agent_name="Itinerary_Planning",
+            context={},
+            reason="",
+            expected_output="",
+            previous_results=[],
+        )
+    )
+    assert result["status"] == "success", result
+    assert agent.calls == 1
+    print("✓ dict 注册表按标准名解析别名 / 大小写变体")
+
+
+def test_update_memory_normalizes_trip_fields_and_dates():
+    """行程字段截断到 100 字；ISO 时间戳归一为日期，非法日期按空处理。"""
+    memory = _StubMemory()
+    results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        },
+        {
+            "agent_name": "event_collection",
+            "status": "success",
+            "result": {
+                "status": "success",
+                "data": {
+                    "origin": "北" * 300,
+                    "destination": "杭州",
+                    "start_date": "2026-03-11T00:00:00",
+                    "end_date": "2026/03/17",
+                    "trip_purpose": "出差",
+                },
+            },
+        },
+    ]
+    OrchestrationAgent(
+        agent_registry={}, memory_manager=memory
+    )._update_memory({}, results)
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1, trips
+    trip = trips[0]
+    assert trip["destination"] == "杭州"
+    assert len(trip["origin"]) == 100, len(trip["origin"])
+    assert trip["start_date"] == "2026-03-11"
+    assert trip["end_date"] == "", "无法解析的结束日期按空处理"
+    print("✓ 行程字段截断与日期归一")
+
+
+def test_update_memory_rejects_unparseable_start_date():
+    """出发日期无法解析时整条跳过，避免落库后被统计 / 日历静默忽略。"""
+    memory = _StubMemory()
+    results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        },
+        {
+            "agent_name": "event_collection",
+            "status": "success",
+            "result": {
+                "status": "success",
+                "data": {"destination": "杭州", "start_date": "下周一"},
+            },
+        },
+    ]
+    OrchestrationAgent(
+        agent_registry={}, memory_manager=memory
+    )._update_memory({}, results)
+    assert memory.long_term.get_trip_history() == []
+    print("✓ 无法解析的出发日期整条跳过保存")
+
+
+def test_preference_values_not_logged(caplog):
+    """偏好值可能是证件号等隐私内容：INFO 日志只记录类型。"""
+    import logging
+
+    memory = _StubMemory()
+    results = [
+        {
+            "agent_name": "preference",
+            "status": "success",
+            "result": {
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {
+                            "type": "passport",
+                            "value": "E12345678",
+                            "action": "append",
+                        }
+                    ]
+                },
+            },
+        },
+    ]
+    with caplog.at_level(logging.INFO):
+        OrchestrationAgent(
+            agent_registry={}, memory_manager=memory
+        )._update_memory({}, results)
+    assert "E12345678" not in caplog.text
+    print("✓ 偏好值不写入 INFO 日志")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
