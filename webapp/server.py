@@ -1989,6 +1989,23 @@ def _json_safe_value(value: Any) -> Any:
     return sanitize_json(value)
 
 
+def _aware_timestamp_text(value: Any) -> Any:
+    """把存储时间戳归一为带偏移的 ISO 文本。
+
+    JSON 后端存的是 naive 服务器本地时间、PostgreSQL 返回带时区的 ISO：
+    前端用 ``new Date()`` 解析，naive 串按浏览器本地解释——服务器与浏览器
+    时区不同（容器 TZ=UTC + 东八区浏览器）时会话日期分组与时钟整体偏移。
+    这里给 naive 值补上该时刻的服务器本地偏移，两种后端输出同一绝对时刻；
+    非法值原样返回（渲染层另有兜底）。
+    """
+    from utils.timestamps import to_aware
+
+    if not isinstance(value, str) or not value:
+        return value
+    aware = to_aware(value)
+    return aware.isoformat() if aware is not None else value
+
+
 def _trim_validation_item(item: dict[str, Any]) -> dict[str, Any]:
     """422 错误条目：input 截断为 200 字符并转义无法编码的字符。
 
@@ -2250,6 +2267,13 @@ def _group_sessions(
                 entry["snippet"] = snippet
                 # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
                 entry["match_index"] = entry["message_count"] - 1
+
+    # 输出前把 updated_at 归一为带偏移的 ISO（JSON 后端的 naive 本地时间
+    # 需要补时间戳时刻的偏移；PG 本来就是 aware），否则前端按浏览器时区
+    # 解释 naive 串，服务器与浏览器时区不同时日期分组整体偏移
+    for entry in grouped.values():
+        if entry["updated_at"]:
+            entry["updated_at"] = _aware_timestamp_text(entry["updated_at"])
 
     sessions = sorted(
         grouped.values(),
@@ -3503,7 +3527,9 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                         if message.get("role") == "assistant"
                         else None,
-                        "timestamp": message.get("timestamp", ""),
+                        "timestamp": _aware_timestamp_text(
+                            message.get("timestamp", "")
+                        ),
                     }
                     for message in messages
                 ],

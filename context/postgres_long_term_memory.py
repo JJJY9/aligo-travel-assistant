@@ -39,6 +39,15 @@ def _pg_timestamp(value: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+
+def _trip_start_is_valid(value: Any) -> bool:
+    """行程出发日期是否为可解析的 YYYY-MM-DD（与 JSON 后端同一统计口径）。"""
+    try:
+        datetime.strptime(str(value or ""), "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
 # 进程内「该 DSN 的表结构已就绪」标记：Web 每个读写接口 / 每个新会话都会
 # 构造 PostgresLongTermMemory。若每次都跑整套 DDL，即使对象已存在，
 # ALTER TABLE ... ADD COLUMN 仍取 aligo_trips 的 ACCESS EXCLUSIVE 锁、
@@ -1397,19 +1406,34 @@ class PostgresLongTermMemory:
             for trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at in rows
         ]
 
-    def get_frequent_destinations(self, top_n: int = 5) -> list[tuple]:
+    def _frequent_destination_counts(self) -> dict[str, int]:
+        """常去目的地计数：只统计出发日期可解析的行程。
+
+        与 JSON 后端的口径一致（``save_trip_histories`` / 迁移重建只统计
+        ``_trip_date_is_valid`` 的行程）：备份恢复允许保真保留旧格式日期
+        （如 ``2026/03/12``），纯 SQL 的 ``destination IS NOT NULL`` 会把
+        这些「僵尸行程」也计入，两后端同一数据给出不同结果。
+        SQL 无法精确复刻 ``strptime`` 语义（``to_date`` 会把 2026-02-31
+        归一成 3 月 3 日），行程数量受写入口径限制（每用户 5000 条），
+        在 Python 侧过滤成本可接受。
+        """
         rows = self._fetchall(
-            """
-            SELECT destination, COUNT(*) AS trip_count
-            FROM aligo_trips
-            WHERE user_id = %s AND destination IS NOT NULL
-            GROUP BY destination
-            ORDER BY trip_count DESC, destination
-            LIMIT %s
-            """,
-            (self.user_id, top_n),
+            "SELECT destination, start_date FROM aligo_trips "
+            "WHERE user_id = %s AND destination IS NOT NULL",
+            (self.user_id,),
         )
-        return [(row[0], int(row[1])) for row in rows]
+        counts: dict[str, int] = {}
+        for destination, start_date in rows:
+            if not _trip_start_is_valid(start_date):
+                continue
+            key = str(destination)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def get_frequent_destinations(self, top_n: int = 5) -> list[tuple]:
+        counts = self._frequent_destination_counts()
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return ordered[:top_n]
 
     # ---------- 统计 ----------
 
@@ -1433,17 +1457,7 @@ class PostgresLongTermMemory:
         queries_row = self._fetchone(
             "SELECT total_queries FROM aligo_user_stats WHERE user_id = %s", (self.user_id,)
         )
-        frequent = {
-            destination: int(count)
-            for destination, count in self._fetchall(
-                """
-                SELECT destination, COUNT(*) FROM aligo_trips
-                WHERE user_id = %s AND destination IS NOT NULL
-                GROUP BY destination
-                """,
-                (self.user_id,),
-            )
-        }
+        frequent = self._frequent_destination_counts()
         return {
             "total_trips": int(trips_row[0]) if trips_row else 0,
             "total_messages": int(messages_row[0]) if messages_row else 0,

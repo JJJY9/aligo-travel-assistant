@@ -1455,6 +1455,57 @@ def test_delete_trips_verified_batches_single_write():
     print("✓ 批量复核删除一次落盘 / 身份不符跳过")
 
 
+def test_delete_dirty_date_trip_keeps_frequent_destinations():
+    """删除日期不可解析的行程不能把合法城市的常去计数误清零。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-freq", storage_dir)
+    created, updated = memory.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-03-11",
+                "end_date": "2026-03-12",
+            },
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026/03/12",
+                "end_date": "2026/03/13",
+            },
+        ]
+    )
+    assert (created, updated) == (2, 0)
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 1}, (
+        "脏日期行程不计数（与保存口径一致）"
+    )
+    assert memory.delete_trip("trip_2") is True
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 1}, (
+        "删除脏日期行程不能让合法城市的计数减免"
+    )
+    assert memory.delete_trip("trip_1") is True
+    assert memory.get_statistics()["frequent_destinations"] == {}
+    print("✓ 删除脏日期行程不误清零常去目的地")
+
+
+def test_pg_frequent_destinations_skip_dirty_dates():
+    """PG 常去目的地与 JSON 同口径：出发日期不可解析的行程不计入。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    calls: list[tuple[str, object]] = []
+
+    def fake_fetchall(sql, params=None):
+        calls.append((sql, params))
+        # 模拟旧备份恢复出的脏日期行（2026/03/12）与无日期行
+        return [("上海", "2026-03-11"), ("上海", "2026/03/12"), ("杭州", None)]
+
+    store._fetchall = fake_fetchall
+    assert store.get_frequent_destinations(10) == [("上海", 1)]
+    print("✓ PostgreSQL 常去目的地按日期可解析口径统计")
+
+
 def test_one_day_trip_dedupes_end_date_variants():
     from context.long_term_memory import LongTermMemory
 
@@ -3069,6 +3120,8 @@ if __name__ == "__main__":
     test_trip_save_deduplicates_same_trip()
     test_trip_save_matches_linebreak_variants()
     test_delete_trips_verified_batches_single_write()
+    test_delete_dirty_date_trip_keeps_frequent_destinations()
+    test_pg_frequent_destinations_skip_dirty_dates()
     test_trip_update_and_conflict()
     test_next_trip_id_not_reused_after_deleting_latest()
     test_one_day_trip_dedupes_end_date_variants()
