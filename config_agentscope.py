@@ -138,11 +138,14 @@ def create_chat_model(
                 "timeout": float(
                     timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
                 ),
-                # OpenAI SDK 默认 max_retries=2：健康检查等「单次请求」场景会
-                # 被放大成 3 次、整体耗时超出调用方给的 timeout；需要时由调用方
-                # 显式传 0（应用层的 retry_with_backoff 才是重试的唯一入口）
+                # OpenAI SDK 自带重试默认 max_retries=2：与应用层
+                # retry_with_backoff（4 次尝试）叠加后一次逻辑调用最坏会
+                # 发出 12 个完整 prompt 请求，单轮可阻塞十分钟级；SDK 内部
+                # 重试对用量统计不可见，超时重试在上游已生成时仍会计费。
+                # 默认关闭，由应用层统一重试；不经过 retry_with_backoff
+                # 的裸调用可在调用处显式传值。
                 "max_retries": int(
-                    2 if max_retries is None else max_retries
+                    0 if max_retries is None else max_retries
                 ),
             },
             generate_kwargs={

@@ -166,8 +166,9 @@ async def run_health_check(
             timeout=timeout_sec,
             temperature=0,
             max_tokens=8,
-            # 关掉 SDK 内建重试：timeout_sec 是本次健康检查的整体预算，
-            # 默认 max_retries=2 会让 10 秒检查实际阻塞 30 秒以上
+            # 显式关闭 SDK 内建重试：timeout_sec 是本次健康检查的整体预算，
+            # 任何重试都会让实际耗时超出预算（工厂默认已是 0，显式传入防止
+            # 默认值回退）
             max_retries=0,
         )
         # 最小请求：必须返回非空文本才算可用。部分兼容网关以 HTTP 200
