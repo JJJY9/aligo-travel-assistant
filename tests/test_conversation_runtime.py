@@ -214,6 +214,56 @@ def test_persist_guard_reaches_memory_write():
     print("✓ 落库守卫传递到记忆写入")
 
 
+def test_deferred_memory_committed_after_successful_persist():
+    """编排器的偏好 / 行程写入延迟到整轮落库成功之后。"""
+    runtime, memory = _make_runtime()
+
+    class _DeferredOrch:
+        def __init__(self):
+            self.deferred = None
+            self.commits = 0
+
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            self.deferred = defer_memory
+            return _Response(json.dumps({"results": []}, ensure_ascii=False))
+
+        async def commit_deferred_memory(self):
+            self.commits += 1
+            return True
+
+    orch = _DeferredOrch()
+    runtime.orchestrator = orch
+    result = asyncio.run(runtime.ask("你好"))
+    assert orch.deferred is True
+    assert orch.commits == 1, "成功落库后必须提交延迟的记忆写入"
+    assert result["persisted"] is True
+    print("✓ 延迟记忆写入在落库成功后提交")
+
+
+def test_deferred_memory_skipped_when_persist_vetoed():
+    """墓碑否决的回合不能执行偏好 / 行程写入（避免幽灵记录）。"""
+    runtime, memory = _make_runtime()
+
+    class _DeferredOrch:
+        def __init__(self):
+            self.commits = 0
+
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            return _Response(json.dumps({"results": []}, ensure_ascii=False))
+
+        async def commit_deferred_memory(self):
+            self.commits += 1
+            return True
+
+    orch = _DeferredOrch()
+    runtime.orchestrator = orch
+    memory.persist_turn = lambda *args, **kwargs: False
+    result = asyncio.run(runtime.ask("你好"))
+    assert result["persisted"] is False
+    assert orch.commits == 0, "被否决的回合不能写偏好 / 行程"
+    print("✓ 否决回合跳过延迟记忆写入")
+
+
 def test_persist_failure_rolls_back_staged_user_message():
     """落库失败（长期记忆未写入）时暂存提问同样要回滚，两层记忆保持一致。"""
     from utils.errors import MemoryPersistenceError
