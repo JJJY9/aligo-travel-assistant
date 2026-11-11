@@ -1413,6 +1413,108 @@ def test_poison_op_dropped_after_repeated_failures(monkeypatch):
     print("✓ 连续失败的毒操作最终被丢弃")
 
 
+def test_poison_warning_redacts_message_content(monkeypatch, caplog):
+    """毒操作告警只记操作类型：消息正文 / 提问原文不能进日志。"""
+    import logging
+
+    from context import short_term_memory as module
+
+    class _PoisonError(Exception):
+        pass
+
+    class _PoisonRedis(_FlakyRedis):
+        def eval(self, script, numkeys, *keys_and_args):
+            if any("POISON" in str(arg) for arg in keys_and_args):
+                raise _PoisonError("WRONGTYPE Operation against a key")
+            return super().eval(script, numkeys, *keys_and_args)
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _PoisonRedis()
+    memory = module.RedisShortTermMemory(client, "s-poison-log", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "我的护照号是 E12345678 POISON")
+    client.fail = False
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+            memory.get_recent_context()
+    assert "护照" not in caplog.text and "E12345678" not in caplog.text
+    assert "丢弃队首 add 操作" in caplog.text
+    print("✓ 毒操作告警不泄露消息内容")
+
+
+def test_replay_discards_queue_when_session_deleted(monkeypatch):
+    """另一进程删除会话后：排队的故障期新增不能再重放回 Redis。"""
+    from context import short_term_memory as module
+    from utils import tombstones
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-deleted-elsewhere", max_turns=5, user_id="u1"
+    )
+    client.fail = True
+    memory.add_message("user", "删除前的提问")
+    memory.add_message("assistant", "删除前的回答")
+    assert memory._pending_ops, "故障期新增应进入重放队列"
+
+    client.fail = False
+    monkeypatch.setattr(
+        tombstones, "is_session_deleted", lambda user_id, session_id: True
+    )
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == []
+    assert memory._pending_ops == [], "已删除会话的排队操作必须整体丢弃"
+    assert client.data == [], "不能把已删除会话的消息写回 Redis"
+    print("✓ 已删除会话的故障期新增不重放")
+
+
+def test_parse_skips_huge_int_literal_without_degrading(monkeypatch):
+    """超 4300 位整数字面量（普通 ValueError）按坏条目跳过，不算 Redis 故障。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "保留", "2026-01-01T00:00:00"),
+        '{"role":"user","content":"x","timestamp":' + "9" * 5000 + "}",
+    ]
+    memory = module.RedisShortTermMemory(client, "s-bigint", max_turns=5, user_id="u1")
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["保留"]
+    assert module.redis_short_term_degraded() is False, "坏条目不能触发进程级降级"
+    print("✓ 超长整数坏条目按数据问题跳过")
+
+
+def test_statistics_tolerates_missing_timestamp_in_fallback(monkeypatch):
+    """影子缓存里的无 timestamp 条目不能让降级统计抛 KeyError。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = ['{"role": "user", "content": "旧条目"}']
+    memory = module.RedisShortTermMemory(client, "s-no-ts", max_turns=5, user_id="u1")
+    memory.get_recent_context()  # 成功读取并把无 timestamp 条目灌入影子缓存
+
+    client.fail = True
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 1
+    assert stats["oldest_message_time"] is None
+    assert stats["newest_message_time"] is None
+    print("✓ 缺 timestamp 的影子条目统计不崩溃")
+
+
+def test_non_positive_ttl_is_clamped():
+    """REDIS_TTL_SEC=0/负数会被钳制到 1：EXPIRE 非正数会直接删键。"""
+    from context import short_term_memory as module
+
+    client = _FlakyRedis()
+    assert module.RedisShortTermMemory(client, "s-ttl", ttl_sec=0).ttl_sec == 1
+    assert module.RedisShortTermMemory(client, "s-ttl", ttl_sec=-5).ttl_sec == 1
+    print("✓ 非正 TTL 钳制为 1 秒")
+
+
 def test_replay_failure_still_registers_current_add(monkeypatch):
     """重放中途失败时本次新增也要登记，恢复后按顺序补写。"""
     from context import short_term_memory as module
