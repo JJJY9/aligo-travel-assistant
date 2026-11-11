@@ -4739,9 +4739,11 @@ def create_app(model: Any = None) -> FastAPI:
         rate_headers = _enforce_read_rate_limit(state, request)
         data = _load_user_data(user_id, strict=True)
         safe_user = _safe_filename(user_id)
-        from utils.json_safe import sanitize_json
+        from utils.exporter import sanitize_backup_data
 
-        data = sanitize_json(data)
+        # 与 CLI user-export 同一清洗：助手 JSON 文本里的 NaN / 消息里的
+        # NUL 若不处理，备份能导出却会在 /api/import 恢复时被整条拒绝
+        data = sanitize_backup_data(data)
         if format == "md":
             return Response(
                 content=_user_data_markdown(user_id, data),
@@ -4768,6 +4770,10 @@ def create_app(model: Any = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
                 logger.warning("导出知识片段失败: %s", exc)
                 raise _storage_failure("知识库导出失败", exc) from exc
+        # 历史数据可能含孤立代理项 / 非有限数、助手 JSON 文本里的 NaN、
+        # 消息里的 NUL：与 CLI user-export 同一清洗（含知识片段），否则
+        # 备份「看起来导出成功」却在 /api/import 恢复时被整条拒绝
+        backup = sanitize_backup_data(backup)
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
         from utils.user_import import backup_limit_problem
@@ -4781,11 +4787,7 @@ def create_app(model: Any = None) -> FastAPI:
                     "该文件无法再导入恢复，请先删除部分旧会话 / 行程后重试"
                 ),
             )
-        # 历史数据可能含孤立代理项 / 非有限数：清洗后再序列化，
-        # 否则响应 UTF-8 编码 500 或产出前端 JSON.parse 拒绝的非法备份
-        payload = json.dumps(
-            sanitize_json(backup), ensure_ascii=False, indent=2
-        )
+        payload = json.dumps(backup, ensure_ascii=False, indent=2)
         return Response(
             content=payload,
             media_type="application/json",
