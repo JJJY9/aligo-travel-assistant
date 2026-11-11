@@ -10,10 +10,11 @@
 - 结果写入短期 / 长期记忆。
 """
 import asyncio
+import inspect
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from agentscope.message import Msg
@@ -227,9 +228,31 @@ class ConversationRuntime:
                 content=json.dumps(intention_data, ensure_ascii=False),
                 role="assistant",
             )
+            # 编排器的偏好 / 行程写库延迟到整轮落库之后（见下方 commit）：
+            # 取消 / 墓碑否决的回合不能留下没有对应对话的幽灵记录。
+            # 同时校验 reply 是否接受 defer_memory：测试 / 自定义编排器可能
+            # 只替换了 reply，签名不兼容时按旧语义直接调用
+            defer_supported = callable(
+                getattr(self.orchestrator, "commit_deferred_memory", None)
+            )
+            if defer_supported:
+                parameters: Iterable[inspect.Parameter]
+                try:
+                    parameters = inspect.signature(
+                        self.orchestrator.reply
+                    ).parameters.values()
+                except (TypeError, ValueError):
+                    parameters = ()
+                defer_supported = any(
+                    parameter.name == "defer_memory"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
             orchestration = await self._call_with_resilience(
                 lambda: self.orchestrator.reply(
-                    sanitized_intention, on_event=on_event
+                    sanitized_intention,
+                    on_event=on_event,
+                    **({"defer_memory": True} if defer_supported else {}),
                 ),
                 max_retries=int(rc.get("max_retries", 3)),
                 base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
@@ -308,6 +331,13 @@ class ConversationRuntime:
             # 上下文里留下一条永远不会落库、也没有回答的孤立提问。
             self._accumulate_unsettled_usage(usage_value)
             await self._request_staged_rollback(user_input, turn_state)
+        if committed is not False and defer_supported:
+            # 整轮问答已成功落库：现在才提交偏好 / 行程；取消与墓碑否决
+            # 的回合不会执行到这里，避免台账出现没有对话的事实记录
+            try:
+                await self.orchestrator.commit_deferred_memory()
+            except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
+                logger.warning("提交延迟记忆写入失败", exc_info=True)
         # 成功落库（True / 旧的 None 语义）时 _meta.usage 已在消息里；
         # 否决分支已记账——本轮用量已有归宿
         settlement["done"] = True

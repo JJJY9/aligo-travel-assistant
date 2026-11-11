@@ -237,6 +237,10 @@ class OrchestrationAgent(AgentBase):
         self.name = name
         self.agent_registry = agent_registry or {}
         self.memory_manager = memory_manager
+        # defer_memory=True 时暂存的偏好/行程落库负载：由调用方在整轮问答
+        # 成功落库之后通过 commit_deferred_memory 提交（取消 / 墓碑否决的
+        # 回合不能留下没有对应对话的幽灵行程与偏好）
+        self._deferred_memory: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
 
     def register_agent(self, agent_name: str, agent: AgentBase):
         """注册子智能体"""
@@ -253,6 +257,7 @@ class OrchestrationAgent(AgentBase):
         self,
         x: Msg | list[Msg] | None = None,
         on_event: ProgressCallback | None = None,
+        defer_memory: bool = False,
     ) -> Msg:
         """
         协调执行流程
@@ -427,15 +432,37 @@ class OrchestrationAgent(AgentBase):
         # 聚合结果
         final_result = self._aggregate_results(results, intention_data)
 
-        # 更新记忆（长期 / 短期写入是阻塞 IO，放到线程池）
+        # 更新记忆（长期 / 短期写入是阻塞 IO，放到线程池）。defer_memory
+        # 由对话运行时使用：偏好 / 行程必须等整轮问答成功落库后再写，
+        # 否则取消、墓碑否决、编辑重发都会留下幽灵行程与偏好
         if self.memory_manager:
-            await asyncio.to_thread(self._update_memory, intention_data, results)
+            if defer_memory:
+                self._deferred_memory = (intention_data, results)
+            else:
+                await asyncio.to_thread(
+                    self._update_memory, intention_data, results
+                )
 
         return Msg(
             name=self.name,
             content=json.dumps(final_result, ensure_ascii=False),
             role="assistant"
         )
+
+    async def commit_deferred_memory(self) -> bool:
+        """提交 defer_memory=True 暂存的偏好 / 行程写入。
+
+        只应在整轮问答成功落库之后调用：编排完成到落库之间被取消或墓碑
+        否决时，本轮的记忆写入不会执行（没有对话的行程 / 偏好会把台账与
+        统计污染成「用户从未经历过的事实」）。返回是否真的执行了写入。
+        """
+        payload = getattr(self, "_deferred_memory", None)
+        if not payload:
+            return False
+        self._deferred_memory = None
+        intention_data, results = payload
+        await asyncio.to_thread(self._update_memory, intention_data, results)
+        return True
 
     def _prepare_context(self, intention_data: dict[str, Any]) -> dict[str, Any]:
         """
