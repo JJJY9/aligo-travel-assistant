@@ -448,7 +448,9 @@ class PostgresLongTermMemory:
                 return cursor.rowcount or 0
 
         with self._preference_lock(pref_type):
-            removed = self._run_with_retry(run)
+            # 与 delete_chat_session 同口径：提交后的断连不能重放成
+            # 「0 行删除 → 偏好仍存在」的假象
+            removed = self._run_with_retry(run, replay_safe=False)
         if removed:
             logger.info("Deleted preference from PostgreSQL: %s", pref_type)
         return bool(removed)
@@ -714,7 +716,11 @@ class PostgresLongTermMemory:
                 )
                 return removed
 
-        removed = self._run_with_retry(run)
+        # 非重放：DELETE 已在服务端提交、但连接在 COMMIT 响应阶段断开时，
+        # 重连重放会匹配 0 行并把真实删除数报成 0（JSON 后端没有这条路径，
+        # 总是返回真实条数；Web DELETE 与导入墓碑回滚都用该计数）。与
+        # delete_last_turn 同口径：连接错误按持久化失败上报、由调用方重试
+        removed = self._run_with_retry(run, replay_safe=False)
         if removed:
             logger.info(
                 "Deleted chat session from PostgreSQL: %s (%s messages)", session_id, removed

@@ -3475,6 +3475,10 @@ def create_app(model: Any = None) -> FastAPI:
         safe_user = _safe_filename(user_id, "user")
         if format == "html":
             html, count = render_all_sessions_html(user_id, messages, titles)
+            if not count:
+                # 只有旧版无 session_id 的消息时渲染结果是空台账：备份脚本
+                # 会把 200 空文件当作导出成功（CLI 已按渲染条数返回失败）
+                raise HTTPException(status_code=404, detail="没有可导出的会话")
             filename = f"aligo_sessions_{safe_user}.html"
             logger.info("Exported %s sessions (html) for %s", count, user_id)
             return Response(
@@ -3486,6 +3490,8 @@ def create_app(model: Any = None) -> FastAPI:
                 },
             )
         markdown, count = render_all_sessions_markdown(user_id, messages, titles)
+        if not count:
+            raise HTTPException(status_code=404, detail="没有可导出的会话")
         filename = f"aligo_sessions_{safe_user}.md"
         logger.info("Exported %s sessions for %s", count, user_id)
         return Response(
@@ -3717,7 +3723,17 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
         await asyncio.to_thread(_enforce_write_rate_limit, state, request)
-        async with state.lock_for(user_id):
+        # 用户锁有界等待（与「删除最后一轮」同一语义）：长回合（单智能体
+        # 上限 300 秒）期间排队的删除会在前端 120 秒超时提示失败后又真正
+        # 执行（uvicorn 断连不取消 ASGI 任务），界面与服务端不一致
+        lock = state.lock_for(user_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_DELETE_LOCK_TIMEOUT_SEC)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise HTTPException(
+                status_code=409, detail="会话正在生成回复，请稍后再试"
+            ) from None
+        try:
             def _exists() -> bool:
                 # 破坏性操作：PostgreSQL 不可用时 strict 打开返回 503，
                 # 不能在回退 JSON 上判断「不存在」并撤销墓碑
@@ -3791,6 +3807,8 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
+        finally:
+            lock.release()
         return {"session_id": session_id, "deleted": removed}
 
     async def _delete_last_turn_impl(
