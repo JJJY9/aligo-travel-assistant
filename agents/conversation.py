@@ -31,6 +31,7 @@ from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import has_preference_value
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
+from utils.usage import add_usage
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,9 @@ class ConversationRuntime:
         # 回滚删掉下一轮文本相同的提问
         self._last_persist_turn: tuple[str, dict[str, bool]] | None = None
         self._pending_rollback: asyncio.Future | None = None
+        # 失败 / 被墓碑否决回合的用量账目：这些回合没有消息可承载 _meta.usage，
+        # 累计到下一轮成功回合一起写入，否则面板与趋势永久少记
+        self._unsettled_usage: dict[str, Any] | None = None
 
         self.memory = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
         self.intention_agent = IntentionAgent(name="IntentionAgent", model=model)
@@ -180,6 +184,7 @@ class ConversationRuntime:
         # 长期记忆里不会留下没有回复的孤儿提问（CLI 同款时序）
         persist_started = False
         committed: bool | None = None
+        usage_value: dict[str, Any] | None = None
         turn_state = {"rollback_requested": False}
         # 上一轮落库 / 回滚可能仍在途（用户停止后 drain 超时、后台回滚线程
         # 未结束）：先等它收尾，失败 / 否决时在这里补回滚，再暂存本轮提问。
@@ -217,7 +222,8 @@ class ConversationRuntime:
                 {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
                 for item in result_data.get("results", [])
             ]
-            usage = self._usage_delta(usage_before)
+            usage = self._drain_unsettled_usage(self._usage_delta(usage_before))
+            usage_value = usage
             elapsed = round(time.time() - start, 2)
             meta = build_turn_meta(intention_data, result_data, usage=usage, elapsed=elapsed)
             if turn_id:
@@ -246,20 +252,31 @@ class ConversationRuntime:
             )
             persist_started = True
             committed = await asyncio.shield(pending)
-        except BaseException:
+        except BaseException as exc:
             # 编排失败 / 取消：暂存的用户提问必须跟着回滚——保留的话，重试
             # 同一问题会在上下文里出现两条重复提问，而长期记忆里没有对应
             # 轮次，两层记忆从此不一致。落库线程已在途（用户停止时常常如此）
             # 就跳过：它会把整轮问答完整写入长期记忆。
             if not persist_started or self._pending_persist is None:
                 await self._request_staged_rollback(user_input, turn_state)
+            # 本轮用量没有写进任何持久化消息：记账到下一轮成功回合，否则
+            # 下一轮的增量会把它们一起减掉，面板 / 趋势永久少记。
+            # 落库已启动且失败（非取消）时用量确实没落库，同样记账；
+            # 取消时写线程仍会带着 _meta.usage 写完，不重复计。
+            if not persist_started or isinstance(exc, Exception):
+                self._accumulate_unsettled_usage(
+                    usage_value
+                    if usage_value is not None
+                    else self._usage_delta(usage_before)
+                )
             # 在途落库的完成回调会在写入失败 / 守卫否决时补回滚
             raise
         if committed is False:
             # 存储层在写入锁内判定会话已删除（墓碑否决整轮）：暂存的提问也
             # 按删除语义回滚，避免墓碑随后被撤销（删除失败）时上下文里留下
-            # 一条永远不会落库、也没有回答的孤立提问
+            # 一条永远不会落库、也没有回答的孤立提问。本轮用量同样记账。
             await self._request_staged_rollback(user_input, turn_state)
+            self._accumulate_unsettled_usage(usage_value)
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
@@ -532,6 +549,29 @@ class ConversationRuntime:
                 self.circuit_breaker.record_failure()
                 self._probe_recorded = True
             raise
+
+    def _accumulate_unsettled_usage(self, usage: dict[str, Any] | None) -> None:
+        """未落库回合的用量记账：并入下一轮成功回合的 _meta.usage。
+
+        用量是会话级累计器（只增不减）：失败 / 取消回合的模型调用若不计入
+        任何消息，下一轮的增量快照会把它们一起减掉，Web 用量面板与近 7 天
+        趋势因此永久少记。
+        """
+        if not usage:
+            return
+        self._unsettled_usage = add_usage(
+            getattr(self, "_unsettled_usage", None), usage
+        )
+
+    def _drain_unsettled_usage(
+        self, usage: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """把之前未结算的用量并入本轮用量并清空账目（本轮若落库失败会再记账）。"""
+        pending = getattr(self, "_unsettled_usage", None)
+        if not pending:
+            return usage
+        self._unsettled_usage = None
+        return add_usage(pending, usage)
 
     def _usage_snapshot(self) -> dict[str, Any] | None:
         tracker = getattr(self.model, "usage", None)

@@ -392,6 +392,47 @@ def test_process_query_sanitizes_surrogates_before_persist():
     print("✓ CLI 模型输出代理项在落库前转义")
 
 
+def test_failed_turn_usage_carried_to_next_success():
+    """失败整轮的 token 计入下一轮展示与落库元数据（不永久少记）。"""
+    import types
+
+    from config_agentscope import UsageTracker
+    from utils.turn_meta import extract_turn_meta
+
+    agent, events = _make_cli_stub()
+    tracker = UsageTracker()
+    agent.model = types.SimpleNamespace(usage=tracker)
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=120)
+
+    class _Boom:
+        async def reply(self, intention, on_event=None):
+            tracker.calls += 1
+            tracker.input_tokens += 100
+            tracker.output_tokens += 10
+            raise RuntimeError("boom")
+
+    agent.orchestrator = _Boom()
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.process_query("第一轮"))
+
+    class _Ok:
+        async def reply(self, intention, on_event=None):
+            tracker.calls += 1
+            tracker.input_tokens += 50
+            tracker.output_tokens += 5
+            return _TextMessage(json.dumps({"results": []}))
+
+    agent.orchestrator = _Ok()
+    asyncio.run(agent.process_query("第二轮"))
+    output = buffer.getvalue()
+    assert "tokens 165" in output, output
+    assistant = events["staged"][-1]
+    meta = extract_turn_meta(assistant)
+    assert meta and meta["usage"]["total_tokens"] == 165, meta
+    print("✓ CLI 失败回合用量并入下一轮展示与落库")
+
+
 def test_process_query_rolls_back_when_persist_vetoed():
     """墓碑否决整轮（persist_turn 返回 False）：回滚暂存提问并明确提示。"""
     agent, events = _make_cli_stub()
@@ -772,6 +813,7 @@ if __name__ == "__main__":
         test_process_query_reloads_long_term_each_turn()
         test_process_query_stages_user_message_before_orchestration()
         test_process_query_rolls_back_when_persist_vetoed()
+        test_failed_turn_usage_carried_to_next_success()
         test_process_query_sanitizes_surrogates_before_persist()
         test_process_query_failure_leaves_no_long_term_user_turn()
         test_process_query_memory_failure_not_counted_by_breaker()

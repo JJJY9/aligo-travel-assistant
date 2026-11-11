@@ -548,6 +548,44 @@ def test_rollback_failure_does_not_mask_original_error():
     print("✓ 回滚失败不掩盖原始错误")
 
 
+def test_failed_turn_usage_settled_in_next_turn():
+    """失败回合的 token 记账到下一轮成功回合（用量面板不再永久少记）。"""
+    import types
+
+    from config_agentscope import UsageTracker
+    from utils.turn_meta import extract_turn_meta
+
+    runtime, memory = _make_runtime()
+    tracker = UsageTracker()
+    runtime.model = types.SimpleNamespace(usage=tracker)
+
+    class _BoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            tracker.calls += 1
+            tracker.input_tokens += 100
+            tracker.output_tokens += 10
+            raise RuntimeError("boom")
+
+    runtime.orchestrator = _BoomOrchestrator()
+    with pytest.raises(RuntimeError):
+        asyncio.run(runtime.ask("第一轮"))
+
+    class _OkOrchestrator:
+        async def reply(self, intention, on_event=None):
+            tracker.calls += 1
+            tracker.input_tokens += 50
+            tracker.output_tokens += 5
+            return _Response(json.dumps({"results": []}))
+
+    runtime.orchestrator = _OkOrchestrator()
+    result = asyncio.run(runtime.ask("第二轮"))
+    assert result["usage"]["total_tokens"] == 165, result["usage"]
+    assistant = [content for role, content in memory.events if role == "assistant"][-1]
+    meta = extract_turn_meta(assistant)
+    assert meta and meta["usage"]["total_tokens"] == 165, meta
+    print("✓ 失败回合的 token 用量并入下一轮落库元数据")
+
+
 def test_memory_without_rollback_hook_is_tolerated():
     """记忆实现没有 rollback_staged_message 时失败路径照常返回。"""
     runtime, memory = _make_runtime()
@@ -720,6 +758,7 @@ if __name__ == "__main__":
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
     test_memory_without_rollback_hook_is_tolerated()
+    test_failed_turn_usage_settled_in_next_turn()
     test_memory_persistence_error_not_counted_as_model_failure()
     test_open_circuit_short_circuits_ask()
     test_model_call_failure_counts_towards_breaker(mp)
