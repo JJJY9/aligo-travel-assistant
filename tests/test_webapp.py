@@ -4349,6 +4349,51 @@ def test_sessions_export_rejects_messages_without_session():
     print("✓ 会话导出按渲染条数判断空")
 
 
+def test_session_detail_tolerates_deep_meta():
+    """旧数据 _meta 嵌套数千层：会话详情 / 状态接口不能递归过深而 500。"""
+    user_id = _unique_user("web_test_deep_meta")
+    deep: dict[str, object] = {"leaf": 1}
+    # Python 3.10 的 json 编码器在约 1000 层递归即溢出：取 300 层
+    # （远高于清洗上限 50，同时可被 json.dumps 正常编码）
+    for _ in range(300):
+        deep = {"next": deep}
+    content = json.dumps({"status": "completed", "results": [], "_meta": deep})
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "问题",
+                        "session_id": "s-deep",
+                        "timestamp": "2026-01-01T00:00:00",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "session_id": "s-deep",
+                        "timestamp": "2026-01-01T00:00:01",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _client()
+    try:
+        response = client.get(
+            "/api/sessions/s-deep", params={"user_id": user_id}
+        )
+        assert response.status_code == 200, response.text
+        status = client.get("/api/status", params={"user_id": user_id})
+        assert status.status_code == 200, status.text
+    finally:
+        _cleanup(user_id)
+    print("✓ 超深 _meta 不再让会话详情 500")
+
+
 def test_null_session_id_is_not_a_ghost_session():
     """session_id 为 None 的旧消息不能被当成名为 None 的会话。"""
     user_id = _unique_user("web_test_null_session")
