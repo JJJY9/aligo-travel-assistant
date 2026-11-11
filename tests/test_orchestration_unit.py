@@ -474,6 +474,39 @@ def test_agent_result_surrogates_sanitized_before_persist():
     print("✓ 技能结果的孤立代理项在落库前转义")
 
 
+def test_model_output_nul_stripped_before_memory():
+    """模型输出里的 NUL 在落库前剔除（PostgreSQL 会确定性拒绝）。"""
+    memory = _StubMemory()
+
+    class _NulStub(_StubAgent):
+        async def reply(self, x):
+            payload = {
+                "preferences": [
+                    {
+                        "type": "hotel_brands",
+                        "value": "汉" + chr(0) + "庭",
+                        "action": "replace",
+                    }
+                ],
+                "has_preferences": True,
+            }
+            return Msg(
+                name=self.name,
+                content=json.dumps(payload, ensure_ascii=False),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={"preference": _NulStub("preference")},
+        memory_manager=memory,
+    )
+    asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "preference", "priority": 1}]))
+    )
+    assert memory.long_term.get_preference("hotel_brands") == "汉庭"
+    print("✓ 技能结果的 NUL 在落库前剔除")
+
+
 def test_preference_payload_with_extra_keys_does_not_write_garbage():
     """包裹层带 note 等说明键时，不能把 preferences/note 当偏好落库。"""
     memory = _StubMemory()
@@ -2236,6 +2269,150 @@ def test_update_memory_derives_end_date_from_duration():
     print("✓ duration_days 补出返程日期（非法时长不补）")
 
 
+def _trip_orchestrator(memory):
+    return OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+
+def _trip_results(event: dict) -> list[dict]:
+    return [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        },
+        {
+            "agent_name": "event_collection",
+            "status": "success",
+            "result": {"status": "success", "data": event},
+        },
+    ]
+
+
+def test_trip_save_does_not_overwrite_purpose_with_default():
+    """未抽取到 trip_purpose 时不能把默认「旅游」写回既有行程。"""
+    memory = _StubMemory()
+    orchestrator = _trip_orchestrator(memory)
+    base = {
+        "origin": "北京",
+        "destination": "杭州",
+        "start_date": "2026-03-11",
+        "end_date": "2026-03-18",
+    }
+    orchestrator._update_memory({}, _trip_results({**base, "trip_purpose": "出差"}))
+    orchestrator._update_memory({}, _trip_results(base))
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1, trips
+    assert trips[0]["purpose"] == "出差", "未提交的目的不能被模板默认值覆盖"
+    print("✓ 行程目的缺失时不覆盖既有值")
+
+
+def test_preference_single_object_is_wrapped():
+    """preferences 返回单个 {type,value,action} 对象时按单条偏好处理。"""
+    memory = _StubMemory()
+    orchestrator = _trip_orchestrator(memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": {
+                            "type": "hotel_brands",
+                            "value": "汉庭",
+                            "action": "append",
+                        }
+                    },
+                },
+            }
+        ],
+    )
+    prefs = memory.long_term.get_preference()
+    assert prefs.get("hotel_brands") == ["汉庭"], prefs
+    assert "type" not in prefs and "value" not in prefs and "action" not in prefs
+    print("✓ 单对象偏好按单条落库（不写垃圾键）")
+
+
+def test_trip_origin_backfilled_from_existing_trip():
+    """后续轮次缺出发地时回填既有同趟行程的 origin，避免拆成两条。"""
+    memory = _StubMemory()
+    orchestrator = _trip_orchestrator(memory)
+    orchestrator._update_memory(
+        {},
+        _trip_results(
+            {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-03-11",
+                "end_date": "2026-03-18",
+            }
+        ),
+    )
+    orchestrator._update_memory(
+        {},
+        _trip_results(
+            {
+                "destination": "杭州",
+                "start_date": "2026-03-11",
+                "end_date": "2026-03-18",
+            }
+        ),
+    )
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1, trips
+    assert trips[0]["origin"] == "北京"
+    print("✓ 缺出发地时回填既有行程 origin")
+
+
+def test_trip_duration_overflow_does_not_abort_turn():
+    """9999-12-31 + 长时长推导返程越界：不抛异常，按单日落库。"""
+    memory = _StubMemory()
+    orchestrator = _trip_orchestrator(memory)
+    orchestrator._update_memory(
+        {},
+        _trip_results(
+            {
+                "destination": "杭州",
+                "start_date": "9999-12-31",
+                "duration_days": 7,
+            }
+        ),
+    )
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1, trips
+    assert (trips[0]["end_date"] or trips[0]["start_date"]) == "9999-12-31"
+    print("✓ 返程日期推导越界时按单日落库")
+
+
+def test_trip_saved_from_intention_entities_when_event_empty():
+    """本轮无事项抽取结果时用意图 key_entities 兜底保存行程。"""
+    memory = _StubMemory()
+    orchestrator = _trip_orchestrator(memory)
+    results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        }
+    ]
+    orchestrator._update_memory(
+        {
+            "key_entities": {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-03-11",
+            }
+        },
+        results,
+    )
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1, trips
+    assert trips[0]["destination"] == "杭州"
+    print("✓ 事项抽取缺失时回退意图实体落库")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -2287,6 +2464,12 @@ if __name__ == "__main__":
     test_update_memory_skips_failed_event_collection()
     test_update_memory_isolates_trip_save_failure()
     test_update_memory_derives_end_date_from_duration()
+    test_trip_save_does_not_overwrite_purpose_with_default()
+    test_preference_single_object_is_wrapped()
+    test_trip_origin_backfilled_from_existing_trip()
+    test_trip_duration_overflow_does_not_abort_turn()
+    test_trip_saved_from_intention_entities_when_event_empty()
+    test_model_output_nul_stripped_before_memory()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)

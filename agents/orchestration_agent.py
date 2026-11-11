@@ -26,7 +26,7 @@ from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.agent_names import canonical_agent_name
-from utils.json_safe import sanitize_json
+from utils.json_safe import sanitize_json, strip_nul
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import (
     has_preference_value,
@@ -526,6 +526,11 @@ class OrchestrationAgent(AgentBase):
             # 当偏好类型落库——此前只有在没有其它键时才解包，带 note 的
             # 结果会把 "preferences" / "note" 写成垃圾偏好
             return raw.get("preferences")
+        if isinstance(raw, dict) and "type" in raw and "value" in raw:
+            # 模型常见的单对象偏差：{"preferences": {type, value, action}}。
+            # 按旧格式 {类型: 值} 表落库会写入 type / value / action 三条
+            # 垃圾偏好并把真实偏好（hotel_brands 等）丢掉
+            return [raw]
         return raw
 
     def _context_with_previous_preferences(
@@ -819,8 +824,10 @@ class OrchestrationAgent(AgentBase):
 
             # 技能结果会直接进入 _update_memory 落库（偏好 / 行程）与聚合
             # 回复：孤立代理项必须在写库前转义，否则 UTF-8 写入抛
-            # MemoryPersistenceError，整轮在技能 LLM 调用完成后作废
-            result = sanitize_json(result)
+            # MemoryPersistenceError，整轮在技能 LLM 调用完成后作废；
+            # NUL 在 PostgreSQL（JSONB / TEXT）确定性写入失败而 JSON 后端
+            # 能保存——与 Web / 备份恢复同口径，入库前剔除
+            result = strip_nul(sanitize_json(result))
 
             # 智能体可能用顶层 error / status=error 表示失败，也可能把失败
             # 嵌套在 results 里并标记 query_success=false（query-info 等技能）；
@@ -953,6 +960,42 @@ class OrchestrationAgent(AgentBase):
         self.memory_manager.long_term.save_preference(pref_type, pref_value)
         logger.info("Replaced preference: %s", pref_type)
 
+    def _infer_trip_origin(
+        self,
+        origin: str,
+        destination: str,
+        start_date: str,
+        end_date: str | None,
+    ) -> str:
+        """本轮未抽取到出发地时推断：既有同趟行程的 origin → 常住地偏好。
+
+        行程身份包含 origin：以空串落库会把同一趟行程拆成两条（统计 /
+        常去目的地翻倍、两条互相报日期冲突，trips-dedupe 因 origin 不同
+        也无法归组），因此能从历史或偏好推断时不要用空串。
+        """
+        if origin:
+            return origin
+        want_end = end_date or start_date
+        try:
+            trips = self.memory_manager.long_term.get_trip_history(limit=None)
+        except Exception:  # noqa: BLE001 - 推断失败退回空串（行为与旧版一致）
+            trips = []
+        for trip in trips:
+            if _trip_field(trip.get("destination")) != destination:
+                continue
+            if _trip_date(trip.get("start_date")) != start_date:
+                continue
+            if (_trip_date(trip.get("end_date")) or start_date) != want_end:
+                continue
+            existing = _trip_field(trip.get("origin"))
+            if existing:
+                return existing
+        try:
+            home = self.memory_manager.long_term.get_preference("home_location")
+        except Exception:  # noqa: BLE001 - 推断失败退回空串
+            home = None
+        return _trip_field(home)
+
     def _update_memory(self, intention_data: dict[str, Any], results: list[dict]):
         """
         更新记忆系统
@@ -1065,9 +1108,28 @@ class OrchestrationAgent(AgentBase):
                         )
                         break
 
-                    # 从 event_data 获取行程信息；模型可能给出列表（多目的地）
-                    # 或数字，统一转成单行文本再落库（不可哈希值会让统计
-                    # 更新抛 TypeError，整轮回复作废）
+                    # 本轮事项抽取缺失的字段用意图识别的 key_entities 兜底：
+                    # 行程信息在上一轮陈述、本轮只说「按刚才说的规划」时，
+                    # event_collection 只读本轮原话会缺目的地 / 日期，规划
+                    # 成功却不落库（台账 / 日历 / 记忆查询全部没有）
+                    entities = intention_data.get("key_entities")
+                    if isinstance(entities, dict):
+                        for key in (
+                            "origin",
+                            "destination",
+                            "start_date",
+                            "end_date",
+                            "trip_purpose",
+                            "duration_days",
+                        ):
+                            if (
+                                event_data.get(key) in (None, "")
+                                and entities.get(key)
+                            ):
+                                event_data[key] = entities[key]
+
+                    # 模型可能给出列表（多目的地）或数字，统一转成单行文本
+                    # 再落库（不可哈希值会让统计更新抛 TypeError，整轮作废）
                     origin = _trip_field(event_data.get("origin"))
                     destination = _trip_field(event_data.get("destination"))
                     start_date = _trip_date(event_data.get("start_date"))
@@ -1081,27 +1143,44 @@ class OrchestrationAgent(AgentBase):
                             event_data.get("duration_days")
                         )
                         if duration:
-                            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                            end_date = (
-                                start_dt + timedelta(days=duration - 1)
-                            ).date().isoformat()
-                    purpose = _trip_field(event_data.get("trip_purpose")) or "旅游"
-
-                    # 保存到长期记忆：必须有出发日期——没有日期的行程无法参与
-                    # 去重（_find_same_trip 对缺 start_date 直接跳过），复述或
-                    # 「重新生成」会让同一条无日期行程被反复写入、统计累加
+                            try:
+                                start_dt = datetime.strptime(
+                                    start_date, "%Y-%m-%d"
+                                )
+                                end_date = (
+                                    start_dt + timedelta(days=duration - 1)
+                                ).date().isoformat()
+                            except (OverflowError, ValueError):
+                                # 9999-12-31 这类「未定」占位日期 + 长时长会
+                                # 越界：异常穿出会让整轮对话作废，按单日落库
+                                logger.warning(
+                                    "返程日期推导越界（%s + %s 天），按单日落库",
+                                    start_date,
+                                    duration,
+                                )
+                    purpose = _trip_field(event_data.get("trip_purpose"))
                     if destination and start_date:
+                        origin = self._infer_trip_origin(
+                            origin, destination, start_date, end_date
+                        )
+                        record: dict[str, Any] = {
+                            "origin": origin,
+                            "destination": destination,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "session_id": getattr(
+                                self.memory_manager, "session_id", None
+                            ),
+                        }
+                        # 未抽取到目的时不写默认值：命中既有行程时存储层会
+                        # 用非 None 目的覆盖（把用户改过的「出差」变回模板
+                        # 值），与 trip-add 的修复同口径
+                        if purpose:
+                            record["purpose"] = purpose
                         try:
-                            self.memory_manager.long_term.save_trip_history({
-                                "origin": origin,
-                                "destination": destination,
-                                "start_date": start_date,
-                                "end_date": end_date,
-                                "purpose": purpose,
-                                "session_id": getattr(
-                                    self.memory_manager, "session_id", None
-                                ),
-                            })
+                            self.memory_manager.long_term.save_trip_history(
+                                record
+                            )
                             logger.info("Saved trip to long-term memory")
                         except Exception as exc:  # noqa: BLE001 - 行程写入失败不阻断回复
                             logger.warning(

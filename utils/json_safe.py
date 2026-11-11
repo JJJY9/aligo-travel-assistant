@@ -27,6 +27,23 @@ def _safe_text(text: str) -> str:
         return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
+def strip_nul(value: Any) -> Any:
+    """递归移除字符串中的 NUL。
+
+    PostgreSQL 的 JSONB / TEXT 都拒绝 `\\u0000`：模型输出里的 NUL 会让
+    偏好 / 行程写入确定性失败（被逐条吞掉、回复却宣称已保存），JSON 后端
+    却能保存——同一对话跨后端行为分叉。写入口径与 Web 请求 / 备份恢复
+    一致：入库前剔除。
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [strip_nul(item) for item in value]
+    if isinstance(value, dict):
+        return {key: strip_nul(item) for key, item in value.items()}
+    return value
+
+
 def sanitize_json(value: Any, _depth: int = 0) -> Any:
     """把 NaN / Infinity 归一为 None、孤立代理项转义（递归处理列表与字典）。
 
