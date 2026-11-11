@@ -2725,7 +2725,11 @@ if __name__ == "__main__":
     test_migrate_recomputes_counters_after_dropping_entries()
     test_pg_reconnects_after_connection_error()
     test_pg_schema_initialized_once_per_process()
-    test_pg_connect_sets_lock_timeout_and_keepalives()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_pg_connect_sets_lock_timeout_and_keepalives(_mp)
+    finally:
+        _mp.undo()
     test_pg_schema_tolerates_concurrent_create_race()
     test_pg_failed_retry_wrapped_as_memory_error()
     test_falsey_preferences_included_in_context()
