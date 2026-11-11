@@ -359,6 +359,20 @@ def test_panel_fixes_cursor_stale_session_and_import_batches():
     print("✓ 面板修复：会话游标 / 幽灵会话 / 知识导入分批")
 
 
+def test_reconcile_confirms_after_open_session():
+    """停止对账：openSession 后以最新数据确认，迟到的落库不再误报未保存。"""
+    data = _run_harness("reconcile")
+    late = data["persistedLate"]
+    assert late["input"] == "", late
+    assert late["toasts"] == [], late
+    assert late["open_calls"] == 1, late
+
+    missing = data["stillMissing"]
+    assert missing["input"] == "你好", missing
+    assert any("没有保存" in item for item in missing["toasts"]), missing
+    print("✓ 停止对账按最终确认结果判定是否保存")
+
+
 def test_chat_done_persisted_signal():
     """落库被墓碑否决：done(persisted=false) 标记提问为临时并切回新对话。"""
     data = _run_harness("chatPersisted")
@@ -389,5 +403,6 @@ if __name__ == "__main__":
     test_startup_does_not_override_user_session_click()
     test_knowledge_eval_panel_states()
     test_panel_fixes_cursor_stale_session_and_import_batches()
+    test_reconcile_confirms_after_open_session()
     test_chat_done_persisted_signal()
     print("\n全部通过")

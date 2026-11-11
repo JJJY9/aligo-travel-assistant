@@ -2762,6 +2762,26 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId) {
           keepOnError: true,
           preserveOnEmpty: true,
         });
+        // openSession 的重新拉取可能刚好包含迟到的落库（服务端 drain 上限
+        // 10 秒，客户端判定期限 ~3 秒）：以最新数据为准再确认一次，避免界面
+        // 已显示保存的问答却把提问塞回输入框并提示「没有保存」，用户重发
+        // 后历史出现两条相同问答
+        try {
+          const latest = await getJSON(
+            `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+          );
+          if (
+            canSync() &&
+            latest &&
+            Array.isArray(latest.messages) &&
+            isPersisted(latest.messages)
+          ) {
+            return;
+          }
+        } catch (_) {
+          /* 确认请求失败：按未保存处理 */
+        }
+        if (!canSync()) return;
         if (!els.input.value.trim()) {
           els.input.value = message;
           resizeInput();

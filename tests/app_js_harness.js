@@ -986,6 +986,65 @@ async function scenarioPanelFixes(source) {
   return results;
 }
 
+async function waitRequest(env) {
+  for (let i = 0; i < 120; i += 1) {
+    if (env.__requests.length) return env.__requests.shift();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("getJSON request not queued");
+}
+
+async function scenarioReconcile(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const oldMessages = [{ role: "user", content: "旧提问" }];
+  const newMessages = [
+    { role: "user", content: "你好" },
+    {
+      role: "assistant",
+      content: "回答",
+      meta: { client_turn_id: "turn-1" },
+    },
+  ];
+  run(`
+    document.querySelector = () => null;
+    state.userId = "u1";
+    state.sessionId = "s1";
+    state.busy = false;
+    sessionLoadToken = 5;
+    els.input.value = "";
+    globalThis.__openCalls = 0;
+    openSession = async () => { __openCalls += 1; };
+    resizeInput = () => {};
+  `);
+
+  const runCase = async (finalMessages) => {
+    run('__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = "";');
+    const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
+    // attempt 0..2 的轮询，以及 attempt 3 的确认轮询：都先给旧数据
+    for (let i = 0; i < 4; i += 1) {
+      const request = await waitRequest(env);
+      request.resolve({ messages: oldMessages });
+      await tick();
+    }
+    // attempt 3：openSession 后追加的最终确认请求
+    const confirm = await waitRequest(env);
+    confirm.resolve({ messages: finalMessages });
+    await promise;
+    await tick();
+    return {
+      input: run("els.input.value"),
+      toasts: run("__toasts.slice()"),
+      open_calls: run("__openCalls"),
+    };
+  };
+
+  const persistedLate = await runCase(newMessages);
+  const stillMissing = await runCase(oldMessages);
+  return { persistedLate, stillMissing };
+}
+
+
 function scenarioChatPersisted(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1086,6 +1145,8 @@ async function main() {
     payload = await scenarioPanelFixes(source);
   } else if (scenario === "startup") {
     payload = await scenarioStartup(source);
+  } else if (scenario === "reconcile") {
+    payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
     payload = scenarioChatPersisted(source);
   } else {
