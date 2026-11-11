@@ -26,7 +26,7 @@ class _Response:
         if self._error is not None:
             raise self._error
 
-    def json(self):
+    def json(self, **kwargs):
         return self._data
 
 
@@ -770,6 +770,70 @@ def test_second_reclaim_follower_reuses_degraded(monkeypatch):
     print("✓ 二次等待：复用降级旧数据")
 
 
+def test_follower_rounds_exhausted_reports_busy_without_upstream(monkeypatch):
+    """等待轮次用尽仍无结果：报「繁忙」并登记失败，不能各自打上游（惊群）。"""
+    stored = []
+    state, _finished = _patch_reclaim_env(
+        monkeypatch,
+        claim_sequence=[False] * 10,
+        cache_values=[None],
+        failure_values=[None],
+        degraded_values=[None],
+    )
+    monkeypatch.setattr(
+        weather, "_store_failure", lambda key, msg: stored.append(msg)
+    )
+    with pytest.raises(weather.WeatherError) as excinfo:
+        weather.fetch_weather("北京", timeout=0.01)
+    assert "繁忙" in str(excinfo.value)
+    assert state["claims"] == weather._FOLLOWER_WAIT_ROUNDS + 1
+    assert stored, "轮次用尽应登记失败缓存，后续请求快速失败"
+    print("✓ 等待轮次用尽报繁忙，不擅自打上游")
+
+
+def test_non_finite_upstream_values_raise_weather_error(monkeypatch):
+    """NaN / 1e400 等非有限数值不能进入缓存（JSON 序列化会 500）。"""
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if "geocoding" in url:
+            return _Response(_geo())
+        data = _forecast()
+        data["current"]["temperature_2m"] = float("nan")
+        return _Response(data)
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    with pytest.raises(weather.WeatherError):
+        weather.fetch_weather("北京")
+    assert weather._cache_hit(weather._cache_key("北京")) is None
+    print("✓ 非有限上游数值被拒绝，不进入缓存")
+
+
+def test_describe_tolerates_non_finite_codes():
+    assert weather._describe(float("inf")) == "未知"
+    assert weather._describe(float("nan")) == "未知"
+    print("✓ 非有限天气码不再抛 OverflowError")
+
+
+def test_upstream_window_limits_rotating_cities(monkeypatch):
+    """全进程上游窗口用尽时拒绝请求：轮换城市名不能绕过 /api/weather 的 IP 桶。"""
+    now = time.monotonic()
+    for _ in range(weather._UPSTREAM_MAX_PER_MINUTE):
+        weather._upstream_calls.append(now)
+    calls = []
+    monkeypatch.setattr(
+        weather.requests, "get", lambda *a, **k: calls.append(1) or _Response(_geo())
+    )
+    with pytest.raises(weather.WeatherError) as excinfo:
+        weather.fetch_weather("北京")
+    assert "频繁" in str(excinfo.value)
+    assert calls == [], "额度用尽后不能再请求上游"
+    # 失败缓存已登记：紧随其后的请求快速失败
+    with pytest.raises(weather.WeatherError):
+        weather.fetch_weather("北京")
+    assert calls == []
+    print("✓ 全进程上游窗口限制生效")
+
+
 if __name__ == "__main__":
     for case in (
         test_stale_fallback_merges_concurrent_requests,
@@ -801,6 +865,9 @@ if __name__ == "__main__":
         test_second_wait_follower_reuses_cached,
         test_fetch_uncached_wraps_missing_location_fields,
         test_failure_cache_evicts_oldest_when_full,
+        test_follower_rounds_exhausted_reports_busy_without_upstream,
+        test_non_finite_upstream_values_raise_weather_error,
+        test_upstream_window_limits_rotating_cities,
     ):
         mp = pytest.MonkeyPatch()
         try:
@@ -810,4 +877,5 @@ if __name__ == "__main__":
     test_empty_city_raises()
     test_parse_weather_tolerates_none_daily_entries()
     test_weather_codes_include_freezing_drizzle()
+    test_describe_tolerates_non_finite_codes()
     print("\n全部通过")
