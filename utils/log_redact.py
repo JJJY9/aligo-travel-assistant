@@ -14,6 +14,26 @@ _BARE_USERINFO = re.compile(r"(?<![\w+.-])([A-Za-z0-9_.%+-]+):([^\s@/:;,]+)@")
 _KEY_VALUE = re.compile(
     r"(?i)((?:password|pwd|api[_-]?key|secret|token)\s*=\s*)[^\s;]+"
 )
+# 本机绝对路径与上游 URL：技能错误文本会经编排层渲染给用户（Web / CLI），
+# 嵌入模型缓存目录、Milvus 库文件路径、下载地址都不应出现在回答里
+_URL_BODY = re.compile(r"https?://[^\s'\"<>）)]+")
+_WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:\\[^\s'\"<>）)]+|\\\\[^\s'\"<>）)]+)")
+_UNIX_PATH = re.compile(
+    r"(?<![\w:/])/(?:home|Users|root|tmp|var|opt|srv|mnt|data|workspace"
+    r"|proc|etc)(?:/[^\s'\"<>）)]+)+"
+)
+
+
+def redact_paths(text: object) -> str:
+    """遮蔽内部绝对路径、上游 URL 与凭据（错误信息可能回流给终端用户）。
+
+    只替换路径 / 链接本身，保留异常的其余文字（如 Connection refused /
+    timeout）：编排层按这些关键词判断瞬时错误并重试，不能一起抹掉。
+    """
+    cleaned = _URL_BODY.sub("http(s)://***", str(text))
+    cleaned = _WINDOWS_PATH.sub("<路径>", cleaned)
+    cleaned = _UNIX_PATH.sub("<路径>", cleaned)
+    return redact_secret(cleaned)
 
 
 def redact_secret(text: object) -> str:
