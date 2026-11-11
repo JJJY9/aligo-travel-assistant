@@ -9,6 +9,14 @@ UnicodeEncodeError，表现为该接口永久 500。
 import math
 from typing import Any
 
+# 递归深度上限：历史 / 手写数据可能带数千层嵌套的 _meta，继续递归会
+# RecursionError——会话详情、状态与导出接口对这类记录会永久 500。
+# 上限取 50：pydantic-core 的响应序列化在约 90 层触发
+# 「Circular reference detected (depth exceeded)」，截断必须低于该限制，
+# 否则清洗后的结构仍会在响应序列化阶段 500。超出部分按 None 截断
+# （与 NaN / Infinity 同一口径），其余数据仍可返回。
+_MAX_JSON_DEPTH = 50
+
 
 def _safe_text(text: str) -> str:
     """把无法 UTF-8 编码的字符串（孤立代理项）转成等价的转义文本。"""
@@ -19,17 +27,25 @@ def _safe_text(text: str) -> str:
         return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
-def sanitize_json(value: Any) -> Any:
-    """把 NaN / Infinity 归一为 None、孤立代理项转义（递归处理列表与字典）。"""
+def sanitize_json(value: Any, _depth: int = 0) -> Any:
+    """把 NaN / Infinity 归一为 None、孤立代理项转义（递归处理列表与字典）。
+
+    嵌套超过 ``_MAX_JSON_DEPTH`` 的子树返回 None：这类结构在序列化 /
+    响应的其它环节同样会触发 RecursionError，截断比整条接口 500 可用。
+    """
+    if _depth >= _MAX_JSON_DEPTH:
+        return None
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, str):
         return _safe_text(value)
     if isinstance(value, list):
-        return [sanitize_json(item) for item in value]
+        return [sanitize_json(item, _depth + 1) for item in value]
     if isinstance(value, dict):
         return {
-            _safe_text(key) if isinstance(key, str) else key: sanitize_json(item)
+            _safe_text(key) if isinstance(key, str) else key: sanitize_json(
+                item, _depth + 1
+            )
             for key, item in value.items()
         }
     return value

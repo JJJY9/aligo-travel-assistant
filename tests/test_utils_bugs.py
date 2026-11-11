@@ -432,6 +432,26 @@ def test_sanitize_json_escapes_surrogates():
     print("✓ sanitize_json 转义孤立代理项并归一 NaN")
 
 
+def test_sanitize_json_depth_guard():
+    """超深嵌套按 None 截断，不抛 RecursionError（旧数据让接口永久 500）。"""
+    from utils.json_safe import sanitize_json
+
+    deep: dict[str, object] = {"leaf": 1}
+    for _ in range(2000):
+        deep = {"next": deep}
+    cleaned = sanitize_json(deep)
+    dumped = json.dumps(cleaned)
+    assert dumped
+    node: object = cleaned
+    depth = 0
+    while isinstance(node, dict) and "next" in node:
+        node = node["next"]
+        depth += 1
+        assert depth <= 300, "深度守卫应立即截断"
+    assert node is None
+    print("✓ sanitize_json 超深嵌套截断")
+
+
 def test_robust_first_json_object_repairs_small_faults():
     """尾逗号等小瑕疵不能整段放弃：修复后仍取出首个对象。"""
     from utils.json_parser import robust_first_json_object
@@ -449,6 +469,7 @@ def test_robust_first_json_object_repairs_small_faults():
 if __name__ == "__main__":
     test_json_parse_failure_raises_value_error()
     test_sanitize_json_escapes_surrogates()
+    test_sanitize_json_depth_guard()
     test_robust_first_json_object_repairs_small_faults()
     test_json_parse_fallback()
     test_json_parse_success_paths_unchanged()
