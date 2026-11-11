@@ -7337,7 +7337,7 @@ def test_knowledge_eval_api(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "knowledge_status",
-        lambda: {
+        lambda **_: {
             "available": True,
             "collection": "kb",
             "documents": 141,
@@ -7360,7 +7360,7 @@ def test_knowledge_eval_api(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "knowledge_status",
-        lambda: {"available": False, "reason": "知识库未初始化", "path": "p"},
+        lambda **_: {"available": False, "reason": "知识库未初始化", "path": "p"},
     )
     assert client.get("/api/knowledge/eval").status_code == 503
 
@@ -7377,7 +7377,7 @@ def test_knowledge_eval_api(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "knowledge_status",
-        lambda: {
+        lambda **_: {
             "available": True,
             "collection": "kb",
             "documents": 141,
@@ -7620,7 +7620,7 @@ def test_knowledge_eval_import_failure(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "knowledge_status",
-        lambda: {"available": True, "collection": "kb", "path": "p"},
+        lambda **_: {"available": True, "collection": "kb", "path": "p"},
     )
     monkeypatch.setitem(
         sys.modules, "agents.rag_knowledge_agent", types.ModuleType("agents.rag_knowledge_agent")
@@ -7979,6 +7979,74 @@ def test_usage_summary_avg_and_top_agents_exact():
     ], usage["top_agents"]
     assert usage["calls"] == 2 and usage["total_tokens"] == 10
     print("✓ usage 汇总的均值与 top_agents 为精确值")
+
+
+def test_usage_summary_total_consistent_with_by_day_for_partial_usage():
+    """备份导入允许只有 total_tokens 的部分 usage：总量与按天必须同口径。"""
+    from datetime import datetime
+
+    from webapp.server import _usage_summary
+
+    today = datetime.now().date().isoformat()
+
+    def _assistant(meta: dict) -> dict:
+        return {
+            "role": "assistant",
+            "content": json.dumps(
+                {"results": [], "_meta": meta}, ensure_ascii=False
+            ),
+            "timestamp": f"{today}T12:00:00",
+            "session_id": "s",
+        }
+
+    history = [
+        # 只有 total_tokens（导入的历史备份形态）
+        _assistant({"usage": {"calls": 1, "total_tokens": 100}}),
+        # 正常形态：input+output 与 total_tokens 一致
+        _assistant(
+            {
+                "usage": {
+                    "calls": 1,
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "total_tokens": 5,
+                }
+            }
+        ),
+    ]
+    usage = _usage_summary(history)
+    assert usage["total_tokens"] == 105, usage
+    bucket = next(d for d in usage["by_day"] if d["date"] == today)
+    assert bucket["tokens"] == usage["total_tokens"], (bucket, usage)
+    assert usage["calls"] == 2
+    print("✓ 部分 usage 的总 tokens 与按天统计同口径")
+
+
+def test_knowledge_eval_bounded_lock_and_masked_status(monkeypatch):
+    """评测端点查状态必须带写锁超时、屏蔽路径与原始异常。"""
+    from webapp import server as server_module
+
+    seen: dict = {}
+
+    def fake_status(**kwargs):
+        seen.update(kwargs)
+        return {
+            "available": False,
+            "reason": "知识库正在写入（导入进行中），请稍后刷新",
+        }
+
+    monkeypatch.setattr(server_module, "knowledge_status", fake_status)
+    response = _client().get("/api/knowledge/eval")
+    assert response.status_code == 503
+    assert seen == {
+        "include_path": False,
+        "detail_errors": False,
+        "lock_timeout": 0.5,
+    }, seen
+    detail = response.json()["detail"]
+    assert "正在写入" in detail
+    assert "milvus_lite.db" not in detail and "C:\\" not in detail
+    print("✓ 评测端点有界等待写锁且不泄露路径 / 原始异常")
 
 
 def test_invalid_user_id_rejected():

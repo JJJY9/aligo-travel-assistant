@@ -2310,9 +2310,24 @@ def _visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
     return visible
 
 
+def _usage_message_total(usage: dict[str, Any]) -> int:
+    """单条消息的 token 总数：优先 input+output，缺失时回退 total_tokens。
+
+    备份导入（utils/user_import）允许只带 total_tokens 的部分 usage；汇总
+    与按天统计必须走同一口径，否则同一份历史在「总 tokens」与近 7 天趋势
+    里给出两个不同数字。
+    """
+    parts = _safe_usage_int(usage.get("input_tokens")) + _safe_usage_int(
+        usage.get("output_tokens")
+    )
+    if parts:
+        return parts
+    return _safe_usage_int(usage.get("total_tokens"))
+
+
 def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     """从历史消息的执行元数据汇总模型用量（旧消息没有 _meta，自动忽略）。"""
-    calls = input_tokens = output_tokens = 0
+    calls = input_tokens = output_tokens = total_tokens = 0
     elapsed_total = 0.0
     elapsed_count = 0
     agent_counts: Counter[str] = Counter()
@@ -2330,6 +2345,8 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
             calls += message_calls
             input_tokens += _safe_usage_int(usage.get("input_tokens"))
             output_tokens += _safe_usage_int(usage.get("output_tokens"))
+            message_tokens = _usage_message_total(usage)
+            total_tokens += message_tokens
 
             timestamp = str(message.get("timestamp") or "")
             try:
@@ -2344,7 +2361,7 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
             if message_day:
                 bucket = by_day.setdefault(message_day, {"calls": 0, "tokens": 0})
                 bucket["calls"] += message_calls
-                bucket["tokens"] += _safe_usage_int(usage.get("total_tokens"))
+                bucket["tokens"] += message_tokens
 
         elapsed = meta.get("elapsed")
         if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
@@ -2377,7 +2394,7 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
         "calls": calls,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": total_tokens,
         "avg_elapsed": (
             round(elapsed_total / elapsed_count, 2)
             if elapsed_count and math.isfinite(elapsed_total)
@@ -2850,7 +2867,12 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             # 先拿评测锁再计额度：已有评测时的 429 不应消耗知识库配额
             response.headers.update(_enforce_kb_rate_limit(state, request))
-            status = knowledge_status()
+            # 与 /api/knowledge 同口径：不泄露本机路径 / 原始异常（备份导入
+            # 可能来自第三方），写锁有界等待（导入持锁时快速 503，而不是
+            # 把共享线程池的一个 worker 钉在导入全程并一直占着评测锁）
+            status = knowledge_status(
+                include_path=False, detail_errors=False, lock_timeout=0.5
+            )
             if not status.get("available"):
                 raise HTTPException(
                     status_code=503,
