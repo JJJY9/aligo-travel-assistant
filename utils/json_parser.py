@@ -213,6 +213,36 @@ def starts_with_json_array(text: str) -> bool:
     return False
 
 
+def _has_unclosed_object(text: str) -> bool:
+    """文本里是否还有未闭合的 ``{``（忽略字符串内的花括号与转义）。
+
+    比「尾部出现带引号键名」更精确：正式结果在写出任何键之前被截断
+    （``{"summary": "下周一…`` / ``{"notes``）时尾部没有任何键名，旧判定
+    会把更早的 prompt 回显示例当成结果；反过来，完整结果后的说明文字里
+    出现 ``{"destination": 城市名}`` 这类带键名的平衡片段，旧判定会误报
+    截断、把有效结果整段丢弃。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+    return depth > 0
+
+
 def _scan_last_json_object_with_keys(
     text: str, keys: "tuple[str, ...]", *, warn: bool = True
 ) -> "tuple[dict | None, bool]":
@@ -225,17 +255,45 @@ def _scan_last_json_object_with_keys(
             selected_end = end
     if selected is None:
         return None, False
-    tail = text[selected_end:]
-    if "{" in tail:
-        for key in keys:
-            if f'"{key}"' in tail:
-                if warn:
-                    logger.warning(
-                        "末尾仍有含 %s 的对象但无法解析（可能被截断），放弃更早的候选",
-                        key,
-                    )
-                return None, True
+    if _has_unclosed_object(text[selected_end:]):
+        if warn:
+            logger.warning(
+                "末尾仍有未闭合的 JSON 对象（可能被截断），放弃更早的候选"
+            )
+        return None, True
     return selected, False
+
+
+def last_json_object_prefer_keys_strict(
+    text: str,
+    strong_keys: "tuple[str, ...]",
+    weak_keys: "tuple[str, ...]",
+) -> "dict | None":
+    """优先取最后一个含强键的对象；没有强键时才回退到最后一个弱键对象。
+
+    行程规划的输出可以是完整包装（含 ``itinerary`` / ``daily_plans``）或
+    裸行程对象（只有 ``title`` / ``duration``）。说明性尾注里的片段
+    （``{"duration": "3天", "note": ...}``）也是弱键对象：与完整行程一起
+    出现时不能顶掉正式结果。末尾出现未闭合对象（截断）时抛 ``ValueError``。
+    """
+    strong: dict | None = None
+    strong_end = -1
+    weak: dict | None = None
+    weak_end = -1
+    for value, end in _iter_objects_with_repair(text):
+        if any(key in value for key in strong_keys):
+            strong, strong_end = value, end
+        elif any(key in value for key in weak_keys):
+            weak, weak_end = value, end
+    if strong is not None:
+        selected, selected_end = strong, strong_end
+    elif weak is not None:
+        selected, selected_end = weak, weak_end
+    else:
+        return None
+    if _has_unclosed_object(text[selected_end:]):
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    return selected
 
 
 def last_json_object_with_keys(
