@@ -180,6 +180,7 @@ function buildEnv(source) {
     URLSearchParams,
     TextEncoder,
     TextDecoder,
+    HTMLElement: Object,
     document: doc,
     localStorage: makeStorage(),
     sessionStorage: makeStorage(),
@@ -370,6 +371,22 @@ function scenarioRender(source) {
     link_paren: invoke(
       "renderMarkdown",
       "[wiki](https://en.wikipedia.org/wiki/Foo_(bar))"
+    ),
+    link_bold_url: invoke(
+      "renderMarkdown",
+      "[wiki](https://en.wikipedia.org/wiki/Foo**bar**)"
+    ),
+    table_escaped_pipe: invoke(
+      "renderMarkdown",
+      "| a\\|b | c |\n| --- | --- |\n| 1 | 2 |"
+    ),
+    table_code_pipe: invoke(
+      "renderMarkdown",
+      "| `a|b` | c |\n| --- | --- |\n| 1 | 2 |"
+    ),
+    sentinel_injection: invoke(
+      "renderInline",
+      "x0y 0 z"
     ),
     table: invoke(
       "renderMarkdown",
@@ -1045,6 +1062,68 @@ async function scenarioReconcile(source) {
 }
 
 
+async function scenarioSse(source) {
+  const env = buildEnv(source);
+  const chunks = [
+    'data: {"type":"session","session_id":"s"}\r\n\r\n',
+    ': keepalive\r\n\r\n',
+    'data: {"type":\ndata: "done","reply":"ok"}\r\n\r\n',
+    'data: null\n\n',
+  ];
+  return runIn(
+    env,
+    `(async () => {
+      const chunks = ${JSON.stringify(chunks)};
+      const events = [];
+      const encoded = chunks.map((chunk) => new TextEncoder().encode(chunk));
+      let index = 0;
+      const body = {
+        getReader: () => ({
+          read: async () =>
+            index < encoded.length
+              ? { done: false, value: encoded[index++] }
+              : { done: true, value: undefined },
+        }),
+      };
+      await readEventStream(body, (event) => events.push(event));
+      return events;
+    })()`
+  );
+}
+
+async function scenarioCopy(source) {
+  const env = buildEnv(source);
+  const removed = [];
+  const originalCreate = env.document.createElement;
+  env.document.createElement = (tag) => {
+    const node = originalCreate(tag);
+    const originalRemove = node.remove.bind(node);
+    node.remove = () => {
+      removed.push(tag);
+      originalRemove();
+    };
+    return node;
+  };
+  const previous = {
+    focusCalls: 0,
+    focus() {
+      this.focusCalls += 1;
+    },
+  };
+  env.document.activeElement = previous;
+  env.document.execCommand = () => {
+    throw new Error("blocked");
+  };
+  env.navigator.clipboard = null;
+  env.isSecureContext = false;
+  await runIn(env, `(async () => { await copyText("x"); })()`);
+  return {
+    removed,
+    focus_restored: previous.focusCalls,
+    toasts: env.__toasts,
+  };
+}
+
 function scenarioChatPersisted(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1144,6 +1223,10 @@ async function main() {
     payload = scenarioPreview(source);
   } else if (scenario === "render") {
     payload = scenarioRender(source);
+  } else if (scenario === "sse") {
+    payload = await scenarioSse(source);
+  } else if (scenario === "copy") {
+    payload = await scenarioCopy(source);
   } else if (scenario === "duplicates") {
     payload = await scenarioDuplicates(source);
   } else if (scenario === "eval") {
