@@ -447,6 +447,70 @@ def test_trip_add_without_purpose_preserves_existing(monkeypatch):
     print("✓ trip-add 未提供目的时保留既有目的 / 不臆造字段")
 
 
+def test_trip_add_reports_success_when_post_save_read_fails(monkeypatch):
+    """写入已提交后读取失败：按成功返回并带 trip_id（不能谎报失败）。"""
+
+    class _FlakyStore(_AddStore):
+        def __init__(self, trips=()):
+            super().__init__(trips)
+            self.reads = 0
+
+        def get_trip_history(self, limit=None):
+            self.reads += 1
+            # 偶数次读取（保存后的那次）失败，保存前的预读仍成功
+            if self.reads % 2 == 0:
+                raise RuntimeError("db down")
+            return super().get_trip_history(limit)
+
+    store = _FlakyStore([])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_add(
+        "u1", "北京", "上海", "2026-12-01", as_json=True
+    )
+    data = json.loads(out)
+    assert code == 0
+    assert data["ok"] is True and data["saved"] is True
+    assert data["trip_id"] == "trip_1"
+    assert data["created"] is None
+    assert "读取行程失败" in data["warning"]
+    code, out = _run_trip_add("u1", "北京", "上海", "2026-12-01")
+    assert code == 0 and "已保存行程" in out and "读取行程失败" in out
+    print("✓ trip-add 写后读取失败仍报告成功")
+
+
+def test_trip_update_reports_success_when_post_save_read_fails(monkeypatch):
+    """更新已提交后读取失败：按成功返回并带 trip_id。"""
+
+    class _FlakyUpdateStore(_UpdateStore):
+        def __init__(self, trips=()):
+            super().__init__(trips)
+            self.reads = 0
+
+        def get_trip_history(self, limit=None):
+            self.reads += 1
+            if self.reads >= 2:
+                raise RuntimeError("db down")
+            return super().get_trip_history(limit)
+
+    store = _FlakyUpdateStore(
+        [_trip("上海", "2026-12-01", trip_id="trip_1")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_update(
+        "u1", "trip_1", {"purpose": "会议"}, as_json=True
+    )
+    data = json.loads(out)
+    assert code == 0
+    assert data["ok"] is True and data["saved"] is True
+    assert data["trip_id"] == "trip_1"
+    assert data["created"] is None and "读取行程失败" in data["warning"]
+    print("✓ trip-update 写后读取失败仍报告成功")
+
+
 def test_trip_add_validation_errors(monkeypatch):
     store = _AddStore([])
     monkeypatch.setattr(
@@ -1232,6 +1296,7 @@ if __name__ == "__main__":
         test_trip_add_json_output,
         test_trip_add_dedupes_same_route_and_dates,
         test_trip_add_without_purpose_preserves_existing,
+        test_trip_add_reports_success_when_post_save_read_fails,
         test_trip_add_validation_errors,
         test_trip_add_rejects_oversized_fields,
         test_trip_add_store_failures,
@@ -1245,6 +1310,7 @@ if __name__ == "__main__":
         test_trip_update_legacy_unpadded_dates,
         test_trip_update_rejects_oversized_fields,
         test_trip_update_store_failures,
+        test_trip_update_reports_success_when_post_save_read_fails,
         test_trip_update_args_and_dispatch,
     ):
         mp = pytest.MonkeyPatch()

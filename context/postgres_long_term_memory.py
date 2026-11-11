@@ -18,7 +18,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from utils.errors import MemoryPersistenceError
+from utils.errors import MemoryPersistenceError, PartialImportError
 from utils.preference_values import merge_preference_value
 from utils.timestamps import localize_naive, parse_iso_datetime
 
@@ -845,57 +845,64 @@ class PostgresLongTermMemory:
 
             created = 0
             updated = 0
-            for trip in trips:
-                destination = trip.get("destination")
-                start_date = str(trip.get("start_date") or "")
-                origin = trip.get("origin")
-                end_date = trip.get("end_date") or start_date
-                key = _key(destination, origin, start_date, end_date)
-                existing_id = index.get(key) if key is not None else None
-                if existing_id is not None:
-                    # 与单条保存一致：未提供的字段（None）保留原值
-                    self._execute(
-                        "UPDATE aligo_trips SET "
-                        "purpose = COALESCE(%s, purpose), "
-                        "session_id = COALESCE(%s, session_id) "
-                        "WHERE id = %s",
-                        (trip.get("purpose"), trip.get("session_id"), existing_id),
+            try:
+                for trip in trips:
+                    destination = trip.get("destination")
+                    start_date = str(trip.get("start_date") or "")
+                    origin = trip.get("origin")
+                    end_date = trip.get("end_date") or start_date
+                    key = _key(destination, origin, start_date, end_date)
+                    existing_id = index.get(key) if key is not None else None
+                    if existing_id is not None:
+                        # 与单条保存一致：未提供的字段（None）保留原值
+                        self._execute(
+                            "UPDATE aligo_trips SET "
+                            "purpose = COALESCE(%s, purpose), "
+                            "session_id = COALESCE(%s, session_id) "
+                            "WHERE id = %s",
+                            (trip.get("purpose"), trip.get("session_id"), existing_id),
+                        )
+                        _abort_if_reconnected()
+                        updated += 1
+                        continue
+                    max_number += 1
+                    inserted = self._fetchone(
+                        "INSERT INTO aligo_trips "
+                        "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (
+                            self.user_id,
+                            f"trip_{max_number}",
+                            trip.get("origin"),
+                            destination,
+                            trip.get("start_date"),
+                            trip.get("end_date"),
+                            trip.get("purpose") or "旅游",
+                            trip.get("session_id"),
+                        ),
+                        # 非幂等写入：连接在提交后丢失时无法区分是否已写入，重放会
+                        # 产生重复行程 / 重复 trip_id，直接按持久化失败上报
+                        replay_safe=False,
                     )
                     _abort_if_reconnected()
-                    updated += 1
-                    continue
-                max_number += 1
-                inserted = self._fetchone(
-                    "INSERT INTO aligo_trips "
-                    "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                    (
-                        self.user_id,
-                        f"trip_{max_number}",
-                        trip.get("origin"),
-                        destination,
-                        trip.get("start_date"),
-                        trip.get("end_date"),
-                        trip.get("purpose") or "旅游",
-                        trip.get("session_id"),
-                    ),
-                    # 非幂等写入：连接在提交后丢失时无法区分是否已写入，重放会
-                    # 产生重复行程 / 重复 trip_id，直接按持久化失败上报
-                    replay_safe=False,
-                )
-                _abort_if_reconnected()
-                if key is not None and inserted is not None:
-                    index[key] = int(inserted[0])
-                created += 1
-            if created:
-                _abort_if_reconnected()
-                self._execute(
-                    "INSERT INTO aligo_trip_counters (user_id, last_number) "
-                    "VALUES (%s, %s) "
-                    "ON CONFLICT (user_id) DO UPDATE SET last_number = GREATEST("
-                    "aligo_trip_counters.last_number, EXCLUDED.last_number)",
-                    (self.user_id, max_number),
-                )
+                    if key is not None and inserted is not None:
+                        index[key] = int(inserted[0])
+                    created += 1
+                if created:
+                    _abort_if_reconnected()
+                    self._execute(
+                        "INSERT INTO aligo_trip_counters (user_id, last_number) "
+                        "VALUES (%s, %s) "
+                        "ON CONFLICT (user_id) DO UPDATE SET last_number = GREATEST("
+                        "aligo_trip_counters.last_number, EXCLUDED.last_number)",
+                        (self.user_id, max_number),
+                    )
+            except Exception as exc:  # noqa: BLE001 - 已提交部分要如实上报
+                raise PartialImportError(
+                    f"批量保存在第 {created + updated} 条后失败：{exc}",
+                    created,
+                    updated,
+                ) from exc
         return created, updated
 
     def set_session_titles(self, titles: dict[str, str]) -> int:

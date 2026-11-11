@@ -4589,6 +4589,36 @@ def _parse_trip_add_args(args: list[str]) -> dict[str, Any] | None:
     return {"user_id": positional[0], "values": values, "as_json": as_json}
 
 
+def _trip_saved_read_unavailable(
+    user_id: str, trip_id: str, exc: Exception, as_json: bool
+) -> int:
+    """行程已写入但重新读取失败：按成功返回（读取失败不等于保存失败）。
+
+    返回 1 会让调用方以为需要重试；更糟的是 JSON 输出只有 ok:false 且
+    不带 trip_id，调用方无从知道数据其实已经落库。
+    """
+    warning = f"读取行程失败，未能检查日期重叠：{exc}"
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": user_id,
+                    "trip_id": trip_id,
+                    "saved": True,
+                    "created": None,
+                    "conflicts": [],
+                    "warning": warning,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(f"已保存行程 #{trip_id}（{warning}）")
+    return 0
+
+
 def run_trip_add_standalone(
     user_id: str,
     origin: str,
@@ -4671,7 +4701,8 @@ def run_trip_add_standalone(
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"读取行程失败：{exc}")
+            # 写入已提交：读取失败不能按失败返回（调用方会误判需要重试）
+            return _trip_saved_read_unavailable(user_id, trip_id, exc, as_json)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -4982,7 +5013,8 @@ def run_trip_update_standalone(
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            return _fail(f"读取行程失败：{exc}")
+            # 更新已提交：读取失败不能按失败返回（调用方会误判需要重试）
+            return _trip_saved_read_unavailable(user_id, trip_id, exc, as_json)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -5140,6 +5172,7 @@ def run_trips_import_standalone(
     import io
     import re
 
+    from utils.errors import PartialImportError
     from utils.trip_import import import_trips_from_text
 
     def _fail(message: str) -> int:
@@ -5189,6 +5222,14 @@ def run_trips_import_standalone(
             )
         except ValueError as exc:
             return _fail(str(exc))
+        except PartialImportError as exc:
+            # 已提交的部分必须如实报告：只说「导入失败」会让用户以为
+            # 整份文件没导入，换文件 / 丢弃备份后数据停留在半份状态
+            return _fail(
+                f"导入行程失败：{exc}"
+                f"（已提交 {exc.created} 条新增、{exc.updated} 条更新；"
+                "重试会按同路线同日期去重，可安全重跑）"
+            )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"导入行程失败：{exc}")
     finally:

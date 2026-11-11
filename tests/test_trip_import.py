@@ -286,6 +286,38 @@ def test_runner_rejects_oversized_file_before_read(monkeypatch):
     print("✓ 超限文件在读入前拒绝")
 
 
+def test_runner_reports_partial_import(monkeypatch):
+    """批量写入中途失败：报告已提交条数（重跑按同路线同日期去重，安全）。"""
+    from utils.errors import PartialImportError
+
+    store = _ImportStore()
+
+    def failing_save(rows):
+        raise PartialImportError("批量保存在第 2 条后失败：db down", 1, 1)
+
+    store.save_trip_histories = failing_save
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    path = _write_csv(
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        "北京,上海,2026-12-01,2026-12-02,出差\n"
+        "北京,杭州,2026-12-03,2026-12-04,出差\n"
+    )
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        code = cli.run_trips_import_standalone("u-partial", path, as_json=True)
+    finally:
+        sys.stdout = real_stdout
+    payload = json.loads(captured.getvalue())
+    assert code == 1
+    assert payload["ok"] is False
+    assert "已提交 1 条新增、1 条更新" in payload["error"]
+    print("✓ 部分导入失败报告已提交条数")
+
+
 def test_runner_rejects_gbk_csv(monkeypatch):
     """GBK 编码的 CSV：友好报错（--json 也有结构化输出）。"""
     store = _ImportStore()
@@ -1108,6 +1140,7 @@ if __name__ == "__main__":
         test_runner_dry_run_preview,
         test_runner_json_output_and_skipped,
         test_runner_errors,
+        test_runner_reports_partial_import,
         test_runner_rejects_oversized_file_before_read,
         test_runner_rejects_gbk_csv,
         test_runner_imports_ics_and_dedupes,
