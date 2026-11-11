@@ -84,6 +84,104 @@ def test_short_term_ttl_non_positive_clamped(monkeypatch):
     print("✓ 非正 REDIS_TTL_SEC 被钳制")
 
 
+def test_redis_client_factory_single_flight(monkeypatch):
+    """并发重建只创建一个客户端：不产生连接风暴 / 多连接池泄漏。"""
+    import threading
+    import time as time_module
+
+    import redis as redis_module
+
+    from context import storage as storage_module
+
+    storage_module.reset_failure_cache()
+    created: list[str] = []
+
+    class _Client:
+        def ping(self):
+            return True
+
+    def fake_from_url(url, **kwargs):
+        created.append(url)
+        time_module.sleep(0.05)
+        return _Client()
+
+    monkeypatch.setattr(redis_module.Redis, "from_url", fake_from_url)
+    results: list[object] = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                storage_module._get_redis_client("redis://race/0")
+            )
+        )
+        for _ in range(8)
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        assert created == ["redis://race/0"], created
+        assert len({id(item) for item in results}) == 1
+        assert results[0] is not None
+    finally:
+        storage_module.reset_failure_cache()
+    print("✓ Redis 客户端并发重建单飞")
+
+
+def test_redis_client_cache_is_url_scoped(monkeypatch):
+    """客户端按 URL 缓存；reset 与在途创建互斥，旧客户端不会写回缓存。"""
+    import threading
+    import time as time_module
+
+    import redis as redis_module
+
+    from context import storage as storage_module
+
+    class _Client:
+        def __init__(self, url):
+            self.url = url
+
+        def ping(self):
+            return True
+
+    storage_module.reset_failure_cache()
+
+    def fake_from_url(url, **kwargs):
+        return _Client(url)
+
+    monkeypatch.setattr(redis_module.Redis, "from_url", fake_from_url)
+    try:
+        a = storage_module._get_redis_client("redis://a/0")
+        b = storage_module._get_redis_client("redis://b/0")
+        assert a is not b and a.url == "redis://a/0"
+        assert storage_module._get_redis_client("redis://a/0") is a
+        # reset 后同 URL 得到新实例（旧客户端已被丢弃）
+        storage_module.reset_failure_cache()
+        assert storage_module._get_redis_client("redis://a/0") is not a
+
+        # 在途创建期间 reset：锁内互斥保证旧结果不会在 reset 之后写回缓存
+        started = threading.Event()
+
+        def slow_from_url(url, **kwargs):
+            started.set()
+            time_module.sleep(0.3)
+            return _Client(url)
+
+        monkeypatch.setattr(redis_module.Redis, "from_url", slow_from_url)
+        storage_module.reset_failure_cache()
+        thread = threading.Thread(
+            target=storage_module._get_redis_client, args=("redis://slow/0",)
+        )
+        thread.start()
+        assert started.wait(2)
+        storage_module.reset_failure_cache()  # 等创建完成后再清空
+        thread.join(5)
+        assert storage_module._redis_clients == {}
+    finally:
+        storage_module.reset_failure_cache()
+    print("✓ Redis 客户端缓存按 URL 隔离且 reset 竞态安全")
+
+
 def test_describe_backends_reports_long_term_degraded(monkeypatch):
     """配置了 PostgreSQL 但已回退 JSON 时，后端描述带 long_term_degraded 标记。"""
     _set("redis_url", "")
@@ -1012,7 +1110,6 @@ def test_pg_success_marks_actual_backend(monkeypatch):
 
 def test_redis_import_failure_falls_back(monkeypatch):
     """redis 包未安装：短期记忆回退进程内实现（返回 None，不抛出）。"""
-    monkeypatch.setattr(storage, "_redis_client", None)
     storage.reset_failure_cache()
     monkeypatch.setitem(sys.modules, "redis", None)
     assert storage._get_redis_client("redis://localhost:1/0") is None
