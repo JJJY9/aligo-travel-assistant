@@ -99,6 +99,47 @@ def test_plan_trip_script_project_root():
     print("✓ 行程脚本 project_root 指向仓库根")
 
 
+def test_compact_recent_dialogue_trims_assistant_json():
+    """追问时最近对话里的整轮结果 JSON 不能原样进入规划 prompt。"""
+    import importlib.util
+    import json
+
+    path = (
+        Path(project_root)
+        / ".claude"
+        / "skills"
+        / "plan-trip"
+        / "script"
+        / "agent.py"
+    )
+    spec = importlib.util.spec_from_file_location("_test_plan_trip_agent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    messages = [
+        {"role": "user", "content": "第一问"},
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                {"answer": "规划好了", "results": [{"data": "x" * 4000}], "_meta": {}},
+                ensure_ascii=False,
+            ),
+        },
+        {"role": "user", "content": "改成周五"},
+        {
+            "role": "assistant",
+            "content": json.dumps({"results": [], "_meta": {}}),
+        },
+        {"role": "user", "content": "x" * 10000},
+    ]
+    compacted = module._compact_recent_dialogue(messages)
+    assert len(compacted) == 4
+    assert compacted[0]["content"] == "规划好了"
+    assert compacted[1]["content"] == "改成周五"
+    assert "已省略" in compacted[2]["content"]
+    assert len(compacted[3]["content"]) == 4000
+    print("✓ 最近对话压缩为摘要并截断")
+
+
 def test_plan_trip_uses_shared_model_factory():
     """模型必须经 create_chat_model 工厂创建（stream=False + generate_kwargs）。"""
     import inspect
@@ -115,5 +156,8 @@ if __name__ == "__main__":
     test_extract_itinerary_from_partial_failure()
     test_extract_itinerary_skips_failed_fallback()
     test_plan_trip_script_project_root()
+
+
+    test_compact_recent_dialogue_trims_assistant_json()
     test_plan_trip_uses_shared_model_factory()
     print("\n全部通过")
