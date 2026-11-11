@@ -366,6 +366,7 @@ class InformationQueryAgent(AgentBase):
             # 开启安全搜索，多取几条再过滤
             search_results = []
             backend_errors: list[str] = []
+            empty_backends = 0
             loop = asyncio.get_running_loop()
             # ddgs 新版本已移除 bing 后端（调用会告警并必然失败）；
             # duckduckgo / google 覆盖主流结果，auto 兜底
@@ -389,7 +390,15 @@ class InformationQueryAgent(AgentBase):
                     search_results = await loop.run_in_executor(None, _search)
                     if search_results:
                         break
+                    empty_backends += 1
                 except Exception as e:
+                    # ddgs 9.x 在「正常完成但无结果」时抛 DDGSException
+                    # ("No results found.")：这是空结果而不是服务故障，
+                    # 否则冷门查询会被报成「搜索失败」且「未找到」分支不可达
+                    if "no results" in str(e).lower():
+                        empty_backends += 1
+                        logger.debug("DDGS backend %s returned no results", backend)
+                        continue
                     backend_errors.append(str(e))
                     logger.warning(f"DDGS backend {backend} failed: {e}")
                     continue
@@ -408,9 +417,9 @@ class InformationQueryAgent(AgentBase):
                     break
 
             if not results:
-                if not search_results and backend_errors:
-                    # 三个后端全部抛错：是搜索服务故障而不是「没有结果」，
-                    # 不能把真实错误吞成未找到（此前仅 debug 级别记录）
+                if not search_results and backend_errors and not empty_backends:
+                    # 所有后端都抛了非「无结果」的异常：是搜索服务故障而
+                    # 不是「没有结果」，不能把真实错误吞成未找到
                     return {
                         "query_type": "网络搜索",
                         "query_success": False,
@@ -457,10 +466,24 @@ class InformationQueryAgent(AgentBase):
         if not results:
             return "未找到相关信息"
 
-        # 构建搜索结果文本
+        # 构建搜索结果文本：第三方 SERP 的标题 / 摘要可能含 <<< >>> 或
+        # 【任务说明】等结构标记，可伪造「数据块已结束」覆盖外层约束——
+        # 先中和分隔符与全角方括号，再放进数据块
+        def _neutralize(text: object) -> str:
+            return (
+                str(text or "")
+                .replace("<<<", "＜＜＜")
+                .replace(">>>", "＞＞＞")
+                .replace("【", "［")
+                .replace("】", "］")
+            )
+
         results_text = ""
         for i, result in enumerate(results, 1):
-            results_text += f"\n{i}. {result['title']}\n{result['snippet']}\n"
+            results_text += (
+                f"\n{i}. {_neutralize(result.get('title'))}\n"
+                f"{_neutralize(result.get('snippet'))}\n"
+            )
 
         # 获取当前时间
         from datetime import datetime
