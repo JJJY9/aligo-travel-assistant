@@ -130,7 +130,7 @@ def test_backup_limit_problem_matches_export_indent_and_surrogates(monkeypatch):
     assert module.backup_limit_problem(backup) is not None, "缩进后体积超限必须判出"
 
     # 孤立代理项（旧数据）：先转义再估算，不能抛 UnicodeEncodeError
-    surrogate = "bad " + chr(92) + "ud800"
+    surrogate = "bad " + chr(0xD800)
     assert (
         module.backup_limit_problem(
             {"chat_history": [{"role": "assistant", "content": surrogate}]}

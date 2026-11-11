@@ -273,7 +273,7 @@ def test_deferred_memory_commits_after_cancel_during_persist():
     """取消落在落库线程期间：写线程仍提交整轮，延迟记忆写入必须补提交。"""
     import threading
 
-    runtime, base_memory = _make_runtime()
+    runtime, _base = _make_runtime()
     started = threading.Event()
     release = threading.Event()
 
@@ -321,6 +321,71 @@ def test_deferred_memory_commits_after_cancel_during_persist():
     asyncio.run(scenario())
     assert orch.commits == 1, "落库成功后的延迟记忆写入不能因取消而丢失"
     print("✓ 取消落在落库线程期间仍补提交延迟记忆")
+
+
+def test_runtime_wires_epoch_guard_into_persist():
+    """回合开始时读取会话纪元，组合守卫传入 persist_turn。"""
+    runtime, _base = _make_runtime()
+
+    class _EpochMemory(_FakeMemory):
+        def __init__(self):
+            super().__init__()
+            self.epoch_reads = 0
+            self.guard_epoch = None
+
+        def session_epoch(self):
+            self.epoch_reads += 1
+            return (True, "7")
+
+        def persist_guard(self, epoch_at_start, base=None):
+            self.guard_epoch = epoch_at_start
+
+            def guard():
+                return True
+
+            return guard
+
+    memory = _EpochMemory()
+    runtime.memory = memory
+    result = asyncio.run(runtime.ask("你好"))
+    assert result["persisted"] is True
+    assert memory.epoch_reads == 1, "回合开始应读取一次会话纪元"
+    assert memory.guard_epoch == (True, "7"), "组合守卫必须收到纪元快照"
+    print("✓ 运行时把会话纪元接入落库守卫")
+
+
+def test_cancel_during_stage_thread_rolls_back_after_visible():
+    """取消落在暂存写入线程期间：回滚必须等写入可见后执行，不留孤儿提问。"""
+    import threading
+
+    runtime, _base = _make_runtime()
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowStage(_FakeMemory):
+        def stage_message(self, role, content, metadata=None):
+            started.set()
+            release.wait(10)
+            super().stage_message(role, content, metadata)
+
+    memory = _SlowStage()
+    runtime.memory = memory
+
+    async def scenario():
+        task = asyncio.ensure_future(runtime.ask("你好"))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await runtime.drain_pending_persist()
+
+    asyncio.run(scenario())
+    assert memory.staged == [], "暂存提问必须被回滚（不能留下无回答的孤儿）"
+    assert memory.rolled_back == ["你好"]
+    print("✓ 暂存写入可见后回滚（取消竞态）")
 
 
 def test_persist_failure_rolls_back_staged_user_message():
@@ -988,6 +1053,8 @@ if __name__ == "__main__":
         mp.undo()
     test_parse_failure_is_user_facing_error()
     test_persist_guard_reaches_memory_write()
+    test_deferred_memory_committed_after_successful_persist()
+    test_deferred_memory_skipped_when_persist_vetoed()
     test_persist_veto_rolls_back_staged_question()
     test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()

@@ -323,6 +323,20 @@ def test_knowledge_eval_panel_states():
     print("✓ 检索评测面板状态")
 
 
+def test_session_html_export_uses_full_server_endpoint():
+    """面板「导出对话（HTML）」走服务端完整会话（不克隆窗口化 DOM）。"""
+    results = _run_harness("sessionExportHtml")
+    downloads = results["downloads"]
+    assert len(downloads) == 1, downloads
+    url = downloads[0]["url"]
+    assert "/api/sessions/s1/export?" in url, url
+    assert "format=html" in url, url
+    assert "user_id=u1" in url, url
+    assert downloads[0]["filename"] == "aligo_s1.html"
+    assert results["toasts"] == ["HTML 已导出"]
+    print("✓ 会话 HTML 导出走服务端完整会话接口")
+
+
 def test_trips_export_button_uses_filtered_ics_endpoint():
     """「导出行程」按展开视图的关键词 / 状态筛选走 format=ics。"""
     results = _run_harness("tripsExport")

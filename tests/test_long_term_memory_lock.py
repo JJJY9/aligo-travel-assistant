@@ -182,6 +182,38 @@ def test_load_closes_handle_before_parse(monkeypatch, tmp_path):
     print("✓ 读句柄在解析前关闭")
 
 
+def test_default_lock_timeout_covers_network_guard(tmp_path):
+    """默认锁等待必须覆盖锁内 Redis 守卫的网络等待（旧 2 秒不够）。"""
+    import threading
+    import time as time_module
+
+    from utils import file_lock as lock_module
+
+    assert lock_module.DEFAULT_TIMEOUT_SEC >= 5.0
+
+    target = str(tmp_path / "slow-holder.json")
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with lock_module.file_lock(target, timeout=5):
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert held.wait(5)
+    timer = threading.Timer(2.2, release.set)
+    timer.start()
+    begin = time_module.monotonic()
+    with lock_module.file_lock(target):
+        waited = time_module.monotonic() - begin
+    thread.join(5)
+    timer.cancel()
+    assert waited >= 2.0, "默认等待应超过旧实现的 2 秒上限"
+    print("✓ 默认文件锁等待覆盖网络守卫场景")
+
+
 def test_file_lock_normalizes_oserror(monkeypatch, tmp_path):
     """权限 / 路径类 OSError 也按契约转成 TimeoutError（调用方只捕获它）。"""
     import builtins
