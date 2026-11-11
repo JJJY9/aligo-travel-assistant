@@ -125,7 +125,7 @@ def check_config() -> CheckResult:
         return CheckResult(
             "大模型配置",
             STATUS_OK,
-            f"{model_name} @ {base_url}（密钥来自 {source}）",
+            f"{model_name} @ {_redact_secret(base_url)}（密钥来自 {source}）",
         )
     return CheckResult(
         "大模型配置",
@@ -508,7 +508,7 @@ async def check_llm_connectivity() -> CheckResult:
     )
     if ok:
         return CheckResult("LLM 连通性", STATUS_OK, f"{LLM_CONFIG['model_name']} 可用")
-    return CheckResult("LLM 连通性", STATUS_FAIL, message[:150])
+    return CheckResult("LLM 连通性", STATUS_FAIL, _redact_secret(message)[:150])
 
 
 def run_doctor_offline() -> list[CheckResult]:

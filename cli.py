@@ -68,15 +68,27 @@ def _terminal_safe(value: object) -> str:
     return escape(text) if escape is not None else text
 
 
-class _SanitizedConsole(Console):  # type: ignore[misc,valid-type]
-    """所有 str 输出先剥终端控制字符（表格单元格由调用方另行处理）。"""
+if Console is not None:
 
-    def print(self, *objects, **kwargs):  # type: ignore[override]
-        safe = tuple(
-            strip_terminal_controls(obj) if isinstance(obj, str) else obj
-            for obj in objects
-        )
-        super().print(*safe, **kwargs)
+    class _SanitizedConsole(Console):  # type: ignore[misc,valid-type]
+        """所有 str 输出先剥终端控制字符（表格单元格由调用方另行处理）。"""
+
+        def print(self, *objects, **kwargs):  # type: ignore[override]
+            safe = tuple(
+                strip_terminal_controls(obj) if isinstance(obj, str) else obj
+                for obj in objects
+            )
+            super().print(*safe, **kwargs)
+
+else:
+
+    class _SanitizedConsole:  # type: ignore[no-redef]
+        """rich 不可用时的占位：保证模块可导入，诊断命令不构造它。"""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                _RUNTIME_IMPORT_ERROR or "缺少运行时依赖，请先安装 requirements.txt"
+            )
 
 # 移除其他智能体的导入，改用懒加载
 
@@ -1742,7 +1754,7 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
     status = knowledge_status()
     if not status.get("available"):
         reason = str(status.get("reason", "未知原因"))
-        if reason in {"知识库未初始化", "集合不存在"}:
+        if reason == "知识库未初始化":
             if as_json:
                 print(
                     json.dumps(
@@ -1754,6 +1766,29 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             else:
                 print(f"跳过评测：{reason}")
             return 0
+        if reason == "集合不存在":
+            # 数据库文件存在但集合缺失（初始化中断）：Web 评测返回 503、
+            # doctor 提示重新初始化，CLI 不能以 0 退出让 `eval || exit 1`
+            # 之类的质量门禁直接放行
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "skipped": False,
+                            "error": "知识库缺少集合（初始化未完成），"
+                            "请运行初始化脚本后重试",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(
+                    "评测失败：知识库集合不存在（初始化未完成），"
+                    "请运行初始化脚本后重试"
+                )
+            return 1
         # 读取失败 / 文件锁占用等属于基础设施故障，不能当作“跳过”并返回成功
         if as_json:
             print(
@@ -5716,7 +5751,15 @@ def _print_stdout(text: str, end: str = "\n") -> None:
 
 
 def main():
-    """主函数"""
+    """主函数：一次 Ctrl-C 中断交互外的命令时干净退出（无 traceback）。"""
+    try:
+        _main_impl()
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+
+
+def _main_impl():
+    """原有入口实现（测试直接调用 main，包装层保证 Ctrl-C 语义一致）。"""
     # 一次性命令不读 stdin：跳过编码探测，避免已连接但无数据的管道卡住启动
     configure_stdio(probe_stdin=len(sys.argv) == 1)
     if len(sys.argv) > 1 and not isinstance(sys.stdout, PipeSafeTextIO):

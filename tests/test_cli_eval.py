@@ -50,6 +50,21 @@ def test_skip_when_uninitialized(monkeypatch):
     print("✓ 未初始化 → 跳过（退出码 0）")
 
 
+def test_collection_missing_is_failure(monkeypatch):
+    """数据库存在但集合缺失（初始化中断）：退出 1（与 Web 503 同口径）。"""
+    monkeypatch.setattr(
+        knowledge_stats, "knowledge_status", lambda: _status(False, "集合不存在")
+    )
+    code, out = _run(monkeypatch)
+    assert code == 1
+    assert "集合不存在" in out
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 1
+    assert payload["ok"] is False, payload
+    print("✓ 集合缺失 → 失败（退出码 1）")
+
+
 def test_failure_on_infra_error(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats,
@@ -259,6 +274,7 @@ if __name__ == "__main__":
 
     for case in (
         test_skip_when_uninitialized,
+        test_collection_missing_is_failure,
         test_failure_on_infra_error,
         test_failure_when_agent_init_raises,
         test_failure_when_agent_import_breaks,

@@ -891,6 +891,37 @@ def test_prompt_oserror_exits_instead_of_hot_loop(monkeypatch):
     print("✓ stdin OSError 干净退出（不热循环）")
 
 
+def test_cli_module_imports_without_runtime_deps():
+    """rich / agentscope 缺失时 cli 模块仍可导入（doctor 等诊断命令能启动）。"""
+    code = (
+        "import sys; sys.modules['rich'] = None; "
+        "sys.modules['agentscope'] = None; "
+        "import cli; print('ok')"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "ok" in completed.stdout
+    print("✓ 运行时依赖缺失时 cli 模块仍可导入")
+
+
+def test_main_keyboard_interrupt_exits_130(monkeypatch):
+    """一次性命令 Ctrl-C：干净退出 130，不打印 traceback。"""
+    def _boom():
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli, "_main_impl", _boom)
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 130
+    print("✓ 一次性命令 Ctrl-C 干净退出")
+
+
 def test_closed_stdout_pipe_does_not_traceback():
     """`| head` 提前关闭 stdout：交互模式也不打 traceback / 非零退出。"""
     proc = subprocess.Popen(
