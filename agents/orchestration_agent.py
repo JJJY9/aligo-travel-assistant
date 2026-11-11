@@ -27,6 +27,7 @@ from agentscope.message import Msg
 
 from utils.agent_names import canonical_agent_name
 from utils.json_safe import sanitize_json, strip_nul
+from utils.log_redact import redact_paths
 from utils.llm_resilience import retry_with_backoff
 from utils.preference_values import (
     has_preference_value,
@@ -859,12 +860,14 @@ class OrchestrationAgent(AgentBase):
 
         except Exception as e:
             logger.error(f"Agent execution failed: {agent_name}, error: {e}")
-            # 返回友好的错误信息，但不中断流程
+            # 返回友好的错误信息，但不中断流程。原始异常文本会渲染进回答并
+            # 随助手消息落库 / 导出：本机缓存路径与上游 URL 必须遮蔽
+            safe_error = redact_paths(e)
             return {
                 "status": "error",
                 "agent_name": agent_name,
-                "data": {"error": str(e)},
-                "message": f"智能体执行失败: {e!s}"
+                "data": {"error": safe_error},
+                "message": f"智能体执行失败: {safe_error}"
             }
 
     def _aggregate_results(

@@ -2411,6 +2411,30 @@ def test_trip_saved_from_intention_entities_when_event_empty():
     assert len(trips) == 1, trips
     assert trips[0]["destination"] == "杭州"
     print("✓ 事项抽取缺失时回退意图实体落库")
+def test_agent_failure_message_redacts_internal_paths():
+    """智能体异常文本会渲染进回答并落库：本机路径 / 上游 URL 必须遮蔽。"""
+    memory = _StubMemory()
+
+    class _Boom(_StubAgent):
+        async def reply(self, x):
+            raise RuntimeError(
+                "无法加载 C:\\Users\\alice\\.cache\\huggingface\\model"
+                " from https://huggingface.co/model"
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={"query": _Boom("query")}, memory_manager=memory
+    )
+    content = asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "query", "priority": 1}]))
+    ).content
+    result = json.loads(content)
+    entry = result["results"][0]
+    assert entry["status"] == "error"
+    assert "<路径>" in entry["message"], entry
+    assert "C:\\Users" not in entry["message"], entry
+    assert "huggingface.co" not in entry["data"]["error"], entry
+    print("✓ 智能体错误信息遮蔽本机路径 / 上游 URL")
 
 
 if __name__ == "__main__":
@@ -2470,6 +2494,7 @@ if __name__ == "__main__":
     test_trip_duration_overflow_does_not_abort_turn()
     test_trip_saved_from_intention_entities_when_event_empty()
     test_model_output_nul_stripped_before_memory()
+    test_agent_failure_message_redacts_internal_paths()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)

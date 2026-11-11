@@ -25,6 +25,7 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.log_redact import redact_paths
 from utils.json_parser import extract_json_from_async_response
 from utils.preference_values import has_preference_value
 
@@ -220,7 +221,7 @@ class MemoryQueryAgent(AgentBase):
                 name=self.name,
                 content=json.dumps({
                     "status": "error",
-                    "message": f"记忆查询失败: {e!s}",
+                    "message": f"记忆查询失败: {redact_paths(e)}",
                     "query": user_query
                 }),
                 role="assistant"
