@@ -2536,33 +2536,93 @@ async function openSession(sessionId, options = {}) {
     setConversationTitle(session ? session.title : data.title || "对话");
 
     els.messages.innerHTML = "";
-    let lastUserText = "";
-    let lastAssistantNode = null;
-    let lastAssistantMeta = null;
-    data.messages.forEach((message) => {
-      if (message.role === "user") {
-        lastUserText = message.content;
-        els.messages.appendChild(renderUserNode(message.content));
-      } else {
-        const node = renderAssistantNode(message.content, {
-          timestamp: message.timestamp,
-          regenText: lastUserText,
-          meta: message.meta || null,
-        });
-        lastAssistantNode = node;
-        lastAssistantMeta = message.meta || null;
-        els.messages.appendChild(node);
+    // 大历史按窗口渲染：整段同步逐条 renderMarkdown + innerHTML 会冻结主线程
+    // （备份导入允许 20 万条消息）；「显示更早消息」从已取回的数据里补一批
+    const totalMessages = data.messages.length;
+    const matchIndex = Number.isInteger(options.matchIndex) ? options.matchIndex : -1;
+    let renderStart = Math.max(0, totalMessages - HISTORY_RENDER_WINDOW);
+    if (matchIndex >= 0 && matchIndex < renderStart) {
+      // 搜索定位的目标在首屏窗口之外：从目标处开始渲染，保证能滚动到
+      renderStart = matchIndex;
+    }
+    const pairTextBefore = (index) => {
+      for (let i = index - 1; i >= 0; i -= 1) {
+        if (data.messages[i].role === "user") return data.messages[i].content;
       }
-    });
+      return "";
+    };
+    const buildNodes = (start, end) => {
+      const nodes = [];
+      let lastUserText = pairTextBefore(start);
+      let windowLastAssistantNode = null;
+      let windowLastAssistantMeta = null;
+      for (let index = start; index < end; index += 1) {
+        const message = data.messages[index];
+        if (message.role === "user") {
+          lastUserText = message.content;
+          nodes.push(renderUserNode(message.content));
+        } else {
+          const node = renderAssistantNode(message.content, {
+            timestamp: message.timestamp,
+            regenText: lastUserText,
+            meta: message.meta || null,
+          });
+          windowLastAssistantNode = node;
+          windowLastAssistantMeta = message.meta || null;
+          nodes.push(node);
+        }
+      }
+      return {
+        nodes,
+        lastAssistantNode: windowLastAssistantNode,
+        lastAssistantMeta: windowLastAssistantMeta,
+      };
+    };
+    const initial = buildNodes(renderStart, totalMessages);
+    initial.nodes.forEach((node) => els.messages.appendChild(node));
+    const lastAssistantNode = initial.lastAssistantNode;
+    const lastAssistantMeta = initial.lastAssistantMeta;
+
+    let earlierButton = null;
+    if (renderStart > 0) {
+      earlierButton = document.createElement("button");
+      earlierButton.type = "button";
+      earlierButton.className = "earlier-more";
+      const updateEarlierButton = () => {
+        earlierButton.textContent = `显示更早消息（还有 ${renderStart} 条）`;
+      };
+      updateEarlierButton();
+      els.messages.insertBefore(earlierButton, els.messages.firstChild);
+      earlierButton.addEventListener("click", () => {
+        const nextStart = Math.max(0, renderStart - HISTORY_RENDER_WINDOW);
+        const older = buildNodes(nextStart, renderStart);
+        const anchor = earlierButton ? earlierButton.nextSibling : els.messages.firstChild;
+        const before = els.scroll.scrollHeight;
+        older.nodes.forEach((node) => els.messages.insertBefore(node, anchor));
+        // 补入的内容把已有节点向下推：同步滚动量，保持当前阅读位置
+        els.scroll.scrollTop += els.scroll.scrollHeight - before;
+        renderStart = nextStart;
+        if (renderStart === 0) {
+          earlierButton.remove();
+          earlierButton = null;
+        } else {
+          updateEarlierButton();
+        }
+        refreshEditButtons();
+      });
+    }
+
     if (lastAssistantNode && lastAssistantMeta) {
       addFollowUps(lastAssistantNode, lastAssistantMeta.agents || []);
     }
     trimRegenButtons();
     refreshEditButtons();
     markActiveHistory();
-    const matchIndex = Number.isInteger(options.matchIndex) ? options.matchIndex : -1;
+    const localMatch = matchIndex >= renderStart ? matchIndex - renderStart : -1;
     const matchNode =
-      matchIndex >= 0 ? els.messages.querySelectorAll(".msg")[matchIndex] : null;
+      localMatch >= 0
+        ? els.messages.querySelectorAll(".msg")[localMatch]
+        : null;
     if (matchNode) {
       matchNode.classList.add("msg-flash");
       matchNode.scrollIntoView({ block: "center" });
@@ -4987,6 +5047,10 @@ async function addKnowledgeDocument(event) {
 // 服务端 /api/chat 的提问上限（Pydantic max_length=4000，按码点计）：
 // 重新生成 / 编辑重发会先删除服务端上一轮再发送，超过上限的重发必然
 // 422——必须在删除之前拦截，否则上一轮已被删、新提问又发不出去
+// 会话详情首屏最多渲染的消息条数：备份导入允许 20 万条，整段同步逐条
+// renderMarkdown + innerHTML 会冻结主线程数秒到数十秒；按窗口渲染，
+// 「显示更早消息」从已取回的数据里再补一批（不再请求网络）
+const HISTORY_RENDER_WINDOW = 200;
 const CHAT_MESSAGE_MAX = 4000;
 // 与服务端 /api/import 同一上限；实际写入按 200 条/批发送，单批远小于
 // 请求体限制。旧版在文件解析前硬性拒绝 >2MB（与 CLI kb-import 不一致，

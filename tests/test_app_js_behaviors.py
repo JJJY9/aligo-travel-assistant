@@ -130,6 +130,24 @@ def test_silent_reload_preserves_scroll():
     print("✓ 静默重载保留滚动位置")
 
 
+def test_history_renders_in_windows():
+    """大历史首屏只渲染一个窗口，补批不请求网络、读完按钮消失。"""
+    data = _run_harness("historyWindow")
+    initial = data["initial"]
+    assert initial["count"] == 200, initial
+    assert initial["hasButton"] is True, initial
+    assert "300" in initial["buttonText"], initial
+
+    mid = data["afterFirst"]
+    assert mid["count"] == 400, mid
+    assert mid["hasButton"] is True and "100" in mid["buttonText"], mid
+
+    done = data["afterSecond"]
+    assert done["count"] == 500, done
+    assert done["hasButton"] is False, done
+    print("✓ 会话历史按窗口渲染并可补批")
+
+
 def test_delete_last_turn_sends_turn_id():
     """删除最后一轮携带 client_turn_id：服务端据此精确匹配本轮。"""
     data = _run_harness("deleteTurn")

@@ -1275,6 +1275,81 @@ async function scenarioScrollPreserve(source) {
   return { silent, normal };
 }
 
+async function scenarioHistoryWindow(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const messages = [];
+  for (let i = 0; i < 500; i += 1) {
+    if (i % 2 === 0) {
+      messages.push({ role: "user", content: "问题 " + i, timestamp: "" });
+    } else {
+      messages.push({
+        role: "assistant",
+        content: "回答 " + i,
+        timestamp: "",
+        meta: { client_turn_id: "turn-" + i },
+      });
+    }
+  }
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    state.sessions = [];
+    state.sessionTotal = 1;
+    els.messages = {
+      children: [],
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node, ref) {
+        const index = ref ? this.children.indexOf(ref) : -1;
+        if (index >= 0) this.children.splice(index, 0, node);
+        else this.children.push(node);
+        return node;
+      },
+      querySelectorAll() { return this.children.filter((n) => n.__msg); },
+      querySelector() { return null; },
+    };
+    renderUserNode = (text) => ({ __msg: true, role: "user", text });
+    renderAssistantNode = (text) => ({ __msg: true, role: "assistant", text });
+    const originalCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = originalCreate(tag);
+      node.remove = () => {
+        const index = els.messages.children.indexOf(node);
+        if (index >= 0) els.messages.children.splice(index, 1);
+      };
+      return node;
+    };
+    closeMobileSidebar = () => {};
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+  `);
+  const promise = run('openSession("s1", {})');
+  const request = await waitRequest(env);
+  request.resolve({ messages });
+  await promise;
+  const snapshot = () =>
+    run(`(() => {
+      const msgs = els.messages.children.filter((n) => n.__msg === true);
+      const button = els.messages.children.find(
+        (n) => n.className === "earlier-more",
+      );
+      return {
+        count: msgs.length,
+        hasButton: Boolean(button),
+        buttonText: button ? button.textContent : "",
+      };
+    })()`);
+  const initial = snapshot();
+  run('els.messages.children.find((n) => n.className === "earlier-more").click()');
+  const afterFirst = snapshot();
+  run('els.messages.children.find((n) => n.className === "earlier-more").click()');
+  const afterSecond = snapshot();
+  return { initial, afterFirst, afterSecond };
+}
+
 function scenarioChatPersisted(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1406,6 +1481,8 @@ async function main() {
     payload = scenarioEditGuard(source);
   } else if (scenario === "scrollPreserve") {
     payload = await scenarioScrollPreserve(source);
+  } else if (scenario === "historyWindow") {
+    payload = await scenarioHistoryWindow(source);
   } else if (scenario === "reconcile") {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
