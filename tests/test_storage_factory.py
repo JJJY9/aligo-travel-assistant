@@ -2331,6 +2331,122 @@ def test_bulk_save_trips_scales_and_dedupes():
     print("✓ 批量行程保存一次建索引（去重 / 编号 / 统计语义一致）")
 
 
+def test_pg_schema_initialized_once_per_process():
+    """每个 DSN 只在进程内建表一次；并发的构造不重复执行 DDL。"""
+    import threading as threading_module
+
+    from context import postgres_long_term_memory as pg_module
+
+    dsn = "postgresql://schema-once/test"
+    pg_module._SCHEMA_READY.discard(dsn)
+
+    class _Cursor:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            self._conn.statements.append(" ".join(str(sql).split()))
+
+    class _Conn:
+        def __init__(self):
+            self.statements = []
+
+        def cursor(self):
+            return _Cursor(self)
+
+    def make_store():
+        store = object.__new__(pg_module.PostgresLongTermMemory)
+        store.dsn = dsn
+        store._conn = _Conn()
+        return store
+
+    try:
+        first = make_store()
+        first._ensure_schema()
+        assert any(
+            statement.startswith("SELECT pg_advisory_lock")
+            for statement in first._conn.statements
+        ), first._conn.statements
+        assert any(
+            "CREATE UNIQUE INDEX" in statement
+            for statement in first._conn.statements
+        ), first._conn.statements
+        created = sum(
+            1 for statement in first._conn.statements if "CREATE TABLE" in statement
+        )
+        assert created >= 1
+
+        second = make_store()
+        second._ensure_schema()
+        assert second._conn.statements == [], "同一 DSN 第二次构造不能再跑 DDL"
+
+        # 并发构造：只有一个线程执行建表，其余直接跳过
+        stores = [make_store() for _ in range(4)]
+        threads = [
+            threading_module.Thread(target=store._ensure_schema)
+            for store in stores
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert sum(len(store._conn.statements) for store in stores) == 0
+    finally:
+        pg_module._SCHEMA_READY.discard(dsn)
+    print("✓ PG 表结构每个 DSN 只建一次")
+
+
+def test_pg_schema_tolerates_concurrent_create_race():
+    """滚动发布中其它实例先建表：DuplicateTable 后重跑 DDL，索引照建。"""
+    import psycopg
+
+    from context import postgres_long_term_memory as pg_module
+
+    dsn = "postgresql://schema-race/test"
+    pg_module._SCHEMA_READY.discard(dsn)
+    calls = {"ddl": 0, "index": 0, "unlock": 0}
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            if text.startswith("CREATE TABLE"):
+                calls["ddl"] += 1
+                if calls["ddl"] == 1:
+                    raise psycopg.errors.DuplicateTable("duplicate table")
+            elif "CREATE UNIQUE INDEX" in text:
+                calls["index"] += 1
+            elif "pg_advisory_unlock" in text:
+                calls["unlock"] += 1
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    store = object.__new__(pg_module.PostgresLongTermMemory)
+    store.dsn = dsn
+    store._conn = _Conn()
+    try:
+        store._ensure_schema()
+    finally:
+        pg_module._SCHEMA_READY.discard(dsn)
+    assert calls["ddl"] == 2, "目录竞争后应重跑一次 DDL"
+    assert calls["index"] == 1
+    assert calls["unlock"] == 1
+    print("✓ 并发建表竞争被容忍并补齐")
+
+
 def test_pg_batch_aborts_when_connection_reconnects():
     """批量保存中途连接重建：索引 / 编号水位已过期，必须中止而不是继续生成 id。"""
     import contextlib as contextlib_module
@@ -2516,6 +2632,8 @@ if __name__ == "__main__":
     test_migrate_drops_non_object_entries()
     test_migrate_recomputes_counters_after_dropping_entries()
     test_pg_reconnects_after_connection_error()
+    test_pg_schema_initialized_once_per_process()
+    test_pg_schema_tolerates_concurrent_create_race()
     test_pg_failed_retry_wrapped_as_memory_error()
     test_falsey_preferences_included_in_context()
     test_path_locks_do_not_grow_unbounded()

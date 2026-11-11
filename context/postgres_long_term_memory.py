@@ -39,6 +39,18 @@ def _pg_timestamp(value: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+# 进程内「该 DSN 的表结构已就绪」标记：Web 每个读写接口 / 每个新会话都会
+# 构造 PostgresLongTermMemory。若每次都跑整套 DDL，即使对象已存在，
+# ALTER TABLE ... ADD COLUMN 仍取 aligo_trips 的 ACCESS EXCLUSIVE 锁、
+# CREATE INDEX 仍取消息表 ShareLock，与导入 / 删除的长事务互相阻塞，把
+# 所有新建存储的请求拖死。表结构只在进程首次连接某个 DSN 时创建一次；
+# 版本升级新增表由重新部署（进程重启）触发。
+_SCHEMA_READY: set[str] = set()
+_SCHEMA_LOCK = threading.Lock()
+# 多实例同时首次启动时串行化建表（跨进程）；滚动发布中旧实例不持此锁，
+# 目录竞争错误按「对象已存在」容忍并重试一次
+_SCHEMA_ADVISORY_LOCK = "aligo:schema_ddl"
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS aligo_preferences (
     user_id TEXT NOT NULL,
@@ -167,16 +179,60 @@ class PostgresLongTermMemory:
         return psycopg.connect(self.dsn, **kwargs)
 
     def _ensure_schema(self) -> None:
+        """创建表 / 索引；同一进程内每个 DSN 只执行一次。
+
+        表结构已存在时的 DDL 仍会取强锁（见模块顶部注释），不能放在每次
+        构造 / 重连路径上；首次初始化在进程内用锁串行，跨进程用 advisory
+        lock 串行，滚动发布中旧实例不持锁造成的目录竞争按「已存在」容忍。
+        """
+        key = self.dsn
+        if key in _SCHEMA_READY:
+            return
+        with _SCHEMA_LOCK:
+            if key in _SCHEMA_READY:
+                return
+            self._create_schema()
+            _SCHEMA_READY.add(key)
+
+    def _create_schema(self) -> None:
+        import psycopg
+
+        duplicate_errors: tuple[type[BaseException], ...] = tuple(
+            error
+            for error in (
+                getattr(psycopg.errors, "DuplicateTable", None),
+                getattr(psycopg.errors, "DuplicateObject", None),
+                getattr(psycopg.errors, "UniqueViolation", None),
+            )
+            if isinstance(error, type)
+        )
         with self._conn.cursor() as cursor:
-            cursor.execute(_SCHEMA_SQL)
+            cursor.execute(
+                "SELECT pg_advisory_lock(hashtext(%s)::bigint)",
+                (_SCHEMA_ADVISORY_LOCK,),
+            )
             try:
-                # 历史库可能已有重复 trip_id，建索引失败只记录，不阻止后端启用
-                cursor.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_aligo_trips_user_trip "
-                    "ON aligo_trips (user_id, trip_id)"
-                )
-            except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
-                logger.warning("无法创建 trip_id 唯一索引: %s", exc)
+                try:
+                    cursor.execute(_SCHEMA_SQL)
+                except duplicate_errors:
+                    # 旧实例（不持本锁）并发建表：批次在失败语句处中止，
+                    # 重跑一次补齐后面的建表语句
+                    logger.info("表结构已被并发创建，重试剩余 DDL")
+                    cursor.execute(_SCHEMA_SQL)
+                try:
+                    # 历史库可能已有重复 trip_id，建索引失败只记录，不阻止后端启用
+                    cursor.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aligo_trips_user_trip "
+                        "ON aligo_trips (user_id, trip_id)"
+                    )
+                except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
+                    logger.warning("无法创建 trip_id 唯一索引: %s", exc)
+            finally:
+                with contextlib.suppress(Exception):
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                        (_SCHEMA_ADVISORY_LOCK,),
+                    )
 
     def _execute(
         self, sql: str, params: tuple | None = None, replay_safe: bool = True
