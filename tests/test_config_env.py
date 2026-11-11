@@ -111,10 +111,15 @@ def test_create_chat_model_max_retries_param():
     from config_agentscope import create_chat_model
 
     default_model = create_chat_model(api_key="sk-test")
-    assert default_model.client.max_retries == 2, "默认保持 SDK 行为"
+    assert default_model.client.max_retries == 0, (
+        "默认关闭 SDK 重试：应用层 retry_with_backoff 才是唯一重试入口，"
+        "叠加会把一次调用放大成 12 个完整请求且用量不可见"
+    )
     no_retry = create_chat_model(api_key="sk-test", max_retries=0)
     assert no_retry.client.max_retries == 0
-    print("✓ create_chat_model 支持 max_retries")
+    explicit = create_chat_model(api_key="sk-test", max_retries=1)
+    assert explicit.client.max_retries == 1
+    print("✓ create_chat_model 默认关闭 SDK 重试，支持显式覆盖")
 
 
 def test_kb_import_rate_limit_env():
