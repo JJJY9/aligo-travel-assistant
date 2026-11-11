@@ -1509,7 +1509,7 @@ def _parse_json_flag(args: list[str], usage: str) -> bool | None:
     """解析可选 ``--json``（大小写不敏感、可重复）；非法参数打印用法并返回 None。"""
     if all(item.lower() == "--json" for item in args):
         return bool(args)
-    print(f"用法：{usage}")
+    _cli_fail(f"用法：{usage}", _args_have_json(args))
     return None
 
 
@@ -1535,6 +1535,11 @@ def _valid_user_id(value: str) -> bool:
         bool(re.fullmatch(r"[\w-]{1,64}", value))
         and not value.startswith("-")
     )
+
+
+def _args_have_json(args: list[str]) -> bool:
+    """参数列表中是否出现 --json（大小写不敏感）。"""
+    return any(item.lower() == "--json" for item in args)
 
 
 def _parse_user_and_json_args(args: list[str]) -> tuple[str, bool] | None:
@@ -5155,9 +5160,19 @@ def run_trips_list_standalone(
 
     if not trips:
         if as_json:
+            # 与有行程时同一形状：query / status 始终存在，脚本读 .status
+            # 不因「恰好没有任何行程」而拿到 null / KeyError
             print(
                 json.dumps(
-                    {"user_id": user_id, "count": 0, "trips": []},
+                    {
+                        "user_id": user_id,
+                        "query": query.strip(),
+                        "status": _TRIP_STATUS_FILTERS.get(
+                            status_filter.strip(), ""
+                        ),
+                        "count": 0,
+                        "trips": [],
+                    },
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -5721,7 +5736,10 @@ def main():
         if arg == "doctor":
             doctor_args = _parse_doctor_args(sys.argv[2:])
             if doctor_args is None:
-                print("用法：python cli.py doctor [--json] [--offline]")
+                _cli_fail(
+                    "用法：python cli.py doctor [--json] [--offline]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             doctor_json, doctor_network = doctor_args
             sys.exit(
@@ -5745,7 +5763,10 @@ def main():
                 if flag != "--json"
             ]
             if len(cities) != 1 or cities[0].startswith("-"):
-                print("用法：python cli.py weather <城市> [--json]")
+                _cli_fail(
+                    "用法：python cli.py weather <城市> [--json]",
+                    weather_json,
+                )
                 sys.exit(2)
             sys.exit(run_weather_standalone(cities[0], as_json=weather_json))
         if arg == "kb":
@@ -5756,7 +5777,10 @@ def main():
         if arg == "eval":
             parsed_eval = _parse_eval_args(sys.argv[2:])
             if parsed_eval is None:
-                print("用法：python cli.py eval [--json] [--min-hit5 0.8]")
+                _cli_fail(
+                    "用法：python cli.py eval [--json] [--min-hit5 0.8]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             eval_json, eval_min_hit5 = parsed_eval
             sys.exit(
@@ -5944,7 +5968,12 @@ def main():
         if arg == "stats":
             parsed_stats = _parse_user_and_json_args(sys.argv[2:])
             if parsed_stats is None:
-                print("用法：python cli.py stats <user_id> [--json]")
+                # 参数错误也遵守 --json 契约：stdout 只输出合法 JSON，
+                # 否则 `... | jq .error` 在真实进程入口直接解析失败
+                _cli_fail(
+                    "用法：python cli.py stats <user_id> [--json]",
+                    any(item.lower() == "--json" for item in sys.argv[2:]),
+                )
                 sys.exit(2)
             stats_user, stats_json = parsed_stats
             sys.exit(run_stats_standalone(stats_user, as_json=stats_json))
@@ -6018,10 +6047,11 @@ def main():
         if arg == "trip-add":
             parsed_trip_add = _parse_trip_add_args(sys.argv[2:])
             if parsed_trip_add is None:
-                print(
+                _cli_fail(
                     "用法：python cli.py trip-add <user_id> --destination X "
                     "--start YYYY-MM-DD [--origin X] [--end YYYY-MM-DD] "
-                    "[--purpose X] [--json]"
+                    "[--purpose X] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             trip_values = parsed_trip_add["values"]
@@ -6039,10 +6069,11 @@ def main():
         if arg == "trip-update":
             parsed_trip_update = _parse_trip_update_args(sys.argv[2:])
             if parsed_trip_update is None:
-                print(
+                _cli_fail(
                     "用法：python cli.py trip-update <user_id> <trip_id> "
                     "[--origin X] [--destination X] [--start YYYY-MM-DD] "
-                    "[--end YYYY-MM-DD] [--purpose X] [--json]"
+                    "[--end YYYY-MM-DD] [--purpose X] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6069,7 +6100,10 @@ def main():
                 else:
                     other = item
             if not valid or target is None or other is None:
-                print("用法：python cli.py trip-delete <user_id> <trip_id> [--json]")
+                _cli_fail(
+                    "用法：python cli.py trip-delete <user_id> <trip_id> [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             sys.exit(
                 run_trip_delete_standalone(target, other, as_json=as_json)
@@ -6077,9 +6111,10 @@ def main():
         if arg == "trips":
             parsed_trips_list = _parse_trips_list_args(sys.argv[2:])
             if parsed_trips_list is None:
-                print(
+                _cli_fail(
                     "用法：python cli.py trips <user_id> [--query 关键词] "
-                    "[--status active|upcoming|past] [--json]"
+                    "[--status active|upcoming|past] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             (
@@ -6098,8 +6133,9 @@ def main():
             )
         if arg == "trips-dedupe":
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                print(
-                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]"
+                _cli_fail(
+                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             dry_run = False
@@ -6115,8 +6151,9 @@ def main():
                     valid = False
                     break
             if not valid:
-                print(
-                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]"
+                _cli_fail(
+                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6406,9 +6443,10 @@ def main():
                 else:
                     positional.append(item)
             if not valid or len(positional) != 2:
-                print(
+                _cli_fail(
                     "用法：python cli.py user-import <user_id> <json_path> "
-                    "[--dry-run] [--skip-knowledge] [--json]"
+                    "[--dry-run] [--skip-knowledge] [--json]",
+                    any(item.lower() == "--json" for item in sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6456,22 +6494,24 @@ def main():
                 )
             )
         if arg == "trips-import":
+            lowered_args = [item.lower() for item in sys.argv[2:]]
             import_args = [
                 a
-                for a in sys.argv[2:]
-                if a not in {"--json", "--ics", "--dry-run"}
+                for a, lowered in zip(sys.argv[2:], lowered_args)
+                if lowered not in {"--json", "--ics", "--dry-run"}
             ]
-            want_json = "--json" in sys.argv[2:]
-            want_ics = "--ics" in sys.argv[2:]
-            want_dry_run = "--dry-run" in sys.argv[2:]
+            want_json = "--json" in lowered_args
+            want_ics = "--ics" in lowered_args
+            want_dry_run = "--dry-run" in lowered_args
             if (
                 len(import_args) != 2
                 or not _valid_user_id(import_args[0])
                 or import_args[1].startswith("-")
             ):
-                print(
+                _cli_fail(
                     "用法：python cli.py trips-import <user_id> <csv_path> "
-                    "[--ics] [--dry-run] [--json]"
+                    "[--ics] [--dry-run] [--json]",
+                    want_json,
                 )
                 sys.exit(2)
             sys.exit(

@@ -94,6 +94,102 @@ def test_health_missing_runtime_dependencies(monkeypatch):
     assert code == 1 and "FAIL" in out
     print("✓ health 缺少运行时依赖时友好失败")
 
+def test_trips_import_flags_are_case_insensitive(monkeypatch, capsys):
+    """trips-import 的 --JSON / --DRY-RUN / --ICS 大小写不敏感。"""
+    original_stdout = sys.stdout
+    try:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cli.py",
+                "trips-import",
+                "u1",
+                "no-such-file-xyz.csv",
+                "--JSON",
+            ],
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1, "文件不存在属于运行期错误（exit 1）"
+        sys.stdout = original_stdout
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["ok"] is False and "不存在" in payload["error"], payload
+    finally:
+        sys.stdout = original_stdout
+    print("✓ trips-import 标志大小写不敏感")
+
+
+def test_dispatch_usage_errors_respect_json(monkeypatch, capsys):
+    """dispatch 级参数错误：带 --json 时 stdout 仍是合法 JSON。"""
+    original_stdout = sys.stdout
+    try:
+        monkeypatch.setattr(
+            sys, "argv", ["cli.py", "stats", "bad!", "--json"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        sys.stdout = original_stdout
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["ok"] is False, payload
+        assert "用法" in payload["error"], payload
+
+        monkeypatch.setattr(sys, "argv", ["cli.py", "stats", "bad!"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        sys.stdout = original_stdout
+        out = capsys.readouterr().out
+        assert "用法" in out and not out.lstrip().startswith("{")
+
+        monkeypatch.setattr(
+            sys, "argv", ["cli.py", "user-import", "u1", "--json"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        sys.stdout = original_stdout
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["ok"] is False, payload
+        assert "user-import" in payload["error"], payload
+
+        monkeypatch.setattr(sys, "argv", ["cli.py", "user-import", "u1"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        out = capsys.readouterr().out
+        assert "user-import" in out
+
+        # 其它一次性命令的用法错误同样遵守 --json 契约
+        for argv, marker in [
+            (["cli.py", "trip-add", "u1", "--destination", "上海", "--json"], "trip-add"),
+            (["cli.py", "trip-update", "u1", "--json"], "trip-update"),
+            (["cli.py", "trip-delete", "u1", "--json"], "trip-delete"),
+            (["cli.py", "trips", "--json"], "trips"),
+            (["cli.py", "trips-dedupe", "--json"], "trips-dedupe"),
+            (["cli.py", "trips-import", "u1", "--json"], "trips-import"),
+            (["cli.py", "health", "--json", "extra"], "health"),
+            (["cli.py", "doctor", "--json", "--bogus"], "doctor"),
+            (["cli.py", "eval", "--min-hit5", "nope", "--json"], "eval"),
+        ]:
+            monkeypatch.setattr(sys, "argv", argv)
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+            assert exc.value.code == 2, argv
+            sys.stdout = original_stdout
+            out = capsys.readouterr().out
+            payload = json.loads(out)
+            assert payload["ok"] is False, (argv, payload)
+            assert marker in payload["error"], (argv, payload)
+    finally:
+        sys.stdout = original_stdout
+    print("✓ dispatch 用法错误遵守 --json 契约（全命令）")
+
+
 if __name__ == "__main__":
     for case in (
         test_health_json_ok,
