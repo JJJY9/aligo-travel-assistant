@@ -8022,6 +8022,61 @@ def test_usage_summary_total_consistent_with_by_day_for_partial_usage():
     print("✓ 部分 usage 的总 tokens 与按天统计同口径")
 
 
+def test_usage_summary_cached_per_user(monkeypatch):
+    """/api/status 的用量汇总按用户缓存：历史不变时不再全量重放。"""
+    from webapp import server as server_module
+
+    server_module._USAGE_SUMMARY_CACHE.clear()
+    calls = {"n": 0}
+    real = server_module._usage_summary
+
+    def counting(history):
+        calls["n"] += 1
+        return real(history)
+
+    monkeypatch.setattr(server_module, "_usage_summary", counting)
+    history = [
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "results": [],
+                    "_meta": {
+                        "usage": {
+                            "calls": 1,
+                            "input_tokens": 2,
+                            "output_tokens": 3,
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            "timestamp": "2026-11-11T12:00:00",
+            "session_id": "s",
+        }
+    ]
+    try:
+        first = server_module._usage_summary_for_user("u-cache", history)
+        second = server_module._usage_summary_for_user("u-cache", history)
+        assert calls["n"] == 1, "历史未变时必须命中缓存"
+        assert first["total_tokens"] == second["total_tokens"] == 5
+        grown = history + [
+            {"role": "user", "content": "追加消息", "timestamp": "2026-11-11T12:01:00"}
+        ]
+        server_module._usage_summary_for_user("u-cache", grown)
+        assert calls["n"] == 2, "历史变化后必须重新汇总"
+        # 缓存封顶：不同用户不会无限写入
+        for index in range(server_module._USAGE_SUMMARY_CACHE_MAX + 5):
+            server_module._usage_summary_for_user(f"u-{index}", [])
+        assert (
+            len(server_module._USAGE_SUMMARY_CACHE)
+            <= server_module._USAGE_SUMMARY_CACHE_MAX
+        )
+    finally:
+        server_module._USAGE_SUMMARY_CACHE.clear()
+    print("✓ /api/status 用量汇总按用户缓存且封顶")
+
+
 def test_knowledge_eval_bounded_lock_and_masked_status(monkeypatch):
     """评测端点查状态必须带写锁超时、屏蔽路径与原始异常。"""
     from webapp import server as server_module
