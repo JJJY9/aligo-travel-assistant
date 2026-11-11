@@ -381,10 +381,25 @@ async function copyText(text, message = "已复制") {
     area.value = text;
     area.style.position = "fixed";
     area.style.opacity = "0";
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     document.body.appendChild(area);
-    area.select();
-    const copied = document.execCommand("copy");
-    area.remove();
+    let copied = false;
+    try {
+      area.select();
+      copied = document.execCommand("copy");
+    } finally {
+      // 清理必须放 finally：execCommand 抛错（文档非 active / 被策略禁用）
+      // 时隐藏 textarea 会留在 DOM 并继续吞键盘输入，每失败一次再叠加一个
+      area.remove();
+      if (previousFocus) {
+        try {
+          previousFocus.focus({ preventScroll: true });
+        } catch {
+          /* 焦点恢复尽力而为 */
+        }
+      }
+    }
     if (!copied) throw new Error("copy failed");
     toast(message);
   } catch {
@@ -454,33 +469,72 @@ async function errorMessage(response) {
    因此不会执行任何 HTML / 脚本。 */
 
 function renderInline(raw) {
+  // 私用区占位符由本函数内部生成：输入里同码点先剥掉，防止消息文本伪造
+  // 占位符劫持代码 / 链接的还原过程
+  raw = String(raw ?? "").replace(/[-]/g, "");
   // 行内代码先抽出为占位符：代码里的链接 / ** 不能被当作 Markdown 处理
   const codeSpans = [];
   let text = escapeHtml(raw).replace(/`([^`]+)`/g, (_, code) => {
     codeSpans.push(code);
     return `${codeSpans.length - 1}`;
   });
+  const links = [];
   text = text
-    // URL 允许一层嵌套括号（维基百科 / Microsoft Learn 等常见）
-    // 链接文字限定 1-500 字且内部不允许再出现 [：超长行里每个 '[' 都
-    // 让 [^]]+ 扫到行尾（二次方回溯），渲染大回答时卡住主线程
+    // 链接先换成占位符：URL 里的 **（如 .../wiki/Foo**bar**）不能被后续
+    // 加粗规则改写 href（此前 <strong> 被插进属性值，链接目标被破坏）
     .replace(
       /\[([^\[\]\n]{1,500})\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+      (_, label, href) => {
+        links.push({ label, href });
+        return `${links.length - 1}`;
+      },
     )
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  return text.replace(/(\d+)/g, (_, index) => {
+  text = text.replace(/(\d+)/g, (_, index) => {
     return `<code>${codeSpans[Number(index)] ?? ""}</code>`;
+  });
+  return text.replace(/(\d+)/g, (_, index) => {
+    const link = links[Number(index)];
+    if (!link) return "";
+    // 链接文字里的强调仍然生效（GFM 允许 ** 出现在链接文本中）
+    const label = link.label.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    return `<a href="${link.href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
   });
 }
 
 function splitTableRow(line) {
-  return line
-    .trim()
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.trim());
+  // GFM 表格：\| 是字面竖线，行内代码里的 | 不拆列；此前直接 split("|")
+  // 会让 `a|b` 被拆成两个残片、\| 错位整张表
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells = [];
+  let current = "";
+  let escaped = false;
+  let inCode = false;
+  for (const ch of trimmed) {
+    if (escaped) {
+      current += ch === "|" ? "|" : `\${ch}`;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "`") {
+      inCode = !inCode;
+      current += ch;
+      continue;
+    }
+    if (ch === "|" && !inCode) {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  cells.push(current.trim());
+  return cells;
 }
 
 function renderMarkdown(text) {
@@ -2824,22 +2878,36 @@ async function readEventStream(body, onEvent) {
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
+    // 代理 / 标准 SSE 服务可能使用 CRLF 分帧：先归一化（跨 chunk 的
+    // \r\n 在下次追加后会合成完整序列再被替换），否则 indexOf("\n\n")
+    // 永远命中不了、整条流在 EOF 时被当作「连接意外中断」
+    buffer = buffer.replace(/\r\n/g, "\n");
+
     let boundary = buffer.indexOf("\n\n");
     while (boundary >= 0) {
       const chunk = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
+      // SSE 规范：同一事件的多个 data: 行按行拼接后再解析；注释行忽略
+      const dataLines = [];
       chunk.split("\n").forEach((line) => {
-        if (!line.startsWith("data:")) return;
-        const payload = line.slice(5).trim();
-        if (!payload) return;
-        let event;
-        try {
-          event = JSON.parse(payload);
-        } catch {
-          return; // 忽略无法解析的事件
-        }
-        onEvent(event);
+        if (!line || line.startsWith(":")) return;
+        const colon = line.indexOf(":");
+        const field = colon === -1 ? line : line.slice(0, colon);
+        if (field !== "data") return;
+        let payload = colon === -1 ? "" : line.slice(colon + 1);
+        if (payload.startsWith(" ")) payload = payload.slice(1);
+        dataLines.push(payload);
       });
+      if (dataLines.length) {
+        let event = null;
+        try {
+          event = JSON.parse(dataLines.join("\n"));
+        } catch {
+          event = null; // 忽略无法解析的事件
+        }
+        // 非对象帧（如 data: null）不再交给 handleStreamEvent 触发 TypeError
+        if (event && typeof event === "object") onEvent(event);
+      }
       boundary = buffer.indexOf("\n\n");
     }
   }
@@ -5378,6 +5446,12 @@ function bindEvents() {
       return;
     }
     window.print();
+  });
+
+  // 浏览器菜单 / Ctrl+P 不经过顶栏按钮：打印前同样退出编辑态，否则
+  // 打印稿里这一轮只剩空 textarea 与保存 / 取消按钮，原提问缺失
+  window.addEventListener("beforeprint", () => {
+    cancelPendingEdits();
   });
 
   els.copyLink.addEventListener("click", () => {

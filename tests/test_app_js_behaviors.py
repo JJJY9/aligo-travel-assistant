@@ -96,6 +96,20 @@ def test_frontend_render_helpers():
     assert 'href="https://en.wikipedia.org/wiki/Foo_(bar)"' in results["link_paren"], (
         "链接 URL 的一层括号必须保留"
     )
+    assert (
+        'href="https://en.wikipedia.org/wiki/Foo**bar**"' in results["link_bold_url"]
+    ), "URL 里的 ** 不能被加粗规则改写进 href"
+    assert "<th>a|b</th>" in results["table_escaped_pipe"], "\\| 必须是字面竖线"
+    assert "<th><code>a|b</code></th>" in results["table_code_pipe"], (
+        "行内代码里的竖线不能拆列"
+    )
+    sentinel = results["sentinel_injection"]
+    assert "" not in sentinel and "" not in sentinel, (
+        "输入里的私用区占位符必须被剥离"
+    )
+    assert "<code>" not in sentinel and "<a " not in sentinel, (
+        "伪造占位符不能注入代码 / 链接"
+    )
 
     table = results["table"]
     assert "<table>" in table and "<th>日期</th>" in table and "<td>小雨</td>" in table
@@ -105,6 +119,27 @@ def test_frontend_render_helpers():
     assert results["pref_object"] == '{"a":1}', "对象偏好显示 JSON"
     assert results["pref_list"] == '汉庭、{"b":2}', "列表偏好用「、」拼接并保留对象 JSON"
     print("✓ 前端渲染 / 高亮 / 截断 / 偏好格式化基线")
+
+
+def test_sse_stream_parsing_robustness():
+    """CRLF 分帧、多行 data 与 data: null 都不能让流解析失效。"""
+    events = _run_harness("sse")
+    assert events == [
+        {"type": "session", "session_id": "s"},
+        {"type": "done", "reply": "ok"},
+    ], events
+    print("✓ SSE 解析兼容 CRLF / 多行 data，非对象帧被跳过")
+
+
+def test_copy_fallback_cleans_up_and_restores_focus():
+    """execCommand 抛错时隐藏 textarea 必须移除、焦点回到原元素。"""
+    results = _run_harness("copy")
+    assert results["removed"] == ["textarea"], results
+    assert results["focus_restored"] == 1, results
+    assert results["toasts"] == ["复制失败"], results
+    print("✓ 复制回退异常时清理节点并恢复焦点")
+
+
 def test_knowledge_duplicates_panel_states():
     """「查重复」按钮：无重复 / 有重复（截断提示）/ 失败三种状态文案。"""
     results = _run_harness("duplicates")

@@ -1229,6 +1229,10 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   .msg.user { max-width: 100%; align-self: stretch; }
   .msg.user .bubble { background: #f0f0f0; color: #111; }
   .bubble.answer { color: #111; font-size: 11.5pt; }
+  /* 引用块与「已停止 / 失败」提示在深色主题下是浅灰文字：白底打印
+     几乎不可见，必须跟随正文改为深色 */
+  .bubble.answer blockquote, .bubble.answer blockquote p { color: #333; }
+  .bubble.answer blockquote { border-left-color: #999; }
   .msg.assistant .msg-head { color: #555; }
   .bubble.answer a { color: #111; }
 }
