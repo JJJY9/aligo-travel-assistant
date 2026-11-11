@@ -379,11 +379,21 @@ class AligoCLI:
                 usage=usage_delta,
                 elapsed=elapsed,
             )
-            self.memory_manager.persist_turn(
+            committed = self.memory_manager.persist_turn(
                 user_input,
                 json.dumps(attach_turn_meta(result_data, meta), ensure_ascii=False),
             )
-            persisted = True
+            if committed is False:
+                # 会话已在面板 / 另一终端被删除（共享墓碑否决整轮）：本轮回
+                # 答不会写入长期记忆，暂存的提问由 finally 回滚。必须明确
+                # 提示——否则墓碑有效期内每轮都被静默丢弃，用户无感知
+                self.console.print(
+                    "\n[bold yellow]该会话已被删除（面板 / 其它终端），"
+                    "本轮未写入长期记忆；请重新开始会话。[/bold yellow]"
+                )
+            else:
+                # None（旧实现无返回值）按成功处理，与 ConversationRuntime 一致
+                persisted = True
         finally:
             if staged and not persisted:
                 rollback = getattr(self.memory_manager, "rollback_staged_message", None)
