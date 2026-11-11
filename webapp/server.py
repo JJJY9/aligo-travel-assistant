@@ -1404,6 +1404,17 @@ class AligoWebApp:
             else:
                 self._tombstones_shared = True
                 self._tombstone_retry_at = 0.0
+            # 会话纪元：与 utils.tombstones 共用键约定，单调递增且不随墓碑
+            # 撤销回退。删除前启动的在途回合在落库守卫处按纪元变化被否决，
+            # 「从未存在 / 并发删除后撤销墓碑」的路径不再留下幽灵写回窗口
+            from utils.tombstones import EPOCH_TTL_SEC, epoch_key
+
+            try:
+                epoch = epoch_key(user_id, session_id)
+                client.incr(epoch)
+                client.expire(epoch, int(EPOCH_TTL_SEC))
+            except Exception as exc:  # noqa: BLE001 - 纪元失败由墓碑兜底
+                logger.warning("写入会话纪元失败：%s", exc)
         return token
 
     def unmark_deleted(

@@ -99,6 +99,36 @@ class MemoryManager:
             self._rebuild_long_term()
         self.long_term.add_chat_message(role, content, self.session_id)
 
+    def session_epoch(self) -> str | None:
+        """当前会话纪元（删除时单调递增）；无共享 Redis / 从未删除时为 None。"""
+        return tombstones.get_session_epoch(self.user_id, self.session_id)
+
+    def persist_guard(
+        self,
+        epoch_at_start: str | None,
+        base: Callable[[], bool] | None = None,
+    ) -> Callable[[], bool]:
+        """组合落库守卫：墓碑（base / 默认共享墓碑）与「纪元未变」同时成立。
+
+        墓碑只保留 1 小时，且「从未存在 / 并发删除」分支会撤销墓碑——删除前
+        启动的长回合可能在墓碑撤销后才落库。纪元在每次删除时单调递增且
+        不回退：回合开始时记下的值与提交时不同即说明本轮开始后会话被删过，
+        无论墓碑是否还在都否决写入。
+        """
+
+        def guard() -> bool:
+            if base is not None:
+                if not base():
+                    return False
+            elif tombstones.is_session_deleted(self.user_id, self.session_id):
+                return False
+            return (
+                tombstones.get_session_epoch(self.user_id, self.session_id)
+                == epoch_at_start
+            )
+
+        return guard
+
     def persist_turn(
         self,
         user_content: str,

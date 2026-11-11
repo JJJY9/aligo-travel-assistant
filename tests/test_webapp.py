@@ -5642,6 +5642,15 @@ def test_shared_tombstones_across_instances():
             self.ttls[key] = ex
             return True
 
+        def incr(self, key):
+            value = int(self.data.get(key, "0")) + 1
+            self.data[key] = str(value)
+            return value
+
+        def expire(self, key, ttl):
+            self.ttls[key] = ttl
+            return 1
+
         def exists(self, key):
             return int(key in self.data)
 
@@ -5670,11 +5679,17 @@ def test_shared_tombstones_across_instances():
     assert shared.ttls["aligo:deleted:u-shared:s-shared"] == int(
         state_a.tombstone_ttl_sec
     ), "共享墓碑 TTL 应与本地一致"
+    # 删除同时递增会话纪元（单调）：撤销墓碑后，删除前启动的在途回合
+    # 仍会因纪元变化在落库守卫处被否决
+    assert shared.data["aligo:session-epoch:u-shared:s-shared"] == "1"
     assert state_b.is_recently_deleted("u-shared", "s-shared") is True
     assert state_b.is_recently_deleted("u-shared", "other") is False
 
     state_a.unmark_deleted("u-shared", "s-shared")
     assert state_b.is_recently_deleted("u-shared", "s-shared") is False
+    assert (
+        shared.data["aligo:session-epoch:u-shared:s-shared"] == "1"
+    ), "撤销墓碑不能回退会话纪元"
     print("✓ 删除墓碑通过 Redis 跨实例共享（含 TTL 与撤销）")
 
 

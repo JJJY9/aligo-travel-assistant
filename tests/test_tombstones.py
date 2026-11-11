@@ -24,6 +24,7 @@ class _FakeRedis:
         self.fail = fail
         self.set_calls = []
         self.exists_calls = []
+        self.ttls = {}
         self.values: dict[str, str] = {}
 
     def set(self, key, value, nx=False, ex=None):
@@ -34,6 +35,19 @@ class _FakeRedis:
             return None
         self.values[key] = value
         return True
+
+    def incr(self, key):
+        if self.fail:
+            raise ConnectionError("redis down")
+        value = int(self.values.get(key, "0")) + 1
+        self.values[key] = str(value)
+        return value
+
+    def expire(self, key, ttl):
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.ttls[key] = ttl
+        return 1
 
     def exists(self, key):
         self.exists_calls.append(key)
@@ -78,6 +92,40 @@ def test_mark_writes_nx_with_ttl(monkeypatch):
     tombstones.mark_session_deleted("u1", "s1", ttl_sec=0, source="web")
     assert client.set_calls[-1][2] is True and client.set_calls[-1][3] == 1
     print("✓ 墓碑写入 NX + TTL")
+
+
+def test_mark_reports_ownership_when_nx_lost(monkeypatch):
+    """SET NX 落败时只有值等于本进程 token 才算拥有（回滚不能删别人的墓碑）。"""
+    client = _FakeRedis()
+    client.values["aligo:deleted:u1:s1"] = "other-process-token"
+    _use_client(monkeypatch, client)
+    assert (
+        tombstones.mark_session_deleted("u1", "s1", source="cli-mine") is False
+    ), "墓碑属于其它进程：本进程不是所有者"
+    assert (
+        tombstones.mark_session_deleted(
+            "u1", "s1", source="other-process-token"
+        )
+        is True
+    ), "值等于本进程 token 的幂等重试视为拥有"
+    print("✓ 墓碑所有权按 SET NX 结果判定")
+
+
+def test_mark_bumps_epoch_and_unmark_keeps_it(monkeypatch):
+    """删除递增会话纪元；撤销墓碑不回退纪元（在途回合按纪元变化被否决）。"""
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    token = "cli-token-1"
+    assert tombstones.mark_session_deleted("u1", "s1", source=token) is True
+    assert tombstones.get_session_epoch("u1", "s1") == "1"
+    assert client.ttls[tombstones.epoch_key("u1", "s1")] == int(
+        tombstones.EPOCH_TTL_SEC
+    )
+    tombstones.unmark_session_deleted("u1", "s1", source=token)
+    assert tombstones.get_session_epoch("u1", "s1") == "1", "撤销墓碑不回退纪元"
+    tombstones.mark_session_deleted("u1", "s1", source="cli-token-2")
+    assert tombstones.get_session_epoch("u1", "s1") == "2"
+    print("✓ 删除递增会话纪元且不回退")
 
 
 def test_is_session_deleted_reads_shared_key(monkeypatch):
@@ -209,6 +257,8 @@ if __name__ == "__main__":
     test_deleted_key_matches_web_contract()
     for case in (
         test_mark_writes_nx_with_ttl,
+        test_mark_reports_ownership_when_nx_lost,
+        test_mark_bumps_epoch_and_unmark_keeps_it,
         test_is_session_deleted_reads_shared_key,
         test_missing_redis_means_not_deleted,
         test_redis_errors_are_swallowed,

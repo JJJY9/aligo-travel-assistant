@@ -203,6 +203,21 @@ class ConversationRuntime:
         # 否则旧回调的回滚按内容匹配可能删掉本轮刚暂存的同一文本提问。
         # 落库线程超时仍未结束时只能继续（用户锁已在上一轮入口释放）。
         await self.drain_pending_persist()
+        # 本轮开始时的会话纪元：删除（含「从未存在 / 并发删除」后撤销墓碑
+        # 的路径）会单调递增纪元，落库前比对可挡住删除前启动的迟到回合。
+        # Redis 不可用时两次读取都是 None，行为与旧版一致。
+        epoch_reader = getattr(self.memory, "session_epoch", None)
+        epoch_at_start = (
+            await asyncio.to_thread(epoch_reader)
+            if callable(epoch_reader)
+            else None
+        )
+        guard_factory = getattr(self.memory, "persist_guard", None)
+        commit_guard = (
+            guard_factory(epoch_at_start, self._persist_guard)
+            if callable(guard_factory)
+            else self._persist_guard
+        )
         try:
             await asyncio.to_thread(self.memory.stage_message, "user", user_input)
             # 用清洗后的意图数据重建 Msg 再交给编排器：原始 Msg 仍可能带
@@ -252,7 +267,7 @@ class ConversationRuntime:
                     self.memory.persist_turn,
                     user_input,
                     assistant_payload,
-                    should_commit=self._persist_guard,
+                    should_commit=commit_guard,
                 )
             )
             self._pending_persist = pending
