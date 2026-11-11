@@ -447,6 +447,50 @@ def test_stream_and_chat_sanitize_model_surrogates(monkeypatch):
     print("✓ SSE / JSON 响应转义模型输出的孤立代理项")
 
 
+def test_stream_and_chat_report_unpersisted_turn(monkeypatch):
+    """墓碑否决的回合：done / 响应必须带 persisted=false，不能伪装成功。"""
+    from agents.conversation import ConversationRuntime
+
+    async def _vetoed_ask(self, message, on_event=None, turn_id=""):
+        return {
+            "reply": "回答",
+            "agents": [],
+            "usage": {},
+            "elapsed": 0.1,
+            "persisted": False,
+        }
+
+    monkeypatch.setattr(ConversationRuntime, "ask", _vetoed_ask)
+    client = _client()
+    user_id = _unique_user("web_test_veto_signal")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-veto"},
+        ) as response:
+            assert response.status_code == 200
+            raw = b"".join(response.iter_bytes())
+        text = raw.decode("utf-8")
+        events = [
+            json.loads(line[5:].strip())
+            for line in text.splitlines()
+            if line.startswith("data:")
+        ]
+        assert events[-1]["type"] == "done", events[-1]
+        assert events[-1]["persisted"] is False, events[-1]
+
+        chat = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-veto2"},
+        )
+        assert chat.status_code == 200, chat.text
+        assert chat.json()["persisted"] is False, chat.json()
+    finally:
+        _cleanup(user_id)
+    print("✓ 未落库回合的 persisted=false 透传到 SSE 与 JSON 响应")
+
+
 def test_stream_forwards_agent_progress_events(monkeypatch):
     """orchestrator 发出的 agent_start / agent_done 必须原样转发到 SSE。"""
     from agents.orchestration_agent import OrchestrationAgent
@@ -9188,6 +9232,11 @@ if __name__ == "__main__":
         test_stream_and_chat_sanitize_model_surrogates(_mp_surrogate)
     finally:
         _mp_surrogate.undo()
+    _mp_veto = pytest.MonkeyPatch()
+    try:
+        test_stream_and_chat_report_unpersisted_turn(_mp_veto)
+    finally:
+        _mp_veto.undo()
     test_stream_heartbeat()
     test_chat_failure_returns_500()
     test_chat_stream_failure_event()

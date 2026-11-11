@@ -2679,13 +2679,7 @@ async function sendMessage(text, options = {}) {
     if (state.sessionId) {
       const users = els.messages.querySelectorAll(".msg.user");
       const lastUser = users[users.length - 1];
-      if (lastUser) {
-        if (terminal === "done") {
-          delete lastUser.dataset.transient;
-        } else {
-          lastUser.dataset.transient = "1";
-        }
-      }
+      if (lastUser) applyTurnPersistence(lastUser, terminal, assistant.persisted);
     }
     setBusy(false);
     refreshEditButtons();
@@ -2834,6 +2828,18 @@ function resetDeletedSessionState(restoreText) {
   }
 }
 
+/* 依据本轮回合终态与落库结果设置「临时提问」标记：
+   只有 done 且服务端确认已落库（persisted !== false）才清除；停止 / 失败 /
+   墓碑否决（persisted=false）一律保留标记，避免出现编辑入口与刷新后无声丢失。 */
+function applyTurnPersistence(lastUser, terminal, persisted) {
+  if (!lastUser) return;
+  if (terminal === "done" && persisted !== false) {
+    delete lastUser.dataset.transient;
+  } else {
+    lastUser.dataset.transient = "1";
+  }
+}
+
 function handleStreamEvent(assistant, event, userText) {
   switch (event.type) {
     case "phase":
@@ -2875,10 +2881,23 @@ function handleStreamEvent(assistant, event, userText) {
       if (els.convTitle.textContent === "新对话") {
         setConversationTitle(clampText(state.lastUserText, 40));
       }
+      assistant.persisted = event.persisted;
       mutate(() => {
         assistant.trace.finish(event.elapsed);
         assistant.setReply(event.reply, event);
       }, true);
+      if (event.persisted === false) {
+        // 落库被墓碑否决（会话已在其它窗口 / 终端删除）：回答没有写入
+        // 历史。保留已显示的回答，但把提问标记为临时、切回新对话状态，
+        // 并明确提示——否则刷新后该轮无声消失，编辑 / 重新生成也会失败
+        const users = els.messages.querySelectorAll(".msg.user");
+        const lastUser = users[users.length - 1];
+        if (lastUser) lastUser.dataset.transient = "1";
+        state.sessionId = null;
+        safeStorageRemove("session", "aligo.sessionId");
+        syncSessionControls();
+        toast("会话已在其它窗口或终端删除，本轮回答未保存");
+      }
       break;
     }
     case "error": {

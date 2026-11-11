@@ -986,6 +986,74 @@ async function scenarioPanelFixes(source) {
   return results;
 }
 
+function scenarioChatPersisted(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+
+  // 落库被墓碑否决：done 带 persisted=false —— 保留回答、提问标记为临时、
+  // 清空会话并提示；不能被 sendMessage 的 finally 当成成功清掉 transient
+  run(`
+    globalThis.__userNodes = [document.createElement("div")];
+    els.messages.querySelectorAll = (sel) =>
+      sel === ".msg.user" ? __userNodes : [];
+    globalThis.__assistant = {
+      trace: {
+        finish() { globalThis.__finished = (globalThis.__finished || 0) + 1; },
+        fail() {},
+      },
+      setReply(reply) { globalThis.__reply = reply; },
+    };
+    state.userId = "u1";
+    state.sessionId = "s-old";
+    state.lastUserText = "你好";
+    sessionStorage.setItem("aligo.sessionId", "s-old");
+    handleStreamEvent(
+      __assistant,
+      {
+        type: "done",
+        session_id: "s-new",
+        reply: "回答",
+        elapsed: 0.2,
+        persisted: false,
+      },
+      "你好",
+    );
+  `);
+  results.veto = {
+    sessionId: run("state.sessionId"),
+    storedSession: run('sessionStorage.getItem("aligo.sessionId")'),
+    transient: run('__userNodes[0].dataset.transient || null'),
+    toasts: run("__toasts.slice()"),
+    finished: run("__finished || 0"),
+    reply: run("__reply || null"),
+  };
+
+  // 正常落库 / 停止 / 否决：applyTurnPersistence 的标记口径
+  run(`
+    globalThis.__userNodes = [document.createElement("div")];
+    __userNodes[0].dataset.transient = "1";
+    applyTurnPersistence(__userNodes[0], "done", true);
+  `);
+  const okTransient = run('__userNodes[0].dataset.transient || null');
+  run(`
+    globalThis.__userNodes = [document.createElement("div")];
+    applyTurnPersistence(__userNodes[0], "done", false);
+  `);
+  const vetoHelper = run('__userNodes[0].dataset.transient || null');
+  run(`
+    globalThis.__userNodes = [document.createElement("div")];
+    applyTurnPersistence(__userNodes[0], "aborted", undefined);
+  `);
+  const stopped = run('__userNodes[0].dataset.transient || null');
+  results.ok = {
+    transient: okTransient,
+    veto_helper: vetoHelper,
+    stopped,
+  };
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1018,6 +1086,8 @@ async function main() {
     payload = await scenarioPanelFixes(source);
   } else if (scenario === "startup") {
     payload = await scenarioStartup(source);
+  } else if (scenario === "chatPersisted") {
+    payload = scenarioChatPersisted(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

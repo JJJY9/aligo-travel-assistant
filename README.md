@@ -611,8 +611,8 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`） |
-| POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果） |
+| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`；响应含 `persisted`，会话在其它进程被删除时整轮不落库并返回 `persisted: false`） |
+| POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果；`done` 事件同样携带 `persisted`） |
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开或技能目录不可用（`skills.ok` 为 `false`）时 `status` 为 `degraded` 并附 `circuit_breaker` / `skills` |
 | GET | `/api/metrics` | 进程内请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors`）与限流后端信息；SSE 长连接只计请求数、不计入延迟分位 |
 | GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |

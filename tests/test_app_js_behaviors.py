@@ -359,6 +359,23 @@ def test_panel_fixes_cursor_stale_session_and_import_batches():
     print("✓ 面板修复：会话游标 / 幽灵会话 / 知识导入分批")
 
 
+def test_chat_done_persisted_signal():
+    """落库被墓碑否决：done(persisted=false) 标记提问为临时并切回新对话。"""
+    data = _run_harness("chatPersisted")
+    veto = data["veto"]
+    assert veto["sessionId"] is None, veto
+    assert veto["storedSession"] is None, veto
+    assert veto["transient"] == "1", veto
+    assert veto["finished"] == 1 and veto["reply"] == "回答", veto
+    assert any("未保存" in item for item in veto["toasts"]), veto
+
+    ok = data["ok"]
+    assert ok["transient"] is None, "正常落库要清除临时标记"
+    assert ok["veto_helper"] == "1", "persisted=false 的 done 仍要保留临时标记"
+    assert ok["stopped"] == "1", "停止 / 失败的回合必须保留临时标记"
+    print("✓ 聊天 done 事件透传落库状态（未保存 / 正常）")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -372,4 +389,5 @@ if __name__ == "__main__":
     test_startup_does_not_override_user_session_click()
     test_knowledge_eval_panel_states()
     test_panel_fixes_cursor_stale_session_and_import_batches()
+    test_chat_done_persisted_signal()
     print("\n全部通过")
