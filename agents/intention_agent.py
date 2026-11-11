@@ -21,7 +21,8 @@ from agentscope.message import Msg
 
 from utils.json_parser import (
     extract_json_from_async_response,
-    iter_json_objects,
+    has_unclosed_json_object,
+    iter_json_objects_with_repair,
     reject_json_constant,
     robust_json_parse,
 )
@@ -315,9 +316,24 @@ class IntentionAgent(AgentBase):
                 # information_query。优先采用最后一个带 agent_schedule 的
                 # 对象——模型回显 prompt 模板时占位对象在前、真实结果在后
                 result = None
-                for candidate in iter_json_objects(text):
+                selected_end = -1
+                truncated = False
+                for candidate, end in iter_json_objects_with_repair(text):
                     if "agent_schedule" in candidate:
                         result = candidate
+                        selected_end = end
+                if result is not None and has_unclosed_json_object(
+                    text[selected_end:]
+                ):
+                    # 回显的模板对象在前、正式意图结果被 max_tokens 截断：
+                    # 模板占位调度不能当成真实决策执行（技能侧已有同等守卫）
+                    logger.warning("意图识别结果在对象处被截断，回退默认调度")
+                    truncated = True
+                    result = None
+                if truncated:
+                    # 不能走 robust_json_parse 兜底：它按「首个 { 到最后一个
+                    # }」截取，会把前面的模板对象解析成功、重新当成结果
+                    raise ValueError("意图识别结果在对象处被截断")
                 if result is None:
                     # 尾逗号 / 裸控制字符等小瑕疵：走修复解析再试一次，
                     # 否则规划请求会被整体降级成 information_query 搜索

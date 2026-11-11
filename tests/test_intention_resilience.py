@@ -200,6 +200,33 @@ def test_template_echo_before_real_result_uses_last():
     print("✓ 多次出现 agent_schedule 时采用最后一个")
 
 
+class _TemplateEchoThenTruncatedModel:
+    """回显模板在前、正式意图结果被 max_tokens 截断：模板不能当真。"""
+
+    async def __call__(self, messages):
+        return (
+            '{"reasoning": "这里是详细的推理过程", "intents": [{"type": "意图类型"}], '
+            '"key_entities": {"origin": "出发地（如果有）"}, '
+            '"rewritten_query": "标准化、补全后的查询内容", '
+            '"agent_schedule": [{"agent_name": "子智能体名称", "priority": 1}]}\n'
+            '正式结果：{"reasoning": "用户要规划行程", '
+            '"key_entities": {"destination": "杭'
+        )
+
+
+def test_template_echo_with_truncated_result_falls_back_to_default():
+    """模板回显 + 正式结果截断：降级默认调度，不执行占位智能体。"""
+    agent = IntentionAgent(
+        name="IntentionAgent", model=_TemplateEchoThenTruncatedModel()
+    )
+    data = json.loads(asyncio.run(agent.reply(_user_msg())).content)
+    names = [item.get("agent_name") for item in data["agent_schedule"]]
+    assert "子智能体名称" not in names, data
+    assert names == ["information_query"], data
+    assert "意图识别出错" in data.get("reasoning", "")
+    print("✓ 模板回显 + 正式结果截断时降级默认调度")
+
+
 def test_single_msg_call_does_not_leak_previous_history():
     """同一实例混用列表与单条 Msg 输入时，上一轮历史不能串进本次 prompt。"""
     model = _CaptureModel()
@@ -357,6 +384,7 @@ if __name__ == "__main__":
     test_long_input_is_truncated()
     test_fragment_before_full_object_keeps_real_schedule()
     test_template_echo_before_real_result_uses_last()
+    test_template_echo_with_truncated_result_falls_back_to_default()
     test_single_msg_call_does_not_leak_previous_history()
     test_content_block_list_is_rendered_as_text()
     test_non_list_schedule_falls_back_to_default()

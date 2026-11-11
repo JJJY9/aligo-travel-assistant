@@ -5,7 +5,6 @@ JSON 解析辅助工具
 import json
 import logging
 import re
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -143,58 +142,189 @@ def iter_json_objects(text: str):
         index = max(end, index + 1)
 
 
-def _iter_objects_with_repair(text: str):
-    """按位置产出文本中的顶层对象，严格解析失败时按小瑕疵修复后再试。
+def _escape_control_chars_in_strings(fragment: str) -> str:
+    """把字符串值内部的裸控制字符转义成合法的 JSON 转义文本。
 
-    产出 ``(value, end)``，``end`` 为对象结束位置（用于判断其后是否还有
-    目标对象）。修复只覆盖「尾逗号」这类小瑕疵（复用
-    :func:`_strip_trailing_commas`）：模型输出被 max_tokens 截断等无法
-    修复的形态不产出，由调用方决定降级。
+    模型输出常在 summary / 正文里直接换行（未写成 ``\\n``）：严格解析失败，
+    但对象本身完整。与 ``robust_json_parse`` 的控制字符修复同一口径，作用
+    域限定在字符串内部（结构中的空白原样保留）。
     """
+    escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for char in fragment:
+        if in_string:
+            if escaped:
+                out.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                out.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                out.append(char)
+                in_string = False
+                continue
+            code = ord(char)
+            if code < 0x20 or 0x7F <= code <= 0x9F:
+                out.append(escapes.get(char) or f"\\u{code:04x}")
+                continue
+            out.append(char)
+            continue
+        if char == '"':
+            in_string = True
+        out.append(char)
+    return "".join(out)
+
+
+def _repair_single_quotes(fragment: str) -> str:
+    """复用 ``robust_json_parse`` 的单引号修复（键名 / 字符串值）。"""
+    fixed = re.sub(r"'([^']*)'(\s*:\s*)", r'"\1"\2', fragment)
+    return re.sub(r":\s*'([^']*)'", r': "\1"', fixed)
+
+
+def _repair_object_fragment(fragment: str) -> "dict | None":
+    """按机械小瑕疵修复候选对象：尾逗号 / 字符串内裸控制字符 / 单引号。"""
     decoder = json.JSONDecoder(parse_constant=reject_json_constant)
+    no_commas = _strip_trailing_commas(fragment)
+    escaped = _escape_control_chars_in_strings(fragment)
+    combined = _escape_control_chars_in_strings(no_commas)
+    candidates = [
+        no_commas,
+        escaped,
+        combined,
+        _repair_single_quotes(combined),
+    ]
+    for candidate in candidates:
+        try:
+            value, end = decoder.raw_decode(candidate, 0)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(value, dict) and not candidate[end:].strip():
+            return value
+    return None
+
+
+def _object_span_end(
+    text: str, start: int, open_char: str, close_char: str
+) -> "int | None":
+    """从 ``start`` 起按字符串感知扫描，返回匹配结束符之后的位置。"""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+_RESULT_KEY_RE = re.compile(r'"\s*[^"\\\n]{1,80}"\s*:')
+_RESULT_VALUE_RE = re.compile(
+    r'"\s*:\s*(?:"|\d|\{|\[|true|false|null|-)'
+)
+
+
+def _looks_like_result_object(fragment: str) -> bool:
+    """粗略判断无法解析的片段是否「像被破坏的结果对象」。
+
+    仅用于「无法修复」的片段：含 NaN / Infinity（确定性非法）或至少一个
+    JSON 形态的值（引号字符串 / 数字 / 容器 / 字面量）时，视为正式结果
+    损坏或截断，拒绝让更早的示例对象顶替；说明文字里的 ``{"destination":
+    城市名}`` 这类平衡片段不满足条件，仍按普通说明忽略。
+    """
+    window = fragment[:2000]
+    if "NaN" in window or "Infinity" in window:
+        return True
+    if not _RESULT_KEY_RE.search(window):
+        return False
+    return bool(_RESULT_VALUE_RE.search(window))
+
+
+def _iter_object_spans(text: str):
+    """按位置产出 ``(start, value | None, end, looks_like)``。
+
+    ``value is None`` 表示找到了一个无法解析的 ``{`` 片段：调用方据此区分
+    「说明文字里的花括号」（looks_like=False）与「结果对象被截断 / 含无法
+    修复的脏字符」（looks_like=True，不能让更早的示例对象顶替）。
+    """
     index = 0
+    decoder = json.JSONDecoder(parse_constant=reject_json_constant)
     while True:
         index = text.find("{", index)
         if index < 0:
             return
-        value: Any = None
-        end = index
-        try:
-            value, end = decoder.raw_decode(text, index)
-        except (json.JSONDecodeError, ValueError):
-            repaired = _strip_trailing_commas(text[index:])
+        end = _object_span_end(text, index, "{", "}")
+        fragment = text[index:end] if end is not None else text[index:]
+        value: "dict | None" = None
+        if end is not None:
             try:
-                value, end_rel = decoder.raw_decode(repaired, 0)
-                end = index + end_rel
+                parsed, _ = decoder.raw_decode(fragment, 0)
             except (json.JSONDecodeError, ValueError):
-                value = None
-        if isinstance(value, dict):
-            yield value, end
-            index = max(end, index + 1)
-        else:
-            index += 1
-def starts_with_json_array(text: str) -> bool:
-    """文本中第一个完整的 JSON 值是数组（而不是对象）。
+                parsed = None
+            if isinstance(parsed, dict):
+                value = parsed
+            else:
+                value = _repair_object_fragment(fragment)
+        if value is not None:
+            yield index, value, end, False
+            index = end if end is not None else index + 1
+            continue
+        yield index, None, end, _looks_like_result_object(fragment)
+        index = end if end is not None else len(text)
 
-    ``robust_json_parse`` 会把 ``[{...}]`` 截成第一个元素返回 dict，单看最终
-    类型无法发现「模型输出了数组」；这里按原始文本判定，数组输出必须按
-    解析失败处理（或由调用方包装），不能把数组元素当成功结果。说明文字
-    里的 ``[注]`` 之类因无法整体解析为 JSON 不会被误判；对象在数组之前
-    出现时以对象为准（对象内部的数组字段不影响判定）。
+
+def iter_json_objects_with_repair(text: str):
+    """按出现顺序产出 ``(对象, 结束位置)``（含小瑕疵修复后解析的对象）。"""
+    for _start, value, end, _looks in _iter_object_spans(text):
+        if value is not None and end is not None:
+            yield value, end
+
+
+def _iter_objects_with_repair(text: str):
+    """兼容旧调用：产出 ``(value, end)``（修复见 :func:`_repair_object_fragment`）。"""
+    yield from iter_json_objects_with_repair(text)
+
+
+def has_unclosed_json_object(text: str) -> bool:
+    """公共包装：文本中是否还有未闭合的 ``{``（字符串感知）。"""
+    return _has_unclosed_object(text)
+def json_array_start(text: str) -> "int | None":
+    """文本中第一个「能整体解析为合法顶层数组」的起始下标；没有返回 None。
+
+    说明文字里的 ``[注]`` / ``[1]`` 等无法整体解析为 JSON 的方括号会被跳过，
+    调用方必须用本函数返回的下标定位载荷（用 ``text.find("[")`` 会指到前言
+    里的方括号，让合法数组被误判解析失败）。
     """
     decoder = json.JSONDecoder()
     first_object = text.find("{")
     index = text.find("[")
     while index != -1:
         if first_object != -1 and first_object < index:
-            return False
+            return None
         try:
             value, end = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
             index = text.find("[", index + 1)
             continue
         if not isinstance(value, list):
-            return False
+            return None
         # 前言里可整体解析的小数组（引用标记 [1]、Markdown 待办「- [ ]」）
         # 后面若还跟着可解析的 JSON 对象（中间可能隔着说明文字），那是
         # 前言，不能当成顶层输出、把紧随其后的合法结果丢掉
@@ -207,10 +337,46 @@ def starts_with_json_array(text: str) -> bool:
                 probe = rest.find("{", probe + 1)
                 continue
             if isinstance(nested, dict):
-                return False
+                return None
             probe = rest.find("{", probe + 1)
-        return True
-    return False
+        return index
+    return None
+
+
+def starts_with_json_array(text: str) -> bool:
+    """文本中第一个完整的 JSON 值是数组（而不是对象）；口径见 :func:`json_array_start`。"""
+    return json_array_start(text) is not None
+
+
+def first_json_array_with_keys(
+    text: str, keys: "tuple[str, ...]"
+) -> "list | None":
+    """返回第一个「元素为含目标键的对象」的顶层数组（没有则 None）。
+
+    用于裸数组输出前面带引用标记（``参考[1]``）或说明方括号的场景：
+    :func:`starts_with_json_array` 会因前言小数组返回 False，对象扫描也
+    找不到 ``preferences`` 键，合法载荷会被整段丢弃。
+    """
+    decoder = json.JSONDecoder()
+    index = 0
+    while True:
+        index = text.find("[", index)
+        if index < 0:
+            return None
+        end = _object_span_end(text, index, "[", "]")
+        if end is not None:
+            try:
+                value, _ = decoder.raw_decode(text[index:end], 0)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, list) and any(
+                isinstance(item, dict) and any(key in item for key in keys)
+                for item in value
+            ):
+                return value
+            index = end
+            continue
+        index += 1
 
 
 def _has_unclosed_object(text: str) -> bool:
@@ -249,16 +415,31 @@ def _scan_last_json_object_with_keys(
     """扫描最后一个含目标键的顶层对象，返回 ``(对象, 是否因末尾截断放弃)``。"""
     selected: dict | None = None
     selected_end = -1
-    for value, end in _iter_objects_with_repair(text):
-        if any(key in value for key in keys):
-            selected = value
-            selected_end = end
+    failed_tail = False
+    for start, value, end, looks_like in _iter_object_spans(text):
+        if value is not None:
+            if any(key in value for key in keys):
+                selected = value
+                selected_end = end
+                failed_tail = False
+            continue
+        if looks_like and start >= selected_end:
+            # 结果位置出现「像结果对象但无法解析」的片段：可能是被截断的
+            # 正式结果，也可能是含裸控制字符 / NaN 等修复不了的脏数据——
+            # 都不能让更早的 prompt 回显示例顶替
+            failed_tail = True
     if selected is None:
+        if failed_tail:
+            if warn:
+                logger.warning(
+                    "存在无法解析的 JSON 结果对象（可能被截断），拒绝回退到更早的候选"
+                )
+            return None, True
         return None, False
-    if _has_unclosed_object(text[selected_end:]):
+    if failed_tail or _has_unclosed_object(text[selected_end:]):
         if warn:
             logger.warning(
-                "末尾仍有未闭合的 JSON 对象（可能被截断），放弃更早的候选"
+                "末尾仍有无法解析 / 未闭合的 JSON 对象（可能被截断），放弃更早的候选"
             )
         return None, True
     return selected, False

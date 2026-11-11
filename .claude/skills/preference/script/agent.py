@@ -17,9 +17,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from utils.json_parser import (
     extract_json_from_async_response,
+    first_json_array_with_keys,
     first_json_object_with_keys,
+    json_array_start,
     last_json_object_with_keys_strict,
-    starts_with_json_array,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,12 +124,14 @@ class PreferenceAgent(AgentBase):
             # 模型可能先复述【当前已保存的偏好】或输出示例再给正式结果：
             # 优先取最后一个形如结果（has_preferences / preferences）的
             # 顶层对象，避免把回显的示例值写进长期记忆
-            if starts_with_json_array(text):
+            array_start = json_array_start(text)
+            if array_start is not None:
                 # 裸数组（省略 {"preferences": [...]} 包裹）：直接交给
                 # robust_first_json_object 会把数组截成第一个元素、当成
                 # 成功但没有 preferences 键——偏好静默丢失且无错误提示。
-                # 这里按数组载荷包装，元素形状交给落库侧校验
-                array_start = text.find("[")
+                # 这里按数组载荷包装，元素形状交给落库侧校验。
+                # 下标必须用 json_array_start 返回的「能整体解析的数组」
+                # 位置：前言里的 [注] / [1] 不能作为 raw_decode 起点
                 decoded, _ = json.JSONDecoder().raw_decode(text[array_start:])
                 items = [item for item in decoded if isinstance(item, dict)]
                 result = {
@@ -148,6 +151,22 @@ class PreferenceAgent(AgentBase):
                     result = first_json_object_with_keys(
                         text, ("has_preferences", "preferences")
                     )
+                if result is None:
+                    # 前言带引用标记（参考[1]）时 starts 判定失败、对象扫描
+                    # 也找不到结果键：最后尝试「元素含 type/value 的数组」
+                    bare_items = first_json_array_with_keys(
+                        text, ("type", "value")
+                    )
+                    if bare_items:
+                        items = [
+                            item
+                            for item in bare_items
+                            if isinstance(item, dict)
+                        ]
+                        result = {
+                            "preferences": items,
+                            "has_preferences": bool(items),
+                        }
                 if result is None:
                     raise ValueError("模型输出中没有可解析的偏好结果对象")
         except Exception as e:
