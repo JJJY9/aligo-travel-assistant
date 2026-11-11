@@ -31,8 +31,22 @@ _redis_degraded_until = 0.0
 _OP_MARKER_TTL_SEC = 30 * 24 * 3600
 
 # 第三方 SDK（redis-py）的连接 / 超时异常不是内置 ConnectionError /
-# TimeoutError 的子类，按类名识别（与 utils/llm_resilience 的做法一致）
-_TRANSIENT_REDIS_ERROR_NAMES = frozenset({"ConnectionError", "TimeoutError"})
+# TimeoutError 的子类，按类名识别（与 utils/llm_resilience 的做法一致）。
+# ReadOnlyError（主从切换后连到只读副本）/ OutOfMemoryError（noeviction）/
+# ClusterDownError / MasterDownError / TryAgainError 是服务端可用性状态，
+# 操作本身没问题，恢复后重放可以成功：若按永久错误计入毒操作，同一队首
+# 连续 3 次失败就会被静默丢弃，故障期消息永久缺失、已删轮次恢复后复活。
+_TRANSIENT_REDIS_ERROR_NAMES = frozenset(
+    {
+        "ConnectionError",
+        "TimeoutError",
+        "ReadOnlyError",
+        "OutOfMemoryError",
+        "ClusterDownError",
+        "MasterDownError",
+        "TryAgainError",
+    }
+)
 
 
 def _is_transient_redis_error(exc: BaseException) -> bool:

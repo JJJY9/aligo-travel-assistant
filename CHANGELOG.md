@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- Redis 短期记忆把服务端状态类错误当暂时故障：`ReadOnlyError`（主从切换后连到只读副本）、`OutOfMemoryError`（noeviction）、`ClusterDownError` / `MasterDownError` / `TryAgainError` 此前被 `_is_transient_redis_error` 判为永久错误——故障重放时同一队首连续 3 次失败即被静默丢弃（约每 3 分钟一条），故障期消息永久缺失、已删除轮次恢复后复活；现在并入暂时故障集合（按类名识别，不 import redis），恢复后按序重放。载荷 / 命令错误（`WRONGTYPE` 等 `ResponseError`）仍按毒操作处理
 - PostgreSQL 表结构每个进程只建一次：此前每次构造存储（Web 每个读写接口、每个新会话）和每次重连都执行整套 DDL——即使对象已存在，`ALTER TABLE` 仍取 `aligo_trips` 的排他锁、`CREATE INDEX` 仍取消息表 ShareLock。恢复大备份 / 删除大会话的长事务期间，所有新建存储的请求（状态、会话、行程、新对话）被堵在锁上，DDL 批次持有的排他锁还把所有用户的行程读写一并拖死；并发首次启动时 `CREATE TABLE IF NOT EXISTS` 还会竞争 `pg_type` 唯一键，工厂把竞争当成 PG 故障冷却 60 秒并静默回退 JSON，窗口内写入的数据与 PG 历史分叉。现在按 DSN 进程内只初始化一次，进程内加锁串行、跨进程用 advisory lock 互斥，滚动发布中旧实例并发建表的目录竞争（DuplicateTable / UniqueViolation）按「已存在」容忍并重跑补齐
 - 服务重启 / 会话被 LRU 淘汰后不再丢上下文：短期记忆为空时 `ConversationRuntime` 从长期记忆回填当前会话最近 10 条消息再组装意图 / 编排上下文——默认进程内短期记忆的部署下，用户刷新页面看到完整历史、追问「把刚才的行程改到周五」时模型侧此前完全没有上文（长期总结排除了当前会话），现在能接上一轮；短期记忆非空时不回填，不放大每轮记忆 IO
 - 模型输出的孤立代理项在入库前统一转义：编排器在解析意图结果与每个技能结果后立即 `sanitize_json`（此前只在 ConversationRuntime 出口转义，偏好 / 行程在编排器内部落库时仍会因 `\ud800` 抛 UnicodeEncodeError → MemoryPersistenceError，整轮在 LLM 调用完成后作废）；ConversationRuntime 用清洗后的意图数据重建 Msg 再交给编排器；CLI `process_query` 解析意图 / 编排结果后同样转义再显示与落库——模型截断 emoji 不再导致整轮回答丢失（Web 与 CLI 同口径）
