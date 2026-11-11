@@ -207,6 +207,55 @@ def test_terminal_controls_stripped_from_export():
     print("✓ 导出剥离终端控制序列")
 
 
+def test_unmatched_backtick_does_not_disable_escaping():
+    """未配对反引号是字面字符：其后尖括号 / 链接仍必须转义。"""
+    from utils.session_markdown import sanitize_body
+
+    text = sanitize_body(
+        "价格低`于 100 元 <img src=x onerror=alert(1)> "
+        "[点我](https://phish.example)"
+    )
+    assert "<img" not in text and "&lt;img" in text
+    assert "](https://phish" not in text, "未配对反引号后的链接也要转义"
+    print("✓ 未配对反引号不关闭转义")
+
+
+def test_fence_state_machine_matches_commonmark():
+    """围栏开合按 CommonMark 判定，错位不能放行原始 HTML。"""
+    from utils.session_markdown import sanitize_body
+
+    # 带尾随文字的行不是关围栏
+    text = sanitize_body(
+        "```\na\n``` oops\n```\n<img src=x onerror=alert(1)>"
+    )
+    assert "&lt;img" in text, "真实关闭围栏后的行必须转义"
+    # 4 空格缩进不是围栏（缩进代码不能开启围栏）
+    text = sanitize_body("hi\n    ```\n<img src=x>")
+    assert "&lt;img" in text, "缩进行不能让后续行跳过转义"
+    # 反引号围栏的 info string 不能包含反引号
+    text = sanitize_body("```js`alert\n<img src=x onerror=alert(1)>")
+    assert "&lt;img" in text
+    # 围栏内代码保真，未闭合在本条消息末尾补齐
+    text = sanitize_body("```python\nif a < b:\n    pass")
+    assert "if a < b:" in text
+    assert text.rstrip().endswith("> ```")
+    print("✓ 围栏开合与 CommonMark 一致")
+
+
+def test_multiline_code_span_content_preserved():
+    """跨行代码段内的字符不被实体化；未闭合的跨行反引号按字面处理。"""
+    from utils.session_markdown import sanitize_body
+
+    text = sanitize_body("示例：`if a < b\nand c > d` 结束")
+    assert "if a < b" in text
+    assert "and c > d" in text, "跨行代码段内的 > 不能被实体化"
+    assert "c &gt; d" not in text
+    # 没有任何关闭串：反引号只是字面字符，禁止据此关闭转义
+    text = sanitize_body("`启示 <img src=x\n<img src=x onerror=alert(1)>")
+    assert text.count("&lt;img") >= 2
+    print("✓ 跨行代码段保真且未闭合时不放行")
+
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
@@ -217,4 +266,7 @@ if __name__ == "__main__":
     test_code_content_not_entity_escaped()
     test_links_and_images_neutralized()
     test_terminal_controls_stripped_from_export()
+    test_unmatched_backtick_does_not_disable_escaping()
+    test_fence_state_machine_matches_commonmark()
+    test_multiline_code_span_content_preserved()
     print("\n全部通过")
