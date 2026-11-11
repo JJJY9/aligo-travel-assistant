@@ -4252,6 +4252,7 @@ def create_app(model: Any = None) -> FastAPI:
                     "start_date": payload.start_date,
                     "end_date": payload.end_date,
                     "destination": payload.destination.strip(),
+                    "origin": payload.origin.strip(),
                 },
             )
             conflicts = _trip_conflicts(
