@@ -65,11 +65,16 @@ def _mark_failed(key: str) -> None:
     _FAILED_UNTIL[key] = time.monotonic() + _FAILURE_COOLDOWN_SEC
 
 
-def _get_redis_client(url: str):
+def _get_redis_client(url: str, force: bool = False):
+    """返回共享 Redis 客户端；``force=True`` 时跳过失败冷却强制尝试一次。
+
+    删除会话 / 故障重放前的墓碑检查这类低频关键路径不能因冷却期返回
+    None 而静默跳过共享保护：冷却只该节省高频枚举的等待时间。
+    """
     global _redis_client
     if _redis_client is not None:
         return _redis_client
-    if _failed_recently(f"redis:{url}"):
+    if not force and _failed_recently(f"redis:{url}"):
         return None
     try:
         import redis
@@ -95,15 +100,16 @@ def _get_redis_client(url: str):
         return None
 
 
-def get_shared_redis_client() -> Any | None:
+def get_shared_redis_client(force: bool = False) -> Any | None:
     """返回共享 Redis 客户端（供限流等模块复用连接池）。
 
-    未配置 ``REDIS_URL``、Redis 不可用或处于失败冷却期时返回 None。
+    未配置 ``REDIS_URL``、Redis 不可用或处于失败冷却期时返回 None；
+    ``force=True`` 跳过失败冷却（供删除 / 重放等关键路径重试一次）。
     """
     url = STORAGE_CONFIG.get("redis_url") or ""
     if not url:
         return None
-    return _get_redis_client(url)
+    return _get_redis_client(url, force=force)
 
 
 def create_short_term_memory(

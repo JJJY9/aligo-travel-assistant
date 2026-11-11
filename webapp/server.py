@@ -1342,17 +1342,23 @@ class AligoWebApp:
     def _deleted_key(user_id: str, session_id: str) -> str:
         return f"{_DELETED_KEY_PREFIX}:{user_id}:{session_id}"
 
-    def _shared_tombstones(self) -> Any | None:
+    def _shared_tombstones(self, force: bool = False) -> Any | None:
         """共享墓碑可用时返回 Redis 客户端；故障冷却期内只用进程内墓碑。
 
         启动时 Redis 不可用（``_redis_client`` 为 None）也允许通过
         ``get_shared_redis_client``（自带 60 秒冷却）在恢复后重新接入。
+        ``force=True``（删除会话这类低频关键路径）跳过两处失败冷却真实
+        尝试一次：冷却期内静默跳过会让其它实例看不到这次删除。
         """
         if self._redis_client is None:
-            self._redis_client = get_shared_redis_client()
+            self._redis_client = get_shared_redis_client(force=force)
             if self._redis_client is None:
                 return None
-        if not self._tombstones_shared and time.monotonic() < self._tombstone_retry_at:
+        if (
+            not force
+            and not self._tombstones_shared
+            and time.monotonic() < self._tombstone_retry_at
+        ):
             return None
         return self._redis_client
 
@@ -1389,7 +1395,9 @@ class AligoWebApp:
                 del self._deleted_sessions[candidate]
             while len(self._deleted_sessions) > self.max_tombstones:
                 self._deleted_sessions.popitem(last=False)
-        client = self._shared_tombstones()
+        # 删除是低频关键路径：跳过失败冷却真实写入一次，冷却期静默跳过
+        # 会让其它实例看不到这次删除（在途回合可把会话写回）
+        client = self._shared_tombstones(force=True)
         if client is not None:
             try:
                 # NX：不覆盖其它实例已有的墓碑（否则回滚时会误删对方的保护）

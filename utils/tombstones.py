@@ -40,15 +40,20 @@ def reset_failure_cache() -> None:
     _failure_until = 0.0
 
 
-def _shared_client() -> "Any | None":
-    """取共享 Redis 客户端；冷却期内或获取失败返回 None。"""
+def _shared_client(force: bool = False) -> "Any | None":
+    """取共享 Redis 客户端；冷却期内或获取失败返回 None。
+
+    ``force=True``（删除 / 故障重放前的检查等低频关键路径）跳过冷却与
+    工厂冷却，真实尝试一次——冷却只该节省高频枚举的等待时间，不能把
+    「是否已删除」的保护静默关掉。
+    """
     global _failure_until
-    if time.monotonic() < _failure_until:
+    if not force and time.monotonic() < _failure_until:
         return None
     from context.storage import get_shared_redis_client
 
     try:
-        return get_shared_redis_client()
+        return get_shared_redis_client(force=force)
     except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
         _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
         logger.warning("读取共享 Redis 失败，跳过删除墓碑操作：%s", exc)
@@ -67,7 +72,10 @@ def epoch_key(user_id: str, session_id: str) -> str:
 
 
 def bump_session_epoch(
-    user_id: str, session_id: str, ttl_sec: float = EPOCH_TTL_SEC
+    user_id: str,
+    session_id: str,
+    ttl_sec: float = EPOCH_TTL_SEC,
+    force: bool = False,
 ) -> None:
     """删除会话时递增会话纪元（单调，撤销墓碑也不会回退）。
 
@@ -76,7 +84,7 @@ def bump_session_epoch(
     路径也不能把已删除会话写回。
     """
     global _failure_until
-    client = _shared_client()
+    client = _shared_client(force=force)
     if client is None:
         return
     key = epoch_key(user_id, session_id)
@@ -110,16 +118,19 @@ def mark_session_deleted(
     session_id: str,
     ttl_sec: float = DEFAULT_TOMBSTONE_TTL_SEC,
     source: str = "cli",
+    force: bool = False,
 ) -> bool:
     """写入共享删除墓碑；返回本次调用是否成为墓碑的所有者。
 
-    Redis 不可用 / 写入失败时返回 False（不抛异常）。``SET NX`` 不覆盖其它
-    进程已有的墓碑——未写入时只有值恰好等于 ``source``（本进程先前的写入 /
-    带唯一 token 的幂等重试）才算自己拥有，否则返回 False，调用方回滚时
-    不能删除别人的保护。无论写入归属如何，删除都会递增会话纪元。
+    Redis 不可用 / 写入失败时返回 False（不抛异常）。``force=True`` 跳过
+    失败冷却真实尝试一次（删除是低频关键路径，冷却期静默跳过会让其它
+    实例看不到这次删除）。``SET NX`` 不覆盖其它进程已有的墓碑——未写入
+    时只有值恰好等于 ``source``（本进程先前的写入 / 带唯一 token 的幂等
+    重试）才算自己拥有，否则返回 False，调用方回滚时不能删除别人的保护。
+    无论写入归属如何，删除都会递增会话纪元。
     """
     global _failure_until
-    client = _shared_client()
+    client = _shared_client(force=force)
     if client is None:
         return False
     key = deleted_key(user_id, session_id)
@@ -134,7 +145,7 @@ def mark_session_deleted(
         _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
         logger.warning("写入共享删除墓碑失败：%s", exc)
         return False
-    bump_session_epoch(user_id, session_id)
+    bump_session_epoch(user_id, session_id, force=force)
     if written:
         return True
     try:
@@ -147,15 +158,18 @@ def mark_session_deleted(
     return value == source
 
 
-def is_session_deleted(user_id: str, session_id: str) -> bool:
+def is_session_deleted(
+    user_id: str, session_id: str, force: bool = False
+) -> bool:
     """共享墓碑是否仍在有效期内；Redis 不可用 / 读取失败按「未删除」处理。
 
     CLI 的备份恢复用它避免把刚被删除的会话写回（墓碑 TTL 与 Web 一致，
     只覆盖删除后的短时间窗）。未配置 ``REDIS_URL`` 时进程之间没有共享通道，
-    返回 False——调用方应在提示里说明。
+    返回 False——调用方应在提示里说明。``force=True`` 供故障重放前的
+    安全检查等关键路径跳过失败冷却，真实读取一次。
     """
     global _failure_until
-    client = _shared_client()
+    client = _shared_client(force=force)
     if client is None:
         return False
     try:
@@ -167,7 +181,7 @@ def is_session_deleted(user_id: str, session_id: str) -> bool:
 
 
 def unmark_session_deleted(
-    user_id: str, session_id: str, source: str = ""
+    user_id: str, session_id: str, source: str = "", force: bool = False
 ) -> bool:
     """撤销本进程写入的墓碑（仅当值等于 ``source`` 时删除）。
 
@@ -176,7 +190,7 @@ def unmark_session_deleted(
     的墓碑值是请求 token，CLI 是 "cli"，互不误删）。
     """
     global _failure_until
-    client = _shared_client()
+    client = _shared_client(force=force)
     if client is None:
         return False
     key = deleted_key(user_id, session_id)

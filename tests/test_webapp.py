@@ -5715,6 +5715,49 @@ def test_shared_tombstones_across_instances():
     print("✓ 删除墓碑通过 Redis 跨实例共享（含 TTL 与撤销）")
 
 
+def test_mark_deleted_force_during_tombstone_cooldown():
+    """墓碑失败冷却期内执行删除仍强制写共享墓碑与会话纪元（不漏保护）。"""
+    import time as time_module
+
+    class _FakeRedis:
+        def __init__(self):
+            self.data = {}
+            self.ttls = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            self.ttls[key] = ex
+            return True
+
+        def incr(self, key):
+            value = int(self.data.get(key, "0")) + 1
+            self.data[key] = str(value)
+            return value
+
+        def expire(self, key, ttl):
+            self.ttls[key] = ttl
+            return 1
+
+        def get(self, key):
+            return self.data.get(key)
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    shared = _FakeRedis()
+    state._redis_client = shared
+    state._tombstones_shared = False
+    # 模拟一次墓碑读取失败后的 60 秒重试冷却
+    state._tombstone_retry_at = time_module.monotonic() + 60
+    state.mark_deleted("u-force", "s-force")
+    assert "aligo:deleted:u-force:s-force" in shared.data, (
+        "关键路径必须绕过冷却真实写入共享墓碑"
+    )
+    assert shared.data["aligo:session-epoch:u-force:s-force"] == "1"
+    print("✓ 删除会话在墓碑冷却期内仍强制写共享墓碑与纪元")
+
+
 def test_shared_tombstone_not_overwritten_by_other_instance():
     """SET NX：重复标记不覆盖其它实例的墓碑，回滚只撤销自己的 token。"""
 
@@ -6029,7 +6072,7 @@ def test_tombstone_reconnects_when_redis_appears_later(monkeypatch):
     state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
     state._redis_client = None
     state._tombstones_shared = False
-    monkeypatch.setattr(server_module, "get_shared_redis_client", lambda: client)
+    monkeypatch.setattr(server_module, "get_shared_redis_client", lambda force=False: client)
 
     state.mark_deleted("u-late", "s-late")
     assert "aligo:deleted:u-late:s-late" in client.data

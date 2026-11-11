@@ -69,7 +69,7 @@ class _FakeRedis:
 
 def _use_client(monkeypatch, client):
     tombstones.reset_failure_cache()
-    monkeypatch.setattr(storage, "get_shared_redis_client", lambda: client)
+    monkeypatch.setattr(storage, "get_shared_redis_client", lambda force=False: client)
 
 
 def test_deleted_key_matches_web_contract():
@@ -126,6 +126,34 @@ def test_mark_bumps_epoch_and_unmark_keeps_it(monkeypatch):
     tombstones.mark_session_deleted("u1", "s1", source="cli-token-2")
     assert tombstones.get_session_epoch("u1", "s1") == "2"
     print("✓ 删除递增会话纪元且不回退")
+
+
+def test_force_bypasses_failure_cooldown(monkeypatch):
+    """关键路径 force 跳过失败冷却：冷却期内仍真实读取共享墓碑。"""
+    import time as time_module
+
+    from context import storage
+
+    tombstones.reset_failure_cache()
+    client = _FakeRedis()
+    client.exists_result = True
+    calls: list[bool] = []
+
+    def fake_get(force=False):
+        calls.append(force)
+        return client
+
+    monkeypatch.setattr(storage, "get_shared_redis_client", fake_get)
+    monkeypatch.setattr(
+        tombstones, "_failure_until", time_module.monotonic() + 60
+    )
+    # 默认读取：冷却期内直接返回「未删除」，不触碰客户端
+    assert tombstones.is_session_deleted("u1", "s1") is False
+    assert calls == []
+    # force：绕过冷却真实读取
+    assert tombstones.is_session_deleted("u1", "s1", force=True) is True
+    assert calls == [True]
+    print("✓ force 跳过墓碑失败冷却")
 
 
 def test_is_session_deleted_reads_shared_key(monkeypatch):
@@ -197,20 +225,23 @@ def test_unmark_only_removes_own_source(monkeypatch):
 
 
 def test_client_factory_failure_sets_cooldown(monkeypatch):
-    """获取 Redis 客户端本身失败：按未删除处理，冷却期内不再重试工厂。"""
+    """获取 Redis 客户端本身失败：默认读取按未删除处理并进入冷却；
+    关键路径（force）仍真实重试一次工厂。"""
     tombstones.reset_failure_cache()
     calls = []
 
-    def boom():
-        calls.append(1)
+    def boom(force=False):
+        calls.append(force)
         raise RuntimeError("client factory down")
 
     monkeypatch.setattr(storage, "get_shared_redis_client", boom)
     assert tombstones.is_session_deleted("u1", "s1") is False
-    assert len(calls) == 1
-    assert tombstones.mark_session_deleted("u1", "s1") is False
-    assert len(calls) == 1, "冷却期内不应再次调用客户端工厂"
-    print("✓ 客户端工厂失败进入冷却")
+    assert calls == [False]
+    assert tombstones.is_session_deleted("u1", "s2") is False
+    assert calls == [False], "冷却期内不应再次调用客户端工厂"
+    assert tombstones.mark_session_deleted("u1", "s3", force=True) is False
+    assert calls == [False, True], "删除等关键路径 force 绕过冷却重试一次"
+    print("✓ 客户端工厂失败进入冷却（关键路径可强制重试）")
 
 
 def test_mark_failure_sets_cooldown(monkeypatch):
@@ -259,6 +290,7 @@ if __name__ == "__main__":
         test_mark_writes_nx_with_ttl,
         test_mark_reports_ownership_when_nx_lost,
         test_mark_bumps_epoch_and_unmark_keeps_it,
+        test_force_bypasses_failure_cooldown,
         test_is_session_deleted_reads_shared_key,
         test_missing_redis_means_not_deleted,
         test_redis_errors_are_swallowed,
