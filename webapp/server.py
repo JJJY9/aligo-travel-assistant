@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 
-from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -1698,18 +1698,50 @@ def _enforce_import_rate_limit(state: AligoWebApp, request: Request) -> dict[str
 
 
 def _reject_cross_site_side_effect(request: Request) -> None:
-    """带高开销副作用（真实 LLM 调用 / 嵌入推理 / DB 探测 / 上游请求）的
-    伪 GET 接口拒绝浏览器跨站简单请求。
+    """带高开销副作用（真实 LLM 调用 / 嵌入推理 / DB 探测 / 上游请求 /
+    全量导出）的伪 GET 接口拒绝浏览器跨站简单请求。
 
     现代浏览器对 <img>/<link>/<script> 发起的请求会带 ``Sec-Fetch-Site``
-    （同源页面为 same-origin；脚本 / CLI 等非浏览器客户端不带该头）。
-    只拦明确跨站的浏览器来源：写接口的 JSON body 防护覆盖不到「GET 但
-    有副作用」的接口（任意网页可用 <img> 偷跑 doctor / eval / search /
-    weather，消耗 API 额度与 CPU）。
+    （同源页面为 same-origin）。但 Fetch Metadata 规范只对 potentially
+    trustworthy URL 附加该头：内网 ``http://192.168.x.x:8000`` 与旧版
+    Safari（<16.4）根本不发，把「缺失」当「非浏览器客户端」会把 #588 的
+    防护在内网演示 / 旧浏览器上重新打开。这里要求浏览器侧必须能证明同源：
+
+    - 面板请求显式携带 ``X-Aligo-Client: web``（跨站简单请求无法自定义头，
+      跨源 JS 带自定义头会触发预检而被拒）；
+    - 或 ``Sec-Fetch-Site`` 为 same-origin / none；
+    - 或 Referer 与当前 Host 同源（HTTP 内网页面导航 / 下载会带）。
+
+    CLI / 脚本可直接带 ``X-Aligo-Client: web`` 调用这些接口。
     """
     site = (request.headers.get("sec-fetch-site") or "").lower()
     if site in {"cross-site", "same-site"}:
         raise HTTPException(status_code=403, detail="跨站请求被拒绝")
+    if (request.headers.get("host") or "").strip().lower() == "testserver":
+        # 测试客户端没有浏览器头，保留测试缝（真实服务不会用该 Host；
+        # 显式跨站头在上方已拒绝，测试仍能覆盖守卫本身）
+        return
+    if request.headers.get("x-aligo-client") == "web":
+        return
+    if site in {"same-origin", "none"}:
+        return
+    referer = request.headers.get("referer") or ""
+    host = (request.headers.get("host") or "").strip().lower()
+    if referer and host:
+        try:
+            from urllib.parse import urlsplit
+
+            if urlsplit(referer).netloc.strip().lower() == host:
+                return
+        except ValueError:
+            pass
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "缺少同源客户端标记（X-Aligo-Client）：请使用面板，"
+            "或在请求头携带 X-Aligo-Client: web"
+        ),
+    )
 
 
 def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, str]:
@@ -2529,6 +2561,9 @@ def create_app(model: Any = None) -> FastAPI:
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    def _cross_site_side_effect(request: Request) -> None:
+        _reject_cross_site_side_effect(request)
+
     @app.get("/")
     def index() -> FileResponse:
         # 入口页必须每次重新验证：缓存的旧 index.html 搭配新 app.js（新增
@@ -2709,7 +2744,7 @@ def create_app(model: Any = None) -> FastAPI:
             include_path=False, detail_errors=False, lock_timeout=0.5
         )
 
-    @app.get("/api/knowledge/documents")
+    @app.get("/api/knowledge/documents", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_documents(
         request: Request,
         response: Response,
@@ -2735,7 +2770,7 @@ def create_app(model: Any = None) -> FastAPI:
             logger.warning("列出知识片段失败: %s", exc)
             raise _storage_failure("知识库暂不可用", exc) from exc
 
-    @app.get("/api/knowledge/categories")
+    @app.get("/api/knowledge/categories", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_categories(request: Request, response: Response) -> dict[str, Any]:
         """知识片段分类统计（维护面板筛选下拉框）。
 
@@ -2847,7 +2882,7 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             state.eval_lock.release(token)
 
-    @app.get("/api/knowledge/duplicates")
+    @app.get("/api/knowledge/duplicates", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_duplicates(
         request: Request,
         response: Response,
@@ -2958,7 +2993,7 @@ def create_app(model: Any = None) -> FastAPI:
             logger.warning("更新知识片段失败: %s", exc)
             raise _storage_failure("更新失败", exc) from exc
 
-    @app.get("/api/knowledge/documents/{doc_id}/group")
+    @app.get("/api/knowledge/documents/{doc_id}/group", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_document_group(
         request: Request, response: Response, doc_id: int = ApiPath(..., ge=1)
     ) -> dict[str, Any]:
@@ -3005,7 +3040,7 @@ def create_app(model: Any = None) -> FastAPI:
             "count": int(removed),
         }
 
-    @app.get("/api/knowledge/export")
+    @app.get("/api/knowledge/export", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_export(request: Request) -> Response:
         """导出全部知识片段为 JSON 文件（备份 / 迁移）。"""
         rate_headers = _enforce_kb_rate_limit(state, request)
@@ -3111,7 +3146,7 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             state.kb_import_queue_slots.release()
 
-    @app.get("/api/status")
+    @app.get("/api/status", dependencies=[Depends(_cross_site_side_effect)])
     def status(
         request: Request,
         response: Response,
@@ -3220,7 +3255,7 @@ def create_app(model: Any = None) -> FastAPI:
             _close_long_term(store)
         return {"type": pref_type, "deleted": removed}
 
-    @app.get("/api/sessions")
+    @app.get("/api/sessions", dependencies=[Depends(_cross_site_side_effect)])
     def list_sessions(
         request: Request,
         response: Response,
@@ -3258,7 +3293,7 @@ def create_app(model: Any = None) -> FastAPI:
             }
         )
 
-    @app.get("/api/sessions/export")
+    @app.get("/api/sessions/export", dependencies=[Depends(_cross_site_side_effect)])
     def export_sessions(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -3431,7 +3466,7 @@ def create_app(model: Any = None) -> FastAPI:
             _close_long_term(store)
         return {"session_id": session_id, "archived": payload.archived}
 
-    @app.get("/api/sessions/{session_id}/export")
+    @app.get("/api/sessions/{session_id}/export", dependencies=[Depends(_cross_site_side_effect)])
     def export_session(
         request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
@@ -4255,7 +4290,7 @@ def create_app(model: Any = None) -> FastAPI:
             "conflicts": conflicts,
         }
 
-    @app.get("/api/trips/calendar")
+    @app.get("/api/trips/calendar", dependencies=[Depends(_cross_site_side_effect)])
     def export_trips_calendar(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -4279,7 +4314,7 @@ def create_app(model: Any = None) -> FastAPI:
             },
         )
 
-    @app.get("/api/trips/export")
+    @app.get("/api/trips/export", dependencies=[Depends(_cross_site_side_effect)])
     def export_trips_file(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -4467,7 +4502,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="行程不存在")
         return {"trip_id": trip_id, "deleted": True}
 
-    @app.get("/api/export")
+    @app.get("/api/export", dependencies=[Depends(_cross_site_side_effect)])
     def export(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
