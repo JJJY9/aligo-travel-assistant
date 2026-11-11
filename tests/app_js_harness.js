@@ -1235,6 +1235,46 @@ async function scenarioDeleteTurn(source) {
   };
 }
 
+async function scenarioScrollPreserve(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const messages = [
+    { role: "user", content: "旧问题", timestamp: "" },
+    { role: "assistant", content: "回答", timestamp: "", meta: {} },
+  ];
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    state.sessions = [];
+    state.sessionTotal = 1;
+    els.scroll.scrollHeight = 1000;
+    els.scroll.clientHeight = 200;
+    els.scroll.scrollTop = 100;
+    globalThis.__bottomCalls = 0;
+    scrollToBottom = () => {
+      __bottomCalls += 1;
+      els.scroll.scrollTop = els.scroll.scrollHeight;
+    };
+    renderUserNode = () => document.createElement("div");
+    renderAssistantNode = () => document.createElement("div");
+    closeMobileSidebar = () => {};
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+  `);
+  const runOpen = async (options) => {
+    const promise = run(`openSession("s1", ${JSON.stringify(options)})`);
+    const request = await waitRequest(env);
+    request.resolve({ messages });
+    await promise;
+    return { scrollTop: run("els.scroll.scrollTop"), calls: run("__bottomCalls") };
+  };
+  run("els.scroll.scrollTop = 100; __bottomCalls = 0;");
+  const silent = await runOpen({ silent: true });
+  run("els.scroll.scrollTop = 100; __bottomCalls = 0;");
+  const normal = await runOpen({});
+  return { silent, normal };
+}
+
 function scenarioChatPersisted(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1364,6 +1404,8 @@ async function main() {
     payload = await scenarioSessionRefresh(source);
   } else if (scenario === "editGuard") {
     payload = scenarioEditGuard(source);
+  } else if (scenario === "scrollPreserve") {
+    payload = await scenarioScrollPreserve(source);
   } else if (scenario === "reconcile") {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {

@@ -2492,6 +2492,10 @@ async function openSession(sessionId, options = {}) {
       return;
     }
   }
+  // 静默重载（停止对账）会重建整个消息区：用户此时可能正在向上翻历史，
+  // 重建后强制滚到底会把阅读位置夺走——记录重载前的滚动位置
+  const previousScrollTop = els.scroll.scrollTop;
+  const wasAtBottom = atBottom();
   const token = ++sessionLoadToken;
   state.sessionLoading = true;
   state.sessionLoadingId = sessionId;
@@ -2563,6 +2567,9 @@ async function openSession(sessionId, options = {}) {
       matchNode.classList.add("msg-flash");
       matchNode.scrollIntoView({ block: "center" });
       setTimeout(() => matchNode.classList.remove("msg-flash"), 1800);
+    } else if (options.silent && !wasAtBottom) {
+      // 静默重载保留阅读位置（内容只会在末尾追加，旧位置仍指向同一段历史）
+      els.scroll.scrollTop = previousScrollTop;
     } else {
       scrollToBottom(true);
     }
