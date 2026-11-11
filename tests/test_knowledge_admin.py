@@ -2909,6 +2909,61 @@ def test_read_lock_times_out_when_write_in_progress():
     print("✓ 只读路径写锁有界等待")
 
 
+def test_agent_lock_wait_is_bounded(monkeypatch):
+    """另一个线程正在构造 Agent 时，等待有界：不能把请求线程整分钟钉在锁上。"""
+    knowledge_admin.reset_knowledge_agent()
+    monkeypatch.setattr(knowledge_admin, "_AGENT_LOCK_TIMEOUT_SEC", 0.05)
+    assert knowledge_admin._agent_lock.acquire()
+    try:
+        with pytest.raises(knowledge_admin.KnowledgeBusyError):
+            knowledge_admin._get_agent()
+        with pytest.raises(knowledge_admin.KnowledgeBusyError):
+            knowledge_admin._get_read_agent()
+    finally:
+        knowledge_admin._agent_lock.release()
+    print("✓ Agent 构造锁等待有界（并发首载快速 503）")
+
+
+def test_skill_search_participates_in_write_lock(monkeypatch):
+    """对话内 RAG 检索与整组替换互斥：写锁占用期间快速失败，不读半写状态。"""
+    import types
+
+    from agents.rag_knowledge_agent import RAGKnowledgeAgent
+
+    agent = object.__new__(RAGKnowledgeAgent)
+    agent.initialized = True
+    agent.collection_name = "kb"
+    agent.top_k = 3
+    agent._milvus_db_path = "test-db"
+    agent.embedding_model = types.SimpleNamespace(
+        encode=lambda query: types.SimpleNamespace(tolist=lambda: [0.0])
+    )
+    searched = []
+
+    def _search(**kwargs):
+        searched.append(kwargs)
+        return [[]]
+
+    fake_client = types.SimpleNamespace(
+        load_collection=lambda name: None, search=_search
+    )
+    module_globals = RAGKnowledgeAgent.search_knowledge.__globals__
+    monkeypatch.setitem(module_globals, "get_milvus_client", lambda db: fake_client)
+    agent._ensure_connection = lambda: None
+
+    assert knowledge_admin._WRITE_LOCK.acquire()
+    try:
+        with pytest.raises(knowledge_admin.KnowledgeBusyError):
+            agent.search_knowledge("住宿标准", strict=True)
+        assert searched == [], "写锁占用期间不得执行检索"
+    finally:
+        knowledge_admin._WRITE_LOCK.release()
+    # 释放后恢复正常检索
+    assert agent.search_knowledge("住宿标准", strict=True) == []
+    assert len(searched) == 1
+    print("✓ RAG 检索与知识库写操作互斥（有界等待）")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()

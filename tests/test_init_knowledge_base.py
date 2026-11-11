@@ -242,7 +242,7 @@ def test_dimension_mismatch_rebuilds(monkeypatch):
         import utils.knowledge_admin as admin_module
 
         # 维度重建前会先导出库内片段：单测环境没有真实知识库，导出空集
-        monkeypatch.setattr(admin_module, "export_documents", lambda: [])
+        monkeypatch.setattr(admin_module, "export_documents", lambda directory=None: [])
         import utils.milvus_client as milvus_module
 
         monkeypatch.setattr(
@@ -299,8 +299,8 @@ def test_preserved_semantics_by_source(monkeypatch):
     ]
     import utils.knowledge_admin as admin_module
 
-    monkeypatch.setattr(admin_module, "export_documents", lambda: rows)
-    preserved, warnings = module._collect_preserved_documents()
+    monkeypatch.setattr(admin_module, "export_documents", lambda directory=None: rows)
+    preserved, warnings = module._collect_preserved_documents(Path("/tmp/source-kb"))
     contents = [piece["content"] for piece in preserved]
     assert "旧版内置内容" not in contents, "受管旧分片必须丢弃（源文件已改动）"
     assert contents.count("面板加的片段") == 1, "单条按 strip 内容去重"
@@ -308,6 +308,91 @@ def test_preserved_semantics_by_source(monkeypatch):
     assert all("残片" not in content for content in contents)
     assert warnings and "残缺" in warnings[0]
     print("✓ 保留片段按来源判定（受管旧分片丢弃 / 组完整保留）")
+
+
+def test_collect_preserved_uses_explicit_source_dir(monkeypatch):
+    """来源目录必须显式传给导出：默认解析会在新库建好后翻转过去。"""
+    module = _load_init_module()
+    import utils.knowledge_admin as admin_module
+
+    seen: dict = {}
+
+    def fake_export(directory=None):
+        seen["dir"] = directory
+        return []
+
+    monkeypatch.setattr(admin_module, "export_documents", fake_export)
+    source = Path("/tmp/legacy-kb")
+    preserved, warnings = module._collect_preserved_documents(source)
+    assert preserved == [] and warnings == []
+    assert seen["dir"] == source
+    print("✓ 保留片段从显式来源目录导出")
+
+
+def test_collect_preserved_drops_huge_parts_declaration(monkeypatch):
+    """parts 声明超大（旧库脏数据）不能被 set(range) 展开，整组丢弃。"""
+    module = _load_init_module()
+    import utils.knowledge_admin as admin_module
+
+    rows = [
+        {
+            "content": "脏分片",
+            "metadata": {"group": "bad", "part": 1, "parts": 10**12},
+        },
+        {"content": "面板片段", "metadata": {"category": "住宿"}},
+    ]
+    monkeypatch.setattr(admin_module, "export_documents", lambda directory=None: rows)
+    preserved, warnings = module._collect_preserved_documents(Path("/tmp/source"))
+    contents = [piece["content"] for piece in preserved]
+    assert "脏分片" not in contents
+    assert "面板片段" in contents
+    assert warnings and "残缺" in warnings[0]
+    print("✓ 超大 parts 声明整组丢弃，不展开 range")
+
+
+def test_collect_preserved_missing_db_is_empty(monkeypatch):
+    """来源库尚未初始化（无 milvus_lite.db）：没有可保留内容，不算失败。"""
+    module = _load_init_module()
+    import utils.knowledge_admin as admin_module
+
+    def missing(directory=None):
+        raise FileNotFoundError("知识库未初始化")
+
+    monkeypatch.setattr(admin_module, "export_documents", missing)
+    preserved, warnings = module._collect_preserved_documents(Path("/tmp/missing"))
+    assert preserved == [] and warnings == []
+    print("✓ 来源库不存在时按空集处理")
+
+
+def test_embedding_dim_unreadable_does_not_drop_collection(monkeypatch):
+    """「无法读取嵌入模型维度」不是维度不一致：不得删集合再重试。"""
+    module = _load_init_module()
+    dropped = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            raise RuntimeError("无法读取嵌入模型维度")
+
+    class _Client:
+        def drop_collection(self, name):
+            dropped.append(name)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        import utils.milvus_client as milvus_module
+
+        monkeypatch.setattr(
+            milvus_module, "get_milvus_client", lambda path: _Client()
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 1
+        assert dropped == [], "模型维度探测失败不得删除知识库集合"
+        assert "知识库保持原样" in out.getvalue()
+    print("✓ 嵌入模型维度不可读时中止且不删库")
 
 
 def test_export_failure_aborts_before_drop(monkeypatch):
@@ -334,7 +419,7 @@ def test_export_failure_aborts_before_drop(monkeypatch):
         import utils.knowledge_admin as admin_module
         import utils.milvus_client as milvus_module
 
-        def boom():
+        def boom(directory=None):
             raise RuntimeError("db locked")
 
         monkeypatch.setattr(admin_module, "export_documents", boom)
@@ -432,7 +517,9 @@ def test_preserved_backup_survives_failed_restore(monkeypatch):
     monkeypatch.setattr(
         admin_module,
         "export_documents",
-        lambda: [{"content": "面板加的片段", "metadata": {"category": "住宿"}}],
+        lambda directory=None: [
+            {"content": "面板加的片段", "metadata": {"category": "住宿"}}
+        ],
     )
 
     class _ExistingMilvus(_FakeMilvus):
