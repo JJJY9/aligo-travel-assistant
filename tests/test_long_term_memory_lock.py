@@ -101,6 +101,87 @@ def test_save_retries_transient_replace_errors(monkeypatch, tmp_path):
     print("✓ os.replace 短暂失败自动重试")
 
 
+def test_save_fsyncs_before_atomic_replace(monkeypatch, tmp_path):
+    """保存先 fsync 再 os.replace：掉电后已确认成功的写入必须可解析。"""
+    memory = LongTermMemory("fsync-order", str(tmp_path))
+    order: list[str] = []
+    real_replace = os.replace
+    real_fsync = os.fsync
+
+    def spy_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def spy_replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("context.long_term_memory.os.fsync", spy_fsync)
+    monkeypatch.setattr("context.long_term_memory.os.replace", spy_replace)
+    memory.increment_query_count()
+    assert "fsync" in order and "replace" in order
+    assert order.index("fsync") < order.index("replace"), order
+    print("✓ 保存先 fsync 再原子替换")
+
+
+def test_load_closes_handle_before_parse(monkeypatch, tmp_path):
+    """解析前关闭读句柄：Windows 上打开中的句柄会阻塞其它进程的替换。"""
+    import builtins
+    import json as json_module
+
+    from context import long_term_memory as module
+
+    memory = LongTermMemory("close-first", str(tmp_path))
+    memory.save_preference("home_location", "北京")
+    path = memory.db_path
+    real_open = builtins.open
+    opened = []
+
+    class _Tracked:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def read(self, *args):
+            return self._handle.read(*args)
+
+        @property
+        def closed(self):
+            return self._handle.closed
+
+    def tracking_open(file, *args, **kwargs):
+        handle = real_open(file, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if str(file) == path and "r" in str(mode):
+            wrapped = _Tracked(handle)
+            opened.append(wrapped)
+            return wrapped
+        return handle
+
+    real_loads = json_module.loads
+    closed_states: list[bool] = []
+
+    def spy_loads(text):
+        closed_states.extend(handle.closed for handle in opened)
+        return real_loads(text)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    monkeypatch.setattr(module.json, "loads", spy_loads)
+    reopened = LongTermMemory("close-first", str(tmp_path))
+    assert reopened.get_preference("home_location") == "北京"
+    assert closed_states and all(closed_states), "解析时读句柄必须已关闭"
+    print("✓ 读句柄在解析前关闭")
+
+
 def test_file_lock_normalizes_oserror(monkeypatch, tmp_path):
     """权限 / 路径类 OSError 也按契约转成 TimeoutError（调用方只捕获它）。"""
     import builtins

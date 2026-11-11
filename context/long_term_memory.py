@@ -129,13 +129,14 @@ class LongTermMemory:
         with self._write_lock:
             if os.path.exists(self.db_path):
                 try:
-                    with open(self.db_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        logger.debug(f"Loaded long-term memory from {self.db_path}")
-
-                        # 数据迁移：兼容旧格式
-                        data = self._migrate_data(data)
-                        return data
+                    # 读句柄尽早关闭：Windows 上任何打开中的句柄都会让其它
+                    # 进程的 os.replace 失败（WinError 5）。大文件的解析占
+                    # 读取耗时的大头，先读完再解析可把阻塞写者的窗口压到最短
+                    with open(self.db_path, "r", encoding="utf-8") as f:
+                        raw = f.read()
+                    data = self._migrate_data(json.loads(raw))
+                    logger.debug(f"Loaded long-term memory from {self.db_path}")
+                    return data
                 except Exception as e:
                     logger.error(f"Failed to load long-term memory: {e}")
                     # 复核与备份都必须持有跨进程文件锁：其它进程的写操作在
@@ -144,8 +145,9 @@ class LongTermMemory:
                     try:
                         with file_lock(self.db_path):
                             try:
-                                with open(self.db_path, 'r', encoding='utf-8') as f:
-                                    latest = json.load(f)
+                                with open(self.db_path, "r", encoding="utf-8") as f:
+                                    latest_raw = f.read()
+                                latest = json.loads(latest_raw)
                                 # 与首次读取一致：合法 JSON 但不是对象 /
                                 # 字段结构异常同样视为损坏，不能逃逸
                                 if not isinstance(latest, dict):
@@ -236,8 +238,10 @@ class LongTermMemory:
     def _reload_latest(self) -> None:
         """从磁盘重载最新数据（写操作前调用，避免旧快照覆盖其它写入）。"""
         try:
+            # 与 _load 同一原因：句柄尽早关闭，解析在句柄关闭后进行
             with open(self.db_path, encoding="utf-8") as f:
-                data = json.load(f)
+                raw = f.read()
+            data = json.loads(raw)
         except FileNotFoundError:
             return
         except Exception as exc:  # noqa: BLE001 - 损坏文件不能静默沿用旧快照
@@ -502,17 +506,24 @@ class LongTermMemory:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(self.data, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    # 持久化屏障：os.replace 只保证原子替换，不保证临时文件
+                    # 数据已落盘（NTFS 的 rename 元数据可能先于数据页写回）。
+                    # fsync 后「保存成功」才意味着掉电/崩溃后文件仍可解析
+                    os.fsync(handle.fileno())
                 # Windows 上另一个进程短暂打开数据文件时 os.replace 会报
-                # PermissionError / WinError 5；大文件读取可能持续数百毫秒，
-                # 重试到约 500ms 再放弃
-                for attempt in range(10):
+                # PermissionError / WinError 5：读者已改为读完立即关闭句柄，
+                # 但大文件读取仍可能占数百毫秒，重试预算与文件锁的等待上限
+                # 对齐（约 1.5 秒）再放弃
+                deadline = time.monotonic() + 1.5
+                while True:
                     try:
                         os.replace(temp_path, self.db_path)
                         break
                     except OSError:
-                        if attempt == 9:
+                        if time.monotonic() >= deadline:
                             raise
-                        time.sleep(0.05)
+                        time.sleep(0.03)
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)

@@ -17,9 +17,11 @@ if os.name == "nt":  # pragma: no cover - 平台分支在 Windows 上执行
 else:  # pragma: no cover - 平台分支在非 Windows 上执行
     import fcntl
 
-# 锁等待上限：单次写盘是毫秒级；Web 侧文件锁在事件循环上同步等待，
-# 上限过大会在跨进程争用时冻结整个服务，这里限制为 2 秒
-DEFAULT_TIMEOUT_SEC = 2.0
+# 锁等待上限：临界区不再是纯本地写盘——落库守卫在锁内做 Redis 墓碑 /
+# 会话纪元检查（黑洞时各一次 socket 超时，合计可达 3 秒），大文件重载 /
+# fsync / 原子替换再叠加数百毫秒。上限仍应存在（防止死锁无限等待），但要
+# 覆盖最坏临界区，否则数据完全健康也会被误报「写锁等待超时」
+DEFAULT_TIMEOUT_SEC = 6.0
 
 
 def _ensure_lockable(handle) -> None:
