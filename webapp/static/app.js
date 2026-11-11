@@ -1057,11 +1057,51 @@ async function retryFailed(node, text) {
     toast("会话正在加载，请稍候");
     return;
   }
+  // 停止 / 断网后服务端可能已把这一轮落库（对账被重试点击抢先跳过）：
+  // 重发前按 client_turn_id 精确确认，已保存则刷新历史而不是再发一条
+  const turnId = (node && node.dataset && node.dataset.turnId) || "";
+  if (turnId && state.sessionId) {
+    setBusy(true);
+    let persisted = false;
+    try {
+      persisted = await turnPersistedTurn(state.sessionId, turnId);
+    } finally {
+      setBusy(false);
+    }
+    if (persisted) {
+      node.remove();
+      await openSession(state.sessionId, {
+        silent: true,
+        keepOnError: true,
+        preserveOnEmpty: true,
+      });
+      toast("这一轮已保存，已按服务端历史刷新");
+      return;
+    }
+  }
   trimRegenButtons();
   // 失败可能发生在提问写入历史之前：只重发，不删服务端上一轮，
   // 避免误删已保存的问答（最多产生一条重复提问，可接受）
   node.remove();
   await sendMessage(text, { echo: false });
+}
+
+async function turnPersistedTurn(sessionId, turnId) {
+  if (!sessionId || !turnId) return false;
+  try {
+    const data = await getJSON(
+      `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+    );
+    return Boolean(
+      data &&
+        Array.isArray(data.messages) &&
+        data.messages.some(
+          (item) => item && item.meta && item.meta.client_turn_id === turnId,
+        ),
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function regenerate(node, text) {
@@ -1985,6 +2025,11 @@ function newSession() {
     toast("请等待当前回复完成");
     return;
   }
+  if (document.querySelector(".user-edit-input")) {
+    if (!window.confirm("正在编辑的修改尚未保存，新建对话将丢弃修改。继续？")) {
+      return;
+    }
+  }
   sessionLoadToken += 1;
   state.sessionLoading = false;
   state.sessionLoadingId = null;
@@ -2299,9 +2344,8 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   state.sessionsLoading = true;
   // 重置（搜索 / 切换用户）取第一页；其它刷新（重命名 / 置顶 / 删除）
   // 保留用户已经「加载更多」展开的数量
-  const limit = options.reset
-    ? 50
-    : Math.min(200, Math.max(50, state.sessions.length));
+  const targetCount = options.reset ? 50 : Math.max(50, state.sessions.length);
+  const limit = Math.min(200, targetCount);
   const params = new URLSearchParams({
     user_id: state.userId,
     limit: String(limit),
@@ -2316,6 +2360,33 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     state.sessions = data.sessions || [];
     state.sessionsOffset = state.sessions.length;
     state.sessionTotal = Number(data.total || state.sessions.length);
+    // 单页上限 200：刷新不能把「加载更多」展开的列表悄悄截回 200 条——
+    // 按刷新前的数量继续取后续页并合并，达到目标或服务端取尽为止
+    if (!options.reset && state.sessions.length < targetCount) {
+      const seen = new Set(state.sessions.map((item) => item.session_id));
+      let serverOffset = state.sessions.length;
+      while (state.sessions.length < targetCount) {
+        const moreParams = new URLSearchParams(params);
+        moreParams.set("offset", String(serverOffset));
+        const more = await getJSON(
+          `/api/sessions?${moreParams}`,
+          undefined,
+          30000,
+        );
+        if (requestId !== sessionsRequestId) return;
+        const page = more.sessions || [];
+        if (!page.length) break;
+        serverOffset += page.length;
+        for (const item of page) {
+          if (!seen.has(item.session_id)) {
+            seen.add(item.session_id);
+            state.sessions.push(item);
+          }
+        }
+        if (page.length < limit) break;
+      }
+      state.sessionsOffset = serverOffset;
+    }
     if (data.archived_count !== undefined) {
       updateArchivedToggle(Number(data.archived_count));
     }
@@ -2402,6 +2473,13 @@ async function openSession(sessionId, options = {}) {
   if (state.busy) {
     if (!options.silent) toast("请等待当前回复完成");
     return;
+  }
+  // 行内编辑中的草稿只存在于 DOM：切换会话会整段重建消息区、草稿静默丢失。
+  // 静默重载（停止对账 / 外部刷新）由调用方保证不在编辑时触发
+  if (!options.silent && document.querySelector(".user-edit-input")) {
+    if (!window.confirm("正在编辑的修改尚未保存，切换会话将丢弃修改。继续？")) {
+      return;
+    }
   }
   const token = ++sessionLoadToken;
   state.sessionLoading = true;
@@ -2673,6 +2751,8 @@ async function sendMessage(text, options = {}) {
     typeof crypto !== "undefined" && crypto.randomUUID
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  // 重试按钮据此在重发前确认「这一轮是否已被服务端落库」，避免重复问答
+  assistant.root.dataset.turnId = turnId;
   let terminal = null;
   try {
     const response = await fetch("/api/chat/stream", {
@@ -2737,6 +2817,27 @@ async function sendMessage(text, options = {}) {
         assistant.fail(error.message || "请求失败，请稍后再试。");
       });
       els.health.className = "health err";
+      // 流在 done / error 之前中断（代理超时 / 断网 / 后端重启）：服务端
+      // 可能已完成原子落库，同样要与历史对账——否则用户点「重试」会在
+      // 历史里留下两条相同问答
+      const sessionId = state.sessionId;
+      if (sessionId) {
+        const token = sessionLoadToken;
+        setTimeout(
+          () =>
+            reconcileStoppedTurn(
+              sessionId,
+              message,
+              token,
+              turnId,
+              "连接中断",
+            ),
+          600,
+        );
+      } else if (!els.input.value.trim()) {
+        els.input.value = message;
+        resizeInput();
+      }
     }
   } finally {
     state.controller = null;
@@ -2773,12 +2874,16 @@ async function sendMessage(text, options = {}) {
    保证用户 + 助手成对出现，回合标识精确到本次提问）：已落库就按服务端
    状态重渲染；连续几次都没出现，说明提问没有保存，重渲染旧历史后把原文
    放回输入框，避免永久丢失。 */
-async function reconcileStoppedTurn(sessionId, message, token, turnId) {
+async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = "已停止") {
   if (!message) return;
+  // 本函数自己会调用 openSession（它自增 sessionLoadToken）：只认启动时
+  // 捕获的 token 会让 openSession 之后的检查恒假——最终确认与回填输入
+  // 变成死代码，提问文本在消息区被清空后没有任何副本
+  let expectedToken = token;
   const canSync = () =>
     sessionId === state.sessionId &&
     !state.busy &&
-    token === sessionLoadToken &&
+    expectedToken === sessionLoadToken &&
     !document.querySelector(".user-edit-input") &&
     !document.querySelector(".pref-input") &&
     !document.querySelector(".hi-input");
@@ -2828,6 +2933,8 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId) {
           keepOnError: true,
           preserveOnEmpty: true,
         });
+        // openSession 自增了 sessionLoadToken：后续检查认新 token
+        expectedToken = sessionLoadToken;
         // openSession 的重新拉取可能刚好包含迟到的落库（服务端 drain 上限
         // 10 秒，客户端判定期限 ~3 秒）：以最新数据为准再确认一次，避免界面
         // 已显示保存的问答却把提问塞回输入框并提示「没有保存」，用户重发
@@ -2852,7 +2959,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId) {
           els.input.value = message;
           resizeInput();
         }
-        toast("已停止，这条提问没有保存");
+        toast(`${reason}，这条提问没有保存`);
         return;
       }
     }
@@ -5220,6 +5327,11 @@ async function saveUser() {
     return;
   }
   if (value !== state.userId) {
+    if (document.querySelector(".user-edit-input")) {
+      if (!window.confirm("正在编辑的修改尚未保存，切换用户将丢弃修改。继续？")) {
+        return;
+      }
+    }
     sessionLoadToken += 1;
     // 作废进行中的会话加载，并清掉 loading 标志：旧加载的 finally 会因
     // token 不匹配而跳过重置，否则之后一直提示「会话正在加载」

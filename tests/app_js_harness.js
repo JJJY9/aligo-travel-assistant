@@ -1031,12 +1031,14 @@ async function scenarioReconcile(source) {
     sessionLoadToken = 5;
     els.input.value = "";
     globalThis.__openCalls = 0;
-    openSession = async () => { __openCalls += 1; };
+    openSession = async () => { __openCalls += 1; sessionLoadToken += 1; };
     resizeInput = () => {};
   `);
 
   const runCase = async (finalMessages) => {
-    run('__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = "";');
+    run(
+      '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5;'
+    );
     const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
     // attempt 0..2 的轮询，以及 attempt 3 的确认轮询：都先给旧数据
     for (let i = 0; i < 4; i += 1) {
@@ -1061,6 +1063,100 @@ async function scenarioReconcile(source) {
   return { persistedLate, stillMissing };
 }
 
+
+async function scenarioRetryGuard(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.sessionId = "s1";
+    state.busy = false;
+    state.ready = true;
+    state.sessionLoading = false;
+    globalThis.__sent = [];
+    globalThis.__opened = 0;
+    globalThis.__removed = 0;
+    sendMessage = async (text) => { __sent.push(text); };
+    openSession = async () => { __opened += 1; };
+    setBusy = () => {};
+    trimRegenButtons = () => {};
+  `);
+  const makeTurnNode = () =>
+    run(
+      '(() => { const d = document.createElement("div"); d.dataset.turnId = "turn-1"; d.remove = () => { globalThis.__removed += 1; }; globalThis.__node = d; return d; })()'
+    );
+  const runCase = async (messages) => {
+    makeTurnNode();
+    run("__toasts.length = 0; __sent = []; __opened = 0; __removed = 0;");
+    const promise = run('retryFailed(__node, "你好")');
+    const request = await waitRequest(env);
+    request.resolve({ messages });
+    await promise;
+    await tick();
+    return {
+      sent: run("__sent.slice()"),
+      opened: run("__opened"),
+      removed: run("__removed"),
+      toasts: run("__toasts.slice()"),
+    };
+  };
+  const persisted = await runCase([
+    { role: "user", content: "你好" },
+    { role: "assistant", content: "回答", meta: { client_turn_id: "turn-1" } },
+  ]);
+  const missing = await runCase([{ role: "user", content: "旧提问" }]);
+  return { persisted, missing };
+}
+
+async function scenarioSessionRefresh(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const page1 = Array.from({ length: 200 }, (_, i) => ({ session_id: "s-" + i }));
+  const page2 = Array.from({ length: 50 }, (_, i) => ({ session_id: "s-" + (200 + i) }));
+  run(`
+    state.userId = "u1";
+    state.searchQuery = "";
+    state.showArchived = false;
+    state.sessions = Array.from({ length: 250 }, (_, i) => ({ session_id: "old-" + i }));
+    state.sessionTotal = 300;
+    state.sessionsOffset = 250;
+    renderHistory = () => {};
+    updateArchivedToggle = () => {};
+    markActiveHistory = () => {};
+    renderArchivedHint = () => {};
+  `);
+  const promise = run("loadSessions(state.searchQuery, {})");
+  const first = await waitRequest(env);
+  first.resolve({ sessions: page1, total: 300 });
+  const second = await waitRequest(env);
+  second.resolve({ sessions: page2, total: 300 });
+  await promise;
+  return {
+    count: run("state.sessions.length"),
+    offset: run("state.sessionsOffset"),
+    first_url: first.args[0],
+    second_url: second.args[0],
+  };
+}
+
+function scenarioEditGuard(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    globalThis.__asked = 0;
+    globalThis.__fakeEdit = document.createElement("input");
+    document.querySelector = (selector) =>
+      selector === ".user-edit-input" ? __fakeEdit : null;
+    window.confirm = () => { __asked += 1; return false; };
+  `);
+  run('openSession("s1", {})');
+  const blocked = { asked: run("__asked"), queued: env.__requests.length };
+  run("__asked = 0; window.confirm = () => { __asked += 1; return true; };");
+  run('openSession("s1", {})');
+  return { blocked, allowedQueued: env.__requests.length };
+}
 
 async function scenarioSse(source) {
   const env = buildEnv(source);
@@ -1245,6 +1341,12 @@ async function main() {
     payload = await scenarioPanelFixes(source);
   } else if (scenario === "startup") {
     payload = await scenarioStartup(source);
+  } else if (scenario === "retryGuard") {
+    payload = await scenarioRetryGuard(source);
+  } else if (scenario === "sessionRefresh") {
+    payload = await scenarioSessionRefresh(source);
+  } else if (scenario === "editGuard") {
+    payload = scenarioEditGuard(source);
   } else if (scenario === "reconcile") {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
