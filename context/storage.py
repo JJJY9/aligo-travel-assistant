@@ -10,6 +10,7 @@
 """
 import logging
 import re
+import threading
 import time
 from typing import Any
 
@@ -22,6 +23,7 @@ from context.short_term_memory import (
     applied_key,
     discard_pending_ops,
     queue_clear,
+    redis_short_term_available,
     redis_short_term_degraded,
     reset_redis_degraded,
     session_key,
@@ -51,7 +53,14 @@ LongTermStore = LongTermMemory | PostgresLongTermMemory
 
 _FAILED_UNTIL: dict[str, float] = {}
 _FAILURE_COOLDOWN_SEC = 60.0
-_redis_client: Any = None
+# 惰性创建客户端必须互斥：冷却到期后的第一波并发请求各自 from_url + ping
+# 会在 Redis 仍不可达时同时排 1.5 秒超时（放大成连接风暴），恢复时又会
+# 创建多个连接池而只有一个进缓存、其余被各会话长期持有
+_redis_lock = threading.Lock()
+# 按 URL 缓存客户端：配置热更新（redis_url 改变 + reset_failure_cache）后
+# 旧 URL 的客户端不会再被新配置的调用复用；reset 与在途创建在同一把锁内，
+# 不存在「reset 之后旧客户端被在途线程写回缓存」的时序
+_redis_clients: dict[str, Any] = {}
 # 最近一次实际返回的后端（describe_backends 用真实状态而不是仅凭时间戳
 # 推断：冷却过期后、下一次成功创建之前，实际仍在使用回退后端）
 _ACTUAL_BACKEND: dict[str, str] = {}
@@ -70,34 +79,37 @@ def _get_redis_client(url: str, force: bool = False):
 
     删除会话 / 故障重放前的墓碑检查这类低频关键路径不能因冷却期返回
     None 而静默跳过共享保护：冷却只该节省高频枚举的等待时间。
+    创建 / ping 全程持模块锁（双重检查）：并发波次只允许一个真实创建者，
+    其余等待后命中缓存或冷却，避免连接风暴与多连接池泄漏。
     """
-    global _redis_client
-    if _redis_client is not None:
-        return _redis_client
-    if not force and _failed_recently(f"redis:{url}"):
-        return None
-    try:
-        import redis
-    except ImportError:
-        logger.warning("redis 未安装，短期记忆回退为进程内实现")
-        return None
-    try:
-        client = redis.Redis.from_url(
-            url,
-            decode_responses=True,
-            socket_connect_timeout=1.5,
-            socket_timeout=1.5,
-        )
-        client.ping()
-        _redis_client = client
-        logger.info("Redis 短期记忆已启用: %s", _redact_url(url))
-        return client
-    except Exception as exc:  # noqa: BLE001 - 连接失败回退
-        _mark_failed(f"redis:{url}")
-        logger.warning(
-            "Redis 不可用（%s），短期记忆回退为进程内实现", redact_secret(exc)
-        )
-        return None
+    with _redis_lock:
+        client = _redis_clients.get(url)
+        if client is not None:
+            return client
+        if not force and _failed_recently(f"redis:{url}"):
+            return None
+        try:
+            import redis
+        except ImportError:
+            logger.warning("redis 未安装，短期记忆回退为进程内实现")
+            return None
+        try:
+            client = redis.Redis.from_url(
+                url,
+                decode_responses=True,
+                socket_connect_timeout=1.5,
+                socket_timeout=1.5,
+            )
+            client.ping()
+            _redis_clients[url] = client
+            logger.info("Redis 短期记忆已启用: %s", _redact_url(url))
+            return client
+        except Exception as exc:  # noqa: BLE001 - 连接失败回退
+            _mark_failed(f"redis:{url}")
+            logger.warning(
+                "Redis 不可用（%s），短期记忆回退为进程内实现", redact_secret(exc)
+            )
+            return None
 
 
 def get_shared_redis_client(force: bool = False) -> Any | None:
@@ -182,11 +194,17 @@ def create_long_term_memory(
 
 
 def reset_failure_cache() -> None:
-    """清空失败冷却、缓存的 Redis 客户端与最近后端记录（测试 / 配置热更新）。"""
-    global _redis_client
-    _FAILED_UNTIL.clear()
-    _redis_client = None
-    _ACTUAL_BACKEND.clear()
+    """清空失败冷却、缓存的 Redis 客户端与最近后端记录（测试 / 配置热更新）。
+
+    持模块锁清空：与在途的 ``_get_redis_client`` 创建互斥，旧 URL 的客户端
+    不会被 reset 之后完成的创建写回缓存。已经直接缓存客户端的消费方
+    （限流器实例、已建会话的短期记忆、Web 状态）仍持有旧客户端，热更新后
+    需重启进程才能全部切到新实例。
+    """
+    with _redis_lock:
+        _FAILED_UNTIL.clear()
+        _redis_clients.clear()
+        _ACTUAL_BACKEND.clear()
     reset_redis_degraded()
 
 
@@ -212,9 +230,15 @@ def describe_backends() -> dict[str, Any]:
         "long_term": long_term,
         "short_term_configured": bool(url),
         "long_term_configured": bool(dsn),
-        # 配置了 Redis 但当前用不上（启动时不可达 / 运行中故障回退进程内）
+        # 配置了 Redis 但当前用不上（启动时不可达 / 运行中故障回退进程内）。
+        # 三条判据缺一不可：degraded() 只看冷却窗口（到期后即使从未成功过
+        # 也返回 False）、available() 看最近一次 Redis 操作是否成功
         "short_term_degraded": bool(url)
-        and (short_term != "redis" or redis_short_term_degraded()),
+        and (
+            short_term != "redis"
+            or redis_short_term_degraded()
+            or not redis_short_term_available()
+        ),
         # 配置了 PostgreSQL 但连接失败、长期记忆已回退本地 JSON
         "long_term_degraded": bool(dsn) and long_term == "json",
     }

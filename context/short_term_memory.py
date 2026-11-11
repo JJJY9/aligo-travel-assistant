@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # 单实例），60 秒后自动重试；健康检查用它区分「配置了 Redis 但当前降级」
 _REDIS_RETRY_COOLDOWN_SEC = 60.0
 _redis_degraded_until = 0.0
+# 最近一次 Redis 操作是否成功：冷却窗口到期不等于恢复（期间可能一次都
+# 没成功过），健康接口必须看真实结果，否则 Redis 仍不可用时上报健康
+_redis_available = True
 
 # 截断脚本一次性标记的存活时间：标记要覆盖「脚本已执行、响应丢失、故障期
 # 操作日志排队等待重放」的整段时间。操作日志在进程内没有过期机制，会话可能
@@ -60,14 +63,25 @@ def _is_transient_redis_error(exc: BaseException) -> bool:
 
 
 def redis_short_term_degraded() -> bool:
-    """短期记忆是否因 Redis 故障处于进程内回退状态。"""
+    """短期记忆是否处于「故障重试冷却」窗口内（内部重试节流用）。"""
     return time.monotonic() < _redis_degraded_until
 
 
+def redis_short_term_available() -> bool:
+    """最近一次 Redis 操作是否成功（健康接口用）。
+
+    与 :func:`redis_short_term_degraded` 的区别：冷却窗口到期但期间没有
+    任何成功操作时，本函数仍返回 False——Redis 实际不可用时健康页不能
+    因为「冷却结束」就报告恢复。
+    """
+    return _redis_available
+
+
 def reset_redis_degraded() -> None:
-    """清空降级冷却（测试隔离 / 配置热更新后立即重试）。"""
-    global _redis_degraded_until
+    """清空降级冷却与失败标记（测试隔离 / 配置热更新后立即重试）。"""
+    global _redis_degraded_until, _redis_available
     _redis_degraded_until = 0.0
+    _redis_available = True
 
 
 def session_key(session_id: str, user_id: str = "") -> str:
@@ -745,7 +759,7 @@ class RedisShortTermMemory:
         日志顺序始终与真实调用顺序一致（并发的清空不会让更早的失败新增
         排到清空之后）。``on_failure(journal)`` 在锁内登记失败操作。
         """
-        global _redis_degraded_until
+        global _redis_degraded_until, _redis_available
         if time.monotonic() < _redis_degraded_until:
             fallback_result = fallback()
             if on_failure is not None:
@@ -782,21 +796,37 @@ class RedisShortTermMemory:
                 if not journal.ops:
                     _drop_idle_journal(self.key, journal)
         except Exception as exc:  # noqa: BLE001 - 短期缓存故障不能中断对话
-            _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
-            # 有工厂时丢弃可能已坏的客户端：冷却结束后经由工厂重新解析
-            # （共享工厂通常直接返回缓存客户端，连接池会在下次命令时自动
-            # 重连）；没有工厂的实例保持原客户端重试，行为与旧版一致
-            if self._client_factory is not None:
-                self.client = None
-            logger.warning(
-                "Redis 短期记忆不可用（%s），本进程回退内存缓存 %ss",
-                exc,
-                int(_REDIS_RETRY_COOLDOWN_SEC),
-            )
+            if _is_transient_redis_error(exc):
+                # 连接 / 服务级故障：本进程全部会话进入重试冷却并走影子缓存
+                _redis_available = False
+                _redis_degraded_until = (
+                    time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
+                )
+                # 有工厂时丢弃可能已坏的客户端：冷却结束后经由工厂重新解析
+                # （共享工厂通常直接返回缓存客户端，连接池会在下次命令时自动
+                # 重连）；没有工厂的实例保持原客户端重试，行为与旧版一致
+                if self._client_factory is not None:
+                    self.client = None
+                logger.warning(
+                    "Redis 短期记忆不可用（%s），本进程回退内存缓存 %ss",
+                    exc,
+                    int(_REDIS_RETRY_COOLDOWN_SEC),
+                )
+            else:
+                # 确定性错误（WRONGTYPE、ACL 拒绝等）只影响本会话键：不能
+                # 把进程级冷却续期——一个中毒会话会让同进程所有健康会话
+                # 在重叠窗口里都退回影子缓存（多实例上下文共享失效）
+                logger.warning(
+                    "短期记忆操作确定性失败（%s，会话 %s），仅本次回退：%s",
+                    type(exc).__name__,
+                    self.key,
+                    exc,
+                )
             if not fallback_done:
                 fallback_result = fallback()
             return fallback_result, False
         _redis_degraded_until = 0.0
+        _redis_available = True
         return result, True
 
     def _redis(self, operation, fallback):

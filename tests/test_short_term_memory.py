@@ -1505,6 +1505,51 @@ def test_statistics_tolerates_missing_timestamp_in_fallback(monkeypatch):
     print("✓ 缺 timestamp 的影子条目统计不崩溃")
 
 
+def test_health_tracks_real_success_not_cooldown_window(monkeypatch):
+    """健康状态看最近一次操作结果：冷却到期但从未成功时仍报不可用。"""
+    from context import short_term_memory as module
+
+    module.reset_redis_degraded()
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-health", max_turns=5, user_id="u1")
+    client.fail = True
+    memory.add_message("user", "故障期消息")
+    assert module.redis_short_term_available() is False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert module.redis_short_term_degraded() is False, "冷却窗口已到期"
+    assert module.redis_short_term_available() is False, (
+        "冷却到期不等于恢复：期间没有任何成功操作"
+    )
+    client.fail = False
+    memory.get_recent_context()
+    assert module.redis_short_term_available() is True
+    print("✓ 健康状态按真实成功而非冷却窗口")
+
+
+def test_deterministic_error_does_not_degrade_process(monkeypatch):
+    """WRONGTYPE 这类会话级确定性错误不能把整个进程拖入 60 秒降级。"""
+    from context import short_term_memory as module
+
+    class _WrongType(Exception):
+        pass
+
+    class _PoisonRedis(_FlakyRedis):
+        def eval(self, script, numkeys, *keys_and_args):
+            raise _WrongType("WRONGTYPE Operation against a key")
+
+    module.reset_redis_degraded()
+    client = _PoisonRedis()
+    memory = module.RedisShortTermMemory(client, "s-dtype", max_turns=5, user_id="u1")
+    memory.add_message("user", "中毒会话")
+    assert module.redis_short_term_degraded() is False, (
+        "确定性错误只降级当前会话，不触发进程级冷却"
+    )
+    assert module.redis_short_term_available() is True, (
+        "确定性错误不是可用性问题"
+    )
+    print("✓ 确定性错误不触发进程级降级")
+
+
 def test_non_positive_ttl_is_clamped():
     """REDIS_TTL_SEC=0/负数会被钳制到 1：EXPIRE 非正数会直接删键。"""
     from context import short_term_memory as module
