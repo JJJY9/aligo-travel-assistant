@@ -346,7 +346,7 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
         entry = None if message.startswith("未找到城市") else _stale_entry(key)
         if entry is not None:
             _stored_at, stale = entry
-            logger.warning("天气接口失败（%s），沿用最近一次成功数据：%s", name, message)
+            logger.warning("天气接口失败，沿用最近一次成功数据")
             # 降级结果单独登记（不写成功缓存）：短窗内复用给并发等待者与后续
             # 请求，但不会刷新「最近一次成功」的时间戳、把 1 小时窗口无限滑动
             _store_degraded(key, stale)
@@ -382,7 +382,10 @@ def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, An
             timeout,
         )
     except requests.RequestException as exc:
-        raise WeatherError(f"天气接口暂时不可用：{exc}") from exc
+        # requests 的异常文本含完整上游 URL 与查询参数（城市名）：只记
+        # 异常类型，原始异常由 raise ... from 保留给调用栈
+        logger.warning("天气请求失败：%s", type(exc).__name__)
+        raise WeatherError("天气接口暂时不可用") from exc
     except WeatherError:
         raise
     except (KeyError, TypeError, ValueError) as exc:

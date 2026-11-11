@@ -594,7 +594,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
 - 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、版本一致性（`pyproject.toml` / wheel 元数据 / `index.html` 静态资源 `?v=` / `utils/version.py`）、技能目录（发现数量）、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
-- 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径（按路由模板聚合，如 `/api/sessions/{session_id}`；未匹配路径记为 `__unmatched__`）、平均 / 最大 / P50 / P95 耗时（百分位基于最近 1000 个请求样本）、熔断器状态、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP / 知识库 / 天气额度配置（请求指标多进程各自统计）；同时提供 Prometheus 文本端点 `GET /metrics`，便于接入 Prometheus / Grafana，多实例需分别采集。
+- 请求指标：`GET /api/metrics` 返回进程内请求总数、状态 / 方法分布、Top 路径（按路由模板聚合，如 `/api/sessions/{session_id}`；未匹配路径记为 `__unmatched__`，Host 白名单拒绝记为 `__host_rejected__`，路由前 413 与尾斜杠重定向按已知接口归一）、平均 / 最大 / P50 / P95 耗时（百分位基于最近 1000 个请求样本；流式与取消 / 客户端断开的 499 不计耗时）、熔断器状态、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP / 知识库 / 天气额度配置（请求指标多进程各自统计）；同时提供 Prometheus 文本端点 `GET /metrics`，便于接入 Prometheus / Grafana，多实例需分别采集。
 
   Prometheus 抓取示例：
 

@@ -10,6 +10,7 @@
 
 运行：python tests/test_json_parser.py
 """
+import logging
 import os
 import sys
 
@@ -289,6 +290,28 @@ def test_prefer_strong_keys_helper():
     print("✓ 强键优先、弱键回退、末尾未闭合仍判截断")
 
 
+def test_parse_failure_log_is_single_line_and_short(caplog):
+    """解析失败日志不能原样打印模型输出：换行可伪造日志行，全文会放大隐私面。"""
+    model_output = (
+        '{"a": 1,\n2026-11-12 09:00:00 ERROR webapp.server - FORGED LOG LINE'
+        '\n"b": }'
+    )
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(ValueError):
+            robust_json_parse(model_output)
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "All JSON parsing attempts failed" in record.getMessage()
+    ]
+    assert messages, caplog.text
+    message = messages[0]
+    assert "\n" not in message and "\r" not in message, repr(message)
+    assert chr(0x2028) not in message and chr(0x2029) not in message
+    assert len(message) <= 260, len(message)
+    print("✓ 解析失败日志单行且截断")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -312,6 +335,7 @@ if __name__ == "__main__":
         test_truncation_detected_before_result_keys()
         test_balanced_explanation_after_result_is_not_truncation()
         test_prefer_strong_keys_helper()
+        test_parse_failure_log_is_single_line_and_short()
     finally:
         mp.undo()
     print("\n全部通过")

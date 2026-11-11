@@ -78,16 +78,17 @@ def test_path_cardinality_is_bounded():
 
 
 def test_method_cardinality_is_bounded():
-    """HTTP 方法由客户端指定（h11 接受任意 token），同样要有基数上限。"""
+    """HTTP 方法由客户端指定：非标准方法一律归 __other__，不占固定预算。"""
     metrics = RequestMetrics()
     for index in range(50):
         metrics.record(f"X{index}", "/api/health", 200, 1.0)
-    snapshot = metrics.snapshot()
-    assert len(snapshot["by_method"]) <= 20
-    full = metrics._by_method  # noqa: SLF001 - 直接断言内部聚合
-    assert len(full) <= 16 + 1
-    assert full["__other__"] == 50 - 16
-    print("✓ 方法基数有上限（超出归 __other__）")
+    metrics.record("GET", "/api/health", 200, 1.0)
+    full = metrics.snapshot()["by_method"]
+    assert full.get("__other__") == 50, full
+    assert full.get("GET") == 1, "伪造方法不能把真实方法挤出统计"
+    assert not any(key.startswith("X") for key in full), full
+    assert len(full) <= 8
+    print("✓ 非标准方法统一归 __other__（真实方法不受影响）")
 
 
 def test_control_characters_are_sanitized():
