@@ -99,6 +99,19 @@ def test_large_history_fast_and_correct():
     print(f"✓ {count} 条行程：冲突对 {total}（二分实现与参考一致）")
 
 
+def test_conflicts_capped_with_exact_count():
+    """重叠极多时只物化前 N 条，conflict_count 仍精确（避免 O(N²) 物化）。"""
+    count = 300
+    trips = [_trip(f"s{index}", 0, 0) for index in range(count)]
+    views = trips_with_conflicts(trips)
+    assert all(view["conflict_count"] == count - 1 for view in views)
+    assert all(len(view["conflicts"]) <= 20 for view in views)
+    assert all(len(view["conflicts"]) == 20 for view in views[::25])
+    timings = sum(len(view["conflicts"]) for view in views)
+    assert timings == count * 20
+    print("✓ 冲突列表截断且总数精确")
+
+
 def test_conflict_order_uses_parsed_dates():
     """未补零历史日期按真实时间排序（字符串序会把 1-15 排到 1-2 前面）。"""
     trips = [
@@ -223,6 +236,7 @@ if __name__ == "__main__":
     test_optimized_matches_naive()
     test_large_history_fast_and_correct()
     test_conflict_order_uses_parsed_dates()
+    test_conflicts_capped_with_exact_count()
     test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
     test_inverted_date_range_is_logged()
