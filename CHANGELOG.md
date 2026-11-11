@@ -38,6 +38,8 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 全量导出限制并发数：`/api/export`、会话合集 / 单会话导出每次都会同时持有数份整库拷贝（实测峰值约为备份大小的 8 倍），只按次数限流挡不住 40 个并发导出（读桶 600 次/分钟额度内）同时申请数 GB 内存导致进程 OOM。新增全局导出信号量（2 个槽位），超出立即 503「导出任务过多，请稍后再试」，不排队占用线程与内存
+
 - 知识库只读接口的写锁改为有界等待：导入 / 更新会在锁内逐条嵌入（分钟级甚至更久），`list_documents` / `export_documents` / `get_document` / `get_document_group` 此前无超时地阻塞在全局写锁上——40 个并发读（知识库 60 次/分钟额度内即可）就能占满 anyio 共享线程池，冻结所有同步 API 与对话落库；现在超过 0.5 秒拿不到锁即抛 `KnowledgeBusyError`，接口快速返回 503「正在写入」，CLI 对应命令同样提示重试；doctor 的知识库检查也带 0.5 秒锁超时
 
 - 跨站守卫扩面并去掉「缺失即放行」：`Sec-Fetch-Site` 只在 potentially trustworthy URL 上发送——HTTP 内网部署（`--host 0.0.0.0` + `http://192.168.x.x:8000`）与 Safari <16.4 完全不带该头，此前一律放行，#588 的防护在这两类真实场景失效。现在要求同源证据：面板请求带 `X-Aligo-Client: web`（跨站简单请求无法自定义头），或 `Sec-Fetch-Site` 为 same-origin / none，或 Referer 与 Host 同源；显式 cross-site / same-site 一律 403。守卫同时扩到全量读取 / 导出类只读接口（`/api/status`、`/api/sessions`、三处导出、知识库 documents / categories / duplicates / group / export、行程 calendar / export）——任意网页不再能用 `<img>` 跨站触发全量扫描、耗尽读桶并打满共享线程池。面板 getJSON / 下载统一携带该头（浏览器实测），README 补充脚本调用方式

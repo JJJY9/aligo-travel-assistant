@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -1162,6 +1163,10 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
         )
+        # 全量导出会同时持有数份整库拷贝（实测峰值约为逻辑大小的 8 倍）：
+        # 只按次数限流挡不住 40 个并发导出同时申请数 GB 内存，这里限制
+        # 同一时刻真正执行导出的请求数（超出立即 503，不排队占线程）
+        self.export_slots = threading.BoundedSemaphore(2)
         # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内；
         # 工厂让启动时 Redis 不可用的实例在恢复后重新参与共享锁
         self.eval_lock = DistributedLock(
@@ -2563,6 +2568,22 @@ def create_app(model: Any = None) -> FastAPI:
 
     def _cross_site_side_effect(request: Request) -> None:
         _reject_cross_site_side_effect(request)
+    def _export_guard(func):
+        """限制同时执行的全量导出数量：内存峰值约为备份大小的 8 倍。"""
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not state.export_slots.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=503,
+                    detail="导出任务过多，请稍后再试",
+                )
+            try:
+                return func(*args, **kwargs)
+            finally:
+                state.export_slots.release()
+
+        return wrapper
 
     @app.get("/")
     def index() -> FileResponse:
@@ -3294,6 +3315,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/sessions/export", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def export_sessions(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -3467,6 +3489,7 @@ def create_app(model: Any = None) -> FastAPI:
         return {"session_id": session_id, "archived": payload.archived}
 
     @app.get("/api/sessions/{session_id}/export", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def export_session(
         request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
@@ -4503,6 +4526,7 @@ def create_app(model: Any = None) -> FastAPI:
         return {"trip_id": trip_id, "deleted": True}
 
     @app.get("/api/export", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def export(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
