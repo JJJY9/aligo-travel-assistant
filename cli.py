@@ -5438,13 +5438,16 @@ def run_trips_list_standalone(
         if state:
             marks.append(f"[{state}]")
         conflicts = trip.get("conflicts") or []
-        if conflicts:
+        conflict_total = int(trip.get("conflict_count") or len(conflicts))
+        if conflict_total:
+            shown = conflicts[:3]
             routes = "、".join(
                 f"{_terminal_safe(item.get('origin') or '—')} → "
                 f"{_terminal_safe(item.get('destination') or '—')}"
-                for item in conflicts
+                for item in shown
             )
-            marks.append(f"⚠ 与 {routes} 日期重叠")
+            more = "等" if conflict_total > len(shown) else ""
+            marks.append(f"⚠ 与 {conflict_total} 条行程日期重叠（{routes}{more}）")
         purpose = _terminal_safe(trip.get("purpose") or "出行")
         line = f"  {dates}  {route}  {' '.join(marks)}".rstrip()
         print(f"{line}  {purpose}")

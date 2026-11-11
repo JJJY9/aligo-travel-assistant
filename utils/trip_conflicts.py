@@ -4,6 +4,7 @@ import logging
 import re
 from collections import Counter
 from datetime import date, datetime
+from itertools import islice
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,12 @@ def filter_trips_by_query(
     return matched
 
 
+# 每条行程最多物化的冲突条目：同一日期导入数千条行程时，逐对物化是
+# O(n²) 引用与序列化体积（5000 条同日行程约 1250 万对，--json 直接 OOM）。
+# 真实重叠数量仍由 conflict_count 精确给出，展示取前 N 条即可。
+_MAX_CONFLICT_ENTRIES = 20
+
+
 def trips_with_conflicts(
     trips: list[dict[str, Any]], pool: list[dict[str, Any]] | None = None
 ) -> list[dict[str, Any]]:
@@ -169,9 +176,12 @@ def trips_with_conflicts(
 
     ``pool`` 用于在一页行程之外计算重叠（如 Web 列表分页时以完整历史为基准）。
 
-    按开始日期排序后用二分定位候选（start ≤ 目标结束），再以结束日期过滤
-    ——全量行程的冲突计算是 O(n log n + 实际重叠对数)，此前逐对比较是
-    O(n²)（几千条历史行程时 CLI 列表 / --json 导出明显卡顿）。
+    返回的每条视图含 ``conflicts``（重叠行程，至多 ``_MAX_CONFLICT_ENTRIES``
+    条，按出发日期排序）与 ``conflict_count``（真实重叠总数）。按开始日期
+    排序后用扫描线统计：每个实例记录插入时已重叠的数量与仍在活动集中的
+    推送数，冲突总数 O(n log n) 精确求出，无需枚举 O(n²) 的每一对；物化
+    只取前 N 条。此前逐对 append 到双方视图，几千条同日行程时列表 / JSON
+    直接卡死或 OOM。
     """
     context = pool if pool is not None else trips
     entries: list[tuple[datetime, datetime, dict[str, Any]]] = []
@@ -184,28 +194,66 @@ def trips_with_conflicts(
     views: list[dict[str, Any]] = []
     view_indices: dict[int, list[int]] = {}
     for index, trip in enumerate(trips):
-        views.append({**trip, "conflicts": []})
+        views.append({**trip, "conflicts": [], "conflict_count": 0})
         view_indices.setdefault(id(trip), []).append(index)
 
-    # 扫描线：按开始日期推进，维护仍在进行的行程堆——每对重叠只枚举一次，
-    # O(n log n + 实际重叠对数)。此前对每个目标都遍历前缀切片，零重叠的
-    # 常见场景仍是 Θ(n²)（几千条历史时 CLI 列表 / --json 明显卡顿）
+    # 扫描线：active_rows 按推送顺序保存仍在进行的行程（取前 N 条即
+    # 「最早开始的重叠行程」）；heap 按结束日期弹出已结束的实例
     active: list[tuple[datetime, int, dict[str, Any]]] = []
-    sequence = 0
+    active_rows: dict[int, dict[str, Any]] = {}
+    active_counts: dict[int, int] = {}
+    insertion_overlap: dict[int, int] = {}
+    counts: dict[int, int] = {}
+    push_epoch = 0
     for start_dt, end_dt, trip in entries:
         while active and active[0][0] < start_dt:
-            heapq.heappop(active)
-        for _other_end, _seq, other in active:
-            if other is trip:
-                continue
-            for view_index in view_indices.get(id(trip), ()):
-                views[view_index]["conflicts"].append(other)
-            for view_index in view_indices.get(id(other), ()):
-                views[view_index]["conflicts"].append(trip)
-        heapq.heappush(active, (end_dt, sequence, trip))
-        sequence += 1
+            _other_end, seq, popped = heapq.heappop(active)
+            active_rows.pop(seq, None)
+            remaining_active = active_counts.get(id(popped), 1) - 1
+            if remaining_active:
+                active_counts[id(popped)] = remaining_active
+            else:
+                active_counts.pop(id(popped), None)
+            # 插入时已重叠的 + 插入后仍在活动集期间推送的 = 本实例的冲突数
+            instance_overlap = insertion_overlap.pop(seq, 0) + (push_epoch - seq)
+            counts[id(popped)] = counts.get(id(popped), 0) + instance_overlap
 
-    for view in views:
+        overlap_now = len(active_rows) - active_counts.get(id(trip), 0)
+        sampled: list[dict[str, Any]] = []
+        if overlap_now > 0:
+            for other in islice(
+                active_rows.values(),
+                _MAX_CONFLICT_ENTRIES + active_counts.get(id(trip), 0),
+            ):
+                if other is trip:
+                    continue
+                sampled.append(other)
+                if len(sampled) >= _MAX_CONFLICT_ENTRIES:
+                    break
+        for other in sampled:
+            for view_index in view_indices.get(id(trip), ()):
+                conflict_list = views[view_index]["conflicts"]
+                if len(conflict_list) < _MAX_CONFLICT_ENTRIES:
+                    conflict_list.append(other)
+            for view_index in view_indices.get(id(other), ()):
+                conflict_list = views[view_index]["conflicts"]
+                if len(conflict_list) < _MAX_CONFLICT_ENTRIES:
+                    conflict_list.append(trip)
+
+        push_epoch += 1
+        insertion_overlap[push_epoch] = overlap_now
+        active_rows[push_epoch] = trip
+        active_counts[id(trip)] = active_counts.get(id(trip), 0) + 1
+        heapq.heappush(active, (end_dt, push_epoch, trip))
+
+    # 仍在活动集中的实例：统计到扫描结束时的推送数
+    while active:
+        _other_end, seq, trip = heapq.heappop(active)
+        instance_overlap = insertion_overlap.pop(seq, 0) + (push_epoch - seq)
+        counts[id(trip)] = counts.get(id(trip), 0) + instance_overlap
+
+    for index, view in enumerate(views):
+        view["conflict_count"] = counts.get(id(trips[index]), 0)
         view["conflicts"].sort(key=_start_sort_value)
     return views
 
