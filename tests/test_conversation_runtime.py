@@ -622,6 +622,104 @@ def test_failed_turn_usage_settled_in_next_turn():
     print("✓ 失败回合的 token 用量并入下一轮落库元数据")
 
 
+def test_cancelled_persist_failure_settles_usage():
+    """取消 + 在途落库失败：本轮用量必须记账（不能假定写线程一定成功）。"""
+    import types
+
+    from config_agentscope import UsageTracker
+    from utils.errors import MemoryPersistenceError
+
+    class _BlockingMemory(_FakeMemory):
+        def __init__(self, fail: bool = False, veto: bool = False) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.fail = fail
+            self.veto = veto
+
+        def persist_turn(self, user_content, assistant_content, should_commit=None):
+            self.started.set()
+            self.release.wait(10)
+            if self.fail:
+                raise MemoryPersistenceError("disk full")
+            if self.veto:
+                return False
+            return super().persist_turn(user_content, assistant_content, should_commit)
+
+    def _run(fail: bool = False, veto: bool = False) -> dict:
+        runtime, _ = _make_runtime()
+        memory = _BlockingMemory(fail=fail, veto=veto)
+        runtime.memory = memory
+        tracker = UsageTracker()
+        runtime.model = types.SimpleNamespace(usage=tracker)
+
+        class _Orchestrator:
+            async def reply(self, intention, on_event=None):
+                tracker.calls += 1
+                tracker.input_tokens += 100
+                tracker.output_tokens += 10
+                return _Response(json.dumps({"results": []}))
+
+        runtime.orchestrator = _Orchestrator()
+
+        async def scenario():
+            task = asyncio.create_task(runtime.ask("第一轮"))
+            await asyncio.to_thread(memory.started.wait, 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            memory.release.set()
+            assert await runtime.drain_pending_persist(timeout_sec=10) is True
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+        return runtime._unsettled_usage or {}
+
+    assert _run(fail=True).get("total_tokens") == 110, "落库失败时必须补记用量"
+    assert _run(fail=False, veto=True).get("total_tokens") == 110, (
+        "墓碑否决同样必须补记用量"
+    )
+    print("✓ 取消 + 落库失败 / 否决时用量记账不漏")
+
+
+def test_cancel_before_persist_settles_usage():
+    """取消发生在记账 try 之前（意图调用中）：用量同样不能丢。"""
+    import types
+
+    from config_agentscope import UsageTracker
+
+    runtime, memory = _make_runtime()
+    tracker = UsageTracker()
+    runtime.model = types.SimpleNamespace(usage=tracker)
+
+    class _SlowIntention:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def reply(self, context):
+            tracker.calls += 1
+            tracker.input_tokens += 70
+            tracker.output_tokens += 7
+            self.entered.set()
+            await asyncio.sleep(30)
+            raise AssertionError("不应走到这里")
+
+    intention = _SlowIntention()
+    runtime.intention_agent = intention
+
+    async def scenario():
+        task = asyncio.create_task(runtime.ask("你好"))
+        await asyncio.wait_for(intention.entered.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert (runtime._unsettled_usage or {}).get("total_tokens") == 77
+    assert memory.staged == [], "未暂存提问，不应有残留"
+    print("✓ 意图阶段取消的用量同样记账")
+
+
 def test_memory_without_rollback_hook_is_tolerated():
     """记忆实现没有 rollback_staged_message 时失败路径照常返回。"""
     runtime, memory = _make_runtime()

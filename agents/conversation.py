@@ -114,10 +114,19 @@ class ConversationRuntime:
         self._probe_recorded = False
         if self.circuit_breaker:
             self.circuit_breaker.raise_if_open()
+        # 本轮用量的归宿标记：_execute_turn 在每个终态（成功落库 / 记账 /
+        # 取消且落库在途托管）置位；早于其内部 try 的取消 / 失败（等待
+        # drain、意图调用等）由这里兜底记账——否则下一轮 usage_before 快照
+        # 会把它们永久减掉，面板与趋势少记
+        settlement = {"done": False}
         try:
             return await self._execute_turn(
-                user_input, on_event, rc, start, usage_before, turn_id
+                user_input, on_event, rc, start, usage_before, turn_id, settlement
             )
+        except BaseException:
+            if not settlement["done"]:
+                self._accumulate_unsettled_usage(self._usage_delta(usage_before))
+            raise
         finally:
             if self.circuit_breaker and not self._probe_recorded:
                 self.circuit_breaker.release_probe()
@@ -130,8 +139,10 @@ class ConversationRuntime:
         start: float,
         usage_before: dict[str, Any] | None,
         turn_id: str = "",
+        settlement: dict[str, bool] | None = None,
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
+        settlement = settlement if settlement is not None else {"done": False}
         self._emit(on_event, {"type": "phase", "phase": "context", "label": "整理记忆与上下文"})
 
         # 多会话写入后保持长期记忆最新（避免覆盖其它会话刚写入的数据）。
@@ -183,6 +194,7 @@ class ConversationRuntime:
         # 编排智能体从短期记忆读取「用户本轮原话」，编排失败 / 用户停止时
         # 长期记忆里不会留下没有回复的孤儿提问（CLI 同款时序）
         persist_started = False
+        pending_persist: asyncio.Future | None = None
         committed: bool | None = None
         usage_value: dict[str, Any] | None = None
         turn_state = {"rollback_requested": False}
@@ -244,6 +256,7 @@ class ConversationRuntime:
                 )
             )
             self._pending_persist = pending
+            pending_persist = pending
             self._last_persist_turn = (user_input, turn_state)
             pending.add_done_callback(
                 lambda fut: self._clear_pending_persist(
@@ -252,7 +265,7 @@ class ConversationRuntime:
             )
             persist_started = True
             committed = await asyncio.shield(pending)
-        except BaseException as exc:
+        except BaseException:
             # 编排失败 / 取消：暂存的用户提问必须跟着回滚——保留的话，重试
             # 同一问题会在上下文里出现两条重复提问，而长期记忆里没有对应
             # 轮次，两层记忆从此不一致。落库线程已在途（用户停止时常常如此）
@@ -260,23 +273,29 @@ class ConversationRuntime:
             if not persist_started or self._pending_persist is None:
                 await self._request_staged_rollback(user_input, turn_state)
             # 本轮用量没有写进任何持久化消息：记账到下一轮成功回合，否则
-            # 下一轮的增量会把它们一起减掉，面板 / 趋势永久少记。
-            # 落库已启动且失败（非取消）时用量确实没落库，同样记账；
-            # 取消时写线程仍会带着 _meta.usage 写完，不重复计。
-            if not persist_started or isinstance(exc, Exception):
-                self._accumulate_unsettled_usage(
-                    usage_value
-                    if usage_value is not None
-                    else self._usage_delta(usage_before)
-                )
+            # 下一轮的增量会把它们一起减掉，面板 / 趋势永久少记。取消时写
+            # 线程可能仍在途——由完成回调按最终结果结算（成功则 _meta.usage
+            # 已随助手消息写入，失败 / 墓碑否决才记账）；先前假定的「取消后
+            # 写线程一定会成功」并不成立（PG 故障 / 会话刚被删除都会失败）
+            pending_usage = (
+                usage_value
+                if usage_value is not None
+                else self._usage_delta(usage_before)
+            )
+            self._settle_usage_after_persist(pending_persist, pending_usage)
+            settlement["done"] = True
             # 在途落库的完成回调会在写入失败 / 守卫否决时补回滚
             raise
         if committed is False:
-            # 存储层在写入锁内判定会话已删除（墓碑否决整轮）：暂存的提问也
-            # 按删除语义回滚，避免墓碑随后被撤销（删除失败）时上下文里留下
-            # 一条永远不会落库、也没有回答的孤立提问。本轮用量同样记账。
-            await self._request_staged_rollback(user_input, turn_state)
+            # 存储层在写入锁内判定会话已删除（墓碑否决整轮）：本轮用量先
+            # 记账（回滚过程中若再被取消，账目也不会随局部变量丢失），
+            # 暂存的提问按删除语义回滚，避免墓碑随后被撤销（删除失败）时
+            # 上下文里留下一条永远不会落库、也没有回答的孤立提问。
             self._accumulate_unsettled_usage(usage_value)
+            await self._request_staged_rollback(user_input, turn_state)
+        # 成功落库（True / 旧的 None 语义）时 _meta.usage 已在消息里；
+        # 否决分支已记账——本轮用量已有归宿
+        settlement["done"] = True
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
@@ -568,6 +587,35 @@ class ConversationRuntime:
         self._unsettled_usage = add_usage(
             getattr(self, "_unsettled_usage", None), usage
         )
+
+    def _settle_usage_after_persist(
+        self,
+        pending: asyncio.Future | None,
+        usage: dict[str, Any] | None,
+    ) -> None:
+        """按落库最终结果结算本轮用量（可在完成回调线程 / 事件循环中调用）。
+
+        - ``pending`` 为 None：本轮从未启动落库，直接记账；
+        - 落库仍在途：挂完成回调，按最终结果结算（取消场景）；
+        - 落库成功（含旧的 None 语义）：_meta.usage 已随助手消息写入，不重复计；
+        - 落库失败 / 被取消 / 墓碑否决：本轮用量没有任何归宿，记账到下一轮。
+        """
+        if not usage:
+            return
+        if pending is not None and not pending.done():
+            pending.add_done_callback(
+                lambda fut: self._settle_usage_after_persist(fut, usage)
+            )
+            return
+        written = False
+        if pending is not None and not pending.cancelled():
+            try:
+                outcome = pending.result()
+            except Exception:  # noqa: BLE001 - 落库失败由记账兜底
+                outcome = False
+            written = outcome is not False
+        if not written:
+            self._accumulate_unsettled_usage(usage)
 
     def _drain_unsettled_usage(
         self, usage: dict[str, Any] | None
