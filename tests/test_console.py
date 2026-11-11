@@ -80,6 +80,39 @@ def test_auto_decode_bom_encodings():
     print("✓ BOM 输入（utf-8-sig / UTF-16）")
 
 
+def test_auto_decode_nul_and_bomless_utf16le():
+    """NUL 行不能原样穿过（exit\\0 不等于 exit）；BOM-less UTF-16LE 按字符解出。"""
+    assert _decode_all(b"exit\x00\n") == "exit\n"
+    assert _decode_all("北京\n".encode("utf-16-le")) == "北京\n"
+    print("✓ NUL 剔除与 BOM-less UTF-16LE 解码")
+
+
+def test_stdin_fallback_prefers_locale_under_pythonutf8(monkeypatch):
+    """PYTHONUTF8=1 时 stream.encoding 已是 utf-8，回退必须改用 locale 编码。"""
+    import sys
+
+    import utils.console as console_module
+
+    class _FakeInput:
+        encoding = "utf-8"
+        buffer = _PipeBuffer(b"")
+        peek = buffer.peek
+
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _FakeInput())
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    monkeypatch.setattr(
+        "locale.getpreferredencoding", lambda do_setlocale=False: "cp936"
+    )
+    console_module.configure_stdio()
+    assert isinstance(sys.stdin, console_module._AutoDecodeInput)
+    assert sys.stdin._fallback == "cp936", sys.stdin._fallback
+    print("✓ PYTHONUTF8 下 stdin 回退使用 locale 编码")
+
+
 def test_readline_line_by_line():
     from utils.console import _AutoDecodeInput
 

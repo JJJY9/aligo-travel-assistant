@@ -99,13 +99,34 @@ class _AutoDecodeInput:
 
     def _decode_line(self, raw: bytes) -> str:
         if self._mode == "utf-8-sig":
-            return raw.decode("utf-8-sig", errors="replace")
-        for candidate in ("utf-8", self._fallback):
-            try:
-                return raw.decode(candidate)
-            except UnicodeDecodeError:
-                continue
-        return raw.decode("utf-8", errors="replace")
+            line = raw.decode("utf-8-sig", errors="replace")
+        else:
+            line = ""
+            if b"\x00" in raw and len(raw) % 2 == 0:
+                # BOM-less UTF-16LE（Node 的 Buffer utf16le、部分 .NET 写出）：
+                # ASCII 字符高位是 0x00，按 UTF-8 解出来全是 NUL。只有解出的
+                # 文本全为可打印字符（含换行）才认定为 UTF-16LE——否则像
+                # "exit\0\n" 这种普通 UTF-8 行会被错误配对成 CJK 乱码
+                try:
+                    candidate = raw.decode("utf-16-le")
+                except UnicodeDecodeError:
+                    candidate = ""
+                if candidate and "\x00" not in candidate and all(
+                    char in "\n\r\t" or char.isprintable() for char in candidate
+                ):
+                    line = candidate
+            if not line:
+                for candidate_encoding in ("utf-8", self._fallback):
+                    try:
+                        line = raw.decode(candidate_encoding)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    line = raw.decode("utf-8", errors="replace")
+        # NUL 不是命令行文本：残留时剔除（否则 "exit\0" 不匹配 exit，
+        # 会被当成自然语言查询连同 NUL 发给模型）
+        return line.replace("\x00", "")
 
     def _try_decode(self, raw: bytes) -> str | None:
         """严格解码（不做替换）；用来判断字节块末尾是否切断了多字节字符。"""
@@ -391,7 +412,23 @@ def configure_stdio(probe_stdin: bool = True) -> None:
     buffer = getattr(stream, "buffer", None)
     if buffer is None or not callable(getattr(buffer, "readline", None)):
         return
-    fallback = getattr(stream, "encoding", None) or "utf-8"
+    fallback = getattr(stream, "encoding", None) or ""
+    normalized = fallback.lower().replace("-", "").replace("_", "")
+    if not normalized or normalized in {"utf8", "utf"}:
+        # PYTHONUTF8 / PYTHONIOENCODING=utf-8 时 stream.encoding 已是 utf-8：
+        # 拿它当回退等于没有回退，GBK 管道字节永远解不出来、被替换成乱码。
+        # 回退改为 locale 编码（Windows 常见 cp936）
+        try:
+            import locale
+
+            locale_fallback = locale.getpreferredencoding(False) or ""
+        except Exception:  # noqa: BLE001 - 探测失败退回 utf-8
+            locale_fallback = ""
+        locale_normalized = locale_fallback.lower().replace("-", "").replace("_", "")
+        if locale_fallback and locale_normalized not in {"utf8", "utf"}:
+            fallback = locale_fallback
+    if not fallback:
+        fallback = "utf-8"
     try:
         sys.stdin = _AutoDecodeInput(buffer, fallback)
     except Exception:  # noqa: BLE001 - 包装失败保持原流

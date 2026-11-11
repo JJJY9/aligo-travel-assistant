@@ -1304,9 +1304,12 @@ class AligoCLI:
                             user_input = Prompt.ask("\n[cyan]>[/cyan]")
                         finally:
                             interrupt["at_prompt"] = False
-                    except (RuntimeError, ValueError) as exc:
+                    except (RuntimeError, ValueError, OSError) as exc:
+                        # stdin 读取失败（控制台句柄失效 / pty 断开）不能
+                        # 立即重试：无退避会刷屏并打满 CPU，永远到不了 EOF
                         self.console.print(
-                            f"\n无法读取输入（{exc}），已退出", style="dim"
+                            f"\n无法读取输入（{escape(str(exc))}），已退出",
+                            style="dim",
                         )
                         break
 

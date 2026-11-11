@@ -864,6 +864,33 @@ def test_preference_display_tolerates_unhashable_type():
     print("✓ 偏好回显跳过非字符串 type（不再 TypeError）")
 
 
+def test_prompt_oserror_exits_instead_of_hot_loop(monkeypatch):
+    """stdin 读取抛 OSError（句柄失效 / pty 断开）时退出，不能刷屏热循环。"""
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    calls = {"n": 0}
+
+    def boom(prompt, **kwargs):
+        calls["n"] += 1
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr(cli.Prompt, "ask", boom)
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    asyncio.run(agent.run())
+    assert calls["n"] == 1, "读失败必须退出而不是无退避热循环"
+    assert "无法读取输入" in buffer.getvalue()
+    print("✓ stdin OSError 干净退出（不热循环）")
+
+
 def test_closed_stdout_pipe_does_not_traceback():
     """`| head` 提前关闭 stdout：交互模式也不打 traceback / 非零退出。"""
     proc = subprocess.Popen(
