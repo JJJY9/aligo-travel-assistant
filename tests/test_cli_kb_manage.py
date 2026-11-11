@@ -269,6 +269,36 @@ def test_search_empty_and_error(monkeypatch):
     print("✓ kb-search 无结果 / 检索失败")
 
 
+def test_list_and_search_strip_terminal_controls(monkeypatch):
+    """列表预览与检索结果里的 ESC / OSC 不能原样送达终端。"""
+    evil = "内容\x1b]52;c;QUJD\x07尾巴"
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset, query: {
+            "total": 1,
+            "items": [
+                {"id": 9, "content": evil, "metadata": {"category": evil}}
+            ],
+        },
+    )
+    code, out = _capture(cli.run_knowledge_list_standalone, "")
+    assert code == 0 and "\x1b" not in out and "\x07" not in out
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "search_documents",
+        lambda query, top_k=5: [
+            {"id": 9, "content": evil, "metadata": {"category": evil}}
+        ],
+    )
+    code, out = _capture(cli.run_knowledge_search_standalone, evil)
+    assert code == 0 and "\x1b" not in out and "\x07" not in out
+    assert "内容" in out and "尾巴" in out
+    print("✓ kb-list / kb-search 剥离终端控制序列")
+
+
 def test_kb_search_args(monkeypatch):
     assert cli._parse_kb_search_args(["住宿"]) == ("住宿", 5, False)
     assert cli._parse_kb_search_args(["住宿", "标准", "--top-k", "3"]) == (
@@ -346,6 +376,26 @@ def test_show_success_and_json(monkeypatch):
     data = json.loads(out)
     assert data["group"] == "g-abc" and data["parts"] == 3
     print("✓ kb-show 文本 / JSON 输出（整篇拼接）")
+
+
+def test_show_strips_terminal_controls(monkeypatch):
+    """知识内容里的 ESC / OSC 不能原样送达终端（kb-show）。"""
+    document = {
+        "id": 8,
+        "group": "g-evil",
+        "parts": 1,
+        "size": 30,
+        "content": "正常知识\x1b]52;c;QUJD\x07后续",
+    }
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin, "get_document_group", lambda doc_id: document
+    )
+    code, out = _capture(cli.run_knowledge_show_standalone, 8)
+    assert code == 0
+    assert "\x1b" not in out and "\x07" not in out
+    assert "正常知识" in out and "后续" in out
+    print("✓ kb-show 剥离终端控制序列")
 
 
 def test_show_missing_and_error(monkeypatch):
@@ -1018,6 +1068,8 @@ if __name__ == "__main__":
         test_kb_search_dispatch,
         test_show_unavailable,
         test_show_success_and_json,
+        test_show_strips_terminal_controls,
+        test_list_and_search_strip_terminal_controls,
         test_show_missing_and_error,
         test_show_marks_legacy_and_missing_parts,
         test_delete_legacy_multi_part_message,

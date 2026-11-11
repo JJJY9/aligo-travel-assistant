@@ -2145,8 +2145,12 @@ def run_knowledge_list_standalone(
     print(f"共 {total} 条{suffix}，显示前 {len(items)} 条（按 id 倒序）")
     for item in items:
         meta = item.get("metadata") or {}
-        category = meta.get("category") or meta.get("title") or ""
-        preview = " ".join(str(item.get("content", "")).split())[:60]
+        category = _terminal_safe(
+            meta.get("category") or meta.get("title") or ""
+        )
+        preview = _terminal_safe(
+            " ".join(str(item.get("content", "")).split())[:60]
+        )
         tag = f" · {category}" if category else ""
         chunk = ""
         try:
@@ -2265,13 +2269,20 @@ def run_knowledge_search_standalone(
         )
         return 0
     if not results:
-        print(f"没有与「{query}」相关的内容")
+        print(f"没有与「{_terminal_safe(query)}」相关的内容")
         return 0
-    print(f"语义检索「{query}」：{len(results)} 条结果（按相似度排序）")
+    print(
+        f"语义检索「{_terminal_safe(query)}」：{len(results)} 条结果"
+        "（按相似度排序）"
+    )
     for item in results:
         metadata = item.get("metadata") or {}
-        category = metadata.get("category") or metadata.get("title") or ""
-        preview = " ".join(str(item.get("content", "")).split())[:60]
+        category = _terminal_safe(
+            metadata.get("category") or metadata.get("title") or ""
+        )
+        preview = _terminal_safe(
+            " ".join(str(item.get("content", "")).split())[:60]
+        )
         bits: list[str] = []
         if item.get("id") is not None:
             bits.append(f"#{item['id']}")
@@ -2346,11 +2357,13 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
             label = f"分片 {part_no}/{parts}" if part_no else f"分片（共 {parts} 片）"
             meta.append(f"{label}（旧数据无 group，无法拼接整篇）")
     if group:
-        meta.append(f"group {group}")
+        meta.append(f"group {_terminal_safe(group)}")
     meta.append(f"{size} 字")
     print(" · ".join(meta))
     print()
-    print(content)
+    # 知识内容可经 Web 新增 / 备份导入写入 ESC / OSC（schema 不拦控制字符）：
+    # 原样 print 会在支持的终端里执行剪贴板写入 / 清屏 / 伪造链接
+    print(_terminal_safe(content))
     return 0
 
 
