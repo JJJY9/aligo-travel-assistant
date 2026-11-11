@@ -1068,11 +1068,17 @@ class LongTermMemory:
             key = _identity(row)
             existing = index.get(key) if key is not None else None
             if existing is not None:
-                for field in ("purpose", "session_id"):
+                for field in ("purpose",):
                     value = row.get(field)
                     if value is not None:
                         existing[field] = value
-                existing["timestamp"] = datetime.now().isoformat()
+                # session_id 键存在即覆盖（含显式 None：备份恢复时该会话
+                # 已被删除 / 命中墓碑，需要清除关联）；键缺失保留原值
+                if "session_id" in row:
+                    existing["session_id"] = row.get("session_id")
+                existing["timestamp"] = (
+                    row.get("timestamp") or datetime.now().isoformat()
+                )
                 updated += 1
                 continue
             max_number += 1

@@ -15,7 +15,7 @@ import re
 from collections import Counter
 from typing import Any
 
-from utils.timestamps import chronological_key, localize_naive, parse_iso_datetime
+from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
 import os
 
@@ -441,16 +441,27 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if problem:
             errors.append(f"跳过第 {index} 条行程：{problem}")
             continue
-        trips.append(
-            {
-                "origin": origin,
-                "destination": destination,
-                "start_date": start_date,
-                "end_date": end_date,
-                "purpose": purpose,
-                "session_id": session_id,
-            }
-        )
+        trip_record: dict[str, Any] = {
+            "origin": origin,
+            "destination": destination,
+            "start_date": start_date,
+            "end_date": end_date,
+            "purpose": purpose,
+        }
+        # 只在备份确实带有关联时写入 session_id：drop_sessions 显式置 None
+        # 表示「清除关联」，与「备份本来没有关联」必须区分（否则恢复会
+        # 清掉目标库里既有行程的会话链接）
+        if ok and session_id:
+            trip_record["session_id"] = session_id
+        # 保留备份里的 trip_id / timestamp（导出格式两种后端都有）：恢复后
+        # 编号与创建时间与备份一致，而不是全部重新编号为 trip_N / 恢复时刻
+        trip_id_raw = str(row.get("trip_id") or "").strip()
+        if re.fullmatch(r"trip_\d+", trip_id_raw):
+            trip_record["trip_id"] = trip_id_raw
+        record_timestamp = _normalize_timestamp(row.get("timestamp"))
+        if record_timestamp:
+            trip_record["timestamp"] = record_timestamp
+        trips.append(trip_record)
     sections["trips"] = trips
 
     messages: list[dict[str, Any]] = []
@@ -488,14 +499,9 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
                 "timestamp": _normalize_timestamp(row.get("timestamp")),
             }
         )
-    # 按时间升序写入（无时间戳的排最后）：多会话恢复后转录顺序与会话
-    # updated_at 都保持与备份一致
-    messages.sort(
-        key=lambda message: (
-            message["timestamp"] is None,
-            chronological_key(message["timestamp"]),
-        )
-    )
+    # 保持备份里的消息顺序：备份由导出按存储顺序写出，会话内提问 / 回答
+    # 有序；全局按时间重排时无时间戳的旧消息会被排到末尾（恢复后会话里
+    # 先显示回答再显示提问）。逐会话顺序由 add_chat_messages 原样追加
     sections["messages"] = messages
     session_ids = {m["session_id"] for m in messages if m["session_id"]}
 
