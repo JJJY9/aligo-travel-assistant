@@ -128,6 +128,21 @@ def test_stdout_and_overwrite_protection(monkeypatch):
     print("✓ trip-calendar --stdout 与覆盖保护")
 
 
+def test_unparsable_end_notice(monkeypatch):
+    """返程日期无法解析：日历按单日导出，但输出提示（不再静默截断）。"""
+    target = os.path.join(tempfile.mkdtemp(), "trip.ics")
+    code, out, _ = _run(
+        monkeypatch,
+        "u1",
+        "trip_1",
+        [_trip(end_date="2026/12/20")],
+        target=target,
+    )
+    assert code == 0
+    assert "返程日期无法解析" in out
+    print("✓ trip-calendar 返程无法解析时提示")
+
+
 def test_invalid_ids_and_store_failure(monkeypatch):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -205,6 +220,7 @@ if __name__ == "__main__":
         test_export_single_trip_ics(mp)
         test_missing_and_ambiguous_trip_rejected(mp)
         test_trip_without_start_date_rejected(mp)
+        test_unparsable_end_notice(mp)
         test_stdout_and_overwrite_protection(mp)
         test_invalid_ids_and_store_failure(mp)
         test_main_dispatch_trip_calendar(mp)

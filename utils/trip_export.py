@@ -14,6 +14,9 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from utils.console import strip_terminal_controls
+from utils.json_safe import sanitize_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,8 +64,20 @@ def _needs_quote_guard(text: str) -> bool:
     return text[index:].startswith(_FORMULA_PREFIXES)
 
 
+def _clean_trip_value(value: object) -> str:
+    """渲染前的字段清洗：孤立代理项转义（避免写文件时 UnicodeEncodeError），
+    换行归一（CRLF / CR → LF，与身份口径一致），再剥离终端控制序列
+    （ESC / OSC 会在终端执行剪贴板写入等操作）。
+
+    存储里的行程字段是用户 / 模型输入，不可信；CSV / ICS / HTML 与
+    ``--stdout`` 输出都必须经过这里。保留制表符与换行。
+    """
+    text = sanitize_json(str(value if value is not None else ""))
+    return strip_terminal_controls(normalize_identity_text(text))
+
+
 def _csv_safe(value: object) -> str:
-    text = str(value or "")
+    text = _clean_trip_value(value)
     return "'" + text if _needs_quote_guard(text) else text
 
 
@@ -144,7 +159,19 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     start = _ics_date(trip.get("start_date") or "")
     if not start:
         return None
-    end = _ics_date(trip.get("end_date") or "") or start
+    raw_end = trip.get("end_date")
+    end = _ics_date(raw_end or "")
+    if raw_end and not end:
+        # 与「结束早于出发」一致留下告警：否则多日行程静默截成单日，
+        # 用户把文件导入日历后才发现少了一天
+        logger.warning(
+            "行程 %s 的返程日期无法解析（%r），日历按单日导出",
+            trip.get("trip_id"),
+            raw_end,
+        )
+        end = start
+    if not end:
+        end = start
     if end < start:
         logger.warning("行程结束日期早于出发日期，按单日处理: %s", trip.get("trip_id"))
         end = start
@@ -155,19 +182,19 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     except OverflowError:
         end_exclusive = end
 
-    origin = str(trip.get("origin") or "出发地")
-    destination = str(trip.get("destination") or "目的地")
-    purpose = str(trip.get("purpose") or "出行")
+    origin = _clean_trip_value(trip.get("origin") or "出发地")
+    destination = _clean_trip_value(trip.get("destination") or "目的地")
+    purpose = _clean_trip_value(trip.get("purpose") or "出行")
     summary = f"{origin} → {destination}（{purpose}）"
     # DESCRIPTION 是 trips-import 的机器可读来源：必须用原始值（占位符只
     # 出现在给人看的 SUMMARY 里），否则空出发地在往返后会变成字面量「出发地」，
     # 去重键随之改变并重复新增行程
     description = (
-        f"Aligo 行程：{escape_ics_machine_field(str(trip.get('origin') or ''))} → "
-        f"{escape_ics_machine_field(str(trip.get('destination') or ''))}，"
+        f"Aligo 行程：{escape_ics_machine_field(_clean_trip_value(trip.get('origin')))} → "
+        f"{escape_ics_machine_field(_clean_trip_value(trip.get('destination')))}，"
         f"{normalize_identity_date(trip.get('start_date'))} ~ "
         f"{normalize_identity_date(trip.get('end_date') or trip.get('start_date'))}，"
-        f"{str(trip.get('purpose') or '')}"
+        f"{_clean_trip_value(trip.get('purpose'))}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     # UID 同时包含行程内容：删除最新行程后 id 可能被复用，仅用 trip_id
@@ -176,8 +203,9 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
         [
             user_id,
             str(trip.get("trip_id") or "trip"),
-            origin,
-            destination,
+            # 只用于摘要：转义后的值保证不会把换行带进 UID 行
+            _ics_escape(origin),
+            _ics_escape(destination),
             str(trip.get("start_date") or ""),
             str(trip.get("end_date") or ""),
         ]
@@ -256,7 +284,7 @@ def render_trips_html(trips: list[dict[str, Any]], user_id: str) -> str:
     import html as _html
 
     def esc(value: object) -> str:
-        return _html.escape(str(value if value is not None else ""))
+        return _html.escape(_clean_trip_value(value))
 
     def sort_key(trip: dict[str, Any]) -> tuple[str, str]:
         # trip_id 是 "trip_N" 字符串：同一天内按 id 文本倒序即可，不能 int()。
@@ -332,3 +360,22 @@ def render_trips_ics(trips: list[dict[str, Any]], user_id: str) -> str:
         if event is not None
     ]
     return _ics_calendar(events)
+
+
+def count_ics_events(text: str) -> int:
+    """统计 iCalendar 文本里的真实事件数。
+
+    必须先按 RFC 5545 展开折行（续行以单个空格开头）再按整行匹配：字段
+    内容折行后可能恰好产生续行 `` BEGIN:VEVENT``，``splitlines`` +
+    ``strip()`` 会把它算成第二个事件，导出条数被凭空放大、跳过提示被吞掉。
+    """
+    unfolded = text.replace("\r\n ", "")
+    return sum(
+        1 for line in unfolded.splitlines() if line.strip() == "BEGIN:VEVENT"
+    )
+
+
+def trip_ics_end_unparsable(trip: dict[str, Any]) -> bool:
+    """返程日期存在但无法解析：ICS 会按单日导出，CLI 需要提示用户。"""
+    raw_end = trip.get("end_date")
+    return bool(raw_end) and _ics_date(str(raw_end)) is None

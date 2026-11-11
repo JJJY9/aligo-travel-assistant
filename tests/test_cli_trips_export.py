@@ -474,6 +474,66 @@ def test_export_status_filter(monkeypatch):
     print("✓ trips-export 按状态过滤")
 
 
+def test_export_csv_warns_about_unimportable_rows(monkeypatch):
+    """CSV 含导入端会整行拒绝的脏日期：导出时明确告警，不静默丢行程。"""
+    import tempfile
+
+    fake = _FakeStore(
+        [
+            _trip("上海", "2026-12-05", "2026-12-07"),
+            _trip("杭州", "2026-12-05", "2026/12/20"),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    target = os.path.join(tempfile.mkdtemp(), "trips.csv")
+    code, out = _run("u1", target=target)
+    assert code == 0
+    assert "回导时有 1 行会被跳过" in out, out
+    print("✓ trips-export CSV 回导告警")
+
+
+def test_export_ics_stdout_reports_skipped(monkeypatch):
+    """--ics --stdout 跳过无出发日期行程时向 stderr 提示，而不是静默空日历。"""
+
+    class _BytesStdout:
+        def __init__(self):
+            self.buffer = io.BytesIO()
+
+        def flush(self):
+            pass
+
+        def fileno(self):
+            return 1
+
+    fake = _FakeStore([_trip(), {"destination": "无日期"}])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    sink = _BytesStdout()
+    err = io.StringIO()
+    real_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", sink)
+    try:
+        with contextlib.redirect_stderr(err):
+            code = cli.run_trips_export_standalone("u1", to_stdout=True, ics=True)
+    finally:
+        monkeypatch.setattr(sys, "stdout", real_stdout)
+    data = sink.buffer.getvalue().decode("utf-8")
+    assert code == 0
+    assert data.count("BEGIN:VEVENT") == 1
+    assert "跳过 1 条缺少出发日期" in err.getvalue()
+    print("✓ trips-export --ics --stdout 跳过提示走 stderr")
+
+
+def test_export_stdout_strips_terminal_controls(monkeypatch):
+    """--stdout 导出剥离终端控制序列（ESC / OSC 不送达终端）。"""
+    fake = _FakeStore([_trip("上海\x1b]52;c;QUJD\x07")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    code, out = _run("u1", to_stdout=True)
+    assert code == 0
+    assert "\x1b" not in out and "\x07" not in out
+    assert "上海" in out
+    print("✓ trips-export --stdout 剥离控制序列")
+
+
 def test_export_status_arg_parsing():
     """--status 只对 trips-export 生效，非法状态按用法错误拒绝。"""
     assert cli._parse_export_args(["--status", "past"], allow_ics=True) == (
@@ -511,6 +571,9 @@ if __name__ == "__main__":
         test_export_html,
         test_main_dispatch_html_and_conflict,
         test_export_status_filter,
+        test_export_csv_warns_about_unimportable_rows,
+        test_export_ics_stdout_reports_skipped,
+        test_export_stdout_strips_terminal_controls,
     ):
         mp = pytest.MonkeyPatch()
         try:

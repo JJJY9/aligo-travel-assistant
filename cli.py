@@ -4244,7 +4244,13 @@ def run_trips_export_standalone(
     from pathlib import Path
 
     from utils.trip_conflicts import filter_trips_by_query, trip_state_label
-    from utils.trip_export import render_trips_csv, render_trips_html, render_trips_ics
+    from utils.trip_export import (
+        count_ics_events,
+        render_trips_csv,
+        render_trips_html,
+        render_trips_ics,
+        trip_ics_end_unparsable,
+    )
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -4273,16 +4279,18 @@ def run_trips_export_standalone(
         trips = [trip for trip in trips if trip_state_label(trip) == status_label]
 
     skipped = 0
+    truncated_end = 0
+    roundtrip_errors: list[tuple[int, str]] = []
+    roundtrip_total = 0
     safe_user = _safe_export_user(user_id)
     if ics:
         text = render_trips_ics(trips, user_id)
         default_name = f"aligo_{safe_user}_trips.ics"
-        # 按整行统计：行程字段（SUMMARY / DESCRIPTION）里出现的同名字符串
-        # 不能把导出条数放大、让"跳过 N 条"失真
-        exported = sum(
-            1 for line in text.splitlines() if line.strip() == "BEGIN:VEVENT"
-        )
+        # 按展开折行后的整行统计：字段内容折行产生的 `` BEGIN:VEVENT``
+        # 续行不能把导出条数放大、让"跳过 N 条"失真
+        exported = count_ics_events(text)
         skipped = max(0, len(trips) - exported)
+        truncated_end = sum(1 for trip in trips if trip_ics_end_unparsable(trip))
     elif html:
         text = render_trips_html(trips, user_id)
         default_name = f"aligo_{safe_user}_trips.html"
@@ -4291,6 +4299,15 @@ def run_trips_export_standalone(
         text = render_trips_csv(trips)
         default_name = f"aligo_{safe_user}_trips.csv"
         exported = len(trips)
+        # 用真实导入解析器检查回导：脏日期（格式非法 / 返程早于出发）与
+        # 超长字段的行导入时会被整行跳过，导出侧必须提前告警，否则迁移 /
+        # 换机恢复时静默丢行程
+        from utils.trip_import import parse_trips_csv
+
+        _, roundtrip_errors = parse_trips_csv(text)
+        roundtrip_total = getattr(
+            roundtrip_errors, "total", len(roundtrip_errors)
+        )
     if to_stdout:
         if ics:
             # ICS 行尾已是 \r\n：文本模式在 Windows 会再次翻译；优先写字节
@@ -4315,6 +4332,12 @@ def run_trips_export_standalone(
                 _print_stdout(text, end="")
         else:
             _print_stdout(text, end="")
+        # --stdout 下 stdout 只能有导出内容：跳过 / 回导告警走 stderr，
+        # 否则空日历 + 退出码 0 会被脚本当成导出成功
+        for note in _trip_export_notes(
+            skipped, truncated_end, roundtrip_errors, roundtrip_total
+        ):
+            print(f"注意：{note}", file=sys.stderr)
         return 0
 
     path = Path(target) if target else Path("exports") / default_name
@@ -4334,9 +4357,34 @@ def run_trips_export_standalone(
     filter_note = f"，筛选「{needle}」" if needle else ""
     if status_label:
         filter_note += f"，状态「{status_label}」"
-    skipped_note = f"，跳过 {skipped} 条缺少出发日期" if skipped else ""
-    print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}{skipped_note}")
+    print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}")
+    for note in _trip_export_notes(
+        skipped, truncated_end, roundtrip_errors, roundtrip_total
+    ):
+        print(f"注意：{note}")
     return 0
+
+
+def _trip_export_notes(
+    skipped: int,
+    truncated_end: int,
+    roundtrip_errors: list[tuple[int, str]],
+    roundtrip_total: int,
+) -> list[str]:
+    """导出后的数据质量提示（跳过 / 截断 / 回导会被拒绝的行）。"""
+    notes: list[str] = []
+    if skipped:
+        notes.append(f"跳过 {skipped} 条缺少出发日期（日历中不会出现）")
+    if truncated_end:
+        notes.append(
+            f"{truncated_end} 条行程的返程日期无法解析，日历按单日导出"
+        )
+    if roundtrip_total:
+        reasons = "；".join(
+            f"第{row}行：{reason}" for row, reason in roundtrip_errors[:3]
+        )
+        notes.append(f"导出文件回导时有 {roundtrip_total} 行会被跳过（{reasons}）")
+    return notes
 
 
 _TRIP_ADD_FLAGS = ("--origin", "--destination", "--start", "--end", "--purpose")
@@ -4361,7 +4409,11 @@ def run_trip_calendar_standalone(
     import re
     from pathlib import Path
 
-    from utils.trip_export import render_trips_ics
+    from utils.trip_export import (
+        count_ics_events,
+        render_trips_ics,
+        trip_ics_end_unparsable,
+    )
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -4393,12 +4445,15 @@ def run_trip_calendar_standalone(
         print(f"行程 {trip_id} 不存在")
         return 1
     text = render_trips_ics(matches, user_id)
-    exported = sum(
-        1 for line in text.splitlines() if line.strip() == "BEGIN:VEVENT"
-    )
+    exported = count_ics_events(text)
     if not exported:
         print(f"行程 {trip_id} 缺少出发日期，无法导出日历")
         return 1
+    truncated_note = (
+        "注意：返程日期无法解析，日历按单日导出"
+        if trip_ics_end_unparsable(matches[0])
+        else ""
+    )
     if to_stdout:
         buffer = getattr(sys.stdout, "buffer", None)
         if buffer is not None:
@@ -4417,8 +4472,9 @@ def run_trip_calendar_standalone(
                     pass
         else:
             _print_stdout(text, end="")
+        if truncated_note:
+            print(truncated_note, file=sys.stderr)
         return 0
-
     # 不同用户的 trip_id 都是 trip_1 起步：默认文件名带上（清洗后的）用户 ID，
     # 与 sessions-export 同一做法，避免跨用户同名导出互相覆盖 / 误报已存在
     path = (
@@ -4436,6 +4492,8 @@ def run_trip_calendar_standalone(
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出行程 {trip_id} 的日历到 {path}（iCalendar）")
+    if truncated_note:
+        print(truncated_note)
     return 0
 
 
@@ -5286,10 +5344,13 @@ def run_trips_list_standalone(
         header = f"用户 {user_id}：共 {len(views)} 条行程（新→旧）"
     print(header)
     for trip in reversed(views):
-        start = trip.get("start_date") or "日期未记录"
-        end = trip.get("end_date") or ""
+        start = _terminal_safe(trip.get("start_date") or "日期未记录")
+        end = _terminal_safe(trip.get("end_date") or "")
         dates = f"{start} ~ {end}" if end and end != start else str(start)
-        route = f"{trip.get('origin') or '—'} → {trip.get('destination') or '—'}"
+        route = (
+            f"{_terminal_safe(trip.get('origin') or '—')} → "
+            f"{_terminal_safe(trip.get('destination') or '—')}"
+        )
         marks = []
         state = trip_state_label(trip)
         if state:
@@ -5297,11 +5358,12 @@ def run_trips_list_standalone(
         conflicts = trip.get("conflicts") or []
         if conflicts:
             routes = "、".join(
-                f"{item.get('origin') or '—'} → {item.get('destination') or '—'}"
+                f"{_terminal_safe(item.get('origin') or '—')} → "
+                f"{_terminal_safe(item.get('destination') or '—')}"
                 for item in conflicts
             )
             marks.append(f"⚠ 与 {routes} 日期重叠")
-        purpose = trip.get("purpose") or "出行"
+        purpose = _terminal_safe(trip.get("purpose") or "出行")
         line = f"  {dates}  {route}  {' '.join(marks)}".rstrip()
         print(f"{line}  {purpose}")
     return 0

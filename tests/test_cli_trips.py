@@ -240,6 +240,18 @@ def test_trips_list_output(monkeypatch):
     print("✓ trips 列表输出（顺序 / 状态 / 重叠）")
 
 
+def test_trips_list_strips_terminal_controls(monkeypatch):
+    """行程字段里的 ESC / OSC 不能原样送达终端（列表输出同样清洗）。"""
+    store = _FakeStore(
+        [_trip("上海\x1b]52;c;QUJD\x07", "2026-12-05", "2026-12-07")]
+    )
+    code, out = _run_list(monkeypatch, store)
+    assert code == 0
+    assert "\x1b" not in out and "\x07" not in out
+    assert "上海" in out
+    print("✓ trips 列表剥离终端控制序列")
+
+
 def test_trips_list_empty(monkeypatch):
     code, out = _run_list(monkeypatch, _FakeStore([]))
     assert code == 0
@@ -1207,6 +1219,7 @@ if __name__ == "__main__":
         test_trips_with_conflicts_uses_pool_without_mutation,
         test_trips_list_json,
         test_trips_list_output,
+        test_trips_list_strips_terminal_controls,
         test_trips_list_empty,
         test_trips_list_read_failure,
         test_trips_list_open_failure,
