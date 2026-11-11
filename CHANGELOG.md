@@ -45,6 +45,9 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 行程导出与列表输出统一清洗不可信字段：`trips` / `trips-export` / `trip-calendar` 的终端文本与 `--stdout` 输出此前原样携带 ESC / OSC 序列（可写剪贴板、伪造链接），历史 JSON 里的孤立代理项还会让导出在编码时抛 `UnicodeEncodeError`（CSV 目标文件被截成 0 字节）。现在 CSV / ICS / HTML 渲染与列表输出都在写出前剥离控制序列、转义孤立代理项并归一行分隔符（与身份口径一致，往返不改变去重键）
+- ICS 导出条数先展开折行再计数：字段内容折行后产生的续行可能恰好是 ` BEGIN:VEVENT`，此前按 `splitlines` 后 `strip` 计数会把它算成第二个事件，导出条数被虚增、`跳过 N 条` 提示被吞掉。现在按 RFC 5545 展开续行后按整行匹配
+- 导出的数据质量提示不再静默：`trips-export` 的 CSV 用真实导入解析器检查回导，含导入端会整行拒绝的脏日期（格式非法 / 返程早于出发）或超长字段时明确告警——此前换机迁移时这些行程会被静默跳过；ICS 返程日期无法解析时告警并按单日导出（`trip-calendar` 同样提示）。`--stdout` 模式下跳过与回导告警一律走 stderr，不再用退出码 0 的空日历伪装成功
 - 行程身份口径统一（存储去重 / 导入预览 / 去重命令 / 保存后定位）：此前只有 `trips-import` 的身份键做 CRLF→LF 归一，存储层 `_find_same_trip`、`save_trip_histories` 与 `trips-dedupe` 仍按原始字符串比较——同一趟行程仅换行写法不同（ICS 回导是最常见来源）会被当成新行程重复导入，且官方去重命令永远清不掉这些重复对。现在四处共用 `normalize_identity_text`（JSON 与 PostgreSQL 后端一致，PG 查询用 REPLACE 归一后比较）；`find_saved_trip` 同步按身份口径归一日期与路线，命中未补零历史行的保存不再把自己报成日期冲突
 - trip-add 未提供 `--purpose` 时不再写默认「出差」：命中同路线同日期的既有行程时，存储层会无条件用该默认值覆盖用户改过的目的（导入路径一直保留原值，两条写入口径不一致）。现在未提交目的字段——既有行程保留原目的，新建行程也不臆造该字段（展示层按「出行」兜底）
 - CLI 参数错误的 `--json` 契约覆盖全部一次性命令：`stats` / `user-import` / `trip-add` / `trip-update` / `trip-delete` / `trips` / `trips-dedupe` / `trips-import` / `health` / `doctor` / `eval` / `weather` 的用法错误此前在 dispatch 层直接打印纯文本并以 2 退出——同一命令的运行期错误输出 `{ok: false, error}`，脚本 `... | jq .error` 在真实进程入口解析失败。现在带 `--json` 时用法错误同样输出合法 JSON（`ok: false` + 用法文本），纯文本模式行为不变；`trips-import` 的 `--JSON` / `--ICS` / `--DRY-RUN` 改为大小写不敏感；`trips --json` 在没有任何行程时也输出 `query` / `status` 字段（与有行程时同形状）

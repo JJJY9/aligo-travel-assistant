@@ -255,6 +255,71 @@ def test_unpadded_dates_normalized_in_exports():
     print("✓ 未补零日期导出补零（CSV / ICS 往返不丢行程）")
 
 
+def test_render_strips_controls_and_surrogates():
+    """ESC / OSC 与孤立代理项字段：渲染不崩溃、输出无控制序列且可编码。"""
+    trip = {
+        "trip_id": "t-ctrl",
+        "origin": "\ud800北京",
+        "destination": "上海\x1b]52;c;QUJD\x07",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-06",
+        "purpose": "出差",
+    }
+    for text in (
+        render_trips_csv([trip]),
+        render_trips_ics([trip], "u1"),
+        render_trips_html([trip], "u1"),
+    ):
+        assert "\x1b" not in text, "终端控制序列必须剥离"
+        assert "\x07" not in text
+        text.encode("utf-8")  # 历史数据里的孤立代理项不能抛 UnicodeEncodeError
+    print("✓ 导出渲染剥离控制序列并转义孤立代理项")
+
+
+def test_count_ics_events_unfolds_before_counting():
+    """折行续行恰好是「 BEGIN:VEVENT」时按展开后的整行计数，不虚增。"""
+    from utils.trip_export import count_ics_events
+
+    trip = {
+        "trip_id": "t-fold",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-07",
+        "purpose": "AABEGIN:VEVENT",
+    }
+    text = render_trips_ics([trip], "u1")
+    raw = sum(1 for line in text.splitlines() if line.strip() == "BEGIN:VEVENT")
+    assert raw >= 2, "前提：折行续行恰好等于事件标记（旧口径会数成 2 个）"
+    assert count_ics_events(text) == 1
+    print("✓ ICS 事件计数先展开折行再按整行匹配")
+
+
+def test_ics_unparsable_end_warns(caplog=None):
+    """返程日期无法解析：日历按单日导出，但必须留告警（不再静默截断）。"""
+    import logging
+
+    from utils.trip_export import trip_ics_end_unparsable
+
+    trip = {
+        "trip_id": "t-end",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026/12/20",
+    }
+    assert trip_ics_end_unparsable(trip)
+    if caplog is not None:
+        with caplog.at_level(logging.WARNING):
+            text = render_trips_ics([trip], "u1")
+        assert "无法解析" in caplog.text
+    else:
+        text = render_trips_ics([trip], "u1")
+    assert "DTSTART;VALUE=DATE:20261205" in text
+    assert "DTEND;VALUE=DATE:20261206" in text
+    print("✓ 返程日期无法解析时告警并按单日导出")
+
+
 if __name__ == "__main__":
     test_header_and_rows()
     test_formula_prefix_neutralized()
@@ -268,4 +333,7 @@ if __name__ == "__main__":
     test_many_leading_quotes_do_not_recurse()
     test_unpadded_dates_normalized_in_exports()
     test_trips_html_normalizes_unpadded_dates()
+    test_render_strips_controls_and_surrogates()
+    test_count_ics_events_unfolds_before_counting()
+    test_ics_unparsable_end_warns()
     print("\n全部通过")
