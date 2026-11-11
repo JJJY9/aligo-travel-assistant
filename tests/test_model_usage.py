@@ -99,6 +99,28 @@ def test_per_session_tracking_is_independent():
     print("✓ 每个会话的用量计数相互独立")
 
 
+def test_add_usage_merges_numeric_fields():
+    """未结算用量的合并：任一侧缺失字段按 0 起算，None 两侧原样返回。"""
+    from utils.usage import add_usage
+
+    assert add_usage(None, None) is None
+    assert add_usage({"calls": 1}, None) == {"calls": 1}
+    assert add_usage(None, {"calls": 1, "total_tokens": 5}) == {
+        "calls": 1,
+        "total_tokens": 5,
+    }
+    assert add_usage({"calls": 2, "total_tokens": 10}, {"calls": 1, "total_tokens": 5}) == {
+        "calls": 3,
+        "total_tokens": 15,
+    }
+    # 任一侧缺字段：按 0 起算，不丢键
+    assert add_usage({"calls": 1}, {"total_tokens": 5}) == {
+        "calls": 1,
+        "total_tokens": 5,
+    }
+    print("✓ add_usage 合并未结算用量")
+
+
 if __name__ == "__main__":
     test_tracks_usage()
     test_missing_usage_counts_call_only()
@@ -106,4 +128,5 @@ if __name__ == "__main__":
     test_factory_returns_tracked_model()
     test_snapshot_delta()
     test_per_session_tracking_is_independent()
+    test_add_usage_merges_numeric_fields()
     print("\n全部通过")
