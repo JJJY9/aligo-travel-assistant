@@ -1080,9 +1080,20 @@ def test_export_sanitizes_surrogate_and_non_finite():
                 "session_id": "s1",
                 "timestamp": "2026-01-01T00:00:01",
             },
+            {
+                # 旧数据形态：assistant 内容是 JSON 文本，内部转义出真代理项；
+                # 渲染时会 json.loads 还原，出口必须再次转义（否则会话详情 500）
+                "role": "assistant",
+                "content": (
+                    '{"results":[{"agent_name":"A","status":"success",'
+                    '"data":{"answer":"坏\\ud800答"}}],"status":"completed"}'
+                ),
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:02",
+            },
         ],
         "trip_history": [],
-        "statistics": {"total_messages": 2, "avg": float("inf")},
+        "statistics": {"total_messages": 3, "avg": float("inf")},
     }
     path.write_text(json_module.dumps(data), encoding="utf-8")
     client = _client()
@@ -1093,6 +1104,16 @@ def test_export_sanitizes_surrogate_and_non_finite():
         contents = [item["content"] for item in payload["chat_history"]]
         assert any("\\ud800" in content for content in contents), contents
         assert payload["statistics"]["avg"] is None
+
+        # 会话详情 / 列表：渲染后的 content 与标题必须可 UTF-8 传输
+        detail = client.get("/api/sessions/s1", params={"user_id": user_id})
+        assert detail.status_code == 200, detail.text[:300]
+        for message in detail.json()["messages"]:
+            message["content"].encode("utf-8")
+        listing = client.get("/api/sessions", params={"user_id": user_id})
+        assert listing.status_code == 200, listing.text[:300]
+        for item in listing.json()["sessions"]:
+            str(item.get("title", "")).encode("utf-8")
 
         response = client.get(
             "/api/export", params={"user_id": user_id, "format": "md"}
@@ -1107,6 +1128,11 @@ def test_export_sanitizes_surrogate_and_non_finite():
             f"/api/sessions/s1/export?user_id={user_id}&format=html"
         )
         assert response.status_code == 200, response.text[:300]
+        md_export = client.get(
+            f"/api/sessions/s1/export?user_id={user_id}&format=md"
+        )
+        assert md_export.status_code == 200, md_export.text[:300]
+        md_export.text.encode("utf-8")
     finally:
         path.unlink(missing_ok=True)
     print("✓ 导出清洗孤立代理项与 NaN（JSON / Markdown / 会话导出）")

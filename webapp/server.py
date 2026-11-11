@@ -3088,14 +3088,18 @@ def create_app(model: Any = None) -> FastAPI:
             "only" if archived else "exclude",
         )
         total = len(sessions)
-        return {
-            "sessions": sessions[offset : offset + limit],
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "archived": archived,
-            "archived_count": _archived_count(data),
-        }
+        # 旧记忆 / 手写文件里的标题与首条消息可能含孤立代理项：列表响应
+        # 序列化失败会让侧栏整个打不开，出口统一转义
+        return _json_safe_value(
+            {
+                "sessions": sessions[offset : offset + limit],
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "archived": archived,
+                "archived_count": _archived_count(data),
+            }
+        )
 
     @app.get("/api/sessions/export")
     def export_sessions(
@@ -3176,27 +3180,29 @@ def create_app(model: Any = None) -> FastAPI:
                 if message.get("role") == "user":
                     title = " ".join(str(message.get("content", "")).split())[:40]
                     break
-        return {
-            "session_id": session_id,
-            "title": title or "新对话",
-            "archived": session_id in archived_ids,
-            "messages": [
-                {
-                    "role": message.get("role", "assistant"),
-                    "content": _render_stored_message(message),
-                    # 旧数据 / 手写记忆文件里的 _meta 可能含 NaN：原样放进
-                    # 响应会让 JSON 序列化（allow_nan=False）失败、该会话
-                    # 每次打开都 500，这里统一归一为 None
-                    "meta": _json_safe_value(
-                        extract_turn_meta(str(message.get("content", "")))
-                    )
-                    if message.get("role") == "assistant"
-                    else None,
-                    "timestamp": message.get("timestamp", ""),
-                }
-                for message in messages
-            ],
-        }
+        return _json_safe_value(
+            {
+                "session_id": session_id,
+                "title": title or "新对话",
+                "archived": session_id in archived_ids,
+                "messages": [
+                    {
+                        "role": message.get("role", "assistant"),
+                        "content": _render_stored_message(message),
+                        # 旧数据 / 手写记忆文件里的 _meta 可能含 NaN：原样放进
+                        # 响应会让 JSON 序列化（allow_nan=False）失败、该会话
+                        # 每次打开都 500，这里统一归一为 None
+                        "meta": _json_safe_value(
+                            extract_turn_meta(str(message.get("content", "")))
+                        )
+                        if message.get("role") == "assistant"
+                        else None,
+                        "timestamp": message.get("timestamp", ""),
+                    }
+                    for message in messages
+                ],
+            }
+        )
 
     @app.put("/api/sessions/{session_id}/title")
     def rename_session(

@@ -57,11 +57,27 @@ def test_render_failure_falls_back_to_raw_content(monkeypatch):
     print("✓ 渲染异常安全回退原文")
 
 
+def test_render_escapes_lone_surrogates():
+    """旧 JSON 文本里的 \\ud800 在渲染出口转义，会话详情 / 导出不再 500。"""
+    content = (
+        '{"results":[{"agent_name":"A","status":"success",'
+        '"data":{"answer":"坏\\ud800答"}}],"status":"completed"}'
+    )
+    rendered = render_stored_message({"role": "assistant", "content": content})
+    rendered.encode("utf-8")  # 未转义会抛 UnicodeEncodeError
+    assert chr(0xD800) not in rendered
+    assert "\\ud800" in rendered, rendered
+    user = render_stored_message({"role": "user", "content": "坏" + chr(0xD800)})
+    user.encode("utf-8")
+    print("✓ 渲染出口转义孤立代理项（JSON / 用户原文）")
+
+
 if __name__ == "__main__":
     test_user_message_is_raw()
     test_assistant_plain_text_is_raw()
     test_assistant_orchestration_json_rendered()
     test_assistant_bad_json_falls_back()
+    test_render_escapes_lone_surrogates()
     _mp = pytest.MonkeyPatch()
     try:
         test_render_failure_falls_back_to_raw_content(_mp)
