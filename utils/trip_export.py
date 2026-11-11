@@ -39,6 +39,16 @@ def normalize_identity_date(value: Any) -> str:
     return f"{match.group(1)}-{month:02d}-{day:02d}"
 
 
+def normalize_identity_text(value: Any) -> str:
+    """行程文本字段的身份归一：CRLF / CR 统一为 LF（不改变其它内容）。
+
+    ICS 往返会把换行还原成 LF，而 CSV 与手动录入可能保留 CRLF：存储去重、
+    导入预览与去重命令必须用同一口径，否则同一趟行程因换行写法不同被当成
+    两条记录（导入回导时重复新增，且去重命令清不掉）。
+    """
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _needs_quote_guard(text: str) -> bool:
     """以公式字符开头，或去掉任意个前导引号后仍需防护（保证导入端可逆）。
 

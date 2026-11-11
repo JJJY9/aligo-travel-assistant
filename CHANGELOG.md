@@ -45,6 +45,8 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 行程身份口径统一（存储去重 / 导入预览 / 去重命令 / 保存后定位）：此前只有 `trips-import` 的身份键做 CRLF→LF 归一，存储层 `_find_same_trip`、`save_trip_histories` 与 `trips-dedupe` 仍按原始字符串比较——同一趟行程仅换行写法不同（ICS 回导是最常见来源）会被当成新行程重复导入，且官方去重命令永远清不掉这些重复对。现在四处共用 `normalize_identity_text`（JSON 与 PostgreSQL 后端一致，PG 查询用 REPLACE 归一后比较）；`find_saved_trip` 同步按身份口径归一日期与路线，命中未补零历史行的保存不再把自己报成日期冲突
+- trip-add 未提供 `--purpose` 时不再写默认「出差」：命中同路线同日期的既有行程时，存储层会无条件用该默认值覆盖用户改过的目的（导入路径一直保留原值，两条写入口径不一致）。现在未提交目的字段——既有行程保留原目的，新建行程也不臆造该字段（展示层按「出行」兜底）
 - CLI 参数错误的 `--json` 契约覆盖全部一次性命令：`stats` / `user-import` / `trip-add` / `trip-update` / `trip-delete` / `trips` / `trips-dedupe` / `trips-import` / `health` / `doctor` / `eval` / `weather` 的用法错误此前在 dispatch 层直接打印纯文本并以 2 退出——同一命令的运行期错误输出 `{ok: false, error}`，脚本 `... | jq .error` 在真实进程入口解析失败。现在带 `--json` 时用法错误同样输出合法 JSON（`ok: false` + 用法文本），纯文本模式行为不变；`trips-import` 的 `--JSON` / `--ICS` / `--DRY-RUN` 改为大小写不敏感；`trips --json` 在没有任何行程时也输出 `query` / `status` 字段（与有行程时同形状）
 - JSON 长期记忆迁移的统计一致性：`chat_history` / `trip_history` 整体类型损坏被清空、或统计段整体缺失时，此前只把计数器补 0（或保留旧值）而不按列表重建——面板同时显示「历史 0 条」与「消息 120 / 上海 ×9」。现在列表被清空 / 丢弃坏条目时同步重算 `total_messages` / `total_trips` 并按当前行程重建 `frequent_destinations`；统计段缺失时按现有列表重建；同一 type 的重复偏好迁移时保留最后一条（此前写路径只更新第一条、`get_preference()` 取最后一条，覆盖后仍读到旧值）
 - 出行天数按日期区间并集：同一长差旅中顺路加一趟、历史重复行程等重叠数据的同一天此前被重复计数（面板 / `cli stats` 的出行天数大于实际离家天数）；现在按并集统计。到访城市与 `statistics.frequent_destinations` 口径对齐：两者都只统计出发日期可解析的行程（此前「常去目的地」把日期非法的僵尸行程也算成到访城市，而概览 `cities=0` 忽略它们）

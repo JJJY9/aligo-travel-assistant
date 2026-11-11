@@ -130,6 +130,44 @@ def test_conflict_order_uses_parsed_dates():
     print("✓ 冲突列表按解析后的日期排序")
 
 
+def test_find_saved_trip_normalizes_identity_fields():
+    """历史行未补零日期 / CRLF 路线仍能定位本次保存的记录（不与自己重叠）。"""
+    from utils.trip_conflicts import find_saved_trip
+
+    trip = {
+        "trip_id": "trip_1",
+        "origin": "北京\r\n西城",
+        "destination": "a\rb\r\nc",
+        "start_date": "2026-1-5",
+        "end_date": "2026-1-6",
+    }
+    record = {
+        "origin": "北京\n西城",
+        "destination": "a\nb\nc",
+        "start_date": "2026-01-05",
+        "end_date": "2026-01-06",
+    }
+    assert find_saved_trip([trip], "trip_1", record) is trip
+
+    # 记录缺返程（同日行程）与历史行显式同日等价
+    same_day = {
+        "trip_id": "trip_2",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-01-05",
+        "end_date": "2026-01-05",
+    }
+    assert (
+        find_saved_trip(
+            [same_day],
+            "trip_2",
+            {"origin": "北京", "destination": "上海", "start_date": "2026-01-05"},
+        )
+        is same_day
+    )
+    print("✓ find_saved_trip 按身份口径归一日期 / 换行")
+
+
 def test_find_saved_trip_distinguishes_origin():
     """同 trip_id、同日同目的地但出发地不同：按出发地定位本次保存的那条。"""
     from utils.trip_conflicts import find_saved_trip
@@ -185,6 +223,7 @@ if __name__ == "__main__":
     test_optimized_matches_naive()
     test_large_history_fast_and_correct()
     test_conflict_order_uses_parsed_dates()
+    test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
     test_inverted_date_range_is_logged()
     print("\n全部通过")

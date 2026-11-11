@@ -4461,14 +4461,15 @@ def run_trip_add_standalone(
     destination: str,
     start_date: str,
     end_date: str | None = None,
-    purpose: str = "出差",
+    purpose: str | None = None,
     as_json: bool = False,
 ) -> int:
     """保存一条行程（`python cli.py trip-add ... [--json]`）。
 
     与 Web 面板 / 对话写入同一存储路径：同路线同日期视为同一趟行程（更新
-    既有记录而不是追加），并提示与其它行程的日期重叠。``--json`` 输出结构化
-    结果（trip_id / created / conflicts）。
+    既有记录而不是追加），并提示与其它行程的日期重叠。``--purpose`` 未提供
+    时不写目的字段——命中既有行程时保留用户此前的目的（与导入路径口径一致）。
+    ``--json`` 输出结构化结果（trip_id / created / conflicts）。
 
     Returns:
         0 保存成功；1 参数 / 读取 / 写入失败
@@ -4497,7 +4498,7 @@ def run_trip_add_standalone(
     for label, value in (
         ("出发地", origin),
         ("目的地", destination),
-        ("目的", purpose),
+        ("目的", purpose or ""),
     ):
         if len(value) > 100:
             return _fail(f"{label}不能超过 100 字（当前 {len(value)} 字）")
@@ -4526,8 +4527,9 @@ def run_trip_add_standalone(
             "destination": destination,
             "start_date": start_date,
             "end_date": end_date,
-            "purpose": purpose or "出差",
         }
+        if purpose:
+            record["purpose"] = purpose
         try:
             trip_id = store.save_trip_history(record)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -6062,7 +6064,7 @@ def main():
                     trip_values["destination"],
                     trip_values["start"],
                     trip_values.get("end"),
-                    trip_values.get("purpose", "出差"),
+                    trip_values.get("purpose"),
                     as_json=parsed_trip_add["as_json"],
                 )
             )

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from utils.trip_export import (
     _needs_quote_guard,
     normalize_identity_date,
+    normalize_identity_text,
     unescape_ics_machine_field,
 )
 
@@ -55,13 +56,8 @@ def _normalize_header(cell: str) -> str:
 
 
 def _normalize_trip_text(value: Any) -> str:
-    """行程字段的行分隔符归一（``\r\n`` / ``\r`` → ``\n``）。
-
-    ICS 导出把换行转义成 ``\n`` 再还原成 ``\n``：身份键用原始字符串时，
-    含 CR 的行程回导后被当成新行程（重复新增）；CSV 路径保留 CRLF，两条
-    路径必须同一口径。
-    """
-    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    """行程字段的行分隔符归一（保留名；口径见 ``normalize_identity_text``）。"""
+    return normalize_identity_text(value)
 
 
 def trip_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:

@@ -773,7 +773,7 @@ class PostgresLongTermMemory:
         count = len(trips)
         if not count:
             return 0, 0
-        from utils.trip_import import normalize_identity_date
+        from utils.trip_import import normalize_identity_date, normalize_identity_text
 
         def _key(
             destination: Any, origin: Any, start_date: Any, end_date: Any
@@ -782,7 +782,12 @@ class PostgresLongTermMemory:
                 return None
             start_key = normalize_identity_date(start_date)
             end_key = normalize_identity_date(end_date) or start_key
-            return (str(destination), str(origin or ""), start_key, end_key)
+            return (
+                normalize_identity_text(destination),
+                normalize_identity_text(origin),
+                start_key,
+                end_key,
+            )
 
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
             # 连接中途重建会换掉同一把 advisory lock 的持有者：快照（索引 /
@@ -1041,14 +1046,22 @@ class PostgresLongTermMemory:
         origin = str(trip_info.get("origin") or "")
         end_date = str(trip_info.get("end_date") or start_date)
         if destination and start_date:
-            from utils.trip_import import normalize_identity_date
+            from utils.trip_import import normalize_identity_date, normalize_identity_text
 
             # 历史行可能是未补零日期（2026-1-5），SQL 等值比较会把补零后的
-            # 导入当成新行程：按路线取出候选行，在 Python 侧归一日期再比对
+            # 导入当成新行程：按路线取出候选行，在 Python 侧归一日期再比对。
+            # 路线字段同样按存储身份口径（CRLF / CR → LF）归一后比较，否则
+            # 换行写法不同的同一趟行程会被重复插入
             candidates = self._fetchall(
                 "SELECT id, trip_id, start_date, end_date FROM aligo_trips "
-                "WHERE user_id = %s AND destination = %s AND COALESCE(origin, '') = %s",
-                (self.user_id, destination, origin),
+                "WHERE user_id = %s "
+                "AND REPLACE(REPLACE(destination, E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s "
+                "AND REPLACE(REPLACE(COALESCE(origin, ''), E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s",
+                (
+                    self.user_id,
+                    normalize_identity_text(destination),
+                    normalize_identity_text(origin),
+                ),
             )
             # 候选快照跨连接重建即失效：空档里其它实例可能已插入同行程 /
             # 删掉候选行，按旧快照更新或插入会造出重复

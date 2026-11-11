@@ -83,6 +83,22 @@ def test_plan_keeps_earliest_and_normalizes_dates():
     print("✓ 去重计划保留最早并归一日期的身份")
 
 
+def test_plan_matches_linebreak_variants():
+    """仅 CRLF / CR 换行写法不同的同路线行程视为重复（与导入身份同一口径）。"""
+    store = _Store(
+        [
+            _trip("t1", destination="a\rb\r\nc"),
+            _trip("t2", destination="a\nb\nc"),
+            _trip("t3", destination="a b c"),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["total_trips"] == 3
+    assert plan["groups_with_duplicates"] == 1
+    assert plan["duplicate_entries"] == [("t1", "t2")]
+    print("✓ 去重身份按行分隔符归一")
+
+
 def test_plan_skips_group_when_kept_row_vanished():
     """保留项已被并发删除：整组跳过，避免把仅剩副本也删掉。"""
     store = _Store(
@@ -208,6 +224,7 @@ def test_apply_removes_when_unchanged_with_verify():
 
 if __name__ == "__main__":
     test_plan_keeps_earliest_and_normalizes_dates()
+    test_plan_matches_linebreak_variants()
     test_plan_skips_group_when_kept_row_vanished()
     test_plan_reports_ambiguous_ids_separately()
     test_plan_ignores_rows_without_start_date()

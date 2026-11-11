@@ -15,7 +15,7 @@ from typing import Any
 
 import logging
 
-from utils.trip_import import normalize_identity_date
+from utils.trip_import import normalize_identity_date, normalize_identity_text
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,8 @@ def _identity(trip: dict[str, Any]) -> tuple[str, str, str, str] | None:
     if not start_date:
         return None
     return (
-        str(trip.get("origin") or ""),
-        str(trip.get("destination") or ""),
+        normalize_identity_text(trip.get("origin")),
+        normalize_identity_text(trip.get("destination")),
         start_date,
         normalize_identity_date(trip.get("end_date") or start_date),
     )
