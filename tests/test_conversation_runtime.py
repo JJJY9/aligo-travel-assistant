@@ -73,6 +73,9 @@ class _FakeMemory:
         self.threads["persist-user"] = threading.get_ident()
         self.threads["add-assistant"] = threading.get_ident()
         self.persist_guard = should_commit
+        if should_commit is not None and not should_commit():
+            # 写锁内判定会话已删除：整轮不写（与真实存储层语义一致）
+            return False
         self.events.append(("user", user_content))
         self.events.append(("assistant", assistant_content))
         return True
@@ -140,6 +143,7 @@ def test_ask_runs_memory_io_off_event_loop():
 
     assert result["reply"]
     assert result["elapsed"] >= 0
+    assert result["persisted"] is True, "正常回合必须标记为已写入长期记忆"
     for name in ("reload", "preferences", "recent", "stage-user", "persist-user", "add-assistant"):
         assert name in memory.threads, f"{name} 未被调用"
         assert memory.threads[name] != loop_thread, (
@@ -189,6 +193,7 @@ def test_persist_veto_rolls_back_staged_question():
     memory.persist_turn = _veto  # type: ignore[method-assign]
     result = asyncio.run(runtime.ask("你好"))
     assert result["reply"]
+    assert result["persisted"] is False, "墓碑否决的回合必须透传未落库状态"
     assert memory.rolled_back == ["你好"], "被否决的整轮不能留下孤立提问"
     assert memory.staged == []
     print("✓ 落库守卫否决后回滚暂存提问")
@@ -204,6 +209,7 @@ def test_persist_guard_reaches_memory_write():
     runtime._persist_guard = guard
     result = asyncio.run(runtime.ask("你好"))
     assert result["reply"]
+    assert result["persisted"] is False
     assert memory.persist_guard is guard
     print("✓ 落库守卫传递到记忆写入")
 

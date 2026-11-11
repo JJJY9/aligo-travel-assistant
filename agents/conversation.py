@@ -97,7 +97,7 @@ class ConversationRuntime:
         Returns:
             {"reply": Markdown 文本, "agents": [{name, status}],
              "usage": {calls, input_tokens, output_tokens, total_tokens, time} | None,
-             "elapsed": 秒}
+             "elapsed": 秒, "persisted": 是否已写入长期记忆}
         """
         rc = RESILIENCE_CONFIG
         start = time.time()
@@ -265,6 +265,9 @@ class ConversationRuntime:
             "agents": agents,
             "usage": usage,
             "elapsed": elapsed,
+            # 落库结果要透传给客户端：墓碑否决（committed=False）时回答
+            # 并没有写入历史，调用方不能把它当成功（Web 会提示"本轮未保存"）
+            "persisted": committed is not False,
         }
 
     async def _request_staged_rollback(

@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- Web 聊天透传落库结果：`ConversationRuntime.ask` 返回 `persisted`，SSE `done` 与 `/api/chat` 响应一并携带——会话在其它窗口 / 终端删除、落库被共享墓碑否决时，此前仍发 done 且返回 200，前端把未落库的回答当已保存（删除「临时」标记、出现编辑 / 重新生成入口、刷新后该轮消失）；现在 `persisted:false` 时前端保留临时标记、切回新对话并提示「会话已在其它窗口或终端删除，本轮回答未保存」，`applyTurnPersistence` 统一处理 done / 停止 / 否决三种终态（Node 桩 + 浏览器实测）
 - 默认关闭 OpenAI SDK 内建重试：`create_chat_model` 的 `max_retries` 默认值 2 → 0——SDK 重试与应用层 `retry_with_backoff`（4 次尝试）叠加时，一次逻辑调用最坏发出 12 个完整 prompt 请求，单轮可阻塞十分钟级并全程持有用户会话锁；SDK 内部重试对用量统计不可见，超时重试在上游已生成后仍会计费。应用层重试仍是唯一入口，裸调用可在调用处显式传值
 - 会话详情 / 列表 / 导出统一转义渲染输出：旧记忆或手写文件里的 assistant 内容若是 JSON 文本且内部带 `\ud800`，`render_stored_message` 的 `json.loads` 会把它还原成真代理项——`GET /api/sessions/{id}` 与导出在 UTF-8 序列化时抛 UnicodeEncodeError，该会话永久 500（停止后的前端对账会因此误判「未落库」并把原文塞回输入框，重发产生重复问答）；现在渲染出口统一 `sanitize_json`，会话详情与列表响应整体转义，Markdown / HTML / 合集导出同一口径
 - PostgreSQL 单条读改写补跨重连防护：`update_trip` 的「冲突检查 + UPDATE」、单条行程保存的「候选检查 + INSERT」与 `append_preference` 的「读 + 合并 + 写」都在 advisory lock 内先读后写；连接闪断时 `_reconnect` 只重放失败语句并重新获取锁，释放到重获的空档里其它实例可完成自己的读改写，本调用按过期快照写入会造出重复行程 / 覆盖别人的偏好更新。现在捕获连接身份，读快照后检测到重建即按持久化失败中止（与批量保存同一口径），由调用方重试
