@@ -789,6 +789,29 @@ async function scenarioDecode(source) {
   return results;
 }
 
+async function scenarioSessionExportHtml(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __downloads = [];
+    __toasts = [];
+    downloadFromApi = (url, filename) => {
+      __downloads.push({ url, filename });
+      return Promise.resolve(true);
+    };
+    cancelPendingEdits = () => true;
+    toast = (text) => __toasts.push(text);
+    state.sessionId = "s1";
+    state.userId = "u1";
+  `);
+  await run("exportSessionHtml()");
+  await run("new Promise((resolve) => setTimeout(resolve, 0))");
+  return {
+    downloads: run("__downloads.slice()"),
+    toasts: run("__toasts.slice()"),
+  };
+}
+
 function scenarioTripsExport(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1463,6 +1486,8 @@ async function main() {
     payload = await scenarioArbitrate(source);
   } else if (scenario === "decode") {
     payload = await scenarioDecode(source);
+  } else if (scenario === "sessionExportHtml") {
+    payload = await scenarioSessionExportHtml(source);
   } else if (scenario === "tripsExport") {
     payload = scenarioTripsExport(source);
   } else if (scenario === "tripsDedupe") {

@@ -535,6 +535,56 @@ def test_preference_payload_with_extra_keys_does_not_write_garbage():
     print("✓ 偏好包裹层的说明键不落库也不进后续上下文")
 
 
+def test_deferred_memory_only_written_after_commit():
+    """真实编排器：defer_memory 只暂存，commit 后才写行程。"""
+    memory = _StubMemory()
+
+    class _EventAgent(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "status": "success",
+                        "destination": "杭州",
+                        "start_date": "2026-03-11",
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class _PlanAgent(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {"itinerary": {"title": "T"}}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "event_collection": _EventAgent("event_collection"),
+            "itinerary_planning": _PlanAgent("itinerary_planning"),
+        },
+        memory_manager=memory,
+    )
+    schedule = [
+        {"agent_name": "event_collection", "priority": 1},
+        {"agent_name": "itinerary_planning", "priority": 1},
+    ]
+    asyncio.run(orchestrator.reply(_intent(schedule), defer_memory=True))
+    assert memory.long_term.get_trip_history() == [], (
+        "defer_memory=True 时不能立即写台账"
+    )
+    asyncio.run(orchestrator.commit_deferred_memory())
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1 and trips[0]["destination"] == "杭州", trips
+    print("✓ 延迟记忆写入只在 commit 后落库（真实编排器）")
+
+
 def test_memory_update_preference_and_trip():
     """偏好覆盖 / 追加与行程写入"""
     memory = _StubMemory()
@@ -2466,6 +2516,7 @@ if __name__ == "__main__":
     test_preference_name_variants_persist_and_dedupe()
     test_agent_result_surrogates_sanitized_before_persist()
     test_preference_payload_with_extra_keys_does_not_write_garbage()
+    test_deferred_memory_only_written_after_commit()
     test_memory_update_preference_and_trip()
     test_memory_update_legacy_preferences_and_custom_backend()
     test_failed_preference_result_not_persisted()
