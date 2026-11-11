@@ -1213,28 +1213,37 @@ def test_group_member_ids_scans_all_batches(monkeypatch):
     print("✓ 组内分片跨多个迭代批次扫描")
 
 
-def test_import_restore_over_limit_skips_document(monkeypatch):
-    """备份还原超过上限时按无效项跳过（不静默截断、也不阻断整份备份）。"""
+def test_import_restore_over_limit_segments_document(monkeypatch):
+    """备份还原超过上限时按上限分段导入（不静默截断、不阻断整份备份）。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
 
+    calls: list[list[dict]] = []
+
     class _Agent:
         def add_documents(self, documents):
-            raise AssertionError("超限备份不应进入写入")
+            calls.append(list(documents))
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
     monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 500)
-    part_text = "长" * 300
+    # 每片使用不同字符，避免分段后的尾片与前面的片同文被内容去重
+    part_text = "".join(chr(0x4E00 + index) for index in range(300))
     documents = [
         {"content": part_text, "metadata": {"group": "g", "part": "1", "parts": "2"}},
         {"content": part_text, "metadata": {"group": "g", "part": "2", "parts": "2"}},
     ]
     result = knowledge_admin.import_documents(documents)
-    assert result["imported"] == 0
-    assert result["skipped_invalid"] == 1
-    print("✓ 超限备份按无效项跳过（不静默截断、不阻断其余文档）")
+    stored = [doc["content"] for batch in calls for doc in batch]
+    assert result["skipped_invalid"] == 0, result
+    assert "".join(stored) == part_text + part_text, "超限备份内容必须完整保留"
+    print("✓ 超限备份按上限分段导入（不静默截断、不阻断其余文档）")
 
 
 def test_add_document_enforces_doc_size_limit(monkeypatch):
@@ -1345,20 +1354,28 @@ def test_import_restore_strips_padding(monkeypatch):
     print("✓ 还原时空白被丢弃（文档大小按实体内容计）")
 
 
-def test_import_restore_oversize_document_skipped_not_aborting(monkeypatch):
-    """超限的还原文档计入 invalid 并跳过，不再让整份备份导入失败。"""
+def test_import_restore_oversize_document_segmented_not_dropped(monkeypatch):
+    """超限的还原文档按上限分段导入：备份内容完整保留，不再整篇丢弃。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
     monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
     monkeypatch.setattr(knowledge_admin, "DOC_MAX_CHARS", 100)
 
+    calls: list[list[dict]] = []
+
     class _Agent:
         def add_documents(self, documents):
-            raise AssertionError("超限文档不应进入写入")
+            calls.append(list(documents))
+            return {
+                "status": "success",
+                "ids": list(range(len(documents))),
+                "total_count": len(documents),
+            }
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
-    pieces = ["x"] * 101  # 实体内容 101 字 > 上限 100
+    # 唯一字符避免分段后尾片与前面的片同文被去重
+    pieces = [chr(0x4E00 + index) for index in range(101)]  # 实体内容 101 字 > 上限 100
     documents = [
         {
             "content": piece,
@@ -1367,9 +1384,12 @@ def test_import_restore_oversize_document_skipped_not_aborting(monkeypatch):
         for index, piece in enumerate(pieces)
     ]
     result = knowledge_admin.import_documents(documents)
-    assert result["imported"] == 0
-    assert result["skipped_invalid"] == 1, result
-    print("✓ 超限还原文档跳过并计数（不中断整份备份）")
+    stored = [doc["content"] for batch in calls for doc in batch]
+    assert result["skipped_invalid"] == 0, result
+    assert result["imported"] == len(stored), result
+    assert len(stored) >= 2, stored
+    assert "".join(stored) == "".join(pieces), "分段后内容必须完整保留"
+    print("✓ 超限还原文档按上限分段导入（内容不丢失）")
 
 
 def test_list_and_export_hold_write_lock(monkeypatch):
@@ -2806,12 +2826,12 @@ if __name__ == "__main__":
         test_import_completes_group_with_duplicate_pieces,
         test_import_restores_large_group_without_truncation,
         test_group_member_ids_scans_all_batches,
-        test_import_restore_over_limit_skips_document,
+        test_import_restore_over_limit_segments_document,
         test_add_document_enforces_doc_size_limit,
         test_update_document_enforces_joined_size_limit,
         test_import_restore_many_short_parts_not_rejected,
         test_import_restore_strips_padding,
-        test_import_restore_oversize_document_skipped_not_aborting,
+        test_import_restore_oversize_document_segmented_not_dropped,
         test_import_partial_group_repairs_missing_parts,
         test_update_document_rejects_post_chunk_oversize,
         test_update_document_scans_old_group_before_writes,
