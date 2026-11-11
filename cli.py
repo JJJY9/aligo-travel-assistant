@@ -2396,10 +2396,52 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
+        # 损坏文件被隔离后存储以空快照启动：读到的全 0 不是「这个用户没有
+        # 数据」，直接按成功返回会让备份 / 清理脚本误判，必须显式报告
+        corrupt_backup = getattr(store, "get_recovered_corrupt_backup", None)
+        quarantined = corrupt_backup() if callable(corrupt_backup) else None
+        if quarantined:
+            message = (
+                f"记忆文件损坏，已隔离备份到 {quarantined}"
+                "（当前统计基于空快照，可用备份文件恢复）"
+            )
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": message,
+                            "corrupt_backup": str(quarantined),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(message)
+            return 1
         try:
             preferences = store.get_preference()
             trips = store.get_trip_history(limit=None)
-            history = store.get_chat_history()
+            # 只读汇总只需要计数与去重集合：PostgreSQL 后端整表取回正文
+            # 在几十万条历史时峰值内存超过 1GB，优先走轻量接口
+            chat_summary = getattr(store, "get_chat_summary", None)
+            if callable(chat_summary):
+                summary = chat_summary()
+                message_count = int(summary.get("messages") or 0)
+                session_ids = {
+                    str(item)
+                    for item in (summary.get("sessions") or ())
+                    if item
+                }
+            else:
+                history = store.get_chat_history()
+                message_count = len(history)
+                session_ids = {
+                    str(item.get("session_id"))
+                    for item in history
+                    if item.get("session_id")
+                }
             archived = store.get_archived_sessions() or []
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _cli_fail(f"读取数据失败：{exc}", as_json)
@@ -2408,10 +2450,9 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
         if callable(close):
             close()
 
-    sessions = {str(item.get("session_id")) for item in history if item.get("session_id")}
     # 与面板 archived_count 同口径：只统计仍有消息的归档会话，幽灵归档
     # （会话已删 / 从未落库）不计入，否则统计永久偏大且 CLI 无法清理
-    archived_alive = [sid for sid in archived if str(sid) in sessions]
+    archived_alive = [sid for sid in archived if str(sid) in session_ids]
     travel = summarize_travel(trips)
     # 与面板 / 状态接口同口径：null / 空白 / 全空列表不计入偏好条数
     visible_preferences = {
@@ -2424,8 +2465,8 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
         "preferences": len(visible_preferences),
         "travel": travel,
         "sessions": {
-            "total": len(sessions),
-            "messages": len(history),
+            "total": len(session_ids),
+            "messages": message_count,
             "archived": len(archived_alive),
         },
     }

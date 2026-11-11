@@ -156,6 +156,58 @@ def test_stats_empty_and_failures(monkeypatch):
     print("✓ stats 空数据 / 非法用户 / 读取与打开失败")
 
 
+def test_stats_uses_lightweight_chat_summary(monkeypatch):
+    """优先用轻量会话概览：不再整表取回消息正文（大历史内存问题）。"""
+
+    class _SummaryStore(_FakeStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.full_history_calls = 0
+
+        def get_chat_summary(self):
+            return {
+                "messages": len(self.history),
+                "sessions": {
+                    m["session_id"] for m in self.history if m.get("session_id")
+                },
+            }
+
+        def get_chat_history(self):
+            self.full_history_calls += 1
+            return super().get_chat_history()
+
+    store = _SummaryStore(
+        history=[_message("s1"), _message("s1", "assistant")], archived=["s1"]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 0, out
+    data = json.loads(out)
+    assert data["sessions"] == {"total": 1, "messages": 2, "archived": 1}
+    assert store.full_history_calls == 0, "不应回退到整表读取"
+    print("✓ stats 使用轻量会话概览")
+
+
+def test_stats_reports_corrupt_memory(monkeypatch):
+    """记忆文件损坏被隔离后 stats 不能按空账号成功：exit 1 + 备份路径。"""
+    store = _FakeStore()
+    store.get_recovered_corrupt_backup = lambda: "data/memory/u1.json.corrupt-x"
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 1
+    data = json.loads(out)
+    assert data["ok"] is False
+    assert "损坏" in data["error"]
+    assert data["corrupt_backup"].endswith(".corrupt-x")
+    code, out = _run("u-stats")
+    assert code == 1 and "损坏" in out and "corrupt-x" in out
+    print("✓ stats 报告损坏的记忆文件")
+
+
 def test_stats_dispatch(monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(
@@ -203,6 +255,12 @@ if __name__ == "__main__":
         mp.undo()
         mp = pytest.MonkeyPatch()
         test_stats_empty_and_failures(mp)
+        mp.undo()
+        mp = pytest.MonkeyPatch()
+        test_stats_uses_lightweight_chat_summary(mp)
+        mp.undo()
+        mp = pytest.MonkeyPatch()
+        test_stats_reports_corrupt_memory(mp)
         mp.undo()
         mp = pytest.MonkeyPatch()
         test_stats_dispatch(mp)

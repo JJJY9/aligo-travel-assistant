@@ -263,7 +263,9 @@ def test_corrupt_memory_file_is_backed_up():
     assert backups, "损坏文件应保留备份"
     assert backups[0].read_text(encoding="utf-8") == "{bad json"
     assert str(os.getpid()) in backups[0].name, "备份名带进程号，避免并发损坏互相覆盖"
-    print("✓ 损坏的记忆文件备份后重建")
+    # 隔离路径必须可被只读命令（CLI stats）报告，否则空快照被当成空账号
+    assert memory.get_recovered_corrupt_backup() == str(backups[0])
+    print("✓ 损坏的记忆文件备份后重建（隔离路径可报告）")
 
 
 def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
@@ -532,6 +534,26 @@ def test_pg_trip_lookup_normalizes_identity_fields():
     assert params == ("u1", "a\nb\nc", "北京\n西城")
     assert trip_id == "trip_1"
     print("✓ PostgreSQL 行程去重按身份口径归一路线")
+
+
+def test_pg_chat_summary_does_not_fetch_message_bodies():
+    """PG 会话概览只查计数与 DISTINCT 会话，不整表取回消息正文。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    calls: list[tuple[str, object]] = []
+    store._fetchone = lambda sql, params=None: (calls.append((sql, params)) or (7,))
+    store._fetchall = lambda sql, params=None: (
+        calls.append((sql, params)) or [("s1",), ("s2",), (None,)]
+    )
+    summary = store.get_chat_summary()
+    assert summary["messages"] == 7
+    assert summary["sessions"] == {"s1", "s2"}
+    assert "COUNT(*)" in calls[0][0]
+    assert "DISTINCT session_id" in calls[1][0]
+    assert all("content" not in sql for sql, _ in calls), "不应查询消息正文"
+    print("✓ PostgreSQL 会话概览只查计数（不读正文）")
 
 
 def test_pg_delete_trip_deletes_single_row():
@@ -2964,6 +2986,7 @@ if __name__ == "__main__":
     test_pg_delete_trip_deletes_single_row()
     test_pg_delete_duplicate_trip_keeps_last_copy()
     test_pg_trip_lookup_normalizes_identity_fields()
+    test_pg_chat_summary_does_not_fetch_message_bodies()
     test_summary_not_starved_by_long_current_session()
     test_memory_persistence_error_is_not_retriable()
     test_redact_url_masks_password_containing_at()
