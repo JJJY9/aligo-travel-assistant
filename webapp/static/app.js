@@ -409,7 +409,17 @@ async function getJSON(url, options, timeoutMs = 120000) {
         }, timeoutMs)
       : null;
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+    const headers = {
+      // 面板请求的客户端标记：高开销伪 GET 接口据此拒绝跨站简单请求
+      // （HTTP 内网 / 旧 Safari 不发送 Sec-Fetch-Site，不能只看该头）
+      "X-Aligo-Client": "web",
+      ...((options && options.headers) || {}),
+    };
+    const response = await fetch(url, {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
     if (!response.ok) {
       const error = new Error(await errorMessage(response));
       error.status = response.status;
@@ -1116,7 +1126,9 @@ function addFollowUps(node, agents) {
 
 async function downloadFromApi(url, fallbackName) {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: { "X-Aligo-Client": "web" },
+    });
     if (!response.ok) {
       throw new Error(await errorMessage(response));
     }

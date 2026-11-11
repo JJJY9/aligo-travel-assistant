@@ -198,6 +198,56 @@ def test_host_allowlist_env(monkeypatch):
     print("✓ ALIGO_ALLOWED_HOSTS 域名白名单")
 
 
+def test_side_effect_guard_requires_same_origin_marker():
+    """缺失 Sec-Fetch-Site 不再视为可信：需 X-Aligo-Client 或同源 Referer。"""
+    client = _client()
+    user_id = _unique_user("web_side_effect_guard")
+    host = {"Host": "127.0.0.1:8000"}
+    try:
+        blocked = client.get("/api/status", params={"user_id": user_id}, headers=host)
+        assert blocked.status_code == 403, blocked.text
+        assert "X-Aligo-Client" in blocked.json()["detail"]
+
+        marked = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "X-Aligo-Client": "web"},
+        )
+        assert marked.status_code == 200, marked.text
+
+        same_ref = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "Referer": "http://127.0.0.1:8000/index.html"},
+        )
+        assert same_ref.status_code == 200, same_ref.text
+
+        bad_ref = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "Referer": "http://evil.example/page"},
+        )
+        assert bad_ref.status_code == 403, bad_ref.text
+
+        # 显式跨站头即使带了客户端标记也拒绝
+        cross = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "Sec-Fetch-Site": "cross-site", "X-Aligo-Client": "web"},
+        )
+        assert cross.status_code == 403, cross.text
+
+        export_blocked = client.get(
+            "/api/export", params={"user_id": user_id}, headers=host
+        )
+        assert export_blocked.status_code == 403, export_blocked.text
+        # 非高开销接口不受影响
+        assert client.get("/api/health", headers=host).status_code == 200
+    finally:
+        _cleanup(user_id)
+    print("✓ 高开销 GET 需同源标记（缺失 Sec-Fetch-Site 不再放行）")
+
+
 def test_health_endpoint():
     data = _client().get("/api/health").json()
     assert data["status"] == "ok"
@@ -9324,6 +9374,7 @@ if __name__ == "__main__":
         test_host_allowlist_env(_mp_host)
     finally:
         _mp_host.undo()
+    test_side_effect_guard_requires_same_origin_marker()
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
