@@ -160,6 +160,44 @@ def test_apply_removes_and_skips_empty_ids():
     print("✓ 删除计数与空 id 跳过")
 
 
+class _BatchStore(_Store):
+    """实现批量复核删除接口的存储（apply 应优先走批量）。"""
+
+    def __init__(self, trips):
+        super().__init__(trips)
+        self.batch_calls = 0
+        self.batch_targets = []
+
+    def delete_trips_verified(self, targets):
+        self.batch_calls += 1
+        self.batch_targets = [dict(target) for target in targets]
+        return len(targets), None
+
+
+def test_apply_prefers_batch_storage_api():
+    """存储支持 delete_trips_verified 时走批量（一次落盘、锁内复核）。"""
+    store = _BatchStore([_trip("t1"), _trip("t2")])
+    plan = plan_trip_dedupe(store)
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (1, None)
+    assert store.batch_calls == 1
+    assert store.batch_targets == [
+        {
+            "trip_id": "t2",
+            "kept_id": "t1",
+            "prefer_last": False,
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-01-05",
+            "end_date": "2026-01-06",
+        }
+    ]
+    assert store.deleted == [], "批量路径不应再逐条调用 delete_trip"
+    print("✓ 去重优先使用存储层批量复核删除")
+
+
 def test_apply_reports_partial_failure():
     """删除中途失败：如实返回已删除数与原因。"""
     store = _Store([_trip("t1"), _trip("t2")], fail_delete_at=1)
@@ -229,6 +267,7 @@ if __name__ == "__main__":
     test_plan_reports_ambiguous_ids_separately()
     test_plan_ignores_rows_without_start_date()
     test_apply_uses_duplicate_deleter_for_same_kept_id()
+    test_apply_prefers_batch_storage_api()
     test_apply_removes_and_skips_empty_ids()
     test_apply_reports_partial_failure()
     test_apply_skips_trip_edited_after_plan()

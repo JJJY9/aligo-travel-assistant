@@ -187,14 +187,24 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
 
 
 def _unfold_ics(text: str) -> list[str]:
-    """按 RFC 5545 展开折行：续行以单个空格 / 制表符开头，属上一行。"""
+    """按 RFC 5545 展开折行：续行以单个空格 / 制表符开头，属上一行。
+
+    按逻辑行累积片段再一次 ``join``：此前逐段 ``lines[-1] += ...`` 拼接
+    不断变长的字符串，单条 5M 字符的超长折行要 20 多秒（O(n²) 复制），
+    用户会以为程序卡死。
+    """
     raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     lines: list[str] = []
+    parts: list[str] | None = None
     for line in raw:
-        if line[:1] in (" ", "\t") and lines:
-            lines[-1] += line[1:]
-        else:
-            lines.append(line)
+        if line[:1] in (" ", "\t") and parts is not None:
+            parts.append(line[1:])
+            continue
+        if parts is not None:
+            lines.append("".join(parts))
+        parts = [line]
+    if parts is not None:
+        lines.append("".join(parts))
     return lines
 
 
