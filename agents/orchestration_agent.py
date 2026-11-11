@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -127,6 +127,17 @@ def _trip_field(value: Any) -> str:
         )
         text = text[:_TRIP_FIELD_MAX_CHARS]
     return text
+
+
+def _trip_duration_days(value: Any) -> int | None:
+    """事项收集的 duration_days：正整数且不超过一年才采用。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0 or number > 365:
+        return None
+    return number
 
 
 def _trip_date(value: Any) -> str:
@@ -1034,6 +1045,19 @@ class OrchestrationAgent(AgentBase):
                     destination = _trip_field(event_data.get("destination"))
                     start_date = _trip_date(event_data.get("start_date"))
                     end_date = _trip_date(event_data.get("end_date"))
+                    if start_date and not end_date:
+                        # 只给出时长（「出差一周」）时按天数补出返程日期：
+                        # 否则整条行程按单日落库，出行天数 / 日历 / 冲突
+                        # 全部少算；下次模型补出返程日期还会因去重身份不同
+                        # （缺省 end=start）再插一条同行程记录
+                        duration = _trip_duration_days(
+                            event_data.get("duration_days")
+                        )
+                        if duration:
+                            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                            end_date = (
+                                start_dt + timedelta(days=duration - 1)
+                            ).date().isoformat()
                     purpose = _trip_field(event_data.get("trip_purpose")) or "旅游"
 
                     # 保存到长期记忆：必须有出发日期——没有日期的行程无法参与

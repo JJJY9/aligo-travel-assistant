@@ -2182,6 +2182,60 @@ def test_update_memory_isolates_trip_save_failure():
     print("✓ 行程写入失败不中断整轮")
 
 
+def test_update_memory_derives_end_date_from_duration():
+    """只给出 duration_days 时按天数补出返程日期；非法时长不补。"""
+    memory = _StubMemory()
+    results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "result": {"status": "success", "data": {"itinerary": {"title": "T"}}},
+        },
+        {
+            "agent_name": "event_collection",
+            "status": "success",
+            "result": {
+                "status": "success",
+                "data": {
+                    "destination": "杭州",
+                    "start_date": "2026-03-11",
+                    "duration_days": 7,
+                },
+            },
+        },
+    ]
+    OrchestrationAgent(
+        agent_registry={}, memory_manager=memory
+    )._update_memory({}, results)
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1, trips
+    assert trips[0]["end_date"] == "2026-03-17", trips[0]
+
+    invalid = _StubMemory()
+    OrchestrationAgent(
+        agent_registry={}, memory_manager=invalid
+    )._update_memory(
+        {},
+        [
+            results[0],
+            {
+                "agent_name": "event_collection",
+                "status": "success",
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "destination": "杭州",
+                        "start_date": "2026-03-11",
+                        "duration_days": 0,
+                    },
+                },
+            },
+        ],
+    )
+    assert invalid.long_term.get_trip_history()[0]["end_date"] == ""
+    print("✓ duration_days 补出返程日期（非法时长不补）")
+
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -2232,6 +2286,7 @@ if __name__ == "__main__":
     test_update_memory_isolates_preference_failures()
     test_update_memory_skips_failed_event_collection()
     test_update_memory_isolates_trip_save_failure()
+    test_update_memory_derives_end_date_from_duration()
     _mp_load = pytest.MonkeyPatch()
     try:
         test_agent_load_timeout_is_bounded(_mp_load)
