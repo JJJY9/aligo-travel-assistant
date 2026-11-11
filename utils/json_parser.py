@@ -6,6 +6,8 @@ import json
 import logging
 import re
 
+from utils.access_log import MAX_LOG_TEXT, _safe_log_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -599,7 +601,10 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         error_pos = getattr(e, 'pos', 0)
         start = max(0, error_pos - 50)
         end = min(len(json_str), error_pos + 50)
-        logger.warning(f"Error context: ...{json_str[start:end]}...")
+        logger.warning(
+            "Error context: ...%s...",
+            _safe_log_text(json_str[start:end])[:MAX_LOG_TEXT],
+        )
 
     # 尝试2: 移除控制字符后解析
     try:
@@ -713,7 +718,10 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         logger.warning(f"First-object extraction failed: {e}")
 
     # 所有尝试都失败
-    logger.error(f"All JSON parsing attempts failed. Full JSON:\n{json_str}")
+    logger.error(
+        "All JSON parsing attempts failed. Full JSON: %s",
+        _safe_log_text(json_str)[:MAX_LOG_TEXT],
+    )
 
     if fallback is not None:
         logger.warning("Using fallback value")

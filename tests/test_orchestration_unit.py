@@ -1221,6 +1221,9 @@ def test_unmanageable_preference_types_skipped_everywhere():
     assert is_manageable_pref_type("a/b") is False
     assert is_manageable_pref_type(123) is False
     assert is_manageable_pref_type("") is False
+    assert is_manageable_pref_type("x" + chr(0x0A) + "fake") is False
+    assert is_manageable_pref_type("x" + chr(0x00) + "y") is False
+    assert is_manageable_pref_type("x" + chr(0x2028) + "y") is False
 
     entries = [
         {"type": "a/b", "value": "x"},

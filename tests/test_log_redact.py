@@ -26,6 +26,26 @@ def test_redact_secret_strips_userinfo_and_query():
     print("✓ redact_secret 去 userinfo 与查询串")
 
 
+def test_redact_secret_keeps_url_punctuation_passwords_out():
+    """密码含 / : @ 等 URL 标点（未编码）时也必须整段遮蔽，只保留主机便于排查。"""
+    bare = redact_secret("aligo:pa/ss@127.0.0.1:5432/aligo")
+    assert "pa/ss" not in bare, bare
+    assert "127.0.0.1:5432/aligo" in bare, bare
+
+    url = redact_secret("postgresql://aligo:sec/ret@db.internal/aligo")
+    assert "sec/ret" not in url, url
+    assert "postgresql://***@db.internal/aligo" in url, url
+
+    multi = redact_secret("postgresql://aligo:p@ss@db:5432/x")
+    assert "p@ss" not in multi and "ss@" not in multi, multi
+    assert "db:5432" in multi, multi
+
+    colon = redact_secret("redis://:pa:ss@cache:6379/0")
+    assert "pa:ss" not in colon, colon
+    assert "cache:6379" in colon, colon
+    print("✓ redact_secret 遮蔽含 URL 标点 / 多个 @ 的密码")
+
+
 def test_preference_and_title_values_not_logged(caplog):
     """偏好值 / 会话标题是用户隐私内容：不进 INFO 日志。"""
     memory = LongTermMemory("u-logredact", tempfile.mkdtemp())
@@ -59,5 +79,6 @@ def test_redact_paths_hides_internal_paths_and_urls():
 
 if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
+    test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_paths_hides_internal_paths_and_urls()
     print("caplog 用例需 pytest 运行")

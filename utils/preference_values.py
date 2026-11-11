@@ -1,4 +1,5 @@
 """偏好值合并（列表语义，JSON / PostgreSQL / 编排器共用）。"""
+import re
 from typing import Any
 
 
@@ -69,4 +70,7 @@ def is_manageable_pref_type(pref_type: object) -> bool:
     if not isinstance(pref_type, str):
         return False
     text = pref_type.strip()
+    if re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", text):
+        # 控制字符 / 行分隔符会被写进 INFO 日志（%0A 伪造日志行）与面板路径
+        return False
     return 0 < len(text) <= 64 and "/" not in text

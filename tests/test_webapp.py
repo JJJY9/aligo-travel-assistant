@@ -445,7 +445,7 @@ def test_health_reports_degraded_write_limiter():
     print("✓ 写限流桶降级会上报健康与指标")
 
 
-def test_weather_api(monkeypatch):
+def test_weather_api(monkeypatch, caplog):
     from utils.weather import WeatherError
     from webapp import server as server_module
 
@@ -475,7 +475,34 @@ def test_weather_api(monkeypatch):
 
     monkeypatch.setattr(server_module, "fetch_weather", unavailable)
     assert client.get("/api/weather", params={"city": "北京"}).status_code == 503
-    print("✓ /api/weather 天气查询（成功 / 422 / 404 / 503）")
+
+    def leaking(city):
+        # requests 的连接异常原文带完整上游 URL 与查询参数：
+        # 503 详情与 WARNING 日志都不能原样回显
+        raise WeatherError(
+            "天气接口暂时不可用：HTTPConnectionPool(host='geocoding-api.open-meteo.com', "
+            "port=443): Max retries exceeded with url: /v1/search?name=北京"
+        )
+
+    monkeypatch.setattr(server_module, "fetch_weather", leaking)
+    leaked = client.get("/api/weather", params={"city": "北京"})
+    assert leaked.status_code == 503
+    detail = leaked.json()["detail"]
+    assert "open-meteo" not in detail and "name=北京" not in detail, detail
+    assert "暂时不可用" in detail
+
+    def missing_again(city):
+        raise WeatherError(f"未找到城市「{city}」")
+
+    monkeypatch.setattr(server_module, "fetch_weather", missing_again)
+    line_sep = chr(0x2028)
+    with caplog.at_level("WARNING"):
+        injected = client.get(
+            "/api/weather", params={"city": f"Paris{line_sep}FAKE WARNING LINE"}
+        )
+    assert injected.status_code == 404
+    assert line_sep not in caplog.text, "日志行分隔符必须净化"
+    print("✓ /api/weather 天气查询（成功 / 422 / 404 / 503，失败详情脱敏）")
 
 
 def test_weather_rate_limit(monkeypatch):
@@ -5134,6 +5161,40 @@ def test_trips_dedupe_endpoint_dry_run_and_apply(monkeypatch):
     print("✓ /api/trips/dedupe 预览与执行")
 
 
+def test_trips_dedupe_failure_detail_redacts_paths(monkeypatch):
+    """去重部分失败：503 详情只留可重试提示，不回显锁文件绝对路径。"""
+    from webapp import server as server_module
+
+    class _Store:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module, "_open_long_term", lambda user_id, **kwargs: _Store()
+    )
+    leaked = (
+        r"长期记忆写锁等待超时：无法获取文件锁："
+        r"C:\Users\alice\AppData\Local\aligo\data\memory\u1.json.lock"
+    )
+    monkeypatch.setattr(
+        server_module,
+        "apply_trip_dedupe",
+        lambda store, entries, verify: (0, leaked),
+    )
+    client = _client()
+    response = client.post(
+        "/api/trips/dedupe", json={"user_id": "u-dedupe-redact"}
+    )
+    assert response.status_code == 503, response.text[:300]
+    detail = response.json()["detail"]
+    assert "alice" not in detail and "<路径>" in detail, detail
+    assert "已删除 0 条" in detail, detail
+    print("✓ 去重失败详情遮蔽内部路径")
+
+
 def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
     """读取失败映射 503；同 id 多行程只报告不删除。"""
     from webapp import server as server_module
@@ -5549,6 +5610,176 @@ def test_content_length_413_metric_labels():
         print("✓ Content-Length 413 指标标签按接口归一")
     finally:
         REQUEST_METRICS.reset()
+
+
+def test_pre_route_metric_labels_cover_write_endpoints():
+    """路由前 413 / 尾斜杠重定向的标签表覆盖真实接口，未知路径仍归 __unmatched__。"""
+    from webapp.server import _metric_path_before_route
+
+    assert (
+        _metric_path_before_route("/api/sessions/s-1/title")
+        == "/api/sessions/{session_id}/title"
+    )
+    assert (
+        _metric_path_before_route("/api/sessions/s-1/pin")
+        == "/api/sessions/{session_id}/pin"
+    )
+    assert (
+        _metric_path_before_route("/api/sessions/s-1/archive")
+        == "/api/sessions/{session_id}/archive"
+    )
+    assert (
+        _metric_path_before_route("/api/preferences/hotel")
+        == "/api/preferences/{pref_type}"
+    )
+    assert (
+        _metric_path_before_route("/api/sessions/s-1")
+        == "/api/sessions/{session_id}"
+    )
+    assert (
+        _metric_path_before_route("/api/knowledge/duplicates/cleanup")
+        == "/api/knowledge/duplicates/cleanup"
+    )
+    assert _metric_path_before_route("/api/evil/whatever") == "__unmatched__"
+    print("✓ 路由前指标标签覆盖写接口")
+
+
+def test_trailing_slash_redirect_metric_label():
+    """尾斜杠 307 重定向按目标路由模板计数，而不是 __unmatched__。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = TestClient(
+        create_app(model=UsageTrackingModel(_FakeModel())),
+        follow_redirects=False,
+    )
+    try:
+        response = client.get("/api/sessions/sess-redirect/")
+        assert response.status_code == 307, response.text[:200]
+        by_path = REQUEST_METRICS.snapshot()["by_path"]
+        assert by_path.get("/api/sessions/{session_id}") == 1, by_path
+        assert "__unmatched__" not in by_path, by_path
+        print("✓ 尾斜杠 307 重定向按路由模板计数")
+    finally:
+        REQUEST_METRICS.reset()
+
+
+def test_host_rejection_is_secured_and_counted():
+    """Host 白名单 400 与其它响应一样带安全头，并进入访问日志 / 指标。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    client = _client()
+    try:
+        response = client.get("/api/health", headers={"Host": "evil.example.com"})
+        assert response.status_code == 400, response.text[:200]
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["cache-control"] == "no-store"
+        # 扫描器直接打 / 也要计入（非 /api 路径平时不记访问日志）
+        root = client.get("/", headers={"Host": "evil.example.com"})
+        assert root.status_code == 400
+        snapshot = REQUEST_METRICS.snapshot()
+        assert snapshot["by_status"].get("400") == 2, snapshot
+        assert snapshot["by_path"].get("__host_rejected__") == 2, snapshot
+        print("✓ Host 拒绝 400 计入指标且带安全头")
+    finally:
+        REQUEST_METRICS.reset()
+
+
+def test_cancelled_request_recorded_as_499():
+    """请求被取消（优雅关闭 / 客户端中止）记 499、不计耗时，且取消向上传播。"""
+    from utils.metrics import REQUEST_METRICS
+    from webapp.server import RequestContextMiddleware
+
+    REQUEST_METRICS.reset()
+
+    async def cancelled_app(scope, receive, send):
+        raise asyncio.CancelledError()
+
+    middleware = RequestContextMiddleware(cancelled_app)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/health",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+
+    async def call():
+        try:
+            await middleware(scope, receive, send)
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "returned"
+
+    assert asyncio.run(call()) == "cancelled", "取消必须继续向上传播"
+    snapshot = REQUEST_METRICS.snapshot()
+    assert snapshot["by_status"].get("499") == 1, snapshot
+    assert "0" not in snapshot["by_status"], snapshot
+    assert snapshot["duration_samples"] == 0, snapshot
+    assert sent == [], "响应未开始时取消不应发送任何消息"
+    REQUEST_METRICS.reset()
+    print("✓ 取消请求记 499 且不计耗时")
+
+
+def test_client_disconnect_recorded_as_499():
+    """客户端中途断开不是服务端故障：记 499、不上报 500、不打 ERROR。"""
+    from starlette.requests import ClientDisconnect
+    from utils.metrics import REQUEST_METRICS
+    from webapp.server import RequestContextMiddleware
+
+    REQUEST_METRICS.reset()
+
+    async def disconnect_app(scope, receive, send):
+        raise ClientDisconnect()
+
+    middleware = RequestContextMiddleware(disconnect_app)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/import",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+
+    asyncio.run(middleware(scope, receive, send))
+    snapshot = REQUEST_METRICS.snapshot()
+    assert snapshot["by_status"].get("499") == 1, snapshot
+    assert "500" not in snapshot["by_status"], snapshot
+    assert sent == []
+    REQUEST_METRICS.reset()
+    print("✓ 客户端断连记 499 而非 500")
+
+
+def test_preference_type_rejects_control_characters():
+    """偏好类型会进 INFO 日志：%0A / %00 / %7F 必须被路由直接拒绝。"""
+    client = _client()
+    user_id = _unique_user("web_test_prefctl")
+    try:
+        for bad in ("x%0AFAKE", "x%00y", "x%7Fz", "x%E2%80%A8y"):
+            response = client.put(
+                f"/api/preferences/{bad}",
+                params={"user_id": user_id},
+                json={"user_id": user_id, "value": "v"},
+            )
+            assert response.status_code == 422, (bad, response.text[:200])
+        print("✓ 偏好类型拒绝控制字符")
+    finally:
+        _cleanup(user_id)
 
 
 def test_prometheus_metrics_endpoint():
@@ -8681,6 +8912,8 @@ def test_route_path_normalization():
     assert _route_path({"path": "/api/import/"}) == "/api/import"
     assert _route_path({"path": "/aligo/", "root_path": "/aligo"}) == "/"
     assert _route_path({"path": "/"}) == "/"
+    # root_path="/" 等价无前缀：剥离后必须保留前导斜杠
+    assert _route_path({"path": "/api/health", "root_path": "/"}) == "/api/health"
     print("✓ 路由视角路径归一（root_path / 尾斜杠）")
 
 
@@ -10179,6 +10412,7 @@ if __name__ == "__main__":
     _mp_dedupe = pytest.MonkeyPatch()
     try:
         test_trips_dedupe_endpoint_dry_run_and_apply(_mp_dedupe)
+        test_trips_dedupe_failure_detail_redacts_paths(_mp_dedupe)
         test_trips_dedupe_endpoint_errors_and_ambiguous(_mp_dedupe)
         test_trips_dedupe_concurrent_requests_keep_one(_mp_dedupe)
     finally:
@@ -10213,6 +10447,12 @@ if __name__ == "__main__":
     test_request_id_header()
     test_metrics_api()
     test_prometheus_metrics_endpoint()
+    test_pre_route_metric_labels_cover_write_endpoints()
+    test_trailing_slash_redirect_metric_label()
+    test_host_rejection_is_secured_and_counted()
+    test_cancelled_request_recorded_as_499()
+    test_client_disconnect_recorded_as_499()
+    test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:
         test_prometheus_storage_gauges_reflect_state(_mp_metrics_gauges)

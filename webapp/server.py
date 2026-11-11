@@ -49,6 +49,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.requests import ClientDisconnect
 
 from agents.conversation import ConversationRuntime
 from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG, STORAGE_CONFIG
@@ -60,7 +61,12 @@ from context.storage import (
     describe_backends,
     get_shared_redis_client,
 )
-from utils.access_log import JsonLogFormatter, access_log_format, format_access_log
+from utils.access_log import (
+    JsonLogFormatter,
+    _safe_log_text,
+    access_log_format,
+    format_access_log,
+)
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio
@@ -83,6 +89,7 @@ from utils.knowledge_admin import (
     update_document,
 )
 from utils.knowledge_stats import knowledge_status
+from utils.log_redact import redact_paths
 from utils.metrics import REQUEST_METRICS
 from utils.preference_values import has_preference_value
 from utils.rate_limit import create_rate_limiter
@@ -154,8 +161,12 @@ def _route_path(scope: dict[str, Any]) -> str:
     """
     raw = str(scope.get("path", "") or "/")
     root = str(scope.get("root_path", "") or "")
-    if root and raw.startswith(root):
+    # root="/" 与无前缀等价：剥离后必须补回前导斜杠（否则 /api/... 变成
+    # api/...，no-store / 限流 / SSE 排除 / 访问日志与指标全部失配）
+    if root and root != "/" and raw.startswith(root):
         raw = raw[len(root):] or "/"
+        if not raw.startswith("/"):
+            raw = "/" + raw
     if raw != "/":
         raw = raw.rstrip("/") or "/"
     return raw
@@ -175,8 +186,9 @@ _ID_PATTERN = r"^[\w-]{1,64}$"
 # 与静态路由冲突的会话 ID（清单与 CLI 共用）：GET /api/sessions/export 永远
 # 命中导出接口，这类会话无法查看 / 继续（聊天请求与备份恢复都必须拒绝）
 _RESERVED_SESSION_IDS = RESERVED_SESSION_IDS
-# 偏好类型可由模型 / 面板自定义（可能含空格等），只限制长度与非空
-_PREF_TYPE_PATTERN = r"^[^/]{1,64}$"
+# 偏好类型可由模型 / 面板自定义（可能含空格等），只限制长度与非空；
+# 控制字符（%0A / %00 等）会原样进 INFO 日志，必须拒绝
+_PREF_TYPE_PATTERN = r"^[^\x00-\x1F\x7F-\x9F\u2028\u2029/]{1,64}$"
 # 会话删除墓碑在 Redis 中的 key 前缀（配置 REDIS_URL 时跨实例共享）
 _DELETED_KEY_PREFIX = "aligo:deleted"
 
@@ -222,10 +234,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = PROJECT_ROOT / "data" / "memory"
 # 未匹配路由（404 / 405）的指标路径统一取值，避免任意路径撑爆指标基数
 _UNMATCHED_METRIC_PATH = "__unmatched__"
-# 路由前就被 413 拒绝（Content-Length 预检）的请求没有 route：已知允许
-# 请求体的接口按接口名归一标签（与 chunked 超限记录到路由模板的口径一致），
-# 未知路径仍归入 __unmatched__——任意路径不能撑爆指标基数
-_413_METRIC_PATHS = frozenset(
+# 路由前即被拒绝的请求（Content-Length 预检 413、尾斜杠 307/308 重定向）
+# 没有 route：已知接口按接口名归一标签（与 chunked 超限记录到路由模板的
+# 口径一致），未知路径仍归入 __unmatched__——任意路径不能撑爆指标基数
+_PRE_ROUTE_METRIC_PATHS = frozenset(
     {
         "/api/chat",
         "/api/chat/stream",
@@ -236,9 +248,11 @@ _413_METRIC_PATHS = frozenset(
         "/api/trips",
         "/api/trips/import",
         "/api/trips/dedupe",
+        "/api/sessions/export",
+        "/api/knowledge/duplicates/cleanup",
     }
 )
-_413_METRIC_PATTERNS = (
+_PRE_ROUTE_METRIC_PATTERNS = (
     (
         re.compile(r"^/api/knowledge/documents/\d+$"),
         "/api/knowledge/documents/{doc_id}",
@@ -248,14 +262,25 @@ _413_METRIC_PATTERNS = (
         re.compile(r"^/api/sessions/[\w-]+/last-turn$"),
         "/api/sessions/{session_id}/last-turn",
     ),
+    (re.compile(r"^/api/sessions/[\w-]+$"), "/api/sessions/{session_id}"),
+    (re.compile(r"^/api/sessions/[\w-]+/title$"), "/api/sessions/{session_id}/title"),
+    (re.compile(r"^/api/sessions/[\w-]+/pin$"), "/api/sessions/{session_id}/pin"),
+    (
+        re.compile(r"^/api/sessions/[\w-]+/archive$"),
+        "/api/sessions/{session_id}/archive",
+    ),
+    (
+        re.compile(r"^/api/preferences/[^/]{1,64}$"),
+        "/api/preferences/{pref_type}",
+    ),
 )
 
 
 def _metric_path_before_route(route_path: str) -> str:
-    """路由前 413 的指标标签：已知接口归一，未知路径归 __unmatched__。"""
-    if route_path in _413_METRIC_PATHS:
+    """路由前拒绝（413 / 尾斜杠重定向）的指标标签：已知接口归一。"""
+    if route_path in _PRE_ROUTE_METRIC_PATHS:
         return route_path
-    for pattern, label in _413_METRIC_PATTERNS:
+    for pattern, label in _PRE_ROUTE_METRIC_PATTERNS:
         if pattern.fullmatch(route_path):
             return label
     return _UNMATCHED_METRIC_PATH
@@ -322,29 +347,9 @@ class RequestContextMiddleware:
         )
         scope.setdefault("state", {})["request_id"] = request_id
 
-        if not _host_allowed(headers.get(b"host", b"").decode("latin-1")):
-            body = json.dumps(
-                {
-                    "detail": (
-                        "Host 不在允许列表（如需通过域名访问，请设置 "
-                        "ALIGO_ALLOWED_HOSTS）"
-                    )
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 400,
-                    "headers": [
-                        (b"content-type", b"application/json; charset=utf-8"),
-                        (b"cache-control", b"no-store"),
-                        (b"x-request-id", request_id.encode("latin-1")),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
-            return
+        host_rejected = not _host_allowed(
+            headers.get(b"host", b"").decode("latin-1")
+        )
 
         started = time.perf_counter()
         status_code = 0
@@ -378,6 +383,29 @@ class RequestContextMiddleware:
             await send(message)
 
         try:
+            if host_rejected:
+                # DNS rebinding 探测也要进访问日志与指标（否则被白名单挡下的
+                # 扫描流量对监控完全不可见），并带齐安全头 / no-store
+                body = json.dumps(
+                    {
+                        "detail": (
+                            "Host 不在允许列表（如需通过域名访问，请设置 "
+                            "ALIGO_ALLOWED_HOSTS）"
+                        )
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                await send_wrapper(
+                    {
+                        "type": "http.response.start",
+                        "status": 400,
+                        "headers": [
+                            (b"content-type", b"application/json; charset=utf-8"),
+                        ],
+                    }
+                )
+                await send_wrapper({"type": "http.response.body", "body": body})
+                return
             content_length = headers.get(b"content-length", b"")
             if content_length:
                 try:
@@ -410,8 +438,28 @@ class RequestContextMiddleware:
                     )
                     return
             await self.app(scope, receive, send_wrapper)
+        except asyncio.CancelledError:
+            # uvicorn 优雅关闭超时 / 客户端中止会在请求任务里注入取消：
+            # 这不是服务端故障，按 499 记账并跳过耗时分位（继续向上传播取消）
+            if status_code == 0:
+                status_code = 499
+            logger.debug(
+                "请求被取消 [%s] %s", request_id, _safe_log_text(path)[:200]
+            )
+            raise
+        except ClientDisconnect:
+            # 客户端中途断开（上传被取消 / 断网）：服务器没发出任何响应，
+            # 不能记为 500（会让错误率与耗时分位失真）
+            status_code = 499
+            logger.debug(
+                "客户端已断开 [%s] %s", request_id, _safe_log_text(path)[:200]
+            )
         except Exception as exc:  # noqa: BLE001 - 兜底：未处理异常也要带上安全头与请求 ID
-            logger.exception("未处理的请求异常 [%s] %s", request_id, path)
+            logger.exception(
+                "未处理的请求异常 [%s] %s",
+                request_id,
+                _safe_log_text(path)[:200],
+            )
             if response_started:
                 # 响应已开始（如流式输出中断），无法再补发 500，交由服务器断开连接
                 raise
@@ -435,7 +483,9 @@ class RequestContextMiddleware:
             except Exception:  # noqa: BLE001 - 客户端可能已断开
                 raise exc from None
         finally:
-            if route_path.startswith("/api/"):
+            # 被 Host 白名单拒绝的请求无论打哪个路径都要可观测（DNS rebinding
+            # 扫描常直接探测 /），其余非 /api 路径保持不记访问日志
+            if route_path.startswith("/api/") or host_rejected:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 logger.info(
                     "%s",
@@ -451,17 +501,22 @@ class RequestContextMiddleware:
                 # 会话 ID 等动态段不会撑爆基数，未匹配的 404 统一归入 __unmatched__
                 route = scope.get("route")
                 metric_path = getattr(route, "path", None) or _UNMATCHED_METRIC_PATH
-                # 路由前就被 413 拒绝的请求没有 route：按已知接口归一标签，
-                # 未知路径归 __unmatched__（与 chunked 超限口径一致）
-                if getattr(route, "path", None) is None and status_code == 413:
-                    metric_path = _metric_path_before_route(route_path)
+                if getattr(route, "path", None) is None:
+                    if host_rejected:
+                        metric_path = "__host_rejected__"
+                    elif status_code in (413, 307, 308):
+                        # 路由前 413 与尾斜杠 307/308 重定向都没有 route：
+                        # 按已知接口归一标签（重定向目标是真实路由）
+                        metric_path = _metric_path_before_route(route_path)
                 REQUEST_METRICS.record(
                     scope.get("method", ""),
                     metric_path,
                     status_code,
                     elapsed_ms,
-                    # SSE 长连接的整段持续时间不能计入延迟分位
-                    streaming=metric_path == "/api/chat/stream",
+                    # SSE 长连接 / 客户端中止（499）的持续时间不能计入延迟分位
+                    streaming=(
+                        metric_path == "/api/chat/stream" or status_code == 499
+                    ),
                 )
 
 
@@ -1967,7 +2022,7 @@ def _redact_doctor_detail(text: str) -> str:
 
 def _storage_failure(action: str, exc: Exception) -> HTTPException:
     """存储 / 依赖类失败的统一 503：细节只进日志，响应不回显内部路径 / SQL。"""
-    logger.warning("%s失败: %s", action, exc)
+    logger.warning("%s失败: %s", action, redact_paths(exc))
     return HTTPException(status_code=503, detail=f"{action}，请稍后再试")
 
 
@@ -2772,9 +2827,16 @@ def create_app(model: Any = None) -> FastAPI:
             )
         except WeatherError as exc:
             message = str(exc)
-            logger.warning("天气查询失败（%s）：%s", name, message)
-            status_code = 404 if message.startswith("未找到城市") else 503
-            raise HTTPException(status_code=status_code, detail=message) from exc
+            not_found = message.startswith("未找到城市")
+            status_code = 404 if not_found else 503
+            # 城市属用户出行信息、上游异常文本含完整 URL 与查询参数：
+            # 日志只记错误类别，503 详情用固定文案，都不回显原文
+            logger.warning(
+                "天气查询失败：%s",
+                "未找到城市" if not_found else "气象服务暂时不可用",
+            )
+            detail = message if not_found else "天气服务暂时不可用，请稍后再试"
+            raise HTTPException(status_code=status_code, detail=detail) from exc
         return JSONResponse(content=jsonable_encoder(data), headers=headers)
 
     @app.get("/api/metrics")
@@ -4633,7 +4695,8 @@ def create_app(model: Any = None) -> FastAPI:
                     raise HTTPException(
                         status_code=503,
                         detail=(
-                            f"删除过程中失败：{failure}（已删除 {removed} 条，"
+                            "删除过程中失败："
+                            f"{redact_paths(failure)}（已删除 {removed} 条，"
                             "可重试）"
                         ),
                     )

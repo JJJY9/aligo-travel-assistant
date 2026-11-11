@@ -859,10 +859,15 @@ class OrchestrationAgent(AgentBase):
             }
 
         except Exception as e:
-            logger.error(f"Agent execution failed: {agent_name}, error: {e}")
             # 返回友好的错误信息，但不中断流程。原始异常文本会渲染进回答并
-            # 随助手消息落库 / 导出：本机缓存路径与上游 URL 必须遮蔽
+            # 随助手消息落库 / 导出：本机缓存路径与上游 URL 必须遮蔽；
+            # 日志同样只记脱敏文本并压成单行（text 模式下可伪造日志行）
             safe_error = redact_paths(e)
+            logger.error(
+                "Agent execution failed: %s, error: %s",
+                agent_name,
+                safe_error.replace("\n", " ").replace("\r", " ")[:300],
+            )
             return {
                 "status": "error",
                 "agent_name": agent_name,

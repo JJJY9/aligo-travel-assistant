@@ -19,6 +19,7 @@ import logging
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
+from utils.access_log import _safe_log_text
 from utils.json_parser import (
     extract_json_from_async_response,
     has_unclosed_json_object,
@@ -344,7 +345,10 @@ class IntentionAgent(AgentBase):
                     if isinstance(repaired, dict) and "agent_schedule" in repaired:
                         result = repaired
                 if result is None:
-                    logger.error(f"JSON parse failed. Text sample: {text[:100]}")
+                    logger.error(
+                        "JSON parse failed. Text sample: %s",
+                        _safe_log_text(text[:100]),
+                    )
                     raise ValueError(f"Failed to parse JSON. Error: {e1}") from e1
 
         except Exception as e:
