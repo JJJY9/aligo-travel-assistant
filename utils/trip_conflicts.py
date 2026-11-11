@@ -1,12 +1,26 @@
 """行程日期解析、重叠判断与状态标签（Web / CLI 共用）。"""
+import heapq
 import logging
 import re
-from bisect import bisect_right
 from collections import Counter
 from datetime import date, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _start_sort_value(trip: dict[str, Any]) -> tuple[datetime, str]:
+    """冲突列表排序键：按解析后的出发日期（未补零日期不再按字符串错序）。
+
+    历史数据支持 ``2026-1-5`` 这类未补零日期：字符串比较下
+    ``2026-1-15`` 会排在 ``2026-1-2`` 前面；无法解析的值统一排在最前，
+    以原始文本稳定次序。
+    """
+    raw = str(trip.get("start_date") or "")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d"), raw
+    except ValueError:
+        return datetime.min, raw
 
 
 def trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
@@ -31,6 +45,12 @@ def trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
             )
         end = start
     if end < start:
+        logger.warning(
+            "行程 %s 的返程日期早于出发日期（%r < %r），按出发当日计算",
+            trip.get("trip_id"),
+            raw_end,
+            trip.get("start_date"),
+        )
         end = start
     return start, end
 
@@ -52,6 +72,13 @@ def find_saved_trip(
             == str(record.get("end_date") or "")
             and str(trip.get("destination") or "")
             == str(record.get("destination") or "")
+            and (
+                # 调用方未提供 origin 时保持旧口径（不参与匹配）；提供时
+                # 用于区分「同 id / 同日 / 同目的地但出发地不同」的历史副本
+                "origin" not in record
+                or str(trip.get("origin") or "")
+                == str(record.get("origin") or "")
+            )
         ):
             return trip
     return None
@@ -89,7 +116,7 @@ def trip_conflicts(
         other_start, other_end = interval
         if other_start <= end and start <= other_end:
             conflicts.append(trip)
-    conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
+    conflicts.sort(key=_start_sort_value)
     return conflicts
 
 
@@ -136,28 +163,39 @@ def trips_with_conflicts(
     O(n²)（几千条历史行程时 CLI 列表 / --json 导出明显卡顿）。
     """
     context = pool if pool is not None else trips
-    entries: list[tuple[datetime, datetime, int, dict[str, Any]]] = []
-    for index, trip in enumerate(context):
+    entries: list[tuple[datetime, datetime, dict[str, Any]]] = []
+    for trip in context:
         interval = trip_interval(trip)
         if interval is not None:
-            entries.append((interval[0], interval[1], index, trip))
+            entries.append((interval[0], interval[1], trip))
     entries.sort(key=lambda item: item[0])
-    starts = [item[0] for item in entries]
 
-    views = []
-    for trip in trips:
-        interval = trip_interval(trip)
-        conflicts: list[dict[str, Any]] = []
-        if interval is not None:
-            start_dt, end_dt = interval
-            # 只有开始日期不晚于目标结束的行程才可能重叠；再按结束日期过滤
-            limit = bisect_right(starts, end_dt)
-            for other_start, other_end, _, other in entries[:limit]:
-                if other is trip or other_end < start_dt:
-                    continue
-                conflicts.append(other)
-            conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
-        views.append({**trip, "conflicts": conflicts})
+    views: list[dict[str, Any]] = []
+    view_indices: dict[int, list[int]] = {}
+    for index, trip in enumerate(trips):
+        views.append({**trip, "conflicts": []})
+        view_indices.setdefault(id(trip), []).append(index)
+
+    # 扫描线：按开始日期推进，维护仍在进行的行程堆——每对重叠只枚举一次，
+    # O(n log n + 实际重叠对数)。此前对每个目标都遍历前缀切片，零重叠的
+    # 常见场景仍是 Θ(n²)（几千条历史时 CLI 列表 / --json 明显卡顿）
+    active: list[tuple[datetime, int, dict[str, Any]]] = []
+    sequence = 0
+    for start_dt, end_dt, trip in entries:
+        while active and active[0][0] < start_dt:
+            heapq.heappop(active)
+        for _other_end, _seq, other in active:
+            if other is trip:
+                continue
+            for view_index in view_indices.get(id(trip), ()):
+                views[view_index]["conflicts"].append(other)
+            for view_index in view_indices.get(id(other), ()):
+                views[view_index]["conflicts"].append(trip)
+        heapq.heappush(active, (end_dt, sequence, trip))
+        sequence += 1
+
+    for view in views:
+        view["conflicts"].sort(key=_start_sort_value)
     return views
 
 

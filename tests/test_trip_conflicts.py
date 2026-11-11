@@ -28,9 +28,22 @@ def _naive_conflicts(trips, pool=None):
                 other_start, other_end = other_interval
                 if other_start <= end_dt and start_dt <= other_end:
                     conflicts.append(other)
-            conflicts.sort(key=lambda item: str(item.get("start_date") or ""))
+            conflicts.sort(
+                key=lambda item: _parsed_start_key(item)
+            )
         results.append([item.get("trip_id") for item in conflicts])
     return results
+
+
+def _parsed_start_key(trip):
+    """与实现相同的排序口径：按解析后的出发日期，无法解析的值排最前。"""
+    from datetime import datetime
+
+    raw = str(trip.get("start_date") or "")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d"), raw
+    except ValueError:
+        return datetime.min, raw
 
 
 def _trip(trip_id, start_offset, duration):
@@ -86,7 +99,92 @@ def test_large_history_fast_and_correct():
     print(f"✓ {count} 条行程：冲突对 {total}（二分实现与参考一致）")
 
 
+def test_conflict_order_uses_parsed_dates():
+    """未补零历史日期按真实时间排序（字符串序会把 1-15 排到 1-2 前面）。"""
+    trips = [
+        {
+            "trip_id": "target",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-20",
+        },
+        {
+            "trip_id": "early",
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-1-2",
+            "end_date": "2026-1-3",
+        },
+        {
+            "trip_id": "late",
+            "origin": "北京",
+            "destination": "南京",
+            "start_date": "2026-1-15",
+            "end_date": "2026-1-16",
+        },
+    ]
+    views = trips_with_conflicts(trips)
+    order = [item["trip_id"] for item in views[0]["conflicts"]]
+    assert order == ["early", "late"], order
+    print("✓ 冲突列表按解析后的日期排序")
+
+
+def test_find_saved_trip_distinguishes_origin():
+    """同 trip_id、同日同目的地但出发地不同：按出发地定位本次保存的那条。"""
+    from utils.trip_conflicts import find_saved_trip
+
+    trips = [
+        {
+            "trip_id": "trip_1",
+            "origin": "广州",
+            "destination": "上海",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+        },
+        {
+            "trip_id": "trip_1",
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+        },
+    ]
+    record = {
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-02",
+    }
+    found = find_saved_trip(trips, "trip_1", record)
+    assert found is trips[1], found
+    print("✓ find_saved_trip 按出发地精确匹配")
+
+
+def test_inverted_date_range_is_logged(caplog=None):
+    """返程早于出发的历史数据静默截成单日，但必须留下告警。"""
+    import logging
+
+    trip = {
+        "trip_id": "trip_inv",
+        "start_date": "2026-03-18",
+        "end_date": "2026-03-11",
+    }
+    if caplog is not None:
+        with caplog.at_level(logging.WARNING):
+            interval = trip_interval(trip)
+        assert "早于出发日期" in caplog.text
+    else:
+        interval = trip_interval(trip)
+    assert interval is not None
+    assert interval[0] == interval[1]
+    print("✓ 倒置日期区间记录告警")
+
+
 if __name__ == "__main__":
     test_optimized_matches_naive()
     test_large_history_fast_and_correct()
+    test_conflict_order_uses_parsed_dates()
+    test_find_saved_trip_distinguishes_origin()
+    test_inverted_date_range_is_logged()
     print("\n全部通过")
