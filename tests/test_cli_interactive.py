@@ -392,6 +392,26 @@ def test_process_query_sanitizes_surrogates_before_persist():
     print("✓ CLI 模型输出代理项在落库前转义")
 
 
+def test_process_query_rolls_back_when_persist_vetoed():
+    """墓碑否决整轮（persist_turn 返回 False）：回滚暂存提问并明确提示。"""
+    agent, events = _make_cli_stub()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=120)
+
+    def veto(user_content, assistant_content):
+        return False
+
+    agent.memory_manager.persist_turn = veto
+    asyncio.run(agent.process_query("你好"))
+    assert events["rolled_back"] == ["你好"], (
+        "墓碑否决后暂存提问必须回滚，不能留在短期上下文"
+    )
+    assert events["persisted"] == [], "否决的整轮不能计入已落库"
+    output = buffer.getvalue()
+    assert "已被删除" in output and "未写入长期记忆" in output, output
+    print("✓ CLI 会话被删除时整轮回滚并提示")
+
+
 def test_process_query_stages_user_message_before_orchestration():
     """编排期间短期记忆必须已含本轮提问（_prepare_context 读取用户本轮原话）。"""
     agent, events = _make_cli_stub()
@@ -751,6 +771,7 @@ if __name__ == "__main__":
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
         test_process_query_reloads_long_term_each_turn()
         test_process_query_stages_user_message_before_orchestration()
+        test_process_query_rolls_back_when_persist_vetoed()
         test_process_query_sanitizes_surrogates_before_persist()
         test_process_query_failure_leaves_no_long_term_user_turn()
         test_process_query_memory_failure_not_counted_by_breaker()
