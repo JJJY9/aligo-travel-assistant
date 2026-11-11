@@ -4,8 +4,10 @@
 天气码映射；结果带 10 分钟进程内缓存，避免频繁请求免费 API。
 """
 import logging
+import math
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import requests
@@ -22,6 +24,14 @@ STALE_TTL_SEC = 3600.0
 FAILURE_TTL_SEC = 60.0
 # 降级结果（stale）在短窗内直接复用：不再重打已故障的上游
 _DEGRADED_REUSE_SEC = 60.0
+# 单飞等待者最多等待的轮数：每轮等待领先线程 timeout*2+1 秒后重新登记；
+# 全部轮次用尽仍无结果时按「服务繁忙」报错，绝不各自重打上游（惊群）
+_FOLLOWER_WAIT_ROUNDS = 3
+# 全进程上游请求窗口上限：/api/weather 有按 IP 的桶，但对话链路（query-info
+# 的 fetch_weather）不受它约束——没有全局限额时轮换城市名即可把 Open-Meteo
+# 免费额度（约 600/分钟、5000/小时）打爆，所有用户的天气一起退化
+_UPSTREAM_MAX_PER_MINUTE = 120
+_upstream_calls: deque[float] = deque()
 # 缓存条目上限：城市名来自请求参数，不能让缓存随查询过的城市无限增长
 _CACHE_MAX_ENTRIES = 256
 _USER_AGENT = "Mozilla/5.0 (compatible; AligoTravel/1.0)"
@@ -76,6 +86,7 @@ def clear_weather_cache() -> None:
         _cache.clear()
         _failures.clear()
         _degraded.clear()
+        _upstream_calls.clear()
 
 
 def _cache_key(name: str) -> str:
@@ -86,9 +97,35 @@ def _cache_key(name: str) -> str:
 def _describe(code: Any) -> str:
     """把 Open-Meteo 天气码转为中文描述（未知 / 非数字返回「未知」）。"""
     try:
-        return WEATHER_CODE_MAP.get(int(code), "未知")
-    except (TypeError, ValueError):
+        number = int(code)
+    except (TypeError, ValueError, OverflowError):
+        # float('inf') / float('nan') 转 int 会抛 OverflowError / ValueError
         return "未知"
+    return WEATHER_CODE_MAP.get(number, "未知")
+
+
+def _ensure_finite(value: Any) -> None:
+    """递归校验响应中的数值都是有限值。
+
+    ``json.loads`` 对 ``1e400`` 会静默溢出为 ``inf``（不触发 parse_constant），
+    非有限值进入缓存后 ``/api/weather`` 的 JSON 序列化（allow_nan=False）每次
+    500，因此解析后必须显式校验。
+    """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise WeatherError("天气接口返回异常数值")
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _ensure_finite(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _ensure_finite(item)
+
+
+def _reject_constant(constant: str) -> Any:
+    raise WeatherError(f"天气接口返回异常数值：{constant}")
 
 
 def _get_json(url: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -99,9 +136,14 @@ def _get_json(url: str, params: dict[str, Any], timeout: float) -> dict[str, Any
         headers={"User-Agent": _USER_AGENT},
     )
     response.raise_for_status()
-    data = response.json()
+    try:
+        # NaN / Infinity 字面量按错误处理（requests 默认宽松解析）
+        data = response.json(parse_constant=_reject_constant)
+    except ValueError as exc:
+        raise WeatherError("天气接口返回格式异常") from exc
     if not isinstance(data, dict):
         raise WeatherError("天气接口返回格式异常")
+    _ensure_finite(data)
     return data
 
 
@@ -209,6 +251,22 @@ def _store_failure(key: str, message: str) -> None:
         _failures[key] = (now, message)
 
 
+def _admit_upstream() -> None:
+    """全进程上游额度：滑动窗口内请求数达到上限时直接拒绝。
+
+    /api/weather 的按 IP 桶保护不到对话链路（query-info 直接调
+    fetch_weather），城市名由用户输入、缓存按城市隔离，轮换城市名即可
+    把 Open-Meteo 免费额度打爆——所有用户一起退化为 stale / 503。
+    """
+    now = time.monotonic()
+    with _cache_lock:
+        while _upstream_calls and now - _upstream_calls[0] >= 60.0:
+            _upstream_calls.popleft()
+        if len(_upstream_calls) >= _UPSTREAM_MAX_PER_MINUTE:
+            raise WeatherError("天气查询过于频繁，请稍后再试")
+        _upstream_calls.append(now)
+
+
 def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     """查询城市的实时天气与未来 3 天预报。
 
@@ -236,19 +294,36 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     if degraded is not None:
         return degraded
 
-    leader, event = _claim_fetch(key)
-    if leader:
-        # 检查缓存与登记在途之间可能有别的线程刚好写入了结果
-        cached = _cache_hit(key)
-        if cached is not None:
-            _finish_fetch(key, event)
-            return cached
-        failed = _failure_hit(key)
-        if failed is not None:
-            _finish_fetch(key, event)
-            raise WeatherError(failed)
-    else:
-        # 等待领先线程：成功时缓存已写入，直接复用；失败或超时则自己重试
+    # 单飞：同一城市只让一个线程打上游，其余等待并复用结果。等待者每轮
+    # event.wait(timeout*2+1) 后重新登记；轮次用尽仍无结果时按「服务繁忙」
+    # 报错——绝不能未抢到名额就自行请求上游（慢上游 / DNS 挂起时所有等待
+    # 线程会同时重打，把单飞变成惊群并放大上游请求）
+    for _ in range(_FOLLOWER_WAIT_ROUNDS + 1):
+        leader, event = _claim_fetch(key)
+        if leader:
+            # 检查缓存 / 失败 / 降级与登记在途之间可能有别的线程刚好写入
+            cached = _cache_hit(key)
+            if cached is not None:
+                _finish_fetch(key, event)
+                return cached
+            failed = _failure_hit(key)
+            if failed is not None:
+                _finish_fetch(key, event)
+                raise WeatherError(failed)
+            degraded = _degraded_hit(key)
+            if degraded is not None:
+                _finish_fetch(key, event)
+                return degraded
+            try:
+                _admit_upstream()
+            except WeatherError as exc:
+                # 全局额度用尽：释放单飞名额并登记短时失败，避免等待者
+                # 继续排队后重复撞额度
+                _finish_fetch(key, event)
+                _store_failure(key, str(exc))
+                raise
+            break
+        # 等待领先线程：成功时缓存已写入，直接复用；失败或降级同理
         event.wait(timeout * 2 + 1)
         cached = _cache_hit(key)
         if cached is not None:
@@ -256,35 +331,13 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
         failed = _failure_hit(key)
         if failed is not None:
             raise WeatherError(failed)
-        # 领先线程可能因上游故障降级：等待线程直接复用同一份结果，
-        # 不各自重打已故障的上游（并发单飞不失效）
         degraded = _degraded_hit(key)
         if degraded is not None:
             return degraded
-        # 等待超时（领先线程在恶劣网络下可能远超 timeout*2+1 仍在途）：
-        # 重新登记单飞——抢到名额才发起新一轮（并重新检查缓存），否则继续
-        # 等待新的领先者，避免所有等待线程同时重打上游、放大成多轮请求
-        leader, event = _claim_fetch(key)
-        if leader:
-            cached = _cache_hit(key)
-            if cached is not None:
-                _finish_fetch(key, event)
-                return cached
-            failed = _failure_hit(key)
-            if failed is not None:
-                _finish_fetch(key, event)
-                raise WeatherError(failed)
-        else:
-            event.wait(timeout * 2 + 1)
-            cached = _cache_hit(key)
-            if cached is not None:
-                return cached
-            failed = _failure_hit(key)
-            if failed is not None:
-                raise WeatherError(failed)
-            degraded = _degraded_hit(key)
-            if degraded is not None:
-                return degraded
+    else:
+        message = "天气服务繁忙，请稍后再试"
+        _store_failure(key, message)
+        raise WeatherError(message)
     try:
         return _fetch_weather_uncached(name, key, timeout)
     except WeatherError as exc:
