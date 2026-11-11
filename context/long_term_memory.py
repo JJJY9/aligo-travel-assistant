@@ -114,6 +114,8 @@ class LongTermMemory:
         # 「加载时没能确认损坏文件已备份」的标记：等锁超时 / 备份失败时置位，
         # 下一次持锁写入前必须复核并补备份，否则空快照会直接覆盖损坏文件
         self._corrupt_pending = False
+        # 本次启动时被隔离的损坏记忆文件路径（供 CLI 报告，无损坏为 None）
+        self._corrupt_backup: str | None = None
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -161,6 +163,7 @@ class LongTermMemory:
                                 )
                                 try:
                                     os.replace(self.db_path, backup)
+                                    self._corrupt_backup = backup
                                     logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 except OSError as backup_error:
                                     # 文件可能仍被其它进程持有：先以空快照启动，
@@ -221,6 +224,7 @@ class LongTermMemory:
                     "记忆文件损坏且无法备份，已拒绝覆盖写入"
                     f"（可手动处理 {self.db_path}）"
                 ) from exc
+            self._corrupt_backup = backup
             logger.warning("损坏的记忆文件已补备份到 %s", backup)
         self._corrupt_pending = False
 
@@ -825,6 +829,24 @@ class LongTermMemory:
         if limit:
             return messages[-limit:]
         return messages
+
+    def get_chat_summary(self) -> dict[str, Any]:
+        """轻量会话概览：消息总数与有消息的会话 ID 集合。
+
+        只读汇总命令（CLI stats）只需要计数与去重集合，不应完整物化每条
+        消息（PostgreSQL 后端会整表取回正文）。
+        """
+        messages = self.data.get("chat_history") or []
+        sessions = {
+            str(message.get("session_id"))
+            for message in messages
+            if isinstance(message, dict) and message.get("session_id")
+        }
+        return {"messages": len(messages), "sessions": sessions}
+
+    def get_recovered_corrupt_backup(self) -> str | None:
+        """本次实例启动时被隔离的损坏记忆文件路径（无损坏为 None）。"""
+        return self._corrupt_backup
 
     @_locked_mutation
     def delete_chat_session(self, session_id: str) -> int:

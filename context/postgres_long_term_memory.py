@@ -653,6 +653,26 @@ class PostgresLongTermMemory:
             for role, content, session_id_value, created_at in rows
         ]
 
+    def get_chat_summary(self) -> dict[str, Any]:
+        """轻量会话概览：消息总数与有消息的会话 ID 集合（不读取消息正文）。
+
+        CLI stats 此前用 ``get_chat_history()`` 整表取回全部正文，只为数
+        条数与会话集合：数十万条历史时峰值内存超过 1GB。
+        """
+        row = self._fetchone(
+            "SELECT COUNT(*) FROM aligo_chat_messages WHERE user_id = %s",
+            (self.user_id,),
+        )
+        rows = self._fetchall(
+            "SELECT DISTINCT session_id FROM aligo_chat_messages "
+            "WHERE user_id = %s AND session_id IS NOT NULL",
+            (self.user_id,),
+        )
+        return {
+            "messages": int(row[0]) if row else 0,
+            "sessions": {str(session_id) for (session_id,) in rows if session_id},
+        }
+
     def delete_chat_session(self, session_id: str) -> int:
         """删除某个会话的全部聊天记录与元数据（单事务），返回删除条数。"""
 
