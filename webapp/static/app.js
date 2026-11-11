@@ -1257,9 +1257,11 @@ async function downloadFromApi(url, fallbackName) {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    return true;
   } catch (error) {
     // 接口可能返回 400/404/409/503 JSON：不能把错误页当成文件下载
     toast(`下载失败：${error.message}`);
+    return false;
   }
 }
 
@@ -1580,92 +1582,24 @@ function exportSafeName(text) {
   return Array.from(cleaned).slice(0, 40).join("") || "aligo";
 }
 
-function buildExportHtml(title, bodyHtml) {
-  const exportedAt = new Date().toLocaleString("zh-CN");
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(title)}</title>
-<style>
-  :root { --ink:#14262e; --ink-3:#7b8d93; --line:#e2e9e8; --accent:#d9552c;
-    --bg:#f2f5f4; --surface:#ffffff; --code-bg:#0e1e24; --code-ink:#dce9e6; }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-    font: 15px/1.65 "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", system-ui, sans-serif; }
-  .page { max-width: 820px; margin: 24px auto; padding: 32px 36px; background: var(--surface);
-    border-radius: 16px; box-shadow: 0 12px 40px rgba(15, 36, 42, 0.08); }
-  h1 { margin: 0 0 4px; font-size: 22px; }
-  .meta { margin-bottom: 20px; color: var(--ink-3); font-size: 12.5px; }
-  .msg { margin: 18px 0; }
-  .msg.user { display: flex; justify-content: flex-end; }
-  .msg.user .bubble { max-width: 85%; padding: 10px 14px; border-radius: 14px 14px 4px 14px;
-    background: #162c34; color: #f3f7f6; white-space: pre-wrap; }
-  .msg.assistant .bubble { padding: 12px 16px; border: 1px solid var(--line);
-    border-radius: 14px 14px 14px 4px; background: var(--surface); }
-  .msg-head, .trace, .msg-foot, .follow-ups, .code-copy { display: none !important; }
-  .bubble p { margin: 8px 0; }
-  .bubble h2, .bubble h3, .bubble h4 { margin: 14px 0 6px; }
-  .bubble ul, .bubble ol { margin: 8px 0; padding-left: 22px; }
-  .bubble pre { padding: 12px 14px; border-radius: 10px; overflow: auto;
-    background: var(--code-bg); color: var(--code-ink); font-size: 13px; }
-  .bubble code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
-  .bubble table { width: 100%; margin: 10px 0; border-collapse: collapse; font-size: 13.5px; }
-  .bubble th, .bubble td { padding: 6px 10px; border: 1px solid var(--line); text-align: left; }
-  .bubble a { color: var(--accent); }
-  .footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid var(--line);
-    color: var(--ink-3); font-size: 12px; }
-  @media print {
-    body { background: #fff; color: #111; }
-    .page { margin: 0; padding: 0; box-shadow: none; }
-    .msg.user .bubble { background: #f0f0f0 !important; color: #111 !important; }
-    .msg.assistant .bubble { border-color: #ddd; }
-    .bubble pre { background: #f5f5f5 !important; color: #111 !important; border: 1px solid #ddd; }
-    .bubble a { color: #111; }
-    .msg, .bubble { break-inside: avoid; }
-  }
-</style>
-</head>
-<body>
-<div class="page">
-<h1>${escapeHtml(title)}</h1>
-<div class="meta">Aligo 智能旅行助手 · 导出于 ${escapeHtml(exportedAt)}</div>
-${bodyHtml}
-<div class="footer">由 Aligo 智能旅行助手生成 · 回答由 AI 生成，请核对关键信息</div>
-</div>
-</body>
-</html>`;
-}
-
 function exportSessionHtml() {
   if (!state.sessionId) return;
   if (!cancelPendingEdits()) {
     toast("正在保存修改，请稍候");
     return;
   }
-  const title = (els.convTitle.textContent || "").trim() || "Aligo 对话";
-  const clone = els.messages.cloneNode(true);
-  clone
-    .querySelectorAll(".trace, .msg-foot, .follow-ups, .code-copy, .welcome")
-    .forEach((node) => node.remove());
-  const html = buildExportHtml(title, clone.innerHTML);
-  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  const now = new Date();
-  const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
-    2,
-    "0",
-  )}-${String(now.getDate()).padStart(2, "0")}`;
-  link.download = `${exportSafeName(title)}-${localDate}.html`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  // 下载是异步读取 Blob 的，稍后再释放，避免 Firefox / Safari 取消下载
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  toast("HTML 已导出");
+  // 走服务端导出：面板 DOM 只渲染最近 HISTORY_RENDER_WINDOW 条（大历史
+  // 窗口化），克隆 DOM 会把长会话静默截断并带上「显示更早消息」按钮；
+  // 服务端按完整会话渲染（与 Markdown 导出、CLI session-export --html
+  // 同一实现）
+  downloadFromApi(
+    `/api/sessions/${encodeURIComponent(state.sessionId)}/export?user_id=${encodeURIComponent(
+      state.userId,
+    )}&format=html`,
+    `aligo_${state.sessionId}.html`,
+  ).then((ok) => {
+    if (ok) toast("HTML 已导出");
+  });
 }
 
 const USER_IMPORT_MAX_BYTES = 50 * 1024 * 1024;

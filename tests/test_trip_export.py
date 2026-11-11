@@ -276,6 +276,23 @@ def test_render_strips_controls_and_surrogates():
     print("✓ 导出渲染剥离控制序列并转义孤立代理项")
 
 
+def test_html_table_wraps_long_unbroken_fields():
+    """超长不可断字段不能把台账表格撑出页面 / 打印纸张。"""
+    trip = {
+        "trip_id": "t-long",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-06",
+        "purpose": "A" * 5000,
+    }
+    html = render_trips_html([trip], "u1")
+    assert "overflow-wrap: anywhere" in html
+    assert "word-break: break-word" in html
+    assert "A" * 5000 in html
+    print("✓ 台账长字段换行样式")
+
+
 def test_count_ics_events_unfolds_before_counting():
     """折行续行恰好是「 BEGIN:VEVENT」时按展开后的整行计数，不虚增。"""
     from utils.trip_export import count_ics_events
@@ -334,6 +351,7 @@ if __name__ == "__main__":
     test_unpadded_dates_normalized_in_exports()
     test_trips_html_normalizes_unpadded_dates()
     test_render_strips_controls_and_surrogates()
+    test_html_table_wraps_long_unbroken_fields()
     test_count_ics_events_unfolds_before_counting()
     test_ics_unparsable_end_warns()
     print("\n全部通过")
