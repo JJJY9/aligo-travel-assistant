@@ -548,6 +548,42 @@ def test_rollback_failure_does_not_mask_original_error():
     print("✓ 回滚失败不掩盖原始错误")
 
 
+def test_rollback_slot_cleared_after_completion():
+    """完成的回滚任务不能把槽位永远钉住（后续回滚要靠它登记 / drain 等待）。"""
+    runtime, memory = _make_runtime()
+
+    async def scenario():
+        await runtime._rollback_staged_user_message("旧提问")
+        await asyncio.sleep(0)
+        assert runtime._pending_rollback is None
+
+    asyncio.run(scenario())
+    assert memory.rolled_back == ["旧提问"]
+    print("✓ 回滚任务完成后清空槽位")
+
+
+def test_drain_waits_for_rollback_after_stale_slot():
+    """陈旧已完成任务不阻挡新回滚登记：drain 仍等到新回滚落地。"""
+    from utils.errors import MemoryPersistenceError
+
+    runtime, memory = _make_runtime()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stale = loop.create_future()
+        stale.set_result(None)
+        runtime._pending_rollback = stale
+        runtime._pending_persist = None
+        pending = loop.create_future()
+        pending.set_exception(MemoryPersistenceError("落库失败"))
+        turn_state = {"rollback_requested": False}
+        runtime._clear_pending_persist(pending, "你好", turn_state)
+        drained = await runtime.drain_pending_persist(timeout_sec=2.0)
+        assert drained is True
+        assert memory.rolled_back == ["你好"], "drain 返回前回滚必须落地"
+
+    asyncio.run(scenario())
+    print("✓ 陈旧回滚任务不再让 drain 提前放行")
 def test_failed_turn_usage_settled_in_next_turn():
     """失败回合的 token 记账到下一轮成功回合（用量面板不再永久少记）。"""
     import types
@@ -758,6 +794,8 @@ if __name__ == "__main__":
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
     test_memory_without_rollback_hook_is_tolerated()
+    test_rollback_slot_cleared_after_completion()
+    test_drain_waits_for_rollback_after_stale_slot()
     test_failed_turn_usage_settled_in_next_turn()
     test_memory_persistence_error_not_counted_as_model_failure()
     test_open_circuit_short_circuits_ask()

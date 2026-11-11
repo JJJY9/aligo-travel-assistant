@@ -304,7 +304,8 @@ class ConversationRuntime:
     async def _await_pending_rollback(self, timeout_sec: float = 2.0) -> None:
         """等待在途回滚线程结束（有界；后台线程超时后自行完成）。"""
         task = getattr(self, "_pending_rollback", None)
-        if task is None or task.done():
+        if task is None or task.done() or task is asyncio.current_task():
+            # 自 await 会永远等不到自己（包装任务内部请求回滚时会走到这里）
             return
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout_sec)
@@ -332,8 +333,11 @@ class ConversationRuntime:
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
             logger.warning("回滚暂存提问失败", exc_info=True)
 
-    @staticmethod
-    def _consume_background_task(task: asyncio.Future) -> None:
+    def _consume_background_task(self, task: asyncio.Future) -> None:
+        # 完成即清空槽位：陈旧任务会让后续新调度的回滚无法登记，drain
+        # 看到旧任务已完成就提前放行用户锁（回滚线程其实还没跑）
+        if getattr(self, "_pending_rollback", None) is task:
+            self._pending_rollback = None
         if not task.cancelled():
             # 后台任务无人 await：取走异常，避免未检索告警
             task.exception()
@@ -366,8 +370,10 @@ class ConversationRuntime:
         task = asyncio.ensure_future(
             self._request_staged_rollback(user_input, turn_state)
         )
-        if getattr(self, "_pending_rollback", None) is None:
-            # 任务尚未开始执行时也让 drain 能看到它，保证释放用户锁前等待
+        current = getattr(self, "_pending_rollback", None)
+        if current is None or current.done():
+            # 任务尚未开始执行时也让 drain 能看到它，保证释放用户锁前等待。
+            # 旧任务已完成时同样登记：陈旧槽位不能让 drain 提前放行
             self._pending_rollback = task
         task.add_done_callback(self._consume_background_task)
 
