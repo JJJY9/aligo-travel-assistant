@@ -3711,7 +3711,7 @@ def run_session_delete_standalone(
 
         tombstone_token = f"cli-{uuid.uuid4().hex}"
         shared_tombstone = mark_session_deleted(
-            user_id, session_id, source=tombstone_token
+            user_id, session_id, source=tombstone_token, force=True
         )
         try:
             removed = store.delete_chat_session(session_id)
@@ -3719,7 +3719,9 @@ def run_session_delete_standalone(
             if shared_tombstone:
                 # 删除失败、会话仍在：撤销本进程写的墓碑恢复可写
                 # （其它实例 / 进程写的墓碑值不是本 token，不会被误删）
-                unmark_session_deleted(user_id, session_id, source=tombstone_token)
+                unmark_session_deleted(
+                    user_id, session_id, source=tombstone_token, force=True
+                )
             return _fail(f"删除会话失败：{exc}")
     finally:
         close = getattr(store, "close", None)

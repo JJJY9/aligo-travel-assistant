@@ -383,7 +383,7 @@ def test_session_delete_writes_shared_tombstone(monkeypatch):
             return None
 
     redis = _Redis()
-    monkeypatch.setattr(storage, "get_shared_redis_client", lambda: redis)
+    monkeypatch.setattr(storage, "get_shared_redis_client", lambda force=False: redis)
     code, out = _run_delete("u1", "s-active", as_json=True)
     assert code == 0
     assert json.loads(out)["shared_tombstone"] is True

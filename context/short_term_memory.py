@@ -630,7 +630,9 @@ class RedisShortTermMemory:
             # 即整体丢弃，并清空影子缓存，避免故障期继续从影子回放旧对话。
             from utils.tombstones import is_session_deleted
 
-            if is_session_deleted(self.user_id, self.session_id):
+            # force：跳过墓碑模块的失败冷却真实读取一次——本检查紧邻真实
+            # 网络调用，冷却期直接返回 False 会把已删除会话的排队消息放行
+            if is_session_deleted(self.user_id, self.session_id, force=True):
                 logger.warning("会话已删除，丢弃短期记忆重放队列：%s", self.key)
                 ops.clear()
                 journal.stuck = ("", 0)

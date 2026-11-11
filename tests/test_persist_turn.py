@@ -303,7 +303,7 @@ def test_persist_turn_default_guard_commits_when_not_deleted(monkeypatch):
     """墓碑不存在时默认守卫放行，正常一次写入整轮。"""
     from utils import tombstones
 
-    monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s: False)
+    monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s, force=False: False)
     manager = MemoryManager("u-ok", "s-ok", storage_path=tempfile.mkdtemp())
     assert manager.persist_turn("问题", "回答") is True
     assert [item["role"] for item in manager.long_term.get_chat_history()] == [
@@ -445,7 +445,7 @@ def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
     manager.session_id = "s1"
 
     epochs = {"value": "2"}
-    monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s: False)
+    monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s, force=False: False)
     monkeypatch.setattr(
         tombstones, "get_session_epoch", lambda u, s: epochs["value"]
     )

@@ -1460,7 +1460,7 @@ def test_replay_discards_queue_when_session_deleted(monkeypatch):
 
     client.fail = False
     monkeypatch.setattr(
-        tombstones, "is_session_deleted", lambda user_id, session_id: True
+        tombstones, "is_session_deleted", lambda user_id, session_id, force=False: True
     )
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     assert memory.get_recent_context() == []
