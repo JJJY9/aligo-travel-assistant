@@ -1697,6 +1697,8 @@ def test_get_document_group_returns_joined_content(monkeypatch):
         "id": 2,
         "group": "g",
         "parts": 3,
+        "missing_parts": 0,
+        "partial": False,
         "size": 9,
         # 空串拼接与导入还原同口径：分片是原文的连续片段，换行分隔会把
         # 分隔符带进编辑框并让长文档超提交上限
@@ -1707,11 +1709,47 @@ def test_get_document_group_returns_joined_content(monkeypatch):
         "id": 4,
         "group": "",
         "parts": 1,
+        "part": 0,
+        "partial": False,
         "size": 4,
         "content": "普通片段",
     }
     assert knowledge_admin.get_document_group(99) is None
     print("✓ 整组文档回填（按 part 拼接 / 单条 / 不存在）")
+
+
+def test_get_document_group_marks_legacy_and_missing_parts(monkeypatch):
+    """旧版无 group 分片与缺片组都要明确标注，不能显示成「整篇」。"""
+    rows = [
+        {
+            "id": 4,
+            "content": "旧片一",
+            "metadata": json.dumps({"part": "1", "parts": "3"}),
+        },
+        {
+            "id": 10,
+            "content": "首段",
+            "metadata": json.dumps({"part": "1", "parts": "3", "group": "gx"}),
+        },
+        {
+            "id": 11,
+            "content": "尾段",
+            "metadata": json.dumps({"part": "3", "parts": "3", "group": "gx"}),
+        },
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+
+    legacy = knowledge_admin.get_document_group(4)
+    assert legacy["group"] == "" and legacy["partial"] is True
+    assert legacy["part"] == 1, "旧版分片要带当前 part 号，不能冒充整篇"
+    assert legacy["content"] == "旧片一"
+
+    grouped = knowledge_admin.get_document_group(10)
+    assert grouped["parts"] == 3, "声明的总片数不能被实际找到的片数覆盖"
+    assert grouped["missing_parts"] == 1 and grouped["partial"] is True
+    assert grouped["content"] == "首段尾段"
+    print("✓ 整组回填标注旧版分片与缺片")
 
 
 def test_document_group_at_size_limit_roundtrip(monkeypatch):
@@ -2101,8 +2139,8 @@ def test_read_agent_not_cached_when_uninitialized(monkeypatch):
     print("✓ 只读 Agent 未初始化时不缓存、reset 同时清理")
 
 
-def test_delete_document_old_parts_without_group_rejected(monkeypatch):
-    """旧版 parts>1 且无 group 的多分片记录同样拒绝单条删除。"""
+def test_delete_document_old_parts_without_group_single_only(monkeypatch):
+    """旧版 parts>1 且无 group：整组删除拒绝，单条删除允许（无整组可删）。"""
     rows = [
         {
             "id": 1,
@@ -2117,10 +2155,12 @@ def test_delete_document_old_parts_without_group_rejected(monkeypatch):
     ]
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
-    with pytest.raises(ValueError, match="多分片"):
-        knowledge_admin.delete_document(1)
-    assert fake.deleted == [], "拒绝删除时不能动库"
-    print("✓ 旧版无 group 的多分片记录拒绝单条删除")
+    with pytest.raises(ValueError, match="旧版多分片记录"):
+        knowledge_admin.delete_document(1, whole_group=True)
+    assert fake.deleted == [], "拒绝整组删除时不能动库"
+    assert knowledge_admin.delete_document(1) == 1
+    assert fake.deleted == [1], "旧版分片没有整组可删，允许逐片清理"
+    print("✓ 旧版无 group 多分片：拒绝整组、允许逐片删除")
 
 
 def test_update_group_to_single_part_replaces_old_members(monkeypatch):
@@ -2235,7 +2275,7 @@ def test_import_detects_occupied_part_hidden_by_identical_content(monkeypatch):
 
 
 def test_delete_document_whole_group(monkeypatch):
-    """group=1 时删除整组分片；无组标识的旧记录只删除当前片段。"""
+    """group=1 时删除整组分片；旧版无 group 的多分片拒绝整组、允许逐片删除。"""
     def _meta(part, group="g-del"):
         return json.dumps({"part": str(part), "parts": "3", "group": group})
 
@@ -2250,10 +2290,16 @@ def test_delete_document_whole_group(monkeypatch):
 
     assert knowledge_admin.delete_document(2, whole_group=True) == 3
     assert sorted(fake_client.deleted) == [1, 2, 3], "应删除同组全部分片"
-    assert knowledge_admin.delete_document(4, whole_group=True) == 1
-    assert fake_client.deleted == [1, 2, 3, 4], "无 group 的旧记录只删除当前片段"
+    # 旧版多分片无 group：无法确定其余分片，整组删除必须显式拒绝而不是
+    # 只删一片后报「成功」
+    with pytest.raises(ValueError, match="旧版多分片记录"):
+        knowledge_admin.delete_document(4, whole_group=True)
+    assert fake_client.deleted == [1, 2, 3]
+    # 没有整组可删：允许按 id 逐片清理
+    assert knowledge_admin.delete_document(4) == 1
+    assert fake_client.deleted == [1, 2, 3, 4]
     assert knowledge_admin.delete_document(99) == 0
-    print("✓ 知识分片整组删除")
+    print("✓ 知识分片整组删除（旧版分片拒绝整组 / 允许逐片）")
 
 
 def test_import_skips_existing_and_duplicate_content(monkeypatch):
@@ -2848,6 +2894,7 @@ if __name__ == "__main__":
         test_import_restores_per_part_metadata,
         test_import_dry_run_skips_writes,
         test_get_document_group_returns_joined_content,
+        test_get_document_group_marks_legacy_and_missing_parts,
         test_document_group_at_size_limit_roundtrip,
         test_find_duplicate_contents,
         test_delete_document_whole_group,

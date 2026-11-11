@@ -363,6 +363,60 @@ def test_show_missing_and_error(monkeypatch):
     print("✓ kb-show 不存在 / 读取失败")
 
 
+def test_show_marks_legacy_and_missing_parts(monkeypatch):
+    """旧版无 group 分片与缺片组不能显示成「整篇」。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document_group",
+        lambda doc_id: {
+            "id": doc_id,
+            "group": "",
+            "parts": 3,
+            "part": 2,
+            "partial": True,
+            "size": 2,
+            "content": "旧片",
+        },
+    )
+    code, out = _capture(cli.run_knowledge_show_standalone, 4)
+    assert code == 0
+    assert "分片 2/3（旧数据无 group，无法拼接整篇）" in out, out
+    assert "整篇 3 片" not in out
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document_group",
+        lambda doc_id: {
+            "id": doc_id,
+            "group": "gx",
+            "parts": 3,
+            "missing_parts": 1,
+            "partial": True,
+            "size": 4,
+            "content": "首段尾段",
+        },
+    )
+    code, out = _capture(cli.run_knowledge_show_standalone, 10)
+    assert code == 0
+    assert "整篇 3 片 · 缺少 1 片" in out, out
+
+
+def test_delete_legacy_multi_part_message(monkeypatch):
+    """旧版无 group 多分片：--group 明确失败，单条删除可清理。"""
+
+    def fake_delete(doc_id, whole_group=False):
+        if whole_group:
+            raise ValueError("该片段属于旧版多分片记录（共 3 片，无 group 标识）")
+        return 1
+
+    monkeypatch.setattr(knowledge_admin, "delete_document", fake_delete)
+    code, out = _capture(cli.run_knowledge_delete_standalone, 4, whole_group=True)
+    assert code == 1 and "旧版多分片记录" in out, out
+    code, out = _capture(cli.run_knowledge_delete_standalone, 4)
+    assert code == 0 and "已删除知识片段 #4" in out, out
+
+
 def test_kb_show_dispatch(monkeypatch):
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
     monkeypatch.setattr(
@@ -686,13 +740,13 @@ def test_delete_success(monkeypatch):
     assert gcode == 0 and "已删除整组分片 #7（共 3 片）" in gout
     assert calls[-1] == (7, True)
 
-    # 旧记录没有 group：--group 回退为单条删除，提示不能声称删掉了整组
+    # 单片记录加 --group：不能声称删掉了整组
     monkeypatch.setattr(
         knowledge_admin, "delete_document", lambda doc_id, whole_group=False: 1
     )
     fcode, fout = _capture(cli.run_knowledge_delete_standalone, 7, whole_group=True)
-    assert fcode == 0 and "未找到同组分片" in fout
-    print("✓ kb-delete 删除成功（单条 / 整组 / 无组回退）")
+    assert fcode == 0 and "该片段不是多分片记录" in fout
+    print("✓ kb-delete 删除成功（单条 / 整组 / 单片夹 --group）")
 
 
 def test_delete_not_found(monkeypatch):
@@ -965,6 +1019,8 @@ if __name__ == "__main__":
         test_show_unavailable,
         test_show_success_and_json,
         test_show_missing_and_error,
+        test_show_marks_legacy_and_missing_parts,
+        test_delete_legacy_multi_part_message,
         test_kb_show_dispatch,
         test_add_from_file,
         test_add_and_update_failures,
