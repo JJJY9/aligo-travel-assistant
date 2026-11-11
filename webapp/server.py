@@ -2407,6 +2407,51 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# /api/status 每次请求都全量重放用户历史（每条 assistant 消息一次 json.loads）
+# 来汇总用量：长期用户上万条消息时单次刷新要解析数十 MB JSON，面板的每次
+# 操作（保存行程 / 偏好 / 切换用户）都会触发。按用户缓存，指纹只取 O(1)
+# 的首尾消息信息——任何追加、删除、编辑末条或导入都会改变长度 / 时间戳 /
+# 内容长度，命中即直接复用上次的汇总结果。
+_USAGE_SUMMARY_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+_USAGE_SUMMARY_CACHE_MAX = 64
+_usage_summary_cache_lock = threading.Lock()
+
+
+def _usage_history_fingerprint(history: list[dict[str, Any]]) -> tuple[Any, ...]:
+    if not history:
+        return (0,)
+    first = history[0]
+    last = history[-1]
+    return (
+        len(history),
+        str(first.get("timestamp") or ""),
+        len(str(first.get("content") or "")),
+        str(last.get("timestamp") or ""),
+        len(str(last.get("content") or "")),
+    )
+
+
+def _usage_summary_for_user(
+    user_id: str, history: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """带缓存的用量汇总（/api/status 专用；导出路径仍走实时计算）。"""
+    fingerprint = _usage_history_fingerprint(history)
+    with _usage_summary_cache_lock:
+        cached = _USAGE_SUMMARY_CACHE.get(user_id)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+    summary = _usage_summary(history)
+    with _usage_summary_cache_lock:
+        if (
+            user_id not in _USAGE_SUMMARY_CACHE
+            and len(_USAGE_SUMMARY_CACHE) >= _USAGE_SUMMARY_CACHE_MAX
+        ):
+            # 用户 ID 来自请求参数：缓存必须封顶，不能随访问过的用户增长
+            _USAGE_SUMMARY_CACHE.pop(next(iter(_USAGE_SUMMARY_CACHE)), None)
+        _USAGE_SUMMARY_CACHE[user_id] = (fingerprint, summary)
+    return summary
+
+
 def _md_inline(value: object) -> str:
     """导出 Markdown 的单行内联文本：折叠空白 + 尖括号转义（与 CLI 同口径）。"""
     return (
@@ -3241,7 +3286,7 @@ def create_app(model: Any = None) -> FastAPI:
             "archived_count": _archived_count(data),
             "statistics": data["statistics"],
             "storage": describe_backends(),
-            "usage": _usage_summary(data["chat_history"]),
+            "usage": _usage_summary_for_user(user_id, data["chat_history"]),
         }
 
     @app.put("/api/preferences/{pref_type}")
