@@ -38,6 +38,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- PostgreSQL 连接默认有界：新增 `lock_timeout=3000ms` 与 TCP keepalive（30s/10s/3）——此前生产连接只有 `connect_timeout=3`，语句等表锁 / advisory lock 或网络半开时 `_ensure_schema`、查询与重连后的重新加锁都可能无限阻塞（旧连接要等系统默认约 2 小时的 keepalive 才被回收），占满 Web 线程池与会话构造槽，且不抛异常所以失败冷却与 `degraded` 标记都不会触发；`statement_timeout` 仍只按显式传入设置，大备份导入等合法长事务不受默认语句上限影响
 - CLI 不再把被墓碑否决的整轮当成功：`persist_turn` 返回 False（会话已被面板 / 另一终端删除）时回滚暂存的用户提问，并在界面明确提示「本轮未写入长期记忆」——此前直接置 `persisted=True`，暂存提问不回滚，墓碑有效期内每轮都被静默丢弃、短期上下文越积越多无回答的提问；`None`（旧实现无返回值）仍按成功处理，与 ConversationRuntime 同口径
 - PostgreSQL 重复行程清理改为单条原子语句：此前在同一 advisory lock 内先 COUNT、再 SELECT / DELETE；连接在两步之间闪断时 `_reconnect` 只重放 SELECT，过期计数会让并发的另一次去重已留下的保留行也被删掉（同一 `trip_id` 全部消失，调用方还提示清理成功）。现在计数、选行与删除在一条 `DELETE … WHERE id = (SELECT …) AND (SELECT COUNT(*) …) >= 2` 里完成，重连重放时计数在服务端重新求值；新增 `_execute_rowcount` 统一返回受影响行数
 - Redis 短期记忆把服务端状态类错误当暂时故障：`ReadOnlyError`（主从切换后连到只读副本）、`OutOfMemoryError`（noeviction）、`ClusterDownError` / `MasterDownError` / `TryAgainError` 此前被 `_is_transient_redis_error` 判为永久错误——故障重放时同一队首连续 3 次失败即被静默丢弃（约每 3 分钟一条），故障期消息永久缺失、已删除轮次恢复后复活；现在并入暂时故障集合（按类名识别，不 import redis），恢复后按序重放。载荷 / 命令错误（`WRONGTYPE` 等 `ResponseError`）仍按毒操作处理

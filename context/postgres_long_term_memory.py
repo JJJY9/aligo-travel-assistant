@@ -171,11 +171,27 @@ class PostgresLongTermMemory:
     def _connect(self):
         import psycopg
 
-        kwargs: dict[str, Any] = {"autocommit": True, "connect_timeout": 3}
+        # connect_timeout 只覆盖建立连接：语句等表锁 / advisory lock 与网络
+        # 半开时的读取还需要额外上限。lock_timeout 让等锁在 3 秒内报错
+        # （由 _run_with_retry 包装为持久化失败，工厂随之冷却降级），
+        # TCP keepalive 让半开连接在一分钟内被内核发现（系统默认约 2 小时，
+        # 期间旧后端会继续持有 advisory lock / 行锁把重连也卡住）。
+        # statement_timeout 只按调用方显式传入设置：大备份导入等合法长
+        # 事务需要跑满，默认上限会误杀。
+        options = ["-c lock_timeout=3000"]
         if self._statement_timeout_ms:
-            kwargs["options"] = (
+            options.append(
                 f"-c statement_timeout={int(self._statement_timeout_ms)}"
             )
+        kwargs: dict[str, Any] = {
+            "autocommit": True,
+            "connect_timeout": 3,
+            "options": " ".join(options),
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 3,
+        }
         return psycopg.connect(self.dsn, **kwargs)
 
     def _ensure_schema(self) -> None:
