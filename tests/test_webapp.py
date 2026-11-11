@@ -78,6 +78,22 @@ def test_index_page():
     print("✓ 首页可访问（新版界面）")
 
 
+def test_knowledge_busy_maps_to_503(monkeypatch):
+    """知识库写锁超时（导入进行中）：读接口快速 503，不再挂线程等锁。"""
+    from utils import knowledge_admin
+    from webapp import server as server_module
+
+    def busy(*args, **kwargs):
+        raise knowledge_admin.KnowledgeBusyError(
+            "知识库正在写入（导入进行中），请稍后重试"
+        )
+
+    monkeypatch.setattr(server_module, "list_documents", busy)
+    client = _client()
+    response = client.get("/api/knowledge/documents")
+    assert response.status_code == 503, response.text
+    assert "知识库暂不可用" in response.json()["detail"]
+    print("✓ 知识库写锁超时快速 503")
 def test_write_rate_limit_headers_and_rejection(monkeypatch):
     """用户数据写接口有独立的按 IP 额度：超限 429，读接口不受影响。"""
     from webapp import server as server_module
@@ -9308,6 +9324,11 @@ if __name__ == "__main__":
     test_rate_identity_ipv6_aggregation()
     test_validation_error_truncates_large_input()
     test_session_cache_evicts_on_hit_path(pytest.MonkeyPatch())
+    _mp_kb_busy = pytest.MonkeyPatch()
+    try:
+        test_knowledge_busy_maps_to_503(_mp_kb_busy)
+    finally:
+        _mp_kb_busy.undo()
     _mp_write = pytest.MonkeyPatch()
     try:
         test_write_rate_limit_headers_and_rejection(_mp_write)
