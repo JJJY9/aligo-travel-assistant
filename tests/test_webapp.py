@@ -263,6 +263,30 @@ def test_side_effect_guard_requires_same_origin_marker():
         _cleanup(user_id)
     print("✓ 高开销 GET 需同源标记（缺失 Sec-Fetch-Site 不再放行）")
 
+def test_export_concurrency_guard():
+    """全量导出并发受信号量限制：槽位占满时快速 503，不排队申请内存。"""
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_export_slots")
+    acquired = [state.export_slots.acquire(blocking=False) for _ in range(2)]
+    try:
+        assert all(acquired), "测试应能占满导出槽位"
+        for path in (
+            "/api/export",
+            "/api/sessions/export",
+            "/api/sessions/s1/export",
+        ):
+            response = client.get(path, params={"user_id": user_id})
+            assert response.status_code == 503, (path, response.text)
+            assert "导出任务过多" in response.json()["detail"]
+    finally:
+        for _ in acquired:
+            state.export_slots.release()
+    # 槽位释放后不再被并发保护拒绝（无数据可能是 404 / 200）
+    response = client.get("/api/export", params={"user_id": user_id})
+    assert response.status_code != 503, response.text
+    print("✓ 全量导出并发上限（槽位占满快速 503）")
+
 
 def test_health_endpoint():
     data = _client().get("/api/health").json()
@@ -9396,6 +9420,8 @@ if __name__ == "__main__":
     finally:
         _mp_host.undo()
     test_side_effect_guard_requires_same_origin_marker()
+
+    test_export_concurrency_guard()
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
