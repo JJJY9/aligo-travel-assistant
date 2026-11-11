@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from agentscope.agent import AgentBase
@@ -34,6 +35,19 @@ try:
 except ImportError:
     DDGS_AVAILABLE = False
     logger.warning("ddgs not installed. Install with: pip install ddgs")
+
+# 网络搜索与技能内天气查询的专用线程池：ddgs 同步调用在上游限流 / 挂起时
+# 会长时间占用线程，此前走 asyncio 默认执行器会连带堵住所有会话的记忆读写
+# 与落库（同池只有 min(32, CPU+4) 个线程）；独立小池把故障限制在信息查询内
+_SEARCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="aligo-ddgs"
+)
+_WEATHER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="aligo-skill-weather"
+)
+# 单次网络搜索后端的总耗时上限：ddgs 内部约 5s/轮，多重试 / 多引擎叠加时
+# 一次查询可占用半分钟以上；超时按该后端失败继续下一个，不拖死整个回合
+_SEARCH_BACKEND_TIMEOUT_SEC = 20.0
 
 # 疑似垃圾/低质域名：多为 SEO 或不良站，不展示给用户
 _SUSPICIOUS_DOMAIN_PATTERN = re.compile(
@@ -166,7 +180,10 @@ class InformationQueryAgent(AgentBase):
             }
 
         try:
-            data = await asyncio.to_thread(fetch_weather, city)
+            loop = asyncio.get_running_loop()
+            # 专用线程池：上游慢时只影响信息查询本身，不占用默认执行器
+            # （记忆读写 / 落库 / 会话构造都在默认执行器上）
+            data = await loop.run_in_executor(_WEATHER_EXECUTOR, fetch_weather, city)
         except WeatherError as e:
             logger.warning(f"Weather query failed: {e}")
             message = str(e)
@@ -385,9 +402,21 @@ class InformationQueryAgent(AgentBase):
                             )
                         )
 
-                    # ddgs.text 是同步网络调用，必须放到线程池，
-                    # 否则会卡住事件循环（SSE 心跳与其它会话全部停顿）
-                    search_results = await loop.run_in_executor(None, _search)
+                    # ddgs.text 是同步网络调用，必须放到专用线程池，
+                    # 否则会卡住事件循环（SSE 心跳与其它会话全部停顿）；
+                    # 单后端总耗时超限按失败处理，继续下一个后端
+                    try:
+                        search_results = await asyncio.wait_for(
+                            loop.run_in_executor(_SEARCH_EXECUTOR, _search),
+                            timeout=_SEARCH_BACKEND_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        backend_errors.append(
+                            f"搜索后端 {backend} 超时"
+                            f"（>{_SEARCH_BACKEND_TIMEOUT_SEC:.0f}s）"
+                        )
+                        logger.warning("DDGS backend %s timed out", backend)
+                        continue
                     if search_results:
                         break
                     empty_backends += 1

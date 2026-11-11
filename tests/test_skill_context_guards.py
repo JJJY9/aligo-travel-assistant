@@ -149,6 +149,37 @@ def test_rag_error_message_redacts_paths_and_urls():
     assert "Connection refused" in text
     print("✓ RAG 错误文本脱敏且保留瞬时错误关键词")
 
+def test_web_search_backend_timeout_continues(monkeypatch):
+    """单个后端超时按失败处理并继续下一个，不拖死整个信息查询回合。"""
+    import time
+
+    module_globals = InformationQueryAgent._web_search.__globals__
+    monkeypatch.setitem(module_globals, "DDGS", _FakeDDGS)
+    monkeypatch.setitem(module_globals, "DDGS_AVAILABLE", True)
+    monkeypatch.setitem(module_globals, "_SEARCH_BACKEND_TIMEOUT_SEC", 0.05)
+    _FakeDDGS.behavior = {
+        "duckduckgo": lambda: time.sleep(0.3) or [],
+        "google": lambda: [
+            {"href": "https://example.com/a", "title": "结果", "body": "摘要"}
+        ],
+        "auto": [],
+    }
+    started = time.monotonic()
+    agent = _query_agent()
+    agent.model = _FakeModel()
+    agent.skill_loader = _FakeSkillLoader()
+
+    async def _fake_extract(response):
+        return "摘要"
+
+    monkeypatch.setitem(module_globals, "extract_json_from_async_response", _fake_extract)
+    result = asyncio.run(agent._web_search("住宿"))
+    elapsed = time.monotonic() - started
+    assert result["query_success"] is True, result
+    assert result["results"]["sources"], result
+    assert elapsed < 1.0, "后端超时必须被 wait_for 截断，不能等它跑完"
+    print("✓ 搜索后端超时按失败继续下一个后端")
+
 
 def _query_agent() -> InformationQueryAgent:
     return object.__new__(InformationQueryAgent)
@@ -162,6 +193,8 @@ class _FakeDDGS:
 
     def text(self, query, **kwargs):
         result = _FakeDDGS.behavior.get(kwargs.get("backend"))
+        if callable(result):
+            return result()
         if isinstance(result, Exception):
             raise result
         return result or []
