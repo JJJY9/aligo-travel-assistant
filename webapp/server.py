@@ -121,6 +121,10 @@ logger = logging.getLogger(__name__)
 SSE_HEARTBEAT_SEC = 15.0
 # 请求体大小上限（JSON 接口都是小请求；防止超大 body 在 Pydantic 校验前耗尽内存）
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+# 实时写入的条数上限：与备份导入的上限同一口径（utils.user_import），
+# 否则写接口可以无限追加，把用户记忆撑到永远无法导出的状态
+MAX_PREFERENCE_ENTRIES = 200
+MAX_TRIP_ENTRIES = 5000
 # /api/import 要一次性接收整份备份（面板文件上限 50 MB，JSON 包装 / 转义
 # 还有额外开销）；其它路径维持 2 MB
 IMPORT_REQUEST_BODY_BYTES = 64 * 1024 * 1024
@@ -1148,6 +1152,16 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
         )
+        # 用户数据写接口（偏好 / 会话元数据 / 行程 / 删除）：每次写都会全量
+        # 重载并重写用户记忆、占用共享文件锁与数据库连接，必须与读接口分开
+        # 限额，避免未认证客户端用写请求打满线程池 / 存储
+        self.write_limiter = create_rate_limiter(
+            "write",
+            RATE_LIMIT_CONFIG.get("write_requests", 240),
+            RATE_LIMIT_CONFIG.get("window_sec", 60),
+            redis_client,
+            client_factory=redis_factory,
+        )
         # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内；
         # 工厂让启动时 Redis 不可用的实例在恢复后重新参与共享锁
         self.eval_lock = DistributedLock(
@@ -1786,6 +1800,38 @@ def _enforce_read_rate_limit(
     remaining, reset = state.read_limiter.status(client)
     return {
         "X-RateLimit-Limit": str(state.read_limiter.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
+
+
+def _enforce_write_rate_limit(
+    state: AligoWebApp, request: Request
+) -> dict[str, str]:
+    """用户数据写接口的独立限流（按客户端 IP）。
+
+    偏好 / 会话标题 / 置顶 / 归档 / 行程增删改 / 删除会话等每次都会全量
+    重载并重写该用户记忆，并与对话落库共用文件锁或数据库连接：不设额度时
+    几十个并发写就能把 anyio 共享线程池与存储打满。
+    """
+    client = _rate_identity(_client_host(request))
+    retry_after = state.write_limiter.check(client)
+    if retry_after is not None:
+        wait_seconds = max(1, math.ceil(retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail=f"写入过于频繁，请约 {wait_seconds} 秒后重试"
+            f"（请求 ID：{_request_id(request)}）",
+            headers={
+                "Retry-After": str(wait_seconds),
+                "X-RateLimit-Limit": str(state.write_limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(wait_seconds),
+            },
+        )
+    remaining, reset = state.write_limiter.status(client)
+    return {
+        "X-RateLimit-Limit": str(state.write_limiter.limit),
         "X-RateLimit-Remaining": str(remaining),
         "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
     }
@@ -3118,10 +3164,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.put("/api/preferences/{pref_type}")
     def update_preference(
+        request: Request,
         payload: PreferencePayload,
         pref_type: str = ApiPath(..., pattern=_PREF_TYPE_PATTERN),
     ) -> dict[str, Any]:
         """新增或覆盖一条用户偏好（记忆面板的手动维护入口）。"""
+        _enforce_write_rate_limit(state, request)
         # 与 CLI pref-set / 面板显示口径一致：空值 = 未设置，不能回显 200
         # 却让偏好从 /api/status 消失（清空请用 DELETE）
         if not has_preference_value(payload.value):
@@ -3132,8 +3180,19 @@ def create_app(model: Any = None) -> FastAPI:
         # 偏好「凭空消失」；与删除 / 行程写入 / CLI 的严格语义一致）
         store = _open_long_term(payload.user_id, strict=True)
         try:
+            existing = store.get_preference()
+            if pref_type not in existing and len(existing) >= MAX_PREFERENCE_ENTRIES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"偏好条目已达上限（{MAX_PREFERENCE_ENTRIES}），"
+                        "请先删除不用的偏好"
+                    ),
+                )
             store.save_preference(pref_type, payload.value)
             value = store.get_preference(pref_type)
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
             logger.warning("保存偏好失败: %s", exc)
             raise _storage_failure("保存失败", exc) from exc
@@ -3143,10 +3202,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.delete("/api/preferences/{pref_type}")
     def delete_preference(
+        request: Request,
         pref_type: str = ApiPath(..., pattern=_PREF_TYPE_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """删除一条用户偏好（记忆面板的手动维护入口）。"""
+        _enforce_write_rate_limit(state, request)
         # 删除是破坏性操作：PostgreSQL 不可用时不能静默作用在回退 JSON 上
         # （恢复后偏好会「复活」），strict 打开会返回 503
         store = _open_long_term(user_id, strict=True)
@@ -3302,10 +3363,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.put("/api/sessions/{session_id}/title")
     def rename_session(
+        request: Request,
         payload: SessionTitlePayload,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """设置或清除会话自定义标题（空标题恢复自动标题）。"""
+        _enforce_write_rate_limit(state, request)
         # strict：回退 JSON 里没有该会话时会误报 404；元数据也不能写错库
         store = _open_long_term(payload.user_id, strict=True)
         try:
@@ -3325,10 +3388,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.put("/api/sessions/{session_id}/pin")
     def pin_session(
+        request: Request,
         payload: SessionPinPayload,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """置顶 / 取消置顶会话。"""
+        _enforce_write_rate_limit(state, request)
         # strict：同标题接口，PG 故障期不能作用在回退 JSON 上
         store = _open_long_term(payload.user_id, strict=True)
         try:
@@ -3346,10 +3411,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.put("/api/sessions/{session_id}/archive")
     def archive_session(
+        request: Request,
         payload: SessionArchivePayload,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """归档 / 恢复会话（归档只从列表隐藏，不删除消息）。"""
+        _enforce_write_rate_limit(state, request)
         # strict：同标题接口，PG 故障期不能作用在回退 JSON 上
         store = _open_long_term(payload.user_id, strict=True)
         try:
@@ -3457,10 +3524,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(
+        request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """删除会话的全部消息与元数据；等待进行中的对话结束后再删除，避免写回。"""
+        await asyncio.to_thread(_enforce_write_rate_limit, state, request)
         async with state.lock_for(user_id):
             def _exists() -> bool:
                 # 破坏性操作：PostgreSQL 不可用时 strict 打开返回 503，
@@ -3584,6 +3653,7 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.delete("/api/sessions/{session_id}/last-turn")
     async def delete_last_turn(
+        request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
         expect: str | None = Query(default=None, max_length=6000),
@@ -3594,10 +3664,12 @@ def create_app(model: Any = None) -> FastAPI:
         内容（例如这条提问在意图识别阶段就失败、并未写入历史），避免误删上一轮。
         查询串形式限制 6000 字（h11 请求行上限）；更长的提问用 POST body 形式。
         """
+        await asyncio.to_thread(_enforce_write_rate_limit, state, request)
         return await _delete_last_turn_impl(user_id, session_id, expect)
 
     @app.post("/api/sessions/{session_id}/last-turn")
     async def delete_last_turn_post(
+        request: Request,
         payload: LastTurnPayload,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
@@ -3607,6 +3679,7 @@ def create_app(model: Any = None) -> FastAPI:
         FastAPI max_length 或 h11 请求行上限——面板的编辑 / 重新生成在长
         提问上会必然失败。
         """
+        await asyncio.to_thread(_enforce_write_rate_limit, state, request)
         return await _delete_last_turn_impl(
             payload.user_id, session_id, payload.expect
         )
@@ -3943,8 +4016,11 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.post("/api/trips", status_code=201)
-    def create_trip(payload: TripPayload) -> dict[str, Any]:
+    def create_trip(
+        request: Request, payload: TripPayload
+    ) -> dict[str, Any]:
         """手动添加一条行程（同路线 + 同起止日期自动去重）。"""
+        _enforce_write_rate_limit(state, request)
         try:
             start = datetime.strptime(payload.start_date, "%Y-%m-%d")
             end = (
@@ -3964,6 +4040,14 @@ def create_app(model: Any = None) -> FastAPI:
         conflicts: list[dict[str, Any]] = []
         try:
             before = len(store.get_trip_history(limit=None))
+            if before >= MAX_TRIP_ENTRIES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"行程数量已达上限（{MAX_TRIP_ENTRIES}），"
+                        "请先删除旧行程"
+                    ),
+                )
             trip_id = store.save_trip_history(
                 {
                     "origin": payload.origin.strip(),
@@ -3993,6 +4077,8 @@ def create_app(model: Any = None) -> FastAPI:
                 exclude_id=trip_id,
                 exclude_trip=saved_record,
             )
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("添加行程失败: %s", exc)
             raise _storage_failure("添加行程失败", exc) from exc
@@ -4070,10 +4156,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.put("/api/trips/{trip_id}")
     def update_trip(
+        request: Request,
         payload: TripUpdatePayload,
         trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """更新一条行程（仅修改提供的字段；与其它行程重复时返回 409）。"""
+        _enforce_write_rate_limit(state, request)
         fields = payload.model_dump(exclude_unset=True)
         fields.pop("user_id", None)
         if not fields:
@@ -4351,10 +4439,12 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.delete("/api/trips/{trip_id}")
     def delete_trip(
+        request: Request,
         trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         """删除一条历史行程（清理误记录）。"""
+        _enforce_write_rate_limit(state, request)
         # 破坏性操作：PostgreSQL 不可用时不能静默作用在回退 JSON 上
         # （恢复后行程会「复活」），strict 打开会返回 503
         store = _open_long_term(user_id, strict=True)

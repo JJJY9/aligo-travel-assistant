@@ -87,6 +87,7 @@ class RateLimitConfig(TypedDict):
     kb_import_requests: int
     weather_requests: int
     read_requests: int
+    write_requests: int
     window_sec: int
     # 是否信任反向代理写入的 X-Forwarded-For（默认关闭，避免客户端伪造 IP 绕过 IP 桶）
     trust_proxy_headers: bool
@@ -159,6 +160,9 @@ RESILIENCE_CONFIG: ResilienceConfig = {
 #                        面板分批导入需要远高于普通知识库操作的额度）
 #   READ_RATE_LIMIT      面板数据读接口（会话列表 / 状态 / 导出等每次全量读取）
 #                        的单 IP 窗口额度（默认 600）
+#   WRITE_RATE_LIMIT     用户数据写接口（偏好 / 会话元数据 / 行程 / 删除等）的
+#                        单 IP 窗口额度（默认 240）：每次写都会全量重载并重写
+#                        用户记忆，且与对话落库共用文件锁 / 数据库连接
 #   TRUST_PROXY_HEADERS  为 1 时按反向代理的 X-Forwarded-For 第一个地址限流（默认关闭）
 RATE_LIMIT_CONFIG: RateLimitConfig = {
     "chat_requests": _env_int("CHAT_RATE_LIMIT", 30),
@@ -167,6 +171,7 @@ RATE_LIMIT_CONFIG: RateLimitConfig = {
     "kb_import_requests": _env_int("KB_IMPORT_RATE_LIMIT", 1200),
     "weather_requests": _env_int("WEATHER_RATE_LIMIT", 30),
     "read_requests": _env_int("READ_RATE_LIMIT", 600),
+    "write_requests": _env_int("WRITE_RATE_LIMIT", 240),
     "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
     "trust_proxy_headers": _env_bool("TRUST_PROXY_HEADERS", False),
 }

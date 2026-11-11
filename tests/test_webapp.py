@@ -78,6 +78,72 @@ def test_index_page():
     print("✓ 首页可访问（新版界面）")
 
 
+def test_write_rate_limit_headers_and_rejection(monkeypatch):
+    """用户数据写接口有独立的按 IP 额度：超限 429，读接口不受影响。"""
+    from webapp import server as server_module
+
+    monkeypatch.setitem(server_module.RATE_LIMIT_CONFIG, "write_requests", 2)
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app)
+    user_id = _unique_user("web_write_limit")
+    try:
+        for index in (1, 2):
+            response = client.put(
+                f"/api/preferences/p{index}",
+                json={"user_id": user_id, "value": "x"},
+            )
+            assert response.status_code == 200, response.text
+        third = client.put(
+            "/api/preferences/p3", json={"user_id": user_id, "value": "x"}
+        )
+        assert third.status_code == 429, third.text
+        assert third.headers.get("retry-after"), third.headers
+        assert "写入过于频繁" in third.json()["detail"]
+        # 写桶与读桶独立：读接口不因写超限被拒
+        assert client.get("/api/health").status_code == 200
+    finally:
+        _cleanup(user_id)
+    print("✓ 写接口独立限流（超限 429，读接口不受影响）")
+
+
+def test_preference_and_trip_write_caps(monkeypatch):
+    """偏好 / 行程实时写入有条数上限（与导入上限同口径）。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "MAX_PREFERENCE_ENTRIES", 2)
+    monkeypatch.setattr(server_module, "MAX_TRIP_ENTRIES", 1)
+    client = _client()
+    user_id = _unique_user("web_write_caps")
+    try:
+        for name in ("p1", "p2"):
+            response = client.put(
+                f"/api/preferences/{name}",
+                json={"user_id": user_id, "value": "x"},
+            )
+            assert response.status_code == 200, response.text
+        third = client.put(
+            "/api/preferences/p3", json={"user_id": user_id, "value": "x"}
+        )
+        assert third.status_code == 409, third.text
+        assert "上限" in third.json()["detail"]
+        # 覆盖已有偏好不受条数上限影响
+        update = client.put(
+            "/api/preferences/p1", json={"user_id": user_id, "value": "y"}
+        )
+        assert update.status_code == 200, update.text
+
+        trips = [
+            {"origin": "北京", "destination": "杭州", "start_date": "2026-12-01"},
+            {"origin": "上海", "destination": "深圳", "start_date": "2026-12-02"},
+        ]
+        first = client.post("/api/trips", json={"user_id": user_id, **trips[0]})
+        assert first.status_code == 201, first.text
+        second = client.post("/api/trips", json={"user_id": user_id, **trips[1]})
+        assert second.status_code == 409, second.text
+        assert "上限" in second.json()["detail"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 偏好 / 行程写接口条数上限")
 def test_host_header_allowlist_blocks_rebinding():
     """未知 Host 一律 400：DNS rebinding 不能以同源身份读写本机数据。"""
     client = _client()
@@ -9242,6 +9308,16 @@ if __name__ == "__main__":
     test_rate_identity_ipv6_aggregation()
     test_validation_error_truncates_large_input()
     test_session_cache_evicts_on_hit_path(pytest.MonkeyPatch())
+    _mp_write = pytest.MonkeyPatch()
+    try:
+        test_write_rate_limit_headers_and_rejection(_mp_write)
+    finally:
+        _mp_write.undo()
+    _mp_caps = pytest.MonkeyPatch()
+    try:
+        test_preference_and_trip_write_caps(_mp_caps)
+    finally:
+        _mp_caps.undo()
     test_host_header_allowlist_blocks_rebinding()
     _mp_host = pytest.MonkeyPatch()
     try:
