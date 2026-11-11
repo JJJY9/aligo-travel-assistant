@@ -362,6 +362,20 @@ class PostgresLongTermMemory:
 
         return Json(value)
 
+    def _abort_if_reconnected(self, start_conn: object) -> None:
+        """锁内读改写跨连接重建时中止本次写入。
+
+        旧连接失效后 _reconnect 会先释放、再重新获取会话级 advisory lock：
+        这段空档里其它实例可以完成自己的读改写。本调用按重连前读到的快照
+        继续写，会基于过期数据（覆盖别人的更新 / 造出重复行），与
+        save_trip_histories 的批量防护同一口径，直接按持久化失败上报让
+        调用方重试。
+        """
+        if getattr(self, "_conn", None) is not start_conn:
+            raise MemoryPersistenceError(
+                "数据库连接已重建，本轮写入可能基于过期数据，请重试"
+            )
+
     @contextlib.contextmanager
     def _advisory_lock(self, lock_name: str):
         """会话级 advisory lock：同一连接内可重入，连接重建后自动重新获取。"""
@@ -437,7 +451,11 @@ class PostgresLongTermMemory:
         用户在记忆面板修改同一类型偏好互相覆盖。
         """
         with self._preference_lock(pref_type):
+            start_conn = getattr(self, "_conn", None)
             current = self.get_preference(pref_type)
+            # 读期间连接重建：旧 advisory lock 已释放，空档里其它实例可能
+            # 已追加同类型偏好，按旧值合并会覆盖别人的更新
+            self._abort_if_reconnected(start_conn)
             merged = merge_preference_value(current, value)
             self.save_preference(pref_type, merged)
             return merged
@@ -1018,6 +1036,7 @@ class PostgresLongTermMemory:
         purpose: str,
         destination: Any,
     ) -> str:
+        start_conn = getattr(self, "_conn", None)
         start_date = str(trip_info.get("start_date") or "")
         origin = str(trip_info.get("origin") or "")
         end_date = str(trip_info.get("end_date") or start_date)
@@ -1031,6 +1050,9 @@ class PostgresLongTermMemory:
                 "WHERE user_id = %s AND destination = %s AND COALESCE(origin, '') = %s",
                 (self.user_id, destination, origin),
             )
+            # 候选快照跨连接重建即失效：空档里其它实例可能已插入同行程 /
+            # 删掉候选行，按旧快照更新或插入会造出重复
+            self._abort_if_reconnected(start_conn)
             want_start = normalize_identity_date(start_date)
             want_end = normalize_identity_date(end_date)
             existing = next(
@@ -1172,6 +1194,7 @@ class PostgresLongTermMemory:
             ValueError: 更新后与另一条既有行程（同路线 + 同起止日期）重复
         """
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+            start_conn = getattr(self, "_conn", None)
             row = self._fetchone(
                 "SELECT id, origin, destination, start_date, end_date "
                 "FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
@@ -1218,6 +1241,9 @@ class PostgresLongTermMemory:
                 if duplicate:
                     raise ValueError("已存在相同行程（同路线 + 同起止日期）")
 
+            # 冲突检查基于上面的读快照；连接重建后快照可能已过期，
+            # 空档里其它实例可能已插入同行程或删掉本行，不能再按旧快照写
+            self._abort_if_reconnected(start_conn)
             updates = {
                 key: fields[key]
                 for key in (

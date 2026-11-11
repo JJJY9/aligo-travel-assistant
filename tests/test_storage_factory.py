@@ -2490,6 +2490,87 @@ def test_pg_schema_tolerates_concurrent_create_race():
     print("✓ 并发建表竞争被容忍并补齐")
 
 
+def test_pg_update_trip_aborts_when_connection_reconnects():
+    """update_trip 的「冲突检查 + 写入」跨连接重建时中止，不按过期快照更新。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    store._conn = object()
+    writes = []
+
+    def fetchone(sql, params=None):
+        # 模拟读取后连接被重建（_reconnect 只重放本次查询）
+        store._conn = object()
+        return (42, "北京", "杭州", "2026-12-01", "2026-12-02")
+
+    store._fetchone = fetchone
+    store._fetchall = lambda sql, params=None: []
+    store._execute = lambda *args, **kwargs: writes.append(args)
+
+    with pytest.raises(MemoryPersistenceError):
+        store.update_trip("trip_1", {"purpose": "出差"})
+    assert writes == [], "连接重建后不能再基于旧快照写入"
+    print("✓ update_trip 跨重连中止写入")
+
+
+def test_pg_append_preference_aborts_when_connection_reconnects():
+    """append_preference 的「读 + 合并 + 写」跨连接重建时中止，不覆盖别人更新。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._preference_lock = lambda pref_type: contextlib.nullcontext()
+    store._conn = object()
+    saved = []
+
+    def fake_get(pref_type=None):
+        store._conn = object()
+        return "汉庭"
+
+    store.get_preference = fake_get
+    store.save_preference = lambda pref_type, value: saved.append((pref_type, value))
+
+    with pytest.raises(MemoryPersistenceError):
+        store.append_preference("hotel_brands", "如家")
+    assert saved == [], "连接重建后不能按旧偏好合并写回"
+    print("✓ append_preference 跨重连中止写入")
+
+
+def test_pg_save_trip_aborts_when_connection_reconnects():
+    """单条行程保存的候选快照跨连接重建时中止，不造出重复行程。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._conn = object()
+
+    def fetchall(sql, params=None):
+        store._conn = object()
+        return []
+
+    store._fetchall = fetchall
+    store._execute = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("不应写入")
+    )
+
+    with pytest.raises(MemoryPersistenceError):
+        store._save_trip_history_locked(
+            {"origin": "北京", "destination": "杭州", "start_date": "2026-12-01"},
+            "出差",
+            "杭州",
+        )
+    print("✓ 单条行程保存跨重连中止写入")
+
+
 def test_pg_delete_duplicate_trip_is_single_atomic_statement():
     """去重删除必须是单条 SQL：重连重放时计数在服务端重新求值，不删光保留行。"""
     import contextlib as contextlib_module
@@ -2784,6 +2865,9 @@ if __name__ == "__main__":
     test_frequent_destinations_tie_order_is_deterministic()
     test_pg_batch_aborts_when_connection_reconnects()
     test_pg_delete_duplicate_trip_is_single_atomic_statement()
+    test_pg_update_trip_aborts_when_connection_reconnects()
+    test_pg_append_preference_aborts_when_connection_reconnects()
+    test_pg_save_trip_aborts_when_connection_reconnects()
     test_bulk_save_trips_matches_sequential_saves()
     _mp = pytest.MonkeyPatch()
     try:
