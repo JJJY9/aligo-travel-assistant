@@ -126,6 +126,10 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 否则写接口可以无限追加，把用户记忆撑到永远无法导出的状态
 MAX_PREFERENCE_ENTRIES = 200
 MAX_TRIP_ENTRIES = 5000
+
+# 备份导入在读取 64MB 请求体前就先占用导入名额：客户端只发请求头、
+# 不发 body 时不能让名额被无限期占住（两个连接即可让所有导入 503）
+IMPORT_BODY_READ_TIMEOUT_SEC = 60.0
 # /api/import 要一次性接收整份备份（面板文件上限 50 MB，JSON 包装 / 转义
 # 还有额外开销）；其它路径维持 2 MB
 IMPORT_REQUEST_BODY_BYTES = 64 * 1024 * 1024
@@ -4659,7 +4663,19 @@ def create_app(model: Any = None) -> FastAPI:
             )
         try:
             loop = asyncio.get_running_loop()
-            raw_body = await request.body()
+            try:
+                raw_body = await asyncio.wait_for(
+                    request.body(), timeout=IMPORT_BODY_READ_TIMEOUT_SEC
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    status_code=408,
+                    detail=(
+                        f"读取备份数据超时（{int(IMPORT_BODY_READ_TIMEOUT_SEC)} 秒），"
+                        "请重试"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                ) from None
             try:
                 payload = await loop.run_in_executor(
                     state.import_executor, UserImportPayload.model_validate_json, raw_body

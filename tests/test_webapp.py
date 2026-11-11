@@ -287,6 +287,53 @@ def test_export_concurrency_guard():
     assert response.status_code != 503, response.text
     print("✓ 全量导出并发上限（槽位占满快速 503）")
 
+def test_import_slow_body_times_out_and_frees_slot(monkeypatch):
+    """只发请求头不发 body：60 秒内超时 408，导入名额必须释放。"""
+    import asyncio
+
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "IMPORT_BODY_READ_TIMEOUT_SEC", 0.05)
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    events: list = []
+
+    async def receive():
+        if not events:
+            events.append("first-request-chunk")
+            return {"type": "http.request", "body": b"", "more_body": True}
+        await asyncio.sleep(10)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            events.append(message["status"])
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/import",
+        "raw_path": b"/api/import",
+        "query_string": b"user_id=slowbody-user",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", b"67108864"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    asyncio.run(app(scope, receive, send))
+    assert 408 in events, events
+    assert state.import_queue_slots.acquire(blocking=False), (
+        "读取 body 超时后必须释放导入名额"
+    )
+    state.import_queue_slots.release()
+    print("✓ 慢速请求体超时 408 并释放导入名额")
+
 
 def test_health_endpoint():
     data = _client().get("/api/health").json()
@@ -9422,6 +9469,12 @@ if __name__ == "__main__":
     test_side_effect_guard_requires_same_origin_marker()
 
     test_export_concurrency_guard()
+
+    _mp_slow_body = pytest.MonkeyPatch()
+    try:
+        test_import_slow_body_times_out_and_frees_slot(_mp_slow_body)
+    finally:
+        _mp_slow_body.undo()
     test_health_endpoint()
     test_knowledge_endpoint()
     test_doctor_endpoint()
