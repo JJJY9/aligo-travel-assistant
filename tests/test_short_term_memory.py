@@ -646,6 +646,38 @@ def test_outage_truncate_keeps_other_instance_messages(monkeypatch):
     print("✓ 故障期截断只精确删除本对象删掉的消息")
 
 
+def test_online_truncate_refreshes_stale_shadow(monkeypatch):
+    """在线截断成功：影子缓存过期时按 Redis 整体刷新，不按文本误删旧轮次。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    alice = module.RedisShortTermMemory(
+        client, "s-refresh", max_turns=5, user_id="u1"
+    )
+    bob = module.RedisShortTermMemory(
+        client, "s-refresh", max_turns=5, user_id="u1"
+    )
+    alice.add_message("user", "同一句话")
+    alice.add_message("assistant", "A1")
+    # 另一实例写入文本相同的下一轮：alice 的影子缓存里看不到它
+    bob.add_message("user", "同一句话")
+    bob.add_message("assistant", "A2")
+
+    assert alice.truncate_last_turn("同一句话") == 2
+    # Redis 删的是 bob 的最后一轮；alice 的影子必须与 Redis 一致（保留第一轮），
+    # 不能按 expect 文本把仍在 Redis 的第一轮也删掉
+    shadow = [item["content"] for item in alice._fallback.messages]
+    assert shadow == ["同一句话", "A1"], shadow
+
+    client.fail = True
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [item["content"] for item in alice.get_recent_context()]
+    assert contents == ["同一句话", "A1"], contents
+    client.fail = False
+    print("✓ 在线截断后影子缓存按 Redis 整体刷新（多实例不误删）")
+
+
 def test_outage_transient_truncate_queues_conditional_delete(monkeypatch):
     """临时对象影子缓存为空时，故障期截断也要记录，恢复后条件删除仍生效。"""
     from context import short_term_memory as module
@@ -1799,6 +1831,11 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_outage_truncate_keeps_other_instance_messages(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_online_truncate_refreshes_stale_shadow(_mp)
     finally:
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()

@@ -839,33 +839,52 @@ class RedisShortTermMemory:
             # 真实内容校正影子缓存（重启 / LRU 淘汰后的新实例、其它实例
             # 的写入、已过期的旧消息都以这里为准）
             raw = self.client.lrange(self.key, -window, -1)
-            messages: list[dict[str, Any]] = []
-            for item in raw:
-                try:
-                    message = json.loads(item)
-                except (TypeError, json.JSONDecodeError, RecursionError):
-                    # 坏元素（旧版本或人工修复写入）不能让整次读取失败，
-                    # 否则数据错误会被当作「Redis 不可用」触发进程级冷却。
-                    # 深嵌套 JSON 解析抛 RecursionError，同样按坏条目跳过
-                    logger.warning("跳过无法解析的短期记忆条目：%s", self.key)
-                    continue
-                if (
-                    isinstance(message, dict)
-                    and isinstance(message.get("role"), str)
-                    and isinstance(message.get("content"), str)
-                ):
-                    messages.append(message)
-                elif isinstance(message, dict):
-                    # 可解析但形状不对（缺 role/content）：同样跳过，否则
-                    # 下游 _build_context 的 message["role"] 会让整个会话
-                    # 每轮都 KeyError（比无法解析的条目更隐蔽）
-                    logger.warning("跳过形状非法的短期记忆条目：%s", self.key)
+            messages = self._parse_window(raw)
             self._fallback.messages = messages[-window:]
             if n_turns is None:
                 return messages
             return messages[-n_turns * 2:]
 
         return self._redis(op, lambda: self._fallback.get_recent_context(n_turns))
+
+    def _parse_window(self, raw) -> list[dict[str, Any]]:
+        """解析窗口内的消息条目；坏元素跳过而不是让整次读取失败。
+
+        无法解析的条目（旧版本或人工修复写入）与形状非法的条目都要跳过：
+        前者按 Redis 故障处理会触发进程级冷却，后者会让下游
+        ``message["role"]`` 每轮 KeyError。
+        """
+        messages: list[dict[str, Any]] = []
+        for item in raw:
+            try:
+                message = json.loads(item)
+            except (TypeError, json.JSONDecodeError, RecursionError):
+                # 深嵌套 JSON 解析抛 RecursionError，同样按坏条目跳过
+                logger.warning("跳过无法解析的短期记忆条目：%s", self.key)
+                continue
+            if (
+                isinstance(message, dict)
+                and isinstance(message.get("role"), str)
+                and isinstance(message.get("content"), str)
+            ):
+                messages.append(message)
+            elif isinstance(message, dict):
+                logger.warning("跳过形状非法的短期记忆条目：%s", self.key)
+        return messages
+
+    def _refresh_fallback(self, window: int) -> None:
+        """用 Redis 的真实内容整体替换影子缓存；读取失败时保持影子不动。
+
+        在线截断成功后不能按 expect 在影子缓存里再删一次：影子可能没见过
+        其它实例写入的最新轮次，按文本匹配会删掉仍在 Redis 的旧轮次（用户
+        重复提问时）或删不掉已删除的轮次。删除是低频操作，多一次读取可接受。
+        """
+        try:
+            raw = self.client.lrange(self.key, -window, -1)
+        except Exception:  # noqa: BLE001 - 刷新失败保持影子不动，等下次成功读取
+            logger.debug("刷新短期记忆影子缓存失败：%s", self.key, exc_info=True)
+            return
+        self._fallback.messages = self._parse_window(raw)[-window:]
 
     def get_context_string(self, n_turns: int = 5) -> str:
         messages = self.get_recent_context(n_turns)
@@ -964,9 +983,11 @@ class RedisShortTermMemory:
             # 场景的少量标记（未删除的成功会随 TTL 过期）
             self._forget_marker(op_id)
         if via_redis and count:
-            # Redis 删除成功时同步镜像缓存，避免 Redis 再故障时把已删除的
-            # 一轮从影子缓存读回来
-            self._fallback.truncate_last_turn(expect)
+            # Redis 删除成功：以 Redis 为准整体刷新影子缓存。不能按 expect
+            # 在本地再删一次——影子可能缺少其它实例写入的最新轮次，文本
+            # 匹配会删掉仍在 Redis 的旧轮次（用户重复提问时）或删不掉已
+            # 删除的轮次；读取失败时保持影子不动，绝不盲删
+            self._refresh_fallback(self.max_turns * 2)
         logger.info(
             "Truncated last turn from Redis memory: %s (%s messages)", self.key, count
         )
