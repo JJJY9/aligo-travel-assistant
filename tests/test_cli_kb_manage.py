@@ -527,6 +527,38 @@ def test_update_merges_existing_metadata(monkeypatch):
     print("✓ kb-update 合并既有元数据（不整体重建）")
 
 
+def test_update_passes_legacy_long_metadata_untruncated(monkeypatch):
+    """库中旧超长元数据不得被静默截断：原样传给 update_document 由其拒绝。"""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    long_value = "长" * 240
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document",
+        lambda doc_id: {
+            "id": doc_id,
+            "content": "旧",
+            "metadata": {"category": long_value},
+        },
+    )
+    captured = {}
+
+    def fake_update(doc_id, content, metadata=None):
+        captured["metadata"] = metadata
+        raise ValueError("元数据值不能超过 200 字（键 category）")
+
+    monkeypatch.setattr(knowledge_admin, "update_document", fake_update)
+    doc = Path(tempfile.mkdtemp()) / "doc.txt"
+    doc.write_text("新内容", encoding="utf-8")
+    code, out = _capture(cli.run_knowledge_update_standalone, 7, str(doc))
+    assert code == 1
+    assert "元数据值不能超过 200 字" in out
+    assert captured["metadata"]["category"] == long_value, "不能被截断后写回"
+    print("✓ kb-update 不再静默截断旧超长元数据")
+
+
 def test_duplicates_json_output(monkeypatch):
     """kb-duplicates --json：结构化分组（含 preview / ids）与错误输出。"""
     import json as _json
@@ -937,6 +969,7 @@ if __name__ == "__main__":
         test_add_from_file,
         test_add_and_update_failures,
         test_update_merges_existing_metadata,
+        test_update_passes_legacy_long_metadata_untruncated,
         test_update_reports_leftover_parts,
         test_kb_write_args_and_dispatch,
     ):

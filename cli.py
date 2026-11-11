@@ -2743,8 +2743,11 @@ def run_knowledge_update_standalone(
     if existing is None:
         print(f"知识片段 {doc_id} 不存在")
         return 1
+    # 与面板整份编辑同一语义：显式提供的字段覆盖，其余原样保留。
+    # 不能在这里截断旧值——update_document 的校验会明确拒绝超长元数据，
+    # 静默截断会让「原样保存」重写记录并永久丢失超长值
     merged_metadata = {
-        str(key)[:32]: str(value)[:200]
+        str(key): str(value)
         for key, value in (existing.get("metadata") or {}).items()
     }
     merged_metadata.update(metadata or {})
