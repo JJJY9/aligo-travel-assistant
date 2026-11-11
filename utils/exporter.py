@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from utils.console import strip_terminal_controls
-from utils.json_safe import sanitize_json
+from utils.json_safe import sanitize_json, strip_nul
 from utils.session_markdown import sanitize_body
 from utils.stored_message import render_stored_message
 
@@ -29,18 +29,6 @@ def _md_cell(value: Any) -> str:
     # 「转义后的竖线」，单元格行仍按 `|` 切列而错位
     text = text.replace("\\", "\\\\").replace("|", "\\|")
     return text.replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _strip_nul_deep(value: Any) -> Any:
-    """递归移除字符串中的 NUL：备份导入会整条拒绝含 NUL 的消息，
-    导出侧必须先清洗，否则「导出成功」的备份恢复时静默丢消息。"""
-    if isinstance(value, str):
-        return value.replace("\x00", "")
-    if isinstance(value, list):
-        return [_strip_nul_deep(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _strip_nul_deep(item) for key, item in value.items()}
-    return value
 
 
 def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -76,7 +64,7 @@ def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:
                     except (TypeError, ValueError):
                         pass
             message["content"] = text
-    return _strip_nul_deep(cleaned)
+    return strip_nul(cleaned)
 
 
 def render_markdown(data: dict[str, Any]) -> str:
