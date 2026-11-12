@@ -347,16 +347,20 @@ class ConversationRuntime:
             # 回合用量重复记账（此前 done 在回滚之后才置位）
             settlement["done"] = True
             await self._request_staged_rollback(user_input, turn_state)
-        if committed is not False and defer_supported:
-            # 整轮问答已成功落库：现在才提交偏好 / 行程；取消与墓碑否决
-            # 的回合不会执行到这里，避免台账出现没有对话的事实记录
-            try:
-                await self.orchestrator.commit_deferred_memory()
-            except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
-                logger.warning("提交延迟记忆写入失败", exc_info=True)
+        if committed is not False:
+            # 整轮已落库（_meta.usage 已写入消息）：先标记结算，再提交延迟
+            # 记忆——提交期间被取消（停止 / 断连）时，ask() 外层兜底不能把
+            # 同一份用量再记入下一轮（与 CLI 的 usage_settled 时序一致）
+            settlement["done"] = True
+            if defer_supported:
+                # 现在才提交偏好 / 行程；取消与墓碑否决的回合不会执行到这里，
+                # 避免台账出现没有对话的事实记录
+                try:
+                    await self.orchestrator.commit_deferred_memory()
+                except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
+                    logger.warning("提交延迟记忆写入失败", exc_info=True)
         # 成功落库（True / 旧的 None 语义）时 _meta.usage 已在消息里；
         # 否决分支已记账——本轮用量已有归宿
-        settlement["done"] = True
         return {
             "reply": result_to_markdown(result_data),
             "agents": agents,
