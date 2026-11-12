@@ -124,6 +124,12 @@ const state = {
   sessionLoading: false,
   // 正在进行加载的会话 id：删除其它会话时不能作废这次加载
   sessionLoadingId: null,
+  // 已渲染窗口的起点 {sessionId, start}：静默重载（停止对账）按同一起点
+  // 重建，用户已点开的更早消息不会从 DOM 消失、旧滚动位置仍然有效
+  renderedStart: null,
+  // 当前 DOM 只渲染到搜索命中窗口、会话更新部分尚未渲染：此期间会话末尾
+  // 不在 DOM 中，编辑 / 重新生成会指向错误的「最后一轮」，一律隐藏
+  partialHistory: false,
   // 偏好编辑被取消时置位：刷新被有意跳过，面板关闭时补一次
   statusStale: false,
 };
@@ -753,6 +759,9 @@ function renderUserNode(text) {
 function refreshEditButtons() {
   els.messages.querySelectorAll(".user-edit").forEach((node) => node.remove());
   if (state.busy || state.sessionLoading || !state.sessionId) return;
+  // 会话末尾未渲染（搜索命中窗口）：「编辑最后一条」会删除并重发服务端
+  // 真正的最后一轮，而不是 DOM 末尾这一条——在补到会话结尾前不提供入口
+  if (state.partialHistory) return;
   const users = els.messages.querySelectorAll(".msg.user");
   const last = users[users.length - 1];
   if (!last) return;
@@ -1007,6 +1016,12 @@ function renderAssistantNode(markdown, options = {}) {
   const { timestamp = "", regenText = "", meta = null } = options;
   const node = document.createElement("div");
   node.className = "msg assistant";
+  // 历史回合同样记录 client_turn_id：从历史打开会话后点「编辑 / 重新生成」
+  // 要用它精确确认「服务端最后一轮确实是本轮」；缺了它服务端退化为按提问
+  // 文本匹配，会误删其它标签页 / CLI 并发写入的同文问答
+  if (meta && typeof meta.client_turn_id === "string" && meta.client_turn_id) {
+    node.dataset.turnId = meta.client_turn_id;
+  }
   const bubble = document.createElement("div");
   bubble.className = "bubble answer";
   bubble.innerHTML = renderMarkdown(markdown || "（无内容）");
@@ -1184,6 +1199,12 @@ async function regenerate(node, text) {
 
 function trimRegenButtons() {
   const buttons = [...els.messages.querySelectorAll('[data-action="regen"]')];
+  if (state.partialHistory) {
+    // 会话末尾未渲染（搜索命中窗口）：DOM 末尾不是真正的最后一轮，
+    // 「重新生成」会按提问文本匹配删除服务端最新问答，全部隐藏
+    buttons.forEach((button) => button.remove());
+    return;
+  }
   buttons.slice(0, -1).forEach((button) => button.remove());
   // 会话以「用户提问」结尾（提问已保存但没有回答：被停止 / 编排中断）时，
   // 上一条回答的「重新生成」对应的已不是最后一轮：保留点击只会 mismatch，
@@ -1221,7 +1242,11 @@ const FOLLOW_UP_SETS = {
 };
 
 function buildFollowUps(agents) {
-  const names = new Set((agents || []).map((agent) => agent && agent.name).filter(Boolean));
+  // 历史数据的 _meta.agents 可能是对象 / 字符串等非数组真值（旧版本或
+  // 手工编辑的备份）：直接 .map 会抛 TypeError，被 openSession 的 catch
+  // 当成「加载会话失败」、静默恢复时还会清掉已保存的会话 ID
+  const list = Array.isArray(agents) ? agents : [];
+  const names = new Set(list.map((agent) => agent && agent.name).filter(Boolean));
   for (const key of [
     "itinerary_planning",
     "information_query",
@@ -2016,6 +2041,7 @@ function newSession() {
   state.sessionLoading = false;
   state.sessionLoadingId = null;
   state.sessionId = null;
+  state.partialHistory = false;
   safeStorageRemove("session", "aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
@@ -2507,14 +2533,33 @@ async function openSession(sessionId, options = {}) {
     setConversationTitle(session ? session.title : data.title || "对话");
 
     els.messages.innerHTML = "";
+    state.partialHistory = false;
     // 大历史按窗口渲染：整段同步逐条 renderMarkdown + innerHTML 会冻结主线程
     // （备份导入允许 20 万条消息）；「显示更早消息」从已取回的数据里补一批
     const totalMessages = data.messages.length;
     const matchIndex = Number.isInteger(options.matchIndex) ? options.matchIndex : -1;
     let renderStart = Math.max(0, totalMessages - HISTORY_RENDER_WINDOW);
+    // 静默重载（停止对账）：用户此前可能点开过更早的消息，恢复同一渲染
+    // 起点重建，否则已展开的历史从 DOM 消失、旧 scrollTop 指向其它内容。
+    // 只对同一会话生效；展开过的条数是用户自己的选择，不会无限增长
+    if (
+      options.silent &&
+      state.renderedStart &&
+      state.renderedStart.sessionId === sessionId &&
+      state.renderedStart.start < renderStart
+    ) {
+      renderStart = state.renderedStart.start;
+    }
+    let renderEnd = totalMessages;
     if (matchIndex >= 0 && matchIndex < renderStart) {
-      // 搜索定位的目标在首屏窗口之外：从目标处开始渲染，保证能滚动到
-      renderStart = matchIndex;
+      // 搜索定位的目标在首屏窗口之外：命中处上下各留一半上下文，只渲染
+      // **一个窗口**并在下方补「显示更新消息」。从目标一路渲染到会话结尾
+      // 会绕过窗口上限，备份导入允许 20 万条消息，长会话会冻结主线程
+      renderStart = Math.max(
+        0,
+        matchIndex - Math.floor(HISTORY_RENDER_WINDOW / 2),
+      );
+      renderEnd = Math.min(totalMessages, renderStart + HISTORY_RENDER_WINDOW);
     }
     const pairTextBefore = (index) => {
       for (let i = index - 1; i >= 0; i -= 1) {
@@ -2549,8 +2594,10 @@ async function openSession(sessionId, options = {}) {
         lastAssistantMeta: windowLastAssistantMeta,
       };
     };
-    const initial = buildNodes(renderStart, totalMessages);
+    const initial = buildNodes(renderStart, renderEnd);
     initial.nodes.forEach((node) => els.messages.appendChild(node));
+    state.renderedStart = { sessionId, start: renderStart };
+    state.partialHistory = renderEnd < totalMessages;
     const lastAssistantNode = initial.lastAssistantNode;
     const lastAssistantMeta = initial.lastAssistantMeta;
 
@@ -2573,6 +2620,7 @@ async function openSession(sessionId, options = {}) {
         // 补入的内容把已有节点向下推：同步滚动量，保持当前阅读位置
         els.scroll.scrollTop += els.scroll.scrollHeight - before;
         renderStart = nextStart;
+        state.renderedStart = { sessionId, start: renderStart };
         if (renderStart === 0) {
           earlierButton.remove();
           earlierButton = null;
@@ -2580,6 +2628,39 @@ async function openSession(sessionId, options = {}) {
           updateEarlierButton();
         }
         refreshEditButtons();
+        // 补入更早的回答后只保留最后一轮（DOM 末尾）的「重新生成」：
+        // 旧回答重新长出按钮，点击会按提问文本匹配删除服务端最新一轮
+        trimRegenButtons();
+      });
+    }
+
+    let laterButton = null;
+    if (renderEnd < totalMessages) {
+      laterButton = document.createElement("button");
+      laterButton.type = "button";
+      laterButton.className = "earlier-more";
+      const updateLaterButton = () => {
+        laterButton.textContent = `显示更新消息（还有 ${
+          totalMessages - renderEnd
+        } 条）`;
+      };
+      updateLaterButton();
+      els.messages.appendChild(laterButton);
+      laterButton.addEventListener("click", () => {
+        const nextEnd = Math.min(totalMessages, renderEnd + HISTORY_RENDER_WINDOW);
+        const newer = buildNodes(renderEnd, nextEnd);
+        newer.nodes.forEach((node) => els.messages.insertBefore(node, laterButton));
+        renderEnd = nextEnd;
+        if (renderEnd >= totalMessages) {
+          laterButton.remove();
+          laterButton = null;
+          // 会话末尾重新进入 DOM：编辑 / 重新生成恢复指向真正的最后一轮
+          state.partialHistory = false;
+        } else {
+          updateLaterButton();
+        }
+        refreshEditButtons();
+        trimRegenButtons();
       });
     }
 
@@ -2589,7 +2670,10 @@ async function openSession(sessionId, options = {}) {
     trimRegenButtons();
     refreshEditButtons();
     markActiveHistory();
-    const localMatch = matchIndex >= renderStart ? matchIndex - renderStart : -1;
+    const localMatch =
+      matchIndex >= renderStart && matchIndex < renderEnd
+        ? matchIndex - renderStart
+        : -1;
     const matchNode =
       localMatch >= 0
         ? els.messages.querySelectorAll(".msg")[localMatch]
@@ -2765,6 +2849,16 @@ async function sendMessage(text, options = {}) {
   if (state.sessionLoading) {
     toast("会话正在加载，请稍候");
     return;
+  }
+  if (state.partialHistory && state.sessionId) {
+    // 搜索命中视图只渲染了会话中间一段：直接发送会把新问答接在窗口末尾、
+    // 中间历史缺失（发送后的静默重载还会把整段中间一起补渲染）。先回到
+    // 最新的尾部窗口再发送
+    await openSession(state.sessionId);
+    if (state.sessionLoading) {
+      toast("会话正在加载，请稍候");
+      return;
+    }
   }
   const draft = els.input.value;
 
