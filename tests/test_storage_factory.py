@@ -2205,6 +2205,74 @@ def test_trip_update_and_conflict():
     print("✓ 行程更新（字段 / 统计 / 清空日期 / 冲突拒绝）")
 
 
+def test_trip_frequent_destinations_ignore_dirty_dates():
+    """常去目的地与批量 / 删除 / PG 同口径：脏日期行程不计入、不能误删合法计数。"""
+    memory = LongTermMemory("u-trip-dirty", tempfile.mkdtemp())
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-03-11",
+            "end_date": "2026-03-12",
+        }
+    )
+    # 备份保真保留的旧格式日期（非法）单条保存：不计入常去目的地
+    dirty_id = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026/03/12",
+            "end_date": "2026/03/13",
+        }
+    )
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 1}
+
+    # 只改脏日期行程的目的地：不能扣合法计数、也不能给脏行程虚增
+    assert memory.update_trip(dirty_id, {"destination": "广州"}) is True
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 1}
+
+    # 修正日期（不改目的地）：变为可计数
+    assert (
+        memory.update_trip(
+            dirty_id, {"destination": "上海", "start_date": "2026-03-12"}
+        )
+        is True
+    )
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 2}
+
+    # 反向：合法行程被改成脏日期 → 扣除计数
+    assert memory.update_trip("trip_1", {"start_date": "2026/03/11"}) is True
+    assert memory.get_statistics()["frequent_destinations"] == {"上海": 1}
+    print("✓ 行程更新按出发日期可解析性维护常去目的地")
+
+
+def test_bulk_message_dedupe_normalizes_legacy_int_session_id():
+    """旧数据的整数 session_id 与解析后的字符串 id 视为同一会话（幂等恢复）。"""
+    root = tempfile.mkdtemp()
+    memory = LongTermMemory("u-int-dedupe", root)
+    memory.add_chat_message("user", "Q", "s1")
+    path = Path(root) / "u-int-dedupe.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["chat_history"] = [
+        {
+            "role": "user",
+            "content": "Q",
+            "timestamp": "2026-01-01T00:00:00",
+            "session_id": 123,
+        }
+    ]
+    data.setdefault("statistics", {})["total_messages"] = 1
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    added = memory.add_chat_messages(
+        [{"role": "user", "content": "Q", "session_id": "123"}], dedupe=True
+    )
+    assert added == 0, "整数旧 id 与字符串 id 必须去重"
+    assert len(memory.get_chat_history(limit=None)) == 1
+    assert memory.get_statistics()["total_messages"] == 1
+    print("✓ 批量恢复对整数 session_id 幂等")
+
+
 def test_reload_rejects_non_object_json():
     """磁盘文件是合法 JSON 但非对象（[] / null）：重载报错而不是沿用旧快照。"""
     from utils.errors import MemoryPersistenceError
@@ -3392,6 +3460,8 @@ if __name__ == "__main__":
     test_delete_dirty_date_trip_keeps_frequent_destinations()
     test_pg_frequent_destinations_skip_dirty_dates()
     test_trip_update_and_conflict()
+    test_trip_frequent_destinations_ignore_dirty_dates()
+    test_bulk_message_dedupe_normalizes_legacy_int_session_id()
     test_next_trip_id_not_reused_after_deleting_latest()
     test_one_day_trip_dedupes_end_date_variants()
     test_session_titles()
