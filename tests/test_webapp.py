@@ -6292,6 +6292,38 @@ def test_deleted_session_cannot_be_resurrected():
         _cleanup(user_id)
 
 
+def test_breaker_open_does_not_consume_rate_limit():
+    """熔断打开的 503 不消耗用户 / IP 限流额度（恢复后重试不被 429 锁住）。"""
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    for _ in range(state.breaker.failure_threshold):
+        state.breaker.record_failure()
+    state.rate_limiter = RateLimiter(limit=5, window_sec=60)
+    state.ip_limiter = RateLimiter(limit=5, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_breaker_quota")
+    try:
+        for path in ("/api/chat", "/api/chat/stream"):
+            response = client.post(
+                path,
+                json={
+                    "message": "你好",
+                    "user_id": user_id,
+                    "session_id": "bq-1",
+                },
+            )
+            assert response.status_code == 503, (path, response.text[:200])
+        remaining, _ = state.rate_limiter.status(f"testclient:{user_id}")
+        assert remaining == 5, f"熔断拒绝消耗了用户桶额度（剩 {remaining}）"
+        ip_remaining, _ = state.ip_limiter.status("testclient")
+        assert ip_remaining == 5, f"熔断拒绝消耗了 IP 桶额度（剩 {ip_remaining}）"
+        print("✓ 熔断打开的拒绝不消耗限流额度")
+    finally:
+        _cleanup(user_id)
+
+
 def test_pending_tombstone_replay_after_redis_recovers():
     """Redis 故障期删除：恢复后补写共享墓碑与会话纪元；回滚则撤销待补写。"""
 
@@ -10731,6 +10763,7 @@ if __name__ == "__main__":
     test_tombstone_helpers_are_thread_safe()
     test_repeated_delete_repairs_shared_tombstone()
     test_pending_tombstone_replay_after_redis_recovers()
+    test_breaker_open_does_not_consume_rate_limit()
     test_session_metadata_requires_existing_session()
     test_session_rename()
     test_session_pin()

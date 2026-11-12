@@ -4162,6 +4162,18 @@ def create_app(model: Any = None) -> FastAPI:
     async def chat(
         request: Request, payload: ChatRequest, response: Response
     ) -> dict[str, Any]:
+        # 熔断打开时直接 503：零 LLM 开销的拒绝不能先扣限流额度，
+        # 否则恢复后的重试者会被 429 锁在滑动窗口里
+        try:
+            state.breaker.raise_if_open()
+        except CircuitOpenError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "服务暂时不可用，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+            ) from exc
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
         )
@@ -4271,6 +4283,18 @@ def create_app(model: Any = None) -> FastAPI:
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
+        # 熔断打开时直接 503：零 LLM 开销的拒绝不能先扣限流额度，
+        # 否则恢复后的重试者会被 429 锁在滑动窗口里
+        try:
+            state.breaker.raise_if_open()
+        except CircuitOpenError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "服务暂时不可用，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+            ) from exc
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
         )
