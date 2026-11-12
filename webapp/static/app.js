@@ -1685,6 +1685,9 @@ async function importUserBackup() {
     toast("备份文件不能超过 50 MB");
     return;
   }
+  // 恢复目标身份在选择文件时确定：读取文件期间可能切换用户，确认框与
+  // 请求都必须写进当初选择的用户，不能跟着 state.userId 漂移
+  const targetUser = state.userId;
   let backupText;
   try {
     // 严格 UTF-8 解码：GBK / ANSI 备份此前被静默替换成 U+FFFD 仍能导入，
@@ -1721,26 +1724,35 @@ async function importUserBackup() {
     toast("备份中没有可恢复的数据");
     return;
   }
+  if (state.userId !== targetUser) {
+    // 读取 / 解析期间切换了用户：恢复进旧用户会与界面上显示的身份不符，
+    // 直接取消（文件内容仍在用户手里，重新选择即可）
+    toast("用户已切换，已取消恢复备份");
+    return;
+  }
   const source = backup.user_id ? `（来自 ${backup.user_id}）` : "";
   const knowledgeNote = counts.knowledge
     ? `\n知识片段 ${counts.knowledge} 条将合并到共享知识库。`
     : "";
   const confirmed = window.confirm(
     `恢复备份${source}？\n偏好 ${counts.preferences} 项、行程 ${counts.trips} 条、` +
-      `聊天消息 ${counts.messages} 条将合并到当前用户 ${state.userId}。` +
+      `聊天消息 ${counts.messages} 条将合并到当前用户 ${targetUser}。` +
       knowledgeNote,
   );
   if (!confirmed) return;
   els.importData.disabled = true;
   els.importData.textContent = "恢复中…";
   try {
+    // 大备份的批量写入可能跑几分钟（单 worker + 用户锁）：默认 120 秒
+    // 超时会在服务端仍在写入时前端就报失败并跳过刷新，放宽到 10 分钟
     const result = await getJSON(
-      `/api/import?user_id=${encodeURIComponent(state.userId)}`,
+      `/api/import?user_id=${encodeURIComponent(targetUser)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ backup }),
       },
+      600000,
     );
     const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
     const knowledgeNote =
@@ -1756,31 +1768,47 @@ async function importUserBackup() {
     if (result.knowledge_error) {
       toast(`知识片段未恢复：${result.knowledge_error}`);
     }
-    await Promise.all([
-      refreshStatus(),
-      loadSessions(),
-      refreshKnowledge(),
-      // 备份可能带 knowledge 段：片段列表与分类同步刷新，否则库 chip 显示
-      // 新增数量、下方列表仍是恢复前的旧数据
-      refreshKnowledgeDocuments(),
-      refreshKnowledgeCategories(),
-    ]);
-    // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面。
-    // 正在编辑提问 / 切换会话时跳过：整体重渲染会销毁编辑框并作废在途加载
-    if (
-      state.sessionId &&
-      !state.sessionLoading &&
-      !document.querySelector(".user-edit-input") &&
-      !document.querySelector(".user-edit-form")
-    ) {
-      await openSession(state.sessionId, {
-        silent: true,
-        keepOnError: true,
-        preserveOnEmpty: true,
-      });
+    if (state.userId !== targetUser) {
+      // 写入的目标用户已不是当前身份：面板刷新会显示新用户的旧数据，
+      // 反而误导；恢复结果已落库，切回后重新打开面板即可看到
+      toast("用户已切换，面板未刷新；恢复结果写入原用户，切回后重新打开面板即可看到");
+    } else {
+      await Promise.all([
+        refreshStatus(),
+        loadSessions(),
+        refreshKnowledge(),
+        // 备份可能带 knowledge 段：片段列表与分类同步刷新，否则库 chip 显示
+        // 新增数量、下方列表仍是恢复前的旧数据
+        refreshKnowledgeDocuments(),
+        refreshKnowledgeCategories(),
+      ]);
+      // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面。
+      // 正在编辑提问 / 切换会话时跳过：整体重渲染会销毁编辑框并作废在途加载
+      if (
+        state.sessionId &&
+        !state.sessionLoading &&
+        !document.querySelector(".user-edit-input") &&
+        !document.querySelector(".user-edit-form")
+      ) {
+        await openSession(state.sessionId, {
+          silent: true,
+          keepOnError: true,
+          preserveOnEmpty: true,
+        });
+      }
     }
   } catch (error) {
-    toast(`恢复失败：${error.message}`);
+    if (String(error.message || "").includes("超时")) {
+      // 客户端放弃等待不代表服务端没在写：单 worker 队列 / 大批量写入
+      // 仍会继续，如实提示并尽力刷新一次当前视图
+      toast("恢复请求超时：服务端可能仍在写入，请稍后刷新面板确认结果");
+      if (state.userId === targetUser) {
+        refreshStatus();
+        loadSessions();
+      }
+    } else {
+      toast(`恢复失败：${error.message}`);
+    }
   } finally {
     els.importData.disabled = false;
     els.importData.textContent = "恢复备份";
@@ -5782,11 +5810,18 @@ function bindEvents() {
   });
   document.addEventListener("keydown", trapShortcutFocus);
 
+  const warnPartialPrint = () => {
+    if (state.renderedStart && state.renderedStart.start > 0) {
+      // 面板 DOM 只渲染已显示的窗口：打印 / 导出 PDF 会静默截断更早的历史
+      toast("打印只包含当前已显示的消息；完整历史请使用「导出 HTML」");
+    }
+  };
   els.printChat.addEventListener("click", () => {
     if (!cancelPendingEdits()) {
       toast("正在保存修改，请稍候");
       return;
     }
+    warnPartialPrint();
     window.print();
   });
 
@@ -5794,6 +5829,7 @@ function bindEvents() {
   // 打印稿里这一轮只剩空 textarea 与保存 / 取消按钮，原提问缺失
   window.addEventListener("beforeprint", () => {
     cancelPendingEdits();
+    warnPartialPrint();
   });
 
   els.copyLink.addEventListener("click", () => {

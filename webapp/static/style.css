@@ -1220,7 +1220,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 @media print {
   body { background: #fff; color: #111; }
   .sidebar, .scrim, .sheet, .toast, .composer-zone, .topbar-right,
-  .follow-ups, .msg-foot, .trace { display: none !important; }
+  .follow-ups, .msg-foot, .trace, .earlier-more { display: none !important; }
   .app { display: block; height: auto; overflow: visible; }
   .main { display: block; }
   .topbar { height: auto; padding: 0 0 10px; border-bottom: 1px solid #ddd; background: #fff; }
