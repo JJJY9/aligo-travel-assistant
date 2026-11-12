@@ -4749,19 +4749,20 @@ async function removeKnowledgeDocument(doc) {
   const docId = Number(typeof doc === "object" && doc ? doc.id : doc);
   const metadata = (typeof doc === "object" && doc && doc.metadata) || {};
   const parts = Number(metadata.parts);
-  const group = String(metadata.group || "");
-  // 旧版多分片记录只有 parts 没有 group：服务端单条删除会被拒绝，必须带
-  // group=1 提交，但实际只删除当前这一片（其余分片仍在库里）。界面文案
-  // 不能声称「整组已删除」，否则用户以为清干净了、检索里还有旧内容
-  const groupFlag = parts > 1;
-  const wholeGroup = groupFlag && Boolean(group);
+  const group = String(metadata.group || "").trim();
+  // 只有带 group 的多分片记录能整组删除。旧版多分片（parts>1 无 group）
+  // 没有「其余分片」可定位：服务端只接受单条删除——带 group=1 会 400，
+  // 面板将永远删不掉（文案同样不能声称「整组已删除」）
+  const groupFlag = Boolean(group);
+  const wholeGroup = groupFlag;
+  const legacyParts = parts > 1 && !groupFlag;
   if (state.kbSaving) {
     toast("正在保存知识片段，请稍候");
     return;
   }
   const label = wholeGroup
     ? `整组分片（#${docId}，共 ${parts} 片）`
-    : groupFlag
+    : legacyParts
       ? `旧版多分片记录中的这一片（#${docId}，共 ${parts} 片，其余分片需逐条删除）`
       : `知识片段 #${docId}`;
   if (!window.confirm(`删除${label}？`)) return;
@@ -4782,7 +4783,7 @@ async function removeKnowledgeDocument(doc) {
     toast(
       wholeGroup
         ? "已删除整组分片"
-        : groupFlag
+        : legacyParts
           ? "已删除该分片（旧版多分片记录的其余分片仍在，可逐条删除）"
           : "知识片段已删除",
     );

@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import threading
+import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -57,10 +58,93 @@ METADATA_KEY_MAX_CHARS = 32
 METADATA_VALUE_MAX_CHARS = 200
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
 _DERIVED_CHUNK_KEYS = {"part", "parts", "group"}
-_WRITE_LOCK = threading.Lock()
+class _ReadWriteLock:
+    """读写锁：读并发、写独占，读写都有界等待（防止钉死共享线程池）。
+
+    读并发是面板 / 列表 / 导出的正常形态：此前的「读」也在全局互斥锁上
+    排队，多个全量扫描同时打开时会互相把对方判成「正在写入」返回 503。
+    写者优先：有写者在等待时新的读者排队，避免长读流饿死写操作。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    def acquire_read(self, timeout: float | None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            while self._writer or self._writers_waiting:
+                remaining = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            self._readers += 1
+            return True
+
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self, timeout: float | None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers:
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._cond.wait(remaining)
+                self._writer = True
+                return True
+            finally:
+                self._writers_waiting -= 1
+                # 写者超时退出后，排队等写者的读者必须被唤醒重新判定
+                self._cond.notify_all()
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    # threading.Lock 兼容接口（测试与少量调用方用它模拟「库正在写入」）
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if not blocking:
+            return self.acquire_write(0.0)
+        return self.acquire_write(None if timeout < 0 else timeout)
+
+    def release(self) -> None:
+        self.release_write()
+
+    def locked(self) -> bool:
+        with self._cond:
+            return self._writer or self._readers > 0
+
+    # 兼容 `with _WRITE_LOCK:`（测试 / 外部调用方模拟「库正在写入」）
+    def __enter__(self) -> "_ReadWriteLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release_write()
+
+
+_WRITE_LOCK = _ReadWriteLock()
 # 只读路径等待写锁的上限：导入 / 更新会在锁内逐条嵌入（分钟级甚至更久），
 # Web 请求线程无超时地排队会把 anyio 共享线程池占满、冻结所有同步接口。
 _READ_LOCK_TIMEOUT_SEC = 0.5
+# 写路径的有界等待：长导入持锁期间，并发写请求最多等 1 秒即失败（503），
+# 不能像此前那样无超时排队——40 个并发写就能把共享线程池全部钉在锁上，
+# /api/health 等所有同步接口一起超时。
+_WRITE_LOCK_TIMEOUT_SEC = 1.0
 
 
 class KnowledgeBusyError(RuntimeError):
@@ -69,13 +153,24 @@ class KnowledgeBusyError(RuntimeError):
 
 @contextlib.contextmanager
 def _read_lock(timeout: float = _READ_LOCK_TIMEOUT_SEC):
-    """只读路径的有界写锁：拿不到立即失败，由调用方快速返回「正在写入」。"""
-    if not _WRITE_LOCK.acquire(timeout=timeout):
+    """只读路径的有界共享锁：拿不到立即失败，由调用方快速返回「正在写入」。"""
+    if not _WRITE_LOCK.acquire_read(timeout):
         raise KnowledgeBusyError("知识库正在写入（导入进行中），请稍后重试")
     try:
         yield
     finally:
-        _WRITE_LOCK.release()
+        _WRITE_LOCK.release_read()
+
+
+@contextlib.contextmanager
+def _write_lock(timeout: float = _WRITE_LOCK_TIMEOUT_SEC):
+    """写路径的有界独占锁：长导入进行中时快速失败，不占住线程池排队。"""
+    if not _WRITE_LOCK.acquire_write(timeout):
+        raise KnowledgeBusyError("知识库正在写入（导入进行中），请稍后重试")
+    try:
+        yield
+    finally:
+        _WRITE_LOCK.release_write()
 _agent: Any = None
 # 检索路径专用的只读 Agent（create_if_missing=False）：语义检索不会在
 # 「库存在但集合缺失」时静默创建空集合、把未初始化伪装成 0 结果
@@ -389,7 +484,7 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
 
     # 模型加载可能耗时数秒，放在锁外；锁只保护 id 生成 + 写入
     agent = _get_agent()
-    with _WRITE_LOCK:
+    with _write_lock():
         result = agent.add_documents(documents)
     if result.get("status") != "success":
         raise RuntimeError(str(result.get("message") or "添加知识片段失败"))
@@ -503,8 +598,14 @@ def _locked_user_snapshot(
         except (TypeError, ValueError):
             part_no = 0
         pieces.append((part_no, str(rows[0].get("content", ""))))
-        if user_meta is None:
-            user_meta = _user_meta(rows[0].get("metadata"))
+        row_meta = _user_meta(rows[0].get("metadata"))
+        if member == int(doc_id):
+            # 原样保存判定必须对「被点击的这一片」比较元数据：整组编辑的
+            # 表单回填的是当前片。用扫描到的第一片会让从其它分片原样保存
+            # 判定失败、触发重切整组并用第一片元数据覆盖逐片元数据
+            user_meta = row_meta
+        elif user_meta is None:
+            user_meta = row_meta
     if user_meta is None:
         return None
     pieces.sort(key=lambda pair: pair[0])
@@ -544,7 +645,7 @@ def update_document(
             f"重新分片后的文档大小超过上限（{stored_size} 字 > {DOC_MAX_CHARS}），"
             "请拆分后重试"
         )
-    with _WRITE_LOCK:
+    with _write_lock():
         existing_parts, group = _document_info(client, int(doc_id))
         if existing_parts == 0:
             raise LookupError("知识片段不存在")
@@ -966,9 +1067,16 @@ def find_duplicate_contents() -> list[tuple[str, list[int]]]:
     只统计可单删的独立片段：带 ``group`` 的新版多分片记录，以及旧版
     多分片记录（``parts > 1`` 但没有 group）内部出现相同段落都是正常的，
     必须通过整份编辑 / 整组删除维护，按单条重复删除会破坏整篇文档。
+    全库扫描与写操作串行（读锁）：此前绕过读锁，会读到整组替换的中间态。
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
+    with _read_lock():
+        return _scan_duplicate_contents(client)
+
+
+def _scan_duplicate_contents(client: Any) -> list[tuple[str, list[int]]]:
+    """无锁版本：调用方必须已持有读锁或写锁。"""
     seen: dict[str, list[tuple[int, bool]]] = {}
     for row in _iter_all_rows(client):
         content = str(row.get("content", "")).strip()
@@ -1030,9 +1138,9 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
     """
     plan: list[dict[str, Any]] = []
 
-    def _build_plan() -> None:
+    def _build_plan(client: Any) -> None:
         plan.clear()
-        for content, ids in find_duplicate_contents():
+        for content, ids in _scan_duplicate_contents(client):
             keep = min(ids)
             remove = sorted(doc_id for doc_id in ids if doc_id != keep)
             if not remove:
@@ -1047,7 +1155,12 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
             )
 
     if dry_run:
-        _build_plan()
+        # 预览同样走读锁：全库扫描不能绕过读串行化（并发时读到整组替换
+        # 的中间态，也会打满共享线程池）
+        client = _client()
+        _load_collection(client, COLLECTION_NAME)
+        with _read_lock():
+            _build_plan(client)
         return {
             "dry_run": True,
             "groups": len(plan),
@@ -1058,10 +1171,10 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
             "plan": plan,
         }
 
-    with _WRITE_LOCK:
-        _build_plan()
+    with _write_lock():
         client = _client()
         _load_collection(client, COLLECTION_NAME)
+        _build_plan(client)
         removed = 0
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
@@ -1212,6 +1325,16 @@ def _backup_fully_existing(merged: list[Any], existing: Iterable[str]) -> bool:
     导入必然没有任何需要写入的内容；返回 False 不代表一定有新内容（长
     文档会重新切片，需完整规划才知道）。
     """
+    for item in merged:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("__restored_parts__"), list):
+            continue
+        # 非还原内容超过切片阈值时实际写入的是重新切出的分片：未切分的
+        # 原文命中（旧版 >400 字单条记录）不代表切片齐全，保守走完整流程
+        # ——否则预览说「将导入 N 片」而正式导入直接判重 0 条
+        if len(str(item.get("content") or "").strip()) > _MAX_CONTENT_CHARS:
+            return False
     return not (Counter(_merged_piece_contents(merged)) - Counter(existing))
 
 
@@ -1384,7 +1507,7 @@ def import_documents(
     agent = None if dry_run else _get_agent()
 
     imported: list[int] = []
-    with _WRITE_LOCK:
+    with _write_lock():
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
         # 插入同一批内容；快照走全量扫描（多重集），超过单页规模或同文
         # 重复分片时判重都不会失真
@@ -1392,23 +1515,46 @@ def import_documents(
         # 内容可能在同一 group 内重复（两段完全相同的正文各占一个 part）：
         # 用多重集而不是集合计数，一份已存在只能抵消一个分片
         existing_counts: Counter[str] = Counter(existing)
+        # 本次导入已写入的 group：备份里两篇文档共用一个 group 时只保留
+        # 先写入的一篇，不能把第二套 part 1..N 塞进同一组
+        planned_groups: set[str] = set()
         problems: list[dict[str, Any]] = []
-        texts_cache: dict[str, set[str] | None] = {}
+        layout_cache: dict[str, Any] = {}
+
+        def _group_layout() -> dict[str, list[tuple[str, int, int]]] | None:
+            # 整次导入只全量扫描一次库内布局：此前每个「部分命中」的组都
+            # 重新扫描全库（O(备份组数 × 库行数)），2MB 备份即可把写锁
+            # 占成分钟级 DoS
+            if "layout" not in layout_cache:
+                try:
+                    layout_cache["layout"] = _existing_group_layout()
+                except Exception as exc:  # noqa: BLE001 - 扫描失败按无法校验处理
+                    logger.warning("扫描库内分片布局失败（%s）", exc)
+                    layout_cache["layout"] = None
+            return layout_cache["layout"]
 
         def _existing_group_texts() -> set[str] | None:
-            # 只在「整组内容多重集已齐全」时按需扫描一次：布局扫描失败
+            # 只在「整组内容多重集已齐全」时按需扫描：布局扫描失败
             # 按已存在处理（与旧行为一致，不因扫描问题阻断幂等重导）
-            if "value" not in texts_cache:
-                try:
-                    texts_cache["value"] = _group_texts_from_layout(
-                        _existing_group_layout()
-                    )
-                except Exception as exc:  # noqa: BLE001 - 扫描失败按已存在处理
-                    logger.warning(
-                        "扫描库内分片布局失败（%s），按已存在处理", exc
-                    )
-                    texts_cache["value"] = None
-            return texts_cache["value"]
+            if "texts" not in layout_cache:
+                layout = _group_layout()
+                layout_cache["texts"] = (
+                    None if layout is None else _group_texts_from_layout(layout)
+                )
+            return layout_cache["texts"]
+
+        def _group_part_contents() -> dict[str, dict[int, set[str]]]:
+            """group → {part 号: 该 part 在库内的内容集合}（整次导入只扫一次）。"""
+            if "part_contents" not in layout_cache:
+                by_group: dict[str, dict[int, set[str]]] = {}
+                for content, candidates in (_group_layout() or {}).items():
+                    for old_group, old_part, _parts in candidates:
+                        if old_group and old_part:
+                            by_group.setdefault(old_group, {}).setdefault(
+                                old_part, set()
+                            ).add(content)
+                layout_cache["part_contents"] = by_group
+            return layout_cache["part_contents"]
 
         merged_items, group_skipped = _regroup_exported_documents(
             valid,
@@ -1549,18 +1695,65 @@ def import_documents(
             if not missing:
                 existing_counts.update(consumed)
                 continue
+            if doc_group and doc_group in planned_groups:
+                existing_counts.update(consumed)
+                conflict += len(missing)
+                problems.append(
+                    {
+                        "group": doc_group,
+                        "reason": (
+                            "备份中有多篇文档使用同一 group 标识，"
+                            "已跳过重复组；请检查备份来源后重新导出"
+                        ),
+                        "parts": len(missing),
+                    }
+                )
+                continue
+            if doc_group and len(missing) == len(doc_chunks):
+                # 整组内容与库内同号组完全不同（改写过的备份 / 残缺组重导）：
+                # 直接沿用原 group 写入会在同一组里产生第二套 part 1..N——
+                # 检索按 part 拼出乱序文档、整组编辑 / 删除波及两篇、导出后
+                # 再导入因 part 编号重复被拒。只有「同组同 part 号的内容确实
+                # 不同」才算冲突：库内该 part 已是同样内容时属于幂等重导
+                occupied = _group_part_contents().get(doc_group) or {}
+                collide = False
+                for chunk in missing:
+                    chunk_meta = chunk.get("metadata") or {}
+                    try:
+                        want_part = int(chunk_meta.get("part") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        want_part = 0
+                    if not want_part or want_part not in occupied:
+                        continue
+                    if chunk["content"].strip() not in occupied[want_part]:
+                        collide = True
+                        break
+                if collide:
+                    logger.warning(
+                        "备份中的文档组 %s 与库内同号组内容不同，已跳过该组："
+                        "请整份编辑或 kb-delete --group 后重新导入",
+                        doc_group,
+                    )
+                    existing_counts.update(consumed)
+                    conflict += len(missing)
+                    problems.append(
+                        {
+                            "group": doc_group,
+                            "reason": (
+                                "库中已存在同号分片组但内容不同，未导入；"
+                                "请整份编辑或 kb-delete --group 后重新导入"
+                            ),
+                            "parts": len(missing),
+                        }
+                    )
+                    continue
             missing_keys = {id(piece) for piece in missing}
             if len(missing) != len(doc_chunks) and doc_group:
                 # 备份组与库内片段部分重合：库内旧分片的 group/part/parts
                 # 必须与本次布局一致才能安全补齐（例如上次导入中途失败的
                 # 同一篇文档）；编辑后重新导入的文档分片布局已变化，补写会
                 # 留下 parts 声明与实际成员错位的半组，保守跳过并提示正确维护方式
-                layout: dict[str, list[tuple[str, int, int]]] | None
-                try:
-                    layout = _existing_group_layout()
-                except Exception as exc:  # noqa: BLE001 - 无法校验布局时不冒险补写
-                    logger.warning("扫描库内分片布局失败（%s），跳过补写组 %s", exc, doc_group)
-                    layout = None
+                layout = _group_layout()
                 conflicts = []
                 cross_group = False
                 if layout is None:
@@ -1683,6 +1876,8 @@ def import_documents(
                 )
                 for missing_piece in missing:
                     missing_piece["metadata"]["parts"] = str(total_parts)
+            if doc_group:
+                planned_groups.add(doc_group)
             existing_counts.update(consumed)
             for missing_piece in missing:
                 existing_counts[missing_piece["content"].strip()] += 1
@@ -1794,7 +1989,7 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
     """
     client = _client()
     _load_collection(client, COLLECTION_NAME)
-    with _WRITE_LOCK:
+    with _write_lock():
         if not _exists(client, int(doc_id)):
             return 0
         ids = [int(doc_id)]

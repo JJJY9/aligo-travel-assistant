@@ -1904,7 +1904,7 @@ def run_knowledge_export_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     status = knowledge_status()
@@ -1975,7 +1975,7 @@ def run_knowledge_import_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     path = Path(source)
@@ -2219,7 +2219,8 @@ def run_knowledge_categories_standalone(as_json: bool = False) -> int:
         return 0
     print(f"知识分类：{len(categories)} 个分类，共 {total} 片")
     for item in categories:
-        print(f"  · {item['category']}  {item['count']} 片")
+        # 分类名来自知识正文 / 元数据：ESC / OSC 序列不能直达终端
+        print(f"  · {_terminal_safe(item['category'])}  {item['count']} 片")
     return 0
 
 
@@ -2621,7 +2622,7 @@ def run_user_import_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3049,7 +3050,7 @@ def run_knowledge_dedupe_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     try:
@@ -3089,7 +3090,7 @@ def run_knowledge_dedupe_standalone(
             "（保留每组最小 id）："
         )
         for item in plan:
-            preview = " ".join(item["content"].split())[:60]
+            preview = _terminal_safe(" ".join(item["content"].split())[:60])
             id_text = "、".join(f"#{doc_id}" for doc_id in item["remove"])
             print(f"  保留 #{item['keep']}，删除 {id_text}  {preview}")
         print("去掉 --dry-run 即可执行删除")
@@ -3160,7 +3161,7 @@ def run_knowledge_duplicates_standalone(
                 )
             )
         else:
-            print(f"读取失败：{exc}")
+            print(f"读取失败：{_terminal_safe(exc)}")
         return 1
     shown = groups if limit <= 0 else groups[:limit]
     entries = [
@@ -3193,7 +3194,8 @@ def run_knowledge_duplicates_standalone(
     print(f"发现 {len(groups)} 组重复内容（共 {total} 条片段）：")
     for entry in entries:
         joined = "、".join(f"#{doc_id}" for doc_id in entry["ids"])
-        print(f"  {len(entry['ids'])} 条 · {joined}  {entry['preview']}")
+        # 预览来自知识正文：ESC / OSC 序列不能直达终端
+        print(f"  {len(entry['ids'])} 条 · {joined}  {_terminal_safe(entry['preview'])}")
     if len(groups) > len(shown):
         print(f"  … 其余 {len(groups) - len(shown)} 组未显示（limit=0 显示全部）")
     print("提示：以上均为未分组的独立片段，确认保留哪一份后可删除其余")
@@ -3226,7 +3228,7 @@ def run_trips_dedupe_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     def _emit(payload: dict[str, Any]) -> None:
@@ -3620,7 +3622,7 @@ def run_session_archive_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3696,7 +3698,7 @@ def run_session_delete_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3792,7 +3794,7 @@ def run_session_title_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3871,7 +3873,7 @@ def run_session_pin_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -3950,7 +3952,7 @@ def run_session_show_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -4674,7 +4676,7 @@ def run_trip_add_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -4804,7 +4806,7 @@ def run_trip_delete_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -4950,7 +4952,7 @@ def run_trip_update_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -5207,7 +5209,7 @@ def run_trips_import_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -5632,7 +5634,7 @@ def run_preference_set_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
@@ -5735,7 +5737,7 @@ def run_preference_delete_standalone(
                 )
             )
         else:
-            print(message)
+            print(_terminal_safe(message))
         return 1
 
     if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):

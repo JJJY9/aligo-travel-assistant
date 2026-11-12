@@ -5765,6 +5765,45 @@ def test_client_disconnect_recorded_as_499():
     print("✓ 客户端断连记 499 而非 500")
 
 
+def test_knowledge_write_rejects_nul_and_surrogates():
+    """知识写入 schema 与服务端清洗同口径：NUL / 孤立代理项直接 422。"""
+    client = _client()
+    for bad in ("含\x00内容", "bad " + chr(0xD800)):
+        body = json.dumps({"content": bad, "metadata": {}}, ensure_ascii=True)
+        response = client.post(
+            "/api/knowledge/documents",
+            content=body.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422, response.text[:200]
+    # 面板分类输入上限与后端元数据值上限一致（200 字）
+    index_html = (Path(__file__).resolve().parents[1] / "webapp" / "static" / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'id="kbCategory"[^>]*maxlength="200"', index_html), (
+        "分类输入框 maxlength 必须与后端 200 字上限一致"
+    )
+    print("✓ 知识写入拒绝 NUL / 孤立代理项，分类上限一致")
+
+
+def test_daemon_import_executor_is_not_joined_at_exit():
+    """导入线程为 daemon 且不登记 atexit join：停服不会被分钟级导入卡住。"""
+    from concurrent.futures.thread import _threads_queues
+    from webapp.server import _DaemonImportExecutor
+
+    executor = _DaemonImportExecutor(
+        max_workers=1, thread_name_prefix="test-import"
+    )
+    try:
+        assert executor.submit(lambda: 1).result(timeout=5) == 1
+        threads = list(executor._threads)
+        assert threads and all(thread.daemon for thread in threads)
+        assert all(thread not in _threads_queues for thread in threads), (
+            "登记到 _threads_queues 会让 atexit 逐个 join，导入中停服仍卡住"
+        )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    print("✓ 导入执行器线程不参与 atexit join")
+
+
 def test_preference_type_rejects_control_characters():
     """偏好类型会进 INFO 日志：%0A / %00 / %7F 必须被路由直接拒绝。"""
     client = _client()
@@ -10452,6 +10491,8 @@ if __name__ == "__main__":
     test_host_rejection_is_secured_and_counted()
     test_cancelled_request_recorded_as_499()
     test_client_disconnect_recorded_as_499()
+    test_daemon_import_executor_is_not_joined_at_exit()
+    test_knowledge_write_rejects_nul_and_surrogates()
     test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:

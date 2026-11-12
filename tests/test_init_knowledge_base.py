@@ -432,6 +432,10 @@ def test_export_failure_aborts_before_drop(monkeypatch):
         assert code == 1
         assert dropped == [], "导出失败时不得删除集合"
         assert calls["n"] == 1
+        assert not (Path(tmp) / "skill" / "data" / "rag_knowledge").exists(), (
+            "中止后不能留下新建的空 skill 库：下次运行会把它当来源，"
+            "旧部署 rag_knowledge/ 的知识永远不再迁移"
+        )
     print("✓ 导出失败先于删库中止")
 
 
