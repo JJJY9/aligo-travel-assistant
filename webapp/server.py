@@ -2255,18 +2255,26 @@ def _load_user_data(user_id: str, strict: bool = False) -> dict[str, Any]:
     try:
         store = _open_long_term(user_id, strict=strict)
         try:
-            return {
-                "preferences": {
-                    key: _json_safe_value(value)
-                    for key, value in store.get_preference().items()
-                },
-                "trip_history": store.get_trip_history(limit=None),
-                "chat_history": store.get_chat_history(),
-                "session_titles": store.get_session_titles(),
-                "pinned_sessions": store.get_pinned_sessions(),
-                "archived_sessions": store.get_archived_sessions(),
-                "statistics": store.get_statistics(),
+            snapshot = getattr(store, "export_snapshot", None)
+            if callable(snapshot):
+                # 一致快照：统计与列表来自同一版本（并发写入时不会出现
+                # 备份里的总数与消息条数对不上）
+                data = snapshot()
+            else:
+                data = {
+                    "preferences": store.get_preference(),
+                    "trip_history": store.get_trip_history(limit=None),
+                    "chat_history": store.get_chat_history(),
+                    "session_titles": store.get_session_titles(),
+                    "pinned_sessions": store.get_pinned_sessions(),
+                    "archived_sessions": store.get_archived_sessions(),
+                    "statistics": store.get_statistics(),
+                }
+            data["preferences"] = {
+                key: _json_safe_value(value)
+                for key, value in (data.get("preferences") or {}).items()
             }
+            return data
         finally:
             _close_long_term(store)
     except HTTPException:

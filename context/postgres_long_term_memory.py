@@ -1524,6 +1524,35 @@ class PostgresLongTermMemory:
             "frequent_destinations": frequent,
         }
 
+    def export_snapshot(self) -> dict[str, Any]:
+        """一次 REPEATABLE READ 事务内导出（统计与各列表同一快照）。
+
+        逐项查询在自动提交下各自取最新快照：并发写入时备份的 statistics
+        与 chat_history / trip_history 可能来自不同版本（总数与条数对不上）。
+        快照事务失败（连接重建等）时退回逐项读取，与原行为一致。
+        """
+        try:
+            with self._conn_lock, self._conn.transaction():
+                # 事务内第一条语句：固定快照后再执行各查询
+                self._execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                )
+                return self._export_snapshot_queries()
+        except Exception as exc:  # noqa: BLE001 - 快照失败退回逐项读取
+            logger.warning("导出一致性快照失败（%s），退回逐项读取", exc)
+            return self._export_snapshot_queries()
+
+    def _export_snapshot_queries(self) -> dict[str, Any]:
+        return {
+            "preferences": self.get_preference(),
+            "trip_history": self.get_trip_history(limit=None),
+            "chat_history": self.get_chat_history(),
+            "session_titles": self.get_session_titles(),
+            "pinned_sessions": self.get_pinned_sessions(),
+            "archived_sessions": self.get_archived_sessions(),
+            "statistics": self.get_statistics(),
+        }
+
     # ---------- 清理 ----------
 
     def clear_history(self) -> None:
