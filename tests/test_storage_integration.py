@@ -553,6 +553,57 @@ def test_pg_batch_save_session_id_none_semantics():
         memory.close()
 
 
+def test_pg_batch_save_preserves_trip_id_and_timestamp():
+    """PG 批量恢复沿用备份 trip_id / timestamp；编号冲突时退回新编号。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        base = {
+            "origin": "北京",
+            "destination": "济南",
+            "start_date": "2026-12-11",
+            "end_date": "2026-12-12",
+            "purpose": "会议",
+            "trip_id": "trip_7",
+            "timestamp": "2025-06-01T08:30:00+08:00",
+        }
+        assert memory.save_trip_histories([dict(base)]) == (1, 0)
+        trips = {
+            trip["destination"]: trip
+            for trip in memory.get_trip_history(limit=None)
+        }
+        assert trips["济南"]["trip_id"] == "trip_7", "未占用的备份编号要沿用"
+        assert "2025-06-01" in trips["济南"]["timestamp"], "备份时间戳要保留"
+
+        clash = {
+            "origin": "北京",
+            "destination": "青岛",
+            "start_date": "2026-12-13",
+            "end_date": "2026-12-14",
+            "trip_id": "trip_7",
+        }
+        assert memory.save_trip_histories([clash]) == (1, 0)
+        trips = {
+            trip["destination"]: trip
+            for trip in memory.get_trip_history(limit=None)
+        }
+        assert trips["青岛"]["trip_id"] != "trip_7", "冲突的备份编号不能复用"
+        ids = [trip["trip_id"] for trip in memory.get_trip_history(limit=None)]
+        assert len(ids) == len(set(ids)), ids
+
+        new_id = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "银川",
+                "start_date": "2026-12-20",
+                "end_date": "2026-12-21",
+            }
+        )
+        assert int(new_id.split("_")[1]) > 7, "编号水位按沿用的备份编号抬高"
+        print("✓ PG 批量恢复保留 trip_id / 时间戳并拒绝编号冲突")
+    finally:
+        memory.close()
+
+
 def test_pg_save_trip_histories_counts_mixed_batch():
     """PG 批量保存：created/updated 计数正确，批内去重且缺省目的保留原值。"""
     memory, _ = _pg_memory_or_skip()

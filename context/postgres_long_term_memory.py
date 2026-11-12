@@ -842,9 +842,15 @@ class PostgresLongTermMemory:
                 (self.user_id,),
             )
             index: dict[tuple[str, str, str, str], int] = {}
+            # 已占用的 trip_id：备份原编号只在未被其它行程占用时沿用，
+            # 否则两趟不同行程共享 trip_id（按 id 删除 / 更新会误伤）
+            used_trip_ids: set[str] = set()
             max_number = 0
             for row_id, trip_id, origin, destination, start, end in rows:
-                match = re.fullmatch(r"trip_(\d+)", str(trip_id or ""))
+                trip_id_text = str(trip_id or "")
+                if trip_id_text:
+                    used_trip_ids.add(trip_id_text)
+                match = re.fullmatch(r"trip_(\d+)", trip_id_text)
                 if match:
                     max_number = max(max_number, int(match.group(1)))
                 key = _key(destination, origin, start, end)
@@ -872,43 +878,75 @@ class PostgresLongTermMemory:
                         # 与 JSON 批量保存同口径：purpose 未提供（None）保留原值；
                         # session_id 键存在即覆盖（含显式 None——备份恢复时该
                         # 会话已被删除，需要清除关联，COALESCE 会把 None 当
-                        # 未提供而保留旧值，留下指向已删除会话的死链）
+                        # 未提供而保留旧值，留下指向已删除会话的死链）；
+                        # timestamp 有值用备份时间、否则按恢复时刻刷新（JSON
+                        # 同样更新既有记录的 timestamp）
+                        updated_timestamp = trip.get("timestamp")
+                        updated_at = (
+                            _pg_timestamp(updated_timestamp)
+                            if updated_timestamp
+                            and parse_iso_datetime(updated_timestamp) is not None
+                            else None
+                        )
                         if "session_id" in trip:
                             self._execute(
                                 "UPDATE aligo_trips SET "
                                 "purpose = COALESCE(%s, purpose), "
-                                "session_id = %s "
+                                "session_id = %s, "
+                                "created_at = COALESCE(%s, now()) "
                                 "WHERE id = %s",
                                 (
                                     trip.get("purpose"),
                                     trip.get("session_id"),
+                                    updated_at,
                                     existing_id,
                                 ),
                             )
                         else:
                             self._execute(
                                 "UPDATE aligo_trips SET "
-                                "purpose = COALESCE(%s, purpose) "
+                                "purpose = COALESCE(%s, purpose), "
+                                "created_at = COALESCE(%s, now()) "
                                 "WHERE id = %s",
-                                (trip.get("purpose"), existing_id),
+                                (trip.get("purpose"), updated_at, existing_id),
                             )
                         _abort_if_reconnected()
                         updated += 1
                         continue
                     max_number += 1
+                    # 备份恢复的行可能自带 trip_id / timestamp：未被占用时
+                    # 沿用（与 JSON 批量保存、user_import 的承诺一致——恢复
+                    # 后编号与创建时间与备份相同）；冲突 / 非法时按水位重新
+                    # 编号、按恢复时间落库
+                    requested_id = str(trip.get("trip_id") or "")
+                    match = re.fullmatch(r"trip_(\d+)", requested_id)
+                    if match and requested_id not in used_trip_ids:
+                        trip_id = requested_id
+                        max_number = max(max_number, int(match.group(1)))
+                    else:
+                        trip_id = f"trip_{max_number}"
+                    used_trip_ids.add(trip_id)
+                    created_timestamp = trip.get("timestamp")
+                    created_at = (
+                        _pg_timestamp(created_timestamp)
+                        if created_timestamp
+                        and parse_iso_datetime(created_timestamp) is not None
+                        else None
+                    )
                     inserted = self._fetchone(
                         "INSERT INTO aligo_trips "
-                        "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now())) RETURNING id",
                         (
                             self.user_id,
-                            f"trip_{max_number}",
+                            trip_id,
                             trip.get("origin"),
                             destination,
                             trip.get("start_date"),
                             trip.get("end_date"),
                             trip.get("purpose") or "旅游",
                             trip.get("session_id"),
+                            created_at,
                         ),
                         # 非幂等写入：连接在提交后丢失时无法区分是否已写入，重放会
                         # 产生重复行程 / 重复 trip_id，直接按持久化失败上报
