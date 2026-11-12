@@ -69,7 +69,7 @@ from utils.access_log import (
 )
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
-from utils.console import configure_stdio
+from utils.console import configure_stdio, strip_terminal_controls
 from utils.doctor import run_doctor
 from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
@@ -2719,12 +2719,13 @@ def _usage_summary_for_user(
 
 
 def _md_inline(value: object) -> str:
-    """导出 Markdown 的单行内联文本：折叠空白 + 尖括号转义（与 CLI 同口径）。"""
-    return (
-        " ".join(str(value if value is not None else "").split())
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    """导出 Markdown 的单行内联文本：折叠空白 + 尖括号转义（与 CLI 同口径）。
+
+    终端控制序列（ESC / OSC / BEL）先剥离：存进记忆的恶意内容此前会原样
+    写进下载的 .md，在终端 cat 时执行（CLI user-export 同一数据会剥离）。
+    """
+    text = strip_terminal_controls(value if value is not None else "")
+    return " ".join(text.split()).replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
@@ -5073,6 +5074,7 @@ def create_app(model: Any = None) -> FastAPI:
         import asyncio
 
         from utils.user_import import (
+            MAX_BACKUP_BYTES,
             drop_sessions,
             import_user_data,
             parse_user_export_data,
@@ -5125,6 +5127,19 @@ def create_app(model: Any = None) -> FastAPI:
                         f"（请求 ID：{_request_id(request)}）"
                     ),
                 ) from None
+            # 备份体积上限与 CLI user-import / 面板一致：请求体允许到 64MB，
+            # 但 50–64MB 的备份恢复后会让该用户 /api/export 永久 413
+            if len(raw_body) > MAX_BACKUP_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "备份文件不能超过 "
+                        f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
+                    ),
+                )
+            # 与 CLI 的 utf-8-sig 读取一致：带 BOM 的备份不应 422
+            if raw_body.startswith(b"\xef\xbb\xbf"):
+                raw_body = raw_body[3:]
             try:
                 payload = await loop.run_in_executor(
                     state.import_executor, UserImportPayload.model_validate_json, raw_body

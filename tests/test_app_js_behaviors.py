@@ -533,6 +533,14 @@ def test_knowledge_delete_legacy_parts_without_group():
     print("✓ 旧版多分片删除不再带 group=1")
 
 
+def test_user_backup_import_rejects_non_utf8():
+    """面板恢复备份：GBK 等非 UTF-8 文件必须提示另存，不能静默损坏后导入。"""
+    data = _run_harness("userBackupDecode")
+    assert any("UTF-8" in toast for toast in data["gbk_toasts"]), data
+    assert data["gbk_requests"] == 0, "解码失败不能发起导入请求"
+    print("✓ 备份恢复拒绝非 UTF-8 文件")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -549,5 +557,6 @@ if __name__ == "__main__":
     test_reconcile_confirms_after_open_session()
     test_knowledge_import_skip_summary_distinguishes_conflicts()
     test_knowledge_delete_legacy_parts_without_group()
+    test_user_backup_import_rejects_non_utf8()
     test_chat_done_persisted_signal()
     print("\n全部通过")

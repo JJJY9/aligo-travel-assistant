@@ -190,6 +190,16 @@ def test_dispatch_usage_errors_respect_json(monkeypatch, capsys):
     print("✓ dispatch 用法错误遵守 --json 契约（全命令）")
 
 
+def test_cli_id_validation_matches_web():
+    """CLI 的 ID 校验与 Web（Rust \\w）同一字符集，前导 - 仍拒绝。"""
+    connector = chr(0x203F)  # ‿ (Pc)：Web 接受、Python re \\w 不接受
+    assert cli._valid_web_id("a" + connector + "b"), "连接符标点必须与 Web 一致"
+    assert not cli._valid_web_id("²abc"), "上标数字 Web 拒绝，CLI 不能放行"
+    assert not cli._valid_web_id("-lead"), "前导 - 会被 CLI 当选项"
+    assert cli._valid_web_id("张三-1")
+    print("✓ CLI 用户 / 会话 ID 校验与 Web 对齐")
+
+
 if __name__ == "__main__":
     for case in (
         test_health_json_ok,
@@ -202,4 +212,5 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+    test_cli_id_validation_matches_web()
     print("\n全部通过")

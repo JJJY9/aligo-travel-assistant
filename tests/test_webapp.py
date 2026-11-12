@@ -1810,6 +1810,58 @@ def test_import_rejects_when_existing_totals_would_exceed_limits(monkeypatch):
     assert response.status_code == 400, response.text[:300]
     assert "上限" in response.json()["detail"]
 
+def test_import_accepts_utf8_bom_backup():
+    """带 UTF-8 BOM 的备份与 CLI utf-8-sig 一致，不能被 422 拒绝。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_bom")
+    try:
+        body = b"\xef\xbb\xbf" + json.dumps(
+            {"backup": {"preferences": {"home_location": "北京"}}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert response.json()["preferences"] == 1
+    finally:
+        _cleanup(user_id)
+
+
+def test_import_rejects_backup_over_size_limit(monkeypatch):
+    """50 MB 备份上限与 CLI / 面板一致：API 不能接受更大文件。"""
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", 32)
+    client = _client()
+    body = json.dumps(
+        {"backup": {"preferences": {"home_location": "北京"}}}
+    ).encode("utf-8")
+    assert len(body) > 32
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_import_big")},
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413, response.text[:300]
+    assert "备份文件不能超过" in response.json()["detail"]
+
+
+def test_markdown_export_strips_terminal_controls():
+    """Web 用户数据 Markdown 导出剥离 ESC / OSC / BEL（CLI 同口径）。"""
+    from webapp import server as server_module
+
+    cleaned = server_module._md_inline(
+        "a" + chr(27) + "]52;c;x" + chr(7) + "b"
+    )
+    assert chr(27) not in cleaned and chr(7) not in cleaned
+    assert "&lt;script&gt;" in server_module._md_inline("<script>")
+    print("✓ Markdown 导出剥离终端控制序列")
+
 
 def test_import_skips_reserved_session_id():
     """备份里的 session_id="export" 不能落库（否则详情路由永远被静态路由遮蔽）。"""
@@ -10818,6 +10870,7 @@ if __name__ == "__main__":
     finally:
         _mp_breaker.undo()
     test_half_open_breaker_recovers_through_chat_endpoint()
+    test_markdown_export_strips_terminal_controls()
     test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:
