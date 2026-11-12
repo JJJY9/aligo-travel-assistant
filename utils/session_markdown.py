@@ -90,15 +90,23 @@ _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
 _BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
 _LIST_ITEM_RE = re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
 _HTML_BLOCK_RE = re.compile(r"^ {0,3}<[A-Za-z/!?]")
+# Setext 标题下划线（紧跟段落行时把段落变成标题）与主题分隔线同样结束段落：
+# 只认纯 ``=`` / ``-``（可带尾随空白）与 ``***`` / ``___`` / 空格分隔的
+# 连字符线；``- -`` 这类按列表项处理（_LIST_ITEM_RE 已覆盖）
+_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+_THEMATIC_BREAK_RE = re.compile(
+    r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"
+)
 
 
 def _starts_block(line: str) -> bool:
     """该行是否开启一个能打断段落的块（CommonMark 块级起始）。
 
     跨行行内代码只能闭合于同一段落内：导出时每行前缀 ``> ``，标题、引用、
-    列表、HTML 块在引用块内仍是真实块，会打断上一行所处的段落。若把块起始
-    行上的反引号当成关闭串，上一行剩余内容会被当作代码而不转义——攻击者用
-    ``x` <img onerror=…>`` 加 ``# ` `` 两行即可让原始 HTML 落进导出文件。
+    列表、HTML 块、Setext 下划线与主题分隔线在引用块内仍是真实块，会打断
+    上一行所处的段落。若把块起始行上的反引号当成关闭串，上一行剩余内容会
+    被当作代码而不转义——攻击者用 ``x` <img onerror=…>`` 加 ``# ` ``（或
+    ``---`` / ``***`` 等再跟一行反引号）即可让原始 HTML 落进导出文件。
     列表起始号的精确规则（有序列表须从 1 开始才能打断段落）不做区分：多认
     块起始只会让跨行代码段内容被保守转义（可见实体），不会放过原始 HTML。
     """
@@ -107,6 +115,8 @@ def _starts_block(line: str) -> bool:
         or _BLOCKQUOTE_RE.match(line)
         or _LIST_ITEM_RE.match(line)
         or _HTML_BLOCK_RE.match(line)
+        or _SETEXT_UNDERLINE_RE.match(line)
+        or _THEMATIC_BREAK_RE.match(line)
     )
 
 

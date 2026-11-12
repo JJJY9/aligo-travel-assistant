@@ -103,6 +103,21 @@ def test_frontend_render_helpers():
     assert "<th><code>a|b</code></th>" in results["table_code_pipe"], (
         "行内代码里的竖线不能拆列"
     )
+    # 反斜杠转义：标点按字面输出，普通字符保留反斜杠；不能出现 ${ch} 乱码
+    table_escape = results["table_backslash_escape"]
+    assert "<th>C:\\temp</th>" in table_escape, table_escape
+    assert "<th>a*b</th>" in table_escape, table_escape
+    assert "${ch}" not in table_escape, "反斜杠转义不能被模板字符串求值成 ${ch}"
+    # 链接文字里的行内代码要还原成 <code>，不能留下不可见占位符
+    label_code = results["link_label_code"]
+    assert "<code>patch</code>" in label_code, label_code
+    assert "\ue000" not in label_code and "\ue001" not in label_code, label_code
+    # ID 校验与服务器同口径：设备保留名拒绝、长度按码点计数
+    assert results["id_reserved_nul"] is False
+    assert results["id_reserved_com1"] is False
+    assert results["id_ok_console"] is True
+    assert results["id_astral_33"] is True, "33 个增补平面字母（66 单元）按码点合法"
+    assert results["id_astral_65"] is False, "65 个码点超过 64 上限"
     sentinel = results["sentinel_injection"]
     assert "" not in sentinel and "" not in sentinel, (
         "输入里的私用区占位符必须被剥离"

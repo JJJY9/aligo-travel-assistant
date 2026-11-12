@@ -384,6 +384,19 @@ function scenarioRender(source) {
       "renderMarkdown",
       "| `a|b` | c |\n| --- | --- |\n| 1 | 2 |"
     ),
+    table_backslash_escape: invoke(
+      "renderMarkdown",
+      "| C:\\temp | a\\*b |\n| --- | --- |\n| x | y |"
+    ),
+    link_label_code: invoke(
+      "renderMarkdown",
+      "[`patch`](https://example.com)"
+    ),
+    id_reserved_nul: invoke("isValidId", "NUL"),
+    id_reserved_com1: invoke("isValidId", "com1"),
+    id_ok_console: invoke("isValidId", "console"),
+    id_astral_33: invoke("isValidId", "𝐀".repeat(33)),
+    id_astral_65: invoke("isValidId", "𝐀".repeat(65)),
     sentinel_injection: invoke(
       "renderInline",
       "x0y 0 z"

@@ -128,12 +128,26 @@ const state = {
   statusStale: false,
 };
 
+// Windows 设备保留名（与服务端 is_valid_web_id 同口径）：ID 会拼成
+// 记忆库文件名（NUL.json 指向设备），服务端为 JSON 后端统一 422
+const RESERVED_DEVICE_NAMES = new Set([
+  "con",
+  "prn",
+  "aux",
+  "nul",
+  ...Array.from({ length: 9 }, (_, i) => `com${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`),
+]);
+
 function isValidId(value) {
   // 与服务端 _ID_PATTERN（pydantic-core 的 Rust \w：Alphabetic + Mark +
   // Nd + Pc + Join_Control）同一集合：CLI / API 建出的含组合符 / 零宽
   // 连接符的 ID 在面板里也要能切换，上标数字这类 No 则两端都拒绝
   const text = String(value || "");
-  if (!text || text.length > 64) return false;
+  // 服务端按码点计数：增补平面字符在 JS 里占两个 UTF-16 单元，按
+  // length 判断会把 33 个星形字母这类合法 ID 误拒
+  if (!text || Array.from(text).length > 64) return false;
+  if (RESERVED_DEVICE_NAMES.has(text.toLowerCase())) return false;
   try {
     return /^[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u200c\u200d-]+$/u.test(text);
   } catch {
@@ -491,14 +505,20 @@ function renderInline(raw) {
       },
     )
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  text = text.replace(/(\d+)/g, (_, index) => {
-    return `<code>${codeSpans[Number(index)] ?? ""}</code>`;
-  });
+  const restoreCode = (value) =>
+    value.replace(/(\d+)/g, (_, index) => {
+      return `<code>${codeSpans[Number(index)] ?? ""}</code>`;
+    });
+  text = restoreCode(text);
   return text.replace(/(\d+)/g, (_, index) => {
     const link = links[Number(index)];
     if (!link) return "";
-    // 链接文字里的强调仍然生效（GFM 允许 ** 出现在链接文本中）
-    const label = link.label.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    // 链接文字里的强调仍然生效（GFM 允许 ** 出现在链接文本中）；
+    // 代码占位符也要还原：[`patch`](url) 的链接文字在抽取链接时已随
+    // label 离开外层 text，外层还原覆盖不到，此前会显示成不可见占位符
+    const label = restoreCode(
+      link.label.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>"),
+    );
     return `<a href="${link.href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
   });
 }
@@ -513,7 +533,13 @@ function splitTableRow(line) {
   let inCode = false;
   for (const ch of trimmed) {
     if (escaped) {
-      current += ch === "|" ? "|" : `\${ch}`;
+      // GFM 反斜杠转义：下一个字符是 ASCII 标点（含 | * _ 等）时按字面
+      // 输出该字符；普通字符（如 C:\temp 的 t）不构成转义，反斜杠本身
+      // 保留。此前模板字符串 `` `\${ch}` `` 求值成字面量 "${ch}"（$ 被
+      // 转义），把单元格改写成了乱码
+      current += /[\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]/.test(ch)
+        ? ch
+        : "\\" + ch;
       escaped = false;
       continue;
     }
