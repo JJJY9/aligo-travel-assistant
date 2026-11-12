@@ -1305,6 +1305,14 @@ async function downloadFromApi(url, fallbackName) {
     if (!response.ok) {
       throw new Error(await errorMessage(response));
     }
+    // ICS 导出会跳过缺少出发日期的行程：响应头带跳过条数，不能静默
+    // 给出少行程的日历文件
+    const skippedTrips = Number(
+      response.headers.get("x-aligo-export-skipped") || 0,
+    );
+    if (skippedTrips > 0) {
+      toast(`有 ${skippedTrips} 条行程缺少出发日期，未包含在日历中`);
+    }
     const blob = await response.blob();
     const disposition = response.headers.get("content-disposition") || "";
     const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);

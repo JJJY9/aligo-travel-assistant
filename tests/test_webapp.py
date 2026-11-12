@@ -4034,6 +4034,56 @@ def test_trips_calendar_api():
         _cleanup(user_id)
 
 
+def test_ics_export_reports_skipped_dateless_trips():
+    """ICS 导出跳过缺出发日期的行程：响应头带条数，前端据此提示。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_ics_skipped")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-11-09",
+                    "end_date": "2026-11-10",
+                    "purpose": "出差",
+                }
+            )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "广州",
+                    "start_date": "",
+                    "end_date": "",
+                    "purpose": "待定",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        calendar = _client().get(
+            "/api/trips/calendar", params={"user_id": user_id}
+        )
+        assert calendar.status_code == 200
+        assert calendar.text.count("BEGIN:VEVENT") == 1, "缺日期行程不产生事件"
+        assert calendar.headers.get("x-aligo-export-skipped") == "1"
+
+        filtered = _client().get(
+            "/api/trips/export", params={"user_id": user_id, "format": "ics"}
+        )
+        assert filtered.status_code == 200
+        assert filtered.headers.get("x-aligo-export-skipped") == "1", (
+            "format=ics 与 /api/trips/calendar 同一口径"
+        )
+        print("✓ ICS 导出通报告被跳过的缺日期行程")
+    finally:
+        _cleanup(user_id)
+
+
 def test_trip_calendar_storage_failure_maps_503(monkeypatch):
     """行程日历导出的存储故障应映射 503（与 CSV / 会话导出一致）。"""
     from webapp import server as server_module
@@ -10901,6 +10951,7 @@ if __name__ == "__main__":
     test_ics_escape_handles_lone_cr()
     test_build_trips_ics_multiple_events()
     test_trips_calendar_api()
+    test_ics_export_reports_skipped_dateless_trips()
     _mp_ics = pytest.MonkeyPatch()
     try:
         test_trip_calendar_storage_failure_maps_503(_mp_ics)
