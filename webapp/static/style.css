@@ -459,6 +459,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 }
 .health i { width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); }
 .health.ok i { background: #1f9d6b; box-shadow: 0 0 0 3px rgba(31, 157, 107, 0.14); }
+.health.warn i { background: #d68b16; box-shadow: 0 0 0 3px rgba(214, 139, 22, 0.16); }
 .health.err i { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 
 .scroll { flex: 1; overflow-y: auto; }

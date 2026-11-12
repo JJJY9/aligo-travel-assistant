@@ -130,6 +130,8 @@ const state = {
   // 当前 DOM 只渲染到搜索命中窗口、会话更新部分尚未渲染：此期间会话末尾
   // 不在 DOM 中，编辑 / 重新生成会指向错误的「最后一轮」，一律隐藏
   partialHistory: false,
+  // 正在删除的会话 id：双击确认不能重复发 DELETE（计数会被减两次）
+  deletingSessions: new Set(),
   // 偏好编辑被取消时置位：刷新被有意跳过，面板关闭时补一次
   statusStale: false,
 };
@@ -461,7 +463,14 @@ async function getJSON(url, options, timeoutMs = 120000) {
       error.status = response.status;
       throw error;
     }
-    return await response.json();
+    // 2xx 也可能是非 JSON：session_id=export 会被静态导出路由截获并 200
+    // 返回 Markdown，直接 response.json() 抛 SyntaxError，被上层当成
+    // 「加载会话失败」；给出可理解的错误文本
+    try {
+      return await response.json();
+    } catch {
+      throw new Error("响应不是 JSON（接口可能被其它路由截获，请更换 ID 后重试）");
+    }
   } catch (error) {
     if (timedOut) throw new Error("请求超时，请稍后重试");
     throw error;
@@ -833,6 +842,10 @@ function startEditUserNode(node, originalText) {
     node.classList.remove("editing");
     bubble.textContent = originalText;
     refreshEditButtons();
+    // 输入框被替换掉后焦点会落到 body：还给该条目的「编辑」按钮，
+    // 键盘用户（Esc 取消 / 空提交）不丢位置
+    const chip = node.querySelector(".user-edit .chip");
+    if (chip) chip.focus();
   };
   const close = () => {
     if (saving) return;
@@ -1121,12 +1134,15 @@ async function retryFailed(node, text) {
     }
     if (persisted) {
       node.remove();
-      await openSession(state.sessionId, {
+      const refreshed = await openSession(state.sessionId, {
         silent: true,
         keepOnError: true,
         preserveOnEmpty: true,
+        toastOnError: true,
       });
-      toast("这一轮已保存，已按服务端历史刷新");
+      if (refreshed) {
+        toast("这一轮已保存，已按服务端历史刷新");
+      }
       return;
     }
   }
@@ -2347,6 +2363,7 @@ function updateArchivedToggle(count) {
 }
 
 async function loadSessions(query = state.searchQuery, options = {}) {
+  const previousQuery = state.searchQuery;
   state.searchQuery = String(query || "").trim();
   const requestId = (sessionsRequestId += 1);
   state.sessionsLoading = true;
@@ -2422,6 +2439,11 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   } catch (error) {
     if (requestId !== sessionsRequestId) return;
     state.sessionsLoading = false;
+    if (options.reset) {
+      // 失败不能把查询词留成新词：列表与分页游标仍是旧查询的，随后
+      // 「加载更多」会用新词 + 旧 offset 拉取，把不同查询的结果混进列表
+      state.searchQuery = previousQuery;
+    }
     // 存储故障 / 网络抖动不能伪装成「没有历史」：保留已有列表并提示
     toast(`加载会话列表失败：${error.message || error}`);
     if (!state.sessions.length) {
@@ -2689,20 +2711,29 @@ async function openSession(sessionId, options = {}) {
       scrollToBottom(true);
     }
     closeMobileSidebar();
+    return true;
   } catch (error) {
     // 请求已被新对话 / 会话切换作废：过期的失败不能在当前界面弹提示
-    if (token !== sessionLoadToken || state.busy) return;
+    if (token !== sessionLoadToken || state.busy) return false;
     if (!options.silent) {
       toast(`加载会话失败：${error.message}`);
-    } else if (!options.keepOnError) {
-      // 启动恢复失败（服务重启 / 网络抖动）：丢弃旧会话 ID，避免下一条消息
-      // 被写进界面从未展示过的隐藏会话。后台静默刷新（停止生成后的同步）
-      // 传 keepOnError，临时失败不能把已知存在的会话从界面上清掉
-      state.sessionId = null;
-      safeStorageRemove("session", "aligo.sessionId");
-      syncSessionControls();
-      showWelcome();
+    } else {
+      if (options.toastOnError) {
+        // 调用方已先移除界面节点（如「重试」确认已落库后）：重载失败必须
+        // 明说，不能继续提示「已按服务端历史刷新」
+        toast(`加载会话失败：${error.message}`);
+      }
+      if (!options.keepOnError) {
+        // 启动恢复失败（服务重启 / 网络抖动）：丢弃旧会话 ID，避免下一条消息
+        // 被写进界面从未展示过的隐藏会话。后台静默刷新（停止生成后的同步）
+        // 传 keepOnError，临时失败不能把已知存在的会话从界面上清掉
+        state.sessionId = null;
+        safeStorageRemove("session", "aligo.sessionId");
+        syncSessionControls();
+        showWelcome();
+      }
     }
+    return false;
   } finally {
     if (token === sessionLoadToken) {
       state.sessionLoading = false;
@@ -2793,7 +2824,11 @@ async function deleteSession(sessionId) {
     toast("请等待当前回复完成");
     return;
   }
+  // 同一会话的删除只发一次：双击确认的第二个 DELETE 返回 deleted:0 仍走
+  // 成功路径，会把 sessionTotal / sessionsOffset 再各减一
+  if (state.deletingSessions.has(sessionId)) return;
   if (!window.confirm("删除这个会话？聊天记录会从长期记忆中移除。")) return;
+  state.deletingSessions.add(sessionId);
   // 只在删除的正是「正在加载的会话」时作废这次加载；删除其它会话不能
   // 把用户刚点击的会话切换静默丢弃（之后消息会写进错误的会话）
   if (state.sessionLoadingId === sessionId) {
@@ -2827,6 +2862,8 @@ async function deleteSession(sessionId) {
     toast("会话已删除");
   } catch (error) {
     toast(`删除失败：${error.message}`);
+  } finally {
+    state.deletingSessions.delete(sessionId);
   }
 }
 
@@ -2835,7 +2872,9 @@ async function deleteSession(sessionId) {
 function setBusy(busy) {
   state.busy = busy;
   els.sendBtn.disabled = busy;
-  els.stopBtn.hidden = !busy;
+  // 非流式阶段（删除并重发 / 会话加载）也会置 busy，但此时没有可中止的
+  // 回合：显示「停止」只会让用户点到无反应的按钮
+  els.stopBtn.hidden = !busy || !state.controller;
 }
 
 async function sendMessage(text, options = {}) {
@@ -2929,6 +2968,8 @@ async function sendMessage(text, options = {}) {
       throw new Error("连接意外中断，回答可能不完整");
     }
     els.health.className = terminal === "error" ? "health err" : "health ok";
+    // 圆点变色同时更新文案：只改 class 会让顶栏在连接异常后仍显示「在线」
+    els.healthText.textContent = terminal === "error" ? "回答出错" : "在线";
   } catch (error) {
     if (error.name === "AbortError") {
       // 服务端已发过 done / error 后再中止（停止按钮晚点、切换会话）：
@@ -2960,6 +3001,7 @@ async function sendMessage(text, options = {}) {
         assistant.fail(error.message || "请求失败，请稍后再试。");
       });
       els.health.className = "health err";
+      els.healthText.textContent = "连接异常";
       // 流在 done / error 之前中断（代理超时 / 断网 / 后端重启）：服务端
       // 可能已完成原子落库，同样要与历史对账——否则用户点「重试」会在
       // 历史里留下两条相同问答
@@ -4132,10 +4174,17 @@ function startEditPreference(row, type, currentValue) {
   input.select();
   let settled = false;
 
+  const focusRowEdit = () => {
+    // 行内编辑框被替换掉后焦点会落到 body：还原本行的「编辑」按钮
+    const editButton = row.querySelector('button[title="编辑偏好"]');
+    if (editButton) editButton.focus();
+  };
+
   const cancel = () => {
     if (settled) return;
     settled = true;
     if (input.isConnected) input.replaceWith(valueEl);
+    focusRowEdit();
     // 不在 blur（mousedown 阶段）里重建列表：那会把本次点击的目标节点
     // 换掉、吞掉 click。标记为过期，面板关闭时统一补一次刷新。
     state.statusStale = true;
@@ -4171,6 +4220,7 @@ function startEditPreference(row, type, currentValue) {
       valueEl.textContent = formatPreferenceValue(value);
       if (input.isConnected) input.replaceWith(valueEl);
       await refreshStatus();
+      focusRowEdit();
     } catch (error) {
       settled = false;
       toast(`保存失败：${error.message}`);
@@ -4214,11 +4264,22 @@ async function refreshHealth() {
   try {
     const data = await getJSON("/api/health", undefined, 30000);
     state.health = data;
-    els.health.className = "health ok";
-    els.healthText.textContent = "在线";
-    els.health.title = `${data.model || "模型"} · ${
-      data.has_api_key ? "密钥已配置" : "未配置密钥"
-    } · v${data.version || ""}`;
+    const breaker = String(data.circuit_breaker || "closed");
+    if (data.status === "degraded" || breaker === "open" || breaker === "half_open") {
+      // 熔断打开 / 半开（或技能缺失）时后端标记 degraded：顶栏不能显示
+      // 「在线」把 503 降级状态掩盖过去
+      els.health.className = "health warn";
+      els.healthText.textContent = "降级";
+      els.health.title = `服务降级（熔断器 ${breaker}）· ${data.model || "模型"} · v${
+        data.version || ""
+      }`;
+    } else {
+      els.health.className = "health ok";
+      els.healthText.textContent = "在线";
+      els.health.title = `${data.model || "模型"} · ${
+        data.has_api_key ? "密钥已配置" : "未配置密钥"
+      } · v${data.version || ""}`;
+    }
     if (data.model) els.modelChip.textContent = data.model;
   } catch {
     state.health = null;
@@ -4618,6 +4679,12 @@ async function runSemanticSearch({ silent = false } = {}) {
   // 取消尚未触发的子串搜索刷新，并让已发出的列表请求作废
   clearTimeout(kbSearchTimer);
   const seq = ++kbListSeq;
+  // 先进入语义模式并记录查询词：请求在途时删除 / 编辑片段触发的
+  // refreshKnowledgeDocuments 会静默重跑当前语义检索，而不是启动关键词
+  // 刷新（自增序列）把本次结果静默作废
+  const wasSemanticMode = state.kbSemanticMode;
+  state.kbSemanticMode = true;
+  state.kbSemanticQuery = query;
   els.kbSemantic.disabled = true;
   els.kbSemantic.textContent = "检索中…";
   // 语义检索期间隐藏「加载更多」：它属于关键词列表，点击结果不应掺入语义视图
@@ -4641,6 +4708,8 @@ async function runSemanticSearch({ silent = false } = {}) {
       toast(`语义结果刷新失败：${error.message}`);
       await refreshKnowledgeDocuments();
     } else {
+      // 首次检索失败：撤销预置的语义模式，面板留在关键词列表
+      if (!wasSemanticMode) state.kbSemanticMode = false;
       els.kbList.textContent = error.message;
     }
   } finally {
@@ -5215,9 +5284,18 @@ async function importKnowledgeFile() {
     }
     let data;
     try {
-      data = JSON.parse(await file.text());
-    } catch {
-      toast("无法解析 JSON 文件");
+      // 严格 UTF-8 解码（与备份恢复同口径）：GBK / ANSI 保存的文件此前被
+      // 宽松解码成 U+FFFD 乱码后仍能导入，损坏的知识片段写进共享知识库；
+      // 先解码再解析，非 UTF-8 直接提示另存
+      const buffer = await file.arrayBuffer();
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      data = JSON.parse(text);
+    } catch (error) {
+      toast(
+        error instanceof SyntaxError
+          ? "无法解析 JSON 文件"
+          : "JSON 文件不是 UTF-8 编码，请另存为 UTF-8 后重试",
+      );
       return;
     }
     const documents = Array.isArray(data)
@@ -5514,6 +5592,10 @@ async function saveUser() {
     state.tripsAllTotal = 0;
     state.tripsFilter = "";
     state.tripsStatusFilter = "";
+    // 筛选输入框与筛选行同样重置：renderOverview 在无 status 时不会渲染
+    // 行程区，新用户会带着上一个用户的筛选文本和展开的筛选行
+    if (els.tripFilter) els.tripFilter.value = "";
+    if (els.tripFilterRow) els.tripFilterRow.hidden = true;
     // 立即清空上一个用户的列表与面板：新用户的 /api/sessions、/api/status
     // 返回前旧行仍可点击，而删除 / 编辑按当前 user_id 执行，会误伤新用户的同名记录
     closeMemorySheet();

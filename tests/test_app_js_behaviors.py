@@ -177,6 +177,15 @@ def test_silent_reload_restores_expanded_window():
     print("✓ 静默重载恢复已展开的历史窗口")
 
 
+def test_search_failure_restores_previous_query():
+    """搜索失败后查询词回到旧值，列表与「加载更多」保持同一查询口径。"""
+    data = _run_harness("sessionSearchFailure")
+    assert data["searchQuery"] == "old", data
+    assert data["sessions"] == ["s-old"], data
+    assert any("加载会话列表失败" in item for item in data["toasts"]), data
+    print("✓ 搜索失败恢复旧查询词（列表与分页不混入新查询）")
+
+
 def test_history_renders_in_windows():
     """大历史首屏只渲染一个窗口，补批不请求网络、读完按钮消失。"""
     data = _run_harness("historyWindow")
@@ -608,4 +617,5 @@ if __name__ == "__main__":
     test_chat_done_persisted_signal()
     test_search_hit_renders_bounded_window()
     test_silent_reload_restores_expanded_window()
+    test_search_failure_restores_previous_query()
     print("\n全部通过")
