@@ -1665,6 +1665,111 @@ def test_parse_rejects_escaped_surrogate_in_assistant_json():
     print("✓ 转义代理项 / NUL 的 assistant 内容在导入时被拒绝")
 
 
+def test_parse_limits_trip_id_length_and_preference_keys():
+    """超大 trip_id 丢弃编号、偏好键与 Web 同口径、上限不被非法键绕过。"""
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "trip_history": [
+                    {
+                        "trip_id": "trip_" + "9" * 19,
+                        "destination": "上海",
+                        "start_date": "2026-12-01",
+                    },
+                    {
+                        "trip_id": "trip_123456789012345678",
+                        "destination": "北京",
+                        "start_date": "2026-12-02",
+                    },
+                ]
+            }
+        )
+    )
+    assert sections["trips"][0].get("trip_id") is None, (
+        "19 位编号会毒化 BIGINT 编号水位，必须按新编号恢复"
+    )
+    assert sections["trips"][1]["trip_id"] == "trip_123456789012345678"
+    assert any("trip_id" in error for error in errors), errors
+
+    sections, errors = parse_user_export(
+        json.dumps({"preferences": {"x" + chr(10) + "y": 1, " home": "上海"}})
+    )
+    assert "x" + chr(10) + "y" not in sections["preferences"]
+    assert sections["preferences"] == {" home": "上海"}, (
+        "键名不能 strip：改名会让相邻键碰撞互相覆盖"
+    )
+    assert any("键名非法" in error for error in errors)
+
+    # 5000 个非法键：错误列表必须被 200 条上限截断（旧实现全部处理）
+    many_bad = {f"bad/{index}": 1 for index in range(5000)}
+    sections, errors = parse_user_export(json.dumps({"preferences": many_bad}))
+    assert sections.get("preferences", {}) == {}
+    assert len(errors) <= 205, len(errors)
+    print("✓ trip_id / 偏好键 / 上限校验收口")
+
+
+def test_import_rejects_when_existing_totals_exceed_limits():
+    """存量 + 本备份越过导出上限时恢复必须中止（否则永久无法导出）。"""
+    sections = {
+        "preferences": {},
+        "trips": [],
+        "messages": [{"session_id": "s", "role": "user", "content": "hi"}],
+    }
+
+    class _FullStore:
+        def get_statistics(self):
+            return {"total_messages": 200000, "total_trips": 0}
+
+        def save_preference(self, key, value):  # pragma: no cover - 不应被调用
+            raise AssertionError("超限时不能开始写入")
+
+    try:
+        import_user_data(_FullStore(), sections)
+    except ValueError as exc:
+        assert "上限" in str(exc), exc
+    else:
+        raise AssertionError("越过导出上限的恢复必须被拒绝")
+
+    class _TripFullStore:
+        def get_statistics(self):
+            return {"total_messages": 0, "total_trips": 5000}
+
+    trip_sections = {
+        "preferences": {},
+        "trips": [{"destination": "上海", "start_date": "2026-12-01"}],
+        "messages": [],
+    }
+    try:
+        import_user_data(_TripFullStore(), trip_sections)
+    except ValueError as exc:
+        assert "上限" in str(exc), exc
+    else:
+        raise AssertionError("行程超限的恢复必须被拒绝")
+    print("✓ 存量超限时恢复中止")
+
+
+def test_preview_normalizes_legacy_integer_session_id():
+    """dry-run 与真实导入共用归一化去重键（旧整数 session_id 不多报）。"""
+    from utils.user_import import preview_user_import
+
+    class _LegacyStore:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_chat_history(self, limit=None):
+            return [{"session_id": 123, "role": "user", "content": "Q"}]
+
+    sections = {
+        "preferences": {},
+        "trips": [],
+        "messages": [{"session_id": "123", "role": "user", "content": "Q"}],
+    }
+    preview = preview_user_import(_LegacyStore(), sections)
+    assert preview["messages_added"] == 0, preview
+    assert preview["messages_skipped"] == 1, preview
+    print("✓ 预览与导入的会话去重键归一化一致")
+
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -1728,4 +1833,7 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+    test_parse_limits_trip_id_length_and_preference_keys()
+    test_import_rejects_when_existing_totals_exceed_limits()
+    test_preview_normalizes_legacy_integer_session_id()
     print("\n全部通过")

@@ -5272,6 +5272,10 @@ def create_app(model: Any = None) -> FastAPI:
                     # 存储打开失败的 503（_open_long_term strict）原样上抛，
                     # 不再被下面的通用分支改成「恢复失败」丢掉原因
                     raise
+                except ValueError as exc:
+                    # 存量 + 备份越过导出上限等用户可修正的问题：明确 400，
+                    # 不能吞成「稍后重试」的 503
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
                 except MemoryPersistenceError as exc:
                     logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                     raise HTTPException(

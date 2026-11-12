@@ -58,8 +58,12 @@ def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:
                     parsed = None
                 if isinstance(parsed, (dict, list)):
                     try:
+                        # NUL 可能以 ``\u0000`` 转义形式藏在字符串值里：
+                        # sanitize_json 不管 NUL，必须再 strip_nul（含字典键），
+                        # 否则导出成功的备份在恢复时该消息被整条拒绝
                         text = json.dumps(
-                            sanitize_json(parsed), ensure_ascii=False
+                            strip_nul(sanitize_json(parsed)),
+                            ensure_ascii=False,
                         )
                     except (TypeError, ValueError):
                         pass
