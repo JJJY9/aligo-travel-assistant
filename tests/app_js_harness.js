@@ -1733,6 +1733,22 @@ async function scenarioUserBackupDecode(source) {
   await run("importUserBackup()");
   results.gbk_toasts = run("__toasts.slice()");
   results.gbk_requests = run("__requests.length");
+  // 读取 / 解析期间切换用户：不能把备份恢复进旧身份，也不能继续弹确认
+  run(`
+    state.userId = "u1";
+    globalThis.__toasts.length = 0;
+    els.importDataFile.files = [{
+      size: 40,
+      arrayBuffer: async () => {
+        state.userId = "u2";
+        return new TextEncoder()
+          .encode('{"preferences": {"home_location": "北京"}}').buffer;
+      },
+    }];
+  `);
+  await run("importUserBackup()");
+  results.switch_toasts = run("__toasts.slice()");
+  results.switch_requests = run("__requests.length");
   return results;
 }
 

@@ -594,6 +594,9 @@ def test_user_backup_import_rejects_non_utf8():
     data = _run_harness("userBackupDecode")
     assert any("UTF-8" in toast for toast in data["gbk_toasts"]), data
     assert data["gbk_requests"] == 0, "解码失败不能发起导入请求"
+    # 读取期间切换用户：取消恢复，不弹确认、不发请求
+    assert any("用户已切换" in toast for toast in data["switch_toasts"]), data
+    assert data["switch_requests"] == 0, "身份已切换不能继续导入"
     print("✓ 备份恢复拒绝非 UTF-8 文件")
 
 
