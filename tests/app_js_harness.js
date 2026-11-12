@@ -1510,6 +1510,21 @@ async function scenarioKbDelete(source) {
   return results;
 }
 
+async function scenarioUserBackupDecode(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  // 非 UTF-8 备份：严格解码失败必须提示另存，且不发任何导入请求
+  run(
+    "els.importDataFile.files = [{ size: 4, arrayBuffer: async () => new Uint8Array([196, 191, 181, 196]).buffer }];",
+  );
+  run("confirm = () => true;");
+  await run("importUserBackup()");
+  results.gbk_toasts = run("__toasts.slice()");
+  results.gbk_requests = run("__requests.length");
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1568,6 +1583,8 @@ async function main() {
     payload = scenarioKbImportSummary(source);
   } else if (scenario === "kbDelete") {
     payload = await scenarioKbDelete(source);
+  } else if (scenario === "userBackupDecode") {
+    payload = await scenarioUserBackupDecode(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

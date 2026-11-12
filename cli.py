@@ -30,6 +30,7 @@ from utils.console import (
     strip_terminal_controls,
 )
 from utils.errors import MemoryPersistenceError
+from utils.identifiers import is_valid_web_id
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import has_preference_value, is_manageable_pref_type
@@ -67,6 +68,19 @@ def _terminal_safe(value: object) -> str:
     """
     text = strip_terminal_controls(value)
     return escape(text) if escape is not None else text
+
+
+def _valid_web_id(value: object) -> bool:
+    """与 Web 端点同一字符集（Rust ``\\w`` 语义）的 ID 校验。
+
+    Python re 的 ``\\w`` 与 pydantic-core 的 Rust ``\\w`` 双向不一致（如
+    「²」Python 接受而 Web 拒绝；连接符标点 / 组合符 Web 接受而旧正则
+    拒绝）：CLI 生成的备份必须能被 Web 打开，Web 导出的备份也必须能被
+    CLI 恢复。前导 ``-`` 仍是 CLI 选项解析的硬限制。
+    """
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        return False
+    return is_valid_web_id(value)
 
 
 if Console is not None:
@@ -146,7 +160,6 @@ class AligoCLI:
 
     def _prompt_user_id(self) -> str:
         """交互式询问用户 ID，并按与 Web 相同的规则校验。"""
-        import re
 
         while True:
             try:
@@ -178,7 +191,7 @@ class AligoCLI:
                     "请改用非交互子命令或接入终端后重试"
                 )
                 raise SystemExit(1) from None
-            if re.fullmatch(r"[\w-]{1,64}", value) and not value.startswith("-"):
+            if _valid_web_id(value):
                 return value
             if not getattr(sys.stdin, "isatty", lambda: True)():
                 # 非交互管道里下一行是查询数据而不是身份重试：继续循环会把
@@ -1245,12 +1258,47 @@ class AligoCLI:
 
     def export_memory(self):
         """把当前用户的长期记忆导出为 JSON 与 Markdown（exports/ 目录）"""
+        from datetime import datetime
+
+        from context.storage import create_long_term_memory
         from utils.exporter import export_files
 
         from utils.user_import import backup_limit_problem
 
-        self.memory_manager.reload_long_term()
-        data = self.memory_manager.export_data()
+        # strict：PostgreSQL 配置但不可用时，user-export 与 /api/export 都会
+        # 明确拒绝；交互式导出不能静默导出空 / 过期的回退 JSON 并宣称成功
+        try:
+            store = create_long_term_memory(self.user_id, "data/memory", strict=True)
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            self.console.print(f"[red]导出中止：{exc}[/red]")
+            return
+        try:
+            snapshot = getattr(store, "export_snapshot", None)
+            if callable(snapshot):
+                sections = snapshot()
+            else:  # pragma: no cover - 未知后端
+                sections = {
+                    "preferences": store.get_preference(),
+                    "trip_history": store.get_trip_history(limit=None),
+                    "chat_history": store.get_chat_history(),
+                    "session_titles": store.get_session_titles(),
+                    "pinned_sessions": store.get_pinned_sessions(),
+                    "archived_sessions": store.get_archived_sessions(),
+                    "statistics": store.get_statistics(),
+                }
+        except Exception as exc:  # noqa: BLE001 - 读取失败直接展示原因
+            self.console.print(f"[red]导出中止：{exc}[/red]")
+            return
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        data = {
+            "user_id": self.user_id,
+            "session_id": getattr(self.memory_manager, "session_id", "") or "",
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            **sections,
+        }
         problem = backup_limit_problem(data)
         if problem:
             self.console.print(
@@ -1584,7 +1632,7 @@ def _parse_strict_date(value: str):
 def _valid_user_id(value: str) -> bool:
     """用户 ID 规则与 API 一致：中文 / 字母 / 数字 / 下划线 / 短横线，1..64 字符。"""
     return (
-        bool(re.fullmatch(r"[\w-]{1,64}", value))
+        _valid_web_id(value)
         and not value.startswith("-")
     )
 
@@ -2436,11 +2484,10 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     Returns:
         0 汇总成功；1 参数 / 读取失败
     """
-    import re
 
     from utils.travel_stats import summarize_travel
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _cli_fail(
             "用户 ID 只能包含中文、字母、数字、下划线和短横线",
             as_json,
@@ -2557,13 +2604,12 @@ def run_user_export_standalone(
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败
     """
-    import re
     from datetime import datetime
     from pathlib import Path
 
     from utils.exporter import export_files
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -2652,7 +2698,6 @@ def run_user_import_standalone(
         或没有可恢复的数据
     """
     import io
-    import re
 
     from utils.user_import import (
         MAX_BACKUP_BYTES,
@@ -2674,7 +2719,7 @@ def run_user_import_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not json_path or json_path.startswith("-"):
         return _fail("请提供 JSON 备份文件路径")
@@ -2838,7 +2883,7 @@ def run_user_import_standalone(
         if knowledge_error:
             print(f"❌ {knowledge_error}（用户数据已恢复，可稍后重跑补齐知识片段）")
         for error in errors[:10]:
-            print(f"  跳过：{error}")
+            print(f"  跳过：{_terminal_safe(error)}")
     return 1 if knowledge_error else 0
 
 
@@ -3265,7 +3310,6 @@ def run_trips_dedupe_standalone(
     Returns:
         0 清理完成（含无重复 / dry-run）；1 参数 / 读取 / 删除失败
     """
-    import re
 
     def _fail(message: str, **extra: Any) -> int:
         if as_json:
@@ -3290,7 +3334,7 @@ def run_trips_dedupe_standalone(
                 )
             )
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
 
     from config import STORAGE_CONFIG
@@ -3537,9 +3581,8 @@ def run_sessions_list_standalone(
     Returns:
         0 列出成功（含无会话）；1 参数 / 读取失败
     """
-    import re
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _cli_fail(
             "用户 ID 只能包含中文、字母、数字、下划线和短横线",
             as_json,
@@ -3659,7 +3702,6 @@ def run_session_archive_standalone(
     Returns:
         0 操作成功；1 参数 / 读取 / 写入失败
     """
-    import re
 
     def _fail(message: str) -> int:
         if as_json:
@@ -3674,9 +3716,9 @@ def run_session_archive_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+    if not _valid_web_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     try:
         store = _open_cli_store(user_id)
@@ -3733,7 +3775,6 @@ def run_session_delete_standalone(
     Returns:
         0 删除成功；1 参数 / 读取 / 删除失败（含会话不存在）
     """
-    import re
 
     from context.storage import clear_short_term_session
 
@@ -3750,9 +3791,9 @@ def run_session_delete_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+    if not _valid_web_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     try:
         store = _open_cli_store(user_id)
@@ -3831,7 +3872,6 @@ def run_session_title_standalone(
     Returns:
         0 设置成功；1 参数 / 读取 / 写入失败（含会话不存在）
     """
-    import re
 
     def _fail(message: str) -> int:
         if as_json:
@@ -3846,9 +3886,9 @@ def run_session_title_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+    if not _valid_web_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     cleaned = title.strip()
     if len(cleaned) > 60:
@@ -3910,7 +3950,6 @@ def run_session_pin_standalone(
     Returns:
         0 操作成功；1 参数 / 读取 / 写入失败（含会话不存在）
     """
-    import re
 
     def _fail(message: str) -> int:
         if as_json:
@@ -3925,9 +3964,9 @@ def run_session_pin_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+    if not _valid_web_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
 
     try:
@@ -3987,7 +4026,6 @@ def run_session_show_standalone(
     Returns:
         0 查看成功；1 参数 / 读取失败（含会话不存在）
     """
-    import re
 
     from utils.stored_message import render_stored_message
 
@@ -4004,9 +4042,9 @@ def run_session_show_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+    if not _valid_web_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
 
     try:
@@ -4138,16 +4176,15 @@ def run_session_export_standalone(
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败或会话不存在
     """
-    import re
     from datetime import datetime
     from pathlib import Path
 
     from utils.stored_message import render_stored_message
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
-    if not re.fullmatch(r"[\w-]{1,64}", session_id) or session_id.startswith("-"):
+    if not _valid_web_id(session_id):
         print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -4259,10 +4296,9 @@ def run_sessions_export_standalone(
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败或没有会话
     """
-    import re
     from pathlib import Path
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -4354,7 +4390,6 @@ def run_trips_export_standalone(
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败
     """
-    import re
     from pathlib import Path
 
     from utils.trip_conflicts import filter_trips_by_query, trip_state_label
@@ -4366,7 +4401,7 @@ def run_trips_export_standalone(
         trip_ics_end_unparsable,
     )
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -4520,7 +4555,6 @@ def run_trip_calendar_standalone(
     Returns:
         0 导出成功；1 参数 / 读取 / 写入失败、行程不存在 / 歧义 / 缺出发日期
     """
-    import re
     from pathlib import Path
 
     from utils.trip_export import (
@@ -4529,10 +4563,10 @@ def run_trip_calendar_standalone(
         trip_ics_end_unparsable,
     )
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
-    if not re.fullmatch(r"[\w-]{1,64}", trip_id) or trip_id.startswith("-"):
+    if not _valid_web_id(trip_id):
         print("行程 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -4711,7 +4745,6 @@ def run_trip_add_standalone(
     Returns:
         0 保存成功；1 参数 / 读取 / 写入失败
     """
-    import re
 
     from utils.trip_conflicts import find_saved_trip, trip_conflicts
 
@@ -4728,7 +4761,7 @@ def run_trip_add_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     # 与 Web 请求模型同一上限：超长字段落库后，面板任何一次编辑保存都会
     # 因该记录确定 422，且无法从面板修正（只能改库）
@@ -4843,7 +4876,6 @@ def run_trip_delete_standalone(
     Returns:
         0 删除成功；1 参数 / 读取 / 删除失败（含行程不存在）
     """
-    import re
 
     def _fail(message: str) -> int:
         if as_json:
@@ -4858,9 +4890,9 @@ def run_trip_delete_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", trip_id) or trip_id.startswith("-"):
+    if not _valid_web_id(trip_id):
         return _fail("行程 ID 只能包含中文、字母、数字、下划线和短横线")
 
     try:
@@ -4987,7 +5019,6 @@ def run_trip_update_standalone(
     Returns:
         0 更新成功；1 参数 / 读取 / 写入失败（含行程不存在）
     """
-    import re
 
     from utils.trip_conflicts import trip_conflicts
 
@@ -5004,9 +5035,9 @@ def run_trip_update_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", trip_id) or trip_id.startswith("-"):
+    if not _valid_web_id(trip_id):
         return _fail("行程 ID 只能包含中文、字母、数字、下划线和短横线")
     mapped = {
         {"start": "start_date", "end": "end_date"}.get(key, key): value
@@ -5168,7 +5199,6 @@ def _parse_trips_list_args(
     ``--query`` / ``--status`` 支持 ``--x 值`` 与 ``--x=值``，``--json``
     不限位置；未知参数、缺值、非法用户 ID、非法状态或位置参数过多返回 None。
     """
-    import re
 
     user_id: str | None = None
     query = ""
@@ -5215,7 +5245,7 @@ def _parse_trips_list_args(
         index += 1
     if (
         user_id is None
-        or not re.fullmatch(r"[\w-]{1,64}", user_id)
+        or not _valid_web_id(user_id)
         or user_id.startswith("-")
     ):
         return None
@@ -5243,7 +5273,6 @@ def run_trips_import_standalone(
         0 至少导入一行（含部分项被跳过）；1 参数 / 读取 / 写入失败或没有可导入行
     """
     import io
-    import re
 
     from utils.errors import PartialImportError
     from utils.trip_import import import_trips_from_text
@@ -5261,7 +5290,7 @@ def run_trips_import_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not csv_path or csv_path.startswith("-"):
         return _fail("请提供 CSV / ICS 文件路径")
@@ -5381,7 +5410,6 @@ def run_trips_list_standalone(
     Returns:
         0 列出成功（含无行程 / 无匹配）；1 参数 / 读取失败
     """
-    import re
 
     from utils.trip_conflicts import (
         filter_trips_by_query,
@@ -5389,7 +5417,7 @@ def run_trips_list_standalone(
         trips_with_conflicts,
     )
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _cli_fail(
             "用户 ID 只能包含中文、字母、数字、下划线和短横线",
             as_json,
@@ -5535,11 +5563,10 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
     Returns:
         0 列出成功（含无偏好）；1 参数 / 读取失败
     """
-    import re
 
     from utils.result_formatter import preference_label
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _cli_fail(
             "用户 ID 只能包含中文、字母、数字、下划线和短横线",
             as_json,
@@ -5686,7 +5713,7 @@ def run_preference_set_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
@@ -5789,7 +5816,7 @@ def run_preference_delete_standalone(
             print(_terminal_safe(message))
         return 1
 
-    if not re.fullmatch(r"[\w-]{1,64}", user_id) or user_id.startswith("-"):
+    if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")

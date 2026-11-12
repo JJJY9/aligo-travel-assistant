@@ -1618,9 +1618,19 @@ async function importUserBackup() {
     toast("备份文件不能超过 50 MB");
     return;
   }
+  let backupText;
+  try {
+    // 严格 UTF-8 解码：GBK / ANSI 备份此前被静默替换成 U+FFFD 仍能导入，
+    // 中文正文永久损坏；CLI 对同一文件会明确拒绝。非 UTF-8 直接提示重存。
+    const buffer = await file.arrayBuffer();
+    backupText = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    toast("备份文件不是 UTF-8 编码，请另存为 UTF-8 后重试");
+    return;
+  }
   let backup;
   try {
-    backup = JSON.parse(await file.text());
+    backup = JSON.parse(backupText);
   } catch {
     toast("无法解析备份 JSON");
     return;
