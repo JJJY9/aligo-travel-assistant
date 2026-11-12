@@ -37,6 +37,15 @@ logger = logging.getLogger(__name__)
 _MAX_QUERY_CHARS = 4000
 
 
+class _ProviderError(RuntimeError):
+    """模型网关以 200 返回错误体 / 空响应时携带状态码，供熔断器分类。"""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+
+
 def _message_text(content) -> str:
     """把 Msg.content（字符串或 agentscope content block 列表）转成纯文本。
 
@@ -297,10 +306,33 @@ class IntentionAgent(AgentBase):
             text = text.removeprefix('```')
             text = text.removesuffix('```')
             text = text.strip()
+            if not text:
+                # 网关以 200 返回空错误体 / choices 为空：上游实际不可用，
+                # 按可重试错误上抛（重试可能恢复），熔断器也能记账；不能
+                # 落进「JSON 解析失败 → 默认意图」被当成成功
+                raise ConnectionError("模型服务返回空响应")
 
             # 解析JSON（拒绝 NaN / Infinity；顶层必须是对象）
             try:
                 result = json.loads(text, parse_constant=reject_json_constant)
+                if (
+                    isinstance(result, dict)
+                    and "agent_schedule" not in result
+                    and "error" in result
+                ):
+                    # 网关 200 + 错误体（限流 / 鉴权失败等）：状态码交给
+                    # 熔断器分类（429/5xx 重试、4xx 记为永久故障）
+                    provider_error = result.get("error")
+                    code: int | None = None
+                    if isinstance(provider_error, dict):
+                        raw_code = provider_error.get("code") or provider_error.get(
+                            "status"
+                        )
+                        if isinstance(raw_code, int):
+                            code = raw_code
+                    raise _ProviderError(
+                        f"模型服务返回错误：{str(provider_error)[:200]}", code
+                    )
                 if not isinstance(result, dict):
                     raise ValueError("意图识别结果不是 JSON 对象")
                 if "agent_schedule" not in result:
