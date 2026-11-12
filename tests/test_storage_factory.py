@@ -2273,6 +2273,71 @@ def test_bulk_message_dedupe_normalizes_legacy_int_session_id():
     print("✓ 批量恢复对整数 session_id 幂等")
 
 
+def test_trip_batch_restore_preserves_ids_and_rejects_collisions():
+    """批量恢复沿用备份 trip_id / timestamp；编号冲突时退回新编号且保持唯一。"""
+    memory = LongTermMemory("u-trip-restore", tempfile.mkdtemp())
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+        }
+    )
+    created, updated = memory.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "广州",
+                "start_date": "2026-02-01",
+                "end_date": "2026-02-02",
+                "trip_id": "trip_5",
+                "timestamp": "2025-05-01T10:00:00+08:00",
+            },
+            {
+                "origin": "北京",
+                "destination": "成都",
+                "start_date": "2026-03-01",
+                "end_date": "2026-03-02",
+                "trip_id": "trip_5",
+            },
+            {
+                "origin": "北京",
+                "destination": "西安",
+                "start_date": "2026-04-01",
+                "end_date": "2026-04-02",
+                "trip_id": "trip_1",
+            },
+        ]
+    )
+    assert (created, updated) == (3, 0)
+    trips = {
+        trip["destination"]: trip for trip in memory.get_trip_history(limit=None)
+    }
+    assert trips["广州"]["trip_id"] == "trip_5", "未占用的备份编号要沿用"
+    assert trips["广州"]["timestamp"].startswith("2025-05-01"), (
+        "备份时间戳要保留"
+    )
+    assert trips["成都"]["trip_id"] not in {"trip_5", "trip_1"}, (
+        "同批重复声明的编号不能复用"
+    )
+    assert trips["西安"]["trip_id"] not in {"trip_5", "trip_1"}, (
+        "与既有行程冲突的编号不能覆盖"
+    )
+    ids = [trip["trip_id"] for trip in memory.get_trip_history(limit=None)]
+    assert len(ids) == len(set(ids)), ids
+    new_id = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "银川",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-02",
+        }
+    )
+    assert int(new_id.split("_")[1]) > 5, "编号水位要按沿用的备份编号抬高"
+    print("✓ 批量恢复保留 trip_id / 时间戳并拒绝编号冲突")
+
+
 def test_reload_rejects_non_object_json():
     """磁盘文件是合法 JSON 但非对象（[] / null）：重载报错而不是沿用旧快照。"""
     from utils.errors import MemoryPersistenceError
@@ -2689,8 +2754,8 @@ def test_pg_save_trip_histories_batches_with_one_index():
     updates = [
         params for sql, params in executed if sql.startswith("UPDATE aligo_trips")
     ]
-    assert updates[0] == (None, 1), "缺省目的 / 会话不更新（保留原值）"
-    assert updates[1] == (None, 11), "批内重复命中刚插入的行"
+    assert updates[0] == (None, None, 1), "缺省目的 / 会话不更新，时间按恢复时刻刷新"
+    assert updates[1] == (None, None, 11), "批内重复命中刚插入的行"
     inserts = inserted_params
     assert len(inserts) == 1
     assert inserts[0][1] == "trip_3"
@@ -3501,6 +3566,7 @@ if __name__ == "__main__":
     test_trip_update_and_conflict()
     test_trip_frequent_destinations_ignore_dirty_dates()
     test_bulk_message_dedupe_normalizes_legacy_int_session_id()
+    test_trip_batch_restore_preserves_ids_and_rejects_collisions()
     test_next_trip_id_not_reused_after_deleting_latest()
     test_one_day_trip_dedupes_end_date_variants()
     test_session_titles()

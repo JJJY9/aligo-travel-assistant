@@ -1176,9 +1176,15 @@ class LongTermMemory:
         history = self.data.setdefault("trip_history", [])
         stats = self.data.setdefault("statistics", {})
         index: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        # 已占用的 trip_id：备份里的原编号只在未被其它行程占用时沿用，
+        # 否则两趟不同行程共享 trip_id（按 id 删除 / 更新会误伤）
+        used_trip_ids: set[str] = set()
         max_number = int(stats.get("last_trip_number") or 0)
         for trip in history:
             key = _identity(trip)
+            trip_id_text = str(trip.get("trip_id") or "")
+            if trip_id_text:
+                used_trip_ids.add(trip_id_text)
             if key is not None:
                 index.setdefault(key, trip)
             match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
@@ -1210,11 +1216,16 @@ class LongTermMemory:
                 "timestamp": datetime.now().isoformat(),
                 **row,
             }
-            # 备份恢复的行可能自带 trip_id：编号水位要按实际落库的 id 抬高，
-            # 否则同批后续记录可能与还原的旧编号冲突
-            match = re.fullmatch(r"trip_(\d+)", str(record.get("trip_id", "")))
-            if match:
+            # 备份恢复的行可能自带 trip_id：未被其它行程占用时沿用原编号，
+            # 并抬高编号水位（否则同批后续记录可能与旧编号冲突）；与既有
+            # 行程冲突 / 非法时退回本次生成的新编号，保持 id 全局唯一
+            backup_id = str(record.get("trip_id") or "")
+            match = re.fullmatch(r"trip_(\d+)", backup_id)
+            if match and backup_id not in used_trip_ids:
                 max_number = max(max_number, int(match.group(1)))
+            else:
+                record["trip_id"] = f"trip_{max_number}"
+            used_trip_ids.add(str(record["trip_id"]))
             stats["last_trip_number"] = max_number
             history.append(record)
             stats["total_trips"] = int(stats.get("total_trips", 0)) + 1
