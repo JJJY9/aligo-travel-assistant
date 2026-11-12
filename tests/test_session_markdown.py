@@ -268,6 +268,12 @@ def test_block_start_line_cannot_close_code_span():
         "x` <img src=x onerror=alert(1)>\n<div>`",
         # 块起始行本身不含反引号，紧随其后的段落行也不能充当关闭串
         "x` <img src=x onerror=alert(1)>\n# 标题\nclose` here",
+        # Setext 下划线 / 主题分隔线同样结束段落（#708 修复的同类绕过）
+        "x` <img src=x onerror=alert(1)>\n---\nb` c",
+        "x` <img src=x onerror=alert(1)>\n===\nb` c",
+        "x` <img src=x onerror=alert(1)>\n***\nb` c",
+        "x` <img src=x onerror=alert(1)>\n___\nb` c",
+        "x` <img src=x onerror=alert(1)>\n- - -\nb` c",
     ]
     for payload in payloads:
         text = sanitize_body(payload)
