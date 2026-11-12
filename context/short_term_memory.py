@@ -276,8 +276,11 @@ for i = 3, #ARGV, 2 do
   local op_id = ARGV[i]
   local payload = ARGV[i + 1]
   if redis.call('SISMEMBER', applied, op_id) == 0 then
-    redis.call('SADD', applied, op_id)
+    -- 先 RPUSH 再登记：脚本不回滚，若先 SADD 后 RPUSH 失败（WRONGTYPE /
+    -- 内存不足），op_id 已被当作「已追加」写入 applied，恢复重放会永久
+    -- 跳过这条消息。RPUSH 出错时脚本中断，op_id 不落 applied，重放可补写。
     redis.call('RPUSH', key, payload)
+    redis.call('SADD', applied, op_id)
     pushed = pushed + 1
   end
 end

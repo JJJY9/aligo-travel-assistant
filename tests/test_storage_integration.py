@@ -953,6 +953,35 @@ def test_memory_manager_uses_configured_backends(monkeypatch):
     print("✓ MemoryManager 按配置启用 Redis + PostgreSQL")
 
 
+def test_add_script_marks_applied_only_after_successful_push():
+    """RPUSH 失败时 op_id 不能先进入 applied：否则恢复重放会永久跳过该消息。"""
+    client = _redis_client_or_skip()
+    from context.short_term_memory import RedisShortTermMemory, applied_key
+
+    session_id = f"pytest-{uuid.uuid4().hex[:8]}"
+    memory = RedisShortTermMemory(
+        client, session_id, max_turns=2, ttl_sec=60, user_id="pytest-user"
+    )
+    try:
+        # messages 键设成字符串：脚本里的 RPUSH 报 WRONGTYPE，追加入队待重放
+        client.set(memory.key, "wrong-type")
+        memory.add_message("user", "pending")
+
+        assert client.smembers(applied_key(memory.key)) == set(), (
+            "RPUSH 失败时不能把 op_id 记为已追加"
+        )
+
+        # 修复键类型后再次读取：重放必须把排队消息补写进 Redis
+        client.delete(memory.key)
+        contents = [
+            item["content"] for item in memory.get_recent_context(n_turns=5)
+        ]
+        assert contents == ["pending"], "恢复后重放必须补写失败时丢失的消息"
+    finally:
+        client.delete(memory.key, applied_key(memory.key))
+    print("✓ 追加脚本先 RPUSH 后记账（失败消息可重放补写）")
+
+
 if __name__ == "__main__":
     test_redis_short_term_memory()
     test_postgres_long_term_memory()
