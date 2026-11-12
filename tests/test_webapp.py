@@ -5784,6 +5784,35 @@ def test_knowledge_write_rejects_nul_and_surrogates():
     print("✓ 知识写入拒绝 NUL / 孤立代理项，分类上限一致")
 
 
+def test_knowledge_collection_missing_gets_actionable_error(monkeypatch):
+    """半初始化（集缺失）的 503 与 /api/knowledge、doctor 同口径，其它异常仍脱敏。"""
+    from webapp import server as server_module
+
+    def missing(*args, **kwargs):
+        raise RuntimeError(
+            "collection not found[collection=business_travel_knowledge]"
+        )
+
+    monkeypatch.setattr(server_module, "list_documents", missing)
+    client = _client()
+    response = client.get("/api/knowledge/documents")
+    assert response.status_code == 503, response.text[:300]
+    detail = response.json()["detail"]
+    assert "集合不存在" in detail and "init_knowledge_base.py" in detail, detail
+    assert "collection not found" not in detail, detail
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(r"milvus write failed at C:\secret\path")
+
+    monkeypatch.setattr(server_module, "get_document_group", boom)
+    response = client.get("/api/knowledge/documents/1/group")
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail == "读取失败，请稍后再试", detail
+    assert "secret" not in detail
+    print("✓ 知识库集合缺失返回可操作提示，其它异常仍脱敏")
+
+
 def test_daemon_import_executor_is_not_joined_at_exit():
     """导入线程为 daemon 且不登记 atexit join：停服不会被分钟级导入卡住。"""
     from concurrent.futures.thread import _threads_queues
@@ -10493,6 +10522,11 @@ if __name__ == "__main__":
     test_client_disconnect_recorded_as_499()
     test_daemon_import_executor_is_not_joined_at_exit()
     test_knowledge_write_rejects_nul_and_surrogates()
+    _mp_halfinit = pytest.MonkeyPatch()
+    try:
+        test_knowledge_collection_missing_gets_actionable_error(_mp_halfinit)
+    finally:
+        _mp_halfinit.undo()
     test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:
