@@ -145,6 +145,38 @@ def test_silent_reload_preserves_scroll():
     print("✓ 静默重载保留滚动位置")
 
 
+def test_search_hit_renders_bounded_window():
+    """搜索命中在窗口外：只渲染一个窗口 + 「显示更新消息」补批。"""
+    data = _run_harness("searchJump")
+    initial = data["initial"]
+    assert initial["count"] == 200, initial
+    assert initial["partial"] is True, initial
+    assert initial["earlierText"] == "", "命中在开头时不应出现更早消息按钮"
+    assert initial["laterText"].startswith("显示更新消息"), initial
+    first = data["afterFirst"]
+    assert first["count"] == 400, first
+    assert first["partial"] is True, first
+    second = data["afterSecond"]
+    assert second["count"] == 600, second
+    assert second["partial"] is False, "补到会话结尾后末尾重新在 DOM 中"
+    assert second["laterText"] == "", "到达结尾后按钮移除"
+    assert data["afterThird"]["count"] == 600, data["afterThird"]
+    print("✓ 搜索命中按窗口渲染（不会从命中处渲染到结尾）")
+
+
+def test_silent_reload_restores_expanded_window():
+    """静默重载恢复已展开的渲染起点，不把窗口重置回最近 200 条。"""
+    data = _run_harness("silentRestoreWindow")
+    assert data["initialCount"] == 200, data
+    assert data["expandedStart"] == 100, data
+    assert data["expandedCount"] == 400, data
+    restored = data["restored"]
+    assert restored["start"] == 100, restored
+    assert restored["count"] == 400, restored
+    assert restored["hasEarlier"] is True, restored
+    print("✓ 静默重载恢复已展开的历史窗口")
+
+
 def test_history_renders_in_windows():
     """大历史首屏只渲染一个窗口，补批不请求网络、读完按钮消失。"""
     data = _run_harness("historyWindow")
@@ -574,4 +606,6 @@ if __name__ == "__main__":
     test_knowledge_delete_legacy_parts_without_group()
     test_user_backup_import_rejects_non_utf8()
     test_chat_done_persisted_signal()
+    test_search_hit_renders_bounded_window()
+    test_silent_reload_restores_expanded_window()
     print("\n全部通过")

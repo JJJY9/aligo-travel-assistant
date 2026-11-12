@@ -1386,6 +1386,174 @@ async function scenarioHistoryWindow(source) {
   return { initial, afterFirst, afterSecond };
 }
 
+async function scenarioSearchJump(source) {
+  // 搜索命中在默认窗口之外：初始只渲染一个窗口 + 「显示更新消息」按钮，
+  // 不能从命中处一路渲染到会话结尾
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const messages = [];
+  for (let i = 0; i < 600; i += 1) {
+    if (i % 2 === 0) {
+      messages.push({ role: "user", content: "问题 " + i, timestamp: "" });
+    } else {
+      messages.push({
+        role: "assistant",
+        content: "回答 " + i,
+        timestamp: "",
+        meta: { client_turn_id: "turn-" + i },
+      });
+    }
+  }
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    state.sessions = [];
+    state.sessionTotal = 1;
+    els.messages = {
+      children: [],
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node, ref) {
+        const index = ref ? this.children.indexOf(ref) : -1;
+        if (index >= 0) this.children.splice(index, 0, node);
+        else this.children.push(node);
+        return node;
+      },
+      querySelectorAll() { return this.children.filter((n) => n.__msg); },
+      querySelector() { return null; },
+    };
+    renderUserNode = (text) => ({ __msg: true, role: "user", text });
+    renderAssistantNode = (text) => ({ __msg: true, role: "assistant", text });
+    const originalCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = originalCreate(tag);
+      node.remove = () => {
+        const index = els.messages.children.indexOf(node);
+        if (index >= 0) els.messages.children.splice(index, 1);
+      };
+      return node;
+    };
+    closeMobileSidebar = () => {};
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+    trimRegenButtons = () => {};
+    refreshEditButtons = () => {};
+  `);
+  const promise = run('openSession("s1", { matchIndex: 10 })');
+  const request = await waitRequest(env);
+  request.resolve({ messages });
+  await promise;
+  const snapshot = () =>
+    run(`(() => {
+      const msgs = els.messages.children.filter((n) => n.__msg === true);
+      const buttons = els.messages.children.filter(
+        (n) => n.className === "earlier-more",
+      );
+      const earlier = buttons.find((n) => n.textContent.startsWith("显示更早消息"));
+      const later = buttons.find((n) => n.textContent.startsWith("显示更新消息"));
+      return {
+        count: msgs.length,
+        earlierText: earlier ? earlier.textContent : "",
+        laterText: later ? later.textContent : "",
+        partial: state.partialHistory,
+        renderedStart: state.renderedStart && state.renderedStart.start,
+      };
+    })()`);
+  const initial = snapshot();
+  const clickLater = () =>
+    run(`(() => {
+      const button = els.messages.children.find(
+        (n) => n.className === "earlier-more" && n.textContent.startsWith("显示更新消息"),
+      );
+      if (button) button.click();
+    })()`);
+  clickLater();
+  const afterFirst = snapshot();
+  clickLater();
+  const afterSecond = snapshot();
+  clickLater();
+  const afterThird = snapshot();
+  return { initial, afterFirst, afterSecond, afterThird };
+}
+
+async function scenarioSilentRestoreWindow(source) {
+  // 静默重载恢复已展开的渲染起点，不把窗口重置回最近 200 条
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const messages = [];
+  for (let i = 0; i < 500; i += 1) {
+    messages.push({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: "消息 " + i,
+      timestamp: "",
+      meta: i % 2 === 0 ? null : { client_turn_id: "turn-" + i },
+    });
+  }
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    state.sessions = [];
+    state.sessionTotal = 1;
+    els.messages = {
+      children: [],
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node, ref) {
+        const index = ref ? this.children.indexOf(ref) : -1;
+        if (index >= 0) this.children.splice(index, 0, node);
+        else this.children.push(node);
+        return node;
+      },
+      querySelectorAll() { return this.children.filter((n) => n.__msg); },
+      querySelector() { return null; },
+    };
+    renderUserNode = (text) => ({ __msg: true, role: "user", text });
+    renderAssistantNode = (text) => ({ __msg: true, role: "assistant", text });
+    const originalCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = originalCreate(tag);
+      node.remove = () => {
+        const index = els.messages.children.indexOf(node);
+        if (index >= 0) els.messages.children.splice(index, 1);
+      };
+      return node;
+    };
+    closeMobileSidebar = () => {};
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+    trimRegenButtons = () => {};
+    refreshEditButtons = () => {};
+  `);
+  const first = run('openSession("s1", {})');
+  (await waitRequest(env)).resolve({ messages });
+  await first;
+  const initialCount = run(
+    "els.messages.children.filter((n) => n.__msg === true).length",
+  );
+  run(`els.messages.children
+    .find((n) => n.className === "earlier-more")
+    .click()`);
+  const expandedStart = run("state.renderedStart.start");
+  const expandedCount = run(
+    "els.messages.children.filter((n) => n.__msg === true).length",
+  );
+  const reload = run('openSession("s1", { silent: true })');
+  (await waitRequest(env)).resolve({ messages });
+  await reload;
+  const restored = {
+    count: run("els.messages.children.filter((n) => n.__msg === true).length"),
+    start: run("state.renderedStart.start"),
+    hasEarlier: run(
+      'els.messages.children.some((n) => n.className === "earlier-more")',
+    ),
+  };
+  return { initialCount, expandedStart, expandedCount, restored };
+}
+
 function scenarioChatPersisted(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -1588,6 +1756,10 @@ async function main() {
     payload = await scenarioScrollPreserve(source);
   } else if (scenario === "historyWindow") {
     payload = await scenarioHistoryWindow(source);
+  } else if (scenario === "searchJump") {
+    payload = await scenarioSearchJump(source);
+  } else if (scenario === "silentRestoreWindow") {
+    payload = await scenarioSilentRestoreWindow(source);
   } else if (scenario === "reconcile") {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
