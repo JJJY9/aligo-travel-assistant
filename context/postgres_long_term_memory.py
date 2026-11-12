@@ -869,14 +869,29 @@ class PostgresLongTermMemory:
                     key = _key(destination, origin, start_date, end_date)
                     existing_id = index.get(key) if key is not None else None
                     if existing_id is not None:
-                        # 与单条保存一致：未提供的字段（None）保留原值
-                        self._execute(
-                            "UPDATE aligo_trips SET "
-                            "purpose = COALESCE(%s, purpose), "
-                            "session_id = COALESCE(%s, session_id) "
-                            "WHERE id = %s",
-                            (trip.get("purpose"), trip.get("session_id"), existing_id),
-                        )
+                        # 与 JSON 批量保存同口径：purpose 未提供（None）保留原值；
+                        # session_id 键存在即覆盖（含显式 None——备份恢复时该
+                        # 会话已被删除，需要清除关联，COALESCE 会把 None 当
+                        # 未提供而保留旧值，留下指向已删除会话的死链）
+                        if "session_id" in trip:
+                            self._execute(
+                                "UPDATE aligo_trips SET "
+                                "purpose = COALESCE(%s, purpose), "
+                                "session_id = %s "
+                                "WHERE id = %s",
+                                (
+                                    trip.get("purpose"),
+                                    trip.get("session_id"),
+                                    existing_id,
+                                ),
+                            )
+                        else:
+                            self._execute(
+                                "UPDATE aligo_trips SET "
+                                "purpose = COALESCE(%s, purpose) "
+                                "WHERE id = %s",
+                                (trip.get("purpose"), existing_id),
+                            )
                         _abort_if_reconnected()
                         updated += 1
                         continue

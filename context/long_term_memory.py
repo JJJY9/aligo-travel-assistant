@@ -330,6 +330,9 @@ class LongTermMemory:
         # 进入损坏备份 / 自愈路径。缺失键（新建用户第一轮落盘后缺
         # last_trip_number）是正常初始状态：静默补 0，不算破坏性修正，
         # 不能为此把整份正常文件复制成 .migrate-backup
+        # 缺失的计数器要按列表重建（与 PG 的 COUNT(*) 同口径）：只补 0 会让
+        # 统计永久低于真实条数，且各删除路径按差值扣减后仍偏小
+        missing_counters: set[str] = set()
         for counter in (
             "total_messages",
             "total_queries",
@@ -338,14 +341,15 @@ class LongTermMemory:
         ):
             if counter not in stats:
                 stats[counter] = 0
+                missing_counters.add(counter)
                 continue
             value = stats.get(counter)
             if not isinstance(value, int) or isinstance(value, bool):
                 stats[counter] = 0
                 destructive = True
-        if not isinstance(stats.get("frequent_destinations"), dict):
-            stats["frequent_destinations"] = {}
-        else:
+                missing_counters.add(counter)
+        frequent_rebuild = not isinstance(stats.get("frequent_destinations"), dict)
+        if not frequent_rebuild:
             # 计数值被写成字符串 / null 时 += 1 同样 TypeError：归零并保留城市键
             frequent = stats["frequent_destinations"]
             cleaned_frequent: dict[str, int] = {}
@@ -362,6 +366,8 @@ class LongTermMemory:
             stats["frequent_destinations"] = cleaned_frequent
             if frequent_changed:
                 destructive = True
+        else:
+            stats["frequent_destinations"] = {}
         if "preferences" not in data:
             data["preferences"] = []
 
@@ -398,12 +404,15 @@ class LongTermMemory:
             # 统计段整体缺失（极老格式）：按现有列表重建，而不是把计数器
             # 补 0 后与列表长度永久脱节
             chats_changed = trips_changed = True
-        if chats_changed:
+        if chats_changed or "total_messages" in missing_counters:
             stats["total_messages"] = len(data["chat_history"])
-        if trips_changed:
+        if trips_changed or "total_trips" in missing_counters:
             stats["total_trips"] = len(data["trip_history"])
-            # 行程被清空 / 丢弃后，常去目的地必须按当前列表重建：
-            # 否则面板「常去目的地」会继续显示已不存在的城市
+        if trips_changed or frequent_rebuild:
+            # 行程列表被清空 / 丢弃，或常去目的地整段类型错误时，按当前
+            # 列表重建（与 PG 的动态统计同口径）：否则面板会继续显示已不
+            # 存在的城市，或保留清零后的空表；逐项计数损坏仍按原语义归零
+            # 并保留城市键
             stats["frequent_destinations"] = Counter(
                 str(trip.get("destination") or "")
                 for trip in data["trip_history"]

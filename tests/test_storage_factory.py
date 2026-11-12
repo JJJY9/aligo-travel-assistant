@@ -2689,8 +2689,8 @@ def test_pg_save_trip_histories_batches_with_one_index():
     updates = [
         params for sql, params in executed if sql.startswith("UPDATE aligo_trips")
     ]
-    assert updates[0] == (None, None, 1), "缺省目的 / 会话保留原值"
-    assert updates[1] == (None, None, 11), "批内重复命中刚插入的行"
+    assert updates[0] == (None, 1), "缺省目的 / 会话不更新（保留原值）"
+    assert updates[1] == (None, 11), "批内重复命中刚插入的行"
     inserts = inserted_params
     assert len(inserts) == 1
     assert inserts[0][1] == "trip_3"
@@ -3419,6 +3419,45 @@ def test_migrate_rebuilds_statistics_when_missing():
     print("✓ 统计段缺失时按列表重建")
 
 
+def test_migrate_rebuilds_missing_individual_counters():
+    """统计段存在但缺单个计数器 / 常去目的地类型错误：按列表重建（与 PG 同口径）。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-partial-stats.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "hi", "session_id": "s"}
+                ],
+                "trip_history": [
+                    {
+                        "destination": "上海",
+                        "start_date": "2026-01-01",
+                        "end_date": "2026-01-02",
+                    },
+                    {
+                        "destination": "上海",
+                        "start_date": "bad",
+                        "end_date": "2026-01-03",
+                    },
+                ],
+                "statistics": {
+                    "last_trip_number": 2,
+                    "frequent_destinations": "损坏的计数",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-partial-stats", storage_dir)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 1, stats
+    assert stats["total_trips"] == 2, stats
+    assert stats["frequent_destinations"] == {"上海": 1}, stats
+    print("✓ 统计段缺单个计数器时按列表重建")
+
+
 def test_migrate_dedupes_preference_types():
     """重复 type 的偏好保留最后一条（与 get_preference 字典取最后一致）。"""
     storage_dir = tempfile.mkdtemp()
@@ -3563,6 +3602,7 @@ if __name__ == "__main__":
         _mp.undo()
     test_migrate_resets_counters_when_lists_cleared()
     test_migrate_rebuilds_statistics_when_missing()
+    test_migrate_rebuilds_missing_individual_counters()
     test_migrate_dedupes_preference_types()
     for case in (
         test_redis_client_factory_single_flight,
