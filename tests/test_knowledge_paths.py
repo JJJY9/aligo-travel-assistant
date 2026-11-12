@@ -17,6 +17,7 @@ def test_default_knowledge_dir_prefers_skill_then_legacy(monkeypatch, tmp_path):
     legacy = tmp_path / "legacy-rag"
     monkeypatch.setattr(knowledge_paths, "SKILL_KNOWLEDGE_DIR", skill)
     monkeypatch.setattr(knowledge_paths, "LEGACY_KNOWLEDGE_DIR", legacy)
+    knowledge_paths.reset_default_knowledge_dir()
 
     # 两处都没有库文件：回退 Skill 数据目录（doctor 会提示先初始化）
     assert knowledge_paths.default_knowledge_dir() == skill
@@ -26,11 +27,36 @@ def test_default_knowledge_dir_prefers_skill_then_legacy(monkeypatch, tmp_path):
     (legacy / "milvus_lite.db").mkdir()
     assert knowledge_paths.default_knowledge_dir() == legacy
 
-    # 两处都有：Skill 数据目录优先
+    # 两处都有：Skill 数据目录优先（需先丢弃上一阶段的快照）
     skill.mkdir()
     (skill / "milvus_lite.db").mkdir()
+    knowledge_paths.reset_default_knowledge_dir()
     assert knowledge_paths.default_knowledge_dir() == skill
     print("✓ 默认知识库目录解析（Skill 优先 / legacy 回退）")
+    knowledge_paths.reset_default_knowledge_dir()
+
+
+def test_default_dir_is_pinned_for_process(monkeypatch, tmp_path):
+    """首次解析后固定在进程内：运行期新建库不会让面板与已缓存智能体分裂。"""
+    skill = tmp_path / "skill-pin"
+    legacy = tmp_path / "legacy-pin"
+    legacy.mkdir()
+    (legacy / "milvus_lite.db").mkdir()
+    monkeypatch.setattr(knowledge_paths, "SKILL_KNOWLEDGE_DIR", skill)
+    monkeypatch.setattr(knowledge_paths, "LEGACY_KNOWLEDGE_DIR", legacy)
+    knowledge_paths.reset_default_knowledge_dir()
+    try:
+        assert knowledge_paths.default_knowledge_dir() == legacy
+        # 服务运行期间新建 skill 库：同一进程仍使用启动时解析的库
+        skill.mkdir()
+        (skill / "milvus_lite.db").mkdir()
+        assert knowledge_paths.default_knowledge_dir() == legacy
+        # 显式重置后才切换（等价于重启进程）
+        knowledge_paths.reset_default_knowledge_dir()
+        assert knowledge_paths.default_knowledge_dir() == skill
+        print("✓ 默认知识库目录进程内固定与显式重置")
+    finally:
+        knowledge_paths.reset_default_knowledge_dir()
 
 
 def test_knowledge_db_path_explicit_directory(tmp_path):
