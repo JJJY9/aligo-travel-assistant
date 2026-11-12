@@ -1263,6 +1263,14 @@ class AligoWebApp:
         self._redis_client = redis_client
         self._tombstones_shared = redis_client is not None
         self._tombstone_retry_at = 0.0
+        # Redis 故障期删除只写进进程内墓碑：共享墓碑 / 会话纪元写失败时
+        # 其它实例看不到这次删除，在途回合可把会话写回。这里记录待补写
+        # 条目（会话 → (token, 本地到期时刻)），恢复后由后续删除 / 健康
+        # 检查 / 删除检查触发补写；进程重启会丢失，属已知短窗。
+        self._pending_shared_tombstones: OrderedDict[
+            tuple[str, str], tuple[str, float]
+        ] = OrderedDict()
+        self._pending_replay_at = 0.0
 
     @staticmethod
     def _session_key(user_id: str, session_id: str) -> str:
@@ -1447,6 +1455,77 @@ class AligoWebApp:
             self.tombstone_retry_sec,
         )
 
+    def _remember_pending_tombstone(
+        self, user_id: str, session_id: str, token: str
+    ) -> None:
+        """记录故障期删除，等 Redis 恢复后补写共享墓碑 / 纪元。"""
+        key = (user_id, session_id)
+        now = time.monotonic()
+        with self._tombstone_lock:
+            self._pending_shared_tombstones[key] = (
+                token,
+                now + self.tombstone_ttl_sec,
+            )
+            self._pending_shared_tombstones.move_to_end(key)
+            while len(self._pending_shared_tombstones) > self.max_tombstones:
+                self._pending_shared_tombstones.popitem(last=False)
+
+    def replay_pending_tombstones(self, limit: int = 20) -> int:
+        """Redis 恢复后补写故障期的共享墓碑与会话纪元（幂等）。
+
+        返回本次成功补写条数；失败时保留剩余条目并重新进入冷却，等待
+        下一次触发。已过期的条目直接丢弃（墓碑窗口已过，补写没有意义）。
+        """
+        with self._tombstone_lock:
+            pending = list(self._pending_shared_tombstones.items())[:limit]
+        if not pending:
+            return 0
+        client = self._shared_tombstones(force=True)
+        if client is None:
+            return 0
+        from utils.tombstones import EPOCH_TTL_SEC, epoch_key
+
+        now = time.monotonic()
+        replayed = 0
+        for (user_id, session_id), (token, expires) in pending:
+            remaining = expires - now
+            key = (user_id, session_id)
+            if remaining < 1:
+                with self._tombstone_lock:
+                    self._pending_shared_tombstones.pop(key, None)
+                continue
+            try:
+                client.set(
+                    self._deleted_key(user_id, session_id),
+                    token,
+                    nx=True,
+                    ex=max(1, int(remaining)),
+                )
+                epoch = epoch_key(user_id, session_id)
+                client.incr(epoch)
+                client.expire(epoch, int(EPOCH_TTL_SEC))
+            except Exception as exc:  # noqa: BLE001 - 保留剩余条目下次再试
+                self._tombstone_failed(exc, "补写")
+                break
+            with self._tombstone_lock:
+                self._pending_shared_tombstones.pop(key, None)
+            replayed += 1
+        if replayed:
+            self._tombstones_shared = True
+            self._tombstone_retry_at = 0.0
+            logger.info("已补写 %d 条故障期的共享删除墓碑", replayed)
+        return replayed
+
+    def _maybe_replay_pending(self) -> None:
+        """有界触发补写（最多每 5 秒一次），避免每个请求都尝试 Redis。"""
+        if not self._pending_shared_tombstones:
+            return
+        now = time.monotonic()
+        if now < self._pending_replay_at:
+            return
+        self._pending_replay_at = now + 5.0
+        self.replay_pending_tombstones()
+
     def mark_deleted(self, user_id: str, session_id: str) -> str:
         """记录短时墓碑，阻止在途对话把刚删除的会话写回，返回本请求的 token。
 
@@ -1473,6 +1552,8 @@ class AligoWebApp:
         # 删除是低频关键路径：跳过失败冷却真实写入一次，冷却期静默跳过
         # 会让其它实例看不到这次删除（在途回合可把会话写回）
         client = self._shared_tombstones(force=True)
+        if client is None:
+            self._remember_pending_tombstone(user_id, session_id, token)
         if client is not None:
             try:
                 # NX：不覆盖其它实例已有的墓碑（否则回滚时会误删对方的保护）
@@ -1484,6 +1565,7 @@ class AligoWebApp:
                 )
             except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
                 self._tombstone_failed(exc, "写入")
+                self._remember_pending_tombstone(user_id, session_id, token)
             else:
                 self._tombstones_shared = True
                 self._tombstone_retry_at = 0.0
@@ -1498,6 +1580,7 @@ class AligoWebApp:
                 client.expire(epoch, int(EPOCH_TTL_SEC))
             except Exception as exc:  # noqa: BLE001 - 纪元失败由墓碑兜底
                 logger.warning("写入会话纪元失败：%s", exc)
+        self._maybe_replay_pending()
         return token
 
     def unmark_deleted(
@@ -1516,6 +1599,11 @@ class AligoWebApp:
                 current = self._deleted_sessions.get(key)
                 if current is not None and current[1] == token:
                     self._deleted_sessions.pop(key, None)
+            # 删除被回滚：待补写条目一并撤销，恢复后不能补出「已撤销」的墓碑
+            pending_key = (user_id, session_id)
+            pending = self._pending_shared_tombstones.get(pending_key)
+            if pending is not None and (token is None or pending[0] == token):
+                self._pending_shared_tombstones.pop(pending_key, None)
         client = self._shared_tombstones()
         if client is None:
             return
@@ -1534,11 +1622,13 @@ class AligoWebApp:
 
     def shared_tombstones_active(self) -> bool:
         """共享墓碑是否在用（配置了 Redis 且最近一次写入成功）。"""
+        self._maybe_replay_pending()
         return self._tombstones_shared
 
     def is_recently_deleted(self, user_id: str, session_id: str | None) -> bool:
         if not session_id:
             return False
+        self._maybe_replay_pending()
         key = self._session_key(user_id, session_id)
         remaining: float | None = None
         token = ""

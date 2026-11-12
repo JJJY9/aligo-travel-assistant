@@ -6292,6 +6292,79 @@ def test_deleted_session_cannot_be_resurrected():
         _cleanup(user_id)
 
 
+def test_pending_tombstone_replay_after_redis_recovers():
+    """Redis 故障期删除：恢复后补写共享墓碑与会话纪元；回滚则撤销待补写。"""
+
+    class _FlakyRedis:
+        def __init__(self):
+            self.up = False
+            self.data = {}
+            self.ttls = {}
+
+        def _check(self):
+            if not self.up:
+                raise ConnectionError("redis down")
+
+        def set(self, key, value, nx=False, ex=None):
+            self._check()
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            self.ttls[key] = ex
+            return True
+
+        def incr(self, key):
+            self._check()
+            value = int(self.data.get(key, "0")) + 1
+            self.data[key] = str(value)
+            return value
+
+        def expire(self, key, ttl):
+            self.ttls[key] = ttl
+            return 1
+
+        def exists(self, key):
+            self._check()
+            return int(key in self.data)
+
+        def delete(self, key):
+            self._check()
+            self.data.pop(key, None)
+            return 1
+
+        def eval(self, script, numkeys, *args):
+            self._check()
+            return 0
+
+    shared = _FlakyRedis()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state._redis_client = shared
+    state._tombstones_shared = False
+
+    token = state.mark_deleted("u-replay", "s-replay")
+    assert "aligo:deleted:u-replay:s-replay" not in shared.data
+    assert ("u-replay", "s-replay") in state._pending_shared_tombstones
+
+    shared.up = True
+    assert state.replay_pending_tombstones() >= 1
+    assert shared.data["aligo:deleted:u-replay:s-replay"] == token
+    assert "aligo:session-epoch:u-replay:s-replay" in shared.data, (
+        "补写时必须同时补会话纪元（落库守卫依赖它）"
+    )
+    assert ("u-replay", "s-replay") not in state._pending_shared_tombstones
+
+    # 删除被回滚：待补写条目一并撤销，恢复后不能补出「已撤销」的墓碑
+    shared.up = False
+    token2 = state.mark_deleted("u-replay2", "s-replay2")
+    state.unmark_deleted("u-replay2", "s-replay2", token2)
+    assert ("u-replay2", "s-replay2") not in state._pending_shared_tombstones
+    shared.up = True
+    state.replay_pending_tombstones()
+    assert "aligo:deleted:u-replay2:s-replay2" not in shared.data
+    print("✓ 故障期删除的共享墓碑 / 纪元在恢复后补写（回滚则撤销）")
+
+
 def test_shared_tombstones_across_instances():
     """配置 Redis 时，删除墓碑跨实例可见（新请求会被拒绝）。"""
 
@@ -10657,6 +10730,7 @@ if __name__ == "__main__":
         _mp_ghost.undo()
     test_tombstone_helpers_are_thread_safe()
     test_repeated_delete_repairs_shared_tombstone()
+    test_pending_tombstone_replay_after_redis_recovers()
     test_session_metadata_requires_existing_session()
     test_session_rename()
     test_session_pin()
