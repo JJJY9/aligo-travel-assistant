@@ -2414,6 +2414,59 @@ def test_trip_batch_restore_preserves_ids_and_rejects_collisions():
     print("✓ 批量恢复保留 trip_id / 时间戳并拒绝编号冲突")
 
 
+def test_json_export_snapshot_is_consistent():
+    """导出快照的统计与列表来自同一版本（写锁内重载）。"""
+    memory = LongTermMemory("u-exp-snap", tempfile.mkdtemp())
+    memory.add_chat_message("user", "Q", "s")
+    memory.add_chat_message("assistant", "A", "s")
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-02",
+        }
+    )
+    snapshot = memory.export_snapshot()
+    assert len(snapshot["chat_history"]) == 2
+    assert snapshot["statistics"]["total_messages"] == 2
+    assert len(snapshot["trip_history"]) == 1
+    assert snapshot["statistics"]["total_trips"] == 1
+    print("✓ JSON 导出快照与列表一致")
+
+
+def test_memory_manager_export_uses_snapshot():
+    """MemoryManager.export_data 优先走 export_snapshot（不再逐项读取）。"""
+    from context.memory_manager import MemoryManager
+
+    manager = MemoryManager("u-exp-mgr", "s-exp", storage_path=tempfile.mkdtemp())
+    calls = []
+
+    class _Stub:
+        def export_snapshot(self):
+            calls.append(True)
+            return {
+                "preferences": {"k": "v"},
+                "trip_history": [],
+                "chat_history": [],
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {"total_messages": 0},
+            }
+
+        def __getattr__(self, name):
+            raise AssertionError(f"不应逐项调用 {name}")
+
+    manager.long_term = _Stub()
+    data = manager.export_data()
+    assert calls == [True]
+    assert data["preferences"] == {"k": "v"}
+    assert data["user_id"] == "u-exp-mgr"
+    assert data["exported_at"]
+    print("✓ MemoryManager 导出走一致快照")
+
+
 def test_reload_rejects_non_object_json():
     """磁盘文件是合法 JSON 但非对象（[] / null）：重载报错而不是沿用旧快照。"""
     from utils.errors import MemoryPersistenceError
@@ -3652,6 +3705,8 @@ if __name__ == "__main__":
     test_trip_frequent_destinations_ignore_dirty_dates()
     test_bulk_message_dedupe_normalizes_legacy_int_session_id()
     test_trip_batch_restore_preserves_ids_and_rejects_collisions()
+    test_json_export_snapshot_is_consistent()
+    test_memory_manager_export_uses_snapshot()
     test_next_trip_id_not_reused_after_deleting_latest()
     test_one_day_trip_dedupes_end_date_variants()
     test_session_titles()

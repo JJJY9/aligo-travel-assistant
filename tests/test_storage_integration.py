@@ -553,6 +553,31 @@ def test_pg_batch_save_session_id_none_semantics():
         memory.close()
 
 
+def test_pg_export_snapshot_matches_lists():
+    """PG 导出一致性快照：统计与列表来自同一事务版本。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        memory.add_chat_message("user", "Q", "s-snap")
+        memory.add_chat_message("assistant", "A", "s-snap")
+        memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-30",
+                "end_date": "2026-12-31",
+            }
+        )
+        snapshot = memory.export_snapshot()
+        assert len(snapshot["chat_history"]) == 2
+        assert snapshot["statistics"]["total_messages"] == 2
+        assert len(snapshot["trip_history"]) == 1
+        assert snapshot["statistics"]["total_trips"] == 1
+        assert snapshot["statistics"]["frequent_destinations"] == {"上海": 1}
+        print("✓ PG 导出快照与列表一致")
+    finally:
+        memory.close()
+
+
 def test_pg_batch_save_preserves_trip_id_and_timestamp():
     """PG 批量恢复沿用备份 trip_id / timestamp；编号冲突时退回新编号。"""
     memory, _ = _pg_memory_or_skip()

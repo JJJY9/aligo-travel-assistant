@@ -278,17 +278,25 @@ class MemoryManager:
 
     def export_data(self) -> dict[str, Any]:
         """导出当前用户的长期记忆数据（偏好 / 行程 / 对话历史 / 统计）。"""
+        snapshot = getattr(self.long_term, "export_snapshot", None)
+        if callable(snapshot):
+            data = snapshot()
+        else:
+            # 未知后端（测试替身等）：逐项读取，保持旧行为
+            data = {
+                "preferences": self.long_term.get_preference(),
+                "trip_history": self.long_term.get_trip_history(limit=None),
+                "chat_history": self.long_term.get_chat_history(),
+                "session_titles": self.long_term.get_session_titles(),
+                "pinned_sessions": self.long_term.get_pinned_sessions(),
+                "archived_sessions": self.long_term.get_archived_sessions(),
+                "statistics": self.long_term.get_statistics(),
+            }
         return {
             "user_id": self.user_id,
             "session_id": self.session_id,
             "exported_at": datetime.now().isoformat(),
-            "preferences": self.long_term.get_preference(),
-            "trip_history": self.long_term.get_trip_history(limit=None),
-            "chat_history": self.long_term.get_chat_history(),
-            "session_titles": self.long_term.get_session_titles(),
-            "pinned_sessions": self.long_term.get_pinned_sessions(),
-            "archived_sessions": self.long_term.get_archived_sessions(),
-            "statistics": self.long_term.get_statistics(),
+            **data,
         }
 
     def reload_long_term(self) -> None:

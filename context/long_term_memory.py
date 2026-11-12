@@ -1482,6 +1482,25 @@ class LongTermMemory:
         """获取统计信息"""
         return self.data["statistics"].copy()
 
+    def export_snapshot(self) -> dict[str, Any]:
+        """导出一致快照：写锁内重载后逐项读取，避免与并发写入交错。
+
+        导出（备份 / 面板 / CLI）此前逐项调用 get_*，其它线程 / 进程在两次
+        读取之间写入时，统计与列表会来自不同版本（备份里总数与消息条数
+        对不上）。写锁同时覆盖进程内线程与跨进程文件锁。
+        """
+        with self._write_lock:
+            self._reload_latest()
+            return {
+                "preferences": self.get_preference(),
+                "trip_history": self.get_trip_history(limit=None),
+                "chat_history": self.get_chat_history(),
+                "session_titles": self.get_session_titles(),
+                "pinned_sessions": self.get_pinned_sessions(),
+                "archived_sessions": self.get_archived_sessions(),
+                "statistics": self.get_statistics(),
+            }
+
     @_locked_mutation
     def clear_history(self):
         """清空历史记录（保留偏好）"""

@@ -2533,18 +2533,27 @@ def run_user_export_standalone(
         return 1
     try:
         try:
-            data = {
+            data: dict[str, Any] = {
                 "user_id": user_id,
                 "session_id": "",
                 "exported_at": datetime.now().isoformat(timespec="seconds"),
-                "preferences": store.get_preference(),
-                "trip_history": store.get_trip_history(limit=None),
-                "chat_history": store.get_chat_history(),
-                "session_titles": store.get_session_titles(),
-                "pinned_sessions": store.get_pinned_sessions(),
-                "archived_sessions": store.get_archived_sessions(),
-                "statistics": store.get_statistics(),
             }
+            snapshot = getattr(store, "export_snapshot", None)
+            if callable(snapshot):
+                # 一致快照：统计与列表同一版本（并发写入不会让备份对不上）
+                data.update(snapshot())
+            else:
+                data.update(
+                    {
+                        "preferences": store.get_preference(),
+                        "trip_history": store.get_trip_history(limit=None),
+                        "chat_history": store.get_chat_history(),
+                        "session_titles": store.get_session_titles(),
+                        "pinned_sessions": store.get_pinned_sessions(),
+                        "archived_sessions": store.get_archived_sessions(),
+                        "statistics": store.get_statistics(),
+                    }
+                )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             print(f"读取用户数据失败：{exc}")
             return 1
