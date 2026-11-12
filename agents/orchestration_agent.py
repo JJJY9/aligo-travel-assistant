@@ -28,7 +28,11 @@ from agentscope.message import Msg
 from utils.agent_names import canonical_agent_name
 from utils.json_safe import sanitize_json, strip_nul
 from utils.log_redact import redact_paths
-from utils.llm_resilience import retry_with_backoff
+from utils.llm_resilience import (
+    is_permanent_llm_error,
+    is_retriable_error,
+    retry_with_backoff,
+)
 from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
@@ -863,6 +867,17 @@ class OrchestrationAgent(AgentBase):
             # 随助手消息落库 / 导出：本机缓存路径与上游 URL 必须遮蔽；
             # 日志同样只记脱敏文本并压成单行（text 模式下可伪造日志行）
             safe_error = redact_paths(e)
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                # 子智能体的 LLM 调用失败（重试耗尽后的 429/5xx、401/402 等）
+                # 不能吞成 status=error：外层会把整轮记为成功，熔断器只看
+                # 意图调用时永远打不开。上抛交由 conversation / CLI 的
+                # retry_with_backoff 与熔断器记账
+                logger.error(
+                    "Agent execution failed (llm): %s, error: %s",
+                    agent_name,
+                    safe_error.replace("\n", " ").replace("\r", " ")[:300],
+                )
+                raise
             logger.error(
                 "Agent execution failed: %s, error: %s",
                 agent_name,
