@@ -48,6 +48,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 安全面收口（安全评审）：① 会话导出 Markdown 的跨行行内代码判定补 CommonMark 块起始（标题 / 引用 / 列表 / HTML 块会打断段落）——此前块起始行上的反引号会被当成上一行未闭合代码段的关闭串，上一行剩余内容（含原始 HTML）因此跳过转义落进导出文件；② 导出的会话标题剥离终端控制序列（ESC / OSC），与正文同一口径；③ 用户数据 Markdown 导出（Web `_md_inline` 与 CLI `_md_cell`）转义右方括号，`[点我](https://phish)` 不再在预览器里变成可点击链接；④ Windows 设备保留名（CON / PRN / AUX / NUL / COM1-9 / LPT1-9）不再能作 user_id——ID 会拼成记忆库文件名，`NUL.json` 指向设备、写入静默丢失（CLI / 导入在 `is_valid_web_id` 拒绝，Web 在打开存储前按同一口径 422）；⑤ `/docs`、`/redoc`、`/openapi.json` 默认关闭（`ALIGO_ENABLE_DOCS=1` 开启），schema 不再默认暴露端点结构；⑥ 备份恢复的 415 / 503 排队 / Content-Length 413 / 读取超时 408 在未读请求体前明确 `Connection: close`，客户端不必把 64MB 传完；⑦ `/api/doctor` 详情中项目根以外的本机绝对路径（虚拟环境、site-packages、临时目录）同样遮蔽为 `<路径>`，`redact_paths` 补容器常用根（/app /usr /build /code /private）与正斜杠写法的 Windows 盘符路径（`D:/…`）；⑧ 迁移前的 `.migrate-backup` 备份文件在 POSIX 上收紧为 0600（含完整用户数据，不再按 umask 共享给同组 / 其他用户）；⑨ `/api/knowledge`、`/api/sessions/{id}`、`/api/trips`、单行程日历四个只读端点补跨站守卫（与其余全量读取接口同口径，403）
 - `/api/import` 的 50 MB 预检提前到读取请求体之前（按 Content-Length，
 含 4 KB JSON 包装余量）：超限的 50–64 MB 请求不再先整份读入内存；
 读取后的兜底检查同样按「上限 + 余量」比较（此前精确按上限会把

@@ -256,6 +256,39 @@ def test_multiline_code_span_content_preserved():
     print("✓ 跨行代码段保真且未闭合时不放行")
 
 
+def test_block_start_line_cannot_close_code_span():
+    """块起始行打断段落：其上的反引号不能关闭上一行的代码段。"""
+    from utils.session_markdown import sanitize_body
+
+    payloads = [
+        "x` <img src=x onerror=alert(1)>\n# `",
+        "x` <img src=x onerror=alert(1)>\n> `",
+        "x` <img src=x onerror=alert(1)>\n- `",
+        "x` <img src=x onerror=alert(1)>\n1. `",
+        "x` <img src=x onerror=alert(1)>\n<div>`",
+        # 块起始行本身不含反引号，紧随其后的段落行也不能充当关闭串
+        "x` <img src=x onerror=alert(1)>\n# 标题\nclose` here",
+    ]
+    for payload in payloads:
+        text = sanitize_body(payload)
+        assert "<img" not in text, f"块起始行放行了原始 HTML：{payload!r}"
+        assert "&lt;img" in text
+    # 普通段落行上的关闭串仍按跨行代码段保真（不是块起始）
+    text = sanitize_body("示例：`if a < b\nand c > d` 结束")
+    assert "c &gt; d" not in text
+    print("✓ 块起始行不能关闭跨行代码段")
+
+
+def test_title_strips_terminal_controls():
+    """自定义标题里的终端控制序列不进入导出文件。"""
+    from utils.session_markdown import sanitize_title
+
+    text = sanitize_title("标题\x1b]8;;https://evil\x07点我\x1b]8;;\x07")
+    assert "\x1b" not in text and "\x07" not in text
+    assert "标题" in text and "点我" in text
+    print("✓ 标题剥离终端控制序列")
+
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
@@ -269,4 +302,6 @@ if __name__ == "__main__":
     test_unmatched_backtick_does_not_disable_escaping()
     test_fence_state_machine_matches_commonmark()
     test_multiline_code_span_content_preserved()
+    test_block_start_line_cannot_close_code_span()
+    test_title_strips_terminal_controls()
     print("\n全部通过")

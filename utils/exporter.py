@@ -20,7 +20,8 @@ _CELL_BREAK = re.compile(r"[\r\n]+")
 def _md_cell(value: Any) -> str:
     """导出表格 / 列表用的单行文本：竖线与换行会破坏 Markdown 结构，
     尖括号转义避免把用户 / 模型可控内容当 HTML 落盘；终端控制序列
-    （ESC / OSC）一并剥离。"""
+    （ESC / OSC）一并剥离。右方括号同样转义：``[x](url)`` 的 ``]`` 不能
+    闭合就无法形成链接 / 图片语法，导出文件在预览器里不会被点成钓鱼链接。"""
     text = strip_terminal_controls(
         str(value if value is not None else "-")
     )
@@ -28,7 +29,8 @@ def _md_cell(value: Any) -> str:
     # 反斜杠必须先转义：值里的 `\` 与随后的 `|` 会被 Markdown 当成
     # 「转义后的竖线」，单元格行仍按 `|` 切列而错位
     text = text.replace("\\", "\\\\").replace("|", "\\|")
-    return text.replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("]", "\\]")
 
 
 def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:

@@ -40,9 +40,25 @@ def is_web_word_char(char: str) -> bool:
     return category in ("Mn", "Mc", "Me", "Nd", "Nl", "Pc")
 
 
+# Windows 设备保留名：``<保留名>`` / ``<保留名>.<任意扩展名>`` 指向设备而不是
+# 普通文件。用户 / 会话 ID 会直接成为记忆库文件名（``NUL.json``），写入会
+# 静默丢弃、读取恒为空；COM1 等串口设备还可能阻塞。大小写不敏感。
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
+
+
 def is_valid_web_id(value: object, max_length: int = 64) -> bool:
-    """是否为 Web 端点可寻址的 ID（``^[\\w-]{1,64}$``，Rust 语义）。"""
+    """是否为 Web 端点可寻址的 ID（``^[\\w-]{1,64}$``，Rust 语义）。
+
+    Windows 设备保留名一律拒绝：ID 会被拼成记忆库文件名，``NUL.json``
+    在 Windows 上打开的是空设备，数据静默丢失。
+    """
     text = str(value or "")
     if not text or len(text) > max_length:
+        return False
+    if text.lower() in _WINDOWS_RESERVED_NAMES:
         return False
     return all(char == "-" or is_web_word_char(char) for char in text)

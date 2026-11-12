@@ -69,7 +69,7 @@ def _escape_inline_markdown(text: str) -> str:
 
 def sanitize_title(title: str) -> str:
     """导出用标题清洗：换行会伪造导出结构，Markdown / HTML 元字符转义。"""
-    text = " ".join(str(title or "").split())
+    text = " ".join(strip_terminal_controls(str(title or "")).split())
     return _escape_inline_markdown(text)
 
 
@@ -86,6 +86,30 @@ def _find_backtick_run(text: str, start: int, run: int) -> int | None:
     return None
 
 
+_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+_BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
+_LIST_ITEM_RE = re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
+_HTML_BLOCK_RE = re.compile(r"^ {0,3}<[A-Za-z/!?]")
+
+
+def _starts_block(line: str) -> bool:
+    """该行是否开启一个能打断段落的块（CommonMark 块级起始）。
+
+    跨行行内代码只能闭合于同一段落内：导出时每行前缀 ``> ``，标题、引用、
+    列表、HTML 块在引用块内仍是真实块，会打断上一行所处的段落。若把块起始
+    行上的反引号当成关闭串，上一行剩余内容会被当作代码而不转义——攻击者用
+    ``x` <img onerror=…>`` 加 ``# ` `` 两行即可让原始 HTML 落进导出文件。
+    列表起始号的精确规则（有序列表须从 1 开始才能打断段落）不做区分：多认
+    块起始只会让跨行代码段内容被保守转义（可见实体），不会放过原始 HTML。
+    """
+    return bool(
+        _ATX_HEADING_RE.match(line)
+        or _BLOCKQUOTE_RE.match(line)
+        or _LIST_ITEM_RE.match(line)
+        or _HTML_BLOCK_RE.match(line)
+    )
+
+
 def _closing_run_follows(
     lines: list[str], line_index: int, run: int
 ) -> bool:
@@ -95,6 +119,8 @@ def _closing_run_follows(
         if not text.strip():
             return False
         if _fence_open(text):
+            return False
+        if _starts_block(text):
             return False
         if _find_backtick_run(text, 0, run) is not None:
             return True

@@ -575,6 +575,24 @@ def test_status_endpoint():
     print("✓ /api/status 正常")
 
 
+def test_reserved_device_user_id_rejected():
+    """Windows 设备保留名不能作 user_id：会拼成记忆库文件名并指向设备。"""
+    client = _client()
+    for user_id in ("NUL", "nul", "CON", "com1", "LPT9"):
+        response = client.get("/api/status", params={"user_id": user_id})
+        assert response.status_code == 422, (user_id, response.text)
+    # 普通名字不受影响（含保留名前缀但不是保留名）
+    accepted = ["console", "con-1", "com10", "nul_2"]
+    try:
+        for user_id in accepted:
+            response = client.get("/api/status", params={"user_id": user_id})
+            assert response.status_code == 200, (user_id, response.text)
+    finally:
+        for user_id in accepted:
+            _cleanup(user_id)
+    print("✓ 设备保留名 user_id 被拒绝")
+
+
 def test_status_travel_summary():
     """行程统计：总行程 / 出行天数（含首尾）/ 到访城市 / 进行中 / 即将出行。"""
     client = _client()
@@ -1653,11 +1671,13 @@ def test_knowledge_status_masks_path_and_rate_limits():
 
 
 def test_doctor_detail_redacts_paths_and_tokens():
-    """/api/doctor 详情脱敏：项目绝对路径 / URL 凭据与查询串不回显。"""
+    """/api/doctor 详情脱敏：项目绝对路径 / 其它本机路径 / URL 凭据与查询串不回显。"""
     from webapp import server as server_module
 
     detail = (
         f"技能目录 {server_module.PROJECT_ROOT}/.claude/skills；"
+        r"依赖 C:\venv\Lib\site-packages\torch\__init__.py 与 "
+        "/usr/lib/python3.12/site-packages/x.py；"
         "网关 https://user:secret@llm.example/v1?api-key=SECRET"
     )
     cleaned = server_module._redact_doctor_detail(detail)
@@ -1665,6 +1685,9 @@ def test_doctor_detail_redacts_paths_and_tokens():
     assert "api-key" not in cleaned and "SECRET" not in cleaned
     assert str(server_module.PROJECT_ROOT) not in cleaned
     assert "<项目>" in cleaned and "llm.example" in cleaned
+    assert "venv" not in cleaned and "torch" not in cleaned
+    assert "/usr/lib" not in cleaned
+    assert "<路径>" in cleaned
     print("✓ doctor 详情脱敏（路径 / 凭据 / 查询串）")
 def test_side_effect_get_rejects_cross_site():
     """带副作用 GET（doctor / search / eval / weather）拒绝浏览器跨站请求。"""
@@ -1849,6 +1872,8 @@ def test_import_rejects_backup_over_size_limit(monkeypatch):
     )
     assert response.status_code == 413, response.text[:300]
     assert "备份文件不能超过" in response.json()["detail"]
+    # Content-Length 预检在读取请求体前触发：连接必须关闭
+    assert response.headers.get("connection") == "close", response.headers
 
 
 def test_markdown_export_strips_terminal_controls():
@@ -1860,6 +1885,10 @@ def test_markdown_export_strips_terminal_controls():
     )
     assert chr(27) not in cleaned and chr(7) not in cleaned
     assert "&lt;script&gt;" in server_module._md_inline("<script>")
+    # 链接 / 图片语法必须被打破：每个 ] 都带反斜杠转义，](url) 不成形
+    link = server_module._md_inline("[点我](https://phish.example)")
+    assert link.count("]") == link.count("\\]")
+    assert "\\](https" in link
     print("✓ Markdown 导出剥离终端控制序列")
 
 
@@ -5367,6 +5396,8 @@ def test_destructive_endpoints_require_json_body():
     )
     assert plain.status_code == 415, plain.text
     assert "application/json" in plain.json()["detail"]
+    # 请求体未读即拒绝：必须让连接关闭，客户端别再继续上传
+    assert plain.headers.get("connection") == "close", plain.headers
     print("✓ 破坏性接口拒绝跨站简单请求（JSON body + Content-Type 门禁）")
 
 
@@ -7675,18 +7706,43 @@ def test_gzip_compression_excludes_sse():
 
 def test_docs_csp_allows_cdn():
     """Swagger UI 需要从 CDN 加载资源：仅文档页面放宽 CSP，普通页面保持严格。"""
-    client = _client()
-    docs = client.get("/docs")
-    assert docs.status_code == 200
-    docs_csp = docs.headers["content-security-policy"]
-    assert "cdn.jsdelivr.net" in docs_csp
-    assert "script-src 'self'" in docs_csp
+    previous = os.environ.get("ALIGO_ENABLE_DOCS")
+    os.environ["ALIGO_ENABLE_DOCS"] = "1"
+    try:
+        client = _client()
+        docs = client.get("/docs")
+        assert docs.status_code == 200
+        docs_csp = docs.headers["content-security-policy"]
+        assert "cdn.jsdelivr.net" in docs_csp
+        assert "script-src 'self'" in docs_csp
 
-    home_csp = client.get("/").headers["content-security-policy"]
-    assert "cdn.jsdelivr.net" not in home_csp
-    assert "script-src 'self'" in home_csp
-    assert "frame-ancestors 'none'" in home_csp
+        home_csp = client.get("/").headers["content-security-policy"]
+        assert "cdn.jsdelivr.net" not in home_csp
+        assert "script-src 'self'" in home_csp
+        assert "frame-ancestors 'none'" in home_csp
+    finally:
+        if previous is None:
+            os.environ.pop("ALIGO_ENABLE_DOCS", None)
+        else:
+            os.environ["ALIGO_ENABLE_DOCS"] = previous
     print("✓ 文档页面放宽 CSP，普通页面保持严格策略")
+
+
+def test_docs_disabled_by_default():
+    """/docs 与 /openapi.json 默认关闭：页面与 schema 都是信息泄露面。"""
+    previous = os.environ.pop("ALIGO_ENABLE_DOCS", None)
+    try:
+        client = _client()
+        assert client.get("/docs").status_code == 404
+        assert client.get("/redoc").status_code == 404
+        assert client.get("/openapi.json").status_code == 404
+        # 首页与 API 不受影响
+        assert client.get("/").status_code == 200
+        assert client.get("/api/health").status_code == 200
+    finally:
+        if previous is not None:
+            os.environ["ALIGO_ENABLE_DOCS"] = previous
+    print("✓ API 文档默认关闭")
 
 
 def test_unhandled_error_returns_500_with_headers():
@@ -9424,6 +9480,7 @@ def test_rate_identity_ipv6_aggregation():
 def test_import_with_root_path_uses_extended_limit(monkeypatch):
     """子路径部署：/aligo/api/import 仍拿 64MB 上限，no-store 与文档 CSP 正常。"""
     target = _unique_user("web_test_rootpath")
+    monkeypatch.setenv("ALIGO_ENABLE_DOCS", "1")
     try:
         app = create_app(model=UsageTrackingModel(_FakeModel()))
         client = TestClient(app, root_path="/aligo")
@@ -10767,6 +10824,7 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_status_endpoint()
+    test_reserved_device_user_id_rejected()
     test_chat_returns_reply_and_usage()
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
@@ -10894,6 +10952,7 @@ if __name__ == "__main__":
     test_chunked_request_body_allowed_under_limit()
     test_gzip_compression_excludes_sse()
     test_docs_csp_allows_cdn()
+    test_docs_disabled_by_default()
     test_unhandled_error_returns_500_with_headers()
     test_chat_rate_limit()
     test_rate_limit_race_rejects_over_limit()

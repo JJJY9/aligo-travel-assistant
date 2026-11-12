@@ -289,15 +289,22 @@ class LongTermMemory:
 
         这些修正是破坏性的（非对象消息被丢弃、非数字计数器归零），直接把
         清理后的快照写回磁盘会让原始内容不可恢复；保留原始副本便于排查。
+        备份含完整用户数据：copyfile 按 umask 新建文件，POSIX 上收紧到
+        0600，避免与协作目录共享时被同组 / 其他用户读取。
         """
         backup = f"{self.db_path}.migrate-backup"
         if os.path.exists(backup):
             return
         try:
             shutil.copyfile(self.db_path, backup)
-            logger.warning("迁移修复前已备份原始记忆文件到 %s", backup)
         except OSError:
             logger.warning("无法备份迁移前的记忆文件：%s", self.db_path)
+            return
+        try:
+            os.chmod(backup, 0o600)
+        except OSError:  # Windows 只映射只读位；权限本就不按 POSIX 位控制
+            pass
+        logger.warning("迁移修复前已备份原始记忆文件到 %s", backup)
 
     def _migrate_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """

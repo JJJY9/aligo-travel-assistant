@@ -11,7 +11,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from context.long_term_memory import LongTermMemory
-from utils.log_redact import redact_paths, redact_secret
+from utils.log_redact import redact_local_paths, redact_paths, redact_secret
 
 
 def test_redact_secret_strips_userinfo_and_query():
@@ -74,11 +74,36 @@ def test_redact_paths_hides_internal_paths_and_urls():
     # 编排层据此判定瞬时错误并重试：关键词不能被抹掉
     assert "Connection refused" in cleaned and "timeout=8" in cleaned
     assert redact_paths("plain error") == "plain error"
+    # 容器 / 构建机常用根（/app /usr /build …）同样不回显
+    container = redact_paths(
+        "依赖 /app/.venv/lib/python3.12/site-packages/x.py "
+        "与 /usr/lib/python3/x.py 以及 /build/workspace/rag_knowledge"
+    )
+    assert "/app/" not in container and "/usr/" not in container
+    assert "/build/" not in container and "<路径>" in container
+    # 正斜杠写法的 Windows 盘符路径（D:/…）按同一规则遮蔽
+    forward = redact_paths("技能目录 D:/Code/chailv/skills 与 E:/work/x.py")
+    assert "D:/Code" not in forward and "E:/work" not in forward
+    assert "<路径>" in forward
     print("✓ redact_paths 遮蔽内部路径 / URL 且保留瞬时限关键词")
+
+
+def test_redact_local_paths_keeps_urls_intact():
+    """只遮蔽路径：URL 的协议与主机保留（诊断报告需要），凭据交给 redact_secret。"""
+    raw = (
+        r"模型目录 C:\Users\alice\.cache\huggingface 与 /usr/share/model "
+        "网关 https://llm.example/v1/chat"
+    )
+    cleaned = redact_local_paths(raw)
+    assert "alice" not in cleaned and "/usr/share" not in cleaned
+    assert cleaned.count("<路径>") == 2
+    assert "https://llm.example/v1/chat" in cleaned, cleaned
+    print("✓ redact_local_paths 只遮蔽路径、保留 URL")
 
 
 if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_paths_hides_internal_paths_and_urls()
+    test_redact_local_paths_keeps_urls_intact()
     print("caplog 用例需 pytest 运行")
