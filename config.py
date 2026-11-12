@@ -1,8 +1,11 @@
 """
 Configuration for the Aligo Multi-Agent System
 """
+import logging
 import os
 from typing import TypedDict
+
+logger = logging.getLogger(__name__)
 
 # LLM Configuration
 # 默认使用 DeepSeek（OpenAI 兼容接口），也支持豆包、OpenAI 等任意兼容服务。
@@ -175,3 +178,12 @@ RATE_LIMIT_CONFIG: RateLimitConfig = {
     "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
     "trust_proxy_headers": _env_bool("TRUST_PROXY_HEADERS", False),
 }
+
+# 窗口 <= 0 会让所有滑动窗口桶退化成「永远是新窗口」（每次请求都被放行，
+# 形同不限流）：按下限 1 秒处理并告警，而不是静默 fail-open
+if int(RATE_LIMIT_CONFIG["window_sec"]) < 1:
+    logger.warning(
+        "CHAT_RATE_WINDOW_SEC=%s 非法（需 >= 1 秒），按 1 秒处理",
+        RATE_LIMIT_CONFIG["window_sec"],
+    )
+    RATE_LIMIT_CONFIG["window_sec"] = 1

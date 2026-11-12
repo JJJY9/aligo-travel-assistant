@@ -206,7 +206,6 @@ def test_probe_recovers_idle_bucket_after_cooldown(monkeypatch):
         def __init__(self):
             super().__init__()
             self.up = False
-            self.pings = 0
 
         def eval(self, *args, **kwargs):
             self.eval_calls += 1
@@ -214,24 +213,19 @@ def test_probe_recovers_idle_bucket_after_cooldown(monkeypatch):
                 raise ConnectionError("redis down")
             return -1
 
-        def ping(self):
-            self.pings += 1
-            if not self.up:
-                raise ConnectionError("redis down")
-            return True
-
     client = _Pingable()
     limiter = RedisRateLimiter(client, "unit-probe", limit=2, window_sec=60)
     assert limiter.check("k") is None
     assert limiter.degraded is True
+    fail_calls = client.eval_calls
 
     # 冷却期内不探测（沿用上次失败的结论）
     assert limiter.probe() is False
-    assert client.pings == 0
+    assert client.eval_calls == fail_calls
 
     times["now"] += 61
     assert limiter.probe() is False, "探测失败继续报降级"
-    assert client.pings == 1
+    assert client.eval_calls == fail_calls + 1, "冷却到期后应真实调用一次 EVAL"
     assert limiter.degraded is True
 
     client.up = True
@@ -399,6 +393,27 @@ def test_redis_cooldown_short_circuit_and_scan_failure():
     print("✓ 冷却短路、reset 清理失败容错与正常删除")
 
 
+def test_rate_window_non_positive_is_clamped():
+    """CHAT_RATE_WINDOW_SEC<=0 会形同不限流：导入时按下限 1 秒处理。"""
+    import subprocess
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import config; print(config.RATE_LIMIT_CONFIG['window_sec'])",
+        ],
+        cwd=project_root,
+        env=dict(os.environ, CHAT_RATE_WINDOW_SEC="0"),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "1", completed.stdout
+    print("✓ 非法限流窗口按下限 1 秒钳制")
+
+
 if __name__ == "__main__":
     test_window_and_keys()
     test_reset()
@@ -415,4 +430,5 @@ if __name__ == "__main__":
     test_peek_and_status_expired_events()
     test_redis_factory_failure_degrades_then_reset_without_client()
     test_redis_cooldown_short_circuit_and_scan_failure()
+    test_rate_window_non_positive_is_clamped()
     print("\n全部通过")

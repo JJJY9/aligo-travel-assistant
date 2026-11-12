@@ -494,7 +494,7 @@ def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
 
 async def check_llm_connectivity() -> CheckResult:
     """检查 LLM 服务连通性（未配置密钥时跳过）。"""
-    from config import LLM_CONFIG
+    from config import LLM_CONFIG, RESILIENCE_CONFIG
     from utils.llm_resilience import run_health_check
 
     if not LLM_CONFIG["api_key"]:
@@ -504,7 +504,11 @@ async def check_llm_connectivity() -> CheckResult:
         base_url=LLM_CONFIG["base_url"],
         api_key=LLM_CONFIG["api_key"],
         model_name=LLM_CONFIG["model_name"],
-        timeout_sec=10.0,
+        # 与配置文件同一口径：此前硬编码 10s，RESILIENCE_CONFIG 在这个
+        # 调用点被忽略（同键不同行为）
+        timeout_sec=float(
+            RESILIENCE_CONFIG.get("health_check_timeout_sec", 10.0)
+        ),
     )
     if ok:
         return CheckResult("LLM 连通性", STATUS_OK, f"{LLM_CONFIG['model_name']} 可用")
