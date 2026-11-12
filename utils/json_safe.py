@@ -15,7 +15,9 @@ from typing import Any
 # 「Circular reference detected (depth exceeded)」，截断必须低于该限制，
 # 否则清洗后的结构仍会在响应序列化阶段 500。超出部分按 None 截断
 # （与 NaN / Infinity 同一口径），其余数据仍可返回。
-_MAX_JSON_DEPTH = 50
+# 公开常量：导入端据此拒绝「比导出保存得更深」的内容，保证
+# 导入成功的数据下一次导出不会被静默截断（备份链不丢数据）。
+MAX_JSON_DEPTH = 50
 
 
 def _safe_text(text: str) -> str:
@@ -55,10 +57,10 @@ def strip_nul(value: Any) -> Any:
 def sanitize_json(value: Any, _depth: int = 0) -> Any:
     """把 NaN / Infinity 归一为 None、孤立代理项转义（递归处理列表与字典）。
 
-    嵌套超过 ``_MAX_JSON_DEPTH`` 的子树返回 None：这类结构在序列化 /
+    嵌套超过 ``MAX_JSON_DEPTH`` 的子树返回 None：这类结构在序列化 /
     响应的其它环节同样会触发 RecursionError，截断比整条接口 500 可用。
     """
-    if _depth >= _MAX_JSON_DEPTH:
+    if _depth >= MAX_JSON_DEPTH:
         return None
     if isinstance(value, float) and not math.isfinite(value):
         return None

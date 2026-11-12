@@ -1321,6 +1321,66 @@ def test_parse_rejects_deeply_nested_preference_value():
     print("✓ 深嵌套偏好值按非法值拒绝")
 
 
+def _nested(depth: int, leaf: object) -> object:
+    value = leaf
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def test_parse_rejects_content_deeper_than_export_saves():
+    """超过导出截断深度（sanitize_json 的 50）的非空内容在导入时拒绝。
+
+    否则导入「成功」的数据在下一次导出被静默截成 null，备份链丢数据；
+    已经导出过的备份在该深度只剩 null，必须仍可导入（导出 → 恢复闭环）。
+    """
+    from utils.json_safe import MAX_JSON_DEPTH
+
+    # assistant JSON：60 层带内容 → 拒绝
+    deep = json.dumps(_nested(MAX_JSON_DEPTH + 10, "x"))
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "assistant", "content": deep, "session_id": "s1"},
+                    {"role": "user", "content": "正常提问", "session_id": "s1"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert [message["role"] for message in sections["messages"]] == ["user"]
+    assert any("超过导出保存深度" in error for error in errors), errors
+
+    # 导出产物形状（MAX_JSON_DEPTH 层容器 + 末端 null）→ 仍可导入
+    exported = json.dumps(_nested(MAX_JSON_DEPTH, None))
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "assistant", "content": exported, "session_id": "s1"}
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert len(sections["messages"]) == 1, errors
+    assert not any("嵌套" in error for error in errors), errors
+
+    # 偏好值：绝对深度 = 自身深度 + 2（{"preferences": {name: value}}）
+    payload = {
+        "preferences": {
+            "hotel_brands": _nested(MAX_JSON_DEPTH, "汉庭"),
+            "ok_list": _nested(10, "如家"),
+        }
+    }
+    sections, errors = parse_user_export(json.dumps(payload))
+    assert "hotel_brands" not in sections.get("preferences", {}), sections
+    assert sections["preferences"].get("ok_list") == _nested(10, "如家")
+    assert any("超过导出保存深度" in error for error in errors), errors
+    print("✓ 深于导出截断点的内容在导入时拒绝，已导出的 null 结尾备份仍可恢复")
+
+
 def test_runner_skips_reserved_and_deleted_sessions(monkeypatch):
     """CLI user-import 与 Web 同一口径：保留字 / 墓碑期会话不能被恢复写回。"""
     from utils import tombstones
@@ -1799,6 +1859,7 @@ if __name__ == "__main__":
     test_import_roundtrip_and_idempotent()
     test_import_duplicate_message_counts()
     test_parse_rejects_deeply_nested_preference_value()
+    test_parse_rejects_content_deeper_than_export_saves()
     test_parse_rejects_huge_integer_literal_content()
     test_parse_survives_extreme_timestamp()
     test_parse_rejects_non_finite_preference_values()
