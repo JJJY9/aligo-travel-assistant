@@ -1194,6 +1194,18 @@ def test_ics_roundtrip_linebreak_identity_closed():
     print("✓ ICS 换行归一后身份闭合")
 
 
+def test_ics_unescape_preserves_unknown_escapes():
+    """RFC 之外的转义保留反斜杠：静默吞掉会把 C:\\temp 改写成 C:temp。"""
+    from utils.trip_import import _ics_unescape
+
+    assert _ics_unescape("C:\\temp") == "C:\\temp"
+    assert _ics_unescape("x\\dy\\uz") == "x\\dy\\uz"
+    assert _ics_unescape("a\\;b\\,c") == "a;b,c"
+    assert _ics_unescape("line1\\nline2") == "line1\nline2"
+    assert _ics_unescape("path\\\\to") == "path\\to"
+    print("✓ ICS 未知转义保留反斜杠")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -1205,6 +1217,7 @@ if __name__ == "__main__":
     test_ics_unfold_long_line_is_linear()
     test_ics_collects_invalid_events()
     test_ics_external_summary_fallback()
+    test_ics_unescape_preserves_unknown_escapes()
     test_ics_valarm_before_properties_keeps_event_description()
     test_ics_structure_errors_do_not_duplicate_events()
     test_ics_quoted_tzid_parameter_is_unquoted()

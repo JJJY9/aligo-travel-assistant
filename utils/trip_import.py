@@ -218,9 +218,13 @@ def _ics_unescape(value: str) -> str:
             nxt = value[index + 1]
             if nxt in ("n", "N"):
                 out.append("\n")
-            else:
-                # \ ; , 还原为字面量；未知转义同样按字面保留（容错外部日历）
+            elif nxt in ("\\", ";", ","):
+                # RFC 5545 定义的转义（\\\\ \\; \\,）：还原为字面量
                 out.append(nxt)
+            else:
+                # 未知转义（非 RFC 写法，手工编辑 / 损坏文件）：保留反斜杠，
+                # 不能静默吞掉——C:\\temp 的 \\t 曾被改写成 C:temp
+                out.append("\\" + nxt)
             index += 2
         else:
             out.append(char)
