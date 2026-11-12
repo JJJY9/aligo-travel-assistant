@@ -681,6 +681,16 @@ class ChatRequest(BaseModel):
             raise ValueError(f"session_id 不能使用保留字 {value}")
         return value
 
+    @field_validator("user_id")
+    @classmethod
+    def _user_id_not_reserved(cls, value: str) -> str:
+        # 对话入口经 ConversationRuntime 直接创建长期记忆、不走
+        # _open_long_term 的守卫：Windows 设备保留名会拼成记忆库文件名
+        # （NUL.json 指向设备），在这里按同一口径拒绝
+        if not is_valid_web_id(value):
+            raise ValueError("user_id 不能使用设备保留名")
+        return value
+
     @field_validator("message")
     @classmethod
     def _message_not_blank(cls, value: str) -> str:
@@ -4790,7 +4800,9 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> Response:
         """导出全部历史行程为一个 iCalendar 文件。"""
         rate_headers = _enforce_read_rate_limit(state, request)
-        store = _open_long_term(user_id)
+        # strict：PostgreSQL 故障期不能把回退 JSON（可能为空 / 陈旧）当作
+        # 成功数据返回 200 空日历（README 与 /api/trips/export 同口径）
+        store = _open_long_term(user_id, strict=True)
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示

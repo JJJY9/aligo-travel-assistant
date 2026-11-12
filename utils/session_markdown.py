@@ -120,6 +120,21 @@ def _starts_block(line: str) -> bool:
     )
 
 
+def _is_table_delimiter(line: str) -> bool:
+    """GFM 表格分隔行（``| --- | :--: |``）判定。
+
+    表格块同样结束段落：表头行里的未配对反引号不能与数据行配对，否则
+    数据行的反引号会被当作跨行关闭串、表头剩余内容（含原始 HTML）跳过
+    转义——与 #708 / #712 同类的 HIGH XSS 绕过。单列分隔线（``---``）
+    没有管道符，按 Setext / 主题分隔线处理，不在此列。
+    """
+    text = line.strip()
+    if "|" not in text:
+        return False
+    cells = text.strip("|").split("|")
+    return all(re.fullmatch(r"[ \t]*:?-+:?[ \t]*", cell) for cell in cells)
+
+
 def _closing_run_follows(
     lines: list[str], line_index: int, run: int
 ) -> bool:
@@ -131,6 +146,13 @@ def _closing_run_follows(
         if _fence_open(text):
             return False
         if _starts_block(text):
+            return False
+        if _is_table_delimiter(text):
+            return False
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if "|" in text and _is_table_delimiter(next_line):
+            # 本行 + 下一行构成 GFM 表格（表头 + 分隔行）：表格块打断段落，
+            # 表头行上的反引号不能关闭上一行的代码段
             return False
         if _find_backtick_run(text, 0, run) is not None:
             return True

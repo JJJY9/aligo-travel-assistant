@@ -2619,6 +2619,17 @@ async function openSession(sessionId, options = {}) {
       );
       renderEnd = Math.min(totalMessages, renderStart + HISTORY_RENDER_WINDOW);
     }
+    if (
+      options.silent &&
+      state.renderedStart &&
+      state.renderedStart.sessionId === sessionId &&
+      Number(state.renderedStart.end) > renderStart &&
+      Number(state.renderedStart.end) < totalMessages
+    ) {
+      // 搜索命中窗口的静默重载：同时恢复窗口上界，不能把「命中处到会话
+      // 结尾」整段同步渲染（#713 消除的整段渲染冻结）
+      renderEnd = Number(state.renderedStart.end);
+    }
     const pairTextBefore = (index) => {
       for (let i = index - 1; i >= 0; i -= 1) {
         if (data.messages[i].role === "user") return data.messages[i].content;
@@ -2654,7 +2665,7 @@ async function openSession(sessionId, options = {}) {
     };
     const initial = buildNodes(renderStart, renderEnd);
     initial.nodes.forEach((node) => els.messages.appendChild(node));
-    state.renderedStart = { sessionId, start: renderStart };
+    state.renderedStart = { sessionId, start: renderStart, end: renderEnd };
     state.partialHistory = renderEnd < totalMessages;
     const lastAssistantNode = initial.lastAssistantNode;
     const lastAssistantMeta = initial.lastAssistantMeta;
@@ -2678,7 +2689,7 @@ async function openSession(sessionId, options = {}) {
         // 补入的内容把已有节点向下推：同步滚动量，保持当前阅读位置
         els.scroll.scrollTop += els.scroll.scrollHeight - before;
         renderStart = nextStart;
-        state.renderedStart = { sessionId, start: renderStart };
+        state.renderedStart = { sessionId, start: renderStart, end: renderEnd };
         if (renderStart === 0) {
           earlierButton.remove();
           earlierButton = null;
@@ -2764,6 +2775,8 @@ async function openSession(sessionId, options = {}) {
         // 被写进界面从未展示过的隐藏会话。后台静默刷新（停止生成后的同步）
         // 传 keepOnError，临时失败不能把已知存在的会话从界面上清掉
         state.sessionId = null;
+        state.partialHistory = false;
+        state.renderedStart = null;
         safeStorageRemove("session", "aligo.sessionId");
         syncSessionControls();
         showWelcome();
@@ -2881,6 +2894,8 @@ async function deleteSession(sessionId) {
       // 不用 newSession()：它会自增会话加载序号，把正在进行的其它会话
       // 切换一并作废
       state.sessionId = null;
+      state.partialHistory = false;
+      state.renderedStart = null;
       safeStorageRemove("session", "aligo.sessionId");
       syncSessionControls();
       setConversationTitle("新对话");
@@ -3243,6 +3258,8 @@ async function readEventStream(body, onEvent) {
 
 function resetDeletedSessionState(restoreText) {
   state.sessionId = null;
+  state.partialHistory = false;
+  state.renderedStart = null;
   safeStorageRemove("session", "aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
@@ -3322,6 +3339,8 @@ function handleStreamEvent(assistant, event, userText) {
         const lastUser = users[users.length - 1];
         if (lastUser) lastUser.dataset.transient = "1";
         state.sessionId = null;
+        state.partialHistory = false;
+        state.renderedStart = null;
         safeStorageRemove("session", "aligo.sessionId");
         syncSessionControls();
         toast("会话已在其它窗口或终端删除，本轮回答未保存");
@@ -5610,6 +5629,8 @@ async function saveUser() {
       /* 忽略 */
     }
     state.sessionId = null;
+    state.partialHistory = false;
+    state.renderedStart = null;
     safeStorageRemove("session", "aligo.sessionId");
     syncSessionControls();
     setConversationTitle("新对话");
@@ -5819,8 +5840,12 @@ function bindEvents() {
   document.addEventListener("keydown", trapShortcutFocus);
 
   const warnPartialPrint = () => {
-    if (state.renderedStart && state.renderedStart.start > 0) {
-      // 面板 DOM 只渲染已显示的窗口：打印 / 导出 PDF 会静默截断更早的历史
+    if (
+      state.partialHistory ||
+      (state.renderedStart && state.renderedStart.start > 0)
+    ) {
+      // 面板 DOM 只渲染已显示的窗口：打印 / 导出 PDF 会静默截断更早
+      // 或更新的历史（partialHistory 覆盖会话末尾未渲染的搜索命中窗口）
       toast("打印只包含当前已显示的消息；完整历史请使用「导出 HTML」");
     }
   };
