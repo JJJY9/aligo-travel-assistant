@@ -520,6 +520,19 @@ def test_knowledge_import_skip_summary_distinguishes_conflicts():
     print("✓ 知识导入跳过摘要区分布局冲突")
 
 
+def test_knowledge_delete_legacy_parts_without_group():
+    """旧版多分片（有 parts 无 group）单条删除：不能带 group=1（服务端 400）。"""
+    data = _run_harness("kbDelete")
+    assert data["legacy_url"] == "/api/knowledge/documents/7", data
+    assert data["legacy_toasts"][-1].startswith("已删除该分片"), data
+    assert "旧版多分片" in data["legacy_toasts"][-1], data
+    assert data["group_url"] == "/api/knowledge/documents/8?group=1", data
+    assert data["group_toasts"][-1] == "已删除整组分片", data
+    assert data["single_url"] == "/api/knowledge/documents/9", data
+    assert data["single_toasts"][-1] == "知识片段已删除", data
+    print("✓ 旧版多分片删除不再带 group=1")
+
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -535,5 +548,6 @@ if __name__ == "__main__":
     test_panel_fixes_cursor_stale_session_and_import_batches()
     test_reconcile_confirms_after_open_session()
     test_knowledge_import_skip_summary_distinguishes_conflicts()
+    test_knowledge_delete_legacy_parts_without_group()
     test_chat_done_persisted_signal()
     print("\n全部通过")

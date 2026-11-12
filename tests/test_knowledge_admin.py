@@ -11,6 +11,8 @@
 import json
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -999,7 +1001,7 @@ def test_cleanup_duplicate_contents_deletes_verified_only(monkeypatch):
     fake = _FakeMilvusClient([{"id": 2, "content": "C", "metadata": "{}"}])
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
     monkeypatch.setattr(
-        knowledge_admin, "find_duplicate_contents", lambda: [("C", [1, 2])]
+        knowledge_admin, "_scan_duplicate_contents", lambda client: [("C", [1, 2])]
     )
     result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
     assert result["removed"] == 0
@@ -1461,11 +1463,11 @@ def test_list_and_export_hold_write_lock(monkeypatch):
             self.entries = 0
             self.exits = 0
 
-        def acquire(self, timeout=None):
+        def acquire_read(self, timeout=None):
             self.entries += 1
             return True
 
-        def release(self):
+        def release_read(self):
             self.exits += 1
 
     lock = _TrackingLock()
@@ -2964,6 +2966,168 @@ def test_skill_search_participates_in_write_lock(monkeypatch):
     print("✓ RAG 检索与知识库写操作互斥（有界等待）")
 
 
+def test_read_write_lock_allows_concurrent_readers(monkeypatch):
+    """读并发、写独占，读写都有界等待（线程池不被长导入钉死）。"""
+    lock = knowledge_admin._ReadWriteLock()
+    assert lock.acquire_read(0.2)
+    assert lock.acquire_read(0.2), "读路径必须允许并发"
+    start = time.monotonic()
+    assert not lock.acquire_write(0.1), "有读者时写锁必须等待"
+    assert time.monotonic() - start < 1.5
+    lock.release_read()
+    lock.release_read()
+    assert lock.acquire_write(0.5)
+    assert not lock.acquire_read(0.1), "写者持锁时读者有界失败（不无限排队）"
+    lock.release_write()
+    assert lock.acquire_read(0.5)
+    lock.release_read()
+    print("✓ 读写锁读并发、写独占且有界等待")
+
+
+def test_cleanup_dry_run_waits_on_write_bounded(monkeypatch):
+    """去重预览走有界读锁：长导入持锁时快速 503，而不是无限排队。"""
+    fake = _FakeMilvusClient([])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(
+        knowledge_admin, "_load_collection", lambda client, name: None
+    )
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        knowledge_admin._WRITE_LOCK.acquire()
+        ready.set()
+        release.wait(5)
+        knowledge_admin._WRITE_LOCK.release()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert ready.wait(2)
+        start = time.monotonic()
+        with pytest.raises(knowledge_admin.KnowledgeBusyError):
+            knowledge_admin.cleanup_duplicate_contents(dry_run=True)
+        assert time.monotonic() - start < 3
+    finally:
+        release.set()
+        holder.join(2)
+    print("✓ 去重预览走有界读锁")
+
+
+def test_add_document_write_wait_is_bounded(monkeypatch):
+    """写路径在长导入期间有界失败，不把共享线程池钉在锁上。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda: Path(__file__)
+    )
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        knowledge_admin._WRITE_LOCK.acquire()
+        ready.set()
+        release.wait(5)
+        knowledge_admin._WRITE_LOCK.release()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert ready.wait(2)
+        start = time.monotonic()
+        with pytest.raises(knowledge_admin.KnowledgeBusyError):
+            knowledge_admin.add_document("片段内容")
+        assert time.monotonic() - start < 3, "写请求必须有界失败"
+        assert agent.calls == []
+    finally:
+        release.set()
+        holder.join(2)
+    print("✓ 写路径在长导入期间有界失败")
+
+
+def test_import_edited_backup_same_group_conflict(monkeypatch):
+    """库内同号 group 已有不同内容：不能再写入第二套 part 1..N。"""
+    from pathlib import Path
+
+    fake = _FakeMilvusClient(
+        [
+            {
+                "id": 1,
+                "content": "旧一" * 150,
+                "metadata": json.dumps(
+                    {"group": "g-same", "part": "1", "parts": "2"}
+                ),
+            },
+            {
+                "id": 2,
+                "content": "旧二" * 150,
+                "metadata": json.dumps(
+                    {"group": "g-same", "part": "2", "parts": "2"}
+                ),
+            },
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda: Path(__file__)
+    )
+    agent = _FakeAgent({"status": "success", "ids": [9, 10], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    backup = [
+        {
+            "content": "新一" * 150,
+            "metadata": {"group": "g-same", "part": "1", "parts": "2"},
+        },
+        {
+            "content": "新二" * 150,
+            "metadata": {"group": "g-same", "part": "2", "parts": "2"},
+        },
+    ]
+    preview = knowledge_admin.import_documents(backup, dry_run=True)
+    assert preview["would_import"] == 0, preview
+    assert preview["skipped_conflict"] == 2, preview
+    result = knowledge_admin.import_documents(backup)
+    assert result["imported"] == 0, result
+    assert result["skipped_conflict"] == 2, result
+    assert agent.calls == [], "同号组内容不同时不能写入第二套 part"
+    print("✓ 同号异内容的分片组导入被拒（不再产生重复 part）")
+
+
+def test_import_unchunked_legacy_record_rechunks(monkeypatch):
+    """旧版未切分长记录：预览与正式导入都按实际切片比较（不早退判重）。"""
+    from pathlib import Path
+
+    legacy = "".join(f"第{i:04d}段验证内容。" for i in range(100))
+    assert len(legacy) > 800
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda: Path(__file__)
+    )
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: [legacy.strip()]
+    )
+    fake = _FakeMilvusClient([])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    expected = knowledge_admin._chunk_documents(legacy, None)
+    assert len(expected) > 1
+    agent = _FakeAgent(
+        {
+            "status": "success",
+            "ids": list(range(len(expected))),
+            "total_count": len(expected),
+        }
+    )
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    payload = [{"content": legacy, "metadata": {}}]
+    preview = knowledge_admin.import_documents(payload, dry_run=True)
+    assert preview["would_import"] == len(expected), preview
+    result = knowledge_admin.import_documents(payload)
+    assert result["imported"] == len(expected), result
+    assert len(agent.calls[0]) == len(expected)
+    print("✓ 未切分旧记录按实际切片判重（预览与导入一致）")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
@@ -3032,6 +3196,11 @@ if __name__ == "__main__":
         test_import_with_new_content_still_loads_model,
         test_import_restores_per_part_metadata,
         test_import_dry_run_skips_writes,
+        test_read_write_lock_allows_concurrent_readers,
+        test_cleanup_dry_run_waits_on_write_bounded,
+        test_add_document_write_wait_is_bounded,
+        test_import_edited_backup_same_group_conflict,
+        test_import_unchunked_legacy_record_rechunks,
         test_get_document_group_returns_joined_content,
         test_get_document_group_marks_legacy_and_missing_parts,
         test_document_group_at_size_limit_roundtrip,

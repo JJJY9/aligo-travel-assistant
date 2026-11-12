@@ -36,7 +36,7 @@ import weakref
 import uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _threads_queues, _worker
+from concurrent.futures.thread import _worker
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -709,6 +709,23 @@ class KnowledgeDocumentPayload(BaseModel):
         default=None, max_length=10
     )
 
+    @field_validator("content")
+    @classmethod
+    def _content_is_writable(cls, value: str) -> str:
+        """NUL / 孤立代理项在写库（JSON 导出剔除 / UTF-8 编码）时才炸。"""
+        problem = _text_write_problem(value)
+        if problem:
+            raise ValueError(f"知识内容{problem}")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_is_writable(cls, value: object) -> object:
+        problem = _text_write_problem(value)
+        if problem:
+            raise ValueError(f"元数据{problem}")
+        return value
+
 
 class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     """更新知识片段：支持整份文档（整组）编辑后按 400 字重新拆分。"""
@@ -1083,7 +1100,10 @@ class _DaemonImportExecutor(ThreadPoolExecutor):
             )
             thread.start()
             self._threads.add(thread)  # type: ignore[attr-defined]
-            _threads_queues[thread] = self._work_queue  # type: ignore[index, attr-defined]
+            # 刻意不登记到 concurrent.futures.thread._threads_queues：atexit
+            # 的 _python_exit 会对登记过的线程逐个 join（daemon=True 不豁免），
+            # 导入进行中停服仍会卡住整个导入时长；不登记则在解释器退出时
+            # 直接随 daemon 线程结束
 
 
 class AligoWebApp:

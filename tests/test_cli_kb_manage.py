@@ -205,6 +205,34 @@ def test_categories_error(monkeypatch):
     print("✓ kb-categories 读取失败返回 1")
 
 
+def test_categories_and_duplicates_strip_terminal_controls(monkeypatch):
+    """分类名与重复预览来自知识正文：ESC / OSC 不能直达终端（--json 保留原文）。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    evil = "分类\x1b[31m红\x1b]8;;http://evil\x1b\\链接\x1b]8;;\x1b\\"
+    monkeypatch.setattr(
+        knowledge_admin, "list_categories", lambda: [{"category": evil, "count": 1}]
+    )
+    code, out = _capture(cli.run_knowledge_categories_standalone)
+    assert code == 0
+    assert "\x1b" not in out, out
+    assert "分类" in out
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "find_duplicate_contents",
+        lambda: [("重复\x1b[2J内容", [1, 2])],
+    )
+    code, out = _capture(cli.run_knowledge_duplicates_standalone)
+    assert code == 0
+    assert "\x1b" not in out, out
+    code, out = _capture(cli.run_knowledge_duplicates_standalone, as_json=True)
+    assert "u001b" in out, "--json 供脚本消费，以 JSON 转义保留原始内容"
+    code, out = _capture(cli.run_knowledge_dedupe_standalone, dry_run=True)
+    assert code == 0
+    assert "\x1b" not in out, out
+    print("✓ kb-categories / kb-duplicates / kb-dedupe 终控序列净化")
+
+
 def test_search_unavailable(monkeypatch):
     monkeypatch.setattr(
         knowledge_stats, "knowledge_status", lambda: _status(False, "知识库未初始化")
@@ -1061,6 +1089,7 @@ if __name__ == "__main__":
         test_categories_prints,
         test_categories_json_and_empty,
         test_categories_error,
+        test_categories_and_duplicates_strip_terminal_controls,
         test_search_unavailable,
         test_search_success_and_json,
         test_search_empty_and_error,

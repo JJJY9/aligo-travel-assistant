@@ -1458,6 +1458,58 @@ function scenarioKbImportSummary(source) {
   };
 }
 
+async function scenarioKbDelete(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  // 删除成功后会刷新知识库状态 / 列表 / 分类：把后续请求逐个 resolve
+  const flush = async (promise) => {
+    for (let i = 0; i < 12; i += 1) {
+      await tick();
+      const pending = env.__requests.filter((request) => !request.__done);
+      if (!pending.length) break;
+      for (const request of pending) {
+        request.__done = true;
+        request.resolve({
+          available: false,
+          documents: 0,
+          total: 0,
+          items: [],
+          categories: [],
+        });
+      }
+    }
+    await promise;
+  };
+
+  // 旧版多分片（parts>1 无 group）：服务端只接受单条删除，带 group=1 会 400
+  let promise = run('removeKnowledgeDocument({id: 7, metadata: {parts: "3"}})');
+  results.legacy_url = env.__requests[0].args[0];
+  env.__requests[0].__done = true;
+  env.__requests[0].resolve({ id: 7, deleted: true, group: false, count: 1 });
+  await flush(promise);
+  results.legacy_toasts = run("__toasts.slice()");
+
+  // 带 group 的多分片：整组删除
+  const beforeGroup = env.__requests.length;
+  promise = run('removeKnowledgeDocument({id: 8, metadata: {parts: 2, group: "g1"}})');
+  results.group_url = env.__requests[beforeGroup].args[0];
+  env.__requests[beforeGroup].__done = true;
+  env.__requests[beforeGroup].resolve({ id: 8, deleted: true, group: true, count: 2 });
+  await flush(promise);
+  results.group_toasts = run("__toasts.slice()");
+
+  // 普通单片：不带 group
+  const beforeSingle = env.__requests.length;
+  promise = run("removeKnowledgeDocument({id: 9, metadata: {}})");
+  results.single_url = env.__requests[beforeSingle].args[0];
+  env.__requests[beforeSingle].__done = true;
+  env.__requests[beforeSingle].resolve({ id: 9, deleted: true, group: false, count: 1 });
+  await flush(promise);
+  results.single_toasts = run("__toasts.slice()");
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1514,6 +1566,8 @@ async function main() {
     payload = scenarioChatPersisted(source);
   } else if (scenario === "kbImportSummary") {
     payload = scenarioKbImportSummary(source);
+  } else if (scenario === "kbDelete") {
+    payload = await scenarioKbDelete(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

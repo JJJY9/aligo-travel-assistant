@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import uuid
 from datetime import datetime
@@ -375,6 +376,27 @@ def _build_agent(model, knowledge_base_path: Path):
     )
 
 
+def _discard_created_library(knowledge_base_path: Path) -> None:
+    """导出失败中止时移除本次运行新建的库目录。
+
+    留着刚建出的空 skill 库会让下一次运行的 ``default_knowledge_dir`` 把它
+    当作优先来源：旧部署项目根 ``rag_knowledge/`` 里的用户知识永远不会再
+    被迁移，面板看起来「知识库被清空」。先关共享客户端再删数据库文件——
+    Milvus Lite 句柄在 Windows 上可能删不掉整个目录，但目录里没有
+    ``milvus_lite.db`` 就不会再被 default_knowledge_dir 认作已初始化。
+    """
+    try:
+        from utils.milvus_client import shutdown_milvus_clients
+
+        shutdown_milvus_clients()
+    except Exception:  # noqa: BLE001 - 清理尽力而为，不改变退出码语义
+        pass
+    with contextlib.suppress(OSError):
+        (knowledge_base_path / "milvus_lite.db").unlink()
+    with contextlib.suppress(OSError):
+        shutil.rmtree(knowledge_base_path)
+
+
 def _drop_collection_for_rebuild(knowledge_base_path: Path) -> None:
     """维度不一致等导致 Agent 构造失败时，先删除旧集合再重建。"""
     from utils.milvus_client import get_milvus_client
@@ -434,6 +456,9 @@ def main() -> int:
             print(f"⚠️ 模型不可用（{exc}），导入与自检继续（问答阶段需配置 API Key）")
         print()
 
+        # 本次运行是否新建了库目录：在导出旧库失败等中止路径上要把它删掉，
+        # 否则空 skill 库会在下一次运行抢在旧部署来源之前（见 discard 注释）
+        created_knowledge_dir = not knowledge_base_path.exists()
         knowledge_base_path.mkdir(parents=True, exist_ok=True)
 
         # 3. 创建 RAG Agent：旧集合维度不一致时先「导出保留片段」再删旧集合
@@ -461,6 +486,8 @@ def main() -> int:
                 )
             except RuntimeError as export_error:
                 print(f"❌ {export_error}，已中止（知识库保持原样）")
+                if created_knowledge_dir:
+                    _discard_created_library(knowledge_base_path)
                 return 1
             for warning in warnings:
                 print(f"   ⚠️  {warning}")
@@ -479,6 +506,8 @@ def main() -> int:
 
         if not rag_agent.initialized:
             print("❌ RAG Agent初始化失败")
+            if created_knowledge_dir:
+                _discard_created_library(knowledge_base_path)
             return 1
         print("✓ RAG Agent初始化成功")
         print()
@@ -500,6 +529,8 @@ def main() -> int:
                     )
                 except RuntimeError as export_error:
                     print(f"❌ {export_error}，已中止（知识库保持原样）")
+                    if created_knowledge_dir:
+                        _discard_created_library(knowledge_base_path)
                     return 1
                 for warning in warnings:
                     print(f"   ⚠️  {warning}")
