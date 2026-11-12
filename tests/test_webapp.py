@@ -3669,7 +3669,10 @@ def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
     backup = {
         "chat_history": [
             {"role": "user", "content": "恢复期间被删", "session_id": "s-late"}
-        ]
+        ],
+        "session_titles": {"s-late": "恢复期间被删"},
+        "pinned_sessions": ["s-late"],
+        "archived_sessions": ["s-late"],
     }
     try:
         response = client.post(
@@ -3678,6 +3681,11 @@ def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
         assert response.status_code == 200, response.text
         payload = response.json()
         assert payload["messages_added"] == 0, payload
+        # 会话整体回滚时，标题 / 置顶 / 归档随 delete_chat_session 一并清除：
+        # 响应里的计数必须同步扣减，不能仍报「已恢复 1 个标题」
+        assert payload["titles"] == 0, payload
+        assert payload["pinned"] == 0, payload
+        assert payload["archived"] == 0, payload
         assert any("写入期间被删除" in item for item in payload["skipped"]), payload[
             "skipped"
         ]
@@ -3686,6 +3694,11 @@ def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
             assert store.get_chat_history(session_id="s-late") == [], (
                 "恢复写库期间被删除的会话不能留下消息"
             )
+            assert "s-late" not in (store.get_session_titles() or {}), (
+                "回滚必须连标题一起清除"
+            )
+            assert "s-late" not in (store.get_pinned_sessions() or [])
+            assert "s-late" not in (store.get_archived_sessions() or [])
         finally:
             close = getattr(store, "close", None)
             if callable(close):

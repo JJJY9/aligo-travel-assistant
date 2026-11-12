@@ -5300,9 +5300,10 @@ def create_app(model: Any = None) -> FastAPI:
                             if state.is_recently_deleted(user_id, session_id)
                         }
                         removed_total = 0
+                        rolled_back_sessions: set[str] = set()
                         for session_id in sorted(late_deleted):
                             try:
-                                removed_total += int(
+                                removed = int(
                                     store.delete_chat_session(session_id) or 0
                                 )
                             except Exception as exc:  # noqa: BLE001 - 尽力回滚
@@ -5312,9 +5313,11 @@ def create_app(model: Any = None) -> FastAPI:
                                     exc,
                                 )
                                 continue
+                            removed_total += removed
+                            rolled_back_sessions.add(session_id)
                             errors.append(
                                 f"会话 {session_id} 在恢复写入期间被删除，"
-                                f"已回滚 {removed_total} 条消息"
+                                f"已回滚 {removed} 条消息"
                             )
                         if removed_total:
                             counts["messages_added"] = max(
@@ -5322,6 +5325,21 @@ def create_app(model: Any = None) -> FastAPI:
                                 int(counts.get("messages_added") or 0)
                                 - removed_total,
                             )
+                        if rolled_back_sessions:
+                            # delete_chat_session 连同标题 / 置顶 / 归档一起清除：
+                            # 计数同步扣减，响应不能把已回滚会话的元数据仍算作
+                            # 「已恢复」（备份里给该会话带过的元数据各扣一条，
+                            # 与导入时一次只记一条的口径一致）
+                            for key, section in (
+                                ("titles", sections.get("titles") or {}),
+                                ("pinned", sections.get("pinned") or []),
+                                ("archived", sections.get("archived") or []),
+                            ):
+                                counts[key] = max(
+                                    0,
+                                    int(counts.get(key) or 0)
+                                    - len(rolled_back_sessions & set(section)),
+                                )
                         return counts
                     finally:
                         _close_long_term(store)
