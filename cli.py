@@ -5,6 +5,7 @@ Aligo 商旅助手 - CLI 交互界面
 """
 import asyncio
 import contextlib
+import inspect
 import os
 import re
 import signal
@@ -374,6 +375,21 @@ class AligoCLI:
 
             # 5. 调度智能体（实时显示智能体进度）
             orchestration_result = None
+            # 真实编排器支持延迟记忆：偏好 / 行程要等整轮问答落库成功后再写
+            # （与 Web ConversationRuntime 一致），墓碑否决 / 落库失败 / 取消
+            # 的回合不能留下没有对话的幽灵记录。测试替身可能没有该参数，
+            # 按签名探测后再传。
+            defer_supported = False
+            try:
+                parameters = inspect.signature(
+                    self.orchestrator.reply
+                ).parameters
+                defer_supported = "defer_memory" in parameters or any(
+                    item.kind is inspect.Parameter.VAR_KEYWORD
+                    for item in parameters.values()
+                )
+            except (TypeError, ValueError):
+                defer_supported = False
             try:
                 with self.console.status("正在调度智能体…", spinner="dots") as orchestration_status:
 
@@ -382,8 +398,19 @@ class AligoCLI:
                         if text:
                             orchestration_status.update(text)
 
+                    def _reply_once():
+                        if defer_supported:
+                            return self.orchestrator.reply(
+                                intention_result,
+                                on_event=on_progress,
+                                defer_memory=True,
+                            )
+                        return self.orchestrator.reply(
+                            intention_result, on_event=on_progress
+                        )
+
                     orchestration_result = await retry_with_backoff(
-                        lambda: self.orchestrator.reply(intention_result, on_event=on_progress),
+                        _reply_once,
                         max_retries=max_retries,
                         base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
                         max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
@@ -456,6 +483,19 @@ class AligoCLI:
                 # None（旧实现无返回值）按成功处理，与 ConversationRuntime 一致
                 persisted = True
                 usage_settled = True
+                # 整轮已落库：现在才提交延迟的偏好 / 行程写入（墓碑否决 /
+                # 落库失败 / 取消的回合不提交，避免幽灵记录）
+                commit_deferred = getattr(
+                    self.orchestrator, "commit_deferred_memory", None
+                )
+                if defer_supported and callable(commit_deferred):
+                    try:
+                        await commit_deferred()
+                    except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
+                        self.console.print(
+                            "[dim yellow]偏好 / 行程写入记忆失败，"
+                            "可在面板重试[/dim yellow]"
+                        )
         finally:
             if staged and not persisted:
                 rollback = getattr(self.memory_manager, "rollback_staged_message", None)

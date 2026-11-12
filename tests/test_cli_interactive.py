@@ -548,6 +548,34 @@ def test_process_query_rolls_back_when_persist_vetoed():
     print("✓ CLI 会话被删除时整轮回滚并提示")
 
 
+def test_process_query_defers_memory_until_persisted():
+    """CLI 回合用 defer_memory 编排；落库成功才提交延迟记忆，否决不提交。"""
+    agent, _events = _make_cli_stub()
+    calls = {"reply": [], "commit": 0}
+
+    class _Deferred:
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            calls["reply"].append(defer_memory)
+            return _TextMessage(json.dumps({"results": []}))
+
+        async def commit_deferred_memory(self):
+            calls["commit"] += 1
+            return True
+
+    agent.orchestrator = _Deferred()
+    asyncio.run(agent.process_query("你好"))
+    assert calls["reply"] == [True], "真实编排器必须 defer_memory=True"
+    assert calls["commit"] == 1, "落库成功后必须提交延迟记忆"
+
+    calls["reply"] = []
+    calls["commit"] = 0
+    agent.memory_manager.persist_turn = lambda user, assistant: False
+    asyncio.run(agent.process_query("第二轮"))
+    assert calls["reply"] == [True]
+    assert calls["commit"] == 0, "墓碑否决的回合不能提交偏好 / 行程"
+    print("✓ CLI 延迟记忆只在落库成功后提交")
+
+
 def test_process_query_stages_user_message_before_orchestration():
     """编排期间短期记忆必须已含本轮提问（_prepare_context 读取用户本轮原话）。"""
     agent, events = _make_cli_stub()
@@ -968,6 +996,7 @@ if __name__ == "__main__":
         test_process_query_reloads_long_term_each_turn()
         test_process_query_stages_user_message_before_orchestration()
         test_process_query_rolls_back_when_persist_vetoed()
+        test_process_query_defers_memory_until_persisted()
         test_failed_turn_usage_carried_to_next_success()
         test_process_query_sanitizes_surrogates_before_persist()
         test_process_query_failure_leaves_no_long_term_user_turn()
