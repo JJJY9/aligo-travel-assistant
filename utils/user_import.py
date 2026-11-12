@@ -24,6 +24,10 @@ _MAX_PREFERENCES = 200
 _MAX_TRIPS = 5000
 _MAX_MESSAGES = 200000
 _MAX_KNOWLEDGE = 50000
+# 备份 trip_id 的数字上限：PostgreSQL 编号计数器是 BIGINT，JSON 后端用
+# Python int 换算——19 位以上（> 2**63-1）的编号会让编号水位永久溢出，
+# 该用户之后新增行程全部写不进去；超过 18 位的一律丢弃编号、按新编号恢复
+_MAX_TRIP_ID_DIGITS = 18
 # 分片数硬上限（与 knowledge_admin._GROUP_PARTS_MAX 同一口径）：parts 声明
 # 来自备份元数据，无上限时 set(range(1, parts + 1)) 会被 1e9 声明直接撑爆
 # 内存（百字节备份即可触发 OOM）
@@ -35,6 +39,15 @@ _USAGE_NUMBER_FIELDS = ("calls", "input_tokens", "output_tokens", "total_tokens"
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _message_session_key(value: Any) -> str | None:
+    """消息去重键的会话维度：与存储层 ``_session_dedupe_key`` 同口径。
+
+    旧 JSON 数据里 session_id 可能是整数（123），解析后的备份是字符串
+    （"123"）：不归一会让 dry-run 预览与实际导入的 messages_added 不一致。
+    """
+    return None if value is None else str(value)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -331,10 +344,10 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     # UnicodeEncodeError），体积按 indent=2（以及 Windows 换行翻译）估算——
     # 紧凑 JSON 的估算会让 1.3-1.6 倍体积的备份通过自检、写盘后却被导入侧
     # 「超过 50 MB」拒绝，导出器产出自己声明可恢复、实际无法导入的备份
-    from utils.json_safe import sanitize_json
+    from utils.exporter import sanitize_backup_data
 
     serialized = json.dumps(
-        sanitize_json(backup), ensure_ascii=False, indent=2
+        sanitize_backup_data(backup), ensure_ascii=False, indent=2
     )
     size = len(serialized.encode("utf-8"))
     if os.linesep != "\n":
@@ -378,16 +391,23 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     preferences = raw_preferences if isinstance(raw_preferences, dict) else {}
     cleaned_preferences: dict[str, Any] = {}
     for index, (key, value) in enumerate(preferences.items(), start=1):
-        name = str(key or "").strip()
-        # 与 Web /api/preferences/{type} 的 ^[^/]{1,64}$ 约束一致：含 "/"
-        # 的键落库后面板（路径段被拆开）与 CLI（字符集校验）都无法编辑或
-        # 删除，只能重新导入覆盖值
-        if not name or len(name) > 64 or "/" in name:
-            errors.append(f"跳过第 {index} 个偏好：键名非法")
-            continue
+        # 上限先于任何 continue：此前非法键直接跳过、永远到不了 break，
+        # 200 条上限可被任意数量的非法键完全绕过
         if index > _MAX_PREFERENCES:
             errors.append(f"偏好超过 {_MAX_PREFERENCES} 个，多余条目已跳过")
             break
+        # 键名与 Web /api/preferences/{type} 的 ^[^/]{1,64}$ 同一口径，并
+        # 排除控制字符 / 行分隔符（与 _PREF_TYPE_PATTERN 一致）：不做 strip
+        # ——改名会让「 home」与「home」碰撞互相覆盖，含 ESC/NUL 的键导入
+        # 后面板与 API 都无法编辑或删除
+        name = str(key)
+        if (
+            not name
+            or len(name) > 64
+            or re.search(r"[\x00-\x1F\x7F-\x9F\u2028\u2029/]", name)
+        ):
+            errors.append(f"跳过第 {index} 个偏好：键名非法")
+            continue
         problem = _text_problem(name) or _bad_text_in_value(value)
         if problem:
             errors.append(f"跳过第 {index} 个偏好：{problem}")
@@ -454,10 +474,15 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if ok and session_id:
             trip_record["session_id"] = session_id
         # 保留备份里的 trip_id / timestamp（导出格式两种后端都有）：恢复后
-        # 编号与创建时间与备份一致，而不是全部重新编号为 trip_N / 恢复时刻
+        # 编号与创建时间与备份一致，而不是全部重新编号为 trip_N / 恢复时刻。
+        # 数字位数必须设上限：BIGINT 计数器 / int 换算会被超大编号永久毒化
         trip_id_raw = str(row.get("trip_id") or "").strip()
-        if re.fullmatch(r"trip_\d+", trip_id_raw):
+        if re.fullmatch(r"trip_\d{1,%d}" % _MAX_TRIP_ID_DIGITS, trip_id_raw):
             trip_record["trip_id"] = trip_id_raw
+        elif trip_id_raw:
+            errors.append(
+                f"第 {index} 条行程的 trip_id 超出可恢复范围，已按新编号恢复"
+            )
         record_timestamp = _normalize_timestamp(row.get("timestamp"))
         if record_timestamp:
             trip_record["timestamp"] = record_timestamp
@@ -720,7 +745,7 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     if messages:
         existing = Counter(
             (
-                message.get("session_id"),
+                _message_session_key(message.get("session_id")),
                 message.get("role"),
                 str(message.get("content") or ""),
             )
@@ -728,7 +753,7 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         )
         for message in messages:
             message_key = (
-                message["session_id"],
+                _message_session_key(message["session_id"]),
                 message["role"],
                 message["content"],
             )
@@ -789,10 +814,46 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         "knowledge_skipped": 0,
     }
 
+    # 存量 + 本备份不能越过导出上限：否则恢复后 /api/export 与 CLI
+    # user-export 永久 413 / 中止，该账号再也导不出备份（上限要避免的正是
+    # 这种不可恢复状态）。统计不可读时不拦截，由写入层自行报错
+    def _existing_total(name: str) -> int | None:
+        getter = getattr(store, "get_statistics", None)
+        if not callable(getter):
+            return None
+        try:
+            return int((getter() or {}).get(name) or 0)
+        except Exception:  # noqa: BLE001 - 统计失败不阻断恢复
+            return None
+
+    existing_messages = _existing_total("total_messages")
+    incoming_messages = len(sections.get("messages", []))
+    if (
+        existing_messages is not None
+        and incoming_messages
+        and existing_messages + incoming_messages > _MAX_MESSAGES
+    ):
+        raise ValueError(
+            f"恢复后消息总数将超过上限 {_MAX_MESSAGES}"
+            f"（现有 {existing_messages} + 导入 {incoming_messages}），"
+            "请先清理历史消息后重试"
+        )
+    existing_trips = _existing_total("total_trips")
+    incoming_trips = len(sections.get("trips", []))
+    if (
+        existing_trips is not None
+        and incoming_trips
+        and existing_trips + incoming_trips > _MAX_TRIPS
+    ):
+        raise ValueError(
+            f"恢复后行程总数将超过上限 {_MAX_TRIPS}"
+            f"（现有 {existing_trips} + 导入 {incoming_trips}），"
+            "请先清理历史行程后重试"
+        )
+
     for key, value in sections.get("preferences", {}).items():
         store.save_preference(key, value)
         result["preferences"] += 1
-
     trips = sections.get("trips", [])
     if trips:
         # 批量保存：JSON 后端一次重载 + 一次原子写回（逐条写是 O(n²)，

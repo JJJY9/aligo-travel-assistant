@@ -40,7 +40,15 @@ def strip_nul(value: Any) -> Any:
     if isinstance(value, list):
         return [strip_nul(item) for item in value]
     if isinstance(value, dict):
-        return {key: strip_nul(item) for key, item in value.items()}
+        cleaned: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str):
+                # 键里的 NUL 同样会被导入端整条拒绝、面板也无法显示 / 删除：
+                # 清理必须覆盖键（此前只清值，含 NUL 的偏好键导出成功、恢复丢失）
+                cleaned[key.replace("\x00", "")] = strip_nul(item)
+            else:
+                cleaned[key] = strip_nul(item)
+        return cleaned
     return value
 
 

@@ -1773,6 +1773,44 @@ def test_session_export_sanitizes_custom_title():
         _cleanup(user_id)
 
 
+def test_import_rejects_when_existing_totals_would_exceed_limits(monkeypatch):
+    """存量 + 备份越过导出上限：返回可修正的 400，而不是通用 503。"""
+    from webapp import server as server_module
+
+    class _FullStore:
+        def get_statistics(self):
+            return {"total_messages": 200000, "total_trips": 0}
+
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_chat_history(self, limit=None):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False: _FullStore(),
+    )
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_import_cap")},
+        json={
+            "backup": {
+                "chat_history": [
+                    {"role": "user", "content": "hi", "session_id": "s1"}
+                ]
+            }
+        },
+    )
+    assert response.status_code == 400, response.text[:300]
+    assert "上限" in response.json()["detail"]
+
+
 def test_import_skips_reserved_session_id():
     """备份里的 session_id="export" 不能落库（否则详情路由永远被静态路由遮蔽）。"""
     client = _client()

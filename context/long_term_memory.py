@@ -1000,6 +1000,15 @@ class LongTermMemory:
             for message in self.data.get("chat_history", [])
         )
 
+    def _session_id_set(self) -> set[str]:
+        """当前快照里存在消息的会话 ID 集合（批量元数据恢复一次扫描）。"""
+        return {
+            str(message.get("session_id"))
+            for message in self.data.get("chat_history", [])
+            if isinstance(message, dict)
+            and message.get("session_id") is not None
+        }
+
     @_locked_mutation
     def set_session_title(self, session_id: str, title: str) -> bool:
         """设置会话自定义标题；空标题表示恢复自动标题。返回会话是否存在。"""
@@ -1062,9 +1071,12 @@ class LongTermMemory:
         """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""
         applied = 0
         stored = self.data.setdefault("session_titles", {})
+        # 一次扫描构建会话集合：逐条 _session_exists 是 O(k×N)，大备份
+        # （20 万消息会话上限）会把恢复拖成分钟级
+        existing = self._session_id_set()
         for session_id, title in titles.items():
             cleaned = str(title).strip()
-            if not cleaned or not self._session_exists(session_id):
+            if not cleaned or session_id not in existing:
                 continue
             stored[session_id] = cleaned[:60]
             applied += 1
@@ -1077,8 +1089,9 @@ class LongTermMemory:
         """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。"""
         applied = 0
         pinned_sessions = self.data.setdefault("pinned_sessions", [])
+        existing = self._session_id_set()
         for session_id in session_ids:
-            if not session_id or not self._session_exists(session_id):
+            if not session_id or session_id not in existing:
                 continue
             if pinned and session_id not in pinned_sessions:
                 pinned_sessions.append(session_id)
@@ -1096,8 +1109,9 @@ class LongTermMemory:
         """批量归档 / 恢复（备份恢复）：返回实际生效数。"""
         applied = 0
         archived_sessions = self.data.setdefault("archived_sessions", [])
+        existing = self._session_id_set()
         for session_id in session_ids:
-            if not session_id or not self._session_exists(session_id):
+            if not session_id or session_id not in existing:
                 continue
             if archived and session_id not in archived_sessions:
                 archived_sessions.append(session_id)

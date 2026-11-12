@@ -218,6 +218,33 @@ def test_export_files_cleans_backup_before_write():
     print("✓ export_files 写出前清洗嵌套 NaN / NUL")
 
 
+def test_backup_sanitize_strips_escaped_nul_and_dict_keys():
+    """助手 JSON 里的转义 NUL 与字典键中的 NUL 都要清除（导入端整条拒绝）。"""
+    from utils.exporter import sanitize_backup_data
+
+    nul = chr(0)
+    data = _base_data()
+    data["preferences"] = {"hotel" + nul + "brands": "汉庭"}
+    data["chat_history"] = [
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                {"answer": "a" + nul + "b", "_meta": {"k" + nul: 1}},
+                ensure_ascii=False,
+            ),
+        }
+    ]
+    cleaned = sanitize_backup_data(data)
+    assert cleaned["preferences"] == {"hotelbrands": "汉庭"}
+    content = cleaned["chat_history"][0]["content"]
+    assert nul not in content
+    assert "\\u0000" not in content, content
+    parsed = json.loads(content)
+    assert parsed["answer"] == "ab"
+    assert parsed["_meta"] == {"k": 1}
+    print("✓ 备份清洗清除转义 NUL 与字典键")
+
+
 if __name__ == "__main__":
     test_markdown_escapes_cells_and_joins_lists()
     test_markdown_null_fields_and_statistics()
@@ -225,6 +252,7 @@ if __name__ == "__main__":
     test_markdown_chat_body_isolated_in_blockquote()
     test_markdown_strips_terminal_controls_everywhere()
     test_backup_sanitize_nested_nonfinite_and_nul()
+    test_backup_sanitize_strips_escaped_nul_and_dict_keys()
     test_export_files_cleans_backup_before_write()
     test_export_files_json_is_nan_safe_and_md_written()
     print("\n全部通过")
