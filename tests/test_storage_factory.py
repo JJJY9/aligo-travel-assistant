@@ -12,6 +12,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -319,6 +321,80 @@ def test_bad_postgres_falls_back():
     assert isinstance(memory, LongTermMemory)
     assert storage._failed_recently("postgres:postgresql://user:pass@127.0.0.1:1/db")
     print("✓ PostgreSQL 不可用时回退 JSON 并进入冷却")
+
+
+def test_pg_create_single_flight_after_cooldown(monkeypatch):
+    """冷却到期后的并发创建只让一个线程真正连接；其余直接降级。"""
+    dsn = "postgresql://u:p@127.0.0.1:1/single"
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "postgres_dsn", dsn)
+    storage.reset_failure_cache()
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowFail:
+        def __init__(self, *args, **kwargs):
+            calls.append(1)
+            started.set()
+            release.wait(5)
+            raise ConnectionError("db down")
+
+    monkeypatch.setattr(storage, "PostgresLongTermMemory", _SlowFail)
+    results = []
+
+    def worker():
+        try:
+            store = storage.create_long_term_memory(
+                "u-pg-single", tempfile.mkdtemp()
+            )
+            results.append(type(store).__name__)
+        except Exception as exc:  # noqa: BLE001 - 断言错误类型
+            results.append(type(exc).__name__)
+
+    try:
+        leader = threading.Thread(target=worker)
+        leader.start()
+        assert started.wait(3)
+        followers = [threading.Thread(target=worker) for _ in range(6)]
+        for thread in followers:
+            thread.start()
+        time.sleep(0.2)  # 让等待者进入 gate.wait
+        release.set()
+        leader.join(5)
+        for thread in followers:
+            thread.join(5)
+        assert len(calls) == 1, f"只有 leader 应真正连接：{len(calls)}"
+        assert results == ["LongTermMemory"] * 7, results
+        assert storage._failed_recently(f"postgres:{dsn}")
+    finally:
+        release.set()
+        storage.reset_failure_cache()
+    print("✓ PG 冷却到期后的并发创建单飞（失败只连接一次）")
+
+
+def test_strict_pg_failure_reports_json_backend(monkeypatch):
+    """strict 打开失败时健康检查不能继续显示 postgres。"""
+    dsn = "postgresql://u:p@127.0.0.1:1/strict"
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "postgres_dsn", dsn)
+    storage.reset_failure_cache()
+    try:
+        storage._mark_failed(f"postgres:{dsn}")
+        try:
+            storage.create_long_term_memory(
+                "u-pg-strict", tempfile.mkdtemp(), strict=True
+            )
+        except MemoryPersistenceError:
+            pass
+        else:
+            raise AssertionError("冷却期内 strict 打开必须失败")
+        assert storage._ACTUAL_BACKEND.get("long_term") == "json"
+        fallback = storage.create_long_term_memory(
+            "u-pg-strict", tempfile.mkdtemp()
+        )
+        assert isinstance(fallback, LongTermMemory)
+    finally:
+        storage.reset_failure_cache()
+    print("✓ strict PG 失败按实际后端（json）上报")
 
 
 def test_memory_manager_uses_factory():
@@ -3556,6 +3632,12 @@ if __name__ == "__main__":
     test_defaults_use_local_backends()
     test_bad_redis_falls_back()
     test_bad_postgres_falls_back()
+    _mp_pg_single = pytest.MonkeyPatch()
+    try:
+        test_pg_create_single_flight_after_cooldown(_mp_pg_single)
+        test_strict_pg_failure_reports_json_backend(_mp_pg_single)
+    finally:
+        _mp_pg_single.undo()
     test_memory_manager_uses_factory()
     test_long_term_delete_session()
     test_long_term_delete_preference()

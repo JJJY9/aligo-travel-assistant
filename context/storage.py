@@ -66,6 +66,13 @@ _redis_clients: dict[str, Any] = {}
 _redis_creating: dict[str, threading.Event] = {}
 _redis_generation = 0
 _CREATE_WAIT_SEC = 5.0
+# PostgreSQL 创建单飞：失败冷却到期后的第一波并发请求不能各自发起
+# psycopg.connect（connect_timeout=3s）——数据库仍不可用时会把工作线程
+# 整批钉在连接超时上，60 秒边界反复制造连接风暴。leader 失败后其余等待者
+# 直接按降级处理（strict 抛持久化错误），不再逐个重试。
+_pg_lock = threading.Lock()
+_pg_creating: dict[str, threading.Event] = {}
+_PG_CREATE_WAIT_SEC = 5.0
 # 最近一次实际返回的后端（describe_backends 用真实状态而不是仅凭时间戳
 # 推断：冷却过期后、下一次成功创建之前，实际仍在使用回退后端）
 _ACTUAL_BACKEND: dict[str, str] = {}
@@ -203,6 +210,27 @@ def create_long_term_memory(
     """
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
     if dsn and not _failed_recently(f"postgres:{dsn}"):
+        # 冷却到期后的第一波并发只让一个 leader 真正连接；其余等待其
+        # 结果——leader 失败会重新进入冷却，等待者直接降级而不是各自再排
+        # 3 秒连接超时（PG 仍不可用时的连接风暴）
+        with _pg_lock:
+            existing = _pg_creating.get(dsn)
+            if existing is None:
+                leader = True
+                gate = threading.Event()
+                _pg_creating[dsn] = gate
+            else:
+                leader = False
+                gate = existing
+        if not leader:
+            gate.wait(_PG_CREATE_WAIT_SEC)
+            if _failed_recently(f"postgres:{dsn}"):
+                _ACTUAL_BACKEND["long_term"] = "json"
+                if strict:
+                    raise MemoryPersistenceError(
+                        "PostgreSQL 处于故障冷却期，操作暂不可用，请稍后再试"
+                    )
+                return LongTermMemory(user_id, storage_path)
         try:
             memory = PostgresLongTermMemory(user_id, dsn)
             _ACTUAL_BACKEND["long_term"] = "postgres"
@@ -215,10 +243,19 @@ def create_long_term_memory(
                 redact_secret(exc),
             )
             if strict:
+                _ACTUAL_BACKEND["long_term"] = "json"
                 raise MemoryPersistenceError(
                     f"PostgreSQL 不可用：{redact_secret(exc)}"
                 ) from exc
+        finally:
+            if leader:
+                with _pg_lock:
+                    _pg_creating.pop(dsn, None)
+                gate.set()
     elif dsn and strict:
+        # 健康检查 / 指标按真实后端上报：冷却期内即使只有 strict 请求，
+        # 也不能继续显示 postgres（此前 _ACTUAL_BACKEND 停留旧值）
+        _ACTUAL_BACKEND["long_term"] = "json"
         raise MemoryPersistenceError(
             "PostgreSQL 处于故障冷却期，删除操作暂不可用，请稍后再试"
         )
