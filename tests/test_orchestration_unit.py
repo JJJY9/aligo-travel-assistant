@@ -2067,6 +2067,270 @@ def test_run_agent_reraised_llm_errors_feed_breaker():
     print("✓ 子智能体 LLM 错误上抛（可重试 / 4xx），普通错误仍按结果降级")
 
 
+def test_parallel_batch_reraises_llm_errors():
+    """并行批次不能把 LLM 错误重新吞成 status=error（熔断 / 重试不可达）。"""
+
+    class _ConnBoom(_StubAgent):
+        async def reply(self, x):
+            raise ConnectionError("upstream 503")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "preference": _ConnBoom("preference"),
+            "event_collection": _ConnBoom("event_collection"),
+        }
+    )
+    schedule = [
+        {"agent_name": "preference", "priority": 1},
+        {"agent_name": "event_collection", "priority": 1},
+    ]
+    try:
+        asyncio.run(orchestrator.reply(_intent(schedule)))
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("并行批次的 LLM 错误被吞成 partial_failure")
+    print("✓ 并行批次的 LLM 错误整批上抛（熔断器可记账）")
+
+
+def test_parallel_batch_non_llm_errors_stay_redacted():
+    """并行批次的普通异常仍聚合为结果，但错误文本先脱敏。"""
+
+    class _PathBoom(_StubAgent):
+        async def reply(self, x):
+            raise ValueError(r"failed at C:\Users\alice\secret\file")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "preference": _PathBoom("preference"),
+            "event_collection": _StubAgent("event_collection", {"ok": True}),
+        }
+    )
+    schedule = [
+        {"agent_name": "preference", "priority": 1},
+        {"agent_name": "event_collection", "priority": 1},
+    ]
+    out = asyncio.run(orchestrator.reply(_intent(schedule)))
+    assert "alice" not in out.content, out.content
+    assert "<路径>" in out.content, out.content
+    print("✓ 并行批次普通异常聚合但脱敏")
+
+
+def test_reply_clears_stale_deferred_memory():
+    """空调度轮次不能提交上一失败回合遗留的暂存负载。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._deferred_memory = (
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {"type": "hotel_brands", "value": "汉庭"}
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    out = asyncio.run(orchestrator.reply(_intent([])))
+    assert "no_agents" in out.content
+    assert orchestrator._deferred_memory is None
+    assert asyncio.run(orchestrator.commit_deferred_memory()) is False
+    assert "hotel_brands" not in memory.long_term.get_preference()
+    print("✓ 空调度轮次清空上一回合的暂存负载")
+
+
+def test_commit_deferred_memory_single_flight():
+    """并发提交等待同一个写入任务（后到者不能立即返回 False）。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    calls: list[int] = []
+
+    def slow_update(intention, results):
+        calls.append(1)
+        time.sleep(0.2)
+
+    orchestrator._update_memory = slow_update  # type: ignore[method-assign]
+    orchestrator._deferred_memory = ({}, [])
+
+    async def run():
+        return await asyncio.gather(
+            orchestrator.commit_deferred_memory(),
+            orchestrator.commit_deferred_memory(),
+        )
+
+    results = asyncio.run(run())
+    assert calls == [1], calls
+    assert results == [True, True]
+    print("✓ 延迟记忆提交单飞（并发调用等待同一写入）")
+
+
+def test_update_memory_key_entities_date_duration_fallback():
+    """意图 key_entities 的 date / duration 别名能兜底落库行程。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "origin": None,
+                    "destination": None,
+                    "start_date": None,
+                    "end_date": None,
+                    "trip_purpose": None,
+                },
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "result": {
+                "status": "success",
+                "data": {"itinerary": {"title": "trip"}},
+            },
+        },
+    ]
+    intention = {
+        "key_entities": {
+            "origin": "北京",
+            "destination": "杭州",
+            "date": "2026-03-11",
+            "duration": "3天",
+        }
+    }
+    orchestrator._update_memory(intention, results)
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert trips[0]["destination"] == "杭州"
+    assert trips[0]["start_date"] == "2026-03-11"
+    assert trips[0]["end_date"] == "2026-03-13", trips
+    print("✓ key_entities 的 date / duration 别名兜底落库")
+
+
+def test_update_memory_rejects_inverted_and_placeholder_dates():
+    """倒置返程与 9999-12-31 占位日期不能写进台账。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+    def plan(event_data):
+        return [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {"status": "success", "data": event_data},
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "trip"}},
+                },
+            },
+        ]
+
+    orchestrator._update_memory(
+        {},
+        plan(
+            {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-03-11",
+                "end_date": "2026-03-01",
+            }
+        ),
+    )
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert not trips[0].get("end_date"), "倒置返程应按未知处理"
+
+    orchestrator._update_memory(
+        {},
+        plan(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-03-20",
+                "end_date": "9999-12-31",
+            }
+        ),
+    )
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 2, "占位返程应按未知处理，行程照常落库"
+    placeholder_trip = next(
+        trip for trip in trips if trip["destination"] == "上海"
+    )
+    assert placeholder_trip["start_date"] == "2026-03-20"
+    assert not placeholder_trip.get("end_date"), "9999-12-31 占位返程不能落库"
+    print("✓ 倒置 / 占位日期不写入台账")
+
+
+def test_update_memory_backfills_origin_on_existing_trip():
+    """后续轮次补出发地时补齐旧行程，而不是插入第二条同趟行程。"""
+    memory = _StubMemory()
+    memory.long_term.save_trip_history(
+        {
+            "origin": "",
+            "destination": "杭州",
+            "start_date": "2026-03-11",
+            "end_date": "2026-03-12",
+        }
+    )
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-03-11",
+                    "end_date": "2026-03-12",
+                },
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "result": {
+                "status": "success",
+                "data": {"itinerary": {"title": "trip"}},
+            },
+        },
+    ]
+    orchestrator._update_memory({}, results)
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, f"补出发地不应新增行程：{trips}"
+    assert trips[0]["origin"] == "北京"
+    print("✓ 后续补出发地时补齐旧行程（不重复建档）")
+
+
+def test_agent_load_executors_are_daemon_and_unregistered():
+    """技能加载执行器为 daemon 且不登记 atexit join（停服不被冷加载拖住）。"""
+    from concurrent.futures.thread import _threads_queues
+
+    from agents import orchestration_agent as module
+
+    for executor in (module._AGENT_LOAD_EXECUTOR, module._RAG_LOAD_EXECUTOR):
+        assert executor.submit(lambda: 1).result(timeout=5) == 1
+        threads = list(executor._threads)
+        assert threads and all(thread.daemon for thread in threads)
+        assert all(thread not in _threads_queues for thread in threads), (
+            "登记到 _threads_queues 会让 atexit 对加载线程逐个 join"
+        )
+    print("✓ 技能加载执行器线程为 daemon 且不参与 atexit join")
+
+
 def test_dict_registry_resolves_name_variants():
     """纯 dict 注册表存标准名时，模型输出的别名 / 大小写变体也能调度。"""
     agent = _StubAgent("itinerary_planning", {"itinerary": {"title": "T"}})
@@ -2547,6 +2811,14 @@ if __name__ == "__main__":
     test_agent_duration_and_progress_events()
     test_unregistered_agent_reports_error()
     test_run_agent_reraised_llm_errors_feed_breaker()
+    test_parallel_batch_reraises_llm_errors()
+    test_parallel_batch_non_llm_errors_stay_redacted()
+    test_reply_clears_stale_deferred_memory()
+    test_commit_deferred_memory_single_flight()
+    test_update_memory_key_entities_date_duration_fallback()
+    test_update_memory_rejects_inverted_and_placeholder_dates()
+    test_update_memory_backfills_origin_on_existing_trip()
+    test_agent_load_executors_are_daemon_and_unregistered()
     test_agent_status_error_and_null_error()
     test_nested_query_failure_is_reported_as_error()
     test_transient_nested_error_triggers_retry()
