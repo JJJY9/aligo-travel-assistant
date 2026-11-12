@@ -2046,6 +2046,36 @@ def _storage_failure(action: str, exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=f"{action}，请稍后再试")
 
 
+_COLLECTION_MISSING_MARKERS = (
+    "collection not found",
+    "can't find collection",
+    "collection doesn't exist",
+    "collection not exist",
+)
+
+
+def _knowledge_unavailable(action: str, exc: Exception) -> HTTPException:
+    """知识库失败的 503：半初始化（库文件在但集合缺失）给出可操作提示。
+
+    Milvus Lite 在「库文件存在、集合尚未建出」时抛的异常文本各不相同
+    （不同版本为 collection not found / can't find collection 等）：
+    管理接口此前统一吞成「知识库暂不可用」，与 /api/knowledge、doctor
+    的「集合不存在 / 请重新初始化」口径矛盾。这里按关键词识别并返回
+    与其它入口一致的结论，其余异常仍走统一 503（细节只进日志）。
+    """
+    lowered = str(exc).lower()
+    if any(marker in lowered for marker in _COLLECTION_MISSING_MARKERS):
+        logger.warning("%s失败（集合缺失）: %s", action, redact_paths(exc))
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "知识库集合不存在（库文件存在但未建集合），请重新运行初始化脚本："
+                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+            ),
+        )
+    return _storage_failure(action, exc)
+
+
 def _close_long_term(store: Any) -> None:
     close = getattr(store, "close", None)
     if callable(close):
@@ -2993,7 +3023,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503，避免泄露内部堆栈
             logger.warning("列出知识片段失败: %s", exc)
-            raise _storage_failure("知识库暂不可用", exc) from exc
+            raise _knowledge_unavailable("知识库暂不可用", exc) from exc
 
     @app.get("/api/knowledge/categories", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_categories(request: Request, response: Response) -> dict[str, Any]:
@@ -3008,7 +3038,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503
             logger.warning("统计知识分类失败: %s", exc)
-            raise _storage_failure("知识库暂不可用", exc) from exc
+            raise _knowledge_unavailable("知识库暂不可用", exc) from exc
 
     @app.get("/api/knowledge/search")
     def knowledge_search(
@@ -3033,7 +3063,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
             logger.warning("语义检索知识片段失败: %s", exc)
-            raise _storage_failure("检索失败", exc) from exc
+            raise _knowledge_unavailable("检索失败", exc) from exc
         return {"query": query, "results": results}
 
     @app.get("/api/knowledge/eval")
@@ -3132,7 +3162,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取重复知识片段失败: %s", exc)
-            raise _storage_failure("读取失败", exc) from exc
+            raise _knowledge_unavailable("读取失败", exc) from exc
         shown = groups if limit <= 0 else groups[:limit]
         return {
             "total_groups": len(groups),
@@ -3169,7 +3199,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 读取 / 删除失败统一提示
             logger.warning("清理重复知识片段失败: %s", exc)
-            raise _storage_failure("清理失败", exc) from exc
+            raise _knowledge_unavailable("清理失败", exc) from exc
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
@@ -3188,7 +3218,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("添加知识片段失败: %s", exc)
-            raise _storage_failure("添加失败", exc) from exc
+            raise _knowledge_unavailable("添加失败", exc) from exc
 
     @app.put("/api/knowledge/documents/{doc_id}")
     def knowledge_update(
@@ -3221,7 +3251,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("更新知识片段失败: %s", exc)
-            raise _storage_failure("更新失败", exc) from exc
+            raise _knowledge_unavailable("更新失败", exc) from exc
 
     @app.get("/api/knowledge/documents/{doc_id}/group", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_document_group(
@@ -3237,7 +3267,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取整组知识文档失败: %s", exc)
-            raise _storage_failure("读取失败", exc) from exc
+            raise _knowledge_unavailable("读取失败", exc) from exc
         if result is None:
             raise HTTPException(status_code=404, detail="知识片段不存在")
         return result
@@ -3260,7 +3290,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
             logger.warning("删除知识片段失败: %s", exc)
-            raise _storage_failure("删除失败", exc) from exc
+            raise _knowledge_unavailable("删除失败", exc) from exc
         if not removed:
             raise HTTPException(status_code=404, detail="知识片段不存在")
         return {
@@ -3282,7 +3312,7 @@ def create_app(model: Any = None) -> FastAPI:
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
             logger.warning("导出知识片段失败: %s", exc)
-            raise _storage_failure("导出失败", exc) from exc
+            raise _knowledge_unavailable("导出失败", exc) from exc
         payload = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
