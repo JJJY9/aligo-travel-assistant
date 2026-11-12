@@ -19,11 +19,52 @@ from utils.json_parser import (
     extract_json_from_async_response,
     first_json_array_with_keys,
     first_json_object_with_keys,
-    json_array_start,
     last_json_object_with_keys_strict,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _last_preference_array(text: str) -> tuple[int, list[dict]] | None:
+    """文本中最后一个「元素形如偏好」的完整 JSON 数组（起始下标 + 元素）。
+
+    ``json_array_start`` 的散文判定（数组前出现对象即视为前言）不适用于
+    「先回显示例对象、再输出正式裸数组」：这里直接扫描所有能整体解析的
+    数组，取最后一个元素含 type / value 的，由调用方与对象候选比较位置。
+    """
+    decoder = json.JSONDecoder()
+    best: tuple[int, list[dict]] | None = None
+    index = text.find("[")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("[", index + 1)
+            continue
+        if isinstance(value, list) and value:
+            items = [item for item in value if isinstance(item, dict)]
+            if items and any(
+                "type" in item or "value" in item for item in items
+            ):
+                best = (index, items)
+        index = text.find("[", max(end, index + 1))
+    return best
+
+
+def _as_preference_result(obj: object) -> dict | None:
+    """取出结果对象；兼容 ``{"data": {preferences...}}`` 包装。"""
+    if not isinstance(obj, dict):
+        return None
+    data = obj.get("data")
+    candidate = (
+        data
+        if isinstance(data, dict)
+        and ("preferences" in data or "has_preferences" in data)
+        else obj
+    )
+    if "preferences" in candidate or "has_preferences" in candidate:
+        return candidate
+    return None
 
 
 class PreferenceAgent(AgentBase):
@@ -121,54 +162,56 @@ class PreferenceAgent(AgentBase):
             text = text.removesuffix('```')
             text = text.strip()
 
-            # 模型可能先复述【当前已保存的偏好】或输出示例再给正式结果：
-            # 优先取最后一个形如结果（has_preferences / preferences）的
-            # 顶层对象，避免把回显的示例值写进长期记忆
-            array_start = json_array_start(text)
-            if array_start is not None:
-                # 裸数组（省略 {"preferences": [...]} 包裹）：直接交给
-                # robust_first_json_object 会把数组截成第一个元素、当成
-                # 成功但没有 preferences 键——偏好静默丢失且无错误提示。
-                # 这里按数组载荷包装，元素形状交给落库侧校验。
-                # 下标必须用 json_array_start 返回的「能整体解析的数组」
-                # 位置：前言里的 [注] / [1] 不能作为 raw_decode 起点
-                decoded, _ = json.JSONDecoder().raw_decode(text[array_start:])
-                items = [item for item in decoded if isinstance(item, dict)]
-                result = {
-                    "preferences": items,
-                    "has_preferences": bool(items),
-                }
-            else:
-                result = last_json_object_with_keys_strict(
-                    text, ("has_preferences", "preferences")
+            # 模型可能先复述示例对象 / 输出示例再给正式结果：优先取
+            # 「位置在示例之后」的正式结果——裸数组和结果对象两种形状
+            # 都可能出现，分别取各自最后一个候选再比较先后
+            result = None
+            array_candidate = _last_preference_array(text)
+            if array_candidate is not None:
+                start, items = array_candidate
+                # 示例对象里的 preferences 数组同样满足形状：只有它排在
+                # 所有含结果键的对象之后时才当作正式裸数组
+                object_hint = max(
+                    text.rfind('"has_preferences"'),
+                    text.rfind('"preferences"'),
                 )
-                if result is None:
-                    # 没有任何含结果键的完整对象：退到第一个含结果键的对象
-                    # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
-                    # 对象」——prompt 回显的示例通常排在最前，正式结果被
-                    # max_tokens 截断时会把示例偏好当成真实结果写库
-                    # （截断场景 strict 版本已提前抛错）。
-                    result = first_json_object_with_keys(
-                        text, ("has_preferences", "preferences")
+                if object_hint == -1 or start > object_hint:
+                    result = {
+                        "preferences": items,
+                        "has_preferences": bool(items),
+                    }
+            if result is None:
+                result = _as_preference_result(
+                    last_json_object_with_keys_strict(
+                        text, ("has_preferences", "preferences", "data")
                     )
-                if result is None:
-                    # 前言带引用标记（参考[1]）时 starts 判定失败、对象扫描
-                    # 也找不到结果键：最后尝试「元素含 type/value 的数组」
-                    bare_items = first_json_array_with_keys(
-                        text, ("type", "value")
+                )
+            if result is None:
+                # 没有任何含结果键的完整对象：退到第一个含结果键的对象
+                # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
+                # 对象」——prompt 回显的示例通常排在最前，正式结果被
+                # max_tokens 截断时会把示例偏好当成真实结果写库
+                result = _as_preference_result(
+                    first_json_object_with_keys(
+                        text, ("has_preferences", "preferences", "data")
                     )
-                    if bare_items:
-                        items = [
-                            item
-                            for item in bare_items
-                            if isinstance(item, dict)
-                        ]
-                        result = {
-                            "preferences": items,
-                            "has_preferences": bool(items),
-                        }
-                if result is None:
-                    raise ValueError("模型输出中没有可解析的偏好结果对象")
+                )
+            if result is None:
+                # 前言带引用标记（参考[1]）时 starts 判定失败、对象扫描
+                # 也找不到结果键：最后尝试「元素含 type/value 的数组」
+                bare_items = first_json_array_with_keys(
+                    text, ("type", "value")
+                )
+                if bare_items:
+                    items = [
+                        item for item in bare_items if isinstance(item, dict)
+                    ]
+                    result = {
+                        "preferences": items,
+                        "has_preferences": bool(items),
+                    }
+            if result is None:
+                raise ValueError("模型输出中没有可解析的偏好结果对象")
         except Exception as e:
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}

@@ -45,6 +45,25 @@ from utils.preference_values import (
 
 logger = logging.getLogger(__name__)
 
+# 旧版字典格式偏好里的说明性键：模型附带 note/message 等时不能被当成
+# 偏好类型落库（会污染面板与后续批次的上下文）
+_PREF_EXPLANATORY_KEYS = frozenset(
+    {
+        "has_preferences",
+        "error",
+        "note",
+        "notes",
+        "message",
+        "reason",
+        "reasoning",
+        "summary",
+        "explanation",
+        "confidence",
+        "status",
+        "action",
+    }
+)
+
 # 单个子智能体的执行上限与瞬时错误重试：防止一个卡住的智能体让整轮对话
 # （以及该用户的会话锁）无限等待；重试只针对可重试的 LLM / 网络错误
 _AGENT_TIMEOUT_SEC = 300.0
@@ -1204,7 +1223,7 @@ class OrchestrationAgent(AgentBase):
                     for pref_type, value in preferences_data.items():
                         if (
                             has_preference_value(value)
-                            and pref_type not in {"has_preferences", "error"}
+                            and pref_type not in _PREF_EXPLANATORY_KEYS
                             and is_manageable_pref_type(pref_type)
                         ):
                             try:

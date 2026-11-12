@@ -318,6 +318,14 @@ class InformationQueryAgent(AgentBase):
                 destination = _destination_city(hop[1])
                 if destination:
                     return destination
+            else:
+                # 「从北京出发，杭州天气」：没有去/到/飞连接词时，出发地
+                # 之后的部分仍是目的地一侧；按最早出现的城市会答成出发地
+                departed = re.split(r"出发|启程", route[1], maxsplit=1)
+                if len(departed) == 2:
+                    destination = _destination_city(departed[1])
+                    if destination:
+                        return destination
         else:
             # 「北京到上海的天气」：只有前半段确实是城市时才按目的地解释，
             # 避免「去哪里玩天气」之类的问句被截出假城市。裸「飞」也算
