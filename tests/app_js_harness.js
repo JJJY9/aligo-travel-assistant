@@ -1462,6 +1462,11 @@ async function scenarioSearchJump(source) {
       };
     })()`);
   const initial = snapshot();
+  // 静默重载（备份恢复后）：必须保持命中窗口的上下界，不能渲染到结尾
+  const silentReload = run('openSession("s1", { silent: true })');
+  (await waitRequest(env)).resolve({ messages });
+  await silentReload;
+  const silentSnapshot = snapshot();
   const clickLater = () =>
     run(`(() => {
       const button = els.messages.children.find(
@@ -1475,7 +1480,7 @@ async function scenarioSearchJump(source) {
   const afterSecond = snapshot();
   clickLater();
   const afterThird = snapshot();
-  return { initial, afterFirst, afterSecond, afterThird };
+  return { initial, silent: silentSnapshot, afterFirst, afterSecond, afterThird };
 }
 
 async function scenarioSessionSearchFailure(source) {

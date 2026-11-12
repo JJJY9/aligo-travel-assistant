@@ -274,6 +274,11 @@ def test_block_start_line_cannot_close_code_span():
         "x` <img src=x onerror=alert(1)>\n***\nb` c",
         "x` <img src=x onerror=alert(1)>\n___\nb` c",
         "x` <img src=x onerror=alert(1)>\n- - -\nb` c",
+        # GFM 表格块（表头 + 分隔行）同样结束段落：数据行 / 表头行的反引号
+        # 不能关闭上一行代码段，表头里的原始 HTML 必须转义
+        "| a` <img src=x onerror=alert(1)> |\n| --- |\n| b` |",
+        "x` <img src=x onerror=alert(1)>\n| a |\n| --- |\nb` c",
+        "x` <img src=x onerror=alert(1)>\n| a | b` |\n| --- |\n| c |",
     ]
     for payload in payloads:
         text = sanitize_body(payload)

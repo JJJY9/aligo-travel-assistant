@@ -153,6 +153,11 @@ def test_search_hit_renders_bounded_window():
     assert initial["partial"] is True, initial
     assert initial["earlierText"] == "", "命中在开头时不应出现更早消息按钮"
     assert initial["laterText"].startswith("显示更新消息"), initial
+    # 静默重载（备份恢复后）保持同一窗口：不能恢复起点却渲染到结尾
+    silent = data["silent"]
+    assert silent["count"] == 200, silent
+    assert silent["partial"] is True, silent
+    assert silent["renderedStart"] == 0, silent
     first = data["afterFirst"]
     assert first["count"] == 400, first
     assert first["partial"] is True, first

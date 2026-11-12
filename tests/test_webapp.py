@@ -581,6 +581,9 @@ def test_reserved_device_user_id_rejected():
     for user_id in ("NUL", "nul", "CON", "com1", "LPT9"):
         response = client.get("/api/status", params={"user_id": user_id})
         assert response.status_code == 422, (user_id, response.text)
+    # 对话入口经 ConversationRuntime 直接创建长期记忆：同样必须拒绝
+    chat = client.post("/api/chat", json={"message": "你好", "user_id": "NUL"})
+    assert chat.status_code == 422, chat.text
     # 普通名字不受影响（含保留名前缀但不是保留名）
     accepted = ["console", "con-1", "com10", "nul_2"]
     try:
@@ -4095,13 +4098,20 @@ def test_trip_calendar_storage_failure_maps_503(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
-    )
+    seen_strict = {"value": None}
+
+    def _open(user_id, strict=False):
+        seen_strict["value"] = strict
+        return _BrokenStore()
+
+    monkeypatch.setattr(server_module, "_open_long_term", _open)
     client = _client()
     for path in ("/api/trips/calendar", "/api/trips/trip_1/calendar"):
         response = client.get(path, params={"user_id": "u-ics"})
         assert response.status_code == 503, path
+    assert seen_strict["value"] is True, (
+        "日历导出必须以 strict 打开：PG 故障期不能返回回退 JSON 的空日历"
+    )
     print("✓ 行程日历导出存储失败 → 503")
 
 
