@@ -10,6 +10,7 @@
 到已存在的会话时旧消息追加在当前转录末尾（存储层按追加顺序保存）。
 """
 import json
+import logging
 import math
 import re
 from collections import Counter
@@ -20,6 +21,8 @@ from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
 import os
+
+logger = logging.getLogger(__name__)
 
 _MAX_PREFERENCES = 200
 _MAX_TRIPS = 5000
@@ -803,6 +806,12 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# drop_sessions 在行程行上留下的内部标记（写库前由
+# _resolve_dropped_trip_links 消费）：是否清除关联取决于目标库既有行程
+# 实际指向的会话，标记本身绝不落库
+_DROPPED_SESSION_KEY = "_dropped_session_id"
+
+
 def drop_sessions(sections: dict[str, Any], session_ids: set[str]) -> None:
     """从备份 sections 中剔除给定会话（原位修改）。
 
@@ -833,8 +842,43 @@ def drop_sessions(sections: dict[str, Any], session_ids: set[str]) -> None:
         if session_id not in session_ids
     ]
     for trip in sections.get("trips") or []:
-        if trip.get("session_id") in session_ids:
-            trip["session_id"] = None
+        session_id = trip.get("session_id")
+        if session_id in session_ids:
+            # 不能直接置 None：目标库里同一行程（同路线 + 同起止日期）可能
+            # 关联着另一条仍存活的会话，无差别清除会把活链接清掉。这里只
+            # 记下被丢弃的会话，写库前再按目标库的实际关联决定（见
+            # _resolve_dropped_trip_links）。
+            trip.pop("session_id", None)
+            trip[_DROPPED_SESSION_KEY] = str(session_id)
+
+
+def _resolve_dropped_trip_links(store: Any, trips: list[dict[str, Any]]) -> None:
+    """把 drop_sessions 的行程关联标记落实为写库语义（原位修改）。
+
+    - 目标库既有同一行程且其 ``session_id`` 正是被丢弃的会话：显式置 None
+      （``save_trip_histories`` 对「键存在」按清除关联处理）；
+    - 否则去掉标记、保持「键缺失」：存储层保留既有链接（可能是另一条存活
+      会话），新建行程也不会产生指向已删除会话的链接。
+
+    读取既有行程失败时按「保留既有链接」保守处理（宁可留一条死链，也不
+    误清存活会话的关联）。标记本身绝不会进入存储。
+    """
+    marked = [row for row in trips if _DROPPED_SESSION_KEY in row]
+    if not marked:
+        return
+    try:
+        history = list(store.get_trip_history(limit=None) or [])
+    except Exception as exc:  # noqa: BLE001 - 读不到既有行程时保守保留链接
+        logger.warning("读取既有行程失败，跳过关联清理判定：%s", exc)
+        history = []
+    existing: dict[Any, dict[str, Any]] = {}
+    for trip in history:
+        existing.setdefault(trip_identity(trip), trip)
+    for row in marked:
+        dropped = str(row.pop(_DROPPED_SESSION_KEY) or "")
+        match = existing.get(trip_identity(row))
+        if match is not None and str(match.get("session_id") or "") == dropped:
+            row["session_id"] = None
 
 
 def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
@@ -894,6 +938,9 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         result["preferences"] += 1
     trips = sections.get("trips", [])
     if trips:
+        # 被删除 / 保留字会话的行程关联：只清除目标库确实指向该会话的记录，
+        # 另一条存活会话的既有链接必须保留（见 _resolve_dropped_trip_links）
+        _resolve_dropped_trip_links(store, trips)
         # 批量保存：JSON 后端一次重载 + 一次原子写回（逐条写是 O(n²)，
         # 几千条行程会把恢复拖成分钟级）
         created, updated = store.save_trip_histories(trips)

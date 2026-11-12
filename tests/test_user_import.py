@@ -1381,6 +1381,66 @@ def test_parse_rejects_content_deeper_than_export_saves():
     print("✓ 深于导出截断点的内容在导入时拒绝，已导出的 null 结尾备份仍可恢复")
 
 
+def test_drop_sessions_only_clears_matching_trip_links():
+    """被丢弃会话的行程关联只清真正指向它的记录，不误清存活会话的链接。"""
+    from utils.user_import import drop_sessions
+
+    backup_trip = {
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-03",
+        "purpose": "会议",
+        "session_id": "s-dead",
+    }
+
+    # 目标库同一行程关联着另一条存活会话：恢复不能把活链接清掉
+    store = LongTermMemory("u-trip-live", tempfile.mkdtemp())
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "会议",
+            "session_id": "s-live",
+        }
+    )
+    payload = {
+        "trip_history": [backup_trip],
+        "chat_history": [{"role": "user", "content": "hi", "session_id": "s-dead"}],
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    drop_sessions(sections, {"s-dead"})
+    counts = import_user_data(store, sections)
+    assert counts["trips_updated"] == 1, counts
+    trips = store.get_trip_history(limit=None)
+    assert trips[0]["session_id"] == "s-live", "存活会话的既有链接不能被清掉"
+    assert all("_dropped_session_id" not in trip for trip in trips), trips
+
+    # 目标库同一行程链接的正是被丢弃的会话：清除死链
+    store = LongTermMemory("u-trip-dead", tempfile.mkdtemp())
+    store.save_trip_history(dict(backup_trip))
+    payload = {"trip_history": [dict(backup_trip)]}
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    drop_sessions(sections, {"s-dead"})
+    import_user_data(store, sections)
+    trips = store.get_trip_history(limit=None)
+    assert trips[0].get("session_id") is None, "死链应被清除"
+    assert "_dropped_session_id" not in trips[0]
+
+    # 新建行程（目标库没有同路线记录）：不产生指向已删除会话的链接
+    store = LongTermMemory("u-trip-new", tempfile.mkdtemp())
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    drop_sessions(sections, {"s-dead"})
+    counts = import_user_data(store, sections)
+    assert counts["trips_created"] == 1, counts
+    trips = store.get_trip_history(limit=None)
+    assert "session_id" not in trips[0], trips
+    assert "_dropped_session_id" not in trips[0]
+    print("✓ 丢弃会话只清真正命中的行程关联（活链接保留）")
+
+
 def test_runner_skips_reserved_and_deleted_sessions(monkeypatch):
     """CLI user-import 与 Web 同一口径：保留字 / 墓碑期会话不能被恢复写回。"""
     from utils import tombstones
@@ -1860,6 +1920,7 @@ if __name__ == "__main__":
     test_import_duplicate_message_counts()
     test_parse_rejects_deeply_nested_preference_value()
     test_parse_rejects_content_deeper_than_export_saves()
+    test_drop_sessions_only_clears_matching_trip_links()
     test_parse_rejects_huge_integer_literal_content()
     test_parse_survives_extreme_timestamp()
     test_parse_rejects_non_finite_preference_values()
