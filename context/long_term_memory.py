@@ -483,10 +483,6 @@ class LongTermMemory:
             if fixed_prefs != data["preferences"]:
                 data["preferences"] = fixed_prefs
 
-        if destructive:
-            # 以上是破坏性修正：写回磁盘前保留原始文件副本，丢弃的数据可追溯
-            self._backup_before_migration()
-
         # 迁移结果在下次写入时落盘：读取路径不再无条件重写文件，
         # 避免搜索/状态等只读请求与对话写入互相覆盖。
         # 同一 type 的重复偏好（旧迁移 bug 产物）：存储写路径只更新第一条、
@@ -505,6 +501,11 @@ class LongTermMemory:
                 )
                 data["preferences"] = list(by_type.values())
                 destructive = True
+
+        if destructive:
+            # 所有破坏性修正（含最后的偏好去重）都完成后才备份：此前在
+            # 去重之前就备份，唯一破坏性修正是去重时不会生成 .migrate-backup
+            self._backup_before_migration()
 
         return data
 

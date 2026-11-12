@@ -3543,6 +3543,9 @@ def test_migrate_dedupes_preference_types():
     prefs = memory.get_preference()
     assert prefs["home_location"] == "B", prefs
     assert prefs["airlines"] == "东航", prefs
+    backup = Path(f"{path}.migrate-backup")
+    assert backup.exists(), "偏好去重是破坏性修正：写回前必须备份原始文件"
+    assert backup.read_text(encoding="utf-8").count("home_location") == 2
     # 写路径也只保留一份：覆盖后字典里仍只有一条同类型
     memory.save_preference("home_location", "C")
     assert memory.get_preference()["home_location"] == "C"
