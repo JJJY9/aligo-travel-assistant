@@ -46,6 +46,17 @@ def _session_id_matches(message: dict[str, Any], session_id: str) -> bool:
     value = message.get("session_id")
     return value is not None and str(value) == session_id
 
+
+def _session_dedupe_key(value: object) -> str | None:
+    """批量恢复的消息去重键：与 :func:`_session_id_matches` 同口径。
+
+    旧数据里 session_id 可能是整数（如 123），导出经 user_import 解析后
+    会字符串化（"123"）：两边不归一化会让同一会话的每条消息在恢复备份时
+    重复插入（「重复导入幂等」失效、total_messages 翻倍），与 PostgreSQL
+    （TEXT 列）行为分叉。
+    """
+    return None if value is None else str(value)
+
 # 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
 # MemoryManager 还会重建实例），按路径共享一把进程内可重入锁，避免并发
 # 读改写互相覆盖。弱引用：实例释放后锁自动移除，不随用户数无限增长。
@@ -736,7 +747,7 @@ class LongTermMemory:
         if dedupe:
             existing = Counter(
                 (
-                    item.get("session_id"),
+                    _session_dedupe_key(item.get("session_id")),
                     item.get("role"),
                     str(item.get("content") or ""),
                 )
@@ -749,7 +760,7 @@ class LongTermMemory:
                 continue
             content = str(message.get("content") or "")
             if existing is not None:
-                key = (message.get("session_id"), role, content)
+                key = (_session_dedupe_key(message.get("session_id")), role, content)
                 if existing[key] > 0:
                     existing[key] -= 1
                     continue
@@ -1109,9 +1120,10 @@ class LongTermMemory:
         # 更新统计信息
         self.data["statistics"]["total_trips"] += 1
 
-        # 更新常去目的地统计
+        # 更新常去目的地统计：与批量保存 / 删除 / 迁移重建同口径，
+        # 出发日期不可解析的行程（备份保真保留的旧格式）不计数
         destination = trip_info.get("destination")
-        if destination:
+        if destination and _trip_date_is_valid(trip_info.get("start_date")):
             freq = self.data["statistics"]["frequent_destinations"]
             freq[destination] = freq.get(destination, 0) + 1
         return str(trip_record["trip_id"]), True
@@ -1382,19 +1394,28 @@ class LongTermMemory:
                 raise ValueError("已存在相同行程（同路线 + 同起止日期）")
 
             old_destination = trip.get("destination")
+            old_start = trip.get("start_date")
             for key in ("origin", "destination", "start_date", "end_date", "purpose"):
                 if key in fields:
                     trip[key] = fields[key]
             new_destination = trip.get("destination")
-            if old_destination != new_destination:
+            new_start = trip.get("start_date")
+            # 常去目的地按「出发日期可解析」计数（与批量保存 / 删除 / 迁移
+            # 重建及 PostgreSQL 同口径）：只有贡献状态发生变化的行程才调整，
+            # 脏日期行程既不能扣掉合法城市的计数、也不能被虚增
+            old_contributes = bool(old_destination) and _trip_date_is_valid(old_start)
+            new_contributes = bool(new_destination) and _trip_date_is_valid(new_start)
+            if old_destination != new_destination or old_contributes != new_contributes:
                 stats = self.data.setdefault("statistics", {})
                 frequent = stats.setdefault("frequent_destinations", {})
-                if old_destination and old_destination in frequent:
+                if old_contributes and old_destination in frequent:
                     frequent[old_destination] = int(frequent[old_destination]) - 1
                     if frequent[old_destination] <= 0:
                         del frequent[old_destination]
-                if new_destination:
-                    frequent[new_destination] = int(frequent.get(new_destination, 0)) + 1
+                if new_contributes:
+                    frequent[new_destination] = int(
+                        frequent.get(new_destination, 0)
+                    ) + 1
             self._persist()
             logger.info("Updated trip history: %s", trip_id)
             return True
