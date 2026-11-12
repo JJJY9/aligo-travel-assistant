@@ -2331,6 +2331,37 @@ def test_agent_load_executors_are_daemon_and_unregistered():
     print("✓ 技能加载执行器线程为 daemon 且不参与 atexit join")
 
 
+def test_update_memory_legacy_dict_skips_explanatory_keys():
+    """旧字典格式偏好：note / message 等说明键不能当偏好类型落库。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": {
+                            "hotel_brands": "汉庭",
+                            "note": "已记录",
+                            "message": "ok",
+                            "has_preferences": True,
+                        }
+                    },
+                },
+            }
+        ],
+    )
+    preferences = memory.long_term.get_preference()
+    assert preferences.get("hotel_brands") == "汉庭", preferences
+    for key in ("note", "message", "has_preferences"):
+        assert key not in preferences, preferences
+    print("✓ 旧字典偏好跳过说明键")
+
+
 def test_dict_registry_resolves_name_variants():
     """纯 dict 注册表存标准名时，模型输出的别名 / 大小写变体也能调度。"""
     agent = _StubAgent("itinerary_planning", {"itinerary": {"title": "T"}})
@@ -2833,6 +2864,7 @@ if __name__ == "__main__":
     test_preference_payload_with_extra_keys_does_not_write_garbage()
     test_deferred_memory_only_written_after_commit()
     test_memory_update_preference_and_trip()
+    test_update_memory_legacy_dict_skips_explanatory_keys()
     test_memory_update_legacy_preferences_and_custom_backend()
     test_failed_preference_result_not_persisted()
     test_trip_destination_list_saved_as_text()

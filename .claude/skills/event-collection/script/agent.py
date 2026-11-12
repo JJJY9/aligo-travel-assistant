@@ -35,9 +35,31 @@ _RESULT_KEYS = (
     "origin",
     "start_date",
     "end_date",
+    "duration_days",
     "return_location",
     "trip_purpose",
+    "summary",
+    # {"data": {...}} 包装：回显示例不含该键，识别后由 _unwrap_result 取出
+    "data",
 )
+
+_EVENT_FIELDS = tuple(key for key in _RESULT_KEYS if key != "data")
+
+
+def _unwrap_result(obj: object) -> dict | None:
+    """取出事项结果对象；兼容 ``{"data": {提取字段...}}`` 包装。"""
+    if not isinstance(obj, dict):
+        return None
+    data = obj.get("data")
+    candidate = (
+        data
+        if isinstance(data, dict)
+        and any(key in data for key in _EVENT_FIELDS)
+        else obj
+    )
+    if any(key in candidate for key in _EVENT_FIELDS):
+        return candidate
+    return None
 
 
 def _format_pref_value(value) -> str:
@@ -181,14 +203,19 @@ class EventCollectionAgent(AgentBase):
             # 模型可能先回显 prompt 里的示例对象再给正式结果：优先取最后
             # 一个形如结果（任一提取字段命中）的顶层对象，避免把回显示例
             # 当成提取结果写成真实行程。正式结果通常带 destination 等字段，
-            # 即使省略 missing_info / extracted_count 也会排在示例之后。
-            result = last_json_object_with_keys_strict(text, _RESULT_KEYS)
+            # 即使省略 missing_info / extracted_count 也会排在示例之后；
+            # duration_days / summary 也算结果形状（只含时长的正式结果）。
+            result = _unwrap_result(
+                last_json_object_with_keys_strict(text, _RESULT_KEYS)
+            )
             if result is None:
                 # 没有任何含提取字段的完整对象：退到第一个含提取字段的对象
                 # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
                 # 对象」——prompt 回显的示例排在最前，正式结果被截断时会把
                 # 示例（北京 / 2026-02-27）当成真实事项写成行程
-                result = first_json_object_with_keys(text, _RESULT_KEYS)
+                result = _unwrap_result(
+                    first_json_object_with_keys(text, _RESULT_KEYS)
+                )
             if result is None:
                 raise ValueError("模型输出中没有可解析的事项结果对象")
         except Exception as e:
