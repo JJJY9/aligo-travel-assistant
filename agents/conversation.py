@@ -523,8 +523,11 @@ class ConversationRuntime:
         """
         pending = getattr(self, "_pending_persist", None)
         if pending is None:
-            # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它
+            # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它；
+            # 完成回调补提交的延迟记忆写入同样可能仍在后台（此前直接返回，
+            # 用户锁在偏好 / 行程仍在落库时释放）
             await self._await_pending_rollback()
+            await self._await_deferred_commit(timeout_sec)
             return True
         failed = object()
         outcome: object = None
@@ -546,21 +549,26 @@ class ConversationRuntime:
             # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
             # 结束，保证释放用户锁前回滚已落地）
             await self._request_staged_rollback(*last_turn)
-        commit_task = getattr(self, "_pending_memory_commit", None)
-        if commit_task is not None and not commit_task.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(commit_task), timeout=timeout_sec
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "等待延迟记忆写入超过 %.1fs，后台继续", timeout_sec
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - 写入失败已逐条吞掉
-                pass
+        await self._await_deferred_commit(timeout_sec)
         return True
+
+    async def _await_deferred_commit(self, timeout_sec: float) -> None:
+        """等待完成回调补提交的延迟记忆写入（尽力而为，超时后台继续）。"""
+        commit_task = getattr(self, "_pending_memory_commit", None)
+        if commit_task is None or commit_task.done():
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(commit_task), timeout=timeout_sec
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "等待延迟记忆写入超过 %.1fs，后台继续", timeout_sec
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 写入失败已逐条吞掉
+            pass
 
     def close(self) -> None:
         """释放会话占用的资源（PostgreSQL 连接等）。"""

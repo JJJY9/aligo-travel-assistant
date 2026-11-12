@@ -16,10 +16,14 @@
 import asyncio
 import json
 import logging
+import re
+import threading
 import time
+import weakref
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.thread import _worker
 from typing import Any
 
 from agentscope.agent import AgentBase
@@ -52,14 +56,47 @@ _AGENT_RETRY_MAX_DELAY = 5.0
 # 下载）嵌入模型；放进默认线程池会在冷启动时占满 min(32, CPU+4) 个 token，
 # 把对话限流 / 记忆读写 / 会话构造等所有 asyncio.to_thread 一起阻塞。
 # 超时只中断等待、线程本身仍占着——隔离到小池后阻塞范围限定在加载自身。
-_AGENT_LOAD_EXECUTOR = ThreadPoolExecutor(
+class _DaemonLoadExecutor(ThreadPoolExecutor):
+    """加载专用执行器：守护线程且不登记 atexit join。
+
+    ThreadPoolExecutor 默认把 worker 登记进 concurrent.futures.thread.
+    _threads_queues，进程退出时 atexit 会对登记线程逐个 join（daemon 标记
+    不豁免）：RAG 冷加载进行中停服，会被拖到加载结束。这里沿用 CPython
+    内部线程创建逻辑（3.10-3.12 稳定），只把线程标记为 daemon 且跳过登记。
+    """
+
+    def _adjust_thread_count(self) -> None:  # type: ignore[override]
+        if self._idle_semaphore.acquire(timeout=0):  # type: ignore[attr-defined]
+            return
+
+        def weakref_cb(_: Any, q: Any = self._work_queue) -> None:  # type: ignore[attr-defined]
+            q.put(None)
+
+        num_threads = len(self._threads)  # type: ignore[attr-defined]
+        if num_threads < self._max_workers:  # type: ignore[attr-defined]
+            thread = threading.Thread(
+                name=f"{self._thread_name_prefix or self}_{num_threads}",
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,  # type: ignore[attr-defined]
+                    self._initializer,  # type: ignore[attr-defined]
+                    self._initargs,  # type: ignore[attr-defined]
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.add(thread)  # type: ignore[attr-defined]
+
+
+_AGENT_LOAD_EXECUTOR = _DaemonLoadExecutor(
     max_workers=2, thread_name_prefix="aligo-agent-load"
 )
 # RAG 知识库的冷加载（import torch + 嵌入模型加载 / 联网下载）可能持续
 # 数十秒到数分钟，且嵌入模型本身有全局加载锁：与轻量技能共用小池时两路
 # 冷启动就会占满线程，其它会话的技能加载全部排队吃「执行超时」。单独
 # 隔离一个 worker——模型锁已串行化，多个 RAG 实例同时加载没有收益。
-_RAG_LOAD_EXECUTOR = ThreadPoolExecutor(
+_RAG_LOAD_EXECUTOR = _DaemonLoadExecutor(
     max_workers=1, thread_name_prefix="aligo-rag-load"
 )
 
@@ -135,12 +172,52 @@ def _trip_field(value: Any) -> str:
 
 
 def _trip_duration_days(value: Any) -> int | None:
-    """事项收集的 duration_days：正整数且不超过一年才采用。"""
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
+    """事项收集的 duration_days：正整数且不超过一年才采用。
+
+    意图模板里的 ``duration`` 常是自然语言（``3天`` / ``三天`` / ``一周``）：
+    只认纯数字会让「上一轮说过日期 / 时长、本轮只说按刚才的规划」的兜底
+    失效（行程规划成功却不落库）。
+    """
+    if isinstance(value, bool):
         return None
-    if number <= 0 or number > 365:
+    number: int | None
+    if isinstance(value, (int, float)):
+        number = int(value)
+    else:
+        text = _as_text(value).strip()
+        if not text:
+            return None
+        match = re.search(r"\d{1,3}", text)
+        if match:
+            number = int(match.group(0))
+        else:
+            cn_digits = {
+                "一": 1,
+                "二": 2,
+                "两": 2,
+                "三": 3,
+                "四": 4,
+                "五": 5,
+                "六": 6,
+                "七": 7,
+                "八": 8,
+                "九": 9,
+            }
+            if text[0] == "十":
+                number = 10
+                if len(text) > 1 and text[1] in cn_digits:
+                    number += cn_digits[text[1]]
+            elif text[0] in cn_digits:
+                number = cn_digits[text[0]]
+                if len(text) > 1 and text[1] == "十":
+                    number = number * 10 + (
+                        cn_digits.get(text[2], 0) if len(text) > 2 else 0
+                    )
+            else:
+                return None
+        if "周" in text or "星期" in text:
+            number *= 7
+    if number is None or number <= 0 or number > 365:
         return None
     return number
 
@@ -246,6 +323,9 @@ class OrchestrationAgent(AgentBase):
         # 成功落库之后通过 commit_deferred_memory 提交（取消 / 墓碑否决的
         # 回合不能留下没有对应对话的幽灵行程与偏好）
         self._deferred_memory: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+        # 单飞中的延迟提交任务：第二次调用等待第一次写完，而不是立即返回
+        # False（否则 drain 会以为没有在途写入、提前释放用户锁）
+        self._deferred_commit_task: asyncio.Future[bool] | None = None
 
     def register_agent(self, agent_name: str, agent: AgentBase):
         """注册子智能体"""
@@ -274,6 +354,10 @@ class OrchestrationAgent(AgentBase):
         Returns:
             Msg: 执行结果
         """
+        # 上一轮失败 / 取消 / 空调度遗留的暂存负载不能带入本轮：只有本轮
+        # 成功落库后的 commit 才应写库；遗留负载会变成没有对话支撑的幽灵
+        # 行程与偏好（no_agents / 非法意图早退路径同样要先清空）
+        self._deferred_memory = None
         if x is None:
             return Msg(
                 name=self.name,
@@ -460,14 +544,33 @@ class OrchestrationAgent(AgentBase):
         只应在整轮问答成功落库之后调用：编排完成到落库之间被取消或墓碑
         否决时，本轮的记忆写入不会执行（没有对话的行程 / 偏好会把台账与
         统计污染成「用户从未经历过的事实」）。返回是否真的执行了写入。
+
+        单飞：并发 / 重入调用等待同一个写入任务完成（先到者清空负载并
+        开始写，后到者此前会立即返回 False，drain 因此提前放行用户锁）。
         """
+        running = getattr(self, "_deferred_commit_task", None)
+        if running is not None and not running.done():
+            await asyncio.shield(running)
+            return True
         payload = getattr(self, "_deferred_memory", None)
         if not payload:
             return False
         self._deferred_memory = None
         intention_data, results = payload
-        await asyncio.to_thread(self._update_memory, intention_data, results)
-        return True
+
+        async def _commit() -> bool:
+            await asyncio.to_thread(self._update_memory, intention_data, results)
+            return True
+
+        task = asyncio.ensure_future(_commit())
+        self._deferred_commit_task = task
+
+        def _clear(done: asyncio.Future[bool]) -> None:
+            if getattr(self, "_deferred_commit_task", None) is done:
+                self._deferred_commit_task = None
+
+        task.add_done_callback(_clear)
+        return await asyncio.shield(task)
 
     def _prepare_context(self, intention_data: dict[str, Any]) -> dict[str, Any]:
         """
@@ -663,17 +766,35 @@ class OrchestrationAgent(AgentBase):
             return_exceptions=True
         )
 
+        # LLM 类失败必须整批上抛：return_exceptions 会把 _run_agent 上抛的
+        # 可重试 / 永久错误重新收集成普通结果，外层随即把整轮记为成功
+        # （熔断器永远打不开、整轮不重试）；单智能体批次直接 await 会正常
+        # 上抛，行为不能取决于调度分组
+        for exec_result in execution_results:
+            if isinstance(exec_result, BaseException) and (
+                is_retriable_error(exec_result)
+                or is_permanent_llm_error(exec_result)
+            ):
+                raise exec_result
+
         # 整理结果
         results: list[dict[str, Any]] = []
         for (agent_name, priority, _), exec_result in zip(parallel_coroutines, execution_results):
             canonical_name = canonical_agent_name(agent_name)
             if isinstance(exec_result, BaseException):
-                logger.error(f"Parallel agent execution failed: {agent_name}, error: {exec_result}")
+                # 异常文本可能含本机路径 / 上游 URL：与 _run_agent 同口径
+                # 先脱敏再进回答与日志（text 日志还要压成单行）
+                safe_error = redact_paths(exec_result)
+                logger.error(
+                    "Parallel agent execution failed: %s, error: %s",
+                    agent_name,
+                    safe_error.replace("\n", " ").replace("\r", " ")[:300],
+                )
                 result = {
                     "status": "error",
                     "agent_name": canonical_name,
-                    "data": {"error": str(exec_result)},
-                    "message": f"并行执行失败: {exec_result!s}"
+                    "data": {"error": safe_error},
+                    "message": f"并行执行失败: {safe_error}"
                 }
             else:
                 result = exec_result
@@ -1134,22 +1255,28 @@ class OrchestrationAgent(AgentBase):
                     # 本轮事项抽取缺失的字段用意图识别的 key_entities 兜底：
                     # 行程信息在上一轮陈述、本轮只说「按刚才说的规划」时，
                     # event_collection 只读本轮原话会缺目的地 / 日期，规划
-                    # 成功却不落库（台账 / 日历 / 记忆查询全部没有）
+                    # 成功却不落库（台账 / 日历 / 记忆查询全部没有）。
+                    # 意图 prompt 的 key_entities 输出键是 date / duration，
+                    # 与事项抽取的 start_date / duration_days 不同名，必须
+                    # 按别名读取，否则兜底永远命中不了
                     entities = intention_data.get("key_entities")
                     if isinstance(entities, dict):
-                        for key in (
-                            "origin",
-                            "destination",
-                            "start_date",
-                            "end_date",
-                            "trip_purpose",
-                            "duration_days",
-                        ):
-                            if (
-                                event_data.get(key) in (None, "")
-                                and entities.get(key)
-                            ):
-                                event_data[key] = entities[key]
+                        entity_aliases = (
+                            ("origin", ("origin",)),
+                            ("destination", ("destination",)),
+                            ("start_date", ("start_date", "date")),
+                            ("end_date", ("end_date",)),
+                            ("trip_purpose", ("trip_purpose",)),
+                            ("duration_days", ("duration_days", "duration")),
+                        )
+                        for target, sources in entity_aliases:
+                            if event_data.get(target) not in (None, ""):
+                                continue
+                            for source in sources:
+                                value = entities.get(source)
+                                if value not in (None, ""):
+                                    event_data[target] = value
+                                    break
 
                     # 模型可能给出列表（多目的地）或数字，统一转成单行文本
                     # 再落库（不可哈希值会让统计更新抛 TypeError，整轮作废）
@@ -1181,11 +1308,66 @@ class OrchestrationAgent(AgentBase):
                                     start_date,
                                     duration,
                                 )
+                    # 返程不得早于出发；9999-12-31 是模型常用的「返程未定」
+                    # 占位日期，倒置区间 / 占位值会让台账状态与冲突检测错乱，
+                    # 按未知处理（出发日期保持原行为：仍是真实可计数行程）
+                    if end_date and (
+                        end_date.startswith("9999")
+                        or (start_date and end_date < start_date)
+                    ):
+                        logger.warning(
+                            "忽略不可信的返程日期 %s（出发 %s）",
+                            end_date,
+                            start_date,
+                        )
+                        end_date = ""
                     purpose = _trip_field(event_data.get("trip_purpose"))
                     if destination and start_date:
                         origin = self._infer_trip_origin(
                             origin, destination, start_date, end_date
                         )
+                        # 上一轮缺出发地已落库的同趟行程：本轮补出发地时
+                        # 按身份（目的地 + 起止日期）找到旧行补齐 origin。
+                        # 否则 origin 不同会被当成新行程再插一条，统计与
+                        # 常去目的地翻倍，且两条互相报日期冲突
+                        if origin:
+                            try:
+                                updater = getattr(
+                                    self.memory_manager.long_term,
+                                    "update_trip",
+                                    None,
+                                )
+                                if callable(updater):
+                                    for old in self.memory_manager.long_term.get_trip_history(
+                                        limit=None
+                                    ):
+                                        if (
+                                            str(old.get("destination") or "")
+                                            == destination
+                                            and _trip_date(old.get("start_date"))
+                                            == start_date
+                                            and (
+                                                _trip_date(old.get("end_date"))
+                                                or _trip_date(
+                                                    old.get("start_date")
+                                                )
+                                            )
+                                            == (end_date or start_date)
+                                            and not str(
+                                                old.get("origin") or ""
+                                            ).strip()
+                                            and old.get("trip_id")
+                                        ):
+                                            updater(
+                                                str(old["trip_id"]),
+                                                {"origin": origin},
+                                            )
+                                            break
+                            except Exception as exc:  # noqa: BLE001 - 补齐失败不阻断保存
+                                logger.warning(
+                                    "补齐历史行程出发地失败（%s），继续保存",
+                                    type(exc).__name__,
+                                )
                         record: dict[str, Any] = {
                             "origin": origin,
                             "destination": destination,
