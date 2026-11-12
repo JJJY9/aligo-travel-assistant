@@ -397,23 +397,58 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
     }, None
 
 
+def _split_ics_property(line: str) -> tuple[str, str]:
+    """把 ``NAME;PARAM=...:VALUE`` 拆成 ``(左部, 值)``；引号内的冒号不切分。
+
+    TZID 参数允许带引号（``TZID="UTC+05:30"``），按第一个冒号切分会把
+    参数值劈开、属性名变形。
+    """
+    in_quotes = False
+    for index, char in enumerate(line):
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == ":" and not in_quotes:
+            return line[:index], line[index + 1 :]
+    return line, ""
+
+
 def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
     """解析 iCalendar 文本，返回 ``(有效行程, [(事件序号, 原因)])``（序从 1 起）。"""
     props: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
     errors = _BoundedErrors()
     in_event = False
+    in_alarm = False
     index = 0
     for line in _unfold_ics(text):
         upper = line.strip().upper()
+        if upper == "BEGIN:VALARM":
+            in_alarm = True
+            continue
+        if upper == "END:VALARM":
+            in_alarm = False
+            continue
         if upper == "BEGIN:VEVENT":
+            if in_event:
+                # 嵌套 BEGIN：外层事件缺少 END，属性已被重置；按错误跳过
+                # 外层并继续解析内层
+                index += 1
+                errors.add((index, "事件嵌套：缺少 END:VEVENT"))
             in_event = True
+            in_alarm = False
             props = {}
             continue
         if upper == "END:VEVENT":
+            if not in_event:
+                # 多余的 END 不能拿上一份 props 再生成一条行程
+                index += 1
+                errors.add((index, "多余的 END:VEVENT"))
+                continue
             in_event = False
+            in_alarm = False
             index += 1
             row, reason = _ics_event_row(props)
+            props = {}
             if reason:
                 errors.add((index, reason))
             elif row is not None:
@@ -423,21 +458,29 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
                         f"单次最多导入 {_MAX_IMPORT_ROWS} 条行程，请拆分文件后再导入"
                     )
             continue
-        if not in_event or ":" not in line:
+        if not in_event or in_alarm or ":" not in line:
+            # VALARM 区块（闹钟）里也有 DESCRIPTION：整块跳过，不能顶替
+            # 事件级描述（RFC 5545 不规定属性顺序）
             continue
-        left, _, raw_value = line.partition(":")
+        left, raw_value = _split_ics_property(line)
         params = left.split(";")
         name = params[0].strip().upper()
         if name in {"DTSTART", "DTEND", "SUMMARY", "DESCRIPTION"}:
-            # VALARM 里也有 DESCRIPTION：setdefault 保留事件级（先出现）的值
+            # 事件级属性以首个出现为准（导出端保证事件级在前）
             props.setdefault(name, raw_value.strip())
             if name in {"DTSTART", "DTEND"}:
                 # 属性参数里的 TZID 决定 DATE-TIME 的时区（Outlook 导出
-                # 常见）；丢弃它会把同一时刻记成不同的日期
+                # 常见）；丢弃它会把同一时刻记成不同的日期。参数值可能
+                # 带引号（TZID="Asia/Shanghai"），查询时区前去掉
                 for param in params[1:]:
                     key, _, param_value = param.partition("=")
                     if key.strip().upper() == "TZID":
-                        props.setdefault(f"{name}_TZID", param_value.strip())
+                        props.setdefault(
+                            f"{name}_TZID", param_value.strip().strip('"')
+                        )
+    if in_event:
+        index += 1
+        errors.add((index, "缺少 END:VEVENT，事件被跳过"))
     if not rows and not errors:
         return [], [(0, "未找到 VEVENT 事件")]
     return rows, errors

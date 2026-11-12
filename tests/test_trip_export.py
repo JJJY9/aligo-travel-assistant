@@ -337,6 +337,33 @@ def test_ics_unparsable_end_warns(caplog=None):
     print("✓ 返程日期无法解析时告警并按单日导出")
 
 
+def test_export_strips_unicode_line_separators_and_counts_events():
+    """U+2028/U+2029 清洗：CSV 注入前缀不被绕过、ICS 计数不受行分隔符影响。"""
+    from utils.trip_export import count_ics_events
+
+    sep = chr(0x2028)
+    sep2 = chr(0x2029)
+    trip = {
+        "trip_id": "t-sep",
+        "origin": "上海" + sep + "=cmd|' /C calc'!A0",
+        "destination": "北京" + sep2 + "第二行",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-07",
+        "purpose": "A" + sep + "BEGIN:VEVENT",
+    }
+    csv_text = render_trips_csv([trip])
+    assert sep not in csv_text and sep2 not in csv_text
+    assert "上海 =cmd" in csv_text, "载荷保留为单元格内部文本"
+    assert "'=cmd" not in csv_text, "公式字符不再处于单元格开头"
+    ics = render_trips_ics([trip], "u1")
+    assert sep not in ics and sep2 not in ics
+    assert count_ics_events(ics) == 1
+    # 计数只按真实换行切分：直接构造含 U+2028 的行不能虚增事件数
+    crafted = "BEGIN:VEVENT\r\nX:a" + sep + "BEGIN:VEVENT\r\nEND:VEVENT\r\n"
+    assert count_ics_events(crafted) == 1
+    print("✓ 导出清洗 U+2028/U+2029，事件计数不受行分隔符影响")
+
+
 if __name__ == "__main__":
     test_header_and_rows()
     test_formula_prefix_neutralized()
@@ -354,4 +381,5 @@ if __name__ == "__main__":
     test_html_table_wraps_long_unbroken_fields()
     test_count_ics_events_unfolds_before_counting()
     test_ics_unparsable_end_warns()
+    test_export_strips_unicode_line_separators_and_counts_events()
     print("\n全部通过")

@@ -552,6 +552,91 @@ def test_ics_external_summary_fallback():
     print("✓ ICS 外部事件 SUMMARY 回退")
 
 
+def test_ics_valarm_before_properties_keeps_event_description():
+    """VALARM 在事件属性之前时，闹钟文本不能顶替事件级 DESCRIPTION。"""
+    text = (
+        "BEGIN:VCALENDAR\nVERSION:2.0\n"
+        "BEGIN:VEVENT\n"
+        "BEGIN:VALARM\nACTION:DISPLAY\nDESCRIPTION:出行提醒\nEND:VALARM\n"
+        "DTSTART;VALUE=DATE:20261205\n"
+        "DTEND;VALUE=DATE:20261208\n"
+        "SUMMARY:Team offsite\n"
+        "DESCRIPTION:Aligo 行程：北京 → 上海，2026-12-05 ~ 2026-12-07，出差\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert len(rows) == 1, rows
+    assert rows[0]["origin"] == "北京", rows[0]
+    assert rows[0]["destination"] == "上海", "事件级描述不能被闹钟文本顶替"
+    assert rows[0]["purpose"] == "出差", rows[0]
+    print("✓ VALARM 在属性前时事件级描述不被闹钟文本顶替")
+
+
+def test_ics_structure_errors_do_not_duplicate_events():
+    """多余 END / 嵌套 BEGIN / 缺少 END 不能静默重复或丢失事件。"""
+    base = (
+        "BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261110\n"
+        "SUMMARY:北京 → 上海（出差）\nEND:VEVENT\n"
+    )
+    rows, errors = parse_trips_ics(base + "END:VEVENT\n")
+    assert len(rows) == 1, "多余的 END 不能拿上一份属性再生成一条"
+    assert any("多余的 END:VEVENT" in reason for _, reason in errors), errors
+
+    nested = (
+        "BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261110\n"
+        "BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261111\n"
+        "SUMMARY:北京 → 上海（出差）\nEND:VEVENT\nEND:VEVENT\n"
+    )
+    rows, errors = parse_trips_ics(nested)
+    assert len(rows) == 1 and rows[0]["start_date"] == "2026-11-11", rows
+    assert any("事件嵌套" in reason for _, reason in errors), errors
+
+    rows, errors = parse_trips_ics(
+        "BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261110\n"
+    )
+    assert rows == []
+    assert any("缺少 END:VEVENT" in reason for _, reason in errors), errors
+    print("✓ ICS 结构错误不重复 / 不丢事件")
+
+
+def test_ics_quoted_tzid_parameter_is_unquoted():
+    """带引号的 TZID（TZID="UTC"）按引号内值查询时区，不按未知时区浮动。"""
+    text = (
+        "BEGIN:VEVENT\n"
+        'DTSTART;TZID="UTC":20261205T120000\n'
+        "SUMMARY:北京 → 上海（出差）\n"
+        "END:VEVENT\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert rows[0]["start_date"] == "2026-12-05", rows
+    print("✓ 带引号 TZID 参数被正确解析")
+
+
+def test_ics_roundtrip_unparsable_end_uses_machine_description():
+    """返程日期无法解析：DESCRIPTION 用 DTEND 的实际单日日期，回导走机器段。"""
+    trip = {
+        "trip_id": "t-bad-end",
+        "origin": "",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "待定",
+        "purpose": "出差",
+    }
+    text = render_trips_ics([trip], "u1")
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert len(rows) == 1, rows
+    # 走 DESCRIPTION 机器段：空出发地回导后仍为空（SUMMARY 回退会变成「出发地」）
+    assert rows[0]["origin"] == "", rows[0]
+    assert rows[0]["destination"] == "上海", rows[0]
+    assert rows[0]["start_date"] == "2026-12-05"
+    assert rows[0]["end_date"] == "2026-12-05", "返程按 DTEND 的单日口径回导"
+    assert rows[0]["purpose"] == "出差"
+    print("✓ 无法解析的返程日期往返后身份一致（不退化为 SUMMARY 回退）")
+
+
 def test_ics_empty_origin_roundtrip():
     """空出发地按原值写入 DESCRIPTION：往返后不能变成「出发地」占位行程。"""
     trips = [
@@ -1120,6 +1205,10 @@ if __name__ == "__main__":
     test_ics_unfold_long_line_is_linear()
     test_ics_collects_invalid_events()
     test_ics_external_summary_fallback()
+    test_ics_valarm_before_properties_keeps_event_description()
+    test_ics_structure_errors_do_not_duplicate_events()
+    test_ics_quoted_tzid_parameter_is_unquoted()
+    test_ics_roundtrip_unparsable_end_uses_machine_description()
     test_ics_empty_origin_roundtrip()
     test_ics_datetime_offset_converts_local_date()
     test_trip_identity_normalizes_unpadded_dates()
