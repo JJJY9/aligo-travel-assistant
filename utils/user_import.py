@@ -16,6 +16,7 @@ from collections import Counter
 from typing import Any
 
 from utils.identifiers import is_valid_web_id
+from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
 import os
@@ -235,6 +236,36 @@ def _non_finite_in_value(value: Any, depth: int = 0) -> str | None:
     return None
 
 
+def _content_beyond_export_depth(value: Any, depth: int = 0) -> bool:
+    """解析后的非空内容是否落进导出截断区（绝对深度 ≥ ``MAX_JSON_DEPTH``）。
+
+    导出 / 状态渲染用 ``sanitize_json``：绝对深度到 ``MAX_JSON_DEPTH`` 的
+    节点一律替换成 None。导入若接受更深的**非空**内容，下一次导出会把
+    它们静默截掉——备份链丢数据，而用户无法感知。已导出的备份在该深度
+    只剩 null（上一轮截断的产物），继续可导入，保证导出 → 恢复闭环。
+    ``depth`` 是 value 根在导出树中的绝对深度（assistant JSON 根为 0；
+    偏好值位于 ``{"preferences": {name: value}}`` 下为 2）。
+    """
+    if value is None:
+        return False
+    if depth >= MAX_JSON_DEPTH:
+        return True
+    if isinstance(value, list):
+        return any(
+            _content_beyond_export_depth(item, depth + 1) for item in value
+        )
+    if isinstance(value, dict):
+        return any(
+            _content_beyond_export_depth(item, depth + 1)
+            for item in value.values()
+        )
+    return False
+
+
+# 偏好值在导出树中的绝对根深度：user_data["preferences"][name] 的 value
+_PREFERENCE_EXPORT_DEPTH = 2
+
+
 def _assistant_content_problem(content: str) -> str | None:
     """assistant 消息里的 _meta.usage 若存在则必须是数字字段。
 
@@ -265,6 +296,8 @@ def _assistant_content_problem(content: str) -> str | None:
     problem = _json_text_problem(data)
     if problem:
         return problem
+    if _content_beyond_export_depth(data):
+        return "消息内容嵌套过深（超过导出保存深度）"
     if not isinstance(data, dict) or "_meta" not in data:
         return None
     meta = data.get("_meta")
@@ -411,6 +444,11 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         problem = _text_problem(name) or _bad_text_in_value(value)
         if problem:
             errors.append(f"跳过第 {index} 个偏好：{problem}")
+            continue
+        if _content_beyond_export_depth(value, _PREFERENCE_EXPORT_DEPTH):
+            errors.append(
+                f"跳过第 {index} 个偏好：嵌套过深（超过导出保存深度）"
+            )
             continue
         cleaned_preferences[name] = value
     sections["preferences"] = cleaned_preferences
