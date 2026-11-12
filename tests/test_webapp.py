@@ -5852,6 +5852,63 @@ def test_dedupe_endpoint_offloads_rate_limit(monkeypatch):
         _cleanup(user_id)
 
 
+def test_half_open_breaker_recovers_through_chat_endpoint():
+    """半开期首个对话不能被端点预检占掉唯一试探名额（否则永久 503）。"""
+    import time as time_module
+
+    calls = {"n": 0}
+
+    class _CountingModel:
+        async def __call__(self, messages, **kwargs):
+            calls["n"] += 1
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(_INTENT, ensure_ascii=False),
+                    }
+                ],
+                "usage": {"input_tokens": 6, "output_tokens": 4, "time": 0.05},
+            }
+
+    app = create_app(model=UsageTrackingModel(_CountingModel()))
+    state = app.state.aligo
+    client = TestClient(app)
+    user_id = _unique_user("web_test_halfopen")
+    try:
+        baseline = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "ho-0"},
+        )
+        assert baseline.status_code == 200, baseline.text[:300]
+        assert calls["n"] == 1
+
+        for _ in range(state.breaker.failure_threshold):
+            state.breaker.record_failure()
+        assert state.breaker.get_status()["state"] == "open"
+        # 模拟恢复期已过（OPEN -> HALF_OPEN 在下次状态读取时发生）
+        state.breaker._opened_at = time_module.monotonic() - 999
+
+        first = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "ho-1"},
+        )
+        assert first.status_code == 200, first.text[:300]
+        assert calls["n"] >= 2, "半开期首个对话必须真正调用模型"
+
+        second = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "ho-2"},
+        )
+        assert second.status_code == 200, second.text[:300]
+        assert state.breaker.get_status()["state"] == "closed", (
+            "两次成功的半开试探后熔断器必须关闭"
+        )
+        print("✓ 半开熔断经对话端点可恢复（预检不占试探名额）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_trip_export_uses_strict_store(monkeypatch):
     """行程导出 / 日历用 strict 打开：PG 故障期不能把回退 JSON 当成功。"""
     from webapp import server as server_module
@@ -10722,6 +10779,7 @@ if __name__ == "__main__":
         test_trip_export_uses_strict_store(_mp_breaker)
     finally:
         _mp_breaker.undo()
+    test_half_open_breaker_recovers_through_chat_endpoint()
     test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:

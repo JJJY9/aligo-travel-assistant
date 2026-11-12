@@ -4163,17 +4163,18 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request, payload: ChatRequest, response: Response
     ) -> dict[str, Any]:
         # 熔断打开时直接 503：零 LLM 开销的拒绝不能先扣限流额度，
-        # 否则恢复后的重试者会被 429 锁在滑动窗口里
-        try:
-            state.breaker.raise_if_open()
-        except CircuitOpenError as exc:
+        # 否则恢复后的重试者会被 429 锁在滑动窗口里。只读状态判断：
+        # raise_if_open 在 HALF_OPEN 下会占用唯一试探名额（owner=本请求
+        # 任务），真正的对话跑在另一个 asyncio 任务里再次申请会被拒——
+        # 半开期所有对话永久 503，熔断器再也回不到 CLOSED
+        if state.breaker.get_status()["state"] == "open":
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "服务暂时不可用，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
-            ) from exc
+            )
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
         )
@@ -4284,17 +4285,18 @@ def create_app(model: Any = None) -> FastAPI:
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
         # 熔断打开时直接 503：零 LLM 开销的拒绝不能先扣限流额度，
-        # 否则恢复后的重试者会被 429 锁在滑动窗口里
-        try:
-            state.breaker.raise_if_open()
-        except CircuitOpenError as exc:
+        # 否则恢复后的重试者会被 429 锁在滑动窗口里。只读状态判断：
+        # raise_if_open 在 HALF_OPEN 下会占用唯一试探名额（owner=本请求
+        # 任务），真正的对话跑在另一个 asyncio 任务里再次申请会被拒——
+        # 半开期所有对话永久 503，熔断器再也回不到 CLOSED
+        if state.breaker.get_status()["state"] == "open":
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "服务暂时不可用，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
-            ) from exc
+            )
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
         )

@@ -894,6 +894,48 @@ def test_cancel_before_persist_settles_usage():
     print("✓ 意图阶段取消的用量同样记账")
 
 
+def test_cancel_during_deferred_commit_does_not_double_usage():
+    """落库已成功后取消落在延迟记忆提交期间：用量不能再记入下一轮。"""
+    import types
+
+    from config_agentscope import UsageTracker
+
+    runtime, memory = _make_runtime()
+    tracker = UsageTracker()
+    runtime.model = types.SimpleNamespace(usage=tracker)
+    commit_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowCommitOrch:
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            tracker.calls += 1
+            tracker.input_tokens += 100
+            tracker.output_tokens += 10
+            return _Response(json.dumps({"results": []}))
+
+        async def commit_deferred_memory(self):
+            commit_entered.set()
+            await release.wait()
+            return True
+
+    runtime.orchestrator = _SlowCommitOrch()
+
+    async def scenario():
+        task = asyncio.create_task(runtime.ask("你好"))
+        await asyncio.wait_for(commit_entered.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert not (getattr(runtime, "_unsettled_usage", None) or {}).get(
+        "total_tokens"
+    ), "助手消息已含 _meta.usage，取消延迟提交不能再记一次"
+    print("✓ 取消延迟记忆提交不重复记账用量")
+
+
 def test_memory_without_rollback_hook_is_tolerated():
     """记忆实现没有 rollback_staged_message 时失败路径照常返回。"""
     runtime, memory = _make_runtime()
@@ -1068,6 +1110,7 @@ if __name__ == "__main__":
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
     test_memory_without_rollback_hook_is_tolerated()
+    test_cancel_during_deferred_commit_does_not_double_usage()
     test_rollback_slot_cleared_after_completion()
     test_drain_waits_for_rollback_after_stale_slot()
     test_failed_turn_usage_settled_in_next_turn()
