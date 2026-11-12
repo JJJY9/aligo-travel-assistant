@@ -509,6 +509,50 @@ def test_pg_delete_all_resets_trip_counters():
         memory.close()
 
 
+def test_pg_batch_save_session_id_none_semantics():
+    """批量恢复：session_id 键存在且为 None 时清除关联，键缺失保留原值（与 JSON 同口径）。"""
+    memory, _ = _pg_memory_or_skip()
+    try:
+        base = {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "session_id": "s-dead",
+        }
+        memory.save_trip_history(dict(base))
+        created, updated = memory.save_trip_histories(
+            [{**base, "session_id": None}]
+        )
+        assert (created, updated) == (0, 1), (created, updated)
+        trips = memory.get_trip_history(limit=None)
+        assert len(trips) == 1, trips
+        assert trips[0]["session_id"] is None, (
+            "显式 None 必须清除被删除会话的关联（COALESCE 会把它当未提供）"
+        )
+
+        keep = {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-06",
+            "session_id": "s-keep",
+        }
+        memory.save_trip_history(dict(keep))
+        without_key = {
+            key: value for key, value in keep.items() if key != "session_id"
+        }
+        created, updated = memory.save_trip_histories([without_key])
+        assert (created, updated) == (0, 1), (created, updated)
+        by_date = {
+            trip["start_date"]: trip for trip in memory.get_trip_history(limit=None)
+        }
+        assert by_date["2026-12-06"]["session_id"] == "s-keep", (
+            "键缺失时必须保留原关联"
+        )
+        print("✓ PG 批量保存 session_id 显式 None / 缺失语义与 JSON 一致")
+    finally:
+        memory.close()
+
+
 def test_pg_save_trip_histories_counts_mixed_batch():
     """PG 批量保存：created/updated 计数正确，批内去重且缺省目的保留原值。"""
     memory, _ = _pg_memory_or_skip()
