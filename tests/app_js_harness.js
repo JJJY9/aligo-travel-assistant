@@ -1113,7 +1113,7 @@ async function scenarioRetryGuard(source) {
     globalThis.__opened = 0;
     globalThis.__removed = 0;
     sendMessage = async (text) => { __sent.push(text); };
-    openSession = async () => { __opened += 1; };
+    openSession = async () => { __opened += 1; return true; };
     setBusy = () => {};
     trimRegenButtons = () => {};
   `);
@@ -1478,6 +1478,36 @@ async function scenarioSearchJump(source) {
   return { initial, afterFirst, afterSecond, afterThird };
 }
 
+async function scenarioSessionSearchFailure(source) {
+  // 搜索请求失败：查询词要回到旧值，列表与「加载更多」仍按旧查询工作
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.sessions = [{ session_id: "s-old", title: "旧" }];
+    state.sessionsOffset = 1;
+    state.sessionTotal = 1;
+    state.searchQuery = "old";
+    state.sessionsLoading = false;
+    els.history = {
+      innerHTML: "",
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+    };
+    renderHistory = () => {};
+    toast = (text) => { (globalThis.__toasts ||= []).push(text); };
+  `);
+  const promise = run('loadSessions("new", { reset: true })');
+  const request = await waitRequest(env);
+  request.reject(new Error("boom"));
+  await promise;
+  return {
+    searchQuery: run("state.searchQuery"),
+    sessions: run("state.sessions.map((s) => s.session_id)"),
+    toasts: run("globalThis.__toasts || []"),
+  };
+}
+
 async function scenarioSilentRestoreWindow(source) {
   // 静默重载恢复已展开的渲染起点，不把窗口重置回最近 200 条
   const env = buildEnv(source);
@@ -1760,6 +1790,8 @@ async function main() {
     payload = await scenarioSearchJump(source);
   } else if (scenario === "silentRestoreWindow") {
     payload = await scenarioSilentRestoreWindow(source);
+  } else if (scenario === "sessionSearchFailure") {
+    payload = await scenarioSessionSearchFailure(source);
   } else if (scenario === "reconcile") {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
