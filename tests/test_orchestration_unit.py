@@ -2028,6 +2028,45 @@ def test_reply_input_edges_and_registry_management():
     print("✓ reply 输入边界 / 调度容错 / 注册注销 / 文本与瞬时错误辅助")
 
 
+def test_run_agent_reraised_llm_errors_feed_breaker():
+    """子智能体的可重试 / 永久 LLM 错误必须上抛，外层才能记熔断失败。"""
+
+    class _ConnBoomAgent:
+        async def reply(self, msg):
+            raise ConnectionError("upstream 503")
+
+    class _AuthBoomAgent:
+        async def reply(self, msg):
+            err = RuntimeError("Error code: 401 - Authentication Fails")
+            err.status_code = 401
+            raise err
+
+    class _ValueBoomAgent:
+        async def reply(self, msg):
+            raise ValueError("bad skill output")
+
+    async def call(agent):
+        orchestrator = OrchestrationAgent(agent_registry={"demo": agent})
+        return await orchestrator._run_agent(
+            agent_name="demo",
+            context={},
+            reason="",
+            expected_output="",
+            previous_results=[],
+        )
+
+    for agent, label in ((_ConnBoomAgent(), "可重试"), (_AuthBoomAgent(), "永久")):
+        try:
+            asyncio.run(call(agent))
+        except (ConnectionError, RuntimeError):
+            pass
+        else:
+            raise AssertionError(f"{label} LLM 错误被吞成 status=error，熔断不可达")
+    result = asyncio.run(call(_ValueBoomAgent()))
+    assert result["status"] == "error", result
+    print("✓ 子智能体 LLM 错误上抛（可重试 / 4xx），普通错误仍按结果降级")
+
+
 def test_dict_registry_resolves_name_variants():
     """纯 dict 注册表存标准名时，模型输出的别名 / 大小写变体也能调度。"""
     agent = _StubAgent("itinerary_planning", {"itinerary": {"title": "T"}})
@@ -2507,6 +2546,7 @@ if __name__ == "__main__":
     test_failure_aggregated_as_partial_failure()
     test_agent_duration_and_progress_events()
     test_unregistered_agent_reports_error()
+    test_run_agent_reraised_llm_errors_feed_breaker()
     test_agent_status_error_and_null_error()
     test_nested_query_failure_is_reported_as_error()
     test_transient_nested_error_triggers_retry()
