@@ -66,14 +66,21 @@ def _needs_quote_guard(text: str) -> bool:
 
 def _clean_trip_value(value: object) -> str:
     """渲染前的字段清洗：孤立代理项转义（避免写文件时 UnicodeEncodeError），
-    换行归一（CRLF / CR → LF，与身份口径一致），再剥离终端控制序列
-    （ESC / OSC 会在终端执行剪贴板写入等操作）。
+    换行归一（CRLF / CR → LF，与身份口径一致），剥离终端控制序列
+    （ESC / OSC 会在终端执行剪贴板写入等操作）并清除 U+2028 / U+2029。
+
+    U+2028 / U+2029 不在终端控制序列范围内，但 ``str.splitlines`` 会在它们
+    处断行（ICS 计数、按 Unicode 行边界解析的导入器会把后续内容当成新
+    记录 / 新属性行），还会绕过「公式字符在首列」的 CSV 注入前缀防护；
+    行程字段是用户 / 模型输入，导出前统一替换为空格。
 
     存储里的行程字段是用户 / 模型输入，不可信；CSV / ICS / HTML 与
     ``--stdout`` 输出都必须经过这里。保留制表符与换行。
     """
     text = sanitize_json(str(value if value is not None else ""))
-    return strip_terminal_controls(normalize_identity_text(text))
+    text = normalize_identity_text(text)
+    text = text.replace("\u2028", " ").replace("\u2029", " ")
+    return strip_terminal_controls(text)
 
 
 def _csv_safe(value: object) -> str:
@@ -188,12 +195,20 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     summary = f"{origin} → {destination}（{purpose}）"
     # DESCRIPTION 是 trips-import 的机器可读来源：必须用原始值（占位符只
     # 出现在给人看的 SUMMARY 里），否则空出发地在往返后会变成字面量「出发地」，
-    # 去重键随之改变并重复新增行程
+    # 去重键随之改变并重复新增行程。日期：出发用 DTSTART 的解析结果；返程
+    # 优先保留可解析的原始日期（含倒置日期，回导后身份不变），只有无法解析
+    # 时才写 DTEND 实际使用的单日日期——否则导入端正则失配回退 SUMMARY，
+    # 路线 / 目的被改写并按新身份重复新增
+    start_iso = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+    end_identity = normalize_identity_date(
+        trip.get("end_date") or trip.get("start_date")
+    )
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_identity):
+        end_identity = f"{end[:4]}-{end[4:6]}-{end[6:8]}"
     description = (
         f"Aligo 行程：{escape_ics_machine_field(_clean_trip_value(trip.get('origin')))} → "
         f"{escape_ics_machine_field(_clean_trip_value(trip.get('destination')))}，"
-        f"{normalize_identity_date(trip.get('start_date'))} ~ "
-        f"{normalize_identity_date(trip.get('end_date') or trip.get('start_date'))}，"
+        f"{start_iso} ~ {end_identity}，"
         f"{_clean_trip_value(trip.get('purpose'))}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -201,13 +216,15 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     # 会让新行程覆盖日历里已存在的旧事件
     uid_source = ":".join(
         [
-            user_id,
-            str(trip.get("trip_id") or "trip"),
+            # 全部经 _clean_trip_value：历史脏数据里的孤立代理项会让
+            # uid_source.encode("utf-8") 抛 UnicodeEncodeError（整个导出 500）
+            _clean_trip_value(user_id),
+            _clean_trip_value(trip.get("trip_id") or "trip"),
             # 只用于摘要：转义后的值保证不会把换行带进 UID 行
             _ics_escape(origin),
             _ics_escape(destination),
-            str(trip.get("start_date") or ""),
-            str(trip.get("end_date") or ""),
+            _clean_trip_value(trip.get("start_date") or ""),
+            _clean_trip_value(trip.get("end_date") or ""),
         ]
     )
     uid_digest = hashlib.sha1(uid_source.encode("utf-8")).hexdigest()[:16]
@@ -371,8 +388,12 @@ def count_ics_events(text: str) -> int:
     ``strip()`` 会把它算成第二个事件，导出条数被凭空放大、跳过提示被吞掉。
     """
     unfolded = text.replace("\r\n ", "")
+    # 只按真实换行切分：``str.splitlines`` 还会在 U+2028 / U+2029 处断行，
+    # 字段里残留的行分隔符会被算成额外事件、跳过提示被吞
     return sum(
-        1 for line in unfolded.splitlines() if line.strip() == "BEGIN:VEVENT"
+        1
+        for line in unfolded.split("\n")
+        if line.strip() == "BEGIN:VEVENT"
     )
 
 

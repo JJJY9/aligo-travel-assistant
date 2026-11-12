@@ -1474,7 +1474,7 @@ async function importTripsFromFile(file) {
         .map((item) => `第 ${item.line} 行：${item.reason}`)
         .join("\n");
       const ok = window.confirm(
-        `将新增 ${Number(preview.created || 0)} 条、更新 ${Number(
+        `将向用户 ${userId} 新增 ${Number(preview.created || 0)} 条、更新 ${Number(
           preview.updated || 0,
         )} 条行程` +
           (previewSkipped ? `，跳过 ${previewSkipped} 条` : "") +

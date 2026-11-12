@@ -318,7 +318,7 @@ def test_trip_import_file_decoding_and_size_guard():
         "结果 toast 的跳过数量同样要用 skipped_total"
     )
     assert results["after_import"]["confirm"] == (
-        "将新增 1 条、更新 0 条行程，跳过 73 条。继续？\n\n"
+        "将向用户 web_user 新增 1 条、更新 0 条行程，跳过 73 条。继续？\n\n"
         "跳过原因（前 2 条）：\n"
         "第 3 行：目的地为空\n"
         "第 7 行：出发日期格式应为 YYYY-MM-DD"

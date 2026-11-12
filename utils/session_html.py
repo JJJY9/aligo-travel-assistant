@@ -117,10 +117,12 @@ def _bundle_title(
     return "Aligo 对话"
 
 
+# 作为 _TEMPLATE.format 的 extra_style **值**插入，不经过二次格式化：
+# 花括号必须写成单层（写 {{ }} 会原样进入 <style>，浏览器丢弃全部合集样式）
 _BUNDLE_STYLE = """
-  .session {{ margin-top: 30px; }}
-  .session h2 {{ font-size: 18px; margin: 0 0 2px; }}
-  .session .meta {{ margin-bottom: 10px; }}
+  .session { margin-top: 30px; }
+  .session h2 { font-size: 18px; margin: 0 0 2px; }
+  .session .meta { margin-bottom: 10px; }
 """
 
 

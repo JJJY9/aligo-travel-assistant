@@ -84,6 +84,9 @@ def test_all_sessions_bundle_grouping_and_escaping():
     assert "自定义&lt;标题&gt;" in text and "&amp;lt;" not in text
     assert "<h2>旧会话 &lt;script&gt;</h2>" in text, "回退标题同样只转义一次"
     assert "会话 old · 2 条消息" in text
+    # 合集样式作为 format 的值插入：双花括号会原样进入 <style>，浏览器
+    # 丢弃整段合集样式（标题间距 / 边距失效）
+    assert ".session {" in text and "{{" not in text, "合集样式不能带双花括号"
     print("✓ 合集 HTML：分组排序 / 自定义与回退标题单次转义")
 
 
