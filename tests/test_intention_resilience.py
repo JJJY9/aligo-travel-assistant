@@ -47,6 +47,59 @@ class _AuthBoomModel:
         raise _AuthError()
 
 
+class _EmptyModel:
+    """网关以 200 返回空错误体 / choices 为空"""
+
+    async def __call__(self, messages):
+        return ""
+
+
+class _ErrorBodyModel:
+    """网关以 200 返回错误体（限流 / 鉴权失败）"""
+
+    def __init__(self, body):
+        self.body = body
+
+    async def __call__(self, messages):
+        return json.dumps(self.body)
+
+
+def test_empty_response_is_retriable_error():
+    """空响应按可重试错误上抛（重试 + 熔断），不能降级成默认意图。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_EmptyModel())
+    try:
+        asyncio.run(agent.reply([_user_msg()]))
+    except ConnectionError:
+        print("✓ 空响应按可重试错误上抛")
+        return
+    raise AssertionError("空响应被吞成默认意图")
+
+
+def test_http_200_error_body_is_llm_error():
+    """200 + 错误体：按错误体状态码分类上抛（429 重试 / 401 永久）。"""
+    from utils.llm_resilience import (
+        is_permanent_llm_error,
+        is_retriable_error,
+    )
+
+    cases = [
+        ({"error": {"code": 429, "message": "rate limited"}}, True, False),
+        ({"error": {"code": 401, "message": "auth failed"}}, False, True),
+    ]
+    for body, retriable, permanent in cases:
+        agent = IntentionAgent(
+            name="IntentionAgent", model=_ErrorBodyModel(body)
+        )
+        try:
+            asyncio.run(agent.reply([_user_msg()]))
+        except Exception as exc:  # noqa: BLE001 - 断言分类结果
+            assert is_retriable_error(exc) is retriable, (body, exc)
+            assert is_permanent_llm_error(exc) is permanent, (body, exc)
+        else:
+            raise AssertionError(f"200 错误体被吞成默认意图：{body}")
+    print("✓ 200 错误体按状态码触发重试 / 熔断")
+
+
 class _TrailingProseModel:
     """合法 JSON 后带说明文字（其中含花括号）的输出"""
 
@@ -401,6 +454,8 @@ def test_repaired_json_with_non_list_schedule_falls_back():
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_permanent_llm_error_is_raised()
+    test_empty_response_is_retriable_error()
+    test_http_200_error_body_is_llm_error()
     test_unparsable_output_falls_back()
     test_json_with_trailing_prose_braces_parses()
     test_non_finite_json_falls_back()
