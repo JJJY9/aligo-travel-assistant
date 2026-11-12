@@ -236,6 +236,40 @@ def test_probe_recovers_idle_bucket_after_cooldown(monkeypatch):
     print("✓ 冷却到期后健康探测恢复低频限流桶")
 
 
+def test_probe_is_throttled_per_second(monkeypatch):
+    """健康探针同秒内不重复访问 Redis（未限流的健康接口不能被洪泛放大）。"""
+    import utils.rate_limit as rate_limit_module
+
+    times = {"now": 1000.0}
+    monkeypatch.setattr(rate_limit_module.time, "monotonic", lambda: times["now"])
+
+    class _Client(_UnavailableRedis):
+        def __init__(self):
+            super().__init__()
+            self.up = False
+
+        def eval(self, *args, **kwargs):
+            self.eval_calls += 1
+            if not self.up:
+                raise ConnectionError("redis down")
+            return -1
+
+    client = _Client()
+    limiter = RedisRateLimiter(
+        client, "unit-probe-throttle", limit=2, window_sec=60
+    )
+    limiter.check("k")  # 进入降级
+    times["now"] += 61
+    assert limiter.probe() is False
+    calls = client.eval_calls
+    assert limiter.probe() is False
+    assert client.eval_calls == calls, "1 秒内重复探测不应再访问 Redis"
+    times["now"] += 61
+    client.up = True
+    assert limiter.probe() is True
+    print("✓ 健康探针按秒节流")
+
+
 def test_create_rate_limiter_backends():
     memory = create_rate_limiter("unit", 1, 60)
     assert isinstance(memory, RateLimiter)

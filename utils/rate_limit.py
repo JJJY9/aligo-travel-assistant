@@ -214,6 +214,9 @@ class RedisRateLimiter:
         # 降级恢复期的单飞：冷却到期后的第一个真实调用执行探测，其余并发
         # 请求直接走进程内回退，避免每个线程各自等满 socket 超时
         self._recovery_lock = threading.Lock()
+        # 健康探测节流：/api/health 等接口未限流，廉价 GET 洪泛不能让每个
+        # 请求都做一次 Redis 往返（最坏 1.5s socket 超时会占满线程池）
+        self._last_probe = 0.0
 
     @property
     def degraded(self) -> bool:
@@ -302,8 +305,14 @@ class RedisRateLimiter:
         """
         if not self._degraded:
             return True
-        if time.monotonic() < self._degraded_until:
+        now = time.monotonic()
+        if now < self._degraded_until:
             return False
+        # 同 1 秒内的重复探测直接沿用当前状态（并发的健康 / 指标请求不会
+        # 各自发起一次 Redis 往返）
+        if now - self._last_probe < 1.0:
+            return not self._degraded
+        self._last_probe = now
         result = self._eval(
             _STATUS_SCRIPT, "__probe__", self.window_sec, self.limit
         )
