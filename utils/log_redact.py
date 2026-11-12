@@ -21,11 +21,24 @@ _KEY_VALUE = re.compile(
 # 本机绝对路径与上游 URL：技能错误文本会经编排层渲染给用户（Web / CLI），
 # 嵌入模型缓存目录、Milvus 库文件路径、下载地址都不应出现在回答里
 _URL_BODY = re.compile(r"https?://[^\s'\"<>）)]+")
-_WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:\\[^\s'\"<>）)]+|\\\\[^\s'\"<>）)]+)")
+_WINDOWS_PATH = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/][^\s'\"<>）)]+|\\\\[^\s'\"<>）)]+)"
+)
 _UNIX_PATH = re.compile(
     r"(?<![\w:/])/(?:home|Users|root|tmp|var|opt|srv|mnt|data|workspace"
-    r"|proc|etc)(?:/[^\s'\"<>）)]+)+"
+    r"|proc|etc|app|code|build|usr|private)(?:/[^\s'\"<>）)]+)+"
 )
+
+
+def redact_local_paths(text: object) -> str:
+    """只遮蔽本机绝对路径（Windows 盘符 / UNC / 常见 Unix 根），其余原样保留。
+
+    诊断报告（/api/doctor）要保留协议与主机便于排查，不能像
+    :func:`redact_paths` 那样把整条 URL 抹成 ``http(s)://***``，但又不能
+    回显 ``C:\\venv\\...`` / ``/usr/lib/...`` 这类目录布局。
+    """
+    cleaned = _WINDOWS_PATH.sub("<路径>", str(text))
+    return _UNIX_PATH.sub("<路径>", cleaned)
 
 
 def redact_paths(text: object) -> str:
@@ -33,10 +46,12 @@ def redact_paths(text: object) -> str:
 
     只替换路径 / 链接本身，保留异常的其余文字（如 Connection refused /
     timeout）：编排层按这些关键词判断瞬时错误并重试，不能一起抹掉。
+    路径先于 URL 处理：``http(s)://***`` 占位符里的 ``s:/`` 会被正斜杠
+    盘符规则误认成 ``C:/`` 形态；原样 URL 中 ``字母:/`` 前是另一字母，
+    路径规则的前瞻守护不会误伤。
     """
-    cleaned = _URL_BODY.sub("http(s)://***", str(text))
-    cleaned = _WINDOWS_PATH.sub("<路径>", cleaned)
-    cleaned = _UNIX_PATH.sub("<路径>", cleaned)
+    cleaned = redact_local_paths(str(text))
+    cleaned = _URL_BODY.sub("http(s)://***", cleaned)
     return redact_secret(cleaned)
 
 

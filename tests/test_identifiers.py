@@ -70,7 +70,34 @@ def test_prefixed_and_suffixed_fragments():
     print("✓ ID 前后缀与非法输入判定")
 
 
+def test_windows_reserved_names_rejected():
+    """Windows 设备保留名不能作 ID：会拼成记忆库文件名并指向设备。
+
+    这是相对 Web 模式的**有意收窄**：Web 的 pydantic 正则（Rust regex）
+    不支持 lookaround，无法表达保留名否定；CLI / 导入 / Web 打开存储的
+    路径统一在 :func:`is_valid_web_id` 拒绝。
+    """
+    for value in (
+        "CON",
+        "con",
+        "Prn",
+        "aux",
+        "NUL",
+        "nul",
+        "COM1",
+        "com9",
+        "LPT1",
+        "LPT9",
+    ):
+        assert is_valid_web_id(value) is False, value
+    # 仅精确命中保留名才拒绝：前缀 / 后缀 / 扩展形态都是普通文件名
+    for value in ("console", "con-1", "con_1", "xcon", "com10", "lpt0", "nul_2"):
+        assert is_valid_web_id(value) is True, value
+    print("✓ Windows 设备保留名被拒绝")
+
+
 if __name__ == "__main__":
     test_ids_match_web_rust_word_semantics()
     test_prefixed_and_suffixed_fragments()
+    test_windows_reserved_names_rejected()
     print("\n全部通过")

@@ -71,6 +71,7 @@ from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio, strip_terminal_controls
 from utils.doctor import run_doctor
+from utils.identifiers import is_valid_web_id
 from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
     METADATA_KEY_MAX_CHARS,
@@ -89,7 +90,7 @@ from utils.knowledge_admin import (
     update_document,
 )
 from utils.knowledge_stats import knowledge_status
-from utils.log_redact import redact_paths
+from utils.log_redact import redact_local_paths, redact_paths, redact_secret
 from utils.metrics import REQUEST_METRICS
 from utils.preference_values import has_preference_value
 from utils.rate_limit import create_rate_limiter
@@ -2119,6 +2120,11 @@ def _open_long_term(user_id: str, strict: bool = False) -> Any:
     统一映射为可重试的 503，避免所有调用点都抛裸 500。调用点仍负责关闭
     返回的 store。
     """
+    if not is_valid_web_id(user_id):
+        # Web 的 pydantic 模式（Rust 正则，无 lookaround）只能校验字符集；
+        # Windows 设备保留名（NUL / COM1 …）会拼成记忆库文件名并指向设备，
+        # 为 JSON 后端在这里统一拒绝，避免写入静默丢失。
+        raise HTTPException(status_code=422, detail="user_id 非法")
     try:
         return create_long_term_memory(user_id, str(MEMORY_DIR), strict=strict)
     except HTTPException:
@@ -2134,11 +2140,10 @@ def _open_long_term(user_id: str, strict: bool = False) -> Any:
 
 
 def _redact_doctor_detail(text: str) -> str:
-    """诊断输出脱敏：项目绝对路径替换为 <项目>，URL 去掉凭据与查询串。"""
-    cleaned = str(text).replace(str(PROJECT_ROOT), "<项目>")
-    cleaned = re.sub(r"(https?://)[^\s/@]+@", r"\1***@", cleaned)
-    cleaned = re.sub(r"(https?://[^\s?#]+)[?#][^\s]*", r"\1", cleaned)
-    return cleaned
+    """诊断输出脱敏：项目根替换为 <项目>，其余本机绝对路径遮蔽为 <路径>，
+    URL / DSN 去掉凭据与查询串（保留协议与主机便于排查问题）。"""
+    cleaned = redact_secret(str(text).replace(str(PROJECT_ROOT), "<项目>"))
+    return redact_local_paths(cleaned)
 
 
 def _storage_failure(action: str, exc: Exception) -> HTTPException:
@@ -2723,13 +2728,18 @@ def _usage_summary_for_user(
 
 
 def _md_inline(value: object) -> str:
-    """导出 Markdown 的单行内联文本：折叠空白 + 尖括号转义（与 CLI 同口径）。
+    """导出 Markdown 的单行内联文本：折叠空白 + 尖括号 / 右方括号转义。
 
     终端控制序列（ESC / OSC / BEL）先剥离：存进记忆的恶意内容此前会原样
     写进下载的 .md，在终端 cat 时执行（CLI user-export 同一数据会剥离）。
+    右方括号同样转义：``[点我](https://phish)`` 只要 ``]`` 不能闭合，
+    链接 / 图片语法就无法成形，避免导出文件在预览器里变成可点击的钓鱼链接。
     """
     text = strip_terminal_controls(value if value is not None else "")
-    return " ".join(text.split()).replace("<", "&lt;").replace(">", "&gt;")
+    cleaned = " ".join(text.split())
+    return (
+        cleaned.replace("<", "&lt;").replace(">", "&gt;").replace("]", "\\]")
+    )
 
 
 def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
@@ -2877,7 +2887,18 @@ def create_app(model: Any = None) -> FastAPI:
         state.import_executor.shutdown(wait=False, cancel_futures=True)
         state.kb_import_executor.shutdown(wait=False, cancel_futures=True)
 
-    app = FastAPI(title="Aligo 智能旅行助手", version=APP_VERSION, lifespan=lifespan)
+    # 交互式 API 文档默认关闭：/docs 加载 CDN 资源、/openapi.json 暴露完整
+    # 端点与参数结构，是内网服务最常见的信息泄露面。需要时显式设置
+    # ALIGO_ENABLE_DOCS=1（README 的部署说明同口径）。
+    docs_enabled = os.environ.get("ALIGO_ENABLE_DOCS") == "1"
+    app = FastAPI(
+        title="Aligo 智能旅行助手",
+        version=APP_VERSION,
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
     app.state.aligo = state
     # Starlette 后注册的中间件在最外层：压缩放在内层，保证 RequestContextMiddleware
     # 能给压缩后的响应补安全头 / 请求 ID，并在异常时可靠地兜底 500。
@@ -3099,7 +3120,7 @@ def create_app(model: Any = None) -> FastAPI:
             ],
         }
 
-    @app.get("/api/knowledge")
+    @app.get("/api/knowledge", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge(request: Request, response: Response) -> dict[str, Any]:
         """知识库状态（集合 / 片段数 / 是否可用）。
 
@@ -3728,7 +3749,7 @@ def create_app(model: Any = None) -> FastAPI:
             },
         )
 
-    @app.get("/api/sessions/{session_id}")
+    @app.get("/api/sessions/{session_id}", dependencies=[Depends(_cross_site_side_effect)])
     def get_session_messages(
         request: Request,
         response: Response,
@@ -4470,7 +4491,7 @@ def create_app(model: Any = None) -> FastAPI:
             },
         )
 
-    @app.get("/api/trips")
+    @app.get("/api/trips", dependencies=[Depends(_cross_site_side_effect)])
     def list_trips(
         request: Request,
         response: Response,
@@ -4909,7 +4930,7 @@ def create_app(model: Any = None) -> FastAPI:
         async with state.lock_for(user_id):
             return await asyncio.to_thread(_run)
 
-    @app.get("/api/trips/{trip_id}/calendar")
+    @app.get("/api/trips/{trip_id}/calendar", dependencies=[Depends(_cross_site_side_effect)])
     def export_trip_calendar(
         request: Request,
         trip_id: str = ApiPath(..., pattern=_ID_PATTERN),
@@ -5098,6 +5119,9 @@ def create_app(model: Any = None) -> FastAPI:
             raise HTTPException(
                 status_code=415,
                 detail="备份恢复只接受 application/json 请求体",
+                # 请求体（可达 64MB）尚未读取：明确关闭连接，让客户端立即停止
+                # 上传，而不是在服务端排队等请求体被丢弃
+                headers={"Connection": "close"},
             )
 
         # 限流先于解析，而且都走线程池：请求体可达 64MB，Pydantic body 参数
@@ -5115,6 +5139,7 @@ def create_app(model: Any = None) -> FastAPI:
                     "已有导入任务在处理，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
+                headers={"Connection": "close"},
             )
         try:
             loop = asyncio.get_running_loop()
@@ -5133,6 +5158,7 @@ def create_app(model: Any = None) -> FastAPI:
                         "备份文件不能超过 "
                         f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
                     ),
+                    headers={"Connection": "close"},
                 )
             try:
                 raw_body = await asyncio.wait_for(
@@ -5146,6 +5172,7 @@ def create_app(model: Any = None) -> FastAPI:
                         "请重试"
                         f"（请求 ID：{_request_id(request)}）"
                     ),
+                    headers={"Connection": "close"},
                 ) from None
             if len(raw_body) > MAX_BACKUP_BYTES + _IMPORT_BODY_ALLOWANCE_BYTES:
                 raise HTTPException(

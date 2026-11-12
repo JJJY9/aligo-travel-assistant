@@ -1122,6 +1122,35 @@ def test_migrate_sanitizes_invalid_preferences():
     print("✓ 非法偏好记录在迁移时清洗并备份")
 
 
+def test_migrate_backup_file_is_owner_only():
+    """迁移备份含完整用户数据：创建后必须收紧为 0600（不随 umask 共享）。"""
+    import context.long_term_memory as ltm
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-perm.json"
+    path.write_text(
+        json.dumps({"preferences": [{"type": ["bad"], "value": "x"}]}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, int]] = []
+    original_chmod = os.chmod
+
+    def record_chmod(target: object, mode: int) -> None:
+        calls.append((str(target), mode))
+        original_chmod(target, mode)
+
+    setattr(ltm.os, "chmod", record_chmod)
+    try:
+        memory = LongTermMemory("u-perm", storage_dir)
+        assert memory.get_preference() == {}
+    finally:
+        setattr(ltm.os, "chmod", original_chmod)
+    backup = str(Path(storage_dir) / "u-perm.json.migrate-backup")
+    assert Path(backup).exists(), "破坏性迁移必须留备份"
+    assert (backup, 0o600) in calls, calls
+    print("✓ 迁移备份按 0600 创建")
+
+
 def test_pg_data_error_wrapped_as_persistence_failure():
     """psycopg DataError（NUL 文本等）包装为 MemoryPersistenceError（503 而非 500）。"""
     import psycopg
@@ -3810,6 +3839,7 @@ if __name__ == "__main__":
     test_migrate_rebuilds_statistics_when_missing()
     test_migrate_rebuilds_missing_individual_counters()
     test_migrate_dedupes_preference_types()
+    test_migrate_backup_file_is_owner_only()
     for case in (
         test_redis_client_factory_single_flight,
         test_redis_client_cache_is_url_scoped,
