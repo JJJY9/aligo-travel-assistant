@@ -73,6 +73,20 @@ def is_retriable_error(exc: BaseException) -> bool:
     return "timeout" in msg or "timed out" in msg or "deadline exceeded" in msg
 
 
+def is_permanent_llm_error(exc: BaseException) -> bool:
+    """不可重试的模型调用失败（401/402/403/404 等 4xx）。
+
+    这类错误意味着上游模型完全不可用（密钥失效 / 余额耗尽 / 模型不存在），
+    不是「模型输出无法解析」：调用方必须上抛让熔断器记账，不能吞成默认
+    意图 / 空结果后由外层把本轮记为成功——否则 LLM 彻底不可用时熔断器
+    永远不会打开，健康检查一直报 closed。
+    """
+    if is_retriable_error(exc):
+        return False
+    status = _status_code(exc)
+    return status is not None and 400 <= status < 500
+
+
 async def retry_with_backoff(
     coro_factory: Callable[[], Awaitable[T]],
     max_retries: int = 3,

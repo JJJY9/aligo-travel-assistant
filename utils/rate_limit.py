@@ -115,9 +115,12 @@ class RateLimiter:
             now = time.monotonic()
             events = self._events.get(key)
             if events is None:
-                # 容量已满时先清理过期桶；仍然满员则直接拒绝新 key：
-                # 淘汰活跃桶会重置其计数（本次被限流的请求重新获得额度）
-                self._sweep(now)
+                # 只有接近容量上限时才清理过期桶：每个新 key 都全表扫描会
+                # 让限流器在持有全局锁的情况下付出 O(表大小)（大量用户的
+                # 常态请求也会中招）；仍然满员则拒绝新 key——淘汰活跃桶会
+                # 重置其计数（本次被限流的请求重新获得额度）
+                if len(self._events) >= self.max_keys // 2:
+                    self._sweep(now)
                 if len(self._events) >= self.max_keys:
                     return round(self.window_sec, 1)
                 events = deque()
@@ -208,6 +211,9 @@ class RedisRateLimiter:
         # 是否正处于回退状态：失败后置 True，只有一次成功的 Redis 调用
         # 才会清除。不能用冷却窗口判断——冷却到期但从未重试成功时仍是降级
         self._degraded = client is None
+        # 降级恢复期的单飞：冷却到期后的第一个真实调用执行探测，其余并发
+        # 请求直接走进程内回退，避免每个线程各自等满 socket 超时
+        self._recovery_lock = threading.Lock()
 
     @property
     def degraded(self) -> bool:
@@ -229,12 +235,25 @@ class RedisRateLimiter:
 
     def _eval(self, script: str, key: str, *args: Any) -> Any:
         """执行 Lua 脚本；Redis 不可用时返回 None 表示应使用回退实现。"""
+        # 冷却判定放在取客户端之前：启动不可达的路径不应每个请求都走一遍
+        # 工厂（工厂内部虽有单飞，但连接惰性创建在冷却期也会被反复触发）
+        if time.monotonic() < self._degraded_until:
+            return None
         client = self._get_client()
         if client is None:
             self._degraded = True
             return None
-        if time.monotonic() < self._degraded_until:
-            return None
+        if self._degraded:
+            # 冷却到期后的恢复探测单飞：并发请求不各自等满 socket 超时
+            if not self._recovery_lock.acquire(blocking=False):
+                return None
+            try:
+                return self._eval_client(client, script, key, *args)
+            finally:
+                self._recovery_lock.release()
+        return self._eval_client(client, script, key, *args)
+
+    def _eval_client(self, client: Any, script: str, key: str, *args: Any) -> Any:
         try:
             result = client.eval(script, 1, self._key(key), *args)
         except Exception as exc:  # noqa: BLE001 - 限流后端故障不能影响请求
@@ -272,30 +291,23 @@ class RedisRateLimiter:
         return self._retry_after(result)
 
     def probe(self) -> bool:
-        """主动探测 Redis 是否已恢复；未降级时直接返回 True。
+        """主动探测 Redis 限流是否已恢复；未降级时直接返回 True。
 
         ``degraded`` 只会在「同一个桶」的 Redis 调用成功时清除；weather /
         import 等低频桶在 Redis 恢复后可能很久没有请求，健康检查若只看
         标记会永远报降级。冷却期内沿用上次失败的结论，冷却到期后用一次
-        PING 刷新状态（失败则重新进入冷却）。
+        真实限流脚本（STATUS，不记录请求）刷新状态：不能用 PING 代替——
+        PING 成功而 EVAL 不可用（maxmemory 拒绝写、只读副本、ACL 禁 EVAL）
+        时，健康检查会谎报限流已恢复。
         """
         if not self._degraded:
             return True
         if time.monotonic() < self._degraded_until:
             return False
-        client = self._get_client()
-        if client is None:
-            return False
-        try:
-            client.ping()
-        except Exception as exc:  # noqa: BLE001 - 探测失败继续按降级处理
-            self._degraded_until = time.monotonic() + REDIS_FAILURE_COOLDOWN_SEC
-            self._degraded = True
-            logger.warning("Redis 限流健康探测失败（%s）：%s", self.name, exc)
-            return False
-        self._degraded = False
-        self._degraded_until = 0.0
-        return True
+        result = self._eval(
+            _STATUS_SCRIPT, "__probe__", self.window_sec, self.limit
+        )
+        return result is not None
 
     def check(self, key: str) -> float | None:
         """记录一次请求；放行返回 None，超限返回建议的 Retry-After 秒数。"""

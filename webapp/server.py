@@ -1624,15 +1624,22 @@ def _client_host(request: Request) -> str:
     """限流使用的客户端地址。
 
     默认取 TCP 对端地址。部署在反向代理后面时设置 ``TRUST_PROXY_HEADERS=1``，
-    改为取 ``X-Forwarded-For`` 的第一个地址（代理需覆盖写入该头）；默认关闭，
-    避免客户端自行伪造该头绕过 IP 桶。
+    改为取 ``X-Forwarded-For`` 的**最后一跳**地址（代理按标准写法追加真实
+    客户端地址，如 nginx ``$proxy_add_x_forwarded_for``）；默认关闭，避免
+    客户端自行伪造该头绕过 IP 桶。取最后一个值而不是第一个：客户端自带的
+    伪造值只会出现在更前面，轮换它不能获得新桶；最后一跳必须是合法 IP，
+    否则退回 TCP 对端地址（任意字符串不能各自成为限流桶）。
     """
     if RATE_LIMIT_CONFIG.get("trust_proxy_headers"):
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
-            first = forwarded.split(",")[0].strip()
-            if first:
-                return first[:64]
+            candidate = forwarded.split(",")[-1].strip()
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                candidate = ""
+            if candidate:
+                return candidate[:64]
     return request.client.host if request.client else "unknown"
 
 
@@ -2831,9 +2838,12 @@ def create_app(model: Any = None) -> FastAPI:
         # 健康检查不能继续报 ok，否则监控全绿而线上无法对话
         skills_ok = skills_root.is_dir() and bool(scripts)
         return {
-            # 熔断打开说明服务已无法正常对话：健康检查不能继续报 ok
+            # 熔断打开 / 半开说明服务已无法正常对话（半开期只有单个试探
+            # 回合放行、其余对话请求 503）：健康检查不能继续报 ok
             "status": (
-                "degraded" if breaker_state == "open" or not skills_ok else "ok"
+                "degraded"
+                if breaker_state in ("open", "half_open") or not skills_ok
+                else "ok"
             ),
             "circuit_breaker": breaker_state,
             "version": APP_VERSION,
@@ -4662,7 +4672,9 @@ def create_app(model: Any = None) -> FastAPI:
         同一渲染口径（ics 缺少出发日期的行程按既有语义跳过）。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
-        store = _open_long_term(user_id)
+        # strict：PostgreSQL 故障期不能把回退 JSON（可能为空 / 陈旧）当作
+        # 成功导出（静默产出空台账），与去重 / 写入的降级语义一致
+        store = _open_long_term(user_id, strict=True)
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
@@ -4717,7 +4729,11 @@ def create_app(model: Any = None) -> FastAPI:
         """
         user_id = payload.user_id
         dry_run = payload.dry_run
-        response.headers.update(_enforce_read_rate_limit(state, request))
+        # async 端点：Redis 限流（eval）是阻塞网络 I/O，必须走线程池——
+        # 裸调用会在 Redis 慢 / 黑洞时占住事件循环，冻结所有请求与 SSE 心跳
+        response.headers.update(
+            await asyncio.to_thread(_enforce_read_rate_limit, state, request)
+        )
 
         def _run() -> dict[str, Any]:
             store = _open_long_term(user_id, strict=True)
@@ -4772,7 +4788,8 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> Response:
         """导出一条行程为 iCalendar（.ics）全天事件。"""
         rate_headers = _enforce_read_rate_limit(state, request)
-        store = _open_long_term(user_id)
+        # strict：PG 故障期不能把回退 JSON 当作「行程不存在」返回 404
+        store = _open_long_term(user_id, strict=True)
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示

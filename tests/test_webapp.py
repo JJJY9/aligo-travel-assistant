@@ -5813,6 +5813,79 @@ def test_knowledge_collection_missing_gets_actionable_error(monkeypatch):
     print("✓ 知识库集合缺失返回可操作提示，其它异常仍脱敏")
 
 
+def test_health_marks_half_open_breaker_degraded(monkeypatch):
+    """HALF_OPEN（仅单飞试探）同样无法正常对话：健康检查必须报 degraded。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app)
+    state = app.state.aligo
+    monkeypatch.setattr(
+        state.breaker, "get_status", lambda: {"state": "half_open"}
+    )
+    data = client.get("/api/health").json()
+    assert data["status"] == "degraded", data
+    assert data["circuit_breaker"] == "half_open"
+    print("✓ 健康检查把 HALF_OPEN 熔断视为 degraded")
+
+
+def test_dedupe_endpoint_offloads_rate_limit(monkeypatch):
+    """async 端点的限流检查必须走线程池：Redis 慢时不能阻塞事件循环。"""
+    from webapp import server as server_module
+
+    calls = []
+    real_to_thread = server_module.asyncio.to_thread
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(getattr(func, "__name__", repr(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(server_module.asyncio, "to_thread", tracking_to_thread)
+    client = _client()
+    user_id = _unique_user("web_test_dedupe_offload")
+    try:
+        response = client.post(
+            "/api/trips/dedupe", json={"user_id": user_id, "dry_run": True}
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert "_enforce_read_rate_limit" in calls, calls
+        print("✓ /api/trips/dedupe 的限流检查走线程池")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trip_export_uses_strict_store(monkeypatch):
+    """行程导出 / 日历用 strict 打开：PG 故障期不能把回退 JSON 当成功。"""
+    from webapp import server as server_module
+
+    captured = []
+
+    class _Store:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def close(self):
+            pass
+
+    def fake_open(user_id, strict=False):
+        captured.append((user_id, strict))
+        return _Store()
+
+    monkeypatch.setattr(server_module, "_open_long_term", fake_open)
+    client = _client()
+    user_id = _unique_user("web_test_strict_export")
+    assert (
+        client.get("/api/trips/export", params={"user_id": user_id}).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/api/trips/trip_1/calendar", params={"user_id": user_id}
+        ).status_code
+        == 404
+    )
+    assert [strict for _, strict in captured] == [True, True], captured
+    print("✓ 行程导出 / 日历使用 strict 打开长期记忆")
+
+
 def test_daemon_import_executor_is_not_joined_at_exit():
     """导入线程为 daemon 且不登记 atexit join：停服不会被分钟级导入卡住。"""
     from concurrent.futures.thread import _threads_queues
@@ -6126,7 +6199,8 @@ def test_rate_limit_trusted_proxy_headers(monkeypatch):
         user_c = _unique_user("web_test_proxy_c")
         user_d = _unique_user("web_test_proxy_d")
         user_e = _unique_user("web_test_proxy_e")
-        users += [user_c, user_d, user_e]
+        user_f = _unique_user("web_test_proxy_f")
+        users += [user_c, user_d, user_e, user_f]
         state.ip_limiter = RateLimiter(limit=1, window_sec=60)
         monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_headers", True)
         forwarded = "203.0.113.9, 10.0.0.1"
@@ -6148,7 +6222,16 @@ def test_rate_limit_trusted_proxy_headers(monkeypatch):
             headers={"X-Forwarded-For": "203.0.113.10"},
         )
         assert fifth.status_code == 200, "不同转发地址不应互相影响"
-        print("✓ 可信代理开启后按 X-Forwarded-For 第一个地址限流")
+        # 客户端自带伪造前缀不能获得新桶：取最后一跳（代理追加的真实地址）
+        sixth = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_f, "session_id": "proxy-f1"},
+            headers={"X-Forwarded-For": "1.1.1.1, 203.0.113.11, 10.0.0.1"},
+        )
+        assert sixth.status_code == 429, (
+            "轮换 XFF 前缀不能绕过 IP 桶（实际 key 取最后一跳）"
+        )
+        print("✓ 可信代理开启后按 X-Forwarded-For 最后一跳地址限流")
     finally:
         for user_id in users:
             _cleanup(user_id)
@@ -10527,6 +10610,13 @@ if __name__ == "__main__":
         test_knowledge_collection_missing_gets_actionable_error(_mp_halfinit)
     finally:
         _mp_halfinit.undo()
+    _mp_breaker = pytest.MonkeyPatch()
+    try:
+        test_health_marks_half_open_breaker_degraded(_mp_breaker)
+        test_dedupe_endpoint_offloads_rate_limit(_mp_breaker)
+        test_trip_export_uses_strict_store(_mp_breaker)
+    finally:
+        _mp_breaker.undo()
     test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:

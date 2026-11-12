@@ -34,6 +34,19 @@ class _UnparsableModel:
         return "这不是 JSON，无法解析"
 
 
+class _AuthError(Exception):
+    def __init__(self):
+        super().__init__("Error code: 401 - Authentication Fails")
+        self.status_code = 401
+
+
+class _AuthBoomModel:
+    """始终抛 401 的模型（密钥失效 / 余额耗尽）"""
+
+    async def __call__(self, messages):
+        raise _AuthError()
+
+
 class _TrailingProseModel:
     """合法 JSON 后带说明文字（其中含花括号）的输出"""
 
@@ -84,6 +97,17 @@ def test_retriable_error_is_raised():
         print("✓ 可重试错误已向上抛出（重试/熔断可用）")
         return
     raise AssertionError("可重试错误被吞掉：reply() 应向上抛出 ConnectionError")
+
+
+def test_permanent_llm_error_is_raised():
+    """401 等 4xx 模型调用失败必须上抛：否则熔断器把 LLM 不可用记为成功。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_AuthBoomModel())
+    try:
+        asyncio.run(agent.reply([_user_msg()]))
+    except _AuthError:
+        print("✓ 不可重试的模型调用错误已向上抛出（熔断器可记账）")
+        return
+    raise AssertionError("401 被吞成默认意图：熔断器与健康检查将永远看不到故障")
 
 
 def test_unparsable_output_falls_back():
@@ -376,6 +400,7 @@ def test_repaired_json_with_non_list_schedule_falls_back():
 
 if __name__ == "__main__":
     test_retriable_error_is_raised()
+    test_permanent_llm_error_is_raised()
     test_unparsable_output_falls_back()
     test_json_with_trailing_prose_braces_parses()
     test_non_finite_json_falls_back()

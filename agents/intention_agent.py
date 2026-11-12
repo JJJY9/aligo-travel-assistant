@@ -27,7 +27,7 @@ from utils.json_parser import (
     reject_json_constant,
     robust_json_parse,
 )
-from utils.llm_resilience import is_retriable_error
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.skill_loader import SkillLoader
 
 logger = logging.getLogger(__name__)
@@ -356,6 +356,12 @@ class IntentionAgent(AgentBase):
             # 交由 cli.py 的 retry_with_backoff 与熔断器处理（Issue #1）
             if is_retriable_error(e):
                 logger.error(f"Intent recognition failed (retriable): {e}")
+                raise
+            if is_permanent_llm_error(e):
+                # 非可重试的模型调用失败（401/402/403/404 等 4xx）：吞成默认
+                # 意图会让外层把「LLM 完全不可用」记为成功，熔断器与健康
+                # 检查永远看不到故障，必须同样上抛
+                logger.error(f"Intent recognition failed (permanent LLM error): {e}")
                 raise
             logger.error(f"Intent recognition failed: {e}")
             # 返回默认结果
