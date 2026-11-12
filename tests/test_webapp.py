@@ -321,7 +321,9 @@ def test_import_slow_body_times_out_and_frees_slot(monkeypatch):
         "headers": [
             (b"host", b"testserver"),
             (b"content-type", b"application/json"),
-            (b"content-length", b"67108864"),
+            # 声明 50 MB（合法上限内）但迟迟不发 body：走读取超时路径；
+            # 超过 上限+余量 的声明会在读取前直接 413（见超限用例）
+            (b"content-length", b"52428800"),
         ],
         "client": ("127.0.0.1", 12345),
         "server": ("testserver", 80),
@@ -1837,10 +1839,8 @@ def test_import_rejects_backup_over_size_limit(monkeypatch):
 
     monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", 32)
     client = _client()
-    body = json.dumps(
-        {"backup": {"preferences": {"home_location": "北京"}}}
-    ).encode("utf-8")
-    assert len(body) > 32
+    # 超过 上限 + 4KB 包装余量：Content-Length 预检在读取请求体前拒绝
+    body = b"x" * 5000
     response = client.post(
         "/api/import",
         params={"user_id": _unique_user("web_test_import_big")},
