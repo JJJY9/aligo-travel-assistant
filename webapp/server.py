@@ -112,6 +112,7 @@ from utils.trip_conflicts import trip_interval as _trip_interval
 from utils.trip_conflicts import trips_with_conflicts as _trips_with_conflicts
 from utils.trip_dedupe import apply_trip_dedupe, plan_trip_dedupe
 from utils.trip_export import (
+    count_ics_events,
     render_trip_ics,
     render_trips_csv,
     render_trips_html,
@@ -4797,11 +4798,16 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("导出失败", exc) from exc
         finally:
             _close_long_term(store)
+        content = render_trips_ics(trips, user_id)
+        # 缺少出发日期的行程按既有语义跳过：用事件数反推跳过条数，前端
+        # 据此提示，不能静默给出少行程的「全部日历」
+        skipped = max(0, len(trips) - count_ics_events(content))
         return Response(
-            content=render_trips_ics(trips, user_id),
+            content=content,
             media_type="text/calendar; charset=utf-8",
             headers={
                 "Content-Disposition": 'attachment; filename="aligo_trips.ics"',
+                "X-Aligo-Export-Skipped": str(skipped),
                 **rate_headers,
             },
         )
@@ -4836,11 +4842,14 @@ def create_app(model: Any = None) -> FastAPI:
         if format == "ics":
             # 与 CLI `trips-export --ics` 同一渲染：过滤后的行程合成一个
             # VCALENDAR（/api/trips/calendar 保留为不带筛选的旧入口）
+            content = render_trips_ics(filtered, user_id)
+            skipped = max(0, len(filtered) - count_ics_events(content))
             return Response(
-                content=render_trips_ics(filtered, user_id),
+                content=content,
                 media_type="text/calendar; charset=utf-8",
                 headers={
                     "Content-Disposition": 'attachment; filename="aligo_trips.ics"',
+                    "X-Aligo-Export-Skipped": str(skipped),
                     **rate_headers,
                 },
             )
