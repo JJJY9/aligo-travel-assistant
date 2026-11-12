@@ -143,6 +143,10 @@ IMPORT_BODY_READ_TIMEOUT_SEC = 60.0
 # /api/import 要一次性接收整份备份（面板文件上限 50 MB，JSON 包装 / 转义
 # 还有额外开销）；其它路径维持 2 MB
 IMPORT_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+# /api/import 的备份上限按 50 MB（与 CLI / 面板一致）预检：请求体还要包一层
+# {"backup": ...}，留 4 KB 余量；Content-Length 超限时在读取请求体之前就
+# 拒绝，不把 50–64 MB 备份先读进内存
+_IMPORT_BODY_ALLOWANCE_BYTES = 4096
 _BODY_LIMIT_OVERRIDES = {"/api/import": IMPORT_REQUEST_BODY_BYTES}
 
 
@@ -5114,6 +5118,22 @@ def create_app(model: Any = None) -> FastAPI:
             )
         try:
             loop = asyncio.get_running_loop()
+            # 备份体积上限与 CLI user-import / 面板一致：请求体允许到 64MB，
+            # 但 50–64MB 的备份恢复后会让该用户 /api/export 永久 413。
+            # 先按 Content-Length 预检，超限时连请求体都不读取
+            declared_length = request.headers.get("content-length", "").strip()
+            if (
+                declared_length.isdigit()
+                and int(declared_length)
+                > MAX_BACKUP_BYTES + _IMPORT_BODY_ALLOWANCE_BYTES
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "备份文件不能超过 "
+                        f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
+                    ),
+                )
             try:
                 raw_body = await asyncio.wait_for(
                     request.body(), timeout=IMPORT_BODY_READ_TIMEOUT_SEC
@@ -5127,9 +5147,7 @@ def create_app(model: Any = None) -> FastAPI:
                         f"（请求 ID：{_request_id(request)}）"
                     ),
                 ) from None
-            # 备份体积上限与 CLI user-import / 面板一致：请求体允许到 64MB，
-            # 但 50–64MB 的备份恢复后会让该用户 /api/export 永久 413
-            if len(raw_body) > MAX_BACKUP_BYTES:
+            if len(raw_body) > MAX_BACKUP_BYTES + _IMPORT_BODY_ALLOWANCE_BYTES:
                 raise HTTPException(
                     status_code=413,
                     detail=(
