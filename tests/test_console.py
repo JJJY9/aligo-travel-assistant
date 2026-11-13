@@ -282,6 +282,52 @@ def test_utf16_readline_is_incremental_not_read_to_eof():
     print("✓ UTF-16 按块增量解码（readline 不再读到 EOF）")
 
 
+def test_bomless_utf16le_stream_lines_decode():
+    """无 BOM 的 UTF-16LE 管道按流级增量解码：0x0A 不能把码元劈开。"""
+    from utils.console import _AutoDecodeInput
+
+    payload = "history\n北京天气\n".encode("utf-16-le")
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.readline() == "history\n"
+    assert shim.readline() == "北京天气\n"
+    assert shim.readline() == ""
+
+    # 首行就是中文（换行 0x0A 0x00 落在样例尾部，同样能探测）
+    payload_cjk = "北京天气\n第二行\n".encode("utf-16-le")
+    shim2 = _AutoDecodeInput(_PipeBuffer(payload_cjk), "gbk")
+    assert shim2.readline() == "北京天气\n"
+    assert shim2.readline() == "第二行\n"
+    print("✓ 无 BOM UTF-16LE 流式解码（含中文首行）")
+
+
+def test_read_size_utf8_with_gbk_fallback_not_mojibake():
+    """分块读取在 cp936 回退下不能把截断的 UTF-8 前缀误当 GBK 解出。"""
+    from utils.console import _AutoDecodeInput
+
+    payload = "汉化测试".encode("utf-8")
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.read(2) == "汉化"
+    assert shim.read() == "测试"
+    print("✓ UTF-8 + GBK 回退分块读取不乱码")
+
+
+def test_pipe_safe_stdout_tolerates_none_stream():
+    """stdout 为 None（pythonw / fd 已关闭）时按损坏接收端静默丢弃。"""
+    from utils.console import PipeSafeTextIO
+
+    sink = PipeSafeTextIO(None)
+    assert sink.write("hello") == 5
+    sink.flush()
+    assert sink.isatty() is False
+    try:
+        sink.fileno()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("None 流的 fileno 必须抛 OSError")
+    print("✓ PipeSafeTextIO 容忍 None 流")
+
+
 def test_pipe_safe_stdout_swallows_broken_pipe():
     """`| head` 关闭管道后的写入静默丢弃；真实写失败照常抛出。"""
     from utils.console import PipeSafeTextIO
@@ -531,6 +577,9 @@ if __name__ == "__main__":
         test_readline_utf16_lines_and_size()
         test_utf16_readline_is_incremental_not_read_to_eof()
         test_pipe_safe_stdout_swallows_broken_pipe()
+        test_bomless_utf16le_stream_lines_decode()
+        test_read_size_utf8_with_gbk_fallback_not_mojibake()
+        test_pipe_safe_stdout_tolerates_none_stream()
         test_probe_stdin_false_leaves_stream_untouched(mp)
         test_non_tty_pipe_is_wrapped(mp)
     finally:

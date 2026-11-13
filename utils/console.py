@@ -81,7 +81,7 @@ class _AutoDecodeInput:
         peek = getattr(self._buffer, "peek", None)
         if callable(peek):
             try:
-                head = bytes(peek(3)[:3])
+                head = bytes(peek(16)[:16])
             except Exception:  # noqa: BLE001 - peek 失败按逐行判断
                 head = b""
         if head[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
@@ -95,7 +95,35 @@ class _AutoDecodeInput:
         if head[:3] == codecs.BOM_UTF8:
             self._mode = "utf-8-sig"
             return
+        if self._looks_like_bomless_utf16le(head):
+            # 无 BOM 的 UTF-16LE（Node Buffer utf16le、部分 .NET 写出）：
+            # 必须按流级模式增量解码——按字节行切分会在 0x0A 处把码元
+            # 劈开，行尾残留一个 0x00 让后续全部错位
+            self._mode = "utf-16-le"
+            self._utf16_decoder = codecs.getincrementaldecoder("utf-16-le")(
+                errors="replace"
+            )
+            return
         self._mode = "auto"
+
+    @staticmethod
+    def _looks_like_bomless_utf16le(head: bytes) -> bool:
+        """无 BOM 的 UTF-16LE 探测：奇数位出现 0x00 且偶数位没有。
+
+        ASCII 文本的 UTF-16LE 是「字符 + 0x00」；中文文本的换行
+        （0x0A 0x00）落在样式尾部同样给出奇数位 0x00。GBK / UTF-8
+        文本不会包含 0x00 字节，因此该组合不会误判。
+        """
+        if len(head) < 4:
+            if len(head) == 2:
+                return head[0] != 0 and head[1] == 0
+            return False
+        sample = head[0::2]
+        high = head[1::2]
+        return high.count(0) >= 1 and sample.count(0) == 0
+
+    def _is_utf16(self) -> bool:
+        return self._mode in ("utf-16", "utf-16-le")
 
     def _decode_line(self, raw: bytes) -> str:
         if self._mode == "utf-8-sig":
@@ -128,19 +156,31 @@ class _AutoDecodeInput:
         # 会被当成自然语言查询连同 NUL 发给模型）
         return line.replace("\x00", "")
 
-    def _try_decode(self, raw: bytes) -> str | None:
-        """严格解码（不做替换）；用来判断字节块末尾是否切断了多字节字符。"""
-        if self._mode == "utf-8-sig":
+    def _needs_more_bytes(self, raw: bytes) -> bool:
+        """块尾是否切断了多字节字符（UTF-8 与回退编码分别判定）。
+
+        不能用「回退编码能否解码整块」判断：GBK 常能把截断的 UTF-8 前缀
+        解成合法字符（E4 BD -> 浣），提前停止补读后整块按 GBK 解码、在
+        中文 locale 下大面积乱码。这里只认「错误恰好位于块尾」的不完整
+        序列——UTF-8 与回退编码各自检查，中段非法字节是真正的其它编码
+        数据，补读只会继续吞字节。
+        """
+
+        def _tail_cut(encoding: str) -> bool:
             try:
-                return raw.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                return None
-        for candidate in ("utf-8", self._fallback):
-            try:
-                return raw.decode(candidate)
-            except UnicodeDecodeError:
-                continue
-        return None
+                raw.decode(encoding)
+                return False
+            except UnicodeDecodeError as exc:
+                return exc.start >= len(raw) - 4 and exc.end == len(raw)
+            except LookupError:
+                return False
+
+        if _tail_cut("utf-8"):
+            return True
+        fallback = str(self._fallback or "")
+        if fallback and fallback.lower().replace("-", "").replace("_", "") != "utf8":
+            return _tail_cut(fallback)
+        return False
 
     def _read_sized(self, read_all: Any, needed: int) -> bytes:
         """按字节读至少 needed 个字符；块尾切断多字节字符时补读（最多 4 字节）。
@@ -150,7 +190,7 @@ class _AutoDecodeInput:
         """
         chunk = read_all(needed) or b""
         extra = 0
-        while chunk and extra < 4 and self._try_decode(chunk) is None:
+        while chunk and extra < 4 and self._needs_more_bytes(chunk):
             more = read_all(1) or b""
             if not more:
                 break
@@ -207,18 +247,21 @@ class _AutoDecodeInput:
             self._pending = pending[newline + 1 :]
             return pending[: newline + 1]
         self._pending = ""
-        if self._mode == "utf-16":
+        if self._is_utf16():
             return pending + self._next_utf16_line()
         raw = self._buffer.readline()
         return pending + (self._decode_line(raw) if raw else "")
 
     def readline(self, size: int | None = -1) -> str:
+        if size == 0:
+            # TextIO 契约：size=0 不消费输入，也不能触发首次探测阻塞
+            return ""
         self._ensure_mode()
         if self._pending:
             line = self._next_pending_line()
         elif self._lines:
             line = self._lines.pop(0)
-        elif self._mode == "utf-16":
+        elif self._is_utf16():
             line = self._next_utf16_line()
             if not line:
                 return ""
@@ -238,10 +281,10 @@ class _AutoDecodeInput:
         return line
 
     def read(self, size: int | None = -1) -> str:
-        self._ensure_mode()
         if size == 0:
-            # TextIO 契约：size=0 不消费输入，也不能阻塞到 EOF
+            # TextIO 契约：size=0 不消费输入，也不能阻塞到 EOF / 首次探测
             return ""
+        self._ensure_mode()
         parts: list[str] = []
         if self._pending:
             parts.append(self._pending)
@@ -250,7 +293,7 @@ class _AutoDecodeInput:
         self._lines = []
         unlimited = size is None or size < 0
         target = -1 if unlimited else int(size if size is not None else 0)
-        if self._mode == "utf-16":
+        if self._is_utf16():
             if self._utf16_text:
                 parts.append(self._utf16_text)
                 self._utf16_text = ""
@@ -314,8 +357,10 @@ class PipeSafeTextIO:
     """
 
     def __init__(self, stream: Any) -> None:
+        # stdout 可能是 None（pythonw / fd 1 已关闭 / 分离的服务进程）：
+        # 按「已损坏的接收端」处理，写入静默丢弃而不是每次写都 AttributeError
         self._stream = stream
-        self._broken = False
+        self._broken = stream is None
 
     @staticmethod
     def _is_pipe_error(exc: OSError) -> bool:
@@ -363,6 +408,8 @@ class PipeSafeTextIO:
             return False
 
     def fileno(self) -> int:
+        if self._stream is None:
+            raise OSError("stdout 不可用")
         return self._stream.fileno()
 
     @property

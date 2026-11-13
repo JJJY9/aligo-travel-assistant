@@ -172,6 +172,19 @@ else:
 # 移除其他智能体的导入，改用懒加载
 
 
+def _console_kwargs() -> dict:
+    """Rich Console 的宽度守卫：无效 COLUMNS（0 / 1 / 非数字）会让 Rich 把
+    max_width 缓存成 0/-1，横幅 / 帮助 / 表格全部静默消失。此时显式回退 80；
+    正整数交给 Rich 自适应。"""
+    try:
+        columns = int(os.environ.get("COLUMNS", "0") or "0")
+    except ValueError:
+        columns = 0
+    if columns >= 20:
+        return {}
+    return {"width": 80}
+
+
 class AligoCLI:
     """Aligo 商旅助手 CLI"""
 
@@ -179,9 +192,15 @@ class AligoCLI:
         """初始化 CLI"""
         # stdout 走管道安全包装：`| head` 提前关闭后 Rich 写入静默丢弃，
         # 不再在错误分支二次抛错打出 traceback（退出时还原见 run()）
-        self.console = _SanitizedConsole(file=PipeSafeTextIO(sys.stdout))
+        self.console = _SanitizedConsole(
+            file=PipeSafeTextIO(sys.stdout), **_console_kwargs()
+        )
         self.user_id = None
         self.session_id = None
+        # 用户 ID 是否来自非 TTY 管道的首行：EOF 时一个命令都没读到要显式
+        # 失败，避免把被吞掉的查询当成一次成功运行
+        self._user_id_from_stdin = False
+        self._processed_any_command = False
         self.memory_manager = None
         self.orchestrator = None
         self.intention_agent = None
@@ -230,7 +249,9 @@ class AligoCLI:
                 self._interrupt["at_prompt"] = True
                 try:
                     value = (
-                        Prompt.ask("用户ID", default="default_user").strip()
+                        Prompt.ask(
+                            "用户ID", default="default_user", console=self.console
+                        ).strip()
                         or "default_user"
                     )
                 finally:
@@ -256,6 +277,8 @@ class AligoCLI:
                 )
                 raise SystemExit(1) from None
             if _valid_web_id(value):
+                if not getattr(sys.stdin, "isatty", lambda: True)():
+                    self._user_id_from_stdin = True
                 return value
             if not getattr(sys.stdin, "isatty", lambda: True)():
                 # 非交互管道里下一行是查询数据而不是身份重试：继续循环会把
@@ -1485,6 +1508,17 @@ class AligoCLI:
             try:
                 await self.initialize_system()
                 await asyncio.sleep(0)  # 取消派发检查点
+            except OSError as exc:
+                # 数据目录不可写 / 句柄失效等初始化失败：原始 traceback 对
+                # 用户没有可操作性，给出目录与排查建议
+                self.console.print(
+                    f"[red]启动失败：{_terminal_safe(exc)}[/red]"
+                )
+                self.console.print(
+                    "[dim]请检查数据目录（ALIGO_DATA_DIR）是否指向可写目录，"
+                    "或运行 python cli.py doctor 排查[/dim]"
+                )
+                raise SystemExit(1) from None
             except KeyboardInterrupt:
                 _abort_startup("\n已取消，退出")
                 raise SystemExit(130) from None
@@ -1505,7 +1539,7 @@ class AligoCLI:
                     try:
                         interrupt["at_prompt"] = True
                         try:
-                            user_input = Prompt.ask("\n[cyan]>[/cyan]")
+                            user_input = Prompt.ask("\n[cyan]>[/cyan]", console=self.console)
                         finally:
                             interrupt["at_prompt"] = False
                     except (RuntimeError, ValueError, OSError) as exc:
@@ -1528,6 +1562,7 @@ class AligoCLI:
 
                     if not user_input.strip():
                         continue
+                    self._processed_any_command = True
 
                     # 处理命令
                     command = user_input.strip().lower()
@@ -1560,6 +1595,19 @@ class AligoCLI:
                 except EOFError:
                     # 管道 / IDE 末尾：退出，避免每次循环都报错刷屏
                     self.console.print()
+                    if getattr(self, "_user_id_from_stdin", False) and not getattr(
+                        self, "_processed_any_command", False
+                    ):
+                        # 首行被当作用户 ID、其后没有任何命令：多半是把
+                        # 整段查询喂进了管道，真实请求被吞掉——不能以 0
+                        # 汇报成功
+                        self.console.print(
+                            "未从管道读取到任何命令（首行是用户 ID，其后每行"
+                            "是一条命令）；如只想问一个问题，请直接运行 "
+                            "python cli.py ask <用户ID> <问题>",
+                            style="red",
+                        )
+                        raise SystemExit(2) from None
                     self.console.print("未检测到输入，已退出", style="dim")
                     break
                 except asyncio.CancelledError:
@@ -1697,9 +1745,9 @@ def run_doctor_standalone(
         )
         return 1 if failed else 0
     if Console is not None:
-        Console().print(build_report_table(results))
+        Console(**_console_kwargs()).print(build_report_table(results))
         text, style = summarize(results)
-        Console().print(text, style=style)
+        Console(**_console_kwargs()).print(text, style=style)
     else:
         # rich 缺失时退回纯文本：依赖缺失本身也要能被如实看到
         for item in results:
