@@ -1188,6 +1188,11 @@ def test_redis_backfill_skipped_while_degraded(monkeypatch):
     _prefs, recent = runtime._memory_snapshot()
     assert len(recent) == 2, "回填结果仍用于本轮上下文"
     assert added == [], "Redis 降级期间不能把回填写入故障重放日志"
+    # 回填写入影子缓存：编排器 / 子智能体本轮读取短期记忆时也能看到
+    assert [m["content"] for m in redis_mem._fallback.messages] == [
+        "旧问题",
+        "旧回答",
+    ], redis_mem._fallback.messages
 
     monkeypatch.setattr(
         conversation_module, "redis_short_term_available", lambda: True
