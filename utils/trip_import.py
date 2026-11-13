@@ -522,6 +522,9 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
 # 并扫 trip_id），且整批持用户锁；5000 条在本地实测约 10 秒，与备份恢复
 # 的 _MAX_TRIPS 同一量级，避免一个文件把对话 / 行程写入阻塞数分钟。
 _MAX_IMPORT_ROWS = 5000
+# 账号内行程总量上限（与 Web 新增行程的 MAX_TRIP_ENTRIES、备份恢复的
+# _MAX_TRIPS 一致）：越过该上限后全量导出会被拒绝，必须先清理
+MAX_TOTAL_TRIPS = 5000
 # 解析错误只在结果里保留前 50 条（HTTP 400 只用前 5 条原因）：一个 1MB
 # 的坏文件可能有数十万条错误，全量物化会占用上百 MB 内存。
 _MAX_SKIPPED = 50
@@ -596,9 +599,24 @@ def import_trips_from_text(
     # 新建行程才补默认目的；已存在（含本批前一行刚新建）的行程保留原目的。
     # 只在写入前扫一次库；批内同身份行必须按顺序加入 pending，否则后一行
     # 会被误判为「新行程」补默认值，覆盖前一行显式给出的目的。
-    existing_keys = {
-        trip_identity(trip) for trip in store.get_trip_history(limit=None)
-    }
+    history = store.get_trip_history(limit=None)
+    existing_keys = {trip_identity(trip) for trip in history}
+    # 与 Web 新增行程的上限同口径：超过总量后 user-export / GET /api/export
+    # 会拒绝导出全量备份，账号将无法再产生可恢复的备份
+    planned_keys = set(existing_keys)
+    planned_created = 0
+    for row in rows:
+        key = trip_identity(row)
+        if key in planned_keys:
+            continue
+        planned_keys.add(key)
+        planned_created += 1
+    if len(history) + planned_created > MAX_TOTAL_TRIPS:
+        raise ValueError(
+            f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
+            f"（现有 {len(history)} + 新增 {planned_created}），"
+            "请先清理历史行程后重试"
+        )
     pending_keys = set(existing_keys)
     for row in rows:
         key = trip_identity(row)

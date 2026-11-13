@@ -1276,6 +1276,15 @@ class AligoCLI:
             self.console.print(f"[red]导出中止：{exc}[/red]")
             return
         try:
+            # 与 standalone user-export 同口径：损坏隔离后不能把空快照
+            # 当作成功备份写出
+            quarantined = _recovered_corrupt_backup(store)
+            if quarantined:
+                self.console.print(
+                    "[red]导出中止：记忆文件损坏，已隔离备份到 "
+                    f"{quarantined}（当前会导出空快照）[/red]"
+                )
+                return
             snapshot = getattr(store, "export_snapshot", None)
             if callable(snapshot):
                 sections = snapshot()
@@ -2622,6 +2631,17 @@ def run_user_export_standalone(
         return 1
     try:
         try:
+            # 损坏文件已被隔离时以空快照启动：继续导出会写出一份全空的
+            # 「成功备份」，只按退出码判断的备份脚本会据此清理原数据
+            quarantined = _recovered_corrupt_backup(store)
+            if quarantined:
+                print(
+                    _terminal_safe(
+                        "导出中止：记忆文件损坏，已隔离备份到 "
+                        f"{quarantined}（当前会导出空快照）"
+                    )
+                )
+                return 1
             data: dict[str, Any] = {
                 "user_id": user_id,
                 "session_id": "",
@@ -3473,6 +3493,16 @@ def run_trips_dedupe_standalone(
         close = getattr(store, "close", None)
         if callable(close):
             close()
+
+
+def _recovered_corrupt_backup(store: Any) -> str | None:
+    """损坏记忆文件的隔离备份路径（无此状态返回 None）。
+
+    存储层在 JSON 损坏时会把文件改名为 ``.corrupt-*`` 并以空快照启动；
+    备份 / 清理脚本必须能区分「用户没有数据」与「读不到用户数据」。
+    """
+    getter = getattr(store, "get_recovered_corrupt_backup", None)
+    return getter() if callable(getter) else None
 
 
 def _open_cli_store(user_id: str):
@@ -4795,6 +4825,14 @@ def run_trip_add_standalone(
             before = len(store.get_trip_history(limit=None))
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
+        # 与 Web POST /api/trips 同一上限：越过总量后 user-export 会拒绝
+        # 导出全量备份（账号再也产生不了可恢复备份），必须在写入口拦住
+        from utils.trip_import import MAX_TOTAL_TRIPS
+
+        if before >= MAX_TOTAL_TRIPS:
+            return _fail(
+                f"行程数量已达上限（{MAX_TOTAL_TRIPS}），请先删除旧行程"
+            )
         record = {
             "origin": origin,
             "destination": destination,
@@ -5755,6 +5793,18 @@ def run_preference_set_standalone(
         return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
+            # 与 Web PUT /api/preferences 同一上限：只新增类型时检查，
+            # 已有类型的值更新不受影响；越过上限后面板新增会被 409 挡住
+            from utils.user_import import _MAX_PREFERENCES
+
+            existing_prefs = store.get_preference() or {}
+            if (
+                pref_type not in existing_prefs
+                and len(existing_prefs) >= _MAX_PREFERENCES
+            ):
+                return _fail(
+                    f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除旧偏好"
+                )
             store.save_preference(pref_type, saved_value)
             saved = store.get_preference(pref_type)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因

@@ -594,6 +594,28 @@ def test_pref_set_json_value_depth_guard(monkeypatch):
     print("✓ --json-value 嵌套深度护栏（含 RecursionError）")
 
 
+def test_pref_set_rejects_new_type_over_limit(monkeypatch):
+    """偏好类型达到上限后拒绝新增类型；已有类型的更新不受影响。"""
+    from utils import user_import as user_import_module
+
+    store = _WriteStore({"home_location": "北京"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    monkeypatch.setattr(user_import_module, "_MAX_PREFERENCES", 1)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "hotel_brands", "汉庭")
+    assert code == 1 and "上限" in out.getvalue(), out.getvalue()
+    assert store.saved == [], "达到上限时不能写入新类型"
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "home_location", "上海")
+    assert code == 0
+    assert store.saved == [("home_location", "上海")]
+    print("✓ pref-set 偏好类型超限时拒绝新增")
+
 if __name__ == "__main__":
     for case in (
         test_preferences_list_output,
@@ -613,6 +635,7 @@ if __name__ == "__main__":
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
         test_pref_set_rejects_oversized_value,
+        test_pref_set_rejects_new_type_over_limit,
     ):
         mp = pytest.MonkeyPatch()
         try:

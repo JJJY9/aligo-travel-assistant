@@ -1890,6 +1890,50 @@ def test_preview_normalizes_legacy_integer_session_id():
     print("✓ 预览与导入的会话去重键归一化一致")
 
 
+def test_import_repeat_backup_at_limit_is_idempotent(monkeypatch):
+    """接近上限时重复导入自己的备份成功；--dry-run 与真实执行同一结论。"""
+    from utils import user_import as module
+
+    payload = {
+        "trip_history": [
+            {"origin": "北京", "destination": "上海", "start_date": "2026-03-01"}
+        ],
+        "chat_history": [{"role": "user", "content": "你好", "session_id": "s1"}],
+    }
+    sections, errors = module.parse_user_export(
+        json.dumps(payload, ensure_ascii=False)
+    )
+    assert errors == [], errors
+    # 备份里多一条新行程：先在正常上限下解析（解析侧也会按上限截断），
+    # 再收紧恢复上限验证「新增越限」路径
+    extra = json.loads(json.dumps(payload))
+    extra["trip_history"].append(
+        {"origin": "北京", "destination": "杭州", "start_date": "2026-03-02"}
+    )
+    sections2, _ = module.parse_user_export(
+        json.dumps(extra, ensure_ascii=False)
+    )
+    assert len(sections2["trips"]) == 2
+
+    store = _real_store("u-limit-idem")
+    module.import_user_data(store, sections)
+    stats = store.get_statistics()
+    assert stats["total_trips"] == 1 and stats["total_messages"] == 1
+
+    monkeypatch.setattr(module, "_MAX_TRIPS", 1)
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+    counts = module.import_user_data(store, sections)
+    assert counts["trips_created"] == 0 and counts["trips_updated"] == 1
+    assert counts["messages_added"] == 0 and counts["messages_skipped"] == 1
+    preview = module.preview_user_import(store, sections)
+    assert preview["trips_created"] == 0 and preview["messages_added"] == 0
+
+    with pytest.raises(ValueError, match="上限"):
+        module.preview_user_import(store, sections2)
+    with pytest.raises(ValueError, match="上限"):
+        module.import_user_data(store, sections2)
+    print("✓ 上限内幂等重放与 dry-run 一致")
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -1949,6 +1993,7 @@ if __name__ == "__main__":
         test_runner_skips_reserved_and_deleted_sessions,
         test_runner_skips_trip_only_reserved_and_deleted_sessions,
         test_runner_rolls_back_session_deleted_during_write,
+        test_import_repeat_backup_at_limit_is_idempotent,
     ):
         mp = pytest.MonkeyPatch()
         try:

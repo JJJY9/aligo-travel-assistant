@@ -759,6 +759,9 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
 
 def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     """预览恢复结果（只读）：返回与 import_user_data 相同键的计数，不写库。"""
+    # --dry-run 与真实执行同一上限口径：预览成功、真跑失败会让恢复脚本
+    # 误判（此前上限只看备份条数，重复导入的大账号两边结论相反）
+    _enforce_import_limits(store, sections)
     result: dict[str, Any] = {
         "preferences": len(sections.get("preferences", {})),
         "knowledge": len(sections.get("knowledge", [])),
@@ -881,6 +884,128 @@ def _resolve_dropped_trip_links(store: Any, trips: list[dict[str, Any]]) -> None
             row["session_id"] = None
 
 
+def _planned_new_counts(
+    store: Any, sections: dict[str, Any]
+) -> tuple[int | None, int | None]:
+    """按写入层去重语义预演真正新增的行程 / 消息条数。
+
+    返回 ``(新增行程, 新增消息)``；存储后端不提供读取接口时对应项为
+    ``None``（调用方按「全部视为新增」保守处理）。恢复上限检查与
+    ``preview_user_import`` 共用：备份里与现有数据重复的行会被去重
+    更新 / 跳过，不计入「恢复后总数」——否则接近上限的账号连自己刚
+    导出的备份都无法重放（幂等恢复失效），且 --dry-run 与真实执行
+    结论相反。
+    """
+    new_trips: int | None = None
+    history_getter = getattr(store, "get_trip_history", None)
+    if callable(history_getter):
+        pending_keys: set[tuple[str, str, str, str]] | None = None
+        try:
+            pending_keys = {
+                trip_identity(trip) for trip in history_getter(limit=None)
+            }
+        except Exception:  # noqa: BLE001 - 读取失败按「全部新增」保守处理
+            pending_keys = None
+        if pending_keys is not None:
+            new_trips = 0
+            for trip_row in sections.get("trips", []):
+                trip_key = trip_identity(trip_row)
+                if trip_key in pending_keys:
+                    continue
+                new_trips += 1
+                pending_keys.add(trip_key)
+
+    new_messages: int | None = None
+    messages = sections.get("messages", [])
+    history_getter = getattr(store, "get_chat_history", None)
+    if messages and callable(history_getter):
+        existing: Counter[tuple[str | None, Any, str]] | None
+        try:
+            existing = Counter(
+                (
+                    _message_session_key(message.get("session_id")),
+                    message.get("role"),
+                    str(message.get("content") or ""),
+                )
+                for message in history_getter(limit=None)
+            )
+        except Exception:  # noqa: BLE001 - 读取失败按「全部新增」保守处理
+            existing = None
+        if existing is not None:
+            new_messages = 0
+            for message in messages:
+                message_key = (
+                    _message_session_key(message.get("session_id")),
+                    message.get("role"),
+                    message.get("content"),
+                )
+                if existing[message_key] > 0:
+                    existing[message_key] -= 1
+                    continue
+                new_messages += 1
+    return new_trips, new_messages
+
+
+def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
+    """恢复前的总量上限预检（与导出上限一致，避免恢复后再也无法导出）。
+
+    先用统计快速判断；只有「现有 + 备份条数」看起来超限时才按去重语义
+    预演真实新增量：大账号重复导入自己的备份不会被当成新增而拒绝。
+    """
+    planned: tuple[int | None, int | None] | None = None
+
+    def planned_counts() -> tuple[int | None, int | None]:
+        nonlocal planned
+        if planned is None:
+            planned = _planned_new_counts(store, sections)
+        return planned
+
+    def existing_total(name: str) -> int | None:
+        getter = getattr(store, "get_statistics", None)
+        if not callable(getter):
+            return None
+        try:
+            return int((getter() or {}).get(name) or 0)
+        except Exception:  # noqa: BLE001 - 统计失败不阻断恢复
+            return None
+
+    messages = sections.get("messages", [])
+    existing_messages = existing_total("total_messages")
+    if (
+        existing_messages is not None
+        and messages
+        and existing_messages + len(messages) > _MAX_MESSAGES
+    ):
+        _planned_trips, new_messages = planned_counts()
+        if new_messages is None:
+            new_messages = len(messages)
+        if existing_messages + new_messages > _MAX_MESSAGES:
+            raise ValueError(
+                f"恢复后消息总数将超过上限 {_MAX_MESSAGES}"
+                f"（现有 {existing_messages} + 新增 {new_messages}；"
+                f"备份中 {len(messages) - new_messages} 条为重复导入），"
+                "请先清理历史消息后重试"
+            )
+
+    trips = sections.get("trips", [])
+    existing_trips = existing_total("total_trips")
+    if (
+        existing_trips is not None
+        and trips
+        and existing_trips + len(trips) > _MAX_TRIPS
+    ):
+        new_trips, _planned_messages = planned_counts()
+        if new_trips is None:
+            new_trips = len(trips)
+        if existing_trips + new_trips > _MAX_TRIPS:
+            raise ValueError(
+                f"恢复后行程总数将超过上限 {_MAX_TRIPS}"
+                f"（现有 {existing_trips} + 新增 {new_trips}；"
+                f"备份中 {len(trips) - new_trips} 条与现有行程重复），"
+                "请先清理历史行程后重试"
+            )
+
+
 def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     """把解析后的数据写入长期记忆；返回各类计数（供 CLI / Web 输出）。"""
     result: dict[str, Any] = {
@@ -898,40 +1023,8 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
 
     # 存量 + 本备份不能越过导出上限：否则恢复后 /api/export 与 CLI
     # user-export 永久 413 / 中止，该账号再也导不出备份（上限要避免的正是
-    # 这种不可恢复状态）。统计不可读时不拦截，由写入层自行报错
-    def _existing_total(name: str) -> int | None:
-        getter = getattr(store, "get_statistics", None)
-        if not callable(getter):
-            return None
-        try:
-            return int((getter() or {}).get(name) or 0)
-        except Exception:  # noqa: BLE001 - 统计失败不阻断恢复
-            return None
-
-    existing_messages = _existing_total("total_messages")
-    incoming_messages = len(sections.get("messages", []))
-    if (
-        existing_messages is not None
-        and incoming_messages
-        and existing_messages + incoming_messages > _MAX_MESSAGES
-    ):
-        raise ValueError(
-            f"恢复后消息总数将超过上限 {_MAX_MESSAGES}"
-            f"（现有 {existing_messages} + 导入 {incoming_messages}），"
-            "请先清理历史消息后重试"
-        )
-    existing_trips = _existing_total("total_trips")
-    incoming_trips = len(sections.get("trips", []))
-    if (
-        existing_trips is not None
-        and incoming_trips
-        and existing_trips + incoming_trips > _MAX_TRIPS
-    ):
-        raise ValueError(
-            f"恢复后行程总数将超过上限 {_MAX_TRIPS}"
-            f"（现有 {existing_trips} + 导入 {incoming_trips}），"
-            "请先清理历史行程后重试"
-        )
+    # 这种不可恢复状态）。重复行按去重语义不计入新增，见 _enforce_import_limits
+    _enforce_import_limits(store, sections)
 
     for key, value in sections.get("preferences", {}).items():
         store.save_preference(key, value)

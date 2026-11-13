@@ -1238,6 +1238,38 @@ def test_ics_summary_balanced_full_width_parens():
     print("✓ SUMMARY 全角括号按最外层配对拆分")
 
 
+def test_import_rejects_when_total_limit_would_be_exceeded(monkeypatch):
+    """导入不能把行程总数推过上限；与现有行程重复的行不计入新增。"""
+    from utils import trip_import as module
+
+    store = _ImportStore()
+    store.trips.append(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "出差",
+        }
+    )
+    monkeypatch.setattr(module, "MAX_TOTAL_TRIPS", 1)
+    duplicate_csv = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        "北京,上海,2026-12-01,2026-12-03,出差\n"
+    )
+    result = module.import_trips_from_text(store, duplicate_csv)
+    assert (result["created"], result["updated"]) == (0, 1), result
+
+    new_csv = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        "北京,杭州,2026-12-02,,\n"
+    )
+    with pytest.raises(ValueError, match="上限"):
+        module.import_trips_from_text(store, new_csv, dry_run=True)
+    with pytest.raises(ValueError, match="上限"):
+        module.import_trips_from_text(store, new_csv)
+    print("✓ 行程导入总量上限（重复行不计入新增）")
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -1281,6 +1313,7 @@ if __name__ == "__main__":
         test_runner_imports_ics_and_dedupes,
         test_runner_dispatch_ics,
         test_import_rejects_oversized_raw_text,
+        test_import_rejects_when_total_limit_would_be_exceeded,
     ):
         mp = pytest.MonkeyPatch()
         try:

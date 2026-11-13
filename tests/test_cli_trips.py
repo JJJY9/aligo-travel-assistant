@@ -1272,6 +1272,20 @@ def test_trip_add_rejects_non_padded_date(monkeypatch):
     assert code == 1 and "YYYY-MM-DD" in out
     print("✓ trip-add 拒绝非补零日期")
 
+def test_trip_add_rejects_when_total_limit_reached(monkeypatch):
+    """行程总数达到上限后不再写入：否则 user-export 将永久无法导出。"""
+    from utils import trip_import as trip_import_module
+
+    store = _AddStore([_trip("上海", "2026-12-01", trip_id="trip_1")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    monkeypatch.setattr(trip_import_module, "MAX_TOTAL_TRIPS", 1)
+    code, out = _run_trip_add("u1", "北京", "杭州", "2026-12-02", None)
+    assert code == 1 and "上限" in out, out
+    assert store.saved == [], "达到上限时不能写入"
+    print("✓ trip-add 行程总量超限时拒绝写入")
+
 if __name__ == "__main__":
     for case in (
         test_trip_conflicts_excludes_only_saved_record_with_duplicate_ids,
@@ -1294,6 +1308,7 @@ if __name__ == "__main__":
         test_trips_query_args_and_dispatch,
         test_trip_add_saves_and_reports_conflicts,
         test_trip_add_json_output,
+        test_trip_add_rejects_when_total_limit_reached,
         test_trip_add_dedupes_same_route_and_dates,
         test_trip_add_without_purpose_preserves_existing,
         test_trip_add_reports_success_when_post_save_read_fails,
