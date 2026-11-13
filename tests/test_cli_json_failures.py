@@ -141,11 +141,62 @@ def test_corrupt_snapshot_fails_read_commands(monkeypatch):
     print("✓ 损坏隔离后读命令失败而不是回报空数据")
 
 
+def test_corrupt_snapshot_blocks_write_commands(monkeypatch):
+    """损坏隔离期间写命令同样拒绝：不能在空快照上重建主文件。"""
+    import tempfile
+    from pathlib import Path
+
+    backup = "data/memory/u1.json.corrupt-20261113-1200"
+
+    class _CorruptStore:
+        def get_recovered_corrupt_backup(self):
+            return backup
+
+        def _unexpected(self, *args, **kwargs):
+            raise AssertionError("损坏状态必须先拒绝，不能触碰存储")
+
+        get_trip_history = _unexpected
+        save_trip_history = _unexpected
+        get_preference = _unexpected
+        save_preference = _unexpected
+        delete_preference = _unexpected
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *a, **k: _CorruptStore()
+    )
+    backup_file = Path(tempfile.mkdtemp()) / "backup.json"
+    backup_file.write_text(
+        json.dumps({"preferences": {"home_location": "上海"}}), encoding="utf-8"
+    )
+    cases = (
+        lambda: cli.run_trip_add_standalone(
+            "u1", "北京", "上海", "2026-12-01", as_json=True
+        ),
+        lambda: cli.run_preference_set_standalone(
+            "u1", "hotel_brands", "汉庭", as_json=True
+        ),
+        lambda: cli.run_user_import_standalone(
+            "u1", str(backup_file), as_json=True
+        ),
+    )
+    for case in cases:
+        code, out = _run(case)
+        payload = json.loads(out)
+        assert code == 1 and payload["ok"] is False, out
+        assert "损坏" in payload["error"], payload
+        assert backup in payload["error"], payload
+    print("✓ 损坏隔离后写命令拒绝执行（不重建空快照）")
+
+
 if __name__ == "__main__":
     for case in (
         test_json_failures_are_structured,
         test_json_invalid_user_is_structured,
         test_corrupt_snapshot_fails_read_commands,
+        test_corrupt_snapshot_blocks_write_commands,
     ):
         mp = pytest.MonkeyPatch()
         try:

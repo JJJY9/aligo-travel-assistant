@@ -154,6 +154,24 @@ def test_ics_lines_folded_at_75_bytes():
     print("✓ ICS 超过 75 字节的行折行")
 
 
+def test_ics_fold_large_field_is_linear():
+    """超长单字段折行不能 O(n²)：备份恢复不限字段长度，2MB 字段不应卡住。"""
+    import time
+
+    from utils.trip_export import _ics_fold
+
+    line = "SUMMARY:" + "很长的行程说明" * 50000  # ≈ 1.2MB UTF-8
+    started = time.monotonic()
+    folded = _ics_fold(line)
+    elapsed = time.monotonic() - started
+    assert elapsed < 3, f"折行 1.2MB 字段耗时 {elapsed:.2f}s"
+    unfolded = folded.replace("\r\n ", "")
+    assert unfolded == line, "折行 / 展开必须无损"
+    physical = folded.split("\r\n")
+    assert all(len(part.encode("utf-8")) <= 75 for part in physical)
+    print("✓ ICS 折行大字段为线性复杂度")
+
+
 def test_render_trips_html():
     """HTML 台账：内容全部转义、按出发日期倒序、无日期行标注。"""
     from utils.trip_export import render_trips_html
@@ -373,6 +391,7 @@ if __name__ == "__main__":
     test_ics_escape_and_multiple_events()
     test_csv_uses_single_line_endings()
     test_ics_lines_folded_at_75_bytes()
+    test_ics_fold_large_field_is_linear()
     test_render_trips_html()
     test_many_leading_quotes_do_not_recurse()
     test_unpadded_dates_normalized_in_exports()
