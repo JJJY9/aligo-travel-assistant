@@ -256,12 +256,34 @@ _PRE_ROUTE_METRIC_PATHS = frozenset(
         "/api/trips/dedupe",
         "/api/sessions/export",
         "/api/knowledge/duplicates/cleanup",
+        # 读接口的尾斜杠 307 同样在路由前拒绝：归入 __unmatched__ 会与
+        # 404 口径混在同一桶，误导「未知路径探测」告警
+        "/api/status",
+        "/api/sessions",
+        "/api/export",
+        "/api/trips/calendar",
+        "/api/trips/export",
+        "/api/knowledge",
+        "/api/knowledge/search",
+        "/api/knowledge/eval",
+        "/api/knowledge/export",
+        "/api/knowledge/categories",
+        "/api/knowledge/duplicates",
+        "/api/health",
+        "/api/metrics",
+        "/api/doctor",
+        "/api/weather",
+        "/api/preferences",
     }
 )
 _PRE_ROUTE_METRIC_PATTERNS = (
     (
         re.compile(r"^/api/knowledge/documents/\d+$"),
         "/api/knowledge/documents/{doc_id}",
+    ),
+    (
+        re.compile(r"^/api/sessions/[\w-]+/export$"),
+        "/api/sessions/{session_id}/export",
     ),
     (re.compile(r"^/api/trips/trip_\d+$"), "/api/trips/{trip_id}"),
     (
@@ -279,15 +301,25 @@ _PRE_ROUTE_METRIC_PATTERNS = (
         re.compile(r"^/api/preferences/[^/]{1,64}$"),
         "/api/preferences/{pref_type}",
     ),
+    (
+        re.compile(r"^/api/knowledge/documents/\d+/group$"),
+        "/api/knowledge/documents/{doc_id}/group",
+    ),
+    (
+        re.compile(r"^/api/trips/trip_\d+/calendar$"),
+        "/api/trips/{trip_id}/calendar",
+    ),
 )
 
 
 def _metric_path_before_route(route_path: str) -> str:
     """路由前拒绝（413 / 尾斜杠重定向）的指标标签：已知接口归一。"""
-    if route_path in _PRE_ROUTE_METRIC_PATHS:
-        return route_path
+    # 尾斜杠重定向的输入带 "/" 后缀：先按去掉尾斜杠的路径查表
+    lookup = route_path.rstrip("/") if len(route_path) > 1 else route_path
+    if lookup in _PRE_ROUTE_METRIC_PATHS:
+        return lookup
     for pattern, label in _PRE_ROUTE_METRIC_PATTERNS:
-        if pattern.fullmatch(route_path):
+        if pattern.fullmatch(lookup):
             return label
     return _UNMATCHED_METRIC_PATH
 
@@ -523,9 +555,15 @@ class RequestContextMiddleware:
                     metric_path,
                     status_code,
                     elapsed_ms,
-                    # SSE 长连接 / 客户端中止（499）的持续时间不能计入延迟分位
+                    # SSE 长连接 / 客户端中止（499）的持续时间不能计入延迟分位；
+                    # 流式路由上的路由前拒绝（307/413/429/503）不是长连接，
+                    # 按实际是否成功进入流式输出（<400）判断
                     streaming=(
-                        metric_path == "/api/chat/stream" or status_code == 499
+                        status_code == 499
+                        or (
+                            metric_path == "/api/chat/stream"
+                            and status_code < 400
+                        )
                     ),
                 )
 
