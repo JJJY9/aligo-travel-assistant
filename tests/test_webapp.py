@@ -9710,6 +9710,32 @@ def test_early_413_metrics_labeled_as_import(monkeypatch):
         REQUEST_METRICS.reset()
 
 
+def test_pre_route_metric_labels_cover_read_routes():
+    """读接口的尾斜杠重定向也按接口名归一，不混入 __unmatched__。"""
+    from webapp import server as server_module
+
+    assert server_module._metric_path_before_route("/api/status/") == "/api/status"
+    assert (
+        server_module._metric_path_before_route("/api/sessions/abc/export/")
+        == "/api/sessions/{session_id}/export"
+    )
+    assert (
+        server_module._metric_path_before_route("/api/trips/trip_1/calendar/")
+        == "/api/trips/{trip_id}/calendar"
+    )
+    assert (
+        server_module._metric_path_before_route(
+            "/api/knowledge/documents/12/group/"
+        )
+        == "/api/knowledge/documents/{doc_id}/group"
+    )
+    assert (
+        server_module._metric_path_before_route("/api/no-such-route/")
+        == "__unmatched__"
+    )
+    print("✓ 路由前指标标签覆盖读接口与尾斜杠")
+
+
 def test_doctor_rate_limited(monkeypatch):
     """未鉴权的自检接口接入知识库桶限流。"""
     from webapp import server as server_module
@@ -10856,6 +10882,7 @@ if __name__ == "__main__":
     test_doctor_endpoint()
     test_create_trip_duplicate_ids_report_other_overlap()
     test_update_trip_invalid_legacy_end_date_keeps_conflicts()
+    test_pre_route_metric_labels_cover_read_routes()
     for case in (
         test_chat_stream_error_event_redacts_internal_details,
         test_chat_stream_user_facing_error_keeps_curated_message,
