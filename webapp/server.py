@@ -124,7 +124,7 @@ from utils.travel_stats import summarize_travel
 from utils.timestamps import chronological_key
 from utils.turn_meta import extract_turn_meta
 from utils.version import APP_VERSION
-from utils.weather import WeatherError, fetch_weather
+from utils.weather import WeatherError, fetch_weather, peek_cached_weather
 
 logger = logging.getLogger(__name__)
 
@@ -3060,6 +3060,11 @@ def create_app(model: Any = None) -> FastAPI:
         name = city.strip()
         if not name:
             raise HTTPException(status_code=422, detail="城市不能为空")
+        # 10 分钟缓存命中不产生上游请求，不应占用保护 Open-Meteo 额度的
+        # IP 桶；只有真正可能访问上游时才计费（侧栏每轮刷新都会调这里）
+        cached = peek_cached_weather(name)
+        if cached is not None:
+            return JSONResponse(content=jsonable_encoder(cached))
         headers = await asyncio.to_thread(
             _enforce_weather_rate_limit, state, request
         )

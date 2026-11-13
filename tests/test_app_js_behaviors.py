@@ -611,6 +611,17 @@ def test_user_backup_import_rejects_non_utf8():
     print("✓ 备份恢复拒绝非 UTF-8 文件")
 
 
+def test_upcoming_weather_normalizes_unpadded_start_date():
+    """历史未补零出发日期也要命中预报行，而不是退回今日。"""
+    results = _run_harness("upcomingWeather")
+    unpadded = results["unpadded"]
+    assert unpadded["hidden"] is False, unpadded
+    assert "出发日 5°C~16°C" in unpadded["text"], unpadded["text"]
+    assert "今日" not in unpadded["text"], unpadded["text"]
+    out_of_window = results["out_of_window"]["text"]
+    assert "今日 10°C~20°C" in out_of_window, out_of_window
+    print("✓ 出发日天气：未补零日期归一后命中，窗口外退回今日")
+
 if __name__ == "__main__":
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
@@ -632,4 +643,5 @@ if __name__ == "__main__":
     test_search_hit_renders_bounded_window()
     test_silent_reload_restores_expanded_window()
     test_search_failure_restores_previous_query()
+    test_upcoming_weather_normalizes_unpadded_start_date()
     print("\n全部通过")
