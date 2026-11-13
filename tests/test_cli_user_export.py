@@ -4,6 +4,8 @@ import io
 import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -276,6 +278,28 @@ def test_user_export_refuses_when_memory_file_quarantined(monkeypatch):
     assert store.closed
     print("✓ 记忆文件损坏隔离后拒绝导出空备份")
 
+
+def test_user_export_scans_existing_quarantine_backups(monkeypatch, tmp_path):
+    """更早进程留下的 .corrupt-* 备份同样拦截导出（主文件缺失即视为损坏）。"""
+    class _MissingStore(_FakeStore):
+        db_path = str(tmp_path / "u-old.json")
+
+    (tmp_path / "u-old.json.corrupt-20260101-000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+    store = _MissingStore()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    target = tmp_path / "exports"
+    code, out = _run("u-old", str(target))
+    assert code == 1, out
+    assert "损坏" in out, out
+    assert not target.exists() or list(target.glob("*")) == []
+    # 主文件恢复后不再拦截
+    (tmp_path / "u-old.json").write_text("{}", encoding="utf-8")
+    assert cli._recovered_corrupt_backup(_MissingStore()) is None
+    print("✓ 已存在的隔离备份同样拦截导出")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -291,6 +315,11 @@ if __name__ == "__main__":
         mp.undo()
         mp = pytest.MonkeyPatch()
         test_user_export_refuses_when_memory_file_quarantined(mp)
+        mp.undo()
+        mp = pytest.MonkeyPatch()
+        test_user_export_scans_existing_quarantine_backups(
+            mp, Path(tempfile.mkdtemp())
+        )
     finally:
         mp.undo()
     print("\n全部通过")

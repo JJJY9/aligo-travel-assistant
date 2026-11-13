@@ -2903,7 +2903,9 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
                 f"{_md_inline(trip.get('destination') or '—')}"
             )
             dates = " ~ ".join(
-                part for part in (trip.get("start_date"), trip.get("end_date")) if part
+                str(part)
+                for part in (trip.get("start_date"), trip.get("end_date"))
+                if part
             ) or "日期未记录"
             lines.append(
                 f"- {route}（{_md_inline(dates)}，"
@@ -2915,7 +2917,12 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
     history = data.get("chat_history") or []
     stats = data.get("statistics") or {}
     usage = _usage_summary(history)
-    archived_ids = set(data.get("archived_sessions") or [])
+    raw_archived = data.get("archived_sessions")
+    archived_ids = {
+        item
+        for item in (raw_archived if isinstance(raw_archived, list) else [])
+        if isinstance(item, str)
+    }
     lines.extend(
         [
             "",
@@ -4966,6 +4973,7 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.get("/api/trips/calendar", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def export_trips_calendar(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -4997,6 +5005,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/trips/export", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def export_trips_file(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
