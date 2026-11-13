@@ -468,6 +468,27 @@ def test_trips_dedupe_panel_flow():
     print("✓ 行程去重面板（空 / 取消 / 执行）")
 
 
+def test_startup_stale_session_not_used_after_failed_click():
+    """初始化期间的用户点击失败时，不能把下一条消息写进从未展示的旧会话。"""
+    results = _run_harness("initStale")
+    assert results["ready"] is True, results
+    assert results["sessionId"] is None, results
+    assert results["stored"] is None, results
+    assert results["welcomeShown"] >= 1, results
+    print("✓ 启动恢复被点击作废后清掉未展示的旧会话")
+
+
+def test_send_message_http_error_not_connection_interruption():
+    """服务端明确返回 4xx/5xx 时不当成连接中断：不对账、不标记连接异常。"""
+    results = _run_harness("httpError")
+    for case in ("rateLimited", "unavailable"):
+        data = results[case]
+        assert data["reconcileCalls"] == [], data
+        assert data["healthText"] != "连接异常", data
+        assert data.get("healthClass") != "health err", data
+    print("✓ HTTP 错误不再触发停止对账 / 连接异常")
+
+
 def test_startup_does_not_override_user_session_click():
     """初始化期间的会话恢复不能作废用户已点击打开的会话。"""
     results = _run_harness("startup")
@@ -642,6 +663,8 @@ if __name__ == "__main__":
     test_trip_import_file_decoding_and_size_guard()
     test_trips_export_button_uses_filtered_ics_endpoint()
     test_trips_dedupe_panel_flow()
+    test_startup_stale_session_not_used_after_failed_click()
+    test_send_message_http_error_not_connection_interruption()
     test_startup_does_not_override_user_session_click()
     test_knowledge_eval_panel_states()
     test_panel_fixes_cursor_stale_session_and_import_batches()
