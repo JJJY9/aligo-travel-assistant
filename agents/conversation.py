@@ -784,6 +784,17 @@ class ConversationRuntime:
                             ):
                                 continue
                             self.memory.short_term.add_message(role, content)
+                    else:
+                        # 降级窗口：写入进程内影子缓存（不登记故障重放），
+                        # 编排器 / 子智能体本轮也能读到回填的历史；恢复后
+                        # 以 Redis 真实内容校正影子缓存
+                        seed = getattr(
+                            self.memory.short_term,
+                            "seed_fallback_context",
+                            None,
+                        )
+                        if callable(seed):
+                            seed(recent)
                 except Exception:  # noqa: BLE001 - 写回失败不影响本轮
                     logger.debug("回填历史写回短期记忆失败", exc_info=True)
         return preferences, recent

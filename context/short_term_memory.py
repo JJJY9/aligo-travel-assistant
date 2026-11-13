@@ -633,6 +633,23 @@ class RedisShortTermMemory:
             journal = _PENDING_JOURNALS.get(self.key)
         return list(journal.ops) if journal is not None else []
 
+    def seed_fallback_context(self, messages: list[dict[str, Any]]) -> None:
+        """降级窗口内把长期记忆回填的上下文写入影子缓存（不登记重放）。
+
+        这些消息来自长期记忆，Redis 里可能本来就有：登记重放会在恢复后
+        重复 RPUSH。但只放在意图上下文里时，编排器 / 子智能体读
+        ``get_recent_context`` 仍是空的——写入影子缓存让本轮子智能体也能
+        看到回填的历史；Redis 恢复后以真实内容校正影子缓存。
+        """
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if role not in ("user", "assistant") or not isinstance(content, str):
+                continue
+            self._fallback.add_message(role, content)
+
     def _append_op(
         self, journal: _PendingJournal, kind: str, payload: Any = None
     ) -> None:
