@@ -1,7 +1,7 @@
 # 本地一键启动 Redis + PostgreSQL（仅用于开发 / 演示）
 #
 # 用法：
-#   docker compose up -d
+#   docker compose up -d --wait    # --wait 会等到两个服务健康后再返回
 #   export REDIS_URL=redis://localhost:6379/0
 #   export DATABASE_URL=postgresql://aligo:aligo@localhost:5432/aligo
 #   python cli.py            # 或 python -m webapp.server
@@ -14,6 +14,13 @@ services:
     ports:
       # 只绑定本机，避免同网段其它机器访问无认证的 Redis
       - "127.0.0.1:6379:6379"
+    # 宿主机 / Docker 重启后自动拉起；容器健康前不要启动应用
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   postgres:
     image: postgres:16-alpine
@@ -26,6 +33,15 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - aligo_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    # 首次 initdb 需要数秒：应用在容器健康前连接会触发 60 秒 JSON 回退，
+    # 造成本地 JSON 与 PostgreSQL 数据分叉
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aligo -d aligo"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
 volumes:
   aligo_pgdata:

@@ -37,6 +37,9 @@ dependencies = [
     "psycopg[binary]==3.3.8",
     "fastapi==0.162.0",
     "uvicorn==0.54.0",
+    # Windows / 无系统时区库的容器：ZoneInfo 需要 tzdata，否则 ICS 的
+    # TZID 被静默当作浮动时间（跨时区日期可能差一天）
+    "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.scripts]

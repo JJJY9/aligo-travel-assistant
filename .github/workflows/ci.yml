@@ -84,6 +84,12 @@ jobs:
             --cov=agents --cov=context --cov=utils --cov=webapp \
             --cov=config_agentscope --cov-report=term-missing:skip-covered
 
-      - name: 打包检查（wheel）
+      - name: 打包检查（wheel 构建 + 安装验证）
         if: matrix.python-version == '3.12'
-        run: python -m build --wheel
+        run: |
+          python -m build --wheel
+          # 安装构建产物并验证入口点 / 包内容：--no-deps 因为运行时依赖已由
+          # requirements 安装，这一步只验证 wheel 本身可安装、可导入、入口可执行
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -c "import webapp.server, cli, utils.paths"
+          aligo-web --help > /dev/null
