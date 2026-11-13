@@ -121,10 +121,23 @@ def test_redact_local_paths_covers_paths_with_spaces():
     assert "C:" not in prose, prose
     print("✓ 含空格路径整体遮蔽且不吞掉错误关键词")
 
+def test_redaction_keeps_url_after_spacey_cjk_path():
+    """含空格续段规则不能把紧跟在路径后的 URL scheme 当成路径片段吃掉。"""
+    raw = (
+        r"加载失败: C:\Users\alice\.cache\model 与 "
+        "https://huggingface.co/BAAI/bge (Connection refused)"
+    )
+    cleaned = redact_paths(raw)
+    assert "alice" not in cleaned, cleaned
+    assert "huggingface.co" not in cleaned and "http(s)://***" in cleaned, cleaned
+    assert "<路径>" in cleaned and "Connection refused" in cleaned
+    print("✓ 路径后的 URL 仍被整体遮蔽")
+
 if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_paths_hides_internal_paths_and_urls()
     test_redact_local_paths_keeps_urls_intact()
     test_redact_local_paths_covers_paths_with_spaces()
+    test_redaction_keeps_url_after_spacey_cjk_path()
     print("caplog 用例需 pytest 运行")
