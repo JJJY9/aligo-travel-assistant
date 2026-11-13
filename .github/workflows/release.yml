@@ -3,13 +3,21 @@
 #
 # 使用方式：
 #   git tag v1.0.1 && git push origin v1.0.1
-# 发布前请同步更新 CHANGELOG.md。
+# 发布前请同步更新 pyproject.toml 版本与 CHANGELOG.md。
+#
+# 手动补发（workflow_dispatch）：必须填写已存在、形如 v1.2.3 的标签；
+# 在分支上直接触发不会出版本发布（标签与 pyproject 版本必须一致）。
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补发布的已存在标签（形如 v1.2.3，且与 pyproject 版本一致）"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -21,11 +29,46 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # 校验「标签提交已在 main 上」需要完整历史
+          fetch-depth: 0
 
       - name: 安装 Python 3.12
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+
+      - name: 校验发布前置条件
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          sys.path.insert(0, ".")
+          tag = os.environ["RELEASE_TAG"].strip()
+          if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+              sys.exit(f"发布标签必须形如 vX.Y.Z，收到 {tag!r}")
+
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text("utf-8"))[
+              "project"
+          ]["version"]
+          if tag.lstrip("v") != version:
+              sys.exit(f"标签 {tag} 与 pyproject 版本 {version} 不一致，拒绝发布")
+
+          subprocess.run(["git", "fetch", "origin", "main"], check=True)
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", "HEAD", "origin/main"]
+          ).returncode != 0:
+              sys.exit("发布提交不在 main 上：请先合并到 main 再打标签")
+          PY
 
       - name: 安装打包工具
         run: |
@@ -35,10 +78,32 @@ jobs:
       - name: 构建 sdist 与 wheel
         run: python -m build
 
+      - name: 校验构建产物版本
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"].strip().lstrip("v")
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          if not wheels or not sdists:
+              sys.exit("构建产物缺失（wheel / sdist）")
+          expected = f"aligo_travel_assistant-{tag}-"
+          for path in wheels + sdists:
+              if not path.name.startswith(expected):
+                  sys.exit(f"产物 {path.name} 与标签版本 {tag} 不一致")
+          PY
+
       - name: 创建 GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --title "${GITHUB_REF_NAME}" \
+          gh release create "${RELEASE_TAG}" dist/* \
+            --verify-tag \
+            --title "${RELEASE_TAG}" \
             --generate-notes
