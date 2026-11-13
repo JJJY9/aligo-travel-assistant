@@ -49,6 +49,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- PostgreSQL 并发与导出一致性：① 会话级 advisory lock 增加实例级 RLock 外层——同一连接上的 `pg_advisory_lock` 对多线程总是可重入，旧线程与新回合共用实例时可并发读改写、静默插出两条身份相同的行程或丢失偏好追加；② `export_snapshot` 记录快照开始时的连接，每个查询后校验未被重建，连接闪断导致整体重试（此前重放查询落在新连接、旧事务上下文静默失效，返回旧新混合的备份）
 - 存储层后端一致性：① 交互式 CLI 构造 MemoryManager 时显式传 `default_data_root()/memory`（此前默认 `data/memory` 锚定包根，设置 `ALIGO_DATA_DIR` 或 wheel 安装时与 Web 面板 / 子命令 / 同会话 export 读写不同文件，重建 venv 即丢）；② PostgreSQL `update_trip` 的重复候选查询按存储身份口径做 CRLF/CR 归一（此前原始等值比较，PG 上可造出 `trip_identity` 相同的两条行程，与 JSON 行为不一致）；③ PG 新建行程不再默认「旅游」目的（JSON 原样保存未提供值），保存命中既有行时刷新 timestamp（与 JSON 一致）；④ PG 批量消息去重的 `session_id` 与 JSON 同口径字符串化（整数 / 字符串视为同一会话）
 - 对话运行时数据目录对齐：ConversationRuntime 的 MemoryManager 此前使用默认 `data/memory`（锚定包根，wheel 下为 site-packages），与 Web 面板 / CLI 使用的 `default_data_root()/memory` 分叉——`/api/chat` 写入的会话、偏好、行程在会话列表、导出、记忆面板与删除里全部不可见，重装 venv 还会静默丢失；现在显式传入运行期数据目录（`ALIGO_DATA_DIR` 同样生效）
 - 流式对话排队有界：`/api/chat/stream` 在返回 StreamingResponse 之前等待同一用户锁此前无超时、无心跳也不检查断连——上一回合（单智能体上限 300 秒）期间第二个请求一直卡住，经反向代理 60s 读超时变成 504，服务端随后仍为已断开的客户端构造会话并启动回合；现在最多等 55 秒，期间每 0.5 秒探测客户端断开，超时返回 503 + Retry-After，断开则直接中止

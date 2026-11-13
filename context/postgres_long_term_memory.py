@@ -387,21 +387,31 @@ class PostgresLongTermMemory:
 
     @contextlib.contextmanager
     def _advisory_lock(self, lock_name: str):
-        """会话级 advisory lock：同一连接内可重入，连接重建后自动重新获取。"""
-        self._execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
-        self._held_locks[lock_name] = self._held_locks.get(lock_name, 0) + 1
-        try:
-            yield
-        finally:
-            count = self._held_locks.get(lock_name, 0) - 1
-            if count > 0:
-                self._held_locks[lock_name] = count
-            else:
-                self._held_locks.pop(lock_name, None)
-            with contextlib.suppress(Exception):
-                self._execute(
-                    "SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,)
-                )
+        """会话级 advisory lock：同一连接内可重入，连接重建后自动重新获取。
+
+        同一实例的多个线程共用一个连接：PostgreSQL 对同一会话的重复加锁
+        总是立即成功（重入计数 +1），两个线程都能「持有」同一把锁，读改写
+        会交错（并发保存同一行程可静默插入两条身份相同的行）。外层实例
+        RLock 把整个临界区串行化；_execute 内部是同一把可重入锁，不会死锁。
+        """
+        with self._conn_lock:
+            self._execute(
+                "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+            )
+            self._held_locks[lock_name] = self._held_locks.get(lock_name, 0) + 1
+            try:
+                yield
+            finally:
+                count = self._held_locks.get(lock_name, 0) - 1
+                if count > 0:
+                    self._held_locks[lock_name] = count
+                else:
+                    self._held_locks.pop(lock_name, None)
+                with contextlib.suppress(Exception):
+                    self._execute(
+                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                        (lock_name,),
+                    )
 
     @contextlib.contextmanager
     def _preference_lock(self, pref_type: str):
@@ -1562,29 +1572,55 @@ class PostgresLongTermMemory:
 
         逐项查询在自动提交下各自取最新快照：并发写入时备份的 statistics
         与 chat_history / trip_history 可能来自不同版本（总数与条数对不上）。
-        快照事务失败（连接重建等）时退回逐项读取，与原行为一致。
+        查询中途连接闪断时 _run_with_retry 会换连接重放，而事务上下文绑定
+        的是旧连接（psycopg 对已关闭连接不抛异常），后续查询会在新连接上
+        各取快照——备份变成旧新混合。这里记录连接身份并在每个查询后校验，
+        检测到重建就整体重试；两次仍失败才退回逐项读取。
         """
-        try:
-            with self._conn_lock, self._conn.transaction():
-                # 事务内第一条语句：固定快照后再执行各查询
-                self._execute(
-                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+        start_conn = self._conn
+        for attempt in (1, 2):
+            try:
+                with self._conn_lock, self._conn.transaction():
+                    # 事务内第一条语句：固定快照后再执行各查询
+                    self._execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                    )
+                    snapshot = self._export_snapshot_queries(start_conn)
+                    self._abort_if_reconnected(start_conn)
+                    return snapshot
+            except MemoryPersistenceError as exc:
+                logger.warning(
+                    "导出一致性快照连接中断（第 %d 次），整体重试：%s",
+                    attempt,
+                    exc,
                 )
-                return self._export_snapshot_queries()
-        except Exception as exc:  # noqa: BLE001 - 快照失败退回逐项读取
-            logger.warning("导出一致性快照失败（%s），退回逐项读取", exc)
-            return self._export_snapshot_queries()
+                start_conn = self._conn
+                continue
+            except Exception as exc:  # noqa: BLE001 - 快照失败退回逐项读取
+                logger.warning("导出一致性快照失败（%s），退回逐项读取", exc)
+                break
+        return self._export_snapshot_queries()
 
-    def _export_snapshot_queries(self) -> dict[str, Any]:
-        return {
-            "preferences": self.get_preference(),
-            "trip_history": self.get_trip_history(limit=None),
-            "chat_history": self.get_chat_history(),
-            "session_titles": self.get_session_titles(),
-            "pinned_sessions": self.get_pinned_sessions(),
-            "archived_sessions": self.get_archived_sessions(),
-            "statistics": self.get_statistics(),
-        }
+    def _export_snapshot_queries(self, start_conn: Any | None = None) -> dict[str, Any]:
+        """导出各项查询；(可选) 每个查询后校验连接未被重建。"""
+
+        def check() -> None:
+            if start_conn is not None:
+                self._abort_if_reconnected(start_conn)
+
+        result: dict[str, Any] = {}
+        for name, getter in (
+            ("preferences", self.get_preference),
+            ("trip_history", lambda: self.get_trip_history(limit=None)),
+            ("chat_history", self.get_chat_history),
+            ("session_titles", self.get_session_titles),
+            ("pinned_sessions", self.get_pinned_sessions),
+            ("archived_sessions", self.get_archived_sessions),
+            ("statistics", self.get_statistics),
+        ):
+            result[name] = getter()
+            check()
+        return result
 
     # ---------- 清理 ----------
 
