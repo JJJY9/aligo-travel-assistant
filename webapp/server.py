@@ -357,6 +357,16 @@ def _normalized_request_host(host_header: str) -> str:
     return host.rstrip(".")
 
 
+def _test_client_host_allowed() -> bool:
+    """测试客户端（FastAPI TestClient 默认 ``Host: testserver``）的测试缝。
+
+    生产默认不信任该 Host：无点单标签名可被搜索后缀 / LLMNR-NBNS / hosts
+    条目解析到本机，配合 DNS rebinding 绕过 Host 白名单与同源守卫。
+    测试文件在导入时设置 ``ALIGO_TEST_CLIENT=1`` 启用。
+    """
+    return os.environ.get("ALIGO_TEST_CLIENT", "").strip() == "1"
+
+
 def _host_allowed(host_header: str) -> bool:
     host = _normalized_request_host(host_header)
     if not host:
@@ -366,7 +376,9 @@ def _host_allowed(host_header: str) -> bool:
         return True
     except ValueError:
         pass
-    if host in {"localhost", "testserver"} or host.endswith(".localhost"):
+    if host in {"localhost"} or host.endswith(".localhost"):
+        return True
+    if host == "testserver" and _test_client_host_allowed():
         return True
     configured = os.environ.get(_ALLOWED_HOSTS_ENV, "")
     for item in configured.split(","):
@@ -566,13 +578,13 @@ class RequestContextMiddleware:
                     status_code,
                     elapsed_ms,
                     # SSE 长连接 / 客户端中止（499）的持续时间不能计入延迟分位；
-                    # 流式路由上的路由前拒绝（307/413/429/503）不是长连接，
-                    # 按实际是否成功进入流式输出（<400）判断
+                    # 流式路由上的路由前拒绝（307/308/413/429/503）不是长连接：
+                    # 只有 2xx 才算真正进入流式输出（3xx 是尾斜杠重定向）
                     streaming=(
                         status_code == 499
                         or (
                             metric_path == "/api/chat/stream"
-                            and status_code < 400
+                            and status_code < 300
                         )
                     ),
                 )
@@ -1986,21 +1998,27 @@ def _reject_cross_site_side_effect(request: Request) -> None:
 
     - 面板请求显式携带 ``X-Aligo-Client: web``（跨站简单请求无法自定义头，
       跨源 JS 带自定义头会触发预检而被拒）；
-    - 或 ``Sec-Fetch-Site`` 为 same-origin / none；
+    - 或 ``Sec-Fetch-Site`` 为 same-origin；
     - 或 Referer 与当前 Host 同源（HTTP 内网页面导航 / 下载会带）。
 
+    ``Sec-Fetch-Site: none``（地址栏 / 书签 / 外部应用链接、经 302 掩码的
+    链接）不构成同源证据：外部链接一次点击即可触发全量导出 / 真实 LLM
+    调用，因此不再放行；直连这些接口请带 ``X-Aligo-Client: web``。
     CLI / 脚本可直接带 ``X-Aligo-Client: web`` 调用这些接口。
     """
     site = (request.headers.get("sec-fetch-site") or "").lower()
     if site in {"cross-site", "same-site"}:
         raise HTTPException(status_code=403, detail="跨站请求被拒绝")
-    if (request.headers.get("host") or "").strip().lower() == "testserver":
-        # 测试客户端没有浏览器头，保留测试缝（真实服务不会用该 Host；
-        # 显式跨站头在上方已拒绝，测试仍能覆盖守卫本身）
+    if (
+        _test_client_host_allowed()
+        and (request.headers.get("host") or "").strip().lower() == "testserver"
+    ):
+        # 测试客户端没有浏览器头：仅在测试环境启用测试缝（显式跨站头在
+        # 上方已拒绝，测试仍能覆盖守卫本身）
         return
     if request.headers.get("x-aligo-client") == "web":
         return
-    if site in {"same-origin", "none"}:
+    if site == "same-origin":
         return
     referer = request.headers.get("referer") or ""
     host = (request.headers.get("host") or "").strip().lower()
@@ -3012,14 +3030,17 @@ async def _ask_cancellable_on_disconnect(
 
 
 async def _acquire_chat_lock(
-    request: Request, lock: asyncio.Lock, request_id: str
+    request: Request,
+    lock: asyncio.Lock,
+    request_id: str,
+    timeout: float = _CHAT_LOCK_WAIT_SEC,
 ) -> None:
     """等待同一用户的对话锁：期间检查客户端是否已断开，超时给出明确 503。
 
     排队期间没有响应头与心跳，代理读超时（60s）会让客户端拿到 504；
     服务端不应在锁释放后继续为已断开的请求构造会话、启动回合。
     """
-    deadline = time.monotonic() + _CHAT_LOCK_WAIT_SEC
+    deadline = time.monotonic() + timeout
     while True:
         try:
             await asyncio.wait_for(lock.acquire(), timeout=_CHAT_LOCK_POLL_SEC)
@@ -3039,6 +3060,21 @@ async def _acquire_chat_lock(
                     ),
                     headers={"Retry-After": "5"},
                 ) from None
+
+
+@contextlib.asynccontextmanager
+async def _bounded_user_lock(
+    request: Request,
+    lock: asyncio.Lock,
+    request_id: str,
+    timeout: float = _CHAT_LOCK_WAIT_SEC,
+):
+    """有界等待并自动释放的用户锁（对话 / 导入共用）。"""
+    await _acquire_chat_lock(request, lock, request_id, timeout)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def create_app(model: Any = None) -> FastAPI:
@@ -3092,8 +3128,37 @@ def create_app(model: Any = None) -> FastAPI:
 
     def _cross_site_side_effect(request: Request) -> None:
         _reject_cross_site_side_effect(request)
+    class _ExportLeaseResponse(StreamingResponse):
+        """导出响应：把并发槽位持有到响应体发送结束。
+
+        Starlette 在端点函数返回之后才逐条发送 body：若在函数内释放槽位，
+        慢读客户端可同时让任意多份完整导出驻留内存（每份可达 50MB）。
+        响应体未开始迭代就被取消时同样在 finally 释放。
+        """
+
+        def __init__(self, content: Any, release: Any, **kwargs: Any) -> None:
+            super().__init__(content, **kwargs)
+            self._release_slot = release
+            self._slot_released = False
+
+        def _release_once(self) -> None:
+            if self._slot_released:
+                return
+            self._slot_released = True
+            self._release_slot()
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                self._release_once()
+
     def _export_guard(func):
-        """限制同时执行的全量导出数量：内存峰值约为备份大小的 8 倍。"""
+        """限制同时执行的全量导出数量：内存峰值约为备份大小的 8 倍。
+
+        槽位持有到响应发送结束（见 :class:`_ExportLeaseResponse`），
+        慢读连接也会占用名额。
+        """
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -3103,9 +3168,31 @@ def create_app(model: Any = None) -> FastAPI:
                     detail="导出任务过多，请稍后再试",
                 )
             try:
-                return func(*args, **kwargs)
-            finally:
+                response = func(*args, **kwargs)
+            except BaseException:
                 state.export_slots.release()
+                raise
+            body = getattr(response, "body", None)
+            if not isinstance(response, Response) or body is None:
+                # 非字节响应（受保护端点不应出现）：无法延后释放，按原样返回
+                state.export_slots.release()
+                return response
+
+            async def _content():
+                yield body
+
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in {"content-length", "content-type"}
+            }
+            return _ExportLeaseResponse(
+                _content(),
+                state.export_slots.release,
+                status_code=response.status_code,
+                headers=headers,
+                media_type=response.media_type,
+            )
 
         return wrapper
 
@@ -4392,7 +4479,9 @@ def create_app(model: Any = None) -> FastAPI:
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
         )
-        async with state.lock_for(payload.user_id):
+        async with _bounded_user_lock(
+            request, state.lock_for(payload.user_id), _request_id(request)
+        ):
             if await asyncio.to_thread(
                 state.is_recently_deleted, payload.user_id, payload.session_id
             ):
@@ -5133,7 +5222,10 @@ def create_app(model: Any = None) -> FastAPI:
             finally:
                 _close_long_term(store)
 
-        async with state.lock_for(user_id):
+        # 长回合期间有界等待用户锁：超时明确 503，不让写请求无上限挂起
+        async with _bounded_user_lock(
+            request, state.lock_for(user_id), _request_id(request), timeout=10.0
+        ):
             return await asyncio.to_thread(_run)
 
     @app.get("/api/trips/{trip_id}/calendar", dependencies=[Depends(_cross_site_side_effect)])
@@ -5334,9 +5426,16 @@ def create_app(model: Any = None) -> FastAPI:
         # 限流先于解析，而且都走线程池：请求体可达 64MB，Pydantic body 参数
         # 会让 FastAPI 在事件循环上同步 json.loads（实测 64MB 约 3 秒），
         # 所有 SSE 与请求一起停摆；超限的风暴请求也不该先付出解析代价
-        response.headers.update(
-            await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
-        )
+        try:
+            response.headers.update(
+                await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
+            )
+        except HTTPException as exc:
+            if exc.status_code == 429:
+                # 被限流的客户端仍在向 64MB 上限的接口上传请求体：明确关闭
+                # 连接，与 415/503/413/408 的早期拒绝同一约定
+                exc.headers = {**(exc.headers or {}), "Connection": "close"}
+            raise
         # 排队背压：单 worker + 无界队列会让并发大备份（各 64MB）全部
         # 驻留内存直到 OOM；已有一个导入在跑 / 排队时直接 503，不读请求体
         if not state.import_queue_slots.acquire(blocking=False):
@@ -5441,7 +5540,12 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                 )
 
-            async with state.lock_for(user_id):
+            # 有界等待用户锁：同一用户有在途长回合时不能在持有全局导入
+            # 槽位的情况下无上限等待（两个请求即可让所有用户的导入 503），
+            # 超时明确 503 并释放槽位
+            async with _bounded_user_lock(
+                request, state.lock_for(user_id), _request_id(request), timeout=10.0
+            ):
                 # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
                 # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
                 # 行程里引用的会话同样计入：只有行程、没有消息的保留字会话

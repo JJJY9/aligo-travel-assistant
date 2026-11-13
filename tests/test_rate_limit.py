@@ -50,8 +50,8 @@ def test_key_eviction_bounds_memory():
         limiter.check(f"user-{i}")
     assert len(limiter) <= 8, f"key 数量应被限制在上限内，实际 {len(limiter)}"
 
-    # 窗口过期后再触发一次扫描，过期 key 应被清空
-    time.sleep(0.25)
+    # 窗口过期后再触发一次扫描，过期 key 应被清空（清理限频 0.5 秒一次）
+    time.sleep(0.6)
     limiter.check("fresh")
     assert len(limiter) == 1, f"过期 key 应被清理，实际 {len(limiter)}"
     print("✓ key 数量有上限且过期 key 会被清理")

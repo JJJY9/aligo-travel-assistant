@@ -11,6 +11,9 @@ from typing import Any
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+# 生产默认不信任测试客户端的 Host: testserver（见 _host_allowed）；
+# 测试显式启用测试缝
+os.environ.setdefault("ALIGO_TEST_CLIENT", "1")
 
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
