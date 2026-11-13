@@ -1699,6 +1699,179 @@ def test_preference_normalizes_legacy_item_shape():
     print("✓ 旧格式条目规范化为 type/value")
 
 
+def _pref_reply(payload: str) -> dict:
+    """用给定模型输出跑一次偏好技能，返回结果 JSON。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return payload
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _PrefLoaderForNewTests()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我搬家到上海了", role="user"))
+    )
+    return json.loads(out.content)
+
+
+def test_preference_bare_single_object_after_echoed_example():
+    """回显示例对象 + 后置裸单对象：必须取正式单对象，示例值不得写库。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    formal = '{"type": "home_location", "value": "上海", "action": "replace"}'
+    data = _pref_reply(f"示例：{example}\n正式：{formal}")
+    assert data.get("has_preferences") is True, data
+    assert data["preferences"] == [
+        {"type": "home_location", "value": "上海", "action": "replace"}
+    ], data
+    assert "浦东" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：示例对象后的正式裸单对象优先")
+
+
+def test_preference_single_object_without_wrapper_is_parsed():
+    """模型只输出单条 {type, value, action}（公认的常见偏差）时不能报错。"""
+    data = _pref_reply(
+        '{"type": "hotel_brands", "value": "汉庭", "action": "append"}'
+    )
+    assert data.get("has_preferences") is True, data
+    assert data["preferences"] == [
+        {"type": "hotel_brands", "value": "汉庭", "action": "append"}
+    ], data
+    print("✓ 偏好：裸单对象形状可解析")
+
+
+def test_preference_legacy_dict_and_data_wrapper():
+    """旧格式 {类型: 值} 与 {"data": {...}} 包装都按偏好解析，data 不是偏好类型。"""
+    legacy = _pref_reply('{"home_location": "上海"}')
+    assert legacy["preferences"] == [
+        {"type": "home_location", "value": "上海"}
+    ], legacy
+
+    wrapped = _pref_reply('{"data": {"home_location": "上海"}}')
+    assert wrapped["preferences"] == [
+        {"type": "home_location", "value": "上海"}
+    ], wrapped
+    assert '"data"' not in json.dumps(wrapped, ensure_ascii=False), wrapped
+    print("✓ 偏好：旧格式字典与 data 包装正确解包")
+
+
+def test_preference_invalid_preferences_value_degrades_to_error():
+    """preferences 值无法解析（字符串）时按错误返回，不能当成功吞掉。"""
+    data = _pref_reply('{"has_preferences": true, "preferences": "汉庭"}')
+    assert data.get("has_preferences") is not True, data
+    assert data.get("error"), data
+
+    # 字符串里是合法 JSON 数组时恢复解析
+    inner = json.dumps(
+        [{"type": "hotel_brands", "value": "汉庭"}], ensure_ascii=False
+    )
+    recovered = _pref_reply(
+        json.dumps(
+            {"has_preferences": True, "preferences": inner}, ensure_ascii=False
+        )
+    )
+    assert recovered.get("has_preferences") is True, recovered
+    assert recovered["preferences"] == [
+        {"type": "hotel_brands", "value": "汉庭"}
+    ], recovered
+    print("✓ 偏好：非法 preferences 值不冒充成功，字符串 JSON 可恢复")
+
+
+def test_preference_empty_formal_array_after_example():
+    """回显示例 + 正式空数组：表示没有新偏好，不能回退到示例值。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "汉庭"}]}'
+    )
+    data = _pref_reply(f"示例：{example}\n正式结果：[]")
+    assert data.get("has_preferences") is False, data
+    assert data.get("preferences") == [], data
+    assert "汉庭" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：正式空数组不被示例对象顶替")
+
+
+def test_preference_replace_then_append_keeps_replace():
+    """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
+    payload = json.dumps(
+        {
+            "has_preferences": True,
+            "preferences": [
+                {"type": "budget", "value": "500", "action": "replace"},
+                {"type": "budget", "value": "800", "action": "append"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    data = _pref_reply(payload)
+    assert data["preferences"] == [
+        {"type": "budget", "value": ["500", "800"], "action": "replace"}
+    ], data
+    print("✓ 偏好：组内出现 replace 时整组按 replace")
+
+
+def test_preference_non_string_type_is_dropped():
+    """非字符串 type 不能靠 str() 强转绕过可管理校验。"""
+    payload = json.dumps(
+        {
+            "has_preferences": True,
+            "preferences": [
+                {"type": 5, "value": "垃圾"},
+                {"type": "holiday", "value": "国庆"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    data = _pref_reply(payload)
+    assert data["preferences"] == [
+        {"type": "holiday", "value": "国庆"}
+    ], data
+    assert '"5"' not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：非字符串 type 被丢弃")
+
+
+def test_preference_empty_list_input_and_permanent_errors():
+    """reply([]) 不抛 IndexError；401/402 等永久模型错误穿透给编排层记账。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _OkModel:
+        async def __call__(self, messages, **kwargs):
+            return '{"has_preferences": false, "preferences": []}'
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_OkModel(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _Loader()
+    out = asyncio.run(agent.reply([]))
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is False, data
+
+    class _Unauthorized(Exception):
+        status_code = 401
+
+    class _BadModel:
+        async def __call__(self, messages, **kwargs):
+            raise _Unauthorized("Incorrect API key")
+
+    agent2 = agent_class(
+        name="PreferenceAgent", model=_BadModel(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent2.skill_loader = _Loader()
+    with pytest.raises(_Unauthorized):
+        asyncio.run(
+            agent2.reply(Msg(name="user", content="我喜欢汉庭", role="user"))
+        )
+    print("✓ 偏好：空消息列表不崩、永久模型错误穿透")
+
+
 def test_skill_reraises_retriable_model_errors():
     """技能不能把 5xx 等可重试模型错误吞成结果 JSON。"""
     module = _load_skill_module("plan-trip")
@@ -1790,6 +1963,15 @@ if __name__ == "__main__":
         test_preference_array_after_prose_brackets_is_parsed()
         test_preference_formal_array_after_echoed_example_object()
         test_preference_data_wrapper_is_unwrapped()
+        test_preference_normalizes_legacy_item_shape()
+        test_preference_bare_single_object_after_echoed_example()
+        test_preference_single_object_without_wrapper_is_parsed()
+        test_preference_legacy_dict_and_data_wrapper()
+        test_preference_invalid_preferences_value_degrades_to_error()
+        test_preference_empty_formal_array_after_example()
+        test_preference_replace_then_append_keeps_replace()
+        test_preference_non_string_type_is_dropped()
+        test_preference_empty_list_input_and_permanent_errors()
         test_event_collection_duration_only_result_beats_echoed_example()
         test_event_collection_data_wrapper_is_unwrapped()
         test_plan_trip_tail_note_does_not_replace_full_plan()

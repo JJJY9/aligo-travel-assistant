@@ -15,7 +15,7 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
-from utils.llm_resilience import is_retriable_error
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.preference_values import (
     EXPLANATORY_PREF_KEYS,
     has_preference_value,
@@ -25,12 +25,16 @@ from utils.preference_values import (
 from utils.user_query import extract_user_query
 from utils.json_parser import (
     extract_json_from_async_response,
-    first_json_array_with_keys,
-    first_json_object_with_keys,
-    last_json_object_with_keys_strict,
+    has_unclosed_json_object,
+    iter_json_object_spans_with_repair,
 )
 
 logger = logging.getLogger(__name__)
+
+# 结果包装键与说明键：旧格式字典扫描必须跳过（{"data": {...}} 的 data
+# 不是偏好类型，否则会落库一条 type="data" 的垃圾偏好）
+_PREF_NON_TYPE_KEYS = frozenset(EXPLANATORY_PREF_KEYS | {"data", "result", "output", "preferences"})
+
 
 
 def _has_unclosed_array(text: str) -> bool:
@@ -62,7 +66,12 @@ def _has_unclosed_array(text: str) -> bool:
 
 
 def _normalize_preference_items(items: list) -> list[dict]:
-    """按 type 合并条目，避免同类型逐条覆盖只剩最后一条。"""
+    """按 type 合并条目，避免同类型逐条覆盖只剩最后一条。
+
+    同类型多条合并规则：值按出现顺序合并；只要组内出现过明确的 replace，
+    整组最终就是 replace——此前「任一条是 append 就把整组改成 append」，
+    用户要求替换掉的旧值会被 append 语义保留下来。
+    """
     merged: dict[str, dict] = {}
     order: list[str] = []
     for item in items:
@@ -72,7 +81,7 @@ def _normalize_preference_items(items: list) -> list[dict]:
             pairs = [
                 (key, value)
                 for key, value in item.items()
-                if key not in EXPLANATORY_PREF_KEYS
+                if key not in _PREF_NON_TYPE_KEYS
                 and is_manageable_pref_type(key)
                 and has_preference_value(value)
             ]
@@ -80,7 +89,12 @@ def _normalize_preference_items(items: list) -> list[dict]:
                 item = {"type": pairs[0][0], "value": pairs[0][1]}
             else:
                 continue
-        pref_type = str(item.get("type") or "").strip()
+        # type 必须是字符串：此前 str() 强转让数字 / 容器类型绕过可管理
+        # 校验，垃圾键（如 "5"）被落库、真实类型丢失
+        pref_type = item.get("type")
+        if not isinstance(pref_type, str):
+            continue
+        pref_type = pref_type.strip()
         value = item.get("value")
         if not is_manageable_pref_type(pref_type) or not has_preference_value(
             value
@@ -92,8 +106,10 @@ def _normalize_preference_items(items: list) -> list[dict]:
         if pref_type in merged:
             entry = merged[pref_type]
             entry["value"] = merge_preference_value(entry.get("value"), value)
-            if is_append or entry.get("action") == "append":
-                entry["action"] = "append"
+            if is_append:
+                # 此前已有 replace：保持 replace（整组替换存储，含本批值）
+                if entry.get("action") != "replace":
+                    entry["action"] = "append"
             elif had_action or "action" in entry:
                 entry["action"] = "replace"
             else:
@@ -109,15 +125,14 @@ def _normalize_preference_items(items: list) -> list[dict]:
     return [merged[pref_type] for pref_type in order]
 
 
-def _last_preference_array(text: str) -> tuple[int, list[dict]] | None:
-    """文本中最后一个「元素形如偏好」的完整 JSON 数组（起始下标 + 元素）。
+def _iter_preference_arrays(text: str):
+    """按位置产出「元素形如偏好」的完整 JSON 数组（起始, 结束, 元素列表）。
 
-    ``json_array_start`` 的散文判定（数组前出现对象即视为前言）不适用于
-    「先回显示例对象、再输出正式裸数组」：这里直接扫描所有能整体解析的
-    数组，取最后一个元素含 type / value 的，由调用方与对象候选比较位置。
+    空数组 ``[]`` 也是候选（正式结果表示「没有新偏好」）；元素全部非
+    对象或不含 type / value 的数组（引用标记 ``[1]``、说明 ``[注]``）
+    不是候选。
     """
     decoder = json.JSONDecoder()
-    best: tuple[int, list[dict]] | None = None
     index = text.find("[")
     while index != -1:
         try:
@@ -125,46 +140,84 @@ def _last_preference_array(text: str) -> tuple[int, list[dict]] | None:
         except json.JSONDecodeError:
             index = text.find("[", index + 1)
             continue
-        if isinstance(value, list) and value:
+        if isinstance(value, list):
             items = [item for item in value if isinstance(item, dict)]
-            if items and any(
-                "type" in item or "value" in item for item in items
+            if not value or (
+                items and any("type" in item or "value" in item for item in items)
             ):
-                best = (index, items)
+                yield index, end, items
         index = text.find("[", max(end, index + 1))
-    return best
 
 
-def _as_preference_result(obj: object) -> dict | None:
-    """取出结果对象；兼容 ``{"data": {preferences...}}`` 包装及常见偏差形状。"""
+def _result_from_preferences(candidate: dict, preferences: object) -> dict | None:
+    """把 preferences 字段的几种形态规范成列表结果；无法解析返回 None。"""
+    if isinstance(preferences, dict):
+        preferences = [preferences]
+    elif isinstance(preferences, str):
+        # 模型可能把数组序列化成字符串：能解析就恢复，否则按无结果处理
+        try:
+            parsed = json.loads(preferences)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return None
+        preferences = parsed
+    elif preferences is None:
+        return {**candidate, "preferences": [], "has_preferences": False}
+    elif not isinstance(preferences, list):
+        return None
+    items = [item for item in preferences if isinstance(item, dict)]
+    normalized = _normalize_preference_items(items)
+    result = {**candidate, "preferences": normalized}
+    if not normalized:
+        # 条目全不可管理时不能宣称「有偏好」：编排层会按空列表展示成功
+        result["has_preferences"] = False
+    return result
+
+
+def _as_preference_result(obj: object, _depth: int = 0) -> dict | None:
+    """取出结果对象；兼容 data 包装、单对象与旧格式字典。
+
+    找不到可解析的偏好形状时返回 None（调用方据此继续找其它候选或报错），
+    不能把形状不对的对象当成功结果返回——否则非法 preferences 值会以
+    「成功」流进编排层，用户偏好被静默丢弃。
+    """
     if not isinstance(obj, dict):
         return None
     data = obj.get("data")
+    if (
+        isinstance(data, dict)
+        and _depth < 2
+        and "preferences" not in data
+        and "has_preferences" not in data
+    ):
+        # {"data": {"home_location": "上海"}}：data 里是旧格式 / 单对象形状
+        inner = _as_preference_result(data, _depth + 1)
+        if inner is not None:
+            return inner
     candidate = (
         data
         if isinstance(data, dict)
         and ("preferences" in data or "has_preferences" in data)
         else obj
     )
-    preferences = candidate.get("preferences")
-    if isinstance(preferences, list):
-        return {
-            **candidate,
-            "preferences": _normalize_preference_items(preferences),
-        }
-    if "preferences" in candidate or "has_preferences" in candidate:
+    if "preferences" in candidate:
+        return _result_from_preferences(candidate, candidate.get("preferences"))
+    if "has_preferences" in candidate:
         return candidate
     # 模型常见单对象偏差：{"type": ..., "value": ..., "action": ...}
     if "type" in obj and "value" in obj:
-        return {
-            "preferences": _normalize_preference_items([obj]),
-            "has_preferences": True,
-        }
-    # 旧格式 {类型: 值} 字典（只挑可管理的偏好键）
+        items = _normalize_preference_items([obj])
+        if items:
+            return {"preferences": items, "has_preferences": True}
+        return None
+    # 旧格式 {类型: 值} 字典（只挑可管理的偏好键，包装 / 说明键除外）
     legacy = [
         {"type": key, "value": value}
         for key, value in obj.items()
-        if key not in EXPLANATORY_PREF_KEYS
+        if key not in _PREF_NON_TYPE_KEYS
         and is_manageable_pref_type(key)
         and has_preference_value(value)
     ]
@@ -174,6 +227,62 @@ def _as_preference_result(obj: object) -> dict | None:
             "has_preferences": True,
         }
     return None
+
+
+def _select_preference_result(text: str) -> dict | None:
+    """在完整输出里按位置选出偏好结果（后出现的正式结果胜过回显示例）。
+
+    候选包括显式结果对象（preferences / has_preferences）、data 包装、
+    裸单对象 {type, value} 与旧格式字典——此前只扫描含结果键的对象，
+    后置的其它形状永远选不中、回显示例反而被当成正式结果写入长期记忆。
+    裸数组与对象按起始位置比较先后；数组若位于某个对象内部（示例对象
+    自带的 preferences 数组）不算独立候选。
+    """
+    spans: list[tuple[int, int]] = []
+    objects: list[tuple[int, int, dict]] = []
+    failed_tail = False
+    last_end = -1
+    for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
+        if value is None:
+            if looks_like and start >= last_end:
+                # 「像结果但解析不了」的尾片段：正式结果可能被截断，不能
+                # 回退到更早的示例对象
+                failed_tail = True
+            continue
+        spans.append((start, end))
+        last_end = max(last_end, end)
+        normalized = _as_preference_result(value)
+        if normalized is not None:
+            objects.append((start, end, normalized))
+            failed_tail = False
+    if failed_tail:
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    array = None
+    for start, end, items in _iter_preference_arrays(text):
+        if any(span_start <= start < span_end for span_start, span_end in spans):
+            continue
+        array = (start, end, items)
+    chosen: tuple[dict, int] | None = None
+    if objects:
+        obj_start, obj_end, obj = objects[-1]
+        chosen = (obj, obj_end)
+        if array is not None and array[0] > obj_start:
+            chosen = None
+    if chosen is None and array is not None:
+        chosen = (
+            {
+                "preferences": _normalize_preference_items(array[2]),
+                "has_preferences": bool(array[2]),
+            },
+            array[1],
+        )
+    if chosen is None:
+        return None
+    result, result_end = chosen
+    if has_unclosed_json_object(text[result_end:]):
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    return result
+
 
 
 class PreferenceAgent(AgentBase):
@@ -194,7 +303,10 @@ class PreferenceAgent(AgentBase):
             return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
-        content = x.content if not isinstance(x, list) else x[-1].content
+        if isinstance(x, list):
+            content = x[-1].content if x else "{}"
+        else:
+            content = x.content
 
         # 如果content是JSON字符串，解析它
         if isinstance(content, str):
@@ -277,58 +389,17 @@ class PreferenceAgent(AgentBase):
                 # 正式裸数组被截断：不能让回显示例对象里的数组顶替
                 raise ValueError("模型输出被截断（数组未闭合）")
 
-            # 模型可能先复述示例对象 / 输出示例再给正式结果：优先取
-            # 「位置在示例之后」的正式结果——裸数组和结果对象两种形状
-            # 都可能出现，分别取各自最后一个候选再比较先后
-            result = None
-            array_candidate = _last_preference_array(text)
-            if array_candidate is not None:
-                start, items = array_candidate
-                # 示例对象里的 preferences 数组同样满足形状：只有它排在
-                # 所有含结果键的对象之后时才当作正式裸数组
-                object_hint = max(
-                    text.rfind('"has_preferences"'),
-                    text.rfind('"preferences"'),
-                )
-                if object_hint == -1 or start > object_hint:
-                    result = {
-                        "preferences": _normalize_preference_items(items),
-                        "has_preferences": bool(items),
-                    }
-            if result is None:
-                result = _as_preference_result(
-                    last_json_object_with_keys_strict(
-                        text, ("has_preferences", "preferences", "data")
-                    )
-                )
-            if result is None:
-                # 没有任何含结果键的完整对象：退到第一个含结果键的对象
-                # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
-                # 对象」——prompt 回显的示例通常排在最前，正式结果被
-                # max_tokens 截断时会把示例偏好当成真实结果写库
-                result = _as_preference_result(
-                    first_json_object_with_keys(
-                        text, ("has_preferences", "preferences", "data")
-                    )
-                )
-            if result is None:
-                # 前言带引用标记（参考[1]）时 starts 判定失败、对象扫描
-                # 也找不到结果键：最后尝试「元素含 type/value 的数组」
-                bare_items = first_json_array_with_keys(
-                    text, ("type", "value")
-                )
-                if bare_items:
-                    items = [
-                        item for item in bare_items if isinstance(item, dict)
-                    ]
-                    result = {
-                        "preferences": _normalize_preference_items(items),
-                        "has_preferences": bool(items),
-                    }
+            # 模型可能先复述示例对象 / 输出示例再给正式结果：按位置取
+            # 「最后一个可解析的偏好结果」，示例对象 / 示例数组不会顶掉
+            # 后置的正式结果；没有候选时报错走错误降级
+            result = _select_preference_result(text)
             if result is None:
                 raise ValueError("模型输出中没有可解析的偏好结果对象")
         except Exception as e:
-            if is_retriable_error(e):
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                # 瞬时错误交给编排层重试；401/402/403/404 等永久错误
+                # 同样穿透，由外层上抛并计入熔断——吞成 error JSON 会让
+                # 密钥失效 / 余额耗尽时熔断器永远打不开
                 raise
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}
