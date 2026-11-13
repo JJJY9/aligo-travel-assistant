@@ -115,6 +115,40 @@ def test_priority_parallel_and_sequential():
     print("✓ 同优先级并行、不同优先级串行")
 
 
+def test_retry_cache_reuses_completed_agents():
+    """整轮重试复用首轮已完成的智能体：只重跑失败的那个，不重复计费。"""
+    calls = {"a": 0, "b": 0}
+
+    class Flaky(_StubAgent):
+        async def reply(self, x):
+            calls[self.name] += 1
+            if self.name == "b" and calls["b"] <= 2:
+                raise ConnectionError("transient blip")
+            return Msg(name=self.name, content='{"ok": true}', role="assistant")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={"a": Flaky("a"), "b": Flaky("b")}
+    )
+    schedule = [
+        {"agent_name": "a", "priority": 1},
+        {"agent_name": "b", "priority": 1},
+    ]
+    cache: dict = {}
+    try:
+        asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=cache))
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("首个可重试错误必须上抛给外层重试")
+    assert calls == {"a": 1, "b": 2}, calls
+    assert cache, "成功的智能体结果应进入重试缓存"
+
+    result = asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=cache))
+    assert calls == {"a": 1, "b": 3}, f"重试只应重跑失败的智能体: {calls}"
+    assert result is not None
+    print("✓ 整轮重试复用已完成智能体，仅重跑失败者")
+
+
 def test_previous_results_passed_to_next_priority():
     """前一优先级的结果通过 previous_results 传给后续智能体"""
     captured: dict = {}

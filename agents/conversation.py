@@ -245,6 +245,7 @@ class ConversationRuntime:
             defer_supported = callable(
                 getattr(self.orchestrator, "commit_deferred_memory", None)
             )
+            retry_cache_supported = False
             if defer_supported:
                 parameters: Iterable[inspect.Parameter]
                 try:
@@ -258,11 +259,25 @@ class ConversationRuntime:
                     or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
+                retry_cache_supported = any(
+                    parameter.name == "retry_cache"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+            # 整轮重试缓存：外层 retry_with_backoff 会重跑整个编排，缓存让
+            # 重试跳过首轮已成功的智能体（一次 429/5xx 曾让同批已完成的
+            # 智能体重复调用模型、放大账单与耗时）
+            orchestration_retry_cache: dict[str, dict[str, Any]] = {}
+            reply_options: dict[str, Any] = {}
+            if defer_supported:
+                reply_options["defer_memory"] = True
+            if retry_cache_supported:
+                reply_options["retry_cache"] = orchestration_retry_cache
             orchestration = await self._call_with_resilience(
                 lambda: self.orchestrator.reply(
                     sanitized_intention,
                     on_event=on_event,
-                    **({"defer_memory": True} if defer_supported else {}),
+                    **reply_options,
                 ),
                 max_retries=int(rc.get("max_retries", 3)),
                 base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
