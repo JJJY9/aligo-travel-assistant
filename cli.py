@@ -1595,7 +1595,9 @@ class AligoCLI:
                 except EOFError:
                     # 管道 / IDE 末尾：退出，避免每次循环都报错刷屏
                     self.console.print()
-                    if self._user_id_from_stdin and not self._processed_any_command:
+                    if getattr(self, "_user_id_from_stdin", False) and not getattr(
+                        self, "_processed_any_command", False
+                    ):
                         # 首行被当作用户 ID、其后没有任何命令：多半是把
                         # 整段查询喂进了管道，真实请求被吞掉——不能以 0
                         # 汇报成功
