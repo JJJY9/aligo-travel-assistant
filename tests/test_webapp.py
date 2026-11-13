@@ -306,6 +306,7 @@ def test_export_concurrency_guard():
             "/api/export",
             "/api/sessions/export",
             "/api/sessions/s1/export",
+            "/api/knowledge/export",
         ):
             response = client.get(path, params={"user_id": user_id})
             assert response.status_code == 503, (path, response.text)
@@ -317,6 +318,28 @@ def test_export_concurrency_guard():
     response = client.get("/api/export", params={"user_id": user_id})
     assert response.status_code != 503, response.text
     print("✓ 全量导出并发上限（槽位占满快速 503）")
+
+
+def test_knowledge_unavailable_recognizes_milvus3_missing_collection():
+    """Milvus Lite 3.x 的 does not exist / released 文案给出可操作提示。"""
+    from webapp import server as server_module
+
+    for message in (
+        "collection 'business_travel_knowledge' does not exist",
+        "Collection business_travel_knowledge is in state 'released'; call load() before search/get/query",
+    ):
+        response = server_module._knowledge_unavailable(
+            "读取知识库失败", RuntimeError(message)
+        )
+        assert response.status_code == 503
+        assert "重新运行初始化脚本" in response.detail, response.detail
+    # 其它存储错误仍是通用文案（不回显内部细节）
+    generic = server_module._knowledge_unavailable(
+        "读取知识库失败", RuntimeError("db down at /home/alice/secret")
+    )
+    assert "请稍后再试" in generic.detail
+    assert "alice" not in generic.detail
+
 
 def test_import_slow_body_times_out_and_frees_slot(monkeypatch):
     """只发请求头不发 body：60 秒内超时 408，导入名额必须释放。"""
@@ -10871,6 +10894,60 @@ def test_weather_cache_hit_skips_rate_limit(monkeypatch):
     assert "Retry-After" in limited.headers
     print("✓ 天气缓存命中不消耗 IP 桶额度")
 
+def test_chat_lock_wait_is_bounded(monkeypatch):
+    """SSE 排队等待用户锁有上限：期间探测断连，超时 503 + Retry-After。"""
+    import asyncio
+
+    from fastapi import HTTPException
+    from webapp import server as server_module
+
+    class _Request:
+        def __init__(self, disconnected: bool = False) -> None:
+            self._disconnected = disconnected
+
+        async def is_disconnected(self) -> bool:
+            return self._disconnected
+
+    monkeypatch.setattr(server_module, "_CHAT_LOCK_WAIT_SEC", 0.05)
+    monkeypatch.setattr(server_module, "_CHAT_LOCK_POLL_SEC", 0.01)
+
+    async def _timed_out():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        try:
+            await server_module._acquire_chat_lock(_Request(), lock, "rid")
+        finally:
+            lock.release()
+
+    with pytest.raises(HTTPException) as info:
+        asyncio.run(_timed_out())
+    assert info.value.status_code == 503
+    assert (info.value.headers or {}).get("Retry-After") == "5"
+    assert "已有对话" in info.value.detail
+
+    async def _disconnected():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        try:
+            await server_module._acquire_chat_lock(
+                _Request(disconnected=True), lock, "rid"
+            )
+        finally:
+            lock.release()
+
+    with pytest.raises(HTTPException) as info:
+        asyncio.run(_disconnected())
+    assert "已断开" in info.value.detail
+
+    async def _free_lock():
+        lock = asyncio.Lock()
+        await server_module._acquire_chat_lock(_Request(), lock, "rid")
+        assert lock.locked()
+        lock.release()
+
+    asyncio.run(_free_lock())
+    print("✓ SSE 对话锁等待有界并探测断连")
+
 if __name__ == "__main__":
     test_index_page()
     test_match_snippet_handles_casefold_length_changes()
@@ -10937,6 +11014,7 @@ if __name__ == "__main__":
     test_side_effect_guard_requires_same_origin_marker()
 
     test_export_concurrency_guard()
+    test_chat_lock_wait_is_bounded(pytest.MonkeyPatch())
 
     _mp_slow_body = pytest.MonkeyPatch()
     try:

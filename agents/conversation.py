@@ -25,10 +25,15 @@ from agents.orchestration_agent import OrchestrationAgent
 from utils.agent_names import canonical_agent_name
 from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
+from context.short_term_memory import (
+    RedisShortTermMemory,
+    redis_short_term_available,
+)
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
+from utils.paths import default_data_root
 from utils.preference_values import has_preference_value
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
@@ -74,7 +79,16 @@ class ConversationRuntime:
         # 累计到下一轮成功回合一起写入，否则面板与趋势永久少记
         self._unsettled_usage: dict[str, Any] | None = None
 
-        self.memory = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
+        # 与 Web 面板 / CLI 命令同一数据目录：MemoryManager 默认的
+        # "data/memory" 会锚定到包根（wheel 下是 site-packages），与
+        # default_data_root()/memory 分叉——对话写入的会话 / 偏好 / 行程
+        # 在面板、导出与删除里全部不可见，重装还会静默丢失
+        self.memory = MemoryManager(
+            user_id=user_id,
+            session_id=session_id,
+            storage_path=str(default_data_root() / "memory"),
+            llm_model=model,
+        )
         self.intention_agent = IntentionAgent(name="IntentionAgent", model=model)
         self.agent_cache: dict[str, Any] = {}
         self.registry = LazyAgentRegistry(
@@ -147,6 +161,24 @@ class ConversationRuntime:
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         settlement = settlement if settlement is not None else {"done": False}
+        # 本轮开始时的会话纪元：必须在任何 await（上下文总结 / 意图 LLM
+        # 重试可达数十秒）之前读取，否则这段窗口内的删除（纪元 +1 后
+        # 「从未存在」路径撤销墓碑）会让落库守卫比较到删除后的值而放行，
+        # 已删除会话的首轮问答被写回并复活
+        epoch_reader = getattr(self.memory, "session_epoch", None)
+        epoch_at_start = (
+            await asyncio.to_thread(epoch_reader)
+            if callable(epoch_reader)
+            else None
+        )
+        guard_factory = getattr(self.memory, "persist_guard", None)
+        # object.__new__ 构造的测试替身可能没有 _persist_guard：按无守卫处理
+        base_guard = getattr(self, "_persist_guard", None)
+        commit_guard = (
+            guard_factory(epoch_at_start, base_guard)
+            if callable(guard_factory)
+            else base_guard
+        )
         self._emit(on_event, {"type": "phase", "phase": "context", "label": "整理记忆与上下文"})
 
         # 多会话写入后保持长期记忆最新（避免覆盖其它会话刚写入的数据）。
@@ -162,6 +194,9 @@ class ConversationRuntime:
             max_retries=int(rc.get("max_retries", 3)),
             base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
             max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
+            # 意图调用成功不重置熔断计数：只发生在编排腿上的子智能体
+            # 429/5xx 否则每轮都被这里清零，永远累计不到阈值
+            record_success=False,
         )
 
         try:
@@ -207,21 +242,6 @@ class ConversationRuntime:
         # 否则旧回调的回滚按内容匹配可能删掉本轮刚暂存的同一文本提问。
         # 落库线程超时仍未结束时只能继续（用户锁已在上一轮入口释放）。
         await self.drain_pending_persist()
-        # 本轮开始时的会话纪元：删除（含「从未存在 / 并发删除」后撤销墓碑
-        # 的路径）会单调递增纪元，落库前比对可挡住删除前启动的迟到回合。
-        # Redis 不可用时两次读取都是 None，行为与旧版一致。
-        epoch_reader = getattr(self.memory, "session_epoch", None)
-        epoch_at_start = (
-            await asyncio.to_thread(epoch_reader)
-            if callable(epoch_reader)
-            else None
-        )
-        guard_factory = getattr(self.memory, "persist_guard", None)
-        commit_guard = (
-            guard_factory(epoch_at_start, self._persist_guard)
-            if callable(guard_factory)
-            else self._persist_guard
-        )
         stage_future: "asyncio.Future | None" = None
         try:
             # 保存暂存任务：取消可能落在写入线程执行期间，回滚前必须等它
@@ -703,21 +723,37 @@ class ConversationRuntime:
                 # get_recent_context(3)，只放进意图上下文的话当轮子智能体
                 # 看不到上文；且本轮落库后短期记忆非空，下一轮会跳过回填，
                 # 闲置前的历史从第 2 轮起彻底丢失。写回失败按原路径继续。
+                # Redis 降级窗口内不能写回：add_message 会以新 op_id 进入
+                # 故障重放日志，恢复后重放把同一批消息再 RPUSH 一份（RPUSH
+                # 带来重复 Q/A 并 LTRIM 挤掉更早的真实轮次）；本轮上下文
+                # 仍使用回填结果，只是不写库。
+                redis_degraded = False
+                if isinstance(self.memory.short_term, RedisShortTermMemory):
+                    try:
+                        redis_degraded = not redis_short_term_available()
+                    except Exception:  # noqa: BLE001 - 状态不明按可用处理
+                        redis_degraded = False
                 try:
-                    for item in recent:
-                        role = item.get("role")
-                        content = item.get("content")
-                        if role not in ("user", "assistant") or not isinstance(
-                            content, str
-                        ):
-                            continue
-                        self.memory.short_term.add_message(role, content)
+                    if not redis_degraded:
+                        for item in recent:
+                            role = item.get("role")
+                            content = item.get("content")
+                            if role not in ("user", "assistant") or not isinstance(
+                                content, str
+                            ):
+                                continue
+                            self.memory.short_term.add_message(role, content)
                 except Exception:  # noqa: BLE001 - 写回失败不影响本轮
                     logger.debug("回填历史写回短期记忆失败", exc_info=True)
         return preferences, recent
 
     async def _call_with_resilience(
-        self, factory, max_retries: int, base_delay: float, max_delay: float
+        self,
+        factory,
+        max_retries: int,
+        base_delay: float,
+        max_delay: float,
+        record_success: bool = True,
     ):
         """带重试与熔断记录的单次 LLM 调用。
 
@@ -735,7 +771,8 @@ class ConversationRuntime:
                 max_delay_sec=max_delay,
             )
             if self.circuit_breaker:
-                self.circuit_breaker.record_success()
+                if record_success:
+                    self.circuit_breaker.record_success()
                 self._probe_recorded = True
             return result
         except CircuitOpenError:

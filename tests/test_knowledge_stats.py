@@ -208,6 +208,38 @@ def test_loaded_dimension_probe_failure(monkeypatch):
     print("✓ 嵌入维度探测失败按未知处理")
 
 
+
+def test_status_reports_unavailable_when_collection_cannot_load(tmp_path):
+    """元数据可读但集合加载失败时状态必须报不可用（不能显示绿色）。"""
+
+    class _BrokenClient:
+        def has_collection(self, name):
+            return True
+
+        def load_collection(self, name):
+            raise ValueError("This file contains pickled (object) data")
+
+        def get_collection_stats(self, name):
+            return {"row_count": 165}
+
+    import utils.knowledge_stats as stats_module
+
+    db = tmp_path / "milvus_lite.db"
+    db.write_text("x", encoding="utf-8")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            stats_module, "get_milvus_client", lambda path: _BrokenClient()
+        )
+        status = knowledge_status(
+            db_path=str(db), include_path=False, detail_errors=False
+        )
+    finally:
+        monkeypatch.undo()
+    assert status["available"] is False, status
+    assert "无法加载" in status["reason"], status
+
+
 if __name__ == "__main__":
     test_missing_database()
     for case in (
