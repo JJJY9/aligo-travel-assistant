@@ -362,6 +362,7 @@ class OrchestrationAgent(AgentBase):
         x: Msg | list[Msg] | None = None,
         on_event: ProgressCallback | None = None,
         defer_memory: bool = False,
+        retry_cache: dict[str, dict[str, Any]] | None = None,
     ) -> Msg:
         """
         协调执行流程
@@ -520,6 +521,7 @@ class OrchestrationAgent(AgentBase):
                         self._context_with_previous_preferences(context, results),
                         results,
                         on_event,
+                        retry_cache,
                     )
                     results.extend(batch_results)
                     parallel_tasks = []
@@ -534,6 +536,7 @@ class OrchestrationAgent(AgentBase):
                 self._context_with_previous_preferences(context, results),
                 results,
                 on_event,
+                retry_cache,
             )
             results.extend(batch_results)
 
@@ -715,12 +718,25 @@ class OrchestrationAgent(AgentBase):
         merged["user_preferences"] = preferences
         return merged
 
+    @staticmethod
+    def _retry_cache_key(task: dict) -> str:
+        """外层整轮回退重试时的智能体结果缓存键（同一计划内稳定）。"""
+        return "|".join(
+            (
+                str(task.get("agent_name") or ""),
+                str(task.get("priority", 0)),
+                str(task.get("reason", "")),
+                str(task.get("expected_output", "")),
+            )
+        )
+
     async def _execute_parallel_agents(
         self,
         tasks: list[dict],
         context: dict[str, Any],
         previous_results: list[dict],
         on_event: ProgressCallback | None = None,
+        retry_cache: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict]:
         """
         并行执行多个智能体
@@ -747,6 +763,8 @@ class OrchestrationAgent(AgentBase):
                 expected_output=task.get("expected_output", ""),
                 previous_results=previous_results,
                 on_event=on_event,
+                retry_cache=retry_cache,
+                cache_key=self._retry_cache_key(task),
             )
             requested_name = str(task.get("agent_name") or "")
             return [{
@@ -776,6 +794,8 @@ class OrchestrationAgent(AgentBase):
                 expected_output=expected_output,
                 previous_results=previous_results,
                 on_event=on_event,
+                retry_cache=retry_cache,
+                cache_key=self._retry_cache_key(task),
             )
             parallel_coroutines.append((agent_name, priority, coroutine))
 
@@ -844,8 +864,15 @@ class OrchestrationAgent(AgentBase):
         expected_output: str,
         previous_results: list[dict],
         on_event: ProgressCallback | None = None,
+        retry_cache: dict[str, dict[str, Any]] | None = None,
+        cache_key: str = "",
     ) -> dict[str, Any]:
         """执行单个智能体，并在开始 / 结束时发出进度事件。"""
+        if retry_cache is not None and cache_key and cache_key in retry_cache:
+            # 外层整轮回退重试：复用首轮已完成的智能体结果，不重复调用
+            # 模型（一次 429/5xx 曾让同批已成功的智能体整体重发），也不再
+            # 重发进度事件（首轮已经展示过）
+            return retry_cache[cache_key]
         # 注册器两种名称都接受，但事件与结果统一用标准名
         canonical_name = canonical_agent_name(agent_name)
         self._emit(on_event, {"type": "agent_start", "agent_name": canonical_name})
@@ -869,6 +896,8 @@ class OrchestrationAgent(AgentBase):
                 "duration": duration,
             },
         )
+        if retry_cache is not None and cache_key:
+            retry_cache[cache_key] = result
         return result
 
     async def _run_agent(
