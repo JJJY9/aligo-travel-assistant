@@ -1192,9 +1192,15 @@ def test_redis_backfill_skipped_while_degraded(monkeypatch):
     monkeypatch.setattr(
         conversation_module, "redis_short_term_available", lambda: True
     )
+    # 启动期客户端工厂冷却（client=None）而进程级标志仍为 True：此时写入
+    # 同样只进故障重放日志，恢复后会把 Redis 已有消息再 RPUSH 一份
+    runtime._memory_snapshot()
+    assert added == [], "client=None 时必须按降级处理，不能写入重放日志"
+
+    redis_mem.client = object()  # 模拟客户端实际可用
     runtime._memory_snapshot()
     assert added == [("user", "旧问题"), ("assistant", "旧回答")]
-    print("✓ Redis 降级期间跳过历史回填写回")
+    print("✓ Redis 降级期间 / 客户端未取到时跳过历史回填写回")
 
 def test_runtime_uses_default_data_root_for_long_term(monkeypatch, tmp_path):
     """对话运行时的长期记忆必须落在 default_data_root()/memory。
@@ -1228,6 +1234,241 @@ def test_runtime_uses_default_data_root_for_long_term(monkeypatch, tmp_path):
     assert captured["storage_path"] == str(default_data_root() / "memory")
     assert captured["storage_path"].startswith(str(tmp_path))
     print("✓ 对话运行时长期记忆跟随 default_data_root")
+def test_summary_output_with_surrogate_is_sanitized():
+    """总结模型输出的孤立代理项必须转义：否则之后每轮请求编码失败。"""
+    from context.memory_manager import MemoryManager
+
+    lonely = chr(0xD800)
+
+    class _FakeLongTerm:
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
+            messages = [
+                {
+                    "session_id": "other",
+                    "role": "user",
+                    "content": "另一会话",
+                    "timestamp": "2026-11-01T10:00:00",
+                }
+            ]
+            return messages[-limit:] if limit else messages
+
+        def get_trip_history(self, limit=None):
+            return []
+
+    class _FakeModel:
+        async def __call__(self, messages, **kwargs):
+            return {"content": [{"type": "text", "text": "摘要" + lonely}]}
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.user_id = "u-surrogate-summary"
+    manager.session_id = "s-surrogate-summary"
+    manager.llm_model = _FakeModel()
+    manager.long_term = _FakeLongTerm()
+    manager._summary_cache = None
+    manager._summary_failure_until = 0.0
+
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    assert summary and lonely not in summary
+    assert manager._summary_cache is not None
+    assert lonely not in manager._summary_cache[1], "被污染的总结不能进缓存"
+    print("✓ 总结输出的孤立代理项被转义")
+
+
+def test_summary_window_ignores_future_timestamps():
+    """未来时间戳的异常消息不进入总结窗口；真实消息仍被总结。"""
+    from context.memory_manager import MemoryManager
+
+    prompts: list[str] = []
+
+    class _FakeLongTerm:
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
+            messages = [
+                {
+                    "session_id": "other",
+                    "role": "user",
+                    "content": f"未来-{index}",
+                    "timestamp": "2099-01-01T10:00:00+00:00",
+                }
+                for index in range(3)
+            ] + [
+                {
+                    "session_id": "other",
+                    "role": "user",
+                    "content": "真实消息",
+                    "timestamp": "2026-01-01T10:00:00",
+                }
+            ]
+            return messages[-limit:] if limit else messages
+
+        def get_trip_history(self, limit=None):
+            return []
+
+    class _FakeModel:
+        async def __call__(self, messages, **kwargs):
+            prompts.append(messages[0]["content"])
+            return {"content": [{"type": "text", "text": "摘要"}]}
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.user_id = "u-future-window"
+    manager.session_id = "s-future-window"
+    manager.llm_model = _FakeModel()
+    manager.long_term = _FakeLongTerm()
+    manager._summary_cache = None
+    manager._summary_failure_until = 0.0
+
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    assert summary
+    prompt = prompts[0]
+    assert "真实消息" in prompt
+    assert "未来-" not in prompt, "未来时间戳消息不能进入总结窗口"
+    print("✓ 未来时间戳不进入总结窗口")
+
+
+def test_summary_window_refills_when_future_messages_mixed():
+    """未来时间戳只占部分窗口时也要扩取，窗口不能静默缩水。"""
+    from context.memory_manager import MemoryManager
+
+    calls: list[int | None] = []
+    prompts: list[str] = []
+
+    class _FakeLongTerm:
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
+            calls.append(limit)
+            real_count = 60 if limit == 200 else 1
+            messages = [
+                {
+                    "session_id": "other",
+                    "role": "user",
+                    "content": f"future-{index}",
+                    "timestamp": "2099-01-01T10:00:00+00:00",
+                }
+                for index in range(49)
+            ] + [
+                {
+                    "session_id": "other",
+                    "role": "user",
+                    "content": f"real-{index}",
+                    "timestamp": "2026-01-01T10:00:00",
+                }
+                for index in range(real_count)
+            ]
+            return messages[-limit:] if limit else messages
+
+        def get_trip_history(self, limit=None):
+            return []
+
+    class _FakeModel:
+        async def __call__(self, messages, **kwargs):
+            prompts.append(messages[0]["content"])
+            return {"content": [{"type": "text", "text": "摘要"}]}
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.user_id = "u-mixed-window"
+    manager.session_id = "s-mixed-window"
+    manager.llm_model = _FakeModel()
+    manager.long_term = _FakeLongTerm()
+    manager._summary_cache = None
+    manager._summary_failure_until = 0.0
+
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    assert summary
+    assert calls == [50, 200], calls
+    assert "real-59" in prompts[0], "扩取后应包含最新的真实消息"
+    assert "future-" not in prompts[0]
+    print("✓ 未来消息混合占窗时扩取补齐")
+
+
+def test_summary_trip_window_uses_newest_with_normalized_dates():
+    """行程窗口按归一化日期取最近，预算不足时保留最新行程。"""
+    from context.memory_manager import MemoryManager, _trip_sort_key
+
+    assert _trip_sort_key({"start_date": "2026-3-5"})[0] == "2026-03-05"
+    assert _trip_sort_key({"start_date": "2026/12/31"})[0] == "2026-12-31"
+    assert _trip_sort_key({"start_date": "2026年1月5日"})[0] == "2026-01-05"
+
+    prompts: list[str] = []
+    trips = []
+    for index in range(20):
+        purpose = "OLDEST" if index == 0 else ("NEWEST" if index == 19 else "旅行")
+        trips.append(
+            {
+                "trip_id": f"t{index}",
+                "origin": "北京" + ("长" * 150),
+                "destination": "上海" + ("长" * 150),
+                "start_date": f"2026-{index + 1:02d}-01",
+                "end_date": f"2026-{index + 1:02d}-02",
+                "purpose": purpose + ("长" * 150),
+                "timestamp": "2026-01-01T00:00:00",
+            }
+        )
+
+    class _FakeLongTerm:
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
+            return []
+
+        def get_trip_history(self, limit=None):
+            return list(trips[:limit] if limit else trips)
+
+    class _FakeModel:
+        async def __call__(self, messages, **kwargs):
+            prompts.append(messages[0]["content"])
+            return {"content": [{"type": "text", "text": "摘要"}]}
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.user_id = "u-trip-budget"
+    manager.session_id = "s-trip-budget"
+    manager.llm_model = _FakeModel()
+    manager.long_term = _FakeLongTerm()
+    manager._summary_cache = None
+    manager._summary_failure_until = 0.0
+
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=30))
+    assert summary
+    prompt = prompts[0]
+    assert "NEWEST" in prompt, "预算生效时必须保留最新行程"
+    assert "OLDEST" not in prompt, "预算生效时应丢弃更旧的行程"
+    print("✓ 行程窗口按归一化日期取最近、预算保留最新")
+
+
+def test_deferred_commit_checks_tombstone_before_commit():
+    """会话已删除时丢弃延迟记忆负载，不写带 session_id 的幽灵行程。"""
+    calls: list[str] = []
+
+    class _Orchestrator:
+        async def commit_deferred_memory(self):
+            calls.append("commit")
+            return True
+
+        def discard_deferred_memory(self):
+            calls.append("discard")
+
+    class _Memory:
+        def session_deleted(self):
+            return True
+
+    runtime = ConversationRuntime.__new__(ConversationRuntime)
+    runtime.orchestrator = _Orchestrator()
+    runtime.memory = _Memory()
+    runtime.session_id = "s-deleted"
+    runtime._pending_memory_commit = None
+
+    async def _run():
+        runtime._schedule_deferred_commit()
+        await runtime._pending_memory_commit
+
+    asyncio.run(_run())
+    assert calls == ["discard"], calls
+    print("✓ 延迟记忆提交前复查墓碑")
+
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -1265,4 +1506,9 @@ if __name__ == "__main__":
     test_normalized_schedule_filters_invalid_entries()
     test_epoch_snapshot_read_before_context_and_intent()
     test_intent_success_does_not_reset_breaker_failures()
+    test_summary_output_with_surrogate_is_sanitized()
+    test_summary_window_ignores_future_timestamps()
+    test_summary_window_refills_when_future_messages_mixed()
+    test_summary_trip_window_uses_newest_with_normalized_dates()
+    test_deferred_commit_checks_tombstone_before_commit()
     print("\n全部通过")

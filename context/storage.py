@@ -165,6 +165,11 @@ def get_shared_redis_client(force: bool = False) -> Any | None:
     return _get_redis_client(url, force=force)
 
 
+def shared_redis_configured() -> bool:
+    """是否配置了共享 Redis（区分「未配置」与「配置但暂不可用」）。"""
+    return bool(STORAGE_CONFIG.get("redis_url") or "")
+
+
 def create_short_term_memory(
     session_id: str, max_turns: int = 10, user_id: str = ""
 ) -> ShortTermStore:

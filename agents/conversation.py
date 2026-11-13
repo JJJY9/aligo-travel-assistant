@@ -389,9 +389,13 @@ class ConversationRuntime:
             settlement["done"] = True
             if defer_supported:
                 # 现在才提交偏好 / 行程；取消与墓碑否决的回合不会执行到这里，
-                # 避免台账出现没有对话的事实记录
+                # 避免台账出现没有对话的事实记录。落库完成回调可能已调度提交
+                # （同样带墓碑复查），这里复用同一入口并等待其完成
                 try:
-                    await self.orchestrator.commit_deferred_memory()
+                    self._schedule_deferred_commit()
+                    pending_commit = getattr(self, "_pending_memory_commit", None)
+                    if pending_commit is not None:
+                        await asyncio.shield(pending_commit)
                 except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
                     logger.warning("提交延迟记忆写入失败", exc_info=True)
         # 成功落库（True / 旧的 None 语义）时 _meta.usage 已在消息里；
@@ -493,11 +497,40 @@ class ConversationRuntime:
             return
         self._schedule_deferred_commit()
 
-    def _schedule_deferred_commit(self) -> None:
+    def _session_deleted_now(self) -> bool:
+        """提交延迟记忆前复查共享墓碑（读取失败按未删除处理，保真优先）。"""
+        check = getattr(self.memory, "session_deleted", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 - 状态不明按未删除处理
+            return False
+
+    def _discard_deferred_memory(self) -> None:
+        discard = getattr(self.orchestrator, "discard_deferred_memory", None)
+        if callable(discard):
+            discard()
+
+    def _schedule_deferred_commit(self, check_deleted: bool = True) -> None:
         commit = getattr(self.orchestrator, "commit_deferred_memory", None)
         if not callable(commit):
             return
-        task = asyncio.ensure_future(commit())
+        if check_deleted:
+            # 落库到提交之间会话可能被其它实例 / CLI 删除：先在线程里复查
+            # 共享墓碑再提交，删除后丢弃负载（不写带 session_id 的幽灵行程）
+            async def _commit_checked() -> bool:
+                if await asyncio.to_thread(self._session_deleted_now):
+                    self._discard_deferred_memory()
+                    logger.info(
+                        "会话已被删除，丢弃延迟记忆写入：%s", self.session_id
+                    )
+                    return False
+                return bool(await commit())
+
+            task: asyncio.Future = asyncio.ensure_future(_commit_checked())
+        else:
+            task = asyncio.ensure_future(commit())
         self._pending_memory_commit = task
         task.add_done_callback(self._consume_memory_commit)
 
@@ -730,7 +763,15 @@ class ConversationRuntime:
                 redis_degraded = False
                 if isinstance(self.memory.short_term, RedisShortTermMemory):
                     try:
-                        redis_degraded = not redis_short_term_available()
+                        # 进程级标志只反映「最近一次真实操作」：启动时客户端
+                        # 工厂就在冷却期（client=None）时标志仍为 True，但
+                        # 此刻的 add_message 同样只进故障重放日志，恢复后
+                        # 会把 Redis 里已存在的消息再 RPUSH 一份
+                        redis_degraded = (
+                            not redis_short_term_available()
+                            or getattr(self.memory.short_term, "client", None)
+                            is None
+                        )
                     except Exception:  # noqa: BLE001 - 状态不明按可用处理
                         redis_degraded = False
                 try:
