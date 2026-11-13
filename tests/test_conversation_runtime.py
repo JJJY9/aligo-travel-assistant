@@ -1032,14 +1032,23 @@ def test_normalized_schedule_filters_invalid_entries():
 
 
 def test_empty_short_term_backfills_current_session_history():
-    """重启 / LRU 淘汰后短期记忆为空：从长期记忆补回本会话最近几轮。"""
+    """重启 / LRU 淘汰后短期记忆为空：从长期记忆补回本会话最近几轮并写回短期记忆。"""
     runtime, memory = _make_runtime()
 
     class _EmptyShortTerm:
+        def __init__(self):
+            self.added = []
+
         def get_recent_context(self, n_turns=5):
-            return []
+            return list(self.added[-n_turns * 2 :])
+
+        def add_message(self, role, content, metadata=None):
+            self.added.append({"role": role, "content": content})
 
     class _LongTerm:
+        def __init__(self):
+            self.history_reads = 0
+
         def get_preference(self):
             return {}
 
@@ -1048,20 +1057,33 @@ def test_empty_short_term_backfills_current_session_history():
         ):
             assert limit == 10
             assert session_id == runtime.session_id
+            self.history_reads += 1
             return [
                 {"role": "user", "content": "帮我把行程改到周五"},
                 {"role": "assistant", "content": "已改到周五"},
             ]
 
-    memory.short_term = _EmptyShortTerm()
-    memory.long_term = _LongTerm()
+    short_term = _EmptyShortTerm()
+    long_term = _LongTerm()
+    memory.short_term = short_term
+    memory.long_term = long_term
     asyncio.run(runtime.ask("那住宿呢"))
     contents = "\n".join(
         m.content for m in runtime.intention_agent.context
     )
     assert "帮我把行程改到周五" in contents, contents
     assert "已改到周五" in contents, contents
-    print("✓ 短期记忆为空时从长期记忆回填本会话上下文")
+    assert [item["content"] for item in short_term.added] == [
+        "帮我把行程改到周五",
+        "已改到周五",
+    ], "回填内容必须写回短期记忆（编排器直接从那里读取）"
+
+    # 第二轮：短期记忆已非空，不能再读长期历史，且上下文仍包含回填内容
+    asyncio.run(runtime.ask("第二天呢"))
+    assert long_term.history_reads == 1, "回填写回后下一轮不应重复读取长期历史"
+    second_context = "\n".join(m.content for m in runtime.intention_agent.context)
+    assert "帮我把行程改到周五" in second_context, second_context
+    print("✓ 短期记忆为空时从长期记忆回填本会话上下文并写回")
 
 
 def test_non_empty_short_term_skips_long_term_backfill():
