@@ -18,6 +18,11 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
+from utils.chat_import import (
+    filter_import_messages,
+    prepare_import_messages,
+    session_dedupe_key,
+)
 from utils.errors import MemoryPersistenceError, PartialImportError
 from utils.preference_values import merge_preference_value
 from utils.timestamps import localize_naive, parse_iso_datetime
@@ -216,10 +221,11 @@ class PostgresLongTermMemory:
         with _SCHEMA_LOCK:
             if key in _SCHEMA_READY:
                 return
-            self._create_schema()
-            _SCHEMA_READY.add(key)
+            # 等锁超时跳过 DDL 时不标记完成：下次构造重试
+            if self._create_schema():
+                _SCHEMA_READY.add(key)
 
-    def _create_schema(self) -> None:
+    def _create_schema(self) -> bool:
         import psycopg
 
         duplicate_errors: tuple[type[BaseException], ...] = tuple(
@@ -232,32 +238,75 @@ class PostgresLongTermMemory:
             if isinstance(error, type)
         )
         with self._conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT pg_advisory_lock(hashtext(%s)::bigint)",
-                (_SCHEMA_ADVISORY_LOCK,),
-            )
+            # 建索引可能让持锁方占用较久：等待 schema 锁期间放宽
+            # lock_timeout（连接默认 3 秒，等待锁超时会冒到构造函数、
+            # 让工厂把健康的 PostgreSQL 误判为故障并回退 JSON）
+            cursor.execute("SET lock_timeout = '60s'")
+            locked = False
             try:
                 try:
-                    cursor.execute(_SCHEMA_SQL)
-                except duplicate_errors:
-                    # 旧实例（不持本锁）并发建表：批次在失败语句处中止，
-                    # 重跑一次补齐后面的建表语句
-                    logger.info("表结构已被并发创建，重试剩余 DDL")
-                    cursor.execute(_SCHEMA_SQL)
-                try:
-                    # 历史库可能已有重复 trip_id，建索引失败只记录，不阻止后端启用
                     cursor.execute(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aligo_trips_user_trip "
-                        "ON aligo_trips (user_id, trip_id)"
-                    )
-                except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
-                    logger.warning("无法创建 trip_id 唯一索引: %s", exc)
-            finally:
-                with contextlib.suppress(Exception):
-                    cursor.execute(
-                        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                        "SELECT pg_advisory_lock(hashtext(%s)::bigint)",
                         (_SCHEMA_ADVISORY_LOCK,),
                     )
+                    locked = True
+                except Exception as exc:  # noqa: BLE001 - 等锁超时不能拖垮后端
+                    # 其它实例正在初始化且耗时较长：跳过本次 DDL（表结构
+                    # 由其创建）；本进程照常启用，读取最多稍慢。不标记
+                    # schema 完成，下次构造重试。
+                    logger.warning("等待表结构初始化锁超时，跳过 DDL: %s", exc)
+                    return False
+                if locked:
+                    try:
+                        try:
+                            cursor.execute(_SCHEMA_SQL)
+                        except duplicate_errors:
+                            # 旧实例（不持本锁）并发建表：批次在失败语句处中止，
+                            # 重跑一次补齐后面的建表语句
+                            logger.info("表结构已被并发创建，重试剩余 DDL")
+                            cursor.execute(_SCHEMA_SQL)
+                        try:
+                            # 历史库可能已有重复 trip_id，建索引失败只记录，不阻止后端启用
+                            cursor.execute(
+                                "CREATE UNIQUE INDEX IF NOT EXISTS idx_aligo_trips_user_trip "
+                                "ON aligo_trips (user_id, trip_id)"
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
+                            logger.warning("无法创建 trip_id 唯一索引: %s", exc)
+                        try:
+                            # 读取按 created_at 排序（恢复的旧消息 created_at
+                            # 很旧、id 最大）。CONCURRENTLY 不阻塞并发写入；
+                            # 构建失败只记录（读取仍正确、全量排序稍慢），
+                            # 下次启动重试。上次中断可能留下无效索引，先清理。
+                            cursor.execute(
+                                "SELECT i.indisvalid FROM pg_index i "
+                                "JOIN pg_class c ON c.oid = i.indexrelid "
+                                "WHERE c.relname = %s",
+                                ("idx_aligo_chat_user_created",),
+                            )
+                            index_row = cursor.fetchone()
+                            if index_row is not None and not index_row[0]:
+                                cursor.execute(
+                                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                                    "idx_aligo_chat_user_created"
+                                )
+                            cursor.execute(
+                                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                                "idx_aligo_chat_user_created "
+                                "ON aligo_chat_messages (user_id, created_at, id)"
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 仅影响读取性能
+                            logger.warning("无法创建消息时间索引（读取会稍慢）: %s", exc)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            cursor.execute(
+                                "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                                (_SCHEMA_ADVISORY_LOCK,),
+                            )
+            finally:
+                with contextlib.suppress(Exception):
+                    cursor.execute("SET lock_timeout = 3000")
+        return True
 
     def _execute(
         self, sql: str, params: tuple | None = None, replay_safe: bool = True
@@ -572,29 +621,22 @@ class PostgresLongTermMemory:
         """批量追加聊天消息（备份恢复）：单事务 executemany。
 
         ``dedupe=True`` 在同一事务内先读出（会话, 角色, 内容）多重集再过滤，
-        重复导入同一备份不会追加重复消息。返回实际写入的条数。
+        重复导入同一备份不会追加重复消息；提问已被去重的轮次连同备份里的
+        旧回答一起跳过（见 :mod:`utils.chat_import`），避免恢复出没有对应
+        提问的重复回答。读取顺序按 ``created_at`` 排序，恢复的旧消息回到
+        会话中的历史位置。返回实际写入的条数。
         """
-        rows: list[tuple] = []
-        fallback = datetime.now().isoformat()
-        for message in messages:
-            role = str(message.get("role") or "")
-            if role not in {"user", "assistant"}:
-                continue
-            timestamp = message.get("timestamp") or fallback
-            rows.append(
-                (
-                    role,
-                    str(message.get("content") or ""),
-                    message.get("session_id"),
-                    _pg_timestamp(timestamp),
-                )
-            )
-        if not rows:
+        incoming = [
+            message
+            for message in prepare_import_messages(messages)
+            if str(message.get("role") or "") in {"user", "assistant"}
+        ]
+        if not incoming:
             return 0
 
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
-                kept = rows
+                kept: list[dict[str, Any]] = incoming
                 if dedupe:
                     # READ COMMITTED 下两个并发导入都能在 SELECT 里看不到对方
                     # 尚未提交的行：先拿用户级事务锁串行化「查重 + 插入」，
@@ -608,33 +650,30 @@ class PostgresLongTermMemory:
                         "WHERE user_id = %s",
                         (self.user_id,),
                     )
-                    def _dedupe_session_key(value: Any) -> str | None:
-                        # 与 JSON context.long_term_memory._session_dedupe_key
-                        # 同口径：旧数据 / 备份里的整数 session_id 字符串化，
-                        # 否则同一会话的恢复消息会被判成新消息重复插入
-                        return None if value is None else str(value)
-
                     existing = Counter(
-                        (_dedupe_session_key(session_id), role, content)
+                        (session_dedupe_key(session_id), role, content)
                         for session_id, role, content in cursor.fetchall()
                     )
-                    filtered = []
-                    for role, content, session_id, timestamp in rows:
-                        key = (_dedupe_session_key(session_id), role, content)
-                        if existing[key] > 0:
-                            existing[key] -= 1
-                            continue
-                        filtered.append((role, content, session_id, timestamp))
-                    kept = filtered
+                    kept = filter_import_messages(incoming, existing)
                 if not kept:
                     return 0
+                fallback = datetime.now().isoformat()
+                rows = [
+                    (
+                        str(message.get("role") or ""),
+                        str(message.get("content") or ""),
+                        message.get("session_id"),
+                        _pg_timestamp(message.get("timestamp") or fallback),
+                    )
+                    for message in kept
+                ]
                 cursor.executemany(
                     "INSERT INTO aligo_chat_messages "
                     "(user_id, role, content, session_id, created_at) "
                     "VALUES (%s, %s, %s, %s, %s)",
-                    [(self.user_id, *row) for row in kept],
+                    [(self.user_id, *row) for row in rows],
                 )
-                return len(kept)
+                return len(rows)
 
         # dedupe=True 的重放会在 SELECT 里看到已提交行并全部跳过，天然幂等；
         # 不带去重的批量插入重放会产生重复消息，禁止自动重放
@@ -659,14 +698,16 @@ class PostgresLongTermMemory:
         if limit:
             rows = self._fetchall(
                 "SELECT role, content, session_id, created_at FROM aligo_chat_messages "
-                f"WHERE {where} ORDER BY id DESC LIMIT %s",
+                f"WHERE {where} ORDER BY created_at DESC, id DESC LIMIT %s",
                 (*params, limit),
             )
             rows = list(reversed(rows))
         else:
+            # 按时间排序而不是插入顺序：备份恢复会把旧消息以旧 created_at
+            # 写到表尾，按 id 读会让会话详情把旧消息显示在最新消息之后
             rows = self._fetchall(
                 "SELECT role, content, session_id, created_at FROM aligo_chat_messages "
-                f"WHERE {where} ORDER BY id",
+                f"WHERE {where} ORDER BY created_at, id",
                 tuple(params),
             )
 
@@ -746,13 +787,17 @@ class PostgresLongTermMemory:
     def delete_last_turn(self, session_id: str, expect: str | None = None) -> int:
         """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。
 
-        ``expect`` 不为 None 时先校验最后一轮的用户提问内容，不一致直接返回 0，
-        避免删除上一轮已保存的对话。删除语句带「没有更新消息」条件，避免在
-        多进程场景下与并发写入交错后删错回合。
+        「最后一轮」按 ``created_at, id`` 认定，与 :meth:`get_chat_history`
+        的读取顺序一致：备份恢复会把旧消息以旧时间戳、新 id 写到表尾，
+        按 id 认定会删掉刚恢复的旧一轮而不是界面显示的最后一轮。
+        ``expect`` 不为 None 时先校验最后一轮的用户提问内容，不一致直接
+        返回 0；删除语句带「没有更新消息」条件，避免在多进程场景下与并发
+        写入交错后删错回合。
         """
         rows = self._fetchall(
-            "SELECT id, role, content FROM aligo_chat_messages "
-            "WHERE user_id = %s AND session_id = %s ORDER BY id DESC LIMIT 2",
+            "SELECT id, role, content, created_at FROM aligo_chat_messages "
+            "WHERE user_id = %s AND session_id = %s "
+            "ORDER BY created_at DESC, id DESC LIMIT 2",
             (self.user_id, session_id),
         )
         if not rows:
@@ -776,14 +821,24 @@ class PostgresLongTermMemory:
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:session_meta:{self.user_id}",),
                 )
+                # 「更新」按与读取一致的 created_at, id 排序判定：只看 id
+                # 会把恢复写入的旧消息误当成新消息，导致删除被意外拒绝
                 cursor.execute(
                     "DELETE FROM aligo_chat_messages "
                     "WHERE user_id = %s AND id = ANY(%s) "
                     "AND NOT EXISTS ("
                     "  SELECT 1 FROM aligo_chat_messages "
-                    "  WHERE user_id = %s AND session_id = %s AND id > %s"
+                    "  WHERE user_id = %s AND session_id = %s "
+                    "  AND (created_at, id) > (%s, %s)"
                     ")",
-                    (self.user_id, ids, self.user_id, session_id, rows[0][0]),
+                    (
+                        self.user_id,
+                        ids,
+                        self.user_id,
+                        session_id,
+                        rows[0][3],
+                        rows[0][0],
+                    ),
                 )
                 removed = cursor.rowcount or 0
                 # 会话消息已被删空时同步清理标题 / 置顶 / 归档标记。清理

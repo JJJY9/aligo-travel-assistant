@@ -2939,7 +2939,8 @@ def run_user_import_standalone(
             f"{prefix}偏好 {counts['preferences']} 项，行程新增 "
             f"{counts['trips_created']} 条 / 更新 {counts['trips_updated']} 条，"
             f"聊天消息 {counts['messages_added']} 条"
-            f"（跳过重复 {counts['messages_skipped']} 条），标题 "
+            f"（跳过重复 / 提问已存在轮次的回答 {counts['messages_skipped']} 条），"
+            f"标题 "
             f"{counts['titles']} 个，置顶 {counts['pinned']} 个，归档 "
             f"{counts['archived']} 个"
         )

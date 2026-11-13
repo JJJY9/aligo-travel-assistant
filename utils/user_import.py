@@ -6,8 +6,9 @@
 （会话, 角色, 内容）多重集去重（重复导入同一备份不会追加重复消息）。
 
 时间戳统一归一成带时区 ISO（naive 按本机时区解释），写入 TIMESTAMPTZ 不会
-发生时区偏移；消息按时间升序批量写入（单次存储层写锁 / 单事务），导入
-到已存在的会话时旧消息追加在当前转录末尾（存储层按追加顺序保存）。
+发生时区偏移；缺失 / 非法时间戳的消息沿用同会话相邻消息的时间。消息批量
+写入（单次存储层写锁 / 单事务）并按时间戳并入全局历史位置；提问已在目标
+库中的轮次跳过备份里的回答（本地优先，见 :mod:`utils.chat_import`）。
 """
 import json
 import logging
@@ -16,6 +17,7 @@ import re
 from collections import Counter
 from typing import Any
 
+from utils.chat_import import filter_import_messages, prepare_import_messages
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
@@ -567,7 +569,9 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         )
     # 保持备份里的消息顺序：备份由导出按存储顺序写出，会话内提问 / 回答
     # 有序；全局按时间重排时无时间戳的旧消息会被排到末尾（恢复后会话里
-    # 先显示回答再显示提问）。逐会话顺序由 add_chat_messages 原样追加
+    # 先显示回答再显示提问）。存储层按时间戳把恢复消息并入全局历史
+    # （缺失时间戳的沿用同会话相邻消息的时间），备份顺序决定同一时刻
+    # 消息的先后。
     sections["messages"] = messages
     session_ids = {m["session_id"] for m in messages if m["session_id"]}
 
@@ -787,25 +791,22 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
 
     messages = sections.get("messages", [])
     if messages:
+        history = store.get_chat_history(limit=None)
         existing = Counter(
             (
                 _message_session_key(message.get("session_id")),
                 message.get("role"),
                 str(message.get("content") or ""),
             )
-            for message in store.get_chat_history(limit=None)
+            for message in history
         )
-        for message in messages:
-            message_key = (
-                _message_session_key(message["session_id"]),
-                message["role"],
-                message["content"],
-            )
-            if existing[message_key] > 0:
-                existing[message_key] -= 1
-                result["messages_skipped"] += 1
-            else:
-                result["messages_added"] += 1
+        # 与写入层同一实现（含缺失时间戳的补齐口径）：重复消息与
+        # 「提问已存在轮次里的回答」都跳过，预览与真实执行的条数一致
+        planned = filter_import_messages(
+            prepare_import_messages(messages), existing
+        )
+        result["messages_added"] = len(planned)
+        result["messages_skipped"] = len(messages) - len(planned)
     return result
 
 
@@ -921,28 +922,23 @@ def _planned_new_counts(
     if messages and callable(history_getter):
         existing: Counter[tuple[str | None, Any, str]] | None
         try:
+            history = history_getter(limit=None)
             existing = Counter(
                 (
                     _message_session_key(message.get("session_id")),
                     message.get("role"),
                     str(message.get("content") or ""),
                 )
-                for message in history_getter(limit=None)
+                for message in history
             )
         except Exception:  # noqa: BLE001 - 读取失败按「全部新增」保守处理
             existing = None
+            history = []
         if existing is not None:
-            new_messages = 0
-            for message in messages:
-                message_key = (
-                    _message_session_key(message.get("session_id")),
-                    message.get("role"),
-                    message.get("content"),
-                )
-                if existing[message_key] > 0:
-                    existing[message_key] -= 1
-                    continue
-                new_messages += 1
+            # 与写入层 / 预览同一实现：重复消息与提问已存在轮次的回答不算新增
+            new_messages = len(
+                filter_import_messages(prepare_import_messages(messages), existing)
+            )
     return new_trips, new_messages
 
 
@@ -983,7 +979,7 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
             raise ValueError(
                 f"恢复后消息总数将超过上限 {_MAX_MESSAGES}"
                 f"（现有 {existing_messages} + 新增 {new_messages}；"
-                f"备份中 {len(messages) - new_messages} 条为重复导入），"
+                f"备份中 {len(messages) - new_messages} 条为重复或提问已存在轮次的回答），"
                 "请先清理历史消息后重试"
             )
 
