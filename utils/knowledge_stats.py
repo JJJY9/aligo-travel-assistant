@@ -69,13 +69,22 @@ def knowledge_status(
         return {**base, "available": False, "reason": "知识库未初始化"}
 
     client = None
-    # 与知识库写锁互斥：整组替换是多步写入，期间读到中间行数会让面板
-    # chip 与列表 total 不一致
-    lock_ctx: Any
+    # 只读快照用共享读锁：此前用独占写锁，纯读并发（面板 chip + 列表 +
+    # 状态）会互相排队，且在写者优先下新读者会被判成「正在写入」。读锁
+    # 仍与整组替换的多步写入互斥，读到中间行数的问题不受影响
+    read_lock_factory: Any = None
+    busy_error: type[Exception] = RuntimeError
+    lock_ctx: Any = contextlib.nullcontext()
     try:
-        from utils.knowledge_admin import _WRITE_LOCK
+        from utils.knowledge_admin import (
+            KnowledgeBusyError,
+            _WRITE_LOCK,
+            _read_lock,
+        )
 
         lock_ctx = _WRITE_LOCK
+        read_lock_factory = _read_lock
+        busy_error = KnowledgeBusyError
     except Exception:  # noqa: BLE001 - 维护模块不可用时保持原行为
         lock_ctx = contextlib.nullcontext()
     def _snapshot(client: Any) -> dict[str, Any]:
@@ -95,16 +104,29 @@ def knowledge_status(
             payload["dimension_mismatch"] = int(dimension) != int(expected)
         return payload
 
+    busy_payload = {
+        **base,
+        "available": False,
+        "reason": "知识库正在写入（导入进行中），请稍后刷新",
+    }
     try:
         client = get_milvus_client(str(db))
+        if read_lock_factory is not None:
+            try:
+                lock = (
+                    read_lock_factory(lock_timeout)
+                    if lock_timeout is not None
+                    else read_lock_factory()
+                )
+                with lock:
+                    return _snapshot(client)
+            except busy_error:
+                return busy_payload
+        # 旧版本维护模块（无读锁）：退回独占加锁
         if lock_timeout is not None:
             acquired = lock_ctx.acquire(timeout=lock_timeout)
             if not acquired:
-                return {
-                    **base,
-                    "available": False,
-                    "reason": "知识库正在写入（导入进行中），请稍后刷新",
-                }
+                return busy_payload
             try:
                 return _snapshot(client)
             finally:

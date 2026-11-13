@@ -635,6 +635,37 @@ def update_document(
         )
     client = _client()
     _load_collection(client, COLLECTION_NAME)
+
+    def _edit_unchanged(
+        snapshot: tuple[str, dict[str, str]],
+    ) -> bool:
+        current_text, current_meta = snapshot
+        wanted_meta = {
+            str(key): str(value)
+            for key, value in (metadata or {}).items()
+            if key not in _DERIVED_CHUNK_KEYS
+        }
+        return text == current_text and wanted_meta == current_meta
+
+    # 原样保存在读锁内先行判定：命中直接返回，不为一次 no-op 保存加载
+    # （冷加载可能联网下载数十秒的）嵌入模型；未命中再走完整写路径，
+    # 锁内仍以权威快照复核，判定不依赖这次读取的时效性
+    try:
+        with _read_lock():
+            parts, pre_group = _document_info(client, int(doc_id))
+            if parts == 1 or (parts > 1 and pre_group):
+                pre_snapshot = _locked_user_snapshot(
+                    client, int(doc_id), pre_group
+                )
+                if pre_snapshot is not None and _edit_unchanged(pre_snapshot):
+                    return {
+                        "status": "success",
+                        "id": int(doc_id),
+                        "unchanged": True,
+                    }
+    except Exception:  # noqa: BLE001 - 预检失败走完整流程
+        logger.debug("原样保存预检失败，按完整流程处理", exc_info=True)
+
     agent = _get_agent()
     documents = _chunk_documents(text, metadata)
     stored_size = sum(len(document["content"]) for document in documents)
@@ -658,19 +689,12 @@ def update_document(
         # 空行 / 换行合并（排版逐渐劣化、分片边界变化），还白白重建分片与
         # 向量；面板「不做修改直接保存」应是 no-op
         snapshot = _locked_user_snapshot(client, int(doc_id), group)
-        if snapshot is not None:
-            current_text, current_meta = snapshot
-            wanted_meta = {
-                str(key): str(value)
-                for key, value in (metadata or {}).items()
-                if key not in _DERIVED_CHUNK_KEYS
+        if snapshot is not None and _edit_unchanged(snapshot):
+            return {
+                "status": "success",
+                "id": int(doc_id),
+                "unchanged": True,
             }
-            if text == current_text and wanted_meta == current_meta:
-                return {
-                    "status": "success",
-                    "id": int(doc_id),
-                    "unchanged": True,
-                }
         # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
         # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
         old_ids: list[int] = []
@@ -1507,7 +1531,10 @@ def import_documents(
     agent = None if dry_run else _get_agent()
 
     imported: list[int] = []
-    with _write_lock():
+    # dry-run 只做只读规划（不加载模型、不写入）：用共享读锁，预览的全库
+    # 判重扫描不再阻塞检索 / 面板等读路径
+    planning_lock = _read_lock() if dry_run else _write_lock()
+    with planning_lock:
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
         # 插入同一批内容；快照走全量扫描（多重集），超过单页规模或同文
         # 重复分片时判重都不会失真

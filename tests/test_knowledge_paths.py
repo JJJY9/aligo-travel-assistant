@@ -70,5 +70,33 @@ def test_knowledge_db_path_explicit_directory(tmp_path):
     print("✓ 显式目录的库路径拼接")
 
 
+
+
+def test_wheel_install_prefers_user_data_dir(monkeypatch, tmp_path):
+    """wheel 安装：知识库跟随用户数据目录（不写安装前缀的技能目录）。"""
+    skill = tmp_path / "site-skills"
+    legacy = tmp_path / "legacy"
+    data_root = tmp_path / "userdata"
+    monkeypatch.setattr(knowledge_paths, "SKILL_KNOWLEDGE_DIR", skill)
+    monkeypatch.setattr(knowledge_paths, "LEGACY_KNOWLEDGE_DIR", legacy)
+    monkeypatch.setattr(knowledge_paths, "is_source_checkout", lambda: False)
+    monkeypatch.setattr(knowledge_paths, "default_data_root", lambda: data_root)
+    knowledge_paths.reset_default_knowledge_dir()
+    try:
+        expected = data_root / "rag_knowledge"
+        assert knowledge_paths.default_knowledge_dir() == expected
+
+        # 用户数据目录已有库：仍取它（优先于已存在的 skill 库）
+        skill.mkdir()
+        (skill / "milvus_lite.db").mkdir()
+        expected.mkdir(parents=True)
+        (expected / "milvus_lite.db").mkdir()
+        knowledge_paths.reset_default_knowledge_dir()
+        assert knowledge_paths.default_knowledge_dir() == expected
+    finally:
+        knowledge_paths.reset_default_knowledge_dir()
+    print("✓ wheel 安装知识库跟随用户数据目录")
+
+
 if __name__ == "__main__":
     print("monkeypatch 用例需 pytest 运行")

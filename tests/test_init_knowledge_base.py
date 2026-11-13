@@ -48,6 +48,11 @@ def _prepare_dirs(module, tmp):
     script.mkdir()
     (documents / "a.txt").write_text("差旅住宿标准：一线城市不超过 500 元。", encoding="utf-8")
     module.current_dir = script
+    # 目标库固定到临时技能目录：默认解析与运行时一致（真实仓库 / 用户数据
+    # 目录），测试必须隔离，不能写进真实知识库
+    module._resolve_knowledge_base_path = (
+        lambda skill_root: Path(skill_root) / "data" / "rag_knowledge"
+    )
 
 
 def test_main_returns_1_when_agent_not_initialized(monkeypatch):

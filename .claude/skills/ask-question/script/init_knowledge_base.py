@@ -407,6 +407,22 @@ def _drop_collection_for_rebuild(knowledge_base_path: Path) -> None:
         client.drop_collection(COLLECTION_NAME)
 
 
+def _resolve_knowledge_base_path(skill_root: Path) -> Path:
+    """初始化目标知识库目录。
+
+    必须与运行时 ``default_knowledge_dir()`` 一致：ALIGO_SKILLS_DIR 指向
+    外部技能目录或 wheel 安装时，脚本自身所在技能目录与运行期解析出的
+    目录不同——写进脚本目录的库应用永远看不到（初始化「成功」、退出码
+    0，但面板与问答恒报未初始化）。无法导入 utils 时退回脚本目录。
+    """
+    try:
+        from utils.knowledge_paths import default_knowledge_dir
+
+        return default_knowledge_dir()
+    except Exception:  # noqa: BLE001 - 独立运行（无 utils）
+        return skill_root / "data" / "rag_knowledge"
+
+
 def main() -> int:
     print("=" * 70)
     print("初始化RAG知识库 (Plugin Version) - With Chunking")
@@ -417,17 +433,9 @@ def main() -> int:
     try:
         # 定义路径
         skill_root = current_dir.parent
-        knowledge_base_path = skill_root / "data" / "rag_knowledge"
         documents_dir = skill_root / "data" / "documents"
-        # 重建前的来源库必须赶在第 3 步建出新库之前确定：旧部署的知识库
-        # 可能在项目根 rag_knowledge/（default_knowledge_dir 的回退路径），
-        # 新建空 skill 库后默认解析会翻转过去，旧库内容将导出成 0 条
-        try:
-            from utils.knowledge_paths import default_knowledge_dir
-
-            source_knowledge_dir = default_knowledge_dir()
-        except Exception:  # noqa: BLE001 - 解析失败时退回脚本自身目录
-            source_knowledge_dir = knowledge_base_path
+        knowledge_base_path = _resolve_knowledge_base_path(skill_root)
+        source_knowledge_dir = knowledge_base_path
 
         # 1. 先加载文档：任一文件失败在触碰知识库之前中止
         print(f"1. 从 {documents_dir} 加载文档...")
@@ -469,12 +477,16 @@ def main() -> int:
         backup_path: Path | None = None
         try:
             rag_agent = _build_agent(model, knowledge_base_path)
-        except RuntimeError as exc:
+        except Exception as exc:  # noqa: BLE001 - pymilvus 的锁/连接异常类型不统一
             # 只对「集合向量维度与嵌入模型不一致」做自愈：模型维度探测失败
             # 抛出的「无法读取嵌入模型维度」同样包含「维度」，误判会先删
             # 集合、重试仍抛同一错误，把可用的知识库删成未初始化状态
             if "不一致" not in str(exc):
-                print(f"❌ 初始化失败：{exc}（知识库保持原样）")
+                hint = ""
+                lowered = str(exc).lower()
+                if "connection" in lowered or "lock" in lowered or "config" in lowered:
+                    hint = "；若 Web 服务正在运行，请先停止服务后重试"
+                print(f"❌ 初始化失败：{exc}（知识库保持原样）{hint}")
                 return 1
             print(f"   ⚠️  {exc}")
             # 顺序关键：先导出面板 / CLI 添加的片段，导出失败即中止——
@@ -502,7 +514,14 @@ def main() -> int:
             )
             preserved_ready = True
             _drop_collection_for_rebuild(knowledge_base_path)
-            rag_agent = _build_agent(model, knowledge_base_path)
+            try:
+                rag_agent = _build_agent(model, knowledge_base_path)
+            except Exception as rebuild_exc:  # noqa: BLE001 - 已保留备份
+                print(
+                    f"❌ 按当前嵌入模型重建失败：{rebuild_exc}"
+                    f"（已导出备份：{backup_path or '无'}）"
+                )
+                return 1
 
         if not rag_agent.initialized:
             print("❌ RAG Agent初始化失败")
