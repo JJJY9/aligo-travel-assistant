@@ -3580,9 +3580,31 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
 
     存储层在 JSON 损坏时会把文件改名为 ``.corrupt-*`` 并以空快照启动；
     备份 / 清理脚本必须能区分「用户没有数据」与「读不到用户数据」。
+    除本次进程的 getter 外还要扫描同目录里更早进程留下的隔离备份：主文件
+    缺失 + 存在 ``<user>.json.corrupt-*`` 时，本进程的空快照与「用户确实
+    没有数据」无从区分，导出会把空数据写盘并以 0 退出。
     """
     getter = getattr(store, "get_recovered_corrupt_backup", None)
-    return getter() if callable(getter) else None
+    if callable(getter):
+        recovered = getter()
+        if recovered:
+            return str(recovered)
+    db_path = getattr(store, "db_path", None)
+    if not db_path:
+        return None
+    from pathlib import Path
+
+    try:
+        base = Path(db_path)
+    except TypeError:
+        return None
+    try:
+        if base.exists():
+            return None
+        matches = sorted(base.parent.glob(base.name + ".corrupt-*"))
+    except OSError:
+        return None
+    return str(matches[-1]) if matches else None
 
 
 def _open_cli_store(user_id: str):

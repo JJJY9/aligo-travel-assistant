@@ -58,7 +58,9 @@ def _escape_inline_markdown(text: str) -> str:
     index = 0
     while index < len(text):
         char = text[index]
-        if char in "\\[]()":
+        if char in "\\[]()`":
+            # 反引号同样转义：裸反引号在渲染器里可能与其它行 / 其它片段
+            # 组成行内代码段，让本该转义的内容被当作代码原样输出
             out.append("\\" + char)
         elif char == "<":
             out.append("&lt;")
@@ -91,123 +93,31 @@ def _find_backtick_run(text: str, start: int, run: int) -> int | None:
     return None
 
 
-_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
-_BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
-_LIST_ITEM_RE = re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
-_HTML_BLOCK_RE = re.compile(r"^ {0,3}<[A-Za-z/!?]")
-# Setext 标题下划线（紧跟段落行时把段落变成标题）与主题分隔线同样结束段落：
-# 只认纯 ``=`` / ``-``（可带尾随空白）与 ``***`` / ``___`` / 空格分隔的
-# 连字符线；``- -`` 这类按列表项处理（_LIST_ITEM_RE 已覆盖）
-_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
-_THEMATIC_BREAK_RE = re.compile(
-    r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"
-)
+def _escape_body_line(line: str) -> str:
+    """引用块内、围栏外的正文行：同一行内成对的行内代码之外全部转义。
 
-
-def _starts_block(line: str) -> bool:
-    """该行是否开启一个能打断段落的块（CommonMark 块级起始）。
-
-    跨行行内代码只能闭合于同一段落内：导出时每行前缀 ``> ``，标题、引用、
-    列表、HTML 块、Setext 下划线与主题分隔线在引用块内仍是真实块，会打断
-    上一行所处的段落。若把块起始行上的反引号当成关闭串，上一行剩余内容会
-    被当作代码而不转义——攻击者用 ``x` <img onerror=…>`` 加 ``# ` ``（或
-    ``---`` / ``***`` 等再跟一行反引号）即可让原始 HTML 落进导出文件。
-    列表起始号的精确规则（有序列表须从 1 开始才能打断段落）不做区分：多认
-    块起始只会让跨行代码段内容被保守转义（可见实体），不会放过原始 HTML。
-    """
-    return bool(
-        _ATX_HEADING_RE.match(line)
-        or _BLOCKQUOTE_RE.match(line)
-        or _LIST_ITEM_RE.match(line)
-        or _HTML_BLOCK_RE.match(line)
-        or _SETEXT_UNDERLINE_RE.match(line)
-        or _THEMATIC_BREAK_RE.match(line)
-    )
-
-
-def _is_table_delimiter(line: str) -> bool:
-    """GFM 表格分隔行（``| --- | :--: |``）判定。
-
-    表格块同样结束段落：表头行里的未配对反引号不能与数据行配对，否则
-    数据行的反引号会被当作跨行关闭串、表头剩余内容（含原始 HTML）跳过
-    转义——与 #708 / #712 同类的 HIGH XSS 绕过。单列分隔线（``---``）
-    没有管道符，按 Setext / 主题分隔线处理，不在此列。
-    """
-    text = line.strip()
-    if "|" not in text:
-        return False
-    cells = text.strip("|").split("|")
-    return all(re.fullmatch(r"[ \t]*:?-+:?[ \t]*", cell) for cell in cells)
-
-
-def _closing_run_follows(
-    lines: list[str], line_index: int, run: int
-) -> bool:
-    """后续行（同一段落内）是否存在等长反引号串（跨行代码段）。
-
-    必须扫到段落真正结束：提前截断会改变反引号的配对位置（被截断的开串
-    与后续行里的闭合串会在 CommonMark 里配成一对，行内剩余内容反而失去
-    转义）。超大消息的线性降级见 :data:`_MAX_INLINE_PAIRING_CHARS`。
-    """
-    for index in range(line_index + 1, len(lines)):
-        text = lines[index]
-        if not text.strip():
-            return False
-        if _fence_open(text):
-            return False
-        if _starts_block(text):
-            return False
-        if _is_table_delimiter(text):
-            return False
-        next_line = lines[index + 1] if index + 1 < len(lines) else ""
-        if "|" in text and _is_table_delimiter(next_line):
-            # 本行 + 下一行构成 GFM 表格（表头 + 分隔行）：表格块打断段落，
-            # 表头行上的反引号不能关闭上一行的代码段
-            return False
-        if _find_backtick_run(text, 0, run) is not None:
-            return True
-    return False
-
-
-def _escape_body_line(
-    line: str, lines: list[str] | None = None, line_index: int = 0
-) -> tuple[str, int]:
-    """引用块内、围栏外的正文行：行内代码之外才转义。
-
-    返回 ``(转义后的文本, 跨行代码段待关闭的反引号长度)``。CommonMark 在
-    行内代码里不解码实体：无条件把 ``<`` 换成 ``&lt;`` 会让导出的示例代码
-    被改写（复制出来是错误源码），因此按反引号开合跳过；但**未配对**的
-    反引号在 CommonMark 里只是普通字符——不能据此把整行剩余内容当成代码
-    而不转义（``价格低`于 <img onerror>`` 会原样输出原始 HTML）。打开
-    代码段前必须具备「同行或后续段落行存在等长关闭串」，否则按字面字符
-    处理、照常转义。
+    跨行行内代码不再保留：导出器对段落边界的推断与真实渲染器不完全一致
+    （块起始行 / 表格 / 缩进代码块 / 转义后结构变化），一旦两边对反引号的
+    配对位置判断不同，渲染器就会把本该转义的内容当代码段原样输出原始
+    HTML。**未配对的反引号一律写成 ``\\```**（CommonMark 转义，显示为
+    字面反引号）：渲染器不可能再拿它与其它行组成代码段。表格行与缩进
+    代码块行（行首 4+ 空格）的上下文不可靠，反引号同样全部转义。
     """
     out: list[str] = []
     index = 0
-    table_like = "|" in line
-    # 本行本身是块起始（ATX 标题 / HTML 块 / 引用 / 列表 / 分隔线）时，
-    # 段落在本行结束：未配对反引号不能与后续行配对，否则本行剩余内容会
-    # 被当作代码而跳过转义（渲染器却按普通段落执行原始 HTML）
-    can_carry = not (_starts_block(line) or _is_table_delimiter(line))
+    # 表格行 / 缩进代码块行的渲染上下文与普通段落不同：不保留行内代码，
+    # 反引号全部转义（转义后不可能参与任何配对）
+    no_pair = "|" in line or _leading_spaces(line) >= 4
     while index < len(line):
         char = line[index]
-        if char == "`" and not table_like:
+        if char == "`":
             end = index
             while end < len(line) and line[end] == "`":
                 end += 1
             run = end - index
-            close = _find_backtick_run(line, end, run)
+            close = None if no_pair else _find_backtick_run(line, end, run)
             if close is None:
-                if (
-                    can_carry
-                    and lines is not None
-                    and _closing_run_follows(lines, line_index, run)
-                ):
-                    # 跨行代码段：本行剩余内容都属于代码，原样保留
-                    out.append(line[index:])
-                    return "".join(out), run
-                # 未配对反引号只是字面字符：保留后继续转义其余内容
-                out.append(line[index:end])
+                out.append("\\`" * run)
                 index = end
                 continue
             out.append(line[index : close + run])
@@ -224,16 +134,7 @@ def _escape_body_line(
         else:
             out.append(char)
         index += 1
-    return "".join(out), 0
-
-
-def _carry_code_line(line: str, run: int) -> tuple[str, int]:
-    """跨行代码段的后续行：原样保留到等长关闭串，之后恢复转义。"""
-    close = _find_backtick_run(line, 0, run)
-    if close is None:
-        return line, run
-    rest, pending = _escape_body_line(line[close + run :])
-    return line[: close + run] + rest, pending
+    return "".join(out)
 
 
 def _leading_spaces(line: str) -> int:
@@ -251,7 +152,12 @@ def sanitize_body(text: str) -> str:
       ``### Aligo`` 只会是引用块内的文字，不能制造顶层会话段落或角色标题；
     - 代码围栏平衡：消息内未闭合的 ``` / ~~~ 在本条消息末尾补齐，后续
       消息与会话不会被吞进同一个代码块；缩进围栏（列表项内）随容器
-      结束恢复转义；表格行不参与跨单元格反引号配对；
+      结束恢复转义；缩进更小的合法关围栏优先按关闭处理（不能重新当成
+      新开围栏）；
+    - 行内代码只保留同一行内成对的反引号；未配对反引号一律反斜杠转义
+      （显示为字面反引号）：导出器对段落边界的推断与真实渲染器不可能
+      完全一致，裸反引号一旦被渲染器与其它行配对，后续内容会被当作代码
+      原样输出原始 HTML；
     - 行内代码之外仍转义尖括号与链接 / 图片语法，避免预览器执行原始 HTML
       或自动加载远程图片；终端控制序列（ESC / OSC）一并剥离；
     - 超过 :data:`_MAX_INLINE_PAIRING_CHARS` 的消息跳过行内代码配对、
@@ -263,16 +169,23 @@ def sanitize_body(text: str) -> str:
     rendered: list[str] = []
     fence = ""
     fence_indent = 0
-    pending_code_run = 0
-    # 超大消息放弃行内代码配对（线性、始终安全）；常规消息完整配对保真
+    # 超大消息放弃行内代码配对（线性、始终安全）；常规消息保留同一行内配对
     fast_mode = len(text) > _MAX_INLINE_PAIRING_CHARS
-    for line_index, line in enumerate(lines):
+    for line in lines:
         if fence:
             if (
                 fence_indent
                 and line.strip()
                 and _leading_spaces(line) < fence_indent
             ):
+                if _fence_close(line, fence):
+                    # 缩进更小的合法关围栏：渲染器在这里关闭围栏，必须
+                    # 先按关闭处理（否则会被当成容器结束，再被重新解析
+                    # 为新开围栏，后续行被当作围栏内容原样输出）
+                    rendered.append(_quote_line(line))
+                    fence = ""
+                    fence_indent = 0
+                    continue
                 # 列表项等容器内的围栏随容器结束：后续未缩进行是正文，
                 # 必须恢复转义（渲染器此时已退出围栏/列表上下文）
                 fence = ""
@@ -290,20 +203,10 @@ def sanitize_body(text: str) -> str:
             rendered.append(_quote_line(line))
             continue
         if fast_mode:
-            # 超过配对阈值：行内反引号不再参与配对，全部内容照常转义
-            # （围栏内的原始代码行已在上面原样保留）
+            # 超过配对阈值：行内反引号不再参与配对，连同尖括号全部转义
             rendered.append(_quote_line(_escape_inline_markdown(line)))
             continue
-        if pending_code_run:
-            rendered_line, pending_code_run = _carry_code_line(
-                line, pending_code_run
-            )
-            rendered.append(_quote_line(rendered_line))
-            continue
-        rendered_line, pending_code_run = _escape_body_line(
-            line, lines, line_index
-        )
-        rendered.append(_quote_line(rendered_line))
+        rendered.append(_quote_line(_escape_body_line(line)))
     if fence:
         rendered.append(_quote_line(fence))
     return "\n".join(rendered)
@@ -384,9 +287,9 @@ def render_all_sessions_markdown(
                 "",
                 f"## {title}",
                 "",
-                f"- 会话：{session_id}",
+                f"- 会话：{sanitize_title(session_id)}",
                 f"- 消息数：{len(session_messages)}",
-                f"- 最近更新：{_latest_timestamp(session_messages) or '—'}",
+                f"- 最近更新：{sanitize_title(_latest_timestamp(session_messages) or '—')}",
                 "",
             ]
         )

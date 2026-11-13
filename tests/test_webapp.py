@@ -1990,6 +1990,30 @@ def test_markdown_export_strips_terminal_controls():
     print("✓ Markdown 导出剥离终端控制序列")
 
 
+def test_user_data_markdown_tolerates_non_string_fields():
+    """历史脏数据（非字符串日期 / archived_sessions 含 dict）不能让 MD 导出 500。"""
+    from webapp import server as server_module
+
+    data = {
+        "preferences": {},
+        "trip_history": [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": 20260101,
+                "end_date": None,
+                "purpose": 1,
+            }
+        ],
+        "chat_history": [],
+        "statistics": {},
+        "archived_sessions": [{"bad": "shape"}, "s1"],
+    }
+    text = server_module._user_data_markdown("u1", data)
+    assert "20260101" in text, text
+    print("✓ 用户数据 Markdown 导出容忍非字符串字段")
+
+
 def test_import_skips_reserved_session_id():
     """备份里的 session_id="export" 不能落库（否则详情路由永远被静态路由遮蔽）。"""
     client = _client()
@@ -11373,6 +11397,7 @@ if __name__ == "__main__":
         _mp_breaker.undo()
     test_half_open_breaker_recovers_through_chat_endpoint()
     test_markdown_export_strips_terminal_controls()
+    test_user_data_markdown_tolerates_non_string_fields()
     test_preference_type_rejects_control_characters()
     _mp_metrics_gauges = pytest.MonkeyPatch()
     try:

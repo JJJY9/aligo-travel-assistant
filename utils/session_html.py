@@ -24,8 +24,8 @@ _TEMPLATE = """<!doctype html>
     font: 15px/1.65 "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", system-ui, sans-serif; }}
   .page {{ max-width: 820px; margin: 24px auto; padding: 32px 36px; background: var(--surface);
     border-radius: 16px; box-shadow: 0 12px 40px rgba(15, 36, 42, 0.08); }}
-  h1 {{ margin: 0 0 4px; font-size: 22px; }}
-  .meta {{ margin-bottom: 20px; color: var(--ink-3); font-size: 12.5px; }}
+  h1 {{ margin: 0 0 4px; font-size: 22px; overflow-wrap: anywhere; word-break: break-word; }}
+  .meta {{ margin-bottom: 20px; color: var(--ink-3); font-size: 12.5px; overflow-wrap: anywhere; word-break: break-word; }}
   .msg {{ margin: 18px 0; }}
   .msg.user {{ display: flex; justify-content: flex-end; }}
   .msg.user .bubble {{ max-width: 85%; padding: 10px 14px; border-radius: 14px 14px 4px 14px;
@@ -121,7 +121,7 @@ def _bundle_title(
 # 花括号必须写成单层（写 {{ }} 会原样进入 <style>，浏览器丢弃全部合集样式）
 _BUNDLE_STYLE = """
   .session { margin-top: 30px; }
-  .session h2 { font-size: 18px; margin: 0 0 2px; }
+  .session h2 { font-size: 18px; margin: 0 0 2px; overflow-wrap: anywhere; word-break: break-word; }
   .session .meta { margin-bottom: 10px; }
 """
 

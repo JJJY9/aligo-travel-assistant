@@ -242,33 +242,79 @@ def test_fence_state_machine_matches_commonmark():
     print("✓ 围栏开合与 CommonMark 一致")
 
 
-def test_multiline_code_span_content_preserved():
-    """跨行代码段内的字符不被实体化；未闭合的跨行反引号按字面处理。"""
+def test_cross_line_code_span_is_escaped():
+    """跨行反引号不再保留为代码段：反引号转义、内容照常转义。
+
+    导出器对段落边界的推断与真实渲染器不一致时，裸的未配对反引号会被
+    渲染器与其它行配成代码段，让本该转义的内容原样输出（原始 HTML）。
+    现在只保留同一行内成对的行内代码；未配对反引号一律写成 ``\\```。
+    """
     from utils.session_markdown import sanitize_body
 
     text = sanitize_body("示例：`if a < b\nand c > d` 结束")
-    assert "if a < b" in text
-    assert "and c > d" in text, "跨行代码段内的 > 不能被实体化"
-    assert "c &gt; d" not in text
-    # 没有任何关闭串：反引号只是字面字符，禁止据此关闭转义
+    assert "\\`" in text, text
+    assert "&lt; b" in text, "跨行反引号后的 < 必须转义"
+    assert "&gt; d" in text, "跨行反引号后的 > 必须转义"
+    # 输出里不能残留裸反引号（除转义形式）
+    assert "`" not in text.replace("\\`", ""), text
+    # 同一行内成对的行内代码仍然保真
+    text = sanitize_body("价格 `if a < b` 结束")
+    assert "`if a < b`" in text, text
+    # 没有任何关闭串：反引号转义，尖括号照常转义
     text = sanitize_body("`启示 <img src=x\n<img src=x onerror=alert(1)>")
     assert text.count("&lt;img") >= 2
-    print("✓ 跨行代码段保真且未闭合时不放行")
+    print("✓ 跨行代码段改为转义，同一行内代码保真")
 
 
 def test_far_apart_backticks_do_not_leak_raw_html():
-    """远超 200 行的跨行代码段仍完整配对：后续行 HTML 必须转义。
-
-    回归：前瞻上界截断会改变反引号配对位置——被截断的开串与后续行的
-    闭合串在 CommonMark 里配成一对，行内剩余内容反而失去转义（XSS）。
-    """
+    """远距离反引号不再参与跨行配对：后续行 HTML 必须转义。"""
     from utils.session_markdown import sanitize_body
 
     payload = "x ` <img src=x onerror=alert(1)>\n`"
     text = sanitize_body("`\n" + "f\n" * 200 + payload)
     assert "<img" not in text, text
     assert "&lt;img" in text, text
-    print("✓ 远距离反引号仍完整配对")
+    print("✓ 远距离反引号不参与配对")
+
+
+def test_renderer_paragraph_mismatch_payloads_are_safe():
+    """评审确认的三类「渲染器段落边界与导出器不一致」载荷都必须转义。"""
+    from utils.session_markdown import sanitize_body
+
+    payloads = [
+        # 引用行在导出里被转义成实体，导出器的块起始判断与渲染器不一致
+        "x`\n> y\nz` <img src=x onerror=alert(1)>\n`",
+        # 含竖线但并非真实表格的段落行
+        "| ` |\ntext` <img src=x onerror=alert(1)>\n`",
+        # 缩进代码块行上的反引号
+        "示例：\n   ```\n````\n<img src=x onerror=alert(1)>",
+    ]
+    for payload in payloads:
+        text = sanitize_body(payload)
+        assert "<img" not in text, (payload, text)
+        assert "&lt;img" in text, (payload, text)
+    print("✓ 段落边界不一致的载荷全部转义")
+
+
+def test_collection_export_escapes_session_metadata():
+    """合集导出的会话 ID / 时间戳不能注入顶层 Markdown / HTML。"""
+    from utils.session_markdown import render_all_sessions_markdown
+
+    dirty = "s1\n<img src=x onerror=alert(1)>"
+    text, _ = render_all_sessions_markdown(
+        "u1",
+        [
+            {
+                "role": "user",
+                "content": "hi",
+                "session_id": dirty,
+                "timestamp": "2026-01-01T10:00:00",
+            }
+        ],
+    )
+    assert "<img" not in text, text
+    assert "&lt;img" in text, text
+    print("✓ 合集导出的会话元数据被转义")
 
 
 def test_large_message_escapes_inline_without_pairing():
@@ -311,9 +357,10 @@ def test_block_start_line_cannot_close_code_span():
         text = sanitize_body(payload)
         assert "<img" not in text, f"块起始行放行了原始 HTML：{payload!r}"
         assert "&lt;img" in text
-    # 普通段落行上的关闭串仍按跨行代码段保真（不是块起始）
+    # 普通段落里的跨行反引号同样不再保留为代码段：未配对即转义，
+    # 内容里的尖括号照常实体化（跨行配对与渲染器的段落边界推断不可靠）
     text = sanitize_body("示例：`if a < b\nand c > d` 结束")
-    assert "c &gt; d" not in text
+    assert "&lt; b" in text and "&gt; d" in text
     print("✓ 块起始行不能关闭跨行代码段")
 
 
@@ -373,8 +420,10 @@ if __name__ == "__main__":
     test_terminal_controls_stripped_from_export()
     test_unmatched_backtick_does_not_disable_escaping()
     test_fence_state_machine_matches_commonmark()
-    test_multiline_code_span_content_preserved()
+    test_cross_line_code_span_is_escaped()
     test_far_apart_backticks_do_not_leak_raw_html()
+    test_renderer_paragraph_mismatch_payloads_are_safe()
+    test_collection_export_escapes_session_metadata()
     test_large_message_escapes_inline_without_pairing()
     test_block_start_line_cannot_close_code_span()
     test_heading_line_cannot_open_cross_line_code_span()
