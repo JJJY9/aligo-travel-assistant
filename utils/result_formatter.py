@@ -9,7 +9,11 @@ from typing import Any
 
 import logging
 
-from utils.preference_values import has_preference_value, is_manageable_pref_type
+from utils.preference_values import (
+    EXPLANATORY_PREF_KEYS,
+    has_preference_value,
+    is_manageable_pref_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +197,11 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         if isinstance(preferences, dict):
             if isinstance(preferences.get("preferences"), (list, dict)):
                 preferences = preferences["preferences"]
+            elif "type" in preferences and "value" in preferences:
+                # 模型常见的单对象偏差 {"type": ..., "value": ..., "action": ...}：
+                # 落库侧 _extract_preferences_payload 会把它包成一条偏好，
+                # 回显必须同一口径（此前渲染出 type/value/action 三条假偏好）
+                preferences = [preferences]
             else:
                 # 旧格式：{type: value} 的偏好字典（历史模型输出）。此前按
                 # 嵌套列表解包，dict 没有 "preferences" 键时渲染成空
@@ -204,7 +213,7 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                 # 与落库路径同一口径：含 "/" / 超长 / 非字符串的键不会写入
                 # 长期记忆，回显不能宣称「已更新」；空值（""/[]/None）同理
                 if (
-                    pref_type in {"has_preferences", "error"}
+                    pref_type in EXPLANATORY_PREF_KEYS
                     or not has_preference_value(value)
                     or not is_manageable_pref_type(pref_type)
                 ):

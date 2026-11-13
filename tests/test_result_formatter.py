@@ -751,6 +751,56 @@ def test_event_collection_missing_non_list():
     print("✓ event_collection missing_info 非列表容错")
 
 
+def test_preference_single_object_renders_one_preference():
+    """模型单对象偏差 {"type","value","action"} 按落库口径渲染为一条偏好。"""
+    data = _wrap(
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "status": "success",
+                "data": {
+                    "preferences": {
+                        "type": "hotel_brands",
+                        "value": ["汉庭"],
+                        "action": "append",
+                    }
+                },
+            }
+        ]
+    )
+    md = result_to_markdown(data)
+    assert "酒店偏好" in md and "汉庭" in md, md
+    assert "type **设置为**" not in md, md
+    assert "value **设置为**" not in md, md
+    assert "action **设置为**" not in md, md
+    print("✓ 单对象偏好偏差按一条偏好渲染")
+
+
+def test_preference_legacy_explanatory_keys_not_rendered():
+    """旧格式字典里的 note / message 等说明键不能回显为已更新偏好。"""
+    data = _wrap(
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "status": "success",
+                "data": {
+                    "preferences": {
+                        "hotel_brands": ["汉庭"],
+                        "note": "用户还提到下周去上海",
+                        "message": "已记录",
+                    }
+                },
+            }
+        ]
+    )
+    md = result_to_markdown(data)
+    assert "酒店偏好" in md and "汉庭" in md, md
+    assert "note **设置为**" not in md, md
+    assert "message **设置为**" not in md, md
+    print("✓ 旧格式说明性键不回显为偏好")
+
 if __name__ == "__main__":
     test_itinerary()
     test_preference()
@@ -772,6 +822,8 @@ if __name__ == "__main__":
     test_event_collection_type_tolerance()
     test_null_values_render_defaults_not_none()
     test_preference_dict_value_and_legacy_message_fallback()
+    test_preference_single_object_renders_one_preference()
+    test_preference_legacy_explanatory_keys_not_rendered()
     test_itinerary_tolerant_shapes_extra()
     test_event_collection_missing_non_list()
     _mp = __import__("pytest").MonkeyPatch()

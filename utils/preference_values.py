@@ -2,6 +2,25 @@
 import re
 from typing import Any
 
+# 旧版字典格式偏好里的说明性键：模型附带 note/message 等时不能被当成
+# 偏好类型落库 / 回显 / 进入后续批次上下文（三处消费口径必须一致）
+EXPLANATORY_PREF_KEYS = frozenset(
+    {
+        "has_preferences",
+        "error",
+        "note",
+        "notes",
+        "message",
+        "reason",
+        "reasoning",
+        "summary",
+        "explanation",
+        "confidence",
+        "status",
+        "action",
+    }
+)
+
 
 def _is_blank_item(value: Any) -> bool:
     """单个偏好值是否有实际内容：None / 空白串 / 空容器视为空。"""
