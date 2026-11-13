@@ -5821,6 +5821,75 @@ def test_delete_session_storage_failure_maps_503(monkeypatch):
     print("✓ 删除会话存储失败 → 503（墓碑回滚）")
 
 
+def test_delete_endpoints_preserve_http_exception_semantics(monkeypatch):
+    """422 / 记忆损坏恢复提示不能被重包成通用 503。"""
+    client = _client()
+    response = client.delete("/api/sessions/s1", params={"user_id": "con"})
+    assert response.status_code == 422, response.text[:200]
+    assert "user_id" in str(response.json().get("detail", "")), response.text
+
+    response = client.delete(
+        "/api/sessions/s1/last-turn",
+        params={"user_id": "con", "expect": "x"},
+    )
+    assert response.status_code == 422, response.text[:200]
+
+    from fastapi import HTTPException as _HTTPException
+
+    from webapp import server as server_module
+
+    def _quarantined(user_id, strict=False):
+        raise _HTTPException(
+            status_code=503,
+            detail="记忆文件损坏并已隔离备份（路径见服务端日志），请使用备份文件恢复后重试",
+        )
+
+    monkeypatch.setattr(server_module, "_open_long_term", _quarantined)
+    response = client.delete("/api/sessions/s1", params={"user_id": "u1"})
+    assert response.status_code == 503, response.text[:200]
+    assert "隔离" in response.json()["detail"], response.text
+    state = client.app.state.aligo
+    assert state.is_recently_deleted("u1", "s1") is False, "HTTPException 分支也要撤销墓碑"
+    print("✓ 删除端点保留 422 / 隔离 503 的原始语义")
+
+
+def test_group_sessions_normalizes_legacy_ids_and_reserved():
+    """整数会话 ID 的置顶 / 归档生效、对象条目不 500、保留字会话不列出。"""
+    from webapp.server import _group_sessions
+
+    history = [
+        {"session_id": 42, "role": "user", "content": "hi", "timestamp": "2026-01-01T00:00:00"},
+        {"session_id": 0, "role": "user", "content": "zero", "timestamp": "2026-01-02T00:00:00"},
+        {"session_id": "export", "role": "user", "content": "x", "timestamp": "2026-01-03T00:00:00"},
+        {"session_id": "s1", "role": "user", "content": "yo", "timestamp": "2026-01-04T00:00:00"},
+    ]
+    sessions = _group_sessions(
+        history,
+        limit=10,
+        pinned=[42, {"bad": 1}],
+        archived=[42, [1]],
+        archived_mode="only",
+    )
+    assert [item["session_id"] for item in sessions] == ["42"], sessions
+    assert sessions[0]["archived"] is True
+    assert sessions[0]["pinned"] is False
+
+    listed = _group_sessions(history, limit=10)
+    ids = [item["session_id"] for item in listed]
+    assert "0" in ids, "整数 0 会话不能被跳过"
+    assert "export" not in ids, "保留字会话不可打开，列表不应出现"
+    print("✓ 会话列表归一旧 ID / 跳过保留字 / 容忍脏置顶条目")
+
+
+def test_match_snippet_handles_whitespace_variants():
+    """含全角 / 连续空格的查询命中原文后不能返回空片段。"""
+    from webapp.server import _match_snippet
+
+    assert _match_snippet("前文 a　b 后文", "a　b"), "全角空格查询必须返回片段"
+    assert _match_snippet("前文 a   b 后文", "a   b"), "连续空格查询必须返回片段"
+    print("✓ 搜索片段容忍空白差异")
+
+
 def test_repeated_delete_keeps_tombstone():
     """重复删除（重试 / 另一标签页）返回 0 时必须保留墓碑，旧 id 不能复活。"""
     client = _client()
@@ -8996,6 +9065,7 @@ def test_knowledge_duplicates_api(monkeypatch):
         "total_groups": 0,
         "total_fragments": 0,
         "shown": 0,
+        "truncated": False,
         "groups": [],
     }
 
