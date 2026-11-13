@@ -922,6 +922,65 @@ def test_ask_cancellable_on_disconnect():
 
     asyncio.run(scenario())
     print("✓ 非流式回合在客户端断开后取消")
+
+
+def test_chat_disconnect_returns_499(monkeypatch):
+    """非流式对话断连：返回 499（而非 200 假成功），指标按 499 记账。"""
+    from utils.metrics import REQUEST_METRICS
+    from webapp import server as server_module
+
+    async def fake_ask(coro, *args, **kwargs):
+        coro.close()
+        return None, True
+
+    monkeypatch.setattr(server_module, "_ask_cancellable_on_disconnect", fake_ask)
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    client = TestClient(app)
+    user_id = _unique_user("web_test_disconnect_499")
+    REQUEST_METRICS.reset()
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "dc-1"},
+        )
+        assert response.status_code == 499, response.text[:300]
+        data = response.json()
+        assert data.get("cancelled") is True and data.get("session_id"), data
+        snapshot = REQUEST_METRICS.snapshot()
+        assert snapshot["by_status"].get("499") == 1, snapshot
+        assert snapshot["by_status"].get("200", 0) == 0, snapshot
+    finally:
+        _cleanup(user_id)
+        REQUEST_METRICS.reset()
+    print("✓ 非流式断连返回 499 并按 499 记账")
+
+
+def test_acquire_chat_lock_disconnect_raises_499():
+    """排队等用户锁期间客户端断开：抛 499 而不是 503（响应已无人接收）。"""
+    from fastapi import HTTPException
+
+    from webapp.server import _acquire_chat_lock
+
+    class _Gone:
+        async def is_disconnected(self):
+            return True
+
+    async def scenario():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        try:
+            await _acquire_chat_lock(_Gone(), lock, "rid-test", timeout=0.05)
+            raise AssertionError("断开连接时应抛出 HTTPException")
+        finally:
+            lock.release()
+
+    try:
+        asyncio.run(scenario())
+    except HTTPException as exc:
+        assert exc.status_code == 499, exc.status_code
+    print("✓ 等锁期间断连抛 499")
+
+
 def test_stream_and_chat_report_unpersisted_turn(monkeypatch):
     """墓碑否决的回合：done / 响应必须带 persisted=false，不能伪装成功。"""
     from agents.conversation import ConversationRuntime
@@ -6728,6 +6787,96 @@ def test_breaker_open_does_not_consume_rate_limit():
         _cleanup(user_id)
 
 
+def test_half_open_busy_probe_denies_before_rate_limit(monkeypatch):
+    """半开唯一试探名额被长回合占用时，并发对话在扣限流额度前就被 503。"""
+    import asyncio
+
+    import httpx
+
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _GateModel:
+        async def __call__(self, messages, **kwargs):
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(_INTENT, ensure_ascii=False),
+                    }
+                ],
+                "usage": {"input_tokens": 6, "output_tokens": 4, "time": 0.05},
+            }
+
+    app = create_app(model=UsageTrackingModel(_GateModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=5, window_sec=60)
+    state.ip_limiter = RateLimiter(limit=5, window_sec=60)
+    for _ in range(state.breaker.failure_threshold):
+        state.breaker.record_failure()
+    state.breaker._opened_at = time.monotonic() - 999  # 进入半开
+
+    rate_calls = {"n": 0}
+    real = server_module._enforce_rate_limit
+
+    def counting(*args, **kwargs):
+        rate_calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(server_module, "_enforce_rate_limit", counting)
+    user_a = _unique_user("web_test_halfopen_busy")
+    user_b = _unique_user("web_test_halfopen_wait")
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+
+            async def first():
+                return await client.post(
+                    "/api/chat",
+                    json={
+                        "message": "你好",
+                        "user_id": user_a,
+                        "session_id": "hb-1",
+                    },
+                )
+
+            first_task = asyncio.create_task(first())
+            assert await asyncio.to_thread(started.wait, 10), "首个对话未进入模型调用"
+            try:
+                before = rate_calls["n"]
+                second = await client.post(
+                    "/api/chat",
+                    json={
+                        "message": "你好",
+                        "user_id": user_b,
+                        "session_id": "hb-2",
+                    },
+                )
+                assert second.status_code == 503, second.text[:300]
+                assert rate_calls["n"] == before, "半开拒绝不应扣限流额度"
+            finally:
+                release.set()
+                first_response = await asyncio.wait_for(first_task, 20)
+                assert first_response.status_code == 200, first_response.text[:300]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        _cleanup(user_a)
+        _cleanup(user_b)
+    print("✓ 半开名额被占时预检在限流之前拒绝")
+
+
 def test_pending_tombstone_replay_after_redis_recovers():
     """Redis 故障期删除：恢复后补写共享墓碑与会话纪元；回滚则撤销待补写。"""
 
@@ -9368,6 +9517,54 @@ def test_usage_summary_total_consistent_with_by_day_for_partial_usage():
     print("✓ 部分 usage 的总 tokens 与按天统计同口径")
 
 
+def test_usage_summary_ignores_negative_usage_and_elapsed():
+    """备份恢复可带入负数 usage / elapsed：不能扣减总量或拉低平均耗时。"""
+    from webapp.server import _usage_summary
+
+    def _assistant(meta: dict) -> dict:
+        return {
+            "role": "assistant",
+            "content": json.dumps(
+                {"results": [], "_meta": meta}, ensure_ascii=False
+            ),
+            "timestamp": "2026-11-04T12:00:00+08:00",
+            "session_id": "s",
+        }
+
+    history = [
+        _assistant(
+            {
+                "usage": {
+                    "calls": 1,
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "total_tokens": 5,
+                },
+                "elapsed": 2.0,
+            }
+        ),
+        # 备份文件里的坏数据：负数 usage 与负数耗时
+        _assistant(
+            {
+                "usage": {
+                    "calls": -3,
+                    "input_tokens": -100,
+                    "output_tokens": -1,
+                    "total_tokens": -1000,
+                },
+                "elapsed": -50.0,
+            }
+        ),
+    ]
+    usage = _usage_summary(history)
+    assert usage["calls"] == 1, usage
+    assert usage["total_tokens"] == 5, usage
+    assert usage["input_tokens"] == 2 and usage["output_tokens"] == 3, usage
+    assert usage["avg_elapsed"] == 2.0, usage
+    assert all(day["tokens"] >= 0 for day in usage["by_day"]), usage["by_day"]
+    print("✓ 负数 usage / elapsed 不计入状态汇总")
+
+
 def test_usage_summary_cached_per_user(monkeypatch):
     """/api/status 的用量汇总按用户缓存：历史不变时不再全量重放。"""
     from webapp import server as server_module
@@ -11335,6 +11532,12 @@ if __name__ == "__main__":
     test_chat_creates_session_when_missing()
     test_chat_stream_events()
     test_ask_cancellable_on_disconnect()
+    _mp_disconnect = pytest.MonkeyPatch()
+    try:
+        test_chat_disconnect_returns_499(_mp_disconnect)
+    finally:
+        _mp_disconnect.undo()
+    test_acquire_chat_lock_disconnect_raises_499()
     test_tombstone_ttl_covers_inflight_turn_lease()
     test_cli_tombstone_default_ttl_matches_web()
     _mp_surrogate = pytest.MonkeyPatch()
@@ -11480,6 +11683,11 @@ if __name__ == "__main__":
     test_repeated_delete_repairs_shared_tombstone()
     test_pending_tombstone_replay_after_redis_recovers()
     test_breaker_open_does_not_consume_rate_limit()
+    _mp_halfopen = pytest.MonkeyPatch()
+    try:
+        test_half_open_busy_probe_denies_before_rate_limit(_mp_halfopen)
+    finally:
+        _mp_halfopen.undo()
     test_session_metadata_requires_existing_session()
     test_session_rename()
     test_session_pin()

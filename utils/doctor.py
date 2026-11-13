@@ -118,9 +118,10 @@ def check_config() -> CheckResult:
     model_name = LLM_CONFIG["model_name"]
     base_url = LLM_CONFIG["base_url"]
     if api_key:
-        # 空 / 纯空白的环境变量在 config 里会回退 config_local.py：
-        # 这里按 strip 后判断，避免误报「密钥来自 环境变量」
-        env_key = os.environ.get("LLM_API_KEY", "").strip()
+        # 空 / 纯空白（含仅 BOM）的环境变量在 config 里会回退
+        # config_local.py：按与 config 完全相同的口径（去 BOM 后 strip）判断
+        # 来源，避免「空格 + BOM」这类值两边结论不一致
+        env_key = os.environ.get("LLM_API_KEY", "").replace("\ufeff", "").strip()
         source = "环境变量" if env_key else "config_local.py"
         return CheckResult(
             "大模型配置",
@@ -224,6 +225,33 @@ def _skill_md_problem(script_path: Path) -> str | None:
     return None
 
 
+def _skill_md_name(script_path: Path) -> str:
+    """技能在意图提示中的名字：SKILL.md frontmatter name，缺失退回目录名。"""
+    skill_dir = script_path.parent.parent
+    fallback = skill_dir.name
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        text = skill_md.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return fallback
+    from utils.skill_loader import _frontmatter_bounds
+
+    bounds = _frontmatter_bounds(text)
+    if bounds is None:
+        return fallback
+    try:
+        import yaml
+
+        data = yaml.safe_load(text[bounds[0]:bounds[1]])
+    except Exception:  # noqa: BLE001 - 解析失败按目录名处理
+        return fallback
+    if isinstance(data, dict):
+        name = data.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return fallback
+
+
 def check_skills() -> CheckResult:
     """检查技能目录：源码运行 / wheel 安装后都应能发现技能脚本。"""
     from utils.skill_paths import resolve_skills_root, skill_scripts
@@ -236,6 +264,26 @@ def check_skills() -> CheckResult:
             problem = _skill_md_problem(Path(scripts[name]))
             if problem:
                 problems.append(f"{name}（{problem}）")
+        # frontmatter name 是 SkillLoader 的字典键：两个技能写同名时后
+        # 加载者覆盖前者，其中一个永远不会出现在意图提示里，doctor 必须
+        # 报出来（目录名不同名也一样）
+        name_owners: dict[str, list[str]] = {}
+        for directory in sorted(scripts):
+            skill_name = _skill_md_name(Path(scripts[directory]))
+            name_owners.setdefault(skill_name, []).append(directory)
+        duplicates = {
+            skill_name: dirs
+            for skill_name, dirs in name_owners.items()
+            if len(dirs) > 1
+        }
+        if duplicates:
+            problems.append(
+                "frontmatter name 重复："
+                + "、".join(
+                    f"{skill_name}（{', '.join(dirs)}）"
+                    for skill_name, dirs in sorted(duplicates.items())
+                )
+            )
         if problems:
             return CheckResult(
                 "技能目录",
@@ -412,7 +460,14 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
             STATUS_OK,
             f"使用 HuggingFace 模型 {configured}（本地无缓存时首次运行自动下载）",
         )
-    required = ["config.json", "model.safetensors", "tokenizer.json"]
+    # 权重 / 分词器有多种合法形态：SentenceTransformer 可加载
+    # pytorch_model.bin，慢分词器模型可能只有 vocab.txt / spiece.model，
+    # 硬编码 safetensors + tokenizer.json 会把可用的模型误报为缺失
+    required_groups = (
+        ("config.json",),
+        ("model.safetensors", "pytorch_model.bin"),
+        ("tokenizer.json", "vocab.txt", "spiece.model", "tokenizer.model"),
+    )
     recommended = ["modules.json", "1_Pooling/config.json", "vocab.txt"]
 
     if not model_path.exists():
@@ -422,7 +477,11 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
             f"未下载: {model_path}（RAG 功能不可用；下载方式见 README）",
         )
 
-    missing_required = [f for f in required if not (model_path / f).exists()]
+    missing_required = [
+        " / ".join(group)
+        for group in required_groups
+        if not any((model_path / name).exists() for name in group)
+    ]
     if missing_required:
         return CheckResult(
             "嵌入模型文件",

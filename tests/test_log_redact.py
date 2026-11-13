@@ -46,6 +46,19 @@ def test_redact_secret_keeps_url_punctuation_passwords_out():
     print("✓ redact_secret 遮蔽含 URL 标点 / 多个 @ 的密码")
 
 
+def test_redact_secret_masks_bare_api_keys():
+    """网关错误体原样引用请求密钥（Incorrect API key provided: sk-…）。"""
+    for prefix in ("sk", "pk", "rk", "ak"):
+        key = f"{prefix}-live0123456789abcdef"
+        redacted = redact_secret(f"Error: Incorrect API key provided: {key}")
+        assert key not in redacted, redacted
+        assert "***" in redacted, redacted
+    # 正常文本与短横线单词不受影响
+    assert redact_secret("risk-based approach") == "risk-based approach"
+    assert redact_secret("任务 sk-learn 流程") == "任务 sk-learn 流程"
+    print("✓ redact_secret 遮蔽裸 API Key")
+
+
 def test_preference_and_title_values_not_logged(caplog):
     """偏好值 / 会话标题是用户隐私内容：不进 INFO 日志。"""
     memory = LongTermMemory("u-logredact", tempfile.mkdtemp())
@@ -136,6 +149,7 @@ def test_redaction_keeps_url_after_spacey_cjk_path():
 if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
+    test_redact_secret_masks_bare_api_keys()
     test_redact_paths_hides_internal_paths_and_urls()
     test_redact_local_paths_keeps_urls_intact()
     test_redact_local_paths_covers_paths_with_spaces()

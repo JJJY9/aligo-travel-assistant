@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 
 from .circuit_breaker import CircuitOpenError
 from .errors import MemoryPersistenceError
+from .log_redact import redact_secret
 
 logger = logging.getLogger(__name__)
 
@@ -225,4 +226,6 @@ async def run_health_check(
     except asyncio.TimeoutError:
         return False, f"健康检查超时（{timeout_sec:.1f}s）"
     except Exception as e:
-        return False, str(e)
+        # 上游异常原文可能含完整 API Key（网关常见「Incorrect API key
+        # provided: sk-…」）：回显给 /api/doctor、cli health 与日志前遮蔽
+        return False, redact_secret(str(e))

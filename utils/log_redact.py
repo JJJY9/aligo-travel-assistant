@@ -18,6 +18,9 @@ _BARE_USERINFO = re.compile(
 _KEY_VALUE = re.compile(
     r"(?i)((?:password|pwd|api[_-]?key|secret|token)\s*=\s*)[^\s;]+"
 )
+# 裸密钥：网关错误体常原样引用请求密钥（如「Incorrect API key provided:
+# sk-…」）；健康检查 / doctor 把异常原文回显给调用方前必须遮蔽
+_BARE_API_KEY = re.compile(r"(?i)\b(?:sk|pk|rk|ak)-[A-Za-z0-9_\-]{12,}")
 # 本机绝对路径与上游 URL：技能错误文本会经编排层渲染给用户（Web / CLI），
 # 嵌入模型缓存目录、Milvus 库文件路径、下载地址都不应出现在回答里
 _URL_BODY = re.compile(r"https?://[^\s'\"<>）)]+")
@@ -95,4 +98,5 @@ def redact_secret(text: object) -> str:
     cleaned = _URL_QUERY.sub(r"\g<base>", cleaned)
     cleaned = _BARE_USERINFO.sub(r"\1:***@", cleaned)
     cleaned = _KEY_VALUE.sub(r"\1***", cleaned)
+    cleaned = _BARE_API_KEY.sub("***", cleaned)
     return cleaned

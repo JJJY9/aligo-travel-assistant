@@ -1634,6 +1634,48 @@ def test_subagent_transient_error_retried(monkeypatch):
     print("✓ 子智能体瞬时错误重试一次")
 
 
+def test_transient_error_json_does_not_escape_for_breaker(monkeypatch):
+    """技能持续上报第三方服务瞬时故障：重试耗尽后按错误结果返回，不上抛。
+
+    此前识别到瞬时标记后重抛的是普通 ConnectionError，外层会把它当作
+    LLM 调用失败上抛给 ConversationRuntime 并计入全局熔断——连续几个
+    搜索 / 天气型回合就会让所有用户 503，即使模型完全健康。
+    """
+    from agents import orchestration_agent as module
+
+    monkeypatch.setattr(module, "_AGENT_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr(module, "_AGENT_RETRY_MAX_DELAY", 0.02)
+
+    class _AlwaysDown:
+        name = "down"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def reply(self, message):
+            self.calls += 1
+            return Msg(
+                name="down",
+                content=json.dumps(
+                    {"error": "Connection refused (upstream search service)"},
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    down = _AlwaysDown()
+    orchestrator = OrchestrationAgent(agent_registry={"down": down})
+    reply = asyncio.run(
+        orchestrator.reply(_intent([{"agent_name": "down", "priority": 1}]))
+    )
+    assert down.calls == module._AGENT_RETRY_MAX + 1, down.calls
+    result = json.loads(reply.content)
+    assert result["status"] == "partial_failure", result
+    text = json.dumps(result, ensure_ascii=False)
+    assert "Connection refused" in text, "错误信息应保留给用户"
+    print("✓ 技能上报的瞬时错误不进全局熔断（按错误结果返回）")
+
+
 def test_conversation_schedule_normalization():
     """进度事件的调度计划应统一名称、过滤空白项与非法优先级。"""
     from agents.conversation import ConversationRuntime
@@ -3125,4 +3167,9 @@ if __name__ == "__main__":
         test_agent_load_timeout_is_bounded(_mp_load)
     finally:
         _mp_load.undo()
+    _mp_transient = pytest.MonkeyPatch()
+    try:
+        test_transient_error_json_does_not_escape_for_breaker(_mp_transient)
+    finally:
+        _mp_transient.undo()
     print("\n全部通过")

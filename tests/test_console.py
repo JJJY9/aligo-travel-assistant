@@ -142,6 +142,22 @@ def test_readline_size_preserves_unread_remainder():
     print("✓ readline(size) 保留未读余量")
 
 
+def test_readline_size_after_read_keeps_buffered_lines():
+    """read() 截断后再 readline(size)：截断余量不能覆盖已缓冲的后续行。"""
+    from utils.console import _AutoDecodeInput
+
+    # 用 ASCII 负载：任意 GBK 汉字字节串都可能是合法 UTF-8，解码有歧义
+    payload = b"abcdef\nsecond\n"
+    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+    assert shim.read(2) == "ab"
+    # 余量里已有「cdef\nsecond\n」；readline(3) 再截断第一行
+    assert shim.readline(3) == "cde"
+    assert shim.readline() == "f\n", "第一行的剩余部分"
+    assert shim.readline() == "second\n", "已缓冲的后续行不能丢失"
+    assert shim.readline() == ""
+    print("✓ readline(size) 截断余量不覆盖已缓冲行")
+
+
 def test_read_size_preserves_unread_remainder():
     """read(size) 截断后的余量留待下一次读取；分块复制不丢内容。"""
     import shutil
@@ -510,6 +526,7 @@ if __name__ == "__main__":
         test_auto_decode_bom_encodings()
         test_readline_line_by_line()
         test_readline_size_preserves_unread_remainder()
+        test_readline_size_after_read_keeps_buffered_lines()
         test_read_size_preserves_unread_remainder()
         test_readline_utf16_lines_and_size()
         test_utf16_readline_is_incremental_not_read_to_eof()
