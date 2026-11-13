@@ -299,6 +299,16 @@ def iter_json_objects_with_repair(text: str):
             yield value, end
 
 
+def iter_json_object_spans_with_repair(text: str):
+    """按位置产出 ``(start, value | None, end | None, looks_like)``。
+
+    与 :func:`_iter_object_spans` 同一实现，供需要「对象起点 / 失败片段」
+    的调用方（技能脚本按位置比较多个候选、区分截断）复用。
+    """
+    yield from _iter_object_spans(text)
+
+
+
 def _iter_objects_with_repair(text: str):
     """兼容旧调用：产出 ``(value, end)``（修复见 :func:`_repair_object_fragment`）。"""
     yield from iter_json_objects_with_repair(text)
