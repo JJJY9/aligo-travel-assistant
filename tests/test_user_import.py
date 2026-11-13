@@ -1934,6 +1934,23 @@ def test_import_repeat_backup_at_limit_is_idempotent(monkeypatch):
         module.import_user_data(store, sections2)
     print("✓ 上限内幂等重放与 dry-run 一致")
 
+def test_import_accepts_device_like_session_ids():
+    """会话 ID 不拼文件名：nul / con 不再被判非法并丢弃消息。"""
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "hi", "session_id": "nul"}
+        ]
+    }
+    sections, errors = parse_user_export(
+        json.dumps(payload, ensure_ascii=False)
+    )
+    assert errors == [], errors
+    assert sections["messages"][0]["session_id"] == "nul"
+    store = _real_store("u-device-session")
+    counts = import_user_data(store, sections)
+    assert counts["messages_added"] == 1
+    print("✓ 备份导入接受设备名会话 ID")
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -2002,5 +2019,6 @@ if __name__ == "__main__":
             mp.undo()
     test_parse_limits_trip_id_length_and_preference_keys()
     test_import_rejects_when_existing_totals_exceed_limits()
+    test_import_accepts_device_like_session_ids()
     test_preview_normalizes_legacy_integer_session_id()
     print("\n全部通过")

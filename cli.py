@@ -29,8 +29,9 @@ from utils.console import (
     is_pipe_error,
     strip_terminal_controls,
 )
+from utils.atomic_write import write_bytes_atomic, write_text_atomic
 from utils.errors import MemoryPersistenceError
-from utils.identifiers import is_valid_web_id
+from utils.identifiers import is_valid_web_id, is_valid_web_session_id
 from utils.paths import default_data_root
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
@@ -82,6 +83,18 @@ def _valid_web_id(value: object) -> bool:
     if not isinstance(value, str) or not value or value.startswith("-"):
         return False
     return is_valid_web_id(value)
+
+
+def _valid_session_id(value: object) -> bool:
+    """会话 ID：字符集同 Web，但不拒绝 Windows 设备保留名。
+
+    会话 ID 不会成为记忆库文件名，Web 的 ChatRequest.session_id 允许
+    ``nul`` / ``con`` 等名字；CLI 按用户 ID 口径拒绝会让这些会话无法
+    查看 / 删除，备份恢复还会丢弃其消息。
+    """
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        return False
+    return is_valid_web_session_id(value)
 
 
 if Console is not None:
@@ -2040,10 +2053,10 @@ def run_knowledge_export_standalone(
         return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        write_text_atomic(
+            path, json.dumps(payload, ensure_ascii=False, indent=2)
         )
-    except OSError as exc:
+    except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出 {len(documents)} 条知识片段到 {path}")
@@ -2693,7 +2706,7 @@ def run_user_export_standalone(
     out_dir = Path(target_dir) if target_dir else Path("exports")
     try:
         paths = export_files(data, out_dir)
-    except OSError as exc:
+    except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
     for path in paths:
@@ -3155,7 +3168,7 @@ def run_knowledge_dedupe_standalone(
     Returns:
         0 清理完成（含无重复 / dry-run）；1 读取 / 删除失败
     """
-    from utils.knowledge_admin import delete_document, find_duplicate_contents
+    from utils.knowledge_admin import cleanup_duplicate_contents
 
     def _fail(message: str, **extra: Any) -> int:
         if as_json:
@@ -3170,18 +3183,27 @@ def run_knowledge_dedupe_standalone(
             print(_terminal_safe(message))
         return 1
 
+    # 扫描与删除必须与 Web 的 /api/knowledge/duplicates/cleanup 走同一实现：
+    # 在写锁内重扫并逐条复核「保留片段仍在、目标内容未变、不是多分片记录」，
+    # 避免按过期 id 删掉并发编辑的新内容或仅剩的副本
     try:
-        groups = find_duplicate_contents()
+        result = cleanup_duplicate_contents(dry_run=bool(dry_run))
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"读取知识库失败：{exc}")
 
-    plan: list[dict[str, Any]] = []
-    for content, ids in groups:
-        keep = min(ids)
-        remove = sorted(doc_id for doc_id in ids if doc_id != keep)
-        if remove:
-            plan.append({"content": content, "keep": keep, "remove": remove})
-    total_remove = sum(len(item["remove"]) for item in plan)
+    plan = [
+        {
+            "content": item.get("content", ""),
+            "preview": item.get("preview", ""),
+            "keep": item["keep"],
+            "remove": list(item.get("remove") or []),
+        }
+        for item in result.get("plan") or []
+    ]
+    total_remove = int(result.get("planned") or 0)
+    removed = int(result.get("removed") or 0)
+    skipped = list(result.get("skipped") or [])
+    failed = list(result.get("failed") or [])
 
     if dry_run or not plan:
         if as_json:
@@ -3189,7 +3211,7 @@ def run_knowledge_dedupe_standalone(
                 json.dumps(
                     {
                         "ok": True,
-                        "dry_run": dry_run,
+                        "dry_run": bool(dry_run),
                         "groups": plan,
                         "would_remove": total_remove,
                         "removed": 0,
@@ -3213,44 +3235,34 @@ def run_knowledge_dedupe_standalone(
         print("去掉 --dry-run 即可执行删除")
         return 0
 
-    removed = 0
-    failure: str | None = None
-    removed_ids: list[int] = []
-    for item in plan:
-        for doc_id in item["remove"]:
-            try:
-                count = delete_document(doc_id)
-            except Exception as exc:  # noqa: BLE001 - 部分删除后失败要如实报告
-                failure = f"删除 #{doc_id} 失败：{exc}（已删除 {removed} 条）"
-                break
-            removed += int(count or 0)
-            removed_ids.append(doc_id)
-        if failure:
-            break
     if as_json:
-        if failure is not None:
-            return _fail(failure, removed=removed, removed_ids=removed_ids)
+        payload = {
+            "ok": not failed,
+            "dry_run": False,
+            "groups": plan,
+            "would_remove": total_remove,
+            "removed": removed,
+            "skipped": skipped,
+            "failed": failed,
+        }
+        if failed:
+            payload["error"] = f"{len(failed)} 条删除失败（已删除 {removed} 条）"
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1 if failed else 0
+
+    for item in skipped:
         print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "dry_run": False,
-                    "groups": plan,
-                    "would_remove": total_remove,
-                    "removed": removed,
-                    "removed_ids": removed_ids,
-                },
-                ensure_ascii=False,
-                indent=2,
+            _terminal_safe(
+                f"跳过 #{item.get('id')}：{item.get('reason') or '并发修改'}"
             )
         )
-        return 0
-    if failure is not None:
-        print(failure)
+    if failed:
+        for item in failed:
+            print(_terminal_safe(f"删除 #{item.get('id')} 失败：{item.get('error')}"))
+        print(f"已删除 {removed} 条，{len(failed)} 条删除失败")
         return 1
     print(f"已删除 {removed} 条重复知识片段（{len(plan)} 组，保留每组最小 id）")
     return 0
-
 
 def run_knowledge_duplicates_standalone(
     limit: int = 20, as_json: bool = False
@@ -3716,13 +3728,15 @@ def run_sessions_list_standalone(
         else:
             status = "—"
         updated = _local_timestamp_text(item["updated_at"]) or "—"
-        title = item["title"][:30]
+        # 标题 / 命中片段来自 Web 或 LLM 写入的内容：ESC / OSC 序列不能
+        # 直达终端（OSC 8 伪造链接、OSC 52 覆盖剪贴板）
+        title = _terminal_safe(item["title"][:30])
         print(
             f"  [{status}] {item['session_id']:<16} {title:<32}"
             f" {item['messages']:>3} 条  {updated}"
         )
         if item.get("_snippet"):
-            print(f"       > {item['_snippet']}")
+            print(f"       > {_terminal_safe(item['_snippet'])}")
     return 0
 
 
@@ -3751,7 +3765,7 @@ def run_session_archive_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not _valid_web_id(session_id):
+    if not _valid_session_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     try:
         store = _open_cli_store(user_id)
@@ -3826,7 +3840,7 @@ def run_session_delete_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not _valid_web_id(session_id):
+    if not _valid_session_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     try:
         store = _open_cli_store(user_id)
@@ -3921,7 +3935,7 @@ def run_session_title_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not _valid_web_id(session_id):
+    if not _valid_session_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
     cleaned = title.strip()
     if len(cleaned) > 60:
@@ -3968,7 +3982,7 @@ def run_session_title_standalone(
         )
         return 0
     if saved:
-        print(f"已设置会话 {session_id} 标题：{saved}")
+        print(f"已设置会话 {session_id} 标题：{_terminal_safe(saved)}")
     else:
         print(f"已恢复会话 {session_id} 的自动标题")
     return 0
@@ -3999,7 +4013,7 @@ def run_session_pin_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not _valid_web_id(session_id):
+    if not _valid_session_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
 
     try:
@@ -4077,7 +4091,7 @@ def run_session_show_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not _valid_web_id(session_id):
+    if not _valid_session_id(session_id):
         return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
 
     try:
@@ -4124,7 +4138,7 @@ def run_session_show_standalone(
             )
         )
         return 0
-    label = title or "（自动标题）"
+    label = _terminal_safe(title or "（自动标题）")
     flags = [
         part
         for part in (("置顶" if pinned else ""), ("已归档" if archived else ""))
@@ -4139,7 +4153,8 @@ def run_session_show_standalone(
         time_text = _local_timestamp_text(str(message.get("timestamp") or ""))
         content = " ".join(render_stored_message(message).split())
         preview = content[:80] + ("…" if len(content) > 80 else "")
-        print(f"  [{time_text}] {role}: {preview}")
+        # 助手消息来自 LLM / 第三方内容：预览同样剥终端控制序列
+        print(f"  [{time_text}] {role}: {_terminal_safe(preview)}")
     return 0
 
 
@@ -4217,7 +4232,7 @@ def run_session_export_standalone(
     if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
-    if not _valid_web_id(session_id):
+    if not _valid_session_id(session_id):
         print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
         return 1
     try:
@@ -4305,8 +4320,8 @@ def run_session_export_standalone(
         return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-    except OSError as exc:
+        write_text_atomic(path, text)
+    except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出会话 {session_id} 到 {path}（{len(messages)} 条消息）")
@@ -4394,8 +4409,8 @@ def run_sessions_export_standalone(
         return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-    except OSError as exc:
+        write_text_atomic(path, text)
+    except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出 {count} 个会话到 {path}（{exported_messages} 条消息）")
@@ -4483,10 +4498,11 @@ def run_trips_export_standalone(
         exported = len(trips)
         # 用真实导入解析器检查回导：脏日期（格式非法 / 返程早于出发）与
         # 超长字段的行导入时会被整行跳过，导出侧必须提前告警，否则迁移 /
-        # 换机恢复时静默丢行程
+        # 换机恢复时静默丢行程。只读导出不受导入侧行数上限约束：超过
+        # 5000 条也必须能导出（导入时再按文件拆分）
         from utils.trip_import import parse_trips_csv
 
-        _, roundtrip_errors = parse_trips_csv(text)
+        _, roundtrip_errors = parse_trips_csv(text, max_rows=None)
         roundtrip_total = getattr(
             roundtrip_errors, "total", len(roundtrip_errors)
         )
@@ -4529,10 +4545,10 @@ def run_trips_export_standalone(
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if ics:
-            path.write_bytes(text.encode("utf-8"))
+            write_bytes_atomic(path, text.encode("utf-8"))
         else:
-            path.write_text(text, encoding="utf-8")
-    except OSError as exc:
+            write_text_atomic(path, text)
+    except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
     suffix = "（iCalendar）" if ics else ("（HTML）" if html else "")
@@ -4668,8 +4684,8 @@ def run_trip_calendar_standalone(
         return 1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(text.encode("utf-8"))
-    except OSError as exc:
+        write_bytes_atomic(path, text.encode("utf-8"))
+    except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出行程 {trip_id} 的日历到 {path}（iCalendar）")
@@ -4898,7 +4914,7 @@ def run_trip_add_standalone(
     )
     print(
         f"{'已添加' if created else '已更新'}行程 #{trip_id}"
-        f"（{origin or '—'} → {destination}，{dates}）"
+        f"（{_terminal_safe(origin) or '—'} → {_terminal_safe(destination)}，{dates}）"
     )
     if conflicts:
         ids = "、".join(f"#{str(item.get('trip_id') or '')}" for item in conflicts)
@@ -4991,7 +5007,10 @@ def run_trip_delete_standalone(
             )
         )
         return 0
-    print(f"已删除行程 #{trip_id}（{origin} → {destination}，{dates}）")
+    print(
+        f"已删除行程 #{trip_id}"
+        f"（{_terminal_safe(origin)} → {_terminal_safe(destination)}，{dates}）"
+    )
     return 0
 
 
@@ -5213,7 +5232,7 @@ def run_trip_update_standalone(
         return 0
     print(
         f"已更新行程 #{trip_id}"
-        f"（{origin or '—'} → {destination or '—'}，{dates}）"
+        f"（{_terminal_safe(origin) or '—'} → {_terminal_safe(destination) or '—'}，{dates}）"
     )
     if conflicts:
         ids = "、".join(f"#{str(item.get('trip_id') or '')}" for item in conflicts)

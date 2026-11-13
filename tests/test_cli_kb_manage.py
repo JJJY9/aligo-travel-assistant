@@ -222,6 +222,26 @@ def test_categories_and_duplicates_strip_terminal_controls(monkeypatch):
         "find_duplicate_contents",
         lambda: [("重复\x1b[2J内容", [1, 2])],
     )
+    monkeypatch.setattr(
+        knowledge_admin,
+        "cleanup_duplicate_contents",
+        lambda dry_run=True: {
+            "dry_run": bool(dry_run),
+            "groups": 1,
+            "planned": 1,
+            "removed": 0 if dry_run else 1,
+            "skipped": [],
+            "failed": [],
+            "plan": [
+                {
+                    "content": "重复\x1b[2J内容",
+                    "preview": "重复\x1b[2J内容",
+                    "keep": 1,
+                    "remove": [2],
+                }
+            ],
+        },
+    )
     code, out = _capture(cli.run_knowledge_duplicates_standalone)
     assert code == 0
     assert "\x1b" not in out, out
@@ -926,36 +946,61 @@ def test_duplicates_none_and_error(monkeypatch):
 
 
 def test_kb_dedupe_dry_run_and_delete(monkeypatch):
-    groups = [("重复甲", [9, 3, 7]), ("重复乙", [5, 6])]
-    deleted = []
+    """dry-run 走同一清理实现的预览；执行沿用 Web 的写锁内复核结果。"""
+    plan = [
+        {"content": "重复甲", "preview": "重复甲", "keep": 3, "remove": [7, 9]},
+        {"content": "重复乙", "preview": "重复乙", "keep": 5, "remove": [6]},
+    ]
+    calls = []
 
-    def fake_delete(doc_id, whole_group=False):
-        deleted.append(doc_id)
-        return 1
+    def fake_cleanup(dry_run=True):
+        calls.append(bool(dry_run))
+        return {
+            "dry_run": bool(dry_run),
+            "groups": len(plan),
+            "planned": 3,
+            "removed": 0 if dry_run else 3,
+            "skipped": [],
+            "failed": [],
+            "plan": plan,
+        }
 
-    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: groups)
-    monkeypatch.setattr(knowledge_admin, "delete_document", fake_delete)
+    monkeypatch.setattr(
+        knowledge_admin, "cleanup_duplicate_contents", fake_cleanup
+    )
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_knowledge_dedupe_standalone(dry_run=True)
     text = out.getvalue()
-    assert code == 0 and deleted == []
+    assert code == 0
     assert "将删除 3 条" in text and "保留 #3，删除 #7、#9" in text
     assert "保留 #5，删除 #6" in text
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_knowledge_dedupe_standalone()
-    assert code == 0 and deleted == [7, 9, 6]
+    assert code == 0 and calls == [True, False]
     assert "已删除 3 条重复知识片段" in out.getvalue()
-    print("✓ kb-dedupe 预览 / 按最小 id 保留并删除")
+    print("✓ kb-dedupe 预览 / 按最小 id 保留并删除（复用 Web 清理实现）")
 
 
 def test_kb_dedupe_json_and_empty(monkeypatch):
     import json as _json
 
-    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", lambda: [])
+    monkeypatch.setattr(
+        knowledge_admin,
+        "cleanup_duplicate_contents",
+        lambda dry_run=True: {
+            "dry_run": bool(dry_run),
+            "groups": 0,
+            "planned": 0,
+            "removed": 0,
+            "skipped": [],
+            "failed": [],
+            "plan": [],
+        },
+    )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_knowledge_dedupe_standalone(as_json=True)
@@ -963,12 +1008,19 @@ def test_kb_dedupe_json_and_empty(monkeypatch):
     assert code == 0 and data["groups"] == [] and data["would_remove"] == 0
 
     monkeypatch.setattr(
-        knowledge_admin, "find_duplicate_contents", lambda: [("甲", [1, 2])]
-    )
-    monkeypatch.setattr(
         knowledge_admin,
-        "delete_document",
-        lambda doc_id, whole_group=False: 1,
+        "cleanup_duplicate_contents",
+        lambda dry_run=True: {
+            "dry_run": bool(dry_run),
+            "groups": 1,
+            "planned": 1,
+            "removed": 0,
+            "skipped": [],
+            "failed": [],
+            "plan": [
+                {"content": "甲", "preview": "甲", "keep": 1, "remove": [2]}
+            ],
+        },
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -981,31 +1033,39 @@ def test_kb_dedupe_json_and_empty(monkeypatch):
 
 
 def test_kb_dedupe_failures(monkeypatch):
-    def boom():
+    def boom(dry_run=True):
         raise RuntimeError("Milvus 故障")
 
-    monkeypatch.setattr(knowledge_admin, "find_duplicate_contents", boom)
+    monkeypatch.setattr(knowledge_admin, "cleanup_duplicate_contents", boom)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_knowledge_dedupe_standalone()
     assert code == 1 and "读取知识库失败" in out.getvalue()
 
+    # 写锁内复核：部分删除失败 / 并发修改跳过都要如实报告
     monkeypatch.setattr(
-        knowledge_admin, "find_duplicate_contents", lambda: [("甲", [1, 2, 3])]
+        knowledge_admin,
+        "cleanup_duplicate_contents",
+        lambda dry_run=True: {
+            "dry_run": False,
+            "groups": 1,
+            "planned": 3,
+            "removed": 1,
+            "skipped": [{"id": 2, "reason": "内容已被修改，已跳过"}],
+            "failed": [{"id": 3, "error": "delete boom"}],
+            "plan": [
+                {"content": "甲", "preview": "甲", "keep": 1, "remove": [2, 3]}
+            ],
+        },
     )
-
-    def flaky(doc_id, whole_group=False):
-        if doc_id == 3:
-            raise RuntimeError("delete boom")
-        return 1
-
-    monkeypatch.setattr(knowledge_admin, "delete_document", flaky)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_knowledge_dedupe_standalone()
     text = out.getvalue()
-    assert code == 1 and "删除 #3 失败" in text and "已删除 1 条" in text
-    print("✓ kb-dedupe 读取 / 部分删除失败")
+    assert code == 1
+    assert "删除 #3 失败：delete boom" in text and "已删除 1 条" in text
+    assert "跳过 #2" in text and "内容已被修改" in text
+    print("✓ kb-dedupe 读取 / 部分删除失败 / 并发复核跳过")
 
 
 def test_kb_dedupe_dispatch(monkeypatch):

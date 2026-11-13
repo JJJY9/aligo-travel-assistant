@@ -62,3 +62,17 @@ def is_valid_web_id(value: object, max_length: int = 64) -> bool:
     if text.lower() in _WINDOWS_RESERVED_NAMES:
         return False
     return all(char == "-" or is_web_word_char(char) for char in text)
+
+
+def is_valid_web_session_id(value: object, max_length: int = 64) -> bool:
+    """会话 ID 的校验口径（字符集与 Web 相同，但不套用设备保留名）。
+
+    会话 ID 只作为消息元数据与 Redis 会话名的组成部分，不会变成记忆库
+    文件名；Web 的 ``ChatRequest.session_id`` 允许 ``nul`` / ``con`` 等
+    名字。CLI 若按用户 ID 的口径拒绝，Web 能创建的会话在 CLI 无法查看 /
+    删除，备份恢复时其消息还会被当作非法 ID 丢弃。
+    """
+    text = str(value or "")
+    if not text or len(text) > max_length:
+        return False
+    return all(char == "-" or is_web_word_char(char) for char in text)

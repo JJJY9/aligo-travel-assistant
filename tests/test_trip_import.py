@@ -1270,6 +1270,21 @@ def test_import_rejects_when_total_limit_would_be_exceeded(monkeypatch):
         module.import_trips_from_text(store, new_csv)
     print("✓ 行程导入总量上限（重复行不计入新增）")
 
+def test_parse_csv_row_limit_can_be_disabled_for_export_roundtrip():
+    """只读回导检查可关闭行数上限；导入路径默认仍受限。"""
+    from utils.trip_export import render_trips_csv
+
+    trips = [
+        {"origin": "北京", "destination": f"城市{i}", "start_date": "2026-12-05"}
+        for i in range(5001)
+    ]
+    text = render_trips_csv(trips)
+    with pytest.raises(ValueError, match="最多导入"):
+        parse_trips_csv(text)
+    rows, errors = parse_trips_csv(text, max_rows=None)
+    assert len(rows) == 5001 and errors == []
+    print("✓ 导出的超限 CSV 可关闭行数上限回读")
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()

@@ -27,6 +27,11 @@ _MAX_TRIP_FIELD_CHARS = 100
 # 解析期错误列表物化上限：一个 5M 字符的坏文件可能有上百万条错误，全量
 # 物化会占用上百 MB 内存；总数仍由 total 精确统计，展示只取前 50 条
 _PARSE_ERRORS_CAP = 1000
+# 单次导入行数上限：批量保存是 O(N²)（JSON 每条重扫历史 / PG 每条查候选
+# 并扫 trip_id），且整批持用户锁；5000 条在本地实测约 10 秒，与备份恢复
+# 的 _MAX_TRIPS 同一量级，避免一个文件把对话 / 行程写入阻塞数分钟。
+# 只读导出侧的回导检查可显式传 max_rows=None 关闭该上限。
+_MAX_IMPORT_ROWS = 5000
 
 
 class _BoundedErrors(list):
@@ -82,8 +87,14 @@ def _strict_date(value: str) -> "datetime | None":
     return parsed
 
 
-def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
-    """解析并校验行程 CSV，返回 ``(有效行程, [(行号, 原因)])``（行号从 2 起）。"""
+def parse_trips_csv(
+    text: str, *, max_rows: int | None = _MAX_IMPORT_ROWS
+) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
+    """解析并校验行程 CSV，返回 ``(有效行程, [(行号, 原因)])``（行号从 2 起）。
+
+    ``max_rows=None`` 关闭行数上限：只读导出侧的回导检查需要解析超过
+    单次导入上限的全量文件。
+    """
     # strict=True：引号错位（如 `C,"D,2026-01-02` 后跟另一行带引号）时
     # 非严格模式会把后续多行静默合并成一条记录、零错误地导入错数据；
     # 严格模式走下面的 csv.Error 分支，保留已解析行并报出行号
@@ -179,9 +190,9 @@ def parse_trips_csv(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
                 "purpose": purpose or None,
             }
         )
-        if len(rows) > _MAX_IMPORT_ROWS:
+        if max_rows is not None and len(rows) > max_rows:
             raise ValueError(
-                f"单次最多导入 {_MAX_IMPORT_ROWS} 条行程，请拆分文件后再导入"
+                f"单次最多导入 {max_rows} 条行程，请拆分文件后再导入"
             )
     return rows, errors
 
@@ -518,10 +529,6 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
     return rows, errors
 
 
-# 单次导入行数上限：批量保存是 O(N²)（JSON 每条重扫历史 / PG 每条查候选
-# 并扫 trip_id），且整批持用户锁；5000 条在本地实测约 10 秒，与备份恢复
-# 的 _MAX_TRIPS 同一量级，避免一个文件把对话 / 行程写入阻塞数分钟。
-_MAX_IMPORT_ROWS = 5000
 # 账号内行程总量上限（与 Web 新增行程的 MAX_TRIP_ENTRIES、备份恢复的
 # _MAX_TRIPS 一致）：越过该上限后全量导出会被拒绝，必须先清理
 MAX_TOTAL_TRIPS = 5000
