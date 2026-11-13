@@ -5163,6 +5163,7 @@ def create_app(model: Any = None) -> FastAPI:
 
         from utils.user_import import (
             MAX_BACKUP_BYTES,
+            backup_limit_problem,
             drop_sessions,
             import_user_data,
             parse_user_export_data,
@@ -5277,6 +5278,25 @@ def create_app(model: Any = None) -> FastAPI:
             if not sections:
                 detail = "；".join(errors[:3]) or "没有可恢复的数据"
                 raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
+            # 请求体上限按紧凑 JSON 预检；恢复后的备份将按导出格式
+            # （indent=2，约 1.3-1.6 倍体积）重新导出——不在这里按导出
+            # 体积再查一次，用户会恢复出一份「自己永远导出不了」的数据
+            try:
+                limit_problem = await loop.run_in_executor(
+                    state.import_executor, backup_limit_problem, payload.backup
+                )
+            except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
+                logger.debug("备份导出口径自检失败", exc_info=True)
+                limit_problem = None
+            if limit_problem:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"备份超过可导入上限：{limit_problem}。"
+                        "按导出格式（indent=2）计算已超过 50 MB，恢复后"
+                        "将无法再次导出；请先在源账号清理后重新导出"
+                    ),
+                )
 
             async with state.lock_for(user_id):
                 # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
