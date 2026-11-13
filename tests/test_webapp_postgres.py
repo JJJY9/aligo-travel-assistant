@@ -520,5 +520,68 @@ def test_add_chat_messages_dedupe_normalizes_integer_session_id():
         store.delete_all()
         store.close()
 
+def test_advisory_lock_serializes_threads_on_same_instance():
+    """同一实例多线程共用连接：会话级 advisory lock 之外要有实例锁。"""
+    import threading
+
+    user_id = f"pglock-{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=5)
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": "上海",
+                        "start_date": "2026-07-01",
+                        "end_date": "2026-07-02",
+                    }
+                )
+            except BaseException as exc:  # noqa: BLE001 - 线程内异常带回主线程
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert not errors, errors
+        trips = store.get_trip_history(limit=None)
+        assert len(trips) == 1, f"同实例并发保存不能插出重复行程: {trips}"
+        print("✓ 同实例多线程的行程读改写被实例锁串行化")
+    finally:
+        store.delete_all()
+        store.close()
+
+
+def test_export_snapshot_retries_after_connection_rebuild(monkeypatch):
+    """快照中途连接重建：整体重试而不是返回旧新混合的备份。"""
+    from utils.errors import MemoryPersistenceError
+
+    user_id = f"pgexport-{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        calls = {"n": 0}
+        original = store._export_snapshot_queries
+
+        def flaky(start_conn=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise MemoryPersistenceError("连接已重建")
+            return original(start_conn)
+
+        monkeypatch.setattr(store, "_export_snapshot_queries", flaky)
+        snapshot = store.export_snapshot()
+        assert calls["n"] == 2, calls
+        assert snapshot["statistics"]["total_messages"] == 0
+        print("✓ 导出快照连接重建后整体重试")
+    finally:
+        store.delete_all()
+        store.close()
+
 if __name__ == "__main__":
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")
