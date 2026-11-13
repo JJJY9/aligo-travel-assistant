@@ -159,8 +159,13 @@ class LongTermMemory:
                     with open(self.db_path, "r", encoding="utf-8") as f:
                         raw = f.read()
                     data = self._migrate_data(json.loads(raw))
+                    # 大小写不敏感文件系统上另一账号可能映射到同一文件：
+                    # 这是身份冲突而不是文件损坏，不能走隔离分支
+                    self._check_owner_case(data)
                     logger.debug(f"Loaded long-term memory from {self.db_path}")
                     return data
+                except MemoryPersistenceError:
+                    raise
                 except Exception as e:
                     logger.error(f"Failed to load long-term memory: {e}")
                     # 复核与备份都必须持有跨进程文件锁：其它进程的写操作在
@@ -212,6 +217,25 @@ class LongTermMemory:
             else:
                 logger.info("No existing long-term memory, creating new")
                 return self._init_data()
+
+    def _check_owner_case(self, data: dict[str, Any]) -> None:
+        """大小写不敏感文件系统上防止跨账号读写同一记忆文件。
+
+        ``Alice`` / ``alice`` 在 Windows / macOS 默认文件系统上指向同一个
+        ``<user_id>.json``；文件里记录着创建它的 user_id。请求的 ID 与记录
+        仅大小写不同时拒绝访问，避免读到 / 写坏另一账号的行程与对话。
+        PostgreSQL 后端按列存储，不受影响。
+        """
+        owner = data.get("user_id")
+        if not isinstance(owner, str) or not owner or owner == self.user_id:
+            return
+        if owner.casefold() != self.user_id.casefold():
+            return
+        raise MemoryPersistenceError(
+            f"用户 ID 与已有记忆文件仅大小写不同（已有 {owner}）。当前文件系统"
+            "大小写不敏感，两个 ID 会读写同一份数据；请使用与已有账号完全一致"
+            "的大小写"
+        )
 
     def _ensure_corrupt_backed_up(self) -> None:
         """写操作前的损坏文件复核（调用方必须已持有跨进程文件锁）。
@@ -282,7 +306,9 @@ class LongTermMemory:
             raise MemoryPersistenceError(
                 f"长期记忆重载失败（{self.db_path}）：内容不是 JSON 对象"
             )
-        self.data = self._migrate_data(data)
+        migrated = self._migrate_data(data)
+        self._check_owner_case(migrated)
+        self.data = migrated
 
     def _backup_before_migration(self) -> None:
         """迁移会丢弃 / 重置坏数据前把原始文件另存一份（每个文件只留首份）。
