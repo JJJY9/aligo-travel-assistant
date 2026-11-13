@@ -451,11 +451,40 @@ def test_repaired_json_with_non_list_schedule_falls_back():
     print("✓ 修复解析后的非列表调度同样降级")
 
 
+def test_permanent_classification_excludes_request_level_4xx():
+    """请求级 4xx（400 长度 / 408 / 409 / 413 / 422）不计入熔断永久故障。"""
+    from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+
+    class _StatusError(Exception):
+        def __init__(self, status, message="boom"):
+            super().__init__(message)
+            self.status_code = status
+
+    for status in (400, 408, 409, 413, 422):
+        exc = _StatusError(
+            status, "context_length_exceeded" if status == 400 else "boom"
+        )
+        assert is_retriable_error(exc) is False, status
+        assert is_permanent_llm_error(exc) is False, status
+
+    # 网关把鉴权错误包成 400：正文关键词按永久故障处理
+    assert is_permanent_llm_error(
+        _StatusError(400, "Authentication Fails, invalid api key")
+    ) is True
+    for status in (401, 402, 403, 404):
+        assert is_permanent_llm_error(_StatusError(status)) is True, status
+
+    # 本地文件类 OSError 不按网络故障重试（重试不会自愈，还会重复计费）
+    assert is_retriable_error(FileNotFoundError("missing model")) is False
+    print("✓ 熔断永久故障分类排除请求级 4xx")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_permanent_llm_error_is_raised()
     test_empty_response_is_retriable_error()
     test_http_200_error_body_is_llm_error()
+    test_permanent_classification_excludes_request_level_4xx()
     test_unparsable_output_falls_back()
     test_json_with_trailing_prose_braces_parses()
     test_non_finite_json_falls_back()

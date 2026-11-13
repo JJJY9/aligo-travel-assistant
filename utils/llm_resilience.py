@@ -54,6 +54,13 @@ def is_retriable_error(exc: BaseException) -> bool:
     # 写盘失败不是网络故障：重试整轮对话只会重复调用大模型，不会让磁盘恢复
     if isinstance(exc, MemoryPersistenceError):
         return False
+    # 本地文件 / 模型加载类的 OSError（缺文件、权限、目录错误）重试不会
+    # 自愈，还会把一轮编排连同其它智能体重复计费
+    if isinstance(
+        exc,
+        (FileNotFoundError, PermissionError, NotADirectoryError, IsADirectoryError),
+    ):
+        return False
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
     if any(
@@ -73,18 +80,40 @@ def is_retriable_error(exc: BaseException) -> bool:
     return "timeout" in msg or "timed out" in msg or "deadline exceeded" in msg
 
 
-def is_permanent_llm_error(exc: BaseException) -> bool:
-    """不可重试的模型调用失败（401/402/403/404 等 4xx）。
+# 明确的「上游模型不可用」状态码：密钥失效 / 余额耗尽 / 模型不存在
+_PERMANENT_LLM_STATUSES = frozenset({401, 402, 403, 404})
+# 网关把鉴权错误包成 400 时正文会带这些关键词：同样按永久故障处理
+_PERMANENT_LLM_MARKERS = (
+    "invalid api key",
+    "incorrect api key",
+    "invalid_api_key",
+    "authentication",
+    "unauthorized",
+    "insufficient_quota",
+    "model_not_found",
+)
 
-    这类错误意味着上游模型完全不可用（密钥失效 / 余额耗尽 / 模型不存在），
-    不是「模型输出无法解析」：调用方必须上抛让熔断器记账，不能吞成默认
-    意图 / 空结果后由外层把本轮记为成功——否则 LLM 彻底不可用时熔断器
-    永远不会打开，健康检查一直报 closed。
+
+def is_permanent_llm_error(exc: BaseException) -> bool:
+    """上游模型不可用的不可重试失败（401/402/403/404，或带鉴权标记的 4xx）。
+
+    这类错误意味着模型服务整体不可用，调用方必须上抛让熔断器记账，不能
+    吞成默认意图 / 空结果后由外层把本轮记为成功——否则 LLM 彻底不可用时
+    熔断器永远不会打开。注意请求级 4xx（400 context_length_exceeded /
+    408 / 409 / 413 / 422）**不在此列**：模型服务本身健康，任意用户连续
+    超长请求不能打开全站熔断；它们按「确定性失败」处理（不重试、不记账）。
     """
     if is_retriable_error(exc):
         return False
     status = _status_code(exc)
-    return status is not None and 400 <= status < 500
+    if status is None:
+        return False
+    if status in _PERMANENT_LLM_STATUSES:
+        return True
+    if 400 <= status < 500:
+        text = str(exc).lower()
+        return any(marker in text for marker in _PERMANENT_LLM_MARKERS)
+    return False
 
 
 async def retry_with_backoff(

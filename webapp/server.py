@@ -300,7 +300,7 @@ _ALLOWED_HOSTS_ENV = "ALIGO_ALLOWED_HOSTS"
 
 
 def _normalized_request_host(host_header: str) -> str:
-    host = (host_header or "").strip().lower().rstrip(".")
+    host = (host_header or "").strip().lower()
     if not host:
         return ""
     if host.startswith("["):
@@ -310,7 +310,9 @@ def _normalized_request_host(host_header: str) -> str:
         return host[1:end]
     if host.count(":") == 1:
         host = host.rsplit(":", 1)[0]
-    return host
+    # 先剥端口再去尾点：``Host: example.com.:8000`` 若先 rstrip('.') 是空操作，
+    # 去端口后仍带尾点、永远匹配不到白名单
+    return host.rstrip(".")
 
 
 def _host_allowed(host_header: str) -> bool:
@@ -326,7 +328,9 @@ def _host_allowed(host_header: str) -> bool:
         return True
     configured = os.environ.get(_ALLOWED_HOSTS_ENV, "")
     for item in configured.split(","):
-        pattern = item.strip().lower().rstrip(".")
+        # 配置项与请求 Host 同一归一化：操作员按地址栏写 ``域名:端口``
+        # 时必须能匹配（此前只对请求侧剥端口，配置侧永不命中、全站 400）
+        pattern = _normalized_request_host(item)
         if not pattern:
             continue
         if pattern.startswith("*.") and host.endswith(pattern[1:]):
@@ -5446,6 +5450,11 @@ def main() -> None:
         host=args.host,
         port=args.port,
         log_level="info",
+        # uvicorn 默认会用客户端可伪造的 X-Forwarded-For 覆盖 scope["client"]
+        # （对 loopback 对端无条件下信任）：本机进程即可轮换「客户端 IP」
+        # 绕过按 IP 的限流桶，与 TRUST_PROXY_HEADERS 的显式开关语义冲突。
+        # 关闭后由应用层统一按配置决定是否采信 XFF（见 _client_host）
+        proxy_headers=False,
         # SSE 心跳让长回合连接持续活跃：不给优雅退出设上限会让
         # Ctrl+C / SIGTERM 无限等待在途回合，被 SIGKILL 时 lifespan 的
         # close_all() 不会执行

@@ -3,7 +3,7 @@ Configuration for the Aligo Multi-Agent System
 """
 import logging
 import os
-from typing import TypedDict
+from typing import TypedDict, cast
 
 logger = logging.getLogger(__name__)
 
@@ -21,22 +21,26 @@ logger = logging.getLogger(__name__)
 #   OpenAI: LLM_BASE_URL=https://api.openai.com/v1
 #           LLM_MODEL_NAME=gpt-4o-mini
 def _env_str(name: str, default: str) -> str:
-    """环境变量存在但为空 / 纯空白时回退默认值（Docker / K8s 常见空注入）。"""
-    value = os.environ.get(name, "").strip()
+    """环境变量存在但为空 / 纯空白时回退默认值（Docker / K8s 常见空注入）。
+
+    同时剥离 UTF-8 BOM（U+FEFF 不是空白）：带 BOM 的 .env 会让 URL / 密钥
+    「看起来已配置」却永远连不上（BOM 混进库名 / HTTP 头编码失败）。
+    """
+    value = os.environ.get(name, "").replace("\ufeff", "").strip()
     return value or default
 
 
 # 密钥必须 strip：复制粘贴带尾随空格 / 换行时，httpx 会拒绝非法 header
 # 值（Bearer sk-xxx␠），所有请求变成「Connection error」且异常链带完整
 # 密钥进日志；纯空白值按未设置处理（否则会阻止回退 config_local.py）
-_api_key = os.environ.get("LLM_API_KEY", "").strip()
+_api_key = os.environ.get("LLM_API_KEY", "").replace("\ufeff", "").strip()
 if not _api_key:
     try:
         # 本地私有配置（已 gitignore）。注意不要用 import ... as _api_key 的写法：
         # config_local.py 不存在时 mypy 会报 "Name already defined [no-redef]"
         from config_local import API_KEY
 
-        _api_key = str(API_KEY or "").strip()
+        _api_key = str(API_KEY or "").replace("\ufeff", "").strip()
     except ImportError as exc:
         # 只吞掉「config_local 不存在 / 没有 API_KEY」；文件里自身 import 失败
         # （例如先 import 了未安装的模块再写密钥）必须暴露，否则有效密钥
@@ -123,9 +127,17 @@ RAG_CONFIG: RAGConfig = {
 #   DATABASE_URL  例如 postgresql://user:pass@localhost:5432/db —— 启用 PostgreSQL 长期记忆
 #   未设置时分别使用进程内滑动窗口 / data/memory/*.json
 def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
     try:
-        return int(os.environ.get(name, str(default)))
+        return int(raw)
     except ValueError:
+        # 静默回退会让一次笔误（如 CHAT_RATE_LIMIT=2,000）变成看不见的默认值
+        logger.warning(
+            "环境变量 %s=%r 不是整数，使用默认值 %s",
+            name,
+            str(raw)[:40],
+            default,
+        )
         return default
 
 
@@ -137,8 +149,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 STORAGE_CONFIG: StorageConfig = {
-    "redis_url": os.environ.get("REDIS_URL", ""),
-    "postgres_dsn": os.environ.get("DATABASE_URL", ""),
+    # 必须 strip / 去 BOM：K8s --from-file 的尾随换行会让 DATABASE_URL 的
+    # 换行并进库名（连接永久失败、长期记忆静默落回本地 JSON），前导空白
+    # 让 REDIS_URL 在 from_url 直接 ValueError（全部限流桶降级）
+    "redis_url": _env_str("REDIS_URL", ""),
+    "postgres_dsn": _env_str("DATABASE_URL", ""),
     "redis_ttl_sec": _env_int("REDIS_TTL_SEC", 3600),
 }
 
@@ -187,3 +202,25 @@ if int(RATE_LIMIT_CONFIG["window_sec"]) < 1:
         RATE_LIMIT_CONFIG["window_sec"],
     )
     RATE_LIMIT_CONFIG["window_sec"] = 1
+
+# 额度 <= 0 会被 RateLimiter 构造时静默钳成 max(1, limit)：常见的
+# 「0 = 关闭限流」写法反而把该桶变成每窗口只有 1 次（面板批量操作全部
+# 429）。显式告警并按下限 1 处理，不再无声变更
+_rate_limits = cast("dict[str, int]", RATE_LIMIT_CONFIG)
+for _limit_key, _limit_env in (
+    ("chat_requests", "CHAT_RATE_LIMIT"),
+    ("ip_requests", "CHAT_RATE_LIMIT_IP"),
+    ("kb_requests", "KB_RATE_LIMIT"),
+    ("kb_import_requests", "KB_IMPORT_RATE_LIMIT"),
+    ("weather_requests", "WEATHER_RATE_LIMIT"),
+    ("read_requests", "READ_RATE_LIMIT"),
+    ("write_requests", "WRITE_RATE_LIMIT"),
+):
+    _limit_value = int(_rate_limits[_limit_key])
+    if _limit_value < 1:
+        logger.warning(
+            "%s=%s 非法（需 >= 1），按每窗口 1 次处理；如需放宽请设置更大值",
+            _limit_env,
+            _limit_value,
+        )
+        _rate_limits[_limit_key] = 1

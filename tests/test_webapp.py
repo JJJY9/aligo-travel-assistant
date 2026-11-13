@@ -211,6 +211,37 @@ def test_host_allowlist_env(monkeypatch):
         ).status_code
         == 400
     )
+    # 配置项与请求 Host 同一归一化：按地址栏写成「域名:端口」也能匹配，
+    # 尾点 + 端口的 Host 先剥端口再去尾点
+    monkeypatch.setenv(
+        "ALIGO_ALLOWED_HOSTS",
+        "aligo.example.com:8000, *.corp.example.com:8443",
+    )
+    client = _client()
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "aligo.example.com:8000"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "aligo.example.com"}
+        ).status_code
+        == 200
+    ), "配置带端口时，不带端口的请求 Host 同样应匹配"
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "box.corp.example.com:8443"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "aligo.example.com.:8000"}
+        ).status_code
+        == 200
+    ), "尾点必须在剥端口之后再去除"
     print("✓ ALIGO_ALLOWED_HOSTS 域名白名单")
 
 
