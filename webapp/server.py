@@ -2170,6 +2170,21 @@ def _get_weather_executor() -> ThreadPoolExecutor:
 # ---------- 长期记忆读取 ----------
 
 
+def _quarantined_memory_backup(user_id: str) -> str | None:
+    """JSON 记忆主文件不存在但存在 .corrupt-* 隔离备份时返回备份路径。
+
+    存储层只在触发隔离的那个实例上保留标记；后续请求打开时主文件已被
+    移走，只能按备份文件判断——否则「数据被隔离」会被当成「用户没有
+    数据」，/api/export 返回 200 空备份、会话导出返回 404。
+    主文件存在（用户已用备份恢复）时不拦截。
+    """
+    base = MEMORY_DIR / f"{user_id}.json"
+    if base.exists():
+        return None
+    backups = sorted(MEMORY_DIR.glob(f"{user_id}.json.corrupt-*"))
+    return str(backups[-1]) if backups else None
+
+
 def _open_long_term(user_id: str, strict: bool = False) -> Any:
     """按当前配置打开长期记忆（JSON 或 PostgreSQL）。
 
@@ -2189,7 +2204,26 @@ def _open_long_term(user_id: str, strict: bool = False) -> Any:
         # 为 JSON 后端在这里统一拒绝，避免写入静默丢失。
         raise HTTPException(status_code=422, detail="user_id 非法")
     try:
-        return create_long_term_memory(user_id, str(MEMORY_DIR), strict=strict)
+        store = create_long_term_memory(user_id, str(MEMORY_DIR), strict=strict)
+        marker = None
+        getter = getattr(store, "get_recovered_corrupt_backup", None)
+        if callable(getter):
+            marker = getter()
+        marker = marker or _quarantined_memory_backup(user_id)
+        if marker:
+            close = getattr(store, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+            logger.warning("记忆文件损坏并已隔离（%s）：%s", user_id, marker)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "记忆文件损坏并已隔离备份（路径见服务端日志），"
+                    "请使用备份文件恢复后重试"
+                ),
+            )
+        return store
     except HTTPException:
         raise
     except MemoryPersistenceError as exc:
