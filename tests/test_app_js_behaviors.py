@@ -511,11 +511,17 @@ def test_reconcile_confirms_after_open_session():
     late = data["persistedLate"]
     assert late["input"] == "", late
     assert late["toasts"] == [], late
-    assert late["open_calls"] == 1, late
+    # 最终确认发现落后再刷一次（openSession）保证界面包含刚落库的一轮
+    assert late["open_calls"] == 2, late
 
     missing = data["stillMissing"]
     assert missing["input"] == "你好", missing
     assert any("没有保存" in item for item in missing["toasts"]), missing
+
+    # 对账期间用户点击了其它会话：不能把旧提问写进当前输入框
+    interleaved = data["interleaved"]
+    assert interleaved["input"] == "", interleaved
+    assert interleaved["toasts"] == [], interleaved
     print("✓ 停止对账按最终确认结果判定是否保存")
 
 
