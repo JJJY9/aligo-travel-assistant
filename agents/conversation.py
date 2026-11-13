@@ -29,6 +29,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
+from utils.paths import default_data_root
 from utils.preference_values import has_preference_value
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
@@ -74,7 +75,16 @@ class ConversationRuntime:
         # 累计到下一轮成功回合一起写入，否则面板与趋势永久少记
         self._unsettled_usage: dict[str, Any] | None = None
 
-        self.memory = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
+        # 与 Web 面板 / CLI 命令同一数据目录：MemoryManager 默认的
+        # "data/memory" 会锚定到包根（wheel 下是 site-packages），与
+        # default_data_root()/memory 分叉——对话写入的会话 / 偏好 / 行程
+        # 在面板、导出与删除里全部不可见，重装还会静默丢失
+        self.memory = MemoryManager(
+            user_id=user_id,
+            session_id=session_id,
+            storage_path=str(default_data_root() / "memory"),
+            llm_model=model,
+        )
         self.intention_agent = IntentionAgent(name="IntentionAgent", model=model)
         self.agent_cache: dict[str, Any] = {}
         self.registry = LazyAgentRegistry(
