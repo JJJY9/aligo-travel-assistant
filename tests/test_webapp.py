@@ -10871,6 +10871,60 @@ def test_weather_cache_hit_skips_rate_limit(monkeypatch):
     assert "Retry-After" in limited.headers
     print("✓ 天气缓存命中不消耗 IP 桶额度")
 
+def test_chat_lock_wait_is_bounded(monkeypatch):
+    """SSE 排队等待用户锁有上限：期间探测断连，超时 503 + Retry-After。"""
+    import asyncio
+
+    from fastapi import HTTPException
+    from webapp import server as server_module
+
+    class _Request:
+        def __init__(self, disconnected: bool = False) -> None:
+            self._disconnected = disconnected
+
+        async def is_disconnected(self) -> bool:
+            return self._disconnected
+
+    monkeypatch.setattr(server_module, "_CHAT_LOCK_WAIT_SEC", 0.05)
+    monkeypatch.setattr(server_module, "_CHAT_LOCK_POLL_SEC", 0.01)
+
+    async def _timed_out():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        try:
+            await server_module._acquire_chat_lock(_Request(), lock, "rid")
+        finally:
+            lock.release()
+
+    with pytest.raises(HTTPException) as info:
+        asyncio.run(_timed_out())
+    assert info.value.status_code == 503
+    assert (info.value.headers or {}).get("Retry-After") == "5"
+    assert "已有对话" in info.value.detail
+
+    async def _disconnected():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        try:
+            await server_module._acquire_chat_lock(
+                _Request(disconnected=True), lock, "rid"
+            )
+        finally:
+            lock.release()
+
+    with pytest.raises(HTTPException) as info:
+        asyncio.run(_disconnected())
+    assert "已断开" in info.value.detail
+
+    async def _free_lock():
+        lock = asyncio.Lock()
+        await server_module._acquire_chat_lock(_Request(), lock, "rid")
+        assert lock.locked()
+        lock.release()
+
+    asyncio.run(_free_lock())
+    print("✓ SSE 对话锁等待有界并探测断连")
+
 if __name__ == "__main__":
     test_index_page()
     test_match_snippet_handles_casefold_length_changes()
@@ -10937,6 +10991,7 @@ if __name__ == "__main__":
     test_side_effect_guard_requires_same_origin_marker()
 
     test_export_concurrency_guard()
+    test_chat_lock_wait_is_bounded(pytest.MonkeyPatch())
 
     _mp_slow_body = pytest.MonkeyPatch()
     try:
