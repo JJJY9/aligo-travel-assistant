@@ -22,6 +22,7 @@ from context.short_term_memory import (
     ShortTermMemory,
     applied_key,
     discard_pending_ops,
+    note_redis_operation_failure,
     queue_clear,
     redis_short_term_available,
     redis_short_term_degraded,
@@ -346,6 +347,9 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
         client.delete(*keys, *[applied_key(key) for key in keys])
     except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程
         logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)
+        # 这是一次真实 Redis 操作失败：健康接口的可用性标志必须跟着变
+        # （连接级故障进入冷却），不能只登记重放让状态显示正常
+        note_redis_operation_failure(exc)
         # 删除失败时登记整键删除：墓碑（300 秒）过期后复用同一
         # session_id 时，下一次访问会先重放它，不会读到旧对话
         queue_clear(replay_key)
