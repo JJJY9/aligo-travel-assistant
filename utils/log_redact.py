@@ -21,12 +21,35 @@ _KEY_VALUE = re.compile(
 # 本机绝对路径与上游 URL：技能错误文本会经编排层渲染给用户（Web / CLI），
 # 嵌入模型缓存目录、Milvus 库文件路径、下载地址都不应出现在回答里
 _URL_BODY = re.compile(r"https?://[^\s'\"<>）)]+")
+# 路径片段里允许空格：每段空格后的词必须由分隔符收尾（``Program Files\``、
+# ``John Doe\``、``Files (x86)\``），否则匹配会横穿自然语言句子、把
+# ``Connection refused`` 这类重试关键词一起吞掉
 _WINDOWS_PATH = re.compile(
-    r"(?<![\w])(?:[A-Za-z]:[\\/][^\s'\"<>）)]+|\\\\[^\s'\"<>）)]+)"
+    r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
+    r"[^\s'\"<>）)]*"
+    r"(?: (?:"
+    r"[^\s\\/'\"<>）)]+(?:"
+    r"[\\/]"
+    r"| \([^()\s'\"<>）]+\)[\\/]"
+    r"| [^\s\\/'\"<>）)]+[\\/]"
+    r")"
+    r"[^\s'\"<>）)]*"
+    r"))*"
+)
+# 引号内的路径整体遮蔽：引号给了明确边界，可以跨空格一直吃到收尾引号
+# （``'C:\Users\John Doe\My File.txt'``）
+_QUOTED_WINDOWS_PATH = re.compile(
+    r"(['\"`])(?:[A-Za-z]:[\\/]|\\\\)[^'\"`\r\n]*?\1"
+)
+_UNIX_ROOTS = (
+    r"home|Users|root|tmp|var|opt|srv|mnt|data|workspace"
+    r"|proc|etc|app|code|build|usr|private"
+)
+_QUOTED_UNIX_PATH = re.compile(
+    r"(['\"`])/(" + _UNIX_ROOTS + r")/[^'\"`\r\n]*?\1"
 )
 _UNIX_PATH = re.compile(
-    r"(?<![\w:/])/(?:home|Users|root|tmp|var|opt|srv|mnt|data|workspace"
-    r"|proc|etc|app|code|build|usr|private)(?:/[^\s'\"<>）)]+)+"
+    r"(?<![\w:/])/(" + _UNIX_ROOTS + r")(?:/[^\s'\"<>）)]+)+"
 )
 
 
@@ -37,7 +60,13 @@ def redact_local_paths(text: object) -> str:
     :func:`redact_paths` 那样把整条 URL 抹成 ``http(s)://***``，但又不能
     回显 ``C:\\venv\\...`` / ``/usr/lib/...`` 这类目录布局。
     """
-    cleaned = _WINDOWS_PATH.sub("<路径>", str(text))
+    cleaned = _QUOTED_WINDOWS_PATH.sub(
+        lambda match: f"{match.group(1)}<路径>{match.group(1)}", str(text)
+    )
+    cleaned = _QUOTED_UNIX_PATH.sub(
+        lambda match: f"{match.group(1)}<路径>{match.group(1)}", cleaned
+    )
+    cleaned = _WINDOWS_PATH.sub("<路径>", cleaned)
     return _UNIX_PATH.sub("<路径>", cleaned)
 
 

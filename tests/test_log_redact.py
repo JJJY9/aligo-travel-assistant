@@ -101,9 +101,30 @@ def test_redact_local_paths_keeps_urls_intact():
     print("✓ redact_local_paths 只遮蔽路径、保留 URL")
 
 
+def test_redact_local_paths_covers_paths_with_spaces():
+    """含空格的 Windows / macOS 路径不能只遮到第一个空格、留下目录尾部。"""
+    cases = {
+        r"open C:\Program Files\Python312\python.exe failed": "open <路径> failed",
+        r"open C:\Program Files (x86)\Common Files\a.dll failed": "open <路径> failed",
+        r"open C:\Users\John Doe\models\bge\config.json failed": "open <路径> failed",
+        r"open \\server\share\My Documents\a.txt failed": "open <路径> failed",
+        "load 'C:\\Users\\John Doe\\My File.txt' failed": "load '<路径>' failed",
+        "load '/Users/John Doe/model/x' failed": "load '<路径>' failed",
+    }
+    for raw, expected in cases.items():
+        cleaned = redact_local_paths(raw)
+        assert cleaned == expected, (raw, cleaned)
+
+    # 自然语言句子不能被跨空格吞掉：瞬时限关键词必须保留
+    prose = redact_paths(r"open C:\Program Files is missing (Connection refused)")
+    assert "Connection refused" in prose and "is missing" in prose, prose
+    assert "C:" not in prose, prose
+    print("✓ 含空格路径整体遮蔽且不吞掉错误关键词")
+
 if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_paths_hides_internal_paths_and_urls()
     test_redact_local_paths_keeps_urls_intact()
+    test_redact_local_paths_covers_paths_with_spaces()
     print("caplog 用例需 pytest 运行")

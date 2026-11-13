@@ -48,6 +48,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 路径脱敏补全含空格路径：`redact_local_paths` 此前遇到 `C:\Program Files\...` / `C:\Users\John Doe\...` 只遮到第一个空格，目录尾部与文件名仍会出现在回答 / 诊断里；现在空格后的片段仅在由分隔符收尾时并入路径（`Program Files\`、`Files (x86)\`、`John Doe\`），引号内路径按引号边界整体遮蔽（含 macOS `/Users/...`），自然语言句子与 Connection refused 等重试关键词不受影响
 - 知识库初始化中止清理重试：导出失败 / 初始化失败时移除本次新建的库目录，milvus-lite 句柄在 Windows 上延迟释放导致 unlink/rmtree 失败时短暂重试（gc 回收后重试 3 次）；仍无法删除 `milvus_lite.db` 时提示手动删除目录，避免新库被误认作已初始化而挡住旧库迁移
 - Milvus 重连修复（pymilvus 3.x）：ConnectionManager 按 uri 复用共享连接，`MilvusClient.close()` 只解除客户端引用、不关闭底层 channel，`reset_milvus_client` 之后重连仍拿回同一条（可能已损坏的）连接；现在 pymilvus 3 以 dedicated 模式创建客户端（进程内仍按数据库路径缓存共享），close() 真正关闭通道，断线重连建立新连接（2.x 参数与行为不变）
 - 初始化脚本目标 / 来源库解析收紧（#735 后续）：纯源码 checkout（技能目录即脚本目录、未设置 ALIGO_SKILLS_DIR）仍使用脚本本地目标与既有 legacy 迁移语义；只有技能目录被覆盖 / wheel 安装等运行期解析分歧时才把目标切到运行时目录。来源库单独解析，legacy 迁移不因空 skill 库抢先而丢失（补技能目录覆盖场景用例）
