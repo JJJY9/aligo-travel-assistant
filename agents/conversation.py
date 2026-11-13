@@ -683,6 +683,22 @@ class ConversationRuntime:
             except Exception:  # noqa: BLE001 - 回填失败按无历史继续
                 logger.debug("回填本会话历史失败", exc_info=True)
                 recent = []
+            if recent:
+                # 回填必须写回短期记忆：编排器 _prepare_context 直接读
+                # get_recent_context(3)，只放进意图上下文的话当轮子智能体
+                # 看不到上文；且本轮落库后短期记忆非空，下一轮会跳过回填，
+                # 闲置前的历史从第 2 轮起彻底丢失。写回失败按原路径继续。
+                try:
+                    for item in recent:
+                        role = item.get("role")
+                        content = item.get("content")
+                        if role not in ("user", "assistant") or not isinstance(
+                            content, str
+                        ):
+                            continue
+                        self.memory.short_term.add_message(role, content)
+                except Exception:  # noqa: BLE001 - 写回失败不影响本轮
+                    logger.debug("回填历史写回短期记忆失败", exc_info=True)
         return preferences, recent
 
     async def _call_with_resilience(
