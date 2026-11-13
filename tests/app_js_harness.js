@@ -215,6 +215,16 @@ function buildEnv(source) {
     Blob: class Blob {},
     File: class File {},
     FormData: class FormData {},
+    AbortController: class AbortController {
+      constructor() {
+        this.signal = {};
+        this.aborted = false;
+      }
+
+      abort() {
+        this.aborted = true;
+      }
+    },
     __toasts: [],
     __showWelcome: 0,
     __requests: [],
@@ -1825,6 +1835,72 @@ async function scenarioUpcomingWeather(source) {
   return results;
 }
 
+async function scenarioHttpError(source) {
+  const runScenario = async (status, detail) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      __reconcileCalls = [];
+      refreshStatus = async () => {};
+      loadSessions = async () => {};
+      state.ready = true;
+      state.userId = "u1";
+      state.sessionId = "s1";
+      state.partialHistory = false;
+      fetch = async (url) => {
+        if (String(url).includes("/api/chat/stream")) {
+          return {
+            ok: false,
+            status: ${status},
+            json: async () => ({ detail: ${JSON.stringify(detail)} }),
+            body: null,
+          };
+        }
+        __reconcileCalls.push(String(url));
+        return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+      };
+    `);
+    await run(`sendMessage("你好")`);
+    // 旧实现会在 600ms 后触发停止对账；等待足够长时间确认没有发生
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    return run(`({
+      toasts: __toasts.slice(),
+      healthText: els.healthText.textContent,
+      healthClass: els.health.className,
+      reconcileCalls: __reconcileCalls.slice(),
+    })`);
+  };
+  return {
+    rateLimited: await runScenario(429, "请求过于频繁，请稍后再试"),
+    unavailable: await runScenario(503, "同一用户已有对话正在进行"),
+  };
+}
+
+async function scenarioInitStale(source) {
+  const env = buildEnv(source);
+  return runIn(
+    env,
+    `(async () => {
+      refreshHealth = async () => {};
+      refreshStatus = async () => {};
+      loadSessions = async () => {};
+      sessionStorage.setItem("aligo.sessionId", "T");
+      state.sessionId = "T";
+      state.ready = false;
+      const pending = init();
+      // 模拟初始化期间用户点击了其它会话（加载失败、从未渲染）
+      sessionLoadToken += 1;
+      await pending;
+      return {
+        ready: state.ready,
+        sessionId: state.sessionId,
+        stored: sessionStorage.getItem("aligo.sessionId"),
+        welcomeShown: __showWelcome,
+      };
+    })()`
+  );
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1893,6 +1969,10 @@ async function main() {
     payload = await scenarioUserBackupDecode(source);
   } else if (scenario === "upcomingWeather") {
     payload = await scenarioUpcomingWeather(source);
+  } else if (scenario === "httpError") {
+    payload = await scenarioHttpError(source);
+  } else if (scenario === "initStale") {
+    payload = await scenarioInitStale(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

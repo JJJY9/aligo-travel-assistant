@@ -2844,8 +2844,14 @@ def _md_inline(value: object) -> str:
     """
     text = strip_terminal_controls(value if value is not None else "")
     cleaned = " ".join(text.split())
+    # 反斜杠必须先转义：用户可控值里的 ``\]`` 若只把 ] 换成 ``\]``，会
+    # 变成 ``\\]``——CommonMark 解析为「转义反斜杠 + 未转义右括号」，
+    # 链接 / 图片语法重新闭合（导出文件可渲染成钓鱼链接 / 自动加载图片）
     return (
-        cleaned.replace("<", "&lt;").replace(">", "&gt;").replace("]", "\\]")
+        cleaned.replace("\\", "\\\\")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("]", "\\]")
     )
 
 

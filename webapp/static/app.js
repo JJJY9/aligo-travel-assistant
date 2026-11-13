@@ -296,6 +296,10 @@ const els = {
 
 let welcomeTemplate = null;
 let sessionLoadToken = 0;
+// 每次会话加载的 AbortController：新加载开始即中止上一次在途请求。
+// 旧请求的结果本就会按 token 丢弃，主动中止还能让等待它 settle 的调用方
+// （启动恢复）立即返回，不会把 state.ready 卡到旧请求超时
+let sessionLoadController = null;
 let sessionsRequestId = 0;
 let statusRequestId = 0;
 // 行程列表（展开全部 / 状态刷新时的二次请求）共用序号：只应用最新一次结果，
@@ -492,6 +496,16 @@ async function errorMessage(response) {
     /* 保留默认错误信息 */
   }
   return detail;
+}
+
+// 服务端已明确响应的错误（429 / 503 / 422 等）：与「连接中断」区分开，
+// 便于调用方决定是否执行停止对账 / 回填输入 / 标记健康状态
+class HttpError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
 }
 
 /* ---------- 安全的 Markdown 渲染 ----------
@@ -2552,6 +2566,8 @@ async function openSession(sessionId, options = {}) {
   const previousScrollTop = els.scroll.scrollTop;
   const wasAtBottom = atBottom();
   const token = ++sessionLoadToken;
+  if (sessionLoadController) sessionLoadController.abort();
+  sessionLoadController = new AbortController();
   state.sessionLoading = true;
   state.sessionLoadingId = sessionId;
   // 加载期间隐藏旧会话的「编辑」入口，避免点击后无反馈
@@ -2559,6 +2575,7 @@ async function openSession(sessionId, options = {}) {
   try {
     const data = await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+      { signal: sessionLoadController.signal },
     );
     // 加载期间用户可能已开始新对话或切换会话，避免覆盖当前界面
     if (state.busy || token !== sessionLoadToken) return;
@@ -2760,6 +2777,8 @@ async function openSession(sessionId, options = {}) {
     closeMobileSidebar();
     return true;
   } catch (error) {
+    // 被后续加载主动中止：这不是失败，静默返回（finally 按 token 清理状态）
+    if (error && error.name === "AbortError") return false;
     // 请求已被新对话 / 会话切换作废：过期的失败不能在当前界面弹提示
     if (token !== sessionLoadToken || state.busy) return false;
     if (!options.silent) {
@@ -2943,10 +2962,16 @@ async function sendMessage(text, options = {}) {
   if (state.partialHistory && state.sessionId) {
     // 搜索命中视图只渲染了会话中间一段：直接发送会把新问答接在窗口末尾、
     // 中间历史缺失（发送后的静默重载还会把整段中间一起补渲染）。先回到
-    // 最新的尾部窗口再发送
-    await openSession(state.sessionId);
-    if (state.sessionLoading) {
-      toast("会话正在加载，请稍候");
+    // 最新的尾部窗口再发送。等待期间用户可能切换到别的会话：恢复完成后
+    // 目标会话已变时必须中止，不能把提问写进刚打开的会话
+    const targetSessionId = state.sessionId;
+    const loaded = await openSession(targetSessionId);
+    if (
+      loaded === false ||
+      state.sessionId !== targetSessionId ||
+      state.sessionLoading
+    ) {
+      toast("会话已切换或加载失败，请重试");
       return;
     }
   }
@@ -3007,7 +3032,7 @@ async function sendMessage(text, options = {}) {
         resetDeletedSessionState(message);
         toast("会话已被删除，下一条消息将开始新对话");
       }
-      throw new Error(detail);
+      throw new HttpError(detail, response.status);
     }
     await readEventStream(response.body, (event) => {
       // 已收到 done / error 后忽略后续事件：连接错误不能覆盖已完成的回答
@@ -3046,10 +3071,28 @@ async function sendMessage(text, options = {}) {
           resizeInput();
         }
       }
-    } else if (!terminal) {
+    } else if (error && error.name === "HttpError") {
+      // 服务端已明确响应（429 限流 / 503 锁占用 / 422 校验等）：不是连接
+      // 中断。展示服务端原因，不执行停止对账（服务端没有执行本轮，重发
+      // 由用户决定），也不把顶栏健康状态改成「连接异常」
       mutate(() => {
-        assistant.trace.fail(error.message || "请求失败");
-        assistant.fail(error.message || "请求失败，请稍后再试。");
+        assistant.trace.fail(error.message);
+        assistant.fail(error.message);
+      });
+    } else if (!terminal) {
+      // 浏览器原生网络错误文案（Failed to fetch / Load failed）直接展示
+      // 成英文且不解释，统一改成中文兜底
+      const reason =
+        error &&
+        error.message &&
+        !/failed to fetch|load failed|networkerror|network request failed/i.test(
+          error.message,
+        )
+          ? error.message
+          : "无法连接服务器，请检查网络后重试";
+      mutate(() => {
+        assistant.trace.fail(reason);
+        assistant.fail(reason);
       });
       els.health.className = "health err";
       els.healthText.textContent = "连接异常";
@@ -4245,7 +4288,12 @@ function startEditPreference(row, type, currentValue) {
   let settled = false;
 
   const focusRowEdit = () => {
-    // 行内编辑框被替换掉后焦点会落到 body：还原本行的「编辑」按钮
+    // 行内编辑框被替换掉后焦点会落到 body：还原本行的「编辑」按钮。
+    // 只有焦点确实丢失（body / 无）时才抢回：保存其它行触发的一次刷新
+    // 可能让本行重新挂载，若无条件 focus，会把另一个正在编辑的行的输入框
+    // blur 掉（blur → cancel），用户刚输入的偏好被静默丢弃
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
     const editButton = row.querySelector('button[title="编辑偏好"]');
     if (editButton) editButton.focus();
   };
@@ -6127,6 +6175,19 @@ async function init() {
     if (state.sessionId) {
       await openSession(state.sessionId, { silent: true });
     } else {
+      showWelcome();
+    }
+  } else {
+    // 用户的点击作废了启动恢复：若当前会话从未被渲染（例如点击的会话
+    // 加载失败 / 是幽灵空会话），清掉旧会话 ID——后续发送不能写进界面
+    // 从未展示过的隐藏会话；已成功加载并展示的会话保持不变
+    const displayed =
+      state.renderedStart && state.renderedStart.sessionId === state.sessionId;
+    if (!displayed) {
+      state.sessionId = null;
+      state.partialHistory = false;
+      state.renderedStart = null;
+      safeStorageRemove("session", "aligo.sessionId");
       showWelcome();
     }
   }

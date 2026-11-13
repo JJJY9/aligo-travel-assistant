@@ -1966,6 +1966,11 @@ def test_markdown_export_strips_terminal_controls():
     link = server_module._md_inline("[点我](https://phish.example)")
     assert link.count("]") == link.count("\\]")
     assert "\\](https" in link
+    # 用户可控值里的 ``\]`` 必须先转义反斜杠：否则会拼成 ``\\]``，CommonMark
+    # 解析为「转义反斜杠 + 未转义右括号」，链接重新闭合
+    tricky = server_module._md_inline("[点我\\](https://phish.example)")
+    closing = tricky.index("](https")
+    assert tricky[closing - 3 : closing] == "\\\\\\", tricky
     print("✓ Markdown 导出剥离终端控制序列")
 
 
