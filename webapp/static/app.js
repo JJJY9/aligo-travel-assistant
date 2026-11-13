@@ -130,6 +130,9 @@ const state = {
   // 当前 DOM 只渲染到搜索命中窗口、会话更新部分尚未渲染：此期间会话末尾
   // 不在 DOM 中，编辑 / 重新生成会指向错误的「最后一轮」，一律隐藏
   partialHistory: false,
+  // 上一轮回答因会话被删除而未落库、仍显示在消息区：下一条消息属于新
+  // 会话，发送前清空该线程（否则两个服务端会话的历史混在一起）
+  retiredThreadVisible: false,
   // 正在删除的会话 id：双击确认不能重复发 DELETE（计数会被减两次）
   deletingSessions: new Set(),
   // 偏好编辑被取消时置位：刷新被有意跳过，面板关闭时补一次
@@ -593,8 +596,18 @@ function splitTableRow(line) {
   return cells;
 }
 
+const MAX_MARKDOWN_CHARS = 200000;
+
 function renderMarkdown(text) {
-  const lines = String(text ?? "").split("\n");
+  let source = String(text ?? "");
+  let truncated = false;
+  if (source.length > MAX_MARKDOWN_CHARS) {
+    // 备份恢复允许单条消息接近 50MB：整段同步转义 + 正则扫描会在打开
+    // 会话时把主线程冻结数秒。截断显示，完整内容仍保留在存储与导出里
+    source = source.slice(0, MAX_MARKDOWN_CHARS);
+    truncated = true;
+  }
+  const lines = source.split("\n");
   const out = [];
   const paragraph = [];
   let index = 0;
@@ -719,6 +732,11 @@ function renderMarkdown(text) {
   }
 
   flushParagraph();
+  if (truncated) {
+    out.push(
+      '<p class="md-truncated">（消息过长，已截断显示；完整内容见导出文件）</p>',
+    );
+  }
   return out.join("\n");
 }
 
@@ -2110,6 +2128,7 @@ function newSession() {
   state.sessionLoadingId = null;
   state.sessionId = null;
   state.partialHistory = false;
+  state.retiredThreadVisible = false;
   safeStorageRemove("session", "aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
@@ -2499,19 +2518,21 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     // 存储故障 / 网络抖动不能伪装成「没有历史」：保留已有列表并提示
     toast(`加载会话列表失败：${error.message || error}`);
     if (!state.sessions.length) {
+      // 空列表也要让调用方（归档切换）知道失败并回滚状态位
       state.sessionTotal = 0;
       state.archivedMatches = 0;
       els.history.innerHTML =
         '<div class="history-empty">加载会话列表失败，请稍后重试</div>';
-      return;
+      return false;
     }
     renderHistory();
-    return;
+    return false;
   }
   if (requestId !== sessionsRequestId) return;
   state.sessionsLoading = false;
   state.archivedMatches = archivedMatches;
   renderHistory();
+  return true;
 }
 
 async function loadMoreSessions() {
@@ -2609,6 +2630,15 @@ async function openSession(sessionId, options = {}) {
     const session = state.sessions.find((item) => item.session_id === sessionId);
     setConversationTitle(session ? session.title : data.title || "对话");
 
+    // 先快照上次渲染状态：下面会清零 partialHistory，无法再区分「上次
+    // 窗口本就不含末尾（搜索命中 / 手动收起）」与「上次渲染到末尾、
+    // 之后又有新消息落库」——后者复用旧上界会把刚落库的整轮问答藏进
+    // 「显示更新消息」并误置 partialHistory（编辑 / 重新生成全部消失）
+    const previousRender =
+      state.renderedStart && state.renderedStart.sessionId === sessionId
+        ? state.renderedStart
+        : null;
+    const previousPartial = Boolean(previousRender && state.partialHistory);
     els.messages.innerHTML = "";
     state.partialHistory = false;
     // 大历史按窗口渲染：整段同步逐条 renderMarkdown + innerHTML 会冻结主线程
@@ -2640,14 +2670,15 @@ async function openSession(sessionId, options = {}) {
     }
     if (
       options.silent &&
-      state.renderedStart &&
-      state.renderedStart.sessionId === sessionId &&
-      Number(state.renderedStart.end) > renderStart &&
-      Number(state.renderedStart.end) < totalMessages
+      previousPartial &&
+      Number(previousRender.end) > renderStart &&
+      Number(previousRender.end) < totalMessages
     ) {
-      // 搜索命中窗口的静默重载：同时恢复窗口上界，不能把「命中处到会话
-      // 结尾」整段同步渲染（#713 消除的整段渲染冻结）
-      renderEnd = Number(state.renderedStart.end);
+      // 上次本就是不完整的窗口（搜索命中 / 用户手动收起）：静默重载恢复
+      // 同一上界，不能把「命中处到会话结尾」整段同步渲染（#713 消除的
+      // 整段渲染冻结）。上次已渲染到末尾时绝不复用旧上界——新落库的
+      // 消息必须立即可见
+      renderEnd = Number(previousRender.end);
     }
     const pairTextBefore = (index) => {
       for (let i = index - 1; i >= 0; i -= 1) {
@@ -2739,6 +2770,9 @@ async function openSession(sessionId, options = {}) {
         const newer = buildNodes(renderEnd, nextEnd);
         newer.nodes.forEach((node) => els.messages.insertBefore(node, laterButton));
         renderEnd = nextEnd;
+        // 与「显示更早消息」同口径：窗口状态必须跟随 DOM，否则下一次
+        // 静默重载会按旧上界把刚展开的末尾重新折叠
+        state.renderedStart = { sessionId, start: renderStart, end: renderEnd };
         if (renderEnd >= totalMessages) {
           laterButton.remove();
           laterButton = null;
@@ -2978,6 +3012,12 @@ async function sendMessage(text, options = {}) {
     }
   }
   const draft = els.input.value;
+  if (
+    document.querySelector(".user-edit-input") &&
+    !window.confirm("正在编辑的修改尚未保存，发送新消息将丢弃修改。继续？")
+  ) {
+    return;
+  }
 
   cancelPendingEdits();
   sessionLoadToken += 1;
@@ -2988,6 +3028,12 @@ async function sendMessage(text, options = {}) {
   document.querySelectorAll(".follow-ups").forEach((row) => row.remove());
 
   mutate(() => {
+    if (state.retiredThreadVisible) {
+      // 上一轮回答因会话被删除而未落库：可见线程不属于接下来的新会话，
+      // 从干净线程开始，避免两个服务端会话的历史混在一起
+      state.retiredThreadVisible = false;
+      els.messages.innerHTML = "";
+    }
     hideWelcome();
     if (options.echo !== false) {
       els.messages.appendChild(renderUserNode(message));
@@ -3318,6 +3364,7 @@ function resetDeletedSessionState(restoreText) {
   state.sessionId = null;
   state.partialHistory = false;
   state.renderedStart = null;
+  state.retiredThreadVisible = false;
   safeStorageRemove("session", "aligo.sessionId");
   syncSessionControls();
   setConversationTitle("新对话");
@@ -3399,6 +3446,10 @@ function handleStreamEvent(assistant, event, userText) {
         state.sessionId = null;
         state.partialHistory = false;
         state.renderedStart = null;
+        // 可见线程属于已删除的会话：下一条消息属于新会话，发送前清空
+        // 该线程；标题同步复位（否则新会话的问答挂在旧标题下）
+        state.retiredThreadVisible = true;
+        setConversationTitle("新对话");
         safeStorageRemove("session", "aligo.sessionId");
         syncSessionControls();
         toast("会话已在其它窗口或终端删除，本轮回答未保存");
@@ -5714,6 +5765,7 @@ async function saveUser() {
     state.sessionId = null;
     state.partialHistory = false;
     state.renderedStart = null;
+    state.retiredThreadVisible = false;
     safeStorageRemove("session", "aligo.sessionId");
     syncSessionControls();
     setConversationTitle("新对话");
@@ -5832,10 +5884,17 @@ function bindEvents() {
   });
 
   byId("newSession").addEventListener("click", newSession);
-  els.archivedToggle.addEventListener("click", () => {
-    state.showArchived = !state.showArchived;
+  els.archivedToggle.addEventListener("click", async () => {
+    const previous = state.showArchived;
+    state.showArchived = !previous;
     updateArchivedToggle();
-    loadSessions(state.searchQuery, { reset: true });
+    const ok = await loadSessions(state.searchQuery, { reset: true });
+    if (ok === false) {
+      // 列表仍是旧视图的数据：状态位必须回滚，否则分组 / 按钮态 / 分页
+      // 口径与真实列表互相矛盾
+      state.showArchived = previous;
+      updateArchivedToggle();
+    }
   });
   byId("brandHome").addEventListener("click", (event) => {
     event.preventDefault();
@@ -6194,6 +6253,31 @@ async function init() {
   if (state.ready || (sessionLoadToken === initToken && state.sessionId === initSessionId)) {
     if (state.sessionId) {
       await openSession(state.sessionId, { silent: true });
+      // 静默恢复期间用户可能点击了别的会话：恢复被中止、或点击的会话
+      // 加载失败时，sessionId 仍是启动快照 / 点击目标而界面从未展示它，
+      // 必须清掉，否则下一条消息写进隐藏会话
+      const displayed =
+        state.renderedStart && state.renderedStart.sessionId === state.sessionId;
+      if (
+        (sessionLoadToken !== initToken ||
+          state.sessionId !== initSessionId) &&
+        !displayed
+      ) {
+        state.sessionId = null;
+        state.partialHistory = false;
+        state.renderedStart = null;
+        state.retiredThreadVisible = false;
+        safeStorageRemove("session", "aligo.sessionId");
+        showWelcome();
+      } else if (!displayed) {
+        // 恢复目标本身加载失败（网络 / 503）：会话从未展示，同样不能把
+        // 后续消息写进去
+        state.sessionId = null;
+        state.partialHistory = false;
+        state.retiredThreadVisible = false;
+        safeStorageRemove("session", "aligo.sessionId");
+        showWelcome();
+      }
     } else {
       showWelcome();
     }

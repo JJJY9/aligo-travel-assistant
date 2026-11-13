@@ -182,6 +182,70 @@ def test_silent_reload_restores_expanded_window():
     print("✓ 静默重载恢复已展开的历史窗口")
 
 
+def test_silent_reload_shows_appended_messages_and_keeps_expansion():
+    """静默重载不能把新落库的消息藏进「显示更新消息」，也不能折叠已展开的末尾。"""
+    data = _run_harness("silentAppendWindow")
+    # 上次渲染到末尾后又落库两条：必须立即可见、partialHistory 保持 false
+    assert data["initial"] == {
+        "count": 10,
+        "partial": False,
+        "laterText": "",
+        "renderedEnd": 10,
+    }, data["initial"]
+    assert data["afterAppend"]["count"] == 12, data["afterAppend"]
+    assert data["afterAppend"]["partial"] is False, data["afterAppend"]
+    assert data["afterAppend"]["laterText"] == "", data["afterAppend"]
+
+    # 搜索命中窗口 → 手动展开到末尾 → 静默重载仍保持完整窗口
+    assert data["windowInitial"]["count"] == 200, data["windowInitial"]
+    assert data["windowInitial"]["partial"] is True, data["windowInitial"]
+    assert data["expanded"]["count"] == 600, data["expanded"]
+    assert data["expanded"]["renderedEnd"] == 600, data["expanded"]
+    assert data["afterExpandReload"]["count"] == 600, data["afterExpandReload"]
+    assert data["afterExpandReload"]["partial"] is False, data["afterExpandReload"]
+    print("✓ 静默重载揭示新消息且不折叠已展开窗口")
+
+
+def test_deleted_session_thread_starts_clean_on_next_send():
+    """persisted=false 后保留可见回答，但下一条消息必须从干净线程开始。"""
+    data = _run_harness("deletedThreadSend")
+    assert data["veto"]["sessionId"] is None, data["veto"]
+    assert data["veto"]["retired"] is True, data["veto"]
+    sent = data["afterSend"]
+    assert sent["retired"] is False, sent
+    assert sent["sessionId"] == "s-new", sent
+    assert sent["sentinelRemoved"] is True, "旧线程节点必须先清空再开始新轮"
+    assert sent["roles"] == ["user"], sent
+    print("✓ 已删除会话的下一轮从干净线程开始")
+
+
+def test_render_markdown_caps_oversized_message():
+    """超大单条消息截断渲染（防止打开会话冻结主线程），常规消息不受影响。"""
+    data = _run_harness("renderCap")
+    assert data["cut"] is True, data
+    assert data["cappedLength"] < 260000, data["cappedLength"]
+    assert data["normalUntouched"] is True, data
+    print("✓ Markdown 渲染长度上限")
+
+
+def test_archived_toggle_rolls_back_on_failure():
+    """归档视图切换失败时回滚状态位，视图与按钮态保持一致。"""
+    data = _run_harness("archivedRollback")
+    assert data["showArchived"] is False, data
+    assert any("加载会话列表失败" in item for item in data["toasts"]), data
+    print("✓ 归档切换失败回滚")
+
+
+def test_send_message_confirms_pending_edit_draft():
+    """存在未保存的行内编辑时，直接发送要先确认；取消则什么都不发。"""
+    data = _run_harness("draftSendGuard")
+    rejected = data["rejected"]
+    assert rejected["fetchCalls"] == 0, rejected
+    assert "尚未保存" in rejected["confirmText"], rejected
+    assert rejected["inputValue"] == "新提问", rejected
+    print("✓ 发送前确认未保存的编辑草稿")
+
+
 def test_search_failure_restores_previous_query():
     """搜索失败后查询词回到旧值，列表与「加载更多」保持同一查询口径。"""
     data = _run_harness("sessionSearchFailure")
