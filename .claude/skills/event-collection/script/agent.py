@@ -17,6 +17,8 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.llm_resilience import is_retriable_error
+from utils.user_query import extract_user_query
 from utils.json_parser import (
     extract_json_from_async_response,
     first_json_object_with_keys,
@@ -113,10 +115,12 @@ class EventCollectionAgent(AgentBase):
                 if not isinstance(user_preferences, dict):
                     user_preferences = {}
             else:
-                user_query = content
+                user_query = extract_user_query(content)
                 user_preferences = {}
         else:
-            user_query = str(content)
+            # agentscope content block 列表 / dict：拼出文本，不能 str() 成
+            # Python repr 当作用户查询
+            user_query = extract_user_query(content)
             user_preferences = {}
 
         # 构建用户背景信息
@@ -192,6 +196,8 @@ class EventCollectionAgent(AgentBase):
 
             # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
             text = await extract_json_from_async_response(response)
+            if not text or not str(text).strip():
+                raise ConnectionError("模型返回空响应")
 
             # 清理文本，移除markdown代码块标记
             text = text.strip()
@@ -219,6 +225,9 @@ class EventCollectionAgent(AgentBase):
             if result is None:
                 raise ValueError("模型输出中没有可解析的事项结果对象")
         except Exception as e:
+            if is_retriable_error(e):
+                # 瞬时模型错误穿透给编排层重试 / 熔断，不吞成结果 JSON
+                raise
             logger.error(f"Event collection failed: {e}")
             result = {
                 "missing_info": ["所有信息"],

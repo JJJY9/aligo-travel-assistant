@@ -15,6 +15,14 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.llm_resilience import is_retriable_error
+from utils.preference_values import (
+    EXPLANATORY_PREF_KEYS,
+    has_preference_value,
+    is_manageable_pref_type,
+    merge_preference_value,
+)
+from utils.user_query import extract_user_query
 from utils.json_parser import (
     extract_json_from_async_response,
     first_json_array_with_keys,
@@ -23,6 +31,82 @@ from utils.json_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _has_unclosed_array(text: str) -> bool:
+    """文本里是否存在未闭合的 JSON 数组（模型输出被 max_tokens 截断）。
+
+    回显示例对象在前、正式裸数组在后且被截断时，示例对象自带的
+    preferences 数组会绕过对象截断守卫被当成正式结果——必须先拒绝这种
+    截断输出，让技能返回明确错误而不是把示例偏好写进长期记忆。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+    return depth > 0
+
+
+def _normalize_preference_items(items: list) -> list[dict]:
+    """按 type 合并条目，避免同类型逐条覆盖只剩最后一条。"""
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "type" not in item and "value" not in item:
+            pairs = [
+                (key, value)
+                for key, value in item.items()
+                if key not in EXPLANATORY_PREF_KEYS
+                and is_manageable_pref_type(key)
+                and has_preference_value(value)
+            ]
+            if len(pairs) == 1:
+                item = {"type": pairs[0][0], "value": pairs[0][1]}
+            else:
+                continue
+        pref_type = str(item.get("type") or "").strip()
+        value = item.get("value")
+        if not is_manageable_pref_type(pref_type) or not has_preference_value(
+            value
+        ):
+            continue
+        action = str(item.get("action") or "replace").strip().lower()
+        is_append = action in {"append", "add", "追加"}
+        had_action = "action" in item
+        if pref_type in merged:
+            entry = merged[pref_type]
+            entry["value"] = merge_preference_value(entry.get("value"), value)
+            if is_append or entry.get("action") == "append":
+                entry["action"] = "append"
+            elif had_action or "action" in entry:
+                entry["action"] = "replace"
+            else:
+                entry.pop("action", None)
+        else:
+            entry = {"type": pref_type, "value": value}
+            if is_append:
+                entry["action"] = "append"
+            elif had_action:
+                entry["action"] = "replace"
+            merged[pref_type] = entry
+            order.append(pref_type)
+    return [merged[pref_type] for pref_type in order]
 
 
 def _last_preference_array(text: str) -> tuple[int, list[dict]] | None:
@@ -52,7 +136,7 @@ def _last_preference_array(text: str) -> tuple[int, list[dict]] | None:
 
 
 def _as_preference_result(obj: object) -> dict | None:
-    """取出结果对象；兼容 ``{"data": {preferences...}}`` 包装。"""
+    """取出结果对象；兼容 ``{"data": {preferences...}}`` 包装及常见偏差形状。"""
     if not isinstance(obj, dict):
         return None
     data = obj.get("data")
@@ -62,8 +146,33 @@ def _as_preference_result(obj: object) -> dict | None:
         and ("preferences" in data or "has_preferences" in data)
         else obj
     )
+    preferences = candidate.get("preferences")
+    if isinstance(preferences, list):
+        return {
+            **candidate,
+            "preferences": _normalize_preference_items(preferences),
+        }
     if "preferences" in candidate or "has_preferences" in candidate:
         return candidate
+    # 模型常见单对象偏差：{"type": ..., "value": ..., "action": ...}
+    if "type" in obj and "value" in obj:
+        return {
+            "preferences": _normalize_preference_items([obj]),
+            "has_preferences": True,
+        }
+    # 旧格式 {类型: 值} 字典（只挑可管理的偏好键）
+    legacy = [
+        {"type": key, "value": value}
+        for key, value in obj.items()
+        if key not in EXPLANATORY_PREF_KEYS
+        and is_manageable_pref_type(key)
+        and has_preference_value(value)
+    ]
+    if legacy:
+        return {
+            "preferences": _normalize_preference_items(legacy),
+            "has_preferences": True,
+        }
     return None
 
 
@@ -107,9 +216,9 @@ class PreferenceAgent(AgentBase):
                     or str(data)
                 )
             else:
-                user_query = content
+                user_query = extract_user_query(content)
         else:
-            user_query = str(content)
+            user_query = extract_user_query(content)
 
         # 获取当前已保存的偏好
         current_preferences = {}
@@ -154,6 +263,8 @@ class PreferenceAgent(AgentBase):
 
             # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
             text = await extract_json_from_async_response(response)
+            if not text or not str(text).strip():
+                raise ConnectionError("模型返回空响应")
 
             # 清理文本，移除markdown代码块标记
             text = text.strip()
@@ -161,6 +272,10 @@ class PreferenceAgent(AgentBase):
             text = text.removeprefix('```')
             text = text.removesuffix('```')
             text = text.strip()
+
+            if _has_unclosed_array(text):
+                # 正式裸数组被截断：不能让回显示例对象里的数组顶替
+                raise ValueError("模型输出被截断（数组未闭合）")
 
             # 模型可能先复述示例对象 / 输出示例再给正式结果：优先取
             # 「位置在示例之后」的正式结果——裸数组和结果对象两种形状
@@ -177,7 +292,7 @@ class PreferenceAgent(AgentBase):
                 )
                 if object_hint == -1 or start > object_hint:
                     result = {
-                        "preferences": items,
+                        "preferences": _normalize_preference_items(items),
                         "has_preferences": bool(items),
                     }
             if result is None:
@@ -207,12 +322,14 @@ class PreferenceAgent(AgentBase):
                         item for item in bare_items if isinstance(item, dict)
                     ]
                     result = {
-                        "preferences": items,
+                        "preferences": _normalize_preference_items(items),
                         "has_preferences": bool(items),
                     }
             if result is None:
                 raise ValueError("模型输出中没有可解析的偏好结果对象")
         except Exception as e:
+            if is_retriable_error(e):
+                raise
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}
 

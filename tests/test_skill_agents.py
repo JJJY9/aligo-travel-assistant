@@ -1537,6 +1537,229 @@ def test_memory_query_formats_null_trip_fields():
     print("✓ memory-query 行程字段 null 正常显示")
 
 
+class _PrefMemoryForNewTests:
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+    long_term = _LongTerm()
+
+
+class _PrefLoaderForNewTests:
+    def get_skill_content(self, name):
+        return ""
+
+
+def test_plan_trip_accepts_data_wrapped_itinerary():
+    """{"data": {"itinerary": ...}} 包装的完整行程不能被判成缺少 itinerary。"""
+    data = _plan_trip_reply(
+        '{"data": {"itinerary": {"title": "杭州行", "daily_plans": '
+        '[{"day": 1, "activities": [{"title": "西湖"}]}]}}}'
+    )
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州行"
+    print("✓ plan-trip 接受 data 包装的行程")
+
+
+def test_plan_trip_compacts_assistant_dialogue_with_days():
+    """追问修改：压缩后的上一轮行程仍含逐日安排；用户自己的 JSON 不摘要。"""
+    module = _load_skill_module("plan-trip")
+    messages = [
+        {
+            "role": "user",
+            "content": '{"itinerary": {"title": "用户粘贴", "daily_plans": [{"day": 1}]}}',
+        },
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "results": [
+                        {
+                            "agent_name": "itinerary_planning",
+                            "data": {
+                                "itinerary": {
+                                    "title": "杭州5日游",
+                                    "duration": "5天",
+                                    "daily_plans": [
+                                        {
+                                            "day": 1,
+                                            "activities": [
+                                                {"title": "湖滨步行街"}
+                                            ],
+                                        },
+                                        {
+                                            "day": 2,
+                                            "activities": [{"title": "灵隐寺"}],
+                                        },
+                                        {
+                                            "day": 3,
+                                            "activities": [
+                                                {"title": "西溪湿地"}
+                                            ],
+                                        },
+                                    ],
+                                }
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    compacted = module._compact_recent_dialogue(messages)
+    assistant_text = compacted[1]["content"]
+    assert "湖滨步行街" in assistant_text and "灵隐寺" in assistant_text
+    assert "西溪湿地" in assistant_text
+    assert "用户粘贴" in compacted[0]["content"], "用户消息不能被摘要成占位符"
+    print("✓ 追问压缩保留逐日安排，用户 JSON 不摘要")
+
+
+def test_preference_merges_same_type_entries():
+    """同 type 多条 replace 合并成一条列表值，避免只有最后一条落库。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return json.dumps(
+                {
+                    "preferences": [
+                        {
+                            "type": "hotel_brands",
+                            "value": "汉庭",
+                            "action": "replace",
+                        },
+                        {
+                            "type": "hotel_brands",
+                            "value": "如家",
+                            "action": "replace",
+                        },
+                    ],
+                    "has_preferences": True,
+                },
+                ensure_ascii=False,
+            )
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _PrefLoaderForNewTests()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我喜欢汉庭和如家", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data["preferences"] == [
+        {"type": "hotel_brands", "value": ["汉庭", "如家"], "action": "replace"}
+    ], data
+    print("✓ 同类型多条偏好合并为一条")
+
+
+def test_preference_rejects_truncated_bare_array_after_example():
+    """示例对象 + 截断的正式裸数组：不能把示例偏好当结果写库。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return (
+                '示例：{"has_preferences": true, "preferences": '
+                '[{"type": "hotel_brands", "value": "汉庭"}]}\n'
+                '正式：[{"type": "hotel_brands", "value": "如家", "action": "append"'
+            )
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _PrefLoaderForNewTests()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我还喜欢如家", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is not True, data
+    assert "截断" in str(data.get("error") or ""), data
+    print("✓ 截断裸数组不再使用回显示例")
+
+
+def test_preference_normalizes_legacy_item_shape():
+    """条目形如 {"hotel_brands": "汉庭"} 时规范成 type/value，不静默丢弃。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return '{"preferences": [{"hotel_brands": "汉庭"}], "has_preferences": true}'
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _PrefLoaderForNewTests()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我喜欢汉庭", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data["preferences"] == [{"type": "hotel_brands", "value": "汉庭"}]
+    print("✓ 旧格式条目规范化为 type/value")
+
+
+def test_skill_reraises_retriable_model_errors():
+    """技能不能把 5xx 等可重试模型错误吞成结果 JSON。"""
+    module = _load_skill_module("plan-trip")
+
+    class InternalServerError(Exception):
+        pass
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            raise InternalServerError("Error code: 500 - Internal Server Error")
+
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=_Model()
+    )
+    agent.skill_loader = _PlanTripLoader()
+    with pytest.raises(InternalServerError):
+        asyncio.run(
+            agent.reply(Msg(name="user", content="规划杭州行程", role="user"))
+        )
+    print("✓ 可重试模型错误穿透给编排层")
+
+
+def test_memory_query_prompt_has_date_and_truncates_dialogue():
+    """记忆查询 prompt 带当前日期，最近对话逐条截断。"""
+    module = _load_skill_module("memory-query")
+    captured: dict = {}
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            captured["prompt"] = messages[-1]["content"]
+            return "回答"
+
+    agent = module.MemoryQueryAgent(
+        name="MemoryQueryAgent", model=_Model(), memory_manager=None
+    )
+    agent.skill_loader = type(
+        "L", (), {"get_skill_content": staticmethod(lambda _n: "")}
+    )()
+    payload = {
+        "context": {
+            "rewritten_query": "我去过哪里",
+            "recent_dialogue": [
+                {"role": "assistant", "content": "X" * 5000},
+                {"role": "user", "content": "问题"},
+            ],
+        }
+    }
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="user",
+                content=json.dumps(payload, ensure_ascii=False),
+                role="user",
+            )
+        )
+    )
+    prompt = captured["prompt"]
+    assert "【当前日期】" in prompt and "计划" in prompt
+    assert "X" * 1300 not in prompt, "最近对话必须逐条截断"
+    print("✓ 记忆查询带日期且对话截断")
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
