@@ -982,6 +982,34 @@ def test_closed_stdout_pipe_does_not_traceback():
     print("✓ stdout 管道提前关闭不再 traceback")
 
 
+def test_interactive_memory_follows_data_root(monkeypatch, tmp_path):
+    """交互式 CLI 的长期记忆必须跟随 default_data_root()/memory。"""
+    from utils.paths import default_data_root
+
+    monkeypatch.setenv("ALIGO_DATA_DIR", str(tmp_path))
+    monkeypatch.setitem(cli.LLM_CONFIG, "api_key", "sk-test-key")
+    monkeypatch.setattr(cli, "init_agentscope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli, "create_chat_model", lambda *args, **kwargs: object()
+    )
+    captured: dict = {}
+
+    class _StopInit(Exception):
+        pass
+
+    class _FakeMemoryManager:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            raise _StopInit()
+
+    monkeypatch.setattr(cli, "MemoryManager", _FakeMemoryManager)
+    agent = cli.AligoCLI()
+    monkeypatch.setattr(agent, "_prompt_user_id", lambda: "u-root")
+    with pytest.raises(_StopInit):
+        asyncio.run(agent.initialize_system())
+    assert captured["storage_path"] == str(default_data_root() / "memory")
+    print("✓ 交互式 CLI 长期记忆跟随 default_data_root")
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:

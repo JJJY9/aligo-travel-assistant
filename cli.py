@@ -286,11 +286,15 @@ class AligoCLI:
                 )
                 raise SystemExit(1) from None
 
-            # 初始化记忆管理器（传入LLM模型用于总结）
+            # 初始化记忆管理器（传入LLM模型用于总结）。显式传运行期数据
+            # 目录：默认 "data/memory" 会锚定包根（wheel 下为 site-packages），
+            # 与 Web 面板 / CLI 子命令 / 同一交互会话的 export 读取的
+            # default_data_root()/memory 分叉
             self.memory_manager = MemoryManager(
                 user_id=self.user_id,
                 session_id=self.session_id,
-                llm_model=self.model
+                storage_path=str(default_data_root() / "memory"),
+                llm_model=self.model,
             )
 
             # 初始化意图识别智能体（必须预加载）

@@ -449,5 +449,76 @@ def test_webapp_trips_dedupe_postgres(monkeypatch):
             )
 
 
+def test_update_trip_dedupe_normalizes_crlf_and_propagates_purpose():
+    """update_trip 的路线比较与 save 同口径（CRLF 归一）；新建行程不写默认目的。"""
+    user_id = f"pgtrip-{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        first = store.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "A\r\nB",
+                "start_date": "2026-12-03",
+                "end_date": "2026-12-04",
+            }
+        )
+        second = store.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "C",
+                "start_date": "2026-12-03",
+                "end_date": "2026-12-04",
+            }
+        )
+        # 不同换行写法的同一目的地应判重（与 save_trip_history 同口径）
+        with pytest.raises(ValueError, match="已存在相同行程"):
+            store.update_trip(second, {"destination": "A\nB"})
+
+        trips = {trip["trip_id"]: trip for trip in store.get_trip_history(limit=None)}
+        assert trips[first]["purpose"] is None, "未提供目的时不能写默认「旅游」"
+        before = trips[second]["timestamp"]
+        # 同一行程再次保存（保存路径命中既有行）：timestamp 按保存时刻刷新，
+        # 与 JSON _apply_trip_locked 的更新分支一致
+        assert (
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "C",
+                    "start_date": "2026-12-03",
+                    "end_date": "2026-12-04",
+                    "purpose": "会议",
+                }
+            )
+            == second
+        )
+        after = {
+            trip["trip_id"]: trip for trip in store.get_trip_history(limit=None)
+        }[second]["timestamp"]
+        assert after != before, "保存命中既有行时刷新 timestamp（与 JSON 一致）"
+        print("✓ PG update_trip CRLF 归一 / 无默认目的 / 时间戳刷新")
+    finally:
+        store.delete_all()
+        store.close()
+
+
+def test_add_chat_messages_dedupe_normalizes_integer_session_id():
+    """批量去重的 session_id 与 JSON 同口径（整数与字符串视为同一会话）。"""
+    user_id = f"pgmsg-{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        first = store.add_chat_messages(
+            [{"role": "user", "content": "同一句话", "session_id": 123}],
+            dedupe=True,
+        )
+        second = store.add_chat_messages(
+            [{"role": "user", "content": "同一句话", "session_id": "123"}],
+            dedupe=True,
+        )
+        assert first == 1 and second == 0, (first, second)
+        print("✓ PG 批量消息去重归一整数 session_id")
+    finally:
+        store.delete_all()
+        store.close()
+
 if __name__ == "__main__":
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")

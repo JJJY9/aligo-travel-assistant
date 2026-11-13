@@ -598,13 +598,19 @@ class PostgresLongTermMemory:
                         "WHERE user_id = %s",
                         (self.user_id,),
                     )
+                    def _dedupe_session_key(value: Any) -> str | None:
+                        # 与 JSON context.long_term_memory._session_dedupe_key
+                        # 同口径：旧数据 / 备份里的整数 session_id 字符串化，
+                        # 否则同一会话的恢复消息会被判成新消息重复插入
+                        return None if value is None else str(value)
+
                     existing = Counter(
-                        (session_id, role, content)
+                        (_dedupe_session_key(session_id), role, content)
                         for session_id, role, content in cursor.fetchall()
                     )
                     filtered = []
                     for role, content, session_id, timestamp in rows:
-                        key = (session_id, role, content)
+                        key = (_dedupe_session_key(session_id), role, content)
                         if existing[key] > 0:
                             existing[key] -= 1
                             continue
@@ -944,7 +950,7 @@ class PostgresLongTermMemory:
                             destination,
                             trip.get("start_date"),
                             trip.get("end_date"),
-                            trip.get("purpose") or "旅游",
+                            trip.get("purpose"),
                             trip.get("session_id"),
                             created_at,
                         ),
@@ -1124,7 +1130,8 @@ class PostgresLongTermMemory:
 
     def save_trip_history(self, trip_info: dict[str, Any]) -> str:
         """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。"""
-        purpose = trip_info.get("purpose") or "旅游"
+        # 与 JSON 后端同口径：未提供目的时原样保存（None），不写默认值
+        purpose = trip_info.get("purpose")
         destination = trip_info.get("destination")
         # 会话级 advisory lock：多线程 / 多进程同时写入同一用户时串行生成 trip_N
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
@@ -1133,7 +1140,7 @@ class PostgresLongTermMemory:
     def _save_trip_history_locked(
         self,
         trip_info: dict[str, Any],
-        purpose: str,
+        purpose: str | None,
         destination: Any,
     ) -> str:
         start_conn = getattr(self, "_conn", None)
@@ -1177,13 +1184,28 @@ class PostgresLongTermMemory:
             )
             if existing:
                 # 与 JSON 后端一致：未提供的字段（None）保留原值，不能被默认值
-                # 覆盖（手动补录同一行程会丢失来源会话 / 用户修改过的目的）
+                # 覆盖（手动补录同一行程会丢失来源会话 / 用户修改过的目的）；
+                # timestamp 有值用备份时间、否则按更新时刻刷新（JSON 单条
+                # 保存同样刷新既有记录的 timestamp）
+                updated_timestamp = trip_info.get("timestamp")
+                updated_at = (
+                    _pg_timestamp(updated_timestamp)
+                    if updated_timestamp
+                    and parse_iso_datetime(updated_timestamp) is not None
+                    else None
+                )
                 self._execute(
                     "UPDATE aligo_trips SET "
                     "purpose = COALESCE(%s, purpose), "
-                    "session_id = COALESCE(%s, session_id) "
+                    "session_id = COALESCE(%s, session_id), "
+                    "created_at = COALESCE(%s, now()) "
                     "WHERE id = %s",
-                    (trip_info.get("purpose"), trip_info.get("session_id"), existing[0]),
+                    (
+                        trip_info.get("purpose"),
+                        trip_info.get("session_id"),
+                        updated_at,
+                        existing[0],
+                    ),
                 )
                 return str(existing[1] or "")
 
@@ -1395,11 +1417,22 @@ class PostgresLongTermMemory:
                 # 与 save_trip_history / JSON 后端 _find_same_trip 的去重口径
                 # 一致：历史行可能是未补零日期（2026-1-5），SQL 等值比较会把
                 # 补零后的更新当成不重复；按路线取候选行后在 Python 侧归一比对
+                from utils.trip_import import normalize_identity_text
+
                 candidates = self._fetchall(
                     "SELECT id, start_date, end_date FROM aligo_trips "
-                    "WHERE user_id = %s AND destination = %s "
-                    "AND COALESCE(origin, '') = %s",
-                    (self.user_id, destination, str(merged.get("origin") or "")),
+                    "WHERE user_id = %s "
+                    "AND REPLACE(REPLACE(destination, E'\r\n', E'\n'), "
+                    "E'\r', E'\n') = %s "
+                    "AND REPLACE(REPLACE(COALESCE(origin, ''), E'\r\n', "
+                    "E'\n'), E'\r', E'\n') = %s",
+                    (
+                        self.user_id,
+                        normalize_identity_text(destination),
+                        normalize_identity_text(
+                            str(merged.get("origin") or "")
+                        ),
+                    ),
                 )
                 want_start = normalize_identity_date(start_date)
                 want_end = normalize_identity_date(
