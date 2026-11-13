@@ -1367,7 +1367,7 @@ class AligoCLI:
                 return
             if hasattr(task, "uncancel"):
                 # 取消已送达后回退计数，避免连锁取消（3.11+）
-                while task.cancelling():
+                while task.cancelling():  # type: ignore[attr-defined]  # 3.11+；hasattr 已守卫
                     task.uncancel()
 
         def _abort_startup(message: str) -> None:
