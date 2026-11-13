@@ -10838,6 +10838,39 @@ def test_kb_import_backpressure_rejects_when_busy():
     print("✓ 知识库导入排队已满返回 503")
 
 
+def test_weather_cache_hit_skips_rate_limit(monkeypatch):
+    """缓存命中不产生上游请求：不消耗天气 IP 桶额度；未命中仍受限流保护。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    cached_payload = {"city": "北京", "current": {"description": "晴"}, "daily": []}
+    monkeypatch.setattr(
+        server_module,
+        "peek_cached_weather",
+        lambda city: dict(cached_payload, city=city),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "fetch_weather",
+        lambda city: {"city": city, "current": {}, "daily": []},
+    )
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    app.state.aligo.weather_limiter = RateLimiter(limit=1, window_sec=60)
+    client = TestClient(app)
+
+    # 两次都命中缓存：即便额度只有 1，也不应 429（缓存不耗额度）
+    for _ in range(2):
+        response = client.get("/api/weather", params={"city": "北京"})
+        assert response.status_code == 200, response.text
+
+    # 缓存未命中：恢复按 IP 限流，第二次 429
+    monkeypatch.setattr(server_module, "peek_cached_weather", lambda city: None)
+    assert client.get("/api/weather", params={"city": "上海"}).status_code == 200
+    limited = client.get("/api/weather", params={"city": "广州"})
+    assert limited.status_code == 429
+    assert "Retry-After" in limited.headers
+    print("✓ 天气缓存命中不消耗 IP 桶额度")
+
 if __name__ == "__main__":
     test_index_page()
     test_match_snippet_handles_casefold_length_changes()
@@ -11200,6 +11233,11 @@ if __name__ == "__main__":
     finally:
         _mp_round22c.undo()
     test_session_capacity_rejects_when_all_in_use()
+    _mp_weather_peek = pytest.MonkeyPatch()
+    try:
+        test_weather_cache_hit_skips_rate_limit(_mp_weather_peek)
+    finally:
+        _mp_weather_peek.undo()
     _mp_capacity = pytest.MonkeyPatch()
     try:
         test_chat_maps_session_capacity_to_503(_mp_capacity)

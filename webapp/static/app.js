@@ -4101,7 +4101,9 @@ async function loadUpcomingWeather(city, startDate) {
     // 3 天窗口内优先展示出发日预报，窗口外退回今日
     let forecast = daily.length ? daily[0] : null;
     let forecastLabel = "今日";
-    const start = String(startDate || "").trim();
+    // 历史行程的出发日期可能未补零（2026-11-5），预报日期恒为零填充；
+    // 不归一直接全等比较会匹配不到，卡片退回今日天气
+    const start = normalizeISODate(startDate);
     if (start && daily.length) {
       const match = daily.find((item) => item && item.date === start);
       if (match) {

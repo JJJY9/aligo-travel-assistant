@@ -834,6 +834,139 @@ def test_upstream_window_limits_rotating_cities(monkeypatch):
     print("✓ 全进程上游窗口限制生效")
 
 
+def test_geocode_prefers_trusted_alias_for_foreign_city(monkeypatch):
+    """中文境外城市：zh 索引只有同名小城（伦敦→加拿大 London）时以 en 为准。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        calls.append((url, params))
+        if "geocoding" in url:
+            if params["language"] == "zh":
+                return _Response(
+                    {
+                        "results": [
+                            {
+                                "name": "伦敦",
+                                "latitude": 42.98,
+                                "longitude": -81.25,
+                                "timezone": "America/Toronto",
+                                "population": 422324,
+                                "feature_code": "PPL",
+                            }
+                        ]
+                    }
+                )
+            return _Response(
+                {
+                    "results": [
+                        {
+                            "name": "London",
+                            "latitude": 51.5,
+                            "longitude": -0.12,
+                            "timezone": "Europe/London",
+                            "population": 8961989,
+                            "feature_code": "PPLC",
+                        }
+                    ]
+                }
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    data = weather.fetch_weather("伦敦")
+    assert data["timezone"] == "Europe/London"
+    assert data["city"] == "London"
+    languages = [params["language"] for url, params in calls if "geocoding" in url]
+    assert languages == ["zh", "en"], calls
+    assert calls[-1][1]["latitude"] == 51.5
+    print("✓ 境外中文城市按英文别名改查")
+
+
+def test_geocode_skips_alias_for_trusted_chinese_city(monkeypatch):
+    """中文国内城市 zh 索引已可信：不做英文别名的二次请求。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        calls.append((url, params))
+        if "geocoding" in url:
+            return _Response(
+                {
+                    "results": [
+                        {
+                            "name": params["name"],
+                            "latitude": 30.2,
+                            "longitude": 120.1,
+                            "timezone": "Asia/Shanghai",
+                            "population": 7500000,
+                            "feature_code": "PPLA",
+                        }
+                    ]
+                }
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    data = weather.fetch_weather("杭州")
+    assert data["timezone"] == "Asia/Shanghai"
+    languages = [params["language"] for url, params in calls if "geocoding" in url]
+    assert languages == ["zh"], calls
+    print("✓ 可信中文城市不做别名二次请求")
+
+
+def test_quota_rejection_serves_stale_without_failure_cache(monkeypatch):
+    """全局额度用尽：有旧数据就降级返回，且不按城市钉死失败缓存。"""
+    key = weather._cache_key("杭州")
+    weather._cache[key] = (
+        time.monotonic() - 1200,
+        {"city": "杭州", "current": {"temperature": 20}},
+    )
+    now = time.monotonic()
+    for _ in range(weather._UPSTREAM_MAX_PER_MINUTE):
+        weather._upstream_calls.append(now)
+    calls = []
+    monkeypatch.setattr(
+        weather.requests,
+        "get",
+        lambda *a, **k: calls.append(1) or _Response(_geo()),
+    )
+    data = weather.fetch_weather("杭州")
+    assert data["stale"] is True
+    assert calls == [], "额度用尽不能请求上游"
+    assert "杭州" not in weather._failures, "全局额度错误不能按城市落失败缓存"
+    print("✓ 额度用尽沿用旧数据且不钉死城市")
+
+
+def test_upstream_concurrency_gate_reports_busy(monkeypatch):
+    """在途上游请求达到上限时按繁忙失败，不再并发打 Open-Meteo。"""
+    gate = threading.BoundedSemaphore(1)
+    gate.acquire()
+    monkeypatch.setattr(weather, "_upstream_slots", gate)
+    try:
+        with pytest.raises(weather.WeatherError, match="繁忙"):
+            weather._fetch_weather_uncached("北京", "北京", 0.05)
+    finally:
+        gate.release()
+    print("✓ 上游并发闸门无可用名额时报繁忙")
+
+
+def test_peek_cached_weather_returns_fresh_entry():
+    """端点限流前的缓存探测：只返回新鲜成功结果。"""
+    weather.clear_weather_cache()
+    try:
+        weather._cache["北京"] = (time.monotonic(), {"city": "北京"})
+        assert weather.peek_cached_weather(" 北京 ") == {"city": "北京"}
+        assert weather.peek_cached_weather("   ") is None
+        weather._cache["北京"] = (
+            time.monotonic() - weather.CACHE_TTL_SEC - 1,
+            {"city": "北京"},
+        )
+        assert weather.peek_cached_weather("北京") is None
+    finally:
+        weather.clear_weather_cache()
+    print("✓ peek_cached_weather 只返回新鲜缓存")
+
 if __name__ == "__main__":
     for case in (
         test_stale_fallback_merges_concurrent_requests,
@@ -868,6 +1001,10 @@ if __name__ == "__main__":
         test_follower_rounds_exhausted_reports_busy_without_upstream,
         test_non_finite_upstream_values_raise_weather_error,
         test_upstream_window_limits_rotating_cities,
+        test_geocode_prefers_trusted_alias_for_foreign_city,
+        test_geocode_skips_alias_for_trusted_chinese_city,
+        test_quota_rejection_serves_stale_without_failure_cache,
+        test_upstream_concurrency_gate_reports_busy,
     ):
         mp = pytest.MonkeyPatch()
         try:
@@ -878,4 +1015,5 @@ if __name__ == "__main__":
     test_parse_weather_tolerates_none_daily_entries()
     test_weather_codes_include_freezing_drizzle()
     test_describe_tolerates_non_finite_codes()
+    test_peek_cached_weather_returns_fresh_entry()
     print("\n全部通过")

@@ -1782,6 +1782,44 @@ async function scenarioUserBackupDecode(source) {
   return results;
 }
 
+async function scenarioUpcomingWeather(source) {
+  const results = {};
+  // 未补零出发日期（2026-1-5）也要与零填充预报日期匹配，展示出发日预报
+  {
+    const env = buildEnv(source);
+    const promise = runIn(env, 'loadUpcomingWeather("杭州", "2020-1-5")');
+    await tick();
+    env.__requests[0].resolve({
+      current: { description: "多云", temperature: 18 },
+      daily: [
+        { date: "2020-01-04", description: "晴", min: 10, max: 20 },
+        { date: "2020-01-05", description: "小雨", min: 5, max: 16 },
+        { date: "2020-01-06", description: "阴", min: 6, max: 17 },
+      ],
+    });
+    await promise;
+    results.unpadded = {
+      text: runIn(env, "els.upcomingWeather.textContent"),
+      hidden: runIn(env, "els.upcomingWeather.hidden"),
+    };
+  }
+  // 出发日不在 3 天窗口内：退回今日（daily[0]），标签不是「出发日」
+  {
+    const env = buildEnv(source);
+    const promise = runIn(env, 'loadUpcomingWeather("杭州", "2020-02-01")');
+    await tick();
+    env.__requests[0].resolve({
+      current: {},
+      daily: [{ date: "2020-01-04", description: "晴", min: 10, max: 20 }],
+    });
+    await promise;
+    results.out_of_window = {
+      text: runIn(env, "els.upcomingWeather.textContent"),
+    };
+  }
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1848,6 +1886,8 @@ async function main() {
     payload = await scenarioKbDelete(source);
   } else if (scenario === "userBackupDecode") {
     payload = await scenarioUserBackupDecode(source);
+  } else if (scenario === "upcomingWeather") {
+    payload = await scenarioUpcomingWeather(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

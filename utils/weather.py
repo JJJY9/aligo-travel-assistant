@@ -32,6 +32,83 @@ _FOLLOWER_WAIT_ROUNDS = 3
 # 免费额度（约 600/分钟、5000/小时）打爆，所有用户的天气一起退化
 _UPSTREAM_MAX_PER_MINUTE = 120
 _upstream_calls: deque[float] = deque()
+# Open-Meteo 免费 API 对同一客户端超过 5 个并发上游请求直接 429（排队中的
+# 也计入）：Web 线程池 8 worker 加技能侧每会话 4 worker，跨城市并发未命中
+# 会越过阈值，把一次瞬时 429 固化成一分钟的失败缓存
+_UPSTREAM_MAX_IN_FLIGHT = 5
+_upstream_slots = threading.BoundedSemaphore(_UPSTREAM_MAX_IN_FLIGHT)
+# 中文城市名的地理编码（language=zh）对境外城市排序很差：「罗马」只命中
+# 澳大利亚同名小镇、「东京」命中江苏村庄、「纽约」直接零结果。常去的境外
+# 城市用一个小型别名表改查英文名（language=en 的索引与排序准确）。只收录
+# 中文名——中文国内城市在 zh 索引里本来就准，不需要二次请求
+_CITY_ALIASES_ZH_EN = {
+    "东京": "Tokyo",
+    "大阪": "Osaka",
+    "京都": "Kyoto",
+    "奈良": "Nara",
+    "札幌": "Sapporo",
+    "福冈": "Fukuoka",
+    "名古屋": "Nagoya",
+    "冲绳": "Okinawa",
+    "首尔": "Seoul",
+    "釜山": "Busan",
+    "济州": "Jeju",
+    "新加坡": "Singapore",
+    "曼谷": "Bangkok",
+    "普吉": "Phuket",
+    "清迈": "Chiang Mai",
+    "吉隆坡": "Kuala Lumpur",
+    "雅加达": "Jakarta",
+    "巴厘岛": "Bali",
+    "河内": "Hanoi",
+    "胡志明市": "Ho Chi Minh City",
+    "马尼拉": "Manila",
+    "迪拜": "Dubai",
+    "多哈": "Doha",
+    "阿布扎比": "Abu Dhabi",
+    "纽约": "New York",
+    "洛杉矶": "Los Angeles",
+    "旧金山": "San Francisco",
+    "西雅图": "Seattle",
+    "芝加哥": "Chicago",
+    "波士顿": "Boston",
+    "华盛顿": "Washington",
+    "拉斯维加斯": "Las Vegas",
+    "温哥华": "Vancouver",
+    "多伦多": "Toronto",
+    "伦敦": "London",
+    "巴黎": "Paris",
+    "罗马": "Rome",
+    "米兰": "Milan",
+    "威尼斯": "Venice",
+    "佛罗伦萨": "Florence",
+    "法兰克福": "Frankfurt",
+    "慕尼黑": "Munich",
+    "柏林": "Berlin",
+    "阿姆斯特丹": "Amsterdam",
+    "布鲁塞尔": "Brussels",
+    "苏黎世": "Zurich",
+    "日内瓦": "Geneva",
+    "维也纳": "Vienna",
+    "布拉格": "Prague",
+    "布达佩斯": "Budapest",
+    "马德里": "Madrid",
+    "巴塞罗那": "Barcelona",
+    "里斯本": "Lisbon",
+    "莫斯科": "Moscow",
+    "伊斯坦布尔": "Istanbul",
+    "悉尼": "Sydney",
+    "墨尔本": "Melbourne",
+    "奥克兰": "Auckland",
+    "台北": "Taipei",
+    "香港": "Hong Kong",
+    "澳门": "Macau",
+}
+# 可信的地理编码结果：首都 / 行政中心，或人口达到规模的城市；两者都不满足
+# 说明命中的很可能是同名村庄 / 机场，境外中文名改查英文索引
+_GEO_TRUSTED_FEATURES = frozenset({"PPLC", "PPLA", "PPLA2"})
+_GEO_MIN_TRUSTED_POPULATION = 100_000
+_GEO_FEATURE_PRIORITY = {"PPLC": 0, "PPLA": 1, "PPLA2": 2, "PPL": 3}
 # 缓存条目上限：城市名来自请求参数，不能让缓存随查询过的城市无限增长
 _CACHE_MAX_ENTRIES = 256
 _USER_AGENT = "Mozilla/5.0 (compatible; AligoTravel/1.0)"
@@ -87,6 +164,18 @@ def clear_weather_cache() -> None:
         _failures.clear()
         _degraded.clear()
         _upstream_calls.clear()
+
+
+def peek_cached_weather(city: str) -> dict[str, Any] | None:
+    """返回 10 分钟内的成功缓存；不访问上游、不消耗任何额度。
+
+    端点在限流之前先查缓存：缓存命中不产生上游请求，不应占用为保护
+    Open-Meteo 额度而设的 IP 桶（此前每轮面板刷新都白扣一次额度）。
+    """
+    name = str(city or "").strip()
+    if not name:
+        return None
+    return _cache_hit(_cache_key(name))
 
 
 def _cache_key(name: str) -> str:
@@ -316,11 +405,17 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
                 return degraded
             try:
                 _admit_upstream()
-            except WeatherError as exc:
-                # 全局额度用尽：释放单飞名额并登记短时失败，避免等待者
-                # 继续排队后重复撞额度
+            except WeatherError:
+                # 全局额度用尽：先沿用该城市 1 小时内的成功数据。额度是全局
+                # 状态，不能按城市写失败缓存——否则窗口释放后该城市仍被钉住
+                # 60 秒，额度恢复也看不到天气
                 _finish_fetch(key, event)
-                _store_failure(key, str(exc))
+                entry = _stale_entry(key)
+                if entry is not None:
+                    _stored_at, stale = entry
+                    logger.warning("天气上游额度用尽，沿用最近一次成功数据")
+                    _store_degraded(key, stale)
+                    return stale
                 raise
             break
         # 等待领先线程：成功时缓存已写入，直接复用；失败或降级同理
@@ -358,38 +453,112 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
             _finish_fetch(key, event)
 
 
-def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, Any]:
+def _has_cjk(text: str) -> bool:
+    return any("一" <= char <= "鿿" for char in text)
+
+
+def _is_trusted_location(item: dict[str, Any]) -> bool:
+    feature = str(item.get("feature_code") or "")
+    if feature in _GEO_TRUSTED_FEATURES:
+        return True
     try:
-        geo = _get_json(
-            GEO_URL,
-            {"name": name, "count": 1, "language": "zh", "format": "json"},
-            timeout,
-        )
-        matches = geo.get("results") or []
-        if not matches:
+        population = int(item.get("population") or 0)
+    except (TypeError, ValueError):
+        population = 0
+    return population >= _GEO_MIN_TRUSTED_POPULATION
+
+
+def _best_geocode_match(
+    name: str, candidates: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """按「同名优先 → 人口 → 行政级别」排序，取最可信的一条。"""
+    wanted = name.strip().casefold()
+
+    def rank(item: dict[str, Any]) -> tuple[int, int, int]:
+        item_name = str(item.get("name") or "").strip().casefold()
+        exact = 0 if item_name == wanted else 1
+        try:
+            population = int(item.get("population") or 0)
+        except (TypeError, ValueError):
+            population = 0
+        feature = str(item.get("feature_code") or "")
+        return (exact, -population, _GEO_FEATURE_PRIORITY.get(feature, 4))
+
+    return min(candidates, key=rank)
+
+
+def _geocode_candidates(
+    name: str, language: str, timeout: float
+) -> list[dict[str, Any]]:
+    geo = _get_json(
+        GEO_URL,
+        {"name": name, "count": 10, "language": language, "format": "json"},
+        timeout,
+    )
+    return [item for item in (geo.get("results") or []) if isinstance(item, dict)]
+
+
+def _geocode(name: str, timeout: float) -> dict[str, Any]:
+    """城市名 → 地理编码最优匹配。
+
+    中文名查 zh 索引；别名表里的境外城市同时查 en 索引并优先采用可信的
+    英文结果（zh 索引的境外城市排序/覆盖都不可靠）。
+    """
+    if not _has_cjk(name):
+        candidates = _geocode_candidates(name, "en", timeout)
+        if not candidates:
             raise WeatherError(f"未找到城市「{name}」")
-        location = matches[0]
-        data = _get_json(
-            FORECAST_URL,
-            {
-                "latitude": location["latitude"],
-                "longitude": location["longitude"],
-                "current": "temperature_2m,relative_humidity_2m,weather_code",
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min",
-                "timezone": str(location.get("timezone") or TIMEZONE_DEFAULT),
-                "forecast_days": 3,
-            },
-            timeout,
-        )
-    except requests.RequestException as exc:
-        # requests 的异常文本含完整上游 URL 与查询参数（城市名）：只记
-        # 异常类型，原始异常由 raise ... from 保留给调用栈
-        logger.warning("天气请求失败：%s", type(exc).__name__)
-        raise WeatherError("天气接口暂时不可用") from exc
-    except WeatherError:
-        raise
-    except (KeyError, TypeError, ValueError) as exc:
-        raise WeatherError("天气接口返回格式异常") from exc
+        return _best_geocode_match(name, candidates)
+
+    candidates = _geocode_candidates(name, "zh", timeout)
+    alias = _CITY_ALIASES_ZH_EN.get(name.strip())
+    if alias:
+        # 别名表里的中文境外城市一律以 en 索引为准：zh 索引里可能只有同名
+        # 小城（「伦敦」→ 加拿大 London，人口 42 万，按人口门槛也会被当成
+        # 可信结果），英文索引才能拿到真正的伦敦 / 纽约 / 罗马
+        english = [
+            item
+            for item in _geocode_candidates(alias, "en", timeout)
+            if _is_trusted_location(item)
+        ]
+        if english:
+            return _best_geocode_match(alias, english)
+    if not candidates:
+        raise WeatherError(f"未找到城市「{name}」")
+    return _best_geocode_match(name, candidates)
+
+
+def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, Any]:
+    # 上游并发闸门：Open-Meteo 免费 API 同一客户端超过 5 个并发请求即 429；
+    # 等待超过单个请求超时就按繁忙报错，由上层走 stale / 503
+    if not _upstream_slots.acquire(timeout=timeout):
+        raise WeatherError("天气服务繁忙，请稍后再试")
+    try:
+        try:
+            location = _geocode(name, timeout)
+            data = _get_json(
+                FORECAST_URL,
+                {
+                    "latitude": location["latitude"],
+                    "longitude": location["longitude"],
+                    "current": "temperature_2m,relative_humidity_2m,weather_code",
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+                    "timezone": str(location.get("timezone") or TIMEZONE_DEFAULT),
+                    "forecast_days": 3,
+                },
+                timeout,
+            )
+        except requests.RequestException as exc:
+            # requests 的异常文本含完整上游 URL 与查询参数（城市名）：只记
+            # 异常类型，原始异常由 raise ... from 保留给调用栈
+            logger.warning("天气请求失败：%s", type(exc).__name__)
+            raise WeatherError("天气接口暂时不可用") from exc
+        except WeatherError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WeatherError("天气接口返回格式异常") from exc
+    finally:
+        _upstream_slots.release()
 
     result = _parse_weather(name, location, data)
     _store_cache(key, result)
