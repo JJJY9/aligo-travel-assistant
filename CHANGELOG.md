@@ -48,6 +48,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- wheel 安装的数据目录与本地配置（部署 / CI / 打包评审）：① 新增 `utils.paths.default_data_root()`：源码 checkout 仍为 `<仓库>/data`，wheel 安装改用用户数据目录（Windows `%LOCALAPPDATA%/aligo/data`、其它 `$XDG_DATA_HOME/aligo/data` 或 `~/.local/share/aligo/data`），`ALIGO_DATA_DIR` 可覆盖——此前长期记忆 / 偏好 / 行程写进 site-packages，重建 venv 即丢用户数据，root 属主安装对普通用户只读、长期记忆直接 503；Web 与 CLI 三处 `data/memory` 统一走新目录；② `config_local.py` 在 `sys.path` 不含 CWD（console script / wheel 安装）时按显式路径从运行目录加载——此前按 README 放置的密钥被静默忽略、`aligo-web` 无法启动
 - 短期记忆影子缓存按 Redis TTL 语义过期：与 Redis 最后一次成功交互后闲置超过 `ttl_sec`（默认 1 小时）时清空影子——此前影子只按条数裁剪，Redis 键已过期的会话在降级窗口仍会把旧对话送进模型（多实例删除的会话也可能借影子回放）；持续使用的会话不受影响（按闲置时长而非消息时间戳判断，避免误删早期轮次）
 - Web 备份恢复按**导出实际体积**（indent=2）复核 50 MB 上限：此前只按紧凑请求体判断，恢复一份 50–64 MB（紧凑计）的备份后，该用户的 `/api/export` 会因缩进后体积超限永久 413——现在恢复前以与导出 / CLI `user-import` 相同的 `backup_limit_problem` 口径自检，超限直接 413 并说明原因
 - 编排整轮重试复用已完成智能体（配置/中间件评审 high）：外层 `retry_with_backoff` 重跑整个多智能体编排时，首轮已完成的智能体结果经 `retry_cache` 复用（不再重复调用模型、不再重发其进度事件）——此前任一子智能体的瞬时失败（一次 429/5xx）会让同批已成功的智能体整体重发，单轮账单与耗时最多放大数倍

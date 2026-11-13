@@ -2,7 +2,9 @@
 Configuration for the Aligo Multi-Agent System
 """
 import logging
+import importlib.util
 import os
+from pathlib import Path
 from typing import TypedDict, cast
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,22 @@ if not _api_key:
         # 被静默忽略、各处误报「未配置 API Key」
         if getattr(exc, "name", "") != "config_local":
             raise
+        # wheel / console script 启动时 sys.path 不含当前目录，常规 import
+        # 找不到运行目录下的 config_local.py（README 指导的放置方式）：
+        # 按显式路径加载一次；文件自身报错照常上抛
+        local_file = Path.cwd() / "config_local.py"
+        if local_file.is_file():
+            spec = importlib.util.spec_from_file_location(
+                "config_local", local_file
+            )
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _api_key = (
+                    str(getattr(module, "API_KEY", "") or "")
+                    .replace("\ufeff", "")
+                    .strip()
+                )
 
 
 class LLMConfig(TypedDict):
