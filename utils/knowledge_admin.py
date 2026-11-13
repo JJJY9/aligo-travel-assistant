@@ -1440,6 +1440,12 @@ def _backup_fully_existing(merged: list[Any], existing: Iterable[str]) -> bool:
     return not (Counter(_merged_piece_contents(merged)) - Counter(existing))
 
 
+def _log_safe_group(value: object) -> str:
+    """日志里的文档组名转义：group 来自备份 / 请求的 metadata，原样进日志
+    可含换行 / ANSI 控制序列（伪造日志行、向运维终端注入），统一 json 转义。"""
+    return json.dumps(str(value or ""), ensure_ascii=False)
+
+
 def import_documents(
     documents: list[dict[str, Any]], dry_run: bool = False
 ) -> dict[str, Any]:
@@ -1838,7 +1844,7 @@ def import_documents(
                     # 第二套 part 1..N 写进可能已存在的组
                     logger.warning(
                         "扫描库内分片布局失败，跳过同号组 %s 的导入",
-                        json.dumps(doc_group, ensure_ascii=False),
+                        _log_safe_group(doc_group),
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
@@ -1870,7 +1876,7 @@ def import_documents(
                     logger.warning(
                         "备份中的文档组 %s 与库内同号组内容不同，已跳过该组："
                         "请整份编辑或 kb-delete --group 后重新导入",
-                        json.dumps(doc_group, ensure_ascii=False),
+                        _log_safe_group(doc_group),
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
@@ -1932,7 +1938,9 @@ def import_documents(
                     # 仍可检索；共享片段已在库中 / 本批写入，不重复落库）
                     logger.warning(
                         "文档组 %s 的共享片段属于其它组，缺失分片将以独立片段入库",
-                        doc_group,
+                        # group 来自备份 / 请求的 metadata：原样进日志会让
+                        # 换行 / ANSI 控制序列伪造日志行，与 1841/1873 同口径转义
+                        _log_safe_group(doc_group),
                     )
                     for chunk in missing:
                         meta = dict(chunk.get("metadata") or {})
@@ -1950,7 +1958,7 @@ def import_documents(
                     logger.warning(
                         "备份中的文档组 %s 与库内已有片段布局不一致，已跳过该组："
                         "请整份编辑或 kb-delete --group 后重新导入",
-                        doc_group,
+                        _log_safe_group(doc_group),
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
@@ -1990,7 +1998,7 @@ def import_documents(
                         logger.warning(
                             "备份中的文档组 %s 缺失分片的 part 号已被库内其它内容"
                             "占用，已跳过该组：请整份编辑或 kb-delete --group 后重新导入",
-                            doc_group,
+                            _log_safe_group(doc_group),
                         )
                         existing_counts.update(consumed)
                         conflict += len(missing)

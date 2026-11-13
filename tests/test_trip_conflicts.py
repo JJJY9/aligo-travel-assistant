@@ -216,6 +216,9 @@ def test_inverted_date_range_is_logged(caplog=None):
     """返程早于出发的历史数据静默截成单日，但必须留下告警。"""
     import logging
 
+    from utils import trip_conflicts as module
+
+    module._WARNED_TRIP_ISSUES.clear()
     trip = {
         "trip_id": "trip_inv",
         "start_date": "2026-03-18",
@@ -230,6 +233,44 @@ def test_inverted_date_range_is_logged(caplog=None):
     assert interval is not None
     assert interval[0] == interval[1]
     print("✓ 倒置日期区间记录告警")
+
+
+def test_trip_interval_warns_once_per_bad_value(caplog):
+    """同一脏日期只警告一次：面板全量刷新不再放大成数万条日志。"""
+    import logging
+
+    from utils import trip_conflicts as module
+
+    module._WARNED_TRIP_ISSUES.clear()
+    bad_end = {
+        "trip_id": "t-bad",
+        "start_date": "2030-01-01",
+        "end_date": "下周一",
+    }
+    inverted = {
+        "trip_id": "t-inv",
+        "start_date": "2030-02-10",
+        "end_date": "2030-02-01",
+    }
+    with caplog.at_level(logging.WARNING, logger="utils.trip_conflicts"):
+        caplog.clear()
+        for _ in range(5):
+            assert module.trip_interval(bad_end) is not None
+            assert module.trip_interval(inverted) is not None
+        messages = [record.getMessage() for record in caplog.records]
+    unparsable = [m for m in messages if "无法解析" in m]
+    inverted_hits = [m for m in messages if "早于出发" in m]
+    assert len(unparsable) == 1, messages
+    assert len(inverted_hits) == 1, messages
+    # 不同脏值各自首次仍会告警
+    with caplog.at_level(logging.WARNING, logger="utils.trip_conflicts"):
+        caplog.clear()
+        module.trip_interval(
+            {"trip_id": "t-bad2", "start_date": "2030-01-01", "end_date": "下周"}
+        )
+        assert any("无法解析" in record.getMessage() for record in caplog.records)
+    module._WARNED_TRIP_ISSUES.clear()
+    print("✓ 脏日期警告按值去重（不同值仍逐类告警）")
 
 
 if __name__ == "__main__":

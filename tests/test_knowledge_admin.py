@@ -3242,8 +3242,21 @@ def test_get_document_group_batches_id_queries(monkeypatch):
     in_calls = [item for item in calls if item.startswith("id in")]
     assert len(in_calls) == 1, calls
     print("✓ 整组回填使用一次 id in 批量查询")
+def test_log_safe_group_escapes_control_characters():
+    """日志里的文档组名转义：换行 / ANSI 不能伪造日志行或注入终端序列。"""
+    from utils.knowledge_admin import _log_safe_group
+
+    poisoned = "g1\nFAKE 2026-01-01 ERROR injected \x1b[31mred\x07"
+    rendered = _log_safe_group(poisoned)
+    assert "\n" not in rendered and "\x1b" not in rendered and "\x07" not in rendered
+    assert "FAKE" in rendered  # 内容保留、形态转义
+    assert _log_safe_group(None) == '""'
+    print("✓ 知识库日志的文档组名统一转义")
+
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
+    test_log_safe_group_escapes_control_characters()
     test_load_collection_failure_is_non_fatal()
     test_iter_all_rows_closes_iterator_even_on_error()
     test_restore_pieces_fallbacks()

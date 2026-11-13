@@ -1232,6 +1232,9 @@ def test_trip_conflicts_exclude_id_only_when_unique(monkeypatch):
 
 def test_trip_interval_warns_on_invalid_end(caplog):
     """返程日期非法（历史脏数据）时告警并按出发当日计算。"""
+    from utils import trip_conflicts as module
+
+    module._WARNED_TRIP_ISSUES.clear()
     with caplog.at_level(logging.WARNING, logger="utils.trip_conflicts"):
         interval = trip_interval(
             {"trip_id": "t1", "start_date": "2026-12-01", "end_date": "未知"}
