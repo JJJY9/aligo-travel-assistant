@@ -1910,6 +1910,26 @@ def test_import_rejects_backup_over_size_limit(monkeypatch):
     assert response.headers.get("connection") == "close", response.headers
 
 
+def test_import_rejects_backup_over_export_size(monkeypatch):
+    """请求体紧凑体积达标、按导出格式（indent=2）却超限的备份必须拒绝。"""
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(
+        user_import_module,
+        "backup_limit_problem",
+        lambda backup: "消息 1 条超过导入上限（模拟导出体积超限）",
+    )
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_import_export_cap")},
+        json={"backup": {"preferences": {"home_location": "北京"}}},
+    )
+    assert response.status_code == 413, response.text
+    assert "无法再次导出" in response.json()["detail"]
+    print("✓ 恢复前按导出口径复核体积上限")
+
+
 def test_markdown_export_strips_terminal_controls():
     """Web 用户数据 Markdown 导出剥离 ESC / OSC / BEL（CLI 同口径）。"""
     from webapp import server as server_module
