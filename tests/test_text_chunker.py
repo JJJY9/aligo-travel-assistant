@@ -230,6 +230,25 @@ def test_repo_documents_do_not_mix_sections():
     print("✓ 自带文档切分无混章节块")
 
 
+def test_numbered_list_block_is_body_not_title():
+    """连续编号短行 / 逗号清单是正文，不能整块当标题并入下一章节。"""
+    from utils.text_chunker import _is_title_block, _is_title_like
+
+    assert not _is_title_block("1. 北京\n2. 上海\n3. 广州")
+    assert not _is_title_like("北京，上海，广州")
+    # 单个编号标题（无冒号）保持既有语义：并入正文块
+    assert _is_title_like("1. 一线城市住宿标准")
+    print("✓ 编号列表块与逗号清单按正文处理")
+
+
+def test_punctuation_only_chunks_dropped():
+    """纯标点分片（定长硬切产物）不进索引。"""
+    from utils.text_chunker import split_text
+
+    assert split_text("。" * 500, max_chars=100) == []
+    print("✓ 纯标点分片被丢弃")
+
+
 if __name__ == "__main__":
     test_sections_not_mixed()
     test_faq_questions_separated()
@@ -244,6 +263,8 @@ if __name__ == "__main__":
     test_unpunctuated_sentence_hard_split()
     test_title_only_text_becomes_single_chunk()
     test_numbered_colon_headings_merged_with_body()
+    test_numbered_list_block_is_body_not_title()
+    test_punctuation_only_chunks_dropped()
     test_whitespace_only_chunks_dropped()
     test_merge_edge_branches()
     test_repo_documents_do_not_mix_sections()

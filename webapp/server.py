@@ -2286,6 +2286,22 @@ def _knowledge_unavailable(action: str, exc: Exception) -> HTTPException:
                 "python .claude/skills/ask-question/script/init_knowledge_base.py"
             ),
         )
+    # 可操作的临时状态：导入占用写锁 / 嵌入模型正在加载，给与
+    # /api/knowledge、doctor 一致的提示与 Retry-After，而不是通用 503
+    if "导入进行中" in lowered or "正在加载（首次使用需加载嵌入模型）" in lowered:
+        return HTTPException(
+            status_code=503,
+            detail=redact_paths(str(exc)) or "知识库正在忙，请稍后再试",
+            headers={"Retry-After": "5"},
+        )
+    if "知识库向量维度" in lowered:
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "知识库向量维度与当前嵌入模型不一致，请重新运行初始化脚本重建："
+                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+            ),
+        )
     return _storage_failure(action, exc)
 
 
@@ -3507,7 +3523,7 @@ def create_app(model: Any = None) -> FastAPI:
         payload: KnowledgeUpdatePayload,
         request: Request,
         response: Response,
-        doc_id: int = ApiPath(..., ge=1),
+        doc_id: int = ApiPath(..., ge=1, le=2**63 - 1),
     ) -> dict[str, Any]:
         """更新知识片段（内容重新向量化；片段不存在返回 404）。"""
         response.headers.update(_enforce_kb_rate_limit(state, request))
@@ -3537,7 +3553,7 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/knowledge/documents/{doc_id}/group", dependencies=[Depends(_cross_site_side_effect)])
     def knowledge_document_group(
-        request: Request, response: Response, doc_id: int = ApiPath(..., ge=1)
+        request: Request, response: Response, doc_id: int = ApiPath(..., ge=1, le=2**63 - 1)
     ) -> dict[str, Any]:
         """返回片段所属的整篇文档（多分片按 part 拼接），供整份编辑回填。"""
         response.headers.update(_enforce_kb_rate_limit(state, request))
@@ -3558,7 +3574,7 @@ def create_app(model: Any = None) -> FastAPI:
     def knowledge_delete(
         request: Request,
         response: Response,
-        doc_id: int = ApiPath(..., ge=1),
+        doc_id: int = ApiPath(..., ge=1, le=2**63 - 1),
         group: bool = Query(default=False),
     ) -> dict[str, Any]:
         """按 id 删除知识片段；``group=1`` 时连同同组分片一起删除。"""

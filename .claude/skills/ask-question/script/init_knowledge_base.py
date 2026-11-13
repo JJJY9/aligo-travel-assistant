@@ -100,9 +100,13 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
                 print(f"   ⚠️  跳过空文件: {file_path.name}")
                 continue
 
-            # 提取标题（第一行）
+            # 提取标题（第一行）；元数据值有长度校验（Web PUT / 管理接口
+            # 200 字）：超长首行会把整篇正文复制进每个分片的 title，导致
+            # 该知识在面板 / CLI 编辑时被拒绝
             lines = content.split("\n")
             title = lines[0].strip() if lines else file_path.stem
+            if len(title) > 180:
+                title = title[:179] + "…"
 
             # 根据文件名确定类别
             category = "商旅知识"
@@ -392,14 +396,20 @@ def _discard_created_library(knowledge_base_path: Path) -> None:
     except Exception:  # noqa: BLE001 - 清理尽力而为，不改变退出码语义
         pass
     # milvus-lite 3.x 的本地句柄在 Windows 上可能延迟释放：unlink/rmtree
-    # 一次失败不代表目录删不掉，短暂重试（gc 触发句柄回收）后再放弃
+    # 一次失败不代表目录删不掉，短暂重试（gc 触发句柄回收）后再放弃。
+    # 3.x 的 milvus_lite.db 是「数据目录」而不是文件：Path.unlink 会抛
+    # IsADirectoryError，被当成占用吞掉、rmtree 永远不执行（实测残留）
     import gc
     import time
 
+    db_path = knowledge_base_path / "milvus_lite.db"
     for attempt in range(3):
         gc.collect()
         try:
-            (knowledge_base_path / "milvus_lite.db").unlink(missing_ok=True)
+            if db_path.is_dir():
+                shutil.rmtree(db_path)
+            else:
+                db_path.unlink(missing_ok=True)
             shutil.rmtree(knowledge_base_path)
             return
         except FileNotFoundError:
@@ -409,11 +419,20 @@ def _discard_created_library(knowledge_base_path: Path) -> None:
                 return
             if attempt < 2:
                 time.sleep(0.2)
-    if (knowledge_base_path / "milvus_lite.db").exists():
-        print(
-            "⚠️  无法删除本次新建的知识库文件（文件被占用），"
-            f"请退出后手动删除目录：{knowledge_base_path}"
+    # 仍删不掉（进程内 milvus-lite server 可能持有目录句柄到进程退出）：
+    # 写「待清理」标记，让 default_knowledge_dir 不再把这个空库当作已
+    # 初始化的来源——否则下次初始化会把旧部署的知识库当成已被迁移而跳过
+    try:
+        knowledge_base_path.mkdir(parents=True, exist_ok=True)
+        (knowledge_base_path / ".discard-pending").write_text(
+            "discard-pending", encoding="utf-8"
         )
+    except OSError:
+        pass
+    print(
+        "⚠️  无法立即删除本次新建的知识库（文件被占用，已标记待清理），"
+        f"请退出后手动删除目录：{knowledge_base_path}"
+    )
 
 
 def _drop_collection_for_rebuild(knowledge_base_path: Path) -> None:
@@ -510,6 +529,10 @@ def main() -> int:
         # 否则空 skill 库会在下一次运行抢在旧部署来源之前（见 discard 注释）
         created_knowledge_dir = not knowledge_base_path.exists()
         knowledge_base_path.mkdir(parents=True, exist_ok=True)
+        # 上一次清理失败留下的「待清理」标记：本次重新使用该目录建库，
+        # 清掉标记（本 run 若中止，discard 会重新写入）
+        with contextlib.suppress(OSError):
+            (knowledge_base_path / ".discard-pending").unlink(missing_ok=True)
 
         # 3. 创建 RAG Agent：旧集合维度不一致时先「导出保留片段」再删旧集合
         print("3. 初始化RAG Agent...")
@@ -529,6 +552,10 @@ def main() -> int:
                 if "connection" in lowered or "lock" in lowered or "config" in lowered:
                     hint = "；若 Web 服务正在运行，请先停止服务后重试"
                 print(f"❌ 初始化失败：{exc}（知识库保持原样）{hint}")
+                # 本次运行新建的空库要清掉（或标记待清理）：否则下次运行
+                # 它会被 default_knowledge_dir 当成已初始化的来源
+                if created_knowledge_dir:
+                    _discard_created_library(knowledge_base_path)
                 return 1
             print(f"   ⚠️  {exc}")
             # 顺序关键：先导出面板 / CLI 添加的片段，导出失败即中止——

@@ -92,8 +92,24 @@ def test_knowledge_busy_maps_to_503(monkeypatch):
     client = _client()
     response = client.get("/api/knowledge/documents")
     assert response.status_code == 503, response.text
-    assert "知识库暂不可用" in response.json()["detail"]
-    print("✓ 知识库写锁超时快速 503")
+    # 可操作的忙碌状态直接透出原因并带 Retry-After，不再吞成通用
+    # 「知识库暂不可用，请稍后再试」
+    assert "导入进行中" in response.json()["detail"], response.text
+    assert response.headers.get("Retry-After") == "5", response.headers
+    print("✓ 知识库写锁超时快速 503（可操作提示 + Retry-After）")
+
+
+def test_knowledge_dimension_mismatch_maps_to_503():
+    """维度不一致给出「重建知识库」的可操作提示，而不是通用「稍后再试」。"""
+    from webapp import server as server_module
+
+    exc = RuntimeError(
+        "知识库向量维度 512 与嵌入模型 768 不一致，请重新运行 python init_knowledge_base.py 重建知识库"
+    )
+    mapped = server_module._knowledge_unavailable("检索", exc)
+    assert mapped.status_code == 503, mapped
+    assert "维度" in mapped.detail and "重新运行" in mapped.detail, mapped.detail
+    print("✓ 知识库维度不一致给出可操作提示")
 def test_write_rate_limit_headers_and_rejection(monkeypatch):
     """用户数据写接口有独立的按 IP 额度：超限 429，读接口不受影响。"""
     from webapp import server as server_module
@@ -11142,6 +11158,7 @@ if __name__ == "__main__":
         test_knowledge_busy_maps_to_503(_mp_kb_busy)
     finally:
         _mp_kb_busy.undo()
+    test_knowledge_dimension_mismatch_maps_to_503()
     _mp_write = pytest.MonkeyPatch()
     try:
         test_write_rate_limit_headers_and_rejection(_mp_write)

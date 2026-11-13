@@ -60,9 +60,14 @@ def default_knowledge_dir() -> Path:
     wheel_dir = _wheel_data_knowledge_dir()
     preferred = wheel_dir if wheel_dir is not None else SKILL_KNOWLEDGE_DIR
     for directory in (preferred, SKILL_KNOWLEDGE_DIR, LEGACY_KNOWLEDGE_DIR):
-        if (directory / "milvus_lite.db").exists():
-            _default_dir = directory
-            return directory
+        if not (directory / "milvus_lite.db").exists():
+            continue
+        # 初始化中止清理失败留下的空库（带待清理标记）：不能当作已初始化
+        # 的来源，否则旧部署的知识库永远不再被迁移
+        if (directory / ".discard-pending").exists():
+            continue
+        _default_dir = directory
+        return directory
     # 尚未初始化：不固定，库创建后按同一目录解析
     return preferred
 

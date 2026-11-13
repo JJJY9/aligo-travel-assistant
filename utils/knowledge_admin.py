@@ -57,7 +57,16 @@ _METADATA_MAX_KEYS = 10
 METADATA_KEY_MAX_CHARS = 32
 METADATA_VALUE_MAX_CHARS = 200
 # 由拆分逻辑派生、不接受调用方回传的分片元数据
-_DERIVED_CHUNK_KEYS = {"part", "parts", "group"}
+_DERIVED_CHUNK_KEYS = {
+    "part",
+    "parts",
+    "group",
+    # 检索 / 诊断侧计算的内部键：用户元数据里同名键会被回答 prompt 当成
+    # 真实的缺片标记，入库与编辑时必须剥掉
+    "missing_parts",
+    "retrieved_parts",
+    "parts_abnormal",
+}
 class _ReadWriteLock:
     """读写锁：读并发、写独占，读写都有界等待（防止钉死共享线程池）。
 
@@ -1927,7 +1936,7 @@ def import_documents(
                     )
                     for chunk in missing:
                         meta = dict(chunk.get("metadata") or {})
-                        for derived in ("part", "parts", "group"):
+                        for derived in _DERIVED_CHUNK_KEYS:
                             meta.pop(derived, None)
                         unique.append(
                             {"content": chunk["content"], "metadata": meta}

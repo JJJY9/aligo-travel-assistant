@@ -34,6 +34,7 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.json_parser import extract_json_from_async_response
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.milvus_client import (  # noqa: F401 - shutdown_milvus_clients 供外部清理
     get_milvus_client,
     next_entity_id,
@@ -554,12 +555,31 @@ class RAGKnowledgeAgent(AgentBase):
         - 单篇片段保持原样；
         - 拼接后的文档以组内最高分参与后续排序。
         """
+        # 这些键由检索侧计算 / 维护：用户元数据里同名的键必须剥掉，
+        # 否则伪造的 missing_parts 会被当成真实缺片标记注入回答 prompt
+        internal_keys = {
+            "group",
+            "part",
+            "parts",
+            "missing_parts",
+            "retrieved_parts",
+            "parts_abnormal",
+        }
         grouped: dict[str, list[tuple[int, dict]]] = {}
         assembled: list[dict] = []
         for doc in docs:
             metadata = doc.get("metadata")
             group = metadata.get("group") if isinstance(metadata, dict) else None
             if not group:
+                if isinstance(metadata, dict):
+                    doc = {
+                        **doc,
+                        "metadata": {
+                            key: value
+                            for key, value in metadata.items()
+                            if key not in internal_keys
+                        },
+                    }
                 assembled.append(doc)
                 continue
             try:
@@ -593,11 +613,12 @@ class RAGKnowledgeAgent(AgentBase):
                     pass
                 if not base_meta:
                     # 保留首片的业务元数据（title/category/parent_doc…）：
-                    # 只留 group/parts 会让回答的「参考来源」消失或指错文档
+                    # 只留 group/parts 会让回答的「参考来源」消失或指错文档；
+                    # 检索侧内部键（含 missing_parts）一律不保留
                     base_meta = {
                         key: value
                         for key, value in metadata.items()
-                        if key not in {"group", "part", "parts"}
+                        if key not in internal_keys
                     }
                 content_text = str(doc.get("content") or "").strip()
                 if content_text:
@@ -684,6 +705,22 @@ class RAGKnowledgeAgent(AgentBase):
         # 尝试解析 JSON 输入 (来自 Orchestrator)，取出检索问题
         user_query = extract_user_query(content)
 
+        if not str(user_query or "").strip():
+            # 空白问题不是知识库故障：按「没有可检索内容」返回。走到
+            # strict 检索会抛 ValueError，被下方宽泛的 except 映射成
+            # 「知识库暂时不可用」，与「空查询视为无结果」的约定不符
+            result = {
+                "status": "no_knowledge",
+                "query": user_query,
+                "answer": "请先输入要查询的问题。",
+                "retrieved_documents": [],
+            }
+            return Msg(
+                name=self.name,
+                content=json.dumps(result, ensure_ascii=False),
+                role="assistant",
+            )
+
         # 检索相关知识。嵌入模型编码与 Milvus 查询是同步阻塞调用，
         # 放到线程池执行，避免卡住事件循环（SSE 心跳与其它会话）。
         # strict=True：后端故障要显式报错，不能伪装成「知识库没有相关信息」
@@ -750,7 +787,11 @@ class RAGKnowledgeAgent(AgentBase):
         for i, doc in enumerate(retrieved_docs):
             metadata = doc.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
-            missing = str(metadata.get("missing_parts") or "").strip()
+            # 缺片号来自检索侧计算（用户元数据里的同名字段已在拼装时剥掉），
+            # 但仍要按第三方内容中和结构标记：注记会原样进入 prompt
+            missing = _knowledge_text(metadata.get("missing_parts") or "").strip()
+            if len(missing) > 120:
+                missing = missing[:119] + "…"
             note = (
                 f"（节选：该文档另有分片 {missing} 未检索到，内容不完整）"
                 if missing
@@ -799,9 +840,11 @@ class RAGKnowledgeAgent(AgentBase):
                 answer = await extract_json_from_async_response(response)
 
                 if not answer:
-                    answer = "无法生成答案"
-                    answer_error = "模型未返回答案内容"
-                
+                    # 网关 200 + 空响应体：与意图识别 / 其它技能同一口径，
+                    # 按可重试的上游故障交给编排层退避重试，不能吞成一次
+                    # 普通失败回答（用户本可重试恢复）
+                    raise ConnectionError("模型服务返回空响应")
+
                 # 清理 LLM 可能输出的 JSON 格式
                 answer_str = answer.strip()
                 if answer_str.startswith("{") and answer_str.endswith("}"):
@@ -814,6 +857,10 @@ class RAGKnowledgeAgent(AgentBase):
                         pass
 
             except Exception as e:
+                if is_retriable_error(e) or is_permanent_llm_error(e):
+                    # 上游 5xx / 超时 / 连接失败 / 空响应：交给编排层退避
+                    # 重试与熔断记账（其它技能同一口径），不能吞成普通失败
+                    raise
                 logger.error(f"Error generating answer with LLM: {e}")
                 # 用户可见的错误信息不能带本机路径 / 上游 URL（模型缓存
                 # 路径、HuggingFace 链接会随回答与备份导出）

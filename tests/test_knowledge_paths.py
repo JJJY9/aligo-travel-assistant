@@ -98,5 +98,24 @@ def test_wheel_install_prefers_user_data_dir(monkeypatch, tmp_path):
     print("✓ wheel 安装知识库跟随用户数据目录")
 
 
+def test_discard_pending_library_is_ignored(monkeypatch, tmp_path):
+    """初始化清理失败留下的空库（待清理标记）不能当作已初始化的来源。"""
+    skill = tmp_path / "skill-marked"
+    legacy = tmp_path / "legacy-marked"
+    legacy.mkdir()
+    (legacy / "milvus_lite.db").mkdir()
+    skill.mkdir()
+    (skill / "milvus_lite.db").mkdir()
+    (skill / ".discard-pending").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(knowledge_paths, "SKILL_KNOWLEDGE_DIR", skill)
+    monkeypatch.setattr(knowledge_paths, "LEGACY_KNOWLEDGE_DIR", legacy)
+    knowledge_paths.reset_default_knowledge_dir()
+    try:
+        assert knowledge_paths.default_knowledge_dir() == legacy
+        print("✓ 待清理的空知识库被来源解析忽略")
+    finally:
+        knowledge_paths.reset_default_knowledge_dir()
+
+
 if __name__ == "__main__":
     print("monkeypatch 用例需 pytest 运行")
