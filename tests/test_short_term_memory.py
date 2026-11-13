@@ -1073,12 +1073,59 @@ def test_clear_short_term_session_failure_queues_clear(monkeypatch):
     monkeypatch.setitem(storage.STORAGE_CONFIG, "redis_url", "redis://fake")
     monkeypatch.setattr(storage, "_get_redis_client", lambda url: client)
     client.fail = True
-    storage.clear_short_term_session("s-fail", "u-fail")
+    try:
+        storage.clear_short_term_session("s-fail", "u-fail")
+        assert module.redis_short_term_available() is False, (
+            "真实删除失败必须反映到健康接口的可用性标志"
+        )
+        assert module.redis_short_term_degraded() is True
+    finally:
+        module.reset_redis_degraded()
     client.fail = False
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     reader = module.RedisShortTermMemory(client, "s-fail", user_id="u-fail")
     assert reader.get_recent_context() == []
     print("✓ 会话删除失败时登记整键删除")
+
+
+class _NoReloadRedis(_FlakyRedis):
+    """截断脚本生效，但随后刷新影子缓存的 lrange 失败（连接两次调用间中断）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_lrange = False
+
+    def lrange(self, key, start, end):
+        if self.fail_lrange:
+            raise ConnectionError("lrange down")
+        return super().lrange(key, start, end)
+
+
+def test_truncate_refresh_failure_clears_shadow(monkeypatch):
+    """在线截断成功但影子刷新失败时清空影子，Redis 降级期不回放已删轮次。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _NoReloadRedis()
+    memory = module.RedisShortTermMemory(client, "s-shadow", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    assert [m["content"] for m in memory._fallback.messages] == ["Q1", "A1"]
+
+    client.fail_lrange = True
+    assert memory.truncate_last_turn("Q1") == 2
+    assert client.data == [], "截断应在 Redis 生效"
+    assert memory._fallback.messages == [], "刷新失败时影子不能保留已删除轮次"
+
+    # Redis 随后整体不可用：回退影子不能把已删除对话送回模型
+    client.fail = True
+    client.fail_lrange = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    try:
+        assert memory.get_recent_context() == []
+    finally:
+        module.reset_redis_degraded()
+    print("✓ 截断刷新失败时清空影子缓存")
 
 
 def test_eviction_prefers_add_only_journals(monkeypatch, caplog):

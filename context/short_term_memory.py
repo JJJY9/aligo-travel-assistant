@@ -86,6 +86,21 @@ def reset_redis_degraded() -> None:
     _redis_available = True
 
 
+def note_redis_operation_failure(exc: BaseException) -> None:
+    """记录一次不在 ``_call_redis`` 内的真实 Redis 操作失败（清理等）。
+
+    与 ``_call_redis`` 的故障语义一致：连接 / 服务级错误进入 60 秒重试
+    冷却并把 ``_redis_available`` 置 False（健康接口「最近一次真实操作」
+    的口径保持准确）；确定性错误（WRONGTYPE / ACL）只影响单个键，不改变
+    进程级状态。
+    """
+    global _redis_available, _redis_degraded_until
+    if not _is_transient_redis_error(exc):
+        return
+    _redis_available = False
+    _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
+
+
 def session_key(session_id: str, user_id: str = "") -> str:
     """Redis 中一个会话对应的键名。
 
@@ -969,7 +984,11 @@ class RedisShortTermMemory:
         """
         try:
             raw = self.client.lrange(self.key, -window, -1)
-        except Exception:  # noqa: BLE001 - 刷新失败保持影子不动，等下次成功读取
+        except Exception:  # noqa: BLE001 - 刷新失败不能保留可能已删除的轮次
+            # 截断 / 清空已在 Redis 生效：影子若保留旧轮次，Redis 降级时
+            # 会把已删除对话重新送进模型。保守清空，等下一次成功读取重建
+            # （影子本就是尽力而为的可用性缓存，宁可暂时少上下文）。
+            self._fallback.messages = []
             logger.debug("刷新短期记忆影子缓存失败：%s", self.key, exc_info=True)
             return
         self._fallback.messages = self._parse_window(raw)[-window:]
