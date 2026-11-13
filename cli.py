@@ -72,6 +72,15 @@ def _terminal_safe(value: object) -> str:
     return escape(text) if escape is not None else text
 
 
+def _plain_safe(value: object) -> str:
+    r"""纯 ``print`` 输出：只剥终端控制序列，不做 rich 转义。
+
+    rich 的反斜杠式转义只在 Rich 渲染时才有意义：直接写 stdout 会把
+    ``[/x]`` 变成字面量 ``\[/x]``，错误文本被改形。
+    """
+    return strip_terminal_controls(value)
+
+
 def _single_line_safe(value: object) -> str:
     """单行终端输出：剥离终端控制序列并把换行 / 制表符折叠为空格。
 
@@ -2578,6 +2587,23 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
         )
     try:
         store = _open_cli_store(user_id)
+    except _QuarantinedMemoryError as exc:
+        # stats 的 --json 契约包含 corrupt_backup 字段（脚本按它定位隔离文件）
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "corrupt_backup": exc.backup,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(_plain_safe(str(exc)))
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
