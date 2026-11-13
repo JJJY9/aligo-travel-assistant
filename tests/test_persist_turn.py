@@ -93,6 +93,29 @@ def test_memory_manager_persist_turn_delegates_and_stages_assistant():
     print("✓ MemoryManager.persist_turn 一次提交并暂存助手副本")
 
 
+def test_persist_turn_does_not_rebuild_snapshot_store(monkeypatch):
+    """JSON 后端的 persist_turn 不重建实例：写锁内重载已足够。"""
+    from context.long_term_memory import LongTermMemory as StoreClass
+
+    builds = {"count": 0}
+    real_init = StoreClass.__init__
+
+    def counting_init(self, *args, **kwargs):
+        builds["count"] += 1
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(StoreClass, "__init__", counting_init)
+    manager = MemoryManager("u-norebuild", "s1", storage_path=tempfile.mkdtemp())
+    before = builds["count"]
+    manager.persist_turn("问题", "回答")
+    assert builds["count"] == before, (
+        "写入不应重建长期记忆实例（每次重建都会完整解析一遍记忆文件）"
+    )
+    history = manager.long_term.get_chat_history(limit=None)
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    print("✓ persist_turn 不重建 JSON 快照实例")
+
+
 class _BlockingMemory:
     """persist_turn 阻塞在事件上，模拟落库线程仍在执行时协程被取消。"""
 
@@ -474,6 +497,7 @@ if __name__ == "__main__":
         test_json_add_chat_turn_rolls_back_pair_on_persist_failure(_mp)
         test_json_add_chat_turn_guard_vetoes_write()
         test_memory_manager_persist_turn_delegates_and_stages_assistant()
+        test_persist_turn_does_not_rebuild_snapshot_store(_mp)
         test_persist_turn_veto_skips_assistant_stage()
         test_persist_turn_defaults_to_shared_tombstone_guard(_mp)
         test_persist_turn_default_guard_commits_when_not_deleted(_mp)

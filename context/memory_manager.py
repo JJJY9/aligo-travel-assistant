@@ -141,6 +141,23 @@ class MemoryManager:
 
     # ========== 短期记忆操作 ==========
 
+    def _rebuild_before_write(self) -> None:
+        """写入长期记忆前的后端复核：只有「JSON 回退实例 + 已配置 PostgreSQL」
+        才需要重建实例（数据库恢复后切回 PG）。
+
+        其余场景不必每写一次都新建实例：JSON 写入在 ``_locked_mutation`` 内
+        会重新加载磁盘最新内容，这里的重建只会把整份记忆文件再完整解析一遍
+        ——与每轮开头的 reload 叠加后，默认 JSON 后端每轮对话要把记忆文件
+        解析三次。
+        """
+        if not getattr(self.long_term, "snapshot_based", True):
+            return
+        if (
+            isinstance(self.long_term, LongTermMemory)
+            and STORAGE_CONFIG.get("postgres_dsn")
+        ):
+            self._rebuild_long_term()
+
     def persist_message(self, role: str, content: str) -> None:
         """只写长期记忆（跨会话持久化）。
 
@@ -148,8 +165,7 @@ class MemoryManager:
         面板写入的标题 / 置顶 / 偏好被旧快照覆盖；PostgreSQL 直接查询，
         无需重载。
         """
-        if getattr(self.long_term, "snapshot_based", True):
-            self._rebuild_long_term()
+        self._rebuild_before_write()
         self.long_term.add_chat_message(role, content, self.session_id)
 
     def session_epoch(self) -> tuple[bool, str | None]:
@@ -237,8 +253,7 @@ class MemoryManager:
         Returns:
             是否真的写入长期记忆
         """
-        if getattr(self.long_term, "snapshot_based", True):
-            self._rebuild_long_term()
+        self._rebuild_before_write()
         if should_commit is None:
             # 无 Redis 共享通道时 is_session_deleted 快速返回 False（不同
             # 进程之间没有共享通道，也就不存在跨实例删除），行为与此前一致
