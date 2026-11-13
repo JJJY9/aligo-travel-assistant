@@ -611,6 +611,10 @@ class RedisShortTermMemory:
         # 0（「永不过期」的常见写法）会让每次写入推入消息后立刻整体删除，
         # 短期记忆静默为空且无任何错误
         self.ttl_sec = max(1, int(ttl_sec))
+        # 影子缓存最近一次与 Redis 成功交互的时刻：Redis 的 TTL 是「键在
+        # 最后一次写入后闲置 ttl_sec 才过期」，按消息时间戳裁剪会把持续
+        # 使用的会话里较早的轮次误删
+        self._shadow_touched = time.monotonic()
         self.user_id = user_id
         self.key = session_key(session_id, user_id)
         # Redis 故障时的进程内影子缓存：对话继续可用（跨实例共享暂时失效）。
@@ -876,11 +880,32 @@ class RedisShortTermMemory:
             return fallback_result, False
         _redis_degraded_until = 0.0
         _redis_available = True
+        self._shadow_touched = time.monotonic()
         return result, True
 
     def _redis(self, operation, fallback):
         """执行 Redis 操作；连接级故障时回退影子缓存并进入 60 秒冷却。"""
         return self._call_redis(operation, fallback)[0]
+
+    def _fallback_context(self, n_turns: int | None) -> list[dict[str, Any]]:
+        """Redis 降级时的影子读取：按空闲时长对齐 Redis 的键 TTL 语义。
+
+        影子缓存只按条数裁剪、从不按时间过期：Redis 键闲置超过 ``ttl_sec``
+        已过期后，降级窗口仍会把旧对话送进模型（多实例删除的会话也会借
+        影子回放）。Redis 的过期是「最后一次写入后闲置」，不是消息时间戳，
+        因此这里只在「与 Redis 最后一次成功交互已超过 ttl_sec」时清空影子
+        ——持续使用的会话不会被误删早期轮次。
+        """
+        if (
+            self.ttl_sec > 0
+            and time.monotonic() - self._shadow_touched > self.ttl_sec
+        ):
+            self._fallback.messages = []
+        messages = self._fallback.get_recent_context()
+        if n_turns is None:
+            return list(messages)
+        n_messages = n_turns * 2
+        return messages[-n_messages:]
 
     def add_message(self, role: str, content: str, metadata: dict | None = None) -> None:
         message = {
@@ -946,7 +971,7 @@ class RedisShortTermMemory:
                 return messages
             return messages[-n_turns * 2:]
 
-        return self._redis(op, lambda: self._fallback.get_recent_context(n_turns))
+        return self._redis(op, lambda: self._fallback_context(n_turns))
 
     def _parse_window(self, raw) -> list[dict[str, Any]]:
         """解析窗口内的消息条目；坏元素跳过而不是让整次读取失败。

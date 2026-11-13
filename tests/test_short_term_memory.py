@@ -1989,6 +1989,30 @@ def test_outage_ops_expire_after_tombstone_window(monkeypatch):
     print("✓ 超过墓碑窗口的排队操作被丢弃，不复活已删会话")
 
 
+def test_fallback_context_prunes_expired_rounds(monkeypatch):
+    """Redis 降级时影子按「闲置超过 ttl」清空（与 Redis 键 TTL 语义对齐）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-shadow-ttl", max_turns=5, ttl_sec=60, user_id="u1"
+    )
+    memory.add_message("user", "fresh")
+    assert [m["content"] for m in memory._fallback.messages] == ["fresh"]
+
+    # 模拟与 Redis 最后一次成功交互已超过 ttl
+    memory._shadow_touched -= 120
+    client.fail = True
+    try:
+        contents = [m["content"] for m in memory.get_recent_context()]
+    finally:
+        module.reset_redis_degraded()
+    assert contents == [], contents
+    assert memory._fallback.messages == []
+    print("✓ 降级影子按闲置时长与 Redis TTL 对齐")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
