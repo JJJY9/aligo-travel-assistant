@@ -742,7 +742,11 @@ class PostgresLongTermMemory:
         }
 
     def delete_chat_session(self, session_id: str) -> int:
-        """删除某个会话的全部聊天记录与元数据（单事务），返回删除条数。"""
+        """删除某个会话的全部聊天记录与元数据（单事务），返回删除条数。
+
+        引用该会话的行程保留、在同一事务内清空会话链接（与会话删除后
+        不可见 / 备份恢复跳过已删除会话的口径一致）。
+        """
 
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
@@ -768,6 +772,13 @@ class PostgresLongTermMemory:
                 )
                 cursor.execute(
                     "DELETE FROM aligo_archived_sessions "
+                    "WHERE user_id = %s AND session_id = %s",
+                    (self.user_id, session_id),
+                )
+                # 行程本身独立于会话保留，但会话链接必须清空：否则面板里
+                # 出现永远打不开的行程会话链接
+                cursor.execute(
+                    "UPDATE aligo_trips SET session_id = NULL "
                     "WHERE user_id = %s AND session_id = %s",
                     (self.user_id, session_id),
                 )

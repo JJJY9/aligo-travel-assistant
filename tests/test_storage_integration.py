@@ -178,6 +178,35 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
         memory.close()
 
 
+def test_pg_delete_chat_session_clears_trip_links():
+    """PG：删除会话清空行程的会话链接（行程保留）。"""
+    memory, _ = _pg_memory_or_skip()
+    session_id = f"sess-{uuid.uuid4().hex[:8]}"
+    try:
+        memory.add_chat_messages(
+            [{"role": "user", "content": "Q", "session_id": session_id}]
+        )
+        trip_id = memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "purpose": "出差",
+                "session_id": session_id,
+            }
+        )
+        assert memory.delete_chat_session(session_id) == 1
+        trips = [
+            trip
+            for trip in memory.get_trip_history(limit=None)
+            if trip.get("trip_id") == trip_id
+        ]
+        assert trips and trips[0].get("session_id") is None, trips
+        print("✓ PG 删除会话清空行程会话链接")
+    finally:
+        memory.close()
+
+
 def test_pg_batch_save_matches_sequential():
     """PG 批量保存与逐条保存的最终结果一致（去重 / 未补零日期 / 缺省目的）。"""
     batch, _ = _pg_memory_or_skip()

@@ -969,7 +969,11 @@ class LongTermMemory:
 
     @_locked_mutation
     def delete_chat_session(self, session_id: str) -> int:
-        """删除某个会话的全部聊天记录，返回删除条数。"""
+        """删除某个会话的全部聊天记录，返回删除条数。
+
+        引用该会话的行程保留、清空会话链接（与会话删除后不可见 / 备份
+        恢复跳过已删除会话的口径一致，避免面板出现永远打不开的会话链接）。
+        """
         messages = self.data["chat_history"]
         remaining = [
             m for m in messages if not _session_id_matches(m, session_id)
@@ -978,6 +982,14 @@ class LongTermMemory:
         titles = self.data.get("session_titles") or {}
         pinned_sessions = self.data.get("pinned_sessions") or []
         archived_sessions = self.data.get("archived_sessions") or []
+        cleared_links = 0
+        for trip in self.data.get("trip_history") or []:
+            if not isinstance(trip, dict):
+                continue
+            value = trip.get("session_id")
+            if value is not None and str(value) == session_id:
+                trip["session_id"] = None
+                cleared_links += 1
         metadata_changed = (
             session_id in titles
             or session_id in pinned_sessions
@@ -989,7 +1001,7 @@ class LongTermMemory:
             stats = self.data["statistics"]
             stats["total_messages"] = max(0, stats.get("total_messages", 0) - removed)
 
-        if removed or metadata_changed:
+        if removed or metadata_changed or cleared_links:
             self.data.get("session_titles", {}).pop(session_id, None)
             if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
                 pinned_sessions.remove(session_id)
@@ -997,10 +1009,11 @@ class LongTermMemory:
                 archived_sessions.remove(session_id)
             self._persist()
             logger.info(
-                "Deleted chat session: %s (%s messages, metadata=%s)",
+                "Deleted chat session: %s (%s messages, metadata=%s, trip_links=%s)",
                 session_id,
                 removed,
                 metadata_changed,
+                cleared_links,
             )
         return removed
 

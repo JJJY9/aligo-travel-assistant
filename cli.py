@@ -3892,6 +3892,17 @@ def run_session_delete_standalone(
     try:
         try:
             exists = bool(store.get_chat_history(session_id=session_id))
+            if not exists:
+                # 仅被行程引用的空会话（旧版本删除会话留下的死链）：仍然
+                # 允许「删除」以清空行程链接，与 Web DELETE 行为一致
+                try:
+                    exists = any(
+                        trip.get("session_id") is not None
+                        and str(trip.get("session_id")) == session_id
+                        for trip in store.get_trip_history(limit=None)
+                    )
+                except Exception:  # noqa: BLE001 - 读取失败按不存在处理
+                    exists = False
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取会话失败：{exc}")
         if not exists:

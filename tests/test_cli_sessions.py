@@ -28,11 +28,12 @@ def _message(role, content, session_id, timestamp="2026-11-04T10:00:00"):
 
 
 class _FakeStore:
-    def __init__(self, messages, titles=None, pinned=None, archived=None):
+    def __init__(self, messages, titles=None, pinned=None, archived=None, trips=None):
         self.messages = list(messages)
         self.titles = dict(titles or {})
         self.pinned = list(pinned or [])
         self.archived = list(archived or [])
+        self.trips = list(trips or [])
         self.archived_calls = []
         self.fail_history = False
         self.fail_delete = False
@@ -45,6 +46,9 @@ class _FakeStore:
         if session_id:
             return [m for m in self.messages if m.get("session_id") == session_id]
         return list(self.messages)
+
+    def get_trip_history(self, limit=None):
+        return list(self.trips)
 
     def get_session_titles(self):
         return dict(self.titles)
@@ -69,6 +73,9 @@ class _FakeStore:
         self.messages = [
             m for m in self.messages if m.get("session_id") != session_id
         ]
+        for trip in self.trips:
+            if trip.get("session_id") == session_id:
+                trip["session_id"] = None
         self.deleted_sessions.append(session_id)
         return before - len(self.messages)
 
@@ -357,6 +364,25 @@ def test_session_delete_removes_messages(monkeypatch):
     assert cleared == [("s-active", "u1")], "短期记忆须同步清理（Redis 会话键）"
     assert fake.closed
     print("✓ session-delete 删除消息并清理短期记忆")
+
+
+def test_session_delete_clears_trip_links_for_empty_session(monkeypatch):
+    """没有消息但被行程引用的会话：允许删除以清空行程链接（与 Web 一致）。"""
+    fake = _sessions_store()
+    fake.trips = [
+        {"trip_id": "trip_1", "session_id": "s-empty", "origin": "北京",
+         "destination": "上海"},
+        {"trip_id": "trip_2", "session_id": "s-active", "origin": "杭州",
+         "destination": "成都"},
+    ]
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+    code, out = _run_delete("u1", "s-empty")
+    assert code == 0 and "已删除会话 s-empty（0 条消息）" in out, out
+    assert fake.deleted_sessions == ["s-empty"]
+    assert fake.trips[0]["session_id"] is None
+    assert fake.trips[1]["session_id"] == "s-active", "其它会话的链接不受影响"
+    print("✓ session-delete 可清理仅被行程引用的空会话链接")
 
 
 def test_session_delete_writes_shared_tombstone(monkeypatch):
