@@ -258,6 +258,7 @@ class _FlakyRedis:
         self.fail_after_apply = False
         self.data: list[str] = []
         self.applied: dict[str, set[str]] = {}
+        self.seen: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
         self.marker_ttls: list[str] = []
         self.eval_calls = 0
@@ -277,6 +278,8 @@ class _FlakyRedis:
         for key in keys:
             if key.endswith(":applied"):
                 self.applied.pop(key, None)
+            elif key.endswith(":seen"):
+                self.seen.pop(key, None)
             elif ":op:" in key:
                 self.markers.pop(key, None)
             else:
@@ -325,15 +328,22 @@ class _FlakyRedis:
             self.data = kept
             return stale
         if "SADD" in script:
-            # 幂等追加：按 op_id 去重后 RPUSH，窗口裁剪与 TTL 略去
+            # 幂等追加：按 op_id 与内容指纹去重后 RPUSH，窗口裁剪与 TTL 略去
             applied = self.applied.setdefault(keys[1], set())
+            seen = self.seen.setdefault(keys[2], set())
             window = int(args[0])
             pushed = 0
-            for index in range(2, len(args) - 1, 2):
-                op_id, payload = args[index], args[index + 1]
+            for index in range(2, len(args) - 2, 3):
+                op_id = args[index]
+                content_id = args[index + 1]
+                payload = args[index + 2]
                 if op_id in applied:
                     continue
+                if content_id and content_id in seen:
+                    continue
                 applied.add(op_id)
+                if content_id:
+                    seen.add(content_id)
                 self.data.append(payload)
                 pushed += 1
             if pushed:
@@ -649,7 +659,18 @@ def test_outage_truncate_keeps_other_instance_messages(monkeypatch):
 def test_online_truncate_refreshes_stale_shadow(monkeypatch):
     """在线截断成功：影子缓存过期时按 Redis 整体刷新，不按文本误删旧轮次。"""
     from context import short_term_memory as module
+    from datetime import datetime as _real_datetime
 
+    # 文本相同的两轮必须有不同的时间戳：内容指纹（角色+内容+时间戳）
+    # 落进同一微秒会被视为同一条消息
+    ticks = iter(range(1, 1000))
+
+    class _Clock:
+        @classmethod
+        def now(cls):
+            return _real_datetime(2026, 11, 14, 12, 0, 0, next(ticks))
+
+    monkeypatch.setattr(module, "datetime", _Clock)
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     client = _FlakyRedis()
     alice = module.RedisShortTermMemory(
@@ -2001,8 +2022,9 @@ def test_fallback_context_prunes_expired_rounds(monkeypatch):
     memory.add_message("user", "fresh")
     assert [m["content"] for m in memory._fallback.messages] == ["fresh"]
 
-    # 模拟与 Redis 最后一次成功交互已超过 ttl
+    # 模拟影子真正闲置超过 ttl：既无 Redis 成功交互、也无降级期本地写入
     memory._shadow_touched -= 120
+    memory._shadow_last_activity -= 120
     client.fail = True
     try:
         contents = [m["content"] for m in memory.get_recent_context()]
@@ -2011,6 +2033,114 @@ def test_fallback_context_prunes_expired_rounds(monkeypatch):
     assert contents == [], contents
     assert memory._fallback.messages == []
     print("✓ 降级影子按闲置时长与 Redis TTL 对齐")
+
+
+def test_fallback_shadow_survives_long_outage_with_activity(monkeypatch):
+    """降级期持续写入的会话不按「最后一次 Redis 成功」整段清空影子。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-shadow-active", max_turns=5, ttl_sec=60, user_id="u1"
+    )
+    memory.add_message("user", "Q1")
+    client.fail = True
+    try:
+        # 故障持续远超 ttl，但期间一直有本地活动（新的降级写入）
+        memory._shadow_touched -= 120
+        memory.add_message("assistant", "A1")
+        contents = [m["content"] for m in memory.get_recent_context()]
+        assert contents == ["Q1", "A1"], contents
+    finally:
+        module.reset_redis_degraded()
+    print("✓ 降级期活跃会话的影子缓存不被整段清空")
+
+
+def test_append_op_starts_new_window_after_drain(monkeypatch):
+    """重放清空后新入队的操作开启新计速窗口（不继承旧起点被整体丢弃）。"""
+    from context import short_term_memory as module
+
+    times = {"now": 100.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: times["now"])
+    memory = module.RedisShortTermMemory(None, "s-window", max_turns=2, user_id="u1")
+    with module._pending_journal(memory.key) as journal:
+        memory._append_op(journal, "add", ("p1", "op1", "cid1"))
+        assert journal.started_at == 100.0
+        # 模拟队列在本次调用的重放阶段成功清空，随后真实操作失败
+        journal.ops.clear()
+        times["now"] = 3900.0
+        memory._append_op(journal, "add", ("p2", "op2", "cid2"))
+        assert journal.started_at == 3900.0, "新操作不能继承 65 分钟前的起点"
+    module.discard_pending_ops(memory.key)
+    print("✓ 日志排空后的新操作重新计速")
+
+
+def test_seed_fallback_context_persists_to_redis(monkeypatch):
+    """故障期回填的历史在恢复后进入 Redis；重复回填按内容指纹去重。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-seed", max_turns=5, user_id="u1"
+    )
+    batch = [
+        {"role": "user", "content": "Q0", "timestamp": "2026-11-01T10:00:00"},
+        {"role": "assistant", "content": "A0", "timestamp": "2026-11-01T10:00:05"},
+    ]
+    client.fail = True
+    try:
+        memory.seed_fallback_context(batch)
+        assert [m["content"] for m in memory._fallback.messages] == ["Q0", "A0"]
+    finally:
+        client.fail = False
+        module.reset_redis_degraded()
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [m["content"] for m in memory.get_recent_context()]
+    assert contents == ["Q0", "A0"], "回填历史必须在恢复后进入 Redis"
+
+    # 同一批消息再次回填（例如另一实例）：内容指纹去重，不重复 RPUSH
+    memory.seed_fallback_context(batch)
+    assert [m["content"] for m in memory.get_recent_context()] == ["Q0", "A0"]
+    assert [
+        m["content"] for m in memory._fallback.messages
+    ] == ["Q0", "A0"], "影子缓存也不能堆出重复历史"
+    print("✓ 回填历史持久化到 Redis 且重复回填幂等")
+
+
+def test_replay_skips_messages_backfilled_by_other_instance(monkeypatch):
+    """跨实例：另一实例已回填的同一批消息，本实例重放时不再推一遍。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    alice = module.RedisShortTermMemory(
+        client, "s-multi", max_turns=5, user_id="u1"
+    )
+    bob = module.RedisShortTermMemory(client, "s-multi", max_turns=5, user_id="u1")
+    client.fail = True
+    try:
+        alice.add_message("user", "Q1")
+        alice.add_message("assistant", "A1")
+    finally:
+        client.fail = False
+        module.reset_redis_degraded()
+    # A 的消息只进了重放日志（Redis 从未写入）：B 从长期记忆回填同一批
+    seeds = [
+        json.loads(payload[0])
+        for kind, payload in alice._pending_ops
+        if kind == "add"
+    ]
+    assert [item["content"] for item in seeds] == ["Q1", "A1"]
+    bob.seed_fallback_context(seeds)
+    assert [json.loads(raw)["content"] for raw in client.data] == ["Q1", "A1"]
+    # A 恢复后重放：内容指纹命中，同一批消息不再重复追加
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [m["content"] for m in alice.get_recent_context()]
+    assert contents == ["Q1", "A1"], contents
+    print("✓ 跨实例回填与重放不重复追加")
+
 
 
 if __name__ == "__main__":
@@ -2154,6 +2284,11 @@ if __name__ == "__main__":
         test_replay_discards_queue_when_session_deleted,
         test_parse_skips_huge_int_literal_without_degrading,
         test_statistics_tolerates_missing_timestamp_in_fallback,
+        test_fallback_context_prunes_expired_rounds,
+        test_fallback_shadow_survives_long_outage_with_activity,
+        test_append_op_starts_new_window_after_drain,
+        test_seed_fallback_context_persists_to_redis,
+        test_replay_skips_messages_backfilled_by_other_instance,
     ):
         _case_mp = __import__("pytest").MonkeyPatch()
         try:
