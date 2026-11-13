@@ -391,10 +391,29 @@ def _discard_created_library(knowledge_base_path: Path) -> None:
         shutdown_milvus_clients()
     except Exception:  # noqa: BLE001 - 清理尽力而为，不改变退出码语义
         pass
-    with contextlib.suppress(OSError):
-        (knowledge_base_path / "milvus_lite.db").unlink()
-    with contextlib.suppress(OSError):
-        shutil.rmtree(knowledge_base_path)
+    # milvus-lite 3.x 的本地句柄在 Windows 上可能延迟释放：unlink/rmtree
+    # 一次失败不代表目录删不掉，短暂重试（gc 触发句柄回收）后再放弃
+    import gc
+    import time
+
+    for attempt in range(3):
+        gc.collect()
+        try:
+            (knowledge_base_path / "milvus_lite.db").unlink(missing_ok=True)
+            shutil.rmtree(knowledge_base_path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if not knowledge_base_path.exists():
+                return
+            if attempt < 2:
+                time.sleep(0.2)
+    if (knowledge_base_path / "milvus_lite.db").exists():
+        print(
+            "⚠️  无法删除本次新建的知识库文件（文件被占用），"
+            f"请退出后手动删除目录：{knowledge_base_path}"
+        )
 
 
 def _drop_collection_for_rebuild(knowledge_base_path: Path) -> None:
