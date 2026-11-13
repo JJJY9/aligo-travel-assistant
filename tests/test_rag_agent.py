@@ -267,6 +267,58 @@ def test_strict_search_error_has_top_level_message():
     print("✓ strict 检索失败带顶层 error/message")
 
 
+def test_skill_agent_anchors_model_to_repo_config_dir():
+    """相对嵌入模型路径以 config 模块目录为首选锚点（不依赖技能脚本深度）。"""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(project_root) / ".claude/skills/ask-question/script/agent.py"
+    spec = importlib.util.spec_from_file_location(
+        "_test_ask_question_agent_anchor", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    agent_cls = module.RAGKnowledgeAgent
+
+    candidates = agent_cls._model_path_candidates(
+        Path("data/models/bge-small-zh-v1.5")
+    )
+    expected_root = Path(project_root) / "data/models/bge-small-zh-v1.5"
+    assert candidates[0] == expected_root, candidates[:2]
+    # CWD 兜底在最后，且候选不重复
+    assert candidates[-1] == Path.cwd() / "data/models/bge-small-zh-v1.5"
+    print("✓ 相对模型路径以仓库 config 目录为首选锚点")
+
+
+def test_grouped_missing_parts_listing_is_bounded():
+    """declared parts 异常大时 missing_parts 有界，不把巨串注入 prompt。"""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(project_root) / ".claude/skills/ask-question/script/agent.py"
+    spec = importlib.util.spec_from_file_location(
+        "_test_ask_question_agent_parts", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    docs = [
+        {
+            "id": "g1",
+            "content": "分片一",
+            "metadata": {"group": "g1", "part": 1, "parts": 100000},
+            "distance": 0.9,
+        }
+    ]
+    assembled = module.RAGKnowledgeAgent._assemble_grouped_documents(None, docs)
+    missing = assembled[0]["metadata"]["missing_parts"]
+    assert len(missing) < 300, len(missing)
+    assert "共 99999 个缺失" in missing, missing
+    print("✓ 缺失分片列表有界")
+
+
 if __name__ == "__main__":
     asyncio.run(test_rag_agent())
     print("\n测试完成！")

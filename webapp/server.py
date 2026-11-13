@@ -2213,6 +2213,9 @@ _COLLECTION_MISSING_MARKERS = (
     "can't find collection",
     "collection doesn't exist",
     "collection not exist",
+    # RAG 智能体在半初始化时抛的是中文文案，此前只匹配英文 Milvus 文本，
+    # /api/knowledge/search 会退化成通用「检索失败，请稍后再试」
+    "知识库缺少集合",
 )
 
 

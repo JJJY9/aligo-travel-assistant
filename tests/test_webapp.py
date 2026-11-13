@@ -9756,6 +9756,19 @@ def test_pre_route_metric_labels_cover_read_routes():
     print("✓ 路由前指标标签覆盖读接口与尾斜杠")
 
 
+def test_knowledge_unavailable_maps_chinese_collection_marker():
+    """半初始化时 RAG 智能体抛中文「缺少集合」：映射为可操作的 503。"""
+    from webapp import server as server_module
+
+    exc = server_module._knowledge_unavailable(
+        "检索",
+        RuntimeError("知识库缺少集合（milvus_lite.db 存在但尚未初始化知识）"),
+    )
+    assert exc.status_code == 503
+    assert "初始化脚本" in exc.detail
+    print("✓ 中文「缺少集合」映射为初始化提示")
+
+
 def test_doctor_rate_limited(monkeypatch):
     """未鉴权的自检接口接入知识库桶限流。"""
     from webapp import server as server_module

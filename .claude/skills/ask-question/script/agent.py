@@ -153,32 +153,38 @@ class RAGKnowledgeAgent(AgentBase):
                 return
 
         # 若配置的是本地路径且存在，则从本地加载，否则按模型 ID 使用（会联网）
+        default_local_model = "data/models/bge-small-zh-v1.5"
         model_path_or_id = embedding_model
         path_obj = Path(embedding_model).expanduser()
         if not path_obj.is_absolute():
-            # 相对路径锚定到项目根目录，避免依赖运行时 CWD（Issue #5）
-            try:
-                project_root = Path(__file__).resolve().parents[4]
-            except IndexError:
-                # ALIGO_SKILLS_DIR 指向仓库外（如 /skills）：技能目录的
-                # parents[4] 不存在，改用 config 模块位置 / CWD 兜底，
-                # 不再抛只有一个「4」的 IndexError
-                try:
-                    import config as _config
-
-                    project_root = Path(_config.__file__).resolve().parent
-                except Exception:  # noqa: BLE001 - 独立运行时退回 CWD
-                    project_root = Path.cwd()
-            path_obj = project_root / path_obj
+            resolved = next(
+                (
+                    candidate
+                    for candidate in self._model_path_candidates(path_obj)
+                    if candidate.exists()
+                ),
+                None,
+            )
+            if resolved is not None:
+                path_obj = resolved
         if path_obj.exists():
             model_path_or_id = str(path_obj.resolve())
             logger.info(f"Using local embedding model: {model_path_or_id}")
         elif self._looks_like_filesystem_path(embedding_model):
             # 只把「看起来是文件路径」的值当作缺失的本地模型：HuggingFace
             # 模型 ID（如 BAAI/bge-small-zh-v1.5）里的 / 不是路径分隔符，
-            # 不能替换成默认模型（会违背调用方的显式选择）
+            # 不能替换成默认模型（会违背调用方的显式选择）。默认配置的
+            # 标准模型未下载时回退到同名 HF 模型无害；**显式配置的本地
+            # 路径缺失必须报错**——静默换成 BAAI 会让查询向量与库内向量
+            # 来自不同模型（维度检查抓不到同维模型），检索静默失真。
+            if embedding_model != default_local_model:
+                raise RuntimeError(
+                    f"配置的本地嵌入模型路径不存在：{embedding_model}"
+                    "（请下载该模型，或修改 RAG_CONFIG['embedding_model']）"
+                )
             logger.warning(
-                f"Configured embedding path does not exist: {embedding_model}，将使用 BAAI/bge-small-zh-v1.5 并尝试联网下载。"
+                f"Configured embedding path does not exist: {embedding_model}，"
+                "将使用同名 HuggingFace 模型 BAAI/bge-small-zh-v1.5 并尝试联网下载。"
             )
             model_path_or_id = "BAAI/bge-small-zh-v1.5"
         logger.info(f"Loading embedding model: {model_path_or_id}")
@@ -237,6 +243,36 @@ class RAGKnowledgeAgent(AgentBase):
     def milvus_client(self):
         """每次从共享注册表取当前客户端，避免重连后其它会话持有已关闭句柄。"""
         return get_milvus_client(self._milvus_db_path)
+
+    @staticmethod
+    def _model_path_candidates(path_obj: Path) -> list[Path]:
+        """相对嵌入模型路径的候选锚点（按优先级）。
+
+        config 模块目录（源码仓库根）→ 运行期数据目录（wheel 的用户数据
+        目录 / ALIGO_DATA_DIR）→ 技能目录在仓库内时的传统锚点 → CWD。
+        不能只用 ``parents[4]``：ALIGO_SKILLS_DIR 指向外部目录或 wheel
+        安装时，锚点会落在用户主目录 / venv 根等无关但存在的目录，
+        配置的本地模型永远找不到。
+        """
+        candidates: list[Path] = []
+        try:
+            import config as _config
+
+            candidates.append(Path(_config.__file__).resolve().parent / path_obj)
+        except Exception:  # noqa: BLE001 - 独立运行（无 config）
+            pass
+        try:
+            from utils.paths import default_data_root
+
+            candidates.append(default_data_root() / path_obj)
+        except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
+            pass
+        try:
+            candidates.append(Path(__file__).resolve().parents[4] / path_obj)
+        except IndexError:
+            pass
+        candidates.append(Path.cwd() / path_obj)
+        return candidates
 
     @staticmethod
     def _looks_like_filesystem_path(value: str) -> bool:
@@ -595,9 +631,13 @@ class RAGKnowledgeAgent(AgentBase):
                 else sorted(set(range(1, total_parts + 1)) - seen_parts)
             )
             if missing:
-                assembled_meta["missing_parts"] = ",".join(
-                    str(item) for item in missing
-                )
+                # 缺失分片号有界展示：一条脏记录声明数万分片时，完整 join
+                # 会把数百 KB 文本注入 LLM prompt 并随元数据落库
+                shown = missing[:50]
+                text = ",".join(str(item) for item in shown)
+                if len(missing) > len(shown):
+                    text += f"…（共 {len(missing)} 个缺失）"
+                assembled_meta["missing_parts"] = text
             assembled.append(
                 {
                     "id": group_id,
