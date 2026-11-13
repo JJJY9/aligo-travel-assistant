@@ -22,7 +22,7 @@
 - 「上海差旅有什么注意事项？」
 
 **会干啥：** 用 RAG 从项目知识库（`data/documents/`）检索文档，用 LLM 生成答案，并给出参考来源。  
-**前置条件：** 已运行过 `python scripts/init_knowledge_base.py`。
+**前置条件：** 已运行过 `python .claude/skills/ask-question/script/init_knowledge_base.py`。
 
 ---
 
@@ -96,6 +96,7 @@ Claude 会依次用 **query-info**（天气）和 **ask-question**（住宿标�
 | **plan-trip** | 行程规划 | 「规划行程」「从XX到XX」「X月X日去北京」 | IntentionAgent → EventCollectionAgent → ItineraryPlanningAgent |
 | **memory-query** | 查询用户自己的历史行程与偏好 | 「我去过哪些地方」「我上次去北京是什么时候」 | MemoryQueryAgent |
 | **preference** | 保存/追加/覆盖用户偏好 | 「我喜欢住汉庭」「我还喜欢如家」「我搬家到上海了」 | PreferenceAgent |
+| **event-collection** | 从对话中抽取出发地、目的地、日期等事项 | 「2 月 27 日从上海去北京出差」 | EventCollectionAgent |
 
 ---
 
@@ -109,16 +110,15 @@ Claude 会依次用 **query-info**（天气）和 **ask-question**（住宿标�
    所有子 Agent 的 `reply()` 均为 **async**，调用时需 **await**。
 
 3. **模型创建**  
+   统一用 `config_agentscope.create_chat_model()`：非流式（`stream=False`，
+   agentscope 1.0.16 的流式解析在 DeepSeek 等标准 OpenAI 兼容服务上会崩溃），
+   `temperature` / `max_tokens` 通过 `generate_kwargs` 传入（作为构造函数顶层
+   参数会被静默忽略），并默认关闭 SDK 内建重试（由应用层 `retry_with_backoff`
+   统一重试）。
    ```python
-   from agentscope.model import OpenAIChatModel
-   from config import LLM_CONFIG
-   model = OpenAIChatModel(
-       model_name=LLM_CONFIG["model_name"],
-       api_key=LLM_CONFIG["api_key"],
-       client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-       temperature=LLM_CONFIG.get("temperature", 0.7),
-       max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-   )
+   from config_agentscope import create_chat_model
+
+   model = create_chat_model()
    ```
 
 4. **依赖 main.py / cli.py**  
@@ -150,7 +150,8 @@ Claude 会依次用 **query-info**（天气）和 **ask-question**（住宿标�
 ├── query-info/SKILL.md
 ├── plan-trip/SKILL.md
 ├── memory-query/SKILL.md
-└── preference/SKILL.md
+├── preference/SKILL.md
+└── event-collection/SKILL.md
 ```
 
 ---

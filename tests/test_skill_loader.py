@@ -47,6 +47,26 @@ def test_load_skills_tolerates_malformed_entries():
     print("✓ 技能加载容忍损坏的 frontmatter")
 
 
+def test_dispatchable_only_excludes_doc_only_skills():
+    """只列出含 script/agent.py 的可调度技能：纯文档技能不会被宣传给模型。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_dispatch_")
+    _write(
+        os.path.join(root, "with-agent", "SKILL.md"),
+        "---\nname: with-agent\ndescription: 可执行技能\n---\n",
+    )
+    _write(os.path.join(root, "with-agent", "script", "agent.py"), "")
+    _write(
+        os.path.join(root, "docs-only", "SKILL.md"),
+        "---\nname: docs-only\ndescription: 纯文档技能\n---\n",
+    )
+    loader = SkillLoader(root, dispatchable_only=True)
+    skills = loader.load_skills()
+    assert set(skills) == {"with-agent"}, skills
+    # 默认（不限制）仍列出纯文档技能，供技能内容注入等其它用途使用
+    assert set(SkillLoader(root).load_skills()) == {"with-agent", "docs-only"}
+    print("✓ 只列出可调度技能（纯文档技能被排除）")
+
+
 def test_get_skill_prompt_sorted_and_mapped():
     """提示词按名称排序；映射生效；缺失描述不报错。"""
     loader = SkillLoader(_make_skills_dir())

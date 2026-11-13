@@ -294,6 +294,60 @@ def test_loaded_agent_accessors(monkeypatch):
     print("✓ values / items / get_loaded_agents")
 
 
+def test_module_executed_once_across_registries(monkeypatch):
+    """同一技能脚本进程内只执行一次：模块级状态不按会话复制。"""
+    root = Path(tempfile.mkdtemp())
+    marker = root / "exec_count.txt"
+    source = (
+        "from pathlib import Path\n"
+        f"p = Path({str(marker)!r})\n"
+        "p.write_text(str(int(p.read_text(encoding='utf-8')) + 1) "
+        "if p.exists() else '1', encoding='utf-8')\n"
+    ) + _AGENT_SOURCE
+    _write_skill(root, "demo-skill", source)
+    monkeypatch.setattr(lazy_agent_registry, "resolve_skills_root", lambda: root)
+    first = LazyAgentRegistry(model="fake-model", cache={})
+    second = LazyAgentRegistry(model="fake-model", cache={})
+    first_agent = first["demo-skill"]
+    second_agent = second["demo-skill"]
+    assert marker.read_text(encoding="utf-8") == "1", "技能模块被重复执行"
+    assert first_agent is not second_agent, "每个注册器仍应各自实例化"
+    print("✓ 技能模块跨注册器只执行一次")
+
+
+def test_agent_class_selection_ignores_imported_subclass(monkeypatch):
+    """只实例化技能模块自己定义的 AgentBase 子类，不选它 import 的类。"""
+    import types
+
+    from agentscope.agent import AgentBase
+
+    helper = types.ModuleType("fake_helper_module")
+
+    class ImportedAgent(AgentBase):
+        async def reply(self, x=None):
+            return None
+
+    helper.ImportedAgent = ImportedAgent
+    monkeypatch.setitem(sys.modules, "fake_helper_module", helper)
+    source = "from fake_helper_module import ImportedAgent\n" + _AGENT_SOURCE
+    registry = _registry(monkeypatch, {"demo": source})
+    agent = registry["demo"]
+    assert type(agent).__name__ == "DemoAgent", type(agent).__name__
+    print("✓ 忽略 import 进来的 AgentBase 子类")
+
+
+def test_cache_is_keyed_by_skill_name(monkeypatch):
+    """标准名与目录名命中同一缓存实例（注册/删除不再绕过或残留）。"""
+    registry = _registry(monkeypatch, {"plan-trip": _AGENT_SOURCE})
+    standard = registry["itinerary_planning"]
+    directory = registry["plan-trip"]
+    assert standard is directory
+    assert set(registry.cache) == {"plan-trip"}
+    del registry["plan-trip"]
+    assert registry.cache == {}
+    print("✓ 缓存按技能目录名统一")
+
+
 if __name__ == "__main__":
     for case in (
         test_uninitialized_agents_not_cached,
@@ -312,6 +366,9 @@ if __name__ == "__main__":
         test_project_root_is_added_to_sys_path,
         test_loaded_agent_accessors,
         test_console_output_failure_does_not_break_loading,
+        test_module_executed_once_across_registries,
+        test_agent_class_selection_ignores_imported_subclass,
+        test_cache_is_keyed_by_skill_name,
     ):
         mp = pytest.MonkeyPatch()
         try:
