@@ -140,6 +140,13 @@ MAX_TRIP_ENTRIES = 5000
 # 无限排队会让前端超时后仍被迟到的删除改掉历史
 _DELETE_LOCK_TIMEOUT_SEC = 10.0
 
+# 对话入口等待同一用户锁的上限：排队期间响应头尚未发出、SSE 心跳也没
+# 开始，反向代理读超时（nginx 默认 60s）会把仍在排队的请求变成 504，
+# 而服务端随后还会为已断开的客户端构造会话并启动回合。最多等 55 秒，
+# 期间短轮询客户端断开；超时返回 503 + Retry-After，客户端可明确重试
+_CHAT_LOCK_WAIT_SEC = 55.0
+_CHAT_LOCK_POLL_SEC = 0.5
+
 # 备份导入在读取 64MB 请求体前就先占用导入名额：客户端只发请求头、
 # 不发 body 时不能让名额被无限期占住（两个连接即可让所有导入 503）
 IMPORT_BODY_READ_TIMEOUT_SEC = 60.0
@@ -2941,6 +2948,36 @@ async def _ask_cancellable_on_disconnect(
         raise
 
 
+async def _acquire_chat_lock(
+    request: Request, lock: asyncio.Lock, request_id: str
+) -> None:
+    """等待同一用户的对话锁：期间检查客户端是否已断开，超时给出明确 503。
+
+    排队期间没有响应头与心跳，代理读超时（60s）会让客户端拿到 504；
+    服务端不应在锁释放后继续为已断开的请求构造会话、启动回合。
+    """
+    deadline = time.monotonic() + _CHAT_LOCK_WAIT_SEC
+    while True:
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_CHAT_LOCK_POLL_SEC)
+            return
+        except asyncio.TimeoutError:
+            if await request.is_disconnected():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"客户端已断开（请求 ID：{request_id}）",
+                ) from None
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "同一用户已有对话正在进行，请稍后再试"
+                        f"（请求 ID：{request_id}）"
+                    ),
+                    headers={"Retry-After": "5"},
+                ) from None
+
+
 def create_app(model: Any = None) -> FastAPI:
     """创建 FastAPI 应用（测试时可注入自定义模型）。"""
     state = AligoWebApp(model=model)
@@ -4406,7 +4443,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 的状态码；此前异常发生在首个事件之前，只能得到一个已建立又中断的
         # 空流。锁在流结束时释放。
         lock = state.lock_for(payload.user_id)
-        await lock.acquire()
+        await _acquire_chat_lock(request, lock, rid)
         lease: _SessionTurnLease | None = None
         try:
             if await asyncio.to_thread(
