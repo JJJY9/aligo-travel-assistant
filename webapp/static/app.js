@@ -1781,15 +1781,17 @@ async function importUserBackup() {
       result.knowledge_imported || result.knowledge_skipped
         ? `，知识片段新增 ${result.knowledge_imported} / 跳过 ${result.knowledge_skipped} 条`
         : "";
-    toast(
+    let restoreMessage =
       `已恢复：偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
-        `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
-        knowledgeNote +
-        (skipped ? `，跳过 ${skipped} 项` : ""),
-    );
+      `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
+      knowledgeNote +
+      (skipped ? `，跳过 ${skipped} 项` : "");
     if (result.knowledge_error) {
-      toast(`知识片段未恢复：${result.knowledge_error}`);
+      // 与摘要合并成一条：同一 tick 的第二次 toast 会复用同一元素并重置
+      // 计时，恢复计数摘要永远不会显示，只剩知识片段失败提示
+      restoreMessage += `；知识片段未恢复：${result.knowledge_error}`;
     }
+    toast(restoreMessage);
     if (state.userId !== targetUser) {
       // 写入的目标用户已不是当前身份：面板刷新会显示新用户的旧数据，
       // 反而误导；恢复结果已落库，切回后重新打开面板即可看到
@@ -4310,6 +4312,16 @@ function startEditPreference(row, type, currentValue) {
 
   const save = async () => {
     if (settled) return;
+    const displayValue = preferenceInputValue(currentValue);
+    if (displayValue && input.value === displayValue) {
+      // 用户没有改动：直接关闭编辑器。存储值可能含换行 / 首尾空白，而
+      // <input> 赋值会做 HTML 值清洗、保存又 trim——继续 PUT 会把清洗后
+      // 的派生值写回，未修改的偏好被静默改写
+      settled = true;
+      if (input.isConnected) input.replaceWith(valueEl);
+      focusRowEdit();
+      return;
+    }
     const text = input.value.trim();
     if (!text) {
       toast("偏好内容不能为空");
@@ -5263,8 +5275,16 @@ async function addKnowledgeDocument(event) {
     );
     state.kbSaving = false;
     const parts = Number((data && data.parts) || 0);
+    const unchanged = Boolean(data && data.unchanged);
     let message;
-    if (editingId && editingGroupParts > 1) {
+    if (editingId && unchanged) {
+      // 服务端判定内容未修改时提前返回、不带 parts：不能按「1 片已更新」
+      // 谎报，用户会以为整份文档被重建过
+      message =
+        editingGroupParts > 1
+          ? `整份文档内容未修改（${editingGroupParts} 片）`
+          : "知识片段内容未修改";
+    } else if (editingId && editingGroupParts > 1) {
       // 内容缩短成单条时服务端不再返回 parts：提示按实际（1 片）展示
       const resultParts = parts > 1 ? parts : 1;
       message = `整份文档已更新（${resultParts} 片）`;
