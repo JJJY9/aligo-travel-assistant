@@ -92,6 +92,7 @@ from utils.knowledge_admin import (
 from utils.knowledge_stats import knowledge_status
 from utils.log_redact import redact_local_paths, redact_paths, redact_secret
 from utils.metrics import REQUEST_METRICS
+from utils.paths import default_data_root
 from utils.preference_values import has_preference_value
 from utils.rate_limit import create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
@@ -237,7 +238,9 @@ def _security_headers_for(path: str) -> list[tuple[bytes, bytes]]:
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MEMORY_DIR = PROJECT_ROOT / "data" / "memory"
+# wheel 安装后 PROJECT_ROOT 是 site-packages：数据目录按运行形态选择
+# （ALIGO_DATA_DIR / 用户数据目录），重建 venv 不会丢用户记忆
+MEMORY_DIR = default_data_root() / "memory"
 # 未匹配路由（404 / 405）的指标路径统一取值，避免任意路径撑爆指标基数
 _UNMATCHED_METRIC_PATH = "__unmatched__"
 # 路由前即被拒绝的请求（Content-Length 预检 413、尾斜杠 307/308 重定向）

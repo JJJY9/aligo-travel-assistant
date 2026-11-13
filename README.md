@@ -356,6 +356,8 @@ aligo-web        # 启动 Web 界面（也可用 python -m webapp.server）
 aligo            # 启动交互式 CLI
 ```
 
+wheel 安装后**数据目录不再写入安装前缀**（site-packages 会随 venv 重建 / `pipx reinstall` 整体消失）：默认使用用户数据目录（Windows `%LOCALAPPDATA%/aligo/data`，其它 `$XDG_DATA_HOME/aligo/data` 或 `~/.local/share/aligo/data`），可用 `ALIGO_DATA_DIR` 指定；源码目录运行时仍为 `<仓库>/data`。`config_local.py` 按**当前运行目录**显式加载，console script（`aligo-web`）启动也能生效。
+
 安装后可访问 `/api/health` 确认 `skills.count` 为 6（或运行 `aligo skills` / `aligo doctor` 查看「技能目录」检查；源码目录下等价命令为 `python cli.py skills` / `python cli.py doctor`）；若为 0，用环境变量 `ALIGO_SKILLS_DIR` 指向技能目录。
 
 RAG 知识库文档、嵌入模型与记忆数据属于运行时数据，不随安装包分发，需要按「知识库初始化」自行准备；技能目录可用环境变量 `ALIGO_SKILLS_DIR` 覆盖。

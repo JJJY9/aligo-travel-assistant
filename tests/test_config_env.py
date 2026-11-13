@@ -269,10 +269,43 @@ def test_llm_request_timeout_env():
     print("✓ 模型超时默认 120s 且可用环境变量覆盖")
 
 
+def test_config_local_loaded_without_cwd_on_sys_path():
+    """console script / wheel 启动（sys.path 不含 CWD）仍加载运行目录的 config_local.py。"""
+    tmp = tempfile.mkdtemp(prefix="chailv_cfg_")
+    Path(tmp, "config_local.py").write_text(
+        'API_KEY = "sk-file-local"\n', encoding="utf-8"
+    )
+    script = (
+        "import importlib.util, os, sys;"
+        "cwd = os.getcwd();"
+        "sys.path = [p for p in sys.path if p not in ('', cwd)];"
+        f"spec = importlib.util.spec_from_file_location('config', r'{project_root}/config.py');"
+        "config = importlib.util.module_from_spec(spec);"
+        "spec.loader.exec_module(config);"
+        "print(repr(config.LLM_CONFIG['api_key']))"
+    )
+    env = dict(os.environ)
+    env.pop("LLM_API_KEY", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == repr("sk-file-local"), result.stdout
+    print("✓ sys.path 无 CWD 时按显式路径加载 config_local.py")
+
+
 if __name__ == "__main__":
     test_api_key_is_stripped_and_blank_falls_back()
     test_storage_urls_strip_whitespace_and_bom()
     test_llm_request_timeout_env()
+    test_config_local_loaded_without_cwd_on_sys_path()
     test_broken_config_local_import_is_not_swallowed()
     test_empty_env_model_and_base_url_fall_back()
     test_create_chat_model_max_retries_param()

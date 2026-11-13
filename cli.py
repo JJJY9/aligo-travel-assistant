@@ -31,6 +31,7 @@ from utils.console import (
 )
 from utils.errors import MemoryPersistenceError
 from utils.identifiers import is_valid_web_id
+from utils.paths import default_data_root
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import has_preference_value, is_manageable_pref_type
@@ -1268,7 +1269,9 @@ class AligoCLI:
         # strict：PostgreSQL 配置但不可用时，user-export 与 /api/export 都会
         # 明确拒绝；交互式导出不能静默导出空 / 过期的回退 JSON 并宣称成功
         try:
-            store = create_long_term_memory(self.user_id, "data/memory", strict=True)
+            store = create_long_term_memory(
+                self.user_id, str(default_data_root() / "memory"), strict=True
+            )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             self.console.print(f"[red]导出中止：{exc}[/red]")
             return
@@ -3343,7 +3346,7 @@ def run_trips_dedupe_standalone(
     from utils.trip_dedupe import apply_trip_dedupe, plan_trip_dedupe
 
     try:
-        store = create_long_term_memory(user_id, "data/memory")
+        store = create_long_term_memory(user_id, str(default_data_root() / "memory"))
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"打开长期记忆失败：{exc}")
 
@@ -3478,7 +3481,7 @@ def _open_cli_store(user_id: str):
     from context.long_term_memory import LongTermMemory
     from context.storage import create_long_term_memory
 
-    store = create_long_term_memory(user_id, "data/memory")
+    store = create_long_term_memory(user_id, str(default_data_root() / "memory"))
     if STORAGE_CONFIG.get("postgres_dsn") and isinstance(store, LongTermMemory):
         close = getattr(store, "close", None)
         if callable(close):
