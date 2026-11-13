@@ -30,6 +30,28 @@ def _env_str(name: str, default: str) -> str:
     return value or default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        # 静默回退会让一次笔误（如 CHAT_RATE_LIMIT=2,000）变成看不见的默认值
+        logger.warning(
+            "环境变量 %s=%r 不是整数，使用默认值 %s",
+            name,
+            str(raw)[:40],
+            default,
+        )
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 # 密钥必须 strip：复制粘贴带尾随空格 / 换行时，httpx 会拒绝非法 header
 # 值（Bearer sk-xxx␠），所有请求变成「Connection error」且异常链带完整
 # 密钥进日志；纯空白值按未设置处理（否则会阻止回退 config_local.py）
@@ -113,7 +135,10 @@ SYSTEM_CONFIG: SystemConfig = {
     "enable_llm": True,  # Set to True to use LLM (recommended), False for rule-based
     "log_level": "INFO",
     "max_retries": 3,
-    "timeout": 60,  # Increased timeout for better stability
+    # 非流式请求的 read 超时兜住整段生成时间：max_tokens=8192 在长行程 /
+    # 大历史下可能超过 60s，60s 会让正常请求 ReadTimeout 并被应用层整轮
+    # 重试（重复计费）。默认 120s，可用 LLM_REQUEST_TIMEOUT_SEC 调整
+    "timeout": _env_int("LLM_REQUEST_TIMEOUT_SEC", 120),
 }
 
 # RAG 知识库：嵌入模型（本地路径，无需连 HuggingFace）
@@ -126,28 +151,6 @@ RAG_CONFIG: RAGConfig = {
 #   REDIS_URL     例如 redis://localhost:6379/0 —— 启用 Redis 短期记忆
 #   DATABASE_URL  例如 postgresql://user:pass@localhost:5432/db —— 启用 PostgreSQL 长期记忆
 #   未设置时分别使用进程内滑动窗口 / data/memory/*.json
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, str(default))
-    try:
-        return int(raw)
-    except ValueError:
-        # 静默回退会让一次笔误（如 CHAT_RATE_LIMIT=2,000）变成看不见的默认值
-        logger.warning(
-            "环境变量 %s=%r 不是整数，使用默认值 %s",
-            name,
-            str(raw)[:40],
-            default,
-        )
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
 STORAGE_CONFIG: StorageConfig = {
     # 必须 strip / 去 BOM：K8s --from-file 的尾随换行会让 DATABASE_URL 的
     # 换行并进库名（连接永久失败、长期记忆静默落回本地 JSON），前导空白
