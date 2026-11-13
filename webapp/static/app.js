@@ -100,6 +100,8 @@ const state = {
   kbDeleting: new Set(),
   kbImporting: false,
   kbEditingId: null,
+  // 回填后的 textarea 基线：再次点同一行「编辑」时据此判断草稿是否被修改
+  kbEditBaseline: "",
   kbEditingMetadata: {},
   kbEditingGroupParts: 0,
   kbEditSeq: 0,
@@ -150,6 +152,14 @@ const RESERVED_DEVICE_NAMES = new Set([
   ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`),
 ]);
 
+// 启动后校验：历史遗留的非法 / 设备保留名 ID 会让所有请求 422、界面不可用
+function sanitizeStoredUserId() {
+  if (isValidId(state.userId)) return;
+  state.userId = "web_user";
+  safeStorageRemove("session", "aligo.userId");
+  safeStorageRemove("local", "aligo.userId");
+}
+
 function isValidId(value) {
   // 与服务端 _ID_PATTERN（pydantic-core 的 Rust \w：Alphabetic + Mark +
   // Nd + Pc + Join_Control）同一集合：CLI / API 建出的含组合符 / 零宽
@@ -165,6 +175,9 @@ function isValidId(value) {
     return /^[A-Za-z0-9_一-龥-]{1,64}$/.test(text);
   }
 }
+
+// state 在常量定义之前创建：存储里的非法 ID 在这里统一回退
+sanitizeStoredUserId();
 
 /* 深链接：?user=...&session=... 可直接打开某个会话 */
 (function applyUrlState() {
@@ -551,7 +564,13 @@ function renderInline(raw) {
     const label = restoreCode(
       link.label.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>"),
     );
-    return `<a href="${link.href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    // URL 里出现行内代码占位符时还原为原文（不带 <code> 标签）：
+    // 否则 href 里残留私用区占位符，链接地址不可用
+    const href = String(link.href).replace(
+      /(\d+)/g,
+      (_, index) => codeSpans[Number(index)] ?? "",
+    );
+    return `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
   });
 }
 
@@ -1641,6 +1660,9 @@ async function addTrip(event) {
     purpose: els.tripPurpose.value.trim(),
   };
   els.tripSubmit.disabled = true;
+  // 保存请求已发出：允许点「取消」只会清空表单、让在途写入继续落库，
+  // 随后又弹出「已添加」——与知识库表单同口径禁用
+  els.tripCancel.disabled = true;
   try {
     let message = "行程已更新";
     if (editingId) {
@@ -1679,6 +1701,7 @@ async function addTrip(event) {
     toast(error.message);
   } finally {
     els.tripSubmit.disabled = false;
+    els.tripCancel.disabled = false;
   }
 }
 
@@ -1809,11 +1832,14 @@ async function importUserBackup() {
       // 计时，恢复计数摘要永远不会显示，只剩知识片段失败提示
       restoreMessage += `；知识片段未恢复：${result.knowledge_error}`;
     }
+    if (state.userId !== targetUser) {
+      // 合并成一条：同一 tick 的第二次 toast 会覆盖计数摘要
+      restoreMessage +=
+        "；用户已切换，面板未刷新（恢复结果写入原用户，切回后重新打开面板即可看到）";
+    }
     toast(restoreMessage);
     if (state.userId !== targetUser) {
-      // 写入的目标用户已不是当前身份：面板刷新会显示新用户的旧数据，
-      // 反而误导；恢复结果已落库，切回后重新打开面板即可看到
-      toast("用户已切换，面板未刷新；恢复结果写入原用户，切回后重新打开面板即可看到");
+      // 面板刷新会显示新用户的旧数据，跳过刷新
     } else {
       await Promise.all([
         refreshStatus(),
@@ -3698,6 +3724,7 @@ function renderOverview() {
     preferences.forEach(([key, value]) => {
       const row = document.createElement("div");
       row.className = "pref-row";
+      row.dataset.prefType = key;
       const label = document.createElement("span");
       label.className = "pref-name";
       label.textContent = PREF_NAMES[key] || key;
@@ -4233,7 +4260,9 @@ function newPreferenceValue(type, text) {
       .split(/[、，,]/)
       .map((item) => item.trim())
       .filter(Boolean);
-    return items.length ? items : text;
+    // 全是分隔符 / 空白时返回空数组，由调用方提示「请输入至少一个」——
+    // 原样返回 "、" 会把分隔符当作偏好值写入
+    return items;
   }
   if (type === "budget_level") {
     const number = Number(text);
@@ -4257,7 +4286,12 @@ async function addPreference(event) {
     toast("请输入偏好值");
     return;
   }
+  if (LIST_PREF_TYPES.has(type) && !newPreferenceValue(type, text).length) {
+    toast("请输入至少一个偏好项（不能只有分隔符）");
+    return;
+  }
   els.prefSubmit.disabled = true;
+  els.prefCancel.disabled = true;
   try {
     await getJSON(`/api/preferences/${encodeURIComponent(type)}`, {
       method: "PUT",
@@ -4277,6 +4311,7 @@ async function addPreference(event) {
     toast(error.message);
   } finally {
     els.prefSubmit.disabled = false;
+    els.prefCancel.disabled = false;
   }
 }
 
@@ -4305,11 +4340,29 @@ function preferenceOutputValue(original, text) {
   // 字面量化成字符串（从对象变成 JSON 字符串同样是数据损坏）
   if (text === preferenceInputValue(original)) return original;
   if (Array.isArray(original)) {
+    if (original.some((item) => item !== null && typeof item === "object")) {
+      // 对象数组不能按「、，,」拆分（会把对象拆成字符串碎片）：整段按
+      // JSON 解析；解析失败返回 undefined 由调用方提示
+      try {
+        const parsed = JSON.parse(text);
+        return Array.isArray(parsed) ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    }
     // 与「添加偏好」保持一致：ASCII 逗号同样视为分隔符
     return text
       .split(/[、，,]/)
       .map((item) => item.trim())
       .filter(Boolean);
+  }
+  if (original !== null && typeof original === "object") {
+    try {
+      const parsed = JSON.parse(text);
+      return parsed !== null && typeof parsed === "object" ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
   }
   const trimmed = text.trim();
   if (
@@ -4347,7 +4400,14 @@ function startEditPreference(row, type, currentValue) {
     // blur 掉（blur → cancel），用户刚输入的偏好被静默丢弃
     const active = document.activeElement;
     if (active && active !== document.body) return;
-    const editButton = row.querySelector('button[title="编辑偏好"]');
+    let target = row;
+    if (typeof target.isConnected === "boolean" && !target.isConnected) {
+      // refreshStatus 已重建概览：旧行脱离文档，按其类型找新行
+      const rows = els.overview.querySelectorAll(".pref-row");
+      target =
+        Array.from(rows).find((item) => item.dataset.prefType === type) || row;
+    }
+    const editButton = target.querySelector('button[title="编辑偏好"]');
     if (editButton) editButton.focus();
   };
 
@@ -4364,7 +4424,10 @@ function startEditPreference(row, type, currentValue) {
   const save = async () => {
     if (settled) return;
     const displayValue = preferenceInputValue(currentValue);
-    if (displayValue && input.value === displayValue) {
+    // <input> 赋值会剥离 CR/LF：含换行的原始值直接比较恒不相等，
+    // 「未修改」保护失效，回车保存会把去换行的派生值 PUT 回去
+    const expectedInput = displayValue.replace(/[\r\n]/g, "");
+    if (displayValue && input.value === expectedInput) {
       // 用户没有改动：直接关闭编辑器。存储值可能含换行 / 首尾空白，而
       // <input> 赋值会做 HTML 值清洗、保存又 trim——继续 PUT 会把清洗后
       // 的派生值写回，未修改的偏好被静默改写
@@ -4381,6 +4444,12 @@ function startEditPreference(row, type, currentValue) {
     }
     settled = true;
     const value = preferenceOutputValue(currentValue, text);
+    if (value === undefined) {
+      settled = false;
+      toast("对象型偏好请保持合法的 JSON 格式");
+      input.focus();
+      return;
+    }
     if (Array.isArray(value) && !value.length) {
       settled = false;
       toast("偏好内容不能为空");
@@ -5200,8 +5269,13 @@ async function startEditKnowledge(doc) {
     return;
   }
   // 表单里已有未提交的新增 / 编辑草稿时先确认：点行内「编辑」会直接
-  // 覆盖，用户会以为刚输入的内容被保存了
-  if (els.kbContent.value.trim() && state.kbEditingId !== doc.id) {
+  // 覆盖，用户会以为刚输入的内容被保存了。同一行再次点击也不例外——
+  // 编辑期间列表仍可点击，此前同 id 会跳过确认直接重置 textarea
+  const editingSameDoc = state.kbEditingId === doc.id;
+  if (
+    els.kbContent.value.trim() &&
+    (!editingSameDoc || els.kbContent.value !== state.kbEditBaseline)
+  ) {
     if (!window.confirm("表单里有未提交的内容，编辑将覆盖，继续？")) return;
   }
   const seq = (state.kbEditSeq += 1);
@@ -5265,6 +5339,7 @@ async function startEditKnowledge(doc) {
       ? `正在编辑整份文档（${groupParts} 片），保存后整组替换`
       : "新增知识片段，例如：一线城市住宿标准为每晚 600 元";
   els.kbContent.value = content;
+  state.kbEditBaseline = content;
   els.kbCategory.value = doc.metadata?.category ? String(doc.metadata.category) : "";
   els.kbSubmit.textContent = "保存修改";
   els.kbCancel.hidden = false;
@@ -5278,6 +5353,7 @@ async function startEditKnowledge(doc) {
 function resetKnowledgeForm({ clear = true } = {}) {
   state.kbEditSeq += 1; // 作废可能在途的整组回填请求
   state.kbEditingId = null;
+  state.kbEditBaseline = "";
   state.kbEditingMetadata = {};
   state.kbEditingGroupParts = 0;
   els.kbContent.maxLength = 2000;
@@ -5737,6 +5813,12 @@ async function saveUser() {
     return;
   }
   const value = els.userIdInput.value.trim() || "web_user";
+  if (RESERVED_DEVICE_NAMES.has(value.toLowerCase())) {
+    // 设备保留名（con / nul / com1…）满足字符规则但不被服务端接受：
+    // 固定文案会让用户反复改大小写仍无法成功
+    toast("用户 ID 不能使用系统设备保留名（如 con / nul / com1），请换一个");
+    return;
+  }
   if (!isValidId(value)) {
     toast("用户 ID 只能包含中文、字母、数字、下划线和短横线");
     return;

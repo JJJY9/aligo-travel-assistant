@@ -246,6 +246,35 @@ def test_send_message_confirms_pending_edit_draft():
     print("✓ 发送前确认未保存的编辑草稿")
 
 
+def test_editor_round2_preferences_and_guards():
+    """对象偏好 JSON 编辑、分隔符校验、保存中取消禁用、KB 重入确认、保留名提示、链接占位符。"""
+    data = _run_harness("editorsRound2")
+    pref = data["prefObject"]
+    assert pref["array"] == [{"name": "如家", "level": 2}], pref
+    assert "arrayInvalid" not in pref, "非法 JSON 必须返回未定义而不是部分数据"
+    assert "objectInvalid" not in pref, pref
+    assert pref["objectKeep"] == {"a": 2}, pref
+    assert pref["plainList"] == ["汉庭", "如家"], pref
+
+    delim = data["delimiterOnly"]
+    assert delim["puts"] == 0, "仅分隔符不能提交"
+    assert any("至少一个偏好项" in item for item in delim["toasts"]), delim
+
+    assert data["prefCancelDuring"]["cancelDisabled"] is True, data["prefCancelDuring"]
+    assert data["prefCancelAfter"]["cancelDisabled"] is False, data["prefCancelAfter"]
+
+    kb = data["kbReclick"]
+    assert kb["confirmCalls"] == 1, "同一行再次编辑且草稿已修改时必须确认"
+    assert kb["kept"] == "用户新输入的草稿", kb
+
+    assert any("设备保留名" in item for item in data["reservedHint"]), data["reservedHint"]
+
+    href = data["href"]
+    assert "http://example.com/code-x" in href, href
+    assert "" not in href and "" not in href, href
+    print("✓ 偏好编辑 / 保存守卫 / KB 重入确认 / 链接占位符")
+
+
 def test_search_failure_restores_previous_query():
     """搜索失败后查询词回到旧值，列表与「加载更多」保持同一查询口径。"""
     data = _run_harness("sessionSearchFailure")
