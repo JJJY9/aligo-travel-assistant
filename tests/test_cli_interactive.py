@@ -42,6 +42,24 @@ def test_eof_at_user_prompt_exits_cleanly():
     print("✓ stdin EOF 正常退出")
 
 
+def test_console_falls_back_on_invalid_columns(monkeypatch):
+    """COLUMNS=0 / 1（部分终端包装器导出）不能让 Rich 静默丢弃全部输出。"""
+    for value in ("0", "1", "abc"):
+        monkeypatch.setenv("COLUMNS", value)
+        agent = cli.AligoCLI()
+        assert agent.console.width == 80, (value, agent.console.width)
+    print("✓ 无效 COLUMNS 回退 80 宽")
+
+
+def test_nontty_single_line_query_is_not_swallowed():
+    """非 TTY 首行被当作用户 ID、没有后续命令时以非零码退出。"""
+    result = _run_cli("我要去北京\n".encode("utf-8"))
+    output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+    assert result.returncode == 2, output
+    assert "Traceback" not in output, output
+    print("✓ 非 TTY 单行查询不再被静默吞掉（退出码 2）")
+
+
 def test_eof_at_main_prompt_breaks_loop(monkeypatch):
     """主循环 stdin 结束时应退出，而不是每轮打印错误刷屏。"""
     import asyncio
