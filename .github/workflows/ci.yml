@@ -75,8 +75,8 @@ jobs:
       - name: 代码风格检查（ruff）
         run: python -m ruff check .
 
-      - name: 类型检查（mypy）
-        run: python -m mypy .
+      - name: 类型检查（mypy，按矩阵 Python 版本语义）
+        run: python -m mypy --python-version "${{ matrix.python-version }}" .
 
       - name: 回归测试（pytest，无需 API Key）
         run: |
