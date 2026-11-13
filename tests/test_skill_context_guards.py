@@ -279,3 +279,68 @@ def test_search_summary_neutralizes_prompt_markers(monkeypatch):
     assert prompt.count("\n<<<\n") == 1
     assert prompt.count("\n>>>\n") == 1
     print("✓ 搜索结果中的分隔符与结构标记被中和")
+
+
+def test_web_search_unwraps_duckduckgo_redirect_links(monkeypatch):
+    """DDG 后端 href 是 //duckduckgo.com/l/?uddg=…，必须还原为真实地址。"""
+    module_globals = InformationQueryAgent._web_search.__globals__
+    monkeypatch.setitem(module_globals, "DDGS", _FakeDDGS)
+    monkeypatch.setitem(module_globals, "DDGS_AVAILABLE", True)
+    _FakeDDGS.behavior = {
+        "duckduckgo": [
+            {
+                "href": "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&rut=x",
+                "title": "结果",
+                "body": "摘要",
+            }
+        ],
+        "google": [],
+        "auto": [],
+    }
+    agent = _query_agent()
+    agent.model = _FakeModel()
+    agent.skill_loader = _FakeSkillLoader()
+
+    async def _fake_extract(response):
+        return "摘要"
+
+    monkeypatch.setitem(
+        module_globals, "extract_json_from_async_response", _fake_extract
+    )
+    result = asyncio.run(agent._web_search("东京"))
+    assert result["query_success"] is True, result
+    assert result["results"]["sources"][0]["url"] == "https://example.com/a"
+    print("✓ DDG 跳转链接还原为真实地址（不再被当成可疑链接丢弃）")
+
+
+def test_search_summary_failure_is_reported(monkeypatch):
+    """摘要模型失败不能伪装成 query_success=True 的空摘要。"""
+    module_globals = InformationQueryAgent._web_search.__globals__
+    monkeypatch.setitem(module_globals, "DDGS", _FakeDDGS)
+    monkeypatch.setitem(module_globals, "DDGS_AVAILABLE", True)
+    _FakeDDGS.behavior = {
+        "duckduckgo": [
+            {"href": "https://example.com/a", "title": "结果", "body": "摘要"}
+        ],
+        "google": [],
+        "auto": [],
+    }
+
+    class _BoomModel:
+        async def __call__(self, messages):
+            raise TimeoutError("summary model timeout")
+
+    agent = _query_agent()
+    agent.model = _BoomModel()
+    agent.skill_loader = _FakeSkillLoader()
+
+    async def _fake_extract(response):
+        return "摘要"
+
+    monkeypatch.setitem(
+        module_globals, "extract_json_from_async_response", _fake_extract
+    )
+    result = asyncio.run(agent._web_search("住宿"))
+    assert result["query_success"] is False, result
+    assert "timeout" in result["results"]["error"], result
+    print("✓ 摘要模型失败按搜索失败上报，保留瞬时错误文本")

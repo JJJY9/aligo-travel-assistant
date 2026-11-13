@@ -57,6 +57,29 @@ _SUSPICIOUS_DOMAIN_PATTERN = re.compile(
 # 域名主体若为长随机字母（无明显词），则过滤
 _RANDOM_DOMAIN_PATTERN = re.compile(r"^[a-z0-9]{10,}$", re.IGNORECASE)
 _VOWELS = set("aeiou")
+# 相对时间词：必须整段剥离（「下周三 / 本周三 / 三天后 / 下个星期五 / 一周后」），
+# 否则残留的「三 / 后」会与城市名拼成不存在的城市（东京三、后纽约）
+_TIME_WORDS_PATTERN = re.compile(
+    r"(?:大?后天|明天|今天|昨天|前天|"
+    r"[上下这本]个?(?:星期|周)[一二三四五六日天末]?|"
+    r"(?:星期|周)[一二三四五六日天末]|"
+    r"未来|这几天|近期|"
+    r"(?:[一二三四五六七八九十两\d]+)(?:天|周)(?:以?[后前])?|"
+    r"几天|一周|下个?月|这个?月)"
+)
+# 问句前缀 / 动作词：「搜索一下东京天气」「查东京天气」「帮我规划去东京的行程」
+# 不剥离会把「搜索一下」「规划去东」当成城市名
+_QUERY_PREFIX_PATTERN = re.compile(
+    r"^(?:请问|请|麻烦|帮我|帮忙|我想|想知道|告诉我|"
+    r"介绍一下|介绍|推荐一下|推荐|"
+    r"搜索一下|搜索|搜一下|搜搜|查看一下|查看|"
+    r"查找一下|查找|查一下|查查|查询|查|"
+    r"看一下|看看|了解|说一下|说说|聊聊|"
+    r"规划一下|规划|安排一下|安排|计划一下|计划|"
+    r"一下)+"
+)
+# 路线连接词：裸「飞」不能命中「飞机」里的飞（「北京坐飞机去纽约」）
+_ROUTE_SPLIT_PATTERN = re.compile(r"去|到|飞往|飞(?!机)")
 
 
 def _is_suspicious_url(url: str) -> bool:
@@ -86,6 +109,31 @@ def _is_suspicious_url(url: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def _normalize_result_url(href: object) -> str:
+    """还原搜索引擎的跳转链接为真实目标地址。
+
+    duckduckgo 后端的 href 是协议相对的跳转链接
+    ``//duckduckgo.com/l/?uddg=<urlencoded>``；直接按 http 前缀过滤会把
+    DDG 的正常结果全部当成可疑链接丢弃，搜索恒定返回「未找到相关结果」。
+    """
+    url = str(href or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        target = (parse_qs(parsed.query).get("uddg") or [""])[0].strip()
+        if target.startswith("//"):
+            target = "https:" + target
+        if target.startswith(("http://", "https://")):
+            return target
+    return url
 
 
 class InformationQueryAgent(AgentBase):
@@ -159,7 +207,16 @@ class InformationQueryAgent(AgentBase):
         q = (query or "").strip()
         if not q:
             return False
-        return "天气" in q or "气温" in q or "下雨" in q or "预报" in q
+        lowered = q.lower()
+        if "weather" in lowered or "forecast" in lowered:
+            return True
+        return (
+            "天气" in q
+            or "气温" in q
+            or "温度" in q
+            or "下雨" in q
+            or "预报" in q
+        )
 
     async def _weather_query(self, query: str) -> dict[str, Any]:
         """查询天气：从问题里提取城市，复用 utils.weather.fetch_weather。
@@ -259,11 +316,7 @@ class InformationQueryAgent(AgentBase):
         def _clean_city_head(text: str) -> str:
             """去掉方向动词 / 时间词 / 助词 / 标点：'去东京，' → '东京'。"""
             value = text.strip(_CITY_PUNCT)
-            value = re.sub(
-                r"^(?:请问|请|麻烦|帮我|帮忙|我想|想知道|查一下|查查|查询|看看|看一下|一下)+",
-                "",
-                value,
-            )
+            value = _QUERY_PREFIX_PATTERN.sub("", value)
             value = re.sub(
                 r"^(?:我|我们|咱们|你|您|他|她|他们)(?:们|还|也|要|想|准备|"
                 r"计划|打算|即将|马上)?",
@@ -272,12 +325,7 @@ class InformationQueryAgent(AgentBase):
             )
             value = re.sub(r"^(?:最近|现在|目前)", "", value)
             value = re.sub(r"^(?:去|到|飞往|飞|往|在|从|至)+", "", value)
-            value = re.sub(
-                r"(?:明天|今天|后天|昨天|大后天|周[一二三四五六日末]|下周|这周|本周|"
-                r"未来|这几天|近期|\d+天|几天|三天|两天|一周)",
-                "",
-                value,
-            )
+            value = _TIME_WORDS_PATTERN.sub("", value)
             value = value.strip(_CITY_PUNCT)
             value = re.sub(
                 r"(?:这两天|这几天|那几天|几天|那边|这边|当地|出差|旅行|旅游|"
@@ -286,6 +334,33 @@ class InformationQueryAgent(AgentBase):
                 value,
             )
             return value.strip(_CITY_PUNCT)
+
+        def _implausible_city(value: str) -> bool:
+            """兜底片段不是城市：问句词 / 动作词拼进去的残片一律拒绝。"""
+            if not value or value in _CITY_STOPWORDS:
+                return True
+            return any(ch in value for ch in "哪什么怎多少几")
+
+        _ENGLISH_STOPWORDS = frozenset({
+            "weather", "forecast", "temperature", "tomorrow", "today",
+            "tonight", "week", "weekend", "the", "and", "what", "how",
+            "next",
+        })
+
+        def _english_city(text: str) -> str:
+            """英文城市名（London / New York）：取最后一个首字母大写的词组。
+
+            Open-Meteo 地理编码支持英文名；中文提取器此前对纯英文直接放弃，
+            「London天气」「London weather」都拿不到城市。
+            """
+            matches = re.findall(
+                r"[A-Z][A-Za-z.'-]*(?: [A-Z][A-Za-z.'-]*)*", text
+            )
+            for candidate in reversed(matches):
+                cleaned = candidate.strip(" .'-")
+                if len(cleaned) >= 2 and cleaned.lower() not in _ENGLISH_STOPWORDS:
+                    return cleaned
+            return ""
 
         def _destination_city(dest_text: str) -> str:
             """从目的地一侧的文本提取城市；提不到返回空串。"""
@@ -300,20 +375,23 @@ class InformationQueryAgent(AgentBase):
             # 非内置常见城市（如「纽约」）：截到 的 / 天气 / 气温 之前的
             # 2~6 个连续中文字，并去掉方向动词、助词与出行目的后缀
             head = re.split(
-                r"(?:的|天气|气温|怎么样|如何)", dest_text, maxsplit=1
+                r"(?:的|天气|气温|温度|怎么样|如何|weather|forecast)",
+                dest_text,
+                maxsplit=1,
+                flags=re.IGNORECASE,
             )[0]
             head = _clean_city_head(head)
             if 2 <= len(head) <= 6 and re.fullmatch(r"[一-龥]+", head):
-                if head in _CITY_STOPWORDS:
+                if _implausible_city(head):
                     return ""
                 return head
-            return ""
+            return _english_city(head)
 
         # 「从北京去纽约的天气」：行程问句问的是目的地一侧，按最早出现的
         # 城市会答成出发地（纽约不是内置常见城市时尤其明显）
         route = re.split(r"从|自", q, maxsplit=1)
         if len(route) == 2:
-            hop = re.split(r"去|到|飞往|飞", route[1], maxsplit=1)
+            hop = _ROUTE_SPLIT_PATTERN.split(route[1], maxsplit=1)
             if len(hop) == 2:
                 destination = _destination_city(hop[1])
                 if destination:
@@ -330,40 +408,62 @@ class InformationQueryAgent(AgentBase):
             # 「北京到上海的天气」：只有前半段确实是城市时才按目的地解释，
             # 避免「去哪里玩天气」之类的问句被截出假城市。裸「飞」也算
             # 目的地连接词（「明天北京飞上海天气」），与「从/自」分支一致
-            hop = re.split(r"到|去|飞往|飞", q, maxsplit=1)
+            hop = _ROUTE_SPLIT_PATTERN.split(q, maxsplit=1)
             if len(hop) == 2 and any(city in hop[0] for city in common_cities):
                 destination = _destination_city(hop[1])
                 if destination:
                     return destination
+
+        # 「我在北京，上海天气怎么样」「下周去上海出差，北京天气怎么样」：
+        # 天气词所在分句里的城市才是被问的城市，不能按全文最早出现选
+        weather_words = (
+            "天气", "气温", "温度", "下雨", "预报", "weather", "forecast",
+        )
+        for clause in re.split(r"[，,。；;！!？?]", q):
+            lowered_clause = clause.lower()
+            if not any(word in lowered_clause for word in weather_words):
+                continue
+            clause_hits = [
+                (clause.find(city), -len(city), city)
+                for city in common_cities
+                if city in clause
+            ]
+            if clause_hits:
+                clause_hits.sort()
+                return clause_hits[0][2]
 
         # 按在问题中最早出现的位置选择（列表顺序会让「深圳和广州」选成广州）
         hits = [(q.find(city), -len(city), city) for city in common_cities if city in q]
         if hits:
             hits.sort()
             return hits[0][2]
-        # 去掉问句前缀、时间词与对比措辞，取剩余文本中第一段 2~4 个连续中文字
-        head = re.split(
-            r"(?:的?天气|气温|下雨|预报|怎么样|如何|情况|对比)", q, maxsplit=1
-        )[0]
-        head = re.sub(
-            r"^(?:请问|请|麻烦|帮我|帮忙|我想|想知道|查一下|查查|查询|看看|看一下|一下)+",
-            "",
-            head,
+        # 去掉问句前缀、时间词与对比措辞；「纽约到巴黎」「规划去东京」问的是
+        # 目的地一侧，「东京和大阪」「东京的行程」取第一个城市
+        head_parts = re.split(
+            r"(?:的?天气|气温|温度|下雨|预报|怎么样|如何|情况|对比|weather|forecast)",
+            q,
+            maxsplit=1,
+            flags=re.IGNORECASE,
         )
-        head = re.sub(
-            r"(?:明天|今天|后天|昨天|大后天|周[一二三四五六日末]|下周|这周|本周|未来|"
-            r"这几天|近期|\d+天|几天|三天|两天|一周)",
-            "",
-            head,
-        )
+        head = head_parts[0]
+        if not head.strip() and len(head_parts) == 2:
+            # 「weather in London」：城市在天气词之后
+            head = head_parts[1]
+        head = _QUERY_PREFIX_PATTERN.sub("", head)
+        head = _TIME_WORDS_PATTERN.sub("", head)
         head = _clean_city_head(head)
-        match = re.search(r"[一-龥]{2,4}", head)
-        if not match:
-            return ""
-        candidate = match.group(0).strip()
-        if candidate in _CITY_STOPWORDS:
-            return ""
-        return candidate
+        tail = _ROUTE_SPLIT_PATTERN.split(head, maxsplit=1)
+        if len(tail) == 2 and tail[1].strip():
+            head = tail[1]
+        head = re.split(r"和|与|及|、|,|，|的", head, maxsplit=1)[0]
+        head = _clean_city_head(head)
+        match = re.search(r"[一-龥]{2,6}", head)
+        if match:
+            candidate = match.group(0).strip()
+            if _implausible_city(candidate):
+                return ""
+            return candidate
+        return _english_city(head)
 
     async def _web_search(self, query: str) -> dict[str, Any]:
         """
@@ -442,7 +542,7 @@ class InformationQueryAgent(AgentBase):
 
             results = []
             for result in search_results:
-                href = result.get("href", "")
+                href = _normalize_result_url(result.get("href", ""))
                 if _is_suspicious_url(href):
                     continue
                 results.append({
@@ -557,8 +657,10 @@ class InformationQueryAgent(AgentBase):
 
             # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
             text = await extract_json_from_async_response(response)
-
-            return text.strip() if text else "无法生成摘要"
         except Exception as e:
+            # 摘要模型超时 / 401 等不能伪装成 query_success=True 的空摘要：
+            # 向上抛给 _web_search 标记失败，编排层才能按瞬时错误重试 / 计数
             logger.error(f"Summarization failed: {e}")
-            return "搜索成功，但摘要生成失败"
+            raise
+
+        return text.strip() if text else "无法生成摘要"
