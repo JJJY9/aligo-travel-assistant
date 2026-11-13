@@ -442,16 +442,25 @@ class AligoCLI:
             # 的回合不能留下没有对话的幽灵记录。测试替身可能没有该参数，
             # 按签名探测后再传。
             defer_supported = False
+            retry_cache_supported = False
             try:
                 parameters = inspect.signature(
                     self.orchestrator.reply
                 ).parameters
-                defer_supported = "defer_memory" in parameters or any(
+                accepts_var_kwargs = any(
                     item.kind is inspect.Parameter.VAR_KEYWORD
                     for item in parameters.values()
                 )
+                defer_supported = "defer_memory" in parameters or accepts_var_kwargs
+                # 整轮重试复用首轮已成功的子智能体结果（与 ConversationRuntime
+                # 一致）：一次 429/5xx 不再把所有子智能体全部重跑、重复计费
+                retry_cache_supported = (
+                    "retry_cache" in parameters or accepts_var_kwargs
+                )
             except (TypeError, ValueError):
                 defer_supported = False
+                retry_cache_supported = False
+            orchestration_retry_cache: dict[str, dict[str, Any]] = {}
             try:
                 with self.console.status("正在调度智能体…", spinner="dots") as orchestration_status:
 
@@ -461,15 +470,12 @@ class AligoCLI:
                             orchestration_status.update(text)
 
                     def _reply_once():
+                        options: dict[str, Any] = {"on_event": on_progress}
                         if defer_supported:
-                            return self.orchestrator.reply(
-                                intention_result,
-                                on_event=on_progress,
-                                defer_memory=True,
-                            )
-                        return self.orchestrator.reply(
-                            intention_result, on_event=on_progress
-                        )
+                            options["defer_memory"] = True
+                        if retry_cache_supported:
+                            options["retry_cache"] = orchestration_retry_cache
+                        return self.orchestrator.reply(intention_result, **options)
 
                     orchestration_result = await retry_with_backoff(
                         _reply_once,
@@ -551,13 +557,31 @@ class AligoCLI:
                     self.orchestrator, "commit_deferred_memory", None
                 )
                 if defer_supported and callable(commit_deferred):
-                    try:
-                        await commit_deferred()
-                    except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
-                        self.console.print(
-                            "[dim yellow]偏好 / 行程写入记忆失败，"
-                            "可在面板重试[/dim yellow]"
+                    # 落库后、提交前会话可能被其它进程 / 实例删除：复查共享
+                    # 墓碑，删除后丢弃负载（不写带 session_id 的幽灵行程）
+                    deleted = False
+                    deleted_check = getattr(
+                        self.memory_manager, "session_deleted", None
+                    )
+                    if callable(deleted_check):
+                        try:
+                            deleted = await asyncio.to_thread(deleted_check)
+                        except Exception:  # noqa: BLE001 - 状态不明按未删除
+                            deleted = False
+                    if deleted:
+                        discard = getattr(
+                            self.orchestrator, "discard_deferred_memory", None
                         )
+                        if callable(discard):
+                            discard()
+                    else:
+                        try:
+                            await commit_deferred()
+                        except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
+                            self.console.print(
+                                "[dim yellow]偏好 / 行程写入记忆失败，"
+                                "可在面板重试[/dim yellow]"
+                            )
         finally:
             if staged and not persisted:
                 rollback = getattr(self.memory_manager, "rollback_staged_message", None)

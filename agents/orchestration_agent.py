@@ -598,6 +598,14 @@ class OrchestrationAgent(AgentBase):
         task.add_done_callback(_clear)
         return await asyncio.shield(task)
 
+    def discard_deferred_memory(self) -> None:
+        """丢弃尚未提交的延迟记忆负载（会话已被删除时）。
+
+        与「取消 / 墓碑否决的回合不提交」同一语义：删除后的会话不能再
+        写入带 session_id 的行程 / 偏好，否则面板出现打不开的幽灵链接。
+        """
+        self._deferred_memory = None
+
     def _prepare_context(self, intention_data: dict[str, Any]) -> dict[str, Any]:
         """
         准备上下文信息，供子智能体使用
