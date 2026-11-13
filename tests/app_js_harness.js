@@ -1901,6 +1901,292 @@ async function scenarioInitStale(source) {
   );
 }
 
+
+async function scenarioSilentAppendWindow(source) {
+  // 静默重载（停止对账 / 恢复后刷新）：
+  // 1) 上次已渲染到末尾、之后落库了新消息：新消息必须立即可见、不能藏进
+  //    「显示更新消息」，也不能误置 partialHistory（编辑/重新生成消失）；
+  // 2) 用户手动点「显示更新消息」展开到末尾后，窗口状态要跟随；
+  //    随后的静默重载不能按旧上界把展开的末尾重新折叠。
+  const build = (count, prefix) => {
+    const list = [];
+    for (let i = 0; i < count; i += 1) {
+      list.push({
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: (prefix || "消息 ") + i,
+        timestamp: "",
+        meta: i % 2 === 0 ? null : { client_turn_id: "turn-" + i },
+      });
+    }
+    return list;
+  };
+  const installDom = (run) => {
+    run(`
+      state.userId = "u1";
+      state.busy = false;
+      state.sessions = [];
+      state.sessionTotal = 1;
+      els.messages = {
+        children: [],
+        set innerHTML(value) { if (value === "") this.children.length = 0; },
+        get innerHTML() { return ""; },
+        get firstChild() { return this.children[0] || null; },
+        appendChild(node) { this.children.push(node); return node; },
+        insertBefore(node, ref) {
+          const index = ref ? this.children.indexOf(ref) : -1;
+          if (index >= 0) this.children.splice(index, 0, node);
+          else this.children.push(node);
+          return node;
+        },
+        querySelectorAll() { return this.children.filter((n) => n.__msg); },
+        querySelector() { return null; },
+      };
+      renderUserNode = (text) => ({ __msg: true, role: "user", text });
+      renderAssistantNode = (text) => ({ __msg: true, role: "assistant", text });
+      const originalCreate = document.createElement.bind(document);
+      document.createElement = (tag) => {
+        const node = originalCreate(tag);
+        node.remove = () => {
+          const index = els.messages.children.indexOf(node);
+          if (index >= 0) els.messages.children.splice(index, 1);
+        };
+        return node;
+      };
+      closeMobileSidebar = () => {};
+      loadSessions = async () => {};
+      refreshStatus = () => {};
+      trimRegenButtons = () => {};
+      refreshEditButtons = () => {};
+    `);
+  };
+  const snapshot = (run) =>
+    run(`(() => {
+      const msgs = els.messages.children.filter((n) => n.__msg === true);
+      const buttons = els.messages.children.filter(
+        (n) => n.className === "earlier-more",
+      );
+      const later = buttons.find((n) => n.textContent.startsWith("显示更新消息"));
+      return {
+        count: msgs.length,
+        partial: state.partialHistory,
+        laterText: later ? later.textContent : "",
+        renderedEnd: state.renderedStart ? state.renderedStart.end : null,
+      };
+    })()`);
+
+  const results = {};
+
+  // ---- 场景 1：追加消息后的静默重载 ----
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    installDom(run);
+    const messages = build(10);
+    const first = run('openSession("s1", {})');
+    (await waitRequest(env)).resolve({ messages });
+    await first;
+    results.initial = snapshot(run);
+    // 停止对账确认落库：服务端历史多出两条
+    messages.push(
+      { role: "user", content: "新提问", timestamp: "", meta: null },
+      { role: "assistant", content: "新回答", timestamp: "", meta: {} },
+    );
+    const reload = run('openSession("s1", { silent: true })');
+    (await waitRequest(env)).resolve({ messages });
+    await reload;
+    results.afterAppend = snapshot(run);
+  }
+
+  // ---- 场景 2：展开到末尾后再静默重载 ----
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    installDom(run);
+    const messages = build(600);
+    const open = run('openSession("s1", { matchIndex: 10 })');
+    (await waitRequest(env)).resolve({ messages });
+    await open;
+    results.windowInitial = snapshot(run);
+    const clickLater = () =>
+      run(`(() => {
+        const button = els.messages.children.find(
+          (n) => n.className === "earlier-more" && n.textContent.startsWith("显示更新消息"),
+        );
+        if (button) button.click();
+      })()`);
+    for (let i = 0; i < 10; i += 1) clickLater();
+    results.expanded = snapshot(run);
+    const reload = run('openSession("s1", { silent: true })');
+    (await waitRequest(env)).resolve({ messages });
+    await reload;
+    results.afterExpandReload = snapshot(run);
+  }
+  return results;
+}
+
+
+async function scenarioDeletedThreadSend(source) {
+  // done(persisted=false)：回答保留可见，但下一条消息必须从干净线程开始
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    globalThis.__userNodes = [document.createElement("div")];
+    els.messages.querySelectorAll = (sel) =>
+      sel === ".msg.user" ? __userNodes : [];
+    globalThis.__assistant = {
+      trace: { finish() {}, fail() {} },
+      setReply() {},
+    };
+    state.userId = "u1";
+    state.sessionId = "s-old";
+    state.lastUserText = "你好";
+    handleStreamEvent(
+      __assistant,
+      { type: "done", session_id: "s-new", reply: "回答", elapsed: 0.2, persisted: false },
+      "你好",
+    );
+  `);
+  const veto = run(`({
+    sessionId: state.sessionId,
+    retired: state.retiredThreadVisible,
+  })`);
+
+  // 下一条消息：fetch 返回只有一条 done 事件的最小 SSE 流
+  run(`
+    state.ready = true;
+    state.busy = false;
+    state.sessionLoading = false;
+    globalThis.__sentinel = { __sentinel: true };
+    els.messages = {
+      children: [__sentinel],
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node, ref) {
+        const index = ref ? this.children.indexOf(ref) : -1;
+        if (index >= 0) this.children.splice(index, 0, node);
+        else this.children.push(node);
+        return node;
+      },
+      querySelectorAll() { return []; },
+      querySelector() { return null; },
+    };
+    renderUserNode = (text) => ({ __msg: true, role: "user", text });
+    renderAssistantNode = (text) => ({ __msg: true, role: "assistant", text });
+    hideWelcome = () => {};
+    trimRegenButtons = () => {};
+    refreshEditButtons = () => {};
+    globalThis.__fetchCalls = 0;
+    const line = "data: " + JSON.stringify({
+      type: "done",
+      session_id: "s-new",
+      reply: "新回答",
+      elapsed: 0.1,
+      persisted: true,
+    }) + String.fromCharCode(10) + String.fromCharCode(10);
+    const bytes = new TextEncoder().encode(line);
+    fetch = async (url) => {
+      __fetchCalls += 1;
+      let sent = false;
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (sent) return { done: true, value: undefined };
+              sent = true;
+              return { done: false, value: bytes };
+            },
+          }),
+        },
+        json: async () => ({}),
+      };
+    };
+    refreshStatus = async () => {};
+    loadSessions = async () => {};
+  `);
+  await run('sendMessage("新提问")');
+  const afterSend = run(`(() => {
+    const kids = els.messages.children.slice();
+    const messages = kids.filter((n) => n.__msg === true);
+    return {
+      retired: state.retiredThreadVisible,
+      sessionId: state.sessionId,
+      childCount: kids.length,
+      sentinelRemoved: !kids.includes(__sentinel),
+      roles: messages.map((n) => n.role),
+    };
+  })()`);
+  return { veto, afterSend };
+}
+
+function scenarioRenderCap(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const big = "长".repeat(300000);
+  const html = run(`renderMarkdown(${JSON.stringify(big)})`);
+  const normal = run('renderMarkdown("普通内容")');
+  return {
+    cut: html.includes("已截断显示"),
+    cappedLength: html.length,
+    normalUntouched: !normal.includes("已截断显示") && normal.includes("普通内容"),
+  };
+}
+
+async function scenarioArchivedRollback(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    getJSON = () => Promise.reject(new Error("network down"));
+    state.userId = "u1";
+    state.showArchived = false;
+    state.sessions = [{ session_id: "s1", title: "t", message_count: 1, updated_at: "" }];
+    state.sessionsLoading = false;
+    bindEvents();
+  `);
+  run("els.archivedToggle.click()");
+  for (let i = 0; i < 50; i += 1) {
+    await tick();
+    if (!run("state.sessionsLoading")) break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  return run(`({
+    showArchived: state.showArchived,
+    toasts: __toasts.slice(),
+  })`);
+}
+
+async function scenarioDraftSendGuard(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.ready = true;
+    state.busy = false;
+    state.sessionLoading = false;
+    globalThis.__fetchCalls = 0;
+    globalThis.__confirmAnswer = false;
+    window.confirm = (message) => { globalThis.__confirmText = message; return __confirmAnswer; };
+    document.querySelector = (sel) =>
+      sel === ".user-edit-input" ? document.createElement("textarea") : null;
+    fetch = async () => { __fetchCalls += 1; throw new Error("不应发送"); };
+    els.input.value = "新提问";
+  `);
+  await run('sendMessage("新提问")');
+  const rejected = run(`({
+    fetchCalls: __fetchCalls,
+    confirmText: globalThis.__confirmText || "",
+    inputValue: els.input.value,
+  })`);
+  return { rejected };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -1973,6 +2259,16 @@ async function main() {
     payload = await scenarioHttpError(source);
   } else if (scenario === "initStale") {
     payload = await scenarioInitStale(source);
+  } else if (scenario === "silentAppendWindow") {
+    payload = await scenarioSilentAppendWindow(source);
+  } else if (scenario === "deletedThreadSend") {
+    payload = await scenarioDeletedThreadSend(source);
+  } else if (scenario === "renderCap") {
+    payload = scenarioRenderCap(source);
+  } else if (scenario === "archivedRollback") {
+    payload = await scenarioArchivedRollback(source);
+  } else if (scenario === "draftSendGuard") {
+    payload = await scenarioDraftSendGuard(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
