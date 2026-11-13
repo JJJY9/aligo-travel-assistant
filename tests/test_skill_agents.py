@@ -605,6 +605,40 @@ def test_weather_city_prefers_destination_side():
     print("✓ 天气城市优先取目的地一侧")
 
 
+def test_weather_city_handles_relative_time_and_action_words():
+    """「下周三 / 三天后 / 计划去…」等措辞不能把时间词或动作词拼进城市名。"""
+    agent_class = _load_skill("query-info", "InformationQueryAgent")
+    agent = object.__new__(agent_class)
+    assert agent._extract_city_from_query("东京下周三天气怎么样") == "东京"
+    assert agent._extract_city_from_query("三天后纽约天气") == "纽约"
+    assert agent._extract_city_from_query("下星期五东京天气") == "东京"
+    assert agent._extract_city_from_query("本周三巴黎天气") == "巴黎"
+    assert agent._extract_city_from_query("从北京去首尔下周三天气") == "首尔"
+    assert (
+        agent._extract_city_from_query("帮我规划下周去东京的行程，顺便看看天气")
+        == "东京"
+    )
+    assert agent._extract_city_from_query("东京和大阪天气对比") == "东京"
+    assert agent._extract_city_from_query("搜索一下东京天气") == "东京"
+    assert agent._extract_city_from_query("查东京天气") == "东京"
+    assert agent._extract_city_from_query("纽约到巴黎的天气") == "巴黎"
+    # 「坐飞机」里的「飞」不是目的地连接词
+    assert agent._extract_city_from_query("从北京坐飞机去纽约的天气") == "纽约"
+    # 多城市：天气词所在分句里的城市才是被问的城市
+    assert agent._extract_city_from_query("我在北京，上海天气怎么样") == "上海"
+    assert agent._extract_city_from_query("下周去上海出差，北京天气怎么样") == "北京"
+    assert agent._extract_city_from_query("北京出发，上海天气怎么样") == "上海"
+    # 英文城市名与「温度」问法
+    assert agent._extract_city_from_query("London天气") == "London"
+    assert agent._extract_city_from_query("weather in London") == "London"
+    assert agent._extract_city_from_query("New York天气") == "New York"
+    assert agent._is_weather_query("北京温度多少") is True
+    # 问句 / 停留地点不能被猜成城市
+    assert agent._extract_city_from_query("去哪里玩天气") == ""
+    assert agent._extract_city_from_query("我明天要出差，天气怎么样") == ""
+    print("✓ 时间词 / 动作词 / 交通方式不影响城市提取")
+
+
 def test_all_search_backends_fail_reports_error(monkeypatch):
     """三个搜索后端全部抛错时如实返回搜索失败，不能伪装成未找到结果。"""
     module = _load_skill_module("query-info")
@@ -1523,6 +1557,7 @@ if __name__ == "__main__":
         test_suspicious_url_uses_registrable_domain()
         test_skill_agents_tolerate_non_object_payloads()
         test_weather_city_prefers_destination_side()
+        test_weather_city_handles_relative_time_and_action_words()
         test_plan_trip_null_rewritten_query_falls_back()
         test_plan_trip_rejects_non_object_result()
         test_plan_trip_rejects_non_itinerary_object()
