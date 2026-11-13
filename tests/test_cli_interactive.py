@@ -224,6 +224,28 @@ def _capture_console() -> tuple[cli.AligoCLI, io.StringIO]:
     return agent, buffer
 
 
+def test_markup_safe_strips_controls_before_escaping():
+    """控制字符插在 [ 与 tag 之间时不能被剥成有效 markup（样式注入 / MarkupError）。"""
+    from rich.console import Console
+
+    from cli import _field_safe, _markup_safe, _terminal_safe
+
+    buffer = io.StringIO()
+    console = Console(file=buffer, force_terminal=False, width=200)
+    attack = "X[" + chr(27) + "red]注入" + "[/red]"
+    console.print(_terminal_safe(attack))
+    output = buffer.getvalue()
+    assert "注入" in output and "[red]" in output, output
+    assert chr(27) not in output
+
+    # 未配对关闭标签不能让 print 抛 MarkupError
+    console.print(f"[cyan]{_markup_safe('[/blue]')}[/cyan]")
+
+    field = _field_safe("上海\n  • 目的地: 杭州")
+    assert "\n" not in field and "目的地" in field, field
+    print("✓ 剥控制符先于 markup 转义 + 单行字段")
+
+
 def test_human_response_escapes_markup():
     """回答里的方括号 / 关闭标签不能被 rich 当作标记（会吞字或抛异常）。"""
     agent, buffer = _capture_console()
@@ -1120,6 +1142,7 @@ if __name__ == "__main__":
         test_gbk_piped_input_keeps_locale_decoding()
         test_utf8_piped_input_not_mojibake()
         test_human_response_escapes_markup()
+        test_markup_safe_strips_controls_before_escaping()
         test_human_response_tolerates_malformed_itinerary()
         test_read_commands_reload_snapshot()
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
