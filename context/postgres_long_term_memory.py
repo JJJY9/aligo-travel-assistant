@@ -1204,14 +1204,63 @@ class PostgresLongTermMemory:
 
     # ---------- 历史行程 ----------
 
-    def save_trip_history(self, trip_info: dict[str, Any]) -> str:
-        """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。"""
+    def save_trip_history(
+        self, trip_info: dict[str, Any], *, max_total: int | None = None
+    ) -> str:
+        """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。
+
+        ``max_total`` 给出时在会话级 advisory lock 内拒绝新建超过上限
+        （调用方锁外先读再写的检查挡不住并发创建）。
+        """
         # 与 JSON 后端同口径：未提供目的时原样保存（None），不写默认值
         purpose = trip_info.get("purpose")
         destination = trip_info.get("destination")
         # 会话级 advisory lock：多线程 / 多进程同时写入同一用户时串行生成 trip_N
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
+            if max_total is not None:
+                self._enforce_trip_cap_locked(trip_info, destination, max_total)
             return self._save_trip_history_locked(trip_info, purpose, destination)
+
+    def _enforce_trip_cap_locked(
+        self, trip_info: dict[str, Any], destination: Any, max_total: int
+    ) -> None:
+        """在 advisory lock 内按「去重命中的算更新」口径检查新增上限。"""
+        start_date = str(trip_info.get("start_date") or "")
+        if destination and start_date:
+            from utils.trip_import import normalize_identity_date, normalize_identity_text
+
+            origin = normalize_identity_text(
+                str(trip_info.get("origin") or "")
+            )
+            candidates = self._fetchall(
+                "SELECT start_date, end_date FROM aligo_trips "
+                "WHERE user_id = %s "
+                "AND REPLACE(REPLACE(destination, E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s "
+                "AND REPLACE(REPLACE(COALESCE(origin, ''), E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s",
+                (
+                    self.user_id,
+                    normalize_identity_text(destination),
+                    origin,
+                ),
+            )
+            want_start = normalize_identity_date(start_date)
+            want_end = normalize_identity_date(
+                str(trip_info.get("end_date") or start_date)
+            )
+            for row in candidates:
+                if (
+                    normalize_identity_date(row[0]) == want_start
+                    and (normalize_identity_date(row[1]) or normalize_identity_date(row[0]))
+                    == want_end
+                ):
+                    # 本行程将按去重更新写入，不增加条数
+                    return
+        row = self._fetchone(
+            "SELECT COUNT(*) FROM aligo_trips WHERE user_id = %s",
+            (self.user_id,),
+        )
+        if row is not None and int(row[0] or 0) >= max_total:
+            raise ValueError(f"行程数量已达上限（{max_total}），请先删除旧行程")
 
     def _save_trip_history_locked(
         self,
@@ -1283,7 +1332,16 @@ class PostgresLongTermMemory:
                         existing[0],
                     ),
                 )
-                return str(existing[1] or "")
+                trip_id = str(existing[1] or "")
+                if not trip_id:
+                    # 旧行可能没有 trip_id：补发编号，否则调用方拿到空串、
+                    # 定位不到刚保存的行并把自己报成冲突
+                    trip_id = f"trip_{self._next_trip_number()}"
+                    self._execute(
+                        "UPDATE aligo_trips SET trip_id = %s WHERE id = %s",
+                        (trip_id, existing[0]),
+                    )
+                return trip_id
 
         trip_number = self._next_trip_number()
         trip_id = f"trip_{trip_number}"

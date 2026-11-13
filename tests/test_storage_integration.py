@@ -393,6 +393,60 @@ def test_pg_and_json_trip_saves_match():
         memory.close()
 
 
+def test_trip_cap_enforced_inside_write_path_and_legacy_id_repaired():
+    """新增上限在存储写锁内生效（去重更新不占额度）；旧行缺 trip_id 时补发。"""
+    memory, _ = _pg_memory_or_skip()
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    json_store = LongTermMemory("json-cap", tempfile.mkdtemp())
+    base = {
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-03",
+        "purpose": "出差",
+    }
+    try:
+        for store in (memory, json_store):
+            store.save_trip_history(dict(base), max_total=2)
+            store.save_trip_history(
+                {**base, "destination": "杭州", "start_date": "2026-12-10"},
+                max_total=2,
+            )
+            # 去重命中（更新既有行程）不受上限影响
+            store.save_trip_history(
+                {**base, "purpose": "客户会议"}, max_total=2
+            )
+            # 第三条新行程在写路径内被拒（锁外预检挡不住并发创建）
+            try:
+                store.save_trip_history(
+                    {**base, "destination": "广州", "start_date": "2026-12-20"},
+                    max_total=2,
+                )
+            except ValueError as exc:
+                assert "上限" in str(exc), exc
+            else:
+                raise AssertionError("超过上限的新行程必须被拒绝")
+            assert len(store.get_trip_history(limit=None)) == 2
+
+        # 旧数据缺口 trip_id：去重命中时补发编号，调用方能定位刚保存的行
+        json_store.data["trip_history"][0].pop("trip_id", None)
+        repaired = json_store.save_trip_history(dict(base))
+        assert repaired, "旧行去重命中后必须返回可用的 trip_id"
+        stored = json_store.get_trip_history(limit=None)
+        matched = [
+            trip
+            for trip in stored
+            if str(trip.get("trip_id")) == repaired
+        ]
+        assert matched, (repaired, stored)
+        print("✓ 行程上限在写路径内生效且旧行补发 trip_id")
+    finally:
+        memory.close()
+
+
 def test_pg_update_trip_normalizes_unpadded_dates():
     """update_trip 的重复检测与 save_trip_history 同一口径（未补零日期）。"""
     memory, _ = _pg_memory_or_skip()

@@ -1216,7 +1216,14 @@ class LongTermMemory:
                 if value is not None:
                     existing[key] = value
             existing["timestamp"] = datetime.now().isoformat()
-            return str(existing.get("trip_id") or ""), False
+            trip_id = str(existing.get("trip_id") or "")
+            if not trip_id:
+                # 旧数据里可能有没有 trip_id 的历史行程：去重命中时补发
+                # 编号，否则调用方拿到空串，定位不到刚保存的行、把自己
+                # 报成冲突（面板重复提示重叠）
+                trip_id = self._next_trip_id()
+                existing["trip_id"] = trip_id
+            return trip_id, False
 
         trip_record = {
             "trip_id": self._next_trip_id(),
@@ -1238,12 +1245,21 @@ class LongTermMemory:
         return str(trip_record["trip_id"]), True
 
     @_locked_mutation
-    def save_trip_history(self, trip_info: dict[str, Any]) -> str:
+    def save_trip_history(
+        self, trip_info: dict[str, Any], *, max_total: int | None = None
+    ) -> str:
         """保存行程历史，返回 trip_id。
 
         同路线 + 同起止日期的行程视为重复记录（多次对话规划同一趟行程），
         更新既有记录而不是追加，避免行程 / 统计 / 日历重复。
+        ``max_total`` 给出时在写锁内拒绝「新建」超过上限（去重更新不受
+        影响）：调用方在锁外先读长度再写的检查挡不住并发创建，越限后
+        /api/export 会因条数上限永久 413。
         """
+        if max_total is not None and self._find_same_trip(trip_info) is None:
+            current = len(self.data.get("trip_history") or [])
+            if current >= max_total:
+                raise ValueError(f"行程数量已达上限（{max_total}），请先删除旧行程")
         trip_id, created = self._apply_trip_locked(trip_info)
         self._persist()
         if created:
