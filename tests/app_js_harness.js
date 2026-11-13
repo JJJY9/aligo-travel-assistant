@@ -2187,6 +2187,105 @@ async function scenarioDraftSendGuard(source) {
   return { rejected };
 }
 
+
+async function scenarioEditorsRound2(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    state.userId = "u1";
+  `);
+
+  const results = {};
+
+  // 对象型偏好：行内编辑按 JSON 整体解析（拆分会把对象拆成字符串碎片）
+  results.prefObject = run(`({
+    array: preferenceOutputValue(
+      [{ name: "汉庭", level: 1 }],
+      '[{"name":"如家","level":2}]',
+    ),
+    arrayInvalid: preferenceOutputValue(
+      [{ name: "汉庭" }],
+      '[{"name":',
+    ),
+    objectInvalid: preferenceOutputValue({ a: 1 }, "not json"),
+    objectKeep: preferenceOutputValue({ a: 1 }, '{"a":2}'),
+    plainList: preferenceOutputValue(["汉庭"], "汉庭、如家"),
+  })`);
+
+  // 仅分隔符的列表输入：拒绝并提示，不发 PUT
+  run(`
+    globalThis.__puts = 0;
+    getJSON = async () => { __puts += 1; return {}; };
+    refreshStatus = async () => {};
+    state.sessions = [];
+    els.prefValue.value = "、、 ，";
+    els.prefType.value = "hotel_brands";
+  `);
+  await run('addPreference({ preventDefault() {} })');
+  results.delimiterOnly = run(`({
+    puts: __puts,
+    toasts: __toasts.slice(),
+    value: els.prefValue.value,
+  })`);
+
+  // 保存期间取消按钮禁用；请求结束后恢复
+  run(`
+    __toasts = [];
+    globalThis.__resolvePut = null;
+    getJSON = () => new Promise((resolve) => { __resolvePut = resolve; });
+    els.prefValue.value = "汉庭";
+    els.prefType.value = "hotel_brands";
+  `);
+  const saving = run('addPreference({ preventDefault() {} })');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  results.prefCancelDuring = run(`({
+    cancelDisabled: els.prefCancel.disabled,
+    submitDisabled: els.prefSubmit.disabled,
+  })`);
+  run("__resolvePut({})");
+  await saving;
+  results.prefCancelAfter = run(`({
+    cancelDisabled: els.prefCancel.disabled,
+    submitDisabled: els.prefSubmit.disabled,
+  })`);
+
+  // 知识库同一行再次点编辑：草稿已修改时必须确认，拒绝后草稿保留
+  run(`
+    __toasts = [];
+    globalThis.__confirmCalls = 0;
+    globalThis.__confirmAnswer = false;
+    window.confirm = () => { __confirmCalls += 1; return __confirmAnswer; };
+    state.kbSaving = false;
+    state.kbEditingId = "doc-1";
+    state.kbEditBaseline = "原始内容";
+    els.kbContent.value = "用户新输入的草稿";
+    els.kbContent.placeholder = "";
+    els.kbContent.setSelectionRange = () => {};
+  `);
+  await run('startEditKnowledge({ id: "doc-1", content: "原始内容", metadata: {} })');
+  results.kbReclick = run(`({
+    confirmCalls: __confirmCalls,
+    kept: els.kbContent.value,
+  })`);
+
+  // Windows 设备保留名：提示真实原因
+  run(`
+    __toasts = [];
+    els.userIdInput.value = "con";
+    state.busy = false;
+  `);
+  await run("saveUser()");
+  results.reservedHint = run("__toasts.slice()");
+
+  // 链接 URL 里的行内代码占位符必须还原成原文（不带 <code>）
+  results.href = run(
+    'renderInline("[链接](http://example.com/`code`-x)")',
+  );
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -2269,6 +2368,8 @@ async function main() {
     payload = await scenarioArchivedRollback(source);
   } else if (scenario === "draftSendGuard") {
     payload = await scenarioDraftSendGuard(source);
+  } else if (scenario === "editorsRound2") {
+    payload = await scenarioEditorsRound2(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
