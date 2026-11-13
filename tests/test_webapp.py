@@ -21,6 +21,9 @@ from pathlib import Path
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+# 生产默认不信任测试客户端的 Host: testserver（见 _host_allowed）；
+# 测试显式启用测试缝
+os.environ.setdefault("ALIGO_TEST_CLIENT", "1")
 
 from fastapi.testclient import TestClient
 
@@ -261,6 +264,21 @@ def test_host_allowlist_env(monkeypatch):
     print("✓ ALIGO_ALLOWED_HOSTS 域名白名单")
 
 
+def test_testserver_host_rejected_without_test_env(monkeypatch):
+    """生产默认不信任 Host: testserver（可被解析到本机 / DNS rebinding）。"""
+    client = _client()
+    monkeypatch.delenv("ALIGO_TEST_CLIENT", raising=False)
+    response = client.get("/api/health", headers={"Host": "testserver"})
+    assert response.status_code == 400, response.text
+    # 测试环境下仍放行（TestClient 默认 Host）
+    monkeypatch.setenv("ALIGO_TEST_CLIENT", "1")
+    assert (
+        client.get("/api/health", headers={"Host": "testserver"}).status_code
+        == 200
+    )
+    print("✓ Host: testserver 仅在测试环境放行")
+
+
 def test_side_effect_guard_requires_same_origin_marker():
     """缺失 Sec-Fetch-Site 不再视为可信：需 X-Aligo-Client 或同源 Referer。"""
     client = _client()
@@ -299,6 +317,22 @@ def test_side_effect_guard_requires_same_origin_marker():
             headers={**host, "Sec-Fetch-Site": "cross-site", "X-Aligo-Client": "web"},
         )
         assert cross.status_code == 403, cross.text
+
+        # Sec-Fetch-Site: none（地址栏 / 外部链接 / 302 掩码）不证明同源：
+        # 外部链接一次点击不能触发全量导出 / 真实 LLM 调用
+        none_site = client.get(
+            "/api/export",
+            params={"user_id": user_id},
+            headers={**host, "Sec-Fetch-Site": "none"},
+        )
+        assert none_site.status_code == 403, none_site.text
+
+        same_site = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "Sec-Fetch-Site": "same-origin"},
+        )
+        assert same_site.status_code == 200, same_site.text
 
         export_blocked = client.get(
             "/api/export", params={"user_id": user_id}, headers=host
@@ -11200,6 +11234,11 @@ if __name__ == "__main__":
     finally:
         _mp_host.undo()
     test_side_effect_guard_requires_same_origin_marker()
+    _mp_test_host = pytest.MonkeyPatch()
+    try:
+        test_testserver_host_rejected_without_test_env(_mp_test_host)
+    finally:
+        _mp_test_host.undo()
 
     test_export_concurrency_guard()
     test_chat_lock_wait_is_bounded(pytest.MonkeyPatch())

@@ -100,6 +100,9 @@ class RateLimiter:
         # KB 等同步接口在 FastAPI 线程池并发执行，内存桶必须自己加锁
         self._lock = threading.Lock()
         self._events: dict[str, deque[float]] = {}
+        # 上一次全表清理的时刻：轮换 key 的风暴下不能每个新 key 都在全局
+        # 锁内做 O(表大小) 扫描
+        self._last_sweep = 0.0
 
     def __len__(self) -> int:
         with self._lock:
@@ -118,9 +121,12 @@ class RateLimiter:
                 # 只有接近容量上限时才清理过期桶：每个新 key 都全表扫描会
                 # 让限流器在持有全局锁的情况下付出 O(表大小)（大量用户的
                 # 常态请求也会中招）；仍然满员则拒绝新 key——淘汰活跃桶会
-                # 重置其计数（本次被限流的请求重新获得额度）
+                # 重置其计数（本次被限流的请求重新获得额度）。
+                # 清理本身限频：轮换 key 的风暴下最多每 0.5 秒扫描一次
                 if len(self._events) >= self.max_keys // 2:
-                    self._sweep(now)
+                    if now - self._last_sweep >= 0.5:
+                        self._sweep(now)
+                        self._last_sweep = now
                 if len(self._events) >= self.max_keys:
                     return round(self.window_sec, 1)
                 events = deque()
