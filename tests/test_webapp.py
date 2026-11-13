@@ -11057,6 +11057,39 @@ def test_preference_reserved_type_rejected():
     assert deleted.status_code == 422, deleted.text
     print("✓ 保留偏好类型 preferences 被拒绝")
 
+def test_import_rejects_merged_preference_limit(monkeypatch):
+    """备份自身未超限但合并存量后超过偏好类型上限：预览与执行都 409。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_import_pref_limit")
+    monkeypatch.setattr(server_module, "MAX_PREFERENCE_ENTRIES", 2)
+    store = create_long_term_memory(user_id, str(server_module.MEMORY_DIR))
+    try:
+        store.save_preference("home_location", "北京")
+        store.save_preference("hotel_brands", ["汉庭"])
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+    backup = {"preferences": {"airlines": ["国航"]}}
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 409, response.text
+        assert "偏好" in response.json()["detail"]
+        preview = client.post(
+            "/api/import",
+            params={"user_id": user_id, "dry_run": 1},
+            json={"backup": backup},
+        )
+        assert preview.status_code == 409, preview.text
+        print("✓ 合并后偏好超限的导入被拒绝（预览一致）")
+    finally:
+        _cleanup(user_id)
+
 if __name__ == "__main__":
     test_index_page()
     test_match_snippet_handles_casefold_length_changes()

@@ -5482,6 +5482,29 @@ def create_app(model: Any = None) -> FastAPI:
                             drop_sessions(sections, late_deleted)
                     store = _open_long_term(user_id, strict=True)
                     try:
+                        # 备份自身不超限不代表合并后不超限：与存量偏好取
+                        # 并集后越过上限时，恢复虽成功但 /api/export 会
+                        # 永久 413（账号再也导不出可恢复的备份）。预览与
+                        # 真实执行同一结论。
+                        incoming_prefs = sections.get("preferences") or {}
+                        if incoming_prefs:
+                            try:
+                                existing_prefs = store.get_preference()
+                            except Exception:  # noqa: BLE001 - 读取失败交给导入层
+                                existing_prefs = None
+                            if isinstance(existing_prefs, dict):
+                                merged_count = len(
+                                    set(existing_prefs) | set(incoming_prefs)
+                                )
+                                if merged_count > MAX_PREFERENCE_ENTRIES:
+                                    raise HTTPException(
+                                        status_code=409,
+                                        detail=(
+                                            "恢复后偏好类型总数将超过上限"
+                                            f"（{MAX_PREFERENCE_ENTRIES}），"
+                                            "请先删除不用的偏好后重试"
+                                        ),
+                                    )
                         if dry_run:
                             return preview_user_import(store, sections)
                         counts = import_user_data(store, sections)
