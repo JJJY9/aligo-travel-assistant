@@ -369,6 +369,26 @@ def test_file_lock_unlock_failure_is_swallowed(monkeypatch, tmp_path):
     print("✓ 解锁失败被吞掉（不会覆盖业务异常）")
 
 
+def test_case_collision_user_id_is_refused(tmp_path):
+    """大小写不敏感文件系统：仅大小写不同的用户 ID 不能读写同一份记忆。"""
+    import shutil
+
+    store = LongTermMemory("alice", str(tmp_path))
+    store.save_preference("home_location", "北京")
+    target = tmp_path / "alice.json"
+    assert target.exists()
+    # 模拟 Windows / macOS 的大小写不敏感：Alice 指向同一文件
+    alias = tmp_path / "Alice.json"
+    if not alias.exists():
+        shutil.copyfile(target, alias)
+
+    with pytest.raises(MemoryPersistenceError, match="大小写"):
+        LongTermMemory("Alice", str(tmp_path))
+    # 完全一致的 ID 不受影响
+    again = LongTermMemory("alice", str(tmp_path))
+    assert again.get_preference()["home_location"] == "北京"
+    print("✓ 用户 ID 大小写冲突拒绝访问同一记忆文件")
+
 if __name__ == "__main__":
     test_cross_process_increments_are_not_lost()
     print("\n全部通过（monkeypatch 用例需 pytest）")
