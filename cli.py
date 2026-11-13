@@ -45,7 +45,7 @@ from utils.version import APP_VERSION
 _RUNTIME_IMPORT_ERROR: Exception | None = None
 try:
     from rich.console import Console
-    from rich.markup import escape
+    from rich.markup import escape as _rich_markup
     from rich.prompt import Prompt
     from rich.table import Table
 
@@ -55,25 +55,34 @@ try:
     from context.memory_manager import MemoryManager
 except Exception as exc:  # noqa: BLE001 - 依赖缺失时诊断命令仍要能运行
     _RUNTIME_IMPORT_ERROR = exc
-    Console = escape = Prompt = Table = None  # type: ignore[assignment,misc]
+    Console = _rich_markup = Prompt = Table = None  # type: ignore[assignment,misc]
     IntentionAgent = OrchestrationAgent = None  # type: ignore[assignment,misc]
     create_chat_model = init_agentscope = None  # type: ignore[assignment]
     MemoryManager = None  # type: ignore[assignment,misc]
 
 
-def _terminal_safe(value: object) -> str:
-    """动态文本打印前先剥终端控制字符，再转义 rich 标记。
+def _markup_safe(value: object) -> str:
+    """先剥终端控制字符，再转义 rich 标记（顺序不可交换）。
 
-    用户内容（行程 / 偏好 / 消息）与上游异常文本都可能带 ESC 序列或
-    ``[/red]`` 之类的标记：原样打印可执行 OSC 52 剪贴板写入 / 清屏，
-    或在 except 处理器里二次抛 MarkupError 终止整个 REPL。
-    仅用于 Rich 输出（console.print / Table）。
-
-    Returns:
-        剥离控制序列并转义 rich 标记后的文本
+    rich.markup.escape 只转义「[ 紧跟 tag 字符」的片段：先转义后剥控制
+    字符时，``[`` + ESC + ``red]`` 不会被转义，剥掉 ESC 后又拼成有效
+    markup——样式注入或 unmatched 关闭标签的 MarkupError 终止 REPL。
     """
     text = strip_terminal_controls(value)
-    return escape(text) if escape is not None else text
+    return _rich_markup(text) if _rich_markup is not None else text
+
+
+def _terminal_safe(value: object) -> str:
+    """动态文本（Rich 输出路径）的安全包装：剥控制序列 + 转义 markup。"""
+    return _markup_safe(value)
+
+
+def _field_safe(value: object) -> str:
+    """单行字段（偏好 / 事项等实时回显）：折叠换行后再转义 markup。
+
+    模型给出的值含换行时可以伪造出与程序输出同格式的「• 目的地」行。
+    """
+    return _markup_safe(_single_line_safe(value))
 
 
 def _plain_safe(value: object) -> str:
@@ -87,8 +96,7 @@ def _plain_safe(value: object) -> str:
 
 def _table_cell(value: object) -> str:
     """Rich Table 单元格：单行化 + rich 标记转义（数据不是 markup）。"""
-    text = _single_line_safe(value)
-    return escape(text) if escape is not None else text
+    return _field_safe(value)
 
 
 def _single_line_safe(value: object) -> str:
@@ -708,7 +716,7 @@ class AligoCLI:
         if agents_called:
             self.console.print()
             self.console.print(
-                f"🤖 调用智能体: {escape(', '.join(agents_called))}",
+                f"🤖 调用智能体: {_markup_safe(', '.join(agents_called))}",
                 style="dim",
             )
 
@@ -866,7 +874,7 @@ class AligoCLI:
                 )
                 agent_display_name = self._get_agent_display_name(agent_name)
                 self.console.print(
-                    f"❌ {escape(str(agent_display_name))}执行失败: {escape(str(error_msg))}",
+                    f"❌ {_markup_safe(str(agent_display_name))}执行失败: {_markup_safe(str(error_msg))}",
                     style="red",
                 )
                 has_output = True
@@ -889,19 +897,19 @@ class AligoCLI:
                     # 模型可能直接返回一段文字行程
                     self.console.print()
                     self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
-                    self.console.print(escape(itinerary))
+                    self.console.print(_markup_safe(itinerary))
                     current_agent_shown = True
                 elif itinerary and not isinstance(itinerary, dict):
                     self.console.print()
                     self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
-                    self.console.print(escape(str(itinerary)))
+                    self.console.print(_markup_safe(str(itinerary)))
                     current_agent_shown = True
                 elif itinerary:
-                    title = escape(str(itinerary.get("title", "行程规划")))
+                    title = _markup_safe(str(itinerary.get("title", "行程规划")))
                     self.console.print()
                     self.console.print(f"✈️  [bold cyan]{title}[/bold cyan]")
                     self.console.print(
-                        f"时长: {escape(str(itinerary.get('duration', '未知')))}"
+                        f"时长: {_markup_safe(str(itinerary.get('duration', '未知')))}"
                     )
                     self.console.print()
 
@@ -913,9 +921,9 @@ class AligoCLI:
                         daily_plans = []
                     for day_plan in daily_plans:
                         if not isinstance(day_plan, dict):
-                            self.console.print(escape(str(day_plan)))
+                            self.console.print(_markup_safe(str(day_plan)))
                             continue
-                        day_num = escape(str(day_plan.get("day", 1)))
+                        day_num = _markup_safe(str(day_plan.get("day", 1)))
                         self.console.print(f"[bold yellow]第 {day_num} 天[/bold yellow]")
 
                         # 兼容 activities 和 time_slots
@@ -928,10 +936,10 @@ class AligoCLI:
                             activities = []
                         for slot in activities:
                             if not isinstance(slot, dict):
-                                self.console.print(escape(str(slot)))
+                                self.console.print(_markup_safe(str(slot)))
                                 continue
-                            time_text = escape(str(slot.get("time", "")))
-                            activity = escape(
+                            time_text = _markup_safe(str(slot.get("time", "")))
+                            activity = _markup_safe(
                                 str(slot.get("activity") or slot.get("location") or "")
                             )
                             description = slot.get("description", "")
@@ -940,11 +948,11 @@ class AligoCLI:
                             self.console.print(f"  {time_text} - {activity}")
                             if description:
                                 self.console.print(
-                                    f"    {escape(str(description))}", style="dim"
+                                    f"    {_markup_safe(str(description))}", style="dim"
                                 )
                             if transport:
                                 self.console.print(
-                                    f"    🚇 {escape(str(transport))}", style="dim"
+                                    f"    🚇 {_markup_safe(str(transport))}", style="dim"
                                 )
 
                         # 餐食建议
@@ -955,11 +963,11 @@ class AligoCLI:
                             self.console.print()
                             if meals.get("lunch"):
                                 self.console.print(
-                                    f"  🍜 {escape(str(meals['lunch']))}", style="dim"
+                                    f"  🍜 {_markup_safe(str(meals['lunch']))}", style="dim"
                                 )
                             if meals.get("dinner"):
                                 self.console.print(
-                                    f"  🍽️  {escape(str(meals['dinner']))}", style="dim"
+                                    f"  🍽️  {_markup_safe(str(meals['dinner']))}", style="dim"
                                 )
                         self.console.print()
 
@@ -972,7 +980,7 @@ class AligoCLI:
                     if notes:
                         self.console.print("[bold]📌 注意事项[/bold]")
                         for note in notes:
-                            self.console.print(f"  • {escape(str(note))}")
+                            self.console.print(f"  • {_markup_safe(str(note))}")
                     current_agent_shown = True
 
             # 偏好管理
@@ -1032,8 +1040,8 @@ class AligoCLI:
                             else "设置为"
                         )
                         self.console.print(
-                            f"  • {escape(str(display_type))} {action_text} "
-                            f"[cyan]{escape(self._format_result_value(pref_value))}"
+                            f"  • {_field_safe(str(display_type))} {action_text} "
+                            f"[cyan]{_field_safe(self._format_result_value(pref_value))}"
                             "[/cyan]"
                         )
                     current_agent_shown = True
@@ -1044,7 +1052,7 @@ class AligoCLI:
                     # 检查是否有错误信息
                     err = data.get("error", "")
                     if err:
-                        self.console.print(f"偏好未保存: {escape(str(err))}", style="yellow")
+                        self.console.print(f"偏好未保存: {_markup_safe(str(err))}", style="yellow")
                         current_agent_shown = True
                     # 如果只是没提取到，可能就是没偏好，不强求显示，交给兜底逻辑
 
@@ -1067,22 +1075,22 @@ class AligoCLI:
                     if origin:
                         self.console.print(
                             "  • 出发地: [cyan]"
-                            f"{escape(self._format_result_value(origin))}[/cyan]"
+                            f"{_field_safe(self._format_result_value(origin))}[/cyan]"
                         )
                     if destination:
                         self.console.print(
                             "  • 目的地: [cyan]"
-                            f"{escape(self._format_result_value(destination))}[/cyan]"
+                            f"{_field_safe(self._format_result_value(destination))}[/cyan]"
                         )
                     if start_date:
                         self.console.print(
                             "  • 出发日期: [cyan]"
-                            f"{escape(self._format_result_value(start_date))}[/cyan]"
+                            f"{_field_safe(self._format_result_value(start_date))}[/cyan]"
                         )
                     if end_date:
                         self.console.print(
                             "  • 返程日期: [cyan]"
-                            f"{escape(self._format_result_value(end_date))}[/cyan]"
+                            f"{_field_safe(self._format_result_value(end_date))}[/cyan]"
                         )
                     info_shown = True
 
@@ -1095,7 +1103,7 @@ class AligoCLI:
                         missing_items = [str(missing_info)]
                     self.console.print()
                     self.console.print(
-                        f"💡 还需要补充: {escape(', '.join(missing_items))}",
+                        f"💡 还需要补充: {_field_safe(', '.join(missing_items))}",
                         style="yellow",
                     )
                     info_shown = True
@@ -1121,22 +1129,22 @@ class AligoCLI:
 
                 if summary:
                     self.console.print()
-                    self.console.print(escape(str(summary)))
+                    self.console.print(_markup_safe(str(summary)))
                     current_agent_shown = True
                 elif message:
                     self.console.print()
-                    self.console.print(escape(str(message)), style="dim")
+                    self.console.print(_markup_safe(str(message)), style="dim")
                     current_agent_shown = True
                 elif error:
                     self.console.print()
-                    self.console.print(escape(str(error)), style="yellow")
+                    self.console.print(_markup_safe(str(error)), style="yellow")
                     current_agent_shown = True
 
                 if sources:
                     self.console.print("\n[bold]参考来源[/bold]")
                     for i, source in enumerate(sources[:3], 1):
                         url = source.get("url", "") if isinstance(source, dict) else str(source)
-                        self.console.print(f"  {i}. {escape(str(url))}", style="dim")
+                        self.console.print(f"  {i}. {_markup_safe(str(url))}", style="dim")
                     current_agent_shown = True
 
             # RAG知识库查询
@@ -1164,7 +1172,7 @@ class AligoCLI:
 
                 if answer:
                     self.console.print()
-                    self.console.print(escape(str(answer)))
+                    self.console.print(_markup_safe(str(answer)))
                     current_agent_shown = True
 
             # 记忆查询
@@ -1176,7 +1184,7 @@ class AligoCLI:
 
                 if query_result:
                     self.console.print()
-                    self.console.print(escape(str(query_result)))
+                    self.console.print(_markup_safe(str(query_result)))
                     current_agent_shown = True
 
             # --- 通用兜底 (如果特定逻辑未生效) ---
@@ -1211,7 +1219,7 @@ class AligoCLI:
 
                 if fallback_content:
                     self.console.print()
-                    self.console.print(escape(str(fallback_content)))
+                    self.console.print(_markup_safe(str(fallback_content)))
                     current_agent_shown = True
                 else:
                     # 实在啥也没有，打印个成功标记，避免完全静默
@@ -1334,7 +1342,7 @@ class AligoCLI:
             self.console.print("LLM 服务: [green]正常[/green]", style="bold")
         else:
             self.console.print(
-                f"LLM 服务: [red]不可用[/red] - {escape(str(msg))}",
+                f"LLM 服务: [red]不可用[/red] - {_markup_safe(str(msg))}",
                 style="bold",
             )
         self.console.print()
@@ -1415,7 +1423,9 @@ class AligoCLI:
                 self.user_id, str(default_data_root() / "memory"), strict=True
             )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            self.console.print(f"[red]导出中止：{exc}[/red]")
+            self.console.print(
+                f"[red]导出中止：{_markup_safe(exc)}[/red]"
+            )
             return
         try:
             # 与 standalone user-export 同口径：损坏隔离后不能把空快照
@@ -1424,7 +1434,7 @@ class AligoCLI:
             if quarantined:
                 self.console.print(
                     "[red]导出中止：记忆文件损坏，已隔离备份到 "
-                    f"{quarantined}（当前会导出空快照）[/red]"
+                    f"{_markup_safe(quarantined)}（当前会导出空快照）[/red]"
                 )
                 return
             snapshot = getattr(store, "export_snapshot", None)
@@ -1441,7 +1451,9 @@ class AligoCLI:
                     "statistics": store.get_statistics(),
                 }
         except Exception as exc:  # noqa: BLE001 - 读取失败直接展示原因
-            self.console.print(f"[red]导出中止：{exc}[/red]")
+            self.console.print(
+                f"[red]导出中止：{_markup_safe(exc)}[/red]"
+            )
             return
         finally:
             close = getattr(store, "close", None)
@@ -1589,7 +1601,7 @@ class AligoCLI:
                         # stdin 读取失败（控制台句柄失效 / pty 断开）不能
                         # 立即重试：无退避会刷屏并打满 CPU，永远到不了 EOF
                         self.console.print(
-                            f"\n无法读取输入（{escape(str(exc))}），已退出",
+                            f"\n无法读取输入（{_markup_safe(str(exc))}），已退出",
                             style="dim",
                         )
                         break
