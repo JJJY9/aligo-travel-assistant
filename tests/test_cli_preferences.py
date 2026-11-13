@@ -549,6 +549,60 @@ def test_pref_set_json_value_rejects_empty_shapes(monkeypatch):
     print("✓ --json-value 拒绝空值形状")
 
 
+def test_pref_set_rejects_reserved_type_and_nul(monkeypatch):
+    """保留类型 preferences 与 NUL 值拒绝（与 Web PUT 422 同口径）。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "preferences", "x", as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and "保留" in data["error"], data
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_delete_standalone(
+            "u1", "preferences", as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and "保留" in data["error"], data
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "memo", json.dumps("a\x00b"), json_value=True, as_json=True
+        )
+    data = json.loads(out.getvalue())
+    assert code == 1 and "NUL" in data["error"], data
+    assert store.saved == [], store.saved
+    print("✓ pref-set 拒绝保留类型与 NUL 值")
+
+
+def test_pref_set_json_value_allows_blank_items_in_list(monkeypatch):
+    """列表内部的 null / 空白项按忽略处理（与存储合并口径一致），不整体拒绝。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1",
+            "hotel_brands",
+            '["汉庭", null, "  "]',
+            json_value=True,
+            as_json=True,
+        )
+    data = json.loads(out.getvalue())
+    assert code == 0 and data["ok"] is True, data
+    assert store.saved and store.saved[0][0] == "hotel_brands", store.saved
+    print("✓ --json-value 允许列表内空项（按忽略）")
+
+
 def test_pref_set_json_value_rejects_non_finite(monkeypatch):
     """1e999 溢出为 Infinity：直接拒绝（不能写非标准 JSON）。"""
     store = _WriteStore({})
@@ -668,6 +722,8 @@ if __name__ == "__main__":
         test_pref_set_text_and_json,
         test_pref_set_json_value_types,
         test_pref_set_json_value_rejects_empty_shapes,
+        test_pref_set_rejects_reserved_type_and_nul,
+        test_pref_set_json_value_allows_blank_items_in_list,
         test_pref_set_json_value_rejects_non_finite,
         test_pref_set_json_value_depth_guard,
         test_preferences_json_filters_blank_list_items,

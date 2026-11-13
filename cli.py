@@ -67,6 +67,10 @@ def _terminal_safe(value: object) -> str:
     用户内容（行程 / 偏好 / 消息）与上游异常文本都可能带 ESC 序列或
     ``[/red]`` 之类的标记：原样打印可执行 OSC 52 剪贴板写入 / 清屏，
     或在 except 处理器里二次抛 MarkupError 终止整个 REPL。
+    仅用于 Rich 输出（console.print / Table）。
+
+    Returns:
+        剥离控制序列并转义 rich 标记后的文本
     """
     text = strip_terminal_controls(value)
     return escape(text) if escape is not None else text
@@ -79,6 +83,12 @@ def _plain_safe(value: object) -> str:
     ``[/x]`` 变成字面量 ``\[/x]``，错误文本被改形。
     """
     return strip_terminal_controls(value)
+
+
+def _table_cell(value: object) -> str:
+    """Rich Table 单元格：单行化 + rich 标记转义（数据不是 markup）。"""
+    text = _single_line_safe(value)
+    return escape(text) if escape is not None else text
 
 
 def _single_line_safe(value: object) -> str:
@@ -1306,14 +1316,15 @@ class AligoCLI:
         table.add_column("目的", style="white")
 
         for trip in history:
-            # Table 单元格不经过 Console.print 的字符串清洗：存储内容里的
-            # ESC 序列（OSC 52 / OSC 8）必须在这里剥掉
+            # Table 单元格按 markup 解析：存储内容里的 ESC 序列（OSC 52 /
+            # OSC 8）必须剥掉，`[/x]` 之类的文本还必须转义——否则 Rich 抛
+            # MarkupError 崩溃或渲染出伪造链接
             table.add_row(
-                _single_line_safe(trip.get("trip_id", "")),
-                _single_line_safe(trip.get("origin", "")),
-                _single_line_safe(trip.get("destination", "")),
-                _single_line_safe(trip.get("start_date", "")),
-                _single_line_safe(trip.get("purpose", "")),
+                _table_cell(trip.get("trip_id", "")),
+                _table_cell(trip.get("origin", "")),
+                _table_cell(trip.get("destination", "")),
+                _table_cell(trip.get("start_date", "")),
+                _table_cell(trip.get("purpose", "")),
             )
 
         self.console.print(table)
@@ -1332,8 +1343,8 @@ class AligoCLI:
             # 整行藏掉，与 standalone preferences 和 Web 面板不一致
             if has_preference_value(value):
                 table.add_row(
-                    _single_line_safe(key),
-                    _single_line_safe(self._format_result_value(value)),
+                    _table_cell(key),
+                    _table_cell(self._format_result_value(value)),
                 )
 
         self.console.print(table)
@@ -2085,7 +2096,7 @@ def run_knowledge_export_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     status = knowledge_status()
@@ -2156,7 +2167,7 @@ def run_knowledge_import_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     path = Path(source)
@@ -2326,10 +2337,10 @@ def run_knowledge_list_standalone(
     print(f"共 {total} 条{suffix}，显示前 {len(items)} 条（按 id 倒序）")
     for item in items:
         meta = item.get("metadata") or {}
-        category = _terminal_safe(
+        category = _plain_safe(
             meta.get("category") or meta.get("title") or ""
         )
-        preview = _terminal_safe(
+        preview = _plain_safe(
             " ".join(str(item.get("content", "")).split())[:60]
         )
         tag = f" · {category}" if category else ""
@@ -2401,7 +2412,7 @@ def run_knowledge_categories_standalone(as_json: bool = False) -> int:
     print(f"知识分类：{len(categories)} 个分类，共 {total} 片")
     for item in categories:
         # 分类名来自知识正文 / 元数据：ESC / OSC 序列不能直达终端
-        print(f"  · {_terminal_safe(item['category'])}  {item['count']} 片")
+        print(f"  · {_plain_safe(item['category'])}  {item['count']} 片")
     return 0
 
 
@@ -2451,18 +2462,18 @@ def run_knowledge_search_standalone(
         )
         return 0
     if not results:
-        print(f"没有与「{_terminal_safe(query)}」相关的内容")
+        print(f"没有与「{_plain_safe(query)}」相关的内容")
         return 0
     print(
-        f"语义检索「{_terminal_safe(query)}」：{len(results)} 条结果"
+        f"语义检索「{_plain_safe(query)}」：{len(results)} 条结果"
         "（按相似度排序）"
     )
     for item in results:
         metadata = item.get("metadata") or {}
-        category = _terminal_safe(
+        category = _plain_safe(
             metadata.get("category") or metadata.get("title") or ""
         )
-        preview = _terminal_safe(
+        preview = _plain_safe(
             " ".join(str(item.get("content", "")).split())[:60]
         )
         bits: list[str] = []
@@ -2539,13 +2550,13 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
             label = f"分片 {part_no}/{parts}" if part_no else f"分片（共 {parts} 片）"
             meta.append(f"{label}（旧数据无 group，无法拼接整篇）")
     if group:
-        meta.append(f"group {_terminal_safe(group)}")
+        meta.append(f"group {_plain_safe(group)}")
     meta.append(f"{size} 字")
     print(" · ".join(meta))
     print()
     # 知识内容可经 Web 新增 / 备份导入写入 ESC / OSC（schema 不拦控制字符）：
     # 原样 print 会在支持的终端里执行剪贴板写入 / 清屏 / 伪造链接
-    print(_terminal_safe(content))
+    print(_plain_safe(content))
     return 0
 
 
@@ -2726,7 +2737,7 @@ def run_user_export_standalone(
         store = _open_cli_store(user_id)
     except _QuarantinedMemoryError as exc:
         # 与下方快照检查同一文案：脚本按「导出中止」识别中止原因
-        print(_terminal_safe(f"导出中止：{exc}（当前会导出空快照）"))
+        print(_plain_safe(f"导出中止：{exc}（当前会导出空快照）"))
         return 1
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         print(f"打开长期记忆失败：{exc}")
@@ -2738,7 +2749,7 @@ def run_user_export_standalone(
             quarantined = _recovered_corrupt_backup(store)
             if quarantined:
                 print(
-                    _terminal_safe(
+                    _plain_safe(
                         "导出中止：记忆文件损坏，已隔离备份到 "
                         f"{quarantined}（当前会导出空快照）"
                     )
@@ -2841,7 +2852,7 @@ def run_user_import_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -3019,7 +3030,7 @@ def run_user_import_standalone(
         if knowledge_error:
             print(f"❌ {knowledge_error}（用户数据已恢复，可稍后重跑补齐知识片段）")
         for error in errors[:10]:
-            print(f"  跳过：{_terminal_safe(error)}")
+            print(f"  跳过：{_plain_safe(error)}")
     return 1 if knowledge_error else 0
 
 
@@ -3280,7 +3291,7 @@ def run_knowledge_dedupe_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     # 扫描与删除必须与 Web 的 /api/knowledge/duplicates/cleanup 走同一实现：
@@ -3329,7 +3340,7 @@ def run_knowledge_dedupe_standalone(
             "（保留每组最小 id）："
         )
         for item in plan:
-            preview = _terminal_safe(" ".join(item["content"].split())[:60])
+            preview = _plain_safe(" ".join(item["content"].split())[:60])
             id_text = "、".join(f"#{doc_id}" for doc_id in item["remove"])
             print(f"  保留 #{item['keep']}，删除 {id_text}  {preview}")
         print("去掉 --dry-run 即可执行删除")
@@ -3352,13 +3363,13 @@ def run_knowledge_dedupe_standalone(
 
     for item in skipped:
         print(
-            _terminal_safe(
+            _plain_safe(
                 f"跳过 #{item.get('id')}：{item.get('reason') or '并发修改'}"
             )
         )
     if failed:
         for item in failed:
-            print(_terminal_safe(f"删除 #{item.get('id')} 失败：{item.get('error')}"))
+            print(_plain_safe(f"删除 #{item.get('id')} 失败：{item.get('error')}"))
         print(f"已删除 {removed} 条，{len(failed)} 条删除失败")
         return 1
     print(f"已删除 {removed} 条重复知识片段（{len(plan)} 组，保留每组最小 id）")
@@ -3390,7 +3401,7 @@ def run_knowledge_duplicates_standalone(
                 )
             )
         else:
-            print(f"读取失败：{_terminal_safe(exc)}")
+            print(f"读取失败：{_plain_safe(exc)}")
         return 1
     shown = groups if limit <= 0 else groups[:limit]
     entries = [
@@ -3424,7 +3435,7 @@ def run_knowledge_duplicates_standalone(
     for entry in entries:
         joined = "、".join(f"#{doc_id}" for doc_id in entry["ids"])
         # 预览来自知识正文：ESC / OSC 序列不能直达终端
-        print(f"  {len(entry['ids'])} 条 · {joined}  {_terminal_safe(entry['preview'])}")
+        print(f"  {len(entry['ids'])} 条 · {joined}  {_plain_safe(entry['preview'])}")
     if len(groups) > len(shown):
         print(f"  … 其余 {len(groups) - len(shown)} 组未显示（limit=0 显示全部）")
     print("提示：以上均为未分组的独立片段，确认保留哪一份后可删除其余")
@@ -3456,7 +3467,7 @@ def run_trips_dedupe_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     def _emit(payload: dict[str, Any]) -> None:
@@ -3563,17 +3574,20 @@ def run_trips_dedupe_standalone(
             )
             for entry in plan["duplicates"]:
                 route = (
-                    f"{entry['origin'] or '—'} → {entry['destination'] or '—'}"
+                    f"{_single_line_safe(entry['origin'] or '—')} → "
+                    f"{_single_line_safe(entry['destination'] or '—')}"
                 )
-                dates = (
+                dates = _single_line_safe(
                     " ~ ".join(
                         part
                         for part in (entry["start_date"], entry["end_date"])
                         if part
                     )
-                    or "日期未记录"
+                ) or "日期未记录"
+                print(
+                    f"  将删除 {_single_line_safe(entry['trip_id'])}"
+                    f"（{route}，{dates}）"
                 )
-                print(f"  将删除 {entry['trip_id']}（{route}，{dates}）")
             print("去掉 --dry-run 即可执行删除")
             return 1 if ambiguous else 0
 
@@ -3923,7 +3937,7 @@ def run_session_archive_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -3998,7 +4012,7 @@ def run_session_delete_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -4104,7 +4118,7 @@ def run_session_title_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -4182,7 +4196,7 @@ def run_session_pin_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -4260,7 +4274,7 @@ def run_session_show_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -4995,7 +5009,7 @@ def run_trip_add_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -5132,7 +5146,7 @@ def run_trip_delete_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -5172,10 +5186,11 @@ def run_trip_delete_standalone(
     destination = str(trip.get("destination") or "") or "—"
     start_date = str(trip.get("start_date") or "")
     end_date = str(trip.get("end_date") or "")
+    # 日期来自存储（可能经备份恢复写入控制序列）：print 前同样单行清洗
     dates = (
-        start_date
+        _single_line_safe(start_date)
         if not end_date or end_date == start_date
-        else f"{start_date} ~ {end_date}"
+        else f"{_single_line_safe(start_date)} ~ {_single_line_safe(end_date)}"
     ) or "日期未记录"
     if as_json:
         print(
@@ -5280,7 +5295,7 @@ def run_trip_update_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -5385,10 +5400,11 @@ def run_trip_update_standalone(
     destination = str(saved.get("destination") or "")
     start_text = str(saved.get("start_date") or "")
     end_text = str(saved.get("end_date") or "")
+    # 与 trip-delete 同口径：打印前清洗存储日期里的控制序列
     dates = (
-        start_text
+        _single_line_safe(start_text)
         if not end_text or end_text == start_text
-        else f"{start_text} ~ {end_text}"
+        else f"{_single_line_safe(start_text)} ~ {_single_line_safe(end_text)}"
     ) or "日期未记录"
     if as_json:
         print(
@@ -5535,7 +5551,7 @@ def run_trips_import_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
@@ -5636,7 +5652,11 @@ def run_trips_import_standalone(
         print(f"{head}：新增 {created} 条，更新 {updated} 条{skipped_note}")
         for item in skipped:
             label = f"事件{item['line']}" if is_ics else f"第{item['line']}行"
-            print(f"  跳过{label}：{item['reason']}")
+            # 解析错误原因来自不可信文件（可能带 ESC / 换行伪造输出行）
+            print(
+                f"  跳过{_single_line_safe(label)}："
+                f"{_single_line_safe(item['reason'])}"
+            )
     return 0
 
 
@@ -5926,16 +5946,33 @@ def _pref_value_problem(value: Any, depth: int = 0) -> str | None:
     if depth > 16:
         return "偏好值嵌套过深（超过 16 层）"
     if not has_preference_value(value):
-        return "偏好值不能为空（清空请使用 pref-delete）"
+        # 顶层空值拒绝；列表 / 字典内部的空项由调用方按忽略处理
+        # （recursion 前已 skip），这里只兜底顶层
+        return "偏好值不能为空（清空请使用 pref-delete）" if depth == 0 else None
     if isinstance(value, float) and not math.isfinite(value):
         return "偏好值不能包含 NaN / Infinity（非有限数）"
+    if isinstance(value, str):
+        # Web PUT 会 422：NUL 在 PostgreSQL 必然写入失败、JSON 后端写出后
+        # 导出又被静默清空；孤立代理项在 UTF-8 序列化时抛错
+        if "\x00" in value:
+            return "偏好值不能包含 NUL 字符"
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return "偏好值包含无法编码的字符（孤立代理项）"
     if isinstance(value, (list, tuple)):
         for item in value:
+            if not has_preference_value(item):
+                # 与 has_preference_value / 存储合并口径一致：列表里的空项
+                # 只忽略，不能把整条偏好判成非法
+                continue
             problem = _pref_value_problem(item, depth + 1)
             if problem:
                 return problem
     elif isinstance(value, dict):
         for item in value.values():
+            if not has_preference_value(item):
+                continue
             problem = _pref_value_problem(item, depth + 1)
             if problem:
                 return problem
@@ -5974,13 +6011,17 @@ def run_preference_set_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not _valid_pref_type(pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型不能包含控制字符或斜杠（最多 64 字符）")
+    if pref_type == "preferences":
+        # 与 Web PUT/DELETE /api/preferences/{type} 的 422 同口径：存储层
+        # 加载时会把该键按旧格式展开，写入会静默改动其它偏好
+        return _fail("preferences 是保留的偏好类型，请使用具体类型名")
     saved_value: Any = value.strip()
     if not has_preference_value(saved_value):
         return _fail("偏好值不能为空（清空请使用 pref-delete）")
@@ -6091,13 +6132,17 @@ def run_preference_delete_standalone(
                 )
             )
         else:
-            print(_terminal_safe(message))
+            print(_plain_safe(message))
         return 1
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not _valid_pref_type(pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型不能包含控制字符或斜杠（最多 64 字符）")
+    if pref_type == "preferences":
+        # 与 Web PUT/DELETE /api/preferences/{type} 的 422 同口径：存储层
+        # 加载时会把该键按旧格式展开，写入会静默改动其它偏好
+        return _fail("preferences 是保留的偏好类型，请使用具体类型名")
 
     try:
         store = _open_cli_store(user_id)

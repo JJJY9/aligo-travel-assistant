@@ -737,6 +737,28 @@ def test_trip_delete_success_and_json(monkeypatch):
     print("✓ trip-delete 文本 / JSON 删除")
 
 
+def test_trip_delete_strips_controls_in_dates(monkeypatch):
+    """存储的出发 / 返程日期带 ESC / OSC 时不能原样打印到终端。"""
+    store = _DeleteStore(
+        [
+            _trip(
+                "上海",
+                "2026-12-01\x1b]52;c;QUJD\x07",
+                "2026-12-03",
+                trip_id="trip_1",
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_delete("u1", "trip_1")
+    assert code == 0
+    assert "\x1b" not in out and "\x07" not in out, repr(out)
+    assert "2026-12-01" in out
+    print("✓ trip-delete 清洗存储日期里的控制序列")
+
+
 def test_trip_delete_not_found_and_ambiguous(monkeypatch):
     store = _DeleteStore([_trip("上海", "2026-12-01", trip_id="trip_1")])
     monkeypatch.setattr(
@@ -1317,6 +1339,7 @@ if __name__ == "__main__":
         test_trip_add_store_failures,
         test_trip_add_args_and_dispatch,
         test_trip_delete_success_and_json,
+        test_trip_delete_strips_controls_in_dates,
         test_trip_delete_not_found_and_ambiguous,
         test_trip_delete_failures,
         test_trip_delete_args_and_dispatch,

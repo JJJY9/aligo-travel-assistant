@@ -200,6 +200,39 @@ def test_runner_json_output_and_skipped(monkeypatch):
     print("✓ --json 输出与跳过清单")
 
 
+def test_runner_skipped_reason_stripped_of_controls(monkeypatch):
+    """成功路径的跳过原因来自不可信文件：ESC / OSC 不能直达终端。"""
+    import contextlib
+
+    from utils import trip_import as trip_import_module
+
+    store = _ImportStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    path = _write_csv("出发地,目的地,出发日期\n北京,上海,2026-12-01\n")
+    monkeypatch.setattr(
+        trip_import_module,
+        "import_trips_from_text",
+        lambda store, text, dry_run=False, force_ics=False: {
+            "format": "csv",
+            "rows": 1,
+            "created": 1,
+            "updated": 0,
+            "skipped": [{"line": 2, "reason": "日期非法\x1b]52;c;QUJD\x07"}],
+            "skipped_total": 1,
+        },
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_import_standalone("u-esc", path)
+    assert code == 0
+    text = out.getvalue()
+    assert "\x1b" not in text and "\x07" not in text, repr(text)
+    assert "日期非法" in text
+    print("✓ trips-import 跳过原因剥离控制序列")
+
+
 def test_runner_dry_run_preview(monkeypatch):
     store = _ImportStore()
     monkeypatch.setattr(
@@ -1321,6 +1354,7 @@ if __name__ == "__main__":
         test_runner_imports_and_dedupes,
         test_runner_dry_run_preview,
         test_runner_json_output_and_skipped,
+        test_runner_skipped_reason_stripped_of_controls,
         test_runner_errors,
         test_runner_reports_partial_import,
         test_runner_rejects_oversized_file_before_read,
