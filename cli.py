@@ -210,7 +210,12 @@ class AligoCLI:
         # SIGINT 来源标记（run() 的处理器读写）：count 连按计数、user 是否由
         # 用户 Ctrl-C 发起、at_prompt 是否停在同步 input 上。初始化阶段也要
         # 用（用户ID 提示符），所以放在实例上而不是 run() 的局部变量。
-        self._interrupt = {"count": 0, "user": False, "at_prompt": False}
+        self._interrupt = {
+            "count": 0,
+            "user": False,
+            "at_prompt": False,
+            "force": False,
+        }
         # 失败 / 未落库回合的用量账目：并入下一轮成功回合的展示与 _meta
         self._unsettled_usage = None
 
@@ -602,12 +607,19 @@ class AligoCLI:
                     # 落库后、提交前会话可能被其它进程 / 实例删除：复查共享
                     # 墓碑，删除后丢弃负载（不写带 session_id 的幽灵行程）
                     deleted = False
+                    pending_cancel = False
                     deleted_check = getattr(
                         self.memory_manager, "session_deleted", None
                     )
                     if callable(deleted_check):
                         try:
                             deleted = await asyncio.to_thread(deleted_check)
+                        except asyncio.CancelledError:
+                            # 回合已落库、延迟提交尚未发生：取消（Ctrl-C）
+                            # 不能静默丢弃偏好 / 行程负载——下一轮 reply 的
+                            # 入口会清空暂存。先按「未删除」完成提交，再把
+                            # 取消留给上层循环回到提示符
+                            pending_cancel = True
                         except Exception:  # noqa: BLE001 - 状态不明按未删除
                             deleted = False
                     if deleted:
@@ -619,11 +631,15 @@ class AligoCLI:
                     else:
                         try:
                             await commit_deferred()
+                        except asyncio.CancelledError:
+                            pending_cancel = True
                         except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
                             self.console.print(
                                 "[dim yellow]偏好 / 行程写入记忆失败，"
                                 "可在面板重试[/dim yellow]"
                             )
+                    if pending_cancel:
+                        raise asyncio.CancelledError()
         finally:
             if staged and not persisted:
                 rollback = getattr(self.memory_manager, "rollback_staged_message", None)
@@ -1166,7 +1182,18 @@ class AligoCLI:
             # --- 通用兜底 (如果特定逻辑未生效) ---
             if not current_agent_shown:
                 # 尝试查找通用字段
-                common_keys = ["answer", "content", "result", "message", "summary", "text", "description"]
+                common_keys = [
+                    "answer",
+                    "content",
+                    "result",
+                    "message",
+                    "summary",
+                    "text",
+                    "description",
+                    # orchestration 把非 JSON 技能输出包成 {"output": ...}：
+                    # 缺这个键时只显示「✓ X已完成」、正文被丢弃
+                    "output",
+                ]
                 fallback_content = ""
                 
                 # 扁平查找
@@ -1454,6 +1481,7 @@ class AligoCLI:
         interrupt["count"] = 0
         interrupt["user"] = False
         interrupt["at_prompt"] = False
+        interrupt["force"] = False
 
         def _on_sigint(signum, frame):
             if main_task is None or main_task.done():
@@ -1465,6 +1493,7 @@ class AligoCLI:
                 # 处理（否则会被 REPL 吞掉、gather 永远等不到主任务）
                 interrupt["count"] = 0
                 interrupt["user"] = False
+                interrupt["force"] = True
                 raise KeyboardInterrupt
             if interrupt["at_prompt"]:
                 # 提示符处（同步 input）按 Ctrl-C：直接打断 input 回到新
@@ -1493,6 +1522,20 @@ class AligoCLI:
                 # 取消已送达后回退计数，避免连锁取消（3.11+）
                 while task.cancelling():  # type: ignore[attr-defined]  # 3.11+；hasattr 已守卫
                     task.uncancel()
+
+        async def _drain_pending_cancel() -> None:
+            """把同步命令执行期间排队的用户取消在已知检查点就地消化。
+
+            同步命令不让出事件循环时 Task.cancel() 只把 ``_must_cancel``
+            置位；3.10 无 uncancel，3.11+ 的 uncancel 也不清它。若不在此
+            交付并吞掉，取消会杀死下一条命令，甚至让 exit / EOF 的收尾以
+            CancelledError 崩溃（traceback、退出码 1）。
+            """
+            _clear_pending_cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                _clear_pending_cancel()
 
         def _abort_startup(message: str) -> None:
             interrupt["user"] = False
@@ -1557,7 +1600,9 @@ class AligoCLI:
                         # 执行（回到提示符，而不是取消下一条命令）
                         interrupt["count"] = 0
                         interrupt["user"] = False
-                        _clear_pending_cancel()
+                        # uncancel 清不掉已排队的取消：在检查点交付并吞掉，
+                        # 否则下一条命令（或 exit / EOF 的收尾）会收到它
+                        await _drain_pending_cancel()
                         self.console.print("已取消上一步操作", style="dim")
 
                     if not user_input.strip():
@@ -1624,6 +1669,11 @@ class AligoCLI:
                     interrupt["user"] = False
                     interrupt["count"] = 0
                     _clear_pending_cancel()
+                    if interrupt.pop("force", False):
+                        # 连按两次 Ctrl-C：强制退出（此前被 REPL 自己的
+                        # except 吞掉，永远退不出去）
+                        self.console.print()
+                        raise SystemExit(130) from None
                     self.console.print("\n使用 'exit' 退出", style="dim")
                 except CircuitOpenError:
                     self.console.print("\n[bold yellow]⚠ 服务暂时不可用，请稍后再试。[/bold yellow]", style="dim")
