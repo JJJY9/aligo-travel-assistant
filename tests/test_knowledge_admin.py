@@ -458,6 +458,7 @@ def test_export_not_truncated_by_default_page(monkeypatch):
 
 
 def test_import_documents_sanitizes(monkeypatch):
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -908,6 +909,7 @@ def test_existing_contents_scans_all_rows(monkeypatch):
 
 def test_import_regroups_exported_chunks(monkeypatch):
     """导出备份中同一 group 的分片应按 part 拼回整篇再导入，而不是各自成条。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -1071,6 +1073,7 @@ def test_cleanup_duplicate_contents_deletes_and_reports_failure(monkeypatch):
 
 def test_import_tolerates_non_finite_part_metadata(monkeypatch):
     """metadata.part 为非有限数（Infinity）时该文档退化为单条，不拖垮整批导入。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -1219,6 +1222,7 @@ def test_import_same_order_group_still_duplicate(monkeypatch):
 
 def test_import_restores_large_group_without_truncation(monkeypatch):
     """备份还原的超长整组文档不能被 2000 字导入上限截断。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -1278,6 +1282,7 @@ def test_group_member_ids_scans_all_batches(monkeypatch):
 
 def test_import_restore_over_limit_segments_document(monkeypatch):
     """备份还原超过上限时按上限分段导入（不静默截断、不阻断整份备份）。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -1344,6 +1349,7 @@ def test_import_restore_many_short_parts_not_rejected(monkeypatch):
     还原的语义上限是文档大小（分片长度之和），拼接长度只受物理上限约束；
     每片 1 字时 20000 字文档拼接近 40000 字，不能因此拒绝合法备份。
     """
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -1383,6 +1389,7 @@ def test_import_restore_many_short_parts_not_rejected(monkeypatch):
 
 def test_import_restore_strips_padding(monkeypatch):
     """分片首尾空白在还原时被丢弃：不进入正文、不虚增文档大小。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -1968,6 +1975,7 @@ def test_import_with_new_content_still_loads_model(monkeypatch):
     print("✓ 有新内容时照常加载模型写入")
 def test_import_restores_per_part_metadata(monkeypatch):
     """导出→导入往返保留逐片元数据：title 的 …(Part N) 不再全部写成 Part 1。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     documents = [
@@ -2459,6 +2467,7 @@ def test_import_raises_on_agent_error_status(monkeypatch):
 
 def test_import_batches_split_only_at_group_start(monkeypatch):
     """按组分批：同一 group 的分片永远落在同一批，只在组起始处切批。"""
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -3128,6 +3137,74 @@ def test_import_unchunked_legacy_record_rechunks(monkeypatch):
     print("✓ 未切分旧记录按实际切片判重（预览与导入一致）")
 
 
+def test_import_whole_group_fails_closed_on_layout_error(monkeypatch):
+    """整组缺失导入时布局扫描失败必须按冲突跳过，不能放行同号组。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    def boom():
+        raise RuntimeError("scan down")
+
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", boom)
+    documents = [
+        {"content": "丙", "metadata": {"group": "G", "part": "1", "parts": "2"}},
+        {"content": "丁", "metadata": {"group": "G", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_conflict"] == 2, result
+    assert "无法校验库内分片布局" in result["skipped_groups"][0]["reason"]
+    print("✓ 布局扫描失败时整组缺失导入 fail-closed")
+
+
+def test_import_rejects_out_of_range_part_numbers(monkeypatch):
+    """part 0 / 超出 parts 声明的分片整组拒绝，不拼进正文重排编号。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+
+    documents = [
+        {"content": "甲", "metadata": {"group": "G", "part": "1", "parts": "2"}},
+        {"content": "乙", "metadata": {"group": "G", "part": "3", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert result["skipped_invalid"] >= 2, result
+    assert "part 编号非法" in result["skipped_groups"][0]["reason"]
+
+    documents = [
+        {"content": "甲", "metadata": {"group": "G", "part": "0", "parts": "2"}},
+        {"content": "乙", "metadata": {"group": "G", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert "part 编号非法" in result["skipped_groups"][0]["reason"]
+    print("✓ 越界 / 缺失 part 编号整组拒绝")
+
+
+def test_import_fast_path_runs_under_read_lock(monkeypatch):
+    """「全部已存在」快速判重必须在读锁内扫描（不读整组编辑中间态）。"""
+    import contextlib
+    from pathlib import Path
+
+    events: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_read_lock():
+        events.append("locked")
+        yield
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_read_lock", fake_read_lock)
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: {"甲"})
+    result = knowledge_admin.import_documents([{"content": "甲", "metadata": {}}])
+    assert events == ["locked"], events
+    assert result["imported"] == 0 and result["skipped_duplicate"] == 1
+    print("✓ 导入快速判重在读锁内执行")
+
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
@@ -3165,6 +3242,9 @@ if __name__ == "__main__":
         test_existing_group_layout_tolerates_bad_numbers,
         test_import_empty_documents_short_circuits,
         test_import_layout_scan_failure_skips_group,
+        test_import_whole_group_fails_closed_on_layout_error,
+        test_import_rejects_out_of_range_part_numbers,
+        test_import_fast_path_runs_under_read_lock,
         test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_reordered_group_is_conflict_not_duplicate,

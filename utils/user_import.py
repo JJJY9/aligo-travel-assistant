@@ -1074,5 +1074,10 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
                 "知识库未初始化（先运行初始化脚本再恢复知识片段）"
             )
         except Exception as exc:  # noqa: BLE001 - 知识库失败不回滚用户数据
-            result["knowledge_error"] = f"知识片段恢复失败：{exc}"
+            # 上游异常可能带本机路径 / URL：与其它知识库接口同一脱敏口径
+            from utils.log_redact import redact_paths
+
+            result["knowledge_error"] = (
+                f"知识片段恢复失败：{redact_paths(exc)}"
+            )
     return result

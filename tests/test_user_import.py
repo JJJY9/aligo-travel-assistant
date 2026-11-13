@@ -1951,6 +1951,32 @@ def test_import_accepts_device_like_session_ids():
     assert counts["messages_added"] == 1
     print("✓ 备份导入接受设备名会话 ID")
 
+def test_import_knowledge_error_redacts_paths(monkeypatch):
+    """知识片段恢复失败回流给用户的文本遮蔽本机路径 / 上游 URL。"""
+    from utils import knowledge_admin as knowledge_module
+
+    def boom(documents):
+        raise RuntimeError(
+            "加载失败: C:\\Users\\alice\\.cache\\model 与 "
+            "https://huggingface.co/BAAI/bge (Connection refused)"
+        )
+
+    monkeypatch.setattr(knowledge_module, "import_documents", boom)
+    sections = {
+        "preferences": {},
+        "trips": [],
+        "messages": [],
+        "knowledge": [{"content": "片段", "metadata": {}}],
+    }
+    store = _real_store("u-kb-redact")
+    counts = import_user_data(store, sections)
+    error = counts["knowledge_error"]
+    assert "alice" not in error, error
+    assert "huggingface.co" not in error, error
+    assert "<路径>" in error and "http(s)://***" in error, error
+    assert "Connection refused" in error, "瞬时错误关键词要保留"
+    print("✓ 知识片段恢复错误脱敏（路径 / URL）")
+
 if __name__ == "__main__":
     test_parse_export_sections()
     test_parse_export_rejects_invalid()
@@ -2010,6 +2036,7 @@ if __name__ == "__main__":
         test_runner_skips_reserved_and_deleted_sessions,
         test_runner_skips_trip_only_reserved_and_deleted_sessions,
         test_runner_rolls_back_session_deleted_during_write,
+        test_import_knowledge_error_redacts_paths,
         test_import_repeat_backup_at_limit_is_idempotent,
     ):
         mp = pytest.MonkeyPatch()

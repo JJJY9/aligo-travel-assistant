@@ -813,6 +813,7 @@ def _merge_exported_group(
     declared = 0
     contents: list[str] = []
     seen_parts: set[int] = set()
+    part_numbers: list[int] = []
     base_meta: dict[str, Any] = {}
     piece_metas: list[dict[str, Any]] = []
     for index, (_, piece) in enumerate(pieces):
@@ -835,6 +836,7 @@ def _merge_exported_group(
                 f"备份中的多分片文档 parts 声明异常（group={key}，"
                 f"parts={declared}）：请检查备份来源"
             )
+        part_numbers.append(part_no)
         if part_no:
             if part_no in seen_parts:
                 # 重复 part 编号会把同一段内容叠进正文（内容变多、丢片）
@@ -854,6 +856,15 @@ def _merge_exported_group(
             }
     if not contents:
         return None, 0
+    if declared:
+        for part_no in part_numbers:
+            if not part_no or part_no > declared:
+                # 缺少编号 / 超出声明（part 0 或 5/parts=2）会把多余分片
+                # 当正文拼入并整体重排编号，与 user_import 的整组校验同口径
+                raise ValueError(
+                    f"备份中的多分片文档 part 编号非法（group={key}，"
+                    f"part={part_no}，parts={declared}）：请检查导出源后重新导出"
+                )
     if declared > 1:
         # 只统计缺失数量并给出少量样例：set(range(1, declared+1)) 与全量
         # join 在 parts=100000 的畸形组上会构造数十万项的集合 / 文本，
@@ -1487,44 +1498,48 @@ def import_documents(
     # 数十秒。按当前快照快速判重，命中即返回幂等结果；未命中 / 扫描失败走
     # 完整流程（锁内仍以权威快照重算，不依赖这次快照的时效性）。
     if not dry_run:
-        try:
-            snapshot = _existing_contents()
-        except Exception as exc:  # noqa: BLE001 - 扫描失败按需要模型处理
-            logger.warning("导入前判重扫描失败（%s），按完整流程处理", exc)
-            snapshot = None
-        if snapshot is not None and _backup_fully_existing(pre_merged, snapshot):
-            # 内容多重集齐全不代表顺序一致：分片相同但重排过的备份必须
-            # 走完整流程按布局冲突提示，不能被快判静默当成已存在
-            order_ok = True
-            restored_texts = _restored_group_texts(pre_merged)
-            if restored_texts:
-                try:
-                    existing_texts = _group_texts_from_layout(
-                        _existing_group_layout()
-                    )
-                except Exception as exc:  # noqa: BLE001 - 扫描失败按已存在处理
-                    logger.warning(
-                        "导入前布局扫描失败（%s），按已存在处理", exc
-                    )
-                    existing_texts = None
-                if (
-                    existing_texts is not None
-                    and not restored_texts <= existing_texts
-                ):
-                    order_ok = False
-            if order_ok:
-                dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
-                duplicate = len(_merged_piece_contents(pre_merged))
-                payload = {
-                    "imported": 0,
-                    "skipped": invalid + dropped + duplicate,
-                    "skipped_invalid": invalid + dropped,
-                    "skipped_duplicate": duplicate,
-                    "skipped_conflict": 0,
-                }
-                if pre_problems:
-                    payload["skipped_groups"] = pre_problems
-                return payload
+        # 快速判重必须在读锁内：整组编辑（写锁）按「插入新分片 →
+        # upsert → 删旧分片」多步提交，锁外扫描会读到中间态并把从未
+        # 持久存在（随后被补偿删除）的瞬态分片当成「已存在」直接返回
+        with _read_lock():
+            try:
+                snapshot = _existing_contents()
+            except Exception as exc:  # noqa: BLE001 - 扫描失败按需要模型处理
+                logger.warning("导入前判重扫描失败（%s），按完整流程处理", exc)
+                snapshot = None
+            if snapshot is not None and _backup_fully_existing(pre_merged, snapshot):
+                # 内容多重集齐全不代表顺序一致：分片相同但重排过的备份必须
+                # 走完整流程按布局冲突提示，不能被快判静默当成已存在
+                order_ok = True
+                restored_texts = _restored_group_texts(pre_merged)
+                if restored_texts:
+                    try:
+                        existing_texts = _group_texts_from_layout(
+                            _existing_group_layout()
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 扫描失败按已存在处理
+                        logger.warning(
+                            "导入前布局扫描失败（%s），按已存在处理", exc
+                        )
+                        existing_texts = None
+                    if (
+                        existing_texts is not None
+                        and not restored_texts <= existing_texts
+                    ):
+                        order_ok = False
+                if order_ok:
+                    dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
+                    duplicate = len(_merged_piece_contents(pre_merged))
+                    payload = {
+                        "imported": 0,
+                        "skipped": invalid + dropped + duplicate,
+                        "skipped_invalid": invalid + dropped,
+                        "skipped_duplicate": duplicate,
+                        "skipped_conflict": 0,
+                    }
+                    if pre_problems:
+                        payload["skipped_groups"] = pre_problems
+                    return payload
 
     # 嵌入模型加载放在写锁外：导入期间其它知识库接口不应因为模型初始化
     # 而全部阻塞；dry-run 不加载模型
@@ -1570,17 +1585,25 @@ def import_documents(
                 )
             return layout_cache["texts"]
 
-        def _group_part_contents() -> dict[str, dict[int, set[str]]]:
-            """group → {part 号: 该 part 在库内的内容集合}（整次导入只扫一次）。"""
+        def _group_part_contents() -> dict[str, dict[int, set[str]]] | None:
+            """group → {part 号: 该 part 在库内的内容集合}（整次导入只扫一次）。
+
+            布局扫描失败返回 None：调用方必须按「无法校验冲突」处理
+            （fail-closed），不能把 None 当作空布局放行同号组的写入。
+            """
             if "part_contents" not in layout_cache:
-                by_group: dict[str, dict[int, set[str]]] = {}
-                for content, candidates in (_group_layout() or {}).items():
-                    for old_group, old_part, _parts in candidates:
-                        if old_group and old_part:
-                            by_group.setdefault(old_group, {}).setdefault(
-                                old_part, set()
-                            ).add(content)
-                layout_cache["part_contents"] = by_group
+                layout = _group_layout()
+                if layout is None:
+                    layout_cache["part_contents"] = None
+                else:
+                    by_group: dict[str, dict[int, set[str]]] = {}
+                    for content, candidates in layout.items():
+                        for old_group, old_part, _parts in candidates:
+                            if old_group and old_part:
+                                by_group.setdefault(old_group, {}).setdefault(
+                                    old_part, set()
+                                ).add(content)
+                    layout_cache["part_contents"] = by_group
             return layout_cache["part_contents"]
 
         merged_items, group_skipped = _regroup_exported_documents(
@@ -1742,7 +1765,28 @@ def import_documents(
                 # 检索按 part 拼出乱序文档、整组编辑 / 删除波及两篇、导出后
                 # 再导入因 part 编号重复被拒。只有「同组同 part 号的内容确实
                 # 不同」才算冲突：库内该 part 已是同样内容时属于幂等重导
-                occupied = _group_part_contents().get(doc_group) or {}
+                part_contents = _group_part_contents()
+                if part_contents is None:
+                    # 无法校验库内同号组：按冲突跳过（fail-closed），绝不把
+                    # 第二套 part 1..N 写进可能已存在的组
+                    logger.warning(
+                        "扫描库内分片布局失败，跳过同号组 %s 的导入",
+                        json.dumps(doc_group, ensure_ascii=False),
+                    )
+                    existing_counts.update(consumed)
+                    conflict += len(missing)
+                    problems.append(
+                        {
+                            "group": doc_group,
+                            "reason": (
+                                "无法校验库内分片布局（扫描失败），"
+                                "已跳过该组；请稍后重试"
+                            ),
+                            "parts": len(missing),
+                        }
+                    )
+                    continue
+                occupied = part_contents.get(doc_group) or {}
                 collide = False
                 for chunk in missing:
                     chunk_meta = chunk.get("metadata") or {}
@@ -1759,7 +1803,7 @@ def import_documents(
                     logger.warning(
                         "备份中的文档组 %s 与库内同号组内容不同，已跳过该组："
                         "请整份编辑或 kb-delete --group 后重新导入",
-                        doc_group,
+                        json.dumps(doc_group, ensure_ascii=False),
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
