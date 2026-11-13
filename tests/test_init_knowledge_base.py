@@ -612,6 +612,48 @@ def test_target_follows_runtime_when_skills_dir_overridden(monkeypatch, tmp_path
     print("✓ 初始化目标库跟随运行时解析（技能目录覆盖场景）")
 
 
+def test_discard_created_library_retries_locked_files(monkeypatch, tmp_path):
+    """Windows 句柄延迟释放：unlink/rmtree 短暂重试，仍失败时提示手动删除。"""
+    import time
+
+    module = _load_init_module()
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    target = tmp_path / "rag"
+    target.mkdir()
+    (target / "milvus_lite.db").write_text("x", encoding="utf-8")
+    calls = {"n": 0}
+    real_rmtree = module.shutil.rmtree
+
+    def flaky(path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("locked")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.shutil, "rmtree", flaky)
+    module._discard_created_library(target)
+    assert not target.exists()
+    assert calls["n"] == 3, calls
+
+    # 数据库文件始终被占用：无法清理时提示手动删除路径
+    target2 = tmp_path / "rag2"
+    target2.mkdir()
+    (target2 / "milvus_lite.db").write_text("x", encoding="utf-8")
+
+    def locked_rmtree(path, *args, **kwargs):
+        raise OSError("locked")
+
+    def locked_unlink(self, *args, **kwargs):
+        raise OSError("locked")
+
+    monkeypatch.setattr(module.shutil, "rmtree", locked_rmtree)
+    monkeypatch.setattr(Path, "unlink", locked_unlink)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        module._discard_created_library(target2)
+    assert "手动删除" in out.getvalue(), out.getvalue()
+    print("✓ 新建库删除失败时重试并提示手动清理")
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -626,6 +668,9 @@ if __name__ == "__main__":
         test_export_failure_aborts_before_drop(_mp)
         test_preserved_backup_helpers_roundtrip(_mp)
         test_preserved_backup_survives_failed_restore(_mp)
+        test_discard_created_library_retries_locked_files(
+            _mp, Path(tempfile.mkdtemp())
+        )
     finally:
         _mp.undo()
     test_multi_chunk_documents_carry_group_metadata()
