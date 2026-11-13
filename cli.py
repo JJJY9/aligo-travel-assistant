@@ -3482,6 +3482,14 @@ def run_trips_dedupe_standalone(
                 # dry-run 与正式执行同一退出码语义：存在歧义 id 需人工处理
                 return 1 if ambiguous else 0
             if not duplicates:
+                if ambiguous:
+                    # 歧义 id 可能把唯一重复组过滤掉：仍需人工处理，退出码
+                    # 与 --json / 正式执行一致（README 承诺三处语义相同）
+                    print(
+                        f"用户 {user_id}：没有可自动删除的重复行程，但存在"
+                        f"需人工处理的歧义 trip_id（共 {plan['total_trips']} 条）"
+                    )
+                    return 1
                 print(
                     f"用户 {user_id}：没有需要删除的重复行程（共 {plan['total_trips']} 条）"
                 )

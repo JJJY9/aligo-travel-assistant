@@ -5929,8 +5929,19 @@ function bindEvents() {
         });
         if (!isModalOpen()) return;
         const count = Number(preview.would_remove || 0);
+        const ambiguous = Array.isArray(preview.ambiguous_ids)
+          ? preview.ambiguous_ids
+          : [];
         if (!count) {
-          toast("没有重复行程可清理");
+          if (ambiguous.length) {
+            // 歧义 id 可能把唯一重复组过滤掉：与接口 409 的提示口径一致，
+            // 不能假装「没有重复」
+            toast(
+              `有 ${ambiguous.length} 个行程编号同时属于多条不同行程，无法自动清理，请运行 python cli.py trips-dedupe 人工处理`,
+            );
+          } else {
+            toast("没有重复行程可清理");
+          }
           return;
         }
         if (

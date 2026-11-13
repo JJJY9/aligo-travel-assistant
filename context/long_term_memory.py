@@ -1462,14 +1462,14 @@ class LongTermMemory:
         removed = 0
         skipped = 0
         for target in targets:
-            trip_id = str(target.get("trip_id") or "")
+            trip_id = str(target.get("trip_id"))
             if not trip_id:
                 continue
             want = trip_identity(target)
             matches = [
                 index
                 for index, trip in enumerate(trips)
-                if str(trip.get("trip_id") or "") == trip_id
+                if str(trip.get("trip_id")) == trip_id
                 and trip_identity(trip) == want
             ]
             if not matches:
@@ -1477,7 +1477,7 @@ class LongTermMemory:
                 continue
             kept_id = str(target.get("kept_id") or "")
             if kept_id and not any(
-                str(trip.get("trip_id") or "") == kept_id
+                str(trip.get("trip_id")) == kept_id
                 and trip_identity(trip) == want
                 for trip in trips
             ):

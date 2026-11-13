@@ -9,6 +9,11 @@ from utils.timestamps import chronological_key
 
 _FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 
+# 超大消息跳过行内代码配对：未配对反引号的逐行回扫在恶意构造（无空行 +
+# 递增反引号串）下可退化为超线性。全部转义（围栏内容仍原样保留）是安全
+# 且线性的降级——代价只是代码段样式丢失，不会放过原始 HTML
+_MAX_INLINE_PAIRING_CHARS = 50_000
+
 
 def _fence_open(line: str) -> str:
     """CommonMark 合法开围栏标记（非法时返回空串）。
@@ -138,7 +143,12 @@ def _is_table_delimiter(line: str) -> bool:
 def _closing_run_follows(
     lines: list[str], line_index: int, run: int
 ) -> bool:
-    """后续行（同一段落内）是否存在等长反引号串（跨行代码段）。"""
+    """后续行（同一段落内）是否存在等长反引号串（跨行代码段）。
+
+    必须扫到段落真正结束：提前截断会改变反引号的配对位置（被截断的开串
+    与后续行里的闭合串会在 CommonMark 里配成一对，行内剩余内容反而失去
+    转义）。超大消息的线性降级见 :data:`_MAX_INLINE_PAIRING_CHARS`。
+    """
     for index in range(line_index + 1, len(lines)):
         text = lines[index]
         if not text.strip():
@@ -243,7 +253,10 @@ def sanitize_body(text: str) -> str:
       消息与会话不会被吞进同一个代码块；缩进围栏（列表项内）随容器
       结束恢复转义；表格行不参与跨单元格反引号配对；
     - 行内代码之外仍转义尖括号与链接 / 图片语法，避免预览器执行原始 HTML
-      或自动加载远程图片；终端控制序列（ESC / OSC）一并剥离。
+      或自动加载远程图片；终端控制序列（ESC / OSC）一并剥离；
+    - 超过 :data:`_MAX_INLINE_PAIRING_CHARS` 的消息跳过行内代码配对、
+      正文全部转义（围栏内的代码行仍原样保留）：配对扫描在恶意构造下
+      是超线性的，多转义永远安全，只损失代码段样式。
     """
     text = strip_terminal_controls(str(text)).strip()
     lines = text.split("\n")
@@ -251,6 +264,8 @@ def sanitize_body(text: str) -> str:
     fence = ""
     fence_indent = 0
     pending_code_run = 0
+    # 超大消息放弃行内代码配对（线性、始终安全）；常规消息完整配对保真
+    fast_mode = len(text) > _MAX_INLINE_PAIRING_CHARS
     for line_index, line in enumerate(lines):
         if fence:
             if (
@@ -273,6 +288,11 @@ def sanitize_body(text: str) -> str:
             fence = opener
             fence_indent = _leading_spaces(line)
             rendered.append(_quote_line(line))
+            continue
+        if fast_mode:
+            # 超过配对阈值：行内反引号不再参与配对，全部内容照常转义
+            # （围栏内的原始代码行已在上面原样保留）
+            rendered.append(_quote_line(_escape_inline_markdown(line)))
             continue
         if pending_code_run:
             rendered_line, pending_code_run = _carry_code_line(
