@@ -594,6 +594,90 @@ def test_process_query_defers_memory_until_persisted():
     print("✓ CLI 延迟记忆只在落库成功后提交")
 
 
+def test_pending_cancel_does_not_kill_next_command(monkeypatch):
+    """同步命令期间 Ctrl-C 后，下一条异步命令正常执行（取消已就地消化）。"""
+    import signal as signal_module
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    def fake_history():
+        signal_module.raise_signal(signal_module.SIGINT)
+
+    calls = {"health": 0}
+
+    async def fake_health():
+        calls["health"] += 1
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    monkeypatch.setattr(agent, "show_history", fake_history)
+    monkeypatch.setattr(agent, "run_health_check", fake_health)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("history\nhealth\nexit\n"))
+    asyncio.run(agent.run())  # 不得抛 CancelledError
+    assert calls["health"] == 1, "取消必须在下一条命令前被消化"
+    assert "已取消上一步操作" in buffer.getvalue()
+    print("✓ 同步命令期间的取消不再杀死下一条命令")
+
+
+def test_double_ctrl_c_forces_exit(monkeypatch):
+    """连按两次 Ctrl-C 必须真正强制退出（不能被 REPL 自己的 except 吞掉）。"""
+    import signal as signal_module
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    def fake_history():
+        signal_module.raise_signal(signal_module.SIGINT)
+        signal_module.raise_signal(signal_module.SIGINT)
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    monkeypatch.setattr(agent, "show_history", fake_history)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("history\n"))
+    with pytest.raises(SystemExit) as info:
+        asyncio.run(agent.run())
+    assert info.value.code == 130, info.value.code
+    print("✓ 连按两次 Ctrl-C 强制退出（130）")
+
+
+def test_process_query_commits_deferred_when_cancelled_before_check():
+    """落库后、提交前的取消不能丢弃延迟的偏好 / 行程负载。"""
+    agent, _events = _make_cli_stub()
+    calls = {"commit": 0}
+
+    class _Deferred:
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            return _TextMessage(json.dumps({"results": []}))
+
+        async def commit_deferred_memory(self):
+            calls["commit"] += 1
+            return True
+
+    agent.orchestrator = _Deferred()
+
+    def _cancelled_check():
+        raise asyncio.CancelledError()
+
+    agent.memory_manager.session_deleted = _cancelled_check
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(agent.process_query("你好"))
+    assert calls["commit"] == 1, "取消不能丢弃延迟的偏好 / 行程负载"
+    print("✓ 落库后的提交阶段被取消仍先提交延迟记忆")
+
+
 def test_process_query_stages_user_message_before_orchestration():
     """编排期间短期记忆必须已含本轮提问（_prepare_context 读取用户本轮原话）。"""
     agent, events = _make_cli_stub()
@@ -1041,6 +1125,9 @@ if __name__ == "__main__":
         test_summary_tolerates_legacy_nested_preference_and_trip_fields()
         test_process_query_reloads_long_term_each_turn()
         test_process_query_stages_user_message_before_orchestration()
+        test_pending_cancel_does_not_kill_next_command(_mp)
+        test_double_ctrl_c_forces_exit(_mp)
+        test_process_query_commits_deferred_when_cancelled_before_check()
         test_process_query_rolls_back_when_persist_vetoed()
         test_process_query_defers_memory_until_persisted()
         test_failed_turn_usage_carried_to_next_success()
