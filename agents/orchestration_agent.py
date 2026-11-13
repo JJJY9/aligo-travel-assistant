@@ -294,6 +294,15 @@ def _transient_agent_error(response: Any) -> str | None:
         return text
     return None
 
+
+class _TransientAgentError(ConnectionError):
+    """技能上报的上游瞬时错误（搜索 / 天气等第三方服务不可用）。
+
+    子类仍是 ConnectionError：技能内部退避重试照常生效。但外层必须把
+    它与真实 LLM 调用错误区分开——外部搜索 / 天气服务故障不能计入全局
+    LLM 熔断（连续 5 个搜索型回合就会让所有用户 503，即使模型完全健康）。
+    """
+
 # 注册器同时接受技能目录名与旧智能体名（plan-trip / event-collection 等）；
 # 下游的聚合、记忆写入与前端展示统一使用旧名称。映射放在
 # utils.agent_names，供轮次元数据等模块共用
@@ -994,11 +1003,13 @@ class OrchestrationAgent(AgentBase):
                 async def _reply_once() -> Any:
                     # 调用智能体：瞬时 LLM / 网络错误重试一次。技能智能体
                     # 会把异常吞成 error JSON 返回，这里识别瞬时标记后重新
-                    # 抛出（ConnectionError 属可重试类型），让退避重试生效
+                    # 抛出（ConnectionError 属可重试类型），让退避重试生效；
+                    # 用 _TransientAgentError 标记「技能上报的上游故障」，
+                    # 外层不把它计入全局 LLM 熔断
                     response = await agent.reply(input_msg)
                     error_text = _transient_agent_error(response)
                     if error_text is not None:
-                        raise ConnectionError(f"瞬时错误：{error_text}")
+                        raise _TransientAgentError(f"瞬时错误：{error_text}")
                     return response
 
                 return await retry_with_backoff(
@@ -1061,8 +1072,10 @@ class OrchestrationAgent(AgentBase):
             # 随助手消息落库 / 导出：本机缓存路径与上游 URL 必须遮蔽；
             # 日志同样只记脱敏文本并压成单行（text 模式下可伪造日志行）
             safe_error = redact_paths(e)
-            if agent_loaded and (
-                is_retriable_error(e) or is_permanent_llm_error(e)
+            if (
+                agent_loaded
+                and not isinstance(e, _TransientAgentError)
+                and (is_retriable_error(e) or is_permanent_llm_error(e))
             ):
                 # 子智能体的 LLM 调用失败（重试耗尽后的 429/5xx、401/402 等）
                 # 不能吞成 status=error：外层会把整轮记为成功，熔断器只看

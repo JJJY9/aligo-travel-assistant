@@ -634,6 +634,85 @@ def test_finished_probe_task_reclaimed_within_lease(monkeypatch):
     print("✓ 试探任务结束后名额立即回收")
 
 
+def test_denies_new_calls_readonly_precheck(monkeypatch):
+    """只读预检：OPEN / 半开名额被占时拒绝，且不占用或回收任何名额。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    assert breaker.denies_new_calls() is False, "CLOSED 不应拒绝预检"
+    breaker.record_failure()
+    assert breaker.denies_new_calls() is True, "OPEN 必须拒绝预检"
+    times["now"] = 111.0  # 恢复期结束 → 预检触发 OPEN -> HALF_OPEN
+    assert breaker.denies_new_calls() is False, "半开且名额空闲应放行"
+    # 预检不得占用唯一试探名额：allow_call 仍能领到它
+    assert breaker.allow_call() is True
+    assert breaker.denies_new_calls() is True, "名额已被持有应拒绝预检"
+    assert breaker.allow_call() is False
+    breaker.record_success()
+    assert breaker.denies_new_calls() is False, "试探完成后名额已释放"
+
+    # 线程归属无法判断活性：租约内拒绝，超租约按卡死回收后放行
+    thread_breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    thread_breaker.record_failure()
+    times["now"] = 200.0
+    assert thread_breaker.allow_call() is True
+    assert thread_breaker.denies_new_calls() is True
+    times["now"] = 200.0 + thread_breaker._probe_lease_sec + 1
+    assert thread_breaker.denies_new_calls() is False, "线程租约过期应视为可回收"
+
+    async def scenario():
+        # 归属任务存活：预检拒绝（即使租约早已过期）
+        live = CircuitBreaker(
+            failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+        )
+        times["now"] = 600.0
+        live.record_failure()
+        times["now"] = 611.0
+        assert live.allow_call() is True  # 本任务持有试探
+        times["now"] = 611.0 + live._probe_lease_sec + 1
+        assert live.denies_new_calls() is True, "持有任务存活时预检必须拒绝"
+        live.record_success()
+
+        # 归属任务已结束：名额立即视为可回收，预检放行
+        finished = CircuitBreaker(
+            failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+        )
+        times["now"] = 1000.0
+        finished.record_failure()
+        times["now"] = 1011.0
+
+        async def claim_and_exit():
+            assert finished.allow_call() is True
+
+        await asyncio.create_task(claim_and_exit())
+        assert finished.denies_new_calls() is False, "归属任务已结束应放行预检"
+
+    asyncio.run(scenario())
+    print("✓ 熔断只读预检（不占名额）")
+
+
+def test_health_check_redacts_api_key_in_error(monkeypatch):
+    """网关错误体原样引用请求密钥：健康检查回显前必须遮蔽裸 API Key。"""
+    def boom(**kwargs):
+        raise RuntimeError(
+            "Error code: 401 - Incorrect API key provided: "
+            "sk-live0123456789abcdef"
+        )
+
+    fake_module = types.ModuleType("config_agentscope")
+    fake_module.create_chat_model = boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "config_agentscope", fake_module)
+    ok, message = asyncio.run(run_health_check("http://x", "k", "m"))
+    assert ok is False
+    assert "sk-live0123456789abcdef" not in message, message
+    assert "Incorrect API key" in message and "***" in message
+    print("✓ 健康检查错误文本遮蔽裸 API Key")
+
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -659,6 +738,8 @@ if __name__ == "__main__":
         test_health_check_enforces_overall_timeout(_mp)
         test_conversation_ask_releases_probe_on_cancel(_mp)
         test_memory_persistence_error_does_not_trip_breaker()
+        test_denies_new_calls_readonly_precheck(_mp)
+        test_health_check_redacts_api_key_in_error(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")

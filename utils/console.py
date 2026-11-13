@@ -230,8 +230,10 @@ class _AutoDecodeInput:
         if size is None or size < 0:
             return line
         if size < len(line):
-            # 截断的剩余部分留待下次读取（size=0 时不消费任何输入）
-            self._pending = line[size:]
+            # 截断的剩余部分留待下次读取（size=0 时不消费任何输入）；
+            # 必须拼在已有缓冲之前：_next_pending_line 已把后续缓冲行留在
+            # _pending 里，直接覆盖会静默丢弃那些行
+            self._pending = line[size:] + self._pending
             return line[:size]
         return line
 

@@ -333,7 +333,7 @@ def test_redact_secret_masks_passwords():
 
 
 def test_check_config_key_source_strips_env(monkeypatch):
-    """LLM_API_KEY 为纯空白时按回退 config_local.py 报告来源。"""
+    """LLM_API_KEY 为纯空白 / 仅 BOM 时按回退 config_local.py 报告来源。"""
     from config import LLM_CONFIG
     from utils import doctor as doctor_module
 
@@ -341,10 +341,18 @@ def test_check_config_key_source_strips_env(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "   ")
     result = doctor_module.check_config()
     assert "config_local.py" in result.detail, result.detail
+    # PowerShell / 记事本存出的 BOM 值：config 会回退，doctor 必须同口径
+    for blank in ("\ufeff", " \ufeff", "\ufeff \ufeff"):
+        monkeypatch.setenv("LLM_API_KEY", blank)
+        result = doctor_module.check_config()
+        assert "config_local.py" in result.detail, (repr(blank), result.detail)
     monkeypatch.setenv("LLM_API_KEY", "  sk-env  ")
     result = doctor_module.check_config()
     assert "环境变量" in result.detail, result.detail
-    print("✓ check_config 按 strip 后判断密钥来源")
+    monkeypatch.setenv("LLM_API_KEY", "sk-\ufeff" + "env")
+    result = doctor_module.check_config()
+    assert "环境变量" in result.detail, result.detail
+    print("✓ check_config 按去 BOM / strip 后判断密钥来源")
 
 
 def test_parse_doctor_args_case_insensitive():
@@ -794,6 +802,54 @@ def test_model_files_missing_required_fail():
     print("✓ 模型目录缺必需文件 → 失败")
 
 
+def test_model_files_alternative_formats_ok():
+    """pytorch_model.bin + vocab.txt 也是合法模型形态，不能误报缺 safetensors。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        for f in [
+            "config.json",
+            "pytorch_model.bin",
+            "vocab.txt",
+            "modules.json",
+            "1_Pooling/config.json",
+        ]:
+            path = Path(tmp) / f
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+        result = check_model_files(Path(tmp))
+    assert result.status == STATUS_OK, result.detail
+    print("✓ pytorch_model.bin / vocab.txt 形态不误报缺失")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "config.json").write_text("x", encoding="utf-8")
+        (Path(tmp) / "tokenizer.json").write_text("x", encoding="utf-8")
+        result = check_model_files(Path(tmp))
+    assert result.status == STATUS_FAIL and "缺少关键文件" in result.detail
+    assert "pytorch_model.bin" in result.detail, result.detail
+    print("✓ 缺全部权重变体时才失败，且提示可接受的候选")
+
+
+def test_skills_check_duplicate_frontmatter_names(monkeypatch):
+    """两个 SKILL.md 写同名时加载互相覆盖，doctor 必须报出来。"""
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for directory in ("skill-a", "skill-b"):
+            script = root / directory / "script" / "agent.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("", encoding="utf-8")
+            (root / directory / "SKILL.md").write_text(
+                "---\nname: 同名技能\ndescription: d\n---\n",
+                encoding="utf-8",
+            )
+        monkeypatch.setattr(skill_paths, "resolve_skills_root", lambda: root)
+        result = check_skills()
+    assert result.status == STATUS_WARN, result.detail
+    assert "frontmatter name 重复" in result.detail, result.detail
+    assert "skill-a" in result.detail and "skill-b" in result.detail, result.detail
+    print("✓ 技能 frontmatter name 重复 → 警告")
+
+
 def test_run_doctor_includes_network_check(monkeypatch):
     from utils import doctor as doctor_module
     from utils.doctor import CheckResult
@@ -899,6 +955,7 @@ if __name__ == "__main__":
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
     test_model_files_missing_required_fail()
+    test_model_files_alternative_formats_ok()
     test_knowledge_base_missing()
     test_redact_secret_masks_passwords()
     test_report_and_summary_statuses()
@@ -913,6 +970,7 @@ if __name__ == "__main__":
         test_configured_model_dimension_reads_pooling_config,
         test_knowledge_base_config_dimension_mismatch_warns,
         test_skills_check_warns_on_broken_skill_md,
+        test_skills_check_duplicate_frontmatter_names,
         test_storage_probe_sets_statement_timeout,
         test_llm_connectivity_branches,
         test_python_version_below_requirement,

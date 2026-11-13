@@ -118,6 +118,29 @@ class CircuitBreaker:
             self._maybe_half_open()
             return self._state
 
+    def denies_new_calls(self) -> bool:
+        """只读预检：现在发起调用是否会被拒绝（不占用任何名额）。
+
+        - OPEN：拒绝；
+        - HALF_OPEN 且唯一试探名额已被占用：拒绝。
+        Web 入口用它在扣限流额度之前做零成本拒绝；``allow_call`` 会占用
+        半开试探名额，不能在预检里调用。
+        """
+        with self._lock:
+            self._maybe_half_open()
+            if self._state == CircuitState.OPEN:
+                return True
+            if self._state != CircuitState.HALF_OPEN:
+                return False
+            if self._half_open_probe_at is None:
+                return False
+            alive = _probe_owner_alive(self._probe_owner)
+            expired = (
+                time.monotonic() - self._half_open_probe_at
+                >= self._probe_lease_sec
+            )
+            return alive is True or (alive is None and not expired)
+
     def allow_call(self) -> bool:
         """
         是否允许本次调用。

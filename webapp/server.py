@@ -2690,13 +2690,15 @@ def _safe_usage_int(value: Any) -> int:
     备份恢复可能带入 NaN / Infinity（Python json.loads 接受它们）或历史脏
     数据：int(NaN) 会 ValueError、int(Infinity) 会 OverflowError，而
     /api/status 依赖本函数汇总——一次坏数据不能让面板概览永久 500。
+    负数同样按坏数据归零：备份文件里的 -1 会让「累计 tokens」被扣减，
+    甚至把总量算成负数展示给用户。
     """
     try:
         number = float(value or 0)
     except (TypeError, ValueError, OverflowError):
         # 超大整数（10**400）转 float 会 OverflowError：同样按坏数据归零
         return 0
-    if not math.isfinite(number):
+    if not math.isfinite(number) or number <= 0:
         return 0
     return int(number)
 
@@ -2783,8 +2785,9 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
                 value = float("nan")
             # 历史数据可能含 NaN / Infinity（旧版本导入），或两条超大的
             # 有限值相加溢出为 inf：非有限值会让 avg_elapsed 变成 inf，
-            # 状态接口的 JSON 序列化（allow_nan=False）每次 500
-            if math.isfinite(value):
+            # 状态接口的 JSON 序列化（allow_nan=False）每次 500。
+            # 负数耗时同样是坏数据（备份文件可以随便写）：不准入平均值
+            if math.isfinite(value) and value >= 0:
                 elapsed_total += value
                 elapsed_count += 1
         agents = meta.get("agents")
@@ -3047,8 +3050,9 @@ async def _acquire_chat_lock(
             return
         except asyncio.TimeoutError:
             if await request.is_disconnected():
+                # 499（客户端中止）：响应无人接收，不能记成 5xx 抬升错误率
                 raise HTTPException(
-                    status_code=503,
+                    status_code=499,
                     detail=f"客户端已断开（请求 ID：{request_id}）",
                 ) from None
             if time.monotonic() >= deadline:
@@ -4462,13 +4466,14 @@ def create_app(model: Any = None) -> FastAPI:
     @app.post("/api/chat")
     async def chat(
         request: Request, payload: ChatRequest, response: Response
-    ) -> dict[str, Any]:
-        # 熔断打开时直接 503：零 LLM 开销的拒绝不能先扣限流额度，
-        # 否则恢复后的重试者会被 429 锁在滑动窗口里。只读状态判断：
-        # raise_if_open 在 HALF_OPEN 下会占用唯一试探名额（owner=本请求
-        # 任务），真正的对话跑在另一个 asyncio 任务里再次申请会被拒——
-        # 半开期所有对话永久 503，熔断器再也回不到 CLOSED
-        if state.breaker.get_status()["state"] == "open":
+    ) -> Any:
+        # 熔断打开（或半开且唯一试探名额已被长回合占用）时直接 503：
+        # 零 LLM 开销的拒绝不能先扣限流额度，否则恢复后的重试者会被 429
+        # 锁在滑动窗口里。只读状态判断：raise_if_open 在 HALF_OPEN 下会
+        # 占用唯一试探名额（owner=本请求任务），真正的对话跑在另一个
+        # asyncio 任务里再次申请会被拒——半开期所有对话永久 503，熔断器
+        # 再也回不到 CLOSED
+        if state.breaker.denies_new_calls():
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -4523,14 +4528,19 @@ def create_app(model: Any = None) -> FastAPI:
                 )
                 if disconnected:
                     # 客户端已断开：回合已取消、暂存提问已回滚；drain /
-                    # end_turn 仍由 finally 完成，响应无人接收
+                    # end_turn 仍由 finally 完成，响应无人接收。
+                    # 499（客户端中止）：不能记成 200 成功，也不把整段耗时
+                    # 计入延迟分位（与中间件的 CancelledError/断连口径一致）
                     logger.info(
                         "客户端断连，已取消在途回合（%s）", _request_id(request)
                     )
-                    return {
-                        "session_id": session.session_id,
-                        "cancelled": True,
-                    }
+                    return JSONResponse(
+                        status_code=499,
+                        content={
+                            "session_id": session.session_id,
+                            "cancelled": True,
+                        },
+                    )
             except CircuitOpenError as exc:
                 raise HTTPException(
                     status_code=503,
@@ -4587,12 +4597,13 @@ def create_app(model: Any = None) -> FastAPI:
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
-        # 熔断打开时直接 503：零 LLM 开销的拒绝不能先扣限流额度，
-        # 否则恢复后的重试者会被 429 锁在滑动窗口里。只读状态判断：
-        # raise_if_open 在 HALF_OPEN 下会占用唯一试探名额（owner=本请求
-        # 任务），真正的对话跑在另一个 asyncio 任务里再次申请会被拒——
-        # 半开期所有对话永久 503，熔断器再也回不到 CLOSED
-        if state.breaker.get_status()["state"] == "open":
+        # 熔断打开（或半开且唯一试探名额已被长回合占用）时直接 503：
+        # 零 LLM 开销的拒绝不能先扣限流额度，否则恢复后的重试者会被 429
+        # 锁在滑动窗口里。只读状态判断：raise_if_open 在 HALF_OPEN 下会
+        # 占用唯一试探名额（owner=本请求任务），真正的对话跑在另一个
+        # asyncio 任务里再次申请会被拒——半开期所有对话永久 503，熔断器
+        # 再也回不到 CLOSED
+        if state.breaker.denies_new_calls():
             raise HTTPException(
                 status_code=503,
                 detail=(
