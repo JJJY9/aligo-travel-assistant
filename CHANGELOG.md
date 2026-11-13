@@ -49,6 +49,7 @@
 
 ### 修复
 - 知识库初始化中止清理重试：导出失败 / 初始化失败时移除本次新建的库目录，milvus-lite 句柄在 Windows 上延迟释放导致 unlink/rmtree 失败时短暂重试（gc 回收后重试 3 次）；仍无法删除 `milvus_lite.db` 时提示手动删除目录，避免新库被误认作已初始化而挡住旧库迁移
+- Milvus 重连修复（pymilvus 3.x）：ConnectionManager 按 uri 复用共享连接，`MilvusClient.close()` 只解除客户端引用、不关闭底层 channel，`reset_milvus_client` 之后重连仍拿回同一条（可能已损坏的）连接；现在 pymilvus 3 以 dedicated 模式创建客户端（进程内仍按数据库路径缓存共享），close() 真正关闭通道，断线重连建立新连接（2.x 参数与行为不变）
 - 初始化脚本目标 / 来源库解析收紧（#735 后续）：纯源码 checkout（技能目录即脚本目录、未设置 ALIGO_SKILLS_DIR）仍使用脚本本地目标与既有 legacy 迁移语义；只有技能目录被覆盖 / wheel 安装等运行期解析分歧时才把目标切到运行时目录。来源库单独解析，legacy 迁移不因空 skill 库抢先而丢失（补技能目录覆盖场景用例）
 - RAG 运行时锁与会话成本补漏：① `knowledge_status` 的只读快照改用共享读锁（此前独占写锁，面板 chip / 列表 / 状态并发时互相排队并在写者优先下被判「正在写入」）；② 导入 **dry-run** 只在读锁内做只读规划（此前持写锁做全库判重扫描，预览期间所有检索读锁超时）；③ `update_document` 的「原样保存」在读锁内先行判定并直接返回，不再为一次 no-op 保存加载（冷加载可能联网下载的）嵌入模型（锁内仍以权威快照复核）
 - RAG / 嵌入模型 / 知识库运行时评审批次：① 技能脚本的相对嵌入模型路径不再用 `parents[4]` 深锚点，依次尝试 config 模块目录 / 运行期数据目录（`default_data_root`）/ 旧锚点 / CWD——`ALIGO_SKILLS_DIR` 指向外部目录或 wheel 安装时不再把模型路径锚到用户主目录 / venv 根后静默联网；显式配置的本地模型路径缺失时明确报错（静默换成同维度 BAAI 会让查询向量与库内向量不同源、检索静默失真），默认路径未下载仍回退同名 HF 模型；② `init_knowledge_base.py` 的目标库改用运行时 `default_knowledge_dir()`（此前写进脚本自身技能目录，`ALIGO_SKILLS_DIR` 场景初始化「成功」但应用恒报未初始化）；锁占用 / 连接类异常给出「先停止 Web 服务」提示而非 Traceback，维度自愈重建失败保留导出备份并明确退出 1；③ wheel 安装的知识库跟随用户数据目录（Milvus Lite 数据不再随重建 venv 删除）；④ 半初始化时 RAG 抛出的中文「知识库缺少集合」在 `/api/knowledge/search` 映射为可操作 503（此前退化成通用「检索失败」）；⑤ 检索结果的缺失分片列表有界展示（异常 parts 声明不再把数百 KB 注入 prompt / 元数据）

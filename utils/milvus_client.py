@@ -35,18 +35,29 @@ _LOCK = threading.RLock()
 
 
 def _create_client(db_path: str) -> Any:
+    import pymilvus
     from pymilvus import MilvusClient
 
-    return MilvusClient(
-        db_path,
-        grpc_options={
+    options: dict[str, Any] = {
+        "grpc_options": {
             "keepalive_time": _GRPC_MAX_MS,
             "keepalive_timeout": "20000",
             "keepalive_permit_without_calls": "0",
             "http2_min_recv_ping_interval_without_data": _GRPC_MAX_MS,
             "http2_min_ping_interval_without_data": _GRPC_MAX_MS,
         },
-    )
+    }
+    # pymilvus 3.x 的 ConnectionManager 按 uri 复用共享连接：close() 只解除
+    # 客户端引用，不关闭底层 channel，重连会拿回同一条（可能已损坏的）连接，
+    # reset_milvus_client 变成空操作。进程内已按路径缓存客户端，用 dedicated
+    # 让 close() 真正关闭，重连才能建出新的 channel。2.x 没有该参数。
+    try:
+        major = int(str(getattr(pymilvus, "__version__", "2")).split(".", 1)[0])
+    except ValueError:
+        major = 2
+    if major >= 3:
+        options["dedicated"] = True
+    return MilvusClient(db_path, **options)
 
 
 def _create_client_with_retry(db_path: str) -> Any:

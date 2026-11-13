@@ -183,6 +183,37 @@ def test_reset_and_shutdown_clients():
     assert closed == ["a"], "close 抛异常不能阻止清空注册表"
 
 
+def test_client_uses_dedicated_connection_on_pymilvus3(monkeypatch):
+    """pymilvus 3 共享连接 close 后仍被复用：用 dedicated 让 reset 真正重连。"""
+    import sys
+    import types
+
+    from utils import milvus_client as mc
+
+    captured = {}
+
+    class _FakeMilvusClient:
+        def __init__(self, uri, **kwargs):
+            captured["uri"] = uri
+            captured["kwargs"] = kwargs
+
+    # CI 不安装重型 RAG 依赖：注入假模块，版本分支无需真实 pymilvus
+    fake_pymilvus = types.ModuleType("pymilvus")
+    fake_pymilvus.MilvusClient = _FakeMilvusClient
+    fake_pymilvus.__version__ = "3.0.2"
+    monkeypatch.setitem(sys.modules, "pymilvus", fake_pymilvus)
+
+    mc._create_client("dedicated.db")
+    assert captured["uri"] == "dedicated.db"
+    assert captured["kwargs"].get("dedicated") is True
+    assert "grpc_options" in captured["kwargs"]
+
+    # 2.x 不认识 dedicated 参数（会作为未知 kwarg 传给连接层），不能下发
+    fake_pymilvus.__version__ = "2.6.9"
+    mc._create_client("legacy.db")
+    assert "dedicated" not in captured["kwargs"], captured["kwargs"]
+    print("✓ pymilvus 3 使用 dedicated 连接，2.x 不下发未知参数")
+
 if __name__ == "__main__":
     for plain_case in (
         test_uses_max_id_not_row_count,
@@ -197,6 +228,7 @@ if __name__ == "__main__":
     for patched_case in (
         test_client_creation_retries_transient_failure,
         test_client_creation_retry_failure_propagates,
+        test_client_uses_dedicated_connection_on_pymilvus3,
     ):
         mp = pytest.MonkeyPatch()
         try:
