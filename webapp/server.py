@@ -3720,19 +3720,23 @@ def create_app(model: Any = None) -> FastAPI:
         trips_view = _trips_with_conflicts(
             data["trip_history"][-5:], data["trip_history"]
         )
-        return {
-            "user_id": user_id,
-            "preferences": preferences,
-            "trip_count": len(data["trip_history"]),
-            "travel_summary": travel_summary,
-            "trips": trips_view,
-            "next_trip": featured_trip,
-            "chat_count": len(data["chat_history"]),
-            "archived_count": _archived_count(data),
-            "statistics": data["statistics"],
-            "storage": describe_backends(),
-            "usage": _usage_summary_for_user(user_id, data["chat_history"]),
-        }
+        # 历史 / 手写数据可能含孤立代理项：不清洗会让响应 UTF-8 编码
+        # 失败（该接口对用户永久 500），与会话接口统一出口清洗
+        return _json_safe_value(
+            {
+                "user_id": user_id,
+                "preferences": preferences,
+                "trip_count": len(data["trip_history"]),
+                "travel_summary": travel_summary,
+                "trips": trips_view,
+                "next_trip": featured_trip,
+                "chat_count": len(data["chat_history"]),
+                "archived_count": _archived_count(data),
+                "statistics": data["statistics"],
+                "storage": describe_backends(),
+                "usage": _usage_summary_for_user(user_id, data["chat_history"]),
+            }
+        )
 
     @app.put("/api/preferences/{pref_type}")
     def update_preference(
@@ -3742,6 +3746,13 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """新增或覆盖一条用户偏好（记忆面板的手动维护入口）。"""
         _enforce_write_rate_limit(state, request)
+        if pref_type == "preferences":
+            # 存储层把该类型视为旧版嵌套偏好容器并在下次加载时展开 / 丢弃：
+            # 写入会「保存成功」后立即消失，删除恒为 false
+            raise HTTPException(
+                status_code=422,
+                detail="preferences 是保留的偏好类型，请使用具体类型名",
+            )
         # 与 CLI pref-set / 面板显示口径一致：空值 = 未设置，不能回显 200
         # 却让偏好从 /api/status 消失（清空请用 DELETE）
         if not has_preference_value(payload.value):
@@ -3780,6 +3791,11 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """删除一条用户偏好（记忆面板的手动维护入口）。"""
         _enforce_write_rate_limit(state, request)
+        if pref_type == "preferences":
+            raise HTTPException(
+                status_code=422,
+                detail="preferences 是保留的偏好类型，请使用具体类型名",
+            )
         # 删除是破坏性操作：PostgreSQL 不可用时不能静默作用在回退 JSON 上
         # （恢复后偏好会「复活」），strict 打开会返回 503
         store = _open_long_term(user_id, strict=True)
@@ -4674,15 +4690,17 @@ def create_app(model: Any = None) -> FastAPI:
         total = len(trips)
         ordered = trips[::-1] if order == "desc" else trips
         page = ordered[offset : offset + limit]
-        return {
-            "trips": _trips_with_conflicts(page, all_trips),
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "order": order,
-            "query": q.strip(),
-            "status": status_label,
-        }
+        return _json_safe_value(
+            {
+                "trips": _trips_with_conflicts(page, all_trips),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "order": order,
+                "query": q.strip(),
+                "status": status_label,
+            }
+        )
 
     @app.post("/api/trips", status_code=201)
     def create_trip(
@@ -5047,15 +5065,17 @@ def create_app(model: Any = None) -> FastAPI:
                     logger.warning("读取行程失败（去重，%s）: %s", user_id, exc)
                     raise _storage_failure("读取行程失败", exc) from exc
                 if dry_run:
-                    return {
-                        "user_id": user_id,
-                        "dry_run": True,
-                        "total_trips": plan["total_trips"],
-                        "would_remove": len(plan["duplicates"]),
-                        "duplicates": plan["duplicates"],
-                        "ambiguous_ids": plan["ambiguous_ids"],
-                        "removed": 0,
-                    }
+                    return _json_safe_value(
+                        {
+                            "user_id": user_id,
+                            "dry_run": True,
+                            "total_trips": plan["total_trips"],
+                            "would_remove": len(plan["duplicates"]),
+                            "duplicates": plan["duplicates"],
+                            "ambiguous_ids": plan["ambiguous_ids"],
+                            "removed": 0,
+                        }
+                    )
                 removed, failure = apply_trip_dedupe(
                     store, plan["duplicate_entries"], plan.get("verify")
                 )
@@ -5069,14 +5089,16 @@ def create_app(model: Any = None) -> FastAPI:
                             "可重试）"
                         ),
                     )
-                return {
-                    "user_id": user_id,
-                    "dry_run": False,
-                    "total_trips": plan["total_trips"],
-                    "removed": removed,
-                    "duplicates": plan["duplicates"],
-                    "ambiguous_ids": plan["ambiguous_ids"],
-                }
+                return _json_safe_value(
+                    {
+                        "user_id": user_id,
+                        "dry_run": False,
+                        "total_trips": plan["total_trips"],
+                        "removed": removed,
+                        "duplicates": plan["duplicates"],
+                        "ambiguous_ids": plan["ambiguous_ids"],
+                    }
+                )
             finally:
                 _close_long_term(store)
 
