@@ -118,6 +118,36 @@ def applied_key(key: str) -> str:
     return f"{key}:applied"
 
 
+def seen_key(key: str) -> str:
+    """会话消息键对应的「已写入消息内容指纹」集合键（TTL 同消息）。
+
+    跨实例 / 回填去重：同一批来自长期记忆的消息（角色 + 内容 + 时间戳
+    相同）经任一实例写入后，其它实例的重放 / 回填据此跳过，不会把同一
+    问答再推一遍、把真实旧轮次挤出窗口。
+    """
+    return f"{key}:seen"
+
+
+def message_content_id(message: dict[str, Any]) -> str:
+    """消息内容指纹：角色 + 内容 + 时间戳的 sha256 前缀。
+
+    与随机 op_id 不同，同一历史消息在任何实例 / 任何时刻都得到同一指纹：
+    回填与故障重放用它在 Redis 侧做跨实例内容去重。实时消息的时间戳唯一，
+    正常重复提问（内容相同、时间不同）不会被误判为同一条。
+    """
+    import hashlib
+
+    raw = json.dumps(
+        [
+            str(message.get("role") or ""),
+            str(message.get("content") or ""),
+            str(message.get("timestamp") or ""),
+        ],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
 # 原子地删除最后一轮（助手 + 用户）消息。ARGV[1] 为 "1" 时校验最后一条
 # 用户提问的内容是否等于 ARGV[2]（不一致则不删除），避免与并发写入交错。
 _TRUNCATE_LAST_TURN_LUA = """
@@ -282,22 +312,34 @@ return #stale
 # 完成。故障期重放时同一条消息（同 op_id）不会重复追加；而只按消息列表
 # 去重无法区分「已追加但被新消息挤出窗口」与「从未写入」——前者应跳过，
 # 后者必须补写，靠窗口内容判断会静默丢消息。
-# ARGV: 窗口大小、TTL、然后每两条为一组 (op_id, payload)。
+# seen 集合按「角色 + 内容 + 时间戳」指纹去重：另一实例的回填 / 重放已写入
+# 同一条消息时，本次重放跳过，跨实例的重复回填不会把同一问答推两遍。
+# ARGV: 窗口大小、TTL、然后每三条为一组 (op_id, content_hash, payload)。
 _ADD_MESSAGES_LUA = """
 local key = KEYS[1]
 local applied = KEYS[2]
+local seen = KEYS[3]
 local window = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local pushed = 0
-for i = 3, #ARGV, 2 do
+for i = 3, #ARGV, 3 do
   local op_id = ARGV[i]
-  local payload = ARGV[i + 1]
-  if redis.call('SISMEMBER', applied, op_id) == 0 then
+  local content_hash = ARGV[i + 1]
+  local payload = ARGV[i + 2]
+  local skip = redis.call('SISMEMBER', applied, op_id) == 1
+  if not skip and content_hash ~= ''
+     and redis.call('SISMEMBER', seen, content_hash) == 1 then
+    skip = true
+  end
+  if not skip then
     -- 先 RPUSH 再登记：脚本不回滚，若先 SADD 后 RPUSH 失败（WRONGTYPE /
     -- 内存不足），op_id 已被当作「已追加」写入 applied，恢复重放会永久
     -- 跳过这条消息。RPUSH 出错时脚本中断，op_id 不落 applied，重放可补写。
     redis.call('RPUSH', key, payload)
     redis.call('SADD', applied, op_id)
+    if content_hash ~= '' then
+      redis.call('SADD', seen, content_hash)
+    end
     pushed = pushed + 1
   end
 end
@@ -305,6 +347,7 @@ if pushed > 0 then
   redis.call('LTRIM', key, -window, -1)
   redis.call('EXPIRE', key, ttl)
   redis.call('EXPIRE', applied, ttl)
+  redis.call('EXPIRE', seen, ttl)
 end
 return pushed
 """
@@ -615,6 +658,10 @@ class RedisShortTermMemory:
         # 最后一次写入后闲置 ttl_sec 才过期」，按消息时间戳裁剪会把持续
         # 使用的会话里较早的轮次误删
         self._shadow_touched = time.monotonic()
+        # 影子缓存最后一次本地活动（降级期写入 / 回填种子）的时刻：降级
+        # 期间不会有 Redis 成功交互，只用 _shadow_touched 会让持续活跃但
+        # 长时间降级的会话在 ttl 后被每次读取整段清空
+        self._shadow_last_activity = self._shadow_touched
         self.user_id = user_id
         self.key = session_key(session_id, user_id)
         # Redis 故障时的进程内影子缓存：对话继续可用（跨实例共享暂时失效）。
@@ -634,12 +681,14 @@ class RedisShortTermMemory:
         return list(journal.ops) if journal is not None else []
 
     def seed_fallback_context(self, messages: list[dict[str, Any]]) -> None:
-        """降级窗口内把长期记忆回填的上下文写入影子缓存（不登记重放）。
+        """把长期记忆回填的上下文写入短期记忆（影子缓存 + Redis / 故障日志）。
 
-        这些消息来自长期记忆，Redis 里可能本来就有：登记重放会在恢复后
-        重复 RPUSH。但只放在意图上下文里时，编排器 / 子智能体读
-        ``get_recent_context`` 仍是空的——写入影子缓存让本轮子智能体也能
-        看到回填的历史；Redis 恢复后以真实内容校正影子缓存。
+        消息来自长期记忆，其它实例的 Redis 里可能已有同一批：每条按
+        「角色 + 内容 + 时间戳」指纹走 ``_ADD_MESSAGES_LUA`` 的 seen 去重，
+        重复回填不会把同一问答再推一遍。Redis 可用时直接写入（回填历史
+        从此留在窗口里，恢复后不会被 Redis 内容整体覆盖掉）；不可用时登记
+        重放（此前只写影子、不登记——故障期回填的历史在恢复后第一次成功
+        读取就被 Redis 内容覆盖，本会话更早的轮次从此不再进入模型上下文）。
         """
         for message in messages:
             if not isinstance(message, dict):
@@ -648,7 +697,66 @@ class RedisShortTermMemory:
             content = message.get("content")
             if role not in ("user", "assistant") or not isinstance(content, str):
                 continue
-            self._fallback.add_message(role, content)
+            timestamp = message.get("timestamp")
+            entry = {
+                "role": role,
+                "content": content,
+                "timestamp": (
+                    timestamp
+                    if isinstance(timestamp, str) and timestamp
+                    else datetime.now().isoformat()
+                ),
+                "metadata": {},
+            }
+            self._push_message(entry)
+        self._shadow_last_activity = time.monotonic()
+
+    def _push_message(self, message: dict[str, Any]) -> None:
+        """把一条成形消息写入影子缓存并（尽力）追加到 Redis；失败登记重放。
+
+        内容指纹跨实例稳定：同一历史消息经回填 / 重放重复提交时由
+        ``_ADD_MESSAGES_LUA`` 按 seen 集合跳过。
+        """
+        payload = json.dumps(message, ensure_ascii=False)
+        op_id = uuid.uuid4().hex
+        content_id = message_content_id(message)
+        # 影子缓存复用同一个消息对象：时间戳与 Redis 中的 JSON 完全一致，
+        # 故障期截断时才能按完整消息项精确删除 Redis 里的对应项。
+        # 同一内容指纹（回填 / 重放重复提交）只镜像一次：实时消息时间戳
+        # 唯一，不会被误判；重复回填不能在影子里堆出重复问答。
+        if content_id not in {
+            message_content_id(item) for item in self._fallback.messages
+        }:
+            self._fallback._append_message(message)
+
+        def op() -> None:
+            # 幂等追加：op_id 写入 applied 集合与 RPUSH 在同一脚本里完成，
+            # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）
+            self.client.eval(
+                _ADD_MESSAGES_LUA,
+                3,
+                self.key,
+                applied_key(self.key),
+                seen_key(self.key),
+                str(self.max_turns * 2),
+                str(self.ttl_sec),
+                op_id,
+                content_id,
+                payload,
+            )
+
+        _, via_redis = self._call_redis(
+            op,
+            lambda: None,
+            lambda journal: self._append_op(
+                journal, "add", (payload, op_id, content_id)
+            ),
+        )
+        if via_redis:
+            # 成功拿到响应后 op_id 不会再被重放，从 applied 集合移除：集合
+            # 只保留「写入结果不确定」的少量条目，不随消息总量增长
+            self._forget_applied(op_id)
+        logger.debug("Added message to short-term memory: %s", message.get("role"))
 
     def _append_op(
         self, journal: _PendingJournal, kind: str, payload: Any = None
@@ -657,6 +765,11 @@ class RedisShortTermMemory:
         if kind == "clear":
             # 清空会覆盖之前所有变更，旧操作不再需要重放
             journal.ops.clear()
+            journal.started_at = None
+        if not journal.ops:
+            # 队列已空（此前的操作刚刚重放成功、本次调用又在随后的真实
+            # 操作上失败）：新操作开启新的计速窗口。否则它会继承旧起点，
+            # 可能入队一两分钟后就被当成「超窗操作」整体丢弃
             journal.started_at = None
         if journal.started_at is None:
             journal.started_at = time.monotonic()
@@ -762,9 +875,9 @@ class RedisShortTermMemory:
         """执行队首的一条（或一批连续的新增）操作，成功后从日志移除。"""
         kind, payload = ops[0]
         if kind == "add":
-            # 连续新增合并为一次脚本调用（最多 100 条）：脚本按 op_id
-            # 幂等，逐条往返会把恢复后的首次调用拖成几十次网络往返
-            batch: list[tuple[str, str]] = []
+            # 连续新增合并为一次脚本调用（最多 100 条）：脚本按 op_id 与
+            # 内容指纹幂等，逐条往返会把恢复后的首次调用拖成几十次网络往返
+            batch: list[tuple[str, str, str]] = []
             consumed = 0
             for op_kind, op_payload in ops:
                 if op_kind != "add" or len(batch) >= 100:
@@ -772,16 +885,21 @@ class RedisShortTermMemory:
                 consumed += 1
                 batch.append(op_payload)
             arguments: list[str] = [str(window), str(self.ttl_sec)]
-            for op_payload, op_id in batch:
-                arguments.extend([op_id, op_payload])
+            for op_payload, op_id, content_id in batch:
+                arguments.extend([op_id, content_id, op_payload])
             self.client.eval(
-                _ADD_MESSAGES_LUA, 2, self.key, applied_key(self.key), *arguments
+                _ADD_MESSAGES_LUA,
+                3,
+                self.key,
+                applied_key(self.key),
+                seen_key(self.key),
+                *arguments,
             )
             # 这些操作已成功出队、不会再重放，回收对应的去重记录；
             # 回收失败只是多留几条无用记录（集合带 TTL），不回调错误
             try:
                 self.client.srem(
-                    applied_key(self.key), *[op_id for _, op_id in batch]
+                    applied_key(self.key), *[op_id for _, op_id, _ in batch]
                 )
             except Exception:  # noqa: BLE001 - 清理失败不影响重放结果
                 logger.debug("清理已重放 applied 记录失败：%s", self.key)
@@ -910,14 +1028,16 @@ class RedisShortTermMemory:
         影子缓存只按条数裁剪、从不按时间过期：Redis 键闲置超过 ``ttl_sec``
         已过期后，降级窗口仍会把旧对话送进模型（多实例删除的会话也会借
         影子回放）。Redis 的过期是「最后一次写入后闲置」，不是消息时间戳，
-        因此这里只在「与 Redis 最后一次成功交互已超过 ttl_sec」时清空影子
-        ——持续使用的会话不会被误删早期轮次。
+        因此这里只在「影子最后一次活动（Redis 成功交互或降级期本地写入）
+        已超过 ttl_sec」时清空影子——持续使用的会话不会被误删早期轮次。
         """
-        if (
-            self.ttl_sec > 0
-            and time.monotonic() - self._shadow_touched > self.ttl_sec
-        ):
+        last_activity = max(self._shadow_touched, self._shadow_last_activity)
+        if self.ttl_sec > 0 and time.monotonic() - last_activity > self.ttl_sec:
             self._fallback.messages = []
+            # 清空后重置计时：否则同一段空闲会让之后每次读取都再清一次，
+            # 把清空后新写入影子的消息也一并抹掉
+            self._shadow_touched = time.monotonic()
+            self._shadow_last_activity = self._shadow_touched
         messages = self._fallback.get_recent_context()
         if n_turns is None:
             return list(messages)
@@ -931,36 +1051,8 @@ class RedisShortTermMemory:
             "timestamp": datetime.now().isoformat(),
             "metadata": metadata or {},
         }
-        payload = json.dumps(message, ensure_ascii=False)
-        op_id = uuid.uuid4().hex
-        # 影子缓存复用同一个消息对象：时间戳与 Redis 中的 JSON 完全一致，
-        # 故障期截断时才能按完整消息项精确删除 Redis 里的对应项
-        self._fallback._append_message(message)
-
-        def op() -> None:
-            # 幂等追加：op_id 写入 applied 集合与 RPUSH 在同一脚本里完成，
-            # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）
-            self.client.eval(
-                _ADD_MESSAGES_LUA,
-                2,
-                self.key,
-                applied_key(self.key),
-                str(self.max_turns * 2),
-                str(self.ttl_sec),
-                op_id,
-                payload,
-            )
-
-        _, via_redis = self._call_redis(
-            op,
-            lambda: None,
-            lambda journal: self._append_op(journal, "add", (payload, op_id)),
-        )
-        if via_redis:
-            # 成功拿到响应后 op_id 不会再被重放，从 applied 集合移除：集合
-            # 只保留「写入结果不确定」的少量条目，不随消息总量增长
-            self._forget_applied(op_id)
-        logger.debug("Added message to Redis short-term memory: %s", role)
+        self._shadow_last_activity = time.monotonic()
+        self._push_message(message)
 
     def _forget_applied(self, op_id: str) -> None:
         try:
