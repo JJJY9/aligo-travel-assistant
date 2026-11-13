@@ -15,7 +15,7 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
-from utils.llm_resilience import is_retriable_error
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.preference_values import (
     EXPLANATORY_PREF_KEYS,
     has_preference_value,
@@ -303,7 +303,10 @@ class PreferenceAgent(AgentBase):
             return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
-        content = x.content if not isinstance(x, list) else x[-1].content
+        if isinstance(x, list):
+            content = x[-1].content if x else "{}"
+        else:
+            content = x.content
 
         # 如果content是JSON字符串，解析它
         if isinstance(content, str):
@@ -393,7 +396,10 @@ class PreferenceAgent(AgentBase):
             if result is None:
                 raise ValueError("模型输出中没有可解析的偏好结果对象")
         except Exception as e:
-            if is_retriable_error(e):
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                # 瞬时错误交给编排层重试；401/402/403/404 等永久错误
+                # 同样穿透，由外层上抛并计入熔断——吞成 error JSON 会让
+                # 密钥失效 / 余额耗尽时熔断器永远打不开
                 raise
             logger.error(f"Preference collection failed: {e}")
             result = {"has_preferences": False, "error": str(e)}

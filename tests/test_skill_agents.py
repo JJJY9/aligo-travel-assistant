@@ -1834,6 +1834,44 @@ def test_preference_non_string_type_is_dropped():
     print("✓ 偏好：非字符串 type 被丢弃")
 
 
+def test_preference_empty_list_input_and_permanent_errors():
+    """reply([]) 不抛 IndexError；401/402 等永久模型错误穿透给编排层记账。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _OkModel:
+        async def __call__(self, messages, **kwargs):
+            return '{"has_preferences": false, "preferences": []}'
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_OkModel(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _Loader()
+    out = asyncio.run(agent.reply([]))
+    data = json.loads(out.content)
+    assert data.get("has_preferences") is False, data
+
+    class _Unauthorized(Exception):
+        status_code = 401
+
+    class _BadModel:
+        async def __call__(self, messages, **kwargs):
+            raise _Unauthorized("Incorrect API key")
+
+    agent2 = agent_class(
+        name="PreferenceAgent", model=_BadModel(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent2.skill_loader = _Loader()
+    with pytest.raises(_Unauthorized):
+        asyncio.run(
+            agent2.reply(Msg(name="user", content="我喜欢汉庭", role="user"))
+        )
+    print("✓ 偏好：空消息列表不崩、永久模型错误穿透")
+
+
 def test_skill_reraises_retriable_model_errors():
     """技能不能把 5xx 等可重试模型错误吞成结果 JSON。"""
     module = _load_skill_module("plan-trip")
@@ -1933,6 +1971,7 @@ if __name__ == "__main__":
         test_preference_empty_formal_array_after_example()
         test_preference_replace_then_append_keeps_replace()
         test_preference_non_string_type_is_dropped()
+        test_preference_empty_list_input_and_permanent_errors()
         test_event_collection_duration_only_result_beats_echoed_example()
         test_event_collection_data_wrapper_is_unwrapped()
         test_plan_trip_tail_note_does_not_replace_full_plan()
