@@ -550,6 +550,25 @@ def test_kb_import_dispatch_flags(monkeypatch):
     print("✓ kb-import 参数解析（--json / --dry-run 任意顺序）")
 
 
+def test_export_failure_preserves_existing_file(monkeypatch):
+    """--force 覆盖时写入失败不能把旧备份截断成 0 字节。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    # 孤立代理项：json.dumps 可序列化，但 UTF-8 编码写入失败
+    monkeypatch.setattr(
+        knowledge_admin,
+        "export_documents",
+        lambda: [{"content": "坏 \ud800 片段", "metadata": {}}],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "kb.json"
+        target.write_text('{"keep": true}', encoding="utf-8")
+        code, out = _capture(
+            cli.run_knowledge_export_standalone, str(target), force=True
+        )
+        assert code == 1 and "写入失败" in out
+        assert json.loads(target.read_text(encoding="utf-8")) == {"keep": True}
+    print("✓ kb-export 写入失败保留旧备份")
+
 if __name__ == "__main__":
     for case in (
         test_export_writes_json,
@@ -571,6 +590,7 @@ if __name__ == "__main__":
         test_import_json_output,
         test_import_json_errors,
         test_kb_import_dispatch_flags,
+        test_export_failure_preserves_existing_file,
     ):
         mp = pytest.MonkeyPatch()
         try:

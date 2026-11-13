@@ -12,7 +12,7 @@ from typing import Annotated
 
 from pydantic import Field, TypeAdapter
 
-from utils.identifiers import is_valid_web_id
+from utils.identifiers import is_valid_web_id, is_valid_web_session_id
 
 _WEB_ID = TypeAdapter(Annotated[str, Field(pattern=r"^[\w-]{1,64}$")])
 
@@ -96,8 +96,20 @@ def test_windows_reserved_names_rejected():
     print("✓ Windows 设备保留名被拒绝")
 
 
+def test_session_ids_allow_windows_device_names():
+    """会话 ID 不拼记忆库文件名：Web 允许的 nul / con 在会话维度合法。"""
+    for value in ("nul", "CON", "com1", "lpt9"):
+        assert is_valid_web_session_id(value) is True, value
+        assert is_valid_web_id(value) is False, value
+    # 保留字（export）由调用方按 RESERVED_SESSION_IDS 另行拒绝
+    assert is_valid_web_session_id("export") is True
+    assert is_valid_web_session_id("has space") is False
+    assert is_valid_web_session_id(None) is False
+    print("✓ 会话 ID 允许设备保留名（用户 ID 仍拒绝）")
+
 if __name__ == "__main__":
     test_ids_match_web_rust_word_semantics()
     test_prefixed_and_suffixed_fragments()
     test_windows_reserved_names_rejected()
+    test_session_ids_allow_windows_device_names()
     print("\n全部通过")

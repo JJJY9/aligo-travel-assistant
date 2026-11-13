@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from utils.atomic_write import write_text_atomic
 from utils.console import strip_terminal_controls
 from utils.json_safe import sanitize_json, strip_nul
 from utils.session_markdown import sanitize_body
@@ -181,9 +182,8 @@ def export_files(
     cleaned = sanitize_backup_data(data)
     json_path = out / f"{stem}.json"
     md_path = out / f"{stem}.md"
-    json_path.write_text(
-        json.dumps(cleaned, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    write_text_atomic(
+        json_path, json.dumps(cleaned, ensure_ascii=False, indent=2)
     )
-    md_path.write_text(render_markdown(cleaned), encoding="utf-8")
+    write_text_atomic(md_path, render_markdown(cleaned))
     return [json_path, md_path]

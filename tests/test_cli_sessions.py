@@ -1469,6 +1469,78 @@ def test_sessions_export_stdout_strips_terminal_controls(monkeypatch):
     print("✓ sessions-export --stdout 剥离终端控制序列")
 
 
+def test_session_views_strip_terminal_controls(monkeypatch):
+    """标题 / 消息预览 / 回读标题里的 OSC 序列不能直达终端。"""
+    evil_title = "标题\x1b]8;;http://evil.example\x07链接"
+    evil_body = "内容\x1b]52;c;SGVsbG8=\x07尾部"
+
+    class _TitleStore(_FakeStore):
+        def set_session_title(self, session_id, title):
+            self.titles[session_id] = title
+            return True
+
+    store = _TitleStore(
+        [_message("assistant", evil_body, "s-esc")],
+        titles={"s-esc": evil_title},
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    outputs = []
+    for func in (
+        lambda: cli.run_sessions_list_standalone("u1"),
+        lambda: cli.run_session_show_standalone("u1", "s-esc"),
+        lambda: cli.run_session_title_standalone("u1", "s-esc", evil_title),
+    ):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = func()
+        assert code == 0, out.getvalue()
+        outputs.append(out.getvalue())
+    joined = "".join(outputs)
+    assert "\x1b]" not in joined and "\x07" not in joined, joined
+    print("✓ 会话标题 / 消息预览 / 回读标题剥离终端控制序列")
+
+def test_session_show_allows_device_like_session_id(monkeypatch):
+    """Web 能创建的 nul / con 会话在 CLI 也能查看；用户 ID 仍拒绝设备名。"""
+    store = _FakeStore([_message("user", "hi", "nul")], titles={"nul": "设备名"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "nul")
+    assert code == 0 and "设备名" in out.getvalue(), out.getvalue()
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("nul", "s1")
+    assert code == 1 and "用户 ID" in out.getvalue()
+    print("✓ 会话 ID 允许设备名，用户 ID 仍拒绝")
+
+def test_session_title_newline_cannot_forge_rows(monkeypatch):
+    """标题里的换行不能伪造会话列表 / 详情里的行。"""
+    fake_title = "标题Z\n  [置顶] fake  888 条"
+    store = _FakeStore(
+        [_message("user", "hi", "s-forge")], titles={"s-forge": fake_title}
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for call in (
+        lambda: cli.run_sessions_list_standalone("u1"),
+        lambda: cli.run_session_show_standalone("u1", "s-forge"),
+    ):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = call()
+        text = out.getvalue()
+        assert code == 0, text
+        assert "\n  [置顶] fake" not in text, text
+        assert "\n  [置顶]" not in text, text
+        assert "标题Z" in text
+    print("✓ 会话标题内嵌换行不能伪造列表行")
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
     test_session_export_flag_parsing()
@@ -1511,6 +1583,9 @@ if __name__ == "__main__":
         test_read_failure,
         test_store_open_failure,
         test_pg_fallback_refused,
+        test_session_views_strip_terminal_controls,
+        test_session_show_allows_device_like_session_id,
+        test_session_title_newline_cannot_forge_rows,
     ):
         mp = pytest.MonkeyPatch()
         try:

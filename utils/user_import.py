@@ -16,7 +16,7 @@ import re
 from collections import Counter
 from typing import Any
 
-from utils.identifiers import is_valid_web_id
+from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_import import _strict_date, trip_identity
@@ -87,7 +87,7 @@ def _clean_session_id(value: Any) -> tuple[str | None, bool]:
     text = str(value).strip()
     if not text:
         return None, True
-    if not is_valid_web_id(text):
+    if not is_valid_web_session_id(text):
         # 与 Web 路径参数（pydantic-core 的 Rust 正则 ^[\w-]{1,64}$）同一
         # 字符集：Web 可以创建并导出含零宽连接符 / 组合符的会话，导入不能
         # 把它们丢掉；反过来也不能恢复出 Web 端点 422 打不开的 ID

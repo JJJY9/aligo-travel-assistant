@@ -552,6 +552,27 @@ def test_export_status_arg_parsing():
     print("✓ --status 参数解析")
 
 
+def test_export_csv_over_import_row_limit(monkeypatch):
+    """行程超过单次导入上限（5000）时 CSV 导出仍成功，而不是 traceback。"""
+    import tempfile
+    from pathlib import Path
+
+    trips = [
+        _trip(destination=f"城市{i}", start="2026-12-05") for i in range(5001)
+    ]
+    store = _FakeStore(trips)
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    target = str(Path(tempfile.mkdtemp()) / "trips.csv")
+    code, out = _run("u1", target=target)
+    assert code == 0, out
+    path = Path(target)
+    assert path.exists()
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    assert len(lines) == 5002, len(lines)  # 表头 + 5001 行
+    print("✓ 行程超过导入上限时 CSV 导出仍成功")
+
 if __name__ == "__main__":
     for case in (
         test_export_to_file,
@@ -574,6 +595,7 @@ if __name__ == "__main__":
         test_export_csv_warns_about_unimportable_rows,
         test_export_ics_stdout_reports_skipped,
         test_export_stdout_strips_terminal_controls,
+        test_export_csv_over_import_row_limit,
     ):
         mp = pytest.MonkeyPatch()
         try:
