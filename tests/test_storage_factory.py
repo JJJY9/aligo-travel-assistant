@@ -1635,6 +1635,45 @@ def test_delete_last_turn_cleans_session_metadata():
     print("✓ 删空会话清理标题 / 置顶 / 归档")
 
 
+def test_delete_chat_session_clears_trip_links():
+    """删除会话清空行程上的会话链接（行程保留），结果落盘。"""
+    from context.long_term_memory import LongTermMemory
+
+    root = tempfile.mkdtemp()
+    memory = LongTermMemory("u-session-trip-link", root)
+    memory.add_chat_message("user", "Q", "s-link")
+    trip_id = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "purpose": "出差",
+            "session_id": "s-link",
+        }
+    )
+    other_id = memory.save_trip_history(
+        {
+            "origin": "杭州",
+            "destination": "成都",
+            "start_date": "2026-12-10",
+            "purpose": "培训",
+            "session_id": "s-other",
+        }
+    )
+    assert memory.delete_chat_session("s-link") == 1
+    trips = {trip["trip_id"]: trip for trip in memory.get_trip_history(limit=None)}
+    assert trips[trip_id].get("session_id") is None, trips[trip_id]
+    # 其它会话的链接不受影响
+    assert trips[other_id].get("session_id") == "s-other", trips[other_id]
+    # 重新加载确认已落盘
+    reloaded = LongTermMemory("u-session-trip-link", root)
+    reloaded_trips = {
+        trip["trip_id"]: trip for trip in reloaded.get_trip_history(limit=None)
+    }
+    assert reloaded_trips[trip_id].get("session_id") is None
+    print("✓ 删除会话清空行程会话链接")
+
+
 def test_migration_backs_up_and_resets_bad_destination_counts():
     """frequent_destinations 计数为字符串时归零并保留城市键，且先备份原始文件。"""
     from context.long_term_memory import LongTermMemory
