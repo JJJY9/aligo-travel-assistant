@@ -174,9 +174,14 @@ def _escape_body_line(
     """
     out: list[str] = []
     index = 0
+    table_like = "|" in line
+    # 本行本身是块起始（ATX 标题 / HTML 块 / 引用 / 列表 / 分隔线）时，
+    # 段落在本行结束：未配对反引号不能与后续行配对，否则本行剩余内容会
+    # 被当作代码而跳过转义（渲染器却按普通段落执行原始 HTML）
+    can_carry = not (_starts_block(line) or _is_table_delimiter(line))
     while index < len(line):
         char = line[index]
-        if char == "`":
+        if char == "`" and not table_like:
             end = index
             while end < len(line) and line[end] == "`":
                 end += 1
@@ -184,7 +189,8 @@ def _escape_body_line(
             close = _find_backtick_run(line, end, run)
             if close is None:
                 if (
-                    lines is not None
+                    can_carry
+                    and lines is not None
                     and _closing_run_follows(lines, line_index, run)
                 ):
                     # 跨行代码段：本行剩余内容都属于代码，原样保留
@@ -220,6 +226,10 @@ def _carry_code_line(line: str, run: int) -> tuple[str, int]:
     return line[: close + run] + rest, pending
 
 
+def _leading_spaces(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
 def _quote_line(line: str) -> str:
     return f"> {line}" if line else ">"
 
@@ -230,7 +240,8 @@ def sanitize_body(text: str) -> str:
     - 结构隔离：正文里伪造的 ``---`` / ``## 标题`` / ``- 会话：…`` /
       ``### Aligo`` 只会是引用块内的文字，不能制造顶层会话段落或角色标题；
     - 代码围栏平衡：消息内未闭合的 ``` / ~~~ 在本条消息末尾补齐，后续
-      消息与会话不会被吞进同一个代码块；围栏内不做任何转义（代码保真）；
+      消息与会话不会被吞进同一个代码块；缩进围栏（列表项内）随容器
+      结束恢复转义；表格行不参与跨单元格反引号配对；
     - 行内代码之外仍转义尖括号与链接 / 图片语法，避免预览器执行原始 HTML
       或自动加载远程图片；终端控制序列（ESC / OSC）一并剥离。
     """
@@ -238,16 +249,29 @@ def sanitize_body(text: str) -> str:
     lines = text.split("\n")
     rendered: list[str] = []
     fence = ""
+    fence_indent = 0
     pending_code_run = 0
     for line_index, line in enumerate(lines):
         if fence:
-            if _fence_close(line, fence):
+            if (
+                fence_indent
+                and line.strip()
+                and _leading_spaces(line) < fence_indent
+            ):
+                # 列表项等容器内的围栏随容器结束：后续未缩进行是正文，
+                # 必须恢复转义（渲染器此时已退出围栏/列表上下文）
                 fence = ""
-            rendered.append(_quote_line(line))
-            continue
+                fence_indent = 0
+            else:
+                if _fence_close(line, fence):
+                    fence = ""
+                    fence_indent = 0
+                rendered.append(_quote_line(line))
+                continue
         opener = _fence_open(line)
         if opener:
             fence = opener
+            fence_indent = _leading_spaces(line)
             rendered.append(_quote_line(line))
             continue
         if pending_code_run:

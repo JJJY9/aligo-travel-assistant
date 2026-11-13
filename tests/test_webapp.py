@@ -10948,6 +10948,115 @@ def test_chat_lock_wait_is_bounded(monkeypatch):
     asyncio.run(_free_lock())
     print("✓ SSE 对话锁等待有界并探测断连")
 
+def test_open_long_term_refuses_quarantined_memory(monkeypatch, tmp_path):
+    """JSON 记忆被隔离后 Web 打开存储必须 503，不能当作空数据继续。"""
+    from fastapi import HTTPException
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+
+    class _Store:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _Store(),
+    )
+    # 主文件已被存储层移走，只剩隔离备份：/api/export 之前会返回 200 空备份
+    (tmp_path / "u-quarantine.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+    with pytest.raises(HTTPException) as info:
+        server_module._open_long_term("u-quarantine")
+    assert info.value.status_code == 503
+    assert "隔离" in info.value.detail
+
+    # 用户用备份恢复出主文件后不再拦截
+    (tmp_path / "u-quarantine.json").write_text("{}", encoding="utf-8")
+    assert server_module._open_long_term("u-quarantine") is not None
+    print("✓ 记忆文件隔离后 Web 接口拒绝空数据")
+
+def test_trips_and_status_sanitize_lone_surrogates(monkeypatch):
+    """历史数据里的孤立代理项不能让 /api/trips、/api/status、去重接口 500。"""
+    from webapp import server as server_module
+
+    surrogate = "\ud800"
+    trips = [
+        {
+            "trip_id": "t1",
+            "origin": "北京",
+            "destination": surrogate,
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+        },
+        {
+            "trip_id": "t2",
+            "origin": "北京",
+            "destination": surrogate,
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+        },
+    ]
+
+    class _Store:
+        def export_snapshot(self):
+            return {
+                "preferences": {},
+                "trip_history": list(trips),
+                "chat_history": [],
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {"total_trips": 2, "total_messages": 0},
+            }
+
+        def get_trip_history(self, limit=None):
+            return list(trips)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _Store(),
+    )
+    client = _client()
+    listed = client.get("/api/trips", params={"user_id": "u-surrogate"})
+    assert listed.status_code == 200, listed.text
+    assert surrogate not in listed.text, listed.text
+    assert "ud800" in listed.text, "孤立代理项应转义为可见文本"
+
+    status = client.get("/api/status", params={"user_id": "u-surrogate"})
+    assert status.status_code == 200, status.text
+    assert surrogate not in status.text
+
+    dedupe = client.post(
+        "/api/trips/dedupe",
+        json={"user_id": "u-surrogate", "dry_run": True},
+    )
+    assert dedupe.status_code == 200, dedupe.text
+    print("✓ 行程 / 状态 / 去重接口清洗孤立代理项")
+
+
+def test_preference_reserved_type_rejected():
+    """保留类型 preferences 的写入 / 删除返回 422，不再假成功。"""
+    client = _client()
+    put = client.put(
+        "/api/preferences/preferences",
+        json={"user_id": "u-reserved-pref", "value": ["汉庭"]},
+    )
+    assert put.status_code == 422, put.text
+    assert "保留" in put.json()["detail"]
+    deleted = client.delete(
+        "/api/preferences/preferences",
+        params={"user_id": "u-reserved-pref"},
+    )
+    assert deleted.status_code == 422, deleted.text
+    print("✓ 保留偏好类型 preferences 被拒绝")
+
 if __name__ == "__main__":
     test_index_page()
     test_match_snippet_handles_casefold_length_changes()
@@ -11015,6 +11124,10 @@ if __name__ == "__main__":
 
     test_export_concurrency_guard()
     test_chat_lock_wait_is_bounded(pytest.MonkeyPatch())
+    test_open_long_term_refuses_quarantined_memory(
+        pytest.MonkeyPatch(),
+        __import__("pathlib").Path(__import__("tempfile").mkdtemp()),
+    )
 
     _mp_slow_body = pytest.MonkeyPatch()
     try:

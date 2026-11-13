@@ -300,6 +300,40 @@ def test_title_strips_terminal_controls():
     print("✓ 标题剥离终端控制序列")
 
 
+def test_heading_line_cannot_open_cross_line_code_span():
+    """ATX 标题行内的未配对反引号不能把同行剩余 HTML 当成代码放行。"""
+    from utils.session_markdown import sanitize_body
+
+    text = sanitize_body("# 标题 `x <img src=x onerror=alert(1)>\n`")
+    assert "<img" not in text, text
+    assert "&lt;img" in text, text
+    print("✓ 标题行不开启跨行代码段")
+
+
+def test_list_scoped_fence_restores_escaping_after_container():
+    """列表项内的围栏随容器结束：后续未缩进行必须恢复转义。"""
+    from utils.session_markdown import sanitize_body
+
+    text = sanitize_body(
+        "- 列表项\n  ```\n  <b>代码</b>\n<img src=x onerror=alert(1)>"
+    )
+    assert "<b>代码</b>" in text, "围栏内代码保持原样"
+    assert "<img" not in text, text
+    assert "&lt;img" in text, text
+    print("✓ 列表容器内的围栏结束后恢复转义")
+
+
+def test_table_row_escapes_html_without_cross_cell_code_span():
+    """GFM 表格行不参与跨单元格反引号配对，单元格里的 HTML 必须转义。"""
+    from utils.session_markdown import sanitize_body
+
+    text = sanitize_body(
+        "| `a <img src=x onerror=alert(1)> | b` |\n| --- | --- |"
+    )
+    assert "<img" not in text, text
+    assert "&lt;img" in text, text
+    print("✓ 表格行不跨单元格配对反引号")
+
 if __name__ == "__main__":
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
@@ -314,5 +348,8 @@ if __name__ == "__main__":
     test_fence_state_machine_matches_commonmark()
     test_multiline_code_span_content_preserved()
     test_block_start_line_cannot_close_code_span()
+    test_heading_line_cannot_open_cross_line_code_span()
+    test_list_scoped_fence_restores_escaping_after_container()
+    test_table_row_escapes_html_without_cross_cell_code_span()
     test_title_strips_terminal_controls()
     print("\n全部通过")

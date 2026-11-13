@@ -49,6 +49,9 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- Web 行程 / 状态响应出口清洗与保留偏好类型：`/api/trips`、`/api/status`、`/api/trips/dedupe` 统一 `_json_safe_value`（旧数据里的孤立代理项不再让接口永久 500，也不再让该用户所有记忆写接口因整文件重写失败而 503）；`preferences` 作为存储层旧格式容器的保留类型，PUT / DELETE 直接 422（此前写入「成功」后下一次请求即消失）
+- Web 导出与读取的损坏隔离保护：JSON 记忆主文件被隔离为 `.corrupt-*` 后，Web 端此前把空快照当作有效数据——`/api/export` 返回 200 空备份、会话导出返回 404「没有可导出的会话」；现在打开长期记忆时检测隔离状态并返回 503 提示使用备份恢复（主文件存在即视为已恢复，不拦截），与 CLI user-export 口径一致
+- Markdown 会话导出 XSS 加固：① 本行本身是块起始（ATX 标题 / HTML 块 / 引用 / 列表 / 分隔线）时不再允许未配对反引号开启跨行代码段，标题行上的 `<img>` 不再原样落盘；② 列表项内的缩进围栏随容器结束恢复转义（未缩进的后续行不能借围栏状态跳过 HTML 转义）；③ GFM 表格行不参与跨单元格反引号配对，单元格内 HTML 一律转义
 - 技能智能体健壮性（plan-trip / event-collection / preference / memory-query）：① plan-trip 接受编排层 / 渲染层已支持的 `{"data": {"itinerary": ...}}` 包装形状（此前整份规划被判缺少 itinerary 丢弃），追问压缩保留上一版逐日安排、用户粘贴的 JSON 不再被摘要成占位符；② 同类型多条偏好（模型按 SKILL 示例逐条 replace）合并为一条列表值，条目形如 `{"hotel_brands": ...}` 或缺 type 的旧格式规范成 type/value，截断的裸数组不再用回显示例顶替；③ 四个技能把 5xx / 超时等可重试模型错误穿透给编排层（此前吞成结果 JSON，重试与熔断失效），网关 200 空响应按可重试错误处理；④ memory-query 的 prompt 带当前日期并标注未来行程只是计划，最近对话逐条截断（此前整轮编排 JSON 原样进入 prompt）；⑤ content block 列表统一用 extract_user_query 拼文本，不再 str() 成 Python repr
 - PostgreSQL 并发与导出一致性：① 会话级 advisory lock 增加实例级 RLock 外层——同一连接上的 `pg_advisory_lock` 对多线程总是可重入，旧线程与新回合共用实例时可并发读改写、静默插出两条身份相同的行程或丢失偏好追加；② `export_snapshot` 记录快照开始时的连接，每个查询后校验未被重建，连接闪断导致整体重试（此前重放查询落在新连接、旧事务上下文静默失效，返回旧新混合的备份）
 - 存储层后端一致性：① 交互式 CLI 构造 MemoryManager 时显式传 `default_data_root()/memory`（此前默认 `data/memory` 锚定包根，设置 `ALIGO_DATA_DIR` 或 wheel 安装时与 Web 面板 / 子命令 / 同会话 export 读写不同文件，重建 venv 即丢）；② PostgreSQL `update_trip` 的重复候选查询按存储身份口径做 CRLF/CR 归一（此前原始等值比较，PG 上可造出 `trip_identity` 相同的两条行程，与 JSON 行为不一致）；③ PG 新建行程不再默认「旅游」目的（JSON 原样保存未提供值），保存命中既有行时刷新 timestamp（与 JSON 一致）；④ PG 批量消息去重的 `session_id` 与 JSON 同口径字符串化（整数 / 字符串视为同一会话）
