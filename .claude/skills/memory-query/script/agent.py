@@ -26,6 +26,7 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.log_redact import redact_paths
+from utils.llm_resilience import is_retriable_error
 from utils.json_parser import extract_json_from_async_response
 from utils.preference_values import has_preference_value
 
@@ -108,9 +109,16 @@ class MemoryQueryAgent(AgentBase):
             if isinstance(raw_dialogue, list)
             else []
         )
+        def _trim_dialogue(value: object, limit: int = 1200) -> str:
+            text = str(value or "")
+            return text if len(text) <= limit else text[:limit] + "…"
+
+        # 助手消息实际是整轮编排结果 JSON（daily_plans / 各技能 data /
+        # _meta）：与历史总结路径同一口径逐条截断，避免 prompt 膨胀
         dialogue_text = (
             "\n".join(
-                f"{'用户' if item.get('role') == 'user' else '助手'}: {item.get('content')}"
+                f"{'用户' if item.get('role') == 'user' else '助手'}: "
+                f"{_trim_dialogue(item.get('content'))}"
                 for item in current_dialogue
             )
             or "（暂无当前会话上下文）"
@@ -160,8 +168,16 @@ class MemoryQueryAgent(AgentBase):
         if not skill_instruction:
             skill_instruction = "请基于用户的历史记忆回答问题，如无相关记录请诚实说明。"
 
-        # 构建 prompt
+        # 构建 prompt：带上当前日期，规划层会提前把未来行程写入历史，
+        # 没有日期模型无法区分「已去过」与「计划中的行程」
+        from datetime import datetime
+
+        current_date = datetime.now().strftime("%Y-%m-%d")
         prompt = f"""你是一个个人记忆助手，请基于用户的历史记忆回答问题。
+
+【当前日期】
+{current_date}
+（用户旅行历史里出发日期晚于当前日期的行程只是计划，不代表已经出行）
 
 【用户问题】
 {user_query}
@@ -192,8 +208,10 @@ class MemoryQueryAgent(AgentBase):
             # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
             answer = await extract_json_from_async_response(response)
 
-            if not answer:
-                answer = "无法基于记忆生成回答"
+            if not answer or not str(answer).strip():
+                # 网关 200 空 choices / 纯空白：按可重试错误上抛，交给编排
+                # 层重试与熔断记账，不能伪装成一条「成功」的空回答
+                raise ConnectionError("模型返回空响应")
 
             logger.info(f"Memory query answered: {user_query[:50]}")
 
@@ -213,6 +231,8 @@ class MemoryQueryAgent(AgentBase):
             return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
 
         except Exception as e:
+            if is_retriable_error(e):
+                raise
             logger.error(f"Memory query failed: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")

@@ -14,6 +14,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 # project_root = Path(__file__).parent.parent # Removed old logic
 # sys.path.insert(0, str(project_root))
 
+from utils.llm_resilience import is_retriable_error
 from utils.json_parser import (
     extract_json_from_async_response,
     iter_json_objects_with_repair,
@@ -89,12 +90,46 @@ def _summarize_result_payload(parsed: dict) -> str:
             duration = str(itinerary.get("duration") or "").strip()
             plans = itinerary.get("daily_plans")
             days = len(plans) if isinstance(plans, list) else 0
+            day_bits: list[str] = []
+            if isinstance(plans, list):
+                for index, plan in enumerate(plans[:7], 1):
+                    if not isinstance(plan, dict):
+                        continue
+                    label = plan.get("day") or index
+                    activities = plan.get("activities")
+                    if not isinstance(activities, list):
+                        activities = plan.get("schedule")
+                    texts: list[str] = []
+                    for activity in (
+                        activities if isinstance(activities, list) else []
+                    ):
+                        if isinstance(activity, dict):
+                            text = (
+                                activity.get("title")
+                                or activity.get("name")
+                                or activity.get("activity")
+                                or activity.get("description")
+                                or ""
+                            )
+                            texts.append(str(text))
+                        elif isinstance(activity, str):
+                            texts.append(activity)
+                    summary_text = "、".join(
+                        part for part in texts if part.strip()
+                    )[:120]
+                    if summary_text:
+                        day_bits.append(f"D{label}:{summary_text}")
             detail = "，".join(
                 item for item in (duration, f"{days} 天" if days else "") if item
             )
-            parts.append(
-                f"行程：{title}（{detail}）" if detail else f"行程：{title}"
-            )
+            if day_bits:
+                parts.append(
+                    f"行程：{title}（{detail}）：" + "；".join(day_bits)
+                )
+            else:
+                parts.append(
+                    f"行程：{title}（{detail}）" if detail else f"行程：{title}"
+                )
             continue
         fields = {
             key: payload.get(key)
@@ -136,7 +171,7 @@ def _compact_recent_dialogue(messages, max_chars: int = 4000):
                 parsed = json.loads(content)
             except (json.JSONDecodeError, ValueError):
                 parsed = None
-        if isinstance(parsed, dict):
+        if isinstance(parsed, dict) and role != "user":
             summary = (
                 parsed.get("answer")
                 or parsed.get("summary")
@@ -145,6 +180,8 @@ def _compact_recent_dialogue(messages, max_chars: int = 4000):
                 or ""
             )
             content = str(summary) if summary else "（上一轮完整结果已省略）"
+        # 用户消息（如粘贴的旧行程 JSON）不摘要：只按长度截断，不能把
+        # 用户自己给的内容替换成占位符
         compacted.append({"role": role, "content": content[:max_chars]})
     return compacted
 
@@ -308,6 +345,10 @@ class ItineraryPlanningAgent(AgentBase):
 
             # 获取响应文本
             text = await extract_json_from_async_response(response)
+            if not text or not str(text).strip():
+                # 网关 200 空 choices / 纯空白：按可重试错误上抛，交给编排
+                # 层重试与熔断记账，不能伪装成一次「空规划成功」
+                raise ConnectionError("模型返回空响应")
 
             # 数组输出会被 robust_json_parse 截成第一个元素仍按成功返回：
             # 必须在解析前按原始文本判定顶层结构
@@ -387,6 +428,19 @@ class ItineraryPlanningAgent(AgentBase):
             if candidate is not None:
                 result = candidate
 
+            # 模型可能把完整行程再套一层 {"data": {"itinerary": ...}}：
+            # 编排层 _merged_skill_payload 与渲染层都显式支持该形状，输出
+            # 校验必须同一口径，否则整份规划被当成缺少 itinerary 丢弃
+            if "itinerary" not in result:
+                nested = result.get("data")
+                if isinstance(nested, dict) and (
+                    "itinerary" in nested
+                    or any(
+                        key in nested
+                        for key in ("title", "daily_plans", "duration", "schedule")
+                    )
+                ):
+                    result = nested
             # 模型可能省略 SKILL.md 要求的 itinerary 包装、直接返回裸行程
             # 对象：按成功返回会让回答为空、行程也不写长期记忆——补齐包装
             if "itinerary" not in result and any(
@@ -407,6 +461,9 @@ class ItineraryPlanningAgent(AgentBase):
                 raise ValueError("行程规划结果缺少有效行程（itinerary 为空）")
 
         except Exception as e:
+            if is_retriable_error(e):
+                # 5xx / 超时 / 限流等瞬时模型错误：穿透给编排层按契约重试
+                raise
             logger.error(f"Itinerary planning failed: {e}")
             # Ensure text is defined for logging even if extraction failed
             # 使用 locals().get 安全获取 text，防止 UnboundLocalError
