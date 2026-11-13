@@ -38,6 +38,7 @@ from utils.llm_resilience import (
     retry_with_backoff,
 )
 from utils.preference_values import (
+    EXPLANATORY_PREF_KEYS,
     has_preference_value,
     is_manageable_pref_type,
     merge_preference_value,
@@ -45,24 +46,8 @@ from utils.preference_values import (
 
 logger = logging.getLogger(__name__)
 
-# 旧版字典格式偏好里的说明性键：模型附带 note/message 等时不能被当成
-# 偏好类型落库（会污染面板与后续批次的上下文）
-_PREF_EXPLANATORY_KEYS = frozenset(
-    {
-        "has_preferences",
-        "error",
-        "note",
-        "notes",
-        "message",
-        "reason",
-        "reasoning",
-        "summary",
-        "explanation",
-        "confidence",
-        "status",
-        "action",
-    }
-)
+# 说明性键集合：落库 / 回显 / 后续批次上下文三处共用同一口径
+_PREF_EXPLANATORY_KEYS = EXPLANATORY_PREF_KEYS
 
 # 单个子智能体的执行上限与瞬时错误重试：防止一个卡住的智能体让整轮对话
 # （以及该用户的会话锁）无限等待；重试只针对可重试的 LLM / 网络错误
@@ -570,13 +555,20 @@ class OrchestrationAgent(AgentBase):
         单飞：并发 / 重入调用等待同一个写入任务完成（先到者清空负载并
         开始写，后到者此前会立即返回 False，drain 因此提前放行用户锁）。
         """
-        running = getattr(self, "_deferred_commit_task", None)
-        if running is not None and not running.done():
+        waited = False
+        while True:
+            running = getattr(self, "_deferred_commit_task", None)
+            if running is None or running.done():
+                break
+            # 等旧提交结束后必须回头提交当前负载：此前直接 return True，
+            # 当前 _deferred_memory 会在下一轮 reply 入口被清空（静默丢失）
+            waited = True
             await asyncio.shield(running)
-            return True
         payload = getattr(self, "_deferred_memory", None)
         if not payload:
-            return False
+            # 等待期间旧提交已完成且没有新的暂存负载：对调用方而言待写
+            # 记忆已经落库（并发调用都返回 True，与单飞语义一致）
+            return waited
         self._deferred_memory = None
         intention_data, results = payload
 
@@ -709,7 +701,7 @@ class OrchestrationAgent(AgentBase):
                         preferences[pref_type] = value
             elif isinstance(raw, dict):
                 for pref_type, value in raw.items():
-                    if pref_type in {"has_preferences", "error"}:
+                    if pref_type in _PREF_EXPLANATORY_KEYS:
                         continue
                     if not is_manageable_pref_type(pref_type):
                         continue
@@ -896,7 +888,13 @@ class OrchestrationAgent(AgentBase):
                 "duration": duration,
             },
         )
-        if retry_cache is not None and cache_key:
+        if (
+            retry_cache is not None
+            and cache_key
+            and result.get("status") == "success"
+        ):
+            # 只复用首轮已成功的结果：status=error（模型格式错误 / 超时）
+            # 在整轮回退重试时应当重新执行，否则瞬时失败被缓存成永久失败
             retry_cache[cache_key] = result
         return result
 
@@ -1414,6 +1412,59 @@ class OrchestrationAgent(AgentBase):
                             except Exception as exc:  # noqa: BLE001 - 补齐失败不阻断保存
                                 logger.warning(
                                     "补齐历史行程出发地失败（%s），继续保存",
+                                    type(exc).__name__,
+                                )
+                        # 上一轮只知出发日、本轮补出返程日期：缺省 end 的
+                        # 同趟行程按身份（目的地 + 出发日）命中并补写 end，
+                        # 否则存储层去重身份含 end，会再插一条重复行程
+                        # （统计翻倍且两条互相报日期冲突）
+                        if end_date:
+                            try:
+                                updater = getattr(
+                                    self.memory_manager.long_term,
+                                    "update_trip",
+                                    None,
+                                )
+                                if callable(updater):
+                                    history = (
+                                        self.memory_manager.long_term.get_trip_history(
+                                            limit=None
+                                        )
+                                    )
+                                    for old in history:
+                                        old_start = _trip_date(
+                                            old.get("start_date")
+                                        )
+                                        old_end = _trip_date(
+                                            old.get("end_date")
+                                        )
+                                        old_origin = str(
+                                            old.get("origin") or ""
+                                        ).strip()
+                                        if (
+                                            str(
+                                                old.get("destination") or ""
+                                            )
+                                            == destination
+                                            and old_start == start_date
+                                            and (
+                                                not old_end
+                                                or old_end == old_start
+                                            )
+                                            and (
+                                                not old_origin
+                                                or old_origin == origin
+                                            )
+                                            and old.get("trip_id")
+                                        ):
+                                            updater(
+                                                str(old["trip_id"]),
+                                                {"end_date": end_date},
+                                            )
+                                            break
+                            except Exception as exc:  # noqa: BLE001 - 补齐失败不阻断保存
+                                logger.warning(
+                                    "补齐历史行程返程日期失败（%s），继续保存",
                                     type(exc).__name__,
                                 )
                         record: dict[str, Any] = {

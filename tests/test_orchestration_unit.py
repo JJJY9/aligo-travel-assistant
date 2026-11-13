@@ -2869,6 +2869,152 @@ def test_agent_failure_message_redacts_internal_paths():
     print("✓ 智能体错误信息遮蔽本机路径 / 上游 URL")
 
 
+def test_retry_cache_does_not_cache_error_results():
+    """整轮重试只复用成功结果：返回 status=error 的智能体应重新执行。"""
+    calls = {"a": 0, "b": 0}
+
+    class Flaky(_StubAgent):
+        async def reply(self, x):
+            calls[self.name] += 1
+            if self.name == "a" and calls["a"] == 1:
+                return Msg(
+                    name=self.name,
+                    content='{"status": "error", "message": "模型返回格式有误"}',
+                    role="assistant",
+                )
+            if self.name == "b" and calls["b"] <= 2:
+                raise ConnectionError("transient blip")
+            return Msg(name=self.name, content='{"ok": true}', role="assistant")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={"a": Flaky("a"), "b": Flaky("b")}
+    )
+    schedule = [
+        {"agent_name": "a", "priority": 1},
+        {"agent_name": "b", "priority": 1},
+    ]
+    cache: dict = {}
+    try:
+        asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=cache))
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("首个可重试错误必须上抛给外层重试")
+    assert calls["a"] == 1
+    assert all(
+        item.get("status") == "success" for item in cache.values()
+    ), "status=error 的结果不能进重试缓存"
+
+    asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=cache))
+    assert calls["a"] == 2, f"error 结果应随整轮重试重新执行: {calls}"
+    assert all(
+        item.get("status") == "success" for item in cache.values()
+    ), cache
+    print("✓ 重试缓存只复用成功结果")
+
+
+def test_commit_deferred_memory_commits_payload_after_waiting():
+    """旧提交在途时到达的新负载必须在等待后继续提交，而不是直接丢弃。"""
+    import threading
+
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    calls: list[int] = []
+    first_started = threading.Event()
+    release = threading.Event()
+
+    def slow_update(intention, results):
+        turn = intention.get("turn")
+        calls.append(turn)
+        if turn == 1:
+            first_started.set()
+            release.wait(5)
+
+    orchestrator._update_memory = slow_update  # type: ignore[method-assign]
+    orchestrator._deferred_memory = ({"turn": 1}, [])
+
+    async def run():
+        first = asyncio.ensure_future(orchestrator.commit_deferred_memory())
+        ready = await asyncio.to_thread(first_started.wait, 5)
+        assert ready, "首个提交未启动"
+        orchestrator._deferred_memory = ({"turn": 2}, [])
+        second = asyncio.ensure_future(orchestrator.commit_deferred_memory())
+        await asyncio.sleep(0.05)
+        release.set()
+        return await asyncio.gather(first, second)
+
+    results = asyncio.run(run())
+    assert calls == [1, 2], f"新负载必须落库: {calls}"
+    assert results == [True, True], results
+    assert orchestrator._deferred_memory is None
+    print("✓ 延迟提交等待旧任务后继续提交新负载")
+
+
+def test_update_memory_backfills_end_date_instead_of_duplicate():
+    """后续轮次补出返程日期时更新既有行程，不插入重复行。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+    def results(start, end):
+        return [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "origin": "北京",
+                        "destination": "上海",
+                        "start_date": start,
+                        "end_date": end,
+                    },
+                },
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "上海出差"}},
+                },
+            },
+        ]
+
+    orchestrator._update_memory({}, results("2026-03-10", None))
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1 and not trips[0].get("end_date"), trips
+
+    orchestrator._update_memory({}, results("2026-03-10", "2026-03-14"))
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert trips[0]["end_date"] == "2026-03-14"
+    assert memory.long_term.get_statistics()["total_trips"] == 1
+    print("✓ 补出返程日期更新既有行程而非重复落库")
+
+
+def test_previous_preferences_context_skips_explanatory_keys():
+    """旧格式偏好字典的说明性键不进入后续批次上下文。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    result = {
+        "agent_name": "preference",
+        "priority": 1,
+        "result": {
+            "status": "success",
+            "data": {
+                "preferences": {
+                    "hotel_brands": ["汉庭"],
+                    "note": "用户还提到下周去上海",
+                    "message": "已记录",
+                    "reason": "模型推理",
+                    "has_preferences": True,
+                }
+            },
+        },
+    }
+    context = orchestrator._context_with_previous_preferences({}, [result])
+    assert context["user_preferences"] == {"hotel_brands": ["汉庭"]}
+    print("✓ 说明性键不进入后续批次偏好上下文")
+
 if __name__ == "__main__":
     test_priority_parallel_and_sequential()
     test_previous_results_passed_to_next_priority()
@@ -2883,6 +3029,10 @@ if __name__ == "__main__":
     test_update_memory_key_entities_date_duration_fallback()
     test_update_memory_rejects_inverted_and_placeholder_dates()
     test_update_memory_backfills_origin_on_existing_trip()
+    test_retry_cache_does_not_cache_error_results()
+    test_commit_deferred_memory_commits_payload_after_waiting()
+    test_update_memory_backfills_end_date_instead_of_duplicate()
+    test_previous_preferences_context_skips_explanatory_keys()
     test_agent_load_executors_are_daemon_and_unregistered()
     test_agent_status_error_and_null_error()
     test_nested_query_failure_is_reported_as_error()
