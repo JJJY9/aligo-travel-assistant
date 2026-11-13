@@ -127,6 +127,91 @@ def test_plan_reports_ambiguous_ids_separately():
     print("✓ 歧义 trip_id 不自动处理")
 
 
+def test_plan_flags_id_shared_with_dateless_row():
+    """同 id 的一条行程缺出发日期也算歧义（与存储层「同 id 多行」同口径）。"""
+    store = _Store(
+        [
+            _trip("dup"),
+            _trip("dup", start=None),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["ambiguous_ids"] == ["dup"], plan["ambiguous_ids"]
+    assert plan["duplicate_entries"] == []
+    print("✓ 同 id 的无日期行同样触发歧义提示")
+
+
+def test_plan_same_id_identical_rows_are_duplicates_not_ambiguous():
+    """同 id 且完全相同的两行是重复行（自动清理），不是歧义。"""
+    store = _Store([_trip("dup"), _trip("dup")])
+    plan = plan_trip_dedupe(store)
+    assert plan["ambiguous_ids"] == []
+    assert plan["duplicate_entries"] == [("dup", "dup")]
+    print("✓ 同 id 完全相同的行按重复处理")
+
+
+def test_plan_identical_dateless_rows_are_cleanable_duplicates():
+    """同 id 且内容完全相同的无日期行：可自动清理（不再是歧义死角）。"""
+    row = {
+        "trip_id": "trip_9",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": None,
+        "end_date": None,
+    }
+    store = _Store([dict(row), dict(row)])
+    plan = plan_trip_dedupe(store)
+    assert plan["ambiguous_ids"] == [], plan["ambiguous_ids"]
+    assert plan["duplicate_entries"] == [("trip_9", "trip_9")], plan
+    assert plan["groups_with_duplicates"] == 1
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (1, None), (removed, failure)
+    assert len(store.trips) == 1, store.trips
+    print("✓ 无日期同 id 裸重复可自动清理")
+
+
+def test_plan_dateless_same_id_different_content_is_ambiguous():
+    """同 id 的无日期行内容不同：仍报歧义，不自动删除。"""
+    store = _Store(
+        [
+            {
+                "trip_id": "trip_9",
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": None,
+                "end_date": None,
+            },
+            {
+                "trip_id": "trip_9",
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": None,
+                "end_date": None,
+            },
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["ambiguous_ids"] == ["trip_9"], plan
+    assert plan["duplicate_entries"] == []
+    print("✓ 无日期同 id 不同行程仍报歧义")
+
+
+def test_plan_integer_trip_id_matches_storage_convention():
+    """整数 0 与字符串 "0" 按同一 id 统计歧义（与存储层 str() 口径一致）。"""
+    store = _Store(
+        [
+            _trip(0, destination="上海"),
+            _trip("0", destination="杭州"),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["ambiguous_ids"] == ["0"], plan
+    assert plan["duplicate_entries"] == []
+    print("✓ 整数 trip_id 与字符串同口径")
+
+
 def test_plan_ignores_rows_without_start_date():
     store = _Store(
         [
@@ -265,6 +350,11 @@ if __name__ == "__main__":
     test_plan_matches_linebreak_variants()
     test_plan_skips_group_when_kept_row_vanished()
     test_plan_reports_ambiguous_ids_separately()
+    test_plan_flags_id_shared_with_dateless_row()
+    test_plan_same_id_identical_rows_are_duplicates_not_ambiguous()
+    test_plan_identical_dateless_rows_are_cleanable_duplicates()
+    test_plan_dateless_same_id_different_content_is_ambiguous()
+    test_plan_integer_trip_id_matches_storage_convention()
     test_plan_ignores_rows_without_start_date()
     test_apply_uses_duplicate_deleter_for_same_kept_id()
     test_apply_prefers_batch_storage_api()

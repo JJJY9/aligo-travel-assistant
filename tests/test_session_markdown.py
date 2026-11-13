@@ -256,6 +256,33 @@ def test_multiline_code_span_content_preserved():
     print("✓ 跨行代码段保真且未闭合时不放行")
 
 
+def test_far_apart_backticks_do_not_leak_raw_html():
+    """远超 200 行的跨行代码段仍完整配对：后续行 HTML 必须转义。
+
+    回归：前瞻上界截断会改变反引号配对位置——被截断的开串与后续行的
+    闭合串在 CommonMark 里配成一对，行内剩余内容反而失去转义（XSS）。
+    """
+    from utils.session_markdown import sanitize_body
+
+    payload = "x ` <img src=x onerror=alert(1)>\n`"
+    text = sanitize_body("`\n" + "f\n" * 200 + payload)
+    assert "<img" not in text, text
+    assert "&lt;img" in text, text
+    print("✓ 远距离反引号仍完整配对")
+
+
+def test_large_message_escapes_inline_without_pairing():
+    """> 50KB 的消息跳过行内代码配对、全部转义（线性降级），不透传 HTML。"""
+    from utils.session_markdown import _MAX_INLINE_PAIRING_CHARS, sanitize_body
+
+    filler = "`<img src=x onerror=alert(1)>` " * 4000
+    assert len(filler) > _MAX_INLINE_PAIRING_CHARS
+    text = sanitize_body(filler)
+    assert "<img" not in text, text[:200]
+    assert "&lt;img" in text
+    print("✓ 超大消息全部转义（跳过行内配对）")
+
+
 def test_block_start_line_cannot_close_code_span():
     """块起始行打断段落：其上的反引号不能关闭上一行的代码段。"""
     from utils.session_markdown import sanitize_body
@@ -347,6 +374,8 @@ if __name__ == "__main__":
     test_unmatched_backtick_does_not_disable_escaping()
     test_fence_state_machine_matches_commonmark()
     test_multiline_code_span_content_preserved()
+    test_far_apart_backticks_do_not_leak_raw_html()
+    test_large_message_escapes_inline_without_pairing()
     test_block_start_line_cannot_close_code_span()
     test_heading_line_cannot_open_cross_line_code_span()
     test_list_scoped_fence_restores_escaping_after_container()

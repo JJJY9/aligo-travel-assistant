@@ -435,6 +435,16 @@ def test_trips_dedupe_panel_flow():
     assert empty["refreshed"] == 0
     assert empty["button"] == {"text": "清理重复", "disabled": False}
 
+    ambiguous = results["ambiguous"]
+    assert ambiguous["urls"] == ["/api/trips/dedupe"], ambiguous
+    assert ambiguous["confirmCalls"] == 0, "有歧义时不弹确认"
+    assert ambiguous["toasts"] and "无法自动清理" in ambiguous["toasts"][0], (
+        ambiguous,
+        "只有歧义 id 时不能提示「没有重复行程可清理」",
+    )
+    assert ambiguous["refreshed"] == 0
+    assert ambiguous["button"] == {"text": "清理重复", "disabled": False}
+
     cancel = results["cancel"]
     assert cancel["urls"] == ["/api/trips/dedupe"], "取消确认后不能再发删除请求"
     assert cancel["bodies"][0]["dry_run"] is True

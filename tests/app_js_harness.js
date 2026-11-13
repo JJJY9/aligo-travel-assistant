@@ -907,6 +907,11 @@ async function scenarioTripsDedupe(source) {
   };
   return {
     empty: await runScenario({ would_remove: 0 }, "true", { removed: 0 }),
+    ambiguous: await runScenario(
+      { would_remove: 0, ambiguous_ids: ["trip_2"] },
+      "true",
+      { removed: 0 },
+    ),
     cancel: await runScenario({ would_remove: 2 }, "false", { removed: 2 }),
     applied: await runScenario({ would_remove: 2 }, "true", { removed: 2 }),
   };

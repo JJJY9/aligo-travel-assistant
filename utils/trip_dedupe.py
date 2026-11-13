@@ -15,7 +15,11 @@ from typing import Any
 
 import logging
 
-from utils.trip_import import normalize_identity_date, normalize_identity_text
+from utils.trip_import import (
+    normalize_identity_date,
+    normalize_identity_text,
+    trip_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +60,43 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
         Exception: 读取行程失败（调用方负责映射为 503 / 退出码）。
     """
     trips = store.get_trip_history(limit=None)
+    trip_ids = [str(trip.get("trip_id")) for trip in trips]
     groups: dict[tuple[str, str, str, str], list[str]] = {}
-    for trip in trips:
+    for trip, trip_id in zip(trips, trip_ids):
         key = _identity(trip)
         if key is None:
             continue
-        groups.setdefault(key, []).append(str(trip.get("trip_id") or ""))
-    by_id = {str(trip.get("trip_id") or ""): trip for trip in trips}
+        groups.setdefault(key, []).append(trip_id)
+    by_id: dict[str, dict[str, Any]] = {}
+    for trip, trip_id in zip(trips, trip_ids):
+        by_id[trip_id] = trip
 
     # 同一 trip_id 出现在多条不同行程里时，delete_trip 可能删错行：
-    # 这类 id 不自动处理，提示人工清理
-    id_groups: dict[str, set[tuple[str, str, str, str]]] = {}
-    for key, ids in groups.items():
-        for trip_id in ids:
-            id_groups.setdefault(trip_id, set()).add(key)
+    # 这类 id 不自动处理，提示人工清理。缺出发日期的行无法按身份归组：
+    # 同 id 且内容完全相同（同路线 / 返程）的裸重复行按同一条处理（可
+    # 自动清理，见下方 dateless_groups），内容不同才算歧义——与存储层
+    # 按行数判断歧义的口径一致
+    id_groups: dict[str, set[Any]] = {}
+    for trip, trip_id in zip(trips, trip_ids):
+        trip_key = _identity(trip)
+        marker: Any = (
+            trip_key
+            if trip_key is not None
+            else ("dateless", *trip_identity(trip))
+        )
+        id_groups.setdefault(trip_id, set()).add(marker)
     ambiguous = {trip_id for trip_id, keys in id_groups.items() if len(keys) > 1}
+
+    # 缺出发日期的同 id 裸重复：旧版本编号复用（删除后按长度重算 id）会
+    # 产生内容完全相同的两行，delete_duplicate_trip 按行数可安全删除后插入
+    # 的一条，不能让它们卡在「歧义」死角（所有按 id 的操作都会 409）
+    dateless_groups: dict[str, dict[tuple[str, str, str, str], list[int]]] = {}
+    for index, (trip, trip_id) in enumerate(zip(trips, trip_ids)):
+        if _identity(trip) is not None:
+            continue
+        dateless_groups.setdefault(trip_id, {}).setdefault(
+            trip_identity(trip), []
+        ).append(index)
 
     # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，避免把
     # 仅剩的副本也删掉。JSON 后端的 get_trip_history 返回进程启动时的
@@ -79,36 +105,55 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
     if callable(reload):
         reload()
     fresh_ids = {
-        str(trip.get("trip_id") or "")
+        str(trip.get("trip_id"))
         for trip in store.get_trip_history(limit=None)
     }
 
     duplicate_entries = [
-        (ids[0], trip_id)
-        for ids in groups.values()
-        for trip_id in ids[1:]
-        if ids[0] in fresh_ids and trip_id not in ambiguous
+        (group[0], trip_id)
+        for group in groups.values()
+        for trip_id in group[1:]
+        if group[0] in fresh_ids and trip_id not in ambiguous
     ]
+    for trip_id, by_content in dateless_groups.items():
+        if trip_id in ambiguous or trip_id not in fresh_ids:
+            continue
+        for indices in by_content.values():
+            if len(indices) > 1:
+                duplicate_entries.extend([(trip_id, trip_id)] * (len(indices) - 1))
+
     # 执行时按「计划时的身份」复核：计划生成后条目被编辑成别的行程
     # （或保留项被删除）时不能再按 id 盲删
     verify: list[dict[str, str]] = []
     for kept_id, trip_id in duplicate_entries:
-        ident = _identity(by_id.get(trip_id) or {})
+        trip_row = by_id.get(trip_id) or {}
+        ident = _identity(trip_row)
+        if ident is not None:
+            origin, destination, start_date, end_date = ident
+        else:
+            destination, origin, start_date, end_date = trip_identity(trip_row)
         verify.append(
             {
                 "kept_id": kept_id,
                 "trip_id": trip_id,
-                "origin": ident[0] if ident else "",
-                "destination": ident[1] if ident else "",
-                "start_date": ident[2] if ident else "",
-                "end_date": ident[3] if ident else "",
+                "origin": origin,
+                "destination": destination,
+                "start_date": start_date,
+                "end_date": end_date,
             }
         )
+    dateless_duplicate_groups = sum(
+        1
+        for by_content in dateless_groups.values()
+        for indices in by_content.values()
+        if len(indices) > 1
+    )
     return {
         "total_trips": len(trips),
         "groups_with_duplicates": sum(
-            1 for ids in groups.values() if len(ids) > 1
-        ),
+            1 for group in groups.values() if len(group) > 1
+        )
+        + dateless_duplicate_groups,
         "duplicates": [
             _entry(trip_id, by_id) for _, trip_id in duplicate_entries
         ],
@@ -184,8 +229,16 @@ def apply_trip_dedupe(
                 reload = getattr(store, "reload", None)
                 if callable(reload):
                     reload()
+                expected_identity = trip_identity(
+                    {
+                        "origin": expected[0],
+                        "destination": expected[1],
+                        "start_date": expected[2],
+                        "end_date": expected[3],
+                    }
+                )
                 fresh = {
-                    str(trip.get("trip_id") or ""): trip
+                    str(trip.get("trip_id")): trip
                     for trip in store.get_trip_history(limit=None)
                 }
                 kept_row = fresh.get(kept_id)
@@ -193,8 +246,8 @@ def apply_trip_dedupe(
                 if (
                     kept_row is None
                     or target_row is None
-                    or _identity(kept_row) != expected
-                    or _identity(target_row) != expected
+                    or trip_identity(kept_row) != expected_identity
+                    or trip_identity(target_row) != expected_identity
                 ):
                     logger.warning(
                         "去重跳过 %s：计划生成后行程已变更或保留项已删除",
