@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
 
+from utils.tombstones import DEFAULT_TOMBSTONE_TTL_SEC
+
 logger = logging.getLogger(__name__)
 
 # Redis 运行中故障的冷却：期间短期记忆回退进程内缓存（多实例共享暂时退化为
@@ -302,11 +304,14 @@ class _PendingJournal:
     期间无法得知这些变更（Redis 不可用），恢复后由本进程的下一次访问补上。
     """
 
-    __slots__ = ("lock", "ops", "stuck")
+    __slots__ = ("lock", "ops", "stuck", "started_at")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.ops: list[tuple[str, Any]] = []
+        # 首条操作的入队时刻：超过删除保护窗口（墓碑 TTL）的排队操作
+        # 不能再安全重放（墓碑已过期，可能复活已删除会话）
+        self.started_at: float | None = None
         # 队首操作的连续失败计数：确定性错误（键类型损坏 / 载荷无法编码
         # 等）每次重试都会失败，连续三次后丢弃该操作，避免整本日志卡死
         self.stuck: tuple[str, int] = ("", 0)
@@ -318,6 +323,10 @@ _PENDING_JOURNALS_LOCK = threading.Lock()
 # 出现新会话时才会积累；超过上限时优先淘汰已空的最旧日志，其次丢弃最旧
 # 会话的待重放操作（记录警告），避免进程内存无界增长
 _PENDING_JOURNALS_MAX = 2048
+# 排队操作的最大存活时间：与共享墓碑 TTL 对齐。墓碑过期后无法再判断排队
+# 的新增是否属于已删除会话（纪元未参与重放检查），重放可能把已删除对话
+# 写回 Redis——长时间故障后宁可有界丢弃
+_PENDING_MAX_AGE_SEC = DEFAULT_TOMBSTONE_TTL_SEC
 
 
 def _evict_journal_locked() -> tuple[str, int, str] | None:
@@ -411,6 +420,7 @@ def discard_pending_ops(key: str) -> int:
                 continue
             dropped = len(journal.ops)
             journal.ops.clear()
+            journal.started_at = None
             # 持锁时判空并移除：释放锁后再移除会把并发追加的操作一起丢掉
             _drop_idle_journal(key, journal)
             return dropped
@@ -427,6 +437,7 @@ def queue_clear(key: str) -> None:
     """
     with _pending_journal(key) as journal:
         journal.ops.clear()
+        journal.started_at = time.monotonic()
         journal.ops.append(("clear", datetime.now().isoformat()))
 
 
@@ -610,6 +621,9 @@ class RedisShortTermMemory:
         if kind == "clear":
             # 清空会覆盖之前所有变更，旧操作不再需要重放
             journal.ops.clear()
+            journal.started_at = None
+        if journal.started_at is None:
+            journal.started_at = time.monotonic()
         journal.ops.append((kind, payload))
         cap = max(64, self.max_turns * 8)
         add_indexes = [
@@ -640,6 +654,22 @@ class RedisShortTermMemory:
     def _replay_ops(self, journal: _PendingJournal) -> None:
         ops = journal.ops
         window = self.max_turns * 2
+        if ops and journal.started_at is not None:
+            age = time.monotonic() - journal.started_at
+            if age > _PENDING_MAX_AGE_SEC:
+                # 超过删除保护窗口：墓碑可能已过期而快照 / 删除不可复原，
+                # 重放排队新增可能复活已删除会话的对话，丢弃并记录条数
+                logger.warning(
+                    "短期记忆故障操作排队超过 %s 秒（%.0fs），丢弃 %s 条待重放操作：%s",
+                    int(_PENDING_MAX_AGE_SEC),
+                    age,
+                    len(ops),
+                    self.key,
+                )
+                ops.clear()
+                journal.started_at = None
+                journal.stuck = ("", 0)
+                return
         if ops and self.user_id and self.session_id:
             # 跨进程删除墓碑：其它实例 / CLI 已删除该会话时，本进程日志里
             # 排队的新增会把已删除对话重新写回 Redis 并注入模型上下文
@@ -652,6 +682,7 @@ class RedisShortTermMemory:
             if is_session_deleted(self.user_id, self.session_id, force=True):
                 logger.warning("会话已删除，丢弃短期记忆重放队列：%s", self.key)
                 ops.clear()
+                journal.started_at = None
                 journal.stuck = ("", 0)
                 self._fallback.messages = []
                 return
