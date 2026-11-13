@@ -194,8 +194,45 @@ def test_read_rate_limit_env():
     print("✓ READ_RATE_LIMIT 可配置（默认 600）")
 
 
+def test_storage_urls_strip_whitespace_and_bom():
+    """REDIS_URL / DATABASE_URL 去空白与 BOM；非法额度告警并钳到 1。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(repr(config.STORAGE_CONFIG['redis_url']));"
+        "print(repr(config.STORAGE_CONFIG['postgres_dsn']));"
+        "print(config.RATE_LIMIT_CONFIG['kb_requests']);"
+        "print(config.RATE_LIMIT_CONFIG['chat_requests'])"
+    )
+    env = dict(os.environ)
+    env["REDIS_URL"] = "  redis://localhost:6379/0\n"
+    env["DATABASE_URL"] = "\ufeffpostgresql://u:p@h/db\n"
+    env["KB_RATE_LIMIT"] = "0"
+    env["CHAT_RATE_LIMIT"] = "2,000"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().split("\n")
+    assert lines[0] == repr("redis://localhost:6379/0"), lines
+    assert lines[1] == repr("postgresql://u:p@h/db"), lines
+    assert lines[2] == "1", "0 额度应被钳到 1"
+    assert lines[3] == "30", "非法整数回退默认值"
+    assert "2,000" in result.stderr and "不是整数" in result.stderr, result.stderr
+    print("✓ 存储 URL 去空白 / BOM，非法额度告警并钳制")
+
+
 if __name__ == "__main__":
     test_api_key_is_stripped_and_blank_falls_back()
+    test_storage_urls_strip_whitespace_and_bom()
     test_broken_config_local_import_is_not_swallowed()
     test_empty_env_model_and_base_url_fall_back()
     test_create_chat_model_max_retries_param()
