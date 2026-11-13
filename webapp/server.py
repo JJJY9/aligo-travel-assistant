@@ -2213,6 +2213,12 @@ _COLLECTION_MISSING_MARKERS = (
     "can't find collection",
     "collection doesn't exist",
     "collection not exist",
+    # Milvus Lite 3.x：collection '<name>' does not exist（集合名插在中间，
+    # 上面的完整短语匹配不到）
+    "does not exist",
+    # 集合存在但加载失败（索引 sidecar 由旧版写入 / 文件损坏，3.x 的
+    # numpy load 会抛 "is in state 'released'" / pickled data 等）
+    "is in state 'released'",
     # RAG 智能体在半初始化时抛的是中文文案，此前只匹配英文 Milvus 文本，
     # /api/knowledge/search 会退化成通用「检索失败，请稍后再试」
     "知识库缺少集合",
@@ -2234,7 +2240,8 @@ def _knowledge_unavailable(action: str, exc: Exception) -> HTTPException:
         return HTTPException(
             status_code=503,
             detail=(
-                "知识库集合不存在（库文件存在但未建集合），请重新运行初始化脚本："
+                "知识库集合不存在或无法加载（库文件存在但集合缺失 / 索引不可读），"
+                "请重新运行初始化脚本："
                 "python .claude/skills/ask-question/script/init_knowledge_base.py"
             ),
         )
@@ -3499,6 +3506,7 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.get("/api/knowledge/export", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def knowledge_export(request: Request) -> Response:
         """导出全部知识片段为 JSON 文件（备份 / 迁移）。"""
         rate_headers = _enforce_kb_rate_limit(state, request)
@@ -3565,7 +3573,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
                 logger.warning("导入知识片段失败: %s", exc)
-                raise _storage_failure("导入失败", exc) from exc
+                raise _knowledge_unavailable("导入失败", exc) from exc
         finally:
             state.kb_import_queue_slots.release()
 
@@ -3600,7 +3608,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - 预览失败统一提示
                 logger.warning("预览导入知识片段失败: %s", exc)
-                raise _storage_failure("预览失败", exc) from exc
+                raise _knowledge_unavailable("预览失败", exc) from exc
         finally:
             state.kb_import_queue_slots.release()
 

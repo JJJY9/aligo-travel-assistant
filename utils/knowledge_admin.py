@@ -262,6 +262,52 @@ def _load_collection(client: Any, collection: str) -> None:
         logger.debug("load_collection skipped: %s", exc)
 
 
+# 批量取行的分块大小：`id in [...]` 表达式过长会超过解析上限，按块查询
+_ID_QUERY_CHUNK = 500
+
+
+def _rows_by_ids(
+    client: Any, ids: list[int], output_fields: list[str] | None = None
+) -> dict[int, dict[str, Any]]:
+    """按 id 批量取行（分块 ``id in [...]``），返回 {id: row}。
+
+    整组编辑回填 / 原样保存预检此前对组内每个分片各发一次 query（N+1）：
+    上千片的组在持锁期间可冻结所有知识库写与聊天检索数十秒。
+    """
+    fields = list(output_fields or ["content", "metadata"])
+    if "id" not in fields:
+        fields.append("id")
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    chunk: list[int] = []
+    for raw_id in ids:
+        chunk.append(int(raw_id))
+        if len(chunk) >= _ID_QUERY_CHUNK:
+            _collect_rows_by_ids(client, chunk, fields, rows_by_id)
+            chunk = []
+    if chunk:
+        _collect_rows_by_ids(client, chunk, fields, rows_by_id)
+    return rows_by_id
+
+
+def _collect_rows_by_ids(
+    client: Any,
+    ids: list[int],
+    fields: list[str],
+    out: dict[int, dict[str, Any]],
+) -> None:
+    rows = client.query(
+        collection_name=COLLECTION_NAME,
+        filter=f"id in {ids}",
+        output_fields=fields,
+        limit=len(ids),
+    )
+    for row in rows:
+        try:
+            out[int(row.get("id"))] = row
+        except (TypeError, ValueError):
+            continue
+
+
 def _parse_metadata(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -583,22 +629,19 @@ def _locked_user_snapshot(
         return str(rows[0].get("content", "")), _user_meta(rows[0].get("metadata"))
     pieces: list[tuple[int, str]] = []
     user_meta: dict[str, str] | None = None
-    for member in _group_member_ids(client, group):
-        rows = client.query(
-            collection_name=COLLECTION_NAME,
-            filter=f"id == {member}",
-            output_fields=["content", "metadata"],
-            limit=1,
-        )
-        if not rows:
+    members = _group_member_ids(client, group)
+    rows_by_id = _rows_by_ids(client, members)
+    for member in members:
+        row = rows_by_id.get(int(member))
+        if row is None:
             continue
-        meta = _parse_metadata(rows[0].get("metadata"))
+        meta = _parse_metadata(row.get("metadata"))
         try:
             part_no = int(meta.get("part") or 0)
         except (TypeError, ValueError):
             part_no = 0
-        pieces.append((part_no, str(rows[0].get("content", ""))))
-        row_meta = _user_meta(rows[0].get("metadata"))
+        pieces.append((part_no, str(row.get("content", ""))))
+        row_meta = _user_meta(row.get("metadata"))
         if member == int(doc_id):
             # 原样保存判定必须对「被点击的这一片」比较元数据：整组编辑的
             # 表单回填的是当前片。用扫描到的第一片会让从其它分片原样保存
@@ -704,6 +747,35 @@ def update_document(
                 for member in _group_member_ids(client, group)
                 if member != int(doc_id)
             ]
+
+        def _delete_ids(
+            ids: list[int], log_label: str
+        ) -> tuple[list[int], list[int]]:
+            """逐条删除；共享客户端被并发 RAG 重连 reset 关闭时重取再试。"""
+            nonlocal client
+            removed: list[int] = []
+            failed: list[int] = []
+            for item_id in ids:
+                for attempt in (1, 2):
+                    try:
+                        client.delete(
+                            collection_name=COLLECTION_NAME, ids=[item_id]
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 汇总后报告
+                        if attempt == 1:
+                            fresh = _client()
+                            if fresh is not client:
+                                client = fresh
+                                continue
+                        logger.warning(
+                            "%s %s 失败：%s", log_label, item_id, exc
+                        )
+                        failed.append(item_id)
+                        break
+                    else:
+                        removed.append(item_id)
+                        break
+            return removed, failed
         # 先写其余新分片：失败时目标分片与旧分片原样保留，可直接重试
         extra_ids: list[int] = []
         if len(documents) > 1:
@@ -724,13 +796,9 @@ def update_document(
         except Exception as original:
             # 补偿：删除本次已插入的其余分片，保持原记录可重试。逐条删除，
             # 失败项随异常一起报出（只写日志会让孤儿分片参与检索且无主可查）
-            failed_compensation: list[int] = []
-            for item_id in extra_ids:
-                try:
-                    client.delete(collection_name=COLLECTION_NAME, ids=[item_id])
-                except Exception as exc:  # noqa: BLE001 - 汇总后随原始错误抛出
-                    logger.warning("更新失败后补偿删除分片 %s 失败：%s", item_id, exc)
-                    failed_compensation.append(item_id)
+            _removed_extra, failed_compensation = _delete_ids(
+                extra_ids, "更新失败后补偿删除分片"
+            )
             if failed_compensation:
                 raise RuntimeError(
                     "更新失败且补偿删除未完成，残留分片 "
@@ -745,14 +813,7 @@ def update_document(
         removed_ids: list[int] = []
         leftover_ids: list[int] = []
         if group:
-            for member in old_ids:
-                try:
-                    client.delete(collection_name=COLLECTION_NAME, ids=[member])
-                except Exception as exc:  # noqa: BLE001 - 保留其余分片继续清理
-                    logger.warning("删除旧分片 %s 失败：%s", member, exc)
-                    leftover_ids.append(member)
-                else:
-                    removed_ids.append(member)
+            removed_ids, leftover_ids = _delete_ids(old_ids, "删除旧分片")
     payload: dict[str, Any] = {"status": "success", "id": int(doc_id)}
     if len(documents) > 1:
         payload["parts"] = len(documents)
@@ -1062,21 +1123,18 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
                 "content": content,
             }
         pieces: list[tuple[int, str]] = []
-        for member in _group_member_ids(client, group):
-            rows = client.query(
-                collection_name=COLLECTION_NAME,
-                filter=f"id == {member}",
-                output_fields=["content", "metadata"],
-                limit=1,
-            )
-            if not rows:
+        members = _group_member_ids(client, group)
+        rows_by_id = _rows_by_ids(client, members)
+        for member in members:
+            row = rows_by_id.get(int(member))
+            if row is None:
                 continue
-            meta = _parse_metadata(rows[0].get("metadata"))
+            meta = _parse_metadata(row.get("metadata"))
             try:
                 part_no = int(meta.get("part") or 0)
             except (TypeError, ValueError):
                 part_no = 0
-            pieces.append((part_no, str(rows[0].get("content", ""))))
+            pieces.append((part_no, str(row.get("content", ""))))
         pieces.sort(key=lambda pair: pair[0])
         # 空串拼接：分片是原文的连续片段（入库时 strip 后直接拼接），用换行
         # 分隔会把分隔符带进编辑框——文档越大越超提交上限，原样保存都失败

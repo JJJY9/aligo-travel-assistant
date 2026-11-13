@@ -31,6 +31,10 @@ class _FakeMilvusClient:
         pass
 
     def query(self, collection_name, filter="", output_fields=None, limit=10, offset=0):
+        if filter.startswith("id in"):
+            ids_part = filter.split("[", 1)[1].split("]", 1)[0]
+            wanted = {int(item) for item in ids_part.split(",") if item.strip()}
+            return [row for row in self.rows if int(row["id"]) in wanted][:limit]
         if filter.startswith("id =="):
             doc_id = int(filter.split("==")[1])
             return [row for row in self.rows if int(row["id"]) == doc_id]
@@ -3205,6 +3209,39 @@ def test_import_fast_path_runs_under_read_lock(monkeypatch):
     assert result["imported"] == 0 and result["skipped_duplicate"] == 1
     print("✓ 导入快速判重在读锁内执行")
 
+def test_get_document_group_batches_id_queries(monkeypatch):
+    """整组回填按 id 批量取行（一次 id in 查询），不再逐片 N+1。"""
+    rows = [
+        {
+            "id": index,
+            "content": f"片{index}",
+            "metadata": json.dumps(
+                {"group": "gb", "part": str(index), "parts": "3"}
+            ),
+        }
+        for index in (1, 2, 3)
+    ]
+    fake = _FakeMilvusClient(rows)
+    calls: list[str] = []
+    original_query = fake.query
+
+    def spy(collection_name, filter="", output_fields=None, limit=10, offset=0):
+        calls.append(filter)
+        return original_query(
+            collection_name,
+            filter=filter,
+            output_fields=output_fields,
+            limit=limit,
+            offset=offset,
+        )
+
+    fake.query = spy  # type: ignore[method-assign]
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    group = knowledge_admin.get_document_group(1)
+    assert group["parts"] == 3 and group["content"] == "片1片2片3"
+    in_calls = [item for item in calls if item.startswith("id in")]
+    assert len(in_calls) == 1, calls
+    print("✓ 整组回填使用一次 id in 批量查询")
 if __name__ == "__main__":
     test_next_entity_id_monotonic_after_delete()
     test_load_collection_failure_is_non_fatal()
@@ -3245,7 +3282,7 @@ if __name__ == "__main__":
         test_import_whole_group_fails_closed_on_layout_error,
         test_import_rejects_out_of_range_part_numbers,
         test_import_fast_path_runs_under_read_lock,
-        test_existing_contents_scans_all_rows,
+        test_get_document_group_batches_id_queries,        test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,
         test_import_reordered_group_is_conflict_not_duplicate,
         test_import_same_order_group_still_duplicate,
