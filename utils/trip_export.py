@@ -252,21 +252,24 @@ def _ics_fold(line: str) -> str:
     """按 RFC 5545 把超过 75 字节的行折行（续行以单个空格开头）。
 
     折行位置不能劈开 UTF-8 字符：回退到完整字符边界。中文 SUMMARY 等
-    长文本不折行会被部分日历客户端拒收或截断。
+    长文本不折行会被部分日历客户端拒收或截断。按下标推进而不是每折一次
+    复制剩余字节：备份恢复不限制字段长度，单条超长字段的反复拷贝是
+    O(n²)，日历导出会卡死数分钟。
     """
     data = line.encode("utf-8")
     if len(data) <= 75:
         return line
     chunks: list[bytes] = []
+    start = 0
     limit = 75
-    while len(data) > limit:
-        cut = limit
-        while cut > 0 and (data[cut] & 0xC0) == 0x80:
+    while len(data) - start > limit:
+        cut = start + limit
+        while cut > start and (data[cut] & 0xC0) == 0x80:
             cut -= 1
-        chunks.append(data[:cut])
-        data = data[cut:]
+        chunks.append(data[start:cut])
+        start = cut
         limit = 74  # 续行开头的空格占 1 字节
-    chunks.append(data)
+    chunks.append(data[start:])
     return "\r\n ".join(chunk.decode("utf-8") for chunk in chunks)
 
 

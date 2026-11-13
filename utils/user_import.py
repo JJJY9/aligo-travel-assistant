@@ -398,6 +398,25 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     return None
 
 
+def sections_limit_problem(sections: dict[str, Any]) -> str | None:
+    """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
+
+    CLI 导入此前只按原始文件字节做 50MB 预检：紧凑 JSON 备份可以通过并
+    恢复成功，随后 user-export 按 indent=2 估算体积超限、永久拒绝导出——
+    用户必须先删数据才能再备份。这里把可恢复段按导出形状重新组装后复用
+    :func:`backup_limit_problem` 的同一口径（与 Web /api/import 一致）。
+    """
+    if not isinstance(sections, dict):
+        return None
+    payload = {
+        "chat_history": sections.get("messages") or [],
+        "trip_history": sections.get("trips") or [],
+        "preferences": sections.get("preferences") or {},
+        "knowledge": sections.get("knowledge") or [],
+    }
+    return backup_limit_problem(payload)
+
+
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
     """解析并校验 user-export JSON 文本，返回 ``(可恢复数据, 错误列表)``。"""
     try:
@@ -495,7 +514,10 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if not ok:
             errors.append(f"第 {index} 条行程：会话 ID 非法，已忽略会话关联")
         origin = str(row.get("origin") or "").strip()
-        purpose = str(row.get("purpose") or "").strip() or "出差"
+        # 备份缺失 / 空的目的不能补默认值：存储层对既有行程按「非 None」
+        # 覆盖 purpose，补默认「出差」会把用户编辑过的目的静默改掉。
+        # 键缺失即保留原值（新行程由展示层按缺省处理）
+        purpose = str(row.get("purpose") or "").strip()
         problem = (
             _text_problem(origin)
             or _text_problem(destination)
@@ -509,8 +531,9 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             "destination": destination,
             "start_date": start_date,
             "end_date": end_date,
-            "purpose": purpose,
         }
+        if purpose:
+            trip_record["purpose"] = purpose
         # 只在备份确实带有关联时写入 session_id：drop_sessions 显式置 None
         # 表示「清除关联」，与「备份本来没有关联」必须区分（否则恢复会
         # 清掉目标库里既有行程的会话链接）
@@ -593,9 +616,13 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
 
     def _session_list(name: str) -> list[str]:
         result: list[str] = []
+        # 集合去重：恢复的置顶 / 归档列表可能很长（&~上万条），
+        # list membership 会让解析变成 O(n²)、导入挂起
+        seen: set[str] = set()
         for item in _as_list(data.get(name)):
             session_id = str(item or "").strip()
-            if session_id and session_id in session_ids and session_id not in result:
+            if session_id and session_id in session_ids and session_id not in seen:
+                seen.add(session_id)
                 result.append(session_id)
         return result
 
@@ -726,9 +753,18 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             broken_groups.add(group)
             continue
         seen = group_parts.get(group, [])
-        if len(seen) != len(set(seen)) or set(seen) != set(
-            range(1, declared_parts + 1)
-        ):
+        seen_set = set(seen)
+        # 完整性判定不走 set(range(1, declared_parts+1))：大量小组合法声明
+        # parts=上限值时，range 集合构造会累积成聚合型 DoS。distinct 值数量
+        # 等于声明数、且最小值 1 / 最大值等于声明数，由鸽巢原理即恰好覆盖
+        # 1..declared_parts
+        complete = (
+            len(seen) == declared_parts
+            and len(seen_set) == declared_parts
+            and min(seen_set) == 1
+            and max(seen_set) == declared_parts
+        )
+        if len(seen) != len(seen_set) or not complete:
             broken_groups.add(group)
     if broken_groups:
         knowledge = [
@@ -1000,6 +1036,27 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
                 f"备份中 {len(trips) - new_trips} 条与现有行程重复），"
                 "请先清理历史行程后重试"
             )
+
+    # 偏好按「类型并集」计：覆盖同名类型不增加总量，只有新类型才可能
+    # 推过上限。此前 CLI 恢复完全没查偏好，恢复后 400 个类型会让
+    # user-export / /api/export 永久拒绝导出全量备份（Web 侧已有同一检查）
+    incoming_preferences = sections.get("preferences")
+    if isinstance(incoming_preferences, dict) and incoming_preferences:
+        getter = getattr(store, "get_preference", None)
+        if callable(getter):
+            try:
+                existing_preferences = getter() or {}
+            except Exception:  # noqa: BLE001 - 读取失败不阻断恢复
+                existing_preferences = None
+            if isinstance(existing_preferences, dict):
+                merged = set(existing_preferences) | set(incoming_preferences)
+                if len(merged) > _MAX_PREFERENCES:
+                    raise ValueError(
+                        f"恢复后偏好类型将超过上限 {_MAX_PREFERENCES}"
+                        f"（现有 {len(existing_preferences)} + 备份 "
+                        f"{len(incoming_preferences)}，合并后 {len(merged)}），"
+                        "请先删除不用的偏好类型后重试"
+                    )
 
 
 def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:

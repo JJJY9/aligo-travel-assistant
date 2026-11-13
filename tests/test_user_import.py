@@ -1127,6 +1127,124 @@ def test_parse_drops_whole_knowledge_group_with_invalid_part():
     print("✓ knowledge 组内坏分片整组跳过（不拖垮其它文档）")
 
 
+def test_import_enforces_preference_type_limit():
+    """恢复后偏好类型并集超过上限时拒绝（否则导出会永久被拒）。"""
+    store = _real_store("u-pref-limit")
+    try:
+        for index in range(200):
+            store.save_preference(f"p{index}", "v")
+        sections, _errors = parse_user_export(
+            json.dumps({"preferences": {f"q{i}": "v" for i in range(200)}})
+        )
+        with pytest.raises(ValueError) as info:
+            import_user_data(store, sections)
+        assert "偏好类型" in str(info.value), info.value
+        assert len(store.get_preference()) == 200, "拒绝时不能已写入部分新类型"
+        # 覆盖同名类型不增加总量：并集仍为 200，允许恢复
+        sections2, _errors2 = parse_user_export(
+            json.dumps({"preferences": {f"p{i}": "new" for i in range(200)}})
+        )
+        import_user_data(store, sections2)
+        assert len(store.get_preference()) == 200
+    finally:
+        store._close() if hasattr(store, "_close") else None
+    print("✓ 偏好类型并集上限在恢复入口生效")
+
+
+def test_import_keeps_existing_purpose_when_backup_lacks_it():
+    """备份行程缺目的时不补默认「出差」：不能改写用户编辑过的目的。"""
+    store = _real_store("u-purpose")
+    try:
+        store.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+                "purpose": "拜访客户",
+            }
+        )
+        sections, _errors = parse_user_export(
+            json.dumps(
+                {
+                    "trip_history": [
+                        {
+                            "origin": "北京",
+                            "destination": "上海",
+                            "start_date": "2026-12-01",
+                            "end_date": "2026-12-03",
+                        }
+                    ]
+                }
+            )
+        )
+        counts = import_user_data(store, sections)
+        assert counts["trips_updated"] == 1, counts
+        trips = store.get_trip_history(limit=None)
+        assert trips[0]["purpose"] == "拜访客户", trips
+    finally:
+        store._close() if hasattr(store, "_close") else None
+    print("✓ 恢复不覆盖既有行程目的")
+
+
+def test_sections_limit_problem_reflects_export_format(monkeypatch):
+    """恢复段按导出格式（indent=2）复核体积，紧凑备份不能绕过。"""
+    from utils import user_import as module
+
+    messages = [
+        {"role": "user", "content": "内容", "session_id": "s1"} for _ in range(50)
+    ]
+    sections, _errors = parse_user_export(
+        json.dumps({"chat_history": messages}, ensure_ascii=False)
+    )
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 10**9)
+    assert module.sections_limit_problem(sections) is None
+    compact_len = len(
+        json.dumps(
+            {"chat_history": sections["messages"]}, ensure_ascii=False
+        ).encode("utf-8")
+    )
+    # 阈值落在紧凑体积与导出体积（indent=2 明显更大）之间时，紧凑备份也必须被拒
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", compact_len + 10)
+    problem = module.sections_limit_problem(sections)
+    assert problem and "MB" in problem, (compact_len, problem)
+    print("✓ 恢复前按导出格式复核体积")
+
+
+def test_parse_many_oversized_knowledge_groups_completes_quickly():
+    """大量超大 parts 声明的分组必须快速丢弃（不能构造巨型 range 集合）。"""
+    import time
+
+    entries = [
+        {
+            "content": "x",
+            "metadata": {"group": f"g{index}", "parts": 999999, "part": 1},
+        }
+        for index in range(2000)
+    ]
+    started = time.monotonic()
+    sections, errors = parse_user_export(json.dumps({"knowledge": entries}))
+    elapsed = time.monotonic() - started
+    assert not sections.get("knowledge"), sections.get("knowledge")
+    assert any("分片数声明异常" in error for error in errors), errors[:3]
+    assert elapsed < 5, f"解析 2000 个超组耗时 {elapsed:.2f}s"
+    print("✓ 超大知识分片组快速丢弃（无 range 构造）")
+
+
+def test_parse_pinned_list_dedupes_in_linear_time():
+    """接受 / 置顶列表去重走集合：大列表不能被放大成 O(n²)。"""
+    messages = [
+        {"role": "user", "content": "hi", "session_id": "s1"},
+        {"role": "user", "content": "hello", "session_id": "s2"},
+    ]
+    pinned = ["s1"] * 20000 + ["s2"] * 20000
+    sections, _errors = parse_user_export(
+        json.dumps({"chat_history": messages, "pinned_sessions": pinned})
+    )
+    assert sections["pinned"] == ["s1", "s2"], sections["pinned"][:5]
+    print("✓ 置顶 / 归档列表线性去重")
+
+
 def test_parse_rejects_deep_nested_assistant_content():
     """`[` 开头的深嵌套 JSON 会在展示 / 摘要路径抛 RecursionError，导入时拒绝。"""
     deep = "[" * 5000 + "]" * 5000
@@ -1995,6 +2113,10 @@ if __name__ == "__main__":
     test_bulk_storage_helpers()
     test_parse_knowledge_section_wrong_type()
     test_parse_drops_whole_knowledge_group_with_invalid_part()
+    test_import_enforces_preference_type_limit()
+    test_import_keeps_existing_purpose_when_backup_lacks_it()
+    test_parse_many_oversized_knowledge_groups_completes_quickly()
+    test_parse_pinned_list_dedupes_in_linear_time()
     test_parse_rejects_deep_nested_assistant_content()
     test_parse_rejects_nul_and_lone_surrogates()
     test_parse_rejects_non_finite_meta_durations()

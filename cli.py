@@ -72,6 +72,15 @@ def _terminal_safe(value: object) -> str:
     return escape(text) if escape is not None else text
 
 
+def _plain_safe(value: object) -> str:
+    r"""纯 ``print`` 输出：只剥终端控制序列，不做 rich 转义。
+
+    rich 的反斜杠式转义只在 Rich 渲染时才有意义：直接写 stdout 会把
+    ``[/x]`` 变成字面量 ``\[/x]``，错误文本被改形。
+    """
+    return strip_terminal_controls(value)
+
+
 def _single_line_safe(value: object) -> str:
     """单行终端输出：剥离终端控制序列并把换行 / 制表符折叠为空格。
 
@@ -2578,6 +2587,23 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
         )
     try:
         store = _open_cli_store(user_id)
+    except _QuarantinedMemoryError as exc:
+        # stats 的 --json 契约包含 corrupt_backup 字段（脚本按它定位隔离文件）
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "corrupt_backup": exc.backup,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(_plain_safe(str(exc)))
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
@@ -2698,6 +2724,10 @@ def run_user_export_standalone(
         return 1
     try:
         store = _open_cli_store(user_id)
+    except _QuarantinedMemoryError as exc:
+        # 与下方快照检查同一文案：脚本按「导出中止」识别中止原因
+        print(_terminal_safe(f"导出中止：{exc}（当前会导出空快照）"))
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         print(f"打开长期记忆失败：{exc}")
         return 1
@@ -2867,7 +2897,7 @@ def run_user_import_standalone(
     # 无法感知其它进程刚删除的会话。
     from utils.session_ids import RESERVED_SESSION_IDS
     from utils.tombstones import is_session_deleted
-    from utils.user_import import drop_sessions
+    from utils.user_import import drop_sessions, sections_limit_problem
 
     candidate_sessions = {
         message.get("session_id")
@@ -2892,6 +2922,16 @@ def run_user_import_standalone(
             else:
                 errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
         drop_sessions(sections, skipped_sessions)
+
+    # 与 Web /api/import 同口径复核「恢复后仍可导出」：紧凑备份按原始文件
+    # 字节可能通过 50MB 预检，但按导出格式（indent=2）已超限——恢复成功后
+    # user-export 会永久拒绝导出，账号再也产生不了可恢复备份
+    limit_problem = sections_limit_problem(sections)
+    if limit_problem:
+        return _fail(
+            f"恢复中止：{limit_problem}"
+            "（恢复后将无法再导出备份，请先清理或拆分备份文件）"
+        )
 
     try:
         store = _open_cli_store(user_id)
@@ -3607,8 +3647,28 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
     return str(matches[-1]) if matches else None
 
 
+class _QuarantinedMemoryError(RuntimeError):
+    """记忆文件损坏已被隔离：所有读写命令都必须先拒绝（含写命令）。
+
+    写命令此前在隔离后的空快照上「成功」执行并重建主文件，之后导出 /
+    损坏检测再也看不到隔离备份，原数据只剩无人提示的 ``.corrupt-*``。
+    """
+
+    def __init__(self, backup: str) -> None:
+        self.backup = backup
+        super().__init__(
+            f"记忆文件损坏，已隔离备份到 {backup}"
+            "（当前会按空快照处理，请先用备份文件恢复）"
+        )
+
+
 def _open_cli_store(user_id: str):
-    """打开长期记忆；PostgreSQL 配置错误回退 JSON 时拒绝执行维护命令。"""
+    """打开长期记忆；PostgreSQL 配置错误回退 JSON 时拒绝执行维护命令。
+
+    记忆文件损坏隔离期间同样拒绝（与 Web 的 _open_long_term 同口径）：
+    读写命令都不能在隔离后的空快照上继续操作——写命令会重建主文件、
+    让隔离备份从此不可见。
+    """
     from config import STORAGE_CONFIG
     from context.long_term_memory import LongTermMemory
     from context.storage import create_long_term_memory
@@ -3621,6 +3681,12 @@ def _open_cli_store(user_id: str):
         raise RuntimeError(
             "PostgreSQL 已配置但连接失败（已回退本地 JSON），请检查数据库后重试"
         )
+    quarantined = _recovered_corrupt_backup(store)
+    if quarantined:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        raise _QuarantinedMemoryError(quarantined)
     return store
 
 
