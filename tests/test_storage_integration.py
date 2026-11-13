@@ -161,6 +161,15 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
                 {"role": "assistant", "content": "A1", "session_id": "s-lt"},
             ]
         )
+        memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+                "session_id": "s-lt",
+            }
+        )
         assert memory.set_session_archived("s-lt", True)
         assert memory.set_session_title("s-lt", "旧标题")
         assert memory.set_session_pinned("s-lt", True)
@@ -173,9 +182,40 @@ def test_pg_delete_last_turn_expect_and_archived_cleanup():
         # 删空会话必须同步清理标题 / 置顶，否则同 ID 重启的新会话沿用旧元数据
         assert "s-lt" not in memory.get_session_titles()
         assert "s-lt" not in memory.get_pinned_sessions()
-        print("✓ PG delete_last_turn expect 校验与标题 / 置顶 / 归档清理")
+        # 会话删空后引用它的行程链接也要清空（否则面板留下打不开的链接）
+        trips = memory.get_trip_history(limit=None)
+        assert trips and not trips[0].get("session_id"), trips
+        print("✓ PG delete_last_turn expect 校验与标题 / 置顶 / 归档 / 行程链接清理")
     finally:
         memory.close()
+
+
+def test_json_delete_last_turn_clears_trip_links_when_emptied():
+    """JSON：last-turn 把会话删空时同样清空行程的会话链接。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    store = LongTermMemory("json-lt-links", tempfile.mkdtemp())
+    store.add_chat_messages(
+        [
+            {"role": "user", "content": "Q1", "session_id": "s-lt2"},
+            {"role": "assistant", "content": "A1", "session_id": "s-lt2"},
+        ]
+    )
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "session_id": "s-lt2",
+        }
+    )
+    assert store.delete_last_turn("s-lt2", expect="Q1") == 2
+    trips = store.get_trip_history(limit=None)
+    assert trips and not trips[0].get("session_id"), trips
+    print("✓ JSON delete_last_turn 删空会话时清空行程链接")
 
 
 def test_pg_delete_chat_session_clears_trip_links():

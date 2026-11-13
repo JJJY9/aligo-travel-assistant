@@ -136,6 +136,9 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 否则写接口可以无限追加，把用户记忆撑到永远无法导出的状态
 MAX_PREFERENCE_ENTRIES = 200
 MAX_TRIP_ENTRIES = 5000
+# /api/knowledge/duplicates 的 limit=0「全部」上限：全量物化 + 序列化整个
+# 知识库会让单次请求把几百 MB 拉进内存；脚本需要全量时走 CLI kb-duplicates
+MAX_DUPLICATE_GROUPS_FULL = 2000
 # 「删除最后一轮」等待用户锁的上限：长回合（单智能体上限 300 秒）期间
 # 无限排队会让前端超时后仍被迟到的删除改掉历史
 _DELETE_LOCK_TIMEOUT_SEC = 10.0
@@ -2572,9 +2575,11 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     cleaned = _strip_markdown_for_snippet(window)
     index = _ci_find(cleaned, needle)
     if index < 0:
-        # 关键字本身含被剥离的记号时回退到原文匹配
+        # 关键字含被剥离的记号 / 全角空格 / 连续空格时，之前的原文精确
+        # 匹配已证明命中：窗口与关键字都做空白归一后再找，不能直接判空
+        # （空片段会让 _group_sessions 把本已命中的会话整条过滤掉）
         cleaned = " ".join(window.split())
-        index = _ci_find(cleaned, needle)
+        index = _ci_find(cleaned, " ".join(needle.split()))
     if index < 0:
         return ""
     start = max(0, index - radius)
@@ -2612,7 +2617,13 @@ def _group_sessions(
     updated_keys: dict[str, Any] = {}
     for message in history:
         session_id = message.get("session_id")
-        if not session_id:
+        # 旧数据里会话 ID 可能是整数（0 也是合法值）：只跳过 None / 空白串
+        if session_id is None or (
+            isinstance(session_id, str) and not session_id.strip()
+        ):
+            continue
+        if str(session_id) in RESERVED_SESSION_IDS:
+            # 保留字会话被静态导出路由遮蔽、永远打不开：列表里不出现
             continue
         entry = grouped.setdefault(
             str(session_id),
@@ -2657,8 +2668,21 @@ def _group_sessions(
         if custom:
             entry["title"] = custom
 
-    pinned_ids = set(pinned or [])
-    archived_ids = set(archived or [])
+    def _id_set(values: list[str] | None) -> set[str]:
+        # 旧数据的会话 ID 可能是整数（与 _archived_count / CLI 的字符串
+        # 口径一致）；手写 / 损坏文件里的对象条目不可哈希，跳过而不是让
+        # 列表接口永久 500
+        result: set[str] = set()
+        for item in values or []:
+            if isinstance(item, (dict, list, set, tuple)):
+                continue
+            text = str(item if item is not None else "").strip()
+            if text:
+                result.add(text)
+        return result
+
+    pinned_ids = _id_set(pinned)
+    archived_ids = _id_set(archived)
     for entry in sessions:
         entry["pinned"] = entry["session_id"] in pinned_ids
         entry["archived"] = entry["session_id"] in archived_ids
@@ -3396,6 +3420,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/knowledge/documents", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def knowledge_documents(
         request: Request,
         response: Response,
@@ -3422,6 +3447,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _knowledge_unavailable("知识库暂不可用", exc) from exc
 
     @app.get("/api/knowledge/categories", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def knowledge_categories(request: Request, response: Response) -> dict[str, Any]:
         """知识片段分类统计（维护面板筛选下拉框）。
 
@@ -3539,6 +3565,7 @@ def create_app(model: Any = None) -> FastAPI:
             state.eval_lock.release(token)
 
     @app.get("/api/knowledge/duplicates", dependencies=[Depends(_cross_site_side_effect)])
+    @_export_guard
     def knowledge_duplicates(
         request: Request,
         response: Response,
@@ -3559,11 +3586,14 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取重复知识片段失败: %s", exc)
             raise _knowledge_unavailable("读取失败", exc) from exc
-        shown = groups if limit <= 0 else groups[:limit]
+        shown = (
+            groups[:MAX_DUPLICATE_GROUPS_FULL] if limit <= 0 else groups[:limit]
+        )
         return {
             "total_groups": len(groups),
             "total_fragments": sum(len(ids) for _, ids in groups),
             "shown": len(shown),
+            "truncated": len(shown) < len(groups),
             "groups": [
                 {
                     "content": content,
@@ -4283,6 +4313,14 @@ def create_app(model: Any = None) -> FastAPI:
 
             try:
                 existed = await asyncio.to_thread(_exists)
+            except HTTPException:
+                # 422（user_id 非法）/ 记忆损坏的 503 恢复指引不能被重包成
+                # 通用「删除失败」：语义与操作指引都会丢失
+                if not already_marked:
+                    await asyncio.to_thread(
+                        state.unmark_deleted, user_id, session_id, token
+                    )
+                raise
             except Exception as exc:  # noqa: BLE001 - 读失败统一提示
                 if not already_marked:
                     # 没读到存在性：撤销本请求的墓碑（允许该 id 继续使用），
@@ -4304,6 +4342,17 @@ def create_app(model: Any = None) -> FastAPI:
                 # PostgreSQL / JSON 的打开与删除是阻塞 IO，放到线程池，
                 # 慢库不能让整个事件循环（其它会话的 SSE 心跳）停住
                 removed = await asyncio.to_thread(_delete)
+            except HTTPException:
+                if not already_marked:
+                    try:
+                        still_exists = await asyncio.to_thread(_exists)
+                    except Exception:  # noqa: BLE001 - 查询失败：保守保留墓碑
+                        still_exists = None
+                    if still_exists is not False:
+                        await asyncio.to_thread(
+                            state.unmark_deleted, user_id, session_id, token
+                        )
+                raise
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
                 if not already_marked:
                     try:
@@ -4396,6 +4445,9 @@ def create_app(model: Any = None) -> FastAPI:
             try:
                 # 阻塞的数据库 / 文件操作放到线程池
                 removed = await asyncio.to_thread(_remove_last_turn)
+            except HTTPException:
+                # 422 / 记忆损坏的 503 恢复指引不能被重包成通用「删除失败」
+                raise
             except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
                 logger.warning("删除最后一轮对话失败: %s", exc)
                 raise _storage_failure("删除失败", exc) from exc

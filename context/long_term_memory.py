@@ -1073,6 +1073,14 @@ class LongTermMemory:
             pinned_sessions = self.data.get("pinned_sessions") or []
             if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
                 pinned_sessions.remove(session_id)
+            # 与整会话删除同口径：清空引用该会话的行程链接，否则面板里
+            # 留下永远打不开的「查看对应对话」（单轮会话编辑重发时删空）
+            for trip in self.data.get("trip_history") or []:
+                if not isinstance(trip, dict):
+                    continue
+                value = trip.get("session_id")
+                if value is not None and str(value) == session_id:
+                    trip["session_id"] = None
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)

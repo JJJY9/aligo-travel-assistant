@@ -869,6 +869,17 @@ class PostgresLongTermMemory:
                         ")",
                         (self.user_id, session_id, self.user_id, session_id),
                     )
+                # 与整会话删除同口径：会话删空后清空引用它的行程链接，
+                # 否则面板留下永远打不开的「查看对应对话」
+                cursor.execute(
+                    "UPDATE aligo_trips SET session_id = NULL "
+                    "WHERE user_id = %s AND session_id = %s "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM aligo_chat_messages "
+                    "  WHERE user_id = %s AND session_id = %s"
+                    ")",
+                    (self.user_id, session_id, self.user_id, session_id),
+                )
                 return removed
 
         # DELETE 匹配的是「当前最后一轮」：提交后响应丢失时重放可能删掉
