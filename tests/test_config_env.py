@@ -210,6 +210,9 @@ def test_storage_urls_strip_whitespace_and_bom():
     env["DATABASE_URL"] = "\ufeffpostgresql://u:p@h/db\n"
     env["KB_RATE_LIMIT"] = "0"
     env["CHAT_RATE_LIMIT"] = "2,000"
+    # Windows \u975e\u63a7\u5236\u53f0\u7ba1\u9053\u9ed8\u8ba4\u7528 ANSI \u4ee3\u7801\u9875\u5199 stderr\uff08GBK\uff09\uff0c\u4e0b\u9762\u6309 UTF-8
+    # \u89e3\u7801\u65ad\u8a00\u4e2d\u6587\u544a\u8b66\u4f1a\u5931\u8d25\uff1b\u5f3a\u5236\u5b50\u8fdb\u7a0b stdio \u7f16\u7801\uff0c\u4fdd\u8bc1\u6d4b\u8bd5\u8de8\u5e73\u53f0\u786e\u5b9a
+    env["PYTHONIOENCODING"] = "utf-8"
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=project_root,
