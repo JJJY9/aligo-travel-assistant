@@ -304,9 +304,39 @@ _ALIGO_DESCRIPTION = re.compile(
     r"(?P<start>\d{4}-\d{2}-\d{2}) ~ (?P<end>\d{4}-\d{2}-\d{2})，(?P<purpose>.*)$",
     re.S,
 )
-_ICS_SUMMARY = re.compile(
-    r"^(?P<origin>.*?) → (?P<destination>.*)（(?P<purpose>.*)）$", re.S
-)
+def _split_ics_summary(summary: str) -> dict[str, str] | None:
+    """把 ``出发地 → 目的地（目的）`` 拆开；括号按配对从尾部解析。
+
+    目的与目的地都可能含全角括号（``会议（重要）`` / ``上海（浦东）``），
+    贪婪或非贪婪正则会固定拆错一侧；从结尾做括号配对扫描，最外层括号
+    始终归目的，其余括号留在目的地里。
+    """
+    text = summary.strip()
+    if not text.endswith("）"):
+        return None
+    depth = 0
+    open_index = -1
+    for index in range(len(text) - 1, -1, -1):
+        char = text[index]
+        if char == "）":
+            depth += 1
+        elif char == "（":
+            depth -= 1
+            if depth == 0:
+                open_index = index
+                break
+    if open_index <= 0:
+        return None
+    head = text[:open_index]
+    purpose = text[open_index + 1 : -1].strip()
+    if " → " not in head:
+        return None
+    origin, _, destination = head.partition(" → ")
+    return {
+        "origin": origin.strip(),
+        "destination": destination.strip(),
+        "purpose": purpose,
+    }
 
 
 def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
@@ -372,13 +402,11 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
         ):
             end_date = machine_end
     else:
-        match = _ICS_SUMMARY.match(summary[:400])
-        if match:
-            origin = unescape_ics_machine_field(match.group("origin").strip())
-            destination = unescape_ics_machine_field(
-                match.group("destination").strip()
-            )
-            purpose = match.group("purpose").strip()
+        parts = _split_ics_summary(summary[:400])
+        if parts:
+            origin = unescape_ics_machine_field(parts["origin"])
+            destination = unescape_ics_machine_field(parts["destination"])
+            purpose = parts["purpose"]
         else:
             destination = summary[:400]
     if not destination:

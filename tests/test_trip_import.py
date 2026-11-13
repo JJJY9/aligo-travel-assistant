@@ -1206,6 +1206,38 @@ def test_ics_unescape_preserves_unknown_escapes():
     print("✓ ICS 未知转义保留反斜杠")
 
 
+def test_ics_summary_balanced_full_width_parens():
+    """SUMMARY 回退按最外层括号拆分：目的 / 目的地含全角括号都不跑偏。"""
+
+    def row_for(summary):
+        text = (
+            "BEGIN:VEVENT\n"
+            "DTSTART;VALUE=DATE:20261205\n"
+            f"SUMMARY:{summary}\n"
+            "END:VEVENT\n"
+        )
+        rows, errors = parse_trips_ics(text)
+        assert errors == [], errors
+        return rows[0]
+
+    nested_purpose = row_for("北京 → 上海（会议（重要））")
+    assert nested_purpose["origin"] == "北京", nested_purpose
+    assert nested_purpose["destination"] == "上海", nested_purpose
+    assert nested_purpose["purpose"] == "会议（重要）", nested_purpose
+
+    paren_destination = row_for("北京 → 上海（浦东）（会议）")
+    assert paren_destination["destination"] == "上海（浦东）", paren_destination
+    assert paren_destination["purpose"] == "会议", paren_destination
+
+    plain = row_for("外部日历事件")
+    assert plain["destination"] == "外部日历事件", plain
+
+    normal = row_for("北京 → 杭州（出差）")
+    assert normal["destination"] == "杭州", normal
+    assert normal["purpose"] == "出差", normal
+    print("✓ SUMMARY 全角括号按最外层配对拆分")
+
+
 if __name__ == "__main__":
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
@@ -1217,6 +1249,7 @@ if __name__ == "__main__":
     test_ics_unfold_long_line_is_linear()
     test_ics_collects_invalid_events()
     test_ics_external_summary_fallback()
+    test_ics_summary_balanced_full_width_parens()
     test_ics_unescape_preserves_unknown_escapes()
     test_ics_valarm_before_properties_keeps_event_description()
     test_ics_structure_errors_do_not_duplicate_events()
