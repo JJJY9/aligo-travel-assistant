@@ -165,7 +165,9 @@ def test_failed_orchestration_leaves_no_long_term_user_turn():
     """编排失败时长期记忆不留孤儿用户提问，短期暂存提问同步回滚。"""
     runtime, memory = _make_runtime()
 
-    async def _direct(factory, max_retries=0, base_delay=0.0, max_delay=0.0):
+    async def _direct(
+        factory, max_retries=0, base_delay=0.0, max_delay=0.0, record_success=True
+    ):
         return await factory()
 
     runtime._call_with_resilience = _direct  # type: ignore[method-assign]
@@ -1105,6 +1107,95 @@ def test_non_empty_short_term_skips_long_term_backfill():
     print("✓ 短期记忆非空时不回填长期历史")
 
 
+def test_epoch_snapshot_read_before_context_and_intent():
+    """会话纪元必须在上下文总结 / 意图 LLM 之前读取（删除窗口守卫）。"""
+    runtime, memory = _make_runtime()
+    order = []
+
+    def epoch():
+        order.append("epoch")
+        return 0
+
+    memory.session_epoch = epoch
+    original_build = runtime._build_context
+
+    async def build(user_input):
+        order.append("context")
+        return await original_build(user_input)
+
+    runtime._build_context = build  # type: ignore[method-assign]
+
+    class _Intent(_FakeIntention):
+        async def reply(self, context):
+            order.append("intent")
+            return await super().reply(context)
+
+    runtime.intention_agent = _Intent()
+    asyncio.run(runtime.ask("你好"))
+    assert order[:3] == ["epoch", "context", "intent"], order
+    print("✓ 会话纪元在上下文 / 意图调用之前读取")
+
+
+def test_intent_success_does_not_reset_breaker_failures():
+    """意图调用成功不清零熔断连续失败计数；编排成功才清零。"""
+    from utils.circuit_breaker import CircuitBreaker
+
+    runtime = ConversationRuntime.__new__(ConversationRuntime)
+    runtime.circuit_breaker = CircuitBreaker(failure_threshold=5)
+    runtime._probe_recorded = False
+    runtime.circuit_breaker.record_failure()
+    assert runtime.circuit_breaker._failure_count == 1
+
+    async def ok():
+        return "ok"
+
+    asyncio.run(
+        runtime._call_with_resilience(
+            ok, max_retries=0, base_delay=0.0, max_delay=0.0, record_success=False
+        )
+    )
+    assert runtime.circuit_breaker._failure_count == 1, (
+        "意图调用成功不能清零只发生在编排腿上的失败"
+    )
+    asyncio.run(
+        runtime._call_with_resilience(
+            ok, max_retries=0, base_delay=0.0, max_delay=0.0
+        )
+    )
+    assert runtime.circuit_breaker._failure_count == 0, "编排成功才清零"
+    print("✓ 意图成功不清零熔断失败计数")
+
+def test_redis_backfill_skipped_while_degraded(monkeypatch):
+    """Redis 降级窗口内不把历史回填写入短期记忆（避免恢复后重放重复）。"""
+    from context.short_term_memory import RedisShortTermMemory
+
+    from agents import conversation as conversation_module
+
+    runtime, memory = _make_runtime()
+    redis_mem = RedisShortTermMemory(None, "s-ctx")
+    added: list[tuple[str, str]] = []
+    redis_mem.add_message = lambda role, content: added.append((role, content))  # type: ignore[method-assign]
+    redis_mem.get_recent_context = lambda n_turns=5: []  # type: ignore[method-assign]
+    memory.short_term = redis_mem
+    memory.get_chat_history = lambda limit=None, session_id=None: [  # type: ignore[method-assign]
+        {"role": "user", "content": "旧问题", "session_id": "s-ctx"},
+        {"role": "assistant", "content": "旧回答", "session_id": "s-ctx"},
+    ]
+
+    monkeypatch.setattr(
+        conversation_module, "redis_short_term_available", lambda: False
+    )
+    _prefs, recent = runtime._memory_snapshot()
+    assert len(recent) == 2, "回填结果仍用于本轮上下文"
+    assert added == [], "Redis 降级期间不能把回填写入故障重放日志"
+
+    monkeypatch.setattr(
+        conversation_module, "redis_short_term_available", lambda: True
+    )
+    runtime._memory_snapshot()
+    assert added == [("user", "旧问题"), ("assistant", "旧回答")]
+    print("✓ Redis 降级期间跳过历史回填写回")
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -1140,4 +1231,6 @@ if __name__ == "__main__":
     test_open_circuit_short_circuits_ask()
     test_model_call_failure_counts_towards_breaker(mp)
     test_normalized_schedule_filters_invalid_entries()
+    test_epoch_snapshot_read_before_context_and_intent()
+    test_intent_success_does_not_reset_breaker_failures()
     print("\n全部通过")
