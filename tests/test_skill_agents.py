@@ -1044,6 +1044,186 @@ def test_event_collection_prefers_last_result_object():
     print("✓ 事项提取取最后一个结果对象（回显示例在前）")
 
 
+def _event_reply(payload_text: str) -> dict:
+    agent_class = _load_skill("event-collection", "EventCollectionAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return payload_text
+
+    agent = agent_class(name="EventCollectionAgent", model=_Model())
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="12 月 1 日去杭州出差", role="user"))
+    )
+    return json.loads(out.content)
+
+
+def test_event_collection_tail_meta_does_not_replace_extraction():
+    """正式提取后的尾注元信息对象（summary / missing_info / data:null）不顶掉结果。"""
+    formal = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"end_date": "2026-12-03", "duration_days": 3, "trip_purpose": "出差", '
+        '"missing_info": [], "extracted_count": 6}'
+    )
+    for tail in (
+        '{"summary": "杭州三天出差"}',
+        '{"missing_info": ["返程地"], "extracted_count": 5}',
+        '{"data": null}',
+    ):
+        data = _event_reply(f"结果：{formal}\n尾注：{tail}")
+        assert data.get("destination") == "杭州", (tail, data)
+        assert data.get("start_date") == "2026-12-01", (tail, data)
+        assert data.get("origin") == "上海", (tail, data)
+    print("✓ 事项收集：尾注不顶掉正式提取")
+
+
+def test_event_collection_normalizes_non_iso_dates():
+    """中文 / 斜杠日期归一为 ISO（否则下游判非法、整条行程静默不落库）。"""
+    payload = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026年12月1日", '
+        '"end_date": "2026/12/03", "duration_days": 3, '
+        '"missing_info": [], "extracted_count": 5}'
+    )
+    data = _event_reply(payload)
+    assert data["start_date"] == "2026-12-01", data
+    assert data["end_date"] == "2026-12-03", data
+
+    invalid = '{"destination": "杭州", "start_date": "2026年2月30日"}'
+    data2 = _event_reply(invalid)
+    assert data2["start_date"] is None, data2
+    print("✓ 事项收集：非 ISO 日期归一 / 非法日历日置 null")
+
+
+def test_event_collection_empty_list_and_permanent_errors():
+    """reply([]) 不崩；401 等永久模型错误穿透给编排层记账。"""
+    agent_class = _load_skill("event-collection", "EventCollectionAgent")
+
+    class _OkModel:
+        async def __call__(self, messages, **kwargs):
+            return '{"destination": "杭州", "start_date": "2026-12-01"}'
+
+    agent = agent_class(name="EventCollectionAgent", model=_OkModel())
+    data = json.loads(asyncio.run(agent.reply([])).content)
+    assert data.get("destination") == "杭州", data
+
+    class _Unauthorized(Exception):
+        status_code = 401
+
+    class _BadModel:
+        async def __call__(self, messages, **kwargs):
+            raise _Unauthorized("Incorrect API key")
+
+    agent2 = agent_class(name="EventCollectionAgent", model=_BadModel())
+    with pytest.raises(_Unauthorized):
+        asyncio.run(agent2.reply(Msg(name="user", content="去杭州", role="user")))
+    print("✓ 事项收集：空消息列表不崩、永久模型错误穿透")
+
+
+def test_plan_trip_data_wrapped_result_after_echoed_example():
+    """回显示例（强键 itinerary）不能压过后置的 data 包装正式结果。"""
+    example = '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    formal = (
+        '正式：{"data": {"itinerary": '
+        '{"title": "杭州出差", "daily_plans": [{"day": 1}, {"day": 2}]}}}'
+    )
+    data = _plan_trip_reply(example + "\n" + formal)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    assert len(data["itinerary"]["daily_plans"]) == 2, data
+    print("✓ 行程规划：示例后的 data 包装正式结果优先")
+
+
+def test_plan_trip_bare_titled_result_after_echoed_example():
+    """回显示例不能压过后置的裸弱键正式行程（title/duration/route）。"""
+    example = '示例：{"itinerary": {"title": "北京3日游"}}'
+    formal = '正式：{"title": "杭州出差", "duration": "3天", "route": "北京 -> 杭州"}'
+    data = _plan_trip_reply(example + "\n" + formal)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：示例后的裸弱键正式行程优先")
+
+
+def test_plan_trip_tail_note_after_data_wrapped_full_plan():
+    """data 包装完整行程之后的尾注弱对象（duration/note）不能顶掉行程。"""
+    formal = (
+        '{"data": {"itinerary": {"title": "杭州出差", '
+        '"daily_plans": [{"day": 1}, {"day": 2}]}}}'
+    )
+    payload = formal + '\n补充：{"duration": "2天", "note": "供参考"}'
+    data = _plan_trip_reply(payload)
+    assert data["itinerary"]["title"] == "杭州出差", data
+    assert len(data["itinerary"]["daily_plans"]) == 2, data
+    print("✓ 行程规划：尾注弱对象不顶掉 data 包装行程")
+
+
+def test_plan_trip_schedule_only_result_is_rejected():
+    """仅 schedule / duration 的裸对象渲染为空，必须按解析失败返回。"""
+    data = _plan_trip_reply(
+        '{"schedule": [{"day": 1, "plan": "开会"}]}\n{"duration": "1天"}'
+    )
+    assert data.get("planning_complete") is False, data
+    assert data.get("error"), data
+    print("✓ 行程规划：仅 schedule 形状按解析失败处理")
+
+
+def test_memory_query_prompt_budget_and_content_blocks():
+    """记忆注入 prompt 有字符预算；content block 列表按文本拼接而非 repr。"""
+    module = _load_skill_module("memory-query")
+    agent = module.MemoryQueryAgent(name="MemoryQueryAgent", model=None)
+    trips = [
+        {
+            "origin": "北京" * 200,
+            "destination": "上海" * 200,
+            "start_date": "2026-01-01",
+            "purpose": "出差" * 200,
+        }
+        for _ in range(200)
+    ]
+    text = agent._format_trip_history(trips)
+    assert len(text) <= module._MAX_TRIP_TEXT_CHARS + 100, len(text)
+    assert "已省略" in text, text[:200]
+
+    prefs = {"hotel_brands": ["汉庭" * 1000], "memo": "x" * 10000}
+    pref_text = agent._format_preferences(prefs)
+    assert len(pref_text) <= module._MAX_PREF_TEXT_CHARS + 100, len(pref_text)
+
+    captured = {}
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            captured["prompt"] = messages[-1]["content"]
+            return "你去过杭州。"
+
+    class _LongTerm:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_preference(self):
+            return {}
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    class _Loader:
+        def get_skill_content(self, name):
+            return ""
+
+    agent2 = module.MemoryQueryAgent(
+        name="MemoryQueryAgent", model=_Model(), memory_manager=_Memory()
+    )
+    agent2.skill_loader = _Loader()
+    content = [{"type": "text", "text": "我去过哪些地方"}]
+    out = asyncio.run(agent2.reply(Msg(name="user", content=content, role="user")))
+    data = json.loads(out.content)
+    assert data.get("status") == "success", data
+    assert "我去过哪些地方" in captured["prompt"], captured["prompt"]
+    assert "'type': 'text'" not in captured["prompt"], "content block 不能以 Python repr 进入 prompt"
+    print("✓ 记忆查询：prompt 预算与 content block 拼接")
+
+
 def test_preference_prefers_last_result_object():
     """回显的『当前偏好』在前时，正式偏好不能被静默丢弃。"""
     agent_class = _load_skill("preference", "PreferenceAgent")
@@ -1972,6 +2152,14 @@ if __name__ == "__main__":
         test_preference_replace_then_append_keeps_replace()
         test_preference_non_string_type_is_dropped()
         test_preference_empty_list_input_and_permanent_errors()
+        test_event_collection_tail_meta_does_not_replace_extraction()
+        test_event_collection_normalizes_non_iso_dates()
+        test_event_collection_empty_list_and_permanent_errors()
+        test_plan_trip_data_wrapped_result_after_echoed_example()
+        test_plan_trip_bare_titled_result_after_echoed_example()
+        test_plan_trip_tail_note_after_data_wrapped_full_plan()
+        test_plan_trip_schedule_only_result_is_rejected()
+        test_memory_query_prompt_budget_and_content_blocks()
         test_event_collection_duration_only_result_beats_echoed_example()
         test_event_collection_data_wrapper_is_unwrapped()
         test_plan_trip_tail_note_does_not_replace_full_plan()

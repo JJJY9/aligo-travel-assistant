@@ -14,16 +14,100 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 # project_root = Path(__file__).parent.parent # Removed old logic
 # sys.path.insert(0, str(project_root))
 
-from utils.llm_resilience import is_retriable_error
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.json_parser import (
     extract_json_from_async_response,
-    iter_json_objects_with_repair,
-    last_json_object_prefer_keys_strict,
+    has_unclosed_json_object,
+    iter_json_object_spans_with_repair,
     robust_json_parse,
     starts_with_json_array,
 )
 
 logger = logging.getLogger(__name__)
+
+# 行程形状的键：识别候选并区分「完整行程」与尾注（仅有 duration / note 的
+# 小对象不能顶掉完整规划）
+_PLAN_SHAPE_KEYS = ("itinerary", "daily_plans", "title", "duration", "schedule", "route")
+# data 包装内部允许的行程键（与下游渲染 / _merged_skill_payload 同口径）
+_PLAN_INNER_KEYS = ("itinerary", "title", "daily_plans", "duration", "schedule")
+
+
+def _as_plan_object(obj: object) -> dict | None:
+    """取出行程候选对象；兼容 ``{"data": {行程字段...}}`` 包装。"""
+    if not isinstance(obj, dict):
+        return None
+    candidate = obj
+    if "itinerary" not in obj and "daily_plans" not in obj:
+        nested = obj.get("data")
+        if isinstance(nested, dict) and any(
+            key in nested for key in _PLAN_INNER_KEYS
+        ):
+            candidate = nested
+    if any(key in candidate for key in _PLAN_SHAPE_KEYS):
+        return candidate
+    return None
+
+
+def _is_full_plan(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    itinerary_value = value.get("itinerary")
+    if isinstance(itinerary_value, dict) and itinerary_value:
+        return True
+    plans = value.get("daily_plans")
+    return isinstance(plans, list) and bool(plans)
+
+
+def _has_plan_title(value: dict) -> bool:
+    title = value.get("title")
+    return isinstance(title, str) and bool(title.strip())
+
+
+def _select_plan_result(text: str) -> dict | None:
+    """按位置选行程候选：完整行程 or 后置的有标题裸行程；尾注不顶替。
+
+    此前用「强键优先」全局挑选：回显的 prompt 示例（含强键 itinerary）
+    会压过后置的 ``{"data": {"itinerary": ...}}`` 包装与裸弱键正式结果；
+    正式结果之后的尾注弱对象（duration / note）又会被当成结果包装成
+    itinerary、整份真实行程被静默丢弃。这里按位置选最后一个「完整行程」
+    或后置的有标题裸行程（真值优于回显示例）；两者都没有时退回最后一个
+    行程形状对象（由调用方校验不足时报错）。末尾截断时抛错不回退。
+    """
+    last_any: dict | None = None
+    last_any_end = -1
+    full: dict | None = None
+    full_end = -1
+    titled: dict | None = None
+    titled_end = -1
+    failed_tail = False
+    for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
+        if value is None:
+            if looks_like and start >= last_any_end:
+                failed_tail = True
+            continue
+        plan = _as_plan_object(value)
+        if plan is None:
+            continue
+        last_any, last_any_end = plan, end
+        failed_tail = False
+        if _is_full_plan(plan):
+            full, full_end = plan, end
+        elif _has_plan_title(plan):
+            titled, titled_end = plan, end
+    if failed_tail:
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    if titled is not None and (full is None or titled_end > full_end):
+        chosen, chosen_end = titled, titled_end
+    elif full is not None:
+        chosen, chosen_end = full, full_end
+    elif last_any is not None:
+        chosen, chosen_end = last_any, last_any_end
+    else:
+        return None
+    if has_unclosed_json_object(text[chosen_end:]):
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    return chosen
+
 
 
 def _format_pref_value(value) -> str:
@@ -208,7 +292,10 @@ class ItineraryPlanningAgent(AgentBase):
             return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
-        content = x.content if not isinstance(x, list) else x[-1].content
+        if isinstance(x, list):
+            content = x[-1].content if x else "{}"
+        else:
+            content = x.content
 
         # 初始化变量
         user_query = ""
@@ -400,31 +487,10 @@ class ItineraryPlanningAgent(AgentBase):
                 )
 
             # strict：末尾还有未闭合对象（截断）时抛错，不能继续沿用更早
-            # 解析出的对象（可能只是 prompt 回显示例）。强键（itinerary /
-            # daily_plans）优先于弱键（duration / schedule / title）：尾注里
-            # 的 {"duration": "3天", "note": ...} 不能顶掉完整行程
-            candidate = last_json_object_prefer_keys_strict(
-                text,
-                ("itinerary", "daily_plans"),
-                ("duration", "schedule", "title"),
-            )
-
-            def _is_full_plan(value: object) -> bool:
-                if not isinstance(value, dict):
-                    return False
-                itinerary_value = value.get("itinerary")
-                if isinstance(itinerary_value, dict) and itinerary_value:
-                    return True
-                plans = value.get("daily_plans")
-                return isinstance(plans, list) and bool(plans)
-
-            if candidate is not None and not _is_full_plan(candidate):
-                # 尾注里的 {"itinerary": "已生成"} / {"itinerary": {}} 带强键
-                # 但不是完整行程：不能顶掉前面生成的完整行程（会按解析失败
-                # 丢弃整份规划）。改取最后一个真正含完整行程的对象。
-                for obj, _end in iter_json_objects_with_repair(text):
-                    if _is_full_plan(obj):
-                        candidate = obj
+            # 解析出的对象（可能只是 prompt 回显示例）。候选按位置选择：
+            # 完整行程 / 后置的有标题裸行程；尾注里的 {"duration": ...,
+            # "note": ...} 不能顶掉完整行程
+            candidate = _select_plan_result(text)
             if candidate is not None:
                 result = candidate
 
@@ -442,10 +508,11 @@ class ItineraryPlanningAgent(AgentBase):
                 ):
                     result = nested
             # 模型可能省略 SKILL.md 要求的 itinerary 包装、直接返回裸行程
-            # 对象：按成功返回会让回答为空、行程也不写长期记忆——补齐包装
-            if "itinerary" not in result and any(
-                key in result
-                for key in ("title", "daily_plans", "duration", "schedule")
+            # 对象：只有带标题或每日安排时才补齐包装（可渲染的真实行程）；
+            # 仅 schedule / duration 的裸对象包装后渲染为空，按解析失败处理
+            if "itinerary" not in result and (
+                _has_plan_title(result)
+                or _is_full_plan(result)
             ):
                 result = {"itinerary": result}
             if "itinerary" not in result:
@@ -461,8 +528,9 @@ class ItineraryPlanningAgent(AgentBase):
                 raise ValueError("行程规划结果缺少有效行程（itinerary 为空）")
 
         except Exception as e:
-            if is_retriable_error(e):
-                # 5xx / 超时 / 限流等瞬时模型错误：穿透给编排层按契约重试
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                # 5xx / 超时 / 限流等瞬时模型错误：穿透给编排层按契约重试；
+                # 401/402/403/404 等永久错误同样穿透并计入熔断
                 raise
             logger.error(f"Itinerary planning failed: {e}")
             # Ensure text is defined for logging even if extraction failed

@@ -155,9 +155,12 @@ async def plan_trip(user_query: str):
     orchestration_result = await orchestrator.reply(orchestration_input)
     result_data = json.loads(orchestration_result.content)
 
-    print("✓ 行程规划完成")
-
     extracted = _extract_itinerary(result_data)
+    if extracted is not None:
+        print("✓ 行程规划完成")
+    else:
+        # partial_failure / 解析失败时不能宣称完成：下方会打印完整结果
+        print("⚠ 行程规划未生成有效行程，请查看下方结果中的错误信息")
     return extracted if extracted is not None else result_data
 
 

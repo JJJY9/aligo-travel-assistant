@@ -9,6 +9,7 @@
 import json
 import logging
 import os
+import re
 import sys
 
 from agentscope.agent import AgentBase
@@ -17,19 +18,18 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
-from utils.llm_resilience import is_retriable_error
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.user_query import extract_user_query
 from utils.json_parser import (
     extract_json_from_async_response,
-    first_json_object_with_keys,
-    last_json_object_with_keys_strict,
+    has_unclosed_json_object,
+    iter_json_object_spans_with_repair,
 )
 
 logger = logging.getLogger(__name__)
 
-# 形如「提取结果」的字段（任一命中即视为候选）。只用 missing_info /
-# extracted_count 会被 prompt 回显骗过：真实结果省略这两个键时，回显的
-# 示例对象（含全部字段）反而是最后一个命中项，被当成真实提取写库。
+# 形如「提取结果」的字段（任一命中即视为结果形状的对象）。data 只作为
+# 包装键参与识别，不参与「实质结果」打分
 _RESULT_KEYS = (
     "missing_info",
     "extracted_count",
@@ -41,11 +41,84 @@ _RESULT_KEYS = (
     "return_location",
     "trip_purpose",
     "summary",
-    # {"data": {...}} 包装：回显示例不含该键，识别后由 _unwrap_result 取出
     "data",
 )
 
 _EVENT_FIELDS = tuple(key for key in _RESULT_KEYS if key != "data")
+
+# 实质提取字段：尾注小对象（只含 summary / missing_info 等元信息）不含
+# 其中任何有值字段，不能顶掉前面的完整提取结果
+_CORE_FIELDS = (
+    "origin",
+    "destination",
+    "start_date",
+    "end_date",
+    "duration_days",
+    "return_location",
+    "trip_purpose",
+)
+
+# 中文 / 斜杠 / 点号写法：模型偶发不遵循 ISO 要求，原样落库会被下游
+# 日期归一判成非法，整条行程静默不建档
+_DATE_TEXT_RE = re.compile(
+    r"^(\d{4})\s*[年/.\-]\s*(\d{1,2})\s*[月/.\-]\s*(\d{1,2})\s*日?$"
+)
+
+
+def _has_event_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict)):
+        return bool(value)
+    return True
+
+
+def _plan_score(obj: dict) -> int:
+    """结果对象的实质字段数量（区分正式结果与尾注元信息对象）。"""
+    return sum(1 for key in _CORE_FIELDS if _has_event_value(obj.get(key)))
+
+
+def _is_explicit_empty(obj: dict) -> bool:
+    """显式「没有提取到信息」的结果（missing_info 非空 / extracted_count=0）。"""
+    count = obj.get("extracted_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count == 0:
+        return True
+    missing = obj.get("missing_info")
+    return isinstance(missing, list) and any(
+        isinstance(item, str) and item.strip() for item in missing
+    )
+
+
+def _normalize_event_date(text: str) -> str | None:
+    """中文 / 斜杠日期归一为 ISO；非法日历日返回 None（字段置 null）。"""
+    match = _DATE_TEXT_RE.fullmatch(text)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        try:
+            from datetime import date
+
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+    try:
+        from datetime import datetime
+
+        return datetime.strptime(text[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        # 非日期文本（「下周一」等）原样保留：下游同样按不可解析处理，
+        # 这里不臆造日期
+        return text
+
+
+def _normalize_result_dates(result: dict) -> dict:
+    for key in ("start_date", "end_date"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            result[key] = _normalize_event_date(value.strip())
+    return result
+
 
 
 def _unwrap_result(obj: object) -> dict | None:
@@ -62,6 +135,53 @@ def _unwrap_result(obj: object) -> dict | None:
     if any(key in candidate for key in _EVENT_FIELDS):
         return candidate
     return None
+
+
+def _select_event_result(text: str) -> dict | None:
+    """按位置选事项结果：最后一个实质结果（或显式缺省结果），尾注不顶替。
+
+    此前取「最后一个含结果键的对象」：正式提取之后的尾注小对象
+    （summary / missing_info / extracted_count）会整体顶掉完整结果；
+    且最后一个含结果键的对象解包失败时（如末尾 ``{"data": null}``）会
+    回退到第一个命中对象——prompt 回显的示例（北京 / 2026-02-27）被当成
+    真实提取写进 trip_history。这里只接受真正可用的结果候选；末尾出现
+    「像结果但解析不了」的片段（截断）时抛错，不回退示例。
+    """
+    last_any: dict | None = None
+    last_any_end = -1
+    substantive: dict | None = None
+    substantive_end = -1
+    explicit_empty: dict | None = None
+    explicit_empty_end = -1
+    failed_tail = False
+    for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
+        if value is None:
+            if looks_like and start >= last_any_end:
+                failed_tail = True
+            continue
+        candidate = _unwrap_result(value)
+        if candidate is None:
+            continue
+        last_any, last_any_end = candidate, end
+        failed_tail = False
+        if _plan_score(candidate) > 0:
+            substantive, substantive_end = candidate, end
+        elif _is_explicit_empty(candidate):
+            explicit_empty, explicit_empty_end = candidate, end
+    if failed_tail:
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    if substantive is not None:
+        chosen, chosen_end = substantive, substantive_end
+    elif explicit_empty is not None:
+        chosen, chosen_end = explicit_empty, explicit_empty_end
+    elif last_any is not None:
+        chosen, chosen_end = last_any, last_any_end
+    else:
+        return None
+    if has_unclosed_json_object(text[chosen_end:]):
+        raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    return chosen
+
 
 
 def _format_pref_value(value) -> str:
@@ -89,7 +209,10 @@ class EventCollectionAgent(AgentBase):
             return Msg(name=self.name, content="{}", role="assistant")
 
         # 解析输入内容
-        content = x.content if not isinstance(x, list) else x[-1].content
+        if isinstance(x, list):
+            content = x[-1].content if x else "{}"
+        else:
+            content = x.content
 
         # 如果content是JSON字符串，解析它
         if isinstance(content, str):
@@ -206,27 +329,17 @@ class EventCollectionAgent(AgentBase):
             text = text.removesuffix('```')
             text = text.strip()
 
-            # 模型可能先回显 prompt 里的示例对象再给正式结果：优先取最后
-            # 一个形如结果（任一提取字段命中）的顶层对象，避免把回显示例
-            # 当成提取结果写成真实行程。正式结果通常带 destination 等字段，
-            # 即使省略 missing_info / extracted_count 也会排在示例之后；
-            # duration_days / summary 也算结果形状（只含时长的正式结果）。
-            result = _unwrap_result(
-                last_json_object_with_keys_strict(text, _RESULT_KEYS)
-            )
-            if result is None:
-                # 没有任何含提取字段的完整对象：退到第一个含提取字段的对象
-                # （尾逗号等小瑕疵由修复路径兜底）。不能回退到「第一个
-                # 对象」——prompt 回显的示例排在最前，正式结果被截断时会把
-                # 示例（北京 / 2026-02-27）当成真实事项写成行程
-                result = _unwrap_result(
-                    first_json_object_with_keys(text, _RESULT_KEYS)
-                )
+            # 模型可能先回显 prompt 里的示例对象再给正式结果：按位置选最后
+            # 一个「实质结果」（尾注元信息对象不顶替完整提取），末尾截断时
+            # 按错误降级而不是把回显示例当成真实事项写成行程
+            result = _select_event_result(text)
             if result is None:
                 raise ValueError("模型输出中没有可解析的事项结果对象")
+            result = _normalize_result_dates(result)
         except Exception as e:
-            if is_retriable_error(e):
-                # 瞬时模型错误穿透给编排层重试 / 熔断，不吞成结果 JSON
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                # 瞬时模型错误交给编排层重试；401/402/403/404 等永久错误
+                # 同样穿透并计入熔断，不能吞成 error JSON
                 raise
             logger.error(f"Event collection failed: {e}")
             result = {

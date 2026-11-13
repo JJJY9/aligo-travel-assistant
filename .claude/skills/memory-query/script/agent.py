@@ -26,11 +26,20 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.log_redact import redact_paths
-from utils.llm_resilience import is_retriable_error
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.json_parser import extract_json_from_async_response
 from utils.preference_values import has_preference_value
+from utils.user_query import extract_user_query
 
 logger = logging.getLogger(__name__)
+
+# 记忆注入 prompt 的字符预算：长期用户可能有上千条行程，历史字段也可能
+# 被备份导入写得很长；无预算拼接会让 prompt 超出模型上下文、查询永久
+# 失败。按「最近优先」装入预算，被省略的条目明确注记。
+_MAX_TRIP_TEXT_CHARS = 12000
+_MAX_TRIP_LINE_CHARS = 300
+_MAX_PREF_TEXT_CHARS = 4000
+_MAX_PREF_VALUE_CHARS = 500
 
 
 class MemoryQueryAgent(AgentBase):
@@ -72,11 +81,11 @@ class MemoryQueryAgent(AgentBase):
         try:
             input_data = json.loads(input_content) if isinstance(input_content, str) else input_content
         except json.JSONDecodeError:
-            input_data = {"context": {"rewritten_query": str(input_content)}}
+            input_data = None
         if not isinstance(input_data, dict):
-            # 顶层数组 / 数字 / null（含 JSON 编码过的纯文本）：按原文处理，
-            # 直接 .get 会 AttributeError
-            input_data = {"context": {"rewritten_query": str(input_content)}}
+            # 顶层数组 / 数字 / null / content block 列表：拼出可读文本作为
+            # 查询（str() 会得到 Python repr，把 block 结构当成问题原文）
+            input_data = {"context": {"rewritten_query": extract_user_query(input_content)}}
 
         # 获取用户查询
         context = input_data.get("context")
@@ -231,7 +240,9 @@ class MemoryQueryAgent(AgentBase):
             return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
 
         except Exception as e:
-            if is_retriable_error(e):
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                # 瞬时错误交给编排层重试；401/402/403/404 等永久错误
+                # 同样穿透并计入熔断，不能吞成 error JSON
                 raise
             logger.error(f"Memory query failed: {e}")
             import traceback
@@ -258,12 +269,18 @@ class MemoryQueryAgent(AgentBase):
         )
 
     def _format_trip_history(self, trip_history: list[dict]) -> str:
-        """格式化旅行历史"""
+        """格式化旅行历史（按最近优先装入字符预算，省略条目明确注记）。"""
         if not trip_history:
             return "（暂无旅行记录）"
 
-        lines = []
-        for i, trip in enumerate(trip_history, 1):
+        lines: list[str] = []
+        used = 0
+        omitted = 0
+        total = len(trip_history)
+        for index in range(total - 1, -1, -1):
+            trip = trip_history[index]
+            if not isinstance(trip, dict):
+                continue
             # 事件收集会对缺失字段显式写 null（key 存在），必须用 or 取默认值
             origin = trip.get("origin") or "未知"
             destination = trip.get("destination") or "未知"
@@ -273,16 +290,27 @@ class MemoryQueryAgent(AgentBase):
             timestamp = trip.get("timestamp") or ""
 
             if start_date and end_date:
-                lines.append(f"{i}. {origin} → {destination} ({start_date} 至 {end_date}) - {purpose}")
+                line = f"{index + 1}. {origin} → {destination} ({start_date} 至 {end_date}) - {purpose}"
             elif start_date:
-                lines.append(f"{i}. {origin} → {destination} ({start_date}) - {purpose}")
+                line = f"{index + 1}. {origin} → {destination} ({start_date}) - {purpose}"
             else:
-                lines.append(f"{i}. {origin} → {destination} - {purpose} (记录时间: {timestamp})")
+                line = f"{index + 1}. {origin} → {destination} - {purpose} (记录时间: {timestamp})"
+            if len(line) > _MAX_TRIP_LINE_CHARS:
+                line = line[:_MAX_TRIP_LINE_CHARS] + "…"
+            if used + len(line) + 1 > _MAX_TRIP_TEXT_CHARS:
+                omitted = index + 1
+                break
+            lines.append(line)
+            used += len(line) + 1
 
-        return "\n".join(lines)
+        lines.reverse()
+        text = "\n".join(lines) or "（暂无旅行记录）"
+        if omitted:
+            text = f"（更早的 {omitted} 条行程已省略）\n{text}"
+        return text
 
     def _format_preferences(self, preferences: dict) -> str:
-        """格式化用户偏好"""
+        """格式化用户偏好（单项截断 + 总量预算）。"""
         if not preferences or not any(
             has_preference_value(v) for v in preferences.values()
         ):
@@ -300,6 +328,8 @@ class MemoryQueryAgent(AgentBase):
             "budget_level": "预算等级",
         }
 
+        used = 0
+        truncated = False
         for key, value in preferences.items():
             if not has_preference_value(value):
                 continue
@@ -311,6 +341,16 @@ class MemoryQueryAgent(AgentBase):
                 value = ", ".join(
                     str(v) for v in value if has_preference_value(v)
                 )
-            lines.append(f"- {name}: {value}")
+            value_text = str(value)
+            if len(value_text) > _MAX_PREF_VALUE_CHARS:
+                value_text = value_text[:_MAX_PREF_VALUE_CHARS] + "…"
+            line = f"- {name}: {value_text}"
+            if used + len(line) + 1 > _MAX_PREF_TEXT_CHARS:
+                truncated = True
+                break
+            lines.append(line)
+            used += len(line) + 1
 
+        if truncated:
+            lines.append("（更多偏好已省略）")
         return "\n".join(lines) if lines else "（暂无偏好记录）"
