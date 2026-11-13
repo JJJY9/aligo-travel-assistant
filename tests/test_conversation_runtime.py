@@ -1196,6 +1196,38 @@ def test_redis_backfill_skipped_while_degraded(monkeypatch):
     assert added == [("user", "旧问题"), ("assistant", "旧回答")]
     print("✓ Redis 降级期间跳过历史回填写回")
 
+def test_runtime_uses_default_data_root_for_long_term(monkeypatch, tmp_path):
+    """对话运行时的长期记忆必须落在 default_data_root()/memory。
+
+    MemoryManager 默认 "data/memory" 锚定包根（wheel 下为 site-packages），
+    与 Web 面板 / CLI 使用的数据目录分叉：对话写入的会话、偏好、行程在
+    面板 / 导出 / 删除里都不可见。
+    """
+    from context import memory_manager as memory_module
+    from utils.paths import default_data_root
+
+    monkeypatch.setenv("ALIGO_DATA_DIR", str(tmp_path))
+    captured = {}
+
+    class _Store:
+        pass
+
+    def _fake_long_term(user_id, storage_path):
+        captured["user_id"] = user_id
+        captured["storage_path"] = storage_path
+        return _Store()
+
+    monkeypatch.setattr(
+        memory_module, "create_long_term_memory", _fake_long_term
+    )
+    monkeypatch.setattr(
+        memory_module, "create_short_term_memory", lambda *args, **kwargs: object()
+    )
+    ConversationRuntime(user_id="u-root", session_id="s-root", model=None)
+    assert captured["user_id"] == "u-root"
+    assert captured["storage_path"] == str(default_data_root() / "memory")
+    assert captured["storage_path"].startswith(str(tmp_path))
+    print("✓ 对话运行时长期记忆跟随 default_data_root")
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:

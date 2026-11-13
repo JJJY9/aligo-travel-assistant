@@ -49,6 +49,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 对话运行时数据目录对齐：ConversationRuntime 的 MemoryManager 此前使用默认 `data/memory`（锚定包根，wheel 下为 site-packages），与 Web 面板 / CLI 使用的 `default_data_root()/memory` 分叉——`/api/chat` 写入的会话、偏好、行程在会话列表、导出、记忆面板与删除里全部不可见，重装 venv 还会静默丢失；现在显式传入运行期数据目录（`ALIGO_DATA_DIR` 同样生效）
 - 流式对话排队有界：`/api/chat/stream` 在返回 StreamingResponse 之前等待同一用户锁此前无超时、无心跳也不检查断连——上一回合（单智能体上限 300 秒）期间第二个请求一直卡住，经反向代理 60s 读超时变成 504，服务端随后仍为已断开的客户端构造会话并启动回合；现在最多等 55 秒，期间每 0.5 秒探测客户端断开，超时返回 503 + Retry-After，断开则直接中止
 - 知识库管理接口加固：① `GET /api/knowledge/export` 接入全量导出并发闸门（槽位占满返回 503，不再允许并发导出按库容量放大内存）；② `_COLLECTION_MISSING_MARKERS` 补充 Milvus Lite 3.x 的 `does not exist` / `is in state 'released'` 文案，半初始化与索引不可读时管理接口返回「集合不存在或无法加载，请重新运行初始化脚本」而不是通用 503，`/api/knowledge/import` 与预览同样走该映射；③ `knowledge_status` 增加集合加载探测，元数据可读但索引损坏（旧版 sidecar / released）时报不可用而不是显示绿色片段数；④ 整组回填 / 原样保存预检改为一次 `id in [...]` 批量取行（分块 500），不再对组内每个分片各发一次查询、长时间冻结全库写与检索；⑤ 整组替换的旧分片删除在共享客户端被并发 RAG 重连 reset 关闭时重取客户端重试一次，减少「删除全部失败仍返回 success」的残留
 - 知识库导入安全：① 库内布局扫描失败时「整组缺失」导入分支此前把 None 当空布局、跳过同号组冲突校验（相同 group 会写入第二套 part 1..N，检索拼出混合文档、整组删除波及两篇、备份恢复到新库时整组被拒）；现在 fail-closed 按冲突跳过；② 备份分片的 part 编号必须为 1..声明 parts（part 0 / 超范围此前被当正文拼入并整体重排编号），与 user_import 整组校验同口径；③「全部已存在」快速判重改在读锁内扫描，不再读到整组编辑的中间态（把随后被补偿删除的瞬态分片当成已存在、静默跳过恢复）；④ `/api/import` 的 knowledge_error 与其它知识库接口同一脱敏口径（本机路径 / 上游 URL）；⑤ 导入日志中的 group 标识 JSON 转义，换行 / ANSI 不能伪造日志行
