@@ -53,6 +53,9 @@ def _prepare_dirs(module, tmp):
     module._resolve_knowledge_base_path = (
         lambda skill_root: Path(skill_root) / "data" / "rag_knowledge"
     )
+    module._resolve_knowledge_source_dir = lambda knowledge_base_path: (
+        knowledge_base_path
+    )
 
 
 def test_main_returns_1_when_agent_not_initialized(monkeypatch):
@@ -584,6 +587,29 @@ def test_preserved_backup_survives_failed_restore(monkeypatch):
         assert "已并入上次" in out.getvalue()
         assert not backup.exists(), "补写成功后应清理备份"
     print("✓ 保留片段备份：失败留盘、重跑补齐、成功后清理")
+
+
+def test_target_follows_runtime_when_skills_dir_overridden(monkeypatch, tmp_path):
+    """ALIGO_SKILLS_DIR 覆盖时目标库跟随运行时解析（脚本目录应用看不到）。"""
+    module = _load_init_module()
+    runtime = tmp_path / "runtime-rag"
+    monkeypatch.setenv("ALIGO_SKILLS_DIR", str(tmp_path / "external-skills"))
+    import utils.knowledge_paths as knowledge_paths
+    import utils.paths as paths
+
+    monkeypatch.setattr(knowledge_paths, "default_knowledge_dir", lambda: runtime)
+    monkeypatch.setattr(paths, "is_source_checkout", lambda: True)
+    skill_root = tmp_path / "repo-skill"
+    target = module._resolve_knowledge_base_path(skill_root)
+    assert target == runtime, target
+    # 来源库同样跟随运行时（legacy 迁移来源与目标一致）
+    assert module._resolve_knowledge_source_dir(target) == runtime
+
+    # 未覆盖技能目录的纯源码 checkout：保持脚本本地目录（旧迁移语义）
+    monkeypatch.delenv("ALIGO_SKILLS_DIR", raising=False)
+    local = skill_root / "data" / "rag_knowledge"
+    assert module._resolve_knowledge_base_path(skill_root) == local
+    print("✓ 初始化目标库跟随运行时解析（技能目录覆盖场景）")
 
 
 if __name__ == "__main__":

@@ -413,14 +413,37 @@ def _resolve_knowledge_base_path(skill_root: Path) -> Path:
     必须与运行时 ``default_knowledge_dir()`` 一致：ALIGO_SKILLS_DIR 指向
     外部技能目录或 wheel 安装时，脚本自身所在技能目录与运行期解析出的
     目录不同——写进脚本目录的库应用永远看不到（初始化「成功」、退出码
-    0，但面板与问答恒报未初始化）。无法导入 utils 时退回脚本目录。
+    0，但面板与问答恒报未初始化）。
+
+    纯源码 checkout（技能目录就是脚本所在目录、未覆盖 ALIGO_SKILLS_DIR）
+    仍返回脚本本地目录：保持旧行为与既有迁移语义（来源库由
+    :func:`_resolve_knowledge_source_dir` 解析，legacy 库仍会被迁移）。
     """
+    script_local = skill_root / "data" / "rag_knowledge"
+    try:
+        from utils.knowledge_paths import default_knowledge_dir
+        from utils.paths import is_source_checkout
+
+        runtime = default_knowledge_dir()
+    except Exception:  # noqa: BLE001 - 独立运行（无 utils）
+        return script_local
+    if runtime == script_local:
+        return script_local
+    import os
+
+    if is_source_checkout() and not os.environ.get("ALIGO_SKILLS_DIR", "").strip():
+        return script_local
+    return runtime
+
+
+def _resolve_knowledge_source_dir(knowledge_base_path: Path) -> Path:
+    """重建前的来源库：运行时的默认解析（legacy 迁移来源可能不同于目标）。"""
     try:
         from utils.knowledge_paths import default_knowledge_dir
 
         return default_knowledge_dir()
-    except Exception:  # noqa: BLE001 - 独立运行（无 utils）
-        return skill_root / "data" / "rag_knowledge"
+    except Exception:  # noqa: BLE001 - 独立运行
+        return knowledge_base_path
 
 
 def main() -> int:
@@ -435,7 +458,7 @@ def main() -> int:
         skill_root = current_dir.parent
         documents_dir = skill_root / "data" / "documents"
         knowledge_base_path = _resolve_knowledge_base_path(skill_root)
-        source_knowledge_dir = knowledge_base_path
+        source_knowledge_dir = _resolve_knowledge_source_dir(knowledge_base_path)
 
         # 1. 先加载文档：任一文件失败在触碰知识库之前中止
         print(f"1. 从 {documents_dir} 加载文档...")
