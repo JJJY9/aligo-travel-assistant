@@ -306,6 +306,7 @@ def test_export_concurrency_guard():
             "/api/export",
             "/api/sessions/export",
             "/api/sessions/s1/export",
+            "/api/knowledge/export",
         ):
             response = client.get(path, params={"user_id": user_id})
             assert response.status_code == 503, (path, response.text)
@@ -317,6 +318,28 @@ def test_export_concurrency_guard():
     response = client.get("/api/export", params={"user_id": user_id})
     assert response.status_code != 503, response.text
     print("✓ 全量导出并发上限（槽位占满快速 503）")
+
+
+def test_knowledge_unavailable_recognizes_milvus3_missing_collection():
+    """Milvus Lite 3.x 的 does not exist / released 文案给出可操作提示。"""
+    from webapp import server as server_module
+
+    for message in (
+        "collection 'business_travel_knowledge' does not exist",
+        "Collection business_travel_knowledge is in state 'released'; call load() before search/get/query",
+    ):
+        response = server_module._knowledge_unavailable(
+            "读取知识库失败", RuntimeError(message)
+        )
+        assert response.status_code == 503
+        assert "重新运行初始化脚本" in response.detail, response.detail
+    # 其它存储错误仍是通用文案（不回显内部细节）
+    generic = server_module._knowledge_unavailable(
+        "读取知识库失败", RuntimeError("db down at /home/alice/secret")
+    )
+    assert "请稍后再试" in generic.detail
+    assert "alice" not in generic.detail
+
 
 def test_import_slow_body_times_out_and_frees_slot(monkeypatch):
     """只发请求头不发 body：60 秒内超时 408，导入名额必须释放。"""

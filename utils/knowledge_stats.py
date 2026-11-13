@@ -90,6 +90,25 @@ def knowledge_status(
     def _snapshot(client: Any) -> dict[str, Any]:
         if not client.has_collection(collection):
             return {**base, "available": False, "reason": "集合不存在"}
+        # 元数据可读不代表集合可用：索引 sidecar 由旧版写入 / 文件损坏时，
+        # has_collection / get_collection_stats 仍正常而 load 必然失败，
+        # 此前状态显示健康、所有数据面端点却 503（用户只能得到通用「暂时
+        # 不可用」）。这里做一次加载探测（已加载时是 no-op；2.x 无该调用
+        # 时跳过，保持旧行为）。
+        loader = getattr(client, "load_collection", None)
+        if callable(loader):
+            try:
+                loader(collection)
+            except Exception as exc:  # noqa: BLE001 - 加载失败即不可用
+                logger.warning("知识库集合加载失败：%s", type(exc).__name__)
+                return {
+                    **base,
+                    "available": False,
+                    "reason": (
+                        "集合无法加载（索引损坏或版本不兼容），"
+                        "请重新运行初始化脚本"
+                    ),
+                }
         stats = client.get_collection_stats(collection)
         dimension = _collection_dimension(client, collection)
         payload = {
