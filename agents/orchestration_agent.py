@@ -425,7 +425,19 @@ class OrchestrationAgent(AgentBase):
 
         # 行程规划必须在事项收集 / 偏好抽取之后一批执行，否则拿不到本轮结果
         def _canonical(task: dict[str, Any]) -> str:
-            return canonical_agent_name(str(task.get("agent_name") or ""))
+            agent_name = str(task.get("agent_name") or "")
+            # 注册表（LazyAgentRegistry）认识 SKILL.md frontmatter 别名：
+            # 先解析成技能目录名再 canonical，别名与目录名 / 标准名指向同一
+            # 技能时去重与依赖排序才能生效（纯 dict 注册表无此方法）
+            resolver = getattr(self.agent_registry, "resolve_agent_name", None)
+            if callable(resolver):
+                try:
+                    resolved = resolver(agent_name)
+                except Exception:  # noqa: BLE001 - 解析失败按标准名处理
+                    resolved = None
+                if resolved:
+                    agent_name = resolved
+            return canonical_agent_name(agent_name)
 
         # 同一智能体可能以「技能目录名 + 标准名」或重复条目出现：注册表同时
         # 接受两种写法，不去重会被并行执行多次（重复调用 LLM、偏好重复落库、
@@ -951,6 +963,11 @@ class OrchestrationAgent(AgentBase):
             role="user"
         )
 
+        # 懒加载失败（缺依赖 / 模型文件损坏 / 嵌入模型离线下载失败）属于
+        # 单个技能不可用，不是 LLM 服务故障：下面的可重试上抛分支只对
+        # 「技能已加载、调用阶段失败」生效，避免把注册器错误计入全局熔断
+        agent_loaded = False
+
         try:
             # 懒加载失败（缺依赖 / 模型文件损坏）也必须落在下面的 except 里，
             # 否则错误会绕过 per-agent 处理让整轮对话 500、进度停在执行中。
@@ -958,11 +975,13 @@ class OrchestrationAgent(AgentBase):
             # 避免卡住事件循环（SSE 心跳与其它会话）；加载与调用一起受超时
             # 约束，卡在导入 / 模型加载上也不会无限占用整轮与该用户的会话锁
             async def _load_and_reply() -> Any:
+                nonlocal agent_loaded
                 agent = await asyncio.get_running_loop().run_in_executor(
                     _load_executor_for(lookup_name),
                     self.agent_registry.__getitem__,
                     lookup_name,
                 )
+                agent_loaded = True
 
                 async def _reply_once() -> Any:
                     # 调用智能体：瞬时 LLM / 网络错误重试一次。技能智能体
@@ -1034,7 +1053,9 @@ class OrchestrationAgent(AgentBase):
             # 随助手消息落库 / 导出：本机缓存路径与上游 URL 必须遮蔽；
             # 日志同样只记脱敏文本并压成单行（text 模式下可伪造日志行）
             safe_error = redact_paths(e)
-            if is_retriable_error(e) or is_permanent_llm_error(e):
+            if agent_loaded and (
+                is_retriable_error(e) or is_permanent_llm_error(e)
+            ):
                 # 子智能体的 LLM 调用失败（重试耗尽后的 429/5xx、401/402 等）
                 # 不能吞成 status=error：外层会把整轮记为成功，熔断器只看
                 # 意图调用时永远打不开。上抛交由 conversation / CLI 的

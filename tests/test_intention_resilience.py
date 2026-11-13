@@ -479,6 +479,102 @@ def test_permanent_classification_excludes_request_level_4xx():
     print("✓ 熔断永久故障分类排除请求级 4xx")
 
 
+class _FullTemplateEchoModel:
+    """完整回显 prompt 输出模板（合法 JSON）。"""
+
+    async def __call__(self, messages):
+        return json.dumps(
+            {
+                "reasoning": "这里是详细的推理过程",
+                "intents": [{"type": "意图类型", "confidence": 0.95}],
+                "key_entities": {
+                    "origin": "出发地（如果有）",
+                    "destination": "目的地（如果有）",
+                    "date": "日期（如果有）",
+                    "duration": "时长（如果有）",
+                    "other": "其他关键信息",
+                },
+                "rewritten_query": "标准化、补全后的查询内容",
+                "agent_schedule": [
+                    {
+                        "agent_name": "子智能体名称",
+                        "priority": 1,
+                        "reason": "调用该智能体的原因和依据",
+                        "expected_output": "期望该智能体提供什么输出",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+
+def test_template_echo_does_not_schedule_placeholder_agent():
+    """模板回显的占位调度 / 占位实体不能当成真实决策与行程字段。"""
+    agent = IntentionAgent(name="IntentionAgent", model=_FullTemplateEchoModel())
+    data = json.loads(asyncio.run(agent.reply([_user_msg()])).content)
+    assert data["agent_schedule"] == [], data["agent_schedule"]
+    assert data["key_entities"] == {}, data["key_entities"]
+    print("✓ 模板回显的占位调度与占位实体被清理")
+
+
+class _MixedScheduleModel:
+    """占位条目 + 大小写变体条目 + 中文日期实体。"""
+
+    async def __call__(self, messages):
+        return json.dumps(
+            {
+                "reasoning": "x",
+                "intents": [],
+                "key_entities": {
+                    "destination": "杭州",
+                    "date": "2026年3月11日",
+                    "origin": "出发地（如果有）",
+                },
+                "rewritten_query": "去杭州",
+                "agent_schedule": [
+                    {"agent_name": "子智能体名称", "priority": 1},
+                    {"agent_name": "Itinerary_Planning", "priority": 2},
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+
+def test_placeholder_entries_dropped_and_date_normalized():
+    agent = IntentionAgent(name="IntentionAgent", model=_MixedScheduleModel())
+    data = json.loads(asyncio.run(agent.reply([_user_msg()])).content)
+    assert [task["agent_name"] for task in data["agent_schedule"]] == [
+        "Itinerary_Planning"
+    ], data["agent_schedule"]
+    assert data["key_entities"] == {
+        "destination": "杭州",
+        "date": "2026-03-11",
+    }, data["key_entities"]
+    print("✓ 未知占位调度被丢弃、日期归一为 ISO")
+
+
+class _TrailingTemplateExampleModel:
+    """真实结果后追加说明示例（示例使用模板占位名）。"""
+
+    async def __call__(self, messages):
+        return (
+            '结果：{"reasoning": "规划", "intents": [], "key_entities": {}, '
+            '"rewritten_query": "去北京", "agent_schedule": '
+            '[{"agent_name": "itinerary_planning", "priority": 1}]}\n'
+            '说明：若只查天气我会输出 {"agent_schedule": '
+            '[{"agent_name": "子智能体名称", "priority": 1}]}'
+        )
+
+
+def test_trailing_template_example_does_not_override_real_result():
+    agent = IntentionAgent(
+        name="IntentionAgent", model=_TrailingTemplateExampleModel()
+    )
+    data = json.loads(asyncio.run(agent.reply([_user_msg()])).content)
+    assert data["agent_schedule"][0]["agent_name"] == "itinerary_planning"
+    print("✓ 尾随模板示例不覆盖真实决策")
+
+
 if __name__ == "__main__":
     test_retriable_error_is_raised()
     test_permanent_llm_error_is_raised()
@@ -502,4 +598,7 @@ if __name__ == "__main__":
     test_long_history_content_is_truncated_in_prompt()
     test_missing_agent_schedule_falls_back()
     test_repaired_json_with_non_list_schedule_falls_back()
+    test_template_echo_does_not_schedule_placeholder_agent()
+    test_placeholder_entries_dropped_and_date_normalized()
+    test_trailing_template_example_does_not_override_real_result()
     print("\n全部通过")

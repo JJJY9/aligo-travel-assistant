@@ -46,8 +46,8 @@ def _strip_frontmatter(content: str) -> str:
 
 class SkillLoader:
     """加载 .claude/skills 下的技能描述"""
-    
-    def __init__(self, skills_dir: str | None = None):
+
+    def __init__(self, skills_dir: str | None = None, dispatchable_only: bool = False):
         # 默认按源码 / 环境变量 / wheel 安装位置解析；显式传入时以传入为准
         if skills_dir:
             current_file_path = os.path.abspath(__file__)
@@ -55,6 +55,9 @@ class SkillLoader:
             self.skills_dir = os.path.join(project_root, skills_dir)
         else:
             self.skills_dir = str(resolve_skills_root())
+        # 只列出可被 LazyAgentRegistry 真正调度的技能（含 script/agent.py）：
+        # 意图 prompt 若宣传纯文档技能，模型调度时会永远「未注册」
+        self.dispatchable_only = dispatchable_only
         self.skills: dict[str, dict] = {}
         
     def load_skills(self) -> dict[str, dict]:
@@ -76,6 +79,10 @@ class SkillLoader:
         for skill_name in entries:
             skill_path = os.path.join(self.skills_dir, skill_name)
             if os.path.isdir(skill_path):
+                if self.dispatchable_only and not os.path.exists(
+                    os.path.join(skill_path, "script", "agent.py")
+                ):
+                    continue
                 md_file = os.path.join(skill_path, "SKILL.md")
                 if not os.path.exists(md_file):
                     print(f"Warning: missing SKILL.md in {skill_path}, skipped.")

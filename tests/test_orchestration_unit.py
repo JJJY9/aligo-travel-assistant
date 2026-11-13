@@ -1781,6 +1781,37 @@ def test_duplicate_schedule_agents_deduped():
     print("✓ 调度计划按 canonical 名去重")
 
 
+class _AliasAwareRegistry(dict):
+    """模拟 LazyAgentRegistry：frontmatter 别名解析到技能目录名。"""
+
+    def resolve_agent_name(self, agent_name):
+        if str(agent_name).casefold() in {"旅行助手", "travel-helper"}:
+            return "travel-helper"
+        return None
+
+    def __contains__(self, key):
+        resolved = self.resolve_agent_name(key)
+        return dict.__contains__(self, resolved or key)
+
+    def __getitem__(self, key):
+        resolved = self.resolve_agent_name(key)
+        return dict.__getitem__(self, resolved or key)
+
+
+def test_frontmatter_alias_dedupes_with_directory_name():
+    """frontmatter 别名与目录名指向同一技能时只执行一次。"""
+    agent = _StubAgent("travel-helper", {"itinerary": {"title": "x"}})
+    registry = _AliasAwareRegistry({"travel-helper": agent})
+    orchestrator = OrchestrationAgent(agent_registry=registry)
+    schedule = [
+        {"agent_name": "旅行助手", "priority": 1},
+        {"agent_name": "travel-helper", "priority": 1},
+    ]
+    asyncio.run(orchestrator.reply(_intent(schedule)))
+    assert agent.calls == 1, f"别名与目录名应去重，实际 {agent.calls} 次"
+    print("✓ frontmatter 别名与目录名去重")
+
+
 def test_failed_preference_not_merged_into_later_context():
     """status=error 的偏好结果不能进入后续批次上下文（与落库守卫一致）。"""
     captured: dict = {}
@@ -3066,6 +3097,7 @@ if __name__ == "__main__":
     test_previous_preference_append_flattens_list()
     test_schedule_names_are_trimmed()
     test_duplicate_schedule_agents_deduped()
+    test_frontmatter_alias_dedupes_with_directory_name()
     test_failed_preference_not_merged_into_later_context()
     test_preference_non_string_type_skipped()
     test_context_merge_skips_non_string_pref_type()

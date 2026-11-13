@@ -15,11 +15,14 @@
 """
 import json
 import logging
+import re
+from datetime import date
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.access_log import _safe_log_text
+from utils.agent_names import SKILL_AGENT_NAMES, canonical_agent_name
 from utils.json_parser import (
     extract_json_from_async_response,
     has_unclosed_json_object,
@@ -35,6 +38,50 @@ logger = logging.getLogger(__name__)
 # 意图 prompt 的输入上限：CLI 等入口可以传任意长度，超长输入会触发模型
 # 上下文错误并降级为携带原文的信息查询，污染后续总结
 _MAX_QUERY_CHARS = 4000
+
+# key_entities 输出模板里的占位说明：模型完整回显模板时会把这些字符串
+# 当真实实体返回，编排层会据此写入「出发地（如果有）」之类的行程
+_ENTITY_PLACEHOLDER_MARKERS = ("（如果有）", "(如果有)", "其他关键信息")
+_DATE_TEXT_RE = re.compile(r"^(\d{4})[年/.](\d{1,2})[月/.](\d{1,2})日?$")
+
+
+def _normalize_date_text(text: str) -> str | None:
+    """key_entities.date 的中文 / 斜杠写法归一成 ISO；非法日历日返回 None。"""
+    match = _DATE_TEXT_RE.fullmatch(text)
+    if not match:
+        return text
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _clean_key_entities(raw) -> dict:
+    """丢弃模板占位值、归一日期：key_entities 会被编排层直接落库成行程。"""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if not text or any(
+                marker in text for marker in _ENTITY_PLACEHOLDER_MARKERS
+            ):
+                continue
+            if key.strip() == "date":
+                normalized = _normalize_date_text(text)
+                if normalized is None:
+                    continue
+                text = normalized
+            cleaned[key.strip()] = text
+        else:
+            cleaned[key.strip()] = value
+    return cleaned
 
 
 class _ProviderError(RuntimeError):
@@ -102,7 +149,60 @@ class IntentionAgent(AgentBase):
         self.name = name
         self.model = model
         self.conversation_history: list[str] = []
-        self.skill_loader = SkillLoader()
+        # 只宣传可被 LazyAgentRegistry 真正调度的技能：纯文档技能展示给
+        # 模型后会永远「未注册」，整轮调度失败
+        self.skill_loader = SkillLoader(dispatchable_only=True)
+        # 技能目录名 → 旧标准名（意图 prompt 展示后者，下游按标准名处理）
+        self._skill_mapping = {
+            "memory-query": "memory_query",
+            "plan-trip": "itinerary_planning",
+            "preference": "preference",
+            "query-info": "information_query",
+            "ask-question": "rag_knowledge",
+            "event-collection": "event_collection",
+        }
+        # 可调度的智能体名（目录名 / 标准名 / frontmatter 名，大小写不敏感）：
+        # 模型回显 prompt 模板时条目名是占位说明，不能被当成真实决策
+        skill_names = list(self.skill_loader.load_skills())
+        self._valid_agent_names = {
+            str(skill_name).strip().casefold()
+            for skill_name in (
+                *self._skill_mapping,
+                *self._skill_mapping.values(),
+                *SKILL_AGENT_NAMES,
+                *SKILL_AGENT_NAMES.values(),
+                *skill_names,
+                "preference",
+            )
+            if str(skill_name).strip()
+        }
+
+    def _valid_schedule(self, schedule: list) -> list[dict]:
+        """过滤占位 / 未知智能体名的调度条目（大小写与旧名变体均接受）。"""
+        valid: list[dict] = []
+        for entry in schedule:
+            if not isinstance(entry, dict):
+                continue
+            agent_name = str(entry.get("agent_name") or "").strip()
+            if not agent_name:
+                continue
+            if (
+                agent_name.casefold() not in self._valid_agent_names
+                and canonical_agent_name(agent_name).casefold()
+                not in self._valid_agent_names
+            ):
+                logger.warning(
+                    "忽略未知智能体名的调度条目：%r", agent_name[:40]
+                )
+                continue
+            valid.append(entry)
+        return valid
+
+    def _schedule_has_known_agent(self, result: dict) -> bool:
+        schedule = result.get("agent_schedule")
+        if not isinstance(schedule, list):
+            return False
+        return bool(self._valid_schedule(schedule))
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         """
@@ -167,15 +267,8 @@ class IntentionAgent(AgentBase):
         weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][datetime.now().weekday()]
 
         # 动态获取 Skills 描述
-        skill_mapping = {
-            "memory-query": "memory_query",
-            "plan-trip": "itinerary_planning", 
-            "preference": "preference",
-            "query-info": "information_query",
-            "ask-question": "rag_knowledge",
-            "event-collection": "event_collection"
-        }
-        
+        skill_mapping = self._skill_mapping
+
         dynamic_skills_prompt = self.skill_loader.get_skill_prompt(skill_mapping)
         
         # 构建意图识别Prompt
@@ -244,11 +337,11 @@ class IntentionAgent(AgentBase):
     ],
 
     "key_entities": {{
-        "origin": "出发地（如果有）",
-        "destination": "目的地（如果有）",
-        "date": "日期（如果有）",
-        "duration": "时长（如果有）",
-        "other": "其他关键信息"
+        "origin": null,
+        "destination": null,
+        "date": null,
+        "duration": null,
+        "other": null
     }},
 
     "rewritten_query": "标准化、补全后的查询内容",
@@ -262,6 +355,10 @@ class IntentionAgent(AgentBase):
         }}
     ]
 }}
+
+【字段要求】
+- key_entities 中没有的字段必须填 null（不要填「出发地（如果有）」之类的说明文字）；date 必须是 YYYY-MM-DD 格式（根据当前时间把「明天」等相对时间换算成完整日期）。
+- agent_schedule 的 agent_name 必须是上方「可调度的子智能体」列表中的名称（或其后括号外的标准名）；不要原样输出模板占位值，否则该条目会被丢弃。
 
 【重要提示 - 优先级设置规则】
 优先级数字相同的智能体会**并行执行**，不同优先级按顺序批次执行。
@@ -351,10 +448,21 @@ class IntentionAgent(AgentBase):
                 result = None
                 selected_end = -1
                 truncated = False
+                fallback_result = None
+                fallback_end = -1
                 for candidate, end in iter_json_objects_with_repair(text):
                     if "agent_schedule" in candidate:
-                        result = candidate
-                        selected_end = end
+                        if self._schedule_has_known_agent(candidate):
+                            # 优先最后一个带已知智能体名的完整结果：模型
+                            # 尾随说明里的示例对象（占位名称）不会顶掉真实决策
+                            result = candidate
+                            selected_end = end
+                        elif fallback_result is None:
+                            fallback_result = candidate
+                            fallback_end = end
+                if result is None and fallback_result is not None:
+                    result = fallback_result
+                    selected_end = fallback_end
                 if result is not None and has_unclosed_json_object(
                     text[selected_end:]
                 ):
@@ -404,6 +512,14 @@ class IntentionAgent(AgentBase):
         if not isinstance(result.get("agent_schedule"), list):
             logger.error("意图识别结果 agent_schedule 不是列表，降级为默认调度")
             result = _default_intent_result(user_query, "agent_schedule 类型非法")
+
+        # 过滤占位 / 未知智能体名的调度条目：模型完整回显 prompt 模板（本身是
+        # 合法 JSON）时，占位条目此前会被当作真实决策交给编排层执行；
+        # key_entities 会被编排层直接落库成行程，同样清理模板占位值与非法日期
+        result["agent_schedule"] = self._valid_schedule(
+            result.get("agent_schedule") or []
+        )
+        result["key_entities"] = _clean_key_entities(result.get("key_entities"))
 
         # 将结果转换为JSON字符串，因为Msg的content必须是字符串
         return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")

@@ -404,9 +404,9 @@ class AligoCLI:
                         base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
                         max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
                     )
-                    if self.circuit_breaker:
-                        self.circuit_breaker.record_success()
-                        probe_recorded = True
+                    # 意图调用成功不记 record_success：每轮都清零连续失败计数
+                    # 会让子智能体的 429/5xx 永远凑不满熔断阈值（与 Web 的
+                    # ConversationRuntime 一致，成功统一由编排调用记账）
                 except CircuitOpenError:
                     raise
                 except MemoryPersistenceError:

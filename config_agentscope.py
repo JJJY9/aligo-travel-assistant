@@ -86,7 +86,12 @@ class UsageTrackingModel:
         return response
 
     def __getattr__(self, item):
-        # 仅在常规属性查找失败时触发；透明代理底层模型属性
+        # 仅在常规属性查找失败时触发；透明代理底层模型属性。
+        # _model 尚未设置（copy / deepcopy / pickle 在 __init__ 之前探测
+        # 属性）时必须直接抛 AttributeError，否则 self._model 再次进入
+        # __getattr__ 无限递归（RecursionError）
+        if item == "_model":
+            raise AttributeError(item)
         return getattr(self._model, item)
 
 
