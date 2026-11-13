@@ -4,7 +4,7 @@
 与记忆面板同口径：出行天数含首尾两天；到访城市按目的地去重；进行中 /
 即将出行以自然日判断。日期缺失或非法的行程只计入总行程数（城市与常去目的地同口径）。
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 
@@ -44,7 +44,11 @@ def summarize_travel(
     if intervals:
         span_start, span_end = intervals[0]
         for day_start, day_end in intervals[1:]:
-            if day_start <= span_end + timedelta(days=1):
+            # 用序数比较而不是 span_end + timedelta(days=1)：终点是
+            # date.max（9999-12-31，模型常用的「长期 / 未定」占位）时
+            # 加一天会 OverflowError，/api/status 与 CLI stats 对该用户
+            # 永久 500（trips 接口本身接受该日期）
+            if day_start.toordinal() <= span_end.toordinal() + 1:
                 if day_end > span_end:
                     span_end = day_end
                 continue

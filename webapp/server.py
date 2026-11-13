@@ -4871,7 +4871,10 @@ def create_app(model: Any = None) -> FastAPI:
                     "start_date": payload.start_date,
                     "end_date": payload.end_date,
                     "purpose": payload.purpose.strip() or "出差",
-                }
+                },
+                # 上限在存储写锁内复核：上面的长度预检挡不住并发创建，
+                # 越限后 /api/export 会因条数上限永久 413
+                max_total=MAX_TRIP_ENTRIES,
             )
             trips = store.get_trip_history(limit=None)
             created = len(trips) > before
@@ -4896,17 +4899,23 @@ def create_app(model: Any = None) -> FastAPI:
             )
         except HTTPException:
             raise
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
             logger.warning("添加行程失败: %s", exc)
             raise _storage_failure("添加行程失败", exc) from exc
         finally:
             _close_long_term(store)
-        return {
-            "trip_id": trip_id,
-            "saved": True,
-            "created": created,
-            "conflicts": conflicts,
-        }
+        # 历史行程字段可能是备份恢复带入的脏数据（孤立代理项等）：
+        # 不做 safe 转换会让 pydantic 序列化在写入生效后 500
+        return _json_safe_value(
+            {
+                "trip_id": trip_id,
+                "saved": True,
+                "created": created,
+                "conflicts": conflicts,
+            }
+        )
 
     @app.post("/api/trips/import")
     def import_trips_endpoint(
@@ -5065,12 +5074,14 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("更新行程失败", exc) from exc
         finally:
             _close_long_term(store)
-        return {
-            "trip_id": trip_id,
-            "saved": True,
-            "trip": saved,
-            "conflicts": conflicts,
-        }
+        return _json_safe_value(
+            {
+                "trip_id": trip_id,
+                "saved": True,
+                "trip": saved,
+                "conflicts": conflicts,
+            }
+        )
 
     @app.get("/api/trips/calendar", dependencies=[Depends(_cross_site_side_effect)])
     @_export_guard

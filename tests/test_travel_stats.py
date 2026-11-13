@@ -70,9 +70,30 @@ def test_summarize_empty_and_invalid():
     print("✓ 空列表 / 非法日期")
 
 
+def test_summarize_tolerates_date_max_end():
+    """终点为 9999-12-31 的行程不能使统计 OverflowError（面板 / CLI 永久 500）。"""
+    long_trip = {
+        "destination": "上海",
+        "start_date": "2020-01-01",
+        "end_date": "9999-12-31",
+    }
+    trips = [
+        long_trip,
+        {"destination": "杭州", "start_date": "2026-03-01", "end_date": "2026-03-05"},
+    ]
+    summary = summarize_travel(trips, today=date(2026, 11, 6))
+    assert summary["total_trips"] == 2
+    assert summary["total_days"] == (date.max - date(2020, 1, 1)).days + 1
+
+    single = summarize_travel([long_trip], today=date(2026, 11, 6))
+    assert single["total_days"] == (date.max - date(2020, 1, 1)).days + 1
+    print("✓ date.max 终点的区间合并不再溢出")
+
+
 if __name__ == "__main__":
     test_summarize_mixed_trips()
     test_summarize_active_and_past()
     test_summarize_overlapping_days_counted_once()
     test_summarize_empty_and_invalid()
+    test_summarize_tolerates_date_max_end()
     print("\n全部通过")
