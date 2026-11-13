@@ -337,7 +337,7 @@ def test_pref_write_validation_and_failures(monkeypatch):
         ),
         (
             cli.run_preference_set_standalone,
-            ("u1", "bad type", "上海"),
+            ("u1", "bad/type", "上海"),
             "偏好类型",
         ),
         (
@@ -352,7 +352,7 @@ def test_pref_write_validation_and_failures(monkeypatch):
         ),
         (
             cli.run_preference_delete_standalone,
-            ("u1", "bad type"),
+            ("u1", "bad/type"),
             "偏好类型",
         ),
     ]
@@ -616,6 +616,46 @@ def test_pref_set_rejects_new_type_over_limit(monkeypatch):
     assert store.saved == [("home_location", "上海")]
     print("✓ pref-set 偏好类型超限时拒绝新增")
 
+def test_pref_values_strip_controls_and_collapse_newlines(monkeypatch):
+    """偏好值里的 OSC 序列 / 换行不能执行剪贴板写入或伪造列表行。"""
+    store = _WriteStore(
+        {"seat_pref": "靠窗\x1b]52;c;AAAA\x07\n  [置顶] fake  999 条"}
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preferences_list_standalone("u1")
+    text = out.getvalue()
+    assert code == 0, text
+    assert "\x1b" not in text and "\x07" not in text, text
+    assert "\n  [置顶] fake" not in text, text
+    assert "靠窗" in text
+    print("✓ 偏好值剥离控制序列并折叠换行")
+
+def test_pref_type_allows_web_charset(monkeypatch):
+    """与 Web 同一字符集：含空格 / 点号的类型可更新删除，斜杠与控制字符仍拒绝。"""
+    store = _WriteStore({"hotel brand": "汉庭"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "hotel brand", "如家")
+    assert code == 0 and store.saved == [("hotel brand", "如家")]
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_delete_standalone("u1", "hotel brand")
+    assert code == 0 and store.deleted == ["hotel brand"]
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "bad/type", "x")
+    assert code == 1 and "偏好类型" in out.getvalue()
+    print("✓ 偏好类型字符集与 Web 对齐（空格 / 点号可用，斜杠拒绝）")
+
 if __name__ == "__main__":
     for case in (
         test_preferences_list_output,
@@ -636,6 +676,8 @@ if __name__ == "__main__":
         test_pref_write_dispatch,
         test_pref_set_rejects_oversized_value,
         test_pref_set_rejects_new_type_over_limit,
+        test_pref_values_strip_controls_and_collapse_newlines,
+        test_pref_type_allows_web_charset,
     ):
         mp = pytest.MonkeyPatch()
         try:

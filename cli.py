@@ -72,6 +72,15 @@ def _terminal_safe(value: object) -> str:
     return escape(text) if escape is not None else text
 
 
+def _single_line_safe(value: object) -> str:
+    """单行终端输出：剥离终端控制序列并把换行 / 制表符折叠为空格。
+
+    ``strip_terminal_controls`` 有意保留换行与制表符（导出正文需要）；
+    列表行、标题回显与偏好值必须单行，否则存储内容可以用换行伪造列表行。
+    """
+    return " ".join(strip_terminal_controls(str(value)).split())
+
+
 def _valid_web_id(value: object) -> bool:
     """与 Web 端点同一字符集（Rust ``\\w`` 语义）的 ID 校验。
 
@@ -95,6 +104,28 @@ def _valid_session_id(value: object) -> bool:
     if not isinstance(value, str) or not value or value.startswith("-"):
         return False
     return is_valid_web_session_id(value)
+
+
+def _valid_pref_type(value: object) -> bool:
+    """与 Web PUT /api/preferences/{type} 同一字符集。
+
+    Web 只排除控制字符、行 / 段分隔符与斜杠（允许空格、点号、中文，
+    可由模型或面板自定义）；CLI 此前只允许单词字符与短横线，Web / 模型
+    写入的“hotel brand”这类类型既不能更新也不能删除。
+    """
+    text = str(value or "")
+    if not text or len(text) > 64:
+        return False
+    for char in text:
+        code = ord(char)
+        if (
+            char == "/"
+            or code < 0x20
+            or 0x7F <= code <= 0x9F
+            or code in (0x2028, 0x2029)
+        ):
+            return False
+    return True
 
 
 if Console is not None:
@@ -1241,11 +1272,11 @@ class AligoCLI:
             # Table 单元格不经过 Console.print 的字符串清洗：存储内容里的
             # ESC 序列（OSC 52 / OSC 8）必须在这里剥掉
             table.add_row(
-                _terminal_safe(trip.get("trip_id", "")),
-                _terminal_safe(trip.get("origin", "")),
-                _terminal_safe(trip.get("destination", "")),
-                _terminal_safe(trip.get("start_date", "")),
-                _terminal_safe(trip.get("purpose", "")),
+                _single_line_safe(trip.get("trip_id", "")),
+                _single_line_safe(trip.get("origin", "")),
+                _single_line_safe(trip.get("destination", "")),
+                _single_line_safe(trip.get("start_date", "")),
+                _single_line_safe(trip.get("purpose", "")),
             )
 
         self.console.print(table)
@@ -1264,8 +1295,8 @@ class AligoCLI:
             # 整行藏掉，与 standalone preferences 和 Web 面板不一致
             if has_preference_value(value):
                 table.add_row(
-                    _terminal_safe(key),
-                    _terminal_safe(self._format_result_value(value)),
+                    _single_line_safe(key),
+                    _single_line_safe(self._format_result_value(value)),
                 )
 
         self.console.print(table)
@@ -3637,6 +3668,13 @@ def run_sessions_list_standalone(
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
+        quarantined = _recovered_corrupt_backup(store)
+        if quarantined:
+            return _cli_fail(
+                f"记忆文件损坏，已隔离备份到 {quarantined}"
+                "（当前会按空快照处理，请先用备份文件恢复）",
+                as_json,
+            )
         try:
             summaries = _session_summaries(store)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -3730,13 +3768,13 @@ def run_sessions_list_standalone(
         updated = _local_timestamp_text(item["updated_at"]) or "—"
         # 标题 / 命中片段来自 Web 或 LLM 写入的内容：ESC / OSC 序列不能
         # 直达终端（OSC 8 伪造链接、OSC 52 覆盖剪贴板）
-        title = _terminal_safe(item["title"][:30])
+        title = _single_line_safe(item["title"])[:30]
         print(
             f"  [{status}] {item['session_id']:<16} {title:<32}"
             f" {item['messages']:>3} 条  {updated}"
         )
         if item.get("_snippet"):
-            print(f"       > {_terminal_safe(item['_snippet'])}")
+            print(f"       > {_single_line_safe(item['_snippet'])}")
     return 0
 
 
@@ -3982,7 +4020,7 @@ def run_session_title_standalone(
         )
         return 0
     if saved:
-        print(f"已设置会话 {session_id} 标题：{_terminal_safe(saved)}")
+        print(f"已设置会话 {session_id} 标题：{_single_line_safe(saved)}")
     else:
         print(f"已恢复会话 {session_id} 的自动标题")
     return 0
@@ -4138,7 +4176,7 @@ def run_session_show_standalone(
             )
         )
         return 0
-    label = _terminal_safe(title or "（自动标题）")
+    label = _single_line_safe(title or "（自动标题）")
     flags = [
         part
         for part in (("置顶" if pinned else ""), ("已归档" if archived else ""))
@@ -4154,7 +4192,7 @@ def run_session_show_standalone(
         content = " ".join(render_stored_message(message).split())
         preview = content[:80] + ("…" if len(content) > 80 else "")
         # 助手消息来自 LLM / 第三方内容：预览同样剥终端控制序列
-        print(f"  [{time_text}] {role}: {_terminal_safe(preview)}")
+        print(f"  [{time_text}] {role}: {_single_line_safe(preview)}")
     return 0
 
 
@@ -4458,6 +4496,13 @@ def run_trips_export_standalone(
         print(f"打开长期记忆失败：{exc}")
         return 1
     try:
+        quarantined = _recovered_corrupt_backup(store)
+        if quarantined:
+            print(
+                f"导出中止：记忆文件损坏，已隔离备份到 {quarantined}"
+                "（当前会导出空文件，请先用备份文件恢复）"
+            )
+            return 1
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -4624,6 +4669,13 @@ def run_trip_calendar_standalone(
         print(f"打开长期记忆失败：{exc}")
         return 1
     try:
+        quarantined = _recovered_corrupt_backup(store)
+        if quarantined:
+            print(
+                f"导出中止：记忆文件损坏，已隔离备份到 {quarantined}"
+                "（当前会导出空文件，请先用备份文件恢复）"
+            )
+            return 1
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -4914,7 +4966,7 @@ def run_trip_add_standalone(
     )
     print(
         f"{'已添加' if created else '已更新'}行程 #{trip_id}"
-        f"（{_terminal_safe(origin) or '—'} → {_terminal_safe(destination)}，{dates}）"
+        f"（{_single_line_safe(origin) or '—'} → {_single_line_safe(destination)}，{dates}）"
     )
     if conflicts:
         ids = "、".join(f"#{str(item.get('trip_id') or '')}" for item in conflicts)
@@ -5009,7 +5061,7 @@ def run_trip_delete_standalone(
         return 0
     print(
         f"已删除行程 #{trip_id}"
-        f"（{_terminal_safe(origin)} → {_terminal_safe(destination)}，{dates}）"
+        f"（{_single_line_safe(origin)} → {_single_line_safe(destination)}，{dates}）"
     )
     return 0
 
@@ -5232,7 +5284,7 @@ def run_trip_update_standalone(
         return 0
     print(
         f"已更新行程 #{trip_id}"
-        f"（{_terminal_safe(origin) or '—'} → {_terminal_safe(destination) or '—'}，{dates}）"
+        f"（{_single_line_safe(origin) or '—'} → {_single_line_safe(destination) or '—'}，{dates}）"
     )
     if conflicts:
         ids = "、".join(f"#{str(item.get('trip_id') or '')}" for item in conflicts)
@@ -5487,6 +5539,13 @@ def run_trips_list_standalone(
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
+        quarantined = _recovered_corrupt_backup(store)
+        if quarantined:
+            return _cli_fail(
+                f"记忆文件损坏，已隔离备份到 {quarantined}"
+                "（当前会按空快照处理，请先用备份文件恢复）",
+                as_json,
+            )
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -5587,12 +5646,12 @@ def run_trips_list_standalone(
         header = f"用户 {user_id}：共 {len(views)} 条行程（新→旧）"
     print(header)
     for trip in reversed(views):
-        start = _terminal_safe(trip.get("start_date") or "日期未记录")
-        end = _terminal_safe(trip.get("end_date") or "")
+        start = _single_line_safe(trip.get("start_date") or "日期未记录")
+        end = _single_line_safe(trip.get("end_date") or "")
         dates = f"{start} ~ {end}" if end and end != start else str(start)
         route = (
-            f"{_terminal_safe(trip.get('origin') or '—')} → "
-            f"{_terminal_safe(trip.get('destination') or '—')}"
+            f"{_single_line_safe(trip.get('origin') or '—')} → "
+            f"{_single_line_safe(trip.get('destination') or '—')}"
         )
         marks = []
         state = trip_state_label(trip)
@@ -5603,13 +5662,13 @@ def run_trips_list_standalone(
         if conflict_total:
             shown = conflicts[:3]
             routes = "、".join(
-                f"{_terminal_safe(item.get('origin') or '—')} → "
-                f"{_terminal_safe(item.get('destination') or '—')}"
+                f"{_single_line_safe(item.get('origin') or '—')} → "
+                f"{_single_line_safe(item.get('destination') or '—')}"
                 for item in shown
             )
             more = "等" if conflict_total > len(shown) else ""
             marks.append(f"⚠ 与 {conflict_total} 条行程日期重叠（{routes}{more}）")
-        purpose = _terminal_safe(trip.get("purpose") or "出行")
+        purpose = _single_line_safe(trip.get("purpose") or "出行")
         line = f"  {dates}  {route}  {' '.join(marks)}".rstrip()
         print(f"{line}  {purpose}")
     return 0
@@ -5636,6 +5695,13 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _cli_fail(f"打开长期记忆失败：{exc}", as_json)
     try:
+        quarantined = _recovered_corrupt_backup(store)
+        if quarantined:
+            return _cli_fail(
+                f"记忆文件损坏，已隔离备份到 {quarantined}"
+                "（当前会按空快照处理，请先用备份文件恢复）",
+                as_json,
+            )
         try:
             preferences = store.get_preference()
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -5712,7 +5778,10 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
             text = "是" if value else "否"
         else:
             text = str(value)
-        print(f"  {preference_label(pref_type)}：{text}")
+        print(
+            f"  {_single_line_safe(preference_label(pref_type))}："
+            f"{_single_line_safe(text)}"
+        )
     return 0
 
 
@@ -5756,7 +5825,6 @@ def run_preference_set_standalone(
     Returns:
         0 保存成功；1 参数 / 读写失败
     """
-    import re
 
     from utils.result_formatter import preference_label
 
@@ -5775,8 +5843,8 @@ def run_preference_set_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
-        return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
+    if not _valid_pref_type(pref_type) or pref_type.startswith("-"):
+        return _fail("偏好类型不能包含控制字符或斜杠（最多 64 字符）")
     saved_value: Any = value.strip()
     if not has_preference_value(saved_value):
         return _fail("偏好值不能为空（清空请使用 pref-delete）")
@@ -5859,7 +5927,10 @@ def run_preference_set_standalone(
         display = "—"
     else:
         display = str(saved)
-    print(f"已设置偏好 {preference_label(pref_type)}：{display}")
+    print(
+        f"已设置偏好 {_single_line_safe(preference_label(pref_type))}："
+        f"{_single_line_safe(display)}"
+    )
     return 0
 
 
@@ -5871,7 +5942,6 @@ def run_preference_delete_standalone(
     Returns:
         0 删除成功；1 参数 / 读写失败（含偏好未设置）
     """
-    import re
 
     from utils.result_formatter import preference_label
 
@@ -5890,8 +5960,8 @@ def run_preference_delete_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not re.fullmatch(r"[\w-]{1,64}", pref_type) or pref_type.startswith("-"):
-        return _fail("偏好类型只能包含中文、字母、数字、下划线和短横线")
+    if not _valid_pref_type(pref_type) or pref_type.startswith("-"):
+        return _fail("偏好类型不能包含控制字符或斜杠（最多 64 字符）")
 
     try:
         store = _open_cli_store(user_id)
@@ -6182,7 +6252,10 @@ def _main_impl():
                 else:
                     target = item
             if not valid or target is None:
-                print("用法：python cli.py kb-import <file.json> [--dry-run] [--json]")
+                _cli_fail(
+                    "用法：python cli.py kb-import <file.json> [--dry-run] [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             sys.exit(
                 run_knowledge_import_standalone(
@@ -6202,7 +6275,10 @@ def _main_impl():
                 else:
                     positional.append(item)
             if not valid:
-                print("用法：python cli.py kb-list [关键词] [--json]")
+                _cli_fail(
+                    "用法：python cli.py kb-list [关键词] [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             sys.exit(
                 run_knowledge_list_standalone(
@@ -6212,8 +6288,9 @@ def _main_impl():
         if arg == "kb-search":
             parsed_search = _parse_kb_search_args(sys.argv[2:])
             if parsed_search is None:
-                print(
-                    "用法：python cli.py kb-search <关键词> [--top-k N] [--json]"
+                _cli_fail(
+                    "用法：python cli.py kb-search <关键词> [--top-k N] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             search_query, search_top_k, search_json = parsed_search
@@ -6232,7 +6309,10 @@ def _main_impl():
             ]
             doc_id = _parse_cli_int(ids[0]) if len(ids) == 1 else None
             if doc_id is None or any(item.startswith("-") for item in ids):
-                print("用法：python cli.py kb-show <id> [--json]")
+                _cli_fail(
+                    "用法：python cli.py kb-show <id> [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             sys.exit(run_knowledge_show_standalone(doc_id, as_json=show_json))
         if arg in ("kb-add", "kb-update"):
@@ -6297,9 +6377,9 @@ def _main_impl():
                 seen_limit = True
                 limit = parsed
             if not valid:
-                print(
-                    "用法：python cli.py kb-duplicates [limit] [--json]"
-                    "（0 显示全部，默认 20）"
+                _cli_fail(
+                    "用法：python cli.py kb-duplicates [limit] [--json]（0 显示全部，默认 20）",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6319,9 +6399,9 @@ def _main_impl():
                     valid = False
                     break
             if not valid:
-                print(
-                    "用法：python cli.py kb-dedupe [--dry-run] [--json]"
-                    "（每组保留最小 id）"
+                _cli_fail(
+                    "用法：python cli.py kb-dedupe [--dry-run] [--json]（每组保留最小 id）",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6344,7 +6424,10 @@ def _main_impl():
         if arg == "preferences":
             parsed_pref = _parse_user_and_json_args(sys.argv[2:])
             if parsed_pref is None:
-                print("用法：python cli.py preferences <user_id> [--json]")
+                _cli_fail(
+                    "用法：python cli.py preferences <user_id> [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             pref_user, pref_json = parsed_pref
             sys.exit(
@@ -6370,9 +6453,9 @@ def _main_impl():
                 else:
                     value = item
             if not valid or value is None:
-                print(
-                    "用法：python cli.py pref-set <user_id> <偏好类型> <值> "
-                    "[--json-value] [--json]"
+                _cli_fail(
+                    "用法：python cli.py pref-set <user_id> <偏好类型> <值> [--json-value] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6399,8 +6482,9 @@ def _main_impl():
                 else:
                     other = item
             if not valid or other is None:
-                print(
-                    "用法：python cli.py pref-delete <user_id> <偏好类型> [--json]"
+                _cli_fail(
+                    "用法：python cli.py pref-delete <user_id> <偏好类型> [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6531,11 +6615,17 @@ def _main_impl():
                 "[--archived|--all] [--query 关键词] [--json]"
             )
             if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                print(usage)
+                _cli_fail(
+                    usage,
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             parsed = _parse_sessions_flags(sys.argv[3:])
             if parsed is None:
-                print(usage)
+                _cli_fail(
+                    usage,
+                    _args_have_json(sys.argv[2:]),
+                )
                 sys.exit(2)
             archived_only, include_all, query, sessions_json = parsed
             sys.exit(
@@ -6553,16 +6643,16 @@ def _main_impl():
                 or sys.argv[2].startswith("-")
                 or sys.argv[3].startswith("-")
             ):
-                print(
-                    "用法：python cli.py session-archive <user_id> <session_id> "
-                    "[--restore] [--json]"
+                _cli_fail(
+                    "用法：python cli.py session-archive <user_id> <session_id> [--restore] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             parsed_archive = _parse_archive_flags(sys.argv[4:])
             if parsed_archive is None:
-                print(
-                    "用法：python cli.py session-archive <user_id> <session_id> "
-                    "[--restore] [--json]"
+                _cli_fail(
+                    "用法：python cli.py session-archive <user_id> <session_id> [--restore] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             restore, as_json = parsed_archive
@@ -6588,9 +6678,9 @@ def _main_impl():
                 else:
                     positional.append(item)
             if not valid or len(positional) != 2:
-                print(
-                    "用法：python cli.py session-delete <user_id> <session_id> "
-                    "[--json]"
+                _cli_fail(
+                    "用法：python cli.py session-delete <user_id> <session_id> [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6620,9 +6710,9 @@ def _main_impl():
                 or (reset and len(positional) == 3)
                 or (not reset and len(positional) != 3)
             ):
-                print(
-                    "用法：python cli.py session-title <user_id> <session_id> "
-                    "<标题|--reset> [--json]"
+                _cli_fail(
+                    "用法：python cli.py session-title <user_id> <session_id> <标题|--reset> [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             title = "" if reset else positional[2]
@@ -6648,9 +6738,9 @@ def _main_impl():
                 else:
                     positional.append(item)
             if not valid or len(positional) != 2:
-                print(
-                    "用法：python cli.py session-pin <user_id> <session_id> "
-                    "[--off] [--json]"
+                _cli_fail(
+                    "用法：python cli.py session-pin <user_id> <session_id> [--off] [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(
@@ -6674,8 +6764,9 @@ def _main_impl():
                 else:
                     positional.append(item)
             if not valid or len(positional) != 2:
-                print(
-                    "用法：python cli.py session-show <user_id> <session_id> [--json]"
+                _cli_fail(
+                    "用法：python cli.py session-show <user_id> <session_id> [--json]",
+                    _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
             sys.exit(

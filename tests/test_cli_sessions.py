@@ -1518,6 +1518,29 @@ def test_session_show_allows_device_like_session_id(monkeypatch):
     assert code == 1 and "用户 ID" in out.getvalue()
     print("✓ 会话 ID 允许设备名，用户 ID 仍拒绝")
 
+def test_session_title_newline_cannot_forge_rows(monkeypatch):
+    """标题里的换行不能伪造会话列表 / 详情里的行。"""
+    fake_title = "标题Z\n  [置顶] fake  888 条"
+    store = _FakeStore(
+        [_message("user", "hi", "s-forge")], titles={"s-forge": fake_title}
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for call in (
+        lambda: cli.run_sessions_list_standalone("u1"),
+        lambda: cli.run_session_show_standalone("u1", "s-forge"),
+    ):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = call()
+        text = out.getvalue()
+        assert code == 0, text
+        assert "\n  [置顶] fake" not in text, text
+        assert "\n  [置顶]" not in text, text
+        assert "标题Z" in text
+    print("✓ 会话标题内嵌换行不能伪造列表行")
+
 if __name__ == "__main__":
     test_flag_parsing_helpers()
     test_session_export_flag_parsing()
@@ -1562,6 +1585,7 @@ if __name__ == "__main__":
         test_pg_fallback_refused,
         test_session_views_strip_terminal_controls,
         test_session_show_allows_device_like_session_id,
+        test_session_title_newline_cannot_forge_rows,
     ):
         mp = pytest.MonkeyPatch()
         try:
