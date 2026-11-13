@@ -1909,6 +1909,39 @@ def test_rollback_staged_message_only_removes_matching_tail():
     print("✓ 暂存提问回滚只删匹配的未回答末条")
 
 
+def test_outage_ops_expire_after_tombstone_window(monkeypatch):
+    """排队超过删除保护窗口（墓碑 TTL）的操作在重放时被丢弃，不复活已删会话。"""
+    from context import short_term_memory as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s-age", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    client.fail = True
+    memory.add_message("user", "Q2-queued")
+    client.fail = False
+    # 窗口内重放：正常补写
+    clock[0] += module._PENDING_MAX_AGE_SEC - 60
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [m["content"] for m in memory.get_recent_context()]
+    assert contents == ["Q1", "A1", "Q2-queued"], contents
+
+    # 再次故障入队，超过窗口后重放必须丢弃
+    client.fail = True
+    memory.add_message("user", "Q3-stale")
+    client.fail = False
+    clock[0] += module._PENDING_MAX_AGE_SEC + 1
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [m["content"] for m in memory.get_recent_context()]
+    assert "Q3-stale" not in contents, contents
+    assert memory._pending_ops == [], memory._pending_ops
+    print("✓ 超过墓碑窗口的排队操作被丢弃，不复活已删会话")
+
+
 if __name__ == "__main__":
     test_truncate_pair()
     test_truncate_expect_mismatch_keeps_history()
@@ -1958,6 +1991,11 @@ if __name__ == "__main__":
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_outage_writes_replayed_after_recovery(_mp)
+    finally:
+        _mp.undo()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_outage_ops_expire_after_tombstone_window(_mp)
     finally:
         _mp.undo()
     _mp = __import__("pytest").MonkeyPatch()
