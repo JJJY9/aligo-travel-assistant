@@ -99,6 +99,11 @@ def result_to_markdown(result_data: dict[str, Any]) -> str:
         except Exception:  # noqa: BLE001 - 渲染失败不能让整轮回答 500
             logger.warning("渲染智能体结果失败: %s", agent_name, exc_info=True)
             rendered = _fallback_text(data)
+        if not rendered:
+            # 已知渲染器对无法识别的载荷返回空字符串（非 dict 被包成
+            # {"result": …} / 裸文本被包成 {"output": …}）：不兜底的话
+            # 用户只看到「已处理您的请求。」，数据被静默丢弃
+            rendered = _fallback_text(data)
         if rendered:
             blocks.append(rendered)
 

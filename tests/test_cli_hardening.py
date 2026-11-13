@@ -148,6 +148,21 @@ def test_kb_import_accepts_utf8_bom(monkeypatch):
     print("✓ kb-import 兼容 UTF-8 BOM")
 
 
+def test_plain_output_not_rich_escaped_and_table_cells_escaped(monkeypatch=None):
+    """plain print 不做 rich 转义（反斜杠会原样可见）；Table 单元格必须转义。"""
+    from cli import _plain_safe, _table_cell, _terminal_safe
+
+    assert _plain_safe("[/x] 失败") == "[/x] 失败"
+    assert "\\" not in _plain_safe("[/x]")
+    # 控制序列在所有路径都剥离
+    assert "\x1b" not in _plain_safe("a\x1b]0;t\x07b")
+    assert _table_cell("[red]x[/red]") == "\\[red]x\\[/red]"
+    assert "\x1b" not in _table_cell("a\x1b[31mb")
+    # Rich 输出路径保留转义（console.print 会二次解析 markup）
+    assert _terminal_safe("[red]x").startswith("\\")
+    print("✓ plain 输出不转义 / Table 单元格转义")
+
+
 def test_doctor_falls_back_without_rich(monkeypatch):
     """rich 缺失时 doctor 退回纯文本输出（诊断命令不依赖渲染库）。"""
     from utils import doctor as doctor_module
@@ -180,6 +195,7 @@ if __name__ == "__main__":
         test_safe_export_user_is_unique,
         test_print_stdout_swallows_broken_pipe,
         test_kb_import_accepts_utf8_bom,
+        test_plain_output_not_rich_escaped_and_table_cells_escaped,
         test_doctor_falls_back_without_rich,
     ):
         mp = pytest.MonkeyPatch()

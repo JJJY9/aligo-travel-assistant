@@ -430,6 +430,23 @@ def test_agent_specific_empty_payloads_render_placeholder():
     print("✓ 各智能体空载荷渲染占位")
 
 
+def test_renderer_empty_result_falls_back_to_text():
+    """渲染器对不认识的载荷返回空串时用 _fallback_text 兜底，不丢内容。"""
+    payload = _wrap(
+        [
+            {
+                "agent_name": "itinerary_planning",
+                "status": "success",
+                "data": {"output": "模型返回的纯文本行程说明"},
+            }
+        ]
+    )
+    md = result_to_markdown(payload)
+    assert "模型返回的纯文本行程说明" in md, md
+    assert md != "已处理您的请求。"
+    print("✓ 渲染器空结果兜底为可读文本")
+
+
 def test_rag_snippet_truncation_and_skip_non_dict():
     long_text = "标准" * 100  # 200 字，超过 140 字截断阈值
     md = result_to_markdown(
@@ -816,6 +833,7 @@ if __name__ == "__main__":
     test_render_failure_falls_back_to_text()
     test_itinerary_string_and_notes_variants()
     test_agent_specific_empty_payloads_render_placeholder()
+    test_renderer_empty_result_falls_back_to_text()
     test_rag_snippet_truncation_and_skip_non_dict()
     test_preference_append_variants_and_legacy_dict()
     test_preference_nested_data_and_empty_legacy_values()
