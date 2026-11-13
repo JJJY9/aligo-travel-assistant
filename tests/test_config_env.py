@@ -230,9 +230,49 @@ def test_storage_urls_strip_whitespace_and_bom():
     print("✓ 存储 URL 去空白 / BOM，非法额度告警并钳制")
 
 
+def test_llm_request_timeout_env():
+    """模型 read 超时默认 120s，可用 LLM_REQUEST_TIMEOUT_SEC 覆盖。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.SYSTEM_CONFIG['timeout'])"
+    )
+    env = dict(os.environ)
+    env.pop("LLM_REQUEST_TIMEOUT_SEC", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "120", result.stdout
+
+    env["LLM_REQUEST_TIMEOUT_SEC"] = "45"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "45", result.stdout
+    print("✓ 模型超时默认 120s 且可用环境变量覆盖")
+
+
 if __name__ == "__main__":
     test_api_key_is_stripped_and_blank_falls_back()
     test_storage_urls_strip_whitespace_and_bom()
+    test_llm_request_timeout_env()
     test_broken_config_local_import_is_not_swallowed()
     test_empty_env_model_and_base_url_fall_back()
     test_create_chat_model_max_retries_param()
