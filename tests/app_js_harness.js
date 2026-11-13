@@ -1067,13 +1067,17 @@ async function scenarioReconcile(source) {
     sessionLoadToken = 5;
     els.input.value = "";
     globalThis.__openCalls = 0;
-    openSession = async () => { __openCalls += 1; sessionLoadToken += 1; };
+    globalThis.__extra = 0;
+    openSession = async () => {
+      __openCalls += 1;
+      sessionLoadToken += 1 + (globalThis.__extra || 0);
+    };
     resizeInput = () => {};
   `);
 
   const runCase = async (finalMessages) => {
     run(
-      '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5;'
+      '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 0;'
     );
     const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
     // attempt 0..2 的轮询，以及 attempt 3 的确认轮询：都先给旧数据
@@ -1096,7 +1100,28 @@ async function scenarioReconcile(source) {
 
   const persistedLate = await runCase(newMessages);
   const stillMissing = await runCase(oldMessages);
-  return { persistedLate, stillMissing };
+
+  // 对账期间用户点击了另一个会话：openSession 自增 token 后又被用户点击
+  // 推进一次，不能认领该 token 把旧提问写进新会话的输入框
+  run(
+    '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 1;'
+  );
+  const interleavedPromise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
+  for (let i = 0; i < 4; i += 1) {
+    const request = await waitRequest(env);
+    request.resolve({ messages: oldMessages });
+    await tick();
+  }
+  await interleavedPromise;
+  await tick();
+  run("globalThis.__extra = 0;");
+  const interleaved = {
+    input: run("els.input.value"),
+    toasts: run("__toasts.slice()"),
+    open_calls: run("__openCalls"),
+  };
+
+  return { persistedLate, stillMissing, interleaved };
 }
 
 

@@ -3164,11 +3164,17 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
         return;
       }
       if (attempt === 3) {
+        const tokenBefore = sessionLoadToken;
         await openSession(sessionId, {
           silent: true,
           keepOnError: true,
           preserveOnEmpty: true,
         });
+        if (sessionLoadToken !== tokenBefore + 1) {
+          // 期间用户点击了其它会话（会话加载序号被额外推进）：不能认领
+          // 那次加载的 token 把旧会话的提问写进新会话的输入框
+          return;
+        }
         // openSession 自增了 sessionLoadToken：后续检查认新 token
         expectedToken = sessionLoadToken;
         // openSession 的重新拉取可能刚好包含迟到的落库（服务端 drain 上限
@@ -3185,6 +3191,13 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
             Array.isArray(latest.messages) &&
             isPersisted(latest.messages)
           ) {
+            // 两次拉取之间刚落库：界面还是上一次（不含本轮）的重建结果，
+            // 必须再刷一次——否则刚问的问题从消息区消失且没有任何提示
+            await openSession(sessionId, {
+              silent: true,
+              keepOnError: true,
+              preserveOnEmpty: true,
+            });
             return;
           }
         } catch (_) {
