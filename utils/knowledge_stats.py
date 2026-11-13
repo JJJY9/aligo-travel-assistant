@@ -141,8 +141,10 @@ def knowledge_status(
                     return _snapshot(client)
             except busy_error:
                 return busy_payload
-        # 旧版本维护模块（无读锁）：退回独占加锁
-        if lock_timeout is not None:
+        # 旧版本维护模块（无读锁）：退回独占加锁。维护模块导入失败时
+        # lock_ctx 是 contextlib.nullcontext()（没有 acquire）：按「无锁」
+        # 直接快照，不能在这里 AttributeError 被外层吞成「状态查询失败」
+        if lock_timeout is not None and hasattr(lock_ctx, "acquire"):
             acquired = lock_ctx.acquire(timeout=lock_timeout)
             if not acquired:
                 return busy_payload

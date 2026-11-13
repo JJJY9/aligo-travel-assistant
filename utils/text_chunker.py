@@ -40,6 +40,9 @@ def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
 _TITLE_PREFIX = re.compile(
     r"^(?:#+\s*|\d+[.、)）]\s*|[（(]\d+[)）]\s*|[一二三四五六七八九十]+[、.]\s*)"
 )
+# 编号列表项的起始（「1. 北京」「(2) 500元」）：没有结尾冒号时是正文清单，
+# 不能当标题——否则整节正文会被 _merge_short_chunks 并入下一章节
+_LIST_NUMBER_PREFIX = re.compile(r"^(?:\d+[.、)）]|[（(]\d+[)）])\s*")
 
 
 def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
@@ -47,6 +50,7 @@ def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
 
     允许「1. 住宿标准：」这类带编号 / 结尾冒号的标题：去掉编号前缀与
     结尾冒号后再看句读，否则它们会被判成正文、作为纯标题块留在索引里。
+    中文逗号 / 顿号清单（「北京，上海，广州」）按正文处理。
     """
     stripped = chunk.strip()
     if "\n" in stripped or len(stripped) >= min_chars:
@@ -55,7 +59,7 @@ def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
     if "：" in body or ":" in body:
         # 内部冒号说明是「标签：内容」的正文行，不是纯标题
         return False
-    return not re.search(r"[。；！？!?.;]", body)
+    return not re.search(r"[。；！？!?.;，,、]", body)
 
 
 # 多行标题块里单行的长度上限：目录式标题很短；章节正文里的短清单行
@@ -76,6 +80,11 @@ def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
         return False
     if len(lines) == 1:
         return _is_title_like(lines[0], min_chars)
+    numbered_lines = sum(1 for line in lines if _LIST_NUMBER_PREFIX.match(line))
+    if numbered_lines >= 2:
+        # 连续编号行（「1. 北京 / 2. 上海」）是列表正文：当作标题块会把
+        # 整节内容挂起到下一章节，产出混主题 chunk
+        return False
     return all(
         len(line) <= _TITLE_LINE_MAX
         and not line.startswith(("-", "*", "•", "·"))
@@ -180,7 +189,11 @@ def split_text(text: str, max_chars: int = 400) -> list[str]:
 
     flush()
     merged = _merge_short_chunks(chunks, max_chars=max_chars)
-    # 定长硬切可能产生纯空白分片（整块空格或单独的换行）：没有内容就不该
-    # 进向量库——空白片段同样会编码成向量并占用检索名额；与
+    # 定长硬切可能产生纯空白 / 纯标点分片：没有实际内容就不该进向量库
+    # （它们同样会编码成向量并占用检索名额）；与
     # knowledge_admin._chunk_documents 的过滤口径保持一致
-    return [chunk for chunk in merged if chunk.strip()]
+    return [
+        chunk
+        for chunk in merged
+        if chunk.strip() and any(char.isalnum() for char in chunk)
+    ]

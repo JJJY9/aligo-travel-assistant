@@ -654,6 +654,18 @@ def test_discard_created_library_retries_locked_files(monkeypatch, tmp_path):
     assert "手动删除" in out.getvalue(), out.getvalue()
     print("✓ 新建库删除失败时重试并提示手动清理")
 
+
+def test_discard_created_library_handles_directory_db(tmp_path):
+    """milvus-lite 3.x 的 milvus_lite.db 是目录：直接 rmtree，不能走 unlink。"""
+    module = _load_init_module()
+    target = tmp_path / "rag-dir-db"
+    db = target / "milvus_lite.db"
+    db.mkdir(parents=True)
+    (db / "LOCK").write_text("x", encoding="utf-8")
+    module._discard_created_library(target)
+    assert not target.exists(), "目录形态的数据库文件应被整体删除"
+    print("✓ 目录形态的 milvus_lite.db 被正确清理")
+
 if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
@@ -670,6 +682,9 @@ if __name__ == "__main__":
         test_preserved_backup_survives_failed_restore(_mp)
         test_discard_created_library_retries_locked_files(
             _mp, Path(tempfile.mkdtemp())
+        )
+        test_discard_created_library_handles_directory_db(
+            Path(tempfile.mkdtemp())
         )
     finally:
         _mp.undo()
