@@ -24,11 +24,34 @@ def _start_sort_value(trip: dict[str, Any]) -> tuple[datetime, str]:
         return datetime.min, raw
 
 
+_WARNED_TRIP_ISSUES: set[tuple[str, str]] = set()
+# 去重集合上限：脏值种类有界，超过后整体清空重新计数，避免长期运行无界增长
+_WARNED_TRIP_ISSUES_MAX = 256
+
+
+def _warn_trip_issue_once(
+    kind: str, raw_value: Any, message: str, *args: Any
+) -> None:
+    """同一类脏日期只警告一次（有界去重集合）。
+
+    ``/api/status`` 对全量历史每条约调用 3 次 ``trip_interval``：备份恢复
+    保留的坏日期此前每次面板刷新都会放大成数万条 WARNING，把有价值的日志
+    全部冲掉（截断 / 早于出发仍按原语义处理，只是不再逐次记录）。
+    """
+    token = (kind, repr(raw_value))
+    if token in _WARNED_TRIP_ISSUES:
+        return
+    if len(_WARNED_TRIP_ISSUES) >= _WARNED_TRIP_ISSUES_MAX:
+        _WARNED_TRIP_ISSUES.clear()
+    _WARNED_TRIP_ISSUES.add(token)
+    logger.warning(message, *args)
+
+
 def trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
     """行程的日期区间（含首尾）；缺少或无法解析出发日期时返回 None。
 
-    返程日期非法（历史脏数据）时按出发当日计算并记录警告——此前完全静默，
-    行程区间被截成单日却无从察觉。
+    返程日期非法（历史脏数据）时按出发当日计算并记录警告（同一脏值只记
+    一次）——此前完全静默，行程区间被截成单日却无从察觉。
     """
     try:
         start = datetime.strptime(str(trip.get("start_date") or ""), "%Y-%m-%d")
@@ -39,14 +62,18 @@ def trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
         end = datetime.strptime(str(raw_end or ""), "%Y-%m-%d")
     except ValueError:
         if raw_end:
-            logger.warning(
+            _warn_trip_issue_once(
+                "unparsable-end",
+                raw_end,
                 "行程 %s 的返程日期无法解析（%r），按出发当日计算",
                 trip.get("trip_id"),
                 raw_end,
             )
         end = start
     if end < start:
-        logger.warning(
+        _warn_trip_issue_once(
+            "inverted",
+            (raw_end, trip.get("start_date")),
             "行程 %s 的返程日期早于出发日期（%r < %r），按出发当日计算",
             trip.get("trip_id"),
             raw_end,
