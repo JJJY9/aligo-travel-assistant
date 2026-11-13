@@ -255,6 +255,27 @@ def test_user_export_with_knowledge_dispatch(monkeypatch):
     assert calls[-1] == ("u1", None, True)
     print("✓ user-export dispatch --with-knowledge")
 
+def test_user_export_refuses_when_memory_file_quarantined(monkeypatch):
+    """损坏记忆文件被隔离后不能把空快照当成成功备份导出。"""
+    import tempfile
+    from pathlib import Path
+
+    class _CorruptStore(_FakeStore):
+        def get_recovered_corrupt_backup(self):
+            return "data/memory/u-corrupt.json.corrupt-20261113-1200"
+
+    store = _CorruptStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    target = tempfile.mkdtemp()
+    code, out = _run("u-corrupt", target)
+    assert code == 1, out
+    assert "导出中止" in out and "损坏" in out, out
+    assert list(Path(target).glob("*")) == [], "损坏状态不能写出空备份"
+    assert store.closed
+    print("✓ 记忆文件损坏隔离后拒绝导出空备份")
+
 if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
@@ -267,6 +288,9 @@ if __name__ == "__main__":
         test_user_export_dispatch(mp)
         test_user_export_with_knowledge(mp)
         test_user_export_with_knowledge_dispatch(mp)
+        mp.undo()
+        mp = pytest.MonkeyPatch()
+        test_user_export_refuses_when_memory_file_quarantined(mp)
     finally:
         mp.undo()
     print("\n全部通过")
