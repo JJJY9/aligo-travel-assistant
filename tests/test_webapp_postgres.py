@@ -382,6 +382,230 @@ def test_pg_import_preserves_timestamp_instant():
         store.close()
 
 
+def test_pg_import_skips_orphan_answer_and_orders_by_timestamp():
+    """旧备份恢复：提问命中去重后旧回答不追加；旧消息按时间回到历史位置。"""
+    from utils.user_import import import_user_data, parse_user_export
+
+    user_id = f"pg_import_order_{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    session_id = "sess-pg-order"
+    try:
+        store.add_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "帮我规划行程",
+                    "session_id": session_id,
+                    "timestamp": "2026-11-10T09:00:00+08:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "新回答",
+                    "session_id": session_id,
+                    "timestamp": "2026-11-10T09:00:05+08:00",
+                },
+            ],
+            dedupe=True,
+        )
+        payload = {
+            "chat_history": [
+                {
+                    "role": "user",
+                    "content": "帮我规划行程",
+                    "session_id": session_id,
+                    "timestamp": "2026-01-01T09:00:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "旧回答",
+                    "session_id": session_id,
+                    "timestamp": "2026-01-01T09:00:05",
+                },
+                {
+                    "role": "user",
+                    "content": "更早的提问",
+                    "session_id": session_id,
+                    "timestamp": "2025-12-01T09:00:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "更早的回答",
+                    "session_id": session_id,
+                    "timestamp": "2025-12-01T09:00:05",
+                },
+            ]
+        }
+        sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+        assert errors == []
+        counts = import_user_data(store, sections)
+        assert counts["messages_added"] == 2, counts
+        assert counts["messages_skipped"] == 2, counts
+        history = store.get_chat_history(limit=None, session_id=session_id)
+        assert [message["content"] for message in history] == [
+            "更早的提问",
+            "更早的回答",
+            "帮我规划行程",
+            "新回答",
+        ], history
+        print("✓ PostgreSQL 恢复跳过旧回答并按时间归位")
+    finally:
+        store.delete_chat_session(session_id)
+        store.close()
+
+
+def test_pg_import_skips_alternative_answer_local_wins():
+    """同一提问的备选回答按本地优先跳过，不产生尾部孤儿回答。"""
+    from utils.user_import import import_user_data, parse_user_export
+
+    user_id = f"pg_import_newer_{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    session_id = "sess-pg-newer"
+    try:
+        store.add_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "同一个问题",
+                    "session_id": session_id,
+                    "timestamp": "2026-01-01T09:00:00+08:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "旧回答",
+                    "session_id": session_id,
+                    "timestamp": "2026-01-01T09:00:05+08:00",
+                },
+            ],
+            dedupe=True,
+        )
+        payload = {
+            "chat_history": [
+                {
+                    "role": "user",
+                    "content": "同一个问题",
+                    "session_id": session_id,
+                    "timestamp": "2026-11-02T09:00:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "新回答",
+                    "session_id": session_id,
+                    "timestamp": "2026-11-02T09:00:05",
+                },
+            ]
+        }
+        sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+        assert errors == []
+        counts = import_user_data(store, sections)
+        assert counts["messages_added"] == 0, counts
+        assert counts["messages_skipped"] == 2, counts
+        history = store.get_chat_history(limit=None, session_id=session_id)
+        assert [message["content"] for message in history] == [
+            "同一个问题",
+            "旧回答",
+        ], history
+        print("✓ PostgreSQL 同一提问的备选回答按本地优先跳过")
+    finally:
+        store.delete_chat_session(session_id)
+        store.close()
+
+
+def test_pg_delete_last_turn_uses_read_order_after_import():
+    """恢复更早备份后「最后一轮」按 created_at 认定：编辑/重新生成不误删。"""
+    from utils.user_import import import_user_data, parse_user_export
+
+    user_id = f"pg_last_turn_{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    session_id = "sess-pg-last-turn"
+    try:
+        store.add_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "最新提问",
+                    "session_id": session_id,
+                    "timestamp": "2026-11-10T09:00:00+08:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "最新回答",
+                    "session_id": session_id,
+                    "timestamp": "2026-11-10T09:00:05+08:00",
+                },
+            ],
+            dedupe=True,
+        )
+        payload = {
+            "chat_history": [
+                {
+                    "role": "user",
+                    "content": "更早的提问",
+                    "session_id": session_id,
+                    "timestamp": "2026-01-01T09:00:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "更早的回答",
+                    "session_id": session_id,
+                    "timestamp": "2026-01-01T09:00:05",
+                },
+            ]
+        }
+        sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+        assert errors == []
+        counts = import_user_data(store, sections)
+        assert counts["messages_added"] == 2, counts
+
+        # expect 指向界面上的最后一轮（最新）：必须删除它而不是恢复的旧轮
+        assert store.delete_last_turn(session_id, expect="最新提问") == 2
+        remaining = store.get_chat_history(limit=None, session_id=session_id)
+        assert [message["content"] for message in remaining] == [
+            "更早的提问",
+            "更早的回答",
+        ], remaining
+        # 恢复的旧轮此时是界面最后一轮；不传 expect 也删它
+        assert store.delete_last_turn(session_id) == 2
+        assert store.get_chat_history(limit=None, session_id=session_id) == []
+        print("✓ PG 恢复旧备份后 delete_last_turn 与读取顺序一致")
+    finally:
+        store.delete_chat_session(session_id)
+        store.close()
+
+
+def test_pg_import_inherits_missing_timestamp_from_neighbor():
+    """无时间戳的旧备份消息沿用相邻消息时间：回答不会排到提问之前。"""
+    from utils.user_import import import_user_data, parse_user_export
+
+    user_id = f"pg_import_naive_{uuid.uuid4().hex[:8]}"
+    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    session_id = "sess-pg-no-ts"
+    try:
+        payload = {
+            "chat_history": [
+                {"role": "user", "content": "无时间戳提问", "session_id": session_id},
+                {
+                    "role": "assistant",
+                    "content": "有时间戳回答",
+                    "session_id": session_id,
+                    "timestamp": "2020-06-01T10:00:00",
+                },
+            ]
+        }
+        sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+        assert errors == []
+        counts = import_user_data(store, sections)
+        assert counts["messages_added"] == 2, counts
+        history = store.get_chat_history(limit=None, session_id=session_id)
+        assert [message["role"] for message in history] == [
+            "user",
+            "assistant",
+        ], history
+        print("✓ PostgreSQL 无时间戳消息沿用相邻消息时间")
+    finally:
+        store.delete_chat_session(session_id)
+        store.close()
+
+
 def test_webapp_trips_dedupe_postgres(monkeypatch):
     """真实 PG：去重接口清理历史重复行、只保留最早一条。"""
     import psycopg

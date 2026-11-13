@@ -18,9 +18,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from utils.chat_import import (
+    filter_import_messages,
+    prepare_import_messages,
+    session_dedupe_key,
+)
 from utils.errors import MemoryPersistenceError
 from utils.file_lock import file_lock
 from utils.preference_values import merge_preference_value
+from utils.timestamps import chronological_key
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +61,31 @@ def _session_dedupe_key(value: object) -> str | None:
     重复插入（「重复导入幂等」失效、total_messages 翻倍），与 PostgreSQL
     （TEXT 列）行为分叉。
     """
-    return None if value is None else str(value)
+    return session_dedupe_key(value)
+
+
+def _merge_messages_chronologically(
+    history: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> bool:
+    """把恢复消息按时间戳并入聊天历史并整体稳定排序，返回顺序是否变化。
+
+    恢复消息与既有历史一起按 ``chronological_key`` 稳定排序：旧版本恢复
+    追加在会话末尾的乱序历史随之归位（与 PostgreSQL 按 ``created_at``
+    读取一致），目标库中不存在的新会话也按时间落位，不会挤占「最近 N
+    条」跨会话窗口。同一时刻的消息保持原有相对顺序（既有消息在前，恢复
+    消息在后）；无时间戳的存量消息按最早处理。顺序未变化时不要求调用方
+    重写整份文件。
+    """
+    if not incoming and not history:
+        return False
+    original = list(history)
+    combined = original + list(incoming)
+    combined.sort(key=lambda message: chronological_key(message.get("timestamp")))
+    changed = len(combined) != len(original) or any(
+        before is not after for before, after in zip(original, combined)
+    )
+    history[:] = combined
+    return changed
 
 # 同一个 JSON 文件可能被多个 LongTermMemory 实例修改（Web 请求各开一个实例、
 # MemoryManager 还会重建实例），按路径共享一把进程内可重入锁，避免并发
@@ -782,42 +812,51 @@ class LongTermMemory:
 
         逐条调用 ``add_chat_message`` 时每次都要重载并重写整个文件
         （O(n²)，几千条消息就会阻塞数分钟），这里合并为单次写锁。
-        ``dedupe=True`` 在写锁内按（会话, 角色, 内容）多重集去重——
-        并发导入不会因为锁外快照过期而重复插入。返回实际写入的条数。
+        ``dedupe=True`` 在写锁内按（会话, 角色, 内容）多重集去重；提问已在
+        库中的轮次跳过其备份里的全部回答（本地优先，避免尾部孤儿回答，
+        见 :mod:`utils.chat_import`），并按时间戳把恢复消息并入全局历史。
+        返回实际写入的条数。
         """
         now = datetime.now().isoformat()
-        existing: Counter | None = None
+        prepared = prepare_import_messages(messages)
+        had_incoming = bool(prepared)
         if dedupe:
+            history = self.data["chat_history"]
             existing = Counter(
                 (
                     _session_dedupe_key(item.get("session_id")),
                     item.get("role"),
                     str(item.get("content") or ""),
                 )
-                for item in self.data["chat_history"]
+                for item in history
             )
-        added = 0
-        for message in messages:
+            prepared = filter_import_messages(prepared, existing)
+        to_add: list[dict[str, Any]] = []
+        for message in prepared:
             role = str(message.get("role") or "")
             if role not in {"user", "assistant"}:
                 continue
-            content = str(message.get("content") or "")
-            if existing is not None:
-                key = (_session_dedupe_key(message.get("session_id")), role, content)
-                if existing[key] > 0:
-                    existing[key] -= 1
-                    continue
-            self.data["chat_history"].append(
+            to_add.append(
                 {
                     "role": role,
-                    "content": content,
+                    "content": str(message.get("content") or ""),
                     "timestamp": message.get("timestamp") or now,
                     "session_id": message.get("session_id"),
                 }
             )
-            added += 1
-        if not added:
+        if not to_add:
+            if dedupe and had_incoming:
+                # 幂等恢复（没有新增消息）也把旧版本追加在末尾的乱序历史
+                # 归位：否则升级后重复恢复同一备份永远看不到修复。顺序
+                # 未变化时不重写整份文件。
+                if _merge_messages_chronologically(self.data["chat_history"], []):
+                    self._persist()
             return 0
+        if dedupe:
+            _merge_messages_chronologically(self.data["chat_history"], to_add)
+        else:
+            self.data["chat_history"].extend(to_add)
+        added = len(to_add)
         statistics = self.data.setdefault("statistics", {})
         statistics["total_messages"] = int(statistics.get("total_messages") or 0) + added
         self._persist()

@@ -3060,7 +3060,9 @@ def test_pg_get_chat_history_excludes_session_in_sql():
     history = store.get_chat_history(limit=10, exclude_session_id="s-cur")
     sql, params = calls[0]
     assert "session_id IS DISTINCT FROM %s" in sql, "NULL 会话旧消息必须保留（!= 会漏掉）"
-    assert "ORDER BY id DESC LIMIT %s" in sql
+    # 按时间排序：备份恢复的旧消息 created_at 很旧但 id 最大，按 id 取
+    # 「最近 N 条」会把它们当成最新消息
+    assert "ORDER BY created_at DESC, id DESC LIMIT %s" in sql
     assert params == ("u-excl", "s-cur", 10)
     assert history == [
         {
@@ -3297,6 +3299,91 @@ def test_pg_schema_tolerates_concurrent_create_race():
     assert calls["index"] == 1
     assert calls["unlock"] == 1
     print("✓ 并发建表竞争被容忍并补齐")
+
+
+def test_pg_schema_lock_timeout_does_not_fail_backend():
+    """等待 schema 锁超时：跳过 DDL 但构造继续，下次构造重试。"""
+    import psycopg
+
+    from context import postgres_long_term_memory as pg_module
+
+    dsn = "postgresql://schema-lock-timeout/test"
+    pg_module._SCHEMA_READY.discard(dsn)
+    statements: list[str] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            statements.append(text)
+            if "pg_advisory_lock" in text and "unlock" not in text:
+                raise psycopg.errors.LockNotAvailable("lock timeout")
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    store = object.__new__(pg_module.PostgresLongTermMemory)
+    store.dsn = dsn
+    store._conn = _Conn()
+    try:
+        store._ensure_schema()
+        assert not any("CREATE TABLE" in text for text in statements)
+        assert dsn not in pg_module._SCHEMA_READY, "等锁超时不标记完成，下次构造重试"
+        assert any(text.startswith("SET lock_timeout") for text in statements)
+    finally:
+        pg_module._SCHEMA_READY.discard(dsn)
+    print("✓ schema 锁等待超时不影响后端启用")
+
+
+def test_pg_schema_drops_invalid_message_index_before_recreate():
+    """上次 CONCURRENTLY 建索引中断留下的无效索引先删除再重建。"""
+    from context import postgres_long_term_memory as pg_module
+
+    dsn = "postgresql://schema-invalid-index/test"
+    pg_module._SCHEMA_READY.discard(dsn)
+    statements: list[str] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            statements.append(" ".join(str(sql).split()))
+
+        def fetchone(self):
+            return (False,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    store = object.__new__(pg_module.PostgresLongTermMemory)
+    store.dsn = dsn
+    store._conn = _Conn()
+    try:
+        store._ensure_schema()
+        assert any(
+            text.startswith("DROP INDEX CONCURRENTLY IF EXISTS")
+            and "idx_aligo_chat_user_created" in text
+            for text in statements
+        ), statements
+        assert any(
+            text.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
+            and "idx_aligo_chat_user_created" in text
+            for text in statements
+        ), statements
+    finally:
+        pg_module._SCHEMA_READY.discard(dsn)
+    print("✓ 无效的消息时间索引被清理后重建")
 
 
 def test_pg_update_trip_aborts_when_connection_reconnects():
