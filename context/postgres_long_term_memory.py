@@ -484,6 +484,16 @@ class PostgresLongTermMemory:
         with self._advisory_lock(f"aligo-pref-{self.user_id}-{pref_type}"):
             yield
 
+    @contextlib.contextmanager
+    def _preference_cap_lock(self):
+        """用户级偏好写锁：类型上限是用户级全局计数，按 pref_type 分名的锁
+        只对同类型互斥——两个并发请求各新增不同类型时互不阻塞，都能读到
+        上限减一后各自插入、越过 200 后 /api/export 永久 413。锁顺序固定
+        「类型级在外、用户级在内」（append_preference 持类型锁调
+        save_preference），不会出现反向获取。"""
+        with self._advisory_lock(f"aligo-pref-cap-{self.user_id}"):
+            yield
+
     # ---------- 偏好 ----------
 
     def save_preference(
@@ -491,22 +501,24 @@ class PostgresLongTermMemory:
     ) -> None:
         """写入偏好。``replay_safe=False`` 用于「读 + 合并 + 写」的结果：
         连接重建后重放会以过期的合并值覆盖空档里其它实例的追加。
-        类型上限在写锁内复核：调用方锁外预检挡不住并发新增。"""
+        类型上限在用户级写锁内复核：调用方锁外预检与按类型的锁都挡不住
+        不同新类型的并发新增。"""
         with self._preference_lock(pref_type):
-            self._enforce_preference_cap(pref_type)
-            self._execute(
-                """
-                INSERT INTO aligo_preferences (user_id, pref_type, value)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id, pref_type)
-                DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-                """,
-                (self.user_id, pref_type, self._json(value)),
-                replay_safe=replay_safe,
-            )
+            with self._preference_cap_lock():
+                self._enforce_preference_cap(pref_type)
+                self._execute(
+                    """
+                    INSERT INTO aligo_preferences (user_id, pref_type, value)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, pref_type)
+                    DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+                    """,
+                    (self.user_id, pref_type, self._json(value)),
+                    replay_safe=replay_safe,
+                )
 
     def _enforce_preference_cap(self, pref_type: str) -> None:
-        """新建偏好类型前复核类型数上限（写锁内，并发安全）。"""
+        """新建偏好类型前复核类型数上限（用户级写锁内，跨类型并发安全）。"""
         try:
             from utils.user_import import _MAX_PREFERENCES
         except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
