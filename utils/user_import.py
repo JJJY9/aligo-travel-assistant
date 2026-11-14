@@ -398,6 +398,70 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     return None
 
 
+def merged_backup_limit_problem(
+    store: Any, sections: dict[str, Any]
+) -> str | None:
+    """恢复后「账号现有数据 + 备份」按导出格式是否仍可能超限。
+
+    ``backup_limit_problem`` 只看备份自身：小备份恢复到接近上限的账号后，
+    账号仍会因导出体积永久 413。这里把现有数据与备份合并后再复核。
+    """
+    if not isinstance(sections, dict):
+        return None
+    try:
+        if callable(getattr(store, "export_snapshot", None)):
+            existing = store.export_snapshot() or {}
+        else:
+            existing = {
+                "preferences": store.get_preference() or {},
+                "trip_history": store.get_trip_history(limit=None) or [],
+                "chat_history": store.get_chat_history() or [],
+                "session_titles": store.get_session_titles() or {},
+                "pinned_sessions": store.get_pinned_sessions() or [],
+                "archived_sessions": store.get_archived_sessions() or [],
+            }
+    except Exception:  # noqa: BLE001 - 读不到现存数据时退回只查备份自身
+        return sections_limit_problem(sections)
+    merged_prefs = (
+        dict(existing.get("preferences") or {})
+        if isinstance(existing.get("preferences"), dict)
+        else {}
+    )
+    incoming_prefs = sections.get("preferences")
+    if isinstance(incoming_prefs, dict):
+        merged_prefs.update(incoming_prefs)
+    existing_titles = existing.get("session_titles")
+    existing_titles = existing_titles if isinstance(existing_titles, dict) else {}
+    incoming_titles = sections.get("titles")
+    merged_titles = dict(existing_titles)
+    if isinstance(incoming_titles, dict):
+        merged_titles.update(incoming_titles)
+    payload = {
+        "chat_history": list(existing.get("chat_history") or [])
+        + list(sections.get("messages") or []),
+        "trip_history": list(existing.get("trip_history") or [])
+        + list(sections.get("trips") or []),
+        "preferences": merged_prefs,
+        "knowledge": sections.get("knowledge") or [],
+        "session_titles": merged_titles,
+        "pinned_sessions": sorted(
+            {
+                str(item)
+                for item in list(existing.get("pinned_sessions") or [])
+                + list(sections.get("pinned") or [])
+            }
+        ),
+        "archived_sessions": sorted(
+            {
+                str(item)
+                for item in list(existing.get("archived_sessions") or [])
+                + list(sections.get("archived") or [])
+            }
+        ),
+    }
+    return backup_limit_problem(payload)
+
+
 def sections_limit_problem(sections: dict[str, Any]) -> str | None:
     """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
 

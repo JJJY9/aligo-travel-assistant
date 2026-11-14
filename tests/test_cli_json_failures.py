@@ -178,9 +178,8 @@ def test_corrupt_snapshot_blocks_write_commands(monkeypatch):
         lambda: cli.run_preference_set_standalone(
             "u1", "hotel_brands", "汉庭", as_json=True
         ),
-        lambda: cli.run_user_import_standalone(
-            "u1", str(backup_file), as_json=True
-        ),
+        # user-import 是隔离账号唯一的产品内恢复路径：显式豁免隔离守卫，
+        # 不走 _fail("损坏")，这里只断言前两类写命令被拒绝
     )
     for case in cases:
         code, out = _run(case)

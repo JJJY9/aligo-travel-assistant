@@ -81,7 +81,7 @@ class _AutoDecodeInput:
         peek = getattr(self._buffer, "peek", None)
         if callable(peek):
             try:
-                head = bytes(peek(16)[:16])
+                head = bytes(peek(64)[:64])
             except Exception:  # noqa: BLE001 - peek 失败按逐行判断
                 head = b""
         if head[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):

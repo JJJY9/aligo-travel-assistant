@@ -1043,6 +1043,28 @@ class _WebSession:
             circuit_breaker=breaker,
             persist_guard=persist_guard,
         )
+        # 聊天会话不经 _open_long_term：在隔离后的空快照上继续写会重建
+        # 主文件、让隔离备份从此不可见（与维护接口同口径拒绝）
+        marker = None
+        try:
+            long_term = getattr(
+                getattr(self.runtime, "memory", None), "long_term", None
+            )
+            getter = getattr(long_term, "get_recovered_corrupt_backup", None)
+            if callable(getter):
+                marker = getter()
+        except Exception:  # noqa: BLE001 - 探测失败不阻断会话
+            marker = None
+        marker = marker or _quarantined_memory_backup(user_id)
+        if marker:
+            try:
+                self.runtime.close()
+            except Exception:  # noqa: BLE001 - 尽力释放
+                pass
+            raise MemoryPersistenceError(
+                "记忆文件损坏并已隔离备份（路径见服务端日志），"
+                "请先用备份文件恢复后重试"
+            )
         # 正在处理对话的请求数：LRU 淘汰必须跳过在用会话，否则会在
         # runtime 执行中途 close（PostgreSQL 连接被抽走）
         self._turn_lock = threading.Lock()
@@ -2206,7 +2228,9 @@ def _quarantined_memory_backup(user_id: str) -> str | None:
     return str(backups[-1]) if backups else None
 
 
-def _open_long_term(user_id: str, strict: bool = False) -> Any:
+def _open_long_term(
+    user_id: str, strict: bool = False, allow_quarantined: bool = False
+) -> Any:
     """按当前配置打开长期记忆（JSON 或 PostgreSQL）。
 
     ``strict=True`` 用于删除等破坏性操作：配置了 PostgreSQL 但当前不可用
@@ -2231,7 +2255,8 @@ def _open_long_term(user_id: str, strict: bool = False) -> Any:
         if callable(getter):
             marker = getter()
         marker = marker or _quarantined_memory_backup(user_id)
-        if marker:
+        # 恢复备份是被隔离账号唯一的产品内恢复路径：/api/import 显式豁免
+        if marker and not allow_quarantined:
             close = getattr(store, "close", None)
             if callable(close):
                 with contextlib.suppress(Exception):
@@ -3926,6 +3951,9 @@ def create_app(model: Any = None) -> FastAPI:
             value = store.get_preference(pref_type)
         except HTTPException:
             raise
+        except ValueError as exc:
+            # 存储写锁内的类型上限复核（并发新增可越过锁外预检）
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
             logger.warning("保存偏好失败: %s", exc)
             raise _storage_failure("保存失败", exc) from exc
@@ -5475,6 +5503,7 @@ def create_app(model: Any = None) -> FastAPI:
             backup_limit_problem,
             drop_sessions,
             import_user_data,
+            merged_backup_limit_problem,
             parse_user_export_data,
             preview_user_import,
         )
@@ -5689,7 +5718,9 @@ def create_app(model: Any = None) -> FastAPI:
                                     "已跳过其消息"
                                 )
                             drop_sessions(sections, late_deleted)
-                    store = _open_long_term(user_id, strict=True)
+                    store = _open_long_term(
+                        user_id, strict=True, allow_quarantined=True
+                    )
                     try:
                         # 备份自身不超限不代表合并后不超限：与存量偏好取
                         # 并集后越过上限时，恢复虽成功但 /api/export 会
@@ -5714,6 +5745,19 @@ def create_app(model: Any = None) -> FastAPI:
                                             "请先删除不用的偏好后重试"
                                         ),
                                     )
+                        # 偏好之外再按「现有数据 + 备份」复核导出体积：
+                        # 恢复到接近上限的账号后仍可能永久 413
+                        merged_problem = merged_backup_limit_problem(
+                            store, sections
+                        )
+                        if merged_problem:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"恢复中止：{merged_problem}"
+                                    "（恢复后账号将无法再导出全量备份）"
+                                ),
+                            )
                         if dry_run:
                             return preview_user_import(store, sections)
                         counts = import_user_data(store, sections)

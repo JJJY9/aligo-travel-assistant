@@ -2014,7 +2014,7 @@ def test_import_rejects_when_existing_totals_would_exceed_limits(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "_open_long_term",
-        lambda user_id, strict=False: _FullStore(),
+        lambda user_id, strict=False, **kwargs: _FullStore(),
     )
     client = _client()
     response = client.post(
@@ -3131,7 +3131,7 @@ def test_export_all_sessions_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     response = _client().get(
         "/api/sessions/export", params={"user_id": "u-export-fail"}
@@ -3725,7 +3725,7 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
     strict_flags = []
     original_open = server_module._open_long_term
 
-    def failing_open(target_user, strict=False):
+    def failing_open(target_user, strict=False, **kwargs):
         strict_flags.append(strict)
         raise MemoryPersistenceError("disk full")
 
@@ -3785,7 +3785,7 @@ def test_create_trip_write_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     client = _client()
     response = client.post(
@@ -3969,7 +3969,7 @@ def test_preference_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     client = _client()
     saved = client.put(
@@ -4147,7 +4147,7 @@ def test_delete_trip_storage_failure_maps_503(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore())
     response = _client().delete(
         "/api/trips/trip_1", params={"user_id": "web_test_trip_broken"}
     )
@@ -5426,7 +5426,7 @@ def test_session_metadata_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     client = _client()
     assert (
@@ -5788,7 +5788,7 @@ def test_trips_csv_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     response = _client().get("/api/trips/export", params={"user_id": "u1"})
     assert response.status_code == 503
@@ -5811,7 +5811,7 @@ def test_delete_session_storage_failure_maps_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     client = _client()
     response = client.delete("/api/sessions/s1", params={"user_id": "u1"})
@@ -5951,7 +5951,7 @@ def test_delete_missing_session_failure_does_not_leave_tombstone(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, strict=False: _Store())
+    monkeypatch.setattr(server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _Store())
     client = _client()
     state = client.app.state.aligo
     response = client.delete("/api/sessions/ghost", params={"user_id": "u-ghost"})
@@ -7624,7 +7624,7 @@ def test_session_read_failures_map_503(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        server_module, "_open_long_term", lambda user_id, strict=False: _BrokenStore()
+        server_module, "_open_long_term", lambda user_id, strict=False, **kwargs: _BrokenStore()
     )
     client = _client()
     for path in (

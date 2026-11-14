@@ -5339,7 +5339,9 @@ async function startEditKnowledge(doc) {
       ? `正在编辑整份文档（${groupParts} 片），保存后整组替换`
       : "新增知识片段，例如：一线城市住宿标准为每晚 600 元";
   els.kbContent.value = content;
-  state.kbEditBaseline = content;
+  // textarea 赋值会把 CRLF 归一为 LF：基线记录归一后的实际值，
+  // 否则含 \r\n 的片段每次点同一行「编辑」都会误弹覆盖确认
+  state.kbEditBaseline = els.kbContent.value;
   els.kbCategory.value = doc.metadata?.category ? String(doc.metadata.category) : "";
   els.kbSubmit.textContent = "保存修改";
   els.kbCancel.hidden = false;
