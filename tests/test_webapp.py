@@ -11465,8 +11465,26 @@ def test_cached_session_quarantined_is_evicted_and_closed(monkeypatch, tmp_path)
     from utils.errors import MemoryPersistenceError
     from webapp import server as server_module
 
+    import threading
+    from collections import OrderedDict
+
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
-    app_state = server_module.AligoWebApp(model=None)
+    monkeypatch.setattr(server_module, "wrap_usage_tracking", lambda m: m)
+
+    class _StubApp:
+        _session_key = staticmethod(server_module.AligoWebApp._session_key)
+
+        def __init__(self):
+            self._sessions_lock = threading.Lock()
+            self.sessions = OrderedDict()
+            self.max_sessions = 1
+            self.session_turn_leak_sec = 60.0
+            self._session_build_slots = threading.Semaphore(1)
+            self.model = None
+            self.breaker = None
+            self.is_recently_deleted = lambda user, session: False
+
+    app_state = _StubApp()
     closed = []
 
     class _FakeLongTerm:
@@ -11500,7 +11518,9 @@ def test_cached_session_quarantined_is_evicted_and_closed(monkeypatch, tmp_path)
     app_state.sessions[key] = _FakeSession()
     try:
         with pytest.raises(MemoryPersistenceError):
-            app_state.get_session("u-cache", "s1")
+            server_module.AligoWebApp.get_session(
+                app_state, "u-cache", "s1"
+            )
     finally:
         app_state.sessions.pop(key, None)
     assert closed == [True], "被驱逐的隔离会话必须立即关闭"
