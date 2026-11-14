@@ -149,6 +149,8 @@ _SUPPLEMENT_LABELS = frozenset(
         "备注",
         "备注说明",
         "附注",
+        "注",
+        "注释",
         "提示",
         "温馨提示",
         "友情提示",
@@ -163,6 +165,7 @@ _SUPPLEMENT_LABELS = frozenset(
 _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次")
 
 
+_PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 def _event_label_phrase(label: str) -> str | None:
     line = ""
     for item in label.splitlines():
@@ -171,7 +174,18 @@ def _event_label_phrase(label: str) -> str | None:
             line = cleaned
     if not line:
         return None
-    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    cleaned_line = line
+    while True:
+        stripped = _PAREN_GROUP_RE.sub("", cleaned_line)
+        if stripped == cleaned_line:
+            break
+        cleaned_line = stripped
+    if not re.sub(r"[:：=\s]", "", cleaned_line):
+        # 整行就是括号里的标签（「（尾注）：」「(示例)：」）：取括号内容
+        match = _PAREN_GROUP_RE.search(line)
+        if match:
+            cleaned_line = match.group(0)[1:-1]
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", cleaned_line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
@@ -207,7 +221,7 @@ def _event_label_is_example(label: str) -> bool:
 _MISSING_FIELD_RULES = (
     (("返程地", "返回地", "回程地"), ("return_location",)),
     (("返程日期", "回程日期", "返回日期", "结束日期"), ("end_date",)),
-    (("出发日期", "开始日期", "出行日期", "行程日期"), ("start_date", "end_date", "duration_days")),
+    (("出发日期", "开始日期", "出行日期", "行程日期"), ("start_date",)),
     (("出发地", "出发城市", "起点"), ("origin",)),
     (("目的地", "目的城市", "终点"), ("destination",)),
     (("事由", "目的"), ("trip_purpose",)),
@@ -239,7 +253,9 @@ def _missing_contradicts_substantive(
             "结束日期",
         ):
             continue
-        if any(word in text for word in _ALL_FIELDS_WORDS):
+        # 全量缺失声明按「整条即该短语」识别：「出发日期等关键信息」
+        # 这类指向具体字段的补充说明不能被子串匹配误判
+        if text in _ALL_FIELDS_WORDS:
             if _plan_score(substantive) > 0:
                 return True
             continue
@@ -346,11 +362,12 @@ def _select_event_result(text: str) -> dict | None:
             last_empty_any, last_empty_any_end = candidate, end
             if label_phrase not in _SUPPLEMENT_LABELS:
                 # 带「尾注：/补充：」标签的局部说明不覆盖更早的矛盾终稿，
-                # 也不参与矛盾判定
+                # 也不参与矛盾判定；带补充标签的 extracted_count=0 空模板
+                # 同样不能覆盖完整提取
                 explicit_empty = candidate
                 explicit_empty_end = end
-            if _is_authoritative_empty(candidate):
-                authoritative_empty, authoritative_end = candidate, end
+                if _is_authoritative_empty(candidate):
+                    authoritative_empty, authoritative_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     # 回显示例不参与实质候选竞争（全是示例时才兜底）

@@ -2184,6 +2184,36 @@ def test_preference_example_suffix_phrases_not_formal():
     print("✓ 偏好：示例前缀短语不判正式空结果")
 
 
+def test_preference_result_heading_and_continuation_words_still_formal():
+    """普通标题行（「输出格式：」「结果如下：」）之后的正式空结果照常生效：
+    只有条件 / 指令型上一行才视为折行说明。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "汉庭"}]}'
+    )
+    cases = [
+        "输出格式：" + "\n" + "正式结果：[]",
+        "结果如下：" + "\n" + "[]",
+    ]
+    for tail in cases:
+        data = _pref_reply(f"示例：{example}" + "\n" + tail)
+        assert data.get("has_preferences") is False, (tail, data)
+        assert "汉庭" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：标题行后的正式空结果照常生效")
+
+
+def test_preference_parenthetical_example_marker_rejects_label():
+    """「结果（示例）：[]」括号里自称示例：不算正式空结果，真实偏好保留。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    for label in ("结果（示例）", "正式结果（例如）"):
+        data = _pref_reply(f"{formal}" + "\n" + f"{label}：[]")
+        assert data.get("has_preferences") is True, (label, data)
+    print("✓ 偏好：括号内含示例词的标签不判正式")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2451,6 +2481,7 @@ def test_event_collection_authoritative_empty_survives_later_tail():
     data = _event_reply(f"{example}" + "\n" + terminal + "\n" + tail)
     rendered = json.dumps(data, ensure_ascii=False)
     assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    assert data.get("missing_info") == ["所有信息"], data
     print("✓ 事项收集：权威空结果不被后置尾注替换")
 
 
@@ -2483,25 +2514,28 @@ def test_event_collection_generic_time_phrases_keep_extraction():
     print("✓ 事项收集：泛化时点缺失项不顶掉完整提取")
 
 
-def test_event_collection_fullwidth_paren_labels():
-    """全角括号标签「（尾注）：」「（示例）：」同样生效。"""
-    example = (
+def test_event_collection_paren_labels_recognized():
+    """全角 / ASCII 括号标签都生效：真实提取之后的（示例）不被选中，
+    （尾注）补充声明不参与矛盾判定。"""
+    real = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"end_date": "2026-12-03", "extracted_count": 6}'
+    )
+    fullwidth_example = (
         '（示例）：{"origin": "北京", "destination": "北京", '
         '"start_date": "2026-02-27", "extracted_count": 7}'
     )
-    terminal = '{"missing_info": ["出发地", "目的地"]}'
-    data = _event_reply(f"{example}" + "\n" + terminal)
-    rendered = json.dumps(data, ensure_ascii=False)
-    assert "北京" not in rendered, data
-
-    formal = (
-        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
-        '"extracted_count": 6}'
-    )
-    tail = '（尾注）：{"missing_info": ["返程地"]}'
-    data = _event_reply(f"{formal}" + "\n" + tail)
-    assert data.get("destination") == "杭州", data
-    print("✓ 事项收集：全角括号标签生效")
+    ascii_example = fullwidth_example.replace("（示例）", "(示例)")
+    for example in (fullwidth_example, ascii_example):
+        data = _event_reply(f"{real}" + "\n" + example)
+        assert data.get("destination") == "杭州", (example, data)
+    for tail in (
+        '（尾注）：{"missing_info": ["返程日期"]}',
+        '(尾注)：{"missing_info": ["返程日期"]}',
+    ):
+        data = _event_reply(f"{real}" + "\n" + tail)
+        assert data.get("destination") == "杭州", (tail, data)
+    print("✓ 事项收集：全角 / ASCII 括号标签生效")
 
 
 def test_event_collection_tail_does_not_replace_contradiction_terminal():
@@ -2515,7 +2549,26 @@ def test_event_collection_tail_does_not_replace_contradiction_terminal():
     data = _event_reply(f"{example}" + "\n" + terminal + "\n" + tail)
     rendered = json.dumps(data, ensure_ascii=False)
     assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    # 矛盾终稿本身必须幸存（否则回退到示例或尾注都可能通过上面的断言）
+    assert data.get("missing_info") == ["出发地", "目的地", "日期"], data
     print("✓ 事项收集：尾注不覆盖矛盾终稿")
+
+
+def test_event_collection_missing_start_date_only_keeps_extraction():
+    """只缺出发日期（返程日期 / 天数已给出）时是无标签尾注而不是矛盾
+    声明：真实提取保留。"""
+    formal = (
+        '结果：{"origin": "上海", "destination": "杭州", "end_date": "2026-12-03", '
+        '"extracted_count": 3}'
+    )
+    for tail in (
+        '{"missing_info": ["出发日期"]}',
+        '{"missing_info": ["出发日期等关键信息"]}',
+    ):
+        data = _event_reply(f"{formal}" + "\n" + tail)
+        assert data.get("destination") == "杭州", (tail, data)
+        assert data.get("end_date") == "2026-12-03", (tail, data)
+    print("✓ 事项收集：仅缺出发日期时保留提取")
 
 
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
@@ -2645,6 +2698,17 @@ def test_plan_trip_known_weak_tail_labels_yield_to_full_plan():
         data = _plan_trip_reply(f"{full}" + "\n" + tail)
         assert data["itinerary"]["title"] == "杭州出差", (tail, data)
     print("✓ 行程规划：带标签的弱尾注让位于完整行程")
+
+    full2 = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    for tail2 in (
+        '注：{"title": "注意事项", "duration": "2天"}',
+        '注释：{"title": "注意事项", "duration": "2天"}',
+        '(补充)：{"title": "注意事项", "duration": "2天"}',
+        '补充（摘要）：{"title": "注意事项", "duration": "2天"}',
+    ):
+        data2 = _plan_trip_reply(f"{full2}" + "\n" + tail2)
+        assert data2["itinerary"]["title"] == "杭州出差", (tail2, data2)
+
 
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
     paren_tail = '（补充）：{"title": "注意事项", "duration": "2天"}'

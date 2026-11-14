@@ -108,6 +108,8 @@ _SUPPLEMENT_LABELS = frozenset(
         "备注",
         "备注说明",
         "附注",
+        "注",
+        "注释",
         "提示",
         "温馨提示",
         "友情提示",
@@ -137,6 +139,7 @@ _FORMAL_LABELS = frozenset(
 _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次")
 
 
+_PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 def _label_phrase(label: str) -> str | None:
     line = ""
     for item in label.splitlines():
@@ -145,7 +148,18 @@ def _label_phrase(label: str) -> str | None:
             line = cleaned
     if not line:
         return None
-    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    cleaned_line = line
+    while True:
+        stripped = _PAREN_GROUP_RE.sub("", cleaned_line)
+        if stripped == cleaned_line:
+            break
+        cleaned_line = stripped
+    if not re.sub(r"[:：=\s]", "", cleaned_line):
+        # 整行就是括号里的标签（「（尾注）：」「(示例)：」）：取括号内容
+        match = _PAREN_GROUP_RE.search(line)
+        if match:
+            cleaned_line = match.group(0)[1:-1]
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", cleaned_line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
