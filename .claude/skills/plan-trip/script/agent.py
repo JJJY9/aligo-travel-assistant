@@ -89,6 +89,25 @@ def _has_nonempty_daily_plans(value: dict) -> bool:
     return False
 
 
+# 弱行程候选前的标签决定它是「本轮终稿」还是「补充说明」：补充尾注
+# （补充：/尾注：/备注：）没有排期内容时不能顶掉更早的完整行程；
+# 没标签或「正式 / 结果 / 输出」标签按位置照常胜出（回显示例之后
+# 的裸弱键正式行程仍然有效）。
+_SUPPLEMENT_LABELS = ("补充", "尾注", "备注", "附注", "提示")
+_FORMAL_LABELS = ("正式", "结果", "输出", "最终", "答案")
+
+
+def _label_is_supplementary(label: str) -> bool:
+    """候选对象前的文本标签是否表明它是补充说明（而非本轮终稿）。"""
+    lines = [item.strip() for item in label.splitlines() if item.strip()]
+    if not lines:
+        return False
+    line = lines[-1]
+    if any(marker in line for marker in _FORMAL_LABELS):
+        return False
+    return any(marker in line for marker in _SUPPLEMENT_LABELS)
+
+
 def _select_plan_result(text: str) -> dict | None:
     """按位置选行程候选：完整行程 or 后置的有标题裸行程；尾注不顶替。
 
@@ -105,12 +124,16 @@ def _select_plan_result(text: str) -> dict | None:
     full_end = -1
     titled: dict | None = None
     titled_end = -1
+    titled_label = ""
     failed_tail = False
+    prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
             continue
+        label = text[prev_end:start]
+        prev_end = end
         plan = _as_plan_object(value)
         if plan is None:
             continue
@@ -119,7 +142,7 @@ def _select_plan_result(text: str) -> dict | None:
         if _is_full_plan(plan):
             full, full_end = plan, end
         elif _is_titled_plan(plan):
-            titled, titled_end = plan, end
+            titled, titled_end, titled_label = plan, end, label
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     if titled is not None and (full is None or titled_end > full_end):
@@ -127,9 +150,11 @@ def _select_plan_result(text: str) -> dict | None:
             full is not None
             and _has_nonempty_daily_plans(full)
             and not _has_nonempty_daily_plans(titled)
+            and _label_is_supplementary(titled_label)
         ):
-            # 后置的「标题 + duration/route/schedule」补充尾注没有排期
-            # 内容，不能因为位置靠后就顶掉更早带 daily_plans 的完整行程
+            # 后置的「标题 + duration/route/schedule」补充尾注（补充：/尾注：）
+            # 没有排期内容，不能因为位置靠后就顶掉更早带 daily_plans 的完整
+            # 行程；无标签或「正式：」标签的裸弱键行程仍按位置胜出
             chosen, chosen_end = full, full_end
         else:
             chosen, chosen_end = titled, titled_end

@@ -99,11 +99,35 @@ def _is_explicit_empty(obj: dict) -> bool:
 
 
 def _is_counted_empty(obj: dict) -> bool:
-    """带计数（extracted_count == 0）的显式空结果：只有这种空结果才允许
-    按位置压过更早的实质提取；计数缺失的 missing_info 尾注是补充说明，
-    不能否决完整结果。"""
+    """带计数（extracted_count == 0）的显式空结果。"""
     count = obj.get("extracted_count")
     return isinstance(count, int) and not isinstance(count, bool) and count == 0
+
+
+def _has_full_event_schema(obj: dict) -> bool:
+    """结果对象是否带完整字段表（所有核心字段键都存在，值可为 null）。
+
+    prompt 要求「对应字段设为 null」，模型按此输出的「信息不足」终稿
+    带全套字段且 missing_info 非空——与本轮结果同形，是最终表态，不是
+    补充说明。
+    """
+    return all(key in obj for key in _CORE_FIELDS)
+
+
+def _is_authoritative_empty(obj: dict) -> bool:
+    """是否「本轮最终表态：没有提取到信息」，允许按位置压过更早的实质候选。
+
+    两类：带计数（extracted_count == 0），或字段表完整、没有任何核心字段
+    有值且声明了缺失信息（全 null 终稿）。局部的 missing_info 尾注
+    （只含 summary / 一两个缺失项）是补充说明，不在其列。
+    """
+    if _is_counted_empty(obj):
+        return True
+    return (
+        _has_full_event_schema(obj)
+        and _plan_score(obj) == 0
+        and _is_explicit_empty(obj)
+    )
 
 
 def _normalize_event_date(text: str) -> str | None:
@@ -168,8 +192,8 @@ def _select_event_result(text: str) -> dict | None:
     substantive_end = -1
     explicit_empty: dict | None = None
     explicit_empty_end = -1
-    counted_empty: dict | None = None
-    counted_empty_end = -1
+    authoritative_empty: dict | None = None
+    authoritative_end = -1
     failed_tail = False
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
@@ -185,16 +209,17 @@ def _select_event_result(text: str) -> dict | None:
             substantive, substantive_end = candidate, end
         elif _is_explicit_empty(candidate):
             explicit_empty, explicit_empty_end = candidate, end
-            if _is_counted_empty(candidate):
-                counted_empty, counted_empty_end = candidate, end
+            if _is_authoritative_empty(candidate):
+                authoritative_empty, authoritative_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    if substantive is not None and counted_empty is not None:
-        # 按位置取后者：回显示例（实质字段俱全）之后又输出带计数的显式
-        # 空结果时，空结果是对本轮的最终表态；计数缺失的 missing_info
-        # 尾注只是补充说明（_is_counted_empty），不能顶掉完整提取
-        if counted_empty_end > substantive_end:
-            chosen, chosen_end = counted_empty, counted_empty_end
+    if substantive is not None and authoritative_empty is not None:
+        # 按位置取后者：回显示例（实质字段俱全）之后又输出本轮终稿
+        # 「没有提取到信息」（带计数，或全 null 字段表 + missing_info）时，
+        # 终稿是对本轮的最终表态；局部的 missing_info 尾注只是补充说明
+        # （_is_authoritative_empty），不能顶掉完整提取
+        if authoritative_end > substantive_end:
+            chosen, chosen_end = authoritative_empty, authoritative_end
         else:
             chosen, chosen_end = substantive, substantive_end
     elif substantive is not None:

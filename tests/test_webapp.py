@@ -11384,6 +11384,33 @@ def test_open_long_term_refuses_quarantined_memory(monkeypatch, tmp_path):
     assert server_module._open_long_term("u-quarantine") is not None
     print("✓ 记忆文件隔离后 Web 接口拒绝空数据（仅 JSON 后端）")
 
+
+def test_open_long_term_forwards_allow_quarantined(monkeypatch, tmp_path):
+    """Web 恢复入口（/api/import）把 allow_quarantined=True 传给存储工厂，
+    普通打开默认 False——隔离状态下只有恢复能重建主文件。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+    recorded = []
+
+    class _Store:
+        db_path = str(tmp_path / "u1.json")
+
+        def close(self):
+            pass
+
+    def fake_factory(user_id, path, strict=False, allow_quarantined=False):
+        recorded.append(allow_quarantined)
+        return _Store()
+
+    monkeypatch.setattr(server_module, "create_long_term_memory", fake_factory)
+    (tmp_path / "u1.json").write_text("{}", encoding="utf-8")
+    server_module._open_long_term("u1")
+    assert recorded[-1] is False
+    server_module._open_long_term("u1", allow_quarantined=True)
+    assert recorded[-1] is True
+    print("✓ Web 存储打开按入口转发 allow_quarantined")
+
 def test_trips_and_status_sanitize_lone_surrogates(monkeypatch):
     """历史数据里的孤立代理项不能让 /api/trips、/api/status、去重接口 500。"""
     from webapp import server as server_module

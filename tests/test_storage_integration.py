@@ -733,7 +733,10 @@ def test_json_preference_cap_covers_append_and_helpers(monkeypatch):
 
 
 def test_pg_preference_cap_serializes_across_types(monkeypatch):
-    """用户级写锁：两个实例并发新增不同类型时不得越过上限。"""
+    """用户级写锁：A 持锁复核上限期间，另一个实例的新类型写入必须等待，
+    不能读到「上限减一」后各自插入。"""
+    import time
+
     memory, user_id = _pg_memory_or_skip()
     from context.postgres_long_term_memory import PostgresLongTermMemory
     from utils import user_import as user_import_module
@@ -743,27 +746,51 @@ def test_pg_preference_cap_serializes_across_types(monkeypatch):
     try:
         memory.save_preference("cap_type_a", "1")
         memory.save_preference("cap_type_b", "2")
-        results: list[object] = []
-        barrier = threading.Barrier(2)
 
-        def worker(store, pref_type):
-            barrier.wait()
+        original = memory._enforce_preference_cap
+        reached = threading.Event()
+        release = threading.Event()
+
+        def slow_cap(pref_type):
+            result = original(pref_type)
+            reached.set()
+            release.wait(5)
+            return result
+
+        # 让 A 在「复核通过、INSERT 之前」停住：没有用户级锁时 B 会在此期间
+        # 完成插入（越过上限）；有锁时 B 必须等在锁上
+        monkeypatch.setattr(memory, "_enforce_preference_cap", slow_cap)
+        results: list[tuple[str, object]] = []
+
+        def worker_a():
             try:
-                store.save_preference(pref_type, "x")
-                results.append("ok")
+                memory.save_preference("cap_type_c", "x")
+                results.append(("a", "ok"))
             except ValueError as exc:
-                results.append(exc)
+                results.append(("a", exc))
 
-        threads = [
-            threading.Thread(target=worker, args=(memory, "cap_type_c")),
-            threading.Thread(target=worker, args=(other, "cap_type_d")),
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(10)
-        assert results.count("ok") == 1, results
-        assert any(isinstance(item, ValueError) for item in results), results
+        def worker_b():
+            reached.wait(5)
+            try:
+                other.save_preference("cap_type_d", "y")
+                results.append(("b", "ok"))
+            except ValueError as exc:
+                results.append(("b", exc))
+
+        thread_a = threading.Thread(target=worker_a)
+        thread_b = threading.Thread(target=worker_b)
+        thread_a.start()
+        assert reached.wait(5), "A 未进入上限复核"
+        thread_b.start()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and not results:
+            time.sleep(0.02)
+        assert not results, f"A 持锁期间 B 不应完成写入：{results}"
+        release.set()
+        thread_a.join(10)
+        thread_b.join(10)
+        assert ("a", "ok") in results, results
+        assert any(name == "b" and isinstance(item, ValueError) for name, item in results), results
         assert len(memory.get_preference()) == 3
         print("✓ PG 偏好上限在不同类型的并发新增之间仍然成立")
     finally:

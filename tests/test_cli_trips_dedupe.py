@@ -62,7 +62,7 @@ def test_dedupes_and_keeps_first(monkeypatch):
         [_trip("trip_1"), _trip("trip_2"), _trip("trip_3", destination="杭州")]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 0
@@ -77,7 +77,7 @@ def test_undated_trips_not_deduped(monkeypatch):
         [_trip("trip_1", start=None, end=None), _trip("trip_2", start=None, end=None)]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 0
@@ -95,7 +95,7 @@ def test_unpadded_dates_group_with_padded(monkeypatch):
         ]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 0
@@ -107,7 +107,7 @@ def test_unpadded_dates_group_with_padded(monkeypatch):
 def test_no_trips(monkeypatch):
     fake = _FakeStore([])
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 0 and "共 0 条" in out
@@ -117,7 +117,7 @@ def test_no_trips(monkeypatch):
 def test_invalid_user_id(monkeypatch):
     called = {"n": 0}
 
-    def fake_factory(user_id, path):
+    def fake_factory(user_id, path, **kwargs):
         called["n"] += 1
         return _FakeStore([])
 
@@ -132,7 +132,7 @@ def test_invalid_user_id(monkeypatch):
 def test_read_failure(monkeypatch):
     fake = _FakeStore([], fail_get=True)
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 1 and "读取行程失败" in out
@@ -141,7 +141,7 @@ def test_read_failure(monkeypatch):
 
 
 def test_store_open_failure(monkeypatch):
-    def boom(user_id, path):
+    def boom(user_id, path, **kwargs):
         raise RuntimeError("cannot open")
 
     monkeypatch.setattr(storage, "create_long_term_memory", boom)
@@ -164,7 +164,7 @@ def test_skips_group_when_keeper_deleted_concurrently(monkeypatch):
 
     fake.get_trip_history = second_read_without_keeper
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 0
@@ -206,7 +206,7 @@ def test_json_backend_reloads_before_keeper_recheck(monkeypatch):
     path.write_text(json.dumps({"trip_history": [trips[1]]}), encoding="utf-8")
 
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: store
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: store
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -225,7 +225,7 @@ def test_delete_failure_returns_1(monkeypatch):
 
     fake = _FailDeleteStore([_trip("trip_1"), _trip("trip_2")])
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 1 and "删除过程中失败" in out
@@ -244,7 +244,7 @@ def test_pg_configured_but_json_fallback(monkeypatch):
     monkeypatch.setattr(ltm, "LongTermMemory", _JsonStore)
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://localhost/x")
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: _JsonStore()
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: _JsonStore()
     )
     code, out = _run("u1")
     assert code == 1
@@ -257,7 +257,7 @@ def test_dry_run_does_not_delete(monkeypatch):
         [_trip("trip_1"), _trip("trip_2"), _trip("trip_3", destination="杭州")]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1", dry_run=True)
     assert code == 0
@@ -290,7 +290,7 @@ def test_ambiguous_trip_id_is_not_deleted(monkeypatch):
         ]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 1
@@ -309,7 +309,7 @@ def test_one_day_trips_use_start_as_end(monkeypatch):
         ]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u1")
     assert code == 0
@@ -325,7 +325,7 @@ def test_json_output_delete_and_dry_run(monkeypatch):
         [_trip("trip_1"), _trip("trip_2"), _trip("trip_3", destination="杭州")]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -355,7 +355,7 @@ def test_json_output_no_duplicates(monkeypatch):
 
     fake = _FakeStore([])
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -382,7 +382,7 @@ def test_ambiguous_without_duplicate_groups(monkeypatch):
         [_trip("dup", destination="上海"), _trip("dup", destination="杭州")]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -409,7 +409,7 @@ def test_json_output_errors_and_ambiguous(monkeypatch):
         [_trip("trip_1"), _trip("trip_2"), _trip("trip_2", destination="杭州")]
     )
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -422,7 +422,7 @@ def test_json_output_errors_and_ambiguous(monkeypatch):
     assert payload["would_remove"] == 0
     assert fake.deleted == []
 
-    def boom(user_id, path):
+    def boom(user_id, path, **kwargs):
         raise RuntimeError("cannot open")
 
     monkeypatch.setattr(storage, "create_long_term_memory", boom)
@@ -489,7 +489,7 @@ def test_same_trip_id_duplicates_keep_earliest_row(monkeypatch):
     later = {**_trip("trip_1"), "purpose": "后来"}
     fake = _DupStore([earliest, later])
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda user_id, path: fake
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
     )
     code, out = _run("u-dup")
     assert code == 0

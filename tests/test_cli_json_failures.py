@@ -190,6 +190,27 @@ def test_corrupt_snapshot_blocks_write_commands(monkeypatch):
     print("✓ 损坏隔离后写命令拒绝执行（不重建空快照）")
 
 
+def test_open_cli_store_forwards_allow_quarantined(monkeypatch):
+    """恢复入口（user-import）把 allow_quarantined=True 传给存储工厂，
+    普通维护命令默认 False——隔离状态下只有恢复能重建主文件。"""
+    recorded = []
+
+    class _Store:
+        def close(self):
+            pass
+
+    def fake_factory(user_id, path, strict=False, allow_quarantined=False):
+        recorded.append(allow_quarantined)
+        return _Store()
+
+    monkeypatch.setattr(storage, "create_long_term_memory", fake_factory)
+    cli._open_cli_store("u1")
+    assert recorded[-1] is False
+    cli._open_cli_store("u1", allow_quarantined=True)
+    assert recorded[-1] is True
+    print("✓ CLI 存储打开按入口转发 allow_quarantined")
+
+
 if __name__ == "__main__":
     for case in (
         test_json_failures_are_structured,

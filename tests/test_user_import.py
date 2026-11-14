@@ -2097,7 +2097,21 @@ def test_merged_backup_limit_previews_dedupe(monkeypatch):
     ]
     problem = module.merged_backup_limit_problem(store, extra)
     assert problem and "上限" in problem, problem
-    print("✓ 合并上限检查按导入去重语义预演")
+
+    # 体积轴：与现有行程同身份的行会被导入更新（不新增条数），更新后的
+    # 行更大——合并体积必须按更新后的行估算，整行跳过会低估、放行一个
+    # 让账号恢复后永久无法导出的恢复
+    big_sections = dict(sections)
+    big_rows = []
+    for trip in sections["trips"]:
+        row = dict(trip)
+        row["purpose"] = "超长目的" * 100_000
+        big_rows.append(row)
+    big_sections["trips"] = big_rows
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 400_000)
+    problem = module.merged_backup_limit_problem(store, big_sections)
+    assert problem and "超过导入上限" in problem, problem
+    print("✓ 合并上限检查按导入去重语义预演（含更新行体积）")
 
 
 def test_import_accepts_device_like_session_ids():
