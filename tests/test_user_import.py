@@ -2183,7 +2183,50 @@ def test_merged_trip_rows_mirror_storage_semantics():
     assert len(fresh) == 1, fresh
     assert fresh[0]["purpose"] == "短"
     assert fresh[0]["note"] == "保留字段"
-    print("✓ 合并预演与存储层的行程索引 / 更新语义一致")
+    # 存储层补写的字段同样进入预演形状；drop_sessions 内部标记不会落库
+    marked = module._merged_trip_rows(
+        [],
+        [
+            {
+                "origin": "上海",
+                "destination": "南京",
+                "start_date": "2026-06-01",
+                module._DROPPED_SESSION_KEY: "s-gone",
+            }
+        ],
+    )
+    assert len(marked) == 1
+    assert "trip_id" in marked[0] and "timestamp" in marked[0], marked[0]
+    assert module._DROPPED_SESSION_KEY not in marked[0], marked[0]
+    print("✓ 合并预演与存储层的行程索引 / 更新语义一致（含补写字段）")
+
+
+def test_import_without_user_data_recreates_quarantined_main():
+    """隔离账号的恢复备份不含用户数据（仅知识片段 / 消息全被剔除）时，
+    恢复成功后同样重建主文件——否则账号持续 503，产品内无自愈路径。"""
+    from pathlib import Path as _Path
+
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_recover_")
+    backup = (
+        _Path(storage_dir)
+        / "u-recover-empty.json.corrupt-20260101000000000000-1"
+    )
+    backup.write_text("{}", encoding="utf-8")
+    store = LongTermMemory(
+        "u-recover-empty", storage_dir, allow_quarantined=True
+    )
+    assert store.get_recovered_corrupt_backup()
+    import_user_data(
+        store, {"preferences": {}, "trips": [], "messages": []}
+    )
+    assert (_Path(storage_dir) / "u-recover-empty.json").exists(), (
+        "无用户数据的恢复成功后必须重建主文件"
+    )
+    fresh = LongTermMemory("u-recover-empty", storage_dir)
+    assert fresh.get_recovered_corrupt_backup() is None
+    print("✓ 无用户数据的恢复重建隔离主文件")
 
 
 def test_import_accepts_device_like_session_ids():
