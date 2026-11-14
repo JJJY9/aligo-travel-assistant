@@ -629,7 +629,7 @@ def _run_import(
     dry_run=False,
     skip_knowledge=False,
 ):
-    monkeypatch.setattr(cli, "_open_cli_store", lambda user_id: store)
+    monkeypatch.setattr(cli, "_open_cli_store", lambda user_id, **kwargs: store)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_user_import_standalone(

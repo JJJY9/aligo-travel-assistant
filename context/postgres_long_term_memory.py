@@ -490,8 +490,10 @@ class PostgresLongTermMemory:
         self, pref_type: str, value: Any, *, replay_safe: bool = True
     ) -> None:
         """写入偏好。``replay_safe=False`` 用于「读 + 合并 + 写」的结果：
-        连接重建后重放会以过期的合并值覆盖空档里其它实例的追加。"""
+        连接重建后重放会以过期的合并值覆盖空档里其它实例的追加。
+        类型上限在写锁内复核：调用方锁外预检挡不住并发新增。"""
         with self._preference_lock(pref_type):
+            self._enforce_preference_cap(pref_type)
             self._execute(
                 """
                 INSERT INTO aligo_preferences (user_id, pref_type, value)
@@ -501,6 +503,28 @@ class PostgresLongTermMemory:
                 """,
                 (self.user_id, pref_type, self._json(value)),
                 replay_safe=replay_safe,
+            )
+
+    def _enforce_preference_cap(self, pref_type: str) -> None:
+        """新建偏好类型前复核类型数上限（写锁内，并发安全）。"""
+        try:
+            from utils.user_import import _MAX_PREFERENCES
+        except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
+            return
+        row = self._fetchone(
+            "SELECT 1 FROM aligo_preferences WHERE user_id = %s AND pref_type = %s",
+            (self.user_id, pref_type),
+        )
+        if row is not None:
+            return
+        count_row = self._fetchone(
+            "SELECT COUNT(*) FROM aligo_preferences WHERE user_id = %s",
+            (self.user_id,),
+        )
+        current = int(count_row[0] or 0) if count_row else 0
+        if current >= _MAX_PREFERENCES:
+            raise ValueError(
+                f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除不用的偏好"
             )
 
     def get_preference(self, pref_type: str | None = None) -> Any:
@@ -1378,6 +1402,9 @@ class PostgresLongTermMemory:
                     # 旧行可能没有 trip_id：补发编号，否则调用方拿到空串、
                     # 定位不到刚保存的行并把自己报成冲突
                     trip_id = f"trip_{self._next_trip_number()}"
+                    # 取号内部可能重连并重放计数 UPSERT：按旧快照继续
+                    # UPDATE 会与并发实例的编号冲突
+                    self._abort_if_reconnected(start_conn)
                     self._execute(
                         "UPDATE aligo_trips SET trip_id = %s WHERE id = %s",
                         (trip_id, existing[0]),
@@ -1774,6 +1801,10 @@ class PostgresLongTermMemory:
                     attempt,
                     exc,
                 )
+                try:
+                    self._reconnect()
+                except Exception:  # noqa: BLE001 - 重连失败交给下一轮判定
+                    pass
                 start_conn = self._conn
                 continue
             except self._retry_errors as exc:
@@ -1785,6 +1816,10 @@ class PostgresLongTermMemory:
                     attempt,
                     exc,
                 )
+                try:
+                    self._reconnect()
+                except Exception:  # noqa: BLE001 - 重连失败交给下一轮判定
+                    pass
                 start_conn = self._conn
                 continue
             except Exception as exc:  # noqa: BLE001 - 快照失败退回逐项读取

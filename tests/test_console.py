@@ -146,11 +146,11 @@ def test_readline_size_after_read_keeps_buffered_lines():
     """read() 截断后再 readline(size)：截断余量不能覆盖已缓冲的后续行。"""
     from utils.console import _AutoDecodeInput
 
-    # 用 ASCII 负载：任意 GBK 汉字字节串都可能是合法 UTF-8，解码有歧义
-    payload = b"abcdef\nsecond\n"
-    shim = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
-    assert shim.read(2) == "ab"
-    # 余量里已有「cdef\nsecond\n」；readline(3) 再截断第一行
+    # 直接构造「余量里已有多行」的缓冲：普通 read(n) 恰好满足字符数时
+    # _pending 为空，旧的新旧实现等价，无法守护目标行为
+    shim = _AutoDecodeInput(_PipeBuffer(b""), "utf-8")
+    shim._ensure_mode()
+    shim._pending = "cdef\nsecond\n"
     assert shim.readline(3) == "cde"
     assert shim.readline() == "f\n", "第一行的剩余部分"
     assert shim.readline() == "second\n", "已缓冲的后续行不能丢失"

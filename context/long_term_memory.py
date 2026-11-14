@@ -686,6 +686,14 @@ class LongTermMemory:
         # 查找是否已存在该类型的偏好
         preferences = self.data["preferences"]
         found = False
+        # 类型上限在写路径（写锁内）复核：调用方锁外先读再写的预检
+        # 挡不住并发新增，越限后 /api/export 会因偏好上限永久 413
+        try:
+            from utils.user_import import _MAX_PREFERENCES
+
+            cap: int | None = _MAX_PREFERENCES
+        except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
+            cap = None
 
         for pref in preferences:
             if pref.get("type") == pref_type:
@@ -695,6 +703,10 @@ class LongTermMemory:
 
         # 如果不存在，添加新的偏好
         if not found:
+            if cap is not None and len(preferences) >= cap:
+                raise ValueError(
+                    f"偏好条目已达上限（{cap}），请先删除不用的偏好"
+                )
             preferences.append({"type": pref_type, "value": value})
 
         self._persist()
@@ -1143,10 +1155,20 @@ class LongTermMemory:
         if not self._session_exists(session_id):
             return False
         pinned_sessions = self.data.setdefault("pinned_sessions", [])
-        if pinned and session_id not in pinned_sessions:
+        # 旧数据的会话 ID 可能是整数：按字符串口径判断成员并移除，否则
+        # 面板「取消置顶」对历史整数 ID 永远无效
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(pinned_sessions)
+                if str(item) == session_id
+            ),
+            None,
+        )
+        if pinned and existing_index is None:
             pinned_sessions.append(session_id)
-        elif not pinned and session_id in pinned_sessions:
-            pinned_sessions.remove(session_id)
+        elif not pinned and existing_index is not None:
+            del pinned_sessions[existing_index]
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
         return True
@@ -1161,10 +1183,18 @@ class LongTermMemory:
         if not self._session_exists(session_id):
             return False
         archived_sessions = self.data.setdefault("archived_sessions", [])
-        if archived and session_id not in archived_sessions:
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(archived_sessions)
+                if str(item) == session_id
+            ),
+            None,
+        )
+        if archived and existing_index is None:
             archived_sessions.append(session_id)
-        elif not archived and session_id in archived_sessions:
-            archived_sessions.remove(session_id)
+        elif not archived and existing_index is not None:
+            del archived_sessions[existing_index]
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
         logger.info("Set session archived: %s -> %s", session_id, archived)

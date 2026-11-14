@@ -351,6 +351,21 @@ class AligoCLI:
                 storage_path=str(default_data_root() / "memory"),
                 llm_model=self.model,
             )
+            # 交互模式不走 _open_cli_store：这里补同口径隔离守卫，
+            # 否则会在隔离后的空快照上继续写、重建主文件让隔离备份不可见
+            quarantined = _recovered_corrupt_backup(
+                self.memory_manager.long_term
+            )
+            if quarantined:
+                self.console.print(
+                    f"[red]记忆文件损坏，已隔离备份到 {_markup_safe(quarantined)}"
+                    "（当前会按空快照处理）[/red]"
+                )
+                self.console.print(
+                    "[dim]请先运行 python cli.py user-import <用户ID> <备份文件> "
+                    "恢复数据后再进入交互模式[/dim]"
+                )
+                raise SystemExit(1)
 
             # 初始化意图识别智能体（必须预加载）
             self.intention_agent = IntentionAgent(
@@ -2948,6 +2963,7 @@ def run_user_import_standalone(
     from utils.user_import import (
         MAX_BACKUP_BYTES,
         import_user_data,
+        merged_backup_limit_problem,
         parse_user_export,
         preview_user_import,
     )
@@ -3055,11 +3071,20 @@ def run_user_import_standalone(
         )
 
     try:
-        store = _open_cli_store(user_id)
+        # 隔离态允许恢复：user-import 是被隔离账号唯一的产品内恢复路径
+        store = _open_cli_store(user_id, allow_quarantined=True)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
+            # 备份自身不超限不代表恢复后仍可导出：与账号既有数据合并后按
+            # 导出格式复核体积（与 Web /api/import 同口径）
+            merged_problem = merged_backup_limit_problem(store, sections)
+            if merged_problem:
+                return _fail(
+                    f"恢复中止：{merged_problem}"
+                    "（恢复后账号将无法再导出全量备份，请先清理数据或拆分备份）"
+                )
             if dry_run:
                 counts = preview_user_import(store, sections)
             else:
@@ -3786,12 +3811,13 @@ class _QuarantinedMemoryError(RuntimeError):
         )
 
 
-def _open_cli_store(user_id: str):
+def _open_cli_store(user_id: str, allow_quarantined: bool = False):
     """打开长期记忆；PostgreSQL 配置错误回退 JSON 时拒绝执行维护命令。
 
     记忆文件损坏隔离期间同样拒绝（与 Web 的 _open_long_term 同口径）：
     读写命令都不能在隔离后的空快照上继续操作——写命令会重建主文件、
-    让隔离备份从此不可见。
+    让隔离备份从此不可见。``allow_quarantined=True`` 仅用于 ``user-import``：
+    恢复备份是被隔离账号唯一的产品内恢复路径。
     """
     from config import STORAGE_CONFIG
     from context.long_term_memory import LongTermMemory
@@ -3805,12 +3831,13 @@ def _open_cli_store(user_id: str):
         raise RuntimeError(
             "PostgreSQL 已配置但连接失败（已回退本地 JSON），请检查数据库后重试"
         )
-    quarantined = _recovered_corrupt_backup(store)
-    if quarantined:
-        close = getattr(store, "close", None)
-        if callable(close):
-            close()
-        raise _QuarantinedMemoryError(quarantined)
+    if not allow_quarantined:
+        quarantined = _recovered_corrupt_backup(store)
+        if quarantined:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+            raise _QuarantinedMemoryError(quarantined)
     return store
 
 

@@ -531,11 +531,23 @@ def test_trip_cap_enforced_inside_write_path_and_legacy_id_repaired():
                 raise AssertionError("超过上限的新行程必须被拒绝")
             assert len(store.get_trip_history(limit=None)) == 2
 
-        # 旧数据缺口 trip_id：去重命中时补发编号，调用方能定位刚保存的行
-        json_store.data["trip_history"][0].pop("trip_id", None)
-        repaired = json_store.save_trip_history(dict(base))
+        # 旧数据缺口 trip_id：写盘后重读（save 的 _locked_mutation 会重载
+        # 磁盘，只在内存里 pop 会被覆盖），去重命中时补发编号
+        import json as _json
+        from pathlib import Path as _Path
+
+        data_path = _Path(json_store.db_path)
+        raw = _json.loads(data_path.read_text(encoding="utf-8"))
+        for trip in raw.get("trip_history", []):
+            if str(trip.get("destination")) == "上海":
+                trip.pop("trip_id", None)
+        data_path.write_text(
+            _json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        reopened = LongTermMemory("json-cap", str(data_path.parent))
+        repaired = reopened.save_trip_history(dict(base), max_total=2)
         assert repaired, "旧行去重命中后必须返回可用的 trip_id"
-        stored = json_store.get_trip_history(limit=None)
+        stored = reopened.get_trip_history(limit=None)
         matched = [
             trip
             for trip in stored
