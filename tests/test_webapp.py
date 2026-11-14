@@ -11405,12 +11405,17 @@ def test_persistence_failure_detail_keeps_quarantine_hint():
         MemoryPersistenceError("长期记忆重载失败（data/memory/u1.json）：bad"),
         "rid-3",
     )
-    assert "恢复" in reload_failed, reload_failed
+    # 未隔离、没有备份可恢复：不能引导用户去找不存在的备份文件
+    assert "损坏" in reload_failed and "备份文件恢复" not in reload_failed, (
+        reload_failed
+    )
     cannot_backup = server_module._persistence_failure_detail(
         MemoryPersistenceError("记忆文件损坏且无法备份，已拒绝覆盖写入"),
         "rid-4",
     )
-    assert "恢复" in cannot_backup, cannot_backup
+    assert "损坏" in cannot_backup and "备份文件恢复" not in cannot_backup, (
+        cannot_backup
+    )
 
 
 def test_persistence_detail_prefix_only():
@@ -11424,12 +11429,91 @@ def test_persistence_detail_prefix_only():
     assert "存储暂时不可用" in detail, detail
 
 
-def test_web_session_quarantine_gate_requires_json_backend(monkeypatch, tmp_path):
-    """_WebSession 构造守卫只在 JSON 后端（db_path）扫描隔离备份：
-    PG 形存储不受遗留 .corrupt-* 影响。"""
+def test_quarantine_marker_fresh_and_pending_unconditional(monkeypatch):
+    """本实例当场检测（fresh）/ 待复核（pending）在任何 DSN 配置下都拦截；
+    历史遗留备份才受 PG 门禁。"""
+    from config import STORAGE_CONFIG
+    from webapp import server as server_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://x/y")
+
+    class _FreshStore:
+        def get_fresh_quarantine_backup(self):
+            return "u.json.corrupt-1"
+
+    assert server_module._quarantine_marker_for("u", _FreshStore())
+
+    class _PendingStore:
+        def get_fresh_quarantine_backup(self):
+            return None
+
+        def has_pending_corrupt_quarantine(self):
+            return True
+
+    assert server_module._quarantine_marker_for("u", _PendingStore())
+
+    class _LeftoverStore:
+        def get_recovered_corrupt_backup(self):
+            return "u.json.corrupt-1"
+
+    assert server_module._quarantine_marker_for("u", _LeftoverStore()) is None
+
+
+def test_cached_session_quarantined_is_evicted_and_closed(monkeypatch, tmp_path):
+    """缓存会话在隔离发生后被驱逐并立即关闭（构造守卫随后 503）。"""
+    from config import STORAGE_CONFIG
     from utils.errors import MemoryPersistenceError
     from webapp import server as server_module
 
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    app_state = server_module.AligoWebApp(model=None)
+    closed = []
+
+    class _FakeLongTerm:
+        db_path = str(tmp_path / "u-cache.json")
+
+        def get_recovered_corrupt_backup(self):
+            return None
+
+    class _FakeMemory:
+        long_term = _FakeLongTerm()
+
+    class _FakeRuntime:
+        memory = _FakeMemory()
+
+    class _FakeSession:
+        runtime = _FakeRuntime()
+
+        def close(self):
+            closed.append(True)
+
+    class _BoomSession:
+        def __init__(self, *args, **kwargs):
+            raise MemoryPersistenceError("记忆文件损坏并已隔离备份")
+
+    (tmp_path / "u-cache.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+    monkeypatch.setattr(server_module, "_WebSession", _BoomSession)
+    key = app_state._session_key("u-cache", "s1")
+    app_state.sessions[key] = _FakeSession()
+    try:
+        with pytest.raises(MemoryPersistenceError):
+            app_state.get_session("u-cache", "s1")
+    finally:
+        app_state.sessions.pop(key, None)
+    assert closed == [True], "被驱逐的隔离会话必须立即关闭"
+
+
+def test_web_session_quarantine_gate_requires_json_backend(monkeypatch, tmp_path):
+    """_WebSession 构造守卫只在 JSON 后端（db_path）扫描隔离备份：
+    PG 形存储不受遗留 .corrupt-* 影响。"""
+    from config import STORAGE_CONFIG
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
     monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
     (tmp_path / "u-gate.json.corrupt-20260101000000000000-1").write_text(
         "{}", encoding="utf-8"

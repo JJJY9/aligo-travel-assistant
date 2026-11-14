@@ -2308,6 +2308,33 @@ def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     print("✓ 合并复核计入现有快照的额外字段")
 
 
+def test_merged_preview_keeps_existing_frequent_destinations(monkeypatch):
+    """存量 statistics 与 trip_history 不一致时取并集（保守，不低估体积）。"""
+    from utils import user_import as module
+
+    class _Store:
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {
+                    "frequent_destinations": {"旧城市" * 600: 3},
+                },
+            }
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 2_000)
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"preferences": {}, "trips": [], "messages": []}
+    )
+    # 存量统计（旧城市×180 字 × 3 的键文本）保留 → 超限
+    assert problem and "超过导入上限" in problem, problem
+    print("✓ 合并预演保留存量 frequent_destinations")
+
+
 def test_merged_payload_recomputes_frequent_destinations(monkeypatch):
     """导入会为每个唯一目的地复制完整文本进 statistics：合并体积按导入后
     重算（沿用导入前快照会系统性低估、放行导出永久 413 的恢复）。"""
