@@ -2292,10 +2292,10 @@ def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
                 "chat_history": [],
                 "trip_history": [],
                 "preferences": {},
-                "session_titles": {},
+                "session_titles": {"s-big": "长标题" * 600},
                 "pinned_sessions": [],
                 "archived_sessions": [],
-                "statistics": {"frequent_destinations": {"x" * 1000: 1}},
+                "statistics": {"total_queries": 1},
                 "user_id": "u1",
                 "exported_at": "2026-01-01T00:00:00",
             }
@@ -2306,6 +2306,40 @@ def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     )
     assert problem and "超过导入上限" in problem, problem
     print("✓ 合并复核计入现有快照的额外字段")
+
+
+def test_merged_payload_recomputes_frequent_destinations(monkeypatch):
+    """导入会为每个唯一目的地复制完整文本进 statistics：合并体积按导入后
+    重算（沿用导入前快照会系统性低估、放行导出永久 413 的恢复）。"""
+    from utils import user_import as module
+
+    class _Store:
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    big_dest = "目的地" * 80
+    trips = [
+        {
+            "origin": "上海",
+            "destination": f"{big_dest}{i}",
+            "start_date": "2027-01-01",
+        }
+        for i in range(50)
+    ]
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 50_000)
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"preferences": {}, "trips": trips, "messages": []}
+    )
+    assert problem and "超过导入上限" in problem, problem
+    print("✓ 合并体积按导入后重算 frequent_destinations")
 
 
 def test_preview_counts_identityless_trips_as_created():

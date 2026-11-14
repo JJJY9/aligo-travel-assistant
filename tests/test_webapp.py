@@ -3722,11 +3722,11 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
 
     client = _client()
     user_id = _unique_user("web_test_import_fail")
-    strict_flags = []
+    open_flags = []
     original_open = server_module._open_long_term
 
     def failing_open(target_user, strict=False, **kwargs):
-        strict_flags.append(strict)
+        open_flags.append((strict, kwargs.get("allow_quarantined")))
         raise MemoryPersistenceError("disk full")
 
     monkeypatch.setattr(server_module, "_open_long_term", failing_open)
@@ -3737,7 +3737,9 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
     )
     assert response.status_code == 503
     assert "存储暂时不可用" in response.json()["detail"]
-    assert strict_flags == [True], "恢复必须 strict 打开（不写回退 JSON）"
+    assert open_flags == [(True, True)], (
+        "恢复必须 strict 且 allow_quarantined 打开"
+    )
 
     def boom_open(target_user, strict=False, allow_quarantined=False):
         raise RuntimeError("unexpected")
@@ -11399,6 +11401,16 @@ def test_persistence_failure_detail_keeps_quarantine_hint():
         MemoryPersistenceError("长期记忆写入失败"), "rid-2"
     )
     assert "存储暂时不可用" in generic and "隔离" not in generic, generic
+    reload_failed = server_module._persistence_failure_detail(
+        MemoryPersistenceError("长期记忆重载失败（data/memory/u1.json）：bad"),
+        "rid-3",
+    )
+    assert "恢复" in reload_failed, reload_failed
+    cannot_backup = server_module._persistence_failure_detail(
+        MemoryPersistenceError("记忆文件损坏且无法备份，已拒绝覆盖写入"),
+        "rid-4",
+    )
+    assert "恢复" in cannot_backup, cannot_backup
 
 
 def test_persistence_detail_prefix_only():
@@ -11410,6 +11422,52 @@ def test_persistence_detail_prefix_only():
         MemoryPersistenceError("写入隔离目录失败"), "rid-3"
     )
     assert "存储暂时不可用" in detail, detail
+
+
+def test_web_session_quarantine_gate_requires_json_backend(monkeypatch, tmp_path):
+    """_WebSession 构造守卫只在 JSON 后端（db_path）扫描隔离备份：
+    PG 形存储不受遗留 .corrupt-* 影响。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+    (tmp_path / "u-gate.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    class _FakeLongTerm:
+        def __init__(self, db_path=None):
+            if db_path is not None:
+                self.db_path = db_path
+
+    class _FakeMemory:
+        def __init__(self, long_term):
+            self.long_term = long_term
+
+    class _FakeRuntime:
+        def __init__(self, long_term):
+            self.memory = _FakeMemory(long_term)
+
+        def close(self):
+            pass
+
+    def make_session(long_term):
+        monkeypatch.setattr(
+            server_module,
+            "ConversationRuntime",
+            lambda **kwargs: _FakeRuntime(long_term),
+        )
+        return server_module._WebSession("u-gate", "s1", None, None)
+
+    # PG 形（无 db_path）：不拦截
+    session = make_session(_FakeLongTerm())
+    session.close()
+
+    # JSON 形（有 db_path）：拦截
+    with pytest.raises(MemoryPersistenceError) as info:
+        make_session(_FakeLongTerm(db_path=str(tmp_path / "u-gate.json")))
+    assert "隔离" in str(info.value)
+    print("✓ _WebSession 隔离门禁按后端类型生效")
 
 
 def test_quarantined_backup_scan_ignores_deleted_accounts(monkeypatch, tmp_path):

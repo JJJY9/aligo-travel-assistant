@@ -1049,21 +1049,9 @@ class _WebSession:
         )
         # 聊天会话不经 _open_long_term：在隔离后的空快照上继续写会重建
         # 主文件、让隔离备份从此不可见（与维护接口同口径拒绝）
-        marker = None
-        try:
-            long_term = getattr(
-                getattr(self.runtime, "memory", None), "long_term", None
-            )
-            getter = getattr(long_term, "get_recovered_corrupt_backup", None)
-            if callable(getter):
-                marker = getter()
-            if not marker and getattr(long_term, "db_path", None):
-                # 目录扫描只对 JSON 后端有意义：PostgreSQL 后端下遗留的
-                # .corrupt-* 文件与该账号无关（恢复写的是 PG），扫描会让
-                # 所有新会话永久 503
-                marker = _quarantined_memory_backup(user_id)
-        except Exception:  # noqa: BLE001 - 探测失败不阻断会话
-            marker = None
+        marker = _quarantine_marker_for(
+            user_id, _session_long_term(self)
+        )
         if marker:
             try:
                 self.runtime.close()
@@ -1438,10 +1426,19 @@ class AligoWebApp:
         with self._sessions_lock:
             session = self.sessions.get(key)
             if session is not None:
-                self.sessions.move_to_end(key)
-                if mark_in_use:
-                    session.begin_turn()
-                self._evict_over_limit_locked(key, evicted)
+                if _quarantine_marker_for(
+                    user_id, _session_long_term(session)
+                ):
+                    # 会话缓存期间账号被隔离：驱逐缓存，走下面新建路径由
+                    # 构造守卫返回带恢复引导的 503（不再先白跑整轮 LLM）
+                    self.sessions.pop(key, None)
+                    evicted.append(session)
+                    session = None
+                else:
+                    self.sessions.move_to_end(key)
+                    if mark_in_use:
+                        session.begin_turn()
+                    self._evict_over_limit_locked(key, evicted)
         if session is None:
             # 构造前预检：_WebSession 构造会打开一条 PostgreSQL 连接并跑建表
             # DDL，全部槽位都在用时不该为注定 503 的请求白付这部分代价。
@@ -2221,6 +2218,34 @@ def _get_weather_executor() -> ThreadPoolExecutor:
 # ---------- 长期记忆读取 ----------
 
 
+def _session_long_term(session: Any) -> Any:
+    return getattr(getattr(session.runtime, "memory", None), "long_term", None)
+
+
+def _quarantine_marker_for(user_id: str, long_term: Any) -> str | None:
+    """会话构造 / 打开 / 缓存命中三处共用的隔离标记探测。
+
+    只在「JSON 后端且未配置 PostgreSQL」时生效：PG 配置但故障冷却时工厂
+    会回退 JSON，遗留的 .corrupt-* 与该账号无关，不能因此拦截（数据库
+    恢复后切回 PG）。
+    """
+    try:
+        from config import STORAGE_CONFIG
+
+        if STORAGE_CONFIG.get("postgres_dsn"):
+            return None
+        getter = getattr(long_term, "get_recovered_corrupt_backup", None)
+        if callable(getter):
+            marker = getter()
+            if marker:
+                return str(marker)
+        if getattr(long_term, "db_path", None):
+            return _quarantined_memory_backup(user_id)
+    except Exception:  # noqa: BLE001 - 探测失败不阻断会话
+        return None
+    return None
+
+
 def _quarantined_memory_backup(user_id: str) -> str | None:
     """JSON 记忆主文件不存在但存在 .corrupt-* 隔离备份时返回备份路径。
 
@@ -2232,10 +2257,23 @@ def _quarantined_memory_backup(user_id: str) -> str | None:
     base = MEMORY_DIR / f"{user_id}.json"
     if base.exists():
         return None
-    if Path(f"{base}.deleted").exists():
-        # 账号数据已删除：遗留的隔离备份是孤儿，不应再让所有请求 503
-        return None
     backups = sorted(MEMORY_DIR.glob(f"{user_id}.json.corrupt-*"))
+    deleted_marker = Path(f"{base}.deleted")
+    if deleted_marker.exists():
+        # 账号数据已删除：遗留的隔离备份是孤儿，不应再让所有请求 503；
+        # 但晚于墓碑的新隔离备份说明删除后又发生了损坏，仍按隔离处理
+        try:
+            marker_mtime = deleted_marker.stat().st_mtime
+        except OSError:
+            marker_mtime = 0.0
+        newest = 0.0
+        for backup in backups:
+            try:
+                newest = max(newest, backup.stat().st_mtime)
+            except OSError:
+                pass
+        if newest <= marker_mtime:
+            return None
     return str(backups[-1]) if backups else None
 
 
@@ -2266,16 +2304,7 @@ def _open_long_term(
             strict=strict,
             allow_quarantined=allow_quarantined,
         )
-        marker = None
-        getter = getattr(store, "get_recovered_corrupt_backup", None)
-        if callable(getter):
-            marker = getter()
-        if not marker and getattr(store, "db_path", None):
-            # 只有 JSON 后端才有 .corrupt-* 文件：PostgreSQL 后端下同一
-            # 目录里遗留的隔离文件与该账号无关，扫描会让其所有请求永久
-            # 503（而 /api/import 的豁免恢复写的是 PG、永远不会重建
-            # u1.json 来清标记）
-            marker = _quarantined_memory_backup(user_id)
+        marker = _quarantine_marker_for(user_id, store)
         # 恢复备份是被隔离账号唯一的产品内恢复路径：/api/import 显式豁免
         if marker and not allow_quarantined:
             close = getattr(store, "close", None)
@@ -2313,6 +2342,8 @@ def _redact_doctor_detail(text: str) -> str:
 _QUARANTINE_MESSAGE_PREFIXES = (
     "记忆文件损坏并已隔离",
     "记忆主文件缺失且存在损坏隔离备份",
+    "长期记忆重载失败",
+    "记忆文件损坏且无法备份",
 )
 
 

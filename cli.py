@@ -3784,10 +3784,20 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
     try:
         if base.exists():
             return None
-        if base.with_name(base.name + ".deleted").exists():
-            # 账号数据已删除：遗留的隔离备份是孤儿
-            return None
         matches = sorted(base.parent.glob(base.name + ".corrupt-*"))
+        deleted_marker = base.with_name(base.name + ".deleted")
+        if deleted_marker.exists():
+            # 账号数据已删除：遗留的隔离备份是孤儿；晚于墓碑的新隔离
+            # 备份说明删除后又发生损坏，仍按隔离处理
+            try:
+                marker_mtime = deleted_marker.stat().st_mtime
+                newest = max(
+                    (m.stat().st_mtime for m in matches), default=0.0
+                )
+            except OSError:
+                marker_mtime, newest = 0.0, 0.0
+            if newest <= marker_mtime:
+                return None
     except OSError:
         return None
     return str(matches[-1]) if matches else None
