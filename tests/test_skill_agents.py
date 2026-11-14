@@ -2261,6 +2261,73 @@ def test_preference_example_labeled_object_not_chosen():
     print("✓ 偏好：示例标签对象不压过真实结果")
 
 
+def test_preference_paren_example_object_and_array_rejected():
+    """「结果（示例）：」标注的对象/数组按示例处理：真实偏好保留。"""
+    real = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "北京朝阳区"}]}'
+    )
+    for tail in (
+        '结果（示例）：{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "汉庭"}]}',
+        '结果(示例)：[{"type": "hotel_brands", "value": "汉庭"}]',
+    ):
+        data = _pref_reply(f"{real}" + "\n" + tail)
+        assert data["preferences"] == [
+            {"type": "home_location", "value": "北京朝阳区"}
+        ], (tail, data)
+    print("✓ 偏好：括号示例标记的对象 / 数组不参与竞争")
+
+
+def test_preference_multielement_example_array_not_written():
+    """多元素「示例：[...]」：全部元素继承示例标记——只有示例答案时按
+    解析失败返回，示例值不写库。"""
+    payload = (
+        '示例：[{"type": "hotel_brands", "value": "汉庭"}, '
+        '{"type": "airlines", "value": "东航"}]'
+    )
+    data = _pref_reply(payload)
+    assert data.get("error"), data
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "汉庭" not in rendered and "东航" not in rendered, data
+
+    real = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "如家"}]}'
+    )
+    data = _pref_reply(f"{real}" + "\n" + payload)
+    assert data["preferences"] == [
+        {"type": "hotel_brands", "value": "如家"}
+    ], data
+    print("✓ 偏好：多元素示例数组不写库")
+
+
+def test_preference_instruction_suffix_phrase_not_formal():
+    """「返回结果 / 若无偏好返回结果」不算结果标签：真实偏好保留。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    for label in ("返回结果", "若无偏好返回结果"):
+        data = _pref_reply(f"{formal}" + "\n" + f"{label}：[]")
+        assert data.get("has_preferences") is True, (label, data)
+    print("✓ 偏好：指令式短语不判正式空结果")
+
+
+def test_preference_bold_paren_formal_label_recognized():
+    """加粗的括号正式标签（「**（正式结果）：**」）判正式空结果。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    data = _pref_reply(
+        f"示例：{example}" + "\n" + "**（正式结果）：**" + "\n" + "[]"
+    )
+    assert data.get("has_preferences") is False, data
+    assert "上海浦东新区" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：加粗括号正式标签生效")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2544,6 +2611,48 @@ def test_event_collection_example_labeled_empty_does_not_beat_real_result():
     print("✓ 事项收集：示例标签的空结果不压过真实提取")
 
 
+def test_event_collection_paren_narrative_line_keeps_real_extraction():
+    """叙述句的括号里出现「示例」（「按照（示例）格式，提取结果如下：」）
+    不把其后的真实提取判为回显。"""
+    example = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"extracted_count": 7}'
+    )
+    sentence = "按照（示例）格式，提取结果如下："
+    real = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    data = _event_reply(f"{example}" + "\n" + sentence + "\n" + real)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：括号叙述句不降级真实提取")
+
+
+def test_event_collection_multiline_example_array_not_written():
+    """多行书写的示例数组（「示例：」下一行才是「[」）：元素继承示例
+    标记——只有示例答案时按解析失败返回，示例字段不写库。"""
+    payload = (
+        '示例：' + "\n" + '[{"origin": "北京", "destination": "北京", "start_date": "2026-02-27"}]'
+    )
+    data = _event_reply(payload)
+    assert data.get("error"), data
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：多行示例数组不写库")
+
+
+def test_event_collection_supplement_labeled_substantive_is_subordinate():
+    """带「尾注：」标签的实质形状对象降级：真实提取保留。"""
+    real = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    tail = '尾注：{"origin": "北京", "destination": "北京"}'
+    data = _event_reply(f"{real}" + "\n" + tail)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：补充标签的实质对象不顶掉真实提取")
+
+
 def test_event_collection_narrative_example_sentence_not_example_label():
     """以「示例」开头的叙述句（含句子标点）不是示例标签：其后的真实提取
     按位置胜出，回显示例不写库。"""
@@ -2716,6 +2825,25 @@ def test_plan_trip_narrative_example_sentence_not_example_label():
     assert data.get("error") is None, data
     assert data["itinerary"]["title"] == "杭州出差", data
     print("✓ 行程规划：示例叙述句不降级真实行程")
+
+
+def test_plan_trip_paren_narrative_line_keeps_real_plan():
+    """叙述句括号里出现「示例」不把真实行程判为回显；「**（尾注）：**」
+    加粗括号标签仍让位。"""
+    example = '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    sentence = "按照（示例）格式，真实行程如下："
+    real = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}, {"day": 2}]}}'
+    data = _plan_trip_reply(
+        f"{example}" + "\n" + sentence + "\n" + real
+    )
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    bold_tail = "**（尾注）：**" + "\n" + '{"title": "注意事项", "duration": "2天"}'
+    data = _plan_trip_reply(f"{full}" + "\n" + bold_tail)
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：括号叙述句不降级、加粗括号尾注让位")
 
 
 def test_plan_trip_prose_with_supplement_word_keeps_formal_result():

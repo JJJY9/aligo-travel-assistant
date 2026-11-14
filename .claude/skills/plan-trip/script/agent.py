@@ -140,6 +140,26 @@ _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "�
 
 
 _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
+_PAREN_EXAMPLE = frozenset(
+    {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
+)
+
+
+def _paren_example_marker(line: str) -> bool:
+    """括号里自称示例的短标签（「结果（示例）：」「（示例）：」）。
+
+    去掉括号组后剩余文本不含句子标点（叙述句不算），且某个括号组的
+    内容精确命中示例短语——「按照（示例）格式，结果如下：」不算示例。"""
+    outside = _PAREN_GROUP_RE.sub("", line)
+    if any(ch in outside for ch in "，。；、！？,;!?…"):
+        return False
+    for group in _PAREN_GROUP_RE.findall(line):
+        content = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", group[1:-1])
+        if content in _PAREN_EXAMPLE:
+            return True
+    return False
+
+
 def _label_phrase(label: str) -> str | None:
     line = ""
     for item in label.splitlines():
@@ -154,11 +174,7 @@ def _label_phrase(label: str) -> str | None:
         if stripped == cleaned_line:
             break
         cleaned_line = stripped
-    for group in _PAREN_GROUP_RE.findall(line):
-        if re.search(r"示例|例如|样例", group):
-            # 「结果（示例）：」「正式结果（例如）：」：括号里自称示例
-            return "示例"
-    if not re.sub(r"[:：=\s]", "", cleaned_line):
+    if not re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", cleaned_line):
         # 整行就是括号里的标签（「（尾注）：」「(示例)：」）：取括号内容
         match = _PAREN_GROUP_RE.search(line)
         if match:
@@ -192,8 +208,16 @@ _SENTENCE_PUNCT = "，。；、！？,;!?…"
 def _label_kind(label: str) -> str:
     """候选对象前的标签：example / supplement / formal / neutral。
 
-    示例标签要求短短语：含句子标点的叙述句（「示例中的日期只是占位，
-    真实结果如下」）不算示例，避免把其后的真实终稿误判为回显。"""
+    示例标签要求短短语或精确的括号示例标记：含句子标点的叙述句
+    （「示例中的日期只是占位，真实结果如下」）不算示例，避免把其后的
+    真实终稿误判为回显。"""
+    line = ""
+    for item in label.splitlines():
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
+        if cleaned:
+            line = cleaned
+    if line and _paren_example_marker(line):
+        return "example"
     phrase = _label_phrase(label)
     if not phrase:
         return "neutral"
@@ -207,6 +231,27 @@ def _label_kind(label: str) -> str:
     if phrase in _FORMAL_LABELS:
         return "formal"
     return "neutral"
+
+
+def _iter_array_spans(text: str):
+    decoder = json.JSONDecoder()
+    index = text.find("[")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("[", index + 1)
+            continue
+        if isinstance(value, list):
+            yield index, end
+        index = text.find("[", max(end, index + 1))
+
+
+def _inside_example_array(text: str, start: int) -> bool:
+    for array_start, array_end in _iter_array_spans(text):
+        if array_start < start < array_end:
+            return _label_kind(text[:array_start]) == "example"
+    return False
 
 
 def _select_plan_result(text: str) -> dict | None:
@@ -237,6 +282,8 @@ def _select_plan_result(text: str) -> dict | None:
                 failed_tail = True
             continue
         kind = _label_kind(text[prev_end:start])
+        if kind != "example" and _inside_example_array(text, start):
+            kind = "example"
         prev_end = end
         plan = _as_plan_object(value)
         if plan is None:
@@ -247,7 +294,9 @@ def _select_plan_result(text: str) -> dict | None:
             candidates.append((plan, end, kind))
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    real = [item for item in candidates if item[2] != "example"] or candidates
+    # 回显示例候选不参与竞争；只剩示例时宁可报错（reply 侧按解析失败
+    # 返回），也不把示例行程当成真实规划交出去
+    real = [item for item in candidates if item[2] != "example"]
     strong = [
         item
         for item in real
@@ -257,6 +306,8 @@ def _select_plan_result(text: str) -> dict | None:
     ] or real
     if strong:
         chosen, chosen_end, _ = strong[-1]
+    elif candidates and all(item[2] == "example" for item in candidates):
+        return None
     elif last_any is not None:
         chosen, chosen_end = last_any, last_any_end
     else:
