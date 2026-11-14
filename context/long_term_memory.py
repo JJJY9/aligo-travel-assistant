@@ -189,9 +189,10 @@ class LongTermMemory:
         self._corrupt_pending = False
         # 本次启动时被隔离的损坏记忆文件路径（供 CLI 报告，无损坏为 None）
         self._corrupt_backup: str | None = None
-        # 本实例亲自完成过隔离（损坏文件由它备份）。只有这种实例允许在
-        # 空快照上继续写回重建；「主文件缺失 + 存在别人的隔离备份」表示
-        # 隔离发生在别处，普通写回会把隔离状态掩盖成正常写入
+        # 写前复核（_ensure_corrupt_backed_up）亲自补备份后允许在空快照上
+        # 继续完成本次写入；构造期检测到损坏、或「主文件缺失 + 存在别人
+        # 的隔离备份」都不放行写回——先打开的长会话（Web 缓存会话 /
+        # CLI 交互）不能把隔离掩盖成正常写入
         self._may_recreate = False
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
@@ -248,7 +249,6 @@ class LongTermMemory:
                                 try:
                                     os.replace(self.db_path, backup)
                                     self._corrupt_backup = backup
-                                    self._may_recreate = True
                                     logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 except OSError as backup_error:
                                     # 文件可能仍被其它进程持有：先以空快照启动，
@@ -369,7 +369,8 @@ class LongTermMemory:
                 # 主文件缺失 + 存在隔离备份：损坏文件已被隔离。沿用内存
                 # 快照写回会重建主文件、让隔离备份从此不可见（恢复提示
                 # 与隔离守卫全部失效）；只有显式以「恢复」打开的实例
-                # （user-import / /api/import）允许重建。
+                # （user-import / /api/import）与写前复核刚补完备份的同一
+                # 次写入（_may_recreate）允许重建。
                 raise MemoryPersistenceError(
                     "记忆主文件缺失且存在损坏隔离备份，已拒绝重建写入"
                     f"（备份：{backups[-1]}）"
@@ -1787,12 +1788,22 @@ class LongTermMemory:
                     except FileNotFoundError:
                         pass
                     # 隔离备份也是该账号的记忆数据：一并删除，否则删除后的
-                    # 第一次写入会因「主文件缺失 + 存在 .corrupt-*」被拒绝
+                    # 第一次写入会因「主文件缺失 + 存在 .corrupt-*」被拒绝。
+                    # 删除失败不能静默：主文件已移除、备份仍在时，后续写入会
+                    # 持续被隔离守卫拒绝，必须让调用方知道删除未完成
+                    failed: list[str] = []
                     for backup in self._corrupt_siblings():
                         try:
                             os.remove(backup)
+                        except FileNotFoundError:
+                            continue
                         except OSError:
-                            pass
+                            failed.append(str(backup))
+                    if failed:
+                        raise MemoryPersistenceError(
+                            "删除长期记忆时无法移除隔离备份："
+                            + "、".join(failed)
+                        )
                     self._corrupt_backup = None
                     self._may_recreate = False
                     self.data = self._init_data()

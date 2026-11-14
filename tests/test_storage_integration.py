@@ -23,6 +23,8 @@ import pytest
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
+from utils.errors import MemoryPersistenceError
+
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "")
 TEST_POSTGRES_DSN = os.environ.get("TEST_POSTGRES_DSN", "")
 
@@ -774,7 +776,9 @@ def test_pg_preference_cap_serializes_across_types(monkeypatch):
             try:
                 other.save_preference("cap_type_d", "y")
                 results.append(("b", "ok"))
-            except ValueError as exc:
+            except (ValueError, MemoryPersistenceError) as exc:
+                # 等锁超时（55P03）同样证明用户级锁生效；CI 调度慢时 B 可能
+                # 等不到 A 释放就按持久化失败退出，不能当成用例失败
                 results.append(("b", exc))
 
         thread_a = threading.Thread(target=worker_a)
@@ -790,7 +794,10 @@ def test_pg_preference_cap_serializes_across_types(monkeypatch):
         thread_a.join(10)
         thread_b.join(10)
         assert ("a", "ok") in results, results
-        assert any(name == "b" and isinstance(item, ValueError) for name, item in results), results
+        assert any(
+            name == "b" and isinstance(item, (ValueError, MemoryPersistenceError))
+            for name, item in results
+        ), results
         assert len(memory.get_preference()) == 3
         print("✓ PG 偏好上限在不同类型的并发新增之间仍然成立")
     finally:

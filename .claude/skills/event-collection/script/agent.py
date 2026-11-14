@@ -98,38 +98,63 @@ def _is_explicit_empty(obj: dict) -> bool:
     )
 
 
-# 候选对象前的标签：只有「整行就是一个短标签」才参与判定（示例：/尾注：），
-# 叙述句里偶然出现「示例」「补充」不算。形状相同的 missing_info 对象既可能
-# 是本轮「信息不足」终稿、也可能是附在结果后的尾注，标签与位置共同决定它
-# 能否否决更早的实质候选。
-_EVENT_EXAMPLE_LABEL_RE = re.compile(
-    r"^(示例|例如|样例)(输出|结果|内容|格式)?\s*[:：]?\s*$"
-)
-_EVENT_SUPPLEMENT_LABEL_RE = re.compile(
-    r"^(补充|尾注|备注|附注|提示|注意|说明|须知)"
-    r"(说明|信息|内容|事项|结果|行程|安排)?\s*[:：]?\s*$"
-)
+def _is_counted_empty(obj: dict) -> bool:
+    """带计数（extracted_count == 0）的显式空结果。"""
+    count = obj.get("extracted_count")
+    return isinstance(count, int) and not isinstance(count, bool) and count == 0
 
 
-def _event_label_kind(label: str) -> str:
-    """候选对象前的标签：example（回显示例）/ supplement（补充尾注）/ neutral。
+def _has_full_event_schema(obj: dict) -> bool:
+    """结果对象是否带完整字段表（所有核心字段键都存在，值可为 null）。
 
-    先剔除 Markdown 围栏（对象常被 ```json 包住，标签与对象之间隔着
-    围栏行），再要求最后一个非空行本身就是一个短标签。
+    prompt 要求「对应字段设为 null」，模型按此输出的「信息不足」终稿
+    带全套字段且 missing_info 非空——与本轮结果同形，是最终表态。
     """
-    lines = []
+    return all(key in obj for key in _CORE_FIELDS)
+
+
+def _is_authoritative_empty(obj: dict) -> bool:
+    """形状上可确定「本轮最终表态：没有提取到信息」的空结果：带计数
+    （extracted_count == 0），或字段表完整、没有任何核心字段有值且声明了
+    缺失信息（全 null 终稿）。无计数、不完整字段表的局部 missing_info
+    尾注不在其列，按补充说明处理（保留更早的完整提取）。"""
+    if _is_counted_empty(obj):
+        return True
+    return (
+        _has_full_event_schema(obj)
+        and _plan_score(obj) == 0
+        and _is_explicit_empty(obj)
+    )
+
+
+# 回显示例句的识别：取候选前文本最后一个非空、非围栏行的最后一个冒号
+# 之后的短语（剔除加粗 / 标题 / 方括号等装饰）——「示例：」「**示例：**」
+# 「【示例】」都算；叙述句（「按照示例格式，提取结果如下：」）不算。
+_EXAMPLE_LABELS = frozenset(
+    {"示例", "例如", "样例", "示例输出", "示例结果", "示例内容", "示例格式"}
+)
+
+
+def _event_label_is_example(label: str) -> bool:
+    line = ""
     for item in label.splitlines():
-        cleaned = re.sub(r"```+\w*\s*$", "", item).strip()
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
-            lines.append(cleaned)
-    if not lines:
-        return "neutral"
-    line = lines[-1]
-    if _EVENT_EXAMPLE_LABEL_RE.match(line):
-        return "example"
-    if _EVENT_SUPPLEMENT_LABEL_RE.match(line):
-        return "supplement"
-    return "neutral"
+            line = cleaned
+    if not line:
+        return False
+    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    phrase = re.split(r"[:：=]", decoration_free.rstrip(":：="))[-1]
+    # 「以下是本次正式结果：」这类说明句：剥掉常见引导词后仍要求整词命中
+    changed = True
+    while changed:
+        changed = False
+        for lead in ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次"):
+            if phrase.startswith(lead) and len(phrase) > len(lead):
+                phrase = phrase[len(lead):]
+                changed = True
+                break
+    return phrase in _EXAMPLE_LABELS
 
 
 def _normalize_event_date(text: str) -> str | None:
@@ -192,10 +217,9 @@ def _select_event_result(text: str) -> dict | None:
     last_any_end = -1
     substantive: dict | None = None
     substantive_end = -1
-    substantive_kind = "neutral"
+    substantive_is_example = False
     explicit_empty: dict | None = None
     explicit_empty_end = -1
-    explicit_empty_kind = "neutral"
     failed_tail = False
     prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
@@ -203,7 +227,7 @@ def _select_event_result(text: str) -> dict | None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
             continue
-        label_kind = _event_label_kind(text[prev_end:start])
+        label_example = _event_label_is_example(text[prev_end:start])
         prev_end = end
         candidate = _unwrap_result(value)
         if candidate is None:
@@ -211,25 +235,26 @@ def _select_event_result(text: str) -> dict | None:
         last_any, last_any_end = candidate, end
         failed_tail = False
         if _plan_score(candidate) > 0:
-            substantive, substantive_end, substantive_kind = candidate, end, label_kind
-        elif _is_explicit_empty(candidate):
-            explicit_empty, explicit_empty_end, explicit_empty_kind = (
+            substantive, substantive_end, substantive_is_example = (
                 candidate,
                 end,
-                label_kind,
+                label_example,
             )
+        elif _is_explicit_empty(candidate):
+            explicit_empty, explicit_empty_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     if substantive is not None and explicit_empty is not None:
         if explicit_empty_end > substantive_end:
-            # 后置的显式空结果按位置胜出——除非它是带「尾注：/补充：」标签
-            # 的局部说明且更早的实质候选不是回显示例：真实提取保留。形状
-            # 相同（计数有无、字段表是否完整）不再参与判定，避免示例回显
-            # 与「信息不足」终稿在不同变体下反复互相顶掉
-            if explicit_empty_kind == "supplement" and substantive_kind != "example":
-                chosen, chosen_end = substantive, substantive_end
-            else:
+            # 后置空结果按位置胜出的两类情形：形状上确定是本轮终稿
+            # （计数 0 / 全 null 字段表），或更早的实质候选是回显示例
+            # （示例之后出现「信息不足」声明：绝不把示例字段写库）。
+            # 其余无标签 / 未识别标签的局部 missing_info 尾注是补充说明，
+            # 不能顶掉真实提取
+            if _is_authoritative_empty(explicit_empty) or substantive_is_example:
                 chosen, chosen_end = explicit_empty, explicit_empty_end
+            else:
+                chosen, chosen_end = substantive, substantive_end
         else:
             chosen, chosen_end = substantive, substantive_end
     elif substantive is not None:

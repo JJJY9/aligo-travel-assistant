@@ -245,34 +245,45 @@ def _looks_result_keyed(value: dict) -> bool:
     return "preferences" in value or "has_preferences" in value
 
 
-# 正式空结果前的标签只认「整行就是结果标签」（正式结果：/结果：）：
-# 说明 / 指令散文里的示例 []（「返回：[] 即可」「例如 []」「- [ ]」、
-# 围栏外的输出格式示例）都不能顶掉正式偏好结果。
-_RESULT_LABEL_RE = re.compile(
-    r"^[-*•]?\s*(正式结果|正式|结果|结论|偏好|输出|最终结果|最终输出|最终)"
-    r"\s*[:：=]\s*$"
+# 正式空结果前的标签：取数组前最后一个非空、非围栏行的最后一个冒号之后
+# 的短语（剔除加粗 / 标题 / 方括号等装饰），整短语必须是结果标签——
+# 「正式结果：」「**结果：**」「以下是本次结果：」都算；说明 / 指令句
+# （「返回：」「若无偏好时输出：」）不算。
+_RESULT_LABELS = frozenset(
+    {"正式结果", "正式", "结果", "结论", "最终结果", "最终输出", "最终", "本次结果"}
 )
 
 
 def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     """空数组是本轮正式空结果吗？
 
-    只认两种形态：整个输出就是这个数组，或数组所在行之前最后一个非空、
-    非围栏行本身就是结果标签（``正式结果：[]`` / ``结果：[]``）。标签行
-    里混入任何其它文字（条件说明、指令、「返回：」等）即判为示例，避免
-    说明散文里的 ``[]`` 按位置顶掉已解析的真实偏好。正式空结果之后的
-    说明散文（换行括号注释 / 句号）不影响判定。"""
+    只认两种形态：整个输出就是这个数组，或数组前最后一个非空、非围栏
+    行的末冒号短语是结果标签（``正式结果：[]`` / ``结果：[]``）。标签行
+    里混入任何其它短语（条件说明、指令、「返回：」「输出：」等）即判为
+    示例，避免说明散文里的 ``[]`` 按位置顶掉已解析的真实偏好。正式空
+    结果之后的说明散文（换行括号注释 / 句号）不影响判定。"""
     prefix = text[:start]
     if not prefix.strip():
         return True
-    label = ""
+    line = ""
     for item in prefix.splitlines():
-        cleaned = re.sub(r"```+\w*\s*$", "", item).strip()
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
-            label = cleaned
-    if not label:
+            line = cleaned
+    if not line:
         return True
-    return bool(_RESULT_LABEL_RE.match(label))
+    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    phrase = re.split(r"[:：=]", decoration_free.rstrip(":：="))[-1]
+    # 「以下是本次正式结果：」这类说明句：剥掉常见引导词后仍要求整词命中
+    changed = True
+    while changed:
+        changed = False
+        for lead in ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次"):
+            if phrase.startswith(lead) and len(phrase) > len(lead):
+                phrase = phrase[len(lead):]
+                changed = True
+                break
+    return phrase in _RESULT_LABELS
 
 
 def _select_preference_result(text: str) -> dict | None:
