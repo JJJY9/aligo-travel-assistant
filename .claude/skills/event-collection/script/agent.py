@@ -81,10 +81,17 @@ def _plan_score(obj: dict) -> int:
 
 
 def _is_explicit_empty(obj: dict) -> bool:
-    """显式「没有提取到信息」的结果（missing_info 非空 / extracted_count=0）。"""
+    """显式「没有提取到信息」的结果：extracted_count == 0，或（计数缺失、
+    没有任何核心字段、missing_info 非空）。
+
+    注意把「附在完整结果之后的元信息尾注」（missing_info 非空但
+    extracted_count > 0）排除在外：那是补充说明，不是否决提取结果。
+    """
     count = obj.get("extracted_count")
-    if isinstance(count, int) and not isinstance(count, bool) and count == 0:
-        return True
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count == 0
+    if _plan_score(obj) > 0:
+        return False
     missing = obj.get("missing_info")
     return isinstance(missing, list) and any(
         isinstance(item, str) and item.strip() for item in missing
@@ -170,7 +177,15 @@ def _select_event_result(text: str) -> dict | None:
             explicit_empty, explicit_empty_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    if substantive is not None:
+    if substantive is not None and explicit_empty is not None:
+        # 按位置取后者：回显示例（实质字段俱全）之后又输出显式空结果时，
+        # 空结果是对本轮的最终表态；而尾注小对象（extracted_count>0）
+        # 已在 _is_explicit_empty 里排除，不会顶掉完整提取
+        if explicit_empty_end > substantive_end:
+            chosen, chosen_end = explicit_empty, explicit_empty_end
+        else:
+            chosen, chosen_end = substantive, substantive_end
+    elif substantive is not None:
         chosen, chosen_end = substantive, substantive_end
     elif explicit_empty is not None:
         chosen, chosen_end = explicit_empty, explicit_empty_end

@@ -63,6 +63,20 @@ def _has_plan_title(value: dict) -> bool:
     return isinstance(title, str) and bool(title.strip())
 
 
+def _is_titled_plan(value: dict) -> bool:
+    """有标题的裸行程：除标题外还必须带一个行程字段。
+
+    只有 title 的小对象通常是正式行程之后的「补充说明」，不能用它顶掉
+    更早的完整 itinerary。
+    """
+    if not _has_plan_title(value):
+        return False
+    return any(
+        key in value
+        for key in ("daily_plans", "duration", "route", "schedule")
+    )
+
+
 def _select_plan_result(text: str) -> dict | None:
     """按位置选行程候选：完整行程 or 后置的有标题裸行程；尾注不顶替。
 
@@ -92,7 +106,7 @@ def _select_plan_result(text: str) -> dict | None:
         failed_tail = False
         if _is_full_plan(plan):
             full, full_end = plan, end
-        elif _has_plan_title(plan):
+        elif _is_titled_plan(plan):
             titled, titled_end = plan, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
