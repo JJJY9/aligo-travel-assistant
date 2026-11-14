@@ -2297,15 +2297,17 @@ def test_import_without_user_data_recreates_quarantined_main():
     print("✓ 无用户数据的恢复重建隔离主文件")
 
 
-def test_preview_read_failure_raises_value_error():
-    """--dry-run 读取既有数据失败必须显式报错，不能给出乐观结论。"""
+def test_preview_read_failure_raises_memory_error():
+    """--dry-run 读取既有数据失败按持久化失败上报（503 脱敏），不能伪装成
+    用户可修正的 ValueError（/api/import 会回 400 并回显底层错误文本）。"""
     from utils import user_import as module
+    from utils.errors import MemoryPersistenceError
 
     class _BrokenStore:
         def get_trip_history(self, limit=None):
             raise OSError("disk")
 
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(MemoryPersistenceError) as info:
         module.preview_user_import(
             _BrokenStore(),
             {"preferences": {}, "trips": [], "messages": []},
@@ -2319,7 +2321,7 @@ def test_preview_read_failure_raises_value_error():
         def get_chat_history(self, limit=None):
             raise OSError("disk")
 
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(MemoryPersistenceError) as info:
         module.preview_user_import(
             _BrokenChatStore(),
             {
@@ -2331,7 +2333,157 @@ def test_preview_read_failure_raises_value_error():
             },
         )
     assert "读取既有消息失败" in str(info.value), str(info.value)
-    print("✓ 合并预演读失败显式报错")
+
+    class _QuarantinedStore:
+        def get_trip_history(self, limit=None):
+            raise MemoryPersistenceError("记忆主文件缺失且存在损坏隔离备份")
+
+    with pytest.raises(MemoryPersistenceError) as info:
+        module.preview_user_import(
+            _QuarantinedStore(),
+            {"preferences": {}, "trips": [], "messages": []},
+        )
+    assert str(info.value).startswith("记忆主文件缺失且存在损坏隔离备份")
+    print("✓ 合并预演读失败按持久化失败上报")
+
+
+def test_merged_payload_top_level_placeholders_equal_length(monkeypatch):
+    """合并体积复核的顶层占位与真实导出信封等长（短占位会低估体积）。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    class _Store:
+        snapshot_based = False
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    assert module.merged_backup_limit_problem(_Store(), {}) is None
+    payload = captured["payload"]
+    assert len(payload["user_id"]) == 64, payload["user_id"]
+    assert (
+        len(payload["exported_at"]) == 26
+        and payload["exported_at"].endswith("000000")
+    ), payload["exported_at"]
+    assert payload["session_id"] == ""
+    # 真实导出恒含该键（空 dict 也序列化）
+    assert payload["statistics"]["frequent_destinations"] == {}
+    print("✓ 合并预演顶层占位等长")
+
+
+def test_merged_trip_rows_wired_to_backend_shape(monkeypatch):
+    """include_empty_keys 接线按后端：PG 行含空键与带时区时间戳，JSON 行
+    没有；行级 trip_id 占位按落库后的最坏长度。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    def make_store(snapshot_based):
+        class _Store:
+            pass
+
+        store = _Store()
+        store.snapshot_based = snapshot_based
+        store.export_snapshot = lambda: {
+            "chat_history": [],
+            "trip_history": [],
+            "preferences": {},
+            "session_titles": {},
+            "pinned_sessions": [],
+            "archived_sessions": [],
+            "statistics": {},
+        }
+        return store
+
+    incoming = {
+        "trips": [
+            {"origin": "上海", "destination": "成都", "start_date": "2026-05-01"}
+        ]
+    }
+    # JSON 后端 snapshot_based=True：导出行没有 purpose / session_id 键
+    module.merged_backup_limit_problem(make_store(True), incoming)
+    json_row = captured["payload"]["trip_history"][0]
+    assert "purpose" not in json_row and "session_id" not in json_row, json_row
+    assert json_row["trip_id"] == "trip_" + "9" * 19, json_row["trip_id"]
+    assert len(json_row["timestamp"]) == 26, json_row["timestamp"]
+
+    # PostgreSQL 后端 snapshot_based=False：空键也序列化，时间戳带时区
+    module.merged_backup_limit_problem(make_store(False), incoming)
+    pg_row = captured["payload"]["trip_history"][0]
+    assert pg_row.get("purpose", "missing") is None, pg_row
+    assert pg_row.get("session_id", "missing") is None, pg_row
+    assert len(pg_row["timestamp"]) == 32, pg_row["timestamp"]
+    print("✓ 合并预演行形状按后端接线")
+
+
+def test_merged_statistics_trip_number_raised(monkeypatch):
+    """预演 statistics.last_trip_number 随备份有效编号抬升（占位不计入）。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    class _Store:
+        snapshot_based = False
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {"last_trip_number": 5},
+            }
+
+    module.merged_backup_limit_problem(
+        _Store(),
+        {
+            "trips": [
+                {
+                    "origin": "上海",
+                    "destination": "成都",
+                    "start_date": "2026-05-01",
+                    "trip_id": "trip_42",
+                },
+                {
+                    "origin": "北京",
+                    "destination": "西安",
+                    "start_date": "2026-06-01",
+                },
+            ]
+        },
+    )
+    stats = captured["payload"]["statistics"]
+    assert stats["last_trip_number"] == 42, stats["last_trip_number"]
+    print("✓ 合并预演抬升 trip_id 水位（占位不参与）")
 
 
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
@@ -2501,6 +2653,7 @@ if __name__ == "__main__":
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
+    import asyncio
     import inspect
     import pathlib
     import tempfile
@@ -2538,7 +2691,12 @@ if __name__ == "__main__":
         except Exception:  # noqa: BLE001 - 配置不可用时不快照
             storage_snapshot = None
         try:
-            func(**kwargs)
+            # async def 用例同样要真正执行：直接调用只创建 coroutine，
+            # 断言从不运行，直跑清单会给出假绿
+            if inspect.iscoroutinefunction(func):
+                asyncio.run(func(**kwargs))
+            else:
+                func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1

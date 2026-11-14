@@ -3840,6 +3840,84 @@ def test_import_write_quarantine_maps_503_detail(monkeypatch):
     print("✓ /api/import 写库隔离错误 503 保留恢复提示")
 
 
+def test_import_dry_run_read_failure_maps_503_sanitized(monkeypatch):
+    """dry-run 预演读取既有数据失败：503 脱敏文案，不能是 400 或回显
+    底层存储错误（主机 / 端口 / 用户）。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    class _BrokenReadStore:
+        def get_preference(self):
+            return {}
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+        def get_trip_history(self, limit=None):
+            raise MemoryPersistenceError(
+                'PostgreSQL 操作失败：connection to server at "db.internal", '
+                'port 5432 failed: password authentication failed for user "aligo"'
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: _BrokenReadStore(),
+    )
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={
+            "user_id": _unique_user("web_test_import_dry_read"),
+            "dry_run": 1,
+        },
+        json={
+            "backup": {
+                "trip_history": [
+                    {
+                        "origin": "上海",
+                        "destination": "成都",
+                        "start_date": "2026-05-01",
+                    }
+                ]
+            }
+        },
+    )
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert "存储暂时不可用" in detail, detail
+    assert "db.internal" not in detail and "5432" not in detail, detail
+    print("✓ dry-run 预演读失败映射 503 且脱敏")
+
+
+def test_persistence_detail_transient_read_is_generic():
+    """瞬时读锁失败（OSError 分流文案）不能报「数据损坏」。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    detail = server_module._persistence_failure_detail(
+        MemoryPersistenceError(
+            "长期记忆暂时不可读（文件可能被占用）（data/memory/u.json）："
+            "[Errno 13] Permission denied"
+        ),
+        "rid-transient",
+    )
+    assert "损坏" not in detail, detail
+    assert "存储暂时不可用" in detail, detail
+    print("✓ 瞬时读失败按通用 503 文案，不误报数据损坏")
+
+
 def test_create_trip_write_failure_maps_503(monkeypatch):
     """POST /api/trips 写入失败映射 503（与更新 / 删除一致）。"""
     from utils.errors import MemoryPersistenceError
@@ -11837,6 +11915,7 @@ if __name__ == "__main__":
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
+    import asyncio
     import inspect
     import pathlib
     import tempfile
@@ -11874,7 +11953,12 @@ if __name__ == "__main__":
         except Exception:  # noqa: BLE001 - 配置不可用时不快照
             storage_snapshot = None
         try:
-            func(**kwargs)
+            # async def 用例同样要真正执行：直接调用只创建 coroutine，
+            # 断言从不运行，直跑清单会给出假绿
+            if inspect.iscoroutinefunction(func):
+                asyncio.run(func(**kwargs))
+            else:
+                func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1

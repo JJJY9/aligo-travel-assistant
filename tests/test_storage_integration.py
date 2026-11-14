@@ -1282,6 +1282,7 @@ if __name__ == "__main__":
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
+    import asyncio
     import inspect
     import pathlib
     import tempfile
@@ -1319,7 +1320,12 @@ if __name__ == "__main__":
         except Exception:  # noqa: BLE001 - 配置不可用时不快照
             storage_snapshot = None
         try:
-            func(**kwargs)
+            # async def 用例同样要真正执行：直接调用只创建 coroutine，
+            # 断言从不运行，直跑清单会给出假绿
+            if inspect.iscoroutinefunction(func):
+                asyncio.run(func(**kwargs))
+            else:
+                func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1

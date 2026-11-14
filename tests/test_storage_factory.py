@@ -691,7 +691,87 @@ def test_fresh_quarantine_blocks_writes_even_under_dsn(monkeypatch):
     with pytest.raises(MemoryPersistenceError):
         detecting.save_preference("hotel_brands", ["汉庭"])
     assert not path.exists(), "fresh 隔离后 DSN 配置不能成为写回豁免"
-    print("✓ fresh 隔离在 DSN 配置下仍拒绝写回")
+    # 隔离标记落盘：DSN 下 MemoryManager 每次写前重建 / 其它 worker 新建
+    # 的实例看不到 _fresh_quarantine，必须靠标记仍按隔离处理
+    rebuilt = LongTermMemory("u-freshdsn", storage_dir)
+    assert rebuilt.get_fresh_quarantine_backup(), "新实例必须看到隔离标记"
+    with pytest.raises(MemoryPersistenceError):
+        rebuilt.save_preference("hotel_brands", ["汉庭"])
+    assert not path.exists(), "重建实例不能把主文件写回"
+    print("✓ fresh 隔离在 DSN 配置下仍拒绝写回（含新构造实例）")
+
+
+def test_quarantine_marker_cleared_by_recovery_and_delete(monkeypatch):
+    """隔离标记是跨实例的恢复引导：恢复入口写回 / delete_all 后必须失效。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-marker.json"
+    seed = LongTermMemory("u-marker", storage_dir)
+    seed.save_preference("home_location", "北京")
+    path.write_text("{bad json", encoding="utf-8")
+
+    detecting = LongTermMemory("u-marker", storage_dir)
+    assert detecting.get_fresh_quarantine_backup()
+    marker = Path(storage_dir) / "u-marker.json.quarantine"
+    assert marker.exists(), "当场隔离必须落盘标记"
+
+    recovering = LongTermMemory("u-marker", storage_dir, allow_quarantined=True)
+    recovering.save_preference("home_location", "上海")
+    assert not marker.exists(), "恢复写回后标记必须清除"
+    fresh = LongTermMemory("u-marker", storage_dir)
+    assert fresh.get_fresh_quarantine_backup() is None
+    assert fresh.get_preference("home_location") == "上海"
+
+    path.write_text("{bad json", encoding="utf-8")
+    again = LongTermMemory("u-marker", storage_dir)
+    assert again.get_fresh_quarantine_backup()
+    again.delete_all()
+    assert not marker.exists(), "删除必须带走隔离标记"
+    after = LongTermMemory("u-marker", storage_dir)
+    assert after.get_fresh_quarantine_backup() is None
+    print("✓ 隔离标记随恢复 / 删除失效")
+
+
+def test_transient_reload_failure_is_not_reported_as_damage(monkeypatch):
+    """读文件时的瞬时 OSError（占用 / I-O）不能报成「数据损坏」。"""
+    from context import long_term_memory as module
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-transient", storage_dir)
+    memory.save_preference("home_location", "北京")
+
+    def flaky_loads(raw):
+        raise PermissionError("[Errno 13] Permission denied")
+
+    monkeypatch.setattr(module.json, "loads", flaky_loads)
+    with pytest.raises(MemoryPersistenceError) as info:
+        memory.save_preference("hotel_brands", ["汉庭"])
+    message = str(info.value)
+    assert message.startswith("长期记忆暂时不可读"), message
+    assert "重载失败" not in message, message
+    monkeypatch.undo()
+    assert memory.get_preference("home_location") == "北京", "瞬时失败不能改动数据"
+    print("✓ 瞬时读失败与数据损坏分流")
+
+
+def test_direct_run_harnesses_await_async_tests():
+    """8 个直跑清单必须 await async 用例：直接调用只创建 coroutine 会假绿。"""
+    root = Path(__file__).resolve().parent
+    for name in (
+        "test_skill_agents.py",
+        "test_user_import.py",
+        "test_storage_integration.py",
+        "test_storage_factory.py",
+        "test_webapp.py",
+        "test_short_term_memory.py",
+        "test_cli_json_failures.py",
+        "test_cli_sessions.py",
+    ):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "asyncio.run(func(**kwargs))" in text, name
+    print("✓ 直跑清单 await async 用例")
 
 
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
@@ -3009,6 +3089,22 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     )
     assert memory.delete_last_turn("s1", expect="q") == 1
     assert delete_calls == [False], "delete_last_turn 的 DELETE 不能自动重放"
+
+    memory._preference_lock = lambda pref_type: contextlib.nullcontext()
+    memory._preference_cap_lock = lambda: contextlib.nullcontext()
+    memory._enforce_preference_cap = lambda pref_type: False
+    memory._json = lambda value: '{"v": 1}'
+    memory.save_preference("home_location", "北京")
+    memory.save_preference("home_location", "上海", replay_safe=True)
+    pref_inserts = [
+        (sql, flag)
+        for sql, flag in recorded
+        if "INSERT INTO aligo_preferences" in sql
+    ]
+    assert len(pref_inserts) == 2, pref_inserts
+    assert all(flag is False for _, flag in pref_inserts), (
+        "偏好 INSERT 一律禁止重放（显式 replay_safe=True 也不例外）"
+    )
     print("✓ PG 非幂等写路径全部禁止自动重放")
 
 
@@ -4271,6 +4367,7 @@ if __name__ == "__main__":
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
+    import asyncio
     import inspect
     import pathlib
     import tempfile
@@ -4308,7 +4405,12 @@ if __name__ == "__main__":
         except Exception:  # noqa: BLE001 - 配置不可用时不快照
             storage_snapshot = None
         try:
-            func(**kwargs)
+            # async def 用例同样要真正执行：直接调用只创建 coroutine，
+            # 断言从不运行，直跑清单会给出假绿
+            if inspect.iscoroutinefunction(func):
+                asyncio.run(func(**kwargs))
+            else:
+                func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
