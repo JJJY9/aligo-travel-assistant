@@ -1571,6 +1571,8 @@ if __name__ == "__main__":
     # 直跑模式自动发现全部用例（monkeypatch 自动提供；pytest.skip 条件
     # 跳过不再中断整体，跳过数量明确报告）
     import inspect
+    import pathlib
+    import tempfile
 
     ran = 0
     skipped = 0
@@ -1585,6 +1587,8 @@ if __name__ == "__main__":
             if param == "monkeypatch":
                 fixture = pytest.MonkeyPatch()
                 kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
             else:
                 unsupported = True
                 break

@@ -2297,6 +2297,43 @@ def test_import_without_user_data_recreates_quarantined_main():
     print("✓ 无用户数据的恢复重建隔离主文件")
 
 
+def test_preview_read_failure_raises_value_error():
+    """--dry-run 读取既有数据失败必须显式报错，不能给出乐观结论。"""
+    from utils import user_import as module
+
+    class _BrokenStore:
+        def get_trip_history(self, limit=None):
+            raise OSError("disk")
+
+    with pytest.raises(ValueError) as info:
+        module.preview_user_import(
+            _BrokenStore(),
+            {"preferences": {}, "trips": [], "messages": []},
+        )
+    assert "读取既有行程失败" in str(info.value), str(info.value)
+
+    class _BrokenChatStore:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_chat_history(self, limit=None):
+            raise OSError("disk")
+
+    with pytest.raises(ValueError) as info:
+        module.preview_user_import(
+            _BrokenChatStore(),
+            {
+                "preferences": {},
+                "trips": [],
+                "messages": [
+                    {"role": "user", "content": "hi", "session_id": "s1"}
+                ],
+            },
+        )
+    assert "读取既有消息失败" in str(info.value), str(info.value)
+    print("✓ 合并预演读失败显式报错")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""
@@ -2308,7 +2345,8 @@ def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
                 "chat_history": [],
                 "trip_history": [],
                 "preferences": {},
-                "session_titles": {"s-big": "长标题" * 600},
+                "custom_pointer": "y" * 2000,
+                "session_titles": {"s1": "t"},
                 "pinned_sessions": [],
                 "archived_sessions": [],
                 "statistics": {"total_queries": 1},
@@ -2492,12 +2530,23 @@ if __name__ == "__main__":
                 fixture.undo()
             skipped += 1
             continue
+        storage_snapshot = None
+        _storage_cfg = None
+        try:
+            from config import STORAGE_CONFIG as _storage_cfg
+
+            storage_snapshot = dict(_storage_cfg)
+        except Exception:  # noqa: BLE001 - 配置不可用时不快照
+            _storage_cfg = None
         try:
             func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if storage_snapshot is not None and _storage_cfg is not None:
+                _storage_cfg.clear()
+                _storage_cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
     total = sum(

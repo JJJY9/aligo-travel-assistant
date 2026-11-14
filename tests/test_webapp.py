@@ -3715,6 +3715,29 @@ def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
     print("✓ /api/chat 熔断 / 存储错误映射 503")
 
 
+def test_chat_quarantine_error_detail_mentions_recovery(monkeypatch):
+    """隔离类持久化失败的 503 文案保留「隔离备份 / 恢复」提示。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_chat_quarantine")
+
+    async def broken_ask(self, message, on_event=None, turn_id=""):
+        raise MemoryPersistenceError(
+            "记忆文件损坏并已隔离备份（data/memory/u1.json.corrupt-1）"
+        )
+
+    monkeypatch.setattr(server_module.ConversationRuntime, "ask", broken_ask)
+    response = client.post(
+        "/api/chat", json={"message": "你好", "user_id": user_id}
+    )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "隔离备份" in detail and "恢复" in detail, detail
+    print("✓ /api/chat 隔离错误 503 文案保留恢复提示")
+
+
 def test_import_strict_open_and_failure_mappings(monkeypatch):
     """/api/import 以 strict=True 打开存储；失败分别映射两条 503 文案。"""
     from utils.errors import MemoryPersistenceError
@@ -3769,6 +3792,52 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
     assert strict_failed.status_code == 503
     assert strict_failed.json()["detail"] == "存储暂时不可用，请稍后再试"
     print("✓ /api/import strict 打开与失败映射")
+
+
+def test_import_write_quarantine_maps_503_detail(monkeypatch):
+    """恢复写库中途进入隔离态（save_preference 抛隔离错误）时，503 文案
+    必须保留隔离备份提示，而不是通用「存储暂时不可用」。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    class _QuarantineStore:
+        def get_preference(self):
+            return {}
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+        def save_preference(self, key, value):
+            raise MemoryPersistenceError(
+                "记忆主文件缺失且存在损坏隔离备份（data/memory/u.json.corrupt-1）"
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: _QuarantineStore(),
+    )
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_import_quarantine")},
+        json={"backup": {"preferences": {"home_location": "北京"}}},
+    )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "隔离备份" in detail and "恢复" in detail, detail
+    print("✓ /api/import 写库隔离错误 503 保留恢复提示")
 
 
 def test_create_trip_write_failure_maps_503(monkeypatch):
@@ -10461,6 +10530,7 @@ def test_user_data_import_api_with_knowledge(monkeypatch):
         assert response.status_code == 200
         payload = response.json()
         assert payload["knowledge_imported"] == 1
+        assert payload["ok"] is True
         assert calls and calls[0][0]["content"] == "知识一"
 
         def missing(documents):
@@ -10472,6 +10542,7 @@ def test_user_data_import_api_with_knowledge(monkeypatch):
         )
         assert response.status_code == 200
         assert "knowledge_error" in response.json()
+        assert response.json()["ok"] is False, "知识恢复失败不能报整体成功"
         print("✓ /api/import 一体化备份（知识片段恢复 / 失败上报）")
     finally:
         _cleanup(target)
@@ -11795,12 +11866,23 @@ if __name__ == "__main__":
                 fixture.undo()
             skipped += 1
             continue
+        storage_snapshot = None
+        _storage_cfg = None
+        try:
+            from config import STORAGE_CONFIG as _storage_cfg
+
+            storage_snapshot = dict(_storage_cfg)
+        except Exception:  # noqa: BLE001 - 配置不可用时不快照
+            _storage_cfg = None
         try:
             func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if storage_snapshot is not None and _storage_cfg is not None:
+                _storage_cfg.clear()
+                _storage_cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
     total = sum(

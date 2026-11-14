@@ -1311,12 +1311,23 @@ if __name__ == "__main__":
                 fixture.undo()
             skipped += 1
             continue
+        storage_snapshot = None
+        _storage_cfg = None
+        try:
+            from config import STORAGE_CONFIG as _storage_cfg
+
+            storage_snapshot = dict(_storage_cfg)
+        except Exception:  # noqa: BLE001 - 配置不可用时不快照
+            _storage_cfg = None
         try:
             func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if storage_snapshot is not None and _storage_cfg is not None:
+                _storage_cfg.clear()
+                _storage_cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
     total = sum(

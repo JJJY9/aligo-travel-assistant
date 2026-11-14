@@ -5952,7 +5952,14 @@ def create_app(model: Any = None) -> FastAPI:
                     raise HTTPException(
                         status_code=503, detail="恢复失败，请稍后重试"
                     ) from exc
-            return {"ok": True, "dry_run": dry_run, **counts, "skipped": errors}
+            # 知识片段恢复失败视为恢复未完成（与 CLI ok=false/退出码 1
+            # 同口径）：账号可能仍处于隔离态、用户数据未必恢复
+            return {
+                "ok": not counts.get("knowledge_error"),
+                "dry_run": dry_run,
+                **counts,
+                "skipped": errors,
+            }
         finally:
             state.import_queue_slots.release()
 

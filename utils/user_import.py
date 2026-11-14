@@ -451,8 +451,11 @@ def merged_backup_limit_problem(
     # export_snapshot 之外补 user_id / exported_at——这里放等长占位，
     # 体积口径与导出端一致
     payload = dict(existing)
-    payload.setdefault("user_id", "merged-limit-preview")
-    payload.setdefault("exported_at", "1970-01-01T00:00:00")
+    # 占位与导出端形状等长：user_id 允许 64 字符、时间戳带微秒、
+    # CLI 导出恒写 session_id 空串
+    payload.setdefault("user_id", "u" * 64)
+    payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
+    payload.setdefault("session_id", "")
     payload.update(
         {
             "chat_history": existing_messages
@@ -1040,11 +1043,13 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
 
     # 与写入层同一去重口径：缺目的地 / 出发日期的行不参与去重，逐条新增
     # （裸 trip_identity 会把它们折叠，--dry-run 与真实导入结论相反）
+    try:
+        history_trips = store.get_trip_history(limit=None)
+    except Exception as exc:  # noqa: BLE001 - dry-run 不能给乐观结论
+        raise ValueError(f"读取既有行程失败：{exc}") from exc
     pending_keys = {
         key
-        for key in (
-            _trip_merge_key(trip) for trip in store.get_trip_history(limit=None)
-        )
+        for key in (_trip_merge_key(trip) for trip in history_trips)
         if key is not None
     }
     for row in sections.get("trips", []):
@@ -1058,7 +1063,10 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
 
     messages = sections.get("messages", [])
     if messages:
-        history = store.get_chat_history(limit=None)
+        try:
+            history = store.get_chat_history(limit=None)
+        except Exception as exc:  # noqa: BLE001 - dry-run 不能给乐观结论
+            raise ValueError(f"读取既有消息失败：{exc}") from exc
         existing = Counter(
             (
                 _message_session_key(message.get("session_id")),
