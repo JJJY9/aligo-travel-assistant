@@ -395,7 +395,7 @@ class LongTermMemory:
                 backups
                 and not self._allow_quarantined
                 and not self._may_recreate
-                and not _postgres_configured()
+                and (self._fresh_quarantine or not _postgres_configured())
             ):
                 # 主文件缺失 + 存在隔离备份：损坏文件已被隔离。沿用内存
                 # 快照写回会重建主文件、让隔离备份从此不可见（恢复提示

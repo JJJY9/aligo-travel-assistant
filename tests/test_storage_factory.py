@@ -314,9 +314,13 @@ def test_describe_backends_reports_long_term_degraded(monkeypatch):
     print("✓ describe_backends 标记长期记忆回退")
 
 
-def test_bad_postgres_falls_back():
-    _set("redis_url", "")
-    _set("postgres_dsn", "postgresql://user:pass@127.0.0.1:1/db")
+def test_bad_postgres_falls_back(monkeypatch):
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "redis_url", "")
+    monkeypatch.setitem(
+        storage.STORAGE_CONFIG,
+        "postgres_dsn",
+        "postgresql://user:pass@127.0.0.1:1/db",
+    )
     memory = storage.create_long_term_memory("u-bad", tempfile.mkdtemp())
     assert isinstance(memory, LongTermMemory)
     assert storage._failed_recently("postgres:postgresql://user:pass@127.0.0.1:1/db")
@@ -572,9 +576,12 @@ def test_corrupt_memory_file_is_backed_up():
     print("✓ 损坏的记忆文件备份后重建（隔离路径可报告）")
 
 
-def test_quarantined_missing_main_blocks_recreate_until_allowed():
+def test_quarantined_missing_main_blocks_recreate_until_allowed(monkeypatch):
     """主文件缺失 + 存在隔离备份：普通实例标记隔离并拒绝重建主文件；
     恢复入口（allow_quarantined）可以写回。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
     storage_dir = tempfile.mkdtemp()
     backup = Path(storage_dir) / "u-gone.json.corrupt-20260101000000000000-1"
     backup.write_text("{broken", encoding="utf-8")
@@ -594,9 +601,12 @@ def test_quarantined_missing_main_blocks_recreate_until_allowed():
     print("✓ 隔离备份阻止普通写回重建，恢复入口放行")
 
 
-def test_cached_instance_write_cannot_hide_quarantine():
+def test_cached_instance_write_cannot_hide_quarantine(monkeypatch):
     """已加载实例（缓存会话）在文件被外部隔离后的下一次写入必须失败，
     不能再按内存快照写回重建主文件、让隔离备份从此不可见。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
     storage_dir = tempfile.mkdtemp()
     memory = LongTermMemory("u-cached", storage_dir)
     memory.save_preference("home_location", "北京")
@@ -618,9 +628,12 @@ def test_cached_instance_write_cannot_hide_quarantine():
     print("✓ 缓存实例写入不掩盖隔离状态；delete_all 一并清理备份")
 
 
-def test_may_recreate_does_not_leak_into_later_writes():
+def test_may_recreate_does_not_leak_into_later_writes(monkeypatch):
     """写前补备份的「允许重建」只覆盖本次写入：同一实例稍后遇到外部
     隔离（主文件被移走 + 备份存在）时必须重新被守卫拦截。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
     storage_dir = tempfile.mkdtemp()
     memory = LongTermMemory("u-leak", storage_dir)
     path = Path(storage_dir) / "u-leak.json"
@@ -637,9 +650,12 @@ def test_may_recreate_does_not_leak_into_later_writes():
     print("✓ 写前补备份的放行不泄漏到后续写入")
 
 
-def test_load_time_quarantine_blocks_writes_from_same_instance():
+def test_load_time_quarantine_blocks_writes_from_same_instance(monkeypatch):
     """构造期检测到损坏并隔离的实例同样不允许写回重建：此后任何新实例 /
     请求必须仍能看到隔离状态（#792 的 503 恢复提示不能被空快照掩盖）。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
     storage_dir = tempfile.mkdtemp()
     path = Path(storage_dir) / "u-self.json"
     seed = LongTermMemory("u-self", storage_dir)
@@ -654,6 +670,28 @@ def test_load_time_quarantine_blocks_writes_from_same_instance():
     fresh = LongTermMemory("u-self", storage_dir)
     assert fresh.get_recovered_corrupt_backup(), "新实例仍应看到隔离状态"
     print("✓ 构造期隔离的实例不允许写回重建，隔离状态对新实例可见")
+
+
+def test_fresh_quarantine_blocks_writes_even_under_dsn(monkeypatch):
+    """配置了 PostgreSQL 时，构造期已隔离（fresh）的实例仍然拒绝写回：
+    主文件就在本实例手里被移动，JSON 回退载体不应把销毁的数据写回。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(
+        STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
+    )
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-freshdsn.json"
+    seed = LongTermMemory("u-freshdsn", storage_dir)
+    seed.save_preference("home_location", "北京")
+    path.write_text("{bad json", encoding="utf-8")
+
+    detecting = LongTermMemory("u-freshdsn", storage_dir)
+    assert detecting.get_recovered_corrupt_backup()
+    with pytest.raises(MemoryPersistenceError):
+        detecting.save_preference("hotel_brands", ["汉庭"])
+    assert not path.exists(), "fresh 隔离后 DSN 配置不能成为写回豁免"
+    print("✓ fresh 隔离在 DSN 配置下仍拒绝写回")
 
 
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
@@ -4262,12 +4300,27 @@ if __name__ == "__main__":
                 fixture.undo()
             skipped += 1
             continue
+        storage_snapshot: dict | None = None
+        try:
+            from config import STORAGE_CONFIG
+
+            storage_snapshot = dict(STORAGE_CONFIG)
+        except Exception:  # noqa: BLE001 - 配置不可用时不快照
+            storage_snapshot = None
         try:
             func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if storage_snapshot is not None:
+                from typing import cast
+
+                from config import STORAGE_CONFIG
+
+                _cfg = cast(dict, STORAGE_CONFIG)
+                _cfg.clear()
+                _cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
     total = sum(
