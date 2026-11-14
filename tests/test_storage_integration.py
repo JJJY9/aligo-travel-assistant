@@ -1279,29 +1279,43 @@ def test_add_script_marks_applied_only_after_successful_push():
 
 
 if __name__ == "__main__":
-    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
-    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
+    # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
+    # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import inspect
     import pathlib
     import tempfile
 
     ran = 0
+    skipped = 0
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
-        if any(param not in ("monkeypatch", "tmp_path") for param in params):
-            continue
         fixture = None
         kwargs: dict = {}
-        if "monkeypatch" in params:
-            fixture = pytest.MonkeyPatch()
-            kwargs["monkeypatch"] = fixture
-        if "tmp_path" in params:
-            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+            elif param == "caplog" and spec.default is None:
+                kwargs[param] = None
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            continue
         try:
             func(**kwargs)
             ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
         finally:
             if fixture is not None:
                 fixture.undo()
@@ -1312,5 +1326,5 @@ if __name__ == "__main__":
     )
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
-        "其余需 pytest 专用夹具，由 pytest 运行）"
+        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
     )

@@ -11401,6 +11401,29 @@ def test_persistence_failure_detail_keeps_quarantine_hint():
     assert "存储暂时不可用" in generic and "隔离" not in generic, generic
 
 
+def test_persistence_detail_prefix_only():
+    """消息中间含「隔离」的普通错误不误报为记忆损坏（前缀判定）。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    detail = server_module._persistence_failure_detail(
+        MemoryPersistenceError("写入隔离目录失败"), "rid-3"
+    )
+    assert "存储暂时不可用" in detail, detail
+
+
+def test_quarantined_backup_scan_ignores_deleted_accounts(monkeypatch, tmp_path):
+    """账号数据已删除（.deleted 墓碑）时遗留隔离备份是孤儿：不再 503。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+    (tmp_path / "u-gone.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+    (tmp_path / "u-gone.json.deleted").write_text("", encoding="utf-8")
+    assert server_module._quarantined_memory_backup("u-gone") is None
+
+
 def test_open_long_term_forwards_allow_quarantined(monkeypatch, tmp_path):
     """Web 恢复入口（/api/import）把 allow_quarantined=True 传给存储工厂，
     普通打开默认 False——隔离状态下只有恢复能重建主文件。"""
@@ -11540,29 +11563,43 @@ def test_import_rejects_merged_preference_limit(monkeypatch):
         _cleanup(user_id)
 
 if __name__ == "__main__":
-    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
-    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
+    # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
+    # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import inspect
     import pathlib
     import tempfile
 
     ran = 0
+    skipped = 0
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
-        if any(param not in ("monkeypatch", "tmp_path") for param in params):
-            continue
         fixture = None
         kwargs: dict = {}
-        if "monkeypatch" in params:
-            fixture = pytest.MonkeyPatch()
-            kwargs["monkeypatch"] = fixture
-        if "tmp_path" in params:
-            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+            elif param == "caplog" and spec.default is None:
+                kwargs[param] = None
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            continue
         try:
             func(**kwargs)
             ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
         finally:
             if fixture is not None:
                 fixture.undo()
@@ -11573,5 +11610,5 @@ if __name__ == "__main__":
     )
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
-        "其余需 pytest 专用夹具，由 pytest 运行）"
+        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
     )

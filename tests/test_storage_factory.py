@@ -706,6 +706,51 @@ def test_ensure_persisted_respects_tombstone():
     print("✓ ensure_persisted 尊重删除墓碑")
 
 
+def test_delete_all_tombstone_written_before_removal(monkeypatch):
+    """墓碑创建失败时删除中止且主文件保持完整（删除未发生，数据安全）。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-tombpre", storage_dir)
+    memory.save_preference("home_location", "北京")
+    path = Path(storage_dir) / "u-tombpre.json"
+    assert path.exists()
+
+    real_touch = Path.touch
+
+    def failing_touch(self, *args, **kwargs):
+        if str(self).endswith(".deleted"):
+            raise OSError("disk full")
+        return real_touch(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "touch", failing_touch)
+    with pytest.raises(MemoryPersistenceError):
+        memory.delete_all()
+    monkeypatch.setattr(Path, "touch", real_touch)
+
+    assert path.exists(), "墓碑创建失败时不能先删主文件"
+    fresh = LongTermMemory("u-tombpre", storage_dir)
+    assert fresh.get_preference("home_location") == "北京"
+    print("✓ 墓碑创建失败时删除中止、数据保留")
+
+
+def test_ensure_persisted_heals_corrupt_pending():
+    """_corrupt_pending 状态下无用户数据的恢复导入自愈：
+    补隔离备份并重建主文件，而不是抛重载失败。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-pending-recover.json"
+    path.write_text("{bad json", encoding="utf-8")
+    memory = LongTermMemory(
+        "u-pending-recover", storage_dir, allow_quarantined=True
+    )
+    memory._corrupt_pending = True  # noqa: SLF001 - 复现前提状态
+
+    memory.ensure_persisted()
+    assert path.exists(), "恢复入口应重建主文件"
+    assert list(Path(storage_dir).glob("u-pending-recover.json.corrupt-*")), (
+        "损坏文件应补备份"
+    )
+    print("✓ ensure_persisted 自愈 _corrupt_pending 状态")
+
+
 def test_delete_all_prevents_stale_instance_resurrection():
     """删除后其它存活实例（缓存会话）的下一次写入从空快照开始：
     已删除的数据不会被旧实例整份写回。"""
@@ -4127,29 +4172,43 @@ def test_migrate_dedupes_preference_types():
 
 
 if __name__ == "__main__":
-    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
-    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
+    # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
+    # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import inspect
     import pathlib
     import tempfile
 
     ran = 0
+    skipped = 0
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
-        if any(param not in ("monkeypatch", "tmp_path") for param in params):
-            continue
         fixture = None
         kwargs: dict = {}
-        if "monkeypatch" in params:
-            fixture = pytest.MonkeyPatch()
-            kwargs["monkeypatch"] = fixture
-        if "tmp_path" in params:
-            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+            elif param == "caplog" and spec.default is None:
+                kwargs[param] = None
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            continue
         try:
             func(**kwargs)
             ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
         finally:
             if fixture is not None:
                 fixture.undo()
@@ -4160,5 +4219,5 @@ if __name__ == "__main__":
     )
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
-        "其余需 pytest 专用夹具，由 pytest 运行）"
+        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
     )

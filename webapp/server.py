@@ -2232,6 +2232,9 @@ def _quarantined_memory_backup(user_id: str) -> str | None:
     base = MEMORY_DIR / f"{user_id}.json"
     if base.exists():
         return None
+    if Path(f"{base}.deleted").exists():
+        # 账号数据已删除：遗留的隔离备份是孤儿，不应再让所有请求 503
+        return None
     backups = sorted(MEMORY_DIR.glob(f"{user_id}.json.corrupt-*"))
     return str(backups[-1]) if backups else None
 
@@ -2307,9 +2310,18 @@ def _redact_doctor_detail(text: str) -> str:
     return redact_local_paths(cleaned)
 
 
+_QUARANTINE_MESSAGE_PREFIXES = (
+    "记忆文件损坏并已隔离",
+    "记忆主文件缺失且存在损坏隔离备份",
+)
+
+
 def _persistence_failure_detail(exc: Exception, request_id: str) -> str:
-    """隔离 / 损坏类持久化失败保留可执行提示（恢复引导），其余用通用文案。"""
-    if "隔离" in str(exc):
+    """隔离 / 损坏类持久化失败保留可执行提示（恢复引导），其余用通用文案。
+
+    按消息前缀判定而不是「含『隔离』」子串：路径里的「隔离」目录等
+    普通错误不能被误报成记忆损坏。"""
+    if str(exc).startswith(_QUARANTINE_MESSAGE_PREFIXES):
         return (
             "记忆文件损坏并已隔离备份（路径见服务端日志），"
             "请使用备份文件恢复后重试"

@@ -190,6 +190,22 @@ def test_corrupt_snapshot_blocks_write_commands(monkeypatch):
     print("✓ 损坏隔离后写命令拒绝执行（不重建空快照）")
 
 
+def test_recovered_corrupt_backup_ignores_deleted_accounts(tmp_path):
+    """账号数据已删除（.deleted 墓碑）时遗留隔离备份是孤儿：不再拦截。"""
+    db_path = tmp_path / "u-gone.json"
+    (tmp_path / "u-gone.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+    (tmp_path / "u-gone.json.deleted").write_text("", encoding="utf-8")
+
+    db_path_value = str(db_path)
+
+    class _Store:
+        db_path = db_path_value
+
+    assert cli._recovered_corrupt_backup(_Store()) is None
+
+
 def test_open_cli_store_forwards_allow_quarantined(monkeypatch):
     """恢复入口（user-import）把 allow_quarantined=True 传给存储工厂，
     普通维护命令默认 False——隔离状态下只有恢复能重建主文件。"""
@@ -212,24 +228,52 @@ def test_open_cli_store_forwards_allow_quarantined(monkeypatch):
 
 
 if __name__ == "__main__":
+    # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
+    # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
+    # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import inspect
+    import pathlib
+    import tempfile
 
     ran = 0
+    skipped = 0
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
-        if any(param not in ("monkeypatch",) for param in params):
-            continue
         fixture = None
         kwargs: dict = {}
-        if "monkeypatch" in params:
-            fixture = pytest.MonkeyPatch()
-            kwargs["monkeypatch"] = fixture
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+            elif param == "caplog" and spec.default is None:
+                kwargs[param] = None
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            continue
         try:
             func(**kwargs)
             ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
         finally:
             if fixture is not None:
                 fixture.undo()
-    print(f"\n全部通过（{ran} 个用例）")
+    total = sum(
+        1
+        for name, func in globals().items()
+        if name.startswith("test_") and callable(func)
+    )
+    print(
+        f"\n全部通过（{ran}/{total} 个用例；"
+        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
+    )
