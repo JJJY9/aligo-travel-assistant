@@ -1568,57 +1568,44 @@ def test_session_title_newline_cannot_forge_rows(monkeypatch):
     print("✓ 会话标题内嵌换行不能伪造列表行")
 
 if __name__ == "__main__":
-    test_flag_parsing_helpers()
-    test_session_export_flag_parsing()
-    test_session_export_html_flag_parsing()
-    test_main_rejects_bad_usage(pytest.MonkeyPatch())
-    for case in (
-        test_lists_active_sessions,
-        test_session_list_converts_utc_timestamps,
-        test_lists_archived_and_all,
-        test_empty_sessions,
-        test_invalid_user_id,
-        test_leading_hyphen_ids_rejected,
-        test_pg_healthy_store_passthrough,
-        test_save_failure_reports_error,
-        test_interactive_user_id_validation,
-        test_main_accepts_valid_flags,
-        test_archive_and_restore,
-        test_archive_missing_session,
-        test_archive_json_output,
-        test_archive_dispatch_json,
-        test_session_title_set_and_reset,
-        test_session_title_validation_and_failures,
-        test_session_title_dispatch,
-        test_session_pin_set_and_unset,
-        test_session_pin_validation_and_failures,
-        test_session_pin_dispatch,
-        test_session_show_text_and_json,
-        test_session_show_renders_assistant_markdown,
-        test_session_show_errors,
-        test_session_show_dispatch,
-        test_session_export_to_file,
-        test_session_export_to_stdout,
-        test_session_export_missing_and_invalid,
-        test_session_export_refuses_overwrite,
-        test_session_export_html,
-        test_session_export_html_title_not_double_escaped,
-        test_session_export_html_dispatch,
-        test_session_export_default_path,
-        test_main_session_export_dispatch,
-        test_read_failure,
-        test_store_open_failure,
-        test_pg_fallback_refused,
-        test_session_views_strip_terminal_controls,
-        test_session_show_allows_device_like_session_id,
-        test_session_title_newline_cannot_forge_rows,
-    ):
-        mp = pytest.MonkeyPatch()
+    # 直跑模式自动发现全部用例（monkeypatch 自动提供；pytest.skip 条件
+    # 跳过不再中断整体，跳过数量明确报告）
+    import inspect
+
+    ran = 0
+    skipped = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        fixture = None
+        kwargs: dict = {}
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            continue
         try:
-            case(mp)
+            func(**kwargs)
+            ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
         finally:
-            mp.undo()
-        test_session_title_ignores_stale_false(mp)
-        test_session_export_sanitizes_custom_title(mp)
-        test_sessions_query_matches_rendered_assistant_content(mp)
-    print("\n全部通过")
+            if fixture is not None:
+                fixture.undo()
+    total = sum(
+        1
+        for name, func in globals().items()
+        if name.startswith("test_") and callable(func)
+    )
+    print(
+        f"\n全部通过（{ran}/{total} 个用例；{skipped} 个按条件跳过）"
+    )

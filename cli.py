@@ -357,14 +357,20 @@ class AligoCLI:
                 self.memory_manager.long_term
             )
             if quarantined:
-                self.console.print(
-                    f"[red]记忆文件损坏，已隔离备份到 {_markup_safe(quarantined)}"
-                    "（当前会按空快照处理）[/red]"
-                )
-                self.console.print(
-                    "[dim]请先运行 python cli.py user-import <用户ID> <备份文件> "
-                    "恢复数据后再进入交互模式[/dim]"
-                )
+                if quarantined == _QUARANTINE_PENDING_DISPLAY:
+                    self.console.print(
+                        "[red]记忆文件损坏且隔离备份尚未完成（文件可能被"
+                        "占用），请稍后重试或联系维护[/red]"
+                    )
+                else:
+                    self.console.print(
+                        f"[red]记忆文件损坏，已隔离备份到 {_markup_safe(quarantined)}"
+                        "（当前会按空快照处理）[/red]"
+                    )
+                    self.console.print(
+                        "[dim]请先运行 python cli.py user-import <用户ID> <备份文件> "
+                        "恢复数据后再进入交互模式[/dim]"
+                    )
                 raise SystemExit(1)
 
             # 初始化意图识别智能体（必须预加载）
@@ -3803,6 +3809,9 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
     return str(matches[-1]) if matches else None
 
 
+_QUARANTINE_PENDING_DISPLAY = "__quarantine_pending__"
+
+
 def _interactive_quarantine_marker(store: Any) -> str | None:
     """交互模式的隔离标记：fresh / pending 无条件拦截；历史遗留备份仅在
     未配置 PostgreSQL 时拦截（PG 故障回退 JSON 的遗留 .corrupt-* 是孤儿）。"""
@@ -3818,7 +3827,7 @@ def _interactive_quarantine_marker(store: Any) -> str | None:
             store, "has_pending_corrupt_quarantine", None
         )
         if callable(pending_getter) and pending_getter():
-            return "隔离改名尚未完成（待复核）"
+            return _QUARANTINE_PENDING_DISPLAY
     except Exception:  # noqa: BLE001 - 探测失败不阻断启动
         pass
     if STORAGE_CONFIG.get("postgres_dsn"):
@@ -3833,11 +3842,14 @@ class _QuarantinedMemoryError(RuntimeError):
     损坏检测再也看不到隔离备份，原数据只剩无人提示的 ``.corrupt-*``。
     """
 
-    def __init__(self, backup: str) -> None:
+    def __init__(self, backup: str, *, message: str | None = None) -> None:
         self.backup = backup
         super().__init__(
-            f"记忆文件损坏，已隔离备份到 {backup}"
-            "（当前会按空快照处理，请先用备份文件恢复）"
+            message
+            or (
+                f"记忆文件损坏，已隔离备份到 {backup}"
+                "（当前会按空快照处理，请先用备份文件恢复）"
+            )
         )
 
 
@@ -3866,6 +3878,29 @@ def _open_cli_store(user_id: str, allow_quarantined: bool = False):
             "PostgreSQL 已配置但连接失败（已回退本地 JSON），请检查数据库后重试"
         )
     if not allow_quarantined:
+        fresh = None
+        getter = getattr(store, "get_fresh_quarantine_backup", None)
+        if callable(getter):
+            fresh = getter()
+        pending_getter = getattr(
+            store, "has_pending_corrupt_quarantine", None
+        )
+        pending = bool(
+            pending_getter() if callable(pending_getter) else False
+        )
+        if fresh or pending:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+            if pending and not fresh:
+                raise _QuarantinedMemoryError(
+                    "",
+                    message=(
+                        "记忆文件损坏且隔离备份尚未完成（文件可能被占用），"
+                        "请稍后重试或联系维护"
+                    ),
+                )
+            raise _QuarantinedMemoryError(str(fresh))
         quarantined = _recovered_corrupt_backup(store)
         if quarantined:
             close = getattr(store, "close", None)

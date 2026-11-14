@@ -11338,9 +11338,11 @@ def test_chat_lock_wait_is_bounded(monkeypatch):
 def test_open_long_term_refuses_quarantined_memory(monkeypatch, tmp_path):
     """JSON 记忆被隔离后 Web 打开存储必须 503，不能当作空数据继续；
     PostgreSQL 后端不受同目录遗留的 .corrupt-* 文件影响。"""
+    from config import STORAGE_CONFIG
     from fastapi import HTTPException
     from webapp import server as server_module
 
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
     monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
 
     class _JsonStore:
@@ -11427,6 +11429,42 @@ def test_persistence_detail_prefix_only():
         MemoryPersistenceError("写入隔离目录失败"), "rid-3"
     )
     assert "存储暂时不可用" in detail, detail
+
+
+def test_pending_quarantine_message_has_no_backup_hint(monkeypatch, tmp_path):
+    """pending（隔离改名未完成、无备份文件）的 503 文案不引导寻找备份。"""
+    from config import STORAGE_CONFIG
+    from fastapi import HTTPException
+    from webapp import server as server_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+
+    class _PendingStore:
+        def get_fresh_quarantine_backup(self):
+            return None
+
+        def has_pending_corrupt_quarantine(self):
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _PendingStore(),
+    )
+    with pytest.raises(HTTPException) as info:
+        server_module._open_long_term("u-pending-msg")
+    detail = info.value.detail
+    assert info.value.status_code == 503
+    assert "尚未完成" in detail and "备份文件恢复" not in detail, detail
+
+    pending_detail = server_module._persistence_failure_detail(
+        server_module.MemoryPersistenceError(detail), "rid-p"
+    )
+    assert "备份文件恢复" not in pending_detail, pending_detail
 
 
 def test_quarantine_marker_fresh_and_pending_unconditional(monkeypatch):

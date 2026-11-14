@@ -254,6 +254,37 @@ def test_recovered_corrupt_backup_ignores_deleted_accounts(tmp_path):
     assert cli._recovered_corrupt_backup(_Store()) is None
 
 
+def test_open_cli_store_blocks_pending_quarantine(monkeypatch):
+    """pending（隔离改名未完成）状态下普通命令拒绝、恢复入口放行。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    recorded = []
+
+    class _PendingStore:
+        def get_fresh_quarantine_backup(self):
+            return None
+
+        def has_pending_corrupt_quarantine(self):
+            return True
+
+        def close(self):
+            recorded.append("closed")
+
+    monkeypatch.setattr(
+        storage,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _PendingStore(),
+    )
+    with pytest.raises(cli._QuarantinedMemoryError) as info:
+        cli._open_cli_store("u1")
+    assert "尚未完成" in str(info.value), str(info.value)
+    assert "已隔离备份到" not in str(info.value)
+    assert recorded == ["closed"]
+    # 恢复入口豁免（不再查询 pending）
+    assert cli._open_cli_store("u1", allow_quarantined=True) is not None
+
+
 def test_open_cli_store_forwards_allow_quarantined(monkeypatch):
     """恢复入口（user-import）把 allow_quarantined=True 传给存储工厂，
     普通维护命令默认 False——隔离状态下只有恢复能重建主文件。"""
