@@ -115,11 +115,12 @@ def _has_full_event_schema(obj: dict) -> bool:
 
 
 def _is_authoritative_empty(obj: dict) -> bool:
-    """是否「本轮最终表态：没有提取到信息」，允许按位置压过更早的实质候选。
+    """形状上可确定「本轮最终表态：没有提取到信息」的空结果。
 
     两类：带计数（extracted_count == 0），或字段表完整、没有任何核心字段
-    有值且声明了缺失信息（全 null 终稿）。局部的 missing_info 尾注
-    （只含 summary / 一两个缺失项）是补充说明，不在其列。
+    有值且声明了缺失信息（全 null 终稿）。只含 summary / 局部缺失项的
+    missing_info 尾注不在其列——形状相同的「信息不足终稿」再由候选前的
+    标签与位置区分（见 _select_event_result）。
     """
     if _is_counted_empty(obj):
         return True
@@ -128,6 +129,29 @@ def _is_authoritative_empty(obj: dict) -> bool:
         and _plan_score(obj) == 0
         and _is_explicit_empty(obj)
     )
+
+
+# 候选对象前的文本标签：示例（回显的 prompt 示例）、补充说明（尾注）、
+# 正式结果。形状相同的 missing_info 对象既可能是本轮「信息不足」终稿、
+# 也可能是附在结果后的尾注，标签与位置共同决定它能否否决更早的实质候选。
+_EVENT_EXAMPLE_LABELS = ("示例", "例如", "样例")
+_EVENT_SUPPLEMENT_LABELS = ("尾注", "补充", "备注", "附注")
+_EVENT_FORMAL_LABELS = ("正式", "结果", "最终", "输出", "结论")
+
+
+def _event_label_kind(label: str) -> str:
+    """候选对象前的标签：example / supplement / formal / neutral。"""
+    lines = [item.strip() for item in label.splitlines() if item.strip()]
+    if not lines:
+        return "neutral"
+    line = lines[-1]
+    if any(marker in line for marker in _EVENT_EXAMPLE_LABELS):
+        return "example"
+    if any(marker in line for marker in _EVENT_SUPPLEMENT_LABELS):
+        return "supplement"
+    if any(marker in line for marker in _EVENT_FORMAL_LABELS):
+        return "formal"
+    return "neutral"
 
 
 def _normalize_event_date(text: str) -> str | None:
@@ -190,34 +214,45 @@ def _select_event_result(text: str) -> dict | None:
     last_any_end = -1
     substantive: dict | None = None
     substantive_end = -1
+    substantive_kind = "neutral"
     explicit_empty: dict | None = None
     explicit_empty_end = -1
     authoritative_empty: dict | None = None
     authoritative_end = -1
     failed_tail = False
+    prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
             continue
+        label_kind = _event_label_kind(text[prev_end:start])
+        prev_end = end
         candidate = _unwrap_result(value)
         if candidate is None:
             continue
         last_any, last_any_end = candidate, end
         failed_tail = False
         if _plan_score(candidate) > 0:
-            substantive, substantive_end = candidate, end
+            substantive, substantive_end, substantive_kind = candidate, end, label_kind
         elif _is_explicit_empty(candidate):
             explicit_empty, explicit_empty_end = candidate, end
-            if _is_authoritative_empty(candidate):
+            if (
+                _is_authoritative_empty(candidate)
+                or label_kind == "formal"
+                # 更早的实质候选是回显的 prompt 示例：本轮没有真实提取，
+                # 后置的 missing_info 终稿（无论自身标签）都要保护用户
+                # ——绝不能让示例字段被当成真实提取写入 trip_history
+                or substantive_kind == "example"
+            ):
                 authoritative_empty, authoritative_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     if substantive is not None and authoritative_empty is not None:
         # 按位置取后者：回显示例（实质字段俱全）之后又输出本轮终稿
-        # 「没有提取到信息」（带计数，或全 null 字段表 + missing_info）时，
-        # 终稿是对本轮的最终表态；局部的 missing_info 尾注只是补充说明
-        # （_is_authoritative_empty），不能顶掉完整提取
+        # 「没有提取到信息」（带计数 / 全 null 字段表 / 正式标签 / 示例之后
+        # 的缺失声明）时，终稿是对本轮的最终表态；附在真实结果之后的
+        # 局部 missing_info 尾注只是补充说明，不能顶掉完整提取
         if authoritative_end > substantive_end:
             chosen, chosen_end = authoritative_empty, authoritative_end
         else:

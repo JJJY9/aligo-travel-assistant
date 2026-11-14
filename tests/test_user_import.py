@@ -2114,6 +2114,78 @@ def test_merged_backup_limit_previews_dedupe(monkeypatch):
     print("✓ 合并上限检查按导入去重语义预演（含更新行体积）")
 
 
+def test_merged_trip_rows_mirror_storage_semantics():
+    """合并预演与 save_trip_histories 一致：同身份只更新第一条既有行；
+    同批重复新行先建后更新（前行其余字段保留）；缺目的地/日期的行逐条新增。"""
+    from utils import user_import as module
+
+    existing = [
+        {
+            "trip_id": "trip_1",
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-03-01",
+        },
+        {
+            # 同身份重复的历史行（旧数据）：存储层只更新 index 里的第一条
+            "trip_id": "trip_2",
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-03-01",
+        },
+        {
+            "trip_id": "trip_3",
+            "origin": "北京",
+            "destination": "无日期",
+        },
+    ]
+    trips = [
+        {
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-03-01",
+            "purpose": "第一次更新",
+        },
+        {
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-03-01",
+            "purpose": "第二次更新",
+        },
+        {"origin": "北京", "destination": "无日期"},
+        {"origin": "北京", "destination": "无日期"},
+    ]
+    merged = module._merged_trip_rows(existing, trips)
+    assert len(merged) == 5, merged  # 3 条既有 + 2 条无身份新行
+    assert merged[0]["purpose"] == "第二次更新", merged[0]
+    assert "purpose" not in merged[1], "同身份只应更新第一条既有行"
+    assert "purpose" not in existing[0], "预演不能原地修改既有行"
+
+    # 同批重复的新行先建后更新：后行的 purpose 覆盖前行，前行其余字段保留
+    fresh = module._merged_trip_rows(
+        [],
+        [
+            {
+                "origin": "上海",
+                "destination": "成都",
+                "start_date": "2026-05-01",
+                "purpose": "长目的",
+                "note": "保留字段",
+            },
+            {
+                "origin": "上海",
+                "destination": "成都",
+                "start_date": "2026-05-01",
+                "purpose": "短",
+            },
+        ],
+    )
+    assert len(fresh) == 1, fresh
+    assert fresh[0]["purpose"] == "短"
+    assert fresh[0]["note"] == "保留字段"
+    print("✓ 合并预演与存储层的行程索引 / 更新语义一致")
+
+
 def test_import_accepts_device_like_session_ids():
     """会话 ID 不拼文件名：nul / con 不再被判非法并丢弃消息。"""
     payload = {

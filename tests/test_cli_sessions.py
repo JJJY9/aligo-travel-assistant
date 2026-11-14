@@ -874,7 +874,7 @@ def test_session_show_errors(monkeypatch):
     assert code == 1 and "读取会话失败" in out.getvalue()
     store.fail_history = False
 
-    def boom(*args):
+    def boom(*args, **kwargs):
         raise RuntimeError("open down")
 
     monkeypatch.setattr(storage, "create_long_term_memory", boom)
@@ -931,7 +931,7 @@ def test_read_failure(monkeypatch):
 
 
 def test_store_open_failure(monkeypatch):
-    def boom(*args):
+    def boom(*args, **kwargs):
         raise RuntimeError("cannot open")
 
     monkeypatch.setattr(storage, "create_long_term_memory", boom)

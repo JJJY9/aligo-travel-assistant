@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import re
 import sys
 
 from agentscope.agent import AgentBase
@@ -89,23 +90,30 @@ def _has_nonempty_daily_plans(value: dict) -> bool:
     return False
 
 
-# 弱行程候选前的标签决定它是「本轮终稿」还是「补充说明」：补充尾注
-# （补充：/尾注：/备注：）没有排期内容时不能顶掉更早的完整行程；
-# 没标签或「正式 / 结果 / 输出」标签按位置照常胜出（回显示例之后
-# 的裸弱键正式行程仍然有效）。
-_SUPPLEMENT_LABELS = ("补充", "尾注", "备注", "附注", "提示")
-_FORMAL_LABELS = ("正式", "结果", "输出", "最终", "答案")
+# 弱行程候选前的标签决定它是「本轮终稿」还是「补充说明」：只有紧凑的
+# 补充说明标签（「补充：」「尾注：」「备注：」等短标签行）才让后置弱行程
+# 固定让位；「根据您补充的信息，行程如下：」这类普通叙述、示例说明与
+# 无标签候选都按位置照常竞争（回显示例之后的裸弱键正式行程仍有效）。
+_SUPPLEMENT_LABEL_RE = re.compile(
+    r"^(补充|尾注|备注|附注|提示|注意|说明|须知)"
+    r"(说明|信息|内容|事项|结果|行程|安排)?\s*[:：]?\s*$"
+)
+_EXAMPLE_LABELS = ("示例", "例如", "样例")
 
 
-def _label_is_supplementary(label: str) -> bool:
-    """候选对象前的文本标签是否表明它是补充说明（而非本轮终稿）。"""
+def _label_kind(label: str) -> str:
+    """候选对象前的标签：example（回显示例）/ supplement（补充尾注）/ neutral。"""
     lines = [item.strip() for item in label.splitlines() if item.strip()]
+    # 去掉 Markdown 围栏行：标签与对象之间常隔着 ```json / ```
+    lines = [item for item in lines if not item.startswith("```")]
     if not lines:
-        return False
+        return "neutral"
     line = lines[-1]
-    if any(marker in line for marker in _FORMAL_LABELS):
-        return False
-    return any(marker in line for marker in _SUPPLEMENT_LABELS)
+    if any(marker in line for marker in _EXAMPLE_LABELS):
+        return "example"
+    if _SUPPLEMENT_LABEL_RE.match(line):
+        return "supplement"
+    return "neutral"
 
 
 def _select_plan_result(text: str) -> dict | None:
@@ -122,9 +130,8 @@ def _select_plan_result(text: str) -> dict | None:
     last_any_end = -1
     full: dict | None = None
     full_end = -1
-    titled: dict | None = None
-    titled_end = -1
-    titled_label = ""
+    full_kind = "neutral"
+    titled_candidates: list[tuple[dict, int, str]] = []
     failed_tail = False
     prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
@@ -132,7 +139,7 @@ def _select_plan_result(text: str) -> dict | None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
             continue
-        label = text[prev_end:start]
+        kind = _label_kind(text[prev_end:start])
         prev_end = end
         plan = _as_plan_object(value)
         if plan is None:
@@ -140,21 +147,32 @@ def _select_plan_result(text: str) -> dict | None:
         last_any, last_any_end = plan, end
         failed_tail = False
         if _is_full_plan(plan):
-            full, full_end = plan, end
+            full, full_end, full_kind = plan, end, kind
         elif _is_titled_plan(plan):
-            titled, titled_end, titled_label = plan, end, label
+            titled_candidates.append((plan, end, kind))
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    # 补充说明标签的弱行程（尾注）不参与「终稿」竞争：多个 titled 候选时
+    # 取最后一个非尾注的；只有全是尾注时才退回最后一个
+    final_titled = [
+        item for item in titled_candidates if item[2] != "supplement"
+    ]
+    titled, titled_end, titled_kind = (
+        (final_titled or titled_candidates)[-1]
+        if titled_candidates
+        else (None, -1, "neutral")
+    )
     if titled is not None and (full is None or titled_end > full_end):
         if (
             full is not None
+            and full_kind != "example"
+            and titled_kind == "supplement"
             and _has_nonempty_daily_plans(full)
             and not _has_nonempty_daily_plans(titled)
-            and _label_is_supplementary(titled_label)
         ):
-            # 后置的「标题 + duration/route/schedule」补充尾注（补充：/尾注：）
-            # 没有排期内容，不能因为位置靠后就顶掉更早带 daily_plans 的完整
-            # 行程；无标签或「正式：」标签的裸弱键行程仍按位置胜出
+            # 真实完整行程之后的「标题 + duration/route/schedule」补充尾注
+            # 没有排期内容，不能因为位置靠后就顶掉完整行程；回显示例
+            # （示例：）之后的裸弱键正式行程与无标签候选仍按位置胜出
             chosen, chosen_end = full, full_end
         else:
             chosen, chosen_end = titled, titled_end
