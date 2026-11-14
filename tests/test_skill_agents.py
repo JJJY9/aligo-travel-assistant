@@ -1989,6 +1989,22 @@ def test_preference_empty_formal_array_with_trailing_prose_after_example():
     print("✓ 偏好：正式空数组后的说明散文不使其失效")
 
 
+def test_preference_paren_example_empty_array_does_not_clear_result():
+    """说明文字/括号里的示例 []（“…返回：[]）”）不是正式空结果，
+    不能顶掉更早真实解析成功的偏好对象。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    for tail in ("\n（若本轮没有新偏好，返回：[]）", "\n格式说明：{无偏好时输出：[]}"):
+        data = _pref_reply(formal + tail)
+        assert data.get("has_preferences") is True, (tail, data)
+        assert data["preferences"] == [
+            {"type": "home_location", "value": "上海"}
+        ], (tail, data)
+    print("✓ 偏好：括号内示例空数组不顶掉真实结果")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2066,6 +2082,30 @@ def test_event_collection_uncounted_missing_info_tail_keeps_full_result():
     print("✓ 事项收集：无计数的 missing_info 尾注不顶掉完整结果")
 
 
+def test_event_collection_full_schema_empty_beats_earlier_example():
+    """不带计数的全 null 终稿（全套字段 + missing_info）是最终表态，
+    必须压过更早的回显示例；示例值不能当成真实提取写库。"""
+    example = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"duration_days": 1, "missing_info": [], "extracted_count": 7}'
+    )
+    formal = (
+        '正式结果：{"origin": null, "destination": null, "start_date": null, '
+        '"end_date": null, "duration_days": null, "return_location": null, '
+        '"trip_purpose": null, "missing_info": ["所有信息"], "summary": "未提供"}'
+    )
+    data = _event_reply(f"{example}\n{formal}")
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    # extracted_count 为 null / 字符串「0」的变体同样按全 null 终稿处理
+    for count in ("null", '"0"'):
+        variant = formal.replace('"summary": "未提供"', f'"extracted_count": {count}, "summary": "未提供"')
+        data = _event_reply(f"{example}\n{variant}")
+        rendered = json.dumps(data, ensure_ascii=False)
+        assert "北京" not in rendered and "2026-02-27" not in rendered, (count, data)
+    print("✓ 事项收集：全 null 字段表的终稿压过更早示例")
+
+
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
@@ -2085,6 +2125,20 @@ def test_plan_trip_titled_duration_tail_does_not_displace_full_plan():
     assert data["itinerary"]["title"] == "杭州出差", data
     assert data["itinerary"].get("daily_plans"), data
     print("✓ 行程规划：标题+duration 尾注不顶掉完整行程")
+
+
+def test_plan_trip_formal_titled_result_after_daily_plans_example():
+    """带 daily_plans 的回显示例之后、无标签或「正式：」标签的裸弱键行程
+    是本轮终稿，不能因缺少 daily_plans 被前面的示例顶掉。"""
+    example = '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    for formal in (
+        '正式：{"title": "杭州出差", "duration": "3天", "route": "北京 -> 杭州"}',
+        '{"title": "杭州出差", "duration": "3天"}',
+    ):
+        data = _plan_trip_reply(f"{example}\n{formal}")
+        assert data.get("error") is None, (formal, data)
+        assert data["itinerary"]["title"] == "杭州出差", (formal, data)
+    print("✓ 行程规划：正式裸弱键行程不被带排期的示例顶掉")
 
 
 def test_plan_trip_empty_daily_plans_shell_does_not_displace_full_plan():

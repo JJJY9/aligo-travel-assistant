@@ -444,8 +444,11 @@ def merged_backup_limit_problem(
     payload = {
         "chat_history": list(existing.get("chat_history") or [])
         + _new_message_rows(store, sections.get("messages") or []),
-        "trip_history": list(existing.get("trip_history") or [])
-        + _new_trip_rows(store, sections.get("trips") or []),
+        "trip_history": _merged_trip_rows(
+            store,
+            list(existing.get("trip_history") or []),
+            sections.get("trips") or [],
+        ),
         "preferences": merged_prefs,
         "knowledge": sections.get("knowledge") or [],
         "session_titles": merged_titles,
@@ -495,25 +498,73 @@ def _new_message_rows(store: Any, messages: list[Any]) -> list[Any]:
         return list(messages)
 
 
-def _new_trip_rows(store: Any, trips: list[Any]) -> list[Any]:
-    """按行程身份去重挑出备份里真正会新增的行程行（同批内也去重）。"""
-    if not trips:
-        return []
+def _merged_trip_rows(
+    store: Any, existing_rows: list[Any], trips: list[Any]
+) -> list[Any]:
+    """恢复后行程表的形状：同身份行按导入语义合并，新身份行追加。
+
+    导入会按 ``trip_identity`` 更新既有行（purpose / session_id / 时间戳），
+    而不是跳过——体积预演必须用更新后的行，否则备份里更大的行会让恢复后
+    的导出体积被低估（放行一个让账号永久无法导出的恢复）。读取既有行程
+    失败时保守返回「现有 + 全部备份行」。
+    """
+    merged_existing = list(existing_rows)
+    incoming = list(trips)
+    if not incoming:
+        return merged_existing
     history_getter = getattr(store, "get_trip_history", None)
     if not callable(history_getter):
-        return list(trips)
+        return merged_existing + incoming
     try:
-        known = {trip_identity(trip) for trip in history_getter(limit=None)}
+        live_rows = [
+            row
+            for row in history_getter(limit=None) or []
+            if isinstance(row, dict)
+        ]
     except Exception:  # noqa: BLE001 - 读取失败按全部新增保守处理
-        return list(trips)
-    fresh: list[Any] = []
-    for trip in trips:
-        key = trip_identity(trip)
-        if key in known:
+        return merged_existing + incoming
+    live_keys = {trip_identity(row) for row in live_rows}
+    updates: dict[Any, dict[str, Any]] = {}
+    appended: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
+    for row in incoming:
+        if not isinstance(row, dict):
             continue
-        known.add(key)
-        fresh.append(trip)
-    return fresh
+        key = trip_identity(row)
+        if key in live_keys:
+            updates[key] = row
+        elif key in appended:
+            appended[key] = row
+        else:
+            appended[key] = row
+            order.append(key)
+    merged: list[Any] = []
+    for row in merged_existing:
+        if not isinstance(row, dict):
+            merged.append(row)
+            continue
+        update = updates.get(trip_identity(row))
+        merged.append(_merge_trip_row(row, update) if update is not None else row)
+    merged.extend(appended[key] for key in order)
+    return merged
+
+
+def _merge_trip_row(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """导入层对同身份行程的更新语义（与 ``save_trip_histories`` 一致）：
+    purpose 非 None 覆盖、session_id 键存在即覆盖（含显式 None）、时间戳
+    取备份值，其余字段保留。"""
+    merged = dict(existing)
+    purpose = incoming.get("purpose")
+    if purpose is not None:
+        merged["purpose"] = purpose
+    if "session_id" in incoming:
+        merged["session_id"] = incoming.get("session_id")
+    timestamp = incoming.get("timestamp")
+    if timestamp:
+        merged["timestamp"] = timestamp
+    return merged
 
 
 def sections_limit_problem(sections: dict[str, Any]) -> str | None:

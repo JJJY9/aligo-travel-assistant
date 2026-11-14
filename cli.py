@@ -3618,25 +3618,19 @@ def run_trips_dedupe_standalone(
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
 
-    from config import STORAGE_CONFIG
-    from context.long_term_memory import LongTermMemory
-    from context.storage import create_long_term_memory
     from utils.trip_dedupe import apply_trip_dedupe, plan_trip_dedupe
 
     try:
-        store = create_long_term_memory(user_id, str(default_data_root() / "memory"))
+        # 与其它维护命令同一打开口径：PostgreSQL 配置但不可用时拒绝在
+        # 过期本地 JSON 上「成功」，记忆文件隔离期间同样拒绝（隔离后的
+        # 空快照会被当成「没有重复行程」报告成功）
+        store = _open_cli_store(user_id)
+    except _QuarantinedMemoryError as exc:
+        return _fail(f"去重中止：{exc}")
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"打开长期记忆失败：{exc}")
 
     try:
-        # PostgreSQL 配置了但连接失败时，工厂会静默回退本地 JSON；维护命令
-        # 必须确保清理的是目标后端，避免对过期本地数据“成功”而真实库未处理
-        if STORAGE_CONFIG.get("postgres_dsn") and isinstance(store, LongTermMemory):
-            return _fail(
-                "PostgreSQL 已配置但连接失败（已回退本地 JSON），"
-                "未执行去重；请检查数据库后重试"
-            )
-
         try:
             plan = plan_trip_dedupe(store)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
