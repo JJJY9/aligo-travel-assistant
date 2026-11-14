@@ -2237,158 +2237,30 @@ def test_replay_skips_messages_backfilled_by_other_instance(monkeypatch):
 
 
 if __name__ == "__main__":
-    test_truncate_pair()
-    test_truncate_expect_mismatch_keeps_history()
-    test_truncate_trailing_user_only()
-    test_truncate_empty()
-    test_truncate_expect_without_user_message_returns_zero()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_get_context_string_formats_and_skips_bad_entries(_mp)
-    finally:
-        _mp.undo()
-    test_max_turns_evicts_oldest()
-    test_recent_context_and_string()
-    test_statistics_and_clear()
-    test_named_connection_error_is_transient()
-    test_server_state_errors_are_transient()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_redis_failure_falls_back_to_memory(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_redis_recovery_resets_degraded(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_shadow_cache_mirrors_truncate(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_truncate_last_turn_skips_turns_written_after_cutoff(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_shadow_cache_mirrors_clear(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_reset_redis_degraded_clears_cooldown(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_writes_replayed_after_recovery(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_ops_expire_after_tombstone_window(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_backlog_is_bounded(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_replay_dedupes_committed_payload(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_truncate_replays_on_recovery(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_add_then_truncate_replays_in_order(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_truncate_keeps_other_instance_messages(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_online_truncate_refreshes_stale_shadow(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_transient_truncate_queues_conditional_delete(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_transient_object_truncate_replays_after_discard(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_truncate_replay_marker_prevents_double_delete(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_truncate_replay_cutoff_skips_newer_same_text_turn(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_delete_ops_cap_does_not_drop_new_adds(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_replay_batches_adds_in_one_pipeline(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_replay_batch_failure_retries_without_duplicates(_mp)
-    finally:
-        _mp.undo()
-    _mp = __import__("pytest").MonkeyPatch()
-    try:
-        test_outage_clear_rewrites_on_recovery(_mp)
-    finally:
-        _mp.undo()
-    for case in (
-        test_none_client_recovers_via_factory,
-        test_broken_client_re_resolved_after_failure,
-        test_connection_failure_during_replay_keeps_queue,
-        test_truncate_marker_outlives_message_ttl,
-        test_named_connection_error_during_replay_keeps_queue,
-        test_server_state_error_during_replay_keeps_queue,
-        test_truncate_replay_marker_uses_long_ttl,
-        test_read_skips_deeply_nested_entries,
-        test_health_tracks_real_success_not_cooldown_window,
-        test_deterministic_error_does_not_degrade_process,
-        test_poison_warning_redacts_message_content,
-        test_replay_discards_queue_when_session_deleted,
-        test_parse_skips_huge_int_literal_without_degrading,
-        test_statistics_tolerates_missing_timestamp_in_fallback,
-        test_fallback_context_prunes_expired_rounds,
-        test_fallback_shadow_survives_long_outage_with_activity,
-        test_append_op_starts_new_window_after_drain,
-        test_backfill_and_replay_share_timestamps_dedupe_once,
-        test_seed_fallback_context_persists_to_redis,
-        test_replay_skips_messages_backfilled_by_other_instance,
-    ):
-        _case_mp = __import__("pytest").MonkeyPatch()
+    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
+    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    import inspect
+    import pathlib
+    import tempfile
+
+    ran = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        if any(param not in ("monkeypatch", "tmp_path") for param in params):
+            continue
+        fixture = None
+        kwargs: dict = {}
+        if "monkeypatch" in params:
+            fixture = pytest.MonkeyPatch()
+            kwargs["monkeypatch"] = fixture
+        if "tmp_path" in params:
+            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
         try:
-            case(_case_mp)
+            func(**kwargs)
+            ran += 1
         finally:
-            _case_mp.undo()
-    test_rollback_staged_message_only_removes_matching_tail()
-    test_non_positive_ttl_is_clamped()
-    print("\n全部通过")
+            if fixture is not None:
+                fixture.undo()
+    print(f"\n全部通过（{ran} 个用例）")

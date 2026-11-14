@@ -166,6 +166,26 @@ _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "�
 
 
 _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
+_PAREN_EXAMPLE = frozenset(
+    {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
+)
+
+
+def _paren_example_marker(line: str) -> bool:
+    """括号里自称示例的短标签（「结果（示例）：」「（示例）：」）。
+
+    去掉括号组后剩余文本不含句子标点（叙述句不算），且某个括号组的
+    内容精确命中示例短语——「按照（示例）格式，结果如下：」不算示例。"""
+    outside = _PAREN_GROUP_RE.sub("", line)
+    if any(ch in outside for ch in "，。；、！？,;!?…"):
+        return False
+    for group in _PAREN_GROUP_RE.findall(line):
+        content = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", group[1:-1])
+        if content in _PAREN_EXAMPLE:
+            return True
+    return False
+
+
 def _event_label_phrase(label: str) -> str | None:
     line = ""
     for item in label.splitlines():
@@ -180,11 +200,7 @@ def _event_label_phrase(label: str) -> str | None:
         if stripped == cleaned_line:
             break
         cleaned_line = stripped
-    for group in _PAREN_GROUP_RE.findall(line):
-        if re.search(r"示例|例如|样例", group):
-            # 「结果（示例）：」「正式结果（例如）：」：括号里自称示例
-            return "示例"
-    if not re.sub(r"[:：=\s]", "", cleaned_line):
+    if not re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", cleaned_line):
         # 整行就是括号里的标签（「（尾注）：」「(示例)：」）：取括号内容
         match = _PAREN_GROUP_RE.search(line)
         if match:
@@ -228,7 +244,37 @@ def _is_example_phrase(phrase: str | None) -> bool:
 
 
 def _event_label_is_example(label: str) -> bool:
+    line = ""
+    for item in label.splitlines():
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
+        if cleaned:
+            line = cleaned
+    if line and _paren_example_marker(line):
+        return True
     return _is_example_phrase(_event_label_phrase(label))
+
+
+def _iter_array_spans(text: str):
+    decoder = json.JSONDecoder()
+    index = text.find("[")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("[", index + 1)
+            continue
+        if isinstance(value, list):
+            yield index, end
+        index = text.find("[", max(end, index + 1))
+
+
+def _inside_example_array(text: str, start: int) -> bool:
+    """对象位于带「示例：」标签的 JSON 数组内：继承示例标记（数组换行
+    书写时「[」行会吞掉元素的标签）。"""
+    for array_start, array_end in _iter_array_spans(text):
+        if array_start < start < array_end:
+            return _event_label_is_example(text[:array_start])
+    return False
 
 
 # missing_info 条目 → 提取字段：用于判断「信息不足」声明与实质提取是否矛盾
@@ -357,8 +403,11 @@ def _select_event_result(text: str) -> dict | None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
             continue
-        label_phrase = _event_label_phrase(text[prev_end:start])
-        label_example = _is_example_phrase(label_phrase)
+        label_segment = text[prev_end:start]
+        label_phrase = _event_label_phrase(label_segment)
+        label_example = _event_label_is_example(label_segment)
+        if not label_example:
+            label_example = _inside_example_array(text, start)
         prev_end = end
         candidate = _unwrap_result(value)
         if candidate is None:
@@ -366,7 +415,9 @@ def _select_event_result(text: str) -> dict | None:
         last_any, last_any_end = candidate, end
         failed_tail = False
         if _plan_score(candidate) > 0:
-            substantives.append((candidate, end, label_example))
+            substantives.append(
+                (candidate, end, label_example, label_phrase in _SUPPLEMENT_LABELS)
+            )
         elif _is_explicit_empty(candidate):
             if label_example:
                 # 回显的空结果示例同样不参与竞争（与实质候选的示例防护对称）
@@ -383,10 +434,13 @@ def _select_event_result(text: str) -> dict | None:
                     authoritative_empty, authoritative_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    # 回显示例不参与实质候选竞争（全是示例时才兜底）
-    real = [item for item in substantives if not item[2]] or substantives
+    # 回显示例与带补充标签的实质候选降级；只剩回显示例时宁可报错，
+    # 也不把示例字段当成真实提取写库
+    strong = [item for item in substantives if not item[2] and not item[3]]
+    if not strong:
+        strong = [item for item in substantives if not item[2]]
     substantive, substantive_end, substantive_is_example = (
-        real[-1] if real else (None, -1, False)
+        strong[-1][:3] if strong else (None, -1, False)
     )
     if substantive is not None:
         if authoritative_empty is not None and authoritative_end > substantive_end:
@@ -416,6 +470,9 @@ def _select_event_result(text: str) -> dict | None:
         chosen, chosen_end = last_empty_any, last_empty_any_end
     elif example_empty is not None:
         chosen, chosen_end = example_empty, example_empty_end
+    elif substantives:
+        # 只有回显示例候选：宁可报错也不写示例数据
+        return None
     elif last_any is not None:
         chosen, chosen_end = last_any, last_any_end
     else:

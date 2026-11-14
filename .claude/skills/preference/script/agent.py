@@ -270,6 +270,26 @@ _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "�
 
 
 _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
+_PAREN_EXAMPLE = frozenset(
+    {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
+)
+
+
+def _paren_example_marker(line: str) -> bool:
+    """括号里自称示例的短标签（「结果（示例）：」「（示例）：」）。
+
+    去掉括号组后剩余文本不含句子标点（叙述句不算），且某个括号组的
+    内容精确命中示例短语——「按照（示例）格式，结果如下：」不算示例。"""
+    outside = _PAREN_GROUP_RE.sub("", line)
+    if any(ch in outside for ch in "，。；、！？,;!?…"):
+        return False
+    for group in _PAREN_GROUP_RE.findall(line):
+        content = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", group[1:-1])
+        if content in _PAREN_EXAMPLE:
+            return True
+    return False
+
+
 
 
 def _label_phrase(line: str) -> str | None:
@@ -281,11 +301,7 @@ def _label_phrase(line: str) -> str | None:
         if stripped == cleaned_line:
             break
         cleaned_line = stripped
-    for group in _PAREN_GROUP_RE.findall(line):
-        # 括号里自称示例（「结果（示例）：」）：整行不是结果标签
-        if re.search(r"示例|例如|样例", group):
-            return None
-    if not re.sub(r"[:：=\s]", "", cleaned_line):
+    if not re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", cleaned_line):
         # 整行就是括号里的标签（「（正式结果）：」）：取括号内容
         match = _PAREN_GROUP_RE.search(line)
         if match:
@@ -326,6 +342,8 @@ def _is_example_label(label: str) -> bool:
             line = cleaned
     if not line:
         return False
+    if _paren_example_marker(line):
+        return True
     phrase = _label_phrase(line)
     if not phrase or any(ch in phrase for ch in _SENTENCE_PUNCT):
         return False
@@ -369,6 +387,12 @@ def _is_result_phrase(phrase: str) -> bool:
         if stripped.endswith(suffix) and len(stripped) > len(suffix):
             stripped = stripped[: -len(suffix)]
             break
+    if any(
+        word in stripped
+        for word in ("返回", "输出", "若无", "如果", "若", "请", "需")
+    ):
+        # 指令 / 条件短语（「返回结果」「若无偏好返回结果」）不是结果标签
+        return False
     return len(stripped) <= 8 and stripped.endswith(_RESULT_SUFFIXES)
 
 
@@ -390,7 +414,11 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
             cleaned_lines.append(cleaned)
     if not cleaned_lines:
         return True
-    phrase = _label_phrase(_strip_line_json_values(cleaned_lines[-1]))
+    label_line = _strip_line_json_values(cleaned_lines[-1])
+    if _paren_example_marker(label_line):
+        # 「结果（示例）：[]」括号里自称示例：不是正式空结果
+        return False
+    phrase = _label_phrase(label_line)
     if not phrase or not _is_result_phrase(phrase):
         return False
     if len(cleaned_lines) >= 2:
@@ -455,14 +483,30 @@ def _select_preference_result(text: str) -> dict | None:
         if any(span_start <= start < span_end for span_start, span_end in spans):
             continue
         arrays.append((start, end, items, _is_example_label(text[:start])))
-    # 回显示例候选（「示例：」前缀）不参与竞争（全是示例时才兜底）
-    real_arrays = [item for item in arrays if not item[3]] or arrays
+    # 示例数组内的元素对象继承示例标记（数组换行书写时元素前的标签段
+    # 只剩「, 」之类的分隔符）
+    example_spans = [(s, e) for s, e, _items, ex in arrays if ex]
+    if example_spans:
+        objects = [
+            (
+                s,
+                e,
+                obj,
+                flag or any(es <= s < ee for es, ee in example_spans),
+            )
+            for (s, e, obj, flag) in objects
+        ]
+    # 回显示例候选（「示例：」前缀）不参与竞争：只剩示例时宁可报错
+    # （reply 侧按解析失败返回），也不把示例偏好当成真实结果写库
+    real_objects = [item for item in objects if not item[3]]
+    real_arrays = [item for item in arrays if not item[3]]
+    if (objects or arrays) and not real_objects and not real_arrays:
+        return None
     array = None
     for start, end, items, _ in real_arrays:
         if not items and not _empty_array_is_formal(text, start, end):
             continue
         array = (start, end, items)
-    real_objects = [item for item in objects if not item[3]] or objects
     chosen: tuple[dict, int, int] | None = None
     if real_objects:
         obj_start, obj_end, obj, _ = real_objects[-1]

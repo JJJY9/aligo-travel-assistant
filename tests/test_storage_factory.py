@@ -4047,149 +4047,30 @@ def test_migrate_dedupes_preference_types():
 
 
 if __name__ == "__main__":
-    test_defaults_use_local_backends()
-    test_bad_redis_falls_back()
-    test_bad_postgres_falls_back()
-    _mp_pg_single = pytest.MonkeyPatch()
-    try:
-        test_pg_create_single_flight_after_cooldown(_mp_pg_single)
-        test_strict_pg_failure_reports_json_backend(_mp_pg_single)
-    finally:
-        _mp_pg_single.undo()
-    test_memory_manager_uses_factory()
-    test_long_term_delete_session()
-    test_long_term_delete_preference()
-    test_trip_history_delete_and_ids()
-    test_stale_snapshot_does_not_resurrect_trip()
-    test_trip_save_deduplicates_same_trip()
-    test_trip_save_matches_linebreak_variants()
-    test_delete_trips_verified_batches_single_write()
-    test_delete_dirty_date_trip_keeps_frequent_destinations()
-    test_pg_frequent_destinations_skip_dirty_dates()
-    test_trip_update_and_conflict()
-    test_trip_frequent_destinations_ignore_dirty_dates()
-    test_bulk_message_dedupe_normalizes_legacy_int_session_id()
-    test_trip_batch_restore_preserves_ids_and_rejects_collisions()
-    test_json_export_snapshot_is_consistent()
-    test_memory_manager_export_uses_snapshot()
-    test_next_trip_id_not_reused_after_deleting_latest()
-    test_one_day_trip_dedupes_end_date_variants()
-    test_session_titles()
-    test_session_pinned()
-    test_add_message_preserves_metadata()
-    test_clear_history_clears_metadata()
-    test_corrupt_memory_file_is_backed_up()
-    test_corrupt_backup_does_not_move_concurrently_written_file(pytest.MonkeyPatch())
-    test_valid_json_non_object_memory_file_is_backed_up()
-    test_corrupt_pending_non_object_file_backed_up_before_write()
-    test_null_list_fields_are_repaired()
-    test_migrate_fills_statistics_defaults()
-    test_migrate_repairs_bad_statistics_values()
-    test_migrate_clamps_inflated_counters_to_list_length()
-    test_migrate_drops_non_object_entries()
-    test_migrate_recomputes_counters_after_dropping_entries()
-    test_pg_reconnects_after_connection_error()
-    test_pg_schema_initialized_once_per_process()
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_pg_connect_sets_lock_timeout_and_keepalives(_mp)
-    finally:
-        _mp.undo()
-    test_pg_schema_tolerates_concurrent_create_race()
-    test_pg_failed_retry_wrapped_as_memory_error()
-    test_falsey_preferences_included_in_context()
-    test_path_locks_do_not_grow_unbounded()
-    test_load_holds_path_lock()
-    test_pg_delete_trip_deletes_single_row()
-    test_pg_delete_duplicate_trip_keeps_last_copy()
-    test_pg_trip_lookup_normalizes_identity_fields()
-    test_pg_chat_summary_does_not_fetch_message_bodies()
-    test_pg_delete_trips_verified_checks_identity_in_lock()
-    test_pg_delete_operations_are_not_replayed()
-    test_summary_not_starved_by_long_current_session()
-    test_memory_persistence_error_is_not_retriable()
-    test_redact_url_masks_password_containing_at()
-    test_redact_url_masks_query_password()
-    test_strict_long_term_raises_when_unreachable()
-    test_strict_long_term_raises_during_cooldown()
-    test_reset_failure_cache_resets_short_term_degraded()
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_describe_reports_actual_backend_after_cooldown(_mp)
-    finally:
-        _mp.undo()
-    test_session_metadata_save_failure_raises()
-    test_json_write_failures_raise()
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_describe_backends_configured_flags(_mp)
-    finally:
-        _mp.undo()
-    test_export_data_includes_session_metadata()
-    test_append_preference_merges_atomically()
-    test_summary_invalidated_by_trip_edit()
-    test_embedding_model_shared(pytest.MonkeyPatch())
-    test_peek_embedding_dim_does_not_block_loading(pytest.MonkeyPatch())
-    test_summary_cache_avoids_repeated_calls()
-    test_summary_cache_shared_across_max_messages()
-    test_summary_fingerprint_detects_history_replacement()
-    test_summary_prompt_is_budgeted_and_formats_nulls()
-    test_summary_failure_cooldown()
-    test_empty_summary_enters_cooldown()
-    test_add_message_writes_long_term_first()
-    test_reload_long_term_respects_backend()
-    test_recovered_postgres_logs_fallback_warning(pytest.MonkeyPatch())
-    test_pg_retry_does_not_replay_non_idempotent_write()
-    test_pg_non_idempotent_call_sites_disable_replay()
-    test_pg_operations_serialized_across_threads()
-    test_pg_close_waits_for_inflight_operation()
-    test_pg_add_chat_turn_locks_before_guard()
-    test_pg_save_trip_histories_batches_with_one_index()
-    test_json_add_chat_turn_guard_runs_under_write_lock()
-    test_json_add_chat_turn_guard_sees_concurrent_delete()
-    test_json_get_chat_history_excludes_session_before_limit()
-    test_pg_get_chat_history_excludes_session_in_sql()
-    test_bulk_save_trips_scales_and_dedupes()
-    test_frequent_destinations_tie_order_is_deterministic()
-    test_pg_batch_aborts_when_connection_reconnects()
-    test_pg_delete_duplicate_trip_is_single_atomic_statement()
-    test_pg_update_trip_aborts_when_connection_reconnects()
-    test_pg_append_preference_aborts_when_connection_reconnects()
-    test_pg_save_trip_aborts_when_connection_reconnects()
-    test_pg_save_trip_aborts_when_reconnect_during_number_allocation()
-    test_pg_delete_trips_verified_delete_not_replayed()
-    test_bulk_save_trips_matches_sequential_saves()
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_pg_success_marks_actual_backend(_mp)
-    finally:
-        _mp.undo()
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_redis_import_failure_falls_back(_mp)
-    finally:
-        _mp.undo()
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_strict_error_message_redacts_dsn(_mp)
-    finally:
-        _mp.undo()
-    test_migrate_resets_counters_when_lists_cleared()
-    test_migrate_rebuilds_statistics_when_missing()
-    test_migrate_rebuilds_missing_individual_counters()
-    test_migrate_dedupes_preference_types()
-    test_migrate_backup_file_is_owner_only()
-    for case in (
-        test_redis_client_factory_single_flight,
-        test_redis_client_cache_is_url_scoped,
-        test_short_term_ttl_non_positive_clamped,
-        test_describe_backends_degraded_until_first_redis_success,
-        test_factory_warns_on_non_positive_ttl,
-        test_pg_batch_save_reports_partial_progress,
-    ):
-        _case_mp = pytest.MonkeyPatch()
+    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
+    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    import inspect
+    import pathlib
+    import tempfile
+
+    ran = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        if any(param not in ("monkeypatch", "tmp_path") for param in params):
+            continue
+        fixture = None
+        kwargs: dict = {}
+        if "monkeypatch" in params:
+            fixture = pytest.MonkeyPatch()
+            kwargs["monkeypatch"] = fixture
+        if "tmp_path" in params:
+            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
         try:
-            case(_case_mp)
+            func(**kwargs)
+            ran += 1
         finally:
-            _case_mp.undo()
-    print("\n全部通过")
+            if fixture is not None:
+                fixture.undo()
+    print(f"\n全部通过（{ran} 个用例）")

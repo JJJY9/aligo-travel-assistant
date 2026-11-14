@@ -2304,78 +2304,30 @@ def test_import_knowledge_error_redacts_paths(monkeypatch):
     print("✓ 知识片段恢复错误脱敏（路径 / URL）")
 
 if __name__ == "__main__":
-    test_parse_export_sections()
-    test_parse_export_rejects_invalid()
-    test_parse_export_skips_invalid_rows()
-    test_exporter_json_is_importable()
-    test_parse_validates_session_ids_and_usage()
-    test_session_id_matches_web_word_semantics()
-    test_import_session_id_roundtrip_with_web_charset()
-    test_import_preserves_message_order()
-    test_import_preserves_trip_id_and_timestamp()
-    test_import_drop_sessions_clears_trip_link()
-    test_import_accepts_z_suffix_timestamps()
-    test_preview_does_not_write_and_matches_import()
-    test_parse_tolerates_bad_timestamps_and_rows()
-    test_parse_limits_preferences()
-    test_bulk_storage_helpers()
-    test_parse_knowledge_section_wrong_type()
-    test_parse_drops_whole_knowledge_group_with_invalid_part()
-    test_import_enforces_preference_type_limit()
-    test_import_keeps_existing_purpose_when_backup_lacks_it()
-    test_parse_many_oversized_knowledge_groups_completes_quickly()
-    test_parse_pinned_list_dedupes_in_linear_time()
-    test_parse_rejects_deep_nested_assistant_content()
-    test_parse_rejects_nul_and_lone_surrogates()
-    test_parse_rejects_non_finite_meta_durations()
-    test_parse_accepts_leading_dash_session_ids()
-    test_parse_rejects_bad_preference_text()
-    test_parse_rejects_non_object_agent_entries()
-    test_import_matches_unpadded_stored_trip_dates()
-    test_import_keeps_inverted_date_trip()
-    test_import_roundtrip_and_idempotent()
-    test_import_duplicate_message_counts()
-    test_parse_rejects_deeply_nested_preference_value()
-    test_parse_rejects_content_deeper_than_export_saves()
-    test_drop_sessions_only_clears_matching_trip_links()
-    test_parse_rejects_huge_integer_literal_content()
-    test_parse_survives_extreme_timestamp()
-    test_parse_rejects_non_finite_preference_values()
-    test_parse_rejects_non_finite_unknown_meta_keys()
-    test_parse_rejects_slash_preference_keys()
-    test_parse_rejects_bad_trip_date_text()
-    test_extreme_timestamps_fall_back_to_restore_time()
-    test_parse_drops_broken_knowledge_groups_and_bad_metadata()
-    test_parse_drops_knowledge_group_with_absurd_parts()
-    test_parse_rejects_escaped_surrogate_in_assistant_json()
-    test_parse_trip_and_knowledge_edge_rows()
-    for case in (
-        test_runner_json_output,
-        test_runner_dry_run,
-        test_runner_errors,
-        test_runner_rejects_oversized_backup,
-        test_runner_dispatch,
-        test_parse_knowledge_section_and_import,
-        test_backup_limit_problem_checks_counts_and_size,
-        test_parse_limits_trips_messages_and_knowledge,
-        test_import_restores_archived_and_reports_generic_knowledge_error,
-        test_runner_knowledge_error_and_skip,
-        test_runner_recovers_knowledge_only_backup,
-        test_parse_user_export_tolerates_recursion_error,
-        test_parse_truncation_drops_split_knowledge_group,
-        test_runner_skips_reserved_and_deleted_sessions,
-        test_runner_skips_trip_only_reserved_and_deleted_sessions,
-        test_runner_rolls_back_session_deleted_during_write,
-        test_import_knowledge_error_redacts_paths,
-        test_import_repeat_backup_at_limit_is_idempotent,
-    ):
-        mp = pytest.MonkeyPatch()
+    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
+    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    import inspect
+    import pathlib
+    import tempfile
+
+    ran = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        if any(param not in ("monkeypatch", "tmp_path") for param in params):
+            continue
+        fixture = None
+        kwargs: dict = {}
+        if "monkeypatch" in params:
+            fixture = pytest.MonkeyPatch()
+            kwargs["monkeypatch"] = fixture
+        if "tmp_path" in params:
+            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
         try:
-            case(mp)
+            func(**kwargs)
+            ran += 1
         finally:
-            mp.undo()
-    test_parse_limits_trip_id_length_and_preference_keys()
-    test_import_rejects_when_existing_totals_exceed_limits()
-    test_import_accepts_device_like_session_ids()
-    test_preview_normalizes_legacy_integer_session_id()
-    print("\n全部通过")
+            if fixture is not None:
+                fixture.undo()
+    print(f"\n全部通过（{ran} 个用例）")

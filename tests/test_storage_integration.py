@@ -1279,8 +1279,30 @@ def test_add_script_marks_applied_only_after_successful_push():
 
 
 if __name__ == "__main__":
-    test_redis_short_term_memory()
-    test_postgres_long_term_memory()
-    test_postgres_trip_id_concurrent()
-    # 本地脚本运行时手动设置环境变量才能跑第三项
-    print("\n完成（未配置服务时相关用例跳过）")
+    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
+    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    import inspect
+    import pathlib
+    import tempfile
+
+    ran = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        if any(param not in ("monkeypatch", "tmp_path") for param in params):
+            continue
+        fixture = None
+        kwargs: dict = {}
+        if "monkeypatch" in params:
+            fixture = pytest.MonkeyPatch()
+            kwargs["monkeypatch"] = fixture
+        if "tmp_path" in params:
+            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
+        try:
+            func(**kwargs)
+            ran += 1
+        finally:
+            if fixture is not None:
+                fixture.undo()
+    print(f"\n全部通过（{ran} 个用例）")
