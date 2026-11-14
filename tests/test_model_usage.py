@@ -71,6 +71,21 @@ def test_factory_returns_tracked_model():
     print("✓ create_chat_model 返回带用量统计的模型")
 
 
+def test_failed_attempts_count_as_calls():
+    """超时 / 5xx 的失败尝试也要计入 calls（上游可能已计费）。"""
+    import pytest
+
+    class _Boom:
+        async def __call__(self, messages, **kwargs):
+            raise TimeoutError("boom")
+
+    model = UsageTrackingModel(_Boom())
+    with pytest.raises(TimeoutError):
+        asyncio.run(model([{"role": "user", "content": "a"}]))
+    assert model.usage.calls == 1, "失败尝试必须计入调用次数"
+    print("✓ 失败尝试计入调用次数")
+
+
 def test_snapshot_delta():
     model = UsageTrackingModel(_FakeModel({"input_tokens": 3, "output_tokens": 2, "time": 0.1}))
     before = model.usage.snapshot()

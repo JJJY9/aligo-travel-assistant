@@ -272,6 +272,118 @@ def test_llm_request_timeout_env():
     print("✓ 模型超时默认 120s 且可用环境变量覆盖")
 
 
+def test_numeric_and_bool_envs_strip_bom_and_strip_quotes():
+    """数值 / 布尔 / 字符串配置统一去 BOM；带引号的文件注入值连引号剥离。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.STORAGE_CONFIG['redis_ttl_sec']);"
+        "print(config.LLM_CONFIG['base_url']);"
+        "print(int(config.RATE_LIMIT_CONFIG['trust_proxy_headers']));"
+        "print(config.SYSTEM_CONFIG['timeout'])"
+    )
+    env = dict(os.environ)
+    env["REDIS_TTL_SEC"] = "\ufeff60"
+    env["LLM_BASE_URL"] = '"https://api.example.com/v1"'
+    env["TRUST_PROXY_HEADERS"] = "\ufeff1"
+    env["LLM_REQUEST_TIMEOUT_SEC"] = "0"
+    env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().split("\n")
+    assert lines[0] == "60", lines
+    assert lines[1] == "https://api.example.com/v1", lines
+    assert lines[2] == "1", lines
+    assert lines[3] == "120", lines
+    assert "非法" in result.stderr, result.stderr
+    print("✓ BOM / 引号清洗与超时钳制")
+
+    # 未识别的布尔值：告警并使用默认值
+    env["TRUST_PROXY_HEADERS"] = "enabled"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().split("\n")[2] == "0"
+    assert "不是布尔值" in result.stderr, result.stderr
+    print("✓ 未知布尔值告警并用默认值")
+
+
+def test_oversized_timeout_clamped_and_factory_survives():
+    """数百位的超时值被钳制到上限，模型工厂不再 OverflowError。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config, config_agentscope as ca;"
+        "m = ca.create_chat_model(api_key='sk-test');"
+        "print(config.SYSTEM_CONFIG['timeout']);"
+        "print('OK')"
+    )
+    env = dict(os.environ)
+    env["LLM_REQUEST_TIMEOUT_SEC"] = "9" * 400
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().split("\n")
+    assert lines[0] == "3600", lines
+    assert lines[1] == "OK", lines
+    print("✓ 超大超时值钳制到上限且工厂不崩溃")
+
+
+def test_init_agentscope_survives_gbk_print_failure(monkeypatch):
+    """Windows GBK 控制台不支持勾号：状态日志失败不能让初始化崩溃。"""
+    import builtins
+
+    from utils import console as console_module  # noqa: F401 - 确保导入顺序
+
+    import config_agentscope as module
+
+    init_calls = {"n": 0}
+
+    def fake_init(**kwargs):
+        init_calls["n"] += 1
+
+    printed = []
+
+    def fake_print(text="", *args, **kwargs):
+        if "✓" in str(text):
+            raise UnicodeEncodeError("gbk", str(text), 0, 1, "illegal")
+        printed.append(str(text))
+
+    monkeypatch.setattr(module.agentscope, "init", fake_init)
+    monkeypatch.setattr(builtins, "print", fake_print)
+    module.init_agentscope()
+    assert init_calls["n"] == 1
+    assert printed and printed[-1].startswith("[OK] AgentScope"), printed
+    monkeypatch.undo()
+    print("✓ GBK 打印失败时初始化降级为 ASCII")
+
+
 def test_config_local_loaded_without_cwd_on_sys_path():
     """console script / wheel 启动（sys.path 不含 CWD）仍加载运行目录的 config_local.py。"""
     tmp = tempfile.mkdtemp(prefix="chailv_cfg_")

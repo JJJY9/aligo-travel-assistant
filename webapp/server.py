@@ -383,7 +383,11 @@ def _host_allowed(host_header: str) -> bool:
         return True
     if host == "testserver" and _test_client_host_allowed():
         return True
-    configured = os.environ.get(_ALLOWED_HOSTS_ENV, "")
+    configured = (
+        os.environ.get(_ALLOWED_HOSTS_ENV, "")
+        .replace("\ufeff", "")
+        .strip()
+    )
     for item in configured.split(","):
         # 配置项与请求 Host 同一归一化：操作员按地址栏写 ``域名:端口``
         # 时必须能匹配（此前只对请求侧剥端口，配置侧永不命中、全站 400）

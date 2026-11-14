@@ -2,9 +2,15 @@
 AgentScope Configuration for Aligo Multi-Agent Travel Planning System
 适配 AgentScope 1.0.16+
 """
+import logging
+
 import agentscope
 
+from typing import Any
+
 from config import LLM_CONFIG
+
+logger = logging.getLogger(__name__)
 
 
 def init_agentscope():
@@ -21,7 +27,12 @@ def init_agentscope():
         logging_level="INFO"
     )
 
-    print(f"✓ AgentScope initialized (version: {agentscope.__version__})")
+    try:
+        print(f"✓ AgentScope initialized (version: {agentscope.__version__})")
+    except UnicodeEncodeError:
+        # Windows GBK 控制台不支持勾号：降级为 ASCII，不能因一行
+        # 状态日志让整个初始化崩溃
+        print(f"[OK] AgentScope initialized (version: {agentscope.__version__})")
 
 
 class UsageTracker:
@@ -75,8 +86,11 @@ class UsageTrackingModel:
         self.usage = UsageTracker()
 
     async def __call__(self, messages, **kwargs):
-        response = await self._model(messages, **kwargs)
+        # 失败尝试同样计入调用次数：超时 / 5xx / 取消时上游可能已生成
+        # 并计费，只在成功返回后累加会让故障与重试期的「调用次数」
+        # 系统性少记
         self.usage.calls += 1
+        response = await self._model(messages, **kwargs)
         usage = (
             response.get("usage")
             if isinstance(response, dict)
@@ -93,6 +107,31 @@ class UsageTrackingModel:
         if item == "_model":
             raise AttributeError(item)
         return getattr(self._model, item)
+
+
+def _resolved_timeout_seconds(timeout: Any | None) -> float:
+    """模型请求超时的最终取值：接受显式参数或系统配置。
+
+    非法值（超长整数 OverflowError、非数字、0 / 负数——httpx 里 0
+    表示立即截止而不是「无超时」）统一告警并回退 120 秒。
+    """
+    from config import SYSTEM_CONFIG
+
+    raw = (
+        timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
+    )
+    try:
+        value = float(raw)
+    except (OverflowError, TypeError, ValueError):
+        logger.warning("模型超时参数非法（%r），回退 120 秒", raw)
+        return 120.0
+    if value <= 0:
+        logger.warning(
+            "模型超时参数 %r 非正数（会导致每次请求立即超时），回退 120 秒",
+            raw,
+        )
+        return 120.0
+    return value
 
 
 def unwrap_usage_model(model):
@@ -131,7 +170,6 @@ def create_chat_model(
     """
     from agentscope.model import OpenAIChatModel
 
-    from config import SYSTEM_CONFIG
 
     return UsageTrackingModel(
         OpenAIChatModel(
@@ -140,9 +178,7 @@ def create_chat_model(
             stream=False,
             client_kwargs={
                 "base_url": base_url or LLM_CONFIG["base_url"],
-                "timeout": float(
-                    timeout if timeout is not None else SYSTEM_CONFIG.get("timeout", 60)
-                ),
+                "timeout": _resolved_timeout_seconds(timeout),
                 # OpenAI SDK 自带重试默认 max_retries=2：与应用层
                 # retry_with_backoff（4 次尝试）叠加后一次逻辑调用最坏会
                 # 发出 12 个完整 prompt 请求，单轮可阻塞十分钟级；SDK 内部
