@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from utils.tombstones import DEFAULT_TOMBSTONE_TTL_SEC
@@ -134,14 +134,30 @@ def message_content_id(message: dict[str, Any]) -> str:
     与随机 op_id 不同，同一历史消息在任何实例 / 任何时刻都得到同一指纹：
     回填与故障重放用它在 Redis 侧做跨实例内容去重。实时消息的时间戳唯一，
     正常重复提问（内容相同、时间不同）不会被误判为同一条。
+
+    时间戳先归一成「同一时刻的同一表示」再参与哈希：naive 本地时间按本机
+    时区解释、带偏移的直接换算，统一转成 UTC ISO。PostgreSQL 后端回读的
+    时间戳带连接会话时区的偏移（如 ``10:00+08:00``），不归一的话同一消息
+    在回填 / 重放侧的指纹永远与实时副本（``10:00`` 的 naive 串）不同、
+    跨来源去重失效。无法解析的时间戳按原文参与哈希。
     """
     import hashlib
 
+    from utils.timestamps import to_aware
+
+    timestamp = message.get("timestamp")
+    normalized = None
+    aware = to_aware(timestamp)
+    if aware is not None:
+        try:
+            normalized = aware.astimezone(timezone.utc).isoformat()
+        except (OverflowError, ValueError, OSError):
+            normalized = None
     raw = json.dumps(
         [
             str(message.get("role") or ""),
             str(message.get("content") or ""),
-            str(message.get("timestamp") or ""),
+            str(timestamp or "") if normalized is None else normalized,
         ],
         ensure_ascii=False,
     )

@@ -2083,6 +2083,32 @@ def test_backfill_and_replay_share_timestamps_dedupe_once(monkeypatch):
     print("✓ 共享时间戳的回填与重放只保留一份")
 
 
+def test_content_id_aligns_naive_and_aware_timestamps():
+    """naive 本地时间与带时区偏移 ISO（同一时刻）指纹一致。"""
+    from datetime import datetime, timezone
+
+    from context.short_term_memory import message_content_id
+    from utils.timestamps import localize_naive
+
+    naive = "2026-11-01T10:00:00.123456"
+    localized = localize_naive(datetime.fromisoformat(naive))
+    aware = localized.isoformat()
+    base = {"role": "user", "content": "Q"}
+    assert message_content_id({**base, "timestamp": naive}) == message_content_id(
+        {**base, "timestamp": aware}
+    ), "同一时刻的 naive / 带偏移表示必须得到同一指纹"
+    # 换算成 UTC 的同一时刻（PG 读回的会话时区可能不是本机时区）同样对齐
+    utc_text = localized.astimezone(timezone.utc).isoformat()
+    assert message_content_id({**base, "timestamp": naive}) == message_content_id(
+        {**base, "timestamp": utc_text}
+    )
+    # 正常重复提问（内容相同、时间不同）不会被误判为同一条
+    assert message_content_id({**base, "timestamp": naive}) != message_content_id(
+        {**base, "timestamp": "2026-11-01T10:00:01.123456"}
+    )
+    print("✓ 内容指纹对 naive / 带偏移时间戳归一（跨后端去重生效）")
+
+
 def test_append_op_starts_new_window_after_drain(monkeypatch):
     """重放清空后新入队的操作开启新计速窗口（不继承旧起点被整体丢弃）。"""
     from context import short_term_memory as module

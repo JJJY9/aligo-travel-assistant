@@ -105,6 +105,16 @@ def _lock_for_path(path: str) -> threading.RLock:
         return lock
 
 
+def _preference_cap() -> int | None:
+    """偏好类型数上限（与导入 / 导出共用 ``utils.user_import`` 的常量）。"""
+    try:
+        from utils.user_import import _MAX_PREFERENCES
+
+        return _MAX_PREFERENCES
+    except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
+        return None
+
+
 def _locked_mutation(func):
     """写操作装饰器：加锁（进程内 RLock + 跨进程文件锁）后重载再修改。
 
@@ -668,6 +678,13 @@ class LongTermMemory:
         if existing is not None:
             existing["value"] = merged
         else:
+            # 新建类型同样受上限约束（与 save_preference / PG 后端同口径）：
+            # 只拦既有类型之外的追加，越限后 /api/export 会永久 413
+            cap = _preference_cap()
+            if cap is not None and len(preferences) >= cap:
+                raise ValueError(
+                    f"偏好条目已达上限（{cap}），请先删除不用的偏好"
+                )
             preferences.append({"type": pref_type, "value": merged})
         self._persist()
         # 偏好值可能是用户隐私内容（证件 / 航班等）：日志只记类型与数量
@@ -688,12 +705,7 @@ class LongTermMemory:
         found = False
         # 类型上限在写路径（写锁内）复核：调用方锁外先读再写的预检
         # 挡不住并发新增，越限后 /api/export 会因偏好上限永久 413
-        try:
-            from utils.user_import import _MAX_PREFERENCES
-
-            cap: int | None = _MAX_PREFERENCES
-        except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
-            cap = None
+        cap = _preference_cap()
 
         for pref in preferences:
             if pref.get("type") == pref_type:
@@ -770,6 +782,12 @@ class LongTermMemory:
 
         # 如果不存在，创建新的
         if not found:
+            # 「不存在则创建」同样受类型上限约束（与 save_preference 同口径）
+            cap = _preference_cap()
+            if cap is not None and len(preferences) >= cap:
+                raise ValueError(
+                    f"偏好条目已达上限（{cap}），请先删除不用的偏好"
+                )
             preferences.append({"type": "hotel_brands", "value": [brand]})
 
         self._persist()
@@ -796,6 +814,12 @@ class LongTermMemory:
 
         # 如果不存在，创建新的
         if not found:
+            # 「不存在则创建」同样受类型上限约束（与 save_preference 同口径）
+            cap = _preference_cap()
+            if cap is not None and len(preferences) >= cap:
+                raise ValueError(
+                    f"偏好条目已达上限（{cap}），请先删除不用的偏好"
+                )
             preferences.append({"type": "airlines", "value": [airline]})
 
         self._persist()

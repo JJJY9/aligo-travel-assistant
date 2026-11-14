@@ -704,6 +704,73 @@ def test_pg_delete_all_resets_trip_counters():
         memory.close()
 
 
+def test_json_preference_cap_covers_append_and_helpers(monkeypatch):
+    """JSON 后端 append_preference / add_hotel_brand / add_airline 新建类型
+    同样受上限约束（此前只有 save_preference 复核，可绕过后导出永久 413）。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(user_import_module, "_MAX_PREFERENCES", 3)
+    store = LongTermMemory(f"json-pref-cap-{uuid.uuid4().hex[:8]}", tempfile.mkdtemp())
+    store.save_preference("p_a", "1")
+    store.save_preference("p_b", "2")
+    store.save_preference("p_c", "3")
+    with pytest.raises(ValueError):
+        store.save_preference("p_d", "4")
+    with pytest.raises(ValueError):
+        store.append_preference("p_e", "5")
+    with pytest.raises(ValueError):
+        store.add_hotel_brand("汉庭")
+    with pytest.raises(ValueError):
+        store.add_airline("东航")
+    # 既有类型的保存 / 追加不受上限影响
+    store.save_preference("p_a", "9")
+    store.append_preference("p_a", "10")
+    assert set(store.get_preference()) == {"p_a", "p_b", "p_c"}
+    print("✓ JSON 偏好上限覆盖 append / 酒店品牌 / 航司的新建分支")
+
+
+def test_pg_preference_cap_serializes_across_types(monkeypatch):
+    """用户级写锁：两个实例并发新增不同类型时不得越过上限。"""
+    memory, user_id = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(user_import_module, "_MAX_PREFERENCES", 3)
+    other = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        memory.save_preference("cap_type_a", "1")
+        memory.save_preference("cap_type_b", "2")
+        results: list[object] = []
+        barrier = threading.Barrier(2)
+
+        def worker(store, pref_type):
+            barrier.wait()
+            try:
+                store.save_preference(pref_type, "x")
+                results.append("ok")
+            except ValueError as exc:
+                results.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(memory, "cap_type_c")),
+            threading.Thread(target=worker, args=(other, "cap_type_d")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert results.count("ok") == 1, results
+        assert any(isinstance(item, ValueError) for item in results), results
+        assert len(memory.get_preference()) == 3
+        print("✓ PG 偏好上限在不同类型的并发新增之间仍然成立")
+    finally:
+        other.close()
+        memory.close()
+
+
 def test_pg_batch_save_session_id_none_semantics():
     """批量恢复：session_id 键存在且为 None 时清除关联，键缺失保留原值（与 JSON 同口径）。"""
     memory, _ = _pg_memory_or_skip()
