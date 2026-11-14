@@ -170,7 +170,7 @@ def test_user_export_write_failure_reports(monkeypatch):
     import tempfile
 
     store = _FakeStore()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
     blocker = os.path.join(tempfile.mkdtemp(), "blocker")
     with io.open(blocker, "w", encoding="utf-8") as handle:
         handle.write("x")

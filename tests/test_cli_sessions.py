@@ -120,7 +120,7 @@ def _run_archive(user_id, session_id, archived=True):
 
 def test_lists_active_sessions(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1")
     assert code == 0
     assert "s-active" in out and "s-pinned" in out
@@ -132,7 +132,7 @@ def test_lists_active_sessions(monkeypatch):
 
 def test_lists_archived_and_all(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1", archived=True)
     assert code == 0 and "s-archived" in out and "s-active" not in out
 
@@ -146,7 +146,7 @@ def test_lists_archived_and_all(monkeypatch):
 def test_list_filters_by_query(monkeypatch):
     """--query 在标题与消息内容中匹配，命中时附带片段；归档范围遵循视图。"""
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1", query="行程")
     assert code == 0
     assert "s-pinned" in out and "s-active" not in out
@@ -164,7 +164,7 @@ def test_list_filters_by_query(monkeypatch):
 def test_list_json_output(monkeypatch):
     """--json 输出会话摘要（含命中片段），空结果也是合法 JSON。"""
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1", as_json=True)
     assert code == 0
     data = json.loads(out)
@@ -187,7 +187,7 @@ def test_list_json_output(monkeypatch):
     fake = _FakeStore(
         [_message("user", "x" * 60 + "后段关键词", "s-long")]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1", query="后段关键词", as_json=True)
     snippet = json.loads(out)["sessions"][0]["snippet"]
     assert "后段关键词" in snippet, snippet
@@ -212,7 +212,7 @@ def test_session_list_converts_utc_timestamps(monkeypatch):
         fake = _FakeStore(
             [_message("user", "问题", "s-utc", "2026-11-04T12:00:00+00:00")]
         )
-        monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+        monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
         code, out = _run_list("u1")
         assert code == 0
         assert "2026-11-04 20:00" in out, "UTC 12:00 应显示为东八区 20:00"
@@ -227,7 +227,7 @@ def test_session_list_converts_utc_timestamps(monkeypatch):
 
 def test_empty_sessions(monkeypatch):
     fake = _FakeStore([])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1")
     assert code == 0 and "没有未归档会话" in out
     print("✓ 无会话时正常返回")
@@ -249,7 +249,7 @@ def test_invalid_user_id(monkeypatch):
 
 def test_archive_and_restore(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_archive("u1", "s-active", archived=True)
     assert code == 0 and "已归档会话 s-active" in out
     assert fake.archived_calls == [("s-active", True)]
@@ -262,7 +262,7 @@ def test_archive_and_restore(monkeypatch):
 
 def test_archive_missing_session(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_archive("u1", "s-missing", archived=True)
     assert code == 1 and "不存在或没有消息" in out
     assert fake.archived_calls == []
@@ -292,7 +292,7 @@ def test_archive_json_output(monkeypatch):
     import json as _json
 
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_session_archive_standalone(
@@ -349,7 +349,7 @@ def _run_delete(user_id, session_id, as_json=False):
 def test_session_delete_removes_messages(monkeypatch):
     fake = _sessions_store()
     cleared = []
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         storage,
         "clear_short_term_session",
@@ -375,7 +375,7 @@ def test_session_delete_clears_trip_links_for_empty_session(monkeypatch):
         {"trip_id": "trip_2", "session_id": "s-active", "origin": "杭州",
          "destination": "成都"},
     ]
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
     code, out = _run_delete("u1", "s-empty")
     assert code == 0 and "已删除会话 s-empty（0 条消息）" in out, out
@@ -388,7 +388,7 @@ def test_session_delete_clears_trip_links_for_empty_session(monkeypatch):
 def test_session_delete_writes_shared_tombstone(monkeypatch):
     """配置 Redis 时写入与 Web 同键的共享删除墓碑（NX、TTL 与 Web 一致 1 小时）。"""
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
 
     class _Redis:
@@ -426,7 +426,7 @@ def test_session_delete_writes_shared_tombstone(monkeypatch):
 def test_session_delete_without_shared_tombstone_hints_refresh(monkeypatch):
     """无共享 Redis 时提示刷新其它已打开的 Web 页面。"""
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
     code, out = _run_delete("u1", "s-active")
     assert code == 0 and "请刷新" in out
@@ -444,7 +444,7 @@ def test_session_delete_marks_tombstone_before_deleting(monkeypatch):
         return original_delete(session_id)
 
     fake.delete_chat_session = tracked_delete
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
 
     from utils import tombstones
@@ -468,7 +468,7 @@ def test_session_delete_failure_revokes_cli_tombstone(monkeypatch):
         raise RuntimeError("db down")
 
     fake.delete_chat_session = boom
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
 
     from utils import tombstones
@@ -493,7 +493,7 @@ def test_session_delete_failure_revokes_cli_tombstone(monkeypatch):
 def test_session_delete_missing_session(monkeypatch):
     fake = _sessions_store()
     cleared = []
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         storage,
         "clear_short_term_session",
@@ -533,7 +533,7 @@ def test_archive_and_pin_report_when_vanished_concurrently(monkeypatch):
 
 def test_session_delete_json_output(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
     code, out = _run_delete("u1", "s-active", as_json=True)
     payload = json.loads(out)
@@ -580,13 +580,13 @@ def test_session_delete_dispatch(monkeypatch):
 def test_session_delete_failures(monkeypatch):
     fake = _sessions_store()
     fake.fail_history = True
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_delete("u1", "s-active")
     assert code == 1 and "读取会话失败" in out
 
     fake = _sessions_store()
     fake.fail_delete = True
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_delete("u1", "s-active")
     assert code == 1 and "删除会话失败" in out
     assert fake.closed
@@ -618,7 +618,7 @@ def test_session_title_set_and_reset(monkeypatch):
     store = _TitleStore(
         [_message("user", "内容", "s-active")], titles={"s-active": "旧标题"}
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_title_standalone("u1", "s-active", "新标题")
@@ -636,7 +636,7 @@ def test_session_title_set_and_reset(monkeypatch):
 
 def test_session_title_validation_and_failures(monkeypatch):
     store = _TitleStore([_message("user", "内容", "s-active")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_title_standalone("u1", "s-active", "长" * 61)
@@ -730,7 +730,7 @@ def test_session_pin_set_and_unset(monkeypatch):
     import json as _json
 
     store = _PinStore([_message("user", "内容", "s-active")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_pin_standalone("u1", "s-active")
@@ -750,7 +750,7 @@ def test_session_pin_set_and_unset(monkeypatch):
 
 def test_session_pin_validation_and_failures(monkeypatch):
     store = _PinStore([_message("user", "内容", "s-active")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_pin_standalone("u1", "s-missing")
@@ -814,7 +814,7 @@ def test_session_show_text_and_json(monkeypatch):
     import json as _json
 
     store = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_show_standalone("u1", "s-pinned")
@@ -846,7 +846,7 @@ def test_session_show_renders_assistant_markdown(monkeypatch):
         {"status": "no_agents", "results": []}, ensure_ascii=False
     )
     store = _FakeStore([_message("assistant", payload, "s-json")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_show_standalone("u1", "s-json")
@@ -856,7 +856,7 @@ def test_session_show_renders_assistant_markdown(monkeypatch):
 
 def test_session_show_errors(monkeypatch):
     store = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_show_standalone("u1", "s-missing")
@@ -923,7 +923,7 @@ def test_session_show_dispatch(monkeypatch):
 def test_read_failure(monkeypatch):
     fake = _sessions_store()
     fake.fail_history = True
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1")
     assert code == 1 and "读取会话失败" in out
     assert fake.closed
@@ -951,7 +951,7 @@ def test_pg_fallback_refused(monkeypatch):
     monkeypatch.setattr(ltm, "LongTermMemory", _JsonStore)
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://localhost/x")
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda *args: _JsonStore([])
+        storage, "create_long_term_memory", lambda *args, **kwargs: _JsonStore([])
     )
     code, out = _run_list("u1")
     assert code == 1 and "回退本地 JSON" in out
@@ -1021,7 +1021,7 @@ def test_pg_healthy_store_passthrough(monkeypatch):
         [_message("user", "PG 会话", "pg-s1")],
         archived=[],
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1")
     assert code == 0 and "pg-s1" in out
     assert fake.closed
@@ -1035,7 +1035,7 @@ def test_save_failure_reports_error(monkeypatch):
         raise OSError("长期记忆写入失败")
 
     fake.set_session_archived = boom
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_archive("u1", "s-active", archived=True)
     assert code == 1 and "操作失败" in out
     print("✓ 存储写入失败返回 1")
@@ -1062,7 +1062,7 @@ def test_main_rejects_bad_usage(monkeypatch):
 def test_main_accepts_valid_flags(monkeypatch):
     """合法参数应进入对应函数（用假 store，避免真实读取）。"""
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(sys, "argv", ["cli.py", "sessions", "u1", "--archived"])
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
@@ -1091,7 +1091,7 @@ def _run_export(
 def test_main_accepts_query_flag(monkeypatch):
     """dispatch 层接受 --query 关键词并传给列表函数。"""
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "sessions", "u1", "--query", "住宿"]
     )
@@ -1108,7 +1108,7 @@ def test_session_export_to_file(monkeypatch):
     import tempfile
 
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "session.md")
     code, out = _run_export("u1", "s-active", target=target)
     assert code == 0 and "已导出会话 s-active" in out
@@ -1123,7 +1123,7 @@ def test_session_export_to_file(monkeypatch):
 
 def test_session_export_to_stdout(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_export("u1", "s-pinned", to_stdout=True)
     assert code == 0
     assert "# 行程规划问题" in out and "回答 B" in out
@@ -1132,7 +1132,7 @@ def test_session_export_to_stdout(monkeypatch):
 
 def test_session_export_missing_and_invalid(monkeypatch):
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_export("u1", "s-missing")
     assert code == 1 and "不存在或没有消息" in out
     code, out = _run_export("--bad", "s-active")
@@ -1185,7 +1185,7 @@ def test_session_export_html(monkeypatch):
         ],
         titles={"s-html": "HTML 导出"},
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "session.html")
     code, out = _run_export("u1", "s-html", target=target, html=True)
     assert code == 0 and "已导出会话 s-html" in out
@@ -1214,7 +1214,7 @@ def test_session_export_html_title_not_double_escaped(monkeypatch):
         [_message("user", "你好", "s-title")],
         titles={"s-title": "预算<5000 对比 A>B"},
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "session.html")
     code, out = _run_export("u1", "s-title", target=target, html=True)
     assert code == 0
@@ -1276,7 +1276,7 @@ def test_session_export_write_failure_reports(monkeypatch):
     import tempfile
 
     fake = _FakeStore([_message("user", "问题", "s-exp")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     blocker = os.path.join(tempfile.mkdtemp(), "blocker")
     with io.open(blocker, "w", encoding="utf-8") as handle:
         handle.write("x")
@@ -1289,7 +1289,7 @@ def test_session_export_refuses_overwrite(monkeypatch):
     import tempfile
 
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "existing.md")
     with open(target, "w", encoding="utf-8") as handle:
         handle.write("旧内容")
@@ -1312,7 +1312,7 @@ def test_session_export_default_path(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_export("u1", "s-active")
     assert code == 0
     path = os.path.join(workdir, "exports", "aligo_u1_s-active.md")
@@ -1326,7 +1326,7 @@ def test_main_session_export_dispatch(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _sessions_store()
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "session-export", "u1", "s-active", "--force"]
     )
@@ -1365,7 +1365,7 @@ def test_session_title_ignores_stale_false(monkeypatch):
         return False
 
     monkeypatch.setattr(_TitleStore, "set_session_title", stale)
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: store)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: store)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = cli.run_session_title_standalone("u1", "s-active", "新标题")
@@ -1377,7 +1377,7 @@ def test_session_export_sanitizes_custom_title(monkeypatch):
     """自定义标题的换行 / HTML 不能伪造导出结构或原样落盘。"""
     fake = _sessions_store()
     fake.titles["s-active"] = "正常标题\n# 伪造标题 <script>"
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_export("u1", "s-active", to_stdout=True)
     assert code == 0
     assert "# 正常标题 # 伪造标题 &lt;script&gt;" in out
@@ -1419,7 +1419,7 @@ def test_sessions_query_matches_rendered_assistant_content(monkeypatch):
             "timestamp": "2026-11-01T00:00:01",
         },
     ]
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_list("u1", query="汉庭")
     assert code == 0 and "s-json" in out
     code, out = _run_list("u1", query="status")
@@ -1432,7 +1432,7 @@ def test_sessions_export_counts_only_rendered_messages(monkeypatch, tmp_path):
 
     fake = _sessions_store()
     fake.messages.append(_message("user", "旧版无会话消息", ""))
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     buf = io.StringIO()
     path = Path(tmp_path) / "all.md"
     with contextlib.redirect_stdout(buf):
@@ -1451,7 +1451,7 @@ def test_sessions_export_without_sessions_returns_1(monkeypatch, tmp_path):
     from pathlib import Path
 
     fake = _FakeStore([_message("user", "旧版无会话消息", "")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     buf = io.StringIO()
     path = Path(tmp_path) / "empty.md"
     with contextlib.redirect_stdout(buf):
@@ -1470,7 +1470,7 @@ def test_session_export_stdout_strips_terminal_controls(monkeypatch):
             _message("assistant", "回答", "s-esc"),
         ]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run_export("u1", "s-esc", to_stdout=True)
     assert code == 0
     assert "\x1b]" not in out
@@ -1486,7 +1486,7 @@ def test_sessions_export_stdout_strips_terminal_controls(monkeypatch):
             _message("assistant", "回答", "s-esc"),
         ]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = cli.run_sessions_export_standalone("u1", to_stdout=True)
