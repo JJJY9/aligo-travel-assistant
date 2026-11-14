@@ -447,8 +447,8 @@ def merged_backup_limit_problem(
     if isinstance(incoming_titles, dict):
         merged_titles.update(incoming_titles)
     existing_messages = list(existing.get("chat_history") or [])
-    # 以现有快照为底（statistics / user_id / exported_at 等同样计入导出
-    # 体积），再覆盖为合并后的各段
+    # 以现有快照为底，再覆盖为合并后的各段。注意真实导出端还会在
+    # export_snapshot 之外补 user_id / exported_at（此处不计，量级可忽略）
     payload = dict(existing)
     payload.update(
         {
@@ -479,6 +479,32 @@ def merged_backup_limit_problem(
             ),
         }
     )
+    # 重算 statistics：导入自身会增长 total_*、并为每个新目的地复制一份
+    # 完整目的地文本进 frequent_destinations——沿用导入前快照会系统性
+    # 低估恢复后的真实导出体积（接近上限时放行「导入后永久 413」的恢复）
+    statistics = dict(payload.get("statistics") or {})
+    merged_trips = payload.get("trip_history") or []
+    merged_messages = payload.get("chat_history") or []
+    statistics["total_trips"] = len(merged_trips)
+    statistics["total_messages"] = len(merged_messages)
+    frequent: dict[str, int] = {}
+    for trip in merged_trips:
+        if not isinstance(trip, dict):
+            continue
+        destination = trip.get("destination")
+        if not destination:
+            continue
+        try:
+            datetime.strptime(str(trip.get("start_date") or ""), "%Y-%m-%d")
+        except ValueError:
+            continue
+        key = str(destination)
+        frequent[key] = frequent.get(key, 0) + 1
+    if frequent:
+        statistics["frequent_destinations"] = frequent
+    else:
+        statistics.pop("frequent_destinations", None)
+    payload["statistics"] = statistics
     return backup_limit_problem(payload)
 
 
@@ -1324,8 +1350,10 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
                 f"知识片段恢复失败：{redact_paths(exc)}"
             )
     # 恢复入口可能没有任何用户数据写入（仅知识片段 / 消息全被剔除）：
-    # 显式落盘重建被隔离移走的主文件，否则账号恢复后仍持续 503
-    ensure_persisted = getattr(store, "ensure_persisted", None)
-    if callable(ensure_persisted):
-        ensure_persisted()
+    # 显式落盘重建被隔离移走的主文件，否则账号恢复后仍持续 503。
+    # 知识片段恢复失败时视为恢复未完成，保留隔离 / 删除标记待重试
+    if "knowledge_error" not in result:
+        ensure_persisted = getattr(store, "ensure_persisted", None)
+        if callable(ensure_persisted):
+            ensure_persisted()
     return result

@@ -190,6 +190,54 @@ def test_corrupt_snapshot_blocks_write_commands(monkeypatch):
     print("✓ 损坏隔离后写命令拒绝执行（不重建空快照）")
 
 
+def test_user_import_call_site_passes_allow_quarantined(monkeypatch, tmp_path):
+    """user-import 真实调用点以 allow_quarantined=True 打开存储。"""
+    backup_path = tmp_path / "backup.json"
+    backup_path.write_text(
+        json.dumps({"preferences": {"home_location": "北京"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    recorded = []
+
+    class _Store:
+        def export_snapshot(self):
+            return {
+                "preferences": {},
+                "trip_history": [],
+                "chat_history": [],
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+        def get_statistics(self):
+            return {"total_messages": 0, "total_trips": 0}
+
+        def get_preference(self):
+            return {}
+
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_chat_history(self, limit=None):
+            return []
+
+        def close(self):
+            pass
+
+    def fake_open(user_id, allow_quarantined=False):
+        recorded.append(allow_quarantined)
+        return _Store()
+
+    monkeypatch.setattr(cli, "_open_cli_store", fake_open)
+    code = cli.run_user_import_standalone(
+        "u1", str(backup_path), dry_run=True
+    )
+    assert code == 0, code
+    assert recorded == [True], "恢复必须豁免隔离打开（allow_quarantined=True）"
+
+
 def test_recovered_corrupt_backup_ignores_deleted_accounts(tmp_path):
     """账号数据已删除（.deleted 墓碑）时遗留隔离备份是孤儿：不再拦截。"""
     db_path = tmp_path / "u-gone.json"

@@ -732,23 +732,38 @@ def test_delete_all_tombstone_written_before_removal(monkeypatch):
     print("✓ 墓碑创建失败时删除中止、数据保留")
 
 
-def test_ensure_persisted_heals_corrupt_pending():
-    """_corrupt_pending 状态下无用户数据的恢复导入自愈：
-    补隔离备份并重建主文件，而不是抛重载失败。"""
+def test_ensure_persisted_heals_corrupt_pending(monkeypatch):
+    """真实的 _corrupt_pending 状态（构造期隔离改名失败）下：
+    ensure_persisted 补隔离备份并重建主文件，而不是抛重载失败。"""
     storage_dir = tempfile.mkdtemp()
     path = Path(storage_dir) / "u-pending-recover.json"
     path.write_text("{bad json", encoding="utf-8")
+
+    import context.long_term_memory as module
+
+    real_replace = module.os.replace
+    calls = {"count": 0}
+
+    def failing_replace(src, dst):
+        if str(src) == str(path) and calls["count"] == 0:
+            calls["count"] += 1
+            raise OSError("locked")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(module.os, "replace", failing_replace)
     memory = LongTermMemory(
         "u-pending-recover", storage_dir, allow_quarantined=True
     )
-    memory._corrupt_pending = True  # noqa: SLF001 - 复现前提状态
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    assert memory._corrupt_pending, "构造期隔离改名失败应留下 pending 标记"  # noqa: SLF001
+    assert path.exists(), "改名失败时损坏文件仍在盘上"
 
     memory.ensure_persisted()
     assert path.exists(), "恢复入口应重建主文件"
     assert list(Path(storage_dir).glob("u-pending-recover.json.corrupt-*")), (
         "损坏文件应补备份"
     )
-    print("✓ ensure_persisted 自愈 _corrupt_pending 状态")
+    print("✓ ensure_persisted 自愈真实 _corrupt_pending 状态")
 
 
 def test_delete_all_prevents_stale_instance_resurrection():

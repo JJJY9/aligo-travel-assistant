@@ -505,7 +505,7 @@ class PostgresLongTermMemory:
         不同新类型的并发新增。"""
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
-                is_new = self._enforce_preference_cap(pref_type)
+                self._enforce_preference_cap(pref_type)
                 self._execute(
                     """
                     INSERT INTO aligo_preferences (user_id, pref_type, value)
@@ -514,9 +514,10 @@ class PostgresLongTermMemory:
                     DO UPDATE SET value = EXCLUDED.value, updated_at = now()
                     """,
                     (self.user_id, pref_type, self._json(value)),
-                    # 新类型的 INSERT 不允许重放：连接重建会释放用户级锁，
-                    # 空档里其它实例可能已把类型数补到上限，重放会越过复核
-                    replay_safe=replay_safe and not is_new,
+                    # 偏好 INSERT 一律禁止重放：连接重建会释放用户级锁，
+                    # 空档里其它实例可能把类型数补到上限（新类型）或删除
+                    # 该类型使其重放变成新增行（既有类型），都会越过复核
+                    replay_safe=False,
                 )
 
     def _enforce_preference_cap(self, pref_type: str) -> bool:

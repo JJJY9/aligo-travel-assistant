@@ -1847,6 +1847,14 @@ class LongTermMemory:
                         )
                     except FileNotFoundError:
                         pass
+                    except OSError as exc:
+                        # Windows 共享冲突等：主文件仍在、墓碑已写入
+                        # （_reload_latest 仅在文件缺失时看墓碑，不影响
+                        # 正常读取）——按删除未完成上报
+                        raise MemoryPersistenceError(
+                            "删除长期记忆主文件失败（文件可能被其它进程占用）："
+                            f"{self.db_path}"
+                        ) from exc
                     # 隔离备份也是该账号的记忆数据：一并删除，否则删除后的
                     # 第一次写入会因「主文件缺失 + 存在 .corrupt-*」被拒绝。
                     # 删除失败不能静默：主文件已移除、备份仍在时，后续写入会
