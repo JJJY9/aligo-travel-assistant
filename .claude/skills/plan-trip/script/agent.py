@@ -104,51 +104,99 @@ def _has_nonempty_daily_plans(value: dict) -> bool:
     return False
 
 
-# 候选对象前的标签只认「整行就是短标签」（示例：/补充：）：叙述句里偶然
-# 出现「示例」「补充」不算。补充说明标签的候选（尾注）不参与终稿竞争；
-# 其余候选按位置取最后一个（回显示例之后的正式结果按位置胜出）。
-_EXAMPLE_LABEL_RE = re.compile(
-    r"^(示例|例如|样例)(输出|结果|内容|格式)?\s*[:：]?\s*$"
+def _has_nonempty_daily_plans(value: dict) -> bool:
+    """候选是否带排期内容（顶层或 itinerary 内的非空 daily_plans）。"""
+    plans = value.get("daily_plans")
+    if isinstance(plans, list) and plans:
+        return True
+    itinerary_value = value.get("itinerary")
+    if isinstance(itinerary_value, dict):
+        plans = itinerary_value.get("daily_plans")
+        return isinstance(plans, list) and bool(plans)
+    return False
+
+
+# 候选标签取候选前文本最后一个非空、非围栏行的最后一个冒号之后的短语
+# （剔除加粗 / 标题 / 方括号等装饰）——「示例：」「**补充：**」「【尾注】」
+# 都算；叙述句（「根据您补充的信息，行程如下：」）不算。
+_EXAMPLE_LABELS = frozenset(
+    {"示例", "例如", "样例", "示例输出", "示例结果", "示例内容", "示例格式"}
 )
-_SUPPLEMENT_LABEL_RE = re.compile(
-    r"^(补充|尾注|备注|附注|提示|注意|说明|须知)"
-    r"(说明|信息|内容|事项|结果|行程|安排)?\s*[:：]?\s*$"
+_SUPPLEMENT_LABELS = frozenset(
+    {
+        "补充",
+        "补充说明",
+        "补充信息",
+        "补充内容",
+        "补充事项",
+        "补充结果",
+        "补充行程",
+        "补充安排",
+        "尾注",
+        "备注",
+        "备注说明",
+        "附注",
+        "提示",
+        "温馨提示",
+        "友情提示",
+        "小贴士",
+        "贴士",
+        "注意",
+        "注意事项",
+        "说明",
+        "须知",
+    }
+)
+_FORMAL_LABELS = frozenset(
+    {"正式", "正式行程", "结果", "最终", "最终结果", "答案", "终稿"}
 )
 
 
 def _label_kind(label: str) -> str:
-    """候选对象前的标签：example（回显示例）/ supplement（补充尾注）/ neutral。
-
-    先剔除 Markdown 围栏（对象常被 ```json 包住，标签与对象之间隔着
-    围栏行；「补充：```json」这类同行围栏同样剥掉），再要求最后一个
-    非空行本身就是一个短标签。
-    """
-    lines = []
+    """候选对象前的标签：example / supplement / formal / neutral。"""
+    line = ""
     for item in label.splitlines():
-        cleaned = re.sub(r"```+\w*\s*$", "", item).strip()
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
-            lines.append(cleaned)
-    if not lines:
+            line = cleaned
+    if not line:
         return "neutral"
-    line = lines[-1]
-    if _EXAMPLE_LABEL_RE.match(line):
+    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    phrase = re.split(r"[:：=]", decoration_free.rstrip(":：="))[-1]
+    # 「以下是本次正式结果：」这类说明句：剥掉常见引导词后仍要求整词命中
+    changed = True
+    while changed:
+        changed = False
+        for lead in ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次"):
+            if phrase.startswith(lead) and len(phrase) > len(lead):
+                phrase = phrase[len(lead):]
+                changed = True
+                break
+    if phrase in _EXAMPLE_LABELS:
         return "example"
-    if _SUPPLEMENT_LABEL_RE.match(line):
+    if phrase in _SUPPLEMENT_LABELS:
         return "supplement"
+    if phrase in _FORMAL_LABELS:
+        return "formal"
     return "neutral"
 
 
 def _select_plan_result(text: str) -> dict | None:
-    """按位置选行程候选：完整行程或有标题裸行程，补充尾注不参与竞争。
+    """按位置选行程候选：完整行程或有标题裸行程，尾注不顶替。
 
     此前用「强键优先」全局挑选：回显的 prompt 示例（含强键 itinerary）
     会压过后置的 ``{"data": {"itinerary": ...}}`` 包装与裸弱键正式结果；
     正式结果之后的尾注弱对象（duration / note）又会被当成结果包装成
-    itinerary、整份真实行程被静默丢弃。现在所有「行程形状」候选（完整
-    行程 / 有标题裸行程，含 itinerary 包装）按位置竞争，带「补充：/
-    尾注：」短标签的候选除外（没有其它候选时才兜底）；两者都没有时
-    退回最后一个行程形状对象（由调用方校验不足时报错）。末尾截断时
-    抛错不回退。
+    itinerary、整份真实行程被静默丢弃。现在的判定顺序：
+
+    1. 回显示例候选（「示例：」标签）不参与竞争（全是示例时才兜底）；
+    2. 补充 / 尾注标签的弱候选（无排期内容）不参与终稿竞争；
+    3. 其余候选按位置取最后一个；若最后一个是无排期内容的弱候选、且
+       之前存在带排期内容的完整行程，视其为尾注、选完整行程——除非该
+       弱候选带「正式：/结果：」标签（本轮终稿仍按位置胜出）。
+
+    两者都没有时退回最后一个行程形状对象（由调用方校验不足时报错）。
+    末尾截断时抛错不回退。
     """
     last_any: dict | None = None
     last_any_end = -1
@@ -171,10 +219,28 @@ def _select_plan_result(text: str) -> dict | None:
             candidates.append((plan, end, kind))
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    non_supplement = [item for item in candidates if item[2] != "supplement"]
-    pool = non_supplement or candidates
-    if pool:
-        chosen, chosen_end, _ = pool[-1]
+    real = [item for item in candidates if item[2] != "example"] or candidates
+    strong = [
+        item
+        for item in real
+        if not (
+            item[2] == "supplement" and not _has_nonempty_daily_plans(item[0])
+        )
+    ] or real
+    if strong:
+        last = strong[-1]
+        if not _has_nonempty_daily_plans(last[0]) and last[2] != "formal":
+            earlier_rich = [
+                item
+                for item in strong
+                if item[1] < last[1] and _has_nonempty_daily_plans(item[0])
+            ]
+            if earlier_rich:
+                chosen, chosen_end, _ = earlier_rich[-1]
+            else:
+                chosen, chosen_end, _ = last
+        else:
+            chosen, chosen_end, _ = last
     elif last_any is not None:
         chosen, chosen_end = last_any, last_any_end
     else:

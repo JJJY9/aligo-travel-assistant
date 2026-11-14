@@ -618,6 +618,51 @@ def test_cached_instance_write_cannot_hide_quarantine():
     print("✓ 缓存实例写入不掩盖隔离状态；delete_all 一并清理备份")
 
 
+def test_load_time_quarantine_blocks_writes_from_same_instance():
+    """构造期检测到损坏并隔离的实例同样不允许写回重建：此后任何新实例 /
+    请求必须仍能看到隔离状态（#792 的 503 恢复提示不能被空快照掩盖）。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-self.json"
+    seed = LongTermMemory("u-self", storage_dir)
+    seed.save_preference("home_location", "北京")
+    path.write_text("{bad json", encoding="utf-8")
+
+    detecting = LongTermMemory("u-self", storage_dir)
+    assert detecting.get_recovered_corrupt_backup()
+    with pytest.raises(MemoryPersistenceError):
+        detecting.save_preference("hotel_brands", ["汉庭"])
+    assert not path.exists(), "构造期隔离后的写入不能重建主文件"
+    fresh = LongTermMemory("u-self", storage_dir)
+    assert fresh.get_recovered_corrupt_backup(), "新实例仍应看到隔离状态"
+    print("✓ 构造期隔离的实例不允许写回重建，隔离状态对新实例可见")
+
+
+def test_delete_all_reports_unremovable_backup(monkeypatch):
+    """隔离备份删不掉时 delete_all 必须报错（删除未完成），不能静默
+    成功后又让后续写入持续被隔离守卫拒绝。"""
+    import context.long_term_memory as module
+
+    storage_dir = tempfile.mkdtemp()
+    backup = Path(storage_dir) / "u-del.json.corrupt-20260101000000000000-1"
+    backup.write_text("{}", encoding="utf-8")
+    memory = LongTermMemory("u-del", storage_dir)
+    assert memory.get_recovered_corrupt_backup()
+
+    real_remove = module.os.remove
+
+    def failing_remove(target):
+        if str(target).endswith(backup.name):
+            raise OSError("locked")
+        return real_remove(target)
+
+    monkeypatch.setattr(module.os, "remove", failing_remove)
+    with pytest.raises(MemoryPersistenceError):
+        memory.delete_all()
+    monkeypatch.setattr(module.os, "remove", real_remove)
+    assert backup.exists(), "删除失败的备份应保留"
+    print("✓ delete_all 对无法删除的隔离备份报错")
+
+
 def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
     """解析失败后、备份前若其它线程写入了新文件，不能把有效数据当损坏文件移走。"""
     import json as json_module
