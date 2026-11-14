@@ -4761,6 +4761,15 @@ def test_delete_last_turn_turn_identity():
         _cleanup(user_id)
 
 
+def test_allowed_hosts_env_strips_bom(monkeypatch):
+    """文件注入的 ALIGO_ALLOWED_HOSTS 带 BOM 时白名单仍能命中。"""
+    from webapp import server as server_module
+
+    monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", "﻿example.com")
+    assert server_module._host_allowed("example.com"), "BOM 不能让白名单首项失效"
+    print("✓ ALIGO_ALLOWED_HOSTS 去 BOM")
+
+
 def test_delete_session_busy_lock_refused(monkeypatch):
     """删除会话在用户锁忙碌时有界返回 409，不再排队到前端超时后仍执行。"""
     import asyncio as asyncio_module

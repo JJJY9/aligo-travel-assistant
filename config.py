@@ -29,11 +29,25 @@ def _env_str(name: str, default: str) -> str:
     「看起来已配置」却永远连不上（BOM 混进库名 / HTTP 头编码失败）。
     """
     value = os.environ.get(name, "").replace("\ufeff", "").strip()
+    # 文件注入的 "value" / 'value'（K8s ConfigMap、.env 模板）连引号
+    # 一起复制进来：原样生效会让 URL / 密钥带引号、连接在鉴权阶段失败
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in "\"'"
+    ):
+        value = value[1:-1].strip()
     return value or default
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, str(default))
+    # 与 _env_str 同一 BOM / 空白清洗口径：带 U+FEFF 的数值此前解析失败、
+    # 静默回退默认值（文件注入的 K8s 值不生效）
+    raw = (
+        os.environ.get(name, str(default))
+        .replace("\ufeff", "")
+        .strip()
+    )
     try:
         return int(raw)
     except ValueError:
@@ -47,11 +61,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+_BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
+    raw = (
+        os.environ.get(name, "")
+        .replace("\ufeff", "")
+        .strip()
+        .lower()
+    )
     if not raw:
         return default
-    return raw in {"1", "true", "yes", "on"}
+    if raw in _BOOL_TRUE_VALUES:
+        return True
+    if raw in _BOOL_FALSE_VALUES:
+        return False
+    # 无法识别的写法（enabled / ture 笔误）此前静默按 False：开关
+    # 永远不生效且无任何提示
+    logger.warning(
+        "环境变量 %s=%r 不是布尔值（true/false/1/0/yes/no/on/off），使用默认值 %s",
+        name,
+        raw[:40],
+        default,
+    )
+    return default
 
 
 # 密钥必须 strip：复制粘贴带尾随空格 / 换行时，httpx 会拒绝非法 header
@@ -158,6 +193,24 @@ SYSTEM_CONFIG: SystemConfig = {
     # 重试（重复计费）。默认 120s，可用 LLM_REQUEST_TIMEOUT_SEC 调整
     "timeout": _env_int("LLM_REQUEST_TIMEOUT_SEC", 120),
 }
+
+# 超时下限 / 上限钳制（与限流窗口、额度的处理同口径）：0 / 负数会被
+# httpx 解释为「立即截止」，每次模型调用瞬间 APITimeoutError、重试
+# 全败并最终打开熔断（全站 503）；数百位的超大值在 float() 转换时
+# OverflowError
+if SYSTEM_CONFIG["timeout"] < 1:
+    logger.warning(
+        "LLM_REQUEST_TIMEOUT_SEC=%s 非法（需 >= 1 秒；0/负数会导致每次请求"
+        "立即超时），按 120 秒处理",
+        SYSTEM_CONFIG["timeout"],
+    )
+    SYSTEM_CONFIG["timeout"] = 120
+elif SYSTEM_CONFIG["timeout"] > 3600:
+    logger.warning(
+        "LLM_REQUEST_TIMEOUT_SEC=%s 超出合理上限，按 3600 秒处理",
+        SYSTEM_CONFIG["timeout"],
+    )
+    SYSTEM_CONFIG["timeout"] = 3600
 
 # RAG 知识库：嵌入模型（本地路径，无需连 HuggingFace）
 RAG_CONFIG: RAGConfig = {
