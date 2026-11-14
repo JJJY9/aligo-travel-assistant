@@ -163,7 +163,9 @@ def _is_authoritative_empty(obj: dict) -> bool:
 # 候选标签：取候选前最后一个非空、非围栏行；行内只允许「一个短语」（可带
 # 引导词「以下是/本次」等），剔除加粗 / 标题 / 方括号装饰。示例短语按前缀
 # 识别（示例、示例1、示例（北京行程）、输出示例…），叙述句不算。
-_EXAMPLE_LABELS = frozenset({"输出示例", "输出样例", "格式示例", "示例输出"})
+_EXAMPLE_LABELS = frozenset(
+    {"输出示例", "输出样例", "格式示例", "示例输出", "以下示例", "举例如下", "比如", "输出格式示例"}
+)
 _SUPPLEMENT_LABELS = frozenset(
     {
         "补充",
@@ -221,15 +223,41 @@ _PAREN_EXAMPLE_OUTER = frozenset(
 )
 
 
+_EXAMPLE_WORDS = (
+    "示例",
+    "例如",
+    "样例",
+    "比如",
+    "以下示例",
+    "举例如下",
+    "输出格式示例",
+)
+
+
 def _colon_example_marker(line: str) -> bool:
-    """「示例：北京行程」式标签：冒号前的短语本身就是示例词。"""
+    """「示例：北京行程」式短标签：冒号前短语是示例词、冒号后是短描述。
+
+    「示例：…，真实结果如下：」「示例：{…}，正式结果：」这类带后续说明
+    或句内标点的叙述行不算示例标签。"""
     decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
         if part
     ]
-    return bool(parts) and parts[0] in _PAREN_EXAMPLE
+    if not parts or parts[0] not in _EXAMPLE_WORDS:
+        return False
+    rest = parts[1:]
+    if not rest:
+        return True
+    if len(rest) > 1:
+        return False
+    tail = rest[0]
+    if any(ch in tail for ch in "，。；、！？,;!?…"):
+        return False
+    if any(word in tail for word in ("真实", "正式", "结果", "如下", "实际")):
+        return False
+    return len(tail) <= 12
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -313,7 +341,7 @@ def _is_example_phrase(phrase: str | None) -> bool:
         return False
     if phrase in _EXAMPLE_LABELS:
         return True
-    return len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例"))
+    return len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例", "比如", "以下示例", "举例如下"))
 
 
 def _event_label_is_example(label: str) -> bool:
@@ -355,52 +383,58 @@ def _inside_example_array(text: str, start: int) -> bool:
 # missing_info 条目 → 提取字段：用于判断「信息不足」声明与实质提取是否矛盾
 # （缺的字段恰恰是提取里已有值的字段 = 示例回显之后的终态，空结果才可信；
 # 缺的是提取里本来就没有的字段 = 补充说明，保留提取）。
-_MISSING_FIELD_RULES = (
-    (("返程地", "返回地", "回程地"), ("return_location",)),
-    (("返程日期", "回程日期", "返回日期", "结束日期"), ("end_date",)),
-    (("出发日期", "开始日期", "出行日期", "行程日期"), ("start_date",)),
-    (("出发地", "出发城市", "起点"), ("origin",)),
-    (("目的地", "目的城市", "终点"), ("destination",)),
-    (("事由", "目的"), ("trip_purpose",)),
-    (("天数", "时长"), ("duration_days",)),
-)
-# 泛化时点词（具体时间 / 出发时间 / 返程航班…）：只说明「时刻/班次」未定，
-# 不是字段级缺失声明，不参与矛盾判定
-_GENERIC_TIME_WORDS = ("时间", "时刻", "钟点", "航班", "车次", "班次", "几点")
-_ALL_FIELDS_WORDS = ("所有信息", "全部信息", "全部字段", "所有字段", "必要信息", "关键信息")
+# missing_info 条目 → 提取字段：只有「字段名精确短语」才算字段级缺失声明。
+# 「目的地具体地址」「出发地交通方式」这类细化说明包含关键词但不是缺该
+# 字段，不能判矛盾（子串匹配会把合法提取整份清空）。
+_MISSING_FIELD_EXACT: dict[str, tuple[str, ...]] = {
+    "出发地": ("origin",),
+    "出发城市": ("origin",),
+    "起点": ("origin",),
+    "目的地": ("destination",),
+    "目的城市": ("destination",),
+    "终点": ("destination",),
+    "出发日期": ("start_date",),
+    "开始日期": ("start_date",),
+    "出行日期": ("start_date",),
+    "行程日期": ("start_date",),
+    "日期": ("start_date", "end_date"),
+    "返程地": ("return_location",),
+    "返回地": ("return_location",),
+    "回程地": ("return_location",),
+    "返程日期": ("end_date",),
+    "回程日期": ("end_date",),
+    "返回日期": ("end_date",),
+    "结束日期": ("end_date",),
+    "天数": ("duration_days",),
+    "时长": ("duration_days",),
+    "事由": ("trip_purpose",),
+    "目的": ("trip_purpose",),
+    "所有信息": _CORE_FIELDS,
+    "全部信息": _CORE_FIELDS,
+    "全部字段": _CORE_FIELDS,
+    "所有字段": _CORE_FIELDS,
+    "必要信息": _CORE_FIELDS,
+    "关键信息": _CORE_FIELDS,
+}
 
 
 def _missing_contradicts_substantive(
     missing_items: list[Any] | str, substantive: dict
 ) -> bool:
+    """缺失声明与提取内容是否矛盾：条目按字段名**精确短语**映射。"""
     if isinstance(missing_items, str):
         missing_items = [missing_items]
+    elif not isinstance(missing_items, (list, tuple)):
+        # 标量 missing_info（true / 数字）：按无缺失声明处理
+        return False
     for item in missing_items:
         if not isinstance(item, str) or not item.strip():
             continue
-        text = item.strip()
-        if any(word in text for word in _GENERIC_TIME_WORDS) and text not in (
-            "出发日期",
-            "开始日期",
-            "出行日期",
-            "行程日期",
-            "返程日期",
-            "回程日期",
-            "返回日期",
-            "结束日期",
-        ):
+        fields = _MISSING_FIELD_EXACT.get(item.strip())
+        if not fields:
             continue
-        # 全量缺失声明按「整条即该短语」识别：「出发日期等关键信息」
-        # 这类指向具体字段的补充说明不能被子串匹配误判
-        if text in _ALL_FIELDS_WORDS:
-            if _plan_score(substantive) > 0:
-                return True
-            continue
-        for keywords, fields in _MISSING_FIELD_RULES:
-            if any(word in text for word in keywords):
-                if any(_has_event_value(substantive.get(field)) for field in fields):
-                    return True
-                break
+        if any(_has_event_value(substantive.get(field)) for field in fields):
+            return True
     return False
 
 
@@ -477,6 +511,10 @@ def _select_event_result(text: str) -> dict | None:
         if value is None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
+            # 不可解析片段（JSON5 示例等）同样推进标签基线：其后真实结果
+            # 的标签段不能把整段「示例：…」算进去
+            if isinstance(end, int):
+                prev_end = max(prev_end, end)
             continue
         label_segment = text[prev_end:start]
         label_phrase = _event_label_phrase(label_segment)
