@@ -212,16 +212,24 @@ def test_open_cli_store_forwards_allow_quarantined(monkeypatch):
 
 
 if __name__ == "__main__":
-    for case in (
-        test_json_failures_are_structured,
-        test_json_invalid_user_is_structured,
-        test_corrupt_snapshot_fails_read_commands,
-        test_corrupt_snapshot_blocks_write_commands,
-    ):
-        mp = pytest.MonkeyPatch()
+    import inspect
+
+    ran = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        if any(param not in ("monkeypatch",) for param in params):
+            continue
+        fixture = None
+        kwargs: dict = {}
+        if "monkeypatch" in params:
+            fixture = pytest.MonkeyPatch()
+            kwargs["monkeypatch"] = fixture
         try:
-            case(mp)
+            func(**kwargs)
+            ran += 1
         finally:
-            mp.undo()
-    test_dispatch_usage_errors_honor_json()
-    print("\n全部通过")
+            if fixture is not None:
+                fixture.undo()
+    print(f"\n全部通过（{ran} 个用例）")

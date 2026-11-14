@@ -49,14 +49,22 @@ def _as_plan_object(obj: object) -> dict | None:
     return None
 
 
+def _daily_plans_nonempty(plans: object) -> bool:
+    """daily_plans 非空：渲染层同时接受列表与「day → 行程」字典形态。"""
+    if isinstance(plans, list):
+        return bool(plans)
+    if isinstance(plans, dict):
+        return bool(plans)
+    return False
+
+
 def _is_full_plan(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     itinerary_value = value.get("itinerary")
     if isinstance(itinerary_value, dict) and itinerary_value:
         return True
-    plans = value.get("daily_plans")
-    return isinstance(plans, list) and bool(plans)
+    return _daily_plans_nonempty(value.get("daily_plans"))
 
 
 def _has_plan_title(value: dict) -> bool:
@@ -72,8 +80,7 @@ def _is_titled_plan(value: dict) -> bool:
     """
     if not _has_plan_title(value):
         return False
-    plans = value.get("daily_plans")
-    if isinstance(plans, list) and plans:
+    if _daily_plans_nonempty(value.get("daily_plans")):
         return True
     return any(value.get(key) for key in ("duration", "route", "schedule"))
 
@@ -83,18 +90,11 @@ def _has_nonempty_daily_plans(value: dict) -> bool:
 
     daily_plans 既可能是列表，也可能是「day → 行程」字典（渲染层同样
     接受 dict 形态并按 values() 处理）——两者都算有排期内容。"""
-    def _nonempty(plans: object) -> bool:
-        if isinstance(plans, list):
-            return bool(plans)
-        if isinstance(plans, dict):
-            return bool(plans)
-        return False
-
-    if _nonempty(value.get("daily_plans")):
+    if _daily_plans_nonempty(value.get("daily_plans")):
         return True
     itinerary_value = value.get("itinerary")
     if isinstance(itinerary_value, dict):
-        return _nonempty(itinerary_value.get("daily_plans"))
+        return _daily_plans_nonempty(itinerary_value.get("daily_plans"))
     return False
 
 
@@ -152,7 +152,24 @@ _PAREN_EXAMPLE = frozenset(
     {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
 )
 _PAREN_EXAMPLE_OUTER = frozenset(
-    {"结果", "正式结果", "最终结果", "结果如下", "提取结果", "偏好", "输出结果"}
+    {
+        "结果",
+        "正式结果",
+        "最终结果",
+        "结果如下",
+        "提取结果",
+        "偏好",
+        "偏好结果",
+        "输出结果",
+        "输出格式",
+        "格式",
+        "行程",
+        "行程结果",
+        "规划",
+        "规划结果",
+        "事项",
+        "事项结果",
+    }
 )
 
 
@@ -728,6 +745,11 @@ class ItineraryPlanningAgent(AgentBase):
             candidate = _select_plan_result(text)
             if candidate is not None:
                 result = candidate
+            elif "{" in text:
+                # 扫描器解析不了但文本含 JSON 片段（如无引号键的 JSON5
+                # 示例）：不用 robust_json_parse 的兜底结果——那可能
+                # 正是回显的示例
+                raise ValueError("模型输出中未找到可用的行程结果对象")
 
             # 模型可能把完整行程再套一层 {"data": {"itinerary": ...}}：
             # 编排层 _merged_skill_payload 与渲染层都显式支持该形状，输出

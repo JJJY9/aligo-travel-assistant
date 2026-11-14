@@ -126,6 +126,15 @@ def _has_missing_declaration(obj: dict) -> bool:
     )
 
 
+def _sanitize_empty(obj: dict) -> dict:
+    """权威空结果若沿用模板的非空字段，置空核心字段后再返回——避免下游
+    据 destination / start_date 把模板残留写成行程。"""
+    sanitized = dict(obj)
+    for key in _CORE_FIELDS:
+        sanitized[key] = None
+    return sanitized
+
+
 def _is_authoritative_empty(obj: dict) -> bool:
     """形状上可确定「本轮最终表态：没有提取到信息」的空结果：带计数
     （extracted_count == 0），或字段表完整、没有任何核心字段有值且声明了
@@ -181,7 +190,24 @@ _PAREN_EXAMPLE = frozenset(
 )
 # 括号示例标记允许的「括号外短语」：结果类短标签（「结果（示例）：」）
 _PAREN_EXAMPLE_OUTER = frozenset(
-    {"结果", "正式结果", "最终结果", "结果如下", "提取结果", "偏好", "输出结果"}
+    {
+        "结果",
+        "正式结果",
+        "最终结果",
+        "结果如下",
+        "提取结果",
+        "偏好",
+        "偏好结果",
+        "输出结果",
+        "输出格式",
+        "格式",
+        "行程",
+        "行程结果",
+        "规划",
+        "规划结果",
+        "事项",
+        "事项结果",
+    }
 )
 
 
@@ -440,6 +466,10 @@ def _select_event_result(text: str) -> dict | None:
             continue
         last_any, last_any_end = candidate, end
         failed_tail = False
+        if _is_authoritative_empty(candidate):
+            # extracted_count == 0 / 全 null 终稿：即使模型沿用了模板的
+            # 非空字段（未置 null），也必须按空结果处理
+            candidate = _sanitize_empty(candidate)
         if _plan_score(candidate) > 0:
             substantives.append(
                 (candidate, end, label_example, label_phrase in _SUPPLEMENT_LABELS)

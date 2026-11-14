@@ -149,10 +149,32 @@ def _iter_preference_arrays(text: str):
         if isinstance(value, list):
             items = [item for item in value if isinstance(item, dict)]
             if not value or (
-                items and any("type" in item or "value" in item for item in items)
+                items
+                and any(
+                    "type" in item
+                    or "value" in item
+                    or any(is_manageable_pref_type(key) for key in item)
+                    for item in items
+                )
             ):
                 yield index, end, items
         index = text.find("[", max(end, index + 1))
+
+
+def _expand_legacy_array_items(items: list) -> list:
+    """数组元素兼容旧格式字典（{"home_location": "上海"}）：展开为
+    {type, value} 后再走统一归一。"""
+    expanded: list = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "type" in item or "value" in item:
+            expanded.append(item)
+            continue
+        for key, value in item.items():
+            if is_manageable_pref_type(key) and has_preference_value(value):
+                expanded.append({"type": key, "value": value})
+    return expanded
 
 
 def _result_from_preferences(candidate: dict, preferences: object) -> dict | None:
@@ -274,7 +296,24 @@ _PAREN_EXAMPLE = frozenset(
     {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
 )
 _PAREN_EXAMPLE_OUTER = frozenset(
-    {"结果", "正式结果", "最终结果", "结果如下", "提取结果", "偏好", "输出结果"}
+    {
+        "结果",
+        "正式结果",
+        "最终结果",
+        "结果如下",
+        "提取结果",
+        "偏好",
+        "偏好结果",
+        "输出结果",
+        "输出格式",
+        "格式",
+        "行程",
+        "行程结果",
+        "规划",
+        "规划结果",
+        "事项",
+        "事项结果",
+    }
 )
 
 
@@ -457,7 +496,26 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
             word in group for word in ("若", "如果", "如无", "无偏好", "需要")
         ):
             return False
+    residual = _PAREN_GROUP_RE.sub("", tail_line)
+    residual = re.sub(r"[`\s，,。.；;、！!？?…）)\-—】」}:：]+", "", residual)
+    if residual:
+        # 行尾还有普通文字（「[] 即可」「[] 表示清空」）：说明性写法
+        return False
     return True
+
+
+def _iter_array_spans(text: str):
+    decoder = json.JSONDecoder()
+    index = text.find("[")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("[", index + 1)
+            continue
+        if isinstance(value, list):
+            yield index, end
+        index = text.find("[", max(end, index + 1))
 
 
 def _select_preference_result(text: str) -> dict | None:
@@ -503,18 +561,28 @@ def _select_preference_result(text: str) -> dict | None:
         arrays.append((start, end, items, _is_example_label(text[:start])))
     # 数组内的元素对象不单独参与竞争：数组本身携带完整元素列表（数组
     # 起点必然早于元素，按位置比较元素会永远压倒数组、只留下最后一个
-    # 元素）；示例数组的元素继承示例标记
+    # 元素）；示例数组（偏好条目数组与任意顶层示例数组）的元素继承
+    # 示例标记
     array_spans = [(s, e) for s, e, _items, _ex in arrays]
-    if array_spans:
+    example_spans = [(s, e) for s, e, _items, ex in arrays if ex]
+    for array_start, array_end in _iter_array_spans(text):
+        if any(span_start <= array_start < span_end for span_start, span_end in spans):
+            continue
+        if any(es == array_start for es, _ee in example_spans):
+            continue
+        if _is_example_label(text[:array_start]):
+            example_spans.append((array_start, array_end))
+    if example_spans:
         objects = [
             (
                 s,
                 e,
                 obj,
-                flag or any(es <= s < ee for es, ee in array_spans),
+                flag or any(es <= s < ee for es, ee in example_spans),
             )
             for (s, e, obj, flag) in objects
         ]
+    if array_spans:
         objects = [
             item
             for item in objects
@@ -540,7 +608,9 @@ def _select_preference_result(text: str) -> dict | None:
     if chosen is None and array is not None:
         chosen = (
             {
-                "preferences": _normalize_preference_items(array[2]),
+                "preferences": _normalize_preference_items(
+                    _expand_legacy_array_items(array[2])
+                ),
                 "has_preferences": bool(array[2]),
             },
             array[0],
@@ -549,8 +619,13 @@ def _select_preference_result(text: str) -> dict | None:
     if chosen is None:
         return None
     result, result_start, result_end = chosen
+    def _in_example_span(position: int) -> bool:
+        return any(es <= position < ee for es, ee in example_spans)
+
     if any(
-        start > result_start for start, is_example in unparsable_keyed if not is_example
+        start > result_start
+        and not (is_example or _in_example_span(start))
+        for start, is_example in unparsable_keyed
     ):
         # 正式结果（形如偏好结果的对象）解析失败：报错而不是把更早的
         # 回显示例写进长期记忆
