@@ -79,14 +79,22 @@ def _is_titled_plan(value: dict) -> bool:
 
 
 def _has_nonempty_daily_plans(value: dict) -> bool:
-    """候选是否带排期内容（顶层或 itinerary 内的非空 daily_plans）。"""
-    plans = value.get("daily_plans")
-    if isinstance(plans, list) and plans:
+    """候选是否带排期内容（顶层或 itinerary 内的非空 daily_plans）。
+
+    daily_plans 既可能是列表，也可能是「day → 行程」字典（渲染层同样
+    接受 dict 形态并按 values() 处理）——两者都算有排期内容。"""
+    def _nonempty(plans: object) -> bool:
+        if isinstance(plans, list):
+            return bool(plans)
+        if isinstance(plans, dict):
+            return bool(plans)
+        return False
+
+    if _nonempty(value.get("daily_plans")):
         return True
     itinerary_value = value.get("itinerary")
     if isinstance(itinerary_value, dict):
-        plans = itinerary_value.get("daily_plans")
-        return isinstance(plans, list) and bool(plans)
+        return _nonempty(itinerary_value.get("daily_plans"))
     return False
 
 
@@ -143,6 +151,9 @@ _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 _PAREN_EXAMPLE = frozenset(
     {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
 )
+_PAREN_EXAMPLE_OUTER = frozenset(
+    {"结果", "正式结果", "最终结果", "结果如下", "提取结果", "偏好", "输出结果"}
+)
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -152,6 +163,18 @@ def _paren_example_marker(line: str) -> bool:
     内容精确命中示例短语——「按照（示例）格式，结果如下：」不算示例。"""
     outside = _PAREN_GROUP_RE.sub("", line)
     if any(ch in outside for ch in "，。；、！？,;!?…"):
+        return False
+    outside_clean = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", outside)
+    changed = True
+    while changed:
+        changed = False
+        for lead in _LEAD_INS:
+            if outside_clean.startswith(lead) and len(outside_clean) > len(lead):
+                outside_clean = outside_clean[len(lead):]
+                changed = True
+                break
+    if outside_clean and outside_clean not in _PAREN_EXAMPLE_OUTER:
+        # 括号外还有叙述性文字（「按照（示例）格式如下：」）：不是短标签
         return False
     for group in _PAREN_GROUP_RE.findall(line):
         content = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", group[1:-1])
@@ -273,6 +296,7 @@ def _select_plan_result(text: str) -> dict | None:
     """
     last_any: dict | None = None
     last_any_end = -1
+    last_any_kind = "neutral"
     candidates: list[tuple[dict, int, str]] = []
     failed_tail = False
     prev_end = 0
@@ -288,7 +312,7 @@ def _select_plan_result(text: str) -> dict | None:
         plan = _as_plan_object(value)
         if plan is None:
             continue
-        last_any, last_any_end = plan, end
+        last_any, last_any_end, last_any_kind = plan, end, kind
         failed_tail = False
         if _is_full_plan(plan) or _is_titled_plan(plan):
             candidates.append((plan, end, kind))
@@ -307,8 +331,12 @@ def _select_plan_result(text: str) -> dict | None:
     if strong:
         chosen, chosen_end, _ = strong[-1]
     elif candidates and all(item[2] == "example" for item in candidates):
-        return None
+        # 只剩回显示例：按解析失败处理（reply 的 try 块转换为标准错误
+        # JSON），绝不能让 robust_json_parse 的兜底把示例行程交出去
+        raise ValueError("模型输出只有回显示例候选，拒绝把示例行程当成真实规划")
     elif last_any is not None:
+        if last_any_kind == "example":
+            raise ValueError("模型输出只有回显示例候选，拒绝把示例行程当成真实规划")
         chosen, chosen_end = last_any, last_any_end
     else:
         return None

@@ -11550,4 +11550,12 @@ if __name__ == "__main__":
         finally:
             if fixture is not None:
                 fixture.undo()
-    print(f"\n全部通过（{ran} 个用例）")
+    total = sum(
+        1
+        for name, func in globals().items()
+        if name.startswith("test_") and callable(func)
+    )
+    print(
+        f"\n全部通过（{ran}/{total} 个用例；"
+        "其余需 pytest 专用夹具，由 pytest 运行）"
+    )
