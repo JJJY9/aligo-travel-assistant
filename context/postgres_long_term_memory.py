@@ -491,7 +491,7 @@ class PostgresLongTermMemory:
         上限减一后各自插入、越过 200 后 /api/export 永久 413。锁顺序固定
         「类型级在外、用户级在内」（append_preference 持类型锁调
         save_preference），不会出现反向获取。"""
-        with self._advisory_lock(f"aligo-pref-cap-{self.user_id}"):
+        with self._advisory_lock(f"aligo-pref-cap!{self.user_id}"):
             yield
 
     # ---------- 偏好 ----------

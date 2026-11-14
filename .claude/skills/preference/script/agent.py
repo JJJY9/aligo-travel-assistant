@@ -313,6 +313,46 @@ def _label_phrase(line: str) -> str | None:
     return phrase
 
 
+_EXAMPLE_LABELS = frozenset({"输出示例", "输出样例", "格式示例", "示例输出"})
+_SENTENCE_PUNCT = "，。；、！？,;!?…"
+
+
+def _is_example_label(label: str) -> bool:
+    """候选前的标签是否是回显示例（短标签约束，叙述句不算）。"""
+    line = ""
+    for item in label.splitlines():
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
+        if cleaned:
+            line = cleaned
+    if not line:
+        return False
+    phrase = _label_phrase(line)
+    if not phrase or any(ch in phrase for ch in _SENTENCE_PUNCT):
+        return False
+    if phrase in _EXAMPLE_LABELS:
+        return True
+    return len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例"))
+
+
+def _strip_line_json_values(line: str) -> str:
+    """去掉行内粘在标签前的完整 JSON 值（「示例：{…} 正式结果：」只留
+    标签部分）。不含 JSON 的行原样返回。"""
+    decoder = json.JSONDecoder()
+    best_end = 0
+    index = line.find("{")
+    while index != -1:
+        try:
+            _value, end = decoder.raw_decode(line, index)
+        except json.JSONDecodeError:
+            index = line.find("{", index + 1)
+            continue
+        best_end = max(best_end, end)
+        index = line.find("{", end)
+    if best_end:
+        return line[best_end:].strip()
+    return line
+
+
 _RESULT_SUFFIXES = ("结果", "偏好", "结论")
 
 
@@ -350,18 +390,26 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
             cleaned_lines.append(cleaned)
     if not cleaned_lines:
         return True
-    phrase = _label_phrase(cleaned_lines[-1])
+    phrase = _label_phrase(_strip_line_json_values(cleaned_lines[-1]))
     if not phrase or not _is_result_phrase(phrase):
         return False
     if len(cleaned_lines) >= 2:
         previous = cleaned_lines[-2].rstrip()
         if previous.endswith(("：", ":")) and any(
             word in previous
-            for word in ("若", "如果", "如无", "无偏好", "需要")
+            for word in ("若", "如果", "如无", "无偏好")
         ):
             # 折行指令 / 条件说明：「（…若本轮没有新偏好，按格式返回：」
             # 换行后跟「结果：[]）」——标签行是续行，不是独立结果标签。
             # 普通标题行（「分析：」「说明：」）不在此列
+            return False
+    # 数组之后同一行的括号标注：自称示例或条件说明（「[]（示例）」
+    # 「[]（若无新偏好时）」）时不是正式空结果
+    tail_line = text[end:].split("\n", 1)[0]
+    for group in _PAREN_GROUP_RE.findall(tail_line):
+        if re.search(r"示例|例如|样例", group) or any(
+            word in group for word in ("若", "如果", "如无", "无偏好", "需要")
+        ):
             return False
     return True
 
@@ -376,10 +424,11 @@ def _select_preference_result(text: str) -> dict | None:
     自带的 preferences 数组）不算独立候选。
     """
     spans: list[tuple[int, int]] = []
-    objects: list[tuple[int, int, dict]] = []
+    objects: list[tuple[int, int, dict, bool]] = []
     unparsable_keyed: list[int] = []
     failed_tail = False
     last_end = -1
+    prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
             if looks_like and start >= last_end:
@@ -387,11 +436,13 @@ def _select_preference_result(text: str) -> dict | None:
                 # 回退到更早的示例对象
                 failed_tail = True
             continue
+        label_example = _is_example_label(text[prev_end:start])
+        prev_end = end
         spans.append((start, end))
         last_end = max(last_end, end)
         normalized = _as_preference_result(value)
         if normalized is not None:
-            objects.append((start, end, normalized))
+            objects.append((start, end, normalized, label_example))
             failed_tail = False
         elif _looks_result_keyed(value):
             # 形如结果却解析不了（preferences 是非法字符串等）：记录位置，
@@ -399,19 +450,22 @@ def _select_preference_result(text: str) -> dict | None:
             unparsable_keyed.append(start)
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    arrays = [
-        (start, end, items)
-        for start, end, items in _iter_preference_arrays(text)
-        if not any(span_start <= start < span_end for span_start, span_end in spans)
-    ]
+    arrays: list[tuple[int, int, list, bool]] = []
+    for start, end, items in _iter_preference_arrays(text):
+        if any(span_start <= start < span_end for span_start, span_end in spans):
+            continue
+        arrays.append((start, end, items, _is_example_label(text[:start])))
+    # 回显示例候选（「示例：」前缀）不参与竞争（全是示例时才兜底）
+    real_arrays = [item for item in arrays if not item[3]] or arrays
     array = None
-    for start, end, items in arrays:
+    for start, end, items, _ in real_arrays:
         if not items and not _empty_array_is_formal(text, start, end):
             continue
         array = (start, end, items)
+    real_objects = [item for item in objects if not item[3]] or objects
     chosen: tuple[dict, int, int] | None = None
-    if objects:
-        obj_start, obj_end, obj = objects[-1]
+    if real_objects:
+        obj_start, obj_end, obj, _ = real_objects[-1]
         chosen = (obj, obj_start, obj_end)
         if array is not None and array[0] > obj_start:
             chosen = None
