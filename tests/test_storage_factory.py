@@ -974,6 +974,34 @@ def test_migrate_fills_statistics_defaults():
     print("✓ 缺失 statistics 子字段时补默认值")
 
 
+def test_migrate_clamps_inflated_counters_to_list_length():
+    """合法但偏大的计数器要向下对齐到真实条数（与 PG 的 COUNT(*) 同口径）。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-inflated.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "hi", "session_id": "s1"}
+                ],
+                "trip_history": [],
+                "statistics": {
+                    "total_messages": 42,
+                    "total_trips": 7,
+                    "total_queries": 3,
+                    "last_trip_number": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-inflated", storage_dir)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 1, stats
+    assert stats["total_trips"] == 0, stats
+    print("✓ 迁移把偏大的计数器对齐到列表长度")
+
+
 def test_migrate_repairs_bad_statistics_values():
     """计数器为 null / 字符串时必须修复，否则每次写入都抛 TypeError。"""
     storage_dir = tempfile.mkdtemp()
@@ -2633,6 +2661,7 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     memory._advisory_lock = lambda name: contextlib.nullcontext()
     memory._next_trip_number = lambda: 7
     memory._fetchall = lambda sql, params=None: []
+    memory._fetchone = lambda sql, params=None: (0,)
     memory.save_trip_history({"destination": "上海", "start_date": "2026-01-01"})
     insert_calls = [
         (sql, flag) for sql, flag in recorded if "INSERT INTO aligo_trips" in sql
@@ -3506,6 +3535,77 @@ def test_pg_save_trip_aborts_when_connection_reconnects():
     print("✓ 单条行程保存跨重连中止写入")
 
 
+def test_pg_save_trip_aborts_when_reconnect_during_number_allocation():
+    """取号内部重连（_next_trip_number 期间）后不得按旧快照继续 INSERT。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._conn = object()
+    store._fetchall = lambda sql, params=None: []
+    executed = []
+
+    def next_number():
+        # 模拟取号期间连接失效并重连：占位检查必须识别出连接已更换
+        store._conn = object()
+        return 6
+
+    store._next_trip_number = next_number
+    store._execute = lambda sql, params=None, replay_safe=True: executed.append(sql)
+    store._abort_if_reconnected = (
+        PostgresLongTermMemory._abort_if_reconnected.__get__(store)
+    )
+
+    with pytest.raises(MemoryPersistenceError):
+        store._save_trip_history_locked(
+            {"origin": "北京", "destination": "杭州", "start_date": "2026-12-01"},
+            "出差",
+            "杭州",
+        )
+    assert not any("INSERT INTO aligo_trips" in str(item) for item in executed), (
+        "重连后不得按旧快照写入新行程"
+    )
+    print("✓ 取号期间重连中止单条行程保存")
+
+
+def test_pg_delete_trips_verified_delete_not_replayed():
+    """去重删除按主键 DELETE 必须禁止重放（身份快照在重连后不可复核）。"""
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store._conn = object()
+    rows = [
+        (3, "trip_2", "北京", "上海", "2026-12-01", "2026-12-02"),
+        (5, "trip_7", "北京", "上海", "2026-12-01", "2026-12-02"),
+    ]
+    store._fetchall = lambda sql, params=None: list(rows)
+    store._advisory_lock = lambda name: contextlib_module.nullcontext()
+    executed = []
+    store._execute = (
+        lambda sql, params=None, replay_safe=True: executed.append(replay_safe)
+    )
+    store._abort_if_reconnected = lambda conn: None
+    target = {
+        "trip_id": "trip_7",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+        "count": 2,
+        "kept_id": "trip_2",
+        "prefer_last": False,
+    }
+    removed, error = store.delete_trips_verified([target])
+    assert error is None, error
+    assert removed == 1, removed
+    assert executed == [False], "按身份快照选定的 DELETE 必须 replay_safe=False"
+    print("✓ 去重删除禁止重放")
+
+
 def test_pg_delete_duplicate_trip_is_single_atomic_statement():
     """去重删除必须是单条 SQL：重连重放时计数在服务端重新求值，不删光保留行。"""
     import contextlib as contextlib_module
@@ -3875,6 +3975,7 @@ if __name__ == "__main__":
     test_null_list_fields_are_repaired()
     test_migrate_fills_statistics_defaults()
     test_migrate_repairs_bad_statistics_values()
+    test_migrate_clamps_inflated_counters_to_list_length()
     test_migrate_drops_non_object_entries()
     test_migrate_recomputes_counters_after_dropping_entries()
     test_pg_reconnects_after_connection_error()
@@ -3945,6 +4046,8 @@ if __name__ == "__main__":
     test_pg_update_trip_aborts_when_connection_reconnects()
     test_pg_append_preference_aborts_when_connection_reconnects()
     test_pg_save_trip_aborts_when_connection_reconnects()
+    test_pg_save_trip_aborts_when_reconnect_during_number_allocation()
+    test_pg_delete_trips_verified_delete_not_replayed()
     test_bulk_save_trips_matches_sequential_saves()
     _mp = pytest.MonkeyPatch()
     try:

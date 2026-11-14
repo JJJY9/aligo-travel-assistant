@@ -218,6 +218,66 @@ def test_json_delete_last_turn_clears_trip_links_when_emptied():
     print("✓ JSON delete_last_turn 删空会话时清空行程链接")
 
 
+def test_trip_cap_default_and_empty_destination_parity():
+    """默认行程上限对主写入路径生效；空目的地不计入常去目的地（与 JSON 同口径）。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils import trip_import as trip_import_module
+
+    # 空目的地口径：两后端都不把它计入常去目的地
+    parity_pg, _user = _pg_memory_or_skip()
+    parity_json = LongTermMemory("json-empty-dest", tempfile.mkdtemp())
+    try:
+        for store in (parity_pg, parity_json):
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "",
+                    "start_date": "2026-12-01",
+                }
+            )
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-12-02",
+                }
+            )
+            counts = dict(store.get_frequent_destinations(10))
+            assert "" not in counts, counts
+            assert counts.get("上海") == 1, counts
+    finally:
+        parity_pg.close()
+
+    # 默认上限：调用方不传 max_total 也要在存储写路径内拦截
+    cap_pg, _user2 = _pg_memory_or_skip()
+    cap_json = LongTermMemory("json-cap-default", tempfile.mkdtemp())
+    original = trip_import_module.MAX_TOTAL_TRIPS
+    trip_import_module.MAX_TOTAL_TRIPS = 2
+    try:
+        for store in (cap_pg, cap_json):
+            store.save_trip_history(
+                {"origin": "北京", "destination": "上海", "start_date": "2027-01-01"}
+            )
+            store.save_trip_history(
+                {"origin": "北京", "destination": "杭州", "start_date": "2027-01-05"}
+            )
+            with pytest.raises(ValueError):
+                store.save_trip_history(
+                    {
+                        "origin": "北京",
+                        "destination": "广州",
+                        "start_date": "2027-01-09",
+                    }
+                )
+            assert len(store.get_trip_history(limit=None)) == 2
+    finally:
+        trip_import_module.MAX_TOTAL_TRIPS = original
+        cap_pg.close()
+    print("✓ 默认行程上限与空目的地口径（JSON / PG 一致）")
+
+
 def test_pg_delete_chat_session_clears_trip_links():
     """PG：删除会话清空行程的会话链接（行程保留）。"""
     memory, _ = _pg_memory_or_skip()

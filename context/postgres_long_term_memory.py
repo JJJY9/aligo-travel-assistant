@@ -174,6 +174,17 @@ class PostgresLongTermMemory:
         self._conn_lock = threading.RLock()
         self._conn = self._connect()
         self._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
+        # 语句级等待超时（lock_timeout 的 55P03 LockNotAvailable、
+        # statement_timeout 的 57014 QueryCanceled）不是连接故障：按连接
+        # 错误重连重试只会让等待时间翻倍并无谓 churn 连接。单独识别后
+        # 直接按持久化失败上抛。
+        errors_module = getattr(psycopg, "errors", None)
+        self._non_retry_db_errors = tuple(
+            cls
+            for name in ("LockNotAvailable", "QueryCanceled")
+            if errors_module is not None
+            and (cls := getattr(errors_module, name, None)) is not None
+        )
         # 当前连接持有的会话级 advisory lock（锁名 -> 重入计数）。advisory lock
         # 随连接失效由服务端释放，重连后必须重新获取，否则读改写失去互斥。
         self._held_locks: dict[str, int] = {}
@@ -396,6 +407,11 @@ class PostgresLongTermMemory:
 
         try:
             return operation()
+        except getattr(self, "_non_retry_db_errors", ()) as busy_exc:
+            # 等锁 / 语句超时：连接本身健康，不重连不重试
+            raise MemoryPersistenceError(
+                f"PostgreSQL 操作失败：{busy_exc}"
+            ) from busy_exc
         except self._retry_errors as first_exc:
             if not replay_safe:
                 raise MemoryPersistenceError(
@@ -470,7 +486,11 @@ class PostgresLongTermMemory:
 
     # ---------- 偏好 ----------
 
-    def save_preference(self, pref_type: str, value: Any) -> None:
+    def save_preference(
+        self, pref_type: str, value: Any, *, replay_safe: bool = True
+    ) -> None:
+        """写入偏好。``replay_safe=False`` 用于「读 + 合并 + 写」的结果：
+        连接重建后重放会以过期的合并值覆盖空档里其它实例的追加。"""
         with self._preference_lock(pref_type):
             self._execute(
                 """
@@ -480,6 +500,7 @@ class PostgresLongTermMemory:
                 DO UPDATE SET value = EXCLUDED.value, updated_at = now()
                 """,
                 (self.user_id, pref_type, self._json(value)),
+                replay_safe=replay_safe,
             )
 
     def get_preference(self, pref_type: str | None = None) -> Any:
@@ -527,7 +548,8 @@ class PostgresLongTermMemory:
             # 已追加同类型偏好，按旧值合并会覆盖别人的更新
             self._abort_if_reconnected(start_conn)
             merged = merge_preference_value(current, value)
-            self.save_preference(pref_type, merged)
+            # UPSERT 禁止重放：合并值基于重连前的旧快照
+            self.save_preference(pref_type, merged, replay_safe=False)
             return merged
 
     def add_hotel_brand(self, brand: str) -> None:
@@ -1227,6 +1249,14 @@ class PostgresLongTermMemory:
         purpose = trip_info.get("purpose")
         destination = trip_info.get("destination")
         # 会话级 advisory lock：多线程 / 多进程同时写入同一用户时串行生成 trip_N
+        if max_total is None:
+            # 主写入路径不传参也要拦截：超过上限后导出接口永久 413
+            try:
+                from utils.trip_import import MAX_TOTAL_TRIPS
+
+                max_total = MAX_TOTAL_TRIPS
+            except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
+                max_total = None
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
             if max_total is not None:
                 self._enforce_trip_cap_locked(trip_info, destination, max_total)
@@ -1355,6 +1385,10 @@ class PostgresLongTermMemory:
                 return trip_id
 
         trip_number = self._next_trip_number()
+        # 取号内部可能因连接失效而重连（并重放计数器 UPSERT）：去重快照
+        # 与编号都基于旧连接，空档里其它实例可能已插入同身份行程 / 占用
+        # 该编号——按旧快照继续 INSERT 会造出重复身份或撞唯一索引
+        self._abort_if_reconnected(start_conn)
         trip_id = f"trip_{trip_number}"
         # INSERT 非幂等：提交后响应丢失自动重放会插出重复行（或撞唯一索引
         # 报错却已写入），按持久化失败上报由调用方整体重试
@@ -1519,6 +1553,10 @@ class PostgresLongTermMemory:
                     self._execute(
                         "DELETE FROM aligo_trips WHERE user_id = %s AND id = %s",
                         (self.user_id, chosen["id"]),
+                        # 目标行按删除前的身份快照选定：重连后的空档里它
+                        # 可能已被改成别的行程，重放会误删（与
+                        # delete_chat_session / delete_preference 同口径）
+                        replay_safe=False,
                     )
                     self._abort_if_reconnected(start_conn)
                     working.remove(chosen)
@@ -1615,6 +1653,9 @@ class PostgresLongTermMemory:
                 self._execute(
                     f"UPDATE aligo_trips SET {assignments} WHERE id = %s",
                     (*updates.values(), row[0]),
+                    # 去重结论基于读快照：重连后重放会与空档里新插入的
+                    # 同身份行程并存
+                    replay_safe=False,
                 )
             return True
 
@@ -1661,6 +1702,10 @@ class PostgresLongTermMemory:
         )
         counts: dict[str, int] = {}
         for destination, start_date in rows:
+            if not destination:
+                # 空目的地与 JSON 后端的真值判断同口径：不计入、不在面板
+                # 渲染空白城市
+                continue
             if not _trip_start_is_valid(start_date):
                 continue
             key = str(destination)
@@ -1726,6 +1771,17 @@ class PostgresLongTermMemory:
             except MemoryPersistenceError as exc:
                 logger.warning(
                     "导出一致性快照连接中断（第 %d 次），整体重试：%s",
+                    attempt,
+                    exc,
+                )
+                start_conn = self._conn
+                continue
+            except self._retry_errors as exc:
+                # 事务上下文进入 / COMMIT 阶段的连接错误是未包装的
+                # psycopg 异常（不在 _run_with_retry 内）：同样按连接中断
+                # 整体重试，而不是直接退回逐项读取
+                logger.warning(
+                    "导出一致性快照事务中断（第 %d 次），整体重试：%s",
                     attempt,
                     exc,
                 )
