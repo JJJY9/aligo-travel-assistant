@@ -244,14 +244,15 @@ def _looks_result_keyed(value: dict) -> bool:
     return "preferences" in value or "has_preferences" in value
 
 
-def _empty_array_is_formal(text: str, start: int, end: int, is_last: bool) -> bool:
-    """空数组只有「是文本最后一个值、前面是冒号 / 等号 / 括号」才算正式的
+def _empty_array_is_formal(text: str, start: int) -> bool:
+    """空数组只有「前面是冒号 / 等号 / 括号（或位于文本开头）」才算正式的
     空结果（``正式结果：[]``）；散文里的 ``[]``（Markdown 待办 ``- [ ]``、
-    ``例如 []``）不能顶掉前面的正式偏好结果。"""
-    if not is_last:
-        return False
-    if text[end:].strip().strip("`").strip():
-        return False
+    ``例如 []``）不能顶掉正式偏好结果。
+
+    只按前缀判断正式性：正式空结果之后的说明散文（「（本轮没有新的
+    偏好）」「。」）是常见形态，此前还要求数组必须是文本最后一个值且
+    后面没有任何文本，模型补一句说明就会让选择逻辑回退到更早的回显
+    示例。位置先后仍由调用方按候选起止比较。"""
     prefix = text[:start].rstrip()
     return prefix == "" or prefix[-1] in ":：=>（("
 
@@ -295,10 +296,8 @@ def _select_preference_result(text: str) -> dict | None:
         if not any(span_start <= start < span_end for span_start, span_end in spans)
     ]
     array = None
-    for index, (start, end, items) in enumerate(arrays):
-        if not items and not _empty_array_is_formal(
-            text, start, end, index == len(arrays) - 1
-        ):
+    for start, end, items in arrays:
+        if not items and not _empty_array_is_formal(text, start):
             continue
         array = (start, end, items)
     chosen: tuple[dict, int, int] | None = None

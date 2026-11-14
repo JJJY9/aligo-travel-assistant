@@ -1975,6 +1975,20 @@ def test_preference_empty_formal_array_after_example():
     print("✓ 偏好：正式空数组不被示例对象顶替")
 
 
+def test_preference_empty_formal_array_with_trailing_prose_after_example():
+    """正式空数组后有说明散文（括号说明 / 句号）：仍是正式空结果，不回退示例。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    for tail in ("\n（本轮没有新的偏好）", "。"):
+        data = _pref_reply(f"示例：{example}\n正式结果：[]{tail}")
+        assert data.get("has_preferences") is False, (tail, data)
+        assert data.get("preferences") == [], (tail, data)
+        assert "上海浦东新区" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：正式空数组后的说明散文不使其失效")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2039,6 +2053,19 @@ def test_event_collection_meta_tail_does_not_override_full_result():
     print("✓ 事项收集：计数>0 的尾注不顶掉完整结果")
 
 
+def test_event_collection_uncounted_missing_info_tail_keeps_full_result():
+    """无 extracted_count 的 missing_info 尾注只是补充说明，不能顶掉完整提取。"""
+    formal = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"end_date": "2026-12-03", "extracted_count": 6}'
+    )
+    tail = '尾注：{"missing_info": ["返程地"], "summary": "杭州出差"}'
+    data = _event_reply(f"{formal}\n{tail}")
+    assert data.get("destination") == "杭州", data
+    assert data.get("start_date") == "2026-12-01", data
+    print("✓ 事项收集：无计数的 missing_info 尾注不顶掉完整结果")
+
+
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
@@ -2047,6 +2074,28 @@ def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     assert data["itinerary"]["title"] == "杭州出差", data
     assert data["itinerary"].get("daily_plans"), data
     print("✓ 行程规划：仅标题尾注不顶掉完整行程")
+
+
+def test_plan_trip_titled_duration_tail_does_not_displace_full_plan():
+    """「标题 + duration」补充尾注（无排期）不能顶掉更早带 daily_plans 的行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    tail = '补充：{"title": "注意事项", "duration": "2天"}'
+    data = _plan_trip_reply(f"{full}\n{tail}")
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    assert data["itinerary"].get("daily_plans"), data
+    print("✓ 行程规划：标题+duration 尾注不顶掉完整行程")
+
+
+def test_plan_trip_empty_daily_plans_shell_does_not_displace_full_plan():
+    """daily_plans 为空列表的壳对象不能顶掉更早带排期的完整行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    tail = '补充：{"title": "杭州出差", "daily_plans": []}'
+    data = _plan_trip_reply(f"{full}\n{tail}")
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    assert data["itinerary"].get("daily_plans"), data
+    print("✓ 行程规划：空 daily_plans 壳不顶掉完整行程")
 
 
 def test_preference_append_then_plain_item_keeps_append():

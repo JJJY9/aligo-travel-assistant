@@ -98,6 +98,14 @@ def _is_explicit_empty(obj: dict) -> bool:
     )
 
 
+def _is_counted_empty(obj: dict) -> bool:
+    """带计数（extracted_count == 0）的显式空结果：只有这种空结果才允许
+    按位置压过更早的实质提取；计数缺失的 missing_info 尾注是补充说明，
+    不能否决完整结果。"""
+    count = obj.get("extracted_count")
+    return isinstance(count, int) and not isinstance(count, bool) and count == 0
+
+
 def _normalize_event_date(text: str) -> str | None:
     """中文 / 斜杠日期归一为 ISO；非法日历日返回 None（字段置 null）。"""
     match = _DATE_TEXT_RE.fullmatch(text)
@@ -160,6 +168,8 @@ def _select_event_result(text: str) -> dict | None:
     substantive_end = -1
     explicit_empty: dict | None = None
     explicit_empty_end = -1
+    counted_empty: dict | None = None
+    counted_empty_end = -1
     failed_tail = False
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
@@ -175,14 +185,16 @@ def _select_event_result(text: str) -> dict | None:
             substantive, substantive_end = candidate, end
         elif _is_explicit_empty(candidate):
             explicit_empty, explicit_empty_end = candidate, end
+            if _is_counted_empty(candidate):
+                counted_empty, counted_empty_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    if substantive is not None and explicit_empty is not None:
-        # 按位置取后者：回显示例（实质字段俱全）之后又输出显式空结果时，
-        # 空结果是对本轮的最终表态；而尾注小对象（extracted_count>0）
-        # 已在 _is_explicit_empty 里排除，不会顶掉完整提取
-        if explicit_empty_end > substantive_end:
-            chosen, chosen_end = explicit_empty, explicit_empty_end
+    if substantive is not None and counted_empty is not None:
+        # 按位置取后者：回显示例（实质字段俱全）之后又输出带计数的显式
+        # 空结果时，空结果是对本轮的最终表态；计数缺失的 missing_info
+        # 尾注只是补充说明（_is_counted_empty），不能顶掉完整提取
+        if counted_empty_end > substantive_end:
+            chosen, chosen_end = counted_empty, counted_empty_end
         else:
             chosen, chosen_end = substantive, substantive_end
     elif substantive is not None:
