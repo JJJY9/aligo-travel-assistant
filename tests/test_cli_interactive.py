@@ -446,7 +446,7 @@ def _make_cli_stub():
                 events["staged"].pop()
             return True
 
-        def add_message(self, role, content, metadata=None):
+        def add_message(self, role, content, metadata=None, timestamp=None):
             self.persist_message(role, content)
             self.stage_message(role, content, metadata)
 

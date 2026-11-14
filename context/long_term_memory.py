@@ -897,6 +897,8 @@ class LongTermMemory:
         assistant_content: str,
         session_id: str | None = None,
         should_commit: Callable[[], bool] | None = None,
+        user_timestamp: str | None = None,
+        assistant_timestamp: str | None = None,
     ) -> bool:
         """原子追加一轮完整问答（用户 + 助手两条消息）。
 
@@ -914,6 +916,10 @@ class LongTermMemory:
         if should_commit is not None and not should_commit():
             return False
         now = datetime.now().isoformat()
+        # 与短期记忆共享同一消息时间戳：内容指纹（角色+内容+时间戳）
+        # 才能在回填 / 重放与实时副本之间对齐
+        user_ts = user_timestamp or now
+        assistant_ts = assistant_timestamp or now
         history = self.data["chat_history"]
         start = len(history)
         total_before = int(self.data["statistics"].get("total_messages") or 0)
@@ -921,7 +927,7 @@ class LongTermMemory:
             {
                 "role": "user",
                 "content": user_content,
-                "timestamp": now,
+                "timestamp": user_ts,
                 "session_id": session_id,
             }
         )
@@ -929,7 +935,7 @@ class LongTermMemory:
             {
                 "role": "assistant",
                 "content": assistant_content,
-                "timestamp": now,
+                "timestamp": assistant_ts,
                 "session_id": session_id,
             }
         )

@@ -622,6 +622,8 @@ class PostgresLongTermMemory:
         assistant_content: str,
         session_id: str | None = None,
         should_commit: Callable[[], bool] | None = None,
+        user_timestamp: str | None = None,
+        assistant_timestamp: str | None = None,
     ) -> bool:
         """同一事务写入一轮完整问答（用户 + 助手两条消息）。
 
@@ -648,13 +650,31 @@ class PostgresLongTermMemory:
                 )
                 if should_commit is not None and not should_commit():
                     return False
+                # 与短期记忆共享同一消息时间戳（内容指纹跨来源对齐）：
+                # 未提供时仍由数据库 now() 兜底
                 cursor.executemany(
                     "INSERT INTO aligo_chat_messages "
-                    "(user_id, role, content, session_id) "
-                    "VALUES (%s, %s, %s, %s)",
+                    "(user_id, role, content, session_id, created_at) "
+                    "VALUES (%s, %s, %s, %s, COALESCE(%s, now()))",
                     [
-                        (self.user_id, "user", user_content, session_id),
-                        (self.user_id, "assistant", assistant_content, session_id),
+                        (
+                            self.user_id,
+                            "user",
+                            user_content,
+                            session_id,
+                            _pg_timestamp(user_timestamp)
+                            if user_timestamp
+                            else None,
+                        ),
+                        (
+                            self.user_id,
+                            "assistant",
+                            assistant_content,
+                            session_id,
+                            _pg_timestamp(assistant_timestamp)
+                            if assistant_timestamp
+                            else None,
+                        ),
                     ],
                 )
             return True

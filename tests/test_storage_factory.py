@@ -2135,7 +2135,7 @@ def test_add_message_writes_long_term_first():
         def __init__(self):
             self.messages = []
 
-        def add_message(self, role, content, metadata=None):
+        def add_message(self, role, content, metadata=None, timestamp=None):
             self.messages.append(content)
 
     manager = MemoryManager("u-order", "s1", storage_path=tempfile.mkdtemp())

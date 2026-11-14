@@ -80,7 +80,7 @@ class _FakeMemory:
         self.events.append(("assistant", assistant_content))
         return True
 
-    def add_message(self, role, content, metadata=None):
+    def add_message(self, role, content, metadata=None, timestamp=None):
         self.threads[f"add-{role}"] = threading.get_ident()
         self.events.append((role, content))
 
@@ -1044,7 +1044,7 @@ def test_empty_short_term_backfills_current_session_history():
         def get_recent_context(self, n_turns=5):
             return list(self.added[-n_turns * 2 :])
 
-        def add_message(self, role, content, metadata=None):
+        def add_message(self, role, content, metadata=None, timestamp=None):
             self.added.append({"role": role, "content": content})
 
     class _LongTerm:
@@ -1174,7 +1174,11 @@ def test_redis_backfill_skipped_while_degraded(monkeypatch):
     runtime, memory = _make_runtime()
     redis_mem = RedisShortTermMemory(None, "s-ctx")
     added: list[tuple[str, str]] = []
-    redis_mem.add_message = lambda role, content: added.append((role, content))  # type: ignore[method-assign]
+    redis_mem.add_message = (
+        lambda role, content, **kwargs: added.append(
+            (role, content, kwargs.get("timestamp"))
+        )
+    )  # type: ignore[method-assign]
     redis_mem.get_recent_context = lambda n_turns=5: []  # type: ignore[method-assign]
     memory.short_term = redis_mem
     memory.get_chat_history = lambda limit=None, session_id=None: [  # type: ignore[method-assign]
@@ -1204,7 +1208,7 @@ def test_redis_backfill_skipped_while_degraded(monkeypatch):
 
     redis_mem.client = object()  # 模拟客户端实际可用
     runtime._memory_snapshot()
-    assert added == [("user", "旧问题"), ("assistant", "旧回答")]
+    assert added == [("user", "旧问题", None), ("assistant", "旧回答", None)]
     print("✓ Redis 降级期间 / 客户端未取到时跳过历史回填写回")
 
 def test_runtime_uses_default_data_root_for_long_term(monkeypatch, tmp_path):
