@@ -505,7 +505,7 @@ class PostgresLongTermMemory:
         不同新类型的并发新增。"""
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
-                self._enforce_preference_cap(pref_type)
+                is_new = self._enforce_preference_cap(pref_type)
                 self._execute(
                     """
                     INSERT INTO aligo_preferences (user_id, pref_type, value)
@@ -514,21 +514,26 @@ class PostgresLongTermMemory:
                     DO UPDATE SET value = EXCLUDED.value, updated_at = now()
                     """,
                     (self.user_id, pref_type, self._json(value)),
-                    replay_safe=replay_safe,
+                    # 新类型的 INSERT 不允许重放：连接重建会释放用户级锁，
+                    # 空档里其它实例可能已把类型数补到上限，重放会越过复核
+                    replay_safe=replay_safe and not is_new,
                 )
 
-    def _enforce_preference_cap(self, pref_type: str) -> None:
-        """新建偏好类型前复核类型数上限（用户级写锁内，跨类型并发安全）。"""
+    def _enforce_preference_cap(self, pref_type: str) -> bool:
+        """新建偏好类型前复核类型数上限（用户级写锁内，跨类型并发安全）。
+
+        返回是否为新类型：新类型的 INSERT 不允许重放（重连空档里其它实例
+        可能已把类型数补到上限），既有类型的 UPSERT 可安全重试。"""
         try:
             from utils.user_import import _MAX_PREFERENCES
         except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
-            return
+            return False
         row = self._fetchone(
             "SELECT 1 FROM aligo_preferences WHERE user_id = %s AND pref_type = %s",
             (self.user_id, pref_type),
         )
         if row is not None:
-            return
+            return False
         count_row = self._fetchone(
             "SELECT COUNT(*) FROM aligo_preferences WHERE user_id = %s",
             (self.user_id,),
@@ -538,6 +543,7 @@ class PostgresLongTermMemory:
             raise ValueError(
                 f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除不用的偏好"
             )
+        return True
 
     def get_preference(self, pref_type: str | None = None) -> Any:
         if pref_type is None:

@@ -15,6 +15,7 @@ import logging
 import math
 import re
 from collections import Counter
+from datetime import datetime
 from typing import Any
 
 from utils.chat_import import filter_import_messages, prepare_import_messages
@@ -540,7 +541,13 @@ def _merged_trip_rows(
             continue
         if key is not None:
             created_index[key] = len(created)
-        created.append(dict(row))
+        record = dict(row)
+        # drop_sessions 的内部标记不会落库；存储层为新建行补写 trip_id 与
+        # timestamp——预演按落库后的形状计数，避免与真实导入结论不一致
+        record.pop(_DROPPED_SESSION_KEY, None)
+        record.setdefault("trip_id", "trip_0")
+        record.setdefault("timestamp", datetime.now().isoformat())
+        created.append(record)
     return base + created
 
 
@@ -1302,4 +1309,9 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
             result["knowledge_error"] = (
                 f"知识片段恢复失败：{redact_paths(exc)}"
             )
+    # 恢复入口可能没有任何用户数据写入（仅知识片段 / 消息全被剔除）：
+    # 显式落盘重建被隔离移走的主文件，否则账号恢复后仍持续 503
+    ensure_persisted = getattr(store, "ensure_persisted", None)
+    if callable(ensure_persisted):
+        ensure_persisted()
     return result

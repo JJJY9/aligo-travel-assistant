@@ -78,32 +78,6 @@ def _is_titled_plan(value: dict) -> bool:
     return any(value.get(key) for key in ("duration", "route", "schedule"))
 
 
-def _is_titled_plan(value: dict) -> bool:
-    """有标题的裸行程：除标题外还必须带一个（非空）行程字段。
-
-    只有 title 的小对象、或 ``daily_plans`` 为空列表的壳，通常是正式
-    行程之后的「补充说明」，不能用它顶掉更早的完整 itinerary。
-    """
-    if not _has_plan_title(value):
-        return False
-    plans = value.get("daily_plans")
-    if isinstance(plans, list) and plans:
-        return True
-    return any(value.get(key) for key in ("duration", "route", "schedule"))
-
-
-def _has_nonempty_daily_plans(value: dict) -> bool:
-    """候选是否带排期内容（顶层或 itinerary 内的非空 daily_plans）。"""
-    plans = value.get("daily_plans")
-    if isinstance(plans, list) and plans:
-        return True
-    itinerary_value = value.get("itinerary")
-    if isinstance(itinerary_value, dict):
-        plans = itinerary_value.get("daily_plans")
-        return isinstance(plans, list) and bool(plans)
-    return False
-
-
 def _has_nonempty_daily_plans(value: dict) -> bool:
     """候选是否带排期内容（顶层或 itinerary 内的非空 daily_plans）。"""
     plans = value.get("daily_plans")

@@ -270,7 +270,7 @@ _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "�
 
 
 def _label_phrase(line: str) -> str | None:
-    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
@@ -293,6 +293,23 @@ def _label_phrase(line: str) -> str | None:
     return phrase
 
 
+_RESULT_SUFFIXES = ("结果", "偏好", "结论")
+
+
+def _is_result_phrase(phrase: str) -> bool:
+    """短语是否结果标签：白名单，或以「结果 / 偏好 / 结论」收尾的短短语
+    （容忍「如下 / 为 / 是」后缀）——「提取结果」「正式结果如下」「无新
+    偏好」都算，「返回」「输出」等指令词不算。"""
+    if phrase in _RESULT_LABELS:
+        return True
+    stripped = phrase
+    for suffix in ("如下", "为", "是"):
+        if stripped.endswith(suffix) and len(stripped) > len(suffix):
+            stripped = stripped[: -len(suffix)]
+            break
+    return len(stripped) <= 8 and stripped.endswith(_RESULT_SUFFIXES)
+
+
 def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     """空数组是本轮正式空结果吗？
 
@@ -304,15 +321,23 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     prefix = text[:start]
     if not prefix.strip():
         return True
-    line = ""
+    cleaned_lines: list[str] = []
     for item in prefix.splitlines():
         cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
-            line = cleaned
-    if not line:
+            cleaned_lines.append(cleaned)
+    if not cleaned_lines:
         return True
-    phrase = _label_phrase(line)
-    return bool(phrase) and phrase in _RESULT_LABELS
+    phrase = _label_phrase(cleaned_lines[-1])
+    if not phrase or not _is_result_phrase(phrase):
+        return False
+    if len(cleaned_lines) >= 2 and cleaned_lines[-2].rstrip().endswith(
+        ("：", ":")
+    ):
+        # 折行说明：「（…按格式返回：」换行后跟「结果：[]）」——上一行
+        # 以冒号收尾，标签行是条件说明的续行，不是独立的结果标签
+        return False
+    return True
 
 
 def _select_preference_result(text: str) -> dict | None:

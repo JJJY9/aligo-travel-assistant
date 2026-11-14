@@ -708,6 +708,22 @@ class LongTermMemory:
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
 
+    def ensure_persisted(self) -> None:
+        """恢复入口用：备份恢复成功但没有任何用户数据写入（仅知识片段 /
+        消息全部被会话删除剔除）时显式落盘重建主文件——主文件已被隔离
+        移走时，不重建会让账号在「导入成功」后持续 503。主文件已存在或
+        实例不是恢复入口（allow_quarantined）时不做任何事。"""
+        if os.path.exists(self.db_path) or not self._allow_quarantined:
+            return
+        with self._write_lock:
+            try:
+                with file_lock(self.db_path):
+                    self._persist()
+            except TimeoutError as exc:
+                raise MemoryPersistenceError(
+                    f"长期记忆写锁等待超时：{exc}"
+                ) from exc
+
     @_locked_mutation
     def append_preference(self, pref_type: str, value: Any) -> Any:
         """在锁内重新加载并追加一个偏好值（列表语义），返回合并后的值。
