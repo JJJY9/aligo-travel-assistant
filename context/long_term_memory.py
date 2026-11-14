@@ -713,11 +713,16 @@ class LongTermMemory:
         消息全部被会话删除剔除）时显式落盘重建主文件——主文件已被隔离
         移走时，不重建会让账号在「导入成功」后持续 503。主文件已存在或
         实例不是恢复入口（allow_quarantined）时不做任何事。"""
-        if os.path.exists(self.db_path) or not self._allow_quarantined:
+        if not self._allow_quarantined:
             return
         with self._write_lock:
             try:
                 with file_lock(self.db_path):
+                    # 存在性检查放在锁内：并发恢复（另一进程 / 请求）在
+                    # 检查与写入之间重建了主文件时，不能用本实例的隔离态
+                    # 空快照把它覆盖
+                    if os.path.exists(self.db_path):
+                        return
                     self._persist()
             except TimeoutError as exc:
                 raise MemoryPersistenceError(

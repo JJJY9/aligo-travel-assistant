@@ -2229,6 +2229,37 @@ def test_import_without_user_data_recreates_quarantined_main():
     print("✓ 无用户数据的恢复重建隔离主文件")
 
 
+def test_preview_counts_identityless_trips_as_created():
+    """--dry-run 与真实导入同一去重口径：缺目的地 / 出发日期的行程行
+    逐条新增（裸 trip_identity 会把它们折叠，预览与真跑结论相反）。"""
+    from utils.user_import import preview_user_import
+
+    class _Store:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def get_statistics(self):
+            return {"total_messages": 0, "total_trips": 0}
+
+        def get_chat_history(self, limit=None):
+            return []
+
+        def get_preference(self):
+            return {}
+
+    sections = {
+        "preferences": {},
+        "trips": [
+            {"origin": "北京", "destination": "无日期"},
+            {"origin": "北京", "destination": "无日期"},
+        ],
+        "messages": [],
+    }
+    preview = preview_user_import(_Store(), sections)
+    assert preview["trips_created"] == 2, preview
+    print("✓ 预览把无身份行程按逐条新增计数")
+
+
 def test_import_accepts_device_like_session_ids():
     """会话 ID 不拼文件名：nul / con 不再被判非法并丢弃消息。"""
     payload = {

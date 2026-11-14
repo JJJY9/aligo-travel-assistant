@@ -269,8 +269,24 @@ _RESULT_LABELS = frozenset(
 _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次")
 
 
+_PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
+
+
 def _label_phrase(line: str) -> str | None:
-    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    # 成对括号里的解释（「正式结果（本轮无新偏好）：」「（正式结果）：」）
+    # 先整体剔除，不并进短语里
+    cleaned_line = line
+    while True:
+        stripped = _PAREN_GROUP_RE.sub("", cleaned_line)
+        if stripped == cleaned_line:
+            break
+        cleaned_line = stripped
+    if not re.sub(r"[:：=\s]", "", cleaned_line):
+        # 整行就是括号里的标签（「（正式结果）：」）：取括号内容
+        match = _PAREN_GROUP_RE.search(line)
+        if match:
+            cleaned_line = match.group(0)[1:-1]
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", cleaned_line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
@@ -300,6 +316,8 @@ def _is_result_phrase(phrase: str) -> bool:
     """短语是否结果标签：白名单，或以「结果 / 偏好 / 结论」收尾的短短语
     （容忍「如下 / 为 / 是」后缀）——「提取结果」「正式结果如下」「无新
     偏好」都算，「返回」「输出」等指令词不算。"""
+    if phrase.startswith(("示例", "例如", "样例")):
+        return False
     if phrase in _RESULT_LABELS:
         return True
     stripped = phrase
@@ -331,12 +349,26 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     phrase = _label_phrase(cleaned_lines[-1])
     if not phrase or not _is_result_phrase(phrase):
         return False
-    if len(cleaned_lines) >= 2 and cleaned_lines[-2].rstrip().endswith(
-        ("：", ":")
-    ):
-        # 折行说明：「（…按格式返回：」换行后跟「结果：[]）」——上一行
-        # 以冒号收尾，标签行是条件说明的续行，不是独立的结果标签
-        return False
+    if len(cleaned_lines) >= 2:
+        previous = cleaned_lines[-2].rstrip()
+        if previous.endswith(("：", ":")) and any(
+            word in previous
+            for word in (
+                "若",
+                "如果",
+                "如无",
+                "无偏好",
+                "返回",
+                "输出",
+                "格式",
+                "如下",
+                "需要",
+            )
+        ):
+            # 折行指令 / 条件说明：「（…若本轮没有新偏好，按格式返回：」
+            # 换行后跟「结果：[]）」——标签行是续行，不是独立结果标签。
+            # 普通标题行（「分析：」「说明：」）不在此列
+            return False
     return True
 
 

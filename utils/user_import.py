@@ -985,16 +985,23 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         "archived": len(sections.get("archived", [])),
     }
 
+    # 与写入层同一去重口径：缺目的地 / 出发日期的行不参与去重，逐条新增
+    # （裸 trip_identity 会把它们折叠，--dry-run 与真实导入结论相反）
     pending_keys = {
-        trip_identity(trip) for trip in store.get_trip_history(limit=None)
+        key
+        for key in (
+            _trip_merge_key(trip) for trip in store.get_trip_history(limit=None)
+        )
+        if key is not None
     }
     for row in sections.get("trips", []):
-        key = trip_identity(row)
-        if key in pending_keys:
+        key = _trip_merge_key(row)
+        if key is not None and key in pending_keys:
             result["trips_updated"] += 1
         else:
             result["trips_created"] += 1
-            pending_keys.add(key)
+            if key is not None:
+                pending_keys.add(key)
 
     messages = sections.get("messages", [])
     if messages:
