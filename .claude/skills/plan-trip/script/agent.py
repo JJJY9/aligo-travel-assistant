@@ -64,17 +64,29 @@ def _has_plan_title(value: dict) -> bool:
 
 
 def _is_titled_plan(value: dict) -> bool:
-    """有标题的裸行程：除标题外还必须带一个行程字段。
+    """有标题的裸行程：除标题外还必须带一个（非空）行程字段。
 
-    只有 title 的小对象通常是正式行程之后的「补充说明」，不能用它顶掉
-    更早的完整 itinerary。
+    只有 title 的小对象、或 ``daily_plans`` 为空列表的壳，通常是正式
+    行程之后的「补充说明」，不能用它顶掉更早的完整 itinerary。
     """
     if not _has_plan_title(value):
         return False
-    return any(
-        key in value
-        for key in ("daily_plans", "duration", "route", "schedule")
-    )
+    plans = value.get("daily_plans")
+    if isinstance(plans, list) and plans:
+        return True
+    return any(value.get(key) for key in ("duration", "route", "schedule"))
+
+
+def _has_nonempty_daily_plans(value: dict) -> bool:
+    """候选是否带排期内容（顶层或 itinerary 内的非空 daily_plans）。"""
+    plans = value.get("daily_plans")
+    if isinstance(plans, list) and plans:
+        return True
+    itinerary_value = value.get("itinerary")
+    if isinstance(itinerary_value, dict):
+        plans = itinerary_value.get("daily_plans")
+        return isinstance(plans, list) and bool(plans)
+    return False
 
 
 def _select_plan_result(text: str) -> dict | None:
@@ -111,7 +123,16 @@ def _select_plan_result(text: str) -> dict | None:
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     if titled is not None and (full is None or titled_end > full_end):
-        chosen, chosen_end = titled, titled_end
+        if (
+            full is not None
+            and _has_nonempty_daily_plans(full)
+            and not _has_nonempty_daily_plans(titled)
+        ):
+            # 后置的「标题 + duration/route/schedule」补充尾注没有排期
+            # 内容，不能因为位置靠后就顶掉更早带 daily_plans 的完整行程
+            chosen, chosen_end = full, full_end
+        else:
+            chosen, chosen_end = titled, titled_end
     elif full is not None:
         chosen, chosen_end = full, full_end
     elif last_any is not None:
