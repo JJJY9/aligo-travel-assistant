@@ -272,6 +272,9 @@ class LongTermMemory:
                             "加载损坏记忆文件时等待文件锁超时: %s", lock_error
                         )
                         return self._init_data()
+            elif Path(f"{self.db_path}.deleted").exists():
+                logger.info("账号数据已删除，从空快照启动")
+                return self._init_data()
             else:
                 backups = self._corrupt_siblings()
                 if backups:
@@ -368,6 +371,10 @@ class LongTermMemory:
                 raw = f.read()
             data = json.loads(raw)
         except FileNotFoundError:
+            if Path(f"{self.db_path}.deleted").exists():
+                # 账号数据已被删除：从空快照开始，不能把失效快照写回
+                self.data = self._init_data()
+                return
             backups = self._corrupt_siblings()
             if backups and not self._allow_quarantined and not self._may_recreate:
                 # 主文件缺失 + 存在隔离备份：损坏文件已被隔离。沿用内存
@@ -698,6 +705,10 @@ class LongTermMemory:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
             logger.debug(f"Saved long-term memory to {self.db_path}")
+            try:
+                Path(f"{self.db_path}.deleted").unlink(missing_ok=True)
+            except OSError:
+                pass
             return True
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")
@@ -1834,14 +1845,25 @@ class LongTermMemory:
                         pass
                     except OSError:
                         failed.append(migrate_backup)
+                    # 无论备份是否删净都先重置内存快照与隔离标记：主文件
+                    # 已移除，旧快照绝不能再被写回
+                    self._corrupt_backup = None
+                    self._may_recreate = False
+                    self.data = self._init_data()
+                    if not failed:
+                        # 删除标记：其它存活实例（长会话 / 嵌入调用方）的
+                        # 下一次写入从空快照开始，不会把已删除的数据整份写回
+                        try:
+                            Path(f"{self.db_path}.deleted").touch(
+                                exist_ok=True
+                            )
+                        except OSError:
+                            pass
                     if failed:
                         raise MemoryPersistenceError(
                             "删除长期记忆时无法移除备份文件："
                             + "、".join(failed)
                         )
-                    self._corrupt_backup = None
-                    self._may_recreate = False
-                    self.data = self._init_data()
             except TimeoutError as exc:
                 raise MemoryPersistenceError(
                     f"长期记忆写锁等待超时：{exc}"

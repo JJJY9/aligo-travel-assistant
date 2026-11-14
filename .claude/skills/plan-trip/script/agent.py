@@ -101,7 +101,9 @@ def _has_nonempty_daily_plans(value: dict) -> bool:
 # 候选标签：取候选前最后一个非空、非围栏行；行内只允许「一个短语」（可带
 # 引导词「以下是/本次」等），剔除加粗 / 标题 / 方括号装饰。示例短语按前缀
 # 识别（示例、示例1、示例（北京行程）、输出示例…），叙述句不算。
-_EXAMPLE_LABELS = frozenset({"输出示例", "输出样例", "格式示例", "示例输出"})
+_EXAMPLE_LABELS = frozenset(
+    {"输出示例", "输出样例", "格式示例", "示例输出", "以下示例", "举例如下", "比如", "输出格式示例"}
+)
 _SUPPLEMENT_LABELS = frozenset(
     {
         "补充",
@@ -173,15 +175,41 @@ _PAREN_EXAMPLE_OUTER = frozenset(
 )
 
 
+_EXAMPLE_WORDS = (
+    "示例",
+    "例如",
+    "样例",
+    "比如",
+    "以下示例",
+    "举例如下",
+    "输出格式示例",
+)
+
+
 def _colon_example_marker(line: str) -> bool:
-    """「示例：北京行程」式标签：冒号前的短语本身就是示例词。"""
+    """「示例：北京行程」式短标签：冒号前短语是示例词、冒号后是短描述。
+
+    「示例：…，真实结果如下：」「示例：{…}，正式结果：」这类带后续说明
+    或句内标点的叙述行不算示例标签。"""
     decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
         if part
     ]
-    return bool(parts) and parts[0] in _PAREN_EXAMPLE
+    if not parts or parts[0] not in _EXAMPLE_WORDS:
+        return False
+    rest = parts[1:]
+    if not rest:
+        return True
+    if len(rest) > 1:
+        return False
+    tail = rest[0]
+    if any(ch in tail for ch in "，。；、！？,;!?…"):
+        return False
+    if any(word in tail for word in ("真实", "正式", "结果", "如下", "实际")):
+        return False
+    return len(tail) <= 12
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -276,7 +304,7 @@ def _label_kind(label: str) -> str:
         return "neutral"
     if not any(ch in phrase for ch in _SENTENCE_PUNCT) and (
         phrase in _EXAMPLE_LABELS
-        or (len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例")))
+        or (len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例", "比如", "以下示例", "举例如下")))
     ):
         return "example"
     if phrase in _SUPPLEMENT_LABELS:
@@ -334,6 +362,10 @@ def _select_plan_result(text: str) -> dict | None:
         if value is None:
             if looks_like and start >= last_any_end:
                 failed_tail = True
+            # 不可解析片段（JSON5 示例等）同样推进标签基线：其后真实结果
+            # 的标签段不能把整段「示例：…」算进去
+            if isinstance(end, int):
+                prev_end = max(prev_end, end)
             continue
         kind = _label_kind(text[prev_end:start])
         if kind != "example" and _inside_example_array(text, start):

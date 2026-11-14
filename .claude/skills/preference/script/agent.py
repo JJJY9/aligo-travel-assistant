@@ -187,7 +187,9 @@ def _expand_legacy_array_items(items: list) -> list:
 
 def _result_from_preferences(candidate: dict, preferences: object) -> dict | None:
     """把 preferences 字段的几种形态规范成列表结果；无法解析返回 None。"""
-    if isinstance(preferences, dict):
+    if isinstance(preferences, list):
+        preferences = _expand_legacy_array_items(preferences)
+    elif isinstance(preferences, dict):
         preferences = [preferences]
     elif isinstance(preferences, str):
         # 模型可能把数组序列化成字符串：能解析就恢复，否则按无结果处理
@@ -325,15 +327,41 @@ _PAREN_EXAMPLE_OUTER = frozenset(
 )
 
 
+_EXAMPLE_WORDS = (
+    "示例",
+    "例如",
+    "样例",
+    "比如",
+    "以下示例",
+    "举例如下",
+    "输出格式示例",
+)
+
+
 def _colon_example_marker(line: str) -> bool:
-    """「示例：北京行程」式标签：冒号前的短语本身就是示例词。"""
+    """「示例：北京行程」式短标签：冒号前短语是示例词、冒号后是短描述。
+
+    「示例：…，真实结果如下：」「示例：{…}，正式结果：」这类带后续说明
+    或句内标点的叙述行不算示例标签。"""
     decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
         if part
     ]
-    return bool(parts) and parts[0] in _PAREN_EXAMPLE
+    if not parts or parts[0] not in _EXAMPLE_WORDS:
+        return False
+    rest = parts[1:]
+    if not rest:
+        return True
+    if len(rest) > 1:
+        return False
+    tail = rest[0]
+    if any(ch in tail for ch in "，。；、！？,;!?…"):
+        return False
+    if any(word in tail for word in ("真实", "正式", "结果", "如下", "实际")):
+        return False
+    return len(tail) <= 12
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -402,7 +430,9 @@ def _label_phrase(line: str) -> str | None:
     return phrase
 
 
-_EXAMPLE_LABELS = frozenset({"输出示例", "输出样例", "格式示例", "示例输出"})
+_EXAMPLE_LABELS = frozenset(
+    {"输出示例", "输出样例", "格式示例", "示例输出", "以下示例", "举例如下", "比如", "输出格式示例"}
+)
 _SENTENCE_PUNCT = "，。；、！？,;!?…"
 
 
@@ -427,7 +457,7 @@ def _is_example_label(label: str) -> bool:
         return False
     if phrase in _EXAMPLE_LABELS:
         return True
-    return len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例"))
+    return len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例", "比如", "以下示例", "举例如下"))
 
 
 def _strip_line_json_values(line: str) -> str:
@@ -457,7 +487,7 @@ def _is_result_phrase(phrase: str) -> bool:
     """短语是否结果标签：白名单，或以「结果 / 偏好 / 结论」收尾的短短语
     （容忍「如下 / 为 / 是」后缀）——「提取结果」「正式结果如下」「无新
     偏好」都算，「返回」「输出」等指令词不算。"""
-    if phrase.startswith(("示例", "例如", "样例")):
+    if phrase.startswith(("示例", "例如", "样例", "比如", "以下示例", "举例如下")):
         return False
     if phrase in _RESULT_LABELS:
         return True
@@ -522,8 +552,9 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     tail_line = text[end:].split("\n", 1)[0]
     for group in _PAREN_GROUP_RE.findall(tail_line):
         if re.search(r"示例|例如|样例", group) or any(
-            word in group for word in ("若", "如果", "如无", "无偏好", "需要")
+            word in group for word in ("若", "如果", "如无", "需要")
         ):
+            # 描述性括注（「（无偏好）」「（本轮无偏好）」）不在此列
             return False
     residual = _PAREN_GROUP_RE.sub("", tail_line)
     residual = re.sub(r"[`\s，,。.；;、！!？?…）)\-—】」}:：]+", "", residual)
@@ -568,6 +599,9 @@ def _select_preference_result(text: str) -> dict | None:
                 # 「像结果但解析不了」的尾片段：正式结果可能被截断，不能
                 # 回退到更早的示例对象
                 failed_tail = True
+            # 不可解析片段（JSON5 示例等）同样推进标签基线
+            if isinstance(end, int):
+                prev_end = max(prev_end, end)
             continue
         label_example = _is_example_label(text[prev_end:start])
         prev_end = end

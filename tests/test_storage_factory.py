@@ -656,6 +656,24 @@ def test_load_time_quarantine_blocks_writes_from_same_instance():
     print("✓ 构造期隔离的实例不允许写回重建，隔离状态对新实例可见")
 
 
+def test_delete_all_prevents_stale_instance_resurrection():
+    """删除后其它存活实例（缓存会话）的下一次写入从空快照开始：
+    已删除的数据不会被旧实例整份写回。"""
+    storage_dir = tempfile.mkdtemp()
+    writer = LongTermMemory("u-tomb", storage_dir)
+    writer.save_preference("home_location", "北京")
+    stale = LongTermMemory("u-tomb", storage_dir)  # 会话打开时已持有快照
+    assert stale.get_preference("home_location") == "北京"
+
+    writer.delete_all()
+
+    stale.save_preference("hotel_brands", ["汉庭"])
+    fresh = LongTermMemory("u-tomb", storage_dir)
+    assert fresh.get_preference("home_location") is None, "已删除的数据不能复活"
+    assert fresh.get_preference("hotel_brands") == ["汉庭"]
+    print("✓ delete_all 后旧实例写入不复活已删除数据")
+
+
 def test_delete_all_removes_migrate_backup():
     """delete_all 连同 .migrate-backup（迁移前完整副本）一并清理。"""
     storage_dir = tempfile.mkdtemp()

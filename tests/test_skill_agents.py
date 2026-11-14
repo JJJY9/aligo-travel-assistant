@@ -2423,6 +2423,40 @@ def test_preference_inline_example_empty_then_formal_empty():
     print("✓ 偏好：同行前置示例空数组后仍判正式空结果")
 
 
+def test_preference_unparsable_example_fragment_does_not_poison_label():
+    """不可解析的「示例：」片段（JSON5）不污染其后真实偏好的标签。"""
+    fragment = '示例：{preferences: [{type: hotel_brands}]}'
+    real = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    data = _pref_reply(fragment + "\n" + real)
+    assert data.get("error") is None, data
+    assert data["preferences"] == [
+        {"type": "home_location", "value": "上海"}
+    ], data
+    print("✓ 偏好：不可解析示例片段不污染后续标签")
+
+
+def test_preference_descriptive_empty_note_allowed():
+    """「（无偏好）/（本轮无偏好）」描述性括注：正式空结果照常成功。"""
+    for tail in ("正式结果：[]（无偏好）", "正式结果：[]（本轮无偏好）"):
+        data = _pref_reply(tail)
+        assert data.get("has_preferences") is False, (tail, data)
+        assert not data.get("error"), (tail, data)
+    print("✓ 偏好：描述性空结果括注不判条件说明")
+
+
+def test_preference_wrapped_legacy_dict_items_expanded():
+    """标准包装路径的旧格式字典元素同样展开（与裸数组路径同口径）。"""
+    payload = '{"has_preferences": true, "preferences": [{"home_location": "上海"}]}'
+    data = _pref_reply(payload)
+    assert data["preferences"] == [
+        {"type": "home_location", "value": "上海"}
+    ], data
+    print("✓ 偏好：包装路径旧格式字典展开")
+
+
 def test_preference_instruction_suffix_phrase_not_formal():
     """「返回结果 / 若无偏好返回结果」不算结果标签：真实偏好保留。"""
     formal = (
@@ -2746,6 +2780,44 @@ def test_event_collection_colon_limited_example_label():
     data = _event_reply(f"{real}" + "\n" + example)
     assert data.get("destination") == "杭州", data
     print("✓ 事项收集：冒号限定示例标签不压过真实提取")
+
+
+def test_event_collection_unparsable_example_fragment_does_not_poison_label():
+    """不可解析的「示例：」片段（JSON5）不污染其后真实结果的标签。"""
+    fragment = '示例：{origin: 北京, destination: 北京}'
+    real = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    data = _event_reply(fragment + "\n" + real)
+    assert data.get("error") is None, data
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：不可解析示例片段不污染后续标签")
+
+
+def test_event_collection_scalar_missing_info_tolerated():
+    """missing_info 为标量（true / 数字）：不抛错，真实提取保留。"""
+    for scalar in ("true", "5"):
+        payload = (
+            '{"origin": "北京", "destination": "上海", "start_date": "2026-12-01", '
+            f'"missing_info": {scalar}}}'
+        )
+        data = _event_reply(payload)
+        assert data.get("error") is None, (scalar, data)
+        assert data.get("destination") == "上海", (scalar, data)
+    print("✓ 事项收集：标量 missing_info 容错")
+
+
+def test_event_collection_refined_missing_note_keeps_extraction():
+    """「目的地具体地址」这类细化说明不是字段级缺失声明：提取保留。"""
+    formal = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    tail = '{"missing_info": ["目的地具体地址", "出发地交通方式"]}'
+    data = _event_reply(f"{formal}" + "\n" + tail)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：细化缺失说明不清空提取")
 
 
 def test_event_collection_generic_time_word_tail_keeps_extraction():
@@ -3073,6 +3145,16 @@ def test_plan_trip_colon_limited_example_label():
     assert data.get("error") is None, data
     assert data["itinerary"]["title"] == "杭州出差", data
     print("✓ 行程规划：冒号限定示例标签不参与竞争")
+
+
+def test_plan_trip_unparsable_example_fragment_does_not_poison_label():
+    """不可解析的「示例：」片段（JSON5）不污染其后真实行程的标签。"""
+    fragment = '示例：{itinerary: {title: 北京3日游, daily_plans: [{day: 1}]}}'
+    real = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    data = _plan_trip_reply(fragment + "\n" + real)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：不可解析示例片段不污染后续标签")
 
 
 def test_plan_trip_narrative_example_sentence_not_example_label():
