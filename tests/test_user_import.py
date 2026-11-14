@@ -2052,6 +2052,54 @@ def test_import_repeat_backup_at_limit_is_idempotent(monkeypatch):
         module.import_user_data(store, sections2)
     print("✓ 上限内幂等重放与 dry-run 一致")
 
+def test_merged_backup_limit_previews_dedupe(monkeypatch):
+    """重导自己的备份：合并上限检查按导入去重语义预演，接近上限不再误拒。"""
+    from utils import user_import as module
+
+    store = _real_store("u-merge-dedupe")
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "trip_history": [
+                    {
+                        "origin": "北京",
+                        "destination": "上海",
+                        "start_date": "2026-03-01",
+                    },
+                    {
+                        "origin": "上海",
+                        "destination": "杭州",
+                        "start_date": "2026-04-01",
+                    },
+                ],
+                "chat_history": [
+                    {"role": "user", "content": "你好", "session_id": "s1"},
+                    {"role": "assistant", "content": "你好！", "session_id": "s1"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert errors == [], errors
+    module.import_user_data(store, sections)
+
+    # 重导同一备份：重复行按去重语义跳过，合并后的条数等于现有条数
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 2)
+    monkeypatch.setattr(module, "_MAX_TRIPS", 2)
+    assert module.merged_backup_limit_problem(store, sections) is None, (
+        "重导自己的备份不应被合并上限误拒"
+    )
+
+    # 备份里有真正新增的行：越过上限仍必须拒绝（去重预演不能放行新增）
+    extra = dict(sections)
+    extra["messages"] = list(sections["messages"]) + [
+        {"session_id": "s1", "role": "user", "content": "新问题"}
+    ]
+    problem = module.merged_backup_limit_problem(store, extra)
+    assert problem and "上限" in problem, problem
+    print("✓ 合并上限检查按导入去重语义预演")
+
+
 def test_import_accepts_device_like_session_ids():
     """会话 ID 不拼文件名：nul / con 不再被判非法并丢弃消息。"""
     payload = {

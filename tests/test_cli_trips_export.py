@@ -71,7 +71,7 @@ def test_export_to_file(monkeypatch):
     import tempfile
 
     fake = _FakeStore([_trip("上海"), _trip("杭州", "2026-12-09", "2026-12-10")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "trips.csv")
     code, out = _run("u1", target=target)
     assert code == 0 and "已导出 2 条行程" in out
@@ -92,7 +92,7 @@ def test_export_write_failure_reports(monkeypatch):
     with io.open(blocker, "w", encoding="utf-8") as handle:
         handle.write("x")
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     code, out = _run("u1", target=os.path.join(blocker, "trips.csv"))
     assert code == 1 and "写入失败" in out
     print("✓ trips-export 写入失败友好报错")
@@ -113,7 +113,7 @@ def test_export_ics_stdout_writes_utf8_bytes(monkeypatch):
             return 1
 
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     real_stdout = sys.stdout
     sink = _BytesStdout()
     monkeypatch.setattr(sys, "stdout", sink)
@@ -129,7 +129,7 @@ def test_export_ics_stdout_writes_utf8_bytes(monkeypatch):
 
 def test_export_stdout(monkeypatch):
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run("u1", to_stdout=True)
     assert code == 0
     assert "出发地,目的地,出发日期,返程日期,目的" in out
@@ -143,7 +143,7 @@ def test_default_path_and_overwrite(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
 
     code, out = _run("u1")
     assert code == 0
@@ -161,7 +161,7 @@ def test_empty_trips(monkeypatch):
     import tempfile
 
     fake = _FakeStore([])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "empty.csv")
     code, out = _run("u1", target=target)
     assert code == 0 and "已导出 0 条行程" in out
@@ -183,7 +183,7 @@ def test_invalid_and_failures(monkeypatch):
     assert called["n"] == 0
 
     fake = _FakeStore([], fail=True)
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     code, out = _run("u1")
     assert code == 1 and "读取行程失败" in out
     assert fake.closed
@@ -210,7 +210,7 @@ def test_pg_fallback_refused(monkeypatch):
     monkeypatch.setattr(ltm, "LongTermMemory", _JsonStore)
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://localhost/x")
     monkeypatch.setattr(
-        storage, "create_long_term_memory", lambda *args: _JsonStore([])
+        storage, "create_long_term_memory", lambda *args, **kwargs: _JsonStore([])
     )
     code, out = _run("u1")
     assert code == 1 and "回退本地 JSON" in out
@@ -224,7 +224,7 @@ def test_export_ics_count_ignores_field_text(monkeypatch):
     workdir = tempfile.mkdtemp()
     fake = _FakeStore([_trip()])
     fake.trips[0]["purpose"] = "会议 BEGIN:VEVENT 演练"
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     target = os.path.join(workdir, "trips.ics")
     code, out = _run("u1", target=target, ics=True)
     assert code == 0
@@ -241,7 +241,7 @@ def test_export_ics(monkeypatch):
     fake = _FakeStore(
         [_trip("上海"), _trip("杭州", "2026-12-09", "2026-12-10"), {"destination": "无日期"}]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
 
     code, out = _run("u1", ics=True)
     assert code == 0 and "iCalendar" in out
@@ -263,7 +263,7 @@ def test_export_query_filter(monkeypatch):
     import tempfile
 
     fake = _FakeStore([_trip("上海"), _trip("杭州", "2026-12-09", "2026-12-10")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "sh.csv")
     code, out = _run("u1", target=target, query="上海")
     assert code == 0
@@ -313,7 +313,7 @@ def test_main_dispatch_ics(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "trips-export", "u1", "--ics", "--force"]
     )
@@ -331,7 +331,7 @@ def test_main_dispatch(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "trips-export", "u1", "--force"]
     )
@@ -349,7 +349,7 @@ def test_export_html(monkeypatch):
 
     workdir = tempfile.mkdtemp()
     fake = _FakeStore([_trip(destination="<上海>")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     target = os.path.join(workdir, "trips.html")
     code, out = _run("u1", target=target, html=True)
     assert code == 0 and "（HTML）" in out
@@ -366,7 +366,7 @@ def test_main_dispatch_html_and_conflict(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _FakeStore([_trip()])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "trips-export", "u1", "--html", "--force"]
     )
@@ -392,7 +392,7 @@ def test_main_dispatch_query(monkeypatch):
     workdir = tempfile.mkdtemp()
     monkeypatch.chdir(workdir)
     fake = _FakeStore([_trip("上海"), _trip("杭州", "2026-12-09", "2026-12-10")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "trips-export", "u1", "--query", "上海"]
     )
@@ -426,7 +426,7 @@ def test_main_dispatch_status(monkeypatch):
             _trip("广州", _d(10), _d(11)),  # 即将出行
         ]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(workdir, "trips.csv")
     monkeypatch.setattr(
         sys,
@@ -463,7 +463,7 @@ def test_export_status_filter(monkeypatch):
             _trip("广州", _d(10), _d(11)),  # 即将出行
         ]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     target = os.path.join(tempfile.mkdtemp(), "trips.csv")
     code, out = _run("u1", target=target, status="upcoming")
     assert code == 0
@@ -484,7 +484,7 @@ def test_export_csv_warns_about_unimportable_rows(monkeypatch):
             _trip("杭州", "2026-12-05", "2026/12/20"),
         ]
     )
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     target = os.path.join(tempfile.mkdtemp(), "trips.csv")
     code, out = _run("u1", target=target)
     assert code == 0
@@ -506,7 +506,7 @@ def test_export_ics_stdout_reports_skipped(monkeypatch):
             return 1
 
     fake = _FakeStore([_trip(), {"destination": "无日期"}])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     sink = _BytesStdout()
     err = io.StringIO()
     real_stdout = sys.stdout
@@ -526,7 +526,7 @@ def test_export_ics_stdout_reports_skipped(monkeypatch):
 def test_export_stdout_strips_terminal_controls(monkeypatch):
     """--stdout 导出剥离终端控制序列（ESC / OSC 不送达终端）。"""
     fake = _FakeStore([_trip("上海\x1b]52;c;QUJD\x07")])
-    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a: fake)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
     code, out = _run("u1", to_stdout=True)
     assert code == 0
     assert "\x1b" not in out and "\x07" not in out

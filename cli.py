@@ -3823,7 +3823,11 @@ def _open_cli_store(user_id: str, allow_quarantined: bool = False):
     from context.long_term_memory import LongTermMemory
     from context.storage import create_long_term_memory
 
-    store = create_long_term_memory(user_id, str(default_data_root() / "memory"))
+    store = create_long_term_memory(
+        user_id,
+        str(default_data_root() / "memory"),
+        allow_quarantined=allow_quarantined,
+    )
     if STORAGE_CONFIG.get("postgres_dsn") and isinstance(store, LongTermMemory):
         close = getattr(store, "close", None)
         if callable(close):
