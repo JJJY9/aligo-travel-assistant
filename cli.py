@@ -3784,6 +3784,9 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
     try:
         if base.exists():
             return None
+        if base.with_name(base.name + ".deleted").exists():
+            # 账号数据已删除：遗留的隔离备份是孤儿
+            return None
         matches = sorted(base.parent.glob(base.name + ".corrupt-*"))
     except OSError:
         return None

@@ -447,31 +447,38 @@ def merged_backup_limit_problem(
     if isinstance(incoming_titles, dict):
         merged_titles.update(incoming_titles)
     existing_messages = list(existing.get("chat_history") or [])
-    payload = {
-        "chat_history": existing_messages
-        + _new_message_rows(existing_messages, sections.get("messages") or []),
-        "trip_history": _merged_trip_rows(
-            list(existing.get("trip_history") or []),
-            sections.get("trips") or [],
-        ),
-        "preferences": merged_prefs,
-        "knowledge": sections.get("knowledge") or [],
-        "session_titles": merged_titles,
-        "pinned_sessions": sorted(
-            {
-                str(item)
-                for item in list(existing.get("pinned_sessions") or [])
-                + list(sections.get("pinned") or [])
-            }
-        ),
-        "archived_sessions": sorted(
-            {
-                str(item)
-                for item in list(existing.get("archived_sessions") or [])
-                + list(sections.get("archived") or [])
-            }
-        ),
-    }
+    # 以现有快照为底（statistics / user_id / exported_at 等同样计入导出
+    # 体积），再覆盖为合并后的各段
+    payload = dict(existing)
+    payload.update(
+        {
+            "chat_history": existing_messages
+            + _new_message_rows(
+                existing_messages, sections.get("messages") or []
+            ),
+            "trip_history": _merged_trip_rows(
+                list(existing.get("trip_history") or []),
+                sections.get("trips") or [],
+            ),
+            "preferences": merged_prefs,
+            "knowledge": sections.get("knowledge") or [],
+            "session_titles": merged_titles,
+            "pinned_sessions": sorted(
+                {
+                    str(item)
+                    for item in list(existing.get("pinned_sessions") or [])
+                    + list(sections.get("pinned") or [])
+                }
+            ),
+            "archived_sessions": sorted(
+                {
+                    str(item)
+                    for item in list(existing.get("archived_sessions") or [])
+                    + list(sections.get("archived") or [])
+                }
+            ),
+        }
+    )
     return backup_limit_problem(payload)
 
 

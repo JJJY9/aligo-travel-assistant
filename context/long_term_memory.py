@@ -729,6 +729,9 @@ class LongTermMemory:
         with self._write_lock:
             try:
                 with file_lock(self.db_path):
+                    # 与 _locked_mutation 同口径的写前损坏复核：_corrupt_pending
+                    # 状态下补隔离备份，恢复入口不再因重载失败无法自愈
+                    self._ensure_corrupt_backed_up()
                     # 存在性检查放在锁内：并发恢复（另一进程 / 请求）在
                     # 检查与写入之间重建了主文件时，不能用本实例的隔离态
                     # 空快照把它覆盖——刷新到磁盘内容即可
@@ -746,6 +749,8 @@ class LongTermMemory:
                 raise MemoryPersistenceError(
                     f"长期记忆写锁等待超时：{exc}"
                 ) from exc
+            finally:
+                self._may_recreate = False
 
     @_locked_mutation
     def append_preference(self, pref_type: str, value: Any) -> Any:
@@ -1823,6 +1828,18 @@ class LongTermMemory:
         with self._write_lock:
             try:
                 with file_lock(self.db_path):
+                    # 删除墓碑先行：进程在「删主文件」与「写墓碑」之间被杀 /
+                    # 掉电时，其它存活实例仍能从墓碑得知账号已删除；墓碑
+                    # 创建失败时主文件尚未删除，按删除失败上报（安全）
+                    try:
+                        Path(f"{self.db_path}.deleted").touch(
+                            exist_ok=True
+                        )
+                    except OSError as exc:
+                        raise MemoryPersistenceError(
+                            "无法写入删除标记，未执行删除："
+                            f"{self.db_path}.deleted"
+                        ) from exc
                     try:
                         os.remove(self.db_path)
                         logger.warning(
@@ -1854,15 +1871,6 @@ class LongTermMemory:
                     self._corrupt_backup = None
                     self._may_recreate = False
                     self.data = self._init_data()
-                    # 删除标记：主文件已移除，其它存活实例（长会话 / 嵌入
-                    # 调用方）的下一次写入从空快照开始，不会把已删除的数据
-                    # 整份写回。备份删除失败也必须写——删除已不可逆
-                    try:
-                        Path(f"{self.db_path}.deleted").touch(
-                            exist_ok=True
-                        )
-                    except OSError:
-                        pass
                     if failed:
                         raise MemoryPersistenceError(
                             "删除长期记忆时无法移除备份文件："

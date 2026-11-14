@@ -2198,6 +2198,58 @@ def test_merged_trip_rows_mirror_storage_semantics():
     assert len(marked) == 1
     assert "trip_id" in marked[0] and "timestamp" in marked[0], marked[0]
     assert module._DROPPED_SESSION_KEY not in marked[0], marked[0]
+
+    # 与真实写入层对照：预演形状必须与 save_trip_histories 的落库结果一致
+    # （身份匹配字段、purpose / session_id 覆盖、新行补写字段）
+    from context.long_term_memory import LongTermMemory as _LTM
+
+    storage_dir = tempfile.mkdtemp(prefix="chailv_merge_parity_")
+    real_store = _LTM("u-merge-parity", storage_dir)
+    real_store.save_trip_histories(
+        [
+            {
+                "origin": "上海",
+                "destination": "杭州",
+                "start_date": "2026-03-01",
+                "purpose": "旧目的",
+                "session_id": "s-old",
+            }
+        ]
+    )
+    incoming = [
+        {
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-03-01",
+            "purpose": "新目的",
+            "session_id": "s-new",
+        },
+        {"origin": "北京", "destination": "无日期"},
+        {"origin": "北京", "destination": "无日期"},
+    ]
+    preview = module._merged_trip_rows(
+        real_store.get_trip_history(limit=None), incoming
+    )
+    real_store.save_trip_histories(incoming)
+    stored = real_store.get_trip_history(limit=None)
+    assert len(preview) == len(stored), (preview, stored)
+    by_key = {
+        (
+            row.get("destination"),
+            row.get("start_date"),
+            row.get("purpose"),
+        )
+        for row in stored
+    }
+    preview_keys = {
+        (
+            row.get("destination"),
+            row.get("start_date"),
+            row.get("purpose"),
+        )
+        for row in preview
+    }
+    assert preview_keys == by_key, (preview_keys, by_key)
     print("✓ 合并预演与存储层的行程索引 / 更新语义一致（含补写字段）")
 
 
@@ -2227,6 +2279,33 @@ def test_import_without_user_data_recreates_quarantined_main():
     fresh = LongTermMemory("u-recover-empty", storage_dir)
     assert fresh.get_recovered_corrupt_backup() is None
     print("✓ 无用户数据的恢复重建隔离主文件")
+
+
+def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
+    """合并体积复核以现有快照为底：statistics 等额外字段同样计入
+    （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""
+    from utils import user_import as module
+
+    class _Store:
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {"frequent_destinations": {"x" * 1000: 1}},
+                "user_id": "u1",
+                "exported_at": "2026-01-01T00:00:00",
+            }
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 600)
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"preferences": {}, "trips": [], "messages": []}
+    )
+    assert problem and "超过导入上限" in problem, problem
+    print("✓ 合并复核计入现有快照的额外字段")
 
 
 def test_preview_counts_identityless_trips_as_created():
@@ -2304,29 +2383,43 @@ def test_import_knowledge_error_redacts_paths(monkeypatch):
     print("✓ 知识片段恢复错误脱敏（路径 / URL）")
 
 if __name__ == "__main__":
-    # 直跑模式自动发现全部用例（monkeypatch / tmp_path 由这里提供）：
-    # 硬编码清单会漏登记新增回归，直跑仍打印「全部通过」
+    # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
+    # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
+    # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import inspect
     import pathlib
     import tempfile
 
     ran = 0
+    skipped = 0
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
-        if any(param not in ("monkeypatch", "tmp_path") for param in params):
-            continue
         fixture = None
         kwargs: dict = {}
-        if "monkeypatch" in params:
-            fixture = pytest.MonkeyPatch()
-            kwargs["monkeypatch"] = fixture
-        if "tmp_path" in params:
-            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+            elif param == "caplog" and spec.default is None:
+                kwargs[param] = None
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            continue
         try:
             func(**kwargs)
             ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
         finally:
             if fixture is not None:
                 fixture.undo()
@@ -2337,5 +2430,5 @@ if __name__ == "__main__":
     )
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
-        "其余需 pytest 专用夹具，由 pytest 运行）"
+        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
     )
