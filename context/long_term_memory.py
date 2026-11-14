@@ -198,6 +198,9 @@ class LongTermMemory:
         # 的隔离备份」都不放行写回——先打开的长会话（Web 缓存会话 /
         # CLI 交互）不能把隔离掩盖成正常写入
         self._may_recreate = False
+        # 本实例「当场检测到损坏」（区别于载入时发现的历史遗留备份）：
+        # 上层守卫在 PostgreSQL 故障回退 JSON 时也只认这一类
+        self._fresh_quarantine = False
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -253,6 +256,7 @@ class LongTermMemory:
                                 try:
                                     os.replace(self.db_path, backup)
                                     self._corrupt_backup = backup
+                                    self._fresh_quarantine = True
                                     logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 except OSError as backup_error:
                                     # 文件可能仍被其它进程持有：先以空快照启动，
@@ -355,6 +359,7 @@ class LongTermMemory:
                 ) from exc
             self._corrupt_backup = backup
             self._may_recreate = True
+            self._fresh_quarantine = True
             logger.warning("损坏的记忆文件已补备份到 %s", backup)
         self._corrupt_pending = False
 
@@ -1111,6 +1116,18 @@ class LongTermMemory:
             if isinstance(message, dict) and message.get("session_id")
         }
         return {"messages": len(messages), "sessions": sessions}
+
+    def get_fresh_quarantine_backup(self) -> str | None:
+        """本实例当场隔离（或写前复核补备份）的损坏文件路径。
+
+        载入时仅「发现历史遗留 .corrupt-*」不算——那可能是其它后端
+        （PostgreSQL 故障回退期间）留下的孤儿。
+        """
+        return self._corrupt_backup if self._fresh_quarantine else None
+
+    def has_pending_corrupt_quarantine(self) -> bool:
+        """检测到损坏但隔离改名 / 等锁失败（备份尚未完成）的状态。"""
+        return bool(self._corrupt_pending)
 
     def get_recovered_corrupt_backup(self) -> str | None:
         """本次实例启动时被隔离的损坏记忆文件路径（无损坏为 None）。"""

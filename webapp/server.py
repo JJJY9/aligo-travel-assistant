@@ -1422,6 +1422,7 @@ class AligoWebApp:
         # 互不覆盖，也不会因为别人关闭同名会话而丢掉自己在进程内的短期记忆
         key = self._session_key(user_id, session_id)
         evicted: list[_WebSession] = []
+        quarantine_stale: _WebSession | None = None
         session: _WebSession | None = None
         with self._sessions_lock:
             session = self.sessions.get(key)
@@ -1430,15 +1431,19 @@ class AligoWebApp:
                     user_id, _session_long_term(session)
                 ):
                     # 会话缓存期间账号被隔离：驱逐缓存，走下面新建路径由
-                    # 构造守卫返回带恢复引导的 503（不再先白跑整轮 LLM）
+                    # 构造守卫返回带恢复引导的 503（不再先白跑整轮 LLM）。
+                    # 构造必然抛错，evicted 的延迟关闭不可达——在锁外立即关闭
                     self.sessions.pop(key, None)
-                    evicted.append(session)
+                    quarantine_stale = session
                     session = None
                 else:
                     self.sessions.move_to_end(key)
                     if mark_in_use:
                         session.begin_turn()
                     self._evict_over_limit_locked(key, evicted)
+        if quarantine_stale is not None:
+            # 隔离账号的缓存会话：先关闭再走构造守卫（必然 503）
+            quarantine_stale.close()
         if session is None:
             # 构造前预检：_WebSession 构造会打开一条 PostgreSQL 连接并跑建表
             # DDL，全部槽位都在用时不该为注定 503 的请求白付这部分代价。
@@ -2225,11 +2230,23 @@ def _session_long_term(session: Any) -> Any:
 def _quarantine_marker_for(user_id: str, long_term: Any) -> str | None:
     """会话构造 / 打开 / 缓存命中三处共用的隔离标记探测。
 
-    只在「JSON 后端且未配置 PostgreSQL」时生效：PG 配置但故障冷却时工厂
-    会回退 JSON，遗留的 .corrupt-* 与该账号无关，不能因此拦截（数据库
-    恢复后切回 PG）。
+    分两类：
+    - 本实例当场检测到损坏 / 待复核（fresh / pending）：任何后端配置下
+      都拦截——PG 故障回退 JSON 时同样需要 503，而不是先按空账号返回；
+    - 载入时发现的历史遗留 .corrupt-*：只在「JSON 后端且未配置
+      PostgreSQL」时拦截（PG 恢复后切回 PG，遗留文件是孤儿）。
     """
     try:
+        fresh_getter = getattr(long_term, "get_fresh_quarantine_backup", None)
+        if callable(fresh_getter):
+            fresh = fresh_getter()
+            if fresh:
+                return str(fresh)
+        pending_getter = getattr(
+            long_term, "has_pending_corrupt_quarantine", None
+        )
+        if callable(pending_getter) and pending_getter():
+            return "隔离改名尚未完成（待复核）"
         from config import STORAGE_CONFIG
 
         if STORAGE_CONFIG.get("postgres_dsn"):
@@ -2342,20 +2359,29 @@ def _redact_doctor_detail(text: str) -> str:
 _QUARANTINE_MESSAGE_PREFIXES = (
     "记忆文件损坏并已隔离",
     "记忆主文件缺失且存在损坏隔离备份",
+)
+_DAMAGE_MESSAGE_PREFIXES = (
     "长期记忆重载失败",
     "记忆文件损坏且无法备份",
 )
 
 
 def _persistence_failure_detail(exc: Exception, request_id: str) -> str:
-    """隔离 / 损坏类持久化失败保留可执行提示（恢复引导），其余用通用文案。
+    """隔离 / 损坏类持久化失败保留可执行提示，其余用通用文案。
 
     按消息前缀判定而不是「含『隔离』」子串：路径里的「隔离」目录等
-    普通错误不能被误报成记忆损坏。"""
-    if str(exc).startswith(_QUARANTINE_MESSAGE_PREFIXES):
+    普通错误不能被误报成记忆损坏；「重载失败 / 无法备份」并没有隔离
+    备份可供恢复，不能引导用户去找不存在的备份文件。"""
+    text = str(exc)
+    if text.startswith(_QUARANTINE_MESSAGE_PREFIXES):
         return (
             "记忆文件损坏并已隔离备份（路径见服务端日志），"
             "请使用备份文件恢复后重试"
+            f"（请求 ID：{request_id}）"
+        )
+    if text.startswith(_DAMAGE_MESSAGE_PREFIXES):
+        return (
+            "记忆数据损坏且未能隔离备份，请稍后再试或联系维护"
             f"（请求 ID：{request_id}）"
         )
     return f"存储暂时不可用，请稍后再试（请求 ID：{request_id}）"
@@ -5898,7 +5924,10 @@ def create_app(model: Any = None) -> FastAPI:
                 except MemoryPersistenceError as exc:
                     logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                     raise HTTPException(
-                        status_code=503, detail="存储暂时不可用，请稍后重试"
+                        status_code=503,
+                        detail=_persistence_failure_detail(
+                            exc, _request_id(request)
+                        ),
                     ) from exc
                 except Exception as exc:  # noqa: BLE001 - 写入失败统一可重试提示
                     # 恢复可能部分成功（按条目写入）：详情只写日志，避免把

@@ -353,7 +353,7 @@ class AligoCLI:
             )
             # 交互模式不走 _open_cli_store：这里补同口径隔离守卫，
             # 否则会在隔离后的空快照上继续写、重建主文件让隔离备份不可见
-            quarantined = _recovered_corrupt_backup(
+            quarantined = _interactive_quarantine_marker(
                 self.memory_manager.long_term
             )
             if quarantined:
@@ -3801,6 +3801,29 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
     except OSError:
         return None
     return str(matches[-1]) if matches else None
+
+
+def _interactive_quarantine_marker(store: Any) -> str | None:
+    """交互模式的隔离标记：fresh / pending 无条件拦截；历史遗留备份仅在
+    未配置 PostgreSQL 时拦截（PG 故障回退 JSON 的遗留 .corrupt-* 是孤儿）。"""
+    from config import STORAGE_CONFIG
+
+    try:
+        fresh_getter = getattr(store, "get_fresh_quarantine_backup", None)
+        if callable(fresh_getter):
+            fresh = fresh_getter()
+            if fresh:
+                return str(fresh)
+        pending_getter = getattr(
+            store, "has_pending_corrupt_quarantine", None
+        )
+        if callable(pending_getter) and pending_getter():
+            return "隔离改名尚未完成（待复核）"
+    except Exception:  # noqa: BLE001 - 探测失败不阻断启动
+        pass
+    if STORAGE_CONFIG.get("postgres_dsn"):
+        return None
+    return _recovered_corrupt_backup(store)
 
 
 class _QuarantinedMemoryError(RuntimeError):

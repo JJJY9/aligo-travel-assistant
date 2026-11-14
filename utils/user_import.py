@@ -447,9 +447,12 @@ def merged_backup_limit_problem(
     if isinstance(incoming_titles, dict):
         merged_titles.update(incoming_titles)
     existing_messages = list(existing.get("chat_history") or [])
-    # 以现有快照为底，再覆盖为合并后的各段。注意真实导出端还会在
-    # export_snapshot 之外补 user_id / exported_at（此处不计，量级可忽略）
+    # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
+    # export_snapshot 之外补 user_id / exported_at——这里放等长占位，
+    # 体积口径与导出端一致
     payload = dict(existing)
+    payload.setdefault("user_id", "merged-limit-preview")
+    payload.setdefault("exported_at", "1970-01-01T00:00:00")
     payload.update(
         {
             "chat_history": existing_messages
@@ -500,8 +503,18 @@ def merged_backup_limit_problem(
             continue
         key = str(destination)
         frequent[key] = frequent.get(key, 0) + 1
-    if frequent:
-        statistics["frequent_destinations"] = frequent
+    existing_frequent = statistics.get("frequent_destinations")
+    merged_frequent: dict[str, int] = {}
+    if isinstance(existing_frequent, dict):
+        for key, value in existing_frequent.items():
+            try:
+                merged_frequent[str(key)] = int(value or 0)
+            except (TypeError, ValueError):
+                merged_frequent[str(key)] = 0
+    for key, value in frequent.items():
+        merged_frequent[key] = max(merged_frequent.get(key, 0), value)
+    if merged_frequent:
+        statistics["frequent_destinations"] = merged_frequent
     else:
         statistics.pop("frequent_destinations", None)
     payload["statistics"] = statistics
@@ -580,6 +593,10 @@ def _merged_trip_rows(
         record.pop(_DROPPED_SESSION_KEY, None)
         record.setdefault("trip_id", "trip_0")
         record.setdefault("timestamp", datetime.now().isoformat())
+        # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也序列化），
+        # 按较宽形状估算体积（偏向保守）
+        record.setdefault("purpose", None)
+        record.setdefault("session_id", None)
         created.append(record)
     return base + created
 
