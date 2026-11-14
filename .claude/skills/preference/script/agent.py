@@ -273,6 +273,9 @@ _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 _PAREN_EXAMPLE = frozenset(
     {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
 )
+_PAREN_EXAMPLE_OUTER = frozenset(
+    {"结果", "正式结果", "最终结果", "结果如下", "提取结果", "偏好", "输出结果"}
+)
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -282,6 +285,18 @@ def _paren_example_marker(line: str) -> bool:
     内容精确命中示例短语——「按照（示例）格式，结果如下：」不算示例。"""
     outside = _PAREN_GROUP_RE.sub("", line)
     if any(ch in outside for ch in "，。；、！？,;!?…"):
+        return False
+    outside_clean = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", outside)
+    changed = True
+    while changed:
+        changed = False
+        for lead in _LEAD_INS:
+            if outside_clean.startswith(lead) and len(outside_clean) > len(lead):
+                outside_clean = outside_clean[len(lead):]
+                changed = True
+                break
+    if outside_clean and outside_clean not in _PAREN_EXAMPLE_OUTER:
+        # 括号外还有叙述性文字（「按照（示例）格式如下：」）：不是短标签
         return False
     for group in _PAREN_GROUP_RE.findall(line):
         content = re.sub(r"[#*`【】\[\]（）>\-•\s:：=]", "", group[1:-1])
@@ -387,6 +402,9 @@ def _is_result_phrase(phrase: str) -> bool:
         if stripped.endswith(suffix) and len(stripped) > len(suffix):
             stripped = stripped[: -len(suffix)]
             break
+    if stripped in _RESULT_LABELS:
+        # 「输出结果如下 / 本次输出结果如下」：去后缀后回到白名单
+        return True
     if any(
         word in stripped
         for word in ("返回", "输出", "若无", "如果", "若", "请", "需")
@@ -453,7 +471,7 @@ def _select_preference_result(text: str) -> dict | None:
     """
     spans: list[tuple[int, int]] = []
     objects: list[tuple[int, int, dict, bool]] = []
-    unparsable_keyed: list[int] = []
+    unparsable_keyed: list[tuple[int, bool]] = []
     failed_tail = False
     last_end = -1
     prev_end = 0
@@ -473,9 +491,9 @@ def _select_preference_result(text: str) -> dict | None:
             objects.append((start, end, normalized, label_example))
             failed_tail = False
         elif _looks_result_keyed(value):
-            # 形如结果却解析不了（preferences 是非法字符串等）：记录位置，
-            # 选择时不回退到它之前的回显示例
-            unparsable_keyed.append(start)
+            # 形如结果却解析不了（preferences 是非法字符串等）：记录位置
+            # 与示例标记，选择时不回退到它之前的回显示例（示例标签的除外）
+            unparsable_keyed.append((start, label_example))
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     arrays: list[tuple[int, int, list, bool]] = []
@@ -483,18 +501,24 @@ def _select_preference_result(text: str) -> dict | None:
         if any(span_start <= start < span_end for span_start, span_end in spans):
             continue
         arrays.append((start, end, items, _is_example_label(text[:start])))
-    # 示例数组内的元素对象继承示例标记（数组换行书写时元素前的标签段
-    # 只剩「, 」之类的分隔符）
-    example_spans = [(s, e) for s, e, _items, ex in arrays if ex]
-    if example_spans:
+    # 数组内的元素对象不单独参与竞争：数组本身携带完整元素列表（数组
+    # 起点必然早于元素，按位置比较元素会永远压倒数组、只留下最后一个
+    # 元素）；示例数组的元素继承示例标记
+    array_spans = [(s, e) for s, e, _items, _ex in arrays]
+    if array_spans:
         objects = [
             (
                 s,
                 e,
                 obj,
-                flag or any(es <= s < ee for es, ee in example_spans),
+                flag or any(es <= s < ee for es, ee in array_spans),
             )
             for (s, e, obj, flag) in objects
+        ]
+        objects = [
+            item
+            for item in objects
+            if not any(s < item[0] < e for s, e in array_spans)
         ]
     # 回显示例候选（「示例：」前缀）不参与竞争：只剩示例时宁可报错
     # （reply 侧按解析失败返回），也不把示例偏好当成真实结果写库
@@ -525,7 +549,9 @@ def _select_preference_result(text: str) -> dict | None:
     if chosen is None:
         return None
     result, result_start, result_end = chosen
-    if any(start > result_start for start in unparsable_keyed):
+    if any(
+        start > result_start for start, is_example in unparsable_keyed if not is_example
+    ):
         # 正式结果（形如偏好结果的对象）解析失败：报错而不是把更早的
         # 回显示例写进长期记忆
         raise ValueError("模型输出中的偏好结果无法解析，拒绝回退到更早的候选")
