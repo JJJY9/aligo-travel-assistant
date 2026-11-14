@@ -135,8 +135,10 @@ def _canonical_timestamp(value: Any) -> str | None:
 
     PostgreSQL 回读的时间戳带连接会话时区偏移（``10:00+08:00``）：换算成
     同一时刻的本地 naive 串后，Redis 实时副本 / 回填副本 / 影子缓存的
-    时间戳逐字节一致——内容指纹（角色+内容+原始时间戳）才能跨来源命中，
-    升级前写入 seen 集合的旧指纹同样能继续匹配。"""
+    时间戳逐字节一致——内容指纹（角色+内容+原始时间戳）才能跨来源命中。
+    升级前以 naive 串写入 seen 集合的旧指纹继续匹配；升级前经 PG 回填
+    写入的 aware 串指纹（若有）在消息 TTL 窗口内不会命中，属一次性的
+    发布过渡影响。"""
     if not isinstance(value, str) or not value.strip():
         return None
     parsed = parse_iso_datetime(value)

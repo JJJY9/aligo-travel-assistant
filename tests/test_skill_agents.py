@@ -2024,6 +2024,40 @@ def test_preference_prose_example_empty_array_keeps_real_result():
     print("✓ 偏好：说明散文中的示例空数组不顶掉真实偏好")
 
 
+def test_preference_multiline_instruction_empty_array_keeps_real_result():
+    """说明 / 指令折行、[] 独占一行、或以句号 / 逗号续写时都不是正式
+    空结果：真实偏好保留。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    for tail in (
+        "\n说明：若无新偏好，返回：\n[]\n即可。",
+        "\n返回：[]。",
+        "\n说明：若无新偏好返回 []，不要返回示例。",
+        "\n（若本轮没有新偏好，返回：[]。）",
+    ):
+        data = _pref_reply(formal + tail)
+        assert data.get("has_preferences") is True, (tail, data)
+        assert data["preferences"] == [
+            {"type": "home_location", "value": "上海"}
+        ], (tail, data)
+    print("✓ 偏好：折行 / 句号 / 逗号续写的示例空数组不顶掉真实偏好")
+
+
+def test_preference_fenced_formal_empty_array_beats_example():
+    """围栏输出里的正式空结果仍按位置胜出：示例偏好不能写库。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    payload = f"示例：{example}\n正式结果：\n```json\n[]\n```\n（本轮没有新的偏好）"
+    data = _pref_reply(payload)
+    assert data.get("has_preferences") is False, data
+    assert "上海浦东新区" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：围栏正式空结果压过示例")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2139,6 +2173,34 @@ def test_event_collection_uncounted_empty_terminal_after_example():
     print("✓ 事项收集：示例后的无计数 missing_info 终稿压过示例")
 
 
+def test_event_collection_fenced_example_label_and_terminal():
+    """围栏输出（```json 包住示例与终稿）下「示例：」标签仍生效：
+    回显示例不能当真实提取，后置的缺失声明终稿按位置胜出。"""
+    payload = (
+        '示例：\n```json\n{"origin": "北京", "destination": "北京", '
+        '"start_date": "2026-02-27", "extracted_count": 7}\n```\n'
+        '未提供出行信息：\n```json\n{"missing_info": ["出发地", "目的地"]}\n```'
+    )
+    data = _event_reply(payload)
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：围栏示例标签生效，终稿压过示例")
+
+
+def test_event_collection_prose_mentioning_example_keeps_real_result():
+    """普通叙述里提到「示例」不改变真实提取的身份：后置的『尾注：』
+    局部缺失项仍不顶掉完整提取。"""
+    payload = (
+        '按照示例格式，提取结果如下：\n'
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"end_date": "2026-12-03", "extracted_count": 6}\n'
+        '尾注：{"missing_info": ["返程地"]}'
+    )
+    data = _event_reply(payload)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：叙述中的「示例」字样不降级真实提取")
+
+
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
@@ -2212,6 +2274,44 @@ def test_plan_trip_formal_bare_result_survives_later_supplement_tail():
     assert data.get("error") is None, data
     assert data["itinerary"]["title"] == "杭州出差", data
     print("✓ 行程规划：正式裸行程不被后置补充尾注替换")
+
+
+def test_plan_trip_wrapped_supplement_tail_yields_to_full_plan():
+    """带 itinerary 包装的「补充：」尾注同样让位于更早的完整行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    for tail in (
+        '补充：{"itinerary": {"title": "注意事项", "duration": "1天"}}',
+        '备注：{"itinerary": {"title": "注意事项", "daily_plans": []}}',
+        '注意：{"title": "注意事项", "duration": "2天"}',
+    ):
+        data = _plan_trip_reply(f"{full}\n{tail}")
+        assert data["itinerary"]["title"] == "杭州出差", (tail, data)
+    print("✓ 行程规划：包装形式的补充尾注让位于完整行程")
+
+
+def test_plan_trip_same_line_fence_label_yields_to_full_plan():
+    """「补充：```json」同行围栏不遮挡补充标签：尾注让位于完整行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    tail = '补充：```json\n{"title": "注意事项", "duration": "2天"}\n```'
+    data = _plan_trip_reply(f"{full}\n{tail}")
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：同行围栏后的补充尾注不顶掉完整行程")
+
+
+def test_plan_trip_prose_example_then_real_full_keeps_real():
+    """真实完整行程前的普通叙述即使提到「示例」也不影响其身份：
+    后置补充尾注让位，真实行程保留。"""
+    payload = (
+        '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}\n'
+        '按照示例格式，真实行程如下：\n'
+        '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}, {"day": 2}]}}\n'
+        '补充：{"title": "注意事项", "duration": "1天"}'
+    )
+    data = _plan_trip_reply(payload)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    assert len(data["itinerary"]["daily_plans"]) == 2, data
+    print("✓ 行程规划：叙述中的「示例」字样不降级真实行程")
 
 
 def test_plan_trip_empty_daily_plans_shell_does_not_displace_full_plan():

@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 
 from agentscope.agent import AgentBase
@@ -244,30 +245,34 @@ def _looks_result_keyed(value: dict) -> bool:
     return "preferences" in value or "has_preferences" in value
 
 
+# 正式空结果前的标签只认「整行就是结果标签」（正式结果：/结果：）：
+# 说明 / 指令散文里的示例 []（「返回：[] 即可」「例如 []」「- [ ]」、
+# 围栏外的输出格式示例）都不能顶掉正式偏好结果。
+_RESULT_LABEL_RE = re.compile(
+    r"^[-*•]?\s*(正式结果|正式|结果|结论|偏好|输出|最终结果|最终输出|最终)"
+    r"\s*[:：=]\s*$"
+)
+
+
 def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
-    """空数组只有「前面是冒号 / 等号 / 括号（或位于文本开头）」才算正式的
-    空结果（``正式结果：[]``）；散文里的 ``[]``（Markdown 待办 ``- [ ]``、
-    ``例如 []``）不能顶掉正式偏好结果。
+    """空数组是本轮正式空结果吗？
 
-    正式空结果之后的说明散文（「（本轮没有新的偏好）」「。」）是常见
-    形态，此前还要求数组必须是文本最后一个值且后面没有任何文本，模型
-    补一句说明就会让选择逻辑回退到更早的回显示例。位置先后仍由调用方
-    按候选起止比较。
-
-    同一行内紧跟普通文字的空数组是指令 / 说明里的示例（``返回：[] 即可``、
-    ``{无偏好时输出：[]}``），不是本轮正式结果：行尾允许闭合标点、括号
-    说明或标点连接词，出现其它内容（含闭合括号 / 花括号）即判非正式。"""
-    prefix = text[:start].rstrip()
-    if prefix and prefix[-1] not in ":：=>（(":
-        return False
-    line_tail = text[end:].split("\n", 1)[0].strip()
-    if line_tail:
-        first = line_tail[0]
-        if first in "）)】」}":
-            return False
-        if first not in "，,。.；;、！!？?…（(—-":
-            return False
-    return True
+    只认两种形态：整个输出就是这个数组，或数组所在行之前最后一个非空、
+    非围栏行本身就是结果标签（``正式结果：[]`` / ``结果：[]``）。标签行
+    里混入任何其它文字（条件说明、指令、「返回：」等）即判为示例，避免
+    说明散文里的 ``[]`` 按位置顶掉已解析的真实偏好。正式空结果之后的
+    说明散文（换行括号注释 / 句号）不影响判定。"""
+    prefix = text[:start]
+    if not prefix.strip():
+        return True
+    label = ""
+    for item in prefix.splitlines():
+        cleaned = re.sub(r"```+\w*\s*$", "", item).strip()
+        if cleaned:
+            label = cleaned
+    if not label:
+        return True
+    return bool(_RESULT_LABEL_RE.match(label))
 
 
 def _select_preference_result(text: str) -> dict | None:

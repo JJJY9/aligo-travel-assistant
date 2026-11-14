@@ -98,59 +98,37 @@ def _is_explicit_empty(obj: dict) -> bool:
     )
 
 
-def _is_counted_empty(obj: dict) -> bool:
-    """带计数（extracted_count == 0）的显式空结果。"""
-    count = obj.get("extracted_count")
-    return isinstance(count, int) and not isinstance(count, bool) and count == 0
-
-
-def _has_full_event_schema(obj: dict) -> bool:
-    """结果对象是否带完整字段表（所有核心字段键都存在，值可为 null）。
-
-    prompt 要求「对应字段设为 null」，模型按此输出的「信息不足」终稿
-    带全套字段且 missing_info 非空——与本轮结果同形，是最终表态，不是
-    补充说明。
-    """
-    return all(key in obj for key in _CORE_FIELDS)
-
-
-def _is_authoritative_empty(obj: dict) -> bool:
-    """形状上可确定「本轮最终表态：没有提取到信息」的空结果。
-
-    两类：带计数（extracted_count == 0），或字段表完整、没有任何核心字段
-    有值且声明了缺失信息（全 null 终稿）。只含 summary / 局部缺失项的
-    missing_info 尾注不在其列——形状相同的「信息不足终稿」再由候选前的
-    标签与位置区分（见 _select_event_result）。
-    """
-    if _is_counted_empty(obj):
-        return True
-    return (
-        _has_full_event_schema(obj)
-        and _plan_score(obj) == 0
-        and _is_explicit_empty(obj)
-    )
-
-
-# 候选对象前的文本标签：示例（回显的 prompt 示例）、补充说明（尾注）、
-# 正式结果。形状相同的 missing_info 对象既可能是本轮「信息不足」终稿、
-# 也可能是附在结果后的尾注，标签与位置共同决定它能否否决更早的实质候选。
-_EVENT_EXAMPLE_LABELS = ("示例", "例如", "样例")
-_EVENT_SUPPLEMENT_LABELS = ("尾注", "补充", "备注", "附注")
-_EVENT_FORMAL_LABELS = ("正式", "结果", "最终", "输出", "结论")
+# 候选对象前的标签：只有「整行就是一个短标签」才参与判定（示例：/尾注：），
+# 叙述句里偶然出现「示例」「补充」不算。形状相同的 missing_info 对象既可能
+# 是本轮「信息不足」终稿、也可能是附在结果后的尾注，标签与位置共同决定它
+# 能否否决更早的实质候选。
+_EVENT_EXAMPLE_LABEL_RE = re.compile(
+    r"^(示例|例如|样例)(输出|结果|内容|格式)?\s*[:：]?\s*$"
+)
+_EVENT_SUPPLEMENT_LABEL_RE = re.compile(
+    r"^(补充|尾注|备注|附注|提示|注意|说明|须知)"
+    r"(说明|信息|内容|事项|结果|行程|安排)?\s*[:：]?\s*$"
+)
 
 
 def _event_label_kind(label: str) -> str:
-    """候选对象前的标签：example / supplement / formal / neutral。"""
-    lines = [item.strip() for item in label.splitlines() if item.strip()]
+    """候选对象前的标签：example（回显示例）/ supplement（补充尾注）/ neutral。
+
+    先剔除 Markdown 围栏（对象常被 ```json 包住，标签与对象之间隔着
+    围栏行），再要求最后一个非空行本身就是一个短标签。
+    """
+    lines = []
+    for item in label.splitlines():
+        cleaned = re.sub(r"```+\w*\s*$", "", item).strip()
+        if cleaned:
+            lines.append(cleaned)
     if not lines:
         return "neutral"
     line = lines[-1]
-    if any(marker in line for marker in _EVENT_EXAMPLE_LABELS):
+    if _EVENT_EXAMPLE_LABEL_RE.match(line):
         return "example"
-    if any(marker in line for marker in _EVENT_SUPPLEMENT_LABELS):
+    if _EVENT_SUPPLEMENT_LABEL_RE.match(line):
         return "supplement"
-    if any(marker in line for marker in _EVENT_FORMAL_LABELS):
-        return "formal"
     return "neutral"
 
 
@@ -217,8 +195,7 @@ def _select_event_result(text: str) -> dict | None:
     substantive_kind = "neutral"
     explicit_empty: dict | None = None
     explicit_empty_end = -1
-    authoritative_empty: dict | None = None
-    authoritative_end = -1
+    explicit_empty_kind = "neutral"
     failed_tail = False
     prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
@@ -236,25 +213,23 @@ def _select_event_result(text: str) -> dict | None:
         if _plan_score(candidate) > 0:
             substantive, substantive_end, substantive_kind = candidate, end, label_kind
         elif _is_explicit_empty(candidate):
-            explicit_empty, explicit_empty_end = candidate, end
-            if (
-                _is_authoritative_empty(candidate)
-                or label_kind == "formal"
-                # 更早的实质候选是回显的 prompt 示例：本轮没有真实提取，
-                # 后置的 missing_info 终稿（无论自身标签）都要保护用户
-                # ——绝不能让示例字段被当成真实提取写入 trip_history
-                or substantive_kind == "example"
-            ):
-                authoritative_empty, authoritative_end = candidate, end
+            explicit_empty, explicit_empty_end, explicit_empty_kind = (
+                candidate,
+                end,
+                label_kind,
+            )
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
-    if substantive is not None and authoritative_empty is not None:
-        # 按位置取后者：回显示例（实质字段俱全）之后又输出本轮终稿
-        # 「没有提取到信息」（带计数 / 全 null 字段表 / 正式标签 / 示例之后
-        # 的缺失声明）时，终稿是对本轮的最终表态；附在真实结果之后的
-        # 局部 missing_info 尾注只是补充说明，不能顶掉完整提取
-        if authoritative_end > substantive_end:
-            chosen, chosen_end = authoritative_empty, authoritative_end
+    if substantive is not None and explicit_empty is not None:
+        if explicit_empty_end > substantive_end:
+            # 后置的显式空结果按位置胜出——除非它是带「尾注：/补充：」标签
+            # 的局部说明且更早的实质候选不是回显示例：真实提取保留。形状
+            # 相同（计数有无、字段表是否完整）不再参与判定，避免示例回显
+            # 与「信息不足」终稿在不同变体下反复互相顶掉
+            if explicit_empty_kind == "supplement" and substantive_kind != "example":
+                chosen, chosen_end = substantive, substantive_end
+            else:
+                chosen, chosen_end = explicit_empty, explicit_empty_end
         else:
             chosen, chosen_end = substantive, substantive_end
     elif substantive is not None:

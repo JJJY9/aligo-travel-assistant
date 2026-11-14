@@ -3739,7 +3739,7 @@ def test_import_strict_open_and_failure_mappings(monkeypatch):
     assert "存储暂时不可用" in response.json()["detail"]
     assert strict_flags == [True], "恢复必须 strict 打开（不写回退 JSON）"
 
-    def boom_open(target_user, strict=False):
+    def boom_open(target_user, strict=False, allow_quarantined=False):
         raise RuntimeError("unexpected")
 
     monkeypatch.setattr(server_module, "_open_long_term", boom_open)
@@ -4342,7 +4342,7 @@ def test_trip_calendar_storage_failure_maps_503(monkeypatch):
 
     seen_strict = {"value": None}
 
-    def _open(user_id, strict=False):
+    def _open(user_id, strict=False, **kwargs):
         seen_strict["value"] = strict
         return _BrokenStore()
 
@@ -5847,7 +5847,7 @@ def test_delete_endpoints_preserve_http_exception_semantics(monkeypatch):
 
     from webapp import server as server_module
 
-    def _quarantined(user_id, strict=False):
+    def _quarantined(user_id, strict=False, **kwargs):
         raise _HTTPException(
             status_code=503,
             detail="记忆文件损坏并已隔离备份（路径见服务端日志），请使用备份文件恢复后重试",
@@ -6436,7 +6436,7 @@ def test_trip_export_uses_strict_store(monkeypatch):
         def close(self):
             pass
 
-    def fake_open(user_id, strict=False):
+    def fake_open(user_id, strict=False, **kwargs):
         captured.append((user_id, strict))
         return _Store()
 
