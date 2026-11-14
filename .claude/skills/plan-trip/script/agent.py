@@ -154,6 +154,10 @@ def _label_phrase(label: str) -> str | None:
         if stripped == cleaned_line:
             break
         cleaned_line = stripped
+    for group in _PAREN_GROUP_RE.findall(line):
+        if re.search(r"示例|例如|样例", group):
+            # 「结果（示例）：」「正式结果（例如）：」：括号里自称示例
+            return "示例"
     if not re.sub(r"[:：=\s]", "", cleaned_line):
         # 整行就是括号里的标签（「（尾注）：」「(示例)：」）：取括号内容
         match = _PAREN_GROUP_RE.search(line)
@@ -182,12 +186,21 @@ def _label_phrase(label: str) -> str | None:
     return phrase
 
 
+_SENTENCE_PUNCT = "，。；、！？,;!?…"
+
+
 def _label_kind(label: str) -> str:
-    """候选对象前的标签：example / supplement / formal / neutral。"""
+    """候选对象前的标签：example / supplement / formal / neutral。
+
+    示例标签要求短短语：含句子标点的叙述句（「示例中的日期只是占位，
+    真实结果如下」）不算示例，避免把其后的真实终稿误判为回显。"""
     phrase = _label_phrase(label)
     if not phrase:
         return "neutral"
-    if phrase.startswith(("示例", "例如", "样例")) or phrase in _EXAMPLE_LABELS:
+    if not any(ch in phrase for ch in _SENTENCE_PUNCT) and (
+        phrase in _EXAMPLE_LABELS
+        or (len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例")))
+    ):
         return "example"
     if phrase in _SUPPLEMENT_LABELS:
         return "supplement"

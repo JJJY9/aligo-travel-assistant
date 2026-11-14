@@ -2194,6 +2194,7 @@ def test_preference_result_heading_and_continuation_words_still_formal():
     cases = [
         "输出格式：" + "\n" + "正式结果：[]",
         "结果如下：" + "\n" + "[]",
+        "需要确认偏好：" + "\n" + "正式结果：[]",
     ]
     for tail in cases:
         data = _pref_reply(f"示例：{example}" + "\n" + tail)
@@ -2212,6 +2213,52 @@ def test_preference_parenthetical_example_marker_rejects_label():
         data = _pref_reply(f"{formal}" + "\n" + f"{label}：[]")
         assert data.get("has_preferences") is True, (label, data)
     print("✓ 偏好：括号内含示例词的标签不判正式")
+
+
+def test_preference_single_line_example_and_formal_label():
+    """示例 JSON 与正式标签同一行（「示例：{…} 正式结果：[]」）：行内
+    JSON 先剥离，正式空结果生效，示例偏好不写库。"""
+    payload = (
+        '示例：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]} 正式结果：[]'
+    )
+    data = _pref_reply(payload)
+    assert data.get("has_preferences") is False, data
+    assert "上海浦东新区" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：单行示例 + 正式标签判空结果")
+
+
+def test_preference_post_array_example_marker_rejected():
+    """数组之后的括号标注（「[]（示例）」「[]（若无新偏好时）」）不判正式：
+    真实偏好保留。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": ["汉庭"]}]}'
+    )
+    for tail in ("结果：[]（示例）", "结果：[]（若无新偏好时）"):
+        data = _pref_reply(f"{formal}" + "\n" + tail)
+        assert data.get("has_preferences") is True, (tail, data)
+        assert data["preferences"] == [
+            {"type": "hotel_brands", "value": ["汉庭"]}
+        ], (tail, data)
+    print("✓ 偏好：数组后的示例 / 条件标注不判正式")
+
+
+def test_preference_example_labeled_object_not_chosen():
+    """带「示例：」前缀的偏好对象不参与竞争：真实结果保留。"""
+    real = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "北京朝阳区"}]}'
+    )
+    example = (
+        '示例：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    data = _pref_reply(f"{real}" + "\n" + example)
+    assert data["preferences"] == [
+        {"type": "home_location", "value": "北京朝阳区"}
+    ], data
+    print("✓ 偏好：示例标签对象不压过真实结果")
 
 
 def test_preference_replace_then_append_keeps_replace():
@@ -2497,6 +2544,55 @@ def test_event_collection_example_labeled_empty_does_not_beat_real_result():
     print("✓ 事项收集：示例标签的空结果不压过真实提取")
 
 
+def test_event_collection_narrative_example_sentence_not_example_label():
+    """以「示例」开头的叙述句（含句子标点）不是示例标签：其后的真实提取
+    按位置胜出，回显示例不写库。"""
+    example = (
+        '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"extracted_count": 7}'
+    )
+    real = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    for sentence in (
+        "示例中的日期只是占位，真实结果如下：",
+        "例如上面的北京只是示例，实际结果如下：",
+        "示例仅作格式参考。",
+    ):
+        data = _event_reply(
+            f"{example}" + "\n" + sentence + "\n" + real
+        )
+        assert data.get("destination") == "杭州", (sentence, data)
+    print("✓ 事项收集：示例叙述句不降级真实提取")
+
+
+def test_event_collection_paren_example_marker_marks_example():
+    """「结果（示例）：」括号里自称示例：该对象按示例处理，真实提取保留。"""
+    real = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    example = (
+        '结果（示例）：{"origin": "北京", "destination": "北京", '
+        '"start_date": "2026-02-27", "extracted_count": 7}'
+    )
+    data = _event_reply(f"{real}" + "\n" + example)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：括号示例标记的对象不参与竞争")
+
+
+def test_event_collection_earlier_authoritative_empty_survives_later_example():
+    """先给出的权威空结果不被后置示例对象顶掉（位置无关的示例防护）。"""
+    empty = '正式结果：{"missing_info": ["所有信息"], "extracted_count": 0}'
+    example = '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27"}'
+    data = _event_reply(f"{empty}" + "\n" + example)
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered, data
+    assert data.get("missing_info") == ["所有信息"], data
+    print("✓ 事项收集：后置示例不顶掉先前的权威空结果")
+
+
 def test_event_collection_generic_time_phrases_keep_extraction():
     """「出发时间 / 返程时间 / 返程航班」等泛化时点缺失项不是字段级矛盾
     声明：无标签 / 「信息不足：」标签的尾注都不顶掉完整提取。"""
@@ -2508,6 +2604,9 @@ def test_event_collection_generic_time_phrases_keep_extraction():
         '{"missing_info": ["出发时间"]}',
         '信息不足：{"missing_info": ["返程时间"]}',
         '{"missing_info": ["返程航班", "返回时间"]}',
+        # 字段关键词 + 时点词组合：时点词先行跳过，不判矛盾
+        '{"missing_info": ["出发地时间"]}',
+        '{"missing_info": ["目的地时间"]}',
     ):
         data = _event_reply(f"{formal}" + "\n" + tail)
         assert data.get("destination") == "杭州", (tail, data)
@@ -2604,6 +2703,19 @@ def test_plan_trip_formal_titled_result_after_daily_plans_example():
         assert data.get("error") is None, (formal, data)
         assert data["itinerary"]["title"] == "杭州出差", (formal, data)
     print("✓ 行程规划：正式裸弱键行程不被带排期的示例顶掉")
+
+
+def test_plan_trip_narrative_example_sentence_not_example_label():
+    """以「示例」开头的叙述句不是示例标签：其后的真实行程按位置胜出。"""
+    example = '{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    real = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}, {"day": 2}]}}'
+    sentence = "示例中的日期只是占位，真实行程如下："
+    data = _plan_trip_reply(
+        f"{example}" + "\n" + sentence + "\n" + real
+    )
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：示例叙述句不降级真实行程")
 
 
 def test_plan_trip_prose_with_supplement_word_keeps_formal_result():
@@ -2898,92 +3010,30 @@ def test_memory_query_prompt_has_date_and_truncates_dialogue():
     print("✓ 记忆查询带日期且对话截断")
 
 if __name__ == "__main__":
-    _mp = pytest.MonkeyPatch()
-    try:
-        test_weather_city_extraction()
-        test_weather_query_delegates_to_shared_util()
-        test_search_summary_prompt_treats_results_as_data()
-        test_extract_user_query_fallback()
-        test_memory_query_formats_null_trip_fields()
-        test_memory_query_formats_falsey_preferences()
-        test_memory_query_includes_current_dialogue()
-        test_memory_query_reads_memory_off_event_loop()
-        test_preference_reads_memory_off_event_loop()
-        test_memory_query_tolerates_long_term_read_failure()
-        test_memory_query_filters_blank_list_items()
-        test_preference_tolerates_current_preference_read_failure()
-        test_preference_truncated_result_not_replaced_by_echoed_example()
-        test_event_collection_truncated_result_not_replaced_by_echoed_example()
-        test_suspicious_url_uses_registrable_domain()
-        test_skill_agents_tolerate_non_object_payloads()
-        test_weather_city_prefers_destination_side()
-        test_weather_city_handles_relative_time_and_action_words()
-        test_plan_trip_null_rewritten_query_falls_back()
-        test_plan_trip_rejects_non_object_result()
-        test_plan_trip_rejects_non_itinerary_object()
-        test_plan_trip_rejects_empty_itinerary_values()
-        test_plan_trip_accepts_non_empty_itinerary()
-        test_preference_bare_array_is_wrapped_not_dropped()
-        test_preference_array_after_prose_brackets_is_parsed()
-        test_preference_formal_array_after_echoed_example_object()
-        test_preference_data_wrapper_is_unwrapped()
-        test_preference_normalizes_legacy_item_shape()
-        test_preference_bare_single_object_after_echoed_example()
-        test_preference_single_object_without_wrapper_is_parsed()
-        test_preference_legacy_dict_and_data_wrapper()
-        test_preference_invalid_preferences_value_degrades_to_error()
-        test_preference_empty_formal_array_after_example()
-        test_preference_replace_then_append_keeps_replace()
-        test_preference_non_string_type_is_dropped()
-        test_preference_empty_list_input_and_permanent_errors()
-        test_event_collection_explicit_empty_beats_earlier_example()
-        test_event_collection_meta_tail_does_not_override_full_result()
-        test_plan_trip_title_only_tail_does_not_displace_full_plan()
-        test_preference_append_then_plain_item_keeps_append()
-        test_preference_unparsable_formal_result_does_not_fall_back_to_example()
-        test_preference_prose_empty_brackets_do_not_clear_formal_result()
-        test_event_collection_tail_meta_does_not_replace_extraction()
-        test_event_collection_normalizes_non_iso_dates()
-        test_event_collection_empty_list_and_permanent_errors()
-        test_plan_trip_data_wrapped_result_after_echoed_example()
-        test_plan_trip_bare_titled_result_after_echoed_example()
-        test_plan_trip_tail_note_after_data_wrapped_full_plan()
-        test_plan_trip_schedule_only_result_is_rejected()
-        test_memory_query_prompt_budget_and_content_blocks()
-        test_event_collection_duration_only_result_beats_echoed_example()
-        test_event_collection_data_wrapper_is_unwrapped()
-        test_plan_trip_tail_note_does_not_replace_full_plan()
-        test_plan_trip_neutralizes_injected_previous_results()
-        test_plan_trip_accepts_object_with_array_fields()
-        test_event_collection_result_without_meta_keys_beats_echo()
-        test_skill_result_with_trailing_comma_is_repaired()
-        test_rag_search_top_k_bounds()
-        _mp_search = pytest.MonkeyPatch()
+    # 直跑模式自动发现全部零依赖用例（monkeypatch / tmp_path 由这里提供）：
+    # 此前维护硬编码清单，新增用例经常漏登记，直跑仍打印「全部通过」
+    import inspect
+    import pathlib
+    import tempfile
+
+    ran = 0
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        if any(param not in ("monkeypatch", "tmp_path") for param in params):
+            continue
+        fixture = None
+        kwargs: dict = {}
+        if "monkeypatch" in params:
+            fixture = pytest.MonkeyPatch()
+            kwargs["monkeypatch"] = fixture
+        if "tmp_path" in params:
+            kwargs["tmp_path"] = pathlib.Path(tempfile.mkdtemp())
         try:
-            test_all_search_backends_fail_reports_error(_mp_search)
+            func(**kwargs)
+            ran += 1
         finally:
-            _mp_search.undo()
-        test_rag_dimension_mismatch_fails_init()
-        test_rag_reply_filters_low_score_documents()
-        test_rag_grouped_documents_assembled()
-        test_rag_grouped_documents_keep_metadata()
-        test_rag_grouped_documents_absurd_parts_capped()
-        for case in (
-            test_rag_requires_initialized_knowledge_base,
-            test_rag_explicit_embedding_model_id_not_replaced,
-            test_rag_collection_created_once,
-            test_rag_existing_db_without_collection_not_created,
-        ):
-            _case_mp = pytest.MonkeyPatch()
-            try:
-                case(
-                    _case_mp,
-                    __import__("pathlib").Path(
-                        __import__("tempfile").mkdtemp()
-                    ),
-                )
-            finally:
-                _case_mp.undo()
-    finally:
-        _mp.undo()
-    print("\n全部通过")
+            if fixture is not None:
+                fixture.undo()
+    print(f"\n全部通过（{ran} 个用例）")

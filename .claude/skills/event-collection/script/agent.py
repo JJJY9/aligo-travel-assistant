@@ -180,6 +180,10 @@ def _event_label_phrase(label: str) -> str | None:
         if stripped == cleaned_line:
             break
         cleaned_line = stripped
+    for group in _PAREN_GROUP_RE.findall(line):
+        if re.search(r"示例|例如|样例", group):
+            # 「结果（示例）：」「正式结果（例如）：」：括号里自称示例
+            return "示例"
     if not re.sub(r"[:：=\s]", "", cleaned_line):
         # 整行就是括号里的标签（「（尾注）：」「(示例)：」）：取括号内容
         match = _PAREN_GROUP_RE.search(line)
@@ -208,11 +212,23 @@ def _event_label_phrase(label: str) -> str | None:
     return phrase
 
 
-def _event_label_is_example(label: str) -> bool:
-    phrase = _event_label_phrase(label)
+_SENTENCE_PUNCT = "，。；、！？,;!?…"
+
+
+def _is_example_phrase(phrase: str | None) -> bool:
+    """示例短语的短标签约束：含句子标点的叙述句（「示例中的日期只是
+    占位，真实结果如下」）不算示例标签。"""
     if not phrase:
         return False
-    return phrase.startswith(("示例", "例如", "样例")) or phrase in _EXAMPLE_LABELS
+    if any(ch in phrase for ch in _SENTENCE_PUNCT):
+        return False
+    if phrase in _EXAMPLE_LABELS:
+        return True
+    return len(phrase) <= 8 and phrase.startswith(("示例", "例如", "样例"))
+
+
+def _event_label_is_example(label: str) -> bool:
+    return _is_example_phrase(_event_label_phrase(label))
 
 
 # missing_info 条目 → 提取字段：用于判断「信息不足」声明与实质提取是否矛盾
@@ -342,10 +358,7 @@ def _select_event_result(text: str) -> dict | None:
                 failed_tail = True
             continue
         label_phrase = _event_label_phrase(text[prev_end:start])
-        label_example = label_phrase is not None and (
-            label_phrase.startswith(("示例", "例如", "样例"))
-            or label_phrase in _EXAMPLE_LABELS
-        )
+        label_example = _is_example_phrase(label_phrase)
         prev_end = end
         candidate = _unwrap_result(value)
         if candidate is None:
@@ -391,13 +404,9 @@ def _select_event_result(text: str) -> dict | None:
                 chosen, chosen_end = explicit_empty, explicit_empty_end
             else:
                 chosen, chosen_end = substantive, substantive_end
-        elif (
-            substantive_is_example
-            and last_empty_any is not None
-            and last_empty_any_end > substantive_end
-        ):
-            # 回显示例之后出现任何缺失声明（含带「尾注：」标签的）：
-            # 绝不能让示例字段被当成真实提取写库
+        elif substantive_is_example and last_empty_any is not None:
+            # 回显示例存在任何缺失声明（含带标签的、位置无关的）时，绝不
+            # 让示例字段被当成真实提取写库
             chosen, chosen_end = last_empty_any, last_empty_any_end
         else:
             chosen, chosen_end = substantive, substantive_end

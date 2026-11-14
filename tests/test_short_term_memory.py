@@ -2084,49 +2084,69 @@ def test_backfill_and_replay_share_timestamps_dedupe_once(monkeypatch):
 
 
 def test_canonical_timestamp_aligns_backfill_with_realtime(monkeypatch):
-    """带偏移时间戳经入口折算为本地 naive ISO：与时区环境无关地可判定
-    （固定 +05:30 偏移；UTC 归一化实现会保留偏移后缀，逐字节断言必失败）。"""
+    """带偏移时间戳经入口折算为本地 naive ISO。强制非 UTC 本地时区
+    （Asia/Shanghai）：UTC 归一化实现会保留偏移后缀 / UTC 墙钟，
+    逐字节断言必失败；纯 UTC 容器不再恒真。"""
+    import os
+    import time as _time
     from datetime import datetime, timedelta, timezone
 
     from context import short_term_memory as module
 
-    aware = datetime(
-        2026,
-        11,
-        1,
-        10,
-        0,
-        0,
-        123456,
-        tzinfo=timezone(timedelta(hours=5, minutes=30)),
-    )
-    canonical = module._canonical_timestamp(aware.isoformat())
-    expected = aware.astimezone().replace(tzinfo=None).isoformat()
-    assert canonical == expected
-    assert "+" not in canonical and "Z" not in canonical, canonical
-    assert module._canonical_timestamp(canonical) == canonical
-    assert module._canonical_timestamp(None) is None
-    assert module._canonical_timestamp("") is None
+    restore = None
+    if hasattr(_time, "tzset"):
+        previous_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Shanghai"
+        _time.tzset()
 
-    # 实时副本（naive）与回填副本（同一时刻的带偏移串）只落一份
-    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
-    client = _FlakyRedis()
-    realtime = module.RedisShortTermMemory(
-        client, "s-canon", max_turns=5, user_id="u1"
-    )
-    realtime.add_message("user", "Q", timestamp=canonical)
-    backfill = module.RedisShortTermMemory(
-        client, "s-canon", max_turns=5, user_id="u1"
-    )
-    backfill.add_message("user", "Q", timestamp=aware.isoformat())
-    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
-    contents = [json.loads(raw)["content"] for raw in client.data]
-    assert contents == ["Q"], contents
-    # 正常重复提问（内容相同、时间不同）不会被误判为同一条
-    realtime.add_message(
-        "user", "Q", timestamp="2026-11-01T10:00:01.123456"
-    )
-    assert [json.loads(raw)["content"] for raw in client.data] == ["Q", "Q"]
+        def restore():
+            if previous_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous_tz
+            _time.tzset()
+
+    try:
+        aware = datetime(
+            2026,
+            11,
+            1,
+            10,
+            0,
+            0,
+            123456,
+            tzinfo=timezone(timedelta(hours=5, minutes=30)),
+        )
+        canonical = module._canonical_timestamp(aware.isoformat())
+        expected = aware.astimezone().replace(tzinfo=None).isoformat()
+        assert canonical == expected
+        assert "+" not in canonical and "Z" not in canonical, canonical
+        assert module._canonical_timestamp(canonical) == canonical
+        assert module._canonical_timestamp(None) is None
+        assert module._canonical_timestamp("") is None
+
+        # 实时副本（naive）与回填副本（同一时刻的带偏移串）只落一份
+        monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+        client = _FlakyRedis()
+        realtime = module.RedisShortTermMemory(
+            client, "s-canon", max_turns=5, user_id="u1"
+        )
+        realtime.add_message("user", "Q", timestamp=canonical)
+        backfill = module.RedisShortTermMemory(
+            client, "s-canon", max_turns=5, user_id="u1"
+        )
+        backfill.add_message("user", "Q", timestamp=aware.isoformat())
+        monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+        contents = [json.loads(raw)["content"] for raw in client.data]
+        assert contents == ["Q"], contents
+        # 正常重复提问（内容相同、时间不同）不会被误判为同一条
+        realtime.add_message(
+            "user", "Q", timestamp="2026-11-01T10:00:01.123456"
+        )
+        assert [json.loads(raw)["content"] for raw in client.data] == ["Q", "Q"]
+    finally:
+        if restore is not None:
+            restore()
     print("✓ 带偏移时间戳归一后跨表示去重生效")
 
 
