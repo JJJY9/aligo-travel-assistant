@@ -766,6 +766,49 @@ def test_ensure_persisted_heals_corrupt_pending(monkeypatch):
     print("✓ ensure_persisted 自愈真实 _corrupt_pending 状态")
 
 
+def test_json_fallback_write_allowed_under_postgres_dsn(monkeypatch):
+    """PG 故障回退 JSON 时遗留隔离备份不阻断写回（PG 恢复后切回 PG）。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://x/y")
+    storage_dir = tempfile.mkdtemp()
+    (Path(storage_dir) / "u-fb.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+    memory = LongTermMemory("u-fb", storage_dir)
+    memory.save_preference("home_location", "北京")
+    assert (Path(storage_dir) / "u-fb.json").exists()
+    print("✓ DSN 回退 JSON 时遗留备份不阻断写回")
+
+
+def test_delete_all_clears_pending_quarantine(monkeypatch):
+    """delete_all 复位 pending / fresh 隔离标记：删除后实例不再报待复核。"""
+    import context.long_term_memory as module
+
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-del-pending.json"
+    path.write_text("{bad json", encoding="utf-8")
+    real_replace = module.os.replace
+    calls = {"count": 0}
+
+    def failing_replace(src, dst):
+        if str(src) == str(path) and calls["count"] == 0:
+            calls["count"] += 1
+            raise OSError("locked")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(module.os, "replace", failing_replace)
+    memory = LongTermMemory("u-del-pending", storage_dir)
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    assert memory.has_pending_corrupt_quarantine()
+
+    memory.delete_all()
+    assert not memory.has_pending_corrupt_quarantine(), (
+        "删除后不能残留 pending 隔离状态"
+    )
+    print("✓ delete_all 复位 pending 隔离标记")
+
+
 def test_delete_all_prevents_stale_instance_resurrection():
     """删除后其它存活实例（缓存会话）的下一次写入从空快照开始：
     已删除的数据不会被旧实例整份写回。"""

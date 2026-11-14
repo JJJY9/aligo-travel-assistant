@@ -105,6 +105,16 @@ def _lock_for_path(path: str) -> threading.RLock:
         return lock
 
 
+def _postgres_configured() -> bool:
+    """是否配置了 PostgreSQL 后端（JSON 只是故障回退时的临时载体）。"""
+    try:
+        from config import STORAGE_CONFIG
+
+        return bool(STORAGE_CONFIG.get("postgres_dsn"))
+    except Exception:  # noqa: BLE001 - 读取失败按未配置
+        return False
+
+
 def _preference_cap() -> int | None:
     """偏好类型数上限（与导入 / 导出共用 ``utils.user_import`` 的常量）。"""
     try:
@@ -381,7 +391,12 @@ class LongTermMemory:
                 self.data = self._init_data()
                 return
             backups = self._corrupt_siblings()
-            if backups and not self._allow_quarantined and not self._may_recreate:
+            if (
+                backups
+                and not self._allow_quarantined
+                and not self._may_recreate
+                and not _postgres_configured()
+            ):
                 # 主文件缺失 + 存在隔离备份：损坏文件已被隔离。沿用内存
                 # 快照写回会重建主文件、让隔离备份从此不可见（恢复提示
                 # 与隔离守卫全部失效）；只有显式以「恢复」打开的实例
@@ -1895,6 +1910,8 @@ class LongTermMemory:
                     # 已移除，旧快照绝不能再被写回
                     self._corrupt_backup = None
                     self._may_recreate = False
+                    self._corrupt_pending = False
+                    self._fresh_quarantine = False
                     self.data = self._init_data()
                     if failed:
                         raise MemoryPersistenceError(

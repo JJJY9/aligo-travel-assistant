@@ -462,6 +462,7 @@ def merged_backup_limit_problem(
             "trip_history": _merged_trip_rows(
                 list(existing.get("trip_history") or []),
                 sections.get("trips") or [],
+                include_empty_keys=not getattr(store, "snapshot_based", False),
             ),
             "preferences": merged_prefs,
             "knowledge": sections.get("knowledge") or [],
@@ -513,10 +514,8 @@ def merged_backup_limit_problem(
                 merged_frequent[str(key)] = 0
     for key, value in frequent.items():
         merged_frequent[key] = max(merged_frequent.get(key, 0), value)
-    if merged_frequent:
-        statistics["frequent_destinations"] = merged_frequent
-    else:
-        statistics.pop("frequent_destinations", None)
+    # 真实导出恒含该键（空 dict 也序列化），同形状计入体积
+    statistics["frequent_destinations"] = merged_frequent
     payload["statistics"] = statistics
     return backup_limit_problem(payload)
 
@@ -554,7 +553,10 @@ def _trip_merge_key(row: dict[str, Any]) -> Any:
 
 
 def _merged_trip_rows(
-    existing_rows: list[Any], trips: list[Any]
+    existing_rows: list[Any],
+    trips: list[Any],
+    *,
+    include_empty_keys: bool = False,
 ) -> list[Any]:
     """恢复后行程表的形状：按 ``save_trip_histories`` 的索引语义预演。
 
@@ -593,10 +595,11 @@ def _merged_trip_rows(
         record.pop(_DROPPED_SESSION_KEY, None)
         record.setdefault("trip_id", "trip_0")
         record.setdefault("timestamp", datetime.now().isoformat())
-        # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也序列化），
-        # 按较宽形状估算体积（偏向保守）
-        record.setdefault("purpose", None)
-        record.setdefault("session_id", None)
+        if include_empty_keys:
+            # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也
+            # 序列化）；JSON 后端没有这两个键
+            record.setdefault("purpose", None)
+            record.setdefault("session_id", None)
         created.append(record)
     return base + created
 

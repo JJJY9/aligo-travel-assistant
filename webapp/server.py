@@ -1057,6 +1057,8 @@ class _WebSession:
                 self.runtime.close()
             except Exception:  # noqa: BLE001 - 尽力释放
                 pass
+            if marker == _QUARANTINE_PENDING_MARKER:
+                raise MemoryPersistenceError(_QUARANTINE_PENDING_MESSAGE)
             raise MemoryPersistenceError(
                 "记忆文件损坏并已隔离备份（路径见服务端日志），"
                 "请先用备份文件恢复后重试"
@@ -2227,6 +2229,14 @@ def _session_long_term(session: Any) -> Any:
     return getattr(getattr(session.runtime, "memory", None), "long_term", None)
 
 
+# pending（隔离改名尚未完成，尚无备份文件）的哨兵标记
+_QUARANTINE_PENDING_MARKER = "__quarantine_pending__"
+_QUARANTINE_PENDING_MESSAGE = (
+    "记忆文件损坏且隔离备份尚未完成（文件可能被占用），"
+    "请稍后重试或联系维护"
+)
+
+
 def _quarantine_marker_for(user_id: str, long_term: Any) -> str | None:
     """会话构造 / 打开 / 缓存命中三处共用的隔离标记探测。
 
@@ -2246,7 +2256,7 @@ def _quarantine_marker_for(user_id: str, long_term: Any) -> str | None:
             long_term, "has_pending_corrupt_quarantine", None
         )
         if callable(pending_getter) and pending_getter():
-            return "隔离改名尚未完成（待复核）"
+            return _QUARANTINE_PENDING_MARKER
         from config import STORAGE_CONFIG
 
         if STORAGE_CONFIG.get("postgres_dsn"):
@@ -2328,6 +2338,11 @@ def _open_long_term(
             if callable(close):
                 with contextlib.suppress(Exception):
                     close()
+            if marker == _QUARANTINE_PENDING_MARKER:
+                logger.warning("记忆隔离未完成（%s）", user_id)
+                raise HTTPException(
+                    status_code=503, detail=_QUARANTINE_PENDING_MESSAGE
+                )
             logger.warning("记忆文件损坏并已隔离（%s）：%s", user_id, marker)
             raise HTTPException(
                 status_code=503,
@@ -2363,6 +2378,7 @@ _QUARANTINE_MESSAGE_PREFIXES = (
 _DAMAGE_MESSAGE_PREFIXES = (
     "长期记忆重载失败",
     "记忆文件损坏且无法备份",
+    "记忆文件损坏且隔离备份尚未完成",
 )
 
 

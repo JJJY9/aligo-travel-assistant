@@ -2052,6 +2052,22 @@ def test_import_repeat_backup_at_limit_is_idempotent(monkeypatch):
         module.import_user_data(store, sections2)
     print("✓ 上限内幂等重放与 dry-run 一致")
 
+def test_merged_trip_rows_empty_keys_backend_aware():
+    """purpose / session_id 空键仅 PG 形状补写（JSON 后端不加）。"""
+    from utils import user_import as module
+
+    incoming = [
+        {"origin": "上海", "destination": "成都", "start_date": "2026-05-01"}
+    ]
+    json_rows = module._merged_trip_rows([], incoming)
+    assert "purpose" not in json_rows[0], json_rows[0]
+    pg_rows = module._merged_trip_rows(
+        [], incoming, include_empty_keys=True
+    )
+    assert pg_rows[0].get("purpose", "missing") is None
+    print("✓ 合并预演的空键按后端形状补写")
+
+
 def test_merged_backup_limit_previews_dedupe(monkeypatch):
     """重导自己的备份：合并上限检查按导入去重语义预演，接近上限不再误拒。"""
     from utils import user_import as module
