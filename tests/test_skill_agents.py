@@ -2089,6 +2089,39 @@ def test_preference_formatted_result_labels_are_recognized():
     print("✓ 偏好：空格围栏 / 加粗 / 说明句引进的结果标签生效")
 
 
+def test_preference_result_variants_beat_example_and_alone_succeed():
+    """「结果如下 / 偏好 / 输出结果」等终稿标签判正式空结果：
+    有示例时不回退写库，无示例时返回成功空结果而不是解析错误。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    for label in ("结果如下", "偏好", "输出结果"):
+        data = _pref_reply(f"示例：{example}" + "\n" + f"{label}：[]")
+        assert data.get("has_preferences") is False, (label, data)
+        assert "上海浦东新区" not in json.dumps(data, ensure_ascii=False), data
+        alone = _pref_reply(f"{label}：[]")
+        assert alone.get("has_preferences") is False, (label, alone)
+        assert not alone.get("error"), (label, alone)
+    print("✓ 偏好：结果如下 / 偏好 / 输出结果标签的正式空结果")
+
+
+def test_preference_instruction_wrapping_result_label_rejected():
+    """「示例：正式结果：[]」这类说明 + 结果标签行不是纯标签行，
+    空数组判示例：真实偏好保留。"""
+    formal = (
+        '结果：{"preferences": [{"type": "home_location", "value": "上海"}], '
+        '"has_preferences": true}'
+    )
+    for line in ("示例：正式结果：[]", "说明：结果：[]", "返回格式：正式结果：[]"):
+        data = _pref_reply(f"{formal}" + "\n" + line)
+        assert data.get("has_preferences") is True, (line, data)
+        assert data["preferences"] == [
+            {"type": "home_location", "value": "上海"}
+        ], (line, data)
+    print("✓ 偏好：说明包裹的结果标签行不顶掉真实偏好")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2187,6 +2220,24 @@ def test_event_collection_full_schema_empty_beats_earlier_example():
         data = _event_reply(f"{example}\n{variant}")
         rendered = json.dumps(data, ensure_ascii=False)
         assert "北京" not in rendered and "2026-02-27" not in rendered, (count, data)
+    # 形状判定的白盒断言：计数 0 与全 null 字段表各自即可判定为权威空结果，
+    # 不依赖示例标签或缺失声明矛盾等旁路（防止该函数的语义被悄悄放宽/架空）
+    module = _load_skill_module("event-collection")
+    counted = {"missing_info": ["所有信息"], "extracted_count": 0}
+    full_null = {
+        "origin": None,
+        "destination": None,
+        "start_date": None,
+        "end_date": None,
+        "duration_days": None,
+        "return_location": None,
+        "trip_purpose": None,
+        "missing_info": ["所有信息"],
+    }
+    partial_tail = {"missing_info": ["返程地"], "summary": "杭州出差"}
+    assert module._is_authoritative_empty(counted) is True
+    assert module._is_authoritative_empty(full_null) is True
+    assert module._is_authoritative_empty(partial_tail) is False
     print("✓ 事项收集：全 null 字段表的终稿压过更早示例")
 
 
@@ -2248,6 +2299,32 @@ def test_event_collection_unlabeled_partial_tail_keeps_real_extraction():
     print("✓ 事项收集：无标签 / 加粗标签的局部尾注不顶掉完整提取")
 
 
+def test_event_collection_unlabeled_example_with_missing_terminal():
+    """无标签回显示例 + 缺的恰是示例里已有字段的「信息不足」终稿：
+    矛盾声明说明终稿是本轮最终表态，示例字段不能写库。"""
+    example = (
+        '来自格式示例：{"origin": "北京", "destination": "北京", '
+        '"start_date": "2026-02-27", "duration_days": 1, "extracted_count": 7}'
+    )
+    terminal = '{"missing_info": ["出发地", "目的地", "日期"], "summary": "未提供"}'
+    data = _event_reply(f"{example}" + "\n" + terminal)
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：矛盾缺失声明的无标签示例不写库")
+
+
+def test_event_collection_qualified_example_label_after_real_result():
+    """真实提取之后带限定词的示例（示例（北京行程）：）不参与实质候选竞争。"""
+    real = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    example = '示例（北京行程）：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27"}'
+    data = _event_reply(f"{real}" + "\n" + example)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：限定词示例标签不压过真实提取")
+
+
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
@@ -2285,10 +2362,12 @@ def test_plan_trip_formal_titled_result_after_daily_plans_example():
 
 def test_plan_trip_prose_with_supplement_word_keeps_formal_result():
     """正式结果前的普通叙述（「根据您补充的信息，行程如下：」）不是补充
-    标签，后置的裸弱键行程仍按位置胜出。"""
-    example = '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    标签：后置的裸弱键行程按位置胜出。示例用无标签形态——若叙述被误判
+    为补充标签、真实行程被排除，回显示例（此处为唯一富候选）就会胜出，
+    用例因而能捕获误判。"""
+    example = '{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
     formal = '根据您补充的信息，行程如下：\n{"title": "杭州出差", "duration": "2天"}'
-    data = _plan_trip_reply(f"{example}\n{formal}")
+    data = _plan_trip_reply(f"{example}" + "\n" + formal)
     assert data.get("error") is None, data
     assert data["itinerary"]["title"] == "杭州出差", data
     print("✓ 行程规划：普通叙述含「补充」不改变正式结果")
@@ -2361,18 +2440,18 @@ def test_plan_trip_prose_example_then_real_full_keeps_real():
     print("✓ 行程规划：叙述中的「示例」字样不降级真实行程")
 
 
-def test_plan_trip_unknown_label_or_unlabeled_weak_tail_yields_to_full_plan():
-    """词表外标签（温馨提示：）或无标签的「标题+时长」尾注同样让位于
-    更早带排期的完整行程。"""
+def test_plan_trip_known_weak_tail_labels_yield_to_full_plan():
+    """温馨提示 / 【尾注】等带标签的弱尾注让位于更早带排期的完整行程；
+    无标签的弱对象与无标签的示例在结构上不可区分，按「最后表态」优先
+    （位置规则，已在 CHANGELOG 记录为接受的取舍）。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
     for tail in (
         '温馨提示：{"title": "注意事项", "duration": "2天"}',
-        '{"title": "注意事项", "duration": "2天"}',
         '【尾注】{"title": "注意事项", "duration": "2天"}',
     ):
         data = _plan_trip_reply(f"{full}" + "\n" + tail)
         assert data["itinerary"]["title"] == "杭州出差", (tail, data)
-    print("✓ 行程规划：词表外 / 无标签的弱尾注让位于完整行程")
+    print("✓ 行程规划：带标签的弱尾注让位于完整行程")
 
 
 def test_plan_trip_supplement_labeled_rich_plan_still_competes():
@@ -2384,6 +2463,17 @@ def test_plan_trip_supplement_labeled_rich_plan_still_competes():
     assert data["itinerary"]["title"] == "杭州出差（备选）", data
     assert len(data["itinerary"]["daily_plans"]) == 2, data
     print("✓ 行程规划：补充标签的完整排期候选仍参与竞争")
+
+
+def test_plan_trip_formal_result_label_weak_plan_competes():
+    """「正式结果：」标签的弱行程按位置参与终稿竞争（正式标签集合
+    覆盖 正式结果 / 结果如下 / 最终输出）。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    formal = '正式结果：{"title": "杭州出差（调整）", "duration": "2天"}'
+    data = _plan_trip_reply(f"{full}" + "\n" + formal)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差（调整）", data
+    print("✓ 行程规划：正式结果标签的弱行程参与竞争")
 
 
 def test_plan_trip_empty_daily_plans_shell_does_not_displace_full_plan():

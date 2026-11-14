@@ -245,20 +245,59 @@ def _looks_result_keyed(value: dict) -> bool:
     return "preferences" in value or "has_preferences" in value
 
 
-# 正式空结果前的标签：取数组前最后一个非空、非围栏行的最后一个冒号之后
-# 的短语（剔除加粗 / 标题 / 方括号等装饰），整短语必须是结果标签——
-# 「正式结果：」「**结果：**」「以下是本次结果：」都算；说明 / 指令句
-# （「返回：」「若无偏好时输出：」）不算。
+# 正式空结果前的标签：取数组前最后一个非空、非围栏行；行内只允许
+# 「一个短语」（可带引导词「以下是/本次」等），剔除加粗 / 标题 / 方括号
+# 装饰。结果短语白名单覆盖常见终稿写法（结果如下 / 偏好 / 输出结果…）；
+# 说明 / 指令句（返回：若无偏好时输出：）不算。
 _RESULT_LABELS = frozenset(
-    {"正式结果", "正式", "结果", "结论", "最终结果", "最终输出", "最终", "本次结果"}
+    {
+        "正式结果",
+        "正式",
+        "结果",
+        "结果如下",
+        "结论",
+        "偏好",
+        "本次结果",
+        "本次输出结果",
+        "最终结果",
+        "最终结果如下",
+        "最终输出",
+        "输出结果",
+        "最终",
+    }
 )
+_LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次")
+
+
+def _label_phrase(line: str) -> str | None:
+    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    if not parts:
+        return None
+    if any(part not in _LEAD_INS for part in parts[:-1]):
+        # 行内还有其它短语（示例：正式结果、说明：…）：不是纯标签行
+        return None
+    phrase = parts[-1]
+    changed = True
+    while changed:
+        changed = False
+        for lead in _LEAD_INS:
+            if phrase.startswith(lead) and len(phrase) > len(lead):
+                phrase = phrase[len(lead):]
+                changed = True
+                break
+    return phrase
 
 
 def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     """空数组是本轮正式空结果吗？
 
     只认两种形态：整个输出就是这个数组，或数组前最后一个非空、非围栏
-    行的末冒号短语是结果标签（``正式结果：[]`` / ``结果：[]``）。标签行
+    行的唯一短语是结果标签（``正式结果：[]`` / ``结果如下：[]``）。标签行
     里混入任何其它短语（条件说明、指令、「返回：」「输出：」等）即判为
     示例，避免说明散文里的 ``[]`` 按位置顶掉已解析的真实偏好。正式空
     结果之后的说明散文（换行括号注释 / 句号）不影响判定。"""
@@ -272,18 +311,8 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
             line = cleaned
     if not line:
         return True
-    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
-    phrase = re.split(r"[:：=]", decoration_free.rstrip(":：="))[-1]
-    # 「以下是本次正式结果：」这类说明句：剥掉常见引导词后仍要求整词命中
-    changed = True
-    while changed:
-        changed = False
-        for lead in ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次"):
-            if phrase.startswith(lead) and len(phrase) > len(lead):
-                phrase = phrase[len(lead):]
-                changed = True
-                break
-    return phrase in _RESULT_LABELS
+    phrase = _label_phrase(line)
+    return bool(phrase) and phrase in _RESULT_LABELS
 
 
 def _select_preference_result(text: str) -> dict | None:

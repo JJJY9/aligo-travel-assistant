@@ -618,6 +618,25 @@ def test_cached_instance_write_cannot_hide_quarantine():
     print("✓ 缓存实例写入不掩盖隔离状态；delete_all 一并清理备份")
 
 
+def test_may_recreate_does_not_leak_into_later_writes():
+    """写前补备份的「允许重建」只覆盖本次写入：同一实例稍后遇到外部
+    隔离（主文件被移走 + 备份存在）时必须重新被守卫拦截。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-leak", storage_dir)
+    path = Path(storage_dir) / "u-leak.json"
+    path.write_text("[]", encoding="utf-8")
+    memory._corrupt_pending = True  # noqa: SLF001 - 模拟写前待复核状态
+    memory.save_preference("home_location", "北京")  # 补备份 + 写回成功
+    assert path.exists()
+    os.replace(
+        path, Path(storage_dir) / "u-leak.json.corrupt-20260101000000000000-3"
+    )
+    with pytest.raises(MemoryPersistenceError):
+        memory.save_preference("hotel_brands", ["汉庭"])
+    assert not path.exists(), "后续写入不能借旧的放行标记重建主文件"
+    print("✓ 写前补备份的放行不泄漏到后续写入")
+
+
 def test_load_time_quarantine_blocks_writes_from_same_instance():
     """构造期检测到损坏并隔离的实例同样不允许写回重建：此后任何新实例 /
     请求必须仍能看到隔离状态（#792 的 503 恢复提示不能被空快照掩盖）。"""
