@@ -62,7 +62,7 @@ class _ShortTerm:
     def __init__(self):
         self.messages = []
 
-    def add_message(self, role, content, metadata=None):
+    def add_message(self, role, content, metadata=None, timestamp=None):
         self.messages.append((role, content))
 
 
@@ -74,7 +74,12 @@ def test_memory_manager_persist_turn_delegates_and_stages_assistant():
             self.turns = []
 
         def add_chat_turn(
-            self, user_content, assistant_content, session_id=None, should_commit=None
+            self,
+            user_content,
+            assistant_content,
+            session_id=None,
+            should_commit=None,
+            **kwargs,
         ):
             self.turns.append((user_content, assistant_content, session_id))
             return True
@@ -91,6 +96,26 @@ def test_memory_manager_persist_turn_delegates_and_stages_assistant():
         "用户消息已在编排前暂存，这里只补助手副本"
     )
     print("✓ MemoryManager.persist_turn 一次提交并暂存助手副本")
+
+
+def test_persist_turn_reuses_staged_timestamps():
+    """落库沿用暂存消息的时间戳：短期副本与长期记忆的内容指纹一致。"""
+    manager = MemoryManager("u-ts", "s1", storage_path=tempfile.mkdtemp())
+    user_ts = manager.stage_message("user", "问题")
+    assert isinstance(user_ts, str) and user_ts
+    manager.persist_turn("问题", "回答")
+    history = manager.long_term.get_chat_history(session_id="s1")
+    assert [m["role"] for m in history] == ["user", "assistant"], history
+    assert history[0]["timestamp"] == user_ts, (
+        "长期记忆必须沿用暂存用户单的时间戳"
+    )
+    assistant_ts = history[1]["timestamp"]
+    shadow = manager.short_term.get_recent_context()
+    assistants = [m for m in shadow if m["role"] == "assistant"]
+    assert assistants and assistants[-1]["timestamp"] == assistant_ts, (
+        "短期助手副本与落库共享同一时间戳"
+    )
+    print("✓ 落库沿用暂存时间戳（短期/长期内容指纹一致）")
 
 
 def test_persist_turn_does_not_rebuild_snapshot_store(monkeypatch):
@@ -498,6 +523,7 @@ if __name__ == "__main__":
         test_json_add_chat_turn_guard_vetoes_write()
         test_memory_manager_persist_turn_delegates_and_stages_assistant()
         test_persist_turn_does_not_rebuild_snapshot_store(_mp)
+        test_persist_turn_reuses_staged_timestamps()
         test_persist_turn_veto_skips_assistant_stage()
         test_persist_turn_defaults_to_shared_tombstone_guard(_mp)
         test_persist_turn_default_guard_commits_when_not_deleted(_mp)

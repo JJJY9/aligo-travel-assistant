@@ -2057,6 +2057,32 @@ def test_fallback_shadow_survives_long_outage_with_activity(monkeypatch):
     print("✓ 降级期活跃会话的影子缓存不被整段清空")
 
 
+def test_backfill_and_replay_share_timestamps_dedupe_once(monkeypatch):
+    """回填与故障重放使用同一存储时间戳时，内容指纹命中、只保留一份。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    a = module.RedisShortTermMemory(client, "s-ts", max_turns=5, user_id="u1")
+    client.fail = True
+    try:
+        a.add_message("user", "Q", timestamp="2026-11-01T10:00:00")
+        a.add_message("assistant", "A", timestamp="2026-11-01T10:00:05")
+    finally:
+        client.fail = False
+        module.reset_redis_degraded()
+    # 另一实例按长期记忆里的同一时间戳回填
+    b = module.RedisShortTermMemory(client, "s-ts", max_turns=5, user_id="u1")
+    b.add_message("user", "Q", timestamp="2026-11-01T10:00:00")
+    b.add_message("assistant", "A", timestamp="2026-11-01T10:00:05")
+    assert [json.loads(raw)["content"] for raw in client.data] == ["Q", "A"]
+    # A 恢复后重放：同一指纹已在 seen 集合，不再重复追加
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [m["content"] for m in a.get_recent_context()]
+    assert contents == ["Q", "A"], contents
+    print("✓ 共享时间戳的回填与重放只保留一份")
+
+
 def test_append_op_starts_new_window_after_drain(monkeypatch):
     """重放清空后新入队的操作开启新计速窗口（不继承旧起点被整体丢弃）。"""
     from context import short_term_memory as module
@@ -2287,6 +2313,7 @@ if __name__ == "__main__":
         test_fallback_context_prunes_expired_rounds,
         test_fallback_shadow_survives_long_outage_with_activity,
         test_append_op_starts_new_window_after_drain,
+        test_backfill_and_replay_share_timestamps_dedupe_once,
         test_seed_fallback_context_persists_to_redis,
         test_replay_skips_messages_backfilled_by_other_instance,
     ):

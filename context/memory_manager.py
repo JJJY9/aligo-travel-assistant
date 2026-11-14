@@ -103,6 +103,8 @@ class MemoryManager:
         self.user_id = user_id
         self.session_id = session_id
         self.llm_model = llm_model
+        # 暂存的用户消息（内容 → 时间戳）：persist_turn 复用同一时间戳
+        self._staged_user_timestamps: list[tuple[str, str]] = []
         self._storage_path = storage_path
 
         # 初始化两层记忆（配置 REDIS_URL / DATABASE_URL 时自动使用 Redis / PostgreSQL，
@@ -261,33 +263,63 @@ class MemoryManager:
                 return not tombstones.is_session_deleted(
                     self.user_id, self.session_id
                 )
+        # 共用短期暂存已生成的消息时间戳：内容指纹（角色+内容+时间戳）
+        # 才能在长期记忆回填 / 故障重放与实时副本之间对齐
+        user_ts = self._pop_staged_user_timestamp(user_content)
+        assistant_ts = datetime.now().isoformat()
         committed = self.long_term.add_chat_turn(
             user_content,
             assistant_content,
             self.session_id,
             should_commit=should_commit,
+            user_timestamp=user_ts,
+            assistant_timestamp=assistant_ts,
         )
         if committed is False:
             logger.info(
                 "会话在落库前被删除，跳过本轮写入：%s", self.session_id
             )
             return False
-        self.stage_message("assistant", assistant_content)
+        self.stage_message(
+            "assistant", assistant_content, timestamp=assistant_ts
+        )
         return True
 
     def stage_message(
-        self, role: str, content: str, metadata: dict | None = None
-    ) -> None:
-        """只写短期记忆（上下文缓存，不落长期记忆）。
+        self,
+        role: str,
+        content: str,
+        metadata: dict | None = None,
+        timestamp: str | None = None,
+    ) -> str | None:
+        """只写短期记忆（上下文缓存，不落长期记忆）；返回消息时间戳。
 
         交互式 CLI 在编排前用它暂存本轮提问：编排智能体从短期记忆读取
         「用户本轮原话」；编排失败时这条只是上下文缓存，长期记忆里不会
-        留下没有回复的孤儿用户轮。
+        留下没有回复的孤儿用户轮。暂存的用户时间戳在 persist_turn 里
+        复用给长期记忆，保证两侧内容指纹一致。
         """
         try:
-            self.short_term.add_message(role, content, metadata)
+            ts = self.short_term.add_message(
+                role, content, metadata, timestamp=timestamp
+            )
         except Exception as exc:  # noqa: BLE001 - 缓存失败降级为缺少本轮上下文
             logger.warning("短期记忆写入失败（%s），本轮上下文可能缺少该消息", exc)
+            return None
+        if role == "user" and isinstance(ts, str) and ts:
+            self._staged_user_timestamps.append((content, ts))
+            if len(self._staged_user_timestamps) > 64:
+                del self._staged_user_timestamps[0]
+        return ts
+
+    def _pop_staged_user_timestamp(self, content: str) -> str | None:
+        """取出与内容匹配的最近一次暂存用户时间戳（不匹配返回 None）。"""
+        for index in range(len(self._staged_user_timestamps) - 1, -1, -1):
+            staged_content, ts = self._staged_user_timestamps[index]
+            if staged_content == content:
+                del self._staged_user_timestamps[index]
+                return ts
+        return None
 
     def rollback_staged_message(self, content: str) -> bool:
         """编排失败 / 取消时移除编排前暂存的用户提问（尽力而为）。
@@ -310,7 +342,15 @@ class MemoryManager:
                 return False
             if last.get("role") != "user" or last.get("content") != content:
                 return False
-            return bool(self.short_term.truncate_last_turn(expect=content))
+            removed = bool(self.short_term.truncate_last_turn(expect=content))
+            if removed:
+                for index in range(
+                    len(self._staged_user_timestamps) - 1, -1, -1
+                ):
+                    if self._staged_user_timestamps[index][0] == content:
+                        del self._staged_user_timestamps[index]
+                        break
+            return removed
         except Exception as exc:  # noqa: BLE001 - 回滚失败不能掩盖原始错误
             logger.warning("回滚暂存提问失败（%s），短期上下文可能残留本轮提问", exc)
             return False

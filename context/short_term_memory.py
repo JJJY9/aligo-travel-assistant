@@ -517,23 +517,33 @@ class ShortTermMemory:
         self.max_turns = max_turns
         self.messages: list[dict[str, Any]] = []
 
-    def add_message(self, role: str, content: str, metadata: dict | None = None):
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        metadata: dict | None = None,
+        timestamp: str | None = None,
+    ) -> str:
         """
-        添加消息到短期记忆
+        添加消息到短期记忆；返回实际使用的时间戳。
 
-        Args:
-            role: 角色 (user/assistant)
-            content: 消息内容
-            metadata: 额外的元数据
+        ``timestamp`` 由调用方给出时沿用（与长期记忆落库共享同一
+        时间戳，跨来源的内容指纹才能对齐）。
         """
+        ts = (
+            timestamp
+            if isinstance(timestamp, str) and timestamp
+            else datetime.now().isoformat()
+        )
         message = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": ts,
             "metadata": metadata or {}
         }
         self._append_message(message)
         logger.debug(f"Added message to short-term memory: {role}")
+        return ts
 
     def _append_message(self, message: dict[str, Any]) -> None:
         """追加一条已成形的消息（Redis 实现复用同一对象，保证两侧内容一致）。"""
@@ -1044,15 +1054,27 @@ class RedisShortTermMemory:
         n_messages = n_turns * 2
         return messages[-n_messages:]
 
-    def add_message(self, role: str, content: str, metadata: dict | None = None) -> None:
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        metadata: dict | None = None,
+        timestamp: str | None = None,
+    ) -> str:
+        ts = (
+            timestamp
+            if isinstance(timestamp, str) and timestamp
+            else datetime.now().isoformat()
+        )
         message = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": ts,
             "metadata": metadata or {},
         }
         self._shadow_last_activity = time.monotonic()
         self._push_message(message)
+        return ts
 
     def _forget_applied(self, op_id: str) -> None:
         try:

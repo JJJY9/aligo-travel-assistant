@@ -284,7 +284,7 @@ def test_conversation_ask_releases_probe_on_cancel(monkeypatch):
         async def get_long_term_summary_async(self, max_messages=30):
             return ""
 
-        def add_message(self, role, content, metadata=None):
+        def add_message(self, role, content, metadata=None, timestamp=None):
             pass
 
     class _Intention:

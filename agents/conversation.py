@@ -783,7 +783,15 @@ class ConversationRuntime:
                                 content, str
                             ):
                                 continue
-                            self.memory.short_term.add_message(role, content)
+                            self.memory.short_term.add_message(
+                                role,
+                                content,
+                                timestamp=(
+                                    item.get("timestamp")
+                                    if isinstance(item.get("timestamp"), str)
+                                    else None
+                                ),
+                            )
                     else:
                         # 降级窗口：写入进程内影子缓存（不登记故障重放），
                         # 编排器 / 子智能体本轮也能读到回填的历史；恢复后
