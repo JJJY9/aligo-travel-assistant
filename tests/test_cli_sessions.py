@@ -1570,6 +1570,7 @@ def test_session_title_newline_cannot_forge_rows(monkeypatch):
 if __name__ == "__main__":
     # 直跑模式自动发现全部用例（monkeypatch 自动提供；pytest.skip 条件
     # 跳过不再中断整体，跳过数量明确报告）
+    import asyncio
     import inspect
     import pathlib
     import tempfile
@@ -1598,7 +1599,12 @@ if __name__ == "__main__":
             skipped += 1
             continue
         try:
-            func(**kwargs)
+            # async def 用例同样要真正执行：直接调用只创建 coroutine，
+            # 断言从不运行，直跑清单会给出假绿
+            if inspect.iscoroutinefunction(func):
+                asyncio.run(func(**kwargs))
+            else:
+                func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1

@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.chat_import import filter_import_messages, prepare_import_messages
+from utils.errors import MemoryPersistenceError
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
@@ -519,6 +520,24 @@ def merged_backup_limit_problem(
         merged_frequent[key] = max(merged_frequent.get(key, 0), value)
     # 真实导出恒含该键（空 dict 也序列化），同形状计入体积
     statistics["frequent_destinations"] = merged_frequent
+    trip_numbers = [
+        int(match.group(1))
+        for match in (
+            re.match(r"trip_(\d+)$", str(trip.get("trip_id") or ""))
+            for trip in merged_trips
+            if isinstance(trip, dict)
+        )
+        # 19 位以上只可能是预演占位（解析层丢弃 18 位以上的真实编号），
+        # 不计入水位
+        if match and int(match.group(1)) < 10**18
+    ]
+    if trip_numbers:
+        # 写入层会按备份编号抬升水位（存储层为新建行补 trip_<水位>）
+        try:
+            existing_last = int(statistics.get("last_trip_number") or 0)
+        except (TypeError, ValueError):
+            existing_last = 0
+        statistics["last_trip_number"] = max(existing_last, *trip_numbers)
     payload["statistics"] = statistics
     return backup_limit_problem(payload)
 
@@ -596,8 +615,15 @@ def _merged_trip_rows(
         # drop_sessions 的内部标记不会落库；存储层为新建行补写 trip_id 与
         # timestamp——预演按落库后的形状计数，避免与真实导入结论不一致
         record.pop(_DROPPED_SESSION_KEY, None)
-        record.setdefault("trip_id", "trip_0")
-        record.setdefault("timestamp", datetime.now().isoformat())
+        # 占位按落库后的最坏形状：存储层补写 trip_<水位>（最长 24 字符），
+        # PG 的导出行时间戳带时区偏移（32 字符）；短占位会低估导出体积
+        record.setdefault("trip_id", "trip_" + "9" * 19)
+        if include_empty_keys:
+            record.setdefault(
+                "timestamp", datetime.now().astimezone().isoformat()
+            )
+        else:
+            record.setdefault("timestamp", datetime.now().isoformat())
         if include_empty_keys:
             # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也
             # 序列化）；JSON 后端没有这两个键
@@ -1045,8 +1071,12 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     # （裸 trip_identity 会把它们折叠，--dry-run 与真实导入结论相反）
     try:
         history_trips = store.get_trip_history(limit=None)
+    except MemoryPersistenceError:
+        # 存储类失败必须落到 503 脱敏分支（ValueError 在 /api/import 会
+        # 被当成用户可修正的请求问题回 400 并原样回显底层错误文本）
+        raise
     except Exception as exc:  # noqa: BLE001 - dry-run 不能给乐观结论
-        raise ValueError(f"读取既有行程失败：{exc}") from exc
+        raise MemoryPersistenceError(f"读取既有行程失败：{exc}") from exc
     pending_keys = {
         key
         for key in (_trip_merge_key(trip) for trip in history_trips)
@@ -1065,8 +1095,10 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     if messages:
         try:
             history = store.get_chat_history(limit=None)
+        except MemoryPersistenceError:
+            raise
         except Exception as exc:  # noqa: BLE001 - dry-run 不能给乐观结论
-            raise ValueError(f"读取既有消息失败：{exc}") from exc
+            raise MemoryPersistenceError(f"读取既有消息失败：{exc}") from exc
         existing = Counter(
             (
                 _message_session_key(message.get("session_id")),

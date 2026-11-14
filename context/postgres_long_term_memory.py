@@ -499,10 +499,13 @@ class PostgresLongTermMemory:
     def save_preference(
         self, pref_type: str, value: Any, *, replay_safe: bool = True
     ) -> None:
-        """写入偏好。``replay_safe=False`` 用于「读 + 合并 + 写」的结果：
-        连接重建后重放会以过期的合并值覆盖空档里其它实例的追加。
-        类型上限在用户级写锁内复核：调用方锁外预检与按类型的锁都挡不住
-        不同新类型的并发新增。"""
+        """写入偏好。类型上限在用户级写锁内复核：调用方锁外预检与按类型
+        的锁都挡不住不同新类型的并发新增。
+
+        ``replay_safe`` 形参保留只为调用方兼容，实际被忽略：偏好 INSERT
+        一律禁止重放——连接重建会释放用户级锁，空档里其它实例可能把类型
+        数补到上限（新类型）或删除该类型使其重放变成新增行（既有类型），
+        都会越过上面的上限复核。"""
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
                 self._enforce_preference_cap(pref_type)
