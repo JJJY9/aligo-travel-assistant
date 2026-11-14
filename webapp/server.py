@@ -2307,6 +2307,17 @@ def _redact_doctor_detail(text: str) -> str:
     return redact_local_paths(cleaned)
 
 
+def _persistence_failure_detail(exc: Exception, request_id: str) -> str:
+    """隔离 / 损坏类持久化失败保留可执行提示（恢复引导），其余用通用文案。"""
+    if "隔离" in str(exc):
+        return (
+            "记忆文件损坏并已隔离备份（路径见服务端日志），"
+            "请使用备份文件恢复后重试"
+            f"（请求 ID：{request_id}）"
+        )
+    return f"存储暂时不可用，请稍后再试（请求 ID：{request_id}）"
+
+
 def _storage_failure(action: str, exc: Exception) -> HTTPException:
     """存储 / 依赖类失败的统一 503：细节只进日志，响应不回显内部路径 / SQL。"""
     logger.warning("%s失败: %s", action, redact_paths(exc))
@@ -4604,9 +4615,8 @@ def create_app(model: Any = None) -> FastAPI:
                 )
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        "存储暂时不可用，请稍后再试"
-                        f"（请求 ID：{_request_id(request)}）"
+                    detail=_persistence_failure_detail(
+                        exc, _request_id(request)
                     ),
                 ) from exc
             except SessionCapacityError as exc:
@@ -4650,9 +4660,8 @@ def create_app(model: Any = None) -> FastAPI:
                 )
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        "存储暂时不可用，请稍后再试"
-                        f"（请求 ID：{_request_id(request)}）"
+                    detail=_persistence_failure_detail(
+                        exc, _request_id(request)
                     ),
                 ) from exc
             except UserFacingError as exc:
@@ -4737,7 +4746,7 @@ def create_app(model: Any = None) -> FastAPI:
                 logger.warning("打开会话失败（%s）: %s", rid, exc)
                 raise HTTPException(
                     status_code=503,
-                    detail=f"存储暂时不可用，请稍后再试（请求 ID：{rid}）",
+                    detail=_persistence_failure_detail(exc, rid),
                 ) from exc
             except SessionCapacityError as exc:
                 logger.warning("会话容纳上限（%s）: %s", rid, exc)

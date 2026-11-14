@@ -11385,6 +11385,22 @@ def test_open_long_term_refuses_quarantined_memory(monkeypatch, tmp_path):
     print("✓ 记忆文件隔离后 Web 接口拒绝空数据（仅 JSON 后端）")
 
 
+def test_persistence_failure_detail_keeps_quarantine_hint():
+    """隔离类持久化失败保留恢复引导文案（与 _open_long_term 的 503 同口径）。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    quarantined = server_module._persistence_failure_detail(
+        MemoryPersistenceError("记忆文件损坏并已隔离备份"), "rid-1"
+    )
+    assert "隔离" in quarantined and "恢复" in quarantined, quarantined
+    assert "rid-1" in quarantined
+    generic = server_module._persistence_failure_detail(
+        MemoryPersistenceError("长期记忆写入失败"), "rid-2"
+    )
+    assert "存储暂时不可用" in generic and "隔离" not in generic, generic
+
+
 def test_open_long_term_forwards_allow_quarantined(monkeypatch, tmp_path):
     """Web 恢复入口（/api/import）把 allow_quarantined=True 传给存储工厂，
     普通打开默认 False——隔离状态下只有恢复能重建主文件。"""
