@@ -281,6 +281,10 @@ def _label_phrase(line: str) -> str | None:
         if stripped == cleaned_line:
             break
         cleaned_line = stripped
+    for group in _PAREN_GROUP_RE.findall(line):
+        # 括号里自称示例（「结果（示例）：」）：整行不是结果标签
+        if re.search(r"示例|例如|样例", group):
+            return None
     if not re.sub(r"[:：=\s]", "", cleaned_line):
         # 整行就是括号里的标签（「（正式结果）：」）：取括号内容
         match = _PAREN_GROUP_RE.search(line)
@@ -353,17 +357,7 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
         previous = cleaned_lines[-2].rstrip()
         if previous.endswith(("：", ":")) and any(
             word in previous
-            for word in (
-                "若",
-                "如果",
-                "如无",
-                "无偏好",
-                "返回",
-                "输出",
-                "格式",
-                "如下",
-                "需要",
-            )
+            for word in ("若", "如果", "如无", "无偏好", "需要")
         ):
             # 折行指令 / 条件说明：「（…若本轮没有新偏好，按格式返回：」
             # 换行后跟「结果：[]）」——标签行是续行，不是独立结果标签。

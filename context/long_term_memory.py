@@ -720,8 +720,11 @@ class LongTermMemory:
                 with file_lock(self.db_path):
                     # 存在性检查放在锁内：并发恢复（另一进程 / 请求）在
                     # 检查与写入之间重建了主文件时，不能用本实例的隔离态
-                    # 空快照把它覆盖
+                    # 空快照把它覆盖——刷新到磁盘内容即可
                     if os.path.exists(self.db_path):
+                        self._reload_latest()
+                        self._corrupt_pending = False
+                        self._corrupt_backup = None
                         return
                     self._persist()
             except TimeoutError as exc:
