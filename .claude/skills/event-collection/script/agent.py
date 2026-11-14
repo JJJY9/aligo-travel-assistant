@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+from typing import Any
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
@@ -127,34 +128,84 @@ def _is_authoritative_empty(obj: dict) -> bool:
     )
 
 
-# 回显示例句的识别：取候选前文本最后一个非空、非围栏行的最后一个冒号
-# 之后的短语（剔除加粗 / 标题 / 方括号等装饰）——「示例：」「**示例：**」
-# 「【示例】」都算；叙述句（「按照示例格式，提取结果如下：」）不算。
-_EXAMPLE_LABELS = frozenset(
-    {"示例", "例如", "样例", "示例输出", "示例结果", "示例内容", "示例格式"}
-)
+# 候选标签：取候选前最后一个非空、非围栏行；行内只允许「一个短语」（可带
+# 引导词「以下是/本次」等），剔除加粗 / 标题 / 方括号装饰。示例短语按前缀
+# 识别（示例、示例1、示例（北京行程）、输出示例…），叙述句不算。
+_EXAMPLE_LABELS = frozenset({"输出示例", "输出样例", "格式示例", "示例输出"})
+_LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次")
 
 
-def _event_label_is_example(label: str) -> bool:
+def _event_label_phrase(label: str) -> str | None:
     line = ""
     for item in label.splitlines():
         cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
             line = cleaned
     if not line:
-        return False
+        return None
     decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
-    phrase = re.split(r"[:：=]", decoration_free.rstrip(":：="))[-1]
-    # 「以下是本次正式结果：」这类说明句：剥掉常见引导词后仍要求整词命中
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    if not parts:
+        return None
+    if any(part not in _LEAD_INS for part in parts[:-1]):
+        # 行内还有其它短语（示例：正式结果、说明：…）：不是纯标签行
+        return None
+    phrase = parts[-1]
     changed = True
     while changed:
         changed = False
-        for lead in ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次"):
+        for lead in _LEAD_INS:
             if phrase.startswith(lead) and len(phrase) > len(lead):
                 phrase = phrase[len(lead):]
                 changed = True
                 break
-    return phrase in _EXAMPLE_LABELS
+    return phrase
+
+
+def _event_label_is_example(label: str) -> bool:
+    phrase = _event_label_phrase(label)
+    if not phrase:
+        return False
+    return phrase.startswith(("示例", "例如", "样例")) or phrase in _EXAMPLE_LABELS
+
+
+# missing_info 条目 → 提取字段：用于判断「信息不足」声明与实质提取是否矛盾
+# （缺的字段恰恰是提取里已有值的字段 = 示例回显之后的终态，空结果才可信；
+# 缺的是提取里本来就没有的字段 = 补充说明，保留提取）。
+_MISSING_FIELD_RULES = (
+    (("返程地", "返回地", "回程地"), ("return_location",)),
+    (("返程日期", "回程日期", "返回日期", "结束日期"), ("end_date",)),
+    (("出发日期", "出发时间", "开始日期", "出行日期", "行程日期", "日期", "时间"), ("start_date", "end_date", "duration_days")),
+    (("出发地", "出发城市", "起点", "出发"), ("origin",)),
+    (("目的地", "目的城市", "终点"), ("destination",)),
+    (("返程", "回程", "返回"), ("end_date", "return_location")),
+    (("事由", "目的"), ("trip_purpose",)),
+    (("天数", "时长"), ("duration_days",)),
+)
+_ALL_FIELDS_WORDS = ("所有信息", "全部信息", "全部字段", "所有字段", "必要信息", "关键信息")
+
+
+def _missing_contradicts_substantive(
+    missing_items: list[Any], substantive: dict
+) -> bool:
+    for item in missing_items:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        text = item.strip()
+        if any(word in text for word in _ALL_FIELDS_WORDS):
+            if _plan_score(substantive) > 0:
+                return True
+            continue
+        for keywords, fields in _MISSING_FIELD_RULES:
+            if any(word in text for word in keywords):
+                if any(_has_event_value(substantive.get(field)) for field in fields):
+                    return True
+                break
+    return False
 
 
 def _normalize_event_date(text: str) -> str | None:
@@ -215,9 +266,7 @@ def _select_event_result(text: str) -> dict | None:
     """
     last_any: dict | None = None
     last_any_end = -1
-    substantive: dict | None = None
-    substantive_end = -1
-    substantive_is_example = False
+    substantives: list[tuple[dict, int, bool]] = []
     explicit_empty: dict | None = None
     explicit_empty_end = -1
     failed_tail = False
@@ -235,23 +284,28 @@ def _select_event_result(text: str) -> dict | None:
         last_any, last_any_end = candidate, end
         failed_tail = False
         if _plan_score(candidate) > 0:
-            substantive, substantive_end, substantive_is_example = (
-                candidate,
-                end,
-                label_example,
-            )
+            substantives.append((candidate, end, label_example))
         elif _is_explicit_empty(candidate):
             explicit_empty, explicit_empty_end = candidate, end
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    # 回显示例不参与实质候选竞争（全是示例时才兜底）
+    real = [item for item in substantives if not item[2]] or substantives
+    substantive, substantive_end, substantive_is_example = (
+        real[-1] if real else (None, -1, False)
+    )
     if substantive is not None and explicit_empty is not None:
         if explicit_empty_end > substantive_end:
-            # 后置空结果按位置胜出的两类情形：形状上确定是本轮终稿
-            # （计数 0 / 全 null 字段表），或更早的实质候选是回显示例
-            # （示例之后出现「信息不足」声明：绝不把示例字段写库）。
-            # 其余无标签 / 未识别标签的局部 missing_info 尾注是补充说明，
-            # 不能顶掉真实提取
-            if _is_authoritative_empty(explicit_empty) or substantive_is_example:
+            # 后置空结果按位置胜出：形状上确定是本轮终稿（计数 0 / 全 null
+            # 字段表），缺失声明与实质提取矛盾（缺的字段提取里明明有值 =
+            # 示例回显之后的终态），或更早的实质候选是回显示例。其余局部
+            # missing_info 尾注是补充说明，不能顶掉真实提取
+            missing_items = explicit_empty.get("missing_info") or []
+            if (
+                _is_authoritative_empty(explicit_empty)
+                or substantive_is_example
+                or _missing_contradicts_substantive(missing_items, substantive)
+            ):
                 chosen, chosen_end = explicit_empty, explicit_empty_end
             else:
                 chosen, chosen_end = substantive, substantive_end

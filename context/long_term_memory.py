@@ -139,6 +139,10 @@ def _locked_mutation(func):
             except TimeoutError as exc:
                 # 写锁超时按持久化失败处理：不触发整轮对话重试 / 熔断器
                 raise MemoryPersistenceError(f"长期记忆写锁等待超时：{exc}") from exc
+            finally:
+                # 写前补备份的「允许重建」只覆盖本次写入：长会话后续再遇
+                # 外部隔离（主文件缺失 + 存在备份）时必须重新被守卫拦截
+                self._may_recreate = False
 
     return wrapper
 

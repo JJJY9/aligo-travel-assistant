@@ -116,12 +116,10 @@ def _has_nonempty_daily_plans(value: dict) -> bool:
     return False
 
 
-# 候选标签取候选前文本最后一个非空、非围栏行的最后一个冒号之后的短语
-# （剔除加粗 / 标题 / 方括号等装饰）——「示例：」「**补充：**」「【尾注】」
-# 都算；叙述句（「根据您补充的信息，行程如下：」）不算。
-_EXAMPLE_LABELS = frozenset(
-    {"示例", "例如", "样例", "示例输出", "示例结果", "示例内容", "示例格式"}
-)
+# 候选标签：取候选前最后一个非空、非围栏行；行内只允许「一个短语」（可带
+# 引导词「以下是/本次」等），剔除加粗 / 标题 / 方括号装饰。示例短语按前缀
+# 识别（示例、示例1、示例（北京行程）、输出示例…），叙述句不算。
+_EXAMPLE_LABELS = frozenset({"输出示例", "输出样例", "格式示例", "示例输出"})
 _SUPPLEMENT_LABELS = frozenset(
     {
         "补充",
@@ -148,31 +146,60 @@ _SUPPLEMENT_LABELS = frozenset(
     }
 )
 _FORMAL_LABELS = frozenset(
-    {"正式", "正式行程", "结果", "最终", "最终结果", "答案", "终稿"}
+    {
+        "正式",
+        "正式行程",
+        "正式结果",
+        "结果",
+        "结果如下",
+        "最终",
+        "最终结果",
+        "最终输出",
+        "输出结果",
+        "答案",
+        "终稿",
+    }
 )
+_LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次")
 
 
-def _label_kind(label: str) -> str:
-    """候选对象前的标签：example / supplement / formal / neutral。"""
+def _label_phrase(label: str) -> str | None:
     line = ""
     for item in label.splitlines():
         cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
             line = cleaned
     if not line:
-        return "neutral"
+        return None
     decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
-    phrase = re.split(r"[:：=]", decoration_free.rstrip(":：="))[-1]
-    # 「以下是本次正式结果：」这类说明句：剥掉常见引导词后仍要求整词命中
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    if not parts:
+        return None
+    if any(part not in _LEAD_INS for part in parts[:-1]):
+        # 行内还有其它短语（示例：正式结果、说明：…）：不是纯标签行
+        return None
+    phrase = parts[-1]
     changed = True
     while changed:
         changed = False
-        for lead in ("以下是", "以下为", "下面是", "如下是", "这里是", "这是", "本次"):
+        for lead in _LEAD_INS:
             if phrase.startswith(lead) and len(phrase) > len(lead):
                 phrase = phrase[len(lead):]
                 changed = True
                 break
-    if phrase in _EXAMPLE_LABELS:
+    return phrase
+
+
+def _label_kind(label: str) -> str:
+    """候选对象前的标签：example / supplement / formal / neutral。"""
+    phrase = _label_phrase(label)
+    if not phrase:
+        return "neutral"
+    if phrase.startswith(("示例", "例如", "样例")) or phrase in _EXAMPLE_LABELS:
         return "example"
     if phrase in _SUPPLEMENT_LABELS:
         return "supplement"
@@ -189,11 +216,11 @@ def _select_plan_result(text: str) -> dict | None:
     正式结果之后的尾注弱对象（duration / note）又会被当成结果包装成
     itinerary、整份真实行程被静默丢弃。现在的判定顺序：
 
-    1. 回显示例候选（「示例：」标签）不参与竞争（全是示例时才兜底）；
+    1. 回显示例候选（「示例：/示例1：/示例（…）：」前缀）不参与竞争
+       （全是示例时才兜底）；
     2. 补充 / 尾注标签的弱候选（无排期内容）不参与终稿竞争；
-    3. 其余候选按位置取最后一个；若最后一个是无排期内容的弱候选、且
-       之前存在带排期内容的完整行程，视其为尾注、选完整行程——除非该
-       弱候选带「正式：/结果：」标签（本轮终稿仍按位置胜出）。
+    3. 其余候选按位置取最后一个——模型的本轮终稿总是最后输出，无标签的
+       尾注与无标签的回显示例在结构上不可区分，按「最后表态」优先。
 
     两者都没有时退回最后一个行程形状对象（由调用方校验不足时报错）。
     末尾截断时抛错不回退。
@@ -228,19 +255,7 @@ def _select_plan_result(text: str) -> dict | None:
         )
     ] or real
     if strong:
-        last = strong[-1]
-        if not _has_nonempty_daily_plans(last[0]) and last[2] != "formal":
-            earlier_rich = [
-                item
-                for item in strong
-                if item[1] < last[1] and _has_nonempty_daily_plans(item[0])
-            ]
-            if earlier_rich:
-                chosen, chosen_end, _ = earlier_rich[-1]
-            else:
-                chosen, chosen_end, _ = last
-        else:
-            chosen, chosen_end, _ = last
+        chosen, chosen_end, _ = strong[-1]
     elif last_any is not None:
         chosen, chosen_end = last_any, last_any_end
     else:
