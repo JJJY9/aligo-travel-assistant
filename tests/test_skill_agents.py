@@ -2382,6 +2382,47 @@ def test_preference_post_array_ordinary_prose_rejected():
     print("✓ 偏好：数组后普通散文不判正式")
 
 
+def test_preference_wrapper_key_arrays_do_not_become_garbage_types():
+    """裸数组元素是包装对象（preferences / note / has_preferences）：
+    包装键不展开成偏好类型，内层真实结果按对象路径解析。"""
+    wrapped = (
+        '[{"preferences": [{"type": "hotel_brands", "value": ["汉庭"]}]}]'
+    )
+    data = _pref_reply(wrapped)
+    assert data["preferences"] == [
+        {"type": "hotel_brands", "value": ["汉庭"]}
+    ], data
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert '"type": "preferences"' not in rendered, data
+
+    note = _pref_reply('[{"note": "未发现明确偏好"}]')
+    assert "note" not in json.dumps(note.get("preferences") or [], ensure_ascii=False), note
+    assert note.get("error") or note.get("has_preferences") is not True, note
+    print("✓ 偏好：包装键数组不产生垃圾偏好类型")
+
+
+def test_preference_inline_example_array_after_real_result():
+    """真实对象与「示例：[…]」同一行：示例数组不参与竞争。"""
+    payload = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]} 示例：'
+        '[{"type": "hotel_brands", "value": "汉庭"}]'
+    )
+    data = _pref_reply(payload)
+    assert data["preferences"] == [
+        {"type": "home_location", "value": "上海"}
+    ], data
+    print("✓ 偏好：同行示例数组不顶掉真实结果")
+
+
+def test_preference_inline_example_empty_then_formal_empty():
+    """「示例：[] 正式结果：[]」同一行：行内前置空数组剥离后判正式空结果。"""
+    data = _pref_reply("示例：[] 正式结果：[]")
+    assert data.get("has_preferences") is False, data
+    assert not data.get("error"), data
+    print("✓ 偏好：同行前置示例空数组后仍判正式空结果")
+
+
 def test_preference_instruction_suffix_phrase_not_formal():
     """「返回结果 / 若无偏好返回结果」不算结果标签：真实偏好保留。"""
     formal = (
@@ -2670,6 +2711,41 @@ def test_event_collection_zero_count_template_fields_sanitized():
     assert not data.get("start_date"), data
     assert data.get("missing_info") == ["出发日期"], data
     print("✓ 事项收集：count=0 模板字段终稿按空结果清洗")
+
+
+def test_event_collection_string_zero_count_template_sanitized():
+    """extracted_count 为 "0" / 0.0 的模板字段终稿同样按空结果清洗。"""
+    for count in ('"0"', "0.0"):
+        template = (
+            '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+            f'"missing_info": ["出发日期"], "extracted_count": {count}}}'
+        )
+        data = _event_reply('结果：{"origin": "上海", "destination": "杭州"}' + "\n" + template)
+        assert data.get("destination") is None, (count, data)
+    print("✓ 事项收集：字符串 / 浮点零计数模板终稿清洗")
+
+
+def test_event_collection_self_contradictory_terminal_sanitized():
+    """计数缺失、自称缺失的字段自身却有值（模板残留）：按空结果清洗。"""
+    template = (
+        '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"missing_info": ["出发地", "目的地"], "summary": "未提供"}'
+    )
+    data = _event_reply('结果：{"origin": "上海", "destination": "杭州"}' + "\n" + template)
+    assert data.get("destination") is None, data
+    print("✓ 事项收集：自相矛盾的模板终稿清洗")
+
+
+def test_event_collection_colon_limited_example_label():
+    """「示例：北京行程」式冒号限定示例标签：后置示例不压过真实提取。"""
+    real = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    example = '示例：北京行程 {"origin": "北京", "destination": "北京", "start_date": "2026-02-27"}'
+    data = _event_reply(f"{real}" + "\n" + example)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：冒号限定示例标签不压过真实提取")
 
 
 def test_event_collection_generic_time_word_tail_keeps_extraction():
@@ -2987,6 +3063,16 @@ def test_plan_trip_domain_paren_example_label():
     assert data.get("error") is None, data
     assert data["itinerary"]["title"] == "杭州出差", data
     print("✓ 行程规划：领域词括号示例不参与竞争")
+
+
+def test_plan_trip_colon_limited_example_label():
+    """「示例：北京行程」式冒号限定标签按示例处理：真实行程保留。"""
+    real = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    example = '示例：北京行程 {"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    data = _plan_trip_reply(f"{real}" + "\n" + example)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：冒号限定示例标签不参与竞争")
 
 
 def test_plan_trip_narrative_example_sentence_not_example_label():

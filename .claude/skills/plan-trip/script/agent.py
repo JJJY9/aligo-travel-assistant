@@ -173,6 +173,17 @@ _PAREN_EXAMPLE_OUTER = frozenset(
 )
 
 
+def _colon_example_marker(line: str) -> bool:
+    """「示例：北京行程」式标签：冒号前的短语本身就是示例词。"""
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    return bool(parts) and parts[0] in _PAREN_EXAMPLE
+
+
 def _paren_example_marker(line: str) -> bool:
     """括号里自称示例的短标签（「结果（示例）：」「（示例）：」）。
 
@@ -256,7 +267,9 @@ def _label_kind(label: str) -> str:
         cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
             line = cleaned
-    if line and _paren_example_marker(line):
+    if line and (
+        _paren_example_marker(line) or _colon_example_marker(line)
+    ):
         return "example"
     phrase = _label_phrase(label)
     if not phrase:

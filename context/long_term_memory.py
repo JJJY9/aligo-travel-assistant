@@ -1827,9 +1827,16 @@ class LongTermMemory:
                             continue
                         except OSError:
                             failed.append(str(backup))
+                    migrate_backup = f"{self.db_path}.migrate-backup"
+                    try:
+                        os.remove(migrate_backup)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        failed.append(migrate_backup)
                     if failed:
                         raise MemoryPersistenceError(
-                            "删除长期记忆时无法移除隔离备份："
+                            "删除长期记忆时无法移除备份文件："
                             + "、".join(failed)
                         )
                     self._corrupt_backup = None

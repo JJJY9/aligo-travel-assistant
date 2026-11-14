@@ -103,9 +103,19 @@ def _is_explicit_empty(obj: dict) -> bool:
 
 
 def _is_counted_empty(obj: dict) -> bool:
-    """带计数（extracted_count == 0）的显式空结果。"""
+    """带计数（extracted_count == 0）的显式空结果。
+
+    兼容模型的数字类写法：0 / 0.0 / "0" / "0.0"。"""
     count = obj.get("extracted_count")
-    return isinstance(count, int) and not isinstance(count, bool) and count == 0
+    if isinstance(count, bool):
+        return False
+    if isinstance(count, int):
+        return count == 0
+    if isinstance(count, float):
+        return count == 0.0
+    if isinstance(count, str):
+        return count.strip() in ("0", "0.0")
+    return False
 
 
 def _has_full_event_schema(obj: dict) -> bool:
@@ -211,6 +221,17 @@ _PAREN_EXAMPLE_OUTER = frozenset(
 )
 
 
+def _colon_example_marker(line: str) -> bool:
+    """「示例：北京行程」式标签：冒号前的短语本身就是示例词。"""
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    return bool(parts) and parts[0] in _PAREN_EXAMPLE
+
+
 def _paren_example_marker(line: str) -> bool:
     """括号里自称示例的短标签（「结果（示例）：」「（示例）：」）。
 
@@ -301,7 +322,9 @@ def _event_label_is_example(label: str) -> bool:
         cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
         if cleaned:
             line = cleaned
-    if line and _paren_example_marker(line):
+    if line and (
+        _paren_example_marker(line) or _colon_example_marker(line)
+    ):
         return True
     return _is_example_phrase(_event_label_phrase(label))
 
@@ -466,9 +489,13 @@ def _select_event_result(text: str) -> dict | None:
             continue
         last_any, last_any_end = candidate, end
         failed_tail = False
-        if _is_authoritative_empty(candidate):
-            # extracted_count == 0 / 全 null 终稿：即使模型沿用了模板的
-            # 非空字段（未置 null），也必须按空结果处理
+        missing_items = candidate.get("missing_info") or []
+        self_contradicts = _plan_score(candidate) > 0 and (
+            _missing_contradicts_substantive(missing_items, candidate)
+        )
+        if _is_authoritative_empty(candidate) or self_contradicts:
+            # extracted_count == 0 / 全 null 终稿 / 自称缺失的字段自身却有值
+            # 的模板残留：按空结果处理并清洗字段
             candidate = _sanitize_empty(candidate)
         if _plan_score(candidate) > 0:
             substantives.append(
