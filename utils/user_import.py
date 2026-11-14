@@ -405,6 +405,11 @@ def merged_backup_limit_problem(
 
     ``backup_limit_problem`` 只看备份自身：小备份恢复到接近上限的账号后，
     账号仍会因导出体积永久 413。这里把现有数据与备份合并后再复核。
+
+    合并按导入层的去重语义预演：备份里与现有数据重复的消息 / 行程会被
+    跳过或更新，不进入合并结果——直接用「现有 + 备份」拼接会让重导自己
+    备份的账号组合体积约为两倍，接近上限时被误判为恢复后超限（幂等恢复
+    失效、--dry-run 与真实执行结论相反）。
     """
     if not isinstance(sections, dict):
         return None
@@ -438,9 +443,9 @@ def merged_backup_limit_problem(
         merged_titles.update(incoming_titles)
     payload = {
         "chat_history": list(existing.get("chat_history") or [])
-        + list(sections.get("messages") or []),
+        + _new_message_rows(store, sections.get("messages") or []),
         "trip_history": list(existing.get("trip_history") or [])
-        + list(sections.get("trips") or []),
+        + _new_trip_rows(store, sections.get("trips") or []),
         "preferences": merged_prefs,
         "knowledge": sections.get("knowledge") or [],
         "session_titles": merged_titles,
@@ -460,6 +465,55 @@ def merged_backup_limit_problem(
         ),
     }
     return backup_limit_problem(payload)
+
+
+def _new_message_rows(store: Any, messages: list[Any]) -> list[Any]:
+    """按写入层去重语义挑出备份里真正会新增的消息行。
+
+    读取既有历史失败时保守返回全部行（与 ``_planned_new_counts`` 同口径：
+    宁可误判超限，也不能放过真正会超限的恢复）。
+    """
+    if not messages:
+        return []
+    history_getter = getattr(store, "get_chat_history", None)
+    if not callable(history_getter):
+        return list(messages)
+    try:
+        history = history_getter() or []
+        existing = Counter(
+            (
+                _message_session_key(message.get("session_id")),
+                message.get("role"),
+                str(message.get("content") or ""),
+            )
+            for message in history
+        )
+        return list(
+            filter_import_messages(prepare_import_messages(messages), existing)
+        )
+    except Exception:  # noqa: BLE001 - 预演失败按全部新增保守处理
+        return list(messages)
+
+
+def _new_trip_rows(store: Any, trips: list[Any]) -> list[Any]:
+    """按行程身份去重挑出备份里真正会新增的行程行（同批内也去重）。"""
+    if not trips:
+        return []
+    history_getter = getattr(store, "get_trip_history", None)
+    if not callable(history_getter):
+        return list(trips)
+    try:
+        known = {trip_identity(trip) for trip in history_getter(limit=None)}
+    except Exception:  # noqa: BLE001 - 读取失败按全部新增保守处理
+        return list(trips)
+    fresh: list[Any] = []
+    for trip in trips:
+        key = trip_identity(trip)
+        if key in known:
+            continue
+        known.add(key)
+        fresh.append(trip)
+    return fresh
 
 
 def sections_limit_problem(sections: dict[str, Any]) -> str | None:

@@ -11334,20 +11334,23 @@ def test_chat_lock_wait_is_bounded(monkeypatch):
     print("✓ SSE 对话锁等待有界并探测断连")
 
 def test_open_long_term_refuses_quarantined_memory(monkeypatch, tmp_path):
-    """JSON 记忆被隔离后 Web 打开存储必须 503，不能当作空数据继续。"""
+    """JSON 记忆被隔离后 Web 打开存储必须 503，不能当作空数据继续；
+    PostgreSQL 后端不受同目录遗留的 .corrupt-* 文件影响。"""
     from fastapi import HTTPException
     from webapp import server as server_module
 
     monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
 
-    class _Store:
+    class _JsonStore:
+        db_path = str(tmp_path / "u-quarantine.json")
+
         def close(self):
             pass
 
     monkeypatch.setattr(
         server_module,
         "create_long_term_memory",
-        lambda *args, **kwargs: _Store(),
+        lambda *args, **kwargs: _JsonStore(),
     )
     # 主文件已被存储层移走，只剩隔离备份：/api/export 之前会返回 200 空备份
     (tmp_path / "u-quarantine.json.corrupt-20260101000000000000-1").write_text(
@@ -11358,10 +11361,28 @@ def test_open_long_term_refuses_quarantined_memory(monkeypatch, tmp_path):
     assert info.value.status_code == 503
     assert "隔离" in info.value.detail
 
+    # PostgreSQL 后端（无 db_path）不回退扫描 JSON 目录：遗留隔离文件
+    # 与该账号无关，扫描会让其所有请求永久 503 且导入恢复永远清不掉
+    class _PgStore:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _PgStore(),
+    )
+    assert server_module._open_long_term("u-quarantine") is not None
+
+    monkeypatch.setattr(
+        server_module,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _JsonStore(),
+    )
     # 用户用备份恢复出主文件后不再拦截
     (tmp_path / "u-quarantine.json").write_text("{}", encoding="utf-8")
     assert server_module._open_long_term("u-quarantine") is not None
-    print("✓ 记忆文件隔离后 Web 接口拒绝空数据")
+    print("✓ 记忆文件隔离后 Web 接口拒绝空数据（仅 JSON 后端）")
 
 def test_trips_and_status_sanitize_lone_surrogates(monkeypatch):
     """历史数据里的孤立代理项不能让 /api/trips、/api/status、去重接口 500。"""

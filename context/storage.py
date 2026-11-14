@@ -205,7 +205,10 @@ def create_short_term_memory(
 
 
 def create_long_term_memory(
-    user_id: str, storage_path: str = "data/memory", strict: bool = False
+    user_id: str,
+    storage_path: str = "data/memory",
+    strict: bool = False,
+    allow_quarantined: bool = False,
 ) -> LongTermStore:
     """创建长期记忆：优先 PostgreSQL（如已配置且可用），否则 JSON 文件。
 
@@ -213,6 +216,10 @@ def create_long_term_memory(
     （连接失败 / 失败冷却期）时抛 ``MemoryPersistenceError``，而不是静默
     回退到 JSON——在回退库上「删除成功」会留下 PostgreSQL 里的数据，冷却
     结束后会话 / 消息重新出现。
+
+    ``allow_quarantined=True`` 仅用于恢复入口（user-import / /api/import）：
+    记忆文件损坏被隔离后，只有恢复备份能重建主文件；普通实例在「主文件
+    缺失 + 存在 .corrupt-* 隔离备份」时拒绝写回重建。
     """
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
     if dsn and not _failed_recently(f"postgres:{dsn}"):
@@ -236,7 +243,11 @@ def create_long_term_memory(
                     raise MemoryPersistenceError(
                         "PostgreSQL 处于故障冷却期，操作暂不可用，请稍后再试"
                     )
-                return LongTermMemory(user_id, storage_path)
+                return LongTermMemory(
+                    user_id,
+                    storage_path,
+                    allow_quarantined=allow_quarantined,
+                )
         try:
             memory = PostgresLongTermMemory(user_id, dsn)
             _ACTUAL_BACKEND["long_term"] = "postgres"
@@ -266,7 +277,9 @@ def create_long_term_memory(
             "PostgreSQL 处于故障冷却期，删除操作暂不可用，请稍后再试"
         )
     _ACTUAL_BACKEND["long_term"] = "json"
-    return LongTermMemory(user_id, storage_path)
+    return LongTermMemory(
+        user_id, storage_path, allow_quarantined=allow_quarantined
+    )
 
 
 def reset_failure_cache() -> None:

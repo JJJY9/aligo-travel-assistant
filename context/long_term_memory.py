@@ -154,13 +154,21 @@ class LongTermMemory:
     # JSON 实现把数据快照放在内存中，多会话写入后需要重新加载
     snapshot_based = True
 
-    def __init__(self, user_id: str, storage_path: str = "data/memory"):
+    def __init__(
+        self,
+        user_id: str,
+        storage_path: str = "data/memory",
+        *,
+        allow_quarantined: bool = False,
+    ):
         """
         初始化长期记忆
 
         Args:
             user_id: 用户ID
             storage_path: 存储路径
+            allow_quarantined: 允许在「主文件缺失 + 存在隔离备份」时重建
+                主文件（仅恢复入口使用：user-import / /api/import）
         """
         self.user_id = user_id
         # 相对路径锚定到项目根目录，避免从其它目录运行时数据写到 CWD（Issue #5）
@@ -170,6 +178,7 @@ class LongTermMemory:
         self.storage_path = str(storage)
         self.db_path = os.path.join(self.storage_path, f"{user_id}.json")
         self._write_lock = _lock_for_path(self.db_path)
+        self._allow_quarantined = allow_quarantined
 
         # 确保存储目录存在
         Path(self.storage_path).mkdir(parents=True, exist_ok=True)
@@ -180,6 +189,10 @@ class LongTermMemory:
         self._corrupt_pending = False
         # 本次启动时被隔离的损坏记忆文件路径（供 CLI 报告，无损坏为 None）
         self._corrupt_backup: str | None = None
+        # 本实例亲自完成过隔离（损坏文件由它备份）。只有这种实例允许在
+        # 空快照上继续写回重建；「主文件缺失 + 存在别人的隔离备份」表示
+        # 隔离发生在别处，普通写回会把隔离状态掩盖成正常写入
+        self._may_recreate = False
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -235,6 +248,7 @@ class LongTermMemory:
                                 try:
                                     os.replace(self.db_path, backup)
                                     self._corrupt_backup = backup
+                                    self._may_recreate = True
                                     logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 except OSError as backup_error:
                                     # 文件可能仍被其它进程持有：先以空快照启动，
@@ -255,8 +269,26 @@ class LongTermMemory:
                         )
                         return self._init_data()
             else:
-                logger.info("No existing long-term memory, creating new")
+                backups = self._corrupt_siblings()
+                if backups:
+                    # 主文件已被其它进程 / 实例隔离：把标记带在新实例上，
+                    # 上层守卫（CLI / Web / 导出）据此识别「数据被隔离」，
+                    # 而不是当成「用户没有数据」返回空备份
+                    self._corrupt_backup = str(backups[-1])
+                    logger.warning(
+                        "记忆主文件缺失且存在隔离备份：%s", backups[-1]
+                    )
+                else:
+                    logger.info("No existing long-term memory, creating new")
                 return self._init_data()
+
+    def _corrupt_siblings(self) -> list[Path]:
+        """主文件同目录下的 ``<user>.json.corrupt-*`` 隔离备份（按名排序）。"""
+        try:
+            base = Path(self.db_path)
+            return sorted(base.parent.glob(base.name + ".corrupt-*"))
+        except OSError:
+            return []
 
     def _check_owner_case(self, data: dict[str, Any]) -> None:
         """大小写不敏感文件系统上防止跨账号读写同一记忆文件。
@@ -315,6 +347,7 @@ class LongTermMemory:
                     f"（可手动处理 {self.db_path}）"
                 ) from exc
             self._corrupt_backup = backup
+            self._may_recreate = True
             logger.warning("损坏的记忆文件已补备份到 %s", backup)
         self._corrupt_pending = False
 
@@ -331,6 +364,16 @@ class LongTermMemory:
                 raw = f.read()
             data = json.loads(raw)
         except FileNotFoundError:
+            backups = self._corrupt_siblings()
+            if backups and not self._allow_quarantined and not self._may_recreate:
+                # 主文件缺失 + 存在隔离备份：损坏文件已被隔离。沿用内存
+                # 快照写回会重建主文件、让隔离备份从此不可见（恢复提示
+                # 与隔离守卫全部失效）；只有显式以「恢复」打开的实例
+                # （user-import / /api/import）允许重建。
+                raise MemoryPersistenceError(
+                    "记忆主文件缺失且存在损坏隔离备份，已拒绝重建写入"
+                    f"（备份：{backups[-1]}）"
+                )
             return
         except Exception as exc:  # noqa: BLE001 - 损坏文件不能静默沿用旧快照
             # 沿用旧快照写回会覆盖磁盘上更新（或已损坏）的数据、把损坏掩盖成
@@ -1722,9 +1765,12 @@ class LongTermMemory:
         self._persist()
         logger.info("Cleared all history (chat + trips)")
 
-    @_locked_mutation
     def delete_all(self):
-        """删除所有数据（包括文件）。
+        """删除所有数据（包括文件与损坏隔离备份）。
+
+        不经过 ``_locked_mutation``：普通写路径在「主文件缺失 + 存在隔离
+        备份」时会拒绝重建（防止把隔离状态掩盖成正常写入），而删除正是
+        要清掉这些文件——写前重载检查在这里没有意义。
 
         删除后必须重置内存快照：``_reload_latest`` 把「文件不存在」当作
         无需更新，不清空快照的话，同一实例的下一次写入会把已删除的数据
@@ -1732,8 +1778,25 @@ class LongTermMemory:
         """
         with self._write_lock:
             try:
-                os.remove(self.db_path)
-                logger.warning(f"Deleted long-term memory file: {self.db_path}")
-            except FileNotFoundError:
-                pass
-            self.data = self._init_data()
+                with file_lock(self.db_path):
+                    try:
+                        os.remove(self.db_path)
+                        logger.warning(
+                            f"Deleted long-term memory file: {self.db_path}"
+                        )
+                    except FileNotFoundError:
+                        pass
+                    # 隔离备份也是该账号的记忆数据：一并删除，否则删除后的
+                    # 第一次写入会因「主文件缺失 + 存在 .corrupt-*」被拒绝
+                    for backup in self._corrupt_siblings():
+                        try:
+                            os.remove(backup)
+                        except OSError:
+                            pass
+                    self._corrupt_backup = None
+                    self._may_recreate = False
+                    self.data = self._init_data()
+            except TimeoutError as exc:
+                raise MemoryPersistenceError(
+                    f"长期记忆写锁等待超时：{exc}"
+                ) from exc

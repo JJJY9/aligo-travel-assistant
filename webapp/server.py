@@ -1057,9 +1057,13 @@ class _WebSession:
             getter = getattr(long_term, "get_recovered_corrupt_backup", None)
             if callable(getter):
                 marker = getter()
+            if not marker and getattr(long_term, "db_path", None):
+                # 目录扫描只对 JSON 后端有意义：PostgreSQL 后端下遗留的
+                # .corrupt-* 文件与该账号无关（恢复写的是 PG），扫描会让
+                # 所有新会话永久 503
+                marker = _quarantined_memory_backup(user_id)
         except Exception:  # noqa: BLE001 - 探测失败不阻断会话
             marker = None
-        marker = marker or _quarantined_memory_backup(user_id)
         if marker:
             try:
                 self.runtime.close()
@@ -2253,12 +2257,22 @@ def _open_long_term(
         # 为 JSON 后端在这里统一拒绝，避免写入静默丢失。
         raise HTTPException(status_code=422, detail="user_id 非法")
     try:
-        store = create_long_term_memory(user_id, str(MEMORY_DIR), strict=strict)
+        store = create_long_term_memory(
+            user_id,
+            str(MEMORY_DIR),
+            strict=strict,
+            allow_quarantined=allow_quarantined,
+        )
         marker = None
         getter = getattr(store, "get_recovered_corrupt_backup", None)
         if callable(getter):
             marker = getter()
-        marker = marker or _quarantined_memory_backup(user_id)
+        if not marker and getattr(store, "db_path", None):
+            # 只有 JSON 后端才有 .corrupt-* 文件：PostgreSQL 后端下同一
+            # 目录里遗留的隔离文件与该账号无关，扫描会让其所有请求永久
+            # 503（而 /api/import 的豁免恢复写的是 PG、永远不会重建
+            # u1.json 来清标记）
+            marker = _quarantined_memory_backup(user_id)
         # 恢复备份是被隔离账号唯一的产品内恢复路径：/api/import 显式豁免
         if marker and not allow_quarantined:
             close = getattr(store, "close", None)

@@ -572,6 +572,52 @@ def test_corrupt_memory_file_is_backed_up():
     print("✓ 损坏的记忆文件备份后重建（隔离路径可报告）")
 
 
+def test_quarantined_missing_main_blocks_recreate_until_allowed():
+    """主文件缺失 + 存在隔离备份：普通实例标记隔离并拒绝重建主文件；
+    恢复入口（allow_quarantined）可以写回。"""
+    storage_dir = tempfile.mkdtemp()
+    backup = Path(storage_dir) / "u-gone.json.corrupt-20260101000000000000-1"
+    backup.write_text("{broken", encoding="utf-8")
+
+    memory = LongTermMemory("u-gone", storage_dir)
+    assert memory.get_recovered_corrupt_backup() == str(backup)
+    with pytest.raises(MemoryPersistenceError):
+        memory.save_preference("home_location", "北京")
+    assert not (Path(storage_dir) / "u-gone.json").exists(), (
+        "隔离状态下普通写入不能重建主文件"
+    )
+
+    recovery = LongTermMemory("u-gone", storage_dir, allow_quarantined=True)
+    recovery.save_preference("home_location", "北京")
+    assert (Path(storage_dir) / "u-gone.json").exists()
+    assert recovery.get_preference("home_location") == "北京"
+    print("✓ 隔离备份阻止普通写回重建，恢复入口放行")
+
+
+def test_cached_instance_write_cannot_hide_quarantine():
+    """已加载实例（缓存会话）在文件被外部隔离后的下一次写入必须失败，
+    不能再按内存快照写回重建主文件、让隔离备份从此不可见。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-cached", storage_dir)
+    memory.save_preference("home_location", "北京")
+    # 模拟其它进程 / 请求触发隔离：主文件被改名
+    os.replace(
+        Path(storage_dir) / "u-cached.json",
+        Path(storage_dir) / "u-cached.json.corrupt-20260101000000000000-2",
+    )
+    with pytest.raises(MemoryPersistenceError):
+        memory.save_preference("hotel_brands", ["汉庭"])
+    assert not (Path(storage_dir) / "u-cached.json").exists(), (
+        "缓存实例的写入不能重建主文件"
+    )
+
+    # delete_all 连同隔离备份一并清理，删除后的写入不被误拦
+    memory.delete_all()
+    assert not list(Path(storage_dir).glob("u-cached.json.corrupt-*"))
+    memory.save_preference("home_location", "上海")
+    print("✓ 缓存实例写入不掩盖隔离状态；delete_all 一并清理备份")
+
+
 def test_corrupt_backup_does_not_move_concurrently_written_file(monkeypatch):
     """解析失败后、备份前若其它线程写入了新文件，不能把有效数据当损坏文件移走。"""
     import json as json_module
