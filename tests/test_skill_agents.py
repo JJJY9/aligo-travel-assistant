@@ -2154,6 +2154,36 @@ def test_preference_result_phrase_suffix_family():
     print("✓ 偏好：结果短语词族（结果 / 偏好 / 结论）判定")
 
 
+def test_preference_heading_or_parenthetical_labels_still_formal():
+    """普通标题行（「分析：」）之后的正式空结果、括号说明并入标签
+    （「正式结果（本轮无新偏好）：」）都判正式：不回退示例。"""
+    example = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "汉庭"}]}'
+    )
+    cases = [
+        "分析：" + "\n" + "正式结果：[]",
+        "正式结果（本轮无新偏好）：[]",
+    ]
+    for tail in cases:
+        data = _pref_reply(f"示例：{example}" + "\n" + tail)
+        assert data.get("has_preferences") is False, (tail, data)
+        assert "汉庭" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：标题行 / 括号说明并入的正式标签")
+
+
+def test_preference_example_suffix_phrases_not_formal():
+    """「示例结果 / 示例偏好」这类示例短语不算正式结果：真实偏好保留。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    for label in ("示例结果", "示例偏好"):
+        data = _pref_reply(f"{formal}" + "\n" + f"{label}：[]")
+        assert data.get("has_preferences") is True, (label, data)
+    print("✓ 偏好：示例前缀短语不判正式空结果")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2436,6 +2466,58 @@ def test_event_collection_example_labeled_empty_does_not_beat_real_result():
     print("✓ 事项收集：示例标签的空结果不压过真实提取")
 
 
+def test_event_collection_generic_time_phrases_keep_extraction():
+    """「出发时间 / 返程时间 / 返程航班」等泛化时点缺失项不是字段级矛盾
+    声明：无标签 / 「信息不足：」标签的尾注都不顶掉完整提取。"""
+    formal = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"end_date": "2026-12-03", "extracted_count": 6}'
+    )
+    for tail in (
+        '{"missing_info": ["出发时间"]}',
+        '信息不足：{"missing_info": ["返程时间"]}',
+        '{"missing_info": ["返程航班", "返回时间"]}',
+    ):
+        data = _event_reply(f"{formal}" + "\n" + tail)
+        assert data.get("destination") == "杭州", (tail, data)
+    print("✓ 事项收集：泛化时点缺失项不顶掉完整提取")
+
+
+def test_event_collection_fullwidth_paren_labels():
+    """全角括号标签「（尾注）：」「（示例）：」同样生效。"""
+    example = (
+        '（示例）：{"origin": "北京", "destination": "北京", '
+        '"start_date": "2026-02-27", "extracted_count": 7}'
+    )
+    terminal = '{"missing_info": ["出发地", "目的地"]}'
+    data = _event_reply(f"{example}" + "\n" + terminal)
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered, data
+
+    formal = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    tail = '（尾注）：{"missing_info": ["返程地"]}'
+    data = _event_reply(f"{formal}" + "\n" + tail)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：全角括号标签生效")
+
+
+def test_event_collection_tail_does_not_replace_contradiction_terminal():
+    """「示例 → 矛盾终稿 → 尾注」序列：尾注不覆盖终稿记录，示例仍不写库。"""
+    example = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"extracted_count": 7}'
+    )
+    terminal = '{"missing_info": ["出发地", "目的地", "日期"], "summary": "用户未提供出行信息"}'
+    tail = '尾注：{"missing_info": ["返程地"]}'
+    data = _event_reply(f"{example}" + "\n" + terminal + "\n" + tail)
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：尾注不覆盖矛盾终稿")
+
+
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
@@ -2563,6 +2645,12 @@ def test_plan_trip_known_weak_tail_labels_yield_to_full_plan():
         data = _plan_trip_reply(f"{full}" + "\n" + tail)
         assert data["itinerary"]["title"] == "杭州出差", (tail, data)
     print("✓ 行程规划：带标签的弱尾注让位于完整行程")
+
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    paren_tail = '（补充）：{"title": "注意事项", "duration": "2天"}'
+    data = _plan_trip_reply(f"{full}" + "\n" + paren_tail)
+    assert data["itinerary"]["title"] == "杭州出差", data
+
 
 
 def test_plan_trip_supplement_labeled_rich_plan_still_competes():

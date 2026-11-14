@@ -171,7 +171,7 @@ def _event_label_phrase(label: str) -> str | None:
             line = cleaned
     if not line:
         return None
-    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
@@ -208,12 +208,14 @@ _MISSING_FIELD_RULES = (
     (("返程地", "返回地", "回程地"), ("return_location",)),
     (("返程日期", "回程日期", "返回日期", "结束日期"), ("end_date",)),
     (("出发日期", "开始日期", "出行日期", "行程日期"), ("start_date", "end_date", "duration_days")),
-    (("出发地", "出发城市", "起点", "出发"), ("origin",)),
+    (("出发地", "出发城市", "起点"), ("origin",)),
     (("目的地", "目的城市", "终点"), ("destination",)),
-    (("返程", "回程", "返回"), ("end_date", "return_location")),
     (("事由", "目的"), ("trip_purpose",)),
     (("天数", "时长"), ("duration_days",)),
 )
+# 泛化时点词（具体时间 / 出发时间 / 返程航班…）：只说明「时刻/班次」未定，
+# 不是字段级缺失声明，不参与矛盾判定
+_GENERIC_TIME_WORDS = ("时间", "时刻", "钟点", "航班", "车次", "班次", "几点")
 _ALL_FIELDS_WORDS = ("所有信息", "全部信息", "全部字段", "所有字段", "必要信息", "关键信息")
 
 
@@ -226,6 +228,17 @@ def _missing_contradicts_substantive(
         if not isinstance(item, str) or not item.strip():
             continue
         text = item.strip()
+        if any(word in text for word in _GENERIC_TIME_WORDS) and text not in (
+            "出发日期",
+            "开始日期",
+            "出行日期",
+            "行程日期",
+            "返程日期",
+            "回程日期",
+            "返回日期",
+            "结束日期",
+        ):
+            continue
         if any(word in text for word in _ALL_FIELDS_WORDS):
             if _plan_score(substantive) > 0:
                 return True
@@ -299,7 +312,8 @@ def _select_event_result(text: str) -> dict | None:
     substantives: list[tuple[dict, int, bool]] = []
     explicit_empty: dict | None = None
     explicit_empty_end = -1
-    explicit_empty_is_supplement = False
+    last_empty_any: dict | None = None
+    last_empty_any_end = -1
     authoritative_empty: dict | None = None
     authoritative_end = -1
     example_empty: dict | None = None
@@ -329,9 +343,12 @@ def _select_event_result(text: str) -> dict | None:
                 # 回显的空结果示例同样不参与竞争（与实质候选的示例防护对称）
                 example_empty, example_empty_end = candidate, end
                 continue
-            explicit_empty = candidate
-            explicit_empty_end = end
-            explicit_empty_is_supplement = label_phrase in _SUPPLEMENT_LABELS
+            last_empty_any, last_empty_any_end = candidate, end
+            if label_phrase not in _SUPPLEMENT_LABELS:
+                # 带「尾注：/补充：」标签的局部说明不覆盖更早的矛盾终稿，
+                # 也不参与矛盾判定
+                explicit_empty = candidate
+                explicit_empty_end = end
             if _is_authoritative_empty(candidate):
                 authoritative_empty, authoritative_end = candidate, end
     if failed_tail:
@@ -349,19 +366,28 @@ def _select_event_result(text: str) -> dict | None:
         elif explicit_empty is not None and explicit_empty_end > substantive_end:
             # 后置空结果按位置胜出：缺失声明与实质提取矛盾（缺的字段提取
             # 里明明有值 = 示例回显之后的终态），或更早的实质候选是回显
-            # 示例；带「尾注：/补充：」标签的局部说明不参与矛盾判定
+            # 示例。带标签的局部说明不走到这里（见下一条兜底）
             missing_items = explicit_empty.get("missing_info") or []
-            if substantive_is_example or (
-                not explicit_empty_is_supplement
-                and _missing_contradicts_substantive(missing_items, substantive)
+            if substantive_is_example or _missing_contradicts_substantive(
+                missing_items, substantive
             ):
                 chosen, chosen_end = explicit_empty, explicit_empty_end
             else:
                 chosen, chosen_end = substantive, substantive_end
+        elif (
+            substantive_is_example
+            and last_empty_any is not None
+            and last_empty_any_end > substantive_end
+        ):
+            # 回显示例之后出现任何缺失声明（含带「尾注：」标签的）：
+            # 绝不能让示例字段被当成真实提取写库
+            chosen, chosen_end = last_empty_any, last_empty_any_end
         else:
             chosen, chosen_end = substantive, substantive_end
     elif explicit_empty is not None:
         chosen, chosen_end = explicit_empty, explicit_empty_end
+    elif last_empty_any is not None:
+        chosen, chosen_end = last_empty_any, last_empty_any_end
     elif example_empty is not None:
         chosen, chosen_end = example_empty, example_empty_end
     elif last_any is not None:

@@ -145,7 +145,7 @@ def _label_phrase(label: str) -> str | None:
             line = cleaned
     if not line:
         return None
-    decoration_free = re.sub(r"[#*`【】\[\]>\-•\s]", "", line)
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
