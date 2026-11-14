@@ -21,7 +21,11 @@ from utils.chat_import import filter_import_messages, prepare_import_messages
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
-from utils.trip_import import _strict_date, trip_identity
+from utils.trip_import import (
+    _strict_date,
+    normalize_identity_date,
+    trip_identity,
+)
 import os
 
 logger = logging.getLogger(__name__)
@@ -441,11 +445,11 @@ def merged_backup_limit_problem(
     merged_titles = dict(existing_titles)
     if isinstance(incoming_titles, dict):
         merged_titles.update(incoming_titles)
+    existing_messages = list(existing.get("chat_history") or [])
     payload = {
-        "chat_history": list(existing.get("chat_history") or [])
-        + _new_message_rows(store, sections.get("messages") or []),
+        "chat_history": existing_messages
+        + _new_message_rows(existing_messages, sections.get("messages") or []),
         "trip_history": _merged_trip_rows(
-            store,
             list(existing.get("trip_history") or []),
             sections.get("trips") or [],
         ),
@@ -470,83 +474,74 @@ def merged_backup_limit_problem(
     return backup_limit_problem(payload)
 
 
-def _new_message_rows(store: Any, messages: list[Any]) -> list[Any]:
+def _new_message_rows(
+    existing_rows: list[Any], messages: list[Any]
+) -> list[Any]:
     """按写入层去重语义挑出备份里真正会新增的消息行。
 
-    读取既有历史失败时保守返回全部行（与 ``_planned_new_counts`` 同口径：
-    宁可误判超限，也不能放过真正会超限的恢复）。
+    复用合并复核已经取得的现有快照（不再整表重读，避免后台两次读取
+    不是同一快照）；快照读不到时调用方退回只查备份自身。
     """
     if not messages:
         return []
-    history_getter = getattr(store, "get_chat_history", None)
-    if not callable(history_getter):
-        return list(messages)
-    try:
-        history = history_getter() or []
-        existing = Counter(
-            (
-                _message_session_key(message.get("session_id")),
-                message.get("role"),
-                str(message.get("content") or ""),
-            )
-            for message in history
+    existing = Counter(
+        (
+            _message_session_key(message.get("session_id")),
+            message.get("role"),
+            str(message.get("content") or ""),
         )
-        return list(
-            filter_import_messages(prepare_import_messages(messages), existing)
-        )
-    except Exception:  # noqa: BLE001 - 预演失败按全部新增保守处理
-        return list(messages)
+        for message in existing_rows
+        if isinstance(message, dict)
+    )
+    return list(filter_import_messages(prepare_import_messages(messages), existing))
+
+
+def _trip_merge_key(row: dict[str, Any]) -> Any:
+    """与 ``save_trip_histories`` 的索引口径一致：缺目的地 / 出发日期的
+    行不参与去重（返回 None，存储层每行都会新增）。"""
+    destination = row.get("destination")
+    start = normalize_identity_date(row.get("start_date"))
+    if not destination or not start:
+        return None
+    return trip_identity(row)
 
 
 def _merged_trip_rows(
-    store: Any, existing_rows: list[Any], trips: list[Any]
+    existing_rows: list[Any], trips: list[Any]
 ) -> list[Any]:
-    """恢复后行程表的形状：同身份行按导入语义合并，新身份行追加。
+    """恢复后行程表的形状：按 ``save_trip_histories`` 的索引语义预演。
 
-    导入会按 ``trip_identity`` 更新既有行（purpose / session_id / 时间戳），
-    而不是跳过——体积预演必须用更新后的行，否则备份里更大的行会让恢复后
-    的导出体积被低估（放行一个让账号永久无法导出的恢复）。读取既有行程
-    失败时保守返回「现有 + 全部备份行」。
+    - 同身份只有第一条既有行被更新（存储层 ``index.setdefault``），更新
+      purpose / session_id / 时间戳；其余同身份历史行保持原样；
+    - 同批重复的新行先建后更新：后行的 purpose / session_id 覆盖前行，
+      前行其余字段保留（新纪录是整行落库，只回填 purpose 会低估体积）；
+    - 缺目的地 / 出发日期的行不参与去重，逐条新增。
     """
-    merged_existing = list(existing_rows)
-    incoming = list(trips)
-    if not incoming:
-        return merged_existing
-    history_getter = getattr(store, "get_trip_history", None)
-    if not callable(history_getter):
-        return merged_existing + incoming
-    try:
-        live_rows = [
-            row
-            for row in history_getter(limit=None) or []
-            if isinstance(row, dict)
-        ]
-    except Exception:  # noqa: BLE001 - 读取失败按全部新增保守处理
-        return merged_existing + incoming
-    live_keys = {trip_identity(row) for row in live_rows}
-    updates: dict[Any, dict[str, Any]] = {}
-    appended: dict[Any, dict[str, Any]] = {}
-    order: list[Any] = []
-    for row in incoming:
+    base = [dict(row) if isinstance(row, dict) else row for row in existing_rows]
+    index: dict[Any, int] = {}
+    for idx, row in enumerate(base):
+        if isinstance(row, dict):
+            key = _trip_merge_key(row)
+            if key is not None:
+                index.setdefault(key, idx)
+    created: list[dict[str, Any]] = []
+    created_index: dict[Any, int] = {}
+    for row in trips:
         if not isinstance(row, dict):
             continue
-        key = trip_identity(row)
-        if key in live_keys:
-            updates[key] = row
-        elif key in appended:
-            appended[key] = row
-        else:
-            appended[key] = row
-            order.append(key)
-    merged: list[Any] = []
-    for row in merged_existing:
-        if not isinstance(row, dict):
-            merged.append(row)
+        key = _trip_merge_key(row)
+        if key is not None and key in index:
+            target = index[key]
+            base[target] = _merge_trip_row(base[target], row)
             continue
-        update = updates.get(trip_identity(row))
-        merged.append(_merge_trip_row(row, update) if update is not None else row)
-    merged.extend(appended[key] for key in order)
-    return merged
+        if key is not None and key in created_index:
+            target = created_index[key]
+            created[target] = _merge_trip_row(created[target], row)
+            continue
+        if key is not None:
+            created_index[key] = len(created)
+        created.append(dict(row))
+    return base + created
 
 
 def _merge_trip_row(
@@ -1108,18 +1103,23 @@ def _planned_new_counts(
         pending_keys: set[tuple[str, str, str, str]] | None = None
         try:
             pending_keys = {
-                trip_identity(trip) for trip in history_getter(limit=None)
+                key
+                for key in (
+                    _trip_merge_key(trip) for trip in history_getter(limit=None)
+                )
+                if key is not None
             }
         except Exception:  # noqa: BLE001 - 读取失败按「全部新增」保守处理
             pending_keys = None
         if pending_keys is not None:
             new_trips = 0
             for trip_row in sections.get("trips", []):
-                trip_key = trip_identity(trip_row)
-                if trip_key in pending_keys:
+                trip_key = _trip_merge_key(trip_row)
+                if trip_key is not None and trip_key in pending_keys:
                     continue
                 new_trips += 1
-                pending_keys.add(trip_key)
+                if trip_key is not None:
+                    pending_keys.add(trip_key)
 
     new_messages: int | None = None
     messages = sections.get("messages", [])

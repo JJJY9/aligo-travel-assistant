@@ -13,9 +13,10 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Iterator
 
+from utils.timestamps import parse_iso_datetime
 from utils.tombstones import DEFAULT_TOMBSTONE_TTL_SEC
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,25 @@ def seen_key(key: str) -> str:
     return f"{key}:seen"
 
 
+def _canonical_timestamp(value: Any) -> str | None:
+    """调用方时间戳统一为本地 naive ISO（与 ``datetime.now().isoformat()``
+    同形）；空 / 非法返回 None。
+
+    PostgreSQL 回读的时间戳带连接会话时区偏移（``10:00+08:00``）：换算成
+    同一时刻的本地 naive 串后，Redis 实时副本 / 回填副本 / 影子缓存的
+    时间戳逐字节一致——内容指纹（角色+内容+原始时间戳）才能跨来源命中，
+    升级前写入 seen 集合的旧指纹同样能继续匹配。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parsed = parse_iso_datetime(value)
+    if parsed is None or parsed.tzinfo is None:
+        return value
+    try:
+        return parsed.astimezone().replace(tzinfo=None).isoformat()
+    except (OverflowError, ValueError, OSError):
+        return value
+
+
 def message_content_id(message: dict[str, Any]) -> str:
     """消息内容指纹：角色 + 内容 + 时间戳的 sha256 前缀。
 
@@ -135,29 +155,15 @@ def message_content_id(message: dict[str, Any]) -> str:
     回填与故障重放用它在 Redis 侧做跨实例内容去重。实时消息的时间戳唯一，
     正常重复提问（内容相同、时间不同）不会被误判为同一条。
 
-    时间戳先归一成「同一时刻的同一表示」再参与哈希：naive 本地时间按本机
-    时区解释、带偏移的直接换算，统一转成 UTC ISO。PostgreSQL 后端回读的
-    时间戳带连接会话时区的偏移（如 ``10:00+08:00``），不归一的话同一消息
-    在回填 / 重放侧的指纹永远与实时副本（``10:00`` 的 naive 串）不同、
-    跨来源去重失效。无法解析的时间戳按原文参与哈希。
-    """
+    时间戳在入口处经 ``_canonical_timestamp`` 统一为本地 naive ISO：
+    不同后端 / 不同进程写同一消息得到逐字节相同的指纹串。"""
     import hashlib
 
-    from utils.timestamps import to_aware
-
-    timestamp = message.get("timestamp")
-    normalized = None
-    aware = to_aware(timestamp)
-    if aware is not None:
-        try:
-            normalized = aware.astimezone(timezone.utc).isoformat()
-        except (OverflowError, ValueError, OSError):
-            normalized = None
     raw = json.dumps(
         [
             str(message.get("role") or ""),
             str(message.get("content") or ""),
-            str(timestamp or "") if normalized is None else normalized,
+            str(message.get("timestamp") or ""),
         ],
         ensure_ascii=False,
     )
@@ -546,11 +552,7 @@ class ShortTermMemory:
         ``timestamp`` 由调用方给出时沿用（与长期记忆落库共享同一
         时间戳，跨来源的内容指纹才能对齐）。
         """
-        ts = (
-            timestamp
-            if isinstance(timestamp, str) and timestamp
-            else datetime.now().isoformat()
-        )
+        ts = _canonical_timestamp(timestamp) or datetime.now().isoformat()
         message = {
             "role": role,
             "content": content,
@@ -723,15 +725,11 @@ class RedisShortTermMemory:
             content = message.get("content")
             if role not in ("user", "assistant") or not isinstance(content, str):
                 continue
-            timestamp = message.get("timestamp")
+            timestamp = _canonical_timestamp(message.get("timestamp"))
             entry = {
                 "role": role,
                 "content": content,
-                "timestamp": (
-                    timestamp
-                    if isinstance(timestamp, str) and timestamp
-                    else datetime.now().isoformat()
-                ),
+                "timestamp": timestamp or datetime.now().isoformat(),
                 "metadata": {},
             }
             self._push_message(entry)
@@ -1077,11 +1075,7 @@ class RedisShortTermMemory:
         metadata: dict | None = None,
         timestamp: str | None = None,
     ) -> str:
-        ts = (
-            timestamp
-            if isinstance(timestamp, str) and timestamp
-            else datetime.now().isoformat()
-        )
+        ts = _canonical_timestamp(timestamp) or datetime.now().isoformat()
         message = {
             "role": role,
             "content": content,

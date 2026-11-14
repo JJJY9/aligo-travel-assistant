@@ -2083,30 +2083,42 @@ def test_backfill_and_replay_share_timestamps_dedupe_once(monkeypatch):
     print("✓ 共享时间戳的回填与重放只保留一份")
 
 
-def test_content_id_aligns_naive_and_aware_timestamps():
-    """naive 本地时间与带时区偏移 ISO（同一时刻）指纹一致。"""
+def test_canonical_timestamp_aligns_backfill_with_realtime(monkeypatch):
+    """PG 回读的带偏移时间戳经入口归一成本地 naive ISO：实时副本 / 回填
+    副本的指纹逐字节一致（含升级前旧指纹格式），跨表示去重只保留一份。"""
     from datetime import datetime, timezone
 
-    from context.short_term_memory import message_content_id
+    from context import short_term_memory as module
     from utils.timestamps import localize_naive
 
     naive = "2026-11-01T10:00:00.123456"
     localized = localize_naive(datetime.fromisoformat(naive))
     aware = localized.isoformat()
-    base = {"role": "user", "content": "Q"}
-    assert message_content_id({**base, "timestamp": naive}) == message_content_id(
-        {**base, "timestamp": aware}
-    ), "同一时刻的 naive / 带偏移表示必须得到同一指纹"
-    # 换算成 UTC 的同一时刻（PG 读回的会话时区可能不是本机时区）同样对齐
     utc_text = localized.astimezone(timezone.utc).isoformat()
-    assert message_content_id({**base, "timestamp": naive}) == message_content_id(
-        {**base, "timestamp": utc_text}
+    assert module._canonical_timestamp(naive) == naive
+    assert module._canonical_timestamp(aware) == naive
+    assert module._canonical_timestamp(utc_text) == naive
+    assert module._canonical_timestamp(None) is None
+    assert module._canonical_timestamp("") is None
+
+    # 实时副本（naive）与回填副本（同一时刻的带偏移串）只落一份
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    realtime = module.RedisShortTermMemory(
+        client, "s-canon", max_turns=5, user_id="u1"
     )
+    realtime.add_message("user", "Q", timestamp=naive)
+    backfill = module.RedisShortTermMemory(
+        client, "s-canon", max_turns=5, user_id="u1"
+    )
+    backfill.add_message("user", "Q", timestamp=aware)
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [json.loads(raw)["content"] for raw in client.data]
+    assert contents == ["Q"], contents
     # 正常重复提问（内容相同、时间不同）不会被误判为同一条
-    assert message_content_id({**base, "timestamp": naive}) != message_content_id(
-        {**base, "timestamp": "2026-11-01T10:00:01.123456"}
-    )
-    print("✓ 内容指纹对 naive / 带偏移时间戳归一（跨后端去重生效）")
+    realtime.add_message("user", "Q", timestamp="2026-11-01T10:00:01.123456")
+    assert [json.loads(raw)["content"] for raw in client.data] == ["Q", "Q"]
+    print("✓ 带偏移时间戳归一后跨表示去重生效")
 
 
 def test_append_op_starts_new_window_after_drain(monkeypatch):

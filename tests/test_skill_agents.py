@@ -2005,6 +2005,25 @@ def test_preference_paren_example_empty_array_does_not_clear_result():
     print("✓ 偏好：括号内示例空数组不顶掉真实结果")
 
 
+def test_preference_prose_example_empty_array_keeps_real_result():
+    """说明性散文里的示例 []（「返回：[] 即可」及其括号变体）不是正式
+    空结果，不能顶掉已解析的真实偏好。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    for tail in (
+        "\n说明：若无新偏好，返回：[] 即可。",
+        "\n（若本轮没有新偏好，返回：[] 即可）",
+    ):
+        data = _pref_reply(formal + tail)
+        assert data.get("has_preferences") is True, (tail, data)
+        assert data["preferences"] == [
+            {"type": "home_location", "value": "上海"}
+        ], (tail, data)
+    print("✓ 偏好：说明散文中的示例空数组不顶掉真实偏好")
+
+
 def test_preference_replace_then_append_keeps_replace():
     """同类型 replace + append：最终必须替换存储，旧值不能借 append 保留。"""
     payload = json.dumps(
@@ -2106,6 +2125,20 @@ def test_event_collection_full_schema_empty_beats_earlier_example():
     print("✓ 事项收集：全 null 字段表的终稿压过更早示例")
 
 
+def test_event_collection_uncounted_empty_terminal_after_example():
+    """示例之后不带计数、也不完整字段表的 missing_info 终稿同样压过示例：
+    多个核心缺失项就是本轮「信息不足」表态，不是局部尾注。"""
+    example = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"duration_days": 1, "extracted_count": 7}'
+    )
+    formal = '{"missing_info": ["出发地", "目的地", "日期"], "summary": "用户未提供出行信息"}'
+    data = _event_reply(f"{example}\n{formal}")
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：示例后的无计数 missing_info 终稿压过示例")
+
+
 def test_plan_trip_title_only_tail_does_not_displace_full_plan():
     """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
     full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
@@ -2139,6 +2172,46 @@ def test_plan_trip_formal_titled_result_after_daily_plans_example():
         assert data.get("error") is None, (formal, data)
         assert data["itinerary"]["title"] == "杭州出差", (formal, data)
     print("✓ 行程规划：正式裸弱键行程不被带排期的示例顶掉")
+
+
+def test_plan_trip_prose_with_supplement_word_keeps_formal_result():
+    """正式结果前的普通叙述（「根据您补充的信息，行程如下：」）不是补充
+    标签，后置的裸弱键行程仍按位置胜出。"""
+    example = '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    formal = '根据您补充的信息，行程如下：\n{"title": "杭州出差", "duration": "2天"}'
+    data = _plan_trip_reply(f"{example}\n{formal}")
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：普通叙述含「补充」不改变正式结果")
+
+
+def test_plan_trip_fenced_supplement_tail_yields_to_full_plan():
+    """围栏代码块隔开的「补充：」尾注同样让位于完整行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    tail = '补充：\n```json\n{"title": "注意事项", "duration": "2天"}\n```'
+    data = _plan_trip_reply(f"{full}\n{tail}")
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：围栏后的补充尾注不顶掉完整行程")
+
+
+def test_plan_trip_supplement_result_label_tail_yields_to_full_plan():
+    """「补充结果：」弱尾注同样让位于完整行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    tail = '补充结果：{"title": "注意事项", "duration": "2天"}'
+    data = _plan_trip_reply(f"{full}\n{tail}")
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：补充结果尾注不顶掉完整行程")
+
+
+def test_plan_trip_formal_bare_result_survives_later_supplement_tail():
+    """正式裸行程之后的「补充：」弱尾注：终稿仍是正式裸行程，不是更早的示例。"""
+    example = '示例：{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    formal = '正式：{"title": "杭州出差", "duration": "2天"}'
+    tail = '补充：{"title": "注意事项", "duration": "1天"}'
+    data = _plan_trip_reply(f"{example}\n{formal}\n{tail}")
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：正式裸行程不被后置补充尾注替换")
 
 
 def test_plan_trip_empty_daily_plans_shell_does_not_displace_full_plan():

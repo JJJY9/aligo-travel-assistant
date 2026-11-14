@@ -191,7 +191,7 @@ def test_invalid_and_failures(monkeypatch):
 
 
 def test_store_open_failure(monkeypatch):
-    def boom(*args):
+    def boom(*args, **kwargs):
         raise RuntimeError("cannot open")
 
     monkeypatch.setattr(storage, "create_long_term_memory", boom)
