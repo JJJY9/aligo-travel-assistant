@@ -110,9 +110,14 @@ def _normalize_preference_items(items: list) -> list[dict]:
                 # 此前已有 replace：保持 replace（整组替换存储，含本批值）
                 if entry.get("action") != "replace":
                     entry["action"] = "append"
-            elif had_action or "action" in entry:
+            elif had_action or entry.get("action") == "replace":
+                # 只有「本条显式 replace」或「组内此前已显式 replace」才整组
+                # 覆盖；无 action 的后续条目不是显式 replace，不能把此前
+                # append 的组翻成覆盖（会删掉存储里的既有偏好）
                 entry["action"] = "replace"
-            else:
+            elif entry.get("action") != "append":
+                # 无 action 条目继承组内既有动作：append 组保持 append；
+                # 此前也没有任何 action 时保持无 action（默认覆盖）
                 entry.pop("action", None)
         else:
             entry = {"type": pref_type, "value": value}
@@ -229,6 +234,28 @@ def _as_preference_result(obj: object, _depth: int = 0) -> dict | None:
     return None
 
 
+def _looks_result_keyed(value: dict) -> bool:
+    """对象是否「形如偏好结果」（含 preferences / has_preferences 键）。"""
+    data = value.get("data")
+    if isinstance(data, dict) and (
+        "preferences" in data or "has_preferences" in data
+    ):
+        return True
+    return "preferences" in value or "has_preferences" in value
+
+
+def _empty_array_is_formal(text: str, start: int, end: int, is_last: bool) -> bool:
+    """空数组只有「是文本最后一个值、前面是冒号 / 等号 / 括号」才算正式的
+    空结果（``正式结果：[]``）；散文里的 ``[]``（Markdown 待办 ``- [ ]``、
+    ``例如 []``）不能顶掉前面的正式偏好结果。"""
+    if not is_last:
+        return False
+    if text[end:].strip().strip("`").strip():
+        return False
+    prefix = text[:start].rstrip()
+    return prefix == "" or prefix[-1] in ":：=>（("
+
+
 def _select_preference_result(text: str) -> dict | None:
     """在完整输出里按位置选出偏好结果（后出现的正式结果胜过回显示例）。
 
@@ -240,6 +267,7 @@ def _select_preference_result(text: str) -> dict | None:
     """
     spans: list[tuple[int, int]] = []
     objects: list[tuple[int, int, dict]] = []
+    unparsable_keyed: list[int] = []
     failed_tail = False
     last_end = -1
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
@@ -255,17 +283,28 @@ def _select_preference_result(text: str) -> dict | None:
         if normalized is not None:
             objects.append((start, end, normalized))
             failed_tail = False
+        elif _looks_result_keyed(value):
+            # 形如结果却解析不了（preferences 是非法字符串等）：记录位置，
+            # 选择时不回退到它之前的回显示例
+            unparsable_keyed.append(start)
     if failed_tail:
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
+    arrays = [
+        (start, end, items)
+        for start, end, items in _iter_preference_arrays(text)
+        if not any(span_start <= start < span_end for span_start, span_end in spans)
+    ]
     array = None
-    for start, end, items in _iter_preference_arrays(text):
-        if any(span_start <= start < span_end for span_start, span_end in spans):
+    for index, (start, end, items) in enumerate(arrays):
+        if not items and not _empty_array_is_formal(
+            text, start, end, index == len(arrays) - 1
+        ):
             continue
         array = (start, end, items)
-    chosen: tuple[dict, int] | None = None
+    chosen: tuple[dict, int, int] | None = None
     if objects:
         obj_start, obj_end, obj = objects[-1]
-        chosen = (obj, obj_end)
+        chosen = (obj, obj_start, obj_end)
         if array is not None and array[0] > obj_start:
             chosen = None
     if chosen is None and array is not None:
@@ -274,11 +313,16 @@ def _select_preference_result(text: str) -> dict | None:
                 "preferences": _normalize_preference_items(array[2]),
                 "has_preferences": bool(array[2]),
             },
+            array[0],
             array[1],
         )
     if chosen is None:
         return None
-    result, result_end = chosen
+    result, result_start, result_end = chosen
+    if any(start > result_start for start in unparsable_keyed):
+        # 正式结果（形如偏好结果的对象）解析失败：报错而不是把更早的
+        # 回显示例写进长期记忆
+        raise ValueError("模型输出中的偏好结果无法解析，拒绝回退到更早的候选")
     if has_unclosed_json_object(text[result_end:]):
         raise ValueError("模型输出在结果对象处被截断，拒绝回退到更早的候选")
     return result

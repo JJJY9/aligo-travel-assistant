@@ -2014,6 +2014,89 @@ def test_preference_non_string_type_is_dropped():
     print("✓ 偏好：非字符串 type 被丢弃")
 
 
+def test_event_collection_explicit_empty_beats_earlier_example():
+    """回显示例之后输出显式空结果：空结果是对本轮的最终表态，示例不得写库。"""
+    example = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"duration_days": 1, "missing_info": [], "extracted_count": 7}'
+    )
+    formal = '结果：{"missing_info": ["所有信息"], "extracted_count": 0}'
+    data = _event_reply(f"{example}\n{formal}")
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：显式空结果压过更早的示例")
+
+
+def test_event_collection_meta_tail_does_not_override_full_result():
+    """extracted_count>0 的元信息尾注不能顶掉完整提取（回归防护保持）。"""
+    formal = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"end_date": "2026-12-03", "extracted_count": 6}'
+    )
+    tail = '{"missing_info": ["返程地"], "extracted_count": 5}'
+    data = _event_reply(f"结果：{formal}\n尾注：{tail}")
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：计数>0 的尾注不顶掉完整结果")
+
+
+def test_plan_trip_title_only_tail_does_not_displace_full_plan():
+    """仅含 title 的小对象（补充说明）不能顶掉更早的完整行程。"""
+    full = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    tail = '补充：{"title": "注意事项"}'
+    data = _plan_trip_reply(f"{full}\n{tail}")
+    assert data["itinerary"]["title"] == "杭州出差", data
+    assert data["itinerary"].get("daily_plans"), data
+    print("✓ 行程规划：仅标题尾注不顶掉完整行程")
+
+
+def test_preference_append_then_plain_item_keeps_append():
+    """append 在前、无 action 条目在后：整组仍是 append（不能删掉既有偏好）。"""
+    payload = json.dumps(
+        {
+            "has_preferences": True,
+            "preferences": [
+                {"type": "hotel_brands", "value": "汉庭", "action": "append"},
+                {"type": "hotel_brands", "value": "如家"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    data = _pref_reply(payload)
+    assert data["preferences"] == [
+        {"type": "hotel_brands", "value": ["汉庭", "如家"], "action": "append"}
+    ], data
+    print("✓ 偏好：append + 无 action 条目保持 append")
+
+
+def test_preference_unparsable_formal_result_does_not_fall_back_to_example():
+    """正式结果形如偏好结果却解析失败：报错而不是回写更早的回显示例。"""
+    example = (
+        '示例：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    formal = '结果：{"has_preferences": true, "preferences": "上海"}'
+    data = _pref_reply(f"{example}\n{formal}")
+    assert data.get("has_preferences") is not True, data
+    assert data.get("error"), data
+    assert "浦东" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：正式结果不可解析时不回退示例")
+
+
+def test_preference_prose_empty_brackets_do_not_clear_formal_result():
+    """正式结果之后散文里的 []（Markdown 待办 / 例如 []）不能顶掉真实偏好。"""
+    formal = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "如家"}]}'
+    )
+    for tail in ("注意：- [ ] 记得核对", "可选项例如 []"):
+        data = _pref_reply(f"{formal}\n{tail}")
+        assert data.get("has_preferences") is True, (tail, data)
+        assert data["preferences"] == [
+            {"type": "hotel_brands", "value": "如家"}
+        ], (tail, data)
+    print("✓ 偏好：散文空方括号不顶掉正式结果")
+
+
 def test_preference_empty_list_input_and_permanent_errors():
     """reply([]) 不抛 IndexError；401/402 等永久模型错误穿透给编排层记账。"""
     agent_class = _load_skill("preference", "PreferenceAgent")
@@ -2152,6 +2235,12 @@ if __name__ == "__main__":
         test_preference_replace_then_append_keeps_replace()
         test_preference_non_string_type_is_dropped()
         test_preference_empty_list_input_and_permanent_errors()
+        test_event_collection_explicit_empty_beats_earlier_example()
+        test_event_collection_meta_tail_does_not_override_full_result()
+        test_plan_trip_title_only_tail_does_not_displace_full_plan()
+        test_preference_append_then_plain_item_keeps_append()
+        test_preference_unparsable_formal_result_does_not_fall_back_to_example()
+        test_preference_prose_empty_brackets_do_not_clear_formal_result()
         test_event_collection_tail_meta_does_not_replace_extraction()
         test_event_collection_normalizes_non_iso_dates()
         test_event_collection_empty_list_and_permanent_errors()
