@@ -198,7 +198,19 @@ _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "�
 
 _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 _PAREN_EXAMPLE = frozenset(
-    {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
+    {
+        "示例",
+        "例如",
+        "样例",
+        "示例输出",
+        "示例结果",
+        "示例格式",
+        "输出示例",
+        "严格JSON",
+        "严格json",
+        "JSON",
+        "json",
+    }
 )
 # 括号示例标记允许的「括号外短语」：结果类短标签（「结果（示例）：」）
 _PAREN_EXAMPLE_OUTER = frozenset(
@@ -237,9 +249,16 @@ _EXAMPLE_WORDS = (
 def _colon_example_marker(line: str) -> bool:
     """「示例：北京行程」式短标签：冒号前短语是示例词、冒号后是短描述。
 
-    「示例：…，真实结果如下：」「示例：{…}，正式结果：」这类带后续说明
-    或句内标点的叙述行不算示例标签。"""
-    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    括号组先整体剔除（「示例：北京3日游（2.27-3.1）」）；冒号后允许
+    逗号分隔的短枚举（「示例：北京，上海」）。带叙述词（真实 / 正式 /
+    结果 / 如下 / 实际）或超长分句的行是说明文字，不算示例标签。"""
+    without_groups = line
+    while True:
+        stripped = _PAREN_GROUP_RE.sub("", without_groups)
+        if stripped == without_groups:
+            break
+        without_groups = stripped
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", without_groups)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
@@ -253,11 +272,14 @@ def _colon_example_marker(line: str) -> bool:
     if len(rest) > 1:
         return False
     tail = rest[0]
-    if any(ch in tail for ch in "，。；、！？,;!?…"):
-        return False
     if any(word in tail for word in ("真实", "正式", "结果", "如下", "实际")):
         return False
-    return len(tail) <= 12
+    if any(ch in tail for ch in "。；、！？;!?…"):
+        return False
+    segments = [seg for seg in re.split(r"[，,]+", tail) if seg]
+    if not segments:
+        return False
+    return all(len(seg) <= 8 for seg in segments)
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -357,13 +379,63 @@ def _event_label_is_example(label: str) -> bool:
     return _is_example_phrase(_event_label_phrase(label))
 
 
-def _iter_array_spans(text: str):
+def _decoded_array_at(text: str, index: int):
+    """严格解析失败时按「括号配平 + 修复尾逗号 / 单引号」再试一次。
+
+    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。"""
     decoder = json.JSONDecoder()
+    try:
+        return decoder.raw_decode(text, index)
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    in_str = False
+    quote = ""
+    end = -1
+    previous = ""
+    for pos in range(index, len(text)):
+        ch = text[pos]
+        if in_str:
+            if ch == quote and previous != "\\":
+                in_str = False
+        elif ch in ("'", '"'):
+            in_str = True
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = pos + 1
+                break
+        previous = ch
+    if end < 0:
+        return None, None
+    fragment = text[index:end]
+    # 不用正则（跨层转义易碎）：循环删尾逗号、单引号统一换双引号
+    repaired = fragment
+    while True:
+        updated = (
+            repaired.replace(",]", "]")
+            .replace(",}", "}")
+            .replace(", ]", "]")
+            .replace(", }", "}")
+        )
+        if updated == repaired:
+            break
+        repaired = updated
+    repaired = repaired.replace("'", '"')
+    try:
+        return json.loads(repaired), end
+    except json.JSONDecodeError:
+        return None, None
+
+
+def _iter_array_spans(text: str):
     index = text.find("[")
     while index != -1:
-        try:
-            value, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
+        value, end = _decoded_array_at(text, index)
+        if value is None:
             index = text.find("[", index + 1)
             continue
         if isinstance(value, list):
@@ -397,7 +469,6 @@ _MISSING_FIELD_EXACT: dict[str, tuple[str, ...]] = {
     "开始日期": ("start_date",),
     "出行日期": ("start_date",),
     "行程日期": ("start_date",),
-    "日期": ("start_date", "end_date"),
     "返程地": ("return_location",),
     "返回地": ("return_location",),
     "回程地": ("return_location",),
@@ -418,10 +489,50 @@ _MISSING_FIELD_EXACT: dict[str, tuple[str, ...]] = {
 }
 
 
+_MISSING_STRIP_HEAD = (
+    "缺少",
+    "未提供",
+    "未填写",
+    "未给出",
+    "没有提供",
+    "缺",
+    "暂无",
+    "无",
+)
+_MISSING_STRIP_TAIL = (
+    "未知",
+    "未提供",
+    "未填写",
+    "待确认",
+    "待定",
+    "不清楚",
+    "不明确",
+)
+
+
+def _normalize_missing_item(text: str) -> str:
+    """「缺少出发地 / 出发地未知」等常见表述剥掉功能词后回到字段名。"""
+    cleaned = re.sub(r"[\s。.!！?？]", "", text)
+    changed = True
+    while changed:
+        changed = False
+        for word in _MISSING_STRIP_HEAD:
+            if cleaned.startswith(word) and len(cleaned) > len(word):
+                cleaned = cleaned[len(word):]
+                changed = True
+                break
+        for word in _MISSING_STRIP_TAIL:
+            if cleaned.endswith(word) and len(cleaned) > len(word):
+                cleaned = cleaned[: -len(word)]
+                changed = True
+                break
+    return cleaned
+
+
 def _missing_contradicts_substantive(
     missing_items: list[Any] | str, substantive: dict
 ) -> bool:
-    """缺失声明与提取内容是否矛盾：条目按字段名**精确短语**映射。"""
+    """缺失声明与提取内容是否矛盾：条目剥功能词后按字段名精确短语映射。"""
     if isinstance(missing_items, str):
         missing_items = [missing_items]
     elif not isinstance(missing_items, (list, tuple)):
@@ -430,7 +541,7 @@ def _missing_contradicts_substantive(
     for item in missing_items:
         if not isinstance(item, str) or not item.strip():
             continue
-        fields = _MISSING_FIELD_EXACT.get(item.strip())
+        fields = _MISSING_FIELD_EXACT.get(_normalize_missing_item(item))
         if not fields:
             continue
         if any(_has_event_value(substantive.get(field)) for field in fields):
@@ -509,7 +620,12 @@ def _select_event_result(text: str) -> dict | None:
     prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
-            if looks_like and start >= last_any_end:
+            fragment_is_example = _event_label_is_example(text[:start])
+            if (
+                looks_like
+                and start >= last_any_end
+                and not fragment_is_example
+            ):
                 failed_tail = True
             # 不可解析片段（JSON5 示例等）同样推进标签基线：其后真实结果
             # 的标签段不能把整段「示例：…」算进去
@@ -536,8 +652,12 @@ def _select_event_result(text: str) -> dict | None:
             # 的模板残留：按空结果处理并清洗字段
             candidate = _sanitize_empty(candidate)
         if _plan_score(candidate) > 0:
+            is_supplement = label_phrase in _SUPPLEMENT_LABELS
+            complete = _has_event_value(
+                candidate.get("destination")
+            ) and _has_event_value(candidate.get("start_date"))
             substantives.append(
-                (candidate, end, label_example, label_phrase in _SUPPLEMENT_LABELS)
+                (candidate, end, label_example, is_supplement and not complete)
             )
         elif _is_explicit_empty(candidate) or _is_authoritative_empty(candidate):
             if label_example:

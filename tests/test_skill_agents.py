@@ -2820,6 +2820,58 @@ def test_event_collection_refined_missing_note_keeps_extraction():
     print("✓ 事项收集：细化缺失说明不清空提取")
 
 
+def test_event_collection_bare_date_tail_keeps_extraction():
+    """无标签尾注 missing_info 裸「日期」：真实提取保留。"""
+    formal = (
+        '结果：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 3}'
+    )
+    tail = '{"missing_info": ["日期"]}'
+    data = _event_reply(f"{formal}" + "\n" + tail)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：裸「日期」尾注不顶掉完整提取")
+
+
+def test_event_collection_missing_affix_phrases_contradict():
+    """「缺少出发地 / 未提供目的地 / 出发地未知」等表述锚定矛盾声明。"""
+    example = (
+        '示例：{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"extracted_count": 7}'
+    )
+    terminal = '{"missing_info": ["缺少出发地", "目的地未知"], "summary": "信息不足"}'
+    data = _event_reply(f"{example}" + "\n" + terminal)
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "北京" not in rendered and "2026-02-27" not in rendered, data
+    print("✓ 事项收集：功能词包裹的缺失表述判矛盾")
+
+
+def test_event_collection_supplement_labeled_complete_terminal_wins():
+    """无标签示例 + 「说明：」引出的完整终稿：终稿保留、示例不写库。"""
+    example = (
+        '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27", '
+        '"extracted_count": 7}'
+    )
+    terminal = (
+        '说明：{"origin": "上海", "destination": "杭州", "start_date": "2026-12-01", '
+        '"extracted_count": 6}'
+    )
+    data = _event_reply(f"{example}" + "\n" + terminal)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：补充标签的完整终稿保留")
+
+
+def test_event_collection_format_header_example_not_written():
+    """【输出格式】(严格JSON) 示例头：示例事项不写库。"""
+    payload = (
+        "【输出格式】(严格JSON)" + "\n"
+        '{"origin": "北京", "destination": "北京", "start_date": "2026-02-27"}'
+    )
+    data = _event_reply(payload)
+    assert data.get("error"), data
+    assert "北京" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 事项收集：格式头示例不写库")
+
+
 def test_event_collection_generic_time_word_tail_keeps_extraction():
     """「具体时间」这类歧义词的尾注不算矛盾声明：真实提取保留。"""
     formal = (
@@ -3145,6 +3197,106 @@ def test_plan_trip_colon_limited_example_label():
     assert data.get("error") is None, data
     assert data["itinerary"]["title"] == "杭州出差", data
     print("✓ 行程规划：冒号限定示例标签不参与竞争")
+
+
+def test_plan_trip_format_header_example_not_returned():
+    """【输出格式】(严格JSON) 示例头：示例行程按解析失败返回。"""
+    payload = (
+        "【输出格式】(严格JSON)" + "\n"
+        '{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}}'
+    )
+    data = _plan_trip_reply(payload)
+    assert data.get("error"), data
+    assert "北京3日游" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 行程规划：格式头示例不返回")
+
+
+def test_plan_trip_trailing_comma_example_array():
+    """尾逗号示例数组同样识别：示例行程不返回。"""
+    real = '{"itinerary": {"title": "杭州出差", "daily_plans": [{"day": 1}]}}'
+    example = '示例：[{"itinerary": {"title": "北京3日游", "daily_plans": [{"day": 1}]}},]'
+    data = _plan_trip_reply(f"{real}" + "\n" + example)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州出差", data
+    print("✓ 行程规划：尾逗号示例数组不参与竞争")
+
+
+def test_preference_colon_example_descriptive_tails():
+    """「示例：北京，上海」「示例：北京3日游（日期区间）」等带描述尾巴的
+    冒号示例标签仍判示例：示例偏好不写库。"""
+    real = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "杭州"}]}'
+    )
+    example_json = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海浦东新区"}]}'
+    )
+    for label in (
+        "示例：北京，上海",
+        "示例：北京3日游（2026-02-27 至 2026-03-01）",
+    ):
+        data = _pref_reply(f"{real}" + "\n" + label + "\n" + example_json)
+        assert data["preferences"] == [
+            {"type": "home_location", "value": "杭州"}
+        ], (label, data)
+    print("✓ 偏好：带描述尾巴的冒号示例标签仍判示例")
+
+
+def test_preference_format_header_example_not_chosen():
+    """SKILL.md 的【输出格式】(严格JSON) 示例头：示例偏好不落库。"""
+    payload = (
+        "【输出格式】(严格JSON)" + "\n"
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "hotel_brands", "value": "汉庭"}]}'
+    )
+    data = _pref_reply(payload)
+    assert data.get("error"), data
+    assert "汉庭" not in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：格式头示例不写库")
+
+
+def test_preference_json5_example_then_formal_empty():
+    """JSON5 示例片段后跟正式空数组：返回成功空结果（不报截断）。"""
+    payload = (
+        "示例：" + "\n"
+        '{preferences: [{"type": "home_location", "value": "北京"}]}' + "\n"
+        "正式结果：" + "\n[]"
+    )
+    data = _pref_reply(payload)
+    assert data.get("has_preferences") is False, data
+    assert not data.get("error"), data
+    print("✓ 偏好：JSON5 示例后的正式空数组成功返回")
+
+
+def test_preference_conditional_no_preference_note_rejected():
+    """条件式「（无偏好时）」不判正式：真实偏好保留。"""
+    formal = (
+        '{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "上海"}]}'
+    )
+    data = _pref_reply(f"{formal}" + "\n" + "正式结果：[]（无偏好时）")
+    assert data.get("has_preferences") is True, data
+    print("✓ 偏好：条件式空结果括注不判正式")
+
+
+def test_preference_trailing_comma_example_and_real_arrays():
+    """尾逗号数组同样识别：示例数组不选、真实裸数组保留全部元素。"""
+    real = (
+        '结果：{"has_preferences": true, "preferences": '
+        '[{"type": "home_location", "value": "杭州"}]}'
+    )
+    example = '示例：[{"type": "hotel_brands", "value": "汉庭"},]'
+    data = _pref_reply(f"{real}" + "\n" + example)
+    assert data["preferences"] == [
+        {"type": "home_location", "value": "杭州"}
+    ], data
+
+    bare = '[{"type": "home_location", "value": "上海"}, {"type": "hotel_brands", "value": "汉庭"},]'
+    data = _pref_reply(bare)
+    types = {item["type"] for item in data.get("preferences") or []}
+    assert types == {"home_location", "hotel_brands"}, data
+    print("✓ 偏好：尾逗号数组识别正确")
 
 
 def test_plan_trip_unparsable_example_fragment_does_not_poison_label():
