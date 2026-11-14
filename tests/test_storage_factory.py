@@ -656,6 +656,56 @@ def test_load_time_quarantine_blocks_writes_from_same_instance():
     print("✓ 构造期隔离的实例不允许写回重建，隔离状态对新实例可见")
 
 
+def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
+    """备份删除失败（删除未完成）也必须写墓碑：主文件已删，旧实例写入
+    不能复活数据。"""
+    import context.long_term_memory as module
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-tombfail", storage_dir)
+    memory.save_preference("home_location", "北京")
+    stale = LongTermMemory("u-tombfail", storage_dir)
+    migrate_backup = Path(storage_dir) / "u-tombfail.json.migrate-backup"
+    migrate_backup.write_text("{}", encoding="utf-8")
+
+    real_remove = module.os.remove
+
+    def failing_remove(target):
+        if str(target).endswith(migrate_backup.name):
+            raise OSError("locked")
+        return real_remove(target)
+
+    monkeypatch.setattr(module.os, "remove", failing_remove)
+    with pytest.raises(MemoryPersistenceError):
+        memory.delete_all()
+    monkeypatch.setattr(module.os, "remove", real_remove)
+
+    assert (Path(storage_dir) / "u-tombfail.json.deleted").exists(), (
+        "备份删除失败时也必须写删除标记"
+    )
+    stale.save_preference("hotel_brands", ["汉庭"])
+    fresh = LongTermMemory("u-tombfail", storage_dir)
+    assert fresh.get_preference("home_location") is None
+    print("✓ 删除未完成时墓碑仍阻止旧实例复活数据")
+
+
+def test_ensure_persisted_respects_tombstone():
+    """恢复入口的 ensure_persisted 不复活已删除账号的陈旧快照。"""
+    storage_dir = tempfile.mkdtemp()
+    writer = LongTermMemory("u-ensure-tomb", storage_dir)
+    writer.save_preference("home_location", "北京")
+    recovery = LongTermMemory(
+        "u-ensure-tomb", storage_dir, allow_quarantined=True
+    )
+    assert recovery.get_preference("home_location") == "北京"
+    writer.delete_all()
+
+    recovery.ensure_persisted()
+    fresh = LongTermMemory("u-ensure-tomb", storage_dir)
+    assert fresh.get_preference("home_location") is None, "陈旧快照不能复活"
+    print("✓ ensure_persisted 尊重删除墓碑")
+
+
 def test_delete_all_prevents_stale_instance_resurrection():
     """删除后其它存活实例（缓存会话）的下一次写入从空快照开始：
     已删除的数据不会被旧实例整份写回。"""

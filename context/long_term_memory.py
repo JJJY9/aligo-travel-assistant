@@ -737,6 +737,10 @@ class LongTermMemory:
                         self._corrupt_pending = False
                         self._corrupt_backup = None
                         return
+                    if Path(f"{self.db_path}.deleted").exists():
+                        # 账号数据已被删除：从空快照落盘（写盘后标记清除），
+                        # 绝不复活实例内的陈旧快照
+                        self.data = self._init_data()
                     self._persist()
             except TimeoutError as exc:
                 raise MemoryPersistenceError(
@@ -1850,15 +1854,15 @@ class LongTermMemory:
                     self._corrupt_backup = None
                     self._may_recreate = False
                     self.data = self._init_data()
-                    if not failed:
-                        # 删除标记：其它存活实例（长会话 / 嵌入调用方）的
-                        # 下一次写入从空快照开始，不会把已删除的数据整份写回
-                        try:
-                            Path(f"{self.db_path}.deleted").touch(
-                                exist_ok=True
-                            )
-                        except OSError:
-                            pass
+                    # 删除标记：主文件已移除，其它存活实例（长会话 / 嵌入
+                    # 调用方）的下一次写入从空快照开始，不会把已删除的数据
+                    # 整份写回。备份删除失败也必须写——删除已不可逆
+                    try:
+                        Path(f"{self.db_path}.deleted").touch(
+                            exist_ok=True
+                        )
+                    except OSError:
+                        pass
                     if failed:
                         raise MemoryPersistenceError(
                             "删除长期记忆时无法移除备份文件："

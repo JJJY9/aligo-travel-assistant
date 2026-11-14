@@ -138,12 +138,10 @@ def _iter_preference_arrays(text: str):
     对象或不含 type / value 的数组（引用标记 ``[1]``、说明 ``[注]``）
     不是候选。
     """
-    decoder = json.JSONDecoder()
     index = text.find("[")
     while index != -1:
-        try:
-            value, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
+        value, end = _decoded_array_at(text, index)
+        if value is None:
             index = text.find("[", index + 1)
             continue
         if isinstance(value, list):
@@ -303,7 +301,19 @@ _LEAD_INS = ("以下是", "以下为", "下面是", "如下是", "这里是", "�
 
 _PAREN_GROUP_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 _PAREN_EXAMPLE = frozenset(
-    {"示例", "例如", "样例", "示例输出", "示例结果", "示例格式", "输出示例"}
+    {
+        "示例",
+        "例如",
+        "样例",
+        "示例输出",
+        "示例结果",
+        "示例格式",
+        "输出示例",
+        "严格JSON",
+        "严格json",
+        "JSON",
+        "json",
+    }
 )
 _PAREN_EXAMPLE_OUTER = frozenset(
     {
@@ -341,9 +351,16 @@ _EXAMPLE_WORDS = (
 def _colon_example_marker(line: str) -> bool:
     """「示例：北京行程」式短标签：冒号前短语是示例词、冒号后是短描述。
 
-    「示例：…，真实结果如下：」「示例：{…}，正式结果：」这类带后续说明
-    或句内标点的叙述行不算示例标签。"""
-    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    括号组先整体剔除（「示例：北京3日游（2.27-3.1）」）；冒号后允许
+    逗号分隔的短枚举（「示例：北京，上海」）。带叙述词（真实 / 正式 /
+    结果 / 如下 / 实际）或超长分句的行是说明文字，不算示例标签。"""
+    without_groups = line
+    while True:
+        stripped = _PAREN_GROUP_RE.sub("", without_groups)
+        if stripped == without_groups:
+            break
+        without_groups = stripped
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", without_groups)
     parts = [
         part
         for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
@@ -357,11 +374,14 @@ def _colon_example_marker(line: str) -> bool:
     if len(rest) > 1:
         return False
     tail = rest[0]
-    if any(ch in tail for ch in "，。；、！？,;!?…"):
-        return False
     if any(word in tail for word in ("真实", "正式", "结果", "如下", "实际")):
         return False
-    return len(tail) <= 12
+    if any(ch in tail for ch in "。；、！？;!?…"):
+        return False
+    segments = [seg for seg in re.split(r"[，,]+", tail) if seg]
+    if not segments:
+        return False
+    return all(len(seg) <= 8 for seg in segments)
 
 
 def _paren_example_marker(line: str) -> bool:
@@ -551,10 +571,14 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     # 「[]（若无新偏好时）」）时不是正式空结果
     tail_line = text[end:].split("\n", 1)[0]
     for group in _PAREN_GROUP_RE.findall(tail_line):
-        if re.search(r"示例|例如|样例", group) or any(
-            word in group for word in ("若", "如果", "如无", "需要")
+        stripped_group = group[1:-1].strip()
+        if (
+            re.search(r"示例|例如|样例", group)
+            or any(word in group for word in ("若", "如果", "如无", "需要"))
+            or stripped_group.endswith("时")
         ):
-            # 描述性括注（「（无偏好）」「（本轮无偏好）」）不在此列
+            # 描述性括注（「（无偏好）」「（本轮无偏好）」）不在此列；
+            # 条件式（「（无偏好时）」）在此列
             return False
     residual = _PAREN_GROUP_RE.sub("", tail_line)
     residual = re.sub(r"[`\s，,。.；;、！!？?…）)\-—】」}:：]+", "", residual)
@@ -564,13 +588,63 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     return True
 
 
-def _iter_array_spans(text: str):
+def _decoded_array_at(text: str, index: int):
+    """严格解析失败时按「括号配平 + 修复尾逗号 / 单引号」再试一次。
+
+    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。"""
     decoder = json.JSONDecoder()
+    try:
+        return decoder.raw_decode(text, index)
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    in_str = False
+    quote = ""
+    end = -1
+    previous = ""
+    for pos in range(index, len(text)):
+        ch = text[pos]
+        if in_str:
+            if ch == quote and previous != "\\":
+                in_str = False
+        elif ch in ("'", '"'):
+            in_str = True
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = pos + 1
+                break
+        previous = ch
+    if end < 0:
+        return None, None
+    fragment = text[index:end]
+    # 不用正则（跨层转义易碎）：循环删尾逗号、单引号统一换双引号
+    repaired = fragment
+    while True:
+        updated = (
+            repaired.replace(",]", "]")
+            .replace(",}", "}")
+            .replace(", ]", "]")
+            .replace(", }", "}")
+        )
+        if updated == repaired:
+            break
+        repaired = updated
+    repaired = repaired.replace("'", '"')
+    try:
+        return json.loads(repaired), end
+    except json.JSONDecodeError:
+        return None, None
+
+
+def _iter_array_spans(text: str):
     index = text.find("[")
     while index != -1:
-        try:
-            value, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
+        value, end = _decoded_array_at(text, index)
+        if value is None:
             index = text.find("[", index + 1)
             continue
         if isinstance(value, list):
@@ -595,9 +669,14 @@ def _select_preference_result(text: str) -> dict | None:
     prev_end = 0
     for start, value, end, looks_like in iter_json_object_spans_with_repair(text):
         if value is None:
-            if looks_like and start >= last_end:
+            fragment_is_example = _is_example_label(text[:start])
+            if (
+                looks_like
+                and start >= last_end
+                and not fragment_is_example
+            ):
                 # 「像结果但解析不了」的尾片段：正式结果可能被截断，不能
-                # 回退到更早的示例对象
+                # 回退到更早的示例对象（示例标签的片段除外）
                 failed_tail = True
             # 不可解析片段（JSON5 示例等）同样推进标签基线
             if isinstance(end, int):
