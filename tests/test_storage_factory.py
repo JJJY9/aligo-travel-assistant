@@ -4300,23 +4300,27 @@ if __name__ == "__main__":
                 fixture.undo()
             skipped += 1
             continue
-        storage_snapshot = None
-        _storage_cfg = None
+        storage_snapshot: dict | None = None
         try:
-            from config import STORAGE_CONFIG as _storage_cfg
+            from config import STORAGE_CONFIG
 
-            storage_snapshot = dict(_storage_cfg)
+            storage_snapshot = dict(STORAGE_CONFIG)
         except Exception:  # noqa: BLE001 - 配置不可用时不快照
-            _storage_cfg = None
+            storage_snapshot = None
         try:
             func(**kwargs)
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
         finally:
-            if storage_snapshot is not None and _storage_cfg is not None:
-                _storage_cfg.clear()
-                _storage_cfg.update(storage_snapshot)
+            if storage_snapshot is not None:
+                from typing import cast
+
+                from config import STORAGE_CONFIG
+
+                _cfg = cast(dict, STORAGE_CONFIG)
+                _cfg.clear()
+                _cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
     total = sum(
