@@ -467,6 +467,21 @@ class LongTermMemory:
             # 统计段整体缺失（极老格式）：按现有列表重建，而不是把计数器
             # 补 0 后与列表长度永久脱节
             chats_changed = trips_changed = True
+        # 计数器合法但与列表长度不符（缺 chat_history 键后补空列表 /
+        # 旧版本把计数写大）：只向下对齐到真实条数——与 PG 的 COUNT(*)
+        # 口径一致，删除路径按差值扣减后不再永久偏大
+        if (
+            isinstance(stats.get("total_messages"), int)
+            and stats["total_messages"] > len(data["chat_history"])
+        ):
+            stats["total_messages"] = len(data["chat_history"])
+            chats_changed = True
+        if (
+            isinstance(stats.get("total_trips"), int)
+            and stats["total_trips"] > len(data["trip_history"])
+        ):
+            stats["total_trips"] = len(data["trip_history"])
+            trips_changed = True
         if chats_changed or "total_messages" in missing_counters:
             stats["total_messages"] = len(data["chat_history"])
         if trips_changed or "total_trips" in missing_counters:
@@ -1264,6 +1279,15 @@ class LongTermMemory:
         影响）：调用方在锁外先读长度再写的检查挡不住并发创建，越限后
         /api/export 会因条数上限永久 413。
         """
+        if max_total is None:
+            # 主写入路径（编排器 / 面板之外的调用方）不传参也要拦截：
+            # 超过上限后 /api/export 与 CLI user-export 会永久 413
+            try:
+                from utils.trip_import import MAX_TOTAL_TRIPS
+
+                max_total = MAX_TOTAL_TRIPS
+            except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
+                max_total = None
         if max_total is not None and self._find_same_trip(trip_info) is None:
             current = len(self.data.get("trip_history") or [])
             if current >= max_total:
