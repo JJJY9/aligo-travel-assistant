@@ -4792,7 +4792,7 @@ def create_app(model: Any = None) -> FastAPI:
                         await queue.put(
                             {
                                 "type": "error",
-                                "message": f"存储暂时不可用，请稍后再试（请求 ID：{rid}）",
+                                "message": _persistence_failure_detail(exc, rid),
                             }
                         )
                     except UserFacingError as exc:

@@ -656,6 +656,18 @@ def test_load_time_quarantine_blocks_writes_from_same_instance():
     print("✓ 构造期隔离的实例不允许写回重建，隔离状态对新实例可见")
 
 
+def test_delete_all_removes_migrate_backup():
+    """delete_all 连同 .migrate-backup（迁移前完整副本）一并清理。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-mig", storage_dir)
+    memory.save_preference("home_location", "北京")
+    migrate_backup = Path(storage_dir) / "u-mig.json.migrate-backup"
+    migrate_backup.write_text("{}", encoding="utf-8")
+    memory.delete_all()
+    assert not migrate_backup.exists(), "迁移副本不能残留在磁盘上"
+    print("✓ delete_all 清理迁移前副本")
+
+
 def test_delete_all_reports_unremovable_backup(monkeypatch):
     """隔离备份删不掉时 delete_all 必须报错（删除未完成），不能静默
     成功后又让后续写入持续被隔离守卫拒绝。"""

@@ -153,7 +153,11 @@ def _iter_preference_arrays(text: str):
                 and any(
                     "type" in item
                     or "value" in item
-                    or any(is_manageable_pref_type(key) for key in item)
+                    or any(
+                        key not in _PREF_NON_TYPE_KEYS
+                        and is_manageable_pref_type(key)
+                        for key in item
+                    )
                     for item in items
                 )
             ):
@@ -172,7 +176,11 @@ def _expand_legacy_array_items(items: list) -> list:
             expanded.append(item)
             continue
         for key, value in item.items():
-            if is_manageable_pref_type(key) and has_preference_value(value):
+            if (
+                key not in _PREF_NON_TYPE_KEYS
+                and is_manageable_pref_type(key)
+                and has_preference_value(value)
+            ):
                 expanded.append({"type": key, "value": value})
     return expanded
 
@@ -317,6 +325,17 @@ _PAREN_EXAMPLE_OUTER = frozenset(
 )
 
 
+def _colon_example_marker(line: str) -> bool:
+    """「示例：北京行程」式标签：冒号前的短语本身就是示例词。"""
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    return bool(parts) and parts[0] in _PAREN_EXAMPLE
+
+
 def _paren_example_marker(line: str) -> bool:
     """括号里自称示例的短标签（「结果（示例）：」「（示例）：」）。
 
@@ -398,6 +417,11 @@ def _is_example_label(label: str) -> bool:
         return False
     if _paren_example_marker(line):
         return True
+    line = _strip_line_json_values(line)
+    if not line:
+        return False
+    if _colon_example_marker(line):
+        return True
     phrase = _label_phrase(line)
     if not phrase or any(ch in phrase for ch in _SENTENCE_PUNCT):
         return False
@@ -407,19 +431,20 @@ def _is_example_label(label: str) -> bool:
 
 
 def _strip_line_json_values(line: str) -> str:
-    """去掉行内粘在标签前的完整 JSON 值（「示例：{…} 正式结果：」只留
-    标签部分）。不含 JSON 的行原样返回。"""
+    """去掉行内粘在标签前的完整 JSON 值（「示例：{…} 正式结果：」
+    「示例：[] 正式结果：」只留标签部分）。不含 JSON 的行原样返回。"""
     decoder = json.JSONDecoder()
     best_end = 0
-    index = line.find("{")
-    while index != -1:
-        try:
-            _value, end = decoder.raw_decode(line, index)
-        except json.JSONDecodeError:
-            index = line.find("{", index + 1)
-            continue
-        best_end = max(best_end, end)
-        index = line.find("{", end)
+    for opener in ("{", "["):
+        index = line.find(opener)
+        while index != -1:
+            try:
+                _value, end = decoder.raw_decode(line, index)
+            except json.JSONDecodeError:
+                index = line.find(opener, index + 1)
+                continue
+            best_end = max(best_end, end)
+            index = line.find(opener, end)
     if best_end:
         return line[best_end:].strip()
     return line
@@ -472,8 +497,12 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
     if not cleaned_lines:
         return True
     label_line = _strip_line_json_values(cleaned_lines[-1])
-    if _paren_example_marker(label_line):
-        # 「结果（示例）：[]」括号里自称示例：不是正式空结果
+    if _paren_example_marker(label_line) or (
+        _colon_example_marker(label_line)
+        and not _label_phrase(label_line)
+    ):
+        # 「结果（示例）：[]」括号里自称示例：不是正式空结果；
+        # 「示例：北京行程」式标签同理
         return False
     phrase = _label_phrase(label_line)
     if not phrase or not _is_result_phrase(phrase):
