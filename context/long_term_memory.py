@@ -1375,6 +1375,14 @@ class LongTermMemory:
                 if _merge_messages_chronologically(self.data["chat_history"], []):
                     self._persist()
             return 0
+        from utils.user_import import _MAX_MESSAGES
+
+        # 写入层硬上限：并发恢复 / 直连调用方合计越限后 /api/export 会
+        # 永久 413（账号再也导不出可恢复备份）
+        if len(self.data["chat_history"]) + len(to_add) > _MAX_MESSAGES:
+            raise ValueError(
+                f"导入后聊天消息总数将超过上限 {_MAX_MESSAGES}"
+            )
         if dedupe:
             _merge_messages_chronologically(self.data["chat_history"], to_add)
         else:
@@ -1898,6 +1906,27 @@ class LongTermMemory:
             match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
             if match:
                 max_number = max(max_number, int(match.group(1)))
+
+        from utils.trip_import import MAX_TOTAL_TRIPS
+
+        # 写入层硬上限：导入预检只在入口做一次，并发导入 / 直连调用方
+        # 合计越限后账号将永远无法导出全量备份——这里按本批实际新增
+        # （去重语义）在落库前拦截
+        planned_seen: set[tuple[str, str, str, str]] = set()
+        planned_created = 0
+        for row in trips:
+            if not isinstance(row, dict):
+                continue
+            key = _identity(row)
+            if key is not None:
+                if key in index or key in planned_seen:
+                    continue
+                planned_seen.add(key)
+            planned_created += 1
+        if len(history) + planned_created > MAX_TOTAL_TRIPS:
+            raise ValueError(
+                f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
+            )
 
         created = 0
         updated = 0

@@ -1268,41 +1268,106 @@ def test_actual_filename_prefers_exact_case(monkeypatch):
     print("✓ 隔离改名沿用精确文件名（大小写敏感平台）")
 
 
-def test_pg_save_preference_aborts_when_cap_check_reconnects():
-    """上限复核期间连接重建：首次 INSERT 也不能发到重连后的会话
-    （advisory lock 曾在空档释放，合并值可能过期 / 偏好被并发删除）。"""
+def test_pg_preference_snapshot_writes_abort_on_reconnect():
+    """快照派生写按连接代次校验：重连（含加锁期间 / 复核期间）即中止，
+    不发 INSERT；直接 replace 不依赖快照，重连后照常写入。"""
     import contextlib
 
     from context.postgres_long_term_memory import PostgresLongTermMemory
 
     memory = object.__new__(PostgresLongTermMemory)
-    memory.user_id = "u-reconnect"
+    memory.user_id = "u-gen"
     memory._conn = object()
+    memory._conn_generation = 0
     recorded: list[str] = []
     memory._execute = (
         lambda sql, params=None, replay_safe=True: recorded.append(sql)
     )
-    memory._preference_lock = lambda pref_type: contextlib.nullcontext()
-    memory._preference_cap_lock = lambda: contextlib.nullcontext()
     memory._json = lambda value: value
 
-    def cap_with_reconnect(pref_type):
-        # 模拟复核 SELECT 触发 _reconnect
+    def cap_reconnect(pref_type):
         memory._conn = object()
+        memory._conn_generation += 1
         return False
 
-    memory._enforce_preference_cap = cap_with_reconnect
-    # 快照派生写（append 的读-合并-写）：重连即中止，不发 INSERT
-    with pytest.raises(MemoryPersistenceError) as info:
-        memory.save_preference("home_location", "北京", replay_safe=False)
-    assert "重试" in str(info.value), str(info.value)
-    assert not any("INSERT INTO aligo_preferences" in sql for sql in recorded)
+    memory._enforce_preference_cap = cap_reconnect
 
-    # 直接 replace（不依赖快照）：等锁期间的重连不阻断，写入照常执行
+    @contextlib.contextmanager
+    def reconnecting_lock(pref_type):
+        # 模拟 advisory lock 获取期间连接重建（第 32 轮的位置翻转正是
+        # 让这类重连逃过校验的缺口）
+        memory._conn = object()
+        memory._conn_generation += 1
+        yield
+
+    memory._preference_lock = reconnecting_lock
+    memory._preference_cap_lock = lambda: contextlib.nullcontext()
+
+    with pytest.raises(MemoryPersistenceError) as info:
+        memory.save_preference(
+            "home_location", "北京", replay_safe=False, expected_generation=0
+        )
+    assert "重试" in str(info.value), str(info.value)
+    assert not any(
+        "INSERT INTO aligo_preferences" in sql for sql in recorded
+    )
+
+    # 直接 replace（无 expected_generation）：同一重连下写入照常执行
     recorded.clear()
     memory.save_preference("home_location", "上海")
-    assert any("INSERT INTO aligo_preferences" in sql for sql in recorded)
-    print("✓ PG 偏好写入仅对快照派生写在重连后中止")
+    assert any(
+        "INSERT INTO aligo_preferences" in sql for sql in recorded
+    )
+    print("✓ PG 偏好只对快照派生写按代次中止")
+
+
+def test_pg_append_preference_aborts_when_save_lock_reconnects():
+    """append 的读-合并-写：save 内层再次加锁期间的重连同样中止
+    （读取时的代次贯穿整个写入）。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-append"
+    memory._conn = object()
+    memory._conn_generation = 0
+    recorded: list[str] = []
+    memory._execute = (
+        lambda sql, params=None, replay_safe=True: recorded.append(sql)
+    )
+    memory._json = lambda value: value
+    memory.get_preference = lambda pref_type: ["汉庭"]
+    memory._enforce_preference_cap = lambda pref_type: False
+    memory._preference_cap_lock = lambda: contextlib.nullcontext()
+    calls = {"n": 0}
+
+    @contextlib.contextmanager
+    def counting_lock(pref_type):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # append 已持有一层（可重入），save 再入时连接重建
+            memory._conn = object()
+            memory._conn_generation += 1
+        yield
+
+    memory._preference_lock = counting_lock
+    with pytest.raises(MemoryPersistenceError):
+        memory.append_preference("hotel_brands", "如家")
+    assert not any(
+        "INSERT INTO aligo_preferences" in sql for sql in recorded
+    )
+
+    # add_hotel_brand 走同一读-合并-写保护
+    calls["n"] = 0
+    memory._conn = object()
+    memory._conn_generation += 10
+    with pytest.raises(MemoryPersistenceError):
+        memory.add_hotel_brand("希尔顿")
+    assert not any(
+        "INSERT INTO aligo_preferences" in sql for sql in recorded
+    )
+    print("✓ append/add_hotel_brand 的重连中止贯穿写入")
 
 
 def test_actual_filename_samefile_fallback(monkeypatch):
@@ -1473,6 +1538,111 @@ def test_pg_trip_number_watermark_reads_counter():
     memory._fetchone = boom
     assert memory.get_trip_number_watermark() is None
     print("✓ PG 行程编号水位读取语义")
+
+
+def test_json_write_layer_total_caps(monkeypatch):
+    """JSON 写层的总量硬上限：绕过导入预检的并发 / 直连写入同样被拦。"""
+    import utils.trip_import as trip_module
+    import utils.user_import as ui_module
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    monkeypatch.setattr(trip_module, "MAX_TOTAL_TRIPS", 2)
+    monkeypatch.setattr(ui_module, "_MAX_MESSAGES", 2)
+    storage_dir = tempfile.mkdtemp()
+    store = LongTermMemory("u-caps", storage_dir)
+    store.save_trip_history(
+        {"destination": "上海", "start_date": "2026-01-01"}
+    )
+    store.save_trip_history(
+        {"destination": "杭州", "start_date": "2026-01-02"}
+    )
+    with pytest.raises(ValueError) as info:
+        store.save_trip_histories(
+            [{"destination": "成都", "start_date": "2026-02-01"}]
+        )
+    assert "行程总数将超过上限" in str(info.value)
+    store.add_chat_messages(
+        [{"role": "user", "content": "a", "session_id": "s1"}]
+    )
+    store.add_chat_messages(
+        [{"role": "user", "content": "b", "session_id": "s1"}]
+    )
+    with pytest.raises(ValueError) as info:
+        store.add_chat_messages(
+            [{"role": "user", "content": "c", "session_id": "s1"}]
+        )
+    assert "消息总数将超过上限" in str(info.value)
+    print("✓ JSON 写入层的总量硬上限")
+
+
+def test_pg_write_layer_total_caps(monkeypatch):
+    """PG 写层的总量硬上限（同一事务锁内计数 + 拦截）。"""
+    import contextlib
+
+    import utils.trip_import as trip_module
+    import utils.user_import as ui_module
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    monkeypatch.setattr(trip_module, "MAX_TOTAL_TRIPS", 1)
+    monkeypatch.setattr(ui_module, "_MAX_MESSAGES", 2)
+
+    trips_store = object.__new__(PostgresLongTermMemory)
+    trips_store.user_id = "u-pgcap"
+    trips_store._conn = object()
+    trips_store._advisory_lock = lambda name: contextlib.nullcontext()
+    trips_store._fetchall = lambda sql, params=None: []
+    trips_store._fetchone = lambda sql, params=None: None
+    trips_store._execute = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("越限时不得写库")
+    )
+    with pytest.raises(ValueError) as info:
+        trips_store.save_trip_histories(
+            [
+                {"destination": "上海", "start_date": "2026-01-01"},
+                {"destination": "杭州", "start_date": "2026-01-02"},
+            ]
+        )
+    assert "行程总数将超过上限" in str(info.value)
+
+    state = {"sql": [], "count": (2,)}
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def execute(self, sql, params=None):
+            state["sql"].append(sql)
+
+        def fetchone(self):
+            return state["count"]
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def transaction(self):
+            return contextlib.nullcontext()
+
+        def cursor(self):
+            return _Cursor()
+
+    msgs_store = object.__new__(PostgresLongTermMemory)
+    msgs_store.user_id = "u-pgcap"
+    msgs_store._conn = _Conn()
+    msgs_store._run_with_retry = lambda op, replay_safe=True: op()
+    with pytest.raises(ValueError) as info:
+        msgs_store.add_chat_messages(
+            [{"role": "user", "content": "x", "session_id": "s1"}]
+        )
+    assert "消息总数将超过上限" in str(info.value)
+    assert not any(
+        "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
+    )
+    print("✓ PG 写入层的总量硬上限")
 
 
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
@@ -4621,14 +4791,19 @@ def test_pg_append_preference_aborts_when_connection_reconnects():
     store.user_id = "u1"
     store._preference_lock = lambda pref_type: contextlib.nullcontext()
     store._conn = object()
+    store._conn_generation = 0
     saved = []
 
     def fake_get(pref_type=None):
         store._conn = object()
+        # 与真实 _reconnect 一致：连接身份变化同时递增代次
+        store._conn_generation += 1
         return "汉庭"
 
     store.get_preference = fake_get
-    store.save_preference = lambda pref_type, value: saved.append((pref_type, value))
+    store.save_preference = lambda pref_type, value, **kwargs: saved.append(
+        (pref_type, value)
+    )
 
     with pytest.raises(MemoryPersistenceError):
         store.append_preference("hotel_brands", "如家")

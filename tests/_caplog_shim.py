@@ -21,13 +21,18 @@ class _AtLevel:
     def __enter__(self):
         target = self._target()
         self._old = target.level
+        self._handler_old = self._shim._handler.level
         target.setLevel(self._level)
+        # pytest 的 at_level 同时把捕获 handler 的级别一并调到目标级别：
+        # 否则目标 logger 的高级别会拦住其它 logger 的低级别日志
+        self._shim._handler.setLevel(self._level)
         # 与 pytest 夹具一致：进入 at_level 不清空已捕获记录（块外日志
         # 同样参与断言；清空只由显式 clear() 触发）
         return self._shim
 
     def __exit__(self, *exc_info):
         self._target().setLevel(self._old)
+        self._shim._handler.setLevel(self._handler_old)
         return False
 
 

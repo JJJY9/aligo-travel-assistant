@@ -2451,7 +2451,7 @@ def test_merged_statistics_trip_number_raised(monkeypatch):
     monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
 
     class _Store:
-        snapshot_based = False
+        snapshot_based = True
 
         def export_snapshot(self):
             return {
@@ -2764,11 +2764,13 @@ def test_sections_limit_uses_neighbor_timestamp_anchor(monkeypatch):
         }
     )
     rows = captured["payload"]["chat_history"]
-    assert rows[0]["timestamp"] == "2026-05-01T10:00:00.123456+08:00"
+    # JSON 形状预检按真实导出宽度估算：解析得到的带偏移时间戳截到 26 字符
+    assert rows[0]["timestamp"] == "2026-05-01T10:00:00.123456", rows[0]
     anchored = rows[1]["timestamp"]
-    assert isinstance(anchored, str) and anchored.endswith("+00:00"), rows[1]
-    assert len(anchored) == 32, anchored
-    print("✓ 导出形状预检复用邻居时间戳锚点")
+    assert isinstance(anchored, str) and len(anchored) == 26, rows[1]
+    # 锚点语义保留：缺时间戳行取邻居的 UTC 键（10:00+08:00 → 02:00Z）
+    assert anchored.startswith("2026-05-01T02:00:00"), anchored
+    print("✓ 导出形状预检复用邻居时间戳锚点（JSON 宽度）")
 
 
 def test_merged_trip_ids_mirror_storage_renumbering(monkeypatch):
@@ -2785,7 +2787,7 @@ def test_merged_trip_ids_mirror_storage_renumbering(monkeypatch):
     monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
 
     class _Store:
-        snapshot_based = False
+        snapshot_based = True
 
         def export_snapshot(self):
             return {
@@ -3073,6 +3075,64 @@ def test_sections_limit_uses_merged_export_shape(monkeypatch):
     assert empty_stats["last_trip_number"] == 0
     assert empty_stats["total_queries"] == 0
     print("✓ 备份自身体积预检与合并复核同形状")
+
+
+def test_merged_preview_includes_global_knowledge(monkeypatch):
+    """一体化备份恢复会把知识片段写进全局知识库：合并体积复核必须计入
+    现有库 + 本次将新增分片的保守上界，否则恢复成功后导出永久 413。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    monkeypatch.setattr(
+        kb,
+        "export_documents",
+        lambda *a, **k: [{"content": "旧知识", "metadata": {}}],
+    )
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    long_content = "y" * 900
+    module.merged_backup_limit_problem(
+        _Store(), {"knowledge": [{"content": long_content}]}
+    )
+    knowledge = captured["payload"]["knowledge"]
+    assert knowledge[0]["content"] == "旧知识"
+    estimate = knowledge[1]["content"]
+    parts = 3  # ceil(900/400)
+    assert len(estimate) >= len(long_content) + parts * 120
+
+    # 现有库读失败：fail-closed（无法确认恢复后仍可导出）
+    from utils.errors import MemoryPersistenceError
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("kb busy")
+
+    monkeypatch.setattr(kb, "export_documents", boom)
+    with pytest.raises(MemoryPersistenceError) as info:
+        module.merged_backup_limit_problem(
+            _Store(), {"knowledge": [{"content": "新"}]}
+        )
+    assert "知识库" in str(info.value)
+    print("✓ 合并预检纳入全局知识库（含读失败 fail-closed）")
 
 
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
