@@ -506,9 +506,15 @@ class PostgresLongTermMemory:
         一律禁止重放——连接重建会释放用户级锁，空档里其它实例可能把类型
         数补到上限（新类型）或删除该类型使其重放变成新增行（既有类型），
         都会越过上面的上限复核。"""
+        start_conn = getattr(self, "_conn", None)
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
                 self._enforce_preference_cap(pref_type)
+                # 上限复核里的 SELECT 允许重连：_reconnect 会重新获取
+                # advisory lock，空档里其它实例可能已改动同一偏好（合并值
+                # 过期）或删除该类型（首次 INSERT 会把已删除的偏好复活）。
+                # 重连后的会话上连「首次」INSERT 也不能发
+                self._abort_if_reconnected(start_conn)
                 self._execute(
                     """
                     INSERT INTO aligo_preferences (user_id, pref_type, value)

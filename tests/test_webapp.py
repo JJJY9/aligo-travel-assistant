@@ -3959,6 +3959,186 @@ def test_open_long_term_no_backup_sentinel_message(monkeypatch):
     print("✓ 无可用隔离备份走「未能隔离备份」文案")
 
 
+def test_import_limit_check_uses_parsed_sections(monkeypatch):
+    """Web 导入自检与 CLI 同口径：按解析后的可恢复段复核，解析会丢弃的
+    非法行不再让同一备份在 Web 413、CLI 可恢复。"""
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 2)
+    client = _client()
+    user_id = _unique_user("web_test_import_parsed")
+    backup = {
+        "backup": {
+            "chat_history": [
+                {"role": "user", "content": "q1", "session_id": "s1"},
+                {"role": "assistant", "content": "a1", "session_id": "s1"},
+                {"role": "system", "content": "非法角色行", "session_id": "s1"},
+            ]
+        }
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json=backup
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert response.json()["messages_added"] == 2
+    finally:
+        _cleanup(user_id)
+    print("✓ 导入自检按解析后段复核（与 CLI 同口径）")
+
+
+def test_import_partial_error_reports_counts(monkeypatch):
+    """/api/import 的部分提交（PartialImportError）如实报告已提交条数。"""
+    from utils.errors import PartialImportError
+    from webapp import server as server_module
+
+    class _PartialStore:
+        def get_preference(self):
+            return {}
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+        def get_trip_history(self, limit=None):
+            return []
+
+        def save_trip_histories(self, trips):
+            raise PartialImportError(
+                "批量保存在第 2 条后失败：connection lost", 1, 1
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: _PartialStore(),
+    )
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_import_partial")},
+        json={
+            "backup": {
+                "trip_history": [
+                    {
+                        "origin": "上海",
+                        "destination": "成都",
+                        "start_date": "2026-05-01",
+                    }
+                ]
+            }
+        },
+    )
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert "已提交 1 条新增、1 条更新" in detail, detail
+    assert "可安全重跑" in detail
+    print("✓ /api/import 部分提交如实报告条数")
+
+
+def test_trips_import_partial_error_reports_counts(monkeypatch):
+    """/api/trips/import 的部分提交（PartialImportError）如实报告条数。"""
+    from utils.errors import PartialImportError
+    from webapp import server as server_module
+
+    class _PartialStore:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def save_trip_histories(self, trips):
+            raise PartialImportError(
+                "批量保存在第 2 条后失败：db down", 1, 0
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: _PartialStore(),
+    )
+    client = _client()
+    response = client.post(
+        "/api/trips/import",
+        params={"user_id": _unique_user("web_test_trips_partial")},
+        json={"content": "出发地,目的地,出发日期\n上海,成都,2026-05-01\n"},
+    )
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert "已提交 1 条新增、0 条更新" in detail, detail
+    assert "可安全重跑" in detail
+    print("✓ /api/trips/import 部分提交如实报告条数")
+
+
+def test_web_session_pending_and_no_backup_messages(monkeypatch, tmp_path):
+    """聊天会话构造守卫的 pending / 无备份文案（此前 0 覆盖）：不得
+    引导用户恢复不存在的备份。"""
+    from config import STORAGE_CONFIG
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+
+    class _FakeLongTerm:
+        def __init__(self, pending=False, active=None):
+            self.db_path = str(tmp_path / "u-ws.json")
+            self._pending = pending
+            self._active = active
+
+        def get_recovered_corrupt_backup(self):
+            return None
+
+        def has_pending_corrupt_quarantine(self):
+            return self._pending
+
+        def get_active_quarantine_backup(self):
+            return self._active
+
+    class _FakeMemory:
+        def __init__(self, long_term):
+            self.long_term = long_term
+
+    class _FakeRuntime:
+        def __init__(self, long_term):
+            self.memory = _FakeMemory(long_term)
+
+        def close(self):
+            pass
+
+    def make_session(long_term):
+        monkeypatch.setattr(
+            server_module,
+            "ConversationRuntime",
+            lambda **kwargs: _FakeRuntime(long_term),
+        )
+        return server_module._WebSession("u-ws", "s1", None, None)
+
+    with pytest.raises(MemoryPersistenceError) as info:
+        make_session(_FakeLongTerm(pending=True))
+    assert "尚未完成" in str(info.value)
+    assert "备份文件恢复" not in str(info.value)
+
+    with pytest.raises(MemoryPersistenceError) as info:
+        make_session(
+            _FakeLongTerm(active=server_module._QUARANTINE_NO_BACKUP_MARKER)
+        )
+    assert "未找到可用隔离备份" in str(info.value)
+    assert "备份文件恢复" not in str(info.value)
+    print("✓ 会话构造的 pending / 无备份文案")
+
+
 def test_create_trip_write_failure_maps_503(monkeypatch):
     """POST /api/trips 写入失败映射 503（与更新 / 删除一致）。"""
     from utils.errors import MemoryPersistenceError
