@@ -1427,22 +1427,29 @@ class AligoWebApp:
         quarantine_stale: _WebSession | None = None
         session: _WebSession | None = None
         with self._sessions_lock:
-            session = self.sessions.get(key)
-            if session is not None:
-                if _quarantine_marker_for(
-                    user_id, _session_long_term(session)
-                ):
-                    # 会话缓存期间账号被隔离：驱逐缓存，走下面新建路径由
-                    # 构造守卫返回带恢复引导的 503（不再先白跑整轮 LLM）。
-                    # 构造必然抛错，evicted 的延迟关闭不可达——在锁外立即关闭
-                    self.sessions.pop(key, None)
-                    quarantine_stale = session
-                    session = None
-                else:
-                    self.sessions.move_to_end(key)
-                    if mark_in_use:
-                        session.begin_turn()
-                    self._evict_over_limit_locked(key, evicted)
+            cached = self.sessions.get(key)
+        if cached is not None:
+            # 隔离探测含文件系统扫描（同步盘 / 网络盘 stat 可阻塞数秒）：
+            # 必须在 _sessions_lock 之外执行——锁内会让所有用户的会话查找
+            # 串行排队，默认线程池被等锁调用占满后其它 to_thread 工作一起停摆
+            if _quarantine_marker_for(user_id, _session_long_term(cached)):
+                # 会话缓存期间账号被隔离：驱逐缓存，走下面新建路径由
+                # 构造守卫返回带恢复引导的 503（不再先白跑整轮 LLM）。
+                # 构造必然抛错，evicted 的延迟关闭不可达——在锁外立即关闭
+                with self._sessions_lock:
+                    if self.sessions.get(key) is cached:
+                        self.sessions.pop(key, None)
+                        quarantine_stale = cached
+            else:
+                with self._sessions_lock:
+                    if self.sessions.get(key) is cached:
+                        session = cached
+                        self.sessions.move_to_end(key)
+                        if mark_in_use:
+                            session.begin_turn()
+                        self._evict_over_limit_locked(key, evicted)
+                # 探测与重取锁之间被其它线程驱逐 / 替换：按未命中处理，
+                # 走下面的新建路径
         if quarantine_stale is not None:
             # 隔离账号的缓存会话：先关闭再走构造守卫（必然 503）
             quarantine_stale.close()
@@ -2257,6 +2264,17 @@ def _quarantine_marker_for(user_id: str, long_term: Any) -> str | None:
         )
         if callable(pending_getter) and pending_getter():
             return _QUARANTINE_PENDING_MARKER
+        marker_getter = getattr(
+            long_term, "get_active_quarantine_backup", None
+        )
+        if callable(marker_getter):
+            active = marker_getter()
+            if active:
+                # 落盘隔离标记（其它实例 / 进程写入）：即使配置了
+                # PostgreSQL（故障回退期）也要拦截——缓存会话不能等到
+                # 落库时才发现隔离、白跑整轮 LLM；无标记的遗留 .corrupt-*
+                # 才按 DSN 豁免当孤儿
+                return str(active)
         from config import STORAGE_CONFIG
 
         if STORAGE_CONFIG.get("postgres_dsn"):
@@ -2357,7 +2375,7 @@ def _open_long_term(
     except MemoryPersistenceError as exc:
         logger.warning("打开长期记忆失败（%s，strict）：%s", user_id, exc)
         raise HTTPException(
-            status_code=503, detail="存储暂时不可用，请稍后再试"
+            status_code=503, detail=_persistence_failure_detail(exc, None)
         ) from exc
     except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
         logger.warning("打开长期记忆失败（%s）：%s", user_id, exc)
@@ -2382,25 +2400,36 @@ _DAMAGE_MESSAGE_PREFIXES = (
 )
 
 
-def _persistence_failure_detail(exc: Exception, request_id: str) -> str:
-    """隔离 / 损坏类持久化失败保留可执行提示，其余用通用文案。
+# 大小写不敏感文件系统上「用户 ID 与已有账号仅大小写不同」：永久且
+# 用户可修正，不能报成可重试的存储故障
+_CASE_CONFLICT_PREFIXES = ("用户 ID 与已有记忆文件仅大小写不同",)
+
+
+def _persistence_failure_detail(
+    exc: Exception, request_id: str | None = None
+) -> str:
+    """隔离 / 损坏 / 大小写冲突类持久化失败保留可执行提示，其余用通用文案。
 
     按消息前缀判定而不是「含『隔离』」子串：路径里的「隔离」目录等
     普通错误不能被误报成记忆损坏；「重载失败 / 无法备份」并没有隔离
-    备份可供恢复，不能引导用户去找不存在的备份文件。"""
+    备份可供恢复，不能引导用户去找不存在的备份文件。``request_id`` 为
+    None 时（如 _open_long_term 无请求上下文）不拼请求 ID。"""
+    suffix = f"（请求 ID：{request_id}）" if request_id else ""
     text = str(exc)
     if text.startswith(_QUARANTINE_MESSAGE_PREFIXES):
         return (
             "记忆文件损坏并已隔离备份（路径见服务端日志），"
-            "请使用备份文件恢复后重试"
-            f"（请求 ID：{request_id}）"
+            f"请使用备份文件恢复后重试{suffix}"
         )
     if text.startswith(_DAMAGE_MESSAGE_PREFIXES):
+        return f"记忆数据损坏且未能隔离备份，请稍后再试或联系维护{suffix}"
+    if text.startswith(_CASE_CONFLICT_PREFIXES):
+        # 不回显已有账号的 owner ID：避免向任意请求方暴露账号存在性
         return (
-            "记忆数据损坏且未能隔离备份，请稍后再试或联系维护"
-            f"（请求 ID：{request_id}）"
+            "用户 ID 与已有账号仅大小写不同，请改用与已有账号完全一致的"
+            f"大小写{suffix}"
         )
-    return f"存储暂时不可用，请稍后再试（请求 ID：{request_id}）"
+    return f"存储暂时不可用，请稍后再试{suffix}"
 
 
 def _storage_failure(action: str, exc: Exception) -> HTTPException:

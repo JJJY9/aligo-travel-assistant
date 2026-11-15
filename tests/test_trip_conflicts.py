@@ -271,6 +271,17 @@ def test_trip_interval_warns_once_per_bad_value(caplog):
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
+    # 断言通过也会以 traceback 退出；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     test_optimized_matches_naive()
     test_large_history_fast_and_correct()
     test_conflict_order_uses_parsed_dates()

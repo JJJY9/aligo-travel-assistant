@@ -60,6 +60,30 @@ def test_nontty_single_line_query_is_not_swallowed():
     print("✓ 非 TTY 单行查询不再被静默吞掉（退出码 2）")
 
 
+def test_startup_memory_error_exits_without_traceback(monkeypatch):
+    """存储初始化失败（瞬时占用 / 大小写冲突）：给可读提示并以 1 退出，
+    不能把 MemoryPersistenceError 的原始 traceback 甩给用户。"""
+    from utils.errors import MemoryPersistenceError
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=120)
+
+    async def broken_init():
+        raise MemoryPersistenceError(
+            "长期记忆暂时不可读（文件可能被占用）（data/memory/u1.json）"
+        )
+
+    monkeypatch.setattr(agent, "initialize_system", broken_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    with pytest.raises(SystemExit) as info:
+        asyncio.run(agent.run())
+    assert info.value.code == 1
+    text = buffer.getvalue()
+    assert "启动失败" in text and "暂时不可读" in text, text
+    print("✓ 启动期存储失败给可读提示（退出码 1）")
+
+
 def test_eof_at_main_prompt_breaks_loop(monkeypatch):
     """主循环 stdin 结束时应退出，而不是每轮打印错误刷屏。"""
     import asyncio
@@ -1135,10 +1159,22 @@ def test_interactive_memory_follows_data_root(monkeypatch, tmp_path):
     print("✓ 交互式 CLI 长期记忆跟随 default_data_root")
 
 if __name__ == "__main__":
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
+    # 断言通过也会以 traceback 退出；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     _mp = pytest.MonkeyPatch()
     try:
         test_eof_at_user_prompt_exits_cleanly()
         test_eof_at_main_prompt_breaks_loop(_mp)
+        test_startup_memory_error_exits_without_traceback(_mp)
         test_gbk_piped_input_keeps_locale_decoding()
         test_utf8_piped_input_not_mojibake()
         test_human_response_escapes_markup()

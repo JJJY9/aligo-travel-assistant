@@ -968,6 +968,17 @@ def test_peek_cached_weather_returns_fresh_entry():
     print("✓ peek_cached_weather 只返回新鲜缓存")
 
 if __name__ == "__main__":
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
+    # 断言通过也会以 traceback 退出；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     for case in (
         test_stale_fallback_merges_concurrent_requests,
         test_fetch_weather_and_cache,
@@ -1008,8 +1019,11 @@ if __name__ == "__main__":
     ):
         mp = pytest.MonkeyPatch()
         try:
+            # 直跑不执行 autouse fixture：手动隔离天气缓存
+            weather.clear_weather_cache()
             case(mp)
         finally:
+            weather.clear_weather_cache()
             mp.undo()
     test_empty_city_raises()
     test_parse_weather_tolerates_none_daily_entries()

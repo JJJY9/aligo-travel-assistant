@@ -1595,6 +1595,18 @@ class AligoCLI:
                     "或运行 python cli.py doctor 排查[/dim]"
                 )
                 raise SystemExit(1) from None
+            except MemoryPersistenceError as exc:
+                # 瞬时读占用 / 大小写冲突等存储初始化失败（RuntimeError
+                # 子类，OSError 分支捕不到）：与子命令 _open_cli_store
+                # 同口径提示，不能把原始 traceback 甩给用户
+                self.console.print(
+                    f"[red]启动失败：{_terminal_safe(exc)}[/red]"
+                )
+                self.console.print(
+                    "[dim]「暂时不可读」请稍后重试；用户 ID 与已有账号仅"
+                    "大小写不同时，请改用完全一致的大小写[/dim]"
+                )
+                raise SystemExit(1) from None
             except KeyboardInterrupt:
                 _abort_startup("\n已取消，退出")
                 raise SystemExit(130) from None

@@ -2287,6 +2287,14 @@ if __name__ == "__main__":
             storage_snapshot = dict(STORAGE_CONFIG)
         except Exception:  # noqa: BLE001 - 配置不可用时不快照
             storage_snapshot = None
+        # 直跑不执行 @pytest.fixture(autouse=True)（那是 pytest 注入）：
+        # 手动隔离进程级日志 / 冷却状态，避免跨用例泄漏
+        # （对应 _isolated_short_term_state 的 setup 部分）
+        from context import short_term_memory as _stm
+
+        with _stm._PENDING_JOURNALS_LOCK:
+            _stm._PENDING_JOURNALS.clear()
+        _stm._redis_degraded_until = 0.0
         try:
             # async def 用例同样要真正执行：直接调用只创建 coroutine，
             # 断言从不运行，直跑清单会给出假绿
@@ -2298,6 +2306,9 @@ if __name__ == "__main__":
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            with _stm._PENDING_JOURNALS_LOCK:
+                _stm._PENDING_JOURNALS.clear()
+            _stm._redis_degraded_until = 0.0
             if storage_snapshot is not None:
                 from typing import cast
 
