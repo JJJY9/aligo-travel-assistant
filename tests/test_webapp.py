@@ -4192,6 +4192,82 @@ def test_import_checks_limit_after_dropping_sessions(monkeypatch):
     print("✓ 导入自检在剔除会话之后执行（与 CLI 同序）")
 
 
+def test_import_queue_dropped_sessions_not_rolled_back(monkeypatch):
+    """排队期间被剔除的会话不进入回滚候选：不得出现「已回滚 0 条」
+    噪音或多余的 delete_chat_session 调用。"""
+    from webapp import server as server_module
+
+    deleted_calls = []
+
+    class _Store:
+        def get_preference(self):
+            return {}
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+        def get_trip_history(self, limit=None):
+            return []
+
+        def ensure_persisted(self):
+            pass
+
+        def delete_chat_session(self, session_id):
+            deleted_calls.append(session_id)
+            return 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: _Store(),
+    )
+    client = _client()
+    user_id = _unique_user("web_test_import_queue_drop")
+    state = client.app.state.aligo
+    answers = {"s-queue": [False, True]}
+
+    def is_recently_deleted(uid, sid):
+        if uid != user_id:
+            return False
+        seq = answers.get(sid)
+        if not seq:
+            return sid == "s-queue"
+        return seq.pop(0)
+
+    monkeypatch.setattr(state, "is_recently_deleted", is_recently_deleted)
+    backup = {
+        "backup": {
+            "chat_history": [
+                {"role": "user", "content": "队列期删除", "session_id": "s-queue"}
+            ]
+        }
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json=backup
+        )
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        assert payload["messages_added"] == 0
+        assert any("排队期间" in item for item in payload["skipped"]), payload
+        assert not any("已回滚" in item for item in payload["skipped"]), payload
+        assert deleted_calls == [], deleted_calls
+    finally:
+        _cleanup(user_id)
+    print("✓ 队列期剔除的会话不误回滚")
+
+
 def test_create_trip_write_failure_maps_503(monkeypatch):
     """POST /api/trips 写入失败映射 503（与更新 / 删除一致）。"""
     from utils.errors import MemoryPersistenceError
@@ -12071,6 +12147,7 @@ def test_active_marker_detected_under_dsn(monkeypatch, tmp_path):
     backup = detecting.get_fresh_quarantine_backup()
     assert backup
 
+    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
     monkeypatch.setitem(
         STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
     )
@@ -12079,9 +12156,10 @@ def test_active_marker_detected_under_dsn(monkeypatch, tmp_path):
     ), "DSN 配置下缓存会话必须从落盘标记发现隔离"
 
     # 无标记的遗留 .corrupt-* 在 DSN 配置下仍是孤儿（PG 恢复后豁免）
-    (tmp_path / "u-legacy.json.corrupt-20260101000000000000-1").write_text(
-        "{}", encoding="utf-8"
+    legacy_backup = (
+        tmp_path / "u-legacy.json.corrupt-20260101000000000000-1"
     )
+    legacy_backup.write_text("{}", encoding="utf-8")
 
     class _Legacy:
         db_path = str(tmp_path / "u-legacy.json")
@@ -12090,7 +12168,15 @@ def test_active_marker_detected_under_dsn(monkeypatch, tmp_path):
             return None
 
     assert server_module._quarantine_marker_for("u-legacy", _Legacy()) is None
-    print("✓ DSN 配置下落盘标记仍拦截、无标记遗留备份豁免")
+
+    # 清除 DSN：扫描必须按实例 db_path 所在目录命中真实备份
+    # （此前固定扫全局 MEMORY_DIR，自定义路径下断言恒真）
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    assert (
+        server_module._quarantine_marker_for("u-legacy", _Legacy())
+        == str(legacy_backup)
+    )
+    print("✓ DSN 配置下落盘标记仍拦截、无标记遗留备份豁免/按实例目录扫描")
 
 
 def test_persistence_detail_maps_case_conflict():

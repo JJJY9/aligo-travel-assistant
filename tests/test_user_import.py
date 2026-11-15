@@ -2887,12 +2887,12 @@ def test_merged_preview_uses_pg_counter_watermark(monkeypatch):
             return dict(snapshot)
 
         def get_trip_number_watermark(self):
-            return 10**18 - 1
+            return 7
 
     module.merged_backup_limit_problem(_PgWithCounter(), incoming)
     row = captured["payload"]["trip_history"][0]
-    assert row["trip_id"] == "trip_1000000000000000000", row["trip_id"]
-    assert len(row["trip_id"]) == 24
+    # 计数器小值必须真实采用（与未知回退的 24 字符占位可区分）
+    assert row["trip_id"] == "trip_8", row["trip_id"]
 
     class _PgNoCounterApi:
         snapshot_based = False
@@ -2904,6 +2904,22 @@ def test_merged_preview_uses_pg_counter_watermark(monkeypatch):
     row = captured["payload"]["trip_history"][0]
     assert row["trip_id"] == "trip_1000000000000000000", (
         "PG 水位未知时必须按 BIGINT 上限占位，不能从 trip_1 起算"
+    )
+    assert len(row["trip_id"]) == 24
+
+    class _PgBrokenCounter:
+        snapshot_based = False
+
+        def export_snapshot(self):
+            return dict(snapshot)
+
+        def get_trip_number_watermark(self):
+            raise RuntimeError("counter query failed")
+
+    module.merged_backup_limit_problem(_PgBrokenCounter(), incoming)
+    row = captured["payload"]["trip_history"][0]
+    assert len(row["trip_id"]) == 24, (
+        "读水位失败同样必须按最坏占位，不能静默从 trip_1 起算"
     )
 
     class _JsonStore:
@@ -3025,9 +3041,12 @@ def test_sections_limit_uses_merged_export_shape(monkeypatch):
     assert payload["session_titles"] == {"s1": "标题"}
     assert payload["pinned_sessions"] == ["s1"]
     assert payload["statistics"]["total_trips"] == 1
+    assert payload["statistics"]["total_queries"] == 0
+    assert payload["statistics"]["last_trip_number"] >= 1
     assert "frequent_destinations" in payload["statistics"]
 
     # 空键后端形状：单条无 purpose 行程，JSON 无键、PG 补 None
+
     single = {
         "trips": [
             {"origin": "北京", "destination": "西安", "start_date": "2026-06-01"}
@@ -3037,9 +3056,22 @@ def test_sections_limit_uses_merged_export_shape(monkeypatch):
     json_row = captured["payload"]["trip_history"][0]
     assert "purpose" not in json_row and "session_id" not in json_row
     module.sections_limit_problem(single, pg_shape=True)
-    pg_row = captured["payload"]["trip_history"][0]
+    pg_payload = captured["payload"]
+    pg_row = pg_payload["trip_history"][0]
     assert pg_row.get("purpose", "missing") is None
     assert pg_row.get("session_id", "missing") is None
+    # 独立预检没有 store、拿不到 PG 计数器：起号从 0（不按最坏占位
+    # 误拒），权威合并复核随后用真实水位兜底
+    assert pg_row["trip_id"] == "trip_1", pg_row["trip_id"]
+    assert "last_trip_number" not in pg_payload["statistics"], (
+        "PG 的 get_statistics 没有该字段，预检保持后端真实形状"
+    )
+
+    # JSON 空行程：统计恒含 last_trip_number（0）
+    module.sections_limit_problem({"trips": []})
+    empty_stats = captured["payload"]["statistics"]
+    assert empty_stats["last_trip_number"] == 0
+    assert empty_stats["total_queries"] == 0
     print("✓ 备份自身体积预检与合并复核同形状")
 
 

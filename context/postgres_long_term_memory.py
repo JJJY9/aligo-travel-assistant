@@ -502,19 +502,23 @@ class PostgresLongTermMemory:
         """写入偏好。类型上限在用户级写锁内复核：调用方锁外预检与按类型
         的锁都挡不住不同新类型的并发新增。
 
-        ``replay_safe`` 形参保留只为调用方兼容，实际被忽略：偏好 INSERT
-        一律禁止重放——连接重建会释放用户级锁，空档里其它实例可能把类型
-        数补到上限（新类型）或删除该类型使其重放变成新增行（既有类型），
-        都会越过上面的上限复核。"""
-        start_conn = getattr(self, "_conn", None)
+        偏好 INSERT 一律禁止重放——连接重建会释放用户级锁，空档里其它
+        实例可能把类型数补到上限（新类型）或删除该类型使其重放变成新增
+        行（既有类型），都会越过上面的上限复核。
+
+        ``replay_safe=False``（append_preference 的「读-合并-写」）额外
+        要求锁内连接身份不变：合并值基于重连前的快照，重连空档里其它实例
+        可能已改动同一偏好（覆盖）或删除该类型（首次 INSERT 会复活它），
+        按可重试失败上报。直接 replace 的写入值不依赖快照，重连后照常
+        执行。"""
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
+                # 连接身份在取得 advisory lock 之后采样：等锁期间的正常
+                # 重连（锁会随重连重新获取）不该让一次可成功的写入失败
+                start_conn = getattr(self, "_conn", None)
                 self._enforce_preference_cap(pref_type)
-                # 上限复核里的 SELECT 允许重连：_reconnect 会重新获取
-                # advisory lock，空档里其它实例可能已改动同一偏好（合并值
-                # 过期）或删除该类型（首次 INSERT 会把已删除的偏好复活）。
-                # 重连后的会话上连「首次」INSERT 也不能发
-                self._abort_if_reconnected(start_conn)
+                if not replay_safe:
+                    self._abort_if_reconnected(start_conn)
                 self._execute(
                     """
                     INSERT INTO aligo_preferences (user_id, pref_type, value)
@@ -1839,7 +1843,8 @@ class PostgresLongTermMemory:
         except Exception:  # noqa: BLE001 - 预演读水位失败按未知处理
             return None
         if row is None:
-            return None
+            # 从未保存过行程：计数从 0 起号，是已知水位而非未知
+            return 0
         try:
             return int(row[0] or 0)
         except (TypeError, ValueError):

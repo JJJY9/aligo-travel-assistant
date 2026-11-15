@@ -1292,11 +1292,17 @@ def test_pg_save_preference_aborts_when_cap_check_reconnects():
         return False
 
     memory._enforce_preference_cap = cap_with_reconnect
+    # 快照派生写（append 的读-合并-写）：重连即中止，不发 INSERT
     with pytest.raises(MemoryPersistenceError) as info:
-        memory.save_preference("home_location", "北京")
+        memory.save_preference("home_location", "北京", replay_safe=False)
     assert "重试" in str(info.value), str(info.value)
     assert not any("INSERT INTO aligo_preferences" in sql for sql in recorded)
-    print("✓ PG 偏好写入在复核重连后中止（不静默覆盖）")
+
+    # 直接 replace（不依赖快照）：等锁期间的重连不阻断，写入照常执行
+    recorded.clear()
+    memory.save_preference("home_location", "上海")
+    assert any("INSERT INTO aligo_preferences" in sql for sql in recorded)
+    print("✓ PG 偏好写入仅对快照派生写在重连后中止")
 
 
 def test_actual_filename_samefile_fallback(monkeypatch):
@@ -1443,6 +1449,30 @@ def test_delete_all_marker_ownership(monkeypatch):
         stale.delete_all()
         assert other_marker.exists()
     print("✓ delete_all 隔离标记归属")
+
+
+def test_pg_trip_number_watermark_reads_counter():
+    """水位读取：无计数器行 = 0（已知起点）、有行取 last_number、
+    查询异常按未知（None）。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-wm"
+
+    memory._fetchone = lambda sql, params=None: None
+    assert memory.get_trip_number_watermark() == 0, (
+        "从未保存过行程的账号计数从 0 起号，是已知水位"
+    )
+
+    memory._fetchone = lambda sql, params=None: (7,)
+    assert memory.get_trip_number_watermark() == 7
+
+    def boom(sql, params=None):
+        raise MemoryPersistenceError("db down")
+
+    memory._fetchone = boom
+    assert memory.get_trip_number_watermark() is None
+    print("✓ PG 行程编号水位读取语义")
 
 
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
