@@ -2425,7 +2425,8 @@ def test_merged_trip_rows_wired_to_backend_shape(monkeypatch):
     module.merged_backup_limit_problem(make_store(True), incoming)
     json_row = captured["payload"]["trip_history"][0]
     assert "purpose" not in json_row and "session_id" not in json_row, json_row
-    assert json_row["trip_id"] == "trip_" + "9" * 19, json_row["trip_id"]
+    # 编号仲裁：无既有水位时首行分配 trip_1（不再用 9*19 假占位）
+    assert json_row["trip_id"] == "trip_1", json_row["trip_id"]
     assert len(json_row["timestamp"]) == 26, json_row["timestamp"]
 
     # PostgreSQL 后端 snapshot_based=False：空键也序列化，时间戳带时区
@@ -2482,7 +2483,8 @@ def test_merged_statistics_trip_number_raised(monkeypatch):
         },
     )
     stats = captured["payload"]["statistics"]
-    assert stats["last_trip_number"] == 42, stats["last_trip_number"]
+    # 保守上界：最大有效编号 42 + 新建行数（每行至少推进一次水位）
+    assert stats["last_trip_number"] >= 43, stats["last_trip_number"]
     print("✓ 合并预演抬升 trip_id 水位（占位不参与）")
 
 
@@ -2695,21 +2697,39 @@ def test_import_limit_read_failure_is_memory_error():
             return {"total_trips": 4_999}
 
         def get_trip_history(self, limit=None):
+            raise OSError("lock timeout")
+
+    trips_backup = {
+        "trips": [
+            {
+                "origin": "上海",
+                "destination": "成都",
+                "start_date": "2026-05-01",
+            },
+            {
+                "origin": "北京",
+                "destination": "西安",
+                "start_date": "2026-05-02",
+            },
+        ]
+    }
+    # 4_999 + 2 > 上限：预演与真实导入两条路径都必须按持久化失败上报
+    for call in (module.preview_user_import, module.import_user_data):
+        with pytest.raises(MemoryPersistenceError) as info:
+            call(_TripStore(), trips_backup)
+        assert "读取既有行程失败" in str(info.value), str(info.value)
+
+    class _TripQuarantineStore:
+        def get_statistics(self):
+            return {"total_trips": 4_999}
+
+        def get_trip_history(self, limit=None):
             raise MemoryPersistenceError("lock timeout")
 
-    with pytest.raises(MemoryPersistenceError):
-        module.preview_user_import(
-            _TripStore(),
-            {
-                "trips": [
-                    {
-                        "origin": "上海",
-                        "destination": "成都",
-                        "start_date": "2026-05-01",
-                    }
-                ]
-            },
-        )
+    # 存储类异常原样透传（保留隔离等前缀供 503 文案分层）
+    with pytest.raises(MemoryPersistenceError) as info:
+        module.import_user_data(_TripQuarantineStore(), trips_backup)
+    assert str(info.value) == "lock timeout"
     print("✓ 上限预检的读取失败按持久化失败上报")
 
 
@@ -2749,6 +2769,86 @@ def test_sections_limit_uses_neighbor_timestamp_anchor(monkeypatch):
     assert isinstance(anchored, str) and anchored.endswith("+00:00"), rows[1]
     assert len(anchored) == 32, anchored
     print("✓ 导出形状预检复用邻居时间戳锚点")
+
+
+def test_merged_trip_ids_mirror_storage_renumbering(monkeypatch):
+    """预演复刻存储层编号仲裁：冲突的备份编号被改写成 trip_<水位>
+    （18 位水位后为 24 字符），未被占用的编号沿用并抬水位。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    class _Store:
+        snapshot_based = False
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [
+                    {
+                        "origin": "上海",
+                        "destination": "成都",
+                        "start_date": "2026-05-01",
+                        "trip_id": "trip_1",
+                    },
+                    {
+                        "origin": "北京",
+                        "destination": "西安",
+                        "start_date": "2026-06-01",
+                        "trip_id": "trip_2",
+                    },
+                ],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {"last_trip_number": 999999999999999999},
+            }
+
+    module.merged_backup_limit_problem(
+        _Store(),
+        {
+            "trips": [
+                {
+                    # 同身份更新：编号保持不变
+                    "origin": "上海",
+                    "destination": "成都",
+                    "start_date": "2026-05-01",
+                },
+                {
+                    # 新身份但备份编号与既有行冲突：存储层会改号
+                    "origin": "上海",
+                    "destination": "杭州",
+                    "start_date": "2026-07-01",
+                    "trip_id": "trip_1",
+                },
+                {
+                    # 未占用的备份编号：沿用并抬水位
+                    "origin": "上海",
+                    "destination": "南京",
+                    "start_date": "2026-08-01",
+                    "trip_id": "trip_5",
+                },
+            ]
+        },
+    )
+    rows = captured["payload"]["trip_history"]
+    assert rows[0]["trip_id"] == "trip_1"
+    conflict_row = rows[2]
+    assert conflict_row["trip_id"] == "trip_1000000000000000000", (
+        conflict_row["trip_id"]
+    )
+    assert len(conflict_row["trip_id"]) == 24
+    assert rows[3]["trip_id"] == "trip_5"
+    stats = captured["payload"]["statistics"]
+    assert stats["last_trip_number"] >= 10**18, stats["last_trip_number"]
+    print("✓ 合并预演复刻编号仲裁（冲突改号/沿用抬水位）")
 
 
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):

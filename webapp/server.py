@@ -67,7 +67,11 @@ from utils.access_log import (
     access_log_format,
     format_access_log,
 )
-from utils.errors import MemoryPersistenceError, UserFacingError
+from utils.errors import (
+    MemoryPersistenceError,
+    PartialImportError,
+    UserFacingError,
+)
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio, strip_terminal_controls
 from utils.doctor import run_doctor
@@ -5201,6 +5205,23 @@ def create_app(model: Any = None) -> FastAPI:
                 raise
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except PartialImportError as exc:
+                # 部分行已提交：与 CLI trips-import 同口径如实报告，
+                # 重试按同路线+同日期去重、可安全重跑（不回显底层文本）
+                logger.warning(
+                    "导入行程部分完成: 已提交 %s 新增 / %s 更新",
+                    exc.created,
+                    exc.updated,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"导入部分失败：已提交 {exc.created} 条新增、"
+                        f"{exc.updated} 条更新；重试会按同路线同日期去重，"
+                        "可安全重跑"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                ) from exc
             except Exception as exc:  # noqa: BLE001 - 读取 / 写入失败统一提示
                 logger.warning("导入行程失败: %s", exc)
                 raise _storage_failure("导入行程失败", exc) from exc
@@ -5661,12 +5682,12 @@ def create_app(model: Any = None) -> FastAPI:
 
         from utils.user_import import (
             MAX_BACKUP_BYTES,
-            backup_limit_problem,
             drop_sessions,
             import_user_data,
             merged_backup_limit_problem,
             parse_user_export_data,
             preview_user_import,
+            sections_limit_problem,
         )
 
         # 破坏性写入接口只接受 application/json：text/plain / 表单属于
@@ -5784,12 +5805,20 @@ def create_app(model: Any = None) -> FastAPI:
             if not sections:
                 detail = "；".join(errors[:3]) or "没有可恢复的数据"
                 raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
-            # 请求体上限按紧凑 JSON 预检；恢复后的备份将按导出格式
-            # （indent=2，约 1.3-1.6 倍体积）重新导出——不在这里按导出
-            # 体积再查一次，用户会恢复出一份「自己永远导出不了」的数据
+            # 上限自检与 CLI user-import 同口径：按【解析后】的可恢复段
+            # 复核。解析会丢弃 / 截断非法行，对原始备份检查会把 Web 413
+            # 与 CLI 可恢复的同一备份判成相反结论
             try:
+                from config import STORAGE_CONFIG as _storage_config
+
                 limit_problem = await loop.run_in_executor(
-                    state.import_executor, backup_limit_problem, payload.backup
+                    state.import_executor,
+                    lambda: sections_limit_problem(
+                        sections,
+                        pg_shape=bool(
+                            _storage_config.get("postgres_dsn")
+                        ),
+                    ),
                 )
             except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
                 logger.debug("备份导出口径自检失败", exc_info=True)
@@ -5986,6 +6015,24 @@ def create_app(model: Any = None) -> FastAPI:
                     # 存量 + 备份越过导出上限等用户可修正的问题：明确 400，
                     # 不能吞成「稍后重试」的 503
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except PartialImportError as exc:
+                    # 批量保存部分已提交：如实报告条数（CLI trips-import
+                    # 同口径）；重复导入按路线+日期去重，可安全重跑
+                    logger.warning(
+                        "恢复用户备份部分完成（%s）：已提交 %s 新增 / %s 更新",
+                        user_id,
+                        exc.created,
+                        exc.updated,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"恢复部分完成：已提交 {exc.created} 条新增、"
+                            f"{exc.updated} 条更新；重复导入按路线+日期"
+                            "去重，可安全重跑"
+                            f"（请求 ID：{_request_id(request)}）"
+                        ),
+                    ) from exc
                 except MemoryPersistenceError as exc:
                     logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                     raise HTTPException(

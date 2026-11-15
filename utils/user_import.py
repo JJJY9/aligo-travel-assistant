@@ -450,6 +450,7 @@ def merged_backup_limit_problem(
     if isinstance(incoming_titles, dict):
         merged_titles.update(incoming_titles)
     existing_messages = list(existing.get("chat_history") or [])
+    existing_trip_rows = list(existing.get("trip_history") or [])
     # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
     # export_snapshot 之外补 user_id / exported_at——这里放等长占位，
     # 体积口径与导出端一致
@@ -468,9 +469,10 @@ def merged_backup_limit_problem(
                 pg_shape=not getattr(store, "snapshot_based", False),
             ),
             "trip_history": _merged_trip_rows(
-                list(existing.get("trip_history") or []),
+                existing_trip_rows,
                 sections.get("trips") or [],
                 include_empty_keys=not getattr(store, "snapshot_based", False),
+                existing_last_number=_existing_last_trip_number(existing),
             ),
             "preferences": merged_prefs,
             "knowledge": sections.get("knowledge") or [],
@@ -527,21 +529,19 @@ def merged_backup_limit_problem(
     trip_numbers = [
         int(match.group(1))
         for match in (
-            re.match(r"trip_(\d+)$", str(trip.get("trip_id") or ""))
+            re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id") or ""))
             for trip in merged_trips
             if isinstance(trip, dict)
         )
-        # 19 位以上只可能是预演占位（解析层丢弃 18 位以上的真实编号），
-        # 不计入水位
-        if match and int(match.group(1)) < 10**18
+        if match
     ]
-    if trip_numbers:
-        # 写入层会按备份编号抬升水位（存储层为新建行补 trip_<水位>）
-        try:
-            existing_last = int(statistics.get("last_trip_number") or 0)
-        except (TypeError, ValueError):
-            existing_last = 0
-        statistics["last_trip_number"] = max(existing_last, *trip_numbers)
+    created_trip_count = max(0, len(merged_trips) - len(existing_trip_rows))
+    if merged_trips:
+        # 写入层对每个新建行至少推进一次水位；冲突改号行还能把水位推到
+        # 18 位以上——取「现有水位 / 最大编号 / 新建行数」的保守上界
+        existing_last = _existing_last_trip_number(existing) or 0
+        water = max([existing_last, *trip_numbers], default=existing_last)
+        statistics["last_trip_number"] = water + created_trip_count
     payload["statistics"] = statistics
     return backup_limit_problem(payload)
 
@@ -594,11 +594,23 @@ def _trip_merge_key(row: dict[str, Any]) -> Any:
     return trip_identity(row)
 
 
+def _existing_last_trip_number(existing: dict[str, Any]) -> int | None:
+    """已有快照里的编号水位（statistics.last_trip_number）。"""
+    statistics = existing.get("statistics")
+    if not isinstance(statistics, dict):
+        return None
+    try:
+        return int(statistics.get("last_trip_number") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
 def _merged_trip_rows(
     existing_rows: list[Any],
     trips: list[Any],
     *,
     include_empty_keys: bool = False,
+    existing_last_number: int | None = None,
 ) -> list[Any]:
     """恢复后行程表的形状：按 ``save_trip_histories`` 的索引语义预演。
 
@@ -615,8 +627,16 @@ def _merged_trip_rows(
     )
     base = [dict(row) if isinstance(row, dict) else row for row in existing_rows]
     index: dict[Any, int] = {}
+    used_trip_ids: set[str] = set()
+    max_number = int(existing_last_number or 0)
     for idx, row in enumerate(base):
         if isinstance(row, dict):
+            trip_id_text = str(row.get("trip_id") or "")
+            if trip_id_text:
+                used_trip_ids.add(trip_id_text)
+            match = re.fullmatch(r"trip_(\d+)", trip_id_text)
+            if match:
+                max_number = max(max_number, int(match.group(1)))
             key = _trip_merge_key(row)
             if key is not None:
                 index.setdefault(key, idx)
@@ -641,12 +661,19 @@ def _merged_trip_rows(
         if key is not None:
             created_index[key] = len(created)
         record = dict(row)
-        # drop_sessions 的内部标记不会落库；存储层为新建行补写 trip_id 与
-        # timestamp——预演按落库后的形状计数，避免与真实导入结论不一致
+        # drop_sessions 的内部标记不会落库；存储层为新建行按编号仲裁
+        # 补写 trip_id——预演必须复刻同一规则（先自增水位，备份编号未被
+        # 占用时可沿用并抬高水位，否则写成 trip_<水位>），否则冲突改号
+        # 的行会按备份里的短编号低估导出体积
         record.pop(_DROPPED_SESSION_KEY, None)
-        # 占位按落库后的最坏形状：存储层补写 trip_<水位>（最长 24 字符），
-        # PG 的导出行时间戳带时区偏移（32 字符）；短占位会低估导出体积
-        record.setdefault("trip_id", "trip_" + "9" * 19)
+        max_number += 1
+        backup_id = str(record.get("trip_id") or "")
+        match = re.fullmatch(r"trip_(\d+)", backup_id)
+        if match and backup_id not in used_trip_ids:
+            max_number = max(max_number, int(match.group(1)))
+        else:
+            record["trip_id"] = f"trip_{max_number}"
+        used_trip_ids.add(str(record["trip_id"]))
         record.setdefault("timestamp", fallback_timestamp)
         if include_empty_keys:
             # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也
