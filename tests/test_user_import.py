@@ -846,7 +846,7 @@ def test_import_restores_archived_and_reports_generic_knowledge_error(monkeypatc
     store = _real_store("u-arch")
     try:
 
-        def boom(documents):
+        def boom(documents, dry_run=False, *, return_pieces=False):
             raise RuntimeError("milvus down")
 
         monkeypatch.setattr(admin_module, "import_documents", boom)
@@ -916,7 +916,7 @@ def test_parse_knowledge_section_and_import(monkeypatch):
 
     calls = []
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
         calls.append(documents)
         return {"imported": 1, "skipped": 0, "skipped_invalid": 0, "skipped_duplicate": 0}
 
@@ -925,7 +925,7 @@ def test_parse_knowledge_section_and_import(monkeypatch):
     assert counts["knowledge_imported"] == 1 and counts["knowledge_skipped"] == 0
     assert calls and calls[0][0]["content"] == "知识一"
 
-    def missing_db(documents):
+    def missing_db(documents, dry_run=False, *, return_pieces=False):
         raise FileNotFoundError("知识库未初始化")
 
     monkeypatch.setattr(admin_module, "import_documents", missing_db)
@@ -949,7 +949,7 @@ def test_runner_knowledge_error_and_skip(monkeypatch):
     )
     store = _real_store("u-kb-cli")
 
-    def missing(documents):
+    def missing(documents, dry_run=False, *, return_pieces=False):
         raise FileNotFoundError("知识库未初始化")
 
     monkeypatch.setattr(admin_module, "import_documents", missing)
@@ -961,7 +961,7 @@ def test_runner_knowledge_error_and_skip(monkeypatch):
 
     calls = []
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
         calls.append(documents)
         return {"imported": 1, "skipped": 0, "skipped_invalid": 0, "skipped_duplicate": 0}
 
@@ -1361,7 +1361,7 @@ def test_runner_recovers_knowledge_only_backup(monkeypatch):
     store = _real_store("u-kb-only")
     calls = []
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
         calls.append(documents)
         return {"imported": 1, "skipped": 0, "skipped_invalid": 0, "skipped_duplicate": 0}
 
@@ -2269,9 +2269,10 @@ def test_merged_trip_rows_mirror_storage_semantics():
     print("✓ 合并预演与存储层的行程索引 / 更新语义一致（含补写字段）")
 
 
-def test_import_without_user_data_recreates_quarantined_main():
-    """隔离账号的恢复备份不含用户数据（仅知识片段 / 消息全被剔除）时，
-    恢复成功后同样重建主文件——否则账号持续 503，产品内无自愈路径。"""
+def test_import_without_user_data_keeps_quarantine_guidance():
+    """隔离账号 + 备份不含任何用户数据：不重建主文件（重建会抹掉
+    .corrupt-* / .quarantine 的恢复指引，让用户误以为已恢复），返回
+    recovery_incomplete；一旦真正写回用户数据，才重建并解除隔离。"""
     from pathlib import Path as _Path
 
     from context.long_term_memory import LongTermMemory
@@ -2286,15 +2287,26 @@ def test_import_without_user_data_recreates_quarantined_main():
         "u-recover-empty", storage_dir, allow_quarantined=True
     )
     assert store.get_recovered_corrupt_backup()
-    import_user_data(
+    counts = import_user_data(
         store, {"preferences": {}, "trips": [], "messages": []}
     )
-    assert (_Path(storage_dir) / "u-recover-empty.json").exists(), (
-        "无用户数据的恢复成功后必须重建主文件"
+    assert counts.get("recovery_incomplete") is True, counts
+    assert not (_Path(storage_dir) / "u-recover-empty.json").exists(), (
+        "无用户数据的恢复不能重建主文件、抹掉隔离指引"
     )
     fresh = LongTermMemory("u-recover-empty", storage_dir)
-    assert fresh.get_recovered_corrupt_backup() is None
-    print("✓ 无用户数据的恢复重建隔离主文件")
+    assert fresh.get_recovered_corrupt_backup(), "隔离证据必须仍然可见"
+    assert backup.exists(), "隔离备份必须仍在磁盘上"
+
+    # 真正写回用户数据：照常重建主文件并解除隔离
+    counts = import_user_data(
+        store, {"preferences": {"home_location": "北京"}}
+    )
+    assert "recovery_incomplete" not in counts
+    assert (_Path(storage_dir) / "u-recover-empty.json").exists()
+    recovered = LongTermMemory("u-recover-empty", storage_dir)
+    assert recovered.get_recovered_corrupt_backup() is None
+    print("✓ 无用户数据的隔离恢复保留指引，有数据才重建")
 
 
 def test_preview_read_failure_raises_memory_error():
@@ -3231,6 +3243,91 @@ def test_merged_knowledge_duplicate_backup_not_rejected(monkeypatch):
     print("✓ 幂等重导知识备份不被双计误拒")
 
 
+def test_merged_knowledge_over_limit_library_does_not_block(monkeypatch):
+    """部署级知识库自身已超导入上限：任何恢复都无法把它推得更糟，
+    不能据此拒绝用户数据（含 --skip-knowledge 路径）。"""
+    from utils import user_import as module
+
+    over_limit = [
+        {"content": f"片{i}", "metadata": {}} for i in range(50_001)
+    ]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(over_limit)
+    )
+    # 用真实计数上限判定基线：库自身超过 50000 片
+    import utils.knowledge_admin as kb
+
+    monkeypatch.setattr(
+        kb, "import_documents", _fake_knowledge_planner([])
+    )
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    # 走真实的 backup_limit_problem（基线判定依赖它）
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"preferences": {"home_location": "北京"}}
+    )
+    assert problem is None, problem
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"knowledge": [{"content": "新"}]}
+    )
+    assert problem is None, problem
+    print("✓ 已超限的全局知识库不阻断用户数据恢复")
+
+
+def test_merged_knowledge_increment_guard_preserved(monkeypatch):
+    """合规知识库 + 本次新增分片越过上限：仍按增量拒绝（保护的正是
+    「恢复后无法再导出」这一状态）。"""
+    from utils import user_import as module
+    import utils.knowledge_admin as kb
+
+    existing = [
+        {"content": f"片{i}", "metadata": {}} for i in range(49_999)
+    ]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(existing)
+    )
+    pieces = [
+        {"content": "新片一", "metadata": {}},
+        {"content": "新片二", "metadata": {}},
+    ]
+    monkeypatch.setattr(
+        kb, "import_documents", _fake_knowledge_planner(pieces)
+    )
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"knowledge": [{"content": "原始"}]}
+    )
+    assert problem and "知识片段" in problem, problem
+    print("✓ 合规知识库的增量越限仍被拒绝")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""
@@ -3372,7 +3469,7 @@ def test_import_knowledge_error_redacts_paths(monkeypatch):
     """知识片段恢复失败回流给用户的文本遮蔽本机路径 / 上游 URL。"""
     from utils import knowledge_admin as knowledge_module
 
-    def boom(documents):
+    def boom(documents, dry_run=False, *, return_pieces=False):
         raise RuntimeError(
             "加载失败: C:\\Users\\alice\\.cache\\model 与 "
             "https://huggingface.co/BAAI/bge (Connection refused)"

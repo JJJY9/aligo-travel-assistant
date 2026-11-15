@@ -10964,7 +10964,7 @@ def test_user_data_import_api_with_knowledge(monkeypatch):
     target = _unique_user("web_test_import_kb")
     calls = []
 
-    def fake_import(documents):
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
         calls.append(documents)
         return {
             "imported": len(documents),
@@ -10991,7 +10991,7 @@ def test_user_data_import_api_with_knowledge(monkeypatch):
         assert payload["ok"] is True
         assert calls and calls[0][0]["content"] == "知识一"
 
-        def missing(documents):
+        def missing(documents, dry_run=False, *, return_pieces=False):
             raise FileNotFoundError("知识库未初始化")
 
         monkeypatch.setattr(admin_module, "import_documents", missing)
