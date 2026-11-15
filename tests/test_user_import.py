@@ -2555,6 +2555,65 @@ def test_sections_limit_counts_missing_timestamps_as_export_shape(monkeypatch):
     print("✓ 备份自身体积预检按导出时间戳形状计")
 
 
+def test_merged_update_rows_get_timestamp(monkeypatch):
+    """同身份更新行落库时无条件刷新时间戳：预演必须同样补占位，
+    否则导出形状（含时间戳键）比预演多出每行约 40 字节。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    def run(snapshot_based):
+        class _Store:
+            pass
+
+        store = _Store()
+        store.snapshot_based = snapshot_based
+        store.export_snapshot = lambda: {
+            "chat_history": [],
+            "trip_history": [
+                {
+                    "origin": "上海",
+                    "destination": "成都",
+                    "start_date": "2026-05-01",
+                }
+            ],
+            "preferences": {},
+            "session_titles": {},
+            "pinned_sessions": [],
+            "archived_sessions": [],
+            "statistics": {},
+        }
+        module.merged_backup_limit_problem(
+            store,
+            {
+                "trips": [
+                    {
+                        "origin": "上海",
+                        "destination": "成都",
+                        "start_date": "2026-05-01",
+                    }
+                ]
+            },
+        )
+        return captured["payload"]["trip_history"][0]
+
+    # JSON 后端（snapshot_based=True）：naive 26 字符
+    json_row = run(True)
+    assert isinstance(json_row.get("timestamp"), str), json_row
+    assert len(json_row["timestamp"]) == 26, json_row["timestamp"]
+    # PostgreSQL 后端：带时区偏移 32 字符
+    pg_row = run(False)
+    assert isinstance(pg_row.get("timestamp"), str), pg_row
+    assert len(pg_row["timestamp"]) == 32, pg_row["timestamp"]
+    print("✓ 合并预演更新行补时间戳占位")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""

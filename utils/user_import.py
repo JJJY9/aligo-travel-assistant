@@ -606,6 +606,11 @@ def _merged_trip_rows(
       前行其余字段保留（新纪录是整行落库，只回填 purpose 会低估体积）；
     - 缺目的地 / 出发日期的行不参与去重，逐条新增。
     """
+    fallback_timestamp = (
+        datetime.now().astimezone().isoformat(timespec="microseconds")
+        if include_empty_keys
+        else datetime.now().isoformat(timespec="microseconds")
+    )
     base = [dict(row) if isinstance(row, dict) else row for row in existing_rows]
     index: dict[Any, int] = {}
     for idx, row in enumerate(base):
@@ -621,11 +626,15 @@ def _merged_trip_rows(
         key = _trip_merge_key(row)
         if key is not None and key in index:
             target = index[key]
-            base[target] = _merge_trip_row(base[target], row)
+            base[target] = _merge_trip_row(
+                base[target], row, fallback_timestamp
+            )
             continue
         if key is not None and key in created_index:
             target = created_index[key]
-            created[target] = _merge_trip_row(created[target], row)
+            created[target] = _merge_trip_row(
+                created[target], row, fallback_timestamp
+            )
             continue
         if key is not None:
             created_index[key] = len(created)
@@ -636,15 +645,7 @@ def _merged_trip_rows(
         # 占位按落库后的最坏形状：存储层补写 trip_<水位>（最长 24 字符），
         # PG 的导出行时间戳带时区偏移（32 字符）；短占位会低估导出体积
         record.setdefault("trip_id", "trip_" + "9" * 19)
-        if include_empty_keys:
-            record.setdefault(
-                "timestamp",
-                datetime.now().astimezone().isoformat(timespec="microseconds"),
-            )
-        else:
-            record.setdefault(
-                "timestamp", datetime.now().isoformat(timespec="microseconds")
-            )
+        record.setdefault("timestamp", fallback_timestamp)
         if include_empty_keys:
             # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也
             # 序列化）；JSON 后端没有这两个键
@@ -655,11 +656,13 @@ def _merged_trip_rows(
 
 
 def _merge_trip_row(
-    existing: dict[str, Any], incoming: dict[str, Any]
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    fallback_timestamp: str = "",
 ) -> dict[str, Any]:
     """导入层对同身份行程的更新语义（与 ``save_trip_histories`` 一致）：
     purpose 非 None 覆盖、session_id 键存在即覆盖（含显式 None）、时间戳
-    取备份值，其余字段保留。"""
+    无条件刷新（``row.get("timestamp") or now``），其余字段保留。"""
     merged = dict(existing)
     purpose = incoming.get("purpose")
     if purpose is not None:
@@ -669,6 +672,10 @@ def _merge_trip_row(
     timestamp = incoming.get("timestamp")
     if timestamp:
         merged["timestamp"] = timestamp
+    elif fallback_timestamp:
+        # 存储层更新行无条件刷新时间戳：预演同样补占位，导出形状
+        # （含时间戳键）才与落库后一致，避免体积低估
+        merged["timestamp"] = fallback_timestamp
     return merged
 
 

@@ -237,16 +237,6 @@ class LongTermMemory:
                     return data
                 except MemoryPersistenceError:
                     raise
-                except OSError as e:
-                    # 读失败 ≠ 内容损坏：杀软 / 同步盘占用、网络盘抖动、
-                    # ACL 禁读时把完好文件改名隔离，会让账号在 CLI / Web
-                    # 全面 503（标记还把误判传播给所有新实例）。交给上层
-                    # 按可重试 503 处理，与 _reload_latest 同口径
-                    logger.error(f"Failed to read long-term memory: {e}")
-                    raise MemoryPersistenceError(
-                        "长期记忆暂时不可读（文件可能被占用）"
-                        f"（{self.db_path}）：{e}"
-                    ) from e
                 except Exception as e:
                     logger.error(f"Failed to load long-term memory: {e}")
                     # 复核与备份都必须持有跨进程文件锁：其它进程的写操作在
@@ -504,10 +494,13 @@ class LongTermMemory:
                 self.data = self._init_data()
                 return
             backups = self._corrupt_siblings()
-            if self._read_quarantine_marker()[0]:
+            quarantined, marker_backup = self._read_quarantine_marker()
+            if quarantined:
                 # 隔离标记（其它实例 / DSN 下的重建实例写入）：与本实例
                 # 当场隔离同等对待，配置了 PostgreSQL 也不能写回
                 self._fresh_quarantine = True
+                if marker_backup and not self._corrupt_backup:
+                    self._corrupt_backup = marker_backup
             if (
                 backups
                 and not self._allow_quarantined
@@ -1270,6 +1263,18 @@ class LongTermMemory:
         （PostgreSQL 故障回退期间）留下的孤儿。
         """
         return self._corrupt_backup if self._fresh_quarantine else None
+
+    def get_active_quarantine_backup(self) -> str | None:
+        """落盘隔离标记指向的备份（跨实例隔离证据，直接读磁盘）。
+
+        与 :meth:`get_fresh_quarantine_backup` 不同，早期加载的实例（Web
+        缓存会话 / CLI 长会话）也能发现其它进程刚写入的隔离。标记损坏
+        但确实存在时按隔离中 fail-closed（返回标记路径作为证据）。
+        """
+        quarantined, backup = self._read_quarantine_marker()
+        if not quarantined:
+            return None
+        return backup or str(self._quarantine_marker_path())
 
     def has_pending_corrupt_quarantine(self) -> bool:
         """检测到损坏但隔离改名 / 等锁失败（备份尚未完成）的状态。"""

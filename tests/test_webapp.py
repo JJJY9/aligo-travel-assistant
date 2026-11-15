@@ -11713,6 +11713,141 @@ def test_cached_session_quarantined_is_evicted_and_closed(monkeypatch, tmp_path)
     assert closed == [True], "被驱逐的隔离会话必须立即关闭"
 
 
+def test_quarantine_probe_runs_outside_sessions_lock(monkeypatch):
+    """缓存命中的隔离探测（文件系统扫描）必须在 _sessions_lock 之外执行：
+    锁内的慢 stat 会把所有用户的会话查找串行阻塞。"""
+    import threading
+    from collections import OrderedDict
+
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "wrap_usage_tracking", lambda m: m)
+
+    class _StubApp:
+        _session_key = staticmethod(server_module.AligoWebApp._session_key)
+
+        def __init__(self):
+            self._sessions_lock = threading.Lock()
+            self.sessions = OrderedDict()
+            self.max_sessions = 4
+            self.session_turn_leak_sec = 60.0
+            self._session_build_slots = threading.Semaphore(1)
+            self.model = None
+            self.breaker = None
+            self.is_recently_deleted = lambda user, session: False
+
+        def _evict_over_limit_locked(self, key, evicted):
+            pass
+
+    app_state = _StubApp()
+
+    class _FakeSession:
+        def close(self):
+            pass
+
+        def begin_turn(self):
+            pass
+
+        def in_use(self):
+            return False
+
+    probed = []
+
+    def probe(user_id, long_term):
+        probed.append(app_state._sessions_lock.locked())
+        return None
+
+    monkeypatch.setattr(server_module, "_quarantine_marker_for", probe)
+    monkeypatch.setattr(
+        server_module, "_session_long_term", lambda session: None
+    )
+    key = app_state._session_key("u-lock", "s1")
+    app_state.sessions[key] = _FakeSession()
+    try:
+        server_module.AligoWebApp.get_session(app_state, "u-lock", "s1")
+    finally:
+        app_state.sessions.pop(key, None)
+    assert probed == [False], "隔离探测不能在全局会话锁内做文件系统 I/O"
+    print("✓ 缓存命中的隔离探测在会话锁外执行")
+
+
+def test_active_marker_detected_under_dsn(monkeypatch, tmp_path):
+    """配置 PostgreSQL 时，落盘隔离标记（其它实例写入）仍要拦截缓存会话；
+    无标记的遗留 .corrupt-* 继续按孤儿豁免。"""
+    from config import STORAGE_CONFIG
+    from context.long_term_memory import LongTermMemory
+    from webapp import server as server_module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = str(tmp_path)
+    seed = LongTermMemory("u-marker-dsn", storage_dir)
+    seed.save_preference("home_location", "北京")
+    # 缓存实例在隔离发生前加载（fresh 为 None）
+    cached = LongTermMemory("u-marker-dsn", storage_dir)
+    assert cached.get_fresh_quarantine_backup() is None
+
+    path = tmp_path / "u-marker-dsn.json"
+    path.write_text("{bad json", encoding="utf-8")
+    detecting = LongTermMemory("u-marker-dsn", storage_dir)
+    backup = detecting.get_fresh_quarantine_backup()
+    assert backup
+
+    monkeypatch.setitem(
+        STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
+    )
+    assert (
+        server_module._quarantine_marker_for("u-marker-dsn", cached) == backup
+    ), "DSN 配置下缓存会话必须从落盘标记发现隔离"
+
+    # 无标记的遗留 .corrupt-* 在 DSN 配置下仍是孤儿（PG 恢复后豁免）
+    (tmp_path / "u-legacy.json.corrupt-20260101000000000000-1").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    class _Legacy:
+        db_path = str(tmp_path / "u-legacy.json")
+
+        def get_recovered_corrupt_backup(self):
+            return None
+
+    assert server_module._quarantine_marker_for("u-legacy", _Legacy()) is None
+    print("✓ DSN 配置下落盘标记仍拦截、无标记遗留备份豁免")
+
+
+def test_persistence_detail_maps_case_conflict():
+    """大小写冲突是永久且可修正的问题，不能报成可重试的存储故障。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    detail = server_module._persistence_failure_detail(
+        MemoryPersistenceError(
+            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）。当前文件系统"
+            "大小写不敏感，请使用与已有账号完全一致的大小写"
+        ),
+        "rid-case",
+    )
+    assert "大小写" in detail and "存储暂时不可用" not in detail, detail
+    assert "alice" not in detail, "不能回显已有账号 ID"
+
+
+def test_open_long_term_maps_case_conflict(monkeypatch):
+    """/api/import 等 _open_long_term 调用点同样给可执行的大小写提示。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    def boom(*args, **kwargs):
+        raise MemoryPersistenceError(
+            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）"
+        )
+
+    monkeypatch.setattr(server_module, "create_long_term_memory", boom)
+    with pytest.raises(server_module.HTTPException) as info:
+        server_module._open_long_term("AliceXyz")
+    assert info.value.status_code == 503
+    assert "大小写" in info.value.detail, info.value.detail
+    print("✓ 大小写冲突映射为可执行提示")
+
+
 def test_web_session_quarantine_gate_requires_json_backend(monkeypatch, tmp_path):
     """_WebSession 构造守卫只在 JSON 后端（db_path）扫描隔离备份：
     PG 形存储不受遗留 .corrupt-* 影响。"""

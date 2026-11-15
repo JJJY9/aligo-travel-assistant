@@ -789,7 +789,12 @@ def test_pg_preference_cap_serializes_across_types(monkeypatch):
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline and not results:
             time.sleep(0.02)
-        assert not results, f"A 持锁期间 B 不应完成写入：{results}"
+        # B 在窗口内等锁超时（55P03）不构成失败（见 worker_b 注释），
+        # 只禁止它成功写入；严格断言会与本用例宣称的容忍自相矛盾，
+        # 主线程被调度暂停超过 lock_timeout 时假失败
+        assert not any(
+            name == "b" and item == "ok" for name, item in results
+        ), f"A 持锁期间 B 不应完成写入：{results}"
         release.set()
         thread_a.join(10)
         thread_b.join(10)
