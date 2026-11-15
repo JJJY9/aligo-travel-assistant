@@ -632,6 +632,14 @@ def _merged_knowledge_rows(sections: dict[str, Any]) -> list[Any]:
     except MemoryPersistenceError as exc:
         logger.warning("合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc)
         existing = []
+    if existing and backup_limit_problem({"knowledge": existing}) is not None:
+        # 部署级知识库自身已超导入 / 导出口径：此后任何恢复都无法把它
+        # 推得更糟（默认导出本来就不带知识库），不能据此阻断用户数据
+        # 恢复——隔离账号的 user-import 是唯一产品内恢复路径
+        logger.warning(
+            "合并预检：全局知识库自身已超过导出上限，跳过知识体积轴"
+        )
+        return []
     rows = sections.get("knowledge") or []
     if not rows:
         return existing
@@ -1656,9 +1664,54 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
             )
     # 恢复入口可能没有任何用户数据写入（仅知识片段 / 消息全被剔除）：
     # 显式落盘重建被隔离移走的主文件，否则账号恢复后仍持续 503。
+    # 但账号处于隔离态而本次又没写回任何用户数据时，重建主文件会把
+    # .corrupt-* / .quarantine 的恢复指引全部抹掉（用户以为已恢复，
+    # 实际数据仍只在隔离备份里）——此时保留隔离证据，返回
+    # recovery_incomplete 供上层提示「用户数据未恢复」。
     # 知识片段恢复失败时视为恢复未完成，保留隔离 / 删除标记待重试
     if "knowledge_error" not in result:
-        ensure_persisted = getattr(store, "ensure_persisted", None)
-        if callable(ensure_persisted):
-            ensure_persisted()
+        wrote_user_data = any(
+            int(result.get(key) or 0)
+            for key in (
+                "preferences",
+                "trips_created",
+                "trips_updated",
+                "messages_added",
+                "titles",
+                "pinned",
+                "archived",
+            )
+        )
+        if not wrote_user_data and _store_has_quarantine_evidence(store):
+            result["recovery_incomplete"] = True
+        else:
+            ensure_persisted = getattr(store, "ensure_persisted", None)
+            if callable(ensure_persisted):
+                ensure_persisted()
     return result
+
+
+def _store_has_quarantine_evidence(store: Any) -> bool:
+    """存储实例是否处于隔离 / 待复核态（含落盘标记）。"""
+    for name in (
+        "get_fresh_quarantine_backup",
+        "get_active_quarantine_backup",
+        # 遗留隔离备份（无标记 / 历史格式）同样属于「隔离证据」：
+        # 空导入重建主文件会让它们从此不可见
+        "get_recovered_corrupt_backup",
+    ):
+        getter = getattr(store, name, None)
+        if callable(getter):
+            try:
+                if getter():
+                    return True
+            except Exception:  # noqa: BLE001 - 探测失败按无证据处理
+                continue
+    pending = getattr(store, "has_pending_corrupt_quarantine", None)
+    if callable(pending):
+        try:
+            if pending():
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+    return False
