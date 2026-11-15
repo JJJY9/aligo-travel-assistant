@@ -2551,7 +2551,14 @@ def test_sections_limit_counts_missing_timestamps_as_export_shape(monkeypatch):
     )
     row = captured["payload"]["chat_history"][0]
     assert isinstance(row["timestamp"], str), row
-    assert len(row["timestamp"]) == 32, row["timestamp"]
+    # JSON 后端默认 26 字符（带时区 32 会把可恢复备份每条多算 6 字节）
+    assert len(row["timestamp"]) == 26, row["timestamp"]
+    module.sections_limit_problem(
+        {"messages": [{"role": "user", "content": "x", "timestamp": None}]},
+        pg_shape=True,
+    )
+    pg_row = captured["payload"]["chat_history"][0]
+    assert len(pg_row["timestamp"]) == 32, pg_row["timestamp"]
     print("✓ 备份自身体积预检按导出时间戳形状计")
 
 
@@ -2612,6 +2619,98 @@ def test_merged_update_rows_get_timestamp(monkeypatch):
     assert isinstance(pg_row.get("timestamp"), str), pg_row
     assert len(pg_row["timestamp"]) == 32, pg_row["timestamp"]
     print("✓ 合并预演更新行补时间戳占位")
+
+
+def test_merged_fallback_uses_backend_shape(monkeypatch):
+    """快照读失败回退到备份自检时，缺时间戳占位仍按后端形状
+    （JSON 26 / PG 32）。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    def run(snapshot_based):
+        class _Store:
+            pass
+
+        store = _Store()
+        store.snapshot_based = snapshot_based
+
+        def boom():
+            raise RuntimeError("snapshot down")
+
+        store.export_snapshot = boom
+        module.merged_backup_limit_problem(
+            store,
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "x",
+                        "session_id": "s1",
+                        "timestamp": None,
+                    }
+                ]
+            },
+        )
+        return captured["payload"]["chat_history"][0]["timestamp"]
+
+    assert len(run(True)) == 26
+    assert len(run(False)) == 32
+    print("✓ 合并回退分支的时间戳占位按后端形状")
+
+
+def test_import_limit_read_failure_is_memory_error():
+    """接近上限时读取既有数据失败：按持久化失败（503）上报，不能
+    伪造「0 条重复」并回 400 引导用户清理历史。"""
+    from utils import user_import as module
+    from utils.errors import MemoryPersistenceError
+
+    class _StatsStore:
+        def get_statistics(self):
+            return {"total_messages": 199_999}
+
+        def get_chat_history(self, limit=None):
+            raise MemoryPersistenceError(
+                "PostgreSQL 操作失败：connection reset"
+            )
+
+    sections = {
+        "messages": [
+            {"role": "user", "content": "a", "session_id": "s1"},
+            {"role": "assistant", "content": "b", "session_id": "s1"},
+        ]
+    }
+    for call in (module.preview_user_import, module.import_user_data):
+        with pytest.raises(MemoryPersistenceError):
+            call(_StatsStore(), sections)
+
+    class _TripStore:
+        def get_statistics(self):
+            return {"total_trips": 4_999}
+
+        def get_trip_history(self, limit=None):
+            raise MemoryPersistenceError("lock timeout")
+
+    with pytest.raises(MemoryPersistenceError):
+        module.preview_user_import(
+            _TripStore(),
+            {
+                "trips": [
+                    {
+                        "origin": "上海",
+                        "destination": "成都",
+                        "start_date": "2026-05-01",
+                    }
+                ]
+            },
+        )
+    print("✓ 上限预检的读取失败按持久化失败上报")
 
 
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
@@ -2799,11 +2898,13 @@ if __name__ == "__main__":
 
     ran = 0
     skipped = 0
+    skipped_names: list[str] = []
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
         fixture = None
+        caplog_shim = None
         kwargs: dict = {}
         unsupported = False
         for param, spec in params.items():
@@ -2812,15 +2913,23 @@ if __name__ == "__main__":
                 kwargs[param] = fixture
             elif param == "tmp_path":
                 kwargs[param] = pathlib.Path(tempfile.mkdtemp())
-            elif param == "caplog" and spec.default is None:
-                kwargs[param] = None
+            elif param == "caplog":
+                # pytest 夹具只在 pytest 内注入：直跑用最小替身真正执行
+                # 日志断言，不能静默跳过（否则脱敏回归在直跑清单上假绿）
+                import _caplog_shim
+
+                caplog_shim = _caplog_shim.CaplogShim()
+                kwargs[param] = caplog_shim
             else:
                 unsupported = True
                 break
         if unsupported:
+            if caplog_shim is not None:
+                caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
             skipped += 1
+            skipped_names.append(name)
             continue
         storage_snapshot: dict | None = None
         try:
@@ -2840,6 +2949,8 @@ if __name__ == "__main__":
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if caplog_shim is not None:
+                caplog_shim.close()
             if storage_snapshot is not None:
                 from typing import cast
 
@@ -2855,6 +2966,8 @@ if __name__ == "__main__":
         for name, func in globals().items()
         if name.startswith("test_") and callable(func)
     )
+    if skipped_names:
+        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
         f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
