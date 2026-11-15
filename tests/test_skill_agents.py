@@ -3685,8 +3685,20 @@ if __name__ == "__main__":
             if fixture is not None:
                 fixture.undo()
             skipped += 1
-            skipped_names.append(name)
+            skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
+        kb_fixture: pytest.MonkeyPatch | None = None
+        try:
+            from utils import user_import as _ui_for_kb
+
+            kb_fixture = pytest.MonkeyPatch()
+            kb_fixture.setattr(
+                _ui_for_kb, "_existing_knowledge_rows", lambda: []
+            )
+        except Exception:  # noqa: BLE001 - 模块不可用时不补丁
+            if kb_fixture is not None:
+                kb_fixture.undo()
+            kb_fixture = None
         storage_snapshot: dict | None = None
         try:
             from config import STORAGE_CONFIG
@@ -3702,9 +3714,9 @@ if __name__ == "__main__":
             else:
                 func(**kwargs)
             ran += 1
-        except pytest.skip.Exception:
+        except pytest.skip.Exception as exc:
             skipped += 1
-            skipped_names.append(name)
+            skipped_names.append(f"{name}（条件跳过：{exc}）")
         finally:
             if caplog_shim is not None:
                 caplog_shim.close()
@@ -3718,13 +3730,15 @@ if __name__ == "__main__":
                 _cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
+            if kb_fixture is not None:
+                kb_fixture.undo()
     total = sum(
         1
         for name, func in globals().items()
         if name.startswith("test_") and callable(func)
     )
     if skipped_names:
-        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
+        print("直跑跳过：" + "、".join(skipped_names))
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
         f"{skipped} 个需 pytest 专用夹具或按条件跳过）"

@@ -478,7 +478,8 @@ def merged_backup_limit_problem(
                 ),
             ),
             "preferences": merged_prefs,
-            "knowledge": _merged_knowledge_rows(sections),
+            "knowledge": _baseline_aware_knowledge_rows(existing, sections)
+            or [],
             "session_titles": merged_titles,
             "pinned_sessions": sorted(
                 {
@@ -618,41 +619,86 @@ def _existing_knowledge_rows() -> list[Any]:
         ) from exc
 
 
-def _merged_knowledge_rows(sections: dict[str, Any]) -> list[Any]:
-    """合并复核的知识段：现有全局库 + 本次真正会写入的分片。
+def _planned_knowledge_rows(sections: dict[str, Any]) -> list[Any] | None:
+    """本次恢复真正会写入的知识分片（导入层 dry-run 规划）。
 
-    直接复用导入层的 dry-run 规划（分组还原 / 去重 / 切分后的最终形状）：
-    预演与真实 ``import_documents`` 逐字节同源，幂等重导自己的一体化备份
-    不会因重复分片被双计而误拒；备份不带知识段时也要计入现有库——带
-    知识库导出会带上它们。知识库不可读时不让用户数据恢复失败（导入层
-    会把知识段以 ``knowledge_error`` 上报），仅跳过知识体积轴。
+    与真实 ``import_documents`` 同一实现（分组还原 / 去重 / 切分后的
+    最终形状）：预演与落库逐字节同源。返回 None 表示知识轴不可评估
+    （规划失败）：调用方跳过知识体积轴、不阻断用户数据恢复（导入层会
+    把知识段以 ``knowledge_error`` 上报）。
     """
-    try:
-        existing = _existing_knowledge_rows()
-    except MemoryPersistenceError as exc:
-        logger.warning("合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc)
-        existing = []
-    if existing and backup_limit_problem({"knowledge": existing}) is not None:
-        # 部署级知识库自身已超导入 / 导出口径：此后任何恢复都无法把它
-        # 推得更糟（默认导出本来就不带知识库），不能据此阻断用户数据
-        # 恢复——隔离账号的 user-import 是唯一产品内恢复路径
-        logger.warning(
-            "合并预检：全局知识库自身已超过导出上限，跳过知识体积轴"
-        )
-        return []
     rows = sections.get("knowledge") or []
     if not rows:
-        return existing
+        return []
     try:
         from utils.knowledge_admin import import_documents
 
         plan = import_documents(rows, dry_run=True, return_pieces=True)
-    except FileNotFoundError:
-        return existing
     except Exception as exc:  # noqa: BLE001 - 知识失败不阻断用户数据恢复
         logger.warning("合并预检：知识库规划失败（%s），跳过知识体积轴", exc)
-        return existing
-    return existing + list(plan.get("pieces") or [])
+        return None
+    return list(plan.get("pieces") or [])
+
+
+def _export_shape_baseline(
+    existing: dict[str, Any], knowledge_rows: list[Any]
+) -> dict[str, Any]:
+    """导入前的完整导出形状（现有存量 + 现有知识库）。
+
+    知识轴是否允许作为拒绝理由，取决于「恢复前」账号本身是否仍可导出
+    WITH-knowledge 备份：已超限的账号不可能被恢复推得更糟。
+    """
+    payload = dict(existing)
+    payload.setdefault("user_id", "u" * 64)
+    payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
+    payload.setdefault("session_id", "")
+    payload.update(
+        {
+            "chat_history": list(existing.get("chat_history") or []),
+            "trip_history": list(existing.get("trip_history") or []),
+            "preferences": existing.get("preferences") or {},
+            "knowledge": list(knowledge_rows),
+            "session_titles": existing.get("session_titles") or {},
+            "pinned_sessions": list(existing.get("pinned_sessions") or []),
+            "archived_sessions": list(
+                existing.get("archived_sessions") or []
+            ),
+            "statistics": existing.get("statistics") or {},
+        }
+    )
+    return payload
+
+
+def _baseline_aware_knowledge_rows(
+    existing: dict[str, Any], sections: dict[str, Any]
+) -> list[Any] | None:
+    """合并预检的知识段；None = 跳过知识轴（仅保留用户数据轴）。
+
+    - 现有知识库不可读 / 本次规划失败：跳过知识轴（不阻断用户数据）；
+    - 「现有存量 + 现有知识库」本已超过导出上限：跳过知识轴——任何恢复
+      都无法让它更糟，不能据此拒绝用户数据（隔离账号的 user-import 是
+      唯一产品内恢复路径）；用户数据轴仍由最终 payload 复核；
+    - 否则计入「现有库 + 本次新增分片」，恢复把合规库推过上限时照常拒绝。
+    """
+    try:
+        existing_kb = _existing_knowledge_rows()
+    except MemoryPersistenceError as exc:
+        logger.warning("合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc)
+        return None
+    planned = _planned_knowledge_rows(sections)
+    if planned is None:
+        return None
+    if not existing_kb and not planned:
+        return []
+    baseline_problem = backup_limit_problem(
+        _export_shape_baseline(existing, existing_kb)
+    )
+    if baseline_problem is not None:
+        logger.warning(
+            "合并预检：导入前数据与知识库已超过导出上限，跳过知识体积轴"
+        )
+        return None
+    return existing_kb + planned
 
 
 def _existing_last_trip_number(existing: dict[str, Any]) -> int | None:
