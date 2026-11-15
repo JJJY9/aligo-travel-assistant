@@ -407,7 +407,13 @@ if __name__ == "__main__":
     test_render_strips_controls_and_surrogates()
     test_html_table_wraps_long_unbroken_fields()
     test_count_ics_events_unfolds_before_counting()
-    # 需 pytest caplog 夹具，直跑清单不覆盖：
-    # test_ics_unparsable_end_warns()
+    # 日志断言用例：直跑用 caplog 替身真正执行
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_ics_unparsable_end_warns(_shim)
+    finally:
+        _shim.close()
     test_export_strips_unicode_line_separators_and_counts_events()
     print("\n全部通过")

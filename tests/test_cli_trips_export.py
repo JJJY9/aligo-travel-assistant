@@ -574,6 +574,17 @@ def test_export_csv_over_import_row_limit(monkeypatch):
     print("✓ 行程超过导入上限时 CSV 导出仍成功")
 
 if __name__ == "__main__":
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
+    # 断言通过也会以 traceback 退出；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     for case in (
         test_export_to_file,
         test_export_stdout,
@@ -596,6 +607,9 @@ if __name__ == "__main__":
         test_export_ics_stdout_reports_skipped,
         test_export_stdout_strips_terminal_controls,
         test_export_csv_over_import_row_limit,
+        test_export_write_failure_reports,
+        test_export_ics_stdout_writes_utf8_bytes,
+        test_export_ics_count_ignores_field_text,
     ):
         mp = pytest.MonkeyPatch()
         try:

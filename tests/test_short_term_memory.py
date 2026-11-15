@@ -2252,6 +2252,13 @@ def test_direct_run_caplog_shim_captures_logs():
             record.getMessage() == "shim-marker-内容"
             for record in shim.records
         )
+        # 与 pytest 夹具一致：进入 at_level 不清空块外记录；logger= 兼容
+        shim.clear()
+        logging.getLogger("aligo.outside").warning("块外日志")
+        with shim.at_level(logging.ERROR, logger="aligo.target"):
+            logging.getLogger("aligo.target").warning("应被 ERROR 级别过滤")
+        assert "块外日志" in shim.text
+        assert "应被 ERROR 级别过滤" not in shim.text
     finally:
         shim.close()
     print("✓ 直跑 caplog 替身捕获日志")

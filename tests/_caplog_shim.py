@@ -9,20 +9,25 @@ import logging
 
 
 class _AtLevel:
-    def __init__(self, shim: "CaplogShim", level: int):
+    def __init__(self, shim: "CaplogShim", level: int, logger: str | None):
         self._shim = shim
         self._level = level
+        self._logger = logger
         self._old = logging.NOTSET
 
+    def _target(self):
+        return logging.getLogger(self._logger)
+
     def __enter__(self):
-        root = logging.getLogger()
-        self._old = root.level
-        root.setLevel(self._level)
-        self._shim.records.clear()
+        target = self._target()
+        self._old = target.level
+        target.setLevel(self._level)
+        # 与 pytest 夹具一致：进入 at_level 不清空已捕获记录（块外日志
+        # 同样参与断言；清空只由显式 clear() 触发）
         return self._shim
 
     def __exit__(self, *exc_info):
-        logging.getLogger().setLevel(self._old)
+        self._target().setLevel(self._old)
         return False
 
 
@@ -45,8 +50,8 @@ class CaplogShim:
     def text(self) -> str:
         return "\n".join(record.getMessage() for record in self.records)
 
-    def at_level(self, level):
-        return _AtLevel(self, level)
+    def at_level(self, level, logger: str | None = None):
+        return _AtLevel(self, level, logger)
 
     def clear(self):
         self.records.clear()

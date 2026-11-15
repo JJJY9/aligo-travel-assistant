@@ -3154,11 +3154,17 @@ if __name__ == "__main__":
     test_agent_load_runs_in_dedicated_executor()
     test_rag_load_uses_isolated_executor()
     test_rag_load_executor_accepts_standard_name()
-    # 需 pytest caplog 夹具，直跑清单不覆盖：
-    # test_update_memory_isolates_preference_failures()
+    # 日志断言用例：直跑用 caplog 替身真正执行（pytest 夹具只在 pytest
+    # 内注入，注释掉会让告警回归在直跑清单上无覆盖）
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_update_memory_isolates_preference_failures(_shim)
+        test_update_memory_isolates_trip_save_failure(_shim)
+    finally:
+        _shim.close()
     test_update_memory_skips_failed_event_collection()
-    # 需 pytest caplog 夹具，直跑清单不覆盖：
-    # test_update_memory_isolates_trip_save_failure()
     test_update_memory_derives_end_date_from_duration()
     test_trip_save_does_not_overwrite_purpose_with_default()
     test_preference_single_object_is_wrapped()

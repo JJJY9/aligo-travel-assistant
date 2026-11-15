@@ -157,6 +157,14 @@ def _locked_mutation(func):
     return wrapper
 
 
+def _case_conflict_message(owner: str) -> str:
+    return (
+        f"用户 ID 与已有记忆文件仅大小写不同（已有 {owner}）。当前文件系统"
+        "大小写不敏感，两个 ID 会读写同一份数据；请使用与已有账号完全一致"
+        "的大小写"
+    )
+
+
 class LongTermMemory:
     """
     长期记忆：持久化用户信息
@@ -299,13 +307,17 @@ class LongTermMemory:
                             "加载损坏记忆文件时等待文件锁超时: %s", lock_error
                         )
                         return self._init_data()
-            elif Path(f"{self.db_path}.deleted").exists():
-                logger.info("账号数据已删除，从空快照启动")
-                return self._init_data()
             else:
                 quarantined, marker_backup = self._read_quarantine_marker()
                 backups = self._corrupt_siblings()
                 if quarantined:
+                    conflict_owner = self._marker_owner_conflict(marker_backup)
+                    if conflict_owner is not None:
+                        # 标记属于仅大小写不同的另一账号（同一路径）：
+                        # 恢复入口也不能接管，标记与备份原样保留
+                        raise MemoryPersistenceError(
+                            _case_conflict_message(conflict_owner)
+                        )
                     # 隔离标记（当初隔离的实例落盘）：与当场隔离同等对待，
                     # PostgreSQL 配置不能成为空快照重建主文件的豁免
                     self._fresh_quarantine = True
@@ -319,6 +331,10 @@ class LongTermMemory:
                     logger.warning(
                         "检测到隔离标记（备份：%s）", self._corrupt_backup
                     )
+                elif Path(f"{self.db_path}.deleted").exists():
+                    # 墓碑只在「没有更新于墓碑的隔离证据」时才代表
+                    # 已删除（孤儿备份 / 失效标记已在上一步清除）
+                    logger.info("账号数据已删除，从空快照启动")
                 elif backups:
                     # 主文件已被其它进程 / 实例隔离：把标记带在新实例上，
                     # 上层守卫（CLI / Web / 导出）据此识别「数据被隔离」，
@@ -366,6 +382,9 @@ class LongTermMemory:
                         {
                             "backup": backup,
                             "at": datetime.now().isoformat(),
+                            # 账号归属：大小写不敏感文件系统上，恢复入口
+                            # 不能接管仅大小写不同的另一账号的隔离
+                            "user_id": self.user_id,
                         },
                         handle,
                     )
@@ -430,11 +449,64 @@ class LongTermMemory:
         backup = payload.get("backup") if isinstance(payload, dict) else None
         if isinstance(backup, str) and backup:
             if os.path.exists(backup):
+                if self._quarantine_is_deleted_orphan(backup):
+                    # 墓碑之后没有新损坏：删除遗留的孤儿备份
+                    self._clear_quarantine_marker()
+                    return False, None
                 return True, backup
             # 备份已不存在：恢复完成 / 手动清理后的失效标记
             self._clear_quarantine_marker()
             return False, None
         return True, None
+
+    def _quarantine_is_deleted_orphan(self, backup: str) -> bool:
+        """墓碑 + 隔离备份：删除之后没有新损坏时备份是孤儿。
+
+        与 Web ``_quarantined_memory_backup`` / CLI ``_recovered_corrupt_backup``
+        同一口径：备份 mtime 晚于墓碑说明删除后又发生过损坏，仍按隔离处理；
+        mtime 无法判定时 fail-closed 按隔离处理。
+        """
+        tombstone = Path(f"{self.db_path}.deleted")
+        try:
+            if not tombstone.exists():
+                return False
+        except OSError:  # noqa: BLE001 - 判定失败按隔离处理
+            return False
+        try:
+            tomb_mtime = tombstone.stat().st_mtime
+            backup_mtime = os.path.getmtime(backup)
+        except OSError:
+            return False
+        return backup_mtime <= tomb_mtime
+
+    def _marker_owner_conflict(self, backup: str | None) -> str | None:
+        """隔离标记的账号归属与实例 user_id 仅大小写不同时返回其 owner。
+
+        新格式标记带 ``user_id``；旧格式从备份文件名推断
+        （``<owner>.json.corrupt-*``，大小写敏感比较）。
+        """
+        marker = self._quarantine_marker_path()
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - 标记不可读：走 fail-closed 分支
+            payload = None
+        owner = payload.get("user_id") if isinstance(payload, dict) else None
+        if not (isinstance(owner, str) and owner):
+            if not backup:
+                return None
+            name = Path(backup).name
+            expected = f"{self.user_id}.json.corrupt-"
+            if name.startswith(expected):
+                return None
+            index = name.casefold().find(".json.corrupt-")
+            if index <= 0:
+                return None
+            owner = name[:index]
+        if owner == self.user_id:
+            return None
+        if owner.casefold() == self.user_id.casefold():
+            return owner
+        return None
 
     def _check_owner_case(self, data: dict[str, Any]) -> None:
         """大小写不敏感文件系统上防止跨账号读写同一记忆文件。
@@ -449,11 +521,20 @@ class LongTermMemory:
             return
         if owner.casefold() != self.user_id.casefold():
             return
-        raise MemoryPersistenceError(
-            f"用户 ID 与已有记忆文件仅大小写不同（已有 {owner}）。当前文件系统"
-            "大小写不敏感，两个 ID 会读写同一份数据；请使用与已有账号完全一致"
-            "的大小写"
-        )
+        raise MemoryPersistenceError(_case_conflict_message(owner))
+
+    def _check_owner_case_on_disk(self) -> None:
+        """运维动作（delete_all）前的归属复核：主文件可解析时校验
+        user_id；解析失败（损坏）按现有路径继续删除。"""
+        try:
+            with open(self.db_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception:  # noqa: BLE001 - 损坏文件仍可删除
+            return
+        if isinstance(data, dict):
+            self._check_owner_case(data)
 
     def _ensure_corrupt_backed_up(self) -> None:
         """写操作前的损坏文件复核（调用方必须已持有跨进程文件锁）。
@@ -518,10 +599,6 @@ class LongTermMemory:
                 raw = f.read()
             data = json.loads(raw)
         except FileNotFoundError:
-            if Path(f"{self.db_path}.deleted").exists():
-                # 账号数据已被删除：从空快照开始，不能把失效快照写回
-                self.data = self._init_data()
-                return
             backups = self._corrupt_siblings()
             quarantined, marker_backup = self._read_quarantine_marker()
             if quarantined:
@@ -531,19 +608,32 @@ class LongTermMemory:
                 if marker_backup and not self._corrupt_backup:
                     self._corrupt_backup = marker_backup
             if (
-                backups
+                Path(f"{self.db_path}.deleted").exists()
+                and not quarantined
+            ):
+                # 账号数据已被删除（无更新于墓碑的隔离证据）：从空快照
+                # 开始，不能把失效快照写回
+                self.data = self._init_data()
+                return
+            if (
+                (backups or quarantined)
                 and not self._allow_quarantined
                 and not self._may_recreate
                 and (self._fresh_quarantine or not _postgres_configured())
             ):
-                # 主文件缺失 + 存在隔离备份：损坏文件已被隔离。沿用内存
-                # 快照写回会重建主文件、让隔离备份从此不可见（恢复提示
-                # 与隔离守卫全部失效）；只有显式以「恢复」打开的实例
-                # （user-import / /api/import）与写前复核刚补完备份的同一
-                # 次写入（_may_recreate）允许重建。
+                # 主文件缺失 + 存在隔离备份 / 标记：损坏文件已被隔离。
+                # 沿用内存快照写回会重建主文件、让隔离备份从此不可见
+                # （恢复提示与隔离守卫全部失效）；只有显式以「恢复」打开
+                # 的实例（user-import / /api/import）与写前复核刚补完备份
+                # 的同一次写入（_may_recreate）允许重建。
+                evidence = (
+                    str(backups[-1])
+                    if backups
+                    else str(self._quarantine_marker_path())
+                )
                 raise MemoryPersistenceError(
                     "记忆主文件缺失且存在损坏隔离备份，已拒绝重建写入"
-                    f"（备份：{backups[-1]}）"
+                    f"（备份：{evidence}）"
                 )
             return
         except OSError as exc:
@@ -2029,6 +2119,9 @@ class LongTermMemory:
         with self._write_lock:
             try:
                 with file_lock(self.db_path):
+                    # 归属复核：陈旧实例（大小写变体）不能删掉另一账号的
+                    # 记忆文件与隔离备份；损坏文件仍允许删除
+                    self._check_owner_case_on_disk()
                     # 删除墓碑先行：进程在「删主文件」与「写墓碑」之间被杀 /
                     # 掉电时，其它存活实例仍能从墓碑得知账号已删除；墓碑
                     # 创建失败时主文件尚未删除，按删除失败上报（安全）

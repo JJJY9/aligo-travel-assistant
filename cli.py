@@ -3846,6 +3846,14 @@ def _interactive_quarantine_marker(store: Any) -> str | None:
         )
         if callable(pending_getter) and pending_getter():
             return _QUARANTINE_PENDING_DISPLAY
+        marker_getter = getattr(
+            store, "get_active_quarantine_backup", None
+        )
+        if callable(marker_getter):
+            active = marker_getter()
+            if active:
+                # 落盘隔离标记：与 Web 探测同口径（含标记损坏无备份）
+                return str(active)
     except Exception:  # noqa: BLE001 - 探测失败不阻断启动
         pass
     if STORAGE_CONFIG.get("postgres_dsn"):
@@ -3919,6 +3927,17 @@ def _open_cli_store(user_id: str, allow_quarantined: bool = False):
                     ),
                 )
             raise _QuarantinedMemoryError(str(fresh))
+        marker_getter = getattr(
+            store, "get_active_quarantine_backup", None
+        )
+        active = marker_getter() if callable(marker_getter) else None
+        if active:
+            # 落盘隔离标记（含标记损坏且无备份的 fail-closed 状态）：与
+            # Web 的 _quarantine_marker_for 同口径拒绝写命令
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+            raise _QuarantinedMemoryError(str(active))
         quarantined = _recovered_corrupt_backup(store)
         if quarantined:
             close = getattr(store, "close", None)

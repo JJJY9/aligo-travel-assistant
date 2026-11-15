@@ -696,10 +696,14 @@ def _export_shape_messages(
         if pg_shape
         else datetime.now().isoformat(timespec="microseconds")
     )
+    # 复用写入层同一时间戳模型：同会话有邻居的缺时间戳消息会拿邻居的
+    # UTC 键（32 字符），与落库 / 导出逐字节一致；无锚点行走后端形状占位
+    dict_rows = [message for message in messages if isinstance(message, dict)]
+    prepared = iter(prepare_import_messages(dict_rows, now=fallback))
     rows: list[Any] = []
     for message in messages:
-        if isinstance(message, dict) and not message.get("timestamp"):
-            rows.append({**message, "timestamp": fallback})
+        if isinstance(message, dict):
+            rows.append(next(prepared))
         else:
             rows.append(message)
     return rows

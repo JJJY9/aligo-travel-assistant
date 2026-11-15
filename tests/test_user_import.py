@@ -2713,6 +2713,44 @@ def test_import_limit_read_failure_is_memory_error():
     print("✓ 上限预检的读取失败按持久化失败上报")
 
 
+def test_sections_limit_uses_neighbor_timestamp_anchor(monkeypatch):
+    """缺时间戳消息的导出形状预检复用写入层模型：同会话有锚点时
+    取邻居的 UTC 键（32 字符），不能按无锚点占位低估。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    module.sections_limit_problem(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "a",
+                    "session_id": "s1",
+                    "timestamp": "2026-05-01T10:00:00.123456+08:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "b",
+                    "session_id": "s1",
+                    "timestamp": None,
+                },
+            ]
+        }
+    )
+    rows = captured["payload"]["chat_history"]
+    assert rows[0]["timestamp"] == "2026-05-01T10:00:00.123456+08:00"
+    anchored = rows[1]["timestamp"]
+    assert isinstance(anchored, str) and anchored.endswith("+00:00"), rows[1]
+    assert len(anchored) == 32, anchored
+    print("✓ 导出形状预检复用邻居时间戳锚点")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""

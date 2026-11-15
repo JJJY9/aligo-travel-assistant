@@ -288,6 +288,12 @@ if __name__ == "__main__":
     test_conflicts_capped_with_exact_count()
     test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
-    # 需 pytest caplog 夹具，直跑清单不覆盖：
-    # test_inverted_date_range_is_logged()
+    # 日志断言用例：直跑用 caplog 替身真正执行
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_inverted_date_range_is_logged(_shim)
+    finally:
+        _shim.close()
     print("\n全部通过")

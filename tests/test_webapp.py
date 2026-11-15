@@ -4027,13 +4027,18 @@ def test_import_skips_recently_deleted_sessions(monkeypatch):
         ],
         "session_titles": {"s-del": "旧标题", "s-ok": "新标题"},
     }
-    response = client.post(
-        "/api/import", params={"user_id": user_id}, json={"backup": backup}
-    )
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    assert payload["messages_added"] == 1
-    assert any("最近被删除" in item for item in payload["skipped"])
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["messages_added"] == 1
+        assert any("最近被删除" in item for item in payload["skipped"])
+    finally:
+        # 直跑自动发现现在会执行本用例：经真实 /api/import 写入 MEMORY_DIR，
+        # 必须清理，否则每次运行遗留一对测试用户文件与锁文件
+        _cleanup(user_id)
     print("✓ /api/import 跳过墓碑期内的已删除会话")
 
 
