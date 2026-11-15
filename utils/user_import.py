@@ -787,11 +787,14 @@ def sections_limit_problem(
     # 仲裁（同身份重复折叠、补 trip_id/timestamp、PG 空键），会话元数据
     # 与重算统计一并计入——手搭的窄字段 payload 会低估同内容的真实导出，
     # 让 CLI / Web 把实际可恢复的备份判成超限
+    # 起号从 0 开始：独立预检没有 store、拿不到 PG 计数器，而后续的
+    # 权威合并复核会用真实水位（读不到时按最坏占位 fail-closed）——
+    # 预检按最坏占位会比权威复核更严，把实际可恢复的备份误拒
     trip_rows = _merged_trip_rows(
         [],
         sections.get("trips") or [],
         include_empty_keys=pg_shape,
-        existing_last_number=10**18 - 1 if pg_shape else 0,
+        existing_last_number=0,
     )
     messages = _export_shape_messages(
         sections.get("messages") or [], pg_shape=pg_shape
@@ -811,6 +814,7 @@ def sections_limit_problem(
     statistics: dict[str, Any] = {
         "total_trips": len(trip_rows),
         "total_messages": len(messages),
+        "total_queries": 0,
     }
     frequent: dict[str, int] = {}
     for trip in trip_rows:
@@ -835,9 +839,13 @@ def sections_limit_problem(
         )
         if match
     ]
-    if trip_rows:
+    if not pg_shape:
+        # JSON 后端的统计恒含该键（空账号也序列化）；PG 的 get_statistics
+        # 没有此字段，保持后端真实形状
         statistics["last_trip_number"] = (
             max(numbers, default=0) + len(trip_rows)
+            if trip_rows
+            else 0
         )
     payload["statistics"] = statistics
     return backup_limit_problem(payload)

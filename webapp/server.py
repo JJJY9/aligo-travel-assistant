@@ -2295,14 +2295,21 @@ def _quarantine_marker_for(user_id: str, long_term: Any) -> str | None:
             marker = getter()
             if marker:
                 return str(marker)
-        if getattr(long_term, "db_path", None):
-            return _quarantined_memory_backup(user_id)
+        db_path = getattr(long_term, "db_path", None)
+        if db_path:
+            # 以实例真实存储目录为准：自定义 / 测试路径不与全局
+            # MEMORY_DIR 一致时，残留备份的扫描不能扫错目录
+            return _quarantined_memory_backup(
+                user_id, Path(db_path).parent
+            )
     except Exception:  # noqa: BLE001 - 探测失败不阻断会话
         return None
     return None
 
 
-def _quarantined_memory_backup(user_id: str) -> str | None:
+def _quarantined_memory_backup(
+    user_id: str, base_dir: Path | None = None
+) -> str | None:
     """JSON 记忆主文件不存在但存在 .corrupt-* 隔离备份时返回备份路径。
 
     存储层只在触发隔离的那个实例上保留标记；后续请求打开时主文件已被
@@ -2310,10 +2317,11 @@ def _quarantined_memory_backup(user_id: str) -> str | None:
     数据」，/api/export 返回 200 空备份、会话导出返回 404。
     主文件存在（用户已用备份恢复）时不拦截。
     """
-    base = MEMORY_DIR / f"{user_id}.json"
+    directory = base_dir if base_dir is not None else MEMORY_DIR
+    base = directory / f"{user_id}.json"
     if base.exists():
         return None
-    backups = sorted(MEMORY_DIR.glob(f"{user_id}.json.corrupt-*"))
+    backups = sorted(directory.glob(f"{user_id}.json.corrupt-*"))
     deleted_marker = Path(f"{base}.deleted")
     if deleted_marker.exists():
         # 账号数据已删除：遗留的隔离备份是孤儿，不应再让所有请求 503；
@@ -5887,6 +5895,8 @@ def create_app(model: Any = None) -> FastAPI:
             async with _bounded_user_lock(
                 request, state.lock_for(user_id), _request_id(request), timeout=10.0
             ):
+                sessions_dropped_in_queue: set[str] = set()
+
                 def _run_import() -> dict[str, Any]:
                     if not dry_run:
                         # 排队期间（单 worker 可能等数分钟）会话可能被其它
@@ -5913,6 +5923,7 @@ def create_app(model: Any = None) -> FastAPI:
                                     "已跳过其消息"
                                 )
                             drop_sessions(sections, late_deleted)
+                            sessions_dropped_in_queue.update(late_deleted)
                     store = _open_long_term(
                         user_id, strict=True, allow_quarantined=True
                     )
@@ -5963,7 +5974,10 @@ def create_app(model: Any = None) -> FastAPI:
                         late_deleted = {
                             session_id
                             for session_id in active_sessions
-                            if state.is_recently_deleted(user_id, session_id)
+                            if session_id not in sessions_dropped_in_queue
+                            and state.is_recently_deleted(
+                                user_id, session_id
+                            )
                         }
                         removed_total = 0
                         rolled_back_sessions: set[str] = set()
