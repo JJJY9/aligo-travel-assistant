@@ -301,6 +301,17 @@ def test_user_export_scans_existing_quarantine_backups(monkeypatch, tmp_path):
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
+    # 断言通过也会以 traceback 退出；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_writes_json_and_markdown(mp)
@@ -320,6 +331,13 @@ if __name__ == "__main__":
         test_user_export_scans_existing_quarantine_backups(
             mp, Path(tempfile.mkdtemp())
         )
+        mp = pytest.MonkeyPatch()
+        try:
+            # 硬编码清单漏登记的用例（此前直跑永远不执行）
+            test_user_export_refuses_oversized_backup(mp)
+            test_user_export_write_failure_reports(mp)
+        finally:
+            mp.undo()
     finally:
         mp.undo()
     print("\n全部通过")

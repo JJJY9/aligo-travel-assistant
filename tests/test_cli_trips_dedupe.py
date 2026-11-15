@@ -549,6 +549,17 @@ def test_delete_duplicate_trip_json_backend_keeps_earliest(tmp_path):
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
+    # 断言通过也会以 traceback 退出；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     for case in (
         test_dedupes_and_keeps_first,
         test_unpadded_dates_group_with_padded,
@@ -577,4 +588,11 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+    # 硬编码清单漏登记：需要 tmp_path 的用例单独调用（否则直跑永远不执行）
+    from pathlib import Path as _Path
+    import tempfile as _tempfile
+
+    test_delete_duplicate_trip_json_backend_keeps_earliest(
+        _Path(_tempfile.mkdtemp())
+    )
     print("\n全部通过")

@@ -1019,6 +1019,107 @@ def test_recheck_load_checks_owner_case(monkeypatch):
     print("✓ 复核分支同样拦截大小写冲突")
 
 
+def test_tombstone_does_not_mask_quarantine(monkeypatch):
+    """墓碑 + 新隔离（备份晚于墓碑）共存时写入必须被拒：墓碑分支不能
+    先于隔离守卫返回空快照、把隔离备份掩埋成孤儿。"""
+    from config import STORAGE_CONFIG
+    from context import long_term_memory as module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-tombq.json"
+    stale = LongTermMemory("u-tombq", storage_dir)
+    stale.save_preference("home_location", "北京")
+
+    real_remove = module.os.remove
+
+    def failing_remove(target):
+        if str(target) == str(path):
+            raise PermissionError("[WinError 32] 文件被占用")
+        return real_remove(target)
+
+    monkeypatch.setattr(module.os, "remove", failing_remove)
+    with pytest.raises(MemoryPersistenceError):
+        stale.delete_all()
+    monkeypatch.setattr(module.os, "remove", real_remove)
+    assert path.exists(), "删除失败必须保留主文件"
+    assert Path(f"{path}.deleted").exists()
+
+    # 主文件随后损坏并被另一实例隔离（备份晚于墓碑）
+    path.write_text("{bad json", encoding="utf-8")
+    detecting = LongTermMemory("u-tombq", storage_dir)
+    assert detecting.get_fresh_quarantine_backup()
+    marker = Path(f"{path}.quarantine")
+    assert marker.exists()
+
+    with pytest.raises(MemoryPersistenceError):
+        stale.save_preference("hotel_brands", ["汉庭"])
+    assert not path.exists(), "墓碑不能成为空快照重建的放行条"
+    assert marker.exists() and Path(f"{path}.deleted").exists()
+    print("✓ 墓碑不遮蔽晚于它的新隔离")
+
+
+def test_quarantine_marker_owner_case_conflict(monkeypatch):
+    """隔离标记属于仅大小写不同的另一账号时，恢复入口同样拒绝接管，
+    标记与备份原样保留。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    backup = Path(storage_dir) / "alice.json.corrupt-20260101000000000000-1"
+    backup.write_text('{"preferences": []}', encoding="utf-8")
+    marker = Path(storage_dir) / "alice.json.quarantine"
+    marker.write_text(
+        json.dumps({"backup": str(backup), "user_id": "Alice"}),
+        encoding="utf-8",
+    )
+
+    for allow in (False, True):
+        with pytest.raises(MemoryPersistenceError) as info:
+            LongTermMemory("alice", storage_dir, allow_quarantined=allow)
+        assert "大小写" in str(info.value), str(info.value)
+    assert marker.exists(), "归属冲突时标记必须保留"
+    assert backup.exists()
+
+    # 旧格式（无 user_id）标记从备份文件名推断归属（备份名大小写不同）
+    legacy = Path(storage_dir) / "Alice.json.corrupt-20260101000000000000-2"
+    legacy.write_text("{}", encoding="utf-8")
+    marker.write_text(
+        json.dumps({"backup": str(legacy)}), encoding="utf-8"
+    )
+    with pytest.raises(MemoryPersistenceError) as info:
+        LongTermMemory("alice", storage_dir)
+    assert "大小写" in str(info.value), str(info.value)
+    print("✓ 隔离标记归属冲突拒绝接管")
+
+
+def test_delete_all_refuses_case_conflict_owner(monkeypatch):
+    """陈旧实例（大小写变体）的 delete_all 不能删掉另一账号的记忆文件。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "alice.json"
+    stale = LongTermMemory("alice", storage_dir)
+    payload = {
+        "user_id": "Alice",
+        "preferences": [{"type": "home_location", "value": "SECRET"}],
+        "chat_history": [],
+        "trip_history": [],
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(MemoryPersistenceError) as info:
+        stale.delete_all()
+    assert "大小写" in str(info.value), str(info.value)
+    assert path.exists(), "删除必须被拒绝且文件原样保留"
+    assert not Path(f"{path}.deleted").exists()
+    print("✓ delete_all 拒绝大小写冲突的删除")
+
+
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
     """备份删除失败（删除未完成）也必须写墓碑：主文件已删，旧实例写入
     不能复活数据。"""

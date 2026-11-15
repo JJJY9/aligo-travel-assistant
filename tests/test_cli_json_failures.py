@@ -254,6 +254,42 @@ def test_recovered_corrupt_backup_ignores_deleted_accounts(tmp_path):
     assert cli._recovered_corrupt_backup(_Store()) is None
 
 
+def test_open_cli_store_blocks_marker_only_quarantine(monkeypatch):
+    """截断的隔离标记且无 .corrupt-* 备份：CLI 写命令同样拒绝（与 Web
+    的 503 同口径），恢复入口照常放行。"""
+    import tempfile
+    from pathlib import Path as pathlib_path
+
+    from config import STORAGE_CONFIG
+    from context.long_term_memory import LongTermMemory
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    marker = pathlib_path(storage_dir) / "u-climarker.json.quarantine"
+    marker.write_text("{trunc", encoding="utf-8")
+
+    monkeypatch.setattr(
+        storage,
+        "create_long_term_memory",
+        lambda user_id, path, **kwargs: LongTermMemory(
+            user_id, storage_dir, **kwargs
+        ),
+    )
+    with pytest.raises(cli._QuarantinedMemoryError) as info:
+        cli._open_cli_store("u-climarker")
+    assert "quarantine" in str(info.value), str(info.value)
+    assert marker.exists()
+    # 恢复入口（allow_quarantined）不拦截
+    store = cli._open_cli_store("u-climarker", allow_quarantined=True)
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
+    # 交互模式探测同口径
+    store = LongTermMemory("u-climarker", storage_dir)
+    assert cli._interactive_quarantine_marker(store)
+    print("✓ CLI 拦截仅标记的 fail-closed 隔离")
+
+
 def test_open_cli_store_blocks_pending_quarantine(monkeypatch):
     """pending（隔离改名未完成）状态下普通命令拒绝、恢复入口放行。"""
     from config import STORAGE_CONFIG
