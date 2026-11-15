@@ -216,7 +216,18 @@ def _clear_json_quarantine_marker(user_id: str, storage_path: str) -> None:
         storage = Path(storage_path)
         if not storage.is_absolute():
             storage = Path(__file__).resolve().parent.parent / storage
-        (storage / f"{user_id}.json.quarantine").unlink(missing_ok=True)
+        marker = storage / f"{user_id}.json.quarantine"
+        # Windows 并发读取共享冲突：短暂重试（与存储层清标记同口径）
+        deadline = time.monotonic() + 1.5
+        while True:
+            try:
+                marker.unlink(missing_ok=True)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    logger.warning("清理 JSON 隔离标记失败: %s", exc)
+                    return
+                time.sleep(0.03)
     except OSError:
         pass
 

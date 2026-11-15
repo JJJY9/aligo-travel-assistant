@@ -284,6 +284,11 @@ class LongTermMemory:
                                         "备份损坏的记忆文件失败: %s", backup_error
                                     )
                                 return self._init_data()
+                            # 复核成功同样要校验大小写冲突：瞬时读失败
+                            # 改道进入本分支后不能绕过 owner 检查、读到
+                            # 另一账号的数据。放在内层 except 之外，避免
+                            # MemoryPersistenceError 被当成损坏隔离
+                            self._check_owner_case(latest)
                             logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
                             return latest
                     except TimeoutError as lock_error:
@@ -374,10 +379,23 @@ class LongTermMemory:
             logger.error("写入隔离标记失败: %s", exc)
 
     def _clear_quarantine_marker(self) -> None:
-        try:
-            self._quarantine_marker_path().unlink(missing_ok=True)
-        except OSError:
-            pass
+        """删除隔离标记。
+
+        Windows 上并发读取（Web 探测）会让 unlink 报共享冲突：与 _save
+        的 os.replace 同口径短暂重试；仍失败要留日志——静默吞掉会让
+        恢复成功的账号被残留标记永久 503。
+        """
+        marker = self._quarantine_marker_path()
+        deadline = time.monotonic() + 1.5
+        while True:
+            try:
+                marker.unlink(missing_ok=True)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    logger.warning("删除隔离标记失败: %s", exc)
+                    return
+                time.sleep(0.03)
 
     def _read_quarantine_marker(self) -> tuple[bool, str | None]:
         """读隔离标记，返回 ``(是否隔离中, 可用备份路径)``。
@@ -388,11 +406,22 @@ class LongTermMemory:
         绝不能把标记文件本身当作隔离备份上报（用户会照提示导入标记）。
         """
         marker = self._quarantine_marker_path()
+        read_failed = False
         try:
             raw = marker.read_text(encoding="utf-8")
         except FileNotFoundError:
             return False, None
-        except OSError:
+        except OSError as exc:
+            logger.debug("读取隔离标记失败: %s", exc)
+            read_failed = True
+            raw = ""
+        if os.path.exists(self.db_path):
+            # 主文件存在 = 已恢复（恢复写回 / 手工拷回备份）：标记只会在
+            # 主文件被移走时写入，此时必然失效。不清除会让账号在产品内
+            # 永久 503（导入重试也不清除）
+            self._clear_quarantine_marker()
+            return False, None
+        if read_failed:
             return True, None
         try:
             payload = json.loads(raw)
@@ -847,10 +876,11 @@ class LongTermMemory:
                 Path(f"{self.db_path}.deleted").unlink(missing_ok=True)
             except OSError:
                 pass
-            if self._fresh_quarantine or self._corrupt_backup:
-                # 成功写入意味着主文件已重建（恢复入口 / 写前补备份放行）：
-                # 隔离标记随恢复完成失效，不再拦截后续实例
-                self._clear_quarantine_marker()
+            # 成功写入意味着主文件已重建（恢复入口 / 写前补备份放行 /
+            # 残留标记的自愈）：标记无条件清除（无标记时是一次 no-op）。
+            # 条件式清除会漏掉「健康主文件 + 残留标记」的实例——它的
+            # fresh/corrupt 标志早就不在了
+            self._clear_quarantine_marker()
             return True
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")
@@ -881,6 +911,9 @@ class LongTermMemory:
                         self._reload_latest()
                         self._corrupt_pending = False
                         self._corrupt_backup = None
+                        # 主文件已恢复：连带清掉残留隔离标记（导入重试
+                        # 也能解除已被残留标记锁死的账号）
+                        self._clear_quarantine_marker()
                         return
                     if Path(f"{self.db_path}.deleted").exists():
                         # 账号数据已被删除：从空快照落盘（写盘后标记清除），

@@ -432,7 +432,9 @@ def merged_backup_limit_problem(
                 "archived_sessions": store.get_archived_sessions() or [],
             }
     except Exception:  # noqa: BLE001 - 读不到现存数据时退回只查备份自身
-        return sections_limit_problem(sections)
+        return sections_limit_problem(
+            sections, pg_shape=not getattr(store, "snapshot_based", False)
+        )
     merged_prefs = (
         dict(existing.get("preferences") or {})
         if isinstance(existing.get("preferences"), dict)
@@ -679,13 +681,21 @@ def _merge_trip_row(
     return merged
 
 
-def _export_shape_messages(messages: list[Any]) -> list[Any]:
+def _export_shape_messages(
+    messages: list[Any], *, pg_shape: bool = False
+) -> list[Any]:
     """备份自身体积预检也按落库后的导出行形状计。
 
-    缺 / 空时间戳的行落库后导出为带时区时间戳（PG 32 字符；JSON 为
-    26 字符），按 ``"timestamp": null``（4 字节）会低估导出体积。
+    缺 / 空时间戳的行落库后导出为时间戳（PG 32 字符带时区；JSON 26
+    字符 naive），按 ``"timestamp": null``（4 字节）会低估导出体积。
+    后端形状必须区分：对纯 JSON 部署按 PG 形状会把可恢复的备份每条
+    多算 6 字节（20 万条约 1.2MB）误拒。
     """
-    fallback = datetime.now().astimezone().isoformat(timespec="microseconds")
+    fallback = (
+        datetime.now().astimezone().isoformat(timespec="microseconds")
+        if pg_shape
+        else datetime.now().isoformat(timespec="microseconds")
+    )
     rows: list[Any] = []
     for message in messages:
         if isinstance(message, dict) and not message.get("timestamp"):
@@ -695,7 +705,9 @@ def _export_shape_messages(messages: list[Any]) -> list[Any]:
     return rows
 
 
-def sections_limit_problem(sections: dict[str, Any]) -> str | None:
+def sections_limit_problem(
+    sections: dict[str, Any], *, pg_shape: bool = False
+) -> str | None:
     """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
 
     CLI 导入此前只按原始文件字节做 50MB 预检：紧凑 JSON 备份可以通过并
@@ -707,7 +719,7 @@ def sections_limit_problem(sections: dict[str, Any]) -> str | None:
         return None
     payload = {
         "chat_history": _export_shape_messages(
-            sections.get("messages") or []
+            sections.get("messages") or [], pg_shape=pg_shape
         ),
         "trip_history": sections.get("trips") or [],
         "preferences": sections.get("preferences") or {},
@@ -1262,8 +1274,12 @@ def _planned_new_counts(
                 )
                 if key is not None
             }
-        except Exception:  # noqa: BLE001 - 读取失败按「全部新增」保守处理
-            pending_keys = None
+        except MemoryPersistenceError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 读取失败不能伪造「全部新增」
+            raise MemoryPersistenceError(
+                f"读取既有行程失败：{exc}"
+            ) from exc
         if pending_keys is not None:
             new_trips = 0
             for trip_row in sections.get("trips", []):
@@ -1289,9 +1305,12 @@ def _planned_new_counts(
                 )
                 for message in history
             )
-        except Exception:  # noqa: BLE001 - 读取失败按「全部新增」保守处理
-            existing = None
-            history = []
+        except MemoryPersistenceError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 读取失败不能伪造「全部新增」
+            raise MemoryPersistenceError(
+                f"读取既有消息失败：{exc}"
+            ) from exc
         if existing is not None:
             # 与写入层 / 预览同一实现：重复消息与提问已存在轮次的回答不算新增
             new_messages = len(

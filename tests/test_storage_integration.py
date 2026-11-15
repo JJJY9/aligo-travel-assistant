@@ -1305,11 +1305,13 @@ if __name__ == "__main__":
 
     ran = 0
     skipped = 0
+    skipped_names: list[str] = []
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
         fixture = None
+        caplog_shim = None
         kwargs: dict = {}
         unsupported = False
         for param, spec in params.items():
@@ -1318,15 +1320,23 @@ if __name__ == "__main__":
                 kwargs[param] = fixture
             elif param == "tmp_path":
                 kwargs[param] = pathlib.Path(tempfile.mkdtemp())
-            elif param == "caplog" and spec.default is None:
-                kwargs[param] = None
+            elif param == "caplog":
+                # pytest 夹具只在 pytest 内注入：直跑用最小替身真正执行
+                # 日志断言，不能静默跳过（否则脱敏回归在直跑清单上假绿）
+                import _caplog_shim
+
+                caplog_shim = _caplog_shim.CaplogShim()
+                kwargs[param] = caplog_shim
             else:
                 unsupported = True
                 break
         if unsupported:
+            if caplog_shim is not None:
+                caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
             skipped += 1
+            skipped_names.append(name)
             continue
         storage_snapshot: dict | None = None
         try:
@@ -1346,6 +1356,8 @@ if __name__ == "__main__":
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if caplog_shim is not None:
+                caplog_shim.close()
             if storage_snapshot is not None:
                 from typing import cast
 
@@ -1361,6 +1373,8 @@ if __name__ == "__main__":
         for name, func in globals().items()
         if name.startswith("test_") and callable(func)
     )
+    if skipped_names:
+        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
         f"{skipped} 个需 pytest 专用夹具或按条件跳过）"

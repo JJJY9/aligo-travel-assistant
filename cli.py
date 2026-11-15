@@ -3081,7 +3081,13 @@ def run_user_import_standalone(
     # 与 Web /api/import 同口径复核「恢复后仍可导出」：紧凑备份按原始文件
     # 字节可能通过 50MB 预检，但按导出格式（indent=2）已超限——恢复成功后
     # user-export 会永久拒绝导出，账号再也产生不了可恢复备份
-    limit_problem = sections_limit_problem(sections)
+    from config import STORAGE_CONFIG
+
+    # 后端形状决定缺时间戳行的占位宽度：JSON 部署按 PG 形状（32 字符）
+    # 会把实际可恢复的备份每行多算 6 字节而误拒
+    limit_problem = sections_limit_problem(
+        sections, pg_shape=bool(STORAGE_CONFIG.get("postgres_dsn"))
+    )
     if limit_problem:
         return _fail(
             f"恢复中止：{limit_problem}"

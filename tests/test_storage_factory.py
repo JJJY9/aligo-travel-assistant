@@ -777,7 +777,9 @@ def test_direct_run_harnesses_handle_async_tests():
         ]
         if not async_tests:
             continue
-        main_source = text[text.index(marker):]
+        # rindex：本用例自身也定义了同名 marker 字面量，index 会命中
+        # 它，切片包含检查代码自身的 "asyncio.run("，断言对本文件恒真
+        main_source = text[text.rindex(marker):]
         if "asyncio.run(" not in main_source:
             problems.append(
                 f"{path.name}: {', '.join(sorted(async_tests)[:3])}"
@@ -919,6 +921,102 @@ def test_pg_success_clears_json_quarantine_marker(monkeypatch):
     assert not marker.exists(), "PG 接管后标记必须清除"
     assert backup.exists(), "隔离备份保留供人工恢复"
     print("✓ PG 接管清理 JSON 隔离标记")
+
+
+def test_stale_quarantine_marker_cleared_when_main_restored(monkeypatch):
+    """主文件已恢复（恢复写回 / 手工拷回备份）时残留的隔离标记必须
+    失效并清除：否则账号在所有 Web / CLI 入口被永久 503、导入重试也
+    无法解除。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-restored.json"
+    seed = LongTermMemory("u-restored", storage_dir)
+    seed.save_preference("home_location", "北京")
+    valid = path.read_text(encoding="utf-8")
+    path.write_text("{bad json", encoding="utf-8")
+    quarantined = LongTermMemory("u-restored", storage_dir)
+    assert quarantined.get_fresh_quarantine_backup()
+    marker = Path(storage_dir) / "u-restored.json.quarantine"
+    assert marker.exists()
+
+    # 用户把有效备份拷回主文件（标记残留）
+    path.write_text(valid, encoding="utf-8")
+    restored = LongTermMemory("u-restored", storage_dir)
+    assert restored.get_preference("home_location") == "北京"
+    assert restored.get_fresh_quarantine_backup() is None
+    assert restored.get_active_quarantine_backup() is None
+    assert not marker.exists(), "主文件已恢复时陈旧标记必须清除并放行"
+    print("✓ 主文件恢复后陈旧隔离标记清除")
+
+
+def test_save_clears_stale_marker_on_healthy_instance(monkeypatch):
+    """健康主文件 + 残留标记：普通写入也要自愈（条件式清除会漏掉
+    fresh/corrupt 标志早已不在的实例）。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-heal.json"
+    seed = LongTermMemory("u-heal", storage_dir)
+    seed.save_preference("home_location", "北京")
+    backup = Path(f"{path}.corrupt-20260101000000000000-1")
+    backup.write_text("{}", encoding="utf-8")
+    marker = Path(f"{path}.quarantine")
+    marker.write_text(
+        json.dumps({"backup": str(backup)}), encoding="utf-8"
+    )
+
+    store = LongTermMemory("u-heal", storage_dir)
+    assert marker.exists()
+    store.save_preference("hotel_brands", ["汉庭"])
+    assert not marker.exists(), "写入成功后残留标记必须清除"
+    print("✓ 普通写入自愈残留隔离标记")
+
+
+def test_recheck_load_checks_owner_case(monkeypatch):
+    """首读瞬时失败改道持锁复核后，复核成功同样要拦截大小写冲突：
+    否则一次瞬时读失败就能读到另一账号的数据。"""
+    import builtins
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "alice.json"
+    payload = {
+        "user_id": "Alice",
+        "preferences": [{"type": "home_location", "value": "SECRET"}],
+        "chat_history": [],
+        "trip_history": [],
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    real_open = builtins.open
+    state = {"fail_once": True}
+
+    def flaky_open(file, mode="r", *args, **kwargs):
+        if (
+            str(file) == str(path)
+            and "r" in mode
+            and state["fail_once"]
+        ):
+            state["fail_once"] = False
+            raise PermissionError("[Errno 13] Permission denied")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    with pytest.raises(MemoryPersistenceError) as info:
+        LongTermMemory("alice", storage_dir)
+    assert "大小写" in str(info.value), str(info.value)
+    assert not list(Path(storage_dir).glob("*corrupt*"))
+    assert not (Path(storage_dir) / "alice.json.quarantine").exists()
+    print("✓ 复核分支同样拦截大小写冲突")
 
 
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
@@ -4532,11 +4630,13 @@ if __name__ == "__main__":
 
     ran = 0
     skipped = 0
+    skipped_names: list[str] = []
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
         params = inspect.signature(func).parameters
         fixture = None
+        caplog_shim = None
         kwargs: dict = {}
         unsupported = False
         for param, spec in params.items():
@@ -4545,15 +4645,23 @@ if __name__ == "__main__":
                 kwargs[param] = fixture
             elif param == "tmp_path":
                 kwargs[param] = pathlib.Path(tempfile.mkdtemp())
-            elif param == "caplog" and spec.default is None:
-                kwargs[param] = None
+            elif param == "caplog":
+                # pytest 夹具只在 pytest 内注入：直跑用最小替身真正执行
+                # 日志断言，不能静默跳过（否则脱敏回归在直跑清单上假绿）
+                import _caplog_shim
+
+                caplog_shim = _caplog_shim.CaplogShim()
+                kwargs[param] = caplog_shim
             else:
                 unsupported = True
                 break
         if unsupported:
+            if caplog_shim is not None:
+                caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
             skipped += 1
+            skipped_names.append(name)
             continue
         storage_snapshot: dict | None = None
         try:
@@ -4573,6 +4681,8 @@ if __name__ == "__main__":
         except pytest.skip.Exception:
             skipped += 1
         finally:
+            if caplog_shim is not None:
+                caplog_shim.close()
             if storage_snapshot is not None:
                 from typing import cast
 
@@ -4588,6 +4698,8 @@ if __name__ == "__main__":
         for name, func in globals().items()
         if name.startswith("test_") and callable(func)
     )
+    if skipped_names:
+        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
         f"{skipped} 个需 pytest 专用夹具或按条件跳过）"

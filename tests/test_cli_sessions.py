@@ -1588,6 +1588,7 @@ if __name__ == "__main__":
 
     ran = 0
     skipped = 0
+    skipped_names: list[str] = []
     for name, func in sorted(globals().items()):
         if not name.startswith("test_") or not callable(func):
             continue
@@ -1608,6 +1609,7 @@ if __name__ == "__main__":
             if fixture is not None:
                 fixture.undo()
             skipped += 1
+            skipped_names.append(name)
             continue
         try:
             # async def 用例同样要真正执行：直接调用只创建 coroutine，
@@ -1627,6 +1629,8 @@ if __name__ == "__main__":
         for name, func in globals().items()
         if name.startswith("test_") and callable(func)
     )
+    if skipped_names:
+        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
     print(
         f"\n全部通过（{ran}/{total} 个用例；{skipped} 个按条件跳过）"
     )
