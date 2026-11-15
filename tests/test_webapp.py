@@ -4139,6 +4139,59 @@ def test_web_session_pending_and_no_backup_messages(monkeypatch, tmp_path):
     print("✓ 会话构造的 pending / 无备份文案")
 
 
+def test_import_checks_limit_after_dropping_sessions(monkeypatch):
+    """50MB 自检必须在剔除墓碑 / 保留字会话之后（与 CLI 同序）：
+    被剔除消息的大体积不能让同一备份在 Web 413。"""
+    from utils import user_import as module
+
+    def fake_limit(payload):
+        contents = [
+            message.get("content")
+            for message in payload.get("chat_history") or []
+            if isinstance(message, dict)
+        ]
+        if any(
+            isinstance(content, str) and len(content) > 1000
+            for content in contents
+        ):
+            return "约 60 MB 超过导入上限 50 MB"
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    client = _client()
+    user_id = _unique_user("web_test_import_tomb_limit")
+    state = client.app.state.aligo
+    monkeypatch.setattr(
+        state,
+        "is_recently_deleted",
+        lambda uid, sid: uid == user_id and sid == "s-dead",
+    )
+    backup = {
+        "backup": {
+            "chat_history": [
+                {
+                    "role": "user",
+                    "content": "x" * 4000,
+                    "session_id": "s-dead",
+                },
+                {"role": "user", "content": "keep", "session_id": "s-ok"},
+            ],
+            "session_titles": {"s-dead": "旧标题", "s-ok": "新标题"},
+        }
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json=backup
+        )
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        assert payload["messages_added"] == 1
+        assert any("最近被删除" in item for item in payload["skipped"])
+    finally:
+        _cleanup(user_id)
+    print("✓ 导入自检在剔除会话之后执行（与 CLI 同序）")
+
+
 def test_create_trip_write_failure_maps_503(monkeypatch):
     """POST /api/trips 写入失败映射 503（与更新 / 删除一致）。"""
     from utils.errors import MemoryPersistenceError

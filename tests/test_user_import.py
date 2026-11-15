@@ -2851,6 +2851,198 @@ def test_merged_trip_ids_mirror_storage_renumbering(monkeypatch):
     print("✓ 合并预演复刻编号仲裁（冲突改号/沿用抬水位）")
 
 
+def test_merged_preview_uses_pg_counter_watermark(monkeypatch):
+    """PG 账号的编号水位来自 aligo_trip_counters（快照 statistics 不带
+    last_trip_number）：读得到按真实值起号，读不到按 BIGINT 上限
+    （trip_ + 19 位 = 24 字符）占位；JSON 无统计从 trip_1 起号。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    snapshot = {
+        "chat_history": [],
+        "trip_history": [],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    incoming = {
+        "trips": [
+            {"origin": "上海", "destination": "成都", "start_date": "2026-05-01"}
+        ]
+    }
+
+    class _PgWithCounter:
+        snapshot_based = False
+
+        def export_snapshot(self):
+            return dict(snapshot)
+
+        def get_trip_number_watermark(self):
+            return 10**18 - 1
+
+    module.merged_backup_limit_problem(_PgWithCounter(), incoming)
+    row = captured["payload"]["trip_history"][0]
+    assert row["trip_id"] == "trip_1000000000000000000", row["trip_id"]
+    assert len(row["trip_id"]) == 24
+
+    class _PgNoCounterApi:
+        snapshot_based = False
+
+        def export_snapshot(self):
+            return dict(snapshot)
+
+    module.merged_backup_limit_problem(_PgNoCounterApi(), incoming)
+    row = captured["payload"]["trip_history"][0]
+    assert row["trip_id"] == "trip_1000000000000000000", (
+        "PG 水位未知时必须按 BIGINT 上限占位，不能从 trip_1 起算"
+    )
+
+    class _JsonStore:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return dict(snapshot)
+
+    module.merged_backup_limit_problem(_JsonStore(), incoming)
+    assert captured["payload"]["trip_history"][0]["trip_id"] == "trip_1"
+    print("✓ 合并预演按 PG 计数器水位 / 最坏占位起号")
+
+
+def test_merged_preview_ids_match_real_storage(monkeypatch):
+    """预演编号必须与真实 save_trip_histories 逐行一致（含重复折叠、
+    冲突改号与沿用编号）。"""
+    import tempfile
+    from pathlib import Path as pathlib_path
+
+    from config import STORAGE_CONFIG
+    from context.long_term_memory import LongTermMemory
+    from utils import user_import as module
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = pathlib_path(storage_dir) / "u-ids.json"
+    seed = {
+        "user_id": "u-ids",
+        "preferences": [],
+        "chat_history": [],
+        "trip_history": [],
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {
+            "last_trip_number": 10**18 - 1,
+            "total_trips": 0,
+            "total_messages": 0,
+            "frequent_destinations": {},
+        },
+    }
+    path.write_text(json.dumps(seed), encoding="utf-8")
+    store = LongTermMemory("u-ids", storage_dir)
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    trips = [
+        {"origin": "上海", "destination": "成都", "start_date": "2026-05-01"},
+        {
+            "origin": "上海",
+            "destination": "成都",
+            "start_date": "2026-05-01",
+            "purpose": "会",
+        },
+        {
+            "origin": "上海",
+            "destination": "杭州",
+            "start_date": "2026-07-01",
+            "trip_id": "trip_1",
+        },
+        {
+            "origin": "上海",
+            "destination": "南京",
+            "start_date": "2026-08-01",
+            "trip_id": "trip_5",
+        },
+    ]
+    module.merged_backup_limit_problem(
+        store, {"trips": [dict(item) for item in trips]}
+    )
+    preview_ids = [
+        row["trip_id"] for row in captured["payload"]["trip_history"]
+    ]
+
+    store.save_trip_histories([dict(item) for item in trips])
+    stored_ids = [row["trip_id"] for row in store.get_trip_history(limit=None)]
+    assert preview_ids == stored_ids, (preview_ids, stored_ids)
+    print("✓ 合并预演编号与真实落库逐行一致")
+
+
+def test_sections_limit_uses_merged_export_shape(monkeypatch):
+    """备份自身体积预检与合并复核同一导出形状：同身份行程折叠、
+    会话元数据与重算统计计入、PG 空键按后端补写。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    sections = {
+        "trips": [
+            {"origin": "上海", "destination": "成都", "start_date": "2026-05-01"},
+            {
+                "origin": "上海",
+                "destination": "成都",
+                "start_date": "2026-05-01",
+                "purpose": "会",
+            },
+        ],
+        "messages": [],
+        "titles": {"s1": "标题"},
+        "pinned": ["s1"],
+        "archived": [],
+    }
+    module.sections_limit_problem(sections)
+    payload = captured["payload"]
+    assert len(payload["trip_history"]) == 1, "同身份重复行必须折叠"
+    assert payload["trip_history"][0]["purpose"] == "会"
+    assert payload["session_titles"] == {"s1": "标题"}
+    assert payload["pinned_sessions"] == ["s1"]
+    assert payload["statistics"]["total_trips"] == 1
+    assert "frequent_destinations" in payload["statistics"]
+
+    # 空键后端形状：单条无 purpose 行程，JSON 无键、PG 补 None
+    single = {
+        "trips": [
+            {"origin": "北京", "destination": "西安", "start_date": "2026-06-01"}
+        ]
+    }
+    module.sections_limit_problem(single)
+    json_row = captured["payload"]["trip_history"][0]
+    assert "purpose" not in json_row and "session_id" not in json_row
+    module.sections_limit_problem(single, pg_shape=True)
+    pg_row = captured["payload"]["trip_history"][0]
+    assert pg_row.get("purpose", "missing") is None
+    assert pg_row.get("session_id", "missing") is None
+    print("✓ 备份自身体积预检与合并复核同形状")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""

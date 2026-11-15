@@ -1822,6 +1822,29 @@ class PostgresLongTermMemory:
             "frequent_destinations": frequent,
         }
 
+    def get_trip_number_watermark(self) -> int | None:
+        """行程编号水位（``aligo_trip_counters.last_number``，只读）。
+
+        合并体积预演据此按真实起号估算导出体积：``statistics`` 只有
+        JSON 后端带 ``last_trip_number``，PG 的计数器不会随行程删除
+        回落（曾导入 18 位编号后即使行程删光，新行仍从 19 位编号起）。
+        读取失败按未知处理（调用方回退到最坏占位）。
+        """
+        try:
+            row = self._fetchone(
+                "SELECT last_number FROM aligo_trip_counters "
+                "WHERE user_id = %s",
+                (self.user_id,),
+            )
+        except Exception:  # noqa: BLE001 - 预演读水位失败按未知处理
+            return None
+        if row is None:
+            return None
+        try:
+            return int(row[0] or 0)
+        except (TypeError, ValueError):
+            return None
+
     def export_snapshot(self) -> dict[str, Any]:
         """一次 REPEATABLE READ 事务内导出（统计与各列表同一快照）。
 

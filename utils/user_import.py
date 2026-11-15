@@ -451,6 +451,7 @@ def merged_backup_limit_problem(
         merged_titles.update(incoming_titles)
     existing_messages = list(existing.get("chat_history") or [])
     existing_trip_rows = list(existing.get("trip_history") or [])
+    pg_shape = not getattr(store, "snapshot_based", False)
     # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
     # export_snapshot 之外补 user_id / exported_at——这里放等长占位，
     # 体积口径与导出端一致
@@ -471,8 +472,10 @@ def merged_backup_limit_problem(
             "trip_history": _merged_trip_rows(
                 existing_trip_rows,
                 sections.get("trips") or [],
-                include_empty_keys=not getattr(store, "snapshot_based", False),
-                existing_last_number=_existing_last_trip_number(existing),
+                include_empty_keys=pg_shape,
+                existing_last_number=_existing_trip_number_watermark(
+                    store, existing, pg_shape=pg_shape
+                ),
             ),
             "preferences": merged_prefs,
             "knowledge": sections.get("knowledge") or [],
@@ -595,14 +598,46 @@ def _trip_merge_key(row: dict[str, Any]) -> Any:
 
 
 def _existing_last_trip_number(existing: dict[str, Any]) -> int | None:
-    """已有快照里的编号水位（statistics.last_trip_number）。"""
+    """已有快照里的编号水位（statistics.last_trip_number）。
+
+    缺省 / 非法返回 None（未知）：PG 的快照不带该字段，未知时调用方
+    必须按最坏情况占位，不能当成 0。
+    """
     statistics = existing.get("statistics")
     if not isinstance(statistics, dict):
         return None
+    value = statistics.get("last_trip_number")
+    if value is None:
+        return None
     try:
-        return int(statistics.get("last_trip_number") or 0)
+        return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _existing_trip_number_watermark(
+    store: Any, existing: dict[str, Any], *, pg_shape: bool
+) -> int:
+    """预演起算编号：JSON 统计水位 / PG 计数器 / 未知时最坏占位。
+
+    PG 的计数器（aligo_trip_counters.last_number）不会随行程删除回落，
+    快照 statistics 又不带 last_trip_number：读得到就用真实值，读不到
+    按 BIGINT 上限（19 位数字，trip_ 前缀共 24 字符）占位——预演绝不
+    低估真实落库后的 trip_id 长度。
+    """
+    watermark = _existing_last_trip_number(existing)
+    getter = getattr(store, "get_trip_number_watermark", None)
+    if callable(getter):
+        try:
+            value = getter()
+        except Exception:  # noqa: BLE001 - 读水位失败按未知处理
+            value = None
+        if value is not None:
+            watermark = max(watermark or 0, int(value))
+    if watermark is not None:
+        return watermark
+    # 未知：JSON 从 0 起号；PG 计数器可到 BIGINT 上限
+    return 10**18 - 1 if pg_shape else 0
 
 
 def _merged_trip_rows(
@@ -748,14 +783,63 @@ def sections_limit_problem(
     """
     if not isinstance(sections, dict):
         return None
-    payload = {
-        "chat_history": _export_shape_messages(
-            sections.get("messages") or [], pg_shape=pg_shape
-        ),
-        "trip_history": sections.get("trips") or [],
+    # 与 merged_backup_limit_problem 同一导出形状（空存量）：行程走编号
+    # 仲裁（同身份重复折叠、补 trip_id/timestamp、PG 空键），会话元数据
+    # 与重算统计一并计入——手搭的窄字段 payload 会低估同内容的真实导出，
+    # 让 CLI / Web 把实际可恢复的备份判成超限
+    trip_rows = _merged_trip_rows(
+        [],
+        sections.get("trips") or [],
+        include_empty_keys=pg_shape,
+        existing_last_number=10**18 - 1 if pg_shape else 0,
+    )
+    messages = _export_shape_messages(
+        sections.get("messages") or [], pg_shape=pg_shape
+    )
+    payload: dict[str, Any] = {
+        "user_id": "u" * 64,
+        "exported_at": "1970-01-01T00:00:00.000000",
+        "session_id": "",
+        "chat_history": messages,
+        "trip_history": trip_rows,
         "preferences": sections.get("preferences") or {},
         "knowledge": sections.get("knowledge") or [],
+        "session_titles": sections.get("titles") or {},
+        "pinned_sessions": sections.get("pinned") or [],
+        "archived_sessions": sections.get("archived") or [],
     }
+    statistics: dict[str, Any] = {
+        "total_trips": len(trip_rows),
+        "total_messages": len(messages),
+    }
+    frequent: dict[str, int] = {}
+    for trip in trip_rows:
+        if not isinstance(trip, dict):
+            continue
+        destination = trip.get("destination")
+        if not destination:
+            continue
+        try:
+            datetime.strptime(str(trip.get("start_date") or ""), "%Y-%m-%d")
+        except ValueError:
+            continue
+        key = str(destination)
+        frequent[key] = frequent.get(key, 0) + 1
+    statistics["frequent_destinations"] = frequent
+    numbers = [
+        int(match.group(1))
+        for match in (
+            re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id") or ""))
+            for trip in trip_rows
+            if isinstance(trip, dict)
+        )
+        if match
+    ]
+    if trip_rows:
+        statistics["last_trip_number"] = (
+            max(numbers, default=0) + len(trip_rows)
+        )
+    payload["statistics"] = statistics
     return backup_limit_problem(payload)
 
 
