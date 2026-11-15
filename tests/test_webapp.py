@@ -1563,6 +1563,31 @@ def test_chat_stream_storage_error_maps_friendly_message(monkeypatch):
     print("✓ SSE 存储故障返回友好提示")
 
 
+def test_chat_stream_quarantine_and_case_conflict_messages(monkeypatch):
+    """SSE 错误事件同样走持久化文案分层：隔离类保留恢复指引、
+    大小写冲突给可执行提示且不回显已有账号。"""
+    from utils.errors import MemoryPersistenceError
+
+    quarantined = _stream_error_message(
+        monkeypatch,
+        MemoryPersistenceError(
+            "记忆文件损坏并已隔离备份（data/memory/u1.json.corrupt-1）"
+        ),
+    )
+    assert "隔离备份" in quarantined and "恢复" in quarantined, quarantined
+
+    case_conflict = _stream_error_message(
+        monkeypatch,
+        MemoryPersistenceError(
+            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）"
+        ),
+    )
+    assert "大小写" in case_conflict, case_conflict
+    assert "存储暂时不可用" not in case_conflict
+    assert "alice" not in case_conflict
+    print("✓ SSE 隔离 / 大小写文案分层")
+
+
 def test_get_session_constructs_outside_lock(monkeypatch):
     """并发首请求各自在锁外构造；后到者关闭自己新建的运行时回收连接。"""
     from webapp import server as server_module
@@ -12011,6 +12036,9 @@ def test_cached_session_quarantined_is_evicted_and_closed(monkeypatch, tmp_path)
     from collections import OrderedDict
 
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    decoupled_dir = tmp_path / "global-memory"
+    decoupled_dir.mkdir()
+    monkeypatch.setattr(server_module, "MEMORY_DIR", decoupled_dir)
     monkeypatch.setattr(server_module, "wrap_usage_tracking", lambda m: m)
 
     class _StubApp:
@@ -12147,7 +12175,10 @@ def test_active_marker_detected_under_dsn(monkeypatch, tmp_path):
     backup = detecting.get_fresh_quarantine_backup()
     assert backup
 
-    monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
+    # 全局 MEMORY_DIR 与实例 db_path 目录解耦：扫描必须按后者命中
+    global_dir = tmp_path / "global-memory"
+    global_dir.mkdir()
+    monkeypatch.setattr(server_module, "MEMORY_DIR", global_dir)
     monkeypatch.setitem(
         STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
     )
@@ -12155,7 +12186,11 @@ def test_active_marker_detected_under_dsn(monkeypatch, tmp_path):
         server_module._quarantine_marker_for("u-marker-dsn", cached) == backup
     ), "DSN 配置下缓存会话必须从落盘标记发现隔离"
 
-    # 无标记的遗留 .corrupt-* 在 DSN 配置下仍是孤儿（PG 恢复后豁免）
+    # 无标记的遗留 .corrupt-* 在 DSN 配置下仍是孤儿（PG 恢复后豁免）；
+    # 全局目录放一个诱饵备份，证明实例目录优先
+    (global_dir / "u-legacy.json.corrupt-20260101000000000000-9").write_text(
+        "{}", encoding="utf-8"
+    )
     legacy_backup = (
         tmp_path / "u-legacy.json.corrupt-20260101000000000000-1"
     )

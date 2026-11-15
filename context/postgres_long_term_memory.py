@@ -173,6 +173,10 @@ class PostgresLongTermMemory:
         # advisory lock 保证互斥
         self._conn_lock = threading.RLock()
         self._conn = self._connect()
+        # 连接代次：每次 _reconnect 递增。「读-合并-写」在读取前记录代次、
+        # 写入检查时比对——不管重连发生在加锁前、加锁中还是复核后，基于
+        # 过期快照的写都会被发现；直接 replace 不依赖快照，不参与比对
+        self._conn_generation = 0
         self._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
         # 语句级等待超时（lock_timeout 的 55P03 LockNotAvailable、
         # statement_timeout 的 57014 QueryCanceled）不是连接故障：按连接
@@ -361,6 +365,7 @@ class PostgresLongTermMemory:
         with contextlib.suppress(Exception):
             self._conn.close()
         self._conn = self._connect()
+        self._conn_generation = getattr(self, "_conn_generation", 0) + 1
         self._ensure_schema()
         # 旧连接上的 advisory lock 已被服务端释放：在新的连接上按重入计数
         # 重新获取，否则重试的读改写会在没有互斥保护的情况下执行（trip_N /
@@ -436,6 +441,16 @@ class PostgresLongTermMemory:
 
         return Json(value)
 
+    def _conn_generation_now(self) -> int:
+        return getattr(self, "_conn_generation", 0)
+
+    def _abort_if_generation_changed(self, generation: int) -> None:
+        """读-合并-写期间连接重建：合并值可能过期，按可重试失败上报。"""
+        if self._conn_generation_now() != generation:
+            raise MemoryPersistenceError(
+                "数据库连接已重建，本轮写入可能基于过期数据，请重试"
+            )
+
     def _abort_if_reconnected(self, start_conn: object) -> None:
         """锁内读改写跨连接重建时中止本次写入。
 
@@ -497,7 +512,12 @@ class PostgresLongTermMemory:
     # ---------- 偏好 ----------
 
     def save_preference(
-        self, pref_type: str, value: Any, *, replay_safe: bool = True
+        self,
+        pref_type: str,
+        value: Any,
+        *,
+        replay_safe: bool = True,
+        expected_generation: int | None = None,
     ) -> None:
         """写入偏好。类型上限在用户级写锁内复核：调用方锁外预检与按类型
         的锁都挡不住不同新类型的并发新增。
@@ -506,19 +526,16 @@ class PostgresLongTermMemory:
         实例可能把类型数补到上限（新类型）或删除该类型使其重放变成新增
         行（既有类型），都会越过上面的上限复核。
 
-        ``replay_safe=False``（append_preference 的「读-合并-写」）额外
-        要求锁内连接身份不变：合并值基于重连前的快照，重连空档里其它实例
-        可能已改动同一偏好（覆盖）或删除该类型（首次 INSERT 会复活它），
-        按可重试失败上报。直接 replace 的写入值不依赖快照，重连后照常
-        执行。"""
+        ``expected_generation``（append_preference 的「读-合并-写」传读取
+        前的连接代次）要求写入期间连接未重建：合并值基于重连前的快照，
+        空档里其它实例可能已改动同一偏好（覆盖）或删除该类型（首次
+        INSERT 会复活它），按可重试失败上报。直接 replace 的写入值不
+        依赖快照，不传该参数、重连后照常执行。"""
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
-                # 连接身份在取得 advisory lock 之后采样：等锁期间的正常
-                # 重连（锁会随重连重新获取）不该让一次可成功的写入失败
-                start_conn = getattr(self, "_conn", None)
                 self._enforce_preference_cap(pref_type)
-                if not replay_safe:
-                    self._abort_if_reconnected(start_conn)
+                if expected_generation is not None:
+                    self._abort_if_generation_changed(expected_generation)
                 self._execute(
                     """
                     INSERT INTO aligo_preferences (user_id, pref_type, value)
@@ -598,29 +615,48 @@ class PostgresLongTermMemory:
         用户在记忆面板修改同一类型偏好互相覆盖。
         """
         with self._preference_lock(pref_type):
-            start_conn = getattr(self, "_conn", None)
+            generation = self._conn_generation_now()
             current = self.get_preference(pref_type)
             # 读期间连接重建：旧 advisory lock 已释放，空档里其它实例可能
             # 已追加同类型偏好，按旧值合并会覆盖别人的更新
-            self._abort_if_reconnected(start_conn)
+            self._abort_if_generation_changed(generation)
             merged = merge_preference_value(current, value)
-            # UPSERT 禁止重放：合并值基于重连前的旧快照
-            self.save_preference(pref_type, merged, replay_safe=False)
+            # UPSERT 禁止重放；写入全程（含 save 内再次加锁）的连接代次
+            # 必须与读取时一致
+            self.save_preference(
+                pref_type,
+                merged,
+                replay_safe=False,
+                expected_generation=generation,
+            )
             return merged
 
+    def _append_locked(self, pref_type: str, item: str) -> None:
+        """类型锁内的「读-合并-写」：阈值同 append_preference，代次不符即
+        中止——读取在锁外时重连空档里的并发追加会被整值覆盖。"""
+        with self._preference_lock(pref_type):
+            generation = self._conn_generation_now()
+            current = self.get_preference(pref_type)
+            self._abort_if_generation_changed(generation)
+            values = (
+                list(current)
+                if isinstance(current, list)
+                else ([current] if current else [])
+            )
+            if item not in values:
+                values.append(item)
+            self.save_preference(
+                pref_type,
+                values,
+                replay_safe=False,
+                expected_generation=generation,
+            )
+
     def add_hotel_brand(self, brand: str) -> None:
-        current = self.get_preference("hotel_brands")
-        values = list(current) if isinstance(current, list) else ([current] if current else [])
-        if brand not in values:
-            values.append(brand)
-        self.save_preference("hotel_brands", values)
+        self._append_locked("hotel_brands", brand)
 
     def add_airline(self, airline: str) -> None:
-        current = self.get_preference("airlines")
-        values = list(current) if isinstance(current, list) else ([current] if current else [])
-        if airline not in values:
-            values.append(airline)
-        self.save_preference("airlines", values)
+        self._append_locked("airlines", airline)
 
     # ---------- 对话历史 ----------
 
@@ -735,14 +771,14 @@ class PostgresLongTermMemory:
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
                 kept: list[dict[str, Any]] = incoming
+                # READ COMMITTED 下两个并发导入都能在 SELECT 里看不到对方
+                # 尚未提交的行：先拿用户级事务锁串行化「查重 + 计数 + 插入」，
+                # 否则并发恢复同一备份会把消息插成两倍、也绕开总量上限
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:chat_messages:{self.user_id}",),
+                )
                 if dedupe:
-                    # READ COMMITTED 下两个并发导入都能在 SELECT 里看不到对方
-                    # 尚未提交的行：先拿用户级事务锁串行化「查重 + 插入」，
-                    # 否则并发恢复同一备份会把消息插成两倍
-                    cursor.execute(
-                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                        (f"aligo:chat_messages:{self.user_id}",),
-                    )
                     cursor.execute(
                         "SELECT session_id, role, content FROM aligo_chat_messages "
                         "WHERE user_id = %s",
@@ -755,6 +791,20 @@ class PostgresLongTermMemory:
                     kept = filter_import_messages(incoming, existing)
                 if not kept:
                     return 0
+                from utils.user_import import _MAX_MESSAGES
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM aligo_chat_messages "
+                    "WHERE user_id = %s",
+                    (self.user_id,),
+                )
+                total_row = cursor.fetchone()
+                total = int(total_row[0] or 0) if total_row else 0
+                # 写入层硬上限：合计越限后 /api/export 会永久 413
+                if total + len(kept) > _MAX_MESSAGES:
+                    raise ValueError(
+                        f"导入后聊天消息总数将超过上限 {_MAX_MESSAGES}"
+                    )
                 fallback = datetime.now().isoformat()
                 rows = [
                     (
@@ -1054,6 +1104,29 @@ class PostgresLongTermMemory:
             _abort_if_reconnected()
             if counter is not None:
                 max_number = max(max_number, int(counter[0] or 0))
+
+            from utils.trip_import import MAX_TOTAL_TRIPS
+
+            planned_seen: set[tuple[str, str, str, str]] = set()
+            planned_created = 0
+            for trip in trips:
+                key = _key(
+                    trip.get("destination"),
+                    trip.get("origin"),
+                    trip.get("start_date"),
+                    trip.get("end_date") or trip.get("start_date"),
+                )
+                if key is not None:
+                    if key in index or key in planned_seen:
+                        continue
+                    planned_seen.add(key)
+                planned_created += 1
+            # 写入层硬上限：并发恢复 / 直连调用方合计越限后账号将永远
+            # 无法导出全量备份
+            if len(rows) + planned_created > MAX_TOTAL_TRIPS:
+                raise ValueError(
+                    f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
+                )
 
             created = 0
             updated = 0

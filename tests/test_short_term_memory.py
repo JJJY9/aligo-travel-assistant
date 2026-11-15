@@ -2257,8 +2257,12 @@ def test_direct_run_caplog_shim_captures_logs():
         logging.getLogger("aligo.outside").warning("块外日志")
         with shim.at_level(logging.ERROR, logger="aligo.target"):
             logging.getLogger("aligo.target").warning("应被 ERROR 级别过滤")
+            logging.getLogger("aligo.outside").warning("跨 logger 警告")
         assert "块外日志" in shim.text
         assert "应被 ERROR 级别过滤" not in shim.text
+        # 与 pytest 一致：at_level 同时抬高捕获 handler 级别，跨 logger
+        # 的 WARNING 在 ERROR 窗口内同样被过滤
+        assert "跨 logger 警告" not in shim.text
     finally:
         shim.close()
     print("✓ 直跑 caplog 替身捕获日志")

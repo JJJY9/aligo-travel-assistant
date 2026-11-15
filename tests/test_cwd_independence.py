@@ -29,7 +29,11 @@ def test_registry_from_other_cwd():
     out = subprocess.run(
         [sys.executable, "-c", code],
         cwd=tempfile.gettempdir(),
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True,
+        # 全量回归时本机可能同时有其它进程持有 Milvus Lite 文件锁 /
+        # 杀软扫描，子进程导入偶发被拖到分钟级（CI 无此问题）；
+        # 超时放宽到 300s，仍能拦住真正的挂死
+        timeout=300,
     )
     count = (out.stdout or "").strip().splitlines()[-1] if out.stdout else ""
     assert count == "6", (

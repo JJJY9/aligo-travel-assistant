@@ -478,7 +478,14 @@ def merged_backup_limit_problem(
                 ),
             ),
             "preferences": merged_prefs,
-            "knowledge": sections.get("knowledge") or [],
+            "knowledge": (
+                _existing_knowledge_rows()
+                + _knowledge_rows_upper_bound(
+                    sections.get("knowledge") or []
+                )
+                if sections.get("knowledge")
+                else []
+            ),
             "session_titles": merged_titles,
             "pinned_sessions": sorted(
                 {
@@ -539,9 +546,10 @@ def merged_backup_limit_problem(
         if match
     ]
     created_trip_count = max(0, len(merged_trips) - len(existing_trip_rows))
-    if merged_trips:
+    if merged_trips and not pg_shape:
         # 写入层对每个新建行至少推进一次水位；冲突改号行还能把水位推到
-        # 18 位以上——取「现有水位 / 最大编号 / 新建行数」的保守上界
+        # 18 位以上——取「现有水位 / 最大编号 / 新建行数」的保守上界。
+        # PG 的 get_statistics 没有该字段，保持后端真实导出形状
         existing_last = _existing_last_trip_number(existing) or 0
         water = max([existing_last, *trip_numbers], default=existing_last)
         statistics["last_trip_number"] = water + created_trip_count
@@ -595,6 +603,57 @@ def _trip_merge_key(row: dict[str, Any]) -> Any:
     if not destination or not start:
         return None
     return trip_identity(row)
+
+
+def _knowledge_rows_upper_bound(rows: list[Any]) -> list[dict[str, Any]]:
+    """备份里的知识片段按导入后的导出行换算（保守上界）。
+
+    导入会把 >400 字内容拆成多分片，每片重复携带 part/parts/group 与
+    用户元数据；这里按分片数与每片开销折算成等长内容行，体积只多不少，
+    保证合并复核不会低估「恢复后导出带知识库的备份」的真实体积。
+    """
+    from utils.knowledge_admin import _MAX_CONTENT_CHARS
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        content = row.get("content")
+        if not isinstance(content, str):
+            continue
+        parts = max(
+            1, -(-len(content.strip()) // _MAX_CONTENT_CHARS)
+        )
+        metadata = row.get("metadata")
+        metadata_size = (
+            len(json.dumps(metadata, ensure_ascii=False))
+            if isinstance(metadata, dict)
+            else 8
+        )
+        estimate = len(content) + parts * (120 + metadata_size)
+        result.append(
+            {
+                "content": "x" * estimate,
+                "metadata": {"source": "merged-limit-estimate"},
+            }
+        )
+    return result
+
+
+def _existing_knowledge_rows() -> list[Any]:
+    """知识库现有片段（合并体积复核用）；未初始化返回空列表。"""
+    from utils.knowledge_admin import export_documents
+
+    try:
+        return list(export_documents() or [])
+    except FileNotFoundError:
+        # 知识库尚未初始化：导入时知识段会以 knowledge_error 上报，
+        # 不构成「恢复后无法导出」风险
+        return []
+    except Exception as exc:  # noqa: BLE001 - 读不到现有库无法确认体积
+        raise MemoryPersistenceError(
+            f"读取知识库现有片段失败，无法确认恢复后仍可导出：{exc}"
+        ) from exc
 
 
 def _existing_last_trip_number(existing: dict[str, Any]) -> int | None:
@@ -764,10 +823,17 @@ def _export_shape_messages(
     prepared = iter(prepare_import_messages(dict_rows, now=fallback))
     rows: list[Any] = []
     for message in messages:
-        if isinstance(message, dict):
-            rows.append(next(prepared))
-        else:
+        if not isinstance(message, dict):
             rows.append(message)
+            continue
+        row = next(prepared)
+        timestamp = row.get("timestamp")
+        if not pg_shape and isinstance(timestamp, str) and len(timestamp) > 26:
+            # 解析把 naive 时间戳归一成带偏移的 32 字符，但 JSON 后端
+            # 幂等重导时重复行不落库、真实导出仍是 26 字符：预检按 26
+            # 估算（新建行走权威合并复核，不会被低估放行）
+            row = {**row, "timestamp": timestamp[:26]}
+        rows.append(row)
     return rows
 
 
