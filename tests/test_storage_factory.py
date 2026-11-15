@@ -1189,9 +1189,10 @@ def test_quarantine_marker_owner_case_conflict(monkeypatch):
     assert marker.exists(), "归属冲突时标记必须保留"
     assert backup.exists()
 
-    # 同大小写的拥有者不受影响
+    # 同大小写的拥有者不受影响（大小写敏感平台上 Alice 实例看不到
+    # alice 名下的标记，但遗留备份分支同样应携带隔离证据）
     owner_store = LongTermMemory("Alice", storage_dir)
-    assert owner_store.get_fresh_quarantine_backup() == str(backup)
+    assert owner_store.get_recovered_corrupt_backup() == str(backup)
 
     # 无标记的遗留备份同样按文件名归属拒绝（仅大小写不敏感的系统上
     # alice 的 glob 才会命中 Alice 的备份；Linux CI 上跳过该变体）
