@@ -3918,6 +3918,41 @@ def test_persistence_detail_transient_read_is_generic():
     print("✓ 瞬时读失败按通用 503 文案，不误报数据损坏")
 
 
+def test_open_long_term_no_backup_sentinel_message(monkeypatch):
+    """标记损坏且无可用备份：503 文案给「未能隔离备份」而不是引导
+    用户恢复不存在的备份。"""
+    from webapp import server as server_module
+
+    class _DummyStore:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "create_long_term_memory",
+        lambda *args, **kwargs: _DummyStore(),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_quarantine_marker_for",
+        lambda user_id, store: server_module._QUARANTINE_NO_BACKUP_MARKER,
+    )
+    with pytest.raises(server_module.HTTPException) as info:
+        server_module._open_long_term("u-no-backup")
+    detail = info.value.detail
+    assert "未能隔离备份" in detail, detail
+    assert "备份文件恢复" not in detail, detail
+
+    mapped = server_module._persistence_failure_detail(
+        server_module.MemoryPersistenceError(
+            "记忆文件损坏且未找到可用隔离备份，请稍后重试或联系维护"
+        ),
+        "rid-nb",
+    )
+    assert "未能隔离备份" in mapped, mapped
+    print("✓ 无可用隔离备份走「未能隔离备份」文案")
+
+
 def test_create_trip_write_failure_maps_503(monkeypatch):
     """POST /api/trips 写入失败映射 503（与更新 / 删除一致）。"""
     from utils.errors import MemoryPersistenceError
@@ -11905,11 +11940,16 @@ def test_quarantined_backup_scan_ignores_deleted_accounts(monkeypatch, tmp_path)
     """账号数据已删除（.deleted 墓碑）时遗留隔离备份是孤儿：不再 503。"""
     from webapp import server as server_module
 
+    import os as os_module
+
     monkeypatch.setattr(server_module, "MEMORY_DIR", tmp_path)
-    (tmp_path / "u-gone.json.corrupt-20260101000000000000-1").write_text(
-        "{}", encoding="utf-8"
-    )
-    (tmp_path / "u-gone.json.deleted").write_text("", encoding="utf-8")
+    backup = tmp_path / "u-gone.json.corrupt-20260101000000000000-1"
+    backup.write_text("{}", encoding="utf-8")
+    tombstone = tmp_path / "u-gone.json.deleted"
+    tombstone.write_text("", encoding="utf-8")
+    # mtime 固化：备份严格早于墓碑才是孤儿（相等按隔离 fail-closed）
+    tomb_mtime = tombstone.stat().st_mtime
+    os_module.utime(backup, (tomb_mtime - 10.0, tomb_mtime - 10.0))
     assert server_module._quarantined_memory_backup("u-gone") is None
 
 

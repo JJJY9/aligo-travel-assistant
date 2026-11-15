@@ -331,10 +331,15 @@ if __name__ == "__main__":
         test_user_export_scans_existing_quarantine_backups(
             mp, Path(tempfile.mkdtemp())
         )
+        # 每个用例独立的 MonkeyPatch：共用实例会让 _MAX_MESSAGES=1
+        # 泄漏到下一个用例（写入失败用例被超限文案顶掉）
         mp = pytest.MonkeyPatch()
         try:
-            # 硬编码清单漏登记的用例（此前直跑永远不执行）
             test_user_export_refuses_oversized_backup(mp)
+        finally:
+            mp.undo()
+        mp = pytest.MonkeyPatch()
+        try:
             test_user_export_write_failure_reports(mp)
         finally:
             mp.undo()

@@ -362,6 +362,11 @@ class AligoCLI:
                         "[red]记忆文件损坏且隔离备份尚未完成（文件可能被"
                         "占用），请稍后重试或联系维护[/red]"
                     )
+                elif quarantined == _QUARANTINE_NO_BACKUP_DISPLAY:
+                    self.console.print(
+                        "[red]记忆文件损坏且未找到可用隔离备份（标记损坏"
+                        "或备份已被清理），请稍后重试或联系维护[/red]"
+                    )
                 else:
                     self.console.print(
                         f"[red]记忆文件损坏，已隔离备份到 {_markup_safe(quarantined)}"
@@ -3812,15 +3817,21 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
         deleted_marker = base.with_name(base.name + ".deleted")
         if deleted_marker.exists():
             # 账号数据已删除：遗留的隔离备份是孤儿；晚于墓碑的新隔离
-            # 备份说明删除后又发生损坏，仍按隔离处理
+            # 备份说明删除后又发生损坏，仍按隔离处理。mtime 相等（同一
+            # 时钟片）或无法 stat 时按隔离 fail-closed
             try:
                 marker_mtime = deleted_marker.stat().st_mtime
+            except OSError:
+                marker_mtime = 0.0
+            try:
                 newest = max(
                     (m.stat().st_mtime for m in matches), default=0.0
                 )
+                stat_failed = False
             except OSError:
-                marker_mtime, newest = 0.0, 0.0
-            if newest <= marker_mtime:
+                newest = 0.0
+                stat_failed = True
+            if not stat_failed and newest < marker_mtime:
                 return None
     except OSError:
         return None
@@ -3828,6 +3839,8 @@ def _recovered_corrupt_backup(store: Any) -> str | None:
 
 
 _QUARANTINE_PENDING_DISPLAY = "__quarantine_pending__"
+# 与存储层 _QUARANTINE_NO_BACKUP_MARKER 同值：标记损坏且无可用备份
+_QUARANTINE_NO_BACKUP_DISPLAY = "__quarantine_no_backup__"
 
 
 def _interactive_quarantine_marker(store: Any) -> str | None:
@@ -3937,6 +3950,15 @@ def _open_cli_store(user_id: str, allow_quarantined: bool = False):
             close = getattr(store, "close", None)
             if callable(close):
                 close()
+            if active == _QUARANTINE_NO_BACKUP_DISPLAY:
+                # 没有可用备份：不能引导用户导入标记文件
+                raise _QuarantinedMemoryError(
+                    "",
+                    message=(
+                        "记忆文件损坏且未找到可用隔离备份（标记损坏或备份"
+                        "已被清理），请稍后重试或联系维护"
+                    ),
+                )
             raise _QuarantinedMemoryError(str(active))
         quarantined = _recovered_corrupt_backup(store)
         if quarantined:
