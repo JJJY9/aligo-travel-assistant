@@ -1621,6 +1621,7 @@ if __name__ == "__main__":
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
+            skipped_names.append(name)
         finally:
             if fixture is not None:
                 fixture.undo()

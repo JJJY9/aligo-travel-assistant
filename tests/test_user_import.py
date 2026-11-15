@@ -3077,9 +3077,36 @@ def test_sections_limit_uses_merged_export_shape(monkeypatch):
     print("✓ 备份自身体积预检与合并复核同形状")
 
 
+def _fake_knowledge_planner(pieces):
+    """规划替身：合并预检与真实导入共用 import_documents 的计划接口。"""
+
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
+        if not dry_run:
+            return {
+                "imported": 0,
+                "skipped": 0,
+                "skipped_invalid": 0,
+                "skipped_duplicate": 0,
+                "skipped_conflict": 0,
+            }
+        payload = {
+            "imported": 0,
+            "skipped": 0,
+            "skipped_invalid": 0,
+            "skipped_duplicate": 0,
+            "skipped_conflict": 0,
+            "would_import": len(pieces),
+        }
+        if return_pieces:
+            payload["pieces"] = [dict(piece) for piece in pieces]
+        return payload
+
+    return fake_import
+
+
 def test_merged_preview_includes_global_knowledge(monkeypatch):
-    """一体化备份恢复会把知识片段写进全局知识库：合并体积复核必须计入
-    现有库 + 本次将新增分片的保守上界，否则恢复成功后导出永久 413。"""
+    """合并体积复核的知识段 = 现有全局库 + 导入层规划出的「真正会写入」
+    分片（去重 / 分组 / 切分同源，重导自己的备份不会被双计误拒）。"""
     import utils.knowledge_admin as kb
     from utils import user_import as module
 
@@ -3091,9 +3118,22 @@ def test_merged_preview_includes_global_knowledge(monkeypatch):
 
     monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
     monkeypatch.setattr(
-        kb,
-        "export_documents",
-        lambda *a, **k: [{"content": "旧知识", "metadata": {}}],
+        module,
+        "_existing_knowledge_rows",
+        lambda: [{"content": "旧知识", "metadata": {}}],
+    )
+    pieces = [
+        {
+            "content": "拆分后的新知识一",
+            "metadata": {"part": "1", "parts": "2", "group": "g1"},
+        },
+        {
+            "content": "拆分后的新知识二",
+            "metadata": {"part": "2", "parts": "2", "group": "g1"},
+        },
+    ]
+    monkeypatch.setattr(
+        kb, "import_documents", _fake_knowledge_planner(pieces)
     )
 
     class _Store:
@@ -3110,29 +3150,85 @@ def test_merged_preview_includes_global_knowledge(monkeypatch):
                 "statistics": {},
             }
 
-    long_content = "y" * 900
     module.merged_backup_limit_problem(
-        _Store(), {"knowledge": [{"content": long_content}]}
+        _Store(), {"knowledge": [{"content": "原始长文"}]}
     )
     knowledge = captured["payload"]["knowledge"]
     assert knowledge[0]["content"] == "旧知识"
-    estimate = knowledge[1]["content"]
-    parts = 3  # ceil(900/400)
-    assert len(estimate) >= len(long_content) + parts * 120
+    # 规划出的分片原样计入（含派生元数据），不再自造体积估算
+    assert [row["content"] for row in knowledge[1:]] == [
+        piece["content"] for piece in pieces
+    ]
+    assert knowledge[1]["metadata"]["group"] == "g1"
 
-    # 现有库读失败：fail-closed（无法确认恢复后仍可导出）
-    from utils.errors import MemoryPersistenceError
+    # 备份不带知识段：现有库也必须计入（带知识库导出会带上它们）
+    module.merged_backup_limit_problem(_Store(), {})
+    assert captured["payload"]["knowledge"] == [
+        {"content": "旧知识", "metadata": {}}
+    ]
+
+    # 现有库读失败：不阻断用户数据恢复（知识轴跳过、不抛错）
+    from utils.errors import MemoryPersistenceError as _MPE
 
     def boom(*args, **kwargs):
-        raise RuntimeError("kb busy")
+        raise _MPE("kb busy")
 
-    monkeypatch.setattr(kb, "export_documents", boom)
-    with pytest.raises(MemoryPersistenceError) as info:
+    monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
+    assert (
         module.merged_backup_limit_problem(
             _Store(), {"knowledge": [{"content": "新"}]}
         )
-    assert "知识库" in str(info.value)
-    print("✓ 合并预检纳入全局知识库（含读失败 fail-closed）")
+        is None
+    )
+    print("✓ 合并预检知识段与导入规划同源（含恒计入/读失败降级）")
+
+
+def test_merged_knowledge_duplicate_backup_not_rejected(monkeypatch):
+    """幂等重导自己的一体化备份：规划结果为空分片时知识段只剩现有库，
+    不会因「现有 + 备份」双计超过上限。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    existing = [
+        {"content": f"分片{i}", "metadata": {"part": "1", "parts": "1"}}
+        for i in range(30_000)
+    ]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(existing)
+    )
+    # 导入层判重后没有任何新片段
+    monkeypatch.setattr(kb, "import_documents", _fake_knowledge_planner([]))
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    backup_rows = [{"content": f"分片{i}"} for i in range(30_000)]
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"knowledge": backup_rows}
+        )
+        is None
+    )
+    assert len(captured["payload"]["knowledge"]) == 30_000
+    print("✓ 幂等重导知识备份不被双计误拒")
 
 
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
@@ -3370,6 +3466,7 @@ if __name__ == "__main__":
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
+            skipped_names.append(name)
         finally:
             if caplog_shim is not None:
                 caplog_shim.close()

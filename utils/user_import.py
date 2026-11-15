@@ -478,14 +478,7 @@ def merged_backup_limit_problem(
                 ),
             ),
             "preferences": merged_prefs,
-            "knowledge": (
-                _existing_knowledge_rows()
-                + _knowledge_rows_upper_bound(
-                    sections.get("knowledge") or []
-                )
-                if sections.get("knowledge")
-                else []
-            ),
+            "knowledge": _merged_knowledge_rows(sections),
             "session_titles": merged_titles,
             "pinned_sessions": sorted(
                 {
@@ -605,55 +598,53 @@ def _trip_merge_key(row: dict[str, Any]) -> Any:
     return trip_identity(row)
 
 
-def _knowledge_rows_upper_bound(rows: list[Any]) -> list[dict[str, Any]]:
-    """备份里的知识片段按导入后的导出行换算（保守上界）。
-
-    导入会把 >400 字内容拆成多分片，每片重复携带 part/parts/group 与
-    用户元数据；这里按分片数与每片开销折算成等长内容行，体积只多不少，
-    保证合并复核不会低估「恢复后导出带知识库的备份」的真实体积。
-    """
-    from utils.knowledge_admin import _MAX_CONTENT_CHARS
-
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        content = row.get("content")
-        if not isinstance(content, str):
-            continue
-        parts = max(
-            1, -(-len(content.strip()) // _MAX_CONTENT_CHARS)
-        )
-        metadata = row.get("metadata")
-        metadata_size = (
-            len(json.dumps(metadata, ensure_ascii=False))
-            if isinstance(metadata, dict)
-            else 8
-        )
-        estimate = len(content) + parts * (120 + metadata_size)
-        result.append(
-            {
-                "content": "x" * estimate,
-                "metadata": {"source": "merged-limit-estimate"},
-            }
-        )
-    return result
-
-
 def _existing_knowledge_rows() -> list[Any]:
-    """知识库现有片段（合并体积复核用）；未初始化返回空列表。"""
-    from utils.knowledge_admin import export_documents
+    """知识库现有片段（合并体积复核用）；未初始化返回空列表。
+
+    知识库未初始化不构成「恢复后无法导出」风险：导入时知识段会以
+    ``knowledge_error`` 上报，用户数据照常恢复。
+    """
+    from utils.knowledge_admin import export_documents, knowledge_db_path
 
     try:
+        if not knowledge_db_path().exists():
+            return []
         return list(export_documents() or [])
     except FileNotFoundError:
-        # 知识库尚未初始化：导入时知识段会以 knowledge_error 上报，
-        # 不构成「恢复后无法导出」风险
         return []
-    except Exception as exc:  # noqa: BLE001 - 读不到现有库无法确认体积
+    except Exception as exc:  # noqa: BLE001 - 交给合并预检按知识轴跳过
         raise MemoryPersistenceError(
-            f"读取知识库现有片段失败，无法确认恢复后仍可导出：{exc}"
+            f"读取知识库现有片段失败：{exc}"
         ) from exc
+
+
+def _merged_knowledge_rows(sections: dict[str, Any]) -> list[Any]:
+    """合并复核的知识段：现有全局库 + 本次真正会写入的分片。
+
+    直接复用导入层的 dry-run 规划（分组还原 / 去重 / 切分后的最终形状）：
+    预演与真实 ``import_documents`` 逐字节同源，幂等重导自己的一体化备份
+    不会因重复分片被双计而误拒；备份不带知识段时也要计入现有库——带
+    知识库导出会带上它们。知识库不可读时不让用户数据恢复失败（导入层
+    会把知识段以 ``knowledge_error`` 上报），仅跳过知识体积轴。
+    """
+    try:
+        existing = _existing_knowledge_rows()
+    except MemoryPersistenceError as exc:
+        logger.warning("合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc)
+        existing = []
+    rows = sections.get("knowledge") or []
+    if not rows:
+        return existing
+    try:
+        from utils.knowledge_admin import import_documents
+
+        plan = import_documents(rows, dry_run=True, return_pieces=True)
+    except FileNotFoundError:
+        return existing
+    except Exception as exc:  # noqa: BLE001 - 知识失败不阻断用户数据恢复
+        logger.warning("合并预检：知识库规划失败（%s），跳过知识体积轴", exc)
+        return existing
+    return existing + list(plan.get("pieces") or [])
 
 
 def _existing_last_trip_number(existing: dict[str, Any]) -> int | None:
