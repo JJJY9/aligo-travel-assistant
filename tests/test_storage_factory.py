@@ -1312,13 +1312,35 @@ def test_pg_preference_snapshot_writes_abort_on_reconnect():
         "INSERT INTO aligo_preferences" in sql for sql in recorded
     )
 
+    # 复核 SELECT 期间的重连（锁已取得）：同样按代次中止
+    recorded.clear()
+    memory._preference_lock = lambda pref_type: contextlib.nullcontext()
+    entered = {"cap": False}
+
+    def cap_only_reconnect(pref_type):
+        entered["cap"] = True
+        memory._conn = object()
+        memory._conn_generation += 1
+        return False
+
+    memory._enforce_preference_cap = cap_only_reconnect
+    with pytest.raises(MemoryPersistenceError):
+        memory.save_preference(
+            "home_location", "杭州", replay_safe=False, expected_generation=0
+        )
+    assert entered["cap"] is True
+    assert not any(
+        "INSERT INTO aligo_preferences" in sql for sql in recorded
+    )
+
     # 直接 replace（无 expected_generation）：同一重连下写入照常执行
     recorded.clear()
+    memory._enforce_preference_cap = lambda pref_type: False
     memory.save_preference("home_location", "上海")
     assert any(
         "INSERT INTO aligo_preferences" in sql for sql in recorded
     )
-    print("✓ PG 偏好只对快照派生写按代次中止")
+    print("✓ PG 偏好只对快照派生写按代次中止（锁期 / 复核期）")
 
 
 def test_pg_append_preference_aborts_when_save_lock_reconnects():
@@ -5311,6 +5333,7 @@ if __name__ == "__main__":
             ran += 1
         except pytest.skip.Exception:
             skipped += 1
+            skipped_names.append(name)
         finally:
             if caplog_shim is not None:
                 caplog_shim.close()

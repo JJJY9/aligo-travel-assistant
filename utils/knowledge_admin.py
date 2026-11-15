@@ -1447,24 +1447,32 @@ def _log_safe_group(value: object) -> str:
 
 
 def import_documents(
-    documents: list[dict[str, Any]], dry_run: bool = False
+    documents: list[dict[str, Any]],
+    dry_run: bool = False,
+    *,
+    return_pieces: bool = False,
 ) -> dict[str, Any]:
     """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。
 
     导出备份中的多分片记录先按 group 拼回整篇再重新拆分；整组已完整存在
     于库中时整组跳过（重复导入同一备份保持幂等，不会因重新拆分产生重复）。
     ``dry_run`` 只做校验 / 去重并返回 ``would_import``，不加载嵌入模型、
-    不写入任何内容。
+    不写入任何内容；``return_pieces``（仅 dry-run 有意义）额外返回
+    ``pieces``——本次真正会写入的分片行（分组还原 / 去重 / 切分后的
+    最终形状），供合并体积预演与真实导入逐字节对齐。
     """
     items = list(documents)
     if not items:
-        return {
+        empty: dict[str, Any] = {
             "imported": 0,
             "skipped": 0,
             "skipped_invalid": 0,
             "skipped_duplicate": 0,
             "skipped_conflict": 0,
         }
+        if dry_run and return_pieces:
+            empty["pieces"] = []
+        return empty
 
     # 与数据库无关的校验先做：全部为空 / 非法时不需要知识库，直接返回
     valid: list[Any] = []
@@ -1539,6 +1547,8 @@ def import_documents(
         if dry_run:
             # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
             payload["would_import"] = 0
+            if return_pieces:
+                payload["pieces"] = []
         return payload
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
@@ -1564,6 +1574,8 @@ def import_documents(
             payload["skipped_groups"] = pre_problems
         if dry_run:
             payload["would_import"] = 0
+            if return_pieces:
+                payload["pieces"] = []
         return payload
 
     # 全部已存在的重复导入不需要嵌入模型：此前先加载模型再判重，模型不可用
@@ -2041,6 +2053,8 @@ def import_documents(
             if dry_run:
                 # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
                 result["would_import"] = 0
+                if return_pieces:
+                    result["pieces"] = []
             return result
         if dry_run:
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
@@ -2052,6 +2066,9 @@ def import_documents(
                 "skipped_conflict": conflict,
                 "would_import": len(unique),
             }
+            if return_pieces:
+                # 真实写入的分片行（含分组派生元数据），预演据此计体积
+                payload["pieces"] = [dict(entry) for entry in unique]
             if problems:
                 payload["skipped_groups"] = problems
             return payload
