@@ -1236,6 +1236,38 @@ def test_delete_all_refuses_case_conflict_owner(monkeypatch):
     print("✓ delete_all 拒绝大小写冲突的删除")
 
 
+def test_actual_filename_prefers_exact_case(monkeypatch):
+    """大小写敏感平台上 alice / Alice 是独立账号：隔离改名的备份名必须
+    沿用本账号的精确文件名，不能采用 scandir 先命中的大小写变体（否则
+    本账号被错误归属永久拒绝，变体账号还能把该备份当自己的删掉）。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    alice_upper = Path(storage_dir) / "Alice.json"
+    alice_upper.write_text('{"user_id": "Alice"}', encoding="utf-8")
+    if (Path(storage_dir) / "alice.json").exists():
+        # 大小写不敏感文件系统（Windows/macOS）：两个变体是同一个文件，
+        # 由 samefile 校验路径覆盖；此用例只在大小写敏感平台有意义
+        print("✓ 精确文件名优先（大小写不敏感平台跳过）")
+        return
+    small = Path(storage_dir) / "alice.json"
+    small.write_text("{bad json", encoding="utf-8")
+
+    store = LongTermMemory("alice", storage_dir)
+    backup = store.get_fresh_quarantine_backup()
+    assert backup is not None
+    assert Path(backup).name.startswith("alice.json.corrupt-"), backup
+    assert (
+        alice_upper.read_text(encoding="utf-8") == '{"user_id": "Alice"}'
+    ), "另一账号的文件不能被改名或覆盖"
+    recovering = LongTermMemory(
+        "alice", storage_dir, allow_quarantined=True
+    )
+    assert recovering.get_recovered_corrupt_backup() == backup
+    print("✓ 隔离改名沿用精确文件名（大小写敏感平台）")
+
+
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
     """备份删除失败（删除未完成）也必须写墓碑：主文件已删，旧实例写入
     不能复活数据。"""

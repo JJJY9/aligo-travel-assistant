@@ -65,6 +65,11 @@ def _cleanup(user_id: str) -> None:
     lock_path = Path(MEMORY_DIR) / f"{user_id}.json.lock"
     if lock_path.exists():
         lock_path.unlink()
+    # 旧格式数据加载会触发破坏性迁移并留下原始副本：同样不能堆在
+    # data/memory（迁移副本含完整用户数据）
+    migrate_path = Path(MEMORY_DIR) / f"{user_id}.json.migrate-backup"
+    if migrate_path.exists():
+        migrate_path.unlink()
 
 
 def _unique_user(prefix: str) -> str:
@@ -1773,7 +1778,8 @@ def test_export_sanitizes_surrogate_and_non_finite():
         assert md_export.status_code == 200, md_export.text[:300]
         md_export.text.encode("utf-8")
     finally:
-        path.unlink(missing_ok=True)
+        # 旧格式数据会触发破坏性迁移：一并清理 .migrate-backup 副本
+        _cleanup(user_id)
     print("✓ 导出清洗孤立代理项与 NaN（JSON / Markdown / 会话导出）")
 
 
