@@ -5805,9 +5805,57 @@ def create_app(model: Any = None) -> FastAPI:
             if not sections:
                 detail = "；".join(errors[:3]) or "没有可恢复的数据"
                 raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
-            # 上限自检与 CLI user-import 同口径：按【解析后】的可恢复段
-            # 复核。解析会丢弃 / 截断非法行，对原始备份检查会把 Web 413
-            # 与 CLI 可恢复的同一备份判成相反结论
+            # 与 CLI user-import 同序：先剔除墓碑期刚删除 / 保留字会话，
+            # 再做 50MB 自检——被剔除的消息不能计入体积，否则同一备份在
+            # Web 413、CLI 却可恢复。墓碑查询走 to_thread，落库前的复查
+            # （_run_import 内的 late_deleted）仍覆盖等待队列期间的删除
+            #
+            # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
+            # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
+            # 行程里引用的会话同样计入：只有行程、没有消息的保留字会话
+            # 也要清掉关联，否则面板里出现一条永远打不开的行程会话链接
+            unique_sessions = {
+                message["session_id"]
+                for message in sections["messages"]
+                if message["session_id"]
+            } | {
+                trip.get("session_id")
+                for trip in sections["trips"]
+                if trip.get("session_id")
+            }
+            if unique_sessions:
+                # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
+                # 意味着数十万次线程跳转与网络往返），且整批放在一次
+                # to_thread 里完成
+                deleted_sessions = await asyncio.to_thread(
+                    lambda: {
+                        session_id
+                        for session_id in unique_sessions
+                        if state.is_recently_deleted(user_id, session_id)
+                    }
+                )
+            else:
+                deleted_sessions = set()
+            # 保留字会话（如 export）在 Web 端永远打不开：备份恢复时与墓碑
+            # 同一处理，跳过其消息与元数据，避免导入一个无法查看的会话
+            reserved_sessions = {
+                session_id
+                for session_id in unique_sessions
+                if session_id in _RESERVED_SESSION_IDS
+            }
+            skipped_sessions = deleted_sessions | reserved_sessions
+            active_sessions = set(unique_sessions) - skipped_sessions
+            for session_id in sorted(deleted_sessions):
+                errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
+            for session_id in sorted(reserved_sessions):
+                errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
+            # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
+            # 共用同一实现，两条恢复路径不再有语义差）
+            drop_sessions(sections, skipped_sessions)
+
+            # 上限自检与 CLI user-import 同口径：按【解析并剔除后】的
+            # 可恢复段复核。解析会丢弃 / 截断非法行、剔除会移除墓碑 /
+            # 保留字会话，任一阶段漏对齐都会让同一备份两入口结论相反
             try:
                 from config import STORAGE_CONFIG as _storage_config
 
@@ -5839,49 +5887,6 @@ def create_app(model: Any = None) -> FastAPI:
             async with _bounded_user_lock(
                 request, state.lock_for(user_id), _request_id(request), timeout=10.0
             ):
-                # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
-                # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
-                # 行程里引用的会话同样计入：只有行程、没有消息的保留字会话
-                # 也要清掉关联，否则面板里出现一条永远打不开的行程会话链接
-                unique_sessions = {
-                    message["session_id"]
-                    for message in sections["messages"]
-                    if message["session_id"]
-                } | {
-                    trip.get("session_id")
-                    for trip in sections["trips"]
-                    if trip.get("session_id")
-                }
-                if unique_sessions:
-                    # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
-                    # 意味着数十万次线程跳转与网络往返），且整批放在一次
-                    # to_thread 里完成
-                    deleted_sessions = await asyncio.to_thread(
-                        lambda: {
-                            session_id
-                            for session_id in unique_sessions
-                            if state.is_recently_deleted(user_id, session_id)
-                        }
-                    )
-                else:
-                    deleted_sessions = set()
-                # 保留字会话（如 export）在 Web 端永远打不开：备份恢复时与墓碑
-                # 同一处理，跳过其消息与元数据，避免导入一个无法查看的会话
-                reserved_sessions = {
-                    session_id
-                    for session_id in unique_sessions
-                    if session_id in _RESERVED_SESSION_IDS
-                }
-                skipped_sessions = deleted_sessions | reserved_sessions
-                active_sessions = set(unique_sessions) - skipped_sessions
-                for session_id in sorted(deleted_sessions):
-                    errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
-                for session_id in sorted(reserved_sessions):
-                    errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
-                # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
-                # 共用同一实现，两条恢复路径不再有语义差）
-                drop_sessions(sections, skipped_sessions)
-
                 def _run_import() -> dict[str, Any]:
                     if not dry_run:
                         # 排队期间（单 worker 可能等数分钟）会话可能被其它
