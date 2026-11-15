@@ -240,11 +240,16 @@ def test_user_import_call_site_passes_allow_quarantined(monkeypatch, tmp_path):
 
 def test_recovered_corrupt_backup_ignores_deleted_accounts(tmp_path):
     """账号数据已删除（.deleted 墓碑）时遗留隔离备份是孤儿：不再拦截。"""
+    import os as os_module
+
     db_path = tmp_path / "u-gone.json"
-    (tmp_path / "u-gone.json.corrupt-20260101000000000000-1").write_text(
-        "{}", encoding="utf-8"
-    )
-    (tmp_path / "u-gone.json.deleted").write_text("", encoding="utf-8")
+    backup = tmp_path / "u-gone.json.corrupt-20260101000000000000-1"
+    backup.write_text("{}", encoding="utf-8")
+    tombstone = tmp_path / "u-gone.json.deleted"
+    tombstone.write_text("", encoding="utf-8")
+    # mtime 固化：备份严格早于墓碑才是孤儿（相等按隔离 fail-closed）
+    tomb_mtime = tombstone.stat().st_mtime
+    os_module.utime(backup, (tomb_mtime - 10.0, tomb_mtime - 10.0))
 
     db_path_value = str(db_path)
 
@@ -277,7 +282,10 @@ def test_open_cli_store_blocks_marker_only_quarantine(monkeypatch):
     )
     with pytest.raises(cli._QuarantinedMemoryError) as info:
         cli._open_cli_store("u-climarker")
-    assert "quarantine" in str(info.value), str(info.value)
+    # 无可用备份：不能把标记文件当「已隔离备份」上报
+    assert "未找到可用隔离备份" in str(info.value), str(info.value)
+    assert "已隔离备份到" not in str(info.value)
+    assert info.value.backup == "", info.value.backup
     assert marker.exists()
     # 恢复入口（allow_quarantined）不拦截
     store = cli._open_cli_store("u-climarker", allow_quarantined=True)

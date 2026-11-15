@@ -1059,6 +1059,10 @@ class _WebSession:
                 pass
             if marker == _QUARANTINE_PENDING_MARKER:
                 raise MemoryPersistenceError(_QUARANTINE_PENDING_MESSAGE)
+            if marker == _QUARANTINE_NO_BACKUP_MARKER:
+                raise MemoryPersistenceError(
+                    "记忆文件损坏且未找到可用隔离备份，请稍后重试或联系维护"
+                )
             raise MemoryPersistenceError(
                 "记忆文件损坏并已隔离备份（路径见服务端日志），"
                 "请先用备份文件恢复后重试"
@@ -2238,6 +2242,9 @@ def _session_long_term(session: Any) -> Any:
 
 # pending（隔离改名尚未完成，尚无备份文件）的哨兵标记
 _QUARANTINE_PENDING_MARKER = "__quarantine_pending__"
+# 与 context/long_term_memory._QUARANTINE_NO_BACKUP_MARKER 同值：隔离标记
+# 存在但没有任何可用备份（标记损坏 / 备份被清理）
+_QUARANTINE_NO_BACKUP_MARKER = "__quarantine_no_backup__"
 _QUARANTINE_PENDING_MESSAGE = (
     "记忆文件损坏且隔离备份尚未完成（文件可能被占用），"
     "请稍后重试或联系维护"
@@ -2306,18 +2313,20 @@ def _quarantined_memory_backup(user_id: str) -> str | None:
     deleted_marker = Path(f"{base}.deleted")
     if deleted_marker.exists():
         # 账号数据已删除：遗留的隔离备份是孤儿，不应再让所有请求 503；
-        # 但晚于墓碑的新隔离备份说明删除后又发生了损坏，仍按隔离处理
+        # 但晚于墓碑的新隔离备份说明删除后又发生了损坏，仍按隔离处理。
+        # mtime 相等（同一时钟片）或无法 stat 时按隔离 fail-closed
         try:
             marker_mtime = deleted_marker.stat().st_mtime
         except OSError:
             marker_mtime = 0.0
         newest = 0.0
+        stat_failed = False
         for backup in backups:
             try:
                 newest = max(newest, backup.stat().st_mtime)
             except OSError:
-                pass
-        if newest <= marker_mtime:
+                stat_failed = True
+        if not stat_failed and newest < marker_mtime:
             return None
     return str(backups[-1]) if backups else None
 
@@ -2361,6 +2370,16 @@ def _open_long_term(
                 raise HTTPException(
                     status_code=503, detail=_QUARANTINE_PENDING_MESSAGE
                 )
+            if marker == _QUARANTINE_NO_BACKUP_MARKER:
+                logger.warning(
+                    "记忆隔离标记损坏且无可用备份（%s）", user_id
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "记忆数据损坏且未能隔离备份，请稍后再试或联系维护"
+                    ),
+                )
             logger.warning("记忆文件损坏并已隔离（%s）：%s", user_id, marker)
             raise HTTPException(
                 status_code=503,
@@ -2394,6 +2413,7 @@ _QUARANTINE_MESSAGE_PREFIXES = (
     "记忆主文件缺失且存在损坏隔离备份",
 )
 _DAMAGE_MESSAGE_PREFIXES = (
+    "记忆文件损坏且未找到可用隔离备份",
     "长期记忆重载失败",
     "记忆文件损坏且无法备份",
     "记忆文件损坏且隔离备份尚未完成",
