@@ -1481,7 +1481,7 @@ def test_poison_op_dropped_after_repeated_failures(monkeypatch):
     print("✓ 连续失败的毒操作最终被丢弃")
 
 
-def test_poison_warning_redacts_message_content(monkeypatch, caplog=None):
+def test_poison_warning_redacts_message_content(monkeypatch, caplog):
     """毒操作告警只记操作类型：消息正文 / 提问原文不能进日志。"""
     import logging
 
@@ -1502,17 +1502,12 @@ def test_poison_warning_redacts_message_content(monkeypatch, caplog=None):
     client.fail = True
     memory.add_message("user", "我的护照号是 E12345678 POISON")
     client.fail = False
-    if caplog is not None:
-        with caplog.at_level(logging.WARNING):
-            for _ in range(3):
-                monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
-                memory.get_recent_context()
-        assert "护照" not in caplog.text and "E12345678" not in caplog.text
-        assert "丢弃队首 add 操作" in caplog.text
-    else:
+    with caplog.at_level(logging.WARNING):
         for _ in range(3):
             monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
             memory.get_recent_context()
+    assert "护照" not in caplog.text and "E12345678" not in caplog.text
+    assert "丢弃队首 add 操作" in caplog.text
     print("✓ 毒操作告警不泄露消息内容")
 
 
@@ -2246,6 +2241,17 @@ if __name__ == "__main__":
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import asyncio
     import inspect
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
+    # 把清单截断在第一个用例；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     import pathlib
     import tempfile
 

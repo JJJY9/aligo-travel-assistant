@@ -42,7 +42,10 @@ def _main_loop_case_names(tree: ast.AST) -> list[list[str]]:
 def _test_function_params(tree: ast.AST) -> dict[str, list[str]]:
     params: dict[str, list[str]] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        ):
             args = node.args
             params[node.name] = [
                 argument.arg

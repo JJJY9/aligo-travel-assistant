@@ -237,6 +237,16 @@ class LongTermMemory:
                     return data
                 except MemoryPersistenceError:
                     raise
+                except OSError as e:
+                    # 读失败 ≠ 内容损坏：杀软 / 同步盘占用、网络盘抖动、
+                    # ACL 禁读时把完好文件改名隔离，会让账号在 CLI / Web
+                    # 全面 503（标记还把误判传播给所有新实例）。交给上层
+                    # 按可重试 503 处理，与 _reload_latest 同口径
+                    logger.error(f"Failed to read long-term memory: {e}")
+                    raise MemoryPersistenceError(
+                        "长期记忆暂时不可读（文件可能被占用）"
+                        f"（{self.db_path}）：{e}"
+                    ) from e
                 except Exception as e:
                     logger.error(f"Failed to load long-term memory: {e}")
                     # 复核与备份都必须持有跨进程文件锁：其它进程的写操作在
@@ -255,6 +265,13 @@ class LongTermMemory:
                                 latest = self._migrate_data(latest)
                             except FileNotFoundError:
                                 return self._init_data()
+                            except OSError as load_error:
+                                # 复核仍读不了（锁定 / I-O 故障）：内容未
+                                # 证实损坏，禁止改名隔离与落标记
+                                raise MemoryPersistenceError(
+                                    "长期记忆暂时不可读（文件可能被占用）"
+                                    f"（{self.db_path}）：{load_error}"
+                                ) from load_error
                             except Exception:
                                 # 备份名带微秒与进程号，同一秒内多次损坏
                                 # 不会互相覆盖
@@ -291,17 +308,22 @@ class LongTermMemory:
                 logger.info("账号数据已删除，从空快照启动")
                 return self._init_data()
             else:
-                marker_backup = self._quarantine_marker_backup()
+                quarantined, marker_backup = self._read_quarantine_marker()
                 backups = self._corrupt_siblings()
-                if marker_backup is not None:
+                if quarantined:
                     # 隔离标记（当初隔离的实例落盘）：与当场隔离同等对待，
                     # PostgreSQL 配置不能成为空快照重建主文件的豁免
                     self._fresh_quarantine = True
-                    if os.path.exists(marker_backup):
+                    if marker_backup:
                         self._corrupt_backup = marker_backup
                     elif backups:
+                        # 标记损坏 / 缺备份字段：恢复引导指向真实备份，
+                        # 并重写标记（后续实例直接读到可用路径）
                         self._corrupt_backup = str(backups[-1])
-                    logger.warning("检测到隔离标记：%s", marker_backup)
+                        self._record_quarantine_marker(self._corrupt_backup)
+                    logger.warning(
+                        "检测到隔离标记（备份：%s）", self._corrupt_backup
+                    )
                 elif backups:
                     # 主文件已被其它进程 / 实例隔离：把标记带在新实例上，
                     # 上层守卫（CLI / Web / 导出）据此识别「数据被隔离」，
@@ -334,13 +356,30 @@ class LongTermMemory:
         并以空快照重建主文件。标记让隔离跨实例可见；没有标记的历史遗留
         备份仍走 DSN 豁免，不会被误判。
         """
+        marker = self._quarantine_marker_path()
         try:
-            self._quarantine_marker_path().write_text(
-                json.dumps(
-                    {"backup": backup, "at": datetime.now().isoformat()}
-                ),
-                encoding="utf-8",
+            # 原子写（临时文件 + fsync + os.replace）：截断的标记会让恢复
+            # 引导指向标记自身；掉电 / 磁盘满也不能留下半截 JSON
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f".{self.user_id}.",
+                suffix=".quarantine.tmp",
+                dir=str(marker.parent),
             )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "backup": backup,
+                            "at": datetime.now().isoformat(),
+                        },
+                        handle,
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, marker)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
         except OSError as exc:
             logger.error("写入隔离标记失败: %s", exc)
 
@@ -350,31 +389,33 @@ class LongTermMemory:
         except OSError:
             pass
 
-    def _quarantine_marker_backup(self) -> str | None:
-        """读隔离标记：返回隔离备份路径。
+    def _read_quarantine_marker(self) -> tuple[bool, str | None]:
+        """读隔离标记，返回 ``(是否隔离中, 可用备份路径)``。
 
         标记指向的备份已不在（恢复 / 手动清理后）时清除标记并返回
-        None；标记本身损坏时按「隔离中」保守处理（返回标记路径）。
+        ``(False, None)``；标记损坏 / 不可读时按「隔离中」保守处理
+        （fail-closed），备份路径留给调用方从 ``.corrupt-*`` 回退——
+        绝不能把标记文件本身当作隔离备份上报（用户会照提示导入标记）。
         """
         marker = self._quarantine_marker_path()
         try:
             raw = marker.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return None
+            return False, None
         except OSError:
-            return str(marker)
+            return True, None
         try:
             payload = json.loads(raw)
         except Exception:  # noqa: BLE001 - 标记损坏按隔离中处理
-            return str(marker)
+            return True, None
         backup = payload.get("backup") if isinstance(payload, dict) else None
         if isinstance(backup, str) and backup:
             if os.path.exists(backup):
-                return backup
+                return True, backup
             # 备份已不存在：恢复完成 / 手动清理后的失效标记
             self._clear_quarantine_marker()
-            return None
-        return str(marker)
+            return False, None
+        return True, None
 
     def _check_owner_case(self, data: dict[str, Any]) -> None:
         """大小写不敏感文件系统上防止跨账号读写同一记忆文件。
@@ -417,6 +458,12 @@ class LongTermMemory:
         except FileNotFoundError:
             self._corrupt_pending = False
             return
+        except OSError as exc:
+            # 瞬时读失败：保留 pending、拒绝本次写入，不得隔离有效文件
+            raise MemoryPersistenceError(
+                f"长期记忆暂时不可读（文件可能被占用）"
+                f"（{self.db_path}）：{exc}"
+            ) from exc
         except Exception:  # noqa: BLE001 - 解析失败按损坏处理
             corrupted = True
         if corrupted:
@@ -457,7 +504,7 @@ class LongTermMemory:
                 self.data = self._init_data()
                 return
             backups = self._corrupt_siblings()
-            if self._quarantine_marker_backup() is not None:
+            if self._read_quarantine_marker()[0]:
                 # 隔离标记（其它实例 / DSN 下的重建实例写入）：与本实例
                 # 当场隔离同等对待，配置了 PostgreSQL 也不能写回
                 self._fresh_quarantine = True

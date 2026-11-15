@@ -267,7 +267,7 @@ def test_describe_backends_degraded_until_first_redis_success(monkeypatch):
     print("✓ 健康页按真实成功判断短期记忆降级")
 
 
-def test_factory_warns_on_non_positive_ttl(monkeypatch, caplog=None):
+def test_factory_warns_on_non_positive_ttl(monkeypatch, caplog):
     """存储工厂对非法 REDIS_TTL_SEC 记录 WARNING（构造函数钳制之外）。"""
     import logging
 
@@ -285,12 +285,9 @@ def test_factory_warns_on_non_positive_ttl(monkeypatch, caplog=None):
     monkeypatch.setattr(
         storage_module, "_get_redis_client", lambda url, force=False: object()
     )
-    if caplog is not None:
-        with caplog.at_level(logging.WARNING):
-            memory = storage_module.create_short_term_memory("s-ttl-warn")
-        assert "REDIS_TTL_SEC" in caplog.text
-    else:
+    with caplog.at_level(logging.WARNING):
         memory = storage_module.create_short_term_memory("s-ttl-warn")
+    assert "REDIS_TTL_SEC" in caplog.text
     assert memory.ttl_sec == 1
     print("✓ 工厂对非法 TTL 记录告警")
 
@@ -756,22 +753,172 @@ def test_transient_reload_failure_is_not_reported_as_damage(monkeypatch):
     print("✓ 瞬时读失败与数据损坏分流")
 
 
-def test_direct_run_harnesses_await_async_tests():
-    """8 个直跑清单必须 await async 用例：直接调用只创建 coroutine 会假绿。"""
+def test_direct_run_harnesses_handle_async_tests():
+    """含 async 用例的测试文件其 __main__ 必须真正执行（asyncio.run）：
+    直跑清单直接调用 async 用例只创建 coroutine，断言从不执行却报通过。"""
+    import ast as ast_module
+
     root = Path(__file__).resolve().parent
-    for name in (
-        "test_skill_agents.py",
-        "test_user_import.py",
-        "test_storage_integration.py",
-        "test_storage_factory.py",
-        "test_webapp.py",
-        "test_short_term_memory.py",
-        "test_cli_json_failures.py",
-        "test_cli_sessions.py",
-    ):
-        text = (root / name).read_text(encoding="utf-8")
-        assert "asyncio.run(func(**kwargs))" in text, name
-    print("✓ 直跑清单 await async 用例")
+    problems = []
+    for path in sorted(root.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        marker = 'if __name__ == "__main__":'
+        if marker not in text:
+            continue
+        try:
+            tree = ast_module.parse(text)
+        except SyntaxError:  # 语法问题交给 ruff / pytest
+            continue
+        async_tests = [
+            node.name
+            for node in ast_module.walk(tree)
+            if isinstance(node, ast_module.AsyncFunctionDef)
+            and node.name.startswith("test_")
+        ]
+        if not async_tests:
+            continue
+        main_source = text[text.index(marker):]
+        if "asyncio.run(" not in main_source:
+            problems.append(
+                f"{path.name}: {', '.join(sorted(async_tests)[:3])}"
+            )
+    assert not problems, "\n".join(problems)
+    print("✓ 含 async 用例的直跑文件都会真正执行")
+
+
+def test_corrupted_quarantine_marker_falls_back_to_real_backup(monkeypatch):
+    """损坏 / 截断 / 不可读的隔离标记不能顶替真实 .corrupt-* 备份上报
+    （用户会照提示把标记文件当备份导入，得到「没有可恢复的数据」）。"""
+    import json as json_module
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    backup = Path(storage_dir) / "u-badmarker.json.corrupt-20260101000000000000-1"
+    backup.write_text('{"preferences": []}', encoding="utf-8")
+    marker = Path(storage_dir) / "u-badmarker.json.quarantine"
+    marker.write_text("{trunc", encoding="utf-8")
+
+    store = LongTermMemory("u-badmarker", storage_dir)
+    reported = store.get_recovered_corrupt_backup()
+    assert reported == str(backup), reported
+    assert store.get_fresh_quarantine_backup() == str(backup)
+    # 标记被重写为可用路径，后续实例直接命中
+    payload = json_module.loads(marker.read_text(encoding="utf-8"))
+    assert payload["backup"] == str(backup)
+
+    # 标记为目录（read_text 抛 OSError）同样回退真实备份
+    storage_dir2 = tempfile.mkdtemp()
+    backup2 = (
+        Path(storage_dir2) / "u-dirmarker.json.corrupt-20260101000000000000-2"
+    )
+    backup2.write_text("{}", encoding="utf-8")
+    (Path(storage_dir2) / "u-dirmarker.json.quarantine").mkdir()
+    store2 = LongTermMemory("u-dirmarker", storage_dir2)
+    assert store2.get_recovered_corrupt_backup() == str(backup2)
+    print("✓ 损坏的隔离标记回退真实备份")
+
+
+def test_load_transient_read_error_does_not_quarantine(monkeypatch):
+    """启动读取的瞬时 OSError（占用 / ACL / I-O）不能把完好文件隔离改名。"""
+    import builtins
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-locked.json"
+    seed = LongTermMemory("u-locked", storage_dir)
+    seed.save_preference("home_location", "北京")
+
+    real_open = builtins.open
+    state = {"fail": True}
+
+    def flaky_open(file, mode="r", *args, **kwargs):
+        if state["fail"] and str(file) == str(path) and "r" in mode:
+            raise PermissionError("[Errno 13] Permission denied")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    with pytest.raises(MemoryPersistenceError) as info:
+        LongTermMemory("u-locked", storage_dir)
+    assert "长期记忆暂时不可读" in str(info.value), str(info.value)
+    state["fail"] = False
+    assert path.exists(), "读失败不能把主文件改名隔离"
+    assert not list(Path(storage_dir).glob("*corrupt*"))
+    assert not (Path(storage_dir) / "u-locked.json.quarantine").exists()
+    fresh = LongTermMemory("u-locked", storage_dir)
+    assert fresh.get_preference("home_location") == "北京"
+    print("✓ 启动读失败不隔离完好文件")
+
+
+def test_pending_recheck_read_error_keeps_file(monkeypatch):
+    """pending 状态的写前复核遇到 OSError：拒绝写入、保留 pending，
+    不得把有效文件当损坏隔离。"""
+    import builtins
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-pend.json"
+    seed = LongTermMemory("u-pend", storage_dir)
+    seed.save_preference("home_location", "北京")
+
+    store = LongTermMemory("u-pend", storage_dir)
+    store._corrupt_pending = True  # noqa: SLF001 - 直接构造 pending 复核场景
+    real_open = builtins.open
+    state = {"fail": True}
+
+    def flaky_open(file, mode="r", *args, **kwargs):
+        if state["fail"] and str(file) == str(path) and "r" in mode:
+            raise PermissionError("[Errno 13] Permission denied")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    with pytest.raises(MemoryPersistenceError) as info:
+        store.save_preference("hotel_brands", ["汉庭"])
+    assert "长期记忆暂时不可读" in str(info.value), str(info.value)
+    state["fail"] = False
+    assert path.exists()
+    assert not list(Path(storage_dir).glob("*corrupt*"))
+    assert store.has_pending_corrupt_quarantine(), "pending 语义必须保留"
+    print("✓ 写前复核读失败不隔离有效文件")
+
+
+def test_pg_success_clears_json_quarantine_marker(monkeypatch):
+    """PostgreSQL 接管后 JSON 回退载体的隔离标记失效（备份保留）。"""
+    from config import STORAGE_CONFIG
+    from context import storage as storage_module
+
+    storage_dir = tempfile.mkdtemp()
+    marker = Path(storage_dir) / "u-pgswitch.json.quarantine"
+    marker.write_text("{}", encoding="utf-8")
+    backup = (
+        Path(storage_dir) / "u-pgswitch.json.corrupt-20260101000000000000-1"
+    )
+    backup.write_text("{}", encoding="utf-8")
+
+    class _FakePG:
+        def __init__(self, user_id, dsn):
+            self.user_id = user_id
+
+    monkeypatch.setattr(storage_module, "PostgresLongTermMemory", _FakePG)
+    monkeypatch.setattr(storage_module, "_failed_recently", lambda key: False)
+    monkeypatch.setitem(
+        STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@127.0.0.1:1/db"
+    )
+    monkeypatch.setitem(
+        storage_module._ACTUAL_BACKEND,
+        "long_term",
+        storage_module._ACTUAL_BACKEND.get("long_term"),
+    )
+    memory = storage_module.create_long_term_memory("u-pgswitch", storage_dir)
+    assert isinstance(memory, _FakePG)
+    assert not marker.exists(), "PG 接管后标记必须清除"
+    assert backup.exists(), "隔离备份保留供人工恢复"
+    print("✓ PG 接管清理 JSON 隔离标记")
 
 
 def test_delete_all_writes_tombstone_even_when_backup_removal_fails(monkeypatch):
@@ -4369,6 +4516,17 @@ if __name__ == "__main__":
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import asyncio
     import inspect
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
+    # 把清单截断在第一个用例；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     import pathlib
     import tempfile
 

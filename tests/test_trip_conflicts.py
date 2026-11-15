@@ -212,7 +212,7 @@ def test_find_saved_trip_distinguishes_origin():
     print("✓ find_saved_trip 按出发地精确匹配")
 
 
-def test_inverted_date_range_is_logged(caplog=None):
+def test_inverted_date_range_is_logged(caplog):
     """返程早于出发的历史数据静默截成单日，但必须留下告警。"""
     import logging
 
@@ -224,12 +224,9 @@ def test_inverted_date_range_is_logged(caplog=None):
         "start_date": "2026-03-18",
         "end_date": "2026-03-11",
     }
-    if caplog is not None:
-        with caplog.at_level(logging.WARNING):
-            interval = trip_interval(trip)
-        assert "早于出发日期" in caplog.text
-    else:
+    with caplog.at_level(logging.WARNING):
         interval = trip_interval(trip)
+    assert "早于出发日期" in caplog.text
     assert interval is not None
     assert interval[0] == interval[1]
     print("✓ 倒置日期区间记录告警")
@@ -280,5 +277,6 @@ if __name__ == "__main__":
     test_conflicts_capped_with_exact_count()
     test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
-    test_inverted_date_range_is_logged()
+    # 需 pytest caplog 夹具，直跑清单不覆盖：
+    # test_inverted_date_range_is_logged()
     print("\n全部通过")

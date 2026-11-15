@@ -2618,7 +2618,7 @@ def _isolated_results():
     ]
 
 
-def test_update_memory_isolates_preference_failures(caplog=None):
+def test_update_memory_isolates_preference_failures(caplog):
     """单条偏好写入失败只跳过该条，其余偏好与同一轮行程照常落库。"""
     import logging
 
@@ -2643,16 +2643,11 @@ def test_update_memory_isolates_preference_failures(caplog=None):
 
     memory = _StubMemory()
     memory.long_term = _FailingPrefs(memory.long_term)
-    if caplog is not None:
-        with caplog.at_level(logging.WARNING):
-            OrchestrationAgent(
-                agent_registry={}, memory_manager=memory
-            )._update_memory({}, _isolated_results())
-        assert "保存偏好失败" in caplog.text
-    else:
+    with caplog.at_level(logging.WARNING):
         OrchestrationAgent(
             agent_registry={}, memory_manager=memory
         )._update_memory({}, _isolated_results())
+    assert "保存偏好失败" in caplog.text
 
     prefs = memory.long_term.inner.get_preference()
     assert prefs.get("home_location") == ["上海"]
@@ -2687,7 +2682,7 @@ def test_update_memory_skips_failed_event_collection():
     print("✓ 失败的事项收集不写入行程")
 
 
-def test_update_memory_isolates_trip_save_failure(caplog=None):
+def test_update_memory_isolates_trip_save_failure(caplog):
     """行程写入失败：记录告警，同轮偏好照常落库（不中断整轮）。"""
     import logging
 
@@ -2708,12 +2703,9 @@ def test_update_memory_isolates_trip_save_failure(caplog=None):
     orchestrator = OrchestrationAgent(
         agent_registry={}, memory_manager=memory
     )
-    if caplog is not None:
-        with caplog.at_level(logging.WARNING):
-            orchestrator._update_memory({}, _isolated_results())
-        assert "保存行程失败" in caplog.text
-    else:
+    with caplog.at_level(logging.WARNING):
         orchestrator._update_memory({}, _isolated_results())
+    assert "保存行程失败" in caplog.text
     prefs = memory.long_term.get_preference()
     assert prefs.get("airlines") == ["东航"], "行程失败不能中断同轮偏好写入"
     assert prefs.get("hotel_brands") == ["汉庭"], prefs
@@ -3151,9 +3143,11 @@ if __name__ == "__main__":
     test_agent_load_runs_in_dedicated_executor()
     test_rag_load_uses_isolated_executor()
     test_rag_load_executor_accepts_standard_name()
-    test_update_memory_isolates_preference_failures()
+    # 需 pytest caplog 夹具，直跑清单不覆盖：
+    # test_update_memory_isolates_preference_failures()
     test_update_memory_skips_failed_event_collection()
-    test_update_memory_isolates_trip_save_failure()
+    # 需 pytest caplog 夹具，直跑清单不覆盖：
+    # test_update_memory_isolates_trip_save_failure()
     test_update_memory_derives_end_date_from_duration()
     test_trip_save_does_not_overwrite_purpose_with_default()
     test_preference_single_object_is_wrapped()
