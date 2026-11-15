@@ -330,7 +330,7 @@ def test_count_ics_events_unfolds_before_counting():
     print("✓ ICS 事件计数先展开折行再按整行匹配")
 
 
-def test_ics_unparsable_end_warns(caplog=None):
+def test_ics_unparsable_end_warns(caplog):
     """返程日期无法解析：日历按单日导出，但必须留告警（不再静默截断）。"""
     import logging
 
@@ -344,12 +344,9 @@ def test_ics_unparsable_end_warns(caplog=None):
         "end_date": "2026/12/20",
     }
     assert trip_ics_end_unparsable(trip)
-    if caplog is not None:
-        with caplog.at_level(logging.WARNING):
-            text = render_trips_ics([trip], "u1")
-        assert "无法解析" in caplog.text
-    else:
+    with caplog.at_level(logging.WARNING):
         text = render_trips_ics([trip], "u1")
+    assert "无法解析" in caplog.text
     assert "DTSTART;VALUE=DATE:20261205" in text
     assert "DTEND;VALUE=DATE:20261206" in text
     print("✓ 返程日期无法解析时告警并按单日导出")
@@ -399,6 +396,7 @@ if __name__ == "__main__":
     test_render_strips_controls_and_surrogates()
     test_html_table_wraps_long_unbroken_fields()
     test_count_ics_events_unfolds_before_counting()
-    test_ics_unparsable_end_warns()
+    # 需 pytest caplog 夹具，直跑清单不覆盖：
+    # test_ics_unparsable_end_warns()
     test_export_strips_unicode_line_separators_and_counts_events()
     print("\n全部通过")

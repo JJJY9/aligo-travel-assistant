@@ -12,6 +12,7 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from config import STORAGE_CONFIG
@@ -204,6 +205,22 @@ def create_short_term_memory(
     return ShortTermMemory(max_turns=max_turns)
 
 
+def _clear_json_quarantine_marker(user_id: str, storage_path: str) -> None:
+    """PostgreSQL 成功接管后清理 JSON 回退载体的隔离标记。
+
+    标记是「JSON 回退文件刚被隔离」的跨实例证据；权威数据在 PostgreSQL
+    时它只会让之后每次 PG 故障把账号整账号 503（且恢复入口同样不可用，
+    提示的恢复动作无从执行）。``.corrupt-*`` 备份保留，供人工恢复。
+    """
+    try:
+        storage = Path(storage_path)
+        if not storage.is_absolute():
+            storage = Path(__file__).resolve().parent.parent / storage
+        (storage / f"{user_id}.json.quarantine").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def create_long_term_memory(
     user_id: str,
     storage_path: str = "data/memory",
@@ -251,6 +268,7 @@ def create_long_term_memory(
         try:
             memory = PostgresLongTermMemory(user_id, dsn)
             _ACTUAL_BACKEND["long_term"] = "postgres"
+            _clear_json_quarantine_marker(user_id, storage_path)
             logger.info("PostgreSQL 长期记忆已启用")
             return memory
         except Exception as exc:  # noqa: BLE001 - 连接失败回退

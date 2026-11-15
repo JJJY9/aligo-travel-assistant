@@ -2486,6 +2486,75 @@ def test_merged_statistics_trip_number_raised(monkeypatch):
     print("✓ 合并预演抬升 trip_id 水位（占位不参与）")
 
 
+def test_merged_message_rows_timestamp_backend_shape(monkeypatch):
+    """缺时间戳消息的合并占位按后端导出形状：PG 32 字符、JSON 26。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    def make_store(snapshot_based):
+        class _Store:
+            pass
+
+        store = _Store()
+        store.snapshot_based = snapshot_based
+        store.export_snapshot = lambda: {
+            "chat_history": [],
+            "trip_history": [],
+            "preferences": {},
+            "session_titles": {},
+            "pinned_sessions": [],
+            "archived_sessions": [],
+            "statistics": {},
+        }
+        return store
+
+    incoming = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "hi",
+                "session_id": "s1",
+                "timestamp": None,
+            }
+        ]
+    }
+    module.merged_backup_limit_problem(make_store(False), incoming)
+    pg_row = captured["payload"]["chat_history"][0]
+    assert len(pg_row["timestamp"]) == 32, pg_row["timestamp"]
+
+    module.merged_backup_limit_problem(make_store(True), incoming)
+    json_row = captured["payload"]["chat_history"][0]
+    assert len(json_row["timestamp"]) == 26, json_row["timestamp"]
+    print("✓ 合并预演消息时间戳按后端形状占位")
+
+
+def test_sections_limit_counts_missing_timestamps_as_export_shape(monkeypatch):
+    """备份自身体积预检：缺时间戳行按导出端带时区时间戳计（不是 null）。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    module.sections_limit_problem(
+        {"messages": [{"role": "user", "content": "x", "timestamp": None}]}
+    )
+    row = captured["payload"]["chat_history"][0]
+    assert isinstance(row["timestamp"], str), row
+    assert len(row["timestamp"]) == 32, row["timestamp"]
+    print("✓ 备份自身体积预检按导出时间戳形状计")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""
@@ -2655,6 +2724,17 @@ if __name__ == "__main__":
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
     import asyncio
     import inspect
+    import sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
+    # 把清单截断在第一个用例；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     import pathlib
     import tempfile
 

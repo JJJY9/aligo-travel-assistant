@@ -461,7 +461,9 @@ def merged_backup_limit_problem(
         {
             "chat_history": existing_messages
             + _new_message_rows(
-                existing_messages, sections.get("messages") or []
+                existing_messages,
+                sections.get("messages") or [],
+                pg_shape=not getattr(store, "snapshot_based", False),
             ),
             "trip_history": _merged_trip_rows(
                 list(existing.get("trip_history") or []),
@@ -543,15 +545,27 @@ def merged_backup_limit_problem(
 
 
 def _new_message_rows(
-    existing_rows: list[Any], messages: list[Any]
+    existing_rows: list[Any],
+    messages: list[Any],
+    *,
+    pg_shape: bool = False,
 ) -> list[Any]:
     """按写入层去重语义挑出备份里真正会新增的消息行。
 
     复用合并复核已经取得的现有快照（不再整表重读，避免后台两次读取
     不是同一快照）；快照读不到时调用方退回只查备份自身。
+
+    缺时间戳且同会话无锚点的消息按落库后的导出形状占位：PostgreSQL
+    落库经 ``_pg_timestamp`` 带时区偏移（32 字符），按 naive 26 字符
+    计会低估导出体积（上限附近可放行「恢复后永久 413」的备份）。
     """
     if not messages:
         return []
+    fallback = (
+        datetime.now().astimezone().isoformat(timespec="microseconds")
+        if pg_shape
+        else datetime.now().isoformat(timespec="microseconds")
+    )
     existing = Counter(
         (
             _message_session_key(message.get("session_id")),
@@ -561,7 +575,11 @@ def _new_message_rows(
         for message in existing_rows
         if isinstance(message, dict)
     )
-    return list(filter_import_messages(prepare_import_messages(messages), existing))
+    return list(
+        filter_import_messages(
+            prepare_import_messages(messages, now=fallback), existing
+        )
+    )
 
 
 def _trip_merge_key(row: dict[str, Any]) -> Any:
@@ -620,10 +638,13 @@ def _merged_trip_rows(
         record.setdefault("trip_id", "trip_" + "9" * 19)
         if include_empty_keys:
             record.setdefault(
-                "timestamp", datetime.now().astimezone().isoformat()
+                "timestamp",
+                datetime.now().astimezone().isoformat(timespec="microseconds"),
             )
         else:
-            record.setdefault("timestamp", datetime.now().isoformat())
+            record.setdefault(
+                "timestamp", datetime.now().isoformat(timespec="microseconds")
+            )
         if include_empty_keys:
             # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也
             # 序列化）；JSON 后端没有这两个键
@@ -651,6 +672,22 @@ def _merge_trip_row(
     return merged
 
 
+def _export_shape_messages(messages: list[Any]) -> list[Any]:
+    """备份自身体积预检也按落库后的导出行形状计。
+
+    缺 / 空时间戳的行落库后导出为带时区时间戳（PG 32 字符；JSON 为
+    26 字符），按 ``"timestamp": null``（4 字节）会低估导出体积。
+    """
+    fallback = datetime.now().astimezone().isoformat(timespec="microseconds")
+    rows: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and not message.get("timestamp"):
+            rows.append({**message, "timestamp": fallback})
+        else:
+            rows.append(message)
+    return rows
+
+
 def sections_limit_problem(sections: dict[str, Any]) -> str | None:
     """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
 
@@ -662,7 +699,9 @@ def sections_limit_problem(sections: dict[str, Any]) -> str | None:
     if not isinstance(sections, dict):
         return None
     payload = {
-        "chat_history": sections.get("messages") or [],
+        "chat_history": _export_shape_messages(
+            sections.get("messages") or []
+        ),
         "trip_history": sections.get("trips") or [],
         "preferences": sections.get("preferences") or {},
         "knowledge": sections.get("knowledge") or [],
