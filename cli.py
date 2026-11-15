@@ -3155,16 +3155,19 @@ def run_user_import_standalone(
             close()
 
     knowledge_error = str(counts.pop("knowledge_error", "") or "")
+    incomplete = bool(counts.pop("recovery_incomplete", False))
+    ok = not knowledge_error and not incomplete
     if as_json:
         print(
             json.dumps(
                 {
-                    "ok": not knowledge_error,
+                    "ok": ok,
                     "user_id": user_id,
                     "path": json_path,
                     "dry_run": dry_run,
                     "skip_knowledge": skip_knowledge,
                     **counts,
+                    **({"recovery_incomplete": True} if incomplete else {}),
                     **({"knowledge_error": knowledge_error} if knowledge_error else {}),
                     "skipped": errors,
                 },
@@ -3193,9 +3196,14 @@ def run_user_import_standalone(
         print(summary)
         if knowledge_error:
             print(f"❌ {knowledge_error}（用户数据已恢复，可稍后重跑补齐知识片段）")
+        if incomplete:
+            print(
+                "⚠ 用户数据未恢复：本次备份没有可写回的用户数据，"
+                "账号仍处于记忆隔离状态；请使用含偏好 / 行程 / 消息的备份重试"
+            )
         for error in errors[:10]:
             print(f"  跳过：{_plain_safe(error)}")
-    return 1 if knowledge_error else 0
+    return 0 if ok else 1
 
 
 def _parse_kb_write_args(

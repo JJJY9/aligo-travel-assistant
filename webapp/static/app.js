@@ -1832,6 +1832,11 @@ async function importUserBackup() {
       // 计时，恢复计数摘要永远不会显示，只剩知识片段失败提示
       restoreMessage += `；知识片段未恢复：${result.knowledge_error}`;
     }
+    if (result.recovery_incomplete) {
+      // 隔离账号 + 备份无可写回的用户数据：不能显示为恢复成功
+      restoreMessage +=
+        "；⚠ 用户数据未恢复：备份中没有可写回的用户数据，账号仍处于记忆隔离状态，请使用含偏好 / 行程 / 消息的备份重试";
+    }
     if (state.userId !== targetUser) {
       // 合并成一条：同一 tick 的第二次 toast 会覆盖计数摘要
       restoreMessage +=

@@ -3328,6 +3328,130 @@ def test_merged_knowledge_increment_guard_preserved(monkeypatch):
     print("✓ 合规知识库的增量越限仍被拒绝")
 
 
+def test_merged_knowledge_baseline_uses_full_export_shape(monkeypatch):
+    """知识轴的基线是「导入前完整导出形状」（存量 + 现有库）：库单独合规
+    但两者合计已超限时，任何恢复都无法更糟，不得据此拒绝用户数据；
+    用户数据轴仍照常复核。"""
+    from utils import user_import as module
+    import utils.knowledge_admin as kb
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 8000)
+    kb_rows = [
+        {"content": "k" * 300, "metadata": {"part": "1", "parts": "1"}}
+        for _ in range(6)
+    ]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(kb_rows)
+    )
+    monkeypatch.setattr(kb, "import_documents", _fake_knowledge_planner([]))
+    messages = [
+        {
+            "role": "user",
+            "content": "m" * 300,
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00.000000",
+        }
+        for _ in range(14)
+    ]
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": list(messages),
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    # 库单独合规、合计超限
+    assert module.backup_limit_problem({"knowledge": list(kb_rows)}) is None
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"preferences": {"home_location": "北京"}}
+        )
+        is None
+    )
+    # 幂等重导自身备份（消息全部命中去重、零写入）同样放行
+    idempotent = {"messages": [dict(message) for message in messages]}
+    assert module.merged_backup_limit_problem(_Store(), idempotent) is None
+    print("✓ 知识轴基线按导入前完整导出形状判定")
+
+
+def test_merged_knowledge_size_axis_baseline(monkeypatch):
+    """基线的尺寸轴：知识库单独超过（按导出格式）体积上限时跳过知识轴。"""
+    from utils import user_import as module
+    import utils.knowledge_admin as kb
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 2000)
+    kb_rows = [
+        {"content": "k" * 700, "metadata": {}} for _ in range(5)
+    ]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(kb_rows)
+    )
+    monkeypatch.setattr(kb, "import_documents", _fake_knowledge_planner([]))
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    assert module.backup_limit_problem({"knowledge": list(kb_rows)}) is not None
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"preferences": {"home_location": "北京"}}
+        )
+        is None
+    )
+    print("✓ 知识轴尺寸基线超限时跳过")
+
+
+def test_user_import_warns_when_quarantined_and_no_user_data(monkeypatch):
+    """隔离账号 + 备份无可写回用户数据：CLI ok=false、退出码 1 并明确
+    提示账号仍处隔离态（不能报告为恢复成功）。"""
+    from pathlib import Path as pathlib_path
+
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_incomplete_")
+    leftover = (
+        pathlib_path(storage_dir)
+        / "u-inc.json.corrupt-20260101000000000000-9"
+    )
+    leftover.write_text("{}", encoding="utf-8")
+    store = LongTermMemory("u-inc", storage_dir, allow_quarantined=True)
+    assert store.get_recovered_corrupt_backup()
+    path = _write_json(
+        {
+            "chat_history": [
+                {"role": "user", "content": "x", "session_id": "export"}
+            ]
+        }
+    )
+    code, out = _run_import(monkeypatch, "u-inc", path, store)
+    assert code == 1, (code, out)
+    assert "用户数据未恢复" in out, out
+    code, out = _run_import(monkeypatch, "u-inc", path, store, as_json=True)
+    payload = json.loads(out)
+    assert code == 1 and payload["ok"] is False, payload
+    assert payload.get("recovery_incomplete") is True, payload
+    print("✓ 隔离账号空恢复 CLI 报告未完成")
+
+
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
     """合并体积复核以现有快照为底：statistics 等额外字段同样计入
     （真实 /api/export 会带上它们，缺失会让预演偏乐观）。"""
@@ -3544,8 +3668,20 @@ if __name__ == "__main__":
             if fixture is not None:
                 fixture.undo()
             skipped += 1
-            skipped_names.append(name)
+            skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
+        kb_fixture: pytest.MonkeyPatch | None = None
+        try:
+            from utils import user_import as _ui_for_kb
+
+            kb_fixture = pytest.MonkeyPatch()
+            kb_fixture.setattr(
+                _ui_for_kb, "_existing_knowledge_rows", lambda: []
+            )
+        except Exception:  # noqa: BLE001 - 模块不可用时不补丁
+            if kb_fixture is not None:
+                kb_fixture.undo()
+            kb_fixture = None
         storage_snapshot: dict | None = None
         try:
             from config import STORAGE_CONFIG
@@ -3561,9 +3697,9 @@ if __name__ == "__main__":
             else:
                 func(**kwargs)
             ran += 1
-        except pytest.skip.Exception:
+        except pytest.skip.Exception as exc:
             skipped += 1
-            skipped_names.append(name)
+            skipped_names.append(f"{name}（条件跳过：{exc}）")
         finally:
             if caplog_shim is not None:
                 caplog_shim.close()
@@ -3577,13 +3713,15 @@ if __name__ == "__main__":
                 _cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
+            if kb_fixture is not None:
+                kb_fixture.undo()
     total = sum(
         1
         for name, func in globals().items()
         if name.startswith("test_") and callable(func)
     )
     if skipped_names:
-        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
+        print("直跑跳过：" + "、".join(skipped_names))
     print(
         f"\n全部通过（{ran}/{total} 个用例；"
         f"{skipped} 个需 pytest 专用夹具或按条件跳过）"

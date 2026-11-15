@@ -6067,10 +6067,11 @@ def create_app(model: Any = None) -> FastAPI:
                     raise HTTPException(
                         status_code=503, detail="恢复失败，请稍后重试"
                     ) from exc
-            # 知识片段恢复失败视为恢复未完成（与 CLI ok=false/退出码 1
-            # 同口径）：账号可能仍处于隔离态、用户数据未必恢复
+            # 知识片段恢复失败 / 隔离账号未写回任何用户数据（主文件未
+            # 重建）都视为恢复未完成（与 CLI ok=false/退出码 1 同口径）
             return {
-                "ok": not counts.get("knowledge_error"),
+                "ok": not counts.get("knowledge_error")
+                and not counts.get("recovery_incomplete"),
                 "dry_run": dry_run,
                 **counts,
                 "skipped": errors,
