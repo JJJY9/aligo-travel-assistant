@@ -398,15 +398,37 @@ class LongTermMemory:
         大小写不敏感文件系统上 ``alice.json`` 可能就是 ``Alice.json``：
         隔离改名必须沿用磁盘上的真实大小写，否则备份名会把「谁先发现」
         误当成账号归属（恢复入口随后会被错误的归属校验锁死）。
+
+        精确同名优先：大小写敏感文件系统上 ``alice`` / ``Alice`` 可以是
+        两个独立账号，scandir 顺序未定义——先命中的大小写变体不能被
+        当成本文件的真实名（否则隔离改名会把备份写到对方名下，本账号
+        随后被归属校验永久拒绝，对方还能把它当自己的备份删掉）。
         """
         directory = os.path.dirname(self.db_path) or "."
+        fallback: str | None = None
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if entry.name.casefold() == name.casefold():
+                    if entry.name == name:
                         return entry.name
+                    if (
+                        fallback is None
+                        and entry.name.casefold() == name.casefold()
+                    ):
+                        fallback = entry.name
         except OSError:
             pass
+        if fallback is not None:
+            # 大小写不敏感别名：确认指向的就是本实例的文件（同目录下
+            # 另一个独立账号的变体文件不能被采用）
+            candidate = os.path.join(directory, fallback)
+            target = os.path.join(directory, name)
+            try:
+                if os.path.samefile(candidate, target):
+                    return fallback
+            except OSError:
+                pass
+            return name
         return name
 
     def _quarantine_marker_path(self) -> Path:

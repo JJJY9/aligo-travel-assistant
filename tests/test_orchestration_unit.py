@@ -3092,95 +3092,85 @@ if __name__ == "__main__":
                 _reconfigure(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         pass
-    test_priority_parallel_and_sequential()
-    test_previous_results_passed_to_next_priority()
-    test_failure_aggregated_as_partial_failure()
-    test_agent_duration_and_progress_events()
-    test_unregistered_agent_reports_error()
-    test_run_agent_reraised_llm_errors_feed_breaker()
-    test_parallel_batch_reraises_llm_errors()
-    test_parallel_batch_non_llm_errors_stay_redacted()
-    test_reply_clears_stale_deferred_memory()
-    test_commit_deferred_memory_single_flight()
-    test_update_memory_key_entities_date_duration_fallback()
-    test_update_memory_rejects_inverted_and_placeholder_dates()
-    test_update_memory_backfills_origin_on_existing_trip()
-    test_retry_cache_does_not_cache_error_results()
-    test_commit_deferred_memory_commits_payload_after_waiting()
-    test_update_memory_backfills_end_date_instead_of_duplicate()
-    test_previous_preferences_context_skips_explanatory_keys()
-    test_agent_load_executors_are_daemon_and_unregistered()
-    test_agent_status_error_and_null_error()
-    test_nested_query_failure_is_reported_as_error()
-    test_transient_nested_error_triggers_retry()
-    test_malformed_schedule_is_sanitized()
-    test_registry_load_failure_reports_agent_error()
-    test_failed_itinerary_is_not_saved_as_trip()
-    test_skill_folder_names_are_canonicalized()
-    test_skill_names_resolve_case_insensitively()
-    test_legacy_name_variants_dedupe_and_planning_floor()
-    test_preference_name_variants_persist_and_dedupe()
-    test_agent_result_surrogates_sanitized_before_persist()
-    test_preference_payload_with_extra_keys_does_not_write_garbage()
-    test_deferred_memory_only_written_after_commit()
-    test_memory_update_preference_and_trip()
-    test_update_memory_legacy_dict_skips_explanatory_keys()
-    test_memory_update_legacy_preferences_and_custom_backend()
-    test_failed_preference_result_not_persisted()
-    test_trip_destination_list_saved_as_text()
-    _mp_retry = pytest.MonkeyPatch()
-    try:
-        test_transient_error_json_triggers_retry(_mp_retry)
-    finally:
-        _mp_retry.undo()
-    test_memory_io_runs_off_event_loop()
-    test_prepare_context_includes_user_query()
-    test_planning_runs_after_collection_and_sees_new_preferences()
-    test_preference_append_action_variants()
-    test_infinite_priority_is_sanitized()
-    test_partial_failure_does_not_trip_breaker()
-    test_previous_preference_append_flattens_list()
-    test_schedule_names_are_trimmed()
-    test_duplicate_schedule_agents_deduped()
-    test_frontmatter_alias_dedupes_with_directory_name()
-    test_failed_preference_not_merged_into_later_context()
-    test_preference_non_string_type_skipped()
-    test_context_merge_skips_non_string_pref_type()
-    test_trip_without_start_date_not_saved()
-    test_trip_destination_dict_uses_scalar_field()
-    test_data_data_nested_preferences_unpacked()
-    test_unmanageable_preference_types_skipped_everywhere()
-    test_reply_input_edges_and_registry_management()
-    test_agent_load_runs_in_dedicated_executor()
-    test_rag_load_uses_isolated_executor()
-    test_rag_load_executor_accepts_standard_name()
-    # 日志断言用例：直跑用 caplog 替身真正执行（pytest 夹具只在 pytest
-    # 内注入，注释掉会让告警回归在直跑清单上无覆盖）
-    import _caplog_shim
 
-    _shim = _caplog_shim.CaplogShim()
-    try:
-        test_update_memory_isolates_preference_failures(_shim)
-        test_update_memory_isolates_trip_save_failure(_shim)
-    finally:
-        _shim.close()
-    test_update_memory_skips_failed_event_collection()
-    test_update_memory_derives_end_date_from_duration()
-    test_trip_save_does_not_overwrite_purpose_with_default()
-    test_preference_single_object_is_wrapped()
-    test_trip_origin_backfilled_from_existing_trip()
-    test_trip_duration_overflow_does_not_abort_turn()
-    test_trip_saved_from_intention_entities_when_event_empty()
-    test_model_output_nul_stripped_before_memory()
-    test_agent_failure_message_redacts_internal_paths()
-    _mp_load = pytest.MonkeyPatch()
-    try:
-        test_agent_load_timeout_is_bounded(_mp_load)
-    finally:
-        _mp_load.undo()
-    _mp_transient = pytest.MonkeyPatch()
-    try:
-        test_transient_error_json_does_not_escape_for_breaker(_mp_transient)
-    finally:
-        _mp_transient.undo()
-    print("\n全部通过")
+    # 自动发现：手写清单曾漏登记 12 个用例（其中 9 个无需任何夹具）
+    # 却仍打印「全部通过」；caplog 用直跑替身真正执行，其余需 pytest
+    # 专用夹具的用例计入跳过并列出名单
+    import asyncio
+    import inspect
+    import pathlib
+    import tempfile
+
+    ran = 0
+    skipped = 0
+    skipped_names: list[str] = []
+    for name, func in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(func):
+            continue
+        params = inspect.signature(func).parameters
+        fixture = None
+        caplog_shim = None
+        kwargs: dict = {}
+        unsupported = False
+        for param, spec in params.items():
+            if param == "monkeypatch":
+                fixture = pytest.MonkeyPatch()
+                kwargs[param] = fixture
+            elif param == "tmp_path":
+                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+            elif param == "caplog":
+                import _caplog_shim
+
+                caplog_shim = _caplog_shim.CaplogShim()
+                kwargs[param] = caplog_shim
+            else:
+                unsupported = True
+                break
+        if unsupported:
+            if caplog_shim is not None:
+                caplog_shim.close()
+            if fixture is not None:
+                fixture.undo()
+            skipped += 1
+            skipped_names.append(name)
+            continue
+        storage_snapshot: dict | None = None
+        try:
+            from config import STORAGE_CONFIG
+
+            storage_snapshot = dict(STORAGE_CONFIG)
+        except Exception:  # noqa: BLE001 - 配置不可用时不快照
+            storage_snapshot = None
+        try:
+            if inspect.iscoroutinefunction(func):
+                asyncio.run(func(**kwargs))
+            else:
+                func(**kwargs)
+            ran += 1
+        except pytest.skip.Exception:
+            skipped += 1
+            skipped_names.append(name)
+        finally:
+            if caplog_shim is not None:
+                caplog_shim.close()
+            if storage_snapshot is not None:
+                from typing import cast
+
+                from config import STORAGE_CONFIG
+
+                _cfg = cast(dict, STORAGE_CONFIG)
+                _cfg.clear()
+                _cfg.update(storage_snapshot)
+            if fixture is not None:
+                fixture.undo()
+    total = sum(
+        1
+        for name, func in globals().items()
+        if name.startswith("test_") and callable(func)
+    )
+    if skipped_names:
+        print("直跑跳过（需 pytest 专用夹具）：" + "、".join(skipped_names))
+    print(
+        f"\n全部通过（{ran}/{total} 个用例；"
+        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
+    )

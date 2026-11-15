@@ -294,6 +294,8 @@ if __name__ == "__main__":
     _shim = _caplog_shim.CaplogShim()
     try:
         test_inverted_date_range_is_logged(_shim)
+        # 此前漏登记：同一文件的另一个日志用例在直跑时从未执行
+        test_trip_interval_warns_once_per_bad_value(_shim)
     finally:
         _shim.close()
     print("\n全部通过")

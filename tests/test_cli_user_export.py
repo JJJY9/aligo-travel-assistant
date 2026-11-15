@@ -331,6 +331,9 @@ if __name__ == "__main__":
         test_user_export_scans_existing_quarantine_backups(
             mp, Path(tempfile.mkdtemp())
         )
+        # 重绑前必须撤销上一个实例：否则 storage.create_long_term_memory
+        # 的补丁泄漏到脚本新建的任何存储实例
+        mp.undo()
         # 每个用例独立的 MonkeyPatch：共用实例会让 _MAX_MESSAGES=1
         # 泄漏到下一个用例（写入失败用例被超限文案顶掉）
         mp = pytest.MonkeyPatch()
