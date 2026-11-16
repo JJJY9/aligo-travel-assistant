@@ -364,21 +364,53 @@ def _assistant_content_problem(content: str) -> str | None:
     return _non_finite_in_value(meta)
 
 
-def _count_limit_problem(backup: dict[str, Any]) -> str | None:
-    """条数轴上限（与导入侧硬上限完全一致）；体积轴另有口径。"""
+def _limit_problems(backup: dict[str, Any]) -> list[tuple[str, str]]:
+    """按轴列出导入上限问题（条数在前、体积在后）。
+
+    轴名用于「导入前基线已超限」豁免：同一轴在导入前已越限时，任何恢复
+    都无法让账号在该轴上更糟，不再作为拒绝理由；不同轴互不豁免
+    （存量消息超限不能放行把偏好推过上限的备份）。
+    """
+    problems: list[tuple[str, str]] = []
     messages = backup.get("chat_history")
     if isinstance(messages, list) and len(messages) > _MAX_MESSAGES:
-        return f"消息 {len(messages)} 条超过导入上限 {_MAX_MESSAGES}"
+        problems.append(
+            (
+                "messages",
+                f"消息 {len(messages)} 条超过导入上限 {_MAX_MESSAGES}",
+            )
+        )
     trips = backup.get("trip_history")
     if isinstance(trips, list) and len(trips) > _MAX_TRIPS:
-        return f"行程 {len(trips)} 条超过导入上限 {_MAX_TRIPS}"
+        problems.append(
+            ("trips", f"行程 {len(trips)} 条超过导入上限 {_MAX_TRIPS}")
+        )
     preferences = backup.get("preferences")
     if isinstance(preferences, (dict, list)) and len(preferences) > _MAX_PREFERENCES:
-        return f"偏好 {len(preferences)} 条超过导入上限 {_MAX_PREFERENCES}"
+        problems.append(
+            (
+                "preferences",
+                f"偏好 {len(preferences)} 条超过导入上限 {_MAX_PREFERENCES}",
+            )
+        )
     knowledge = backup.get("knowledge")
     if isinstance(knowledge, list) and len(knowledge) > _MAX_KNOWLEDGE:
-        return f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}"
-    return None
+        problems.append(
+            (
+                "knowledge",
+                f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}",
+            )
+        )
+    size = _backup_payload_size(backup)
+    if size > MAX_BACKUP_BYTES:
+        problems.append(
+            (
+                "size",
+                f"约 {size / (1024 * 1024):.1f} MB 超过导入上限 "
+                f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB",
+            )
+        )
+    return problems
 
 
 def _backup_payload_size(backup: dict[str, Any]) -> int:
@@ -405,16 +437,30 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     """
     if not isinstance(backup, dict):
         return None
-    problem = _count_limit_problem(backup)
-    if problem is not None:
-        return problem
-    size = _backup_payload_size(backup)
-    if size > MAX_BACKUP_BYTES:
-        return (
-            f"约 {size / (1024 * 1024):.1f} MB 超过导入上限 "
-            f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
-        )
-    return None
+    problems = _limit_problems(backup)
+    return problems[0][1] if problems else None
+
+
+def _store_export_snapshot(store: Any) -> dict[str, Any] | None:
+    """账号现有数据的导出形状快照；读取失败返回 None。
+
+    None 表示「无法确定导入前基线」：调用方保持原严格口径（不做基线
+    豁免），而不是把读取失败当成「账号未超限」放行。
+    """
+    try:
+        if callable(getattr(store, "export_snapshot", None)):
+            snapshot = store.export_snapshot() or {}
+            return snapshot if isinstance(snapshot, dict) else None
+        return {
+            "preferences": store.get_preference() or {},
+            "trip_history": store.get_trip_history(limit=None) or [],
+            "chat_history": store.get_chat_history() or [],
+            "session_titles": store.get_session_titles() or {},
+            "pinned_sessions": store.get_pinned_sessions() or [],
+            "archived_sessions": store.get_archived_sessions() or [],
+        }
+    except Exception:  # noqa: BLE001 - 读不到现存数据时退回只查备份自身
+        return None
 
 
 def merged_backup_limit_problem(
@@ -432,19 +478,8 @@ def merged_backup_limit_problem(
     """
     if not isinstance(sections, dict):
         return None
-    try:
-        if callable(getattr(store, "export_snapshot", None)):
-            existing = store.export_snapshot() or {}
-        else:
-            existing = {
-                "preferences": store.get_preference() or {},
-                "trip_history": store.get_trip_history(limit=None) or [],
-                "chat_history": store.get_chat_history() or [],
-                "session_titles": store.get_session_titles() or {},
-                "pinned_sessions": store.get_pinned_sessions() or [],
-                "archived_sessions": store.get_archived_sessions() or [],
-            }
-    except Exception:  # noqa: BLE001 - 读不到现存数据时退回只查备份自身
+    existing = _store_export_snapshot(store)
+    if existing is None:
         return sections_limit_problem(
             sections, pg_shape=not getattr(store, "snapshot_based", False)
         )
@@ -564,18 +599,23 @@ def merged_backup_limit_problem(
     problem = backup_limit_problem(payload)
     if problem is None:
         return None
-    # 用户数据轴的导入前基线：存量账号自身（不含知识库）按导出格式已
-    # 超限时——正常聊天积累到 50MB 以上的账号——任何恢复都无法让它更糟，
-    # 体积轴不再作为拒绝理由（否则该账号连幂等重导自身备份都会被 413，
-    # 完全无法换机 / 恢复）。条数轴照常生效：把账号推过条数上限的备份
-    # （导入后永远无法导出）仍然拒绝。
-    baseline = _export_shape_baseline(existing, [])
-    if (
-        backup_limit_problem(baseline) is not None
-        and _count_limit_problem(payload) is None
-    ):
-        return None
-    return problem
+    # 用户数据轴的导入前基线：存量账号自身（不含知识库）已在某个轴
+    # 超限时——正常聊天积累到 50MB / 20 万条以上的账号——任何恢复都
+    # 无法让账号在该轴上更糟，该轴不再作为拒绝理由（否则账号连幂等
+    # 重导自身备份都会被 413，换机 / 恢复被完全封死）。不同轴互不豁免：
+    # 存量消息超限不能放行把偏好推过上限的备份；未超限的轴照常拦截
+    # 「恢复后永远无法导出」的增量。
+    baseline_axes = {
+        axis
+        for axis, _message in _limit_problems(
+            _export_shape_baseline(existing, [])
+        )
+    }
+    problems = _limit_problems(payload)
+    for axis, message in problems:
+        if axis not in baseline_axes:
+            return message
+    return problem if not problems else None
 
 
 def _new_message_rows(
@@ -910,7 +950,10 @@ def _export_shape_messages(
 
 
 def sections_limit_problem(
-    sections: dict[str, Any], *, pg_shape: bool = False
+    sections: dict[str, Any],
+    *,
+    pg_shape: bool = False,
+    existing: dict[str, Any] | None = None,
 ) -> str | None:
     """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
 
@@ -918,6 +961,11 @@ def sections_limit_problem(
     恢复成功，随后 user-export 按 indent=2 估算体积超限、永久拒绝导出——
     用户必须先删数据才能再备份。这里把可恢复段按导出形状重新组装后复用
     :func:`backup_limit_problem` 的同一口径（与 Web /api/import 一致）。
+
+    ``existing`` 为账号现有数据的导出形状快照：导入前基线已在某个轴
+    超限时该轴不再作为拒绝理由（与 :func:`merged_backup_limit_problem`
+    同一豁免语义）——否则存量已超 50MB 的账号恢复自身体积超限的备份会
+    被预检 413，合并复核的基线放行永远不可达。传 None 保持原严格口径。
     """
     if not isinstance(sections, dict):
         return None
@@ -986,7 +1034,22 @@ def sections_limit_problem(
             else 0
         )
     payload["statistics"] = statistics
-    return backup_limit_problem(payload)
+    problem = backup_limit_problem(payload)
+    if problem is None:
+        return None
+    if existing is None:
+        return problem
+    baseline_axes = {
+        axis
+        for axis, _message in _limit_problems(
+            _export_shape_baseline(existing, [])
+        )
+    }
+    problems = _limit_problems(payload)
+    for axis, message in problems:
+        if axis not in baseline_axes:
+            return message
+    return problem if not problems else None
 
 
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
@@ -1433,6 +1496,23 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         )
         result["messages_added"] = len(planned)
         result["messages_skipped"] = len(messages) - len(planned)
+    # 预览与真实执行同一结论：隔离账号 + 备份无可写回用户数据时，
+    # --dry-run / ?dry_run=1 同样报告恢复未完成（否则预览 ok=true、
+    # 真实执行 ok=false、退出码相反，用户按预览结论误判恢复可用）
+    wrote_user_data = any(
+        int(result.get(key) or 0)
+        for key in (
+            "preferences",
+            "trips_created",
+            "trips_updated",
+            "messages_added",
+            "titles",
+            "pinned",
+            "archived",
+        )
+    )
+    if not wrote_user_data and _store_has_quarantine_evidence(store):
+        result["recovery_incomplete"] = True
     return result
 
 
@@ -1607,6 +1687,10 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
     existing_messages = existing_total("total_messages")
     if (
         existing_messages is not None
+        # 导入前已越限的账号（对话热路径加硬上限之前的存量）不再按
+        # 「推过上限」拒绝：恢复无法让它在该轴上更糟，备份新增量与
+        # 基线豁免同语义
+        and existing_messages <= _MAX_MESSAGES
         and messages
         and existing_messages + len(messages) > _MAX_MESSAGES
     ):
@@ -1625,6 +1709,8 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
     existing_trips = existing_total("total_trips")
     if (
         existing_trips is not None
+        # 与消息同一基线语义：已越限的账号不再按「推过上限」拒绝
+        and existing_trips <= _MAX_TRIPS
         and trips
         and existing_trips + len(trips) > _MAX_TRIPS
     ):
@@ -1652,7 +1738,10 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
                 existing_preferences = None
             if isinstance(existing_preferences, dict):
                 merged = set(existing_preferences) | set(incoming_preferences)
-                if len(merged) > _MAX_PREFERENCES:
+                if (
+                    len(existing_preferences) <= _MAX_PREFERENCES
+                    and len(merged) > _MAX_PREFERENCES
+                ):
                     raise ValueError(
                         f"恢复后偏好类型将超过上限 {_MAX_PREFERENCES}"
                         f"（现有 {len(existing_preferences)} + 备份 "

@@ -742,6 +742,12 @@ def test_user_backup_restore_reports_recovery_incomplete():
     assert any(
         "用户数据未恢复" in toast for toast in data["incomplete_toasts"]
     ), data
+    assert all(
+        "已恢复" not in toast for toast in data["incomplete_toasts"]
+    ), "空恢复不能以「已恢复」开头"
+    assert all(
+        "已恢复" not in toast for toast in data["combo_toasts"]
+    ), data
     ok_toasts = data["ok_toasts"]
     assert ok_toasts and all(
         "用户数据未恢复" not in toast for toast in ok_toasts

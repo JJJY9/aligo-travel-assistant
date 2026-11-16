@@ -215,6 +215,9 @@ def test_json_backend_reloads_before_keeper_recheck(monkeypatch):
     assert "没有需要删除的重复行程" in out.getvalue()
     remaining = json.loads(path.read_text(encoding="utf-8"))["trip_history"]
     assert [item["trip_id"] for item in remaining] == ["trip_2"], "不能删掉仅剩的副本"
+    import shutil
+
+    shutil.rmtree(storage_dir, ignore_errors=True)
     print("✓ JSON 后端删除前重载磁盘（保留者并发删除时不误删）")
 
 
@@ -588,11 +591,15 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
-    # 硬编码清单漏登记：需要 tmp_path 的用例单独调用（否则直跑永远不执行）
+    # 硬编码清单漏登记：需要 tmp_path 的用例单独调用（否则直跑永远不执行），
+    # 直跑自建的临时目录要自己清（pytest 外没有 tmp_path 夹具回收）
     from pathlib import Path as _Path
+    import shutil as _shutil
     import tempfile as _tempfile
 
-    test_delete_duplicate_trip_json_backend_keeps_earliest(
-        _Path(_tempfile.mkdtemp())
-    )
+    _tmp_dir = _Path(_tempfile.mkdtemp())
+    try:
+        test_delete_duplicate_trip_json_backend_keeps_earliest(_tmp_dir)
+    finally:
+        _shutil.rmtree(_tmp_dir, ignore_errors=True)
     print("\n全部通过")

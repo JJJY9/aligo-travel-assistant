@@ -4229,11 +4229,15 @@ def test_pg_add_chat_turn_locks_before_guard():
     assert "pg_advisory_xact_lock(hashtext(%s))" in events[0][1]
     assert events[0][2] == ("aligo:session_meta:u-order",)
     assert events[1] == ("guard",), "守卫必须在拿到会话锁之后调用"
-    # 守卫通过后在锁内计数（写层硬上限），再插入
+    # 守卫通过后先取与批量导入共用的消息上限锁（两把锁固定顺序
+    # session_meta → chat_messages），再在锁内计数（写层硬上限）
     assert events[2][0] == "execute"
-    assert "COUNT(*)" in events[2][1]
-    assert events[3][0] == "executemany"
-    rows = events[3][2]
+    assert "pg_advisory_xact_lock(hashtext(%s))" in events[2][1]
+    assert events[2][2] == ("aligo:chat_messages:u-order",)
+    assert events[3][0] == "execute"
+    assert "COUNT(*)" in events[3][1]
+    assert events[4][0] == "executemany"
+    rows = events[4][2]
     assert [row[1] for row in rows] == ["user", "assistant"]
     assert [row[2] for row in rows] == ["问", "答"]
 

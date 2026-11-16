@@ -2436,6 +2436,10 @@ _DAMAGE_MESSAGE_PREFIXES = (
 # 用户可修正，不能报成可重试的存储故障
 _CASE_CONFLICT_PREFIXES = ("用户 ID 与已有记忆文件仅大小写不同",)
 
+# 聊天消息条数硬上限：永久且用户可修正（删除历史消息），不能报成
+# 「存储暂时不可用，请稍后再试」——重试永远不会成功
+_CHAT_CAP_PREFIXES = ("聊天消息总数已达上限",)
+
 
 def _persistence_failure_detail(
     exc: Exception, request_id: str | None = None
@@ -2460,6 +2464,12 @@ def _persistence_failure_detail(
         return (
             "用户 ID 与已有账号仅大小写不同，请改用与已有账号完全一致的"
             f"大小写{suffix}"
+        )
+    if text.startswith(_CHAT_CAP_PREFIXES):
+        # 上限是永久状态：给出唯一可行动作，而不是引导无限重试
+        return (
+            "聊天消息总数已达上限（20 万条），请先清理历史消息"
+            f"（删除不再需要的会话）后再试{suffix}"
         )
     return f"存储暂时不可用，请稍后再试{suffix}"
 
@@ -4804,12 +4814,17 @@ def create_app(model: Any = None) -> FastAPI:
                 logger.warning(
                     "对话存储失败（%s）: %s", _request_id(request), exc
                 )
-                raise HTTPException(
-                    status_code=503,
-                    detail=_persistence_failure_detail(
-                        exc, _request_id(request)
-                    ),
-                ) from exc
+                detail = _persistence_failure_detail(
+                    exc, _request_id(request)
+                )
+                # 条数硬上限是永久状态：与偏好 / 行程上限同样回 409，
+                # 客户端不能按「稍后重试」处理
+                status = (
+                    409
+                    if str(exc).startswith(_CHAT_CAP_PREFIXES)
+                    else 503
+                )
+                raise HTTPException(status_code=status, detail=detail) from exc
             except UserFacingError as exc:
                 # 该类异常的消息是给用户看的固定文案（流式路径同样原样返回），
                 # 不能吞成通用 500 丢失「重试」提示
@@ -5690,6 +5705,7 @@ def create_app(model: Any = None) -> FastAPI:
 
         from utils.user_import import (
             MAX_BACKUP_BYTES,
+            _store_export_snapshot,
             drop_sessions,
             import_user_data,
             merged_backup_limit_problem,
@@ -5872,34 +5888,6 @@ def create_app(model: Any = None) -> FastAPI:
                     set(unique_sessions) - deleted_sessions - reserved_sessions
                 )
 
-                # 上限自检与 CLI user-import 同口径：按【解析并剔除后】的
-                # 可恢复段复核。解析会丢弃 / 截断非法行、剔除会移除墓碑 /
-                # 保留字会话，任一阶段漏对齐都会让同一备份两入口结论相反
-                try:
-                    from config import STORAGE_CONFIG as _storage_config
-
-                    limit_problem = await loop.run_in_executor(
-                        state.import_executor,
-                        lambda: sections_limit_problem(
-                            sections,
-                            pg_shape=bool(
-                                _storage_config.get("postgres_dsn")
-                            ),
-                        ),
-                    )
-                except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
-                    logger.debug("备份导出口径自检失败", exc_info=True)
-                    limit_problem = None
-                if limit_problem:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"备份超过可导入上限：{limit_problem}。"
-                            "按导出格式（indent=2）计算已超过 50 MB，恢复后"
-                            "将无法再次导出；请先在源账号清理后重新导出"
-                        ),
-                    )
-
                 def _run_import() -> dict[str, Any]:
                     if not dry_run:
                         # 排队期间（单 worker 可能等数分钟）会话可能被其它
@@ -5931,6 +5919,36 @@ def create_app(model: Any = None) -> FastAPI:
                         user_id, strict=True, allow_quarantined=True
                     )
                     try:
+                        # 上限自检与 CLI user-import 同口径：按【解析并
+                        # 剔除后】的可恢复段复核。解析会丢弃 / 截断非法行、
+                        # 剔除会移除墓碑 / 保留字会话，任一阶段漏对齐都会
+                        # 让同一备份两入口结论相反。自检需要账号现有数据
+                        # 做基线豁免（存量已超限的账号恢复自身体积超限的
+                        # 备份不能被预检 413），因此在打开 store 之后执行；
+                        # 读取快照失败时按原严格口径复核。
+                        try:
+                            from config import STORAGE_CONFIG as _storage_config
+
+                            limit_problem = sections_limit_problem(
+                                sections,
+                                pg_shape=bool(
+                                    _storage_config.get("postgres_dsn")
+                                ),
+                                existing=_store_export_snapshot(store),
+                            )
+                        except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
+                            logger.debug("备份导出口径自检失败", exc_info=True)
+                            limit_problem = None
+                        if limit_problem:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"备份超过可导入上限：{limit_problem}。"
+                                    "按导出格式（indent=2）计算已超过 50 MB，"
+                                    "恢复后将无法再次导出；请先在源账号清理"
+                                    "后重新导出"
+                                ),
+                            )
                         # 备份自身不超限不代表合并后不超限：与存量偏好取
                         # 并集后越过上限时，恢复虽成功但 /api/export 会
                         # 永久 413（账号再也导不出可恢复的备份）。预览与

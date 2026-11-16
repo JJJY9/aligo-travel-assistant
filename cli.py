@@ -3057,7 +3057,11 @@ def run_user_import_standalone(
     # 无法感知其它进程刚删除的会话。
     from utils.session_ids import RESERVED_SESSION_IDS
     from utils.tombstones import is_session_deleted
-    from utils.user_import import drop_sessions, sections_limit_problem
+    from utils.user_import import (
+        _store_export_snapshot,
+        drop_sessions,
+        sections_limit_problem,
+    )
 
     candidate_sessions = {
         message.get("session_id")
@@ -3088,17 +3092,6 @@ def run_user_import_standalone(
     # user-export 会永久拒绝导出，账号再也产生不了可恢复备份
     from config import STORAGE_CONFIG
 
-    # 后端形状决定缺时间戳行的占位宽度：JSON 部署按 PG 形状（32 字符）
-    # 会把实际可恢复的备份每行多算 6 字节而误拒
-    limit_problem = sections_limit_problem(
-        sections, pg_shape=bool(STORAGE_CONFIG.get("postgres_dsn"))
-    )
-    if limit_problem:
-        return _fail(
-            f"恢复中止：{limit_problem}"
-            "（恢复后将无法再导出备份，请先清理或拆分备份文件）"
-        )
-
     try:
         # 隔离态允许恢复：user-import 是被隔离账号唯一的产品内恢复路径
         store = _open_cli_store(user_id, allow_quarantined=True)
@@ -3106,6 +3099,20 @@ def run_user_import_standalone(
         return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
+            # 后端形状决定缺时间戳行的占位宽度：JSON 部署按 PG 形状
+            # （32 字符）会把实际可恢复的备份每行多算 6 字节而误拒。
+            # 预检放在打开 store 之后：存量已超限的账号恢复自身体积超限
+            # 的备份需要基线豁免（否则预检 413 先于合并复核的放行执行）
+            limit_problem = sections_limit_problem(
+                sections,
+                pg_shape=bool(STORAGE_CONFIG.get("postgres_dsn")),
+                existing=_store_export_snapshot(store),
+            )
+            if limit_problem:
+                return _fail(
+                    f"恢复中止：{limit_problem}"
+                    "（恢复后将无法再导出备份，请先清理或拆分备份文件）"
+                )
             # 备份自身不超限不代表恢复后仍可导出：与账号既有数据合并后按
             # 导出格式复核体积（与 Web /api/import 同口径）
             merged_problem = merged_backup_limit_problem(store, sections)
