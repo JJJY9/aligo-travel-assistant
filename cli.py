@@ -5345,11 +5345,12 @@ def run_trip_add_standalone(
             before = len(store.get_trip_history(limit=None))
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
-        # 与 Web POST /api/trips 同一上限：越过总量后 user-export 会拒绝
-        # 导出全量备份（账号再也产生不了可恢复备份），必须在写入口拦住
+        # 只拦「恰好在上限」的新增：存储写锁内同样只拦跨越上限的写入
+        # （同身份重复按更新放行、已越限的历史账号继续可用），入口预检
+        # 与写层口径一致
         from utils.trip_import import MAX_TOTAL_TRIPS
 
-        if before >= MAX_TOTAL_TRIPS:
+        if before == MAX_TOTAL_TRIPS:
             return _fail(
                 f"行程数量已达上限（{MAX_TOTAL_TRIPS}），请先删除旧行程"
             )
@@ -6364,9 +6365,11 @@ def run_preference_set_standalone(
             from utils.user_import import _MAX_PREFERENCES
 
             existing_prefs = store.get_preference() or {}
+            # 只拦「恰好在上限、本次新增类型」：已越限的历史账号继续
+            # 可用，与存储写层 / 导入基线豁免同口径
             if (
                 pref_type not in existing_prefs
-                and len(existing_prefs) >= _MAX_PREFERENCES
+                and len(existing_prefs) == _MAX_PREFERENCES
             ):
                 return _fail(
                     f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除旧偏好"

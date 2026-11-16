@@ -711,6 +711,17 @@ def test_pref_type_allows_web_charset(monkeypatch):
     print("✓ 偏好类型字符集与 Web 对齐（空格 / 点号可用，斜杠拒绝）")
 
 if __name__ == "__main__":
+    import sys as _sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
+    # 把清单截断在第一个用例；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (_sys.stdout, _sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     for case in (
         test_preferences_list_output,
         test_preferences_list_empty,
