@@ -618,7 +618,12 @@ def import_trips_from_text(
             continue
         planned_keys.add(key)
         planned_created += 1
-    if len(history) + planned_created > MAX_TOTAL_TRIPS:
+    # 只拦「导入前未越限、本批会推过上限」：已越限的历史账号恢复自身
+    # 备份（含新增行）不再被永久拒绝，与导入侧按轴基线豁免一致
+    if (
+        len(history) <= MAX_TOTAL_TRIPS
+        and len(history) + planned_created > MAX_TOTAL_TRIPS
+    ):
         raise ValueError(
             f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
             f"（现有 {len(history)} + 新增 {planned_created}），"

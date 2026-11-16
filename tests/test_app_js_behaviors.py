@@ -772,6 +772,18 @@ def test_upcoming_weather_normalizes_unpadded_start_date():
     print("✓ 出发日天气：未补零日期归一后命中，窗口外退回今日")
 
 if __name__ == "__main__":
+    import sys as _sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
+    # 把清单截断在第一个用例；先切 UTF-8（不支持时保持原状）——与其它
+    # 直跑清单同一守卫
+    try:
+        for _stream in (_sys.stdout, _sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()

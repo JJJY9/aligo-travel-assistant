@@ -12562,6 +12562,57 @@ def test_import_rejects_merged_preference_limit(monkeypatch):
     finally:
         _cleanup(user_id)
 
+
+def test_import_over_limit_preference_account_allowed(monkeypatch):
+    """存量偏好类型数已超上限的账号：恢复只更新既有类型的备份不再 409
+    （与 CLI / 合并复核的基线豁免同口径），预览与执行同结论。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_import_pref_over")
+    monkeypatch.setattr(server_module, "MAX_PREFERENCE_ENTRIES", 2)
+    store = create_long_term_memory(user_id, str(server_module.MEMORY_DIR))
+    try:
+        for index, pref_type in enumerate(
+            ("home_location", "hotel_brands", "airlines")
+        ):
+            store.save_preference(pref_type, f"v{index}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+    backup = {
+        "preferences": {
+            "home_location": "北京",
+            "hotel_brands": ["汉庭"],
+            "airlines": ["国航"],
+        }
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["preferences"] == 3
+        preview = client.post(
+            "/api/import",
+            params={"user_id": user_id, "dry_run": 1},
+            json={"backup": backup},
+        )
+        assert preview.status_code == 200, preview.text
+        # 存量恰好在上限时，新增类型仍拒绝（只豁免已越限存量）
+        monkeypatch.setattr(server_module, "MAX_PREFERENCE_ENTRIES", 3)
+        blocked = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"seat": "靠窗"}}},
+        )
+        assert blocked.status_code == 409, blocked.text
+    finally:
+        _cleanup(user_id)
+    print("✓ 存量超限偏好账号的恢复按基线放行")
+
 if __name__ == "__main__":
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；

@@ -1153,7 +1153,10 @@ class LongTermMemory:
             # 新建类型同样受上限约束（与 save_preference / PG 后端同口径）：
             # 只拦既有类型之外的追加，越限后 /api/export 会永久 413
             cap = _preference_cap()
-            if cap is not None and len(preferences) >= cap:
+            # 只拦「导入前未越限、本次新增会推过上限」：已越限的历史
+            # 账号（上限上线前的存量）不再被永久拒绝，与导入侧按轴基线
+            # 豁免一致
+            if cap is not None and len(preferences) == cap:
                 raise ValueError(
                     f"偏好条目已达上限（{cap}），请先删除不用的偏好"
                 )
@@ -1187,7 +1190,10 @@ class LongTermMemory:
 
         # 如果不存在，添加新的偏好
         if not found:
-            if cap is not None and len(preferences) >= cap:
+            # 只拦「导入前未越限、本次新增会推过上限」：已越限的历史
+            # 账号（上限上线前的存量）不再被永久拒绝，与导入侧按轴基线
+            # 豁免一致
+            if cap is not None and len(preferences) == cap:
                 raise ValueError(
                     f"偏好条目已达上限（{cap}），请先删除不用的偏好"
                 )
@@ -1256,7 +1262,10 @@ class LongTermMemory:
         if not found:
             # 「不存在则创建」同样受类型上限约束（与 save_preference 同口径）
             cap = _preference_cap()
-            if cap is not None and len(preferences) >= cap:
+            # 只拦「导入前未越限、本次新增会推过上限」：已越限的历史
+            # 账号（上限上线前的存量）不再被永久拒绝，与导入侧按轴基线
+            # 豁免一致
+            if cap is not None and len(preferences) == cap:
                 raise ValueError(
                     f"偏好条目已达上限（{cap}），请先删除不用的偏好"
                 )
@@ -1288,7 +1297,10 @@ class LongTermMemory:
         if not found:
             # 「不存在则创建」同样受类型上限约束（与 save_preference 同口径）
             cap = _preference_cap()
-            if cap is not None and len(preferences) >= cap:
+            # 只拦「导入前未越限、本次新增会推过上限」：已越限的历史
+            # 账号（上限上线前的存量）不再被永久拒绝，与导入侧按轴基线
+            # 豁免一致
+            if cap is not None and len(preferences) == cap:
                 raise ValueError(
                     f"偏好条目已达上限（{cap}），请先删除不用的偏好"
                 )
@@ -1324,9 +1336,14 @@ class LongTermMemory:
 
         from utils.user_import import _MAX_MESSAGES
 
-        # 写入层硬上限（与批量恢复同口径）：并发 / 长期运行越限后
-        # /api/export 会永久 413，账号再也导不出可恢复的备份
-        if len(self.data["chat_history"]) + 1 > _MAX_MESSAGES:
+        # 写入层硬上限（与导入预检同口径）：只拦「导入前未越限、本次会
+        # 推过上限」的写入。已越限的历史账号（上限上线前的存量）不再被
+        # 永久拒绝——恢复 / 继续使用都无法让它在导出能力上更糟，与
+        # 导入侧按轴基线豁免一致
+        if (
+            len(self.data["chat_history"]) <= _MAX_MESSAGES
+            and len(self.data["chat_history"]) + 1 > _MAX_MESSAGES
+        ):
             raise MemoryPersistenceError(
                 f"聊天消息总数已达上限 {_MAX_MESSAGES}，请先清理历史消息"
             )
@@ -1385,9 +1402,13 @@ class LongTermMemory:
             return 0
         from utils.user_import import _MAX_MESSAGES
 
-        # 写入层硬上限：并发恢复 / 直连调用方合计越限后 /api/export 会
-        # 永久 413（账号再也导不出可恢复备份）
-        if len(self.data["chat_history"]) + len(to_add) > _MAX_MESSAGES:
+        # 写入层硬上限（与导入预检同口径）：只拦「导入前未越限、本批会
+        # 推过上限」的写入；已越限的历史账号恢复自身备份（含新增行）
+        # 不再被永久拒绝
+        if (
+            len(self.data["chat_history"]) <= _MAX_MESSAGES
+            and len(self.data["chat_history"]) + len(to_add) > _MAX_MESSAGES
+        ):
             raise ValueError(
                 f"导入后聊天消息总数将超过上限 {_MAX_MESSAGES}"
             )
@@ -1435,9 +1456,12 @@ class LongTermMemory:
         history = self.data["chat_history"]
         from utils.user_import import _MAX_MESSAGES
 
-        # 写入层硬上限（与批量恢复同口径）：每轮写两条，越限后 /api/export
-        # 会永久 413，账号再也导不出可恢复的备份
-        if len(history) + 2 > _MAX_MESSAGES:
+        # 写入层硬上限（与导入预检同口径）：每轮两条，只拦「导入前未
+        # 越限、本次会推过上限」的写入；已越限的历史账号不再被永久拒绝
+        if (
+            len(history) <= _MAX_MESSAGES
+            and len(history) + 2 > _MAX_MESSAGES
+        ):
             raise MemoryPersistenceError(
                 f"聊天消息总数已达上限 {_MAX_MESSAGES}，请先清理历史消息"
             )
@@ -1874,7 +1898,9 @@ class LongTermMemory:
                 max_total = None
         if max_total is not None and self._find_same_trip(trip_info) is None:
             current = len(self.data.get("trip_history") or [])
-            if current >= max_total:
+            # 只拦「上限内、本次会推过上限」的新增：已越限的历史账号
+            # （上限上线前的存量）不再被永久拒绝，与导入侧基线豁免一致
+            if current == max_total:
                 raise ValueError(f"行程数量已达上限（{max_total}），请先删除旧行程")
         trip_id, created = self._apply_trip_locked(trip_info)
         self._persist()
@@ -1925,9 +1951,6 @@ class LongTermMemory:
 
         from utils.trip_import import MAX_TOTAL_TRIPS
 
-        # 写入层硬上限：导入预检只在入口做一次，并发导入 / 直连调用方
-        # 合计越限后账号将永远无法导出全量备份——这里按本批实际新增
-        # （去重语义）在落库前拦截
         planned_seen: set[tuple[str, str, str, str]] = set()
         planned_created = 0
         for row in trips:
@@ -1939,7 +1962,13 @@ class LongTermMemory:
                     continue
                 planned_seen.add(key)
             planned_created += 1
-        if len(history) + planned_created > MAX_TOTAL_TRIPS:
+        # 写入层硬上限（与导入预检同口径）：只拦「导入前未越限、本批
+        # 会推过上限」的写入；已越限的历史账号恢复自身备份（含更新）
+        # 不再被永久拒绝
+        if (
+            len(history) <= MAX_TOTAL_TRIPS
+            and len(history) + planned_created > MAX_TOTAL_TRIPS
+        ):
             raise ValueError(
                 f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
             )

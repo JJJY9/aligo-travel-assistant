@@ -966,9 +966,18 @@ def sections_limit_problem(
     超限时该轴不再作为拒绝理由（与 :func:`merged_backup_limit_problem`
     同一豁免语义）——否则存量已超 50MB 的账号恢复自身体积超限的备份会
     被预检 413，合并复核的基线放行永远不可达。传 None 保持原严格口径。
+
+    知识库段只在 ``existing is None``（快照读不到、后续没有权威合并
+    复核）时计入：知识轴（含知识段体积）由随后的
+    :func:`merged_backup_limit_problem` 按「现有数据 + 现有知识库」
+    完整基线判定，预检只有用户数据快照时无法复刻该基线——把备份知识段
+    计入会把部署级超限知识库的重导误拒，而 merged 本会放行。
     """
     if not isinstance(sections, dict):
         return None
+    # 已知存量基线的调用方（CLI / Web 主路径）随后必定执行合并复核：
+    # 知识轴交给它判定；预检只覆盖用户数据轴
+    include_knowledge = existing is None
     # 与 merged_backup_limit_problem 同一导出形状（空存量）：行程走编号
     # 仲裁（同身份重复折叠、补 trip_id/timestamp、PG 空键），会话元数据
     # 与重算统计一并计入——手搭的窄字段 payload 会低估同内容的真实导出，
@@ -992,7 +1001,9 @@ def sections_limit_problem(
         "chat_history": messages,
         "trip_history": trip_rows,
         "preferences": sections.get("preferences") or {},
-        "knowledge": sections.get("knowledge") or [],
+        "knowledge": (sections.get("knowledge") or [])
+        if include_knowledge
+        else [],
         "session_titles": sections.get("titles") or {},
         "pinned_sessions": sections.get("pinned") or [],
         "archived_sessions": sections.get("archived") or [],

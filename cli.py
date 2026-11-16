@@ -2990,6 +2990,7 @@ def run_user_import_standalone(
         parse_user_export,
         preview_user_import,
     )
+    from utils.errors import PartialImportError
 
     def _fail(message: str) -> int:
         if as_json:
@@ -3153,6 +3154,15 @@ def run_user_import_standalone(
                         0,
                         int(counts.get("messages_added") or 0) - removed_total,
                     )
+        except PartialImportError as exc:
+            # 已提交的部分必须如实报告：只说「失败」会让用户以为整份
+            # 没导入而换文件 / 丢弃备份，数据停留在半份状态
+            action = "预览" if dry_run else "写入"
+            return _fail(
+                f"{action}失败：{exc}"
+                f"（已提交 {exc.created} 条新增、{exc.updated} 条更新；"
+                "重复导入按路线+日期去重，可安全重跑，请保留原备份）"
+            )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             action = "预览" if dry_run else "写入"
             return _fail(f"{action}失败：{exc}")
