@@ -1603,6 +1603,30 @@ def test_json_write_layer_total_caps(monkeypatch):
         store.add_chat_turn("q", "a", "s1")
     assert "聊天消息总数已达上限" in str(info.value)
     assert len(store.get_chat_history()) == 2, "越限时不得落盘任何一条"
+    # 存量已越限（上限上线前的账号）：写入层只拦「跨越上限」的批次，
+    # 不再永久拒绝恢复 / 追加（与导入预检的按轴基线豁免同口径）
+    monkeypatch.setattr(ui_module, "_MAX_MESSAGES", 1)
+    store.add_chat_message("user", "d", "s1")
+    store.add_chat_messages(
+        [{"role": "user", "content": "e", "session_id": "s1"}]
+    )
+    store.add_chat_turn("q2", "a2", "s1")
+    assert len(store.get_chat_history()) == 6
+    monkeypatch.setattr(trip_module, "MAX_TOTAL_TRIPS", 1)
+    store.save_trip_histories(
+        [{"destination": "成都", "start_date": "2026-03-01"}]
+    )
+    assert len(store.get_trip_history(limit=None)) == 3
+    store.save_preference("home_location", "北京")
+    store.save_preference("hotel_brands", ["汉庭"])
+    monkeypatch.setattr(ui_module, "_MAX_PREFERENCES", 1)
+    store.save_preference("airlines", ["国航"])
+    assert len(store.get_preference()) == 3
+    # 「恰好在上限」仍拒绝新增类型（只豁免已越限存量）
+    monkeypatch.setattr(ui_module, "_MAX_PREFERENCES", 3)
+    with pytest.raises(ValueError) as info:
+        store.save_preference("seat", "靠窗")
+    assert "偏好条目已达上限" in str(info.value)
     print("✓ JSON 写入层的总量硬上限")
 
 
@@ -1647,6 +1671,9 @@ def test_pg_write_layer_total_caps(monkeypatch):
         def execute(self, sql, params=None):
             state["sql"].append(sql)
 
+        def executemany(self, sql, rows):
+            state["sql"].append(sql)
+
         def fetchone(self):
             return state["count"]
 
@@ -1682,6 +1709,19 @@ def test_pg_write_layer_total_caps(monkeypatch):
         msgs_store.add_chat_turn("q", "a", "s1")
     assert "聊天消息总数已达上限" in str(info.value)
     assert not any(
+        "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
+    )
+    # 存量已越限：只拦「跨越上限」的写入，不再永久拒绝（与导入预检
+    # 的按轴基线豁免同口径）
+    monkeypatch.setattr(ui_module, "_MAX_MESSAGES", 1)
+    state["sql"] = []
+    msgs_store.add_chat_message("user", "y", "s1")
+    assert any(
+        "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
+    )
+    state["sql"] = []
+    msgs_store.add_chat_turn("q2", "a2", "s1")
+    assert any(
         "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
     )
     print("✓ PG 写入层的总量硬上限")

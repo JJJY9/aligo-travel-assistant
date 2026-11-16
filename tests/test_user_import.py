@@ -3585,6 +3585,89 @@ def test_cli_import_baseline_allows_oversized_backup(monkeypatch):
     print("✓ 存量超限账号的 CLI 导入按基线放行")
 
 
+def test_import_user_data_over_limit_account_real_write(monkeypatch):
+    """预检与写层同口径：存量已越限账号导入含新增行的备份真实执行成功
+    （不再出现「预览成功、真实写入 400」的部分失败），重复导入幂等。"""
+    import utils.trip_import as trip_module
+    from utils import user_import as module
+
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_over_")
+    store = LongTermMemory("u-over-write", storage_dir)
+    for index in range(3):
+        store.save_trip_history(
+            {"destination": f"城市{index}", "start_date": "2026-01-01"}
+        )
+    for index in range(3):
+        store.add_chat_message("user", "old", f"s{index}")
+    # 种入越限存量之后再收紧上限（上限上线前的历史账号）
+    monkeypatch.setattr(trip_module, "MAX_TOTAL_TRIPS", 2)
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 2)
+    sections = {
+        "messages": [{"role": "user", "content": "new", "session_id": "s9"}],
+        "trips": [{"destination": "新城市", "start_date": "2026-02-01"}],
+    }
+    preview = module.preview_user_import(store, sections)
+    assert preview["messages_added"] == 1, preview
+    counts = module.import_user_data(store, sections)
+    assert counts["messages_added"] == 1, counts
+    assert counts["trips_created"] == 1, counts
+    # 幂等重导（本批新增为 0）：写层同样放行
+    counts = module.import_user_data(store, sections)
+    assert counts["messages_added"] == 0, counts
+    assert counts["trips_created"] == 0, counts
+    print("✓ 存量超限账号的真实导入与幂等重导放行")
+
+
+def test_sections_limit_defers_knowledge_axis_to_merged(monkeypatch):
+    """有存量快照时备份自身体积预检不把知识段计入：知识轴（含其体积）
+    由随后的合并复核按「用户数据 + 现有知识库」完整基线判定，否则
+    部署级超限知识库的重导会被预检 413 而 merged 本会放行。"""
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 3000)
+    sections = {"knowledge": [{"content": "k" * 4000, "metadata": {}}]}
+    existing = {
+        "chat_history": [],
+        "trip_history": [],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    # 无基线（快照读不到、后续没有权威复核）：保持严格口径
+    assert module.sections_limit_problem(sections) is not None
+    # 有基线：知识段不计入预检体积（交给 merged 的完整基线判定）
+    assert (
+        module.sections_limit_problem(sections, existing=existing) is None
+    )
+    print("✓ 备份预检把知识轴交给合并复核")
+
+
+def test_cli_import_reports_partial_commit(monkeypatch):
+    """CLI user-import 遇 PartialImportError 如实报告已提交条数并可安全
+    重跑（与 trips-import / Web 同口径），不再只说「写入失败」。"""
+    from utils import user_import as module
+    from utils.errors import PartialImportError
+
+    def boom(store, sections):
+        raise PartialImportError("批量保存在第 1 条后失败：db down", 1, 0)
+
+    monkeypatch.setattr(module, "import_user_data", boom)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_partial_")
+    store = LongTermMemory("u-partial", storage_dir)
+    path = _write_json({"preferences": {"home_location": "北京"}})
+    code, out = _run_import(monkeypatch, "u-partial", path, store)
+    assert code == 1, out
+    assert "已提交 1 条新增、0 条更新" in out, out
+    assert "可安全重跑" in out, out
+    code, out = _run_import(monkeypatch, "u-partial", path, store, as_json=True)
+    payload = json.loads(out)
+    assert code == 1 and payload["ok"] is False, payload
+    assert "已提交 1 条新增" in payload["error"], payload
+    print("✓ 主恢复入口报告部分提交")
+
+
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
     """知识片段恢复失败不能吞掉「用户数据未恢复」：隔离账号 + 备份只有
     保留字会话消息 + 一条知识片段，导入结果同时带 knowledge_error 与

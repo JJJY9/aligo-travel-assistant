@@ -570,7 +570,9 @@ class PostgresLongTermMemory:
             (self.user_id,),
         )
         current = int(count_row[0] or 0) if count_row else 0
-        if current >= _MAX_PREFERENCES:
+        # 只拦「导入前未越限、本次新增会推过上限」：已越限的历史账号
+        # 不再被永久拒绝，与导入侧按轴基线豁免一致
+        if current == _MAX_PREFERENCES:
             raise ValueError(
                 f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除不用的偏好"
             )
@@ -685,7 +687,9 @@ class PostgresLongTermMemory:
                 )
                 total_row = cursor.fetchone()
                 total = int(total_row[0] or 0) if total_row else 0
-                if total + 1 > _MAX_MESSAGES:
+                # 只拦「导入前未越限、本次会推过上限」的写入：已越限的
+                # 历史账号不再被永久拒绝，与导入侧按轴基线豁免一致
+                if total <= _MAX_MESSAGES and total + 1 > _MAX_MESSAGES:
                     raise MemoryPersistenceError(
                         f"聊天消息总数已达上限 {_MAX_MESSAGES}，"
                         "请先清理历史消息"
@@ -771,7 +775,7 @@ class PostgresLongTermMemory:
                 total = int(total_row[0] or 0) if total_row else 0
                 # 写入层硬上限（与批量恢复同口径）：每轮两条，合计越限后
                 # /api/export 会永久 413，账号再也导不出可恢复的备份
-                if total + 2 > _MAX_MESSAGES:
+                if total <= _MAX_MESSAGES and total + 2 > _MAX_MESSAGES:
                     raise MemoryPersistenceError(
                         f"聊天消息总数已达上限 {_MAX_MESSAGES}，"
                         "请先清理历史消息"
@@ -859,7 +863,10 @@ class PostgresLongTermMemory:
                 total_row = cursor.fetchone()
                 total = int(total_row[0] or 0) if total_row else 0
                 # 写入层硬上限：合计越限后 /api/export 会永久 413
-                if total + len(kept) > _MAX_MESSAGES:
+                if (
+                    total <= _MAX_MESSAGES
+                    and total + len(kept) > _MAX_MESSAGES
+                ):
                     raise ValueError(
                         f"导入后聊天消息总数将超过上限 {_MAX_MESSAGES}"
                     )
@@ -1181,7 +1188,10 @@ class PostgresLongTermMemory:
                 planned_created += 1
             # 写入层硬上限：并发恢复 / 直连调用方合计越限后账号将永远
             # 无法导出全量备份
-            if len(rows) + planned_created > MAX_TOTAL_TRIPS:
+            if (
+                len(rows) <= MAX_TOTAL_TRIPS
+                and len(rows) + planned_created > MAX_TOTAL_TRIPS
+            ):
                 raise ValueError(
                     f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
                 )
@@ -1507,7 +1517,9 @@ class PostgresLongTermMemory:
             "SELECT COUNT(*) FROM aligo_trips WHERE user_id = %s",
             (self.user_id,),
         )
-        if row is not None and int(row[0] or 0) >= max_total:
+        if row is not None and int(row[0] or 0) == max_total:
+            # 只拦「上限内、本次会推过上限」的新增：已越限的历史账号
+            # 不再被永久拒绝，与导入侧基线豁免一致
             raise ValueError(f"行程数量已达上限（{max_total}），请先删除旧行程")
 
     def _save_trip_history_locked(

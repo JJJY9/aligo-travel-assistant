@@ -5963,7 +5963,14 @@ def create_app(model: Any = None) -> FastAPI:
                                 merged_count = len(
                                     set(existing_prefs) | set(incoming_prefs)
                                 )
-                                if merged_count > MAX_PREFERENCE_ENTRIES:
+                                # 与导入侧同口径的基线豁免：存量类型数已
+                                # 超上限的账号（上限上线前的存量）恢复
+                                # 「只更新既有类型」的备份不能让偏好轴更糟
+                                if (
+                                    len(existing_prefs)
+                                    <= MAX_PREFERENCE_ENTRIES
+                                    and merged_count > MAX_PREFERENCE_ENTRIES
+                                ):
                                     raise HTTPException(
                                         status_code=409,
                                         detail=(
