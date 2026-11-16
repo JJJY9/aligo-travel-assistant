@@ -2401,6 +2401,34 @@ class LongTermMemory:
                         marker.unlink(missing_ok=True)
                     except OSError:
                         failed.append(str(marker))
+                    # 崩溃遗留的原子写临时文件（fsync 与 replace 之间被强杀）
+                    # 内含完整记忆快照：delete_all 宣称删除所有数据，必须一并
+                    # 清理。持锁期间匹配到的 .tmp 不可能是活跃写者的临时文件；
+                    # 前缀用本实例 user_id 的精确大小写（_save 以同一拼写
+                    # 命名），避免误删仅大小写不同的另一账号的临时文件
+                    tmp_prefix = f".{self.user_id}."
+                    try:
+                        with os.scandir(
+                            os.path.dirname(self.db_path) or "."
+                        ) as entries:
+                            for entry in entries:
+                                if not (
+                                    entry.name.startswith(tmp_prefix)
+                                    and entry.name.endswith(".tmp")
+                                ):
+                                    continue
+                                try:
+                                    os.remove(entry.path)
+                                except FileNotFoundError:
+                                    continue
+                                except OSError:
+                                    failed.append(entry.path)
+                    except OSError:
+                        # 目录不可读时不阻断已完成的删除（主文件与备份
+                        # 已移除）；残留临时文件可由后续清理发现
+                        logger.warning(
+                            "删除长期记忆时无法扫描临时文件目录"
+                        )
                     # 无论备份是否删净都先重置内存快照与隔离标记：主文件
                     # 已移除，旧快照绝不能再被写回
                     self._corrupt_backup = None

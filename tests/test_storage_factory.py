@@ -1159,9 +1159,9 @@ def test_delete_all_refuses_case_variant_backups(monkeypatch):
     backup = Path(storage_dir) / "Alice.json.corrupt-20260101000000000000-3"
     backup.write_text("{}", encoding="utf-8")
     if not list(Path(storage_dir).glob("alice.json.corrupt-*")):
-        # 大小写敏感文件系统（Linux CI）：变体不指向同一备份，跳过
-        print("✓ delete_all 拒绝大小写变体备份（平台跳过）")
-        return
+        # 大小写敏感文件系统（Linux CI）：变体不指向同一备份。用 skip 而
+        # 不是 print+return——零断言"通过"会让 CI 误以为该守卫已覆盖
+        pytest.skip("大小写敏感文件系统：变体别名不指向同一隔离备份")
     with pytest.raises(MemoryPersistenceError) as info:
         stale.delete_all()
     assert "大小写" in str(info.value), str(info.value)
@@ -1248,9 +1248,8 @@ def test_actual_filename_prefers_exact_case(monkeypatch):
     alice_upper.write_text('{"user_id": "Alice"}', encoding="utf-8")
     if (Path(storage_dir) / "alice.json").exists():
         # 大小写不敏感文件系统（Windows/macOS）：两个变体是同一个文件，
-        # 由 samefile 校验路径覆盖；此用例只在大小写敏感平台有意义
-        print("✓ 精确文件名优先（大小写不敏感平台跳过）")
-        return
+        # 由 samefile 校验路径覆盖；用 skip 而不是零断言「通过」
+        pytest.skip("大小写不敏感文件系统：两个变体指向同一文件")
     small = Path(storage_dir) / "alice.json"
     small.write_text("{bad json", encoding="utf-8")
 
@@ -1617,6 +1616,11 @@ def test_json_write_layer_total_caps(monkeypatch):
         [{"destination": "成都", "start_date": "2026-03-01"}]
     )
     assert len(store.get_trip_history(limit=None)) == 3
+    # 单条新增路径同口径：越限存量放行、只拦恰好跨越上限
+    store.save_trip_history(
+        {"destination": "重庆", "start_date": "2026-04-01"}
+    )
+    assert len(store.get_trip_history(limit=None)) == 4
     store.save_preference("home_location", "北京")
     store.save_preference("hotel_brands", ["汉庭"])
     monkeypatch.setattr(ui_module, "_MAX_PREFERENCES", 1)
@@ -1627,6 +1631,19 @@ def test_json_write_layer_total_caps(monkeypatch):
     with pytest.raises(ValueError) as info:
         store.save_preference("seat", "靠窗")
     assert "偏好条目已达上限" in str(info.value)
+    # 越限存量：append / 酒店品牌 / 航司的新建分支同样放行（与保存路径
+    # 同一基线语义）
+    helper_store = LongTermMemory("u-caps-helper", tempfile.mkdtemp())
+    helper_store.save_preference("p1", "1")
+    helper_store.save_preference("p2", "2")
+    monkeypatch.setattr(ui_module, "_MAX_PREFERENCES", 1)
+    store.append_preference("new_list", "v")
+    assert "new_list" in store.get_preference()
+    helper_store.add_hotel_brand("汉庭")
+    helper_store.add_airline("东航")
+    assert {"p1", "p2", "hotel_brands", "airlines"} <= set(
+        helper_store.get_preference()
+    )
     print("✓ JSON 写入层的总量硬上限")
 
 
@@ -1699,6 +1716,17 @@ def test_pg_write_layer_total_caps(monkeypatch):
     assert not any(
         "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
     )
+    # 锁序：用户级消息锁必须先于 COUNT（并发写入方在同一把锁上串行化，
+    # 否则 READ COMMITTED 下各自通过计数后合计越限）
+    lock_ix = [
+        i
+        for i, sql in enumerate(state["sql"])
+        if "pg_advisory_xact_lock" in sql
+    ]
+    count_ix = [
+        i for i, sql in enumerate(state["sql"]) if "COUNT(*)" in sql
+    ]
+    assert lock_ix and count_ix and max(lock_ix) < min(count_ix), state["sql"]
     # 单条 / 单轮路径同样拦截（同一事务锁内计数）
     state["sql"] = []
     with pytest.raises(MemoryPersistenceError) as info:
@@ -1716,9 +1744,21 @@ def test_pg_write_layer_total_caps(monkeypatch):
     monkeypatch.setattr(ui_module, "_MAX_MESSAGES", 1)
     state["sql"] = []
     msgs_store.add_chat_message("user", "y", "s1")
-    assert any(
-        "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
-    )
+    insert_ix = [
+        i
+        for i, sql in enumerate(state["sql"])
+        if "INSERT INTO aligo_chat_messages" in sql
+    ]
+    assert insert_ix, state["sql"]
+    lock_ix = [
+        i
+        for i, sql in enumerate(state["sql"])
+        if "pg_advisory_xact_lock" in sql
+    ]
+    count_ix = [
+        i for i, sql in enumerate(state["sql"]) if "COUNT(*)" in sql
+    ]
+    assert lock_ix and count_ix and max(lock_ix) < min(count_ix) < min(insert_ix)
     state["sql"] = []
     msgs_store.add_chat_turn("q2", "a2", "s1")
     assert any(
@@ -1908,6 +1948,23 @@ def test_delete_all_removes_migrate_backup():
     memory.delete_all()
     assert not migrate_backup.exists(), "迁移副本不能残留在磁盘上"
     print("✓ delete_all 清理迁移前副本")
+
+
+def test_delete_all_removes_atomic_write_temp_files():
+    """delete_all 宣称删除所有数据：崩溃遗留（fsync 与 replace 之间被
+    强杀）的 .<user_id>.*.tmp 完整记忆快照必须一并清理，且不能误删
+    其它账号的临时文件。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-tmpclean", storage_dir)
+    memory.save_preference("home_location", "北京")
+    own_tmp = Path(storage_dir) / ".u-tmpclean.deadbeef.tmp"
+    own_tmp.write_text('{"user_id": "u-tmpclean"}', encoding="utf-8")
+    other_tmp = Path(storage_dir) / ".other-user.deadbeef.tmp"
+    other_tmp.write_text('{"user_id": "other-user"}', encoding="utf-8")
+    memory.delete_all()
+    assert not own_tmp.exists(), "崩溃遗留的完整快照必须随删除清理"
+    assert other_tmp.exists(), "其它账号的临时文件不能被误删"
+    print("✓ delete_all 清理原子写临时快照")
 
 
 def test_delete_all_reports_unremovable_backup(monkeypatch):

@@ -1312,6 +1312,17 @@ def test_trip_add_rejects_when_total_limit_reached(monkeypatch):
     print("✓ trip-add 行程总量超限时拒绝写入")
 
 if __name__ == "__main__":
+    import sys as _sys
+
+    # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
+    # 把清单截断在第一个用例；先切 UTF-8（不支持时保持原状）
+    try:
+        for _stream in (_sys.stdout, _sys.stderr):
+            _reconfigure = getattr(_stream, "reconfigure", None)
+            if callable(_reconfigure):
+                _reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
     for case in (
         test_trip_conflicts_excludes_only_saved_record_with_duplicate_ids,
         test_trip_conflicts_exclude_id_only_when_unique,

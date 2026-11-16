@@ -4124,7 +4124,9 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(payload.user_id, strict=True)
         try:
             existing = store.get_preference()
-            if pref_type not in existing and len(existing) >= MAX_PREFERENCE_ENTRIES:
+            # 只拦「恰好在上限、本次新增类型」：已越限的历史账号（上限
+            # 上线前的存量）继续可用，与存储写层 / 导入基线豁免同口径
+            if pref_type not in existing and len(existing) == MAX_PREFERENCE_ENTRIES:
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -5124,14 +5126,9 @@ def create_app(model: Any = None) -> FastAPI:
         conflicts: list[dict[str, Any]] = []
         try:
             before = len(store.get_trip_history(limit=None))
-            if before >= MAX_TRIP_ENTRIES:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"行程数量已达上限（{MAX_TRIP_ENTRIES}），"
-                        "请先删除旧行程"
-                    ),
-                )
+            # 不在锁外按「存量 >= 上限」预检：存储写锁内只拦「恰好在上限、
+            # 本次确属新增」的写入（同身份重复提交按更新放行；已越限的
+            # 历史账号继续可用），预检会把可去重更新误拒且与写层结论分叉
             trip_id = store.save_trip_history(
                 {
                     "origin": payload.origin.strip(),

@@ -181,6 +181,18 @@ def test_preference_and_trip_write_caps(monkeypatch):
         second = client.post("/api/trips", json={"user_id": user_id, **trips[1]})
         assert second.status_code == 409, second.text
         assert "上限" in second.json()["detail"]
+        # 恰好在上限时同身份重复提交按更新放行（不再被锁外预检 409）；
+        # 上限收紧后已越限的账号继续可用（与存储写层同口径）
+        duplicate = client.post(
+            "/api/trips", json={"user_id": user_id, **trips[0]}
+        )
+        assert duplicate.status_code == 201, duplicate.text
+        assert duplicate.json()["created"] is False
+        monkeypatch.setattr(server_module, "MAX_PREFERENCE_ENTRIES", 1)
+        over = client.put(
+            "/api/preferences/p3", json={"user_id": user_id, "value": "x"}
+        )
+        assert over.status_code == 200, over.text
     finally:
         _cleanup(user_id)
     print("✓ 偏好 / 行程写接口条数上限")
@@ -12582,19 +12594,18 @@ def test_import_over_limit_preference_account_allowed(monkeypatch):
         close = getattr(store, "close", None)
         if callable(close):
             close()
-    backup = {
-        "preferences": {
-            "home_location": "北京",
-            "hotel_brands": ["汉庭"],
-            "airlines": ["国航"],
-        }
-    }
+    # 同步收紧导入层上限：只有存量 > 上限时 _enforce_import_limits 的
+    # 基线豁免分支才会真正执行（两个 200 常量不收紧则用例恒绿）
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(user_import_module, "_MAX_PREFERENCES", 2)
+    backup = {"preferences": {"home_location": "北京"}}
     try:
         response = client.post(
             "/api/import", params={"user_id": user_id}, json={"backup": backup}
         )
         assert response.status_code == 200, response.text
-        assert response.json()["preferences"] == 3
+        assert response.json()["preferences"] == 1
         preview = client.post(
             "/api/import",
             params={"user_id": user_id, "dry_run": 1},
