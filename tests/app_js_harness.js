@@ -1797,6 +1797,63 @@ async function scenarioUserBackupDecode(source) {
   return results;
 }
 
+async function scenarioUserBackupRestore(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  run(`
+    state.userId = "u1";
+    confirm = () => true;
+    refreshStatus = async () => {};
+    loadSessions = async () => {};
+    refreshKnowledge = async () => {};
+    refreshKnowledgeDocuments = async () => {};
+    refreshKnowledgeCategories = async () => {};
+    getJSON = async () => __importResult;
+    els.importDataFile.files = [{
+      size: 41,
+      arrayBuffer: async () =>
+        new TextEncoder()
+          .encode('{"preferences": {"home_location": "北京"}}').buffer,
+    }];
+  `);
+  const base = {
+    preferences: 1,
+    trips_created: 0,
+    trips_updated: 0,
+    messages_added: 0,
+    knowledge_imported: 0,
+    knowledge_skipped: 0,
+    skipped: [],
+  };
+  run(
+    `__importResult = ${JSON.stringify({
+      ...base,
+      preferences: 0,
+      recovery_incomplete: true,
+    })};`,
+  );
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.incomplete_toasts = run("__toasts.slice()");
+  run(`__importResult = ${JSON.stringify(base)};`);
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.ok_toasts = run("__toasts.slice()");
+  run(
+    `__importResult = ${JSON.stringify({
+      ...base,
+      preferences: 0,
+      knowledge_error: "Milvus 写入失败",
+      recovery_incomplete: true,
+    })};`,
+  );
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.combo_toasts = run("__toasts.slice()");
+  return results;
+}
+
 async function scenarioUpcomingWeather(source) {
   const results = {};
   // 未补零出发日期（2026-1-5）也要与零填充预报日期匹配，展示出发日预报
@@ -2352,6 +2409,8 @@ async function main() {
     payload = await scenarioKbDelete(source);
   } else if (scenario === "userBackupDecode") {
     payload = await scenarioUserBackupDecode(source);
+  } else if (scenario === "userBackupRestore") {
+    payload = await scenarioUserBackupRestore(source);
   } else if (scenario === "upcomingWeather") {
     payload = await scenarioUpcomingWeather(source);
   } else if (scenario === "httpError") {

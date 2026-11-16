@@ -1812,7 +1812,9 @@ def test_export_refuses_backup_over_import_limits(monkeypatch):
     """超出导入上限的备份返回 413（不产出永远无法恢复的文件）。"""
     from utils import user_import as module
 
-    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+    # 写层硬上限同样生效：先按「一轮 = 两条消息」的上限写入，
+    # 再收紧上限模拟存量账号已超过导出上限（写路径无法再越限）
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 2)
     client = _client()
     user_id = _unique_user("web_export_oversize")
     try:
@@ -1821,6 +1823,7 @@ def test_export_refuses_backup_over_import_limits(monkeypatch):
             json={"message": "你好", "user_id": user_id, "session_id": "s1"},
         )
         assert response.status_code == 200
+        monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
         response = client.get("/api/export", params={"user_id": user_id})
         assert response.status_code == 413, response.text[:300]
         assert "导入上限" in response.json()["detail"]
@@ -12531,6 +12534,7 @@ if __name__ == "__main__":
     except (OSError, ValueError):
         pass
     import pathlib
+    import shutil
     import tempfile
 
     ran = 0
@@ -12543,13 +12547,16 @@ if __name__ == "__main__":
         fixture = None
         caplog_shim = None
         kwargs: dict = {}
+        tmp_dir_paths: list[pathlib.Path] = []
         unsupported = False
         for param, spec in params.items():
             if param == "monkeypatch":
                 fixture = pytest.MonkeyPatch()
                 kwargs[param] = fixture
             elif param == "tmp_path":
-                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+                _tmp_dir = pathlib.Path(tempfile.mkdtemp())
+                tmp_dir_paths.append(_tmp_dir)
+                kwargs[param] = _tmp_dir
             elif param == "caplog":
                 # pytest 夹具只在 pytest 内注入：直跑用最小替身真正执行
                 # 日志断言，不能静默跳过（否则脱敏回归在直跑清单上假绿）
@@ -12565,6 +12572,8 @@ if __name__ == "__main__":
                 caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
@@ -12613,6 +12622,10 @@ if __name__ == "__main__":
                 fixture.undo()
             if kb_fixture is not None:
                 kb_fixture.undo()
+            # 直跑模式自建的临时目录要自己清：否则每跑一次清单就在系统
+            # 临时目录里留下一批带记忆文件的目录
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
     total = sum(
         1
         for name, func in globals().items()

@@ -3099,6 +3099,7 @@ if __name__ == "__main__":
     import asyncio
     import inspect
     import pathlib
+    import shutil
     import tempfile
 
     ran = 0
@@ -3111,13 +3112,16 @@ if __name__ == "__main__":
         fixture = None
         caplog_shim = None
         kwargs: dict = {}
+        tmp_dir_paths: list[pathlib.Path] = []
         unsupported = False
         for param, spec in params.items():
             if param == "monkeypatch":
                 fixture = pytest.MonkeyPatch()
                 kwargs[param] = fixture
             elif param == "tmp_path":
-                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+                _tmp_dir = pathlib.Path(tempfile.mkdtemp())
+                tmp_dir_paths.append(_tmp_dir)
+                kwargs[param] = _tmp_dir
             elif param == "caplog":
                 import _caplog_shim
 
@@ -3131,6 +3135,8 @@ if __name__ == "__main__":
                 caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
             skipped += 1
             skipped_names.append(name)
             continue
@@ -3163,6 +3169,10 @@ if __name__ == "__main__":
                 _cfg.update(storage_snapshot)
             if fixture is not None:
                 fixture.undo()
+            # 直跑模式自建的临时目录要自己清：否则每跑一次清单就在系统
+            # 临时目录里留下一批带记忆文件的目录
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
     total = sum(
         1
         for name, func in globals().items()

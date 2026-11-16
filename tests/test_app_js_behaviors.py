@@ -735,6 +735,25 @@ def test_user_backup_import_rejects_non_utf8():
     print("✓ 备份恢复拒绝非 UTF-8 文件")
 
 
+def test_user_backup_restore_reports_recovery_incomplete():
+    """隔离账号空恢复：toast 必须明确「用户数据未恢复」；与知识片段
+    失败组合时两条提示都要出现，正常恢复不能带该警告。"""
+    data = _run_harness("userBackupRestore")
+    assert any(
+        "用户数据未恢复" in toast for toast in data["incomplete_toasts"]
+    ), data
+    ok_toasts = data["ok_toasts"]
+    assert ok_toasts and all(
+        "用户数据未恢复" not in toast for toast in ok_toasts
+    ), ok_toasts
+    assert any("已恢复" in toast for toast in ok_toasts), ok_toasts
+    assert any(
+        "知识片段未恢复" in toast and "用户数据未恢复" in toast
+        for toast in data["combo_toasts"]
+    ), data
+    print("✓ 恢复完成度提示接入 toast")
+
+
 def test_upcoming_weather_normalizes_unpadded_start_date():
     """历史未补零出发日期也要命中预报行，而不是退回今日。"""
     results = _run_harness("upcomingWeather")
@@ -765,6 +784,7 @@ if __name__ == "__main__":
     test_knowledge_import_skip_summary_distinguishes_conflicts()
     test_knowledge_delete_legacy_parts_without_group()
     test_user_backup_import_rejects_non_utf8()
+    test_user_backup_restore_reports_recovery_incomplete()
     test_chat_done_persisted_signal()
     test_search_hit_renders_bounded_window()
     test_silent_reload_restores_expanded_window()

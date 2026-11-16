@@ -1595,6 +1595,14 @@ def test_json_write_layer_total_caps(monkeypatch):
             [{"role": "user", "content": "c", "session_id": "s1"}]
         )
     assert "消息总数将超过上限" in str(info.value)
+    # 单条 / 单轮路径同样拦截（对话热路径绕过批量预检也能越限）
+    with pytest.raises(MemoryPersistenceError) as info:
+        store.add_chat_message("user", "c", "s1")
+    assert "聊天消息总数已达上限" in str(info.value)
+    with pytest.raises(MemoryPersistenceError) as info:
+        store.add_chat_turn("q", "a", "s1")
+    assert "聊天消息总数已达上限" in str(info.value)
+    assert len(store.get_chat_history()) == 2, "越限时不得落盘任何一条"
     print("✓ JSON 写入层的总量硬上限")
 
 
@@ -1661,6 +1669,18 @@ def test_pg_write_layer_total_caps(monkeypatch):
             [{"role": "user", "content": "x", "session_id": "s1"}]
         )
     assert "消息总数将超过上限" in str(info.value)
+    assert not any(
+        "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
+    )
+    # 单条 / 单轮路径同样拦截（同一事务锁内计数）
+    state["sql"] = []
+    with pytest.raises(MemoryPersistenceError) as info:
+        msgs_store.add_chat_message("user", "x", "s1")
+    assert "聊天消息总数已达上限" in str(info.value)
+    state["sql"] = []
+    with pytest.raises(MemoryPersistenceError) as info:
+        msgs_store.add_chat_turn("q", "a", "s1")
+    assert "聊天消息总数已达上限" in str(info.value)
     assert not any(
         "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
     )
@@ -3953,6 +3973,11 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     memory._execute = lambda sql, params=None, replay_safe=True: recorded.append(
         (sql, replay_safe)
     )
+    # 单条消息走「事务 + 计数 + 插入」：同样禁止自动重放
+    chat_runs: list[bool] = []
+    memory._run_with_retry = (
+        lambda op, replay_safe=True: chat_runs.append(replay_safe) or 0
+    )
     memory.add_chat_message("user", "hi", "s1")
     memory.add_chat_message(
         "user", "hi", "s1", timestamp="2026-01-01T00:00:00"
@@ -3960,7 +3985,8 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     memory.increment_query_count()
     for sql, flag in recorded:
         assert flag is False, sql
-    assert len(recorded) == 3
+    assert chat_runs == [False, False], chat_runs
+    assert len(recorded) == 1
 
     memory._advisory_lock = lambda name: contextlib.nullcontext()
     memory._next_trip_number = lambda: 7
@@ -4176,6 +4202,9 @@ def test_pg_add_chat_turn_locks_before_guard():
         def execute(self, sql, params=None):
             events.append(("execute", str(sql), params))
 
+        def fetchone(self):
+            return (0,)
+
         def executemany(self, sql, rows):
             events.append(("executemany", str(sql), list(rows)))
 
@@ -4200,8 +4229,11 @@ def test_pg_add_chat_turn_locks_before_guard():
     assert "pg_advisory_xact_lock(hashtext(%s))" in events[0][1]
     assert events[0][2] == ("aligo:session_meta:u-order",)
     assert events[1] == ("guard",), "守卫必须在拿到会话锁之后调用"
-    assert events[2][0] == "executemany"
-    rows = events[2][2]
+    # 守卫通过后在锁内计数（写层硬上限），再插入
+    assert events[2][0] == "execute"
+    assert "COUNT(*)" in events[2][1]
+    assert events[3][0] == "executemany"
+    rows = events[3][2]
     assert [row[1] for row in rows] == ["user", "assistant"]
     assert [row[2] for row in rows] == ["问", "答"]
 
@@ -5279,6 +5311,7 @@ if __name__ == "__main__":
     except (OSError, ValueError):
         pass
     import pathlib
+    import shutil
     import tempfile
 
     ran = 0
@@ -5291,13 +5324,16 @@ if __name__ == "__main__":
         fixture = None
         caplog_shim = None
         kwargs: dict = {}
+        tmp_dir_paths: list[pathlib.Path] = []
         unsupported = False
         for param, spec in params.items():
             if param == "monkeypatch":
                 fixture = pytest.MonkeyPatch()
                 kwargs[param] = fixture
             elif param == "tmp_path":
-                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+                _tmp_dir = pathlib.Path(tempfile.mkdtemp())
+                tmp_dir_paths.append(_tmp_dir)
+                kwargs[param] = _tmp_dir
             elif param == "caplog":
                 # pytest 夹具只在 pytest 内注入：直跑用最小替身真正执行
                 # 日志断言，不能静默跳过（否则脱敏回归在直跑清单上假绿）
@@ -5313,6 +5349,8 @@ if __name__ == "__main__":
                 caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
@@ -5361,6 +5399,10 @@ if __name__ == "__main__":
                 fixture.undo()
             if kb_fixture is not None:
                 kb_fixture.undo()
+            # 直跑模式自建的临时目录要自己清：否则每跑一次清单就在系统
+            # 临时目录里留下一批带记忆文件的目录
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
     total = sum(
         1
         for name, func in globals().items()

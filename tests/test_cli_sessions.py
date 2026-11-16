@@ -1584,6 +1584,7 @@ if __name__ == "__main__":
     except (OSError, ValueError):
         pass
     import pathlib
+    import shutil
     import tempfile
 
     ran = 0
@@ -1595,19 +1596,24 @@ if __name__ == "__main__":
         params = inspect.signature(func).parameters
         fixture = None
         kwargs: dict = {}
+        tmp_dir_paths: list[pathlib.Path] = []
         unsupported = False
         for param, spec in params.items():
             if param == "monkeypatch":
                 fixture = pytest.MonkeyPatch()
                 kwargs[param] = fixture
             elif param == "tmp_path":
-                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+                _tmp_dir = pathlib.Path(tempfile.mkdtemp())
+                tmp_dir_paths.append(_tmp_dir)
+                kwargs[param] = _tmp_dir
             else:
                 unsupported = True
                 break
         if unsupported:
             if fixture is not None:
                 fixture.undo()
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
@@ -1639,6 +1645,10 @@ if __name__ == "__main__":
                 fixture.undo()
             if kb_fixture is not None:
                 kb_fixture.undo()
+            # 直跑模式自建的临时目录要自己清：否则每跑一次清单就在系统
+            # 临时目录里留下一批带记忆文件的目录
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
     total = sum(
         1
         for name, func in globals().items()

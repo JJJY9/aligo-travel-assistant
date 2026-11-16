@@ -3420,6 +3420,116 @@ def test_merged_knowledge_size_axis_baseline(monkeypatch):
     print("✓ 知识轴尺寸基线超限时跳过")
 
 
+def test_merged_user_data_baseline_allows_oversized_account(monkeypatch):
+    """存量用户数据自身（不含知识库）已超导出上限的账号（正常聊天积累
+    到 50MB 以上）：任何恢复都无法让它更糟，体积轴不得把该账号的所有
+    导入都 413（连幂等重导自身备份都不行）；条数轴仍照常拒绝。"""
+    from utils import user_import as module
+
+    messages = [
+        {
+            "role": "user",
+            "content": "m" * 3000,
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00.000000",
+        }
+        for _ in range(10)
+    ]
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [dict(item) for item in messages],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 8000)
+    assert (
+        module.backup_limit_problem(
+            module._export_shape_baseline(_Store().export_snapshot(), [])
+        )
+        is not None
+    )
+    # 小备份不再被体积轴拒绝（否则该账号换机 / 恢复完全不可用）
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"preferences": {"home_location": "北京"}}
+        )
+        is None
+    )
+    # 幂等重导自身备份（消息全部命中去重、零写入）同样放行
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"messages": [dict(item) for item in messages]}
+        )
+        is None
+    )
+    # 条数轴照常生效：把账号推过消息条数上限的备份仍然拒绝
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 12)
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"preferences": {"home_location": "北京"}}
+        )
+        is None
+    )
+    too_many = {
+        "messages": [dict(item) for item in messages]
+        + [
+            {"role": "user", "content": "新", "session_id": "s2"}
+            for _ in range(5)
+        ]
+    }
+    problem = module.merged_backup_limit_problem(_Store(), too_many)
+    assert problem and "上限" in problem, problem
+    print("✓ 存量已超限账号的体积轴放行、条数轴保留")
+
+
+def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
+    """知识片段恢复失败不能吞掉「用户数据未恢复」：隔离账号 + 备份只有
+    保留字会话消息 + 一条知识片段，导入结果同时带 knowledge_error 与
+    recovery_incomplete，CLI 文案不得声称「用户数据已恢复」。"""
+    import utils.knowledge_admin as kb
+    from pathlib import Path as pathlib_path
+
+    def boom(documents, *args, **kwargs):
+        raise RuntimeError("kb down")
+
+    monkeypatch.setattr(kb, "import_documents", boom)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_combo_")
+    leftover = (
+        pathlib_path(storage_dir)
+        / "u-combo.json.corrupt-20260101000000000000-9"
+    )
+    leftover.write_text("{}", encoding="utf-8")
+    store = LongTermMemory("u-combo", storage_dir, allow_quarantined=True)
+    assert store.get_recovered_corrupt_backup()
+    path = _write_json(
+        {
+            "chat_history": [
+                {"role": "user", "content": "x", "session_id": "export"}
+            ],
+            "knowledge": [{"content": "知识片段"}],
+        }
+    )
+    code, out = _run_import(monkeypatch, "u-combo", path, store, as_json=True)
+    payload = json.loads(out)
+    assert code == 1, (code, out)
+    assert payload.get("recovery_incomplete") is True, payload
+    assert payload.get("knowledge_error"), payload
+    code, out = _run_import(monkeypatch, "u-combo", path, store)
+    assert code == 1, (code, out)
+    assert "⚠ 用户数据未恢复" in out, out
+    assert "用户数据已恢复" not in out, out
+    print("✓ 知识失败与空恢复同时报告")
+
+
 def test_user_import_warns_when_quarantined_and_no_user_data(monkeypatch):
     """隔离账号 + 备份无可写回用户数据：CLI ok=false、退出码 1 并明确
     提示账号仍处隔离态（不能报告为恢复成功）。"""
@@ -3472,9 +3582,15 @@ def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
                 "exported_at": "2026-01-01T00:00:00",
             }
 
-    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 600)
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 4000)
     problem = module.merged_backup_limit_problem(
-        _Store(), {"preferences": {}, "trips": [], "messages": []}
+        _Store(),
+        {
+            # 写入的偏好本身不超限：只有把现有快照的额外字段计入才超限
+            "preferences": {"home_location": "p" * 2000},
+            "trips": [],
+            "messages": [],
+        },
     )
     assert problem and "超过导入上限" in problem, problem
     print("✓ 合并复核计入现有快照的额外字段")
@@ -3498,11 +3614,17 @@ def test_merged_preview_keeps_existing_frequent_destinations(monkeypatch):
                 },
             }
 
-    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 2_000)
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 6000)
     problem = module.merged_backup_limit_problem(
-        _Store(), {"preferences": {}, "trips": [], "messages": []}
+        _Store(),
+        {
+            "preferences": {"home_location": "p" * 1500},
+            "trips": [],
+            "messages": [],
+        },
     )
-    # 存量统计（旧城市×180 字 × 3 的键文本）保留 → 超限
+    # 存量统计（旧城市×180 字 × 3 的键文本）保留 → 合并超限；
+    # 丢掉存量 frequent_destinations 则合并体积在上限内
     assert problem and "超过导入上限" in problem, problem
     print("✓ 合并预演保留存量 frequent_destinations")
 
@@ -3633,6 +3755,7 @@ if __name__ == "__main__":
     except (OSError, ValueError):
         pass
     import pathlib
+    import shutil
     import tempfile
 
     ran = 0
@@ -3645,13 +3768,16 @@ if __name__ == "__main__":
         fixture = None
         caplog_shim = None
         kwargs: dict = {}
+        tmp_dir_paths: list[pathlib.Path] = []
         unsupported = False
         for param, spec in params.items():
             if param == "monkeypatch":
                 fixture = pytest.MonkeyPatch()
                 kwargs[param] = fixture
             elif param == "tmp_path":
-                kwargs[param] = pathlib.Path(tempfile.mkdtemp())
+                _tmp_dir = pathlib.Path(tempfile.mkdtemp())
+                tmp_dir_paths.append(_tmp_dir)
+                kwargs[param] = _tmp_dir
             elif param == "caplog":
                 # pytest 夹具只在 pytest 内注入：直跑用最小替身真正执行
                 # 日志断言，不能静默跳过（否则脱敏回归在直跑清单上假绿）
@@ -3667,6 +3793,8 @@ if __name__ == "__main__":
                 caplog_shim.close()
             if fixture is not None:
                 fixture.undo()
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
@@ -3715,6 +3843,10 @@ if __name__ == "__main__":
                 fixture.undo()
             if kb_fixture is not None:
                 kb_fixture.undo()
+            # 直跑模式自建的临时目录要自己清：否则每跑一次清单就在系统
+            # 临时目录里留下一批带记忆文件的目录
+            for _tmp_dir in tmp_dir_paths:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
     total = sum(
         1
         for name, func in globals().items()

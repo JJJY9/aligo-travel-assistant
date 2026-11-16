@@ -3176,7 +3176,13 @@ def run_user_import_standalone(
             )
         )
     else:
-        prefix = "预览（未写入）：" if dry_run else "已恢复："
+        if dry_run:
+            prefix = "预览（未写入）："
+        elif incomplete:
+            # 无写回用户数据（隔离证据尚在）：不能以「已恢复」汇报
+            prefix = "已写入："
+        else:
+            prefix = "已恢复："
         summary = (
             f"{prefix}偏好 {counts['preferences']} 项，行程新增 "
             f"{counts['trips_created']} 条 / 更新 {counts['trips_updated']} 条，"
@@ -3195,7 +3201,13 @@ def run_user_import_standalone(
             )
         print(summary)
         if knowledge_error:
-            print(f"❌ {knowledge_error}（用户数据已恢复，可稍后重跑补齐知识片段）")
+            if incomplete:
+                print(f"❌ {knowledge_error}")
+            else:
+                print(
+                    f"❌ {knowledge_error}"
+                    "（用户数据已恢复，可稍后重跑补齐知识片段）"
+                )
         if incomplete:
             print(
                 "⚠ 用户数据未恢复：本次备份没有可写回的用户数据，"
