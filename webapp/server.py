@@ -5815,8 +5815,9 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")
             # 与 CLI user-import 同序：先剔除墓碑期刚删除 / 保留字会话，
             # 再做 50MB 自检——被剔除的消息不能计入体积，否则同一备份在
-            # Web 413、CLI 却可恢复。墓碑查询走 to_thread，落库前的复查
-            # （_run_import 内的 late_deleted）仍覆盖等待队列期间的删除
+            # Web 413、CLI 却可恢复。真正剔除放在用户锁内（见下）：DELETE
+            # 失败会撤销墓碑，锁外的「查询 → 剔除」窗口里一旦撤销，已从
+            # sections 删掉的消息就永远恢复不了，接口却仍报告成功。
             #
             # 墓碑期内的会话刚被删除：跳过其消息与元数据，避免恢复把
             # 已删除的会话重新写回（DELETE 的墓碑只需覆盖这段时间）。
@@ -5831,19 +5832,6 @@ def create_app(model: Any = None) -> FastAPI:
                 for trip in sections["trips"]
                 if trip.get("session_id")
             }
-            if unique_sessions:
-                # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
-                # 意味着数十万次线程跳转与网络往返），且整批放在一次
-                # to_thread 里完成
-                deleted_sessions = await asyncio.to_thread(
-                    lambda: {
-                        session_id
-                        for session_id in unique_sessions
-                        if state.is_recently_deleted(user_id, session_id)
-                    }
-                )
-            else:
-                deleted_sessions = set()
             # 保留字会话（如 export）在 Web 端永远打不开：备份恢复时与墓碑
             # 同一处理，跳过其消息与元数据，避免导入一个无法查看的会话
             reserved_sessions = {
@@ -5851,43 +5839,6 @@ def create_app(model: Any = None) -> FastAPI:
                 for session_id in unique_sessions
                 if session_id in _RESERVED_SESSION_IDS
             }
-            skipped_sessions = deleted_sessions | reserved_sessions
-            active_sessions = set(unique_sessions) - skipped_sessions
-            for session_id in sorted(deleted_sessions):
-                errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
-            for session_id in sorted(reserved_sessions):
-                errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
-            # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
-            # 共用同一实现，两条恢复路径不再有语义差）
-            drop_sessions(sections, skipped_sessions)
-
-            # 上限自检与 CLI user-import 同口径：按【解析并剔除后】的
-            # 可恢复段复核。解析会丢弃 / 截断非法行、剔除会移除墓碑 /
-            # 保留字会话，任一阶段漏对齐都会让同一备份两入口结论相反
-            try:
-                from config import STORAGE_CONFIG as _storage_config
-
-                limit_problem = await loop.run_in_executor(
-                    state.import_executor,
-                    lambda: sections_limit_problem(
-                        sections,
-                        pg_shape=bool(
-                            _storage_config.get("postgres_dsn")
-                        ),
-                    ),
-                )
-            except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
-                logger.debug("备份导出口径自检失败", exc_info=True)
-                limit_problem = None
-            if limit_problem:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"备份超过可导入上限：{limit_problem}。"
-                        "按导出格式（indent=2）计算已超过 50 MB，恢复后"
-                        "将无法再次导出；请先在源账号清理后重新导出"
-                    ),
-                )
 
             # 有界等待用户锁：同一用户有在途长回合时不能在持有全局导入
             # 槽位的情况下无上限等待（两个请求即可让所有用户的导入 503），
@@ -5896,6 +5847,58 @@ def create_app(model: Any = None) -> FastAPI:
                 request, state.lock_for(user_id), _request_id(request), timeout=10.0
             ):
                 sessions_dropped_in_queue: set[str] = set()
+
+                if unique_sessions:
+                    # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
+                    # 意味着数十万次线程跳转与网络往返），且整批放在一次
+                    # to_thread 里完成
+                    deleted_sessions = await asyncio.to_thread(
+                        lambda: {
+                            session_id
+                            for session_id in unique_sessions
+                            if state.is_recently_deleted(user_id, session_id)
+                        }
+                    )
+                else:
+                    deleted_sessions = set()
+                for session_id in sorted(deleted_sessions):
+                    errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
+                for session_id in sorted(reserved_sessions):
+                    errors.append(f"会话 {session_id} 使用了保留字，已跳过其消息")
+                # 剔除消息 / 标题 / 置顶 / 归档并清空行程关联（与 CLI user-import
+                # 共用同一实现，两条恢复路径不再有语义差）
+                drop_sessions(sections, deleted_sessions | reserved_sessions)
+                active_sessions = (
+                    set(unique_sessions) - deleted_sessions - reserved_sessions
+                )
+
+                # 上限自检与 CLI user-import 同口径：按【解析并剔除后】的
+                # 可恢复段复核。解析会丢弃 / 截断非法行、剔除会移除墓碑 /
+                # 保留字会话，任一阶段漏对齐都会让同一备份两入口结论相反
+                try:
+                    from config import STORAGE_CONFIG as _storage_config
+
+                    limit_problem = await loop.run_in_executor(
+                        state.import_executor,
+                        lambda: sections_limit_problem(
+                            sections,
+                            pg_shape=bool(
+                                _storage_config.get("postgres_dsn")
+                            ),
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
+                    logger.debug("备份导出口径自检失败", exc_info=True)
+                    limit_problem = None
+                if limit_problem:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"备份超过可导入上限：{limit_problem}。"
+                            "按导出格式（indent=2）计算已超过 50 MB，恢复后"
+                            "将无法再次导出；请先在源账号清理后重新导出"
+                        ),
+                    )
 
                 def _run_import() -> dict[str, Any]:
                     if not dry_run:

@@ -1322,6 +1322,14 @@ class LongTermMemory:
             "session_id": session_id
         }
 
+        from utils.user_import import _MAX_MESSAGES
+
+        # 写入层硬上限（与批量恢复同口径）：并发 / 长期运行越限后
+        # /api/export 会永久 413，账号再也导不出可恢复的备份
+        if len(self.data["chat_history"]) + 1 > _MAX_MESSAGES:
+            raise MemoryPersistenceError(
+                f"聊天消息总数已达上限 {_MAX_MESSAGES}，请先清理历史消息"
+            )
         self.data["chat_history"].append(message)
         self.data["statistics"]["total_messages"] += 1
         self._persist()
@@ -1425,6 +1433,14 @@ class LongTermMemory:
         user_ts = user_timestamp or now
         assistant_ts = assistant_timestamp or now
         history = self.data["chat_history"]
+        from utils.user_import import _MAX_MESSAGES
+
+        # 写入层硬上限（与批量恢复同口径）：每轮写两条，越限后 /api/export
+        # 会永久 413，账号再也导不出可恢复的备份
+        if len(history) + 2 > _MAX_MESSAGES:
+            raise MemoryPersistenceError(
+                f"聊天消息总数已达上限 {_MAX_MESSAGES}，请先清理历史消息"
+            )
         start = len(history)
         total_before = int(self.data["statistics"].get("total_messages") or 0)
         history.append(

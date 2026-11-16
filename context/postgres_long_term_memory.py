@@ -667,22 +667,54 @@ class PostgresLongTermMemory:
         session_id: str | None = None,
         timestamp: str | None = None,
     ) -> None:
-        if timestamp:
-            # 备份恢复：保留原始时间戳（naive 按本机时区解释）。
-            # INSERT 非幂等：提交后响应丢失不能自动重放（会产生重复消息）
-            self._execute(
-                "INSERT INTO aligo_chat_messages "
-                "(user_id, role, content, session_id, created_at) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (self.user_id, role, content, session_id, _pg_timestamp(timestamp)),
-                replay_safe=False,
-            )
-            return
-        self._execute(
-            "INSERT INTO aligo_chat_messages (user_id, role, content, session_id) VALUES (%s, %s, %s, %s)",
-            (self.user_id, role, content, session_id),
-            replay_safe=False,
-        )
+        from utils.user_import import _MAX_MESSAGES
+
+        def run() -> None:
+            # 与批量恢复同一个用户级事务锁：「计数 + 插入」与并发导入 /
+            # 并发写入串行化，否则两个写入方都能在对方的未提交行不可见
+            # 时通过上限检查、合计越限后 /api/export 会永久 413
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:chat_messages:{self.user_id}",),
+                )
+                cursor.execute(
+                    "SELECT COUNT(*) FROM aligo_chat_messages "
+                    "WHERE user_id = %s",
+                    (self.user_id,),
+                )
+                total_row = cursor.fetchone()
+                total = int(total_row[0] or 0) if total_row else 0
+                if total + 1 > _MAX_MESSAGES:
+                    raise MemoryPersistenceError(
+                        f"聊天消息总数已达上限 {_MAX_MESSAGES}，"
+                        "请先清理历史消息"
+                    )
+                if timestamp:
+                    # 备份恢复：保留原始时间戳（naive 按本机时区解释）。
+                    # INSERT 非幂等：提交后响应丢失不能自动重放（会产生
+                    # 重复消息）
+                    cursor.execute(
+                        "INSERT INTO aligo_chat_messages "
+                        "(user_id, role, content, session_id, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            self.user_id,
+                            role,
+                            content,
+                            session_id,
+                            _pg_timestamp(timestamp),
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT INTO aligo_chat_messages "
+                        "(user_id, role, content, session_id) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (self.user_id, role, content, session_id),
+                    )
+
+        self._run_with_retry(run, replay_safe=False)
 
     def add_chat_turn(
         self,
@@ -718,6 +750,22 @@ class PostgresLongTermMemory:
                 )
                 if should_commit is not None and not should_commit():
                     return False
+                from utils.user_import import _MAX_MESSAGES
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM aligo_chat_messages "
+                    "WHERE user_id = %s",
+                    (self.user_id,),
+                )
+                total_row = cursor.fetchone()
+                total = int(total_row[0] or 0) if total_row else 0
+                # 写入层硬上限（与批量恢复同口径）：每轮两条，合计越限后
+                # /api/export 会永久 413，账号再也导不出可恢复的备份
+                if total + 2 > _MAX_MESSAGES:
+                    raise MemoryPersistenceError(
+                        f"聊天消息总数已达上限 {_MAX_MESSAGES}，"
+                        "请先清理历史消息"
+                    )
                 # 与短期记忆共享同一消息时间戳（内容指纹跨来源对齐）：
                 # 未提供时仍由数据库 now() 兜底
                 cursor.executemany(

@@ -364,14 +364,8 @@ def _assistant_content_problem(content: str) -> str | None:
     return _non_finite_in_value(meta)
 
 
-def backup_limit_problem(backup: dict[str, Any]) -> str | None:
-    """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
-
-    口径与 ``parse_user_export`` / ``import_user_data`` 的硬上限一致：
-    条数与备份文件字节上限。返回具体原因或 None。
-    """
-    if not isinstance(backup, dict):
-        return None
+def _count_limit_problem(backup: dict[str, Any]) -> str | None:
+    """条数轴上限（与导入侧硬上限完全一致）；体积轴另有口径。"""
     messages = backup.get("chat_history")
     if isinstance(messages, list) and len(messages) > _MAX_MESSAGES:
         return f"消息 {len(messages)} 条超过导入上限 {_MAX_MESSAGES}"
@@ -384,8 +378,12 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     knowledge = backup.get("knowledge")
     if isinstance(knowledge, list) and len(knowledge) > _MAX_KNOWLEDGE:
         return f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}"
-    # 与导出实际写出的格式对齐：孤立代理项先转义（否则 encode 直接抛
-    # UnicodeEncodeError），体积按 indent=2（以及 Windows 换行翻译）估算——
+    return None
+
+
+def _backup_payload_size(backup: dict[str, Any]) -> int:
+    """按导出实际写出的格式估算体积（indent=2，Windows 换行翻译）。"""
+    # 孤立代理项先转义（否则 encode 直接抛 UnicodeEncodeError）——
     # 紧凑 JSON 的估算会让 1.3-1.6 倍体积的备份通过自检、写盘后却被导入侧
     # 「超过 50 MB」拒绝，导出器产出自己声明可恢复、实际无法导入的备份
     from utils.exporter import sanitize_backup_data
@@ -396,6 +394,21 @@ def backup_limit_problem(backup: dict[str, Any]) -> str | None:
     size = len(serialized.encode("utf-8"))
     if os.linesep != "\n":
         size += serialized.count("\n")
+    return size
+
+
+def backup_limit_problem(backup: dict[str, Any]) -> str | None:
+    """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
+
+    口径与 ``parse_user_export`` / ``import_user_data`` 的硬上限一致：
+    条数与备份文件字节上限。返回具体原因或 None。
+    """
+    if not isinstance(backup, dict):
+        return None
+    problem = _count_limit_problem(backup)
+    if problem is not None:
+        return problem
+    size = _backup_payload_size(backup)
     if size > MAX_BACKUP_BYTES:
         return (
             f"约 {size / (1024 * 1024):.1f} MB 超过导入上限 "
@@ -548,7 +561,21 @@ def merged_backup_limit_problem(
         water = max([existing_last, *trip_numbers], default=existing_last)
         statistics["last_trip_number"] = water + created_trip_count
     payload["statistics"] = statistics
-    return backup_limit_problem(payload)
+    problem = backup_limit_problem(payload)
+    if problem is None:
+        return None
+    # 用户数据轴的导入前基线：存量账号自身（不含知识库）按导出格式已
+    # 超限时——正常聊天积累到 50MB 以上的账号——任何恢复都无法让它更糟，
+    # 体积轴不再作为拒绝理由（否则该账号连幂等重导自身备份都会被 413，
+    # 完全无法换机 / 恢复）。条数轴照常生效：把账号推过条数上限的备份
+    # （导入后永远无法导出）仍然拒绝。
+    baseline = _export_shape_baseline(existing, [])
+    if (
+        backup_limit_problem(baseline) is not None
+        and _count_limit_problem(payload) is None
+    ):
+        return None
+    return problem
 
 
 def _new_message_rows(
@@ -1714,26 +1741,29 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     # .corrupt-* / .quarantine 的恢复指引全部抹掉（用户以为已恢复，
     # 实际数据仍只在隔离备份里）——此时保留隔离证据，返回
     # recovery_incomplete 供上层提示「用户数据未恢复」。
-    # 知识片段恢复失败时视为恢复未完成，保留隔离 / 删除标记待重试
-    if "knowledge_error" not in result:
-        wrote_user_data = any(
-            int(result.get(key) or 0)
-            for key in (
-                "preferences",
-                "trips_created",
-                "trips_updated",
-                "messages_added",
-                "titles",
-                "pinned",
-                "archived",
-            )
+    # 知识片段恢复失败时视为恢复未完成，保留隔离 / 删除标记待重试；
+    # 「无用户数据 + 隔离证据」的判定与知识片段无关：知识失败路径同样
+    # 必须报告用户数据未恢复（否则上层只看 knowledge_error，面板会把
+    # 空恢复显示成「已恢复」）。ensure_persisted 仍只在知识片段成功时
+    # 调用——知识失败不重建主文件，隔离 / 删除标记得以保留。
+    wrote_user_data = any(
+        int(result.get(key) or 0)
+        for key in (
+            "preferences",
+            "trips_created",
+            "trips_updated",
+            "messages_added",
+            "titles",
+            "pinned",
+            "archived",
         )
-        if not wrote_user_data and _store_has_quarantine_evidence(store):
-            result["recovery_incomplete"] = True
-        else:
-            ensure_persisted = getattr(store, "ensure_persisted", None)
-            if callable(ensure_persisted):
-                ensure_persisted()
+    )
+    if not wrote_user_data and _store_has_quarantine_evidence(store):
+        result["recovery_incomplete"] = True
+    elif "knowledge_error" not in result:
+        ensure_persisted = getattr(store, "ensure_persisted", None)
+        if callable(ensure_persisted):
+            ensure_persisted()
     return result
 
 
