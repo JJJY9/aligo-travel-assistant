@@ -1822,8 +1822,11 @@ async function importUserBackup() {
       result.knowledge_imported || result.knowledge_skipped
         ? `，知识片段新增 ${result.knowledge_imported} / 跳过 ${result.knowledge_skipped} 条`
         : "";
+    // 与 CLI 同口径：隔离账号 + 无写回数据（recovery_incomplete）时
+    // 不能以「已恢复」开头，否则同一条 toast 先声称恢复成功再追加警告
+    const restorePrefix = result.recovery_incomplete ? "已写入：" : "已恢复：";
     let restoreMessage =
-      `已恢复：偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
+      `${restorePrefix}偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
       `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
       knowledgeNote +
       (skipped ? `，跳过 ${skipped} 项` : "");

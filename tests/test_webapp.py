@@ -1808,6 +1808,52 @@ def test_export_sanitizes_surrogate_and_non_finite():
     print("✓ 导出清洗孤立代理项与 NaN（JSON / Markdown / 会话导出）")
 
 
+def test_chat_message_cap_surfaces_cleanup_hint(monkeypatch):
+    """聊天消息条数硬上限：普通端点回 409 + 可执行清理提示（不是
+    「存储暂时不可用」），流式 error 事件同样保留该提示。"""
+    from utils import user_import as module
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    hint = server_module._persistence_failure_detail(
+        MemoryPersistenceError(
+            "聊天消息总数已达上限 200000，请先清理历史消息"
+        ),
+        "rid",
+    )
+    assert "清理历史消息" in hint and "存储暂时不可用" not in hint, hint
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 2)
+    client = _client()
+    user_id = _unique_user("web_chat_cap")
+    try:
+        first = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "s1"},
+        )
+        assert first.status_code == 200, first.text[:200]
+        second = client.post(
+            "/api/chat",
+            json={"message": "再来", "user_id": user_id, "session_id": "s1"},
+        )
+        assert second.status_code == 409, second.text[:300]
+        assert "清理历史消息" in second.json()["detail"]
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"message": "流式", "user_id": user_id, "session_id": "s2"},
+        ) as response:
+            assert response.status_code == 200
+            events = []
+            for line in response.iter_lines():
+                if line.startswith("data:"):
+                    events.append(json.loads(line[5:].strip()))
+        errors = [event for event in events if event.get("type") == "error"]
+        assert errors and "清理历史消息" in errors[-1]["message"], events[-3:]
+    finally:
+        _cleanup(user_id)
+    print("✓ 聊天消息上限回 409 并保留清理提示")
+
+
 def test_export_refuses_backup_over_import_limits(monkeypatch):
     """超出导入上限的备份返回 413（不产出永远无法恢复的文件）。"""
     from utils import user_import as module

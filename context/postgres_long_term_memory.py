@@ -750,6 +750,16 @@ class PostgresLongTermMemory:
                 )
                 if should_commit is not None and not should_commit():
                     return False
+                # 与 add_chat_message / add_chat_messages 共用同一把用户级
+                # 消息锁：只拿会话元数据锁时，批量导入（chat_messages 锁）
+                # 与单轮写入（session_meta 锁）在 READ COMMITTED 下都看不到
+                # 对方未提交行、各自通过上限检查后合计越限。固定锁序
+                # session_meta → chat_messages：导入只取后者、删除 / 会话
+                # 元数据只取前者，无反向获取，不会死锁
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:chat_messages:{self.user_id}",),
+                )
                 from utils.user_import import _MAX_MESSAGES
 
                 cursor.execute(

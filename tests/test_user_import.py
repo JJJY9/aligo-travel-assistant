@@ -3488,7 +3488,101 @@ def test_merged_user_data_baseline_allows_oversized_account(monkeypatch):
     }
     problem = module.merged_backup_limit_problem(_Store(), too_many)
     assert problem and "上限" in problem, problem
+    # 存量自身已超条数上限（硬上限上线前的越限账号）：条数轴同样豁免，
+    # 任何导入都不能被存量条数拒绝；_enforce_import_limits 同口径
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 8)
+
+    class _CapStore:
+        def get_statistics(self):
+            return {"total_messages": 10}
+
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"preferences": {"home_location": "北京"}}
+        )
+        is None
+    )
+    # 已越限账号导入新增消息也不再按「推过上限」拒绝（与基线语义一致）
+    module._enforce_import_limits(
+        _CapStore(),
+        {"messages": [{"role": "user", "content": "新", "session_id": "s2"}]},
+    )
     print("✓ 存量已超限账号的体积轴放行、条数轴保留")
+
+
+def test_sections_limit_baseline_exempts_over_limit_axis(monkeypatch):
+    """备份自身体积预检同样按导入前基线豁免：存量已超限的账号恢复
+    自身体积超限的备份不能被预检 413（合并复核的放行必须可达）；
+    不同轴互不豁免。"""
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 2000)
+    message = {
+        "role": "user",
+        "content": "m" * 3000,
+        "session_id": "s1",
+        "timestamp": "2026-01-01T00:00:00.000000",
+    }
+    sections = {"messages": [dict(message)]}
+    existing = {
+        "chat_history": [],
+        "trip_history": [
+            {
+                "origin": "A",
+                "destination": "B",
+                "start_date": "2026-01-01",
+                "purpose": "p" * 3000,
+            }
+        ],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    # 无基线：原严格口径（体积超限）
+    assert module.sections_limit_problem(sections) is not None
+    # 存量体积已超限：体积轴豁免；存量未超限时保持原判定
+    assert module.sections_limit_problem(sections, existing=existing) is None
+    assert (
+        module.sections_limit_problem(sections, existing={"chat_history": []})
+        is not None
+    )
+    # 不同轴互不豁免：存量只在体积轴超限，不能放行条数轴超限的备份
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 0)
+    problem = module.sections_limit_problem(sections, existing=existing)
+    assert problem and "消息" in problem, problem
+    print("✓ 备份体积预检按导入前基线豁免")
+
+
+def test_cli_import_baseline_allows_oversized_backup(monkeypatch):
+    """CLI 入口：存量已超导出上限的账号导入「按导出形状超限」的备份
+    不再被预检拒绝（预检需要打开 store 取基线，与合并复核同结论）。"""
+    from utils import user_import as module
+
+    # 原始文件（紧凑 JSON）低于上限、按导出形状（indent=2）超限：
+    # 覆盖真实场景里「紧凑备份预检通过、导出形状复核超限」的差异
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 8000)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_bigcli_")
+    store = LongTermMemory("u-bigcli", storage_dir)
+    for index in range(60):
+        store.add_chat_message("user", "m" * 40, f"old-{index}")
+    path = _write_json(
+        {
+            "chat_history": [
+                {
+                    "role": "user",
+                    "content": "m" * 40,
+                    "session_id": f"new-{index}",
+                }
+                for index in range(60)
+            ]
+        }
+    )
+    code, out = _run_import(monkeypatch, "u-bigcli", path, store)
+    assert code == 0, out
+    assert len(store.get_chat_history()) == 120
+    print("✓ 存量超限账号的 CLI 导入按基线放行")
 
 
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
@@ -3523,6 +3617,13 @@ def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
     assert code == 1, (code, out)
     assert payload.get("recovery_incomplete") is True, payload
     assert payload.get("knowledge_error"), payload
+    # 预览与真实执行同结论：--dry-run 同样报告恢复未完成
+    code, out = _run_import(
+        monkeypatch, "u-combo", path, store, as_json=True, dry_run=True
+    )
+    payload = json.loads(out)
+    assert code == 1, (code, out)
+    assert payload.get("recovery_incomplete") is True, payload
     code, out = _run_import(monkeypatch, "u-combo", path, store)
     assert code == 1, (code, out)
     assert "⚠ 用户数据未恢复" in out, out
