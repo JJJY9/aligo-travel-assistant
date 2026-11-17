@@ -1866,6 +1866,33 @@ def test_chat_message_cap_surfaces_cleanup_hint(monkeypatch):
     print("✓ 聊天消息上限回 409 并保留清理提示")
 
 
+def test_import_reads_export_snapshot_once(monkeypatch):
+    """预检与合并复核共用同一导出快照：每个导入只做一次全量读取。"""
+    from utils import user_import as module
+
+    calls = {"n": 0}
+    real = module._store_export_snapshot
+
+    def counting(store):
+        calls["n"] += 1
+        return real(store)
+
+    monkeypatch.setattr(module, "_store_export_snapshot", counting)
+    client = _client()
+    user_id = _unique_user("web_import_snapshot_once")
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"home_location": "北京"}}},
+        )
+        assert response.status_code == 200, response.text
+        assert calls["n"] == 1, calls
+    finally:
+        _cleanup(user_id)
+    print("✓ 导入预检与合并复核共用一次快照")
+
+
 def test_export_refuses_backup_over_import_limits(monkeypatch):
     """超出导入上限的备份返回 413（不产出永远无法恢复的文件）。"""
     from utils import user_import as module
@@ -2171,7 +2198,7 @@ def test_import_rejects_backup_over_export_size(monkeypatch):
     monkeypatch.setattr(
         user_import_module,
         "backup_limit_problem",
-        lambda backup: "消息 1 条超过导入上限（模拟导出体积超限）",
+        lambda backup, **kwargs: "消息 1 条超过导入上限（模拟导出体积超限）",
     )
     client = _client()
     response = client.post(
@@ -4230,7 +4257,7 @@ def test_import_checks_limit_after_dropping_sessions(monkeypatch):
     被剔除消息的大体积不能让同一备份在 Web 413。"""
     from utils import user_import as module
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         contents = [
             message.get("content")
             for message in payload.get("chat_history") or []

@@ -676,6 +676,10 @@ class PostgresLongTermMemory:
             # 并发写入串行化，否则两个写入方都能在对方的未提交行不可见
             # 时通过上限检查、合计越限后 /api/export 会永久 413
             with self._conn.transaction(), self._conn.cursor() as cursor:
+                # 单条写入等的是「导入事务」这类长持锁者：默认连接级
+                # lock_timeout（3s）会让正常的长导入期间的单条写入直接
+                # 失败。SET LOCAL 只作用于本事务，给这把锁 30s 预算
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:chat_messages:{self.user_id}",),
@@ -759,7 +763,11 @@ class PostgresLongTermMemory:
                 # 与单轮写入（session_meta 锁）在 READ COMMITTED 下都看不到
                 # 对方未提交行、各自通过上限检查后合计越限。固定锁序
                 # session_meta → chat_messages：导入只取后者、删除 / 会话
-                # 元数据只取前者，无反向获取，不会死锁
+                # 元数据只取前者，无反向获取，不会死锁。
+                # 这把锁的持有者可能是整个导入事务：本事务内把等待预算
+                # 放宽到 30s（SET LOCAL 只影响当前事务），避免长导入期间
+                # 已生成的回答因默认 3s lock_timeout 被整轮丢弃
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:chat_messages:{self.user_id}",),

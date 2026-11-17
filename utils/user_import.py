@@ -364,12 +364,19 @@ def _assistant_content_problem(content: str) -> str | None:
     return _non_finite_in_value(meta)
 
 
-def _limit_problems(backup: dict[str, Any]) -> list[tuple[str, str]]:
+def _limit_problems(
+    backup: dict[str, Any], *, crlf: bool | None = None
+) -> list[tuple[str, str]]:
     """按轴列出导入上限问题（条数在前、体积在后）。
 
     轴名用于「导入前基线已超限」豁免：同一轴在导入前已越限时，任何恢复
     都无法让账号在该轴上更糟，不再作为拒绝理由；不同轴互不豁免
     （存量消息超限不能放行把偏好推过上限的备份）。
+
+    ``crlf`` 控制体积轴按哪种行尾估算：``None`` 按运行平台（与 CLI
+    ``write_text_atomic`` 的落盘口径一致）；``False`` 按 LF（Web
+    ``/api/export`` 响应体原样字节）——Windows 上把 LF 备份按 CRLF
+    估算会按行多算 1 字节，接近 50 MB 的合法 Web 备份被误判超限。
     """
     problems: list[tuple[str, str]] = []
     messages = backup.get("chat_history")
@@ -401,7 +408,7 @@ def _limit_problems(backup: dict[str, Any]) -> list[tuple[str, str]]:
                 f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}",
             )
         )
-    size = _backup_payload_size(backup)
+    size = _backup_payload_size(backup, crlf=crlf)
     if size > MAX_BACKUP_BYTES:
         problems.append(
             (
@@ -413,8 +420,14 @@ def _limit_problems(backup: dict[str, Any]) -> list[tuple[str, str]]:
     return problems
 
 
-def _backup_payload_size(backup: dict[str, Any]) -> int:
-    """按导出实际写出的格式估算体积（indent=2，Windows 换行翻译）。"""
+def _backup_payload_size(
+    backup: dict[str, Any], *, crlf: bool | None = None
+) -> int:
+    """按导出实际写出的格式估算体积（indent=2，可选 CRLF 换行翻译）。
+
+    ``crlf=None`` 按运行平台推定（Windows 的 CLI 写盘加 1 字节/行）；
+    ``crlf=False`` 按 LF 计（Web 响应体与浏览器下载的备份就是 LF）。
+    """
     # 孤立代理项先转义（否则 encode 直接抛 UnicodeEncodeError）——
     # 紧凑 JSON 的估算会让 1.3-1.6 倍体积的备份通过自检、写盘后却被导入侧
     # 「超过 50 MB」拒绝，导出器产出自己声明可恢复、实际无法导入的备份
@@ -424,20 +437,24 @@ def _backup_payload_size(backup: dict[str, Any]) -> int:
         sanitize_backup_data(backup), ensure_ascii=False, indent=2
     )
     size = len(serialized.encode("utf-8"))
-    if os.linesep != "\n":
+    use_crlf = (os.linesep != "\n") if crlf is None else crlf
+    if use_crlf:
         size += serialized.count("\n")
     return size
 
 
-def backup_limit_problem(backup: dict[str, Any]) -> str | None:
+def backup_limit_problem(
+    backup: dict[str, Any], *, crlf: bool | None = None
+) -> str | None:
     """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
 
     口径与 ``parse_user_export`` / ``import_user_data`` 的硬上限一致：
-    条数与备份文件字节上限。返回具体原因或 None。
+    条数与备份文件字节上限。返回具体原因或 None。``crlf`` 见
+    :func:`_limit_problems`（Web 通道按 LF 估算）。
     """
     if not isinstance(backup, dict):
         return None
-    problems = _limit_problems(backup)
+    problems = _limit_problems(backup, crlf=crlf)
     return problems[0][1] if problems else None
 
 
@@ -464,7 +481,11 @@ def _store_export_snapshot(store: Any) -> dict[str, Any] | None:
 
 
 def merged_backup_limit_problem(
-    store: Any, sections: dict[str, Any]
+    store: Any,
+    sections: dict[str, Any],
+    *,
+    existing: dict[str, Any] | None = None,
+    crlf: bool | None = None,
 ) -> str | None:
     """恢复后「账号现有数据 + 备份」按导出格式是否仍可能超限。
 
@@ -475,13 +496,21 @@ def merged_backup_limit_problem(
     跳过或更新，不进入合并结果——直接用「现有 + 备份」拼接会让重导自己
     备份的账号组合体积约为两倍，接近上限时被误判为恢复后超限（幂等恢复
     失效、--dry-run 与真实执行结论相反）。
+
+    ``existing`` 可由调用方传入已取得的导出快照（预检同一次读取），
+    避免每个请求对账号数据做两次全量读取、两次快照不一致。
+    ``crlf`` 见 :func:`_limit_problems`。
     """
     if not isinstance(sections, dict):
         return None
-    existing = _store_export_snapshot(store)
+    if existing is None:
+        existing = _store_export_snapshot(store)
     if existing is None:
         return sections_limit_problem(
-            sections, pg_shape=not getattr(store, "snapshot_based", False)
+            sections,
+            pg_shape=not getattr(store, "snapshot_based", False),
+            conservative=True,
+            crlf=crlf,
         )
     merged_prefs = (
         dict(existing.get("preferences") or {})
@@ -526,7 +555,9 @@ def merged_backup_limit_problem(
                 ),
             ),
             "preferences": merged_prefs,
-            "knowledge": _baseline_aware_knowledge_rows(existing, sections)
+            "knowledge": _baseline_aware_knowledge_rows(
+                existing, sections, crlf=crlf
+            )
             or [],
             "session_titles": merged_titles,
             "pinned_sessions": sorted(
@@ -596,7 +627,7 @@ def merged_backup_limit_problem(
         water = max([existing_last, *trip_numbers], default=existing_last)
         statistics["last_trip_number"] = water + created_trip_count
     payload["statistics"] = statistics
-    problem = backup_limit_problem(payload)
+    problem = backup_limit_problem(payload, crlf=crlf)
     if problem is None:
         return None
     # 用户数据轴的导入前基线：存量账号自身（不含知识库）已在某个轴
@@ -608,10 +639,10 @@ def merged_backup_limit_problem(
     baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            _export_shape_baseline(existing, [])
+            _export_shape_baseline(existing, []), crlf=crlf
         )
     }
-    problems = _limit_problems(payload)
+    problems = _limit_problems(payload, crlf=crlf)
     for axis, message in problems:
         if axis not in baseline_axes:
             return message
@@ -737,7 +768,10 @@ def _export_shape_baseline(
 
 
 def _baseline_aware_knowledge_rows(
-    existing: dict[str, Any], sections: dict[str, Any]
+    existing: dict[str, Any],
+    sections: dict[str, Any],
+    *,
+    crlf: bool | None = None,
 ) -> list[Any] | None:
     """合并预检的知识段；None = 跳过知识轴（仅保留用户数据轴）。
 
@@ -758,7 +792,7 @@ def _baseline_aware_knowledge_rows(
     if not existing_kb and not planned:
         return []
     baseline_problem = backup_limit_problem(
-        _export_shape_baseline(existing, existing_kb)
+        _export_shape_baseline(existing, existing_kb), crlf=crlf
     )
     if baseline_problem is not None:
         logger.warning(
@@ -915,7 +949,10 @@ def _merge_trip_row(
 
 
 def _export_shape_messages(
-    messages: list[Any], *, pg_shape: bool = False
+    messages: list[Any],
+    *,
+    pg_shape: bool = False,
+    trim_json_timestamps: bool = True,
 ) -> list[Any]:
     """备份自身体积预检也按落库后的导出行形状计。
 
@@ -940,10 +977,17 @@ def _export_shape_messages(
             continue
         row = next(prepared)
         timestamp = row.get("timestamp")
-        if not pg_shape and isinstance(timestamp, str) and len(timestamp) > 26:
-            # 解析把 naive 时间戳归一成带偏移的 32 字符，但 JSON 后端
-            # 幂等重导时重复行不落库、真实导出仍是 26 字符：预检按 26
-            # 估算（新建行走权威合并复核，不会被低估放行）
+        if (
+            trim_json_timestamps
+            and not pg_shape
+            and isinstance(timestamp, str)
+            and len(timestamp) > 26
+        ):
+            # 解析把 naive 时间戳归一成带偏移的 32 字符，但幂等重导时
+            # 重复行不落库、真实导出仍是 26 字符：已有快照、后续还有
+            # 权威合并复核时按 26 估算（新建行由合并复核精确判定）。
+            # conservative=True（快照读不到、本预检即最终判定）不截断，
+            # 按落库后的真实宽度 32 计，避免低估放行「恢复后永久 413」
             row = {**row, "timestamp": timestamp[:26]}
         rows.append(row)
     return rows
@@ -954,6 +998,8 @@ def sections_limit_problem(
     *,
     pg_shape: bool = False,
     existing: dict[str, Any] | None = None,
+    conservative: bool = False,
+    crlf: bool | None = None,
 ) -> str | None:
     """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
 
@@ -972,6 +1018,10 @@ def sections_limit_problem(
     :func:`merged_backup_limit_problem` 按「现有数据 + 现有知识库」
     完整基线判定，预检只有用户数据快照时无法复刻该基线——把备份知识段
     计入会把部署级超限知识库的重导误拒，而 merged 本会放行。
+
+    ``conservative=True`` 用于「本预检即最终判定」的回退路径（合并复核
+    读不到快照时）：JSON 时间戳不按 26 字符截断，按落库后的真实宽度
+    32 计，避免低估放行「恢复后永久无法导出」的备份。
     """
     if not isinstance(sections, dict):
         return None
@@ -992,7 +1042,9 @@ def sections_limit_problem(
         existing_last_number=0,
     )
     messages = _export_shape_messages(
-        sections.get("messages") or [], pg_shape=pg_shape
+        sections.get("messages") or [],
+        pg_shape=pg_shape,
+        trim_json_timestamps=not conservative,
     )
     payload: dict[str, Any] = {
         "user_id": "u" * 64,
@@ -1045,7 +1097,7 @@ def sections_limit_problem(
             else 0
         )
     payload["statistics"] = statistics
-    problem = backup_limit_problem(payload)
+    problem = backup_limit_problem(payload, crlf=crlf)
     if problem is None:
         return None
     if existing is None:
@@ -1053,10 +1105,10 @@ def sections_limit_problem(
     baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            _export_shape_baseline(existing, [])
+            _export_shape_baseline(existing, []), crlf=crlf
         )
     }
-    problems = _limit_problems(payload)
+    problems = _limit_problems(payload, crlf=crlf)
     for axis, message in problems:
         if axis not in baseline_axes:
             return message
