@@ -260,4 +260,5 @@ if __name__ == "__main__":
     test_backup_sanitize_strips_escaped_nul_and_dict_keys()
     test_export_files_cleans_backup_before_write()
     test_export_files_json_is_nan_safe_and_md_written()
+    test_markdown_chat_body_escapes_html_and_backslash_cells()
     print("\n全部通过")

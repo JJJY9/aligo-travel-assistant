@@ -1016,6 +1016,7 @@ if __name__ == "__main__":
         test_geocode_skips_alias_for_trusted_chinese_city,
         test_quota_rejection_serves_stale_without_failure_cache,
         test_upstream_concurrency_gate_reports_busy,
+        test_degraded_reuse_window_and_expiry,
     ):
         mp = pytest.MonkeyPatch()
         try:

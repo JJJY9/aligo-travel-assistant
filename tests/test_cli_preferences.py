@@ -745,6 +745,9 @@ if __name__ == "__main__":
         test_pref_set_rejects_new_type_over_limit,
         test_pref_values_strip_controls_and_collapse_newlines,
         test_pref_type_allows_web_charset,
+        test_preferences_list_json,
+        test_preferences_dispatch_json_and_bad_args,
+        test_preferences_hides_blank_and_null_items,
     ):
         mp = pytest.MonkeyPatch()
         try:

@@ -949,6 +949,14 @@ def test_skills_check_warns_on_broken_skill_md(monkeypatch):
     print("✓ 技能 SKILL.md 校验（缺失 / 空 / 非法 frontmatter）")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_version_check_skips_without_pyproject": "需要 tmp_path 夹具",
+    "test_version_check_wheel_mode_checks_static": "需要 tmp_path 夹具",
+    "test_version_check_handles_non_utf8_files": "需要 tmp_path 夹具",
+    "test_version_check_detects_static_version_mismatch": "需要 tmp_path 夹具",
+    "test_doctor_rejects_unknown_flag": "需要 capsys 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
 
@@ -987,12 +995,18 @@ if __name__ == "__main__":
         test_storage_postgres_configured_but_json,
         test_version_check_unreadable_index,
         test_default_model_dir_falls_back,
+        test_skills_check_missing_root,
+        test_doctor_redacts_base_url_credentials,
+        test_doctor_offline_flag,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
+    test_parse_doctor_args_case_insensitive()
+    test_report_table_escapes_markup_and_controls()
+    test_skills_check_reports_repo_skills()
     test_run_doctor_without_network()
     test_version_compare_normalizes_pep440()
     mp = pytest.MonkeyPatch()

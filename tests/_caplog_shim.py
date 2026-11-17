@@ -45,6 +45,10 @@ class CaplogShim:
 
         class _Handler(logging.Handler):
             def emit(self, record):  # noqa: D102 - 与 logging.Handler 一致
+                # 与 pytest 的 LogCaptureHandler 一致：emit 内格式化，
+                # Formatter.format 会设置 record.message（caplog.records
+                # 断言 message 的用例在直跑时不再依赖其它 handler 先格式化）
+                self.format(record)
                 records.append(record)
 
         self._handler = _Handler()

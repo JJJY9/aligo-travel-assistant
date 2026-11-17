@@ -2679,7 +2679,7 @@ def test_write_agent_cached_with_create_if_missing(monkeypatch):
         first = knowledge_admin._get_agent()
         second = knowledge_admin._get_agent()
         assert first is second, "同一实例必须被复用"
-        assert len(calls) == 1
+        assert len(calls) == 1, calls
         assert calls[0] == {
             "collection_name": knowledge_admin.COLLECTION_NAME,
             "create_if_missing": True,
@@ -3356,11 +3356,26 @@ if __name__ == "__main__":
         test_import_chunks_large_documents,
         test_import_failure_reports_partial_count,
         test_import_empty_and_missing_db,
+        test_regroup_requires_multiset_coverage,
+        test_import_skips_restore_group_with_layout_conflict,
+        test_import_tolerates_non_finite_parts_metadata,
+        test_import_missing_part_conflict_skips_group,
+        test_import_invalid_group_member_skips_group_not_batch,
+        test_import_skips_absurd_parts_declaration,
+        test_import_dry_run_reports_skip_reasons,
+        test_read_agent_not_cached_when_uninitialized,
+        test_delete_document_old_parts_without_group_single_only,
+        test_update_group_to_single_part_replaces_old_members,
+        test_existing_group_layout_real_scan,
+        test_import_raises_on_agent_error_status,
+        test_import_batches_split_only_at_group_start,
+        test_agent_lock_wait_is_bounded,
+        test_skill_search_participates_in_write_lock,
+        test_import_rejects_oversized_single_content,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
-        test_import_rejects_oversized_single_content(mp)
     print("\n全部通过")

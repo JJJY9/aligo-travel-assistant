@@ -47,10 +47,10 @@ _MAX_KNOWLEDGE_PARTS = 100000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
 
-# 导出形状里的 user_id 占位：合法 user_id 最多 64 个字符且允许中文
-# （UTF-8 3 字节/字，最多 192 字节）。按 64 个 ASCII 字节占位会在近
-# 50 MB 时系统性低估，换成最坏字节宽度的 64 个汉字
-_USER_ID_PLACEHOLDER = "测" * 64
+# 导出形状里的 user_id 占位：合法 user_id 最多 64 个字符，字符集允许
+# Unicode 字母（含 4 字节的扩展平面字符，最多 256 字节）。按 ASCII 或
+# 3 字节汉字占位都会在近 50 MB 时系统性低估；用 64 个 4 字节字母占位
+_USER_ID_PLACEHOLDER = chr(0x10400) * 64
 
 _USAGE_NUMBER_FIELDS = ("calls", "input_tokens", "output_tokens", "total_tokens")
 
@@ -671,6 +671,20 @@ def merged_backup_limit_problem(
     problems = _limit_problems(payload, crlf=crlf)
     for axis, message in problems:
         if axis not in baseline_axes:
+            return message
+    # 知识库体积轴独立复核：size 轴与用户数据共享，账号自身在 size 轴
+    # 已超限时上面的按轴豁免会连带放过知识增量。这里按「全局知识库
+    # 单独导出」判定，只在库自身已超限时豁免——其它轴不连带。
+    kb_baseline_axes = {
+        axis
+        for axis, _message in _limit_problems(
+            {"knowledge": list(existing_kb or [])}, crlf=crlf
+        )
+    }
+    for axis, message in _limit_problems(
+        {"knowledge": list(knowledge_rows or [])}, crlf=crlf
+    ):
+        if axis not in kb_baseline_axes:
             return message
     return problem if not problems else None
 
@@ -1504,6 +1518,20 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     return sections, errors
 
 
+def _knowledge_ready_probe() -> None:
+    """确认嵌入模型可加载（与真实导入同一入口）。
+
+    ``import_documents(dry_run=True)`` 只做规划、不加载模型：模型文件
+    缺失 / 损坏的部署里预览会通过、真实导入才失败。这里复用维护模块
+    的懒加载入口（Agent 与模型被缓存，真实导入随后直接命中）。
+    单测 / 直跑清单默认把它替换为 no-op（见 tests/conftest.py），
+    避免逐用例加载真实模型。
+    """
+    from utils.knowledge_admin import _get_agent
+
+    _get_agent()
+
+
 def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     """预览恢复结果（只读）：返回与 import_user_data 相同键的计数，不写库。"""
     # --dry-run 与真实执行同一上限口径：预览成功、真跑失败会让恢复脚本
@@ -1569,17 +1597,23 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         result["messages_added"] = len(planned)
         result["messages_skipped"] = len(messages) - len(planned)
     # 预览与真实执行同一结论：知识库不可用时真实导入会报 knowledge_error
-    # （知识一条未恢复、ok=false），dry-run 也必须如实报告。用与真实导入
-    # 同一实现（import_documents 的 dry-run 计划接口）探测可用性，异常
-    # 映射与 import_user_data 完全一致
+    # （知识一条未恢复、ok=false），dry-run 也必须如实报告。规划结果同时
+    # 给出「将新增 / 跳过」的真实计数（而不是备份输入条数），并按真实
+    # 导入同一入口探测嵌入模型可用性——dry-run 规划本身不加载模型，
+    # 只看它会漏掉「模型不可用」这一类失败
     knowledge_rows = sections.get("knowledge") or []
     if knowledge_rows:
         try:
             from utils.knowledge_admin import import_documents
 
-            import_documents(
+            plan = import_documents(
                 knowledge_rows, dry_run=True, return_pieces=True
             )
+            _knowledge_ready_probe()
+            result["knowledge_imported"] = int(
+                plan.get("would_import") or 0
+            )
+            result["knowledge_skipped"] = int(plan.get("skipped") or 0)
         except FileNotFoundError:
             result["knowledge_error"] = (
                 "知识库未初始化（先运行初始化脚本再恢复知识片段）"

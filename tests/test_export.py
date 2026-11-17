@@ -201,4 +201,5 @@ if __name__ == "__main__":
     test_render_markdown_renders_assistant_orchestration_json()
     test_render_markdown_escapes_table_cells()
     test_export_files()
+    test_export_files_sanitizes_surrogates_in_markdown()
     print("\n全部通过")

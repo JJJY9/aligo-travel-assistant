@@ -3220,7 +3220,13 @@ def run_user_import_standalone(
             f"{counts['archived']} 个"
         )
         if dry_run:
-            summary += f"，知识片段 {counts.get('knowledge', 0)} 条"
+            if "knowledge_imported" in counts:
+                summary += (
+                    f"，知识片段将新增 {counts['knowledge_imported']} 条"
+                    f"（跳过 {counts['knowledge_skipped']} 条）"
+                )
+            else:
+                summary += f"，知识片段 {counts.get('knowledge', 0)} 条"
         elif "knowledge_imported" in counts:
             summary += (
                 f"，知识片段新增 {counts['knowledge_imported']} 条"
@@ -3228,7 +3234,10 @@ def run_user_import_standalone(
             )
         print(summary)
         if knowledge_error:
-            if incomplete:
+            if dry_run:
+                # 预览没有写入任何数据：不能声称「用户数据已恢复」
+                print(f"❌ {knowledge_error}（预览未写入任何数据）")
+            elif incomplete:
                 print(f"❌ {knowledge_error}")
             else:
                 print(
