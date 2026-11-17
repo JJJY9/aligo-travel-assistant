@@ -170,6 +170,18 @@ def _case_conflict_message(owner: str) -> str:
     )
 
 
+def _reject_reserved_preference_type(pref_type: Any) -> None:
+    """拒绝保留偏好类型 ``preferences``（JSON 存储层写路径统一守卫）。
+
+    ``_migrate_data`` 在下一次加载时把该类型的列表值展开成独立偏好类型
+    （并丢弃 / 覆盖同名条目）：写入「成功」后偏好数会突然膨胀、可把类型
+    数推过上限让账号永久无法导出。Web PUT / CLI pref-set / 导入解析都已
+    拒绝，存储层是智能体等直连调用方的最后一道守卫。
+    """
+    if pref_type == "preferences":
+        raise ValueError("preferences 是保留的偏好类型，请使用具体类型名")
+
+
 class LongTermMemory:
     """
     长期记忆：持久化用户信息
@@ -1190,6 +1202,7 @@ class LongTermMemory:
         ``get_preference() + save_preference()`` 的读改写会覆盖并发写入的
         偏好（例如本轮 LLM 调用期间用户在记忆面板修改了同一类型）。
         """
+        _reject_reserved_preference_type(pref_type)
         preferences = self.data["preferences"]
         existing = None
         for pref in preferences:
@@ -1226,6 +1239,7 @@ class LongTermMemory:
             pref_type: 偏好类型
             value: 偏好值
         """
+        _reject_reserved_preference_type(pref_type)
         # 查找是否已存在该类型的偏好
         preferences = self.data["preferences"]
         found = False

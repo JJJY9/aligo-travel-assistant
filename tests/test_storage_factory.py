@@ -1572,6 +1572,26 @@ def test_pg_preference_snapshot_writes_abort_on_reconnect():
     print("✓ PG 偏好只对快照派生写按代次中止（锁期 / 复核期）")
 
 
+def test_storage_rejects_reserved_preference_type():
+    """存储层写路径拒绝保留偏好类型 preferences（智能体等直连调用方的
+    最后一道守卫）——JSON 加载时该类型会被展开成大量独立偏好类型。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-reserved-pref", storage_dir)
+    with pytest.raises(ValueError, match="保留的偏好类型"):
+        memory.save_preference("preferences", [{"type": "x", "value": "v"}])
+    with pytest.raises(ValueError, match="保留的偏好类型"):
+        memory.append_preference("preferences", "v")
+    assert memory.get_preference() == {}
+
+    # PG 同口径：写入前即拒绝，不触达锁 / SQL
+    store = object.__new__(PostgresLongTermMemory)
+    with pytest.raises(ValueError, match="保留的偏好类型"):
+        store.save_preference("preferences", "v")
+    print("✓ 存储层拒绝保留偏好类型 preferences")
+
+
 def test_pg_save_preference_never_replays():
     """偏好 UPSERT 一律禁止重放（并发删除 + 补位会让重放变成未经上限
     复核的新增行）：方法不再暴露会被静默忽略的 replay_safe 形参，两条

@@ -568,6 +568,10 @@ class PostgresLongTermMemory:
         空档里其它实例可能已改动同一偏好（覆盖）或删除该类型（首次
         INSERT 会复活它），按可重试失败上报。直接 replace 的写入值不
         依赖快照，不传该参数、重连后照常执行。"""
+        if pref_type == "preferences":
+            # 保留类型：JSON 存储层加载时会把列表值展开成独立偏好类型，
+            # 两个后端口径一致；Web PUT / CLI pref-set / 导入解析均已拒绝
+            raise ValueError("preferences 是保留的偏好类型，请使用具体类型名")
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
                 self._enforce_preference_cap(pref_type)

@@ -238,7 +238,12 @@ if __name__ == "__main__":
         test_skill_scripts_handles_permission_error(mp)
     finally:
         mp.undo()
-    test_wheel_data_files_cover_skill_code()
+    # Python 3.10 无 tomllib：该用例 pytest.skip（Skipped 不是 Exception），
+    # 直跑按跳过处理，不能中断后续用例
+    try:
+        test_wheel_data_files_cover_skill_code()
+    except pytest.skip.Exception as exc:
+        print(f"直跑跳过 test_wheel_data_files_cover_skill_code（{exc}）")
     mp = pytest.MonkeyPatch()
     try:
         test_sysconfig_data_dir_fallback(mp)

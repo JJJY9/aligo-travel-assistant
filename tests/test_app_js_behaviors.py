@@ -790,6 +790,14 @@ if __name__ == "__main__":
                 _reconfigure(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         pass
+    # 全部用例都经 _run_harness 依赖 node：模块级无 skipif，直跑必须
+    # 自己守卫——否则首个用例的 pytest.skip（Skipped 是 BaseException）
+    # 会冒泡成 traceback、后续用例全部不执行
+    import shutil as _shutil
+
+    if _shutil.which("node") is None:
+        print("未安装 node，跳过前端行为直跑用例（请通过 pytest 运行）")
+        raise SystemExit(0)
     test_session_request_race_guards()
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()
