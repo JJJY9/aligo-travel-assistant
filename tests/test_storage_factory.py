@@ -1592,6 +1592,37 @@ def test_storage_rejects_reserved_preference_type():
     print("✓ 存储层拒绝保留偏好类型 preferences")
 
 
+def test_pg_timestamp_localizes_naive_with_fixed_tz():
+    """_pg_timestamp 把 naive 本地时间按本机时区本地化：固定
+    TZ=Asia/Shanghai 断言字面量偏移（CI 的 UTC runner 删掉本地化即失败）。"""
+    import time as time_module
+
+    from context.postgres_long_term_memory import _pg_timestamp
+
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("当前平台不支持动态时区（time.tzset）")
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time_module.tzset()
+    try:
+        assert (
+            _pg_timestamp("2026-11-02T08:30:00")
+            == "2026-11-02T08:30:00+08:00"
+        )
+        # aware 输入原样透传（不重复本地化）
+        assert (
+            _pg_timestamp("2026-11-02T08:30:00+00:00")
+            == "2026-11-02T08:30:00+00:00"
+        )
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time_module.tzset()
+    print("✓ _pg_timestamp 按固定时区本地化 naive 时间")
+
+
 def test_pg_add_chat_messages_reports_committed_count_after_lost_ack():
     """提交后连接中断的重放：重放的判重 SELECT 看到已提交行时按首次
     尝试的保留条数报告，不能把实际已写入的消息全报成跳过。"""
@@ -5897,6 +5928,11 @@ if __name__ == "__main__":
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
+        # helper 导入必须在兜底 try 之外：_direct_run_kb 缺失 / 隔离装配
+        # 失败要显式中止，不能被「user_import 不可用」的兜底吞掉后
+        # 静默跑真实知识库
+        import _direct_run_kb
+
         kb_fixture: pytest.MonkeyPatch | None = None
         try:
             from utils import user_import as _ui_for_kb
@@ -5909,15 +5945,14 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
-            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
-            # Milvus（与 CI「无库」结论一致）
-            import _direct_run_kb
-
-            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()
             kb_fixture = None
+        else:
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            _direct_run_kb.isolate(kb_fixture)
         storage_snapshot: dict | None = None
         try:
             from config import STORAGE_CONFIG

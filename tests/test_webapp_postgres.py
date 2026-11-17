@@ -342,11 +342,21 @@ def test_update_trip_dedupe_normalizes_single_day_end_date():
 
 
 def test_pg_import_preserves_timestamp_instant():
-    """备份恢复：naive 本地时间戳写入 TIMESTAMPTZ 后不能发生时区偏移。"""
-    from datetime import datetime
+    """备份恢复：naive 本地时间戳写入 TIMESTAMPTZ 后不能发生时区偏移。
+
+    固定 TZ=Asia/Shanghai 并断言字面量 UTC 时刻：此前期望值用同一
+    astimezone 规则现算，UTC 的 CI 上删掉本地化转换仍然通过。"""
+    import os
+    import time as time_module
+    from datetime import datetime, timezone
 
     from utils.user_import import import_user_data, parse_user_export
 
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("当前平台不支持动态时区（time.tzset）")
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time_module.tzset()
     user_id = f"pg_import_{uuid.uuid4().hex[:8]}"
     store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
     try:
@@ -369,10 +379,11 @@ def test_pg_import_preserves_timestamp_instant():
         assert len(messages) == 1
         parsed = datetime.fromisoformat(messages[0]["timestamp"])
         assert parsed.tzinfo is not None
-        # 墙钟时间按本机时区解释：换回本机后与原始 naive 时间一致
+        # 东八区 08:30 的同一时刻：删掉 naive → 本机时区的本地化会写成
+        # 08:30+00:00（UTC 08:30），此处字面量断言即失败
         assert (
-            parsed.astimezone().replace(tzinfo=None).isoformat()
-            == "2026-11-02T08:30:00"
+            parsed.astimezone(timezone.utc).isoformat()
+            == "2026-11-02T00:30:00+00:00"
         )
 
         # 重复导入幂等
@@ -383,6 +394,11 @@ def test_pg_import_preserves_timestamp_instant():
     finally:
         store.delete_chat_session("sess-pg-import")
         store.close()
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time_module.tzset()
 
 
 def test_pg_import_skips_orphan_answer_and_orders_by_timestamp():

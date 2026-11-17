@@ -722,14 +722,19 @@ def merged_backup_limit_problem(
             return message
     # 默认导出（不含知识库）的体积轴独立复核：知识库只进带知识库的全量
     # 导出，不能抬高用户数据轴的基线把用户数据增长一并豁免——否则恢复
-    # 可以把「默认导出」推过 50 MB 而 with_knowledge 基线掩盖了它
+    # 可以把「默认导出」推过 50 MB 而 with_knowledge 基线掩盖了它。
+    # 默认导出没有 knowledge 键（两个通道都不写）：删掉而不是置空，
+    # 合成的键会让判定边界整体平移、临近上限时翻转豁免判定
     user_payload = dict(payload)
-    user_payload["knowledge"] = []
+    user_payload.pop("knowledge", None)
     user_baseline_axes = {
         axis
         for axis, _message in _limit_problems(
             _export_shape_baseline(
-                existing, [], user_id=target_user_id
+                existing,
+                [],
+                user_id=target_user_id,
+                include_knowledge=False,
             ),
             crlf=crlf,
         )
@@ -872,6 +877,7 @@ def _export_shape_baseline(
     knowledge_rows: list[Any],
     *,
     user_id: str | None = None,
+    include_knowledge: bool = True,
 ) -> dict[str, Any]:
     """导入前的完整导出形状（现有存量 + 现有知识库）。
 
@@ -881,6 +887,9 @@ def _export_shape_baseline(
     ``user_id`` 用真实账号 ID 计算基线：按最坏占位会把实际未超限的
     账号误判成基线超限、连带豁免本次导入的体积增长（占位只保留在合并后
     的 payload，那里高估是 fail-closed 的安全方向）。
+
+    ``include_knowledge=False`` 用于「默认导出」轴：真实默认导出的键集
+    不含 ``knowledge``，合成的空键会让判定边界整体平移。
     """
     payload = dict(existing)
     payload["user_id"] = user_id or _USER_ID_PLACEHOLDER
@@ -891,7 +900,6 @@ def _export_shape_baseline(
             "chat_history": list(existing.get("chat_history") or []),
             "trip_history": list(existing.get("trip_history") or []),
             "preferences": existing.get("preferences") or {},
-            "knowledge": list(knowledge_rows),
             "session_titles": existing.get("session_titles") or {},
             "pinned_sessions": list(existing.get("pinned_sessions") or []),
             "archived_sessions": list(
@@ -900,6 +908,8 @@ def _export_shape_baseline(
             "statistics": existing.get("statistics") or {},
         }
     )
+    if include_knowledge:
+        payload["knowledge"] = list(knowledge_rows)
     return payload
 
 

@@ -12810,6 +12810,11 @@ if __name__ == "__main__":
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
+        # helper 导入必须在兜底 try 之外：_direct_run_kb 缺失 / 隔离装配
+        # 失败要显式中止，不能被「user_import 不可用」的兜底吞掉后
+        # 静默跑真实知识库
+        import _direct_run_kb
+
         kb_fixture: pytest.MonkeyPatch | None = None
         try:
             from utils import user_import as _ui_for_kb
@@ -12822,15 +12827,14 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
-            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
-            # Milvus（与 CI「无库」结论一致）
-            import _direct_run_kb
-
-            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()
             kb_fixture = None
+        else:
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            _direct_run_kb.isolate(kb_fixture)
         storage_snapshot: dict | None = None
         try:
             from config import STORAGE_CONFIG

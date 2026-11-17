@@ -2158,12 +2158,18 @@ def test_import_dry_run_missing_collection_multipart_group(monkeypatch):
     print("✓ 集合缺失时多分片组按空布局预览（扫描失败仍 fail-closed）")
 
 
-def test_hermetic_knowledge_db_path_is_missing():
+def test_hermetic_knowledge_db_path_is_missing(hermetic_kb_path):
     """conftest 的 autouse 夹具把全局知识库路径指向不存在的文件（与 CI
-    无库行为一致）：单测的规划 / 布局扫描不再打开真实 Milvus。"""
-    path = knowledge_admin.knowledge_db_path()
-    if path.exists():
-        pytest.skip("直跑不加载 conftest 隔离夹具（真实知识库存在）")
+    无库行为一致）：单测的规划 / 布局扫描不再打开真实 Milvus。
+
+    断言与夹具注入的具体路径相等：夹具被删除 / 失效时（开发机上默认
+    路径可能存在，CI 上虽不存在但也不等于该路径）本用例必须失败，
+    而不是用 skip 吞掉。"""
+    from pathlib import Path
+
+    path = Path(knowledge_admin.knowledge_db_path())
+    assert path == hermetic_kb_path, (path, hermetic_kb_path)
+    assert not hermetic_kb_path.exists()
     print("✓ 单测知识库路径整体隔离（与 CI 无库一致）")
 
 
@@ -3332,6 +3338,11 @@ def test_log_safe_group_escapes_control_characters():
     print("✓ 知识库日志的文档组名统一转义")
 
 
+_DIRECT_RUN_SKIP: dict[str, str] = {
+    # 断言的是 conftest 注入的隔离路径本身，直跑没有该夹具
+    "test_hermetic_knowledge_db_path_is_missing": "需要 hermetic_kb_path 夹具（conftest 注入）",
+}
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -3339,10 +3350,8 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     _tmp_registry.install()
     test_next_entity_id_monotonic_after_delete()
-    try:
-        test_hermetic_knowledge_db_path_is_missing()
-    except pytest.skip.Exception as exc:
-        print(f"直跑跳过 test_hermetic_knowledge_db_path_is_missing（{exc}）")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     test_log_safe_group_escapes_control_characters()
     test_load_collection_failure_is_non_fatal()
     test_iter_all_rows_closes_iterator_even_on_error()
@@ -3464,4 +3473,9 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+    if _DIRECT_RUN_SKIP:
+        print(
+            f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例"
+            "（需 pytest 专用夹具或真实服务）"
+        )
     print("\n全部通过")
