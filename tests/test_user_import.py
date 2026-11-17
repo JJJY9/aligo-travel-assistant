@@ -4514,15 +4514,19 @@ def test_merged_default_export_has_no_synthetic_knowledge_key(monkeypatch):
         def export_snapshot(self):
             return dict(existing)
 
+    # 上限取「真实默认导出（无 knowledge / 无 session_id）基线 + 10B」：
+    # 完整基线（含 knowledge 键）越过上限 → 主检查按轴豁免；默认导出
+    # 复核必须拒绝（旧实现给 user payload / 基线也加合成 knowledge 键
+    # → 基线同样「已超限」→ 豁免后返回 None）
     real_baseline_size = module._backup_payload_size(
         module._export_shape_baseline(
-            existing, [], user_id="u1", include_knowledge=False
+            existing,
+            [],
+            user_id="u1",
+            include_knowledge=False,
+            include_session_id=False,
         )
     )
-    # 上限取「真实默认导出基线 + 10B」：完整基线（含 knowledge 键）越过
-    # 上限 → 主检查按轴豁免；默认导出复核必须拒绝（旧实现给 user
-    # payload / 基线也加合成 knowledge 键 → 基线同样「已超限」→ 豁免
-    # 后返回 None）
     monkeypatch.setattr(module, "MAX_BACKUP_BYTES", real_baseline_size + 10)
     problem = module.merged_backup_limit_problem(_Store(), {})
     assert problem and "MB" in problem, problem
@@ -4531,6 +4535,61 @@ def test_merged_default_export_has_no_synthetic_knowledge_key(monkeypatch):
     assert "knowledge" in payloads[1], payloads[1].keys()
     assert "knowledge" not in payloads[-1], payloads[-1].keys()
     print("✓ 默认导出复核键集与真实导出一致（无合成 knowledge 键）")
+
+
+def test_merged_baseline_matches_real_web_export_shape(monkeypatch):
+    """导入前基线必须与真实 Web 导出键集 / 宽度一致（无合成 session_id）：
+    基线高估 ~18 字节会把临近上限的账号误判成「已超限」、size 轴整体
+    豁免，导入把真实导出推过 50MB 后永久 413。"""
+    from utils import user_import as module
+
+    existing = {
+        "chat_history": [
+            {"role": "user", "content": "m" * 200, "session_id": "s1"}
+        ],
+        "trip_history": [],
+        "preferences": {"home_location": "北京"},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    baseline = module._export_shape_baseline(
+        existing,
+        [],
+        user_id="u1",
+        include_knowledge=False,
+        include_session_id=False,
+    )
+    assert "session_id" not in baseline, baseline.keys()
+    # 与真实 Web 导出（user_id + exported_at + snapshot，无 session_id）
+    # 同形状同字节
+    web_export = {
+        "user_id": "u1",
+        "exported_at": baseline["exported_at"],
+        **existing,
+    }
+    assert module._backup_payload_size(baseline) == module._backup_payload_size(
+        web_export
+    )
+
+    class _Store:
+        user_id = "u1"
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return dict(existing)
+
+    # 真实 Web 导出距上限只有 5 字节：导入一条新偏好必须被拒；旧实现
+    # 的基线多出合成 session_id（+16B）→ 基线「已超限」→ 整轴豁免
+    monkeypatch.setattr(
+        module, "MAX_BACKUP_BYTES", module._backup_payload_size(web_export) + 5
+    )
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
+    incoming = {"preferences": {"hotel_brands": ["汉庭"]}}
+    problem = module.merged_backup_limit_problem(_Store(), incoming)
+    assert problem and "MB" in problem, problem
+    print("✓ 基线形状与真实 Web 导出一致（临近上限不误判超限）")
 
 
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):

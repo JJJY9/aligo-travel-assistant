@@ -60,7 +60,6 @@ def test_public_bind_warns(monkeypatch, caplog):
 
 
 _DIRECT_RUN_SKIP: dict[str, str] = {
-    "test_public_bind_warns": "需要 caplog 夹具",
     "test_version_flag": "需要 capsys 夹具",
 }
 
@@ -71,6 +70,16 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     _tmp_registry.install()
     test_loopback_host_detection()
-    print("\n全部通过（--version / 监听警告用例需 pytest 的 capsys / caplog）")
+    # caplog 用例用共享替身真实执行（监听告警断言不能跳过，假绿）
+    import _caplog_shim
+
+    mp = pytest.MonkeyPatch()
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_public_bind_warns(mp, _shim)
+    finally:
+        _shim.close()
+        mp.undo()
+    print("\n全部通过（--version 用例需 pytest 的 capsys）")
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

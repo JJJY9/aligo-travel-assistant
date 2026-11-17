@@ -147,7 +147,6 @@ def test_redaction_keeps_url_after_spacey_cjk_path():
     print("✓ 路径后的 URL 仍被整体遮蔽")
 
 _DIRECT_RUN_SKIP: dict[str, str] = {
-    "test_preference_and_title_values_not_logged": "需要 caplog 夹具",
 }
 
 if __name__ == "__main__":
@@ -163,6 +162,13 @@ if __name__ == "__main__":
     test_redact_local_paths_keeps_urls_intact()
     test_redact_local_paths_covers_paths_with_spaces()
     test_redaction_keeps_url_after_spacey_cjk_path()
-    print("caplog 用例需 pytest 运行")
+    # caplog 用例用共享替身真实执行：日志脱敏断言不能跳过（假绿）
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_preference_and_title_values_not_logged(_shim)
+    finally:
+        _shim.close()
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

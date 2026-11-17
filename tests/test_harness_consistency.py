@@ -206,14 +206,16 @@ def test_manual_lists_cover_all_tests():
         }
         for name, reason in skip.items():
             params = funcs.get(name, [])
+            # caplog 不能作为跳过理由：直跑提供 tests/_caplog_shim.py
+            # 替身，跳过会让日志断言在直跑清单上零覆盖（假绿）
             fixture_justified = any(
                 fixture in params
-                for fixture in ("tmp_path", "capsys", "caplog", "request")
+                for fixture in ("tmp_path", "capsys", "request")
             ) or any(
                 # 原因里点名的夹具参数（如 hermetic_kb_path）同样算具体
                 param in reason
                 for param in params
-                if param != "monkeypatch"
+                if param not in {"monkeypatch", "caplog"}
             )
             if fixture_justified or "真实" in reason:
                 continue

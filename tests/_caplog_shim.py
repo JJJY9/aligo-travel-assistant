@@ -62,6 +62,12 @@ class CaplogShim:
     def at_level(self, level, logger: str | None = None):
         return _AtLevel(self, level, logger)
 
+    def set_level(self, level, logger: str | None = None) -> None:
+        """与 pytest caplog.set_level 一致：调整目标 logger 与捕获 handler
+        级别（持续到进程结束 / 下一次 set_level）。"""
+        logging.getLogger(logger).setLevel(level)
+        self._handler.setLevel(level)
+
     def clear(self):
         self.records.clear()
 
