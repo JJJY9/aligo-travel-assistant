@@ -267,8 +267,10 @@ def test_weather_query_marks_stale_data():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_weather_failure_falls_back_to_search()
     test_weather_exception_falls_back_to_search()
     test_weather_success_no_search()

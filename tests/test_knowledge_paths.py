@@ -117,8 +117,18 @@ def test_discard_pending_library_is_ignored(monkeypatch, tmp_path):
         knowledge_paths.reset_default_knowledge_dir()
 
 
+_DIRECT_RUN_SKIP = {
+    "test_default_dir_is_pinned_for_process": "需要 tmp_path 夹具",
+    "test_default_knowledge_dir_prefers_skill_then_legacy": "需要 tmp_path 夹具",
+    "test_discard_pending_library_is_ignored": "需要 tmp_path 夹具",
+    "test_knowledge_db_path_explicit_directory": "需要 tmp_path 夹具",
+    "test_wheel_install_prefers_user_data_dir": "需要 tmp_path 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     print("monkeypatch 用例需 pytest 运行")

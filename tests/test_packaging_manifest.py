@@ -23,7 +23,9 @@ def test_manifest_prunes_runtime_data():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_manifest_prunes_runtime_data()
     print("\n全部通过")

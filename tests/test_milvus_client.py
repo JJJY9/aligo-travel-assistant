@@ -216,8 +216,10 @@ def test_client_uses_dedicated_connection_on_pymilvus3(monkeypatch):
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     for plain_case in (
         test_uses_max_id_not_row_count,
         test_empty_collection_starts_at_one,

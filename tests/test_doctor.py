@@ -959,8 +959,10 @@ _DIRECT_RUN_SKIP = {
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_python_ok()
     test_model_files_missing_dir()
     test_model_files_complete()

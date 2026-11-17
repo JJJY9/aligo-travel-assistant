@@ -1158,7 +1158,27 @@ def test_interactive_memory_follows_data_root(monkeypatch, tmp_path):
     assert captured["storage_path"] == str(default_data_root() / "memory")
     print("✓ 交互式 CLI 长期记忆跟随 default_data_root")
 
+_DIRECT_RUN_SKIP = {
+    "test_cli_module_imports_without_runtime_deps": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_console_falls_back_on_invalid_columns": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_history_table_strips_terminal_controls": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_interactive_memory_follows_data_root": "需要 tmp_path 夹具",
+    "test_main_keyboard_interrupt_exits_130": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_nontty_single_line_query_is_not_swallowed": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pending_cancel_cleared_when_loop_ends_by_eof": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_process_query_counts_generic_orchestration_failure": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_process_query_filters_malformed_recent_context": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_process_query_open_breaker_returns_quickly": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_process_query_unparsable_intention_returns": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_prompt_oserror_exits_instead_of_hot_loop": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_repl_error_markup_is_escaped": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_sanitized_console_strips_controls_from_print": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，

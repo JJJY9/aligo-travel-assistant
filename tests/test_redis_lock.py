@@ -390,10 +390,16 @@ def test_transient_renew_failure_keeps_lock():
     print("✓ 瞬时续期抖动不标记丢失")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_cross_instance_lock": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_fallback_when_redis_unavailable()
     test_factory_failure_falls_back_to_local()
     test_contended_redis_lock_releases_local()

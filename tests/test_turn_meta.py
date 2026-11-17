@@ -182,8 +182,10 @@ def test_strip_turn_meta_non_mapping_returns_original():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_build_and_roundtrip()
     test_markdown_ignores_meta()
     test_invalid_content()

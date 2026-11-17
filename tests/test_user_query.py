@@ -70,8 +70,10 @@ def test_content_text_helper():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_plain_and_json_strings()
     test_dict_and_block_inputs()
     test_content_text_helper()

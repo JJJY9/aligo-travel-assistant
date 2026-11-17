@@ -216,8 +216,10 @@ def test_main_dispatch_rejects_html_and_bad_args(monkeypatch):
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     mp = pytest.MonkeyPatch()
     try:
         test_export_single_trip_ics(mp)

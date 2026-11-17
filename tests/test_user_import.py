@@ -16,6 +16,9 @@ sys.path.insert(0, project_root)
 
 import cli
 from context.long_term_memory import LongTermMemory
+from utils.user_import import (
+    _knowledge_ready_probe as _real_knowledge_ready_probe,
+)
 from utils.user_import import import_user_data, parse_user_export
 
 
@@ -3914,6 +3917,51 @@ def test_merged_knowledge_size_increment_guarded_when_account_over_size(
     )
     assert problem and "MB" in problem, problem
     print("✓ 知识库体积增量不受其它轴连带豁免")
+
+
+def test_knowledge_ready_probe_checks_initialized_agent(monkeypatch):
+    """探针不能只看构造是否抛错：构造成功但 initialized=False（依赖
+    缺失 / 集合不可用）同样视为不可用。"""
+    import utils.knowledge_admin as kb
+
+    class _Uninitialized:
+        initialized = False
+
+    monkeypatch.setattr(kb, "_get_agent", lambda: _Uninitialized())
+    with pytest.raises(RuntimeError):
+        # conftest 把模块属性替换成 no-op：这里调用 import 时捕获的真实现
+        _real_knowledge_ready_probe()
+
+    class _Ready:
+        initialized = True
+
+    monkeypatch.setattr(kb, "_get_agent", lambda: _Ready())
+    _real_knowledge_ready_probe()
+    print("✓ 探针校验 Agent 初始化状态")
+
+
+def test_preview_skips_probe_when_knowledge_all_exists(monkeypatch):
+    """知识片段全部已存在时真实导入走快速判重、不加载模型：预览同样
+    不探测，模型不可用也不报错（与真实执行同结论）。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
+        return {"would_import": 0, "skipped": 2, "skipped_duplicate": 2}
+
+    def boom():
+        raise RuntimeError("model files missing")
+
+    monkeypatch.setattr(kb, "import_documents", fake_import)
+    monkeypatch.setattr(module, "_knowledge_ready_probe", boom)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_allkb_")
+    store = LongTermMemory("u-allkb", storage_dir)
+    sections = {"knowledge": [{"content": "k1"}, {"content": "k2"}]}
+    preview = module.preview_user_import(store, sections)
+    assert "knowledge_error" not in preview, preview
+    assert preview["knowledge_imported"] == 0, preview
+    assert preview["knowledge_skipped"] == 2, preview
+    print("✓ 全部已存在时预览不加载模型")
 
 
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):

@@ -34,7 +34,9 @@ def test_canonical_agent_name_cases():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_canonical_agent_name_cases()
     print("\n全部通过")

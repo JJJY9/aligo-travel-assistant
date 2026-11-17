@@ -209,10 +209,16 @@ def test_webapp_uses_redis_rate_limit_across_instances(monkeypatch):
             Path(f"{memory_file}.lock").unlink(missing_ok=True)
 
 
+_DIRECT_RUN_SKIP = {
+    "test_webapp_uses_redis_rate_limit_across_instances": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_shared_window_across_instances()
     test_concurrent_checks_share_atomic_quota()
     test_peek_does_not_record_and_window_expires()

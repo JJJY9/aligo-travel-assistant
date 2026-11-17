@@ -771,7 +771,28 @@ def test_upcoming_weather_normalizes_unpadded_start_date():
     assert "今日 10°C~20°C" in out_of_window, out_of_window
     print("✓ 出发日天气：未补零日期归一后命中，窗口外退回今日")
 
+_DIRECT_RUN_SKIP = {
+    "test_archived_toggle_rolls_back_on_failure": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_copy_fallback_cleans_up_and_restores_focus": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_delete_last_turn_sends_turn_id": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_deleted_session_thread_starts_clean_on_next_send": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_editor_round2_preferences_and_guards": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_history_renders_in_windows": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_open_session_confirms_pending_edit": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_render_markdown_caps_oversized_message": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_retry_checks_turn_persisted_first": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_send_message_confirms_pending_edit_draft": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_session_html_export_uses_full_server_endpoint": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_session_refresh_keeps_expanded_list": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_silent_reload_preserves_scroll": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_silent_reload_shows_appended_messages_and_keeps_expansion": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_sse_stream_parsing_robustness": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys as _sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError

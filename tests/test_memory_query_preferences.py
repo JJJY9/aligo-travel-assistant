@@ -117,8 +117,10 @@ def test_reply_prompt_contains_preferences():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_format_preferences_shows_real_types()
     test_format_preferences_list_and_custom()
     test_reply_prompt_contains_preferences()

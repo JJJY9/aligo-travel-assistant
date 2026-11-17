@@ -207,8 +207,10 @@ _DIRECT_RUN_SKIP = {
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     for case in (
         test_health_json_ok,
         test_health_json_failure,

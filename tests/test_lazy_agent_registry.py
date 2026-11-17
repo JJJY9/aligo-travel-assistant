@@ -350,8 +350,10 @@ def test_cache_is_keyed_by_skill_name(monkeypatch):
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     for case in (
         test_uninitialized_agents_not_cached,
         test_discovers_and_caches_agents,

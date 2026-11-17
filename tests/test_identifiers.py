@@ -109,8 +109,10 @@ def test_session_ids_allow_windows_device_names():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_ids_match_web_rust_word_semantics()
     test_prefixed_and_suffixed_fragments()
     test_windows_reserved_names_rejected()

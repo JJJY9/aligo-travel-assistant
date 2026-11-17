@@ -116,8 +116,10 @@ def test_reply_none_returns_valid_content():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_prefers_user_query_over_rewritten()
     test_falls_back_to_rewritten_query()
     test_non_object_payload_does_not_crash()

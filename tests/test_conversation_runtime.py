@@ -1478,10 +1478,22 @@ def test_deferred_commit_checks_tombstone_before_commit():
     print("✓ 延迟记忆提交前复查墓碑")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_cancel_before_persist_settles_usage": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_cancel_during_stage_thread_rolls_back_after_visible": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_cancelled_persist_failure_settles_usage": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_deferred_memory_commits_after_cancel_during_persist": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_redis_backfill_skipped_while_degraded": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_runtime_uses_default_data_root_for_long_term": "需要 tmp_path 夹具",
+    "test_runtime_wires_epoch_guard_into_persist": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     mp = pytest.MonkeyPatch()
     try:
         test_ask_runs_memory_io_off_event_loop()
@@ -1514,7 +1526,11 @@ if __name__ == "__main__":
     test_failed_turn_usage_settled_in_next_turn()
     test_memory_persistence_error_not_counted_as_model_failure()
     test_open_circuit_short_circuits_ask()
-    test_model_call_failure_counts_towards_breaker(mp)
+    mp = pytest.MonkeyPatch()
+    try:
+        test_model_call_failure_counts_towards_breaker(mp)
+    finally:
+        mp.undo()
     test_normalized_schedule_filters_invalid_entries()
     test_epoch_snapshot_read_before_context_and_intent()
     test_intent_success_does_not_reset_breaker_failures()

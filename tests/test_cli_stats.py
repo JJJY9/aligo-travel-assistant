@@ -248,10 +248,17 @@ def test_stats_dispatch(monkeypatch):
     print("✓ dispatch 层 stats 正常执行 / 严格参数")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_stats_archived_counts_only_live_sessions": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_stats_counts_only_visible_preferences": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     mp = pytest.MonkeyPatch()
     try:
         test_stats_text_and_json(mp)

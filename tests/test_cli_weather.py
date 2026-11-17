@@ -129,8 +129,10 @@ def test_main_dispatch_usage(monkeypatch):
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     for case in (
         test_weather_text,
         test_weather_json,

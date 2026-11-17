@@ -466,10 +466,16 @@ def test_robust_first_json_object_repairs_small_faults():
     print("✓ 首个 JSON 对象修复解析（尾逗号）")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_extract_first_json_object_escape_state_machine": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_json_parse_failure_raises_value_error()
     test_sanitize_json_escapes_surrogates()
     test_sanitize_json_depth_guard()

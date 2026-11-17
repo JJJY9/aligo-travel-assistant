@@ -810,8 +810,27 @@ def test_export_snapshot_retries_after_connection_rebuild(monkeypatch):
         store.delete_all()
         store.close()
 
+_DIRECT_RUN_SKIP = {
+    "test_add_chat_messages_dedupe_normalizes_integer_session_id": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_advisory_lock_reacquired_after_reconnect": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_advisory_lock_reentrant_reacquire_after_reconnect": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_advisory_lock_serializes_threads_on_same_instance": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_export_snapshot_retries_after_connection_rebuild": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pg_delete_last_turn_uses_read_order_after_import": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pg_import_inherits_missing_timestamp_from_neighbor": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pg_import_preserves_timestamp_instant": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pg_import_skips_alternative_answer_local_wins": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pg_import_skips_orphan_answer_and_orders_by_timestamp": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_update_trip_dedupe_normalizes_crlf_and_propagates_purpose": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_update_trip_dedupe_normalizes_single_day_end_date": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_webapp_trips_dedupe_postgres": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_webapp_with_postgres_backend": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")

@@ -564,10 +564,26 @@ def test_configure_stdio_isatty_error_and_wrap_failure(monkeypatch):
     print("✓ configure_stdio isatty 异常与包装失败")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_auto_decode_input_textio_properties": "需要 tmp_path 夹具",
+    "test_auto_decode_nul_and_bomless_utf16le": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_auto_decode_peek_failure_uses_auto_mode": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_configure_stdio_isatty_error_and_wrap_failure": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_pipe_safe_textio_delegates_metadata": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_read_merges_pending_line": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_read_size_does_not_read_to_eof": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_read_size_truncation_keeps_remainder_utf16": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_reconfigure_failure_is_swallowed": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_stdin_fallback_prefers_locale_under_pythonutf8": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_utf16_readline_uses_single_chunk_reads": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_idle_pipe_does_not_block_startup()
     mp = pytest.MonkeyPatch()
     try:

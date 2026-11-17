@@ -713,10 +713,17 @@ def test_health_check_redacts_api_key_in_error(monkeypatch):
     print("✓ 健康检查错误文本遮蔽裸 API Key")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_json_formatter_includes_exc_info": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_json_formatter_sanitizes_any_message": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     _mp = pytest.MonkeyPatch()
     try:
         test_retriable_error_classification()

@@ -1524,12 +1524,16 @@ def _knowledge_ready_probe() -> None:
     ``import_documents(dry_run=True)`` 只做规划、不加载模型：模型文件
     缺失 / 损坏的部署里预览会通过、真实导入才失败。这里复用维护模块
     的懒加载入口（Agent 与模型被缓存，真实导入随后直接命中）。
+    构造成功但 ``initialized`` 为 False（依赖缺失 / 集合不可用）同样
+    视为不可用——真实导入会在写入批次时以状态错误失败。
     单测 / 直跑清单默认把它替换为 no-op（见 tests/conftest.py），
     避免逐用例加载真实模型。
     """
     from utils.knowledge_admin import _get_agent
 
-    _get_agent()
+    agent = _get_agent()
+    if getattr(agent, "initialized", True) is False:
+        raise RuntimeError("嵌入模型或知识库集合不可用")
 
 
 def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
@@ -1609,11 +1613,14 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
             plan = import_documents(
                 knowledge_rows, dry_run=True, return_pieces=True
             )
-            _knowledge_ready_probe()
             result["knowledge_imported"] = int(
                 plan.get("would_import") or 0
             )
             result["knowledge_skipped"] = int(plan.get("skipped") or 0)
+            # 与写层同一判定：全部内容已存在时真实导入走快速判重、
+            # 不加载嵌入模型；只有确有新增分片才需要模型可用
+            if int(plan.get("would_import") or 0) > 0:
+                _knowledge_ready_probe()
         except FileNotFoundError:
             result["knowledge_error"] = (
                 "知识库未初始化（先运行初始化脚本再恢复知识片段）"

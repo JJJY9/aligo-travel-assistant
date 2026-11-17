@@ -154,8 +154,10 @@ def test_plan_trip_uses_shared_model_factory():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_extract_itinerary_from_partial_failure()
     test_extract_itinerary_skips_failed_fallback()
     test_plan_trip_script_project_root()

@@ -410,10 +410,17 @@ def test_local_timestamp_text_tolerates_extreme_years():
     print("✓ 展示时间容忍极端年份")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_agent_error_uses_aggregated_message": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_skill_loader_warns_missing_manifest": "需要 capsys 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     mp = pytest.MonkeyPatch()
     try:
         test_missing_api_key_exits_cleanly(mp)

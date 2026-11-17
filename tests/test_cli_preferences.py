@@ -711,6 +711,9 @@ def test_pref_type_allows_web_charset(monkeypatch):
     print("✓ 偏好类型字符集与 Web 对齐（空格 / 点号可用，斜杠拒绝）")
 
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys as _sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError

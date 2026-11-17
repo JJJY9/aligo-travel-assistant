@@ -92,8 +92,10 @@ def test_summarize_tolerates_date_max_end():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_summarize_mixed_trips()
     test_summarize_active_and_past()
     test_summarize_overlapping_days_counted_once()
