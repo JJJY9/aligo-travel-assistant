@@ -10,8 +10,8 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_knowledge_library(monkeypatch):
-    from utils import user_import
+def _hermetic_knowledge_library(monkeypatch, tmp_path_factory, request):
+    from utils import knowledge_admin, user_import
 
     monkeypatch.setattr(
         user_import, "_existing_knowledge_rows", lambda: []
@@ -20,6 +20,25 @@ def _hermetic_knowledge_library(monkeypatch):
     # 需要验证模型不可用的用例自行覆盖该探针
     monkeypatch.setattr(
         user_import, "_knowledge_ready_probe", lambda: None
+    )
+    # 规划路径（import_documents 的 dry-run / 布局扫描）同样不能打开
+    # 真实全局库：此前只替换 existing 快照，开发机上单测仍会扫描真实
+    # Milvus（与 CI「无库」行为不一致，还可能被其它进程的文件锁干扰）。
+    # 把库路径指向不存在的文件，与 CI 一致；需要真实 / 临时知识库的
+    # 用例自行 monkeypatch knowledge_db_path 或 import_documents 覆盖。
+    # 例外：test_knowledge_admin_integration.py 按设计读写本地真实库
+    #（自带 _skip_reason 在无库环境跳过），不能被重定向。
+    node_path = getattr(request.node, "path", None)
+    if (
+        node_path is not None
+        and node_path.name == "test_knowledge_admin_integration.py"
+    ):
+        return
+    missing_db = (
+        tmp_path_factory.mktemp("hermetic_kb") / "milvus_lite.db"
+    )
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda *args, **kwargs: missing_db
     )
 
 

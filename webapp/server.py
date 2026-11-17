@@ -6089,13 +6089,11 @@ def create_app(model: Any = None) -> FastAPI:
                     # 存储打开失败的 503（_open_long_term strict）原样上抛，
                     # 不再被下面的通用分支改成「恢复失败」丢掉原因
                     raise
-                except ValueError as exc:
-                    # 存量 + 备份越过导出上限等用户可修正的问题：明确 400，
-                    # 不能吞成「稍后重试」的 503
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
                 except ImportVolumeError as exc:
                     # 锁内体积复核拒绝：恢复后账号将无法再导出全量备份，
-                    # 与锁外预检同一 413 口径（不是可重试的存储故障）
+                    # 与锁外预检同一 413 口径（不是可重试的存储故障）。
+                    # 必须排在 except ValueError 之前：本类是 ValueError
+                    # 的子类，父类分支在前会让 413 / 专用日志全部不可达
                     logger.warning("恢复用户备份被体积复核拒绝（%s）：%s", user_id, exc)
                     raise HTTPException(
                         status_code=413,
@@ -6103,6 +6101,10 @@ def create_app(model: Any = None) -> FastAPI:
                             f"{exc}（请求 ID：{_request_id(request)}）"
                         ),
                     ) from exc
+                except ValueError as exc:
+                    # 存量 + 备份越过导出上限等用户可修正的问题：明确 400，
+                    # 不能吞成「稍后重试」的 503
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
                 except PartialImportError as exc:
                     # 批量保存部分已提交：如实报告条数（CLI trips-import
                     # 同口径）；重复导入按路线+日期去重，可安全重跑

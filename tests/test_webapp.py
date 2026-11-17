@@ -1919,6 +1919,37 @@ def test_import_reads_export_snapshot_once(monkeypatch):
     print("✓ 导入预检共用快照，真实写入在导入锁内复核一次")
 
 
+def test_import_lock_volume_rejection_maps_to_413(monkeypatch):
+    """锁内体积复核拒绝映射 413：ImportVolumeError 是 ValueError 子类，
+    except 顺序必须让子类分支先命中（此前 413 / 专用日志不可达）。"""
+    from utils import user_import as module
+
+    calls = {"n": 0}
+
+    def fake_merged(store, sections, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # 锁外预检通过（并发导入在锁内写入）
+        return "约 60.0 MB 超过导入上限 50 MB"
+
+    monkeypatch.setattr(module, "merged_backup_limit_problem", fake_merged)
+    client = _client()
+    user_id = _unique_user("web_import_lock_volume")
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"home_location": "北京"}}},
+        )
+        assert response.status_code == 413, response.text
+        detail = response.json()["detail"]
+        assert "恢复中止" in detail and "请求 ID" in detail, detail
+        assert calls["n"] >= 2, calls
+    finally:
+        _cleanup(user_id)
+    print("✓ 导入锁内体积拒绝返回 413（不是可重试 503 / 400）")
+
+
 def test_export_refuses_backup_over_import_limits(monkeypatch):
     """超出导入上限的备份返回 413（不产出永远无法恢复的文件）。"""
     from utils import user_import as module
