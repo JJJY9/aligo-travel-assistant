@@ -3494,6 +3494,42 @@ def test_import_user_data_survives_knowledge_outage(monkeypatch):
     print("✓ 知识库忙时用户数据照常恢复（知识段跳过并上报）")
 
 
+def test_preview_dropped_trip_links_mirrors_storage_semantics():
+    """合并预演复刻 _resolve_dropped_trip_links 的两条分支：既有链接正是
+    被丢弃会话 → 显式 session_id=None；否则去标记、保留既有链接。"""
+    from utils import user_import as module
+
+    base = {
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-01-01",
+        "purpose": "出差",
+    }
+    dropped = "sess-gone"
+    marked = dict(base)
+    marked[module._DROPPED_SESSION_KEY] = dropped
+
+    # 既有同身份行程链接被丢弃会话 → 预演为显式清空
+    hit = module._preview_dropped_trip_links(
+        [dict(base, session_id=dropped)], [dict(marked)]
+    )
+    assert hit[0]["session_id"] is None
+    assert module._DROPPED_SESSION_KEY not in hit[0]
+
+    # 既有链接指向仍存活的会话 → 去标记、保留链接（键缺失）
+    keep = module._preview_dropped_trip_links(
+        [dict(base, session_id="sess-alive")], [dict(marked)]
+    )
+    assert "session_id" not in keep[0]
+    assert module._DROPPED_SESSION_KEY not in keep[0]
+
+    # 无标记行原样返回（不复制、不改写标记）
+    plain = dict(base, session_id="sess-alive")
+    out = module._preview_dropped_trip_links([], [plain])
+    assert out[0] is plain
+    print("✓ 行程链接预演与真实落库语义一致")
+
+
 def test_preview_probe_skips_write_agent_when_collection_missing(monkeypatch):
     """半初始化库（集合缺失）下预览探针只验证嵌入模型，不构造写路径
     Agent——后者 create_if_missing 会在「只读」预览里创建空集合。"""

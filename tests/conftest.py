@@ -9,6 +9,27 @@ monkeypatch ``utils.user_import._existing_knowledge_rows`` / 知识库规划。
 import pytest
 
 
+def _ensure_utf8_stdio() -> None:
+    """Windows GBK 控制台 / 管道下 ``pytest -s``（关闭捕获）时，用例里的
+    ✓ 等字符会抛 UnicodeEncodeError 把整份运行变成失败：导入期先切
+    UTF-8（与直跑清单的 ``tests/_stdio.ensure_utf8`` 同口径，不支持时
+    保持原状）。默认捕获模式下 stdout 已被 pytest 替换，reconfigure 为
+    no-op。
+    """
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+_ensure_utf8_stdio()
+
+
 @pytest.fixture
 def hermetic_kb_path(tmp_path_factory):
     """知识库隔离夹具注入的「不存在的库路径」（供回归用例断言相等）。"""

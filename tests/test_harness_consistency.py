@@ -344,6 +344,17 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
                             arg.id,
                         )
                     )
+                elif (
+                    isinstance(arg, ast.Call)
+                    and isinstance(arg.func, ast.Attribute)
+                    and arg.func.attr == "MonkeyPatch"
+                ):
+                    # 内联新建的实例没有任何引用可撤销：补丁会泄漏到
+                    # 后续用例 / 进程结束
+                    problems.append(
+                        f"{name}:{arg.lineno} {func.id} 收到内联新建的 "
+                        "pytest.MonkeyPatch()：无法撤销，补丁会泄漏"
+                    )
     events.sort()
     states: dict[str, str] = {var: "none" for var in patch_vars}
     last_call: dict[str, str] = {}
@@ -367,6 +378,13 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
                 )
             else:
                 last_call[var] = kind[5:]
+    for var, state in states.items():
+        if state == "new":
+            # 清单跑完仍未撤销：全局模块替身泄漏到进程末尾（py3.14 -
+            # 等后续语句 / 测试清理都可能被污染）
+            problems.append(
+                f"{name}: 补丁实例 {var} 创建后从未撤销（补丁会泄漏）"
+            )
     return problems
 
 
@@ -460,12 +478,24 @@ def test_monkeypatch_reuse_check_covers_renamed_vars():
     problems = _monkeypatch_reuse_problems(undo_then_call, "synthetic.py")
     assert problems and "复用了已撤销" in problems[0], problems
 
+    # 内联新建无法撤销：必须报问题（此前被当作「天然安全」）
     inline = (
         "import pytest\n"
         "if __name__ == '__main__':\n"
         "    test_a(pytest.MonkeyPatch())\n"
     )
-    assert _monkeypatch_reuse_problems(inline, "synthetic.py") == []
+    problems = _monkeypatch_reuse_problems(inline, "synthetic.py")
+    assert problems and "内联新建" in problems[0], problems
+
+    # 创建后从未撤销同样必须报问题（全局替身泄漏到进程末尾）
+    never_undone = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp = pytest.MonkeyPatch()\n"
+        "    test_a(mp)\n"
+    )
+    problems = _monkeypatch_reuse_problems(never_undone, "synthetic.py")
+    assert problems and "从未撤销" in problems[0], problems
     print("✓ MonkeyPatch 复用自检覆盖任意变量名")
 
 

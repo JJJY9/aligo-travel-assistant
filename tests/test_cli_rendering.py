@@ -275,7 +275,14 @@ def test_print_stdout_swallows_pipe_errors_only(monkeypatch):
 
     monkeypatch.setattr("builtins.print", fake_print)
     errors.append(OSError(22, "invalid argument"))
-    cli_module._print_stdout("x")  # Errno 22（Windows 管道关闭）应被吞掉
+    # 管道错误分支会把真实 fd1 重定向到 devnull（生产语义：下游已断开，
+    # 静默收尾）：测试必须保存并恢复 fd1，否则进程后续输出被永久吞掉
+    saved_fd = os.dup(1)
+    try:
+        cli_module._print_stdout("x")  # Errno 22（Windows 管道关闭）应被吞掉
+    finally:
+        os.dup2(saved_fd, 1)
+        os.close(saved_fd)
 
     errors.append(OSError(5, "io error"))
     with pytest.raises(OSError):
