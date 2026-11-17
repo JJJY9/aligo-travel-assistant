@@ -65,6 +65,10 @@ def _cleanup(user_id: str) -> None:
     lock_path = Path(MEMORY_DIR) / f"{user_id}.json.lock"
     if lock_path.exists():
         lock_path.unlink()
+    # 导入互斥锁（<user>.json.import.lock）同样是零字节残留
+    import_lock = Path(MEMORY_DIR) / f"{user_id}.json.import.lock"
+    if import_lock.exists():
+        import_lock.unlink()
     # 旧格式数据加载会触发破坏性迁移并留下原始副本：同样不能堆在
     # data/memory（迁移副本含完整用户数据）
     migrate_path = Path(MEMORY_DIR) / f"{user_id}.json.migrate-backup"
@@ -1879,7 +1883,9 @@ def test_chat_message_cap_surfaces_cleanup_hint(monkeypatch):
 
 
 def test_import_reads_export_snapshot_once(monkeypatch):
-    """预检与合并复核共用同一导出快照：每个导入只做一次全量读取。"""
+    """预检与合并复核共用同一导出快照（dry-run 每次请求只读一次）；
+    真实写入在导入互斥锁内再取一次快照做并发体积复核（两次并发导入
+    各自锁外通过后合计越限会让账号永久无法导出）。"""
     from utils import user_import as module
 
     calls = {"n": 0}
@@ -1895,14 +1901,22 @@ def test_import_reads_export_snapshot_once(monkeypatch):
     try:
         response = client.post(
             "/api/import",
-            params={"user_id": user_id},
+            params={"user_id": user_id, "dry_run": 1},
             json={"backup": {"preferences": {"home_location": "北京"}}},
         )
         assert response.status_code == 200, response.text
         assert calls["n"] == 1, calls
+        calls["n"] = 0
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"home_location": "北京"}}},
+        )
+        assert response.status_code == 200, response.text
+        assert calls["n"] == 2, calls
     finally:
         _cleanup(user_id)
-    print("✓ 导入预检与合并复核共用一次快照")
+    print("✓ 导入预检共用快照，真实写入在导入锁内复核一次")
 
 
 def test_export_refuses_backup_over_import_limits(monkeypatch):
