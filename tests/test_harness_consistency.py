@@ -271,20 +271,25 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
     events: list[tuple[int, str, str]] = []
     patch_vars: set[str] = set()
     for node in ast.walk(block):
+        lineno = int(getattr(node, "lineno", 0))
         target: ast.expr | None = None
+        value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
+            value = node.value
         elif isinstance(node, ast.AnnAssign):
             target = node.target
+            value = node.value
         if (
             target is not None
             and isinstance(target, ast.Name)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Attribute)
-            and node.value.func.attr == "MonkeyPatch"
+            and value is not None
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "MonkeyPatch"
         ):
             patch_vars.add(target.id)
-            events.append((node.lineno, "new", target.id))
+            events.append((lineno, "new", target.id))
             continue
         if not isinstance(node, ast.Call):
             continue
