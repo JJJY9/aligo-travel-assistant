@@ -878,6 +878,11 @@ class PostgresLongTermMemory:
         if not incoming:
             return 0
 
+        # 首次尝试实际保留的条数：「提交后 COMMIT ack 丢失」时 _run_with_retry
+        # 会重连重放，重放的判重 SELECT 已能看到那批行并全部过滤（kept 为空）。
+        # 数据已在库里，不能把实际已写入的消息全报成跳过
+        attempts: dict[str, int] = {"previous_kept": 0}
+
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
                 kept: list[dict[str, Any]] = incoming
@@ -903,7 +908,10 @@ class PostgresLongTermMemory:
                     )
                     kept = filter_import_messages(incoming, existing)
                 if not kept:
-                    return 0
+                    # 幂等路径（全部已存在）或重放路径（首次尝试已提交、
+                    # ack 丢失）：按首次尝试的保留条数报告
+                    return attempts["previous_kept"]
+                attempts["previous_kept"] = len(kept)
                 from utils.user_import import _MAX_MESSAGES
 
                 cursor.execute(

@@ -1592,6 +1592,99 @@ def test_storage_rejects_reserved_preference_type():
     print("✓ 存储层拒绝保留偏好类型 preferences")
 
 
+def test_pg_add_chat_messages_reports_committed_count_after_lost_ack():
+    """提交后连接中断的重放：重放的判重 SELECT 看到已提交行时按首次
+    尝试的保留条数报告，不能把实际已写入的消息全报成跳过。"""
+    import psycopg
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    state = {"attempt": 1}
+
+    class _Cursor:
+        def __init__(self, conn):
+            self._conn = conn
+            self._rows: list[tuple] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            if text.startswith("SELECT session_id, role, content"):
+                # 已提交行为 (user_id, role, content, session_id, created_at)
+                self._rows = [
+                    (row[3], row[1], row[2]) for row in self._conn.committed
+                ]
+            elif text.startswith("SELECT COUNT(*)"):
+                self._rows = [(len(self._conn.committed),)]
+            else:
+                self._rows = []
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        def executemany(self, sql, rows):
+            self._conn.pending.extend(rows)
+
+    class _Transaction:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            # 提交在服务端成功，但 COMMIT ack 丢失
+            self._conn.committed.extend(self._conn.pending)
+            self._conn.pending.clear()
+            if state["attempt"] == 1:
+                state["attempt"] = 2
+                raise psycopg.OperationalError("lost commit ack")
+            return False
+
+    class _Conn:
+        def __init__(self, committed=()):
+            self.committed = list(committed)
+            self.pending: list[tuple] = []
+
+        def transaction(self):
+            return _Transaction(self)
+
+        def cursor(self):
+            return _Cursor(self)
+
+        def close(self):
+            pass
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-lost-ack"
+    store._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
+    store._non_retry_db_errors = (psycopg.errors.LockNotAvailable,)
+    store._held_locks = {}
+    store._conn_lock = threading.RLock()
+    first = _Conn()
+    store._conn = first
+    store._reconnect = lambda: setattr(
+        store, "_conn", _Conn(first.committed)
+    )
+
+    messages = [
+        {"role": "user", "content": f"m{i}", "session_id": "s1"}
+        for i in range(3)
+    ]
+    added = store.add_chat_messages(messages, dedupe=True)
+    assert added == 3, added
+    assert len(first.committed) == 3, first.committed
+    print("✓ 提交 ack 丢失的重放按已提交条数报告")
+
+
 def test_pg_save_preference_never_replays():
     """偏好 UPSERT 一律禁止重放（并发删除 + 补位会让重放变成未经上限
     复核的新增行）：方法不再暴露会被静默忽略的 replay_safe 形参，两条
@@ -5816,6 +5909,11 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            import _direct_run_kb
+
+            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()
