@@ -251,8 +251,10 @@ def test_punctuation_only_chunks_dropped():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_sections_not_mixed()
     test_faq_questions_separated()
     test_long_paragraph_split()

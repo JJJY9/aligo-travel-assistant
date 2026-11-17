@@ -329,9 +329,18 @@ def test_grouped_missing_parts_listing_is_bounded():
     print("✓ 缺失分片列表有界")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_grouped_missing_parts_listing_is_bounded": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_rag_query_extraction_falls_back_to_raw_query": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_skill_agent_anchors_model_to_repo_config_dir": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_strict_search_error_has_top_level_message": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     asyncio.run(test_rag_agent())
     print("\n测试完成！")

@@ -146,10 +146,16 @@ def test_redaction_keeps_url_after_spacey_cjk_path():
     assert "<路径>" in cleaned and "Connection refused" in cleaned
     print("✓ 路径后的 URL 仍被整体遮蔽")
 
+_DIRECT_RUN_SKIP = {
+    "test_preference_and_title_values_not_logged": "需要 caplog 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_secret_masks_bare_api_keys()

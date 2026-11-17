@@ -312,10 +312,16 @@ def test_parse_failure_log_is_single_line_and_short(caplog):
     print("✓ 解析失败日志单行且截断")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_parse_failure_log_is_single_line_and_short": "需要 caplog 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     mp = pytest.MonkeyPatch()
     try:
         test_escaped_quotes_in_string_do_not_break_scan()

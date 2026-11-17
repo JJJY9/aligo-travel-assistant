@@ -100,8 +100,10 @@ def test_empty_bundle_renders_placeholder():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_single_session_escapes_every_dynamic_field()
     test_assistant_message_text_variants()
     test_all_sessions_bundle_grouping_and_escaping()

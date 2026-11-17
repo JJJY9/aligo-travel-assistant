@@ -389,9 +389,26 @@ def test_case_collision_user_id_is_refused(tmp_path):
     assert again.get_preference()["home_location"] == "北京"
     print("✓ 用户 ID 大小写冲突拒绝访问同一记忆文件")
 
+_DIRECT_RUN_SKIP = {
+    "test_case_collision_user_id_is_refused": "需要 tmp_path 夹具",
+    "test_corrupt_file_backed_up_before_overwrite": "需要 tmp_path 夹具",
+    "test_corrupt_file_write_refused_when_backup_fails": "需要 tmp_path 夹具",
+    "test_default_lock_timeout_covers_network_guard": "需要 tmp_path 夹具",
+    "test_file_lock_close_error_does_not_mask_timeout": "需要 tmp_path 夹具",
+    "test_file_lock_normalizes_oserror": "需要 tmp_path 夹具",
+    "test_file_lock_times_out_while_held": "需要 tmp_path 夹具",
+    "test_file_lock_unlock_failure_is_swallowed": "需要 tmp_path 夹具",
+    "test_load_closes_handle_before_parse": "需要 tmp_path 夹具",
+    "test_lock_timeout_maps_to_persistence_error": "需要 tmp_path 夹具",
+    "test_save_fsyncs_before_atomic_replace": "需要 tmp_path 夹具",
+    "test_save_retries_transient_replace_errors": "需要 tmp_path 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_cross_process_increments_are_not_lost()
     print("\n全部通过（monkeypatch 用例需 pytest）")

@@ -245,6 +245,8 @@ async def test_information_query_agent():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     asyncio.run(test_information_query_agent())

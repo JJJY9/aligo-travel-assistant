@@ -136,10 +136,16 @@ def test_add_usage_merges_numeric_fields():
     print("✓ add_usage 合并未结算用量")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_failed_attempts_count_as_calls": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_tracks_usage()
     test_missing_usage_counts_call_only()
     test_attribute_delegation()

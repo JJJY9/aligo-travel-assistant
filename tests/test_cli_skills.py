@@ -92,8 +92,10 @@ def test_main_rejects_unknown_flag(monkeypatch):
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_lists_repo_skills()
     mp = pytest.MonkeyPatch()
     try:

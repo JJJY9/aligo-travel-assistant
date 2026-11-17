@@ -574,6 +574,9 @@ def test_export_csv_over_import_row_limit(monkeypatch):
     print("✓ 行程超过导入上限时 CSV 导出仍成功")
 
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，

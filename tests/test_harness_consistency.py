@@ -152,15 +152,30 @@ def test_manual_lists_cover_all_tests():
         block = _find_main_block(tree)
         if block is None:
             continue
-        tuple_loops = [
-            node
+        # 自动发现清单（globals() 循环）与 asyncio.run(main()) 委托
+        # 无法静态枚举，天然执行全部用例
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "items"
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "globals"
             for node in ast.walk(block)
-            if isinstance(node, ast.For)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "case"
-            and isinstance(node.iter, ast.Tuple)
-        ]
-        if not tuple_loops:
+        ) or any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "asyncio"
+            and any(
+                isinstance(argument, ast.Call)
+                and isinstance(argument.func, ast.Name)
+                and argument.func.id == "main"
+                for argument in node.args
+            )
+            for node in ast.walk(block)
+        ):
             continue
         tests = [
             node.name
@@ -217,8 +232,89 @@ def test_case_loops_do_not_call_tests_after_undo():
     print("✓ case 循环内不重复调用用例")
 
 
+def test_main_blocks_do_not_reuse_undone_monkeypatch():
+    """__main__ 里 `test_x(mp)` 之前必须有一个晚于最近一次
+    `mp.undo()` 的 `mp = pytest.MonkeyPatch()`：复用已撤销的补丁实例
+    会泄漏补丁（注册到不会再 undo 的实例上）并重复执行用例。"""
+    problems: list[str] = []
+    for path in sorted(TESTS_DIR.glob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        block = _find_main_block(tree)
+        if block is None:
+            continue
+        events: list[tuple[int, str]] = []
+        for node in ast.walk(block):
+            if isinstance(node, ast.Assign):
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "mp"
+                ):
+                    value = node.value
+                    if (
+                        isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Attribute)
+                        and value.func.attr == "MonkeyPatch"
+                    ):
+                        events.append((node.lineno, "new"))
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "undo"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "mp"
+                ):
+                    events.append((node.lineno, "undo"))
+                elif (
+                    isinstance(func, ast.Name)
+                    and func.id.startswith("test_")
+                    and any(
+                        isinstance(arg, ast.Name) and arg.id == "mp"
+                        for arg in node.args
+                    )
+                ):
+                    events.append((node.lineno, f"call:{func.id}"))
+        events.sort()
+        state = "none"
+        for lineno, kind in events:
+            if kind in ("new", "undo"):
+                state = kind
+            elif kind.startswith("call:") and state != "new":
+                problems.append(
+                    f"{path.name}:{lineno} {kind[5:]} 复用了已撤销的 MonkeyPatch"
+                )
+    assert not problems, chr(10).join(problems)
+    print("✓ __main__ 不复用已撤销的 MonkeyPatch")
+
+
+def test_direct_run_files_install_tmp_registry():
+    """直跑文件若用 ``tempfile.mkdtemp()`` 自建目录，__main__ 必须接入
+    临时目录登记表（直接调用 ``_tmp_registry.install()``，或经共享的
+    ``_stdio.ensure_utf8()``——它已顺带安装）。否则直跑结束后
+    含记忆 JSON 的目录会永久留在系统临时目录。"""
+    marker = 'if __name__ == "__main__":'
+    problems: list[str] = []
+    for path in sorted(TESTS_DIR.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        if marker not in text or "tempfile.mkdtemp(" not in text:
+            continue
+        block = text[text.rfind(marker):]
+        if "_tmp_registry.install()" in block or "_stdio.ensure_utf8()" in block:
+            continue
+        problems.append(path.name)
+    assert not problems, "缺临时目录登记：" + ", ".join(problems)
+    print("✓ 直跑清单接入临时目录登记")
+
+
 
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，
@@ -234,4 +330,6 @@ if __name__ == "__main__":
     test_main_blocks_guard_utf8_output()
     test_manual_lists_cover_all_tests()
     test_case_loops_do_not_call_tests_after_undo()
+    test_main_blocks_do_not_reuse_undone_monkeypatch()
+    test_direct_run_files_install_tmp_registry()
     print("\n全部通过")

@@ -15,3 +15,11 @@ def ensure_utf8() -> None:
                 reconfigure(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         pass
+    # 直跑清单常用 tempfile.mkdtemp() 自建记忆目录：顺手安装登记表，
+    # 进程退出时统一清理（重复调用幂等）
+    try:
+        import _tmp_registry
+
+        _tmp_registry.install()
+    except Exception:  # noqa: BLE001 - 登记表不可用时不影响输出守卫
+        pass

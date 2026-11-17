@@ -416,10 +416,18 @@ def test_config_local_loaded_without_cwd_on_sys_path():
     print("✓ sys.path 无 CWD 时按显式路径加载 config_local.py")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_init_agentscope_survives_gbk_print_failure": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_numeric_and_bool_envs_strip_bom_and_strip_quotes": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_oversized_timeout_clamped_and_factory_survives": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_api_key_is_stripped_and_blank_falls_back()
     test_storage_urls_strip_whitespace_and_bom()
     test_llm_request_timeout_env()

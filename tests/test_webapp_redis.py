@@ -358,8 +358,15 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
         client.delete(key, applied_key(key))
 
 
+_DIRECT_RUN_SKIP = {
+    "test_redis_short_term_replays_after_outage": "暂未纳入直跑清单（pytest 覆盖）",
+    "test_webapp_with_redis_short_term": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     print("该测试需要 TEST_REDIS_URL，请通过 pytest 运行")

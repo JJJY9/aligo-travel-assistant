@@ -199,8 +199,10 @@ def display_result(result):
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     print("="*70)
     print("意图识别智能体测试")
     print("="*70)

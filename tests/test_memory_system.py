@@ -308,8 +308,10 @@ async def test_memory_system():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
 
     try:
         asyncio.run(test_memory_system())

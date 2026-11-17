@@ -48,8 +48,10 @@ def test_phase_and_plan_events():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_agent_events()
     test_phase_and_plan_events()
     print("\n全部通过")

@@ -222,8 +222,10 @@ def test_multipart_group_roundtrip():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     skip_reason = _skip_reason()
     if skip_reason:
         print(f"跳过：{skip_reason}")

@@ -820,8 +820,10 @@ def test_preference_legacy_explanatory_keys_not_rendered():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_itinerary()
     test_preference()
     test_rag_answer_with_sources()

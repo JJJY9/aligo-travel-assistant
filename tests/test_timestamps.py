@@ -95,8 +95,10 @@ def test_chronological_key_extreme_years_do_not_raise():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_to_aware_parses_naive_and_aware()
     test_chronological_key_compares_by_instant()
     test_naive_and_aware_same_instant_share_key()

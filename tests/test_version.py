@@ -33,9 +33,15 @@ def test_cli_version_flag(monkeypatch, capsys):
     print("✓ cli.py --version / -V")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_cli_version_flag": "需要 capsys 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_version_format_and_shared()
     print("\n全部通过（--version 用例需 pytest 的 capsys）")

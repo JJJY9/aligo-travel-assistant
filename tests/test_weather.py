@@ -968,6 +968,9 @@ def test_peek_cached_weather_returns_fresh_entry():
     print("✓ peek_cached_weather 只返回新鲜缓存")
 
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，

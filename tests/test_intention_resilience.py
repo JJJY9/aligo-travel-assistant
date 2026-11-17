@@ -577,8 +577,10 @@ def test_trailing_template_example_does_not_override_real_result():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_retriable_error_is_raised()
     test_permanent_llm_error_is_raised()
     test_empty_response_is_retriable_error()

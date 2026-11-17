@@ -70,7 +70,9 @@ def test_string_preferences_in_prompt():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_string_preferences_in_prompt()
     print("\n全部通过")

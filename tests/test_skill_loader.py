@@ -209,10 +209,16 @@ def test_read_errors_return_none(monkeypatch):
     print("✓ SKILL.md / 正文读取失败返回 None")
 
 
+_DIRECT_RUN_SKIP = {
+    "test_dispatchable_only_excludes_doc_only_skills": "暂未纳入直跑清单（pytest 覆盖）",
+}
+
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_load_skills_tolerates_malformed_entries()
     test_get_skill_prompt_sorted_and_mapped()
     test_missing_skills_dir_returns_empty()

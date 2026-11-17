@@ -146,8 +146,10 @@ def test_reset():
 
 if __name__ == "__main__":
     import _stdio
+    import _tmp_registry
 
     _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_record_and_snapshot()
     test_percentiles_use_bounded_recent_samples()
     test_path_cardinality_is_bounded()
