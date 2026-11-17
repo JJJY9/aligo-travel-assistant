@@ -12474,7 +12474,8 @@ def test_persistence_detail_maps_case_conflict():
 
 
 def test_open_long_term_maps_case_conflict(monkeypatch):
-    """/api/import 等 _open_long_term 调用点同样给可执行的大小写提示。"""
+    """/api/import 等 _open_long_term 调用点同样给可执行的大小写提示，
+    状态码为永久可修正的 409（不是可重试 503）。"""
     from utils.errors import MemoryPersistenceError
     from webapp import server as server_module
 
@@ -12486,9 +12487,33 @@ def test_open_long_term_maps_case_conflict(monkeypatch):
     monkeypatch.setattr(server_module, "create_long_term_memory", boom)
     with pytest.raises(server_module.HTTPException) as info:
         server_module._open_long_term("AliceXyz")
-    assert info.value.status_code == 503
+    assert info.value.status_code == 409
     assert "大小写" in info.value.detail, info.value.detail
-    print("✓ 大小写冲突映射为可执行提示")
+    print("✓ 大小写冲突映射为 409 + 可执行提示")
+
+
+def test_chat_maps_case_conflict_to_409(monkeypatch):
+    """对话（含流式）端点同样把永久、可修正的大小写冲突映射为 409。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    async def boom(*args, **kwargs):
+        raise MemoryPersistenceError(
+            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）"
+        )
+
+    monkeypatch.setattr(server_module, "_get_session_marked", boom)
+    client = _client()
+    response = client.post(
+        "/api/chat", json={"message": "你好", "user_id": "AliceXyz"}
+    )
+    assert response.status_code == 409, response.text
+    assert "大小写" in response.json()["detail"], response.text
+    streamed = client.post(
+        "/api/chat/stream", json={"message": "你好", "user_id": "AliceXyz"}
+    )
+    assert streamed.status_code == 409, streamed.text
+    print("✓ 对话 / 流式端点把大小写冲突映射为 409")
 
 
 def test_web_session_quarantine_gate_requires_json_backend(monkeypatch, tmp_path):

@@ -1177,44 +1177,80 @@ if __name__ == "__main__":
                 _reconfigure(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         pass
+    test_eof_at_user_prompt_exits_cleanly()
     _mp = pytest.MonkeyPatch()
     try:
-        test_eof_at_user_prompt_exits_cleanly()
         test_eof_at_main_prompt_breaks_loop(_mp)
-        test_startup_memory_error_exits_without_traceback(_mp)
-        # GBK 管道用例带 @skipif(sys.platform != "win32")：标记只对 pytest
-        # 生效，直跑要按平台自己守卫
-        if sys.platform == "win32":
-            test_gbk_piped_input_keeps_locale_decoding()
-        else:
-            print("跳过 GBK 管道用例（仅 Windows）")
-        test_utf8_piped_input_not_mojibake()
-        test_human_response_escapes_markup()
-        test_markup_safe_strips_controls_before_escaping()
-        test_human_response_tolerates_malformed_itinerary()
-        test_read_commands_reload_snapshot()
-        test_summary_tolerates_legacy_nested_preference_and_trip_fields()
-        test_process_query_reloads_long_term_each_turn()
-        test_process_query_stages_user_message_before_orchestration()
-        test_pending_cancel_does_not_kill_next_command(_mp)
-        test_double_ctrl_c_forces_exit(_mp)
-        test_process_query_commits_deferred_when_cancelled_before_check()
-        test_process_query_rolls_back_when_persist_vetoed()
-        test_process_query_defers_memory_until_persisted()
-        test_failed_turn_usage_carried_to_next_success()
-        test_process_query_sanitizes_surrogates_before_persist()
-        test_process_query_failure_leaves_no_long_term_user_turn()
-        test_process_query_memory_failure_not_counted_by_breaker()
-        test_process_query_releases_probe_on_early_failure(_mp)
-        test_prompt_sigint_does_not_cancel_next_command(_mp)
-        test_user_sigint_during_query_returns_to_prompt(_mp)
-        test_external_cancel_propagates_out_of_repl(_mp)
-        test_sigint_at_user_id_prompt_exits_cleanly(_mp)
-        test_sigint_during_initialization_does_not_poison_first_command(_mp)
-        test_preference_display_tolerates_unhashable_type()
-        test_closed_stdout_pipe_does_not_traceback()
     finally:
         _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_startup_memory_error_exits_without_traceback(_mp)
+    finally:
+        _mp.undo()
+    # GBK 管道用例带 @skipif(sys.platform != "win32")：标记只对 pytest
+    # 生效，直跑要按平台自己守卫
+    if sys.platform == "win32":
+        test_gbk_piped_input_keeps_locale_decoding()
+    else:
+        print("跳过 GBK 管道用例（仅 Windows）")
+    test_utf8_piped_input_not_mojibake()
+    test_human_response_escapes_markup()
+    test_markup_safe_strips_controls_before_escaping()
+    test_human_response_tolerates_malformed_itinerary()
+    test_read_commands_reload_snapshot()
+    test_summary_tolerates_legacy_nested_preference_and_trip_fields()
+    test_process_query_reloads_long_term_each_turn()
+    test_process_query_stages_user_message_before_orchestration()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_pending_cancel_does_not_kill_next_command(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_double_ctrl_c_forces_exit(_mp)
+    finally:
+        _mp.undo()
+    test_process_query_commits_deferred_when_cancelled_before_check()
+    test_process_query_rolls_back_when_persist_vetoed()
+    test_process_query_defers_memory_until_persisted()
+    test_failed_turn_usage_carried_to_next_success()
+    test_process_query_sanitizes_surrogates_before_persist()
+    test_process_query_failure_leaves_no_long_term_user_turn()
+    test_process_query_memory_failure_not_counted_by_breaker()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_process_query_releases_probe_on_early_failure(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_prompt_sigint_does_not_cancel_next_command(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_user_sigint_during_query_returns_to_prompt(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_external_cancel_propagates_out_of_repl(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_sigint_at_user_id_prompt_exits_cleanly(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_sigint_during_initialization_does_not_poison_first_command(_mp)
+    finally:
+        _mp.undo()
+    test_preference_display_tolerates_unhashable_type()
+    test_closed_stdout_pipe_does_not_traceback()
     test_cli_module_imports_without_runtime_deps()
     _mp = pytest.MonkeyPatch()
     try:

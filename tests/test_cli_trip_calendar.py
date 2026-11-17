@@ -223,13 +223,45 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_export_single_trip_ics(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_missing_and_ambiguous_trip_rejected(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_trip_without_start_date_rejected(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_unparsable_end_notice(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_stdout_and_overwrite_protection(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_invalid_ids_and_store_failure(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_main_dispatch_trip_calendar(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_default_path_includes_safe_user(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_main_dispatch_rejects_html_and_bad_args(mp)
     finally:
         mp.undo()

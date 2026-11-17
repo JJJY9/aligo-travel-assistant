@@ -521,25 +521,41 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
+    test_json_add_chat_turn_writes_pair_once()
     _mp = pytest.MonkeyPatch()
     try:
-        test_json_add_chat_turn_writes_pair_once()
         test_json_add_chat_turn_rolls_back_pair_on_persist_failure(_mp)
-        test_json_add_chat_turn_guard_vetoes_write()
-        test_memory_manager_persist_turn_delegates_and_stages_assistant()
-        test_persist_turn_does_not_rebuild_snapshot_store(_mp)
-        test_persist_turn_reuses_staged_timestamps()
-        test_persist_turn_veto_skips_assistant_stage()
-        test_persist_turn_defaults_to_shared_tombstone_guard(_mp)
-        test_persist_turn_default_guard_commits_when_not_deleted(_mp)
-        test_memory_manager_persist_guard_vetoes_on_epoch_change(_mp)
-        test_cancel_during_persist_drains_with_both_messages()
-        test_cancel_during_persist_does_not_rollback_staged()
-        test_cancel_with_failed_persist_rolls_back_staged()
-        test_cancel_with_vetoed_persist_rolls_back_staged()
-        test_next_turn_waits_for_previous_rollback()
-        test_next_turn_waits_for_inflight_persist_after_drain_timeout()
-        test_drain_without_pending_returns_immediately()
     finally:
         _mp.undo()
+    test_json_add_chat_turn_guard_vetoes_write()
+    test_memory_manager_persist_turn_delegates_and_stages_assistant()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_persist_turn_does_not_rebuild_snapshot_store(_mp)
+    finally:
+        _mp.undo()
+    test_persist_turn_reuses_staged_timestamps()
+    test_persist_turn_veto_skips_assistant_stage()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_persist_turn_defaults_to_shared_tombstone_guard(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_persist_turn_default_guard_commits_when_not_deleted(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_memory_manager_persist_guard_vetoes_on_epoch_change(_mp)
+    finally:
+        _mp.undo()
+    test_cancel_during_persist_drains_with_both_messages()
+    test_cancel_during_persist_does_not_rollback_staged()
+    test_cancel_with_failed_persist_rolls_back_staged()
+    test_cancel_with_vetoed_persist_rolls_back_staged()
+    test_next_turn_waits_for_previous_rollback()
+    test_next_turn_waits_for_inflight_persist_after_drain_timeout()
+    test_drain_without_pending_returns_immediately()
     print("\n全部通过")

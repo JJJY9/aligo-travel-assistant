@@ -725,28 +725,120 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_retriable_error_classification()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_retry_does_not_retry_parse_error_with_500()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_health_check_rejects_empty_response(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_half_open_single_probe_and_recovery(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_half_open_probe_lease_covers_slow_probe(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_live_probe_task_not_preempted_after_lease(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_finished_probe_task_reclaimed_within_lease(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_failure_after_recovery_timeout_reopens(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_build_turn_meta_tolerates_non_list_shapes()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_access_log_strips_control_characters()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_access_log_truncates_user_controlled_fields()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_release_probe_returns_half_open_slot(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_probe_owner_only(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_late_success_cannot_close_breaker(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_late_failure_cannot_reopen_half_open(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_retry_jitter_respects_max_delay(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_response_text_dict_and_scalar_shapes()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_retry_error_edges_and_response_shapes()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_health_check_error_paths(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_health_check_enforces_overall_timeout(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_conversation_ask_releases_probe_on_cancel(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_memory_persistence_error_does_not_trip_breaker()
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_denies_new_calls_readonly_precheck(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_health_check_redacts_api_key_in_error(_mp)
     finally:
         _mp.undo()

@@ -329,7 +329,6 @@ if __name__ == "__main__":
         test_iter_json_objects_empty_text()
         test_robust_first_json_object_without_object()
         test_robust_json_parse_empty_text()
-        test_robust_json_parse_without_json5(mp)
         test_robust_json_parse_uses_json5_when_available()
         test_extract_response_text_object_with_content_string()
         test_top_level_scan_skips_broken_prefix()
@@ -343,6 +342,23 @@ if __name__ == "__main__":
         test_truncation_detected_before_result_keys()
         test_balanced_explanation_after_result_is_not_truncation()
         test_prefer_strong_keys_helper()
+    finally:
+        mp.undo()
+    # json5 相关用例单独用各自的补丁实例：without_json5 会把
+    # sys.modules["json5"] 置 None，共享作用域会让后续 importorskip
+    # 抛 Skipped（BaseException）中断整份直跑清单
+    mp = pytest.MonkeyPatch()
+    try:
+        test_robust_json_parse_without_json5(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_robust_json_parse_uses_json5_when_available()
+    except pytest.skip.Exception as exc:
+        # 本机未安装可选依赖 json5：与 pytest 的 importorskip 同语义，
+        # 按跳过处理而不是以 traceback 退出
+        print(f"直跑跳过 json5 分支用例（{exc}）")
     finally:
         mp.undo()
     # caplog 用例用共享替身真实执行：跳过会让日志形态断言在直跑清单上

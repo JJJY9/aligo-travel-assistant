@@ -679,19 +679,67 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_main_returns_1_when_agent_not_initialized(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_main_returns_1_when_add_documents_fails(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_main_succeeds_without_chat_model(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_empty_documents_fail_before_agent(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_load_failure_aborts_before_agent(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_self_check_failure_returns_1(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_dimension_mismatch_rebuilds(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_preserved_semantics_by_source(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_export_failure_aborts_before_drop(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_preserved_backup_helpers_roundtrip(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_preserved_backup_survives_failed_restore(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_discard_created_library_retries_locked_files(
             _mp, Path(tempfile.mkdtemp())
         )
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
         test_discard_created_library_handles_directory_db(
             Path(tempfile.mkdtemp())
         )
@@ -699,7 +747,11 @@ if __name__ == "__main__":
         _mp.undo()
     test_multi_chunk_documents_carry_group_metadata()
     test_batch_by_group_keeps_groups_together()
-    test_add_in_batches_retries_and_reports(pytest.MonkeyPatch())
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_add_in_batches_retries_and_reports(_mp)
+    finally:
+        _mp.undo()
     _mp = pytest.MonkeyPatch()
     try:
         test_collect_preserved_drops_huge_parts_declaration(_mp)

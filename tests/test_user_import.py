@@ -3201,25 +3201,24 @@ def test_merged_preview_includes_global_knowledge(monkeypatch):
         {"content": "旧知识", "metadata": {}}
     ]
 
-    # 现有库读失败：不阻断用户数据恢复（知识轴跳过、不抛错）
+    # 现有库读失败：按可重试的持久化失败上报（不能按空库核对体积）
     from utils.errors import MemoryPersistenceError as _MPE
 
     def boom(*args, **kwargs):
         raise _MPE("kb busy")
 
     monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
-    assert (
+    with pytest.raises(_MPE, match="不可读"):
         module.merged_backup_limit_problem(
             _Store(), {"knowledge": [{"content": "新"}]}
         )
-        is None
-    )
-    print("✓ 合并预检知识段与导入规划同源（含恒计入/读失败降级）")
+    print("✓ 合并预检知识段与导入规划同源（读失败按可重试失败上报）")
 
 
 def test_merged_knowledge_unverify_reports_reason(monkeypatch):
-    """知识轴不可核对（现有库读不到 / 规划失败）必须经 knowledge_unverified
-    上报：此前跳过知识轴后真实导入仍会无上限写入全局知识库。"""
+    """知识轴不可核对时 fail-closed：规划失败经 knowledge_unverified 上报
+    （本次跳过知识写入）；现有库整体不可读按可重试持久化失败上报——
+    都不能按空库放行（with_knowledge 导出包含既有库的体积）。"""
     import utils.knowledge_admin as kb
     from utils import user_import as module
     from utils.errors import MemoryPersistenceError as _MPE
@@ -3239,27 +3238,19 @@ def test_merged_knowledge_unverify_reports_reason(monkeypatch):
                 "statistics": {},
             }
 
-    # 读取现有知识库失败
+    # 读取现有知识库失败：按可重试失败上报（有无知识段都要拦）
     def boom(*args, **kwargs):
         raise _MPE("kb busy")
 
     monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
-    unverified: dict[str, str] = {}
-    assert (
+    with pytest.raises(_MPE, match="不可读"):
         module.merged_backup_limit_problem(
             _Store(),
             {"knowledge": [{"content": "新"}]},
-            knowledge_unverified=unverified,
+            knowledge_unverified={},
         )
-        is None
-    )
-    assert "不可读" in unverified.get("reason", ""), unverified
-    # 备份不带知识段：没有知识写入，无需上报
-    empty: dict[str, str] = {}
-    module.merged_backup_limit_problem(
-        _Store(), {}, knowledge_unverified=empty
-    )
-    assert empty == {}, empty
+    with pytest.raises(_MPE, match="不可读"):
+        module.merged_backup_limit_problem(_Store(), {})
 
     # 规划失败同样不可核对
     monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
