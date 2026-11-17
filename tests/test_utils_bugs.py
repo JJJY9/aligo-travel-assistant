@@ -466,8 +466,7 @@ def test_robust_first_json_object_repairs_small_faults():
     print("✓ 首个 JSON 对象修复解析（尾逗号）")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_extract_first_json_object_escape_state_machine": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -505,4 +504,5 @@ if __name__ == "__main__":
     test_increment_query_count_fresh_data()
     test_increment_query_count_legacy_data()
     test_delete_all_does_not_resurrect_data()
+    test_extract_first_json_object_escape_state_machine()
     print("\n全部通过")

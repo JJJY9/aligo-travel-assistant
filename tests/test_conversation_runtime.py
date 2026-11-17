@@ -1478,14 +1478,8 @@ def test_deferred_commit_checks_tombstone_before_commit():
     print("✓ 延迟记忆提交前复查墓碑")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_cancel_before_persist_settles_usage": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_cancel_during_stage_thread_rolls_back_after_visible": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_cancelled_persist_failure_settles_usage": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_deferred_memory_commits_after_cancel_during_persist": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_redis_backfill_skipped_while_degraded": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_runtime_uses_default_data_root_for_long_term": "需要 tmp_path 夹具",
-    "test_runtime_wires_epoch_guard_into_persist": "暂未纳入直跑清单（pytest 覆盖）",
 }
 
 if __name__ == "__main__":
@@ -1539,4 +1533,16 @@ if __name__ == "__main__":
     test_summary_window_refills_when_future_messages_mixed()
     test_summary_trip_window_uses_newest_with_normalized_dates()
     test_deferred_commit_checks_tombstone_before_commit()
+    test_cancel_before_persist_settles_usage()
+    test_cancel_during_stage_thread_rolls_back_after_visible()
+    test_cancelled_persist_failure_settles_usage()
+    test_deferred_memory_commits_after_cancel_during_persist()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_redis_backfill_skipped_while_degraded(_mp)
+    finally:
+        _mp.undo()
+    test_runtime_wires_epoch_guard_into_persist()
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

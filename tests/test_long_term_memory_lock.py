@@ -389,7 +389,7 @@ def test_case_collision_user_id_is_refused(tmp_path):
     assert again.get_preference()["home_location"] == "北京"
     print("✓ 用户 ID 大小写冲突拒绝访问同一记忆文件")
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_case_collision_user_id_is_refused": "需要 tmp_path 夹具",
     "test_corrupt_file_backed_up_before_overwrite": "需要 tmp_path 夹具",
     "test_corrupt_file_write_refused_when_backup_fails": "需要 tmp_path 夹具",
@@ -412,3 +412,5 @@ if __name__ == "__main__":
     _tmp_registry.install()
     test_cross_process_increments_are_not_lost()
     print("\n全部通过（monkeypatch 用例需 pytest）")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

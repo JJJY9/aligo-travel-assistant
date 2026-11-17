@@ -209,8 +209,9 @@ def test_webapp_uses_redis_rate_limit_across_instances(monkeypatch):
             Path(f"{memory_file}.lock").unlink(missing_ok=True)
 
 
-_DIRECT_RUN_SKIP = {
-    "test_webapp_uses_redis_rate_limit_across_instances": "暂未纳入直跑清单（pytest 覆盖）",
+
+_DIRECT_RUN_SKIP: dict[str, str] = {
+    "test_webapp_uses_redis_rate_limit_across_instances": "需要真实 Redis（TEST_REDIS_URL）",
 }
 
 if __name__ == "__main__":
@@ -224,3 +225,5 @@ if __name__ == "__main__":
     test_peek_does_not_record_and_window_expires()
     test_bucket_names_isolated_and_reset()
     print("\n全部通过（Web 集成用例需 pytest 的 monkeypatch，未在 __main__ 中运行）")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

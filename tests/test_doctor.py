@@ -949,7 +949,7 @@ def test_skills_check_warns_on_broken_skill_md(monkeypatch):
     print("✓ 技能 SKILL.md 校验（缺失 / 空 / 非法 frontmatter）")
 
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_version_check_skips_without_pyproject": "需要 tmp_path 夹具",
     "test_version_check_wheel_mode_checks_static": "需要 tmp_path 夹具",
     "test_version_check_handles_non_utf8_files": "需要 tmp_path 夹具",
@@ -1027,3 +1027,5 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     print("\n全部通过")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

@@ -1158,21 +1158,8 @@ def test_interactive_memory_follows_data_root(monkeypatch, tmp_path):
     assert captured["storage_path"] == str(default_data_root() / "memory")
     print("✓ 交互式 CLI 长期记忆跟随 default_data_root")
 
-_DIRECT_RUN_SKIP = {
-    "test_cli_module_imports_without_runtime_deps": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_console_falls_back_on_invalid_columns": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_history_table_strips_terminal_controls": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_interactive_memory_follows_data_root": "需要 tmp_path 夹具",
-    "test_main_keyboard_interrupt_exits_130": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_nontty_single_line_query_is_not_swallowed": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_pending_cancel_cleared_when_loop_ends_by_eof": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_process_query_counts_generic_orchestration_failure": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_process_query_filters_malformed_recent_context": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_process_query_open_breaker_returns_quickly": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_process_query_unparsable_intention_returns": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_prompt_oserror_exits_instead_of_hot_loop": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_repl_error_markup_is_escaped": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_sanitized_console_strips_controls_from_print": "暂未纳入直跑清单（pytest 覆盖）",
 }
 
 if __name__ == "__main__":
@@ -1223,4 +1210,39 @@ if __name__ == "__main__":
         test_closed_stdout_pipe_does_not_traceback()
     finally:
         _mp.undo()
+    test_cli_module_imports_without_runtime_deps()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_console_falls_back_on_invalid_columns(_mp)
+    finally:
+        _mp.undo()
+    test_history_table_strips_terminal_controls()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_main_keyboard_interrupt_exits_130(_mp)
+    finally:
+        _mp.undo()
+    test_nontty_single_line_query_is_not_swallowed()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_pending_cancel_cleared_when_loop_ends_by_eof(_mp)
+    finally:
+        _mp.undo()
+    test_process_query_counts_generic_orchestration_failure()
+    test_process_query_filters_malformed_recent_context()
+    test_process_query_open_breaker_returns_quickly()
+    test_process_query_unparsable_intention_returns()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_prompt_oserror_exits_instead_of_hot_loop(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_repl_error_markup_is_escaped(_mp)
+    finally:
+        _mp.undo()
+    test_sanitized_console_strips_controls_from_print()
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

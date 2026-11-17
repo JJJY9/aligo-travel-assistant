@@ -713,9 +713,7 @@ def test_health_check_redacts_api_key_in_error(monkeypatch):
     print("✓ 健康检查错误文本遮蔽裸 API Key")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_json_formatter_includes_exc_info": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_json_formatter_sanitizes_any_message": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -752,4 +750,6 @@ if __name__ == "__main__":
         test_health_check_redacts_api_key_in_error(_mp)
     finally:
         _mp.undo()
+    test_json_formatter_includes_exc_info()
+    test_json_formatter_sanitizes_any_message()
     print("\n全部通过")

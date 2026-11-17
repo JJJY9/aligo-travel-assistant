@@ -117,24 +117,28 @@ def _find_main_block(tree: ast.Module):
 
 def _module_literal_dict(tree: ast.Module, name: str) -> dict[str, str]:
     for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not (isinstance(target, ast.Name) and target.id == name):
-            continue
-        if not isinstance(node.value, ast.Dict):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.AnnAssign):
+            # 带类型注解的声明（``_DIRECT_RUN_SKIP: dict[str, str] = {…}``）
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        if not (
+            isinstance(target, ast.Name)
+            and target.id == name
+            and isinstance(value, ast.Dict)
+        ):
             continue
         out: dict[str, str] = {}
-        for key, value in zip(node.value.keys, node.value.values):
+        for key, item in zip(value.keys, value.values):
             if (
                 isinstance(key, ast.Constant)
                 and isinstance(key.value, str)
-                and isinstance(value, ast.Constant)
-                and isinstance(value.value, str)
+                and isinstance(item, ast.Constant)
+                and isinstance(item.value, str)
             ):
-                out[key.value] = value.value
+                out[key.value] = item.value
         return out
     return {}
 
@@ -142,7 +146,7 @@ def _module_literal_dict(tree: ast.Module, name: str) -> dict[str, str]:
 def test_manual_lists_cover_all_tests():
     """手写 `for case in (…, …)` 清单必须覆盖文件里所有 test_* 函数：
     漏登记会让直接运行打印「全部通过」却从不执行这些用例。确需专用
-    夹具的用例在模块级 `_DIRECT_RUN_SKIP = {名称: 原因}` 中显式声明。"""
+    夹具的用例在模块级 `_DIRECT_RUN_SKIP: dict[str, str] = {名称: 原因}` 中显式声明。"""
     problems: list[str] = []
     for path in sorted(TESTS_DIR.glob("test_*.py")):
         try:
@@ -190,6 +194,25 @@ def test_manual_lists_cover_all_tests():
         ]
         if missing:
             problems.append(f"{path.name}: {', '.join(missing)}")
+        # 跳过原因必须具体：零参数 / 仅 monkeypatch 的用例可以直接登记，
+        # 通用「暂未纳入」会让清单静默降覆盖
+        funcs = {
+            node.name: [a.arg for a in node.args.posonlyargs + node.args.args]
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        }
+        for name, reason in skip.items():
+            params = funcs.get(name, [])
+            fixture_justified = any(
+                fixture in params
+                for fixture in ("tmp_path", "capsys", "caplog", "request")
+            )
+            if fixture_justified or "真实" in reason:
+                continue
+            problems.append(
+                f"{path.name}: {name} 的跳过原因不可接受（{reason}）"
+            )
     assert not problems, chr(10).join(problems)
     print("✓ 手写直跑清单覆盖全部用例（或显式跳过）")
 

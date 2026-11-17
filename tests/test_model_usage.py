@@ -136,8 +136,7 @@ def test_add_usage_merges_numeric_fields():
     print("✓ add_usage 合并未结算用量")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_failed_attempts_count_as_calls": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -153,4 +152,5 @@ if __name__ == "__main__":
     test_snapshot_delta()
     test_per_session_tracking_is_independent()
     test_add_usage_merges_numeric_fields()
+    test_failed_attempts_count_as_calls()
     print("\n全部通过")

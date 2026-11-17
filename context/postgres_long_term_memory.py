@@ -749,6 +749,10 @@ class PostgresLongTermMemory:
 
         def run() -> bool:
             with self._conn.transaction(), self._conn.cursor() as cursor:
+                # 等锁预算必须先于第一把锁放宽：会话元数据锁的持有者
+                # 可能是长删除事务（单会话 20 万条），默认连接级 3s
+                # 会让「回答已生成」的一轮在落库处整轮失败
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
                 # 与 delete_chat_session / delete_last_turn 的会话元数据锁同一个
                 # 键：「墓碑判定 + 插入」与并发删除串行化，避免守卫通过后删除
                 # 先提交、写入再把已删除会话的两条消息写回
@@ -764,10 +768,9 @@ class PostgresLongTermMemory:
                 # 对方未提交行、各自通过上限检查后合计越限。固定锁序
                 # session_meta → chat_messages：导入只取后者、删除 / 会话
                 # 元数据只取前者，无反向获取，不会死锁。
-                # 这把锁的持有者可能是整个导入事务：本事务内把等待预算
-                # 放宽到 30s（SET LOCAL 只影响当前事务），避免长导入期间
-                # 已生成的回答因默认 3s lock_timeout 被整轮丢弃
-                cursor.execute("SET LOCAL lock_timeout = '30s'")
+                # 这把锁的持有者可能是整个导入事务：本事务的等待预算
+                # 已在事务开头放宽到 30s，覆盖 session_meta 与
+                # chat_messages 两把锁
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:chat_messages:{self.user_id}",),
@@ -841,6 +844,9 @@ class PostgresLongTermMemory:
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
                 kept: list[dict[str, Any]] = incoming
+                # 与单条 / 单轮写入同一等锁预算：长导入互相排队时不能
+                # 在默认 3s 处失败
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
                 # READ COMMITTED 下两个并发导入都能在 SELECT 里看不到对方
                 # 尚未提交的行：先拿用户级事务锁串行化「查重 + 计数 + 插入」，
                 # 否则并发恢复同一备份会把消息插成两倍、也绕开总量上限

@@ -59,7 +59,7 @@ def test_public_bind_warns(monkeypatch, caplog):
     print("✓ 非环回监听地址给出安全警告")
 
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_public_bind_warns": "需要 caplog 夹具",
     "test_version_flag": "需要 capsys 夹具",
 }
@@ -72,3 +72,5 @@ if __name__ == "__main__":
     _tmp_registry.install()
     test_loopback_host_detection()
     print("\n全部通过（--version / 监听警告用例需 pytest 的 capsys / caplog）")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

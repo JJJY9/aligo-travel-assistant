@@ -408,8 +408,7 @@ def test_table_row_escapes_html_without_cross_cell_code_span():
     assert "&lt;img" in text, text
     print("✓ 表格行不跨单元格配对反引号")
 
-_DIRECT_RUN_SKIP = {
-    "test_message_body_escaped_in_export": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -439,4 +438,5 @@ if __name__ == "__main__":
     test_list_scoped_fence_restores_escaping_after_container()
     test_table_row_escapes_html_without_cross_cell_code_span()
     test_title_strips_terminal_controls()
+    test_message_body_escaped_in_export()
     print("\n全部通过")

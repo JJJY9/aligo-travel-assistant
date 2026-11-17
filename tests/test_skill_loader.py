@@ -209,8 +209,7 @@ def test_read_errors_return_none(monkeypatch):
     print("✓ SKILL.md / 正文读取失败返回 None")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_dispatchable_only_excludes_doc_only_skills": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -239,4 +238,5 @@ if __name__ == "__main__":
         test_read_errors_return_none(_mp)
     finally:
         _mp.undo()
+    test_dispatchable_only_excludes_doc_only_skills()
     print("\n全部通过")

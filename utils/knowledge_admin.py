@@ -256,6 +256,14 @@ def _client() -> Any:
     return get_milvus_client(str(db))
 
 
+def _collection_exists() -> bool:
+    """集合是否已建立；探测失败按「存在」处理（沿用原错误路径）。"""
+    try:
+        return bool(_client().has_collection(COLLECTION_NAME))
+    except Exception:  # noqa: BLE001 - 探测失败不改变原有错误口径
+        return True
+
+
 def _client_for(directory: str | Path) -> Any:
     """按显式目录取 Milvus 客户端（初始化脚本读取旧部署的来源库）。"""
     db = knowledge_db_path(directory)
@@ -1638,7 +1646,17 @@ def import_documents(
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
         # 插入同一批内容；快照走全量扫描（多重集），超过单页规模或同文
         # 重复分片时判重都不会失真
-        existing = _existing_contents()
+        if dry_run:
+            try:
+                existing = _existing_contents()
+            except Exception:
+                # 库文件存在但集合缺失：写路径经 create_if_missing 自动
+                # 建集合后成功；dry-run 不建集合，按空快照规划同口径
+                if _collection_exists():
+                    raise
+                existing = []
+        else:
+            existing = _existing_contents()
         # 内容可能在同一 group 内重复（两段完全相同的正文各占一个 part）：
         # 用多重集而不是集合计数，一份已存在只能抵消一个分片
         existing_counts: Counter[str] = Counter(existing)
@@ -1691,6 +1709,23 @@ def import_documents(
                     layout_cache["part_contents"] = by_group
             return layout_cache["part_contents"]
 
+        # 预览模型的可用性判定：写层只有「内容齐全且分片顺序一致」的
+        # 快速判重会跳过 _get_agent()，其它路径（含顺序重排、集合缺失）
+        # 都会加载嵌入模型。dry-run 用同一谓词告诉调用方是否需要探测
+        model_needed = True
+        if dry_run:
+            try:
+                fully_existing = _backup_fully_existing(pre_merged, existing)
+            except Exception:  # noqa: BLE001 - 判重失败按需要模型处理
+                fully_existing = False
+            order_ok = True
+            if fully_existing:
+                restored_texts = _restored_group_texts(pre_merged)
+                if restored_texts:
+                    existing_texts = _existing_group_texts()
+                    # 布局扫描失败时写层按「已存在」快捷返回（同口径）
+                    order_ok = existing_texts is None or restored_texts <= existing_texts
+            model_needed = not (fully_existing and order_ok)
         merged_items, group_skipped = _regroup_exported_documents(
             valid,
             existing,
@@ -2053,6 +2088,7 @@ def import_documents(
             if dry_run:
                 # 预览的返回结构保持稳定：没有可导入项时 would_import 为 0
                 result["would_import"] = 0
+                result["needs_model"] = model_needed
                 if return_pieces:
                     result["pieces"] = []
             return result
@@ -2065,6 +2101,7 @@ def import_documents(
                 "skipped_duplicate": duplicate,
                 "skipped_conflict": conflict,
                 "would_import": len(unique),
+                "needs_model": model_needed,
             }
             if return_pieces:
                 # 真实写入的分片行（含分组派生元数据），预演据此计体积

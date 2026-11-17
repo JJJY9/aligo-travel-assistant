@@ -390,8 +390,9 @@ def test_transient_renew_failure_keeps_lock():
     print("✓ 瞬时续期抖动不标记丢失")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_cross_instance_lock": "暂未纳入直跑清单（pytest 覆盖）",
+
+_DIRECT_RUN_SKIP: dict[str, str] = {
+    "test_cross_instance_lock": "需要真实 Redis（TEST_REDIS_URL）",
 }
 
 if __name__ == "__main__":
@@ -413,3 +414,5 @@ if __name__ == "__main__":
     test_transient_renew_failure_keeps_lock()
     test_stale_renewal_does_not_mark_new_hold_lost()
     print("\n全部通过（Redis 集成用例需 TEST_REDIS_URL）")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

@@ -3964,6 +3964,92 @@ def test_preview_skips_probe_when_knowledge_all_exists(monkeypatch):
     print("✓ 全部已存在时预览不加载模型")
 
 
+def test_preview_honors_planner_needs_model(monkeypatch):
+    """预览按规划器的 needs_model 决定是否探测（与写层快速判重同一
+    谓词）：快速判重路径不探测，重排组等会加载模型的路径必须探测；
+    探测失败时不给乐观的新增计数。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    probes = []
+
+    def slow_plan(documents, dry_run=False, *, return_pieces=False):
+        return {"would_import": 0, "skipped": 2, "needs_model": True}
+
+    def boom():
+        probes.append(True)
+        raise RuntimeError("model files missing")
+
+    monkeypatch.setattr(kb, "import_documents", slow_plan)
+    monkeypatch.setattr(module, "_knowledge_ready_probe", boom)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_needs_")
+    store = LongTermMemory("u-needs", storage_dir)
+    preview = module.preview_user_import(
+        store, {"knowledge": [{"content": "k1"}, {"content": "k2"}]}
+    )
+    assert probes, "needs_model=True 时必须探测"
+    assert "knowledge_error" in preview, preview
+    assert "knowledge_imported" not in preview, preview
+
+    def fast_plan(documents, dry_run=False, *, return_pieces=False):
+        return {"would_import": 2, "skipped": 0, "needs_model": False}
+
+    monkeypatch.setattr(kb, "import_documents", fast_plan)
+    preview = module.preview_user_import(
+        store, {"knowledge": [{"content": "k1"}, {"content": "k2"}]}
+    )
+    assert "knowledge_error" not in preview, preview
+    assert preview["knowledge_imported"] == 2, preview
+    print("✓ 预览按 needs_model 探测模型")
+
+
+def test_merged_default_export_axis_not_exempted_by_kb(monkeypatch):
+    """知识库只进 with_knowledge 全量导出，不能抬高默认导出的体积基线：
+    用户数据单独被恢复推过 50 MB 时必须拒绝（即使含知识库的合计基线
+    早已超限）。"""
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 3000)
+    existing_messages = [
+        {"role": "user", "content": "m" * 400, "session_id": f"s{i}"}
+        for i in range(5)
+    ]
+    incoming_messages = [
+        {"role": "user", "content": "n" * 400, "session_id": f"t{i}"}
+        for i in range(10)
+    ]
+    existing_kb = [{"content": "k" * 900, "metadata": {}}]
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [dict(item) for item in existing_messages],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: list(existing_kb))
+    # 用户数据自身合规，但与现有知识库合计已超体积上限
+    assert module.backup_limit_problem({"chat_history": existing_messages}) is None
+    assert (
+        module.backup_limit_problem(
+            module._export_shape_baseline(_Store().export_snapshot(), existing_kb)
+        )
+        is not None
+    )
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"messages": [dict(item) for item in incoming_messages]}
+    )
+    assert problem and "MB" in problem, problem
+    print("✓ 默认导出体积轴不被知识库基线连带豁免")
+
+
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
     """知识片段恢复失败不能吞掉「用户数据未恢复」：隔离账号 + 备份只有
     保留字会话消息 + 一条知识片段，导入结果同时带 knowledge_error 与

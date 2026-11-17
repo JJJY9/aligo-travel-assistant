@@ -410,8 +410,7 @@ def test_local_timestamp_text_tolerates_extreme_years():
     print("✓ 展示时间容忍极端年份")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_agent_error_uses_aggregated_message": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_skill_loader_warns_missing_manifest": "需要 capsys 夹具",
 }
 
@@ -440,3 +439,6 @@ if __name__ == "__main__":
     test_preferences_table_keeps_zero_and_lists()
     test_result_formatter_generic_output_field()
     print("全部通过（capsys 相关用例请用 pytest 运行）")
+    test_agent_error_uses_aggregated_message()
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

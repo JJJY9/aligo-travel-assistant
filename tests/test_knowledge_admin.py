@@ -2056,6 +2056,7 @@ def test_import_dry_run_skips_writes(monkeypatch):
         "skipped_duplicate": 0,
         "skipped_conflict": 0,
         "would_import": 1,
+        "needs_model": True,
     }
 
     # 已有内容仍计入跳过
@@ -2072,9 +2073,10 @@ def test_import_dry_run_skips_writes(monkeypatch):
         "skipped_duplicate": 1,
         "skipped_conflict": 0,
         "would_import": 1,
+        "needs_model": True,
     }
 
-    # 全部已存在：预览返回稳定结构（would_import = 0）
+    # 全部已存在：预览返回稳定结构（would_import = 0，快速判重不加载模型）
     result3 = knowledge_admin.import_documents(
         [{"content": "已有内容"}], dry_run=True
     )
@@ -2085,8 +2087,33 @@ def test_import_dry_run_skips_writes(monkeypatch):
         "skipped_duplicate": 1,
         "skipped_conflict": 0,
         "would_import": 0,
+        "needs_model": False,
     }
     print("✓ 导入 dry-run 只统计不写入")
+
+
+def test_import_dry_run_tolerates_missing_collection(monkeypatch):
+    """库文件存在但集合缺失：写路径经 create_if_missing 自动建集合后
+    成功；dry-run 不建集合，按空快照规划（不因扫描失败报错）。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    def boom():
+        raise RuntimeError("collection not found")
+
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", boom)
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: False)
+    result = knowledge_admin.import_documents(
+        [{"content": "新内容"}], dry_run=True
+    )
+    assert result["would_import"] == 1, result
+    assert result["needs_model"] is True, result
+    # 集合存在但扫描失败：保持原错误路径（由调用方上报 knowledge_error）
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: True)
+    with pytest.raises(RuntimeError):
+        knowledge_admin.import_documents([{"content": "新内容"}], dry_run=True)
+    print("✓ 集合缺失时 dry-run 按空快照规划")
 
 
 def test_import_dry_run_reports_skip_reasons(monkeypatch):
@@ -3374,6 +3401,7 @@ if __name__ == "__main__":
         test_agent_lock_wait_is_bounded,
         test_skill_search_participates_in_write_lock,
         test_import_rejects_oversized_single_content,
+        test_import_dry_run_tolerates_missing_collection,
     ):
         mp = pytest.MonkeyPatch()
         try:
