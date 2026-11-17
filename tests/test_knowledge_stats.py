@@ -240,6 +240,10 @@ def test_status_reports_unavailable_when_collection_cannot_load(tmp_path):
     assert "无法加载" in status["reason"], status
 
 
+_DIRECT_RUN_SKIP = {
+    "test_status_reports_unavailable_when_collection_cannot_load": "需要 tmp_path 夹具",
+}
+
 if __name__ == "__main__":
     import _stdio
 
@@ -250,12 +254,15 @@ if __name__ == "__main__":
         test_dimension_probe_and_collection_errors,
         test_write_lock_import_failure_falls_back,
         test_loaded_dimension_probe_failure,
+        test_status_options_mask_path_and_details,
+        test_status_lock_timeout_reports_busy,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
+    test_default_knowledge_base_if_present()
     status = knowledge_status()
     if status["available"]:
         print(f"✓ 本地知识库：{status['documents']} 片段")

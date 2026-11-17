@@ -1174,12 +1174,13 @@ if __name__ == "__main__":
         test_update_passes_legacy_long_metadata_untruncated,
         test_update_reports_leftover_parts,
         test_kb_write_args_and_dispatch,
+        test_update_missing_or_unreadable_document,
+        test_kb_add_gbk_file_friendly_error,
+        test_kb_show_json_missing_document,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
-        test_kb_add_gbk_file_friendly_error(mp)
-        test_kb_show_json_missing_document(mp)
     print("\n全部通过")

@@ -594,6 +594,7 @@ if __name__ == "__main__":
         test_import_json_errors,
         test_kb_import_dispatch_flags,
         test_export_failure_preserves_existing_file,
+        test_export_write_failure_reports,
     ):
         mp = pytest.MonkeyPatch()
         try:

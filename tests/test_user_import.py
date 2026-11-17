@@ -3788,7 +3788,7 @@ def test_merged_payload_empty_trips_keeps_last_trip_number(monkeypatch):
     module.merged_backup_limit_problem(_Store(), {})
     payload = captured["payload"]
     assert payload["statistics"].get("last_trip_number") == 0, payload
-    assert len(payload["user_id"].encode("utf-8")) == 192, payload["user_id"]
+    assert len(payload["user_id"].encode("utf-8")) == 256, payload["user_id"]
     print("✓ 空行程预演保留 last_trip_number 与最坏 user_id 占位")
 
 
@@ -3817,6 +3817,103 @@ def test_preview_reports_knowledge_unavailable(monkeypatch):
     assert payload["ok"] is False, payload
     assert "知识库未初始化" in payload.get("knowledge_error", ""), payload
     print("✓ 预览与真实执行同报知识库不可用")
+
+
+def test_preview_reports_knowledge_plan_counts(monkeypatch):
+    """dry-run 的知识计数来自规划结果（将新增 / 跳过），而不是备份
+    输入条数：幂等重导全部命中时预览同样显示 0 新增。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
+        assert dry_run
+        return {"would_import": 0, "skipped": 2, "skipped_duplicate": 2}
+
+    monkeypatch.setattr(kb, "import_documents", fake_import)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_plan_")
+    store = LongTermMemory("u-plan", storage_dir)
+    sections = {"knowledge": [{"content": "k1"}, {"content": "k2"}]}
+    preview = module.preview_user_import(store, sections)
+    assert preview["knowledge"] == 2, preview  # 输入条数保留
+    assert preview["knowledge_imported"] == 0, preview
+    assert preview["knowledge_skipped"] == 2, preview
+    print("✓ 预览知识计数按规划结果")
+
+
+def test_preview_reports_model_unavailable(monkeypatch):
+    """嵌入模型不可用：dry-run 规划可通过、真实导入才失败——预览必须
+    同样报 knowledge_error（与真实执行同结论）。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
+        return {"would_import": 1, "skipped": 0, "pieces": []}
+
+    def boom():
+        raise RuntimeError("model files missing")
+
+    monkeypatch.setattr(kb, "import_documents", fake_import)
+    monkeypatch.setattr(module, "_knowledge_ready_probe", boom)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_model_")
+    store = LongTermMemory("u-model", storage_dir)
+    path = _write_json(
+        {
+            "preferences": {"home_location": "北京"},
+            "knowledge": [{"content": "知识片段"}],
+        }
+    )
+    code, out = _run_import(
+        monkeypatch, "u-model", path, store, as_json=True, dry_run=True
+    )
+    payload = json.loads(out)
+    assert code == 1, (code, out)
+    assert payload["ok"] is False, payload
+    assert "知识片段恢复失败" in payload.get("knowledge_error", ""), payload
+    print("✓ 预览同样报告嵌入模型不可用")
+
+
+def test_merged_knowledge_size_increment_guarded_when_account_over_size(
+    monkeypatch,
+):
+    """账号自身在 size 轴已超限（按轴豁免）时，知识增量仍按「全局库
+    单独导出」复核：把知识库推过体积上限的恢复必须拒绝（size 轴与
+    用户数据共享，不能把知识库的越限连带豁免）。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 3000)
+    existing_kb = [{"content": "k" * 1000, "metadata": {}}]
+    planned = [{"content": "k" * 1000, "metadata": {}} for _ in range(2)]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(existing_kb)
+    )
+    monkeypatch.setattr(kb, "import_documents", _fake_knowledge_planner(planned))
+    messages = [
+        {"role": "user", "content": "m" * 400, "session_id": "s1"}
+        for _ in range(8)
+    ]
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [dict(item) for item in messages],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    # 账号用户数据自身已超 size 轴（会被按轴豁免）
+    assert module.backup_limit_problem({"chat_history": messages}) is not None
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"knowledge": [{"content": "原始长文"}]}
+    )
+    assert problem and "MB" in problem, problem
+    print("✓ 知识库体积增量不受其它轴连带豁免")
 
 
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
@@ -4236,6 +4333,10 @@ if __name__ == "__main__":
             kb_fixture = pytest.MonkeyPatch()
             kb_fixture.setattr(
                 _ui_for_kb, "_existing_knowledge_rows", lambda: []
+            )
+            # 预览的知识可用性探针会加载真实嵌入模型：直跑默认 no-op
+            kb_fixture.setattr(
+                _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:

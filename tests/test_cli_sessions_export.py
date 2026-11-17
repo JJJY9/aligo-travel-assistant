@@ -236,6 +236,7 @@ if __name__ == "__main__":
         test_export_failures,
         test_export_rejects_bad_user_id,
         test_dispatch_strict,
+        test_export_write_failure_reports,
     ):
         mp = pytest.MonkeyPatch()
         try:

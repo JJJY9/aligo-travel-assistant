@@ -1398,6 +1398,10 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_existing_knowledge_rows", lambda: []
             )
+            # 预览的知识可用性探针会加载真实嵌入模型：直跑默认 no-op
+            kb_fixture.setattr(
+                _ui_for_kb, "_knowledge_ready_probe", lambda: None
+            )
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()

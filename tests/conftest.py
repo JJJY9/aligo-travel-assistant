@@ -16,6 +16,11 @@ def _hermetic_knowledge_library(monkeypatch):
     monkeypatch.setattr(
         user_import, "_existing_knowledge_rows", lambda: []
     )
+    # 预览的知识可用性探针会加载真实嵌入模型：单测默认替换为 no-op，
+    # 需要验证模型不可用的用例自行覆盖该探针
+    monkeypatch.setattr(
+        user_import, "_knowledge_ready_probe", lambda: None
+    )
 
 
 @pytest.fixture(autouse=True)
