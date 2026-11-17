@@ -3104,10 +3104,12 @@ def run_user_import_standalone(
             # （32 字符）会把实际可恢复的备份每行多算 6 字节而误拒。
             # 预检放在打开 store 之后：存量已超限的账号恢复自身体积超限
             # 的备份需要基线豁免（否则预检 413 先于合并复核的放行执行）
+            # 快照只全量读取一次：预检与合并复核共用
+            snapshot = _store_export_snapshot(store)
             limit_problem = sections_limit_problem(
                 sections,
                 pg_shape=bool(STORAGE_CONFIG.get("postgres_dsn")),
-                existing=_store_export_snapshot(store),
+                existing=snapshot,
             )
             if limit_problem:
                 return _fail(
@@ -3115,8 +3117,10 @@ def run_user_import_standalone(
                     "（恢复后将无法再导出备份，请先清理或拆分备份文件）"
                 )
             # 备份自身不超限不代表恢复后仍可导出：与账号既有数据合并后按
-            # 导出格式复核体积（与 Web /api/import 同口径）
-            merged_problem = merged_backup_limit_problem(store, sections)
+            # 导出格式复核体积（与 Web /api/import 同口径；复用同一快照）
+            merged_problem = merged_backup_limit_problem(
+                store, sections, existing=snapshot
+            )
             if merged_problem:
                 return _fail(
                     f"恢复中止：{merged_problem}"
@@ -5345,15 +5349,9 @@ def run_trip_add_standalone(
             before = len(store.get_trip_history(limit=None))
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
-        # 只拦「恰好在上限」的新增：存储写锁内同样只拦跨越上限的写入
-        # （同身份重复按更新放行、已越限的历史账号继续可用），入口预检
-        # 与写层口径一致
-        from utils.trip_import import MAX_TOTAL_TRIPS
-
-        if before == MAX_TOTAL_TRIPS:
-            return _fail(
-                f"行程数量已达上限（{MAX_TOTAL_TRIPS}），请先删除旧行程"
-            )
+        # 上限交给存储写锁内判定：只拦「恰好在上限、本次确属新增」的
+        # 写入（同身份重复按更新放行、已越限的历史账号继续可用）——
+        # 锁外按存量 == 上限预检会把可去重更新误拒，且与写层口径分叉
         record = {
             "origin": origin,
             "destination": destination,
@@ -5364,6 +5362,9 @@ def run_trip_add_standalone(
             record["purpose"] = purpose
         try:
             trip_id = store.save_trip_history(record)
+        except ValueError as exc:
+            # 上限等用户可修正问题：原样给出可执行提示（不加通用前缀）
+            return _fail(str(exc))
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"保存行程失败：{exc}")
         try:

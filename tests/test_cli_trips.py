@@ -1298,18 +1298,54 @@ def test_trip_add_rejects_non_padded_date(monkeypatch):
     print("✓ trip-add 拒绝非补零日期")
 
 def test_trip_add_rejects_when_total_limit_reached(monkeypatch):
-    """行程总数达到上限后不再写入：否则 user-export 将永久无法导出。"""
+    """行程总数达到上限后新增被拒绝（上限由存储写锁内判定：锁外预检
+    会把恰好在上限时的同身份更新误拒）。"""
+    import shutil
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
     from utils import trip_import as trip_import_module
 
-    store = _AddStore([_trip("上海", "2026-12-01", trip_id="trip_1")])
+    storage_dir = tempfile.mkdtemp()
+    store = LongTermMemory("u1", storage_dir)
+    store.save_trip_history(
+        {"origin": "北京", "destination": "上海", "start_date": "2026-12-01"}
+    )
     monkeypatch.setattr(
         storage, "create_long_term_memory", lambda *args, **kwargs: store
     )
     monkeypatch.setattr(trip_import_module, "MAX_TOTAL_TRIPS", 1)
     code, out = _run_trip_add("u1", "北京", "杭州", "2026-12-02", None)
     assert code == 1 and "上限" in out, out
-    assert store.saved == [], "达到上限时不能写入"
+    assert len(store.get_trip_history(limit=None)) == 1, "达到上限时不能写入"
+    shutil.rmtree(storage_dir, ignore_errors=True)
     print("✓ trip-add 行程总量超限时拒绝写入")
+
+
+def test_trip_add_updates_same_identity_at_limit(monkeypatch):
+    """恰好在上限时同身份重复提交按更新放行（不再被锁外预检拒绝），
+    与存储写层、Web POST /api/trips 同口径。"""
+    import shutil
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils import trip_import as trip_import_module
+
+    storage_dir = tempfile.mkdtemp()
+    store = LongTermMemory("u1", storage_dir)
+    store.save_trip_history(
+        {"origin": "北京", "destination": "上海", "start_date": "2026-12-01"}
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    monkeypatch.setattr(trip_import_module, "MAX_TOTAL_TRIPS", 1)
+    code, out = _run_trip_add("u1", "北京", "上海", "2026-12-01", None, "会议")
+    assert code == 0, out
+    trips = store.get_trip_history(limit=None)
+    assert len(trips) == 1 and trips[0]["purpose"] == "会议", trips
+    shutil.rmtree(storage_dir, ignore_errors=True)
+    print("✓ trip-add 恰好在上限时同身份更新放行")
 
 if __name__ == "__main__":
     import sys as _sys
@@ -1345,6 +1381,7 @@ if __name__ == "__main__":
         test_trip_add_saves_and_reports_conflicts,
         test_trip_add_json_output,
         test_trip_add_rejects_when_total_limit_reached,
+        test_trip_add_updates_same_identity_at_limit,
         test_trip_add_dedupes_same_route_and_dates,
         test_trip_add_without_purpose_preserves_existing,
         test_trip_add_reports_success_when_post_save_read_fails,

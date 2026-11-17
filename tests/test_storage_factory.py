@@ -1201,11 +1201,14 @@ def test_quarantine_marker_owner_case_conflict(monkeypatch):
         Path(storage_dir2) / "Alice.json.corrupt-20260101000000000000-2"
     )
     legacy.write_text("{}", encoding="utf-8")
-    if list(Path(storage_dir2).glob("alice.json.corrupt-*")):
-        with pytest.raises(MemoryPersistenceError) as info:
-            LongTermMemory("alice", storage_dir2)
-        assert "大小写" in str(info.value), str(info.value)
-        assert legacy.exists()
+    if not list(Path(storage_dir2).glob("alice.json.corrupt-*")):
+        # 平台条件用 skip 而不是零断言通过：平台无关的覆盖由
+        # test_variant_backup_guard_platform_independent 承担
+        pytest.skip("大小写敏感文件系统：变体别名不命中另一账号的备份")
+    with pytest.raises(MemoryPersistenceError) as info:
+        LongTermMemory("alice", storage_dir2)
+    assert "大小写" in str(info.value), str(info.value)
+    assert legacy.exists()
     print("✓ 隔离备份归属冲突拒绝接管")
 
 
@@ -1759,6 +1762,8 @@ def test_pg_write_layer_total_caps(monkeypatch):
         i for i, sql in enumerate(state["sql"]) if "COUNT(*)" in sql
     ]
     assert lock_ix and count_ix and max(lock_ix) < min(count_ix) < min(insert_ix)
+    # 等锁预算在本事务内放宽（长导入持锁期间单条写入不会 3s 即失败）
+    assert any("SET LOCAL lock_timeout" in sql for sql in state["sql"])
     state["sql"] = []
     msgs_store.add_chat_turn("q2", "a2", "s1")
     assert any(
@@ -1965,6 +1970,47 @@ def test_delete_all_removes_atomic_write_temp_files():
     assert not own_tmp.exists(), "崩溃遗留的完整快照必须随删除清理"
     assert other_tmp.exists(), "其它账号的临时文件不能被误删"
     print("✓ delete_all 清理原子写临时快照")
+
+
+def test_variant_backup_guard_platform_independent(monkeypatch):
+    """大小写变体隔离备份的归属守卫不依赖文件系统别名：加载与 delete_all
+    在大小写敏感平台（Linux CI）同样拒绝并保留文件。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    first_dir = tempfile.mkdtemp()
+    second_dir = tempfile.mkdtemp()
+    store = LongTermMemory("alice", first_dir)
+    store.save_preference("home_location", "北京")
+    own_backup = (
+        Path(first_dir) / "Alice.json.corrupt-20260101000000000000-3"
+    )
+    own_backup.write_text("{bad json", encoding="utf-8")
+    legacy = Path(second_dir) / "Alice.json.corrupt-20260101000000000000-4"
+    legacy.write_text("{bad json", encoding="utf-8")
+
+    real = LongTermMemory._corrupt_siblings
+
+    def variant_siblings(self):
+        parent = str(Path(self.db_path).parent)
+        if parent == first_dir:
+            return [own_backup]
+        if parent == second_dir:
+            return [legacy]
+        return real(self)
+
+    monkeypatch.setattr(LongTermMemory, "_corrupt_siblings", variant_siblings)
+    # 加载：无标记的变体遗留备份按归属拒绝（不依赖平台别名）
+    with pytest.raises(MemoryPersistenceError) as info:
+        LongTermMemory("alice", second_dir)
+    assert "大小写" in str(info.value), str(info.value)
+    assert legacy.exists()
+    # delete_all：变体备份归属冲突时拒绝删除并保留主文件与备份
+    with pytest.raises(MemoryPersistenceError) as info:
+        store.delete_all()
+    assert "大小写" in str(info.value), str(info.value)
+    assert own_backup.exists() and (Path(first_dir) / "alice.json").exists()
+    print("✓ 大小写变体备份守卫（平台无关）")
 
 
 def test_delete_all_reports_unremovable_backup(monkeypatch):
@@ -4326,15 +4372,18 @@ def test_pg_add_chat_turn_locks_before_guard():
     assert "pg_advisory_xact_lock(hashtext(%s))" in events[0][1]
     assert events[0][2] == ("aligo:session_meta:u-order",)
     assert events[1] == ("guard",), "守卫必须在拿到会话锁之后调用"
-    # 守卫通过后先取与批量导入共用的消息上限锁（两把锁固定顺序
-    # session_meta → chat_messages），再在锁内计数（写层硬上限）
+    # 守卫通过后先把本事务的等锁预算放宽（长导入持锁期间单轮写入
+    # 不能在默认 3s 后整轮失败），再取与批量导入共用的消息上限锁
+    # （两把锁固定顺序 session_meta → chat_messages），最后锁内计数
     assert events[2][0] == "execute"
-    assert "pg_advisory_xact_lock(hashtext(%s))" in events[2][1]
-    assert events[2][2] == ("aligo:chat_messages:u-order",)
+    assert "SET LOCAL lock_timeout" in events[2][1]
     assert events[3][0] == "execute"
-    assert "COUNT(*)" in events[3][1]
-    assert events[4][0] == "executemany"
-    rows = events[4][2]
+    assert "pg_advisory_xact_lock(hashtext(%s))" in events[3][1]
+    assert events[3][2] == ("aligo:chat_messages:u-order",)
+    assert events[4][0] == "execute"
+    assert "COUNT(*)" in events[4][1]
+    assert events[5][0] == "executemany"
+    rows = events[5][2]
     assert [row[1] for row in rows] == ["user", "assistant"]
     assert [row[2] for row in rows] == ["问", "答"]
 

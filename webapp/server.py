@@ -5660,7 +5660,10 @@ def create_app(model: Any = None) -> FastAPI:
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
         from utils.user_import import backup_limit_problem
 
-        limit_problem = backup_limit_problem(backup)
+        # Web 响应体是 LF（Starlette 原样编码，浏览器下载也不转换）：
+        # 按平台 CRLF 估算会每行多算 1 字节，把 49.x MB 的合法备份误判
+        # 超过 50 MB（CLI 导出确实写 CRLF，保持默认口径）
+        limit_problem = backup_limit_problem(backup, crlf=False)
         if limit_problem:
             raise HTTPException(
                 status_code=413,
@@ -5923,6 +5926,9 @@ def create_app(model: Any = None) -> FastAPI:
                         # 做基线豁免（存量已超限的账号恢复自身体积超限的
                         # 备份不能被预检 413），因此在打开 store 之后执行；
                         # 读取快照失败时按原严格口径复核。
+                        # 快照只全量读取一次：预检与合并复核共用，避免
+                        # 每请求两次重读与两次快照不一致
+                        snapshot = _store_export_snapshot(store)
                         try:
                             from config import STORAGE_CONFIG as _storage_config
 
@@ -5931,7 +5937,9 @@ def create_app(model: Any = None) -> FastAPI:
                                 pg_shape=bool(
                                     _storage_config.get("postgres_dsn")
                                 ),
-                                existing=_store_export_snapshot(store),
+                                existing=snapshot,
+                                # Web 导出的备份是 LF：体积轴同口径
+                                crlf=False,
                             )
                         except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
                             logger.debug("备份导出口径自检失败", exc_info=True)
@@ -5977,9 +5985,10 @@ def create_app(model: Any = None) -> FastAPI:
                                         ),
                                     )
                         # 偏好之外再按「现有数据 + 备份」复核导出体积：
-                        # 恢复到接近上限的账号后仍可能永久 413
+                        # 恢复到接近上限的账号后仍可能永久 413。复用预检
+                        # 同一快照，避免第二次全量读取
                         merged_problem = merged_backup_limit_problem(
-                            store, sections
+                            store, sections, existing=snapshot, crlf=False
                         )
                         if merged_problem:
                             raise HTTPException(

@@ -2365,7 +2365,7 @@ def test_merged_payload_top_level_placeholders_equal_length(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2405,7 +2405,7 @@ def test_merged_trip_rows_wired_to_backend_shape(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2456,7 +2456,7 @@ def test_merged_statistics_trip_number_raised(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2506,7 +2506,7 @@ def test_merged_message_rows_timestamp_backend_shape(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2555,7 +2555,7 @@ def test_sections_limit_counts_missing_timestamps_as_export_shape(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2583,7 +2583,7 @@ def test_merged_update_rows_get_timestamp(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2642,7 +2642,7 @@ def test_merged_fallback_uses_backend_shape(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2752,7 +2752,7 @@ def test_sections_limit_uses_neighbor_timestamp_anchor(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2792,7 +2792,7 @@ def test_merged_trip_ids_mirror_storage_renumbering(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2873,7 +2873,7 @@ def test_merged_preview_uses_pg_counter_watermark(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -2980,7 +2980,7 @@ def test_merged_preview_ids_match_real_storage(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -3027,7 +3027,7 @@ def test_sections_limit_uses_merged_export_shape(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -3124,7 +3124,7 @@ def test_merged_preview_includes_global_knowledge(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -3203,7 +3203,7 @@ def test_merged_knowledge_duplicate_backup_not_rejected(monkeypatch):
 
     captured = {}
 
-    def fake_limit(payload):
+    def fake_limit(payload, **kwargs):
         captured["payload"] = payload
         return None
 
@@ -3744,6 +3744,97 @@ def test_user_import_warns_when_quarantined_and_no_user_data(monkeypatch):
     assert code == 1 and payload["ok"] is False, payload
     assert payload.get("recovery_incomplete") is True, payload
     print("✓ 隔离账号空恢复 CLI 报告未完成")
+
+
+def test_backup_size_accounts_for_lf_vs_crlf(monkeypatch):
+    """Windows 上 Web 响应体是 LF：体积轴按通道选择行尾口径，
+    否则接近 50 MB 的合法 Web 备份每行多算 1 字节被误判超限。"""
+    from utils import user_import as module
+
+    backup = {"preferences": {"home_location": "北京", "note": "x" * 200}}
+    lf = module._backup_payload_size(backup, crlf=False)
+    crlf = module._backup_payload_size(backup, crlf=True)
+    assert crlf > lf, (lf, crlf)
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", (lf + crlf) // 2)
+    assert module.backup_limit_problem(backup, crlf=False) is None
+    assert module.backup_limit_problem(backup, crlf=True) is not None
+    print("✓ 体积轴按 LF/CRLF 通道口径区分")
+
+
+def test_merged_reuses_provided_snapshot(monkeypatch):
+    """调用方传入导出快照后合并复核不得再次全量读取（两次读取既费时
+    又可能读到不一致的快照）。"""
+    from utils import user_import as module
+
+    calls = {"n": 0}
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            calls["n"] += 1
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    snapshot = _Store().export_snapshot()
+    calls["n"] = 0
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), {"preferences": {"home_location": "北京"}},
+            existing=snapshot,
+        )
+        is None
+    )
+    assert calls["n"] == 0, "传入快照后不得再次读取"
+    module.merged_backup_limit_problem(
+        _Store(), {"preferences": {"home_location": "北京"}}
+    )
+    assert calls["n"] == 1
+    print("✓ 合并复核复用调用方快照")
+
+
+def test_merged_fallback_counts_full_timestamp_width(monkeypatch):
+    """快照读不到时该预检即最终判定：JSON 时间戳按落库后的真实宽度
+    32 计（不再截成 26 低估，避免放行恢复后永久 413 的备份）。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload, **kwargs):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    class _Broken:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            raise RuntimeError("disk busy")
+
+    module.merged_backup_limit_problem(
+        _Broken(),
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "x",
+                    "session_id": "s1",
+                    "timestamp": "2026-05-01T10:00:00.123456+08:00",
+                }
+            ]
+        },
+    )
+    rows = captured["payload"]["chat_history"]
+    assert len(rows[0]["timestamp"]) == 32, rows[0]
+    print("✓ 回退口径按真实时间戳宽度计")
 
 
 def test_merged_payload_includes_snapshot_extra_fields(monkeypatch):
