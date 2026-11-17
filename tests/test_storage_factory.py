@@ -1716,6 +1716,50 @@ def test_pg_add_chat_messages_reports_committed_count_after_lost_ack():
     print("✓ 提交 ack 丢失的重放按已提交条数报告")
 
 
+def test_pg_save_preference_holds_user_cap_lock_before_count():
+    """用户级偏好上限锁必须包住「类型是否存在 + COUNT」复核：删掉该锁
+    或退回按类型锁时本用例立即变红（不依赖真实 PG / TEST_POSTGRES_DSN）。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-lock-order"
+    store._json = lambda value: value
+    order: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_pref_lock(pref_type):
+        order.append(f"pref:{pref_type}")
+        yield
+
+    @contextlib.contextmanager
+    def fake_cap_lock():
+        order.append("cap")
+        yield
+
+    store._preference_lock = fake_pref_lock
+    store._preference_cap_lock = fake_cap_lock
+
+    def fake_fetchone(sql, params=None):
+        text = " ".join(str(sql).split())
+        if "COUNT(*)" in text:
+            order.append("count")
+            return (0,)
+        order.append("exists")
+        return None
+
+    store._fetchone = fake_fetchone
+    store._execute = (
+        lambda sql, params=None, replay_safe=True: order.append("insert")
+    )
+    store.save_preference("home_location", "北京")
+    assert order == ["pref:home_location", "cap", "exists", "count", "insert"], (
+        order
+    )
+    print("✓ PG 偏好上限复核在用户级锁内（删除锁即变红）")
+
+
 def test_pg_save_preference_never_replays():
     """偏好 UPSERT 一律禁止重放（并发删除 + 补位会让重放变成未经上限
     复核的新增行）：方法不再暴露会被静默忽略的 replay_safe 形参，两条
