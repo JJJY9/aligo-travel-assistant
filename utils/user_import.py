@@ -1719,9 +1719,8 @@ def _probe_embedding_model() -> None:
 
     from agents.rag_knowledge_agent import RAGKnowledgeAgent
 
-    configured = str(
-        RAG_CONFIG.get("embedding_model") or "data/models/bge-small-zh-v1.5"
-    )
+    default_local_model = "data/models/bge-small-zh-v1.5"
+    configured = str(RAG_CONFIG.get("embedding_model") or default_local_model)
     path_obj = Path(configured).expanduser()
     model_path_or_id = configured
     if not path_obj.is_absolute():
@@ -1739,6 +1738,16 @@ def _probe_embedding_model() -> None:
             path_obj = resolved
     if path_obj.exists():
         model_path_or_id = str(path_obj.resolve())
+    elif RAGKnowledgeAgent._looks_like_filesystem_path(configured):
+        # 与技能侧一致：只把「看起来是路径」的缺失值当错误；默认本地
+        # 模型未下载时回退同名 HF 模型（联网下载）。显式配置的其它本地
+        # 路径缺失必须报错——静默换模型会让查询向量与库内向量来源不一致
+        if configured != default_local_model:
+            raise RuntimeError(
+                f"配置的本地嵌入模型路径不存在：{configured}"
+                "（请下载该模型，或修改 RAG_CONFIG['embedding_model']）"
+            )
+        model_path_or_id = "BAAI/bge-small-zh-v1.5"
     model = get_embedding_model(model_path_or_id)
     if embedding_dimension(model) is None:
         raise RuntimeError("无法读取嵌入模型维度")
