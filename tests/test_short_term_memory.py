@@ -2268,6 +2268,11 @@ def test_direct_run_caplog_shim_captures_logs():
     print("✓ 直跑 caplog 替身捕获日志")
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告

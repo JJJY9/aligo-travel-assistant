@@ -1568,6 +1568,11 @@ def test_session_title_newline_cannot_forge_rows(monkeypatch):
     print("✓ 会话标题内嵌换行不能伪造列表行")
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     # 直跑模式自动发现全部用例（monkeypatch 自动提供；pytest.skip 条件
     # 跳过不再中断整体，跳过数量明确报告）
     import asyncio
