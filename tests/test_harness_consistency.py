@@ -217,7 +217,22 @@ def test_manual_lists_cover_all_tests():
                 for param in params
                 if param not in {"monkeypatch", "caplog"}
             )
-            if fixture_justified or "真实" in reason:
+            real_service = "真实" in reason and any(
+                tag in reason
+                for tag in (
+                    "PostgreSQL",
+                    "Redis",
+                    "DSN",
+                    "模型",
+                    "知识库",
+                    "Milvus",
+                    "网络",
+                    "搜索",
+                    "LLM",
+                    "API Key",
+                )
+            )
+            if fixture_justified or real_service:
                 continue
             problems.append(
                 f"{path.name}: {name} 的跳过原因不可接受（{reason}）"
@@ -277,7 +292,7 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
     block = _find_main_block(tree)
     if block is None:
         return problems
-    events: list[tuple[int, str, str]] = []
+    events: list[tuple[int, int, str, str]] = []
     patch_vars: set[str] = set()
     for node in ast.walk(block):
         lineno = int(getattr(node, "lineno", 0))
@@ -298,7 +313,8 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
             and value.func.attr == "MonkeyPatch"
         ):
             patch_vars.add(target.id)
-            events.append((lineno, "new", target.id))
+            # 同一行内 new 必须先于 undo / call 处理（rank 排序）
+            events.append((lineno, 0, "new", target.id))
             continue
         if not isinstance(node, ast.Call):
             continue
@@ -309,24 +325,37 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
             and isinstance(func.value, ast.Name)
             and func.value.id in patch_vars
         ):
-            events.append((node.lineno, "undo", func.value.id))
+            events.append((int(node.lineno), 1, "undo", func.value.id))
         elif isinstance(func, ast.Name) and func.id.startswith("test_"):
             arg_values: list[ast.expr] = list(node.args) + [
                 keyword.value for keyword in node.keywords
             ]
             for arg in arg_values:
                 if isinstance(arg, ast.Name) and arg.id in patch_vars:
-                    events.append((node.lineno, f"call:{func.id}", arg.id))
+                    events.append((int(node.lineno), 2, f"call:{func.id}", arg.id))
     events.sort()
     states: dict[str, str] = {var: "none" for var in patch_vars}
-    for lineno, kind, var in events:
+    last_call: dict[str, str] = {}
+    for lineno, _rank, kind, var in events:
         if kind in ("new", "undo"):
             states[var] = kind
-        elif kind.startswith("call:") and states.get(var) != "new":
-            problems.append(
-                f"{name}:{lineno} {kind[5:]} 复用了已撤销的 "
-                f"MonkeyPatch（{var}）"
-            )
+            last_call.pop(var, None)
+        elif kind.startswith("call:"):
+            if states.get(var) != "new":
+                problems.append(
+                    f"{name}:{lineno} {kind[5:]} 复用了已撤销的 "
+                    f"MonkeyPatch（{var}）"
+                )
+            elif var in last_call:
+                # 一个补丁实例跨多个用例：后一个用例运行在前一个的补丁
+                # 泄漏作用域里（全局模块替身如 asyncio.sleep / shutil
+                # 会一直生效），直跑清单会互相污染
+                problems.append(
+                    f"{name}:{lineno} {kind[5:]} 与上一个用例共享同一 "
+                    f"MonkeyPatch（{var}）且未撤销：补丁会泄漏到下一个用例"
+                )
+            else:
+                last_call[var] = kind[5:]
     return problems
 
 
@@ -376,6 +405,27 @@ def test_monkeypatch_reuse_check_covers_renamed_vars():
         "        mp2.undo()\n"
     )
     assert _monkeypatch_reuse_problems(recreated, "synthetic.py") == []
+
+    shared = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp = pytest.MonkeyPatch()\n"
+        "    try:\n"
+        "        test_a(mp)\n"
+        "        test_b(mp)\n"
+        "    finally:\n"
+        "        mp.undo()\n"
+    )
+    problems = _monkeypatch_reuse_problems(shared, "synthetic.py")
+    assert problems and "共享同一" in problems[0], problems
+
+    same_line = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp = pytest.MonkeyPatch(); test_a(mp)\n"
+        "    mp.undo()\n"
+    )
+    assert _monkeypatch_reuse_problems(same_line, "synthetic.py") == []
 
     inline = (
         "import pytest\n"

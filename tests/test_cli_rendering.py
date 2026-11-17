@@ -423,10 +423,30 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_missing_api_key_exits_cleanly(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_model_init_failure_exits_cleanly(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_print_stdout_swallows_pipe_errors_only(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_repl_foreign_cancelled_error_propagates(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_repl_memory_failure_keeps_session(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_repl_input_unavailable_exits(mp)
     finally:
         mp.undo()

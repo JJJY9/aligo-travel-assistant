@@ -358,7 +358,16 @@ def test_pg_import_preserves_timestamp_instant():
     os.environ["TZ"] = "Asia/Shanghai"
     time_module.tzset()
     user_id = f"pg_import_{uuid.uuid4().hex[:8]}"
-    store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    try:
+        store = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    except BaseException:
+        # 构造失败同样必须恢复进程级 TZ（否则 pytest 进程永久留在东八区）
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time_module.tzset()
+        raise
     try:
         payload = {
             "chat_history": [
@@ -392,13 +401,16 @@ def test_pg_import_preserves_timestamp_instant():
         assert len(store.get_chat_history(limit=None, session_id="sess-pg-import")) == 1
         print("✓ PostgreSQL 备份恢复时间戳保真且幂等")
     finally:
-        store.delete_chat_session("sess-pg-import")
-        store.close()
-        if previous_tz is None:
-            os.environ.pop("TZ", None)
-        else:
-            os.environ["TZ"] = previous_tz
-        time_module.tzset()
+        try:
+            store.delete_chat_session("sess-pg-import")
+            store.close()
+        finally:
+            # 清理抛错也不能把进程级 TZ 留在东八区
+            if previous_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous_tz
+            time_module.tzset()
 
 
 def test_pg_import_skips_orphan_answer_and_orders_by_timestamp():

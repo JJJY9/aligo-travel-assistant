@@ -508,12 +508,13 @@ def merged_backup_limit_problem(
     避免每个请求对账号数据做两次全量读取、两次快照不一致。
     ``crlf`` 见 :func:`_limit_problems`。
 
-    ``knowledge_unverified`` 传入 dict 时：知识轴无法核对（现有库读不到 /
-    本次分片规划失败）会写入 ``{"reason": ...}``。调用方必须据此跳过本次
-    知识段写入并上报错误（见 ``import_user_data`` / ``preview_user_import``
-    的同名参数）——把知识轴当作「无问题」放行会让真实导入在未核对体积
-    的情况下把全局知识库推过导出上限（所有用户的带知识库导出从此永久
-    413）。不传时保持旧的「跳过知识轴」行为（仅测试兼容）。
+    ``knowledge_unverified`` 传入 dict 时：知识轴无法核对（本次分片规划
+    失败）会写入 ``{"reason": ...}``。调用方必须据此跳过本次知识段写入并
+    上报错误（见 ``import_user_data`` / ``preview_user_import`` 的同名
+    参数）——把知识轴当作「无问题」放行会让真实导入在未核对体积的情况
+    下把全局知识库推过导出上限（所有用户的带知识库导出从此永久 413）。
+    现有知识库整体不可读时本函数按可重试的持久化失败上报（导入幂等，
+    稍后重试安全），不会在未核对的情况下写入。
     """
     if not isinstance(sections, dict):
         return None
@@ -550,43 +551,32 @@ def merged_backup_limit_problem(
     existing_messages = list(existing.get("chat_history") or [])
     existing_trip_rows = list(existing.get("trip_history") or [])
     pg_shape = not getattr(store, "snapshot_based", False)
-    # 现有全局知识库只读一次：既进合并后的知识段，也进按轴基线豁免的
-    # 基线形状（此前基线用「任意轴取首个问题」，账号在消息/行程轴超限
-    # 时知识轴被连带豁免，可把全局库推过导出上限）。读不到 / 规划失败
-    # 时知识轴不可核对：不能当作「无问题」跳过，必须由调用方跳过本次
-    # 知识写入（用户数据恢复不受影响）
-    existing_kb: list[Any] | None
-    unverified_reason = ""
+    # 现有全局知识库：库文件存在但读不出来时 fail-closed（按可重试失败
+    # 上报）——它与带知识库导出共享 50MB 上限，静默按空库放行会让用户
+    # 数据增长把账号的 with_knowledge 导出永久推过上限（之后所有导出
+    # 413）。导入幂等，稍后重试安全；知识库未初始化 / 集合缺失已在
+    # _existing_knowledge_rows 内部按空库处理，不会走到这里
     try:
-        existing_kb = _existing_knowledge_rows()
+        existing_kb: list[Any] = _existing_knowledge_rows()
     except MemoryPersistenceError as exc:
         logger.warning(
-            "合并预检：读取现有知识库失败（%s），知识轴不可核对", exc
+            "合并预检：读取现有知识库失败（%s），无法核对导出体积", exc
         )
-        existing_kb = None
-        unverified_reason = (
-            "知识库当前不可读，无法核对恢复后的知识体积；"
-            "本次未恢复知识片段，请稍后重试补全"
-        )
+        raise MemoryPersistenceError(
+            "知识库当前不可读，无法核对恢复后的导出体积，请稍后重试"
+        ) from exc
     plan_reason: dict[str, str] = {}
-    knowledge_rows = (
-        _knowledge_rows_for_merge(
-            existing_kb, sections, reason_out=plan_reason
-        )
-        if existing_kb is not None
-        else None
+    knowledge_rows = _knowledge_rows_for_merge(
+        existing_kb, sections, reason_out=plan_reason
     )
-    if existing_kb is not None and knowledge_rows is None:
+    unverified_reason = ""
+    if knowledge_rows is None:
         unverified_reason = plan_reason.get(
             "reason",
             "知识库规划失败，无法核对恢复后的知识体积；"
             "本次未恢复知识片段，请稍后重试补全",
         )
-    if (
-        knowledge_unverified is not None
-        and unverified_reason
-        and sections.get("knowledge")
-    ):
+    if knowledge_unverified is not None and unverified_reason:
         knowledge_unverified["reason"] = unverified_reason
     # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
     # export_snapshot 之外补 user_id / exported_at——这里放与导出端
@@ -604,7 +594,7 @@ def merged_backup_limit_problem(
     merged_knowledge = (
         list(knowledge_rows)
         if knowledge_rows is not None
-        else list(existing_kb or [])
+        else list(existing_kb)
     )
     payload.update(
         {
@@ -616,7 +606,9 @@ def merged_backup_limit_problem(
             ),
             "trip_history": _merged_trip_rows(
                 existing_trip_rows,
-                sections.get("trips") or [],
+                _preview_dropped_trip_links(
+                    existing_trip_rows, sections.get("trips") or []
+                ),
                 include_empty_keys=pg_shape,
                 existing_last_number=_existing_trip_number_watermark(
                     store, existing, pg_shape=pg_shape
@@ -752,7 +744,7 @@ def merged_backup_limit_problem(
     kb_baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            {"knowledge": list(existing_kb or [])}, crlf=crlf
+            {"knowledge": list(existing_kb)}, crlf=crlf
         )
     }
     for axis, message in _limit_problems(
@@ -988,6 +980,39 @@ def _existing_trip_number_watermark(
     return 10**18 - 1 if pg_shape else 0
 
 
+def _preview_dropped_trip_links(
+    existing_rows: list[Any], trips: list[Any]
+) -> list[Any]:
+    """合并预演用：复刻 ``_resolve_dropped_trip_links`` 的写库语义（副本上）。
+
+    带 ``_DROPPED_SESSION_KEY`` 标记的备份行在真实导入时：目标库同一行程
+    的 ``session_id`` 正是被丢弃的会话 → 显式置 None；否则去掉标记、保留
+    既有链接。标记本身绝不进入存储——预览既不能把标记算进导出体积，也
+    不能漏掉 ``session_id=None`` 的字节（临近上限时预演与真实落库结论
+    会相反）。sections 上的标记不被消耗（真实清除仍由导入层执行）。
+    """
+    if not any(
+        isinstance(row, dict) and _DROPPED_SESSION_KEY in row for row in trips
+    ):
+        return list(trips)
+    existing: dict[Any, dict[str, Any]] = {}
+    for row in existing_rows:
+        if isinstance(row, dict):
+            existing.setdefault(trip_identity(row), row)
+    cleaned: list[Any] = []
+    for row in trips:
+        if not isinstance(row, dict) or _DROPPED_SESSION_KEY not in row:
+            cleaned.append(row)
+            continue
+        copy = dict(row)
+        dropped = str(copy.pop(_DROPPED_SESSION_KEY) or "")
+        match = existing.get(trip_identity(copy))
+        if match is not None and str(match.get("session_id") or "") == dropped:
+            copy["session_id"] = None
+        cleaned.append(copy)
+    return cleaned
+
+
 def _merged_trip_rows(
     existing_rows: list[Any],
     trips: list[Any],
@@ -1184,7 +1209,8 @@ def sections_limit_problem(
     # 预检按最坏占位会比权威复核更严，把实际可恢复的备份误拒
     trip_rows = _merged_trip_rows(
         [],
-        sections.get("trips") or [],
+        # 预演同样不能把 drop_sessions 的私有标记算进导出行
+        _preview_dropped_trip_links([], sections.get("trips") or []),
         include_empty_keys=pg_shape,
         existing_last_number=0,
     )

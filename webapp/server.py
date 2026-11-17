@@ -2407,7 +2407,8 @@ def _open_long_term(
     except MemoryPersistenceError as exc:
         logger.warning("打开长期记忆失败（%s，strict）：%s", user_id, exc)
         raise HTTPException(
-            status_code=503, detail=_persistence_failure_detail(exc, None)
+            status_code=_persistence_failure_status(exc),
+            detail=_persistence_failure_detail(exc, None),
         ) from exc
     except Exception as exc:  # noqa: BLE001 - 存储故障统一可重试的 503
         logger.warning("打开长期记忆失败（%s）：%s", user_id, exc)
@@ -2476,6 +2477,18 @@ def _persistence_failure_detail(
             f"（删除不再需要的会话）后再试{suffix}"
         )
     return f"存储暂时不可用，请稍后再试{suffix}"
+
+
+def _persistence_failure_status(exc: Exception) -> int:
+    """持久化异常对应的 HTTP 状态：大小写冲突与聊天条数上限是永久、
+    用户可修正的状态（409），其余（隔离 / 瞬时占用 / 未知）按可重试
+    503。所有把 MemoryPersistenceError 映射到响应的入口统一走这里，
+    避免「永久可修正」的文案以 503（稍后重试）状态返回。
+    """
+    text = str(exc)
+    if text.startswith(_CASE_CONFLICT_PREFIXES + _CHAT_CAP_PREFIXES):
+        return 409
+    return 503
 
 
 def _storage_failure(action: str, exc: Exception) -> HTTPException:
@@ -4776,7 +4789,7 @@ def create_app(model: Any = None) -> FastAPI:
                     "打开会话失败（%s）: %s", _request_id(request), exc
                 )
                 raise HTTPException(
-                    status_code=503,
+                    status_code=_persistence_failure_status(exc),
                     detail=_persistence_failure_detail(
                         exc, _request_id(request)
                     ),
@@ -4825,11 +4838,7 @@ def create_app(model: Any = None) -> FastAPI:
                 )
                 # 条数硬上限是永久状态：与偏好 / 行程上限同样回 409，
                 # 客户端不能按「稍后重试」处理
-                status = (
-                    409
-                    if str(exc).startswith(_CHAT_CAP_PREFIXES)
-                    else 503
-                )
+                status = _persistence_failure_status(exc)
                 raise HTTPException(status_code=status, detail=detail) from exc
             except UserFacingError as exc:
                 # 该类异常的消息是给用户看的固定文案（流式路径同样原样返回），
@@ -4912,7 +4921,7 @@ def create_app(model: Any = None) -> FastAPI:
             except MemoryPersistenceError as exc:
                 logger.warning("打开会话失败（%s）: %s", rid, exc)
                 raise HTTPException(
-                    status_code=503,
+                    status_code=_persistence_failure_status(exc),
                     detail=_persistence_failure_detail(exc, rid),
                 ) from exc
             except SessionCapacityError as exc:
@@ -6126,7 +6135,7 @@ def create_app(model: Any = None) -> FastAPI:
                 except MemoryPersistenceError as exc:
                     logger.warning("恢复用户备份失败（%s）：%s", user_id, exc)
                     raise HTTPException(
-                        status_code=503,
+                        status_code=_persistence_failure_status(exc),
                         detail=_persistence_failure_detail(
                             exc, _request_id(request)
                         ),

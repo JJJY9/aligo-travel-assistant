@@ -319,40 +319,53 @@ if __name__ == "__main__":
                 _reconfigure(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         pass
+    # 每个用例独立的 MonkeyPatch：共用实例会把全局补丁（storage 工厂 /
+    # _MAX_MESSAGES）泄漏到下一个用例
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_writes_json_and_markdown(mp)
+    finally:
         mp.undo()
-        mp = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
         test_user_export_default_dir_and_failures(mp)
+    finally:
         mp.undo()
-        mp = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
         test_user_export_dispatch(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_user_export_with_knowledge(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
         test_user_export_with_knowledge_dispatch(mp)
+    finally:
         mp.undo()
-        mp = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
         test_user_export_refuses_when_memory_file_quarantined(mp)
+    finally:
         mp.undo()
-        mp = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
         test_user_export_scans_existing_quarantine_backups(
             mp, Path(tempfile.mkdtemp())
         )
-        # 重绑前必须撤销上一个实例：否则 storage.create_long_term_memory
-        # 的补丁泄漏到脚本新建的任何存储实例
+    finally:
         mp.undo()
-        # 每个用例独立的 MonkeyPatch：共用实例会让 _MAX_MESSAGES=1
-        # 泄漏到下一个用例（写入失败用例被超限文案顶掉）
-        mp = pytest.MonkeyPatch()
-        try:
-            test_user_export_refuses_oversized_backup(mp)
-        finally:
-            mp.undo()
-        mp = pytest.MonkeyPatch()
-        try:
-            test_user_export_write_failure_reports(mp)
-        finally:
-            mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_export_refuses_oversized_backup(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_export_write_failure_reports(mp)
     finally:
         mp.undo()
     print("\n全部通过")
