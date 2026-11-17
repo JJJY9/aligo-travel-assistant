@@ -5940,6 +5940,8 @@ def create_app(model: Any = None) -> FastAPI:
                                 existing=snapshot,
                                 # Web 导出的备份是 LF：体积轴同口径
                                 crlf=False,
+                                # 基线按真实账号 ID 估算（占位只用于合并 payload）
+                                user_id=user_id,
                             )
                         except Exception:  # noqa: BLE001 - 自检失败不阻断恢复
                             logger.debug("备份导出口径自检失败", exc_info=True)

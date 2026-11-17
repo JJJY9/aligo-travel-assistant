@@ -4003,6 +4003,53 @@ def test_preview_honors_planner_needs_model(monkeypatch):
     print("✓ 预览按 needs_model 探测模型")
 
 
+def test_merged_baseline_uses_real_user_id(monkeypatch):
+    """基线按真实账号 ID 估算：最坏占位会把实际未超限的账号误判成
+    基线超限、连带豁免本次导入的体积增长。"""
+    from utils import user_import as module
+
+    messages = [
+        {"role": "user", "content": "m" * 500, "session_id": f"s{i}"}
+        for i in range(3)
+    ]
+    existing = {
+        "chat_history": [dict(item) for item in messages],
+        "trip_history": [],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    real_size = module._backup_payload_size(
+        module._export_shape_baseline(existing, [], user_id="u1")
+    )
+    placeholder_size = module._backup_payload_size(
+        module._export_shape_baseline(existing, [])
+    )
+    assert placeholder_size - real_size == 254, (
+        placeholder_size,
+        real_size,
+    )
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", real_size + 10)
+
+    class _Store:
+        user_id = "u1"
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return dict(existing)
+
+    incoming = {
+        "messages": [
+            {"role": "user", "content": "n" * 200, "session_id": "new"}
+        ]
+    }
+    problem = module.merged_backup_limit_problem(_Store(), incoming)
+    assert problem and "MB" in problem, problem
+    print("✓ 基线按真实 user_id 估算")
+
+
 def test_merged_default_export_axis_not_exempted_by_kb(monkeypatch):
     """知识库只进 with_knowledge 全量导出，不能抬高默认导出的体积基线：
     用户数据单独被恢复推过 50 MB 时必须拒绝（即使含知识库的合计基线

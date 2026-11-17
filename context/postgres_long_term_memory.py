@@ -373,10 +373,12 @@ class PostgresLongTermMemory:
         # 直接使用游标而不再走 _run_with_retry，避免数据库不可用时无限递归重连。
         for lock_name, count in list(self._held_locks.items()):
             with self._conn.cursor() as cursor:
+                cursor.execute("SET lock_timeout = '30s'")
                 for _ in range(max(1, count)):
                     cursor.execute(
                         "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
                     )
+                cursor.execute("SET lock_timeout = 3000")
         logger.info("PostgreSQL 连接已重建（user=%s）", self.user_id)
 
     def _run_with_retry(self, operation, replay_safe: bool = True):
@@ -475,9 +477,19 @@ class PostgresLongTermMemory:
         RLock 把整个临界区串行化；_execute 内部是同一把可重入锁，不会死锁。
         """
         with self._conn_lock:
-            self._execute(
-                "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
-            )
+            # 会话级锁在 autocommit 连接上等待：SET LOCAL 无效，用会话级
+            # SET 把等待预算放宽到 30s（长删除 / 长导入持锁期间 3s 即
+            # 失败会让标题 / 置顶 / 删除等操作无谓 503），获得锁后恢复
+            # 连接默认值 3000
+            self._execute("SET lock_timeout = '30s'")
+            try:
+                self._execute(
+                    "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
+                )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self._execute("SET lock_timeout = 3000")
+                raise
             self._held_locks[lock_name] = self._held_locks.get(lock_name, 0) + 1
             try:
                 yield
@@ -492,6 +504,8 @@ class PostgresLongTermMemory:
                         "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
                         (lock_name,),
                     )
+                with contextlib.suppress(Exception):
+                    self._execute("SET lock_timeout = 3000")
 
     @contextlib.contextmanager
     def _preference_lock(self, pref_type: str):
@@ -977,6 +991,9 @@ class PostgresLongTermMemory:
 
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
+                # 与写入 / 批量导入同一等锁预算：长持锁事务期间不能 3s
+                # 即报持久化失败
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:session_meta:{self.user_id}",),
@@ -1055,6 +1072,7 @@ class PostgresLongTermMemory:
                 return 0
         def _delete_rows() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:session_meta:{self.user_id}",),

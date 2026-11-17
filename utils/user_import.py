@@ -508,6 +508,10 @@ def merged_backup_limit_problem(
     """
     if not isinstance(sections, dict):
         return None
+    # 基线按真实账号 ID 估算（占位只用于合并后的 payload）
+    target_user_id = getattr(store, "user_id", None)
+    if not isinstance(target_user_id, str) or not target_user_id:
+        target_user_id = None
     if existing is None:
         existing = _store_export_snapshot(store)
     if existing is None:
@@ -663,7 +667,9 @@ def merged_backup_limit_problem(
         axis
         for axis, _message in _limit_problems(
             _export_shape_baseline(
-                existing, existing_kb if existing_kb is not None else []
+                existing,
+                existing_kb if existing_kb is not None else [],
+                user_id=target_user_id,
             ),
             crlf=crlf,
         )
@@ -680,7 +686,10 @@ def merged_backup_limit_problem(
     user_baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            _export_shape_baseline(existing, []), crlf=crlf
+            _export_shape_baseline(
+                existing, [], user_id=target_user_id
+            ),
+            crlf=crlf,
         )
     }
     for axis, message in _limit_problems(user_payload, crlf=crlf):
@@ -793,15 +802,22 @@ def _planned_knowledge_rows(sections: dict[str, Any]) -> list[Any] | None:
 
 
 def _export_shape_baseline(
-    existing: dict[str, Any], knowledge_rows: list[Any]
+    existing: dict[str, Any],
+    knowledge_rows: list[Any],
+    *,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """导入前的完整导出形状（现有存量 + 现有知识库）。
 
     知识轴是否允许作为拒绝理由，取决于「恢复前」账号本身是否仍可导出
     WITH-knowledge 备份：已超限的账号不可能被恢复推得更糟。
+
+    ``user_id`` 用真实账号 ID 计算基线：按最坏占位会把实际未超限的
+    账号误判成基线超限、连带豁免本次导入的体积增长（占位只保留在合并后
+    的 payload，那里高估是 fail-closed 的安全方向）。
     """
     payload = dict(existing)
-    payload.setdefault("user_id", _USER_ID_PLACEHOLDER)
+    payload["user_id"] = user_id or _USER_ID_PLACEHOLDER
     payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
     payload.setdefault("session_id", "")
     payload.update(
@@ -1037,6 +1053,7 @@ def sections_limit_problem(
     existing: dict[str, Any] | None = None,
     conservative: bool = False,
     crlf: bool | None = None,
+    user_id: str | None = None,
 ) -> str | None:
     """恢复后账号是否仍能导出全量备份（按导出格式复核条数与体积）。
 
@@ -1142,7 +1159,7 @@ def sections_limit_problem(
     baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            _export_shape_baseline(existing, []), crlf=crlf
+            _export_shape_baseline(existing, [], user_id=user_id), crlf=crlf
         )
     }
     problems = _limit_problems(payload, crlf=crlf)
