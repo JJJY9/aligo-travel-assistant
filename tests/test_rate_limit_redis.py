@@ -220,6 +220,11 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
+    # 模块级 pytestmark=skipif(not TEST_REDIS_URL) 只对 pytest 生效：
+    # 直跑必须自己守卫，否则无 Redis 时 4 个用例全部连接失败退出码 1
+    if not TEST_REDIS_URL:
+        print("未设置 TEST_REDIS_URL，跳过 Redis 限流用例（请通过 pytest 运行）")
+        raise SystemExit(0)
     test_shared_window_across_instances()
     test_concurrent_checks_share_atomic_quota()
     test_peek_does_not_record_and_window_expires()

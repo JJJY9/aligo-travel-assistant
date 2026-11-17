@@ -698,6 +698,135 @@ def test_fresh_quarantine_blocks_writes_even_under_dsn(monkeypatch):
     print("✓ fresh 隔离在 DSN 配置下仍拒绝写回（含新构造实例）")
 
 
+def test_quarantine_marker_write_failure_restores_corrupt_file(monkeypatch):
+    """隔离标记重试后仍写不进去：损坏文件还原原位、构造按持久化失败
+    上报——不能留下「主文件缺失 + 无标记孤儿备份」，否则 DSN 回退的
+    重建实例会把它当成用户没有数据、以空快照覆盖主文件。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-markfail.json"
+    path.write_text("{bad json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        LongTermMemory,
+        "_record_quarantine_marker",
+        lambda self_, backup: False,
+    )
+    with pytest.raises(MemoryPersistenceError):
+        LongTermMemory("u-markfail", storage_dir)
+    assert path.exists(), "标记失败后损坏文件必须还原原位"
+    assert path.read_text(encoding="utf-8") == "{bad json"
+    assert not list(Path(storage_dir).glob("u-markfail.json.corrupt-*")), (
+        "不能留下无标记的孤儿备份"
+    )
+    print("✓ 隔离标记失败时损坏文件还原、按持久化失败上报")
+
+
+def test_pending_quarantine_marker_failure_refuses_write(monkeypatch):
+    """写前补备份时隔离标记写失败：拒绝本次写入并还原损坏文件；
+    标记恢复可写后下一次写入重新隔离并自愈。"""
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-pending-marker", storage_dir)
+    memory.save_preference("home_location", "北京")
+    path = Path(storage_dir) / "u-pending-marker.json"
+    path.write_text("[]", encoding="utf-8")  # 合法 JSON 但不是对象
+    memory._corrupt_pending = True  # noqa: SLF001 - 模拟写前待复核状态
+
+    original = LongTermMemory._record_quarantine_marker
+    monkeypatch.setattr(
+        LongTermMemory,
+        "_record_quarantine_marker",
+        lambda self_, backup: False,
+    )
+    with pytest.raises(MemoryPersistenceError):
+        memory.save_preference("hotel_brands", ["汉庭"])
+    assert path.exists() and path.read_text(encoding="utf-8") == "[]", (
+        "标记失败时损坏文件必须还原、不能留下孤儿备份"
+    )
+    assert not list(Path(storage_dir).glob("u-pending-marker.json.corrupt-*"))
+
+    # 标记恢复可写：_corrupt_pending 保持，下一次写入重新隔离并自愈
+    monkeypatch.setattr(
+        LongTermMemory, "_record_quarantine_marker", original
+    )
+    memory.save_preference("hotel_brands", ["汉庭"])
+    assert path.exists()
+    assert memory.get_preference("hotel_brands") == ["汉庭"]
+    assert memory.get_preference("home_location") == "北京"
+    print("✓ 写前补备份的标记失败拒绝写入，恢复后可自愈")
+
+
+def test_pg_advisory_lock_replays_wait_budget_after_reconnect(monkeypatch):
+    """advisory 锁等待期间连接被终止：重连后的重试必须先重放 30s 等锁
+    预算再做阻塞加锁（SET 与加锁是同一可重试操作），获锁后立即恢复
+    3000——否则重试只剩新连接的默认 3s 预算，长持锁方下立即 55P03。"""
+    import psycopg
+
+    from context import postgres_long_term_memory as pg_module
+
+    first_state: dict = {"statements": [], "fail_next": True}
+    second_state: dict = {"statements": [], "fail_next": False}
+
+    class _Cursor:
+        def __init__(self, state):
+            self._state = state
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            self._state["statements"].append(text)
+            if (
+                text.startswith("SELECT pg_advisory_lock")
+                and self._state["fail_next"]
+            ):
+                self._state["fail_next"] = False
+                raise psycopg.OperationalError("terminated while waiting")
+
+    class _Conn:
+        def __init__(self, state):
+            self._state = state
+
+        def cursor(self):
+            return _Cursor(self._state)
+
+    store = object.__new__(pg_module.PostgresLongTermMemory)
+    store._conn = _Conn(first_state)
+    store._conn_lock = threading.RLock()
+    store._retry_errors = (psycopg.OperationalError, psycopg.InterfaceError)
+    store._non_retry_db_errors = (psycopg.errors.LockNotAvailable,)
+    store._held_locks = {}
+    monkeypatch.setattr(
+        store, "_reconnect", lambda: setattr(store, "_conn", _Conn(second_state))
+    )
+    with store._advisory_lock("aligo-test-lock"):
+        assert first_state["statements"] == [
+            "SET lock_timeout = '30s'",
+            "SELECT pg_advisory_lock(hashtext(%s)::bigint)",
+        ], first_state["statements"]
+        # 重连重试：新连接上先 SET 30s 再阻塞加锁，获锁后恢复 3000
+        assert second_state["statements"] == [
+            "SET lock_timeout = '30s'",
+            "SELECT pg_advisory_lock(hashtext(%s)::bigint)",
+            "SET lock_timeout = 3000",
+        ], second_state["statements"]
+    # 退出：解锁后再兜底恢复一次
+    assert second_state["statements"][-2:] == [
+        "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+        "SET lock_timeout = 3000",
+    ], second_state["statements"]
+    print("✓ advisory 锁重连重试重放 30s 等锁预算，获锁后恢复 3000")
+
+
 def test_quarantine_marker_cleared_by_recovery_and_delete(monkeypatch):
     """隔离标记是跨实例的恢复引导：恢复入口写回 / delete_all 后必须失效。"""
     from config import STORAGE_CONFIG

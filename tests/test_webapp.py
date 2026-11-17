@@ -787,27 +787,39 @@ def test_status_survives_date_max_trip():
 
 def test_chat_returns_reply_and_usage():
     client = _client()
-    response = client.post(
-        "/api/chat",
-        json={"message": "你好", "user_id": "web_test_user", "session_id": "sess-1"},
-    )
-    assert response.status_code == 200, response.text
-    data = response.json()
-    assert data["session_id"] == "sess-1"
-    assert isinstance(data["reply"], str) and data["reply"]
-    assert data["agents"] == []
-    assert data["usage"]["calls"] >= 1
-    assert data["usage"]["total_tokens"] >= 10
-    assert data["elapsed"] >= 0
-    print("✓ /api/chat 返回回复、用量与耗时")
+    # 固定 user_id 会把真实记忆文件写进仓库 data/memory 并跨轮次累积：
+    # 每个用例用唯一账号，finally 清理
+    user_id = _unique_user("web_test_chat")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "sess-1"},
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["session_id"] == "sess-1"
+        assert isinstance(data["reply"], str) and data["reply"]
+        assert data["agents"] == []
+        assert data["usage"]["calls"] >= 1
+        assert data["usage"]["total_tokens"] >= 10
+        assert data["elapsed"] >= 0
+        print("✓ /api/chat 返回回复、用量与耗时")
+    finally:
+        _cleanup(user_id)
 
 
 def test_chat_creates_session_when_missing():
-    response = _client().post("/api/chat", json={"message": "你好", "user_id": "web_test_user"})
-    assert response.status_code == 200
-    session_id = response.json()["session_id"]
-    assert isinstance(session_id, str) and len(session_id) == 12
-    print("✓ 未提供会话时自动创建")
+    user_id = _unique_user("web_test_chat")
+    try:
+        response = _client().post(
+            "/api/chat", json={"message": "你好", "user_id": user_id}
+        )
+        assert response.status_code == 200
+        session_id = response.json()["session_id"]
+        assert isinstance(session_id, str) and len(session_id) == 12
+        print("✓ 未提供会话时自动创建")
+    finally:
+        _cleanup(user_id)
 
 
 def test_chat_stream_events():
@@ -4599,8 +4611,8 @@ def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
 
     original_import = user_import_module.import_user_data
 
-    def import_then_delete(store, sections):
-        counts = original_import(store, sections)
+    def import_then_delete(store, sections, **kwargs):
+        counts = original_import(store, sections, **kwargs)
         flags["late"] = True
         return counts
 
@@ -10483,12 +10495,16 @@ def test_invalid_user_id_rejected():
 
 
 def test_export_attachment():
-    response = _client().get("/api/export", params={"user_id": "web_test_user"})
-    assert response.status_code == 200
-    assert "attachment" in response.headers.get("content-disposition", "")
-    payload = json.loads(response.text)
-    assert payload["user_id"] == "web_test_user"
-    print("✓ /api/export 返回可下载 JSON")
+    user_id = _unique_user("web_test_export")
+    try:
+        response = _client().get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 200
+        assert "attachment" in response.headers.get("content-disposition", "")
+        payload = json.loads(response.text)
+        assert payload["user_id"] == user_id
+        print("✓ /api/export 返回可下载 JSON")
+    finally:
+        _cleanup(user_id)
 
 
 def _seed_trip_file(user_id, trips):
@@ -11341,7 +11357,7 @@ def test_import_body_parsed_off_event_loop(monkeypatch):
     monkeypatch.setattr(
         user_import_module,
         "import_user_data",
-        lambda store, sections: {"imported": 0, "skipped": 0},
+        lambda store, sections, **kwargs: {"imported": 0, "skipped": 0},
     )
     client = _client()
     user = _unique_user("web_import_thread")

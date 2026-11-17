@@ -491,6 +491,7 @@ def merged_backup_limit_problem(
     *,
     existing: dict[str, Any] | None = None,
     crlf: bool | None = None,
+    knowledge_unverified: dict[str, str] | None = None,
 ) -> str | None:
     """恢复后「账号现有数据 + 备份」按导出格式是否仍可能超限。
 
@@ -505,10 +506,19 @@ def merged_backup_limit_problem(
     ``existing`` 可由调用方传入已取得的导出快照（预检同一次读取），
     避免每个请求对账号数据做两次全量读取、两次快照不一致。
     ``crlf`` 见 :func:`_limit_problems`。
+
+    ``knowledge_unverified`` 传入 dict 时：知识轴无法核对（现有库读不到 /
+    本次分片规划失败）会写入 ``{"reason": ...}``。调用方必须据此跳过本次
+    知识段写入并上报错误（见 ``import_user_data`` / ``preview_user_import``
+    的同名参数）——把知识轴当作「无问题」放行会让真实导入在未核对体积
+    的情况下把全局知识库推过导出上限（所有用户的带知识库导出从此永久
+    413）。不传时保持旧的「跳过知识轴」行为（仅测试兼容）。
     """
     if not isinstance(sections, dict):
         return None
-    # 基线按真实账号 ID 估算（占位只用于合并后的 payload）
+    # 基线按真实账号 ID 估算（与合并 payload 同一口径：占位只在 ID
+    # 未知时兜底，否则导出逼近上限的账号重导自身备份会被多算 ~250
+    # 字节误拒 413）
     target_user_id = getattr(store, "user_id", None)
     if not isinstance(target_user_id, str) or not target_user_id:
         target_user_id = None
@@ -520,6 +530,7 @@ def merged_backup_limit_problem(
             pg_shape=not getattr(store, "snapshot_based", False),
             conservative=True,
             crlf=crlf,
+            user_id=target_user_id,
         )
     merged_prefs = (
         dict(existing.get("preferences") or {})
@@ -540,28 +551,49 @@ def merged_backup_limit_problem(
     pg_shape = not getattr(store, "snapshot_based", False)
     # 现有全局知识库只读一次：既进合并后的知识段，也进按轴基线豁免的
     # 基线形状（此前基线用「任意轴取首个问题」，账号在消息/行程轴超限
-    # 时知识轴被连带豁免，可把全局库推过导出上限）。读不到时只跳过
-    # 知识轴，不阻断用户数据恢复。
+    # 时知识轴被连带豁免，可把全局库推过导出上限）。读不到 / 规划失败
+    # 时知识轴不可核对：不能当作「无问题」跳过，必须由调用方跳过本次
+    # 知识写入（用户数据恢复不受影响）
     existing_kb: list[Any] | None
+    unverified_reason = ""
     try:
         existing_kb = _existing_knowledge_rows()
     except MemoryPersistenceError as exc:
         logger.warning(
-            "合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc
+            "合并预检：读取现有知识库失败（%s），知识轴不可核对", exc
         )
         existing_kb = None
+        unverified_reason = (
+            "知识库当前不可读，无法核对恢复后的知识体积；"
+            "本次未恢复知识片段，请稍后重试补全"
+        )
+    plan_reason: dict[str, str] = {}
     knowledge_rows = (
-        _knowledge_rows_for_merge(existing_kb, sections)
+        _knowledge_rows_for_merge(
+            existing_kb, sections, reason_out=plan_reason
+        )
         if existing_kb is not None
         else None
     )
+    if existing_kb is not None and knowledge_rows is None:
+        unverified_reason = plan_reason.get(
+            "reason",
+            "知识库规划失败，无法核对恢复后的知识体积；"
+            "本次未恢复知识片段，请稍后重试补全",
+        )
+    if (
+        knowledge_unverified is not None
+        and unverified_reason
+        and sections.get("knowledge")
+    ):
+        knowledge_unverified["reason"] = unverified_reason
     # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
-    # export_snapshot 之外补 user_id / exported_at——这里放等长占位，
-    # 体积口径与导出端一致
+    # export_snapshot 之外补 user_id / exported_at——这里放与导出端
+    # 等价的形状（user_id 用真实账号 ID；exported_at 取微秒宽度，
+    # CLI 导出的秒级时间戳更窄；session_id 是 CLI 导出恒写的空串，
+    # Web 导出没有——三者取跨通道上界，高估是 fail-closed 的安全方向）
     payload = dict(existing)
-    # 占位与导出端形状等长：user_id 允许 64 字符、时间戳带微秒、
-    # CLI 导出恒写 session_id 空串
-    payload.setdefault("user_id", _USER_ID_PLACEHOLDER)
+    payload.setdefault("user_id", target_user_id or _USER_ID_PLACEHOLDER)
     payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
     payload.setdefault("session_id", "")
     payload.update(
@@ -780,13 +812,16 @@ def _existing_knowledge_rows() -> list[Any]:
         ) from exc
 
 
-def _planned_knowledge_rows(sections: dict[str, Any]) -> list[Any] | None:
+def _planned_knowledge_rows(
+    sections: dict[str, Any], *, reason_out: dict[str, str] | None = None
+) -> list[Any] | None:
     """本次恢复真正会写入的知识分片（导入层 dry-run 规划）。
 
     与真实 ``import_documents`` 同一实现（分组还原 / 去重 / 切分后的
     最终形状）：预演与落库逐字节同源。返回 None 表示知识轴不可评估
     （规划失败）：调用方跳过知识体积轴、不阻断用户数据恢复（导入层会
-    把知识段以 ``knowledge_error`` 上报）。
+    把知识段以 ``knowledge_error`` 上报）。``reason_out`` 传入 dict 时
+    写入面向用户的原因（未初始化与通用规划失败分开，前者重试无益）。
     """
     rows = sections.get("knowledge") or []
     if not rows:
@@ -795,8 +830,20 @@ def _planned_knowledge_rows(sections: dict[str, Any]) -> list[Any] | None:
         from utils.knowledge_admin import import_documents
 
         plan = import_documents(rows, dry_run=True, return_pieces=True)
+    except FileNotFoundError:
+        # 与真实导入同一文案：知识库未初始化，重试无益
+        if reason_out is not None:
+            reason_out["reason"] = (
+                "知识库未初始化（先运行初始化脚本再恢复知识片段）"
+            )
+        return None
     except Exception as exc:  # noqa: BLE001 - 知识失败不阻断用户数据恢复
         logger.warning("合并预检：知识库规划失败（%s），跳过知识体积轴", exc)
+        if reason_out is not None:
+            reason_out["reason"] = (
+                "知识库规划失败，无法核对恢复后的知识体积；"
+                "本次未恢复知识片段，请稍后重试补全"
+            )
         return None
     return list(plan.get("pieces") or [])
 
@@ -838,7 +885,10 @@ def _export_shape_baseline(
 
 
 def _knowledge_rows_for_merge(
-    existing_kb: list[Any], sections: dict[str, Any]
+    existing_kb: list[Any],
+    sections: dict[str, Any],
+    *,
+    reason_out: dict[str, str] | None = None,
 ) -> list[Any] | None:
     """合并预检的知识段：现有全局库 + 本次真正写入的分片。
 
@@ -847,9 +897,9 @@ def _knowledge_rows_for_merge(
     按轴基线豁免统一判定（与用户数据轴同一语义）：此前用「完整导出
     形状是否有任意问题」决定跳过，账号在其它轴超限时知识轴被连带
     豁免，可把全局知识库推过导出上限（此后所有用户的带知识库导出
-    永久 413）。
+    永久 413）。``reason_out`` 见 :func:`_planned_knowledge_rows`。
     """
-    planned = _planned_knowledge_rows(sections)
+    planned = _planned_knowledge_rows(sections, reason_out=reason_out)
     if planned is None:
         return None
     return existing_kb + planned
@@ -1101,7 +1151,9 @@ def sections_limit_problem(
         trim_json_timestamps=not conservative,
     )
     payload: dict[str, Any] = {
-        "user_id": _USER_ID_PLACEHOLDER,
+        # 传入真实账号 ID 时按真实宽度估算；ID 未知才用最坏占位
+        # （占位 256 字节，会把逼近 50MB 的合法账号重导自身备份误拒）
+        "user_id": user_id or _USER_ID_PLACEHOLDER,
         "exported_at": "1970-01-01T00:00:00.000000",
         "session_id": "",
         "chat_history": messages,
@@ -1567,8 +1619,15 @@ def _knowledge_ready_probe() -> None:
         raise RuntimeError("嵌入模型或知识库集合不可用")
 
 
-def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
-    """预览恢复结果（只读）：返回与 import_user_data 相同键的计数，不写库。"""
+def preview_user_import(
+    store: Any, sections: dict[str, Any], *, knowledge_unverified: str = ""
+) -> dict[str, Any]:
+    """预览恢复结果（只读）：返回与 import_user_data 相同键的计数，不写库。
+
+    ``knowledge_unverified`` 与 :func:`import_user_data` 同名参数一致：
+    合并复核无法核对知识体积时，真实执行会跳过知识段并上报错误，预览
+    必须给出同一结论（否则 --dry-run ok=true、真实执行 ok=false）。
+    """
     # --dry-run 与真实执行同一上限口径：预览成功、真跑失败会让恢复脚本
     # 误判（此前上限只看备份条数，重复导入的大账号两边结论相反）
     _enforce_import_limits(store, sections)
@@ -1637,7 +1696,10 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     # 导入同一入口探测嵌入模型可用性——dry-run 规划本身不加载模型，
     # 只看它会漏掉「模型不可用」这一类失败
     knowledge_rows = sections.get("knowledge") or []
-    if knowledge_rows:
+    if knowledge_rows and knowledge_unverified:
+        # 与真实执行同一结论：知识段本次不写，如实上报原因
+        result["knowledge_error"] = knowledge_unverified
+    elif knowledge_rows:
         try:
             from utils.knowledge_admin import import_documents
 
@@ -1924,8 +1986,18 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
                     )
 
 
-def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
-    """把解析后的数据写入长期记忆；返回各类计数（供 CLI / Web 输出）。"""
+def import_user_data(
+    store: Any, sections: dict[str, Any], *, knowledge_unverified: str = ""
+) -> dict[str, Any]:
+    """把解析后的数据写入长期记忆；返回各类计数（供 CLI / Web 输出）。
+
+    ``knowledge_unverified`` 由合并体积复核给出（见
+    :func:`merged_backup_limit_problem`）：现有知识库读不到 / 本次分片
+    规划失败时知识轴无法核对，此时跳过知识段写入并上报
+    ``knowledge_error``，绝不把全局知识库无上限写下去（推过导出上限后
+    所有用户的带知识库导出永久 413）。用户数据恢复不受影响，重跑可
+    补齐知识片段（导入幂等）。
+    """
     result: dict[str, Any] = {
         "preferences": 0,
         "trips_created": 0,
@@ -1978,7 +2050,11 @@ def import_user_data(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
     if archived:
         result["archived"] = int(store.set_sessions_archived(archived, True))
     knowledge = sections.get("knowledge", [])
-    if knowledge:
+    if knowledge and knowledge_unverified:
+        # 合并复核无法核对知识体积：跳过写入并如实上报（用户数据已恢复，
+        # 重跑补全知识片段即可）
+        result["knowledge_error"] = knowledge_unverified
+    elif knowledge:
         # 知识片段是全局知识库（不随用户隔离）：失败时用户数据已恢复，
         # 记录错误由调用方决定退出码 / 提示，重跑可补齐（导入幂等）
         try:

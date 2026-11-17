@@ -5988,9 +5988,17 @@ def create_app(model: Any = None) -> FastAPI:
                                     )
                         # 偏好之外再按「现有数据 + 备份」复核导出体积：
                         # 恢复到接近上限的账号后仍可能永久 413。复用预检
-                        # 同一快照，避免第二次全量读取
+                        # 同一快照，避免第二次全量读取。知识轴无法核对
+                        # （现有库读不到 / 规划失败）时写入 skip 原因：
+                        # 本次不写知识段、如实上报，绝不放行未核对的
+                        # 全局知识库增长
+                        knowledge_unverified: dict[str, str] = {}
                         merged_problem = merged_backup_limit_problem(
-                            store, sections, existing=snapshot, crlf=False
+                            store,
+                            sections,
+                            existing=snapshot,
+                            crlf=False,
+                            knowledge_unverified=knowledge_unverified,
                         )
                         if merged_problem:
                             raise HTTPException(
@@ -6000,9 +6008,20 @@ def create_app(model: Any = None) -> FastAPI:
                                     "（恢复后账号将无法再导出全量备份）"
                                 ),
                             )
+                        knowledge_skip_reason = knowledge_unverified.get(
+                            "reason", ""
+                        )
                         if dry_run:
-                            return preview_user_import(store, sections)
-                        counts = import_user_data(store, sections)
+                            return preview_user_import(
+                                store,
+                                sections,
+                                knowledge_unverified=knowledge_skip_reason,
+                            )
+                        counts = import_user_data(
+                            store,
+                            sections,
+                            knowledge_unverified=knowledge_skip_reason,
+                        )
                         # 写库期间（大备份可能数十秒）其它实例 / CLI 可能删除
                         # 某个会话：最后再查一次墓碑并整会话回滚，避免迟到的
                         # 删除被恢复写回。若删除发生在本次检查之后，它自己的

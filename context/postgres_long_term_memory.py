@@ -480,17 +480,40 @@ class PostgresLongTermMemory:
             # 会话级锁在 autocommit 连接上等待：SET LOCAL 无效，用会话级
             # SET 把等待预算放宽到 30s（长删除 / 长导入持锁期间 3s 即
             # 失败会让标题 / 置顶 / 删除等操作无谓 503），获得锁后恢复
-            # 连接默认值 3000
-            self._execute("SET lock_timeout = '30s'")
+            # 连接默认值 3000。
+            #
+            # 预算 SET 与阻塞加锁必须是同一个可重试操作：等待期间连接被
+            # 服务端终止时 _run_with_retry 会重连并重放整个闭包——SET 若
+            # 留在闭包外，重试的 pg_advisory_lock 只剩新连接的默认 3s
+            # 预算，持锁方 3s 内不释放就 55P03。
+            def acquire() -> None:
+                with self._conn.cursor() as cursor:
+                    cursor.execute("SET lock_timeout = '30s'")
+                    cursor.execute(
+                        "SELECT pg_advisory_lock(hashtext(%s)::bigint)",
+                        (lock_name,),
+                    )
+
             try:
-                self._execute(
-                    "SELECT pg_advisory_lock(hashtext(%s)::bigint)", (lock_name,)
-                )
+                self._run_with_retry(acquire)
             except BaseException:
                 with contextlib.suppress(Exception):
                     self._execute("SET lock_timeout = 3000")
                 raise
             self._held_locks[lock_name] = self._held_locks.get(lock_name, 0) + 1
+            try:
+                # 获锁后立即恢复连接默认预算：30s 只覆盖等待锁本身，
+                # 受保护体内的语句（标题 / 置顶 / 归档 / 批量导入的
+                # UPDATE/INSERT）维持 3000，与 _reconnect 重获锁后的
+                # 恢复语义一致
+                self._execute("SET lock_timeout = 3000")
+            except BaseException:
+                count = self._held_locks.get(lock_name, 0) - 1
+                if count > 0:
+                    self._held_locks[lock_name] = count
+                else:
+                    self._held_locks.pop(lock_name, None)
+                raise
             try:
                 yield
             finally:

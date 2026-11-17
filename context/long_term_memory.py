@@ -293,10 +293,6 @@ class LongTermMemory:
                                 )
                                 try:
                                     os.replace(self.db_path, backup)
-                                    self._corrupt_backup = backup
-                                    self._fresh_quarantine = True
-                                    self._record_quarantine_marker(backup)
-                                    logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 except OSError as backup_error:
                                     # 文件可能仍被其它进程持有：先以空快照启动，
                                     # 但写入前必须补备份（见 _ensure_corrupt_backed_up）
@@ -304,6 +300,27 @@ class LongTermMemory:
                                     logger.error(
                                         "备份损坏的记忆文件失败: %s", backup_error
                                     )
+                                    return self._init_data()
+                                if not self._record_quarantine_marker(backup):
+                                    # 标记是跨实例唯一的隔离证据：写不进去就
+                                    # 把损坏文件放回原位，让每个实例继续走
+                                    # 「解析失败 → 隔离」路径（fail-closed），
+                                    # 而不是留下无标记孤儿备份、被 DSN 回退
+                                    # 的实例当成「用户没有数据」以空快照覆盖
+                                    try:
+                                        os.replace(backup, self.db_path)
+                                    except OSError as restore_error:
+                                        logger.critical(
+                                            "隔离标记写入失败且无法还原损坏文件: %s",
+                                            restore_error,
+                                        )
+                                    raise MemoryPersistenceError(
+                                        "记忆文件损坏且无法记录隔离标记，"
+                                        f"已拒绝以空快照启动（{self.db_path}）"
+                                    )
+                                self._corrupt_backup = backup
+                                self._fresh_quarantine = True
+                                logger.warning("损坏的记忆文件已备份到 %s", backup)
                                 return self._init_data()
                             # 复核成功同样要校验大小写冲突：瞬时读失败
                             # 改道进入本分支后不能绕过 owner 检查、读到
@@ -434,14 +451,20 @@ class LongTermMemory:
     def _quarantine_marker_path(self) -> Path:
         return Path(f"{self.db_path}.quarantine")
 
-    def _record_quarantine_marker(self, backup: str) -> None:
-        """把「当场隔离」事实落盘（``<user>.json.quarantine``）。
+    def _record_quarantine_marker(self, backup: str) -> bool:
+        """把「当场隔离」事实落盘（``<user>.json.quarantine``），返回是否成功。
 
         ``_fresh_quarantine`` 只存在于实例内存：配置了 PostgreSQL 时
         ``MemoryManager`` 每次写前重建实例，其它 worker 也会新建实例，
         重建后的实例只看到「主文件缺失 + 遗留备份」，会把隔离当成孤儿
         并以空快照重建主文件。标记让隔离跨实例可见；没有标记的历史遗留
         备份仍走 DSN 豁免，不会被误判。
+
+        写入不能是尽力而为：标记丢失后 DSN 回退实例会把隔离当成孤儿、
+        用空快照覆盖主文件（备份从此不可见）。os.replace 与 ``_save`` /
+        ``_clear_quarantine_marker`` 同一 1.5s 重试预算（Windows 共享
+        冲突 / 杀软扫描）；仍失败时返回 False，由调用方把损坏文件放回
+        原位、继续按损坏 fail-closed，而不是留下一份无标记的孤儿备份。
         """
         marker = self._quarantine_marker_path()
         try:
@@ -466,12 +489,21 @@ class LongTermMemory:
                     )
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(temp_path, marker)
+                deadline = time.monotonic() + 1.5
+                while True:
+                    try:
+                        os.replace(temp_path, marker)
+                        return True
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.03)
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
         except OSError as exc:
             logger.error("写入隔离标记失败: %s", exc)
+            return False
 
     def _clear_quarantine_marker(self) -> None:
         """删除隔离标记。
@@ -667,10 +699,23 @@ class LongTermMemory:
                     "记忆文件损坏且无法备份，已拒绝覆盖写入"
                     f"（可手动处理 {self.db_path}）"
                 ) from exc
+            if not self._record_quarantine_marker(backup):
+                # 与 _load 同一取舍：无标记的孤儿备份会被 DSN 回退实例
+                # 当成「用户没有数据」——把损坏文件放回原位继续按损坏
+                # fail-closed（_corrupt_pending 保持，下一次写入重试隔离）
+                try:
+                    os.replace(backup, self.db_path)
+                except OSError as restore_error:
+                    logger.critical(
+                        "隔离标记写入失败且无法还原损坏文件: %s", restore_error
+                    )
+                raise MemoryPersistenceError(
+                    "记忆文件损坏且无法记录隔离标记，已拒绝覆盖写入"
+                    f"（可手动处理 {self.db_path}）"
+                )
             self._corrupt_backup = backup
             self._may_recreate = True
             self._fresh_quarantine = True
-            self._record_quarantine_marker(backup)
             logger.warning("损坏的记忆文件已补备份到 %s", backup)
         self._corrupt_pending = False
 
