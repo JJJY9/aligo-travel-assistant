@@ -758,7 +758,48 @@ def test_pending_quarantine_marker_failure_refuses_write(monkeypatch):
     assert path.exists()
     assert memory.get_preference("hotel_brands") == ["汉庭"]
     assert memory.get_preference("home_location") == "北京"
+    # 自愈后的实例不再报告隔离态：Web 缓存会话的隔离探测不能拿旧备份
+    # 路径把健康账号反复驱逐 / close（标记已随写入清除）
+    assert memory.get_fresh_quarantine_backup() is None
+    assert memory.get_recovered_corrupt_backup() is None
+    assert not memory.has_pending_corrupt_quarantine()
+    # 损坏内容仍保留在隔离备份里（自愈只重建主文件，不删备份）
+    assert list(Path(storage_dir).glob("u-pending-marker.json.corrupt-*"))
     print("✓ 写前补备份的标记失败拒绝写入，恢复后可自愈")
+
+
+def test_quarantine_marker_replace_retries_transient_errors(monkeypatch):
+    """隔离标记的 os.replace 与 _save 同一 1.5s 重试预算：Windows 共享
+    冲突等瞬时失败重试后成功，标记照常落盘。"""
+    import json as json_module
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-marker-retry", storage_dir)
+    marker = Path(storage_dir) / "u-marker-retry.json.quarantine"
+    backup = str(Path(storage_dir) / "u-marker-retry.json.corrupt-1")
+    real_replace = os.replace
+    calls = {"count": 0}
+
+    def flaky_replace(src, dst):
+        # 只让标记文件的 replace 失败：主文件保存路径不受影响
+        if str(dst).endswith(".quarantine"):
+            calls["count"] += 1
+            if calls["count"] <= 2:
+                raise PermissionError("reader holds the marker")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(
+        "context.long_term_memory.os.replace", flaky_replace
+    )
+    assert memory._record_quarantine_marker(backup) is True
+    assert calls["count"] == 3, calls
+    assert marker.exists()
+    payload = json_module.loads(marker.read_text(encoding="utf-8"))
+    assert payload["backup"] == backup, payload
+    print("✓ 隔离标记替换瞬时失败重试后成功落盘")
 
 
 def test_pg_advisory_lock_replays_wait_budget_after_reconnect(monkeypatch):

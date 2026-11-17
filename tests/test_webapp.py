@@ -12131,6 +12131,17 @@ def test_persistence_failure_detail_keeps_quarantine_hint():
     assert "损坏" in cannot_backup and "备份文件恢复" not in cannot_backup, (
         cannot_backup
     )
+    # 隔离标记最终写不进去（损坏文件已还原原位）：同属「损坏且未能隔离
+    # 备份」，不能降级成可重试的通用 503
+    marker_failed = server_module._persistence_failure_detail(
+        MemoryPersistenceError(
+            "记忆文件损坏且无法记录隔离标记，已拒绝以空快照启动（u1.json）"
+        ),
+        "rid-5",
+    )
+    assert "损坏" in marker_failed, marker_failed
+    assert "存储暂时不可用" not in marker_failed, marker_failed
+    assert "备份文件恢复" not in marker_failed, marker_failed
 
 
 def test_persistence_detail_prefix_only():

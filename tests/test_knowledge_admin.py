@@ -2116,6 +2116,48 @@ def test_import_dry_run_tolerates_missing_collection(monkeypatch):
     print("✓ 集合缺失时 dry-run 按空快照规划")
 
 
+def test_import_dry_run_missing_collection_multipart_group(monkeypatch):
+    """集合缺失时多分片文档的布局扫描同样按空布局处理：预览不能把
+    写路径（建集合后按空布局导入）会成功的组判成布局冲突跳过。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda: Path(__file__)
+    )
+
+    def boom():
+        raise RuntimeError("collection not found")
+
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", boom)
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", boom)
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: False)
+    documents = [
+        {
+            "content": "第一片",
+            "metadata": {"group": "g1", "part": "1", "parts": "2"},
+        },
+        {
+            "content": "第二片",
+            "metadata": {"group": "g1", "part": "2", "parts": "2"},
+        },
+    ]
+    result = knowledge_admin.import_documents(
+        documents, dry_run=True, return_pieces=True
+    )
+    assert result["would_import"] > 0, result
+    assert result["skipped_conflict"] == 0, result
+    assert len(result["pieces"]) == 2, result
+    # 集合存在但布局扫描失败：保持 fail-closed（按冲突跳过）
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: [])
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: True)
+    result = knowledge_admin.import_documents(
+        documents, dry_run=True, return_pieces=True
+    )
+    assert result["would_import"] == 0, result
+    assert result["skipped_conflict"] == 2, result
+    print("✓ 集合缺失时多分片组按空布局预览（扫描失败仍 fail-closed）")
+
+
 def test_import_dry_run_reports_skip_reasons(monkeypatch):
     """预览分别统计跳过原因：已存在（重复）与无效内容。"""
     from pathlib import Path
@@ -3402,6 +3444,7 @@ if __name__ == "__main__":
         test_skill_search_participates_in_write_lock,
         test_import_rejects_oversized_single_content,
         test_import_dry_run_tolerates_missing_collection,
+        test_import_dry_run_missing_collection_multipart_group,
     ):
         mp = pytest.MonkeyPatch()
         try:
