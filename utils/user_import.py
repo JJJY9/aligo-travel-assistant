@@ -14,9 +14,11 @@ import contextlib
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from utils.chat_import import filter_import_messages, prepare_import_messages
@@ -29,7 +31,6 @@ from utils.trip_import import (
     normalize_identity_date,
     trip_identity,
 )
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -508,13 +509,13 @@ def merged_backup_limit_problem(
     避免每个请求对账号数据做两次全量读取、两次快照不一致。
     ``crlf`` 见 :func:`_limit_problems`。
 
-    ``knowledge_unverified`` 传入 dict 时：知识轴无法核对（本次分片规划
-    失败）会写入 ``{"reason": ...}``。调用方必须据此跳过本次知识段写入并
-    上报错误（见 ``import_user_data`` / ``preview_user_import`` 的同名
-    参数）——把知识轴当作「无问题」放行会让真实导入在未核对体积的情况
-    下把全局知识库推过导出上限（所有用户的带知识库导出从此永久 413）。
-    现有知识库整体不可读时本函数按可重试的持久化失败上报（导入幂等，
-    稍后重试安全），不会在未核对的情况下写入。
+    ``knowledge_unverified`` 传入 dict 时：知识轴无法核对（现有库读不到 /
+    本次分片规划失败）会写入 ``{"reason": ...}``。调用方必须据此跳过本次
+    知识段写入并上报错误（见 ``import_user_data`` / ``preview_user_import``
+    的同名参数）——把知识轴当作「无问题」放行会让真实导入在未核对体积的
+    情况下把全局知识库推过导出上限。用户数据恢复不受知识库故障影响
+    （知识体积轴冻结约定：不得引入「阻断用户数据恢复」类回归），不可读
+    期间的 with_knowledge 体积边界按冻结记录接受残余风险。
     """
     if not isinstance(sections, dict):
         return None
@@ -551,32 +552,46 @@ def merged_backup_limit_problem(
     existing_messages = list(existing.get("chat_history") or [])
     existing_trip_rows = list(existing.get("trip_history") or [])
     pg_shape = not getattr(store, "snapshot_based", False)
-    # 现有全局知识库：库文件存在但读不出来时 fail-closed（按可重试失败
-    # 上报）——它与带知识库导出共享 50MB 上限，静默按空库放行会让用户
-    # 数据增长把账号的 with_knowledge 导出永久推过上限（之后所有导出
-    # 413）。导入幂等，稍后重试安全；知识库未初始化 / 集合缺失已在
-    # _existing_knowledge_rows 内部按空库处理，不会走到这里
+    # 现有全局知识库：库文件存在但读不出（忙 / 锁冲突 / 损坏）时按
+    # 「不可核对」优雅降级——用户数据照常恢复，知识段跳过并上报
+    # （knowledge_unverified），不阻断恢复。知识库忙是常见并发状态
+    # （面板知识导入持写锁、Web 进程持 milvus-lite 文件锁时 CLI 访问），
+    # 对它做硬失败会阻断全部恢复（含不含知识段 / --skip-knowledge 的
+    # 备份）——知识体积轴冻结约定：不得引入「阻断用户数据恢复」类回归。
+    # 代价是知识库不可读期间的 with_knowledge 体积边界无法核对，按冻结
+    # 记录接受该残余风险。未初始化 / 集合缺失仍在读取层按空库处理
+    existing_kb: list[Any] | None
+    unverified_reason = ""
     try:
-        existing_kb: list[Any] = _existing_knowledge_rows()
+        existing_kb = _existing_knowledge_rows()
     except MemoryPersistenceError as exc:
         logger.warning(
-            "合并预检：读取现有知识库失败（%s），无法核对导出体积", exc
+            "合并预检：读取现有知识库失败（%s），知识轴不可核对", exc
         )
-        raise MemoryPersistenceError(
-            "知识库当前不可读，无法核对恢复后的导出体积，请稍后重试"
-        ) from exc
+        existing_kb = None
+        unverified_reason = (
+            "知识库当前不可读，无法核对恢复后的知识体积；"
+            "本次未恢复知识片段，请稍后重试补全"
+        )
     plan_reason: dict[str, str] = {}
-    knowledge_rows = _knowledge_rows_for_merge(
-        existing_kb, sections, reason_out=plan_reason
+    knowledge_rows = (
+        _knowledge_rows_for_merge(
+            existing_kb, sections, reason_out=plan_reason
+        )
+        if existing_kb is not None
+        else None
     )
-    unverified_reason = ""
-    if knowledge_rows is None:
+    if existing_kb is not None and knowledge_rows is None:
         unverified_reason = plan_reason.get(
             "reason",
             "知识库规划失败，无法核对恢复后的知识体积；"
             "本次未恢复知识片段，请稍后重试补全",
         )
-    if knowledge_unverified is not None and unverified_reason:
+    if (
+        knowledge_unverified is not None
+        and unverified_reason
+        and sections.get("knowledge")
+    ):
         knowledge_unverified["reason"] = unverified_reason
     # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
     # export_snapshot 之外补 user_id / exported_at——这里放与导出端
@@ -594,7 +609,7 @@ def merged_backup_limit_problem(
     merged_knowledge = (
         list(knowledge_rows)
         if knowledge_rows is not None
-        else list(existing_kb)
+        else list(existing_kb or [])
     )
     payload.update(
         {
@@ -744,7 +759,7 @@ def merged_backup_limit_problem(
     kb_baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            {"knowledge": list(existing_kb)}, crlf=crlf
+            {"knowledge": list(existing_kb or [])}, crlf=crlf
         )
     }
     for axis, message in _limit_problems(
@@ -1692,6 +1707,43 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
     return sections, errors
 
 
+def _probe_embedding_model() -> None:
+    """只加载嵌入模型（不建库 / 不建集合）：半初始化库的预览探针。
+
+    路径解析与技能侧 ``RAGKnowledgeAgent`` 的初始化保持一致（本地模型
+    候选锚点 → 模型 ID 兜底）；两边漂移会让预览误报模型不可用，调整时
+    需同步。
+    """
+    from config import RAG_CONFIG
+    from utils.embedding_model import embedding_dimension, get_embedding_model
+
+    from agents.rag_knowledge_agent import RAGKnowledgeAgent
+
+    configured = str(
+        RAG_CONFIG.get("embedding_model") or "data/models/bge-small-zh-v1.5"
+    )
+    path_obj = Path(configured).expanduser()
+    model_path_or_id = configured
+    if not path_obj.is_absolute():
+        resolved = next(
+            (
+                candidate
+                for candidate in RAGKnowledgeAgent._model_path_candidates(
+                    path_obj
+                )
+                if candidate.exists()
+            ),
+            None,
+        )
+        if resolved is not None:
+            path_obj = resolved
+    if path_obj.exists():
+        model_path_or_id = str(path_obj.resolve())
+    model = get_embedding_model(model_path_or_id)
+    if embedding_dimension(model) is None:
+        raise RuntimeError("无法读取嵌入模型维度")
+
+
 def _knowledge_ready_probe() -> None:
     """确认嵌入模型可加载（与真实导入同一入口）。
 
@@ -1700,9 +1752,18 @@ def _knowledge_ready_probe() -> None:
     的懒加载入口（Agent 与模型被缓存，真实导入随后直接命中）。
     构造成功但 ``initialized`` 为 False（依赖缺失 / 集合不可用）同样
     视为不可用——真实导入会在写入批次时以状态错误失败。
+    半初始化库（库文件存在但集合缺失）下不构造写路径 Agent：
+    ``create_if_missing=True`` 会在「只读」预览里创建空集合、改写知识库
+    状态；这类部署的写路径会自动建集合，预览只验证嵌入模型可加载。
     单测 / 直跑清单默认把它替换为 no-op（见 tests/conftest.py），
     避免逐用例加载真实模型。
     """
+    from utils import knowledge_admin
+
+    exists_fn = getattr(knowledge_admin, "_collection_exists", None)
+    if callable(exists_fn) and not exists_fn():
+        _probe_embedding_model()
+        return
     from utils.knowledge_admin import _get_agent
 
     agent = _get_agent()

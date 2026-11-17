@@ -3201,24 +3201,28 @@ def test_merged_preview_includes_global_knowledge(monkeypatch):
         {"content": "旧知识", "metadata": {}}
     ]
 
-    # 现有库读失败：按可重试的持久化失败上报（不能按空库核对体积）
+    # 现有库读失败：不阻断用户数据恢复（知识轴跳过、不抛错）
     from utils.errors import MemoryPersistenceError as _MPE
 
     def boom(*args, **kwargs):
         raise _MPE("kb busy")
 
     monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
-    with pytest.raises(_MPE, match="不可读"):
+    assert (
         module.merged_backup_limit_problem(
             _Store(), {"knowledge": [{"content": "新"}]}
         )
-    print("✓ 合并预检知识段与导入规划同源（读失败按可重试失败上报）")
+        is None
+    )
+    print("✓ 合并预检知识段与导入规划同源（含恒计入/读失败降级）")
 
 
 def test_merged_knowledge_unverify_reports_reason(monkeypatch):
-    """知识轴不可核对时 fail-closed：规划失败经 knowledge_unverified 上报
-    （本次跳过知识写入）；现有库整体不可读按可重试持久化失败上报——
-    都不能按空库放行（with_knowledge 导出包含既有库的体积）。"""
+    """知识轴不可核对（现有库读不到 / 规划失败）必须经 knowledge_unverified
+    上报：跳过知识轴后真实导入不能仍无上限写入全局知识库。
+
+    现有库读不到时用户数据照常恢复（知识体积轴冻结约定：不得引入
+    阻断用户数据恢复类回归）——只是本次跳过知识写入并上报原因。"""
     import utils.knowledge_admin as kb
     from utils import user_import as module
     from utils.errors import MemoryPersistenceError as _MPE
@@ -3238,19 +3242,27 @@ def test_merged_knowledge_unverify_reports_reason(monkeypatch):
                 "statistics": {},
             }
 
-    # 读取现有知识库失败：按可重试失败上报（有无知识段都要拦）
+    # 读取现有知识库失败：降级 + 上报原因（不抛错）
     def boom(*args, **kwargs):
         raise _MPE("kb busy")
 
     monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
-    with pytest.raises(_MPE, match="不可读"):
+    unverified: dict[str, str] = {}
+    assert (
         module.merged_backup_limit_problem(
             _Store(),
             {"knowledge": [{"content": "新"}]},
-            knowledge_unverified={},
+            knowledge_unverified=unverified,
         )
-    with pytest.raises(_MPE, match="不可读"):
-        module.merged_backup_limit_problem(_Store(), {})
+        is None
+    )
+    assert "不可读" in unverified.get("reason", ""), unverified
+    # 备份不带知识段：没有知识写入，无需上报
+    empty: dict[str, str] = {}
+    module.merged_backup_limit_problem(
+        _Store(), {}, knowledge_unverified=empty
+    )
+    assert empty == {}, empty
 
     # 规划失败同样不可核对
     monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
@@ -3447,6 +3459,70 @@ def test_parse_rejects_reserved_preferences_pref_type():
     assert sections["preferences"] == {"home_location": "北京"}, sections
     assert any("保留的偏好类型" in item for item in errors), errors
     print("✓ 导入拒绝保留偏好类型 preferences")
+
+
+def test_import_user_data_survives_knowledge_outage(monkeypatch):
+    """知识库忙 / 不可读不能阻断用户数据恢复（含不含知识段的备份与
+    --skip-knowledge）：知识体积轴冻结约定，不得引入阻断恢复类回归。"""
+    from utils import user_import as module
+    from utils.errors import MemoryPersistenceError as _MPE
+
+    store = LongTermMemory("u-kb-outage", tempfile.mkdtemp())
+
+    def boom(*args, **kwargs):
+        raise _MPE("知识库正在写入（导入进行中）")
+
+    monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
+    counts = module.import_user_data(
+        store, {"preferences": {"home_location": "北京"}}
+    )
+    assert counts["preferences"] == 1, counts
+    assert store.get_preference("home_location") == "北京"
+    assert "knowledge_error" not in counts, counts
+
+    # 含知识段的备份：用户数据照常恢复，知识段跳过并上报
+    counts = module.import_user_data(
+        store,
+        {
+            "preferences": {"hotel_brands": ["汉庭"]},
+            "knowledge": [{"content": "片段", "metadata": {}}],
+        },
+    )
+    assert counts["preferences"] == 1, counts
+    assert counts.get("knowledge_error"), counts
+    assert store.get_preference("hotel_brands") == ["汉庭"]
+    print("✓ 知识库忙时用户数据照常恢复（知识段跳过并上报）")
+
+
+def test_preview_probe_skips_write_agent_when_collection_missing(monkeypatch):
+    """半初始化库（集合缺失）下预览探针只验证嵌入模型，不构造写路径
+    Agent——后者 create_if_missing 会在「只读」预览里创建空集合。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    calls = {"agent": 0, "model": 0}
+    monkeypatch.setattr(kb, "_collection_exists", lambda: False)
+    monkeypatch.setattr(
+        kb, "_get_agent", lambda: calls.__setitem__("agent", calls["agent"] + 1)
+    )
+    monkeypatch.setattr(
+        module,
+        "_probe_embedding_model",
+        lambda: calls.__setitem__("model", calls["model"] + 1),
+    )
+    _real_knowledge_ready_probe()
+    assert calls == {"agent": 0, "model": 1}, calls
+
+    # 集合存在：仍走写路径 Agent（保持「initialized=False 视为不可用」）
+    monkeypatch.setattr(kb, "_collection_exists", lambda: True)
+
+    class _Agent:
+        initialized = True
+
+    monkeypatch.setattr(kb, "_get_agent", lambda: _Agent())
+    _real_knowledge_ready_probe()
+    assert calls == {"agent": 0, "model": 1}, calls
+    print("✓ 半初始化库的预览探针不创建集合")
 
 
 def test_existing_knowledge_rows_tolerates_missing_collection(

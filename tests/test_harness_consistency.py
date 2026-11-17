@@ -292,10 +292,11 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
     block = _find_main_block(tree)
     if block is None:
         return problems
-    events: list[tuple[int, int, str, str]] = []
+    events: list[tuple[int, int, int, str, str]] = []
     patch_vars: set[str] = set()
     for node in ast.walk(block):
         lineno = int(getattr(node, "lineno", 0))
+        col = int(getattr(node, "col_offset", 0))
         target: ast.expr | None = None
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -313,8 +314,8 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
             and value.func.attr == "MonkeyPatch"
         ):
             patch_vars.add(target.id)
-            # 同一行内 new 必须先于 undo / call 处理（rank 排序）
-            events.append((lineno, 0, "new", target.id))
+            # 事件按 (行, 列) 还原源码顺序；rank 仅作同列兜底
+            events.append((lineno, col, 0, "new", target.id))
             continue
         if not isinstance(node, ast.Call):
             continue
@@ -325,18 +326,28 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
             and isinstance(func.value, ast.Name)
             and func.value.id in patch_vars
         ):
-            events.append((int(node.lineno), 1, "undo", func.value.id))
+            events.append(
+                (int(node.lineno), int(node.col_offset), 1, "undo", func.value.id)
+            )
         elif isinstance(func, ast.Name) and func.id.startswith("test_"):
             arg_values: list[ast.expr] = list(node.args) + [
                 keyword.value for keyword in node.keywords
             ]
             for arg in arg_values:
                 if isinstance(arg, ast.Name) and arg.id in patch_vars:
-                    events.append((int(node.lineno), 2, f"call:{func.id}", arg.id))
+                    events.append(
+                        (
+                            int(node.lineno),
+                            int(node.col_offset),
+                            2,
+                            f"call:{func.id}",
+                            arg.id,
+                        )
+                    )
     events.sort()
     states: dict[str, str] = {var: "none" for var in patch_vars}
     last_call: dict[str, str] = {}
-    for lineno, _rank, kind, var in events:
+    for lineno, _col, _rank, kind, var in events:
         if kind in ("new", "undo"):
             states[var] = kind
             last_call.pop(var, None)
@@ -426,6 +437,28 @@ def test_monkeypatch_reuse_check_covers_renamed_vars():
         "    mp.undo()\n"
     )
     assert _monkeypatch_reuse_problems(same_line, "synthetic.py") == []
+
+    # 同行「调用后撤销」是合法顺序（按列号还原，undo 不能恒排在前）
+    call_then_undo = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp = pytest.MonkeyPatch()\n"
+        "    test_a(mp); mp.undo()\n"
+    )
+    assert (
+        _monkeypatch_reuse_problems(call_then_undo, "synthetic.py") == []
+    )
+
+    # 同行「撤销后调用」必须报问题
+    undo_then_call = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp = pytest.MonkeyPatch()\n"
+        "    test_a(mp)\n"
+        "    mp.undo(); test_a(mp)\n"
+    )
+    problems = _monkeypatch_reuse_problems(undo_then_call, "synthetic.py")
+    assert problems and "复用了已撤销" in problems[0], problems
 
     inline = (
         "import pytest\n"
