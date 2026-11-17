@@ -2263,6 +2263,13 @@ def test_direct_run_caplog_shim_captures_logs():
         # 与 pytest 一致：at_level 同时抬高捕获 handler 级别，跨 logger
         # 的 WARNING 在 ERROR 窗口内同样被过滤
         assert "跨 logger 警告" not in shim.text
+        # set_level（非上下文持久级别）：与 pytest 同语义
+        shim.clear()
+        shim.set_level(logging.ERROR, logger="aligo.setlevel")
+        logging.getLogger("aligo.setlevel").warning("set_level 过滤")
+        logging.getLogger("aligo.setlevel").error("set_level 捕获")
+        assert "set_level 过滤" not in shim.text
+        assert "set_level 捕获" in shim.text
     finally:
         shim.close()
     print("✓ 直跑 caplog 替身捕获日志")

@@ -712,6 +712,9 @@ def merged_backup_limit_problem(
                 existing,
                 existing_kb if existing_kb is not None else [],
                 user_id=target_user_id,
+                # 基线对齐真实 Web 导出键集（无 session_id）：基线高估会
+                # 把临近上限的账号误判成「已超限」并整体豁免 size 轴
+                include_session_id=False,
             ),
             crlf=crlf,
         )
@@ -735,6 +738,7 @@ def merged_backup_limit_problem(
                 [],
                 user_id=target_user_id,
                 include_knowledge=False,
+                include_session_id=False,
             ),
             crlf=crlf,
         )
@@ -878,6 +882,7 @@ def _export_shape_baseline(
     *,
     user_id: str | None = None,
     include_knowledge: bool = True,
+    include_session_id: bool = True,
 ) -> dict[str, Any]:
     """导入前的完整导出形状（现有存量 + 现有知识库）。
 
@@ -890,11 +895,17 @@ def _export_shape_baseline(
 
     ``include_knowledge=False`` 用于「默认导出」轴：真实默认导出的键集
     不含 ``knowledge``，合成的空键会让判定边界整体平移。
+
+    ``include_session_id=False``（基线判定用）对齐真实 Web 导出：Web
+    `/api/export` 没有该键，合成键会把基线抬高 ~18 字节——基线高估会让
+    临近上限的账号被误判成「已超限」、size 轴整体豁免（fail-open）。
+    合并后的 payload 仍保留合成键（跨通道上界，那里高估是安全方向）。
     """
     payload = dict(existing)
     payload["user_id"] = user_id or _USER_ID_PLACEHOLDER
     payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
-    payload.setdefault("session_id", "")
+    if include_session_id:
+        payload.setdefault("session_id", "")
     payload.update(
         {
             "chat_history": list(existing.get("chat_history") or []),
@@ -1255,7 +1266,10 @@ def sections_limit_problem(
     baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            _export_shape_baseline(existing, [], user_id=user_id), crlf=crlf
+            _export_shape_baseline(
+                existing, [], user_id=user_id, include_session_id=False
+            ),
+            crlf=crlf,
         )
     }
     for axis, message in problems:

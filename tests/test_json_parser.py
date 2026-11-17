@@ -313,7 +313,6 @@ def test_parse_failure_log_is_single_line_and_short(caplog):
 
 
 _DIRECT_RUN_SKIP: dict[str, str] = {
-    "test_parse_failure_log_is_single_line_and_short": "需要 caplog 夹具",
 }
 
 if __name__ == "__main__":
@@ -346,6 +345,15 @@ if __name__ == "__main__":
         test_prefer_strong_keys_helper()
     finally:
         mp.undo()
+    # caplog 用例用共享替身真实执行：跳过会让日志形态断言在直跑清单上
+    # 零覆盖（假绿）
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_parse_failure_log_is_single_line_and_short(_shim)
+    finally:
+        _shim.close()
     print("\n全部通过")
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
