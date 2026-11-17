@@ -816,6 +816,62 @@ def test_pg_add_chat_messages_waits_out_long_lock():
         memory.close()
 
 
+def test_pg_session_meta_waiters_share_wait_budget():
+    """同一把 session_meta 锁的所有等待方（标题 / 删除最后一轮 / 整会话
+    删除）与写入共用 30s 等锁预算：持锁 4.2s 时各自等待后成功，而不是
+    在连接级 3s 处 503。"""
+    import time
+
+    memory, user_id = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    assert memory.add_chat_turn("问", "答", "s-meta-budget") is True
+    lock_key = f"aligo:session_meta:{user_id}"
+
+    def with_hold(call):
+        holder_memory = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with holder_memory._conn.transaction(), holder_memory._conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,)
+                )
+                locked.set()
+                release.wait(15)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        try:
+            assert locked.wait(10), "持锁线程未拿到 session_meta 锁"
+            threading.Timer(4.2, release.set).start()
+            started = time.monotonic()
+            result = call()
+            elapsed = time.monotonic() - started
+            assert elapsed >= 3.8, f"未按放宽预算等待：{elapsed:.1f}s"
+            return result
+        finally:
+            release.set()
+            holder.join(15)
+            holder_memory.close()
+
+    try:
+        assert with_hold(
+            lambda: memory.set_session_title("s-meta-budget", "标题")
+        ) is True
+        assert with_hold(
+            lambda: memory.delete_last_turn("s-meta-budget", expect="问")
+        ) == 2
+        # 会话已删空：整会话删除无需再删行，但仍须等待锁而不是 3s 失败
+        assert with_hold(
+            lambda: memory.delete_chat_session("s-meta-budget")
+        ) == 0
+        print("✓ PG session_meta 等待方共享 30s 等锁预算")
+    finally:
+        memory.close()
+
+
 def test_pg_delete_all_resets_trip_counters():
     """PG delete_all：行程编号计数器一并删除（重新从 trip_1 开始）。"""
     memory, _ = _pg_memory_or_skip()

@@ -3116,6 +3116,7 @@ def run_user_import_standalone(
                 existing=snapshot,
                 # CLI / Web 导出都固定写 LF，体积轴同口径
                 crlf=False,
+                user_id=user_id,
             )
             if limit_problem:
                 return _fail(
