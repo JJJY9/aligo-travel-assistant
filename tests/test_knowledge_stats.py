@@ -240,7 +240,7 @@ def test_status_reports_unavailable_when_collection_cannot_load(tmp_path):
     assert "无法加载" in status["reason"], status
 
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_status_reports_unavailable_when_collection_cannot_load": "需要 tmp_path 夹具",
 }
 
@@ -270,4 +270,6 @@ if __name__ == "__main__":
         print(f"✓ 本地知识库：{status['documents']} 片段")
     else:
         print(f"（本地知识库不可用：{status.get('reason')}）")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

@@ -729,6 +729,93 @@ def test_pg_chat_turn_waits_out_long_import_lock():
         memory.close()
 
 
+def test_pg_chat_turn_waits_out_long_session_meta_lock():
+    """长删除事务持会话元数据锁超过默认 3s 时，单轮写入按事务内放宽的
+    预算等待并成功：等锁预算必须在事务第一把锁之前生效。"""
+    import time
+
+    memory, user_id = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    holder_memory = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    lock_key = f"aligo:session_meta:{user_id}"
+    holder_locked = threading.Event()
+    allow_commit = threading.Event()
+
+    def hold_lock():
+        with holder_memory._conn.transaction(), holder_memory._conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,)
+            )
+            holder_locked.set()
+            assert allow_commit.wait(15)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert holder_locked.wait(10), "持锁线程未拿到 session_meta 锁"
+        threading.Timer(4.5, allow_commit.set).start()
+        started = time.monotonic()
+        assert memory.add_chat_turn("问", "答", "s-meta-wait") is True
+        elapsed = time.monotonic() - started
+        assert elapsed >= 4.0, f"未按放宽预算等待：{elapsed:.1f}s"
+        assert len(memory.get_chat_history(session_id="s-meta-wait")) == 2
+        print("✓ PG 单轮写入等待长会话元数据锁（超过默认 3s 预算）")
+    finally:
+        allow_commit.set()
+        holder.join(15)
+        holder_memory.close()
+        memory.close()
+
+
+def test_pg_add_chat_messages_waits_out_long_lock():
+    """批量导入与单条 / 单轮共用 30s 等锁预算：长持锁方 4.5s 时导入
+    等待后成功，而不是在连接级 3s 处失败。"""
+    import time
+
+    memory, user_id = _pg_memory_or_skip()
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    holder_memory = PostgresLongTermMemory(user_id, TEST_POSTGRES_DSN)
+    lock_key = f"aligo:chat_messages:{user_id}"
+    holder_locked = threading.Event()
+    allow_commit = threading.Event()
+
+    def hold_lock():
+        with holder_memory._conn.transaction(), holder_memory._conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,)
+            )
+            holder_locked.set()
+            assert allow_commit.wait(15)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert holder_locked.wait(10), "持锁线程未拿到 chat_messages 锁"
+        threading.Timer(4.5, allow_commit.set).start()
+        started = time.monotonic()
+        added = memory.add_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "批量导入等待长锁",
+                    "session_id": "s-batch-wait",
+                }
+            ],
+            dedupe=True,
+        )
+        elapsed = time.monotonic() - started
+        assert added == 1, added
+        assert elapsed >= 4.0, f"未按放宽预算等待：{elapsed:.1f}s"
+        print("✓ PG 批量导入等待长锁（超过默认 3s 预算）")
+    finally:
+        allow_commit.set()
+        holder.join(15)
+        holder_memory.close()
+        memory.close()
+
+
 def test_pg_delete_all_resets_trip_counters():
     """PG delete_all：行程编号计数器一并删除（重新从 trip_1 开始）。"""
     memory, _ = _pg_memory_or_skip()

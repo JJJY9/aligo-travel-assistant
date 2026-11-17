@@ -248,9 +248,7 @@ def test_stats_dispatch(monkeypatch):
     print("✓ dispatch 层 stats 正常执行 / 严格参数")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_stats_archived_counts_only_live_sessions": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_stats_counts_only_visible_preferences": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -276,4 +274,14 @@ if __name__ == "__main__":
         test_stats_dispatch(mp)
     finally:
         mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_stats_archived_counts_only_live_sessions(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_stats_counts_only_visible_preferences(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")

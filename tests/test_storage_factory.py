@@ -1776,6 +1776,8 @@ def test_pg_write_layer_total_caps(monkeypatch):
     assert not any(
         "INSERT INTO aligo_chat_messages" in sql for sql in state["sql"]
     )
+    # 批量导入与单条 / 单轮同一等锁预算（长导入互相排队不能 3s 失败）
+    assert any("SET LOCAL lock_timeout" in sql for sql in state["sql"])
     # 锁序：用户级消息锁必须先于 COUNT（并发写入方在同一把锁上串行化，
     # 否则 READ COMMITTED 下各自通过计数后合计越限）
     lock_ix = [
@@ -4425,15 +4427,16 @@ def test_pg_add_chat_turn_locks_before_guard():
         return True
 
     assert memory.add_chat_turn("问", "答", "s-lock", should_commit=guard) is True
+    # 等锁预算必须是事务内的第一条语句：会话元数据锁的长持有者（大删除
+    # 事务）同样不能在默认 3s 处让整轮问答落库失败
     assert events[0][0] == "execute"
-    assert "pg_advisory_xact_lock(hashtext(%s))" in events[0][1]
-    assert events[0][2] == ("aligo:session_meta:u-order",)
-    assert events[1] == ("guard",), "守卫必须在拿到会话锁之后调用"
-    # 守卫通过后先把本事务的等锁预算放宽（长导入持锁期间单轮写入
-    # 不能在默认 3s 后整轮失败），再取与批量导入共用的消息上限锁
-    # （两把锁固定顺序 session_meta → chat_messages），最后锁内计数
-    assert events[2][0] == "execute"
-    assert "SET LOCAL lock_timeout" in events[2][1]
+    assert "SET LOCAL lock_timeout" in events[0][1]
+    assert events[1][0] == "execute"
+    assert "pg_advisory_xact_lock(hashtext(%s))" in events[1][1]
+    assert events[1][2] == ("aligo:session_meta:u-order",)
+    assert events[2] == ("guard",), "守卫必须在拿到会话锁之后调用"
+    # 守卫通过后取与批量导入共用的消息上限锁（两把锁固定顺序
+    # session_meta → chat_messages），最后锁内计数
     assert events[3][0] == "execute"
     assert "pg_advisory_xact_lock(hashtext(%s))" in events[3][1]
     assert events[3][2] == ("aligo:chat_messages:u-order",)
@@ -4455,7 +4458,7 @@ def test_pg_add_chat_turn_locks_before_guard():
         )
         is False
     )
-    assert [event[0] for event in events] == ["execute", "guard"]
+    assert [event[0] for event in events] == ["execute", "execute", "guard"]
     print("✓ PG add_chat_turn 先锁会话元数据、再守卫、再写入")
 
 

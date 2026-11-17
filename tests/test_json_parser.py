@@ -312,7 +312,7 @@ def test_parse_failure_log_is_single_line_and_short(caplog):
     print("✓ 解析失败日志单行且截断")
 
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_parse_failure_log_is_single_line_and_short": "需要 caplog 夹具",
 }
 
@@ -347,3 +347,5 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     print("\n全部通过")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

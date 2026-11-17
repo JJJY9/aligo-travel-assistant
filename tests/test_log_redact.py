@@ -146,7 +146,7 @@ def test_redaction_keeps_url_after_spacey_cjk_path():
     assert "<路径>" in cleaned and "Connection refused" in cleaned
     print("✓ 路径后的 URL 仍被整体遮蔽")
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_preference_and_title_values_not_logged": "需要 caplog 夹具",
 }
 
@@ -164,3 +164,5 @@ if __name__ == "__main__":
     test_redact_local_paths_covers_paths_with_spaces()
     test_redaction_keeps_url_after_spacey_cjk_path()
     print("caplog 用例需 pytest 运行")
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

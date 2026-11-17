@@ -666,11 +666,7 @@ def test_discard_created_library_handles_directory_db(tmp_path):
     assert not target.exists(), "目录形态的数据库文件应被整体删除"
     print("✓ 目录形态的 milvus_lite.db 被正确清理")
 
-_DIRECT_RUN_SKIP = {
-    "test_collect_preserved_drops_huge_parts_declaration": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_collect_preserved_missing_db_is_empty": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_collect_preserved_uses_explicit_source_dir": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_embedding_dim_unreadable_does_not_drop_collection": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_target_follows_runtime_when_skills_dir_overridden": "需要 tmp_path 夹具",
 }
 
@@ -704,4 +700,26 @@ if __name__ == "__main__":
     test_multi_chunk_documents_carry_group_metadata()
     test_batch_by_group_keeps_groups_together()
     test_add_in_batches_retries_and_reports(pytest.MonkeyPatch())
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_collect_preserved_drops_huge_parts_declaration(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_collect_preserved_missing_db_is_empty(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_collect_preserved_uses_explicit_source_dir(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_embedding_dim_unreadable_does_not_drop_collection(_mp)
+    finally:
+        _mp.undo()
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

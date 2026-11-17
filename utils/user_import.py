@@ -672,6 +672,20 @@ def merged_backup_limit_problem(
     for axis, message in problems:
         if axis not in baseline_axes:
             return message
+    # 默认导出（不含知识库）的体积轴独立复核：知识库只进带知识库的全量
+    # 导出，不能抬高用户数据轴的基线把用户数据增长一并豁免——否则恢复
+    # 可以把「默认导出」推过 50 MB 而 with_knowledge 基线掩盖了它
+    user_payload = dict(payload)
+    user_payload["knowledge"] = []
+    user_baseline_axes = {
+        axis
+        for axis, _message in _limit_problems(
+            _export_shape_baseline(existing, []), crlf=crlf
+        )
+    }
+    for axis, message in _limit_problems(user_payload, crlf=crlf):
+        if axis not in user_baseline_axes:
+            return message
     # 知识库体积轴独立复核：size 轴与用户数据共享，账号自身在 size 轴
     # 已超限时上面的按轴豁免会连带放过知识增量。这里按「全局知识库
     # 单独导出」判定，只在库自身已超限时豁免——其它轴不连带。
@@ -1613,14 +1627,21 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
             plan = import_documents(
                 knowledge_rows, dry_run=True, return_pieces=True
             )
+            # 与写层同一判定：快速判重（内容齐全且分片顺序一致）会跳过
+            # 嵌入模型；其它路径（含顺序重排、集合缺失）都会加载模型，
+            # 预览按 needs_model 决定是否探测。旧计划接口无该字段时
+            # 退回「确有新增才需要模型」的保守近似
+            needs_model = plan.get("needs_model")
+            if needs_model is None:
+                needs_model = int(plan.get("would_import") or 0) > 0
+            if needs_model:
+                _knowledge_ready_probe()
+            # 计数在探测之后回填：探测失败时真实导入一条未写，预览也
+            # 不应给出「将新增 N 条」的乐观计数
             result["knowledge_imported"] = int(
                 plan.get("would_import") or 0
             )
             result["knowledge_skipped"] = int(plan.get("skipped") or 0)
-            # 与写层同一判定：全部内容已存在时真实导入走快速判重、
-            # 不加载嵌入模型；只有确有新增分片才需要模型可用
-            if int(plan.get("would_import") or 0) > 0:
-                _knowledge_ready_probe()
         except FileNotFoundError:
             result["knowledge_error"] = (
                 "知识库未初始化（先运行初始化脚本再恢复知识片段）"

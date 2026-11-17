@@ -448,10 +448,7 @@ def test_rate_window_non_positive_is_clamped():
     print("✓ 非法限流窗口按下限 1 秒钳制")
 
 
-_DIRECT_RUN_SKIP = {
-    "test_probe_is_throttled_per_second": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_probe_recovers_idle_bucket_after_cooldown": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_redis_limiter_recovers_after_cooldown": "暂未纳入直跑清单（pytest 覆盖）",
+_DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
 if __name__ == "__main__":
@@ -460,6 +457,7 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
+    import pytest
     test_window_and_keys()
     test_reset()
     test_key_eviction_bounds_memory()
@@ -476,4 +474,19 @@ if __name__ == "__main__":
     test_redis_factory_failure_degrades_then_reset_without_client()
     test_redis_cooldown_short_circuit_and_scan_failure()
     test_rate_window_non_positive_is_clamped()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_probe_is_throttled_per_second(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_probe_recovers_idle_bucket_after_cooldown(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_redis_limiter_recovers_after_cooldown(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")

@@ -200,7 +200,7 @@ def test_cli_id_validation_matches_web():
     print("✓ CLI 用户 / 会话 ID 校验与 Web 对齐")
 
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_trips_import_flags_are_case_insensitive": "需要 capsys 夹具",
     "test_dispatch_usage_errors_respect_json": "需要 capsys 夹具",
 }
@@ -223,4 +223,6 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     test_cli_id_validation_matches_web()
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

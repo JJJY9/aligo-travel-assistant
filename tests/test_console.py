@@ -564,18 +564,8 @@ def test_configure_stdio_isatty_error_and_wrap_failure(monkeypatch):
     print("✓ configure_stdio isatty 异常与包装失败")
 
 
-_DIRECT_RUN_SKIP = {
+_DIRECT_RUN_SKIP: dict[str, str] = {
     "test_auto_decode_input_textio_properties": "需要 tmp_path 夹具",
-    "test_auto_decode_nul_and_bomless_utf16le": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_auto_decode_peek_failure_uses_auto_mode": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_configure_stdio_isatty_error_and_wrap_failure": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_pipe_safe_textio_delegates_metadata": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_read_merges_pending_line": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_read_size_does_not_read_to_eof": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_read_size_truncation_keeps_remainder_utf16": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_reconfigure_failure_is_swallowed": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_stdin_fallback_prefers_locale_under_pythonutf8": "暂未纳入直跑清单（pytest 覆盖）",
-    "test_utf16_readline_uses_single_chunk_reads": "暂未纳入直跑清单（pytest 覆盖）",
 }
 
 if __name__ == "__main__":
@@ -603,4 +593,28 @@ if __name__ == "__main__":
         test_non_tty_pipe_is_wrapped(mp)
     finally:
         mp.undo()
+    test_auto_decode_nul_and_bomless_utf16le()
+    test_auto_decode_peek_failure_uses_auto_mode()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_configure_stdio_isatty_error_and_wrap_failure(_mp)
+    finally:
+        _mp.undo()
+    test_pipe_safe_textio_delegates_metadata()
+    test_read_merges_pending_line()
+    test_read_size_does_not_read_to_eof()
+    test_read_size_truncation_keeps_remainder_utf16()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_reconfigure_failure_is_swallowed(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_stdin_fallback_prefers_locale_under_pythonutf8(_mp)
+    finally:
+        _mp.undo()
+    test_utf16_readline_uses_single_chunk_reads()
+    if _DIRECT_RUN_SKIP:
+        print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")
