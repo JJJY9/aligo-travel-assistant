@@ -10,6 +10,7 @@
 写入（单次存储层写锁 / 单事务）并按时间戳并入全局历史位置；提问已在目标
 库中的轮次跳过备份里的回答（本地优先，见 :mod:`utils.chat_import`）。
 """
+import contextlib
 import json
 import logging
 import math
@@ -19,7 +20,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.chat_import import filter_import_messages, prepare_import_messages
-from utils.errors import MemoryPersistenceError
+from utils.errors import ImportVolumeError, MemoryPersistenceError
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
@@ -1287,6 +1288,14 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         ):
             errors.append(f"跳过第 {index} 个偏好：键名非法")
             continue
+        if name == "preferences":
+            # 保留类型：存储层加载时把该类型的列表值展开成独立偏好类型
+            # （并丢弃 / 覆盖同名条目），恢复后类型数可远超上限、账号
+            # 永久无法导出；与 Web PUT / CLI pref-set 的拒绝口径一致
+            errors.append(
+                f"跳过第 {index} 个偏好：preferences 是保留的偏好类型"
+            )
+            continue
         problem = _text_problem(name) or _bad_text_in_value(value)
         if problem:
             errors.append(f"跳过第 {index} 个偏好：{problem}")
@@ -2004,6 +2013,36 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
                     )
 
 
+@contextlib.contextmanager
+def _import_exclusion(store: Any):
+    """导入写入的跨进程互斥（JSON 数据目录文件锁 / PG 用户级 advisory 锁）。
+
+    锁文件与数据锁分离（``<db>.import.lock``）：嵌套同一把文件锁会自锁。
+    持锁期间另一个导入（CLI / Web / 其它进程）不能插入——两次并发导入
+    各自在锁外通过体积复核后先后写入，合计越限会让账号此后永久无法
+    导出。拿不到锁按可重试的持久化失败上报（导入幂等，稍后重试安全）。
+    """
+    db_path = getattr(store, "db_path", None)
+    advisory = getattr(store, "_advisory_lock", None)
+    user_id = str(getattr(store, "user_id", "") or "")
+    if isinstance(db_path, str) and db_path:
+        from utils.file_lock import file_lock
+
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(file_lock(f"{db_path}.import"))
+            except TimeoutError as exc:
+                raise MemoryPersistenceError(
+                    f"另一个导入正在进行，请稍后重试：{exc}"
+                ) from exc
+            yield
+    elif callable(advisory):
+        with advisory(f"aligo-import!{user_id}"):
+            yield
+    else:
+        yield
+
+
 def import_user_data(
     store: Any, sections: dict[str, Any], *, knowledge_unverified: str = ""
 ) -> dict[str, Any]:
@@ -2015,7 +2054,40 @@ def import_user_data(
     ``knowledge_error``，绝不把全局知识库无上限写下去（推过导出上限后
     所有用户的带知识库导出永久 413）。用户数据恢复不受影响，重跑可
     补齐知识片段（导入幂等）。
+
+    写入全程持有跨进程导入互斥锁，并在锁内重取快照重跑合并体积复核：
+    锁外预检挡不住两个并发导入各自通过后合计越限（此后导出永久 413）。
     """
+    # 存量 + 本备份不能越过导出上限：否则恢复后 /api/export 与 CLI
+    # user-export 永久 413 / 中止，该账号再也导不出备份（上限要避免的正是
+    # 这种不可恢复状态）。重复行按去重语义不计入新增，见 _enforce_import_limits
+    _enforce_import_limits(store, sections)
+    with _import_exclusion(store):
+        return _import_user_data_locked(store, sections, knowledge_unverified)
+
+
+def _import_user_data_locked(
+    store: Any, sections: dict[str, Any], knowledge_unverified: str
+) -> dict[str, Any]:
+    """导入互斥锁内的实际写入（含锁内体积复核）。"""
+    # 锁内重取快照并重跑合并体积复核：另一个导入可能已在本次锁外预检
+    # 之后写入，合计体积越限会让账号此后永久无法导出全量备份。体积按
+    # 导出落盘的 LF 口径（CLI / Web 导出都写 LF，与调用方预检一致）
+    late_unverified: dict[str, str] = {}
+    late_problem = merged_backup_limit_problem(
+        store,
+        sections,
+        crlf=False,
+        knowledge_unverified=late_unverified,
+    )
+    if late_problem:
+        raise ImportVolumeError(
+            f"恢复中止：{late_problem}（恢复后账号将无法再导出全量备份）"
+        )
+    if late_unverified and sections.get("knowledge"):
+        knowledge_unverified = late_unverified.get(
+            "reason", knowledge_unverified
+        )
     result: dict[str, Any] = {
         "preferences": 0,
         "trips_created": 0,
@@ -2028,11 +2100,6 @@ def import_user_data(
         "knowledge_imported": 0,
         "knowledge_skipped": 0,
     }
-
-    # 存量 + 本备份不能越过导出上限：否则恢复后 /api/export 与 CLI
-    # user-export 永久 413 / 中止，该账号再也导不出备份（上限要避免的正是
-    # 这种不可恢复状态）。重复行按去重语义不计入新增，见 _enforce_import_limits
-    _enforce_import_limits(store, sections)
 
     for key, value in sections.get("preferences", {}).items():
         store.save_preference(key, value)

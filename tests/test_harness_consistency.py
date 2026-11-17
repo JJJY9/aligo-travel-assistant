@@ -255,6 +255,72 @@ def test_case_loops_do_not_call_tests_after_undo():
     print("✓ case 循环内不重复调用用例")
 
 
+def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
+    """分析 ``__main__`` 块里「复用已撤销 MonkeyPatch」问题。
+
+    补丁变量名不限于 ``mp``（``_mp`` / ``mp2`` 等同理）：凡是从
+    ``*.MonkeyPatch()`` 赋值的名字都按同一状态机跟踪。"""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    problems: list[str] = []
+    block = _find_main_block(tree)
+    if block is None:
+        return problems
+    events: list[tuple[int, str, str]] = []
+    patch_vars: set[str] = set()
+    for node in ast.walk(block):
+        lineno = int(getattr(node, "lineno", 0))
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            value = node.value
+        if (
+            target is not None
+            and isinstance(target, ast.Name)
+            and value is not None
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "MonkeyPatch"
+        ):
+            patch_vars.add(target.id)
+            events.append((lineno, "new", target.id))
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "undo"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in patch_vars
+        ):
+            events.append((node.lineno, "undo", func.value.id))
+        elif isinstance(func, ast.Name) and func.id.startswith("test_"):
+            arg_values: list[ast.expr] = list(node.args) + [
+                keyword.value for keyword in node.keywords
+            ]
+            for arg in arg_values:
+                if isinstance(arg, ast.Name) and arg.id in patch_vars:
+                    events.append((node.lineno, f"call:{func.id}", arg.id))
+    events.sort()
+    states: dict[str, str] = {var: "none" for var in patch_vars}
+    for lineno, kind, var in events:
+        if kind in ("new", "undo"):
+            states[var] = kind
+        elif kind.startswith("call:") and states.get(var) != "new":
+            problems.append(
+                f"{name}:{lineno} {kind[5:]} 复用了已撤销的 "
+                f"MonkeyPatch（{var}）"
+            )
+    return problems
+
+
 def test_main_blocks_do_not_reuse_undone_monkeypatch():
     """__main__ 里 `test_x(mp)` 之前必须有一个晚于最近一次
     `mp.undo()` 的 `mp = pytest.MonkeyPatch()`：复用已撤销的补丁实例
@@ -262,56 +328,53 @@ def test_main_blocks_do_not_reuse_undone_monkeypatch():
     problems: list[str] = []
     for path in sorted(TESTS_DIR.glob("test_*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError):
+            source = path.read_text(encoding="utf-8")
+        except OSError:
             continue
-        block = _find_main_block(tree)
-        if block is None:
-            continue
-        events: list[tuple[int, str]] = []
-        for node in ast.walk(block):
-            if isinstance(node, ast.Assign):
-                if (
-                    len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and node.targets[0].id == "mp"
-                ):
-                    value = node.value
-                    if (
-                        isinstance(value, ast.Call)
-                        and isinstance(value.func, ast.Attribute)
-                        and value.func.attr == "MonkeyPatch"
-                    ):
-                        events.append((node.lineno, "new"))
-            elif isinstance(node, ast.Call):
-                func = node.func
-                if (
-                    isinstance(func, ast.Attribute)
-                    and func.attr == "undo"
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "mp"
-                ):
-                    events.append((node.lineno, "undo"))
-                elif (
-                    isinstance(func, ast.Name)
-                    and func.id.startswith("test_")
-                    and any(
-                        isinstance(arg, ast.Name) and arg.id == "mp"
-                        for arg in node.args
-                    )
-                ):
-                    events.append((node.lineno, f"call:{func.id}"))
-        events.sort()
-        state = "none"
-        for lineno, kind in events:
-            if kind in ("new", "undo"):
-                state = kind
-            elif kind.startswith("call:") and state != "new":
-                problems.append(
-                    f"{path.name}:{lineno} {kind[5:]} 复用了已撤销的 MonkeyPatch"
-                )
+        problems.extend(_monkeypatch_reuse_problems(source, path.name))
     assert not problems, chr(10).join(problems)
     print("✓ __main__ 不复用已撤销的 MonkeyPatch")
+
+
+def test_monkeypatch_reuse_check_covers_renamed_vars():
+    """自检不能只认变量名 ``mp``：``_mp`` / ``mp2`` 的复用同样要检出，
+    重新创建后再调用不算复用（内联新建的实例天然安全）。"""
+    reused = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    _mp = pytest.MonkeyPatch()\n"
+        "    try:\n"
+        "        test_a(_mp)\n"
+        "    finally:\n"
+        "        _mp.undo()\n"
+        "    test_a(_mp)\n"
+    )
+    problems = _monkeypatch_reuse_problems(reused, "synthetic.py")
+    assert problems and "_mp" in problems[0], problems
+
+    recreated = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp2 = pytest.MonkeyPatch()\n"
+        "    try:\n"
+        "        test_a(mp2)\n"
+        "    finally:\n"
+        "        mp2.undo()\n"
+        "    mp2 = pytest.MonkeyPatch()\n"
+        "    try:\n"
+        "        test_a(mp2)\n"
+        "    finally:\n"
+        "        mp2.undo()\n"
+    )
+    assert _monkeypatch_reuse_problems(recreated, "synthetic.py") == []
+
+    inline = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    test_a(pytest.MonkeyPatch())\n"
+    )
+    assert _monkeypatch_reuse_problems(inline, "synthetic.py") == []
+    print("✓ MonkeyPatch 复用自检覆盖任意变量名")
 
 
 def test_direct_run_files_install_tmp_registry():
@@ -354,5 +417,6 @@ if __name__ == "__main__":
     test_manual_lists_cover_all_tests()
     test_case_loops_do_not_call_tests_after_undo()
     test_main_blocks_do_not_reuse_undone_monkeypatch()
+    test_monkeypatch_reuse_check_covers_renamed_vars()
     test_direct_run_files_install_tmp_registry()
     print("\n全部通过")

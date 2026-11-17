@@ -853,6 +853,14 @@ def test_import_restores_archived_and_reports_generic_knowledge_error(monkeypatc
     try:
 
         def boom(documents, dry_run=False, *, return_pieces=False):
+            if dry_run:
+                # 锁内复核的规划照常成功（失败的是真实写入）
+                return {
+                    "imported": 0,
+                    "skipped": 0,
+                    "would_import": len(documents),
+                    "pieces": list(documents),
+                }
             raise RuntimeError("milvus down")
 
         monkeypatch.setattr(admin_module, "import_documents", boom)
@@ -3346,6 +3354,70 @@ def test_merged_and_sections_payload_use_real_user_id(monkeypatch):
     print("✓ 合并 / 预检 payload 使用真实 user_id")
 
 
+def test_import_rechecks_volume_under_import_lock(monkeypatch):
+    """锁外预检挡不住并发导入：锁内重取快照后的合并复核必须拒绝并
+    零写入（两次导入各自通过预检后合计越限会让账号永久无法导出）。"""
+    from utils import user_import as module
+
+    store = LongTermMemory("u-race", tempfile.mkdtemp())
+    store.save_preference("home_location", "北京")
+    sections = {
+        "messages": [
+            {"role": "user", "content": "n" * 400, "session_id": f"t{i}"}
+            for i in range(10)
+        ]
+    }
+    other_import = {
+        "chat_history": [
+            {"role": "user", "content": "x" * 400, "session_id": f"s{i}"}
+            for i in range(10)
+        ],
+        "trip_history": [],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    real_snapshot = module._store_export_snapshot
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 7000)
+    # 模拟另一个导入已在本次锁外预检之后写入
+    monkeypatch.setattr(
+        module, "_store_export_snapshot", lambda store_obj: dict(other_import)
+    )
+    with pytest.raises(module.ImportVolumeError):
+        module.import_user_data(store, sections)
+    assert store.get_chat_history() == []
+    assert store.get_preference("home_location") == "北京"
+
+    # 没有并发导入时同一份备份通过锁内复核并写入（导入幂等，重试安全）
+    monkeypatch.setattr(module, "_store_export_snapshot", real_snapshot)
+    counts = module.import_user_data(store, sections)
+    assert counts["messages_added"] == 10, counts
+    print("✓ 锁内体积复核拒绝并发导入合计越限")
+
+
+def test_parse_rejects_reserved_preferences_pref_type():
+    """「preferences」是保留偏好类型：存储层加载时把该类型的列表值
+    展开成独立类型（并覆盖同名条目），恢复后类型数可远超上限；解析
+    直接拒绝，与 Web PUT / CLI pref-set 同口径。"""
+    payload = {
+        "preferences": {
+            "preferences": [
+                {"type": f"x{i}", "value": f"v{i}"} for i in range(250)
+            ],
+            "home_location": "北京",
+        }
+    }
+    sections, errors = parse_user_export(
+        json.dumps(payload, ensure_ascii=False)
+    )
+    assert sections["preferences"] == {"home_location": "北京"}, sections
+    assert any("保留的偏好类型" in item for item in errors), errors
+    print("✓ 导入拒绝保留偏好类型 preferences")
+
+
 def test_existing_knowledge_rows_tolerates_missing_collection(
     monkeypatch, tmp_path
 ):
@@ -4008,6 +4080,8 @@ def test_cli_import_uses_file_newline_for_size_axis(monkeypatch):
         assert code == 0, out
         assert captured == [
             ("sections", False),
+            ("merged", False),
+            # 导入层在互斥锁内再复核一次（同为 LF 口径）
             ("merged", False),
         ], captured
     print("✓ CLI 导入体积轴固定 LF（与导出口径一致）")
@@ -4673,6 +4747,14 @@ def test_import_knowledge_error_redacts_paths(monkeypatch):
     from utils import knowledge_admin as knowledge_module
 
     def boom(documents, dry_run=False, *, return_pieces=False):
+        if dry_run:
+            # 锁内复核的规划照常成功（失败的是真实写入）
+            return {
+                "imported": 0,
+                "skipped": 0,
+                "would_import": len(documents),
+                "pieces": list(documents),
+            }
         raise RuntimeError(
             "加载失败: C:\\Users\\alice\\.cache\\model 与 "
             "https://huggingface.co/BAAI/bge (Connection refused)"

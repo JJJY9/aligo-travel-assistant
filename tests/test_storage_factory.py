@@ -1534,7 +1534,7 @@ def test_pg_preference_snapshot_writes_abort_on_reconnect():
 
     with pytest.raises(MemoryPersistenceError) as info:
         memory.save_preference(
-            "home_location", "北京", replay_safe=False, expected_generation=0
+            "home_location", "北京", expected_generation=0
         )
     assert "重试" in str(info.value), str(info.value)
     assert not any(
@@ -1555,7 +1555,7 @@ def test_pg_preference_snapshot_writes_abort_on_reconnect():
     memory._enforce_preference_cap = cap_only_reconnect
     with pytest.raises(MemoryPersistenceError):
         memory.save_preference(
-            "home_location", "杭州", replay_safe=False, expected_generation=0
+            "home_location", "杭州", expected_generation=0
         )
     assert entered["cap"] is True
     assert not any(
@@ -1570,6 +1570,51 @@ def test_pg_preference_snapshot_writes_abort_on_reconnect():
         "INSERT INTO aligo_preferences" in sql for sql in recorded
     )
     print("✓ PG 偏好只对快照派生写按代次中止（锁期 / 复核期）")
+
+
+def test_pg_save_preference_never_replays():
+    """偏好 UPSERT 一律禁止重放（并发删除 + 补位会让重放变成未经上限
+    复核的新增行）：方法不再暴露会被静默忽略的 replay_safe 形参，两条
+    写入路径都以 replay_safe=False 执行。"""
+    import contextlib
+    import inspect
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    params = inspect.signature(
+        PostgresLongTermMemory.save_preference
+    ).parameters
+    assert "replay_safe" not in params, params
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-pref-replay"
+    memory._json = lambda value: value
+    recorded: list[bool] = []
+    memory._execute = (
+        lambda sql, params=None, replay_safe=True: recorded.append(replay_safe)
+    )
+    memory._preference_lock = lambda pref_type: contextlib.nullcontext()
+    memory._preference_cap_lock = lambda: contextlib.nullcontext()
+
+    memory._enforce_preference_cap = lambda pref_type: True
+    memory.save_preference("home_location", "北京")
+    memory._enforce_preference_cap = lambda pref_type: False
+    memory.save_preference("home_location", "上海")
+    assert recorded == [False, False], recorded
+
+    # 非幂等写入遇到连接错误不重连重放
+    memory._retry_errors = (OSError,)
+    calls: list[int] = []
+
+    def op() -> None:
+        calls.append(1)
+        raise OSError("lost after commit")
+
+    with pytest.raises(MemoryPersistenceError):
+        memory._run_with_retry(op, replay_safe=False)
+    assert calls == [1]
+    print("✓ PG 偏好写入一律禁重放，形参不再被静默忽略")
 
 
 def test_pg_append_preference_aborts_when_save_lock_reconnects():
@@ -4386,7 +4431,7 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     memory._enforce_preference_cap = lambda pref_type: False
     memory._json = lambda value: '{"v": 1}'
     memory.save_preference("home_location", "北京")
-    memory.save_preference("home_location", "上海", replay_safe=True)
+    memory.save_preference("home_location", "上海")
     pref_inserts = [
         (sql, flag)
         for sql, flag in recorded
@@ -4394,7 +4439,7 @@ def test_pg_non_idempotent_call_sites_disable_replay():
     ]
     assert len(pref_inserts) == 2, pref_inserts
     assert all(flag is False for _, flag in pref_inserts), (
-        "偏好 INSERT 一律禁止重放（显式 replay_safe=True 也不例外）"
+        "偏好 UPSERT 一律禁止重放（形参已移除，无法显式放行）"
     )
     print("✓ PG 非幂等写路径全部禁止自动重放")
 

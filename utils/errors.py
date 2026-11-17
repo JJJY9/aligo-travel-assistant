@@ -27,6 +27,16 @@ class PartialImportError(MemoryPersistenceError):
         self.updated = updated
 
 
+class ImportVolumeError(ValueError):
+    """导入写入前的锁内体积复核拒绝。
+
+    预检在锁外、写入在锁内：两次并发导入各自通过复核后先后写入，合计
+    越限会让账号此后永久无法导出全量备份。写入前在导入互斥锁内重取快照
+    并重跑合并体积复核，超限时抛本异常（ValueError 子类：这是用户可
+    修正的数据问题，Web 映射 413、CLI 直接展示原因，而不是可重试 503）。
+    """
+
+
 class UserFacingError(RuntimeError):
     """消息本身就是给用户看的提示（固定文案，不含内部异常细节）。
 

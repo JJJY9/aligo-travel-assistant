@@ -553,15 +553,15 @@ class PostgresLongTermMemory:
         pref_type: str,
         value: Any,
         *,
-        replay_safe: bool = True,
         expected_generation: int | None = None,
     ) -> None:
         """写入偏好。类型上限在用户级写锁内复核：调用方锁外预检与按类型
         的锁都挡不住不同新类型的并发新增。
 
-        偏好 INSERT 一律禁止重放——连接重建会释放用户级锁，空档里其它
-        实例可能把类型数补到上限（新类型）或删除该类型使其重放变成新增
-        行（既有类型），都会越过上面的上限复核。
+        偏好 UPSERT 一律禁止重放——连接重建会释放用户级锁，空档里其它
+        实例可能把类型数补到上限；即便本次是既有类型，也可能在空档里被
+        删除后重放成新增行（或删除 + 其它实例补位后再插入），都会越过
+        上面的上限复核。
 
         ``expected_generation``（append_preference 的「读-合并-写」传读取
         前的连接代次）要求写入期间连接未重建：合并值基于重连前的快照，
@@ -581,27 +581,27 @@ class PostgresLongTermMemory:
                     DO UPDATE SET value = EXCLUDED.value, updated_at = now()
                     """,
                     (self.user_id, pref_type, self._json(value)),
-                    # 偏好 INSERT 一律禁止重放：连接重建会释放用户级锁，
-                    # 空档里其它实例可能把类型数补到上限（新类型）或删除
-                    # 该类型使其重放变成新增行（既有类型），都会越过复核
+                    # 偏好 UPSERT 一律禁止重放：重连空档里类型可能被删 / 被
+                    # 补位，重放会变成未经过上限复核的新增行
                     replay_safe=False,
                 )
 
-    def _enforce_preference_cap(self, pref_type: str) -> bool:
+    def _enforce_preference_cap(self, pref_type: str) -> None:
         """新建偏好类型前复核类型数上限（用户级写锁内，跨类型并发安全）。
 
-        返回是否为新类型：新类型的 INSERT 不允许重放（重连空档里其它实例
-        可能已把类型数补到上限），既有类型的 UPSERT 可安全重试。"""
+        调用方的 INSERT 一律禁止重放：既有类型也可能在重连空档被删除，
+        重放会成为未经过上限复核的新增行，所以这里没有「可安全重试」
+        的返回值。"""
         try:
             from utils.user_import import _MAX_PREFERENCES
         except Exception:  # noqa: BLE001 - 依赖缺失时按无上限
-            return False
+            return
         row = self._fetchone(
             "SELECT 1 FROM aligo_preferences WHERE user_id = %s AND pref_type = %s",
             (self.user_id, pref_type),
         )
         if row is not None:
-            return False
+            return
         count_row = self._fetchone(
             "SELECT COUNT(*) FROM aligo_preferences WHERE user_id = %s",
             (self.user_id,),
@@ -613,7 +613,6 @@ class PostgresLongTermMemory:
             raise ValueError(
                 f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除不用的偏好"
             )
-        return True
 
     def get_preference(self, pref_type: str | None = None) -> Any:
         if pref_type is None:
@@ -660,12 +659,10 @@ class PostgresLongTermMemory:
             # 已追加同类型偏好，按旧值合并会覆盖别人的更新
             self._abort_if_generation_changed(generation)
             merged = merge_preference_value(current, value)
-            # UPSERT 禁止重放；写入全程（含 save 内再次加锁）的连接代次
-            # 必须与读取时一致
+            # 写入全程（含 save 内再次加锁）的连接代次必须与读取时一致
             self.save_preference(
                 pref_type,
                 merged,
-                replay_safe=False,
                 expected_generation=generation,
             )
             return merged
@@ -687,7 +684,6 @@ class PostgresLongTermMemory:
             self.save_preference(
                 pref_type,
                 values,
-                replay_safe=False,
                 expected_generation=generation,
             )
 
