@@ -3494,6 +3494,64 @@ def test_import_user_data_survives_knowledge_outage(monkeypatch):
     print("✓ 知识库忙时用户数据照常恢复（知识段跳过并上报）")
 
 
+def test_probe_embedding_model_path_fallback(monkeypatch):
+    """预览探针的模型路径解析与技能侧同口径：默认本地模型缺失 → BAAI
+    HF ID；显式配置的其它本地路径缺失报错；本地存在时用解析后路径；
+    维度不可读报错。"""
+    import config
+    from agents.rag_knowledge_agent import RAGKnowledgeAgent
+    from pathlib import Path
+    from utils import embedding_model as em
+    from utils import user_import as module
+
+    calls: list[str] = []
+    # 切到空的临时目录：默认相对模型路径在仓库根下存在，不切目录会走
+    # 「本地存在」分支（本用例要模拟默认模型未下载的部署）
+    monkeypatch.chdir(tempfile.mkdtemp())
+    monkeypatch.setitem(
+        config.RAG_CONFIG, "embedding_model", "data/models/bge-small-zh-v1.5"
+    )
+    monkeypatch.setattr(
+        RAGKnowledgeAgent,
+        "_model_path_candidates",
+        staticmethod(lambda path_obj: []),
+    )
+    monkeypatch.setattr(
+        RAGKnowledgeAgent,
+        "_looks_like_filesystem_path",
+        staticmethod(lambda value: True),
+    )
+    monkeypatch.setattr(
+        em, "get_embedding_model", lambda path: calls.append(path) or object()
+    )
+    monkeypatch.setattr(em, "embedding_dimension", lambda model: 512)
+    module._probe_embedding_model()
+    assert calls == ["BAAI/bge-small-zh-v1.5"], calls
+
+    # 显式配置的其它本地路径缺失：报错且不加载任何模型
+    calls.clear()
+    monkeypatch.setitem(config.RAG_CONFIG, "embedding_model", "./missing-model")
+    with pytest.raises(RuntimeError, match="不存在"):
+        module._probe_embedding_model()
+    assert calls == []
+
+    # 本地模型存在：使用解析后的绝对路径
+    model_dir = Path(tempfile.mkdtemp()) / "model"
+    model_dir.mkdir()
+    monkeypatch.setitem(config.RAG_CONFIG, "embedding_model", str(model_dir))
+    module._probe_embedding_model()
+    assert calls == [str(model_dir.resolve())], calls
+
+    # 维度不可读：报错
+    monkeypatch.setitem(
+        config.RAG_CONFIG, "embedding_model", "data/models/bge-small-zh-v1.5"
+    )
+    monkeypatch.setattr(em, "embedding_dimension", lambda model: None)
+    with pytest.raises(RuntimeError, match="维度"):
+        module._probe_embedding_model()
+    print("✓ 预览探针的模型路径回退与错误分支")
+
+
 def test_preview_dropped_trip_links_mirrors_storage_semantics():
     """合并预演复刻 _resolve_dropped_trip_links 的两条分支：既有链接正是
     被丢弃会话 → 显式 session_id=None；否则去标记、保留既有链接。"""
