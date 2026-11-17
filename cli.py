@@ -3157,6 +3157,7 @@ def run_user_import_standalone(
                     if is_session_deleted(user_id, str(session_id))
                 }
                 removed_total = 0
+                rolled_back_sessions: set[str] = set()
                 for session_id in sorted(late_deleted):
                     try:
                         removed_total += int(
@@ -3168,6 +3169,7 @@ def run_user_import_standalone(
                             f"回滚失败：{exc}"
                         )
                         continue
+                    rolled_back_sessions.add(str(session_id))
                     errors.append(
                         f"会话 {session_id} 在恢复写入期间被删除，"
                         "已回滚其消息"
@@ -3177,6 +3179,21 @@ def run_user_import_standalone(
                         0,
                         int(counts.get("messages_added") or 0) - removed_total,
                     )
+                if rolled_back_sessions:
+                    # delete_chat_session 连同标题 / 置顶 / 归档一起清除：
+                    # 计数同步扣减（与 Web /api/import 同口径），否则
+                    # --json / 文本摘要把已被回滚的会话元数据仍报告为已恢复
+                    for key, section in (
+                        ("titles", sections.get("titles") or {}),
+                        ("pinned", sections.get("pinned") or []),
+                        ("archived", sections.get("archived") or []),
+                    ):
+                        entry_ids = {str(item) for item in section}
+                        counts[key] = max(
+                            0,
+                            int(counts.get(key) or 0)
+                            - len(rolled_back_sessions & entry_ids),
+                        )
         except PartialImportError as exc:
             # 已提交的部分必须如实报告：只说「失败」会让用户以为整份
             # 没导入而换文件 / 丢弃备份，数据停留在半份状态

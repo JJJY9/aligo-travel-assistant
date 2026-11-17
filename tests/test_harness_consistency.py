@@ -12,6 +12,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -207,6 +209,11 @@ def test_manual_lists_cover_all_tests():
             fixture_justified = any(
                 fixture in params
                 for fixture in ("tmp_path", "capsys", "caplog", "request")
+            ) or any(
+                # 原因里点名的夹具参数（如 hermetic_kb_path）同样算具体
+                param in reason
+                for param in params
+                if param != "monkeypatch"
             )
             if fixture_justified or "真实" in reason:
                 continue
@@ -412,6 +419,27 @@ def test_direct_run_kb_fixture_is_isolated():
     print("✓ 直跑 kb_fixture 接入知识库路径隔离")
 
 
+def test_direct_run_kb_isolate_patches_path():
+    """``_direct_run_kb.isolate`` 必须真正把知识库路径指向缺失文件并在
+    ``undo`` 后恢复：只查源码文本的守卫在 helper 失效 / 被改名时仍会
+    全绿，这里直接运行一次确认隔离生效。"""
+    import _direct_run_kb
+
+    from utils import knowledge_admin
+
+    original = knowledge_admin.knowledge_db_path
+    fixture = pytest.MonkeyPatch()
+    try:
+        missing = _direct_run_kb.isolate(fixture)
+        patched = Path(str(knowledge_admin.knowledge_db_path()))
+        assert patched == missing, (patched, missing)
+        assert not patched.exists()
+    finally:
+        fixture.undo()
+    assert knowledge_admin.knowledge_db_path is original
+    print("✓ 直跑知识库隔离 helper 实际生效")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -434,5 +462,6 @@ if __name__ == "__main__":
     test_main_blocks_do_not_reuse_undone_monkeypatch()
     test_monkeypatch_reuse_check_covers_renamed_vars()
     test_direct_run_kb_fixture_is_isolated()
+    test_direct_run_kb_isolate_patches_path()
     test_direct_run_files_install_tmp_registry()
     print("\n全部通过")

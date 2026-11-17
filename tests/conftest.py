@@ -9,8 +9,14 @@ monkeypatch ``utils.user_import._existing_knowledge_rows`` / 知识库规划。
 import pytest
 
 
+@pytest.fixture
+def hermetic_kb_path(tmp_path_factory):
+    """知识库隔离夹具注入的「不存在的库路径」（供回归用例断言相等）。"""
+    return tmp_path_factory.mktemp("hermetic_kb") / "milvus_lite.db"
+
+
 @pytest.fixture(autouse=True)
-def _hermetic_knowledge_library(monkeypatch, tmp_path_factory, request):
+def _hermetic_knowledge_library(monkeypatch, hermetic_kb_path, request):
     from utils import knowledge_admin, user_import
 
     monkeypatch.setattr(
@@ -34,11 +40,10 @@ def _hermetic_knowledge_library(monkeypatch, tmp_path_factory, request):
         and node_path.name == "test_knowledge_admin_integration.py"
     ):
         return
-    missing_db = (
-        tmp_path_factory.mktemp("hermetic_kb") / "milvus_lite.db"
-    )
     monkeypatch.setattr(
-        knowledge_admin, "knowledge_db_path", lambda *args, **kwargs: missing_db
+        knowledge_admin,
+        "knowledge_db_path",
+        lambda *args, **kwargs: hermetic_kb_path,
     )
 
 

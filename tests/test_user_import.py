@@ -1681,7 +1681,10 @@ def test_runner_rolls_back_session_deleted_during_write(monkeypatch):
     payload = {
         "chat_history": [
             {"role": "user", "content": "恢复期间被删", "session_id": "s-late"}
-        ]
+        ],
+        "session_titles": {"s-late": "恢复期间被删"},
+        "pinned_sessions": ["s-late"],
+        "archived_sessions": ["s-late"],
     }
     path = _write_json(payload)
     store = _real_store("u-cli-late")
@@ -1703,6 +1706,11 @@ def test_runner_rolls_back_session_deleted_during_write(monkeypatch):
     result = json.loads(out)
     assert code == 0, out
     assert result["messages_added"] == 0, result
+    # delete_chat_session 连同标题 / 置顶 / 归档一起清除：计数同步扣减
+    # （与 Web /api/import 同口径），不能再报「已恢复」
+    assert result["titles"] == 0, result
+    assert result["pinned"] == 0, result
+    assert result["archived"] == 0, result
     assert any("写入期间被删除" in item for item in result["skipped"]), result
     assert store.get_chat_history(session_id="s-late") == []
     print("✓ CLI 恢复回滚写入期间被删除的会话")
@@ -4467,6 +4475,64 @@ def test_merged_default_export_axis_not_exempted_by_kb(monkeypatch):
     print("✓ 默认导出体积轴不被知识库基线连带豁免")
 
 
+def test_merged_default_export_has_no_synthetic_knowledge_key(monkeypatch):
+    """默认导出的独立复核不能给 payload / 基线注入 knowledge 键（真实
+    默认导出没有该键）：合成键让判定边界整体平移，临近上限时会把
+    基线误判成「已超限」从而豁免本次增长（fail-open）。"""
+    from utils import user_import as module
+
+    payloads: list[dict] = []
+    real_limit_problems = module._limit_problems
+
+    def spy_limit_problems(payload, **kwargs):
+        # 默认导出复核只用 _limit_problems 判定（不经过 backup_limit_problem）
+        payloads.append(dict(payload))
+        return real_limit_problems(payload, **kwargs)
+
+    monkeypatch.setattr(module, "_limit_problems", spy_limit_problems)
+    # 强制进入「主检查有超限 → 按轴豁免 → 默认导出独立复核」分支
+    monkeypatch.setattr(
+        module, "backup_limit_problem", lambda payload, **kwargs: "模拟超限"
+    )
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
+    existing = {
+        "chat_history": [
+            {"role": "user", "content": "m" * 200, "session_id": "s1"}
+        ],
+        "trip_history": [],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+
+    class _Store:
+        user_id = "u1"
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return dict(existing)
+
+    real_baseline_size = module._backup_payload_size(
+        module._export_shape_baseline(
+            existing, [], user_id="u1", include_knowledge=False
+        )
+    )
+    # 上限取「真实默认导出基线 + 10B」：完整基线（含 knowledge 键）越过
+    # 上限 → 主检查按轴豁免；默认导出复核必须拒绝（旧实现给 user
+    # payload / 基线也加合成 knowledge 键 → 基线同样「已超限」→ 豁免
+    # 后返回 None）
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", real_baseline_size + 10)
+    problem = module.merged_backup_limit_problem(_Store(), {})
+    assert problem and "MB" in problem, problem
+    # 调用序：完整基线 / 主（with_knowledge）payload / 默认导出基线 /
+    # 默认导出 payload——主形状带 knowledge 键，默认导出形状不带
+    assert "knowledge" in payloads[1], payloads[1].keys()
+    assert "knowledge" not in payloads[-1], payloads[-1].keys()
+    print("✓ 默认导出复核键集与真实导出一致（无合成 knowledge 键）")
+
+
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
     """知识片段恢复失败不能吞掉「用户数据未恢复」：隔离账号 + 备份只有
     保留字会话消息 + 一条知识片段，导入结果同时带 knowledge_error 与
@@ -4885,6 +4951,11 @@ if __name__ == "__main__":
             skipped += 1
             skipped_names.append(f"{name}（需 pytest 专用夹具）")
             continue
+        # helper 导入必须在兜底 try 之外：_direct_run_kb 缺失 / 隔离装配
+        # 失败要显式中止，不能被「user_import 不可用」的兜底吞掉后
+        # 静默跑真实知识库
+        import _direct_run_kb
+
         kb_fixture: pytest.MonkeyPatch | None = None
         try:
             from utils import user_import as _ui_for_kb
@@ -4897,15 +4968,14 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
-            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
-            # Milvus（与 CI「无库」结论一致）
-            import _direct_run_kb
-
-            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()
             kb_fixture = None
+        else:
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            _direct_run_kb.isolate(kb_fixture)
         storage_snapshot: dict | None = None
         try:
             from config import STORAGE_CONFIG
