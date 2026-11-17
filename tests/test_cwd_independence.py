@@ -63,6 +63,11 @@ def test_memory_path_anchored_to_project_root():
         finally:
             if os.path.exists(memory.db_path):
                 os.remove(memory.db_path)
+            # file_lock 的 <user>.json.lock（单字节）不会随写入释放删除：
+            # 不清理会在仓库 data/memory 里永久残留
+            lock_path = f"{memory.db_path}.lock"
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
     finally:
         os.chdir(old_cwd)
 

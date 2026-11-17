@@ -313,11 +313,20 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     _tmp_registry.install()
 
+    # @requires_llm_key 只对 pytest 收集生效：直跑必须自己守卫
+    if not LLM_CONFIG["api_key"]:
+        print("未配置模型密钥（LLM_API_KEY / config_local），跳过实时模型用例")
+        raise SystemExit(0)
+
     try:
         asyncio.run(test_memory_system())
     except KeyboardInterrupt:
         print("\n\n⚠ 测试被用户中断")
+        raise SystemExit(130) from None
     except Exception as e:
         print(f"\n\n✗ 测试失败: {e}")
         import traceback
         traceback.print_exc()
+        # 直跑是回归清单的一环：失败必须非零退出，否则脚本按退出码
+        # 判断时会给出假绿
+        raise SystemExit(1) from None

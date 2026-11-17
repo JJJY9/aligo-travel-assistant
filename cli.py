@@ -3124,19 +3124,31 @@ def run_user_import_standalone(
                     "（恢复后将无法再导出备份，请先清理或拆分备份文件）"
                 )
             # 备份自身不超限不代表恢复后仍可导出：与账号既有数据合并后按
-            # 导出格式复核体积（与 Web /api/import 同口径；复用同一快照）
+            # 导出格式复核体积（与 Web /api/import 同口径；复用同一快照）。
+            # 知识轴无法核对（现有库读不到 / 规划失败）时本次不写知识段、
+            # 如实上报，绝不放行未核对的全局知识库增长
+            knowledge_unverified: dict[str, str] = {}
             merged_problem = merged_backup_limit_problem(
-                store, sections, existing=snapshot, crlf=False
+                store,
+                sections,
+                existing=snapshot,
+                crlf=False,
+                knowledge_unverified=knowledge_unverified,
             )
             if merged_problem:
                 return _fail(
                     f"恢复中止：{merged_problem}"
                     "（恢复后账号将无法再导出全量备份，请先清理数据或拆分备份）"
                 )
+            knowledge_skip_reason = knowledge_unverified.get("reason", "")
             if dry_run:
-                counts = preview_user_import(store, sections)
+                counts = preview_user_import(
+                    store, sections, knowledge_unverified=knowledge_skip_reason
+                )
             else:
-                counts = import_user_data(store, sections)
+                counts = import_user_data(
+                    store, sections, knowledge_unverified=knowledge_skip_reason
+                )
                 # 写库期间其它实例可能删除某个会话：最后再查一次共享墓碑
                 # 并整会话回滚，避免迟到的删除被恢复写回
                 late_deleted = {

@@ -519,7 +519,7 @@ def test_runner_text_summary_and_knowledge_error(monkeypatch):
         "knowledge_skipped": 0,
     }
     monkeypatch.setattr(
-        import_module, "import_user_data", lambda store, sections: dict(counts)
+        import_module, "import_user_data", lambda store, sections, **kwargs: dict(counts)
     )
     path = _write_json(_export_payload())
     store = _real_store("u-text-summary")
@@ -530,7 +530,7 @@ def test_runner_text_summary_and_knowledge_error(monkeypatch):
 
     counts_err = dict(counts, knowledge_error="知识库未初始化")
     monkeypatch.setattr(
-        import_module, "import_user_data", lambda store, sections: dict(counts_err)
+        import_module, "import_user_data", lambda store, sections, **kwargs: dict(counts_err)
     )
     code, out = _run_import(monkeypatch, "u-text-summary", path, store)
     assert code == 1
@@ -1677,8 +1677,8 @@ def test_runner_rolls_back_session_deleted_during_write(monkeypatch):
     flags = {"late": False}
     original_import = user_import_module.import_user_data
 
-    def import_then_delete(store_obj, sections):
-        counts = original_import(store_obj, sections)
+    def import_then_delete(store_obj, sections, **kwargs):
+        counts = original_import(store_obj, sections, **kwargs)
         flags["late"] = True
         return counts
 
@@ -3198,6 +3198,151 @@ def test_merged_preview_includes_global_knowledge(monkeypatch):
     print("✓ 合并预检知识段与导入规划同源（含恒计入/读失败降级）")
 
 
+def test_merged_knowledge_unverify_reports_reason(monkeypatch):
+    """知识轴不可核对（现有库读不到 / 规划失败）必须经 knowledge_unverified
+    上报：此前跳过知识轴后真实导入仍会无上限写入全局知识库。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+    from utils.errors import MemoryPersistenceError as _MPE
+
+    class _Store:
+        user_id = "u1"
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    # 读取现有知识库失败
+    def boom(*args, **kwargs):
+        raise _MPE("kb busy")
+
+    monkeypatch.setattr(module, "_existing_knowledge_rows", boom)
+    unverified: dict[str, str] = {}
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(),
+            {"knowledge": [{"content": "新"}]},
+            knowledge_unverified=unverified,
+        )
+        is None
+    )
+    assert "不可读" in unverified.get("reason", ""), unverified
+    # 备份不带知识段：没有知识写入，无需上报
+    empty: dict[str, str] = {}
+    module.merged_backup_limit_problem(
+        _Store(), {}, knowledge_unverified=empty
+    )
+    assert empty == {}, empty
+
+    # 规划失败同样不可核对
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
+
+    def plan_boom(*args, **kwargs):
+        raise RuntimeError("milvus down")
+
+    monkeypatch.setattr(kb, "import_documents", plan_boom)
+    unverified = {}
+    module.merged_backup_limit_problem(
+        _Store(),
+        {"knowledge": [{"content": "新"}]},
+        knowledge_unverified=unverified,
+    )
+    assert "规划失败" in unverified.get("reason", ""), unverified
+    print("✓ 知识轴不可核对经 knowledge_unverified 上报")
+
+
+def test_import_and_preview_skip_unverified_knowledge(monkeypatch):
+    """不可核对的知识段：真实导入与预览都跳过知识写入并上报
+    knowledge_error（用户数据照常恢复，重跑可补齐）。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    calls: list[tuple] = []
+
+    def fake_import(documents, dry_run=False, *, return_pieces=False):
+        calls.append((list(documents), dry_run))
+        return {
+            "imported": len(documents),
+            "skipped": 0,
+            "would_import": len(documents),
+            "pieces": list(documents),
+        }
+
+    monkeypatch.setattr(kb, "import_documents", fake_import)
+    sections = {"knowledge": [{"content": "新知识", "metadata": {}}]}
+
+    class _Store:
+        user_id = "u1"
+
+        def get_trip_history(self, limit=None):
+            return []
+
+    reason = "知识库当前不可读，无法核对恢复后的知识体积；本次未恢复知识片段"
+    counts = module.import_user_data(
+        _Store(), sections, knowledge_unverified=reason
+    )
+    assert counts.get("knowledge_error") == reason, counts
+    preview = module.preview_user_import(
+        _Store(), sections, knowledge_unverified=reason
+    )
+    assert preview.get("knowledge_error") == reason, preview
+    assert calls == [], "不可核对时不能写 / 规划知识片段"
+
+    # 无 skip 原因时照常写入（回归：跳过只针对不可核对路径）
+    counts = module.import_user_data(_Store(), sections)
+    assert counts["knowledge_imported"] == 1, counts
+    assert "knowledge_error" not in counts, counts
+    assert calls, calls
+    print("✓ 不可核对的知识段在导入与预览中一致跳过并上报")
+
+
+def test_merged_and_sections_payload_use_real_user_id(monkeypatch):
+    """账号 ID 已知时合并 / 预检 payload 都用真实 ID：256 字节最坏占位
+    会把逼近 50MB 的合法账号重导自身备份误拒 413。"""
+    from utils import user_import as module
+
+    captured: dict[str, dict] = {}
+
+    def fake_limit(payload, **kwargs):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
+
+    class _Store:
+        user_id = "u1"
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    assert module.merged_backup_limit_problem(_Store(), {}) is None
+    assert captured["payload"]["user_id"] == "u1", captured["payload"]
+    assert module.sections_limit_problem({}, user_id="u1") is None
+    assert captured["payload"]["user_id"] == "u1", captured["payload"]
+    # ID 未知（旧调用 / 测试替身）时仍用最坏占位兜底
+    assert module.sections_limit_problem({}) is None
+    assert len(captured["payload"]["user_id"]) == 64
+    print("✓ 合并 / 预检 payload 使用真实 user_id")
+
+
 def test_merged_knowledge_duplicate_backup_not_rejected(monkeypatch):
     """幂等重导自己的一体化备份：规划结果为空分片时知识段只剩现有库，
     不会因「现有 + 备份」双计超过上限。"""
@@ -3699,7 +3844,7 @@ def test_cli_import_reports_partial_commit(monkeypatch):
     from utils import user_import as module
     from utils.errors import PartialImportError
 
-    def boom(store, sections):
+    def boom(store, sections, **kwargs):
         raise PartialImportError("批量保存在第 1 条后失败：db down", 1, 0)
 
     monkeypatch.setattr(module, "import_user_data", boom)

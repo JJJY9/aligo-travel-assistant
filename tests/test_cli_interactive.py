@@ -1182,7 +1182,12 @@ if __name__ == "__main__":
         test_eof_at_user_prompt_exits_cleanly()
         test_eof_at_main_prompt_breaks_loop(_mp)
         test_startup_memory_error_exits_without_traceback(_mp)
-        test_gbk_piped_input_keeps_locale_decoding()
+        # GBK 管道用例带 @skipif(sys.platform != "win32")：标记只对 pytest
+        # 生效，直跑要按平台自己守卫
+        if sys.platform == "win32":
+            test_gbk_piped_input_keeps_locale_decoding()
+        else:
+            print("跳过 GBK 管道用例（仅 Windows）")
         test_utf8_piped_input_not_mojibake()
         test_human_response_escapes_markup()
         test_markup_safe_strips_controls_before_escaping()

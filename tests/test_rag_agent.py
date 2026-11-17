@@ -338,7 +338,14 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
-    asyncio.run(test_rag_agent())
+    # @requires_llm_eval / @requires_llm_key 只是 pytest 收集期标记，
+    # 直跑不会被拦截：实时模型评测默认跳过，显式开启且配置密钥才运行
+    if _runs_llm_eval and LLM_CONFIG["api_key"]:
+        asyncio.run(test_rag_agent())
+    else:
+        print(
+            "已跳过实时模型评测（设 ALIGO_RUN_LLM_EVALS=1 且配置模型密钥后启用）"
+        )
     print("\n测试完成！")
     test_grouped_missing_parts_listing_is_bounded()
     test_rag_query_extraction_falls_back_to_raw_query()

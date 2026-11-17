@@ -203,6 +203,10 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
+    # @requires_llm_key 只对 pytest 收集生效：直跑必须自己守卫
+    if not LLM_CONFIG["api_key"]:
+        print("未配置模型密钥（LLM_API_KEY / config_local），跳过实时模型用例")
+        raise SystemExit(0)
     print("="*70)
     print("意图识别智能体测试")
     print("="*70)

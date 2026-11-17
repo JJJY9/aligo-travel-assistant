@@ -103,9 +103,12 @@ def test_cli_commands_with_postgres(monkeypatch):
 
 def test_postgres_trip_dedupe_empty_end_date():
     """end_date 为空串与 NULL 同为「无返程」：重复保存更新而不是新增。"""
-    memory = PostgresLongTermMemory(
-        f"trips-empty-{uuid.uuid4().hex[:8]}", TEST_POSTGRES_DSN
-    )
+    try:
+        memory = PostgresLongTermMemory(
+            f"trips-empty-{uuid.uuid4().hex[:8]}", TEST_POSTGRES_DSN
+        )
+    except Exception as exc:  # noqa: BLE001 - 测试环境无 PG 时跳过
+        pytest.skip(f"PostgreSQL 不可用: {exc}")
     try:
         first = memory.save_trip_history(
             {
@@ -159,10 +162,24 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
-    mp = pytest.MonkeyPatch()
+    # 模块级 pytestmark=skipif(not TEST_POSTGRES_DSN) 只对 pytest 生效：
+    # 直跑必须自己守卫，否则缺 DSN 时连接本机默认库 / pytest.skip 的
+    # Skipped（BaseException）直接冒泡成 traceback + 退出码 1
+    if not TEST_POSTGRES_DSN:
+        print("未设置 TEST_POSTGRES_DSN，跳过 PostgreSQL 集成用例（请通过 pytest 运行）")
+        raise SystemExit(0)
     try:
-        test_cli_commands_with_postgres(mp)
-    finally:
-        mp.undo()
-    test_postgres_trip_dedupe_empty_end_date()
+        mp = pytest.MonkeyPatch()
+        try:
+            test_cli_commands_with_postgres(mp)
+        finally:
+            mp.undo()
+        test_postgres_trip_dedupe_empty_end_date()
+    except BaseException as exc:  # noqa: BLE001 - Skipped 不是 Exception
+        from _pytest.outcomes import Skipped
+
+        if isinstance(exc, Skipped):
+            print(f"PostgreSQL 不可用，跳过：{exc}")
+            raise SystemExit(0) from None
+        raise
     print("\n全部通过")
