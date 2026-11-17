@@ -1674,8 +1674,15 @@ def import_documents(
                 try:
                     layout_cache["layout"] = _existing_group_layout()
                 except Exception as exc:  # noqa: BLE001 - 扫描失败按无法校验处理
-                    logger.warning("扫描库内分片布局失败（%s）", exc)
-                    layout_cache["layout"] = None
+                    if not _collection_exists():
+                        # 与 existing 快照同一容错：库文件存在但集合缺失
+                        # 时库内布局必为空（写路径会建集后台空布局导入），
+                        # 不能把它当成「扫描失败」让多分片文档在预览里按
+                        # 布局冲突跳过、与真实导入结论相反
+                        layout_cache["layout"] = {}
+                    else:
+                        logger.warning("扫描库内分片布局失败（%s）", exc)
+                        layout_cache["layout"] = None
             return layout_cache["layout"]
 
         def _existing_group_texts() -> set[str] | None:

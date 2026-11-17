@@ -596,6 +596,15 @@ def merged_backup_limit_problem(
     payload.setdefault("user_id", target_user_id or _USER_ID_PLACEHOLDER)
     payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
     payload.setdefault("session_id", "")
+    # 合并 payload 的知识段按「恢复后真正会存在的库内容」计：规划失败时
+    # 本次跳过知识写入（见上），库内容就是已知的现有库——用空列表替换会
+    # 把既有全局库从 with_knowledge 导出体积里抹掉，用户数据增长可把
+    # 导出推过 50MB 而复核放行（此后永久 413）
+    merged_knowledge = (
+        list(knowledge_rows)
+        if knowledge_rows is not None
+        else list(existing_kb or [])
+    )
     payload.update(
         {
             "chat_history": existing_messages
@@ -613,7 +622,7 @@ def merged_backup_limit_problem(
                 ),
             ),
             "preferences": merged_prefs,
-            "knowledge": knowledge_rows or [],
+            "knowledge": merged_knowledge,
             "session_titles": merged_titles,
             "pinned_sessions": sorted(
                 {
@@ -737,7 +746,7 @@ def merged_backup_limit_problem(
         )
     }
     for axis, message in _limit_problems(
-        {"knowledge": list(knowledge_rows or [])}, crlf=crlf
+        {"knowledge": list(merged_knowledge)}, crlf=crlf
     ):
         if axis not in kb_baseline_axes:
             return message
@@ -797,16 +806,25 @@ def _existing_knowledge_rows() -> list[Any]:
 
     知识库未初始化不构成「恢复后无法导出」风险：导入时知识段会以
     ``knowledge_error`` 上报，用户数据照常恢复。
+
+    「库文件存在但集合缺失」（半初始化）按空库处理：写路径的
+    ``_get_agent(create_if_missing=True)`` 会自动建集合并成功导入，
+    把它当成「不可读」会让每次导入都跳过知识段并报不可恢复的错误，
+    与真实写路径相反。探测失败（``_collection_exists`` 返回 True）
+    保持原 fail-closed 口径。
     """
-    from utils.knowledge_admin import export_documents, knowledge_db_path
+    from utils import knowledge_admin
 
     try:
-        if not knowledge_db_path().exists():
+        if not knowledge_admin.knowledge_db_path().exists():
             return []
-        return list(export_documents() or [])
+        return list(knowledge_admin.export_documents() or [])
     except FileNotFoundError:
         return []
     except Exception as exc:  # noqa: BLE001 - 交给合并预检按知识轴跳过
+        exists_fn = getattr(knowledge_admin, "_collection_exists", None)
+        if callable(exists_fn) and not exists_fn():
+            return []
         raise MemoryPersistenceError(
             f"读取知识库现有片段失败：{exc}"
         ) from exc

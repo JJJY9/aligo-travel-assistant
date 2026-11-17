@@ -17,6 +17,9 @@ sys.path.insert(0, project_root)
 import cli
 from context.long_term_memory import LongTermMemory
 from utils.user_import import (
+    _existing_knowledge_rows as _real_existing_knowledge_rows,
+)
+from utils.user_import import (
     _knowledge_ready_probe as _real_knowledge_ready_probe,
 )
 from utils.user_import import import_user_data, parse_user_export
@@ -3341,6 +3344,111 @@ def test_merged_and_sections_payload_use_real_user_id(monkeypatch):
     assert module.sections_limit_problem({}) is None
     assert len(captured["payload"]["user_id"]) == 64
     print("✓ 合并 / 预检 payload 使用真实 user_id")
+
+
+def test_existing_knowledge_rows_tolerates_missing_collection(
+    monkeypatch, tmp_path
+):
+    """库文件存在但集合缺失（半初始化）按空库处理：写路径会自动建集合，
+    把它当「不可读」会让每次导入都跳过知识段并报不可恢复的错误；
+    集合探测失败（视为存在）仍保持 fail-closed。"""
+    from utils import knowledge_admin
+    from utils.errors import MemoryPersistenceError as _MPE
+
+    db = tmp_path / "milvus_lite.db"
+    db.write_bytes(b"")
+    monkeypatch.setattr(
+        knowledge_admin, "knowledge_db_path", lambda *args, **kwargs: db
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("collection not found")
+
+    monkeypatch.setattr(knowledge_admin, "export_documents", boom)
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: False)
+    assert _real_existing_knowledge_rows() == []
+
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: True)
+    with pytest.raises(_MPE):
+        _real_existing_knowledge_rows()
+    print("✓ 集合缺失按空知识库处理，探测失败仍 fail-closed")
+
+
+def test_merged_knowledge_plan_failure_keeps_existing_library(monkeypatch):
+    """知识规划失败（本次跳过知识写入）时合并 payload 必须保留已知的
+    现有全局库：用空列表替换会让用户数据增长把 with_knowledge 导出推过
+    50MB 而复核放行（此后永久 413）。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+    from utils.errors import MemoryPersistenceError as _MPE
+
+    existing_kb = [{"content": "k" * 900, "metadata": {}}]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(existing_kb)
+    )
+
+    def boom(*args, **kwargs):
+        raise _MPE("milvus down")
+
+    monkeypatch.setattr(kb, "import_documents", boom)
+
+    existing = {
+        "chat_history": [],
+        "trip_history": [],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    incoming = {
+        "messages": [
+            {"role": "user", "content": "n" * 100, "session_id": "t1"}
+        ],
+        "knowledge": [{"content": "新知识", "metadata": {}}],
+    }
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return dict(existing)
+
+    captured: dict[str, dict] = {}
+    real_limit = module.backup_limit_problem
+
+    def fake_limit(payload, **kwargs):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+    unverified: dict[str, str] = {}
+    assert (
+        module.merged_backup_limit_problem(
+            _Store(), incoming, knowledge_unverified=unverified
+        )
+        is None
+    )
+    payload = captured["payload"]
+    assert payload["knowledge"] == existing_kb, payload["knowledge"]
+    assert "规划失败" in unverified.get("reason", ""), unverified
+
+    # 上限落在「不含库」与「含库」之间：纳入现有库后必须拒绝
+    monkeypatch.setattr(module, "backup_limit_problem", real_limit)
+    without = dict(payload)
+    without["knowledge"] = []
+    assert module._backup_payload_size(payload) > module._backup_payload_size(
+        without
+    )
+    baseline_size = module._backup_payload_size(
+        module._export_shape_baseline(existing, existing_kb)
+    )
+    total_size = module._backup_payload_size(payload)
+    assert total_size > baseline_size, (total_size, baseline_size)
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", baseline_size + 100)
+    problem = module.merged_backup_limit_problem(_Store(), incoming)
+    assert problem and "MB" in problem, problem
+    print("✓ 规划失败时合并 payload 保留现有知识库、体积轴照常拦截")
 
 
 def test_merged_knowledge_duplicate_backup_not_rejected(monkeypatch):

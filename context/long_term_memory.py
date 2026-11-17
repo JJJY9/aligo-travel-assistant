@@ -1131,6 +1131,12 @@ class LongTermMemory:
             # 条件式清除会漏掉「健康主文件 + 残留标记」的实例——它的
             # fresh/corrupt 标志早就不在了
             self._clear_quarantine_marker()
+            # 实例级隔离 / 待复核状态与标记同步复位：主文件刚刚原子重建，
+            # Web 缓存会话的隔离探测（get_fresh_quarantine_backup）不能
+            # 拿已自愈的旧备份路径把健康账号反复驱逐 / close
+            self._fresh_quarantine = False
+            self._corrupt_pending = False
+            self._corrupt_backup = None
             return True
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")

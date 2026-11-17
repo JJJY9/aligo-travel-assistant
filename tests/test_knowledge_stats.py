@@ -264,7 +264,12 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
-    test_default_knowledge_base_if_present()
+    # 本地未初始化知识库时该用例 pytest.skip；Skipped 不是 Exception，
+    # 直跑必须按 pytest 语义转成跳过提示（否则 traceback + 退出码 1）
+    try:
+        test_default_knowledge_base_if_present()
+    except pytest.skip.Exception as exc:
+        print(f"直跑跳过 test_default_knowledge_base_if_present（{exc}）")
     status = knowledge_status()
     if status["available"]:
         print(f"✓ 本地知识库：{status['documents']} 片段")

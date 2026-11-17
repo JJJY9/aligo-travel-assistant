@@ -341,7 +341,12 @@ if __name__ == "__main__":
     # @requires_llm_eval / @requires_llm_key 只是 pytest 收集期标记，
     # 直跑不会被拦截：实时模型评测默认跳过，显式开启且配置密钥才运行
     if _runs_llm_eval and LLM_CONFIG["api_key"]:
-        asyncio.run(test_rag_agent())
+        try:
+            asyncio.run(test_rag_agent())
+        except pytest.skip.Exception as exc:
+            # 用例内部（RAG Agent 未初始化）的 pytest.skip 在直跑中同样
+            # 按跳过处理，而不是冒泡成 traceback
+            print(f"已跳过实时模型评测（{exc}）")
     else:
         print(
             "已跳过实时模型评测（设 ALIGO_RUN_LLM_EVALS=1 且配置模型密钥后启用）"
