@@ -246,6 +246,11 @@ def test_backup_sanitize_strips_escaped_nul_and_dict_keys():
 
 
 if __name__ == "__main__":
+    import _stdio
+    import _tmp_registry
+
+    _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_markdown_escapes_cells_and_joins_lists()
     test_markdown_null_fields_and_statistics()
     test_markdown_chat_history_rendering()

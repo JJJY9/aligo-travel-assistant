@@ -51,6 +51,9 @@ def test_wheel_install_falls_back_to_user_dir(monkeypatch, tmp_path=None):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     import pytest
 
     for case in (

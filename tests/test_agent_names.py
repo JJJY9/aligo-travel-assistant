@@ -33,5 +33,8 @@ def test_canonical_agent_name_cases():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_canonical_agent_name_cases()
     print("\n全部通过")

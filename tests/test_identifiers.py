@@ -108,6 +108,9 @@ def test_session_ids_allow_windows_device_names():
     print("✓ 会话 ID 允许设备保留名（用户 ID 仍拒绝）")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_ids_match_web_rust_word_semantics()
     test_prefixed_and_suffixed_fragments()
     test_windows_reserved_names_rejected()

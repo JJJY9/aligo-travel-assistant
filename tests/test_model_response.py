@@ -65,6 +65,9 @@ def test_factory_uses_nonstream_and_generate_kwargs():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_chat_response_dict()
     test_string_and_plain_object()
     test_async_stream_chunks()

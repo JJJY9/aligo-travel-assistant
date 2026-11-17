@@ -118,4 +118,7 @@ def test_discard_pending_library_is_ignored(monkeypatch, tmp_path):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     print("monkeypatch 用例需 pytest 运行")

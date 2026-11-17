@@ -330,5 +330,8 @@ def test_grouped_missing_parts_listing_is_bounded():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     asyncio.run(test_rag_agent())
     print("\n测试完成！")

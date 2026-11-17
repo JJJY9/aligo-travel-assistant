@@ -47,6 +47,11 @@ _MAX_KNOWLEDGE_PARTS = 100000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
 
+# 导出形状里的 user_id 占位：合法 user_id 最多 64 个字符且允许中文
+# （UTF-8 3 字节/字，最多 192 字节）。按 64 个 ASCII 字节占位会在近
+# 50 MB 时系统性低估，换成最坏字节宽度的 64 个汉字
+_USER_ID_PLACEHOLDER = "测" * 64
+
 _USAGE_NUMBER_FIELDS = ("calls", "input_tokens", "output_tokens", "total_tokens")
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -529,13 +534,30 @@ def merged_backup_limit_problem(
     existing_messages = list(existing.get("chat_history") or [])
     existing_trip_rows = list(existing.get("trip_history") or [])
     pg_shape = not getattr(store, "snapshot_based", False)
+    # 现有全局知识库只读一次：既进合并后的知识段，也进按轴基线豁免的
+    # 基线形状（此前基线用「任意轴取首个问题」，账号在消息/行程轴超限
+    # 时知识轴被连带豁免，可把全局库推过导出上限）。读不到时只跳过
+    # 知识轴，不阻断用户数据恢复。
+    existing_kb: list[Any] | None
+    try:
+        existing_kb = _existing_knowledge_rows()
+    except MemoryPersistenceError as exc:
+        logger.warning(
+            "合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc
+        )
+        existing_kb = None
+    knowledge_rows = (
+        _knowledge_rows_for_merge(existing_kb, sections)
+        if existing_kb is not None
+        else None
+    )
     # 以现有快照为底，再覆盖为合并后的各段；真实导出端会在
     # export_snapshot 之外补 user_id / exported_at——这里放等长占位，
     # 体积口径与导出端一致
     payload = dict(existing)
     # 占位与导出端形状等长：user_id 允许 64 字符、时间戳带微秒、
     # CLI 导出恒写 session_id 空串
-    payload.setdefault("user_id", "u" * 64)
+    payload.setdefault("user_id", _USER_ID_PLACEHOLDER)
     payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
     payload.setdefault("session_id", "")
     payload.update(
@@ -555,10 +577,7 @@ def merged_backup_limit_problem(
                 ),
             ),
             "preferences": merged_prefs,
-            "knowledge": _baseline_aware_knowledge_rows(
-                existing, sections, crlf=crlf
-            )
-            or [],
+            "knowledge": knowledge_rows or [],
             "session_titles": merged_titles,
             "pinned_sessions": sorted(
                 {
@@ -619,7 +638,10 @@ def merged_backup_limit_problem(
         if match
     ]
     created_trip_count = max(0, len(merged_trips) - len(existing_trip_rows))
-    if merged_trips and not pg_shape:
+    # JSON 后端恒写该字段（空行程也序列化 0，与真实导出一致）；只在
+    # PG 形状省略。行程为空时取现有水位（无则 0），不能漏键——
+    # sections 预检与真实导出都带它，漏写会低估恢复后的导出体积
+    if not pg_shape:
         # 写入层对每个新建行至少推进一次水位；冲突改号行还能把水位推到
         # 18 位以上——取「现有水位 / 最大编号 / 新建行数」的保守上界。
         # PG 的 get_statistics 没有该字段，保持后端真实导出形状
@@ -630,16 +652,20 @@ def merged_backup_limit_problem(
     problem = backup_limit_problem(payload, crlf=crlf)
     if problem is None:
         return None
-    # 用户数据轴的导入前基线：存量账号自身（不含知识库）已在某个轴
-    # 超限时——正常聊天积累到 50MB / 20 万条以上的账号——任何恢复都
-    # 无法让账号在该轴上更糟，该轴不再作为拒绝理由（否则账号连幂等
-    # 重导自身备份都会被 413，换机 / 恢复被完全封死）。不同轴互不豁免：
-    # 存量消息超限不能放行把偏好推过上限的备份；未超限的轴照常拦截
-    # 「恢复后永远无法导出」的增量。
+    # 导入前基线的按轴豁免：存量账号在某个轴上已超限时（体积 / 消息 /
+    # 行程 / 偏好 / 知识片段）——任何恢复都无法让账号在该轴上更糟，
+    # 该轴不再作为拒绝理由（否则账号连幂等重导自身备份都会被 413）。
+    # 基线包含现有全局知识库：知识轴只在自身上已超限时豁免，不再被
+    # 其它轴的超限连带放行。不同轴互不豁免：存量消息超限不能放行把
+    # 知识库推过上限的备份；未超限的轴照常拦截「恢复后永远无法导出」
+    # 的增量。
     baseline_axes = {
         axis
         for axis, _message in _limit_problems(
-            _export_shape_baseline(existing, []), crlf=crlf
+            _export_shape_baseline(
+                existing, existing_kb if existing_kb is not None else []
+            ),
+            crlf=crlf,
         )
     }
     problems = _limit_problems(payload, crlf=crlf)
@@ -747,7 +773,7 @@ def _export_shape_baseline(
     WITH-knowledge 备份：已超限的账号不可能被恢复推得更糟。
     """
     payload = dict(existing)
-    payload.setdefault("user_id", "u" * 64)
+    payload.setdefault("user_id", _USER_ID_PLACEHOLDER)
     payload.setdefault("exported_at", "1970-01-01T00:00:00.000000")
     payload.setdefault("session_id", "")
     payload.update(
@@ -767,37 +793,20 @@ def _export_shape_baseline(
     return payload
 
 
-def _baseline_aware_knowledge_rows(
-    existing: dict[str, Any],
-    sections: dict[str, Any],
-    *,
-    crlf: bool | None = None,
+def _knowledge_rows_for_merge(
+    existing_kb: list[Any], sections: dict[str, Any]
 ) -> list[Any] | None:
-    """合并预检的知识段；None = 跳过知识轴（仅保留用户数据轴）。
+    """合并预检的知识段：现有全局库 + 本次真正写入的分片。
 
-    - 现有知识库不可读 / 本次规划失败：跳过知识轴（不阻断用户数据）；
-    - 「现有存量 + 现有知识库」本已超过导出上限：跳过知识轴——任何恢复
-      都无法让它更糟，不能据此拒绝用户数据（隔离账号的 user-import 是
-      唯一产品内恢复路径）；用户数据轴仍由最终 payload 复核；
-    - 否则计入「现有库 + 本次新增分片」，恢复把合规库推过上限时照常拒绝。
+    None = 跳过知识轴（仅当本次规划失败——现有库读不到时调用方直接
+    跳过，不进入这里）。知识轴是否允许作为拒绝理由由最终 payload 的
+    按轴基线豁免统一判定（与用户数据轴同一语义）：此前用「完整导出
+    形状是否有任意问题」决定跳过，账号在其它轴超限时知识轴被连带
+    豁免，可把全局知识库推过导出上限（此后所有用户的带知识库导出
+    永久 413）。
     """
-    try:
-        existing_kb = _existing_knowledge_rows()
-    except MemoryPersistenceError as exc:
-        logger.warning("合并预检：读取现有知识库失败（%s），跳过知识体积轴", exc)
-        return None
     planned = _planned_knowledge_rows(sections)
     if planned is None:
-        return None
-    if not existing_kb and not planned:
-        return []
-    baseline_problem = backup_limit_problem(
-        _export_shape_baseline(existing, existing_kb), crlf=crlf
-    )
-    if baseline_problem is not None:
-        logger.warning(
-            "合并预检：导入前数据与知识库已超过导出上限，跳过知识体积轴"
-        )
         return None
     return existing_kb + planned
 
@@ -1047,7 +1056,7 @@ def sections_limit_problem(
         trim_json_timestamps=not conservative,
     )
     payload: dict[str, Any] = {
-        "user_id": "u" * 64,
+        "user_id": _USER_ID_PLACEHOLDER,
         "exported_at": "1970-01-01T00:00:00.000000",
         "session_id": "",
         "chat_history": messages,
@@ -1559,6 +1568,29 @@ def preview_user_import(store: Any, sections: dict[str, Any]) -> dict[str, Any]:
         )
         result["messages_added"] = len(planned)
         result["messages_skipped"] = len(messages) - len(planned)
+    # 预览与真实执行同一结论：知识库不可用时真实导入会报 knowledge_error
+    # （知识一条未恢复、ok=false），dry-run 也必须如实报告。用与真实导入
+    # 同一实现（import_documents 的 dry-run 计划接口）探测可用性，异常
+    # 映射与 import_user_data 完全一致
+    knowledge_rows = sections.get("knowledge") or []
+    if knowledge_rows:
+        try:
+            from utils.knowledge_admin import import_documents
+
+            import_documents(
+                knowledge_rows, dry_run=True, return_pieces=True
+            )
+        except FileNotFoundError:
+            result["knowledge_error"] = (
+                "知识库未初始化（先运行初始化脚本再恢复知识片段）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 与真实导入同口径
+            # 上游异常可能带本机路径 / URL：与其它知识库接口同一脱敏口径
+            from utils.log_redact import redact_paths
+
+            result["knowledge_error"] = (
+                f"知识片段恢复失败：{redact_paths(exc)}"
+            )
     # 预览与真实执行同一结论：隔离账号 + 备份无可写回用户数据时，
     # --dry-run / ?dry_run=1 同样报告恢复未完成（否则预览 ok=true、
     # 真实执行 ok=false、退出码相反，用户按预览结论误判恢复可用）

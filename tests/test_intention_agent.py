@@ -198,6 +198,9 @@ def display_result(result):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     print("="*70)
     print("意图识别智能体测试")
     print("="*70)

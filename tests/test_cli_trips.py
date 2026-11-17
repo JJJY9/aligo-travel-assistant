@@ -1414,4 +1414,13 @@ if __name__ == "__main__":
             case(mp)
         finally:
             mp.undo()
+    # caplog 用例不能进 case(mp) 循环（参数是 caplog 不是 monkeypatch）：
+    # 用共享替身执行，否则直跑清单会漏跑却仍打印「全部通过」
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_trip_interval_warns_on_invalid_end(_shim)
+    finally:
+        _shim.close()
     print("\n全部通过")

@@ -811,4 +811,7 @@ def test_export_snapshot_retries_after_connection_rebuild(monkeypatch):
         store.close()
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     print("该测试需要 TEST_POSTGRES_DSN，请通过 pytest 运行")

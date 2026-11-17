@@ -467,6 +467,9 @@ def test_robust_first_json_object_repairs_small_faults():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_json_parse_failure_raises_value_error()
     test_sanitize_json_escapes_surrogates()
     test_sanitize_json_depth_guard()

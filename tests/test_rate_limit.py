@@ -449,6 +449,9 @@ def test_rate_window_non_positive_is_clamped():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_window_and_keys()
     test_reset()
     test_key_eviction_bounds_memory()

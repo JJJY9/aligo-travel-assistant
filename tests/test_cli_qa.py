@@ -198,4 +198,7 @@ def save_results(results: list[dict]):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     asyncio.run(main())

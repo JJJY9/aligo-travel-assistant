@@ -211,6 +211,9 @@ def test_user_base_skills_fallbacks(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     mp = pytest.MonkeyPatch()
     try:
         test_source_tree_resolves_repo_skills()

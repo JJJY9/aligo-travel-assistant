@@ -69,6 +69,9 @@ def test_content_text_helper():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_plain_and_json_strings()
     test_dict_and_block_inputs()
     test_content_text_helper()

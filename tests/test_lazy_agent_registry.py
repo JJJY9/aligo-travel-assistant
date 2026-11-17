@@ -349,6 +349,9 @@ def test_cache_is_keyed_by_skill_name(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for case in (
         test_uninitialized_agents_not_cached,
         test_discovers_and_caches_agents,

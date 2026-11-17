@@ -3255,6 +3255,9 @@ def test_log_safe_group_escapes_control_characters():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_next_entity_id_monotonic_after_delete()
     test_log_safe_group_escapes_control_characters()
     test_load_collection_failure_is_non_fatal()

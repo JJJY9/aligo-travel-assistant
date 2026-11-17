@@ -69,5 +69,8 @@ def test_string_preferences_in_prompt():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_string_preferences_in_prompt()
     print("\n全部通过")

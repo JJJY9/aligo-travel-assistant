@@ -154,6 +154,9 @@ def test_postgres_trip_dedupe_empty_end_date():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     mp = pytest.MonkeyPatch()
     try:
         test_cli_commands_with_postgres(mp)

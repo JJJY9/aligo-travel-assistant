@@ -61,6 +61,9 @@ def test_minimum_size_respected():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_sse_path_never_compressed()
     test_minimum_size_respected()
     print("\n全部通过")

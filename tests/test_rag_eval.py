@@ -106,6 +106,9 @@ def test_min_score_filters_low_similarity_and_warns():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_min_score_filters_low_similarity_and_warns()
     test_all_hits_at_one()
     test_mixed_ranks_and_misses()

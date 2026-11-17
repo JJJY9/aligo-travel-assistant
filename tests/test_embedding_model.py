@@ -121,6 +121,9 @@ def test_load_failure_is_remembered_with_cooldown(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_dimension_prefers_new_method()
     test_dimension_falls_back_to_old_method()
     test_dimension_unknown_or_broken_returns_none()

@@ -667,6 +667,9 @@ def test_discard_created_library_handles_directory_db(tmp_path):
     print("✓ 目录形态的 milvus_lite.db 被正确清理")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     _mp = pytest.MonkeyPatch()
     try:
         test_main_returns_1_when_agent_not_initialized(_mp)

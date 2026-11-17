@@ -950,6 +950,9 @@ def test_skills_check_warns_on_broken_skill_md(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_python_ok()
     test_model_files_missing_dir()
     test_model_files_complete()

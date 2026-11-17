@@ -213,4 +213,7 @@ async def test_orchestration():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     asyncio.run(test_orchestration())

@@ -29,5 +29,19 @@ def install() -> None:
 
 
 def _cleanup() -> None:
+    import os
+
+    cwd = os.path.realpath(os.getcwd())
     while _created:
-        shutil.rmtree(_created.pop(), ignore_errors=True)
+        path = _created.pop()
+        real = os.path.realpath(path)
+        try:
+            inside = os.path.commonpath([cwd, real]) == real
+        except ValueError:
+            inside = False
+        if inside:
+            # 进程可能 chdir 进了自建目录：先离开，Windows 上目录非空时
+            # rmtree 才能成功
+            os.chdir(tempfile.gettempdir())
+            cwd = os.path.realpath(os.getcwd())
+        shutil.rmtree(path, ignore_errors=True)

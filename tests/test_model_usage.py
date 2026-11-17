@@ -137,6 +137,9 @@ def test_add_usage_merges_numeric_fields():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_tracks_usage()
     test_missing_usage_counts_call_only()
     test_attribute_delegation()

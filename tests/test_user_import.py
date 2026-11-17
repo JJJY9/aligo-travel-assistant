@@ -3328,6 +3328,52 @@ def test_merged_knowledge_increment_guard_preserved(monkeypatch):
     print("✓ 合规知识库的增量越限仍被拒绝")
 
 
+def test_merged_knowledge_increment_guard_survives_other_axis_over(monkeypatch):
+    """账号在其它轴（消息条数）已超限（按轴豁免）时，知识轴不得被连带
+    豁免：把全局知识库推过片数上限的恢复仍必须拒绝——否则所有用户的
+    带知识库导出从此永久 413。"""
+    import utils.knowledge_admin as kb
+    from utils import user_import as module
+
+    existing_kb = [{"content": "旧片", "metadata": {}}]
+    monkeypatch.setattr(
+        module, "_existing_knowledge_rows", lambda: list(existing_kb)
+    )
+    monkeypatch.setattr(
+        kb,
+        "import_documents",
+        _fake_knowledge_planner(
+            [{"content": f"新片{i}", "metadata": {}} for i in range(5)]
+        ),
+    )
+    monkeypatch.setattr(module, "_MAX_KNOWLEDGE", 5)
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 2)
+    messages = [
+        {"role": "user", "content": f"m{i}", "session_id": "s1"}
+        for i in range(3)
+    ]
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [dict(item) for item in messages],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    problem = module.merged_backup_limit_problem(
+        _Store(), {"knowledge": [{"content": "原始长文"}]}
+    )
+    assert problem and "知识片段" in problem, problem
+    print("✓ 其它轴超限不连带豁免知识轴")
+
+
 def test_merged_knowledge_baseline_uses_full_export_shape(monkeypatch):
     """知识轴的基线是「导入前完整导出形状」（存量 + 现有库）：库单独合规
     但两者合计已超限时，任何恢复都无法更糟，不得据此拒绝用户数据；
@@ -3669,9 +3715,9 @@ def test_cli_import_reports_partial_commit(monkeypatch):
 
 
 def test_cli_import_uses_file_newline_for_size_axis(monkeypatch):
-    """CLI 导入的体积轴按导入文件自身的行尾口径：LF 文件传 crlf=False，
-    CRLF 文件传 True——同一份 Web 下载的 LF 备份在 CLI / Web 两入口
-    得到相同结论。"""
+    """CLI 导入的体积轴固定按 LF（与 CLI / Web 导出落盘口径一致）：
+    导入文件自身是 LF 还是 CRLF 不影响结论——否则 Windows 上恢复一份
+    LF 备份后，同一账号的 CLI 导出（当时按 CRLF 估算）会永久中止。"""
     from pathlib import Path as pathlib_path
 
     from utils import user_import as module
@@ -3700,20 +3746,77 @@ def test_cli_import_uses_file_newline_for_size_axis(monkeypatch):
     crlf_path = pathlib_path(storage_dir) / "crlf.json"
     crlf_path.write_text(payload, encoding="utf-8", newline="\r\n")
 
-    code, out = _run_import(monkeypatch, "u-nl", str(lf_path), store)
-    assert code == 0, out
-    assert captured == [
-        ("sections", False),
-        ("merged", False),
-    ], captured
-    captured.clear()
-    code, out = _run_import(monkeypatch, "u-nl", str(crlf_path), store)
-    assert code == 0, out
-    assert captured == [
-        ("sections", True),
-        ("merged", True),
-    ], captured
-    print("✓ CLI 导入按文件真实行尾估算体积轴")
+    for path in (lf_path, crlf_path):
+        captured.clear()
+        code, out = _run_import(monkeypatch, "u-nl", str(path), store)
+        assert code == 0, out
+        assert captured == [
+            ("sections", False),
+            ("merged", False),
+        ], captured
+    print("✓ CLI 导入体积轴固定 LF（与导出口径一致）")
+
+
+def test_merged_payload_empty_trips_keeps_last_trip_number(monkeypatch):
+    """JSON 导出恒带 statistics.last_trip_number（空账号 0）：恢复后行程
+    为空时合并预演同样必须写该键，否则低估真实导出体积；user_id 占位
+    按最坏字节宽度（64 个 3 字节汉字）而不是 64 个 ASCII 字节。"""
+    from utils import user_import as module
+
+    captured = {}
+
+    def fake_limit(payload, **kwargs):
+        captured["payload"] = payload
+        return None
+
+    monkeypatch.setattr(module, "backup_limit_problem", fake_limit)
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {
+                "chat_history": [],
+                "trip_history": [],
+                "preferences": {},
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+    module.merged_backup_limit_problem(_Store(), {})
+    payload = captured["payload"]
+    assert payload["statistics"].get("last_trip_number") == 0, payload
+    assert len(payload["user_id"].encode("utf-8")) == 192, payload["user_id"]
+    print("✓ 空行程预演保留 last_trip_number 与最坏 user_id 占位")
+
+
+def test_preview_reports_knowledge_unavailable(monkeypatch):
+    """--dry-run 预览与真实执行同结论：知识库未初始化时 knowledge_error
+    同样出现在预览结果里（CLI ok=false / 退出码 1）。"""
+    import utils.knowledge_admin as kb
+
+    def boom(documents, dry_run=False, *, return_pieces=False):
+        raise FileNotFoundError("no db")
+
+    monkeypatch.setattr(kb, "import_documents", boom)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_kbpreview_")
+    store = LongTermMemory("u-kbpreview", storage_dir)
+    path = _write_json(
+        {
+            "preferences": {"home_location": "北京"},
+            "knowledge": [{"content": "知识片段"}],
+        }
+    )
+    code, out = _run_import(
+        monkeypatch, "u-kbpreview", path, store, as_json=True, dry_run=True
+    )
+    payload = json.loads(out)
+    assert code == 1, (code, out)
+    assert payload["ok"] is False, payload
+    assert "知识库未初始化" in payload.get("knowledge_error", ""), payload
+    print("✓ 预览与真实执行同报知识库不可用")
 
 
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):

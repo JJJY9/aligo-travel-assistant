@@ -819,6 +819,9 @@ def test_preference_legacy_explanatory_keys_not_rendered():
     print("✓ 旧格式说明性键不回显为偏好")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_itinerary()
     test_preference()
     test_rag_answer_with_sources()

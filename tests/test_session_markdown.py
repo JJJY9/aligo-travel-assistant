@@ -409,6 +409,9 @@ def test_table_row_escapes_html_without_cross_cell_code_span():
     print("✓ 表格行不跨单元格配对反引号")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_group_sessions_orders_by_recent_update()
     test_custom_title_single_line_and_escaped()
     test_fallback_title_escaped_like_custom()

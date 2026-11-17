@@ -241,6 +241,9 @@ def test_status_reports_unavailable_when_collection_cannot_load(tmp_path):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_missing_database()
     for case in (
         test_dimension_mismatch_best_effort,

@@ -22,5 +22,8 @@ def test_manifest_prunes_runtime_data():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_manifest_prunes_runtime_data()
     print("\n全部通过")
