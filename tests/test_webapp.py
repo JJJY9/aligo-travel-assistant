@@ -2282,7 +2282,10 @@ def test_import_rejects_backup_over_export_size(monkeypatch):
         json={"backup": {"preferences": {"home_location": "北京"}}},
     )
     assert response.status_code == 413, response.text
-    assert "无法再次导出" in response.json()["detail"]
+    detail = response.json()["detail"]
+    # 有快照时体积轴由合并复核判定（预检只做条数轴），两处文案都以
+    # 「无法（再次）导出」提示不可恢复状态
+    assert "无法再次导出" in detail or "无法再导出" in detail, detail
     print("✓ 恢复前按导出口径复核体积上限")
 
 
@@ -12819,6 +12822,11 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            import _direct_run_kb
+
+            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()

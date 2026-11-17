@@ -397,6 +397,21 @@ def test_direct_run_files_install_tmp_registry():
 
 
 
+def test_direct_run_kb_fixture_is_isolated():
+    """直跑清单的 kb_fixture 块必须接入 ``_direct_run_kb`` 隔离：只替换
+    ``_existing_knowledge_rows`` / 探针时，``python tests/xxx.py`` 的
+    规划路径仍会打开真实 Milvus，结论与 pytest / CI（无库）不一致。"""
+    problems: list[str] = []
+    for path in sorted(TESTS_DIR.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "kb_fixture.setattr(" not in text:
+            continue
+        if "_direct_run_kb.isolate(" not in text:
+            problems.append(path.name)
+    assert not problems, "缺知识库路径隔离：" + ", ".join(problems)
+    print("✓ 直跑 kb_fixture 接入知识库路径隔离")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -418,5 +433,6 @@ if __name__ == "__main__":
     test_case_loops_do_not_call_tests_after_undo()
     test_main_blocks_do_not_reuse_undone_monkeypatch()
     test_monkeypatch_reuse_check_covers_renamed_vars()
+    test_direct_run_kb_fixture_is_isolated()
     test_direct_run_files_install_tmp_registry()
     print("\n全部通过")

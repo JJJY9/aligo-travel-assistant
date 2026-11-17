@@ -3354,6 +3354,38 @@ def test_merged_and_sections_payload_use_real_user_id(monkeypatch):
     print("✓ 合并 / 预检 payload 使用真实 user_id")
 
 
+def test_sections_defers_size_axis_to_merged_with_snapshot(monkeypatch):
+    """有存量快照时体积轴交给合并复核：空行程表预演会给缺 trip_id 的
+    历史行程逐行补 id，比真实导入（同身份批量更新、不补 id）更严，
+    临近上限的合法备份会被预检误拒 413。"""
+    from utils import user_import as module
+
+    trips = [
+        {"destination": f"城市{i}", "start_date": "2026-01-01", "purpose": "出差"}
+        for i in range(40)
+    ]
+    existing = {
+        "chat_history": [],
+        "trip_history": [dict(row) for row in trips],
+        "preferences": {},
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+        "statistics": {},
+    }
+    baseline_size = module._backup_payload_size(
+        module._export_shape_baseline(existing, [])
+    )
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", baseline_size + 100)
+    sections = {"trips": [dict(row) for row in trips]}
+    # 无快照（保守回退）：仍按备份自有形状严格判定（空表预演即超限）
+    problem = module.sections_limit_problem(sections)
+    assert problem and "MB" in problem, problem
+    # 有快照：体积轴交给随后必定执行的合并复核，不再因补 id 预演误拒
+    assert module.sections_limit_problem(sections, existing=existing) is None
+    print("✓ 有快照时预检把体积轴交给合并复核")
+
+
 def test_import_rechecks_volume_under_import_lock(monkeypatch):
     """锁外预检挡不住并发导入：锁内重取快照后的合并复核必须拒绝并
     零写入（两次导入各自通过预检后合计越限会让账号永久无法导出）。"""
@@ -3916,12 +3948,23 @@ def test_sections_limit_baseline_exempts_over_limit_axis(monkeypatch):
     }
     # 无基线：原严格口径（体积超限）
     assert module.sections_limit_problem(sections) is not None
-    # 存量体积已超限：体积轴豁免；存量未超限时保持原判定
+    # 存量体积已超限：体积轴豁免
     assert module.sections_limit_problem(sections, existing=existing) is None
+    # 有快照时体积轴整体交给合并复核（空行程表预演会给缺 trip_id 的
+    # 历史行程补 id，独立判定比真实导入更严）；合并复核用同一快照拒绝
     assert (
         module.sections_limit_problem(sections, existing={"chat_history": []})
-        is not None
+        is None
     )
+
+    class _Store:
+        snapshot_based = True
+
+        def export_snapshot(self):
+            return {"chat_history": []}
+
+    merged_problem = module.merged_backup_limit_problem(_Store(), sections)
+    assert merged_problem and "MB" in merged_problem, merged_problem
     # 不同轴互不豁免：存量只在体积轴超限，不能放行条数轴超限的备份
     monkeypatch.setattr(module, "_MAX_MESSAGES", 0)
     problem = module.sections_limit_problem(sections, existing=existing)
@@ -4854,6 +4897,11 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            import _direct_run_kb
+
+            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()

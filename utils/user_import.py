@@ -1135,6 +1135,9 @@ def sections_limit_problem(
     超限时该轴不再作为拒绝理由（与 :func:`merged_backup_limit_problem`
     同一豁免语义）——否则存量已超 50MB 的账号恢复自身体积超限的备份会
     被预检 413，合并复核的基线放行永远不可达。传 None 保持原严格口径。
+    传快照时体积轴不在本函数判定（交给随后必定执行的合并复核）：本函数
+    的空行程表预演会给缺 trip_id 的历史行程补 id，比真实导入的同身份
+    批量更新更严；条数轴仍按基线豁免判定。
 
     知识库段只在 ``existing is None``（快照读不到、后续没有权威合并
     复核）时计入：知识轴（含知识段体积）由随后的
@@ -1225,19 +1228,30 @@ def sections_limit_problem(
     problem = backup_limit_problem(payload, crlf=crlf)
     if problem is None:
         return None
+    problems = _limit_problems(payload, crlf=crlf)
+    if existing is not None:
+        # 体积轴交给随后的权威合并复核（merged_backup_limit_problem 用
+        # 同一快照、含存量消息与现有知识库基线）：本函数的空行程表预演
+        # 会给缺 trip_id 的历史行程逐行补 id（真实导入只按同身份批量
+        # 更新、不补 id），独立判定比权威复核更严、临近上限的合法备份
+        # 被误拒 413。CLI / Web 主路径随后必定执行合并复核
+        problems = [
+            (axis, message) for axis, message in problems if axis != "size"
+        ]
+    if not problems:
+        return None
     if existing is None:
-        return problem
+        return problems[0][1]
     baseline_axes = {
         axis
         for axis, _message in _limit_problems(
             _export_shape_baseline(existing, [], user_id=user_id), crlf=crlf
         )
     }
-    problems = _limit_problems(payload, crlf=crlf)
     for axis, message in problems:
         if axis not in baseline_axes:
             return message
-    return problem if not problems else None
+    return None
 
 
 def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:

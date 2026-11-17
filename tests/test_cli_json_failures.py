@@ -428,6 +428,11 @@ if __name__ == "__main__":
             kb_fixture.setattr(
                 _ui_for_kb, "_knowledge_ready_probe", lambda: None
             )
+            # 与 pytest conftest 同口径：规划 / 布局扫描也不能打开真实
+            # Milvus（与 CI「无库」结论一致）
+            import _direct_run_kb
+
+            _direct_run_kb.isolate(kb_fixture)
         except Exception:  # noqa: BLE001 - 模块不可用时不补丁
             if kb_fixture is not None:
                 kb_fixture.undo()
