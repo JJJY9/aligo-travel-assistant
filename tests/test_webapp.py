@@ -1958,30 +1958,48 @@ def test_export_filenames_disambiguate_non_ascii_ids():
     print("✓ 导出文件名去撞名（短哈希 + 用户维度）")
 
 
-def test_knowledge_status_masks_path_and_rate_limits():
+def test_knowledge_status_masks_path_and_rate_limits(monkeypatch):
     """/api/knowledge 不返回本机路径；挂起写锁期间快速返回「正在写入」。"""
+    import tempfile as tempfile_module
     import threading
+    from pathlib import Path as pathlib_path
 
     import utils.knowledge_admin as admin_module
+    import utils.knowledge_stats as stats_module
 
     client = _client()
     data = client.get("/api/knowledge").json()
     assert "path" not in data, data
     assert data.get("available") in (True, False)
 
-    if not data.get("available"):
-        print("✓ /api/knowledge 脱敏（本环境知识库未初始化，跳过写锁繁忙断言）")
-        return
+    # 用临时 KB 目录 + 假客户端让状态查询必然走到读锁分支：写锁繁忙
+    # 断言在 CI / 干净环境（本机库未初始化）也同样执行，不再提前 return
+    with tempfile_module.TemporaryDirectory() as tmp:
+        db = pathlib_path(tmp) / "milvus_lite.db"
+        db.mkdir()
 
-    holder = threading.Thread(target=lambda: admin_module._WRITE_LOCK.acquire())
-    holder.start()
-    holder.join()
-    try:
-        busy = client.get("/api/knowledge").json()
-    finally:
-        admin_module._WRITE_LOCK.release()
-    assert busy.get("available") is False, busy
-    assert "正在写入" in busy.get("reason", ""), busy
+        class _FakeClient:
+            def has_collection(self, name):
+                return True
+
+            def get_collection_stats(self, name):
+                return {"row_count": 0}
+
+        monkeypatch.setattr(stats_module, "default_db_path", lambda: db)
+        monkeypatch.setattr(
+            stats_module, "get_milvus_client", lambda path: _FakeClient()
+        )
+        holder = threading.Thread(
+            target=lambda: admin_module._WRITE_LOCK.acquire()
+        )
+        holder.start()
+        holder.join()
+        try:
+            busy = client.get("/api/knowledge").json()
+        finally:
+            admin_module._WRITE_LOCK.release()
+        assert busy.get("available") is False, busy
+        assert "正在写入" in busy.get("reason", ""), busy
     print("✓ /api/knowledge 脱敏且写锁繁忙时快速返回")
 
 
@@ -12652,6 +12670,11 @@ def test_import_over_limit_preference_account_allowed(monkeypatch):
     print("✓ 存量超限偏好账号的恢复按基线放行")
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告

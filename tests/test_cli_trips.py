@@ -1348,6 +1348,11 @@ def test_trip_add_updates_same_identity_at_limit(monkeypatch):
     print("✓ trip-add 恰好在上限时同身份更新放行")
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys as _sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError
@@ -1401,12 +1406,12 @@ if __name__ == "__main__":
         test_trip_update_store_failures,
         test_trip_update_reports_success_when_post_save_read_fails,
         test_trip_update_args_and_dispatch,
+        test_trip_update_ignores_invalid_legacy_end,
+        test_trip_add_rejects_non_padded_date,
     ):
         mp = pytest.MonkeyPatch()
         try:
             case(mp)
         finally:
             mp.undo()
-        test_trip_update_ignores_invalid_legacy_end(mp)
-        test_trip_add_rejects_non_padded_date(mp)
     print("\n全部通过")

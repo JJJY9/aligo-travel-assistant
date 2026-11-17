@@ -3668,6 +3668,54 @@ def test_cli_import_reports_partial_commit(monkeypatch):
     print("✓ 主恢复入口报告部分提交")
 
 
+def test_cli_import_uses_file_newline_for_size_axis(monkeypatch):
+    """CLI 导入的体积轴按导入文件自身的行尾口径：LF 文件传 crlf=False，
+    CRLF 文件传 True——同一份 Web 下载的 LF 备份在 CLI / Web 两入口
+    得到相同结论。"""
+    from pathlib import Path as pathlib_path
+
+    from utils import user_import as module
+
+    captured: list[tuple[str, object]] = []
+
+    def fake_sections(sections, **kwargs):
+        captured.append(("sections", kwargs.get("crlf")))
+        return None
+
+    def fake_merged(store, sections, **kwargs):
+        captured.append(("merged", kwargs.get("crlf")))
+        return None
+
+    monkeypatch.setattr(module, "sections_limit_problem", fake_sections)
+    monkeypatch.setattr(module, "merged_backup_limit_problem", fake_merged)
+    storage_dir = tempfile.mkdtemp(prefix="chailv_uimport_nl_")
+    store = LongTermMemory("u-nl", storage_dir)
+    payload = json.dumps(
+        {"preferences": {"home_location": "北京"}},
+        ensure_ascii=False,
+        indent=2,
+    )
+    lf_path = pathlib_path(storage_dir) / "lf.json"
+    lf_path.write_text(payload, encoding="utf-8", newline="\n")
+    crlf_path = pathlib_path(storage_dir) / "crlf.json"
+    crlf_path.write_text(payload, encoding="utf-8", newline="\r\n")
+
+    code, out = _run_import(monkeypatch, "u-nl", str(lf_path), store)
+    assert code == 0, out
+    assert captured == [
+        ("sections", False),
+        ("merged", False),
+    ], captured
+    captured.clear()
+    code, out = _run_import(monkeypatch, "u-nl", str(crlf_path), store)
+    assert code == 0, out
+    assert captured == [
+        ("sections", True),
+        ("merged", True),
+    ], captured
+    print("✓ CLI 导入按文件真实行尾估算体积轴")
+
+
 def test_recovery_incomplete_reported_with_knowledge_error(monkeypatch):
     """知识片段恢复失败不能吞掉「用户数据未恢复」：隔离账号 + 备份只有
     保留字会话消息 + 一条知识片段，导入结果同时带 knowledge_error 与
@@ -4013,6 +4061,11 @@ def test_import_knowledge_error_redacts_paths(monkeypatch):
     print("✓ 知识片段恢复错误脱敏（路径 / URL）")
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告

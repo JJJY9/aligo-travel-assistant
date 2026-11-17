@@ -3081,6 +3081,11 @@ def test_previous_preferences_context_skips_explanatory_keys():
     print("✓ 说明性键不进入后续批次偏好上下文")
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，

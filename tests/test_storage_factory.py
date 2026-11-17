@@ -753,6 +753,29 @@ def test_transient_reload_failure_is_not_reported_as_damage(monkeypatch):
     print("✓ 瞬时读失败与数据损坏分流")
 
 
+def _main_block(tree):
+    """定位模块顶层的 ``if __name__ == "__main__":`` 节点。"""
+    import ast as ast_module
+
+    for node in tree.body:
+        if not isinstance(node, ast_module.If):
+            continue
+        test = node.test
+        if not isinstance(test, ast_module.Compare):
+            continue
+        left = test.left
+        if not (isinstance(left, ast_module.Name) and left.id == "__name__"):
+            continue
+        comparators = test.comparators
+        if (
+            comparators
+            and isinstance(comparators[0], ast_module.Constant)
+            and comparators[0].value == "__main__"
+        ):
+            return node
+    return None
+
+
 def test_direct_run_harnesses_handle_async_tests():
     """含 async 用例的测试文件其 __main__ 必须真正执行（asyncio.run）：
     直跑清单直接调用 async 用例只创建 coroutine，断言从不执行却报通过。"""
@@ -777,12 +800,46 @@ def test_direct_run_harnesses_handle_async_tests():
         ]
         if not async_tests:
             continue
-        # rindex：本用例自身也定义了同名 marker 字面量，index 会命中
-        # 它，切片包含检查代码自身的 "asyncio.run("，断言对本文件恒真
-        main_source = text[text.rindex(marker):]
-        if "asyncio.run(" not in main_source:
+        # 按 AST 检查真实的 asyncio.run 调用：注释 / 字符串里的字面量不算
+        main_block = _main_block(tree)
+        if main_block is None:
+            problems.append(f"{path.name}: 缺少 __main__ 块")
+            continue
+        calls = [
+            node
+            for node in ast_module.walk(main_block)
+            if isinstance(node, ast_module.Call)
+        ]
+        runs = [
+            call
+            for call in calls
+            if isinstance(call.func, ast_module.Attribute)
+            and call.func.attr == "run"
+            and isinstance(call.func.value, ast_module.Name)
+            and call.func.value.id == "asyncio"
+        ]
+        # 通用 globals() 自动发现清单：循环内以 asyncio.run(func(...))
+        # 分发到每个用例，覆盖全部 async 测试
+        generic = any(
+            isinstance(argument, ast_module.Call)
+            and isinstance(argument.func, ast_module.Name)
+            and argument.func.id == "func"
+            for call in runs
+            for argument in call.args
+        )
+        if generic:
+            continue
+        ran_names = {
+            argument.func.id
+            for call in runs
+            for argument in call.args
+            if isinstance(argument, ast_module.Call)
+            and isinstance(argument.func, ast_module.Name)
+        }
+        missing = [name for name in async_tests if name not in ran_names]
+        if missing:
             problems.append(
-                f"{path.name}: {', '.join(sorted(async_tests)[:3])}"
+                f"{path.name}: {', '.join(sorted(missing)[:3])} 未被 asyncio.run 执行"
             )
     assert not problems, "\n".join(problems)
     print("✓ 含 async 用例的直跑文件都会真正执行")
@@ -5444,6 +5501,11 @@ def test_migrate_dedupes_preference_types():
 
 
 if __name__ == "__main__":
+    # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
+    # conftest 回收，登记后在进程退出时统一清理
+    import _tmp_registry
+
+    _tmp_registry.install()
     # 直跑模式自动发现全部用例：monkeypatch / tmp_path 自动提供，
     # 可选 caplog（默认 None，用例自带无 caplog 分支）按 None 传入；
     # 其余需 pytest 专用夹具的用例计入跳过数并明确报告
