@@ -215,6 +215,9 @@ def test_client_uses_dedicated_connection_on_pymilvus3(monkeypatch):
     print("✓ pymilvus 3 使用 dedicated 连接，2.x 不下发未知参数")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for plain_case in (
         test_uses_max_id_not_row_count,
         test_empty_collection_starts_at_one,

@@ -390,5 +390,8 @@ def test_case_collision_user_id_is_refused(tmp_path):
     print("✓ 用户 ID 大小写冲突拒绝访问同一记忆文件")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_cross_process_increments_are_not_lost()
     print("\n全部通过（monkeypatch 用例需 pytest）")

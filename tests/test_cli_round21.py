@@ -47,6 +47,9 @@ def test_is_pipe_error_predicate():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     _mp = pytest.MonkeyPatch()
     try:
         test_onetime_command_wraps_stdout_for_pipe_safety(_mp)

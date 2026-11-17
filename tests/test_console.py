@@ -565,6 +565,9 @@ def test_configure_stdio_isatty_error_and_wrap_failure(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_idle_pipe_does_not_block_startup()
     mp = pytest.MonkeyPatch()
     try:

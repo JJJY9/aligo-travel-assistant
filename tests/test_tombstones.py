@@ -299,6 +299,9 @@ def test_unmark_accepts_bytes_value(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_deleted_key_matches_web_contract()
     for case in (
         test_mark_writes_nx_with_ttl,

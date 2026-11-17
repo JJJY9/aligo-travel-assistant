@@ -346,6 +346,9 @@ def test_apply_removes_when_unchanged_with_verify():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_plan_keeps_earliest_and_normalizes_dates()
     test_plan_matches_linebreak_variants()
     test_plan_skips_group_when_kept_row_vanished()

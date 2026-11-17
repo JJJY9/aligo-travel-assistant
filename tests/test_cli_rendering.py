@@ -411,6 +411,9 @@ def test_local_timestamp_text_tolerates_extreme_years():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     mp = pytest.MonkeyPatch()
     try:
         test_missing_api_key_exits_cleanly(mp)

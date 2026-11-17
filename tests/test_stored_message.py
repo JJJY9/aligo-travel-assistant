@@ -73,6 +73,9 @@ def test_render_escapes_lone_surrogates():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_user_message_is_raw()
     test_assistant_plain_text_is_raw()
     test_assistant_orchestration_json_rendered()

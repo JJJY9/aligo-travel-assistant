@@ -210,6 +210,9 @@ def test_read_errors_return_none(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_load_skills_tolerates_malformed_entries()
     test_get_skill_prompt_sorted_and_mapped()
     test_missing_skills_dir_returns_empty()

@@ -1127,6 +1127,11 @@ def test_kb_show_json_missing_document(monkeypatch):
     print("✓ kb-show --json 缺失片段输出 JSON 错误")
 
 if __name__ == "__main__":
+    import _stdio
+    import _tmp_registry
+
+    _stdio.ensure_utf8()
+    _tmp_registry.install()
     for case in (
         test_list_unavailable,
         test_list_prints_items,

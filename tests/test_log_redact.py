@@ -147,6 +147,9 @@ def test_redaction_keeps_url_after_spacey_cjk_path():
     print("✓ 路径后的 URL 仍被整体遮蔽")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_secret_masks_bare_api_keys()

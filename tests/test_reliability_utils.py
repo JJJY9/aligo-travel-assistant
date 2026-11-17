@@ -714,6 +714,9 @@ def test_health_check_redacts_api_key_in_error(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     _mp = pytest.MonkeyPatch()
     try:
         test_retriable_error_classification()

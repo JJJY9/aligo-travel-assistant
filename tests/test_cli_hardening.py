@@ -186,6 +186,9 @@ def test_doctor_falls_back_without_rich(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for case in (
         test_unknown_command_exits_2,
         test_commands_hint_matches_dispatch,

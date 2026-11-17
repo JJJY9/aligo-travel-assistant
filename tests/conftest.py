@@ -39,5 +39,18 @@ def _clean_created_tempdirs(monkeypatch):
 
     monkeypatch.setattr(tempfile, "mkdtemp", tracked_mkdtemp)
     yield
+    # 用例可能 chdir 进了自建目录（Windows 上目录非空 / 被占用时
+    # rmtree 会失败）：先离开再删，monkeypatch 之后仍会恢复原 cwd
+    import os
+
+    cwd = os.path.realpath(os.getcwd())
     for path in created:
+        real = os.path.realpath(path)
+        try:
+            inside = os.path.commonpath([cwd, real]) == real
+        except ValueError:
+            inside = False
+        if inside:
+            os.chdir(tempfile.gettempdir())
+            cwd = os.path.realpath(os.getcwd())
         shutil.rmtree(path, ignore_errors=True)

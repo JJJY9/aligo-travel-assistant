@@ -114,6 +114,10 @@ def test_user_export_writes_json_and_markdown(monkeypatch):
     markdown = md_path.read_text(encoding="utf-8")
     assert "## 用户偏好" in markdown and "## 历史行程" in markdown
     assert "你好" in markdown
+    # CLI / Web 导出与体积轴统一按 LF：Windows 默认 CRLF 会让同一份
+    # 数据每行多 1 字节，接近上限时两通道结论不一致
+    assert b"\r\n" not in json_path.read_bytes(), "导出的 JSON 必须是 LF"
+    assert b"\r\n" not in md_path.read_bytes(), "导出的 Markdown 必须是 LF"
     assert "已导出：" in out
     print("✓ user-export 写出 JSON + Markdown")
 
@@ -301,6 +305,9 @@ def test_user_export_scans_existing_quarantine_backups(monkeypatch, tmp_path):
 
 
 if __name__ == "__main__":
+    import _tmp_registry
+
+    _tmp_registry.install()
     import sys
 
     # Windows 控制台 / 重定向管道默认 GBK：✓ 等字符会抛 UnicodeEncodeError，

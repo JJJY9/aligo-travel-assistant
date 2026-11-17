@@ -210,6 +210,9 @@ def test_webapp_uses_redis_rate_limit_across_instances(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_shared_window_across_instances()
     test_concurrent_checks_share_atomic_quota()
     test_peek_does_not_record_and_window_expires()

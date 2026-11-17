@@ -1479,6 +1479,9 @@ def test_deferred_commit_checks_tombstone_before_commit():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     mp = pytest.MonkeyPatch()
     try:
         test_ask_runs_memory_io_off_event_loop()

@@ -149,6 +149,9 @@ def test_reply_none_returns_valid_content():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_string_preference_not_split()
     test_list_preference_joined()
     test_result_parsed()

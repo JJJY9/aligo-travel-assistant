@@ -516,6 +516,9 @@ def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     _mp = pytest.MonkeyPatch()
     try:
         test_json_add_chat_turn_writes_pair_once()

@@ -359,4 +359,7 @@ def test_redis_short_term_replays_after_outage(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     print("该测试需要 TEST_REDIS_URL，请通过 pytest 运行")

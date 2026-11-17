@@ -201,6 +201,9 @@ def test_cli_id_validation_matches_web():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for case in (
         test_health_json_ok,
         test_health_json_failure,

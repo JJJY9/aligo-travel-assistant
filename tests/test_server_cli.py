@@ -60,5 +60,8 @@ def test_public_bind_warns(monkeypatch, caplog):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_loopback_host_detection()
     print("\n全部通过（--version / 监听警告用例需 pytest 的 capsys / caplog）")

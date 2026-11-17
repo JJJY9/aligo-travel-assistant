@@ -34,5 +34,8 @@ def test_cli_version_flag(monkeypatch, capsys):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_version_format_and_shared()
     print("\n全部通过（--version 用例需 pytest 的 capsys）")

@@ -249,6 +249,9 @@ def test_stats_dispatch(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     mp = pytest.MonkeyPatch()
     try:
         test_stats_text_and_json(mp)

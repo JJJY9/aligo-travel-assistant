@@ -149,6 +149,9 @@ def test_rag_agent_checks_db_before_loading_embeddings(tmp_path, monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     _mp = None
     test_weather_city_extraction_rejects_pronoun_fragments()
     test_starts_with_json_array_ignores_preamble_arrays()

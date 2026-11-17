@@ -1319,6 +1319,11 @@ def test_parse_csv_row_limit_can_be_disabled_for_export_roundtrip():
     print("✓ 导出的超限 CSV 可关闭行数上限回读")
 
 if __name__ == "__main__":
+    import _stdio
+    import _tmp_registry
+
+    _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_parse_chinese_and_english_headers()
     test_parse_skips_invalid_rows()
     test_parse_missing_columns_and_empty()

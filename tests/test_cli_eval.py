@@ -270,6 +270,9 @@ def test_json_output(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     import pytest
 
     for case in (

@@ -244,4 +244,7 @@ async def test_information_query_agent():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     asyncio.run(test_information_query_agent())

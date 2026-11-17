@@ -1491,7 +1491,9 @@ class AligoCLI:
             "exported_at": datetime.now().isoformat(timespec="seconds"),
             **sections,
         }
-        problem = backup_limit_problem(data)
+        # 与 user-export 的落盘口径一致：导出文件固定 LF（newline="\n"），
+        # 体积轴按 LF 估算，不再按平台 CRLF 高估
+        problem = backup_limit_problem(data, crlf=False)
         if problem:
             self.console.print(
                 f"[red]导出中止：{problem}（该文件将无法再导入恢复，"
@@ -2943,7 +2945,9 @@ def run_user_export_standalone(
 
     from utils.user_import import backup_limit_problem
 
-    problem = backup_limit_problem(data)
+    # 导出文件固定 LF（exporter write_text_atomic newline="\n"）：体积轴
+    # 按 LF 估算，CLI 与 Web 导出同字节、同口径
+    problem = backup_limit_problem(data, crlf=False)
     if problem:
         print(
             f"导出中止：{problem}（该文件将无法再导入恢复，"
@@ -3016,12 +3020,7 @@ def run_user_import_standalone(
         # 不存在 / 不可读交给下面的读取步骤给出具体原因
         pass
     try:
-        # newline=""：保留文件真实行尾（不做行尾统一），体积轴按导入
-        # 文件自身的行尾口径估算——Web 下载的 LF 备份与 CLI 导出的
-        # CRLF 备份在 CLI / Web 两入口得到同一结论
-        text = io.open(
-            json_path, "r", encoding="utf-8-sig", newline=""
-        ).read()
+        text = io.open(json_path, "r", encoding="utf-8-sig").read()
     except FileNotFoundError:
         return _fail(f"文件不存在：{json_path}")
     except UnicodeDecodeError as exc:
@@ -3029,7 +3028,6 @@ def run_user_import_standalone(
     except OSError as exc:
         return _fail(f"读取备份失败：{exc}")
 
-    file_crlf = (chr(13) + chr(10)) in text
     sections, errors = parse_user_export(text)
     if skip_knowledge:
         sections.pop("knowledge", None)
@@ -3116,7 +3114,8 @@ def run_user_import_standalone(
                 sections,
                 pg_shape=bool(STORAGE_CONFIG.get("postgres_dsn")),
                 existing=snapshot,
-                crlf=file_crlf,
+                # CLI / Web 导出都固定写 LF，体积轴同口径
+                crlf=False,
             )
             if limit_problem:
                 return _fail(
@@ -3126,7 +3125,7 @@ def run_user_import_standalone(
             # 备份自身不超限不代表恢复后仍可导出：与账号既有数据合并后按
             # 导出格式复核体积（与 Web /api/import 同口径；复用同一快照）
             merged_problem = merged_backup_limit_problem(
-                store, sections, existing=snapshot, crlf=file_crlf
+                store, sections, existing=snapshot, crlf=False
             )
             if merged_problem:
                 return _fail(

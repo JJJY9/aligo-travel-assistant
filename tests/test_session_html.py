@@ -99,6 +99,9 @@ def test_empty_bundle_renders_placeholder():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_single_session_escapes_every_dynamic_field()
     test_assistant_message_text_variants()
     test_all_sessions_bundle_grouping_and_escaping()

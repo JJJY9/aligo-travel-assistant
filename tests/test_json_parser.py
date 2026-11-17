@@ -313,6 +313,9 @@ def test_parse_failure_log_is_single_line_and_short(caplog):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     mp = pytest.MonkeyPatch()
     try:
         test_escaped_quotes_in_string_do_not_break_scan()

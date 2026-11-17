@@ -225,6 +225,9 @@ def test_dispatch_strict(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for case in (
         test_export_to_stdout,
         test_export_to_file_and_overwrite_protection,

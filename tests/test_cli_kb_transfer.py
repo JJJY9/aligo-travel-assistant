@@ -570,6 +570,9 @@ def test_export_failure_preserves_existing_file(monkeypatch):
     print("✓ kb-export 写入失败保留旧备份")
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for case in (
         test_export_writes_json,
         test_export_refuses_overwrite_without_force,

@@ -191,6 +191,11 @@ def test_render_markdown_escapes_table_cells():
 
 
 if __name__ == "__main__":
+    import _stdio
+    import _tmp_registry
+
+    _stdio.ensure_utf8()
+    _tmp_registry.install()
     test_memory_manager_export_data()
     test_render_markdown()
     test_render_markdown_renders_assistant_orchestration_json()

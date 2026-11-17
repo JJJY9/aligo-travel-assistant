@@ -391,6 +391,9 @@ def test_transient_renew_failure_keeps_lock():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_fallback_when_redis_unavailable()
     test_factory_failure_falls_back_to_local()
     test_contended_redis_lock_releases_local()

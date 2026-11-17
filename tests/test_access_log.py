@@ -74,6 +74,9 @@ def test_json_formatter_merges_access_fields():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     import pytest
 
     mp = pytest.MonkeyPatch()

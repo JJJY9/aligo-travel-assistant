@@ -183,7 +183,12 @@ def export_files(
     json_path = out / f"{stem}.json"
     md_path = out / f"{stem}.md"
     write_text_atomic(
-        json_path, json.dumps(cleaned, ensure_ascii=False, indent=2)
+        json_path,
+        json.dumps(cleaned, ensure_ascii=False, indent=2),
+        # 固定 LF：体积上限按 indent=2 的 LF 口径估算，CLI 与 Web 导出
+        # 同字节；Windows 的默认 CRLF 翻译会让同一份数据多出每行 1 字节，
+        # 接近上限时两通道结论不一致
+        newline="\n",
     )
-    write_text_atomic(md_path, render_markdown(cleaned))
+    write_text_atomic(md_path, render_markdown(cleaned), newline="\n")
     return [json_path, md_path]

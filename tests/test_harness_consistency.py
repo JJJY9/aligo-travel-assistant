@@ -77,6 +77,26 @@ def test_main_loops_pass_monkeypatch():
     print("✓ __main__ 循环用例签名一致（均接受 monkeypatch）")
 
 
+def test_main_blocks_guard_utf8_output():
+    """每个直跑清单的 __main__ 必须切换 stdout/stderr 到 UTF-8（或调用
+    共享守卫 tests/_stdio.py）：GBK 控制台下第一个 ✓ 即
+    UnicodeEncodeError，后续用例全部不执行却看起来「跑过」。"""
+    marker = 'if __name__ == "__main__":'
+    problems: list[str] = []
+    for path in sorted(TESTS_DIR.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        if marker not in text:
+            continue
+        block = text[text.rfind(marker):]
+        guarded = "_stdio.ensure_utf8()" in block or (
+            "reconfigure(" in block and 'encoding="utf-8"' in block
+        )
+        if not guarded:
+            problems.append(path.name)
+    assert not problems, "缺 UTF-8 守卫：" + ", ".join(problems)
+    print("✓ 直跑清单均切换 UTF-8 输出")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -90,4 +110,5 @@ if __name__ == "__main__":
     except (OSError, ValueError):
         pass
     test_main_loops_pass_monkeypatch()
+    test_main_blocks_guard_utf8_output()
     print("\n全部通过")

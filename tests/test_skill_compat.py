@@ -63,6 +63,9 @@ def test_loads_class_from_skill_file(monkeypatch):
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     for case in (
         test_missing_file_raises,
         test_missing_class_raises,

@@ -417,6 +417,9 @@ def test_config_local_loaded_without_cwd_on_sys_path():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_api_key_is_stripped_and_blank_falls_back()
     test_storage_urls_strip_whitespace_and_bom()
     test_llm_request_timeout_env()

@@ -250,6 +250,9 @@ def test_punctuation_only_chunks_dropped():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_sections_not_mixed()
     test_faq_questions_separated()
     test_long_paragraph_split()
