@@ -318,6 +318,39 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
             events.append((lineno, col, 0, "new", target.id))
             continue
         if not isinstance(node, ast.Call):
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "case"
+            ):
+                # 循环清单：case(mp) 的补丁实例必须在循环体内新建；
+                # 循环外创建会让每轮用例共享同一补丁作用域（跨轮泄漏）
+                inner_new = {
+                    target.id
+                    for stmt in ast.walk(node)
+                    if isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    for target in [stmt.targets[0]]
+                }
+                for stmt in ast.walk(node):
+                    if not (
+                        isinstance(stmt, ast.Call)
+                        and isinstance(stmt.func, ast.Name)
+                        and stmt.func.id == "case"
+                    ):
+                        continue
+                    for arg in stmt.args:
+                        if (
+                            isinstance(arg, ast.Name)
+                            and arg.id in patch_vars
+                            and arg.id not in inner_new
+                        ):
+                            problems.append(
+                                f"{name}:{stmt.lineno} case({arg.id}) 在循环内"
+                                "复用循环外创建的 MonkeyPatch：每轮用例"
+                                "共享同一补丁作用域，补丁会跨轮泄漏"
+                            )
             continue
         func = node.func
         if (
@@ -329,7 +362,9 @@ def _monkeypatch_reuse_problems(source: str, name: str) -> list[str]:
             events.append(
                 (int(node.lineno), int(node.col_offset), 1, "undo", func.value.id)
             )
-        elif isinstance(func, ast.Name) and func.id.startswith("test_"):
+        elif isinstance(func, ast.Name) and (
+            func.id.startswith("test_") or func.id == "case"
+        ):
             arg_values: list[ast.expr] = list(node.args) + [
                 keyword.value for keyword in node.keywords
             ]
@@ -496,6 +531,29 @@ def test_monkeypatch_reuse_check_covers_renamed_vars():
     )
     problems = _monkeypatch_reuse_problems(never_undone, "synthetic.py")
     assert problems and "从未撤销" in problems[0], problems
+    # 循环清单的 case(mp) 同样是补丁使用：mp 在循环外创建、多轮复用必须报
+    loop_reuse = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    mp = pytest.MonkeyPatch()\n"
+        "    for case in (test_a, test_b):\n"
+        "        case(mp)\n"
+    )
+    problems = _monkeypatch_reuse_problems(loop_reuse, "synthetic.py")
+    assert problems and "共享同一" in problems[0], problems
+
+    # 每轮新建 / 撤销的安全循环写法不报问题
+    loop_ok = (
+        "import pytest\n"
+        "if __name__ == '__main__':\n"
+        "    for case in (test_a, test_b):\n"
+        "        mp = pytest.MonkeyPatch()\n"
+        "        try:\n"
+        "            case(mp)\n"
+        "        finally:\n"
+        "            mp.undo()\n"
+    )
+    assert _monkeypatch_reuse_problems(loop_ok, "synthetic.py") == []
     print("✓ MonkeyPatch 复用自检覆盖任意变量名")
 
 

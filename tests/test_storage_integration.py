@@ -1602,7 +1602,12 @@ if __name__ == "__main__":
     )
     if skipped_names:
         print("直跑跳过：" + "、".join(skipped_names))
-    print(
-        f"\n全部通过（{ran}/{total} 个用例；"
-        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
-    )
+    if skipped:
+        # 大量条件跳过时不宣称「全部通过」：真实服务缺失（PG / Redis）
+        # 下清单只验证了可运行部分，汇总要如实区分
+        print(
+            f"\n执行完成（{ran} 个通过；{skipped} 个按条件跳过 / "
+            "需 pytest 专用夹具）"
+        )
+    else:
+        print(f"\n全部通过（{ran}/{total} 个用例）")
