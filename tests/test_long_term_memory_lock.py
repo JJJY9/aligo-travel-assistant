@@ -411,6 +411,11 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     _tmp_registry.install()
     test_cross_process_increments_are_not_lost()
-    print("\n全部通过（monkeypatch 用例需 pytest）")
+    if _DIRECT_RUN_SKIP:
+        print(
+            f"\n执行完成（1 个通过；{len(_DIRECT_RUN_SKIP)} 个需 pytest 专用夹具）"
+        )
+    else:
+        print("\n全部通过")
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

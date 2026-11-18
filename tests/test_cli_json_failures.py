@@ -485,7 +485,10 @@ if __name__ == "__main__":
     )
     if skipped_names:
         print("直跑跳过：" + "、".join(skipped_names))
-    print(
-        f"\n全部通过（{ran}/{total} 个用例；"
-        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
-    )
+    if skipped:
+        print(
+            f"\n执行完成（{ran} 个通过；{skipped} 个按条件跳过 / "
+            "需 pytest 专用夹具）"
+        )
+    else:
+        print(f"\n全部通过（{ran}/{total} 个用例）")
