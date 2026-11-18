@@ -12190,6 +12190,13 @@ def test_persistence_failure_detail_keeps_quarantine_hint():
     assert "损坏" in marker_failed, marker_failed
     assert "存储暂时不可用" not in marker_failed, marker_failed
     assert "备份文件恢复" not in marker_failed, marker_failed
+    # 导入互斥锁冲突：可重试，但保留可行动的原因
+    import_busy = server_module._persistence_failure_detail(
+        MemoryPersistenceError("另一个导入正在进行，请稍后重试：锁被占用"),
+        "rid-6",
+    )
+    assert "另一个导入正在进行" in import_busy, import_busy
+    assert "存储暂时不可用" not in import_busy, import_busy
 
 
 def test_persistence_detail_prefix_only():
@@ -12904,7 +12911,43 @@ if __name__ == "__main__":
     )
     if skipped_names:
         print("直跑跳过：" + "、".join(skipped_names))
-    print(
-        f"\n全部通过（{ran}/{total} 个用例；"
-        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
-    )
+    if skipped:
+        print(
+            f"\n执行完成（{ran} 个通过；{skipped} 个按条件跳过 / "
+            "需 pytest 专用夹具）"
+        )
+    else:
+        print(f"\n全部通过（{ran}/{total} 个用例）")
+
+
+def test_cached_session_protected_during_quarantine_probe(monkeypatch):
+    """缓存命中的锁外隔离探测期间会话被占住：探测窗口内的容量回收不能
+    驱逐刚命中的条目（此前已命中请求会落入饱和预检 503）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_probe_protect")
+    chat = {"message": "你好", "user_id": user_id, "session_id": "s1"}
+    try:
+        first = client.post("/api/chat", json=chat)
+        assert first.status_code == 200, first.text
+        key = state._session_key(user_id, "s1")
+        observed = {}
+        original = server_module._quarantine_marker_for
+
+        def probing(user, long_term):
+            with state._sessions_lock:
+                item = state.sessions.get(key)
+                observed["in_use"] = None if item is None else item.in_use()
+            return original(user, long_term)
+
+        monkeypatch.setattr(server_module, "_quarantine_marker_for", probing)
+        second = client.post("/api/chat", json=chat)
+        assert second.status_code == 200, second.text
+        assert observed.get("in_use") is True, observed
+        with state._sessions_lock:
+            assert not state.sessions[key].in_use()
+    finally:
+        _cleanup(user_id)
+    print("✓ 探测窗口内缓存命中被占住（不被容量回收驱逐）")

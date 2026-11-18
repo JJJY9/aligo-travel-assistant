@@ -1437,11 +1437,25 @@ class AligoWebApp:
         session: _WebSession | None = None
         with self._sessions_lock:
             cached = self.sessions.get(key)
+            if cached is not None and mark_in_use:
+                # 锁外隔离探测期间先占住缓存：否则探测与重取之间条目会被
+                # 容量回收驱逐，原本可命中的请求落入饱和预检 503。
+                # in_use 的条目不会被 _evict_over_limit_locked 选中
+                cached.begin_turn()
         if cached is not None:
             # 隔离探测含文件系统扫描（同步盘 / 网络盘 stat 可阻塞数秒）：
             # 必须在 _sessions_lock 之外执行——锁内会让所有用户的会话查找
             # 串行排队，默认线程池被等锁调用占满后其它 to_thread 工作一起停摆
-            if _quarantine_marker_for(user_id, _session_long_term(cached)):
+            try:
+                quarantined = _quarantine_marker_for(
+                    user_id, _session_long_term(cached)
+                )
+            except BaseException:
+                # 探测异常不能泄漏占用计数（否则该会话永远不会被回收）
+                if mark_in_use:
+                    cached.end_turn()
+                raise
+            if quarantined:
                 # 会话缓存期间账号被隔离：驱逐缓存，走下面新建路径由
                 # 构造守卫返回带恢复引导的 503（不再先白跑整轮 LLM）。
                 # 构造必然抛错，evicted 的延迟关闭不可达——在锁外立即关闭
@@ -1449,14 +1463,21 @@ class AligoWebApp:
                     if self.sessions.get(key) is cached:
                         self.sessions.pop(key, None)
                         quarantine_stale = cached
+                # 探测前占住的计数归还（关闭前配对；即使已被并发替换也
+                # 只归还本线程占用的一次）
+                if mark_in_use:
+                    cached.end_turn()
             else:
                 with self._sessions_lock:
                     if self.sessions.get(key) is cached:
                         session = cached
                         self.sessions.move_to_end(key)
-                        if mark_in_use:
-                            session.begin_turn()
                         self._evict_over_limit_locked(key, evicted)
+                    else:
+                        # 探测期间条目被并发隔离 / 替换驱逐：归还占住
+                        # 计数后按未命中处理，走下面的新建路径
+                        if mark_in_use:
+                            cached.end_turn()
                 # 探测与重取锁之间被其它线程驱逐 / 替换：按未命中处理，
                 # 走下面的新建路径
         if quarantine_stale is not None:
@@ -2445,6 +2466,10 @@ _CASE_CONFLICT_PREFIXES = ("用户 ID 与已有记忆文件仅大小写不同",)
 # 「存储暂时不可用，请稍后再试」——重试永远不会成功
 _CHAT_CAP_PREFIXES = ("聊天消息总数已达上限",)
 
+# 导入互斥锁冲突：可重试，但「另一个导入正在进行」是用户能行动的原因，
+# 不能吞成通用「存储暂时不可用」
+_IMPORT_BUSY_PREFIXES = ("另一个导入正在进行",)
+
 
 def _persistence_failure_detail(
     exc: Exception, request_id: str | None = None
@@ -2476,6 +2501,9 @@ def _persistence_failure_detail(
             "聊天消息总数已达上限（20 万条），请先清理历史消息"
             f"（删除不再需要的会话）后再试{suffix}"
         )
+    if text.startswith(_IMPORT_BUSY_PREFIXES):
+        # 可重试，但保留可行动的原因（另一个导入正在进行）
+        return f"另一个导入正在进行，请稍后重试{suffix}"
     return f"存储暂时不可用，请稍后再试{suffix}"
 
 

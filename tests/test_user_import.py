@@ -3607,15 +3607,29 @@ def test_preview_probe_skips_write_agent_when_collection_missing(monkeypatch):
     _real_knowledge_ready_probe()
     assert calls == {"agent": 0, "model": 1}, calls
 
-    # 集合存在：仍走写路径 Agent（保持「initialized=False 视为不可用」）
+    # 集合存在：仍走写路径 Agent（计数替身真实执行，initialized 判定生效）
     monkeypatch.setattr(kb, "_collection_exists", lambda: True)
+    agent_calls = {"n": 0}
 
     class _Agent:
         initialized = True
 
-    monkeypatch.setattr(kb, "_get_agent", lambda: _Agent())
+    def fake_get_agent():
+        agent_calls["n"] += 1
+        return _Agent()
+
+    monkeypatch.setattr(kb, "_get_agent", fake_get_agent)
     _real_knowledge_ready_probe()
-    assert calls == {"agent": 0, "model": 1}, calls
+    assert agent_calls["n"] == 1, agent_calls
+    assert calls["model"] == 1, calls
+
+    # initialized=False 视为不可用
+    class _BadAgent:
+        initialized = False
+
+    monkeypatch.setattr(kb, "_get_agent", lambda: _BadAgent())
+    with pytest.raises(RuntimeError, match="不可用"):
+        _real_knowledge_ready_probe()
     print("✓ 半初始化库的预览探针不创建集合")
 
 
@@ -5240,7 +5254,10 @@ if __name__ == "__main__":
     )
     if skipped_names:
         print("直跑跳过：" + "、".join(skipped_names))
-    print(
-        f"\n全部通过（{ran}/{total} 个用例；"
-        f"{skipped} 个需 pytest 专用夹具或按条件跳过）"
-    )
+    if skipped:
+        print(
+            f"\n执行完成（{ran} 个通过；{skipped} 个按条件跳过 / "
+            "需 pytest 专用夹具）"
+        )
+    else:
+        print(f"\n全部通过（{ran}/{total} 个用例）")
