@@ -11,7 +11,9 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -1456,6 +1458,117 @@ def test_rag_search_top_k_bounds():
     print("✓ search_knowledge top_k 边界")
 
 
+def test_rag_hybrid_search_includes_bm25_only_documents(monkeypatch):
+    """混合检索：只在 BM25 路命中的片段也进入结果，并带可解释分数。"""
+    module = _load_skill_module("ask-question")
+    agent_class = module.RAGKnowledgeAgent
+    agent = object.__new__(agent_class)
+    agent.initialized = True
+    agent.top_k = 5
+    agent.collection_name = "kb"
+    agent.knowledge_base_path = Path(tempfile.mkdtemp())
+    agent._milvus_db_path = str(agent.knowledge_base_path / "milvus_lite.db")
+
+    class _Embedding:
+        def encode(self, query):
+            class _Vector:
+                def tolist(self):
+                    return [0.0]
+
+            return _Vector()
+
+    class _Iterator:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def next(self):
+            rows, self._rows = self._rows, []
+            return rows
+
+        def close(self):
+            pass
+
+    class _Client:
+        def load_collection(self, name):
+            pass
+
+        def search(self, **kwargs):
+            return [
+                [
+                    {
+                        "entity": {
+                            "id": 1,
+                            "content": "住宿标准：一线城市每晚 600 元",
+                            "metadata": "{}",
+                        },
+                        "distance": 0.62,
+                    },
+                    {
+                        "entity": {
+                            "id": 2,
+                            "content": "市内交通标准：每天 100 元",
+                            "metadata": "{}",
+                        },
+                        "distance": 0.55,
+                    },
+                ]
+            ]
+
+        def query_iterator(self, **kwargs):
+            return _Iterator(
+                [
+                    {
+                        "id": 1,
+                        "content": "住宿标准：一线城市每晚 600 元",
+                        "metadata": "{}",
+                    },
+                    {
+                        "id": 2,
+                        "content": "市内交通标准：每天 100 元",
+                        "metadata": "{}",
+                    },
+                    {
+                        "id": 3,
+                        "content": "住宿标准：二线城市每晚 400 元",
+                        "metadata": "{}",
+                    },
+                ]
+            )
+
+    fake_client = _Client()
+    monkeypatch.setattr(
+        module, "get_milvus_client", lambda path: fake_client
+    )
+    agent.embedding_model = _Embedding()
+    agent._ensure_connection = lambda: None
+    agent._reranker = None
+    agent._reranker_failed = False
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+
+    from config import RAG_CONFIG
+
+    monkeypatch.setitem(RAG_CONFIG, "hybrid_enabled", True)
+    monkeypatch.setitem(RAG_CONFIG, "hybrid_candidates", 20)
+    monkeypatch.setitem(RAG_CONFIG, "rrf_k", 60)
+    monkeypatch.setitem(RAG_CONFIG, "rerank_model", "")
+    monkeypatch.setitem(RAG_CONFIG, "rerank_candidates", 20)
+    monkeypatch.setitem(RAG_CONFIG, "bm25_max_docs", 20000)
+    monkeypatch.setitem(RAG_CONFIG, "bm25_ttl_sec", 60)
+
+    hybrid_docs = agent.search_knowledge("住宿标准", hybrid=True)
+    ids = {doc["id"] for doc in hybrid_docs}
+    assert ids == {1, 2, 3}, f"BM25 独有片段应进入结果: {hybrid_docs}"
+    by_id = {doc["id"]: doc for doc in hybrid_docs}
+    assert by_id[3]["bm25_score"] > 0
+    assert by_id[3]["distance"] > 0, "关键词命中应通过混合相关性阈值"
+    assert by_id[1]["distance"] >= 0.62
+
+    vector_only = agent.search_knowledge("住宿标准")
+    assert [doc["id"] for doc in vector_only] == [1, 2], "默认仍为纯向量口径"
+    print("✓ 混合检索纳入 BM25 独有片段，默认接口保持纯向量")
+
+
 def test_rag_dimension_mismatch_fails_init():
     """集合维度与嵌入模型不一致时初始化直接失败（否则每问都抛底层 matmul 异常）。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
@@ -1614,7 +1727,7 @@ def test_rag_reply_filters_low_score_documents():
 
     agent = _Agent()
     docs = [{"id": "1", "content": "无关片段", "metadata": {}, "distance": 0.3}]
-    agent.search_knowledge = lambda q, k=None, s=False: list(docs)
+    agent.search_knowledge = lambda q, k=None, s=False, hybrid=False: list(docs)
     out = asyncio.run(
         agent.reply(Msg(name="x", content="今天适合吃什么水果", role="user"))
     )

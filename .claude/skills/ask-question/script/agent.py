@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import threading
+import time
 
 # Add project root to sys.path
 import sys
@@ -67,12 +68,25 @@ except ImportError as e:
     DEPENDENCIES_AVAILABLE = False
 
 from utils.embedding_model import embedding_dimension, get_embedding_model
+from utils.hybrid_retrieval import BM25Index, annotate_hybrid_scores, rrf_fuse
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
 # 进程内集合初始化互斥：并发的首次构造都会看到 has_collection=False，
 # 同时 create_collection 会让其中一个抛 MilvusException
 _COLLECTION_INIT_LOCK = threading.Lock()
+
+# BM25 索引缓存：模块在会话间共享（_MODULE_CACHE），同一知识库只构建
+# 一次；写入后按知识库键失效，TTL 兜住其它进程的修改。
+_BM25_CACHE: dict[tuple[str, str], tuple[float, BM25Index]] = {}
+_BM25_FAILED_AT: dict[tuple[str, str], float] = {}
+_BM25_CACHE_LOCK = threading.Lock()
+_BM25_KEY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+
+
+def _bm25_key_lock(key: tuple[str, str]) -> threading.Lock:
+    with _BM25_CACHE_LOCK:
+        return _BM25_KEY_LOCKS.setdefault(key, threading.Lock())
 
 
 class RAGKnowledgeAgent(AgentBase):
@@ -102,6 +116,9 @@ class RAGKnowledgeAgent(AgentBase):
         self.knowledge_base_path = Path(knowledge_base_path)
         self.collection_name = collection_name
         self.top_k = top_k
+        # 重排模型懒加载；加载失败后本实例不再重试
+        self._reranker = None
+        self._reranker_failed = False
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
 
@@ -393,6 +410,9 @@ class RAGKnowledgeAgent(AgentBase):
                 record_used_entity_id(
                     self.milvus_client, self.collection_name, inserted_ids[-1]
                 )
+                # 知识库内容已变化：进程级 BM25 缓存立即失效，下一次检索
+                # 重建索引（其它进程由 TTL 兜底）
+                self._invalidate_bm25_cache()
 
             # 获取总数（仅用于展示；统计失败不能把已成功的写入报成失败）
             try:
@@ -435,6 +455,7 @@ class RAGKnowledgeAgent(AgentBase):
                 ],
             )
             logger.info(f"Successfully updated document {document_id}")
+            self._invalidate_bm25_cache()
             return {"status": "success", "id": int(document_id)}
         except Exception as e:
             logger.error(f"Error updating document: {e}")
@@ -448,7 +469,13 @@ class RAGKnowledgeAgent(AgentBase):
         """
         return next_entity_id(self.milvus_client, self.collection_name)
 
-    def search_knowledge(self, query: str, top_k: int | None = None, strict: bool = False) -> list[dict]:
+    def search_knowledge(
+        self,
+        query: str,
+        top_k: int | None = None,
+        strict: bool = False,
+        hybrid: bool = False,
+    ) -> list[dict]:
         """
         检索知识库
 
@@ -457,6 +484,9 @@ class RAGKnowledgeAgent(AgentBase):
             top_k: 返回top k个结果
             strict: 为 True 时不吞掉异常（未初始化 / 后端故障直接抛出），
                 供需要区分“空结果”与“检索失败”的管理接口使用
+            hybrid: 是否启用混合检索（向量 + BM25 + RRF）。仅聊天问答
+                路径开启；管理 / 评测接口保持纯向量口径。配置
+                RAG_CONFIG["hybrid_enabled"] 为 False 时仍退回纯向量。
 
         Returns:
             检索结果列表
@@ -497,6 +527,14 @@ class RAGKnowledgeAgent(AgentBase):
                 if k <= 0:
                     return []
 
+            # 混合检索需要比最终 top-k 更宽的向量候选（BM25 路同样取
+            # hybrid_candidates），否则向量路只有 top-k 条可供融合
+            search_limit = k
+            if hybrid:
+                hybrid_enabled, hybrid_candidates = self._hybrid_settings()
+                if hybrid_enabled:
+                    search_limit = max(k, hybrid_candidates)
+
             # 生成查询向量
             query_embedding = self.embedding_model.encode(query).tolist()
 
@@ -516,7 +554,7 @@ class RAGKnowledgeAgent(AgentBase):
                 results = self.milvus_client.search(
                     collection_name=self.collection_name,
                     data=[query_embedding],
-                    limit=k,
+                    limit=search_limit,
                     output_fields=["id", "content", "metadata"]
                 )
 
@@ -538,6 +576,9 @@ class RAGKnowledgeAgent(AgentBase):
                         'distance': hit.get("distance", 0.0)
                     })
 
+            if hybrid and retrieved_docs:
+                retrieved_docs = self._hybrid_search(query, retrieved_docs, k)
+
             logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query[:50]}")
             return retrieved_docs
 
@@ -546,6 +587,173 @@ class RAGKnowledgeAgent(AgentBase):
             if strict:
                 raise
             return []
+
+    def _hybrid_settings(self) -> tuple[bool, int]:
+        """读取混合检索开关与候选宽度；配置不可用时按开启 / 20 条。"""
+        try:
+            from config import RAG_CONFIG
+
+            enabled = bool(RAG_CONFIG.get("hybrid_enabled", True))
+            candidates = int(RAG_CONFIG.get("hybrid_candidates", 20) or 20)
+        except Exception:  # noqa: BLE001 - 配置异常按默认值
+            return True, 20
+        return enabled, max(1, min(200, candidates))
+
+    def _get_bm25_index(self) -> BM25Index | None:
+        """构建 / 复用进程级 BM25 索引；失败时返回 None（检索退回向量）。"""
+        try:
+            from config import RAG_CONFIG
+
+            max_docs = int(RAG_CONFIG.get("bm25_max_docs", 20000) or 20000)
+            ttl = max(0, int(RAG_CONFIG.get("bm25_ttl_sec", 60) or 0))
+        except Exception:  # noqa: BLE001 - 配置异常按默认值
+            max_docs, ttl = 20000, 60
+
+        key = (str(self.knowledge_base_path), self.collection_name)
+        now = time.monotonic()
+        with _BM25_CACHE_LOCK:
+            cached = _BM25_CACHE.get(key)
+            failed_at = _BM25_FAILED_AT.get(key, 0.0)
+        if cached is not None and (now - cached[0]) <= ttl:
+            return cached[1]
+        if failed_at and (now - failed_at) <= ttl:
+            return None
+
+        with _bm25_key_lock(key):
+            now = time.monotonic()
+            with _BM25_CACHE_LOCK:
+                cached = _BM25_CACHE.get(key)
+                failed_at = _BM25_FAILED_AT.get(key, 0.0)
+            if cached is not None and (now - cached[0]) <= ttl:
+                return cached[1]
+            if failed_at and (now - failed_at) <= ttl:
+                return None
+            try:
+                rows = self._fetch_all_documents(max_docs)
+            except Exception as exc:  # noqa: BLE001 - 混合检索是增强项
+                logger.warning("BM25 索引构建失败，检索退回纯向量: %s", exc)
+                with _BM25_CACHE_LOCK:
+                    _BM25_FAILED_AT[key] = now
+                return None
+            index = BM25Index(rows)
+            with _BM25_CACHE_LOCK:
+                _BM25_CACHE[key] = (time.monotonic(), index)
+                _BM25_FAILED_AT.pop(key, None)
+            logger.info(
+                "BM25 索引已构建：%s 条片段（集合 %s）",
+                len(index),
+                self.collection_name,
+            )
+            return index
+
+    def _fetch_all_documents(self, max_docs: int) -> list[dict]:
+        """用 query_iterator 分页拉取全量片段（超过上限则放弃混合检索）。"""
+        with contextlib.suppress(Exception):
+            self.milvus_client.load_collection(self.collection_name)
+        iterator = self.milvus_client.query_iterator(
+            collection_name=self.collection_name,
+            filter="id >= 0",
+            batch_size=1000,
+            output_fields=["id", "content", "metadata"],
+        )
+        rows: list[dict] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                rows.extend(batch)
+                if len(rows) > max_docs:
+                    raise RuntimeError(
+                        f"知识库片段数超过 BM25 上限 {max_docs}，"
+                        "本次检索退回纯向量"
+                    )
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+        return rows
+
+    def _hybrid_search(
+        self, query: str, vector_docs: list[dict], top_k: int
+    ) -> list[dict]:
+        """向量 + BM25 → RRF 融合 → 可选重排；任何一步失败都退回向量结果。"""
+        enabled, candidates = self._hybrid_settings()
+        if not enabled:
+            return vector_docs[:top_k]
+        index = self._get_bm25_index()
+        if index is None or not len(index):
+            return vector_docs[:top_k]
+        bm25_hits = index.search(query, candidates)
+        if not bm25_hits:
+            return vector_docs[:top_k]
+        bm25_docs = [{**doc, "bm25_score": score} for doc, score in bm25_hits]
+        try:
+            from config import RAG_CONFIG
+
+            rrf_k = int(RAG_CONFIG.get("rrf_k", 60) or 60)
+        except Exception:  # noqa: BLE001 - 配置异常按默认值
+            rrf_k = 60
+        fused = rrf_fuse([vector_docs, bm25_docs], k=max(1, rrf_k))
+        vector_scores = {
+            str(doc.get("id") or ""): float(doc.get("distance") or 0.0)
+            for doc in vector_docs
+        }
+        bm25_scores = {
+            str(doc.get("id") or ""): float(doc.get("bm25_score") or 0.0)
+            for doc in bm25_docs
+        }
+        fused = annotate_hybrid_scores(fused, vector_scores, bm25_scores)
+        fused = self._rerank_documents(query, fused)
+        return fused[:top_k]
+
+    def _rerank_documents(
+        self, query: str, documents: list[dict]
+    ) -> list[dict]:
+        """可选 cross-encoder 精排；模型未配置 / 加载失败时保持 RRF 顺序。"""
+        try:
+            from config import RAG_CONFIG
+
+            model_name = str(RAG_CONFIG.get("rerank_model") or "").strip()
+            candidates = int(RAG_CONFIG.get("rerank_candidates", 20) or 20)
+        except Exception:  # noqa: BLE001 - 配置异常视为未启用
+            return documents
+        if not model_name or self._reranker_failed:
+            return documents
+        if self._reranker is None:
+            try:
+                from sentence_transformers import CrossEncoder
+
+                self._reranker = CrossEncoder(model_name)
+            except Exception as exc:  # noqa: BLE001 - 重排是增强项
+                self._reranker_failed = True
+                logger.warning(
+                    "重排模型加载失败（%s），跳过重排: %s", model_name, exc
+                )
+                return documents
+        head = documents[: max(1, candidates)]
+        tail = documents[max(1, candidates) :]
+        try:
+            scores = self._reranker.predict(
+                [(query, str(doc.get("content") or "")) for doc in head]
+            )
+        except Exception as exc:  # noqa: BLE001 - 重排失败保持原顺序
+            logger.warning("重排失败，保持 RRF 顺序: %s", exc)
+            return documents
+        for doc, score in zip(head, scores):
+            doc["rerank_score"] = float(score)
+        head.sort(
+            key=lambda doc: float(doc.get("rerank_score") or 0.0), reverse=True
+        )
+        return head + tail
+
+    def _invalidate_bm25_cache(self) -> None:
+        """知识库写入后失效进程级 BM25 缓存（其它进程由 TTL 兜底）。"""
+        key = (str(self.knowledge_base_path), self.collection_name)
+        with _BM25_CACHE_LOCK:
+            _BM25_CACHE.pop(key, None)
+            _BM25_FAILED_AT.pop(key, None)
 
     def _assemble_grouped_documents(self, docs: list[dict]) -> list[dict]:
         """把检索到的多分片文档按 group 拼回整篇，再按最佳分数排序。
@@ -726,7 +934,7 @@ class RAGKnowledgeAgent(AgentBase):
         # strict=True：后端故障要显式报错，不能伪装成「知识库没有相关信息」
         try:
             retrieved_docs = await asyncio.to_thread(
-                self.search_knowledge, user_query, None, True
+                self.search_knowledge, user_query, None, True, hybrid=True
             )
         except Exception as exc:  # noqa: BLE001 - 知识库故障转为智能体错误
             logger.warning("知识库检索失败: %s", exc)
