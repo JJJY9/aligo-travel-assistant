@@ -1972,6 +1972,34 @@ def test_rag_assemble_preserves_rerank_order():
     print("✓ 拼装保持精排顺序")
 
 
+def test_rag_grouped_documents_prefers_reranked_duplicate_part():
+    """同名 part 的重复分片按精排分取舍，不能只看向量距离。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+    grouped = agent._assemble_grouped_documents(
+        [
+            {
+                "id": "p1-old",
+                "content": "旧文本",
+                "metadata": {"group": "g", "part": 1},
+                "distance": 0.9,
+                "rerank_score": 0.1,
+            },
+            {
+                "id": "p1-new",
+                "content": "新文本",
+                "metadata": {"group": "g", "part": 1},
+                "distance": 0.5,
+                "rerank_score": 0.9,
+            },
+        ]
+    )
+    item = next(entry for entry in grouped if entry["id"] == "g")
+    assert item["content"] == "新文本", item
+    assert item["rerank_score"] == 0.9, item
+    print("✓ 同名分片按精排分取舍")
+
+
 def test_bm25_cache_invalidated_across_module_copies(monkeypatch):
     """共享版本号让所有模块副本的 BM25 缓存在知识写入后一起过期。"""
     from utils.hybrid_retrieval import invalidate_bm25_cache

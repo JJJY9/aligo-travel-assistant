@@ -291,6 +291,7 @@ def test_deferred_memory_commits_after_cancel_during_persist():
         def __init__(self):
             self.commits = 0
             self.pending = False
+            self.clears = 0
 
         async def reply(self, intention, on_event=None, defer_memory=False):
             self.pending = bool(defer_memory)
@@ -302,6 +303,9 @@ def test_deferred_memory_commits_after_cancel_during_persist():
             self.pending = False
             self.commits += 1
             return True
+
+        def clear_checkpoint(self):
+            self.clears += 1
 
     orch = _DeferredOrch()
     runtime.orchestrator = orch
@@ -322,6 +326,7 @@ def test_deferred_memory_commits_after_cancel_during_persist():
 
     asyncio.run(scenario())
     assert orch.commits == 1, "落库成功后的延迟记忆写入不能因取消而丢失"
+    assert orch.clears == 1, "取消落在落库线程期间也要清理检查点"
     print("✓ 取消落在落库线程期间仍补提交延迟记忆")
 
 
@@ -1489,6 +1494,7 @@ def test_checkpoint_key_binds_message_content_and_clears_after_persist():
             self.keys: list[str | None] = []
             self.scopes: list[str | None] = []
             self.cleared = 0
+            self.cleared_keys: list[str] = []
 
         async def reply(
             self,
@@ -1511,6 +1517,9 @@ def test_checkpoint_key_binds_message_content_and_clears_after_persist():
         def clear_checkpoint(self):
             self.cleared += 1
 
+        def clear_checkpoint_key(self, key):
+            self.cleared_keys.append(str(key))
+
     orch = _CheckpointOrch()
     runtime.orchestrator = orch
     asyncio.run(runtime.ask("第一条消息", turn_id="turn-1"))
@@ -1526,6 +1535,7 @@ def test_checkpoint_key_binds_message_content_and_clears_after_persist():
         "检查点作用域用于会话删除后的定向清理"
     )
     assert orch.cleared == 2, "整轮成功落库后必须清理检查点"
+    assert orch.cleared_keys == orch.keys, "落库回调按本轮键清理，不能误删下一轮"
     print("✓ 检查点键绑定提问内容并在成功后清理")
 
 

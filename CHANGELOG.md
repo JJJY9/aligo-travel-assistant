@@ -73,6 +73,8 @@
 
 - RAG 配置环境变量（v2.0）：`RAG_EMBEDDING_MODEL` 覆盖默认嵌入模型（可指向本地 bge-m3，维度按模型配置探测）；`RAG_MIN_SCORE` 覆盖问答阈值并钳制 0–1，非法 / 非有限值告警回退；新增 `_env_float` 与 `.env.example` 说明。新增子进程隔离回归
 
+- 复核修复（v2.0）：扩展技能的用户问题单独插值处同样中和分隔符并限制长度；解包 ```json 围栏里的模型信封；多分片同名 part 重复时优先按精排分取舍（无精排再按向量距离）；取消落在落库线程期间的成功回合在完成回调里按本轮键清理检查点（迟到的回调不会误删下一轮）；新增 `ignore_existing` 真实分支回归（不扫描源库、返回全部分片）
+
 ### 修复
 - 测试：`test_json_export_snapshot_is_consistent` 补第二个 LongTermMemory 实例的外部写入——此前同一实例先写后导出，`export_snapshot` 文档承诺的「写锁内 _reload_latest 后读取」零覆盖；现在断言快照与统计都包含外部新增消息与行程
 - 测试：`tests/test_memory_system.py` 第 5 步此前用 `except Exception` 吞掉长期总结的全部异常、空结果也只打印警告，函数末尾仍输出「所有测试通过」；现在异常 / 空摘要直接断言失败，完整上下文与 Agent 上下文补结构断言

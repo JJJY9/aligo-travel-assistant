@@ -5196,6 +5196,41 @@ def test_export_volume_check_checks_raw_backup_first(monkeypatch):
     print("✓ 导出体积自检先看原始备份字节")
 
 
+def test_import_documents_ignore_existing_returns_all_pieces(monkeypatch):
+    """真实 ignore_existing 分支：不扫描源库、返回全部分片，而不是只剩新增。"""
+    from pathlib import Path
+
+    from utils import knowledge_admin
+
+    rows = [
+        {"content": "住宿标准说明", "metadata": {"category": "住宿"}},
+        {"content": "交通标准说明", "metadata": {"category": "交通"}},
+    ]
+    scans: list[int] = []
+    monkeypatch.setattr(
+        knowledge_admin,
+        "knowledge_db_path",
+        lambda: Path(project_root) / "pyproject.toml",
+    )
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_contents",
+        lambda: scans.append(1) or [row["content"] for row in rows],
+    )
+    deduped = knowledge_admin.import_documents(
+        rows, dry_run=True, return_pieces=True
+    )
+    assert deduped["pieces"] == [], "普通 dry-run 对源库判重后没有新增分片"
+    assert scans, "普通 dry-run 应扫描现有库"
+    scans.clear()
+    planned = knowledge_admin.import_documents(
+        rows, dry_run=True, return_pieces=True, ignore_existing=True
+    )
+    assert len(planned["pieces"]) == len(rows), planned
+    assert scans == [], "ignore_existing 不能扫描现有库"
+    print("✓ ignore_existing 真实分支返回全部分片且不扫库")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
