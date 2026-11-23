@@ -1711,6 +1711,30 @@ def test_rag_missing_collection_skips_model_load(monkeypatch, tmp_path):
     print("✓ 集合缺失时不加载嵌入模型")
 
 
+def test_rag_assemble_tolerates_non_finite_part_metadata():
+    """metadata 的 part/parts 为 Infinity 时不能抛 OverflowError 丢整份结果。"""
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    docs = [
+        {
+            "id": "d1",
+            "content": "片段A",
+            "metadata": {"group": "g", "part": float("inf"), "parts": float("inf")},
+            "distance": 0.9,
+        },
+        {
+            "id": "d2",
+            "content": "片段B",
+            "metadata": {"group": "g", "part": 1, "parts": 1},
+            "distance": 0.8,
+        },
+    ]
+    assembled = agent._assemble_grouped_documents(docs)
+    assert assembled, "非有限 part/parts 不能让整份结果丢失"
+    assert "片段" in assembled[0]["content"]
+    print("✓ 非有限 part/parts 元数据不再抛 OverflowError")
+
+
 def test_rag_reply_filters_low_score_documents():
     """低分片段不能当知识注入（无关问题应回答没有找到相关信息）。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")

@@ -45,6 +45,8 @@ def test_api_key_is_stripped_and_blank_falls_back():
     )
     # 尾随空格 / 换行必须被去掉（否则 httpx 拒绝 Authorization 头）
     assert _run_config(tmp, "  sk-env-key\n") == repr("sk-env-key")
+    # 文件注入的成对引号连引号复制：密钥必须剥离引号后才用于鉴权
+    assert _run_config(tmp, '"sk-env-key"') == repr("sk-env-key")
     # 纯空白视为未设置：回退 config_local.py
     assert _run_config(tmp, "   ") == repr("sk-local-valid")
     # 完全未设置同样回退
@@ -284,9 +286,9 @@ def test_numeric_and_bool_envs_strip_bom_and_strip_quotes():
         "print(config.SYSTEM_CONFIG['timeout'])"
     )
     env = dict(os.environ)
-    env["REDIS_TTL_SEC"] = "\ufeff60"
+    env["REDIS_TTL_SEC"] = '"﻿90"'
     env["LLM_BASE_URL"] = '"https://api.example.com/v1"'
-    env["TRUST_PROXY_HEADERS"] = "\ufeff1"
+    env["TRUST_PROXY_HEADERS"] = "'﻿1'"
     env["LLM_REQUEST_TIMEOUT_SEC"] = "0"
     env["PYTHONIOENCODING"] = "utf-8"
     result = subprocess.run(
@@ -301,12 +303,12 @@ def test_numeric_and_bool_envs_strip_bom_and_strip_quotes():
     )
     assert result.returncode == 0, result.stderr
     lines = result.stdout.strip().split("\n")
-    assert lines[0] == "60", lines
+    assert lines[0] == "90", lines
     assert lines[1] == "https://api.example.com/v1", lines
     assert lines[2] == "1", lines
     assert lines[3] == "120", lines
     assert "非法" in result.stderr, result.stderr
-    print("✓ BOM / 引号清洗与超时钳制")
+    print("✓ BOM / 引号清洗（字符串 / 整数 / 布尔）与超时钳制")
 
     # 未识别的布尔值：告警并使用默认值
     env["TRUST_PROXY_HEADERS"] = "enabled"
