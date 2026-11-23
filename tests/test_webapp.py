@@ -11507,7 +11507,7 @@ def test_export_reports_skipped_knowledge_header(monkeypatch):
     """导出体积通过但知识行恢复会跳过时，响应头带跳过计数。"""
     from utils import user_import
 
-    def _fake(backup, warning_out=None):
+    def _fake(backup, warning_out=None, reason_out=None):
         if warning_out is not None:
             warning_out["knowledge_skipped_count"] = 3
         return None
