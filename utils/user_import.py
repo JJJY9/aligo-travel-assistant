@@ -883,24 +883,63 @@ def _planned_knowledge_rows(
     return list(plan.get("pieces") or [])
 
 
-def knowledge_rows_for_volume_check(rows: list[Any]) -> list[Any]:
-    """导出体积校验使用的知识行：与导入 dry-run 同一规划（重切分后的分片）。
+def knowledge_rows_for_volume_check(rows: list[Any]) -> list[Any] | None:
+    """导出体积校验使用的知识行：按「导入空库」规划的分片形状。
 
-    导出端此前用原始行估算体积，导入端按 ``import_documents(dry_run)``
-    的分片计划估算；长文档在导入时会被切成多片，导致「导出成功、导入却
-    被知识体积轴拒绝」。规划失败（未初始化 / 后端故障）退回原始行：导入
-    端会把知识段以 ``knowledge_error`` 上报并跳过，不阻断用户数据恢复。
+    不能在源库上规划：整库导出行本来就在源库中，``dry_run`` 去重后
+    pieces 只剩「新增分片」，pieces 非空时整体替换原始行会让其余全部
+    知识行退出体积 / 条数估算（40 MB 库 + 一条旧版长单条时只校验 2 片，
+    导出写出 55 MB 文件却永远无法导入）。``ignore_existing`` 不碰库内容、
+    不持锁，按导入空库返回全部分片。
+
+    规划失败返回 None：调用方必须按「无法确认备份可恢复」拒绝导出，
+    不能退回原始行放行（旧版长单条重切分后的分片可能远超原始行体积）。
     """
     if not rows:
         return []
     try:
         from utils.knowledge_admin import import_documents
 
-        plan = import_documents(rows, dry_run=True, return_pieces=True)
-    except Exception:  # noqa: BLE001 - 校验退回旧口径
-        return list(rows)
+        plan = import_documents(
+            rows,
+            dry_run=True,
+            return_pieces=True,
+            ignore_existing=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - 由调用方按不可核对拒绝导出
+        logger.warning("导出预检：知识分片规划失败（%s）", exc)
+        return None
     pieces = plan.get("pieces") if isinstance(plan, dict) else None
-    return list(pieces or rows)
+    if pieces is None:
+        return None
+    return list(pieces)
+
+
+def export_backup_limit_problem(backup: dict[str, Any]) -> str | None:
+    """导出端自检：原始备份与「导入空库」的知识分片形状都必须可导入。
+
+    两道轴缺一不可：
+    - 原始备份：导入端在规划前就按原始知识行数 / 文件字节拒绝；
+    - 空库分片计划：长文档重切分后每片都带元数据，恢复后的体积可能
+      大于原始行（#876 的口径），只看原始行会写出无法恢复的备份。
+
+    知识规划失败时返回拒绝原因（fail-closed）：无法确认备份可恢复。
+    """
+    if not isinstance(backup, dict):
+        return None
+    problem = backup_limit_problem(backup, crlf=False)
+    if problem:
+        return problem
+    knowledge = backup.get("knowledge")
+    if not isinstance(knowledge, list) or not knowledge:
+        return None
+    planned = knowledge_rows_for_volume_check(knowledge)
+    if planned is None:
+        return (
+            "知识片段无法按导入规则规划，无法确认备份可恢复；"
+            "请稍后重试（知识库忙时暂停写入）"
+        )
+    return backup_limit_problem({**backup, "knowledge": planned}, crlf=False)
 
 
 def _export_shape_baseline(

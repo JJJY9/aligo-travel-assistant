@@ -1459,6 +1459,7 @@ def import_documents(
     dry_run: bool = False,
     *,
     return_pieces: bool = False,
+    ignore_existing: bool = False,
 ) -> dict[str, Any]:
     """批量导入知识片段；空内容 / 非法项跳过，超长字段按接口上限截断。
 
@@ -1468,8 +1469,13 @@ def import_documents(
     不写入任何内容；``return_pieces``（仅 dry-run 有意义）额外返回
     ``pieces``——本次真正会写入的分片行（分组还原 / 去重 / 切分后的
     最终形状），供合并体积预演与真实导入逐字节对齐。
+    ``ignore_existing``（仅 dry-run）不与现有库去重、不扫描库内容，按
+    「导入空库」返回全部分片：导出端自检不能用源库去重后的「新增分片」
+    估算备份体积（整库导出行本就在源库中，pieces 会几乎为空）。
     """
     items = list(documents)
+    if ignore_existing and not dry_run:
+        raise ValueError("ignore_existing 仅用于 dry_run 规划")
     if not items:
         empty: dict[str, Any] = {
             "imported": 0,
@@ -1558,7 +1564,7 @@ def import_documents(
             if return_pieces:
                 payload["pieces"] = []
         return payload
-    if not knowledge_db_path().exists():
+    if not ignore_existing and not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
 
     # 先做与库内容无关的备份完整性校验，避免为坏备份加载嵌入模型（首次可能
@@ -1640,13 +1646,21 @@ def import_documents(
 
     imported: list[int] = []
     # dry-run 只做只读规划（不加载模型、不写入）：用共享读锁，预览的全库
-    # 判重扫描不再阻塞检索 / 面板等读路径
-    planning_lock = _read_lock() if dry_run else _write_lock()
+    # 判重扫描不再阻塞检索 / 面板等读路径。ignore_existing 完全不碰库内容
+    # （纯形状规划），不持锁：导出端自检不应因一次全库规划挡住写入
+    if ignore_existing:
+        planning_lock: contextlib.AbstractContextManager[Any] = (
+            contextlib.nullcontext()
+        )
+    else:
+        planning_lock = _read_lock() if dry_run else _write_lock()
     with planning_lock:
         # 去重判断放在锁内：并发导入（不同客户端 / 重试）不会都基于旧快照
         # 插入同一批内容；快照走全量扫描（多重集），超过单页规模或同文
         # 重复分片时判重都不会失真
-        if dry_run:
+        if ignore_existing:
+            existing = []
+        elif dry_run:
             try:
                 existing = _existing_contents()
             except Exception:
@@ -1665,6 +1679,11 @@ def import_documents(
         planned_groups: set[str] = set()
         problems: list[dict[str, Any]] = []
         layout_cache: dict[str, Any] = {}
+        if ignore_existing:
+            # 空库规划：库内布局恒为空，不能触发对真实库的扫描
+            layout_cache["layout"] = {}
+            layout_cache["texts"] = set()
+            layout_cache["part_contents"] = {}
 
         def _group_layout() -> dict[str, list[tuple[str, int, int]]] | None:
             # 整次导入只全量扫描一次库内布局：此前每个「部分命中」的组都

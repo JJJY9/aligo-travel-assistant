@@ -5793,19 +5793,24 @@ def test_export_with_knowledge_uses_import_chunk_plan(monkeypatch):
             "export_documents",
             lambda: [{"content": "原始长文档", "metadata": {}}],
         )
-        monkeypatch.setattr(
-            knowledge_admin,
-            "import_documents",
-            lambda rows, dry_run=False, return_pieces=False: {
-                "pieces": [{"content": "x" * 100}] * 10
-            },
-        )
-        monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", 500)
+        calls: dict = {}
+
+        def fake_import(
+            rows, dry_run=False, return_pieces=False, **kwargs
+        ):
+            calls.update(kwargs)
+            return {"pieces": [{"content": "x" * 100}] * 100}
+
+        monkeypatch.setattr(knowledge_admin, "import_documents", fake_import)
+        monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", 5000)
         response = client.get(
             "/api/export",
             params={"user_id": user_id, "with_knowledge": 1},
         )
         assert response.status_code == 413, response.text
+        assert calls.get("ignore_existing") is True, (
+            "导出体积预演必须按导入空库规划，不能对源库去重后只剩新增分片"
+        )
         raw_problem = user_import.backup_limit_problem(
             {
                 "chat_history": [],
@@ -5819,8 +5824,8 @@ def test_export_with_knowledge_uses_import_chunk_plan(monkeypatch):
     print("✓ with_knowledge 导出按导入分片计划估算体积")
 
 
-def test_knowledge_volume_rows_falls_back_on_planning_error(monkeypatch):
-    """知识库规划失败时导出校验退回原始行（不阻断导出）。"""
+def test_knowledge_volume_rows_fails_closed_on_planning_error(monkeypatch):
+    """知识库规划失败时返回 None：导出端按无法确认可恢复拒绝。"""
     from utils import knowledge_admin, user_import
 
     rows = [{"content": "原始行", "metadata": {}}]
@@ -5829,8 +5834,8 @@ def test_knowledge_volume_rows_falls_back_on_planning_error(monkeypatch):
         raise RuntimeError("kb down")
 
     monkeypatch.setattr(knowledge_admin, "import_documents", boom)
-    assert user_import.knowledge_rows_for_volume_check(rows) == rows
-    print("✓ 知识规划失败时体积校验退回原始行")
+    assert user_import.knowledge_rows_for_volume_check(rows) is None
+    print("✓ 知识规划失败时体积校验 fail-closed")
 
 
 def test_session_detail_tolerates_deep_meta():

@@ -5119,6 +5119,83 @@ def test_import_knowledge_error_redacts_paths(monkeypatch):
     assert "Connection refused" in error, "瞬时错误关键词要保留"
     print("✓ 知识片段恢复错误脱敏（路径 / URL）")
 
+def test_knowledge_volume_plan_ignores_existing_library(monkeypatch):
+    """导出体积预演按「导入空库」规划：不能对源库去重后只剩新增分片。"""
+    from utils import knowledge_admin, user_import
+
+    calls: dict = {}
+
+    def fake_import(rows, dry_run=False, return_pieces=False, **kwargs):
+        calls.update(kwargs)
+        return {"pieces": [{"content": "片1", "metadata": {}}]}
+
+    monkeypatch.setattr(knowledge_admin, "import_documents", fake_import)
+    pieces = user_import.knowledge_rows_for_volume_check(
+        [{"content": "原始行", "metadata": {}}]
+    )
+    assert calls.get("ignore_existing") is True
+    assert pieces == [{"content": "片1", "metadata": {}}]
+    print("✓ 导出体积预演按空库规划知识分片")
+
+
+def test_knowledge_volume_plan_empty_pieces_kept_empty(monkeypatch):
+    """规划结果为空时返回空列表，不能回退原始行替换真实分片形状。"""
+    from utils import knowledge_admin, user_import
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "import_documents",
+        lambda rows, dry_run=False, return_pieces=False, **kwargs: {
+            "pieces": []
+        },
+    )
+    assert user_import.knowledge_rows_for_volume_check(
+        [{"content": "x", "metadata": {}}]
+    ) == []
+    print("✓ 空分片计划保持为空")
+
+
+def test_knowledge_volume_plan_error_is_fail_closed(monkeypatch):
+    """规划失败返回 None，导出端按「无法确认可恢复」拒绝而不是放行。"""
+    from utils import knowledge_admin, user_import
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("kb down")
+
+    monkeypatch.setattr(knowledge_admin, "import_documents", boom)
+    assert (
+        user_import.knowledge_rows_for_volume_check(
+            [{"content": "x", "metadata": {}}]
+        )
+        is None
+    )
+    problem = user_import.export_backup_limit_problem(
+        {
+            "chat_history": [],
+            "knowledge": [{"content": "x", "metadata": {}}],
+        }
+    )
+    assert problem and "无法确认" in problem, problem
+    print("✓ 知识规划失败按 fail-closed 拒绝导出")
+
+
+def test_export_volume_check_checks_raw_backup_first(monkeypatch):
+    """原始备份字节轴先于规划：规划为空也不能放过超限文件。"""
+    from utils import user_import
+
+    monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", 200)
+    monkeypatch.setattr(
+        user_import, "knowledge_rows_for_volume_check", lambda rows: []
+    )
+    backup = {
+        "chat_history": [],
+        "knowledge": [{"content": "长" * 500, "metadata": {}}],
+    }
+    problem = user_import.export_backup_limit_problem(backup)
+    assert problem and "MB" in problem, problem
+    print("✓ 导出体积自检先看原始备份字节")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
