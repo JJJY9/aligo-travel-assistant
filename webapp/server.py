@@ -5103,6 +5103,26 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                         + "\n\n"
                     )
+                    if cached.get("__incomplete__"):
+                        # 上一流式请求已落库但客户端断连：回放错误终态，
+                        # 不重放空答案、也不重新执行
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": str(
+                                        cached.get("message")
+                                        or "上一请求已处理但响应未送达，"
+                                        "请刷新会话历史"
+                                    ),
+                                    "idempotent_replay": True,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        return
                     yield (
                         "data: "
                         + json.dumps(
@@ -5129,6 +5149,7 @@ def create_app(model: Any = None) -> FastAPI:
         async def event_stream() -> Any:
             task: asyncio.Task[None] | None = None
             heartbeat: asyncio.Task[None] | None = None
+            completed = False
             try:
 
                 async def run() -> None:
@@ -5227,6 +5248,7 @@ def create_app(model: Any = None) -> FastAPI:
                         "\n\n"
                     )
                     if event["type"] in ("done", "error"):
+                        completed = event["type"] == "done"
                         break
             finally:
                 if heartbeat is not None:
@@ -5241,6 +5263,25 @@ def create_app(model: Any = None) -> FastAPI:
                     task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await lease.stop_turn()
+                if (
+                    not completed
+                    and idem_key is not None
+                    and getattr(
+                        session.runtime,
+                        "turn_persisted",
+                        lambda _input: False,
+                    )(payload.message)
+                ):
+                    # 客户端断连但整轮已落库：给幂等键留标记，同键重试
+                    # 回放错误终态而不是重新执行
+                    state.idempotency.put(
+                        idem_key,
+                        {
+                            "session_id": session.session_id,
+                            "__incomplete__": True,
+                            "message": "上一请求已处理但响应未送达，请刷新会话历史",
+                        },
+                    )
                 # 释放租约统一由 _LeasedStreamingResponse 在取消作用域外执行：
                 # 本轮在作用域内被取消时上面的等待无法完成，这里提前 release
                 # 会让删除 / 新一轮请求在落库线程结束前拿到用户锁

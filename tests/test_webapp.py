@@ -980,6 +980,53 @@ def test_chat_stream_idempotency_replay():
         _cleanup(user_id)
 
 
+def test_chat_stream_incomplete_marker_replays_error():
+    """流式：未完成幂等标记回放 error 终态，不重放 done、不重新执行。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    user_id = _unique_user("web_test_idem_stream_incomplete")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-idem-stream-inc",
+            "idempotency_key": "req-stream-inc",
+        }
+        state = client.app.state.aligo
+        key = make_key(
+            user_id,
+            "sess-idem-stream-inc",
+            "req-stream-inc",
+            endpoint="chat_stream",
+            message="你好",
+        )
+        state.idempotency.put(
+            key,
+            {
+                "session_id": "sess-idem-stream-inc",
+                "__incomplete__": True,
+                "message": "上一请求已处理但响应未送达，请刷新会话历史",
+            },
+        )
+        with client.stream(
+            "POST", "/api/chat/stream", json=payload
+        ) as response:
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+        assert [event["type"] for event in events] == ["session", "error"], (
+            events
+        )
+        assert events[-1].get("idempotent_replay") is True
+        assert "刷新会话历史" in events[-1]["message"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 流式未完成幂等标记回放 error")
+
+
 def test_chat_creates_session_when_missing():
     user_id = _unique_user("web_test_chat")
     try:
