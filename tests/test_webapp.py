@@ -1020,6 +1020,51 @@ def test_chat_incomplete_idempotency_marker_returns_409():
     print("✓ 未完成幂等标记返回 409")
 
 
+def test_leased_streaming_response_settles_after_drain():
+    """流式响应在 stop_turn（drain）之后才执行断连标记回调。"""
+    from webapp.server import _LeasedStreamingResponse
+
+    order: list[str] = []
+    drained = {"value": False}
+
+    class _Lease:
+        async def stop_turn(self):
+            await asyncio.sleep(0)
+            drained["value"] = True
+            order.append("stop_turn")
+
+        def after_stop(self):
+            assert drained["value"] is True, "after_stop 必须在 drain 完成之后执行"
+            order.append("after_stop")
+
+        def release(self):
+            order.append("release")
+
+    async def _content():
+        yield b"data: {}\n\n"
+
+    async def _run():
+        response = _LeasedStreamingResponse(_content(), _Lease())
+        sent: list[dict] = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            # 必须有真实的挂起点：立即返回的协程不让出事件循环，Starlette
+            # 的 listen_for_disconnect 会把它变成忙循环，响应体永远发不出去
+            await asyncio.sleep(0)
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await response({"type": "http", "method": "GET"}, receive, send)
+        return sent
+
+    sent = asyncio.run(_run())
+    assert order == ["stop_turn", "after_stop", "release"], order
+    assert any(message.get("type") == "http.response.body" for message in sent)
+    print("✓ 流式响应在 drain 之后执行收尾回调")
+
+
 def test_chat_stream_idempotency_replay():
     """流式重复提交只回放 session + done，不重新执行 Agent。"""
     class _CountingModel:

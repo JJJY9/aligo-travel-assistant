@@ -354,6 +354,9 @@ class OrchestrationAgent(AgentBase):
         # 成功落库之后通过 commit_deferred_memory 提交（取消 / 墓碑否决的
         # 回合不能留下没有对应对话的幽灵行程与偏好）
         self._deferred_memory: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+        # 暂存负载所属的延迟记忆纪元（由对话运行时按轮传入）：迟到的上一轮
+        # 落库回调只能提交它自己那一轮的负载，不能把新一轮的负载提前提交
+        self._deferred_epoch: int | None = None
         # 单飞中的延迟提交任务：第二次调用等待第一次写完，而不是立即返回
         # False（否则 drain 会以为没有在途写入、提前释放用户锁）
         self._deferred_commit_task: asyncio.Future[bool] | None = None
@@ -379,6 +382,7 @@ class OrchestrationAgent(AgentBase):
         x: Msg | list[Msg] | None = None,
         on_event: ProgressCallback | None = None,
         defer_memory: bool = False,
+        defer_epoch: int | None = None,
         retry_cache: dict[str, dict[str, Any]] | None = None,
         checkpoint_key: str | None = None,
         checkpoint_scope: str | None = None,
@@ -408,6 +412,7 @@ class OrchestrationAgent(AgentBase):
         # 成功落库后的 commit 才应写库；遗留负载会变成没有对话支撑的幽灵
         # 行程与偏好（no_agents / 非法意图早退路径同样要先清空）
         self._deferred_memory = None
+        self._deferred_epoch = None
         if x is None:
             return Msg(
                 name=self.name,
@@ -601,6 +606,7 @@ class OrchestrationAgent(AgentBase):
         if self.memory_manager:
             if defer_memory:
                 self._deferred_memory = (intention_data, results)
+                self._deferred_epoch = defer_epoch
             else:
                 await asyncio.to_thread(
                     self._update_memory, intention_data, results
@@ -612,12 +618,16 @@ class OrchestrationAgent(AgentBase):
             role="assistant"
         )
 
-    async def commit_deferred_memory(self) -> bool:
+    async def commit_deferred_memory(self, epoch: int | None = None) -> bool:
         """提交 defer_memory=True 暂存的偏好 / 行程写入。
 
         只应在整轮问答成功落库之后调用：编排完成到落库之间被取消或墓碑
         否决时，本轮的记忆写入不会执行（没有对话的行程 / 偏好会把台账与
         统计污染成「用户从未经历过的事实」）。返回是否真的执行了写入。
+
+        ``epoch`` 为调用方那一轮的延迟记忆纪元：当前暂存负载属于另一轮
+        （新一轮已暂存）时直接跳过，迟到的上一轮回调不能把下一轮的负载
+        提前提交。
 
         单飞：并发 / 重入调用等待同一个写入任务完成（先到者清空负载并
         开始写，后到者此前会立即返回 False，drain 因此提前放行用户锁）。
@@ -631,12 +641,16 @@ class OrchestrationAgent(AgentBase):
             # 当前 _deferred_memory 会在下一轮 reply 入口被清空（静默丢失）
             waited = True
             await asyncio.shield(running)
+        if epoch is not None and getattr(self, "_deferred_epoch", None) != epoch:
+            # 当前暂存负载属于另一轮：迟到的回调不能提前提交它
+            return False
         payload = getattr(self, "_deferred_memory", None)
         if not payload:
             # 等待期间旧提交已完成且没有新的暂存负载：对调用方而言待写
             # 记忆已经落库（并发调用都返回 True，与单飞语义一致）
             return waited
         self._deferred_memory = None
+        self._deferred_epoch = None
         intention_data, results = payload
 
         async def _commit() -> bool:
@@ -653,13 +667,18 @@ class OrchestrationAgent(AgentBase):
         task.add_done_callback(_clear)
         return await asyncio.shield(task)
 
-    def discard_deferred_memory(self) -> None:
+    def discard_deferred_memory(self, epoch: int | None = None) -> None:
         """丢弃尚未提交的延迟记忆负载（会话已被删除时）。
 
         与「取消 / 墓碑否决的回合不提交」同一语义：删除后的会话不能再
         写入带 session_id 的行程 / 偏好，否则面板出现打不开的幽灵链接。
+        ``epoch`` 不为 None 且与当前负载所属纪元不一致时不丢弃（那份
+        负载属于新一轮，删掉的应是旧负载，不能误伤）。
         """
+        if epoch is not None and getattr(self, "_deferred_epoch", None) != epoch:
+            return
         self._deferred_memory = None
+        self._deferred_epoch = None
 
     def _prepare_context(self, intention_data: dict[str, Any]) -> dict[str, Any]:
         """

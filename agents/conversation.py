@@ -76,6 +76,11 @@ class ConversationRuntime:
         # 最近一次落库是否成功（提问文本）：客户端断连返回 499 后，Web 层
         # 据此决定是否给幂等键写「已落库但响应未送达」标记，避免重试重复
         self._last_persist_committed: str | None = None
+        # 延迟记忆（偏好 / 行程）提交纪元：每轮开始推进，迟到的上一轮落库
+        # 回调据此判断自己是否仍属于最近一轮
+        self._deferred_epoch = 0
+        # 回合序号：每轮开始推进，落库状态按它确认「属于最近一轮」
+        self._turn_seq = 0
         self._pending_rollback: asyncio.Future | None = None
         # 延迟记忆写入（偏好 / 行程）的提交任务：取消落在落库线程期间时由
         # 落库完成回调补提交，drain 释放用户锁前等待它结束
@@ -169,6 +174,15 @@ class ConversationRuntime:
         # 新一轮开始即失效上一轮的落库成功标记：若本轮在落库前失败，
         # 断连路径不能把上一轮同文本的成功误当成这一轮已落库
         self._last_persist_committed = None
+        # 推进延迟记忆纪元：上一轮迟到的落库回调不能提交本轮暂存的
+        # 偏好 / 行程（那份负载属于本轮，必须等本轮自己的落库结果）
+        self._deferred_epoch = getattr(self, "_deferred_epoch", 0) + 1
+        deferred_epoch = self._deferred_epoch
+        # 回合序号：本轮开始即推进。落库状态按它确认「属于最近一轮」——
+        # 本轮在落库之前失败 / 被取消时，同文本的上一轮成功不能被当成
+        # 本轮已落库（_last_persist_turn 要到落库开始才替换为本轮状态）
+        self._turn_seq = getattr(self, "_turn_seq", 0) + 1
+        turn_seq = self._turn_seq
         # 本轮开始时的会话纪元：必须在任何 await（上下文总结 / 意图 LLM
         # 重试可达数十秒）之前读取，否则这段窗口内的删除（纪元 +1 后
         # 「从未存在」路径撤销墓碑）会让落库守卫比较到删除后的值而放行，
@@ -244,7 +258,12 @@ class ConversationRuntime:
         pending_persist: asyncio.Future | None = None
         committed: bool | None = None
         usage_value: dict[str, Any] | None = None
-        turn_state = {"rollback_requested": False, "turn_id": turn_id}
+        turn_state = {
+            "rollback_requested": False,
+            "turn_id": turn_id,
+            "persisted": None,
+            "seq": turn_seq,
+        }
         # 上一轮落库 / 回滚可能仍在途（用户停止后 drain 超时、后台回滚线程
         # 未结束）：先等它收尾，失败 / 否决时在这里补回滚，再暂存本轮提问。
         # 否则旧回调的回滚按内容匹配可能删掉本轮刚暂存的同一文本提问。
@@ -283,6 +302,7 @@ class ConversationRuntime:
             retry_cache_supported = False
             checkpoint_supported = False
             checkpoint_scope_supported = False
+            defer_epoch_supported = False
             if defer_supported:
                 parameters: Iterable[inspect.Parameter]
                 try:
@@ -311,6 +331,11 @@ class ConversationRuntime:
                     or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
+                defer_epoch_supported = any(
+                    parameter.name == "defer_epoch"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
             # 整轮重试缓存：外层 retry_with_backoff 会重跑整个编排，缓存让
             # 重试跳过首轮已成功的智能体（一次 429/5xx 曾让同批已完成的
             # 智能体重复调用模型、放大账单与耗时）
@@ -318,6 +343,8 @@ class ConversationRuntime:
             reply_options: dict[str, Any] = {}
             if defer_supported:
                 reply_options["defer_memory"] = True
+                if defer_epoch_supported:
+                    reply_options["defer_epoch"] = deferred_epoch
             if retry_cache_supported:
                 reply_options["retry_cache"] = orchestration_retry_cache
             if checkpoint_supported and turn_id:
@@ -398,7 +425,9 @@ class ConversationRuntime:
             if defer_supported:
                 pending.add_done_callback(
                     lambda fut: self._commit_deferred_after_persist(
-                        fut, checkpoint_key=checkpoint_key_for_turn
+                        fut,
+                        checkpoint_key=checkpoint_key_for_turn,
+                        deferred_epoch=deferred_epoch,
                     )
                 )
             persist_started = True
@@ -566,13 +595,20 @@ class ConversationRuntime:
         self._clear_checkpoint()
 
     def _commit_deferred_after_persist(
-        self, fut: asyncio.Future, checkpoint_key: str | None = None
+        self,
+        fut: asyncio.Future,
+        checkpoint_key: str | None = None,
+        deferred_epoch: int | None = None,
     ) -> None:
         """落库完成回调：提交成功时补做延迟的偏好 / 行程写入。
 
         取消落在落库线程执行期间时，``ask()`` 的正常收尾路径不会执行，但
         整轮问答会被写线程完整提交——延迟的偏好 / 行程不能因此丢失（下一轮
         defer 会覆盖暂存负载）。否决（False）与写入失败不提交。
+
+        ``deferred_epoch`` 是本轮开始时的纪元：回调迟到时下一轮已开始并
+        暂存了自己的负载，这里不能把下一轮的负载提前提交（下一轮失败 /
+        被否决时会产生没有对应对话的幽灵写入）。
         """
         if fut.cancelled():
             return
@@ -582,13 +618,15 @@ class ConversationRuntime:
             return
         if outcome is False:
             return
-        # 取消发生在落库线程执行期间：正常路径的清理不会执行，但整轮已
-        # 落库，检查点同样必须丢弃（按本轮键清理，不能误删下一轮的）
+        # 检查点清理与纪元无关：已落库回合的检查点必须丢弃——同一
+        # client_turn_id + 同文本的重试不能复用已落库回合的子智能体结果
         if checkpoint_key:
             self._clear_checkpoint_key(checkpoint_key)
         else:
             self._clear_checkpoint()
-        self._schedule_deferred_commit()
+        # 延迟记忆按负载纪元提交：上一轮迟到的回调只能提交仍属于上一轮的
+        # 负载（新一轮已暂存时由编排层按纪元拒绝，不会提前提交新负载）
+        self._schedule_deferred_commit(epoch=deferred_epoch)
 
     def _session_deleted_now(self) -> bool:
         """提交延迟记忆前复查共享墓碑（读取失败按未删除处理，保真优先）。"""
@@ -600,30 +638,54 @@ class ConversationRuntime:
         except Exception:  # noqa: BLE001 - 状态不明按未删除处理
             return False
 
-    def _discard_deferred_memory(self) -> None:
-        discard = getattr(self.orchestrator, "discard_deferred_memory", None)
-        if callable(discard):
-            discard()
+    @staticmethod
+    def _accepts_argument(func: Any, name: str) -> bool:
+        """可调用对象是否接受名为 ``name`` 的关键字参数（含 **kwargs）。"""
+        try:
+            parameters = inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
 
-    def _schedule_deferred_commit(self, check_deleted: bool = True) -> None:
+    def _discard_deferred_memory(self, epoch: int | None = None) -> None:
+        discard = getattr(self.orchestrator, "discard_deferred_memory", None)
+        if not callable(discard):
+            return
+        if epoch is not None and self._accepts_argument(discard, "epoch"):
+            discard(epoch)
+            return
+        discard()
+
+    def _schedule_deferred_commit(
+        self, check_deleted: bool = True, epoch: int | None = None
+    ) -> None:
         commit = getattr(self.orchestrator, "commit_deferred_memory", None)
         if not callable(commit):
             return
+
+        async def _commit_current() -> bool:
+            if epoch is not None and self._accepts_argument(commit, "epoch"):
+                return bool(await commit(epoch))
+            return bool(await commit())
+
         if check_deleted:
             # 落库到提交之间会话可能被其它实例 / CLI 删除：先在线程里复查
             # 共享墓碑再提交，删除后丢弃负载（不写带 session_id 的幽灵行程）
             async def _commit_checked() -> bool:
                 if await asyncio.to_thread(self._session_deleted_now):
-                    self._discard_deferred_memory()
+                    self._discard_deferred_memory(epoch)
                     logger.info(
                         "会话已被删除，丢弃延迟记忆写入：%s", self.session_id
                     )
                     return False
-                return bool(await commit())
+                return await _commit_current()
 
             task: asyncio.Future = asyncio.ensure_future(_commit_checked())
         else:
-            task = asyncio.ensure_future(commit())
+            task = asyncio.ensure_future(_commit_current())
         self._pending_memory_commit = task
         task.add_done_callback(self._consume_memory_commit)
 
@@ -650,7 +712,7 @@ class ConversationRuntime:
         user_input: str = "",
         turn_state: dict[str, Any] | None = None,
     ) -> None:
-        if self._pending_persist is pending:
+        if getattr(self, "_pending_persist", None) is pending:
             self._pending_persist = None
         if pending.cancelled():
             # 取消后没人再 await 这个任务：取走异常，避免
@@ -661,13 +723,24 @@ class ConversationRuntime:
             outcome = pending.result()
         except Exception:  # noqa: BLE001 - 落库失败由回滚兜底
             outcome = failed
-        if outcome is not False and outcome is not failed:
-            self._last_persist_committed = user_input
+        success = outcome is not False and outcome is not failed
+        if turn_state is not None:
+            # 落库结果绑定在「本轮」状态上：迟到的上一轮回调只更新它自己
+            # 的 turn_state，不会把同文本的上一轮成功算到本轮头（也不会
+            # 抹掉本轮已成功的结果）
+            turn_state["persisted"] = success
+            current = getattr(self, "_last_persist_turn", None)
+            if (
+                current is not None
+                and current[1] is turn_state
+                and current[0] == user_input
+            ):
+                self._last_persist_committed = user_input if success else None
         else:
-            self._last_persist_committed = None
+            self._last_persist_committed = user_input if success else None
         if turn_state is None:
             return
-        if outcome is not False and outcome is not failed:
+        if success:
             # True（已提交）或 None（旧实现无返回值按成功处理）：
             # 不需要回滚（标记后主路径 / drain 也不会再回滚）
             turn_state["rollback_requested"] = True
@@ -684,13 +757,20 @@ class ConversationRuntime:
         task.add_done_callback(self._consume_background_task)
 
     def turn_persisted(self, user_input: str) -> bool:
-        """最近一次落库是否成功写入了该提问（断连 499 的幂等标记用）。"""
-        turn = self._last_persist_turn
-        return (
-            turn is not None
-            and turn[0] == user_input
-            and self._last_persist_committed == user_input
-        )
+        """最近一次落库是否成功写入了该提问（断连 499 的幂等标记用）。
+
+        结果绑定在本轮的 ``turn_state["persisted"]`` 上：迟到的上一轮回调
+        不会把同文本的上一轮成功误算成本轮，也不会抹掉本轮已成功的结果。
+        """
+        turn = getattr(self, "_last_persist_turn", None)
+        if turn is None or turn[0] != user_input:
+            return False
+        state = turn[1]
+        if state.get("seq") != getattr(self, "_turn_seq", 0):
+            # 槽里存的是更早一轮的状态：本轮还没开始落库（或本请求从未
+            # 启动回合），不能把上一轮同文本的成功算到本轮头
+            return False
+        return state.get("persisted") is True
 
     async def drain_pending_persist(self, timeout_sec: float = 10.0) -> bool:
         """等待在途的记忆落库线程结束，返回是否在超时前完成。
