@@ -15,6 +15,8 @@ import math
 import re
 from typing import Any, Iterable
 
+from utils.entity_normalize import normalize_event_data
+
 _BUDGET_RE = re.compile(
     r"(?:预算|总预算|花费|费用)[^\d]{0,8}(\d+(?:\.\d+)?)\s*(万元|万|元|块)?"
 )
@@ -97,7 +99,7 @@ def extract_requirements(
 ) -> dict[str, Any]:
     """从用户原话与事项收集结果提取可校验约束（缺失的键不返回）。"""
     requirements: dict[str, Any] = {}
-    event = event_data if isinstance(event_data, dict) else {}
+    event = normalize_event_data(event_data)
     duration = event.get("duration_days")
     if isinstance(duration, (int, float)) and int(duration) > 0:
         requirements["duration_days"] = int(duration)
