@@ -812,6 +812,96 @@ def test_chat_returns_reply_and_usage():
         _cleanup(user_id)
 
 
+def test_chat_idempotency_key_replays_without_rerun():
+    """同一幂等键重放缓存响应；不同键仍真实执行。"""
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-idem",
+            "idempotency_key": "req-1",
+        }
+        first = client.post("/api/chat", json=payload)
+        assert first.status_code == 200, first.text
+        calls_after_first = counting.calls
+        assert calls_after_first >= 1
+
+        second = client.post("/api/chat", json=payload)
+        assert second.status_code == 200, second.text
+        assert second.headers.get("x-idempotent-replay") == "1"
+        assert second.json() == first.json(), "重放必须返回同一份响应"
+        assert counting.calls == calls_after_first, "重放不能重新执行模型"
+
+        third = client.post(
+            "/api/chat", json={**payload, "idempotency_key": "req-2"}
+        )
+        assert third.status_code == 200, third.text
+        assert counting.calls > calls_after_first, "不同幂等键应真实执行"
+        print("✓ 幂等键重放不重复执行；不同键正常执行")
+    finally:
+        _cleanup(user_id)
+
+
+def test_chat_stream_idempotency_replay():
+    """流式重复提交只回放 session + done，不重新执行 Agent。"""
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem_stream")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-idem-stream",
+            "idempotency_key": "req-stream-1",
+        }
+
+        def _events(response):
+            return [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+
+        with client.stream("POST", "/api/chat/stream", json=payload) as response:
+            events = _events(response)
+        assert events[-1]["type"] == "done"
+        calls_after_first = counting.calls
+        assert calls_after_first >= 1
+
+        with client.stream("POST", "/api/chat/stream", json=payload) as response:
+            assert response.status_code == 200
+            events2 = _events(response)
+        assert [event["type"] for event in events2] == ["session", "done"]
+        assert events2[0].get("idempotent_replay") is True
+        assert events2[-1].get("idempotent_replay") is True
+        assert events2[-1]["reply"] == events[-1]["reply"]
+        assert counting.calls == calls_after_first
+        print("✓ 流式幂等键只回放 session + done")
+    finally:
+        _cleanup(user_id)
+
+
 def test_chat_creates_session_when_missing():
     user_id = _unique_user("web_test_chat")
     try:
