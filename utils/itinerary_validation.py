@@ -147,7 +147,8 @@ def extract_requirements(
         requirements["duration_days"] = int(duration)
     for key in ("start_date", "end_date"):
         value = event.get(key)
-        if isinstance(value, str) and value.strip():
+        # 只接受能被解析成 ISO 日期的值：归一失败的原串不能当合法需求
+        if isinstance(value, str) and _iso_date(value) is not None:
             requirements[key] = value.strip()
     # 起止日期完整时以日期算出的天数为准：模型抽取的 duration_days 与
     # 日期冲突时（或根本没抽）会漏掉天数校验

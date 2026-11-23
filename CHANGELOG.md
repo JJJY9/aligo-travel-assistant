@@ -6,6 +6,7 @@
 
 ### 新增
 - 实体归一（v2.0）：新增 `utils/entity_normalize.py`——城市名去行政后缀（杭州市→杭州、香港特别行政区→香港），中文日期（今天 / 明天 / 本周五 / 下周三 / 3月4日 / 下个月5号 / 月底）归一为 ISO；事项收集结果在行程需求提取前自动归一（副本，不修改原数据）。新增城市 / 日期 / 事项数据回归
+- 实体归一日期边界（v2.0）：无年份月日已过去时顺延到明年（11 月说「1月5日」指明年，与「周X 取未来最近一天」一致，不再产出过去日期）；显式年份保持原样；非闰年 2月29日 / 3月32日等不可能日期在 `normalize_event_data` 中丢弃而不是原样透传；`extract_requirements` 只接受可解析的 ISO 日期。新增跨年 / 非法日期回归
 - 扩展技能（v2.0，共 12 个技能）：新增 trip-budget / packing-list / travel-checklist / local-transport / safety-tips / trip-notes 六个轻量提示技能（SKILL.md + scripts），共用 `utils/simple_skill.py` 基类（上下文截断与中和、数据块注入、统一 `{status, skill, <result_key>, answer}` 返回）；LazyAgentRegistry 自动发现，wheel 数据文件同步；新增技能加载 / 注册 / 空响应测试
 - 扩展技能错误与上下文加固（v2.0）：`SimplePromptSkill` 不再吞掉可重试 / 永久模型错误（空响应、429/5xx、401/402 上抛，由编排层退避重试并计入熔断）；SKILL.md 与子类 system_prompt 合并为指令（此前有 SKILL.md 时 system_prompt 是死代码）；模型返回 JSON 信封时取正文；超长上下文按字段裁剪并保持 JSON 可解析（不再按 12000 字符腰斩）。新增对应回归
 - 执行检查点接入编排（v2.0）：`OrchestrationAgent.reply` 新增 `checkpoint_key`——每批已成功的子智能体结果落盘，同一 user + session + turn_id 的重试 / 重启复用成功步骤、只重跑失败或未完成者；`ConversationRuntime` 在 `client_turn_id` 存在时自动生成键，CLI / 无 turn_id 场景保持原行为。检查点读写失败只记日志、不阻断对话
