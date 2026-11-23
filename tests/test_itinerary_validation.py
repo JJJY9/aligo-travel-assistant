@@ -191,6 +191,124 @@ def test_validate_handles_empty_and_unknown_shapes():
     print("✓ 空行程 / 非法形状的兜底")
 
 
+def test_must_see_enumeration_with_separators():
+    """顿号 / 逗号枚举的必去项全部捕获（此前只取第一个）。"""
+    requirements = extract_requirements(
+        "去杭州玩3天，必去西湖、灵隐寺、雷峰塔，预算5000元"
+    )
+    assert requirements["budget"] == 5000, requirements
+    assert requirements["must_see"] == ["西湖", "灵隐寺", "雷峰塔"], requirements
+    # 同一句里的千分位预算不能把「10,000」拆成幽灵必去项「000元」
+    mixed = extract_requirements(
+        "去杭州玩3天，必去西湖、灵隐寺和雷峰塔，预算10,000元"
+    )
+    assert mixed["budget"] == 10000, mixed
+    assert mixed["must_see"] == ["西湖", "灵隐寺", "雷峰塔"], mixed
+    plan = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "09:00-11:00", "title": "西湖", "cost": 1000}
+                ],
+                "estimated_budget": 1000,
+            }
+        ]
+    }
+    issues = validate_itinerary(plan, requirements)
+    assert any(issue["code"] == "must_see_missing" for issue in issues), issues
+    print("✓ 顿号枚举的必去项全部参与校验")
+
+
+def test_must_see_ignores_negated_places():
+    """「不想去 / 不太想去 / 不一定要去」里的地点不是必去项。"""
+    assert extract_requirements("我不想去西湖，想去灵隐寺")["must_see"] == ["灵隐寺"]
+    assert "must_see" not in extract_requirements("不太想去西湖")
+    assert "must_see" not in extract_requirements("不一定要去西湖")
+    # 正向的强烈意愿不能被否定词误伤
+    assert extract_requirements("我太想去西湖了")["must_see"] == ["西湖"]
+    print("✓ 否定语境的地点不算必去项")
+
+
+def test_budget_supports_thousands_separators():
+    """预算支持千分位（逗号 / 空格 / 全角逗号），且不跨并列数字拼接。"""
+    assert extract_requirements("预算10,000元")["budget"] == 10000
+    assert extract_requirements("预算 10 000 元")["budget"] == 10000
+    assert extract_requirements("预算1，500元")["budget"] == 1500
+    assert extract_requirements("预算5000，住宿另算3000")["budget"] == 5000
+    print("✓ 预算支持千分位且不跨并列数字")
+
+
+def test_fee_number_supports_wan_and_thousands():
+    """费用字段的数值支持万单位与千分位。"""
+    from utils.itinerary_validation import _number
+
+    assert _number("约1.5万元") == 15000
+    assert _number("10,000元") == 10000
+    assert _number("1.2万") == 12000
+    assert _number(None) is None
+    print("✓ 费用数值支持万 / 千分位")
+
+
+def test_activities_accepts_mapping_and_schedule_key():
+    """键→活动字典与 schedule 键的安排同样参与时间冲突检查。"""
+    requirements = {"duration_days": 1}
+    mapping_plan = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": {
+                    "morning": {"time": "09:00-11:00", "title": "西湖"},
+                    "late": {"time": "10:00-12:00", "title": "灵隐寺"},
+                },
+            }
+        ]
+    }
+    issues = validate_itinerary(mapping_plan, requirements)
+    assert any(issue["code"] == "time_conflict" for issue in issues), issues
+    schedule_plan = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "schedule": [
+                    {"time": "09:00-11:00", "title": "A", "cost": 1000},
+                    {"time": "10:00-12:00", "title": "B", "cost": 1000},
+                ],
+            }
+        ]
+    }
+    issues = validate_itinerary(schedule_plan, requirements)
+    assert any(issue["code"] == "time_conflict" for issue in issues), issues
+    print("✓ activities 字典 / schedule 键参与校验")
+
+
+def test_must_see_strips_admin_suffix_and_leading_particles():
+    """杭州市 + 西湖 / 杭州市西湖：按行政后缀归一；疑问助词不当地名。"""
+    req = extract_requirements(
+        "去杭州市出差3天，必去杭州市西湖", {"destination": "杭州市"}
+    )
+    assert req.get("must_see") == ["西湖"], req
+    req = extract_requirements(
+        "去杭州玩3天，必去西湖的哪些景点", {"destination": "杭州"}
+    )
+    assert req.get("must_see") == ["西湖"], req
+    # 整座城市不是景点
+    assert "must_see" not in extract_requirements(
+        "去北京市出差2天，必去北京市", {"destination": "北京市"}
+    )
+    print("✓ 行政后缀归一与前置助词清洗")
+
+
+def test_text_duration_skips_ordinals_and_ranges():
+    """「第一天」「5日到7日」不是行程总天数。"""
+    from utils.itinerary_validation import _text_duration
+
+    assert _text_duration("第一天去西湖，第二天去灵隐寺") is None
+    assert _text_duration("5日到7日去杭州") is None
+    assert _text_duration("玩3天") == 3
+    print("✓ 序数 / 日期区间不算行程天数")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -207,4 +325,11 @@ if __name__ == "__main__":
     test_validate_passes_for_consistent_plan()
     test_validate_detects_all_five_checks()
     test_validate_handles_empty_and_unknown_shapes()
+    test_must_see_enumeration_with_separators()
+    test_must_see_ignores_negated_places()
+    test_budget_supports_thousands_separators()
+    test_fee_number_supports_wan_and_thousands()
+    test_activities_accepts_mapping_and_schedule_key()
+    test_must_see_strips_admin_suffix_and_leading_particles()
+    test_text_duration_skips_ordinals_and_ranges()
     print("\n全部通过")
