@@ -144,6 +144,15 @@ class RAGConfig(TypedDict):
     # 问答检索的最低余弦相似度：低于该分的片段视为「与知识库无关」，
     # 不再注入回答提示词（无关问题得分通常 <0.5，相关命中 >0.6）
     min_score: float
+    # v2.0 混合检索：向量 + BM25，RRF 融合；重排模型为空表示不启用。
+    # BM25 索引从 Milvus 拉取片段构建并缓存，集合过大时跳过。
+    hybrid_enabled: bool
+    hybrid_candidates: int
+    rrf_k: int
+    rerank_model: str
+    rerank_candidates: int
+    bm25_max_docs: int
+    bm25_ttl_sec: int
 
 
 class StorageConfig(TypedDict):
@@ -216,6 +225,20 @@ elif SYSTEM_CONFIG["timeout"] > 3600:
 RAG_CONFIG: RAGConfig = {
     "embedding_model": "data/models/bge-small-zh-v1.5",
     "min_score": 0.5,
+    # 混合检索（v2.0）：默认开启；BM25 索引构建失败时自动退回纯向量。
+    # 重排模型（如 BAAI/bge-reranker-base）留空表示不加载，避免默认
+    # 拉取额外模型；启用后对 RRF 候选做 cross-encoder 精排。
+    "hybrid_enabled": _env_bool("RAG_HYBRID_ENABLED", True),
+    "hybrid_candidates": max(
+        1, min(200, _env_int("RAG_HYBRID_CANDIDATES", 20))
+    ),
+    "rrf_k": max(1, _env_int("RAG_RRF_K", 60)),
+    "rerank_model": _env_str("RAG_RERANK_MODEL", ""),
+    "rerank_candidates": max(
+        1, min(200, _env_int("RAG_RERANK_CANDIDATES", 20))
+    ),
+    "bm25_max_docs": max(1, _env_int("RAG_BM25_MAX_DOCS", 20000)),
+    "bm25_ttl_sec": max(0, _env_int("RAG_BM25_TTL_SEC", 60)),
 }
 
 # 存储后端（生产模式可选；未配置或连接失败时自动回退本地实现）：
