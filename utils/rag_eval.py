@@ -53,8 +53,11 @@ def evaluate_retrieval(
         search: ``search(query, top_k) -> [{"content": ..., "distance": ...}, ...]``
         cases: 评测用例
         top_k: 每个问题检索的片段数（同时决定 hit@K 的上限）
-        min_score: 与问答链路一致的相似度阈值；给定时低于阈值的结果不参与
-            命中判定（否则评测能 100% 通过而真实回答全是「没有找到」）
+        min_score: 问答链路的相似度阈值（同一配置值）。评测 / 管理接口是
+            纯向量口径，这里过滤的是向量余弦距离；聊天链路过滤的是
+            ``max(余弦, 归一化 BM25)`` 的混合 ``distance``——数值同源、
+            但不在同一分数空间。给定时低于阈值的结果不参与命中判定
+            （否则评测能 100% 通过而真实回答全是「没有找到」）
 
     Returns:
         {"total", "hit1", "hit3", "hit5", "mrr", "rows": [{"query", "rank"}],
