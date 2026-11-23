@@ -792,7 +792,7 @@ class RAGKnowledgeAgent(AgentBase):
                 continue
             try:
                 part = int(metadata.get("part") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 part = 0
             grouped.setdefault(str(group), []).append((part, doc))
 
@@ -817,7 +817,7 @@ class RAGKnowledgeAgent(AgentBase):
                 metadata = metadata if isinstance(metadata, dict) else {}
                 try:
                     declared = max(declared, int(metadata.get("parts") or 0))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
                 if not base_meta:
                     # 保留首片的业务元数据（title/category/parent_doc…）：

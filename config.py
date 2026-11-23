@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 #           LLM_MODEL_NAME=doubao-seed-1-6-flash-250828
 #   OpenAI: LLM_BASE_URL=https://api.openai.com/v1
 #           LLM_MODEL_NAME=gpt-4o-mini
+def _strip_injected_quotes(value: str) -> str:
+    """剥离文件注入的成对引号（K8s ConfigMap / .env 模板）。
+
+    ``"value"`` / ``'value'`` 连引号一起复制进环境变量时，字符串配置会
+    带着引号生效（URL / 密钥鉴权失败），数值 / 布尔则解析失败并静默
+    回退默认值——三类配置必须同一清洗口径。
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1].strip()
+    return value
+
+
 def _env_str(name: str, default: str) -> str:
     """环境变量存在但为空 / 纯空白时回退默认值（Docker / K8s 常见空注入）。
 
@@ -31,22 +43,14 @@ def _env_str(name: str, default: str) -> str:
     value = os.environ.get(name, "").replace("\ufeff", "").strip()
     # 文件注入的 "value" / 'value'（K8s ConfigMap、.env 模板）连引号
     # 一起复制进来：原样生效会让 URL / 密钥带引号、连接在鉴权阶段失败
-    if (
-        len(value) >= 2
-        and value[0] == value[-1]
-        and value[0] in "\"'"
-    ):
-        value = value[1:-1].strip()
-    return value or default
+    return _strip_injected_quotes(value) or default
 
 
 def _env_int(name: str, default: int) -> int:
     # 与 _env_str 同一 BOM / 空白清洗口径：带 U+FEFF 的数值此前解析失败、
     # 静默回退默认值（文件注入的 K8s 值不生效）
-    raw = (
-        os.environ.get(name, str(default))
-        .replace("\ufeff", "")
-        .strip()
+    raw = _strip_injected_quotes(
+        os.environ.get(name, str(default)).replace("\ufeff", "").strip()
     )
     try:
         return int(raw)
@@ -66,12 +70,9 @@ _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = (
-        os.environ.get(name, "")
-        .replace("\ufeff", "")
-        .strip()
-        .lower()
-    )
+    raw = _strip_injected_quotes(
+        os.environ.get(name, "").replace("\ufeff", "").strip()
+    ).lower()
     if not raw:
         return default
     if raw in _BOOL_TRUE_VALUES:
@@ -92,14 +93,18 @@ def _env_bool(name: str, default: bool) -> bool:
 # 密钥必须 strip：复制粘贴带尾随空格 / 换行时，httpx 会拒绝非法 header
 # 值（Bearer sk-xxx␠），所有请求变成「Connection error」且异常链带完整
 # 密钥进日志；纯空白值按未设置处理（否则会阻止回退 config_local.py）
-_api_key = os.environ.get("LLM_API_KEY", "").replace("\ufeff", "").strip()
+_api_key = _strip_injected_quotes(
+    os.environ.get("LLM_API_KEY", "").replace("\ufeff", "").strip()
+)
 if not _api_key:
     try:
         # 本地私有配置（已 gitignore）。注意不要用 import ... as _api_key 的写法：
         # config_local.py 不存在时 mypy 会报 "Name already defined [no-redef]"
         from config_local import API_KEY
 
-        _api_key = str(API_KEY or "").replace("\ufeff", "").strip()
+        _api_key = _strip_injected_quotes(
+            str(API_KEY or "").replace("\ufeff", "").strip()
+        )
     except ImportError as exc:
         # 只吞掉「config_local 不存在 / 没有 API_KEY」；文件里自身 import 失败
         # （例如先 import 了未安装的模块再写密钥）必须暴露，否则有效密钥
@@ -117,7 +122,7 @@ if not _api_key:
             if spec is not None and spec.loader is not None:
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
-                _api_key = (
+                _api_key = _strip_injected_quotes(
                     str(getattr(module, "API_KEY", "") or "")
                     .replace("\ufeff", "")
                     .strip()
