@@ -2332,6 +2332,160 @@ def run_eval_cases_standalone(
     return 0
 
 
+def _parse_eval_agent_args(
+    args: list[str],
+) -> tuple[int, int, float, bool] | None:
+    """解析 eval-agent 的 ``[--count N] [--seed N] [--min-pass X] [--json]``。"""
+    count = 20
+    seed = 7
+    min_pass = 0.0
+    as_json = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+        elif lowered == "--count" or lowered.startswith("--count="):
+            if lowered == "--count":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--count="):]
+            if not re.fullmatch(r"[0-9]{1,4}", value):
+                return None
+            count = int(value)
+            if count < 1 or count > 5000:
+                return None
+        elif lowered == "--seed" or lowered.startswith("--seed="):
+            if lowered == "--seed":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--seed="):]
+            if not re.fullmatch(r"[0-9]{1,10}", value):
+                return None
+            seed = int(value)
+        elif lowered == "--min-pass" or lowered.startswith("--min-pass="):
+            if lowered == "--min-pass":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--min-pass="):]
+            if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", value):
+                return None
+            min_pass = float(value)
+            if not 0.0 <= min_pass <= 1.0:
+                return None
+        else:
+            return None
+        index += 1
+    return count, seed, min_pass, as_json
+
+
+def run_agent_eval_standalone(
+    count: int = 20,
+    seed: int = 7,
+    min_pass: float = 0.0,
+    as_json: bool = False,
+    intention_factory: Any = None,
+) -> int:
+    """跑意图评测（`python cli.py eval-agent`），可注入 fake 意图智能体。"""
+    from utils.agent_eval import (
+        collect_intent_predictions,
+        evaluate_intent_predictions,
+    )
+    from utils.eval_cases import build_cases
+
+    try:
+        cases = build_cases(count, seed)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"生成评测用例失败：{exc}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"生成评测用例失败：{exc}")
+        return 1
+
+    try:
+        if intention_factory is None:
+            from config import LLM_CONFIG
+
+            if not LLM_CONFIG["api_key"]:
+                raise RuntimeError(
+                    "未配置模型密钥（LLM_API_KEY 或 config_local）；"
+                    "eval-agent 需要真实意图模型"
+                )
+            from config_agentscope import create_chat_model
+            from agents.intention_agent import IntentionAgent
+
+            agent = IntentionAgent(model=create_chat_model())
+        else:
+            agent = intention_factory()
+        predictions = asyncio.run(
+            collect_intent_predictions(cases, agent)
+        )
+        summary = evaluate_intent_predictions(cases, predictions)
+    except Exception as exc:  # noqa: BLE001 - 评测失败输出原因并以 1 退出
+        from utils.log_redact import redact_paths
+
+        detail = redact_paths(exc)
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"意图评测失败：{detail}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"意图评测失败：{detail}")
+        return 1
+
+    passed = float(summary["pass_at_1"]) >= min_pass
+    if as_json:
+        payload = {
+            "ok": passed,
+            "count": summary["total"],
+            "seed": seed,
+            "pass_at_1": summary["pass_at_1"],
+            "min_pass": min_pass,
+            "by_category": summary["by_category"],
+            "failures": summary["failures"][:20],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if passed else 1
+
+    print(
+        f"意图评测：{summary['total']} 条 · Pass@1 "
+        f"{summary['pass_at_1']:.0%} · 阈值 {min_pass:.0%}"
+    )
+    for name, bucket in sorted(summary["by_category"].items()):
+        total = int(bucket.get("total", 0))
+        hit = int(bucket.get("passed", 0))
+        ratio = (hit / total) if total else 0.0
+        print(f"  {name}: {hit}/{total}（{ratio:.0%}）")
+    if summary["failures"]:
+        print("失败用例（最多 5 条）：")
+        for item in summary["failures"][:5]:
+            reasons = "；".join(str(reason) for reason in item["reasons"])
+            print(f"  {item['id']}（{item['category']}）：{reasons}")
+    if not passed:
+        print(f"低于阈值 Pass@1 >= {min_pass:.0%}")
+    return 0 if passed else 1
+
+
 def run_knowledge_export_standalone(
     target: str | None = None, force: bool = False, to_stdout: bool = False
 ) -> int:
@@ -6756,6 +6910,7 @@ def _parse_export_args(
 
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / stats / kb / eval / eval-cases / "
+    "eval-agent / "
     "kb-export / "
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
@@ -6890,6 +7045,24 @@ def _main_impl():
                     seed=cases_seed,
                     out_path=cases_out,
                     as_json=cases_json,
+                )
+            )
+        if arg == "eval-agent":
+            parsed_agent = _parse_eval_agent_args(sys.argv[2:])
+            if parsed_agent is None:
+                _cli_fail(
+                    "用法：python cli.py eval-agent "
+                    "[--count 20] [--seed 7] [--min-pass 0.0] [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
+                sys.exit(2)
+            agent_count, agent_seed, agent_min_pass, agent_json = parsed_agent
+            sys.exit(
+                run_agent_eval_standalone(
+                    count=agent_count,
+                    seed=agent_seed,
+                    min_pass=agent_min_pass,
+                    as_json=agent_json,
                 )
             )
         if arg == "kb-export":
