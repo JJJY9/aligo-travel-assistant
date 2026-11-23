@@ -2597,6 +2597,16 @@ def _close_long_term(store: Any) -> None:
             close()
 
 
+def _invalidate_preference_caches() -> None:
+    """面板 / 导入直写偏好后清空各会话的偏好快照缓存（失败不影响写入）。"""
+    try:
+        from context.memory_manager import MemoryManager
+
+        MemoryManager.invalidate_all_preference_caches()
+    except Exception:  # noqa: BLE001 - 缓存清理失败由 5 秒 TTL 兜底
+        logger.debug("清理偏好快照缓存失败", exc_info=True)
+
+
 def _safe_filename(value: str, fallback: str = "aligo") -> str:
     """把用户 / 会话 ID 转为只含 ASCII 的安全下载文件名。
 
@@ -4220,6 +4230,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("保存失败", exc) from exc
         finally:
             _close_long_term(store)
+        _invalidate_preference_caches()
         return {"type": pref_type, "value": value}
 
     @app.delete("/api/preferences/{pref_type}")
@@ -4245,6 +4256,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("删除失败", exc) from exc
         finally:
             _close_long_term(store)
+        _invalidate_preference_caches()
         return {"type": pref_type, "deleted": removed}
 
     @app.get("/api/sessions", dependencies=[Depends(_cross_site_side_effect)])
@@ -6186,6 +6198,8 @@ def create_app(model: Any = None) -> FastAPI:
                             sections,
                             knowledge_unverified=knowledge_skip_reason,
                         )
+                        # 导入可能覆盖 / 删除偏好：清掉已建会话的 5 秒快照
+                        _invalidate_preference_caches()
                         # 写库期间（大备份可能数十秒）其它实例 / CLI 可能删除
                         # 某个会话：最后再查一次墓碑并整会话回滚，避免迟到的
                         # 删除被恢复写回。若删除发生在本次检查之后，它自己的

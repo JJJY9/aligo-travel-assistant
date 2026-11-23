@@ -84,6 +84,32 @@ def test_pg_backend_cache_hit_and_invalidation(monkeypatch):
         shutil.rmtree(storage, ignore_errors=True)
 
 
+def test_invalidate_all_preference_caches(monkeypatch):
+    """面板 / 导入直写时一次清空本进程所有实例的偏好快照。"""
+    _with_pg(monkeypatch)
+    first, first_storage = _manager()
+    second, second_storage = _manager()
+    try:
+        first_store = _FakeStore(snapshot_based=False)
+        second_store = _FakeStore(snapshot_based=False)
+        first.long_term = first_store
+        second.long_term = second_store
+        first.get_preferences()
+        second.get_preferences()
+        assert first_store.reads == second_store.reads == 1
+
+        MemoryManager.invalidate_all_preference_caches()
+
+        first.get_preferences()
+        second.get_preferences()
+        assert first_store.reads == 2, "全局失效后第一个实例应重新读取"
+        assert second_store.reads == 2, "全局失效后第二个实例应重新读取"
+        print("✓ 全局失效清空所有实例偏好缓存")
+    finally:
+        shutil.rmtree(first_storage, ignore_errors=True)
+        shutil.rmtree(second_storage, ignore_errors=True)
+
+
 def test_pg_cache_ttl_expiry(monkeypatch):
     """超过 TTL 后重新读取。"""
     _with_pg(monkeypatch)
@@ -148,6 +174,7 @@ if __name__ == "__main__":
     for _case in (
         test_json_backend_does_not_cache,
         test_pg_backend_cache_hit_and_invalidation,
+        test_invalidate_all_preference_caches,
         test_pg_cache_ttl_expiry,
     ):
         _mp = pytest.MonkeyPatch()
