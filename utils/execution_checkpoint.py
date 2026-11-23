@@ -293,7 +293,10 @@ def clear_session_checkpoints(
     与条目上限兜底。
     """
     try:
-        target = store or CheckpointStore()
+        # ``store or ...`` 会把「空存储」当成缺省：CheckpointStore 定义了
+        # __len__，没有文件时真值为假，传入的自定义 store 会被静默忽略、
+        # 清理落到默认目录
+        target = store if store is not None else CheckpointStore()
         return target.clear_scope(f"{user_id}:{session_id}")
     except Exception as exc:  # noqa: BLE001 - 清理失败不阻断会话删除
         logger.warning("清理会话执行检查点失败: %s", exc)

@@ -941,13 +941,12 @@ class OrchestrationAgent(AgentBase):
         store = getattr(self, "_checkpoint_store", None)
         if store is None:
             try:
-                from utils.paths import default_data_root
-
                 from utils.execution_checkpoint import CheckpointStore
 
-                store = CheckpointStore(
-                    default_data_root() / "runtime" / "checkpoints"
-                )
+                # 不传显式 root：默认存储初始化时会清理旧 CWD / 包根目录
+                # 里已过 TTL 的检查点（显式 root 按测试 / 自定义部署语义
+                # 跳过清理，此前传默认路径让旧文件永远清不掉）
+                store = CheckpointStore()
             except Exception as exc:  # noqa: BLE001 - 检查点不可用不影响对话
                 logger.warning("初始化执行检查点失败，跳过持久化: %s", exc)
                 return None

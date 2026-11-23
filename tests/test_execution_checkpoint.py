@@ -189,6 +189,67 @@ def test_clear_session_checkpoints_uses_default_store():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_clear_session_checkpoints_uses_empty_custom_store():
+    """空的自定义 store 不能被 `or` 误判为缺省（__len__ 为 0 时为假）。"""
+    from utils.execution_checkpoint import clear_session_checkpoints
+
+    class _EmptyStore:
+        def __init__(self):
+            self.calls = []
+
+        def __len__(self):
+            return 0
+
+        def clear_scope(self, scope):
+            self.calls.append(scope)
+            return 3
+
+    store = _EmptyStore()
+    assert clear_session_checkpoints("u1", "s1", store=store) == 3
+    assert store.calls == ["u1:s1"]
+    print("✓ 清空存储的自定义 store 仍被使用")
+
+
+def test_orchestration_checkpoint_store_cleans_legacy():
+    """编排层检查点用默认存储构造：旧 CWD 目录的过期检查点会被清理。"""
+    from agents.orchestration_agent import OrchestrationAgent
+
+    import utils.execution_checkpoint as checkpoint_module
+
+    old_env = os.environ.get("ALIGO_DATA_DIR")
+    old_cwd = os.getcwd()
+    base = tempfile.mkdtemp(prefix="chailv_ckpt_orch_")
+    legacy = Path(base) / "data" / "runtime" / "checkpoints"
+    legacy.mkdir(parents=True)
+    stale = legacy / "stale.json"
+    stale.write_text("{}", encoding="utf-8")
+    old_ts = time.time() - 7200
+    os.utime(stale, (old_ts, old_ts))
+    old_package_root = checkpoint_module.package_root
+    try:
+        checkpoint_module.package_root = lambda: Path(base) / "package"
+        os.environ["ALIGO_DATA_DIR"] = str(Path(base) / "newdata")
+        os.chdir(base)
+        agent = object.__new__(OrchestrationAgent)
+        agent._checkpoint_key = "u:s:t:d"
+        agent._checkpoint_store = None
+        store = agent._checkpoint_store_for_turn()
+        assert store is not None
+        assert store.root == Path(base) / "newdata" / "runtime" / "checkpoints", (
+            store.root
+        )
+        assert not stale.exists(), "编排层初始化应清理旧目录的过期检查点"
+    finally:
+        checkpoint_module.package_root = old_package_root
+        os.chdir(old_cwd)
+        if old_env is None:
+            os.environ.pop("ALIGO_DATA_DIR", None)
+        else:
+            os.environ["ALIGO_DATA_DIR"] = old_env
+        shutil.rmtree(base, ignore_errors=True)
+    print("✓ 编排层检查点存储清理旧目录")
+
+
 def test_default_store_cleans_stale_legacy_checkpoints():
     """默认根只清理旧 CWD 目录中已过 TTL 的检查点，近期文件保留。"""
     import utils.execution_checkpoint as checkpoint_module
@@ -257,6 +318,8 @@ if __name__ == "__main__":
     test_init_prunes_expired_and_stale_temp()
     test_clear_scope_removes_only_matching_session()
     test_clear_session_checkpoints_uses_default_store()
+    test_clear_session_checkpoints_uses_empty_custom_store()
+    test_orchestration_checkpoint_store_cleans_legacy()
     test_default_store_cleans_stale_legacy_checkpoints()
     test_explicit_root_does_not_clean_legacy_checkpoints()
     print("\n全部通过")
