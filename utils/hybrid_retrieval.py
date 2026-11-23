@@ -11,10 +11,30 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 from collections import Counter
 from typing import Any, Sequence
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+|[一-鿿]+")
+
+# 进程级缓存失效版本号：技能脚本可能以不同模块名被加载多次（懒加载注册器、
+# 测试重复导入），每个副本各有一份模块级缓存；知识写入方 bump 版本号后，
+# 所有副本在下一次读取时都会判定缓存过期，不必互相持有对方的缓存对象
+_BM25_EPOCH_LOCK = threading.Lock()
+_BM25_EPOCH = 0
+
+
+def bm25_cache_epoch() -> int:
+    """当前 BM25 缓存版本（跨模块副本共享）。"""
+    with _BM25_EPOCH_LOCK:
+        return _BM25_EPOCH
+
+
+def invalidate_bm25_cache() -> None:
+    """使进程内所有 BM25 索引缓存失效（知识写入 / 删除后调用）。"""
+    global _BM25_EPOCH
+    with _BM25_EPOCH_LOCK:
+        _BM25_EPOCH += 1
 
 
 def tokenize(text: object) -> list[str]:
@@ -95,6 +115,16 @@ class BM25Index:
             results.append((self.documents[index], scores[index]))
         return results
 
+    def query_reference(self, query: object) -> float:
+        """归一化基准：覆盖全部查询词、长度取平均的理想片段得分。
+
+        取查询词 IDF 之和（文档平均长度下每个词一次的 BM25 贡献恰为
+        ``idf``）。用「本次结果的最高分」归一化会让任何查询的 top-1 都
+        变成 1.0，弱关键词命中也绕过 ``min_score``；按查询覆盖面归一化
+        后，只命中少量常见词的片段分数自然低于阈值。
+        """
+        return sum(self._idf.get(term, 0.0) for term in set(tokenize(query)))
+
 
 def rrf_fuse(
     ranked_lists: Sequence[Sequence[dict[str, Any]]],
@@ -127,20 +157,31 @@ def annotate_hybrid_scores(
     fused_documents: Sequence[dict[str, Any]],
     vector_distances: dict[str, float],
     bm25_scores: dict[str, float],
+    *,
+    bm25_reference: float | None = None,
 ) -> list[dict[str, Any]]:
     """为融合结果写入可解释分数，并生成用于阈值过滤的 ``distance``。
 
     ``distance`` = max(向量相似度, 归一化 BM25)。这样既保留既有
     ``min_score`` 的「0–1、越高越相关」语义，又让只在关键词路命中
     （向量分低）的片段有机会通过阈值。
+
+    ``bm25_reference`` 应传 ``BM25Index.query_reference(query)``（查询词
+    IDF 之和）。缺省退回「本次最高 BM25 分」的旧口径：top-1 永远是
+    1.0，弱命中也会绕过阈值，仅为兼容旧调用方保留。
     """
-    max_bm25 = max(bm25_scores.values(), default=0.0)
+    if bm25_reference is not None and bm25_reference > 0:
+        reference = float(bm25_reference)
+    else:
+        reference = max(bm25_scores.values(), default=0.0)
     annotated: list[dict[str, Any]] = []
     for doc in fused_documents:
         key = str(doc.get("id") or "")
         vector_score = float(vector_distances.get(key, 0.0) or 0.0)
         bm25_score = float(bm25_scores.get(key, 0.0) or 0.0)
-        normalized = (bm25_score / max_bm25) if max_bm25 > 0 else 0.0
+        normalized = (
+            min(1.0, bm25_score / reference) if reference > 0 else 0.0
+        )
         annotated.append(
             {
                 **doc,

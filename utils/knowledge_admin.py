@@ -256,6 +256,20 @@ def _client() -> Any:
     return get_milvus_client(str(db))
 
 
+def _invalidate_hybrid_cache() -> None:
+    """知识写入 / 删除后让进程内 BM25 缓存失效。
+
+    缓存版本号放在 utils.hybrid_retrieval（进程级），技能脚本以不同模块名
+    被加载多次时所有副本一起过期；失败只影响新鲜度，由索引 TTL 兜底。
+    """
+    try:
+        from utils.hybrid_retrieval import invalidate_bm25_cache
+
+        invalidate_bm25_cache()
+    except Exception:  # noqa: BLE001 - 失效失败由 TTL 兜底
+        logger.debug("BM25 缓存失效失败", exc_info=True)
+
+
 def _collection_exists() -> bool:
     """集合是否已建立；探测失败按「存在」处理（沿用原错误路径）。"""
     try:
@@ -839,6 +853,7 @@ def update_document(
         payload["removed_ids"] = removed_ids
     if leftover_ids:
         payload["leftover_ids"] = leftover_ids
+    _invalidate_hybrid_cache()
     return payload
 
 
@@ -1318,6 +1333,8 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
                     failed.append({"id": doc_id, "error": str(exc)})
                     continue
                 removed += 1
+        if removed:
+            _invalidate_hybrid_cache()
         return {
             "dry_run": False,
             "groups": len(plan),
@@ -2226,6 +2243,7 @@ def delete_document(doc_id: int, whole_group: bool = False) -> int:
                     parts,
                 )
         client.delete(collection_name=COLLECTION_NAME, ids=ids)
+        _invalidate_hybrid_cache()
         return len(ids)
 
 

@@ -68,7 +68,13 @@ except ImportError as e:
     DEPENDENCIES_AVAILABLE = False
 
 from utils.embedding_model import embedding_dimension, get_embedding_model
-from utils.hybrid_retrieval import BM25Index, annotate_hybrid_scores, rrf_fuse
+from utils.hybrid_retrieval import (
+    BM25Index,
+    annotate_hybrid_scores,
+    bm25_cache_epoch,
+    invalidate_bm25_cache,
+    rrf_fuse,
+)
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
@@ -77,8 +83,10 @@ from utils.user_query import extract_user_query
 _COLLECTION_INIT_LOCK = threading.Lock()
 
 # BM25 索引缓存：模块在会话间共享（_MODULE_CACHE），同一知识库只构建
-# 一次；写入后按知识库键失效，TTL 兜住其它进程的修改。
-_BM25_CACHE: dict[tuple[str, str], tuple[float, BM25Index]] = {}
+# 一次；写入后按知识库键失效，TTL 兜住其它进程的修改。条目携带共享
+# 版本号：技能脚本可能以不同模块名被加载多次，各副本缓存互不可见，
+# 写入方 bump utils 里的进程级版本号即可让所有副本一起过期。
+_BM25_CACHE: dict[tuple[str, str], tuple[float, BM25Index, int]] = {}
 _BM25_FAILED_AT: dict[tuple[str, str], float] = {}
 _BM25_CACHE_LOCK = threading.Lock()
 _BM25_KEY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
@@ -87,6 +95,23 @@ _BM25_KEY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 def _bm25_key_lock(key: tuple[str, str]) -> threading.Lock:
     with _BM25_CACHE_LOCK:
         return _BM25_KEY_LOCKS.setdefault(key, threading.Lock())
+
+
+def _metadata_dict(value: object) -> dict:
+    """Milvus 行里的 metadata 是 JSON 字符串：解析为 dict 再参与分组。
+
+    向量路会解析 metadata，BM25 路此前原样保留字符串——只在关键词路
+    命中的多分片文档拼不回整篇，业务元数据也一起丢失。
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 class RAGKnowledgeAgent(AgentBase):
@@ -611,20 +636,32 @@ class RAGKnowledgeAgent(AgentBase):
 
         key = (str(self.knowledge_base_path), self.collection_name)
         now = time.monotonic()
+        epoch = bm25_cache_epoch()
         with _BM25_CACHE_LOCK:
             cached = _BM25_CACHE.get(key)
             failed_at = _BM25_FAILED_AT.get(key, 0.0)
-        if cached is not None and (now - cached[0]) <= ttl:
+        if (
+            cached is not None
+            and cached[2] == epoch
+            and (now - cached[0]) <= ttl
+        ):
             return cached[1]
         if failed_at and (now - failed_at) <= ttl:
             return None
 
         with _bm25_key_lock(key):
             now = time.monotonic()
+            # 构建前捕获版本号：构建期间若发生写入 / 删除，索引按旧版本
+            # 落缓存，下一次读取会因版本不一致而重建
+            epoch = bm25_cache_epoch()
             with _BM25_CACHE_LOCK:
                 cached = _BM25_CACHE.get(key)
                 failed_at = _BM25_FAILED_AT.get(key, 0.0)
-            if cached is not None and (now - cached[0]) <= ttl:
+            if (
+                cached is not None
+                and cached[2] == epoch
+                and (now - cached[0]) <= ttl
+            ):
                 return cached[1]
             if failed_at and (now - failed_at) <= ttl:
                 return None
@@ -636,9 +673,15 @@ class RAGKnowledgeAgent(AgentBase):
                     _BM25_FAILED_AT[key] = now
                 return None
             index = BM25Index(rows)
-            with _BM25_CACHE_LOCK:
-                _BM25_CACHE[key] = (time.monotonic(), index)
-                _BM25_FAILED_AT.pop(key, None)
+            # 扫描期间若发生知识写入 / 删除（版本号已变），这份快照可能
+            # 读到整组替换的中间态：只服务本次请求，不能写入缓存覆盖新
+            # 数据（下一次请求会按新版本重建）
+            if bm25_cache_epoch() == epoch:
+                with _BM25_CACHE_LOCK:
+                    _BM25_CACHE[key] = (time.monotonic(), index, epoch)
+                    _BM25_FAILED_AT.pop(key, None)
+            else:
+                logger.info("BM25 索引构建期间知识库已变更，本次不缓存")
             logger.info(
                 "BM25 索引已构建：%s 条片段（集合 %s）",
                 len(index),
@@ -662,7 +705,13 @@ class RAGKnowledgeAgent(AgentBase):
                 batch = iterator.next()
                 if not batch:
                     break
-                rows.extend(batch)
+                rows.extend(
+                    {
+                        **row,
+                        "metadata": _metadata_dict(row.get("metadata")),
+                    }
+                    for row in batch
+                )
                 if len(rows) > max_docs:
                     raise RuntimeError(
                         f"知识库片段数超过 BM25 上限 {max_docs}，"
@@ -704,7 +753,12 @@ class RAGKnowledgeAgent(AgentBase):
             str(doc.get("id") or ""): float(doc.get("bm25_score") or 0.0)
             for doc in bm25_docs
         }
-        fused = annotate_hybrid_scores(fused, vector_scores, bm25_scores)
+        fused = annotate_hybrid_scores(
+            fused,
+            vector_scores,
+            bm25_scores,
+            bm25_reference=index.query_reference(query),
+        )
         fused = self._rerank_documents(query, fused)
         return fused[:top_k]
 
@@ -749,7 +803,12 @@ class RAGKnowledgeAgent(AgentBase):
         return head + tail
 
     def _invalidate_bm25_cache(self) -> None:
-        """知识库写入后失效进程级 BM25 缓存（其它进程由 TTL 兜底）。"""
+        """知识库写入后失效进程级 BM25 缓存。
+
+        先 bump 共享版本号：技能脚本可能以不同模块名被加载多次，各副本
+        缓存互不可见；只 pop 本模块的键会让聊天链路继续用旧索引。
+        """
+        invalidate_bm25_cache()
         key = (str(self.knowledge_base_path), self.collection_name)
         with _BM25_CACHE_LOCK:
             _BM25_CACHE.pop(key, None)
@@ -807,6 +866,7 @@ class RAGKnowledgeAgent(AgentBase):
             seen_parts: set[int] = set()
             texts: list[str] = []
             best_score = 0.0
+            best_rerank: float | None = None
             base_meta: dict = {}
             declared = 0
             for part, doc in parts:
@@ -834,6 +894,18 @@ class RAGKnowledgeAgent(AgentBase):
                 best_score = max(
                     best_score, float(doc.get("distance") or 0.0)
                 )
+                rerank_value = doc.get("rerank_score")
+                if rerank_value is not None:
+                    try:
+                        rerank_score = float(rerank_value)
+                    except (TypeError, ValueError):
+                        rerank_score = None
+                    if rerank_score is not None:
+                        best_rerank = (
+                            rerank_score
+                            if best_rerank is None
+                            else max(best_rerank, rerank_score)
+                        )
             # 用换行拼接：分片跳号 / 只有部分分片过阈值时直接相连会把两段
             # 文字粘在一起；parts 保留原始声明，另记实际取回片数与缺片
             total_parts = max(declared, max(seen_parts, default=0))
@@ -867,18 +939,32 @@ class RAGKnowledgeAgent(AgentBase):
                 if len(missing) > len(shown):
                     text += f"…（共 {len(missing)} 个缺失）"
                 assembled_meta["missing_parts"] = text
-            assembled.append(
-                {
-                    "id": group_id,
-                    "content": "\n".join(texts),
-                    "metadata": assembled_meta,
-                    "distance": best_score,
-                }
-            )
+            assembled_doc = {
+                "id": group_id,
+                "content": "\n".join(texts),
+                "metadata": assembled_meta,
+                "distance": best_score,
+            }
+            if best_rerank is not None:
+                assembled_doc["rerank_score"] = best_rerank
+            assembled.append(assembled_doc)
 
-        assembled.sort(
-            key=lambda item: float(item.get("distance") or 0.0), reverse=True
-        )
+        # 有精排分数时按精排排序（组取组内最佳）：只按 distance 重排会把
+        # _rerank_documents 的结果整体打回 RRF 顺序，精排形同虚设
+        if any(item.get("rerank_score") is not None for item in assembled):
+            assembled.sort(
+                key=lambda item: (
+                    1 if item.get("rerank_score") is not None else 0,
+                    float(item.get("rerank_score") or 0.0),
+                    float(item.get("distance") or 0.0),
+                ),
+                reverse=True,
+            )
+        else:
+            assembled.sort(
+                key=lambda item: float(item.get("distance") or 0.0),
+                reverse=True,
+            )
         return assembled
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
