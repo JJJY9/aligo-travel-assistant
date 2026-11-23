@@ -573,6 +573,12 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
         raise FileNotFoundError("知识库未初始化")
     documents = _chunk_documents(text, metadata)
 
+    # 全局上限预检放在模型加载前：统计失败按 0 放行（导出端有降级兜底），
+    # 越限明确拒绝而不是把知识库推过导出上限（此后备份只能省略知识段）
+    problem = _knowledge_row_limit_problem(_collection_row_count(), len(documents))
+    if problem:
+        raise ValueError(problem)
+
     # 模型加载可能耗时数秒，放在锁外；锁只保护 id 生成 + 写入
     agent = _get_agent()
     with _write_lock():
@@ -1254,6 +1260,47 @@ def _existing_contents() -> list[str]:
     ]
 
 
+def _knowledge_row_limit_problem(current_rows: int, adding: int) -> str | None:
+    """全局知识库行数不得越过导出上限（与备份导入的条数上限同一口径）。
+
+    知识管理导入（``/api/knowledge/import`` 可反复导入累积）与 CLI
+    ``kb-import``（不限条数）不设全局上限时，知识库能被推到导出上限之
+    外，此后 /api/export?with_knowledge 的备份只能省略知识段（降级），
+    任何账号都拿不到含完整知识的备份。返回拒绝原因或 None。
+    """
+    try:
+        from utils.user_import import _MAX_KNOWLEDGE
+    except Exception:  # noqa: BLE001 - 上限模块不可用时保持旧行为
+        return None
+    total = int(current_rows) + max(0, int(adding))
+    if total <= _MAX_KNOWLEDGE:
+        return None
+    return (
+        f"全局知识库将达 {total} 条、超过导出上限 {_MAX_KNOWLEDGE} 条"
+        f"（现有 {current_rows} + 本次 {adding}）：超出后所有用户的"
+        "「备份（含知识库）」都只能省略知识段。请先删除部分旧片段"
+        "（面板删除 / kb-delete）后重试"
+    )
+
+
+def _collection_row_count() -> int:
+    """集合行数（get_collection_stats，毫秒级）；读取失败返回 0。
+
+    ``add_document`` 的全局上限预检用：统计失败按 0 放行（导出端已有
+    降级兜底，不能因为统计抖动阻断面板添加一条知识）。批量导入不用它
+    ——写锁内已有全库内容快照（``len(existing)`` 即行数），不受统计
+    快照延迟影响。
+    """
+    try:
+        client = _client()
+        _load_collection(client, COLLECTION_NAME)
+        stats = client.get_collection_stats(COLLECTION_NAME)
+        return int(stats.get("row_count", 0) or 0)
+    except Exception as exc:  # noqa: BLE001 - 统计失败按旧行为放行
+        logger.warning("读取知识库行数失败（%s），跳过全局上限预检", exc)
+        return 0
+
+
 def _row_content(client: Any, doc_id: int) -> str | None:
     """按 id 读取片段内容（不存在返回 None）。"""
     rows = client.query(
@@ -1503,6 +1550,10 @@ def import_documents(
     ``ignore_existing``（仅 dry-run）不与现有库去重、不扫描库内容，按
     「导入空库」返回全部分片：导出端自检不能用源库去重后的「新增分片」
     估算备份体积（整库导出行本就在源库中，pieces 会几乎为空）。
+
+    全局行数不得越过导出上限（与备份导入的条数上限同一口径）：真实导入
+    在写入前抛 :class:`ValueError`，dry-run 在返回值的
+    ``export_limit_problem`` 字段说明原因（预览不拒绝，供调用方展示）。
     """
     items = list(documents)
     if ignore_existing and not dry_run:
@@ -2149,6 +2200,15 @@ def import_documents(
                 if return_pieces:
                     result["pieces"] = []
             return result
+        # 全局导出上限：existing 是写锁内已扫描的全库内容快照（len 即库内
+        # 片段数），unique 是本次真正写入的行。预览不拒绝（原因回填给
+        # 调用方展示），真实导入在写入前拒绝——知识库越过导出上限后所有
+        # 用户的 with_knowledge 备份只能省略知识段（降级）。
+        export_limit_problem = _knowledge_row_limit_problem(
+            len(existing), len(unique)
+        )
+        if export_limit_problem and not dry_run:
+            raise ValueError(export_limit_problem)
         if dry_run:
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
             payload = {
@@ -2165,6 +2225,8 @@ def import_documents(
                 payload["pieces"] = [dict(entry) for entry in unique]
             if problems:
                 payload["skipped_groups"] = problems
+            if export_limit_problem:
+                payload["export_limit_problem"] = export_limit_problem
             return payload
 
         # 按「文档」分批：同一 group 的分片必须落在同一批（批间失败会在库
