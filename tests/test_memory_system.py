@@ -179,24 +179,27 @@ async def test_memory_system():
     print_section("测试5: 长期记忆总结（使用LLM生成摘要）")
 
     print("正在生成长期记忆总结（调用LLM）...")
+    summary_error: Exception | None = None
     try:
         summary = await memory_manager.get_long_term_summary_async(max_messages=30)
-        if summary:
-            print("✓ 长期记忆总结生成成功\n")
-            print("📝 总结内容:")
-            print("-" * 80)
-            print(summary)
-            print("-" * 80)
-        else:
-            print("⚠ 长期记忆总结为空（可能是没有历史记录）")
-    except Exception as e:
-        print(f"✗ 长期记忆总结生成失败: {e}")
+    except Exception as exc:  # noqa: BLE001 - 记录后统一断言，不能吞成假绿
+        summary = ""
+        summary_error = exc
+    assert summary_error is None, f"长期记忆总结生成失败: {summary_error}"
+    assert isinstance(summary, str) and summary.strip(), "长期记忆总结为空"
+    print("✓ 长期记忆总结生成成功\n")
+    print("📝 总结内容:")
+    print("-" * 80)
+    print(summary)
+    print("-" * 80)
 
     # ========== 测试完整上下文获取 ==========
     print_section("测试6: 获取完整上下文（短期+长期记忆）")
 
     print("📝 完整上下文结构:")
     full_context = memory_manager.get_full_context()
+    assert set(full_context) >= {"short_term", "long_term"}, full_context
+    assert "recent_dialogue" in full_context["short_term"]
 
     print("\n【短期记忆】")
     print(f"  - 最近对话数: {len(full_context['short_term']['recent_dialogue'])}")
@@ -215,6 +218,7 @@ async def test_memory_system():
 
     print("📝 Agent上下文字符串:")
     agent_context = memory_manager.get_context_for_agent(long_term_summary)
+    assert isinstance(agent_context, str) and agent_context.strip(), "Agent 上下文为空"
     print("-" * 80)
     print(agent_context)
     print("-" * 80)
