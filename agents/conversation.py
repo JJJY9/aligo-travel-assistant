@@ -266,6 +266,7 @@ class ConversationRuntime:
                 getattr(self.orchestrator, "commit_deferred_memory", None)
             )
             retry_cache_supported = False
+            checkpoint_supported = False
             if defer_supported:
                 parameters: Iterable[inspect.Parameter]
                 try:
@@ -284,6 +285,11 @@ class ConversationRuntime:
                     or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
+                checkpoint_supported = any(
+                    parameter.name == "checkpoint_key"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
             # 整轮重试缓存：外层 retry_with_backoff 会重跑整个编排，缓存让
             # 重试跳过首轮已成功的智能体（一次 429/5xx 曾让同批已完成的
             # 智能体重复调用模型、放大账单与耗时）
@@ -293,6 +299,13 @@ class ConversationRuntime:
                 reply_options["defer_memory"] = True
             if retry_cache_supported:
                 reply_options["retry_cache"] = orchestration_retry_cache
+            if checkpoint_supported and turn_id:
+                # v2.0 持久化执行：同一 user + session + turn 的重试 / 重启
+                # 复用已成功的子智能体结果（client_turn_id 由前端生成）
+                reply_options["checkpoint_key"] = (
+                    f"{getattr(self.memory, 'user_id', '')}:"
+                    f"{getattr(self.memory, 'session_id', '')}:{turn_id}"
+                )
             orchestration = await self._call_with_resilience(
                 lambda: self.orchestrator.reply(
                     sanitized_intention,

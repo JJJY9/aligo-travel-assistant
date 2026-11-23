@@ -349,6 +349,9 @@ class OrchestrationAgent(AgentBase):
         # 单飞中的延迟提交任务：第二次调用等待第一次写完，而不是立即返回
         # False（否则 drain 会以为没有在途写入、提前释放用户锁）
         self._deferred_commit_task: asyncio.Future[bool] | None = None
+        # 执行检查点（v2.0）：键在 reply 入口设置；存储懒加载 / 测试可注入
+        self._checkpoint_key: str | None = None
+        self._checkpoint_store = None
 
     def register_agent(self, agent_name: str, agent: AgentBase):
         """注册子智能体"""
@@ -367,6 +370,7 @@ class OrchestrationAgent(AgentBase):
         on_event: ProgressCallback | None = None,
         defer_memory: bool = False,
         retry_cache: dict[str, dict[str, Any]] | None = None,
+        checkpoint_key: str | None = None,
     ) -> Msg:
         """
         协调执行流程
@@ -374,10 +378,16 @@ class OrchestrationAgent(AgentBase):
         Args:
             x: 输入消息，应包含 IntentionAgent 的输出
             on_event: 进度回调（可选），接收 agent_start / agent_done 事件
+            checkpoint_key: 执行检查点键（v2.0，可选）。提供时把已成功的
+                子智能体结果落盘，同一键的重试 / 重启复用这些结果。
 
         Returns:
             Msg: 执行结果
         """
+        # v2.0 持久化执行：本轮检查点键（未提供则不复用 / 不落盘）
+        self._checkpoint_key = (
+            str(checkpoint_key).strip() if checkpoint_key else None
+        )
         # 上一轮失败 / 取消 / 空调度遗留的暂存负载不能带入本轮：只有本轮
         # 成功落库后的 commit 才应写库；遗留负载会变成没有对话支撑的幽灵
         # 行程与偏好（no_agents / 非法意图早退路径同样要先清空）
@@ -904,6 +914,18 @@ class OrchestrationAgent(AgentBase):
         except Exception:  # noqa: BLE001 - 进度展示失败不应中断执行
             logger.debug("Progress callback failed", exc_info=True)
 
+    def _checkpoint_store_for_turn(self):
+        """本轮检查点存储（懒加载）；未提供键时返回 None。"""
+        if not getattr(self, "_checkpoint_key", None):
+            return None
+        store = getattr(self, "_checkpoint_store", None)
+        if store is None:
+            from utils.execution_checkpoint import CheckpointStore
+
+            store = CheckpointStore("data/runtime/checkpoints")
+            self._checkpoint_store = store
+        return store
+
     async def _execute_agent(
         self,
         agent_name: str,
@@ -916,13 +938,26 @@ class OrchestrationAgent(AgentBase):
         cache_key: str = "",
     ) -> dict[str, Any]:
         """执行单个智能体，并在开始 / 结束时发出进度事件。"""
+        # 注册器两种名称都接受，但事件与结果统一用标准名
+        canonical_name = canonical_agent_name(agent_name)
         if retry_cache is not None and cache_key and cache_key in retry_cache:
             # 外层整轮回退重试：复用首轮已完成的智能体结果，不重复调用
             # 模型（一次 429/5xx 曾让同批已成功的智能体整体重发），也不再
             # 重发进度事件（首轮已经展示过）
             return retry_cache[cache_key]
-        # 注册器两种名称都接受，但事件与结果统一用标准名
-        canonical_name = canonical_agent_name(agent_name)
+        checkpoint_store = self._checkpoint_store_for_turn()
+        checkpoint_key = getattr(self, "_checkpoint_key", None)
+        if checkpoint_store is not None and checkpoint_key:
+            try:
+                state = await asyncio.to_thread(checkpoint_store.load, checkpoint_key)
+            except Exception as exc:  # noqa: BLE001 - 检查点读取失败按无缓存
+                logger.warning("读取执行检查点失败: %s", exc)
+                state = None
+            steps = state.get("steps") if isinstance(state, dict) else None
+            cached = steps.get(canonical_name) if isinstance(steps, dict) else None
+            if isinstance(cached, dict) and cached.get("status") == "success":
+                # 持久化检查点里已成功：直接复用（重启 / 失败重试场景）
+                return cached
         self._emit(on_event, {"type": "agent_start", "agent_name": canonical_name})
         started = time.perf_counter()
         result = await self._run_agent(
@@ -952,6 +987,20 @@ class OrchestrationAgent(AgentBase):
             # 只复用首轮已成功的结果：status=error（模型格式错误 / 超时）
             # 在整轮回退重试时应当重新执行，否则瞬时失败被缓存成永久失败
             retry_cache[cache_key] = result
+        if (
+            checkpoint_store is not None
+            and checkpoint_key
+            and result.get("status") == "success"
+        ):
+            try:
+                await asyncio.to_thread(
+                    checkpoint_store.update_step,
+                    checkpoint_key,
+                    canonical_name,
+                    result,
+                )
+            except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
+                logger.warning("保存执行检查点失败: %s", exc)
         return result
 
     async def _run_agent(
