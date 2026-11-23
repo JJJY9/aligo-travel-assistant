@@ -77,6 +77,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio, strip_terminal_controls
 from utils.doctor import run_doctor
 from utils.identifiers import is_valid_web_id
+from utils.idempotency import IdempotencyCache, make_key
 from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
     METADATA_KEY_MAX_CHARS,
@@ -748,6 +749,9 @@ class ChatRequest(BaseModel):
     # 客户端生成的回合标识：写入助手消息的 _meta，停止 / 断网后的前端
     # 对账用它精确判断这一轮是否已落库（文本比较会把重复提问误判成已保存）
     client_turn_id: str | None = Field(default=None, pattern=_ID_PATTERN)
+    # 幂等键（v2.0）：同一用户 + 同一会话 + 同一键的重复提交直接返回上次
+    # 成功响应，不重复执行 Agent / 写记忆。前端网络重试时携带。
+    idempotency_key: str | None = Field(default=None, max_length=200)
 
     @field_validator("session_id")
     @classmethod
@@ -1283,6 +1287,10 @@ class AligoWebApp:
         # 锁表占满且全部在用时的兜底锁：让无法入表的新用户串行处理，
         # 保证锁表内存有界（不能为了收录新用户而丢弃正在持有的锁）
         self.overflow_lock = asyncio.Lock()
+        # 请求级幂等缓存（v2.0）：同一用户 + 会话 + 幂等键重复提交时直接
+        # 返回上次成功响应，避免重复执行 Agent / 重复写偏好与行程。
+        # 进程内 TTL + LRU；多实例部署可替换为 Redis 实现。
+        self.idempotency = IdempotencyCache()
         # 配置 REDIS_URL 且可用时，两个桶都使用 Redis 共享计数，多实例共享额度；
         # 未配置或 Redis 不可用时回退进程内滑动窗口（单个实例内仍然有效）
         redis_client = get_shared_redis_client()
@@ -4830,6 +4838,29 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=503,
                     detail=f"{exc}（请求 ID：{_request_id(request)}）",
                 ) from exc
+            # v2.0 幂等：重复提交（同一 user + 会话 + 幂等键）直接返回上次
+            # 成功响应；检查在用户锁内，并发重复请求会串行并命中缓存
+            idem_key = (
+                make_key(
+                    payload.user_id,
+                    session.session_id,
+                    payload.idempotency_key,
+                )
+                if payload.idempotency_key
+                else None
+            )
+            if idem_key is not None:
+                cached = state.idempotency.get(idem_key)
+                if cached is not None:
+                    # 会话已由 _get_session_marked 标记在用：回放也必须
+                    # 归还占用标记，否则缓存命中的请求会把会话永久占住
+                    try:
+                        await session.runtime.drain_pending_persist()
+                    finally:
+                        session.end_turn()
+                    response.headers.update(rate_headers)
+                    response.headers["X-Idempotent-Replay"] = "1"
+                    return cached
             try:
                 result, disconnected = await _ask_cancellable_on_disconnect(
                     session.runtime.ask(
@@ -4903,7 +4934,13 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(rate_headers)
         # reply / agents 来自模型输出：孤立代理项（截断 emoji 的转义）会让
         # JSONResponse 的 UTF-8 编码抛 UnicodeEncodeError（500），响应前统一转义
-        return {"session_id": session.session_id, **_json_safe_value(result)}
+        response_payload = {
+            "session_id": session.session_id,
+            **_json_safe_value(result),
+        }
+        if idem_key is not None:
+            state.idempotency.put(idem_key, response_payload)
+        return response_payload
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
@@ -4966,6 +5003,53 @@ def create_app(model: Any = None) -> FastAPI:
                 lock.release()
             raise
 
+        # v2.0 幂等：同一 user + 会话 + 幂等键的重复流式提交只回放缓存，
+        # 不重新执行 Agent。检查在租约内（用户锁已持有），并发重复请求
+        # 会串行，后到者命中缓存。
+        idem_key = (
+            make_key(payload.user_id, session.session_id, payload.idempotency_key)
+            if payload.idempotency_key
+            else None
+        )
+        if idem_key is not None:
+            cached = state.idempotency.get(idem_key)
+            if cached is not None:
+                async def replay_stream() -> Any:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "session",
+                                "session_id": session.session_id,
+                                "idempotent_replay": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            _json_safe_value(
+                                {**cached, "idempotent_replay": True}
+                            ),
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+
+                return _LeasedStreamingResponse(
+                    replay_stream(),
+                    lease,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                        "Connection": "keep-alive",
+                        **rate_headers,
+                    },
+                )
+
         async def event_stream() -> Any:
             task: asyncio.Task[None] | None = None
             heartbeat: asyncio.Task[None] | None = None
@@ -4978,9 +5062,16 @@ def create_app(model: Any = None) -> FastAPI:
                             on_event=queue.put_nowait,
                             turn_id=payload.client_turn_id or "",
                         )
-                        await queue.put(
-                            {"type": "done", "session_id": session.session_id, **result}
-                        )
+                        done_event = {
+                            "type": "done",
+                            "session_id": session.session_id,
+                            **result,
+                        }
+                        if idem_key is not None:
+                            state.idempotency.put(
+                                idem_key, _json_safe_value(done_event)
+                            )
+                        await queue.put(done_event)
                     except asyncio.CancelledError:
                         raise
                     except CircuitOpenError:
