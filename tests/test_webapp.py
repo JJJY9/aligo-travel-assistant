@@ -2386,6 +2386,82 @@ def test_export_refuses_backup_over_import_limits(monkeypatch):
     print("✓ 超限备份返回 413")
 
 
+def test_export_degrades_knowledge_over_limit_only(monkeypatch):
+    """仅知识轴超限时省略知识段继续导出（提示头）；用户数据轴超限仍 413。
+
+    知识库是全局存量，可被知识管理导入推到导出上限之外；不能让之后所有
+    with_knowledge 导出永久 413，也不能借降级掩盖用户数据本身的超限。
+    """
+    from utils import user_import as module
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [
+            {"id": 1, "content": "片段一", "metadata": {}},
+            {"id": 2, "content": "片段二", "metadata": {}},
+        ],
+    )
+    client = _client()
+    user_id = _unique_user("web_export_omit_knowledge")
+    try:
+        # 知识轴超限（上限收紧到 1 条），用户数据为空：降级导出成功
+        monkeypatch.setattr(module, "_MAX_KNOWLEDGE", 1)
+        response = client.get(
+            "/api/export", params={"user_id": user_id, "with_knowledge": 1}
+        )
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        assert "knowledge" not in payload
+        assert response.headers.get("x-knowledge-omitted") == "over-limit"
+
+        # 用户数据本身也超限：省略知识后仍然 413（不掩盖用户数据轴）
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "s1"},
+        )
+        assert response.status_code == 200, response.text[:300]
+        monkeypatch.setattr(module, "_MAX_MESSAGES", 1)
+        response = client.get(
+            "/api/export", params={"user_id": user_id, "with_knowledge": 1}
+        )
+        assert response.status_code == 413, response.text[:300]
+        assert "导入上限" in response.json()["detail"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 仅知识轴超限时省略知识段导出（用户数据轴超限仍 413）")
+
+
+def test_knowledge_export_sanitizes_non_finite(monkeypatch):
+    """知识导出里的 NaN / Infinity 必须清洗，产物能被标准 JSON 回读。"""
+    import json as json_module
+
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [
+            {
+                "id": 1,
+                "content": "住宿标准",
+                "metadata": {"score": float("inf")},
+            }
+        ],
+    )
+    client = _client()
+    response = client.get("/api/knowledge/export")
+    assert response.status_code == 200, response.text[:300]
+
+    def _reject(value):
+        raise AssertionError(f"非标准 JSON 常量: {value}")
+
+    payload = json_module.loads(response.text, parse_constant=_reject)
+    assert payload["documents"][0]["metadata"]["score"] is None
+    print("✓ 知识导出清洗非有限数（标准 JSON 可回读）")
+
+
 def test_export_refuses_while_restore_in_progress():
     """恢复写入期间同账号导出返回 409：不会产出半截快照。"""
     client = _client()
@@ -6382,7 +6458,8 @@ def test_api_export_cleans_dirty_backup():
 
 
 def test_export_with_knowledge_uses_import_chunk_plan(monkeypatch):
-    """知识段体积按导入重切分后的分片估算，避免导出成功但导入超限。"""
+    """知识段体积按导入重切分后的分片估算；分片计划超限时省略知识段导出
+    （不能产出导入必超限的文件，也不能让用户数据永久 413）。"""
     from context.storage import create_long_term_memory
     from utils import knowledge_admin, user_import
     from webapp import server as server_module
@@ -6411,7 +6488,11 @@ def test_export_with_knowledge_uses_import_chunk_plan(monkeypatch):
             "/api/export",
             params={"user_id": user_id, "with_knowledge": 1},
         )
-        assert response.status_code == 413, response.text
+        # 分片计划超限属于知识轴：降级为省略知识段的备份 + 提示头，
+        # 用户数据本身仍可导出 / 恢复
+        assert response.status_code == 200, response.text
+        assert "knowledge" not in response.json()
+        assert response.headers.get("x-knowledge-omitted") == "over-limit"
         assert calls.get("ignore_existing") is True, (
             "导出体积预演必须按导入空库规划，不能对源库去重后只剩新增分片"
         )

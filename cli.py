@@ -2527,6 +2527,12 @@ def run_knowledge_export_standalone(
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         return _fail(f"导出失败：{exc}")
 
+    # 元数据里的 NaN / Infinity 会让产物不是合法 JSON（标准解析器无法
+    # 回读，kb-import 也拒绝）：与 Web 知识导出同口径清洗后再写出
+    from utils.json_safe import sanitize_json
+
+    documents = sanitize_json(documents)
+
     from datetime import datetime, timezone
 
     payload = {
@@ -3210,7 +3216,7 @@ def run_user_export_standalone(
             print(f"读取知识库失败：{exc}")
             return 1
 
-    from utils.user_import import export_backup_limit_problem
+    from utils.user_import import backup_limit_problem, export_backup_limit_problem
 
     # 导出文件固定 LF（exporter write_text_atomic newline="\n"）：体积轴
     # 按 LF 估算，CLI 与 Web 导出同字节、同口径。原始备份与「导入空库」
@@ -3218,6 +3224,21 @@ def run_user_export_standalone(
     # 长文档重切分后的真实恢复体积。
     warnings: dict[str, object] = {}
     problem = export_backup_limit_problem(data, warning_out=warnings)
+    knowledge_omitted = ""
+    if problem and "knowledge" in data:
+        # 知识库是全局存量：知识管理导入 / CLI kb-import 不受导出上限
+        # 约束，可被推到超出上限。只让知识轴超限/无法规划时省略知识段
+        # 继续导出（用户数据仍可恢复），而不是让备份永久无法产出。
+        without_knowledge = {
+            key: value for key, value in data.items() if key != "knowledge"
+        }
+        if backup_limit_problem(without_knowledge, crlf=False) is None:
+            data = without_knowledge
+            knowledge_omitted = (
+                "知识库整体超出导出上限，本次备份不含知识片段"
+                "（用户数据仍可恢复；知识库请单独使用 kb-export）"
+            )
+            problem = None
     if problem:
         print(
             f"导出中止：{problem}（该文件将无法再导入恢复，"
@@ -3227,6 +3248,8 @@ def run_user_export_standalone(
     warning = str(warnings.get("knowledge_skipped") or "")
     if warning:
         print(f"警告：{warning}", file=sys.stderr)
+    if knowledge_omitted:
+        print(f"警告：{knowledge_omitted}", file=sys.stderr)
 
     out_dir = Path(target_dir) if target_dir else Path("exports")
     try:

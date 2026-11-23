@@ -1398,6 +1398,13 @@ async function downloadFromApi(url, fallbackName) {
         `备份中有 ${skippedKnowledge} 条知识片段无法恢复，恢复时会跳过`,
       );
     }
+    // 知识库整体超出导出上限时服务端省略知识段（用户数据仍可恢复）：
+    // 不能把「不含知识」的备份当完整成功静默下载
+    if (response.headers.get("x-knowledge-omitted")) {
+      toast(
+        "知识库整体超出导出上限，本次备份不含知识片段（用户数据仍可恢复）",
+      );
+    }
     const blob = await response.blob();
     const disposition = response.headers.get("content-disposition") || "";
     const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);

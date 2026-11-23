@@ -2306,34 +2306,58 @@ async function scenarioRetiredThreadRegenerate(source) {
 }
 
 async function scenarioKnowledgeSkippedToast(source) {
-  // /api/export?with_knowledge=1 的 X-Knowledge-Skipped 必须提示（不能静默）
+  // /api/export?with_knowledge=1 的 X-Knowledge-Skipped / X-Knowledge-Omitted
+  // 必须提示（不能把「知识不全 / 不含知识」的备份当完整成功静默下载）
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
-  run(`
-    globalThis.__toasts = [];
-    toast = (message) => { __toasts.push(message); };
-    fetch = async () => ({
-      ok: true,
-      status: 200,
-      headers: {
-        get(name) {
-          const key = String(name).toLowerCase();
-          if (key === "x-knowledge-skipped") return "3";
-          if (key === "x-aligo-export-skipped") return "0";
-          if (key === "content-disposition") return 'attachment; filename="aligo_u.json"';
-          return "";
+  const mockResponse = (headers) => {
+    run(`
+      globalThis.__toasts = [];
+      toast = (message) => { __toasts.push(message); };
+      fetch = async () => ({
+        ok: true,
+        status: 200,
+        headers: {
+          get(name) {
+            const key = String(name).toLowerCase();
+            const values = ${JSON.stringify(headers)};
+            if (Object.prototype.hasOwnProperty.call(values, key)) {
+              return values[key];
+            }
+            return "";
+          },
         },
-      },
-      blob: async () => ({ __blob: true }),
-    });
-    URL.createObjectURL = () => "blob:x";
-    URL.revokeObjectURL = () => {};
-    document.body.appendChild = () => {};
-  `);
+        blob: async () => ({ __blob: true }),
+      });
+      URL.createObjectURL = () => "blob:x";
+      URL.revokeObjectURL = () => {};
+      document.body.appendChild = () => {};
+    `);
+  };
+  mockResponse({
+    "x-knowledge-skipped": "3",
+    "x-aligo-export-skipped": "0",
+    "content-disposition": 'attachment; filename="aligo_u.json"',
+  });
   const ok = await run(
     'downloadFromApi("/api/export?with_knowledge=1", "fallback.json")'
   );
-  return { ok, toasts: run("__toasts.slice()") };
+  const skippedToasts = run("__toasts.slice()");
+  mockResponse({
+    "x-knowledge-omitted": "over-limit",
+    "x-aligo-export-skipped": "0",
+    "content-disposition": 'attachment; filename="aligo_u.json"',
+  });
+  const omittedOk = await run(
+    'downloadFromApi("/api/export?with_knowledge=1", "fallback.json")'
+  );
+  const omittedToasts = run("__toasts.slice()");
+  return {
+    ok,
+    toasts: skippedToasts,
+    omittedOk,
+    omittedToasts,
+  };
 }
 
 function scenarioRenderCap(source) {

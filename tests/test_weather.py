@@ -204,6 +204,10 @@ def test_shared_hit_anchors_age_to_fetch_time(monkeypatch):
     weather.clear_weather_cache()
     monkeypatch.setattr(weather, "_fetch_weather_uncached", lambda *a, **k: {})
     monkeypatch.setattr(weather, "_admit_upstream", lambda: None)
+    # 单调钟从 0 起算，CI 新 VM 的上机时长可能小于回拨量（< 500 秒），
+    # 减法被钳到 0 后「回拨到抓取时刻」的断言失去意义（3.10 矩阵实测
+    # monotonic()≈278s 时误报）：装一个大起点的时钟，只验证相对回拨
+    monkeypatch.setattr(weather.time, "monotonic", lambda: 1_000_000.0)
     before = time.monotonic()
     assert weather.fetch_weather("杭州") == payload
     stamp = weather._cache[key][0]

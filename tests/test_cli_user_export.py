@@ -243,6 +243,39 @@ def test_user_export_with_knowledge(monkeypatch):
     print("✓ user-export --with-knowledge 一体化备份")
 
 
+def test_user_export_degrades_knowledge_over_limit(monkeypatch):
+    """仅知识轴超限时省略知识段继续导出，并明确提示不含知识。"""
+    import tempfile
+    from pathlib import Path
+
+    from utils import knowledge_admin as admin_module
+    from utils import user_import as module
+
+    store = _FakeStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    docs = [
+        {"content": "片段一", "metadata": {"category": "住宿"}},
+        {"content": "片段二", "metadata": {"category": "住宿"}},
+    ]
+    monkeypatch.setattr(admin_module, "export_documents", lambda: docs)
+    monkeypatch.setattr(module, "_MAX_KNOWLEDGE", 1)
+    out_dir = Path(tempfile.mkdtemp())
+    buf = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+        code = cli.run_user_export_standalone(
+            "u-kb-omit", str(out_dir), with_knowledge=True
+        )
+    assert code == 0, buf.getvalue()
+    json_path = next(path for path in out_dir.iterdir() if path.suffix == ".json")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "knowledge" not in data
+    assert "不含知识片段" in err.getvalue()
+    print("✓ user-export 仅知识轴超限时省略知识段")
+
+
 def test_user_export_with_knowledge_dispatch(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -339,6 +372,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_with_knowledge(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_export_degrades_knowledge_over_limit(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()

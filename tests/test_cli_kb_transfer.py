@@ -131,6 +131,29 @@ def test_kb_export_dispatch_strict(monkeypatch):
     print("✓ kb-export 严格参数解析（含 --stdout 互斥）")
 
 
+def test_export_sanitizes_non_finite(monkeypatch):
+    """kb-export 产物必须能被标准 JSON 解析器回读（NaN / Infinity 清洗）。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "export_documents",
+        lambda: [{"content": "住宿标准", "metadata": {"score": float("inf")}}],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "kb.json"
+        code, out = _capture(cli.run_knowledge_export_standalone, str(target))
+        assert code == 0, out
+
+        def _reject(value):
+            raise AssertionError(f"非标准 JSON 常量: {value}")
+
+        payload = json.loads(
+            target.read_text(encoding="utf-8"), parse_constant=_reject
+        )
+        assert payload["documents"][0]["metadata"]["score"] is None
+    print("✓ kb-export 清洗非有限数（标准 JSON 可回读）")
+
+
 def test_export_to_stdout_writes_no_file(monkeypatch):
     """--stdout 直接打印 JSON，不写入任何文件。"""
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
@@ -550,10 +573,9 @@ def test_kb_import_dispatch_flags(monkeypatch):
     print("✓ kb-import 参数解析（--json / --dry-run 任意顺序）")
 
 
-def test_export_failure_preserves_existing_file(monkeypatch):
-    """--force 覆盖时写入失败不能把旧备份截断成 0 字节。"""
+def test_export_sanitizes_surrogate_and_write_failure_preserves_file(monkeypatch):
+    """孤立代理项被转义后可正常写盘；真实写入失败不能截断旧备份。"""
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
-    # 孤立代理项：json.dumps 可序列化，但 UTF-8 编码写入失败
     monkeypatch.setattr(
         knowledge_admin,
         "export_documents",
@@ -561,13 +583,24 @@ def test_export_failure_preserves_existing_file(monkeypatch):
     )
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / "kb.json"
+        code, out = _capture(cli.run_knowledge_export_standalone, str(target))
+        assert code == 0, out
+        # 转义后的代理项让产物仍是合法 UTF-8 JSON，标准解析器可回读
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert "\\ud800" in payload["documents"][0]["content"]
+
         target.write_text('{"keep": true}', encoding="utf-8")
+
+        def boom(path, text):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cli, "write_text_atomic", boom)
         code, out = _capture(
             cli.run_knowledge_export_standalone, str(target), force=True
         )
         assert code == 1 and "写入失败" in out
         assert json.loads(target.read_text(encoding="utf-8")) == {"keep": True}
-    print("✓ kb-export 写入失败保留旧备份")
+    print("✓ kb-export 转义代理项；写入失败保留旧备份")
 
 if __name__ == "__main__":
     import _stdio
@@ -577,6 +610,7 @@ if __name__ == "__main__":
     _tmp_registry.install()
     for case in (
         test_export_writes_json,
+        test_export_sanitizes_non_finite,
         test_export_refuses_overwrite_without_force,
         test_kb_export_dispatch_strict,
         test_export_to_stdout_writes_no_file,
@@ -595,7 +629,7 @@ if __name__ == "__main__":
         test_import_json_output,
         test_import_json_errors,
         test_kb_import_dispatch_flags,
-        test_export_failure_preserves_existing_file,
+        test_export_sanitizes_surrogate_and_write_failure_preserves_file,
         test_export_write_failure_reports,
     ):
         mp = pytest.MonkeyPatch()

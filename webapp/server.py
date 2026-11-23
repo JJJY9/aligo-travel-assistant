@@ -4217,6 +4217,9 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
             logger.warning("导出知识片段失败: %s", exc)
             raise _knowledge_unavailable("导出失败", exc) from exc
+        # 元数据里的 NaN / Infinity 会让产物不是合法 JSON（标准解析器
+        # 无法回读，kb-import 也拒绝）：与用户备份同口径清洗后再写出
+        documents = _json_safe_value(documents)
         payload = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -6166,7 +6169,10 @@ def create_app(model: Any = None) -> FastAPI:
         backup = sanitize_backup_data(backup)
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
-        from utils.user_import import export_backup_limit_problem
+        from utils.user_import import (
+            backup_limit_problem,
+            export_backup_limit_problem,
+        )
 
         # 原始备份与「导入空库」的分片计划都要可导入：前者是导入端规划前
         # 的硬上限，后者覆盖长文档重切分后的真实恢复体积
@@ -6174,6 +6180,19 @@ def create_app(model: Any = None) -> FastAPI:
         limit_problem = export_backup_limit_problem(
             backup, warning_out=warnings
         )
+        knowledge_omitted = False
+        if limit_problem and "knowledge" in backup:
+            # 知识库是全局存量：知识管理导入 / CLI kb-import 不受导出上限
+            # 约束，可被推到超出上限，之后所有 with_knowledge 导出都会 413，
+            # 用户数据本身却仍可恢复。只让知识轴超限/无法规划时省略知识段
+            # （用户数据轴仍超限则保持原拒绝），响应头提示文件不含知识。
+            without_knowledge = {
+                key: value for key, value in backup.items() if key != "knowledge"
+            }
+            if backup_limit_problem(without_knowledge, crlf=False) is None:
+                backup = without_knowledge
+                knowledge_omitted = True
+                limit_problem = None
         if limit_problem:
             raise HTTPException(
                 status_code=413,
@@ -6192,6 +6211,9 @@ def create_app(model: Any = None) -> FastAPI:
             # 文件仍可导出（用户数据可恢复），但部分知识行恢复时会被跳过；
             # 面板 / 脚本可据响应头提示（正文是备份文件，不能混入额外字段）
             headers["X-Knowledge-Skipped"] = str(skipped)
+        if knowledge_omitted:
+            # 备份整体不含知识段：恢复仍成功，但知识库需要单独 kb-export
+            headers["X-Knowledge-Omitted"] = "over-limit"
         return Response(
             content=payload,
             media_type="application/json",

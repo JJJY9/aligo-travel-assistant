@@ -241,11 +241,14 @@ def test_retired_thread_regenerate_renders_user_question():
 
 
 def test_export_reports_skipped_knowledge():
-    """含知识库备份导出：X-Knowledge-Skipped 让面板提示跳过条数。"""
+    """含知识库备份导出：X-Knowledge-Skipped 让面板提示跳过条数；
+    X-Knowledge-Omitted（仅知识轴超限被省略）同样必须提示。"""
     data = _run_harness("knowledgeSkippedToast")
     assert data["ok"] is True, data
     assert any("知识片段" in item for item in data["toasts"]), data
-    print("✓ 含知识库备份导出提示跳过条数")
+    assert data["omittedOk"] is True, data
+    assert any("不含知识片段" in item for item in data["omittedToasts"]), data
+    print("✓ 含知识库备份导出提示跳过条数 / 知识段省略")
 
 
 def test_render_markdown_caps_oversized_message():
