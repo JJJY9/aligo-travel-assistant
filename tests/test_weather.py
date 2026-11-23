@@ -339,6 +339,57 @@ def test_failure_cache_prevents_repeat_requests(monkeypatch):
     print("✓ 失败结果短时缓存，避免重复请求上游")
 
 
+def test_busy_gate_does_not_cache_failure(monkeypatch):
+    """上游并发闸门繁忙不能写 60 秒失败缓存（名额恢复后应立即可用）。"""
+    class _BusySlots:
+        def acquire(self, timeout=None):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(weather, "_upstream_slots", _BusySlots())
+    with pytest.raises(weather.WeatherError) as info:
+        weather.fetch_weather("北京", timeout=0.01)
+    assert "繁忙" in str(info.value)
+    assert weather._failure_hit(weather._cache_key("北京")) is None
+
+    class _OpenSlots:
+        def acquire(self, timeout=None):
+            return True
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(weather, "_upstream_slots", _OpenSlots())
+    monkeypatch.setattr(
+        weather,
+        "_fetch_weather_uncached",
+        lambda name, key, timeout: {"city": name, "source": "test"},
+    )
+    assert weather.fetch_weather("北京", timeout=0.01)["city"] == "北京"
+    print("✓ 闸门繁忙不写失败缓存")
+
+
+def test_follower_wait_exhaustion_not_cached(monkeypatch):
+    """单飞等待轮次耗尽不是上游故障：不写失败缓存。"""
+    class _Event:
+        def wait(self, timeout=None):
+            return False
+
+        def set(self):
+            pass
+
+    monkeypatch.setattr(
+        weather, "_claim_fetch", lambda name: (False, _Event())
+    )
+    with pytest.raises(weather.WeatherError) as info:
+        weather.fetch_weather("北京", timeout=0.01)
+    assert "繁忙" in str(info.value)
+    assert weather._failure_hit(weather._cache_key("北京")) is None
+    print("✓ 单飞等待耗尽不写失败缓存")
+
+
 def test_failure_cache_expires(monkeypatch):
     calls = []
 
@@ -771,7 +822,7 @@ def test_second_reclaim_follower_reuses_degraded(monkeypatch):
 
 
 def test_follower_rounds_exhausted_reports_busy_without_upstream(monkeypatch):
-    """等待轮次用尽仍无结果：报「繁忙」并登记失败，不能各自打上游（惊群）。"""
+    """等待轮次用尽仍无结果：报「繁忙」但不写失败缓存，不能各自打上游。"""
     stored = []
     state, _finished = _patch_reclaim_env(
         monkeypatch,
@@ -787,8 +838,8 @@ def test_follower_rounds_exhausted_reports_busy_without_upstream(monkeypatch):
         weather.fetch_weather("北京", timeout=0.01)
     assert "繁忙" in str(excinfo.value)
     assert state["claims"] == weather._FOLLOWER_WAIT_ROUNDS + 1
-    assert stored, "轮次用尽应登记失败缓存，后续请求快速失败"
-    print("✓ 等待轮次用尽报繁忙，不擅自打上游")
+    assert stored == [], "等待耗尽不是上游故障，不能登记 60 秒失败缓存"
+    print("✓ 等待轮次用尽报繁忙，不擅自打上游、不写失败缓存")
 
 
 def test_non_finite_upstream_values_raise_weather_error(monkeypatch):
@@ -1013,6 +1064,8 @@ if __name__ == "__main__":
         test_fetch_uncached_wraps_missing_location_fields,
         test_failure_cache_evicts_oldest_when_full,
         test_follower_rounds_exhausted_reports_busy_without_upstream,
+        test_busy_gate_does_not_cache_failure,
+        test_follower_wait_exhaustion_not_cached,
         test_non_finite_upstream_values_raise_weather_error,
         test_upstream_window_limits_rotating_cities,
         test_geocode_prefers_trusted_alias_for_foreign_city,
