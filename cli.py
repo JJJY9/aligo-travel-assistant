@@ -2943,21 +2943,13 @@ def run_user_export_standalone(
             print(f"读取知识库失败：{exc}")
             return 1
 
-    from utils.user_import import (
-        backup_limit_problem,
-        knowledge_rows_for_volume_check,
-    )
+    from utils.user_import import export_backup_limit_problem
 
     # 导出文件固定 LF（exporter write_text_atomic newline="\n"）：体积轴
-    # 按 LF 估算，CLI 与 Web 导出同字节、同口径。知识段按导入 dry-run 的
-    # 分片计划估算：长文档导入时会被重切成多片，按原始行会低估体积。
-    check_data = data
-    if with_knowledge and isinstance(data.get("knowledge"), list):
-        check_data = {
-            **data,
-            "knowledge": knowledge_rows_for_volume_check(data["knowledge"]),
-        }
-    problem = backup_limit_problem(check_data, crlf=False)
+    # 按 LF 估算，CLI 与 Web 导出同字节、同口径。原始备份与「导入空库」
+    # 的知识分片计划都要可导入：前者是导入端规划前的硬上限，后者覆盖
+    # 长文档重切分后的真实恢复体积。
+    problem = export_backup_limit_problem(data)
     if problem:
         print(
             f"导出中止：{problem}（该文件将无法再导入恢复，"
