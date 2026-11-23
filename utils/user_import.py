@@ -898,8 +898,10 @@ def knowledge_rows_for_volume_check(
     ``skip_out`` 传入 dict 时回填导入规划会跳过的行数（无效 / 残缺组 /
     布局冲突）：导出端据此提示「文件仍可导出、但恢复时这些知识会跳过」。
 
-    规划失败返回 None：调用方必须按「无法确认备份可恢复」拒绝导出，
-    不能退回原始行放行（旧版长单条重切分后的分片可能远超原始行体积）。
+    规划失败返回 None：调用方不能退回原始行放行（旧版长单条重切分后的
+    分片可能远超原始行体积）。导出端有两种处置：按「无法确认备份可恢复」
+    拒绝导出，或在用户数据本身仍可导出时省略知识段降级（见
+    :func:`export_backup_limit_problem` 的 ``reason_out``）。
     """
     if not rows:
         return []
@@ -936,6 +938,7 @@ def export_backup_limit_problem(
     backup: dict[str, Any],
     *,
     warning_out: dict[str, Any] | None = None,
+    reason_out: dict[str, Any] | None = None,
 ) -> str | None:
     """导出端自检：原始备份与「导入空库」的知识分片形状都必须可导入。
 
@@ -944,9 +947,14 @@ def export_backup_limit_problem(
     - 空库分片计划：长文档重切分后每片都带元数据，恢复后的体积可能
       大于原始行（#876 的口径），只看原始行会写出无法恢复的备份。
 
-    知识规划失败时返回拒绝原因（fail-closed）：无法确认备份可恢复。
-    ``warning_out`` 传入 dict 时回填「恢复时会被跳过的知识行」提示：
-    这些行不会阻断导出（用户数据仍可恢复），但文件并不包含完整知识。
+    知识规划失败时返回拒绝原因（无法确认备份可恢复）。``warning_out``
+    传入 dict 时回填「恢复时会被跳过的知识行」提示：这些行不会阻断导出
+    （用户数据仍可恢复），但文件并不包含完整知识。
+
+    ``reason_out`` 传入 dict 时回填知识轴的拒绝原因代码
+    （``over-limit`` 超限 / ``planning-failed`` 分片规划失败）：导出端在
+    用户数据本身仍可导出时可按此省略知识段降级，并向用户给出区分文案
+    （「超限请清理」与「暂无法核对请稍后重试」是不同处置）。
     """
     if not isinstance(backup, dict):
         return None
@@ -961,6 +969,8 @@ def export_backup_limit_problem(
         knowledge, skip_out=skip_counts
     )
     if planned is None:
+        if reason_out is not None:
+            reason_out["knowledge"] = "planning-failed"
         return (
             "知识片段无法按导入规则规划，无法确认备份可恢复；"
             "请稍后重试（知识库忙时暂停写入）"
@@ -969,6 +979,8 @@ def export_backup_limit_problem(
         {**backup, "knowledge": planned}, crlf=False
     )
     if problem:
+        if reason_out is not None:
+            reason_out["knowledge"] = "over-limit"
         return problem
     total_skipped = sum(skip_counts.values())
     if warning_out is not None and total_skipped:

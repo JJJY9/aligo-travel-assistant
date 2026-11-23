@@ -4217,6 +4217,9 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
             logger.warning("导出知识片段失败: %s", exc)
             raise _knowledge_unavailable("导出失败", exc) from exc
+        # 元数据里的 NaN / Infinity 会让产物不是合法 JSON（标准解析器
+        # 无法回读，kb-import 也拒绝）：与用户备份同口径清洗后再写出
+        documents = _json_safe_value(documents)
         payload = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -6120,6 +6123,10 @@ def create_app(model: Any = None) -> FastAPI:
         ``with_knowledge=1``（仅 JSON）把全局知识库片段一并写入备份的
         ``knowledge`` 字段（与 CLI ``user-export --with-knowledge`` 同一
         字段），可由 ``/api/import`` 一体化恢复；``format=md`` 忽略该参数。
+        仅知识轴超限（或分片计划暂无法核对）且用户数据本身仍可导出时，
+        备份省略 ``knowledge`` 段继续返回 200，响应头
+        ``X-Knowledge-Omitted`` 给出原因（``over-limit`` / ``planning-failed``）；
+        用户数据轴超限仍返回 413。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
         entry_epoch = _export_start_epoch(request, user_id)
@@ -6166,14 +6173,35 @@ def create_app(model: Any = None) -> FastAPI:
         backup = sanitize_backup_data(backup)
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
-        from utils.user_import import export_backup_limit_problem
+        from utils.user_import import (
+            backup_limit_problem,
+            export_backup_limit_problem,
+        )
 
         # 原始备份与「导入空库」的分片计划都要可导入：前者是导入端规划前
         # 的硬上限，后者覆盖长文档重切分后的真实恢复体积
         warnings: dict[str, object] = {}
+        knowledge_reasons: dict[str, object] = {}
         limit_problem = export_backup_limit_problem(
-            backup, warning_out=warnings
+            backup, warning_out=warnings, reason_out=knowledge_reasons
         )
+        knowledge_omitted = ""
+        if limit_problem and "knowledge" in backup:
+            # 知识库是全局存量：知识管理导入 / CLI kb-import 不受导出上限
+            # 约束，可被推到超出上限，之后所有 with_knowledge 导出都会 413，
+            # 用户数据本身却仍可恢复。只让知识轴超限/无法规划时省略知识段
+            # （用户数据轴仍超限则保持原拒绝），响应头携带原因提示。
+            without_knowledge = {
+                key: value for key, value in backup.items() if key != "knowledge"
+            }
+            if backup_limit_problem(without_knowledge, crlf=False) is None:
+                backup = without_knowledge
+                # 原始备份轴失败（行数 / 字节超限）时 reason_out 未回填，
+                # 能走到这里说明去掉知识后通过，原因即知识轴超限
+                knowledge_omitted = str(
+                    knowledge_reasons.get("knowledge") or "over-limit"
+                )
+                limit_problem = None
         if limit_problem:
             raise HTTPException(
                 status_code=413,
@@ -6192,6 +6220,11 @@ def create_app(model: Any = None) -> FastAPI:
             # 文件仍可导出（用户数据可恢复），但部分知识行恢复时会被跳过；
             # 面板 / 脚本可据响应头提示（正文是备份文件，不能混入额外字段）
             headers["X-Knowledge-Skipped"] = str(skipped)
+        if knowledge_omitted:
+            # 备份整体不含知识段：恢复仍成功，但知识库需要单独 kb-export。
+            # 头值携带原因：over-limit（清理知识库）与 planning-failed
+            # （暂无法核对，稍后重试）对用户是不同处置
+            headers["X-Knowledge-Omitted"] = knowledge_omitted
         return Response(
             content=payload,
             media_type="application/json",
