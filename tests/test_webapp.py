@@ -2224,6 +2224,32 @@ def test_sessions_listing_and_delete():
         _cleanup(user_id)
 
 
+def test_delete_session_clears_execution_checkpoints(monkeypatch):
+    """DELETE 会话同时清理执行检查点（内含子智能体结果），不等 TTL。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_ckpt_clear")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("你好", "在", "s-ckpt")
+        called: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server_module,
+            "clear_session_checkpoints",
+            lambda u, s: called.append((u, s)) or 0,
+        )
+        response = client.delete(
+            "/api/sessions/s-ckpt", params={"user_id": user_id}
+        )
+        assert response.status_code == 200, response.text
+        assert called == [(user_id, "s-ckpt")]
+    finally:
+        _cleanup(user_id)
+    print("✓ 删除会话清理执行检查点")
+
+
 def test_session_markdown_export():
     client = _client()
     user_id = _unique_user("web_test_export")

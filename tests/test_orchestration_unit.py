@@ -13,6 +13,7 @@
 运行：python tests/test_orchestration_unit.py
 """
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -170,6 +171,30 @@ def test_clear_checkpoint_removes_state_after_success(tmp_path):
     assert store.load("u:s:t1") is None, "整轮成功后再复用会返回陈旧结果"
     assert orchestrator._checkpoint_key is None
     print("✓ 整轮成功后清理执行检查点")
+
+
+def test_checkpoint_scope_hash_recorded_for_session_cleanup(tmp_path):
+    """检查点记录会话作用域哈希，会话删除可按作用域定向清理。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    agent = _StubAgent("a", {"ok": True})
+    orchestrator = OrchestrationAgent(agent_registry={"a": agent})
+    orchestrator._checkpoint_store = store
+    schedule = [{"agent_name": "a", "priority": 1}]
+    asyncio.run(
+        orchestrator.reply(
+            _intent(schedule),
+            checkpoint_key="u:s:t1:abc",
+            checkpoint_scope="u:s",
+        )
+    )
+    state = store.load("u:s:t1:abc")
+    assert state is not None
+    assert state["scope_hash"] == hashlib.sha256(b"u:s").hexdigest()
+    assert store.clear_scope("u:s") == 1
+    assert store.load("u:s:t1:abc") is None
+    print("✓ 检查点作用域哈希与会话清理")
 
 
 def test_checkpoint_store_failure_does_not_block_turn(monkeypatch):

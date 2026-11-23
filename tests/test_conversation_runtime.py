@@ -1487,6 +1487,7 @@ def test_checkpoint_key_binds_message_content_and_clears_after_persist():
     class _CheckpointOrch:
         def __init__(self):
             self.keys: list[str | None] = []
+            self.scopes: list[str | None] = []
             self.cleared = 0
 
         async def reply(
@@ -1496,8 +1497,10 @@ def test_checkpoint_key_binds_message_content_and_clears_after_persist():
             defer_memory=False,
             retry_cache=None,
             checkpoint_key=None,
+            checkpoint_scope=None,
         ):
             self.keys.append(checkpoint_key)
+            self.scopes.append(checkpoint_scope)
             return _Response(
                 json.dumps({"results": []}, ensure_ascii=False)
             )
@@ -1519,6 +1522,9 @@ def test_checkpoint_key_binds_message_content_and_clears_after_persist():
     assert all(
         str(key).startswith("u-ctx:s-ctx:turn-1:") for key in orch.keys
     ), orch.keys
+    assert orch.scopes == ["u-ctx:s-ctx", "u-ctx:s-ctx"], (
+        "检查点作用域用于会话删除后的定向清理"
+    )
     assert orch.cleared == 2, "整轮成功落库后必须清理检查点"
     print("✓ 检查点键绑定提问内容并在成功后清理")
 

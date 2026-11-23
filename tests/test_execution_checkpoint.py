@@ -150,6 +150,45 @@ def test_init_prunes_expired_and_stale_temp():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_clear_scope_removes_only_matching_session():
+    """会话删除按作用域清理：只删该 user:session 的检查点。"""
+    store, root = _store()
+    try:
+        store.save("u1:s1:t1:d", {"status": "ok"}, scope="u1:s1")
+        store.update_step("u1:s1:t2:d", "a", {"ok": True}, scope="u1:s1")
+        store.save("u1:s2:t1:d", {"status": "ok"}, scope="u1:s2")
+        store.save("legacy", {"status": "ok"})
+        assert store.clear_scope("u1:s1") == 2
+        assert store.load("u1:s1:t1:d") is None
+        assert store.load("u1:s1:t2:d") is None
+        assert store.load("u1:s2:t1:d") is not None
+        assert store.load("legacy") is not None, "无作用域的旧检查点不应被误删"
+        print("✓ 按会话作用域清理检查点")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_clear_session_checkpoints_uses_default_store():
+    """会话删除的清理入口跟随数据根目录（不要求调用方构造存储）。"""
+    from utils.execution_checkpoint import clear_session_checkpoints
+
+    old = os.environ.get("ALIGO_DATA_DIR")
+    root = tempfile.mkdtemp(prefix="chailv_ckpt_clean_")
+    os.environ["ALIGO_DATA_DIR"] = root
+    try:
+        store = CheckpointStore()
+        store.save("u:s:t:d", {"status": "ok"}, scope="u:s")
+        assert clear_session_checkpoints("u", "s") == 1
+        assert store.load("u:s:t:d") is None
+        print("✓ 会话删除清理入口使用默认存储")
+    finally:
+        if old is None:
+            os.environ.pop("ALIGO_DATA_DIR", None)
+        else:
+            os.environ["ALIGO_DATA_DIR"] = old
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -162,4 +201,6 @@ if __name__ == "__main__":
     test_raw_key_not_written_to_disk()
     test_default_root_follows_data_dir()
     test_init_prunes_expired_and_stale_temp()
+    test_clear_scope_removes_only_matching_session()
+    test_clear_session_checkpoints_uses_default_store()
     print("\n全部通过")

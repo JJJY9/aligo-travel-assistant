@@ -351,6 +351,8 @@ class OrchestrationAgent(AgentBase):
         self._deferred_commit_task: asyncio.Future[bool] | None = None
         # 执行检查点（v2.0）：键在 reply 入口设置；存储懒加载 / 测试可注入
         self._checkpoint_key: str | None = None
+        # 检查点作用域（user:session，只存哈希）：会话删除时按它清理检查点
+        self._checkpoint_scope: str | None = None
         self._checkpoint_store = None
 
     def register_agent(self, agent_name: str, agent: AgentBase):
@@ -371,6 +373,7 @@ class OrchestrationAgent(AgentBase):
         defer_memory: bool = False,
         retry_cache: dict[str, dict[str, Any]] | None = None,
         checkpoint_key: str | None = None,
+        checkpoint_scope: str | None = None,
     ) -> Msg:
         """
         协调执行流程
@@ -380,6 +383,8 @@ class OrchestrationAgent(AgentBase):
             on_event: 进度回调（可选），接收 agent_start / agent_done 事件
             checkpoint_key: 执行检查点键（v2.0，可选）。提供时把已成功的
                 子智能体结果落盘，同一键的重试 / 重启复用这些结果。
+            checkpoint_scope: 检查点作用域（``user:session``，可选）。
+                只保存哈希，供会话删除时定向清理检查点。
 
         Returns:
             Msg: 执行结果
@@ -387,6 +392,9 @@ class OrchestrationAgent(AgentBase):
         # v2.0 持久化执行：本轮检查点键（未提供则不复用 / 不落盘）
         self._checkpoint_key = (
             str(checkpoint_key).strip() if checkpoint_key else None
+        )
+        self._checkpoint_scope = (
+            str(checkpoint_scope).strip() if checkpoint_scope else None
         )
         # 上一轮失败 / 取消 / 空调度遗留的暂存负载不能带入本轮：只有本轮
         # 成功落库后的 commit 才应写库；遗留负载会变成没有对话支撑的幽灵
@@ -948,6 +956,7 @@ class OrchestrationAgent(AgentBase):
         key = getattr(self, "_checkpoint_key", None)
         store = getattr(self, "_checkpoint_store", None)
         self._checkpoint_key = None
+        self._checkpoint_scope = None
         if not key or store is None:
             return
         try:
@@ -1027,6 +1036,7 @@ class OrchestrationAgent(AgentBase):
                     checkpoint_key,
                     canonical_name,
                     result,
+                    scope=getattr(self, "_checkpoint_scope", None),
                 )
             except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
                 logger.warning("保存执行检查点失败: %s", exc)
