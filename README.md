@@ -14,10 +14,10 @@
 
 在原有「多智能体 + 两层记忆 + RAG」之上，v2.0 增加了以下可验证能力（均有回归测试）：
 
-- **混合检索**：向量 + BM25（中文按字符二元组，无需分词器）双路召回，RRF 融合；可选 `RAG_RERANK_MODEL` 做 cross-encoder 精排（默认关闭）。BM25 索引进程内缓存、写入失效，构建 / 重排失败自动回退纯向量；管理 / 评测接口保持纯向量口径。
+- **混合检索**：向量 + BM25（中文按字符二元组，无需分词器）双路召回，RRF 融合；可选 `RAG_RERANK_MODEL` 做 cross-encoder 精排（默认关闭）。BM25 按查询词 IDF 和归一（弱关键词命中不会自动满分绕过 `min_score`），索引进程内缓存、写入 / 删除即时失效，构建 / 重排失败自动回退纯向量；首轮结果全部低于阈值时用去掉疑问词 / 标点的简化查询重检索一次，仍无命中才拒答；管理 / 评测接口保持纯向量口径。
 - **行程约束求解与校验**：需求提取（预算 / 必去项 / 天数）→ 必去项按天分配（OR-Tools CP-SAT 可选，未安装时确定性贪心）→ 五项校验（天数、时间冲突、预算、必去项、费用复核）；未通过时带原因重生成一次，仍失败保留原行程并返回 `validation`。
 - **固定 DAG 调度**：行程规划依赖事项收集 / 偏好抽取，优先级只上调不下调（迭代处理传递依赖）；事项缺失信息随结果返回 `missing_info` / `clarification`，不阻断规划。
-- **持久化执行与防重**：`/api/chat` / `/api/chat/stream` 支持 `idempotency_key`（重复提交直接回放成功响应）；编排按 `user:session:turn_id` 落执行检查点到 `data/runtime/checkpoints`，失败重试 / 重启复用已成功的子智能体结果，只重跑失败者。
+- **持久化执行与防重**：`/api/chat` / `/api/chat/stream` 支持 `idempotency_key`（重复提交直接回放成功响应）；编排按 `user:session:turn_id` 落执行检查点到 `data/runtime/checkpoints`，失败重试 / 重启复用已成功的子智能体结果，只重跑失败者；键绑定本轮提问内容，成功落库后清理，删除会话时按 `user:session` 作用域清理（落盘只存哈希，不等 TTL）。
 - **记忆一致性**：最近 10 轮对话生成 ≤200 字滚动摘要（窗口指纹缓存、失败冷却）；PostgreSQL 后端偏好快照 5 秒缓存，写入后立即失效。
 - **12 个技能**：原 6 个技能 + `trip-budget` / `packing-list` / `travel-checklist` / `local-transport` / `safety-tips` / `trip-notes`，统一 `SKILL.md` + 懒加载，意图阶段只暴露元数据。
 - **评测骨架**：`utils/eval_harness.py`（规则验收 + 可选 LLM-as-Judge ≥0.6、Pass@1 / 分类准确率 / 失败原因）与 `utils/eval_cases.py`（12 类场景确定性生成 500 条分层用例，JSONL 导出）。
@@ -306,7 +306,7 @@ python tests/test_memory_system.py
 - **向量数据库**: Milvus（本地存储）
 - **Embedding模型**: BGE-small-zh-v1.5（中文向量化，本地部署 `data/models/bge-small-zh-v1.5`）
 - **文档处理**: 按小节切分（Chunking，章节 / FAQ 边界强制断块，块长 ≤ 400 字）
-- **检索算法（v2.0 混合检索）**: 向量余弦 + BM25（中文按字符二元组切词，无需分词器）双路召回，按 RRF 融合取 Top-K；可选 `RAG_RERANK_MODEL`（如 `BAAI/bge-reranker-base`）对候选做 cross-encoder 精排（默认关闭，不额外下载模型）。BM25 索引按知识库进程内缓存（`RAG_BM25_TTL_SEC`，写入即失效），片段数超过 `RAG_BM25_MAX_DOCS` 时自动退回纯向量；管理 / 评测接口保持纯向量口径
+- **检索算法（v2.0 混合检索）**: 向量余弦 + BM25（中文按字符二元组切词，无需分词器）双路召回，按 RRF 融合取 Top-K；可选 `RAG_RERANK_MODEL`（如 `BAAI/bge-reranker-base`）对候选做 cross-encoder 精排（默认关闭，不额外下载模型）。BM25 按查询词 IDF 和归一，索引按知识库进程内缓存（`RAG_BM25_TTL_SEC`，写入 / 删除即时失效），片段数超过 `RAG_BM25_MAX_DOCS` 时自动退回纯向量；首轮全被 `min_score` 过滤时用简化查询重检索一次。管理 / 评测接口保持纯向量口径
 - **可追溯性**: 返回文档来源，支持知识溯源
 - **准确率**: 95%（知识库问答准确率）
 
