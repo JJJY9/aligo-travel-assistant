@@ -983,6 +983,70 @@ def test_chat_stream_idempotency_without_session_id_replays():
         _cleanup(user_id)
 
 
+def test_chat_idempotency_replays_when_retry_sends_resolved_session_id():
+    """首条消息（无 session_id）执行后，客户端带上服务端生成的会话 id
+    同键重试：仍命中缓存回放，而不是重新执行。"""
+
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem_resolved_session")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "idempotency_key": "req-rs-1",
+        }
+        first = client.post("/api/chat", json=payload)
+        assert first.status_code == 200, first.text
+        calls_after_first = counting.calls
+        session_id = first.json()["session_id"]
+        assert session_id
+        # 客户端在 session 事件里学会会话 id 后用同一键重试
+        retry = client.post("/api/chat", json={**payload, "session_id": session_id})
+        assert retry.status_code == 200, retry.text
+        assert retry.headers.get("x-idempotent-replay") == "1"
+        assert retry.json() == first.json()
+        assert counting.calls == calls_after_first
+        print("✓ 带上解析后会话 id 的同键重试仍回放")
+    finally:
+        _cleanup(user_id)
+
+
+def test_remember_idempotent_indexes_resolved_session():
+    """幂等缓存双写：请求会话键与解析后的会话键都能取到同一负载。"""
+    from utils.idempotency import IdempotencyCache, make_key
+
+    from webapp.server import _remember_idempotent
+
+    cache = IdempotencyCache()
+    primary = make_key("u", "", "k", endpoint="chat", message="m")
+    _remember_idempotent(
+        cache,
+        primary,
+        user_id="u",
+        request_session_id=None,
+        resolved_session_id="S1",
+        key="k",
+        endpoint="chat",
+        message="m",
+        payload={"ok": True},
+    )
+    assert cache.get(primary) == {"ok": True}
+    assert cache.get(
+        make_key("u", "S1", "k", endpoint="chat", message="m")
+    ) == {"ok": True}
+    print("✓ 幂等缓存按解析后会话 id 双写")
+
+
 def test_chat_incomplete_idempotency_marker_returns_409():
     """断连 499 落库成功后的标记：重试返回 409，不重放也不重复执行。"""
     from utils.idempotency import make_key

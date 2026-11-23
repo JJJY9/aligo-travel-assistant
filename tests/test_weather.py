@@ -115,6 +115,37 @@ def test_success_cache_write_is_shared(monkeypatch):
     print("✓ 成功天气结果写入共享缓存")
 
 
+def test_shared_fill_respects_cache_limits(monkeypatch):
+    """共享缓存回填同样受进程内条数上限约束（不能无限膨胀）。"""
+    client = _FakeSharedRedis()
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    limit = weather._CACHE_MAX_ENTRIES
+    for index in range(limit + 50):
+        payload = {"city": f"城市{index}", "current": {}, "daily": []}
+        weather._fill_from_shared(f"city-{index}", payload, 0)
+    with weather._cache_lock:
+        assert len(weather._cache) <= limit, len(weather._cache)
+    print("✓ 共享回填受进程内缓存上限约束")
+
+
+def test_shared_cache_success_resets_redis_availability(monkeypatch):
+    """共享缓存成功操作复位短期记忆的 Redis 可用性标记。"""
+    from context import short_term_memory as module
+
+    client = _FakeSharedRedis()
+    payload = {"city": "杭州", "current": {}, "daily": []}
+    key = weather._cache_key("杭州")
+    client.data[f"aligo:weather:{key}"] = _shared_envelope(payload)
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    module.note_redis_operation_failure(ConnectionError("down"))
+    assert module.redis_short_term_available() is False
+    weather._shared_cache_get(key)
+    assert module.redis_short_term_available() is True
+    print("✓ 共享缓存成功操作复位 Redis 可用性")
+
+
 def test_shared_cache_failure_enters_cooldown(monkeypatch):
     """Redis 操作失败后 60 秒冷却内不再触达客户端（避免每次等满超时）。"""
     from context import storage as storage_module
@@ -200,16 +231,20 @@ def _isolate_weather_cache(monkeypatch):
 
     共享缓存（配置 REDIS_URL 时）是进程外状态：测试统一隔离为「无
     Redis」，否则用例会读写真实 Redis 并互相污染（clear_weather_cache
-    只清进程内表，不清共享键）。
+    只清进程内表，不清共享键）。共享缓存的成功 / 失败会改短期记忆的
+    Redis 可用性标记，夹具一并复位。
     """
+    from context import short_term_memory as short_term_module
     from context import storage as storage_module
 
     weather.clear_weather_cache()
+    short_term_module.reset_redis_degraded()
     monkeypatch.setattr(
         storage_module, "get_shared_redis_client", lambda *a, **k: None
     )
     yield
     weather.clear_weather_cache()
+    short_term_module.reset_redis_degraded()
 
 
 def _geo(city="北京"):
@@ -1252,10 +1287,14 @@ if __name__ == "__main__":
         test_shared_cache_failure_enters_cooldown,
         test_shared_cache_ignores_stale_or_invalid_entry,
         test_shared_hit_anchors_age_to_fetch_time,
+        test_shared_fill_respects_cache_limits,
+        test_shared_cache_success_resets_redis_availability,
     ):
         mp = pytest.MonkeyPatch()
         try:
-            # 直跑不执行 autouse fixture：手动隔离天气缓存与共享 Redis
+            # 直跑不执行 autouse fixture：手动隔离天气缓存与共享 Redis，
+            # 并复位短期记忆的 Redis 可用性标记（成功 / 失败路径会改它）
+            from context import short_term_memory as _st_module
             from context import storage as _storage_module
 
             mp.setattr(
@@ -1263,10 +1302,12 @@ if __name__ == "__main__":
                 "get_shared_redis_client",
                 lambda *a, **k: None,
             )
+            _st_module.reset_redis_degraded()
             weather.clear_weather_cache()
             case(mp)
         finally:
             weather.clear_weather_cache()
+            _st_module.reset_redis_degraded()
             mp.undo()
     test_empty_city_raises()
     test_parse_weather_tolerates_none_daily_entries()

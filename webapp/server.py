@@ -1964,6 +1964,40 @@ class AligoWebApp:
             )
 
 
+def _remember_idempotent(
+    idempotency: Any,
+    idem_key: Any,
+    *,
+    user_id: str,
+    request_session_id: str | None,
+    resolved_session_id: str,
+    key: str,
+    endpoint: str,
+    message: str,
+    payload: dict[str, Any],
+) -> None:
+    """写入幂等缓存，并在「解析后的会话 id」下再索引一份。
+
+    新会话首条消息的请求不带 session_id（键用空串），客户端在处理 SSE
+    session 帧后才知道服务端生成的会话 id，同键重试会带上它；只写请求
+    session 的键会让这类重试永远 miss、重新执行一遍。两处都写入，重试
+    无论用哪个 id 都能回放（成功响应或未完成标记）。
+    """
+    idempotency.put(idem_key, payload)
+    request_session = request_session_id or ""
+    if resolved_session_id and resolved_session_id != request_session:
+        idempotency.put(
+            make_key(
+                user_id,
+                resolved_session_id,
+                key,
+                endpoint=endpoint,
+                message=message,
+            ),
+            payload,
+        )
+
+
 def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", "") or "")
 
@@ -5149,9 +5183,16 @@ def create_app(model: Any = None) -> FastAPI:
                     # 断连 499 无法携带回答，但落库线程已把整轮写入：
                     # 给幂等键留标记，重试时返回 409 而不是再执行一遍
                     # （否则聊天历史会出现两条相同问答）
-                    state.idempotency.put(
+                    _remember_idempotent(
+                        state.idempotency,
                         idem_key,
-                        {
+                        user_id=payload.user_id,
+                        request_session_id=payload.session_id,
+                        resolved_session_id=session.session_id,
+                        key=payload.idempotency_key or "",
+                        endpoint="chat",
+                        message=payload.message,
+                        payload={
                             "session_id": session.session_id,
                             "__incomplete__": True,
                             "message": "上一请求已处理但响应未送达，请刷新会话历史",
@@ -5165,7 +5206,17 @@ def create_app(model: Any = None) -> FastAPI:
             **_json_safe_value(result),
         }
         if idem_key is not None:
-            state.idempotency.put(idem_key, response_payload)
+            _remember_idempotent(
+                state.idempotency,
+                idem_key,
+                user_id=payload.user_id,
+                request_session_id=payload.session_id,
+                resolved_session_id=session.session_id,
+                key=payload.idempotency_key or "",
+                endpoint="chat",
+                message=payload.message,
+                payload=response_payload,
+            )
         return response_payload
 
     @app.post("/api/chat/stream")
@@ -5325,9 +5376,16 @@ def create_app(model: Any = None) -> FastAPI:
                     # 流在 done 之前结束（客户端断连），但 drain 后确认整轮
                     # 已落库：给幂等键留标记，同键重试回放错误终态而不是
                     # 重新执行
-                    state.idempotency.put(
+                    _remember_idempotent(
+                        state.idempotency,
                         idem_key,
-                        {
+                        user_id=payload.user_id,
+                        request_session_id=payload.session_id,
+                        resolved_session_id=session.session_id,
+                        key=payload.idempotency_key or "",
+                        endpoint="chat_stream",
+                        message=payload.message,
+                        payload={
                             "session_id": session.session_id,
                             "__incomplete__": True,
                             "message": "上一请求已处理但响应未送达，请刷新会话历史",
@@ -5361,8 +5419,16 @@ def create_app(model: Any = None) -> FastAPI:
                             **result,
                         }
                         if idem_key is not None:
-                            state.idempotency.put(
-                                idem_key, _json_safe_value(done_event)
+                            _remember_idempotent(
+                                state.idempotency,
+                                idem_key,
+                                user_id=payload.user_id,
+                                request_session_id=payload.session_id,
+                                resolved_session_id=session.session_id,
+                                key=payload.idempotency_key or "",
+                                endpoint="chat_stream",
+                                message=payload.message,
+                                payload=_json_safe_value(done_event),
                             )
                         await queue.put(done_event)
                     except asyncio.CancelledError:
