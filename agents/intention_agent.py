@@ -372,12 +372,18 @@ class IntentionAgent(AgentBase):
 - information_query: 信息查询智能体（联网搜索）
 - rag_knowledge: RAG知识库智能体（查询企业知识库）
 
-**Priority 2（依赖 Priority 1）- 行程规划类：**
+**Priority 2（依赖 Priority 1）- 行程规划与行前信息类：**
 - itinerary_planning: 行程规划智能体（需要事项收集的结果）
+- packing-list / travel-checklist / safety-tips / trip-notes: 行李 / 行前 / 安全 / 贴士（需要目的地、日期等事项信息）
+
+**Priority 3（依赖行程规划）：**
+- trip-budget: 预算建议（需要行程规划结果）
+- local-transport: 市内交通（需要行程规划结果）
 
 **说明：**
 - Priority 1 的智能体都是信息获取，互不依赖，可并行执行提升速度
 - Priority 2 的智能体需要使用 Priority 1 收集的信息
+- Priority 3 的智能体需要行程规划结果（未调度行程规划时可与 Priority 2 同批）
 - 示例：用户说"我要从天津去北京，喜欢住汉庭"
   → Priority 1: preference + event_collection（并行）
   → Priority 2: itinerary_planning（使用 Priority 1 的结果）
