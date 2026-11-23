@@ -2181,6 +2181,45 @@ async function scenarioDeletedThreadSend(source) {
   return { veto, afterSend };
 }
 
+async function scenarioRetiredThreadOpenSession(source) {
+  // persisted=false 后打开另一个会话：可见线程属于新会话，标记必须复位，
+  // 否则下一次发送会清空刚加载的历史
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    state.sessionLoading = false;
+    state.sessionId = null;
+    state.retiredThreadVisible = true;
+    state.sessions = [{ session_id: "s2", title: "会话二" }];
+    state.sessionTotal = 1;
+    state.sessionsOffset = 0;
+    els.messages.children = [];
+    getJSON = async () => ({
+      messages: [
+        { role: "user", content: "历史提问", timestamp: "" },
+        { role: "assistant", content: "历史回答", timestamp: "" },
+      ],
+      title: "会话二",
+    });
+    safeStorageSet = () => {};
+    safeStorageRemove = () => {};
+    syncSessionControls = () => {};
+    setConversationTitle = () => {};
+    hideWelcome = () => {};
+    refreshEditButtons = () => {};
+    refreshStatus = async () => {};
+    loadSessions = async () => {};
+  `);
+  await run('openSession("s2")');
+  const afterOpen = run(`({
+    retired: state.retiredThreadVisible,
+    sessionId: state.sessionId,
+  })`);
+  return { afterOpen };
+}
+
 function scenarioRenderCap(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -2421,6 +2460,8 @@ async function main() {
     payload = await scenarioSilentAppendWindow(source);
   } else if (scenario === "deletedThreadSend") {
     payload = await scenarioDeletedThreadSend(source);
+  } else if (scenario === "retiredThreadOpenSession") {
+    payload = await scenarioRetiredThreadOpenSession(source);
   } else if (scenario === "renderCap") {
     payload = scenarioRenderCap(source);
   } else if (scenario === "archivedRollback") {
