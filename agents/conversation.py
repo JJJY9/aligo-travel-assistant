@@ -715,6 +715,19 @@ class ConversationRuntime:
         if summary:
             memory_parts.append(f"【历史会话总结】\n{summary}")
 
+        # v2.0：当前会话最近对话的 200 字滚动摘要（内存管理器支持时才取，
+        # 测试 / 自定义记忆实现不实现该方法时保持原行为）
+        recent_summary_getter = getattr(
+            self.memory, "get_recent_summary_async", None
+        )
+        if callable(recent_summary_getter):
+            try:
+                recent_summary = await recent_summary_getter(max_turns=10)
+            except Exception:
+                recent_summary = ""
+            if recent_summary:
+                memory_parts.append(f"【最近对话摘要】\n{recent_summary}")
+
         messages: list[Msg] = []
         if memory_parts:
             messages.append(Msg(name="system", content="\n\n".join(memory_parts), role="system"))
