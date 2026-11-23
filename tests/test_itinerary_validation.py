@@ -71,6 +71,29 @@ def test_must_see_trims_duration_and_budget_fragments():
     print("✓ 必去项截掉天数 / 预算片段")
 
 
+def test_must_see_skips_narrative_and_preserves_connector_names():
+    """「北京旅游」「景点有哪些」不是地名；颐和园 / 和平饭店不能被拆坏。"""
+    assert extract_requirements("我想去北京旅游")["must_see"] == ["北京"]
+    assert "must_see" not in extract_requirements("北京必去景点有哪些")
+    assert extract_requirements("想去颐和园")["must_see"] == ["颐和园"]
+    assert extract_requirements("必去和平饭店")["must_see"] == ["和平饭店"]
+    assert extract_requirements("必去颐和园和圆明园")["must_see"] == [
+        "颐和园",
+        "圆明园",
+    ]
+    print("✓ 必去项保护连接字地名并过滤叙述词")
+
+
+def test_budget_does_not_cross_enumeration_punctuation():
+    """顿号 / 冒号后的分项金额不能被当成总预算。"""
+    assert "budget" not in extract_requirements(
+        "预算还没定、酒店500元左右"
+    )
+    assert "budget" not in extract_requirements("费用：交通500，住宿600")
+    assert extract_requirements("预算：5000元")["budget"] == 5000
+    print("✓ 预算不跨顿号 / 冒号")
+
+
 def test_must_see_only_checks_daily_plans():
     """备注里提到的地名不算已安排：必须出现在每日行程里。"""
     itinerary = {
@@ -164,6 +187,8 @@ if __name__ == "__main__":
     test_date_day_is_not_duration_and_dates_drive_day_count()
     test_budget_does_not_cross_clause_punctuation()
     test_must_see_trims_duration_and_budget_fragments()
+    test_must_see_skips_narrative_and_preserves_connector_names()
+    test_budget_does_not_cross_enumeration_punctuation()
     test_must_see_only_checks_daily_plans()
     test_validate_passes_for_consistent_plan()
     test_validate_detects_all_five_checks()
