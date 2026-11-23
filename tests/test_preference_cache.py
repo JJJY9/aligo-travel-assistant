@@ -224,6 +224,11 @@ def test_orchestration_invalidates_after_preference_write():
 
 def test_shared_version_invalidates_cross_process_cache(monkeypatch):
     """其它进程写入偏好（版本 INCR）后本进程立即重读，不等满 TTL。"""
+    from utils.metrics import REQUEST_METRICS
+
+    def pref_metrics():
+        return REQUEST_METRICS.snapshot()["preference_cache"]
+
     _with_pg(monkeypatch)
     redis = _FakeRedis()
     _with_redis(monkeypatch, redis)
@@ -231,13 +236,29 @@ def test_shared_version_invalidates_cross_process_cache(monkeypatch):
     try:
         store = _FakeStore(snapshot_based=False)
         manager.long_term = store
+        baseline = pref_metrics()
         manager.get_preferences()
         manager.get_preferences()
         assert store.reads == 1, "版本未变应命中缓存"
+        after_hit = pref_metrics()
+        assert after_hit["hits"] - baseline["hits"] == 1
+        assert after_hit["misses"] - baseline["misses"] == 1
+        assert (
+            after_hit["version_invalidations"]
+            - baseline["version_invalidations"]
+            == 0
+        )
         redis.incr("aligo:prefver:pref_cache_user")  # 模拟其它实例 / CLI 写入
         manager.get_preferences()
         assert store.reads == 2, "版本变化后应立即重新读取"
-        print("✓ 共享版本变化立即失效跨进程偏好缓存")
+        after_change = pref_metrics()
+        assert after_change["misses"] - after_hit["misses"] == 1
+        assert (
+            after_change["version_invalidations"]
+            - after_hit["version_invalidations"]
+            == 1
+        )
+        print("✓ 共享版本变化立即失效跨进程偏好缓存（计入指标）")
     finally:
         shutil.rmtree(storage, ignore_errors=True)
 
@@ -278,6 +299,70 @@ def test_version_protocol_order(monkeypatch):
         manager.get_preferences()
         assert events == ["version"], "命中缓存不应再读库"
         print("✓ 版本先于偏好读取，缓存命中只取版本")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_version_invalidation_requires_fresh_snapshot(monkeypatch):
+    """TTL 已过期的 miss 不算版本失效（无论如何都要回源）。"""
+    from utils.metrics import REQUEST_METRICS
+
+    _with_pg(monkeypatch)
+    redis = _FakeRedis()
+    _with_redis(monkeypatch, redis)
+    manager, storage = _manager()
+    try:
+        store = _FakeStore(snapshot_based=False)
+        manager.long_term = store
+        now = [1000.0]
+        monkeypatch.setattr(
+            memory_manager_module.time, "monotonic", lambda: now[0]
+        )
+        manager.get_preferences()
+        baseline = REQUEST_METRICS.snapshot()["preference_cache"]
+        redis.incr("aligo:prefver:pref_cache_user")  # 其它进程写入
+        now[0] = 1006.0  # 快照已过 5 秒 TTL
+        manager.get_preferences()
+        latest = REQUEST_METRICS.snapshot()["preference_cache"]
+        assert latest["misses"] - baseline["misses"] == 1
+        assert (
+            latest["version_invalidations"]
+            == baseline["version_invalidations"]
+        ), "TTL 过期导致的回源不能计为版本失效"
+        print("✓ TTL 过期的回源不计入版本失效")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_version_recovery_from_none_not_counted(monkeypatch):
+    """版本从不可读（None）恢复不算版本变化：TTL 内继续命中且不误计。"""
+    from context import storage as storage_module
+    from utils.metrics import REQUEST_METRICS
+
+    _with_pg(monkeypatch)
+    broken = _BrokenRedis()
+    _with_redis(monkeypatch, broken)
+    manager, storage = _manager()
+    try:
+        store = _FakeStore(snapshot_based=False)
+        manager.long_term = store
+        manager.get_preferences()  # 版本不可读：快照记录 None
+        assert manager._preference_cache[1] is None
+        # Redis 恢复（期间没有任何偏好写入），冷却结束
+        healthy = _FakeRedis()
+        monkeypatch.setattr(
+            storage_module, "get_shared_redis_client", lambda *a, **k: healthy
+        )
+        storage_module.reset_pref_version_failure()
+        baseline = REQUEST_METRICS.snapshot()["preference_cache"]
+        manager.get_preferences()
+        latest = REQUEST_METRICS.snapshot()["preference_cache"]
+        assert latest["hits"] - baseline["hits"] == 1, "TTL 内应继续命中"
+        assert (
+            latest["version_invalidations"]
+            == baseline["version_invalidations"]
+        ), "版本从不可读恢复不是版本变化"
+        print("✓ 版本从不可读恢复不误计为版本变化")
     finally:
         shutil.rmtree(storage, ignore_errors=True)
 
@@ -379,6 +464,8 @@ if __name__ == "__main__":
         test_shared_version_invalidates_cross_process_cache,
         test_shared_version_failure_keeps_ttl_cache,
         test_version_protocol_order,
+        test_version_invalidation_requires_fresh_snapshot,
+        test_version_recovery_from_none_not_counted,
         test_postgres_preference_writes_bump_shared_version,
     ):
         _mp = pytest.MonkeyPatch()

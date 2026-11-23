@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- 偏好缓存命中率指标（v2.0）：`/api/metrics` 新增 `preference_cache` 计数（hits / misses / version_invalidations），Prometheus 暴露 `aligo_preference_cache_hits_total` / `aligo_preference_cache_misses_total` / `aligo_preference_cache_version_invalidations_total`；`MemoryManager.get_preferences` 每次读取计入 hits 或 misses，快照仍在 TTL 内、因跨进程版本变化被迫回源时额外计入 version_invalidations（misses 的子集；TTL 过期与版本读取失败不计入），补齐 README「设计目标尚未实现」项。新增指标快照 / Prometheus / 缓存读取计数 / TTL 过期与版本恢复不误计回归
 - 偏好缓存跨进程失效（v2.0）：配置 `REDIS_URL` 时，`PostgresLongTermMemory` 在偏好写入 / 删除 / 整表清空后推进每用户共享版本键（`aligo:prefver:<用户>`，INCR 后 EXPIRE 1 天——与墓碑会话纪元同一键生命周期约定，过期只会让下一次读取多一次重读）；`MemoryManager.get_preferences` 读取前取版本、与快照记录的版本不一致即重读，多实例 / CLI 写入后其它进程下一次读取就拿到新偏好，不再等满 5 秒 TTL。版本读写失败进入 60 秒本地冷却（不会让故障期每次偏好读取 / 写入都等满 socket 超时）并同步 Redis 可用性标记，退回原有 TTL + 本进程失效语义（版本推进失败不影响写入）。新增跨进程版本失效 / Redis 故障冷却 / 读侧与写侧顺序不变量 / 存储层版本推进与 TTL 回归
 - 导出与备份恢复互斥（v2.0）：`/api/import` 在真实写入期间标记该用户并推进每用户恢复纪元；同账号的导出接口（`/api/export`、`/api/sessions/export`、`/api/sessions/{id}/export`、`/api/trips/export`、`/api/trips/calendar`）返回 409（恢复进行中带 `Retry-After`），不再产出「只有偏好没有消息」的半截快照。导出在读取前原子地取纪元、读完快照后复核：读取期间才开始、甚至读完前已经结束的恢复也会让本次导出作废（PG 快照 / JSON 打开时快照可能定格在写入中途，只查「当前是否在恢复」会漏掉）。dry-run 不标记，写入失败也清除标记；恢复标记与纪元是进程内状态，多实例 / CLI 跨进程仍按已知限制在恢复结束后导出。新增入口 / 读取中途开始 / 读取期间完成的恢复回归
 - 实体归一（v2.0）：新增 `utils/entity_normalize.py`——城市名去行政后缀（杭州市→杭州、香港特别行政区→香港），中文日期（今天 / 明天 / 本周五 / 下周三 / 3月4日 / 下个月5号 / 月底）归一为 ISO；事项收集结果在行程需求提取前自动归一（副本，不修改原数据）。新增城市 / 日期 / 事项数据回归
