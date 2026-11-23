@@ -115,6 +115,44 @@ def test_priority_parallel_and_sequential():
     print("✓ 同优先级并行、不同优先级串行")
 
 
+def test_checkpoint_reuses_successful_agents_across_instances(tmp_path):
+    """持久化检查点：重启后的新编排器复用已成功智能体，只重跑失败者。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    first_a = _StubAgent("a", {"ok": True})
+    first_b = _StubAgent("b", raise_error=True)
+    first = OrchestrationAgent(
+        agent_registry={"a": first_a, "b": first_b}
+    )
+    first._checkpoint_store = store
+    schedule = [
+        {"agent_name": "a", "priority": 1},
+        {"agent_name": "b", "priority": 1},
+    ]
+    try:
+        asyncio.run(
+            first.reply(_intent(schedule), checkpoint_key="u:s:t1")
+        )
+    except Exception:  # noqa: BLE001 - 失败本身不是本用例重点
+        pass
+    assert first_a.calls == 1
+    state = store.load("u:s:t1")
+    assert state and state["steps"]["a"]["status"] == "success"
+    assert "b" not in state["steps"], "失败智能体不能写入检查点"
+
+    second_a = _StubAgent("a", {"ok": True})
+    second_b = _StubAgent("b", {"ok": True})
+    second = OrchestrationAgent(
+        agent_registry={"a": second_a, "b": second_b}
+    )
+    second._checkpoint_store = store
+    asyncio.run(second.reply(_intent(schedule), checkpoint_key="u:s:t1"))
+    assert second_a.calls == 0, "已成功的智能体不应重复执行"
+    assert second_b.calls == 1, "失败 / 未完成的智能体应重新执行"
+    state = store.load("u:s:t1")
+    assert set(state["steps"]) == {"a", "b"}
+    print("✓ 执行检查点跨编排器实例复用成功步骤")
 def test_dag_dependency_overrides_llm_priority():
     """行程规划即使被 LLM 标成更高优先级，也必须排在事项收集之后。"""
     order: list[str] = []
