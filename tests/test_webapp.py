@@ -2189,6 +2189,237 @@ def test_export_refuses_backup_over_import_limits(monkeypatch):
     print("✓ 超限备份返回 413")
 
 
+def test_export_refuses_while_restore_in_progress():
+    """恢复写入期间同账号导出返回 409：不会产出半截快照。"""
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_export_during_restore")
+    other_id = _unique_user("web_export_during_restore_other")
+    state.begin_user_import(user_id)
+    try:
+        for path in (
+            "/api/export",
+            "/api/sessions/export",
+            "/api/sessions/s1/export",
+            "/api/trips/export",
+            "/api/trips/calendar",
+        ):
+            response = client.get(path, params={"user_id": user_id})
+            assert response.status_code == 409, (path, response.text)
+            assert "正在恢复备份" in response.json()["detail"], (
+                path,
+                response.text,
+            )
+        # 别的账号不受影响
+        response = client.get("/api/export", params={"user_id": other_id})
+        assert response.status_code == 200, response.text
+        # 被拒绝的导出不占用导出槽位（槽位没有泄漏）
+        acquired: list[bool] = []
+        try:
+            acquired = [
+                state.export_slots.acquire(blocking=False) for _ in range(2)
+            ]
+            assert all(acquired), "409 拒绝不应占用导出槽位"
+        finally:
+            for got_slot in acquired:
+                if got_slot:
+                    state.export_slots.release()
+    finally:
+        state.end_user_import(user_id)
+        _cleanup(user_id)
+        _cleanup(other_id)
+    # 标记清除后可正常导出
+    response = client.get("/api/export", params={"user_id": user_id})
+    assert response.status_code == 200, response.text
+    print("✓ 恢复进行中导出 409，结束后恢复可用")
+
+
+def test_import_marks_user_while_restoring(monkeypatch):
+    """真实恢复写入期间标记用户；dry-run 不标记；失败也清除标记。"""
+    from utils import user_import as module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_import_marker")
+    seen: dict[str, bool] = {}
+    real_import = module.import_user_data
+    real_preview = module.preview_user_import
+
+    def wrapped_import(store, sections, **kwargs):
+        seen["import"] = state.is_user_import_active(user_id)
+        return real_import(store, sections, **kwargs)
+
+    def wrapped_preview(store, sections, **kwargs):
+        seen["preview"] = state.is_user_import_active(user_id)
+        return real_preview(store, sections, **kwargs)
+
+    monkeypatch.setattr(module, "import_user_data", wrapped_import)
+    monkeypatch.setattr(module, "preview_user_import", wrapped_preview)
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id, "dry_run": 1},
+            json={"backup": {"preferences": {"home_location": "北京"}}},
+        )
+        assert response.status_code == 200, response.text
+        assert seen.get("preview") is False
+
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"home_location": "北京"}}},
+        )
+        assert response.status_code == 200, response.text
+        assert seen.get("import") is True
+        assert state.is_user_import_active(user_id) is False
+
+        def failing_import(store, sections, **kwargs):
+            seen["failed"] = state.is_user_import_active(user_id)
+            raise ValueError("注入的恢复失败")
+
+        monkeypatch.setattr(module, "import_user_data", failing_import)
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"home_location": "上海"}}},
+        )
+        assert response.status_code == 400, response.text
+        assert seen.get("failed") is True
+        assert state.is_user_import_active(user_id) is False
+    finally:
+        _cleanup(user_id)
+    print("✓ 恢复写入期间标记用户，dry-run 不标记，失败清除标记")
+
+
+def test_export_rejects_snapshot_when_restore_starts_mid_read(monkeypatch):
+    """入口检查通过后、读取期间才开始恢复：读完再确认并丢弃快照（409）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_export_restore_race")
+    real_load = server_module._load_user_data
+
+    def load_with_restore_start(uid, strict=False):
+        data = real_load(uid, strict=strict)
+        state.begin_user_import(uid)
+        return data
+
+    monkeypatch.setattr(
+        server_module, "_load_user_data", load_with_restore_start
+    )
+    try:
+        response = client.get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 409, response.text
+        assert "正在恢复备份" in response.json()["detail"]
+    finally:
+        state.end_user_import(user_id)
+        _cleanup(user_id)
+    print("✓ 读取期间开始恢复：导出丢弃快照并返回 409")
+
+
+def test_export_detects_restore_completed_during_read(monkeypatch):
+    """恢复在读取期间开始并结束（标记已清）：纪元变化同样让导出作废。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_export_restore_epoch")
+    real_load = server_module._load_user_data
+
+    def load_with_full_restore(uid, strict=False):
+        data = real_load(uid, strict=strict)
+        # 模拟一次完整恢复在读取期间发生：结束标记已清，但纪元已推进
+        state.begin_user_import(uid)
+        state.end_user_import(uid)
+        return data
+
+    monkeypatch.setattr(
+        server_module, "_load_user_data", load_with_full_restore
+    )
+    try:
+        response = client.get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert "发生过备份恢复" in detail, detail
+        # 恢复已结束：立即重试即可，无需 Retry-After
+        assert "Retry-After" not in response.headers
+    finally:
+        _cleanup(user_id)
+    print("✓ 读取期间开始并结束的恢复：纪元变化让导出作废")
+
+
+def test_export_endpoints_detect_restore_started_mid_read(monkeypatch):
+    """会话 / 行程导出与 with_knowledge 的知识读取：读取中途才开始恢复
+    同样让本次导出作废（覆盖每个端点的读完复核，而不只是入口检查）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_export_mid_read")
+    real_open = server_module._open_long_term
+
+    class _RestoreOnReadStore:
+        """第一次读会话 / 行程后开始一次恢复，模拟读取中途才开始写入。"""
+
+        def __init__(self, store):
+            self._store = store
+
+        def __getattr__(self, name):
+            return getattr(self._store, name)
+
+        def _start_restore(self):
+            state.begin_user_import(user_id)
+
+        def get_chat_history(self, *args, **kwargs):
+            data = self._store.get_chat_history(*args, **kwargs)
+            self._start_restore()
+            return data
+
+        def get_trip_history(self, *args, **kwargs):
+            data = self._store.get_trip_history(*args, **kwargs)
+            self._start_restore()
+            return data
+
+    def open_with_restore(uid, *args, **kwargs):
+        return _RestoreOnReadStore(real_open(uid, *args, **kwargs))
+
+    monkeypatch.setattr(server_module, "_open_long_term", open_with_restore)
+    try:
+        for path in (
+            "/api/sessions/export",
+            "/api/sessions/s1/export",
+            "/api/trips/export",
+            "/api/trips/calendar",
+        ):
+            response = client.get(path, params={"user_id": user_id})
+            assert response.status_code == 409, (path, response.text)
+            assert "正在恢复备份" in response.json()["detail"], (
+                path,
+                response.text,
+            )
+            # 清掉标记：下一轮只能靠端点内的读完复核命中（入口不拦）
+            state.end_user_import(user_id)
+
+        # with_knowledge：用户数据读完后、知识片段读取期间才开始恢复
+        def start_restore_then_documents():
+            state.begin_user_import(user_id)
+            return []
+
+        monkeypatch.setattr(
+            server_module, "export_documents", start_restore_then_documents
+        )
+        response = client.get(
+            "/api/export", params={"user_id": user_id, "with_knowledge": 1}
+        )
+        assert response.status_code == 409, response.text
+        assert "正在恢复备份" in response.json()["detail"]
+    finally:
+        state.end_user_import(user_id)
+        _cleanup(user_id)
+    print("✓ 各导出端点读完复核：读取中途开始的恢复返回 409")
+
+
 def test_export_filenames_disambiguate_non_ascii_ids():
     """中文 ID 清洗后追加短哈希；单会话导出文件名带用户维度。"""
     import re as re_module

@@ -673,7 +673,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | DELETE | `/api/sessions/{id}` | 删除某个会话的聊天记录与元数据；引用该会话的行程保留、会话链接清空（与 CLI `session-delete` 同一实现） |
 | DELETE | `/api/sessions/{id}/last-turn` | 删除最后一轮对话（用户提问 + 助手回答）；`expect` 与最后一轮用户提问不一致时不删除；可选 `turn_id`（助手消息 `_meta.client_turn_id`）用于精确匹配本轮，同文并发提问时不会误删其它客户端的回合；用户锁被长回合占用超过 10 秒返回 409「会话正在生成回复」，不排队到前端超时后仍执行 |
 | POST | `/api/sessions/{id}/last-turn` | 同上，`expect` 走 JSON body（长提问不受查询串 4000 字上限），body 支持 `turn_id`；面板「编辑重发 / 重新生成」使用此入口并携带本轮身份 |
-| GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载）；`with_knowledge=1`（仅 JSON）把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段，可由 `/api/import` 一体化恢复） |
+| GET | `/api/export` | 导出用户长期记忆（`format=json` 默认 / `format=md`，附件下载）；`with_knowledge=1`（仅 JSON）把全局知识库片段写入备份的 `knowledge` 字段（与 CLI `user-export --with-knowledge` 同一字段，可由 `/api/import` 一体化恢复）；同账号恢复备份写入期间返回 409（避免导出半截快照） |
 | POST | `/api/import?user_id=` | 从 `/api/export` 的 JSON 备份恢复（只接受 `Content-Type: application/json`，body `{backup: <导出 JSON 对象>}`，备份上限 50 MB / 请求体上限 64 MB；偏好 / 行程 / 聊天消息 / 会话标题与置顶归档，重复导入幂等，最近被删除的会话跳过，备份含 `knowledge` 段时一并恢复知识片段（失败时 `knowledge_error` 字段说明）；非法条目在 `skipped` 列出；PostgreSQL 不可用时 503；`dry_run=1` 只预览不写库） |
 | POST | `/api/trips` | 手动添加一条行程（同路线 + 同起止日期自动去重，返回 `trip_id`、`created` 与日期重叠的 `conflicts`） |
 | POST | `/api/trips/dedupe` | 清理重复行程（JSON body `{"user_id": ..., "dry_run": true}`；同路线 + 同起止日期保留最早一条，与 CLI `trips-dedupe` 共用判定 / 复核 / 删除；同 id 多行程只列在 `ambiguous_ids` 不自动处理；`dry_run` 只预览 `would_remove` / `duplicates`；PostgreSQL 配置但不可用时 503） |
@@ -951,7 +951,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **反向代理与 `X-Forwarded-For`**：默认按 TCP 对端地址限流。部署在反向代理后需设置 `TRUST_PROXY_HEADERS=1`，并让最靠近应用的代理以追加模式写入 `X-Forwarded-For`（应用取**最后一个地址**，前面的伪造前缀不被采用）；直接暴露服务时请保持默认关闭。uvicorn 的 `proxy_headers` 在启动时已关闭，XFF 只由应用层按 `TRUST_PROXY_HEADERS` 采信。
 - **并发新建会话与数据库连接峰值**：会话缓存上限（`max_sessions`）约束的是缓存中的会话数；并发首次请求在淘汰旧会话前各自新建会话，构造中的连接与缓存中的连接会短暂并存（峰值可达上限的数倍）。高并发部署请相应提高 PostgreSQL `max_connections`，或调低会话上限，避免连接失败后进程级回退本地 JSON。
 - **限流在请求体解析之后**：`/api/chat` 等接口的限流在请求体解析与 schema 校验之后执行——schema 非法的请求（422）不消耗额度，且请求体（≤2 MB）的 JSON 解析发生在事件循环上。反向代理层限制请求体大小 / 速率可缓解解析类无效请求的刷量。
-- **导出与进行中的备份恢复不共享用户锁**：Web 导出是只读快照，不与导入持同一把用户锁，恢复进行中导出可能得到「只有偏好没有消息」的半截快照；请在恢复完成后再导出正式备份。
+- **导出与进行中的备份恢复**：恢复备份按条目逐条提交，期间导出会得到「只有偏好没有消息」的半截快照。Web 端恢复写入期间对同账号的导出接口（`/api/export`、`/api/sessions/export`、`/api/sessions/{id}/export`、`/api/trips/export`、`/api/trips/calendar`）返回 409「正在恢复备份」并带 `Retry-After`；导出在读取前原子地取该账号的恢复纪元、读完快照后复核——读取期间才开始（即使读完时已经结束）的恢复同样让本次导出作废（409「发生过备份恢复」，PG 快照 / JSON 打开时快照可能定格在写入中途，只查「当前是否在恢复」会漏掉）。恢复标记与纪元是进程内状态：多实例部署或 CLI 与 Web 分属不同进程时互相看不到对方的恢复，跨进程导出仍请在恢复结束后进行。
 - **备份恢复的本地优先**：同一会话里内容完全相同的提问（例如导出后在面板编辑重发 / 重新生成过）以目标库为准——备份在该轮次随后的回答（重复或另一台机器上的备选版本）不会追加，避免恢复出没有对应提问的尾部回答、破坏面板的问答配对与「删除最后一轮」。缺失 / 非法时间戳的恢复消息沿用同会话相邻消息的时间；提问 / 行程 / 偏好等其它数据不受影响。需要保留另一台机器的回答时，请在备份侧另行保存。
 - **备份恢复的时间戳口径**：JSON 后端的消息时间戳是本地墙钟（naive），恢复时的归位排序按当前机器的时区解释——跨时区旅行 / 夏令时回拨 / 校时后写入的两段对话，存储时间的先后可能与真实发生顺序不同，恢复（包括重复恢复同一备份）会按时间戳重排；PostgreSQL 的 `created_at` 是数据库绝对时间，不受影响。恢复带未来时间戳的消息（导出机时钟超前或手工备份，年份上限 2100）后，PostgreSQL 会把之后实时发送的回合排在它之前，JSON 则追加在末尾，两后端对「最后一轮」的认定不同；请在恢复前检查备份里的异常时间戳。
 - **停机与在途导入**：关闭服务（Ctrl+C / SIGTERM）**不会**等待在途的备份恢复 / 知识库导入——导入执行器是 daemon 线程且刻意不登记 atexit join，lifespan 以 `shutdown(wait=False)` 关闭，端口先关闭、进程随即退出，未完成的导入可能被中断。导入是幂等的（行程按路线 + 日期去重、消息按多重集去重），重新运行同一备份即可补齐；JSON 后端按批原子写回不会留下半写文件，PostgreSQL 已提交的行保留、中断的批次需重跑。需要保证完成时请等待导入结束再退出。

@@ -40,7 +40,7 @@ from concurrent.futures.thread import _worker
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, NoReturn
 
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -1276,6 +1276,17 @@ class AligoWebApp:
         # 导入排队上限（1 执行 + 1 等待）：执行器队列无界，并发大备份
         # （各可达 64MB）会在排队期间常驻内存直到 OOM，排队已满时按 503 背压
         self.import_queue_slots = threading.BoundedSemaphore(2)
+        # 正在恢复备份的用户：恢复在导入执行器线程里逐条写库，导出若在
+        # 写入期间读取会得到半截快照（用户会把它当成完整备份保存）。导出
+        # 入口与读完快照时都检查该标记，命中返回 409。执行器线程写标记，
+        # 事件循环 / 线程池读，需要独立互斥
+        self._importing_users: set[str] = set()
+        # 每用户恢复纪元（只增不减）：导出读取开始时取号、读完比对。只查
+        # 「当前是否在恢复」会漏掉「读取期间开始并结束」的恢复——读到的
+        # 快照可能定格在写入中途（PG REPEATABLE READ / JSON 打开时快照），
+        # 读完时标记已清除，必须靠纪元变化识别
+        self._import_epochs: dict[str, int] = {}
+        self._importing_users_lock = threading.Lock()
         # 知识库批量导入同样可能一次编码上万条分片并长时间持有写锁：放专用
         # 单 worker 执行器，避免 40 个并发导入占满 Starlette 共享线程池后把
         # /api/status、/api/sessions 等同步端点全部排队拖死
@@ -1867,6 +1878,42 @@ class AligoWebApp:
             lock = asyncio.Lock()
             self.locks[user_id] = lock
         return lock
+
+    def begin_user_import(self, user_id: str) -> None:
+        """标记该用户开始恢复备份并推进恢复纪元（写入前调用）。"""
+        with self._importing_users_lock:
+            self._importing_users.add(user_id)
+            self._import_epochs[user_id] = (
+                self._import_epochs.get(user_id, 0) + 1
+            )
+
+    def end_user_import(self, user_id: str) -> None:
+        """恢复结束（成功 / 失败）后解除标记；纪元保持不变。"""
+        with self._importing_users_lock:
+            self._importing_users.discard(user_id)
+
+    def is_user_import_active(self, user_id: str) -> bool:
+        with self._importing_users_lock:
+            return user_id in self._importing_users
+
+    def export_start_epoch(self, user_id: str) -> int | None:
+        """导出读取起点：返回当前纪元；正在恢复时返回 ``None``。
+
+        「是否在恢复」与纪元读取在同一把锁内完成，恢复开始要么发生在
+        取号之前（返回 None，直接拒绝），要么让纪元在读完时不一致。
+        """
+        with self._importing_users_lock:
+            if user_id in self._importing_users:
+                return None
+            return self._import_epochs.get(user_id, 0)
+
+    def import_generation(self, user_id: str) -> tuple[bool, int]:
+        """原子读取（是否正在恢复, 当前纪元），供导出读完后的复核。"""
+        with self._importing_users_lock:
+            return (
+                user_id in self._importing_users,
+                self._import_epochs.get(user_id, 0),
+            )
 
 
 def _request_id(request: Request) -> str:
@@ -3475,6 +3522,54 @@ def create_app(model: Any = None) -> FastAPI:
             finally:
                 self._release_once()
 
+    def _raise_restore_conflict(
+        request: Request | None, *, active: bool
+    ) -> NoReturn:
+        """409：恢复进行中，或本次导出读取期间发生过恢复。"""
+        if active:
+            detail = "该账号正在恢复备份，请恢复完成后再导出"
+            headers = {"Retry-After": "5"}
+        else:
+            # 恢复已结束：立刻重试即可得到完整快照，无需等待
+            detail = "该账号在本次导出期间发生过备份恢复，快照可能不完整，请重新导出"
+            headers = None
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{detail}"
+                f"（请求 ID：{_request_id(request) if request else ''}）"
+            ),
+            headers=headers,
+        )
+
+    def _export_start_epoch(request: Request | None, user_id: Any) -> int:
+        """导出读取前取恢复纪元：与「是否在恢复」原子判断，命中直接 409。"""
+        if not isinstance(user_id, str):
+            return 0
+        epoch = state.export_start_epoch(user_id)
+        if epoch is None:
+            _raise_restore_conflict(request, active=True)
+        return epoch
+
+    def _reject_export_during_restore(
+        request: Request | None,
+        user_id: Any,
+        since_epoch: int | None = None,
+    ) -> None:
+        """导出读完快照后复核：恢复仍在进行，或读取期间发生过恢复。
+
+        只查「当前是否在恢复」会漏掉读取期间开始并结束的恢复——PG 的
+        REPEATABLE READ / JSON 打开时的内存快照都可能定格在写入中途，
+        读完时标记已清除，但恢复纪元已变化，本次快照必须丢弃。
+        """
+        if not isinstance(user_id, str):
+            return
+        active, epoch = state.import_generation(user_id)
+        if active:
+            _raise_restore_conflict(request, active=True)
+        if since_epoch is not None and epoch != since_epoch:
+            _raise_restore_conflict(request, active=False)
+
     def _export_guard(func):
         """限制同时执行的全量导出数量：内存峰值约为备份大小的 8 倍。
 
@@ -3484,6 +3579,10 @@ def create_app(model: Any = None) -> FastAPI:
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # 恢复进行中的导出直接拒绝，且不占用导出槽位
+            _reject_export_during_restore(
+                kwargs.get("request"), kwargs.get("user_id")
+            )
             if not state.export_slots.acquire(blocking=False):
                 raise HTTPException(
                     status_code=503,
@@ -4312,6 +4411,7 @@ def create_app(model: Any = None) -> FastAPI:
         必须声明在 ``/api/sessions/{session_id}`` 之前，否则会被动态路由捕获。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
+        entry_epoch = _export_start_epoch(request, user_id)
         # strict：PG 故障期不能把回退 JSON 当「没有可导出的会话」/空备份
         store = _open_long_term(user_id, strict=True)
         try:
@@ -4322,6 +4422,8 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("读取会话失败", exc) from exc
         finally:
             _close_long_term(store)
+        # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
+        _reject_export_during_restore(request, user_id, entry_epoch)
         from utils.json_safe import sanitize_json
 
         messages = sanitize_json(messages)
@@ -4493,6 +4595,7 @@ def create_app(model: Any = None) -> FastAPI:
         （单文件内嵌样式、全部动态文本单次转义，可分享 / 打印）。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
+        entry_epoch = _export_start_epoch(request, user_id)
         # strict：同合集导出，PG 故障期不能误报「会话不存在」
         store = _open_long_term(user_id, strict=True)
         try:
@@ -4503,6 +4606,8 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("读取会话失败", exc) from exc
         finally:
             _close_long_term(store)
+        # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
+        _reject_export_during_restore(request, user_id, entry_epoch)
         from utils.json_safe import sanitize_json
 
         messages = sanitize_json(messages)
@@ -5622,6 +5727,7 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> Response:
         """导出全部历史行程为一个 iCalendar 文件。"""
         rate_headers = _enforce_read_rate_limit(state, request)
+        entry_epoch = _export_start_epoch(request, user_id)
         # strict：PostgreSQL 故障期不能把回退 JSON（可能为空 / 陈旧）当作
         # 成功数据返回 200 空日历（README 与 /api/trips/export 同口径）
         store = _open_long_term(user_id, strict=True)
@@ -5632,6 +5738,8 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("导出失败", exc) from exc
         finally:
             _close_long_term(store)
+        # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
+        _reject_export_during_restore(request, user_id, entry_epoch)
         content = render_trips_ics(trips, user_id)
         # 缺少出发日期的行程按既有语义跳过：用事件数反推跳过条数，前端
         # 据此提示，不能静默给出少行程的「全部日历」
@@ -5663,6 +5771,7 @@ def create_app(model: Any = None) -> FastAPI:
         同一渲染口径（ics 缺少出发日期的行程按既有语义跳过）。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
+        entry_epoch = _export_start_epoch(request, user_id)
         # strict：PostgreSQL 故障期不能把回退 JSON（可能为空 / 陈旧）当作
         # 成功导出（静默产出空台账），与去重 / 写入的降级语义一致
         store = _open_long_term(user_id, strict=True)
@@ -5673,6 +5782,8 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("导出失败", exc) from exc
         finally:
             _close_long_term(store)
+        # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
+        _reject_export_during_restore(request, user_id, entry_epoch)
         filtered = _filter_trips_by_status(_filter_trips_by_query(trips, q), status)
         if format == "ics":
             # 与 CLI `trips-export --ics` 同一渲染：过滤后的行程合成一个
@@ -5868,7 +5979,10 @@ def create_app(model: Any = None) -> FastAPI:
         字段），可由 ``/api/import`` 一体化恢复；``format=md`` 忽略该参数。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
+        entry_epoch = _export_start_epoch(request, user_id)
         data = _load_user_data(user_id, strict=True)
+        # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
+        _reject_export_during_restore(request, user_id, entry_epoch)
         safe_user = _safe_filename(user_id)
         from utils.exporter import sanitize_backup_data
 
@@ -5901,6 +6015,8 @@ def create_app(model: Any = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
                 logger.warning("导出知识片段失败: %s", exc)
                 raise _storage_failure("知识库导出失败", exc) from exc
+        # 知识片段同样是快照：读取期间才开始（或已结束）的恢复整份备份作废
+        _reject_export_during_restore(request, user_id, entry_epoch)
         # 历史数据可能含孤立代理项 / 非有限数、助手 JSON 文本里的 NaN、
         # 消息里的 NUL：与 CLI user-export 同一清洗（含知识片段），否则
         # 备份「看起来导出成功」却在 /api/import 恢复时被整条拒绝
@@ -6274,11 +6390,17 @@ def create_app(model: Any = None) -> FastAPI:
                                 sections,
                                 knowledge_unverified=knowledge_skip_reason,
                             )
-                        counts = import_user_data(
-                            store,
-                            sections,
-                            knowledge_unverified=knowledge_skip_reason,
-                        )
+                        # 写入前标记该用户：导出入口与读完快照时的检查都会
+                        # 拒绝并发导出，避免导出半截备份
+                        state.begin_user_import(user_id)
+                        try:
+                            counts = import_user_data(
+                                store,
+                                sections,
+                                knowledge_unverified=knowledge_skip_reason,
+                            )
+                        finally:
+                            state.end_user_import(user_id)
                         # 导入可能覆盖 / 删除偏好：清掉已建会话的 5 秒快照
                         _invalidate_preference_caches()
                         # 写库期间（大备份可能数十秒）其它实例 / CLI 可能删除
