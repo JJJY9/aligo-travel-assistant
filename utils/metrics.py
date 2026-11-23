@@ -61,6 +61,11 @@ class RequestMetrics:
         # SSE 长连接的耗时不计入延迟分位（详见 record 的 streaming 参数）；
         # 另有独立计数记录「HTTP 200 但以 error 事件收尾」的流式回合
         self._sse_errors = 0
+        # 偏好快照缓存（PostgreSQL 后端）：命中 / 未命中 / 因跨进程版本
+        # 变化而失效，进程内累计（多实例各自统计）
+        self._pref_cache_hits = 0
+        self._pref_cache_misses = 0
+        self._pref_cache_version_invalidations = 0
 
     def record(
         self,
@@ -108,6 +113,23 @@ class RequestMetrics:
         with self._lock:
             self._sse_errors += 1
 
+    def record_preference_cache(
+        self, hit: bool, *, version_changed: bool = False
+    ) -> None:
+        """记录一次偏好快照缓存读取（PostgreSQL 后端）。
+
+        ``version_changed`` 表示未命中是「快照仍在 TTL 内、因跨进程共享
+        版本变化被迫回源」——它是 misses 的子集，用于评估 Redis 版本键
+        挡下的陈旧读取（TTL 过期、版本读取失败都不计入）。
+        """
+        with self._lock:
+            if hit:
+                self._pref_cache_hits += 1
+                return
+            self._pref_cache_misses += 1
+            if version_changed:
+                self._pref_cache_version_invalidations += 1
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             total = self._total
@@ -128,6 +150,13 @@ class RequestMetrics:
                 "p95_duration_ms": round(_percentile(samples, 0.95), 2),
                 "duration_samples": len(samples),
                 "sse_errors": self._sse_errors,
+                "preference_cache": {
+                    "hits": self._pref_cache_hits,
+                    "misses": self._pref_cache_misses,
+                    "version_invalidations": (
+                        self._pref_cache_version_invalidations
+                    ),
+                },
             }
 
     def render_prometheus(self) -> str:
@@ -148,6 +177,11 @@ class RequestMetrics:
             p95_seconds = _percentile(samples, 0.95) / 1000
             sample_count = len(samples)
             sse_errors = self._sse_errors
+            pref_hits = self._pref_cache_hits
+            pref_misses = self._pref_cache_misses
+            pref_version_invalidations = (
+                self._pref_cache_version_invalidations
+            )
             uptime = time.monotonic() - self._started_at
 
         lines = [
@@ -159,6 +193,16 @@ class RequestMetrics:
             "# HELP aligo_sse_errors_total Streaming turns that ended with an error event.",
             "# TYPE aligo_sse_errors_total counter",
             f"aligo_sse_errors_total {sse_errors}",
+            "# HELP aligo_preference_cache_hits_total Preference snapshot cache hits (process).",
+            "# TYPE aligo_preference_cache_hits_total counter",
+            f"aligo_preference_cache_hits_total {pref_hits}",
+            "# HELP aligo_preference_cache_misses_total Preference snapshot cache misses (process).",
+            "# TYPE aligo_preference_cache_misses_total counter",
+            f"aligo_preference_cache_misses_total {pref_misses}",
+            "# HELP aligo_preference_cache_version_invalidations_total Misses a shared preference version change caused while the snapshot was still fresh (subset of misses).",
+            "# TYPE aligo_preference_cache_version_invalidations_total counter",
+            "aligo_preference_cache_version_invalidations_total "
+            f"{pref_version_invalidations}",
         ]
         for status, value in statuses:
             lines.append(
@@ -225,6 +269,9 @@ class RequestMetrics:
             self._durations.clear()
             self._duration_count = 0
             self._sse_errors = 0
+            self._pref_cache_hits = 0
+            self._pref_cache_misses = 0
+            self._pref_cache_version_invalidations = 0
 
 
 REQUEST_METRICS = RequestMetrics()

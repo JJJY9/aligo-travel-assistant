@@ -18,6 +18,7 @@ from config import STORAGE_CONFIG
 from utils import tombstones
 from utils.json_parser import extract_json_from_async_response
 from utils.json_safe import sanitize_json
+from utils.metrics import REQUEST_METRICS
 from utils.preference_values import has_preference_value
 from utils.timestamps import to_aware
 from utils.turn_meta import strip_turn_meta
@@ -206,19 +207,35 @@ class MemoryManager:
         """读取用户偏好（PG 后端带 5 秒快照缓存，写入时显式失效）。"""
         now = time.monotonic()
         version: str | None = None
-        if self._preference_cache_enabled():
+        cache_active = self._preference_cache_enabled()
+        if cache_active:
             # 跨进程版本优先于 TTL：其它实例 / CLI 写入后本进程下一次读取
             # 就拿到新偏好，不用等满 5 秒
             version = self._shared_preference_version(self.user_id)
             cached = self._preference_cache
-            if (
+            within_ttl = (
                 cached is not None
                 and (now - cached[0]) <= _PREFERENCE_CACHE_TTL_SEC
-                and (version is None or cached[1] == version)
-            ):
+            )
+            # 只有「TTL 内本来会命中、因版本变化被迫回源」才算版本失效：
+            # TTL 过期无论如何都要回源；版本读取失败（None）不代表任何版本
+            # 值，Redis 恢复 / 版本键过期或淘汰后的重建都不算跨进程写入
+            version_changed = (
+                cached is not None
+                and within_ttl
+                and cached[1] is not None
+                and version is not None
+                and cached[1] != version
+            )
+            if cached is not None and within_ttl and not version_changed:
+                REQUEST_METRICS.record_preference_cache(True)
                 return copy.deepcopy(cached[2])
+            # 命中率 / 版本失效计数供 /api/metrics 观测（多实例各自统计）
+            REQUEST_METRICS.record_preference_cache(
+                False, version_changed=version_changed
+            )
         preferences = self.long_term.get_preference()
-        if self._preference_cache_enabled():
+        if cache_active:
             self._preference_cache = (
                 now,
                 version,

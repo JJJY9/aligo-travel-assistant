@@ -144,6 +144,31 @@ def test_reset():
     print("✓ 重置指标")
 
 
+def test_preference_cache_metrics():
+    """偏好快照缓存命中 / 未命中 / 版本失效计数进入快照与 Prometheus。"""
+    metrics = RequestMetrics()
+    metrics.record_preference_cache(True)
+    metrics.record_preference_cache(True)
+    metrics.record_preference_cache(False)
+    metrics.record_preference_cache(False, version_changed=True)
+    assert metrics.snapshot()["preference_cache"] == {
+        "hits": 2,
+        "misses": 2,
+        "version_invalidations": 1,
+    }
+    body = metrics.render_prometheus()
+    assert "aligo_preference_cache_hits_total 2" in body
+    assert "aligo_preference_cache_misses_total 2" in body
+    assert "aligo_preference_cache_version_invalidations_total 1" in body
+    metrics.reset()
+    assert metrics.snapshot()["preference_cache"] == {
+        "hits": 0,
+        "misses": 0,
+        "version_invalidations": 0,
+    }
+    print("✓ 偏好缓存命中率指标")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -160,4 +185,5 @@ if __name__ == "__main__":
     test_prometheus_omits_duration_stats_without_samples()
     test_uptime_uses_monotonic_clock()
     test_reset()
+    test_preference_cache_metrics()
     print("\n全部通过")
