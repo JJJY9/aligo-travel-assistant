@@ -70,6 +70,17 @@ def test_key_normalization_and_clear():
     print("✓ 幂等键归一化与清空")
 
 
+def test_key_binds_endpoint_and_message():
+    """同一幂等键 + 不同消息 / 端点必须得到不同缓存键。"""
+    base = make_key("u", "s", "k", endpoint="chat", message="你好")
+    assert base == make_key("u", "s", "k", endpoint="chat", message="你好")
+    assert base != make_key("u", "s", "k", endpoint="chat", message="在吗")
+    assert base != make_key(
+        "u", "s", "k", endpoint="chat_stream", message="你好"
+    )
+    print("✓ 幂等键绑定消息与端点")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -84,4 +95,5 @@ if __name__ == "__main__":
         mp.undo()
     test_lru_eviction()
     test_key_normalization_and_clear()
+    test_key_binds_endpoint_and_message()
     print("\n全部通过")

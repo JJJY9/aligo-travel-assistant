@@ -95,9 +95,12 @@ def _cp_sat_assign(
     capacity = max(0, day_end - day_start)
     per_item = visit_min + travel_min
     for day in range(days):
+        # 当天第一项不需要通勤：k 项实际耗时 visit*k + travel*(k-1)，
+        # 即 (visit+travel)*k <= capacity + travel；旧约束少算一次通勤，
+        # 紧凑时间窗下会把可行项误判为未安排
         model.Add(
             sum(slots[item, day] * per_item for item in range(len(names)))
-            <= capacity
+            <= capacity + travel_min
         )
     model.Maximize(sum(slots.values()))
     solver = cp_model.CpSolver()

@@ -84,6 +84,24 @@ def test_judge_score_and_failure():
     print("✓ Judge 分数与故障兜底")
 
 
+def test_empty_expected_intents_still_checked():
+    """空期望意图（问候）也必须完全匹配，不能被跳过。"""
+    case = _case(
+        category="greeting",
+        expected_intents=[],
+        required_keywords=[],
+        forbidden_keywords=[],
+    )
+    wrong = evaluate_case(
+        case, {"intents": ["itinerary_planning"], "answer": ""}
+    )
+    assert wrong["passed"] is False
+    assert "意图不匹配" in " ".join(wrong["reasons"])
+    right = evaluate_case(case, {"intents": [], "answer": ""})
+    assert right["passed"] is True
+    print("✓ 空期望意图仍严格匹配")
+
+
 def test_run_eval_aggregates_and_handles_errors():
     cases = [
         _case(id="ok", required_keywords=[], forbidden_keywords=[]),
@@ -143,6 +161,7 @@ if __name__ == "__main__":
     test_evaluate_case_passes()
     test_evaluate_case_reports_reasons()
     test_judge_score_and_failure()
+    test_empty_expected_intents_still_checked()
     test_run_eval_aggregates_and_handles_errors()
     test_build_cases_covers_twelve_categories()
     test_dump_cases_jsonl_roundtrip()

@@ -142,20 +142,39 @@ def test_plan_validation_regenerates_with_reasons():
 
 
 def test_plan_validation_keeps_issues_when_repair_still_fails():
-    """修复版仍不通过时保留问题列表，不抛异常、不丢原行程。"""
+    """修复版仍不通过时保留原行程与问题列表，不能换成更差的修复版。"""
     module = _load_plan_module()
-    bad = _plan(
-        [
-            {
-                "day": 1,
-                "activities": [
-                    {"time": "09:00-12:00", "title": "西湖", "cost": 900},
-                ],
-            }
-        ],
-        estimated_budget=900,
+    bad = json.loads(
+        _plan(
+            [
+                {
+                    "day": 1,
+                    "activities": [
+                        {"time": "09:00-12:00", "title": "西湖", "cost": 900},
+                    ],
+                }
+            ],
+            estimated_budget=900,
+        )
     )
-    model = _ScriptedModel([bad, bad])
+    bad["itinerary"]["title"] = "原行程"
+    worse = json.loads(
+        _plan(
+            [
+                {
+                    "day": 1,
+                    "activities": [
+                        {"time": "12:00-13:00", "title": "雷峰塔", "cost": 900},
+                    ],
+                }
+            ],
+            estimated_budget=900,
+        )
+    )
+    worse["itinerary"]["title"] = "更差的修复版"
+    model = _ScriptedModel(
+        [json.dumps(bad, ensure_ascii=False), json.dumps(worse, ensure_ascii=False)]
+    )
     agent = module.ItineraryPlanningAgent(name="ItineraryPlanningAgent", model=model)
     out = asyncio.run(
         agent.reply(
@@ -170,8 +189,11 @@ def test_plan_validation_keeps_issues_when_repair_still_fails():
     assert result["validation"]["passed"] is False
     codes = {issue["code"] for issue in result["validation"]["issues"]}
     assert {"day_count_mismatch", "budget_exceeded", "must_see_missing"} <= codes
-    assert result["itinerary"]["daily_plans"], "原行程不能因修复失败被清空"
-    print("✓ 修复仍失败时保留问题与行程")
+    assert result["itinerary"]["title"] == "原行程", (
+        "修复版仍不通过时必须保留原行程"
+    )
+    assert "原行程" in model.prompts[1], "修复 prompt 应携带上一版行程"
+    print("✓ 修复仍失败时保留原行程与问题")
 
 
 def test_neutralize_boundaries_covers_dict_keys():

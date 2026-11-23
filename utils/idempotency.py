@@ -13,20 +13,37 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import threading
 import time
 from collections import OrderedDict
 from typing import Any
 
-IdempotencyKey = tuple[str, str, str]
+IdempotencyKey = tuple[str, str, str, str]
 
 
-def make_key(user_id: str, session_id: str, idempotency_key: str) -> IdempotencyKey:
-    """归一化幂等键：去空白、限制长度，空幂等键由调用方决定是否使用。"""
+def make_key(
+    user_id: str,
+    session_id: str,
+    idempotency_key: str,
+    *,
+    endpoint: str = "",
+    message: str = "",
+) -> IdempotencyKey:
+    """归一化幂等键：去空白、限制长度，并绑定端点与请求正文。
+
+    只按 (user, session, key) 复用会让客户端复用键但换了提问时静默回放
+    上一问的答案：新消息既不执行也不落库。请求指纹用 SHA-256 前 32 位，
+    不把完整长消息放进缓存键。
+    """
+    fingerprint = hashlib.sha256(
+        f"{endpoint}\x00{message}".encode("utf-8")
+    ).hexdigest()[:32]
     return (
         str(user_id or "").strip(),
         str(session_id or "").strip(),
         str(idempotency_key or "").strip()[:200],
+        fingerprint,
     )
 
 

@@ -82,6 +82,22 @@ def test_render_schedule_text():
     print("✓ 分配结果渲染")
 
 
+def test_tight_window_counts_travel_only_between_items():
+    """紧凑窗口下当天第一项不需要通勤：仍能安排一个必去项。"""
+    schedule = schedule_must_see(
+        ["西湖", "灵隐寺"],
+        days=1,
+        day_start=9 * 60,
+        day_end=11 * 60,
+        visit_min=120,
+        travel_min=30,
+    )
+    items = schedule["days"][0]["items"]
+    assert len(items) == 1, schedule
+    assert len(schedule["unscheduled"]) == 1, schedule
+    print("✓ 紧凑窗口按项间通勤计算容量")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -91,4 +107,5 @@ if __name__ == "__main__":
     test_unscheduled_when_capacity_insufficient()
     test_zero_days()
     test_render_schedule_text()
+    test_tight_window_counts_travel_only_between_items()
     print("\n全部通过")

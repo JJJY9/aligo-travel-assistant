@@ -4870,6 +4870,8 @@ def create_app(model: Any = None) -> FastAPI:
                     payload.user_id,
                     session.session_id,
                     payload.idempotency_key,
+                    endpoint="chat",
+                    message=payload.message,
                 )
                 if payload.idempotency_key
                 else None
@@ -5032,7 +5034,13 @@ def create_app(model: Any = None) -> FastAPI:
         # 不重新执行 Agent。检查在租约内（用户锁已持有），并发重复请求
         # 会串行，后到者命中缓存。
         idem_key = (
-            make_key(payload.user_id, session.session_id, payload.idempotency_key)
+            make_key(
+                payload.user_id,
+                session.session_id,
+                payload.idempotency_key,
+                endpoint="chat_stream",
+                message=payload.message,
+            )
             if payload.idempotency_key
             else None
         )

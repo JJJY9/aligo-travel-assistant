@@ -780,7 +780,11 @@ class MemoryManager:
         if not self.llm_model:
             return ""
         try:
-            messages = self.short_term.get_recent_context(int(max_turns))
+            # Redis 后端的 get_recent_context 会同步 LRANGE：留在事件循环
+            # 线程会冻结同进程所有 SSE 流（与长期总结读取同一约定）
+            messages = await asyncio.to_thread(
+                self.short_term.get_recent_context, int(max_turns)
+            )
         except Exception as exc:  # noqa: BLE001 - 摘要失败不阻断对话
             logger.warning("读取最近对话失败，跳过摘要: %s", exc)
             return ""
