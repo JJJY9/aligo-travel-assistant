@@ -483,6 +483,102 @@ def _select_plan_result(text: str) -> dict | None:
     return chosen
 
 
+def _plan_repair_settings() -> tuple[bool, int]:
+    """读取行程校验修复开关与最大重生成次数（配置异常按默认值）。"""
+    try:
+        from config import PLAN_CONFIG
+
+        enabled = bool(PLAN_CONFIG.get("repair_enabled", True))
+        attempts = int(PLAN_CONFIG.get("max_repair_attempts", 1) or 0)
+    except Exception:  # noqa: BLE001 - 配置不可用按默认值
+        return True, 1
+    return enabled, max(0, min(3, attempts))
+
+
+def _parse_plan_text(text: str) -> dict:
+    """把模型输出解析为行程结果对象；无法得到有效行程时抛 ValueError。
+
+    兼容：标准 JSON / 尾随文本 / Markdown 代码块 / ``{"data": {...}}``
+    包装 / 裸行程对象。具体候选选择规则见 ``_select_plan_result``。
+    """
+    if starts_with_json_array(text):
+        # 数组输出会被 robust_json_parse 截成第一个元素仍按成功返回：
+        # 必须在解析前按原始文本判定顶层结构
+        raise ValueError("行程规划结果顶层是 JSON 数组，不是行程对象")
+
+    result = None
+    try:
+        result = robust_json_parse(text, fallback=None)
+    except Exception:
+        try:
+            clean_text = text
+            if "```" in clean_text:
+                clean_text = re.sub(
+                    r"```json\s*", "", clean_text, flags=re.IGNORECASE
+                )
+                clean_text = re.sub(r"```", "", clean_text)
+            clean_text = clean_text.strip()
+            start_idx = clean_text.find("{")
+            if start_idx != -1:
+                clean_text = clean_text[start_idx:]
+                decoder = json.JSONDecoder()
+                obj, _ = decoder.raw_decode(clean_text)
+                result = obj
+            else:
+                raise ValueError("No JSON object start '{' found")
+        except Exception as decode_err:
+            raise ValueError(
+                "All JSON parsing attempts failed. "
+                f"Strategy 2 error: {decode_err}"
+            )
+
+    if not isinstance(result, dict):
+        raise ValueError(
+            "行程规划结果不是 JSON 对象"
+            f"（实际类型：{type(result).__name__}）"
+        )
+
+    # strict：末尾还有未闭合对象（截断）时抛错，不能继续沿用更早解析出的
+    # 对象（可能只是 prompt 回显示例）；候选按位置选择。
+    candidate = _select_plan_result(text)
+    if candidate is not None:
+        result = candidate
+    elif "{" in text:
+        # 扫描器解析不了但文本含 JSON 片段（如无引号键的 JSON5 示例）：
+        # 不用 robust_json_parse 的兜底结果——那可能正是回显的示例
+        raise ValueError("模型输出中未找到可用的行程结果对象")
+
+    # 模型可能把完整行程再套一层 {"data": {"itinerary": ...}}：
+    # 编排层 _merged_skill_payload 与渲染层都显式支持该形状，输出校验
+    # 必须同一口径，否则整份规划被当成缺少 itinerary 丢弃
+    if "itinerary" not in result:
+        nested = result.get("data")
+        if isinstance(nested, dict) and (
+            "itinerary" in nested
+            or any(
+                key in nested
+                for key in ("title", "daily_plans", "duration", "schedule")
+            )
+        ):
+            result = nested
+    # 模型可能省略 SKILL.md 要求的 itinerary 包装、直接返回裸行程对象：
+    # 只有带标题或每日安排时才补齐包装（可渲染的真实行程）；仅 schedule /
+    # duration 的裸对象包装后渲染为空，按解析失败处理
+    if "itinerary" not in result and (
+        _has_plan_title(result) or _is_full_plan(result)
+    ):
+        result = {"itinerary": result}
+    if "itinerary" not in result:
+        raise ValueError("行程规划结果缺少行程字段（itinerary）")
+    itinerary_value = result.get("itinerary")
+    if not isinstance(itinerary_value, dict) or not itinerary_value:
+        # 键存在但值为 null / {} / [] / 字符串：同样按解析失败处理。
+        # 只看键存在会让空 result 以 success 返回——编排 completed、
+        # 回复渲染为空、行程也不落库，用户拿不到任何提示
+        raise ValueError("行程规划结果缺少有效行程（itinerary 为空）")
+    return result
+
+
 def _format_pref_value(value) -> str:
     """偏好值可能是字符串或列表（见 LongTermMemory），统一为可读文本。
 
@@ -658,6 +754,30 @@ class ItineraryPlanningAgent(AgentBase):
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
 
+    async def _repair_plan(
+        self, base_prompt: str, issues: list[dict]
+    ) -> dict | None:
+        """带校验原因重生成一次；模型 / 解析失败返回 None（保留原行程）。"""
+        from utils.itinerary_validation import format_issues
+
+        repair_prompt = (
+            base_prompt
+            + "\n\n【上一版行程未通过校验，请修正后重新输出完整行程 JSON】\n"
+            + format_issues(issues)
+            + "\n只输出修正后的 JSON；保持用户核心需求与已确认信息不变。\n"
+        )
+        try:
+            response = await self.model(
+                [{"role": "user", "content": repair_prompt}]
+            )
+            text = await extract_json_from_async_response(response)
+            if not text or not str(text).strip():
+                return None
+            return _parse_plan_text(str(text))
+        except Exception as exc:  # noqa: BLE001 - 修复失败保留原结果
+            logger.warning("行程校验修复失败，保留原行程：%s", exc)
+            return None
+
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
         if x is None:
             # Msg.content 必须是 str 或 content block 列表（agentscope 断言）；
@@ -810,100 +930,40 @@ class ItineraryPlanningAgent(AgentBase):
                 # 层重试与熔断记账，不能伪装成一次「空规划成功」
                 raise ConnectionError("模型返回空响应")
 
-            # 数组输出会被 robust_json_parse 截成第一个元素仍按成功返回：
-            # 必须在解析前按原始文本判定顶层结构
-            if starts_with_json_array(text):
-                raise ValueError("行程规划结果顶层是 JSON 数组，不是行程对象")
+            # 解析模型输出（标准 JSON / 尾随文本 / data 包装 / 裸行程）
+            result = _parse_plan_text(text)
 
-            # 模型可能先回显 prompt 里的输出示例 / 片段再给正式结果：解析完成
-            # 后统一改取「最后一个行程形状的对象」。即使只有一个完整对象，
-            # 也要检查末尾是否还有被截断的正式结果（strict 会抛错），否则
-            # 回显的示例行程会被当成本次规划结果
+            # v2.0 行程校验：从用户需求与事项收集结果提取约束，做五项
+            # 确定性检查（天数 / 时间冲突 / 预算 / 必去项 / 费用复核）；
+            # 未通过时带原因重生成，仍失败则保留问题列表随结果返回
+            from utils.itinerary_validation import (
+                extract_requirements,
+                validate_itinerary,
+            )
 
-            # 解析结果
-            result = None
-            
-            # 策略1: 尝试标准解析 (依赖 robust_json_parse 的清洗能力)
-            try:
-                result = robust_json_parse(text, fallback=None)
-            except Exception:
-                # 策略2: 使用 raw_decode 解析前缀 JSON (最强力，能忽略尾随文本如 Thinking)
-                try:
-                    # 再次清理 Markdown (以防 extract_json_from_async_response 漏网)
-                    clean_text = text
-                    if "```" in clean_text:
-                        import re
-                        clean_text = re.sub(r'```json\s*', '', clean_text, flags=re.IGNORECASE)
-                        clean_text = re.sub(r'```', '', clean_text)
-                    
-                    clean_text = clean_text.strip()
-                    start_idx = clean_text.find('{')
-                    
-                    if start_idx != -1:
-                        # 从第一个 { 开始尝试解析
-                        clean_text = clean_text[start_idx:]
-                        decoder = json.JSONDecoder()
-                        obj, _ = decoder.raw_decode(clean_text)
-                        result = obj
-                    else:
-                        raise ValueError("No JSON object start '{' found")
-                except Exception as decode_err:
-                    # 如果策略2也失败，抛出包含详细信息的异常
-                    raise ValueError(f"All JSON parsing attempts failed. Strategy 2 error: {decode_err}")
-
-            if not isinstance(result, dict):
-                # 数组 / 标量输出（robust_json_parse 会把数组截成第一个
-                # 元素）不是行程对象：必须按解析失败处理，不能当成功返回
-                raise ValueError(
-                    "行程规划结果不是 JSON 对象"
-                    f"（实际类型：{type(result).__name__}）"
-                )
-
-            # strict：末尾还有未闭合对象（截断）时抛错，不能继续沿用更早
-            # 解析出的对象（可能只是 prompt 回显示例）。候选按位置选择：
-            # 完整行程 / 后置的有标题裸行程；尾注里的 {"duration": ...,
-            # "note": ...} 不能顶掉完整行程
-            candidate = _select_plan_result(text)
-            if candidate is not None:
-                result = candidate
-            elif "{" in text:
-                # 扫描器解析不了但文本含 JSON 片段（如无引号键的 JSON5
-                # 示例）：不用 robust_json_parse 的兜底结果——那可能
-                # 正是回显的示例
-                raise ValueError("模型输出中未找到可用的行程结果对象")
-
-            # 模型可能把完整行程再套一层 {"data": {"itinerary": ...}}：
-            # 编排层 _merged_skill_payload 与渲染层都显式支持该形状，输出
-            # 校验必须同一口径，否则整份规划被当成缺少 itinerary 丢弃
-            if "itinerary" not in result:
-                nested = result.get("data")
-                if isinstance(nested, dict) and (
-                    "itinerary" in nested
-                    or any(
-                        key in nested
-                        for key in ("title", "daily_plans", "duration", "schedule")
+            event_data = all_info.get("event_collection")
+            if not isinstance(event_data, dict):
+                event_data = context_info.get("event_data")
+            plan_requirements = extract_requirements(user_query, event_data)
+            plan_issues = validate_itinerary(
+                result.get("itinerary"), plan_requirements
+            )
+            repair_enabled, repair_attempts = _plan_repair_settings()
+            if plan_issues and repair_enabled:
+                for _attempt in range(repair_attempts):
+                    repaired = await self._repair_plan(prompt, plan_issues)
+                    if repaired is None:
+                        break
+                    result = repaired
+                    plan_issues = validate_itinerary(
+                        result.get("itinerary"), plan_requirements
                     )
-                ):
-                    result = nested
-            # 模型可能省略 SKILL.md 要求的 itinerary 包装、直接返回裸行程
-            # 对象：只有带标题或每日安排时才补齐包装（可渲染的真实行程）；
-            # 仅 schedule / duration 的裸对象包装后渲染为空，按解析失败处理
-            if "itinerary" not in result and (
-                _has_plan_title(result)
-                or _is_full_plan(result)
-            ):
-                result = {"itinerary": result}
-            if "itinerary" not in result:
-                # 可解析但不是行程形状（{"route": ...} / {"status": "ok"} 等）：
-                # 按成功返回会让编排状态 completed、渲染为空，用户既没有
-                # 行程也没有错误提示——按解析失败处理
-                raise ValueError("行程规划结果缺少行程字段（itinerary）")
-            itinerary_value = result.get("itinerary")
-            if not isinstance(itinerary_value, dict) or not itinerary_value:
-                # 键存在但值为 null / {} / [] / 字符串：同样按解析失败处理。
-                # 只看键存在会让空 result 以 success 返回——编排 completed、
-                # 回复渲染为空、行程也不落库，用户拿不到任何提示
-                raise ValueError("行程规划结果缺少有效行程（itinerary 为空）")
+                    if not plan_issues:
+                        break
+            result["validation"] = {
+                "passed": not plan_issues,
+                "issues": plan_issues,
+            }
 
         except Exception as e:
             if is_retriable_error(e) or is_permanent_llm_error(e):

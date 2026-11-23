@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- 行程约束校验（v2.0）：行程规划输出后做五项确定性检查——天数与要求一致、每日活动时间不重叠 / 区间合法、预计费用不超预算、必去项出现在行程中、分项费用与申报总额一致（±20%）且单笔费用在合理范围。需求侧自动提取预算（元 / 万元）、必去项（支持「西湖和灵隐寺」拆分）与天数；未通过时把问题码与原因回填 prompt 重生成（`PLAN_REPAIR_ENABLED` 默认开、`PLAN_REPAIR_ATTEMPTS` 默认 1 次，上限 3），仍失败则保留原行程并随结果返回 `validation`（`passed` / `issues`），不阻断对话。新增 `utils/itinerary_validation.py` 与单元、集成测试
 - 混合检索（v2.0）：知识问答在向量召回之外并行 BM25（中文按字符二元组切词，无需分词器），按 RRF 融合两路候选后取 Top-K；`RAG_RERANK_MODEL` 配置后对候选做 cross-encoder 精排（默认关闭）。BM25 索引按知识库在进程内缓存（`RAG_BM25_TTL_SEC`，知识写入即失效），片段数超过 `RAG_BM25_MAX_DOCS` 时自动退回纯向量；索引构建 / 重排失败均不阻断问答。管理 / 评测接口保持纯向量口径，`search_knowledge(..., hybrid=True)` 仅由聊天问答路径启用；新增 `utils/hybrid_retrieval.py`（BM25 / RRF / 混合相关性标注）与对应单元、集成测试
 - CLI `pref-set --json-value`：按 JSON 解析偏好值，可写入列表（`'["汉庭","如家"]'`）/ 数字 / 布尔等带类型值（默认仍是字符串；序列化上限 10000 字符与 Web PUT 一致，非法 JSON / null / 超长值拒绝）
 - 行程去重（Web 面板）：记忆面板「清理重复」按钮与 `POST /api/trips/dedupe`（默认 `dry_run=1` 只预览；确认后按「同路线 + 同起止日期」保留最早一条、删除其余；同 id 多行程只提示不自动处理；判定 / 复核 / 删除与 CLI `trips-dedupe` 共用 `utils.trip_dedupe`，两条入口不再漂移）
