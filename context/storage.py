@@ -195,6 +195,16 @@ def note_pref_version_failure(exc: BaseException) -> None:
     note_redis_operation_failure(exc)
 
 
+def note_pref_version_success() -> None:
+    """偏好版本操作成功：复位 Redis 可用性标记（健康接口口径）。"""
+    try:
+        from context.short_term_memory import note_redis_operation_success
+
+        note_redis_operation_success()
+    except Exception:  # noqa: BLE001 - 标记失败不影响主流程
+        pass
+
+
 def reset_pref_version_failure() -> None:
     """清空偏好版本冷却（测试隔离 / 配置热更新）。"""
     global _pref_version_failed_until

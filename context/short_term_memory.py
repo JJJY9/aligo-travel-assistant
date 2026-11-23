@@ -103,6 +103,18 @@ def note_redis_operation_failure(exc: BaseException) -> None:
     _redis_degraded_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SEC
 
 
+def note_redis_operation_success() -> None:
+    """记录一次不在 ``_call_redis`` 内的真实 Redis 操作成功。
+
+    与 :func:`note_redis_operation_failure` 对称：偏好版本键 / 天气共享
+    缓存等操作成功后也要复位可用性标志，否则一次瞬时故障会让
+    ``/api/health`` 在没有对话流量时一直报 ``short_term_degraded``。
+    """
+    global _redis_available, _redis_degraded_until
+    _redis_available = True
+    _redis_degraded_until = 0.0
+
+
 def session_key(session_id: str, user_id: str = "") -> str:
     """Redis 中一个会话对应的键名。
 

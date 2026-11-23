@@ -140,6 +140,10 @@ class ConversationRuntime:
         # 名额会一直占到 recovery_timeout 之后，期间其它用户全部被拒绝；
         # finally 中归还（记录过成功 / 失败时 release_probe 不产生效果）
         self._probe_recorded = False
+        # 本请求的回合序号在熔断探针之前推进：ask() 可能在 raise_if_open /
+        # 探测名额竞争上直接失败、从未进入 _execute_turn——此时也不能把
+        # 上一轮同文本的成功当成本请求已落库（turn_persisted 的序号校验）
+        self._turn_seq = getattr(self, "_turn_seq", 0) + 1
         if self.circuit_breaker:
             self.circuit_breaker.raise_if_open()
         # 本轮用量的归宿标记：_execute_turn 在每个终态（成功落库 / 记账 /

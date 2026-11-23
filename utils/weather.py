@@ -232,6 +232,16 @@ def _note_shared_cache_failure(exc: BaseException) -> None:
         pass
 
 
+def _note_shared_cache_success() -> None:
+    """成功操作复位 Redis 可用性标记：故障标记不能在没有对话流量时永挂。"""
+    try:
+        from context.short_term_memory import note_redis_operation_success
+
+        note_redis_operation_success()
+    except Exception:  # noqa: BLE001 - 健康标记失败不影响主流程
+        pass
+
+
 def _shared_cache_key(name: str) -> str:
     return f"aligo:weather:{name}"
 
@@ -271,6 +281,7 @@ def _shared_cache_get(name: str) -> tuple[float, dict[str, Any]] | None:
     except Exception as exc:  # noqa: BLE001 - Redis 故障退回进程内缓存
         _note_shared_cache_failure(exc)
         return None
+    _note_shared_cache_success()
     if raw is None:
         return None
     try:
@@ -308,6 +319,8 @@ def _shared_cache_set(name: str, result: dict[str, Any]) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - 缓存写失败不影响主流程
         _note_shared_cache_failure(exc)
+    else:
+        _note_shared_cache_success()
 
 
 def _describe(code: Any) -> str:
@@ -387,19 +400,11 @@ def _fill_from_shared(
 ) -> dict[str, Any]:
     """把共享条目回填进程内缓存，新鲜度锚点按真实抓取时刻。
 
-    并发下本地线程可能刚抓到更新的数据：只在不会覆盖更新的本地条目时
-    写入，并返回实际生效的数据（回填的旧快照不能盖掉本地新结果）。
+    回填同样受进程内缓存上限与过期清理约束（统一走 `_store_cache`），
+    且不覆盖更新的本地结果——返回实际生效的数据。
     """
     stamp = time.monotonic() - max(0.0, age_sec)
-    with _cache_lock:
-        existing = _cache.get(name)
-        if existing is not None and existing[0] >= stamp:
-            return existing[1]
-        _cache[name] = (stamp, payload)
-        _failures.pop(name, None)
-        # 新鲜数据到达后，短窗内的降级复用立即失效
-        _degraded.pop(name, None)
-        return payload
+    return _store_cache(name, payload, share=False, stamp=stamp)
 
 
 def _claim_fetch(name: str) -> tuple[bool, threading.Event]:
@@ -420,22 +425,40 @@ def _finish_fetch(name: str, event: threading.Event) -> None:
     event.set()
 
 
-def _store_cache(name: str, result: dict[str, Any]) -> None:
-    """写入成功缓存：顺带清掉过期条目，并按上限淘汰最旧的一条。"""
+def _store_cache(
+    name: str,
+    result: dict[str, Any],
+    *,
+    share: bool = True,
+    stamp: float | None = None,
+) -> dict[str, Any]:
+    """写入成功缓存：清过期、按上限淘汰，返回实际生效的结果。
+
+    ``stamp`` 用于共享缓存回填（按真实抓取时刻设置新鲜度锚点，且不覆盖
+    更新的本地条目）；``share=False`` 不回写共享缓存（避免读取续期）。
+    """
     now = time.monotonic()
     keep_sec = max(CACHE_TTL_SEC, STALE_TTL_SEC)
+    entry_stamp = now if stamp is None else max(0.0, min(now, stamp))
     with _cache_lock:
+        if stamp is not None:
+            existing = _cache.get(name)
+            if existing is not None and existing[0] >= entry_stamp:
+                # 回填的旧快照不能盖掉本地更新的结果
+                return existing[1]
         expired = [key for key, (at, _) in _cache.items() if now - at >= keep_sec]
         for key in expired:
             del _cache[key]
         if name not in _cache and len(_cache) >= _CACHE_MAX_ENTRIES:
             oldest = min(_cache, key=lambda key: _cache[key][0])
             del _cache[oldest]
-        _cache[name] = (now, result)
+        _cache[name] = (entry_stamp, result)
         _failures.pop(name, None)
         # 新鲜数据到达后，短窗内的降级复用立即失效
         _degraded.pop(name, None)
-    _shared_cache_set(name, result)
+    if share:
+        _shared_cache_set(name, result)
+    return result
 
 
 def _stale_entry(key: str) -> tuple[float, dict[str, Any]] | None:

@@ -69,6 +69,17 @@ def test_truncate_turn_id_mismatch_keeps_history():
     print("✓ 回合 id 不一致时保留历史")
 
 
+def test_note_redis_operation_success_resets_availability():
+    """成功操作复位 Redis 可用性标记（天气 / 偏好版本路径与失败标记对称）。"""
+    from context import short_term_memory as module
+
+    module.note_redis_operation_failure(ConnectionError("down"))
+    assert module.redis_short_term_available() is False
+    module.note_redis_operation_success()
+    assert module.redis_short_term_available() is True
+    print("✓ Redis 成功操作复位可用性标记")
+
+
 def test_truncate_turn_id_falls_back_without_metadata():
     """消息没有回合 id（回填 / 旧数据）时退回内容匹配，不能因缺 id 拒删。"""
     memory = ShortTermMemory()

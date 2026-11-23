@@ -184,6 +184,7 @@ class MemoryManager:
         try:
             from context.storage import (
                 note_pref_version_failure,
+                note_pref_version_success,
                 pref_version_client,
             )
         except Exception:  # noqa: BLE001 - 存储模块不可用时退回 TTL
@@ -197,6 +198,9 @@ class MemoryManager:
             # 操作级冷却：故障期不再让每次读取都等满 socket 超时
             note_pref_version_failure(exc)
             return None
+        # 成功读取复位 Redis 可用性标记：天气 / 偏好版本等新路径也会置
+        # 降级，若成功后不复位，健康接口会在无对话流量时一直误报降级
+        note_pref_version_success()
         if raw is None:
             return "0"
         if isinstance(raw, bytes):

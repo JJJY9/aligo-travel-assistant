@@ -562,6 +562,7 @@ class PostgresLongTermMemory:
         try:
             from context.storage import (
                 note_pref_version_failure,
+                note_pref_version_success,
                 pref_version_client,
             )
         except Exception:  # noqa: BLE001 - 存储模块不可用时放弃推进
@@ -581,6 +582,9 @@ class PostgresLongTermMemory:
             logger.debug(
                 "推进偏好版本失败（%s）", self.user_id, exc_info=True
             )
+        else:
+            # 成功推进同样复位 Redis 可用性标记（与失败标记对称）
+            note_pref_version_success()
 
     def save_preference(
         self,

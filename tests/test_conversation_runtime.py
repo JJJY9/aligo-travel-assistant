@@ -856,6 +856,30 @@ def test_deferred_commit_forwards_epoch():
     print("✓ 延迟记忆纪元按编排器能力传递")
 
 
+def test_turn_persisted_false_when_probe_fails_before_turn():
+    """熔断探针在 _execute_turn 之前失败：同文本上一轮的成功不能算到本请求。"""
+    runtime, _ = _make_runtime()
+
+    class _DenyBreaker:
+        def raise_if_open(self):
+            raise RuntimeError("circuit open")
+
+        def release_probe(self):
+            return None
+
+    runtime.circuit_breaker = _DenyBreaker()
+    runtime._turn_seq = 1
+    runtime._last_persist_turn = (
+        "你好",
+        {"rollback_requested": False, "persisted": True, "seq": 1},
+    )
+    with pytest.raises(RuntimeError, match="circuit open"):
+        asyncio.run(runtime.ask("你好"))
+    # 本请求从未进入 _execute_turn：序号已推进，不能复用上一轮的状态
+    assert runtime.turn_persisted("你好") is False
+    print("✓ 探针失败时不误用上一轮落库状态")
+
+
 def test_rollback_carries_turn_id():
     """暂存与回滚都携带回合 id：跨实例同文本提问不会被误删。"""
     runtime, memory = _make_runtime()
@@ -1732,6 +1756,7 @@ if __name__ == "__main__":
     test_rollback_failure_does_not_mask_original_error()
     test_rollback_carries_turn_id()
     test_late_persist_callback_cannot_poison_current_turn()
+    test_turn_persisted_false_when_probe_fails_before_turn()
     test_deferred_commit_forwards_epoch()
     test_memory_without_rollback_hook_is_tolerated()
     test_cancel_during_deferred_commit_does_not_double_usage()
