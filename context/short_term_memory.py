@@ -332,8 +332,8 @@ end
 return #stale
 """
 
-# 幂等追加消息：以 op_id 在 applied 集合中记账，与 RPUSH 在同一脚本里原子
-# 完成。故障期重放时同一条消息（同 op_id）不会重复追加；而只按消息列表
+# 幂等追加消息：以 op_id 在 applied 集合中记账，与时间序插入在同一脚本里
+# 原子完成。故障期重放时同一条消息（同 op_id）不会重复追加；而只按消息列表
 # 去重无法区分「已追加但被新消息挤出窗口」与「从未写入」——前者应跳过，
 # 后者必须补写，靠窗口内容判断会静默丢消息。
 # seen 集合按「角色 + 内容 + 时间戳」指纹去重：另一实例的回填 / 重放已写入
@@ -346,6 +346,54 @@ local seen = KEYS[3]
 local window = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local pushed = 0
+
+-- 时间序插入（v2.0）：回填 / 重放的历史消息必须按 timestamp 放到对应
+-- 位置。无条件 RPUSH 会把更旧的消息放到窗口尾部，LTRIM 随后把真实的
+-- 最近轮次挤出窗口。时间戳缺失 / 无法解析时退回 RPUSH（宁可乱序不丢消息）。
+local function timestamp_key(value)
+  if type(value) ~= 'string' or #value < 10 then
+    return ''
+  end
+  return string.sub(value, 1, 19)
+end
+
+local function insert_payload(payload)
+  local ok, msg = pcall(cjson.decode, payload)
+  local new_ts = ''
+  if ok and type(msg) == 'table' then
+    new_ts = timestamp_key(msg['timestamp'])
+  end
+  if new_ts == '' then
+    redis.call('RPUSH', key, payload)
+    return
+  end
+  local n = redis.call('LLEN', key)
+  local insert_after = -1
+  for index = n - 1, 0, -1 do
+    local raw = redis.call('LINDEX', key, index)
+    local ok_old, old = pcall(cjson.decode, raw)
+    local old_ts = ''
+    if ok_old and type(old) == 'table' then
+      old_ts = timestamp_key(old['timestamp'])
+    end
+    if old_ts == '' then
+      -- 旧条目没有可比时间戳：无法安全越过它，退回追加
+      redis.call('RPUSH', key, payload)
+      return
+    end
+    if old_ts <= new_ts then
+      insert_after = index
+      break
+    end
+  end
+  if insert_after >= 0 then
+    local anchor = redis.call('LINDEX', key, insert_after)
+    redis.call('LINSERT', key, 'AFTER', anchor, payload)
+  else
+    redis.call('LPUSH', key, payload)
+  end
+end
+
 for i = 3, #ARGV, 3 do
   local op_id = ARGV[i]
   local content_hash = ARGV[i + 1]
@@ -356,10 +404,10 @@ for i = 3, #ARGV, 3 do
     skip = true
   end
   if not skip then
-    -- 先 RPUSH 再登记：脚本不回滚，若先 SADD 后 RPUSH 失败（WRONGTYPE /
+    -- 先插入再登记：脚本不回滚，若先 SADD 后插入失败（WRONGTYPE /
     -- 内存不足），op_id 已被当作「已追加」写入 applied，恢复重放会永久
-    -- 跳过这条消息。RPUSH 出错时脚本中断，op_id 不落 applied，重放可补写。
-    redis.call('RPUSH', key, payload)
+    -- 跳过这条消息。插入出错时脚本中断，op_id 不落 applied，重放可补写。
+    insert_payload(payload)
     redis.call('SADD', applied, op_id)
     if content_hash ~= '' then
       redis.call('SADD', seen, content_hash)

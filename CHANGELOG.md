@@ -62,6 +62,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 短期记忆重放时间序：`_ADD_MESSAGES_LUA` 不再无条件 RPUSH——按消息 timestamp 插入对应位置（缺失 / 无法解析退回追加）；回填 / 重放更旧历史时不再把最近轮次挤出窗口。新增 fakeredis[lua] 真实 Lua 回归（窗口满回填、夹层插入、实时追加、缺时间戳、op_id 去重），CI 测试依赖同步加入 `fakeredis[lua]==2.40.0`
 - 前端切换会话后误清历史：`done(persisted=false)` 会置 `retiredThreadVisible`，用户随后打开另一个会话时该标记未复位，下一次发送会清空刚加载的历史；现在打开会话成功即复位，并新增 node harness 场景（deletedThreadSend 后 openSession）
 - 知识切分表格正文识别：多行短块里的金额 / 分栏 / Markdown 表格行（如「北京 500元」「| 北京 | 500元 |」）不再被当成纯标题块并入下一章节（此前住宿标准表格会被挂到交通标准，产出混主题向量）。新增表格 / 分栏短行回归用例
 - 配置环境变量与检索元数据健壮性：`_env_int` / `_env_bool` / `LLM_API_KEY` / `config_local` 统一剥离文件注入的成对引号（此前引号导致数值 / 布尔静默回退默认值、密钥带引号鉴权失败）；RAG 分片元数据的 `part` / `parts` 为 Infinity 时捕获 OverflowError（此前整份检索结果抛异常）。补引号 + BOM 混合与 Infinity 元数据回归
