@@ -5811,11 +5811,19 @@ def create_app(model: Any = None) -> FastAPI:
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
         from utils.user_import import backup_limit_problem
+        from utils.user_import import knowledge_rows_for_volume_check
 
-        # Web 响应体是 LF（Starlette 原样编码，浏览器下载也不转换）：
-        # 按平台 CRLF 估算会每行多算 1 字节，把 49.x MB 的合法备份误判
-        # 超过 50 MB（CLI 导出确实写 CRLF，保持默认口径）
-        limit_problem = backup_limit_problem(backup, crlf=False)
+        # 导出体积与导入端同一口径：长文档会被 import_documents 重切成
+        # 多片，按原始行估算会产出「导出成功、导入却超知识体积」的备份
+        check_backup = backup
+        if with_knowledge and isinstance(backup.get("knowledge"), list):
+            check_backup = {
+                **backup,
+                "knowledge": knowledge_rows_for_volume_check(
+                    backup["knowledge"]
+                ),
+            }
+        limit_problem = backup_limit_problem(check_backup, crlf=False)
         if limit_problem:
             raise HTTPException(
                 status_code=413,

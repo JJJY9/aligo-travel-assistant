@@ -5777,6 +5777,62 @@ def test_api_export_cleans_dirty_backup():
     print("✓ /api/export 备份清洗脏数据后可恢复")
 
 
+def test_export_with_knowledge_uses_import_chunk_plan(monkeypatch):
+    """知识段体积按导入重切分后的分片估算，避免导出成功但导入超限。"""
+    from context.storage import create_long_term_memory
+    from utils import knowledge_admin, user_import
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_export_kb_plan")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("你好", "你好呀", "sess-export-kb")
+        monkeypatch.setattr(
+            server_module,
+            "export_documents",
+            lambda: [{"content": "原始长文档", "metadata": {}}],
+        )
+        monkeypatch.setattr(
+            knowledge_admin,
+            "import_documents",
+            lambda rows, dry_run=False, return_pieces=False: {
+                "pieces": [{"content": "x" * 100}] * 10
+            },
+        )
+        monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", 500)
+        response = client.get(
+            "/api/export",
+            params={"user_id": user_id, "with_knowledge": 1},
+        )
+        assert response.status_code == 413, response.text
+        raw_problem = user_import.backup_limit_problem(
+            {
+                "chat_history": [],
+                "knowledge": [{"content": "原始长文档", "metadata": {}}],
+            },
+            crlf=False,
+        )
+        assert raw_problem is None, raw_problem
+    finally:
+        _cleanup(user_id)
+    print("✓ with_knowledge 导出按导入分片计划估算体积")
+
+
+def test_knowledge_volume_rows_falls_back_on_planning_error(monkeypatch):
+    """知识库规划失败时导出校验退回原始行（不阻断导出）。"""
+    from utils import knowledge_admin, user_import
+
+    rows = [{"content": "原始行", "metadata": {}}]
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("kb down")
+
+    monkeypatch.setattr(knowledge_admin, "import_documents", boom)
+    assert user_import.knowledge_rows_for_volume_check(rows) == rows
+    print("✓ 知识规划失败时体积校验退回原始行")
+
+
 def test_session_detail_tolerates_deep_meta():
     """旧数据 _meta 嵌套数千层：会话详情 / 状态接口不能递归过深而 500。"""
     user_id = _unique_user("web_test_deep_meta")
