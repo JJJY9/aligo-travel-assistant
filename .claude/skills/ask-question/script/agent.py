@@ -775,7 +775,16 @@ class RAGKnowledgeAgent(AgentBase):
             fused,
             vector_scores,
             bm25_scores,
-            bm25_reference=index.query_reference(query),
+            # 按每篇文档自身长度归一（覆盖度 × TF 饱和、长度中性）：平均
+            # 长度基准会把覆盖全部关键词的长片段压到阈值以下（评分倒挂），
+            # 也会让只命中个别常见词的短片段过线
+            bm25_normalized={
+                str(doc.get("id") or ""): index.normalized_score(
+                    query, doc.get("content")
+                )
+                for doc in fused
+                if str(doc.get("id") or "") in bm25_scores
+            },
         )
         fused = self._rerank_documents(query, fused)
         return fused[:top_k]

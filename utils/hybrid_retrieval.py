@@ -87,11 +87,14 @@ class BM25Index:
         query_tokens = tokenize(query)
         if not query_tokens or not self.documents or top_k <= 0:
             return []
+        # 二元查询词去重：重复词不能把 BM25 分翻倍（归一化基准按唯一查询
+        # 词计，重复累计会让弱命中被截断成 1.0 绕过 min_score）
+        unique_tokens = list(dict.fromkeys(query_tokens))
         scores: list[float] = []
         for index, tf in enumerate(self._tf):
             doc_len = self._doc_len[index]
             score = 0.0
-            for term in query_tokens:
+            for term in unique_tokens:
                 freq = tf.get(term)
                 if not freq:
                     continue
@@ -115,15 +118,71 @@ class BM25Index:
             results.append((self.documents[index], scores[index]))
         return results
 
-    def query_reference(self, query: object) -> float:
-        """归一化基准：覆盖全部查询词、长度取平均的理想片段得分。
+    def _unseen_idf(self) -> float:
+        """查询里未出现在索引的词按 df=0 计 IDF（即最少见词的得分）。
 
-        取查询词 IDF 之和（文档平均长度下每个词一次的 BM25 贡献恰为
-        ``idf``）。用「本次结果的最高分」归一化会让任何查询的 top-1 都
-        变成 1.0，弱关键词命中也绕过 ``min_score``；按查询覆盖面归一化
-        后，只命中少量常见词的片段分数自然低于阈值。
+        只在分子里命中「在库词」、基准却只累加在库词，会让内容词全部
+        OOV 的查询基准坍缩为唯一在库的疑问词（如「怎么办」）：命中该词
+        的片段归一后接近 1.0，绕过 ``min_score`` 把无关问题当有证据。
         """
-        return sum(self._idf.get(term, 0.0) for term in set(tokenize(query)))
+        total = len(self.documents)
+        if total <= 0:
+            return 0.0
+        return math.log(1.0 + (total + 0.5) / 0.5)
+
+    def _query_idf_terms(self, query: object) -> list[tuple[str, float]]:
+        """唯一查询词及其 IDF（OOV 按 df=0 的 IDF 计入）。"""
+        unseen = self._unseen_idf()
+        return [
+            (term, self._idf.get(term, unseen))
+            for term in set(tokenize(query))
+        ]
+
+    def query_reference(self, query: object) -> float:
+        """归一化基准：平均长度下覆盖全部查询词的理想 BM25 得分。
+
+        未出现在索引的查询词按 df=0 的 IDF 计入（不贡献分子、只抬高
+        基准）：内容词全部 OOV 时，命中唯一在库疑问词的片段归一后仍低于
+        ``min_score``。旧调用方沿用它即可；聊天链路使用按文档长度计的更
+        精确口径（:meth:`normalized_score`）。
+        """
+        return sum(idf for _, idf in self._query_idf_terms(query))
+
+    def normalization_reference(self, query: object, doc_len: int) -> float:
+        """指定文档长度下覆盖全部查询词（各一次）的 BM25 满分。
+
+        长度因子按文档自身长度计：长片段覆盖全部查询词也能到 1.0，
+        短片段只覆盖部分查询词不会因长度被抬到阈值以上。
+        """
+        if not self.documents or self._avgdl <= 0:
+            return 0.0
+        norm = 1.0 - self.b + self.b * doc_len / self._avgdl
+        saturation = (self.k1 + 1.0) / (1.0 + self.k1 * norm)
+        return sum(idf for _, idf in self._query_idf_terms(query)) * saturation
+
+    def normalized_score(self, query: object, content: object) -> float:
+        """单篇内容的归一化 BM25（0–1，覆盖度 × TF 饱和，长度中性）。
+
+        分子按该文档自身长度饱和、分母取同长度下「覆盖全部查询词」的
+        满分：覆盖度按查询词 IDF 质量计，长片段不会因长度惩罚被误拒，
+        短片段也不会仅凭命中个别常见词就拿到高分。
+        """
+        tokens = tokenize(content)
+        if not tokens or not self.documents or self._avgdl <= 0:
+            return 0.0
+        doc_len = len(tokens)
+        norm = 1.0 - self.b + self.b * doc_len / self._avgdl
+        tf = Counter(tokens)
+        score = 0.0
+        for term, idf in self._query_idf_terms(query):
+            freq = tf.get(term)
+            if not freq:
+                continue
+            score += idf * freq * (self.k1 + 1.0) / (freq + self.k1 * norm)
+        reference = self.normalization_reference(query, doc_len)
+        if reference <= 0:
+            return 0.0
+        return min(1.0, score / reference)
 
 
 def rrf_fuse(
@@ -159,6 +218,7 @@ def annotate_hybrid_scores(
     bm25_scores: dict[str, float],
     *,
     bm25_reference: float | None = None,
+    bm25_normalized: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """为融合结果写入可解释分数，并生成用于阈值过滤的 ``distance``。
 
@@ -166,22 +226,32 @@ def annotate_hybrid_scores(
     ``min_score`` 的「0–1、越高越相关」语义，又让只在关键词路命中
     （向量分低）的片段有机会通过阈值。
 
-    ``bm25_reference`` 应传 ``BM25Index.query_reference(query)``（查询词
-    IDF 之和）。缺省退回「本次最高 BM25 分」的旧口径：top-1 永远是
-    1.0，弱命中也会绕过阈值，仅为兼容旧调用方保留。
+    归一化口径优先用 ``bm25_normalized``（每篇按自身长度计算的
+    ``BM25Index.normalized_score``：覆盖度 × TF 饱和、长度中性）。兼容
+    传入 ``bm25_reference`` 的旧口径（平均长度理想得分，长片段会因长度
+    惩罚被压低）；两者都缺省时退回「本次最高 BM25 分」——top-1 永远
+    是 1.0，仅为兼容旧调用方保留。
     """
-    if bm25_reference is not None and bm25_reference > 0:
-        reference = float(bm25_reference)
+    if bm25_normalized is None:
+        if bm25_reference is not None and bm25_reference > 0:
+            reference = float(bm25_reference)
+        else:
+            reference = max(bm25_scores.values(), default=0.0)
     else:
-        reference = max(bm25_scores.values(), default=0.0)
+        reference = 0.0
     annotated: list[dict[str, Any]] = []
     for doc in fused_documents:
         key = str(doc.get("id") or "")
         vector_score = float(vector_distances.get(key, 0.0) or 0.0)
         bm25_score = float(bm25_scores.get(key, 0.0) or 0.0)
-        normalized = (
-            min(1.0, bm25_score / reference) if reference > 0 else 0.0
-        )
+        if bm25_normalized is not None:
+            normalized = min(
+                1.0, max(0.0, float(bm25_normalized.get(key, 0.0) or 0.0))
+            )
+        elif reference > 0:
+            normalized = min(1.0, bm25_score / reference)
+        else:
+            normalized = 0.0
         annotated.append(
             {
                 **doc,
