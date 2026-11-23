@@ -748,7 +748,12 @@ class ConversationRuntime:
 
     def _memory_snapshot(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """同步读取记忆快照（偏好 + 最近对话），供 ``asyncio.to_thread`` 调用。"""
-        preferences = self.memory.long_term.get_preference()
+        get_preferences = getattr(self.memory, "get_preferences", None)
+        preferences = (
+            get_preferences()
+            if callable(get_preferences)
+            else self.memory.long_term.get_preference()
+        )
         recent = list(self.memory.short_term.get_recent_context(n_turns=5))
         if not recent:
             # 进程重启 / 会话被 LRU 淘汰后短期记忆为空，而长期总结又排除了

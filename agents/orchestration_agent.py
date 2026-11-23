@@ -670,8 +670,15 @@ class OrchestrationAgent(AgentBase):
                 "",
             )
 
-            # 长期记忆：用户偏好
-            preferences = self.memory_manager.long_term.get_preference()
+            # 长期记忆：用户偏好（PG 后端走 5 秒快照缓存，写入时失效）
+            get_preferences = getattr(
+                self.memory_manager, "get_preferences", None
+            )
+            preferences = (
+                get_preferences()
+                if callable(get_preferences)
+                else self.memory_manager.long_term.get_preference()
+            )
             context["user_preferences"] = preferences
 
         return context
@@ -1219,6 +1226,14 @@ class OrchestrationAgent(AgentBase):
         merged.update({key: value for key, value in data.items() if key != "data"})
         return merged
 
+    def _invalidate_preference_cache(self) -> None:
+        """偏好写入后失效 MemoryManager 的快照缓存（自定义记忆实现可无此方法）。"""
+        invalidate = getattr(
+            self.memory_manager, "invalidate_preference_cache", None
+        )
+        if callable(invalidate):
+            invalidate()
+
     def _apply_single_preference(
         self, pref_type: str, pref_value: Any, pref_action: str
     ) -> None:
@@ -1233,6 +1248,7 @@ class OrchestrationAgent(AgentBase):
                 # 存储层在锁内重新读取再合并，避免覆盖本轮 LLM 调用期间
                 # 用户在记忆面板写入的偏好
                 append_pref(pref_type, pref_value)
+                self._invalidate_preference_cache()
                 # 偏好值可能是证件号 / 住址等隐私内容：只记录类型
                 logger.info("Appended to %s", pref_type)
                 return
@@ -1243,9 +1259,11 @@ class OrchestrationAgent(AgentBase):
             existing_value = current_prefs.get(pref_type)
             merged_value = merge_preference_value(existing_value, pref_value)
             self.memory_manager.long_term.save_preference(pref_type, merged_value)
+            self._invalidate_preference_cache()
             logger.info("Appended to %s", pref_type)
             return
         self.memory_manager.long_term.save_preference(pref_type, pref_value)
+        self._invalidate_preference_cache()
         logger.info("Replaced preference: %s", pref_type)
 
     def _infer_trip_origin(
@@ -1355,6 +1373,7 @@ class OrchestrationAgent(AgentBase):
                                 self.memory_manager.long_term.save_preference(
                                     pref_type, value
                                 )
+                                self._invalidate_preference_cache()
                                 logger.info(
                                     "Updated preference: %s (legacy format)",
                                     pref_type,
