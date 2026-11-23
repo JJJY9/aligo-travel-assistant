@@ -895,6 +895,43 @@ def test_chat_idempotency_key_binds_message_content():
     print("✓ 幂等键绑定消息内容")
 
 
+def test_chat_incomplete_idempotency_marker_returns_409():
+    """断连 499 落库成功后的标记：重试返回 409，不重放也不重复执行。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    user_id = _unique_user("web_test_idem_incomplete")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-idem-incomplete",
+            "idempotency_key": "req-incomplete",
+        }
+        state = client.app.state.aligo
+        key = make_key(
+            user_id,
+            "sess-idem-incomplete",
+            "req-incomplete",
+            endpoint="chat",
+            message="你好",
+        )
+        state.idempotency.put(
+            key,
+            {
+                "session_id": "sess-idem-incomplete",
+                "__incomplete__": True,
+                "message": "上一请求已处理但响应未送达，请刷新会话历史",
+            },
+        )
+        response = client.post("/api/chat", json=payload)
+        assert response.status_code == 409, response.text
+        assert "刷新会话历史" in response.json()["detail"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 未完成幂等标记返回 409")
+
+
 def test_chat_stream_idempotency_replay():
     """流式重复提交只回放 session + done，不重新执行 Agent。"""
     class _CountingModel:

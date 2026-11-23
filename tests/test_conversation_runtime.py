@@ -196,6 +196,7 @@ def test_persist_veto_rolls_back_staged_question():
     result = asyncio.run(runtime.ask("你好"))
     assert result["reply"]
     assert result["persisted"] is False, "墓碑否决的回合必须透传未落库状态"
+    assert not runtime.turn_persisted("你好"), "被否决的回合不能标记为已落库"
     assert memory.rolled_back == ["你好"], "被否决的整轮不能留下孤立提问"
     assert memory.staged == []
     print("✓ 落库守卫否决后回滚暂存提问")
@@ -327,6 +328,7 @@ def test_deferred_memory_commits_after_cancel_during_persist():
     asyncio.run(scenario())
     assert orch.commits == 1, "落库成功后的延迟记忆写入不能因取消而丢失"
     assert orch.clears == 1, "取消落在落库线程期间也要清理检查点"
+    assert runtime.turn_persisted("你好"), "取消但落库成功的回合应标记已落库"
     print("✓ 取消落在落库线程期间仍补提交延迟记忆")
 
 

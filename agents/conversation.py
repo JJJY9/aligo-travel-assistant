@@ -72,6 +72,9 @@ class ConversationRuntime:
         # 由完成回调触发回滚；下一轮开始前先等这次回滚结束，避免迟到的
         # 回滚删掉下一轮文本相同的提问
         self._last_persist_turn: tuple[str, dict[str, bool]] | None = None
+        # 最近一次落库是否成功（提问文本）：客户端断连返回 499 后，Web 层
+        # 据此决定是否给幂等键写「已落库但响应未送达」标记，避免重试重复
+        self._last_persist_committed: str | None = None
         self._pending_rollback: asyncio.Future | None = None
         # 延迟记忆写入（偏好 / 行程）的提交任务：取消落在落库线程期间时由
         # 落库完成回调补提交，drain 释放用户锁前等待它结束
@@ -375,6 +378,7 @@ class ConversationRuntime:
             self._pending_persist = pending
             pending_persist = pending
             self._last_persist_turn = (user_input, turn_state)
+            self._last_persist_committed = None
             pending.add_done_callback(
                 lambda fut: self._clear_pending_persist(
                     fut, user_input, turn_state
@@ -639,6 +643,10 @@ class ConversationRuntime:
             outcome = pending.result()
         except Exception:  # noqa: BLE001 - 落库失败由回滚兜底
             outcome = failed
+        if outcome is not False and outcome is not failed:
+            self._last_persist_committed = user_input
+        else:
+            self._last_persist_committed = None
         if turn_state is None:
             return
         if outcome is not False and outcome is not failed:
@@ -656,6 +664,15 @@ class ConversationRuntime:
             # 旧任务已完成时同样登记：陈旧槽位不能让 drain 提前放行
             self._pending_rollback = task
         task.add_done_callback(self._consume_background_task)
+
+    def turn_persisted(self, user_input: str) -> bool:
+        """最近一次落库是否成功写入了该提问（断连 499 的幂等标记用）。"""
+        turn = self._last_persist_turn
+        return (
+            turn is not None
+            and turn[0] == user_input
+            and self._last_persist_committed == user_input
+        )
 
     async def drain_pending_persist(self, timeout_sec: float = 10.0) -> bool:
         """等待在途的记忆落库线程结束，返回是否在超时前完成。
