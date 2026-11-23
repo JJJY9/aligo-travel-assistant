@@ -241,6 +241,44 @@ def test_dag_dependency_overrides_llm_priority():
     print("✓ DAG 依赖优先于 LLM 计划优先级")
 
 
+def test_extension_skills_follow_dag_dependencies():
+    """预算 / 市内交通排在行程之后；行前类排在事项收集之后。"""
+    order: list[str] = []
+
+    class Recorder(_StubAgent):
+        async def reply(self, x):
+            order.append(f"start:{self.name}")
+            await asyncio.sleep(0.03)
+            order.append(f"end:{self.name}")
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "event_collection": Recorder("event_collection"),
+            "itinerary_planning": Recorder("itinerary_planning"),
+            "trip-budget": Recorder("trip-budget"),
+            "packing-list": Recorder("packing-list"),
+        }
+    )
+    schedule = [
+        {"agent_name": "trip-budget", "priority": 1},
+        {"agent_name": "itinerary_planning", "priority": 1},
+        {"agent_name": "event_collection", "priority": 1},
+        {"agent_name": "packing-list", "priority": 1},
+    ]
+    asyncio.run(orchestrator.reply(_intent(schedule)))
+    assert order.index("start:packing-list") > order.index(
+        "end:event_collection"
+    ), order
+    assert order.index("start:itinerary_planning") > order.index(
+        "end:event_collection"
+    ), order
+    assert order.index("start:trip-budget") > order.index(
+        "end:itinerary_planning"
+    ), order
+    print("✓ 扩展技能按 DAG 依赖排批")
+
+
 def test_aggregate_results_surfaces_missing_info():
     """事项收集的缺失信息随聚合结果返回，并生成补充提示。"""
     orchestrator = OrchestrationAgent(agent_registry={})

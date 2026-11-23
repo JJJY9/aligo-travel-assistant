@@ -117,6 +117,14 @@ _PLANNING_DEPENDENCIES = {"event_collection", "preference"}
 # 在满足 DAG 的前提下生效，可能被上调、不会被下调）
 _AGENT_DEPENDENCIES: dict[str, set[str]] = {
     "itinerary_planning": set(_PLANNING_DEPENDENCIES),
+    # v2.0 扩展技能：预算 / 市内交通以行程为输入，必须排在规划之后；
+    # 行前清单 / 安全 / 贴士只需要事项收集的目的地、日期等基本信息
+    "trip-budget": {"itinerary_planning"},
+    "local-transport": {"itinerary_planning"},
+    "packing-list": {"event_collection"},
+    "travel-checklist": {"event_collection"},
+    "safety-tips": {"event_collection"},
+    "trip-notes": {"event_collection"},
 }
 
 # 技能智能体通常把 LLM / 网络异常吞成 {"error": ...} 返回，外层重试等不到
