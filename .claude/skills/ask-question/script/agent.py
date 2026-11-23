@@ -97,6 +97,24 @@ def _bm25_key_lock(key: tuple[str, str]) -> threading.Lock:
         return _BM25_KEY_LOCKS.setdefault(key, threading.Lock())
 
 
+# 首轮检索全被 min_score 过滤时，去掉疑问 / 客套词再检索一次：用户问题
+# 里的「请问 / 是多少 / 吗」会稀释向量相似度，但几乎不影响知识关键词
+_RETRIEVAL_NOISE_RE = re.compile(
+    r"(请问|请帮我|帮我|我想知道|想问一下|问一下|麻烦|怎么|如何|"
+    r"是什么|是多少|多少|有哪些|可以|能否|是否|吗|呢|啊|呀)"
+)
+_RETRIEVAL_PUNCT_RE = re.compile(
+    r"[？?！!。，,、；;：:（）()\[\]【】\"'“”‘’]+"
+)
+
+
+def _simplify_retrieval_query(query: object) -> str:
+    """去掉疑问 / 客套词与标点，供无命中时二次检索。"""
+    text = _RETRIEVAL_NOISE_RE.sub(" ", str(query or ""))
+    text = _RETRIEVAL_PUNCT_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
 def _metadata_dict(value: object) -> dict:
     """Milvus 行里的 metadata 是 JSON 字符串：解析为 dict 再参与分组。
 
@@ -1053,11 +1071,35 @@ class RAGKnowledgeAgent(AgentBase):
             min_score = float(RAG_CONFIG.get("min_score", min_score))
         except Exception:
             pass
-        retrieved_docs = [
-            doc
-            for doc in retrieved_docs
-            if float(doc.get("distance") or 0.0) >= min_score
-        ]
+
+        def _above_threshold(docs: list[dict]) -> list[dict]:
+            return [
+                doc
+                for doc in docs
+                if float(doc.get("distance") or 0.0) >= min_score
+            ]
+
+        retrieved_docs = _above_threshold(retrieved_docs)
+        if not retrieved_docs:
+            # 无命中重检索（v2.0）：疑问 / 客套词会稀释向量相似度；去掉
+            # 后再检一次，仍无命中才按「没有相关信息」拒答。二次检索失败
+            # 不升级成错误——首轮已经成功，只是没有可用片段
+            simplified = _simplify_retrieval_query(user_query)
+            if simplified and simplified != str(user_query).strip():
+                try:
+                    retried = await asyncio.to_thread(
+                        self.search_knowledge,
+                        simplified,
+                        None,
+                        True,
+                        hybrid=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 重检索失败按无结果
+                    logger.warning("简化查询重检索失败: %s", exc)
+                else:
+                    retrieved_docs = _above_threshold(retried)
+                    if retrieved_docs:
+                        logger.info("首次检索无命中，简化查询重检索成功")
         # 多分片文档按 group/part 拼回整篇：相似度排序会把整篇拆散、
         # 低分分片被阈值过滤后还会缺片，直接逐条注入可能重复或乱序
         retrieved_docs = self._assemble_grouped_documents(retrieved_docs)

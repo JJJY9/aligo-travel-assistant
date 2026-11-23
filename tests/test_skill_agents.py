@@ -1767,6 +1767,112 @@ def test_rag_reply_filters_low_score_documents():
     print("✓ 低分片段按阈值过滤")
 
 
+def test_simplify_retrieval_query_strips_noise():
+    """无命中重检索：去掉疑问 / 客套词与标点，保留知识关键词。"""
+    module = _load_skill_module("ask-question")
+    simplified = module._simplify_retrieval_query("请问住宿标准是多少？")
+    assert "住宿标准" in simplified
+    assert "请问" not in simplified and "多少" not in simplified
+    assert module._simplify_retrieval_query("") == ""
+    print("✓ 检索查询简化")
+
+
+def test_rag_retries_with_simplified_query_when_no_hits():
+    """首轮全被阈值过滤时用简化查询重检索一次；命中后正常作答。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+
+    class _Agent(agent_class):
+        def __init__(self):
+            from agentscope.agent import AgentBase
+
+            AgentBase.__init__(self)
+            self.name = "RAGKnowledgeAgent"
+            self.initialized = True
+            self.model = _FakeModel()
+
+            class _Loader:
+                def get_skill_content(self, name):
+                    return ""
+
+            self.skill_loader = _Loader()
+
+    agent = _Agent()
+    calls: list[str] = []
+
+    def fake_search(query, k=None, s=False, hybrid=False):
+        calls.append(str(query))
+        if len(calls) == 1:
+            return [
+                {"id": "1", "content": "无关片段", "metadata": {}, "distance": 0.2}
+            ]
+        return [
+            {
+                "id": "2",
+                "content": "住宿标准为每晚 600 元",
+                "metadata": {},
+                "distance": 0.7,
+            }
+        ]
+
+    agent.search_knowledge = fake_search
+    out = asyncio.run(
+        agent.reply(
+            Msg(name="x", content="请问住宿标准是多少？", role="user")
+        )
+    )
+    payload = json.loads(out.content)
+    assert payload["status"] == "success", payload
+    assert len(calls) == 2, calls
+    assert calls[1] != calls[0] and "住宿标准" in calls[1]
+    assert "住宿标准" in payload["retrieved_documents"][0]["content"]
+    print("✓ 无命中时简化查询重检索")
+
+
+def test_rag_no_retry_when_first_search_hits():
+    """首轮已有命中：不做二次检索。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+
+    class _Agent(agent_class):
+        def __init__(self):
+            from agentscope.agent import AgentBase
+
+            AgentBase.__init__(self)
+            self.name = "RAGKnowledgeAgent"
+            self.initialized = True
+            self.model = _FakeModel()
+
+            class _Loader:
+                def get_skill_content(self, name):
+                    return ""
+
+            self.skill_loader = _Loader()
+
+    agent = _Agent()
+    calls: list[str] = []
+
+    def fake_search(query, k=None, s=False, hybrid=False):
+        calls.append(str(query))
+        return [
+            {
+                "id": "1",
+                "content": "住宿标准为每晚 600 元",
+                "metadata": {},
+                "distance": 0.8,
+            }
+        ]
+
+    agent.search_knowledge = fake_search
+    out = asyncio.run(
+        agent.reply(
+            Msg(name="x", content="请问住宿标准是多少？", role="user")
+        )
+    )
+    payload = json.loads(out.content)
+    assert payload["status"] == "success"
+    assert len(calls) == 1, calls
+    print("✓ 首轮命中不再重检索")
+
+
 def test_rag_grouped_documents_assembled():
     """多分片文档按 group/part 拼回整篇，重复 part 取高分者。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
