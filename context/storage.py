@@ -171,6 +171,36 @@ def shared_redis_configured() -> bool:
     return bool(STORAGE_CONFIG.get("redis_url") or "")
 
 
+# 偏好版本键的本地失败冷却：共享客户端一旦被缓存，_failed_recently 不会
+# 在取客户端时生效；Redis 中途变黑洞（丢包不复位）会让每次 GET / INCR
+# 都等满 1.5 秒 socket 超时——偏好读取每轮 1-2 次、导入每条偏好一次，
+# 必须像墓碑 / 限流一样做操作级冷却
+_PREF_VERSION_FAILURE_COOLDOWN_SEC = 60.0
+_pref_version_failed_until = 0.0
+
+
+def pref_version_client() -> Any | None:
+    """偏好版本键专用客户端：操作失败后的冷却期内直接返回 None。"""
+    if time.monotonic() < _pref_version_failed_until:
+        return None
+    return get_shared_redis_client()
+
+
+def note_pref_version_failure(exc: BaseException) -> None:
+    """偏好版本操作失败：进入 60 秒本地冷却，并同步 Redis 可用性标记。"""
+    global _pref_version_failed_until
+    _pref_version_failed_until = (
+        time.monotonic() + _PREF_VERSION_FAILURE_COOLDOWN_SEC
+    )
+    note_redis_operation_failure(exc)
+
+
+def reset_pref_version_failure() -> None:
+    """清空偏好版本冷却（测试隔离 / 配置热更新）。"""
+    global _pref_version_failed_until
+    _pref_version_failed_until = 0.0
+
+
 def create_short_term_memory(
     session_id: str, max_turns: int = 10, user_id: str = ""
 ) -> ShortTermStore:
@@ -327,6 +357,7 @@ def reset_failure_cache() -> None:
         # 在途创建完成时按代数丢弃结果，reset 之后旧客户端不会写回缓存
         _redis_generation += 1
     reset_redis_degraded()
+    reset_pref_version_failure()
 
 
 def describe_backends() -> dict[str, Any]:

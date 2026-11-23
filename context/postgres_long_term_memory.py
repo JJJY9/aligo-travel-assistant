@@ -44,6 +44,10 @@ def _pg_timestamp(value: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+# 偏好版本键 TTL：与墓碑会话纪元同口径（1 天）。MemoryManager 的快照缓存
+# 只有 5 秒，键过期只会让下一次读取多一次重读，不会把旧版本当新版本用。
+_PREF_VERSION_TTL_SEC = 86400
+
 
 def _trip_start_is_valid(value: Any) -> bool:
     """行程出发日期是否为可解析的 YYYY-MM-DD（与 JSON 后端同一统计口径）。"""
@@ -548,6 +552,36 @@ class PostgresLongTermMemory:
 
     # ---------- 偏好 ----------
 
+    def _bump_shared_preference_version(self) -> None:
+        """偏好变更后推进跨进程版本键（配置 Redis 时）。
+
+        其它实例 / CLI 进程的 5 秒偏好快照按该键立即失效；未配置 Redis
+        或 Redis 故障时保持原有 TTL + 本进程失效语义，版本推进失败不
+        影响本次写入。
+        """
+        try:
+            from context.storage import (
+                note_pref_version_failure,
+                pref_version_client,
+            )
+        except Exception:  # noqa: BLE001 - 存储模块不可用时放弃推进
+            return
+        try:
+            client = pref_version_client()
+            if client is None:
+                return
+            key = f"aligo:prefver:{self.user_id}"
+            client.incr(key)
+            # 与墓碑会话纪元同一约定：INCR 后 EXPIRE，避免每用户永久留键；
+            # 快照缓存 TTL 只有 5 秒，键过期只会让下一次读取多一次重读
+            client.expire(key, _PREF_VERSION_TTL_SEC)
+        except Exception as exc:  # noqa: BLE001 - 版本推进失败由 TTL 兜底
+            # 操作级冷却：故障期不再让每次偏好写入都等满 socket 超时
+            note_pref_version_failure(exc)
+            logger.debug(
+                "推进偏好版本失败（%s）", self.user_id, exc_info=True
+            )
+
     def save_preference(
         self,
         pref_type: str,
@@ -589,6 +623,8 @@ class PostgresLongTermMemory:
                     # 补位，重放会变成未经过上限复核的新增行
                     replay_safe=False,
                 )
+        # 提交成功后再推进版本：其它实例的快照缓存据此立即失效
+        self._bump_shared_preference_version()
 
     def _enforce_preference_cap(self, pref_type: str) -> None:
         """新建偏好类型前复核类型数上限（用户级写锁内，跨类型并发安全）。
@@ -648,6 +684,8 @@ class PostgresLongTermMemory:
             removed = self._run_with_retry(run, replay_safe=False)
         if removed:
             logger.info("Deleted preference from PostgreSQL: %s", pref_type)
+            # 删除同样推进版本：其它实例的快照里还留着该类型
+            self._bump_shared_preference_version()
         return bool(removed)
 
     def append_preference(self, pref_type: str, value: Any) -> Any:
@@ -2151,6 +2189,8 @@ class PostgresLongTermMemory:
             "aligo_archived_sessions",
         ):
             self._execute(f"DELETE FROM {table} WHERE user_id = %s", (self.user_id,))
+        # 偏好被整表清空：其它实例的快照缓存必须立即失效
+        self._bump_shared_preference_version()
 
     def close(self) -> None:
         # 与所有数据库操作共用同一把实例锁：drain 超时后旧落库线程仍可能
