@@ -84,6 +84,19 @@ def test_must_see_skips_narrative_and_preserves_connector_names():
     print("✓ 必去项保护连接字地名并过滤叙述词")
 
 
+def test_must_see_strips_destination_and_purpose():
+    """出行目的（北京出差）不是景点；城市前缀后的景点保留。"""
+    requirements = extract_requirements(
+        "想去北京出差3天", {"destination": "北京市"}
+    )
+    assert "must_see" not in requirements, requirements
+    requirements = extract_requirements(
+        "想去杭州西湖游玩", {"destination": "杭州市"}
+    )
+    assert requirements["must_see"] == ["西湖"], requirements
+    print("✓ 必去项剥离城市前缀与出行目的")
+
+
 def test_budget_does_not_cross_enumeration_punctuation():
     """顿号 / 冒号后的分项金额不能被当成总预算。"""
     assert "budget" not in extract_requirements(
@@ -188,6 +201,7 @@ if __name__ == "__main__":
     test_budget_does_not_cross_clause_punctuation()
     test_must_see_trims_duration_and_budget_fragments()
     test_must_see_skips_narrative_and_preserves_connector_names()
+    test_must_see_strips_destination_and_purpose()
     test_budget_does_not_cross_enumeration_punctuation()
     test_must_see_only_checks_daily_plans()
     test_validate_passes_for_consistent_plan()

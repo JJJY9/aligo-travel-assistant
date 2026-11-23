@@ -138,10 +138,12 @@ def _clean_must_see(value: str) -> list[str]:
         "旅游",
         "旅行",
         "游玩",
+        "出差",
         "好玩",
         "有哪些",
         "有什么",
         "转转",
+        "游",
         "的",
         "了",
         "一下",
@@ -232,6 +234,19 @@ def extract_requirements(
         for name in _clean_must_see(match.group(1)):
             if name not in must_see:
                 must_see.append(name)
+    destination = str(event.get("destination") or "").strip()
+    if must_see and destination:
+        refined: list[str] = []
+        for name in must_see:
+            # 「北京出差」这类只剩城市名的，是出行目的不是景点；
+            # 「杭州西湖游玩」剥掉城市前缀后保留真正的必去项「西湖」
+            if name == destination:
+                continue
+            if name.startswith(destination) and len(name) >= len(destination) + 2:
+                name = name[len(destination) :].strip()
+            if name and name not in _MUST_SEE_GENERIC and name not in refined:
+                refined.append(name)
+        must_see = refined
     if must_see:
         requirements["must_see"] = must_see
 

@@ -1288,13 +1288,21 @@ class OrchestrationAgent(AgentBase):
                 != "event_collection"
             ):
                 continue
-            data = (result.get("result") or {}).get("data") or {}
+            payload = result.get("result") or {}
+            # 失败结果里的 missing_info 是兜底占位（如「所有信息」），
+            # 不能当成用户真的少给了信息——真实原因是该技能执行失败
+            if isinstance(payload, dict) and payload.get("status") == "error":
+                continue
+            data = (payload.get("data") if isinstance(payload, dict) else None) or {}
             if isinstance(data, dict) and isinstance(data.get("data"), dict):
                 data = {
                     **data["data"],
                     **{key: value for key, value in data.items() if key != "data"},
                 }
             info = data.get("missing_info") if isinstance(data, dict) else None
+            # 模型偶发返回单个字符串（展示层已兼容），聚合层同样归一
+            if isinstance(info, str):
+                info = [info]
             if not isinstance(info, list):
                 continue
             for item in info:

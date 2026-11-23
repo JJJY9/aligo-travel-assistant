@@ -540,6 +540,41 @@ def test_summary_inputs_off_event_loop():
     print("✓ 总结查询离开事件循环线程")
 
 
+def test_recent_summary_short_term_read_off_event_loop():
+    """当前会话最近对话摘要的短期记忆读取不能在事件循环线程执行。"""
+    from context.memory_manager import MemoryManager
+
+    threads: list[int] = []
+
+    class _ShortTerm:
+        def get_recent_context(self, n_turns=5):
+            threads.append(threading.get_ident())
+            return [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "你好呀"},
+                {"role": "user", "content": "明天去杭州"},
+                {"role": "assistant", "content": "好的"},
+            ]
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return {"content": [{"type": "text", "text": "最近摘要"}]}
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.short_term = _ShortTerm()
+    manager.llm_model = _Model()
+    manager._recent_summary_cache = None
+    manager._recent_summary_failure_until = 0.0
+
+    loop_thread = threading.get_ident()
+    summary = asyncio.run(manager.get_recent_summary_async(max_turns=2))
+    assert summary
+    assert threads and all(tid != loop_thread for tid in threads), (
+        "最近摘要的短期记忆读取不能阻塞事件循环"
+    )
+    print("✓ 最近摘要读取离开事件循环线程")
+
+
 def test_model_output_with_lone_surrogate_is_sanitized():
     """模型输出含转义孤立代理项（截断 emoji）：事件 / 回复 / 落库都必须可编码。
 
@@ -1565,6 +1600,7 @@ if __name__ == "__main__":
     test_persist_veto_rolls_back_staged_question()
     test_persist_failure_rolls_back_staged_user_message()
     test_summary_inputs_off_event_loop()
+    test_recent_summary_short_term_read_off_event_loop()
     test_model_output_with_lone_surrogate_is_sanitized()
     test_non_dict_model_outputs_are_user_facing_errors()
     test_non_list_schedule_does_not_crash()

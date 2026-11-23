@@ -814,6 +814,7 @@ def test_chat_returns_reply_and_usage():
 
 def test_chat_idempotency_key_replays_without_rerun():
     """同一幂等键重放缓存响应；不同键仍真实执行。"""
+
     class _CountingModel:
         def __init__(self):
             self.calls = 0
@@ -855,6 +856,43 @@ def test_chat_idempotency_key_replays_without_rerun():
         print("✓ 幂等键重放不重复执行；不同键正常执行")
     finally:
         _cleanup(user_id)
+
+
+def test_chat_idempotency_key_binds_message_content():
+    """同一幂等键换了消息不能被回放：新提问必须真实执行。"""
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem_message")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-idem-msg",
+            "idempotency_key": "req-same",
+        }
+        first = client.post("/api/chat", json=payload)
+        assert first.status_code == 200, first.text
+        calls_after_first = counting.calls
+        second = client.post(
+            "/api/chat", json={**payload, "message": "在吗"}
+        )
+        assert second.status_code == 200, second.text
+        assert second.headers.get("x-idempotent-replay") is None, (
+            "同键不同消息不能回放上一问"
+        )
+        assert counting.calls > calls_after_first
+    finally:
+        _cleanup(user_id)
+    print("✓ 幂等键绑定消息内容")
 
 
 def test_chat_stream_idempotency_replay():

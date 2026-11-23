@@ -263,6 +263,38 @@ def test_aggregate_results_surfaces_missing_info():
     print("✓ 聚合结果携带缺失信息澄清")
 
 
+def test_aggregate_missing_info_string_and_failed_result():
+    """字符串形缺失信息要保留；失败结果的兜底占位不能当缺失信息。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    string_case = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {"destination": "杭州", "missing_info": "返程日期"},
+            },
+        }
+    ]
+    aggregated = orchestrator._aggregate_results(string_case, {})
+    assert aggregated["missing_info"] == ["返程日期"], aggregated
+
+    failed_case = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "error",
+                "data": {"missing_info": ["所有信息"], "error": "解析失败"},
+            },
+        }
+    ]
+    aggregated = orchestrator._aggregate_results(failed_case, {})
+    assert "missing_info" not in aggregated, aggregated
+    assert aggregated["status"] == "partial_failure"
+    print("✓ 聚合缺失信息兼容字符串且跳过失败结果")
+
+
 def test_retry_cache_reuses_completed_agents():
     """整轮重试复用首轮已完成的智能体：只重跑失败的那个，不重复计费。"""
     calls = {"a": 0, "b": 0}

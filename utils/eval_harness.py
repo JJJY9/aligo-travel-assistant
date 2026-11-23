@@ -38,7 +38,7 @@ def evaluate_case(
     reasons: list[str] = []
     expected = _intents(case.get("expected_intents"))
     predicted = _intents(prediction.get("intents"))
-    intents_ok = expected == predicted if expected else True
+    intents_ok = expected == predicted
     if not intents_ok:
         reasons.append(
             "意图不匹配：期望 "
