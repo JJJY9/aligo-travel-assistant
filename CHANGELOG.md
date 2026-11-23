@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- 扩展技能（v2.0，共 12 个技能）：新增 trip-budget / packing-list / travel-checklist / local-transport / safety-tips / trip-notes 六个轻量提示技能（SKILL.md + scripts），共用 `utils/simple_skill.py` 基类（上下文截断与中和、数据块注入、统一 `{status, skill, <result_key>, answer}` 返回）；LazyAgentRegistry 自动发现，wheel 数据文件同步；新增技能加载 / 注册 / 空响应测试
 - 执行检查点接入编排（v2.0）：`OrchestrationAgent.reply` 新增 `checkpoint_key`——每批已成功的子智能体结果落盘，同一 user + session + turn_id 的重试 / 重启复用成功步骤、只重跑失败或未完成者；`ConversationRuntime` 在 `client_turn_id` 存在时自动生成键，CLI / 无 turn_id 场景保持原行为。检查点读写失败只记日志、不阻断对话
 - 执行检查点存储（v2.0）：新增 `utils/execution_checkpoint.py`——按幂等键把编排中间结果原子落盘（SHA-256 文件名、临时文件 + fsync + `os.replace`、TTL 与条目上限淘汰、损坏文件清理、进程内互斥），作为失败重试 / 重启续跑的基础设施；本次只提供存储与单元测试，接入编排在后续 PR
 - 偏好快照缓存（v2.0）：`MemoryManager.get_preferences` 对 PostgreSQL 后端启用 5 秒偏好快照缓存（深拷贝返回，避免调用方改坏缓存），编排层每次偏好写入（append / replace / 旧格式批量）后立即 `invalidate_preference_cache`；JSON 后端读取本身在内存里，不启用缓存。对话快照、编排上下文与 `get_context_for_agent` 统一走该入口

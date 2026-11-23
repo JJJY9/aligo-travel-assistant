@@ -18,7 +18,7 @@ sys.path.insert(0, project_root)
 
 
 def test_registry_from_other_cwd():
-    """从系统临时目录运行注册器，应仍发现 6 个技能"""
+    """从系统临时目录运行注册器，应仍发现 12 个技能"""
     code = (
         f"import sys; sys.path.insert(0, r'{project_root}');"
         "from agents.lazy_agent_registry import LazyAgentRegistry;"
@@ -36,11 +36,11 @@ def test_registry_from_other_cwd():
         timeout=300,
     )
     count = (out.stdout or "").strip().splitlines()[-1] if out.stdout else ""
-    assert count == "6", (
-        f"从其它目录运行时发现技能数 = {count!r}，期望 '6'（Issue #5 复现）。\n"
+    assert count == "12", (
+        f"从其它目录运行时发现技能数 = {count!r}，期望 '12'（Issue #5 复现）。\n"
         f"stderr: {out.stderr[-300:]}"
     )
-    print("✓ 其它 CWD 下技能发现正常（6 个）")
+    print("✓ 其它 CWD 下技能发现正常（12 个）")
 
 
 def test_memory_path_anchored_to_project_root():

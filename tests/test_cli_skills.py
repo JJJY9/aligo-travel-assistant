@@ -31,8 +31,14 @@ def test_lists_repo_skills():
     code, output = _run()
     assert code == 0
     assert "技能目录" in output
-    assert "已发现 6 个技能" in output
-    for name in ("ask-question", "event-collection", "plan-trip"):
+    assert "已发现 12 个技能" in output
+    for name in (
+        "ask-question",
+        "event-collection",
+        "plan-trip",
+        "trip-budget",
+        "safety-tips",
+    ):
         assert name in output
     print("✓ cli.py skills 列出仓库技能")
 
