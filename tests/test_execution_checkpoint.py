@@ -189,6 +189,60 @@ def test_clear_session_checkpoints_uses_default_store():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_default_store_cleans_stale_legacy_checkpoints():
+    """默认根只清理旧 CWD 目录中已过 TTL 的检查点，近期文件保留。"""
+    import utils.execution_checkpoint as checkpoint_module
+
+    old_env = os.environ.get("ALIGO_DATA_DIR")
+    old_cwd = os.getcwd()
+    base = tempfile.mkdtemp(prefix="chailv_ckpt_legacy_")
+    legacy = Path(base) / "data" / "runtime" / "checkpoints"
+    legacy.mkdir(parents=True)
+    stale = legacy / "stale.json"
+    fresh = legacy / "fresh.json"
+    stale.write_text("{}", encoding="utf-8")
+    fresh.write_text("{}", encoding="utf-8")
+    old_ts = time.time() - 7200
+    os.utime(stale, (old_ts, old_ts))
+    old_package_root = checkpoint_module.package_root
+    try:
+        checkpoint_module.package_root = lambda: Path(base) / "package"
+        os.environ["ALIGO_DATA_DIR"] = str(Path(base) / "newdata")
+        os.chdir(base)
+        CheckpointStore()
+        assert not stale.exists(), "过期的旧目录检查点应被清理"
+        assert fresh.exists(), "TTL 内的旧目录文件不能误删"
+    finally:
+        checkpoint_module.package_root = old_package_root
+        os.chdir(old_cwd)
+        if old_env is None:
+            os.environ.pop("ALIGO_DATA_DIR", None)
+        else:
+            os.environ["ALIGO_DATA_DIR"] = old_env
+        shutil.rmtree(base, ignore_errors=True)
+    print("✓ 默认存储清理旧目录过期检查点")
+
+
+def test_explicit_root_does_not_clean_legacy_checkpoints():
+    """显式 root（测试 / 自定义部署）不应触碰 CWD 下的旧目录。"""
+    old_cwd = os.getcwd()
+    base = tempfile.mkdtemp(prefix="chailv_ckpt_explicit_")
+    legacy = Path(base) / "data" / "runtime" / "checkpoints"
+    legacy.mkdir(parents=True)
+    old = legacy / "old.json"
+    old.write_text("{}", encoding="utf-8")
+    old_ts = time.time() - 7200
+    os.utime(old, (old_ts, old_ts))
+    try:
+        os.chdir(base)
+        CheckpointStore(root=Path(base) / "explicit")
+        assert old.exists(), "显式 root 不得清理旧目录"
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(base, ignore_errors=True)
+    print("✓ 显式 root 不清理旧目录")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -203,4 +257,6 @@ if __name__ == "__main__":
     test_init_prunes_expired_and_stale_temp()
     test_clear_scope_removes_only_matching_session()
     test_clear_session_checkpoints_uses_default_store()
+    test_default_store_cleans_stale_legacy_checkpoints()
+    test_explicit_root_does_not_clean_legacy_checkpoints()
     print("\n全部通过")

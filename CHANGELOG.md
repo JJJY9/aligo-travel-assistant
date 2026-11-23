@@ -12,6 +12,7 @@
 - 执行检查点接入编排（v2.0）：`OrchestrationAgent.reply` 新增 `checkpoint_key`——每批已成功的子智能体结果落盘，同一 user + session + turn_id 的重试 / 重启复用成功步骤、只重跑失败或未完成者；`ConversationRuntime` 在 `client_turn_id` 存在时自动生成键，CLI / 无 turn_id 场景保持原行为。检查点读写失败只记日志、不阻断对话
 - 检查点加固（v2.0）：键绑定本轮提问内容（同一 `client_turn_id` 换消息不能复用上一问的子智能体结果），整轮成功落库后立即清理；默认目录跟随 `default_data_root()`（源码 / wheel / `ALIGO_DATA_DIR` 一致）并加入 `.gitignore`，初始化时清理过期检查点与崩溃遗留临时文件；落盘只保留键哈希（不再写入用户 / 会话标识），存储初始化失败只记日志、不阻断对话
 - 检查点会话清理（v2.0）：编排层新增 `checkpoint_scope`（`user:session`，落盘只存哈希），Web `DELETE /api/sessions/{id}` 与 CLI `session-delete` 删除会话时按作用域清理对应检查点，内含子智能体结果不再等 1 小时 TTL；清理失败只记日志、不阻断会话删除。新增作用域清理、编排记录、删除入口回归
+- 旧版检查点清理（v2.0）：新默认存储启动时清理旧 CWD / 包根目录中已超过 TTL 的检查点与临时文件（旧负载含原始用户 / 会话键），TTL 内的近期文件保留，避免误删旧进程仍在使用的检查点；显式 root（测试 / 自定义部署）不触发清理。新增默认清理与显式 root 隔离回归
 - 执行检查点存储（v2.0）：新增 `utils/execution_checkpoint.py`——按幂等键把编排中间结果原子落盘（SHA-256 文件名、临时文件 + fsync + `os.replace`、TTL 与条目上限淘汰、损坏文件清理、进程内互斥），作为失败重试 / 重启续跑的基础设施；本次只提供存储与单元测试，接入编排在后续 PR
 - 偏好快照缓存（v2.0）：`MemoryManager.get_preferences` 对 PostgreSQL 后端启用 5 秒偏好快照缓存（深拷贝返回，避免调用方改坏缓存），编排层每次偏好写入（append / replace / 旧格式批量）后立即 `invalidate_preference_cache`；JSON 后端读取本身在内存里，不启用缓存。对话快照、编排上下文与 `get_context_for_agent` 统一走该入口
 - 偏好缓存全入口失效（v2.0）：`MemoryManager` 维护进程内实例弱引用集合，新增 `invalidate_all_preference_caches()`；Web 面板 PUT / DELETE 偏好与 `/api/import` 恢复备份后统一清空所有已建会话的 5 秒快照缓存，不再出现「面板已改、对话仍按旧偏好规划」的窗口（跨进程写入仍由 TTL 兜底）。新增全局失效与面板写入回归

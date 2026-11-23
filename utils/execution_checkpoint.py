@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from utils.paths import default_data_root
+from utils.paths import default_data_root, package_root
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class CheckpointStore:
     ) -> None:
         # 默认路径必须跟长期数据目录走：此前是 CWD 相对字面量，从其它目录
         # 启动时检查点散落在任意工作目录，且默认路径不在 .gitignore 里
+        explicit_root = root is not None
         self.root = (
             Path(root) if root is not None
             else default_data_root() / "runtime" / "checkpoints"
@@ -56,6 +57,10 @@ class CheckpointStore:
         with self._lock:
             self._clean_temp_files()
             self._prune()
+        if not explicit_root:
+            # 旧版本默认目录是 CWD 相对路径：升级后这些文件不会再被读取，
+            # 但含原始用户 / 会话键；仅当使用默认根时清理已过 TTL 的残片
+            self._cleanup_legacy_roots()
 
     # ---------- 内部工具 ----------
 
@@ -160,6 +165,46 @@ class CheckpointStore:
                 pass
             raise
         self._prune()
+
+    def _cleanup_legacy_roots(self) -> None:
+        """清理升级前按 CWD 相对路径写下的过期检查点。
+
+        旧版本默认目录是 ``<当前工作目录>/data/runtime/checkpoints``，
+        升级后新默认根随数据目录走，旧文件不会再被任何读取路径触达，
+        但其中可能含原始用户 / 会话键。只删除已超过 TTL 的文件：仍可能
+        被旧进程使用的近期文件保留，避免误删活跃检查点。
+        """
+        try:
+            current = self.root.resolve()
+        except OSError:
+            current = self.root
+        candidates = [
+            Path.cwd() / "data" / "runtime" / "checkpoints",
+            package_root() / "data" / "runtime" / "checkpoints",
+        ]
+        cutoff = time.time() - max(self.ttl_sec, DEFAULT_TTL_SEC)
+        removed = 0
+        for legacy in candidates:
+            try:
+                resolved = legacy.resolve()
+            except OSError:
+                continue
+            if resolved == current or not legacy.is_dir():
+                continue
+            for path in list(legacy.glob("*.json")) + list(legacy.glob(".*.tmp")):
+                try:
+                    if path.stat().st_mtime >= cutoff:
+                        continue
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+            try:
+                legacy.rmdir()
+            except OSError:
+                pass
+        if removed:
+            logger.info("已清理旧版检查点目录过期文件 %s 个", removed)
 
     def _load_unlocked(self, key: str) -> dict[str, Any] | None:
         """调用方已持有 ``self._lock`` 时使用。"""
