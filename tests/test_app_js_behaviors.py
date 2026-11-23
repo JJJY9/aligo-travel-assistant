@@ -42,6 +42,15 @@ def _run_harness(scenario: str) -> dict:
     return json.loads(completed.stdout)
 
 
+def test_retired_thread_reset_on_open_session():
+    """persisted=false 后打开另一个会话：retiredThreadVisible 必须复位。"""
+    results = _run_harness("retiredThreadOpenSession")
+    after = results["afterOpen"]
+    assert after["sessionId"] == "s2"
+    assert after["retired"] is False
+    print("✓ 打开会话后清除 retiredThreadVisible")
+
+
 def test_session_request_race_guards():
     """作废的会话请求失败不打扰当前视图；未作废的失败保留原语义。"""
     results = _run_harness("race")
@@ -799,6 +808,7 @@ if __name__ == "__main__":
         print("未安装 node，跳过前端行为直跑用例（请通过 pytest 运行）")
         raise SystemExit(0)
     test_session_request_race_guards()
+    test_retired_thread_reset_on_open_session()
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()
     test_knowledge_duplicates_panel_states()

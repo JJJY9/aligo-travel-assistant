@@ -2658,6 +2658,9 @@ async function openSession(sessionId, options = {}) {
       return;
     }
     state.sessionId = sessionId;
+    // 打开会话成功后，可见线程属于该会话：清除「上一轮未落库、下一条
+    // 消息发送前清空线程」的标记，否则刚加载的历史会在下一次发送时被清空
+    state.retiredThreadVisible = false;
     safeStorageSet("session", "aligo.sessionId", sessionId);
     syncSessionControls();
 
