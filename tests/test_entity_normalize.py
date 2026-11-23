@@ -90,6 +90,45 @@ def test_extract_requirements_uses_normalized_event_data():
     print("✓ 行程校验需求使用归一后的日期")
 
 
+def test_date_year_rollover_for_past_month_day():
+    """无年份月日已过去时顺延到明年；显式年份不滚动。"""
+    base = date(2026, 11, 23)
+    assert normalize_date("1月5日", base) == "2027-01-05"
+    assert normalize_date("12月1日", base) == "2026-12-01"
+    assert normalize_date("11月23日", base) == "2026-11-23"
+    assert normalize_date("2027年1月5日", base) == "2027-01-05"
+    assert normalize_date("2026年1月5日", base) == "2026-01-05"
+    assert normalize_date("2月29日", date(2026, 3, 1)) is None
+    print("✓ 无年份日期跨年顺延")
+
+
+def test_invalid_event_dates_are_dropped():
+    """不可能日期不能原样透传成合法需求。"""
+    result = normalize_event_data(
+        {
+            "start_date": "3月32日",
+            "end_date": "不是日期",
+            "purpose": "出差",
+        }
+    )
+    assert "start_date" not in result
+    assert "end_date" not in result
+    assert result["purpose"] == "出差"
+    print("✓ 非法事项日期丢弃")
+
+
+def test_extract_requirements_ignores_unparseable_dates():
+    """需求提取只接受可解析的 ISO 日期。"""
+    from utils.itinerary_validation import extract_requirements
+
+    requirements = extract_requirements(
+        "去北京", {"start_date": "3月32日", "end_date": "2026-02-30"}
+    )
+    assert "start_date" not in requirements
+    assert "end_date" not in requirements
+    print("✓ 需求层拒绝非法日期")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -100,4 +139,7 @@ if __name__ == "__main__":
     test_date_month_end_and_next_month()
     test_normalize_event_data_copy_and_absolute_dates()
     test_extract_requirements_uses_normalized_event_data()
+    test_date_year_rollover_for_past_month_day()
+    test_invalid_event_dates_are_dropped()
+    test_extract_requirements_ignores_unparseable_dates()
     print("\n全部通过")

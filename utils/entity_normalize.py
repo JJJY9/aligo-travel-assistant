@@ -73,7 +73,8 @@ def normalize_date(
 
     支持：ISO（含斜杠）、``3月4日`` / ``2026年3月4日``、今天 / 明天 /
     后天 / 大后天、本周 / 下周 / 下下周 / 周X / 星期X、下个月N号、月底。
-    未写年份的日期按 ``today`` 所在年；``周X`` 未指明周次时取未来最近一天。
+    未写年份的日期按 ``today`` 所在年、已过去的月日顺延到明年；
+    ``周X`` 未指明周次时取未来最近一天。
     """
     base = today or date.today()
     text = str(value or "").strip()
@@ -91,11 +92,21 @@ def normalize_date(
         r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})[日号]?", text
     )
     if match:
-        year = int(match.group(1)) if match.group(1) else base.year
+        explicit_year = match.group(1)
+        year = int(explicit_year) if explicit_year else base.year
         try:
-            return date(year, int(match.group(2)), int(match.group(3))).isoformat()
+            parsed = date(year, int(match.group(2)), int(match.group(3)))
         except ValueError:
             return None
+        # 无年份的月日已过去时按明年算（11 月说「1月5日」指的是明年），
+        # 与上面「周X 取未来最近一天」一致；跨年输出过去日期会让规划 /
+        # 校验拿到早已结束的行程
+        if explicit_year is None and parsed < base:
+            try:
+                parsed = parsed.replace(year=year + 1)
+            except ValueError:  # 2月29日落到非闰年
+                return None
+        return parsed.isoformat()
 
     match = re.fullmatch(
         r"(下下周|下周|本周|这周|周|星期)([一二三四五六日天])", text
@@ -143,7 +154,12 @@ def normalize_event_data(data: object) -> dict[str, Any]:
             result[key] = normalize_city(result[key])
     for key in ("start_date", "end_date"):
         if key in result:
-            normalized = normalize_date(result[key])
+            raw = result[key]
+            normalized = normalize_date(raw)
             if normalized:
                 result[key] = normalized
+            elif isinstance(raw, str) and raw.strip():
+                # 非法 / 不可能日期（非闰年 2月29日、3月32日）不能原样
+                # 透传：下游会把任何非空字符串当成合法日期需求
+                result.pop(key, None)
     return result
