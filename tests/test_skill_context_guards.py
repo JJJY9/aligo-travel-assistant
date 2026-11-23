@@ -95,7 +95,7 @@ def test_rag_reply_marks_excerpt_and_neutralizes_markers(monkeypatch):
             "distance": 0.9,
         }
     ]
-    agent.search_knowledge = lambda query, top_k=None, strict=False, hybrid=False: docs
+    agent.search_knowledge = lambda query, top_k=None, strict=False, hybrid=False, min_distance=None: docs
 
     module_globals = RAGKnowledgeAgent.reply.__wrapped__.__globals__
 
@@ -400,7 +400,7 @@ def test_rag_empty_model_response_is_retriable(monkeypatch):
     agent = _rag_agent()
     agent.model = _FakeModel(reply="")
     agent.skill_loader = _FakeSkillLoader()
-    agent.search_knowledge = lambda query, top_k=None, strict=False, hybrid=False: [
+    agent.search_knowledge = lambda query, top_k=None, strict=False, hybrid=False, min_distance=None: [
         {
             "id": "doc",
             "content": "标准 500 元",

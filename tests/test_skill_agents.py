@@ -1569,6 +1569,44 @@ def test_rag_hybrid_search_includes_bm25_only_documents(monkeypatch):
     print("✓ 混合检索纳入 BM25 独有片段，默认接口保持纯向量")
 
 
+def test_hybrid_search_threshold_precedes_rerank():
+    """min_distance 先于精排 / 截断：精排不能把通过阈值的片段挤出 top-K。"""
+    module = _load_skill_module("ask-question")
+    agent_class = module.RAGKnowledgeAgent
+    agent = object.__new__(agent_class)
+    docs = [
+        {
+            "id": 1,
+            "content": "市内交通标准：每天 100 元",
+            "distance": 0.2,
+        },
+        {
+            "id": 2,
+            "content": "住宿标准：一线城市每晚 600 元",
+            "distance": 0.7,
+        },
+    ]
+    index = module.BM25Index(
+        [
+            {"id": 1, "content": docs[0]["content"]},
+            {"id": 2, "content": docs[1]["content"]},
+        ]
+    )
+    agent._hybrid_settings = lambda: (True, 20)
+    agent._get_bm25_index = lambda: index
+    # 精排把低分文档排到第一（模拟精排分与 distance 量纲不同）
+    agent._rerank_documents = lambda query, fused: sorted(
+        fused, key=lambda doc: float(doc.get("distance") or 0.0)
+    )
+    legacy = agent._hybrid_search("住宿标准", [dict(doc) for doc in docs], 1)
+    assert [doc["id"] for doc in legacy] == [1], legacy
+    filtered = agent._hybrid_search(
+        "住宿标准", [dict(doc) for doc in docs], 1, min_distance=0.5
+    )
+    assert [doc["id"] for doc in filtered] == [2], filtered
+    print("✓ 证据门槛先于精排截断")
+
+
 def test_rag_dimension_mismatch_fails_init():
     """集合维度与嵌入模型不一致时初始化直接失败（否则每问都抛底层 matmul 异常）。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
@@ -1751,7 +1789,7 @@ def test_rag_reply_filters_low_score_documents():
 
     agent = _Agent()
     docs = [{"id": "1", "content": "无关片段", "metadata": {}, "distance": 0.3}]
-    agent.search_knowledge = lambda q, k=None, s=False, hybrid=False: list(docs)
+    agent.search_knowledge = lambda q, k=None, s=False, hybrid=False, min_distance=None: list(docs)
     out = asyncio.run(
         agent.reply(Msg(name="x", content="今天适合吃什么水果", role="user"))
     )
@@ -1799,7 +1837,7 @@ def test_rag_retries_with_simplified_query_when_no_hits():
     agent = _Agent()
     calls: list[str] = []
 
-    def fake_search(query, k=None, s=False, hybrid=False):
+    def fake_search(query, k=None, s=False, hybrid=False, min_distance=None):
         calls.append(str(query))
         if len(calls) == 1:
             return [
@@ -1850,7 +1888,7 @@ def test_rag_no_retry_when_first_search_hits():
     agent = _Agent()
     calls: list[str] = []
 
-    def fake_search(query, k=None, s=False, hybrid=False):
+    def fake_search(query, k=None, s=False, hybrid=False, min_distance=None):
         calls.append(str(query))
         return [
             {
