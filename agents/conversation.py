@@ -10,6 +10,7 @@
 - 结果写入短期 / 长期记忆。
 """
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -301,10 +302,16 @@ class ConversationRuntime:
                 reply_options["retry_cache"] = orchestration_retry_cache
             if checkpoint_supported and turn_id:
                 # v2.0 持久化执行：同一 user + session + turn 的重试 / 重启
-                # 复用已成功的子智能体结果（client_turn_id 由前端生成）
+                # 复用已成功的子智能体结果（client_turn_id 由前端生成）。
+                # 键同时绑定本轮提问内容：前端复用 / 客户端 bug 让同一
+                # turn_id 换了消息时，不能复用上一问的子智能体结果
+                content_digest = hashlib.sha256(
+                    str(user_input).encode("utf-8")
+                ).hexdigest()[:16]
                 reply_options["checkpoint_key"] = (
                     f"{getattr(self.memory, 'user_id', '')}:"
-                    f"{getattr(self.memory, 'session_id', '')}:{turn_id}"
+                    f"{getattr(self.memory, 'session_id', '')}:{turn_id}:"
+                    f"{content_digest}"
                 )
             orchestration = await self._call_with_resilience(
                 lambda: self.orchestrator.reply(
@@ -400,6 +407,14 @@ class ConversationRuntime:
             # 记忆——提交期间被取消（停止 / 断连）时，ask() 外层兜底不能把
             # 同一份用量再记入下一轮（与 CLI 的 usage_settled 时序一致）
             settlement["done"] = True
+            # 整轮已落库：检查点只服务于同一轮的重试 / 重启，成功后再用
+            # 同一键请求必须重新执行，不能静默返回上一问缓存的子结果
+            clear_checkpoint = getattr(self.orchestrator, "clear_checkpoint", None)
+            if callable(clear_checkpoint):
+                try:
+                    clear_checkpoint()
+                except Exception:  # noqa: BLE001 - 清理失败不影响已完成的回合
+                    logger.warning("清理执行检查点失败", exc_info=True)
             if defer_supported:
                 # 现在才提交偏好 / 行程；取消与墓碑否决的回合不会执行到这里，
                 # 避免台账出现没有对话的事实记录。落库完成回调可能已调度提交

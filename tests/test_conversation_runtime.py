@@ -1478,6 +1478,51 @@ def test_deferred_commit_checks_tombstone_before_commit():
     print("✓ 延迟记忆提交前复查墓碑")
 
 
+def test_checkpoint_key_binds_message_content_and_clears_after_persist():
+    """检查点键绑定提问内容，整轮成功落库后清理（不能复用陈旧结果）。"""
+    runtime, memory = _make_runtime()
+    memory.user_id = "u-ctx"
+    memory.session_id = "s-ctx"
+
+    class _CheckpointOrch:
+        def __init__(self):
+            self.keys: list[str | None] = []
+            self.cleared = 0
+
+        async def reply(
+            self,
+            intention,
+            on_event=None,
+            defer_memory=False,
+            retry_cache=None,
+            checkpoint_key=None,
+        ):
+            self.keys.append(checkpoint_key)
+            return _Response(
+                json.dumps({"results": []}, ensure_ascii=False)
+            )
+
+        async def commit_deferred_memory(self):
+            return True
+
+        def clear_checkpoint(self):
+            self.cleared += 1
+
+    orch = _CheckpointOrch()
+    runtime.orchestrator = orch
+    asyncio.run(runtime.ask("第一条消息", turn_id="turn-1"))
+    asyncio.run(runtime.ask("第二条消息", turn_id="turn-1"))
+
+    assert orch.keys[0] != orch.keys[1], (
+        "同一 turn_id 换了消息不能复用上一问的子智能体结果"
+    )
+    assert all(
+        str(key).startswith("u-ctx:s-ctx:turn-1:") for key in orch.keys
+    ), orch.keys
+    assert orch.cleared == 2, "整轮成功落库后必须清理检查点"
+    print("✓ 检查点键绑定提问内容并在成功后清理")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_runtime_uses_default_data_root_for_long_term": "需要 tmp_path 夹具",
 }
@@ -1537,6 +1582,7 @@ if __name__ == "__main__":
     test_cancel_during_stage_thread_rolls_back_after_visible()
     test_cancelled_persist_failure_settles_usage()
     test_deferred_memory_commits_after_cancel_during_persist()
+    test_checkpoint_key_binds_message_content_and_clears_after_persist()
     _mp = pytest.MonkeyPatch()
     try:
         test_redis_backfill_skipped_while_degraded(_mp)

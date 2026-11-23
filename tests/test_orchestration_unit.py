@@ -153,6 +153,41 @@ def test_checkpoint_reuses_successful_agents_across_instances(tmp_path):
     state = store.load("u:s:t1")
     assert set(state["steps"]) == {"a", "b"}
     print("✓ 执行检查点跨编排器实例复用成功步骤")
+
+
+def test_clear_checkpoint_removes_state_after_success(tmp_path):
+    """成功落库后清理检查点：同一键再次请求不能复用上一问的子结果。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    agent = _StubAgent("a", {"ok": True})
+    orchestrator = OrchestrationAgent(agent_registry={"a": agent})
+    orchestrator._checkpoint_store = store
+    schedule = [{"agent_name": "a", "priority": 1}]
+    asyncio.run(orchestrator.reply(_intent(schedule), checkpoint_key="u:s:t1"))
+    assert store.load("u:s:t1") is not None
+    orchestrator.clear_checkpoint()
+    assert store.load("u:s:t1") is None, "整轮成功后再复用会返回陈旧结果"
+    assert orchestrator._checkpoint_key is None
+    print("✓ 整轮成功后清理执行检查点")
+
+
+def test_checkpoint_store_failure_does_not_block_turn(monkeypatch):
+    """检查点目录不可用（磁盘 / 权限）只记日志，对话照常完成。"""
+    import utils.execution_checkpoint as checkpoint_module
+
+    class _BrokenStore:
+        def __init__(self, *args, **kwargs):
+            raise OSError("disk unavailable")
+
+    monkeypatch.setattr(checkpoint_module, "CheckpointStore", _BrokenStore)
+    agent = _StubAgent("a", {"ok": True})
+    orchestrator = OrchestrationAgent(agent_registry={"a": agent})
+    schedule = [{"agent_name": "a", "priority": 1}]
+    asyncio.run(orchestrator.reply(_intent(schedule), checkpoint_key="u:s:t1"))
+    assert agent.calls == 1, "检查点初始化失败不能阻断智能体执行"
+    assert orchestrator._checkpoint_store is None
+    print("✓ 检查点存储初始化失败不阻断对话")
 def test_dag_dependency_overrides_llm_priority():
     """行程规划即使被 LLM 标成更高优先级，也必须排在事项收集之后。"""
     order: list[str] = []
