@@ -55,6 +55,37 @@ def test_truncate_expect_mismatch_keeps_history():
     print("✓ expect 不一致时保留历史")
 
 
+def test_truncate_turn_id_mismatch_keeps_history():
+    """回合 id 不一致时不删除：跨实例同文本提问不会被误删。"""
+    memory = ShortTermMemory()
+    memory.add_message(
+        "user", "同一句提问", metadata={"client_turn_id": "t-other"}
+    )
+    memory.add_message("assistant", "回答")
+    assert memory.truncate_last_turn("同一句提问", "t-mine") == 0
+    assert len(memory.messages) == 2, "回合 id 不一致时不应删除"
+    assert memory.truncate_last_turn("同一句提问", "t-other") == 2
+    assert memory.messages == []
+    print("✓ 回合 id 不一致时保留历史")
+
+
+def test_truncate_turn_id_falls_back_without_metadata():
+    """消息没有回合 id（回填 / 旧数据）时退回内容匹配，不能因缺 id 拒删。"""
+    memory = ShortTermMemory()
+    memory.add_message("user", "回填提问")
+    assert memory.truncate_last_turn("回填提问", "t1") == 1
+    assert memory.messages == []
+    print("✓ 缺少回合 id 时退回内容匹配")
+
+
+def test_truncate_empty_turn_id_skips_check():
+    """空串 turn_id 视为「无回合 id」（与 Redis Lua 口径一致）。"""
+    memory = ShortTermMemory()
+    memory.add_message("user", "问", metadata={"client_turn_id": "t1"})
+    assert memory.truncate_last_turn("问", "") == 1
+    print("✓ 空串回合 id 按无 id 处理")
+
+
 def test_truncate_trailing_user_only():
     memory = ShortTermMemory()
     memory.add_message("user", "只有提问")

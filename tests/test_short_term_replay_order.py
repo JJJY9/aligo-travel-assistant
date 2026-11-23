@@ -192,6 +192,67 @@ def test_live_append_mode_ignores_clock_skew():
     print("✓ 实时追加不受时钟回拨影响")
 
 
+def test_redis_truncate_respects_turn_id():
+    """Lua 截断按 metadata.client_turn_id 匹配；缺 id / 空串退回内容校验。"""
+    from context.short_term_memory import _TRUNCATE_LAST_TURN_LUA
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+
+    def push(content, turn_id):
+        metadata = {"client_turn_id": turn_id} if turn_id else {}
+        client.rpush(
+            key,
+            json.dumps(
+                {
+                    "role": "user",
+                    "content": content,
+                    "timestamp": "2026-03-11T10:00:00",
+                    "metadata": metadata,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "回答",
+                    "timestamp": "2026-03-11T10:00:01",
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    def truncate(content, turn_id):
+        return client.eval(
+            _TRUNCATE_LAST_TURN_LUA,
+            1,
+            key,
+            "1",
+            content,
+            "",
+            "",
+            turn_id,
+        )
+
+    push("同一句提问", "t-other")
+    assert truncate("同一句提问", "t-mine") == 0
+    assert client.llen(key) == 2, "回合 id 不一致时不应删除"
+    assert truncate("同一句提问", "t-other") == 2
+    assert client.llen(key) == 0
+
+    # 消息没有回合 id（长期记忆回填 / 旧数据）：退回内容匹配，不能拒删
+    push("回填提问", None)
+    assert truncate("回填提问", "t-mine") == 2
+    assert client.llen(key) == 0
+
+    # 空串 turn_id 视为「无回合 id」：与进程内实现口径一致
+    push("空 id 提问", "t-other")
+    assert truncate("空 id 提问", "") == 2
+    assert client.llen(key) == 0
+    print("✓ Redis 截断按回合 id 精确匹配（缺 id / 空串退回内容校验）")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -205,4 +266,5 @@ if __name__ == "__main__":
     test_space_separator_timestamp_is_normalized()
     test_untimestamped_old_entry_does_not_force_append()
     test_live_append_mode_ignores_clock_skew()
+    test_redis_truncate_respects_turn_id()
     print("\n全部通过")

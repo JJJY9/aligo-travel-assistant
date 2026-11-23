@@ -29,7 +29,9 @@ class _FakeMemory:
         self.threads: dict[str, int] = {}
         self.events: list[tuple[str, str]] = []
         self.staged: list[tuple[str, str]] = []
+        self.stage_metadata: list[dict | None] = []
         self.rolled_back: list[str] = []
+        self.rollback_turn_ids: list[str | None] = []
         self.long_term = self
         self.short_term = self
 
@@ -56,10 +58,12 @@ class _FakeMemory:
     def stage_message(self, role, content, metadata=None):
         self.threads[f"stage-{role}"] = threading.get_ident()
         self.staged.append((role, content))
+        self.stage_metadata.append(metadata)
 
-    def rollback_staged_message(self, content):
+    def rollback_staged_message(self, content, turn_id=None):
         self.threads["rollback"] = threading.get_ident()
         self.rolled_back.append(content)
+        self.rollback_turn_ids.append(turn_id)
         if self.staged and self.staged[-1] == ("user", content):
             self.staged.pop()
         return True
@@ -751,7 +755,7 @@ def test_rollback_failure_does_not_mask_original_error():
     """暂存回滚自身失败时保留原始错误（编排异常照常上抛）。"""
     runtime, memory = _make_runtime()
 
-    def boom(content):
+    def boom(content, turn_id=None):
         raise RuntimeError("rollback blew up")
 
     memory.rollback_staged_message = boom  # type: ignore[method-assign]
@@ -764,6 +768,24 @@ def test_rollback_failure_does_not_mask_original_error():
     with pytest.raises(RuntimeError, match="gateway down"):
         asyncio.run(runtime.ask("你好"))
     print("✓ 回滚失败不掩盖原始错误")
+
+
+def test_rollback_carries_turn_id():
+    """暂存与回滚都携带回合 id：跨实例同文本提问不会被误删。"""
+    runtime, memory = _make_runtime()
+
+    class _BoomOrchestrator:
+        async def reply(self, intention, on_event=None):
+            raise RuntimeError("gateway down")
+
+    runtime.orchestrator = _BoomOrchestrator()
+    with pytest.raises(RuntimeError, match="gateway down"):
+        asyncio.run(runtime.ask("同一句提问", turn_id="t-1"))
+    assert memory.stage_metadata and memory.stage_metadata[0] == {
+        "client_turn_id": "t-1"
+    }, memory.stage_metadata
+    assert memory.rollback_turn_ids == ["t-1"], memory.rollback_turn_ids
+    print("✓ 暂存 / 回滚携带回合 id")
 
 
 def test_rollback_slot_cleared_after_completion():
@@ -1612,6 +1634,7 @@ if __name__ == "__main__":
     test_empty_short_term_backfills_current_session_history()
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
+    test_rollback_carries_turn_id()
     test_memory_without_rollback_hook_is_tolerated()
     test_cancel_during_deferred_commit_does_not_double_usage()
     test_rollback_slot_cleared_after_completion()
