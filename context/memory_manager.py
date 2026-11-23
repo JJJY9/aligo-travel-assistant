@@ -7,6 +7,7 @@ import copy
 import logging
 import re
 import time
+import weakref
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -102,6 +103,10 @@ class MemoryManager:
     - 长期记忆：用户偏好和历史（跨会话）
     """
 
+    # 本进程内存活实例的弱引用集合：Web 面板 / 导入经独立 store 直写偏好
+    # 时，需要一次清掉所有已建会话的 5 秒快照缓存（弱引用不阻止 GC）
+    _preference_cache_instances: weakref.WeakSet[Any] = weakref.WeakSet()
+
     def __init__(self, user_id: str, session_id: str, storage_path: str = "data/memory", llm_model=None):
         """
         初始化记忆管理器
@@ -134,6 +139,7 @@ class MemoryManager:
         self._recent_summary_failure_until = 0.0
         # 偏好快照缓存（v2.0）：(monotonic, preferences)，仅 PG 后端启用
         self._preference_cache: tuple[float, dict[str, Any]] | None = None
+        MemoryManager._preference_cache_instances.add(self)
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -183,6 +189,20 @@ class MemoryManager:
     def invalidate_preference_cache(self) -> None:
         """偏好写入 / 后端重建后立即失效快照缓存。"""
         self._preference_cache = None
+
+    @classmethod
+    def invalidate_all_preference_caches(cls) -> None:
+        """清空本进程所有实例的偏好快照缓存。
+
+        面板 PUT/DELETE 偏好与备份导入经独立 store 直接写库，不经过各
+        会话的 MemoryManager；不全局失效时，PostgreSQL 后端下会话最多
+        5 秒内仍按旧偏好规划。
+        """
+        for instance in list(cls._preference_cache_instances):
+            try:
+                instance.invalidate_preference_cache()
+            except Exception:  # noqa: BLE001 - 单个实例失败不影响其它
+                continue
 
     # ========== 短期记忆操作 ==========
 

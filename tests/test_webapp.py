@@ -3887,6 +3887,34 @@ def test_preferences_api():
         _cleanup(user_id)
 
 
+def test_preference_writes_invalidate_all_caches(monkeypatch):
+    """面板 PUT / DELETE 偏好后清空所有会话的偏好快照缓存。"""
+    from webapp import server as server_module
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        server_module,
+        "_invalidate_preference_caches",
+        lambda: calls.append(1),
+    )
+    client = _client()
+    user_id = _unique_user("web_test_pref_cache")
+    try:
+        response = client.put(
+            "/api/preferences/hotel_brands",
+            json={"user_id": user_id, "value": ["汉庭"]},
+        )
+        assert response.status_code == 200, response.text
+        response = client.delete(
+            "/api/preferences/hotel_brands", params={"user_id": user_id}
+        )
+        assert response.status_code == 200, response.text
+        assert len(calls) >= 2, "PUT / DELETE 后都应清空会话偏好缓存"
+    finally:
+        _cleanup(user_id)
+    print("✓ 面板偏好写入清空会话缓存")
+
+
 def test_preference_put_rejects_blank_values():
     """与 CLI pref-set / 面板口径一致：空值 PUT 返回 422（清空用 DELETE）。"""
     client = _client()
