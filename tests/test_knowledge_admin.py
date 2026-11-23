@@ -1075,8 +1075,9 @@ def test_cleanup_duplicate_contents_deletes_and_reports_failure(monkeypatch):
     print("✓ 重复清理逐条删除并汇报失败")
 
 
-def test_import_tolerates_non_finite_part_metadata(monkeypatch):
-    """metadata.part 为非有限数（Infinity）时该文档退化为单条，不拖垮整批导入。"""
+def test_import_skips_group_with_non_finite_part_metadata(monkeypatch):
+    """parts=2、part 非有限数的组按结构非法整组跳过：不崩溃，也不把残缺
+    组导入成单条；同批正常文档照常导入。"""
     monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
     from pathlib import Path
 
@@ -1091,13 +1092,24 @@ def test_import_tolerates_non_finite_part_metadata(monkeypatch):
         {"content": "正常文档", "metadata": {}},
     ]
     result = knowledge_admin.import_documents(documents, dry_run=True)
-    assert result["would_import"] == 2, result
+    assert result["would_import"] == 1, result
+    assert result["skipped_invalid"] == 1, result
+    assert any(
+        "part 编号非法" in item["reason"]
+        for item in result.get("skipped_groups") or []
+    ), result
 
-    merged, skipped = knowledge_admin._regroup_exported_documents(documents, set())
+    problems: list[dict] = []
+    merged, skipped = knowledge_admin._regroup_exported_documents(
+        documents, set(), problems=problems
+    )
     assert skipped == 0, skipped
-    assert len(merged) == 2, merged
     assert any(doc.get("content") == "正常文档" for doc in merged), merged
-    print("✓ 非有限 part 元数据不再让整批导入抛错")
+    assert all(doc.get("content") != "坏分片" for doc in merged if isinstance(doc, dict)), (
+        "残缺组不能作为单条导入"
+    )
+    assert problems and problems[0]["group"] == "g-inf-part", problems
+    print("✓ 非有限 part 的多分片组整组跳过、不拖垮整批导入")
 
 
 def test_regroup_requires_multiset_coverage(monkeypatch):
@@ -2861,6 +2873,36 @@ def test_iter_all_rows_closes_iterator_even_on_error():
     print("✓ 全量遍历关闭迭代器且吞掉 close 异常")
 
 
+def test_meta_int_handles_non_finite_metadata():
+    """metadata 整数字段：Infinity / NaN 等非有限值按默认值，不抛 OverflowError。"""
+    assert knowledge_admin._meta_int(float("inf"), 3) == 3
+    assert knowledge_admin._meta_int(float("-inf")) == 0
+    assert knowledge_admin._meta_int(float("nan"), 1) == 1
+    assert knowledge_admin._meta_int("5") == 5
+    assert knowledge_admin._meta_int(None, 1) == 1
+    print("✓ metadata 非有限整数字段按默认值")
+
+
+def test_regroup_tolerates_non_finite_part_metadata():
+    """parts / part 为 JSON Infinity 的损坏条目不能把导入规划打成崩溃。"""
+    documents = [
+        {
+            "content": "甲",
+            "metadata": {
+                "group": "g-inf",
+                "part": float("inf"),
+                "parts": float("inf"),
+            },
+        },
+        {"content": "乙", "metadata": {}},
+    ]
+    merged, skipped = knowledge_admin._regroup_exported_documents(documents, set())
+    # parts 非有限按单片处理：损坏组不参与合并，条目原样保留
+    assert merged == [documents[0], documents[1]], merged
+    assert skipped == 0
+    print("✓ 非有限 parts / part 按单片容错")
+
+
 def test_regroup_keeps_non_dict_items():
     """重组只按 group 合并字典条目，非对象条目原样保留。"""
     merged, skipped = knowledge_admin._regroup_exported_documents(
@@ -3357,6 +3399,8 @@ if __name__ == "__main__":
     test_iter_all_rows_closes_iterator_even_on_error()
     test_restore_pieces_fallbacks()
     test_regroup_keeps_non_dict_items()
+    test_meta_int_handles_non_finite_metadata()
+    test_regroup_tolerates_non_finite_part_metadata()
     test_regroup_rejects_duplicate_part_numbers()
     test_regroup_bounds_missing_part_detail()
     test_regroup_caps_problem_details()
@@ -3378,7 +3422,7 @@ if __name__ == "__main__":
         test_update_grouped_update_failure_rolls_back_extras,
         test_chunk_documents_marks_even_with_full_metadata,
         test_import_regroups_exported_chunks,
-        test_import_tolerates_non_finite_part_metadata,
+        test_import_skips_group_with_non_finite_part_metadata,
         test_find_duplicate_contents_ignores_grouped_fragments,
         test_cleanup_duplicate_contents_dry_run,
         test_cleanup_duplicate_contents_deletes_verified_only,

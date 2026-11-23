@@ -351,6 +351,20 @@ def _parse_metadata(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _meta_int(value: Any, default: int = 0) -> int:
+    """metadata 里的整数字段：非数字 / 非有限值（JSON Infinity / NaN）按默认值。
+
+    ``json.loads`` 接受 ``Infinity`` / ``NaN``：``int(float("inf"))`` 抛
+    OverflowError、``int(float("nan"))`` 抛 ValueError。只捕获 TypeError /
+    ValueError 的路径会让损坏行把去重扫描、删除 / 编辑接口打成 500/503，
+    损坏行反而无法清理。
+    """
+    try:
+        return int(value or default)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def list_documents(
     limit: int = 20,
     offset: int = 0,
@@ -592,7 +606,7 @@ def _document_info(client: Any, doc_id: int) -> tuple[int, str]:
         return 0, ""
     meta = _parse_metadata(rows[0].get("metadata"))
     try:
-        parts = max(1, int(meta.get("parts") or 1))
+        parts = max(1, _meta_int(meta.get("parts"), 1))
     except (TypeError, ValueError):
         parts = 1
     return parts, str(meta.get("group") or "") if parts > 1 else ""
@@ -668,7 +682,7 @@ def _locked_user_snapshot(
             continue
         meta = _parse_metadata(row.get("metadata"))
         try:
-            part_no = int(meta.get("part") or 0)
+            part_no = _meta_int(meta.get("part"), 0)
         except (TypeError, ValueError):
             part_no = 0
         pieces.append((part_no, str(row.get("content", ""))))
@@ -920,8 +934,8 @@ def _merge_exported_group(
             }
         )
         try:
-            part_no = int(metadata.get("part") or 0)
-            declared = max(declared, int(metadata.get("parts") or 0))
+            part_no = _meta_int(metadata.get("part"), 0)
+            declared = max(declared, _meta_int(metadata.get("parts"), 0))
         except (TypeError, ValueError, OverflowError):
             part_no = 0
         if declared > _GROUP_PARTS_MAX:
@@ -1052,12 +1066,12 @@ def _regroup_exported_documents(
         metadata = metadata if isinstance(metadata, dict) else {}
         group = str(metadata.get("group") or "")
         try:
-            parts = int(metadata.get("parts") or 1)
+            parts = _meta_int(metadata.get("parts"), 1)
         except (TypeError, ValueError, OverflowError):
             parts = 1
         if group and parts > 1:
             try:
-                part_no = int(metadata.get("part") or 0)
+                part_no = _meta_int(metadata.get("part"), 0)
             except (TypeError, ValueError, OverflowError):
                 part_no = 0
             grouped.setdefault(group, []).append((part_no, item))
@@ -1141,7 +1155,7 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
             content = str(row.get("content", ""))
             meta = _parse_metadata(row.get("metadata"))
             try:
-                part_no = int(meta.get("part") or 0)
+                part_no = _meta_int(meta.get("part"), 0)
             except (TypeError, ValueError):
                 part_no = 0
             return {
@@ -1163,7 +1177,7 @@ def get_document_group(doc_id: int) -> dict[str, Any] | None:
                 continue
             meta = _parse_metadata(row.get("metadata"))
             try:
-                part_no = int(meta.get("part") or 0)
+                part_no = _meta_int(meta.get("part"), 0)
             except (TypeError, ValueError):
                 part_no = 0
             pieces.append((part_no, str(row.get("content", ""))))
@@ -1209,7 +1223,7 @@ def _scan_duplicate_contents(client: Any) -> list[tuple[str, list[int]]]:
             continue
         meta = _parse_metadata(row.get("metadata"))
         try:
-            parts = int(meta.get("parts") or 1)
+            parts = _meta_int(meta.get("parts"), 1)
         except (TypeError, ValueError):
             parts = 1
         # 旧数据可能只有 parts 没有 group：同样是多分片文档，不能按单条处理
@@ -1362,11 +1376,11 @@ def _existing_group_layout() -> dict[str, list[tuple[str, int, int]]]:
             continue
         meta = _parse_metadata(row.get("metadata"))
         try:
-            parts = int(meta.get("parts") or 1)
+            parts = _meta_int(meta.get("parts"), 1)
         except (TypeError, ValueError):
             parts = 1
         try:
-            part = int(meta.get("part") or 0)
+            part = _meta_int(meta.get("part"), 0)
         except (TypeError, ValueError):
             part = 0
         layout.setdefault(content, []).append(
@@ -1593,7 +1607,7 @@ def import_documents(
         valid, set(), problems=pre_problems
     )
     if not pre_merged:
-        dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
+        dropped = sum(_meta_int(item.get("parts"), 0) for item in pre_problems)
         payload = {
             "imported": 0,
             "skipped": invalid + dropped,
@@ -1644,7 +1658,7 @@ def import_documents(
                     ):
                         order_ok = False
                 if order_ok:
-                    dropped = sum(int(item.get("parts") or 0) for item in pre_problems)
+                    dropped = sum(_meta_int(item.get("parts"), 0) for item in pre_problems)
                     duplicate = len(_merged_piece_contents(pre_merged))
                     payload = {
                         "imported": 0,
@@ -1776,7 +1790,7 @@ def import_documents(
             existing_group_texts=_existing_group_texts,
         )
         # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方
-        invalid += sum(int(item.get("parts") or 0) for item in problems)
+        invalid += sum(_meta_int(item.get("parts"), 0) for item in problems)
         duplicate = group_skipped
         # 布局冲突（缺失分片的 part 号被旧内容占用 / 布局校验失败）：内容
         # 没有导入，不能计成「已存在」——否则用户会把备份当作已恢复
@@ -1954,7 +1968,7 @@ def import_documents(
                 for chunk in missing:
                     chunk_meta = chunk.get("metadata") or {}
                     try:
-                        want_part = int(chunk_meta.get("part") or 0)
+                        want_part = _meta_int(chunk_meta.get("part"), 0)
                     except (TypeError, ValueError, OverflowError):
                         want_part = 0
                     if not want_part or want_part not in occupied:
@@ -2000,8 +2014,8 @@ def import_documents(
                             continue
                         candidates = layout.get(key, [])
                         chunk_meta = chunk.get("metadata")
-                        want_part = int((chunk_meta or {}).get("part") or 0)
-                        want_parts = int((chunk_meta or {}).get("parts") or 1)
+                        want_part = _meta_int((chunk_meta or {}).get("part"), 0)
+                        want_parts = _meta_int((chunk_meta or {}).get("parts"), 1)
                         # 同一内容可能对应库内多行（组内同文分片 / 独立副本）：
                         # 任一行与本篇布局一致即可按原布局补齐
                         if any(
@@ -2079,7 +2093,7 @@ def import_documents(
                     for chunk in missing:
                         chunk_meta = chunk.get("metadata") or {}
                         try:
-                            want_part = int(chunk_meta.get("part") or 0)
+                            want_part = _meta_int(chunk_meta.get("part"), 0)
                         except (TypeError, ValueError, OverflowError):
                             want_part = 0
                         if want_part:
@@ -2107,7 +2121,7 @@ def import_documents(
             # 补写后组内成员按内容齐全——整组跳过会把残缺组永久留在库里
             if len(missing) != len(doc_chunks):
                 total_parts = max(
-                    int(piece["metadata"].get("parts") or 1)
+                    _meta_int(piece["metadata"].get("parts"), 1)
                     for piece in doc_chunks
                 )
                 for missing_piece in missing:
