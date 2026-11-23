@@ -138,7 +138,7 @@ class MemoryManager:
         self._recent_summary_cache: tuple[tuple, str] | None = None
         self._recent_summary_failure_until = 0.0
         # 偏好快照缓存（v2.0）：(monotonic, preferences)，仅 PG 后端启用
-        self._preference_cache: tuple[float, dict[str, Any]] | None = None
+        self._preference_cache: tuple[float, str | None, dict[str, Any]] | None = None
         MemoryManager._preference_cache_instances.add(self)
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
@@ -171,19 +171,59 @@ class MemoryManager:
             getattr(self.long_term, "snapshot_based", True) is False
         )
 
+    @staticmethod
+    def _shared_preference_version(user_id: str) -> str | None:
+        """跨进程偏好版本（配置 Redis 时）：无 Redis / 读取失败返回 None。
+
+        PostgreSQL 存储在偏好写入 / 删除 / 清空后 INCR
+        ``aligo:prefver:<user>``；其它实例据版本变化立即丢弃自己的 5 秒
+        快照。版本键不存在按 "0" 处理（与首次写入前一致），读取失败退回
+        原有 TTL + 本进程失效语义。
+        """
+        try:
+            from context.storage import (
+                note_pref_version_failure,
+                pref_version_client,
+            )
+        except Exception:  # noqa: BLE001 - 存储模块不可用时退回 TTL
+            return None
+        try:
+            client = pref_version_client()
+            if client is None:
+                return None
+            raw = client.get(f"aligo:prefver:{user_id}")
+        except Exception as exc:  # noqa: BLE001 - Redis 故障退回 TTL + 本地失效
+            # 操作级冷却：故障期不再让每次读取都等满 socket 超时
+            note_pref_version_failure(exc)
+            return None
+        if raw is None:
+            return "0"
+        if isinstance(raw, bytes):
+            return raw.decode("ascii", "replace")
+        return str(raw)
+
     def get_preferences(self) -> dict[str, Any]:
         """读取用户偏好（PG 后端带 5 秒快照缓存，写入时显式失效）。"""
         now = time.monotonic()
+        version: str | None = None
         if self._preference_cache_enabled():
+            # 跨进程版本优先于 TTL：其它实例 / CLI 写入后本进程下一次读取
+            # 就拿到新偏好，不用等满 5 秒
+            version = self._shared_preference_version(self.user_id)
             cached = self._preference_cache
             if (
                 cached is not None
                 and (now - cached[0]) <= _PREFERENCE_CACHE_TTL_SEC
+                and (version is None or cached[1] == version)
             ):
-                return copy.deepcopy(cached[1])
+                return copy.deepcopy(cached[2])
         preferences = self.long_term.get_preference()
         if self._preference_cache_enabled():
-            self._preference_cache = (now, copy.deepcopy(preferences))
+            self._preference_cache = (
+                now,
+                version,
+                copy.deepcopy(preferences),
+            )
         return preferences
 
     def invalidate_preference_cache(self) -> None:

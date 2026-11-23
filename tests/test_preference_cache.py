@@ -20,12 +20,15 @@ from context.memory_manager import MemoryManager
 class _FakeStore:
     snapshot_based = False
 
-    def __init__(self, snapshot_based=False):
+    def __init__(self, snapshot_based=False, events=None):
         self.snapshot_based = snapshot_based
         self.reads = 0
+        self.events = events
 
     def get_preference(self):
         self.reads += 1
+        if self.events is not None:
+            self.events.append("read")
         return {"hotel_brands": ["汉庭"]}
 
 
@@ -44,6 +47,60 @@ def _with_pg(monkeypatch):
     from config import STORAGE_CONFIG
 
     monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://dummy")
+
+
+class _FakeRedis:
+    """最小 Redis 替身：只实现偏好版本用到的 GET / INCR / EXPIRE。"""
+
+    def __init__(self):
+        self.data = {}
+        self.get_calls = 0
+        self.incr_calls = []
+        self.expire_calls = []
+        self.events = None  # 可选：与 _FakeStore 共用的调用序列
+
+    def get(self, key):
+        self.get_calls += 1
+        if self.events is not None:
+            self.events.append("version")
+        return self.data.get(key)
+
+    def incr(self, key):
+        self.incr_calls.append(key)
+        if self.events is not None:
+            self.events.append("incr")
+        self.data[key] = int(self.data.get(key, 0)) + 1
+        return self.data[key]
+
+    def expire(self, key, ttl):
+        self.expire_calls.append((key, ttl))
+        return True
+
+
+class _BrokenRedis:
+    """模拟 Redis 故障：读写都抛连接错误。"""
+
+    def __init__(self):
+        self.get_calls = 0
+        self.incr_calls = []
+
+    def get(self, key):
+        self.get_calls += 1
+        raise ConnectionError("redis down")
+
+    def incr(self, key):
+        self.incr_calls.append(key)
+        raise ConnectionError("redis down")
+
+
+def _with_redis(monkeypatch, client):
+    from context import storage as storage_module
+
+    # 冷却状态跨用例共享：每个用例从干净的冷却状态开始
+    storage_module.reset_pref_version_failure()
+    monkeypatch.setattr(
+        storage_module, "get_shared_redis_client", lambda *a, **k: client
+    )
 
 
 def test_json_backend_does_not_cache(monkeypatch):
@@ -165,6 +222,149 @@ def test_orchestration_invalidates_after_preference_write():
     print("✓ 偏好写入后立即失效快照缓存")
 
 
+def test_shared_version_invalidates_cross_process_cache(monkeypatch):
+    """其它进程写入偏好（版本 INCR）后本进程立即重读，不等满 TTL。"""
+    _with_pg(monkeypatch)
+    redis = _FakeRedis()
+    _with_redis(monkeypatch, redis)
+    manager, storage = _manager()
+    try:
+        store = _FakeStore(snapshot_based=False)
+        manager.long_term = store
+        manager.get_preferences()
+        manager.get_preferences()
+        assert store.reads == 1, "版本未变应命中缓存"
+        redis.incr("aligo:prefver:pref_cache_user")  # 模拟其它实例 / CLI 写入
+        manager.get_preferences()
+        assert store.reads == 2, "版本变化后应立即重新读取"
+        print("✓ 共享版本变化立即失效跨进程偏好缓存")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_shared_version_failure_keeps_ttl_cache(monkeypatch):
+    """Redis 故障时退回原有 TTL 缓存语义，并进入 60 秒本地冷却。"""
+    _with_pg(monkeypatch)
+    redis = _BrokenRedis()
+    _with_redis(monkeypatch, redis)
+    manager, storage = _manager()
+    try:
+        store = _FakeStore(snapshot_based=False)
+        manager.long_term = store
+        manager.get_preferences()
+        manager.get_preferences()
+        assert store.reads == 1, "Redis 故障时按 TTL 命中缓存"
+        # 操作级冷却：故障期不能每次读都等满 socket 超时
+        assert redis.get_calls == 1, "冷却期内不应再触达 Redis"
+        print("✓ Redis 故障时偏好缓存按 TTL 兜底并进入冷却")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_version_protocol_order(monkeypatch):
+    """锁死读侧顺序：先取版本再读偏好；缓存命中时只取版本不读库。"""
+    _with_pg(monkeypatch)
+    events = []
+    redis = _FakeRedis()
+    redis.events = events
+    _with_redis(monkeypatch, redis)
+    manager, storage = _manager()
+    try:
+        store = _FakeStore(snapshot_based=False, events=events)
+        manager.long_term = store
+        manager.get_preferences()
+        assert events == ["version", "read"], events
+        events.clear()
+        manager.get_preferences()
+        assert events == ["version"], "命中缓存不应再读库"
+        print("✓ 版本先于偏好读取，缓存命中只取版本")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_postgres_preference_writes_bump_shared_version(monkeypatch):
+    """PG 存储层在偏好写入 / 删除 / 清空后推进跨进程版本键。"""
+    import contextlib
+    import json
+
+    from context import storage as storage_module
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    events = []
+    redis = _FakeRedis()
+    redis.events = events
+    monkeypatch.setattr(
+        storage_module, "get_shared_redis_client", lambda *a, **k: redis
+    )
+    storage_module.reset_pref_version_failure()
+    store = PostgresLongTermMemory.__new__(PostgresLongTermMemory)
+    store.user_id = "pref_cache_user"
+    store._conn_generation = 0
+    monkeypatch.setattr(
+        store, "_preference_lock", lambda pref_type: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        store, "_preference_cap_lock", lambda: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(store, "_enforce_preference_cap", lambda pref_type: None)
+    monkeypatch.setattr(
+        store, "_abort_if_generation_changed", lambda generation: None
+    )
+    monkeypatch.setattr(
+        store, "_execute", lambda *a, **k: events.append("execute")
+    )
+    monkeypatch.setattr(
+        store, "_json", lambda value: json.dumps(value, ensure_ascii=False)
+    )
+
+    store.save_preference("hotel_brands", "汉庭")
+    assert redis.incr_calls == ["aligo:prefver:pref_cache_user"]
+    # 顺序不变量：写库提交之后才推进版本（提前 INCR 会让别的进程把旧数据
+    # 记到新版本号下，快照此后一直命中）
+    assert events == ["execute", "incr"], events
+    # 版本键带 TTL：不能给每个写过偏好的用户永久留键
+    assert redis.expire_calls[-1][0] == "aligo:prefver:pref_cache_user"
+    assert redis.expire_calls[-1][1] >= 3600
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    store._conn = _Conn()
+    monkeypatch.setattr(store, "_run_with_retry", lambda fn, **kwargs: fn())
+    assert store.delete_preference("hotel_brands") is True
+    assert len(redis.incr_calls) == 2, "删除应推进版本"
+
+    store.delete_all()
+    assert len(redis.incr_calls) == 3, "整表清空应推进版本"
+
+    # 版本推进失败不能影响写入本身，且冷却期内不再触达 Redis
+    broken = _BrokenRedis()
+    monkeypatch.setattr(
+        storage_module, "get_shared_redis_client", lambda *a, **k: broken
+    )
+    storage_module.reset_pref_version_failure()
+    store.save_preference("airlines", "东航")
+    assert broken.incr_calls == ["aligo:prefver:pref_cache_user"]
+    store.save_preference("airlines", "东航")
+    assert broken.incr_calls == ["aligo:prefver:pref_cache_user"], (
+        "冷却期内不应再触达 Redis"
+    )
+    print("✓ PG 偏好写入 / 删除 / 清空推进共享版本（提交后 INCR + TTL）")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -176,6 +376,10 @@ if __name__ == "__main__":
         test_pg_backend_cache_hit_and_invalidation,
         test_invalidate_all_preference_caches,
         test_pg_cache_ttl_expiry,
+        test_shared_version_invalidates_cross_process_cache,
+        test_shared_version_failure_keeps_ttl_cache,
+        test_version_protocol_order,
+        test_postgres_preference_writes_bump_shared_version,
     ):
         _mp = pytest.MonkeyPatch()
         try:
