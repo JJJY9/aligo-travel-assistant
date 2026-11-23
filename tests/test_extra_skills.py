@@ -10,6 +10,8 @@ import json
 import os
 import sys
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -76,10 +78,57 @@ def test_extra_skills_reply_with_uniform_result():
         print(f"✓ {skill} 统一返回结构")
 
 
-def test_extra_skill_empty_model_response_is_error():
-    """模型返回空串：技能按错误状态返回，不伪装成功。"""
+def test_extra_skill_empty_model_response_is_retriable():
+    """模型返回空串：按可重试错误上抛，由编排层退避重试 / 记账。"""
     agent_class = _load("trip-budget", "TripBudgetAgent")
     agent = agent_class(model=_Model(response=""))
+    with pytest.raises(ConnectionError):
+        asyncio.run(
+            agent.reply(
+                Msg(
+                    name="orchestrator",
+                    content=json.dumps({"context": {"rewritten_query": "预算"}}),
+                    role="user",
+                )
+            )
+        )
+    print("✓ 扩展技能空响应按可重试错误上抛")
+
+
+def test_extra_skill_permanent_llm_error_propagates():
+    """401/402 等永久模型故障必须上抛给熔断器，不能吞成普通错误结果。"""
+
+    class _AuthError(Exception):
+        status_code = 401
+
+    class _AuthModel(_Model):
+        async def __call__(self, messages, **kwargs):
+            raise _AuthError("invalid api key")
+
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=_AuthModel())
+    with pytest.raises(_AuthError):
+        asyncio.run(
+            agent.reply(
+                Msg(
+                    name="orchestrator",
+                    content=json.dumps({"context": {"rewritten_query": "预算"}}),
+                    role="user",
+                )
+            )
+        )
+    print("✓ 扩展技能永久模型错误上抛")
+
+
+def test_extra_skill_non_transient_error_returns_error():
+    """非上游故障（如本地输出处理失败）仍按错误状态返回，不误触发重试。"""
+
+    class _BadModel(_Model):
+        async def __call__(self, messages, **kwargs):
+            raise ValueError("输出无法处理")
+
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=_BadModel())
     out = asyncio.run(
         agent.reply(
             Msg(
@@ -91,8 +140,75 @@ def test_extra_skill_empty_model_response_is_error():
     )
     data = json.loads(out.content)
     assert data["status"] == "error", data
-    assert "空响应" in data["message"]
-    print("✓ 扩展技能空响应按错误返回")
+    assert "输出无法处理" in data["message"]
+    print("✓ 扩展技能确定性错误按错误状态返回")
+
+
+def test_extra_skill_prompt_combines_skill_md_and_system_prompt():
+    """SKILL.md 与子类 system_prompt 都要进入指令（此前 system_prompt 是死代码）。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps({"context": {"rewritten_query": "预算"}}),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    assert "Trip Budget Skill" in prompt, "SKILL.md 指令缺失"
+    assert "差旅预算助手" in prompt, "子类 system_prompt 指令缺失"
+    print("✓ 扩展技能指令合并 SKILL.md 与 system_prompt")
+
+
+def test_extra_skill_unwraps_json_envelope():
+    """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    envelope = json.dumps(
+        {"status": "success", "budget_advice": "分项预算正文"},
+        ensure_ascii=False,
+    )
+    agent = agent_class(model=_Model(response=envelope))
+    out = asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps({"context": {"rewritten_query": "预算"}}),
+                role="user",
+            )
+        )
+    )
+    data = json.loads(out.content)
+    assert data["status"] == "success", data
+    assert data["budget_advice"] == "分项预算正文"
+    assert data["answer"] == "分项预算正文"
+    print("✓ 扩展技能解包模型 JSON 信封")
+
+
+def test_extra_skill_long_context_keeps_json_structure():
+    """超长上下文按字段裁剪，数据块仍是可解析的 JSON（不再腰斩）。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    payload = {
+        "context": {
+            "rewritten_query": "预算",
+            "previous_results": [{"content": "长" * 20000}],
+        }
+    }
+    asyncio.run(
+        agent.reply(Msg(name="orchestrator", content=json.dumps(payload), role="user"))
+    )
+    prompt = model.prompts[0]
+    block = prompt.split("<<<\n", 1)[1].split("\n>>>", 1)[0]
+    parsed = json.loads(block)
+    content = parsed["context"]["previous_results"][0]["content"]
+    assert content.endswith("…（已截断）"), content[-20:]
+    assert len(content) < 20000
+    print("✓ 扩展技能超长上下文保持 JSON 结构")
 
 
 def test_registry_discovers_extra_skills():
@@ -113,6 +229,11 @@ if __name__ == "__main__":
 
     _stdio.ensure_utf8()
     test_extra_skills_reply_with_uniform_result()
-    test_extra_skill_empty_model_response_is_error()
+    test_extra_skill_empty_model_response_is_retriable()
+    test_extra_skill_permanent_llm_error_propagates()
+    test_extra_skill_non_transient_error_returns_error()
+    test_extra_skill_prompt_combines_skill_md_and_system_prompt()
+    test_extra_skill_unwraps_json_envelope()
+    test_extra_skill_long_context_keeps_json_structure()
     test_registry_discovers_extra_skills()
     print("\n全部通过")
