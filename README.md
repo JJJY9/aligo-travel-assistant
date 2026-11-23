@@ -304,7 +304,7 @@ python tests/test_memory_system.py
 
 **技术方案**：
 - **向量数据库**: Milvus（本地存储）
-- **Embedding模型**: BGE-small-zh-v1.5（中文向量化，本地部署 `data/models/bge-small-zh-v1.5`）
+- **Embedding模型**: 默认 BGE-small-zh-v1.5（中文向量化，本地部署 `data/models/bge-small-zh-v1.5`）；可用 `RAG_EMBEDDING_MODEL` 指向其它本地模型（如 BAAI/bge-m3），维度按模型配置探测；问答阈值 `RAG_MIN_SCORE` 可覆盖默认 0.5（钳制 0–1）
 - **文档处理**: 按小节切分（Chunking，章节 / FAQ 边界强制断块，块长 ≤ 400 字）
 - **检索算法（v2.0 混合检索）**: 向量余弦 + BM25（中文按字符二元组切词，无需分词器）双路召回，按 RRF 融合取 Top-K；可选 `RAG_RERANK_MODEL`（如 `BAAI/bge-reranker-base`）对候选做 cross-encoder 精排（默认关闭，不额外下载模型）。BM25 索引按知识库进程内缓存（`RAG_BM25_TTL_SEC`，写入即失效），片段数超过 `RAG_BM25_MAX_DOCS` 时自动退回纯向量；管理 / 评测接口保持纯向量口径
 - **可追溯性**: 返回文档来源，支持知识溯源

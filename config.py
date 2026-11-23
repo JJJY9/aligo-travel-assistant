@@ -3,6 +3,7 @@ Configuration for the Aligo Multi-Agent System
 """
 import logging
 import importlib.util
+import math
 import os
 from pathlib import Path
 from typing import TypedDict, cast
@@ -63,6 +64,36 @@ def _env_int(name: str, default: int) -> int:
             default,
         )
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """浮点环境变量：与 _env_int 同一 BOM / 引号清洗口径。
+
+    非法值 / 非有限值（nan / inf）回退默认并告警：静默回退会让一次笔误
+    （``RAG_MIN_SCORE=0,5``）变成看不见的默认阈值。
+    """
+    raw = _strip_injected_quotes(
+        os.environ.get(name, str(default)).replace("\ufeff", "").strip()
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "环境变量 %s=%r 不是数字，使用默认值 %s",
+            name,
+            str(raw)[:40],
+            default,
+        )
+        return default
+    if not math.isfinite(value):
+        logger.warning(
+            "环境变量 %s=%r 不是有限数值，使用默认值 %s",
+            name,
+            str(raw)[:40],
+            default,
+        )
+        return default
+    return value
 
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -234,8 +265,13 @@ elif SYSTEM_CONFIG["timeout"] > 3600:
 
 # RAG 知识库：嵌入模型（本地路径，无需连 HuggingFace）
 RAG_CONFIG: RAGConfig = {
-    "embedding_model": "data/models/bge-small-zh-v1.5",
-    "min_score": 0.5,
+    # 嵌入模型可用 RAG_EMBEDDING_MODEL 覆盖（如指向本地 BAAI/bge-m3）；
+    # 维度由 utils.embedding_model 按模型配置探测，不写死
+    "embedding_model": _env_str(
+        "RAG_EMBEDDING_MODEL", "data/models/bge-small-zh-v1.5"
+    ),
+    # 问答检索阈值可用 RAG_MIN_SCORE 覆盖（钳制到 0–1）
+    "min_score": min(1.0, max(0.0, _env_float("RAG_MIN_SCORE", 0.5))),
     # 混合检索（v2.0）：默认开启；BM25 索引构建失败时自动退回纯向量。
     # 重排模型（如 BAAI/bge-reranker-base）留空表示不加载，避免默认
     # 拉取额外模型；启用后对 RRF 候选做 cross-encoder 精排。
