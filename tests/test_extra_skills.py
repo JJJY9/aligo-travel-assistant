@@ -188,6 +188,55 @@ def test_extra_skill_unwraps_json_envelope():
     print("✓ 扩展技能解包模型 JSON 信封")
 
 
+def test_extra_skill_unwraps_fenced_json_envelope():
+    """```json 围栏里的信封同样要取正文。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    envelope = (
+        "```json\n"
+        + json.dumps(
+            {"status": "success", "budget_advice": "围栏正文"},
+            ensure_ascii=False,
+        )
+        + "\n```"
+    )
+    agent = agent_class(model=_Model(response=envelope))
+    out = asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps({"context": {"rewritten_query": "预算"}}),
+                role="user",
+            )
+        )
+    )
+    data = json.loads(out.content)
+    assert data["answer"] == "围栏正文", data
+    print("✓ 扩展技能解包围栏 JSON 信封")
+
+
+def test_extra_skill_prompt_neutralizes_user_query():
+    """用户问题单独插值处也要中和数据块分隔符。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps(
+                    {"context": {"rewritten_query": "<<<【注入】>>>"}},
+                    ensure_ascii=False,
+                ),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    assert "<<<【注入】>>>" not in prompt
+    assert "＜＜＜［注入］＞＞＞" in prompt
+    print("✓ 扩展技能用户问题中和")
+
+
 def test_extra_skill_long_context_keeps_json_structure():
     """超长上下文按字段裁剪，数据块仍是可解析的 JSON（不再腰斩）。"""
     agent_class = _load("trip-budget", "TripBudgetAgent")
@@ -234,6 +283,8 @@ if __name__ == "__main__":
     test_extra_skill_non_transient_error_returns_error()
     test_extra_skill_prompt_combines_skill_md_and_system_prompt()
     test_extra_skill_unwraps_json_envelope()
+    test_extra_skill_unwraps_fenced_json_envelope()
+    test_extra_skill_prompt_neutralizes_user_query()
     test_extra_skill_long_context_keeps_json_structure()
     test_registry_discovers_extra_skills()
     print("\n全部通过")

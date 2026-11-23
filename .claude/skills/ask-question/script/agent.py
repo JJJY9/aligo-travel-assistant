@@ -874,13 +874,20 @@ class RAGKnowledgeAgent(AgentBase):
             grouped.setdefault(str(group), []).append((part, doc))
 
         for group_id, parts in grouped.items():
-            # 同名 part 的重复项取高分者（整组替换窗口内新旧分片可能共存）
-            parts.sort(
-                key=lambda item: (
-                    item[0],
-                    -float(item[1].get("distance") or 0.0),
-                )
-            )
+            # 同名 part 的重复项取高分者（整组替换窗口内新旧分片可能共存）：
+            # 有精排分时以精排为准，否则按向量相似度——只按 distance 会
+            # 把精排更看好的分片丢掉，抵消函数末尾的精排顺序
+            def _part_rank(item):
+                part_no, doc = item
+                rerank_value = doc.get("rerank_score")
+                if rerank_value is not None:
+                    try:
+                        return (part_no, 0, -float(rerank_value))
+                    except (TypeError, ValueError):
+                        pass
+                return (part_no, 1, -float(doc.get("distance") or 0.0))
+
+            parts.sort(key=_part_rank)
             seen_parts: set[int] = set()
             texts: list[str] = []
             best_score = 0.0

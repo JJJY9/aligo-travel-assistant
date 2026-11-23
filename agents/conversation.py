@@ -324,6 +324,9 @@ class ConversationRuntime:
                     reply_options["checkpoint_scope"] = (
                         f"{user_id}:{session_id}"
                     )
+            checkpoint_key_for_turn = (
+                str(reply_options.get("checkpoint_key") or "") or None
+            )
             orchestration = await self._call_with_resilience(
                 lambda: self.orchestrator.reply(
                     sanitized_intention,
@@ -378,7 +381,11 @@ class ConversationRuntime:
                 )
             )
             if defer_supported:
-                pending.add_done_callback(self._commit_deferred_after_persist)
+                pending.add_done_callback(
+                    lambda fut: self._commit_deferred_after_persist(
+                        fut, checkpoint_key=checkpoint_key_for_turn
+                    )
+                )
             persist_started = True
             committed = await asyncio.shield(pending)
         except BaseException:
@@ -420,12 +427,7 @@ class ConversationRuntime:
             settlement["done"] = True
             # 整轮已落库：检查点只服务于同一轮的重试 / 重启，成功后再用
             # 同一键请求必须重新执行，不能静默返回上一问缓存的子结果
-            clear_checkpoint = getattr(self.orchestrator, "clear_checkpoint", None)
-            if callable(clear_checkpoint):
-                try:
-                    clear_checkpoint()
-                except Exception:  # noqa: BLE001 - 清理失败不影响已完成的回合
-                    logger.warning("清理执行检查点失败", exc_info=True)
+            self._clear_checkpoint()
             if defer_supported:
                 # 现在才提交偏好 / 行程；取消与墓碑否决的回合不会执行到这里，
                 # 避免台账出现没有对话的事实记录。落库完成回调可能已调度提交
@@ -519,7 +521,31 @@ class ConversationRuntime:
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
             logger.warning("回滚暂存提问失败", exc_info=True)
 
-    def _commit_deferred_after_persist(self, fut: asyncio.Future) -> None:
+    def _clear_checkpoint(self) -> None:
+        """丢弃本轮检查点（成功落库后调用；失败只记日志）。"""
+        clear = getattr(self.orchestrator, "clear_checkpoint", None)
+        if not callable(clear):
+            return
+        try:
+            clear()
+        except Exception:  # noqa: BLE001 - 清理失败不影响已完成的回合
+            logger.warning("清理执行检查点失败", exc_info=True)
+
+    def _clear_checkpoint_key(self, key: str) -> None:
+        """按轮次键清理检查点（迟到的落库回调使用，避免误删下一轮）。"""
+        clear_key = getattr(self.orchestrator, "clear_checkpoint_key", None)
+        if callable(clear_key):
+            try:
+                clear_key(key)
+            except Exception:  # noqa: BLE001 - 清理失败不影响已完成的回合
+                logger.warning("清理执行检查点失败", exc_info=True)
+            return
+        # 旧编排器没有按键清理：退回清理当前键（同进程版本一致时适用）
+        self._clear_checkpoint()
+
+    def _commit_deferred_after_persist(
+        self, fut: asyncio.Future, checkpoint_key: str | None = None
+    ) -> None:
         """落库完成回调：提交成功时补做延迟的偏好 / 行程写入。
 
         取消落在落库线程执行期间时，``ask()`` 的正常收尾路径不会执行，但
@@ -534,6 +560,12 @@ class ConversationRuntime:
             return
         if outcome is False:
             return
+        # 取消发生在落库线程执行期间：正常路径的清理不会执行，但整轮已
+        # 落库，检查点同样必须丢弃（按本轮键清理，不能误删下一轮的）
+        if checkpoint_key:
+            self._clear_checkpoint_key(checkpoint_key)
+        else:
+            self._clear_checkpoint()
         self._schedule_deferred_commit()
 
     def _session_deleted_now(self) -> bool:

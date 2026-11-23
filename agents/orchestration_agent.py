@@ -964,6 +964,24 @@ class OrchestrationAgent(AgentBase):
         except Exception as exc:  # noqa: BLE001 - 清理失败不影响对话
             logger.warning("清理执行检查点失败: %s", exc)
 
+    def clear_checkpoint_key(self, key: str) -> None:
+        """清理指定键的检查点（取消回合的迟到落库回调使用）。
+
+        不能只清「当前键」：上一轮取消后落库线程完成时，下一轮可能已经开始，
+        按当前键清会误删新一轮的检查点。
+        """
+        target = str(key or "").strip()
+        store = getattr(self, "_checkpoint_store", None)
+        if not target or store is None:
+            return
+        try:
+            store.clear(target)
+        except Exception as exc:  # noqa: BLE001 - 清理失败不影响对话
+            logger.warning("清理执行检查点失败: %s", exc)
+        if getattr(self, "_checkpoint_key", None) == target:
+            self._checkpoint_key = None
+            self._checkpoint_scope = None
+
     async def _execute_agent(
         self,
         agent_name: str,
