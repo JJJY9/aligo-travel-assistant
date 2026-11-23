@@ -518,6 +518,7 @@ class RAGKnowledgeAgent(AgentBase):
         top_k: int | None = None,
         strict: bool = False,
         hybrid: bool = False,
+        min_distance: float | None = None,
     ) -> list[dict]:
         """
         检索知识库
@@ -530,6 +531,9 @@ class RAGKnowledgeAgent(AgentBase):
             hybrid: 是否启用混合检索（向量 + BM25 + RRF）。仅聊天问答
                 路径开启；管理 / 评测接口保持纯向量口径。配置
                 RAG_CONFIG["hybrid_enabled"] 为 False 时仍退回纯向量。
+            min_distance: 混合检索的证据门槛（聊天链路传 min_score）：
+                先按 distance 过滤再精排 / 截断。精排分与 distance 不是
+                同一量纲，先截断会把通过阈值的片段挤出 top-K。
 
         Returns:
             检索结果列表
@@ -620,7 +624,9 @@ class RAGKnowledgeAgent(AgentBase):
                     })
 
             if hybrid and retrieved_docs:
-                retrieved_docs = self._hybrid_search(query, retrieved_docs, k)
+                retrieved_docs = self._hybrid_search(
+                    query, retrieved_docs, k, min_distance
+                )
 
             logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query[:50]}")
             return retrieved_docs
@@ -743,7 +749,11 @@ class RAGKnowledgeAgent(AgentBase):
         return rows
 
     def _hybrid_search(
-        self, query: str, vector_docs: list[dict], top_k: int
+        self,
+        query: str,
+        vector_docs: list[dict],
+        top_k: int,
+        min_distance: float | None = None,
     ) -> list[dict]:
         """向量 + BM25 → RRF 融合 → 可选重排；任何一步失败都退回向量结果。"""
         enabled, candidates = self._hybrid_settings()
@@ -786,6 +796,15 @@ class RAGKnowledgeAgent(AgentBase):
                 if str(doc.get("id") or "") in bm25_scores
             },
         )
+        if min_distance is not None:
+            # 证据门槛先于精排 / 截断：精排分与 distance 不在同一量纲，
+            # 先按精排截断会把通过阈值的片段挤出 top-K，有证据也拒答。
+            # 精排只负责给已过门槛的候选排序
+            fused = [
+                doc
+                for doc in fused
+                if float(doc.get("distance") or 0.0) >= min_distance
+            ]
         fused = self._rerank_documents(query, fused)
         return fused[:top_k]
 
@@ -1049,12 +1068,30 @@ class RAGKnowledgeAgent(AgentBase):
                 role="assistant",
             )
 
+        # 低分片段（与商旅知识无关的问题）不能当知识注入：实测无关查询的
+        # top 分通常 <0.5、相关命中 >0.6；阈值可由 RAG_CONFIG["min_score"]
+        # 调整（评测 / 管理接口走 search_knowledge 原始结果，不传门槛）。
+        # 混合检索把同一阈值作为 min_distance：先过滤再精排 / 截断，精排
+        # 分与 distance 量纲不同，不能先截断后过滤
+        min_score = 0.5
+        try:
+            from config import RAG_CONFIG
+
+            min_score = float(RAG_CONFIG.get("min_score", min_score))
+        except Exception:  # noqa: BLE001 - 配置异常按默认值
+            pass
+
         # 检索相关知识。嵌入模型编码与 Milvus 查询是同步阻塞调用，
         # 放到线程池执行，避免卡住事件循环（SSE 心跳与其它会话）。
         # strict=True：后端故障要显式报错，不能伪装成「知识库没有相关信息」
         try:
             retrieved_docs = await asyncio.to_thread(
-                self.search_knowledge, user_query, None, True, hybrid=True
+                self.search_knowledge,
+                user_query,
+                None,
+                True,
+                hybrid=True,
+                min_distance=min_score,
             )
         except Exception as exc:  # noqa: BLE001 - 知识库故障转为智能体错误
             logger.warning("知识库检索失败: %s", exc)
@@ -1078,16 +1115,8 @@ class RAGKnowledgeAgent(AgentBase):
                 role="assistant",
             )
 
-        # 低分片段（与商旅知识无关的问题）不能当知识注入：实测无关查询的
-        # top 分通常 <0.5、相关命中 >0.6；阈值可由 RAG_CONFIG["min_score"]
-        # 调整（评测 / 管理接口走 search_knowledge 原始结果，不受影响）
-        min_score = 0.5
-        try:
-            from config import RAG_CONFIG
-            min_score = float(RAG_CONFIG.get("min_score", min_score))
-        except Exception:
-            pass
-
+        # 二次过滤兜底：混合检索已在截断前按 min_distance 过滤；纯向量
+        # 回退路径（混合被关闭 / BM25 无命中）仍在这里按同一阈值过滤
         def _above_threshold(docs: list[dict]) -> list[dict]:
             return [
                 doc
@@ -1109,6 +1138,7 @@ class RAGKnowledgeAgent(AgentBase):
                         None,
                         True,
                         hybrid=True,
+                        min_distance=min_score,
                     )
                 except Exception as exc:  # noqa: BLE001 - 重检索失败按无结果
                     logger.warning("简化查询重检索失败: %s", exc)
