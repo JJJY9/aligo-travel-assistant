@@ -28,6 +28,7 @@ from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from context.short_term_memory import (
     RedisShortTermMemory,
+    _assistant_turn_id_after,
     redis_short_term_available,
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
@@ -899,16 +900,23 @@ class ConversationRuntime:
                         redis_degraded = False
                 try:
                     if not redis_degraded:
-                        for item in recent:
+                        items = list(recent)
+                        for index, item in enumerate(items):
                             role = item.get("role")
                             content = item.get("content")
                             if role not in ("user", "assistant") or not isinstance(
                                 content, str
                             ):
                                 continue
+                            metadata = None
+                            if role == "user":
+                                turn_id = _assistant_turn_id_after(items, index)
+                                if turn_id:
+                                    metadata = {"client_turn_id": turn_id}
                             self.memory.short_term.add_message(
                                 role,
                                 content,
+                                metadata=metadata,
                                 timestamp=(
                                     item.get("timestamp")
                                     if isinstance(item.get("timestamp"), str)

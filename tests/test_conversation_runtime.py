@@ -1109,7 +1109,9 @@ def test_empty_short_term_backfills_current_session_history():
             return list(self.added[-n_turns * 2 :])
 
         def add_message(self, role, content, metadata=None, timestamp=None):
-            self.added.append({"role": role, "content": content})
+            self.added.append(
+                {"role": role, "content": content, "metadata": metadata}
+            )
 
     class _LongTerm:
         def __init__(self):
@@ -1124,9 +1126,13 @@ def test_empty_short_term_backfills_current_session_history():
             assert limit == 10
             assert session_id == runtime.session_id
             self.history_reads += 1
+            assistant = json.dumps(
+                {"answer": "已改到周五", "_meta": {"client_turn_id": "t-hist"}},
+                ensure_ascii=False,
+            )
             return [
                 {"role": "user", "content": "帮我把行程改到周五"},
-                {"role": "assistant", "content": "已改到周五"},
+                {"role": "assistant", "content": assistant},
             ]
 
     short_term = _EmptyShortTerm()
@@ -1139,10 +1145,14 @@ def test_empty_short_term_backfills_current_session_history():
     )
     assert "帮我把行程改到周五" in contents, contents
     assert "已改到周五" in contents, contents
-    assert [item["content"] for item in short_term.added] == [
-        "帮我把行程改到周五",
-        "已改到周五",
-    ], "回填内容必须写回短期记忆（编排器直接从那里读取）"
+    assert short_term.added[0]["content"] == "帮我把行程改到周五", (
+        "回填内容必须写回短期记忆（编排器直接从那里读取）"
+    )
+    assert "已改到周五" in short_term.added[1]["content"], short_term.added[1]
+    assert short_term.added[0]["metadata"] == {"client_turn_id": "t-hist"}, (
+        "回填的用户消息应从助手 _meta 补上回合 id"
+    )
+    assert short_term.added[1]["metadata"] is None, short_term.added[1]
 
     # 第二轮：短期记忆已非空，不能再读长期历史，且上下文仍包含回填内容
     asyncio.run(runtime.ask("第二天呢"))

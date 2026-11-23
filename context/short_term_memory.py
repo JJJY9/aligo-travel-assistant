@@ -14,10 +14,11 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from utils.timestamps import parse_iso_datetime
 from utils.tombstones import DEFAULT_TOMBSTONE_TTL_SEC
+from utils.turn_meta import extract_turn_meta
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,30 @@ def message_content_id(message: dict[str, Any]) -> str:
         ensure_ascii=False,
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _assistant_turn_id_after(
+    messages: Sequence[dict[str, Any]], index: int
+) -> str:
+    """回填历史里用户消息的回合 id：取紧随其后助手消息的 _meta。
+
+    长期记忆只把 ``client_turn_id`` 写在助手消息的 ``_meta`` 里；回填时
+    把它补到对应用户消息的 metadata 上，重启 / LRU 淘汰后回填的旧轮次
+    也能按回合 id 精确截断（否则只能退回文本匹配）。
+    """
+    for item in messages[index + 1 :]:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        if not isinstance(content, str):
+            return ""
+        meta = extract_turn_meta(content)
+        if isinstance(meta, dict):
+            return str(meta.get("client_turn_id") or "")
+        return ""
+    return ""
 
 
 # 原子地删除最后一轮（助手 + 用户）消息。ARGV[1] 为 "1" 时校验最后一条
@@ -825,7 +850,8 @@ class RedisShortTermMemory:
         重放（此前只写影子、不登记——故障期回填的历史在恢复后第一次成功
         读取就被 Redis 内容覆盖，本会话更早的轮次从此不再进入模型上下文）。
         """
-        for message in messages:
+        items = list(messages)
+        for index, message in enumerate(items):
             if not isinstance(message, dict):
                 continue
             role = message.get("role")
@@ -833,11 +859,18 @@ class RedisShortTermMemory:
             if role not in ("user", "assistant") or not isinstance(content, str):
                 continue
             timestamp = _canonical_timestamp(message.get("timestamp"))
+            metadata: dict[str, Any] = {}
+            if role == "user":
+                turn_id = _assistant_turn_id_after(items, index)
+                if turn_id:
+                    # 与实时暂存同口径：回填的用户消息也带回合 id，后续
+                    # 「删除最后一轮」可以精确匹配而不是退回文本匹配
+                    metadata["client_turn_id"] = turn_id
             entry = {
                 "role": role,
                 "content": content,
                 "timestamp": timestamp or datetime.now().isoformat(),
-                "metadata": {},
+                "metadata": metadata,
             }
             self._push_message(entry, ordered=True)
         self._shadow_last_activity = time.monotonic()
