@@ -4852,6 +4852,12 @@ def create_app(model: Any = None) -> FastAPI:
             if idem_key is not None:
                 cached = state.idempotency.get(idem_key)
                 if cached is not None:
+                    # 会话已由 _get_session_marked 标记在用：回放也必须
+                    # 归还占用标记，否则缓存命中的请求会把会话永久占住
+                    try:
+                        await session.runtime.drain_pending_persist()
+                    finally:
+                        session.end_turn()
                     response.headers.update(rate_headers)
                     response.headers["X-Idempotent-Replay"] = "1"
                     return cached

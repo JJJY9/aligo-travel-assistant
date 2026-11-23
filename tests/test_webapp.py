@@ -843,6 +843,9 @@ def test_chat_idempotency_key_replays_without_rerun():
         assert second.headers.get("x-idempotent-replay") == "1"
         assert second.json() == first.json(), "重放必须返回同一份响应"
         assert counting.calls == calls_after_first, "重放不能重新执行模型"
+        state = client.app.state.aligo
+        session = state.sessions[state._session_key(user_id, "sess-idem")]
+        assert session.in_use() is False, "回放后必须归还会话占用标记"
 
         third = client.post(
             "/api/chat", json={**payload, "idempotency_key": "req-2"}
