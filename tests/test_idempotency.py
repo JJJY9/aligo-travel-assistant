@@ -14,7 +14,7 @@ from utils import idempotency
 from utils.idempotency import IdempotencyCache, make_key
 
 
-def test_put_get_returns_deep_copy(monkeypatch):
+def test_put_get_returns_deep_copy():
     """读出的是深拷贝：修改返回值不会污染缓存。"""
     cache = IdempotencyCache()
     key = make_key("u1", "s1", "req-1")
@@ -78,7 +78,7 @@ if __name__ == "__main__":
 
     mp = pytest.MonkeyPatch()
     try:
-        test_put_get_returns_deep_copy(mp)
+        test_put_get_returns_deep_copy()
         test_ttl_expiry(mp)
     finally:
         mp.undo()
