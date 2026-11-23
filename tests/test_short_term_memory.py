@@ -86,6 +86,29 @@ def test_truncate_empty_turn_id_skips_check():
     print("✓ 空串回合 id 按无 id 处理")
 
 
+def test_seed_fallback_carries_turn_ids():
+    """回填到影子缓存时，用户消息从紧随其后的助手 _meta 补回合 id。"""
+    from context import short_term_memory as module
+
+    memory = module.RedisShortTermMemory(
+        _BrokenRedis(), "s-seed", max_turns=5, user_id="u1"
+    )
+    assistant = json.dumps(
+        {"answer": "好的", "_meta": {"client_turn_id": "t-seed"}},
+        ensure_ascii=False,
+    )
+    memory.seed_fallback_context(
+        [
+            {"role": "user", "content": "帮我改行程"},
+            {"role": "assistant", "content": assistant},
+        ]
+    )
+    recent = memory.get_recent_context()
+    assert recent[0]["metadata"] == {"client_turn_id": "t-seed"}, recent[0]
+    assert recent[1]["metadata"] == {}, recent[1]
+    print("✓ 回填影子缓存携带回合 id")
+
+
 def test_truncate_trailing_user_only():
     memory = ShortTermMemory()
     memory.add_message("user", "只有提问")
