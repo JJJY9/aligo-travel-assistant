@@ -72,6 +72,9 @@ def test_annotate_hybrid_scores_uses_max_of_vector_and_normalized_bm25():
 
 
 if __name__ == "__main__":
+    import _stdio
+
+    _stdio.ensure_utf8()
     test_tokenize_chinese_bigrams_and_ascii_words()
     test_bm25_ranks_keyword_match()
     test_rrf_prefers_documents_in_both_lists()
