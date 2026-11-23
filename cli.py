@@ -3140,7 +3140,10 @@ def run_user_export_standalone(
     （`python cli.py user-export <user_id> [dir] [--with-knowledge]`）。
 
     ``--with-knowledge`` 把全局知识库片段一并写入 JSON（一体化备份，便于
-    迁移到另一台机器后一次恢复）。
+    迁移到另一台机器后一次恢复）。知识库是全局存量、可被推到导出上限
+    之外：仅知识轴超限（或分片计划暂无法核对）且用户数据本身仍可导出时，
+    备份省略 ``knowledge`` 段继续写出（退出码 0，stderr 警告），知识库请
+    单独使用 ``kb-export``；用户数据轴超限仍中止（退出码 1）。
 
     与交互模式的 export 命令输出同两份文件（utils.exporter.export_files）：
     偏好、历史行程、统计与全部对话历史；默认写入 `exports/`。
@@ -3216,14 +3219,23 @@ def run_user_export_standalone(
             print(f"读取知识库失败：{exc}")
             return 1
 
+    from utils.exporter import sanitize_backup_data
     from utils.user_import import backup_limit_problem, export_backup_limit_problem
 
+    # 预检必须与落盘内容同口径：export_files 写盘前会 sanitize_backup_data
+    # （孤立代理项转义 / 非有限数归一），Web /api/export 同样先清洗再预检。
+    # 用原始行预检会把含代理项的知识行误判「恢复时会被跳过」（写出后其实
+    # 是合法内容），计划体积轴也漏算这些行恢复时的重切分体积。
+    data = sanitize_backup_data(data)
     # 导出文件固定 LF（exporter write_text_atomic newline="\n"）：体积轴
     # 按 LF 估算，CLI 与 Web 导出同字节、同口径。原始备份与「导入空库」
     # 的知识分片计划都要可导入：前者是导入端规划前的硬上限，后者覆盖
     # 长文档重切分后的真实恢复体积。
     warnings: dict[str, object] = {}
-    problem = export_backup_limit_problem(data, warning_out=warnings)
+    reasons: dict[str, object] = {}
+    problem = export_backup_limit_problem(
+        data, warning_out=warnings, reason_out=reasons
+    )
     knowledge_omitted = ""
     if problem and "knowledge" in data:
         # 知识库是全局存量：知识管理导入 / CLI kb-import 不受导出上限
@@ -3234,10 +3246,16 @@ def run_user_export_standalone(
         }
         if backup_limit_problem(without_knowledge, crlf=False) is None:
             data = without_knowledge
-            knowledge_omitted = (
-                "知识库整体超出导出上限，本次备份不含知识片段"
-                "（用户数据仍可恢复；知识库请单独使用 kb-export）"
-            )
+            if reasons.get("knowledge") == "planning-failed":
+                knowledge_omitted = (
+                    "知识库暂时无法核对分片体积，本次备份不含知识片段"
+                    "（用户数据仍可恢复；请稍后重试获得含知识的备份）"
+                )
+            else:
+                knowledge_omitted = (
+                    "知识库整体超出导出上限，本次备份不含知识片段"
+                    "（用户数据仍可恢复；知识库请单独使用 kb-export）"
+                )
             problem = None
     if problem:
         print(

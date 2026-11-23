@@ -2352,11 +2352,23 @@ async function scenarioKnowledgeSkippedToast(source) {
     'downloadFromApi("/api/export?with_knowledge=1", "fallback.json")'
   );
   const omittedToasts = run("__toasts.slice()");
+  // planning-failed 是「暂无法核对、稍后重试」而非「超限请清理」：文案必须不同
+  mockResponse({
+    "x-knowledge-omitted": "planning-failed",
+    "x-aligo-export-skipped": "0",
+    "content-disposition": 'attachment; filename="aligo_u.json"',
+  });
+  const planningOk = await run(
+    'downloadFromApi("/api/export?with_knowledge=1", "fallback.json")'
+  );
+  const planningToasts = run("__toasts.slice()");
   return {
     ok,
     toasts: skippedToasts,
     omittedOk,
     omittedToasts,
+    planningOk,
+    planningToasts,
   };
 }
 

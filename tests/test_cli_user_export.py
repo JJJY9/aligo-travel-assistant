@@ -244,7 +244,8 @@ def test_user_export_with_knowledge(monkeypatch):
 
 
 def test_user_export_degrades_knowledge_over_limit(monkeypatch):
-    """仅知识轴超限时省略知识段继续导出，并明确提示不含知识。"""
+    """仅知识轴超限时省略知识段继续导出，并明确提示不含知识；
+    规划失败给出「稍后重试」文案；用户数据轴超限仍中止。"""
     import tempfile
     from pathlib import Path
 
@@ -273,7 +274,63 @@ def test_user_export_degrades_knowledge_over_limit(monkeypatch):
     data = json.loads(json_path.read_text(encoding="utf-8"))
     assert "knowledge" not in data
     assert "不含知识片段" in err.getvalue()
-    print("✓ user-export 仅知识轴超限时省略知识段")
+
+    # 分片规划失败（知识库忙）：同样降级，但文案引导稍后重试而非清理知识库
+    monkeypatch.setattr(module, "_MAX_KNOWLEDGE", 50000)
+
+    def planning_boom(*args, **kwargs):
+        raise RuntimeError("kb busy")
+
+    monkeypatch.setattr(admin_module, "import_documents", planning_boom)
+    planning_dir = Path(tempfile.mkdtemp())
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = cli.run_user_export_standalone(
+            "u-kb-planning", str(planning_dir), with_knowledge=True
+        )
+    assert code == 0, err.getvalue()
+    assert "暂时无法核对分片体积" in err.getvalue()
+    assert "稍后重试" in err.getvalue()
+
+    # 用户数据本身超限：知识再省略也不能导出（与 Web 413 同口径）
+    monkeypatch.setattr(module, "_MAX_MESSAGES", 1)  # _FakeStore 自带 2 条消息
+    blocked_dir = Path(tempfile.mkdtemp())
+    with contextlib.redirect_stdout(io.StringIO()) as blocked_out:
+        code = cli.run_user_export_standalone(
+            "u-kb-oversize", str(blocked_dir), with_knowledge=True
+        )
+    assert code == 1 and "导出中止" in blocked_out.getvalue()
+    assert list(blocked_dir.iterdir()) == []
+    print("✓ user-export 仅知识轴超限 / 规划失败时降级，用户数据超限仍中止")
+
+
+def test_user_export_precheck_matches_sanitized_output(monkeypatch):
+    """限额预检与落盘同口径：含孤立代理项的知识行不再误报「会被跳过」，
+    写出的行仍保留（转义为合法文本），体积轴按清洗后的重切分体积计算。"""
+    import tempfile
+    from pathlib import Path
+
+    from utils import knowledge_admin as admin_module
+
+    store = _FakeStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    docs = [{"content": "坏 \ud800 片段", "metadata": {"category": "住宿"}}]
+    monkeypatch.setattr(admin_module, "export_documents", lambda: docs)
+    out_dir = Path(tempfile.mkdtemp())
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = cli.run_user_export_standalone(
+            "u-kb-surrogate", str(out_dir), with_knowledge=True
+        )
+    assert code == 0, err.getvalue()
+    assert "会被跳过" not in err.getvalue(), err.getvalue()
+    json_path = next(path for path in out_dir.iterdir() if path.suffix == ".json")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert len(data["knowledge"]) == 1
+    assert "\\ud800" in data["knowledge"][0]["content"]
+    print("✓ user-export 限额预检与清洗后的落盘内容同口径")
 
 
 def test_user_export_with_knowledge_dispatch(monkeypatch):
@@ -377,6 +434,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_degrades_knowledge_over_limit(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_export_precheck_matches_sanitized_output(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()
