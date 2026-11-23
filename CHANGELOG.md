@@ -88,6 +88,7 @@
 - 天气并发闸门繁忙不再写 60 秒失败缓存：本地排队（上游名额耗尽 / 单飞等待轮次用完）不是上游故障；有 1 小时内成功数据则沿用旧数据，否则直接报繁忙，名额释放后可立即重试，不再把城市钉住一分钟。新增闸门繁忙与等待耗尽不写失败缓存的回归
 - 导出 with-knowledge 体积口径与导入对齐：CLI / Web 导出前把知识段按 `import_documents(dry_run)` 重切分后的分片估算（长文档导入会被切成多片）；此前按原始行估算会产出「导出成功、导入却超知识体积」的备份。规划失败退回原始行，不阻断导出（导入端会以 knowledge_error 上报）。新增 Web 导出 413 与规划失败回退用例
 - 导出 with-knowledge 体积自检修正（评审 CONFIRMED）：此前把整库导出行交给 `import_documents(dry_run)` 对同一源库判重，pieces 只剩「新增分片」且非空时整体替换原始行——40 MB 库 + 一条旧版长单条时只校验 2 片，写出 55 MB 备份却永远无法导入。现在导入规划新增 `ignore_existing`（不扫库、不持锁，按导入空库返回全部分片），导出自检 `export_backup_limit_problem` 同时校验原始备份字节 / 条数与空库分片形状；规划失败 fail-closed 拒绝导出。新增空库规划、空 pieces、fail-closed、原始字节轴回归
+- 导出知识跳过提示（v2.0）：`export_backup_limit_problem` 支持 `warning_out`，导入规划会跳过的旧版超长 / 残缺组 / 布局冲突行数回填给调用方；CLI `user-export` 向 stderr 打印警告，Web `/api/export` 返回 `X-Knowledge-Skipped` 响应头（用户数据仍可恢复，文件不阻断导出）。新增规划计数与响应头回归
 - 测试：`tests/test_webapp.py` 的 `test_cached_session_protected_during_quarantine_probe` 此前定义在 `__main__` 直跑块之后——直跑清单在函数定义前就已遍历 globals，该用例只在 pytest 下执行、直跑假绿；现已移到直跑块之前并纳入自动发现
 - 短期记忆重放时间序：`_ADD_MESSAGES_LUA` 不再无条件 RPUSH——按消息 timestamp 插入对应位置（缺失 / 无法解析退回追加）；回填 / 重放更旧历史时不再把最近轮次挤出窗口。新增 fakeredis[lua] 真实 Lua 回归（窗口满回填、夹层插入、实时追加、缺时间戳、op_id 去重），CI 测试依赖同步加入 `fakeredis[lua]==2.40.0`
 - 短期记忆排序边界加固（v2.0）：Lua 时间键保留微秒并把空格分隔符归一为 `T`（同一秒内的回填消息不再失去顺序）；旧条目缺时间戳时跳过继续找锚点，不再把回填历史追加到窗口尾部；实时消息改走 `append` 模式（时钟回拨 / 多实例时间偏差时不会被插到头部后遭 LTRIM 丢掉），历史回填仍按时间序插入，模式随故障操作日志记录、恢复重放保持原语义。新增同秒微秒序、空格时间戳、缺时间戳旧条目、时钟回拨实时追加回归

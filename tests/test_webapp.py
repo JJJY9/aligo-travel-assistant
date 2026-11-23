@@ -10942,6 +10942,30 @@ def test_export_attachment():
         _cleanup(user_id)
 
 
+def test_export_reports_skipped_knowledge_header(monkeypatch):
+    """导出体积通过但知识行恢复会跳过时，响应头带跳过计数。"""
+    from utils import user_import
+
+    def _fake(backup, warning_out=None):
+        if warning_out is not None:
+            warning_out["knowledge_skipped_count"] = 3
+        return None
+
+    monkeypatch.setattr(
+        user_import, "export_backup_limit_problem", _fake
+    )
+    user_id = _unique_user("web_test_export_skipped")
+    try:
+        response = _client().get(
+            "/api/export", params={"user_id": user_id}
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers.get("x-knowledge-skipped") == "3"
+        print("✓ /api/export 提示恢复会跳过的知识行")
+    finally:
+        _cleanup(user_id)
+
+
 def _seed_trip_file(user_id, trips):
     path = Path(MEMORY_DIR) / f"{user_id}.json"
     path.write_text(

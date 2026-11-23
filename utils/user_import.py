@@ -883,7 +883,10 @@ def _planned_knowledge_rows(
     return list(plan.get("pieces") or [])
 
 
-def knowledge_rows_for_volume_check(rows: list[Any]) -> list[Any] | None:
+def knowledge_rows_for_volume_check(
+    rows: list[Any],
+    skip_out: dict[str, int] | None = None,
+) -> list[Any] | None:
     """导出体积校验使用的知识行：按「导入空库」规划的分片形状。
 
     不能在源库上规划：整库导出行本来就在源库中，``dry_run`` 去重后
@@ -891,6 +894,9 @@ def knowledge_rows_for_volume_check(rows: list[Any]) -> list[Any] | None:
     知识行退出体积 / 条数估算（40 MB 库 + 一条旧版长单条时只校验 2 片，
     导出写出 55 MB 文件却永远无法导入）。``ignore_existing`` 不碰库内容、
     不持锁，按导入空库返回全部分片。
+
+    ``skip_out`` 传入 dict 时回填导入规划会跳过的行数（无效 / 残缺组 /
+    布局冲突）：导出端据此提示「文件仍可导出、但恢复时这些知识会跳过」。
 
     规划失败返回 None：调用方必须按「无法确认备份可恢复」拒绝导出，
     不能退回原始行放行（旧版长单条重切分后的分片可能远超原始行体积）。
@@ -912,10 +918,25 @@ def knowledge_rows_for_volume_check(rows: list[Any]) -> list[Any] | None:
     pieces = plan.get("pieces") if isinstance(plan, dict) else None
     if pieces is None:
         return None
+    if skip_out is not None and isinstance(plan, dict):
+        groups = plan.get("skipped_groups")
+        skip_out["skipped_invalid"] = int(
+            plan.get("skipped_invalid") or 0
+        )
+        skip_out["skipped_groups"] = (
+            len(groups) if isinstance(groups, list) else int(groups or 0)
+        )
+        skip_out["skipped_conflict"] = int(
+            plan.get("skipped_conflict") or 0
+        )
     return list(pieces)
 
 
-def export_backup_limit_problem(backup: dict[str, Any]) -> str | None:
+def export_backup_limit_problem(
+    backup: dict[str, Any],
+    *,
+    warning_out: dict[str, Any] | None = None,
+) -> str | None:
     """导出端自检：原始备份与「导入空库」的知识分片形状都必须可导入。
 
     两道轴缺一不可：
@@ -924,6 +945,8 @@ def export_backup_limit_problem(backup: dict[str, Any]) -> str | None:
       大于原始行（#876 的口径），只看原始行会写出无法恢复的备份。
 
     知识规划失败时返回拒绝原因（fail-closed）：无法确认备份可恢复。
+    ``warning_out`` 传入 dict 时回填「恢复时会被跳过的知识行」提示：
+    这些行不会阻断导出（用户数据仍可恢复），但文件并不包含完整知识。
     """
     if not isinstance(backup, dict):
         return None
@@ -933,13 +956,29 @@ def export_backup_limit_problem(backup: dict[str, Any]) -> str | None:
     knowledge = backup.get("knowledge")
     if not isinstance(knowledge, list) or not knowledge:
         return None
-    planned = knowledge_rows_for_volume_check(knowledge)
+    skip_counts: dict[str, int] = {}
+    planned = knowledge_rows_for_volume_check(
+        knowledge, skip_out=skip_counts
+    )
     if planned is None:
         return (
             "知识片段无法按导入规则规划，无法确认备份可恢复；"
             "请稍后重试（知识库忙时暂停写入）"
         )
-    return backup_limit_problem({**backup, "knowledge": planned}, crlf=False)
+    problem = backup_limit_problem(
+        {**backup, "knowledge": planned}, crlf=False
+    )
+    if problem:
+        return problem
+    total_skipped = sum(skip_counts.values())
+    if warning_out is not None and total_skipped:
+        warning_out["knowledge_skipped_count"] = total_skipped
+        warning_out["knowledge_skipped"] = (
+            f"{total_skipped} 条知识片段在恢复时会被跳过"
+            "（无效内容 / 残缺分片组 / 布局冲突）；"
+            "备份中的用户数据仍可恢复"
+        )
+    return None
 
 
 def _export_shape_baseline(
