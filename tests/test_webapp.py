@@ -2427,6 +2427,63 @@ def test_user_data_markdown_tolerates_non_string_fields():
     print("✓ 用户数据 Markdown 导出容忍非字符串字段")
 
 
+def test_session_title_helper_matches_old_expression_and_scans_prefix():
+    """标题裁剪与旧表达式逐字符一致；大输入只扫描标题前缀。"""
+    import time
+
+    from webapp import server as server_module
+
+    cases = [
+        "  你好   世界  ",
+        "a" * 100,
+        ("词 " * 5000).strip(),
+        "a " * 5000,
+        "\n\t ",
+        "",
+    ]
+    for content in cases:
+        expected = " ".join(str(content).split())[:40]
+        assert (
+            server_module._session_title_from_content(content) == expected
+        ), (content[:20], expected)
+
+    huge = ("a " * 2_000_000).strip()
+    started = time.monotonic()
+    title = server_module._session_title_from_content(huge)
+    elapsed = time.monotonic() - started
+    assert title == " ".join(huge.split())[:40]
+    assert elapsed < 0.5, f"大消息标题裁剪耗时 {elapsed:.2f}s"
+    assert server_module._id_set([{"bad": "shape"}, [1], "s1", 2]) == {"s1", "2"}
+    print("✓ 会话标题裁剪语义一致且只扫描前缀")
+
+
+def test_session_detail_tolerates_dirty_archived_sessions():
+    """archived_sessions 含 dict/list 脏条目时，会话仍可列出与打开。"""
+    client = _client()
+    user_id = _unique_user("web_test_dirty_archive")
+    session_id = "sess-dirty-archive"
+    try:
+        from context.storage import create_long_term_memory
+
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("你好", "你好呀", session_id)
+        path = Path(MEMORY_DIR) / f"{user_id}.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["archived_sessions"] = [{"bad": "shape"}, [1, 2], session_id]
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        listing = client.get("/api/sessions", params={"user_id": user_id})
+        assert listing.status_code == 200, listing.text
+        detail = client.get(
+            f"/api/sessions/{session_id}", params={"user_id": user_id}
+        )
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["messages"], detail.text
+        print("✓ archived_sessions 脏条目不影响会话列表 / 详情")
+    finally:
+        _cleanup(user_id)
+
+
 def test_import_skips_reserved_session_id():
     """备份里的 session_id="export" 不能落库（否则详情路由永远被静态路由遮蔽）。"""
     client = _client()

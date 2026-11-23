@@ -2855,6 +2855,39 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     return snippet
 
 
+def _session_title_from_content(content: object) -> str:
+    """会话标题：折叠空白后取前 40 字符，只扫描到足够长度即停止。
+
+    导入允许 50MB 级消息；对整条大消息做 ``split()`` 会生成数千万项
+    中间列表（数百 MB~GB 内存、秒级 CPU）。标题只需要前 40 个归一化
+    字符，按 ``\\S+`` 惰性扫描到够长即停止，内存与耗时只和标题前缀有关；
+    输出与 ``" ".join(str(content).split())[:40]`` 完全一致。
+    """
+    result = ""
+    for match in re.finditer(r"\S+", str(content or "")):
+        piece = (" " if result else "") + match.group(0)
+        if len(result) + len(piece) >= 40:
+            return (result + piece)[:40]
+        result += piece
+    return result[:40]
+
+
+def _id_set(values: list[str] | None) -> set[str]:
+    """会话 ID 集合：整数 ID 转字符串；不可哈希的脏条目跳过。
+
+    手写 / 损坏的备份里 ``archived_sessions`` 可能是 dict / list，
+    直接 ``set(...)`` 会抛 TypeError，把列表接口或会话详情变成永久 503。
+    """
+    result: set[str] = set()
+    for item in values or []:
+        if isinstance(item, (dict, list, set, tuple)):
+            continue
+        text = str(item if item is not None else "").strip()
+        if text:
+            result.add(text)
+    return result
+
+
 def _group_sessions(
     history: list[dict[str, Any]],
     limit: int,
@@ -2903,9 +2936,9 @@ def _group_sessions(
                 updated_keys[str(session_id)] = parsed_key
                 entry["updated_at"] = timestamp
         if not entry["title"] and message.get("role") == "user":
-            title = " ".join(str(message.get("content", "")).split())
+            title = _session_title_from_content(message.get("content"))
             if title:
-                entry["title"] = title[:40]
+                entry["title"] = title
         if raw_query and "snippet" not in entry:
             snippet = _match_snippet(_message_search_text(message), raw_query)
             if snippet:
@@ -2930,19 +2963,6 @@ def _group_sessions(
         custom = custom_titles.get(entry["session_id"])
         if custom:
             entry["title"] = custom
-
-    def _id_set(values: list[str] | None) -> set[str]:
-        # 旧数据的会话 ID 可能是整数（与 _archived_count / CLI 的字符串
-        # 口径一致）；手写 / 损坏文件里的对象条目不可哈希，跳过而不是让
-        # 列表接口永久 500
-        result: set[str] = set()
-        for item in values or []:
-            if isinstance(item, (dict, list, set, tuple)):
-                continue
-            text = str(item if item is not None else "").strip()
-            if text:
-                result.add(text)
-        return result
 
     pinned_ids = _id_set(pinned)
     archived_ids = _id_set(archived)
@@ -4338,7 +4358,7 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             messages = store.get_chat_history(session_id=session_id)
             titles = store.get_session_titles()
-            archived_ids = set(store.get_archived_sessions())
+            archived_ids = _id_set(store.get_archived_sessions())
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
             logger.warning("读取会话失败（%s）：%s", session_id, exc)
             raise _storage_failure("读取会话失败", exc) from exc
@@ -4348,7 +4368,7 @@ def create_app(model: Any = None) -> FastAPI:
         if not title:
             for message in messages:
                 if message.get("role") == "user":
-                    title = " ".join(str(message.get("content", "")).split())[:40]
+                    title = _session_title_from_content(message.get("content"))
                     break
         return _json_safe_value(
             {
@@ -4483,7 +4503,7 @@ def create_app(model: Any = None) -> FastAPI:
             for message in messages:
                 if message.get("role") == "user":
                     raw_title = (
-                        " ".join(str(message.get("content", "")).split())[:40]
+                        _session_title_from_content(message.get("content"))
                         or raw_title
                     )
                     break
