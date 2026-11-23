@@ -1125,6 +1125,7 @@ class _SessionTurnLease:
         self._session = session
         self._released = False
         self._turn_task: asyncio.Task[Any] | None = None
+        self._after_stop: Any = None
 
     def bind_turn(self, task: asyncio.Task[Any]) -> None:
         """登记本回合的协程任务：释放租约前先由 :meth:`stop_turn` 收尾。"""
@@ -1161,6 +1162,21 @@ class _SessionTurnLease:
         self._session.end_turn()
         self._lock.release()
 
+    def set_after_stop(self, callback: Any) -> None:
+        """登记「drain 之后」的收尾回调（断连未完成标记用）。
+
+        生成器可能在 anyio 取消作用域内被取消，作用域里的 stop_turn 会
+        立即抛 CancelledError；真正的 drain 在响应包装器的 finally 完成，
+        标记必须在那之后依据最终落库结果写入。
+        """
+        self._after_stop = callback
+
+    def after_stop(self) -> None:
+        callback = self._after_stop
+        self._after_stop = None
+        if callback is not None:
+            callback()
+
 
 class _LockReplayLease:
     """幂等回放的流式响应租约：只持有用户锁（不创建会话）。"""
@@ -1171,6 +1187,9 @@ class _LockReplayLease:
 
     async def stop_turn(self) -> None:
         """回放没有在途回合，无需收尾。"""
+        return None
+
+    def after_stop(self) -> None:
         return None
 
     def release(self) -> None:
@@ -1198,6 +1217,12 @@ class _LeasedStreamingResponse(StreamingResponse):
         finally:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._lease.stop_turn()
+            # drain 完成后才决定断连未完成标记（作用域内的 stop_turn 在
+            # 取消时可能没跑到 drain）
+            try:
+                self._lease.after_stop()
+            except Exception:  # noqa: BLE001 - 标记失败不影响释放
+                logger.warning("流式回合收尾回调失败", exc_info=True)
             self._lease.release()
 
 
@@ -5173,6 +5198,7 @@ def create_app(model: Any = None) -> FastAPI:
         lock = state.lock_for(payload.user_id)
         await _acquire_chat_lock(request, lock, rid)
         lease: _SessionTurnLease | None = None
+        stream_state = {"completed": False, "turn_started": False}
         try:
             if await asyncio.to_thread(
                 state.is_recently_deleted, payload.user_id, payload.session_id
@@ -5273,6 +5299,42 @@ def create_app(model: Any = None) -> FastAPI:
                     detail=f"{exc}（请求 ID：{rid}）",
                 ) from exc
             lease = _SessionTurnLease(lock, session)
+            if idem_key is not None:
+
+                def _mark_stream_incomplete() -> None:
+                    # 在响应包装器的 drain 之后执行：作用域内被取消时
+                    # stop_turn 会立即抛 CancelledError，此处才是最终落库结果
+                    if stream_state.get("completed"):
+                        return
+                    if not stream_state.get("turn_started"):
+                        # 回合从未启动（响应体未迭代即被取消）：没有本轮
+                        # 落库这回事，不能把上一轮同文本的成功算到本轮
+                        return
+                    try:
+                        persisted = bool(
+                            getattr(
+                                session.runtime,
+                                "turn_persisted",
+                                lambda _input: False,
+                            )(payload.message)
+                        )
+                    except Exception:  # noqa: BLE001 - 状态不明按未落库
+                        persisted = False
+                    if not persisted:
+                        return
+                    # 流在 done 之前结束（客户端断连），但 drain 后确认整轮
+                    # 已落库：给幂等键留标记，同键重试回放错误终态而不是
+                    # 重新执行
+                    state.idempotency.put(
+                        idem_key,
+                        {
+                            "session_id": session.session_id,
+                            "__incomplete__": True,
+                            "message": "上一请求已处理但响应未送达，请刷新会话历史",
+                        },
+                    )
+
+                lease.set_after_stop(_mark_stream_incomplete)
         except BaseException:
             if lease is not None:
                 lease.release()
@@ -5357,6 +5419,7 @@ def create_app(model: Any = None) -> FastAPI:
                     + "\n\n"
                 )
                 task = asyncio.create_task(run())
+                stream_state["turn_started"] = True
                 lease.bind_turn(task)
 
                 async def send_heartbeat() -> None:
@@ -5385,6 +5448,7 @@ def create_app(model: Any = None) -> FastAPI:
                         completed = event["type"] == "done"
                         break
             finally:
+                stream_state["completed"] = completed
                 if heartbeat is not None:
                     heartbeat.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -5397,25 +5461,9 @@ def create_app(model: Any = None) -> FastAPI:
                     task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await lease.stop_turn()
-                if (
-                    not completed
-                    and idem_key is not None
-                    and getattr(
-                        session.runtime,
-                        "turn_persisted",
-                        lambda _input: False,
-                    )(payload.message)
-                ):
-                    # 客户端断连但整轮已落库：给幂等键留标记，同键重试
-                    # 回放错误终态而不是重新执行
-                    state.idempotency.put(
-                        idem_key,
-                        {
-                            "session_id": session.session_id,
-                            "__incomplete__": True,
-                            "message": "上一请求已处理但响应未送达，请刷新会话历史",
-                        },
-                    )
+                # 断连未完成标记不在这里写：取消时上面的等待会立即抛错，
+                # 拿不到最终落库结果；标记在 drain 之后由响应包装器触发的
+                # lease.after_stop 写入
                 # 释放租约统一由 _LeasedStreamingResponse 在取消作用域外执行：
                 # 本轮在作用域内被取消时上面的等待无法完成，这里提前 release
                 # 会让删除 / 新一轮请求在落库线程结束前拿到用户锁

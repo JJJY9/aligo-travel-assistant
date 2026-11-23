@@ -770,6 +770,92 @@ def test_rollback_failure_does_not_mask_original_error():
     print("✓ 回滚失败不掩盖原始错误")
 
 
+def test_late_persist_callback_cannot_poison_current_turn():
+    """迟到的上一轮回调只更新自己的 turn_state，不改写本轮落库结果。"""
+    runtime, _ = _make_runtime()
+
+    async def _scenario():
+        loop = asyncio.get_running_loop()
+
+        def _done(value):
+            fut = loop.create_future()
+            fut.set_result(value)
+            return fut
+
+        old_state = {"rollback_requested": False, "persisted": None, "seq": 1}
+        new_state = {"rollback_requested": False, "persisted": None, "seq": 2}
+        runtime._turn_seq = 2
+        runtime._last_persist_turn = ("同一句提问", new_state)
+        runtime._last_persist_committed = None
+
+        # 上一轮的成功回调迟到：不能把本轮（同文本）标记为已落库
+        runtime._clear_pending_persist(_done(True), "同一句提问", old_state)
+        assert old_state["persisted"] is True
+        assert runtime.turn_persisted("同一句提问") is False
+
+        # 本轮尚未开始落库（槽里仍是上一轮状态）：同文本也不能算本轮已落库
+        runtime._last_persist_turn = ("同一句提问", old_state)
+        assert runtime.turn_persisted("同一句提问") is False
+        runtime._last_persist_turn = ("同一句提问", new_state)
+
+        # 本轮成功
+        runtime._clear_pending_persist(_done(True), "同一句提问", new_state)
+        assert runtime.turn_persisted("同一句提问") is True
+
+        # 上一轮的失败回调再迟到：不能抹掉本轮的已落库结果
+        runtime._clear_pending_persist(_done(False), "同一句提问", old_state)
+        pending = runtime._pending_rollback
+        if pending is not None:
+            await pending
+        assert runtime.turn_persisted("同一句提问") is True
+
+    asyncio.run(_scenario())
+    print("✓ 迟到的落库回调不改写本轮状态")
+
+
+def test_deferred_commit_forwards_epoch():
+    """落库回调把本轮纪元传给支持 epoch 的编排器；旧编排器按无参调用。"""
+    runtime, _ = _make_runtime()
+    epochs: list[int | None] = []
+
+    async def commit(epoch=None):
+        epochs.append(epoch)
+        return True
+
+    runtime.orchestrator.commit_deferred_memory = commit  # type: ignore[method-assign]
+
+    async def _scenario():
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        fut.set_result(True)
+        runtime._clear_checkpoint = lambda: None  # type: ignore[method-assign]
+        runtime._commit_deferred_after_persist(
+            fut, checkpoint_key=None, deferred_epoch=7
+        )
+        await runtime._await_deferred_commit(timeout_sec=2.0)
+
+    asyncio.run(_scenario())
+    assert epochs == [7], epochs
+
+    # 旧编排器（没有 epoch 形参）仍按无参调用
+    legacy_runtime, _ = _make_runtime()
+    calls: list[bool] = []
+
+    async def legacy_commit():
+        calls.append(True)
+        return True
+
+    legacy_runtime.orchestrator.commit_deferred_memory = legacy_commit  # type: ignore[method-assign]
+
+    async def _legacy_scenario():
+        legacy_runtime._schedule_deferred_commit(check_deleted=False, epoch=3)
+        await legacy_runtime._await_deferred_commit(timeout_sec=2.0)
+
+    asyncio.run(_legacy_scenario())
+    assert calls == [True], calls
+    print("✓ 延迟记忆纪元按编排器能力传递")
+
+
 def test_rollback_carries_turn_id():
     """暂存与回滚都携带回合 id：跨实例同文本提问不会被误删。"""
     runtime, memory = _make_runtime()
@@ -1645,6 +1731,8 @@ if __name__ == "__main__":
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
     test_rollback_carries_turn_id()
+    test_late_persist_callback_cannot_poison_current_turn()
+    test_deferred_commit_forwards_epoch()
     test_memory_without_rollback_hook_is_tolerated()
     test_cancel_during_deferred_commit_does_not_double_usage()
     test_rollback_slot_cleared_after_completion()

@@ -837,6 +837,67 @@ def test_deferred_memory_only_written_after_commit():
     print("✓ 延迟记忆写入只在 commit 后落库（真实编排器）")
 
 
+def test_deferred_memory_commit_respects_epoch():
+    """暂存负载带纪元：迟到的上一轮回调不能提交新一轮的负载。"""
+    memory = _StubMemory()
+
+    class _EventAgent(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {
+                        "status": "success",
+                        "destination": "杭州",
+                        "start_date": "2026-03-11",
+                    },
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class _PlanAgent(_StubAgent):
+        async def reply(self, x):
+            return Msg(
+                name=self.name,
+                content=json.dumps(
+                    {"itinerary": {"title": "T"}}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "event_collection": _EventAgent("event_collection"),
+            "itinerary_planning": _PlanAgent("itinerary_planning"),
+        },
+        memory_manager=memory,
+    )
+    schedule = [
+        {"agent_name": "event_collection", "priority": 1},
+        {"agent_name": "itinerary_planning", "priority": 1},
+    ]
+    asyncio.run(
+        orchestrator.reply(_intent(schedule), defer_memory=True, defer_epoch=1)
+    )
+    # 迟到的上一轮（纪元 2）不能提交纪元 1 的负载
+    assert asyncio.run(orchestrator.commit_deferred_memory(epoch=2)) is False
+    assert memory.long_term.get_trip_history() == []
+    assert asyncio.run(orchestrator.commit_deferred_memory(epoch=1)) is True
+    trips = memory.long_term.get_trip_history()
+    assert len(trips) == 1 and trips[0]["destination"] == "杭州", trips
+
+    # 纪元不符时也不能丢弃新一轮的负载
+    asyncio.run(
+        orchestrator.reply(_intent(schedule), defer_memory=True, defer_epoch=3)
+    )
+    orchestrator.discard_deferred_memory(epoch=4)
+    assert orchestrator._deferred_memory is not None, "纪元不符不能丢弃新一轮负载"
+    orchestrator.discard_deferred_memory(epoch=3)
+    assert orchestrator._deferred_memory is None
+    print("✓ 延迟记忆提交 / 丢弃按负载纪元归属")
+
+
 def test_memory_update_preference_and_trip():
     """偏好覆盖 / 追加与行程写入"""
     memory = _StubMemory()
