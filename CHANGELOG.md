@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- 记忆一致性（v2.0）：`MemoryManager.get_recent_summary_async` 对当前会话最近 10 轮对话生成 ≤200 字滚动摘要——按窗口内容指纹缓存（窗口不变不重复调用模型）、失败 / 空输出进入 30 秒冷却、输出经 `sanitize_json` 清洗；对话上下文新增「最近对话摘要」段（与跨会话长期总结互补），`get_context_for_agent` 支持 `recent_summary` 参数。新增单元测试覆盖消息不足不调用、指纹缓存、窗口变化重算、200 字截断与失败冷却
 - 请求幂等（v2.0）：`POST /api/chat` 与 `/api/chat/stream` 接受可选 `idempotency_key`（≤200 字）。同一用户 + 同一会话 + 同一键的重复提交直接回放上次成功响应（非流式带 `X-Idempotent-Replay: 1`，流式只回放 `session` + `done` 且标记 `idempotent_replay`），不再重复执行 Agent、不重复写偏好 / 行程 / 聊天记录；失败响应不缓存，客户端可正常重试。进程内 TTL 10 分钟 + LRU 256 条，新增 `utils/idempotency.py` 与单元、Web 集成测试
 - 行程约束校验（v2.0）：行程规划输出后做五项确定性检查——天数与要求一致、每日活动时间不重叠 / 区间合法、预计费用不超预算、必去项出现在行程中、分项费用与申报总额一致（±20%）且单笔费用在合理范围。需求侧自动提取预算（元 / 万元）、必去项（支持「西湖和灵隐寺」拆分）与天数；未通过时把问题码与原因回填 prompt 重生成（`PLAN_REPAIR_ENABLED` 默认开、`PLAN_REPAIR_ATTEMPTS` 默认 1 次，上限 3），仍失败则保留原行程并随结果返回 `validation`（`passed` / `issues`），不阻断对话。新增 `utils/itinerary_validation.py` 与单元、集成测试
 - 混合检索（v2.0）：知识问答在向量召回之外并行 BM25（中文按字符二元组切词，无需分词器），按 RRF 融合两路候选后取 Top-K；`RAG_RERANK_MODEL` 配置后对候选做 cross-encoder 精排（默认关闭）。BM25 索引按知识库在进程内缓存（`RAG_BM25_TTL_SEC`，知识写入即失效），片段数超过 `RAG_BM25_MAX_DOCS` 时自动退回纯向量；索引构建 / 重排失败均不阻断问答。管理 / 评测接口保持纯向量口径，`search_knowledge(..., hybrid=True)` 仅由聊天问答路径启用；新增 `utils/hybrid_retrieval.py`（BM25 / RRF / 混合相关性标注）与对应单元、集成测试

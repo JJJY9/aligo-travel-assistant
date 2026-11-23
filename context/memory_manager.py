@@ -42,6 +42,13 @@ _SUMMARY_WINDOW_FETCH = 200
 _SUMMARY_TRIP_FETCH = 200
 _SUMMARY_TRIP_WINDOW = 20
 
+# 当前会话最近对话的滚动摘要（v2.0）：200 字以内，按窗口内容指纹缓存，
+# 窗口不变时不重复调用 LLM（与跨会话长期总结互补）
+_RECENT_SUMMARY_MAX_CHARS = 200
+_RECENT_SUMMARY_MIN_MESSAGES = 4
+_RECENT_SUMMARY_WINDOW_TURNS = 10
+_RECENT_SUMMARY_FAILURE_COOLDOWN_SEC = 30.0
+
 
 def _is_future_timestamp(message: dict) -> bool:
     """消息时间戳是否明显在未来（异常数据，不参与总结窗口）。"""
@@ -117,6 +124,9 @@ class MemoryManager:
         self._summary_cache: tuple[tuple, str] | None = None
         # 总结失败后的短时冷却：避免模型持续报错时每轮都重试
         self._summary_failure_until = 0.0
+        # 当前会话滚动摘要（v2.0）：按最近窗口内容指纹缓存
+        self._recent_summary_cache: tuple[tuple, str] | None = None
+        self._recent_summary_failure_until = 0.0
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -433,12 +443,14 @@ class MemoryManager:
             return
         self._rebuild_long_term()
 
-    def get_context_for_agent(self, long_term_summary: str | None = None) -> str:
+    def get_context_for_agent(self, long_term_summary: str | None = None, recent_summary: str | None = None) -> str:
         """
         获取用于Agent的上下文字符串
 
         Args:
             long_term_summary: 长期记忆总结（可选，需提前调用 get_long_term_summary_async）
+            recent_summary: 当前会话最近对话的滚动摘要（可选，需提前调用
+                get_recent_summary_async）
 
         Returns:
             格式化的上下文字符串
@@ -449,6 +461,12 @@ class MemoryManager:
         if long_term_summary:
             lines.append("【历史会话总结】")
             lines.append(long_term_summary)
+            lines.append("")
+
+        # 当前会话滚动摘要（v2.0）
+        if recent_summary:
+            lines.append("【最近对话摘要】")
+            lines.append(recent_summary)
             lines.append("")
 
         # 用户偏好
@@ -715,6 +733,95 @@ class MemoryManager:
             logger.error(f"Failed to generate long-term summary: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
+            return ""
+
+    async def get_recent_summary_async(
+        self, max_turns: int = _RECENT_SUMMARY_WINDOW_TURNS
+    ) -> str:
+        """当前会话最近对话的滚动摘要（≤200 字，按内容指纹缓存）。
+
+        与跨会话长期总结互补：长期总结覆盖其它会话，这里压缩当前窗口，
+        用于在最近若干轮对话之外补一段低成本摘要。窗口内容不变时直接
+        复用缓存，不重复调用 LLM；失败 / 空输出进入短时冷却，不阻断对话。
+        """
+        if not self.llm_model:
+            return ""
+        try:
+            messages = self.short_term.get_recent_context(int(max_turns))
+        except Exception as exc:  # noqa: BLE001 - 摘要失败不阻断对话
+            logger.warning("读取最近对话失败，跳过摘要: %s", exc)
+            return ""
+        items = [
+            message
+            for message in messages
+            if isinstance(message, dict)
+            and str(message.get("content") or "").strip()
+        ]
+        if len(items) < _RECENT_SUMMARY_MIN_MESSAGES:
+            return ""
+        fingerprint = tuple(
+            (
+                str(item.get("role") or ""),
+                len(str(item.get("content") or "")),
+                str(item.get("content") or "")[:500],
+            )
+            for item in items
+        )
+        cache = self._recent_summary_cache
+        if cache is not None and cache[0] == fingerprint:
+            return cache[1]
+        if time.monotonic() < self._recent_summary_failure_until:
+            return ""
+
+        lines: list[str] = []
+        for item in items:
+            content = str(item.get("content") or "")
+            if item.get("role") == "assistant":
+                content = strip_turn_meta(content)
+            if len(content) > _SUMMARY_MESSAGE_MAX_CHARS:
+                content = content[:_SUMMARY_MESSAGE_MAX_CHARS] + "…"
+            lines.append(f"{item.get('role')}: {content}")
+
+        def _neutralize(text: str) -> str:
+            return (
+                text.replace("<<<", "＜＜＜")
+                .replace(">>>", "＞＞＞")
+                .replace("【", "［")
+                .replace("】", "］")
+            )
+
+        prompt = (
+            "请用不超过200字总结下面这段最近的差旅对话，保留：用户的偏好与"
+            "限制、已确认的行程要素（地点 / 日期 / 预算）、尚未完成的事项。\n"
+            "只输出摘要正文，不要复述指令。\n\n"
+            "【最近对话】\n<<<\n"
+            + _neutralize("\n".join(lines))
+            + "\n>>>\n\n摘要："
+        )
+        try:
+            response = await self.llm_model(
+                [{"role": "user", "content": prompt}]
+            )
+            summary = await extract_json_from_async_response(response)
+            summary = sanitize_json(str(summary or "").strip())
+            if not summary:
+                self._recent_summary_failure_until = (
+                    time.monotonic() + _RECENT_SUMMARY_FAILURE_COOLDOWN_SEC
+                )
+                return ""
+            if len(summary) > _RECENT_SUMMARY_MAX_CHARS:
+                summary = summary[:_RECENT_SUMMARY_MAX_CHARS]
+            self._recent_summary_cache = (fingerprint, summary)
+            self._recent_summary_failure_until = 0.0
+            logger.info(
+                "Generated recent memory summary (%d chars)", len(summary)
+            )
+            return summary
+        except Exception as exc:  # noqa: BLE001 - 摘要失败不阻断对话
+            self._recent_summary_failure_until = (
+                time.monotonic() + _RECENT_SUMMARY_FAILURE_COOLDOWN_SEC
+            )
+            logger.warning("生成最近对话摘要失败: %s", exc)
             return ""
 
     def get_long_term_summary(self, max_messages: int = 50) -> str:
