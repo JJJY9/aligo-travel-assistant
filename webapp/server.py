@@ -3676,8 +3676,10 @@ def create_app(model: Any = None) -> FastAPI:
         if not name:
             raise HTTPException(status_code=422, detail="城市不能为空")
         # 10 分钟缓存命中不产生上游请求，不应占用保护 Open-Meteo 额度的
-        # IP 桶；只有真正可能访问上游时才计费（侧栏每轮刷新都会调这里）
-        cached = peek_cached_weather(name)
+        # IP 桶；只有真正可能访问上游时才计费（侧栏每轮刷新都会调这里）。
+        # 共享缓存（配置 REDIS_URL 时）可能读 Redis：同步 I/O 不能放在事件
+        # 循环线程上，否则一次网络等待会阻塞同进程的所有请求
+        cached = await asyncio.to_thread(peek_cached_weather, name)
         if cached is not None:
             return JSONResponse(content=jsonable_encoder(cached))
         headers = await asyncio.to_thread(
