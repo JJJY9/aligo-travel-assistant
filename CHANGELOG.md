@@ -63,6 +63,7 @@
 - 性能：PostgreSQL 批量保存行程同样一次读出历史构建索引 + 编号水位（原先每条按路线查候选并全量扫描 `trip_id`，整批持 advisory lock 会阻塞并发行程写入；计数直接来自本批操作，语义与单条保存一致）
 
 ### 修复
+- 测试：`test_json_export_snapshot_is_consistent` 补第二个 LongTermMemory 实例的外部写入——此前同一实例先写后导出，`export_snapshot` 文档承诺的「写锁内 _reload_latest 后读取」零覆盖；现在断言快照与统计都包含外部新增消息与行程
 - 测试：`tests/test_memory_system.py` 第 5 步此前用 `except Exception` 吞掉长期总结的全部异常、空结果也只打印警告，函数末尾仍输出「所有测试通过」；现在异常 / 空摘要直接断言失败，完整上下文与 Agent 上下文补结构断言
 - 导出 with-knowledge 体积口径与导入对齐：CLI / Web 导出前把知识段按 `import_documents(dry_run)` 重切分后的分片估算（长文档导入会被切成多片）；此前按原始行估算会产出「导出成功、导入却超知识体积」的备份。规划失败退回原始行，不阻断导出（导入端会以 knowledge_error 上报）。新增 Web 导出 413 与规划失败回退用例
 - 测试：`tests/test_webapp.py` 的 `test_cached_session_protected_during_quarantine_probe` 此前定义在 `__main__` 直跑块之后——直跑清单在函数定义前就已遍历 globals，该用例只在 pytest 下执行、直跑假绿；现已移到直跑块之前并纳入自动发现
