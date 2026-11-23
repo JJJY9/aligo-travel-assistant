@@ -883,6 +883,26 @@ def _planned_knowledge_rows(
     return list(plan.get("pieces") or [])
 
 
+def knowledge_rows_for_volume_check(rows: list[Any]) -> list[Any]:
+    """导出体积校验使用的知识行：与导入 dry-run 同一规划（重切分后的分片）。
+
+    导出端此前用原始行估算体积，导入端按 ``import_documents(dry_run)``
+    的分片计划估算；长文档在导入时会被切成多片，导致「导出成功、导入却
+    被知识体积轴拒绝」。规划失败（未初始化 / 后端故障）退回原始行：导入
+    端会把知识段以 ``knowledge_error`` 上报并跳过，不阻断用户数据恢复。
+    """
+    if not rows:
+        return []
+    try:
+        from utils.knowledge_admin import import_documents
+
+        plan = import_documents(rows, dry_run=True, return_pieces=True)
+    except Exception:  # noqa: BLE001 - 校验退回旧口径
+        return list(rows)
+    pieces = plan.get("pieces") if isinstance(plan, dict) else None
+    return list(pieces or rows)
+
+
 def _export_shape_baseline(
     existing: dict[str, Any],
     knowledge_rows: list[Any],
