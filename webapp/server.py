@@ -4897,9 +4897,20 @@ def create_app(model: Any = None) -> FastAPI:
                         await session.runtime.drain_pending_persist()
                     finally:
                         session.end_turn()
+                    if cached.get("__incomplete__"):
+                        # 上一请求已落库但客户端断连没收到响应：不能重放
+                        # 空答案，也不能重新执行（会在历史里追加第二份问答）
+                        raise HTTPException(
+                            status_code=409,
+                            detail=str(
+                                cached.get("message")
+                                or "上一请求已处理但响应未送达，请刷新会话历史"
+                            ),
+                        )
                     response.headers.update(rate_headers)
                     response.headers["X-Idempotent-Replay"] = "1"
                     return cached
+            disconnected = False
             try:
                 result, disconnected = await _ask_cancellable_on_disconnect(
                     session.runtime.ask(
@@ -4970,6 +4981,26 @@ def create_app(model: Any = None) -> FastAPI:
                     await session.runtime.drain_pending_persist()
                 finally:
                     session.end_turn()
+                if (
+                    disconnected
+                    and idem_key is not None
+                    and getattr(
+                        session.runtime,
+                        "turn_persisted",
+                        lambda _input: False,
+                    )(payload.message)
+                ):
+                    # 断连 499 无法携带回答，但落库线程已把整轮写入：
+                    # 给幂等键留标记，重试时返回 409 而不是再执行一遍
+                    # （否则聊天历史会出现两条相同问答）
+                    state.idempotency.put(
+                        idem_key,
+                        {
+                            "session_id": session.session_id,
+                            "__incomplete__": True,
+                            "message": "上一请求已处理但响应未送达，请刷新会话历史",
+                        },
+                    )
         response.headers.update(rate_headers)
         # reply / agents 来自模型输出：孤立代理项（截断 emoji 的转义）会让
         # JSONResponse 的 UTF-8 编码抛 UnicodeEncodeError（500），响应前统一转义
