@@ -155,6 +155,12 @@ class RAGConfig(TypedDict):
     bm25_ttl_sec: int
 
 
+class PlanConfig(TypedDict):
+    # v2.0 行程校验：五项检查未通过时带原因重生成（默认 1 次）。
+    repair_enabled: bool
+    max_repair_attempts: int
+
+
 class StorageConfig(TypedDict):
     redis_url: str
     postgres_dsn: str
@@ -239,6 +245,13 @@ RAG_CONFIG: RAGConfig = {
     ),
     "bm25_max_docs": max(1, _env_int("RAG_BM25_MAX_DOCS", 20000)),
     "bm25_ttl_sec": max(0, _env_int("RAG_BM25_TTL_SEC", 60)),
+}
+
+# 行程规划校验（v2.0）：五项检查失败后带原因重生成。
+# attempts 上限 3，默认 1（一次重生成；仍失败则保留问题列表返回）。
+PLAN_CONFIG: PlanConfig = {
+    "repair_enabled": _env_bool("PLAN_REPAIR_ENABLED", True),
+    "max_repair_attempts": max(0, min(3, _env_int("PLAN_REPAIR_ATTEMPTS", 1))),
 }
 
 # 存储后端（生产模式可选；未配置或连接失败时自动回退本地实现）：
