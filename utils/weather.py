@@ -3,6 +3,7 @@
 城市名 → 地理编码 → 实时天气 + 未来 3 天预报。Web 侧栏与查询技能共用同一套
 天气码映射；结果带 10 分钟进程内缓存，避免频繁请求免费 API。
 """
+import json
 import logging
 import math
 import threading
@@ -168,6 +169,7 @@ def clear_weather_cache() -> None:
         _failures.clear()
         _degraded.clear()
         _upstream_calls.clear()
+    reset_shared_cache_failure()
 
 
 def peek_cached_weather(city: str) -> dict[str, Any] | None:
@@ -185,6 +187,127 @@ def peek_cached_weather(city: str) -> dict[str, Any] | None:
 def _cache_key(name: str) -> str:
     """归一化城市键：忽略大小写与多余空白，避免同一地点重复占用缓存。"""
     return " ".join(name.casefold().split())
+
+
+# ---------- 跨进程共享缓存（可选，配置 REDIS_URL 时） ----------
+# 只共享「成功的新鲜结果」：失败 / 降级缓存留在进程内（不同实例的上游
+# 状态不同，共享失败缓存会互相钉死）。与偏好版本键同一降级约定：Redis
+# 未配置 / 不可用 / 操作失败时退回进程内缓存；操作失败进入 60 秒本地
+# 冷却，避免 Redis 黑洞时每次查天气（侧栏刷新频繁）都等满 socket 超时。
+_SHARED_CACHE_FAILURE_COOLDOWN_SEC = 60.0
+_shared_cache_failed_until = 0.0
+_shared_cache_lock = threading.Lock()
+
+
+def reset_shared_cache_failure() -> None:
+    """清空共享缓存冷却（测试隔离 / 配置热更新）。"""
+    global _shared_cache_failed_until
+    with _shared_cache_lock:
+        _shared_cache_failed_until = 0.0
+
+
+def _shared_cache_client() -> Any | None:
+    with _shared_cache_lock:
+        if time.monotonic() < _shared_cache_failed_until:
+            return None
+    try:
+        from context.storage import get_shared_redis_client
+
+        return get_shared_redis_client()
+    except Exception:  # noqa: BLE001 - 存储模块不可用时退回进程内
+        return None
+
+
+def _note_shared_cache_failure(exc: BaseException) -> None:
+    global _shared_cache_failed_until
+    with _shared_cache_lock:
+        _shared_cache_failed_until = (
+            time.monotonic() + _SHARED_CACHE_FAILURE_COOLDOWN_SEC
+        )
+    try:
+        from context.short_term_memory import note_redis_operation_failure
+
+        note_redis_operation_failure(exc)
+    except Exception:  # noqa: BLE001 - 健康标记失败不影响降级
+        pass
+
+
+def _shared_cache_key(name: str) -> str:
+    return f"aligo:weather:{name}"
+
+
+def _valid_shared_payload(payload: Any) -> dict[str, Any] | None:
+    """共享负载的结构 / 数值校验：来自进程外，不能直接当成功结果返回。"""
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(payload.get("city"), str):
+        return None
+    current = payload.get("current")
+    daily = payload.get("daily")
+    if not isinstance(current, dict) or not isinstance(daily, list):
+        return None
+    if not all(isinstance(day, dict) for day in daily):
+        return None
+    try:
+        _ensure_finite(payload)
+    except WeatherError:
+        return None
+    return payload
+
+
+def _shared_cache_get(name: str) -> tuple[float, dict[str, Any]] | None:
+    """读取共享缓存：返回 (抓取时刻墙钟秒, 结果)；不可用 / 陈旧 / 非法为 None。
+
+    负载带抓取时刻：回填进程内缓存的「新鲜度锚点」按真实抓取时间计，
+    否则 10 分钟的共享条目被回填后可再活 10 分钟（陈旧窗口翻倍，stale
+    兜底窗口同样被拉长）。墙钟只用于计算年龄，跨实例时钟偏差按 0 年龄
+    下限处理（Redis TTL 仍然兜底过期）。
+    """
+    client = _shared_cache_client()
+    if client is None:
+        return None
+    try:
+        raw = client.get(_shared_cache_key(name))
+    except Exception as exc:  # noqa: BLE001 - Redis 故障退回进程内缓存
+        _note_shared_cache_failure(exc)
+        return None
+    if raw is None:
+        return None
+    try:
+        envelope = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    fetched_at = envelope.get("fetched_at")
+    if isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float)):
+        return None
+    fetched_at = float(fetched_at)
+    if not math.isfinite(fetched_at):
+        return None
+    payload = _valid_shared_payload(envelope.get("data"))
+    if payload is None:
+        return None
+    if time.time() - fetched_at >= CACHE_TTL_SEC:
+        # 本地墙钟看到已超过 10 分钟（Redis TTL 与墙钟的偏差兜底）：
+        # 按未命中处理，下一次成功抓取会覆盖共享键
+        return None
+    return fetched_at, payload
+
+
+def _shared_cache_set(name: str, result: dict[str, Any]) -> None:
+    client = _shared_cache_client()
+    if client is None:
+        return
+    envelope = {"fetched_at": time.time(), "data": result}
+    try:
+        client.setex(
+            _shared_cache_key(name),
+            int(CACHE_TTL_SEC),
+            json.dumps(envelope, ensure_ascii=False),
+        )
+    except Exception as exc:  # noqa: BLE001 - 缓存写失败不影响主流程
+        _note_shared_cache_failure(exc)
 
 
 def _describe(code: Any) -> str:
@@ -241,12 +364,42 @@ def _get_json(url: str, params: dict[str, Any], timeout: float) -> dict[str, Any
 
 
 def _cache_hit(name: str) -> dict[str, Any] | None:
-    """返回未过期的缓存结果（过期条目留给写入时的清理）。"""
+    """返回未过期的缓存结果（过期条目留给写入时的清理）。
+
+    进程内未命中时再看跨进程共享缓存（配置 Redis 时）：命中则按真实
+    抓取时刻回填进程内缓存。Redis 读取在 ``_cache_lock`` 之外，避免网络
+    等待阻塞其它城市的缓存读写。
+    """
     with _cache_lock:
         cached = _cache.get(name)
         if cached is not None and time.monotonic() - cached[0] < CACHE_TTL_SEC:
             return cached[1]
+    shared = _shared_cache_get(name)
+    if shared is not None:
+        fetched_at, payload = shared
+        age = max(0.0, time.time() - fetched_at)
+        return _fill_from_shared(name, payload, age)
     return None
+
+
+def _fill_from_shared(
+    name: str, payload: dict[str, Any], age_sec: float
+) -> dict[str, Any]:
+    """把共享条目回填进程内缓存，新鲜度锚点按真实抓取时刻。
+
+    并发下本地线程可能刚抓到更新的数据：只在不会覆盖更新的本地条目时
+    写入，并返回实际生效的数据（回填的旧快照不能盖掉本地新结果）。
+    """
+    stamp = time.monotonic() - max(0.0, age_sec)
+    with _cache_lock:
+        existing = _cache.get(name)
+        if existing is not None and existing[0] >= stamp:
+            return existing[1]
+        _cache[name] = (stamp, payload)
+        _failures.pop(name, None)
+        # 新鲜数据到达后，短窗内的降级复用立即失效
+        _degraded.pop(name, None)
+        return payload
 
 
 def _claim_fetch(name: str) -> tuple[bool, threading.Event]:
@@ -282,6 +435,7 @@ def _store_cache(name: str, result: dict[str, Any]) -> None:
         _failures.pop(name, None)
         # 新鲜数据到达后，短窗内的降级复用立即失效
         _degraded.pop(name, None)
+    _shared_cache_set(name, result)
 
 
 def _stale_entry(key: str) -> tuple[float, dict[str, Any]] | None:

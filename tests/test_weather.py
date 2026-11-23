@@ -3,6 +3,7 @@ Open-Meteo 天气工具测试（无需 API Key、不访问网络）
 
 运行：python tests/test_weather.py
 """
+import json
 import os
 import sys
 import threading
@@ -30,10 +31,183 @@ class _Response:
         return self._data
 
 
-@pytest.fixture(autouse=True)
-def _isolate_weather_cache():
-    """天气缓存是进程级全局状态，避免成功 / 失败结果在用例之间泄漏。"""
+class _FakeSharedRedis:
+    """最小 Redis 替身：只实现天气共享缓存用到的 GET / SETEX。"""
+
+    def __init__(self):
+        self.data = {}
+        self.get_calls = 0
+        self.setex_calls = []
+
+    def get(self, key):
+        self.get_calls += 1
+        return self.data.get(key)
+
+    def setex(self, key, ttl, value):
+        self.setex_calls.append((key, ttl, value))
+        self.data[key] = value
+        return True
+
+
+class _BrokenSharedRedis:
+    def __init__(self):
+        self.get_calls = 0
+
+    def get(self, key):
+        self.get_calls += 1
+        raise ConnectionError("redis down")
+
+    def setex(self, key, ttl, value):
+        raise ConnectionError("redis down")
+
+
+def _shared_envelope(payload, fetched_at=None):
+    return json.dumps(
+        {
+            "fetched_at": time.time() if fetched_at is None else fetched_at,
+            "data": payload,
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_shared_cache_hit_avoids_upstream(monkeypatch):
+    """共享缓存命中直接返回并回填进程内缓存，不访问上游、不续期共享条目。"""
+    client = _FakeSharedRedis()
+    payload = {"city": "杭州", "current": {"temperature": 20}, "daily": []}
+    key = weather._cache_key("杭州")
+    client.data[f"aligo:weather:{key}"] = _shared_envelope(payload)
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
     weather.clear_weather_cache()
+    upstream_calls = []
+
+    def fake_uncached(*args, **kwargs):
+        upstream_calls.append(args)
+        return {}
+
+    monkeypatch.setattr(weather, "_fetch_weather_uncached", fake_uncached)
+    monkeypatch.setattr(weather, "_admit_upstream", lambda: None)
+
+    assert weather.fetch_weather("杭州") == payload
+    assert not upstream_calls, "共享缓存命中不应访问上游"
+    assert client.setex_calls == [], "回填进程内缓存不能续期共享条目"
+    # 回填后同一进程再读命中进程内缓存，不再触达 Redis
+    assert weather.fetch_weather("杭州") == payload
+    assert client.get_calls == 1
+    print("✓ 共享天气缓存命中避免上游调用")
+
+
+def test_success_cache_write_is_shared(monkeypatch):
+    """成功结果写入共享缓存（带 10 分钟 TTL 与抓取时刻信封）。"""
+    client = _FakeSharedRedis()
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    key = weather._cache_key("杭州")
+    sample = {"city": "杭州", "current": {"temperature": 18}, "daily": []}
+    weather._store_cache(key, sample)
+    assert client.setex_calls, "成功缓存应写入共享缓存"
+    stored_key, ttl, raw = client.setex_calls[-1]
+    assert stored_key == f"aligo:weather:{key}"
+    assert ttl == int(weather.CACHE_TTL_SEC)
+    envelope = json.loads(raw)
+    assert envelope["data"] == sample
+    assert abs(envelope["fetched_at"] - time.time()) < 60
+    print("✓ 成功天气结果写入共享缓存")
+
+
+def test_shared_cache_failure_enters_cooldown(monkeypatch):
+    """Redis 操作失败后 60 秒冷却内不再触达客户端（避免每次等满超时）。"""
+    from context import storage as storage_module
+
+    broken = _BrokenSharedRedis()
+    weather.reset_shared_cache_failure()
+    monkeypatch.setattr(
+        storage_module, "get_shared_redis_client", lambda *a, **k: broken
+    )
+    assert weather._shared_cache_get("bj") is None
+    assert weather._shared_cache_get("sh") is None
+    assert broken.get_calls == 1, "冷却期内不应再触达 Redis"
+    weather.reset_shared_cache_failure()
+    assert weather._shared_cache_get("gz") is None
+    assert broken.get_calls == 2, "重置冷却后重新尝试"
+    print("✓ 共享天气缓存的 Redis 故障进入冷却")
+
+
+def test_shared_cache_ignores_stale_or_invalid_entry(monkeypatch):
+    """共享缓存的陈旧 / 非法负载按未命中处理（不阻断查询、不当成功结果）。"""
+    client = _FakeSharedRedis()
+    key = weather._cache_key("杭州")
+    redis_key = f"aligo:weather:{key}"
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    payload = {"city": "杭州", "current": {}, "daily": []}
+    # 超过 10 分钟：即使 Redis 里还在也不能当新鲜数据
+    client.data[redis_key] = _shared_envelope(
+        payload, fetched_at=time.time() - weather.CACHE_TTL_SEC - 5
+    )
+    assert weather._shared_cache_get(key) is None
+    # 非 JSON / 非对象 / 结构不对 / 非有限数值：一律按未命中
+    client.data[redis_key] = b"not-json"
+    assert weather._shared_cache_get(key) is None
+    client.data[redis_key] = _shared_envelope(
+        {"city": "杭州", "current": {}, "daily": ["x"]}
+    )
+    assert weather._shared_cache_get(key) is None
+    client.data[redis_key] = (
+        '{"fetched_at": %s, "data": {"city": "杭州", '
+        '"current": {"temperature": Infinity}, "daily": []}}' % time.time()
+    ).encode()
+    assert weather._shared_cache_get(key) is None
+    print("✓ 共享缓存的陈旧 / 非法负载按未命中处理")
+
+
+def test_shared_hit_anchors_age_to_fetch_time(monkeypatch):
+    """回填的新鲜度锚点按真实抓取时刻：共享条目不会因回填续命。"""
+    client = _FakeSharedRedis()
+    payload = {"city": "杭州", "current": {"temperature": 20}, "daily": []}
+    key = weather._cache_key("杭州")
+    client.data[f"aligo:weather:{key}"] = _shared_envelope(
+        payload, fetched_at=time.time() - 500
+    )
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    monkeypatch.setattr(weather, "_fetch_weather_uncached", lambda *a, **k: {})
+    monkeypatch.setattr(weather, "_admit_upstream", lambda: None)
+    before = time.monotonic()
+    assert weather.fetch_weather("杭州") == payload
+    stamp = weather._cache[key][0]
+    assert stamp <= before - 400, "锚点必须回拨到真实抓取时刻附近"
+    assert stamp >= before - 700
+    print("✓ 共享命中按真实抓取时刻回填新鲜度")
+
+
+def test_shared_backfill_keeps_newer_local_entry():
+    """并发下本地刚抓到的新结果不被共享回填覆盖。"""
+    key = weather._cache_key("杭州")
+    new_payload = {"city": "杭州", "current": {"temperature": 30}, "daily": []}
+    old_payload = {"city": "杭州", "current": {"temperature": 10}, "daily": []}
+    weather.clear_weather_cache()
+    with weather._cache_lock:
+        weather._cache[key] = (time.monotonic(), new_payload)
+    assert weather._fill_from_shared(key, old_payload, 500) is new_payload
+    assert weather._cache[key][1] is new_payload
+    print("✓ 共享回填不覆盖更新的本地结果")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_weather_cache(monkeypatch):
+    """天气缓存是进程级全局状态，避免成功 / 失败结果在用例之间泄漏。
+
+    共享缓存（配置 REDIS_URL 时）是进程外状态：测试统一隔离为「无
+    Redis」，否则用例会读写真实 Redis 并互相污染（clear_weather_cache
+    只清进程内表，不清共享键）。
+    """
+    from context import storage as storage_module
+
+    weather.clear_weather_cache()
+    monkeypatch.setattr(
+        storage_module, "get_shared_redis_client", lambda *a, **k: None
+    )
     yield
     weather.clear_weather_cache()
 
@@ -1073,10 +1247,22 @@ if __name__ == "__main__":
         test_quota_rejection_serves_stale_without_failure_cache,
         test_upstream_concurrency_gate_reports_busy,
         test_degraded_reuse_window_and_expiry,
+        test_shared_cache_hit_avoids_upstream,
+        test_success_cache_write_is_shared,
+        test_shared_cache_failure_enters_cooldown,
+        test_shared_cache_ignores_stale_or_invalid_entry,
+        test_shared_hit_anchors_age_to_fetch_time,
     ):
         mp = pytest.MonkeyPatch()
         try:
-            # 直跑不执行 autouse fixture：手动隔离天气缓存
+            # 直跑不执行 autouse fixture：手动隔离天气缓存与共享 Redis
+            from context import storage as _storage_module
+
+            mp.setattr(
+                _storage_module,
+                "get_shared_redis_client",
+                lambda *a, **k: None,
+            )
             weather.clear_weather_cache()
             case(mp)
         finally:
@@ -1087,4 +1273,12 @@ if __name__ == "__main__":
     test_weather_codes_include_freezing_drizzle()
     test_describe_tolerates_non_finite_codes()
     test_peek_cached_weather_returns_fresh_entry()
+    with pytest.MonkeyPatch.context() as _mp:
+        from context import storage as _storage_module
+
+        _mp.setattr(
+            _storage_module, "get_shared_redis_client", lambda *a, **k: None
+        )
+        weather.clear_weather_cache()
+        test_shared_backfill_keeps_newer_local_entry()
     print("\n全部通过")
