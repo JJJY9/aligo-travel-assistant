@@ -3057,6 +3057,62 @@ def test_update_memory_backfills_end_date_instead_of_duplicate():
     print("✓ 补出返程日期更新既有行程而非重复落库")
 
 
+def test_update_memory_backfills_origin_and_end_together():
+    """同一轮既补出发地又补返程日期时，两字段一起写入旧行程，不重复建档。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+    def results(origin, end):
+        return [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "origin": origin,
+                        "destination": "杭州",
+                        "start_date": "2026-03-11",
+                        "end_date": end,
+                    },
+                },
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "杭州出差"}},
+                },
+            },
+        ]
+
+    orchestrator._update_memory({}, results("", None))
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1 and not trips[0].get("origin"), trips
+
+    orchestrator._update_memory({}, results("上海", "2026-03-15"))
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, f"同时补出发地/返程不应新增行程：{trips}"
+    assert trips[0]["origin"] == "上海"
+    assert trips[0]["end_date"] == "2026-03-15"
+    assert memory.long_term.get_statistics()["total_trips"] == 1
+    print("✓ 同轮补出发地与返程更新既有行程，不重复建档")
+
+
+def test_trip_duration_days_week_word_does_not_inflate_day_counts():
+    """「周末 3 天」「假期 3 天」按 3 天解释；纯周表达才 ×7。"""
+    from agents.orchestration_agent import _trip_duration_days
+
+    assert _trip_duration_days("周末3天") == 3
+    assert _trip_duration_days("假期3天") == 3
+    assert _trip_duration_days("3天2晚") == 3
+    assert _trip_duration_days("一周") == 7
+    assert _trip_duration_days("两周") == 14
+    assert _trip_duration_days("3个星期") == 21
+    print("✓ 时长解析：带天/日的文本不按周放大")
+
+
 def test_previous_preferences_context_skips_explanatory_keys():
     """旧格式偏好字典的说明性键不进入后续批次上下文。"""
     orchestrator = OrchestrationAgent(agent_registry={})

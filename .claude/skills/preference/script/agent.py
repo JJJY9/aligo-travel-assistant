@@ -183,8 +183,23 @@ def _expand_legacy_array_items(items: list) -> list:
     return expanded
 
 
-def _result_from_preferences(candidate: dict, preferences: object) -> dict | None:
+def _result_from_preferences(
+    candidate: dict, preferences: object, _depth: int = 0
+) -> dict | None:
     """把 preferences 字段的几种形态规范成列表结果；无法解析返回 None。"""
+    if (
+        _depth < 2
+        and isinstance(preferences, dict)
+        and isinstance(preferences.get("preferences"), (list, dict))
+    ):
+        # 模型偶尔把结果对象再包一层：
+        # {"preferences": {"preferences": [...], "has_preferences": true}}。
+        # 直接按单对象处理会把内层的 preferences / has_preferences 键过滤掉，
+        # 归一结果为空列表——技能返回成功但用户偏好被静默丢弃。编排层已兼容
+        # 该形状（_extract_preferences_payload），技能侧按同一口径解包。
+        return _result_from_preferences(
+            candidate, preferences.get("preferences"), _depth + 1
+        )
     if isinstance(preferences, list):
         preferences = _expand_legacy_array_items(preferences)
     elif isinstance(preferences, dict):
@@ -195,6 +210,14 @@ def _result_from_preferences(candidate: dict, preferences: object) -> dict | Non
             parsed = json.loads(preferences)
         except (json.JSONDecodeError, ValueError):
             return None
+        if (
+            _depth < 2
+            and isinstance(parsed, dict)
+            and isinstance(parsed.get("preferences"), (list, dict))
+        ):
+            return _result_from_preferences(
+                candidate, parsed.get("preferences"), _depth + 1
+            )
         if isinstance(parsed, dict):
             parsed = [parsed]
         if not isinstance(parsed, list):

@@ -146,96 +146,115 @@ class LazyAgentRegistry:
         return self._resolve_agent_name(str(agent_name or ""))
 
     def __getitem__(self, agent_name: str):
-        """获取智能体 (懒加载)"""
+        """获取智能体 (懒加载)。
+
+        缓存命中走无锁快速路径：其它技能的冷加载（RAG 首次加载可能数
+        十秒）不能阻塞已加载技能的取用。同一技能的并发首载按脚本路径
+        串行，不同技能各自持锁、互不阻塞。
+        """
+        cached = self.cache.get(agent_name)
+        if cached is not None:
+            return cached
+
+        skill_name = self._resolve_agent_name(agent_name)
+        if not skill_name:
+            raise KeyError(f"Agent '{agent_name}' not found in skills directory")
+
+        # 缓存统一按技能目录名存放：编排器固定用标准名（itinerary_planning）
+        # 查找、调用方可能用目录名（plan-trip）注册 / 删除，两个入口必须
+        # 命中同一实例，否则同一技能会被加载两次（按目录名 delete 也残留）
         with self._load_lock:
-            if agent_name in self.cache:
-                return self.cache[agent_name]
+            cached = self.cache.get(skill_name)
+            if cached is not None:
+                return cached
 
-            skill_name = self._resolve_agent_name(agent_name)
-            if not skill_name:
-                raise KeyError(f"Agent '{agent_name}' not found in skills directory")
+        script_path = self._skill_map[skill_name]
 
-            # 缓存统一按技能目录名存放：编排器固定用标准名（itinerary_planning）
-            # 查找、调用方可能用目录名（plan-trip）注册 / 删除，两个入口必须
-            # 命中同一实例，否则同一技能会被加载两次（按目录名 delete 也残留）
-            if skill_name in self.cache:
-                return self.cache[skill_name]
+        # 同一技能的并发首载串行化：加载锁按脚本路径隔离，不再用注册器
+        # 级 _load_lock 包住整个导入 / 实例化过程
+        with _module_lock(f"agent-load:{script_path}"):
+            with self._load_lock:
+                cached = self.cache.get(skill_name)
+                if cached is not None:
+                    return cached
+            return self._load_agent(agent_name, skill_name, script_path)
 
-            script_path = self._skill_map[skill_name]
+    def _load_agent(self, agent_name: str, skill_name: str, script_path: Path):
+        """加载并实例化单个技能。调用方须持有该技能的加载锁。"""
+        self._say(f"[dim]🔄 正在加载 {agent_name} (from {skill_name})...[/dim]")
 
-            self._say(f"[dim]🔄 正在加载 {agent_name} (from {skill_name})...[/dim]")
+        try:
+            # 1. 动态加载模块（同一脚本进程内只执行一次；并发首载按路径串行）
+            module_name = f"skills.{skill_name}.agent"
+            cache_key = str(script_path)
+            with _module_lock(cache_key):
+                module = _MODULE_CACHE.get(cache_key)
+                if module is None:
+                    spec = importlib.util.spec_from_file_location(
+                        module_name, script_path
+                    )
+                    if spec is None or spec.loader is None:
+                        raise ImportError(f"Cannot load spec from {script_path}")
 
-            try:
-                # 1. 动态加载模块（同一脚本进程内只执行一次；并发首载按路径串行）
-                module_name = f"skills.{skill_name}.agent"
-                cache_key = str(script_path)
-                with _module_lock(cache_key):
-                    module = _MODULE_CACHE.get(cache_key)
-                    if module is None:
-                        spec = importlib.util.spec_from_file_location(
-                            module_name, script_path
-                        )
-                        if spec is None or spec.loader is None:
-                            raise ImportError(f"Cannot load spec from {script_path}")
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = module
 
-                        module = importlib.util.module_from_spec(spec)
-                        sys.modules[module_name] = module
+                    # 关键：确保模块能找到项目根目录的包 (utils, config 等)
+                    project_root = str(Path(__file__).parent.parent.absolute())
+                    if project_root not in sys.path:
+                        sys.path.insert(0, project_root)
 
-                        # 关键：确保模块能找到项目根目录的包 (utils, config 等)
-                        project_root = str(Path(__file__).parent.parent.absolute())
-                        if project_root not in sys.path:
-                            sys.path.insert(0, project_root)
+                    spec.loader.exec_module(module)
+                    _MODULE_CACHE[cache_key] = module
 
-                        spec.loader.exec_module(module)
-                        _MODULE_CACHE[cache_key] = module
+            # 2. 查找 Agent 类：只看本技能模块里定义的类，避免选中它
+            # import 进来的其它 AgentBase 子类 / 辅助类
+            agent_class = None
+            for name, obj in inspect.getmembers(module):
+                if (
+                    inspect.isclass(obj)
+                    and issubclass(obj, AgentBase)
+                    and obj is not AgentBase
+                    and getattr(obj, "__module__", None) == module.__name__
+                ):
+                    agent_class = obj
+                    break
 
-                # 2. 查找 Agent 类：只看本技能模块里定义的类，避免选中它
-                # import 进来的其它 AgentBase 子类 / 辅助类
-                agent_class = None
-                for name, obj in inspect.getmembers(module):
-                    if (
-                        inspect.isclass(obj)
-                        and issubclass(obj, AgentBase)
-                        and obj is not AgentBase
-                        and getattr(obj, "__module__", None) == module.__name__
-                    ):
-                        agent_class = obj
-                        break
+            if not agent_class:
+                raise ValueError(f"No AgentBase subclass found in {script_path}")
 
-                if not agent_class:
-                    raise ValueError(f"No AgentBase subclass found in {script_path}")
+            # 3. 实例化
+            # 构造参数：name, model, memory_manager (如果需要), **kwargs
+            init_params = {
+                "name": agent_name, # 使用请求的名字，或者可以用 skill_name
+                "model": self.model,
+            }
 
-                # 3. 实例化
-                # 构造参数：name, model, memory_manager (如果需要), **kwargs
-                init_params = {
-                    "name": agent_name, # 使用请求的名字，或者可以用 skill_name
-                    "model": self.model,
-                }
+            # 检查是否需要 memory_manager
+            sig = inspect.signature(agent_class.__init__)
+            if "memory_manager" in sig.parameters:
+                init_params["memory_manager"] = self.memory_manager
 
-                # 检查是否需要 memory_manager
-                sig = inspect.signature(agent_class.__init__)
-                if "memory_manager" in sig.parameters:
-                    init_params["memory_manager"] = self.memory_manager
+            agent_instance = agent_class(**init_params)
 
-                agent_instance = agent_class(**init_params)
-
-                # 4. 缓存（初始化失败的实例不缓存）
-                # 按技能目录名缓存：标准名 / 目录名 / 别名 / 大小写变体都
-                # 解析到同一实例。知识库未初始化等场景会构造出
-                # initialized=False 的实例：用户补跑初始化脚本后，下一次
-                # 调用应重新加载，而不是在同一进程 / 会话里永远返回旧的
-                # 「知识库尚未初始化」错误
-                if getattr(agent_instance, "initialized", True) is not False:
+            # 4. 缓存（初始化失败的实例不缓存）
+            # 按技能目录名缓存：标准名 / 目录名 / 别名 / 大小写变体都
+            # 解析到同一实例。知识库未初始化等场景会构造出
+            # initialized=False 的实例：用户补跑初始化脚本后，下一次
+            # 调用应重新加载，而不是在同一进程 / 会话里永远返回旧的
+            # 「知识库尚未初始化」错误
+            if getattr(agent_instance, "initialized", True) is not False:
+                with self._load_lock:
                     self.cache[skill_name] = agent_instance
-                self._say(f"[dim]✓ {agent_name} 加载完成[/dim]")
+            self._say(f"[dim]✓ {agent_name} 加载完成[/dim]")
 
-                return agent_instance
+            return agent_instance
 
-            except Exception as e:
-                self._say(f"[red]✗ 加载 {agent_name} 失败: {e}[/red]")
-                import traceback
-                traceback.print_exc()
-                raise
+        except Exception as e:
+            self._say(f"[red]✗ 加载 {agent_name} 失败: {e}[/red]")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def __setitem__(self, agent_name: str, agent: Any) -> None:
         """注册自定义智能体（与 dict 注册表同一语义）：写入缓存直接命中。"""

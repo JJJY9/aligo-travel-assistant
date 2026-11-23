@@ -8,6 +8,8 @@
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -75,6 +77,46 @@ def test_uninitialized_agents_not_cached(monkeypatch):
     second = registry["rag_knowledge"]
     assert second is not first, "initialized=False 的实例不能进入缓存"
     print("✓ 初始化失败的智能体不缓存")
+
+
+def test_cached_agent_not_blocked_by_other_skill_slow_load(monkeypatch):
+    """一个技能的慢加载不能阻塞已缓存技能的取用（缓存快速路径无全局锁）。"""
+    root = Path(tempfile.mkdtemp())
+    _write_skill(root, "fast", _AGENT_SOURCE)
+    _write_skill(root, "slow", _AGENT_SOURCE)
+    monkeypatch.setattr(lazy_agent_registry, "resolve_skills_root", lambda: root)
+
+    class _BlockingRegistry(LazyAgentRegistry):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def _load_agent(self, agent_name, skill_name, script_path):
+            if skill_name == "slow":
+                self.started.set()
+                assert self.release.wait(5), "测试未及时放行慢加载"
+            return super()._load_agent(agent_name, skill_name, script_path)
+
+    registry = _BlockingRegistry(model="fake-model", cache={})
+    fast = registry["fast"]
+
+    loaded = {}
+    thread = threading.Thread(
+        target=lambda: loaded.setdefault("slow", registry["slow"])
+    )
+    thread.start()
+    try:
+        assert registry.started.wait(5), "慢加载未开始"
+        start = time.monotonic()
+        assert registry["fast"] is fast, "缓存命中的技能必须返回同一实例"
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, f"缓存命中被其它技能加载阻塞 {elapsed:.2f}s"
+    finally:
+        registry.release.set()
+        thread.join(5)
+    assert loaded.get("slow") is not None, "慢加载线程未完成"
+    print("✓ 慢加载不阻塞已缓存技能取用")
 
 
 def test_discovers_and_caches_agents(monkeypatch):
@@ -374,6 +416,7 @@ if __name__ == "__main__":
         test_module_executed_once_across_registries,
         test_agent_class_selection_ignores_imported_subclass,
         test_cache_is_keyed_by_skill_name,
+        test_cached_agent_not_blocked_by_other_skill_slow_load,
     ):
         mp = pytest.MonkeyPatch()
         try:
