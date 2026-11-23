@@ -333,10 +333,12 @@ class _FlakyRedis:
             seen = self.seen.setdefault(keys[2], set())
             window = int(args[0])
             pushed = 0
-            for index in range(2, len(args) - 2, 3):
+            for index in range(2, len(args) - 3, 4):
                 op_id = args[index]
                 content_id = args[index + 1]
-                payload = args[index + 2]
+                # args[index + 2] 是模式（append / ordered）：桩不做时间序
+                # 插入，统一按追加处理
+                payload = args[index + 3]
                 if op_id in applied:
                     continue
                 if content_id and content_id in seen:

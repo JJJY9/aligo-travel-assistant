@@ -35,10 +35,10 @@ def _message(content, timestamp):
     )
 
 
-def _add(client, key, payloads, window="20"):
+def _add(client, key, payloads, window="20", mode="ordered"):
     args = [window, "3600"]
     for payload in payloads:
-        args.extend([f"op-{payload}", f"hash-{payload}", payload])
+        args.extend([f"op-{payload}", f"hash-{payload}", mode, payload])
     return client.eval(
         _ADD_MESSAGES_LUA,
         3,
@@ -124,7 +124,7 @@ def test_same_op_id_not_duplicated():
     client = fakeredis.FakeRedis(decode_responses=True)
     key = "aligo:short:v1:u:s"
     payload = _message("a", "2026-03-11T10:00:00")
-    args = ["20", "3600", "same-op", "hash-a", payload]
+    args = ["20", "3600", "same-op", "hash-a", "ordered", payload]
     client.eval(
         _ADD_MESSAGES_LUA, 3, key, applied_key(key), seen_key(key), *args
     )
@@ -133,6 +133,63 @@ def test_same_op_id_not_duplicated():
     )
     assert _contents(client, key) == ["a"]
     print("✓ 同 op_id 重放不重复")
+
+
+def test_same_second_backfill_keeps_microsecond_order():
+    """同一秒内的回填消息按微秒排序（旧实现截到秒后无法区分）。"""
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    for index in (0, 2):
+        client.rpush(
+            key,
+            _message(f"m{index}", f"2026-03-11T10:00:00.{index}00000"),
+        )
+    _add(client, key, [_message("m1", "2026-03-11T10:00:00.100000")])
+    assert _contents(client, key) == ["m0", "m1", "m2"]
+    print("✓ 同秒回填按微秒顺序插入")
+
+
+def test_space_separator_timestamp_is_normalized():
+    """空格分隔的时间戳按 'T' 归一后再比较，不会插到更早的位置。"""
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    client.rpush(key, _message("a", "2026-03-11T10:00:30"))
+    _add(client, key, [_message("b", "2026-03-11 10:00:20")])
+    assert _contents(client, key) == ["b", "a"]
+    print("✓ 空格分隔时间戳归一后排序")
+
+
+def test_untimestamped_old_entry_does_not_force_append():
+    """旧条目缺时间戳时跳过继续找锚点，不能把回填历史追加到窗口尾部。"""
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    client.rpush(
+        key, json.dumps({"role": "user", "content": "no-ts", "metadata": {}})
+    )
+    client.rpush(key, _message("recent1", "2026-03-11T10:00:00"))
+    client.rpush(key, _message("recent2", "2026-03-11T10:01:00"))
+    _add(client, key, [_message("old", "2026-03-10T09:00:00")])
+    assert _contents(client, key) == ["old", "no-ts", "recent1", "recent2"]
+    print("✓ 旧条目缺时间戳不再强制追加")
+
+
+def test_live_append_mode_ignores_clock_skew():
+    """实时消息走 append：时间戳偏旧也不会被插到头部后遭 LTRIM 丢掉。"""
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    client.rpush(key, _message("new1", "2026-03-11T10:01:00"))
+    client.rpush(key, _message("new2", "2026-03-11T10:02:00"))
+    _add(
+        client,
+        key,
+        [_message("live-skewed", "2026-03-11T09:00:00")],
+        window="3",
+        mode="append",
+    )
+    contents = _contents(client, key)
+    assert contents[-1] == "live-skewed", contents
+    assert "live-skewed" in contents, "时钟回拨的实时消息不能被 LTRIM 丢掉"
+    print("✓ 实时追加不受时钟回拨影响")
 
 
 if __name__ == "__main__":
@@ -144,4 +201,8 @@ if __name__ == "__main__":
     test_new_messages_append_in_order()
     test_missing_timestamp_falls_back_to_append()
     test_same_op_id_not_duplicated()
+    test_same_second_backfill_keeps_microsecond_order()
+    test_space_separator_timestamp_is_normalized()
+    test_untimestamped_old_entry_does_not_force_append()
+    test_live_append_mode_ignores_clock_skew()
     print("\n全部通过")

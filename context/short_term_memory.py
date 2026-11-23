@@ -347,17 +347,29 @@ local window = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local pushed = 0
 
--- 时间序插入（v2.0）：回填 / 重放的历史消息必须按 timestamp 放到对应
--- 位置。无条件 RPUSH 会把更旧的消息放到窗口尾部，LTRIM 随后把真实的
--- 最近轮次挤出窗口。时间戳缺失 / 无法解析时退回 RPUSH（宁可乱序不丢消息）。
+-- 时间序插入（v2.0）：回填的历史消息必须按 timestamp 放到对应位置。
+-- 无条件 RPUSH 会把更旧的消息放到窗口尾部，LTRIM 随后把真实的最近轮次
+-- 挤出窗口。实时消息走 append 模式，不参与时间排序。
+--
+-- 时间戳键保留到微秒（26 字符）并把空格分隔符归一为 'T'：Python
+-- datetime.isoformat() 带微秒，只截到秒会让同一秒内的回填消息失去顺序；
+-- 空格 / T 两种写法的字典序不同（空格 < 'T'），不归一会直接比较错。
 local function timestamp_key(value)
   if type(value) ~= 'string' or #value < 10 then
     return ''
   end
-  return string.sub(value, 1, 19)
+  local normalized = value
+  if string.sub(normalized, 11, 11) == ' ' then
+    normalized = string.sub(normalized, 1, 10)
+      .. 'T' .. string.sub(normalized, 12)
+  end
+  if #normalized > 26 then
+    normalized = string.sub(normalized, 1, 26)
+  end
+  return normalized
 end
 
-local function insert_payload(payload)
+local function insert_ordered(payload)
   local ok, msg = pcall(cjson.decode, payload)
   local new_ts = ''
   if ok and type(msg) == 'table' then
@@ -376,15 +388,12 @@ local function insert_payload(payload)
     if ok_old and type(old) == 'table' then
       old_ts = timestamp_key(old['timestamp'])
     end
-    if old_ts == '' then
-      -- 旧条目没有可比时间戳：无法安全越过它，退回追加
-      redis.call('RPUSH', key, payload)
-      return
-    end
-    if old_ts <= new_ts then
+    if old_ts ~= '' and old_ts <= new_ts then
       insert_after = index
       break
     end
+    -- 旧条目没有可比时间戳（升级前的历史）：跳过继续向前找锚点。
+    -- 不能退回 RPUSH——那会把旧历史放到窗口尾部、挤出真正的最近轮次
   end
   if insert_after >= 0 then
     local anchor = redis.call('LINDEX', key, insert_after)
@@ -394,10 +403,21 @@ local function insert_payload(payload)
   end
 end
 
-for i = 3, #ARGV, 3 do
+local function insert_payload(payload, mode)
+  if mode == 'append' then
+    -- 实时消息永远追加：时钟回拨 / 多实例时间偏差时按时间插入可能把
+    -- 新消息放到窗口头部，随后的 LTRIM 直接把它丢掉
+    redis.call('RPUSH', key, payload)
+    return
+  end
+  insert_ordered(payload)
+end
+
+for i = 3, #ARGV, 4 do
   local op_id = ARGV[i]
   local content_hash = ARGV[i + 1]
-  local payload = ARGV[i + 2]
+  local mode = ARGV[i + 2]
+  local payload = ARGV[i + 3]
   local skip = redis.call('SISMEMBER', applied, op_id) == 1
   if not skip and content_hash ~= ''
      and redis.call('SISMEMBER', seen, content_hash) == 1 then
@@ -407,7 +427,7 @@ for i = 3, #ARGV, 3 do
     -- 先插入再登记：脚本不回滚，若先 SADD 后插入失败（WRONGTYPE /
     -- 内存不足），op_id 已被当作「已追加」写入 applied，恢复重放会永久
     -- 跳过这条消息。插入出错时脚本中断，op_id 不落 applied，重放可补写。
-    insert_payload(payload)
+    insert_payload(payload, mode)
     redis.call('SADD', applied, op_id)
     if content_hash ~= '' then
       redis.call('SADD', seen, content_hash)
@@ -746,7 +766,7 @@ class RedisShortTermMemory:
         # 成功的写入也镜像一份，故障切换时上下文与删除操作仍然正确。
         self._fallback = ShortTermMemory(max_turns=max_turns)
         # 故障期变更记入按会话键共享的操作日志（见 _PendingJournal）：
-        # ("add", (JSON 项, op_id)) / ("truncate", (expect, op_id, cutoff)) /
+        # ("add", (JSON 项, op_id, 内容指纹, 模式)) / ("truncate", (expect, op_id, cutoff)) /
         # ("remove", [JSON 项]) / ("clear", cutoff)，恢复后按发生顺序重放。
         # 只补写新增会在恢复后复活已删除的轮次；按影子缓存整键重写会丢掉
         # 其它实例在故障期间写入、而本对象从未见过的消息。
@@ -782,11 +802,15 @@ class RedisShortTermMemory:
                 "timestamp": timestamp or datetime.now().isoformat(),
                 "metadata": {},
             }
-            self._push_message(entry)
+            self._push_message(entry, ordered=True)
         self._shadow_last_activity = time.monotonic()
 
-    def _push_message(self, message: dict[str, Any]) -> None:
+    def _push_message(self, message: dict[str, Any], ordered: bool = False) -> None:
         """把一条成形消息写入影子缓存并（尽力）追加到 Redis；失败登记重放。
+
+        ``ordered=True`` 只用于回填的历史消息：按 timestamp 插入到窗口对应
+        位置。实时消息保持追加（``ordered=False``），时钟回拨 / 多实例时间
+        偏差时按时间插入会把新消息放到头部、被 LTRIM 直接丢掉。
 
         内容指纹跨实例稳定：同一历史消息经回填 / 重放重复提交时由
         ``_ADD_MESSAGES_LUA`` 按 seen 集合跳过。
@@ -794,6 +818,7 @@ class RedisShortTermMemory:
         payload = json.dumps(message, ensure_ascii=False)
         op_id = uuid.uuid4().hex
         content_id = message_content_id(message)
+        mode = "ordered" if ordered else "append"
         # 影子缓存复用同一个消息对象：时间戳与 Redis 中的 JSON 完全一致，
         # 故障期截断时才能按完整消息项精确删除 Redis 里的对应项。
         # 同一内容指纹（回填 / 重放重复提交）只镜像一次：实时消息时间戳
@@ -816,6 +841,7 @@ class RedisShortTermMemory:
                 str(self.ttl_sec),
                 op_id,
                 content_id,
+                mode,
                 payload,
             )
 
@@ -823,7 +849,7 @@ class RedisShortTermMemory:
             op,
             lambda: None,
             lambda journal: self._append_op(
-                journal, "add", (payload, op_id, content_id)
+                journal, "add", (payload, op_id, content_id, mode)
             ),
         )
         if via_redis:
@@ -951,7 +977,7 @@ class RedisShortTermMemory:
         if kind == "add":
             # 连续新增合并为一次脚本调用（最多 100 条）：脚本按 op_id 与
             # 内容指纹幂等，逐条往返会把恢复后的首次调用拖成几十次网络往返
-            batch: list[tuple[str, str, str]] = []
+            batch: list[tuple[str, ...]] = []
             consumed = 0
             for op_kind, op_payload in ops:
                 if op_kind != "add" or len(batch) >= 100:
@@ -959,8 +985,12 @@ class RedisShortTermMemory:
                 consumed += 1
                 batch.append(op_payload)
             arguments: list[str] = [str(window), str(self.ttl_sec)]
-            for op_payload, op_id, content_id in batch:
-                arguments.extend([op_id, content_id, op_payload])
+            for op_payload in batch:
+                stored_payload, op_id, content_id = op_payload[:3]
+                # 升级前排队的内存日志没有模式字段：按实时追加处理，
+                # 只影响顺序，不会丢消息
+                mode = op_payload[3] if len(op_payload) > 3 else "append"
+                arguments.extend([op_id, content_id, mode, stored_payload])
             self.client.eval(
                 _ADD_MESSAGES_LUA,
                 3,
@@ -973,7 +1003,7 @@ class RedisShortTermMemory:
             # 回收失败只是多留几条无用记录（集合带 TTL），不回调错误
             try:
                 self.client.srem(
-                    applied_key(self.key), *[op_id for _, op_id, _ in batch]
+                    applied_key(self.key), *[op[1] for op in batch]
                 )
             except Exception:  # noqa: BLE001 - 清理失败不影响重放结果
                 logger.debug("清理已重放 applied 记录失败：%s", self.key)
