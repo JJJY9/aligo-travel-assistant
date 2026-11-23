@@ -3,6 +3,7 @@
 统一管理两层记忆，提供简单的API
 """
 import asyncio
+import copy
 import logging
 import re
 import time
@@ -48,6 +49,10 @@ _RECENT_SUMMARY_MAX_CHARS = 200
 _RECENT_SUMMARY_MIN_MESSAGES = 4
 _RECENT_SUMMARY_WINDOW_TURNS = 10
 _RECENT_SUMMARY_FAILURE_COOLDOWN_SEC = 30.0
+# 偏好快照缓存（v2.0）：只对非快照后端（PostgreSQL）启用——JSON 后端
+# 读取本身在内存里，缓存没有收益；跨进程修改由 TTL 兜底，本进程写入
+# 通过 invalidate_preference_cache 立即失效
+_PREFERENCE_CACHE_TTL_SEC = 5.0
 
 
 def _is_future_timestamp(message: dict) -> bool:
@@ -127,6 +132,8 @@ class MemoryManager:
         # 当前会话滚动摘要（v2.0）：按最近窗口内容指纹缓存
         self._recent_summary_cache: tuple[tuple, str] | None = None
         self._recent_summary_failure_until = 0.0
+        # 偏好快照缓存（v2.0）：(monotonic, preferences)，仅 PG 后端启用
+        self._preference_cache: tuple[float, dict[str, Any]] | None = None
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -150,6 +157,32 @@ class MemoryManager:
                 self.user_id,
             )
         self.long_term = new_store
+        self.invalidate_preference_cache()
+
+    def _preference_cache_enabled(self) -> bool:
+        """只有非快照后端（PostgreSQL）值得缓存偏好快照。"""
+        return bool(STORAGE_CONFIG.get("postgres_dsn")) and (
+            getattr(self.long_term, "snapshot_based", True) is False
+        )
+
+    def get_preferences(self) -> dict[str, Any]:
+        """读取用户偏好（PG 后端带 5 秒快照缓存，写入时显式失效）。"""
+        now = time.monotonic()
+        if self._preference_cache_enabled():
+            cached = self._preference_cache
+            if (
+                cached is not None
+                and (now - cached[0]) <= _PREFERENCE_CACHE_TTL_SEC
+            ):
+                return copy.deepcopy(cached[1])
+        preferences = self.long_term.get_preference()
+        if self._preference_cache_enabled():
+            self._preference_cache = (now, copy.deepcopy(preferences))
+        return preferences
+
+    def invalidate_preference_cache(self) -> None:
+        """偏好写入 / 后端重建后立即失效快照缓存。"""
+        self._preference_cache = None
 
     # ========== 短期记忆操作 ==========
 
@@ -399,7 +432,7 @@ class MemoryManager:
                 "statistics": self.short_term.get_statistics()
             },
             "long_term": {
-                "preferences": self.long_term.get_preference(),
+                "preferences": self.get_preferences(),
                 "chat_history": self.long_term.get_chat_history(10),
                 "trip_history": self.long_term.get_trip_history(5),
                 "frequent_destinations": self.long_term.get_frequent_destinations(3),
@@ -415,7 +448,7 @@ class MemoryManager:
         else:
             # 未知后端（测试替身等）：逐项读取，保持旧行为
             data = {
-                "preferences": self.long_term.get_preference(),
+                "preferences": self.get_preferences(),
                 "trip_history": self.long_term.get_trip_history(limit=None),
                 "chat_history": self.long_term.get_chat_history(),
                 "session_titles": self.long_term.get_session_titles(),
@@ -470,7 +503,7 @@ class MemoryManager:
             lines.append("")
 
         # 用户偏好
-        prefs = self.long_term.get_preference()
+        prefs = self.get_preferences()
         has_prefs = any(has_preference_value(v) for v in prefs.values())
         if has_prefs:
             lines.append("【用户偏好】")
