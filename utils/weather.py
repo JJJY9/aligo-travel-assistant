@@ -157,6 +157,10 @@ class WeatherError(Exception):
     """天气查询失败（城市不存在或接口不可用）。"""
 
 
+class _WeatherBusyError(WeatherError):
+    """本地排队繁忙（上游并发闸门 / 单飞等待轮次耗尽），不是上游故障。"""
+
+
 def clear_weather_cache() -> None:
     """清空天气成功 / 失败 / 降级缓存（测试或运维需要时使用）。"""
     with _cache_lock:
@@ -431,10 +435,20 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
             return degraded
     else:
         message = "天气服务繁忙，请稍后再试"
-        _store_failure(key, message)
-        raise WeatherError(message)
+        # 本地单飞等待耗尽不是上游故障：不能写 60 秒失败缓存把城市钉住
+        raise _WeatherBusyError(message)
     try:
         return _fetch_weather_uncached(name, key, timeout)
+    except _WeatherBusyError:
+        # 上游并发闸门繁忙（本地排队）同样不是上游故障：不写失败缓存，
+        # 否则名额释放后该城市仍被钉住 60 秒；有旧数据则沿用
+        entry = _stale_entry(key)
+        if entry is not None:
+            _stored_at, stale = entry
+            logger.warning("天气服务繁忙，沿用最近一次成功数据")
+            _store_degraded(key, stale)
+            return stale
+        raise
     except WeatherError as exc:
         message = str(exc)
         # 上游抖动 / 格式异常时沿用最近一次成功数据；城市不存在没有旧数据可用
@@ -532,7 +546,7 @@ def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, An
     # 上游并发闸门：Open-Meteo 免费 API 同一客户端超过 5 个并发请求即 429；
     # 等待超过单个请求超时就按繁忙报错，由上层走 stale / 503
     if not _upstream_slots.acquire(timeout=timeout):
-        raise WeatherError("天气服务繁忙，请稍后再试")
+        raise _WeatherBusyError("天气服务繁忙，请稍后再试")
     try:
         try:
             location = _geocode(name, timeout)
