@@ -23,12 +23,32 @@ _BUDGET_RE = re.compile(
     # 冒号后必须紧跟金额（「费用：交通500」是分项不是总预算）；
     # 无冒号时允许「预算大约是」等短填充，但不能跨越顿号 / 逗号 / 句号
     r"(?:[：:]\s*|[^\d。！？；;，,、：:\n]{0,8})"
-    r"(\d+(?:\.\d+)?)\s*(万元|万|元|块)?"
+    # 千分位组（10,000 / 1，500 / 10 000）整体匹配：只认「逗号后恰好三位」，
+    # 避免把「预算5000，3000」这类并列数字连成一个巨款
+    r"(\d{1,3}(?:[,， ]\d{3})+|\d+)(?:\.\d+)?\s*(万元|万|元|块)?"
 )
 _MUST_SEE_RE = re.compile(
     r"(?:必去|一定要去|必须去|想去|打卡|别错过)[：:\s]*"
-    r"([一-鿿A-Za-z0-9·]{2,24})"
+    # 捕获串允许顿号 / 逗号分隔符（交给 _split_must_see 拆分），但惰性
+    # 截到下一个触发词 / 句末为止——不能让一个触发词的捕获吞掉下一句
+    # 触发词（否则否定语境会连带把后面的正常必去项一起丢掉）。没有边界
+    # 的超长列表退回 24 字贪心截断，避免吞掉整段叙述
+    r"("
+    r"[一-鿿A-Za-z0-9·、，,；;/ ]{2,24}?"
+    r"(?=(?:必去|一定要去|必须去|想去|打卡|别错过)|[。！？；;\n]|$)"
+    r"|"
+    r"[一-鿿A-Za-z0-9·、，,；;/ ]{2,24}"
+    r")"
 )
+# 否定语境（不想去 / 不太想去 / 不一定要去 / 不必去 / 无需去）：触发词
+# 前 6 个字里出现否定词、且否定词与触发词之间最多隔 2 个字时不算必去项
+_MUST_SEE_NEGATION_RE = re.compile(r"(?:不|别|无需|不用|不要)[^，。！？；\n]{0,2}$")
+# 费用字段的数值：千分位组（逗号后恰好三位）整体匹配，支持万单位
+_NUMBER_RE = re.compile(
+    r"(-?(?:\d{1,3}(?:[,， ]\d{3})+|\d+)(?:\.\d+)?)\s*(万元|万|元|块)?"
+)
+# 城市名的行政后缀：目的地「杭州市」与必去项「杭州市西湖」按「杭州」比较
+_ADMIN_SUFFIXES = ("特别行政区", "自治区", "自治州", "地区", "市", "省", "区", "县")
 # 「3月4日」里的「4日」是日期不是行程天数：匹配后再看数字前是否紧邻「月」
 _DURATION_RE = re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:天|日)")
 # 必去项里混入的天数 / 预算片段：截断后再清洗动词后缀
@@ -91,6 +111,24 @@ def _cn_number(value: str) -> int | None:
     return None
 
 
+def _strip_admin_suffix(value: str) -> str:
+    """去掉城市名末尾的行政后缀（杭州市 → 杭州），太短的保持原样。"""
+    text = str(value or "").strip()
+    for suffix in _ADMIN_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix) + 1:
+            return text[: -len(suffix)]
+    return text
+
+
+def _strip_leading_admin_suffix(value: str) -> str:
+    """去掉「市 / 省」等被前缀剥离后残留在开头的一个行政后缀字。"""
+    text = str(value or "").strip()
+    for suffix in ("市", "省", "区", "县"):
+        if text.startswith(suffix) and len(text) > len(suffix) + 1:
+            return text[len(suffix) :].strip()
+    return text
+
+
 def _split_connected(part: str) -> list[str]:
     """递归按连接词拆分：取第一个两侧都 ≥2 字的连接点。"""
     connectors = [
@@ -115,7 +153,11 @@ def _split_must_see(value: str) -> list[str]:
     """
     parts = [
         part.strip()
-        for part in re.split(r"[、，,；;/]+", str(value or ""))
+        for part in re.split(
+            r"[、，,；;/\s]+",
+            # 千分位逗号不是枚举分隔符（10,000 不能被拆成「10」「000元」）
+            re.sub(r"(?<=\d)[,，](?=\d{3}(?:\D|$))", "", str(value or "")),
+        )
         if part.strip()
     ]
     names: list[str] = []
@@ -142,6 +184,14 @@ def _clean_must_see(value: str) -> list[str]:
         "好玩",
         "有哪些",
         "有什么",
+        "哪些",
+        "什么",
+        "哪个",
+        "哪里",
+        "地点",
+        "地方",
+        "景点",
+        "景区",
         "转转",
         "游",
         "的",
@@ -151,6 +201,12 @@ def _clean_must_see(value: str) -> list[str]:
     names: list[str] = []
     for part in parts:
         name = part.strip().strip("。.!！?？ ")
+        # 触发词后面的前置助词 / 疑问词不是地名的一部分（「西湖的哪些景点」）
+        name = re.sub(
+            r"^(?:的|了|哪些|什么|哪个|哪儿|哪里|地点|地方|景点|还有|大概|大约)+",
+            "",
+            name,
+        ).strip()
         # 「西湖玩3天」「故宫预算5000」：先截掉混入的天数 / 预算片段
         name = _MUST_SEE_DURATION_RE.sub("", name)
         name = _MUST_SEE_BUDGET_RE.sub("", name)
@@ -162,6 +218,9 @@ def _clean_must_see(value: str) -> list[str]:
                     name = name[: -len(suffix)].strip()
                     changed = True
         if name.isdigit() or name in _MUST_SEE_GENERIC:
+            continue
+        # 拆分千分位后残留的纯金额片段（「000元」）不是地名
+        if re.fullmatch(r"[\d,，.\s]*元?", name):
             continue
         if 2 <= len(name) <= 24 and name not in names:
             names.append(name)
@@ -189,10 +248,17 @@ def _date_range_days(requirements: dict[str, Any]) -> int | None:
 
 
 def _text_duration(text: str) -> int | None:
-    """「N 天 / 日」天数；跳过「3月4日」这类日期里的「4日」。"""
+    """「N 天 / 日」天数；跳过「3月4日」「第一天」「5日到7日」这类日期。
+
+    序数（第 N 天）与日期区间（N 日到 M 日）不是行程总天数：把「第一天」
+    读成 1 天会让天数校验把正确行程判失败。
+    """
     for match in _DURATION_RE.finditer(text):
         prefix = text[: match.start()].rstrip()
-        if prefix.endswith("月"):
+        if prefix.endswith(("月", "第", "到", "至", "~", "—", "-")):
+            continue
+        suffix = text[match.end() :].lstrip()
+        if suffix[:1] in ("到", "至", "~", "—", "-"):
             continue
         number = _cn_number(match.group(1))
         if number and 0 < number <= 365:
@@ -223,7 +289,11 @@ def extract_requirements(
     text = str(user_query or "")
     budget_match = _BUDGET_RE.search(text)
     if budget_match:
-        amount = float(budget_match.group(1))
+        raw_amount = re.sub(r"[,，\s]", "", budget_match.group(1))
+        try:
+            amount = float(raw_amount)
+        except ValueError:
+            amount = 0.0
         if budget_match.group(2) in ("万元", "万"):
             amount *= 10000
         if math.isfinite(amount) and amount > 0:
@@ -231,19 +301,36 @@ def extract_requirements(
 
     must_see: list[str] = []
     for match in _MUST_SEE_RE.finditer(text):
+        # 「不想去 / 不太想去 / 不一定要去 / 不必去」里的地点不是必去项
+        negated = text[max(0, match.start() - 6) : match.start()]
+        if _MUST_SEE_NEGATION_RE.search(negated):
+            continue
         for name in _clean_must_see(match.group(1)):
             if name not in must_see:
                 must_see.append(name)
     destination = str(event.get("destination") or "").strip()
     if must_see and destination:
+        dest_core = _strip_admin_suffix(destination)
+        forms = sorted(
+            {form for form in (destination, dest_core) if form},
+            key=len,
+            reverse=True,
+        )
         refined: list[str] = []
         for name in must_see:
-            # 「北京出差」这类只剩城市名的，是出行目的不是景点；
-            # 「杭州西湖游玩」剥掉城市前缀后保留真正的必去项「西湖」
-            if name == destination:
+            name_core = _strip_admin_suffix(name)
+            # 「北京出差」这类只剩城市名的，是出行目的不是景点
+            if name == destination or name_core == dest_core:
                 continue
-            if name.startswith(destination) and len(name) >= len(destination) + 2:
-                name = name[len(destination) :].strip()
+            # 「杭州市西湖」「杭州西湖」都剥掉城市前缀后保留「西湖」
+            stripped = name
+            for form in forms:
+                if stripped.startswith(form) and len(stripped) >= len(form) + 2:
+                    stripped = _strip_leading_admin_suffix(
+                        stripped[len(form) :].strip()
+                    )
+                    break
+            name = stripped
             if name and name not in _MUST_SEE_GENERIC and name not in refined:
                 refined.append(name)
         must_see = refined
@@ -274,11 +361,28 @@ def _daily_plans(itinerary: object) -> list[dict]:
 
 
 def _activities(plan: dict) -> list[dict]:
-    items = plan.get("activities")
-    if isinstance(items, list):
-        return [item for item in items if isinstance(item, dict)]
-    if isinstance(items, dict):
-        return [items]
+    """一天的活动列表：支持列表、「键→活动」字典与 schedule 等别名键。
+
+    LLM 输出偶尔把 activities 写成 ``{"09:00": {...}, "14:00": {...}}``，
+    或把安排放在 schedule 键下——只认 list / 单个 dict 会让时间冲突与
+    费用检查整体静默跳过。
+    """
+    for key in ("activities", "schedule", "安排", "计划"):
+        items = plan.get(key)
+        if isinstance(items, list):
+            activities = [item for item in items if isinstance(item, dict)]
+            if activities:
+                return activities
+        elif isinstance(items, dict):
+            if any(
+                field in items
+                for field in ("time", "title", "name", "activity", "cost", "price", "fee")
+            ):
+                return [items]
+            nested = [
+                value for value in items.values() if isinstance(value, dict)
+            ]
+            return nested or [items]
     return []
 
 
@@ -298,10 +402,18 @@ def _number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         number = float(value)
     elif isinstance(value, str):
-        match = re.search(r"-?\d+(?:\.\d+)?", value)
+        # 费用字段可能是「约1.5万元」「10,000元」：支持千分位与万单位，
+        # 否则「1.5万」会被读成 1.5、「10,000」只读到 10
+        match = _NUMBER_RE.search(value)
         if not match:
             return None
-        number = float(match.group(0))
+        raw = re.sub(r"[,，\s]", "", match.group(1))
+        try:
+            number = float(raw)
+        except ValueError:
+            return None
+        if match.group(2) in ("万元", "万"):
+            number *= 10000
     else:
         return None
     return number if math.isfinite(number) else None
