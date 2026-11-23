@@ -1986,12 +1986,23 @@ def preview_user_import(
                 needs_model = int(plan.get("would_import") or 0) > 0
             if needs_model:
                 _knowledge_ready_probe()
-            # 计数在探测之后回填：探测失败时真实导入一条未写，预览也
-            # 不应给出「将新增 N 条」的乐观计数
-            result["knowledge_imported"] = int(
-                plan.get("would_import") or 0
-            )
-            result["knowledge_skipped"] = int(plan.get("skipped") or 0)
+            # 全局导出上限：恢复前知识库已越限（合并复核按基线豁免放行）
+            # 或账号快照不可读时，真实导入会在写锁内被拒绝并记
+            # knowledge_error——预览必须同一结论，不能报「将新增 N 条」
+            export_limit_problem = plan.get("export_limit_problem")
+            if export_limit_problem:
+                from utils.log_redact import redact_paths
+
+                result["knowledge_error"] = (
+                    f"知识片段恢复失败：{redact_paths(export_limit_problem)}"
+                )
+            else:
+                # 计数在探测之后回填：探测失败时真实导入一条未写，预览也
+                # 不应给出「将新增 N 条」的乐观计数
+                result["knowledge_imported"] = int(
+                    plan.get("would_import") or 0
+                )
+                result["knowledge_skipped"] = int(plan.get("skipped") or 0)
         except FileNotFoundError:
             result["knowledge_error"] = (
                 "知识库未初始化（先运行初始化脚本再恢复知识片段）"

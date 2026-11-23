@@ -2670,6 +2670,10 @@ def run_knowledge_import_standalone(
             payload["skipped_groups"] = problems[:100]
         if dry_run:
             payload["would_import"] = would_import
+            # 越限原因不能丢：迁移脚本据预览结论放行后真实导入会退出 1
+            export_limit_problem = result.get("export_limit_problem")
+            if export_limit_problem:
+                payload["export_limit_problem"] = str(export_limit_problem)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     detail_parts = []
@@ -2687,6 +2691,13 @@ def run_knowledge_import_standalone(
             f"预览：将导入 {would_import} 条知识片段，"
             f"跳过 {skipped} 条{detail}（未写入）"
         )
+        export_limit_problem = str(result.get("export_limit_problem") or "")
+        if export_limit_problem:
+            # 预览已判定越限：真实导入会被拒绝，明确告警而不是只报条数
+            print(
+                f"警告：{export_limit_problem}（真实导入会被拒绝）",
+                file=sys.stderr,
+            )
         return 0
     print(f"已导入 {imported} 条知识片段，跳过 {skipped} 条{detail}")
     return 0

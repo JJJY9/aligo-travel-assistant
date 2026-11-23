@@ -582,6 +582,14 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     # 模型加载可能耗时数秒，放在锁外；锁只保护 id 生成 + 写入
     agent = _get_agent()
     with _write_lock():
+        # 锁内复核：锁外预检与真正写入之间可能有并发添加 / 批量导入写入，
+        # 仅按锁外统计快照放行会把全局知识库推过导出上限（导入路径在
+        # 同一把写锁内计数，锁内复核后全部写入方串行一致）
+        problem = _knowledge_row_limit_problem(
+            _collection_row_count(), len(documents)
+        )
+        if problem:
+            raise ValueError(problem)
         result = agent.add_documents(documents)
     if result.get("status") != "success":
         raise RuntimeError(str(result.get("message") or "添加知识片段失败"))
@@ -798,6 +806,15 @@ def update_document(
                 for member in _group_member_ids(client, group)
                 if member != int(doc_id)
             ]
+        # 全局导出上限：整组替换先增后删，按「现有 − 被替换的旧分片 +
+        # 本次新分片」在写入前预检——越限状态下不能经编辑长文继续推高
+        # 行数（add_document / 导入已在同类预检处拒绝）
+        current_rows = _collection_row_count()
+        problem = _knowledge_row_limit_problem(
+            max(0, current_rows - (1 + len(old_ids))), len(documents)
+        )
+        if problem:
+            raise ValueError(problem)
 
         def _delete_ids(
             ids: list[int], log_label: str

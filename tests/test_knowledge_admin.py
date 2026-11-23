@@ -590,6 +590,68 @@ def test_collection_row_count_reads_stats_and_tolerates_failure(monkeypatch):
     print("✓ 行数统计读取与失败容错")
 
 
+def test_add_document_rechecks_limit_inside_write_lock(monkeypatch):
+    """锁外预检放行后并发写入可能越限：锁内必须用新统计复核并拒绝。"""
+    from pathlib import Path
+
+    from utils import user_import
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(user_import, "_MAX_KNOWLEDGE", 50000)
+    # 锁外读到 49999（放行），锁内并发添加已使库到 50000（加 1 即越限）
+    counts = iter([49999, 50000])
+    monkeypatch.setattr(
+        knowledge_admin, "_collection_row_count", lambda: next(counts)
+    )
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    with pytest.raises(ValueError) as exc:
+        knowledge_admin.add_document("并发添加")
+    assert "超过导出上限" in str(exc.value)
+    assert agent.calls == [], "锁内复核拒绝后不得写入"
+    print("✓ add_document 锁内复核上限（并发窗口）")
+
+
+def test_update_document_enforces_export_row_limit(monkeypatch):
+    """整组编辑按「现有 − 被替换旧分片 + 新分片」预检全局上限。"""
+    from pathlib import Path
+
+    from utils import user_import
+
+    fake_client = _FakeMilvusClient(
+        [{"id": 1, "content": "旧内容", "metadata": '{"title": "x"}'}]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(user_import, "_MAX_KNOWLEDGE", 50000)
+    # 库内恰在上限：单条编辑成长文会拆出多个分片、净增行数越限
+    monkeypatch.setattr(knowledge_admin, "_collection_row_count", lambda: 50000)
+    agent = _FakeAgent({"status": "success", "ids": [2], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    with pytest.raises(ValueError) as exc:
+        knowledge_admin.update_document(1, "长内容" * 1000, {"title": "x"})
+    assert "超过导出上限" in str(exc.value)
+    assert agent.calls == [] and fake_client.deleted == [], (
+        "越限编辑必须在写入前拒绝"
+    )
+
+    # 上限内编辑正常执行（分片数与旧记录相同：替换不增行）
+    class _UpdateAgent:
+        def __init__(self):
+            self.calls = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.calls.append((doc_id, content, metadata))
+            return {"status": "success", "id": doc_id}
+
+    updater = _UpdateAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: updater)
+    result = knowledge_admin.update_document(1, "短内容", {"title": "x"})
+    assert result["status"] == "success" and result["id"] == 1, result
+    assert updater.calls == [(1, "短内容", {"title": "x"})]
+    print("✓ update_document 按替换净增预检全局上限")
+
+
 def test_import_duplicate_content_group_is_idempotent(monkeypatch):
     """组内两片同文且都已入库：整组跳过，不能因快照用集合而重复补写。"""
     from pathlib import Path
@@ -3593,6 +3655,8 @@ if __name__ == "__main__":
         test_import_dry_run_missing_collection_multipart_group,
         test_import_documents_enforces_export_row_limit,
         test_add_document_enforces_export_row_limit,
+        test_add_document_rechecks_limit_inside_write_lock,
+        test_update_document_enforces_export_row_limit,
         test_collection_row_count_reads_stats_and_tolerates_failure,
     ):
         mp = pytest.MonkeyPatch()

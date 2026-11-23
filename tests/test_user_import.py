@@ -591,6 +591,65 @@ def test_preview_does_not_write_and_matches_import():
     print("✓ 预览只读且计数与真实恢复一致")
 
 
+def test_preview_matches_import_on_global_knowledge_limit(monkeypatch):
+    """恢复前知识库已越限（合并复核按基线豁免）：预览与真实导入同结论。
+
+    真实导入的知识段会被全局上限拒绝并记 knowledge_error——预览不能报
+    「将新增 N 条」（--dry-run ok=true、真跑 ok=false 会让脚本误判），
+    用户数据两侧照常恢复。
+    """
+    from pathlib import Path
+
+    from utils import knowledge_admin
+    from utils.user_import import import_user_data, preview_user_import
+    from utils import user_import as module
+
+    class _FakeAgent:
+        def __init__(self):
+            self.calls = []
+
+        def add_documents(self, documents):
+            self.calls.append(documents)
+            return {"status": "success", "ids": [1], "total_count": 1}
+
+    agent = _FakeAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_existing_contents",
+        lambda: [f"旧-{i}" for i in range(50001)],
+    )
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    # 合并体积复核按「导入前基线已越限、知识轴豁免」放行（既有行为）
+    monkeypatch.setattr(
+        module, "merged_backup_limit_problem", lambda *args, **kwargs: None
+    )
+    # 模型探测不在本用例范围（越限在写入前拒绝，不依赖模型）
+    monkeypatch.setattr(module, "_knowledge_ready_probe", lambda: None)
+
+    sections = {
+        "preferences": {"home_location": "北京"},
+        "trips": [],
+        "messages": [],
+        "titles": {},
+        "pinned": [],
+        "archived": [],
+        "knowledge": [{"content": "全新知识", "metadata": {}}],
+    }
+    store = _real_store("u-preview-kb-limit")
+    preview = preview_user_import(store, sections)
+    assert "超过导出上限" in preview.get("knowledge_error", ""), preview
+    assert not preview.get("knowledge_imported"), preview
+
+    counts = import_user_data(store, sections)
+    assert "超过导出上限" in counts.get("knowledge_error", ""), counts
+    assert not counts.get("knowledge_imported"), counts
+    assert counts["preferences"] == preview["preferences"] == 1
+    assert agent.calls == [], "越限知识段不得写入"
+    print("✓ 恢复预览与真实导入在知识库越限时同结论")
+
+
 def test_exporter_json_is_importable():
     """user-export 实际写出的 JSON 必须能被 user-import 解析（防 schema 漂移）。"""
     from utils.exporter import export_files
