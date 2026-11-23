@@ -241,6 +241,29 @@ def test_numbered_list_block_is_body_not_title():
     print("✓ 编号列表块与逗号清单按正文处理")
 
 
+def test_table_rows_are_body_not_title():
+    """表格 / 短清单行（金额、分栏）不能被当纯标题块并入下一章节。"""
+    from utils.text_chunker import _is_title_block, split_text
+
+    assert not _is_title_block("北京 500元\n上海 600元")
+    assert not _is_title_block("| 城市 | 价格 |\n| 北京 | 500元 |")
+    assert not _is_title_block("北京    500\n上海    600")
+    text = (
+        "一、住宿标准\n"
+        "北京 500元\n"
+        "上海 600元\n"
+        "\n"
+        "二、交通标准\n"
+        "市内交通 100元\n"
+    )
+    chunks = split_text(text)
+    accommodation = [chunk for chunk in chunks if "住宿标准" in chunk]
+    assert accommodation, chunks
+    assert "北京 500元" in accommodation[0], chunks
+    assert "二、交通标准" not in accommodation[0], chunks
+    print("✓ 表格 / 短清单行按正文切分")
+
+
 def test_punctuation_only_chunks_dropped():
     """纯标点分片（定长硬切产物）不进索引。"""
     from utils.text_chunker import split_text
@@ -269,6 +292,7 @@ if __name__ == "__main__":
     test_title_only_text_becomes_single_chunk()
     test_numbered_colon_headings_merged_with_body()
     test_numbered_list_block_is_body_not_title()
+    test_table_rows_are_body_not_title()
     test_punctuation_only_chunks_dropped()
     test_whitespace_only_chunks_dropped()
     test_merge_edge_branches()

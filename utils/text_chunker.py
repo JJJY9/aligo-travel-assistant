@@ -65,6 +65,23 @@ def _is_title_like(chunk: str, min_chars: int = 30) -> bool:
 # 多行标题块里单行的长度上限：目录式标题很短；章节正文里的短清单行
 # （同样没有句读）通常更长或以项目符号开头
 _TITLE_LINE_MAX = 16
+# 表格 / 两列清单的短行：金额、百分比、制表符、Markdown 表格线或
+# 多空格分栏。这些是正文——即使每行都很短、没有句读，也不能当标题块，
+# 否则整节内容会被挂起并并入下一章节，产出混主题向量。
+_TABLE_CELL_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:万元|万|元|块|%|元/晚|元/天)"
+)
+
+
+def _looks_like_table_line(line: str) -> bool:
+    """短行是否更像表格 / 分栏清单而不是标题。"""
+    if line.startswith("|") or line.endswith("|"):
+        return True
+    if "\t" in line:
+        return True
+    if re.search(r"\S\s{2,}\S", line):
+        return True
+    return bool(_TABLE_CELL_RE.search(line))
 
 
 def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
@@ -77,6 +94,8 @@ def _is_title_block(chunk: str, min_chars: int = 30) -> bool:
     """
     lines = [line.strip() for line in chunk.splitlines() if line.strip()]
     if not lines:
+        return False
+    if any(_looks_like_table_line(line) for line in lines):
         return False
     if len(lines) == 1:
         return _is_title_like(lines[0], min_chars)
