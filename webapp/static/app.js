@@ -1175,6 +1175,8 @@ async function retryFailed(node, text) {
   // 停止 / 断网后服务端可能已把这一轮落库（对账被重试点击抢先跳过）：
   // 重发前按 client_turn_id 精确确认，已保存则刷新历史而不是再发一条
   const turnId = (node && node.dataset && node.dataset.turnId) || "";
+  const idempotencyKey =
+    (node && node.dataset && node.dataset.idempotencyKey) || "";
   if (turnId && state.sessionId) {
     setBusy(true);
     let persisted = false;
@@ -1199,9 +1201,14 @@ async function retryFailed(node, text) {
   }
   trimRegenButtons();
   // 失败可能发生在提问写入历史之前：只重发，不删服务端上一轮，
-  // 避免误删已保存的问答（最多产生一条重复提问，可接受）
+  // 避免误删已保存的问答。重发复用原 turn id 与幂等键：同一逻辑回合
+  // 若其实已被服务端执行 / 落库，回放响应而不是再执行一遍
   node.remove();
-  await sendMessage(text, { echo: false });
+  await sendMessage(text, {
+    echo: false,
+    turnId,
+    idempotencyKey,
+  });
 }
 
 async function turnPersistedTurn(sessionId, turnId) {
@@ -1222,6 +1229,20 @@ async function turnPersistedTurn(sessionId, turnId) {
   }
 }
 
+function randomId() {
+  // 浏览器提供 randomUUID 时用它；旧环境退回时间 + 随机的可读 id
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function confirmDiscardPendingEdit(action) {
+  if (!document.querySelector(".user-edit-input")) return true;
+  return window.confirm(
+    `正在编辑的修改尚未保存，${action}将丢弃修改。继续？`,
+  );
+}
+
 async function regenerate(node, text) {
   if (state.busy) return;
   if (!state.ready) {
@@ -1234,6 +1255,9 @@ async function regenerate(node, text) {
     toast("会话正在加载，请稍候");
     return;
   }
+  // 未保存的编辑确认必须在删除服务端上一轮之前：确认可取消，之后的
+  // deleteLastTurn + node.remove 是破坏性的
+  if (!confirmDiscardPendingEdit("重新生成")) return;
   trimRegenButtons();
   if ([...text].length > CHAT_MESSAGE_MAX) {
     toast(`提问超过 ${CHAT_MESSAGE_MAX} 字，无法重新发送；请先精简后再试`);
@@ -1261,7 +1285,7 @@ async function regenerate(node, text) {
     }
   }
   node.remove();
-  await sendMessage(text, { echo: false });
+  await sendMessage(text, { echo: false, skipEditConfirm: true });
 }
 
 function trimRegenButtons() {
@@ -1363,6 +1387,16 @@ async function downloadFromApi(url, fallbackName) {
     );
     if (skippedTrips > 0) {
       toast(`有 ${skippedTrips} 条行程缺少出发日期，未包含在日历中`);
+    }
+    // 含知识库的备份在恢复时可能跳过无法恢复的旧版 / 残缺片段：
+    // 服务端用响应头给出计数，不能把「不含完整知识」的备份当完整成功
+    const skippedKnowledge = Number(
+      response.headers.get("x-knowledge-skipped") || 0,
+    );
+    if (skippedKnowledge > 0) {
+      toast(
+        `备份中有 ${skippedKnowledge} 条知识片段无法恢复，恢复时会跳过`,
+      );
     }
     const blob = await response.blob();
     const disposition = response.headers.get("content-disposition") || "";
@@ -3049,10 +3083,7 @@ async function sendMessage(text, options = {}) {
     }
   }
   const draft = els.input.value;
-  if (
-    document.querySelector(".user-edit-input") &&
-    !window.confirm("正在编辑的修改尚未保存，发送新消息将丢弃修改。继续？")
-  ) {
+  if (!options.skipEditConfirm && !confirmDiscardPendingEdit("发送新消息")) {
     return;
   }
 
@@ -3064,15 +3095,19 @@ async function sendMessage(text, options = {}) {
   trimRegenButtons();
   document.querySelectorAll(".follow-ups").forEach((row) => row.remove());
 
+  let clearedRetiredThread = false;
   mutate(() => {
     if (state.retiredThreadVisible) {
       // 上一轮回答因会话被删除而未落库：可见线程不属于接下来的新会话，
       // 从干净线程开始，避免两个服务端会话的历史混在一起
       state.retiredThreadVisible = false;
       els.messages.innerHTML = "";
+      clearedRetiredThread = true;
     }
     hideWelcome();
-    if (options.echo !== false) {
+    // 线程被清空时 DOM 里已没有可复用的用户气泡（重新生成走 echo:false），
+    // 必须补渲染，否则新会话只剩一条没有对应提问的回答
+    if (options.echo !== false || clearedRetiredThread) {
       els.messages.appendChild(renderUserNode(message));
     }
   }, true);
@@ -3089,13 +3124,15 @@ async function sendMessage(text, options = {}) {
   mutate(() => els.messages.appendChild(assistant.root), true);
 
   // 本轮唯一标识：服务端写进助手消息的 _meta，停止后对账用它精确判断
-  // 「这一轮是否已落库」（比较文本会把重复提问误判成已保存）
-  const turnId =
-    typeof crypto !== "undefined" && crypto.randomUUID
-      ? crypto.randomUUID()
-      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  // 「这一轮是否已落库」（比较文本会把重复提问误判成已保存）。重试按钮
+  // 复用原 id，让同一逻辑回合的重复提交命中服务端幂等回放
+  const turnId = options.turnId || randomId();
+  // 幂等键：网络层重试 / 断连重连时服务端按同一键回放已完成的回合，
+  // 不重复执行、不重复落库（重试按钮复用原键；重新生成是新回合、用新键）
+  const idempotencyKey = options.idempotencyKey || randomId();
   // 重试按钮据此在重发前确认「这一轮是否已被服务端落库」，避免重复问答
   assistant.root.dataset.turnId = turnId;
+  assistant.root.dataset.idempotencyKey = idempotencyKey;
   let terminal = null;
   try {
     const response = await fetch("/api/chat/stream", {
@@ -3106,6 +3143,7 @@ async function sendMessage(text, options = {}) {
         user_id: state.userId,
         session_id: state.sessionId,
         client_turn_id: turnId,
+        idempotency_key: idempotencyKey,
       }),
       signal: state.controller.signal,
     });
@@ -3270,7 +3308,9 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
         last.role === "assistant",
     );
   };
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+  // 服务端断连后最多等 10 秒 drain（超时后落库线程仍可能继续）：判定期限
+  // 必须覆盖它，前 4 次 700ms 快速命中，之后放慢到 1.5s 直到 ~12 秒
+  for (let attempt = 0; attempt < 10; attempt += 1) {
     if (!canSync()) return;
     let data = null;
     try {
@@ -3291,7 +3331,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
         });
         return;
       }
-      if (attempt === 3) {
+      if (attempt === 9) {
         const tokenBefore = sessionLoadToken;
         await openSession(sessionId, {
           silent: true,
@@ -3306,9 +3346,9 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
         // openSession 自增了 sessionLoadToken：后续检查认新 token
         expectedToken = sessionLoadToken;
         // openSession 的重新拉取可能刚好包含迟到的落库（服务端 drain 上限
-        // 10 秒，客户端判定期限 ~3 秒）：以最新数据为准再确认一次，避免界面
-        // 已显示保存的问答却把提问塞回输入框并提示「没有保存」，用户重发
-        // 后历史出现两条相同问答
+        // 10 秒，客户端判定期限已覆盖）：以最新数据为准再确认一次，避免界面
+        // 已显示保存的问答却把提问塞回输入框并提示未保存，用户重发后历史
+        // 出现两条相同问答
         try {
           const latest = await getJSON(
             `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
@@ -3329,18 +3369,18 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
             return;
           }
         } catch (_) {
-          /* 确认请求失败：按未保存处理 */
+          /* 确认请求失败：按未确认处理 */
         }
         if (!canSync()) return;
         if (!els.input.value.trim()) {
           els.input.value = message;
           resizeInput();
         }
-        toast(`${reason}，这条提问没有保存`);
+        toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
         return;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    await new Promise((resolve) => setTimeout(resolve, attempt < 4 ? 700 : 1500));
   }
   // 连续请求失败（服务不可达）：保留本地「已停止」气泡，至少把原文还回输入框。
   // 但期间用户可能已切换会话 / 用户：不能再把旧提问写进新的输入框
@@ -3349,6 +3389,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     els.input.value = message;
     resizeInput();
   }
+  toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
 }
 
 async function readEventStream(body, onEvent) {

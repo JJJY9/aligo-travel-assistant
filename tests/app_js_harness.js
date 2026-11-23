@@ -1089,19 +1089,23 @@ async function scenarioReconcile(source) {
     };
     resizeInput = () => {};
   `);
+  // 判定期限已拉长到 ~12 秒（覆盖服务端 10 秒 drain）：VM 内的定时器
+  // 立即触发，测试不真等；异常在回调里吞掉，避免打乱场景
+  run("setTimeout = (cb) => { try { cb(); } catch (_) {} return 0; };");
 
   const runCase = async (finalMessages) => {
     run(
       '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 0;'
     );
     const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
-    // attempt 0..2 的轮询，以及 attempt 3 的确认轮询：都先给旧数据
-    for (let i = 0; i < 4; i += 1) {
+    // 判定期限覆盖服务端 10 秒 drain：前 9 次轮询 + 第 10 次（进入最终确认
+    // 分支前的那次）都先给旧数据；VM 内 setTimeout 立即触发，测试不真等
+    for (let i = 0; i < 10; i += 1) {
       const request = await waitRequest(env);
       request.resolve({ messages: oldMessages });
       await tick();
     }
-    // attempt 3：openSession 后追加的最终确认请求
+    // 最终确认：openSession 后追加的确认请求
     const confirm = await waitRequest(env);
     confirm.resolve({ messages: finalMessages });
     await promise;
@@ -1122,7 +1126,7 @@ async function scenarioReconcile(source) {
     '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 1;'
   );
   const interleavedPromise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 10; i += 1) {
     const request = await waitRequest(env);
     request.resolve({ messages: oldMessages });
     await tick();
@@ -2137,6 +2141,7 @@ async function scenarioDeletedThreadSend(source) {
     trimRegenButtons = () => {};
     refreshEditButtons = () => {};
     globalThis.__fetchCalls = 0;
+    globalThis.__bodies = [];
     const line = "data: " + JSON.stringify({
       type: "done",
       session_id: "s-new",
@@ -2145,8 +2150,9 @@ async function scenarioDeletedThreadSend(source) {
       persisted: true,
     }) + String.fromCharCode(10) + String.fromCharCode(10);
     const bytes = new TextEncoder().encode(line);
-    fetch = async (url) => {
+    fetch = async (url, options) => {
       __fetchCalls += 1;
+      if (options && options.body) __bodies.push(JSON.parse(options.body));
       let sent = false;
       return {
         ok: true,
@@ -2178,7 +2184,7 @@ async function scenarioDeletedThreadSend(source) {
       roles: messages.map((n) => n.role),
     };
   })()`);
-  return { veto, afterSend };
+  return { veto, afterSend, bodies: run("globalThis.__bodies") };
 }
 
 async function scenarioRetiredThreadOpenSession(source) {
@@ -2218,6 +2224,116 @@ async function scenarioRetiredThreadOpenSession(source) {
     sessionId: state.sessionId,
   })`);
   return { afterOpen };
+}
+
+async function scenarioRetiredThreadRegenerate(source) {
+  // 会话被删除后的可见线程（retired）+「重新生成」：新会话必须同时渲染
+  // 用户提问（echo:false 也不能只剩一条没有提问的回答）
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    document.querySelector = () => null;
+    window.confirm = () => true;
+    state.userId = "u1";
+    state.sessionId = null;
+    state.retiredThreadVisible = true;
+    state.ready = true;
+    state.busy = false;
+    state.sessionLoading = false;
+    state.partialHistory = false;
+    els.input.value = "";
+    globalThis.__sentinel = { __sentinel: true };
+    els.messages = {
+      children: [__sentinel],
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node, ref) {
+        const index = ref ? this.children.indexOf(ref) : -1;
+        if (index >= 0) this.children.splice(index, 0, node);
+        else this.children.push(node);
+        return node;
+      },
+      querySelectorAll() { return []; },
+      querySelector() { return null; },
+    };
+    renderUserNode = (text) => ({ __msg: true, role: "user", text });
+    createAssistantMessage = () => ({
+      root: { __msg: true, role: "assistant", dataset: {}, classList: { add() {}, remove() {}, contains() { return false; } } },
+      trace: { start() {}, finish() {}, fail() {} },
+      setReply() {},
+      finish() {},
+      fail() {},
+    });
+    hideWelcome = () => {};
+    trimRegenButtons = () => {};
+    refreshEditButtons = () => {};
+    refreshStatus = async () => {};
+    loadSessions = async () => {};
+    cancelPendingEdits = () => {};
+    resizeInput = () => {};
+    setBusy = () => {};
+    applyTurnPersistence = () => {};
+    const line = "data: " + JSON.stringify({
+      type: "done", session_id: "s-new", reply: "新回答", elapsed: 0.1, persisted: true,
+    }) + String.fromCharCode(10) + String.fromCharCode(10);
+    const bytes = new TextEncoder().encode(line);
+    fetch = async () => {
+      let sent = false;
+      return {
+        ok: true,
+        status: 200,
+        body: { getReader: () => ({ read: async () => (sent ? { done: true } : ((sent = true), { done: false, value: bytes })) }) },
+        json: async () => ({}),
+      };
+    };
+  `);
+  run(
+    'globalThis.__node = document.createElement("div"); __node.dataset = {}; __node.remove = () => { globalThis.__removed = true; };'
+  );
+  await run('regenerate(__node, "旧提问")');
+  return run(`(() => {
+    const messages = els.messages.children.filter((n) => n.__msg === true);
+    return {
+      removed: Boolean(globalThis.__removed),
+      sentinelGone: !els.messages.children.includes(globalThis.__sentinel),
+      roles: messages.map((n) => n.role),
+    };
+  })()`);
+}
+
+async function scenarioKnowledgeSkippedToast(source) {
+  // /api/export?with_knowledge=1 的 X-Knowledge-Skipped 必须提示（不能静默）
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    fetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          const key = String(name).toLowerCase();
+          if (key === "x-knowledge-skipped") return "3";
+          if (key === "x-aligo-export-skipped") return "0";
+          if (key === "content-disposition") return 'attachment; filename="aligo_u.json"';
+          return "";
+        },
+      },
+      blob: async () => ({ __blob: true }),
+    });
+    URL.createObjectURL = () => "blob:x";
+    URL.revokeObjectURL = () => {};
+    document.body.appendChild = () => {};
+  `);
+  const ok = await run(
+    'downloadFromApi("/api/export?with_knowledge=1", "fallback.json")'
+  );
+  return { ok, toasts: run("__toasts.slice()") };
 }
 
 function scenarioRenderCap(source) {
@@ -2470,6 +2586,10 @@ async function main() {
     payload = await scenarioDraftSendGuard(source);
   } else if (scenario === "editorsRound2") {
     payload = await scenarioEditorsRound2(source);
+  } else if (scenario === "retiredThreadRegenerate") {
+    payload = await scenarioRetiredThreadRegenerate(source);
+  } else if (scenario === "knowledgeSkippedToast") {
+    payload = await scenarioKnowledgeSkippedToast(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
