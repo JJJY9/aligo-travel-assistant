@@ -19,7 +19,11 @@ from typing import Any, Iterable
 from utils.entity_normalize import normalize_event_data
 
 _BUDGET_RE = re.compile(
-    r"(?:预算|总预算|花费|费用)[^\d。！？；;，,\n]{0,8}(\d+(?:\.\d+)?)\s*(万元|万|元|块)?"
+    r"(?:预算|总预算|花费|费用)"
+    # 冒号后必须紧跟金额（「费用：交通500」是分项不是总预算）；
+    # 无冒号时允许「预算大约是」等短填充，但不能跨越顿号 / 逗号 / 句号
+    r"(?:[：:]\s*|[^\d。！？；;，,、：:\n]{0,8})"
+    r"(\d+(?:\.\d+)?)\s*(万元|万|元|块)?"
 )
 _MUST_SEE_RE = re.compile(
     r"(?:必去|一定要去|必须去|想去|打卡|别错过)[：:\s]*"
@@ -30,6 +34,24 @@ _DURATION_RE = re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:天|
 # 必去项里混入的天数 / 预算片段：截断后再清洗动词后缀
 _MUST_SEE_DURATION_RE = re.compile(r"[0-9一二两三四五六七八九十]+\s*[天日].*$")
 _MUST_SEE_BUDGET_RE = re.compile(r"(?:预算|花费|费用|人均|总价|左右|以内).*$")
+# 「和 / 与 / 及」既可能是并列连接词，也可能是地名的一部分（颐和园、
+# 和平饭店）：只在两侧都像完整名称时才拆
+_MUST_SEE_CONNECTOR_RE = re.compile(r"[和与及]")
+_MUST_SEE_GENERIC = frozenset(
+    {
+        "景点",
+        "景区",
+        "地方",
+        "城市",
+        "路线",
+        "行程",
+        "酒店",
+        "美食",
+        "旅游",
+        "旅行",
+        "好玩",
+    }
+)
 _TIME_RANGE_RE = re.compile(
     r"(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:-|~|—|至|到)\s*"
     r"(\d{1,2})\s*[:：]\s*(\d{2})"
@@ -69,9 +91,42 @@ def _cn_number(value: str) -> int | None:
     return None
 
 
+def _split_connected(part: str) -> list[str]:
+    """递归按连接词拆分：取第一个两侧都 ≥2 字的连接点。"""
+    connectors = [
+        match
+        for match in _MUST_SEE_CONNECTOR_RE.finditer(part)
+        if 0 < match.start() < len(part) - 1
+    ]
+    for match in connectors:
+        left = part[: match.start()].strip()
+        right = part[match.end() :].strip()
+        if len(left) >= 2 and len(right) >= 2:
+            return [left] + _split_connected(right)
+    return [part]
+
+
+def _split_must_see(value: str) -> list[str]:
+    """按顿号 / 逗号与「和 / 与 / 及」拆分必去项，保护地名里的连接字。
+
+    例：「西湖和灵隐寺」→ 西湖 / 灵隐寺；「颐和园」「和平饭店」保持完整
+    （连接字两侧不是两个完整名称时不拆）；「颐和园和圆明园」能跳过
+    园名里的「和」在后面的连接点拆分。
+    """
+    parts = [
+        part.strip()
+        for part in re.split(r"[、，,；;/]+", str(value or ""))
+        if part.strip()
+    ]
+    names: list[str] = []
+    for part in parts:
+        names.extend(_split_connected(part))
+    return names
+
+
 def _clean_must_see(value: str) -> list[str]:
     """把「西湖和灵隐寺」拆成多个必去项，并去掉尾随动词 / 助词。"""
-    parts = re.split(r"[和与及、，,；;/]+", str(value or ""))
+    parts = _split_must_see(value)
     trailing = (
         "逛逛",
         "看看",
@@ -80,6 +135,13 @@ def _clean_must_see(value: str) -> list[str]:
         "打卡",
         "参观",
         "游览",
+        "旅游",
+        "旅行",
+        "游玩",
+        "好玩",
+        "有哪些",
+        "有什么",
+        "转转",
         "的",
         "了",
         "一下",
@@ -97,7 +159,7 @@ def _clean_must_see(value: str) -> list[str]:
                 if name.endswith(suffix) and len(name) > len(suffix):
                     name = name[: -len(suffix)].strip()
                     changed = True
-        if name.isdigit():
+        if name.isdigit() or name in _MUST_SEE_GENERIC:
             continue
         if 2 <= len(name) <= 24 and name not in names:
             names.append(name)

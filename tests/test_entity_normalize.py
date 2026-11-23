@@ -129,6 +129,34 @@ def test_extract_requirements_ignores_unparseable_dates():
     print("✓ 需求层拒绝非法日期")
 
 
+def test_event_date_range_is_consistent_across_year_boundary():
+    """起止月日按区间整体解析：不能一个顺延到来年、另一个留在今年。"""
+    base = date(2026, 11, 23)
+    result = normalize_event_data(
+        {"start_date": "11月20日", "end_date": "11月30日"}, today=base
+    )
+    assert result["start_date"] == "2026-11-20", result
+    assert result["end_date"] == "2026-11-30", result
+    result = normalize_event_data(
+        {"start_date": "1月5日", "end_date": "1月9日"}, today=base
+    )
+    assert result["start_date"] == "2027-01-05", result
+    assert result["end_date"] == "2027-01-09", result
+    result = normalize_event_data(
+        {"start_date": "12月28日", "end_date": "1月3日"},
+        today=date(2026, 12, 30),
+    )
+    assert result["start_date"] == "2026-12-28", result
+    assert result["end_date"] == "2027-01-03", result
+    result = normalize_event_data(
+        {"start_date": "2026年3月4日", "end_date": "2026年3月6日"},
+        today=base,
+    )
+    assert result["start_date"] == "2026-03-04", result
+    assert result["end_date"] == "2026-03-06", result
+    print("✓ 起止日期区间跨年一致")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -142,4 +170,5 @@ if __name__ == "__main__":
     test_date_year_rollover_for_past_month_day()
     test_invalid_event_dates_are_dropped()
     test_extract_requirements_ignores_unparseable_dates()
+    test_event_date_range_is_consistent_across_year_boundary()
     print("\n全部通过")

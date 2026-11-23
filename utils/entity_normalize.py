@@ -144,18 +144,87 @@ def normalize_date(
     return None
 
 
-def normalize_event_data(data: object) -> dict[str, Any]:
+_MONTH_DAY_RE = re.compile(r"^\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?\s*$")
+_EXPLICIT_YEAR_RE = re.compile(r"(?:\d{4}\s*年|\d{4}[-/]\d{1,2})")
+
+
+def _month_day(value: object) -> tuple[int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = _MONTH_DAY_RE.fullmatch(value)
+    if not match:
+        return None
+    month, day = int(match.group(1)), int(match.group(2))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return month, day
+
+
+def _normalize_event_range(
+    start_raw: str, end_raw: str, base: date
+) -> tuple[str, str] | None:
+    """把无年份的月日区间作为整体解析，避免起止分别顺延导致区间倒置。
+
+    选择顺序：包含今天的区间（行程进行中）→ 最近的未来区间 → 今年区间。
+    """
+    start_md = _month_day(start_raw)
+    end_md = _month_day(end_raw)
+    if start_md is None or end_md is None:
+        return None
+    candidates: list[tuple[date, date]] = []
+    for start_year in (base.year, base.year + 1):
+        try:
+            start = date(start_year, *start_md)
+            end_year = start_year if end_md >= start_md else start_year + 1
+            end = date(end_year, *end_md)
+        except ValueError:
+            continue
+        candidates.append((start, end))
+    if not candidates:
+        return None
+    for start, end in candidates:
+        if start <= base <= end:
+            return start.isoformat(), end.isoformat()
+    future = [pair for pair in candidates if pair[0] >= base]
+    if future:
+        start, end = min(future, key=lambda pair: pair[0])
+        return start.isoformat(), end.isoformat()
+    start, end = candidates[0]
+    return start.isoformat(), end.isoformat()
+
+
+def normalize_event_data(
+    data: object, today: date | None = None
+) -> dict[str, Any]:
     """归一事项收集结果里的 origin / destination / 起止日期（副本）。"""
+    base = today or date.today()
     if not isinstance(data, dict):
         return {}
     result = dict(data)
     for key in ("origin", "destination"):
         if key in result:
             result[key] = normalize_city(result[key])
+    # 起止日期都是无年份月日时按区间整体解析：逐条顺延会让「11月20日
+    # 到 11月30日」变成明年的 20 日到今年的 30 日（区间倒置）
+    planned: dict[str, str] = {}
+    start_raw = result.get("start_date")
+    end_raw = result.get("end_date")
+    if (
+        isinstance(start_raw, str)
+        and isinstance(end_raw, str)
+        and not _EXPLICIT_YEAR_RE.search(start_raw)
+        and not _EXPLICIT_YEAR_RE.search(end_raw)
+    ):
+        pair = _normalize_event_range(start_raw, end_raw, base)
+        if pair is not None:
+            planned = {"start_date": pair[0], "end_date": pair[1]}
     for key in ("start_date", "end_date"):
+        if key in planned:
+            result[key] = planned[key]
+            continue
         if key in result:
             raw = result[key]
-            normalized = normalize_date(raw)
+            normalized = normalize_date(raw, base)
             if normalized:
                 result[key] = normalized
             elif isinstance(raw, str) and raw.strip():
