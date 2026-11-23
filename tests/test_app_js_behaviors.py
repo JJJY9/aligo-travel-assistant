@@ -225,7 +225,27 @@ def test_deleted_session_thread_starts_clean_on_next_send():
     assert sent["sessionId"] == "s-new", sent
     assert sent["sentinelRemoved"] is True, "旧线程节点必须先清空再开始新轮"
     assert sent["roles"] == ["user"], sent
-    print("✓ 已删除会话的下一轮从干净线程开始")
+    bodies = data.get("bodies") or []
+    assert bodies and bodies[0].get("idempotency_key"), bodies
+    assert bodies[0].get("client_turn_id"), bodies
+    print("✓ 已删除会话的下一轮从干净线程开始（请求携带幂等键）")
+
+
+def test_retired_thread_regenerate_renders_user_question():
+    """已删除会话的可见线程上「重新生成」：新会话必须补齐用户提问。"""
+    data = _run_harness("retiredThreadRegenerate")
+    assert data["removed"] is True, data
+    assert data["sentinelGone"] is True, data
+    assert data["roles"] == ["user", "assistant"], data
+    print("✓ 已删除会话的可见线程重新生成会补齐用户提问")
+
+
+def test_export_reports_skipped_knowledge():
+    """含知识库备份导出：X-Knowledge-Skipped 让面板提示跳过条数。"""
+    data = _run_harness("knowledgeSkippedToast")
+    assert data["ok"] is True, data
+    assert any("知识片段" in item for item in data["toasts"]), data
+    print("✓ 含知识库备份导出提示跳过条数")
 
 
 def test_render_markdown_caps_oversized_message():
@@ -649,7 +669,7 @@ def test_reconcile_confirms_after_open_session():
 
     missing = data["stillMissing"]
     assert missing["input"] == "你好", missing
-    assert any("没有保存" in item for item in missing["toasts"]), missing
+    assert any("暂未确认保存结果" in item for item in missing["toasts"]), missing
 
     # 对账期间用户点击了其它会话：不能把旧提问写进当前输入框
     interleaved = data["interleaved"]
@@ -836,6 +856,8 @@ if __name__ == "__main__":
     test_copy_fallback_cleans_up_and_restores_focus()
     test_delete_last_turn_sends_turn_id()
     test_deleted_session_thread_starts_clean_on_next_send()
+    test_retired_thread_regenerate_renders_user_question()
+    test_export_reports_skipped_knowledge()
     test_editor_round2_preferences_and_guards()
     test_history_renders_in_windows()
     test_open_session_confirms_pending_edit()
