@@ -10,6 +10,7 @@
 - 扩展技能错误与上下文加固（v2.0）：`SimplePromptSkill` 不再吞掉可重试 / 永久模型错误（空响应、429/5xx、401/402 上抛，由编排层退避重试并计入熔断）；SKILL.md 与子类 system_prompt 合并为指令（此前有 SKILL.md 时 system_prompt 是死代码）；模型返回 JSON 信封时取正文；超长上下文按字段裁剪并保持 JSON 可解析（不再按 12000 字符腰斩）。新增对应回归
 - 执行检查点接入编排（v2.0）：`OrchestrationAgent.reply` 新增 `checkpoint_key`——每批已成功的子智能体结果落盘，同一 user + session + turn_id 的重试 / 重启复用成功步骤、只重跑失败或未完成者；`ConversationRuntime` 在 `client_turn_id` 存在时自动生成键，CLI / 无 turn_id 场景保持原行为。检查点读写失败只记日志、不阻断对话
 - 检查点加固（v2.0）：键绑定本轮提问内容（同一 `client_turn_id` 换消息不能复用上一问的子智能体结果），整轮成功落库后立即清理；默认目录跟随 `default_data_root()`（源码 / wheel / `ALIGO_DATA_DIR` 一致）并加入 `.gitignore`，初始化时清理过期检查点与崩溃遗留临时文件；落盘只保留键哈希（不再写入用户 / 会话标识），存储初始化失败只记日志、不阻断对话
+- 检查点会话清理（v2.0）：编排层新增 `checkpoint_scope`（`user:session`，落盘只存哈希），Web `DELETE /api/sessions/{id}` 与 CLI `session-delete` 删除会话时按作用域清理对应检查点，内含子智能体结果不再等 1 小时 TTL；清理失败只记日志、不阻断会话删除。新增作用域清理、编排记录、删除入口回归
 - 执行检查点存储（v2.0）：新增 `utils/execution_checkpoint.py`——按幂等键把编排中间结果原子落盘（SHA-256 文件名、临时文件 + fsync + `os.replace`、TTL 与条目上限淘汰、损坏文件清理、进程内互斥），作为失败重试 / 重启续跑的基础设施；本次只提供存储与单元测试，接入编排在后续 PR
 - 偏好快照缓存（v2.0）：`MemoryManager.get_preferences` 对 PostgreSQL 后端启用 5 秒偏好快照缓存（深拷贝返回，避免调用方改坏缓存），编排层每次偏好写入（append / replace / 旧格式批量）后立即 `invalidate_preference_cache`；JSON 后端读取本身在内存里，不启用缓存。对话快照、编排上下文与 `get_context_for_agent` 统一走该入口
 - 固定 DAG 编排（v2.0）：调度计划按依赖图校正优先级（行程规划依赖事项收集 / 偏好抽取；依赖方只会被上调、不会被下调，迭代处理传递依赖），LLM 把规划标成更高优先级也不会先于依赖执行；聚合结果新增 `missing_info` 与 `clarification`（事项收集的缺失字段归一为可读文本，最多 8 条），不阻断规划、供前端 / CLI 提示补充。新增 DAG 顺序与缺失信息聚合回归用例

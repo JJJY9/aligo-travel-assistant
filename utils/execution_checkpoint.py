@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from utils.paths import default_data_root
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SEC = 3600.0
 DEFAULT_MAX_ENTRIES = 256
@@ -116,14 +119,31 @@ class CheckpointStore:
             except OSError:
                 continue
 
-    def _payload(self, key: str, state: dict[str, Any]) -> dict[str, Any]:
-        """落盘负载：只留键哈希，不把含用户 / 会话标识的原始键写进文件。"""
-        return {**state, "key_hash": self._digest(key)}
+    def _payload(
+        self,
+        key: str,
+        state: dict[str, Any],
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        """落盘负载：只留键哈希，不把含用户 / 会话标识的原始键写进文件。
 
-    def _write_unlocked(self, key: str, state: dict[str, Any]) -> None:
+        ``scope``（``user:session``）同样只存哈希：会话删除时按它清理
+        检查点，不必落盘用户 / 会话标识。
+        """
+        payload = {**state, "key_hash": self._digest(key)}
+        if scope:
+            payload["scope_hash"] = self._digest(scope)
+        return payload
+
+    def _write_unlocked(
+        self,
+        key: str,
+        state: dict[str, Any],
+        scope: str | None = None,
+    ) -> None:
         """原子写入（调用方已持有 ``self._lock``）。"""
         path = self._path(key)
-        payload = self._payload(key, state)
+        payload = self._payload(key, state, scope)
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=self.root
         )
@@ -161,12 +181,21 @@ class CheckpointStore:
         with self._lock:
             return self._load_unlocked(key)
 
-    def save(self, key: str, state: dict[str, Any]) -> None:
+    def save(
+        self, key: str, state: dict[str, Any], *, scope: str | None = None
+    ) -> None:
         """原子写入检查点（整份状态）。"""
         with self._lock:
-            self._write_unlocked(key, state)
+            self._write_unlocked(key, state, scope)
 
-    def update_step(self, key: str, step: str, result: Any) -> None:
+    def update_step(
+        self,
+        key: str,
+        step: str,
+        result: Any,
+        *,
+        scope: str | None = None,
+    ) -> None:
         """记录某个子步骤的结果（读-改-写在进程锁内完成）。"""
         with self._lock:
             state = self._load_unlocked(key) or {}
@@ -175,7 +204,27 @@ class CheckpointStore:
                 steps = {}
             steps[str(step)] = result
             state["steps"] = steps
-            self._write_unlocked(key, state)
+            self._write_unlocked(key, state, scope)
+
+    def clear_scope(self, scope: str) -> int:
+        """删除属于某作用域（``user:session``）的全部检查点，返回条数。"""
+        if not scope:
+            return 0
+        digest = self._digest(scope)
+        removed = 0
+        with self._lock:
+            for path in self.root.glob("*.json"):
+                data = self._read(path)
+                if not isinstance(data, dict):
+                    continue
+                if data.get("scope_hash") != digest:
+                    continue
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
 
     def clear(self, key: str) -> None:
         with self._lock:
@@ -187,3 +236,20 @@ class CheckpointStore:
     def __len__(self) -> int:
         with self._lock:
             return len(list(self.root.glob("*.json")))
+
+
+def clear_session_checkpoints(
+    user_id: str, session_id: str, store: CheckpointStore | None = None
+) -> int:
+    """删除某用户会话的执行检查点（DELETE 会话时调用），返回删除条数。
+
+    检查点里是子智能体结果（含用户提问与行程内容）：会话删除后不能等
+    TTL 自然过期。清理失败只记日志（删除操作本身已完成），残留由 TTL
+    与条目上限兜底。
+    """
+    try:
+        target = store or CheckpointStore()
+        return target.clear_scope(f"{user_id}:{session_id}")
+    except Exception as exc:  # noqa: BLE001 - 清理失败不阻断会话删除
+        logger.warning("清理会话执行检查点失败: %s", exc)
+        return 0

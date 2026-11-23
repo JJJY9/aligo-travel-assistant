@@ -73,6 +73,7 @@ from utils.errors import (
     PartialImportError,
     UserFacingError,
 )
+from utils.execution_checkpoint import clear_session_checkpoints
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio, strip_terminal_controls
 from utils.doctor import run_doctor
@@ -4669,6 +4670,10 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             await asyncio.to_thread(state.drop_session, user_id, session_id)
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
+            # 检查点里是子智能体结果（含用户数据）：会话删除后不等 TTL
+            await asyncio.to_thread(
+                clear_session_checkpoints, user_id, session_id
+            )
         finally:
             lock.release()
         return {"session_id": session_id, "deleted": removed}

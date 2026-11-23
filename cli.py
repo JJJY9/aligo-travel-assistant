@@ -4422,6 +4422,10 @@ def run_session_delete_standalone(
             close()
     # 短期记忆清理失败不阻断：长期记忆已删除，残留由故障重放 / 过期回收兜底
     clear_short_term_session(session_id, user_id)
+    # 执行检查点含子智能体结果，会话删除后不等 TTL
+    from utils.execution_checkpoint import clear_session_checkpoints
+
+    clear_session_checkpoints(user_id, session_id)
     if as_json:
         print(
             json.dumps(

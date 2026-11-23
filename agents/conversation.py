@@ -268,6 +268,7 @@ class ConversationRuntime:
             )
             retry_cache_supported = False
             checkpoint_supported = False
+            checkpoint_scope_supported = False
             if defer_supported:
                 parameters: Iterable[inspect.Parameter]
                 try:
@@ -291,6 +292,11 @@ class ConversationRuntime:
                     or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
+                checkpoint_scope_supported = any(
+                    parameter.name == "checkpoint_scope"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
             # 整轮重试缓存：外层 retry_with_backoff 会重跑整个编排，缓存让
             # 重试跳过首轮已成功的智能体（一次 429/5xx 曾让同批已完成的
             # 智能体重复调用模型、放大账单与耗时）
@@ -308,11 +314,16 @@ class ConversationRuntime:
                 content_digest = hashlib.sha256(
                     str(user_input).encode("utf-8")
                 ).hexdigest()[:16]
+                user_id = str(getattr(self.memory, "user_id", ""))
+                session_id = str(getattr(self.memory, "session_id", ""))
                 reply_options["checkpoint_key"] = (
-                    f"{getattr(self.memory, 'user_id', '')}:"
-                    f"{getattr(self.memory, 'session_id', '')}:{turn_id}:"
-                    f"{content_digest}"
+                    f"{user_id}:{session_id}:{turn_id}:{content_digest}"
                 )
+                if checkpoint_scope_supported:
+                    # 会话删除时按 user:session 定向清理检查点（落盘只存哈希）
+                    reply_options["checkpoint_scope"] = (
+                        f"{user_id}:{session_id}"
+                    )
             orchestration = await self._call_with_resilience(
                 lambda: self.orchestrator.reply(
                     sanitized_intention,
