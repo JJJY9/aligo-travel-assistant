@@ -4440,8 +4440,9 @@ def test_trip_batch_restore_preserves_ids_and_rejects_collisions():
 
 
 def test_json_export_snapshot_is_consistent():
-    """导出快照的统计与列表来自同一版本（写锁内重载）。"""
-    memory = LongTermMemory("u-exp-snap", tempfile.mkdtemp())
+    """导出快照的统计与列表来自同一版本（写锁内重载外部写入）。"""
+    storage = tempfile.mkdtemp()
+    memory = LongTermMemory("u-exp-snap", storage)
     memory.add_chat_message("user", "Q", "s")
     memory.add_chat_message("assistant", "A", "s")
     memory.save_trip_history(
@@ -4457,7 +4458,25 @@ def test_json_export_snapshot_is_consistent():
     assert snapshot["statistics"]["total_messages"] == 2
     assert len(snapshot["trip_history"]) == 1
     assert snapshot["statistics"]["total_trips"] == 1
-    print("✓ JSON 导出快照与列表一致")
+
+    # 第二个实例（模拟另一个进程 / 面板写入）在快照之后写入：
+    # export_snapshot 必须在写锁内 _reload_latest，快照与统计都要包含外部写入
+    other = LongTermMemory("u-exp-snap", storage)
+    other.add_chat_message("user", "Q2", "s")
+    other.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-06-01",
+            "end_date": "2026-06-02",
+        }
+    )
+    refreshed = memory.export_snapshot()
+    assert len(refreshed["chat_history"]) == 3, refreshed["chat_history"]
+    assert refreshed["statistics"]["total_messages"] == 3
+    assert len(refreshed["trip_history"]) == 2, refreshed["trip_history"]
+    assert refreshed["statistics"]["total_trips"] == 2
+    print("✓ JSON 导出快照包含第二个实例的外部写入")
 
 
 def test_memory_manager_export_uses_snapshot():
