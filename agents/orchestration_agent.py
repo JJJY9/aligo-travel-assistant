@@ -219,7 +219,12 @@ def _trip_duration_days(value: Any) -> int | None:
                     )
             else:
                 return None
-        if "周" in text or "星期" in text:
+        # 「周末 3 天」「假期 3 天」里的「周」不是周单位：文本已经给出
+        # 天 / 日 / 晚时按天解释；只有纯周表达（两周、3 个星期）才 ×7，
+        # 否则会把 3 天误算成 21 天并推导出离谱的返程日期
+        if ("周" in text or "星期" in text) and not any(
+            unit in text for unit in ("天", "日", "晚")
+        ):
             number *= 7
     if number is None or number <= 0 or number > 365:
         return None
@@ -1499,9 +1504,18 @@ class OrchestrationAgent(AgentBase):
                                             )
                                             and old.get("trip_id")
                                         ):
+                                            fields = {"end_date": end_date}
+                                            # 同一轮既补出发地又补返程日期时，
+                                            # 上面的出发地补齐分支按「旧 end
+                                            # 等于新 end」找不到旧行；这里必须
+                                            # 把缺失的 origin 一并写入，否则
+                                            # 存储层去重身份含 origin，会再插
+                                            # 一条重复行程（统计翻倍、互相报
+                                            # 日期冲突）
+                                            if origin and not old_origin:
+                                                fields["origin"] = origin
                                             updater(
-                                                str(old["trip_id"]),
-                                                {"end_date": end_date},
+                                                str(old["trip_id"]), fields
                                             )
                                             break
                             except Exception as exc:  # noqa: BLE001 - 补齐失败不阻断保存
