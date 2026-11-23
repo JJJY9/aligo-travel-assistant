@@ -421,6 +421,54 @@ def test_config_local_loaded_without_cwd_on_sys_path():
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
+def test_rag_config_env_overrides():
+    """RAG 嵌入模型与检索阈值可用环境变量覆盖，非法值告警回退。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.RAG_CONFIG['embedding_model']);"
+        "print(config.RAG_CONFIG['min_score'])"
+    )
+    base_env = dict(os.environ)
+    for key in ("RAG_EMBEDDING_MODEL", "RAG_MIN_SCORE"):
+        base_env.pop(key, None)
+    base_env["PYTHONIOENCODING"] = "utf-8"
+
+    def _run(env: dict) -> tuple[list[str], str]:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip().split("\n"), result.stderr
+
+    lines, _ = _run(base_env)
+    assert lines == ["data/models/bge-small-zh-v1.5", "0.5"], lines
+
+    env = dict(base_env)
+    env["RAG_EMBEDDING_MODEL"] = "D:/models/bge-m3"
+    env["RAG_MIN_SCORE"] = "0.62"
+    lines, _ = _run(env)
+    assert lines == ["D:/models/bge-m3", "0.62"], lines
+
+    env["RAG_MIN_SCORE"] = "1.5"
+    lines, _ = _run(env)
+    assert lines[1] == "1.0", "阈值需钳制到 0–1"
+
+    env["RAG_MIN_SCORE"] = "0,5"
+    lines, stderr = _run(env)
+    assert lines[1] == "0.5", lines
+    assert "不是数字" in stderr, stderr
+    print("✓ RAG 嵌入模型 / 检索阈值环境变量覆盖")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -444,4 +492,5 @@ if __name__ == "__main__":
         _mp.undo()
     test_numeric_and_bool_envs_strip_bom_and_strip_quotes()
     test_oversized_timeout_clamped_and_factory_survives()
+    test_rag_config_env_overrides()
     print("\n全部通过")
