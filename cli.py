@@ -1701,7 +1701,7 @@ class AligoCLI:
                         self.console.print(
                             "未从管道读取到任何命令（首行是用户 ID，其后每行"
                             "是一条命令）；如只想问一个问题，请直接运行 "
-                            "python cli.py ask <用户ID> <问题>",
+                            "python cli.py 进入交互模式后输入问题",
                             style="red",
                         )
                         raise SystemExit(2) from None

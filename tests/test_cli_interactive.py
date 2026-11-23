@@ -57,7 +57,10 @@ def test_nontty_single_line_query_is_not_swallowed():
     output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
     assert result.returncode == 2, output
     assert "Traceback" not in output, output
-    print("✓ 非 TTY 单行查询不再被静默吞掉（退出码 2）")
+    # 提示必须给真实存在的入口：此前引导用户运行不存在的 `python cli.py ask`
+    assert "交互模式" in output, output
+    assert "cli.py ask" not in output, output
+    print("✓ 非 TTY 单行查询不再被静默吞掉（退出码 2，提示有效入口）")
 
 
 def test_startup_memory_error_exits_without_traceback(monkeypatch):
