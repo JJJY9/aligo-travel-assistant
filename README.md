@@ -10,6 +10,21 @@
 
 > **实现现状**：本仓库是可直接运行的**本地实现**——短期记忆默认进程内滑动窗口，长期记忆默认 JSON 文件（`data/memory/`），RAG 使用 Milvus Lite 本地向量库。Redis / PostgreSQL 为**可选生产存储后端**（配置 `REDIS_URL` / `DATABASE_URL` 启用，未配置或连接失败时自动回退）；关键指标为开发期实验口径（见「关键指标」小节说明）。
 
+## 🚀 v2.0 Personal Agent 能力
+
+在原有「多智能体 + 两层记忆 + RAG」之上，v2.0 增加了以下可验证能力（均有回归测试）：
+
+- **混合检索**：向量 + BM25（中文按字符二元组，无需分词器）双路召回，RRF 融合；可选 `RAG_RERANK_MODEL` 做 cross-encoder 精排（默认关闭）。BM25 索引进程内缓存、写入失效，构建 / 重排失败自动回退纯向量；管理 / 评测接口保持纯向量口径。
+- **行程约束求解与校验**：需求提取（预算 / 必去项 / 天数）→ 必去项按天分配（OR-Tools CP-SAT 可选，未安装时确定性贪心）→ 五项校验（天数、时间冲突、预算、必去项、费用复核）；未通过时带原因重生成一次，仍失败保留原行程并返回 `validation`。
+- **固定 DAG 调度**：行程规划依赖事项收集 / 偏好抽取，优先级只上调不下调（迭代处理传递依赖）；事项缺失信息随结果返回 `missing_info` / `clarification`，不阻断规划。
+- **持久化执行与防重**：`/api/chat` / `/api/chat/stream` 支持 `idempotency_key`（重复提交直接回放成功响应）；编排按 `user:session:turn_id` 落执行检查点到 `data/runtime/checkpoints`，失败重试 / 重启复用已成功的子智能体结果，只重跑失败者。
+- **记忆一致性**：最近 10 轮对话生成 ≤200 字滚动摘要（窗口指纹缓存、失败冷却）；PostgreSQL 后端偏好快照 5 秒缓存，写入后立即失效。
+- **12 个技能**：原 6 个技能 + `trip-budget` / `packing-list` / `travel-checklist` / `local-transport` / `safety-tips` / `trip-notes`，统一 `SKILL.md` + 懒加载，意图阶段只暴露元数据。
+- **评测骨架**：`utils/eval_harness.py`（规则验收 + 可选 LLM-as-Judge ≥0.6、Pass@1 / 分类准确率 / 失败原因）与 `utils/eval_cases.py`（12 类场景确定性生成 500 条分层用例，JSONL 导出）。
+- **工程细节**：备份导入导出 50MB 可恢复性（原子写、隔离备份、跨进程锁、PG advisory lock、并发导入互斥）、固定 DAG 与检查点、2300+ 测试、CI 双 Python 版本。
+
+> 说明：以上为已落地的工程能力；真实模型跑分需要 `LLM_API_KEY`，仓库不附带线上指标。
+
 ## 界面预览
 
 | 对话与执行路线（浅色） | 深色模式 |
