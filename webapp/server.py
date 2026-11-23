@@ -1162,10 +1162,33 @@ class _SessionTurnLease:
         self._lock.release()
 
 
+class _LockReplayLease:
+    """幂等回放的流式响应租约：只持有用户锁（不创建会话）。"""
+
+    def __init__(self, lock: asyncio.Lock) -> None:
+        self._lock = lock
+        self._released = False
+
+    async def stop_turn(self) -> None:
+        """回放没有在途回合，无需收尾。"""
+        return None
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._lock.release()
+
+
 class _LeasedStreamingResponse(StreamingResponse):
     """响应结束（含未开始迭代即被取消）时停稳回合并释放租约。"""
 
-    def __init__(self, content: Any, lease: _SessionTurnLease, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        content: Any,
+        lease: _SessionTurnLease | _LockReplayLease,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(content, **kwargs)
         self._lease = lease
 
@@ -4961,6 +4984,37 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
+            # v2.0 幂等：键用请求里的 session_id（缺省空串）而不是服务端
+            # 新生成的会话 id——首条消息不带 session_id 时，同键重试必须
+            # 仍然命中缓存（否则会在新会话里再执行一遍、再落一份问答）；
+            # 缓存响应里带着首次执行生成的会话 id，客户端据此继续原会话
+            idem_key = (
+                make_key(
+                    payload.user_id,
+                    payload.session_id or "",
+                    payload.idempotency_key,
+                    endpoint="chat",
+                    message=payload.message,
+                )
+                if payload.idempotency_key
+                else None
+            )
+            if idem_key is not None:
+                cached = state.idempotency.get(idem_key)
+                if cached is not None:
+                    if cached.get("__incomplete__"):
+                        # 上一请求已落库但客户端断连没收到响应：不能重放
+                        # 空答案，也不能重新执行（会在历史里追加第二份问答）
+                        raise HTTPException(
+                            status_code=409,
+                            detail=str(
+                                cached.get("message")
+                                or "上一请求已处理但响应未送达，请刷新会话历史"
+                            ),
+                        )
+                    response.headers.update(rate_headers)
+                    response.headers["X-Idempotent-Replay"] = "1"
+                    return cached
             # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池；
             # mark_in_use 阻止会话在 ask 期间被 LRU 淘汰 close；请求在等待
             # 期间被取消时，_get_session_marked 负责在构造完成后补 end_turn
@@ -4986,41 +5040,7 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=503,
                     detail=f"{exc}（请求 ID：{_request_id(request)}）",
                 ) from exc
-            # v2.0 幂等：重复提交（同一 user + 会话 + 幂等键）直接返回上次
-            # 成功响应；检查在用户锁内，并发重复请求会串行并命中缓存
-            idem_key = (
-                make_key(
-                    payload.user_id,
-                    session.session_id,
-                    payload.idempotency_key,
-                    endpoint="chat",
-                    message=payload.message,
-                )
-                if payload.idempotency_key
-                else None
-            )
-            if idem_key is not None:
-                cached = state.idempotency.get(idem_key)
-                if cached is not None:
-                    # 会话已由 _get_session_marked 标记在用：回放也必须
-                    # 归还占用标记，否则缓存命中的请求会把会话永久占住
-                    try:
-                        await session.runtime.drain_pending_persist()
-                    finally:
-                        session.end_turn()
-                    if cached.get("__incomplete__"):
-                        # 上一请求已落库但客户端断连没收到响应：不能重放
-                        # 空答案，也不能重新执行（会在历史里追加第二份问答）
-                        raise HTTPException(
-                            status_code=409,
-                            detail=str(
-                                cached.get("message")
-                                or "上一请求已处理但响应未送达，请刷新会话历史"
-                            ),
-                        )
-                    response.headers.update(rate_headers)
-                    response.headers["X-Idempotent-Replay"] = "1"
-                    return cached
+            # v2.0 幂等缓存写入在下方成功路径统一完成（键与回放口径见上）
             disconnected = False
             try:
                 result, disconnected = await _ask_cancellable_on_disconnect(
@@ -5160,6 +5180,82 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
+            # 幂等回放：键用请求里的 session_id（缺省空串），不依赖服务端
+            # 新生成的会话 id（否则不带 session_id 的首条消息同键重试永远
+            # 命不中）；回放不创建会话，会话事件回放首次执行的会话 id
+            idem_key = (
+                make_key(
+                    payload.user_id,
+                    payload.session_id or "",
+                    payload.idempotency_key,
+                    endpoint="chat_stream",
+                    message=payload.message,
+                )
+                if payload.idempotency_key
+                else None
+            )
+            if idem_key is not None:
+                cached = state.idempotency.get(idem_key)
+                if cached is not None:
+                    cached_session_id = str(
+                        cached.get("session_id") or payload.session_id or ""
+                    )
+
+                    async def replay_stream() -> Any:
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "session",
+                                    "session_id": cached_session_id,
+                                    "idempotent_replay": True,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        if cached.get("__incomplete__"):
+                            # 上一流式请求已落库但客户端断连：回放错误终态，
+                            # 不重放空答案、也不重新执行
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": str(
+                                            cached.get("message")
+                                            or "上一请求已处理但响应未送达，"
+                                            "请刷新会话历史"
+                                        ),
+                                        "idempotent_replay": True,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n\n"
+                            )
+                            return
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                _json_safe_value(
+                                    {**cached, "idempotent_replay": True}
+                                ),
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+
+                    return _LeasedStreamingResponse(
+                        replay_stream(),
+                        _LockReplayLease(lock),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                            "Connection": "keep-alive",
+                            **rate_headers,
+                        },
+                    )
             try:
                 session = await _get_session_marked(
                     state, payload.user_id, payload.session_id
@@ -5183,79 +5279,6 @@ def create_app(model: Any = None) -> FastAPI:
             else:
                 lock.release()
             raise
-
-        # v2.0 幂等：同一 user + 会话 + 幂等键的重复流式提交只回放缓存，
-        # 不重新执行 Agent。检查在租约内（用户锁已持有），并发重复请求
-        # 会串行，后到者命中缓存。
-        idem_key = (
-            make_key(
-                payload.user_id,
-                session.session_id,
-                payload.idempotency_key,
-                endpoint="chat_stream",
-                message=payload.message,
-            )
-            if payload.idempotency_key
-            else None
-        )
-        if idem_key is not None:
-            cached = state.idempotency.get(idem_key)
-            if cached is not None:
-                async def replay_stream() -> Any:
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {
-                                "type": "session",
-                                "session_id": session.session_id,
-                                "idempotent_replay": True,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n\n"
-                    )
-                    if cached.get("__incomplete__"):
-                        # 上一流式请求已落库但客户端断连：回放错误终态，
-                        # 不重放空答案、也不重新执行
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {
-                                    "type": "error",
-                                    "message": str(
-                                        cached.get("message")
-                                        or "上一请求已处理但响应未送达，"
-                                        "请刷新会话历史"
-                                    ),
-                                    "idempotent_replay": True,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
-                        )
-                        return
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            _json_safe_value(
-                                {**cached, "idempotent_replay": True}
-                            ),
-                            ensure_ascii=False,
-                        )
-                        + "\n\n"
-                    )
-
-                return _LeasedStreamingResponse(
-                    replay_stream(),
-                    lease,
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                        "Connection": "keep-alive",
-                        **rate_headers,
-                    },
-                )
 
         async def event_stream() -> Any:
             task: asyncio.Task[None] | None = None

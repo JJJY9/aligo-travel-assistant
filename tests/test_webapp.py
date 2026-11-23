@@ -895,6 +895,94 @@ def test_chat_idempotency_key_binds_message_content():
     print("✓ 幂等键绑定消息内容")
 
 
+def test_chat_idempotency_without_session_id_replays():
+    """不带 session_id 的首条消息：同键重试回放首次响应（含生成的会话 id）。"""
+
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem_no_session")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "idempotency_key": "req-ns-1",
+        }
+        first = client.post("/api/chat", json=payload)
+        assert first.status_code == 200, first.text
+        calls_after_first = counting.calls
+        session_id = first.json().get("session_id")
+        assert session_id, first.json()
+
+        second = client.post("/api/chat", json=payload)
+        assert second.status_code == 200, second.text
+        assert second.headers.get("x-idempotent-replay") == "1"
+        assert second.json() == first.json()
+        assert second.json().get("session_id") == session_id
+        assert counting.calls == calls_after_first, "首条消息的重试不能重新执行"
+        print("✓ 不带 session_id 的同键重试回放首次响应")
+    finally:
+        _cleanup(user_id)
+
+
+def test_chat_stream_idempotency_without_session_id_replays():
+    """流式不带 session_id：同键重试回放首次会话 id，不重新执行。"""
+
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem_stream_no_session")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "idempotency_key": "req-stream-ns",
+        }
+
+        def _events(response):
+            return [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+
+        with client.stream("POST", "/api/chat/stream", json=payload) as response:
+            events = _events(response)
+        assert events[-1]["type"] == "done"
+        session_id = events[0]["session_id"]
+        assert session_id
+        calls_after_first = counting.calls
+
+        with client.stream("POST", "/api/chat/stream", json=payload) as response:
+            events2 = _events(response)
+        assert [event["type"] for event in events2] == ["session", "done"]
+        assert events2[0]["session_id"] == session_id, (
+            "回放会话语必须使用首次执行的会话 id"
+        )
+        assert events2[0].get("idempotent_replay") is True
+        assert events2[-1].get("idempotent_replay") is True
+        assert counting.calls == calls_after_first, "首条消息的重试不能重新执行"
+        print("✓ 流式不带 session_id 的同键重试回放首次会话")
+    finally:
+        _cleanup(user_id)
+
+
 def test_chat_incomplete_idempotency_marker_returns_409():
     """断连 499 落库成功后的标记：重试返回 409，不重放也不重复执行。"""
     from utils.idempotency import make_key
