@@ -38,6 +38,57 @@ def test_extract_requirements_wan_and_chinese_duration():
     print("✓ 万元预算 / 中文天数")
 
 
+def test_date_day_is_not_duration_and_dates_drive_day_count():
+    """「3月4日」的「4日」不是天数；起止日期完整时按日期算天数。"""
+    requirements = extract_requirements("3月4日出发去杭州玩3天")
+    assert requirements["duration_days"] == 3
+    requirements = extract_requirements(
+        "",
+        {
+            "start_date": "2026-03-04",
+            "end_date": "2026-03-06",
+            "duration_days": 5,
+        },
+    )
+    assert requirements["duration_days"] == 3, "应按起止日期算天数（含首尾）"
+    print("✓ 日期不再被当作天数，起止日期决定天数")
+
+
+def test_budget_does_not_cross_clause_punctuation():
+    """预算关键词不能越过逗号 / 句号去匹配后面无关的金额。"""
+    assert "budget" not in extract_requirements("预算还没定，酒店 500 元")
+    assert extract_requirements("预算大概是5000元")["budget"] == 5000
+    print("✓ 预算提取不跨标点")
+
+
+def test_must_see_trims_duration_and_budget_fragments():
+    """必去项捕获里的天数 / 预算片段要截掉，不能变成完整地名。"""
+    requirements = extract_requirements("必去西湖玩3天，预算5000元")
+    assert requirements["must_see"] == ["西湖"], requirements
+    requirements = extract_requirements("想去故宫预算5000")
+    assert requirements["must_see"] == ["故宫"], requirements
+    assert requirements["budget"] == 5000
+    print("✓ 必去项截掉天数 / 预算片段")
+
+
+def test_must_see_only_checks_daily_plans():
+    """备注里提到的地名不算已安排：必须出现在每日行程里。"""
+    itinerary = {
+        "notes": "本行程参考雷峰塔夜景攻略",
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "09:00-12:00", "title": "西湖"}
+                ],
+            }
+        ],
+    }
+    issues = validate_itinerary(itinerary, {"must_see": ["雷峰塔"]})
+    assert [issue["code"] for issue in issues] == ["must_see_missing"], issues
+    print("✓ 必去项只核对每日安排")
+
+
 def test_validate_passes_for_consistent_plan():
     """天数、时间、预算、必去项、费用一致时无问题。"""
     itinerary = {
@@ -110,6 +161,10 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     test_extract_requirements_budget_must_see_duration()
     test_extract_requirements_wan_and_chinese_duration()
+    test_date_day_is_not_duration_and_dates_drive_day_count()
+    test_budget_does_not_cross_clause_punctuation()
+    test_must_see_trims_duration_and_budget_fragments()
+    test_must_see_only_checks_daily_plans()
     test_validate_passes_for_consistent_plan()
     test_validate_detects_all_five_checks()
     test_validate_handles_empty_and_unknown_shapes()

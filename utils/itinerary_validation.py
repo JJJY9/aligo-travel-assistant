@@ -13,18 +13,23 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import date as _date
 from typing import Any, Iterable
 
 from utils.entity_normalize import normalize_event_data
 
 _BUDGET_RE = re.compile(
-    r"(?:预算|总预算|花费|费用)[^\d]{0,8}(\d+(?:\.\d+)?)\s*(万元|万|元|块)?"
+    r"(?:预算|总预算|花费|费用)[^\d。！？；;，,\n]{0,8}(\d+(?:\.\d+)?)\s*(万元|万|元|块)?"
 )
 _MUST_SEE_RE = re.compile(
     r"(?:必去|一定要去|必须去|想去|打卡|别错过)[：:\s]*"
     r"([一-鿿A-Za-z0-9·]{2,24})"
 )
+# 「3月4日」里的「4日」是日期不是行程天数：匹配后再看数字前是否紧邻「月」
 _DURATION_RE = re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:天|日)")
+# 必去项里混入的天数 / 预算片段：截断后再清洗动词后缀
+_MUST_SEE_DURATION_RE = re.compile(r"[0-9一二两三四五六七八九十]+\s*[天日].*$")
+_MUST_SEE_BUDGET_RE = re.compile(r"(?:预算|花费|费用|人均|总价|左右|以内).*$")
 _TIME_RANGE_RE = re.compile(
     r"(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:-|~|—|至|到)\s*"
     r"(\d{1,2})\s*[:：]\s*(\d{2})"
@@ -82,6 +87,9 @@ def _clean_must_see(value: str) -> list[str]:
     names: list[str] = []
     for part in parts:
         name = part.strip().strip("。.!！?？ ")
+        # 「西湖玩3天」「故宫预算5000」：先截掉混入的天数 / 预算片段
+        name = _MUST_SEE_DURATION_RE.sub("", name)
+        name = _MUST_SEE_BUDGET_RE.sub("", name)
         changed = True
         while changed and name:
             changed = False
@@ -89,9 +97,43 @@ def _clean_must_see(value: str) -> list[str]:
                 if name.endswith(suffix) and len(name) > len(suffix):
                     name = name[: -len(suffix)].strip()
                     changed = True
+        if name.isdigit():
+            continue
         if 2 <= len(name) <= 24 and name not in names:
             names.append(name)
     return names
+
+
+def _iso_date(value: object) -> _date | None:
+    text = str(value or "").strip()
+    if len(text) < 10:
+        return None
+    try:
+        return _date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _date_range_days(requirements: dict[str, Any]) -> int | None:
+    """起止日期都在时用日期算天数（比模型抽取的 duration_days 可靠）。"""
+    start = _iso_date(requirements.get("start_date"))
+    end = _iso_date(requirements.get("end_date"))
+    if start is None or end is None or end < start:
+        return None
+    days = (end - start).days + 1
+    return days if 0 < days <= 366 else None
+
+
+def _text_duration(text: str) -> int | None:
+    """「N 天 / 日」天数；跳过「3月4日」这类日期里的「4日」。"""
+    for match in _DURATION_RE.finditer(text):
+        prefix = text[: match.start()].rstrip()
+        if prefix.endswith("月"):
+            continue
+        number = _cn_number(match.group(1))
+        if number and 0 < number <= 365:
+            return number
+    return None
 
 
 def extract_requirements(
@@ -107,6 +149,11 @@ def extract_requirements(
         value = event.get(key)
         if isinstance(value, str) and value.strip():
             requirements[key] = value.strip()
+    # 起止日期完整时以日期算出的天数为准：模型抽取的 duration_days 与
+    # 日期冲突时（或根本没抽）会漏掉天数校验
+    date_days = _date_range_days(requirements)
+    if date_days is not None:
+        requirements["duration_days"] = date_days
 
     text = str(user_query or "")
     budget_match = _BUDGET_RE.search(text)
@@ -126,11 +173,9 @@ def extract_requirements(
         requirements["must_see"] = must_see
 
     if "duration_days" not in requirements:
-        duration_match = _DURATION_RE.search(text)
-        if duration_match:
-            number = _cn_number(duration_match.group(1))
-            if number and 0 < number <= 365:
-                requirements["duration_days"] = number
+        duration_days = _text_duration(text)
+        if duration_days:
+            requirements["duration_days"] = duration_days
     return requirements
 
 
@@ -319,10 +364,11 @@ def validate_itinerary(
                 }
             )
 
-    # 5) 必去项
+    # 5) 必去项：只核对每日安排。整份 JSON 会把备注 / 用户原话里提到的
+    # 地名也算作「已安排」，行程实际没去也判通过
     must_see = requirements.get("must_see")
     if isinstance(must_see, list):
-        text = json.dumps(itinerary, ensure_ascii=False).casefold()
+        text = json.dumps(plans, ensure_ascii=False).casefold()
         for name in must_see:
             if str(name).casefold() not in text:
                 issues.append(
