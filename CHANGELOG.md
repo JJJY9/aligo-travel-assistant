@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- 导出与备份恢复互斥（v2.0）：`/api/import` 在真实写入期间标记该用户并推进每用户恢复纪元；同账号的导出接口（`/api/export`、`/api/sessions/export`、`/api/sessions/{id}/export`、`/api/trips/export`、`/api/trips/calendar`）返回 409（恢复进行中带 `Retry-After`），不再产出「只有偏好没有消息」的半截快照。导出在读取前原子地取纪元、读完快照后复核：读取期间才开始、甚至读完前已经结束的恢复也会让本次导出作废（PG 快照 / JSON 打开时快照可能定格在写入中途，只查「当前是否在恢复」会漏掉）。dry-run 不标记，写入失败也清除标记；恢复标记与纪元是进程内状态，多实例 / CLI 跨进程仍按已知限制在恢复结束后导出。新增入口 / 读取中途开始 / 读取期间完成的恢复回归
 - 实体归一（v2.0）：新增 `utils/entity_normalize.py`——城市名去行政后缀（杭州市→杭州、香港特别行政区→香港），中文日期（今天 / 明天 / 本周五 / 下周三 / 3月4日 / 下个月5号 / 月底）归一为 ISO；事项收集结果在行程需求提取前自动归一（副本，不修改原数据）。新增城市 / 日期 / 事项数据回归
 - 实体归一日期边界（v2.0）：无年份月日已过去时顺延到明年（11 月说「1月5日」指明年，与「周X 取未来最近一天」一致，不再产出过去日期）；显式年份保持原样；非闰年 2月29日 / 3月32日等不可能日期在 `normalize_event_data` 中丢弃而不是原样透传；`extract_requirements` 只接受可解析的 ISO 日期。新增跨年 / 非法日期回归
 - 扩展技能（v2.0，共 12 个技能）：新增 trip-budget / packing-list / travel-checklist / local-transport / safety-tips / trip-notes 六个轻量提示技能（SKILL.md + scripts），共用 `utils/simple_skill.py` 基类（上下文截断与中和、数据块注入、统一 `{status, skill, <result_key>, answer}` 返回）；LazyAgentRegistry 自动发现，wheel 数据文件同步；新增技能加载 / 注册 / 空响应测试
