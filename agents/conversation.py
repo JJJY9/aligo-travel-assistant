@@ -71,7 +71,7 @@ class ConversationRuntime:
         # 最近一次在途落库对应的提问 / 本轮回滚状态：落库失败或守卫否决时
         # 由完成回调触发回滚；下一轮开始前先等这次回滚结束，避免迟到的
         # 回滚删掉下一轮文本相同的提问
-        self._last_persist_turn: tuple[str, dict[str, bool]] | None = None
+        self._last_persist_turn: tuple[str, dict[str, Any]] | None = None
         # 最近一次落库是否成功（提问文本）：客户端断连返回 499 后，Web 层
         # 据此决定是否给幂等键写「已落库但响应未送达」标记，避免重试重复
         self._last_persist_committed: str | None = None
@@ -243,7 +243,7 @@ class ConversationRuntime:
         pending_persist: asyncio.Future | None = None
         committed: bool | None = None
         usage_value: dict[str, Any] | None = None
-        turn_state = {"rollback_requested": False}
+        turn_state = {"rollback_requested": False, "turn_id": turn_id}
         # 上一轮落库 / 回滚可能仍在途（用户停止后 drain 超时、后台回滚线程
         # 未结束）：先等它收尾，失败 / 否决时在这里补回滚，再暂存本轮提问。
         # 否则旧回调的回滚按内容匹配可能删掉本轮刚暂存的同一文本提问。
@@ -255,7 +255,14 @@ class ConversationRuntime:
             # 落地，否则回滚读到的窗口里还没有这条提问、内容不匹配直接
             # 返回 False，随后写入落地留下无回答的孤儿提问
             stage_future = asyncio.ensure_future(
-                asyncio.to_thread(self.memory.stage_message, "user", user_input)
+                asyncio.to_thread(
+                    self.memory.stage_message,
+                    "user",
+                    user_input,
+                    # 回合 id 随消息进短期记忆：删除 / 回滚时据此精确区分
+                    # 「同一文本的不同回合」（跨实例并发同问）
+                    {"client_turn_id": turn_id} if turn_id else None,
+                )
             )
             await asyncio.shield(stage_future)
             # 用清洗后的意图数据重建 Msg 再交给编排器：原始 Msg 仍可能带
@@ -459,7 +466,7 @@ class ConversationRuntime:
         }
 
     async def _request_staged_rollback(
-        self, user_input: str, turn_state: dict[str, bool]
+        self, user_input: str, turn_state: dict[str, Any]
     ) -> None:
         """本轮只回滚一次（主路径与落库完成回调可能同时请求）。
 
@@ -470,7 +477,9 @@ class ConversationRuntime:
             await self._await_pending_rollback()
             return
         turn_state["rollback_requested"] = True
-        await self._rollback_staged_user_message(user_input)
+        await self._rollback_staged_user_message(
+            user_input, turn_state.get("turn_id") or None
+        )
 
     async def _settle_staged_write(
         self, stage_future: "asyncio.Future | None"
@@ -509,16 +518,21 @@ class ConversationRuntime:
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
             logger.warning("回滚暂存提问失败", exc_info=True)
 
-    async def _rollback_staged_user_message(self, user_input: str) -> None:
+    async def _rollback_staged_user_message(
+        self, user_input: str, turn_id: str | None = None
+    ) -> None:
         """移除编排前暂存的用户提问（尽力而为，不阻塞取消 / 错误上报）。
 
         回滚本身是阻塞 IO，放线程池执行；用户停止请求时当前任务已处于取消
         状态，任何 await 都会被立即再次取消，因此只做有限等待，线程自行完成。
+        ``turn_id`` 透传给短期记忆，避免跨实例同文本提问被误删。
         """
         rollback = getattr(self.memory, "rollback_staged_message", None)
         if not callable(rollback):
             return
-        task = asyncio.ensure_future(asyncio.to_thread(rollback, user_input))
+        task = asyncio.ensure_future(
+            asyncio.to_thread(rollback, user_input, turn_id)
+        )
         self._pending_rollback = task
         task.add_done_callback(self._consume_background_task)
         try:
@@ -633,7 +647,7 @@ class ConversationRuntime:
         self,
         pending: asyncio.Future,
         user_input: str = "",
-        turn_state: dict[str, bool] | None = None,
+        turn_state: dict[str, Any] | None = None,
     ) -> None:
         if self._pending_persist is pending:
             self._pending_persist = None

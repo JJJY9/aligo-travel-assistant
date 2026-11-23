@@ -441,14 +441,18 @@ class MemoryManager:
                 return ts
         return None
 
-    def rollback_staged_message(self, content: str) -> bool:
+    def rollback_staged_message(
+        self, content: str, turn_id: str | None = None
+    ) -> bool:
         """编排失败 / 取消时移除编排前暂存的用户提问（尽力而为）。
 
         仅当短期记忆末尾仍是这条未回答的用户消息时才删除：编排失败后
         若保留，重试同一问题会在上下文里出现两条重复提问；长期记忆里
         却没有对应轮次，两层记忆从此不一致。删除走与「删除最后一轮」
         相同的实现（Redis 端原子脚本 + 故障期日志重放），不会误删其它
-        实例已写入的轮次。
+        实例已写入的轮次；``turn_id`` 不为 None 时还要求暂存提问的
+        ``metadata.client_turn_id`` 一致——另一实例正在生成同文本提问时，
+        只按内容匹配会删掉对方的轮次。
 
         Returns:
             是否真的删除了暂存的提问
@@ -462,7 +466,11 @@ class MemoryManager:
                 return False
             if last.get("role") != "user" or last.get("content") != content:
                 return False
-            removed = bool(self.short_term.truncate_last_turn(expect=content))
+            removed = bool(
+                self.short_term.truncate_last_turn(
+                    expect=content, turn_id=turn_id
+                )
+            )
             if removed:
                 for index in range(
                     len(self._staged_user_timestamps) - 1, -1, -1

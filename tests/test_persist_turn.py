@@ -181,7 +181,7 @@ class _BlockingMemory:
         self.events.append(("stage", content))
         self.staged.append((role, content))
 
-    def rollback_staged_message(self, content):
+    def rollback_staged_message(self, content, turn_id=None):
         self.rolled_back.append(content)
         self.rollback_seen.set()
         self.events.append(("rollback", content))

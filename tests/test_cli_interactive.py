@@ -467,7 +467,7 @@ def _make_cli_stub():
         def stage_message(self, role, content, metadata=None):
             events["staged"].append(content)
 
-        def rollback_staged_message(self, content):
+        def rollback_staged_message(self, content, turn_id=None):
             events["rolled_back"].append(content)
             if events["staged"] and events["staged"][-1] == content:
                 events["staged"].pop()

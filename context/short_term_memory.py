@@ -218,6 +218,23 @@ if cutoff and cutoff ~= '' and user_raw ~= nil then
   if cut_ok and type(cut_msg) == 'table' and type(cut_msg['timestamp']) == 'string'
      and cut_msg['timestamp'] > cutoff then return 0 end
 end
+-- 回合 id 校验（跨实精确截断）：另一实例正在生成同文本提问时，只按
+-- 文本匹配会误删对方的轮次；传入 turn_id 时要求末尾用户消息的
+-- metadata.client_turn_id 完全一致。消息没有回合 id（长期记忆回填 /
+-- 旧数据 / CLI）时退回内容校验，不能因缺 id 拒删——那会把已删除的
+-- 旧提问继续留在短期上下文里。空串 turn_id 视为「无回合 id」
+local turn_id = ARGV[5]
+if turn_id and turn_id ~= '' then
+  if user_raw == nil then return 0 end
+  local tid_ok, tid_msg = pcall(cjson.decode, user_raw)
+  if not tid_ok or type(tid_msg) ~= 'table' then return 0 end
+  local meta = tid_msg['metadata']
+  local got = ''
+  if type(meta) == 'table' and type(meta['client_turn_id']) == 'string' then
+    got = meta['client_turn_id']
+  end
+  if got ~= '' and got ~= turn_id then return 0 end
+end
 if check == '1' then
   if user_raw == nil then return 0 end
   local msg_ok, msg = pcall(cjson.decode, user_raw)
@@ -686,12 +703,17 @@ class ShortTermMemory:
         self.messages = []
         logger.info("Short-term memory cleared")
 
-    def truncate_last_turn(self, expect: str | None = None) -> int:
+    def truncate_last_turn(
+        self, expect: str | None = None, turn_id: str | None = None
+    ) -> int:
         """删除最后一轮对话（助手 + 提问的用户），返回删除条数。
 
         历史以用户提问结尾（例如回答过程中被停止）时只删除该条提问。
         ``expect`` 不为 None 时先校验最后一条用户提问的内容，不一致则不做修改
-        （例如这条提问并未真正写入）。
+        （例如这条提问并未真正写入）。``turn_id`` 为非空字符串且该提问带
+        ``metadata.client_turn_id`` 时要求两者一致——另一实例正在生成同文本
+        提问时，只按内容匹配会误删对方的轮次；消息没有回合 id（长期记忆回填 /
+        旧数据 / CLI）或 turn_id 为空串时退回内容校验，不因缺 id 拒删。
         """
         if not self.messages:
             return 0
@@ -704,6 +726,20 @@ class ShortTermMemory:
         ):
             count = 2
             last_user = self.messages[-2]
+        if isinstance(turn_id, str) and turn_id:
+            if last_user is None:
+                return 0
+            metadata = last_user.get("metadata")
+            got = (
+                str(metadata.get("client_turn_id") or "")
+                if isinstance(metadata, dict)
+                else ""
+            )
+            # 消息没有回合 id（回填 / 旧数据 / CLI）时退回内容校验；空串
+            # turn_id 视为「无回合 id」（与 Redis Lua 口径一致）
+            if got and got != str(turn_id):
+                logger.info("Skip truncating last turn: turn id mismatch")
+                return 0
         if expect is not None:
             if last_user is None:
                 return 0
@@ -766,7 +802,8 @@ class RedisShortTermMemory:
         # 成功的写入也镜像一份，故障切换时上下文与删除操作仍然正确。
         self._fallback = ShortTermMemory(max_turns=max_turns)
         # 故障期变更记入按会话键共享的操作日志（见 _PendingJournal）：
-        # ("add", (JSON 项, op_id, 内容指纹, 模式)) / ("truncate", (expect, op_id, cutoff)) /
+        # ("add", (JSON 项, op_id, 内容指纹, 模式)) /
+        # ("truncate", (expect, op_id, cutoff, turn_id)) /
         # ("remove", [JSON 项]) / ("clear", cutoff)，恢复后按发生顺序重放。
         # 只补写新增会在恢复后复活已删除的轮次；按影子缓存整键重写会丢掉
         # 其它实例在故障期间写入、而本对象从未见过的消息。
@@ -1010,7 +1047,8 @@ class RedisShortTermMemory:
             del ops[:consumed]
             return
         if kind == "truncate":
-            expect, op_id, cutoff = payload
+            expect, op_id, cutoff, *rest = payload
+            turn_id = rest[0] if rest else None
             result = int(
                 self.client.eval(
                     _TRUNCATE_LAST_TURN_LUA,
@@ -1021,6 +1059,7 @@ class RedisShortTermMemory:
                     (expect or "").strip(),
                     str(_OP_MARKER_TTL_SEC),
                     cutoff or "",
+                    turn_id or "",
                 )
                 or 0
             )
@@ -1271,14 +1310,19 @@ class RedisShortTermMemory:
         self._fallback.clear()
         logger.info("Redis short-term memory cleared: %s", self.key)
 
-    def truncate_last_turn(self, expect: str | None = None) -> int:
+    def truncate_last_turn(
+        self, expect: str | None = None, turn_id: str | None = None
+    ) -> int:
         """删除 Redis 中最后一轮对话，返回删除条数（保留的条目 TTL 不变）。
 
         使用 Lua 脚本把「读取最后两条 → 判断 → 裁剪」放在一次原子调用里，
         避免与其它进程 / worker 追加消息的写入交错后裁错条目；``expect`` 不为
-        None 时内容不一致则不修改。在线调用与故障重放使用同一个一次性标记
-        （op_id）：脚本已在服务端执行但响应丢失时，重放会凭标记直接跳过，
-        不会把上一轮同文本的对话再删一次。
+        None 时内容不一致则不修改；``turn_id`` 为非空字符串且末尾用户消息带
+        ``metadata.client_turn_id`` 时要求两者一致（另一实例正在生成同文本
+        提问时，只按内容匹配会误删对方的轮次；消息没有回合 id 时退回内容
+        校验）。在线调用与故障重放使用同一个一次性标记（op_id）：脚本已在
+        服务端执行但响应丢失时，重放会凭标记直接跳过，不会把上一轮同文本的
+        对话再删一次。
         """
         removed: list[dict[str, Any]] = []
         op_id = uuid.uuid4().hex
@@ -1286,7 +1330,7 @@ class RedisShortTermMemory:
 
         def fallback() -> int:
             tail = self._fallback.messages[-2:]
-            count = self._fallback.truncate_last_turn(expect)
+            count = self._fallback.truncate_last_turn(expect, turn_id)
             if count:
                 # 记录从影子缓存删除的完整消息，恢复后按项精确删除
                 removed[:] = tail[len(tail) - count:]
@@ -1310,7 +1354,9 @@ class RedisShortTermMemory:
                 # 恢复后按「发起时刻之前」条件删除末尾轮次——有内容校验时
                 # 还需内容一致；没有校验时只靠 cutoff，迟到的重放不会误删
                 # 故障期间其它实例新写入的轮次
-                self._append_op(journal, "truncate", (expect, op_id, cutoff))
+                self._append_op(
+                    journal, "truncate", (expect, op_id, cutoff, turn_id)
+                )
 
         raw, via_redis = self._call_redis(
             lambda: self.client.eval(
@@ -1326,6 +1372,8 @@ class RedisShortTermMemory:
                 # 与故障重放的判定口径一致（此前在线传空串，跨实例并发
                 # 删除最后一轮可能删掉刚写入的新一轮）
                 cutoff,
+                # 回合 id：跨实例精确区分「同一文本的不同回合」
+                (turn_id or ""),
             ),
             fallback,
             on_failure,

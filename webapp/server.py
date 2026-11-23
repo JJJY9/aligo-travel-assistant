@@ -4871,15 +4871,19 @@ def create_app(model: Any = None) -> FastAPI:
                 def _truncate_short_term() -> None:
                     # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
                     # Redis 键按 user_id + session_id 隔离，未缓存的会话也可安全清理。
+                    # turn_id 一并传入：另一实例正在生成同文本提问时，只按
+                    # 内容匹配会删掉对方的轮次
                     session = state.sessions.get(
                         state._session_key(user_id, session_id)
                     )
                     if session is not None:
-                        session.runtime.memory.short_term.truncate_last_turn(expect)
+                        session.runtime.memory.short_term.truncate_last_turn(
+                            expect, turn_id
+                        )
                     else:
                         create_short_term_memory(
                             session_id, user_id=user_id
-                        ).truncate_last_turn(expect)
+                        ).truncate_last_turn(expect, turn_id)
 
                 try:
                     await asyncio.to_thread(_truncate_short_term)
