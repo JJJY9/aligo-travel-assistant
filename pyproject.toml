@@ -138,3 +138,27 @@ webapp = ["static/*"]
 ".claude/skills/query-info/script" = [
     ".claude/skills/query-info/script/agent.py",
 ]
+".claude/skills/trip-budget" = [".claude/skills/trip-budget/SKILL.md"]
+".claude/skills/trip-budget/script" = [
+    ".claude/skills/trip-budget/script/agent.py",
+]
+".claude/skills/packing-list" = [".claude/skills/packing-list/SKILL.md"]
+".claude/skills/packing-list/script" = [
+    ".claude/skills/packing-list/script/agent.py",
+]
+".claude/skills/travel-checklist" = [".claude/skills/travel-checklist/SKILL.md"]
+".claude/skills/travel-checklist/script" = [
+    ".claude/skills/travel-checklist/script/agent.py",
+]
+".claude/skills/local-transport" = [".claude/skills/local-transport/SKILL.md"]
+".claude/skills/local-transport/script" = [
+    ".claude/skills/local-transport/script/agent.py",
+]
+".claude/skills/safety-tips" = [".claude/skills/safety-tips/SKILL.md"]
+".claude/skills/safety-tips/script" = [
+    ".claude/skills/safety-tips/script/agent.py",
+]
+".claude/skills/trip-notes" = [".claude/skills/trip-notes/SKILL.md"]
+".claude/skills/trip-notes/script" = [
+    ".claude/skills/trip-notes/script/agent.py",
+]

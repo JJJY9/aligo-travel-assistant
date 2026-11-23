@@ -88,6 +88,13 @@ def test_skill_scripts_discovers_agents():
         "plan-trip",
         "preference",
         "query-info",
+        # v2.0 扩展技能（6 个轻量提示技能，共 12 个）
+        "trip-budget",
+        "packing-list",
+        "travel-checklist",
+        "local-transport",
+        "safety-tips",
+        "trip-notes",
     }
     assert scripts["plan-trip"].is_file()
     assert skill_scripts(root / "missing") == {}

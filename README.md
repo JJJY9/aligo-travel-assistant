@@ -742,13 +742,19 @@ aligo-travel-assistant/
 │   ├── orchestration_agent.py       # 协调器（优先级 + 并行调度）
 │   ├── lazy_agent_registry.py       # 智能体插件注册器（懒加载）
 │   └── conversation.py              # 对话运行时（Web 界面的完整流水线）
-├── .claude/skills/                  # Skill Plugins（子智能体）
+├── .claude/skills/                  # Skill Plugins（12 个子智能体 / 技能）
 │   ├── ask-question/                # RAG 知识库问答（含文档与向量库）
 │   ├── event-collection/            # 事项收集
 │   ├── plan-trip/                   # 行程规划
 │   ├── preference/                  # 偏好管理
 │   ├── query-info/                  # 联网信息查询
-│   └── memory-query/                # 记忆查询
+│   ├── memory-query/                # 记忆查询
+│   ├── trip-budget/                 # 预算建议（v2.0）
+│   ├── packing-list/                # 行李清单（v2.0）
+│   ├── travel-checklist/            # 行前检查清单（v2.0）
+│   ├── local-transport/             # 市内交通建议（v2.0）
+│   ├── safety-tips/                 # 安全提醒（v2.0）
+│   └── trip-notes/                  # 差旅贴士（v2.0）
 ├── context/                         # 两层记忆（可插拔后端）
 │   ├── memory_manager.py            # 记忆管理器（统一门面）
 │   ├── storage.py                   # 存储工厂（Redis / PostgreSQL 自动启用与回退）
