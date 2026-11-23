@@ -5911,7 +5911,10 @@ def create_app(model: Any = None) -> FastAPI:
 
         # 原始备份与「导入空库」的分片计划都要可导入：前者是导入端规划前
         # 的硬上限，后者覆盖长文档重切分后的真实恢复体积
-        limit_problem = export_backup_limit_problem(backup)
+        warnings: dict[str, object] = {}
+        limit_problem = export_backup_limit_problem(
+            backup, warning_out=warnings
+        )
         if limit_problem:
             raise HTTPException(
                 status_code=413,
@@ -5921,13 +5924,19 @@ def create_app(model: Any = None) -> FastAPI:
                 ),
             )
         payload = json.dumps(backup, ensure_ascii=False, indent=2)
+        headers = {
+            "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"',
+            **rate_headers,
+        }
+        skipped = warnings.get("knowledge_skipped_count")
+        if skipped:
+            # 文件仍可导出（用户数据可恢复），但部分知识行恢复时会被跳过；
+            # 面板 / 脚本可据响应头提示（正文是备份文件，不能混入额外字段）
+            headers["X-Knowledge-Skipped"] = str(skipped)
         return Response(
             content=payload,
             media_type="application/json",
-            headers={
-                "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"',
-                **rate_headers,
-            },
+            headers=headers,
         )
 
     @app.post("/api/import")

@@ -3216,13 +3216,17 @@ def run_user_export_standalone(
     # 按 LF 估算，CLI 与 Web 导出同字节、同口径。原始备份与「导入空库」
     # 的知识分片计划都要可导入：前者是导入端规划前的硬上限，后者覆盖
     # 长文档重切分后的真实恢复体积。
-    problem = export_backup_limit_problem(data)
+    warnings: dict[str, object] = {}
+    problem = export_backup_limit_problem(data, warning_out=warnings)
     if problem:
         print(
             f"导出中止：{problem}（该文件将无法再导入恢复，"
             "请先清理部分旧会话 / 行程后重试）"
         )
         return 1
+    warning = str(warnings.get("knowledge_skipped") or "")
+    if warning:
+        print(f"警告：{warning}", file=sys.stderr)
 
     out_dir = Path(target_dir) if target_dir else Path("exports")
     try:

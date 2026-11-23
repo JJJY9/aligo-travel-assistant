@@ -5231,6 +5231,34 @@ def test_import_documents_ignore_existing_returns_all_pieces(monkeypatch):
     print("✓ ignore_existing 真实分支返回全部分片且不扫库")
 
 
+def test_export_volume_warning_for_skipped_knowledge(monkeypatch):
+    """导出体积通过但规划会跳过知识行时，回填恢复提示与计数。"""
+    from utils import knowledge_admin, user_import
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "import_documents",
+        lambda rows, dry_run=False, return_pieces=False, **kwargs: {
+            "pieces": [{"content": "可恢复", "metadata": {}}],
+            "skipped_invalid": 2,
+            "skipped_groups": [{"group": "g", "reason": "缺片", "parts": 1}],
+            "skipped_conflict": 1,
+        },
+    )
+    warning: dict = {}
+    problem = user_import.export_backup_limit_problem(
+        {
+            "chat_history": [],
+            "knowledge": [{"content": "旧行", "metadata": {}}],
+        },
+        warning_out=warning,
+    )
+    assert problem is None
+    assert warning["knowledge_skipped_count"] == 4, warning
+    assert "4 条" in warning["knowledge_skipped"]
+    print("✓ 导出提示恢复时会跳过的知识行")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
