@@ -115,6 +115,56 @@ def test_priority_parallel_and_sequential():
     print("✓ 同优先级并行、不同优先级串行")
 
 
+def test_dag_dependency_overrides_llm_priority():
+    """行程规划即使被 LLM 标成更高优先级，也必须排在事项收集之后。"""
+    order: list[str] = []
+
+    class Recorder(_StubAgent):
+        async def reply(self, x):
+            order.append(f"start:{self.name}")
+            await asyncio.sleep(0.03)
+            order.append(f"end:{self.name}")
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "event_collection": Recorder("event_collection"),
+            "itinerary_planning": Recorder("itinerary_planning"),
+        }
+    )
+    schedule = [
+        {"agent_name": "itinerary_planning", "priority": 1},
+        {"agent_name": "event_collection", "priority": 3},
+    ]
+    asyncio.run(orchestrator.reply(_intent(schedule)))
+    assert order.index("start:itinerary_planning") > order.index(
+        "end:event_collection"
+    ), order
+    print("✓ DAG 依赖优先于 LLM 计划优先级")
+
+
+def test_aggregate_results_surfaces_missing_info():
+    """事项收集的缺失信息随聚合结果返回，并生成补充提示。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "destination": "杭州",
+                    "missing_info": ["返程日期", {"field": "预算"}],
+                },
+            },
+        }
+    ]
+    aggregated = orchestrator._aggregate_results(results, {})
+    assert aggregated["missing_info"] == ["返程日期", "预算"]
+    assert "请补充" in aggregated["clarification"]
+    print("✓ 聚合结果携带缺失信息澄清")
+
+
 def test_retry_cache_reuses_completed_agents():
     """整轮重试复用首轮已完成的智能体：只重跑失败的那个，不重复计费。"""
     calls = {"a": 0, "b": 0}

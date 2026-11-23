@@ -113,6 +113,11 @@ def _load_executor_for(agent_name: str) -> ThreadPoolExecutor:
 
 # 行程规划依赖事项收集与偏好抽取的结果：两者同批时规划拿不到这些上下文
 _PLANNING_DEPENDENCIES = {"event_collection", "preference"}
+# v2.0 固定 DAG：依赖方必须在依赖项之后一批执行（LLM 给的优先级只会
+# 在满足 DAG 的前提下生效，可能被上调、不会被下调）
+_AGENT_DEPENDENCIES: dict[str, set[str]] = {
+    "itinerary_planning": set(_PLANNING_DEPENDENCIES),
+}
 
 # 技能智能体通常把 LLM / 网络异常吞成 {"error": ...} 返回，外层重试等不到
 # 异常；识别这些瞬时错误标记并重新抛出，走与真实异常相同的退避重试
@@ -483,19 +488,29 @@ class OrchestrationAgent(AgentBase):
                 }
             ]
 
-        dependency_priorities = [
-            task["priority"]
-            for task in agent_schedule
-            if _canonical(task) in _PLANNING_DEPENDENCIES
-        ]
-        if dependency_priorities:
-            planning_floor = max(dependency_priorities) + 1
-            for task in agent_schedule:
+        # 固定 DAG：依赖方必须在依赖项之后一批执行。LLM 给的优先级只在
+        # 满足 DAG 的前提下生效（只会被上调，不会被下调）；迭代到不再
+        # 变化，传递依赖同样成立。没有依赖的任务保持模型给的优先级。
+        canonical_schedule = [(task, _canonical(task)) for task in agent_schedule]
+        for _ in range(len(agent_schedule)):
+            changed = False
+            for task, canonical in canonical_schedule:
+                dependencies = _AGENT_DEPENDENCIES.get(canonical, set())
+                if not dependencies:
+                    continue
+                dependency_priorities = [
+                    other["priority"]
+                    for other, other_canonical in canonical_schedule
+                    if other_canonical in dependencies
+                ]
                 if (
-                    _canonical(task) == "itinerary_planning"
+                    dependency_priorities
                     and task["priority"] <= max(dependency_priorities)
                 ):
-                    task["priority"] = planning_floor
+                    task["priority"] = max(dependency_priorities) + 1
+                    changed = True
+            if not changed:
+                break
         if not agent_schedule:
             return Msg(
                 name=self.name,
@@ -1150,6 +1165,42 @@ class OrchestrationAgent(AgentBase):
         if errors:
             aggregated["status"] = "partial_failure"
             aggregated["errors"] = len(errors)
+
+        # v2.0：事项收集的缺失信息随结果返回（不阻断规划，前端 / CLI 可
+        # 提示用户补充；字段归一兼容字符串与 {field/name/description} 对象）
+        missing: list[str] = []
+        for result in results:
+            if (
+                canonical_agent_name(str(result.get("agent_name") or ""))
+                != "event_collection"
+            ):
+                continue
+            data = (result.get("result") or {}).get("data") or {}
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                data = {
+                    **data["data"],
+                    **{key: value for key, value in data.items() if key != "data"},
+                }
+            info = data.get("missing_info") if isinstance(data, dict) else None
+            if not isinstance(info, list):
+                continue
+            for item in info:
+                if isinstance(item, dict):
+                    text = str(
+                        item.get("field")
+                        or item.get("name")
+                        or item.get("description")
+                        or ""
+                    ).strip()
+                else:
+                    text = str(item).strip()
+                if text and text not in missing:
+                    missing.append(text)
+        if missing:
+            aggregated["missing_info"] = missing[:8]
+            aggregated["clarification"] = (
+                "为更准确规划，请补充：" + "、".join(missing[:8])
+            )
 
         return aggregated
 
