@@ -165,6 +165,9 @@ class ConversationRuntime:
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         settlement = settlement if settlement is not None else {"done": False}
+        # 新一轮开始即失效上一轮的落库成功标记：若本轮在落库前失败，
+        # 断连路径不能把上一轮同文本的成功误当成这一轮已落库
+        self._last_persist_committed = None
         # 本轮开始时的会话纪元：必须在任何 await（上下文总结 / 意图 LLM
         # 重试可达数十秒）之前读取，否则这段窗口内的删除（纪元 +1 后
         # 「从未存在」路径撤销墓碑）会让落库守卫比较到删除后的值而放行，
