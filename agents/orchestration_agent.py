@@ -915,16 +915,45 @@ class OrchestrationAgent(AgentBase):
             logger.debug("Progress callback failed", exc_info=True)
 
     def _checkpoint_store_for_turn(self):
-        """本轮检查点存储（懒加载）；未提供键时返回 None。"""
+        """本轮检查点存储（懒加载）；未提供键或初始化失败时返回 None。
+
+        构造可能因磁盘 / 权限失败：必须按「检查点失败只记日志、不阻断
+        对话」的承诺吞掉，否则持久化执行反而让每一轮都 500。
+        """
         if not getattr(self, "_checkpoint_key", None):
             return None
         store = getattr(self, "_checkpoint_store", None)
         if store is None:
-            from utils.execution_checkpoint import CheckpointStore
+            try:
+                from utils.paths import default_data_root
 
-            store = CheckpointStore("data/runtime/checkpoints")
+                from utils.execution_checkpoint import CheckpointStore
+
+                store = CheckpointStore(
+                    default_data_root() / "runtime" / "checkpoints"
+                )
+            except Exception as exc:  # noqa: BLE001 - 检查点不可用不影响对话
+                logger.warning("初始化执行检查点失败，跳过持久化: %s", exc)
+                return None
             self._checkpoint_store = store
         return store
+
+    def clear_checkpoint(self) -> None:
+        """整轮成功落库后丢弃本轮检查点。
+
+        检查点只服务于同一轮的重试 / 重启；回合已完整落库后再用同一键
+        请求（前端复用 client_turn_id 或客户端 bug）必须重新执行，不能
+        静默返回上一问缓存的子智能体结果。
+        """
+        key = getattr(self, "_checkpoint_key", None)
+        store = getattr(self, "_checkpoint_store", None)
+        self._checkpoint_key = None
+        if not key or store is None:
+            return
+        try:
+            store.clear(key)
+        except Exception as exc:  # noqa: BLE001 - 清理失败不影响对话
+            logger.warning("清理执行检查点失败: %s", exc)
 
     async def _execute_agent(
         self,

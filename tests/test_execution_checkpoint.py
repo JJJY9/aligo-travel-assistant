@@ -1,10 +1,11 @@
 """执行检查点存储测试（v2.0，纯 Python）。
 
 覆盖：落盘 / 读取、步骤合并、TTL 过期、损坏文件清理、条目上限、
-键哈希（不把原始 key 用作路径）与清除。
+目录/键哈希（不把原始 key 用作路径或写入文件）与清除。
 
 运行：python tests/test_execution_checkpoint.py
 """
+import hashlib
 import os
 import shutil
 import sys
@@ -29,7 +30,8 @@ def test_save_load_roundtrip_and_step_merge():
         store.save("u1:s1:req1", {"status": "running"})
         state = store.load("u1:s1:req1")
         assert state["status"] == "running"
-        assert state["key"] == "u1:s1:req1"
+        assert state["key_hash"] == hashlib.sha256(b"u1:s1:req1").hexdigest()
+        assert "key" not in state, "原始键（含用户 / 会话标识）不能写进检查点文件"
         store.update_step("u1:s1:req1", "event_collection", {"origin": "北京"})
         store.update_step("u1:s1:req1", "preference", {"hotel": "汉庭"})
         state = store.load("u1:s1:req1")
@@ -96,6 +98,58 @@ def test_key_is_hashed_on_disk():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_raw_key_not_written_to_disk():
+    store, root = _store()
+    try:
+        tricky = "user-秘密:session-1:turn-1"
+        store.save(tricky, {"status": "ok"})
+        raw = next(Path(root).glob("*.json")).read_text(encoding="utf-8")
+        assert "秘密" not in raw, "用户标识不能落盘"
+        assert "session-1" not in raw, "会话标识不能落盘"
+        assert store.load(tricky)["status"] == "ok"
+        print("✓ 检查点文件不写入原始键")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_default_root_follows_data_dir():
+    old = os.environ.get("ALIGO_DATA_DIR")
+    root = tempfile.mkdtemp(prefix="chailv_ckpt_env_")
+    os.environ["ALIGO_DATA_DIR"] = root
+    try:
+        store = CheckpointStore()
+        assert store.root == Path(root) / "runtime" / "checkpoints"
+        assert store.root.is_dir()
+        print("✓ 默认检查点目录跟随数据根目录")
+    finally:
+        if old is None:
+            os.environ.pop("ALIGO_DATA_DIR", None)
+        else:
+            os.environ["ALIGO_DATA_DIR"] = old
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_init_prunes_expired_and_stale_temp():
+    root = tempfile.mkdtemp(prefix="chailv_ckpt_init_")
+    try:
+        store = CheckpointStore(root=root, ttl_sec=10)
+        store.save("old", {"status": "ok"})
+        path = next(Path(root).glob("*.json"))
+        stale_ts = time.time() - 3600
+        os.utime(path, (stale_ts, stale_ts))
+        stale_tmp = Path(root) / ".stale.json.abc.tmp"
+        stale_tmp.write_text("{}", encoding="utf-8")
+        os.utime(stale_tmp, (stale_ts, stale_ts))
+        # 进程重启（同目录重建）：初始化就要清理过期检查点与崩溃遗留的
+        # 临时文件，而不是等下一次写入才淘汰
+        CheckpointStore(root=root, ttl_sec=10)
+        assert not path.exists(), "过期检查点应在初始化时清理"
+        assert not stale_tmp.exists(), "崩溃遗留的临时文件应在初始化时清理"
+        print("✓ 初始化清理过期 / 临时检查点")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -105,4 +159,7 @@ if __name__ == "__main__":
     test_corrupted_file_is_cleaned()
     test_max_entries_prunes_oldest()
     test_key_is_hashed_on_disk()
+    test_raw_key_not_written_to_disk()
+    test_default_root_follows_data_dir()
+    test_init_prunes_expired_and_stale_temp()
     print("\n全部通过")

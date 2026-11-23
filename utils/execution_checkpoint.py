@@ -1,10 +1,12 @@
 """执行检查点存储（v2.0 持久化执行的基础设施）。
 
-按幂等键把一轮编排的中间结果落盘（默认 ``data/runtime/checkpoints``），
-供进程重启 / 失败重试时复用已完成的子智能体结果，避免重复调用模型。
+按幂等键把一轮编排的中间结果落盘（默认数据目录下的
+``runtime/checkpoints``），供进程重启 / 失败重试时复用已完成的子智能体
+结果，避免重复调用模型。
 
 设计：
-- 每个键一个 JSON 文件（文件名 = SHA-256(key)），内容含原始 key 便于排查；
+- 每个键一个 JSON 文件（文件名 = SHA-256(key)），内容只存键哈希：键里
+  带用户 / 会话标识，落盘原始值等于把个人数据写进运行期文件；
 - 原子写：同目录临时文件 → fsync → ``os.replace``；
 - TTL + 最大条目数：读取过期文件视为不存在并清理，写入后按 mtime 淘汰；
 - 损坏文件按不存在处理并移出（不阻断调用方）；
@@ -23,6 +25,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from utils.paths import default_data_root
+
 DEFAULT_TTL_SEC = 3600.0
 DEFAULT_MAX_ENTRIES = 256
 
@@ -32,15 +36,23 @@ class CheckpointStore:
 
     def __init__(
         self,
-        root: str | Path = "data/runtime/checkpoints",
+        root: str | Path | None = None,
         ttl_sec: float = DEFAULT_TTL_SEC,
         max_entries: int = DEFAULT_MAX_ENTRIES,
     ) -> None:
-        self.root = Path(root)
+        # 默认路径必须跟长期数据目录走：此前是 CWD 相对字面量，从其它目录
+        # 启动时检查点散落在任意工作目录，且默认路径不在 .gitignore 里
+        self.root = (
+            Path(root) if root is not None
+            else default_data_root() / "runtime" / "checkpoints"
+        )
         self.ttl_sec = max(0.0, float(ttl_sec))
         self.max_entries = max(1, int(max_entries))
         self._lock = threading.Lock()
         self.root.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._clean_temp_files()
+            self._prune()
 
     # ---------- 内部工具 ----------
 
@@ -94,6 +106,41 @@ class CheckpointStore:
             except OSError:
                 pass
 
+    def _clean_temp_files(self) -> None:
+        """清理崩溃 / 断电遗留的临时文件（调用方已持有 ``self._lock``）。"""
+        cutoff = time.time() - max(self.ttl_sec, 60.0)
+        for path in self.root.glob(".*.tmp"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+
+    def _payload(self, key: str, state: dict[str, Any]) -> dict[str, Any]:
+        """落盘负载：只留键哈希，不把含用户 / 会话标识的原始键写进文件。"""
+        return {**state, "key_hash": self._digest(key)}
+
+    def _write_unlocked(self, key: str, state: dict[str, Any]) -> None:
+        """原子写入（调用方已持有 ``self._lock``）。"""
+        path = self._path(key)
+        payload = self._payload(key, state)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=self.root
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        except Exception:
+            try:
+                Path(temp_name).unlink()
+            except OSError:
+                pass
+            raise
+        self._prune()
+
     def _load_unlocked(self, key: str) -> dict[str, Any] | None:
         """调用方已持有 ``self._lock`` 时使用。"""
         path = self._path(key)
@@ -116,25 +163,8 @@ class CheckpointStore:
 
     def save(self, key: str, state: dict[str, Any]) -> None:
         """原子写入检查点（整份状态）。"""
-        payload = {"key": str(key), **state}
-        path = self._path(key)
         with self._lock:
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=self.root
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, ensure_ascii=False)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp_name, path)
-            except Exception:
-                try:
-                    Path(temp_name).unlink()
-                except OSError:
-                    pass
-                raise
-            self._prune()
+            self._write_unlocked(key, state)
 
     def update_step(self, key: str, step: str, result: Any) -> None:
         """记录某个子步骤的结果（读-改-写在进程锁内完成）。"""
@@ -145,25 +175,7 @@ class CheckpointStore:
                 steps = {}
             steps[str(step)] = result
             state["steps"] = steps
-            # 已持有进程锁：直接构造 payload 落盘（不能再调用 load）
-            payload = {"key": str(key), **state}
-            path = self._path(key)
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=self.root
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, ensure_ascii=False)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp_name, path)
-            except Exception:
-                try:
-                    Path(temp_name).unlink()
-                except OSError:
-                    pass
-                raise
-            self._prune()
+            self._write_unlocked(key, state)
 
     def clear(self, key: str) -> None:
         with self._lock:
