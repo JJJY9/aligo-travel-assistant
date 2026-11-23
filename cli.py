@@ -2219,6 +2219,119 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
     return 0
 
 
+def _parse_eval_cases_args(
+    args: list[str],
+) -> tuple[int, int, str | None, bool] | None:
+    """解析 eval-cases 的 ``[--count N] [--seed N] [--out PATH] [--json]``。"""
+    count = 500
+    seed = 7
+    out_path: str | None = None
+    as_json = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        lowered = item.lower()
+        if lowered == "--json":
+            as_json = True
+        elif lowered == "--count" or lowered.startswith("--count="):
+            if lowered == "--count":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--count="):]
+            if not re.fullmatch(r"[0-9]{1,4}", value):
+                return None
+            count = int(value)
+            if count > 5000:
+                return None
+        elif lowered == "--seed" or lowered.startswith("--seed="):
+            if lowered == "--seed":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--seed="):]
+            if not re.fullmatch(r"[0-9]{1,10}", value):
+                return None
+            seed = int(value)
+        elif lowered == "--out" or lowered.startswith("--out="):
+            if lowered == "--out":
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            else:
+                value = item[len("--out="):]
+            if not value.strip() or value.startswith("-"):
+                return None
+            out_path = value
+        else:
+            return None
+        index += 1
+    return count, seed, out_path, as_json
+
+
+def run_eval_cases_standalone(
+    count: int = 500,
+    seed: int = 7,
+    out_path: str | None = None,
+    as_json: bool = False,
+) -> int:
+    """生成分层评测用例（`python cli.py eval-cases`），可选写入 JSONL。
+
+    Returns:
+        0 生成成功；1 参数 / 写入失败
+    """
+    from pathlib import Path
+
+    from utils.eval_cases import build_cases, dump_cases
+
+    try:
+        cases = build_cases(count, seed)
+        if out_path:
+            dump_cases(out_path, cases)
+    except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"生成评测用例失败：{exc}"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"生成评测用例失败：{exc}")
+        return 1
+
+    categories: dict[str, int] = {}
+    for case in cases:
+        name = str(case.get("category") or "未分类")
+        categories[name] = categories.get(name, 0) + 1
+    payload: dict[str, object] = {
+        "ok": True,
+        "count": len(cases),
+        "seed": seed,
+        "categories": dict(sorted(categories.items())),
+    }
+    if out_path:
+        payload["path"] = str(Path(out_path))
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(
+        f"已生成 {len(cases)} 条评测用例"
+        f"（seed={seed}，{len(categories)} 类）"
+    )
+    for name, number in sorted(categories.items()):
+        print(f"  {name}: {number}")
+    if out_path:
+        print(f"已写入：{out_path}")
+    return 0
+
+
 def run_knowledge_export_standalone(
     target: str | None = None, force: bool = False, to_stdout: bool = False
 ) -> int:
@@ -6642,7 +6755,8 @@ def _parse_export_args(
 
 
 _COMMANDS_HINT = (
-    "可用命令：health / doctor / skills / weather / stats / kb / eval / kb-export / "
+    "可用命令：health / doctor / skills / weather / stats / kb / eval / eval-cases / "
+    "kb-export / "
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
     "preferences / pref-set / pref-delete / "
@@ -6758,6 +6872,24 @@ def _main_impl():
             sys.exit(
                 run_rag_eval_standalone(
                     as_json=eval_json, min_hit5=eval_min_hit5
+                )
+            )
+        if arg == "eval-cases":
+            parsed_cases = _parse_eval_cases_args(sys.argv[2:])
+            if parsed_cases is None:
+                _cli_fail(
+                    "用法：python cli.py eval-cases "
+                    "[--count 500] [--seed 7] [--out PATH] [--json]",
+                    _args_have_json(sys.argv[2:]),
+                )
+                sys.exit(2)
+            cases_count, cases_seed, cases_out, cases_json = parsed_cases
+            sys.exit(
+                run_eval_cases_standalone(
+                    count=cases_count,
+                    seed=cases_seed,
+                    out_path=cases_out,
+                    as_json=cases_json,
                 )
             )
         if arg == "kb-export":

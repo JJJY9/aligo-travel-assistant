@@ -534,6 +534,7 @@ python cli.py
 知识库状态（不进入交互）：`python cli.py kb`，输出集合名 / 片段数与数据库路径，退出码 0/1；`--json` 输出完整状态对象（`available` / `collection` / `documents` / `path` / `reason`）。
 
 知识库检索评测（不进入交互、不调用大模型）：`python cli.py eval`，对 14 个差旅问题计算 hit@1 / hit@3 / hit@5 与 MRR（当前基线：hit@5 100%，MRR 0.80），hit@5 低于 80% 时退出码 1；知识库未初始化时提示跳过。`--json` 输出完整指标对象（`ok` / `skipped` / `threshold` / `hit@K` / `mrr` / `rows`），便于 CI 或脚本回归。
+评测用例生成（不进入交互、不调用大模型）：`python cli.py eval-cases [--count 500] [--seed 7] [--out cases.jsonl] [--json]` 按 12 类场景模板确定性生成分层评测用例，可选写入 JSONL，供 `utils/eval_harness.py` 的规则 + Judge 回归使用。
 
 知识库导出 / 导入（不进入交互）：`python cli.py kb-export [path] [--stdout] [--force]` 导出全部片段为 JSON（默认 `exports/knowledge-export.json`，已存在时需 `--force` 覆盖；`--stdout` 直接打印到标准输出、与路径互斥）；`python cli.py kb-import <file.json> [--dry-run] [--json]` 批量导入（`--dry-run` 只校验 / 去重并报告将导入的数量，不加载嵌入模型；`--json` 输出结构化结果与跳过原因，供脚本消费；CLI 不限条数，Web 接口单次最多 20000 条（多分片组整组同批，请求体 2 MB 上限）），适合备份、换机与批量补充知识。
 
