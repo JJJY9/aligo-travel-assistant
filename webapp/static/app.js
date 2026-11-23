@@ -5646,6 +5646,13 @@ async function importKnowledgeFile() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ documents }),
       });
+      // 预览已判定越过全局导出上限：导入必被服务端拒绝，先提示原因
+      // （先删除旧片段再导入），不进入确认 / 分批上传
+      const limitProblem = String(preview.export_limit_problem || "");
+      if (limitProblem) {
+        toast(limitProblem);
+        return;
+      }
       const wouldImport = Number(preview.would_import || 0);
       const skippedText = knowledgeImportSkipSummary(preview);
       confirmText = `将导入 ${wouldImport} 条知识片段${skippedText}？`;

@@ -154,6 +154,51 @@ def test_export_sanitizes_non_finite(monkeypatch):
     print("✓ kb-export 清洗非有限数（标准 JSON 可回读）")
 
 
+def test_import_dry_run_surfaces_export_limit_problem(monkeypatch):
+    """--dry-run 越过全局导出上限时必须给出原因（JSON 字段 / stderr 告警），
+    与真实导入的拒绝结论一致（不能 ok=true 静默放行）。"""
+    problem_text = "全局知识库将达 50002 条、超过导出上限 50000 条"
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "import_documents",
+        lambda documents, dry_run=False, **kwargs: {
+            "imported": 0,
+            "skipped": 0,
+            "skipped_invalid": 0,
+            "skipped_duplicate": 0,
+            "skipped_conflict": 0,
+            "would_import": 1,
+            "export_limit_problem": problem_text,
+        },
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "docs.json"
+        source.write_text(
+            json.dumps({"documents": [{"content": "新知识", "metadata": {}}]}),
+            encoding="utf-8",
+        )
+        code, out = _capture(
+            cli.run_knowledge_import_standalone,
+            str(source),
+            dry_run=True,
+            as_json=True,
+        )
+        assert code == 0, out
+        payload = json.loads(out)
+        assert payload["dry_run"] is True
+        assert problem_text in payload.get("export_limit_problem", ""), payload
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ):
+            code = cli.run_knowledge_import_standalone(str(source), dry_run=True)
+        assert code == 0
+        assert "会被拒绝" in err.getvalue(), err.getvalue()
+    print("✓ kb-import --dry-run 越限时给出原因（与真实导入同结论）")
+
+
 def test_export_to_stdout_writes_no_file(monkeypatch):
     """--stdout 直接打印 JSON，不写入任何文件。"""
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
@@ -622,6 +667,7 @@ if __name__ == "__main__":
         test_import_rejects_non_utf8_file,
         test_import_large_file_not_capped,
         test_import_dry_run,
+        test_import_dry_run_surfaces_export_limit_problem,
         test_import_reports_skip_reasons,
         test_import_all_invalid_or_conflict_exits_nonzero,
         test_import_all_duplicate_still_succeeds,

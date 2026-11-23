@@ -510,6 +510,148 @@ def test_import_documents_sanitizes(monkeypatch):
     print("✓ 导入知识片段（空项 / 非字符串跳过，超长按无效项，长内容拆分）")
 
 
+def test_import_documents_enforces_export_row_limit(monkeypatch):
+    """全局知识库不得越过导出上限：真实导入在写入前拒绝，预览回填原因。"""
+    from pathlib import Path
+
+    from utils import user_import
+
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: {})
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    # 已有 3 条、上限收紧到 4：本次导入 2 条会越过
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: ["a", "b", "c"]
+    )
+    monkeypatch.setattr(user_import, "_MAX_KNOWLEDGE", 4)
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+
+    docs = [{"content": "新一", "metadata": {}}, {"content": "新二", "metadata": {}}]
+    preview = knowledge_admin.import_documents(docs, dry_run=True)
+    problem = preview.get("export_limit_problem")
+    assert problem and "超过导出上限 4 条" in problem, preview
+    assert preview["would_import"] == 2, preview
+
+    with pytest.raises(ValueError) as exc:
+        knowledge_admin.import_documents(docs)
+    assert "超过导出上限" in str(exc.value)
+    assert agent.calls == [], "越限导入必须在写入前拒绝"
+
+    # 上限内放行：3 + 1 <= 4
+    result = knowledge_admin.import_documents(docs[:1])
+    assert result["imported"] == 1, result
+    print("✓ 批量导入守住全局导出上限（越限拒绝 / 预览回填原因）")
+
+
+def test_add_document_enforces_export_row_limit(monkeypatch):
+    """单条添加同样受全局上限约束（统计读取失败按旧行为放行）。"""
+    from pathlib import Path
+
+    from utils import user_import
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(user_import, "_MAX_KNOWLEDGE", 2)
+    monkeypatch.setattr(knowledge_admin, "_collection_row_count", lambda: 2)
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_get_agent",
+        lambda: pytest.fail("越限时不得加载嵌入模型"),
+    )
+    with pytest.raises(ValueError) as exc:
+        knowledge_admin.add_document("新知识")
+    assert "超过导出上限" in str(exc.value)
+
+    monkeypatch.setattr(knowledge_admin, "_collection_row_count", lambda: 1)
+    agent = _FakeAgent({"status": "success", "ids": [7], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.add_document("新知识")
+    assert result["status"] == "success" and result["id"] == 7, result
+    print("✓ 单条添加守住全局导出上限")
+
+
+def test_collection_row_count_reads_stats_and_tolerates_failure(monkeypatch):
+    """行数统计读取 row_count；读取失败按 0 放行（不阻断面板添加）。"""
+
+    class _StatsClient:
+        def load_collection(self, name):
+            pass
+
+        def get_collection_stats(self, name):
+            return {"row_count": 123}
+
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: _StatsClient())
+    assert knowledge_admin._collection_row_count() == 123
+
+    def boom():
+        raise RuntimeError("stats down")
+
+    monkeypatch.setattr(knowledge_admin, "_client", boom)
+    assert knowledge_admin._collection_row_count() == 0
+    print("✓ 行数统计读取与失败容错")
+
+
+def test_add_document_rechecks_limit_inside_write_lock(monkeypatch):
+    """锁外预检放行后并发写入可能越限：锁内必须用新统计复核并拒绝。"""
+    from pathlib import Path
+
+    from utils import user_import
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(user_import, "_MAX_KNOWLEDGE", 50000)
+    # 锁外读到 49999（放行），锁内并发添加已使库到 50000（加 1 即越限）
+    counts = iter([49999, 50000])
+    monkeypatch.setattr(
+        knowledge_admin, "_collection_row_count", lambda: next(counts)
+    )
+    agent = _FakeAgent({"status": "success", "ids": [1], "total_count": 1})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    with pytest.raises(ValueError) as exc:
+        knowledge_admin.add_document("并发添加")
+    assert "超过导出上限" in str(exc.value)
+    assert agent.calls == [], "锁内复核拒绝后不得写入"
+    print("✓ add_document 锁内复核上限（并发窗口）")
+
+
+def test_update_document_enforces_export_row_limit(monkeypatch):
+    """整组编辑按「现有 − 被替换旧分片 + 新分片」预检全局上限。"""
+    from pathlib import Path
+
+    from utils import user_import
+
+    fake_client = _FakeMilvusClient(
+        [{"id": 1, "content": "旧内容", "metadata": '{"title": "x"}'}]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(user_import, "_MAX_KNOWLEDGE", 50000)
+    # 库内恰在上限：单条编辑成长文会拆出多个分片、净增行数越限
+    monkeypatch.setattr(knowledge_admin, "_collection_row_count", lambda: 50000)
+    agent = _FakeAgent({"status": "success", "ids": [2], "total_count": 2})
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    with pytest.raises(ValueError) as exc:
+        knowledge_admin.update_document(1, "长内容" * 1000, {"title": "x"})
+    assert "超过导出上限" in str(exc.value)
+    assert agent.calls == [] and fake_client.deleted == [], (
+        "越限编辑必须在写入前拒绝"
+    )
+
+    # 上限内编辑正常执行（分片数与旧记录相同：替换不增行）
+    class _UpdateAgent:
+        def __init__(self):
+            self.calls = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.calls.append((doc_id, content, metadata))
+            return {"status": "success", "id": doc_id}
+
+    updater = _UpdateAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: updater)
+    result = knowledge_admin.update_document(1, "短内容", {"title": "x"})
+    assert result["status"] == "success" and result["id"] == 1, result
+    assert updater.calls == [(1, "短内容", {"title": "x"})]
+    print("✓ update_document 按替换净增预检全局上限")
+
+
 def test_import_duplicate_content_group_is_idempotent(monkeypatch):
     """组内两片同文且都已入库：整组跳过，不能因快照用集合而重复补写。"""
     from pathlib import Path
@@ -3511,6 +3653,11 @@ if __name__ == "__main__":
         test_import_rejects_oversized_single_content,
         test_import_dry_run_tolerates_missing_collection,
         test_import_dry_run_missing_collection_multipart_group,
+        test_import_documents_enforces_export_row_limit,
+        test_add_document_enforces_export_row_limit,
+        test_add_document_rechecks_limit_inside_write_lock,
+        test_update_document_enforces_export_row_limit,
+        test_collection_row_count_reads_stats_and_tolerates_failure,
     ):
         mp = pytest.MonkeyPatch()
         try:
