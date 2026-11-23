@@ -1845,6 +1845,119 @@ def test_rag_grouped_documents_absurd_parts_capped():
     print("✓ 异常 parts 声明不展开巨型 range")
 
 
+def test_rag_assemble_preserves_rerank_order():
+    """拼装不能按 distance 重排：精排序是最终相关性顺序（组取最佳）。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+    grouped = agent._assemble_grouped_documents(
+        [
+            {"id": "a", "content": "A", "metadata": {}, "distance": 0.9,
+             "rerank_score": 0.1},
+            {"id": "b", "content": "B", "metadata": {}, "distance": 0.5,
+             "rerank_score": 0.9},
+            {"id": "g2", "content": "B2", "metadata": {"group": "g", "part": 2},
+             "distance": 0.6, "rerank_score": 0.8},
+            {"id": "g1", "content": "A1", "metadata": {"group": "g", "part": 1},
+             "distance": 0.5, "rerank_score": 0.95},
+        ]
+    )
+    assert [item["id"] for item in grouped] == ["g", "b", "a"], grouped
+    assert grouped[0]["rerank_score"] == 0.95, "组取组内最佳精排分"
+    print("✓ 拼装保持精排顺序")
+
+
+def test_bm25_cache_invalidated_across_module_copies(monkeypatch):
+    """共享版本号让所有模块副本的 BM25 缓存在知识写入后一起过期。"""
+    from utils.hybrid_retrieval import invalidate_bm25_cache
+
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent.knowledge_base_path = "/tmp/kb-epoch"
+    agent.collection_name = "kb-epoch-test"
+    calls: list[int] = []
+
+    def fake_fetch(limit):
+        calls.append(limit)
+        return [{"id": 1, "content": "住宿标准", "metadata": {}}]
+
+    agent._fetch_all_documents = fake_fetch
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+    first = agent._get_bm25_index()
+    second = agent._get_bm25_index()
+    assert first is second and len(calls) == 1, "TTL 内应复用缓存"
+    invalidate_bm25_cache()
+    third = agent._get_bm25_index()
+    assert len(calls) == 2, "版本号变化后必须重建索引"
+    assert third is not first
+    print("✓ BM25 缓存跨模块副本失效")
+
+
+def test_bm25_index_built_during_write_is_not_cached(monkeypatch):
+    """扫描期间发生知识写入：旧快照只服务本次请求，不能写入缓存。"""
+    from utils.hybrid_retrieval import invalidate_bm25_cache
+
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent.knowledge_base_path = "/tmp/kb-epoch-build"
+    agent.collection_name = "kb-epoch-build-test"
+    calls: list[int] = []
+
+    def fake_fetch(limit):
+        calls.append(limit)
+        invalidate_bm25_cache()
+        return [{"id": 1, "content": "住宿标准", "metadata": {}}]
+
+    agent._fetch_all_documents = fake_fetch
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+    key = (agent.knowledge_base_path, agent.collection_name)
+    first = agent._get_bm25_index()
+    assert first is not None
+    assert key not in module._BM25_CACHE, "构建期间发生写入时不得缓存旧快照"
+    second = agent._get_bm25_index()
+    assert second is not None and len(calls) == 2
+    print("✓ BM25 构建期间写入不缓存旧快照")
+
+
+def test_fetch_all_documents_parses_metadata_json(monkeypatch):
+    """BM25 索引行里的 metadata 字符串要解析成 dict，分组才能生效。"""
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent.collection_name = "kb-meta"
+    agent._milvus_db_path = "/tmp/kb-meta.db"
+
+    class _Iterator:
+        def __init__(self):
+            self._batches = [
+                [
+                    {
+                        "id": 1,
+                        "content": "片段",
+                        "metadata": '{"group": "g", "part": 1}',
+                    }
+                ]
+            ]
+
+        def next(self):
+            return self._batches.pop(0) if self._batches else []
+
+        def close(self):
+            pass
+
+    class _Client:
+        def load_collection(self, name):
+            pass
+
+        def query_iterator(self, **kwargs):
+            return _Iterator()
+
+    monkeypatch.setattr(module, "get_milvus_client", lambda path: _Client())
+    rows = agent._fetch_all_documents(10)
+    assert rows[0]["metadata"] == {"group": "g", "part": 1}
+    print("✓ BM25 索引行 metadata 解析为 dict")
+
+
 def test_rag_collection_created_once(monkeypatch, tmp_path):
     """首次构造创建集合；已有集合不再重复创建；初始化路径允许无库文件创建。"""
     module = _load_skill_module("ask-question")

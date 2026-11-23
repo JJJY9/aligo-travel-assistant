@@ -71,6 +71,36 @@ def test_annotate_hybrid_scores_uses_max_of_vector_and_normalized_bm25():
     print("✓ 混合相关性标注")
 
 
+def test_bm25_query_reference_uses_unique_query_terms():
+    """归一化基准是查询词 IDF 之和；重复词不抬高基准。"""
+    index = BM25Index(
+        [
+            {"id": 1, "content": "住宿标准：一线城市每晚 600 元"},
+            {"id": 2, "content": "市内交通标准：每天 100 元"},
+        ]
+    )
+    reference = index.query_reference("住宿标准")
+    assert reference > 0
+    repeated = index.query_reference("住宿住宿住宿")
+    single = index.query_reference("住宿")
+    assert abs(repeated - single) < 1e-9, "重复查询词不能重复累计 IDF"
+    print("✓ BM25 归一化基准按唯一查询词")
+
+
+def test_annotate_with_query_reference_does_not_auto_pass_top_hit():
+    """按查询覆盖面归一：弱命中 top-1 不再自动变成 1.0 绕过阈值。"""
+    fused = [{"id": "a"}]
+    weak = annotate_hybrid_scores(
+        fused, {}, {"a": 10.0}, bm25_reference=100.0
+    )
+    assert abs(weak[0]["distance"] - 0.1) < 1e-9, weak[0]
+    strong = annotate_hybrid_scores(
+        fused, {}, {"a": 10.0}, bm25_reference=5.0
+    )
+    assert strong[0]["distance"] == 1.0, "超过基准时截断为 1"
+    print("✓ 混合标注按查询覆盖面归一")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -79,4 +109,6 @@ if __name__ == "__main__":
     test_bm25_ranks_keyword_match()
     test_rrf_prefers_documents_in_both_lists()
     test_annotate_hybrid_scores_uses_max_of_vector_and_normalized_bm25()
+    test_bm25_query_reference_uses_unique_query_terms()
+    test_annotate_with_query_reference_does_not_auto_pass_top_hit()
     print("\n全部通过")
