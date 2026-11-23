@@ -12926,6 +12926,41 @@ def test_import_over_limit_preference_account_allowed(monkeypatch):
         _cleanup(user_id)
     print("✓ 存量超限偏好账号的恢复按基线放行")
 
+
+
+def test_cached_session_protected_during_quarantine_probe(monkeypatch):
+    """缓存命中的锁外隔离探测期间会话被占住：探测窗口内的容量回收不能
+    驱逐刚命中的条目（此前已命中请求会落入饱和预检 503）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_probe_protect")
+    chat = {"message": "你好", "user_id": user_id, "session_id": "s1"}
+    try:
+        first = client.post("/api/chat", json=chat)
+        assert first.status_code == 200, first.text
+        key = state._session_key(user_id, "s1")
+        observed = {}
+        original = server_module._quarantine_marker_for
+
+        def probing(user, long_term):
+            with state._sessions_lock:
+                item = state.sessions.get(key)
+                observed["in_use"] = None if item is None else item.in_use()
+            return original(user, long_term)
+
+        monkeypatch.setattr(server_module, "_quarantine_marker_for", probing)
+        second = client.post("/api/chat", json=chat)
+        assert second.status_code == 200, second.text
+        assert observed.get("in_use") is True, observed
+        with state._sessions_lock:
+            assert not state.sessions[key].in_use()
+    finally:
+        _cleanup(user_id)
+    print("✓ 探测窗口内缓存命中被占住（不被容量回收驱逐）")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
@@ -13068,36 +13103,3 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n全部通过（{ran}/{total} 个用例）")
-
-
-def test_cached_session_protected_during_quarantine_probe(monkeypatch):
-    """缓存命中的锁外隔离探测期间会话被占住：探测窗口内的容量回收不能
-    驱逐刚命中的条目（此前已命中请求会落入饱和预检 503）。"""
-    from webapp import server as server_module
-
-    client = _client()
-    state = client.app.state.aligo
-    user_id = _unique_user("web_probe_protect")
-    chat = {"message": "你好", "user_id": user_id, "session_id": "s1"}
-    try:
-        first = client.post("/api/chat", json=chat)
-        assert first.status_code == 200, first.text
-        key = state._session_key(user_id, "s1")
-        observed = {}
-        original = server_module._quarantine_marker_for
-
-        def probing(user, long_term):
-            with state._sessions_lock:
-                item = state.sessions.get(key)
-                observed["in_use"] = None if item is None else item.in_use()
-            return original(user, long_term)
-
-        monkeypatch.setattr(server_module, "_quarantine_marker_for", probing)
-        second = client.post("/api/chat", json=chat)
-        assert second.status_code == 200, second.text
-        assert observed.get("in_use") is True, observed
-        with state._sessions_lock:
-            assert not state.sessions[key].in_use()
-    finally:
-        _cleanup(user_id)
-    print("✓ 探测窗口内缓存命中被占住（不被容量回收驱逐）")
