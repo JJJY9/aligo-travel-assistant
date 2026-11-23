@@ -84,7 +84,9 @@ def test_plan_validation_passes_without_repair():
     assert result["validation"]["passed"] is True
     assert result["validation"]["issues"] == []
     assert len(model.prompts) == 1
-    print("✓ 合规行程一次通过，无修复调用")
+    assert "必去项建议分配" in model.prompts[0], "必去项应带求解器建议"
+    assert "西湖" in model.prompts[0] and "灵隐寺" in model.prompts[0]
+    print("✓ 合规行程一次通过，无修复调用；prompt 含必去项分配建议")
 
 
 def test_plan_validation_regenerates_with_reasons():

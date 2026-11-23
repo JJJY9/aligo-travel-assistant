@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 新增
+- 行程必去项求解（v2.0）：新增 `utils/itinerary_solver.py`——把必去项按天分配，保证每日时间窗（默认 09:00–18:00、单点参观 2 小时、点间通勤 30 分钟）不超限；优先使用 OR-Tools CP-SAT（可选依赖，未安装时自动退回确定性贪心），任一实现都输出每日起止时间与未能安排项。`plan-trip` 在调用模型前把可行的分配建议注入 prompt（时间不足时明确列出未安排项），校验层仍独立复核最终行程
 - 评测骨架（v2.0）：`utils/eval_harness.py` 规则验收（意图集合完全匹配、必需 / 禁用关键词、可选 LLM-as-Judge ≥0.6）与总体 Pass@1、分类准确率、Judge 均分、失败原因汇总；`utils/eval_cases.py` 按 12 类场景模板确定性生成 500 条分层用例（覆盖问候 / 规划 / 事项收集 / 偏好写入与查询 / 记忆 / 政策 RAG / 天气 / 搜索 / 多意图 / 澄清 / 无关问题）并支持 JSONL 导出；新增单元测试
 - 记忆一致性（v2.0）：`MemoryManager.get_recent_summary_async` 对当前会话最近 10 轮对话生成 ≤200 字滚动摘要——按窗口内容指纹缓存（窗口不变不重复调用模型）、失败 / 空输出进入 30 秒冷却、输出经 `sanitize_json` 清洗；对话上下文新增「最近对话摘要」段（与跨会话长期总结互补），`get_context_for_agent` 支持 `recent_summary` 参数。新增单元测试覆盖消息不足不调用、指纹缓存、窗口变化重算、200 字截断与失败冷却
 - 请求幂等（v2.0）：`POST /api/chat` 与 `/api/chat/stream` 接受可选 `idempotency_key`（≤200 字）。同一用户 + 同一会话 + 同一键的重复提交直接回放上次成功响应（非流式带 `X-Idempotent-Replay: 1`，流式只回放 `session` + `done` 且标记 `idempotent_replay`），不再重复执行 Agent、不重复写偏好 / 行程 / 聊天记录；失败响应不缓存，客户端可正常重试。进程内 TTL 10 分钟 + LRU 256 条，新增 `utils/idempotency.py` 与单元、Web 集成测试
