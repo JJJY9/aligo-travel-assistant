@@ -1457,7 +1457,7 @@ class AligoCLI:
         from datetime import datetime
 
         from context.storage import create_long_term_memory
-        from utils.exporter import export_files
+        from utils.exporter import export_files, write_export_files
 
         # strict：PostgreSQL 配置但不可用时，user-export 与 /api/export 都会
         # 明确拒绝；交互式导出不能静默导出空 / 过期的回退 JSON 并宣称成功
@@ -1516,14 +1516,21 @@ class AligoCLI:
         # standalone 与 Web，交互菜单路径遗漏）
         from utils.user_import import export_backup_limit_problem
 
-        problem = export_backup_limit_problem(data)
+        prepared: dict[str, Any] = {}
+        problem = export_backup_limit_problem(data, prepared_out=prepared)
         if problem:
             self.console.print(
                 f"[red]导出中止：{problem}（该文件将无法再导入恢复，"
                 "请先清理部分旧会话 / 行程后重试）[/red]"
             )
             return
-        paths = export_files(data, "exports")
+        # 体积预检已序列化过一次：直接写同一串字节，不再清洗 + dumps 一遍
+        if prepared.get("cleaned") is not None and "json_bytes" in prepared:
+            paths = write_export_files(
+                prepared["cleaned"], prepared["json_bytes"], "exports"
+            )
+        else:
+            paths = export_files(data, "exports")
         for path in paths:
             self.console.print(f"✓ 已导出: {path}", style="green")
 
@@ -3217,7 +3224,7 @@ def run_user_export_standalone(
     from datetime import datetime
     from pathlib import Path
 
-    from utils.exporter import export_files
+    from utils.exporter import export_files, write_export_files
 
     if not _valid_web_id(user_id):
         print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
@@ -3296,8 +3303,16 @@ def run_user_export_standalone(
     # 长文档重切分后的真实恢复体积。
     warnings: dict[str, object] = {}
     reasons: dict[str, object] = {}
+    # data 刚清洗过：体积轴直接复用这一份（pre_sanitized），并把按导出格式
+    # 序列化出的字节回填到 prepared——通过后写盘用的就是同一串字节，
+    # 不再清洗一遍、dumps 一遍
+    prepared: dict[str, Any] = {}
     problem = export_backup_limit_problem(
-        data, warning_out=warnings, reason_out=reasons
+        data,
+        warning_out=warnings,
+        reason_out=reasons,
+        pre_sanitized=True,
+        prepared_out=prepared,
     )
     knowledge_omitted = ""
     if problem and "knowledge" in data:
@@ -3307,7 +3322,14 @@ def run_user_export_standalone(
         without_knowledge = {
             key: value for key, value in data.items() if key != "knowledge"
         }
-        if export_backup_limit_problem(without_knowledge) is None:
+        if (
+            export_backup_limit_problem(
+                without_knowledge,
+                pre_sanitized=True,
+                prepared_out=prepared,
+            )
+            is None
+        ):
             data = without_knowledge
             if reasons.get("knowledge") == "planning-failed":
                 knowledge_omitted = (
@@ -3335,7 +3357,14 @@ def run_user_export_standalone(
 
     out_dir = Path(target_dir) if target_dir else Path("exports")
     try:
-        paths = export_files(data, out_dir)
+        # 体积预检已按导出格式序列化过：直接写同一串字节（与预检同源），
+        # 不再清洗 + indent=2 序列化一遍；文件命名口径由 exporter 统一
+        if prepared.get("cleaned") is not None and "json_bytes" in prepared:
+            paths = write_export_files(
+                prepared["cleaned"], prepared["json_bytes"], out_dir
+            )
+        else:
+            paths = export_files(data, out_dir)
     except (OSError, UnicodeEncodeError) as exc:
         print(f"写入失败：{exc}")
         return 1
@@ -4473,8 +4502,13 @@ def _local_timestamp_text(value: str) -> str:
         return text[:19].replace("T", " ")
 
 
-def _session_summaries(store) -> list[dict]:
-    """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。"""
+def _session_summaries(store, *, needle: str = "") -> list[dict]:
+    """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。
+
+    ``needle`` 非空时才构建关键词匹配文本（标题 + 归一后的消息正文）；
+    会话一旦命中就不再为后续消息渲染 / 归一化。无搜索的列表展示不再为
+    每条助手消息付一次编排 JSON 的渲染代价。
+    """
     from utils.stored_message import render_stored_message
 
     history = store.get_chat_history()
@@ -4482,6 +4516,7 @@ def _session_summaries(store) -> list[dict]:
     pinned = {str(item) for item in (store.get_pinned_sessions() or [])}
     archived = {str(item) for item in (store.get_archived_sessions() or [])}
     grouped: dict[str, dict] = {}
+    best_keys: dict[str, str] = {}
     for message in history:
         session_id = message.get("session_id")
         if not session_id:
@@ -4493,34 +4528,42 @@ def _session_summaries(store) -> list[dict]:
         )
         entry["messages"] += 1
         timestamp = str(message.get("timestamp") or "")
-        if timestamp and (
-            not entry["updated_at"]
-            or chronological_key(timestamp) >= chronological_key(entry["updated_at"])
-        ):
-            # 取转录里「最大时间戳」而不是最后一条：恢复备份按时间升序追加，
-            # 旧消息排在末尾时最近更新会被错误回拨
-            entry["updated_at"] = timestamp
+        if timestamp:
+            parsed_key = chronological_key(timestamp)
+            seen_key = best_keys.get(sid)
+            # 保持 CLI 原 >= 语义（Web 列表用 >）：等键的不同原始串仍取
+            # 后一条原文，--json 输出的 updated_at 不能变
+            if seen_key is None or parsed_key >= seen_key:
+                best_keys[sid] = parsed_key
+                # 取转录里「最大时间戳」而不是最后一条：恢复备份按时间升序
+                # 追加，旧消息排在末尾时最近更新会被错误回拨
+                entry["updated_at"] = timestamp
         if not entry["title"] and message.get("role") == "user":
             title = " ".join(str(message.get("content", "")).split())
             if title:
                 entry["title"] = title[:40]
-        # 助手消息存的是编排 JSON：用渲染后的正文做关键词匹配（与 Web
-        # 面板同口径），直接匹配原始 JSON 会把「回答里有没有某个词」判错
-        if message.get("role") == "user":
-            raw_text = str(message.get("content", ""))
-        else:
-            raw_text = render_stored_message(message)
-        content = " ".join(raw_text.split())
-        if content:
-            entry.setdefault("_parts", []).append(content)
+        if needle and not entry.get("_query_hit"):
+            # 助手消息存的是编排 JSON：用渲染后的正文做关键词匹配（与 Web
+            # 面板同口径），直接匹配原始 JSON 会把「回答里有没有某个词」判错
+            if message.get("role") == "user":
+                raw_text = str(message.get("content", ""))
+            else:
+                raw_text = render_stored_message(message)
+            content = " ".join(raw_text.split())
+            if content:
+                entry.setdefault("_parts", []).append(content)
+                if needle in content.lower():
+                    entry["_query_hit"] = True
     for entry in grouped.values():
+        entry.pop("_query_hit", None)
         entry["title"] = str(
             titles.get(entry["session_id"]) or entry["title"] or "新对话"
         )
         entry["pinned"] = entry["session_id"] in pinned
         entry["archived"] = entry["session_id"] in archived
-        # 标题 + 消息内容（已归一空白）供 --query 关键词过滤与命中片段
-        entry["_parts"] = [entry["title"], *entry.pop("_parts", [])]
+        if needle:
+            # 标题 + 消息内容（已归一空白）供 --query 关键词过滤与命中片段
+            entry["_parts"] = [entry["title"], *entry.pop("_parts", [])]
     return sorted(
         grouped.values(),
         key=lambda item: chronological_key(item["updated_at"]),
@@ -4561,8 +4604,9 @@ def run_sessions_list_standalone(
                 "（当前会按空快照处理，请先用备份文件恢复）",
                 as_json,
             )
+        needle = query.strip().lower()
         try:
-            summaries = _session_summaries(store)
+            summaries = _session_summaries(store, needle=needle)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _cli_fail(f"读取会话失败：{exc}", as_json)
     finally:
@@ -4572,7 +4616,6 @@ def run_sessions_list_standalone(
 
     archived_total = sum(1 for item in summaries if item["archived"])
     total_all = len(summaries)
-    needle = query.strip().lower()
     if needle:
         matched = []
         for item in summaries:
@@ -5330,12 +5373,16 @@ def run_sessions_export_standalone(
     if html:
         from utils.session_html import render_all_sessions_html
 
-        text, count = render_all_sessions_html(user_id, messages, titles)
+        text, count = render_all_sessions_html(
+            user_id, messages, titles, sessions=grouped
+        )
         suffix = ".html"
     else:
         from utils.session_markdown import render_all_sessions_markdown
 
-        text, count = render_all_sessions_markdown(user_id, messages, titles)
+        text, count = render_all_sessions_markdown(
+            user_id, messages, titles, sessions=grouped
+        )
         suffix = ".md"
 
     if to_stdout:

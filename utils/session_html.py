@@ -130,17 +130,21 @@ def render_all_sessions_html(
     user_id: str,
     messages: list[dict[str, Any]],
     titles: dict[str, str] | None = None,
+    *,
+    sessions: list[tuple[str, list[dict[str, Any]]]] | None = None,
 ) -> tuple[str, int]:
     """把全部会话渲染为一份独立 HTML，返回 (文本, 会话数)。
 
     与 Markdown 合集同一分组 / 排序（最近更新的会话在前），所有动态文本
     转义；标题在这里保持原始字符、出口统一转义一次（不能先 sanitize，
-    否则 HTML 里会显示字面量 ``&lt;``）。
+    否则 HTML 里会显示字面量 ``&lt;``）。``sessions`` 传入调用方已算好的
+    分组时直接复用，不再做第二遍分组。
     """
-    from utils.session_markdown import group_sessions
-
     titles = titles or {}
-    sessions = group_sessions(messages)
+    if sessions is None:
+        from utils.session_markdown import group_sessions
+
+        sessions = group_sessions(messages)
     sections: list[str] = []
     for session_id, session_messages in sessions:
         title = _bundle_title(session_id, session_messages, titles)

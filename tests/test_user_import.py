@@ -193,6 +193,66 @@ def test_precomputed_size_matches_recomputed_and_idempotent_sanitize(monkeypatch
     assert via_precomputed == via_recomputed and via_precomputed is not None
     print("✓ precomputed_size 与重算口径一致且清洗幂等")
 
+
+def test_prepared_out_binds_cleaned_bytes_for_export(monkeypatch):
+    """prepared_out 回填「体积预检所用字节」：pre_sanitized 时不再清洗。"""
+    import json as json_module
+
+    from utils import exporter
+    from utils import user_import as module
+
+    dirty = {
+        "chat_history": [
+            {"role": "user", "content": "a\x00b", "session_id": "s"}
+        ]
+    }
+    prepared: dict[str, object] = {}
+    assert module.export_backup_limit_problem(dirty, prepared_out=prepared) is None
+    cleaned = exporter.sanitize_backup_data(dirty)
+    assert prepared["cleaned"] == cleaned
+    assert prepared["json_bytes"] == json_module.dumps(
+        cleaned, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+
+    # 已清洗数据显式 pre_sanitized：体积轴不再整份深拷贝清洗
+    calls: list[int] = []
+    real = exporter.sanitize_backup_data
+
+    def _spy(value):
+        calls.append(1)
+        return real(value)
+
+    monkeypatch.setattr(exporter, "sanitize_backup_data", _spy)
+    prepared2: dict[str, object] = {}
+    assert (
+        module.export_backup_limit_problem(
+            cleaned, pre_sanitized=True, prepared_out=prepared2
+        )
+        is None
+    )
+    assert calls == [], "pre_sanitized=True 时不应再整份清洗"
+    assert prepared2["json_bytes"] == prepared["json_bytes"]
+
+    # 知识分片计划轴与原始备份字节不同：不得覆盖 prepared 里的写盘字节
+    monkeypatch.setattr(
+        module,
+        "knowledge_rows_for_volume_check",
+        lambda rows, skip_out=None: list(rows),
+    )
+    with_knowledge = {**dirty, "knowledge": ["片段一"]}
+    prepared3: dict[str, object] = {}
+    assert (
+        module.export_backup_limit_problem(
+            with_knowledge, prepared_out=prepared3
+        )
+        is None
+    )
+    raw_cleaned = exporter.sanitize_backup_data(with_knowledge)
+    assert prepared3["json_bytes"] == json_module.dumps(
+        raw_cleaned, ensure_ascii=False, indent=2
+    ).encode("utf-8"), "prepared 必须绑定原始备份（写盘）字节"
+    print("✓ prepared_out 与写盘字节同源（分片轴不覆盖）")
+
 def test_parse_export_rejects_invalid():
     sections, errors = parse_user_export("not json")
     assert sections == {} and "JSON 解析失败" in errors[0]

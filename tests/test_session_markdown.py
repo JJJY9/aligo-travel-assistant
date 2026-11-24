@@ -408,6 +408,55 @@ def test_table_row_escapes_html_without_cross_cell_code_span():
     assert "&lt;img" in text, text
     print("✓ 表格行不跨单元格配对反引号")
 
+def test_latest_timestamp_keeps_first_on_ties_and_invalid():
+    """最大时间戳的取串口径：严格 > 保留先出现者；全非法取首条原文。"""
+    from utils.session_markdown import _latest_timestamp
+
+    assert _latest_timestamp([]) == ""
+    assert (
+        _latest_timestamp(
+            [{"timestamp": "bad"}, {"timestamp": ""}, {"timestamp": "worse"}]
+        )
+        == "bad"
+    ), "全非法时间戳的会话不能从首条退化成末条"
+    assert (
+        _latest_timestamp(
+            [
+                {"timestamp": "2026-11-04T10:00:00+08:00"},
+                {"timestamp": "2026-11-04T02:00:00+00:00"},
+            ]
+        )
+        == "2026-11-04T10:00:00+08:00"
+    ), "同一时刻的不同写法保留先出现者（严格 >）"
+    assert (
+        _latest_timestamp(
+            [
+                {"timestamp": "2026-11-01T10:00:00"},
+                {"timestamp": "2026-11-03T10:00:00"},
+            ]
+        )
+        == "2026-11-03T10:00:00"
+    )
+    print("✓ 最大时间戳取串口径（并列 / 全非法）")
+
+
+def test_render_all_sessions_matches_with_precomputed_grouping():
+    """传入 CLI 已算好的分组与内部重新分组输出逐字节一致。"""
+    messages = [
+        _msg("user", "旧问题", "s1", "2026-11-01T10:00:00"),
+        _msg("assistant", "旧回答", "s1", "2026-11-01T10:01:00"),
+        _msg("user", "新问题", "s2", "2026-11-02T10:00:00"),
+        _msg("assistant", "新回答", "s2", "2026-11-02T10:01:00"),
+    ]
+    grouped = group_sessions(messages)
+    internal = render_all_sessions_markdown("u1", messages, {"s2": "标题"})
+    reused = render_all_sessions_markdown(
+        "u1", messages, {"s2": "标题"}, sessions=grouped
+    )
+    assert reused == internal
+    print("✓ 会话合集渲染复用预分组结果（字节一致）")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
@@ -437,6 +486,8 @@ if __name__ == "__main__":
     test_heading_line_cannot_open_cross_line_code_span()
     test_list_scoped_fence_restores_escaping_after_container()
     test_table_row_escapes_html_without_cross_cell_code_span()
+    test_latest_timestamp_keeps_first_on_ties_and_invalid()
+    test_render_all_sessions_matches_with_precomputed_grouping()
     test_title_strips_terminal_controls()
     test_message_body_escaped_in_export()
     print("\n全部通过")

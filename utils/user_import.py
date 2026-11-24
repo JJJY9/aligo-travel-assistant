@@ -381,6 +381,8 @@ def _limit_problems(
     crlf: bool | None = None,
     size_out: dict[str, int] | None = None,
     precomputed_size: int | None = None,
+    pre_sanitized: bool = False,
+    prepared_out: dict[str, Any] | None = None,
 ) -> list[tuple[str, str]]:
     """按轴列出导入上限问题（条数在前、体积在后）。
 
@@ -431,7 +433,12 @@ def _limit_problems(
     size = (
         precomputed_size
         if precomputed_size is not None
-        else _backup_payload_size(backup, crlf=crlf)
+        else _backup_payload_size(
+            backup,
+            crlf=crlf,
+            pre_sanitized=pre_sanitized,
+            prepared_out=prepared_out,
+        )
     )
     if size_out is not None:
         size_out["size"] = size
@@ -447,25 +454,36 @@ def _limit_problems(
 
 
 def _backup_payload_size(
-    backup: dict[str, Any], *, crlf: bool | None = None
+    backup: dict[str, Any],
+    *,
+    crlf: bool | None = None,
+    pre_sanitized: bool = False,
+    prepared_out: dict[str, Any] | None = None,
 ) -> int:
     """按导出实际写出的格式估算体积（indent=2，可选 CRLF 换行翻译）。
 
     ``crlf=None`` 按运行平台推定（Windows 的 CLI 写盘加 1 字节/行）；
     ``crlf=False`` 按 LF 计（Web 响应体与浏览器下载的备份就是 LF）。
+
+    ``pre_sanitized=True`` 表示调用方已 ``sanitize_backup_data`` 过同一份
+    数据（CLI 导出路径），省掉再清洗一次全量深拷贝；``prepared_out`` 传入
+    dict 时回填 ``{"cleaned", "json_bytes"}``，供导出端直接落盘，保证
+    「体积预检的字节」与「写出的字节」同一来源。
     """
     # 孤立代理项先转义（否则 encode 直接抛 UnicodeEncodeError）——
     # 紧凑 JSON 的估算会让 1.3-1.6 倍体积的备份通过自检、写盘后却被导入侧
     # 「超过 50 MB」拒绝，导出器产出自己声明可恢复、实际无法导入的备份
     from utils.exporter import sanitize_backup_data
 
-    serialized = json.dumps(
-        sanitize_backup_data(backup), ensure_ascii=False, indent=2
-    )
+    cleaned = backup if pre_sanitized else sanitize_backup_data(backup)
+    serialized = json.dumps(cleaned, ensure_ascii=False, indent=2)
     size = len(serialized.encode("utf-8"))
     use_crlf = (os.linesep != "\n") if crlf is None else crlf
     if use_crlf:
         size += serialized.count("\n")
+    if prepared_out is not None:
+        prepared_out["cleaned"] = cleaned
+        prepared_out["json_bytes"] = serialized.encode("utf-8")
     return size
 
 
@@ -475,13 +493,16 @@ def backup_limit_problem(
     crlf: bool | None = None,
     size_out: dict[str, int] | None = None,
     precomputed_size: int | None = None,
+    pre_sanitized: bool = False,
+    prepared_out: dict[str, Any] | None = None,
 ) -> str | None:
     """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
 
     口径与 ``parse_user_export`` / ``import_user_data`` 的硬上限一致：
     条数与备份文件字节上限。返回具体原因或 None。``crlf`` 见
     :func:`_limit_problems`（Web 通道按 LF 估算）；``precomputed_size``
-    的适用前提见同函数说明。
+    / ``pre_sanitized`` / ``prepared_out`` 的适用前提见同函数与
+    :func:`_backup_payload_size` 说明。
     """
     if not isinstance(backup, dict):
         return None
@@ -490,6 +511,8 @@ def backup_limit_problem(
         crlf=crlf,
         size_out=size_out,
         precomputed_size=precomputed_size,
+        pre_sanitized=pre_sanitized,
+        prepared_out=prepared_out,
     )
     return problems[0][1] if problems else None
 
@@ -972,6 +995,8 @@ def export_backup_limit_problem(
     warning_out: dict[str, Any] | None = None,
     reason_out: dict[str, Any] | None = None,
     precomputed_size: int | None = None,
+    pre_sanitized: bool = False,
+    prepared_out: dict[str, Any] | None = None,
 ) -> str | None:
     """导出端自检：原始备份与「导入空库」的知识分片形状都必须可导入。
 
@@ -983,6 +1008,9 @@ def export_backup_limit_problem(
     ``precomputed_size``：原始备份已按导出格式序列化过时传入字节数，
     省掉第一次体积估算的再次清洗 + 再序列化（见 :func:`_limit_problems`）。
     分片计划形状（``shaped``）与原始备份字节不同，那次复核**不得**复用。
+    ``pre_sanitized`` / ``prepared_out`` 只作用于原始备份轴（最终写盘的
+    raw payload）；分片计划形状来自导入规划输出，不能假定已清洗，必须
+    照旧清洗并在第二次复核时重新计算体积。
 
     知识规划失败时返回拒绝原因（无法确认备份可恢复）。``warning_out``
     传入 dict 时回填「恢复时会被跳过的知识行」提示：这些行不会阻断导出
@@ -1001,6 +1029,8 @@ def export_backup_limit_problem(
         crlf=False,
         size_out=size_out,
         precomputed_size=precomputed_size,
+        pre_sanitized=pre_sanitized,
+        prepared_out=prepared_out,
     )
     if problem:
         return problem

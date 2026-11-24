@@ -1576,6 +1576,134 @@ def test_session_title_newline_cannot_forge_rows(monkeypatch):
         assert "标题Z" in text
     print("✓ 会话标题内嵌换行不能伪造列表行")
 
+def _legacy_session_summaries(store):
+    """改动前的实现（逐字复刻）：用于对齐新实现的无搜索 / 无命中输出。"""
+    from utils.stored_message import render_stored_message
+    from utils.timestamps import chronological_key
+
+    history = store.get_chat_history()
+    titles = store.get_session_titles() or {}
+    pinned = {str(item) for item in (store.get_pinned_sessions() or [])}
+    archived = {str(item) for item in (store.get_archived_sessions() or [])}
+    grouped: dict[str, dict] = {}
+    for message in history:
+        session_id = message.get("session_id")
+        if not session_id:
+            continue
+        sid = str(session_id)
+        entry = grouped.setdefault(
+            sid,
+            {"session_id": sid, "title": "", "messages": 0, "updated_at": ""},
+        )
+        entry["messages"] += 1
+        timestamp = str(message.get("timestamp") or "")
+        if timestamp and (
+            not entry["updated_at"]
+            or chronological_key(timestamp)
+            >= chronological_key(entry["updated_at"])
+        ):
+            entry["updated_at"] = timestamp
+        if not entry["title"] and message.get("role") == "user":
+            title = " ".join(str(message.get("content", "")).split())
+            if title:
+                entry["title"] = title[:40]
+        if message.get("role") == "user":
+            raw_text = str(message.get("content", ""))
+        else:
+            raw_text = render_stored_message(message)
+        content = " ".join(raw_text.split())
+        if content:
+            entry.setdefault("_parts", []).append(content)
+    for entry in grouped.values():
+        entry["title"] = str(
+            titles.get(entry["session_id"]) or entry["title"] or "新对话"
+        )
+        entry["pinned"] = entry["session_id"] in pinned
+        entry["archived"] = entry["session_id"] in archived
+        entry["_parts"] = [entry["title"], *entry.pop("_parts", [])]
+    return sorted(
+        grouped.values(),
+        key=lambda item: chronological_key(item["updated_at"]),
+        reverse=True,
+    )
+
+
+def test_session_summaries_matches_legacy_and_defers_search_text(monkeypatch):
+    """新聚合与旧实现逐字段一致；无搜索不渲染助手消息，搜索命中即停。"""
+    assistant = json.dumps(
+        {"results": ["回答甲包含关键词"], "_meta": {}}, ensure_ascii=False
+    )
+    messages = [
+        _message("user", "北京出差", "s1", "2026-11-04T10:00:00"),
+        _message("assistant", assistant, "s1", "2026-11-04T11:00:00"),
+        _message("user", "第二问（旧消息排末尾）", "s1", "2026-11-03T09:00:00"),
+        _message("user", "上海", "s2", "2026-11-02 08:00:00"),
+        _message("user", "无效时间", "s2", "not-a-time"),
+        _message("user", "", "s2", ""),
+        _message("user", "无会话", "", "2026-11-05T00:00:00"),
+    ]
+    store = _FakeStore(
+        messages, titles={"s1": "自定义标题"}, pinned=["s2"], archived=["s9"]
+    )
+
+    def _display(entries):
+        # 旧实现总带 _parts（搜索文本）；无搜索的新实现不构建，比较展示字段
+        return [
+            {key: value for key, value in item.items() if key != "_parts"}
+            for item in entries
+        ]
+
+    legacy = _legacy_session_summaries(store)
+    fresh = cli._session_summaries(store)
+    assert fresh == _display(legacy)
+    assert all("_parts" not in item for item in fresh), "无搜索不构建匹配文本"
+
+    rendered = []
+    import utils.stored_message as stored_message
+
+    real = stored_message.render_stored_message
+
+    def _counting(message):
+        rendered.append(1)
+        return real(message)
+
+    monkeypatch.setattr(stored_message, "render_stored_message", _counting)
+    assert cli._session_summaries(store) == _display(legacy)
+    assert rendered == [], "无搜索时不渲染助手消息"
+
+    def _hits(entries, needle):
+        found = {}
+        for item in entries:
+            hit = next(
+                (part for part in item.get("_parts", []) if needle in part.lower()),
+                None,
+            )
+            if hit is not None:
+                found[item["session_id"]] = hit
+        return found
+
+    searched = cli._session_summaries(store, needle="关键词")
+    assert rendered, "搜索时才渲染助手消息"
+    assert _hits(searched, "关键词") == _hits(legacy, "关键词")
+    # 无命中时仍需全量扫描：匹配文本与旧实现完全一致
+    missing = cli._session_summaries(store, needle="不存在的关键词")
+    assert missing == _legacy_session_summaries(store)
+    print("✓ 会话摘要新实现与旧实现一致（搜索文本按需构建）")
+
+
+def test_session_summaries_equal_instant_keeps_later_original():
+    """等 chronological_key 的不同原始串：updated_at 仍取后一条原文（>= 语义）。"""
+    store = _FakeStore(
+        [
+            _message("user", "a", "s", "2026-11-04T10:00:00+08:00"),
+            _message("user", "b", "s", "2026-11-04T02:00:00+00:00"),
+        ]
+    )
+    summaries = cli._session_summaries(store)
+    assert summaries[0]["updated_at"] == "2026-11-04T02:00:00+00:00"
+    print("✓ 等时刻时间戳保留后一条原文")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
