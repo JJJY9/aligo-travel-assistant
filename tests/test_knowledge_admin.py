@@ -216,6 +216,50 @@ def test_update_document_rewrites_content(monkeypatch):
     print("✓ 知识片段更新（存在性 / 内容清洗 / 缺省 id）")
 
 
+def test_update_document_marks_edited_builtin_chunks(monkeypatch):
+    """编辑内置文档（source + file_path）时给新分片打 user_edited 标记。
+
+    init 重建据此保留编辑版并跳过对应源文件；没有标记时重建会把用户的
+    修改静默还原成原文。
+    """
+    from pathlib import Path
+
+    rows = [
+        {
+            "id": 7,
+            "content": "旧内置内容",
+            "metadata": '{"source": "商旅知识库文档", "file_path": "01.txt"}',
+        }
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _UpdateAgent:
+        def __init__(self):
+            self.updated = None
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+    agent = _UpdateAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    knowledge_admin.update_document(
+        7,
+        "我修改后的内置内容",
+        {"source": "商旅知识库文档", "file_path": "01.txt"},
+    )
+    assert agent.updated[0] == 7
+    assert agent.updated[2]["user_edited"] == "1"
+
+    # 普通（非内置）文档不带编辑标记
+    fake_client.rows = [{"id": 8, "content": "普通", "metadata": "{}"}]
+    knowledge_admin.update_document(8, "普通改", {"category": "住宿"})
+    assert "user_edited" not in agent.updated[2]
+    print("✓ 编辑内置文档打 user_edited 标记（普通文档不受影响）")
+
+
 def test_update_document_error_propagates(monkeypatch):
     from pathlib import Path
 
@@ -3654,6 +3698,7 @@ if __name__ == "__main__":
         test_add_document_error_raises,
         test_add_document_splits_long_content,
         test_update_document_rewrites_content,
+        test_update_document_marks_edited_builtin_chunks,
         test_update_document_splits_long_content,
         test_chunk_documents_overrides_stale_part_metadata,
         test_update_document_rejects_multipart_edit,

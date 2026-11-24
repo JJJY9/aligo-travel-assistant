@@ -552,6 +552,7 @@ class RAGKnowledgeAgent(AgentBase):
             return []
         query = str(query)
 
+        load_error: Exception | None = None
         try:
             # 确保连接正常
             self._ensure_connection()
@@ -559,10 +560,16 @@ class RAGKnowledgeAgent(AgentBase):
             # 确保 collection 已加载后再检索：
             # Milvus Lite 3.x（Windows）新会话中 collection 默认为 released 状态，
             # 不加载会报 "call load() before search/get/query"；2.x 上该调用无副作用。
+            # 加载失败通常是索引 sidecar 损坏 / 版本不兼容（真实原因不能被
+            # debug 吞掉）：记录后若检索随后报 released，错误里带上真实原因
             try:
                 self.milvus_client.load_collection(self.collection_name)
-            except Exception as load_err:
-                logger.debug(f"load_collection skipped: {load_err}")
+            except Exception as load_err:  # noqa: BLE001 - 交由下方错误归因
+                load_error = load_err
+                logger.warning(
+                    "load_collection 失败（索引可能损坏或版本不兼容）: %s",
+                    load_err,
+                )
 
             if top_k is None:
                 k = self.top_k
@@ -634,6 +641,13 @@ class RAGKnowledgeAgent(AgentBase):
         except Exception as e:
             logger.error(f"Error searching knowledge: {e}")
             if strict:
+                if load_error is not None:
+                    # 后续的 "call load() before search/get/query" 只是症状：
+                    # 把真实加载错误一并抛出（管理接口据此提示重建索引）
+                    raise RuntimeError(
+                        f"知识库索引加载失败：{load_error}。"
+                        f"检索随后报错：{e}（请重新运行初始化脚本重建索引）"
+                    ) from e
                 raise
             return []
 
@@ -663,14 +677,16 @@ class RAGKnowledgeAgent(AgentBase):
         epoch = bm25_cache_epoch()
         with _BM25_CACHE_LOCK:
             cached = _BM25_CACHE.get(key)
-            failed_at = _BM25_FAILED_AT.get(key, 0.0)
+            failed = _BM25_FAILED_AT.get(key)
         if (
             cached is not None
             and cached[2] == epoch
             and (now - cached[0]) <= ttl
         ):
             return cached[1]
-        if failed_at and (now - failed_at) <= ttl:
+        # 退避标记记录当时的缓存版本：知识写入 / 修正后的新版本立即重试，
+        # 一次瞬时构建失败不再让聊天链路在 TTL 内一直退回纯向量
+        if failed and failed[1] == epoch and (now - failed[0]) <= ttl:
             return None
 
         with _bm25_key_lock(key):
@@ -680,21 +696,21 @@ class RAGKnowledgeAgent(AgentBase):
             epoch = bm25_cache_epoch()
             with _BM25_CACHE_LOCK:
                 cached = _BM25_CACHE.get(key)
-                failed_at = _BM25_FAILED_AT.get(key, 0.0)
+                failed = _BM25_FAILED_AT.get(key)
             if (
                 cached is not None
                 and cached[2] == epoch
                 and (now - cached[0]) <= ttl
             ):
                 return cached[1]
-            if failed_at and (now - failed_at) <= ttl:
+            if failed and failed[1] == epoch and (now - failed[0]) <= ttl:
                 return None
             try:
                 rows = self._fetch_all_documents(max_docs)
             except Exception as exc:  # noqa: BLE001 - 混合检索是增强项
                 logger.warning("BM25 索引构建失败，检索退回纯向量: %s", exc)
                 with _BM25_CACHE_LOCK:
-                    _BM25_FAILED_AT[key] = now
+                    _BM25_FAILED_AT[key] = (now, epoch)
                 return None
             index = BM25Index(rows)
             # 扫描期间若发生知识写入 / 删除（版本号已变），这份快照可能
@@ -756,15 +772,28 @@ class RAGKnowledgeAgent(AgentBase):
         min_distance: float | None = None,
     ) -> list[dict]:
         """向量 + BM25 → RRF 融合 → 可选重排；任何一步失败都退回向量结果。"""
+        def _vector_fallback() -> list[dict]:
+            # 回退纯向量时同样执行证据门槛（公开契约：先按 distance 过滤
+            # 再截断）；此前三个回退分支直接切片，min_distance 被静默忽略，
+            # 低分片段会带着「通过门槛」的假象进入调用方
+            docs = vector_docs
+            if min_distance is not None:
+                docs = [
+                    doc
+                    for doc in docs
+                    if float(doc.get("distance") or 0.0) >= min_distance
+                ]
+            return docs[:top_k]
+
         enabled, candidates = self._hybrid_settings()
         if not enabled:
-            return vector_docs[:top_k]
+            return _vector_fallback()
         index = self._get_bm25_index()
         if index is None or not len(index):
-            return vector_docs[:top_k]
+            return _vector_fallback()
         bm25_hits = index.search(query, candidates)
         if not bm25_hits:
-            return vector_docs[:top_k]
+            return _vector_fallback()
         bm25_docs = [{**doc, "bm25_score": score} for doc, score in bm25_hits]
         try:
             from config import RAG_CONFIG
@@ -823,9 +852,12 @@ class RAGKnowledgeAgent(AgentBase):
             return documents
         if self._reranker is None:
             try:
-                from sentence_transformers import CrossEncoder
+                # 进程级共享：Web 每个会话各有一个 RAGKnowledgeAgent 实例，
+                # 按实例加载会让重排模型（~1GB）随会话数成倍复制；与嵌入
+                # 模型同一共享口径（utils/reranker_model）
+                from utils.reranker_model import get_shared_cross_encoder
 
-                self._reranker = CrossEncoder(model_name)
+                self._reranker = get_shared_cross_encoder(model_name)
             except Exception as exc:  # noqa: BLE001 - 重排是增强项
                 self._reranker_failed = True
                 logger.warning(

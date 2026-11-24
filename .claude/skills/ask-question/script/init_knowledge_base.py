@@ -170,7 +170,7 @@ def _is_managed_metadata(metadata: dict) -> bool:
 
 def _collect_preserved_documents(
     source_dir: Path,
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[dict], list[str], set[str]]:
     """导出重建前集合里「非受管」的已有片段（面板 / CLI 添加）。
 
     ``source_dir`` 是收集来源的知识库目录：初始化脚本第 3 步会在 skill
@@ -184,8 +184,11 @@ def _collect_preserved_documents(
     - 带 group 的多分片文档整组保留且**不做内容去重**（组内相同内容合法），
       parts 声明与实际分片不齐的残缺组整体丢弃并告警。
 
-    返回 ``(可补写片段, 告警列表)``；导出失败抛 RuntimeError，调用方必须在
-    删库之前中止（否则面板 / CLI 添加的知识会永久丢失）。
+    返回 ``(可补写片段, 告警列表, 需要跳过的源文件)``；导出失败抛
+    RuntimeError，调用方必须在删库之前中止（否则面板 / CLI 添加的知识会
+    永久丢失）。被面板 / CLI 编辑过的内置文档（分片带 ``user_edited`` 标记）
+    按普通知识保留（去掉受管标记），其源文件返回给调用方跳过导入——否则
+    「重建 = 源文件重新导入」会把用户的编辑静默还原成原文。
     """
     try:
         from utils.knowledge_admin import export_documents
@@ -199,6 +202,7 @@ def _collect_preserved_documents(
     groups: dict[str, list[dict]] = {}
     singles: list[dict] = []
     seen_singles: set[str] = set()
+    edited_files: set[str] = set()
     for row in rows:
         content = str(row.get("content") or "")
         key = content.strip()
@@ -207,9 +211,20 @@ def _collect_preserved_documents(
         metadata = row.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
         if _is_managed_metadata(metadata):
-            # 受管文档的旧切分（文件已改动 / 删除）不能补写：否则新旧两版
-            # 长期共存，且旧分片会形成 parts 声明不符的残缺组
-            continue
+            if str(metadata.get("user_edited") or "") != "1":
+                # 未编辑的受管文档旧切分（文件已改动 / 删除）不能补写：
+                # 否则新旧两版长期共存，且旧分片会形成 parts 声明不符的残缺组
+                continue
+            # 用户在面板 / CLI 编辑过内置文档：编辑版作为普通知识保留（去掉
+            # 受管标记，后续重建不再当作过期内容），并记录源文件供调用方跳过
+            file_path = str(metadata.get("file_path") or "")
+            if file_path:
+                edited_files.add(file_path)
+            metadata = {
+                meta_key: meta_value
+                for meta_key, meta_value in metadata.items()
+                if meta_key not in {"source", "file_path", "user_edited"}
+            }
         entry = {"content": content, "metadata": metadata}
         group = str(metadata.get("group") or "")
         if group:
@@ -224,11 +239,17 @@ def _collect_preserved_documents(
         parts: set[int] = set()
         for piece in pieces:
             meta = piece["metadata"]
+            # part 与 parts 分开解析：metadata 可能带 Infinity（json.loads
+            # 默认接受），int(inf) 抛 OverflowError——单个坏字段不能阻止
+            # parts 声明继续参与完整性判定（否则残缺组会被误当完整组保留）
             try:
                 parts.add(int(meta.get("part") or 0))
-                declared = max(declared, int(meta.get("parts") or 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 parts.add(0)
+            try:
+                declared = max(declared, int(meta.get("parts") or 0))
+            except (TypeError, ValueError, OverflowError):
+                pass
         if declared > _GROUP_PARTS_MAX:
             dropped_groups += 1
             continue
@@ -239,7 +260,12 @@ def _collect_preserved_documents(
     warnings: list[str] = []
     if dropped_groups:
         warnings.append(f"丢弃 {dropped_groups} 个残缺分片组（parts 声明与实际不符）")
-    return preserved + singles, warnings
+    if edited_files:
+        warnings.append(
+            f"{len(edited_files)} 个内置文档存在手动编辑：本次保留编辑版并跳过"
+            "源文件导入（如需恢复内置原文，请在面板删除该文档后重新运行本脚本）"
+        )
+    return preserved + singles, warnings, edited_files
 
 
 _BACKUP_NAME = "preserved_backup.json"
@@ -538,6 +564,7 @@ def main() -> int:
         print("3. 初始化RAG Agent...")
         print(f"   知识库路径: {knowledge_base_path}")
         preserved: list[dict] = []
+        edited_files: set[str] = set()
         preserved_ready = False
         backup_path: Path | None = None
         try:
@@ -562,7 +589,7 @@ def main() -> int:
             # 先删集合后导出会让这些知识在换嵌入模型时永久丢失
             print("   正在导出库内已有片段（维度重建前保留）...")
             try:
-                preserved, warnings = _collect_preserved_documents(
+                preserved, warnings, edited_files = _collect_preserved_documents(
                     source_knowledge_dir
                 )
             except RuntimeError as export_error:
@@ -612,7 +639,7 @@ def main() -> int:
                 # 导出失败必须在删库之前中止：库内面板 / CLI 添加的片段
                 # 只存在于 Milvus，先删后导会永久丢失
                 try:
-                    preserved, warnings = _collect_preserved_documents(
+                    preserved, warnings, edited_files = _collect_preserved_documents(
                         source_knowledge_dir
                     )
                 except RuntimeError as export_error:
@@ -643,6 +670,13 @@ def main() -> int:
                 print("   ✓ Collection 重建完成")
 
         # 5. 写入文档（内置文件 + 重建前导出的已有片段）
+        if edited_files:
+            documents = [
+                doc
+                for doc in documents
+                if str((doc.get("metadata") or {}).get("file_path") or "")
+                not in edited_files
+            ]
         print("5. 将文档添加到RAG知识库...")
         try:
             # 分批写入（每批 200 条、失败重试一次）：一次性巨型调用在补写

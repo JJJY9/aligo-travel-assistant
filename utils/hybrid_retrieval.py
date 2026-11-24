@@ -161,28 +161,32 @@ class BM25Index:
         return sum(idf for _, idf in self._query_idf_terms(query)) * saturation
 
     def normalized_score(self, query: object, content: object) -> float:
-        """单篇内容的归一化 BM25（0–1，覆盖度 × TF 饱和，长度中性）。
+        """单篇内容的归一化 BM25（0–1，IDF 加权覆盖度 × 绝对证据量）。
 
-        分子按该文档自身长度饱和、分母取同长度下「覆盖全部查询词」的
-        满分：覆盖度按查询词 IDF 质量计，长片段不会因长度惩罚被误拒，
-        短片段也不会仅凭命中个别常见词就拿到高分。
+        评分 = 覆盖度 × 绝对证据量：
+
+        - 覆盖度 = 命中查询词的 IDF 之和 / 全部查询词（含 OOV）的 IDF 之和；
+        - 绝对证据量 = ``1 - exp(-命中词 IDF 之和)``。
+
+        不再使用 TF 饱和比值：旧口径里重复一个查询词就能把单篇分值抬到
+        「覆盖全部查询词」的满分（``distance=max(余弦, 归一化BM25)`` 以
+        1.0 通过 min_score 并排到首位），单 token 查询更是任何包含该词
+        的片段恒为 1.0。IDF 加权覆盖度让「只命中一部分查询词」的片段
+        按缺失词的质量缩水；绝对证据量让只命中一个高频词（idf≈1）的
+        片段停在 0.5 上下，必须命中更多 / 更罕见的查询词才能接近 1.0。
+        长度中性（不做文档长度归一）；TF 仍影响 BM25 排序本身。
         """
-        tokens = tokenize(content)
-        if not tokens or not self.documents or self._avgdl <= 0:
+        terms = self._query_idf_terms(query)
+        if not terms or not self.documents:
             return 0.0
-        doc_len = len(tokens)
-        norm = 1.0 - self.b + self.b * doc_len / self._avgdl
-        tf = Counter(tokens)
-        score = 0.0
-        for term, idf in self._query_idf_terms(query):
-            freq = tf.get(term)
-            if not freq:
-                continue
-            score += idf * freq * (self.k1 + 1.0) / (freq + self.k1 * norm)
-        reference = self.normalization_reference(query, doc_len)
-        if reference <= 0:
+        tf = Counter(tokenize(content))
+        total_idf = sum(idf for _, idf in terms)
+        matched_idf = sum(idf for term, idf in terms if tf.get(term))
+        if total_idf <= 0 or matched_idf <= 0:
             return 0.0
-        return min(1.0, score / reference)
+        coverage = matched_idf / total_idf
+        evidence = 1.0 - math.exp(-matched_idf)
+        return coverage * evidence
 
 
 def rrf_fuse(
@@ -226,8 +230,8 @@ def annotate_hybrid_scores(
     ``min_score`` 的「0–1、越高越相关」语义，又让只在关键词路命中
     （向量分低）的片段有机会通过阈值。
 
-    归一化口径优先用 ``bm25_normalized``（每篇按自身长度计算的
-    ``BM25Index.normalized_score``：覆盖度 × TF 饱和、长度中性）。兼容
+    归一化口径优先用 ``bm25_normalized``（``BM25Index.normalized_score``：
+    IDF 加权覆盖度 × 绝对证据量，单一高频词 / 部分覆盖不会到满分）。兼容
     传入 ``bm25_reference`` 的旧口径（平均长度理想得分，长片段会因长度
     惩罚被压低）；两者都缺省时退回「本次最高 BM25 分」——top-1 永远
     是 1.0，仅为兼容旧调用方保留。

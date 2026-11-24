@@ -96,6 +96,7 @@ def test_min_score_filters_low_similarity_and_warns():
     result = evaluate_retrieval(search_low, cases=cases, top_k=5, min_score=0.5)
     assert result["hit5"] == 0.0 and result["mrr"] == 0.0
     assert "warning" in result and "题库" in result["warning"]
+    assert "min_score" in result["warning"], "告警需提示阈值排查，不能只引导换题库"
 
     def search_high(query, top_k):
         return [{"content": "关键词", "distance": 0.8}]

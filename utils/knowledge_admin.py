@@ -786,6 +786,19 @@ def update_document(
 
     agent = _get_agent()
     documents = _chunk_documents(text, metadata)
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("source")
+        and metadata.get("file_path")
+    ):
+        # 内置知识库文档（init 脚本写入，带 source + file_path）被面板 / CLI
+        # 编辑：给新分片打上编辑标记，下一次 init 重建会保留编辑版并跳过
+        # 对应源文件——否则「重建 = 源文件重新导入」会把用户的修改静默抹掉
+        for document in documents:
+            document["metadata"] = {
+                **document["metadata"],
+                "user_edited": "1",
+            }
     stored_size = sum(len(document["content"]) for document in documents)
     if stored_size > DOC_MAX_CHARS:
         # 提交文本含分片分隔符时可能略超上限，但重新分片后的实际入库总长

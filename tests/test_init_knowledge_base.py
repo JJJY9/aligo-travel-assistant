@@ -304,18 +304,40 @@ def test_preserved_semantics_by_source(monkeypatch):
         {"content": "重复段", "metadata": {"group": "u1", "part": 2, "parts": 2}},
         {"content": "残片1", "metadata": {"group": "u2", "part": 1, "parts": 3}},
         {"content": "残片2", "metadata": {"group": "u2", "part": 2, "parts": 3}},
+        # 面板编辑过的内置文档：保留编辑版并跳过源文件导入
+        {
+            "content": "我改过的内置内容",
+            "metadata": {
+                "source": "商旅知识库文档",
+                "file_path": "02_edited.txt",
+                "user_edited": "1",
+            },
+        },
+        # metadata 带 Infinity（json.loads 可解析出）：int() 不能抛 OverflowError
+        {"content": "无穷分片", "metadata": {"group": "u3", "part": float("inf"), "parts": 2}},
     ]
     import utils.knowledge_admin as admin_module
 
     monkeypatch.setattr(admin_module, "export_documents", lambda directory=None: rows)
-    preserved, warnings = module._collect_preserved_documents(Path("/tmp/source-kb"))
+    preserved, warnings, edited_files = module._collect_preserved_documents(Path("/tmp/source-kb"))
     contents = [piece["content"] for piece in preserved]
     assert "旧版内置内容" not in contents, "受管旧分片必须丢弃（源文件已改动）"
     assert contents.count("面板加的片段") == 1, "单条按 strip 内容去重"
     assert contents.count("重复段") == 2, "用户组内相同内容不得合并"
     assert all("残片" not in content for content in contents)
-    assert warnings and "残缺" in warnings[0]
-    print("✓ 保留片段按来源判定（受管旧分片丢弃 / 组完整保留）")
+    assert "我改过的内置内容" in contents, "面板编辑过的内置文档必须保留"
+    edited_entry = next(
+        piece for piece in preserved if piece["content"] == "我改过的内置内容"
+    )
+    assert "source" not in edited_entry["metadata"]
+    assert "file_path" not in edited_entry["metadata"]
+    assert "user_edited" not in edited_entry["metadata"]
+    assert edited_files == {"02_edited.txt"}
+    assert any("手动编辑" in warning for warning in warnings), warnings
+    assert any("残缺" in warning for warning in warnings), warnings
+    # Infinity 分片按「缺编号」处理，不让整次收集崩溃
+    assert all("无穷" not in content for content in contents)
+    print("✓ 保留片段按来源判定（受管旧分片丢弃 / 编辑版保留 / 组完整保留）")
 
 
 def test_collect_preserved_uses_explicit_source_dir(monkeypatch):
@@ -331,7 +353,7 @@ def test_collect_preserved_uses_explicit_source_dir(monkeypatch):
 
     monkeypatch.setattr(admin_module, "export_documents", fake_export)
     source = Path("/tmp/legacy-kb")
-    preserved, warnings = module._collect_preserved_documents(source)
+    preserved, warnings, edited_files = module._collect_preserved_documents(source)
     assert preserved == [] and warnings == []
     assert seen["dir"] == source
     print("✓ 保留片段从显式来源目录导出")
@@ -350,7 +372,7 @@ def test_collect_preserved_drops_huge_parts_declaration(monkeypatch):
         {"content": "面板片段", "metadata": {"category": "住宿"}},
     ]
     monkeypatch.setattr(admin_module, "export_documents", lambda directory=None: rows)
-    preserved, warnings = module._collect_preserved_documents(Path("/tmp/source"))
+    preserved, warnings, edited_files = module._collect_preserved_documents(Path("/tmp/source"))
     contents = [piece["content"] for piece in preserved]
     assert "脏分片" not in contents
     assert "面板片段" in contents
@@ -367,7 +389,7 @@ def test_collect_preserved_missing_db_is_empty(monkeypatch):
         raise FileNotFoundError("知识库未初始化")
 
     monkeypatch.setattr(admin_module, "export_documents", missing)
-    preserved, warnings = module._collect_preserved_documents(Path("/tmp/missing"))
+    preserved, warnings, edited_files = module._collect_preserved_documents(Path("/tmp/missing"))
     assert preserved == [] and warnings == []
     print("✓ 来源库不存在时按空集处理")
 
