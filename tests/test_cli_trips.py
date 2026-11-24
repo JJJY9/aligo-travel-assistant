@@ -1008,6 +1008,17 @@ def test_trip_update_args_and_dispatch(monkeypatch):
         cli._parse_trip_update_args(["u1", "trip_1", "--purpose", "--json"])
         is None
     ), "以 - 开头的值必须拒绝，避免把 --json 存成 purpose"
+    # 与 Web PUT 一致：origin / purpose 允许空串（清空字段），
+    # 目的地 / 日期为空仍拒绝
+    parsed_clear = cli._parse_trip_update_args(
+        ["u1", "trip_1", "--origin", "", "--purpose", ""]
+    )
+    assert parsed_clear["values"] == {"origin": "", "purpose": ""}, parsed_clear
+    assert (
+        cli._parse_trip_update_args(["u1", "trip_1", "--destination", ""])
+        is None
+    )
+    assert cli._parse_trip_update_args(["u1", "trip_1", "--start", ""]) is None
     parsed = cli._parse_trip_update_args(
         ["u1", "trip_1", "--purpose=会议", "--start", "2026-12-01", "--json"]
     )

@@ -131,16 +131,23 @@ def parse_trips_csv(
 
     rows: list[dict[str, Any]] = []
     errors = _BoundedErrors()
+    last_error_line = -1
     while True:
         try:
             row = next(reader)
         except StopIteration:
             break
         except csv.Error as exc:
-            # 超长字段 / 未闭合引号把余下内容吞成同一字段：保留已解析行，
-            # 记录错误后停止（与「非法行收集后列出并跳过」的既有契约一致）
+            # 错位引号 / 超长字段之后 csv.reader 仍能继续返回后续行：
+            # 只跳过当前记录，不能 break 丢弃余下可解析的行（README 承诺
+            # 「非法行收集后列出并跳过、不中断其余项」）。未闭合引号会把
+            # 余下文本吞成一条，下一轮要么再次报错、要么整条被判非法行；
+            # 以行号是否推进作为继续条件，避免同一行上报错死循环
             errors.add((reader.line_num, f"CSV 解析失败：{exc}"))
-            break
+            if reader.line_num <= last_error_line:
+                break
+            last_error_line = reader.line_num
+            continue
         # csv.reader 把带引号的多行字段算作一条记录：enumerate 的序号不是
         # 物理行号，用 reader.line_num 才能让报错指向用户看到的行
         line_no = reader.line_num

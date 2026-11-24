@@ -143,6 +143,23 @@ def test_csv_malformed_quote_reports_error_instead_of_merging():
     print("✓ CSV 引号错位报错而非静默合并")
 
 
+def test_csv_error_does_not_drop_following_rows():
+    """错位引号只跳过当前记录：其后可解析的行照常导入（不中断其余项）。"""
+    text = (
+        "出发地,目的地,出发日期\n"
+        "北京,上海,2026-12-01\n"
+        '广州,"深"圳,2026-12-02,,x\n'
+        "北京,广州,2026-12-03\n"
+        "上海,杭州,2026-12-04\n"
+    )
+    rows, errors = parse_trips_csv(text)
+    assert [row["destination"] for row in rows] == ["上海", "广州", "杭州"], rows
+    assert any(
+        "CSV 解析失败" in message for _line, message in errors
+    ), errors
+    print("✓ CSV 解析错误不再丢弃后续行")
+
+
 def test_runner_imports_and_dedupes(monkeypatch):
     store = _ImportStore()
     monkeypatch.setattr(
@@ -1328,6 +1345,7 @@ if __name__ == "__main__":
     test_parse_skips_invalid_rows()
     test_parse_missing_columns_and_empty()
     test_csv_malformed_quote_reports_error_instead_of_merging()
+    test_csv_error_does_not_drop_following_rows()
     test_ics_roundtrip_matches_export()
     test_ics_roundtrip_escapes_machine_delimiters()
     test_ics_unfold_and_lf_only()

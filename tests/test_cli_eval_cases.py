@@ -22,10 +22,13 @@ from utils.eval_cases import build_cases
 
 def test_parse_eval_cases_args():
     """默认值、等号形式与非法参数。"""
-    assert cli._parse_eval_cases_args([]) == (500, 7, None, False)
+    assert cli._parse_eval_cases_args([]) == (500, 7, None, False, False)
     assert cli._parse_eval_cases_args(
         ["--count", "12", "--seed=3", "--out", "cases.jsonl", "--json"]
-    ) == (12, 3, "cases.jsonl", True)
+    ) == (12, 3, "cases.jsonl", True, False)
+    assert cli._parse_eval_cases_args(
+        ["--out", "cases.jsonl", "--force"]
+    ) == (500, 7, "cases.jsonl", False, True)
     assert cli._parse_eval_cases_args(["--count", "abc"]) is None
     assert cli._parse_eval_cases_args(["--count", "5001"]) is None
     assert cli._parse_eval_cases_args(["--seed", "-1"]) is None
@@ -62,7 +65,8 @@ def test_run_eval_cases_write_failure_is_error():
         with contextlib.redirect_stdout(output):
             code = cli.run_eval_cases_standalone(3, 7, root)
         assert code == 1
-        assert "生成评测用例失败" in output.getvalue()
+        # 目标已存在（这里是同名目录）走覆盖守卫，而不是「生成失败」
+        assert "文件已存在" in output.getvalue(), output.getvalue()
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("✓ eval-cases 写入失败返回错误")
@@ -90,7 +94,17 @@ def test_eval_cases_dispatch(monkeypatch):
         "seed": 7,
         "out_path": None,
         "as_json": True,
+        "force": False,
     }
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "eval-cases", "--count", "12", "--out", "x.jsonl", "--force"],
+    )
+    with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls["force"] is True and calls["out_path"] == "x.jsonl"
     print("✓ eval-cases dispatch")
 
 

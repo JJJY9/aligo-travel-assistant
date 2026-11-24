@@ -196,6 +196,39 @@ def test_backup_sanitize_nested_nonfinite_and_nul():
     print("✓ 备份清洗嵌套非有限数与 NUL（可被导入端接受）")
 
 
+def test_export_user_names_are_casefold_unique():
+    """大小写不敏感文件系统上 Alice / alice 不能映射到同一导出文件。
+
+    清洗后名 + 短哈希与合法 ASCII ID 的重叠空间（张三 → ___xxxxxx）
+    也要与真实用户的 ID 区分开。
+    """
+    from utils.exporter import safe_export_user
+
+    names = {
+        user: safe_export_user(user)
+        for user in ("Alice", "alice", "张三", "___ced07f", "a" * 40)
+    }
+    folded = {name.casefold() for name in names.values()}
+    assert len(folded) == len(names), names
+    assert safe_export_user("alice") == "alice", "纯小写普通 ID 不变"
+    # export_files 默认 stem 同样按真实 user_id 消歧
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        alice = export_files(
+            {"user_id": "Alice", "exported_at": "2026-01-01T10:00:00.123456"},
+            Path(tmp),
+        )
+        lower = export_files(
+            {"user_id": "alice", "exported_at": "2026-01-01T10:00:00.123456"},
+            Path(tmp),
+        )
+        assert alice[0] != lower[0]
+        assert alice[0].exists() and lower[0].exists()
+    print("✓ 导出文件名按大小写折叠唯一（含哈希重叠空间）")
+
+
 def test_export_files_cleans_backup_before_write():
     """export_files 接线必须使用 sanitize_backup_data：脏备份写出即可恢复。"""
     from utils.user_import import parse_user_export
@@ -259,6 +292,7 @@ if __name__ == "__main__":
     test_backup_sanitize_nested_nonfinite_and_nul()
     test_backup_sanitize_strips_escaped_nul_and_dict_keys()
     test_export_files_cleans_backup_before_write()
+    test_export_user_names_are_casefold_unique()
     test_export_files_json_is_nan_safe_and_md_written()
     test_markdown_chat_body_escapes_html_and_backslash_cells()
     print("\n全部通过")

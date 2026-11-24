@@ -455,6 +455,26 @@ def test_pref_write_dispatch(monkeypatch):
     assert exc.value.code == 0
     assert calls[-1] == ("set", "u1", "hotel_brands", '["汉庭"]', False, True)
 
+    # 负数与以 '-' 开头的值：单 '-' 开头直接按值处理，'--' 之后一律按值
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "pref-set", "u1", "budget", "-5", "--json-value", "--json"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("set", "u1", "budget", "-5", True, True)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "pref-set", "u1", "note", "--json-value", "--", "--x"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("set", "u1", "note", "--x", False, True)
+
     monkeypatch.setattr(
         sys, "argv", ["cli.py", "pref-delete", "u1", "home_location"]
     )

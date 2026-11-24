@@ -187,10 +187,24 @@ def build_cases(count: int = 500, seed: int = 7) -> list[dict[str, Any]]:
     return cases
 
 
-def dump_cases(path: str | Path, cases: Sequence[dict[str, Any]]) -> None:
-    """把评测用例写成 JSONL（一行一条）。"""
+def dump_cases(
+    path: str | Path,
+    cases: Sequence[dict[str, Any]],
+    *,
+    force: bool = False,
+) -> None:
+    """把评测用例写成 JSONL（一行一条；默认拒绝覆盖已有文件）。
+
+    与其它导出命令（trips-export / session-export / kb-export）同一守卫：
+    ``--out`` 指向用户记忆文件、旧备份或人工维护的用例集时不能被静默
+    截断覆盖；写入走原子替换，中途失败不会留下半截文件。
+    """
+    from utils.atomic_write import write_text_atomic
+
     output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as handle:
-        for case in cases:
-            handle.write(json.dumps(case, ensure_ascii=False) + "\n")
+    if output.exists() and not force:
+        raise FileExistsError(f"文件已存在：{output}（加 --force 覆盖）")
+    text = "".join(
+        json.dumps(case, ensure_ascii=False) + "\n" for case in cases
+    )
+    write_text_atomic(output, text, newline="\n")

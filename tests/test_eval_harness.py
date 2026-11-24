@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -151,7 +153,13 @@ def test_dump_cases_jsonl_roundtrip():
         lines = path.read_text(encoding="utf-8").splitlines()
         assert len(lines) == 12
         assert json.loads(lines[0])["id"] == cases[0]["id"]
-    print("✓ 评测用例 JSONL 导出")
+        # 覆盖守卫：已存在文件默认拒绝（与其它导出命令一致），--force 才覆盖
+        with pytest.raises(FileExistsError):
+            dump_cases(path, build_cases(count=3))
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 12
+        dump_cases(path, build_cases(count=3), force=True)
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 3
+    print("✓ 评测用例 JSONL 导出（默认拒绝覆盖，--force 覆盖）")
 
 
 if __name__ == "__main__":

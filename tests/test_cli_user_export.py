@@ -394,6 +394,67 @@ def test_user_export_scans_existing_quarantine_backups(monkeypatch, tmp_path):
     print("✓ 已存在的隔离备份同样拦截导出")
 
 
+def test_interactive_export_uses_restore_shape_check(monkeypatch, tmp_path):
+    """交互菜单 export 与 user-export / Web 同一「恢复后形状」50MB 复核。
+
+    #929 只迁移了 standalone 与 Web；菜单路径只看原始字节会写出导入端
+    必然拒绝的备份，并打印「✓ 已导出」。
+    """
+    from rich.console import Console
+
+    from utils import exporter as exporter_module
+    from utils import user_import
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=120)
+    agent.user_id = "u1"
+
+    class _Store:
+        def export_snapshot(self):
+            return {
+                "preferences": {"home_location": "北京"},
+                "trip_history": [],
+                "chat_history": [],
+                "session_titles": {},
+                "pinned_sessions": [],
+                "archived_sessions": [],
+                "statistics": {},
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: _Store()
+    )
+    written: list = []
+    monkeypatch.setattr(
+        exporter_module,
+        "export_files",
+        lambda data, out: written.append(data)
+        or [tmp_path / "aligo_u1.json"],
+    )
+    monkeypatch.setattr(
+        user_import,
+        "export_backup_limit_problem",
+        lambda backup, **kwargs: "恢复后约 51.0 MB 超过导入上限 50 MB",
+    )
+    agent.export_memory()
+    assert "导出中止" in buffer.getvalue(), buffer.getvalue()
+    assert written == [], "形状复核拒绝时不能写出文件"
+
+    monkeypatch.setattr(
+        user_import,
+        "export_backup_limit_problem",
+        lambda backup, **kwargs: None,
+    )
+    agent.export_memory()
+    assert written and written[-1]["user_id"] == "u1"
+    assert "已导出" in buffer.getvalue()
+    print("✓ 交互导出按恢复后形状复核 50MB")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -466,6 +527,13 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_write_failure_reports(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_interactive_export_uses_restore_shape_check(
+            mp, Path(tempfile.mkdtemp())
+        )
     finally:
         mp.undo()
     print("\n全部通过")
