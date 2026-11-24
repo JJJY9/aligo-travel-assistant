@@ -874,6 +874,41 @@ def test_drain_budget_is_shared_across_waits():
     print("✓ drain 总预算在回滚与延迟提交之间共享")
 
 
+def test_drain_budget_covers_rollback_wait():
+    """落库失败 / 否决分支的回滚等待同样受 drain 总预算约束。"""
+    runtime, _ = _make_runtime()
+    seen = {}
+
+    async def record_rollback(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout_sec")
+        await asyncio.sleep(0.1)
+
+    async def record_commit(timeout_sec):
+        seen["commit"] = timeout_sec
+
+    state = {
+        "rollback_requested": False,
+        "turn_id": "t1",
+        "seq": 1,
+        "persisted": None,
+    }
+    runtime._last_persist_turn = ("你好", state)
+    runtime._request_staged_rollback = record_rollback  # type: ignore[method-assign]
+    runtime._await_deferred_commit = record_commit  # type: ignore[method-assign]
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        pending.set_exception(RuntimeError("persist failed"))
+        runtime._pending_persist = pending
+        return await runtime.drain_pending_persist(timeout_sec=0.3)
+
+    assert asyncio.run(_run()) is True
+    assert seen["timeout"] is not None and seen["timeout"] <= 0.35, seen
+    assert seen["commit"] <= 0.35, seen
+    print("✓ drain 总预算覆盖回滚等待")
+
+
 def test_deferred_commit_forwards_epoch():
     """落库回调把本轮纪元传给支持 epoch 的编排器；旧编排器按无参调用。"""
     runtime, _ = _make_runtime()
@@ -1820,6 +1855,7 @@ if __name__ == "__main__":
     test_turn_persisted_false_when_probe_fails_before_turn()
     test_deferred_commit_forwards_epoch()
     test_drain_budget_is_shared_across_waits()
+    test_drain_budget_covers_rollback_wait()
     test_late_callback_without_checkpoint_key_keeps_next_checkpoint()
     test_memory_without_rollback_hook_is_tolerated()
     test_cancel_during_deferred_commit_does_not_double_usage()

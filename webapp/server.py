@@ -137,6 +137,8 @@ logger = logging.getLogger(__name__)
 
 # SSE 心跳间隔（秒）：LLM 调用可能持续数十秒，定期发送注释行避免代理/浏览器超时
 SSE_HEARTBEAT_SEC = 15.0
+# 流式回合收尾的 drain 总预算（生成器 finally 与响应包装器共享同一截止时刻）
+_STREAM_DRAIN_BUDGET_SEC = 10.0
 # 请求体大小上限（JSON 接口都是小请求；防止超大 body 在 Pydantic 校验前耗尽内存）
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 实时写入的条数上限：与备份导入的上限同一口径（utils.user_import），
@@ -1135,6 +1137,9 @@ class _SessionTurnLease:
         self._released = False
         self._turn_task: asyncio.Task[Any] | None = None
         self._after_stop: Any = None
+        # drain 总预算的截止时刻：生成器 finally 与响应包装器可能各调一次
+        # stop_turn（aclose 先跑生成器收尾），两次必须共享同一预算
+        self._drain_deadline: float | None = None
 
     def bind_turn(self, task: asyncio.Task[Any]) -> None:
         """登记本回合的协程任务：释放租约前先由 :meth:`stop_turn` 收尾。"""
@@ -1157,8 +1162,13 @@ class _SessionTurnLease:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if self._drain_deadline is None:
+            self._drain_deadline = time.monotonic() + _STREAM_DRAIN_BUDGET_SEC
+        remaining = max(0.1, self._drain_deadline - time.monotonic())
         try:
-            await self._session.runtime.drain_pending_persist()
+            await self._session.runtime.drain_pending_persist(
+                timeout_sec=remaining
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 落库失败已由回合自身映射
@@ -1241,11 +1251,10 @@ class _LeasedStreamingResponse(StreamingResponse):
             if self._stream_state is not None:
                 # 断连记账：ASGI 2.3（uvicorn 0.54）下 Starlette 会把
                 # http.disconnect 的取消吞掉、正常返回，中间件看不到任何
-                # 异常。回合已启动、任一终态都未送达 ⇒ 客户端断连 ——
-                # 在 scope 上打标，由中间件按 499 记账（线上状态保持 200）
-                if self._stream_state.get("turn_started") and not (
-                    self._stream_state.get("terminal_delivered")
-                ):
+                # 异常。任一终态未送达 ⇒ 客户端断连（含幂等回放流与首帧
+                # 发送前的中断）——在 scope 上打标，由中间件按 499 记账
+                # （线上状态保持 200）
+                if not self._stream_state.get("terminal_delivered"):
                     scope.setdefault("state", {})["aligo_stream_aborted"] = True
             with contextlib.suppress(asyncio.CancelledError):
                 await self._lease.stop_turn()
@@ -5134,6 +5143,16 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             if idem_key is not None:
                 cached = state.idempotency.get(idem_key)
+                if cached is None and state.breaker.denies_new_calls():
+                    # 入口预检到锁内之间缓存可能过期 / 被淘汰：熔断仍要拒绝，
+                    # 不能把打开期的请求放回限流 → 建会话 → ask 的重路径
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "服务暂时不可用，请稍后再试"
+                            f"（请求 ID：{_request_id(request)}）"
+                        ),
+                    )
                 if cached is not None:
                     if cached.get("__incomplete__"):
                         # 上一请求已落库但客户端断连没收到响应：不能重放
@@ -5357,10 +5376,22 @@ def create_app(model: Any = None) -> FastAPI:
             # 执行的会话 id
             if idem_key is not None:
                 cached = state.idempotency.get(idem_key)
+                if cached is None and state.breaker.denies_new_calls():
+                    # 入口预检到锁内之间缓存可能过期 / 被淘汰：补一次熔断
+                    # 复核，不让打开期的请求进入限流后的重路径
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "服务暂时不可用，请稍后再试"
+                            f"（请求 ID：{_request_id(request)}）"
+                        ),
+                    )
                 if cached is not None:
                     cached_session_id = str(
                         cached.get("session_id") or payload.session_id or ""
                     )
+
+                    replay_state = {"terminal_delivered": False}
 
                     async def replay_stream() -> Any:
                         yield (
@@ -5394,6 +5425,8 @@ def create_app(model: Any = None) -> FastAPI:
                                 )
                                 + "\n\n"
                             )
+                            # 消费方取下一项才执行：走到这里说明终态帧已送达
+                            replay_state["terminal_delivered"] = True
                             return
                         yield (
                             "data: "
@@ -5405,10 +5438,12 @@ def create_app(model: Any = None) -> FastAPI:
                             )
                             + "\n\n"
                         )
+                        replay_state["terminal_delivered"] = True
 
                     return _LeasedStreamingResponse(
                         replay_stream(),
                         _LockReplayLease(lock),
+                        stream_state=replay_state,
                         media_type="text/event-stream",
                         headers={
                             "Cache-Control": "no-cache",
@@ -5460,10 +5495,22 @@ def create_app(model: Any = None) -> FastAPI:
                         persisted = False
                     if not persisted:
                         return
-                    if state.idempotency.get(idem_key) is not None:
-                        # 服务器已缓存终态（done 在入队后、发送前写入缓存，
-                        # 断连可能发生在缓存之后）：同键重试应回放已缓存的
-                        # 完整回答，不能用「未送达」标记覆盖掉它
+                    # 服务器已缓存终态（done 在入队后、发送前写入缓存，
+                    # 断连可能发生在缓存之后）：同键重试应回放已缓存的
+                    # 完整回答，不能用「未送达」标记覆盖掉它。缓存是双写
+                    # 的（请求会话键先写、解析后会话键后写），LRU 淘汰顺序
+                    # 可能只留下 resolved 键——两个键都要查
+                    resolved_key = make_key(
+                        payload.user_id,
+                        session.session_id,
+                        payload.idempotency_key or "",
+                        endpoint="chat_stream",
+                        message=payload.message,
+                    )
+                    if state.idempotency.get(idem_key) is not None or (
+                        resolved_key != idem_key
+                        and state.idempotency.get(resolved_key) is not None
+                    ):
                         return
                     # 流在 done 之前结束（客户端断连），但 drain 后确认整轮
                     # 已落库：给幂等键留标记，同键重试回放错误终态而不是

@@ -1211,7 +1211,8 @@ def test_leased_streaming_abort_flags_and_closes_generator():
             events.append("closed")
 
     async def _run():
-        state = {"turn_started": True, "terminal_delivered": False}
+        # 不再依赖 turn_started（幂等回放流 / 首帧发送前的中断也要记账）
+        state = {"terminal_delivered": False}
         response = _LeasedStreamingResponse(body(), _Lease(), stream_state=state)
         sent: list[dict] = []
 
@@ -1243,7 +1244,26 @@ def test_leased_streaming_abort_flags_and_closes_generator():
     assert scope["state"].get("aligo_stream_aborted") is True, scope
     assert "closed" in events, "断连后必须显式关闭生成器（取消心跳 / 落定状态）"
     assert events[-1] == "release", events
-    print("✓ 流式断连关闭生成器并打标")
+
+    # 终态已送达的完整流：send 抛错发生在所有帧之后也不能打标
+    async def _complete_run():
+        state = {"terminal_delivered": True}
+        response = _LeasedStreamingResponse(body(), _Lease(), stream_state=state)
+        scope = {"type": "http", "state": {}}
+
+        async def send(message):
+            return None
+
+        async def receive():
+            await asyncio.sleep(0)
+            return {"type": "http.request"}
+
+        await response(scope, receive, send)
+        return scope
+
+    complete_scope = asyncio.run(_complete_run())
+    assert not complete_scope["state"].get("aligo_stream_aborted")
+    print("✓ 流式断连关闭生成器并打标（终态送达不误报）")
 
 
 def test_idempotent_replay_survives_open_breaker(monkeypatch):
@@ -1329,6 +1349,51 @@ def test_idempotent_replay_survives_open_breaker(monkeypatch):
     finally:
         _cleanup(user_id)
     print("✓ 熔断打开时已缓存结果仍可回放")
+
+
+def test_breaker_rechecked_when_idem_cache_misses_inside_lock(monkeypatch):
+    """入口缓存预检命中、锁内已被淘汰：熔断仍要拒绝（不能回到重路径）。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_breaker_recheck")
+    key = make_key(user_id, "s-br2", "k-1", endpoint="chat", message="你好")
+
+    calls = {"n": 0}
+    real_get = state.idempotency.get
+
+    def flaky_get(entry_key):
+        if entry_key == key:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"session_id": "s-br2", "reply": "cached"}
+            return None
+        return real_get(entry_key)
+
+    class _DenyBreaker:
+        def denies_new_calls(self):
+            return True
+
+        def raise_if_open(self):
+            raise AssertionError("不应进入对话")
+
+    try:
+        monkeypatch.setattr(state.idempotency, "get", flaky_get)
+        monkeypatch.setattr(state, "breaker", _DenyBreaker(), raising=False)
+        response = client.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "s-br2",
+                "idempotency_key": "k-1",
+            },
+        )
+        assert response.status_code == 503, response.text
+    finally:
+        _cleanup(user_id)
+    print("✓ 锁内缓存 miss 时补熔断复核（503）")
 
 
 def test_chat_lock_checks_disconnect_after_uncontended_acquire():
@@ -13405,14 +13470,17 @@ def test_chat_lock_wait_is_bounded(monkeypatch):
         async def is_disconnected(self) -> bool:
             return self._disconnected
 
-    monkeypatch.setattr(server_module, "_CHAT_LOCK_WAIT_SEC", 0.05)
+    # 超时必须显式传参：_acquire_chat_lock 的默认值在模块导入时已绑定，
+    # 给模块常量打补丁不会生效（此前该用例实际等满生产超时 ~50 秒）
     monkeypatch.setattr(server_module, "_CHAT_LOCK_POLL_SEC", 0.01)
 
     async def _timed_out():
         lock = asyncio.Lock()
         await lock.acquire()
         try:
-            await server_module._acquire_chat_lock(_Request(), lock, "rid")
+            await server_module._acquire_chat_lock(
+                _Request(), lock, "rid", timeout=0.05
+            )
         finally:
             lock.release()
 
@@ -13427,7 +13495,7 @@ def test_chat_lock_wait_is_bounded(monkeypatch):
         await lock.acquire()
         try:
             await server_module._acquire_chat_lock(
-                _Request(disconnected=True), lock, "rid"
+                _Request(disconnected=True), lock, "rid", timeout=0.05
             )
         finally:
             lock.release()
