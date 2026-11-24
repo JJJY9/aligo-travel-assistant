@@ -674,16 +674,34 @@ def test_reconcile_confirms_after_open_session():
     assert late["toasts"] == [], late
     # 最终确认发现落后再刷一次（openSession）保证界面包含刚落库的一轮
     assert late["open_calls"] == 2, late
+    # 对账轮询用 5 秒短超时（默认 120 秒会让 ~12 秒判定期在挂起时失效）
+    assert late["timeouts"] and all(
+        value == 5000 for value in late["timeouts"]
+    ), late
 
     missing = data["stillMissing"]
     assert missing["input"] == "你好", missing
     assert any("暂未确认保存结果" in item for item in missing["toasts"]), missing
+    assert all(value == 5000 for value in missing["timeouts"]), missing
 
     # 对账期间用户点击了其它会话：不能把旧提问写进当前输入框
     interleaved = data["interleaved"]
     assert interleaved["input"] == "", interleaved
     assert interleaved["toasts"] == [], interleaved
     print("✓ 停止对账按最终确认结果判定是否保存")
+
+
+def test_download_suppresses_concurrency_and_times_out():
+    """下载：并发点击被抑制；服务端挂起时 abort 超时并在结束后复位。"""
+    data = _run_harness("downloadGuards")
+    assert data["second"] is False, data
+    assert any("仍在进行中" in item for item in data["toasts"]), data
+    assert data["firstResult"] is False, data
+    assert any("下载超时" in item for item in data["toasts"]), data
+    # 超时后守卫复位：同一 URL 可以重新下载
+    assert data["third"] is True, data
+    assert data["calls"] == 2, data
+    print("✓ 下载并发抑制与超时复位")
 
 
 def test_retry_checks_turn_persisted_first():
@@ -693,10 +711,12 @@ def test_retry_checks_turn_persisted_first():
     assert persisted["sent"] == [], persisted
     assert persisted["opened"] == 1 and persisted["removed"] == 1, persisted
     assert any("已保存" in item for item in persisted["toasts"]), persisted
+    assert persisted["timeout"] == 5000, persisted
 
     missing = data["missing"]
     assert missing["sent"] == ["你好"], missing
     assert missing["opened"] == 0, missing
+    assert missing["timeout"] == 5000, missing
     print("✓ 重试前检查本轮是否已落库（避免重复问答）")
 
 
@@ -871,6 +891,7 @@ if __name__ == "__main__":
     test_open_session_confirms_pending_edit()
     test_render_markdown_caps_oversized_message()
     test_retry_checks_turn_persisted_first()
+    test_download_suppresses_concurrency_and_times_out()
     test_send_message_confirms_pending_edit_draft()
     test_session_html_export_uses_full_server_endpoint()
     test_session_refresh_keeps_expanded_list()

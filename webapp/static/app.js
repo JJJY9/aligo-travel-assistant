@@ -1216,6 +1216,8 @@ async function turnPersistedTurn(sessionId, turnId) {
   try {
     const data = await getJSON(
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+      {},
+      5000,
     );
     return Boolean(
       data &&
@@ -1372,10 +1374,24 @@ function addFollowUps(node, agents) {
   node.appendChild(row);
 }
 
+const downloadInFlight = new Set();
+
 async function downloadFromApi(url, fallbackName) {
+  if (downloadInFlight.has(url)) {
+    // 重复点击不能叠加发起多次全量导出（导出槽位被占满后只会 503）
+    toast("下载仍在进行中，请稍候");
+    return false;
+  }
+  downloadInFlight.add(url);
+  const controller =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => controller.abort(), 120000)
+    : null;
   try {
     const response = await fetch(url, {
       headers: { "X-Aligo-Client": "web" },
+      ...(controller ? { signal: controller.signal } : {}),
     });
     if (!response.ok) {
       throw new Error(await errorMessage(response));
@@ -1430,9 +1446,17 @@ async function downloadFromApi(url, fallbackName) {
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
     return true;
   } catch (error) {
-    // 接口可能返回 400/404/409/503 JSON：不能把错误页当成文件下载
-    toast(`下载失败：${error.message}`);
+    if (error && error.name === "AbortError") {
+      // 服务端挂起 / 连接黑洞：不能让按钮永远没有反馈
+      toast("下载超时：服务端未在 2 分钟内返回，请稍后重试");
+    } else {
+      // 接口可能返回 400/404/409/503 JSON：不能把错误页当成文件下载
+      toast(`下载失败：${error.message}`);
+    }
     return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+    downloadInFlight.delete(url);
   }
 }
 
@@ -3327,6 +3351,8 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     try {
       data = await getJSON(
         `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+        {},
+        5000,
       );
     } catch (_) {
       data = null;
@@ -3363,6 +3389,8 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
         try {
           const latest = await getJSON(
             `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+            {},
+            5000,
           );
           if (
             canSync() &&
@@ -4785,10 +4813,10 @@ async function refreshKnowledgeDocuments({ refreshCategories = true } = {}) {
     return;
   }
   const seq = ++kbListSeq;
-  els.kbList.textContent = "加载中…";
-  state.kbItems = [];
-  state.kbOffset = 0;
-  state.kbTotal = 0;
+  // 已有结果时保留列表直到新数据到达（失败不清空、不闪烁）
+  if (!state.kbItems.length) {
+    els.kbList.textContent = "加载中…";
+  }
   // 刷新期间隐藏「加载更多」：否则点击会以 offset=0 请求第一页
   updateKnowledgeMore();
   // 分类计数只随库内容变化：关键词搜索的每次防抖刷新都重扫整库会白白
@@ -4802,7 +4830,16 @@ async function refreshKnowledgeDocuments({ refreshCategories = true } = {}) {
     renderKnowledgeDocuments(data.items || [], false);
   } catch (error) {
     if (seq !== kbListSeq) return;
-    els.kbList.textContent = error.message;
+    if (error && error.status === 429) {
+      // 限流（搜索防抖仍可能把 60 次/分钟的桶耗尽）：toast 提示并保留
+      // 已有结果，不能把列表内容替换成错误原文
+      toast(error.message);
+    } else {
+      els.kbList.textContent = error.message;
+      state.kbItems = [];
+      state.kbOffset = 0;
+      state.kbTotal = 0;
+    }
   }
   updateKnowledgeMore();
 }
@@ -5999,21 +6036,31 @@ function bindEvents() {
   }
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
-  els.kbSearch.addEventListener("input", () => {
+  const applyKnowledgeSearch = () => {
     clearTimeout(kbSearchTimer);
-    kbSearchTimer = setTimeout(() => {
-      exitKbSemanticMode();
-      state.kbQuery = els.kbSearch.value.trim();
-      refreshKnowledgeDocuments({ refreshCategories: false });
-    }, 250);
+    exitKbSemanticMode();
+    const query = els.kbSearch.value.trim();
+    // 同值去重：输入法确认 / 焦点事件产生的重复 input 不重复消耗额度
+    if (query === state.kbQuery) return;
+    state.kbQuery = query;
+    refreshKnowledgeDocuments({ refreshCategories: false });
+  };
+  const scheduleKnowledgeSearch = () => {
+    clearTimeout(kbSearchTimer);
+    // 600ms 防抖：服务端每次搜索都整库扫描，并与写入 / 导入共用
+    // 60 次/分钟的限流桶——250ms 停顿即发请求会自伤式耗尽额度
+    kbSearchTimer = setTimeout(applyKnowledgeSearch, 600);
+  };
+  els.kbSearch.addEventListener("input", (event) => {
+    // 输入法合成期间不发请求：合成结束再由 compositionend 触发
+    if (event.isComposing) return;
+    scheduleKnowledgeSearch();
   });
+  els.kbSearch.addEventListener("compositionend", scheduleKnowledgeSearch);
   els.kbSearch.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
-      clearTimeout(kbSearchTimer);
-      exitKbSemanticMode();
-      state.kbQuery = els.kbSearch.value.trim();
-      refreshKnowledgeDocuments({ refreshCategories: false });
+      applyKnowledgeSearch();
     }
   });
   els.kbCategoryFilter.addEventListener("change", () => {

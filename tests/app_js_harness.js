@@ -1098,15 +1098,18 @@ async function scenarioReconcile(source) {
       '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 0;'
     );
     const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
+    const timeouts = [];
     // 判定期限覆盖服务端 10 秒 drain：前 9 次轮询 + 第 10 次（进入最终确认
     // 分支前的那次）都先给旧数据；VM 内 setTimeout 立即触发，测试不真等
     for (let i = 0; i < 10; i += 1) {
       const request = await waitRequest(env);
+      timeouts.push(request.args[2]);
       request.resolve({ messages: oldMessages });
       await tick();
     }
     // 最终确认：openSession 后追加的确认请求
     const confirm = await waitRequest(env);
+    timeouts.push(confirm.args[2]);
     confirm.resolve({ messages: finalMessages });
     await promise;
     await tick();
@@ -1114,6 +1117,7 @@ async function scenarioReconcile(source) {
       input: run("els.input.value"),
       toasts: run("__toasts.slice()"),
       open_calls: run("__openCalls"),
+      timeouts,
     };
   };
 
@@ -1178,6 +1182,7 @@ async function scenarioRetryGuard(source) {
       opened: run("__opened"),
       removed: run("__removed"),
       toasts: run("__toasts.slice()"),
+      timeout: request.args[2],
     };
   };
   const persisted = await runCase([
@@ -1186,6 +1191,72 @@ async function scenarioRetryGuard(source) {
   ]);
   const missing = await runCase([{ role: "user", content: "旧提问" }]);
   return { persisted, missing };
+}
+
+async function scenarioDownloadGuards(source) {
+  // 下载：并发点击被抑制；服务端挂起时 abort 超时并复位在途标记
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    globalThis.__controllers = [];
+    globalThis.__calls = 0;
+    AbortController = class {
+      constructor() {
+        this.signal = {
+          listeners: [],
+          addEventListener: (_, fn) => this.signal.listeners.push(fn),
+        };
+        __controllers.push(this);
+      }
+      abort() {
+        this.signal.listeners.forEach((fn) => fn());
+      }
+    };
+    fetch = (url, options) => new Promise((resolve, reject) => {
+      __calls += 1;
+      const call = __calls;
+      if (call === 1) {
+        // 第一个请求挂起，直到被 abort
+        options.signal.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+        return;
+      }
+      resolve({
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) =>
+            String(name).toLowerCase() === "content-disposition"
+              ? 'attachment; filename="x.json"'
+              : "",
+        },
+        blob: async () => ({ __blob: true }),
+      });
+    });
+    URL.createObjectURL = () => "blob:x";
+    URL.revokeObjectURL = () => {};
+    document.body.appendChild = () => {};
+  `);
+  run('__first = downloadFromApi("/api/export", "f.json")');
+  const second = await run('downloadFromApi("/api/export", "f.json")');
+  run("__controllers[0].abort()");
+  run("__first.then((value) => { globalThis.__firstResult = value; });");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const firstResult = run("globalThis.__firstResult");
+  // 第一次结束后在途标记必须复位：同一 URL 可以重新下载
+  const third = await run('downloadFromApi("/api/export", "f.json")');
+  return {
+    second,
+    firstResult,
+    third,
+    calls: run("__calls"),
+    toasts: run("__toasts.slice()"),
+  };
 }
 
 async function scenarioSessionRefresh(source) {
@@ -2590,6 +2661,8 @@ async function main() {
     payload = await scenarioSilentRestoreWindow(source);
   } else if (scenario === "sessionSearchFailure") {
     payload = await scenarioSessionSearchFailure(source);
+  } else if (scenario === "downloadGuards") {
+    payload = await scenarioDownloadGuards(source);
   } else if (scenario === "reconcile") {
     payload = await scenarioReconcile(source);
   } else if (scenario === "chatPersisted") {
