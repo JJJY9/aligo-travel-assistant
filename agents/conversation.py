@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -44,6 +45,35 @@ from utils.usage import add_usage
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+_STAGE_VISIBLE_WAIT_SEC = 5.0
+
+
+def _wait_stage_visible(
+    loop: asyncio.AbstractEventLoop,
+    stage_future: "asyncio.Future | None",
+    timeout_sec: float = _STAGE_VISIBLE_WAIT_SEC,
+) -> None:
+    """回滚线程内等待暂存写入可见（协程取消不会打断线程）。
+
+    取消收尾里的协程等待（``_settle_staged_write``）会被外层任务的再次
+    取消经 ``Task.cancel`` 转发打断；把同一等待放进回滚线程，写入未可见
+    就不回滚——否则回滚按末尾内容匹配会失败，写入随后落地留下无回答的
+    孤儿提问。``stage_future`` 为 None（完成回调路径）时直接返回。
+    """
+    if stage_future is None or stage_future.done():
+        return
+    done = threading.Event()
+
+    def _notify(_fut: "asyncio.Future") -> None:
+        done.set()
+
+    try:
+        loop.call_soon_threadsafe(stage_future.add_done_callback, _notify)
+    except RuntimeError:
+        # 事件循环已关闭（进程退出）：无法等待，按尽力而为继续
+        return
+    done.wait(timeout_sec)
 
 
 class ConversationRuntime:
@@ -445,6 +475,7 @@ class ConversationRuntime:
                     user_input,
                     turn_state,
                     timeout_sec=self._cancel_remaining(2.0),
+                    stage_future=stage_future,
                 )
             # 本轮用量没有写进任何持久化消息：记账到下一轮成功回合，否则
             # 下一轮的增量会把它们一起减掉，面板 / 趋势永久少记。取消时写
@@ -509,22 +540,31 @@ class ConversationRuntime:
         turn_state: dict[str, Any],
         *,
         timeout_sec: float | None = None,
+        swallow_cancel: bool = True,
+        stage_future: "asyncio.Future | None" = None,
     ) -> None:
         """本轮只回滚一次（主路径与落库完成回调可能同时请求）。
 
         另一路径已在回滚时也做有限等待：调用方（``ask`` 返回前、drain 释放
         用户锁前）依赖回滚已落地，不能因为回调抢先置位就提前返回。
-        ``timeout_sec`` 由 drain 传入剩余预算（默认各自 2 秒）。
+        ``timeout_sec`` 由 drain 传入剩余预算（默认各自 2 秒）；
+        ``swallow_cancel=False`` 供 drain 使用——drain 自身的取消要向外传播，
+        不能被等待回滚吞掉。``stage_future`` 传给回滚线程：线程先等暂存
+        写入可见再回滚（协程侧的等待可能被取消打断，见
+        :meth:`_settle_staged_write`）。
         """
         wait_sec = timeout_sec if timeout_sec is not None else 2.0
         if turn_state["rollback_requested"]:
-            await self._await_pending_rollback(wait_sec)
+            await self._await_pending_rollback(
+                wait_sec, swallow_cancel=swallow_cancel
+            )
             return
         turn_state["rollback_requested"] = True
         await self._rollback_staged_user_message(
             user_input,
             turn_state.get("turn_id") or None,
             timeout_sec=timeout_sec,
+            stage_future=stage_future,
         )
 
     def begin_drain_cleanup(self, deadline: float | None = None) -> None:
@@ -554,6 +594,11 @@ class ConversationRuntime:
         ``stage_message`` 的 Redis / 文件写入在池线程执行，取消协程不会
         取消线程；写入尚未可见时回滚按末尾内容匹配会直接失败且不再重试，
         短期记忆留下无回答的孤儿提问。
+
+        这里的协程等待只是「尽快收尾」的优化：外层任务的再次取消会经
+        ``Task.cancel`` 转发到本 await 点，无法只靠取消次数保护。真正的
+        顺序保证在回滚线程内（``_wait_stage_visible``）——即使本等待被打断，
+        回滚线程也会等写入可见后才执行。
         """
         if stage_future is None or stage_future.done():
             return
@@ -563,14 +608,22 @@ class ConversationRuntime:
                 timeout=self._cancel_remaining(5.0),
             )
         except asyncio.TimeoutError:
-            logger.debug("等待暂存写入未在限时内完成，回滚可能跳过该条")
+            logger.debug("等待暂存写入未在限时内完成，回滚线程将等待可见")
         except asyncio.CancelledError:
-            logger.debug("等待暂存写入时被取消，回滚交给后台线程")
+            logger.debug("等待暂存写入时被取消，回滚线程将等待可见")
         except Exception:  # noqa: BLE001 - stage_message 自身吞异常，兜底
             logger.debug("暂存写入失败，回滚无需等待", exc_info=True)
 
-    async def _await_pending_rollback(self, timeout_sec: float = 2.0) -> None:
-        """等待在途回滚线程结束（有界；后台线程超时后自行完成）。"""
+    async def _await_pending_rollback(
+        self, timeout_sec: float = 2.0, *, swallow_cancel: bool = True
+    ) -> None:
+        """等待在途回滚线程结束（有界；后台线程超时后自行完成）。
+
+        ``swallow_cancel=True``（默认，ask 的异常处理器使用）：调用方本身
+        已在取消收尾中，吞掉取消才能保证后续用量结算 / 状态置位执行；
+        ``False``（drain 使用）：drain 任务被取消时取消必须向外传播，
+        否则停止请求的响应会在取消后又继续跑完整套收尾。
+        """
         task = getattr(self, "_pending_rollback", None)
         if task is None or task.done() or task is asyncio.current_task():
             # 自 await 会永远等不到自己（包装任务内部请求回滚时会走到这里）
@@ -580,6 +633,8 @@ class ConversationRuntime:
         except asyncio.TimeoutError:
             logger.debug("等待回滚暂存提问未在限时内完成，后台线程继续执行")
         except asyncio.CancelledError:
+            if not swallow_cancel:
+                raise
             # 调用方（except 处理器）的取消不能顶掉后续用量结算 / 状态置位：
             # 回滚线程自行完成，这里吞掉取消继续收尾
             logger.debug("等待回滚时被取消，回滚由后台线程完成")
@@ -592,19 +647,27 @@ class ConversationRuntime:
         turn_id: str | None = None,
         *,
         timeout_sec: float | None = None,
+        stage_future: "asyncio.Future | None" = None,
     ) -> None:
         """移除编排前暂存的用户提问（尽力而为，不阻塞取消 / 错误上报）。
 
         回滚本身是阻塞 IO，放线程池执行；用户停止请求时当前任务已处于取消
         状态，任何 await 都会被立即再次取消，因此只做有限等待，线程自行完成。
         ``turn_id`` 透传给短期记忆，避免跨实例同文本提问被误删。
+        ``stage_future`` 交给回滚线程先等暂存写入可见（见
+        ``_wait_stage_visible``）：协程侧的等待可能被转发取消打断，顺序
+        保证必须放在线程里。
         """
         rollback = getattr(self.memory, "rollback_staged_message", None)
         if not callable(rollback):
             return
-        task = asyncio.ensure_future(
-            asyncio.to_thread(rollback, user_input, turn_id)
-        )
+        loop = asyncio.get_running_loop()
+
+        def _rollback_when_visible() -> None:
+            _wait_stage_visible(loop, stage_future)
+            rollback(user_input, turn_id)
+
+        task = asyncio.ensure_future(asyncio.to_thread(_rollback_when_visible))
         self._pending_rollback = task
         task.add_done_callback(self._consume_background_task)
         try:
@@ -833,7 +896,7 @@ class ConversationRuntime:
             # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它；
             # 完成回调补提交的延迟记忆写入同样可能仍在后台（此前直接返回，
             # 用户锁在偏好 / 行程仍在落库时释放）
-            await self._await_pending_rollback(_remaining())
+            await self._await_pending_rollback(_remaining(), swallow_cancel=False)
             await self._await_deferred_commit(_remaining())
             return True
         failed = object()
@@ -856,7 +919,9 @@ class ConversationRuntime:
             # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
             # 结束，保证释放用户锁前回滚已落地）；回滚等待同样受总预算约束
             await self._request_staged_rollback(
-                *last_turn, timeout_sec=_remaining()
+                *last_turn,
+                timeout_sec=_remaining(),
+                swallow_cancel=False,
             )
         await self._await_deferred_commit(_remaining())
         return True

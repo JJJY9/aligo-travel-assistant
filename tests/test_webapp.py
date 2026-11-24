@@ -1710,6 +1710,91 @@ def test_ask_cancellable_on_disconnect():
     print("✓ 非流式回合在客户端断开后取消")
 
 
+def test_disconnect_wiring_shares_budget_and_cancels_once():
+    """server 接线：断连取消前建立共享预算；stop_turn 只显式 cancel 一次。"""
+    import asyncio
+
+    from webapp.server import _SessionTurnLease, _ask_cancellable_on_disconnect
+
+    class _Req:
+        def __init__(self):
+            self.calls = 0
+
+        async def is_disconnected(self):
+            self.calls += 1
+            return self.calls >= 2
+
+    class _Runtime:
+        def __init__(self, order):
+            self.order = order
+            self.deadlines: list[float | None] = []
+
+        def begin_drain_cleanup(self, deadline=None):
+            self.deadlines.append(deadline)
+            self.order.append("begin")
+
+        async def drain_pending_persist(self, timeout_sec=10.0):
+            return True
+
+    class _FakeTask:
+        def __init__(self, order):
+            self.cancels = 0
+            self.order = order
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancels += 1
+            self.order.append("explicit-cancel")
+
+        def __await__(self):
+            if False:  # pragma: no cover - 只用于成为生成器
+                yield
+            return None
+
+    class _Session:
+        runtime = None
+
+        def end_turn(self):
+            pass
+
+    async def scenario():
+        order: list[str] = []
+
+        async def turn():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                # 预算必须在取消投递前建立：回滚 / 暂存等待才能扣减同一截止时刻
+                assert order and order[0] == "begin", order
+                order.append("cancel")
+                raise
+
+        runtime = _Runtime(order)
+        result, disconnected = await _ask_cancellable_on_disconnect(
+            turn(), _Req(), poll_interval=0.01, runtime=runtime
+        )
+        assert (result, disconnected) == (None, True), (result, disconnected)
+        assert order == ["begin", "cancel"], order
+
+        # stop_turn：显式 cancel 只发一次；两次调用共享同一 drain 截止时刻
+        lock = asyncio.Lock()
+        await lock.acquire()
+        lease = _SessionTurnLease(lock, _Session())
+        fake_task = _FakeTask(order)
+        lease.bind_turn(fake_task)
+        await lease.stop_turn()
+        deadline = lease._drain_deadline
+        await lease.stop_turn()
+        assert fake_task.cancels == 1, fake_task.cancels
+        assert lease._drain_deadline == deadline, "两次 stop_turn 必须共享同一预算"
+        lease.release()
+
+    asyncio.run(scenario())
+    print("✓ 断连接线先建预算后取消，stop_turn 单次 cancel 且共享预算")
+
+
 def test_chat_disconnect_returns_499(monkeypatch):
     """非流式对话断连：返回 499（而非 200 假成功），指标按 499 记账。"""
     from utils.metrics import REQUEST_METRICS
@@ -11164,21 +11249,28 @@ def test_knowledge_duplicates_limit_zero_caps_on_web(monkeypatch):
 
 
 def test_knowledge_cleanup_plan_truncated(monkeypatch):
-    """清理接口的 plan 与读接口同一上限：超过 2000 组时截断并标记。"""
+    """清理接口的 plan 与读接口同一上限：超过 2000 组时截断并标记。
+
+    ``plan_total`` / ``truncated`` 恒出现（未截断时为组数与 false）；
+    截断只影响视图——``dry_run=false`` 的删除仍按全量计划执行（fake 记录
+    传入的 dry_run 并确认响应不含截断后的执行语义变化）。
+    """
     from utils.rate_limit import RateLimiter
     from webapp import server as server_module
 
+    calls: list[bool] = []
     plan = [{"keep": i, "remove": [i + 10000]} for i in range(2001)]
-    monkeypatch.setattr(
-        server_module,
-        "cleanup_duplicate_contents",
-        lambda dry_run: {
+
+    def _cleanup(dry_run):
+        calls.append(dry_run)
+        return {
             "dry_run": dry_run,
-            "removed": 0,
+            "removed": 0 if dry_run else 2001,
             "skipped": [],
-            "plan": plan,
-        },
-    )
+            "plan": list(plan),
+        }
+
+    monkeypatch.setattr(server_module, "cleanup_duplicate_contents", _cleanup)
     client = _client()
     client.app.state.aligo.kb_limiter = RateLimiter(limit=10, window_sec=60)
     response = client.post(
@@ -11189,7 +11281,40 @@ def test_knowledge_cleanup_plan_truncated(monkeypatch):
     assert payload["truncated"] is True, payload.get("truncated")
     assert payload["plan_total"] == 2001
     assert len(payload["plan"]) == 2000
-    print("✓ 清理接口 plan 截断到 2000 组并标记")
+
+    # dry_run=false：全量执行（fake 收到 False、计数来自全量计划），
+    # 视图截断与执行语义互不影响
+    executed = client.post(
+        "/api/knowledge/duplicates/cleanup", json={"dry_run": False}
+    )
+    assert executed.status_code == 200, executed.text[:300]
+    executed_payload = executed.json()
+    assert calls == [True, False]
+    assert executed_payload["removed"] == 2001
+    assert executed_payload["plan_total"] == 2001
+    assert executed_payload["truncated"] is True
+    assert len(executed_payload["plan"]) == 2000
+
+    # 未截断：字段恒定出现，消费者无需区分「未截断」与旧服务端
+    monkeypatch.setattr(
+        server_module,
+        "cleanup_duplicate_contents",
+        lambda dry_run: {
+            "dry_run": dry_run,
+            "removed": 0,
+            "skipped": [],
+            "plan": [{"keep": 1, "remove": [2]}],
+        },
+    )
+    small = client.post(
+        "/api/knowledge/duplicates/cleanup", json={"dry_run": True}
+    )
+    assert small.status_code == 200, small.text[:300]
+    small_payload = small.json()
+    assert small_payload["plan_total"] == 1
+    assert small_payload["truncated"] is False
+    assert len(small_payload["plan"]) == 1
+    print("✓ 清理接口 plan 截断到 2000 组并恒定标记 plan_total / truncated")
 
 
 def test_knowledge_cleanup_redacts_failed_errors(monkeypatch):

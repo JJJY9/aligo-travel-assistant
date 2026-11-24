@@ -857,8 +857,10 @@ def test_drain_budget_is_shared_across_waits():
     runtime, _ = _make_runtime()
     seen = {}
 
-    async def slow_rollback(timeout_sec=2.0):
+    async def slow_rollback(timeout_sec=2.0, *, swallow_cancel=True):
         seen["rollback"] = timeout_sec
+        # drain 的取消必须向外传播：等待回滚不能吞掉 drain 自身的取消
+        seen["swallow_cancel"] = swallow_cancel
         await asyncio.sleep(0.3)
 
     async def record_commit(timeout_sec):
@@ -870,8 +872,38 @@ def test_drain_budget_is_shared_across_waits():
 
     assert asyncio.run(runtime.drain_pending_persist(timeout_sec=0.5)) is True
     assert seen["rollback"] <= 0.5, seen
+    assert seen["swallow_cancel"] is False, seen
     assert seen["commit"] < 0.35, seen
     print("✓ drain 总预算在回滚与延迟提交之间共享")
+
+
+def test_rollback_thread_waits_for_staged_write_visibility():
+    """回滚线程先等暂存写入可见：协程侧的等待被取消也留不下孤儿提问。"""
+    runtime, memory = _make_runtime()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stage = loop.create_future()
+        observed = {}
+
+        def rollback(content, turn_id=None):
+            # 线程内观察：写入已可见（stage future 完成）后才允许回滚；
+            # 取消收尾的协程等待可能被转发取消打断，顺序保证在线程里
+            observed["visible"] = stage.done()
+            observed["content"] = content
+            return True
+
+        memory.rollback_staged_message = rollback
+        loop.call_later(0.15, stage.set_result, True)
+        state = {"rollback_requested": False, "turn_id": "t1"}
+        await runtime._request_staged_rollback(
+            "你好", state, timeout_sec=2.0, stage_future=stage
+        )
+        assert observed.get("visible") is True, "回滚先于暂存写入可见执行"
+        assert observed.get("content") == "你好"
+
+    asyncio.run(scenario())
+    print("✓ 回滚线程等待暂存写入可见")
 
 
 def test_drain_budget_covers_rollback_wait():
@@ -1883,6 +1915,7 @@ if __name__ == "__main__":
     test_deferred_commit_forwards_epoch()
     test_cancel_cleanup_shares_drain_budget()
     test_drain_budget_is_shared_across_waits()
+    test_rollback_thread_waits_for_staged_write_visibility()
     test_drain_budget_covers_rollback_wait()
     test_late_callback_without_checkpoint_key_keeps_next_checkpoint()
     test_memory_without_rollback_hook_is_tolerated()

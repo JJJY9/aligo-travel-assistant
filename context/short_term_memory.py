@@ -142,6 +142,18 @@ def seen_key(key: str) -> str:
     return f"{key}:seen"
 
 
+def tomb_key(key: str) -> str:
+    """会话消息键对应的「已删除消息内容指纹」墓碑集合键（TTL 同消息）。
+
+    truncate / 精确删除只删用户主动删除的轮次：把它们的指纹写进墓碑，
+    ``_ADD_MESSAGES_LUA`` 命中墓碑一律跳过——故障重放 / 长期记忆回填不能把
+    已删除的问答写回窗口。与 ``seen`` 分开：seen 表达「曾写入 / 去重」，
+    墓碑表达「已删除」——删空整键时 seen 可以清（回填恢复被窗口裁掉的
+    更早轮次），已删除内容仍由墓碑挡住；clear / 会话删除同时清墓碑。
+    """
+    return f"{key}:tomb"
+
+
 def _iso_order_key(value: Any) -> str:
     """ISO 时间戳的字典序比较键（与 Lua ``timestamp_key`` 同一口径）。
 
@@ -378,16 +390,25 @@ if check == '1' then
   end
   if strip_ends(content) ~= expected then return 0 end
 end
+local deleted = {}
 if count >= n then
+  for i = 0, n - 1 do
+    deleted[#deleted + 1] = redis.call('LINDEX', key, i)
+  end
   redis.call('DEL', key)
-  -- seen 指纹刻意保留：删空的末尾轮次是用户主动删除的内容，seen 是
-  -- 故障重放 / 长期记忆回填「不把已删除问答写回窗口」的唯一跨实例保护。
-  -- （只有 clear / 会话删除路径才随消息键一起清 seen——那些场景的旧
-  -- 历史本来就该由回填恢复）
+  -- 删空整键时 seen 一并清：回填需要能恢复「仅被窗口裁出、从未删除」
+  -- 的更早轮次；本次删除的条目由调用方写入 :tomb 墓碑（ARGV[6] 是
+  -- 目标键的 seen 名），重放不会复活已删除内容
+  local seen = ARGV[6]
+  if seen and seen ~= '' then redis.call('DEL', seen) end
 else
+  for i = -count, -1 do
+    deleted[#deleted + 1] = redis.call('LINDEX', key, i)
+  end
   redis.call('LTRIM', key, 0, -count - 1)
 end
-return count
+-- 返回删除明细：调用方据此把被删消息的指纹写入 :tomb 墓碑
+return cjson.encode({count = count, deleted = deleted})
 """
 
 # 按完整消息项（含时间戳，实际唯一）精确删除故障期间从影子缓存裁掉的
@@ -397,12 +418,15 @@ return count
 # Redis 里。
 _REMOVE_MESSAGES_LUA = """
 local key = KEYS[1]
+local seen = KEYS[2]
 for i = 1, #ARGV do
   redis.call('LREM', key, 0, ARGV[i])
 end
--- seen 指纹刻意保留：remove 只来自「删除最后一轮」的回滚，删掉的是
--- 用户主动删除的内容——seen 是重放 / 回填不把已删除问答写回窗口的
--- 唯一跨实例保护（clear / 会话删除路径才随消息键一起清 seen）
+-- 删空时清 seen（回填恢复被窗口裁出的更早轮次）；本次删除的条目由
+-- 调用方写入 :tomb 墓碑，重放不会复活已删除内容
+if seen and redis.call('LLEN', key) == 0 then
+  redis.call('DEL', seen)
+end
 return 1
 """
 
@@ -414,11 +438,13 @@ return 1
 _CLEAR_BEFORE_LUA = """
 local key = KEYS[1]
 local seen = KEYS[2]
+local tomb = KEYS[3]
 local cut = ARGV[1]
 local n = redis.call('LLEN', key)
 if cut == '' then
   redis.call('DEL', key)
   if seen then redis.call('DEL', seen) end
+  if tomb then redis.call('DEL', tomb) end
   return n
 end
 -- 时间戳归一（与 _TRUNCATE_LAST_TURN_LUA 同一口径）：空格分隔 / 超长
@@ -452,10 +478,12 @@ end
 for _, raw in ipairs(stale) do
   redis.call('LREM', key, 0, raw)
 end
--- 列表删空时一并删除 seen 指纹（与在线 clear / 截断同一契约）：残留
--- 指纹会让恢复后的回填 / 重放被永久跳过；仍有存活消息时保留
+-- 列表删空时一并删除 seen 与 tomb（与在线 clear / 会话删除同一契约）：
+-- 清空后旧历史应由回填恢复；截断 / 精确删除路径则相反——它们刻意清
+-- seen 但保留/写入 tomb 墓碑（见 _TRUNCATE_LAST_TURN_LUA）
 if seen and redis.call('LLEN', key) == 0 then
   redis.call('DEL', seen)
+  if tomb then redis.call('DEL', tomb) end
 end
 return #stale
 """
@@ -471,6 +499,7 @@ _ADD_MESSAGES_LUA = """
 local key = KEYS[1]
 local applied = KEYS[2]
 local seen = KEYS[3]
+local tomb = KEYS[4]
 local window = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local pushed = 0
@@ -551,6 +580,12 @@ for i = 3, #ARGV, 4 do
      and redis.call('SISMEMBER', seen, content_hash) == 1 then
     skip = true
   end
+  if not skip and content_hash ~= ''
+     and redis.call('SISMEMBER', tomb, content_hash) == 1 then
+    -- 已删除消息的墓碑：重放 / 回填不能把它写回窗口（seen 可能已被
+    -- 删空整键的清空动作一并清掉）
+    skip = true
+  end
   if not skip then
     -- 先插入再登记：脚本不回滚，若先 SADD 后插入失败（WRONGTYPE /
     -- 内存不足），op_id 已被当作「已追加」写入 applied，恢复重放会永久
@@ -568,6 +603,7 @@ if pushed > 0 then
   redis.call('EXPIRE', key, ttl)
   redis.call('EXPIRE', applied, ttl)
   redis.call('EXPIRE', seen, ttl)
+  redis.call('EXPIRE', tomb, ttl)
 end
 return pushed
 """
@@ -1001,10 +1037,11 @@ class RedisShortTermMemory:
             # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）
             self.client.eval(
                 _ADD_MESSAGES_LUA,
-                3,
+                4,
                 self.key,
                 applied_key(self.key),
                 seen_key(self.key),
+                tomb_key(self.key),
                 str(self.max_turns * 2),
                 str(self.ttl_sec),
                 op_id,
@@ -1161,10 +1198,11 @@ class RedisShortTermMemory:
                 arguments.extend([op_id, content_id, mode, stored_payload])
             self.client.eval(
                 _ADD_MESSAGES_LUA,
-                3,
+                4,
                 self.key,
                 applied_key(self.key),
                 seen_key(self.key),
+                tomb_key(self.key),
                 *arguments,
             )
             # 这些操作已成功出队、不会再重放，回收对应的去重记录；
@@ -1180,20 +1218,21 @@ class RedisShortTermMemory:
         if kind == "truncate":
             expect, op_id, cutoff, *rest = payload
             turn_id = rest[0] if rest else None
-            result = int(
-                self.client.eval(
-                    _TRUNCATE_LAST_TURN_LUA,
-                    2,
-                    self.key,
-                    self._op_marker_key(op_id),
-                    "1" if expect is not None else "0",
-                    (expect or "").strip(),
-                    str(_OP_MARKER_TTL_SEC),
-                    cutoff or "",
-                    turn_id or "",
-                )
-                or 0
+            raw_result = self.client.eval(
+                _TRUNCATE_LAST_TURN_LUA,
+                2,
+                self.key,
+                self._op_marker_key(op_id),
+                "1" if expect is not None else "0",
+                (expect or "").strip(),
+                str(_OP_MARKER_TTL_SEC),
+                cutoff or "",
+                turn_id or "",
+                seen_key(self.key),
             )
+            result, replay_deleted = self._parse_truncate_result(raw_result)
+            if replay_deleted:
+                self._remember_deleted(replay_deleted)
             if result == 0:
                 logger.warning(
                     "短期记忆故障期截断重放未匹配（列表末尾已变化），已跳过：%s",
@@ -1207,15 +1246,23 @@ class RedisShortTermMemory:
             ops.pop(0)
         elif kind == "remove":
             if payload:
-                self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
+                self.client.eval(
+                    _REMOVE_MESSAGES_LUA,
+                    2,
+                    self.key,
+                    seen_key(self.key),
+                    *payload,
+                )
+                self._remember_deleted(list(payload))
             ops.pop(0)
         else:  # clear
             cutoff = payload if isinstance(payload, str) else ""
             self.client.eval(
                 _CLEAR_BEFORE_LUA,
-                2,
+                3,
                 self.key,
                 seen_key(self.key),
+                tomb_key(self.key),
                 cutoff,
             )
             ops.pop(0)
@@ -1348,6 +1395,56 @@ class RedisShortTermMemory:
         except Exception:  # noqa: BLE001 - 清理失败只留下一条无用记录
             logger.debug("清理 applied 记录失败：%s", self.key)
 
+    def _parse_truncate_result(self, raw: Any) -> tuple[int, list[str]]:
+        """解析截断脚本返回值：``{count, deleted}``（JSON）或数字（-1 / 0）。"""
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, RecursionError):
+                return 0, []
+            if isinstance(parsed, dict):
+                try:
+                    count = int(parsed.get("count") or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                deleted = [
+                    str(item)
+                    for item in parsed.get("deleted") or []
+                    if isinstance(item, str)
+                ]
+                return count, deleted
+        try:
+            return int(raw or 0), []
+        except (TypeError, ValueError):
+            return 0, []
+
+    def _remember_deleted(self, deleted: list[str]) -> None:
+        """把本次删除消息的指纹写入 ``:tomb`` 墓碑并同步清理 seen。
+
+        墓碑让故障重放 / 长期记忆回填在 seen 被删空清掉后仍然跳过已删除
+        内容；记录失败只记日志（seen / TTL 兜底）。
+        """
+        ids: list[str] = []
+        for raw in deleted:
+            try:
+                message = json.loads(raw)
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if isinstance(message, dict):
+                content_id = message_content_id(message)
+                if content_id:
+                    ids.append(content_id)
+        if not ids:
+            return
+        try:
+            self.client.sadd(tomb_key(self.key), *ids)
+            self.client.srem(seen_key(self.key), *ids)
+            self.client.expire(tomb_key(self.key), self.ttl_sec)
+        except Exception as exc:  # noqa: BLE001 - 墓碑写失败由 seen / TTL 兜底
+            logger.debug("记录删除墓碑失败：%s", exc)
+
     def _forget_marker(self, op_id: str) -> None:
         try:
             self.client.delete(self._op_marker_key(op_id))
@@ -1439,7 +1536,10 @@ class RedisShortTermMemory:
 
         self._call_redis(
             lambda: self.client.delete(
-                self.key, applied_key(self.key), seen_key(self.key)
+                self.key,
+                applied_key(self.key),
+                seen_key(self.key),
+                tomb_key(self.key),
             ),
             lambda: None,
             on_failure,
@@ -1513,11 +1613,18 @@ class RedisShortTermMemory:
                 cutoff,
                 # 回合 id：跨实例精确区分「同一文本的不同回合」
                 (turn_id or ""),
+                # 删空整键时一并清 seen（tomb 墓碑由下方 _remember_deleted
+                # 写入被删消息的指纹，重放不会复活）
+                seen_key(self.key),
             ),
             fallback,
             on_failure,
         )
-        count = int(raw or 0)
+        count, deleted_raws = self._parse_truncate_result(raw)
+        if via_redis and deleted_raws:
+            # 被删除消息的指纹写进 :tomb 墓碑：故障重放 / 长期记忆回填
+            # 不能把用户删除的问答写回窗口
+            self._remember_deleted(deleted_raws)
         if via_redis:
             # 已拿到响应，标记不会再被重放使用；删除后键空间只保留失败
             # 场景的少量标记（未删除的成功会随 TTL 过期）

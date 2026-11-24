@@ -197,6 +197,40 @@ def test_checkpoint_scope_hash_recorded_for_session_cleanup(tmp_path):
     print("✓ 检查点作用域哈希与会话清理")
 
 
+def test_checkpoint_tombstone_probe_only_for_successful_results(tmp_path):
+    """墓碑复查只服务检查点写入：失败结果不做无用的 Redis 查询。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    schedule = [{"agent_name": "a", "priority": 1}]
+    probes = {"failed": 0, "success": 0}
+
+    def make_probe(bucket):
+        def _probe():
+            probes[bucket] += 1
+            return False
+
+        return _probe
+
+    failing = OrchestrationAgent(
+        agent_registry={"a": _StubAgent("a", raise_error=True)}
+    )
+    failing._checkpoint_store = store
+    failing._session_deleted_now = make_probe("failed")  # type: ignore[method-assign]
+    try:
+        asyncio.run(failing.reply(_intent(schedule), checkpoint_key="u:s:f"))
+    except Exception:  # noqa: BLE001 - 失败本身不是本用例重点
+        pass
+    assert probes["failed"] == 0, "失败结果不写检查点，不应执行墓碑复查"
+
+    ok = OrchestrationAgent(agent_registry={"a": _StubAgent("a", {"ok": True})})
+    ok._checkpoint_store = store
+    ok._session_deleted_now = make_probe("success")  # type: ignore[method-assign]
+    asyncio.run(ok.reply(_intent(schedule), checkpoint_key="u:s:ok"))
+    assert probes["success"] == 1, "成功结果写入检查点前必须复查墓碑"
+    print("✓ 墓碑复查只在该轮写入检查点（成功）时执行")
+
+
 def test_checkpoint_store_failure_does_not_block_turn(monkeypatch):
     """检查点目录不可用（磁盘 / 权限）只记日志，对话照常完成。"""
     import utils.execution_checkpoint as checkpoint_module

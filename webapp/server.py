@@ -1140,8 +1140,11 @@ class _SessionTurnLease:
         # drain 总预算的截止时刻：生成器 finally 与响应包装器可能各调一次
         # stop_turn（aclose 先跑生成器收尾），两次必须共享同一预算
         self._drain_deadline: float | None = None
-        # 回合任务只取消一次：第二次 cancel() 会打断回合协程里「先等暂存
-        # 写入可见再回滚」的收尾等待，让回滚在写入可见前失败
+        # 回合任务只显式取消一次：再次 cancel() 会打断回合协程里的收尾
+        # 等待。注意它只挡住本类的重复取消——外层任务在 await task 期间被
+        # 再次取消时，asyncio 仍会把取消转发给回合任务的等待点；取消收尾
+        # 的顺序不变量因此不依赖取消次数：回滚线程自己等暂存写入可见
+        # （agents/conversation.py::_wait_stage_visible）
         self._turn_cancelled = False
 
     def bind_turn(self, task: asyncio.Task[Any]) -> None:
@@ -4180,6 +4183,11 @@ def create_app(model: Any = None) -> FastAPI:
         与 CLI ``kb-dedupe`` 同一语义：``dry_run=false`` 才真正删除。扫描
         与删除在同一把写锁内完成、逐条复核内容未变化（并发编辑 / 删除不会
         被按过期 id 误删），已消失 / 已变化的条目记入 ``skipped``。
+
+        响应恒带 ``plan_total``（完整计划组数）与 ``truncated``（``plan``
+        视图是否被截断）：``plan`` 最多 ``MAX_DUPLICATE_GROUPS_FULL`` 组
+        （与重复组读接口同一上限，避免单次响应拉进几百 MB），截断只影响
+        返回视图——``dry_run=false`` 的删除始终按全量计划执行。
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
@@ -4196,12 +4204,13 @@ def create_app(model: Any = None) -> FastAPI:
         from utils.log_redact import redact_paths
 
         plan = result.get("plan")
-        if isinstance(plan, list) and len(plan) > MAX_DUPLICATE_GROUPS_FULL:
-            # 与重复组读接口同一上限：全量物化 + 序列化整个知识库会让
-            # 单次响应拉进几百 MB（清理本身已按全量执行，这里只截断视图）
+        if isinstance(plan, list):
+            # 计数字段恒定出现：消费者无需区分「未截断」与旧服务端。
+            # 截断只作用于视图：清理本身已按全量执行
             result["plan_total"] = len(plan)
-            result["truncated"] = True
-            result["plan"] = plan[:MAX_DUPLICATE_GROUPS_FULL]
+            result["truncated"] = len(plan) > MAX_DUPLICATE_GROUPS_FULL
+            if result["truncated"]:
+                result["plan"] = plan[:MAX_DUPLICATE_GROUPS_FULL]
         for item in result.get("failed") or []:
             if isinstance(item, dict) and "error" in item:
                 item["error"] = redact_paths(item["error"])
