@@ -12,7 +12,7 @@ import pytest
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from context.short_term_memory import ShortTermMemory
+from context.short_term_memory import ShortTermMemory, _iso_order_key
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +126,40 @@ def test_truncate_trailing_user_only():
     assert memory.truncate_last_turn("只有提问") == 1
     assert memory.messages == []
     print("✓ 只剩提问时只删除提问")
+
+
+def test_inprocess_truncate_rejects_future_timestamp():
+    """cutoff 守卫与 Lua 同口径：未来时间戳拒删，但精确匹配的回合 id 例外。"""
+    from datetime import datetime, timedelta
+
+    memory = ShortTermMemory(max_turns=10)
+    future = (datetime.now() + timedelta(hours=1)).isoformat()
+    memory.add_message("user", "未来的提问", timestamp=future)
+    memory.add_message("assistant", "回答", timestamp=future)
+    # 无回合 id / 回合 id 不匹配：cutoff 拒删（校验顺序与 Lua 一致）
+    assert memory.truncate_last_turn("未来的提问") == 0
+    assert memory.truncate_last_turn("未来的提问", turn_id="t-other") == 0
+    assert len(memory.messages) == 2
+
+    # 完全匹配的回合 id 是精确身份：跳过 cutoff（显式删除不被时钟超前
+    # 挡住——长期记忆已删、短期留着会让旧问答继续进入模型上下文）
+    identified = ShortTermMemory(max_turns=10)
+    identified.add_message(
+        "user",
+        "未来的提问",
+        metadata={"client_turn_id": "t1"},
+        timestamp=future,
+    )
+    identified.add_message("assistant", "回答", timestamp=future)
+    assert identified.truncate_last_turn("未来的提问", turn_id="t1") == 2
+
+    # 过去时间戳照常删除
+    past = (datetime.now() - timedelta(hours=1)).isoformat()
+    normal = ShortTermMemory(max_turns=10)
+    normal.add_message("user", "正常提问", timestamp=past)
+    normal.add_message("assistant", "回答", timestamp=past)
+    assert normal.truncate_last_turn("正常提问") == 2
+    print("✓ 进程内截断与 Lua 同口径（未来时间戳拒删 / 精确回合 id 例外）")
 
 
 def test_truncate_empty():
@@ -372,11 +406,17 @@ class _FlakyRedis:
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:]) or [""]
         if "ipairs(stale)" in script:
-            # 条件清空：只删除 cutoff 之前写入的消息
+            # 条件清空：只删除 cutoff 之前写入的消息；列表删空时与真实
+            # Lua 一致清 seen 指纹（KEYS[2]）
+            def _drop_seen_if_empty() -> None:
+                if not self.data and len(keys) > 1:
+                    self.seen.pop(keys[1], None)
+
             cut = args[0] if args else ""
             if cut == "":
                 count = len(self.data)
                 self.data.clear()
+                _drop_seen_if_empty()
                 return count
             stale = 0
             kept = []
@@ -391,6 +431,7 @@ class _FlakyRedis:
                 else:
                     kept.append(raw)
             self.data = kept
+            _drop_seen_if_empty()
             return stale
         if "SADD" in script:
             # 幂等追加：按 op_id 与内容指纹去重后 RPUSH，窗口裁剪与 TTL 略去
@@ -426,6 +467,9 @@ class _FlakyRedis:
                     else:
                         kept.append(item)
                 self.data = kept
+            # 列表删空时与真实 Lua 一致清 seen 指纹（KEYS[2]）
+            if not self.data and len(keys) > 1:
+                self.seen.pop(keys[1], None)
             return removed
         # 截断脚本：角色判断、内容校验、一次性标记与 cutoff 与 Lua 对应
         marker = keys[1] if len(keys) > 1 else None
@@ -456,15 +500,39 @@ class _FlakyRedis:
                 user_raw = self.data[-2]
         elif isinstance(last, dict) and last.get("role") == "user":
             user_raw = self.data[-1]
-        # cutoff 对有无内容校验的删除都生效（与真实脚本一致）
-        if cutoff and user_raw is not None:
+        # 回合 id 校验在前（与真实脚本一致）：完全匹配是精确身份，跳过
+        # cutoff 守卫；归一化比较（空格 → 'T'、截断 26 字符）与 Lua 同口径
+        turn_id = args[4] if len(args) > 4 else ""
+        identified = False
+        if turn_id:
+            if user_raw is None:
+                return 0
+            try:
+                tid_user = json.loads(user_raw)
+            except json.JSONDecodeError:
+                return 0
+            if not isinstance(tid_user, dict):
+                return 0
+            meta = tid_user.get("metadata")
+            got = ""
+            if isinstance(meta, dict) and isinstance(
+                meta.get("client_turn_id"), str
+            ):
+                got = meta["client_turn_id"]
+            if got and got != turn_id:
+                return 0
+            identified = bool(got)
+        # cutoff 对有无内容校验的删除都生效（与真实脚本一致）；精确回合
+        # id 不参与 cutoff 判定
+        if not identified and cutoff and user_raw is not None:
             try:
                 cut_user = json.loads(user_raw)
             except json.JSONDecodeError:
                 cut_user = None
             if isinstance(cut_user, dict):
-                timestamp = cut_user.get("timestamp")
-                if isinstance(timestamp, str) and timestamp > cutoff:
+                timestamp = _iso_order_key(cut_user.get("timestamp"))
+                cutoff_key = _iso_order_key(cutoff)
+                if timestamp and cutoff_key and timestamp > cutoff_key:
                     return 0
         if check == "1":
             if user_raw is None:
@@ -480,7 +548,12 @@ class _FlakyRedis:
                 return 0
             if content.strip() != expected:
                 return 0
+        len_before = len(self.data)
         del self.data[-count:]
+        # 整键删除时与真实 Lua 一致清 seen 指纹（ARGV[6]）：残留的指纹
+        # 会让之后回填 / 重放的同批历史被永久跳过
+        if count >= len_before and len(args) > 5 and args[5]:
+            self.seen.pop(args[5], None)
         return count
 
     def llen(self, key):
@@ -673,6 +746,81 @@ def test_outage_truncate_replays_on_recovery(monkeypatch):
     )
     assert len(client.data) == 2
     print("✓ 故障期截断在恢复后精确删除")
+
+
+def test_outage_clear_replay_clears_seen_fingerprints(monkeypatch):
+    """故障期清空恢复后重放：seen 指纹必须一并清掉（否则回填被永久跳过）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    seen = module.seen_key(memory.key)
+    assert client.seen.get(seen), "写入后应有 seen 指纹"
+
+    client.fail = True
+    memory.clear()
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == []
+    assert client.data == []
+    assert not client.seen.get(seen), (
+        "清空重放必须删除 seen 指纹，否则回填 / 重放的同批历史被永久跳过"
+    )
+    print("✓ 故障期清空重放同时清 seen 指纹")
+
+
+def test_outage_truncate_replay_clears_seen_when_emptied(monkeypatch):
+    """故障期截断把列表删空：重放同样清理 seen（回填不被永久跳过）。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+    seen = module.seen_key(memory.key)
+    assert client.seen.get(seen)
+
+    client.fail = True
+    assert memory.truncate_last_turn("Q1") == 2
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    assert memory.get_recent_context() == []
+    assert client.data == []
+    assert not client.seen.get(seen), (
+        "截断重放删空整键时必须与在线路径一致清理 seen 指纹"
+    )
+    print("✓ 故障期截断删空重放同时清 seen 指纹")
+
+
+def test_outage_truncate_replay_clears_seen_from_other_instance(monkeypatch):
+    """影子缓存没有该轮时走「条件截断」重放：删空整键同样清 seen。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    alice = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    bob = module.RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    bob.add_message("user", "Q1", metadata={"client_turn_id": "t1"})
+    bob.add_message("assistant", "A1")
+    seen = module.seen_key(alice.key)
+    assert client.seen.get(seen)
+
+    client.fail = True
+    # alice 的影子缓存没有这一轮：登记条件截断重放（带回合 id）
+    assert alice.truncate_last_turn("Q1", turn_id="t1") == 0
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    alice.get_recent_context()
+    assert client.data == []
+    assert not client.seen.get(seen), "条件截断重放删除整键时必须清 seen"
+    print("✓ 条件截断重放删空整键同时清 seen 指纹")
 
 
 def test_outage_add_then_truncate_replays_in_order(monkeypatch):

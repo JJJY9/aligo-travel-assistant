@@ -4522,7 +4522,7 @@ def test_preferences_api():
 
 
 def test_preference_writes_invalidate_all_caches(monkeypatch):
-    """面板 PUT / DELETE 偏好后清空所有会话的偏好快照缓存。"""
+    """面板 PUT / DELETE 偏好与备份导入后清空所有会话的偏好快照缓存。"""
     from webapp import server as server_module
 
     calls: list[int] = []
@@ -4544,9 +4544,20 @@ def test_preference_writes_invalidate_all_caches(monkeypatch):
         )
         assert response.status_code == 200, response.text
         assert len(calls) >= 2, "PUT / DELETE 后都应清空会话偏好缓存"
+        # 备份导入直写同样要清空：不经过各会话的 MemoryManager
+        before_import = len(calls)
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {"home_location": "上海"}}},
+        )
+        assert response.status_code == 200, response.text
+        assert len(calls) == before_import + 1, (
+            "备份导入成功后必须清空会话偏好缓存"
+        )
     finally:
         _cleanup(user_id)
-    print("✓ 面板偏好写入清空会话缓存")
+    print("✓ 面板偏好写入 / 备份导入清空会话缓存")
 
 
 def test_preference_put_rejects_blank_values():
@@ -13652,20 +13663,48 @@ def test_trips_and_status_sanitize_lone_surrogates(monkeypatch):
 
 
 def test_preference_reserved_type_rejected():
-    """保留类型 preferences 的写入 / 删除返回 422，不再假成功。"""
+    """保留类型 preferences：写入仍 422；删除放行（历史脏数据只能经它清理）。"""
+    import json as json_module
+
+    from webapp import server as server_module
+
     client = _client()
-    put = client.put(
-        "/api/preferences/preferences",
-        json={"user_id": "u-reserved-pref", "value": ["汉庭"]},
-    )
-    assert put.status_code == 422, put.text
-    assert "保留" in put.json()["detail"]
-    deleted = client.delete(
-        "/api/preferences/preferences",
-        params={"user_id": "u-reserved-pref"},
-    )
-    assert deleted.status_code == 422, deleted.text
-    print("✓ 保留偏好类型 preferences 被拒绝")
+    user_id = _unique_user("web_reserved_pref")
+    memory_dir = Path(server_module.MEMORY_DIR)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        put = client.put(
+            "/api/preferences/preferences",
+            json={"user_id": user_id, "value": ["汉庭"]},
+        )
+        assert put.status_code == 422, put.text
+        assert "保留" in put.json()["detail"]
+
+        # 历史脏数据：旧版嵌套偏好容器行加载后不会被展开 / 丢弃
+        (memory_dir / f"{user_id}.json").write_text(
+            json_module.dumps(
+                {
+                    "preferences": [
+                        {"type": "preferences", "value": {"nested": "旧格式"}}
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        deleted = client.delete(
+            "/api/preferences/preferences", params={"user_id": user_id}
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"type": "preferences", "deleted": True}
+        # 再删一次：行已不存在，如实返回未删除
+        again = client.delete(
+            "/api/preferences/preferences", params={"user_id": user_id}
+        )
+        assert again.status_code == 200 and again.json()["deleted"] is False
+    finally:
+        _cleanup(user_id)
+    print("✓ 保留偏好类型 preferences：写入拒绝、删除可清历史脏数据")
 
 def test_import_rejects_merged_preference_limit(monkeypatch):
     """备份自身未超限但合并存量后超过偏好类型上限：预览与执行都 409。"""

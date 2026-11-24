@@ -69,13 +69,10 @@ class ConversationRuntime:
         # 在途的记忆落库任务：取消 ask() 只取消协程，执行器线程仍会写完；
         # Web 入口在释放用户锁前先 drain 它（见 drain_pending_persist）
         self._pending_persist: asyncio.Future | None = None
-        # 最近一次在途落库对应的提问 / 本轮回滚状态：落库失败或守卫否决时
+        # 最近一次落库对应的提问 / 本轮回滚状态：落库失败或守卫否决时
         # 由完成回调触发回滚；下一轮开始前先等这次回滚结束，避免迟到的
         # 回滚删掉下一轮文本相同的提问
         self._last_persist_turn: tuple[str, dict[str, Any]] | None = None
-        # 最近一次落库是否成功（提问文本）：客户端断连返回 499 后，Web 层
-        # 据此决定是否给幂等键写「已落库但响应未送达」标记，避免重试重复
-        self._last_persist_committed: str | None = None
         # 延迟记忆（偏好 / 行程）提交纪元：每轮开始推进，迟到的上一轮落库
         # 回调据此判断自己是否仍属于最近一轮
         self._deferred_epoch = 0
@@ -175,9 +172,6 @@ class ConversationRuntime:
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         settlement = settlement if settlement is not None else {"done": False}
-        # 新一轮开始即失效上一轮的落库成功标记：若本轮在落库前失败，
-        # 断连路径不能把上一轮同文本的成功误当成这一轮已落库
-        self._last_persist_committed = None
         # 推进延迟记忆纪元：上一轮迟到的落库回调不能提交本轮暂存的
         # 偏好 / 行程（那份负载属于本轮，必须等本轮自己的落库结果）
         self._deferred_epoch = getattr(self, "_deferred_epoch", 0) + 1
@@ -420,7 +414,6 @@ class ConversationRuntime:
             self._pending_persist = pending
             pending_persist = pending
             self._last_persist_turn = (user_input, turn_state)
-            self._last_persist_committed = None
             pending.add_done_callback(
                 lambda fut: self._clear_pending_persist(
                     fut, user_input, turn_state
@@ -623,11 +616,11 @@ class ConversationRuntime:
         if outcome is False:
             return
         # 检查点清理与纪元无关：已落库回合的检查点必须丢弃——同一
-        # client_turn_id + 同文本的重试不能复用已落库回合的子智能体结果
+        # client_turn_id + 同文本的重试不能复用已落库回合的子智能体结果。
+        # 只按键清理：没有 checkpoint_key 的回合从未创建过检查点，不能
+        # 退回「清理当前键」——迟到回调跨轮时那会删掉下一轮刚建立的检查点
         if checkpoint_key:
             self._clear_checkpoint_key(checkpoint_key)
-        else:
-            self._clear_checkpoint()
         # 延迟记忆按负载纪元提交：上一轮迟到的回调只能提交仍属于上一轮的
         # 负载（新一轮已暂存时由编排层按纪元拒绝，不会提前提交新负载）
         self._schedule_deferred_commit(epoch=deferred_epoch)
@@ -733,15 +726,6 @@ class ConversationRuntime:
             # 的 turn_state，不会把同文本的上一轮成功算到本轮头（也不会
             # 抹掉本轮已成功的结果）
             turn_state["persisted"] = success
-            current = getattr(self, "_last_persist_turn", None)
-            if (
-                current is not None
-                and current[1] is turn_state
-                and current[0] == user_input
-            ):
-                self._last_persist_committed = user_input if success else None
-        else:
-            self._last_persist_committed = user_input if success else None
         if turn_state is None:
             return
         if success:

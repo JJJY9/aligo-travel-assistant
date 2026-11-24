@@ -331,7 +331,9 @@ def test_deferred_memory_commits_after_cancel_during_persist():
 
     asyncio.run(scenario())
     assert orch.commits == 1, "落库成功后的延迟记忆写入不能因取消而丢失"
-    assert orch.clears == 1, "取消落在落库线程期间也要清理检查点"
+    # 请求未带 turn_id：本轮从未创建检查点，迟到回调不应清理「当前」键
+    # （跨轮迟到时那可能是下一轮刚建立的检查点）；按键清理见检查点用例
+    assert orch.clears == 0
     assert runtime.turn_persisted("你好"), "取消但落库成功的回合应标记已落库"
     print("✓ 取消落在落库线程期间仍补提交延迟记忆")
 
@@ -786,7 +788,6 @@ def test_late_persist_callback_cannot_poison_current_turn():
         new_state = {"rollback_requested": False, "persisted": None, "seq": 2}
         runtime._turn_seq = 2
         runtime._last_persist_turn = ("同一句提问", new_state)
-        runtime._last_persist_committed = None
 
         # 上一轮的成功回调迟到：不能把本轮（同文本）标记为已落库
         runtime._clear_pending_persist(_done(True), "同一句提问", old_state)
@@ -811,6 +812,44 @@ def test_late_persist_callback_cannot_poison_current_turn():
 
     asyncio.run(_scenario())
     print("✓ 迟到的落库回调不改写本轮状态")
+
+
+def test_late_callback_without_checkpoint_key_keeps_next_checkpoint():
+    """迟到落库回调没有本轮检查点键时不得清理「当前」检查点（下一轮的）。"""
+    runtime, _ = _make_runtime()
+    cleared: list[str] = []
+
+    class _Orch:
+        def clear_checkpoint(self):
+            cleared.append("current")
+
+        def clear_checkpoint_key(self, key):
+            cleared.append(str(key))
+
+        async def commit_deferred_memory(self, *args, **kwargs):
+            return True
+
+    runtime.orchestrator = _Orch()
+    runtime._schedule_deferred_commit = lambda **kwargs: None
+
+    async def _scenario():
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        fut.set_result(True)
+        runtime._commit_deferred_after_persist(
+            fut, checkpoint_key=None, deferred_epoch=1
+        )
+        fut2 = loop.create_future()
+        fut2.set_result(True)
+        runtime._commit_deferred_after_persist(
+            fut2, checkpoint_key="turn-9:hash", deferred_epoch=1
+        )
+
+    asyncio.run(_scenario())
+    assert cleared == ["turn-9:hash"], (
+        "无本轮检查点键时不能清理当前（下一轮）检查点，有键时按本轮键清理"
+    )
+    print("✓ 迟到回调按本轮键清理检查点，无键不误删下一轮")
 
 
 def test_deferred_commit_forwards_epoch():
@@ -1758,6 +1797,7 @@ if __name__ == "__main__":
     test_late_persist_callback_cannot_poison_current_turn()
     test_turn_persisted_false_when_probe_fails_before_turn()
     test_deferred_commit_forwards_epoch()
+    test_late_callback_without_checkpoint_key_keeps_next_checkpoint()
     test_memory_without_rollback_hook_is_tolerated()
     test_cancel_during_deferred_commit_does_not_double_usage()
     test_rollback_slot_cleared_after_completion()

@@ -4668,7 +4668,7 @@ def run_session_delete_standalone(
     与面板 DELETE ``/api/sessions/{id}`` 同一语义：长期记忆中该会话的消息
     全部删除，并清理短期记忆（Redis 会话键与故障期重放登记）；配置
     ``REDIS_URL`` 时同时写入共享删除墓碑（与 Web 相同的 ``aligo:deleted``
-    键，TTL 300 秒），其它实例的旧标签页下一次请求即 404。CLI 是单次
+    键，TTL 3600 秒），其它实例的旧标签页下一次请求即 404。CLI 是单次
     进程、不持有在途对话；若 Web 服务正在同一会话上流式回复，请先停止再
     删除（与其它 CLI 破坏性命令一致）。
 
@@ -6819,10 +6819,9 @@ def run_preference_delete_standalone(
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
     if not _valid_pref_type(pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型不能包含控制字符或斜杠（最多 64 字符）")
-    if pref_type == "preferences":
-        # 与 Web PUT/DELETE /api/preferences/{type} 的 422 同口径：存储层
-        # 加载时会把该键按旧格式展开，写入会静默改动其它偏好
-        return _fail("preferences 是保留的偏好类型，请使用具体类型名")
+    # ``preferences`` 是旧版嵌套偏好容器：pref-set 拒绝（写入会被下次
+    # 加载展开 / 丢弃），pref-delete 放行——历史脏数据里的该类型行只能
+    # 经删除清掉（Web DELETE /api/preferences/{type} 同口径）
 
     try:
         store = _open_cli_store(user_id)
