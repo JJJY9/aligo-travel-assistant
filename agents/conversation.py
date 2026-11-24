@@ -474,7 +474,9 @@ class ConversationRuntime:
                 # 避免台账出现没有对话的事实记录。落库完成回调可能已调度提交
                 # （同样带墓碑复查），这里复用同一入口并等待其完成
                 try:
-                    self._schedule_deferred_commit()
+                    # 携带本轮纪元：迟到 / 跨轮的调度不能把下一轮暂存、
+                    # 随后被否决或取消的负载提前提交
+                    self._schedule_deferred_commit(epoch=deferred_epoch)
                     pending_commit = getattr(self, "_pending_memory_commit", None)
                     if pending_commit is not None:
                         await asyncio.shield(pending_commit)

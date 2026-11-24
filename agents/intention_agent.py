@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from datetime import date
+from typing import Any
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
@@ -114,6 +115,46 @@ def _message_text(content) -> str:
                     parts.append(text)
         return "".join(parts)
     return str(content or "")
+
+
+_PERMANENT_ERROR_CODES = {
+    # OpenAI 兼容网关的字符串错误码（HTTP 200 + 错误体）：鉴权 / 权限 /
+    # 配额类均为永久故障，映射为 401 让熔断器与重试层如实分类
+    "invalid_api_key": 401,
+    "authentication_error": 401,
+    "permission_error": 403,
+    "insufficient_quota": 402,
+    "billing_hard_limit_reached": 402,
+    "invalid_request_error": 400,
+    "context_length_exceeded": 400,
+}
+
+
+def _error_status_code(raw_code: Any, provider_error: dict) -> int | None:
+    """从错误体的 code / status / type 提取状态码（int 或字符串形态）。"""
+    for candidate in (
+        raw_code,
+        provider_error.get("type"),
+    ):
+        if isinstance(candidate, int):
+            return candidate
+        if isinstance(candidate, str):
+            text = candidate.strip().lower()
+            if text.isdigit():
+                return int(text)
+            if text in _PERMANENT_ERROR_CODES:
+                return _PERMANENT_ERROR_CODES[text]
+    return None
+
+
+def _redact_error_text(error: BaseException) -> str:
+    """错误文本脱敏：去掉密钥 / URL 凭据 / 本机路径后写进 reasoning。"""
+    try:
+        from utils.log_redact import redact_paths
+
+        return redact_paths(str(error))
+    except Exception:  # noqa: BLE001 - 脱敏失败也不能阻断降级
+        return str(error)
 
 
 def _default_intent_result(user_query: str, error: str) -> dict:
@@ -431,8 +472,7 @@ class IntentionAgent(AgentBase):
                         raw_code = provider_error.get("code") or provider_error.get(
                             "status"
                         )
-                        if isinstance(raw_code, int):
-                            code = raw_code
+                        code = _error_status_code(raw_code, provider_error)
                     raise _ProviderError(
                         f"模型服务返回错误：{str(provider_error)[:200]}", code
                     )
@@ -510,8 +550,11 @@ class IntentionAgent(AgentBase):
                 logger.error(f"Intent recognition failed (permanent LLM error): {e}")
                 raise
             logger.error(f"Intent recognition failed: {e}")
-            # 返回默认结果
-            result = _default_intent_result(user_query, str(e))
+            # 返回默认结果；reasoning 会随 _meta 落库与 SSE 下发，错误文本
+            # 可能夹带上游网关的密钥 / 内部地址，必须先脱敏
+            result = _default_intent_result(
+                user_query, _redact_error_text(e)
+            )
 
         # JSONDecodeError 扫描分支选中的对象同样可能带非列表 schedule：
         # 与缺键 / 类型非法一致，降级为默认 information_query 调度
@@ -522,9 +565,22 @@ class IntentionAgent(AgentBase):
         # 过滤占位 / 未知智能体名的调度条目：模型完整回显 prompt 模板（本身是
         # 合法 JSON）时，占位条目此前会被当作真实决策交给编排层执行；
         # key_entities 会被编排层直接落库成行程，同样清理模板占位值与非法日期
-        result["agent_schedule"] = self._valid_schedule(
-            result.get("agent_schedule") or []
-        )
+        raw_schedule = result.get("agent_schedule") or []
+        filtered_schedule = self._valid_schedule(raw_schedule)
+        if not filtered_schedule and raw_schedule:
+            # 调度列表非空但过滤后为空：未知 / 占位名、字符串条目、缺
+            # agent_name、空名字等全部形态都算——与编排层「全部非法 →
+            # 默认信息查询」同一口径
+            # 调度条目全部未知 / 占位（如 weather_query 等下划线变体或模板
+            # 回显）：上游过滤成空后，编排层再也看不到「全部非法」这一状态，
+            # 「降级默认信息查询」永不触发，用户请求会被静默吞成 no_agents
+            # （前端渲染「已记录」）。与编排层同一口径降级。
+            logger.warning("意图调度条目全部未知 / 占位，降级为默认信息查询")
+            result = _default_intent_result(
+                user_query, "调度条目均为未知 / 占位智能体"
+            )
+        else:
+            result["agent_schedule"] = filtered_schedule
         result["key_entities"] = _clean_key_entities(result.get("key_entities"))
 
         # 将结果转换为JSON字符串，因为Msg的content必须是字符串

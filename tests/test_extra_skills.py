@@ -260,6 +260,110 @@ def test_extra_skill_long_context_keeps_json_structure():
     print("✓ 扩展技能超长上下文保持 JSON 结构")
 
 
+def test_extra_skill_long_dialogue_keeps_previous_results():
+    """长对话历史不能挤掉 previous_results（DAG 依赖），数据块始终合法 JSON。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    long_reply = json.dumps(
+        {"results": [{"agent_name": "A", "data": {"answer": "长" * 4100}}]},
+        ensure_ascii=False,
+    )
+    payload = {
+        "context": {
+            "rewritten_query": "预算多少",
+            "recent_dialogue": [
+                {"role": "user", "content": "上一问"},
+                {"role": "assistant", "content": long_reply},
+                {"role": "user", "content": "再问"},
+                {"role": "assistant", "content": long_reply},
+                {"role": "user", "content": "三问"},
+                {"role": "assistant", "content": long_reply},
+            ],
+        },
+        "reason": "预算",
+        "expected_output": "费用估算",
+        "previous_results": [
+            {
+                "agent_name": "itinerary_planning",
+                "status": "success",
+                "data": {
+                    "result": {
+                        "status": "success",
+                        "data": {
+                            "itinerary": {"title": "杭州三日行", "days": 3}
+                        },
+                    }
+                },
+            }
+        ],
+    }
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps(payload, ensure_ascii=False),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    block = prompt.split("<<<\n", 1)[1].split("\n>>>", 1)[0]
+    parsed = json.loads(block)  # 必须始终是合法 JSON
+    assert parsed.get("previous_results"), "previous_results 不能被整体丢弃"
+    assert "杭州三日行" in json.dumps(
+        parsed["previous_results"], ensure_ascii=False
+    ), "DAG 依赖的行程标题必须在数据块里"
+    print("✓ 长对话历史不挤掉 previous_results（合法 JSON）")
+
+
+def test_extra_skill_single_oversized_previous_result_is_kept():
+    """单个 previous_results 条目自身超限：裁短保留（键位与行程标题不丢）。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    payload = {
+        "context": {"rewritten_query": "预算"},
+        "reason": "预算",
+        "expected_output": "费用估算",
+        "previous_results": [
+            {
+                "agent_name": "itinerary_planning",
+                "status": "success",
+                "data": {
+                    "result": {
+                        "status": "success",
+                        "data": {
+                            "itinerary": {
+                                "title": "杭州三日行",
+                                "body": "长" * 20000,
+                            }
+                        },
+                    }
+                },
+            }
+        ],
+    }
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps(payload, ensure_ascii=False),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    block = prompt.split("<<<\n", 1)[1].split("\n>>>", 1)[0]
+    parsed = json.loads(block)
+    assert len(block) <= 12000, len(block)
+    assert parsed.get("previous_results"), "单个超限条目不能被整体丢弃"
+    assert "杭州三日行" in json.dumps(
+        parsed["previous_results"], ensure_ascii=False
+    ), "行程标题必须在数据块里"
+    print("✓ 单个超限 previous_results 裁短保留")
+
+
 def test_registry_discovers_extra_skills():
     """懒加载注册器能发现并实例化六个扩展技能。"""
     from agents.lazy_agent_registry import LazyAgentRegistry
@@ -286,5 +390,7 @@ if __name__ == "__main__":
     test_extra_skill_unwraps_fenced_json_envelope()
     test_extra_skill_prompt_neutralizes_user_query()
     test_extra_skill_long_context_keeps_json_structure()
+    test_extra_skill_long_dialogue_keeps_previous_results()
+    test_extra_skill_single_oversized_previous_result_is_kept()
     test_registry_discovers_extra_skills()
     print("\n全部通过")
