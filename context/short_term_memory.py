@@ -260,21 +260,33 @@ if last_ok and type(last) == 'table' and last['role'] == 'assistant' then
 elseif last_ok and type(last) == 'table' and last['role'] == 'user' then
   user_raw = last_raw
 end
--- 只删除「发起时刻之前」的末尾轮次：迟到的重放（含无内容校验的无条件
--- 删除）不会误删故障期间其它实例新写入的轮次。cutoff 与消息时间戳都是
--- 各实例本地时钟的 ISO 字符串，前提是同一部署内各实例时钟基本同步
--- （容器部署通常为 UTC）；时钟偏差超过故障窗口时不保证判断正确
-if cutoff and cutoff ~= '' and user_raw ~= nil then
-  local cut_ok, cut_msg = pcall(cjson.decode, user_raw)
-  if cut_ok and type(cut_msg) == 'table' and type(cut_msg['timestamp']) == 'string'
-     and cut_msg['timestamp'] > cutoff then return 0 end
+-- 时间戳归一（与 _ADD_MESSAGES_LUA 的 timestamp_key 同一口径）：cutoff
+-- 与消息时间戳按同一格式比较，空格分隔 / 超长微秒不会让在线与降级两条
+-- 路径对同一请求得出相反结论
+local function timestamp_key(value)
+  if type(value) ~= 'string' or #value < 10 then
+    return ''
+  end
+  local normalized = value
+  if string.sub(normalized, 11, 11) == ' ' then
+    normalized = string.sub(normalized, 1, 10)
+      .. 'T' .. string.sub(normalized, 12)
+  end
+  if #normalized > 26 then
+    normalized = string.sub(normalized, 1, 26)
+  end
+  return normalized
 end
 -- 回合 id 校验（跨实精确截断）：另一实例正在生成同文本提问时，只按
 -- 文本匹配会误删对方的轮次；传入 turn_id 时要求末尾用户消息的
 -- metadata.client_turn_id 完全一致。消息没有回合 id（长期记忆回填 /
 -- 旧数据 / CLI）时退回内容校验，不能因缺 id 拒删——那会把已删除的
--- 旧提问继续留在短期上下文里。空串 turn_id 视为「无回合 id」
+-- 旧提问继续留在短期上下文里。空串 turn_id 视为「无回合 id」。
+-- 完全匹配的回合 id 是精确身份（回合 id 全局唯一）：跳过下面的 cutoff
+-- 守卫——时钟回拨 / 导入自超前机器的未来时间戳不应挡住显式删除，
+-- 否则长期记忆已删、短期留着，已删除的问答会继续进入模型上下文
 local turn_id = ARGV[5]
+local identified = false
 if turn_id and turn_id ~= '' then
   if user_raw == nil then return 0 end
   local tid_ok, tid_msg = pcall(cjson.decode, user_raw)
@@ -285,6 +297,21 @@ if turn_id and turn_id ~= '' then
     got = meta['client_turn_id']
   end
   if got ~= '' and got ~= turn_id then return 0 end
+  identified = got ~= ''
+end
+-- 只删除「发起时刻之前」的末尾轮次：迟到的重放（含无内容校验的无条件
+-- 删除）不会误删故障期间其它实例新写入的轮次。cutoff 与消息时间戳都是
+-- 各实例本地时钟的 ISO 字符串，前提是同一部署内各实例时钟基本同步
+-- （容器部署通常为 UTC）；时钟偏差超过故障窗口时不保证判断正确
+if not identified and cutoff and cutoff ~= '' and user_raw ~= nil then
+  local cut_ok, cut_msg = pcall(cjson.decode, user_raw)
+  if cut_ok and type(cut_msg) == 'table' then
+    local msg_time = timestamp_key(cut_msg['timestamp'])
+    local cut_time = timestamp_key(cutoff)
+    if msg_time ~= '' and cut_time ~= '' and msg_time > cut_time then
+      return 0
+    end
+  end
 end
 if check == '1' then
   if user_raw == nil then return 0 end
@@ -371,8 +398,14 @@ return count
 # Redis 里。
 _REMOVE_MESSAGES_LUA = """
 local key = KEYS[1]
+local seen = KEYS[2]
 for i = 1, #ARGV do
   redis.call('LREM', key, 0, ARGV[i])
+end
+-- 列表删空时一并删除 seen 指纹（残留会让回填 / 重放的同批历史被永久
+-- 跳过）；仍有存活消息时保留 seen，避免重放把同一问答再推一遍
+if seen and redis.call('LLEN', key) == 0 then
+  redis.call('DEL', seen)
 end
 return 1
 """
@@ -384,10 +417,12 @@ return 1
 # 无时间戳的条目保守保留。ARGV[1] 为空时退化为整键删除（兼容旧日志）。
 _CLEAR_BEFORE_LUA = """
 local key = KEYS[1]
+local seen = KEYS[2]
 local cut = ARGV[1]
 local n = redis.call('LLEN', key)
 if cut == '' then
   redis.call('DEL', key)
+  if seen then redis.call('DEL', seen) end
   return n
 end
 local stale = {}
@@ -401,6 +436,11 @@ for i = 0, n - 1 do
 end
 for _, raw in ipairs(stale) do
   redis.call('LREM', key, 0, raw)
+end
+-- 列表删空时一并删除 seen 指纹（与在线 clear / 截断同一契约）：残留
+-- 指纹会让恢复后的回填 / 重放被永久跳过；仍有存活消息时保留
+if seen and redis.call('LLEN', key) == 0 then
+  redis.call('DEL', seen)
 end
 return #stale
 """
@@ -782,16 +822,11 @@ class ShortTermMemory:
         ):
             count = 2
             last_user = self.messages[-2]
-        # 与 Redis Lua 同一口径：末尾提问的时间戳晚于本机当前时刻（时钟
-        # 回拨 / 导入自时钟超前的机器）时拒绝删除——在线与降级两条路径
-        # 对同一请求必须同结论，不能因有无 Redis 而行为相反
-        if last_user is not None:
-            message_time = _iso_order_key(last_user.get("timestamp"))
-            if message_time and message_time > _iso_order_key(
-                datetime.now().isoformat()
-            ):
-                logger.info("Skip truncating last turn: future timestamp")
-                return 0
+        # 与 Redis Lua 同一口径（顺序也一致）：回合 id 校验在前，完全匹配
+        # 的回合 id 是精确身份（全局唯一），跳过 cutoff 守卫——时钟回拨 /
+        # 导入自超前机器的未来时间戳不应挡住显式删除，否则长期记忆已删、
+        # 短期留着，已删除的问答会继续进入模型上下文
+        identified = False
         if isinstance(turn_id, str) and turn_id:
             if last_user is None:
                 return 0
@@ -805,6 +840,13 @@ class ShortTermMemory:
             # turn_id 视为「无回合 id」（与 Redis Lua 口径一致）
             if got and got != str(turn_id):
                 logger.info("Skip truncating last turn: turn id mismatch")
+                return 0
+            identified = bool(got)
+        if last_user is not None and not identified:
+            message_time = _iso_order_key(last_user.get("timestamp"))
+            cutoff_time = _iso_order_key(datetime.now().isoformat())
+            if message_time and cutoff_time and message_time > cutoff_time:
+                logger.info("Skip truncating last turn: future timestamp")
                 return 0
         if expect is not None:
             if last_user is None:
@@ -1134,6 +1176,8 @@ class RedisShortTermMemory:
                     str(_OP_MARKER_TTL_SEC),
                     cutoff or "",
                     turn_id or "",
+                    # 与在线调用同一口径：重放删空整键时一并清 seen 指纹
+                    seen_key(self.key),
                 )
                 or 0
             )
@@ -1150,11 +1194,23 @@ class RedisShortTermMemory:
             ops.pop(0)
         elif kind == "remove":
             if payload:
-                self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
+                self.client.eval(
+                    _REMOVE_MESSAGES_LUA,
+                    2,
+                    self.key,
+                    seen_key(self.key),
+                    *payload,
+                )
             ops.pop(0)
         else:  # clear
             cutoff = payload if isinstance(payload, str) else ""
-            self.client.eval(_CLEAR_BEFORE_LUA, 1, self.key, cutoff)
+            self.client.eval(
+                _CLEAR_BEFORE_LUA,
+                2,
+                self.key,
+                seen_key(self.key),
+                cutoff,
+            )
             ops.pop(0)
 
     def _call_redis(self, operation, fallback, on_failure=None):

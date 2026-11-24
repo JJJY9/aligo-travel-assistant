@@ -288,7 +288,7 @@ def test_truncate_clears_seen_fingerprints_on_full_delete():
 
 
 def test_clear_before_and_remove_scripts_execute():
-    """_CLEAR_BEFORE_LUA / _REMOVE_MESSAGES_LUA 在真实 Lua 解释器下可执行。"""
+    """_CLEAR_BEFORE_LUA / _REMOVE_MESSAGES_LUA 在真实 Lua 下执行并清 seen。"""
     from context.short_term_memory import (
         _CLEAR_BEFORE_LUA,
         _REMOVE_MESSAGES_LUA,
@@ -296,22 +296,105 @@ def test_clear_before_and_remove_scripts_execute():
 
     client = fakeredis.FakeRedis(decode_responses=True)
     key = "aligo:short:v1:u:s"
+    seen = seen_key(key)
     old = _message("old", "2026-03-11T09:00:00")
     new = _message("new", "2026-03-11T11:00:00")
     client.rpush(key, old)
     client.rpush(key, new)
-    removed = client.eval(_CLEAR_BEFORE_LUA, 1, key, "2026-03-11T10:00:00")
+    client.sadd(seen, "hash-old", "hash-new")
+    removed = client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "2026-03-11T10:00:00")
     assert removed == 1
     assert _contents(client, key) == ["new"]
-    # cutoff 为空串：兼容旧日志的整键清空
-    assert client.eval(_CLEAR_BEFORE_LUA, 1, key, "") == 1
+    assert client.scard(seen) == 2, "仍有存活消息时保留 seen（重放不重复写入）"
+
+    # 删空整表：seen 随之清掉（否则回填 / 重放的同批历史被永久跳过）
+    assert client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "2026-03-12T00:00:00") == 1
     assert client.exists(key) == 0
-    # 按完整消息项精确删除（影子缓存镜像）
+    assert client.exists(seen) == 0
+
+    # cutoff 为空串：兼容旧日志的整键清空，seen 同样清
+    client.rpush(key, old)
+    client.sadd(seen, "hash-old")
+    assert client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "") == 1
+    assert client.exists(key) == 0 and client.exists(seen) == 0
+
+    # 按完整消息项精确删除（影子缓存镜像）：删空时同样清 seen
     client.rpush(key, old)
     client.rpush(key, new)
-    client.eval(_REMOVE_MESSAGES_LUA, 1, key, old)
+    client.sadd(seen, "hash-old", "hash-new")
+    client.eval(_REMOVE_MESSAGES_LUA, 2, key, seen, old)
     assert _contents(client, key) == ["new"]
-    print("✓ 条件清空 / 精确删除脚本在真实 Lua 下执行")
+    assert client.scard(seen) == 2, "仍有存活消息时保留 seen"
+    client.eval(_REMOVE_MESSAGES_LUA, 2, key, seen, new)
+    assert client.exists(key) == 0 and client.exists(seen) == 0
+    print("✓ 条件清空 / 精确删除脚本在真实 Lua 下执行并清 seen")
+
+
+def test_truncate_cutoff_skips_identified_turn():
+    """未来时间戳：无 / 不匹配回合 id 时 cutoff 拒删；完全匹配的回合 id
+    是精确身份、跳过 cutoff（时钟超前不挡住显式删除）；空格分隔时间戳
+    归一后比较。"""
+    from context.short_term_memory import _TRUNCATE_LAST_TURN_LUA
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    cutoff = "2026-11-24T10:00:00"
+    future = "2099-01-01T00:00:00"
+
+    def push_turn(timestamp):
+        client.rpush(
+            key,
+            json.dumps(
+                {
+                    "role": "user",
+                    "content": "Q",
+                    "timestamp": timestamp,
+                    "metadata": {"client_turn_id": "t1"},
+                },
+                ensure_ascii=False,
+            ),
+        )
+        client.rpush(
+            key,
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "A",
+                    "timestamp": timestamp,
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    push_turn(future)
+    assert (
+        client.eval(
+            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, ""
+        )
+        == 0
+    ), "无回合 id 时未来时间戳应被 cutoff 拒删"
+    assert (
+        client.eval(
+            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, "t-other"
+        )
+        == 0
+    ), "回合 id 不匹配时拒删"
+    assert (
+        client.eval(
+            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, "t1"
+        )
+        == 2
+    ), "完全匹配的回合 id 是精确身份，跳过 cutoff"
+    assert client.llen(key) == 0
+
+    # 空格分隔的未来时间戳：归一后比较仍判未来（未修前原始比较会误判过去）
+    push_turn("2099-01-01 00:00:00")
+    client.eval(
+        _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, ""
+    )
+    assert client.llen(key) == 2, "空格分隔时间戳必须归一并按未来拒删"
+    print("✓ 截断 cutoff 与回合 id 精确身份的优先级（含时间戳归一）")
 
 
 if __name__ == "__main__":
@@ -330,4 +413,5 @@ if __name__ == "__main__":
     test_redis_truncate_respects_turn_id()
     test_truncate_clears_seen_fingerprints_on_full_delete()
     test_clear_before_and_remove_scripts_execute()
+    test_truncate_cutoff_skips_identified_turn()
     print("\n全部通过")
