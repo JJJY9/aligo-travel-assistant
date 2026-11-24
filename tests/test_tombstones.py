@@ -24,8 +24,21 @@ class _FakeRedis:
         self.fail = fail
         self.set_calls = []
         self.exists_calls = []
+        self.eval_calls = []
         self.ttls = {}
         self.values: dict[str, str] = {}
+
+    def eval(self, script, numkeys, *keys_and_args):
+        """模拟纪元脚本（INCR + EXPIRE 原子完成，无 incr/expire 两条命令）。"""
+        if self.fail:
+            raise ConnectionError("redis down")
+        args = list(keys_and_args)
+        self.eval_calls.append((script, args))
+        key = args[0]
+        value = int(self.values.get(key, "0")) + 1
+        self.values[key] = str(value)
+        self.ttls[key] = int(args[1])
+        return 1
 
     def set(self, key, value, nx=False, ex=None):
         self.set_calls.append((key, value, nx, ex))
@@ -298,6 +311,18 @@ def test_unmark_accepts_bytes_value(monkeypatch):
     print("✓ 撤销墓碑兼容 bytes 值")
 
 
+def test_epoch_bump_is_atomic_script(monkeypatch):
+    """纪元推进走 INCR + EXPIRE 单脚本：中途失败不会留下无 TTL 的永久键。"""
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    tombstones.bump_session_epoch("u1", "s1")
+    assert len(client.eval_calls) == 1, "INCR 与 EXPIRE 必须在同一脚本里"
+    key = tombstones.epoch_key("u1", "s1")
+    assert client.values[key] == "1"
+    assert client.ttls[key] == int(tombstones.EPOCH_TTL_SEC)
+    print("✓ 会话纪元原子推进（单脚本 INCR + EXPIRE）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -320,6 +345,7 @@ if __name__ == "__main__":
         test_client_factory_failure_sets_cooldown,
         test_unmark_failure_paths,
         test_unmark_accepts_bytes_value,
+        test_epoch_bump_is_atomic_script,
     ):
         mp = pytest.MonkeyPatch()
         try:

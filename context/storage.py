@@ -29,6 +29,7 @@ from context.short_term_memory import (
     redis_short_term_degraded,
     reset_redis_degraded,
     seen_key,
+    seen_queue_key,
     session_key,
     tomb_key,
 )
@@ -438,12 +439,13 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
         queue_clear(replay_key)
         return
     try:
-        # applied / seen 必须随消息键一起删除：seen 残留会让之后回填 /
-        # 重放的同批历史被内容指纹永久跳过，空窗口再也进不了历史
+        # applied / seen / seenq 必须随消息键一起删除：seen 残留会让之后
+        # 回填 / 重放的同批历史被内容指纹永久跳过，空窗口再也进不了历史
         client.delete(
             *keys,
             *[applied_key(key) for key in keys],
             *[seen_key(key) for key in keys],
+            *[seen_queue_key(key) for key in keys],
             *[tomb_key(key) for key in keys],
         )
     except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程

@@ -358,6 +358,7 @@ class _FlakyRedis:
         self.data: list[str] = []
         self.applied: dict[str, set[str]] = {}
         self.seen: dict[str, set[str]] = {}
+        self.seenq: dict[str, list[str]] = {}
         self.tomb: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
         self.marker_ttls: list[str] = []
@@ -379,6 +380,8 @@ class _FlakyRedis:
         for key in keys:
             if key.endswith(":applied"):
                 self.applied.pop(key, None)
+            elif key.endswith(":seenq"):
+                self.seenq.pop(key, None)
             elif key.endswith(":seen"):
                 self.seen.pop(key, None)
             elif key.endswith(":tomb"):
@@ -439,6 +442,14 @@ class _FlakyRedis:
                     seen.discard(member)
                 if not seen:
                     self.seen.pop(keys[1], None)
+            if len(keys) > 2:
+                queue = self.seenq.get(keys[2])
+                if queue is not None:
+                    self.seenq[keys[2]] = [
+                        item for item in queue if item not in set(ids)
+                    ]
+                    if not self.seenq[keys[2]]:
+                        self.seenq.pop(keys[2], None)
             return 1
         if "ipairs(stale)" in script:
             # 条件清空：只删除 cutoff 之前写入的消息；时间戳两侧按
@@ -450,6 +461,8 @@ class _FlakyRedis:
                 if not self.data:
                     if len(keys) > 1:
                         self.seen.pop(keys[1], None)
+                    if len(keys) > 3:
+                        self.seenq.pop(keys[3], None)
                     if len(keys) > 2:
                         self.tomb.pop(keys[2], None)
 
@@ -483,9 +496,11 @@ class _FlakyRedis:
             applied = self.applied.setdefault(keys[1], set())
             seen = self.seen.setdefault(keys[2], set())
             tomb = self.tomb.setdefault(keys[3], set())
+            queue = self.seenq.setdefault(keys[4], []) if len(keys) > 4 else None
             window = int(args[0])
             pushed = 0
-            for index in range(2, len(args) - 3, 4):
+            # ARGV：窗口、消息 TTL、墓碑 TTL，随后每 4 个一组
+            for index in range(3, len(args) - 3, 4):
                 op_id = args[index]
                 content_id = args[index + 1]
                 # args[index + 2] 是模式（append / ordered）：桩不做时间序
@@ -501,10 +516,17 @@ class _FlakyRedis:
                 applied.add(op_id)
                 if content_id:
                     seen.add(content_id)
+                    if queue is not None:
+                        queue.append(content_id)
                 self.data.append(payload)
                 pushed += 1
             if pushed:
                 self.data = self.data[-window:]
+                if queue is not None and len(queue) > window * 4:
+                    evicted = queue[: len(queue) - window * 4]
+                    self.seenq[keys[4]] = queue[len(queue) - window * 4:]
+                    for item in evicted:
+                        seen.discard(item)
             return pushed
         if "LREM" in script:
             removed = 0
@@ -520,6 +542,8 @@ class _FlakyRedis:
             # 已删除内容由 :tomb 墓碑挡住）
             if not self.data and len(keys) > 1:
                 self.seen.pop(keys[1], None)
+                if len(keys) > 2:
+                    self.seenq.pop(keys[2], None)
             return removed
         # 截断脚本：角色判断、内容校验、一次性标记与 cutoff 与 Lua 对应
         marker = keys[1] if len(keys) > 1 else None
@@ -864,12 +888,14 @@ def test_outage_truncate_replay_records_tombstones(monkeypatch):
     message = json.loads(original[0])
     client.eval(
         module._ADD_MESSAGES_LUA,
-        4,
+        5,
         memory.key,
         module.applied_key(memory.key),
         seen,
         tomb,
+        module.seen_queue_key(memory.key),
         "10",
+        "3600",
         "3600",
         "op-replay",
         module.message_content_id(message),
@@ -909,12 +935,14 @@ def test_outage_truncate_replay_records_tombstones_from_other_instance(monkeypat
     message = json.loads(original[0])
     client.eval(
         module._ADD_MESSAGES_LUA,
-        4,
+        5,
         alice.key,
         module.applied_key(alice.key),
         seen,
         tomb,
+        module.seen_queue_key(alice.key),
         "10",
+        "3600",
         "3600",
         "op-replay",
         module.message_content_id(message),
@@ -1322,12 +1350,14 @@ def test_online_truncate_response_lost_after_empty_records_tombstones(monkeypatc
     for index, raw in enumerate((user, answer)):
         pushed = client.eval(
             _ADD_MESSAGES_LUA,
-            4,
+            5,
             reader.key,
             module.applied_key(reader.key),
             module.seen_key(reader.key),
             module.tomb_key(reader.key),
+            module.seen_queue_key(reader.key),
             "10",
+            "3600",
             "3600",
             f"op-other-{index}",
             module.message_content_id(json.loads(raw)),
@@ -1336,6 +1366,67 @@ def test_online_truncate_response_lost_after_empty_records_tombstones(monkeypatc
         )
         assert pushed == 0, "已删除的轮次不能被另一实例的重放复活"
     print("✓ 截断删空响应丢失后重放补写墓碑，重放不复活")
+
+
+def test_online_truncate_tombstone_failure_replays_write(monkeypatch):
+    """在线删空后墓碑写入失败：删除明细必须登记重放，恢复后补写、不复活。
+
+    删空分支已在 Lua 内清掉 seen、``:op`` 标记随后也被清理——墓碑不补写，
+    被删消息就再也没有任何防复活记录。
+    """
+    from context import short_term_memory as module
+
+    class _TombFailRedis(_FlakyRedis):
+        fail_tomb = False
+
+        def eval(self, script, numkeys, *keys_and_args):
+            if self.fail_tomb and "local tomb = KEYS[1]" in script:
+                raise ConnectionError("tomb write failed")
+            return super().eval(script, numkeys, *keys_and_args)
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _TombFailRedis()
+    user = _message("user", "要删除的问题", "2000-01-01T10:00:00")
+    answer = _message("assistant", "要删除的回答", "2000-01-01T10:00:01")
+    client.data = [user, answer]
+    memory = module.RedisShortTermMemory(
+        client, "s-tomb-lost", max_turns=5, user_id="u1"
+    )
+    client.fail_tomb = True
+    assert memory.truncate_last_turn("要删除的问题") == 2
+    assert client.data == []
+    assert not client.tomb, "本用例模拟墓碑写入失败"
+    assert [kind for kind, _ in memory._pending_ops] == ["tombstone"], (
+        "删除明细必须登记重放，否则删空的问答没有任何防复活记录"
+    )
+
+    client.fail_tomb = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory.get_recent_context()  # 触发重放：补写墓碑
+    tomb = client.tomb.get(module.tomb_key(memory.key), set())
+    assert len(tomb) == 2, "重放必须补写两条被删消息的墓碑"
+    assert memory._pending_ops == []
+
+    # 另一实例排队的同指纹 add 重放：被墓碑挡住，不复活
+    for index, raw in enumerate((user, answer)):
+        pushed = client.eval(
+            module._ADD_MESSAGES_LUA,
+            5,
+            memory.key,
+            module.applied_key(memory.key),
+            module.seen_key(memory.key),
+            module.tomb_key(memory.key),
+            module.seen_queue_key(memory.key),
+            "10",
+            "3600",
+            "3600",
+            f"op-revive-{index}",
+            module.message_content_id(json.loads(raw)),
+            "append",
+            raw,
+        )
+        assert pushed == 0, "已删除的轮次不能被重放复活"
+    print("✓ 在线截断墓碑写失败登记重放，恢复后补写、不复活")
 
 
 def test_clear_then_add_replays_in_order(monkeypatch):
@@ -1449,6 +1540,7 @@ def test_clear_short_term_session_discards_and_clears_applied(monkeypatch):
     monkeypatch.setattr(storage, "_get_redis_client", lambda url: client)
     key = module.session_key("s-storage", "u-storage")
     client.applied[module.applied_key(key)] = {"x"}
+    client.seenq[module.seen_queue_key(key)] = ["hash-x"]
     memory = module.RedisShortTermMemory(client, "s-storage", user_id="u-storage")
     client.fail = True
     memory.add_message("user", "待删除会话的内容")
@@ -1458,6 +1550,9 @@ def test_clear_short_term_session_discards_and_clears_applied(monkeypatch):
     storage.clear_short_term_session("s-storage", "u-storage")
     assert memory._pending_ops == []
     assert module.applied_key(key) not in client.applied
+    assert module.seen_queue_key(key) not in client.seenq, (
+        "seen 顺序队列必须随会话删除一并清理"
+    )
     print("✓ 会话删除清理排队操作与 applied 集合")
 
 
@@ -2069,7 +2164,7 @@ def test_truncate_marker_outlives_message_ttl(monkeypatch):
     )
     assert memory.truncate_last_turn("问题") == 2
     ttl = [int(value) for value in client.marker_ttls if value]
-    assert ttl and ttl[0] >= 24 * 3600, (
+    assert ttl and ttl[0] >= 2 * int(module._PENDING_MAX_AGE_SEC), (
         f"标记 TTL={ttl} 不能短于故障重放的等待窗口（消息 TTL={memory.ttl_sec}s）"
     )
     print("✓ 截断标记 TTL 覆盖故障重放窗口")
@@ -2232,7 +2327,9 @@ def test_truncate_replay_marker_uses_long_ttl(monkeypatch):
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     memory.get_recent_context()
     assert client.marker_ttls == [str(module._OP_MARKER_TTL_SEC)]
-    assert int(client.marker_ttls[0]) >= 24 * 3600, "标记必须覆盖进程内日志的整个等待窗口"
+    assert (
+        int(client.marker_ttls[0]) >= 2 * int(module._PENDING_MAX_AGE_SEC)
+    ), "标记必须覆盖进程内日志的整个等待窗口并留一倍余量"
     assert client.marker_ttls[0] != "60", "不能用消息 TTL（本实例 60 秒）"
     assert client.markers == {}, "重放（含未匹配）后标记要清理"
     print("✓ 截断重放路径的标记 TTL 与在线路径一致")

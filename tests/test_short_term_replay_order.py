@@ -18,8 +18,10 @@ from context.short_term_memory import (
     _ADD_MESSAGES_LUA,
     applied_key,
     seen_key,
+    seen_queue_key,
     tomb_key,
 )
+from utils.tombstones import DEFAULT_TOMBSTONE_TTL_SEC
 
 fakeredis = pytest.importorskip("fakeredis")
 
@@ -37,16 +39,17 @@ def _message(content, timestamp):
 
 
 def _add(client, key, payloads, window="20", mode="ordered"):
-    args = [window, "3600"]
+    args = [window, "3600", "3600"]
     for payload in payloads:
         args.extend([f"op-{payload}", f"hash-{payload}", mode, payload])
     return client.eval(
         _ADD_MESSAGES_LUA,
-        4,
+        5,
         key,
         applied_key(key),
         seen_key(key),
         tomb_key(key),
+        seen_queue_key(key),
         *args,
     )
 
@@ -135,23 +138,25 @@ def test_same_op_id_not_duplicated():
     client = fakeredis.FakeRedis(decode_responses=True)
     key = "aligo:short:v1:u:s"
     payload = _message("a", "2026-03-11T10:00:00")
-    args = ["20", "3600", "same-op", "hash-a", "ordered", payload]
+    args = ["20", "3600", "3600", "same-op", "hash-a", "ordered", payload]
     client.eval(
         _ADD_MESSAGES_LUA,
-        4,
+        5,
         key,
         applied_key(key),
         seen_key(key),
         tomb_key(key),
+        seen_queue_key(key),
         *args,
     )
     client.eval(
         _ADD_MESSAGES_LUA,
-        4,
+        5,
         key,
         applied_key(key),
         seen_key(key),
         tomb_key(key),
+        seen_queue_key(key),
         *args,
     )
     assert _contents(client, key) == ["a"]
@@ -307,12 +312,14 @@ def test_truncate_records_tombstones_and_clears_seen():
     message = json.loads(stored)
     client.eval(
         _ADD_MESSAGES_LUA,
-        4,
+        5,
         key,
         applied_key(key),
         seen_key(key),
         tomb_key(key),
+        seen_queue_key(key),
         "20",
+        "3600",
         "3600",
         "op-replay",
         message_content_id(message),
@@ -492,6 +499,55 @@ def test_truncate_cutoff_skips_identified_turn():
     print("✓ 截断 cutoff 与回合 id 精确身份的优先级（含时间戳归一）")
 
 
+def test_add_messages_keeps_tombstone_ttl_floor():
+    """消息 TTL 小于重放窗口时，追加不能把 :tomb 的 TTL 刷短。
+
+    旧实现每次追加都用消息 TTL 覆盖墓碑 TTL：REDIS_TTL_SEC<3600 时，
+    删除轮次后再写一条消息就把墓碑从 3600s 拖到 ttl，迟到的跨实例重放
+    会在墓碑过期后把已删除问答写回窗口。
+    """
+    from context.short_term_memory import RedisShortTermMemory
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    memory = RedisShortTermMemory(
+        client, "s1", max_turns=5, ttl_sec=60, user_id="u1"
+    )
+    memory.add_message("user", "将被删除")
+    raw = client.lindex(memory.key, 0)
+    memory._remember_deleted([raw])
+    tomb = tomb_key(memory.key)
+    floor = int(DEFAULT_TOMBSTONE_TTL_SEC)
+    assert client.ttl(tomb) >= floor - 2
+    memory.add_message("assistant", "后续消息")
+    assert client.ttl(tomb) >= floor - 2, (
+        "追加消息不能把墓碑 TTL 刷成消息 TTL（60s）"
+    )
+    print("✓ 追加消息保留墓碑 TTL 下限")
+
+
+def test_add_messages_prunes_seen_queue():
+    """seen 指纹集合按窗口修剪：长活会话的集合不会无界增长。"""
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    payloads = [
+        _message(f"m{i}", f"2026-03-11T10:{i // 60:02d}:{i % 60:02d}")
+        for i in range(40)
+    ]
+    _add(client, key, payloads, window="6")
+    assert client.llen(key) == 6
+    keep = 6 * 4
+    assert client.scard(seen_key(key)) == keep, (
+        "seen 必须修剪到最近 window*4 条指纹"
+    )
+    assert client.llen(seen_queue_key(key)) == keep
+    # 最近的指纹仍在 seen 里：重复回填仍被去重
+    recent = payloads[-1]
+    assert (
+        _add(client, key, [recent], window="6") == 0
+    ), "窗口内消息的重复回填仍要被 seen 去重"
+    print("✓ seen 指纹集合按窗口修剪")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -510,4 +566,6 @@ if __name__ == "__main__":
     test_truncate_marker_returns_deleted_details_for_replay()
     test_clear_before_and_remove_scripts_execute()
     test_truncate_cutoff_skips_identified_turn()
+    test_add_messages_keeps_tombstone_ttl_floor()
+    test_add_messages_prunes_seen_queue()
     print("\n全部通过")

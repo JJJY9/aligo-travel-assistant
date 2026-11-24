@@ -31,11 +31,11 @@ _redis_degraded_until = 0.0
 _redis_available = True
 
 # 截断脚本一次性标记的存活时间：标记要覆盖「脚本已执行、响应丢失、故障期
-# 操作日志排队等待重放」的整段时间。操作日志在进程内没有过期机制，会话可能
-# 隔很久才再次访问；标记若按消息 TTL（默认 1 小时）过期，迟到的重放会重新
-# 执行删除脚本，把同文本的下一轮对话再删一次。取 30 天，同时保证「响应丢失
-# 且操作日志被淘汰」时残留标记最终自动清理。
-_OP_MARKER_TTL_SEC = 30 * 24 * 3600
+# 操作日志排队等待重放」的整段时间。故障期日志在超过 _PENDING_MAX_AGE_SEC
+# （= 共享墓碑 TTL，1 小时）后整体丢弃、不再重放，因此标记只需活过「入队
+# 后 1 小时」再加一倍余量：取 2 小时。标记不会再被重放使用后残留的计数
+# 会在 2 小时内自动过期（旧值 30 天让会话删除后依旧留下成批的标记键）。
+_OP_MARKER_TTL_SEC = int(2 * DEFAULT_TOMBSTONE_TTL_SEC)
 
 # 第三方 SDK（redis-py）的连接 / 超时异常不是内置 ConnectionError /
 # TimeoutError 的子类，按类名识别（与 utils/llm_resilience 的做法一致）。
@@ -142,6 +142,17 @@ def seen_key(key: str) -> str:
     return f"{key}:seen"
 
 
+def seen_queue_key(key: str) -> str:
+    """``seen`` 集合的写入顺序队列（与集合一一对应的指纹列表）。
+
+    Redis 集合无序、无法按写入时刻淘汰，``_ADD_MESSAGES_LUA`` 只能在
+    每次 SADD 时把指纹 RPUSH 进这个队列，再按队列长度把最旧的指纹连同
+    集合成员一起淘汰——否则长活会话的 seen 只增不减（每条消息 32 字节
+    孤儿指纹，且每次 push 都把 TTL 续期，永远不会过期）。
+    """
+    return f"{key}:seenq"
+
+
 def tomb_key(key: str) -> str:
     """会话消息键对应的「已删除消息内容指纹」墓碑集合键（TTL 同消息）。
 
@@ -241,6 +252,8 @@ _TRUNCATE_LAST_TURN_LUA = """
 local key = KEYS[1]
 local marker = nil
 if #KEYS >= 2 then marker = KEYS[2] end
+local seenq = nil
+if #KEYS >= 3 then seenq = KEYS[3] end
 local check = ARGV[1]
 local expected = ARGV[2]
 local marker_ttl = ARGV[3]
@@ -411,6 +424,7 @@ if count >= n then
   -- 目标键的 seen 名），重放不会复活已删除内容
   local seen = ARGV[6]
   if seen and seen ~= '' then redis.call('DEL', seen) end
+  if seenq then redis.call('DEL', seenq) end
 else
   for i = -count, -1 do
     deleted[#deleted + 1] = redis.call('LINDEX', key, i)
@@ -442,6 +456,8 @@ return out
 _REMOVE_MESSAGES_LUA = """
 local key = KEYS[1]
 local seen = KEYS[2]
+local seenq = nil
+if #KEYS >= 3 then seenq = KEYS[3] end
 for i = 1, #ARGV do
   redis.call('LREM', key, 0, ARGV[i])
 end
@@ -449,6 +465,7 @@ end
 -- 调用方写入 :tomb 墓碑，重放不会复活已删除内容
 if seen and redis.call('LLEN', key) == 0 then
   redis.call('DEL', seen)
+  if seenq then redis.call('DEL', seenq) end
 end
 return 1
 """
@@ -463,6 +480,8 @@ return 1
 _RECORD_TOMBSTONES_LUA = """
 local tomb = KEYS[1]
 local seen = KEYS[2]
+local seenq = nil
+if #KEYS >= 3 then seenq = KEYS[3] end
 local ttl = tonumber(ARGV[1])
 for i = 2, #ARGV do
   redis.call('SADD', tomb, ARGV[i])
@@ -470,6 +489,9 @@ end
 redis.call('EXPIRE', tomb, ttl)
 for i = 2, #ARGV do
   redis.call('SREM', seen, ARGV[i])
+  -- 队列与集合一一对应：SREM 的同时把队列项一并移除，否则淘汰旧队列项时
+  -- 会把同指纹后来重新加入的集合成员误删
+  if seenq then redis.call('LREM', seenq, 0, ARGV[i]) end
 end
 return 1
 """
@@ -483,11 +505,14 @@ _CLEAR_BEFORE_LUA = """
 local key = KEYS[1]
 local seen = KEYS[2]
 local tomb = KEYS[3]
+local seenq = nil
+if #KEYS >= 4 then seenq = KEYS[4] end
 local cut = ARGV[1]
 local n = redis.call('LLEN', key)
 if cut == '' then
   redis.call('DEL', key)
   if seen then redis.call('DEL', seen) end
+  if seenq then redis.call('DEL', seenq) end
   if tomb then redis.call('DEL', tomb) end
   return n
 end
@@ -527,6 +552,7 @@ end
 -- seen 但保留/写入 tomb 墓碑（见 _TRUNCATE_LAST_TURN_LUA）
 if seen and redis.call('LLEN', key) == 0 then
   redis.call('DEL', seen)
+  if seenq then redis.call('DEL', seenq) end
   if tomb then redis.call('DEL', tomb) end
 end
 return #stale
@@ -538,15 +564,32 @@ return #stale
 # 后者必须补写，靠窗口内容判断会静默丢消息。
 # seen 集合按「角色 + 内容 + 时间戳」指纹去重：另一实例的回填 / 重放已写入
 # 同一条消息时，本次重放跳过，跨实例的重复回填不会把同一问答推两遍。
-# ARGV: 窗口大小、TTL、然后每三条为一组 (op_id, content_hash, payload)。
+# ARGV: 窗口大小、消息 TTL、墓碑 TTL（下限口径由调用方取
+# max(消息 TTL, 排队重放窗口)），然后每四条为一组
+# (op_id, content_hash, mode, payload)。
 _ADD_MESSAGES_LUA = """
 local key = KEYS[1]
 local applied = KEYS[2]
 local seen = KEYS[3]
 local tomb = KEYS[4]
+local seenq = KEYS[5]
 local window = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
+local tomb_ttl = tonumber(ARGV[3])
 local pushed = 0
+
+-- 升级前的 seen 集合没有配套队列：一次性按任意顺序接管现有指纹（沿用
+-- seen 的剩余 TTL），此后每次追加都能按队列修剪。必须放在推送循环之前：
+-- 循环里的 SADD 会先把队列填上，之后再检测「队列为空」就永远不成立。
+if redis.call('LLEN', seenq) == 0 and redis.call('SCARD', seen) > 0 then
+  for _, hash in ipairs(redis.call('SMEMBERS', seen)) do
+    redis.call('RPUSH', seenq, hash)
+  end
+  local seen_ttl = redis.call('TTL', seen)
+  if seen_ttl and seen_ttl > 0 then
+    redis.call('EXPIRE', seenq, seen_ttl)
+  end
+end
 
 -- 时间序插入（v2.0）：回填的历史消息必须按 timestamp 放到对应位置。
 -- 无条件 RPUSH 会把更旧的消息放到窗口尾部，LTRIM 随后把真实的最近轮次
@@ -614,7 +657,7 @@ local function insert_payload(payload, mode)
   insert_ordered(payload)
 end
 
-for i = 3, #ARGV, 4 do
+for i = 4, #ARGV, 4 do
   local op_id = ARGV[i]
   local content_hash = ARGV[i + 1]
   local mode = ARGV[i + 2]
@@ -636,8 +679,11 @@ for i = 3, #ARGV, 4 do
     -- 跳过这条消息。插入出错时脚本中断，op_id 不落 applied，重放可补写。
     insert_payload(payload, mode)
     redis.call('SADD', applied, op_id)
-    if content_hash ~= '' then
-      redis.call('SADD', seen, content_hash)
+    if content_hash ~= ''
+       and redis.call('SADD', seen, content_hash) == 1 then
+      -- 指纹队列与集合一一对应（SREM 处同步 LREM）：集合无序，只能靠
+      -- 队列按写入时刻淘汰，见下方修剪
+      redis.call('RPUSH', seenq, content_hash)
     end
     pushed = pushed + 1
   end
@@ -647,7 +693,22 @@ if pushed > 0 then
   redis.call('EXPIRE', key, ttl)
   redis.call('EXPIRE', applied, ttl)
   redis.call('EXPIRE', seen, ttl)
-  redis.call('EXPIRE', tomb, ttl)
+  -- 墓碑 TTL 不能低于排队重放窗口（tomb_ttl）：REDIS_TTL_SEC 调小于 1 小时
+  -- 时，每次追加都把 :tomb 刷成消息 TTL，晚到的跨实例重放会在墓碑过期后
+  -- 把用户已删除的问答写回窗口
+  redis.call('EXPIRE', tomb, tomb_ttl)
+  -- seen 修剪：只为「最近 window*4 条」指纹保留去重记录。无界增长的长活
+  -- 会话会让集合只增不减（每次 push 还续期，永不自动过期）
+  local keep = window * 4
+  local excess = redis.call('LLEN', seenq) - keep
+  if excess > 0 then
+    local evicted = redis.call('LRANGE', seenq, 0, excess - 1)
+    redis.call('LTRIM', seenq, excess, -1)
+    for _, hash in ipairs(evicted) do
+      redis.call('SREM', seen, hash)
+    end
+  end
+  redis.call('EXPIRE', seenq, ttl)
 end
 return pushed
 """
@@ -1081,13 +1142,15 @@ class RedisShortTermMemory:
             # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）
             self.client.eval(
                 _ADD_MESSAGES_LUA,
-                4,
+                5,
                 self.key,
                 applied_key(self.key),
                 seen_key(self.key),
                 tomb_key(self.key),
+                seen_queue_key(self.key),
                 str(self.max_turns * 2),
                 str(self.ttl_sec),
+                str(max(self.ttl_sec, int(DEFAULT_TOMBSTONE_TTL_SEC))),
                 op_id,
                 content_id,
                 mode,
@@ -1233,7 +1296,11 @@ class RedisShortTermMemory:
                     break
                 consumed += 1
                 batch.append(op_payload)
-            arguments: list[str] = [str(window), str(self.ttl_sec)]
+            arguments: list[str] = [
+                str(window),
+                str(self.ttl_sec),
+                str(max(self.ttl_sec, int(DEFAULT_TOMBSTONE_TTL_SEC))),
+            ]
             for op_payload in batch:
                 stored_payload, op_id, content_id = op_payload[:3]
                 # 升级前排队的内存日志没有模式字段：按实时追加处理，
@@ -1242,11 +1309,12 @@ class RedisShortTermMemory:
                 arguments.extend([op_id, content_id, mode, stored_payload])
             self.client.eval(
                 _ADD_MESSAGES_LUA,
-                4,
+                5,
                 self.key,
                 applied_key(self.key),
                 seen_key(self.key),
                 tomb_key(self.key),
+                seen_queue_key(self.key),
                 *arguments,
             )
             # 这些操作已成功出队、不会再重放，回收对应的去重记录；
@@ -1264,9 +1332,10 @@ class RedisShortTermMemory:
             turn_id = rest[0] if rest else None
             raw_result = self.client.eval(
                 _TRUNCATE_LAST_TURN_LUA,
-                2,
+                3,
                 self.key,
                 self._op_marker_key(op_id),
+                seen_queue_key(self.key),
                 "1" if expect is not None else "0",
                 (expect or "").strip(),
                 str(_OP_MARKER_TTL_SEC),
@@ -1274,12 +1343,13 @@ class RedisShortTermMemory:
                 turn_id or "",
                 seen_key(self.key),
                 # 删除明细旁键的短 TTL：与排队操作的最大存活时间一致，
-                # 已删除内容不会随 30 天标记长期滞留
+                # 已删除内容不会随标记长期滞留
                 str(int(_PENDING_MAX_AGE_SEC)),
             )
             result, replay_deleted = self._parse_truncate_result(raw_result)
             if replay_deleted:
-                self._remember_deleted(replay_deleted)
+                # 已在日志锁内：墓碑写失败时直接抛出保留操作重试，不能再入队
+                self._remember_deleted(replay_deleted, defer=False)
             if result == 0:
                 logger.warning(
                     "短期记忆故障期截断重放未匹配（列表末尾已变化），已跳过：%s",
@@ -1292,21 +1362,29 @@ class RedisShortTermMemory:
             if payload:
                 self.client.eval(
                     _REMOVE_MESSAGES_LUA,
-                    2,
+                    3,
                     self.key,
                     seen_key(self.key),
+                    seen_queue_key(self.key),
                     *payload,
                 )
-                self._remember_deleted(list(payload))
+                self._remember_deleted(list(payload), defer=False)
+            ops.pop(0)
+        elif kind == "tombstone":
+            # 在线删除墓碑写入失败：Redis 恢复后补写（删空分支的 seen 已被
+            # 脚本清掉，不补写则已删除问答没有任何防复活记录）
+            if payload:
+                self._remember_deleted(list(payload), defer=False)
             ops.pop(0)
         else:  # clear
             cutoff = payload if isinstance(payload, str) else ""
             self.client.eval(
                 _CLEAR_BEFORE_LUA,
-                3,
+                4,
                 self.key,
                 seen_key(self.key),
                 tomb_key(self.key),
+                seen_queue_key(self.key),
                 cutoff,
             )
             ops.pop(0)
@@ -1464,16 +1542,7 @@ class RedisShortTermMemory:
         except (TypeError, ValueError):
             return 0, []
 
-    def _remember_deleted(self, deleted: list[str]) -> None:
-        """把本次删除消息的指纹写入 ``:tomb`` 墓碑并同步清理 seen。
-
-        SADD / EXPIRE / SREM 在一个 Lua 脚本里原子完成——分开执行时
-        「SADD 成功、EXPIRE 失败 / 进程退出」会留下没有 TTL 的墓碑键，
-        同 session_id 复用后回填被永久跳过。TTL 取消息 TTL 与排队重放
-        窗口的较大者：REDIS_TTL_SEC 调小时墓碑不会先于迟到的故障重放过期。
-        记录失败按 warning 处理；seen 若仍保留指纹仍可挡住重放，删空场景
-        由调用方在恢复重放时从 :op 标记的删除明细补写。
-        """
+    def _tombstone_ids(self, deleted: list[str]) -> list[str]:
         ids: list[str] = []
         for raw in deleted:
             try:
@@ -1484,20 +1553,48 @@ class RedisShortTermMemory:
                 content_id = message_content_id(message)
                 if content_id:
                     ids.append(content_id)
-        if not ids:
-            return
+        return ids
+
+    def _write_tombstones(self, ids: list[str]) -> None:
+        """把指纹写入 ``:tomb`` 墓碑（失败抛异常，由调用方决定处置）。"""
         ttl = max(self.ttl_sec, int(DEFAULT_TOMBSTONE_TTL_SEC))
+        self.client.eval(
+            _RECORD_TOMBSTONES_LUA,
+            3,
+            tomb_key(self.key),
+            seen_key(self.key),
+            seen_queue_key(self.key),
+            str(ttl),
+            *ids,
+        )
+
+    def _remember_deleted(self, deleted: list[str], defer: bool = True) -> bool:
+        """把本次删除消息的指纹写入 ``:tomb`` 墓碑并同步清理 seen。
+
+        SADD / EXPIRE / SREM 在一个 Lua 脚本里原子完成——分开执行时
+        「SADD 成功、EXPIRE 失败 / 进程退出」会留下没有 TTL 的墓碑键，
+        同 session_id 复用后回填被永久跳过。TTL 取消息 TTL 与排队重放
+        窗口的较大者：REDIS_TTL_SEC 调小时墓碑不会先于迟到的故障重放过期。
+
+        写失败时默认（``defer=True``，在线路径、日志锁外）把删除明细登记
+        进故障期日志，Redis 恢复后的下一次调用补写——删空整键的分支已在
+        脚本内清掉 seen，不补写墓碑（也不保留标记）会让被删消息没有任何
+        防复活记录。``defer=False`` 用于重放路径（已持有日志锁，不能再
+        入队）：直接抛出，让队首操作保留下来稍后重试。
+        """
+        ids = self._tombstone_ids(deleted)
+        if not ids:
+            return True
         try:
-            self.client.eval(
-                _RECORD_TOMBSTONES_LUA,
-                2,
-                tomb_key(self.key),
-                seen_key(self.key),
-                str(ttl),
-                *ids,
-            )
-        except Exception as exc:  # noqa: BLE001 - 墓碑写失败只记日志
+            self._write_tombstones(ids)
+            return True
+        except Exception as exc:  # noqa: BLE001 - 在线路径登记补写，重放路径抛出
             logger.warning("记录删除墓碑失败：%s", exc)
+            if not defer:
+                raise
+            with _pending_journal(self.key) as journal:
+                self._append_op(journal, "tombstone", list(deleted))
+            return False
 
     def _forget_marker(self, op_id: str) -> None:
         try:
@@ -1595,6 +1692,7 @@ class RedisShortTermMemory:
                 self.key,
                 applied_key(self.key),
                 seen_key(self.key),
+                seen_queue_key(self.key),
                 tomb_key(self.key),
             ),
             lambda: None,
@@ -1656,9 +1754,10 @@ class RedisShortTermMemory:
         raw, via_redis = self._call_redis(
             lambda: self.client.eval(
                 _TRUNCATE_LAST_TURN_LUA,
-                2,
+                3,
                 self.key,
                 self._op_marker_key(op_id),
+                seen_queue_key(self.key),
                 "1" if expect is not None else "0",
                 (expect or "").strip(),
                 str(_OP_MARKER_TTL_SEC),

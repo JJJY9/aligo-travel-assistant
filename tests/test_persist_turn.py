@@ -512,6 +512,12 @@ def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
         "读不到纪元时按墓碑结果放行，不能把瞬时故障当成删除"
     )
     assert manager.persist_guard((False, None), None)() is True
+    # 回合开始时有纪元、提交时键自然过期 / 被逐出：删除一定会写非空纪元，
+    # 键消失不是删除信号——否则合法回合被整轮否决，用户回答静默丢失
+    epochs["state"] = (True, None)
+    assert manager.persist_guard((True, "7"), None)() is True, (
+        "纪元键消失（过期 / 逐出）不等于会话被删除，必须放行"
+    )
     print("✓ 落库守卫按会话纪元变化否决（读不到时不误否决）")
 
 

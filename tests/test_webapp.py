@@ -9414,6 +9414,22 @@ def test_half_open_busy_probe_denies_before_rate_limit(monkeypatch):
     print("✓ 半开名额被占时预检在限流之前拒绝")
 
 
+def _emulate_epoch_bump(fake, script, args):
+    """bump-epoch Lua 的测试桩：脚本含 INCR 时按 INCR + EXPIRE 模拟。
+
+    返回 None 表示不是纪元脚本，调用方的 eval 继续按各自逻辑处理。
+    """
+    if "INCR" not in script:
+        return None
+    key = args[0]
+    value = int(fake.data.get(key, "0")) + 1
+    fake.data[key] = str(value)
+    ttls = getattr(fake, "ttls", None)
+    if ttls is not None:
+        ttls[key] = int(args[1])
+    return value
+
+
 def test_pending_tombstone_replay_after_redis_recovers():
     """Redis 故障期删除：恢复后补写共享墓碑与会话纪元；回滚则撤销待补写。"""
 
@@ -9456,7 +9472,8 @@ def test_pending_tombstone_replay_after_redis_recovers():
 
         def eval(self, script, numkeys, *args):
             self._check()
-            return 0
+            bumped = _emulate_epoch_bump(self, script, args)
+            return 0 if bumped is None else bumped
 
     shared = _FlakyRedis()
     app = create_app(model=UsageTrackingModel(_FakeModel()))
@@ -9519,6 +9536,9 @@ def test_shared_tombstones_across_instances():
             return 1
 
         def eval(self, script, numkeys, *args):
+            bumped = _emulate_epoch_bump(self, script, args)
+            if bumped is not None:
+                return bumped
             key, expected = args[0], args[1]
             if self.data.get(key) == expected:
                 self.data.pop(key, None)
@@ -9580,6 +9600,9 @@ def test_mark_deleted_force_during_tombstone_cooldown():
 
         def get(self, key):
             return self.data.get(key)
+
+        def eval(self, script, numkeys, *args):
+            return _emulate_epoch_bump(self, script, args)
 
     app = create_app(model=UsageTrackingModel(_FakeModel()))
     state = app.state.aligo
@@ -9643,6 +9666,128 @@ def test_shared_tombstone_not_overwritten_by_other_instance():
     assert key not in shared.data
     assert state_b.is_recently_deleted("u-nx", "s-nx") is False
     print("✓ 共享墓碑按 token 归属（NX 不覆盖 / 回滚只删自己的）")
+
+
+def test_successful_delete_reasserts_shared_tombstone():
+    """并发删除：成功删除方覆盖墓碑为自身 token，原所有者回滚不误删。"""
+
+    class _FakeRedis:
+        def __init__(self):
+            self.data = {}
+            self.ttls = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            self.ttls[key] = ex
+            return True
+
+        def get(self, key):
+            return self.data.get(key)
+
+        def exists(self, key):
+            return int(key in self.data)
+
+        def delete(self, key):
+            self.data.pop(key, None)
+            return 1
+
+        def eval(self, script, numkeys, *args):
+            bumped = _emulate_epoch_bump(self, script, args)
+            if bumped is not None:
+                return bumped
+            key, expected = args[0], args[1]
+            if self.data.get(key) == expected:
+                self.data.pop(key, None)
+                return 1
+            return 0
+
+    shared = _FakeRedis()
+    state_a = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state_b = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    for state in (state_a, state_b):
+        state._redis_client = shared
+        state._tombstones_shared = True
+
+    key = "aligo:deleted:u-re:s-re"
+    token_a = state_a.mark_deleted("u-re", "s-re")
+    token_b = state_b.mark_deleted("u-re", "s-re")
+    assert shared.data[key] == token_a, "先到者是墓碑所有者"
+
+    # B 的删除实际成功（A 的删除检查到「已不存在」并回滚）：成功方在删除后
+    # 重新主张墓碑，覆盖为自己的 token
+    state_b.reassert_deleted("u-re", "s-re", token_b)
+    assert shared.data[key] == token_b
+
+    # A 的删除失败回滚按旧 token 匹配：不能删掉 B 的墓碑
+    state_a.unmark_deleted("u-re", "s-re", token_a)
+    assert shared.data.get(key) == token_b, "已删除会话必须保留共享删除保护"
+    assert state_b.is_recently_deleted("u-re", "s-re") is True
+    print("✓ 并发删除的成功方重新主张共享墓碑")
+
+
+def test_pending_replay_skips_rolled_back_delete():
+    """补写与撤销交错：已回滚的删除不能被恢复后的补写固化成真实墓碑。"""
+
+    class _HookRedis:
+        def __init__(self):
+            self.data = {}
+            self.up = False
+            self.on_set = None
+
+        def _check(self):
+            if not self.up:
+                raise ConnectionError("redis down")
+
+        def set(self, key, value, nx=False, ex=None):
+            self._check()
+            hook, self.on_set = self.on_set, None
+            if hook is not None:
+                hook()
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def exists(self, key):
+            self._check()
+            return int(key in self.data)
+
+        def delete(self, key):
+            self._check()
+            self.data.pop(key, None)
+            return 1
+
+        def eval(self, script, numkeys, *args):
+            self._check()
+            bumped = _emulate_epoch_bump(self, script, args)
+            if bumped is not None:
+                return bumped
+            key, expected = args[0], args[1]
+            if self.data.get(key) == expected:
+                self.data.pop(key, None)
+                return 1
+            return 0
+
+    shared = _HookRedis()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state._redis_client = shared
+    state._tombstones_shared = False
+
+    token = state.mark_deleted("u-race", "s-race")
+    assert ("u-race", "s-race") in state._pending_shared_tombstones
+
+    shared.up = True
+    # 补写的 SET 执行期间删除被回滚（unmark 撤销待补写条目并删共享墓碑）
+    shared.on_set = lambda: state.unmark_deleted("u-race", "s-race", token)
+    assert state.replay_pending_tombstones() == 0
+    assert "aligo:deleted:u-race:s-race" not in shared.data, (
+        "已回滚的删除不能被补写固化成真实墓碑"
+    )
+    assert state.is_recently_deleted("u-race", "s-race") is False
+    print("✓ 补写前复查 + 写后补偿：回滚的删除不被固化")
 
 
 def test_delete_failures_roll_back_shared_tombstone(monkeypatch):
