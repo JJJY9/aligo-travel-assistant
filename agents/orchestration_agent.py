@@ -1095,20 +1095,23 @@ class OrchestrationAgent(AgentBase):
             checkpoint_store is not None
             and checkpoint_key
             and result.get("status") == "success"
-            and not self._session_deleted_now()
         ):
             # 会话删除（CLI / 另一实例）已清理该作用域的检查点：在途回合
-            # 不能再写出新的检查点文件（会残留到 TTL 且含用户数据）
-            try:
-                await asyncio.to_thread(
-                    checkpoint_store.update_step,
-                    checkpoint_key,
-                    canonical_name,
-                    result,
-                    scope=getattr(self, "_checkpoint_scope", None),
-                )
-            except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
-                logger.warning("保存执行检查点失败: %s", exc)
+            # 不能再写出新的检查点文件（会残留到 TTL 且含用户数据）。
+            # 墓碑复查只在确实要写检查点时执行：失败 / 超时结果不写检查点，
+            # 无需为此多付一次 Redis 查询（Redis 变慢时延迟用户可见错误）
+            deleted_now = await asyncio.to_thread(self._session_deleted_now)
+            if not deleted_now:
+                try:
+                    await asyncio.to_thread(
+                        checkpoint_store.update_step,
+                        checkpoint_key,
+                        canonical_name,
+                        result,
+                        scope=getattr(self, "_checkpoint_scope", None),
+                    )
+                except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
+                    logger.warning("保存执行检查点失败: %s", exc)
         return result
 
     async def _run_agent(

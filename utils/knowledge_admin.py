@@ -1338,6 +1338,9 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
     删除在同一把写锁内完成，并在删除前逐条复核「保留片段仍在、内容仍与
     计划一致、不是多分片记录」，避免按过期 id 删掉并发编辑后的新内容；
     并发下已消失 / 已变化的片段记入 ``skipped``，删除异常记入 ``failed``。
+    删除开始后的存储查询故障逐条记入 ``failed`` 并照常返回结果——已删除
+    的部分不可逆，不能把它变成异常让调用方丢失计划 / 计数（503 只留给
+    尚未开始删除的阶段：扫描 / 加载）。
     """
     plan: list[dict[str, Any]] = []
 
@@ -1381,9 +1384,22 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
         removed = 0
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        aborted: str | None = None
         for item in plan:
+            if aborted is not None:
+                # 删除开始后的存储故障：后续分组不再查询（每次查询都可能
+                # 等满 socket 超时），逐条记入 failed，结果照常返回
+                for doc_id in item["remove"]:
+                    failed.append({"id": doc_id, "error": aborted})
+                continue
             expected = item["content"].strip()
-            keep_content = _row_content(client, item["keep"])
+            try:
+                keep_content = _row_content(client, item["keep"])
+            except Exception as exc:  # noqa: BLE001 - 查询失败按组记入 failed
+                aborted = f"存储查询失败：{exc}"
+                for doc_id in item["remove"]:
+                    failed.append({"id": doc_id, "error": aborted})
+                continue
             if keep_content is None or keep_content.strip() != expected:
                 for doc_id in item["remove"]:
                     skipped.append(
@@ -1391,7 +1407,15 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
                     )
                 continue
             for doc_id in item["remove"]:
-                current = _row_content(client, doc_id)
+                if aborted is not None:
+                    failed.append({"id": doc_id, "error": aborted})
+                    continue
+                try:
+                    current = _row_content(client, doc_id)
+                except Exception as exc:  # noqa: BLE001 - 同上
+                    aborted = f"存储查询失败：{exc}"
+                    failed.append({"id": doc_id, "error": aborted})
+                    continue
                 if current is None:
                     skipped.append({"id": doc_id, "reason": "片段不存在或已被删除"})
                     continue

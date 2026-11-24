@@ -358,8 +358,10 @@ class _FlakyRedis:
         self.data: list[str] = []
         self.applied: dict[str, set[str]] = {}
         self.seen: dict[str, set[str]] = {}
+        self.tomb: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
         self.marker_ttls: list[str] = []
+        self.tomb_ttls: list[int] = []
         self.eval_calls = 0
 
     def _check(self):
@@ -379,15 +381,31 @@ class _FlakyRedis:
                 self.applied.pop(key, None)
             elif key.endswith(":seen"):
                 self.seen.pop(key, None)
+            elif key.endswith(":tomb"):
+                self.tomb.pop(key, None)
             elif ":op:" in key:
                 self.markers.pop(key, None)
             else:
                 self.data.clear()
         return len(keys)
 
+    def _bucket(self, key):
+        if key.endswith(":seen"):
+            return self.seen
+        if key.endswith(":tomb"):
+            return self.tomb
+        return self.applied
+
+    def sadd(self, key, *members):
+        self._check()
+        bucket = self._bucket(key).setdefault(key, set())
+        bucket.update(members)
+        return len(members)
+
     def srem(self, key, *members):
         self._check()
-        bucket = self.applied.get(key)
+        store = self._bucket(key)
+        bucket = store.get(key)
         if bucket is None:
             return 0
         removed = 0
@@ -396,8 +414,12 @@ class _FlakyRedis:
                 bucket.remove(member)
                 removed += 1
         if not bucket:
-            self.applied.pop(key, None)
+            store.pop(key, None)
         return removed
+
+    def expire(self, key, ttl):
+        self._check()
+        return 1
 
     def eval(self, script, numkeys, *keys_and_args):
         """按 redis-py 的 eval(script, numkeys, *keys_and_args) 解析。"""
@@ -405,18 +427,36 @@ class _FlakyRedis:
         self.eval_calls += 1
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:]) or [""]
-        if "ipairs(stale)" in script:
-            # 条件清空：只删除 cutoff 之前写入的消息；列表删空时与真实
-            # Lua 一致清 seen 指纹（KEYS[2]）
-            def _drop_seen_if_empty() -> None:
-                if not self.data and len(keys) > 1:
+        if "local tomb = KEYS[1]" in script:
+            # 墓碑原子写入：SADD 指纹 + EXPIRE + SREM seen（与真实 Lua 同序）
+            tomb = self.tomb.setdefault(keys[0], set())
+            ids = list(args[1:])
+            tomb.update(ids)
+            self.tomb_ttls.append(int(args[0]) if args and args[0] else 0)
+            seen = self.seen.get(keys[1])
+            if seen is not None:
+                for member in ids:
+                    seen.discard(member)
+                if not seen:
                     self.seen.pop(keys[1], None)
+            return 1
+        if "ipairs(stale)" in script:
+            # 条件清空：只删除 cutoff 之前写入的消息；时间戳两侧按
+            # _iso_order_key 归一（与真实 Lua 的 timestamp_key 同口径）；
+            # 列表删空时清 seen 与 tomb（KEYS[2] / KEYS[3]）
+            cut_key = _iso_order_key(args[0] if args else "")
 
-            cut = args[0] if args else ""
-            if cut == "":
+            def _drop_if_empty() -> None:
+                if not self.data:
+                    if len(keys) > 1:
+                        self.seen.pop(keys[1], None)
+                    if len(keys) > 2:
+                        self.tomb.pop(keys[2], None)
+
+            if not cut_key:
                 count = len(self.data)
                 self.data.clear()
-                _drop_seen_if_empty()
+                _drop_if_empty()
                 return count
             stale = 0
             kept = []
@@ -425,18 +465,24 @@ class _FlakyRedis:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     msg = None
-                timestamp = msg.get("timestamp") if isinstance(msg, dict) else None
-                if isinstance(timestamp, str) and timestamp <= cut:
+                timestamp = (
+                    _iso_order_key(msg.get("timestamp"))
+                    if isinstance(msg, dict)
+                    else ""
+                )
+                if timestamp and timestamp <= cut_key:
                     stale += 1
                 else:
                     kept.append(raw)
             self.data = kept
-            _drop_seen_if_empty()
+            _drop_if_empty()
             return stale
         if "SADD" in script:
-            # 幂等追加：按 op_id 与内容指纹去重后 RPUSH，窗口裁剪与 TTL 略去
+            # 幂等追加：按 op_id / 内容指纹 / 删除墓碑去重后 RPUSH，
+            # 窗口裁剪与 TTL 略去
             applied = self.applied.setdefault(keys[1], set())
             seen = self.seen.setdefault(keys[2], set())
+            tomb = self.tomb.setdefault(keys[3], set())
             window = int(args[0])
             pushed = 0
             for index in range(2, len(args) - 3, 4):
@@ -448,6 +494,9 @@ class _FlakyRedis:
                 if op_id in applied:
                     continue
                 if content_id and content_id in seen:
+                    continue
+                if content_id and content_id in tomb:
+                    # 已删除消息的墓碑：重放 / 回填不能写回窗口
                     continue
                 applied.add(op_id)
                 if content_id:
@@ -467,7 +516,8 @@ class _FlakyRedis:
                     else:
                         kept.append(item)
                 self.data = kept
-            # 列表删空时与真实 Lua 一致清 seen 指纹（KEYS[2]）
+            # 与真实 Lua 一致：删空时清 seen（回填恢复窗口外更早轮次；
+            # 已删除内容由 :tomb 墓碑挡住）
             if not self.data and len(keys) > 1:
                 self.seen.pop(keys[1], None)
             return removed
@@ -479,8 +529,13 @@ class _FlakyRedis:
         cutoff = args[3] if len(args) > 3 else ""
         if marker is not None:
             if marker in self.markers:
-                return -1
-            self.markers[marker] = marker_ttl
+                # 与真实 Lua 一致：标记只存计数，删除明细在短 TTL 的
+                # ``:del`` 旁键里（重放据此补写墓碑）；旁键已过期则只回计数
+                detail = self.markers.get(f"{marker}:del")
+                if detail is not None:
+                    return detail
+                return self.markers[marker]
+            self.markers[marker] = '{"count": -1, "deleted": []}'
             self.marker_ttls.append(marker_ttl)
         if not self.data:
             return 0
@@ -548,13 +603,21 @@ class _FlakyRedis:
                 return 0
             if content.strip() != expected:
                 return 0
-        len_before = len(self.data)
+        deleted = list(self.data[-count:])
         del self.data[-count:]
-        # 整键删除时与真实 Lua 一致清 seen 指纹（ARGV[6]）：残留的指纹
-        # 会让之后回填 / 重放的同批历史被永久跳过
-        if count >= len_before and len(args) > 5 and args[5]:
-            self.seen.pop(args[5], None)
-        return count
+        if not self.data:
+            # 与真实 Lua 一致：删空整键清 seen（回填恢复窗口外更早轮次；
+            # 本次删除的条目由 _remember_deleted 写入 :tomb 墓碑）
+            seen_key_name = args[5] if len(args) > 5 else ""
+            if seen_key_name:
+                self.seen.pop(seen_key_name, None)
+        # 与真实 Lua 一致返回删除明细（调用方据此写墓碑），并把明细写进
+        # ``:del`` 旁键（标记只留计数）——响应丢失后的重放从旁键取明细
+        result = json.dumps({"count": count, "deleted": deleted}, ensure_ascii=False)
+        if marker is not None:
+            self.markers[f"{marker}:del"] = result
+            self.markers[marker] = json.dumps({"count": count}, ensure_ascii=False)
+        return result
 
     def llen(self, key):
         self._check()
@@ -773,8 +836,8 @@ def test_outage_clear_replay_clears_seen_fingerprints(monkeypatch):
     print("✓ 故障期清空重放同时清 seen 指纹")
 
 
-def test_outage_truncate_replay_clears_seen_when_emptied(monkeypatch):
-    """故障期截断把列表删空：重放同样清理 seen（回填不被永久跳过）。"""
+def test_outage_truncate_replay_records_tombstones(monkeypatch):
+    """故障期截断删空：重放清 seen（回填可恢复更早轮次）并写 :tomb 墓碑。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -783,6 +846,8 @@ def test_outage_truncate_replay_clears_seen_when_emptied(monkeypatch):
     memory.add_message("user", "Q1")
     memory.add_message("assistant", "A1")
     seen = module.seen_key(memory.key)
+    tomb = module.tomb_key(memory.key)
+    original = list(client.data)
     assert client.seen.get(seen)
 
     client.fail = True
@@ -792,14 +857,31 @@ def test_outage_truncate_replay_clears_seen_when_emptied(monkeypatch):
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     assert memory.get_recent_context() == []
     assert client.data == []
-    assert not client.seen.get(seen), (
-        "截断重放删空整键时必须与在线路径一致清理 seen 指纹"
+    assert not client.seen.get(seen), "删空时 seen 应清（回填恢复更早轮次）"
+    assert client.tomb.get(tomb), "被删除消息必须写入 :tomb 墓碑"
+
+    # 同一内容重放：被墓碑拦截（不能复活已删除的问答）
+    message = json.loads(original[0])
+    client.eval(
+        module._ADD_MESSAGES_LUA,
+        4,
+        memory.key,
+        module.applied_key(memory.key),
+        seen,
+        tomb,
+        "10",
+        "3600",
+        "op-replay",
+        module.message_content_id(message),
+        "append",
+        original[0],
     )
-    print("✓ 故障期截断删空重放同时清 seen 指纹")
+    assert client.data == [], "已删除内容不能被重放写回"
+    print("✓ 故障期截断删空重放写墓碑，重放不复活")
 
 
-def test_outage_truncate_replay_clears_seen_from_other_instance(monkeypatch):
-    """影子缓存没有该轮时走「条件截断」重放：删空整键同样清 seen。"""
+def test_outage_truncate_replay_records_tombstones_from_other_instance(monkeypatch):
+    """影子缓存没有该轮时走「条件截断」重放：删空清 seen 并写墓碑。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -809,6 +891,8 @@ def test_outage_truncate_replay_clears_seen_from_other_instance(monkeypatch):
     bob.add_message("user", "Q1", metadata={"client_turn_id": "t1"})
     bob.add_message("assistant", "A1")
     seen = module.seen_key(alice.key)
+    tomb = module.tomb_key(alice.key)
+    original = list(client.data)
     assert client.seen.get(seen)
 
     client.fail = True
@@ -819,8 +903,26 @@ def test_outage_truncate_replay_clears_seen_from_other_instance(monkeypatch):
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     alice.get_recent_context()
     assert client.data == []
-    assert not client.seen.get(seen), "条件截断重放删除整键时必须清 seen"
-    print("✓ 条件截断重放删空整键同时清 seen 指纹")
+    assert not client.seen.get(seen), "删空时 seen 应清"
+    assert client.tomb.get(tomb), "条件截断重放必须为被删除消息写墓碑"
+
+    message = json.loads(original[0])
+    client.eval(
+        module._ADD_MESSAGES_LUA,
+        4,
+        alice.key,
+        module.applied_key(alice.key),
+        seen,
+        tomb,
+        "10",
+        "3600",
+        "op-replay",
+        module.message_content_id(message),
+        "append",
+        original[0],
+    )
+    assert client.data == [], "已删除内容不能被重放写回"
+    print("✓ 条件截断重放写墓碑，重放不复活")
 
 
 def test_outage_add_then_truncate_replays_in_order(monkeypatch):
@@ -1177,6 +1279,65 @@ def test_online_truncate_response_lost_does_not_double_delete(monkeypatch):
     print("✓ 在线截断响应丢失后重放不多删")
 
 
+def test_online_truncate_response_lost_after_empty_records_tombstones(monkeypatch):
+    """截断删空且响应丢失：恢复重放从 :op 标记取删除明细补写墓碑。
+
+    Lua 删空时已清 seen（回填恢复更早轮次），墓碑只能由重放补写——否则
+    另一实例故障期排队的同指纹 add 重放会把已删除问答写回窗口。
+    """
+    from context import short_term_memory as module
+    from context.short_term_memory import _ADD_MESSAGES_LUA
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _EvalApplyThenFailRedis()
+    user = _message("user", "要删除的问题", "2000-01-01T10:00:00")
+    answer = _message("assistant", "要删除的回答", "2000-01-01T10:00:01")
+    client.data = [user, answer]
+    memory = module.RedisShortTermMemory(client, "s-lost", max_turns=5, user_id="u1")
+    client.fail_after_apply = True
+    assert memory.truncate_last_turn("要删除的问题") == 0  # 脚本已执行，响应丢失
+    assert client.data == []
+    assert client.tomb == {}, "在线路径拿不到删除明细，墓碑只能由重放补写"
+    assert client.seen == {}, "删空时 Lua 清 seen（回填恢复更早轮次）"
+
+    client.fail_after_apply = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    reader = module.RedisShortTermMemory(client, "s-lost", max_turns=5, user_id="u1")
+    reader.get_recent_context()  # 触发重放：命中标记取删除明细 → 补写墓碑
+    assert [json.loads(item)["content"] for item in client.data] == []
+    tomb = client.tomb.get(module.tomb_key(reader.key), set())
+    assert len(tomb) == 2, "重放必须为被删的两条消息补写墓碑"
+    assert client.tomb_ttls == [3600], "墓碑 TTL 应取消息 TTL 与重放窗口的较大者"
+    assert reader._pending_ops == []
+
+    # REDIS_TTL_SEC 调小于排队重放窗口（3600s）时，墓碑不能被消息 TTL
+    # 拖短——否则迟到的重放会在墓碑过期后复活已删除轮次
+    short_ttl = module.RedisShortTermMemory(
+        client, "s-ttl-floor", max_turns=5, ttl_sec=600, user_id="u1"
+    )
+    short_ttl._remember_deleted([user, answer])
+    assert client.tomb_ttls[-1] == int(module.DEFAULT_TOMBSTONE_TTL_SEC) == 3600
+
+    # 另一实例故障期排队的同指纹 add 重放：被墓碑挡住，不复活
+    for index, raw in enumerate((user, answer)):
+        pushed = client.eval(
+            _ADD_MESSAGES_LUA,
+            4,
+            reader.key,
+            module.applied_key(reader.key),
+            module.seen_key(reader.key),
+            module.tomb_key(reader.key),
+            "10",
+            "3600",
+            f"op-other-{index}",
+            module.message_content_id(json.loads(raw)),
+            "append",
+            raw,
+        )
+        assert pushed == 0, "已删除的轮次不能被另一实例的重放复活"
+    print("✓ 截断删空响应丢失后重放补写墓碑，重放不复活")
+
+
 def test_clear_then_add_replays_in_order(monkeypatch):
     """故障期先清空再新增：重放顺序为删除后写入，旧对话不会复活。"""
     from context import short_term_memory as module
@@ -1257,7 +1418,9 @@ def test_truncate_marker_cleaned_after_success(monkeypatch):
     memory.add_message("assistant", "A1")
     client.fail_after_apply = True
     assert memory.truncate_last_turn("Q1") == 2  # 回退到影子缓存删除
-    assert len(client.markers) == 1, "响应丢失时标记保留（只在拿到响应后清理）"
+    assert len(client.markers) == 2, (
+        "响应丢失时标记与删除明细旁键都保留（只在拿到响应 / 重放后清理）"
+    )
     print("✓ 截断标记成功即清理、失败时保留")
 
 

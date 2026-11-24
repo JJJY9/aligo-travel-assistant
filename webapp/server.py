@@ -1140,6 +1140,12 @@ class _SessionTurnLease:
         # drain 总预算的截止时刻：生成器 finally 与响应包装器可能各调一次
         # stop_turn（aclose 先跑生成器收尾），两次必须共享同一预算
         self._drain_deadline: float | None = None
+        # 回合任务只显式取消一次：再次 cancel() 会打断回合协程里的收尾
+        # 等待。注意它只挡住本类的重复取消——外层任务在 await task 期间被
+        # 再次取消时，asyncio 仍会把取消转发给回合任务的等待点；取消收尾
+        # 的顺序不变量因此不依赖取消次数：回滚线程自己等暂存写入可见
+        # （agents/conversation.py::_wait_stage_visible）
+        self._turn_cancelled = False
 
     def bind_turn(self, task: asyncio.Task[Any]) -> None:
         """登记本回合的协程任务：释放租约前先由 :meth:`stop_turn` 收尾。"""
@@ -1157,18 +1163,26 @@ class _SessionTurnLease:
         作用域外的 :class:`_LeasedStreamingResponse` 兜底执行，这里在
         作用域内被取消时直接向上抛，仍由兜底路径完成。
         """
-        task = self._turn_task
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        # 预算先行：取消收尾里的暂存等待 / 回滚等待与 drain 共享同一
+        # 截止时刻（此前它们发生在 drain 计时之前，上限约 17 秒）
         if self._drain_deadline is None:
             self._drain_deadline = time.monotonic() + _STREAM_DRAIN_BUDGET_SEC
+        runtime = getattr(self._session, "runtime", None)
+        if runtime is not None:
+            begin = getattr(runtime, "begin_drain_cleanup", None)
+            if callable(begin):
+                begin(self._drain_deadline)
+        task = self._turn_task
+        if task is not None and not task.done() and not self._turn_cancelled:
+            self._turn_cancelled = True
+            task.cancel()
+        if task is not None and not task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         remaining = max(0.1, self._drain_deadline - time.monotonic())
         try:
-            await self._session.runtime.drain_pending_persist(
-                timeout_sec=remaining
-            )
+            if runtime is not None:
+                await runtime.drain_pending_persist(timeout_sec=remaining)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 落库失败已由回合自身映射
@@ -3499,8 +3513,28 @@ async def _get_session_marked(
         raise
 
 
+async def _cancel_turn_with_budget(runtime: Any, task: "asyncio.Task[Any]") -> None:
+    """建立共享预算后取消回合并等它停稳（断连与端点取消共用）。
+
+    只 ``task.cancel()`` 不等待时，端点 finally 的 drain 在回合的收尾任务
+    （暂存等待 / 回滚线程）建立之前就返回，用户锁先于旧回合释放——
+    ``begin_drain_cleanup`` 让收尾等待落在同一截止时刻内，``await task``
+    保证释放用户锁前旧回合已停稳。
+    """
+    if runtime is not None:
+        begin = getattr(runtime, "begin_drain_cleanup", None)
+        if callable(begin):
+            begin()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 async def _ask_cancellable_on_disconnect(
-    coro: Any, request: Request, poll_interval: float = 0.2
+    coro: Any,
+    request: Request,
+    poll_interval: float = 0.2,
+    runtime: Any = None,
 ) -> tuple[Any, bool]:
     """等待对话回合完成；客户端断开时取消它，返回 ``(结果, 是否断开)``。
 
@@ -3516,14 +3550,16 @@ async def _ask_cancellable_on_disconnect(
             if task.done():
                 break
             if await request.is_disconnected():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                # 取消前建立共享截止时刻：回合协程的暂存等待 / 回滚等待
+                # 与随后的 drain 用同一预算（约 10 秒口径）
+                await _cancel_turn_with_budget(runtime, task)
                 return None, True
         return await task, False
     except asyncio.CancelledError:
-        # 端点自身被取消（服务关闭 / 上层取消）：回合不能留在后台继续跑
-        task.cancel()
+        # 端点自身被取消（服务关闭 / 上层取消）：回合不能留在后台继续跑。
+        # 与断连分支同一收尾——只 cancel 不等待时，端点 finally 的 drain
+        # 会在回合收尾任务建立前返回，用户锁先于旧回合释放
+        await _cancel_turn_with_budget(runtime, task)
         raise
 
 
@@ -4160,6 +4196,13 @@ def create_app(model: Any = None) -> FastAPI:
         与 CLI ``kb-dedupe`` 同一语义：``dry_run=false`` 才真正删除。扫描
         与删除在同一把写锁内完成、逐条复核内容未变化（并发编辑 / 删除不会
         被按过期 id 误删），已消失 / 已变化的条目记入 ``skipped``。
+
+        2xx 响应恒带 ``plan_total``（完整计划组数）与 ``truncated``（``plan``
+        视图是否被截断）：``plan`` 最多 ``MAX_DUPLICATE_GROUPS_FULL`` 组
+        （与重复组读接口同一上限，避免单次响应拉进几百 MB），截断只影响
+        返回视图——``dry_run=false`` 的删除始终按全量计划执行。删除开始后
+        的存储故障逐条记入 ``failed`` 并照常返回（已删部分不可逆，不能
+        变成 503 丢失计划）；503 只出现在尚未开始删除的失败（扫描 / 加载）。
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
@@ -4175,6 +4218,14 @@ def create_app(model: Any = None) -> FastAPI:
         # 与其它知识库接口同一脱敏口径
         from utils.log_redact import redact_paths
 
+        plan = result.get("plan")
+        if isinstance(plan, list):
+            # 计数字段恒定出现：消费者无需区分「未截断」与旧服务端。
+            # 截断只作用于视图：清理本身已按全量执行
+            result["plan_total"] = len(plan)
+            result["truncated"] = len(plan) > MAX_DUPLICATE_GROUPS_FULL
+            if result["truncated"]:
+                result["plan"] = plan[:MAX_DUPLICATE_GROUPS_FULL]
         for item in result.get("failed") or []:
             if isinstance(item, dict) and "error" in item:
                 item["error"] = redact_paths(item["error"])
@@ -5209,6 +5260,7 @@ def create_app(model: Any = None) -> FastAPI:
                         payload.message, turn_id=payload.client_turn_id or ""
                     ),
                     request,
+                    runtime=session.runtime,
                 )
                 if disconnected:
                     # 客户端已断开：回合已取消、暂存提问已回滚；drain /
@@ -6660,8 +6712,8 @@ def create_app(model: Any = None) -> FastAPI:
                                 detail=(
                                     f"备份超过可导入上限：{limit_problem}。"
                                     "按导出格式（indent=2）计算已超过 50 MB，"
-                                    "恢复后将无法再次导出；请先在源账号清理"
-                                    "后重新导出"
+                                    "恢复后账号导出的备份将超过上限；请先在"
+                                    "源账号清理后重新导出"
                                 ),
                             )
                         # 备份自身不超限不代表合并后不超限：与存量偏好取
@@ -6713,7 +6765,8 @@ def create_app(model: Any = None) -> FastAPI:
                                 status_code=413,
                                 detail=(
                                     f"恢复中止：{merged_problem}"
-                                    "（恢复后账号将无法再导出全量备份）"
+                                    "（恢复后账号导出的备份将超过导入"
+                                    "上限，请先清理部分数据后重试）"
                                 ),
                             )
                         knowledge_skip_reason = knowledge_unverified.get(

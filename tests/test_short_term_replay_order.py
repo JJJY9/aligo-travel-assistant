@@ -18,6 +18,7 @@ from context.short_term_memory import (
     _ADD_MESSAGES_LUA,
     applied_key,
     seen_key,
+    tomb_key,
 )
 
 fakeredis = pytest.importorskip("fakeredis")
@@ -41,12 +42,22 @@ def _add(client, key, payloads, window="20", mode="ordered"):
         args.extend([f"op-{payload}", f"hash-{payload}", mode, payload])
     return client.eval(
         _ADD_MESSAGES_LUA,
-        3,
+        4,
         key,
         applied_key(key),
         seen_key(key),
+        tomb_key(key),
         *args,
     )
+
+
+def _truncate_count(raw):
+    """截断脚本返回 ``{count, deleted}`` JSON；非 JSON 时是 -1 / 0。"""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        return json.loads(raw)["count"]
+    return int(raw or 0)
 
 
 def _contents(client, key):
@@ -126,10 +137,22 @@ def test_same_op_id_not_duplicated():
     payload = _message("a", "2026-03-11T10:00:00")
     args = ["20", "3600", "same-op", "hash-a", "ordered", payload]
     client.eval(
-        _ADD_MESSAGES_LUA, 3, key, applied_key(key), seen_key(key), *args
+        _ADD_MESSAGES_LUA,
+        4,
+        key,
+        applied_key(key),
+        seen_key(key),
+        tomb_key(key),
+        *args,
     )
     client.eval(
-        _ADD_MESSAGES_LUA, 3, key, applied_key(key), seen_key(key), *args
+        _ADD_MESSAGES_LUA,
+        4,
+        key,
+        applied_key(key),
+        seen_key(key),
+        tomb_key(key),
+        *args,
     )
     assert _contents(client, key) == ["a"]
     print("✓ 同 op_id 重放不重复")
@@ -224,15 +247,17 @@ def test_redis_truncate_respects_turn_id():
         )
 
     def truncate(content, turn_id):
-        return client.eval(
-            _TRUNCATE_LAST_TURN_LUA,
-            1,
-            key,
-            "1",
-            content,
-            "",
-            "",
-            turn_id,
+        return _truncate_count(
+            client.eval(
+                _TRUNCATE_LAST_TURN_LUA,
+                1,
+                key,
+                "1",
+                content,
+                "",
+                "",
+                turn_id,
+            )
         )
 
     push("同一句提问", "t-other")
@@ -253,38 +278,79 @@ def test_redis_truncate_respects_turn_id():
     print("✓ Redis 截断按回合 id 精确匹配（缺 id / 空串退回内容校验）")
 
 
-def test_truncate_clears_seen_fingerprints_on_full_delete():
-    """截断删空整键时一并清 seen 指纹：回填 / 重放的同批历史不被永久跳过。"""
+def test_truncate_records_tombstones_and_clears_seen():
+    """截断删空：seen 清（回填恢复窗口裁掉的更早轮次）、tomb 写墓碑。
+
+    实现在 ``RedisShortTermMemory.truncate_last_turn``：删除明细写进
+    ``:tomb`` 后，重放 / 回填同内容的已删除消息被墓碑拦截。
+    """
+    from context.short_term_memory import (
+        RedisShortTermMemory,
+        message_content_id,
+    )
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    memory = RedisShortTermMemory(client, "s1", max_turns=5, user_id="u1")
+    memory.add_message("user", "Q")
+    key = memory.key
+    assert client.scard(seen_key(key)) == 1
+    stored = client.lindex(key, 0)
+
+    assert memory.truncate_last_turn("Q") == 1
+    assert client.exists(key) == 0
+    assert client.scard(seen_key(key)) == 0, (
+        "截断删空必须清 seen：回填要能恢复被窗口裁掉（而非被删除）的更早轮次"
+    )
+    assert client.scard(tomb_key(key)) == 1, "被删除消息的指纹写入 :tomb 墓碑"
+
+    # 同一内容重放（长期记忆回填 / 故障重放）：被墓碑拦截，不复活
+    message = json.loads(stored)
+    client.eval(
+        _ADD_MESSAGES_LUA,
+        4,
+        key,
+        applied_key(key),
+        seen_key(key),
+        tomb_key(key),
+        "20",
+        "3600",
+        "op-replay",
+        message_content_id(message),
+        "ordered",
+        stored,
+    )
+    assert client.llen(key) == 0, "已删除的轮次不能被重放复活"
+
+    # 对照：未删除、只是被窗口裁掉的更早消息仍可由回填恢复
+    _add(client, key, [_message("older", "2026-03-10T10:00:00")])
+    assert _contents(client, key) == ["older"]
+    print("✓ 截断删空清 seen、写墓碑；重放不复活且回填仍可用")
+
+
+def test_truncate_marker_returns_deleted_details_for_replay():
+    """响应丢失后的重放：命中 :op 标记返回删除明细，供调用方补写墓碑。"""
     from context.short_term_memory import _TRUNCATE_LAST_TURN_LUA
 
     client = fakeredis.FakeRedis(decode_responses=True)
     key = "aligo:short:v1:u:s"
+    marker = f"{key}:op:lost"
     payload = _message("Q", "2026-03-11T10:00:00")
-    _add(client, key, [payload])
-    assert client.scard(seen_key(key)) == 1
-
-    count = client.eval(
-        _TRUNCATE_LAST_TURN_LUA,
-        1,
-        key,
-        "0",
-        "",
-        "",
-        "",
-        "",
-        seen_key(key),
+    client.rpush(key, payload)
+    first = client.eval(
+        _TRUNCATE_LAST_TURN_LUA, 2, key, marker, "0", "", "600", "", "", "", "3600"
     )
-    assert count == 1
+    assert _truncate_count(first) == 1
     assert client.exists(key) == 0
-    assert client.exists(seen_key(key)) == 0, "seen 指纹必须随消息键一起清"
-
-    # 清空后同一内容重新回填（op_id 不同）：不能被残留 seen 跳过
-    args = ["20", "3600", "op-new", "hash-new", "ordered", payload]
-    client.eval(
-        _ADD_MESSAGES_LUA, 3, key, applied_key(key), seen_key(key), *args
+    # 标记本身只存计数：已删除的用户内容不随 30 天标记长期滞留
+    marker_value = json.loads(client.get(marker))
+    assert marker_value["count"] == 1 and "deleted" not in marker_value
+    assert int(client.ttl(f"{marker}:del")) > 0
+    second = client.eval(
+        _TRUNCATE_LAST_TURN_LUA, 2, key, marker, "0", "", "600", "", "", "", "3600"
     )
-    assert _contents(client, key) == ["Q"]
-    print("✓ 截断整键删除同时清 seen 指纹，回填不被跳过")
+    data = json.loads(second)
+    assert data["count"] == 1 and data["deleted"] == [payload], data
+    print("✓ 截断标记存删除明细，重放可取回补写墓碑")
 
 
 def test_clear_before_and_remove_scripts_execute():
@@ -297,28 +363,48 @@ def test_clear_before_and_remove_scripts_execute():
     client = fakeredis.FakeRedis(decode_responses=True)
     key = "aligo:short:v1:u:s"
     seen = seen_key(key)
+    tomb = tomb_key(key)
     old = _message("old", "2026-03-11T09:00:00")
     new = _message("new", "2026-03-11T11:00:00")
     client.rpush(key, old)
     client.rpush(key, new)
     client.sadd(seen, "hash-old", "hash-new")
-    removed = client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "2026-03-11T10:00:00")
+    removed = client.eval(
+        _CLEAR_BEFORE_LUA, 3, key, seen, tomb, "2026-03-11T10:00:00"
+    )
     assert removed == 1
     assert _contents(client, key) == ["new"]
     assert client.scard(seen) == 2, "仍有存活消息时保留 seen（重放不重复写入）"
 
-    # 删空整表：seen 随之清掉（否则回填 / 重放的同批历史被永久跳过）
-    assert client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "2026-03-12T00:00:00") == 1
+    # 空格分隔且晚于 cutoff 的消息：归一后比较，迟到的清空重放不误删
+    client.rpush(key, _message("later", "2026-03-11 12:00:00"))
+    assert (
+        client.eval(_CLEAR_BEFORE_LUA, 3, key, seen, tomb, "2026-03-11T10:00:00")
+        == 0
+    )
+    assert _contents(client, key) == ["new", "later"]
+    client.lrem(key, 0, _message("later", "2026-03-11 12:00:00"))
+
+    # 删空整表：seen 与 tomb 一并清掉（清空后旧历史应由回填恢复）
+    client.sadd(tomb, "hash-deleted")
+    assert (
+        client.eval(_CLEAR_BEFORE_LUA, 3, key, seen, tomb, "2026-03-12T00:00:00")
+        == 1
+    )
     assert client.exists(key) == 0
     assert client.exists(seen) == 0
+    assert client.exists(tomb) == 0
 
-    # cutoff 为空串：兼容旧日志的整键清空，seen 同样清
+    # cutoff 为空串：兼容旧日志的整键清空，seen / tomb 同样清
     client.rpush(key, old)
     client.sadd(seen, "hash-old")
-    assert client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "") == 1
+    client.sadd(tomb, "hash-deleted")
+    assert client.eval(_CLEAR_BEFORE_LUA, 3, key, seen, tomb, "") == 1
     assert client.exists(key) == 0 and client.exists(seen) == 0
+    assert client.exists(tomb) == 0
 
-    # 按完整消息项精确删除（影子缓存镜像）：删空时同样清 seen
+    # 按完整消息项精确删除（影子缓存镜像）：删空时清 seen，已删除内容
+    # 由调用方写入 :tomb 墓碑（见 RedisShortTermMemory 的 remove 重放路径）
     client.rpush(key, old)
     client.rpush(key, new)
     client.sadd(seen, "hash-old", "hash-new")
@@ -326,8 +412,9 @@ def test_clear_before_and_remove_scripts_execute():
     assert _contents(client, key) == ["new"]
     assert client.scard(seen) == 2, "仍有存活消息时保留 seen"
     client.eval(_REMOVE_MESSAGES_LUA, 2, key, seen, new)
-    assert client.exists(key) == 0 and client.exists(seen) == 0
-    print("✓ 条件清空 / 精确删除脚本在真实 Lua 下执行并清 seen")
+    assert client.exists(key) == 0
+    assert client.exists(seen) == 0, "删空后 seen 清（回填可恢复更早轮次）"
+    print("✓ 条件清空清 seen+tomb / 精确删除删空清 seen")
 
 
 def test_truncate_cutoff_skips_identified_turn():
@@ -369,20 +456,26 @@ def test_truncate_cutoff_skips_identified_turn():
 
     push_turn(future)
     assert (
-        client.eval(
-            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, ""
+        _truncate_count(
+            client.eval(
+                _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, ""
+            )
         )
         == 0
     ), "无回合 id 时未来时间戳应被 cutoff 拒删"
     assert (
-        client.eval(
-            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, "t-other"
+        _truncate_count(
+            client.eval(
+                _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, "t-other"
+            )
         )
         == 0
     ), "回合 id 不匹配时拒删"
     assert (
-        client.eval(
-            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, "t1"
+        _truncate_count(
+            client.eval(
+                _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, "t1"
+            )
         )
         == 2
     ), "完全匹配的回合 id 是精确身份，跳过 cutoff"
@@ -390,8 +483,10 @@ def test_truncate_cutoff_skips_identified_turn():
 
     # 空格分隔的未来时间戳：归一后比较仍判未来（未修前原始比较会误判过去）
     push_turn("2099-01-01 00:00:00")
-    client.eval(
-        _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, ""
+    _truncate_count(
+        client.eval(
+            _TRUNCATE_LAST_TURN_LUA, 1, key, "1", "Q", "", cutoff, ""
+        )
     )
     assert client.llen(key) == 2, "空格分隔时间戳必须归一并按未来拒删"
     print("✓ 截断 cutoff 与回合 id 精确身份的优先级（含时间戳归一）")
@@ -411,7 +506,8 @@ if __name__ == "__main__":
     test_untimestamped_old_entry_does_not_force_append()
     test_live_append_mode_ignores_clock_skew()
     test_redis_truncate_respects_turn_id()
-    test_truncate_clears_seen_fingerprints_on_full_delete()
+    test_truncate_records_tombstones_and_clears_seen()
+    test_truncate_marker_returns_deleted_details_for_replay()
     test_clear_before_and_remove_scripts_execute()
     test_truncate_cutoff_skips_identified_turn()
     print("\n全部通过")

@@ -30,6 +30,7 @@ from context.short_term_memory import (
     reset_redis_degraded,
     seen_key,
     session_key,
+    tomb_key,
 )
 from utils.errors import MemoryPersistenceError
 from utils.log_redact import redact_secret
@@ -439,6 +440,7 @@ def clear_short_term_session(session_id: str, user_id: str = "") -> None:
             *keys,
             *[applied_key(key) for key in keys],
             *[seen_key(key) for key in keys],
+            *[tomb_key(key) for key in keys],
         )
     except Exception as exc:  # noqa: BLE001 - 清理失败不影响主流程
         logger.warning("清理 Redis 会话失败（%s）: %s", session_id, exc)

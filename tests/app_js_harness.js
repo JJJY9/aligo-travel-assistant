@@ -1168,6 +1168,29 @@ async function scenarioReconcile(source) {
   };
   const allFailed = await runAllFailed();
 
+  // 判定期内前 9 次拿到了有效历史、第 10 次轮询失败：按「已确认未落库」
+  // 处理（回填输入框），不能因最后一次失败误判结果未知
+  const runLastPollFailed = async () => {
+    run(
+      '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 0;'
+    );
+    const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
+    for (let i = 0; i < 9; i += 1) {
+      const request = await waitRequest(env);
+      request.resolve({ messages: oldMessages });
+      await tick();
+    }
+    const last = await waitRequest(env);
+    last.reject(new Error("429"));
+    await promise;
+    await tick();
+    return {
+      input: run("els.input.value"),
+      toasts: run("__toasts.slice()"),
+    };
+  };
+  const lastPollFailed = await runLastPollFailed();
+
   // 对账期间用户点击了另一个会话：openSession 自增 token 后又被用户点击
   // 推进一次，不能认领该 token 把旧提问写进新会话的输入框
   run(
@@ -1188,7 +1211,14 @@ async function scenarioReconcile(source) {
     open_calls: run("__openCalls"),
   };
 
-  return { persistedLate, stillMissing, interleaved, confirmFailed, allFailed };
+  return {
+    persistedLate,
+    stillMissing,
+    interleaved,
+    confirmFailed,
+    allFailed,
+    lastPollFailed,
+  };
 }
 
 

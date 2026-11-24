@@ -1217,6 +1217,48 @@ def test_cleanup_duplicate_contents_deletes_and_reports_failure(monkeypatch):
     print("✓ 重复清理逐条删除并汇报失败")
 
 
+def test_cleanup_partial_storage_failure_returns_plan(monkeypatch):
+    """删除开始后的存储故障不再整体上抛：已删部分不可逆，结果照常返回。
+
+    此前第二组复核查询抛错会让整次清理变成异常（Web 503 丢失全部计划 /
+    计数）；现在记入 failed、后续分组快速放弃（不再逐个等满超时），
+    removed / plan / 计数字段完整。
+    """
+
+    class _FlakyQueryClient(_FakeMilvusClient):
+        def __init__(self, rows, fail_ids):
+            super().__init__(rows)
+            self.fail_ids = set(fail_ids)
+
+        def query(self, collection_name, filter="", output_fields=None, limit=10, offset=0):
+            if filter.startswith("id =="):
+                doc_id = int(filter.split("==")[1])
+                if doc_id in self.fail_ids:
+                    raise RuntimeError("storage unavailable")
+            return super().query(
+                collection_name, filter, output_fields, limit, offset
+            )
+
+    fake = _FlakyQueryClient(
+        [
+            {"id": 1, "content": "A", "metadata": "{}"},
+            {"id": 2, "content": "A", "metadata": "{}"},
+            {"id": 3, "content": "B", "metadata": "{}"},
+            {"id": 4, "content": "B", "metadata": "{}"},
+        ],
+        fail_ids={3},
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert result["removed"] == 1, result
+    assert fake.deleted == [2], "第一组照常删除"
+    assert (result["groups"], result["planned"]) == (2, 2)
+    errors = {item["id"]: item["error"] for item in result["failed"]}
+    assert set(errors) == {4}, result["failed"]
+    assert all("storage unavailable" in text for text in errors.values())
+    print("✓ 删除开始后的存储故障记入 failed，计划与计数照常返回")
+
+
 def test_import_skips_group_with_non_finite_part_metadata(monkeypatch):
     """parts=2、part 非有限数的组按结构非法整组跳过：不崩溃，也不把残缺
     组导入成单条；同批正常文档照常导入。"""
@@ -3569,6 +3611,7 @@ if __name__ == "__main__":
         test_cleanup_duplicate_contents_dry_run,
         test_cleanup_duplicate_contents_deletes_verified_only,
         test_cleanup_duplicate_contents_deletes_and_reports_failure,
+        test_cleanup_partial_storage_failure_returns_plan,
         test_write_agent_cached_with_create_if_missing,
         test_get_document_reads_single_row,
         test_existing_group_layout_tolerates_bad_numbers,
