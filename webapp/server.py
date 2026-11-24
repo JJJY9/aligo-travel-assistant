@@ -162,15 +162,14 @@ _CHAT_LOCK_WAIT_SEC = 50.0
 _CHAT_LOCK_POLL_SEC = 0.5
 
 # 备份导入在读取 64MB 请求体前就先占用导入名额：客户端只发请求头、
-# 不发 body 时不能让名额被无限期占住（两个连接即可让所有导入 503）
-IMPORT_BODY_READ_TIMEOUT_SEC = 60.0
+# 不发 body 时不能让名额被无限期占住（两个连接即可让所有导入 503）。
+# 预算要覆盖慢上行：50 MB 备份在 2 Mbps 上需约 200 秒，60 秒会让正常
+# 备份在大文件上必然 408；300 秒与前端 10 分钟等待、单导入槽的背压口径
+# 相洽（408 发生在解析前，零写入，可安全重试）
+IMPORT_BODY_READ_TIMEOUT_SEC = 300.0
 # /api/import 要一次性接收整份备份（面板文件上限 50 MB，JSON 包装 / 转义
 # 还有额外开销）；其它路径维持 2 MB
 IMPORT_REQUEST_BODY_BYTES = 64 * 1024 * 1024
-# /api/import 的备份上限按 50 MB（与 CLI / 面板一致）预检：请求体还要包一层
-# {"backup": ...}，留 4 KB 余量；Content-Length 超限时在读取请求体之前就
-# 拒绝，不把 50–64 MB 备份先读进内存
-_IMPORT_BODY_ALLOWANCE_BYTES = 4096
 _BODY_LIMIT_OVERRIDES = {"/api/import": IMPORT_REQUEST_BODY_BYTES}
 
 
@@ -2865,6 +2864,37 @@ def _trim_validation_item(item: dict[str, Any]) -> dict[str, Any]:
 def _ambiguous_trip_id(trips: list[dict[str, Any]], trip_id: str) -> bool:
     """历史数据里同一 trip_id 可能对应多条不同行程，这类 id 不能按 id 操作。"""
     return sum(1 for trip in trips if str(trip.get("trip_id")) == trip_id) > 1
+
+
+def _reject_oversized_json_export(user_id: str) -> None:
+    """账号存储文件已超导入上限时，导出在读取前直接 413。
+
+    导出格式（indent=2、UTF-8 原文）不小于同内容的存储文件，存储文件
+    超过 50 MB 时整份备份必然超限——提前拒绝，避免对数百 MB 的账号先做
+    全量读取与多次深拷贝（导出槽 2 并发时按 4–5 倍体积放大，小内存容器
+    可被 OOM）。PostgreSQL 后端没有等价的廉价体积探针，仍走完整导出后
+    自检。调用前 user_id 已经过路由正则校验，拼出的路径不会越出数据目录。
+    """
+    from config import STORAGE_CONFIG
+    from utils.user_import import MAX_BACKUP_BYTES
+
+    if STORAGE_CONFIG.get("postgres_dsn"):
+        return
+    path = Path(MEMORY_DIR) / f"{user_id}.json"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= MAX_BACKUP_BYTES:
+        return
+    raise HTTPException(
+        status_code=413,
+        detail=(
+            f"备份超过导入上限：账号数据约 {size / (1024 * 1024):.1f} MB"
+            f"（上限 {MAX_BACKUP_BYTES // (1024 * 1024)} MB）。"
+            "该文件无法再导入恢复，请先删除部分旧会话 / 行程后重试"
+        ),
+    )
 
 
 def _load_user_data(user_id: str, strict: bool = False) -> dict[str, Any]:
@@ -6333,6 +6363,8 @@ def create_app(model: Any = None) -> FastAPI:
         """
         rate_headers = _enforce_read_rate_limit(state, request)
         entry_epoch = _export_start_epoch(request, user_id)
+        if format == "json":
+            _reject_oversized_json_export(user_id)
         data = _load_user_data(user_id, strict=True)
         # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
         _reject_export_during_restore(request, user_id, entry_epoch)
@@ -6370,16 +6402,16 @@ def create_app(model: Any = None) -> FastAPI:
                 raise _storage_failure("知识库导出失败", exc) from exc
         # 知识片段同样是快照：读取期间才开始（或已结束）的恢复整份备份作废
         _reject_export_during_restore(request, user_id, entry_epoch)
-        # 历史数据可能含孤立代理项 / 非有限数、助手 JSON 文本里的 NaN、
-        # 消息里的 NUL：与 CLI user-export 同一清洗（含知识片段），否则
-        # 备份「看起来导出成功」却在 /api/import 恢复时被整条拒绝
-        backup = sanitize_backup_data(backup)
+        # data 已在前面整份清洗；这里只补知识片段——export_documents 原样
+        # 返回库内内容，而再次整份清洗会按账号体积重复深拷贝与助手 JSON
+        # 重编码，超限账号在 413 之前的内存放大因此近乎翻倍
+        if backup.get("knowledge"):
+            backup["knowledge"] = sanitize_backup_data(
+                {"knowledge": backup["knowledge"]}
+            )["knowledge"]
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
-        from utils.user_import import (
-            backup_limit_problem,
-            export_backup_limit_problem,
-        )
+        from utils.user_import import export_backup_limit_problem
 
         # 原始备份与「导入空库」的分片计划都要可导入：前者是导入端规划前
         # 的硬上限，后者覆盖长文档重切分后的真实恢复体积
@@ -6397,7 +6429,7 @@ def create_app(model: Any = None) -> FastAPI:
             without_knowledge = {
                 key: value for key, value in backup.items() if key != "knowledge"
             }
-            if backup_limit_problem(without_knowledge, crlf=False) is None:
+            if export_backup_limit_problem(without_knowledge) is None:
                 backup = without_knowledge
                 # 原始备份轴失败（行数 / 字节超限）时 reason_out 未回填，
                 # 能走到这里说明去掉知识后通过，原因即知识轴超限
@@ -6414,8 +6446,15 @@ def create_app(model: Any = None) -> FastAPI:
                 ),
             )
         payload = json.dumps(backup, ensure_ascii=False, indent=2)
+        # 含知识段的备份单独命名：与面板的备用下载名一致，也避免与普通
+        # 备份同名落盘后迁移时选错文件（静默缺失知识段）
+        filename = (
+            f"aligo_{safe_user}_with_knowledge.json"
+            if backup.get("knowledge")
+            else f"aligo_{safe_user}.json"
+        )
         headers = {
-            "Content-Disposition": f'attachment; filename="aligo_{safe_user}.json"',
+            "Content-Disposition": f'attachment; filename="{filename}"',
             **rate_headers,
         }
         skipped = warnings.get("knowledge_skipped_count")
@@ -6456,7 +6495,6 @@ def create_app(model: Any = None) -> FastAPI:
         import asyncio
 
         from utils.user_import import (
-            MAX_BACKUP_BYTES,
             _store_export_snapshot,
             drop_sessions,
             import_user_data,
@@ -6523,20 +6561,12 @@ def create_app(model: Any = None) -> FastAPI:
             # 备份体积上限与 CLI user-import / 面板一致：请求体允许到 64MB，
             # 但 50–64MB 的备份恢复后会让该用户 /api/export 永久 413。
             # 先按 Content-Length 预检，超限时连请求体都不读取
-            declared_length = request.headers.get("content-length", "").strip()
-            if (
-                declared_length.isdigit()
-                and int(declared_length)
-                > MAX_BACKUP_BYTES + _IMPORT_BODY_ALLOWANCE_BYTES
-            ):
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        "备份文件不能超过 "
-                        f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
-                    ),
-                    headers={"Connection": "close"},
-                )
+            # 不再按请求体字节数提前 413：备份对象的上限按导出格式
+            # （indent=2、UTF-8 原文）衡量，而客户端可能以 Unicode 转义
+            # 发送（requests 默认 ensure_ascii=True，CJK 内容体积翻倍）——
+            # 27 MB 的合法备份会得到 57 MB 的请求体并在解析前被误拒。
+            # 请求体上限由 64 MB 中间件把关；对象本身是否超限交给解析后
+            # 的 sections / merged 体积复核（同一 413 文案）
             try:
                 raw_body = await asyncio.wait_for(
                     request.body(), timeout=IMPORT_BODY_READ_TIMEOUT_SEC
@@ -6551,14 +6581,6 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                     headers={"Connection": "close"},
                 ) from None
-            if len(raw_body) > MAX_BACKUP_BYTES + _IMPORT_BODY_ALLOWANCE_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        "备份文件不能超过 "
-                        f"{MAX_BACKUP_BYTES // (1024 * 1024)} MB"
-                    ),
-                )
             # 与 CLI 的 utf-8-sig 读取一致：带 BOM 的备份不应 422
             if raw_body.startswith(b"\xef\xbb\xbf"):
                 raw_body = raw_body[3:]
@@ -6579,9 +6601,16 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                     ),
                 ) from exc
+            # 解析阶段被整组丢弃的残缺知识分片不会进入 import_documents，
+            # 其 knowledge_skipped 恒为 0；解析器回填丢弃行数，响应里并入
+            # 同一计数（README 承诺这些行「恢复时计入 knowledge_skipped」）
+            parse_stats: dict[str, int] = {}
             try:
                 sections, errors = await loop.run_in_executor(
-                    state.import_executor, parse_user_export_data, payload.backup
+                    state.import_executor,
+                    lambda: parse_user_export_data(
+                        payload.backup, stats_out=parse_stats
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - 边界年份 / 畸形条目等解析异常
                 logger.warning("备份解析失败：%s", exc)
@@ -6852,6 +6881,14 @@ def create_app(model: Any = None) -> FastAPI:
 
                 try:
                     counts = await loop.run_in_executor(state.import_executor, _run_import)
+                    dropped_knowledge = int(
+                        parse_stats.get("knowledge_dropped") or 0
+                    )
+                    if dropped_knowledge:
+                        counts["knowledge_skipped"] = (
+                            int(counts.get("knowledge_skipped") or 0)
+                            + dropped_knowledge
+                        )
                 except HTTPException:
                     # 存储打开失败的 503（_open_long_term strict）原样上抛，
                     # 不再被下面的通用分支改成「恢复失败」丢掉原因

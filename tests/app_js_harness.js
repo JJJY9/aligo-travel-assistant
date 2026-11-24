@@ -2126,6 +2126,44 @@ async function scenarioUserBackupRestore(source) {
   run("__toasts.length = 0;");
   await run("importUserBackup()");
   results.combo_toasts = run("__toasts.slice()");
+
+  // 错误分支：408（上传超时，零写入）/ 部分完成 503 / 普通失败 / 静默刷新
+  run(`
+    __refreshes = 0;
+    refreshStatus = async () => { __refreshes += 1; };
+    __makeErr = (message, status) => {
+      const error = new Error(message);
+      if (status) error.status = status;
+      return error;
+    };
+  `);
+  run(
+    `getJSON = async () => { throw __makeErr("读取备份数据超时（300 秒），请重试", 408); };`,
+  );
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.upload_timeout_toasts = run("__toasts.slice()");
+
+  run(
+    `getJSON = async () => { throw __makeErr("恢复部分完成：已提交 2 条新增、1 条更新；重复导入按路线+日期去重，可安全重跑", 503); };`,
+  );
+  run("__toasts.length = 0; __refreshes = 0;");
+  await run("importUserBackup()");
+  results.partial_toasts = run("__toasts.slice()");
+  results.partial_refreshes = run("__refreshes");
+
+  run(`getJSON = async () => { throw __makeErr("内部错误", 500); };`);
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.failure_toasts = run("__toasts.slice()");
+
+  // 成功但刷新失败：全部静默（allSettled），刷新错误不能覆盖恢复摘要
+  run(`getJSON = async () => __importResult;`);
+  run(`refreshStatus = async () => { throw new Error("刷新失败"); };`);
+  run(`__importResult = ${JSON.stringify(base)};`);
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.silent_refresh_toasts = run("__toasts.slice()");
   return results;
 }
 

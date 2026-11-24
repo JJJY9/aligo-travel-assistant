@@ -5290,8 +5290,111 @@ def test_import_documents_ignore_existing_returns_all_pieces(monkeypatch):
     print("✓ ignore_existing 真实分支返回全部分片且不扫库")
 
 
+def test_export_shape_check_catches_unrestorable_backup(monkeypatch):
+    """导出 200 / 导入 413 的非对称修复：落库形状超过上限也要拒绝。
+
+    恢复端把缺 timestamp 的旧消息归一为带时区 32 字符并补键；只按原始
+    文件形状自检会产出「在源账号可导出、到新账号无法恢复」的备份。
+    """
+    from utils import user_import
+
+    messages = [
+        {"role": "user", "content": "问题" + "x" * 40, "session_id": "s"}
+        for _ in range(600)
+    ]
+    backup = {
+        "user_id": "u1",
+        "chat_history": messages,
+        "trip_history": [],
+        "preferences": {},
+        "statistics": {},
+    }
+    raw = user_import._backup_payload_size(backup, crlf=False)
+    shaped = user_import._backup_payload_size(
+        {
+            **backup,
+            "chat_history": user_import._export_shape_messages(
+                [dict(item) for item in messages]
+            ),
+        },
+        crlf=False,
+    )
+    assert shaped > raw + 8192, f"前提：落库形状确实更大 {(raw, shaped)}"
+    monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", raw + 8192)
+    problem = user_import.export_backup_limit_problem(backup)
+    assert problem and problem.startswith("恢复后"), problem
+    # 上限放宽到落库形状之上：同一备份可正常导出（两端口径对称）
+    monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", shaped + 1024)
+    assert user_import.export_backup_limit_problem(backup) is None
+    print("✓ 导出按落库形状复核，不再产出无法恢复的备份")
+
+
+def test_parse_stats_counts_dropped_knowledge_rows():
+    """解析阶段丢弃的残缺知识行计入 stats（恢复结果的 knowledge_skipped 口径）。"""
+    from utils.user_import import parse_user_export_data
+
+    stats: dict[str, int] = {}
+    sections, errors = parse_user_export_data(
+        {
+            "preferences": {"home_location": "北京"},
+            "knowledge": [
+                {
+                    "content": "缺片组",
+                    "metadata": {"group": "g1", "part": "1", "parts": "2"},
+                },
+                {"content": "有效单条", "metadata": {}},
+            ],
+        },
+        stats_out=stats,
+    )
+    assert len(sections["knowledge"]) == 1
+    assert stats["knowledge_dropped"] == 1
+    assert any("知识分片组" in err for err in errors)
+
+    stats2: dict[str, int] = {}
+    parse_user_export_data(
+        {
+            "preferences": {"home_location": "北京"},
+            "knowledge": [{"content": "有效", "metadata": {}}],
+        },
+        stats_out=stats2,
+    )
+    assert stats2["knowledge_dropped"] == 0
+    print("✓ 解析阶段丢弃的知识行有结构化计数")
+
+
+def test_import_skips_oversized_preference_values():
+    """恢复不写进面板保存不了的超大偏好值（与 PUT / CLI 同一序列化口径）。"""
+    from utils.user_import import (
+        PREFERENCE_VALUE_MAX_CHARS,
+        parse_user_export_data,
+    )
+
+    sections, errors = parse_user_export_data(
+        {
+            "preferences": {
+                # 字符串序列化后含两侧引号：留 2 字符余量才在限额内
+                "ok": "x" * (PREFERENCE_VALUE_MAX_CHARS - 2),
+                "too_big": "x" * PREFERENCE_VALUE_MAX_CHARS,
+                "nested_big": {"k": "y" * PREFERENCE_VALUE_MAX_CHARS},
+            },
+            "chat_history": [],
+        }
+    )
+    assert "ok" in sections["preferences"]
+    assert "too_big" not in sections["preferences"]
+    assert "nested_big" not in sections["preferences"]
+    assert any("序列化后超过" in err for err in errors)
+    print("✓ 超大偏好值在恢复时按条跳过")
+
+
 def test_export_volume_warning_for_skipped_knowledge(monkeypatch):
-    """导出体积通过但规划会跳过知识行时，回填恢复提示与计数。"""
+    """导出体积通过但规划会跳过知识行时，回填恢复提示与计数。
+
+    计数按行口径：planner 的 ``skipped_invalid`` 已含坏组内的各分片，
+    ``skipped_groups`` 只是组数，不能再相加（否则跳过数会大于备份里的
+    知识行总数）。
+    """
     from utils import knowledge_admin, user_import
 
     monkeypatch.setattr(
@@ -5299,6 +5402,7 @@ def test_export_volume_warning_for_skipped_knowledge(monkeypatch):
         "import_documents",
         lambda rows, dry_run=False, return_pieces=False, **kwargs: {
             "pieces": [{"content": "可恢复", "metadata": {}}],
+            # 坏组 parts=1 的分片已计入 skipped_invalid（真实 planner 口径）
             "skipped_invalid": 2,
             "skipped_groups": [{"group": "g", "reason": "缺片", "parts": 1}],
             "skipped_conflict": 1,
@@ -5313,9 +5417,9 @@ def test_export_volume_warning_for_skipped_knowledge(monkeypatch):
         warning_out=warning,
     )
     assert problem is None
-    assert warning["knowledge_skipped_count"] == 4, warning
-    assert "4 条" in warning["knowledge_skipped"]
-    print("✓ 导出提示恢复时会跳过的知识行")
+    assert warning["knowledge_skipped_count"] == 3, warning
+    assert "3 条" in warning["knowledge_skipped"]
+    print("✓ 导出提示恢复时会跳过的知识行（组数不重复计数）")
 
 
 if __name__ == "__main__":
