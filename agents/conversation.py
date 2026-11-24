@@ -493,19 +493,27 @@ class ConversationRuntime:
         }
 
     async def _request_staged_rollback(
-        self, user_input: str, turn_state: dict[str, Any]
+        self,
+        user_input: str,
+        turn_state: dict[str, Any],
+        *,
+        timeout_sec: float | None = None,
     ) -> None:
         """本轮只回滚一次（主路径与落库完成回调可能同时请求）。
 
         另一路径已在回滚时也做有限等待：调用方（``ask`` 返回前、drain 释放
         用户锁前）依赖回滚已落地，不能因为回调抢先置位就提前返回。
+        ``timeout_sec`` 由 drain 传入剩余预算（默认各自 2 秒）。
         """
+        wait_sec = timeout_sec if timeout_sec is not None else 2.0
         if turn_state["rollback_requested"]:
-            await self._await_pending_rollback()
+            await self._await_pending_rollback(wait_sec)
             return
         turn_state["rollback_requested"] = True
         await self._rollback_staged_user_message(
-            user_input, turn_state.get("turn_id") or None
+            user_input,
+            turn_state.get("turn_id") or None,
+            timeout_sec=timeout_sec,
         )
 
     async def _settle_staged_write(
@@ -546,7 +554,11 @@ class ConversationRuntime:
             logger.warning("回滚暂存提问失败", exc_info=True)
 
     async def _rollback_staged_user_message(
-        self, user_input: str, turn_id: str | None = None
+        self,
+        user_input: str,
+        turn_id: str | None = None,
+        *,
+        timeout_sec: float | None = None,
     ) -> None:
         """移除编排前暂存的用户提问（尽力而为，不阻塞取消 / 错误上报）。
 
@@ -563,7 +575,10 @@ class ConversationRuntime:
         self._pending_rollback = task
         task.add_done_callback(self._consume_background_task)
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=timeout_sec if timeout_sec is not None else 2.0,
+            )
         except (asyncio.CancelledError, asyncio.TimeoutError):
             logger.debug("回滚暂存提问未在限时内完成，后台线程继续执行")
         except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
@@ -766,20 +781,29 @@ class ConversationRuntime:
         取消 ``ask()`` 只中断协程，``asyncio.to_thread`` 里的写线程不受影响。
         Web 入口在释放用户锁 / 会话占用标记前先等它结束，否则同一用户随后
         的删除会话 / 新一轮对话会与迟到的写入并发（已删除的会话被写回）。
+
+        ``timeout_sec`` 是**总预算**：落库等待、回滚等待与延迟记忆提交
+        共享同一个截止时刻（此前各自按 10s / 2s / 10s 串行累计，释放用户
+        锁前的实际上限约 22 秒，与 README 的 10 秒口径不符）。
         """
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+
+        def _remaining() -> float:
+            return max(0.05, deadline - time.monotonic())
+
         pending = getattr(self, "_pending_persist", None)
         if pending is None:
             # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它；
             # 完成回调补提交的延迟记忆写入同样可能仍在后台（此前直接返回，
             # 用户锁在偏好 / 行程仍在落库时释放）
-            await self._await_pending_rollback()
-            await self._await_deferred_commit(timeout_sec)
+            await self._await_pending_rollback(_remaining())
+            await self._await_deferred_commit(_remaining())
             return True
         failed = object()
         outcome: object = None
         try:
             outcome = await asyncio.wait_for(
-                asyncio.shield(pending), timeout=timeout_sec
+                asyncio.shield(pending), timeout=_remaining()
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -793,9 +817,11 @@ class ConversationRuntime:
         last_turn = getattr(self, "_last_persist_turn", None)
         if last_turn is not None and (outcome is False or outcome is failed):
             # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
-            # 结束，保证释放用户锁前回滚已落地）
-            await self._request_staged_rollback(*last_turn)
-        await self._await_deferred_commit(timeout_sec)
+            # 结束，保证释放用户锁前回滚已落地）；回滚等待同样受总预算约束
+            await self._request_staged_rollback(
+                *last_turn, timeout_sec=_remaining()
+            )
+        await self._await_deferred_commit(_remaining())
         return True
 
     async def _await_deferred_commit(self, timeout_sec: float) -> None:
