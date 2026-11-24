@@ -12280,6 +12280,123 @@ def test_usage_by_day_local_date():
     print("✓ by_day 使用本地日期（固定时区跨日时间戳）")
 
 
+def test_cached_chronological_key_invalidates_on_tz_change():
+    """chronological_key 缓存必须带时区世代：进程内切 TZ 后不得命中旧结果。"""
+    import time as time_module
+
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("当前平台不支持动态时区（time.tzset）")
+    from webapp import server as server_module
+
+    server_module._cached_chronological_key.cache_clear()
+    timestamp = "2026-03-04T00:30:00"
+    previous_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "UTC"
+        time_module.tzset()
+        utc_key = server_module._cached_chronological_key(
+            server_module._tz_epoch(), timestamp
+        )
+        os.environ["TZ"] = "Asia/Shanghai"
+        time_module.tzset()
+        shanghai_key = server_module._cached_chronological_key(
+            server_module._tz_epoch(), timestamp
+        )
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time_module.tzset()
+    assert utc_key == "2026-03-04T00:30:00+00:00", utc_key
+    assert shanghai_key == "2026-03-03T16:30:00+00:00", shanghai_key
+    print("✓ 时间戳排序键缓存随时区切换失效")
+
+
+def test_group_sessions_chronological_key_cache_serves_repeat_requests(monkeypatch):
+    """同一历史重复请求：排序键全部命中缓存，输出与首次逐字段一致。"""
+    from webapp import server as server_module
+
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"m{index}",
+            "timestamp": f"2026-03-{1 + index % 5:02d}T10:{index:02d}:00",
+            "session_id": f"s{index % 4}",
+        }
+        for index in range(40)
+    ]
+    first = server_module._group_sessions(history, 1_000_000)
+
+    def _boom(value):
+        raise AssertionError("热请求不应重新计算排序键")
+
+    monkeypatch.setattr(server_module, "chronological_key", _boom)
+    second = server_module._group_sessions(history, 1_000_000)
+    assert second == first, "记忆化后的会话列表必须与首次逐字段一致"
+    print("✓ 会话列表排序键命中缓存且输出不变")
+
+
+def test_archived_count_shared_live_ids_matches_scan():
+    """列表聚合收集的 live ids 与 _archived_count 全量扫描口径逐项一致。"""
+    from webapp import server as server_module
+
+    history = [
+        {"session_id": "s1", "content": "a", "timestamp": "2026-01-01T00:00:00"},
+        {"session_id": "s1", "content": "b", "timestamp": "2026-01-01T00:01:00"},
+        {"session_id": "export", "content": "c", "timestamp": "2026-01-01T00:02:00"},
+        {"session_id": " ", "content": "d", "timestamp": "2026-01-01T00:03:00"},
+        {"session_id": 0, "content": "e", "timestamp": "2026-01-01T00:04:00"},
+        {"session_id": None, "content": "f", "timestamp": "2026-01-01T00:05:00"},
+    ]
+    data = {
+        "chat_history": history,
+        # s1 重复计两条、保留字 'export' 与空白串照旧计入；'0' 不在集合、
+        # 空串 falsy、ghost 没有消息 —— 与旧实现同一口径
+        "archived_sessions": ["s1", "s1", "export", " ", "0", "", "ghost"],
+    }
+    live: set[str] = set()
+    server_module._group_sessions(history, 1_000_000, live_session_ids=live)
+    shared = server_module._archived_count(data, live)
+    assert shared == server_module._archived_count(data) == 4
+    assert (
+        server_module._archived_count(
+            {"chat_history": history, "archived_sessions": []}, live
+        )
+        == 0
+    ), "无归档账号直接归零"
+    print("✓ 归档计数复用聚合集合（口径与全量扫描一致）")
+
+
+def test_export_reuses_serialized_payload_for_limit_check(monkeypatch):
+    """导出只序列化一次：上限自检走 precomputed_size，响应体复用同一串字节。"""
+    from utils import user_import
+
+    seen: list[object] = []
+    original = user_import._backup_payload_size
+
+    def _spy(backup, *, crlf=None):
+        seen.append(crlf)
+        return original(backup, crlf=crlf)
+
+    monkeypatch.setattr(user_import, "_backup_payload_size", _spy)
+    user_id = _unique_user("web_test_export_precomputed")
+    try:
+        response = _client().get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 200, response.text
+        assert seen == [], "已清洗备份的字节数应复用，不再重复清洗 + 序列化"
+        body = json.loads(response.content)
+        assert body["user_id"] == user_id
+        # 响应体 == 自检口径的同一份字节（indent=2、LF、UTF-8）
+        assert (
+            user_import._backup_payload_size(body, crlf=False)
+            == len(response.content)
+        ), "响应体必须与体积自检使用的字节完全一致"
+        print("✓ 导出复用同一份序列化字节")
+    finally:
+        _cleanup(user_id)
+
+
 def test_usage_summary_avg_and_top_agents_exact():
     """avg_elapsed / top_agents 必须由元数据真实计算，而不是恒 0 / 空列表。"""
     from webapp.server import _usage_summary
@@ -12542,7 +12659,7 @@ def test_export_reports_skipped_knowledge_header(monkeypatch):
     """导出体积通过但知识行恢复会跳过时，响应头带跳过计数。"""
     from utils import user_import
 
-    def _fake(backup, warning_out=None, reason_out=None):
+    def _fake(backup, warning_out=None, reason_out=None, precomputed_size=None):
         if warning_out is not None:
             warning_out["knowledge_skipped_count"] = 3
         return None

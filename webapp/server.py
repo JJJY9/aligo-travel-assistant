@@ -2937,11 +2937,13 @@ def _ambiguous_trip_id(trips: list[dict[str, Any]], trip_id: str) -> bool:
 def _reject_oversized_json_export(user_id: str) -> None:
     """账号存储文件已超导入上限时，导出在读取前直接 413。
 
-    导出格式（indent=2、UTF-8 原文）不小于同内容的存储文件，存储文件
-    超过 50 MB 时整份备份必然超限——提前拒绝，避免对数百 MB 的账号先做
-    全量读取与多次深拷贝（导出槽 2 并发时按 4–5 倍体积放大，小内存容器
-    可被 OOM）。PostgreSQL 后端没有等价的廉价体积探针，仍走完整导出后
-    自检。调用前 user_id 已经过路由正则校验，拼出的路径不会越出数据目录。
+    存储文件超过导入上限时整份备份必然超限——提前拒绝，避免对数百 MB 的
+    账号先做全量读取与多次深拷贝（导出槽 2 并发时按 4–5 倍体积放大，小
+    内存容器可被 OOM）。新版写入用紧凑 JSON（小于导出用的 indent=2），
+    该预检对逼近上限的账号只覆盖「存储本身已超限」的一半情形，另一半由
+    导出路径按真实导出字节的硬上限兜底（结论相同，只是拒绝得更晚）。
+    PostgreSQL 后端没有等价的廉价体积探针，仍走完整导出后自检。调用前
+    user_id 已经过路由正则校验，拼出的路径不会越出数据目录。
     """
     from config import STORAGE_CONFIG
     from utils.user_import import MAX_BACKUP_BYTES
@@ -3000,15 +3002,24 @@ def _load_user_data(user_id: str, strict: bool = False) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="读取用户数据失败，请稍后重试") from exc
 
 
-def _archived_count(data: dict[str, Any]) -> int:
-    """实际仍存在于历史中的归档会话数（消息被删光的归档标记不计入）。"""
-    session_ids = {
-        str(message.get("session_id"))
-        for message in data.get("chat_history") or []
-        if message.get("session_id")
-    }
+def _archived_count(
+    data: dict[str, Any], live_session_ids: set[str] | None = None
+) -> int:
+    """实际仍存在于历史中的归档会话数（消息被删光的归档标记不计入）。
+
+    ``live_session_ids`` 可由调用方传入（会话列表在聚合时顺带收集），
+    省掉对全部消息的第二次扫描；无归档账号直接返回 0。
+    """
     archived = data.get("archived_sessions") or []
-    return sum(1 for session_id in archived if str(session_id) in session_ids)
+    if not archived:
+        return 0
+    if live_session_ids is None:
+        live_session_ids = {
+            str(message.get("session_id"))
+            for message in data.get("chat_history") or []
+            if message.get("session_id")
+        }
+    return sum(1 for session_id in archived if str(session_id) in live_session_ids)
 
 
 def _render_stored_message(message: dict[str, Any]) -> str:
@@ -3188,6 +3199,22 @@ def _id_set(values: list[str] | None) -> set[str]:
     return result
 
 
+# 会话列表每次请求都为全部消息调用 chronological_key（纯函数：入参字符串 +
+# 进程本地时区）。120k 条消息实测该循环约 350-400ms；进程内记忆化后同一
+# 历史的热请求降到 ~20ms。缓存键必须带时区世代：进程内 tzset 切换时区后
+# 旧结果一律不命中（生产进程 TZ 启动后固定，世代恒定）。maxsize 与导入
+# 消息上限同量级，导入携带的任意多不同时间戳串也不会让缓存无界增长。
+def _tz_epoch() -> tuple[int, int, int, tuple[str, str]]:
+    return (time.timezone, time.altzone, time.daylight, time.tzname)
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _cached_chronological_key(
+    tz_epoch: tuple[int, int, int, tuple[str, str]], timestamp: str
+) -> str:
+    return chronological_key(timestamp)
+
+
 def _group_sessions(
     history: list[dict[str, Any]],
     limit: int,
@@ -3196,16 +3223,20 @@ def _group_sessions(
     pinned: list[str] | None = None,
     archived: list[str] | None = None,
     archived_mode: str = "exclude",
+    live_session_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。
 
     ``archived_mode``：``exclude`` 只返回未归档会话，``only`` 只返回归档会话。
+    ``live_session_ids``：可选出参，收集历史里出现过的会话 ID（口径与
+    ``_archived_count`` 的集合完全相同），供列表端点省掉第二次全量扫描。
     """
     # 片段 / 标题匹配都用原文查询：_ci_find 自己处理大小写（lower() 改变
     # 长度时改在原文上用正则定位）。先把查询 lower 会让含 İ 的关键字在
     # 原文里完全匹配不到——仅助手消息命中「İstanbul」的会话被整条过滤，
     # 仅标题命中的会话也拿不到 snippet / match_index
     raw_query = query.strip()
+    tz_epoch = _tz_epoch()
     grouped: dict[str, dict[str, Any]] = {}
     # 每条消息的行内时间戳只解析一次：/api/sessions 每次请求都重新聚合全量
     # 历史，原实现对同一个最新时间戳反复 fromisoformat，几十万条消息时 CPU
@@ -3213,6 +3244,10 @@ def _group_sessions(
     updated_keys: dict[str, Any] = {}
     for message in history:
         session_id = message.get("session_id")
+        if live_session_ids is not None and session_id:
+            # 与 _archived_count 的原集合同一口径：在空白串 / 保留字过滤之前
+            # 收集（恢复语义），truthy 判断保持不变
+            live_session_ids.add(str(session_id))
         # 旧数据里会话 ID 可能是整数（0 也是合法值）：只跳过 None / 空白串
         if session_id is None or (
             isinstance(session_id, str) and not session_id.strip()
@@ -3228,7 +3263,7 @@ def _group_sessions(
         entry["message_count"] += 1
         timestamp = str(message.get("timestamp") or "")
         if timestamp:
-            parsed_key = chronological_key(timestamp)
+            parsed_key = _cached_chronological_key(tz_epoch, timestamp)
             current_key = updated_keys.get(str(session_id))
             if current_key is None or parsed_key > current_key:
                 # 取会话内最大时间戳：恢复早于现有会话的备份后，消息按导出
@@ -3255,7 +3290,7 @@ def _group_sessions(
 
     sessions = sorted(
         grouped.values(),
-        key=lambda item: chronological_key(item["updated_at"]),
+        key=lambda item: _cached_chronological_key(tz_epoch, item["updated_at"]),
         reverse=True,
     )
     custom_titles = titles or {}
@@ -4726,6 +4761,7 @@ def create_app(model: Any = None) -> FastAPI:
         titles = data.get("session_titles") or {}
         pinned = data.get("pinned_sessions") or []
         archived_ids = data.get("archived_sessions") or []
+        live_ids: set[str] = set()
         sessions = _group_sessions(
             data["chat_history"],
             1_000_000,
@@ -4734,6 +4770,7 @@ def create_app(model: Any = None) -> FastAPI:
             pinned,
             archived_ids,
             "only" if archived else "exclude",
+            live_session_ids=live_ids,
         )
         total = len(sessions)
         # 旧记忆 / 手写文件里的标题与首条消息可能含孤立代理项：列表响应
@@ -4745,7 +4782,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "offset": offset,
                 "limit": limit,
                 "archived": archived,
-                "archived_count": _archived_count(data),
+                "archived_count": _archived_count(data, live_ids),
             }
         )
 
@@ -6532,8 +6569,17 @@ def create_app(model: Any = None) -> FastAPI:
         # 的硬上限，后者覆盖长文档重切分后的真实恢复体积
         warnings: dict[str, object] = {}
         knowledge_reasons: dict[str, object] = {}
+        # 同一份已清洗备份只序列化一次：字节数直接复用给上限自检，通过后
+        # 同一串字节就是响应体。此前自检内部会对整份备份再清洗深拷贝 +
+        # 再 indent=2 序列化一遍，37MB 账号要多付一份全量内存与 CPU
+        payload_bytes = json.dumps(
+            backup, ensure_ascii=False, indent=2
+        ).encode("utf-8")
         limit_problem = export_backup_limit_problem(
-            backup, warning_out=warnings, reason_out=knowledge_reasons
+            backup,
+            warning_out=warnings,
+            reason_out=knowledge_reasons,
+            precomputed_size=len(payload_bytes),
         )
         knowledge_omitted = ""
         if limit_problem and "knowledge" in backup:
@@ -6544,8 +6590,17 @@ def create_app(model: Any = None) -> FastAPI:
             without_knowledge = {
                 key: value for key, value in backup.items() if key != "knowledge"
             }
-            if export_backup_limit_problem(without_knowledge) is None:
+            fallback_bytes = json.dumps(
+                without_knowledge, ensure_ascii=False, indent=2
+            ).encode("utf-8")
+            if (
+                export_backup_limit_problem(
+                    without_knowledge, precomputed_size=len(fallback_bytes)
+                )
+                is None
+            ):
                 backup = without_knowledge
+                payload_bytes = fallback_bytes
                 # 原始备份轴失败（行数 / 字节超限）时 reason_out 未回填，
                 # 能走到这里说明去掉知识后通过，原因即知识轴超限
                 knowledge_omitted = str(
@@ -6560,7 +6615,6 @@ def create_app(model: Any = None) -> FastAPI:
                     "该文件无法再导入恢复，请先删除部分旧会话 / 行程后重试"
                 ),
             )
-        payload = json.dumps(backup, ensure_ascii=False, indent=2)
         # 含知识段的备份单独命名：与面板的备用下载名一致，也避免与普通
         # 备份同名落盘后迁移时选错文件（静默缺失知识段）
         filename = (
@@ -6583,7 +6637,7 @@ def create_app(model: Any = None) -> FastAPI:
             # （暂无法核对，稍后重试）对用户是不同处置
             headers["X-Knowledge-Omitted"] = knowledge_omitted
         return Response(
-            content=payload,
+            content=payload_bytes,
             media_type="application/json",
             headers=headers,
         )

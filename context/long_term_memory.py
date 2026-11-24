@@ -16,6 +16,7 @@ import weakref
 from collections import Counter
 from collections.abc import Callable
 from datetime import datetime
+from itertools import repeat
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,28 @@ def _lock_for_path(path: str) -> threading.RLock:
             lock = threading.RLock()
             _PATH_LOCKS[path] = lock
         return lock
+
+
+def _stat_fingerprint(stat_info: os.stat_result) -> tuple[int, int, int] | None:
+    """文件身份指纹 (ino, size, mtime_ns)；ino 不可用时返回 None。
+
+    所有写者都以 ``mkstemp + fsync + os.replace`` 原子替换提交，替换后
+    ino 与 mtime 必变；FAT 等 mtime 粒度粗的文件系统由 ino 变化兜底。
+    ctime 不参与：Windows 上 ``os.fstat``（读取句柄）与 ``os.stat``（路径）
+    的 st_ctime 口径不一致，会把「刚读过的同一文件」误判为已变化。
+    ino 为 0 的平台（部分网络文件系统）保守返回 None，调用方退化为每次重读。
+    """
+    try:
+        inode = int(stat_info.st_ino)
+        if inode == 0:
+            return None
+        return (
+            inode,
+            int(stat_info.st_size),
+            int(stat_info.st_mtime_ns),
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def _postgres_configured() -> bool:
@@ -253,6 +276,10 @@ class LongTermMemory:
         # 本实例「当场检测到损坏」（区别于载入时发现的历史遗留备份）：
         # 上层守卫在 PostgreSQL 故障回退 JSON 时也只认这一类
         self._fresh_quarantine = False
+        # 已解析内容的磁盘指纹 (ino, size, mtime_ns, ctime_ns)：再次读取前
+        # 先 stat 比对，未变化就不重复整份解析（导出快照等读路径每请求会
+        # 打开新实例，构造时刚解析过同一文件）。None = 尚未确认，必须重载
+        self._loaded_stat: tuple[int, int, int] | None = None
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -268,13 +295,17 @@ class LongTermMemory:
                 try:
                     # 读句柄尽早关闭：Windows 上任何打开中的句柄都会让其它
                     # 进程的 os.replace 失败（WinError 5）。大文件的解析占
-                    # 读取耗时的大头，先读完再解析可把阻塞写者的窗口压到最短
+                    # 读取耗时的大头，先读完再解析可把阻塞写者的窗口压到最短。
+                    # 指纹在 read 之前 fstat：若存在原地写者，得到的是不晚于
+                    # 所读字节的指纹，只会多一次重载、不会假命中
                     with open(self.db_path, "r", encoding="utf-8") as f:
+                        stat_info = os.fstat(f.fileno())
                         raw = f.read()
                     data = self._migrate_data(json.loads(raw))
                     # 大小写不敏感文件系统上另一账号可能映射到同一文件：
                     # 这是身份冲突而不是文件损坏，不能走隔离分支
                     self._check_owner_case(data)
+                    self._loaded_stat = _stat_fingerprint(stat_info)
                     logger.debug(f"Loaded long-term memory from {self.db_path}")
                     return data
                 except MemoryPersistenceError:
@@ -288,6 +319,7 @@ class LongTermMemory:
                         with file_lock(self.db_path):
                             try:
                                 with open(self.db_path, "r", encoding="utf-8") as f:
+                                    recheck_stat = os.fstat(f.fileno())
                                     latest_raw = f.read()
                                 latest = json.loads(latest_raw)
                                 # 与首次读取一致：合法 JSON 但不是对象 /
@@ -356,6 +388,7 @@ class LongTermMemory:
                             # 另一账号的数据。放在内层 except 之外，避免
                             # MemoryPersistenceError 被当成损坏隔离
                             self._check_owner_case(latest)
+                            self._loaded_stat = _stat_fingerprint(recheck_stat)
                             logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
                             return latest
                     except TimeoutError as lock_error:
@@ -767,8 +800,10 @@ class LongTermMemory:
     def _reload_latest(self) -> None:
         """从磁盘重载最新数据（写操作前调用，避免旧快照覆盖其它写入）。"""
         try:
-            # 与 _load 同一原因：句柄尽早关闭，解析在句柄关闭后进行
+            # 与 _load 同一原因：句柄尽早关闭，解析在句柄关闭后进行；
+            # 指纹在 read 之前取，只会多一次重载、不会假命中
             with open(self.db_path, encoding="utf-8") as f:
+                reload_stat = os.fstat(f.fileno())
                 raw = f.read()
             data = json.loads(raw)
         except FileNotFoundError:
@@ -861,6 +896,24 @@ class LongTermMemory:
         migrated = self._migrate_data(data)
         self._check_owner_case(migrated)
         self.data = migrated
+        self._loaded_stat = _stat_fingerprint(reload_stat)
+
+    def _disk_unchanged(self) -> bool:
+        """磁盘文件是否仍是上次解析时的那一份（stat 指纹一致才可跳过重载）。
+
+        写者一律以 ``mkstemp + fsync + os.replace`` 原子替换提交，换文件身份
+        （ino / ctime 必变）；FAT 等 mtime 粒度粗的文件系统由 ino 变化兜底。
+        文件系统不提供稳定 ino（返回 0）时保守返回 False，退化为现状。
+        """
+        fingerprint = self._loaded_stat
+        if fingerprint is None:
+            return False
+        try:
+            stat_info = os.stat(self.db_path)
+        except OSError:
+            # 文件被删除 / 正在替换：交给 _reload_latest 的墓碑 / 隔离分支
+            return False
+        return _stat_fingerprint(stat_info) == fingerprint
 
     def _backup_before_migration(self) -> None:
         """迁移会丢弃 / 重置坏数据前把原始文件另存一份（每个文件只留首份）。
@@ -968,22 +1021,27 @@ class LongTermMemory:
                 else:
                     trips_changed = True
                 continue
-            cleaned = [item for item in data[list_key] if isinstance(item, dict)]
-            if len(cleaned) != len(data[list_key]):
-                logger.warning(
-                    "丢弃 %s 中 %d 条非对象记录",
-                    list_key,
-                    len(data[list_key]) - len(cleaned),
-                )
-                destructive = True
-                # 计数与列表同步：丢弃坏条目后各删除路径按差值扣减，
-                # 旧总数会让统计永久偏大（总数与列表长度必须一致）
-                if list_key == "chat_history":
-                    stats["total_messages"] = len(cleaned)
-                    chats_changed = True
-                else:
-                    stats["total_trips"] = len(cleaned)
-                    trips_changed = True
+            items = data[list_key]
+            # 健康数据快路径（C 级 map+isinstance）：全部是 dict 时保持原列表，
+            # 每次读请求不分配一份 12 万条的影子列表；任何非 dict 仍走下方
+            # 原有重建路径（日志 / 计数同步 / 迁移备份语义不变）
+            if all(map(isinstance, items, repeat(dict))):
+                continue
+            cleaned = [item for item in items if isinstance(item, dict)]
+            logger.warning(
+                "丢弃 %s 中 %d 条非对象记录",
+                list_key,
+                len(items) - len(cleaned),
+            )
+            destructive = True
+            # 计数与列表同步：丢弃坏条目后各删除路径按差值扣减，
+            # 旧总数会让统计永久偏大（总数与列表长度必须一致）
+            if list_key == "chat_history":
+                stats["total_messages"] = len(cleaned)
+                chats_changed = True
+            else:
+                stats["total_trips"] = len(cleaned)
+                trips_changed = True
             data[list_key] = cleaned
         if stats_missing:
             # 统计段整体缺失（极老格式）：按现有列表重建，而不是把计数器
@@ -1139,7 +1197,16 @@ class LongTermMemory:
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(self.data, handle, ensure_ascii=False, indent=2)
+                    # 紧凑分隔符：indent=2 会退回纯 Python 编码器（同一份
+                    # 12 万条数据实测慢 5 倍以上），且文件大 22-25%——每次
+                    # 读盘解析都要为这份空白付钱。全部读取方都是整文件
+                    # json.loads，对格式无契约；旧版紧凑 / 缩进文件都能读
+                    json.dump(
+                        self.data,
+                        handle,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                     handle.flush()
                     # 持久化屏障：os.replace 只保证原子替换，不保证临时文件
                     # 数据已落盘（NTFS 的 rename 元数据可能先于数据页写回）。
@@ -1177,6 +1244,12 @@ class LongTermMemory:
             self._fresh_quarantine = False
             self._corrupt_pending = False
             self._corrupt_backup = None
+            # 写后刷新指纹：刚写入的 self.data 就是磁盘内容，本实例后续的
+            # 快照读取不必再整份重载；stat 失败按「未确认」处理
+            try:
+                self._loaded_stat = _stat_fingerprint(os.stat(self.db_path))
+            except OSError:
+                self._loaded_stat = None
             return True
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")
@@ -1609,6 +1682,21 @@ class LongTermMemory:
         if session_id:
             messages = [m for m in messages if _session_id_matches(m, session_id)]
         elif exclude_session_id:
+            if limit and limit > 0:
+                # 正常追加序下当前会话在末尾：反向收集满 limit 即停，避免
+                # 每轮为取最近 50 条而把 12 万条全量过滤成临时列表。
+                # add_chat_turn 失败回滚会原地缩短同一 list，读路径本就不
+                # 持锁，越界索引跳过即可（弱一致语义与整体过滤一致）
+                window: list[dict[str, Any]] = []
+                index = len(messages) - 1
+                while index >= 0 and len(window) < limit:
+                    if index < len(messages):
+                        message = messages[index]
+                        if not _session_id_matches(message, exclude_session_id):
+                            window.append(message)
+                    index -= 1
+                window.reverse()
+                return window
             messages = [
                 m
                 for m in messages
@@ -2357,14 +2445,18 @@ class LongTermMemory:
         return self.data["statistics"].copy()
 
     def export_snapshot(self) -> dict[str, Any]:
-        """导出一致快照：写锁内重载后逐项读取，避免与并发写入交错。
+        """导出一致快照：磁盘有变化时在写锁内重载，再逐项读取。
 
         导出（备份 / 面板 / CLI）此前逐项调用 get_*，其它线程 / 进程在两次
         读取之间写入时，统计与列表会来自不同版本（备份里总数与消息条数
-        对不上）。写锁同时覆盖进程内线程与跨进程文件锁。
+        对不上）。写锁覆盖进程内线程；跨进程写入经原子替换提交，这里用
+        stat 指纹判断「磁盘是否已变」——未变时复用本实例刚解析的快照（读
+        接口每请求新建实例，构造时已全量解析过一次，无条件重载等于整份
+        解析两遍），变了仍走 _reload_latest 的完整复核路径。
         """
         with self._write_lock:
-            self._reload_latest()
+            if not self._disk_unchanged():
+                self._reload_latest()
             return {
                 "preferences": self.get_preference(),
                 "trip_history": self.get_trip_history(limit=None),
