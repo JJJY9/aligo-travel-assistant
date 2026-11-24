@@ -528,6 +528,16 @@ def test_postgres_preference_writes_bump_shared_version(monkeypatch):
         def cursor(self):
             return _Cursor()
 
+        def transaction(self):
+            class _Txn:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return _Txn()
+
     store._conn = _Conn()
     monkeypatch.setattr(store, "_run_with_retry", lambda fn, **kwargs: fn())
     assert store.delete_preference("hotel_brands") is True

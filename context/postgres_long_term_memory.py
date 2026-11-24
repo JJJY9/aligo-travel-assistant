@@ -2307,25 +2307,58 @@ class PostgresLongTermMemory:
 
     # ---------- 清理 ----------
 
+    def _delete_user_rows(self, tables: tuple[str, ...]) -> None:
+        """在单事务内清空用户在这些表的行（session_meta → chat_messages 锁序）。
+
+        逐表 autocommit 删除在中途失败 / 与其它实例并发写入交错时会留下
+        半清空账号（消息已删、会话元数据还在，或反之）；与 add_chat_turn /
+        delete_chat_session 使用同一 advisory 锁序串行化同账号的并发写入，
+        整批在同一事务里提交（DELETE 按 user_id 幂等，重连重放安全）。
+        """
+
+        def run() -> None:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.execute("SET LOCAL lock_timeout = '30s'")
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:session_meta:{self.user_id}",),
+                )
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:chat_messages:{self.user_id}",),
+                )
+                for table in tables:
+                    cursor.execute(
+                        f"DELETE FROM {table} WHERE user_id = %s",
+                        (self.user_id,),
+                    )
+
+        self._run_with_retry(run, replay_safe=True)
+
     def clear_history(self) -> None:
-        self._execute("DELETE FROM aligo_chat_messages WHERE user_id = %s", (self.user_id,))
-        self._execute("DELETE FROM aligo_trips WHERE user_id = %s", (self.user_id,))
-        self._execute("DELETE FROM aligo_session_titles WHERE user_id = %s", (self.user_id,))
-        self._execute("DELETE FROM aligo_pinned_sessions WHERE user_id = %s", (self.user_id,))
-        self._execute("DELETE FROM aligo_archived_sessions WHERE user_id = %s", (self.user_id,))
+        self._delete_user_rows(
+            (
+                "aligo_chat_messages",
+                "aligo_trips",
+                "aligo_session_titles",
+                "aligo_pinned_sessions",
+                "aligo_archived_sessions",
+            )
+        )
 
     def delete_all(self) -> None:
-        for table in (
-            "aligo_chat_messages",
-            "aligo_trips",
-            "aligo_trip_counters",
-            "aligo_preferences",
-            "aligo_user_stats",
-            "aligo_session_titles",
-            "aligo_pinned_sessions",
-            "aligo_archived_sessions",
-        ):
-            self._execute(f"DELETE FROM {table} WHERE user_id = %s", (self.user_id,))
+        self._delete_user_rows(
+            (
+                "aligo_chat_messages",
+                "aligo_trips",
+                "aligo_trip_counters",
+                "aligo_preferences",
+                "aligo_user_stats",
+                "aligo_session_titles",
+                "aligo_pinned_sessions",
+                "aligo_archived_sessions",
+            )
+        )
         # 偏好被整表清空：其它实例的快照缓存必须立即失效
         self._bump_shared_preference_version()
 

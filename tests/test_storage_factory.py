@@ -1623,6 +1623,89 @@ def test_pg_timestamp_localizes_naive_with_fixed_tz():
     print("✓ _pg_timestamp 按固定时区本地化 naive 时间")
 
 
+def test_pg_clear_and_delete_all_use_single_transaction():
+    """clear_history / delete_all 在单事务内按 session_meta→chat_messages 锁序清空。
+
+    逐表 autocommit 删除在中途失败 / 并发写入时会留下半清空账号。
+    """
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    state: dict = {"statements": [], "locks": [], "commits": 0, "fail_at": None}
+
+    class _Cursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            state["statements"].append(text)
+            if "pg_advisory_xact_lock" in text and params:
+                state["locks"].append(params[0])
+            if state["fail_at"] is not None and text.startswith(
+                "DELETE FROM " + state["fail_at"] + " "
+            ):
+                raise RuntimeError("db down mid-clear")
+
+    class _Txn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            if exc[0] is None:
+                state["commits"] += 1
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def transaction(self):
+            return _Txn()
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-pg-clear"
+    store._conn = _Conn()
+    store._run_with_retry = lambda fn, replay_safe=True: fn()
+    store._bump_shared_preference_version = lambda: None
+
+    store.clear_history()
+    assert state["commits"] == 1, "清空历史必须在单事务内提交"
+    assert state["locks"][:2] == [
+        "aligo:session_meta:u-pg-clear",
+        "aligo:chat_messages:u-pg-clear",
+    ], "advisory 锁序必须与删除路径一致（session_meta → chat_messages）"
+    deletes = [s for s in state["statements"] if s.startswith("DELETE FROM ")]
+    assert any("aligo_chat_messages" in s for s in deletes)
+    assert any("aligo_session_titles" in s for s in deletes)
+
+    state.update(statements=[], locks=[], commits=0, fail_at="aligo_trips")
+    try:
+        store.clear_history()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("中途失败必须向上抛出")
+    assert state["commits"] == 0, "中途失败不能提交半清空结果"
+
+    state.update(statements=[], locks=[], commits=0, fail_at=None)
+    store.delete_all()
+    assert state["commits"] == 1
+    all_deletes = "\n".join(state["statements"])
+    for table in (
+        "aligo_preferences",
+        "aligo_user_stats",
+        "aligo_trip_counters",
+        "aligo_session_titles",
+    ):
+        assert table in all_deletes, table
+    print("✓ PG 清空历史 / 删除全部在单事务内按锁序执行")
+
+
 def test_pg_add_chat_messages_reports_committed_count_after_lost_ack():
     """提交后连接中断的重放：重放的判重 SELECT 看到已提交行时按首次
     尝试的保留条数报告，不能把实际已写入的消息全报成跳过。"""
