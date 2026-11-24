@@ -62,8 +62,8 @@
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
 - 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪；接口同时返回集合向量维度，进程内已加载嵌入模型时附带 `dimension_mismatch`（换模型后不必等到问答报错才发现）
-- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`；长内容自动按语义边界拆分并带 `group` 标识，任一分片可**编辑整份文档**或**整组删除**），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），并可运行**检索评测**（`/api/knowledge/eval`，14 个问题计算 hit@1/3/5 与 MRR，不调用大模型，同一时间只允许一个评测：配置 `REDIS_URL` 时通过 Redis 锁跨实例共享，未配置或 Redis 故障时回退进程内），面板「查重复」按钮与 `GET /api/knowledge/duplicates` 可列出内容完全相同的独立片段组（与 CLI `kb-duplicates` 同一实现，确认后到列表删除多余片段），「清理重复」按钮走 `POST /api/knowledge/duplicates/cleanup`（默认 dry-run 预览，确认后每组保留最早一条删除其余，与 CLI `kb-dedupe` 同一语义），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 20000 条（面板按 200 条分批、多分片组整组同批），CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
-- 检索评测：`python cli.py eval` 用 14 个差旅问题离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归；Web 知识库维护面板也可直接「检索评测」
+- 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`；长内容自动按语义边界拆分并带 `group` 标识，任一分片可**编辑整份文档**或**整组删除**），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），并可运行**检索评测**（`/api/knowledge/eval`，30 个问题（覆盖全部 8 份随仓库知识文档）计算 hit@1/3/5 与 MRR，不调用大模型，同一时间只允许一个评测：配置 `REDIS_URL` 时通过 Redis 锁跨实例共享，未配置或 Redis 故障时回退进程内），面板「查重复」按钮与 `GET /api/knowledge/duplicates` 可列出内容完全相同的独立片段组（与 CLI `kb-duplicates` 同一实现，确认后到列表删除多余片段），「清理重复」按钮走 `POST /api/knowledge/duplicates/cleanup`（默认 dry-run 预览，确认后每组保留最早一条删除其余，与 CLI `kb-dedupe` 同一语义），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 20000 条（面板按 200 条分批、多分片组整组同批），CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
+- 检索评测：`python cli.py eval` 用 30 个差旅问题（覆盖全部 8 份随仓库知识文档）离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归；Web 知识库维护面板也可直接「检索评测」
 
 ### ⚡ 优先级并行调度
 - Plan-and-Execute架构：IntentionAgent → OrchestrationAgent → 子Agent
@@ -533,7 +533,7 @@ python cli.py
 
 知识库状态（不进入交互）：`python cli.py kb`，输出集合名 / 片段数与数据库路径，退出码 0/1；`--json` 输出完整状态对象（`available` / `collection` / `documents` / `path` / `reason`）。
 
-知识库检索评测（不进入交互、不调用大模型）：`python cli.py eval`，对 14 个差旅问题计算 hit@1 / hit@3 / hit@5 与 MRR（当前基线：hit@5 100%，MRR 0.80），hit@5 低于 80% 时退出码 1；知识库未初始化时提示跳过。`--json` 输出完整指标对象（`ok` / `skipped` / `threshold` / `hit@K` / `mrr` / `rows`），便于 CI 或脚本回归。
+知识库检索评测（不进入交互、不调用大模型）：`python cli.py eval`，对 30 个差旅问题（覆盖全部 8 份随仓库知识文档）计算 hit@1 / hit@3 / hit@5 与 MRR（题库与知识文档的一致性由 `test_rag_eval.py` 离线用例守护），hit@5 低于 80% 时退出码 1；知识库未初始化时提示跳过。`--json` 输出完整指标对象（`ok` / `skipped` / `threshold` / `hit@K` / `mrr` / `rows`（逐题排名与 `source` 来源文档）），便于 CI 或脚本回归。
 评测用例生成（不进入交互、不调用大模型）：`python cli.py eval-cases [--count 500] [--seed 7] [--out cases.jsonl] [--json]` 按 12 类场景模板确定性生成分层评测用例，可选写入 JSONL，供 `utils/eval_harness.py` 的规则 + Judge 回归使用。
 意图评测（调用真实意图模型）：`python cli.py eval-agent [--count 20] [--seed 7] [--min-pass 0.0] [--json]` 生成分层用例并逐条跑 `IntentionAgent`，按标准智能体名集合完全匹配计算 Pass@1 / 分类准确率；未配置模型密钥或低于 `--min-pass` 时退出 1。
 
@@ -652,7 +652,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/knowledge/documents/{id}/group` | 返回片段所属整篇文档（多分片按 `part` 拼接），供面板「编辑整份文档」回填 |
 | GET | `/api/knowledge/categories` | 知识片段分类统计（维护面板筛选下拉框） |
 | GET | `/api/knowledge/search` | 语义检索知识片段（`q` / `top_k`，返回相似度） |
-| GET | `/api/knowledge/eval` | 离线检索评测（14 个问题，hit@1/3/5 与 MRR；不调用大模型） |
+| GET | `/api/knowledge/eval` | 离线检索评测（30 个问题，覆盖全部随仓库知识文档；hit@1/3/5 与 MRR，不调用大模型） |
 | GET | `/api/knowledge/duplicates` | 内容完全相同的独立知识片段组（与 CLI `kb-duplicates` 同一实现；`limit=0` 表示全部，Web 侧最多返回 2000 组并在 `truncated` 标记；无上限的全量审计请用 CLI `kb-duplicates 0`；多分片记录不计为重复） |
 | POST | `/api/knowledge/duplicates/cleanup` | 清理内容完全相同的独立片段（每组保留最小 id，与 CLI `kb-dedupe` 同一语义；JSON body `{"dry_run": true}` 默认只返回计划，`false` 才在写锁内逐条复核并删除，已消失 / 已变化 / 变为多分片的条目记入 `skipped`、删除异常记入 `failed`；2xx 响应恒带 `plan_total` 与 `truncated`，`plan` 视图最多 2000 组——截断只影响返回视图，删除始终按全量计划执行；删除开始后的存储故障逐条记入 `failed` 并照常返回（已删部分不可逆，不变成 503 丢失计划），503 只出现在扫描 / 加载阶段的失败；必须 JSON body，跨站表单无法触发） |
 | DELETE | `/api/knowledge/documents/{id}` | 删除知识片段；`group=1` 时连同同一拆分组的其余分片一起删除（带 `group` 的多分片记录不能单条删除，返回 400 提示整组删除） |
