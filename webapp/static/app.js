@@ -2421,17 +2421,12 @@ function renderHistory() {
     hint.dataset.focusKey = "archived-hint";
     hint.textContent = `另有 ${state.archivedMatches} 条归档会话匹配`;
     hint.addEventListener("click", async () => {
-      const previous = state.showArchived;
       state.showArchived = true;
       updateArchivedToggle();
-      const ok = await loadSessions(state.searchQuery, { reset: true });
-      if (ok === false) {
-        // 请求失败：回滚视图位并按旧视图重渲染，不能把普通列表挂在
-        // 「已归档」标题下（loadSessions 的失败分支已按新视图渲染过）
-        state.showArchived = previous;
-        updateArchivedToggle();
-        renderHistory();
-      }
+      // 失败时 loadSessions 已按已渲染快照回滚并重渲染（快照为 null 时
+      // 回滚为非归档视图），这里只收敛按钮态
+      await loadSessions(state.searchQuery, { reset: true });
+      updateArchivedToggle();
     });
     els.history.appendChild(hint);
   };
@@ -2625,6 +2620,10 @@ async function loadSessions(query = state.searchQuery, options = {}) {
       }
       state.sessionsOffset = serverOffset;
     }
+    // 快照紧跟数据写入：归档匹配是独立子请求，期间被后续 reset 取代时
+    // 本请求会早退——快照必须已经与 state.sessions / offset 对齐
+    state.sessionsLoadedQuery = state.searchQuery;
+    state.sessionsLoadedArchived = state.showArchived;
     if (data.archived_count !== undefined) {
       updateArchivedToggle(Number(data.archived_count));
     }
@@ -2683,8 +2682,6 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   if (requestId !== sessionsRequestId) return;
   state.sessionsLoading = false;
   state.archivedMatches = archivedMatches;
-  state.sessionsLoadedQuery = state.searchQuery;
-  state.sessionsLoadedArchived = state.showArchived;
   renderHistory();
   return true;
 }
@@ -6124,6 +6121,10 @@ async function saveUser() {
     state.sessions = [];
     state.sessionTotal = 0;
     state.archivedMatches = 0;
+    // 快照属于上一个用户的已渲染列表：不清掉的话，首屏请求失败时
+    // 失败分支会按陈旧快照把上一用户的查询词 / 归档视图回滚给新用户
+    state.sessionsLoadedQuery = null;
+    state.sessionsLoadedArchived = null;
     els.history.innerHTML = "";
     renderOverview();
     await loadSessions(state.searchQuery, { reset: true });
@@ -6236,18 +6237,13 @@ function bindEvents() {
 
   byId("newSession").addEventListener("click", newSession);
   els.archivedToggle.addEventListener("click", async () => {
-    const previous = state.showArchived;
-    state.showArchived = !previous;
+    state.showArchived = !state.showArchived;
     updateArchivedToggle();
-    const ok = await loadSessions(state.searchQuery, { reset: true });
-    if (ok === false) {
-      // 列表仍是旧视图的数据：状态位回滚后必须按恢复的视图重渲染——
-      // loadSessions 的失败分支已按「翻转后」的视图渲染过旧列表，只改
-      // 状态位会让分组标题 / 行按钮与状态互相矛盾
-      state.showArchived = previous;
-      updateArchivedToggle();
-      renderHistory();
-    }
+    // 失败时 loadSessions 内部已按「已渲染快照」回滚视图位并重渲染；
+    // 这里不能再按点击前捕获的值覆盖——重叠点击时它是瞬态值，会与
+    // 快照 / 列表数据分叉
+    await loadSessions(state.searchQuery, { reset: true });
+    updateArchivedToggle();
   });
   byId("brandHome").addEventListener("click", (event) => {
     event.preventDefault();

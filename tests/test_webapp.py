@@ -389,14 +389,20 @@ def test_session_detail_fails_closed_when_store_unavailable(monkeypatch):
     from utils.errors import MemoryPersistenceError
     from webapp import server as server_module
 
-    def boom(user_id, *args, **kwargs):
+    calls = {}
+
+    def fake_open(user_id, *args, **kwargs):
+        calls["strict"] = kwargs.get("strict")
         raise MemoryPersistenceError("PostgreSQL 处于故障冷却期")
 
-    monkeypatch.setattr(server_module, "_open_long_term", boom)
+    monkeypatch.setattr(server_module, "_open_long_term", fake_open)
     client = _client()
     response = client.get("/api/sessions/s1", params={"user_id": "u1"})
     assert response.status_code == 503, response.text
-    print("✓ 会话详情在存储不可用时 503（不回退空消息）")
+    assert calls.get("strict") is True, (
+        "会话详情必须以 strict 打开存储，不能静默回退 JSON 库返回空消息"
+    )
+    print("✓ 会话详情严格打开存储（不可用时 503）")
 
 
 def test_export_concurrency_guard():

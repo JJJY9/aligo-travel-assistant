@@ -2656,8 +2656,16 @@ async function scenarioArchivedRollback(source) {
     if (!run("state.sessionsLoading")) break;
   }
   await new Promise((resolve) => setTimeout(resolve, 10));
+  // 重叠点击：第二次翻转取代第一次请求；失败后视图位必须与已渲染快照一致
+  run("els.archivedToggle.click(); els.archivedToggle.click();");
+  for (let i = 0; i < 50; i += 1) {
+    await tick();
+    if (!run("state.sessionsLoading")) break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 10));
   return run(`({
     showArchived: state.showArchived,
+    loadedArchived: state.sessionsLoadedArchived,
     toasts: __toasts.slice(),
     renderCalls: __renderCalls,
   })`);
