@@ -1124,6 +1124,50 @@ async function scenarioReconcile(source) {
   const persistedLate = await runCase(newMessages);
   const stillMissing = await runCase(oldMessages);
 
+  // 最终确认请求失败 / 超时：落库结果未知——openSession 可能已渲染出刚
+  // 落库的一轮，不能把提问塞回输入框（诱导重发会产生重复问答）
+  const runConfirmFailed = async () => {
+    run(
+      '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 0;'
+    );
+    const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
+    for (let i = 0; i < 10; i += 1) {
+      const request = await waitRequest(env);
+      request.resolve({ messages: oldMessages });
+      await tick();
+    }
+    const confirm = await waitRequest(env);
+    confirm.reject(new Error("timeout"));
+    await promise;
+    await tick();
+    return {
+      input: run("els.input.value"),
+      toasts: run("__toasts.slice()"),
+    };
+  };
+  const confirmFailed = await runConfirmFailed();
+
+  // 判定期内始终拿不到有效响应（连续超时）：结果未知，同样不回填输入框
+  const runAllFailed = async () => {
+    run(
+      '__toasts.length = 0; globalThis.__openCalls = 0; els.input.value = ""; sessionLoadToken = 5; globalThis.__extra = 0;'
+    );
+    const promise = run('reconcileStoppedTurn("s1", "你好", 5, "turn-1")');
+    for (let i = 0; i < 10; i += 1) {
+      const request = await waitRequest(env);
+      request.reject(new Error("timeout"));
+      await tick();
+    }
+    await promise;
+    await tick();
+    return {
+      input: run("els.input.value"),
+      toasts: run("__toasts.slice()"),
+      open_calls: run("__openCalls"),
+    };
+  };
+  const allFailed = await runAllFailed();
+
   // 对账期间用户点击了另一个会话：openSession 自增 token 后又被用户点击
   // 推进一次，不能认领该 token 把旧提问写进新会话的输入框
   run(
@@ -1144,9 +1188,109 @@ async function scenarioReconcile(source) {
     open_calls: run("__openCalls"),
   };
 
-  return { persistedLate, stillMissing, interleaved };
+  return { persistedLate, stillMissing, interleaved, confirmFailed, allFailed };
 }
 
+
+async function scenarioKbSearchFlow(source) {
+  // 知识库搜索：防抖 / 去重 / 429 保留列表 / 分页对齐 / 输入法守卫
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    const makeField = () => ({
+      value: "",
+      handlers: {},
+      addEventListener(type, fn) {
+        (this.handlers[type] = this.handlers[type] || []).push(fn);
+      },
+      dispatch(type, event) {
+        (this.handlers[type] || []).forEach((fn) => fn(event || {}));
+      },
+    });
+    els.kbSearch = makeField();
+    els.kbCategory = makeField();
+    els.kbList = { textContent: "", innerHTML: "", appendChild() {}, focus() {} };
+    els.kbMore = {
+      hidden: true,
+      disabled: false,
+      addEventListener() {},
+      focus() {},
+    };
+    globalThis.__rendered = 0;
+    renderKnowledgeDocuments = (items, append) => {
+      state.kbItems = append ? state.kbItems.concat(items) : items.slice();
+      globalThis.__rendered += 1;
+    };
+    refreshKnowledgeCategories = () => {};
+    state.userId = "u1";
+    setTimeout = (cb) => { try { cb(); } catch (_) {} return 0; };
+    bindEvents();
+  `);
+  const rows = (prefix, count) =>
+    Array.from({ length: count }, (_, i) => ({
+      id: prefix + i,
+      content: prefix + i,
+      metadata: {},
+    }));
+
+  // 1) foo 搜索成功：20/40，加载更多可见
+  run('els.kbSearch.value = "foo"; els.kbSearch.dispatch("input", {});');
+  (await waitRequest(env)).resolve({ total: 40, items: rows("foo-", 20) });
+  await tick();
+  const fooState = run(
+    '({ items: state.kbItems.length, moreHidden: els.kbMore.hidden })'
+  );
+
+  // 2) 输入 bar 刷新收 429：列表保留、加载更多隐藏、toast 提示
+  run('els.kbSearch.value = "bar"; els.kbSearch.dispatch("input", {});');
+  const limited = await waitRequest(env);
+  limited.reject(
+    Object.assign(new Error("知识库操作过于频繁，请约 60 秒后重试"), {
+      status: 429,
+    })
+  );
+  await tick();
+  const after429 = run(
+    '({ items: state.kbItems.length, moreHidden: els.kbMore.hidden, toasts: __toasts.slice() })'
+  );
+
+  // 3) 条件不一致时「加载更多」不得发请求（否则新查询 + 旧游标混合列表）
+  run("loadMoreKnowledgeDocuments();");
+  await tick();
+  const moreBlocked = env.__requests.length === 0;
+
+  // 4) 回车强制重试同一查询：不被去重吞掉
+  run(
+    'els.kbSearch.dispatch("keydown", { key: "Enter", isComposing: false, preventDefault() {} });'
+  );
+  const retry = await waitRequest(env);
+  retry.resolve({ total: 1, items: rows("bar-", 1) });
+  await tick();
+  const afterRetry = run(
+    '({ query: state.kbQuery, loaded: state.kbLoadedQuery, items: state.kbItems.length })'
+  );
+
+  // 5) 输入法合成期间按回车不发请求；compositionend 恢复调度
+  run(`
+    els.kbSearch.dispatch("compositionstart", {});
+    els.kbSearch.value = "baz";
+    els.kbSearch.dispatch("keydown", { key: "Enter", isComposing: false, preventDefault() {} });
+  `);
+  await tick();
+  const composeBlocked = env.__requests.length === 0;
+  run('els.kbSearch.dispatch("compositionend", {});');
+  const composed = await waitRequest(env);
+  composed.resolve({ total: 0, items: [] });
+  await tick();
+  return {
+    fooState,
+    after429,
+    moreBlocked,
+    afterRetry,
+    composeBlocked,
+    composedUrl: composed.args[0],
+  };
+}
 
 async function scenarioRetryGuard(source) {
   const env = buildEnv(source);
@@ -2661,6 +2805,8 @@ async function main() {
     payload = await scenarioSilentRestoreWindow(source);
   } else if (scenario === "sessionSearchFailure") {
     payload = await scenarioSessionSearchFailure(source);
+  } else if (scenario === "kbSearchFlow") {
+    payload = await scenarioKbSearchFlow(source);
   } else if (scenario === "downloadGuards") {
     payload = await scenarioDownloadGuards(source);
   } else if (scenario === "reconcile") {

@@ -107,6 +107,13 @@ const state = {
   kbEditSeq: 0,
   kbSaving: false,
   kbSemanticMode: false,
+  // 关键词列表的渲染状态：列表内容对应的查询 / 分类快照。刷新失败（429
+  // 保留旧结果）或在途时，"加载更多"不能以新查询 + 旧游标取页
+  kbListLoading: false,
+  kbLoadedQuery: null,
+  kbLoadedCategory: null,
+  kbListFailed: false,
+  kbComposing: false,
   kbSemanticQuery: "",
   tripEditingId: null,
   tripsExpanded: false,
@@ -3345,6 +3352,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
   };
   // 服务端断连后最多等 10 秒 drain（超时后落库线程仍可能继续）：判定期限
   // 必须覆盖它，前 4 次 700ms 快速命中，之后放慢到 1.5s 直到 ~12 秒
+  let lastResponseValid = false;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     if (!canSync()) return;
     let data = null;
@@ -3357,6 +3365,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     } catch (_) {
       data = null;
     }
+    lastResponseValid = Boolean(data && Array.isArray(data.messages));
     if (!canSync()) return;
     if (data && Array.isArray(data.messages)) {
       const messages = data.messages;
@@ -3386,11 +3395,12 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
         // 10 秒，客户端判定期限已覆盖）：以最新数据为准再确认一次，避免界面
         // 已显示保存的问答却把提问塞回输入框并提示未保存，用户重发后历史
         // 出现两条相同问答
+        let confirmUnknown = false;
         try {
           const latest = await getJSON(
             `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
             {},
-            5000,
+            15000,
           );
           if (
             canSync() &&
@@ -3408,9 +3418,16 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
             return;
           }
         } catch (_) {
-          /* 确认请求失败：按未确认处理 */
+          // 确认请求超时 / 失败：落库结果未知
+          confirmUnknown = true;
         }
         if (!canSync()) return;
+        if (confirmUnknown) {
+          // openSession 的重新拉取可能已渲染出刚落库的一轮：把提问塞回
+          // 输入框会让用户重发、历史出现两条相同问答——只提示未知
+          toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
+          return;
+        }
         if (!els.input.value.trim()) {
           els.input.value = message;
           resizeInput();
@@ -3421,9 +3438,14 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     }
     await new Promise((resolve) => setTimeout(resolve, attempt < 4 ? 700 : 1500));
   }
-  // 连续请求失败（服务不可达）：保留本地「已停止」气泡，至少把原文还回输入框。
-  // 但期间用户可能已切换会话 / 用户：不能再把旧提问写进新的输入框
+  // 判定期内始终拿不到有效响应（连续超时 / 服务不可达）：落库结果未知。
+  // 不把提问塞回输入框——服务端 drain 可能已经落库，诱导重发会产生重复
+  // 问答；期间用户可能已切换会话 / 用户，也要避免写进新的输入框
   if (!canSync()) return;
+  if (!lastResponseValid) {
+    toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
+    return;
+  }
   if (!els.input.value.trim()) {
     els.input.value = message;
     resizeInput();
@@ -4759,13 +4781,17 @@ function exitKbSemanticMode() {
   state.kbSemanticQuery = "";
 }
 
-function knowledgeQueryParams(offset) {
+function knowledgeQueryParams(
+  offset,
+  query = state.kbQuery,
+  category = state.kbCategory,
+) {
   const params = new URLSearchParams({
     limit: String(KB_PAGE_SIZE),
     offset: String(offset),
   });
-  if (state.kbQuery) params.set("q", state.kbQuery);
-  if (state.kbCategory) params.set("category", state.kbCategory);
+  if (query) params.set("q", query);
+  if (category) params.set("category", category);
   return params;
 }
 
@@ -4813,45 +4839,80 @@ async function refreshKnowledgeDocuments({ refreshCategories = true } = {}) {
     return;
   }
   const seq = ++kbListSeq;
+  // 查询 / 分类快照：请求发出后用户可能继续输入，响应必须按发起时的
+  // 条件入账（否则新查询的结果会以旧条件渲染）
+  const query = state.kbQuery;
+  const category = state.kbCategory;
+  state.kbListLoading = true;
   // 已有结果时保留列表直到新数据到达（失败不清空、不闪烁）
   if (!state.kbItems.length) {
     els.kbList.textContent = "加载中…";
   }
-  // 刷新期间隐藏「加载更多」：否则点击会以 offset=0 请求第一页
+  // 刷新在途 / 条件与已渲染列表不一致时隐藏「加载更多」：否则点击会以
+  // 新查询 + 旧游标取页，把两个查询的结果混在一起
   updateKnowledgeMore();
   // 分类计数只随库内容变化：关键词搜索的每次防抖刷新都重扫整库会白白
   // 消耗知识库限流额度（与片段列表共用 60 次/分钟桶）
   if (refreshCategories) refreshKnowledgeCategories();
   try {
-    const data = await getJSON(`/api/knowledge/documents?${knowledgeQueryParams(0)}`);
+    const data = await getJSON(
+      `/api/knowledge/documents?${knowledgeQueryParams(0, query, category)}`,
+    );
     if (seq !== kbListSeq) return;
     state.kbTotal = Number(data.total || 0);
     state.kbOffset = (data.items || []).length;
+    state.kbLoadedQuery = query;
+    state.kbLoadedCategory = category;
+    state.kbListFailed = false;
     renderKnowledgeDocuments(data.items || [], false);
   } catch (error) {
     if (seq !== kbListSeq) return;
+    state.kbListFailed = true;
     if (error && error.status === 429) {
-      // 限流（搜索防抖仍可能把 60 次/分钟的桶耗尽）：toast 提示并保留
-      // 已有结果，不能把列表内容替换成错误原文
-      toast(error.message);
+      // 限流（搜索防抖仍可能把 60 次/分钟的桶耗尽）：有结果时 toast 并
+      // 保留列表；首屏为空时给可读的错误文本，不能永远停在「加载中…」
+      if (!state.kbItems.length) {
+        els.kbList.textContent = error.message;
+      } else {
+        toast(error.message);
+      }
     } else {
       els.kbList.textContent = error.message;
       state.kbItems = [];
       state.kbOffset = 0;
       state.kbTotal = 0;
+      state.kbLoadedQuery = null;
+      state.kbLoadedCategory = null;
+    }
+  } finally {
+    if (seq === kbListSeq) {
+      state.kbListLoading = false;
+      updateKnowledgeMore();
     }
   }
-  updateKnowledgeMore();
 }
 
 async function loadMoreKnowledgeDocuments() {
   if (!els.kbList || state.kbSemanticMode) return;
+  if (state.kbListLoading) return;
+  if (
+    state.kbQuery !== state.kbLoadedQuery ||
+    state.kbCategory !== state.kbLoadedCategory
+  ) {
+    // 条件与已渲染列表不一致（刷新失败保留旧结果 / 新查询未成功）：
+    // 以新查询 + 旧游标取页会把两个查询的结果混在一起
+    return;
+  }
   // 自增序号：翻页与刷新互相作废对方响应，避免第一页被追加两次
   const seq = ++kbListSeq;
   els.kbMore.disabled = true;
   try {
     const data = await getJSON(
-      `/api/knowledge/documents?${knowledgeQueryParams(state.kbOffset)}`,
+      `/api/knowledge/documents?${knowledgeQueryParams(
+        state.kbOffset,
+        state.kbLoadedQuery,
+        state.kbLoadedCategory,
+      )}`,
     );
     // 语义检索可能在请求期间开始：不能再把关键词行追加进语义结果
     if (seq !== kbListSeq || state.kbSemanticMode) return;
@@ -4877,7 +4938,11 @@ function updateKnowledgeMore() {
     els.kbMore.hidden = true;
     return;
   }
-  els.kbMore.hidden = state.kbOffset >= state.kbTotal;
+  const aligned =
+    !state.kbListLoading &&
+    state.kbQuery === state.kbLoadedQuery &&
+    state.kbCategory === state.kbLoadedCategory;
+  els.kbMore.hidden = !aligned || state.kbOffset >= state.kbTotal;
 }
 
 function knowledgePreview(content, query) {
@@ -6036,12 +6101,18 @@ function bindEvents() {
   }
   els.kbImport.addEventListener("click", () => els.kbImportFile.click());
   els.kbImportFile.addEventListener("change", importKnowledgeFile);
-  const applyKnowledgeSearch = () => {
+  const applyKnowledgeSearch = (force) => {
     clearTimeout(kbSearchTimer);
+    if (state.kbComposing) {
+      // 防抖定时器落在下一次合成期间：preedit 文本不是用户意图，
+      // 跳过本次；compositionend 会重新调度
+      return;
+    }
     exitKbSemanticMode();
     const query = els.kbSearch.value.trim();
-    // 同值去重：输入法确认 / 焦点事件产生的重复 input 不重复消耗额度
-    if (query === state.kbQuery) return;
+    // 同值去重只用于防抖输入：刷新失败（429 / 网络错误）后的回车重试
+    // 与清空重输必须能再次请求，不能被去重静默吞掉
+    if (!force && query === state.kbQuery && !state.kbListFailed) return;
     state.kbQuery = query;
     refreshKnowledgeDocuments({ refreshCategories: false });
   };
@@ -6049,18 +6120,24 @@ function bindEvents() {
     clearTimeout(kbSearchTimer);
     // 600ms 防抖：服务端每次搜索都整库扫描，并与写入 / 导入共用
     // 60 次/分钟的限流桶——250ms 停顿即发请求会自伤式耗尽额度
-    kbSearchTimer = setTimeout(applyKnowledgeSearch, 600);
+    kbSearchTimer = setTimeout(() => applyKnowledgeSearch(false), 600);
   };
   els.kbSearch.addEventListener("input", (event) => {
     // 输入法合成期间不发请求：合成结束再由 compositionend 触发
     if (event.isComposing) return;
     scheduleKnowledgeSearch();
   });
-  els.kbSearch.addEventListener("compositionend", scheduleKnowledgeSearch);
+  els.kbSearch.addEventListener("compositionstart", () => {
+    state.kbComposing = true;
+  });
+  els.kbSearch.addEventListener("compositionend", () => {
+    state.kbComposing = false;
+    scheduleKnowledgeSearch();
+  });
   els.kbSearch.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
-      applyKnowledgeSearch();
+      applyKnowledgeSearch(true);
     }
   });
   els.kbCategoryFilter.addEventListener("change", () => {

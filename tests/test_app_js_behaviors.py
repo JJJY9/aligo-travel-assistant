@@ -674,21 +674,61 @@ def test_reconcile_confirms_after_open_session():
     assert late["toasts"] == [], late
     # 最终确认发现落后再刷一次（openSession）保证界面包含刚落库的一轮
     assert late["open_calls"] == 2, late
-    # 对账轮询用 5 秒短超时（默认 120 秒会让 ~12 秒判定期在挂起时失效）
+    # 对账轮询用 5 秒短超时（默认 120 秒会让 ~12 秒判定期在挂起时失效），
+    # 最终确认容忍慢响应用 15 秒
     assert late["timeouts"] and all(
-        value == 5000 for value in late["timeouts"]
+        value == 5000 for value in late["timeouts"][:-1]
     ), late
+    assert late["timeouts"][-1] == 15000, late
 
     missing = data["stillMissing"]
     assert missing["input"] == "你好", missing
     assert any("暂未确认保存结果" in item for item in missing["toasts"]), missing
-    assert all(value == 5000 for value in missing["timeouts"]), missing
+    assert all(value == 5000 for value in missing["timeouts"][:-1]), missing
+    assert missing["timeouts"][-1] == 15000, missing
+
+    # 最终确认请求超时 / 失败：结果未知，不能把提问塞回输入框诱导重发
+    confirm_failed = data["confirmFailed"]
+    assert confirm_failed["input"] == "", confirm_failed
+    assert any(
+        "暂未确认保存结果" in item for item in confirm_failed["toasts"]
+    ), confirm_failed
+
+    # 判定期内始终拿不到有效响应：同样只提示、不回填输入框
+    all_failed = data["allFailed"]
+    assert all_failed["input"] == "", all_failed
+    assert all_failed["open_calls"] == 0, all_failed
+    assert any("暂未确认保存结果" in item for item in all_failed["toasts"]), (
+        all_failed
+    )
 
     # 对账期间用户点击了其它会话：不能把旧提问写进当前输入框
     interleaved = data["interleaved"]
     assert interleaved["input"] == "", interleaved
     assert interleaved["toasts"] == [], interleaved
     print("✓ 停止对账按最终确认结果判定是否保存")
+
+
+def test_kb_search_state_machine():
+    """知识库搜索：429 保留列表并隐藏加载更多、回车可重试、合成期不请求。"""
+    data = _run_harness("kbSearchFlow")
+    foo = data["fooState"]
+    assert foo["items"] == 20, foo
+    assert foo["moreHidden"] is False, foo
+
+    limited = data["after429"]
+    assert limited["items"] == 20, "429 不能清空已有结果"
+    assert limited["moreHidden"] is True, "条件与列表不一致时不能显示加载更多"
+    assert any("过于频繁" in item for item in limited["toasts"]), limited
+    assert data["moreBlocked"] is True, "不一致状态下点加载更多不能发请求"
+
+    retried = data["afterRetry"]
+    assert retried["query"] == retried["loaded"] == "bar", retried
+    assert retried["items"] == 1, retried
+
+    assert data["composeBlocked"] is True, "输入法合成期间按回车不能发请求"
+    assert "q=baz" in data["composedUrl"], data
+    print("✓ 知识库搜索状态机（429 / 分页对齐 / 重试 / 输入法）")
 
 
 def test_download_suppresses_concurrency_and_times_out():
@@ -892,6 +932,7 @@ if __name__ == "__main__":
     test_render_markdown_caps_oversized_message()
     test_retry_checks_turn_persisted_first()
     test_download_suppresses_concurrency_and_times_out()
+    test_kb_search_state_machine()
     test_send_message_confirms_pending_edit_draft()
     test_session_html_export_uses_full_server_endpoint()
     test_session_refresh_keeps_expanded_list()
