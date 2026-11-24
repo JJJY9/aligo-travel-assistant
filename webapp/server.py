@@ -3513,6 +3513,23 @@ async def _get_session_marked(
         raise
 
 
+async def _cancel_turn_with_budget(runtime: Any, task: "asyncio.Task[Any]") -> None:
+    """建立共享预算后取消回合并等它停稳（断连与端点取消共用）。
+
+    只 ``task.cancel()`` 不等待时，端点 finally 的 drain 在回合的收尾任务
+    （暂存等待 / 回滚线程）建立之前就返回，用户锁先于旧回合释放——
+    ``begin_drain_cleanup`` 让收尾等待落在同一截止时刻内，``await task``
+    保证释放用户锁前旧回合已停稳。
+    """
+    if runtime is not None:
+        begin = getattr(runtime, "begin_drain_cleanup", None)
+        if callable(begin):
+            begin()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 async def _ask_cancellable_on_disconnect(
     coro: Any,
     request: Request,
@@ -3535,18 +3552,14 @@ async def _ask_cancellable_on_disconnect(
             if await request.is_disconnected():
                 # 取消前建立共享截止时刻：回合协程的暂存等待 / 回滚等待
                 # 与随后的 drain 用同一预算（约 10 秒口径）
-                if runtime is not None:
-                    begin = getattr(runtime, "begin_drain_cleanup", None)
-                    if callable(begin):
-                        begin()
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                await _cancel_turn_with_budget(runtime, task)
                 return None, True
         return await task, False
     except asyncio.CancelledError:
-        # 端点自身被取消（服务关闭 / 上层取消）：回合不能留在后台继续跑
-        task.cancel()
+        # 端点自身被取消（服务关闭 / 上层取消）：回合不能留在后台继续跑。
+        # 与断连分支同一收尾——只 cancel 不等待时，端点 finally 的 drain
+        # 会在回合收尾任务建立前返回，用户锁先于旧回合释放
+        await _cancel_turn_with_budget(runtime, task)
         raise
 
 
@@ -4184,10 +4197,12 @@ def create_app(model: Any = None) -> FastAPI:
         与删除在同一把写锁内完成、逐条复核内容未变化（并发编辑 / 删除不会
         被按过期 id 误删），已消失 / 已变化的条目记入 ``skipped``。
 
-        响应恒带 ``plan_total``（完整计划组数）与 ``truncated``（``plan``
+        2xx 响应恒带 ``plan_total``（完整计划组数）与 ``truncated``（``plan``
         视图是否被截断）：``plan`` 最多 ``MAX_DUPLICATE_GROUPS_FULL`` 组
         （与重复组读接口同一上限，避免单次响应拉进几百 MB），截断只影响
-        返回视图——``dry_run=false`` 的删除始终按全量计划执行。
+        返回视图——``dry_run=false`` 的删除始终按全量计划执行。删除开始后
+        的存储故障逐条记入 ``failed`` 并照常返回（已删部分不可逆，不能
+        变成 503 丢失计划）；503 只出现在尚未开始删除的失败（扫描 / 加载）。
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:

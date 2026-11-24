@@ -1778,6 +1778,38 @@ def test_disconnect_wiring_shares_budget_and_cancels_once():
         assert (result, disconnected) == (None, True), (result, disconnected)
         assert order == ["begin", "cancel"], order
 
+        # 端点自身被取消（服务关闭 / 上层取消）：同样先建预算，取消后等
+        # 回合收尾完成才向外抛——否则端点 finally 的 drain 会在收尾任务
+        # 建立前返回，用户锁先于旧回合释放
+        class _NeverDisconnect:
+            async def is_disconnected(self):
+                return False
+
+        order2: list[str] = []
+
+        async def slow_turn():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                order2.append("cancelled")
+                await asyncio.sleep(0.05)
+                order2.append("cleanup-done")
+                raise
+
+        runtime2 = _Runtime(order2)
+        wrapper = asyncio.ensure_future(
+            _ask_cancellable_on_disconnect(
+                slow_turn(), _NeverDisconnect(), poll_interval=0.01, runtime=runtime2
+            )
+        )
+        await asyncio.sleep(0.05)
+        wrapper.cancel()
+        try:
+            await wrapper
+        except asyncio.CancelledError:
+            pass
+        assert order2 == ["begin", "cancelled", "cleanup-done"], order2
+
         # stop_turn：显式 cancel 只发一次；两次调用共享同一 drain 截止时刻
         lock = asyncio.Lock()
         await lock.acquire()

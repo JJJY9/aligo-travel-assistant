@@ -327,6 +327,32 @@ def test_truncate_records_tombstones_and_clears_seen():
     print("✓ 截断删空清 seen、写墓碑；重放不复活且回填仍可用")
 
 
+def test_truncate_marker_returns_deleted_details_for_replay():
+    """响应丢失后的重放：命中 :op 标记返回删除明细，供调用方补写墓碑。"""
+    from context.short_term_memory import _TRUNCATE_LAST_TURN_LUA
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    key = "aligo:short:v1:u:s"
+    marker = f"{key}:op:lost"
+    payload = _message("Q", "2026-03-11T10:00:00")
+    client.rpush(key, payload)
+    first = client.eval(
+        _TRUNCATE_LAST_TURN_LUA, 2, key, marker, "0", "", "600", "", "", "", "3600"
+    )
+    assert _truncate_count(first) == 1
+    assert client.exists(key) == 0
+    # 标记本身只存计数：已删除的用户内容不随 30 天标记长期滞留
+    marker_value = json.loads(client.get(marker))
+    assert marker_value["count"] == 1 and "deleted" not in marker_value
+    assert int(client.ttl(f"{marker}:del")) > 0
+    second = client.eval(
+        _TRUNCATE_LAST_TURN_LUA, 2, key, marker, "0", "", "600", "", "", "", "3600"
+    )
+    data = json.loads(second)
+    assert data["count"] == 1 and data["deleted"] == [payload], data
+    print("✓ 截断标记存删除明细，重放可取回补写墓碑")
+
+
 def test_clear_before_and_remove_scripts_execute():
     """_CLEAR_BEFORE_LUA / _REMOVE_MESSAGES_LUA 在真实 Lua 下执行并清 seen。"""
     from context.short_term_memory import (
@@ -481,6 +507,7 @@ if __name__ == "__main__":
     test_live_append_mode_ignores_clock_skew()
     test_redis_truncate_respects_turn_id()
     test_truncate_records_tombstones_and_clears_seen()
+    test_truncate_marker_returns_deleted_details_for_replay()
     test_clear_before_and_remove_scripts_execute()
     test_truncate_cutoff_skips_identified_turn()
     print("\n全部通过")

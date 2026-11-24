@@ -654,7 +654,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/knowledge/search` | 语义检索知识片段（`q` / `top_k`，返回相似度） |
 | GET | `/api/knowledge/eval` | 离线检索评测（14 个问题，hit@1/3/5 与 MRR；不调用大模型） |
 | GET | `/api/knowledge/duplicates` | 内容完全相同的独立知识片段组（与 CLI `kb-duplicates` 同一实现；`limit=0` 表示全部，Web 侧最多返回 2000 组并在 `truncated` 标记；无上限的全量审计请用 CLI `kb-duplicates 0`；多分片记录不计为重复） |
-| POST | `/api/knowledge/duplicates/cleanup` | 清理内容完全相同的独立片段（每组保留最小 id，与 CLI `kb-dedupe` 同一语义；JSON body `{"dry_run": true}` 默认只返回计划，`false` 才在写锁内逐条复核并删除，已消失 / 已变化 / 变为多分片的条目记入 `skipped`、删除异常记入 `failed`；响应恒带 `plan_total` 与 `truncated`，`plan` 视图最多 2000 组——截断只影响返回视图，删除始终按全量计划执行；必须 JSON body，跨站表单无法触发） |
+| POST | `/api/knowledge/duplicates/cleanup` | 清理内容完全相同的独立片段（每组保留最小 id，与 CLI `kb-dedupe` 同一语义；JSON body `{"dry_run": true}` 默认只返回计划，`false` 才在写锁内逐条复核并删除，已消失 / 已变化 / 变为多分片的条目记入 `skipped`、删除异常记入 `failed`；2xx 响应恒带 `plan_total` 与 `truncated`，`plan` 视图最多 2000 组——截断只影响返回视图，删除始终按全量计划执行；删除开始后的存储故障逐条记入 `failed` 并照常返回（已删部分不可逆，不变成 503 丢失计划），503 只出现在扫描 / 加载阶段的失败；必须 JSON body，跨站表单无法触发） |
 | DELETE | `/api/knowledge/documents/{id}` | 删除知识片段；`group=1` 时连同同一拆分组的其余分片一起删除（带 `group` 的多分片记录不能单条删除，返回 400 提示整组删除） |
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 20000 条；`dry_run=1` 只返回 `would_import` 不写库） |

@@ -246,12 +246,22 @@ local expected = ARGV[2]
 local marker_ttl = ARGV[3]
 local cutoff = ARGV[4]
 -- 故障重放的一次性标记：脚本已执行（含「无需删除」）但响应丢失时，重试凭
--- 标记直接返回 -1，不会把上一轮同样文本的对话再删一次。脚本在 Redis 中
--- 原子执行，标记与删除不存在「只置标记未删除」的中间态。
+-- 标记不再重复删除。脚本在 Redis 中原子执行，标记与删除不存在「只置标记
+-- 未删除」的中间态。删除明细（含消息原文）存在短 TTL 的 ``<标记>:del``
+-- 旁键里（排队重放窗口），重放据此补写 :tomb 墓碑——响应丢失后调用方拿
+-- 不到删除内容，而删空分支已在脚本内清掉 seen，不补写墓碑会让跨实例排队
+-- 重放把已删除问答写回窗口。标记本身只存计数（30 天）：既保持「重放不再
+-- 删一次」的语义，又不会让已删除的用户内容滞留整个标记生命周期。
+local marker_payload = '{"count":-1,"deleted":[]}'
 if marker then
-  if redis.call('EXISTS', marker) == 1 then return -1 end
+  local prior = redis.call('GET', marker)
+  if prior then
+    local detail = redis.call('GET', marker .. ':del')
+    if detail then return detail end
+    return prior
+  end
   if marker_ttl and marker_ttl ~= '' then
-    redis.call('SET', marker, '1', 'EX', tonumber(marker_ttl))
+    redis.call('SET', marker, marker_payload, 'EX', tonumber(marker_ttl))
   end
 end
 local n = redis.call('LLEN', key)
@@ -407,8 +417,21 @@ else
   end
   redis.call('LTRIM', key, 0, -count - 1)
 end
--- 返回删除明细：调用方据此把被删消息的指纹写入 :tomb 墓碑
-return cjson.encode({count = count, deleted = deleted})
+-- 返回删除明细：调用方据此把被删消息的指纹写入 :tomb 墓碑。明细同时写进
+-- 短 TTL 的 ``<标记>:del`` 旁键（ARGV[7] 为排队重放窗口）：响应丢失时
+-- 重放从旁键取删除明细补写墓碑；标记本身只留计数（见脚本开头）
+local out = cjson.encode({count = count, deleted = deleted})
+if marker and marker_ttl and marker_ttl ~= '' then
+  local detail_ttl = ARGV[7]
+  if detail_ttl and detail_ttl ~= '' then
+    redis.call('SET', marker .. ':del', out, 'EX', tonumber(detail_ttl))
+  end
+  redis.call(
+    'SET', marker, cjson.encode({count = count}),
+    'EX', tonumber(marker_ttl)
+  )
+end
+return out
 """
 
 # 按完整消息项（含时间戳，实际唯一）精确删除故障期间从影子缓存裁掉的
@@ -426,6 +449,27 @@ end
 -- 调用方写入 :tomb 墓碑，重放不会复活已删除内容
 if seen and redis.call('LLEN', key) == 0 then
   redis.call('DEL', seen)
+end
+return 1
+"""
+
+# 原子写入删除墓碑：SADD 指纹、EXPIRE、SREM seen 在同一脚本内完成——分开
+# 执行时「SADD 成功、EXPIRE 失败 / 进程退出」会留下没有 TTL 的 :tomb 键
+# 永不自动过期（同 session_id 复用后回填被永久跳过）。SREM 放在 EXPIRE
+# 之后：即使中途出错，已删除指纹仍留在 seen 里继续挡重放，保护不变。
+# TTL 由调用方取「消息 TTL 与排队重放窗口（_PENDING_MAX_AGE_SEC = 共享墓碑
+# TTL）的较大者」——REDIS_TTL_SEC 调小于 3600 时墓碑不能先于迟到重放过期。
+# ARGV: TTL，然后是指纹列表
+_RECORD_TOMBSTONES_LUA = """
+local tomb = KEYS[1]
+local seen = KEYS[2]
+local ttl = tonumber(ARGV[1])
+for i = 2, #ARGV do
+  redis.call('SADD', tomb, ARGV[i])
+end
+redis.call('EXPIRE', tomb, ttl)
+for i = 2, #ARGV do
+  redis.call('SREM', seen, ARGV[i])
 end
 return 1
 """
@@ -1229,6 +1273,9 @@ class RedisShortTermMemory:
                 cutoff or "",
                 turn_id or "",
                 seen_key(self.key),
+                # 删除明细旁键的短 TTL：与排队操作的最大存活时间一致，
+                # 已删除内容不会随 30 天标记长期滞留
+                str(int(_PENDING_MAX_AGE_SEC)),
             )
             result, replay_deleted = self._parse_truncate_result(raw_result)
             if replay_deleted:
@@ -1238,11 +1285,8 @@ class RedisShortTermMemory:
                     "短期记忆故障期截断重放未匹配（列表末尾已变化），已跳过：%s",
                     self.key,
                 )
-            # 拿到脚本响应后标记不会再被使用，删除避免残留到 TTL
-            try:
-                self.client.delete(self._op_marker_key(op_id))
-            except Exception:  # noqa: BLE001 - 标记带 TTL，删除失败也会过期
-                logger.debug("清理截断标记失败：%s", self.key)
+            # 拿到脚本响应后标记不会再被使用，删除标记与明细旁键避免残留
+            self._forget_marker(op_id)
             ops.pop(0)
         elif kind == "remove":
             if payload:
@@ -1423,8 +1467,12 @@ class RedisShortTermMemory:
     def _remember_deleted(self, deleted: list[str]) -> None:
         """把本次删除消息的指纹写入 ``:tomb`` 墓碑并同步清理 seen。
 
-        墓碑让故障重放 / 长期记忆回填在 seen 被删空清掉后仍然跳过已删除
-        内容；记录失败只记日志（seen / TTL 兜底）。
+        SADD / EXPIRE / SREM 在一个 Lua 脚本里原子完成——分开执行时
+        「SADD 成功、EXPIRE 失败 / 进程退出」会留下没有 TTL 的墓碑键，
+        同 session_id 复用后回填被永久跳过。TTL 取消息 TTL 与排队重放
+        窗口的较大者：REDIS_TTL_SEC 调小时墓碑不会先于迟到的故障重放过期。
+        记录失败按 warning 处理；seen 若仍保留指纹仍可挡住重放，删空场景
+        由调用方在恢复重放时从 :op 标记的删除明细补写。
         """
         ids: list[str] = []
         for raw in deleted:
@@ -1438,16 +1486,24 @@ class RedisShortTermMemory:
                     ids.append(content_id)
         if not ids:
             return
+        ttl = max(self.ttl_sec, int(DEFAULT_TOMBSTONE_TTL_SEC))
         try:
-            self.client.sadd(tomb_key(self.key), *ids)
-            self.client.srem(seen_key(self.key), *ids)
-            self.client.expire(tomb_key(self.key), self.ttl_sec)
-        except Exception as exc:  # noqa: BLE001 - 墓碑写失败由 seen / TTL 兜底
-            logger.debug("记录删除墓碑失败：%s", exc)
+            self.client.eval(
+                _RECORD_TOMBSTONES_LUA,
+                2,
+                tomb_key(self.key),
+                seen_key(self.key),
+                str(ttl),
+                *ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - 墓碑写失败只记日志
+            logger.warning("记录删除墓碑失败：%s", exc)
 
     def _forget_marker(self, op_id: str) -> None:
         try:
-            self.client.delete(self._op_marker_key(op_id))
+            marker = self._op_marker_key(op_id)
+            # 删除明细旁键一并清理：已处理完的删除不应让用户内容继续滞留
+            self.client.delete(marker, f"{marker}:del")
         except Exception:  # noqa: BLE001 - 标记带 TTL，清理失败也会自动过期
             logger.debug("清理截断标记失败：%s", self.key)
 
@@ -1616,6 +1672,9 @@ class RedisShortTermMemory:
                 # 删空整键时一并清 seen（tomb 墓碑由下方 _remember_deleted
                 # 写入被删消息的指纹，重放不会复活）
                 seen_key(self.key),
+                # 删除明细旁键的短 TTL（排队重放窗口）：响应丢失后重放
+                # 据此补写墓碑，用户内容不会滞留整个 30 天标记周期
+                str(int(_PENDING_MAX_AGE_SEC)),
             ),
             fallback,
             on_failure,

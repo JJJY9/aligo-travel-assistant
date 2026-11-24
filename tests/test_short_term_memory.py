@@ -361,6 +361,7 @@ class _FlakyRedis:
         self.tomb: dict[str, set[str]] = {}
         self.markers: dict[str, str] = {}
         self.marker_ttls: list[str] = []
+        self.tomb_ttls: list[int] = []
         self.eval_calls = 0
 
     def _check(self):
@@ -426,6 +427,19 @@ class _FlakyRedis:
         self.eval_calls += 1
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:]) or [""]
+        if "local tomb = KEYS[1]" in script:
+            # 墓碑原子写入：SADD 指纹 + EXPIRE + SREM seen（与真实 Lua 同序）
+            tomb = self.tomb.setdefault(keys[0], set())
+            ids = list(args[1:])
+            tomb.update(ids)
+            self.tomb_ttls.append(int(args[0]) if args and args[0] else 0)
+            seen = self.seen.get(keys[1])
+            if seen is not None:
+                for member in ids:
+                    seen.discard(member)
+                if not seen:
+                    self.seen.pop(keys[1], None)
+            return 1
         if "ipairs(stale)" in script:
             # 条件清空：只删除 cutoff 之前写入的消息；时间戳两侧按
             # _iso_order_key 归一（与真实 Lua 的 timestamp_key 同口径）；
@@ -515,8 +529,13 @@ class _FlakyRedis:
         cutoff = args[3] if len(args) > 3 else ""
         if marker is not None:
             if marker in self.markers:
-                return -1
-            self.markers[marker] = marker_ttl
+                # 与真实 Lua 一致：标记只存计数，删除明细在短 TTL 的
+                # ``:del`` 旁键里（重放据此补写墓碑）；旁键已过期则只回计数
+                detail = self.markers.get(f"{marker}:del")
+                if detail is not None:
+                    return detail
+                return self.markers[marker]
+            self.markers[marker] = '{"count": -1, "deleted": []}'
             self.marker_ttls.append(marker_ttl)
         if not self.data:
             return 0
@@ -592,8 +611,13 @@ class _FlakyRedis:
             seen_key_name = args[5] if len(args) > 5 else ""
             if seen_key_name:
                 self.seen.pop(seen_key_name, None)
-        # 与真实 Lua 一致返回删除明细（调用方据此写墓碑）
-        return json.dumps({"count": count, "deleted": deleted}, ensure_ascii=False)
+        # 与真实 Lua 一致返回删除明细（调用方据此写墓碑），并把明细写进
+        # ``:del`` 旁键（标记只留计数）——响应丢失后的重放从旁键取明细
+        result = json.dumps({"count": count, "deleted": deleted}, ensure_ascii=False)
+        if marker is not None:
+            self.markers[f"{marker}:del"] = result
+            self.markers[marker] = json.dumps({"count": count}, ensure_ascii=False)
+        return result
 
     def llen(self, key):
         self._check()
@@ -1255,6 +1279,65 @@ def test_online_truncate_response_lost_does_not_double_delete(monkeypatch):
     print("✓ 在线截断响应丢失后重放不多删")
 
 
+def test_online_truncate_response_lost_after_empty_records_tombstones(monkeypatch):
+    """截断删空且响应丢失：恢复重放从 :op 标记取删除明细补写墓碑。
+
+    Lua 删空时已清 seen（回填恢复更早轮次），墓碑只能由重放补写——否则
+    另一实例故障期排队的同指纹 add 重放会把已删除问答写回窗口。
+    """
+    from context import short_term_memory as module
+    from context.short_term_memory import _ADD_MESSAGES_LUA
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _EvalApplyThenFailRedis()
+    user = _message("user", "要删除的问题", "2000-01-01T10:00:00")
+    answer = _message("assistant", "要删除的回答", "2000-01-01T10:00:01")
+    client.data = [user, answer]
+    memory = module.RedisShortTermMemory(client, "s-lost", max_turns=5, user_id="u1")
+    client.fail_after_apply = True
+    assert memory.truncate_last_turn("要删除的问题") == 0  # 脚本已执行，响应丢失
+    assert client.data == []
+    assert client.tomb == {}, "在线路径拿不到删除明细，墓碑只能由重放补写"
+    assert client.seen == {}, "删空时 Lua 清 seen（回填恢复更早轮次）"
+
+    client.fail_after_apply = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    reader = module.RedisShortTermMemory(client, "s-lost", max_turns=5, user_id="u1")
+    reader.get_recent_context()  # 触发重放：命中标记取删除明细 → 补写墓碑
+    assert [json.loads(item)["content"] for item in client.data] == []
+    tomb = client.tomb.get(module.tomb_key(reader.key), set())
+    assert len(tomb) == 2, "重放必须为被删的两条消息补写墓碑"
+    assert client.tomb_ttls == [3600], "墓碑 TTL 应取消息 TTL 与重放窗口的较大者"
+    assert reader._pending_ops == []
+
+    # REDIS_TTL_SEC 调小于排队重放窗口（3600s）时，墓碑不能被消息 TTL
+    # 拖短——否则迟到的重放会在墓碑过期后复活已删除轮次
+    short_ttl = module.RedisShortTermMemory(
+        client, "s-ttl-floor", max_turns=5, ttl_sec=600, user_id="u1"
+    )
+    short_ttl._remember_deleted([user, answer])
+    assert client.tomb_ttls[-1] == int(module.DEFAULT_TOMBSTONE_TTL_SEC) == 3600
+
+    # 另一实例故障期排队的同指纹 add 重放：被墓碑挡住，不复活
+    for index, raw in enumerate((user, answer)):
+        pushed = client.eval(
+            _ADD_MESSAGES_LUA,
+            4,
+            reader.key,
+            module.applied_key(reader.key),
+            module.seen_key(reader.key),
+            module.tomb_key(reader.key),
+            "10",
+            "3600",
+            f"op-other-{index}",
+            module.message_content_id(json.loads(raw)),
+            "append",
+            raw,
+        )
+        assert pushed == 0, "已删除的轮次不能被另一实例的重放复活"
+    print("✓ 截断删空响应丢失后重放补写墓碑，重放不复活")
+
+
 def test_clear_then_add_replays_in_order(monkeypatch):
     """故障期先清空再新增：重放顺序为删除后写入，旧对话不会复活。"""
     from context import short_term_memory as module
@@ -1335,7 +1418,9 @@ def test_truncate_marker_cleaned_after_success(monkeypatch):
     memory.add_message("assistant", "A1")
     client.fail_after_apply = True
     assert memory.truncate_last_turn("Q1") == 2  # 回退到影子缓存删除
-    assert len(client.markers) == 1, "响应丢失时标记保留（只在拿到响应后清理）"
+    assert len(client.markers) == 2, (
+        "响应丢失时标记与删除明细旁键都保留（只在拿到响应 / 重放后清理）"
+    )
     print("✓ 截断标记成功即清理、失败时保留")
 
 
