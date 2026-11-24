@@ -169,7 +169,14 @@ def _locked_mutation(func):
                     # 磁盘上的损坏文件直接覆盖且不产生 .corrupt-* 备份
                     self._ensure_corrupt_backed_up()
                     self._reload_latest()
-                    return func(self, *args, **kwargs)
+                    # 修改开始：成功写盘由 _save 复位；中途异常 / 未落盘的
+                    # 修改保持 dirty，下一次重载会把它们丢弃（现行语义）
+                    self._dirty = True
+                    try:
+                        return func(self, *args, **kwargs)
+                    except BaseException:
+                        self._dirty = True
+                        raise
             except TimeoutError as exc:
                 # 写锁超时按持久化失败处理：不触发整轮对话重试 / 熔断器
                 raise MemoryPersistenceError(f"长期记忆写锁等待超时：{exc}") from exc
@@ -276,10 +283,14 @@ class LongTermMemory:
         # 本实例「当场检测到损坏」（区别于载入时发现的历史遗留备份）：
         # 上层守卫在 PostgreSQL 故障回退 JSON 时也只认这一类
         self._fresh_quarantine = False
-        # 已解析内容的磁盘指纹 (ino, size, mtime_ns, ctime_ns)：再次读取前
+        # 已解析内容的磁盘指纹 (ino, size, mtime_ns)：再次读取前
         # 先 stat 比对，未变化就不重复整份解析（导出快照等读路径每请求会
         # 打开新实例，构造时刚解析过同一文件）。None = 尚未确认，必须重载
         self._loaded_stat: tuple[int, int, int] | None = None
+        # 内存快照是否可能领先于磁盘（构造 / 重载成功后为 False；写操作
+        # 开始置 True、成功写盘复位；写失败保持 True 并在下次重载时丢弃
+        # 未落盘的修改）。长寿命实例（交互 REPL）的 reload 据此跳过重读
+        self._dirty = True
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -306,6 +317,7 @@ class LongTermMemory:
                     # 这是身份冲突而不是文件损坏，不能走隔离分支
                     self._check_owner_case(data)
                     self._loaded_stat = _stat_fingerprint(stat_info)
+                    self._dirty = False
                     logger.debug(f"Loaded long-term memory from {self.db_path}")
                     return data
                 except MemoryPersistenceError:
@@ -389,6 +401,7 @@ class LongTermMemory:
                             # MemoryPersistenceError 被当成损坏隔离
                             self._check_owner_case(latest)
                             self._loaded_stat = _stat_fingerprint(recheck_stat)
+                            self._dirty = False
                             logger.info("记忆文件在加载失败后已被并发更新，改用最新内容")
                             return latest
                     except TimeoutError as lock_error:
@@ -897,6 +910,26 @@ class LongTermMemory:
         self._check_owner_case(migrated)
         self.data = migrated
         self._loaded_stat = _stat_fingerprint(reload_stat)
+        self._dirty = False
+
+    def reload_if_changed(self) -> bool:
+        """磁盘自上次加载 / 保存以来是否没有变化（True = 当前实例仍可用）。
+
+        供长寿命实例（交互 REPL）逐命令调用：数据未变时保持当前快照，不必
+        重建实例、整份重读解析；有未落盘修改（写失败 / 写中异常）、损坏
+        待复核或文件已变（其它进程经原子替换写入）时返回 False，调用方
+        走原有重建路径。只取按路径进程 RLock，不等待跨进程文件锁。
+        """
+        with self._write_lock:
+            if self._dirty or self._loaded_stat is None:
+                return False
+            if (
+                self._corrupt_pending
+                or self._fresh_quarantine
+                or self._may_recreate
+            ):
+                return False
+            return self._disk_unchanged()
 
     def _disk_unchanged(self) -> bool:
         """磁盘文件是否仍是上次解析时的那一份（stat 指纹一致才可跳过重载）。
@@ -1250,8 +1283,12 @@ class LongTermMemory:
                 self._loaded_stat = _stat_fingerprint(os.stat(self.db_path))
             except OSError:
                 self._loaded_stat = None
+            self._dirty = False
             return True
         except Exception as e:
+            # 落盘失败：内存里的修改没有磁盘对应物，下一次重载必须丢弃它
+            self._dirty = True
+            self._loaded_stat = None
             logger.error(f"Failed to save long-term memory: {e}")
             return False
 
@@ -2621,6 +2658,10 @@ class LongTermMemory:
                     self._corrupt_pending = False
                     self._fresh_quarantine = False
                     self.data = self._init_data()
+                    # 磁盘已无对应文件：指纹失效、快照按「未落盘」对待，
+                    # 长寿命实例的 reload 必须重建而不是复用
+                    self._loaded_stat = None
+                    self._dirty = True
                     if failed:
                         raise MemoryPersistenceError(
                             "删除长期记忆时无法移除备份文件："

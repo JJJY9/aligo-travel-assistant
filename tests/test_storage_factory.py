@@ -4167,13 +4167,45 @@ def test_recovered_postgres_logs_fallback_warning(monkeypatch):
     print("✓ PG 恢复切换后端时记录回退数据警告")
 
 
-def test_reload_long_term_respects_backend():
+def test_reload_long_term_respects_backend(monkeypatch):
     from context.memory_manager import MemoryManager
+    from config import STORAGE_CONFIG
+    from context.long_term_memory import LongTermMemory
+    from utils.errors import MemoryPersistenceError
 
-    manager = MemoryManager("u-reload", "s-reload", storage_path=tempfile.mkdtemp())
-    original = manager.long_term
+    path = tempfile.mkdtemp()
+    manager = MemoryManager("u-reload", "s-reload", storage_path=path)
+    # 全新账号还没有主文件（指纹未知）：首次 reload 仍重建；写盘后才有
+    # 可比较的磁盘身份
+    manager.long_term.save_preference("hotel_brand", ["汉庭"])
+    kept = manager.long_term
+
+    # 磁盘未变：保留实例（交互 REPL 逐命令调用不再整份重解析）
     manager.reload_long_term()
-    assert manager.long_term is not original, "JSON 快照后端应重新加载"
+    assert manager.long_term is kept, "磁盘未变时不应重建 JSON 实例"
+
+    # 另一实例经原子替换写入：指纹变化 → 重建并看到新数据
+    writer = LongTermMemory("u-reload", path)
+    writer.save_preference("airline", ["东航"])
+    manager.reload_long_term()
+    assert manager.long_term is not kept, "外部写入后必须重建"
+    assert manager.long_term.get_preference()["airline"] == ["东航"]
+    assert manager.long_term.get_preference()["hotel_brand"] == ["汉庭"]
+
+    # 本实例成功写盘后指纹已刷新：保持同一实例
+    written = manager.long_term
+    written.save_preference("seat", ["靠窗"])
+    manager.reload_long_term()
+    assert manager.long_term is written
+
+    # 写失败：未落盘的修改必须在下一次重载时被重建丢弃
+    monkeypatch.setattr(manager.long_term, "_save", lambda: False)
+    with pytest.raises(MemoryPersistenceError):
+        manager.long_term.save_preference("company", ["Acme"])
+    stale = manager.long_term
+    manager.reload_long_term()
+    assert manager.long_term is not stale, "写失败后必须重建，丢弃未落盘修改"
+    assert "company" not in manager.long_term.get_preference()
 
     class _LiveStore:
         snapshot_based = False
@@ -4182,7 +4214,49 @@ def test_reload_long_term_respects_backend():
     manager.long_term = live  # type: ignore[assignment]
     manager.reload_long_term()
     assert manager.long_term is live, "无快照后端不应重建（避免每轮新建连接）"
-    print("✓ 长期记忆重载按后端类型决定")
+
+    # 配置了 PostgreSQL（可能正处于故障回退 JSON）：仍每次重建，交给工厂
+    # 探测恢复并切回 PG；此处只验证重建被触发
+    manager.long_term = LongTermMemory("u-reload", path)  # type: ignore[assignment]
+    rebuilds: list[int] = []
+    monkeypatch.setattr(
+        manager, "_rebuild_long_term", lambda: rebuilds.append(1)
+    )
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://fake")
+    manager.reload_long_term()
+    assert rebuilds == [1], "DSN 配置下必须每次重建以探测 PG 恢复"
+    print("✓ 长期记忆重载按后端类型与磁盘指纹决定")
+
+
+def test_reload_if_changed_tracks_dirty_and_disk():
+    """reload_if_changed：磁盘未变且无未落盘修改时为 True。"""
+    from context.long_term_memory import LongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    path = tempfile.mkdtemp()
+    memory = LongTermMemory("u-ric", path)
+    assert memory.reload_if_changed() is False, (
+        "尚无主文件（指纹未知）时必须重建"
+    )
+    memory.save_preference("hotel_brand", ["汉庭"])
+    assert memory.reload_if_changed() is True, "成功写盘后指纹已刷新"
+
+    other = LongTermMemory("u-ric", path)
+    other.save_preference("airline", ["东航"])
+    assert memory.reload_if_changed() is False, "外部写入后必须重建"
+
+    # 写失败：内存修改未落盘，重建才会丢弃
+    memory2 = LongTermMemory("u-ric2", path)
+    memory2._save = lambda: False  # type: ignore[method-assign]
+    with pytest.raises(MemoryPersistenceError):
+        memory2.save_preference("seat", ["靠窗"])
+    assert memory2.reload_if_changed() is False, "未落盘修改必须走重建"
+
+    # delete_all 后磁盘已无对应文件：同样必须重建
+    memory3 = LongTermMemory("u-ric3", path)
+    memory3.delete_all()
+    assert memory3.reload_if_changed() is False
+    print("✓ reload_if_changed 跟踪脏标记与磁盘指纹")
 
 
 def test_stale_snapshot_does_not_resurrect_trip():
