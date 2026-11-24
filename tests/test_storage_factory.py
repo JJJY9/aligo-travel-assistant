@@ -4479,6 +4479,90 @@ def test_json_export_snapshot_is_consistent():
     print("✓ JSON 导出快照包含第二个实例的外部写入")
 
 
+def test_export_snapshot_skips_reload_when_disk_unchanged(monkeypatch):
+    """构造时刚全量解析过同一文件：磁盘未变时导出快照不得再整份重载。
+
+    读接口（/api/status、/api/sessions、/api/export）每请求新建实例，
+    构造 _load 已解析一次；此前 export_snapshot 无条件 _reload_latest，
+    同一份字节每次请求解析两遍。外部写入（os.replace 换文件身份）仍必须
+    被检出并重载。
+    """
+    storage = tempfile.mkdtemp()
+    memory = LongTermMemory("u-exp-skip", storage)
+    memory.add_chat_message("user", "Q", "s")
+
+    calls: list[int] = []
+    original = LongTermMemory._reload_latest
+
+    def _spy(self):
+        if self is memory:
+            calls.append(1)
+        return original(self)
+
+    monkeypatch.setattr(LongTermMemory, "_reload_latest", _spy)
+    snapshot = memory.export_snapshot()
+    assert calls == [], "磁盘未变时导出快照不得整份重载"
+    assert len(snapshot["chat_history"]) == 1
+    assert memory._disk_unchanged() is True
+
+    other = LongTermMemory("u-exp-skip", storage)
+    other.add_chat_message("user", "Q2", "s")
+    refreshed = memory.export_snapshot()
+    assert calls == [1], "第二个实例写入后必须重载"
+    assert len(refreshed["chat_history"]) == 2
+
+    # 本实例写盘后指纹已刷新：随后的快照读取只需承受写前那一次重载
+    memory.add_chat_message("user", "Q3", "s")
+    assert len(calls) == 2, "写操作自身的重载照旧"
+    memory.export_snapshot()
+    assert len(calls) == 2, "本实例写盘后不必再重载"
+    print("✓ 导出快照按磁盘指纹跳过重复解析（外部写入仍可见）")
+
+
+def test_memory_file_is_compact_and_reloadable():
+    """写入用紧凑 JSON：文件更小（所有进程每次读取都受益），旧读路径照常。"""
+    storage = tempfile.mkdtemp()
+    memory = LongTermMemory("u-compact", storage)
+    memory.save_preference("hotel_brand", ["汉庭"])
+    raw = (Path(storage) / "u-compact.json").read_text(encoding="utf-8")
+    assert "\n  " not in raw, "存储文件不应再带 indent=2 的缩进空白"
+    reloaded = LongTermMemory("u-compact", storage)
+    assert reloaded.get_preference()["hotel_brand"] == ["汉庭"]
+    print("✓ 存储文件紧凑编码且可正常回读")
+
+
+def test_get_chat_history_exclude_limit_matches_full_filter():
+    """排除会话 + limit 的反向窗口与「先全量过滤再取末尾」逐项一致。"""
+    storage = tempfile.mkdtemp()
+    memory = LongTermMemory("u-tail", storage)
+    for index in range(5):
+        memory.add_chat_message("user", f"a{index}", "s-a")
+        memory.add_chat_message("assistant", f"b{index}", "s-b")
+    full = [
+        message
+        for message in memory.get_chat_history()
+        if message.get("session_id") != "s-a"
+    ]
+    assert len(full) == 5
+    for limit in (1, 2, 5, 50):
+        assert (
+            memory.get_chat_history(exclude_session_id="s-a", limit=limit)
+            == full[-limit:]
+        ), limit
+    assert memory.get_chat_history(exclude_session_id="s-a", limit=None) == full
+    assert memory.get_chat_history(exclude_session_id="s-a", limit=0) == full
+    # 负 limit 保持旧切片语义（messages[-limit:]）
+    assert memory.get_chat_history(exclude_session_id="s-a", limit=-2) == full[2:]
+    # session_id 优先于 exclude_session_id（既有契约）
+    only = memory.get_chat_history(
+        session_id="s-a", exclude_session_id="s-b", limit=3
+    )
+    assert len(only) == 3 and all(
+        message["session_id"] == "s-a" for message in only
+    )
+    print("✓ 排除会话的尾部窗口与全量过滤结果一致")
+
+
 def test_memory_manager_export_uses_snapshot():
     """MemoryManager.export_data 优先走 export_snapshot（不再逐项读取）。"""
     from context.memory_manager import MemoryManager

@@ -145,6 +145,54 @@ def test_backup_limit_problem_matches_export_indent_and_surrogates(monkeypatch):
     )
     print("✓ backup_limit_problem 与导出体积口径一致且耐受孤立代理项")
 
+
+def test_precomputed_size_matches_recomputed_and_idempotent_sanitize(monkeypatch):
+    """导出端复用的字节数与自检口径一致；清洗对已清洗数据幂等。"""
+    import json as json_module
+
+    from utils import user_import as module
+    from utils.exporter import sanitize_backup_data
+
+    # 含 NaN / 孤立代理项 / NUL 的脏备份：清洗一次后按导出格式序列化
+    dirty = {
+        "user_id": "u",
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": json_module.dumps(
+                    {"value": float("nan"), "text": "a\x00b"}
+                )
+                + chr(0xD800),
+                "session_id": "s",
+            }
+        ],
+    }
+    cleaned = sanitize_backup_data(dirty)
+    once = json_module.dumps(cleaned, ensure_ascii=False, indent=2)
+    twice = json_module.dumps(
+        sanitize_backup_data(cleaned), ensure_ascii=False, indent=2
+    )
+    assert once == twice, "sanitize_backup_data 对已清洗数据必须幂等"
+    expected = len(once.encode("utf-8"))
+    assert module._backup_payload_size(dirty, crlf=False) == expected, (
+        "precomputed_size 口径必须与 _backup_payload_size(crlf=False) 相同"
+    )
+
+    precomputed = module.backup_limit_problem(
+        dirty, crlf=False, precomputed_size=expected
+    )
+    assert precomputed == module.backup_limit_problem(dirty, crlf=False)
+    assert precomputed is None
+
+    # 收紧上限后两条路径给出一致的问题文案（体积数值相同）
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", expected - 1)
+    via_precomputed = module.backup_limit_problem(
+        dirty, crlf=False, precomputed_size=expected
+    )
+    via_recomputed = module.backup_limit_problem(dirty, crlf=False)
+    assert via_precomputed == via_recomputed and via_precomputed is not None
+    print("✓ precomputed_size 与重算口径一致且清洗幂等")
+
 def test_parse_export_rejects_invalid():
     sections, errors = parse_user_export("not json")
     assert sections == {} and "JSON 解析失败" in errors[0]

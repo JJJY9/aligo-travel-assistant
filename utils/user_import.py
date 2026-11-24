@@ -380,6 +380,7 @@ def _limit_problems(
     *,
     crlf: bool | None = None,
     size_out: dict[str, int] | None = None,
+    precomputed_size: int | None = None,
 ) -> list[tuple[str, str]]:
     """按轴列出导入上限问题（条数在前、体积在后）。
 
@@ -391,6 +392,11 @@ def _limit_problems(
     ``write_text_atomic`` 的落盘口径一致）；``False`` 按 LF（Web
     ``/api/export`` 响应体原样字节）——Windows 上把 LF 备份按 CRLF
     估算会按行多算 1 字节，接近 50 MB 的合法 Web 备份被误判超限。
+
+    ``precomputed_size``：调用方已按导出格式（``ensure_ascii=False``、
+    indent=2、LF、UTF-8）序列化过同一份**已清洗**备份时直接复用字节数，
+    省掉本函数内再清洗深拷贝 + 再序列化一遍（导出端对 37MB 备份会因此
+    多付一份全量工作）。仅在该口径下传入；``crlf`` 此时被忽略。
     """
     problems: list[tuple[str, str]] = []
     messages = backup.get("chat_history")
@@ -422,7 +428,11 @@ def _limit_problems(
                 f"知识片段 {len(knowledge)} 条超过导入上限 {_MAX_KNOWLEDGE}",
             )
         )
-    size = _backup_payload_size(backup, crlf=crlf)
+    size = (
+        precomputed_size
+        if precomputed_size is not None
+        else _backup_payload_size(backup, crlf=crlf)
+    )
     if size_out is not None:
         size_out["size"] = size
     if size > MAX_BACKUP_BYTES:
@@ -464,16 +474,23 @@ def backup_limit_problem(
     *,
     crlf: bool | None = None,
     size_out: dict[str, int] | None = None,
+    precomputed_size: int | None = None,
 ) -> str | None:
     """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
 
     口径与 ``parse_user_export`` / ``import_user_data`` 的硬上限一致：
     条数与备份文件字节上限。返回具体原因或 None。``crlf`` 见
-    :func:`_limit_problems`（Web 通道按 LF 估算）。
+    :func:`_limit_problems`（Web 通道按 LF 估算）；``precomputed_size``
+    的适用前提见同函数说明。
     """
     if not isinstance(backup, dict):
         return None
-    problems = _limit_problems(backup, crlf=crlf, size_out=size_out)
+    problems = _limit_problems(
+        backup,
+        crlf=crlf,
+        size_out=size_out,
+        precomputed_size=precomputed_size,
+    )
     return problems[0][1] if problems else None
 
 
@@ -954,6 +971,7 @@ def export_backup_limit_problem(
     *,
     warning_out: dict[str, Any] | None = None,
     reason_out: dict[str, Any] | None = None,
+    precomputed_size: int | None = None,
 ) -> str | None:
     """导出端自检：原始备份与「导入空库」的知识分片形状都必须可导入。
 
@@ -961,6 +979,10 @@ def export_backup_limit_problem(
     - 原始备份：导入端在规划前就按原始知识行数 / 文件字节拒绝；
     - 空库分片计划：长文档重切分后每片都带元数据，恢复后的体积可能
       大于原始行（#876 的口径），只看原始行会写出无法恢复的备份。
+
+    ``precomputed_size``：原始备份已按导出格式序列化过时传入字节数，
+    省掉第一次体积估算的再次清洗 + 再序列化（见 :func:`_limit_problems`）。
+    分片计划形状（``shaped``）与原始备份字节不同，那次复核**不得**复用。
 
     知识规划失败时返回拒绝原因（无法确认备份可恢复）。``warning_out``
     传入 dict 时回填「恢复时会被跳过的知识行」提示：这些行不会阻断导出
@@ -974,7 +996,12 @@ def export_backup_limit_problem(
     if not isinstance(backup, dict):
         return None
     size_out: dict[str, int] = {}
-    problem = backup_limit_problem(backup, crlf=False, size_out=size_out)
+    problem = backup_limit_problem(
+        backup,
+        crlf=False,
+        size_out=size_out,
+        precomputed_size=precomputed_size,
+    )
     if problem:
         return problem
     shaped: dict[str, Any] = backup
