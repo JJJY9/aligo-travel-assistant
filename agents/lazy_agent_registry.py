@@ -258,8 +258,12 @@ class LazyAgentRegistry:
 
     def __setitem__(self, agent_name: str, agent: Any) -> None:
         """注册自定义智能体（与 dict 注册表同一语义）：写入缓存直接命中。"""
+        # 与 __getitem__ / __delitem__ 同一键：标准名 / 目录名 / 别名 /
+        # 大小写变体必须命中同一缓存项，否则同一技能会出现两个实例、
+        # 注销后注册项残留
+        skill_name = self._resolve_agent_name(agent_name) or str(agent_name)
         with self._load_lock:
-            self.cache[agent_name] = agent
+            self.cache[skill_name] = agent
 
     def __delitem__(self, agent_name: str) -> None:
         """注销智能体：移除缓存实例；未加载过的技能从发现表里移除。"""

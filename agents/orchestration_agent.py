@@ -14,6 +14,7 @@
 - Parallel (并行执行): 同时执行多个智能体（暂不实现）
 """
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -326,6 +327,10 @@ class _TransientAgentError(ConnectionError):
 # utils.agent_names，供轮次元数据等模块共用
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class _AgentTimeoutInternal(Exception):
+    """技能执行超过单智能体上限：内部信号，与技能自身抛出的超时区分。"""
 
 
 class OrchestrationAgent(AgentBase):
@@ -811,6 +816,16 @@ class OrchestrationAgent(AgentBase):
         merged["user_preferences"] = preferences
         return merged
 
+    def _session_deleted_now(self) -> bool:
+        """提交检查点前复查共享墓碑（读取失败按未删除处理，保真优先）。"""
+        check = getattr(self.memory_manager, "session_deleted", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 - 状态不明按未删除处理
+            return False
+
     @staticmethod
     def _retry_cache_key(task: dict) -> str:
         """外层整轮回退重试时的智能体结果缓存键（同一计划内稳定）。"""
@@ -1027,6 +1042,17 @@ class OrchestrationAgent(AgentBase):
             # 模型（一次 429/5xx 曾让同批已成功的智能体整体重发），也不再
             # 重发进度事件（首轮已经展示过）
             return retry_cache[cache_key]
+        timed_out_results = getattr(self, "_timed_out_results", None)
+        if (
+            retry_cache is not None
+            and cache_key
+            and timed_out_results
+            and cache_key in timed_out_results
+        ):
+            # 首轮该智能体已耗尽 300 秒上限：整轮回退重试重新执行会再次
+            # 跑满超时（会话锁最长被占 3×批次数×300 秒），直接复用失败结果
+            # 让重试快速收敛
+            return dict(timed_out_results[cache_key])
         checkpoint_store = self._checkpoint_store_for_turn()
         checkpoint_key = getattr(self, "_checkpoint_key", None)
         if checkpoint_store is not None and checkpoint_key:
@@ -1051,6 +1077,12 @@ class OrchestrationAgent(AgentBase):
         )
         duration = round(time.perf_counter() - started, 2)
         result["duration"] = duration
+        if result.pop("_timed_out", False) and cache_key:
+            timed_out_results = getattr(self, "_timed_out_results", None)
+            if timed_out_results is None:
+                timed_out_results = {}
+                self._timed_out_results = timed_out_results
+            timed_out_results[cache_key] = dict(result)
         self._emit(
             on_event,
             {
@@ -1073,7 +1105,10 @@ class OrchestrationAgent(AgentBase):
             checkpoint_store is not None
             and checkpoint_key
             and result.get("status") == "success"
+            and not self._session_deleted_now()
         ):
+            # 会话删除（CLI / 另一实例）已清理该作用域的检查点：在途回合
+            # 不能再写出新的检查点文件（会残留到 TTL 且含用户数据）
             try:
                 await asyncio.to_thread(
                     checkpoint_store.update_step,
@@ -1178,9 +1213,22 @@ class OrchestrationAgent(AgentBase):
                     max_delay_sec=_AGENT_RETRY_MAX_DELAY,
                 )
 
-            response = await asyncio.wait_for(
-                _load_and_reply(), timeout=_AGENT_TIMEOUT_SEC
-            )
+            # 用 shield + 完成状态区分两种超时：wait_for 上限触发（技能仍
+            # 在跑）与技能自身抛出的 TimeoutError（应走可重试分类，不能
+            # 误报「执行超时（>300 秒）」并吞掉重试与熔断记账）
+            attempt = asyncio.ensure_future(_load_and_reply())
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.shield(attempt), timeout=_AGENT_TIMEOUT_SEC
+                )
+            except asyncio.TimeoutError:
+                if attempt.done() and not attempt.cancelled():
+                    # 上限未触发：是技能自己的 TimeoutError
+                    raise attempt.exception() or asyncio.TimeoutError()
+                attempt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await attempt
+                raise _AgentTimeoutInternal(agent_name) from None
 
             # 解析响应
             if isinstance(response.content, str):
@@ -1217,13 +1265,15 @@ class OrchestrationAgent(AgentBase):
                 "data": result
             }
 
-        except asyncio.TimeoutError:
+        except _AgentTimeoutInternal:
             logger.error("Agent execution timed out: %s", agent_name)
+            # 标记为超时结果：整轮回退重试时不再重新跑满上限（见 _execute_task）
             return {
                 "status": "error",
                 "agent_name": agent_name,
                 "data": {"error": f"执行超时（>{_AGENT_TIMEOUT_SEC:g} 秒）"},
                 "message": "智能体执行超时",
+                "_timed_out": True,
             }
 
         except Exception as e:

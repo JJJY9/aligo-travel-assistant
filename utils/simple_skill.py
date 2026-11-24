@@ -28,6 +28,9 @@ _CONTEXT_MAX_CHARS = 12000
 _CONTEXT_MAX_STRING = 4000
 _CONTEXT_MAX_ITEMS = 40
 _ENVELOPE_KEYS = ("answer", "content", "text", "advice", "reply")
+# previous_results 的裁剪深度：行程 / 校验 / 缺失信息在嵌套 5 层以下，
+# 按默认深度会被整块省略，DAG 依赖的技能拿不到上游结果
+_PREVIOUS_RESULTS_MAX_DEPTH = 9
 
 
 class SimplePromptSkill(AgentBase):
@@ -88,17 +91,19 @@ class SimplePromptSkill(AgentBase):
         return data, user_query
 
     @classmethod
-    def _clip_value(cls, value: Any, depth: int = 0) -> Any:
+    def _clip_value(
+        cls, value: Any, depth: int = 0, max_depth: int = 5
+    ) -> Any:
         """按字段裁剪上下文，尽量保持 JSON 结构完整。"""
         if isinstance(value, str):
             if len(value) > _CONTEXT_MAX_STRING:
                 return value[:_CONTEXT_MAX_STRING] + "…（已截断）"
             return value
         if isinstance(value, list):
-            if depth >= 5:
+            if depth >= max_depth:
                 return f"…（{len(value)} 项已省略）"
             clipped_list = [
-                cls._clip_value(item, depth + 1)
+                cls._clip_value(item, depth + 1, max_depth)
                 for item in value[:_CONTEXT_MAX_ITEMS]
             ]
             if len(value) > _CONTEXT_MAX_ITEMS:
@@ -107,10 +112,10 @@ class SimplePromptSkill(AgentBase):
                 )
             return clipped_list
         if isinstance(value, dict):
-            if depth >= 5:
+            if depth >= max_depth:
                 return f"…（{len(value)} 个字段已省略）"
             clipped_dict = {
-                key: cls._clip_value(item, depth + 1)
+                key: cls._clip_value(item, depth + 1, max_depth)
                 for key, item in list(value.items())[:_CONTEXT_MAX_ITEMS]
             }
             if len(value) > _CONTEXT_MAX_ITEMS:
@@ -121,15 +126,62 @@ class SimplePromptSkill(AgentBase):
         return value
 
     def _clip_context(self, data: dict[str, Any]) -> str:
-        """序列化上下文；超限时按字段裁剪而不是腰斩 JSON。"""
+        """序列化上下文；超限时按字段 / 整项丢弃，绝不腰斩 JSON。
+
+        ``previous_results`` 是固定 DAG 依赖的核心输入（预算 / 交通技能依赖
+        行程规划结果）：给它更深的裁剪深度，且超限时优先丢弃最旧的对话
+        消息而不是砍掉它——字符级腰斩会让数据块不再是合法 JSON。
+        """
         text = json.dumps(data, ensure_ascii=False)
         if len(text) <= _CONTEXT_MAX_CHARS:
             return text
-        clipped = json.dumps(self._clip_value(data), ensure_ascii=False)
-        if len(clipped) > _CONTEXT_MAX_CHARS:
-            # 极端情况（大量短字段）仍超限：保留截断标记，不伪装成完整 JSON
-            clipped = clipped[:_CONTEXT_MAX_CHARS] + "…（上下文过长，已截断）"
-        return clipped
+        clipped_data = {
+            key: self._clip_value(
+                value,
+                max_depth=(
+                    _PREVIOUS_RESULTS_MAX_DEPTH
+                    if key == "previous_results"
+                    else 5
+                ),
+            )
+            for key, value in data.items()
+        }
+        text = json.dumps(clipped_data, ensure_ascii=False)
+        context = clipped_data.get("context")
+        # 从最旧的对话消息开始整条丢弃（长会话里 assistant 消息是完整聚合
+        # JSON，几条就能占满预算）
+        while len(text) > _CONTEXT_MAX_CHARS and isinstance(context, dict):
+            dialogue = context.get("recent_dialogue")
+            if not isinstance(dialogue, list) or not dialogue:
+                break
+            dialogue.pop(0)
+            if not dialogue:
+                context.pop("recent_dialogue", None)
+            text = json.dumps(clipped_data, ensure_ascii=False)
+        # 仍超限：按低优先级整字段丢弃上下文（reason / expected_output 最后）
+        if len(text) > _CONTEXT_MAX_CHARS and isinstance(context, dict):
+            for key in (
+                "long_term_summary",
+                "recent_dialogue",
+                "user_preferences",
+                "rewritten_query",
+            ):
+                if key in context:
+                    context.pop(key, None)
+                    text = json.dumps(clipped_data, ensure_ascii=False)
+                    if len(text) <= _CONTEXT_MAX_CHARS:
+                        break
+        # 极端兜底：整项丢弃最旧的 previous_results（仍保持合法 JSON）
+        if len(text) > _CONTEXT_MAX_CHARS:
+            previous = clipped_data.get("previous_results")
+            while (
+                isinstance(previous, list)
+                and previous
+                and len(text) > _CONTEXT_MAX_CHARS
+            ):
+                previous.pop(0)
+                text = json.dumps(clipped_data, ensure_ascii=False)
+        return text
 
     def _unwrap_answer(self, text: str) -> str:
         """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。"""

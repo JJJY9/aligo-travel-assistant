@@ -512,9 +512,16 @@ def test_template_echo_does_not_schedule_placeholder_agent():
     """模板回显的占位调度 / 占位实体不能当成真实决策与行程字段。"""
     agent = IntentionAgent(name="IntentionAgent", model=_FullTemplateEchoModel())
     data = json.loads(asyncio.run(agent.reply([_user_msg()])).content)
-    assert data["agent_schedule"] == [], data["agent_schedule"]
+    # 全部条目被过滤成空时与编排层同一口径降级为默认信息查询：
+    # 否则用户请求会被静默吞成 no_agents（前端渲染「已记录」）
+    assert [task["agent_name"] for task in data["agent_schedule"]] == [
+        "information_query"
+    ], data["agent_schedule"]
+    assert "未知" in data["reasoning"] or "占位" in data["reasoning"], (
+        data["reasoning"]
+    )
     assert data["key_entities"] == {}, data["key_entities"]
-    print("✓ 模板回显的占位调度与占位实体被清理")
+    print("✓ 模板回显的占位调度被清理并降级默认查询")
 
 
 class _MixedScheduleModel:
