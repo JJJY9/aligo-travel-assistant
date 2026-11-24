@@ -301,7 +301,11 @@ def test_testserver_host_rejected_without_test_env(monkeypatch):
 
 
 def test_side_effect_guard_requires_same_origin_marker():
-    """缺失 Sec-Fetch-Site 不再视为可信：需 X-Aligo-Client 或同源 Referer。"""
+    """缺失 Sec-Fetch-Site 不再视为可信：需 X-Aligo-Client 或 same-origin。
+
+    Referer 不作为同源证据（对所有响应下发 Referrer-Policy: no-referrer，
+    且反代部署下 request.url.scheme 恒为 http，scheme 比较不可信）。
+    """
     client = _client()
     user_id = _unique_user("web_side_effect_guard")
     host = {"Host": "127.0.0.1:8000"}
@@ -317,12 +321,13 @@ def test_side_effect_guard_requires_same_origin_marker():
         )
         assert marked.status_code == 200, marked.text
 
+        # Referer 不再作为同源证据：即使 netloc 与 Host 一致也拒绝
         same_ref = client.get(
             "/api/status",
             params={"user_id": user_id},
             headers={**host, "Referer": "http://127.0.0.1:8000/index.html"},
         )
-        assert same_ref.status_code == 200, same_ref.text
+        assert same_ref.status_code == 403, same_ref.text
 
         bad_ref = client.get(
             "/api/status",
@@ -7449,6 +7454,25 @@ def test_destructive_endpoints_require_json_body():
     assert "application/json" in plain.json()["detail"]
     # 请求体未读即拒绝：必须让连接关闭，客户端别再继续上传
     assert plain.headers.get("connection") == "close", plain.headers
+
+    # 与 FastAPI 严格校验同口径：application/*+json 放行，非 application
+    # 主类型（text/x+json）仍 415
+    structured = client.post(
+        "/api/import",
+        params={"user_id": "u-csrf", "dry_run": 1},
+        content='{"backup": {"preferences": {"home_location": "北京"}}}'.encode(
+            "utf-8"
+        ),
+        headers={"content-type": "application/merge-patch+json"},
+    )
+    assert structured.status_code == 200, structured.text
+    textual = client.post(
+        "/api/import",
+        params={"user_id": "u-csrf"},
+        content=b'{"backup": {"preferences": {}}}',
+        headers={"content-type": "text/x+json"},
+    )
+    assert textual.status_code == 415, textual.text
     print("✓ 破坏性接口拒绝跨站简单请求（JSON body + Content-Type 门禁）")
 
 
@@ -8465,7 +8489,7 @@ def test_chat_rate_limit_rejected_request_does_not_consume_other_bucket():
 
 
 def test_rate_limit_trusted_proxy_headers(monkeypatch):
-    """TRUST_PROXY_HEADERS 开启后按 X-Forwarded-For 第一个地址限流。"""
+    """TRUST_PROXY_HEADERS 开启后按 X-Forwarded-For 最后一跳地址限流。"""
     from config import RATE_LIMIT_CONFIG
     from utils.rate_limit import RateLimiter
 

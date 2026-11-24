@@ -2218,13 +2218,18 @@ def _reject_cross_site_side_effect(request: Request) -> None:
 
     - 面板请求显式携带 ``X-Aligo-Client: web``（跨站简单请求无法自定义头，
       跨源 JS 带自定义头会触发预检而被拒）；
-    - 或 ``Sec-Fetch-Site`` 为 same-origin；
-    - 或 Referer 与当前 Host 同源（HTTP 内网页面导航 / 下载会带）。
+    - 或 ``Sec-Fetch-Site`` 为 same-origin。
 
     ``Sec-Fetch-Site: none``（地址栏 / 书签 / 外部应用链接、经 302 掩码的
     链接）不构成同源证据：外部链接一次点击即可触发全量导出 / 真实 LLM
     调用，因此不再放行；直连这些接口请带 ``X-Aligo-Client: web``。
     CLI / 脚本可直接带 ``X-Aligo-Client: web`` 调用这些接口。
+
+    Referer 不作为同源证据：应用对所有响应（含面板页）下发
+    ``Referrer-Policy: no-referrer``，面板导航 / 下载根本不带 Referer；
+    且 TLS 终止反代下 uvicorn 以 ``proxy_headers=False`` 启动，
+    ``request.url.scheme`` 恒为 http，无法与浏览器实际来源 scheme 比较
+    （https 同源被误杀、http 同主机跨 scheme 被误放行）。
     """
     site = (request.headers.get("sec-fetch-site") or "").lower()
     if site in {"cross-site", "same-site"}:
@@ -2240,25 +2245,6 @@ def _reject_cross_site_side_effect(request: Request) -> None:
         return
     if site == "same-origin":
         return
-    referer = request.headers.get("referer") or ""
-    host = (request.headers.get("host") or "").strip().lower()
-    if referer and host:
-        try:
-            from urllib.parse import urlsplit
-
-            parsed = urlsplit(referer)
-            # 必须绝对 URL 且 scheme 与当前请求一致：同主机不同 scheme
-            # （http 页面打 https 面板或反之）与协议相对串（//host/path）
-            # 都是跨源，只比 netloc 会把它们当成同源放行
-            if (
-                parsed.scheme
-                and parsed.netloc
-                and parsed.scheme.lower() == request.url.scheme.lower()
-                and parsed.netloc.strip().lower() == host
-            ):
-                return
-        except ValueError:
-            pass
     raise HTTPException(
         status_code=403,
         detail=(
@@ -4139,7 +4125,9 @@ def create_app(model: Any = None) -> FastAPI:
         for item in result.get("failed") or []:
             if isinstance(item, dict) and "error" in item:
                 item["error"] = redact_paths(item["error"])
-        return result
+        # plan 里的 content / preview 来自库内原始内容：与重复组读接口同口径
+        # 清洗（孤立代理项不能让清理结果 500——dry_run=false 时会先删后报错）
+        return _json_safe_value(result)
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
@@ -6311,7 +6299,11 @@ def create_app(model: Any = None) -> FastAPI:
         # application/json 与 application/*+json（带参数已剥离），其余
         # （含缺失 / text/plain / 表单）在这一入口统一 415——手动检查早于
         # 64MB 请求体读取，比其它破坏性端点的 422 更明确且能提前断开上传
-        if content_type != "application/json" and not content_type.endswith("+json"):
+        is_json_type = content_type == "application/json" or (
+            content_type.startswith("application/")
+            and content_type.endswith("+json")
+        )
+        if not is_json_type:
             raise HTTPException(
                 status_code=415,
                 detail="备份恢复只接受 application/json 请求体",
