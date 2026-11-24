@@ -587,16 +587,24 @@ class MemoryManager:
         }
 
     def reload_long_term(self) -> None:
-        """重新从磁盘加载长期记忆。
+        """重新从磁盘加载长期记忆（仅在磁盘确实变化时重建实例）。
 
         多会话（如 Web 界面同时开多个标签页）/ 多进程写入后，内存中的快照可能
         过期；在一轮对话开始前调用本方法可避免覆盖其它会话刚写入的数据。
 
         仅对基于内存快照的后端（JSON 文件）需要重建；PostgreSQL 每次调用直接
-        查询数据库，重建反而会每轮新建连接，故跳过。
+        查询数据库，重建反而会每轮新建连接，故跳过。JSON 后端上长寿命实例
+        （交互 REPL 的 status / history / preferences 每条命令都会调用）先查
+        ``reload_if_changed``：磁盘指纹未变且无未落盘修改时保留当前实例，
+        不再整份重读解析；配置了 PostgreSQL 时仍每次重建（工厂借此探测
+        恢复并切回 PG）。
         """
         if not getattr(self.long_term, "snapshot_based", True):
             return
+        if not STORAGE_CONFIG.get("postgres_dsn"):
+            checker = getattr(self.long_term, "reload_if_changed", None)
+            if callable(checker) and checker():
+                return
         self._rebuild_long_term()
 
     def get_context_for_agent(self, long_term_summary: str | None = None, recent_summary: str | None = None) -> str:
