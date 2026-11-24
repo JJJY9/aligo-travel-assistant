@@ -4259,6 +4259,118 @@ def test_reload_if_changed_tracks_dirty_and_disk():
     print("✓ reload_if_changed 跟踪脏标记与磁盘指纹")
 
 
+def test_write_batch_merges_writes_into_single_save(monkeypatch):
+    """批内多次写只重载一次、只写盘一次（含同线程嵌套）。"""
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch", path)
+    saves: list[int] = []
+    real_save = LongTermMemory._save
+
+    def _counting(self):
+        if self is memory:
+            saves.append(1)
+        return real_save(self)
+
+    monkeypatch.setattr(LongTermMemory, "_save", _counting)
+    with memory.write_batch():
+        memory.save_preference("hotel_brand", ["汉庭"])
+        with memory.write_batch():  # 同线程重入：并入外层批
+            memory.save_preference("airline", ["东航"])
+        memory.save_trip_history(
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+            }
+        )
+        assert saves == [], "批内不落盘"
+    assert saves == [1], "整批只写一次"
+    reloaded = LongTermMemory("u-batch", path)
+    preferences = reloaded.get_preference()
+    assert preferences["hotel_brand"] == ["汉庭"]
+    assert preferences["airline"] == ["东航"]
+    assert len(reloaded.get_trip_history(limit=None)) == 1
+    print("✓ write_batch 合并多次写为一次写盘")
+
+
+def test_write_batch_rolls_back_on_error(monkeypatch):
+    """批内异常整体回滚：未落盘的修改被丢弃，磁盘状态保留。"""
+    import pytest
+
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch-rb", path)
+    memory.save_preference("airline", ["东航"])
+    saves: list[int] = []
+    real_save = LongTermMemory._save
+
+    def _counting(self):
+        if self is memory:
+            saves.append(1)
+        return real_save(self)
+
+    monkeypatch.setattr(LongTermMemory, "_save", _counting)
+    with pytest.raises(RuntimeError):
+        with memory.write_batch():
+            memory.save_preference("hotel_brand", ["汉庭"])
+            raise RuntimeError("boom")
+    assert saves == [], "批内异常不应落盘"
+    assert "hotel_brand" not in memory.get_preference(), "内存回滚到磁盘状态"
+    assert memory.get_preference()["airline"] == ["东航"]
+    # 回滚后普通写入仍然可用
+    memory.save_preference("seat", ["靠窗"])
+    assert LongTermMemory("u-batch-rb", path).get_preference()["seat"] == ["靠窗"]
+    print("✓ write_batch 批内异常回滚")
+
+
+def test_write_batch_persist_failure_raises_and_marks_dirty(monkeypatch):
+    """批结束写盘失败：抛出持久化错误并把快照标记为脏（下次重载丢弃）。"""
+    import pytest
+
+    from context.long_term_memory import LongTermMemory
+    from utils.errors import MemoryPersistenceError
+
+    path = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch-fail", path)
+    memory.save_preference("airline", ["东航"])
+    monkeypatch.setattr(memory, "_save", lambda: False)
+    with pytest.raises(MemoryPersistenceError):
+        with memory.write_batch():
+            memory.save_preference("hotel_brand", ["汉庭"])
+    assert memory._dirty is True
+    assert memory.reload_if_changed() is False
+    print("✓ write_batch 写盘失败抛错并保持脏标记")
+
+
+def test_write_batch_serializes_other_threads():
+    """其它线程的写必须等待本批结束，且批后两边的修改都在磁盘上。"""
+    import threading
+
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch-thread", path)
+    memory.save_preference("airline", ["东航"])
+    worker = threading.Thread(
+        target=memory.save_preference, args=("seat", ["靠窗"]), daemon=True
+    )
+    with memory.write_batch():
+        memory.save_preference("hotel_brand", ["汉庭"])
+        worker.start()
+        worker.join(timeout=0.3)
+        assert worker.is_alive(), "其它线程的写必须阻塞到本批结束"
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    reloaded = LongTermMemory("u-batch-thread", path).get_preference()
+    assert reloaded["hotel_brand"] == ["汉庭"]
+    assert reloaded["seat"] == ["靠窗"]
+    print("✓ write_batch 与其它线程的写互斥")
+
+
 def test_stale_snapshot_does_not_resurrect_trip():
     """回合开始时的旧快照写回时，不能把别处刚删除的行程/统计恢复。"""
     from context.long_term_memory import LongTermMemory

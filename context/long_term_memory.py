@@ -2,6 +2,7 @@
 长期记忆 (Long-term Memory)
 持久化存储用户信息，支持跨会话访问
 """
+import contextlib
 import functools
 import json
 import logging
@@ -18,7 +19,7 @@ from collections.abc import Callable
 from datetime import datetime
 from itertools import repeat
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from utils.chat_import import (
     filter_import_messages,
@@ -162,6 +163,15 @@ def _locked_mutation(func):
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        if self._batch_owner == threading.get_ident():
+            # 批量写内部：外层 write_batch 已持锁并重载过；落盘由批结束时
+            # 统一完成，批内异常整批回滚（见 write_batch）
+            self._dirty = True
+            try:
+                return func(self, *args, **kwargs)
+            except BaseException:
+                self._dirty = True
+                raise
         with self._write_lock:
             try:
                 with file_lock(self.db_path):
@@ -291,6 +301,12 @@ class LongTermMemory:
         # 开始置 True、成功写盘复位；写失败保持 True 并在下次重载时丢弃
         # 未落盘的修改）。长寿命实例（交互 REPL）的 reload 据此跳过重读
         self._dirty = True
+        # 批量写（write_batch）：持有者线程 + 重入深度 + 是否有待落盘修改。
+        # 一轮对话的多处落库合并为一次重载 + 一次写回，线程绑定保证其它
+        # 线程的写请求仍各自加锁（阻塞到本批结束）
+        self._batch_owner: int | None = None
+        self._batch_depth = 0
+        self._batch_dirty = False
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
 
@@ -912,6 +928,62 @@ class LongTermMemory:
         self._loaded_stat = _stat_fingerprint(reload_stat)
         self._dirty = False
 
+    @contextlib.contextmanager
+    def write_batch(self) -> Iterator["LongTermMemory"]:
+        """把当前线程的一组写操作合并为一次「重载 + 原子写回」。
+
+        一轮对话的记忆更新包含偏好 / 行程 / 会话元数据等多处落库：逐次写
+        会各自重载并整份重写用户记忆文件（大账号一轮 3-4 次、秒级 I/O）。
+        进入时取写锁 + 跨进程文件锁并重载一次；批内 ``_persist`` 只置脏
+        标记，退出时统一写盘一次；批内异常整体回滚到磁盘状态。仅对当前
+        线程生效（同线程可重入），其它线程的写请求照常各自加锁、等待本批
+        结束后重载，语义与逐次写一致。
+        """
+        tid = threading.get_ident()
+        if self._batch_owner == tid:
+            self._batch_depth += 1
+            try:
+                yield self
+            finally:
+                self._batch_depth -= 1
+            return
+        with self._write_lock:
+            try:
+                with file_lock(self.db_path):
+                    self._ensure_corrupt_backed_up()
+                    self._reload_latest()
+                    self._batch_owner = tid
+                    self._batch_depth = 1
+                    self._batch_dirty = False
+                    try:
+                        yield self
+                    except BaseException:
+                        # 批内失败：丢弃未落盘的修改（磁盘可能仍是旧内容；
+                        # 回滚失败时保持脏标记，下一次重载继续丢弃）
+                        self._batch_owner = None
+                        self._batch_depth = 0
+                        self._batch_dirty = False
+                        try:
+                            self._reload_latest()
+                        except Exception:  # noqa: BLE001 - 回滚尽力而为
+                            self._dirty = True
+                            logger.warning(
+                                "批量写失败后回滚内存快照失败", exc_info=True
+                            )
+                        raise
+                    else:
+                        self._batch_owner = None
+                        self._batch_depth = 0
+                        if self._batch_dirty:
+                            self._batch_dirty = False
+                            self._persist()
+            except TimeoutError as exc:
+                raise MemoryPersistenceError(
+                    f"长期记忆写锁等待超时：{exc}"
+                ) from exc
+            finally:
+                self._may_recreate = False
+
     def reload_if_changed(self) -> bool:
         """磁盘自上次加载 / 保存以来是否没有变化（True = 当前实例仍可用）。
 
@@ -1294,6 +1366,11 @@ class LongTermMemory:
 
     def _persist(self) -> None:
         """写盘失败时抛错，避免上层把未落盘的修改当成功。"""
+        if self._batch_owner == threading.get_ident():
+            # 批量写内部：只登记待落盘，批结束时统一写一次
+            self._dirty = True
+            self._batch_dirty = True
+            return
         if not self._save():
             raise MemoryPersistenceError("长期记忆写入失败")
 

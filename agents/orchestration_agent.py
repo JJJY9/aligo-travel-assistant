@@ -1503,13 +1503,31 @@ class OrchestrationAgent(AgentBase):
         return _trip_field(home)
 
     def _update_memory(self, intention_data: dict[str, Any], results: list[dict]):
-        """
-        更新记忆系统
+        """更新记忆系统（本轮全部落库合并为一次重载 + 一次原子写回）。
+
+        一轮对话通常要写偏好 / 行程 / 会话元数据等多处：JSON 后端逐次写会
+        各自重载并整份重写用户记忆（大账号一轮 3-4 次）。长期记忆提供
+        ``write_batch`` 时把整轮写入合并；PostgreSQL / 测试替身没有该接口
+        时保持原路径。
 
         Args:
             intention_data: 意图识别结果
             results: 智能体执行结果
         """
+        if not self.memory_manager:
+            return
+        long_term = getattr(self.memory_manager, "long_term", None)
+        batch_factory = getattr(long_term, "write_batch", None)
+        if callable(batch_factory):
+            with batch_factory():
+                self._apply_memory_updates(intention_data, results)
+            return
+        self._apply_memory_updates(intention_data, results)
+
+    def _apply_memory_updates(
+        self, intention_data: dict[str, Any], results: list[dict]
+    ):
+        """把智能体结果写入长期记忆（调用方负责加锁 / 批量语义）。"""
         if not self.memory_manager:
             return
 

@@ -505,6 +505,54 @@ def test_failed_itinerary_is_not_saved_as_trip():
     print("✓ 规划失败不写入行程历史")
 
 
+def test_update_memory_batches_long_term_writes(monkeypatch):
+    """一轮内的多处落库合并为一次重载 + 一次写盘（write_batch）。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = _StubMemory()
+    long_term = memory.long_term
+    saves: list[int] = []
+    real_save = LongTermMemory._save
+
+    def _counting(self):
+        if self is long_term:
+            saves.append(1)
+        return real_save(self)
+
+    monkeypatch.setattr(LongTermMemory, "_save", _counting)
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": [
+                            {
+                                "type": "hotel_brand",
+                                "value": ["汉庭"],
+                                "action": "replace",
+                            },
+                            {
+                                "type": "airline",
+                                "value": ["东航"],
+                                "action": "replace",
+                            },
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    assert saves == [1], f"整轮落库应只写盘一次，实际 {len(saves)}"
+    assert long_term.get_preference("hotel_brand") == ["汉庭"]
+    assert long_term.get_preference("airline") == ["东航"]
+    print("✓ 一轮多处落库合并为一次写盘")
+
+
 def test_skill_folder_names_are_canonicalized():
     """调度里使用技能目录名时，结果与行程写入仍按标准智能体名处理。"""
     memory = _StubMemory()
