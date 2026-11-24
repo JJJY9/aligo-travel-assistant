@@ -439,7 +439,10 @@ def _store_cache(
     """
     now = time.monotonic()
     keep_sec = max(CACHE_TTL_SEC, STALE_TTL_SEC)
-    entry_stamp = now if stamp is None else max(0.0, min(now, stamp))
+    # 负锚点是合法的：共享条目的真实年龄可能超过本进程的 monotonic 时钟
+    # （主机 / 容器启动不足 10 分钟），钳到 0 会把旧条目当「刚抓取」，让
+    # 新鲜度 / stale 窗口凭空延长最多一个 CACHE_TTL
+    entry_stamp = now if stamp is None else min(now, stamp)
     with _cache_lock:
         if stamp is not None:
             existing = _cache.get(name)

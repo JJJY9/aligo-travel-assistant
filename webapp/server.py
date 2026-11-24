@@ -1772,16 +1772,24 @@ class AligoWebApp:
         client = self._shared_tombstones(force=True)
         if client is None:
             return 0
-        from utils.tombstones import EPOCH_TTL_SEC, epoch_key
+        from utils.tombstones import EPOCH_TTL_SEC, bump_epoch
 
         now = time.monotonic()
         replayed = 0
         for (user_id, session_id), (token, expires) in pending:
             remaining = expires - now
             key = (user_id, session_id)
+            # 快照之后删除可能已被回滚（unmark 撤销了待补写条目）或同键又有
+            # 新的删除：写前复查，补写一条已撤销的墓碑会把回滚固化成真实删除
+            with self._tombstone_lock:
+                current = self._pending_shared_tombstones.get(key)
+            if current is None or current[0] != token:
+                continue
             if remaining < 1:
                 with self._tombstone_lock:
-                    self._pending_shared_tombstones.pop(key, None)
+                    current = self._pending_shared_tombstones.get(key)
+                    if current is not None and current[0] == token:
+                        self._pending_shared_tombstones.pop(key, None)
                 continue
             try:
                 client.set(
@@ -1790,14 +1798,28 @@ class AligoWebApp:
                     nx=True,
                     ex=max(1, int(remaining)),
                 )
-                epoch = epoch_key(user_id, session_id)
-                client.incr(epoch)
-                client.expire(epoch, int(EPOCH_TTL_SEC))
+                # 写后复查：unmark 已把条目撤销（它的 Redis 删除可能发生在本
+                # 次 SET 之前）时必须补偿删除刚补写的墓碑，否则已回滚的删除
+                # 被固化；token 匹配保证不会误删其它请求的墓碑
+                with self._tombstone_lock:
+                    current = self._pending_shared_tombstones.get(key)
+                    kept = current is not None and current[0] == token
+                if not kept:
+                    client.eval(
+                        _UNMARK_TOMBSTONE_LUA,
+                        1,
+                        self._deleted_key(user_id, session_id),
+                        token,
+                    )
+                    continue
+                bump_epoch(client, user_id, session_id, EPOCH_TTL_SEC)
             except Exception as exc:  # noqa: BLE001 - 保留剩余条目下次再试
                 self._tombstone_failed(exc, "补写")
                 break
             with self._tombstone_lock:
-                self._pending_shared_tombstones.pop(key, None)
+                current = self._pending_shared_tombstones.get(key)
+                if current is not None and current[0] == token:
+                    self._pending_shared_tombstones.pop(key, None)
             replayed += 1
         if replayed:
             self._tombstones_shared = True
@@ -1861,16 +1883,45 @@ class AligoWebApp:
             # 会话纪元：与 utils.tombstones 共用键约定，单调递增且不随墓碑
             # 撤销回退。删除前启动的在途回合在落库守卫处按纪元变化被否决，
             # 「从未存在 / 并发删除后撤销墓碑」的路径不再留下幽灵写回窗口
-            from utils.tombstones import EPOCH_TTL_SEC, epoch_key
+            from utils.tombstones import EPOCH_TTL_SEC, bump_epoch
 
             try:
-                epoch = epoch_key(user_id, session_id)
-                client.incr(epoch)
-                client.expire(epoch, int(EPOCH_TTL_SEC))
+                bump_epoch(client, user_id, session_id, EPOCH_TTL_SEC)
             except Exception as exc:  # noqa: BLE001 - 纪元失败由墓碑兜底
                 logger.warning("写入会话纪元失败：%s", exc)
         self._maybe_replay_pending()
         return token
+
+    def reassert_deleted(self, user_id: str, session_id: str, token: str) -> None:
+        """删除已成功执行：以本请求的 token 重新主张共享墓碑（覆盖旧值）。
+
+        并发删除同一会话时，后到者的 ``SET NX`` 落败、先到者（墓碑所有者）
+        可能因「会话已不存在」回滚并用 token 匹配删掉唯一的共享墓碑：
+        成功删除方在删除后覆盖为自己的 token，原所有者的回滚按旧 token
+        匹配不再命中，已删除会话在其它实例上保留删除保护。
+        覆盖只发生在删除成功之后，不会抢占真正需要回滚的墓碑。
+        """
+        key = self._session_key(user_id, session_id)
+        now = time.monotonic()
+        with self._tombstone_lock:
+            self._deleted_sessions[key] = (now, token)
+            self._deleted_sessions.move_to_end(key)
+        client = self._shared_tombstones(force=True)
+        if client is None:
+            self._remember_pending_tombstone(user_id, session_id, token)
+            return
+        try:
+            client.set(
+                self._deleted_key(user_id, session_id),
+                token,
+                ex=int(self.tombstone_ttl_sec),
+            )
+        except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
+            self._tombstone_failed(exc, "重写")
+            self._remember_pending_tombstone(user_id, session_id, token)
+        else:
+            self._tombstones_shared = True
+            self._tombstone_retry_at = 0.0
 
     def unmark_deleted(
         self, user_id: str, session_id: str, token: str | None = None
@@ -1893,7 +1944,10 @@ class AligoWebApp:
             pending = self._pending_shared_tombstones.get(pending_key)
             if pending is not None and (token is None or pending[0] == token):
                 self._pending_shared_tombstones.pop(pending_key, None)
-        client = self._shared_tombstones()
+        # 回滚是低频关键路径：与 CLI 的 unmark_session_deleted 同一口径跳过
+        # 失败冷却真实触达一次——冷却期静默跳过会让「删除失败但墓碑残留」
+        # 的会话在其它实例上一直不可写
+        client = self._shared_tombstones(force=True)
         if client is None:
             return
         try:
@@ -5087,7 +5141,15 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                 logger.warning("删除会话失败: %s", exc)
                 raise _storage_failure("删除失败", exc) from exc
-            if removed == 0 and not existed and not already_marked:
+            if existed or removed:
+                # 删除成功（含并发中已被其它请求删掉、本次删到 0 条）：以本
+                # 请求 token 重新主张共享墓碑。并发删除时先到者是墓碑所有者，
+                # 它可能因「会话已不存在」回滚并按旧 token 删掉唯一的共享
+                # 墓碑，覆盖后它的回滚不再命中，已删除会话保留删除保护
+                await asyncio.to_thread(
+                    state.reassert_deleted, user_id, session_id, token
+                )
+            elif not already_marked:
                 # 从未存在的 id：撤销本请求的墓碑，允许用该 id 新开对话；
                 # 属于其它实例的共享墓碑因 token 不匹配而保留
                 await asyncio.to_thread(

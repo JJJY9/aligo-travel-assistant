@@ -229,6 +229,32 @@ def test_shared_backfill_keeps_newer_local_entry():
     print("✓ 共享回填不覆盖更新的本地结果")
 
 
+def test_shared_fill_keeps_negative_stamp_on_fresh_boot(monkeypatch):
+    """主机刚启动（monotonic 小于共享条目年龄）时负锚点必须保留，不能钳 0。
+
+    钳 0 会把已接近 10 分钟的共享条目当成「刚抓取」：进程内新鲜度窗口
+    与 stale 兜底窗口都被拉长最多一个 CACHE_TTL。
+    """
+    client = _FakeSharedRedis()
+    payload = {"city": "杭州", "current": {"temperature": 20}, "daily": []}
+    key = weather._cache_key("杭州")
+    client.data[f"aligo:weather:{key}"] = _shared_envelope(
+        payload, fetched_at=time.time() - 500
+    )
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    monkeypatch.setattr(weather.time, "monotonic", lambda: 100.0)
+    assert weather._cache_hit(key) == payload
+    stamp = weather._cache[key][0]
+    # 锚点 = monotonic - 真实年龄：约 -400（墙钟与抓取时刻之间有毫秒级误差）
+    assert -401.0 <= stamp <= -399.0, "锚点必须保留负值（真实抓取时刻）"
+    # 150 秒后真实总龄约 650 秒（> 10 分钟）：进程内条目必须按过期未命中
+    monkeypatch.setattr(weather.time, "monotonic", lambda: 250.0)
+    monkeypatch.setattr(weather, "_shared_cache_get", lambda name: None)
+    assert weather._cache_hit(key) is None, "总龄超过 CACHE_TTL 的条目不能继续命中"
+    print("✓ 刚启动的主机回填共享条目保留负锚点（窗口不翻倍）")
+
+
 @pytest.fixture(autouse=True)
 def _isolate_weather_cache(monkeypatch):
     """天气缓存是进程级全局状态，避免成功 / 失败结果在用例之间泄漏。
@@ -1291,6 +1317,7 @@ if __name__ == "__main__":
         test_shared_cache_failure_enters_cooldown,
         test_shared_cache_ignores_stale_or_invalid_entry,
         test_shared_hit_anchors_age_to_fetch_time,
+        test_shared_fill_keeps_negative_stamp_on_fresh_boot,
         test_shared_fill_respects_cache_limits,
         test_shared_cache_success_resets_redis_availability,
     ):

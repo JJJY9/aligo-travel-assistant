@@ -71,6 +71,35 @@ def epoch_key(user_id: str, session_id: str) -> str:
     return f"{EPOCH_KEY_PREFIX}:{user_id}:{session_id}"
 
 
+# INCR 与 EXPIRE 放在同一脚本里：两条独立命令之间连接错误 / 进程退出会留下
+# 没有 TTL 的永久纪元键，键空间上界（EPOCH_TTL_SEC）失效且全仓库没有删除
+# 纪元键的路径——与 #921 为 aligo:prefver 修复的键空间泄漏同型
+_BUMP_EPOCH_LUA = """
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+return 1
+"""
+
+
+def bump_epoch(
+    client: Any,
+    user_id: str,
+    session_id: str,
+    ttl_sec: float = EPOCH_TTL_SEC,
+) -> None:
+    """用给定客户端原子推进会话纪元（INCR + EXPIRE 单脚本）；失败抛异常。
+
+    Web 端持有自己的共享客户端（可注入 / 可故障冷却），不能走本模块的
+    全局客户端，因此把脚本执行抽出来供两边共用。
+    """
+    client.eval(
+        _BUMP_EPOCH_LUA,
+        1,
+        epoch_key(user_id, session_id),
+        str(max(int(ttl_sec), 1)),
+    )
+
+
 def bump_session_epoch(
     user_id: str,
     session_id: str,
@@ -87,10 +116,8 @@ def bump_session_epoch(
     client = _shared_client(force=force)
     if client is None:
         return
-    key = epoch_key(user_id, session_id)
     try:
-        client.incr(key)
-        client.expire(key, max(int(ttl_sec), 1))
+        bump_epoch(client, user_id, session_id, ttl_sec)
     except Exception as exc:  # noqa: BLE001 - 纪元失败由墓碑兜底
         _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
         logger.warning("写入会话纪元失败：%s", exc)

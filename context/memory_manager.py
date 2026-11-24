@@ -377,6 +377,16 @@ class MemoryManager:
                     self.session_id,
                 )
                 return True
+            if start_value is not None and now_value is None:
+                # 删除一定会把纪元写成非空值（INCR），提交时键消失只可能是
+                # 自然过期 / maxmemory 逐出：不能当成「会话已删除」否决合法
+                # 回合，否则用户整轮回答被静默丢弃
+                logger.warning(
+                    "回合开始时的会话纪元已消失（开始=%s），按墓碑结果放行：%s",
+                    start_value,
+                    self.session_id,
+                )
+                return True
             return start_value == now_value
 
         return guard
