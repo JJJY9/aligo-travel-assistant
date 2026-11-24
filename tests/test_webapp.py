@@ -11111,6 +11111,7 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
 
 def test_knowledge_eval_api(monkeypatch):
     """检索评测接口：返回 hit@K / MRR，带额度头；知识库不可用返回 503。"""
+    from utils.rag_eval import EVAL_CASES
     from utils.rate_limit import RateLimiter
     from webapp import server as server_module
 
@@ -11128,7 +11129,7 @@ def test_knowledge_eval_api(monkeypatch):
     def fake_evaluate(search, **kwargs):
         search("测试", 5)
         return {
-            "total": 14,
+            "total": len(EVAL_CASES),
             "hit1": 0.64,
             "hit3": 0.93,
             "hit5": 1.0,
@@ -11156,7 +11157,7 @@ def test_knowledge_eval_api(monkeypatch):
     response = client.get("/api/knowledge/eval")
     assert response.status_code == 200
     data = response.json()
-    assert data["total"] == 14
+    assert data["total"] == len(EVAL_CASES)
     assert data["hit5"] == 1.0
     assert "x-ratelimit-limit" in response.headers
     assert runs == [True], "评测必须用 strict=True 区分空结果与检索失败"

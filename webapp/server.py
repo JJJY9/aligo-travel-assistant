@@ -4066,7 +4066,8 @@ def create_app(model: Any = None) -> FastAPI:
 
     @app.get("/api/knowledge/eval")
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
-        """离线检索评测：14 个差旅问题计算 hit@1/3/5 与 MRR（不调用大模型）。"""
+        """离线检索评测：30 个差旅问题（覆盖全部随仓库知识文档）计算
+        hit@1/3/5 与 MRR（不调用大模型）。"""
         _reject_cross_site_side_effect(request)
         token = state.eval_lock.acquire()
         if token is None:
@@ -4105,7 +4106,8 @@ def create_app(model: Any = None) -> FastAPI:
             if not agent.initialized:
                 raise HTTPException(status_code=503, detail="RAG 依赖未安装")
             try:
-                # 14 个问题逐个检索，首次会加载嵌入模型；接口为 sync，FastAPI 在线程池执行
+                # 全部评测问题逐个检索，首次会加载嵌入模型；接口为 sync，
+                # FastAPI 在线程池执行
                 from config import RAG_CONFIG
 
                 result = evaluate_retrieval(

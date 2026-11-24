@@ -512,7 +512,7 @@ def test_knowledge_eval_panel_states():
     """「检索评测」按钮：达标 / 低基线+告警 / 失败三种状态与标黄逻辑。"""
     results = _run_harness("eval")
     assert results["ok_text"] == (
-        "检索评测：14 个问题 · hit@1 64% · hit@3 93% · hit@5 100% · MRR 0.80"
+        "检索评测：30 个问题 · hit@1 64% · hit@3 93% · hit@5 100% · MRR 0.80"
         " · 未命中 1 个：「住宿标准」"
     ), results["ok_text"]
     assert results["ok_warn"] is False, "达标时不应标黄"

@@ -105,6 +105,42 @@ def test_min_score_filters_low_similarity_and_warns():
     print("✓ 评测阈值过滤与题库不匹配告警")
 
 
+def test_eval_cases_match_bundled_documents():
+    """题库与随仓库提供的知识文档一致：每个关键词在声明的来源文档中真实
+    出现，且每份文档都有用例覆盖——改知识库或新增文档时题库不会悄悄漂移。"""
+    from pathlib import Path
+
+    from utils.rag_eval import EVAL_CASES
+
+    documents_dir = (
+        Path(__file__).resolve().parent.parent
+        / ".claude"
+        / "skills"
+        / "ask-question"
+        / "data"
+        / "documents"
+    )
+    files = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in documents_dir.glob("*.txt")
+    }
+    assert files, f"找不到随仓库提供的知识文档：{documents_dir}"
+    covered: set[str] = set()
+    for case in EVAL_CASES:
+        assert case.source in files, (
+            f"用例来源不存在：{case.query} -> {case.source!r}"
+        )
+        covered.add(case.source)
+        text = files[case.source].lower()
+        for keyword in case.keywords:
+            assert keyword.lower() in text, (
+                f"关键词未在来源文档中出现：{case.query} -> {keyword}（{case.source}）"
+            )
+    missing = set(files) - covered
+    assert not missing, f"以下知识文档没有任何评测用例覆盖：{sorted(missing)}"
+    print("✓ 评测题库与知识文档一致且全量覆盖")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -116,4 +152,5 @@ if __name__ == "__main__":
     test_mixed_ranks_and_misses()
     test_top_k_truncation()
     test_empty_cases()
+    test_eval_cases_match_bundled_documents()
     print("\n全部通过")

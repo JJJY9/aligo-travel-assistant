@@ -473,7 +473,7 @@ async function scenarioEval(source) {
   let promise = run("runKbEval()");
   await tick();
   env.__requests[0].resolve({
-    total: 14,
+    total: 30,
     hit1: 0.64,
     hit3: 0.93,
     hit5: 1.0,
@@ -492,7 +492,7 @@ async function scenarioEval(source) {
   promise = run("runKbEval()");
   await tick();
   env.__requests[1].resolve({
-    total: 14,
+    total: 30,
     hit1: 0.3,
     hit3: 0.5,
     hit5: 0.6,
@@ -622,7 +622,7 @@ async function scenarioArbitrate(source) {
   const afterDuplicates = run("els.kbEvalResult.textContent");
 
   env.__requests[0].resolve({
-    total: 14,
+    total: 30,
     hit1: 0.6,
     hit3: 0.9,
     hit5: 1.0,
