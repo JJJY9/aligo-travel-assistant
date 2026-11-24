@@ -3465,24 +3465,55 @@ def test_import_accepts_utf8_bom_backup():
         _cleanup(user_id)
 
 
-def test_import_rejects_backup_over_size_limit(monkeypatch):
-    """50 MB 备份上限与 CLI / 面板一致：API 不能接受更大文件。"""
-    from utils import user_import as user_import_module
+def test_import_rejects_oversized_request_body(monkeypatch):
+    """请求体超过 64MB 中间件上限时提前 413。
 
-    monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", 32)
+    端点不再按「50MB + 4KB」预检请求体字节数：备份上限按导出对象衡量，
+    以 Unicode 转义发送的请求体可达对象体积的近 2 倍（见下一个用例），
+    请求体只受 64MB 硬上限约束。
+    """
+    from webapp import server as server_module
+
+    monkeypatch.setitem(server_module._BODY_LIMIT_OVERRIDES, "/api/import", 64)
     client = _client()
-    # 超过 上限 + 4KB 包装余量：Content-Length 预检在读取请求体前拒绝
-    body = b"x" * 5000
     response = client.post(
         "/api/import",
         params={"user_id": _unique_user("web_test_import_big")},
-        content=body,
+        content=b"x" * 4096,
         headers={"Content-Type": "application/json"},
     )
     assert response.status_code == 413, response.text[:300]
-    assert "备份文件不能超过" in response.json()["detail"]
-    # Content-Length 预检在读取请求体前触发：连接必须关闭
-    assert response.headers.get("connection") == "close", response.headers
+
+
+def test_import_accepts_escaped_body_over_backup_limit(monkeypatch):
+    """Unicode 转义放大的请求体不按备份字节上限拒绝（对象本身达标即可）。
+
+    requests 默认 ensure_ascii=True：CJK 内容在请求体里按转义序列展开，
+    体积近乎翻倍。按请求体字节预检会把 27 MB 的合法备份（57 MB 请求体）
+    误判为超过 50 MB。
+    """
+    from utils import user_import as user_import_module
+
+    backup = {"preferences": {"home_location": "北" * 2000}}
+    escaped = json.dumps({"backup": backup}, ensure_ascii=True).encode("utf-8")
+    raw = json.dumps({"backup": backup}, ensure_ascii=False).encode("utf-8")
+    limit = 10_000
+    assert len(raw) < limit < len(escaped), (len(raw), len(escaped))
+    monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", limit)
+    client = _client()
+    user = _unique_user("web_test_import_escape")
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": user, "dry_run": True},
+            content=escaped,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert response.json()["preferences"] == 1
+    finally:
+        _cleanup(user)
+    print("✓ 转义放大的请求体不再被字节上限误拒")
 
 
 def test_import_rejects_backup_over_export_size(monkeypatch):
@@ -6992,6 +7023,143 @@ def test_export_with_knowledge_uses_import_chunk_plan(monkeypatch):
     finally:
         _cleanup(user_id)
     print("✓ with_knowledge 导出按导入分片计划估算体积")
+
+
+def test_export_with_knowledge_filename_and_plain_name(monkeypatch):
+    """含知识段的备份下载名带 _with_knowledge 后缀；普通导出的名称不变。"""
+    from context.storage import create_long_term_memory
+    from utils import knowledge_admin
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_export_kb_name")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("你好", "你好呀", "sess-export-name")
+        monkeypatch.setattr(
+            server_module,
+            "export_documents",
+            lambda: [{"content": "知识", "metadata": {}}],
+        )
+        monkeypatch.setattr(
+            knowledge_admin,
+            "import_documents",
+            lambda rows, dry_run=False, return_pieces=False, **kwargs: {
+                "pieces": [{"content": "知识", "metadata": {}}]
+            },
+        )
+        with_kb = client.get(
+            "/api/export", params={"user_id": user_id, "with_knowledge": 1}
+        )
+        assert with_kb.status_code == 200, with_kb.text[:200]
+        assert "knowledge" in with_kb.json()
+        disposition = with_kb.headers["content-disposition"]
+        assert "_with_knowledge.json" in disposition, disposition
+
+        plain = client.get("/api/export", params={"user_id": user_id})
+        assert plain.status_code == 200, plain.text[:200]
+        plain_disposition = plain.headers["content-disposition"]
+        assert "_with_knowledge" not in plain_disposition, plain_disposition
+    finally:
+        _cleanup(user_id)
+    print("✓ 含知识段备份的下载名与普通备份区分")
+
+
+def test_export_early_rejects_oversized_json_account(monkeypatch):
+    """JSON 存储文件已超上限：导出在读取前拒绝，不做全量读取。"""
+    from utils import user_import
+    from webapp import server as server_module
+
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_export_oversized")
+    path = MEMORY_DIR / f"{user_id}.json"
+    try:
+        # 合法但超限的记忆文件（早期拒绝不能依赖文件损坏）
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.save_preference("home_location", "x" * 4096)
+        assert path.stat().st_size > 1024
+        monkeypatch.setattr(user_import, "MAX_BACKUP_BYTES", 1024)
+        loads = []
+        real_load = server_module._load_user_data
+        monkeypatch.setattr(
+            server_module,
+            "_load_user_data",
+            lambda *args, **kwargs: (loads.append(1), real_load(*args, **kwargs))[1],
+        )
+        response = client.get("/api/export", params={"user_id": user_id})
+        assert response.status_code == 413, response.text[:200]
+        assert "账号数据约" in response.json()["detail"]
+        assert loads == [], "超限账号不应先做全量读取"
+        # md 导出是摘要（不用于恢复），不受备份字节上限约束
+        md = client.get(
+            "/api/export", params={"user_id": user_id, "format": "md"}
+        )
+        assert md.status_code == 200, md.text[:200]
+    finally:
+        path.unlink(missing_ok=True)
+        _cleanup(user_id)
+    print("✓ 超限 JSON 账号的导出在读取前拒绝")
+
+
+def test_import_dry_run_counts_dropped_knowledge():
+    """解析阶段整组丢弃的残缺知识行计入 knowledge_skipped（README 口径）。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_kb_dropped")
+    try:
+        backup = {
+            "preferences": {"home_location": "北京"},
+            "knowledge": [
+                {
+                    "content": "缺片组的分片",
+                    "metadata": {"group": "g1", "part": "1", "parts": "2"},
+                },
+                {"content": "有效的独立片段", "metadata": {}},
+            ],
+        }
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id, "dry_run": True},
+            json={"backup": backup},
+        )
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        assert payload["knowledge_skipped"] == 1, payload
+        assert any(
+            "知识分片组" in item for item in payload["skipped"]
+        ), payload["skipped"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 解析丢弃的知识行计入 knowledge_skipped")
+
+
+def test_import_skips_oversized_preference_value():
+    """恢复按条跳过超大偏好值（面板之后无法再保存的存量值）。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_pref_big")
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id, "dry_run": True},
+            json={
+                "backup": {
+                    "preferences": {
+                        "home_location": "北京",
+                        "oversized": "x" * 10001,
+                    }
+                }
+            },
+        )
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        assert payload["preferences"] == 1, payload
+        assert any(
+            "序列化后超过" in item for item in payload["skipped"]
+        ), payload["skipped"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 超大偏好值在恢复时按条跳过")
 
 
 def test_knowledge_volume_rows_fails_closed_on_planning_error(monkeypatch):
@@ -13020,7 +13188,10 @@ def test_import_body_parsed_off_event_loop(monkeypatch):
     monkeypatch.setattr(
         user_import_module,
         "parse_user_export_data",
-        lambda backup: ({"messages": [], "titles": {}, "pinned": [], "archived": [], "trips": []}, []),
+        lambda backup, stats_out=None: (
+            {"messages": [], "titles": {}, "pinned": [], "archived": [], "trips": []},
+            [],
+        ),
     )
     monkeypatch.setattr(
         user_import_module,

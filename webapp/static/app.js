@@ -1848,6 +1848,20 @@ async function importUserBackup() {
   // 恢复目标身份在选择文件时确定：读取文件期间可能切换用户，确认框与
   // 请求都必须写进当初选择的用户，不能跟着 state.userId 漂移
   const targetUser = state.userId;
+  // 读取 / 解析期间也占住入口：大备份读取可达数秒，此前按钮要到确认之后
+  // 才禁用，期间可再次打开文件选择并发启动第二个恢复（双确认、双 POST）
+  els.importData.disabled = true;
+  els.importData.textContent = "读取中…";
+  try {
+    await _runUserBackupImport(file, targetUser);
+  } finally {
+    els.importData.disabled = false;
+    els.importData.textContent = "恢复备份";
+  }
+}
+
+async function _runUserBackupImport(file, targetUser) {
+  if (!file) return;
   let backupText;
   try {
     // 严格 UTF-8 解码：GBK / ANSI 备份此前被静默替换成 U+FFFD 仍能导入，
@@ -1900,7 +1914,6 @@ async function importUserBackup() {
       knowledgeNote,
   );
   if (!confirmed) return;
-  els.importData.disabled = true;
   els.importData.textContent = "恢复中…";
   try {
     // 大备份的批量写入可能跑几分钟（单 worker + 用户锁）：默认 120 秒
@@ -1914,7 +1927,9 @@ async function importUserBackup() {
       },
       600000,
     );
-    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    // 服务端 skipped 是「处理说明」列表（含未跳过的保留说明与一条概括
+    // 多条截断的汇总），不能当跳过条数：跳过口径用结构化计数
+    const messagesSkipped = Number(result.messages_skipped || 0);
     const knowledgeNote =
       result.knowledge_imported || result.knowledge_skipped
         ? `，知识片段新增 ${result.knowledge_imported} / 跳过 ${result.knowledge_skipped} 条`
@@ -1926,7 +1941,7 @@ async function importUserBackup() {
       `${restorePrefix}偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
       `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
       knowledgeNote +
-      (skipped ? `，跳过 ${skipped} 项` : "");
+      (messagesSkipped ? `，跳过重复消息 ${messagesSkipped} 条` : "");
     if (result.knowledge_error) {
       // 与摘要合并成一条：同一 tick 的第二次 toast 会复用同一元素并重置
       // 计时，恢复计数摘要永远不会显示，只剩知识片段失败提示
@@ -1946,13 +1961,15 @@ async function importUserBackup() {
     if (state.userId !== targetUser) {
       // 面板刷新会显示新用户的旧数据，跳过刷新
     } else {
-      await Promise.all([
-        refreshStatus(),
-        loadSessions(),
+      // 刷新一律静默且互不阻断：任一子刷新失败（限流 / 存储抖动）产生的
+      // toast 会在同一 tick 覆盖刚显示的恢复摘要
+      await Promise.allSettled([
+        refreshStatus({ silentFailure: true }),
+        loadSessions(undefined, { silentFailure: true }),
         refreshKnowledge(),
         // 备份可能带 knowledge 段：片段列表与分类同步刷新，否则库 chip 显示
         // 新增数量、下方列表仍是恢复前的旧数据
-        refreshKnowledgeDocuments(),
+        refreshKnowledgeDocuments({ silentFailure: true }),
         refreshKnowledgeCategories(),
       ]);
       // 当前会话若也在备份里，重拉一次展示恢复出的消息；不在时保留现有界面。
@@ -1971,20 +1988,32 @@ async function importUserBackup() {
       }
     }
   } catch (error) {
-    if (String(error.message || "").includes("超时")) {
+    const errorText = String(error.message || "");
+    const status = Number(error.status || 0);
+    if (status === 408) {
+      // 408 = 请求体读取超时：服务端尚未解析、零写入，可安全重试
+      toast("上传超时：备份未写入服务器，请重试（网络较慢时可换更小的备份）");
+    } else if (status === 503 && errorText.startsWith("恢复部分完成")) {
+      // 批量写入中途失败：部分数据已落库，如实展示服务端文案并刷新视图
+      toast(errorText);
+      if (state.userId === targetUser) {
+        await Promise.allSettled([
+          refreshStatus({ silentFailure: true }),
+          loadSessions(undefined, { silentFailure: true }),
+          refreshKnowledgeDocuments({ silentFailure: true }),
+        ]);
+      }
+    } else if (!status && errorText.includes("超时")) {
       // 客户端放弃等待不代表服务端没在写：单 worker 队列 / 大批量写入
       // 仍会继续，如实提示并尽力刷新一次当前视图
       toast("恢复请求超时：服务端可能仍在写入，请稍后刷新面板确认结果");
       if (state.userId === targetUser) {
-        refreshStatus();
-        loadSessions();
+        refreshStatus({ silentFailure: true });
+        loadSessions(undefined, { silentFailure: true });
       }
     } else {
-      toast(`恢复失败：${error.message}`);
+      toast(`恢复失败：${errorText}`);
     }
-  } finally {
-    els.importData.disabled = false;
-    els.importData.textContent = "恢复备份";
   }
 }
 
@@ -2666,7 +2695,10 @@ async function loadSessions(query = state.searchQuery, options = {}) {
       updateArchivedToggle();
     }
     // 存储故障 / 网络抖动不能伪装成「没有历史」：保留已有列表并提示
-    toast(`加载会话列表失败：${error.message || error}`);
+    // （恢复备份后的批量刷新走静默：失败提示会覆盖恢复摘要）
+    if (!options.silentFailure) {
+      toast(`加载会话列表失败：${error.message || error}`);
+    }
     if (!state.sessions.length) {
       // 空列表也要让调用方（归档切换）知道失败并回滚状态位；列表内容
       // 已清空，渲染快照随之失效（任何查询都可重试）
@@ -4901,7 +4933,9 @@ async function refreshKnowledgeCategories() {
   }
 }
 
-async function refreshKnowledgeDocuments({ refreshCategories = true } = {}) {
+async function refreshKnowledgeDocuments(
+  { refreshCategories = true, silentFailure = false } = {},
+) {
   if (!els.kbList) return;
   if (state.kbSemanticMode) {
     // 保持在语义检索模式：删除 / 编辑 / 导入后刷新的是当前语义结果，
@@ -4947,7 +4981,7 @@ async function refreshKnowledgeDocuments({ refreshCategories = true } = {}) {
       // 保留列表；首屏为空时给可读的错误文本，不能永远停在「加载中…」
       if (!state.kbItems.length) {
         els.kbList.textContent = error.message;
-      } else {
+      } else if (!silentFailure) {
         toast(error.message);
       }
     } else {

@@ -3231,7 +3231,7 @@ def run_user_export_standalone(
             return 1
 
     from utils.exporter import sanitize_backup_data
-    from utils.user_import import backup_limit_problem, export_backup_limit_problem
+    from utils.user_import import export_backup_limit_problem
 
     # 预检必须与落盘内容同口径：export_files 写盘前会 sanitize_backup_data
     # （孤立代理项转义 / 非有限数归一），Web /api/export 同样先清洗再预检。
@@ -3255,7 +3255,7 @@ def run_user_export_standalone(
         without_knowledge = {
             key: value for key, value in data.items() if key != "knowledge"
         }
-        if backup_limit_problem(without_knowledge, crlf=False) is None:
+        if export_backup_limit_problem(without_knowledge) is None:
             data = without_knowledge
             if reasons.get("knowledge") == "planning-failed":
                 knowledge_omitted = (
@@ -3354,7 +3354,8 @@ def run_user_import_standalone(
     except OSError as exc:
         return _fail(f"读取备份失败：{exc}")
 
-    sections, errors = parse_user_export(text)
+    parse_stats: dict[str, int] = {}
+    sections, errors = parse_user_export(text, stats_out=parse_stats)
     if skip_knowledge:
         sections.pop("knowledge", None)
     # 只含 knowledge 段的备份在 --skip-knowledge 后没有用户数据可恢复：
@@ -3538,6 +3539,14 @@ def run_user_import_standalone(
         if callable(close):
             close()
 
+    # 解析阶段整组丢弃的残缺知识分片不会进入 import_documents：并入
+    # knowledge_skipped（README 承诺这些行恢复时计入该计数）；
+    # --skip-knowledge 是用户主动跳过，不把解析丢弃算作跳过
+    dropped_knowledge = int(parse_stats.get("knowledge_dropped") or 0)
+    if dropped_knowledge and not skip_knowledge:
+        counts["knowledge_skipped"] = (
+            int(counts.get("knowledge_skipped") or 0) + dropped_knowledge
+        )
     knowledge_error = str(counts.pop("knowledge_error", "") or "")
     incomplete = bool(counts.pop("recovery_incomplete", False))
     ok = not knowledge_error and not incomplete

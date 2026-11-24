@@ -876,7 +876,23 @@ def test_user_backup_restore_reports_recovery_incomplete():
         "知识片段未恢复" in toast and "用户数据未恢复" in toast
         for toast in data["combo_toasts"]
     ), data
-    print("✓ 恢复完成度提示接入 toast")
+
+    # 408 = 请求体读取超时（服务端零写入）：不能提示「服务端可能仍在写入」
+    timeouts = data["upload_timeout_toasts"]
+    assert timeouts and "备份未写入服务器" in timeouts[-1], timeouts
+    assert all("恢复失败" not in toast for toast in timeouts), timeouts
+    # 部分完成 503：如实展示服务端文案并刷新视图，不加「恢复失败：」前缀
+    partial = data["partial_toasts"]
+    assert partial and partial[-1].startswith("恢复部分完成"), partial
+    assert data["partial_refreshes"] >= 1, data
+    # 普通失败保持统一前缀
+    assert any(
+        toast.startswith("恢复失败：") for toast in data["failure_toasts"]
+    ), data
+    # 成功后的刷新失败全部静默：恢复摘要不能被刷新错误覆盖
+    silent = data["silent_refresh_toasts"]
+    assert len(silent) == 1 and "已恢复" in silent[0], silent
+    print("✓ 恢复完成度提示与错误分支接入 toast")
 
 
 def test_upcoming_weather_normalizes_unpadded_start_date():

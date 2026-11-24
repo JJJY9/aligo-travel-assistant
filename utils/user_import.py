@@ -48,6 +48,10 @@ _MAX_TRIP_ID_DIGITS = 18
 _MAX_KNOWLEDGE_PARTS = 100000
 # 单个备份文件的体积上限：整份读入内存之前先拒绝明显异常的输入
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
+# 单个偏好值序列化后的字符上限：与 Web PUT /api/preferences 的
+# _PREFERENCE_VALUE_MAX_JSON、CLI 偏好编辑同一口径——恢复不能写进
+# 面板自身拒绝保存的超大值（之后编辑该偏好必然失败）
+PREFERENCE_VALUE_MAX_CHARS = 10000
 
 # 导出形状里的 user_id 占位：合法 user_id 最多 64 个字符，字符集允许
 # Unicode 字母（含 4 字节的扩展平面字符，最多 256 字节）。按 ASCII 或
@@ -372,7 +376,10 @@ def _assistant_content_problem(content: str) -> str | None:
 
 
 def _limit_problems(
-    backup: dict[str, Any], *, crlf: bool | None = None
+    backup: dict[str, Any],
+    *,
+    crlf: bool | None = None,
+    size_out: dict[str, int] | None = None,
 ) -> list[tuple[str, str]]:
     """按轴列出导入上限问题（条数在前、体积在后）。
 
@@ -416,6 +423,8 @@ def _limit_problems(
             )
         )
     size = _backup_payload_size(backup, crlf=crlf)
+    if size_out is not None:
+        size_out["size"] = size
     if size > MAX_BACKUP_BYTES:
         problems.append(
             (
@@ -451,7 +460,10 @@ def _backup_payload_size(
 
 
 def backup_limit_problem(
-    backup: dict[str, Any], *, crlf: bool | None = None
+    backup: dict[str, Any],
+    *,
+    crlf: bool | None = None,
+    size_out: dict[str, int] | None = None,
 ) -> str | None:
     """导出的备份是否超出导入侧上限（超出的备份永远无法恢复）。
 
@@ -461,7 +473,7 @@ def backup_limit_problem(
     """
     if not isinstance(backup, dict):
         return None
-    problems = _limit_problems(backup, crlf=crlf)
+    problems = _limit_problems(backup, crlf=crlf, size_out=size_out)
     return problems[0][1] if problems else None
 
 
@@ -922,6 +934,9 @@ def knowledge_rows_for_volume_check(
         return None
     if skip_out is not None and isinstance(plan, dict):
         groups = plan.get("skipped_groups")
+        # skipped_invalid 已按行计入坏组内的每个分片（knowledge_admin 的
+        # planner 口径）：skipped_groups 只是组数，仅供提示文案，不能再与
+        # 行数相加——否则跳过条数会超过备份里的知识行总数
         skip_out["skipped_invalid"] = int(
             plan.get("skipped_invalid") or 0
         )
@@ -958,31 +973,52 @@ def export_backup_limit_problem(
     """
     if not isinstance(backup, dict):
         return None
-    problem = backup_limit_problem(backup, crlf=False)
+    size_out: dict[str, int] = {}
+    problem = backup_limit_problem(backup, crlf=False, size_out=size_out)
     if problem:
         return problem
-    knowledge = backup.get("knowledge")
-    if not isinstance(knowledge, list) or not knowledge:
-        return None
+    shaped: dict[str, Any] = backup
     skip_counts: dict[str, int] = {}
-    planned = knowledge_rows_for_volume_check(
-        knowledge, skip_out=skip_counts
-    )
-    if planned is None:
-        if reason_out is not None:
-            reason_out["knowledge"] = "planning-failed"
-        return (
-            "知识片段无法按导入规则规划，无法确认备份可恢复；"
-            "请稍后重试（知识库忙时暂停写入）"
+    knowledge = backup.get("knowledge")
+    if isinstance(knowledge, list) and knowledge:
+        planned = knowledge_rows_for_volume_check(
+            knowledge, skip_out=skip_counts
         )
-    problem = backup_limit_problem(
-        {**backup, "knowledge": planned}, crlf=False
+        if planned is None:
+            if reason_out is not None:
+                reason_out["knowledge"] = "planning-failed"
+            return (
+                "知识片段无法按导入规则规划，无法确认备份可恢复；"
+                "请稍后重试（知识库忙时暂停写入）"
+            )
+        shaped = {**backup, "knowledge": planned}
+        problem = backup_limit_problem(
+            shaped, crlf=False, size_out=size_out
+        )
+        if problem:
+            if reason_out is not None:
+                reason_out["knowledge"] = "over-limit"
+            return problem
+    # 落库形状复核：恢复端会把消息时间戳归一为带时区 32 字符、补齐行程
+    # 编号 / 时间戳并重算统计——只按原始文件形状自检会产出「导出 200、
+    # 恢复到新账号 413」的不可恢复备份。只在逼近上限时精确复核（解析 +
+    # 重组整份导出 payload 的代价与导出本身同量级，逐条裸算不值得）。
+    messages = shaped.get("chat_history")
+    trips = shaped.get("trip_history")
+    margin = (
+        64 * (len(messages) if isinstance(messages, list) else 0)
+        + 512 * (len(trips) if isinstance(trips, list) else 0)
+        + 4096
     )
-    if problem:
-        if reason_out is not None:
-            reason_out["knowledge"] = "over-limit"
-        return problem
-    total_skipped = sum(skip_counts.values())
+    if size_out.get("size", 0) + margin > MAX_BACKUP_BYTES:
+        shape_problem = _post_restore_shape_problem(shaped)
+        if shape_problem:
+            return f"恢复后{shape_problem}"
+    # 行数口径：skipped_invalid 已含坏组内的各分片行，skipped_groups 只是
+    # 组数，不能再相加（否则跳过条数会超过备份里的知识行总数）
+    total_skipped = skip_counts.get(
+        "skipped_invalid", 0
+    ) + skip_counts.get("skipped_conflict", 0)
     if warning_out is not None and total_skipped:
         warning_out["knowledge_skipped_count"] = total_skipped
         warning_out["knowledge_skipped"] = (
@@ -991,6 +1027,36 @@ def export_backup_limit_problem(
             "备份中的用户数据仍可恢复"
         )
     return None
+
+
+def _post_restore_shape_problem(backup: dict[str, Any]) -> str | None:
+    """按导入端的落库形状复核 50MB（导出 200 / 导入 413 的非对称修复）。
+
+    解析失败按原口径放行：能走到这里说明原始备份已通过全部结构预检，
+    解析异常属于内部问题，不应把合法导出误拒。``pg_shape`` 取当前部署
+    后端——恢复到同部署的新账号是最常见场景，也是导出承诺的可恢复性
+    口径。
+    """
+    try:
+        sections, _errors = parse_user_export_data(backup)
+    except Exception:  # noqa: BLE001 - 见 docstring
+        return None
+    if not isinstance(sections, dict):
+        return None
+    try:
+        from config import STORAGE_CONFIG
+
+        pg_shape = bool(STORAGE_CONFIG.get("postgres_dsn"))
+    except Exception:  # noqa: BLE001 - 配置不可读时按 JSON 口径
+        pg_shape = False
+    return sections_limit_problem(
+        sections,
+        pg_shape=pg_shape,
+        existing=None,
+        conservative=True,
+        crlf=False,
+        user_id=str(backup.get("user_id") or "") or None,
+    )
 
 
 def _export_shape_baseline(
@@ -1429,7 +1495,9 @@ def sections_limit_problem(
     return None
 
 
-def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
+def parse_user_export(
+    text: str, *, stats_out: dict[str, int] | None = None
+) -> tuple[dict[str, Any], list[str]]:
     """解析并校验 user-export JSON 文本，返回 ``(可恢复数据, 错误列表)``。"""
     try:
         data = json.loads(text)
@@ -1439,20 +1507,37 @@ def parse_user_export(text: str) -> tuple[dict[str, Any], list[str]]:
         return {}, ["JSON 嵌套过深，无法解析"]
     except (TypeError, ValueError) as exc:
         return {}, [f"JSON 解析失败：{exc}"]
-    return parse_user_export_data(data)
+    return parse_user_export_data(data, stats_out=stats_out)
 
 
-def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
+def parse_user_export_data(
+    data: Any, *, stats_out: dict[str, int] | None = None
+) -> tuple[dict[str, Any], list[str]]:
     """校验已解析的 user-export JSON 对象（CLI 文本路径与 Web API 共用）。
 
     可恢复数据键：preferences / trips / messages / titles / pinned / archived。
     没有任何可恢复数据时返回空 dict（错误列表说明原因）。
+
+    ``stats_out`` 传入 dict 时回填 ``knowledge_dropped``：备份里存在、但
+    在解析阶段被丢弃的知识行数（非法行 / 残缺分片组）。这些行不会进入
+    :func:`import_user_data` 的 ``knowledge_skipped``，调用方据此把它并入
+    恢复结果，与 README「恢复时计入 knowledge_skipped」的口径一致。
     """
+
+    def _stats(dropped: int = 0) -> None:
+        if stats_out is not None:
+            stats_out["knowledge_dropped"] = max(0, int(dropped))
+
     if not isinstance(data, dict):
+        _stats()
         return {}, ["文件内容不是 JSON 对象"]
 
     errors: list[str] = []
     sections: dict[str, Any] = {}
+    raw_knowledge = data.get("knowledge")
+    raw_knowledge_count = (
+        len(raw_knowledge) if isinstance(raw_knowledge, list) else 0
+    )
 
     raw_preferences = data.get("preferences")
     if raw_preferences is not None and not isinstance(raw_preferences, dict):
@@ -1492,6 +1577,18 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
         if _content_beyond_export_depth(value, _PREFERENCE_EXPORT_DEPTH):
             errors.append(
                 f"跳过第 {index} 个偏好：嵌套过深（超过导出保存深度）"
+            )
+            continue
+        try:
+            value_size = len(json.dumps(value, ensure_ascii=False))
+        except (TypeError, ValueError):
+            value_size = None
+        if value_size is not None and value_size > PREFERENCE_VALUE_MAX_CHARS:
+            # 与 Web / CLI 编辑同一序列化口径：导入超限值会让该偏好
+            # 之后无法在面板保存（新增 / 编辑都会被 422 拒绝）
+            errors.append(
+                f"跳过第 {index} 个偏好：序列化后超过 "
+                f"{PREFERENCE_VALUE_MAX_CHARS} 字符"
             )
             continue
         cleaned_preferences[name] = value
@@ -1804,6 +1901,7 @@ def parse_user_export_data(data: Any) -> tuple[dict[str, Any], list[str]]:
             )
 
     sections["knowledge"] = knowledge
+    _stats(raw_knowledge_count - len(knowledge))
 
     recoverable = any(
         sections[key]
