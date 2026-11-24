@@ -953,7 +953,11 @@ class PostgresLongTermMemory:
         return bool(self._run_with_retry(run, replay_safe=False))
 
     def add_chat_messages(
-        self, messages: list[dict[str, Any]], dedupe: bool = False
+        self,
+        messages: list[dict[str, Any]],
+        dedupe: bool = False,
+        *,
+        added_by_session: dict[str, int] | None = None,
     ) -> int:
         """批量追加聊天消息（备份恢复）：单事务 executemany。
 
@@ -961,8 +965,12 @@ class PostgresLongTermMemory:
         重复导入同一备份不会追加重复消息；提问已被去重的轮次连同备份里的
         旧回答一起跳过（见 :mod:`utils.chat_import`），避免恢复出没有对应
         提问的重复回答。读取顺序按 ``created_at`` 排序，恢复的旧消息回到
-        会话中的历史位置。返回实际写入的条数。
+        会话中的历史位置。``added_by_session`` 传入 dict 时清空并回填本次
+        **实际写入**的按会话计数（重连重放路径沿用首次尝试的计数）。返回
+        实际写入的条数。
         """
+        if added_by_session is not None:
+            added_by_session.clear()
         incoming = [
             message
             for message in prepare_import_messages(messages)
@@ -974,7 +982,10 @@ class PostgresLongTermMemory:
         # 首次尝试实际保留的条数：「提交后 COMMIT ack 丢失」时 _run_with_retry
         # 会重连重放，重放的判重 SELECT 已能看到那批行并全部过滤（kept 为空）。
         # 数据已在库里，不能把实际已写入的消息全报成跳过
-        attempts: dict[str, int] = {"previous_kept": 0}
+        attempts: dict[str, Any] = {
+            "previous_kept": 0,
+            "previous_by_session": {},
+        }
 
         def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
@@ -1003,6 +1014,11 @@ class PostgresLongTermMemory:
                 if not kept:
                     # 幂等路径（全部已存在）或重放路径（首次尝试已提交、
                     # ack 丢失）：按首次尝试的保留条数报告
+                    if added_by_session is not None:
+                        added_by_session.clear()
+                        added_by_session.update(
+                            attempts.get("previous_by_session") or {}
+                        )
                     return attempts["previous_kept"]
                 attempts["previous_kept"] = len(kept)
                 from utils.user_import import _MAX_MESSAGES
@@ -1038,6 +1054,17 @@ class PostgresLongTermMemory:
                     "VALUES (%s, %s, %s, %s, %s)",
                     [(self.user_id, *row) for row in rows],
                 )
+                by_session: dict[str, int] = {}
+                for message in kept:
+                    sid = message.get("session_id")
+                    if sid is None:
+                        continue
+                    key = str(sid)
+                    by_session[key] = by_session.get(key, 0) + 1
+                attempts["previous_by_session"] = by_session
+                if added_by_session is not None:
+                    added_by_session.clear()
+                    added_by_session.update(by_session)
                 return len(rows)
 
         # dedupe=True 的重放会在 SELECT 里看到已提交行并全部跳过，天然幂等；
@@ -1485,31 +1512,53 @@ class PostgresLongTermMemory:
                 ) from exc
         return created, updated
 
-    def set_session_titles(self, titles: dict[str, str]) -> int:
-        """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""
+    def set_session_titles(
+        self, titles: dict[str, str], *, applied_out: set[str] | None = None
+    ) -> int:
+        """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。
+
+        ``applied_out`` 回填实际写入的会话（导入迟到回滚按实际生效集合
+        扣减计数）。
+        """
         applied = 0
         for session_id, title in titles.items():
             cleaned = str(title).strip()
             if cleaned and self.set_session_title(session_id, cleaned):
                 applied += 1
+                if applied_out is not None:
+                    applied_out.add(session_id)
         return applied
 
-    def set_sessions_pinned(self, session_ids: list[str], pinned: bool = True) -> int:
+    def set_sessions_pinned(
+        self,
+        session_ids: list[str],
+        pinned: bool = True,
+        *,
+        applied_out: set[str] | None = None,
+    ) -> int:
         """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。"""
         applied = 0
         for session_id in session_ids:
             if session_id and self.set_session_pinned(session_id, pinned):
                 applied += 1
+                if applied_out is not None:
+                    applied_out.add(session_id)
         return applied
 
     def set_sessions_archived(
-        self, session_ids: list[str], archived: bool = True
+        self,
+        session_ids: list[str],
+        archived: bool = True,
+        *,
+        applied_out: set[str] | None = None,
     ) -> int:
         """批量归档 / 恢复（备份恢复）：返回实际生效数。"""
         applied = 0
         for session_id in session_ids:
             if session_id and self.set_session_archived(session_id, archived):
                 applied += 1
+                if applied_out is not None:
+                    applied_out.add(session_id)
         return applied
 
     def _session_exists(self, session_id: str) -> bool:

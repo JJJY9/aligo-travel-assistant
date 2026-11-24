@@ -6339,6 +6339,77 @@ def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
     print("✓ /api/import 回滚恢复写入期间被删除的会话")
 
 
+def test_import_rollback_counts_only_applied_entries(monkeypatch):
+    """迟到回滚按本次实际生效集合扣减，不按备份段（否则误减存活会话）。"""
+    from context.long_term_memory import LongTermMemory
+    from utils import user_import as user_import_module
+
+    client = _client()
+    user_id = _unique_user("web_test_import_applied")
+    state = client.app.state.aligo
+    flags = {"late": False, "pre_deleted": False}
+    monkeypatch.setattr(
+        state,
+        "is_recently_deleted",
+        lambda uid, sid: uid == user_id and sid == "s-del" and flags["late"],
+    )
+    # 模拟「消息已写入、元数据尚未写入」时其它实例删除 s-del：
+    # set_session_titles 执行前整会话删除，s-del 的标题 / 置顶 / 归档不会
+    # 生效（但备份段里仍有它们）
+    original_titles = LongTermMemory.set_session_titles
+
+    def titles_after_delete(self, titles, **kwargs):
+        if not flags["pre_deleted"]:
+            flags["pre_deleted"] = True
+            self.delete_chat_session("s-del")
+        return original_titles(self, titles, **kwargs)
+
+    monkeypatch.setattr(LongTermMemory, "set_session_titles", titles_after_delete)
+    original_import = user_import_module.import_user_data
+
+    def import_then_flag(store, sections, **kwargs):
+        counts = original_import(store, sections, **kwargs)
+        flags["late"] = True
+        return counts
+
+    monkeypatch.setattr(user_import_module, "import_user_data", import_then_flag)
+    backup = {
+        "chat_history": [
+            {"role": "user", "content": "被删会话", "session_id": "s-del"},
+            {"role": "user", "content": "存活会话", "session_id": "s-ok"},
+        ],
+        "session_titles": {"s-del": "删", "s-ok": "存"},
+        "pinned_sessions": ["s-del", "s-ok"],
+        "archived_sessions": ["s-del", "s-ok"],
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["messages_added"] == 1, payload
+        assert payload["titles"] == 1, payload
+        assert payload["pinned"] == 1, payload
+        assert payload["archived"] == 1, payload
+        assert any("写入期间被删除" in item for item in payload["skipped"])
+        from context.storage import create_long_term_memory
+
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            assert store.get_chat_history(session_id="s-del") == []
+            assert store.get_session_titles().get("s-ok") == "存"
+            assert "s-ok" in (store.get_pinned_sessions() or [])
+            assert "s-ok" in (store.get_archived_sessions() or [])
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+    finally:
+        _cleanup(user_id)
+    print("✓ 迟到回滚只扣本次实际生效的条目")
+
+
 def test_preference_storage_failure_maps_503(monkeypatch):
     """偏好写盘失败应返回 503（与其它存储接口一致），而不是通用 500。"""
     from utils.errors import MemoryPersistenceError

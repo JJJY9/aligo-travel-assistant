@@ -1662,7 +1662,11 @@ class LongTermMemory:
 
     @_locked_mutation
     def add_chat_messages(
-        self, messages: list[dict[str, Any]], dedupe: bool = False
+        self,
+        messages: list[dict[str, Any]],
+        dedupe: bool = False,
+        *,
+        added_by_session: dict[str, int] | None = None,
     ) -> int:
         """批量追加聊天消息（备份恢复）：一次重载 + 一次原子写回。
 
@@ -1671,9 +1675,13 @@ class LongTermMemory:
         ``dedupe=True`` 在写锁内按（会话, 角色, 内容）多重集去重；提问已在
         库中的轮次跳过其备份里的全部回答（本地优先，避免尾部孤儿回答，
         见 :mod:`utils.chat_import`），并按时间戳把恢复消息并入全局历史。
-        返回实际写入的条数。
+        ``added_by_session`` 传入 dict 时清空并回填本次**实际写入**的按会话
+        计数：导入端「写入期间会话被删除」的迟到回滚据此只扣真正新增的
+        消息（按备份段扣分会高估）。返回实际写入的条数。
         """
         now = datetime.now().isoformat()
+        if added_by_session is not None:
+            added_by_session.clear()
         prepared = prepare_import_messages(messages)
         had_incoming = bool(prepared)
         if dedupe:
@@ -1725,6 +1733,13 @@ class LongTermMemory:
         else:
             self.data["chat_history"].extend(to_add)
         added = len(to_add)
+        if added_by_session is not None:
+            for message in to_add:
+                sid = message.get("session_id")
+                if sid is None:
+                    continue
+                key = str(sid)
+                added_by_session[key] = added_by_session.get(key, 0) + 1
         statistics = self.data.setdefault("statistics", {})
         statistics["total_messages"] = int(statistics.get("total_messages") or 0) + added
         self._persist()
@@ -2104,8 +2119,15 @@ class LongTermMemory:
         return list(self.data.get("archived_sessions") or [])
 
     @_locked_mutation
-    def set_session_titles(self, titles: dict[str, str]) -> int:
-        """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。"""
+    def set_session_titles(
+        self, titles: dict[str, str], *, applied_out: set[str] | None = None
+    ) -> int:
+        """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。
+
+        ``applied_out`` 传入 set 时回填本次实际写入的会话 ID：导入端在
+        「写入期间会话被删除」的迟到回滚里只扣减真正恢复过的条目
+        （备份为准会误扣从未生效的会话）。
+        """
         applied = 0
         stored = self.data.setdefault("session_titles", {})
         # 一次扫描构建会话集合：逐条 _session_exists 是 O(k×N)，大备份
@@ -2117,13 +2139,24 @@ class LongTermMemory:
                 continue
             stored[session_id] = cleaned[:60]
             applied += 1
+            if applied_out is not None:
+                applied_out.add(session_id)
         if applied:
             self._persist()
         return applied
 
     @_locked_mutation
-    def set_sessions_pinned(self, session_ids: list[str], pinned: bool = True) -> int:
-        """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。"""
+    def set_sessions_pinned(
+        self,
+        session_ids: list[str],
+        pinned: bool = True,
+        *,
+        applied_out: set[str] | None = None,
+    ) -> int:
+        """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。
+
+        ``applied_out`` 语义同 :meth:`set_session_titles`。
+        """
         applied = 0
         pinned_sessions = self.data.setdefault("pinned_sessions", [])
         existing = self._session_id_set()
@@ -2139,15 +2172,24 @@ class LongTermMemory:
             elif not pinned and has_ref:
                 _drop_session_refs(pinned_sessions, session_id)
             applied += 1
+            if applied_out is not None:
+                applied_out.add(session_id)
         if applied:
             self._persist()
         return applied
 
     @_locked_mutation
     def set_sessions_archived(
-        self, session_ids: list[str], archived: bool = True
+        self,
+        session_ids: list[str],
+        archived: bool = True,
+        *,
+        applied_out: set[str] | None = None,
     ) -> int:
-        """批量归档 / 恢复（备份恢复）：返回实际生效数。"""
+        """批量归档 / 恢复（备份恢复）：返回实际生效数。
+
+        ``applied_out`` 语义同 :meth:`set_session_titles`。
+        """
         applied = 0
         archived_sessions = self.data.setdefault("archived_sessions", [])
         existing = self._session_id_set()
@@ -2163,6 +2205,8 @@ class LongTermMemory:
             elif not archived and has_ref:
                 _drop_session_refs(archived_sessions, session_id)
             applied += 1
+            if applied_out is not None:
+                applied_out.add(session_id)
         if applied:
             self._persist()
         return applied
