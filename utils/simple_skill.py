@@ -92,18 +92,22 @@ class SimplePromptSkill(AgentBase):
 
     @classmethod
     def _clip_value(
-        cls, value: Any, depth: int = 0, max_depth: int = 5
+        cls,
+        value: Any,
+        depth: int = 0,
+        max_depth: int = 5,
+        max_string: int = _CONTEXT_MAX_STRING,
     ) -> Any:
         """按字段裁剪上下文，尽量保持 JSON 结构完整。"""
         if isinstance(value, str):
-            if len(value) > _CONTEXT_MAX_STRING:
-                return value[:_CONTEXT_MAX_STRING] + "…（已截断）"
+            if len(value) > max_string:
+                return value[:max_string] + "…（已截断）"
             return value
         if isinstance(value, list):
             if depth >= max_depth:
                 return f"…（{len(value)} 项已省略）"
             clipped_list = [
-                cls._clip_value(item, depth + 1, max_depth)
+                cls._clip_value(item, depth + 1, max_depth, max_string)
                 for item in value[:_CONTEXT_MAX_ITEMS]
             ]
             if len(value) > _CONTEXT_MAX_ITEMS:
@@ -115,7 +119,7 @@ class SimplePromptSkill(AgentBase):
             if depth >= max_depth:
                 return f"…（{len(value)} 个字段已省略）"
             clipped_dict = {
-                key: cls._clip_value(item, depth + 1, max_depth)
+                key: cls._clip_value(item, depth + 1, max_depth, max_string)
                 for key, item in list(value.items())[:_CONTEXT_MAX_ITEMS]
             }
             if len(value) > _CONTEXT_MAX_ITEMS:
@@ -171,6 +175,25 @@ class SimplePromptSkill(AgentBase):
                     text = json.dumps(clipped_data, ensure_ascii=False)
                     if len(text) <= _CONTEXT_MAX_CHARS:
                         break
+        # 仍超限：逐级收紧字符串上限——previous_results 的单个条目自身
+        # 超限时不能整项丢弃（DAG 核心输入宁可裁短），先把所有长字符串
+        # 减半再减半
+        limit = _CONTEXT_MAX_STRING
+        while len(text) > _CONTEXT_MAX_CHARS and limit > 100:
+            limit //= 2
+            clipped_data = {
+                key: self._clip_value(
+                    value,
+                    max_depth=(
+                        _PREVIOUS_RESULTS_MAX_DEPTH
+                        if key == "previous_results"
+                        else 5
+                    ),
+                    max_string=limit,
+                )
+                for key, value in clipped_data.items()
+            }
+            text = json.dumps(clipped_data, ensure_ascii=False)
         # 极端兜底：整项丢弃最旧的 previous_results（仍保持合法 JSON）
         if len(text) > _CONTEXT_MAX_CHARS:
             previous = clipped_data.get("previous_results")
@@ -181,6 +204,22 @@ class SimplePromptSkill(AgentBase):
             ):
                 previous.pop(0)
                 text = json.dumps(clipped_data, ensure_ascii=False)
+        # 硬上限兜底：以省略占位保留键位，保证不超过预算且始终合法 JSON
+        if len(text) > _CONTEXT_MAX_CHARS:
+            had_previous = bool(data.get("previous_results"))
+            floor: dict[str, Any] = {
+                "context": {"_truncated": "上下文过长已省略"},
+                "previous_results": (
+                    [{"_truncated": "结果过大已省略，请参考行程历史"}]
+                    if had_previous
+                    else []
+                ),
+            }
+            for key in ("reason", "expected_output", "rewritten_query", "user_query"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    floor[key] = self._clip_value(value, max_string=200)
+            text = json.dumps(floor, ensure_ascii=False)
         return text
 
     def _unwrap_answer(self, text: str) -> str:

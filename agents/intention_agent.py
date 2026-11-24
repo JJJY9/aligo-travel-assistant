@@ -567,11 +567,10 @@ class IntentionAgent(AgentBase):
         # key_entities 会被编排层直接落库成行程，同样清理模板占位值与非法日期
         raw_schedule = result.get("agent_schedule") or []
         filtered_schedule = self._valid_schedule(raw_schedule)
-        if not filtered_schedule and any(
-            isinstance(entry, dict)
-            and str(entry.get("agent_name") or "").strip()
-            for entry in raw_schedule
-        ):
+        if not filtered_schedule and raw_schedule:
+            # 调度列表非空但过滤后为空：未知 / 占位名、字符串条目、缺
+            # agent_name、空名字等全部形态都算——与编排层「全部非法 →
+            # 默认信息查询」同一口径
             # 调度条目全部未知 / 占位（如 weather_query 等下划线变体或模板
             # 回显）：上游过滤成空后，编排层再也看不到「全部非法」这一状态，
             # 「降级默认信息查询」永不触发，用户请求会被静默吞成 no_agents

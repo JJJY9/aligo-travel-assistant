@@ -1042,17 +1042,6 @@ class OrchestrationAgent(AgentBase):
             # 模型（一次 429/5xx 曾让同批已成功的智能体整体重发），也不再
             # 重发进度事件（首轮已经展示过）
             return retry_cache[cache_key]
-        timed_out_results = getattr(self, "_timed_out_results", None)
-        if (
-            retry_cache is not None
-            and cache_key
-            and timed_out_results
-            and cache_key in timed_out_results
-        ):
-            # 首轮该智能体已耗尽 300 秒上限：整轮回退重试重新执行会再次
-            # 跑满超时（会话锁最长被占 3×批次数×300 秒），直接复用失败结果
-            # 让重试快速收敛
-            return dict(timed_out_results[cache_key])
         checkpoint_store = self._checkpoint_store_for_turn()
         checkpoint_key = getattr(self, "_checkpoint_key", None)
         if checkpoint_store is not None and checkpoint_key:
@@ -1078,11 +1067,12 @@ class OrchestrationAgent(AgentBase):
         duration = round(time.perf_counter() - started, 2)
         result["duration"] = duration
         if result.pop("_timed_out", False) and cache_key:
-            timed_out_results = getattr(self, "_timed_out_results", None)
-            if timed_out_results is None:
-                timed_out_results = {}
-                self._timed_out_results = timed_out_results
-            timed_out_results[cache_key] = dict(result)
+            if retry_cache is not None:
+                # 超时结果按整轮缓存键记录：同一轮的回退重试（同一个
+                # retry_cache 对象）直接复用、不再跑满 300 秒；下一轮由
+                # 调用方新建的空 dict 自然失效。不能挂在编排器实例上——
+                # 那会把一次瞬时超时永久毒化同键任务（跨轮跳过执行）
+                retry_cache[cache_key] = dict(result)
         self._emit(
             on_event,
             {
@@ -1221,13 +1211,30 @@ class OrchestrationAgent(AgentBase):
                 response = await asyncio.wait_for(
                     asyncio.shield(attempt), timeout=_AGENT_TIMEOUT_SEC
                 )
+            except asyncio.CancelledError:
+                # 外层取消（用户停止 / 客户端断连）：shield 不传播取消，必须
+                # 显式取消并收尾技能任务——否则断连后技能继续跑满自身时长
+                # （消耗模型额度，还会与下一轮并发共用注册表缓存的同一实例）
+                attempt.cancel()
+                with contextlib.suppress(BaseException):
+                    await attempt
+                raise
             except asyncio.TimeoutError:
                 if attempt.done() and not attempt.cancelled():
                     # 上限未触发：是技能自己的 TimeoutError
                     raise attempt.exception() or asyncio.TimeoutError()
                 attempt.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
+                try:
                     await attempt
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    cancelling = getattr(current, "cancelling", None)
+                    if callable(cancelling) and cancelling() > 0:
+                        # 收尾期间外层被取消（断连 / 停止）：如实传播，
+                        # 不能转成 timeout 错误结果继续跑完回合
+                        raise
+                except Exception:  # noqa: BLE001 - 技能收尾失败不影响超时结果
+                    pass
                 raise _AgentTimeoutInternal(agent_name) from None
 
             # 解析响应

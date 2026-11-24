@@ -2083,6 +2083,79 @@ def test_agent_load_timeout_is_bounded(monkeypatch):
     print("✓ 懒加载受智能体超时约束")
 
 
+def test_agent_timeout_not_replayed_across_turns(monkeypatch):
+    """超时只在本轮整轮回退重试内复用：下一轮（全新 retry_cache）必须重新执行。"""
+    import agents.orchestration_agent as module
+
+    class Slow(_StubAgent):
+        async def reply(self, x):
+            self.calls += 1
+            await asyncio.sleep(0.5)
+            return Msg(name=self.name, content='{"ok": true}', role="assistant")
+
+    monkeypatch.setattr(module, "_AGENT_TIMEOUT_SEC", 0.05)
+    agent = Slow("a", {})
+    orchestrator = OrchestrationAgent(agent_registry={"a": agent})
+    schedule = [{"agent_name": "a", "priority": 1}]
+
+    # 同一轮整轮回退重试：同一个 retry_cache 对象 → 超时结果复用、不再跑
+    shared: dict = {}
+    first = json.loads(
+        asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=shared)).content
+    )
+    assert first["status"] == "partial_failure", first
+    assert agent.calls == 1, agent.calls
+    again = json.loads(
+        asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=shared)).content
+    )
+    assert again["status"] == "partial_failure"
+    assert agent.calls == 1, "同一 retry_cache 内的重试应复用超时结果"
+
+    # 下一轮：调用方新建空 dict → 必须重新执行（超时不能跨轮毒化）
+    nxt = json.loads(
+        asyncio.run(orchestrator.reply(_intent(schedule), retry_cache={})).content
+    )
+    assert nxt["status"] == "partial_failure"
+    assert agent.calls == 2, "下一轮必须重新执行同键任务"
+    print("✓ 智能体超时只在本轮重试内复用")
+
+
+def test_outer_cancel_cancels_running_skill():
+    """外层取消（用户停止 / 客户端断连）必须终止正在执行的技能任务。"""
+    started = asyncio.Event()
+    state = {"finished": False, "cancelled": False}
+
+    class Waiting(_StubAgent):
+        async def reply(self, x):
+            started.set()
+            try:
+                await asyncio.sleep(30)
+                state["finished"] = True
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+            return Msg(name=self.name, content='{"ok": true}', role="assistant")
+
+    orchestrator = OrchestrationAgent(agent_registry={"a": Waiting("a")})
+
+    async def _run():
+        task = asyncio.ensure_future(
+            orchestrator.reply(_intent([{"agent_name": "a", "priority": 1}]))
+        )
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_run())
+    assert state["cancelled"] is True, state
+    assert state["finished"] is False
+    print("✓ 外层取消终止在途技能")
+
+
 def test_duplicate_schedule_agents_deduped():
     """同一智能体以别名 / 重复条目出现时只执行一次（避免重复调用与双份结果）。"""
     plan = _StubAgent("plan-trip", {"itinerary": {"title": "杭州行程"}})
