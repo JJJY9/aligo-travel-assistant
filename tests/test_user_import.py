@@ -1930,6 +1930,61 @@ def test_runner_rolls_back_session_deleted_during_write(monkeypatch):
     print("✓ CLI 恢复回滚写入期间被删除的会话")
 
 
+def test_cli_import_rollback_counts_only_applied_entries(monkeypatch):
+    """CLI 迟到回滚按实际生效集合扣减（备份段会误减存活会话）。"""
+    from utils import tombstones
+    from utils import user_import as user_import_module
+
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "被删会话", "session_id": "s-del"},
+            {"role": "user", "content": "存活会话", "session_id": "s-ok"},
+        ],
+        "session_titles": {"s-del": "删", "s-ok": "存"},
+        "pinned_sessions": ["s-del", "s-ok"],
+        "archived_sessions": ["s-del", "s-ok"],
+    }
+    path = _write_json(payload)
+    store = _real_store("u-cli-applied")
+    flags = {"late": False, "pre_deleted": False}
+    original_titles = LongTermMemory.set_session_titles
+
+    def titles_after_delete(self, titles, **kwargs):
+        if not flags["pre_deleted"]:
+            flags["pre_deleted"] = True
+            self.delete_chat_session("s-del")
+        return original_titles(self, titles, **kwargs)
+
+    monkeypatch.setattr(LongTermMemory, "set_session_titles", titles_after_delete)
+    original_import = user_import_module.import_user_data
+
+    def import_then_flag(store_obj, sections, **kwargs):
+        counts = original_import(store_obj, sections, **kwargs)
+        flags["late"] = True
+        return counts
+
+    monkeypatch.setattr(user_import_module, "import_user_data", import_then_flag)
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id: session_id == "s-del" and flags["late"],
+    )
+    code, out = _run_import(
+        monkeypatch, "u-cli-applied", path, store, as_json=True
+    )
+    result = json.loads(out)
+    assert code == 0, out
+    assert result["messages_added"] == 1, result
+    assert result["titles"] == 1, result
+    assert result["pinned"] == 1, result
+    assert result["archived"] == 1, result
+    assert any("写入期间被删除" in item for item in result["skipped"]), result
+    assert store.get_session_titles().get("s-ok") == "存"
+    assert "s-ok" in (store.get_pinned_sessions() or [])
+    assert "s-ok" in (store.get_archived_sessions() or [])
+    print("✓ CLI 迟到回滚只扣本次实际生效的条目")
+
+
 def test_parse_rejects_huge_integer_literal_content():
     """含超 4300 位整数字面量的助手消息在导入时拒绝（否则汇总/查看永久 500）。"""
     payload = {

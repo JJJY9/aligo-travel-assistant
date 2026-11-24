@@ -2479,7 +2479,11 @@ def _import_exclusion(store: Any):
 
 
 def import_user_data(
-    store: Any, sections: dict[str, Any], *, knowledge_unverified: str = ""
+    store: Any,
+    sections: dict[str, Any],
+    *,
+    knowledge_unverified: str = "",
+    applied_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把解析后的数据写入长期记忆；返回各类计数（供 CLI / Web 输出）。
 
@@ -2490,6 +2494,12 @@ def import_user_data(
     所有用户的带知识库导出永久 413）。用户数据恢复不受影响，重跑可
     补齐知识片段（导入幂等）。
 
+    ``applied_out`` 传入 dict 时回填本次**实际生效**的集合：
+    ``titles`` / ``pinned`` / ``archived``（各为 set）与
+    ``messages_by_session``（dict 会话 → 实际新增条数）。导入端「写入
+    期间会话被删除」的迟到回滚据此只扣真正恢复过的条目（按备份段扣减
+    会把从未生效的会话也扣掉、消息数则高估）。
+
     写入全程持有跨进程导入互斥锁，并在锁内重取快照重跑合并体积复核：
     锁外预检挡不住两个并发导入各自通过后合计越限（此后导出永久 413）。
     """
@@ -2498,11 +2508,17 @@ def import_user_data(
     # 这种不可恢复状态）。重复行按去重语义不计入新增，见 _enforce_import_limits
     _enforce_import_limits(store, sections)
     with _import_exclusion(store):
-        return _import_user_data_locked(store, sections, knowledge_unverified)
+        return _import_user_data_locked(
+            store, sections, knowledge_unverified, applied_out=applied_out
+        )
 
 
 def _import_user_data_locked(
-    store: Any, sections: dict[str, Any], knowledge_unverified: str
+    store: Any,
+    sections: dict[str, Any],
+    knowledge_unverified: str,
+    *,
+    applied_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """导入互斥锁内的实际写入（含锁内体积复核）。"""
     # 锁内重取快照并重跑合并体积复核：另一个导入可能已在本次锁外预检
@@ -2536,6 +2552,12 @@ def _import_user_data_locked(
         "knowledge_imported": 0,
         "knowledge_skipped": 0,
     }
+    # 本次「实际生效」集合（只有调用方要迟到回滚计数时才向 store 传新
+    # 出参：直接调用 import_user_data 的测试 / 第三方替身保持旧签名）
+    applied_titles: set[str] = set()
+    applied_pinned: set[str] = set()
+    applied_archived: set[str] = set()
+    msg_by_session: dict[str, int] = {}
 
     for key, value in sections.get("preferences", {}).items():
         store.save_preference(key, value)
@@ -2556,20 +2578,44 @@ def _import_user_data_locked(
         # 批量写入 + 存储层写锁内去重：JSON 后端一次重载一次原子写回
         # （逐条写是 O(n²)，大备份会跑几分钟到数小时）；去重放在写锁内
         # 使并发导入也不会因锁外快照过期而重复插入
-        added = store.add_chat_messages(messages, dedupe=True)
+        if applied_out is not None:
+            added = store.add_chat_messages(
+                messages, dedupe=True, added_by_session=msg_by_session
+            )
+        else:
+            added = store.add_chat_messages(messages, dedupe=True)
         added = int(added if added is not None else len(messages))
         result["messages_added"] = added
         result["messages_skipped"] = len(messages) - added
 
     titles = sections.get("titles", {})
     if titles:
-        result["titles"] = int(store.set_session_titles(titles))
+        if applied_out is not None:
+            result["titles"] = int(
+                store.set_session_titles(titles, applied_out=applied_titles)
+            )
+        else:
+            result["titles"] = int(store.set_session_titles(titles))
     pinned = sections.get("pinned", [])
     if pinned:
-        result["pinned"] = int(store.set_sessions_pinned(pinned, True))
+        if applied_out is not None:
+            result["pinned"] = int(
+                store.set_sessions_pinned(
+                    pinned, True, applied_out=applied_pinned
+                )
+            )
+        else:
+            result["pinned"] = int(store.set_sessions_pinned(pinned, True))
     archived = sections.get("archived", [])
     if archived:
-        result["archived"] = int(store.set_sessions_archived(archived, True))
+        if applied_out is not None:
+            result["archived"] = int(
+                store.set_sessions_archived(
+                    archived, True, applied_out=applied_archived
+                )
+            )
+        else:
+            result["archived"] = int(store.set_sessions_archived(archived, True))
     knowledge = sections.get("knowledge", [])
     if knowledge and knowledge_unverified:
         # 合并复核无法核对知识体积：跳过写入并如实上报（用户数据已恢复，
@@ -2624,6 +2670,15 @@ def _import_user_data_locked(
         ensure_persisted = getattr(store, "ensure_persisted", None)
         if callable(ensure_persisted):
             ensure_persisted()
+    if applied_out is not None:
+        applied_out.update(
+            {
+                "titles": set(applied_titles),
+                "pinned": set(applied_pinned),
+                "archived": set(applied_archived),
+                "messages_by_session": dict(msg_by_session),
+            }
+        )
     return result
 
 

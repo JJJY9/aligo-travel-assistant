@@ -7412,11 +7412,13 @@ def create_app(model: Any = None) -> FastAPI:
                         # 写入前标记该用户：导出入口与读完快照时的检查都会
                         # 拒绝并发导出，避免导出半截备份
                         state.begin_user_import(user_id)
+                        applied: dict[str, Any] = {}
                         try:
                             counts = import_user_data(
                                 store,
                                 sections,
                                 knowledge_unverified=knowledge_skip_reason,
+                                applied_out=applied,
                             )
                         finally:
                             state.end_user_import(user_id)
@@ -7434,7 +7436,6 @@ def create_app(model: Any = None) -> FastAPI:
                                 user_id, session_id
                             )
                         }
-                        removed_total = 0
                         rolled_back_sessions: set[str] = set()
                         for session_id in sorted(late_deleted):
                             try:
@@ -7448,32 +7449,34 @@ def create_app(model: Any = None) -> FastAPI:
                                     exc,
                                 )
                                 continue
-                            removed_total += removed
                             rolled_back_sessions.add(session_id)
                             errors.append(
                                 f"会话 {session_id} 在恢复写入期间被删除，"
                                 f"已回滚 {removed} 条消息"
                             )
-                        if removed_total:
-                            counts["messages_added"] = max(
-                                0,
-                                int(counts.get("messages_added") or 0)
-                                - removed_total,
-                            )
                         if rolled_back_sessions:
-                            # delete_chat_session 连同标题 / 置顶 / 归档一起清除：
-                            # 计数同步扣减，响应不能把已回滚会话的元数据仍算作
-                            # 「已恢复」（备份里给该会话带过的元数据各扣一条，
-                            # 与导入时一次只记一条的口径一致）
-                            for key, section in (
-                                ("titles", sections.get("titles") or {}),
-                                ("pinned", sections.get("pinned") or []),
-                                ("archived", sections.get("archived") or []),
-                            ):
+                            # 按本次**实际生效**的集合扣减（备份段会把从未恢复
+                            # 的会话也扣掉；消息数则需按实际新增逐会话求和，
+                            # 否则「备份有 10 条、只成功写入 2 条」会多扣 8）
+                            messages_by_session = applied.get(
+                                "messages_by_session"
+                            ) or {}
+                            deducted = sum(
+                                int(messages_by_session.get(session_id, 0))
+                                for session_id in rolled_back_sessions
+                            )
+                            if deducted:
+                                counts["messages_added"] = max(
+                                    0,
+                                    int(counts.get("messages_added") or 0)
+                                    - deducted,
+                                )
+                            for key in ("titles", "pinned", "archived"):
+                                applied_keys = set(applied.get(key) or ())
                                 counts[key] = max(
                                     0,
                                     int(counts.get(key) or 0)
-                                    - len(rolled_back_sessions & set(section)),
+                                    - len(rolled_back_sessions & applied_keys),
                                 )
                         return counts
                     finally:

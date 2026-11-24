@@ -3555,8 +3555,12 @@ def run_user_import_standalone(
                     store, sections, knowledge_unverified=knowledge_skip_reason
                 )
             else:
+                applied: dict[str, Any] = {}
                 counts = import_user_data(
-                    store, sections, knowledge_unverified=knowledge_skip_reason
+                    store,
+                    sections,
+                    knowledge_unverified=knowledge_skip_reason,
+                    applied_out=applied,
                 )
                 # 写库期间其它实例可能删除某个会话：最后再查一次共享墓碑
                 # 并整会话回滚，避免迟到的删除被恢复写回
@@ -3565,13 +3569,10 @@ def run_user_import_standalone(
                     for session_id in active_sessions
                     if is_session_deleted(user_id, str(session_id))
                 }
-                removed_total = 0
                 rolled_back_sessions: set[str] = set()
                 for session_id in sorted(late_deleted):
                     try:
-                        removed_total += int(
-                            store.delete_chat_session(str(session_id)) or 0
-                        )
+                        store.delete_chat_session(str(session_id))
                     except Exception as exc:  # noqa: BLE001 - 尽力回滚
                         errors.append(
                             f"会话 {session_id} 在恢复写入期间被删除，"
@@ -3583,25 +3584,28 @@ def run_user_import_standalone(
                         f"会话 {session_id} 在恢复写入期间被删除，"
                         "已回滚其消息"
                     )
-                if removed_total:
-                    counts["messages_added"] = max(
-                        0,
-                        int(counts.get("messages_added") or 0) - removed_total,
-                    )
                 if rolled_back_sessions:
-                    # delete_chat_session 连同标题 / 置顶 / 归档一起清除：
-                    # 计数同步扣减（与 Web /api/import 同口径），否则
-                    # --json / 文本摘要把已被回滚的会话元数据仍报告为已恢复
-                    for key, section in (
-                        ("titles", sections.get("titles") or {}),
-                        ("pinned", sections.get("pinned") or []),
-                        ("archived", sections.get("archived") or []),
-                    ):
-                        entry_ids = {str(item) for item in section}
+                    # 按本次**实际生效**的集合扣减（与 Web /api/import 同
+                    # 口径）：备份段会把从未恢复的会话也扣掉；消息数按实际
+                    # 新增逐会话求和，避免「备份 N 条、只写入 M 条」多扣
+                    messages_by_session = applied.get(
+                        "messages_by_session"
+                    ) or {}
+                    deducted = sum(
+                        int(messages_by_session.get(session_id, 0))
+                        for session_id in rolled_back_sessions
+                    )
+                    if deducted:
+                        counts["messages_added"] = max(
+                            0,
+                            int(counts.get("messages_added") or 0) - deducted,
+                        )
+                    for key in ("titles", "pinned", "archived"):
+                        applied_keys = set(applied.get(key) or ())
                         counts[key] = max(
                             0,
                             int(counts.get(key) or 0)
-                            - len(rolled_back_sessions & entry_ids),
+                            - len(rolled_back_sessions & applied_keys),
                         )
         except PartialImportError as exc:
             # 已提交的部分必须如实报告：只说「失败」会让用户以为整份
