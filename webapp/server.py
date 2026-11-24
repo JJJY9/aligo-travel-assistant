@@ -102,7 +102,7 @@ from utils.log_redact import redact_local_paths, redact_paths, redact_secret
 from utils.metrics import REQUEST_METRICS
 from utils.paths import default_data_root
 from utils.preference_values import has_preference_value
-from utils.rate_limit import create_rate_limiter
+from utils.rate_limit import CapacityRetry, create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
@@ -1422,12 +1422,16 @@ class AligoWebApp:
         redis_factory = (
             get_shared_redis_client if STORAGE_CONFIG.get("redis_url") else None
         )
+        # 进程内桶的键表上限（Redis 后端不设上限）：小时 / 日窗口或高键基数
+        # 部署需要调大，满时对新 key fail-closed
+        rate_limit_max_keys = int(RATE_LIMIT_CONFIG.get("max_keys", 10000))
         self.rate_limiter = create_rate_limiter(
             "user",
             RATE_LIMIT_CONFIG.get("chat_requests", 30),
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 用户 ID 由请求方提供、可以轮换；再按纯客户端 IP 限流，防止换 ID 绕过
         self.ip_limiter = create_rate_limiter(
@@ -1436,6 +1440,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 知识库写入 / 导入 / 语义检索会触发嵌入模型推理，单独按客户端 IP 限流，
         # 不占用对话额度（Web 批量导入每批 200 条，60 次/分钟足够）
@@ -1445,6 +1450,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 备份导入的面板循环按 200 条/批调用导入接口：沿用知识库 60 次/分钟
         # 会让数万条的备份在窗口内必然 429，且重试时前几十批都是快速跳过的
@@ -1461,6 +1467,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 天气接口每次未命中会上游发两次请求；按客户端 IP 限流，
         # 保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度
@@ -1470,6 +1477,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 面板数据读接口（会话列表 / 状态 / 导出 / 台账）每次请求都全量读取
         # 用户历史，且走共享线程池；不设额度时几十个并发读就能把线程池占满
@@ -1480,6 +1488,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 用户数据写接口（偏好 / 会话元数据 / 行程 / 删除）：每次写都会全量
         # 重载并重写用户记忆、占用共享文件锁与数据库连接，必须与读接口分开
@@ -1490,6 +1499,7 @@ class AligoWebApp:
             RATE_LIMIT_CONFIG.get("window_sec", 60),
             redis_client,
             client_factory=redis_factory,
+            max_keys=rate_limit_max_keys,
         )
         # 全量导出会同时持有数份整库拷贝（实测峰值约为逻辑大小的 8 倍）：
         # 只按次数限流挡不住 40 个并发导出同时申请数 GB 内存，这里限制
@@ -2123,16 +2133,111 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", "") or "")
 
 
+@functools.lru_cache(maxsize=8)
+def _trusted_proxy_networks(raw: str) -> tuple[Any, ...]:
+    """解析 TRUSTED_PROXY_CIDRS（逗号分隔 CIDR）；非法项告警并忽略。"""
+    networks: list[Any] = []
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logger.warning("TRUSTED_PROXY_CIDRS 项 %r 非法，已忽略", item)
+    return tuple(networks)
+
+
+def _is_trusted_proxy_peer(peer: str) -> bool:
+    """对端地址是否在可信代理网段内（非 IP 对端一律不可信）。"""
+    try:
+        address = ipaddress.ip_address(str(peer or ""))
+    except ValueError:
+        # "testclient" / "unknown" / UNIX socket 等非 IP 对端
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    for network in _trusted_proxy_networks(
+        str(RATE_LIMIT_CONFIG.get("trusted_proxy_cidrs", ""))
+    ):
+        if network.version == address.version and address in network:
+            return True
+    return False
+
+
+def _last_hop_address(value: str) -> str:
+    """解析 X-Forwarded-For 末跳：裸 IP、``[IPv6]``/``[IPv6]:port``、``IP:port``。
+
+    返回规范化后的地址（端口被剥离）；无法解析返回空串。只接受上述三种
+    形式，任意字符串不能各自成为限流桶（防伪造绕过）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        pass
+    else:
+        return text
+    if text.startswith("[") and "]" in text:
+        host, sep, rest = text[1:].partition("]")
+        if sep and (not rest or _valid_port(rest[1:]) and rest.startswith(":")):
+            try:
+                if ipaddress.ip_address(host).version == 6:
+                    return host
+            except ValueError:
+                return ""
+        return ""
+    if text.count(":") == 1:
+        host, _, port = text.rpartition(":")
+        if _valid_port(port):
+            try:
+                if ipaddress.ip_address(host).version == 4:
+                    return host
+            except ValueError:
+                return ""
+    return ""
+
+
+def _valid_port(text: str) -> bool:
+    return text.isdigit() and 1 <= int(text) <= 65535
+
+
+_xff_warn_lock = threading.Lock()
+_xff_warn_last = 0.0
+_XFF_WARN_INTERVAL_SEC = 60.0
+
+
+def _warn_unparsable_forwarded_hop(request: Request, candidate: str) -> None:
+    """XFF 末跳不是合法 IP 时告警（进程内 ≤1 条/分钟，经日志脱敏截断）。"""
+    global _xff_warn_last
+    now = time.monotonic()
+    with _xff_warn_lock:
+        if now - _xff_warn_last < _XFF_WARN_INTERVAL_SEC:
+            return
+        _xff_warn_last = now
+    logger.warning(
+        "TRUST_PROXY_HEADERS=1 但 X-Forwarded-For 末跳不是合法 IP（%r），"
+        "已回退 TCP 对端 %s；请让最近一跳代理写入裸 IP 或 [IPv6]/IP:port",
+        _safe_log_text(candidate)[:64],
+        request.client.host if request.client else "unknown",
+    )
+
+
 def _client_host(request: Request) -> str:
     """限流使用的客户端地址。
 
     默认取 TCP 对端地址。部署在反向代理后面时设置 ``TRUST_PROXY_HEADERS=1``，
     改为取 ``X-Forwarded-For`` 的**最后一跳**地址（代理按标准写法追加真实
-    客户端地址，如 nginx ``$proxy_add_x_forwarded_for``）；默认关闭，避免
-    客户端自行伪造该头绕过 IP 桶。取最后一个值而不是第一个：客户端自带的
-    伪造值只会出现在更前面，轮换它不能获得新桶；最后一跳必须是合法 IP，
-    否则退回 TCP 对端地址（任意字符串不能各自成为限流桶）。
+    客户端地址，如 nginx ``$proxy_add_x_forwarded_for``）；且只信任来自
+    ``TRUSTED_PROXY_CIDRS``（默认仅回环）的对端写入的 XFF——否则任意可达
+    对端可自选限流身份。末跳接受裸 IP、``[IPv6]`` / ``[IPv6]:port`` 与
+    ``IP:port``（端口剥离）；无法解析时回退 TCP 对端并告警。取最后一个值
+    而不是第一个：客户端自带的伪造值只会出现在更前面，轮换它不能获得新桶。
     """
+    peer = request.client.host if request.client else ""
     if RATE_LIMIT_CONFIG.get("trust_proxy_headers"):
         # 代理可能以多条独立头行追加（RFC 7230：多个同名头行等价于按
         # 顺序逗号拼接），只读第一行会把客户端自带的 XFF 当成实际值——
@@ -2144,20 +2249,41 @@ def _client_host(request: Request) -> str:
             values = [request.headers.get("x-forwarded-for") or ""]
         forwarded = ",".join(str(value) for value in values if value)
         if forwarded:
-            candidate = forwarded.split(",")[-1].strip()
-            try:
-                ipaddress.ip_address(candidate)
-            except ValueError:
-                candidate = ""
-            if candidate:
-                return candidate[:64]
-    return request.client.host if request.client else "unknown"
+            if not _is_trusted_proxy_peer(peer):
+                # 非可信对端的 XFF 一律忽略：任意可达客户端不能自选身份
+                _warn_untrusted_forwarded(request, peer)
+            else:
+                candidate = forwarded.split(",")[-1].strip()
+                host = _last_hop_address(candidate)
+                if host:
+                    return host[:64]
+                _warn_unparsable_forwarded_hop(request, candidate)
+    return peer or "unknown"
+
+
+_xff_peer_warn_lock = threading.Lock()
+_xff_peer_warn_last = 0.0
+
+
+def _warn_untrusted_forwarded(request: Request, peer: str) -> None:
+    """非可信对端携带 XFF 时告警（进程内 ≤1 条/分钟）。"""
+    global _xff_peer_warn_last
+    now = time.monotonic()
+    with _xff_peer_warn_lock:
+        if now - _xff_peer_warn_last < _XFF_WARN_INTERVAL_SEC:
+            return
+        _xff_peer_warn_last = now
+    logger.warning(
+        "TRUST_PROXY_HEADERS=1 但对端 %s 不在 TRUSTED_PROXY_CIDRS 内，"
+        "已忽略其 X-Forwarded-For；如确为代理请在 TRUSTED_PROXY_CIDRS 中声明",
+        peer or "unknown",
+    )
 
 
 def _rate_identity(host: str) -> str:
-    """限流桶的客户端标识：IPv6 按 /64 聚合。
+    """限流桶的客户端标识：IPv6 按前缀聚合（默认 /64，可配 32..64）。
 
-    同一 /64 子网内可以随意轮换源地址；按完整地址做 key 时每次轮换都是
+    同一前缀内可以随意轮换源地址；按完整地址做 key 时每次轮换都是
     新桶，IP 维度限流被直接绕过。
     """
     text = str(host or "").strip()
@@ -2173,7 +2299,17 @@ def _rate_identity(host: str) -> str:
             # IPv4 映射地址（::ffff:1.2.3.4）：按真实 IPv4 聚合，否则所有
             # IPv4 客户端都会落进 ::/64 同一个桶
             return str(mapped)
-        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+        try:
+            prefix = int(RATE_LIMIT_CONFIG.get("ipv6_prefix_len", 64))
+        except (TypeError, ValueError):
+            prefix = 64
+        if not 32 <= prefix <= 64:
+            prefix = 64
+        try:
+            return str(ipaddress.ip_network(f"{address}/{prefix}", strict=False))
+        except ValueError:
+            # 带 zone id（%eth0）等异常输入：退回原文，不引入 500
+            return text
     return text
 
 
@@ -2204,6 +2340,13 @@ def _limiter_degraded(limiter: Any) -> bool:
     return bool(getattr(limiter, "degraded", False))
 
 
+# 健康 / 指标接口对限流桶做恢复探测的总预算（秒）：7 个桶串行 EVAL 在
+# 慢 Redis 恢复时最坏叠加 7×socket 超时（约 10s），健康检查 / 抓取会被
+# 拖超时。单次探测上界对齐共享客户端的 socket_timeout（约 1.5s）。
+RATE_LIMIT_PROBE_BUDGET_SEC = 2.0
+RATE_LIMIT_PROBE_MAX_LATENCY_SEC = 1.5
+
+
 def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """限流后端与状态（健康检查与指标接口共用）。
 
@@ -2223,7 +2366,20 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
         state.read_limiter,
         state.write_limiter,
     )
-    degraded = any(_limiter_degraded(limiter) for limiter in limiters) or (
+    # 探测总预算：只剩不到一次完整往返的时间时，沿用桶当前的降级标记
+    # （下次健康 / 指标请求再探测），避免慢 Redis 下逐个桶叠加超时
+    probe_deadline = (
+        time.monotonic()
+        + RATE_LIMIT_PROBE_BUDGET_SEC
+        - RATE_LIMIT_PROBE_MAX_LATENCY_SEC
+    )
+
+    def _bucket_degraded(limiter: Any) -> bool:
+        if time.monotonic() >= probe_deadline:
+            return bool(getattr(limiter, "degraded", False))
+        return _limiter_degraded(limiter)
+
+    degraded = any(_bucket_degraded(limiter) for limiter in limiters) or (
         backend == "memory" and configured
     )
     return {
@@ -2252,12 +2408,22 @@ def _enforce_rate_limit(
     client = _rate_identity(_client_host(request))
     user_key = f"{client}:{user_id}"
 
-    def _over_limit(limit: int, retry_after: float) -> HTTPException:
-        """429 响应：Retry-After 取整数秒（向上取整、至少 1 秒）。"""
+    def _over_limit(
+        limit: int, retry_after: float, *, capacity: bool = False
+    ) -> HTTPException:
+        """429 响应：Retry-After 取整数秒（向上取整、至少 1 秒）。
+
+        ``capacity=True`` 表示键表容量暂满（不是该客户端额度耗尽）：
+        文案单独标注，避免用户误以为被判定为高频请求。
+        """
         wait_seconds = max(1, math.ceil(retry_after))
+        if capacity:
+            message = "限流容量暂满"
+        else:
+            message = "请求过于频繁"
         return HTTPException(
             status_code=429,
-            detail=f"请求过于频繁，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
+            detail=f"{message}，请约 {wait_seconds} 秒后重试（请求 ID：{_request_id(request)}）",
             headers={
                 "Retry-After": str(wait_seconds),
                 "X-RateLimit-Limit": str(limit),
@@ -2276,17 +2442,32 @@ def _enforce_rate_limit(
             limit = state.rate_limiter.limit
         else:
             limit = state.ip_limiter.limit
-        raise _over_limit(limit, max(retry_after or 0.0, ip_retry_after or 0.0))
+        capacity = isinstance(retry_after, CapacityRetry) or isinstance(
+            ip_retry_after, CapacityRetry
+        )
+        raise _over_limit(
+            limit,
+            max(retry_after or 0.0, ip_retry_after or 0.0),
+            capacity=capacity,
+        )
     # peek 与 check 之间额度可能被并发请求抢走：check 返回非 None 时请求已
     # 超额，必须按它的结果拒绝，否则会放行超出额度的请求。先记 IP 桶再记
     # 用户桶：IP 桶拒绝时不消耗用户额度（并发下也不会）；反过来用户桶迟到
     # 拒绝只会浪费共享 IP 桶的一个名额，影响面更小
     ip_retry = state.ip_limiter.check(client)
     if ip_retry is not None:
-        raise _over_limit(state.ip_limiter.limit, ip_retry)
+        raise _over_limit(
+            state.ip_limiter.limit,
+            ip_retry,
+            capacity=isinstance(ip_retry, CapacityRetry),
+        )
     user_retry = state.rate_limiter.check(user_key)
     if user_retry is not None:
-        raise _over_limit(state.rate_limiter.limit, user_retry)
+        raise _over_limit(
+            state.rate_limiter.limit,
+            user_retry,
+            capacity=isinstance(user_retry, CapacityRetry),
+        )
     remaining_user, reset_user = state.rate_limiter.status(user_key)
     remaining_ip, reset_ip = state.ip_limiter.status(client)
     # 额度头取自当前更紧的桶（剩余更少；剩余相同时取重置更晚的），
@@ -2302,22 +2483,83 @@ def _enforce_rate_limit(
     }
 
 
+def _rate_limited_exception(
+    request: Request,
+    message: str,
+    limit: int,
+    retry_after: float,
+) -> HTTPException:
+    """单桶 429：配额路径保留各桶原文案；容量拒绝统一标注「限流容量暂满」。"""
+    wait_seconds = max(1, math.ceil(retry_after))
+    if isinstance(retry_after, CapacityRetry):
+        message = "限流容量暂满"
+    return HTTPException(
+        status_code=429,
+        detail=(
+            f"{message}，请约 {wait_seconds} 秒后重试"
+            f"（请求 ID：{_request_id(request)}）"
+        ),
+        headers={
+            "Retry-After": str(wait_seconds),
+            "X-RateLimit-Limit": str(limit),
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": str(wait_seconds),
+        },
+    )
+
+
+def _tighter_rate_headers(
+    first: dict[str, str], second: dict[str, str]
+) -> dict[str, str]:
+    """两个桶的额度头取更紧的那个（剩余更少；相同时取重置更晚的）。"""
+    try:
+        key_first = (
+            int(first.get("X-RateLimit-Remaining", "0")),
+            -int(first.get("X-RateLimit-Reset", "0")),
+        )
+        key_second = (
+            int(second.get("X-RateLimit-Remaining", "0")),
+            -int(second.get("X-RateLimit-Reset", "0")),
+        )
+    except (TypeError, ValueError):
+        return first
+    return first if key_first <= key_second else second
+
+
+def _precheck_rate_limit(
+    state: AligoWebApp,
+    request: Request | None,
+    limiter: Any,
+    operation: str,
+) -> None:
+    """只读预检：已超限的请求在建槽 / 占锁之前直接 429（peek 不记账）。
+
+    权威记账仍在端点体内的 ``_enforce_*``（唯一的额度头来源）；这里只提前
+    拒绝「已确定超限」的请求，避免它们先占走稀缺的导出 / 知识库读槽位或
+    跨实例评测锁。Redis 故障时 peek 自动走进程内回退。
+    """
+    if request is None:
+        return
+    client = _rate_identity(_client_host(request))
+    retry_after = limiter.peek(client)
+    if retry_after is not None:
+        raise _rate_limited_exception(
+            request, f"{operation}过于频繁", limiter.limit, retry_after
+        )
+
+
 def _enforce_import_rate_limit(state: AligoWebApp, request: Request) -> dict[str, str]:
-    """备份导入接口的独立限流（比知识库维护接口更宽松，按客户端 IP）。"""
+    """导入类接口的独立限流（比知识库维护接口更宽松，按客户端 IP）。
+
+    服务知识库导入 / 导入预览与行程导入（批量写需要远高于普通操作的
+    额度）；备份恢复 ``/api/import`` 占用的是知识库桶（见
+    :func:`_enforce_kb_rate_limit` 的「备份恢复操作」调用点）。
+    """
     client = _rate_identity(_client_host(request))
     retry_after = state.import_limiter.check(client)
     if retry_after is not None:
-        wait_seconds = max(1, math.ceil(retry_after))
-        raise HTTPException(
-            status_code=429,
-            detail=f"导入过于频繁，请约 {wait_seconds} 秒后重试"
-            f"（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(state.import_limiter.limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
+        raise _rate_limited_exception(
+            request, "导入过于频繁", state.import_limiter.limit, retry_after
         )
     remaining, reset = state.import_limiter.status(client)
     return {
@@ -2391,17 +2633,11 @@ def _enforce_kb_rate_limit(
     # 之间被并发请求插队导致超发；check 超限时本身不会记录事件
     retry_after = state.kb_limiter.check(client)
     if retry_after is not None:
-        wait_seconds = max(1, math.ceil(retry_after))
-        raise HTTPException(
-            status_code=429,
-            detail=f"{operation}过于频繁，请约 {wait_seconds} 秒后重试"
-            f"（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(state.kb_limiter.limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
+        raise _rate_limited_exception(
+            request,
+            f"{operation}过于频繁",
+            state.kb_limiter.limit,
+            retry_after,
         )
     remaining, reset = state.kb_limiter.status(client)
     return {
@@ -2422,17 +2658,8 @@ def _enforce_weather_rate_limit(
     client = _rate_identity(_client_host(request))
     retry_after = state.weather_limiter.check(client)
     if retry_after is not None:
-        wait_seconds = max(1, math.ceil(retry_after))
-        raise HTTPException(
-            status_code=429,
-            detail=f"天气查询过于频繁，请约 {wait_seconds} 秒后重试"
-            f"（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(state.weather_limiter.limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
+        raise _rate_limited_exception(
+            request, "天气查询过于频繁", state.weather_limiter.limit, retry_after
         )
     remaining, reset = state.weather_limiter.status(client)
     return {
@@ -2453,17 +2680,8 @@ def _enforce_read_rate_limit(
     client = _rate_identity(_client_host(request))
     retry_after = state.read_limiter.check(client)
     if retry_after is not None:
-        wait_seconds = max(1, math.ceil(retry_after))
-        raise HTTPException(
-            status_code=429,
-            detail=f"数据读取过于频繁，请约 {wait_seconds} 秒后重试"
-            f"（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(state.read_limiter.limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
+        raise _rate_limited_exception(
+            request, "数据读取过于频繁", state.read_limiter.limit, retry_after
         )
     remaining, reset = state.read_limiter.status(client)
     return {
@@ -2487,17 +2705,8 @@ def _enforce_write_rate_limit(state: AligoWebApp, request: Request) -> None:
     client = _rate_identity(_client_host(request))
     retry_after = state.write_limiter.check(client)
     if retry_after is not None:
-        wait_seconds = max(1, math.ceil(retry_after))
-        raise HTTPException(
-            status_code=429,
-            detail=f"写入过于频繁，请约 {wait_seconds} 秒后重试"
-            f"（请求 ID：{_request_id(request)}）",
-            headers={
-                "Retry-After": str(wait_seconds),
-                "X-RateLimit-Limit": str(state.write_limiter.limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(wait_seconds),
-            },
+        raise _rate_limited_exception(
+            request, "写入过于频繁", state.write_limiter.limit, retry_after
         )
 
 
@@ -3878,52 +4087,71 @@ def create_app(model: Any = None) -> FastAPI:
         if since_epoch is not None and epoch != since_epoch:
             _raise_restore_conflict(request, active=False)
 
-    def _export_guard(func):
+    def _export_guard(bucket: str = "read"):
         """限制同时执行的全量导出数量：内存峰值约为备份大小的 8 倍。
 
         槽位持有到响应发送结束（见 :class:`_ExportLeaseResponse`），
-        慢读连接也会占用名额。
+        慢读连接也会占用名额。占槽前先按 ``bucket`` 对应的限流桶做只读
+        预检：已超限的请求不再短暂占住导出槽（否则槽满时合法请求收到
+        503 而不是 429）。权威记账仍由端点体内的 _enforce_* 完成。
         """
 
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # 恢复进行中的导出直接拒绝，且不占用导出槽位
-            _reject_export_during_restore(
-                kwargs.get("request"), kwargs.get("user_id")
-            )
-            if not state.export_slots.acquire(blocking=False):
-                raise HTTPException(
-                    status_code=503,
-                    detail="导出任务过多，请稍后再试",
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                # 恢复进行中的导出直接拒绝，且不占用导出槽位
+                _reject_export_during_restore(
+                    kwargs.get("request"), kwargs.get("user_id")
                 )
-            try:
-                response = func(*args, **kwargs)
-            except BaseException:
-                state.export_slots.release()
-                raise
-            body = getattr(response, "body", None)
-            if not isinstance(response, Response) or body is None:
-                # 非字节响应（受保护端点不应出现）：无法延后释放，按原样返回
-                state.export_slots.release()
-                return response
+                if bucket == "kb":
+                    _precheck_rate_limit(
+                        state,
+                        kwargs.get("request"),
+                        state.kb_limiter,
+                        "知识库操作",
+                    )
+                else:
+                    _precheck_rate_limit(
+                        state,
+                        kwargs.get("request"),
+                        state.read_limiter,
+                        "数据读取",
+                    )
+                if not state.export_slots.acquire(blocking=False):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="导出任务过多，请稍后再试",
+                    )
+                try:
+                    response = func(*args, **kwargs)
+                except BaseException:
+                    state.export_slots.release()
+                    raise
+                body = getattr(response, "body", None)
+                if not isinstance(response, Response) or body is None:
+                    # 非字节响应（受保护端点不应出现）：无法延后释放，按原样返回
+                    state.export_slots.release()
+                    return response
 
-            async def _content():
-                yield body
+                async def _content():
+                    yield body
 
-            headers = {
-                key: value
-                for key, value in response.headers.items()
-                if key.lower() not in {"content-length", "content-type"}
-            }
-            return _ExportLeaseResponse(
-                _content(),
-                state.export_slots.release,
-                status_code=response.status_code,
-                headers=headers,
-                media_type=response.media_type,
-            )
+                headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() not in {"content-length", "content-type"}
+                }
+                return _ExportLeaseResponse(
+                    _content(),
+                    state.export_slots.release,
+                    status_code=response.status_code,
+                    headers=headers,
+                    media_type=response.media_type,
+                )
 
-        return wrapper
+            return wrapper
+
+        return decorator
 
     def _kb_read_guard(func):
         """知识库面板只读接口的并发上限（与导出槽分离）。
@@ -3937,6 +4165,11 @@ def create_app(model: Any = None) -> FastAPI:
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # 已超限的请求不占全库扫描槽位：槽满时应回 429（限流）而不是
+            # 503（知识库读取任务过多），且 429 请求不消耗并发名额
+            _precheck_rate_limit(
+                state, kwargs.get("request"), state.kb_limiter, "知识库操作"
+            )
             if not state.kb_read_slots.acquire(blocking=False):
                 raise HTTPException(
                     status_code=503,
@@ -4227,6 +4460,10 @@ def create_app(model: Any = None) -> FastAPI:
         """离线检索评测：30 个差旅问题（覆盖全部随仓库知识文档）计算
         hit@1/3/5 与 MRR（不调用大模型）。"""
         _reject_cross_site_side_effect(request)
+        # 已超限的请求不触碰跨实例评测锁（否则每次超限调用都要做一次
+        # Redis 锁写，并让锁被占用时的合法评测收到误导性的「评测运行中」
+        # 429）；权威记账仍在锁内执行，额度头来源不变
+        _precheck_rate_limit(state, request, state.kb_limiter, "知识库操作")
         token = state.eval_lock.acquire()
         if token is None:
             raise HTTPException(
@@ -4507,7 +4744,7 @@ def create_app(model: Any = None) -> FastAPI:
         }
 
     @app.get("/api/knowledge/export", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_export_guard("kb")
     def knowledge_export(request: Request) -> Response:
         """导出全部知识片段为 JSON 文件（备份 / 迁移）。"""
         rate_headers = _enforce_kb_rate_limit(state, request)
@@ -4787,7 +5024,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/sessions/export", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_export_guard()
     def export_sessions(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -4981,7 +5218,7 @@ def create_app(model: Any = None) -> FastAPI:
         return {"session_id": session_id, "archived": payload.archived}
 
     @app.get("/api/sessions/{session_id}/export", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_export_guard()
     def export_session(
         request: Request,
         session_id: str = ApiPath(..., pattern=_ID_PATTERN),
@@ -6251,7 +6488,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/trips/calendar", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_export_guard()
     def export_trips_calendar(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -6286,7 +6523,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/trips/export", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_export_guard()
     def export_trips_file(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -6496,7 +6733,7 @@ def create_app(model: Any = None) -> FastAPI:
         return {"trip_id": trip_id, "deleted": True}
 
     @app.get("/api/export", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_export_guard()
     def export(
         request: Request,
         user_id: str = Query(..., pattern=_ID_PATTERN),
@@ -6511,9 +6748,16 @@ def create_app(model: Any = None) -> FastAPI:
         仅知识轴超限（或分片计划暂无法核对）且用户数据本身仍可导出时，
         备份省略 ``knowledge`` 段继续返回 200，响应头
         ``X-Knowledge-Omitted`` 给出原因（``over-limit`` / ``planning-failed``）；
-        用户数据轴超限仍返回 413。
+        用户数据轴超限仍返回 413。``with_knowledge`` 会整库扫描知识片段，
+        因此同时占用知识库桶（先查 KB 桶再查读桶：被 KB 额度拒绝的请求
+        不消耗读额度，避免连带锁死同 IP 的面板读）。
         """
+        kb_headers: dict[str, str] | None = None
+        if with_knowledge and format == "json":
+            kb_headers = _enforce_kb_rate_limit(state, request, "知识库导出操作")
         rate_headers = _enforce_read_rate_limit(state, request)
+        if kb_headers is not None:
+            rate_headers = _tighter_rate_headers(rate_headers, kb_headers)
         entry_epoch = _export_start_epoch(request, user_id)
         if format == "json":
             _reject_oversized_json_export(user_id)
