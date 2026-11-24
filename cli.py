@@ -750,8 +750,13 @@ class AligoCLI:
         """显示执行结果 - 确保永远有回复"""
         self.console.print()
 
-        # 获取结果列表
+        # 获取结果列表（模型 / 旧编排可能把 results 返回成对象或标量：
+        # 非列表时按无结果处理，不能让后续 result.get 在 REPL 里抛异常）
         results = result_data.get("results", [])
+        if isinstance(results, dict):
+            results = [results] if results else []
+        elif not isinstance(results, list):
+            results = []
 
         if not results:
             # 情况1: 没有任何智能体被调用
@@ -881,6 +886,8 @@ class AligoCLI:
         has_output = False
 
         for result in results:
+            if not isinstance(result, dict):
+                continue
             agent_name = result.get("agent_name", "")
             status = result.get("status", "")
             data = result.get("data", {})
@@ -1031,6 +1038,10 @@ class AligoCLI:
                     prefs_list = raw_prefs.get("preferences", [])
                 else:
                     prefs_list = raw_prefs if isinstance(raw_prefs, list) else []
+                if not isinstance(prefs_list, list):
+                    # 模型可能把 preferences 返回成对象 / 标量：按无条目处理，
+                    # 不能让列表推导在 REPL 里抛 TypeError
+                    prefs_list = []
                 # 模型可能返回字符串 / null 等非对象条目，或把 type 返回成
                 # 对象 / 数组 / 含 "/" 的键：落库路径（orchestration_agent）
                 # 只接受可管理的字符串 type，这里同一口径过滤——否则回显
@@ -1150,6 +1161,8 @@ class AligoCLI:
 
                 summary = query_results.get("summary", "")
                 sources = query_results.get("sources", []) or []
+                if not isinstance(sources, list):
+                    sources = []
                 message = query_results.get("message", "")
                 error = query_results.get("error", "")
 
@@ -1179,9 +1192,15 @@ class AligoCLI:
                 if not answer and "data" in data and isinstance(data["data"], dict):
                     answer = data["data"].get("answer")
                 
-                # 增强：也查找 content
+                # 增强：也查找 content（data["data"] 可能是字符串 / null：
+                # 与上方 answer 分支同口径先做 isinstance 守卫）
                 if not answer:
-                    answer = data.get("content") or data.get("data", {}).get("content")
+                    nested = data.get("data")
+                    answer = data.get("content") or (
+                        nested.get("content")
+                        if isinstance(nested, dict)
+                        else None
+                    )
 
                 # 深度清洗
                 if isinstance(answer, dict):
@@ -1440,8 +1459,6 @@ class AligoCLI:
         from context.storage import create_long_term_memory
         from utils.exporter import export_files
 
-        from utils.user_import import backup_limit_problem
-
         # strict：PostgreSQL 配置但不可用时，user-export 与 /api/export 都会
         # 明确拒绝；交互式导出不能静默导出空 / 过期的回退 JSON 并宣称成功
         try:
@@ -1488,12 +1505,18 @@ class AligoCLI:
         data = {
             "user_id": self.user_id,
             "session_id": getattr(self.memory_manager, "session_id", "") or "",
-            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "exported_at": datetime.now().isoformat(),
             **sections,
         }
         # 与 user-export 的落盘口径一致：导出文件固定 LF（newline="\n"），
         # 体积轴按 LF 估算，不再按平台 CRLF 高估
-        problem = backup_limit_problem(data, crlf=False)
+        # 与 user-export / Web /api/export 同一口径：除原始文件形状外还要按
+        # 「恢复到新账号后的导出形状」复核（时间戳归一 32 字符、补行程编号、
+        # 重算统计）——只看原始字节会写出导入端必然拒绝的备份（#929 只迁移了
+        # standalone 与 Web，交互菜单路径遗漏）
+        from utils.user_import import export_backup_limit_problem
+
+        problem = export_backup_limit_problem(data)
         if problem:
             self.console.print(
                 f"[red]导出中止：{problem}（该文件将无法再导入恢复，"
@@ -2221,18 +2244,21 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
 
 def _parse_eval_cases_args(
     args: list[str],
-) -> tuple[int, int, str | None, bool] | None:
-    """解析 eval-cases 的 ``[--count N] [--seed N] [--out PATH] [--json]``。"""
+) -> tuple[int, int, str | None, bool, bool] | None:
+    """解析 eval-cases 的 ``[--count N] [--seed N] [--out PATH] [--force] [--json]``。"""
     count = 500
     seed = 7
     out_path: str | None = None
     as_json = False
+    force = False
     index = 0
     while index < len(args):
         item = args[index]
         lowered = item.lower()
         if lowered == "--json":
             as_json = True
+        elif lowered == "--force":
+            force = True
         elif lowered == "--count" or lowered.startswith("--count="):
             if lowered == "--count":
                 index += 1
@@ -2271,7 +2297,7 @@ def _parse_eval_cases_args(
         else:
             return None
         index += 1
-    return count, seed, out_path, as_json
+    return count, seed, out_path, as_json, force
 
 
 def run_eval_cases_standalone(
@@ -2279,6 +2305,7 @@ def run_eval_cases_standalone(
     seed: int = 7,
     out_path: str | None = None,
     as_json: bool = False,
+    force: bool = False,
 ) -> int:
     """生成分层评测用例（`python cli.py eval-cases`），可选写入 JSONL。
 
@@ -2292,7 +2319,20 @@ def run_eval_cases_standalone(
     try:
         cases = build_cases(count, seed)
         if out_path:
-            dump_cases(out_path, cases)
+            dump_cases(out_path, cases, force=force)
+    except FileExistsError as exc:
+        # 覆盖已存在文件是明确的守卫，不是「生成失败」
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "error": str(exc)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(str(exc))
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
         if as_json:
             print(
@@ -2598,9 +2638,21 @@ def run_knowledge_import_standalone(
         return _fail(f"文件不存在：{path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-        # RecursionError：结构性深层嵌套（如 '['*3000）不是 ValueError 子类，
-        # 不捕获会让 --json 模式打印 traceback、stdout 无结构化输出
+    except MemoryError:
+        # 整份读入的内存不足：给出可执行提示，而不是裸 traceback
+        return _fail(
+            "读取失败：文件过大，内存不足以整体解析；请拆分后再导入"
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
+        # ValueError：JSONDecodeError 是它的子类，Python 3.11+ 对超 4300 位
+        # 整数字面量抛普通 ValueError；RecursionError：结构性深层嵌套
+        # （如 '['*3000）不是 ValueError 子类——都不捕获会让 --json 模式
+        # 打印 traceback、stdout 无结构化输出
         return _fail(f"读取失败：{exc}（文件需为 UTF-8 编码的 JSON）")
 
     documents = (
@@ -3195,7 +3247,7 @@ def run_user_export_standalone(
             data: dict[str, Any] = {
                 "user_id": user_id,
                 "session_id": "",
-                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "exported_at": datetime.now().isoformat(),
             }
             snapshot = getattr(store, "export_snapshot", None)
             if callable(snapshot):
@@ -3660,6 +3712,9 @@ def _read_kb_file(path: str) -> str | None:
 
     try:
         text = Path(path).read_text(encoding="utf-8-sig")
+    except MemoryError:
+        print("读取文件失败：文件过大，内存不足以整体读入；请拆分后再导入")
+        return None
     except UnicodeDecodeError as exc:
         print(f"读取文件失败：{exc}（文件需为 UTF-8 编码）")
         return None
@@ -4056,11 +4111,11 @@ def run_trips_dedupe_standalone(
             print(_plain_safe(message))
         return 1
 
-    def _emit(payload: dict[str, Any]) -> None:
+    def _emit(payload: dict[str, Any], *, ok: bool = True) -> None:
         if as_json:
             print(
                 json.dumps(
-                    {"ok": True, **payload},
+                    {"ok": ok, **payload},
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -4100,7 +4155,10 @@ def run_trips_dedupe_standalone(
                     # 没有重复组也可能存在同 id 多行程（歧义）：同样要提醒
                     "needs_attention": bool(ambiguous),
                     "removed": 0,
-                }
+                },
+                # 退出码 1（存在歧义）时 --json 的 ok 必须同步为 false：
+                # 「退出 1 ⇒ ok:false」是其它命令的共同契约
+                ok=not ambiguous,
             )
             if not as_json:
                 if ambiguous:
@@ -4131,7 +4189,8 @@ def run_trips_dedupe_standalone(
                     "ambiguous_ids": sorted(ambiguous),
                     "needs_attention": bool(ambiguous),
                     "removed": 0,
-                }
+                },
+                ok=not ambiguous,
             )
             if as_json:
                 # dry-run 与正式执行同一退出码语义：存在歧义 id 需人工处理
@@ -4190,7 +4249,8 @@ def run_trips_dedupe_standalone(
                     "duplicates": plan["duplicates"],
                     "ambiguous_ids": sorted(ambiguous),
                     "needs_attention": bool(ambiguous),
-                }
+                },
+                ok=not ambiguous,
             )
             return 1 if ambiguous else 0
         if failure is not None:
@@ -4984,13 +5044,20 @@ def run_session_show_standalone(
             return _fail(f"读取会话失败：{exc}")
         if not messages:
             return _fail(f"会话 {session_id} 不存在或没有消息")
-        title = str((store.get_session_titles() or {}).get(session_id) or "")
-        pinned = session_id in [
-            str(item) for item in store.get_pinned_sessions() or []
-        ]
-        archived = session_id in [
-            str(item) for item in store.get_archived_sessions() or []
-        ]
+        try:
+            # 标题 / 置顶 / 归档同样是存储读取：异常不能以裸 traceback 逃出
+            # （--json 模式下 stdout 会没有任何 JSON）
+            title = str(
+                (store.get_session_titles() or {}).get(session_id) or ""
+            )
+            pinned = session_id in [
+                str(item) for item in store.get_pinned_sessions() or []
+            ]
+            archived = session_id in [
+                str(item) for item in store.get_archived_sessions() or []
+            ]
+        except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            return _fail(f"读取会话状态失败：{exc}")
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -5943,9 +6010,14 @@ def _parse_trip_update_args(args: list[str]) -> dict[str, Any] | None:
             if index >= len(args):
                 return None
             value = args[index]
-        if not value.strip() or value.startswith("-"):
+        key = flag[2:]
+        if value.startswith("-"):
             return None
-        values[flag[2:]] = value.strip()
+        # 与 Web PUT 一致：origin / purpose 允许空串（清空该字段）；
+        # 目的地 / 日期为空仍是非法输入
+        if not value.strip() and key not in {"origin", "purpose"}:
+            return None
+        values[key] = value.strip()
         index += 1
     if len(positional) != 2 or not values:
         return None
@@ -6987,16 +7059,10 @@ _COMMANDS_HINT = (
 
 
 def _safe_export_user(user_id: str) -> str:
-    """导出文件名里的用户 ID：清洗非法字符，撞名风险时追加短哈希。"""
-    import hashlib
-    import re
+    """导出文件名里的用户 ID（与 user-export 共用 utils.exporter 同一实现）。"""
+    from utils.exporter import safe_export_user
 
-    safe = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24] or "user"
-    if safe != user_id:
-        # 中文 / 超长用户 ID 清洗后可能撞名，追加短哈希避免 --force 覆盖他人导出
-        digest = hashlib.sha1(user_id.encode("utf-8")).hexdigest()[:6]
-        safe = f"{safe}_{digest}"
-    return safe
+    return safe_export_user(user_id)
 
 
 def _print_stdout(text: str, end: str = "\n") -> None:
@@ -7100,17 +7166,24 @@ def _main_impl():
             if parsed_cases is None:
                 _cli_fail(
                     "用法：python cli.py eval-cases "
-                    "[--count 500] [--seed 7] [--out PATH] [--json]",
+                    "[--count 500] [--seed 7] [--out PATH] [--force] [--json]",
                     _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
-            cases_count, cases_seed, cases_out, cases_json = parsed_cases
+            (
+                cases_count,
+                cases_seed,
+                cases_out,
+                cases_json,
+                cases_force,
+            ) = parsed_cases
             sys.exit(
                 run_eval_cases_standalone(
                     count=cases_count,
                     seed=cases_seed,
                     out_path=cases_out,
                     as_json=cases_json,
+                    force=cases_force,
                 )
             )
         if arg == "eval-agent":
@@ -7343,24 +7416,37 @@ def _main_impl():
                 run_preferences_list_standalone(pref_user, as_json=pref_json)
             )
         if arg == "pref-set":
-            target = other = value = None
             as_json = False
             json_value = False
             valid = True
+            positional: list[str] = []
+            rest_positional = False
             for item in sys.argv[2:]:
-                if item.lower() == "--json":
+                if rest_positional:
+                    positional.append(item)
+                    continue
+                if item == "--":
+                    # 与 argparse 同语义：-- 之后全部按位置参数处理，
+                    # 负数偏好 / 以 '-' 开头的 JSON 字符串不再被当成选项
+                    rest_positional = True
+                    continue
+                lowered = item.lower()
+                if lowered == "--json":
                     as_json = True
-                elif item.lower() == "--json-value":
+                elif lowered == "--json-value":
                     json_value = True
-                elif item.startswith("-") or value is not None:
+                elif item.startswith("--"):
+                    # 未知长选项仍按用法错误拒绝（单个 '-' 开头的值合法，
+                    # 如 -5；含 '--' 前缀的值请用 -- 分隔）
                     valid = False
                     break
-                elif target is None:
-                    target = item
-                elif other is None:
-                    other = item
                 else:
-                    value = item
+                    positional.append(item)
+            target = other = value = None
+            if len(positional) == 3:
+                target, other, value = positional
+            else:
+                valid = False
             if not valid or value is None:
                 _cli_fail(
                     "用法：python cli.py pref-set <user_id> <偏好类型> <值> [--json-value] [--json]",
@@ -7602,13 +7688,22 @@ def _main_impl():
             as_json = False
             reset = False
             valid = True
+            rest_positional = False
             for item in sys.argv[2:]:
+                if rest_positional:
+                    positional.append(item)
+                    continue
+                if item == "--":
+                    rest_positional = True
+                    continue
                 lowered = item.lower()
                 if lowered == "--json":
                     as_json = True
                 elif lowered == "--reset":
                     reset = True
-                elif item.startswith("-") or len(positional) >= 3:
+                elif item.startswith("--") or len(positional) >= 3:
+                    # 单个 '-' 开头的标题合法（如 "- 北京"）；以 '--' 开头的
+                    # 标题用 -- 分隔（与 argparse 同语义），未知长选项仍拒绝
                     valid = False
                     break
                 else:

@@ -685,6 +685,15 @@ def test_session_title_dispatch(monkeypatch):
             ["cli.py", "session-title", "u1", "s1", "标题", "--JSON"],
             ("u1", "s1", "标题", True),
         ),
+        # 单个 '-' 开头的标题直接可用；'--' 开头需 -- 分隔（与 argparse 同语义）
+        (
+            ["cli.py", "session-title", "u1", "s1", "- 北京", "--json"],
+            ("u1", "s1", "- 北京", True),
+        ),
+        (
+            ["cli.py", "session-title", "u1", "s1", "--", "-- 北京"],
+            ("u1", "s1", "-- 北京", False),
+        ),
     ):
         monkeypatch.setattr(sys, "argv", argv)
         with pytest.raises(SystemExit) as exc:

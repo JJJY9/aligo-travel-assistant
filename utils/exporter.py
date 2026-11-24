@@ -163,6 +163,31 @@ def render_markdown(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def safe_export_user(user_id: str) -> str:
+    """导出文件名里的用户 ID：清洗非法字符，撞名风险时追加短哈希。
+
+    大小写不敏感文件系统上 ``Alice`` / ``alice`` 是不同账号却解析到同一
+    目录项；清洗后追加的 ``_<hex>`` 后缀与合法 ASCII ID 空间也重叠
+    （如 张三 → ___ced07f，用户 ___ced07f 原样保留）。出现任一风险时
+    统一追加 user_id 的短哈希，展开后按大小写折叠仍唯一。
+    """
+    import hashlib
+    import re
+
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24] or "user"
+    risky = (
+        safe != user_id
+        # 大小写不敏感文件系统：Alice / alice 会撞到同一文件
+        or safe != safe.lower()
+        # 与「清洗后名 + _<6 hex>」的生成空间重叠
+        or bool(re.search(r"_[0-9a-f]{6}$", safe))
+    )
+    if risky:
+        digest = hashlib.sha1(user_id.encode("utf-8")).hexdigest()[:6]
+        safe = f"{safe}_{digest}"
+    return safe
+
+
 def export_files(
     data: dict[str, Any],
     out_dir: Path | str,
@@ -173,8 +198,16 @@ def export_files(
     out.mkdir(parents=True, exist_ok=True)
 
     if stem is None:
-        timestamp = str(data.get("exported_at", "")).replace(":", "").replace("-", "")[:15]
-        stem = f"{data.get('user_id', 'user')}_{timestamp or 'export'}"
+        # 与 CLI 各导出命令同一命名口径：大小写折叠后仍唯一（Alice /
+        # alice 在大小写不敏感文件系统上不再互相覆盖）；保留微秒避免
+        # 同一用户同一秒内两次导出互相覆盖
+        timestamp = (
+            str(data.get("exported_at", ""))
+            .replace(":", "")
+            .replace("-", "")[:21]
+        )
+        user = safe_export_user(str(data.get("user_id", "user")) or "user")
+        stem = f"{user}_{timestamp or 'export'}"
 
     # 备份与 Markdown 使用同一份清洗后的数据：嵌套非有限数 / NUL / 孤立
     # 代理项会让「导出成功」的备份在恢复时被整条拒绝，或让 write_text 抛
