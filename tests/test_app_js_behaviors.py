@@ -257,20 +257,27 @@ def test_export_reports_skipped_knowledge():
 
 
 def test_render_markdown_caps_oversized_message():
-    """超大单条消息截断渲染（防止打开会话冻结主线程），常规消息不受影响。"""
+    """超大单条消息截断渲染（防止打开会话冻结主线程），用户气泡同样受限。"""
     data = _run_harness("renderCap")
     assert data["cut"] is True, data
     assert data["cappedLength"] < 260000, data["cappedLength"]
     assert data["normalUntouched"] is True, data
-    print("✓ Markdown 渲染长度上限")
+
+    assert data["userCut"] is True, data
+    assert data["userCappedLength"] < 260000, data["userCappedLength"]
+    assert data["userNormalUntouched"] is True, data
+    print("✓ Markdown / 用户气泡渲染长度上限")
 
 
 def test_archived_toggle_rolls_back_on_failure():
-    """归档视图切换失败时回滚状态位，视图与按钮态保持一致。"""
+    """归档视图切换失败时回滚状态位并按恢复视图重渲染。"""
     data = _run_harness("archivedRollback")
     assert data["showArchived"] is False, data
+    # 失败分支按已渲染快照回滚并重渲染；重叠点击后视图位仍与快照一致
+    assert data["showArchived"] == bool(data["loadedArchived"]), data
     assert any("加载会话列表失败" in item for item in data["toasts"]), data
-    print("✓ 归档切换失败回滚")
+    assert data["renderCalls"] >= 1, data
+    print("✓ 归档切换失败回滚并重渲染（含重叠点击）")
 
 
 def test_send_message_confirms_pending_edit_draft():
@@ -313,12 +320,20 @@ def test_editor_round2_preferences_and_guards():
 
 
 def test_search_failure_restores_previous_query():
-    """搜索失败后查询词回到旧值，列表与「加载更多」保持同一查询口径。"""
+    """搜索失败回滚到「已渲染查询」；被取代的失败不滚到未渲染词。"""
     data = _run_harness("sessionSearchFailure")
-    assert data["searchQuery"] == "old", data
-    assert data["sessions"] == ["s-old"], data
-    assert any("加载会话列表失败" in item for item in data["toasts"]), data
-    print("✓ 搜索失败恢复旧查询词（列表与分页不混入新查询）")
+    single = data["single"]
+    assert single["searchQuery"] == "old", single
+    assert single["sessions"] == ["s-old"], single
+    assert any("加载会话列表失败" in item for item in single["toasts"]), single
+
+    # 被取代的重试：回滚目标是已渲染查询（old），晚到的成功被作废
+    superseded = data["superseded"]
+    assert superseded["searchQuery"] == superseded["loaded"] == "old", superseded
+    assert superseded["sessions"] == ["s-old"], superseded
+
+    assert data["moreBlocked"] is True, "状态与已渲染快照不一致时不能发分页请求"
+    print("✓ 搜索失败恢复已渲染查询（列表与分页不混入新查询）")
 
 
 def test_history_renders_in_windows():

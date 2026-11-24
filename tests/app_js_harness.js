@@ -1743,7 +1743,8 @@ async function scenarioSearchJump(source) {
 }
 
 async function scenarioSessionSearchFailure(source) {
-  // 搜索请求失败：查询词要回到旧值，列表与「加载更多」仍按旧查询工作
+  // 搜索请求失败：查询词要回到「已渲染列表」的查询，列表与「加载更多」
+  // 仍按旧查询工作；被后一次请求取代的失败同样不能把状态滚到未渲染词
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
   run(`
@@ -1752,6 +1753,8 @@ async function scenarioSessionSearchFailure(source) {
     state.sessionsOffset = 1;
     state.sessionTotal = 1;
     state.searchQuery = "old";
+    state.sessionsLoadedQuery = "old";
+    state.sessionsLoadedArchived = false;
     state.sessionsLoading = false;
     els.history = {
       innerHTML: "",
@@ -1765,11 +1768,34 @@ async function scenarioSessionSearchFailure(source) {
   const request = await waitRequest(env);
   request.reject(new Error("boom"));
   await promise;
-  return {
+  const single = {
     searchQuery: run("state.searchQuery"),
     sessions: run("state.sessions.map((s) => s.session_id)"),
     toasts: run("globalThis.__toasts || []"),
   };
+
+  // 被取代的重试：A 在途时同词重试 B，B 失败——回滚目标是已渲染查询
+  // （old），不是从未渲染过的 foo；A 晚到的成功也必须被作废
+  const a = run('loadSessions("foo", { reset: true })');
+  const requestA = await waitRequest(env);
+  const b = run('loadSessions("foo", { reset: true })');
+  const requestB = await waitRequest(env);
+  requestB.reject(new Error("timeout"));
+  await b;
+  requestA.resolve({ sessions: [{ session_id: "foo-1", title: "f" }], total: 1 });
+  await a;
+  const superseded = {
+    searchQuery: run("state.searchQuery"),
+    loaded: run("state.sessionsLoadedQuery"),
+    sessions: run("state.sessions.map((s) => s.session_id)"),
+  };
+
+  // 状态与已渲染快照不一致时「加载更多」不发请求
+  run('state.searchQuery = "drift"');
+  run("loadMoreSessions()");
+  await tick();
+  const moreBlocked = env.__requests.length === 0;
+  return { single, superseded, moreBlocked };
 }
 
 async function scenarioSilentRestoreWindow(source) {
@@ -2593,10 +2619,16 @@ function scenarioRenderCap(source) {
   const big = "长".repeat(300000);
   const html = run(`renderMarkdown(${JSON.stringify(big)})`);
   const normal = run('renderMarkdown("普通内容")');
+  // 用户消息气泡同样要有渲染上限（备份恢复允许单条消息接近 50MB）
+  const userText = run(`capRenderText(${JSON.stringify(big)})`);
+  const smallText = run('capRenderText("普通提问")');
   return {
     cut: html.includes("已截断显示"),
     cappedLength: html.length,
     normalUntouched: !normal.includes("已截断显示") && normal.includes("普通内容"),
+    userCut: userText.includes("已截断显示"),
+    userCappedLength: userText.length,
+    userNormalUntouched: smallText === "普通提问",
   };
 }
 
@@ -2610,7 +2642,12 @@ async function scenarioArchivedRollback(source) {
     state.userId = "u1";
     state.showArchived = false;
     state.sessions = [{ session_id: "s1", title: "t", message_count: 1, updated_at: "" }];
+    state.sessionsLoadedQuery = "";
+    state.sessionsLoadedArchived = false;
     state.sessionsLoading = false;
+    globalThis.__renderCalls = 0;
+    const realRender = renderHistory;
+    renderHistory = () => { __renderCalls += 1; return realRender(); };
     bindEvents();
   `);
   run("els.archivedToggle.click()");
@@ -2619,9 +2656,18 @@ async function scenarioArchivedRollback(source) {
     if (!run("state.sessionsLoading")) break;
   }
   await new Promise((resolve) => setTimeout(resolve, 10));
+  // 重叠点击：第二次翻转取代第一次请求；失败后视图位必须与已渲染快照一致
+  run("els.archivedToggle.click(); els.archivedToggle.click();");
+  for (let i = 0; i < 50; i += 1) {
+    await tick();
+    if (!run("state.sessionsLoading")) break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 10));
   return run(`({
     showArchived: state.showArchived,
+    loadedArchived: state.sessionsLoadedArchived,
     toasts: __toasts.slice(),
+    renderCalls: __renderCalls,
   })`);
 }
 

@@ -130,6 +130,10 @@ const state = {
   archivedCount: 0,
   archivedMatches: 0,
   sessionsLoading: false,
+  // 会话列表当前渲染内容对应的查询 / 归档快照：搜索失败回滚与「加载更多」
+  // 都以它为准（对齐知识库的 kbLoadedQuery / kbLoadedCategory）
+  sessionsLoadedQuery: null,
+  sessionsLoadedArchived: null,
   sessionLoading: false,
   // 正在进行加载的会话 id：删除其它会话时不能作废这次加载
   sessionLoadingId: null,
@@ -813,12 +817,22 @@ function chipButton(iconName, label, onClick) {
   return button;
 }
 
+function capRenderText(text) {
+  // 用户消息也要有渲染上限：备份恢复允许单条消息接近 50MB，原样塞进
+  // pre-wrap 气泡会让浏览器布局阶段冻结主线程（助手消息已由
+  // renderMarkdown 的 MAX_MARKDOWN_CHARS 截断，这里此前遗漏）
+  const source = String(text == null ? "" : text);
+  return source.length > MAX_MARKDOWN_CHARS
+    ? source.slice(0, MAX_MARKDOWN_CHARS) + "…（已截断显示）"
+    : source;
+}
+
 function renderUserNode(text) {
   const node = document.createElement("div");
   node.className = "msg user";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+  bubble.textContent = capRenderText(text);
   node.appendChild(bubble);
   return node;
 }
@@ -927,6 +941,11 @@ function startEditUserNode(node, originalText) {
 
   async function submit() {
     if (saving) return;
+    if (state.busy) {
+      // 流式回合进行中删除 / 重发会与在途回合交错（旧流事件写回新视图）
+      toast("请等待当前回复完成");
+      return;
+    }
     if (!state.ready) {
       // 初始化未完成：此时 sendMessage 会直接拒绝，而本轮删除已经发生，
       // 这一轮会从历史里消失。删除前先拦住
@@ -2401,10 +2420,13 @@ function renderHistory() {
     hint.className = "history-more archived-hint";
     hint.dataset.focusKey = "archived-hint";
     hint.textContent = `另有 ${state.archivedMatches} 条归档会话匹配`;
-    hint.addEventListener("click", () => {
+    hint.addEventListener("click", async () => {
       state.showArchived = true;
       updateArchivedToggle();
-      loadSessions(state.searchQuery, { reset: true });
+      // 失败时 loadSessions 已按已渲染快照回滚并重渲染（快照为 null 时
+      // 回滚为非归档视图），这里只收敛按钮态
+      await loadSessions(state.searchQuery, { reset: true });
+      updateArchivedToggle();
     });
     els.history.appendChild(hint);
   };
@@ -2449,7 +2471,12 @@ function renderHistory() {
     groups.forEach((items, label) => addSection(label, items));
   }
 
-  if (state.sessions.length < state.sessionTotal) {
+  const viewAligned =
+    (state.sessionsLoadedQuery === null ||
+      state.searchQuery === state.sessionsLoadedQuery) &&
+    (state.sessionsLoadedArchived === null ||
+      state.showArchived === state.sessionsLoadedArchived);
+  if (viewAligned && state.sessions.length < state.sessionTotal) {
     const more = document.createElement("button");
     more.type = "button";
     more.className = "history-more";
@@ -2593,6 +2620,10 @@ async function loadSessions(query = state.searchQuery, options = {}) {
       }
       state.sessionsOffset = serverOffset;
     }
+    // 快照紧跟数据写入：归档匹配是独立子请求，期间被后续 reset 取代时
+    // 本请求会早退——快照必须已经与 state.sessions / offset 对齐
+    state.sessionsLoadedQuery = state.searchQuery;
+    state.sessionsLoadedArchived = state.showArchived;
     if (data.archived_count !== undefined) {
       updateArchivedToggle(Number(data.archived_count));
     }
@@ -2621,16 +2652,26 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     if (requestId !== sessionsRequestId) return;
     state.sessionsLoading = false;
     if (options.reset) {
-      // 失败不能把查询词留成新词：列表与分页游标仍是旧查询的，随后
-      // 「加载更多」会用新词 + 旧 offset 拉取，把不同查询的结果混进列表
-      state.searchQuery = previousQuery;
+      // 失败不能把查询词留成新词：列表与分页游标仍是旧查询的。回滚目标
+      // 必须是「当前列表实际渲染的查询」（快照），而不是「上一次请求的
+      // 查询词」——请求被后一次取代时 previousQuery 从未渲染过，状态与
+      // 列表会分叉，「加载更多」随后把两个查询的结果混进同一列表
+      state.searchQuery =
+        state.sessionsLoadedQuery === null
+          ? previousQuery
+          : state.sessionsLoadedQuery;
+      state.showArchived = Boolean(state.sessionsLoadedArchived);
+      updateArchivedToggle();
     }
     // 存储故障 / 网络抖动不能伪装成「没有历史」：保留已有列表并提示
     toast(`加载会话列表失败：${error.message || error}`);
     if (!state.sessions.length) {
-      // 空列表也要让调用方（归档切换）知道失败并回滚状态位
+      // 空列表也要让调用方（归档切换）知道失败并回滚状态位；列表内容
+      // 已清空，渲染快照随之失效（任何查询都可重试）
       state.sessionTotal = 0;
       state.archivedMatches = 0;
+      state.sessionsLoadedQuery = null;
+      state.sessionsLoadedArchived = null;
       els.history.innerHTML =
         '<div class="history-empty">加载会话列表失败，请稍后重试</div>';
       return false;
@@ -2648,6 +2689,18 @@ async function loadSessions(query = state.searchQuery, options = {}) {
 async function loadMoreSessions() {
   // 视图切换 / 新搜索的第一页仍在加载时，旧列表的 offset 不能用于新查询
   if (state.sessionsLoading) return;
+  const alignedQuery =
+    state.sessionsLoadedQuery === null ||
+    state.searchQuery === state.sessionsLoadedQuery;
+  const alignedArchived =
+    state.sessionsLoadedArchived === null ||
+    state.showArchived === state.sessionsLoadedArchived;
+  if (!alignedQuery || !alignedArchived) {
+    // 当前状态与已渲染列表不一致（搜索失败回滚前 / 归档切换中）：
+    // 以新查询 + 旧游标取页会把两个查询的结果混进同一列表。快照为
+    // null 表示还没有任何经 loadSessions 渲染的列表，按当前状态放行
+    return;
+  }
   const viewQuery = state.searchQuery;
   const viewArchived = state.showArchived;
   const requestId = (sessionsRequestId += 1);
@@ -2656,8 +2709,8 @@ async function loadMoreSessions() {
     limit: "50",
     offset: String(state.sessionsOffset),
   });
-  if (state.searchQuery) params.set("q", state.searchQuery);
-  if (state.showArchived) params.set("archived", "1");
+  if (state.sessionsLoadedQuery) params.set("q", state.sessionsLoadedQuery);
+  if (state.sessionsLoadedArchived) params.set("archived", "1");
   try {
     const data = await getJSON(`/api/sessions?${params}`, undefined, 30000);
     if (requestId !== sessionsRequestId) return;
@@ -2741,7 +2794,12 @@ async function openSession(sessionId, options = {}) {
     syncSessionControls();
 
     const session = state.sessions.find((item) => item.session_id === sessionId);
-    setConversationTitle(session ? session.title : data.title || "对话");
+    // 详情响应里的标题比侧栏列表新（列表可能是并发刷新前的快照）
+    setConversationTitle(
+      (data.title && data.title !== "新对话" ? data.title : "") ||
+        (session ? session.title : "") ||
+        "对话",
+    );
 
     // 先快照上次渲染状态：下面会清零 partialHistory，无法再区分「上次
     // 窗口本就不含末尾（搜索命中 / 手动收起）」与「上次渲染到末尾、
@@ -2993,11 +3051,14 @@ function startRenameSession(item, session, initialValue) {
     const value = input.value.trim();
     settled = true;
     try {
-      await getJSON(`/api/sessions/${encodeURIComponent(session.session_id)}/title`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: state.userId, title: value }),
-      });
+      const saved = await getJSON(
+        `/api/sessions/${encodeURIComponent(session.session_id)}/title`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: state.userId, title: value }),
+        },
+      );
       toast(value ? "会话已重命名" : "已恢复自动标题");
       // 先移除输入框再刷新：否则 renderHistory 会把「正在重命名」的
       // 快照恢复出来，已保存的输入框重新出现
@@ -3010,7 +3071,13 @@ function startRenameSession(item, session, initialValue) {
       if (refreshed) refreshed.focus();
       if (state.sessionId === session.session_id) {
         const updated = state.sessions.find((s) => s.session_id === session.session_id);
-        setConversationTitle(updated ? updated.title : value);
+        // PUT 响应里的 title 是权威值（空串 = 恢复自动标题，自动标题由
+        // 列表刷新提供）；刷新失败 / 被并发刷新作废时不再回退旧标题
+        const savedTitle =
+          saved && typeof saved.title === "string" ? saved.title : "";
+        setConversationTitle(
+          savedTitle || (updated && updated.title) || "对话",
+        );
       }
     } catch (error) {
       settled = false;
@@ -3078,6 +3145,9 @@ async function deleteSession(sessionId) {
     state.sessionsOffset = Math.max(0, state.sessionsOffset - 1);
     renderHistory();
     await loadSessions();
+    // 状态卡片（「即将出行」等）可能引用已删除的会话：不刷新时点击会
+    // 打开一个不存在的会话、把当前对话视图重置
+    refreshStatus().catch(() => {});
     toast("会话已删除");
   } catch (error) {
     toast(`删除失败：${error.message}`);
@@ -6051,6 +6121,10 @@ async function saveUser() {
     state.sessions = [];
     state.sessionTotal = 0;
     state.archivedMatches = 0;
+    // 快照属于上一个用户的已渲染列表：不清掉的话，首屏请求失败时
+    // 失败分支会按陈旧快照把上一用户的查询词 / 归档视图回滚给新用户
+    state.sessionsLoadedQuery = null;
+    state.sessionsLoadedArchived = null;
     els.history.innerHTML = "";
     renderOverview();
     await loadSessions(state.searchQuery, { reset: true });
@@ -6163,16 +6237,13 @@ function bindEvents() {
 
   byId("newSession").addEventListener("click", newSession);
   els.archivedToggle.addEventListener("click", async () => {
-    const previous = state.showArchived;
-    state.showArchived = !previous;
+    state.showArchived = !state.showArchived;
     updateArchivedToggle();
-    const ok = await loadSessions(state.searchQuery, { reset: true });
-    if (ok === false) {
-      // 列表仍是旧视图的数据：状态位必须回滚，否则分组 / 按钮态 / 分页
-      // 口径与真实列表互相矛盾
-      state.showArchived = previous;
-      updateArchivedToggle();
-    }
+    // 失败时 loadSessions 内部已按「已渲染快照」回滚视图位并重渲染；
+    // 这里不能再按点击前捕获的值覆盖——重叠点击时它是瞬态值，会与
+    // 快照 / 列表数据分叉
+    await loadSessions(state.searchQuery, { reset: true });
+    updateArchivedToggle();
   });
   byId("brandHome").addEventListener("click", (event) => {
     event.preventDefault();
