@@ -4371,6 +4371,149 @@ def test_write_batch_serializes_other_threads():
     print("✓ write_batch 与其它线程的写互斥")
 
 
+def test_delete_paths_clean_integer_metadata_entries():
+    """整数形态的置顶 / 归档条目随删除一起清理（同 ID 复用不继承旧状态）。"""
+    import json as json_module
+
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    db = Path(path) / "u-int-meta.json"
+    # 旧数据：整数 session_id 的消息 + 整数元数据条目
+    db.write_text(
+        json_module.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "Q1",
+                        "session_id": 42,
+                        "timestamp": "2000-01-01T00:00:00",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "A1",
+                        "session_id": 42,
+                        "timestamp": "2000-01-01T00:00:01",
+                    },
+                ],
+                "session_titles": {"42": "旧标题"},
+                "pinned_sessions": [42],
+                "archived_sessions": [42],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-int-meta", path)
+    assert memory.delete_last_turn("42", expect="Q1") == 2
+    reloaded = LongTermMemory("u-int-meta", path)
+    assert reloaded.get_session_titles() == {}, "删空后标题应清理"
+    assert reloaded.get_pinned_sessions() == [], "整数置顶条目必须一并清理"
+    assert reloaded.get_archived_sessions() == [], "整数归档条目必须一并清理"
+    # 同 ID 重新对话：不继承旧置顶 / 归档
+    reloaded.add_chat_turn("新问题", "新回答", session_id="42")
+    assert reloaded.get_pinned_sessions() == []
+    assert reloaded.get_archived_sessions() == []
+
+    # 仅剩元数据的幽灵（无消息）：删除会话也应清空条目（对齐 PG 无条件清理）
+    ghost_path = tempfile.mkdtemp()
+    (Path(ghost_path) / "u-ghost.json").write_text(
+        json_module.dumps(
+            {"pinned_sessions": [42], "archived_sessions": ["42"]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ghost = LongTermMemory("u-ghost", ghost_path)
+    assert ghost.delete_chat_session("42") == 0
+    cleared = LongTermMemory("u-ghost", ghost_path)
+    assert cleared.get_pinned_sessions() == []
+    assert cleared.get_archived_sessions() == []
+    print("✓ 删除路径清理整数置顶 / 归档条目")
+
+
+def test_batch_restore_dedupes_integer_metadata():
+    """批量恢复按字符串口径判重与移除：不再产生 [42, "42"] 重复条目。"""
+    import json as json_module
+
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    (Path(path) / "u-int-batch.json").write_text(
+        json_module.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "Q",
+                        "session_id": 42,
+                        "timestamp": "2000-01-01T00:00:00",
+                    }
+                ],
+                "pinned_sessions": [42],
+                "archived_sessions": [42],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-int-batch", path)
+    assert memory.set_sessions_pinned(["42"], pinned=True) == 1
+    assert memory.set_sessions_archived(["42"], archived=True) == 1
+    assert memory.get_pinned_sessions() == [42], "等价条目不应重复追加"
+    assert memory.get_archived_sessions() == [42]
+    # 取消置顶 / 恢复一次即清空全部等价条目
+    assert memory.set_sessions_pinned(["42"], pinned=False) == 1
+    assert memory.get_pinned_sessions() == []
+    assert memory.set_session_archived("42", archived=False) is True
+    assert memory.get_archived_sessions() == []
+    print("✓ 批量恢复按字符串口径去重（整数 + 字符串等价）")
+
+
+def test_write_batch_covers_session_metadata_and_delete_last_turn(monkeypatch):
+    """write_batch 覆盖单条元数据 setter 与 delete_last_turn（批内失败整批回滚）。"""
+    import pytest
+
+    from context.long_term_memory import LongTermMemory
+
+    path = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch-meta", path)
+    memory.add_chat_turn("Q1", "A1", session_id="s1")
+    saves: list[int] = []
+    real_save = LongTermMemory._save
+
+    def _counting(self):
+        if self is memory:
+            saves.append(1)
+        return real_save(self)
+
+    monkeypatch.setattr(LongTermMemory, "_save", _counting)
+    with pytest.raises(RuntimeError):
+        with memory.write_batch():
+            memory.save_preference("hotel_brand", ["汉庭"])
+            memory.set_session_title("s1", "新标题")
+            memory.set_session_pinned("s1", True)
+            memory.delete_last_turn("s1")
+            raise RuntimeError("boom")
+    assert saves == [], "批内（含元数据 setter 与删轮）不得提前落盘"
+    reloaded = LongTermMemory("u-batch-meta", path)
+    assert "hotel_brand" not in reloaded.get_preference(), "整批回滚"
+    assert reloaded.get_session_titles() == {}
+    assert reloaded.get_pinned_sessions() == []
+    assert len(reloaded.get_chat_history()) == 2, "删轮也应随批回滚"
+
+    # 成功混合批：恰好一次写盘
+    with memory.write_batch():
+        memory.save_preference("airline", ["东航"])
+        memory.set_session_title("s1", "保留标题")
+    assert saves == [1]
+    final = LongTermMemory("u-batch-meta", path)
+    assert final.get_preference()["airline"] == ["东航"]
+    assert final.get_session_titles()["s1"] == "保留标题"
+    print("✓ write_batch 覆盖元数据 setter 与删轮")
+
+
 def test_stale_snapshot_does_not_resurrect_trip():
     """回合开始时的旧快照写回时，不能把别处刚删除的行程/统计恢复。"""
     from context.long_term_memory import LongTermMemory

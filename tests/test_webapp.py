@@ -549,6 +549,74 @@ def test_session_detail_fails_closed_when_store_unavailable(monkeypatch):
     print("✓ 会话详情严格打开存储（不可用时 503）")
 
 
+def test_sessions_and_status_fail_closed_when_store_unavailable(monkeypatch):
+    """PG 故障冷却期：会话列表与状态同样 503（与详情 / 写接口同口径）。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    def _fail(user_id, *args, **kwargs):
+        raise MemoryPersistenceError("PostgreSQL 处于故障冷却期")
+
+    monkeypatch.setattr(server_module, "_open_long_term", _fail)
+    client = _client()
+    for path in ("/api/sessions", "/api/status"):
+        response = client.get(path, params={"user_id": "u1"})
+        assert response.status_code == 503, (path, response.text)
+    print("✓ 列表 / 状态严格打开存储（PG 故障期 503）")
+
+
+def test_session_metadata_string_identity():
+    """整数历史元数据：置顶响应 / 列表 / 归档计数按字符串归一口径。"""
+    user = _unique_user("web_test_int_meta")
+    path = Path(MEMORY_DIR) / f"{user}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "Q",
+                        "session_id": 42,
+                        "timestamp": "2000-01-01T00:00:00",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Z",
+                        "session_id": 0,
+                        "timestamp": "2000-01-02T00:00:00",
+                    },
+                ],
+                "pinned_sessions": [42],
+                "archived_sessions": [42],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        client = _client()
+        pinned = client.put(
+            "/api/sessions/42/pin", json={"user_id": user, "pinned": True}
+        )
+        assert pinned.status_code == 200, pinned.text
+        assert pinned.json()["pinned"] is True, (
+            "整数置顶条目下重复置顶应报 pinned=true"
+        )
+        listing = client.get("/api/sessions", params={"user_id": user}).json()
+        ids = {item["session_id"] for item in listing["sessions"]}
+        assert "0" in ids, "整数 0 会话应出现在列表（与 Web / PG 同口径）"
+        assert "42" not in ids, "归档会话不出现在默认列表"
+        assert listing["archived_count"] == 1
+        archived = client.get(
+            "/api/sessions", params={"user_id": user, "archived": True}
+        ).json()
+        assert [item["session_id"] for item in archived["sessions"]] == ["42"]
+        assert archived["archived_count"] == 1
+    finally:
+        _cleanup(user)
+    print("✓ 整数元数据按字符串归一口径（置顶响应 / 列表 / 归档计数）")
+
+
 def test_export_concurrency_guard():
     """全量导出并发受信号量限制：槽位占满时快速 503，不排队申请内存。"""
     client = _client()
@@ -12780,21 +12848,28 @@ def test_archived_count_shared_live_ids_matches_scan():
     ]
     data = {
         "chat_history": history,
-        # s1 重复计两条、保留字 'export' 与空白串照旧计入；'0' 不在集合、
-        # 空串 falsy、ghost 没有消息 —— 与旧实现同一口径
+        # 集合语义：重复条目只计一次；保留字 'export' 与纯空白串不算可见
+        # 会话；整数 0 是合法会话（与 PG 的 TEXT 列 / 归档视图一致）；
+        # ghost 没有消息 —— 计数 = {"s1", "0"} 与可见集合的交集
         "archived_sessions": ["s1", "s1", "export", " ", "0", "", "ghost"],
     }
     live: set[str] = set()
     server_module._group_sessions(history, 1_000_000, live_session_ids=live)
     shared = server_module._archived_count(data, live)
-    assert shared == server_module._archived_count(data) == 4
+    assert shared == server_module._archived_count(data) == 2
+    # 归档计数必须与归档视图的会话数逐项一致（重复 / 保留字 / 整数 0）
+    archived_view = server_module._group_sessions(
+        history, 1_000_000, archived=data["archived_sessions"], archived_mode="only"
+    )
+    assert len(archived_view) == shared
+    assert {item["session_id"] for item in archived_view} == {"s1", "0"}
     assert (
         server_module._archived_count(
             {"chat_history": history, "archived_sessions": []}, live
         )
         == 0
     ), "无归档账号直接归零"
-    print("✓ 归档计数复用聚合集合（口径与全量扫描一致）")
+    print("✓ 归档计数复用聚合集合（口径与归档视图一致）")
 
 
 def test_export_reuses_serialized_payload_for_limit_check(monkeypatch):

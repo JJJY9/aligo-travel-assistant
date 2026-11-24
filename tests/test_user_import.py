@@ -253,6 +253,53 @@ def test_prepared_out_binds_cleaned_bytes_for_export(monkeypatch):
     ).encode("utf-8"), "prepared 必须绑定原始备份（写盘）字节"
     print("✓ prepared_out 与写盘字节同源（分片轴不覆盖）")
 
+
+def test_parse_session_metadata_string_identity_and_bad_shapes():
+    """置顶/归档里的整数 0 是合法会话；坏段与非字符串标题计入 errors。"""
+    from utils.user_import import parse_user_export_data
+
+    backup = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "Q",
+                "session_id": 0,
+                "timestamp": "2026-01-01T00:00:00",
+            }
+        ],
+        "pinned_sessions": [0, None, "", {"x": 1}],
+        "archived_sessions": [0],
+        "session_titles": {"0": {"nested": 1}},
+    }
+    sections, errors = parse_user_export_data(backup)
+    assert sections["pinned"] == ["0"], "整数 0 的置顶条目不能被当成空值丢弃"
+    assert sections["archived"] == ["0"]
+    assert sections["titles"] == {}, "非字符串标题不能 repr 成用户可见标题"
+    assert any("不是字符串" in error for error in errors), errors
+
+    bad = {
+        "chat_history": {"not": "list"},
+        "trip_history": "nope",
+        "session_titles": ["x"],
+        "pinned_sessions": "p",
+        "archived_sessions": {"a": 1},
+        "preferences": {"home_location": "上海"},
+    }
+    sections, errors = parse_user_export_data(bad)
+    joined = "\n".join(errors)
+    for name in (
+        "chat_history",
+        "trip_history",
+        "session_titles",
+        "pinned_sessions",
+        "archived_sessions",
+    ):
+        assert name in joined, f"坏段 {name} 必须计入 errors：{errors}"
+    assert sections["preferences"]["home_location"] == "上海", (
+        "坏段不影响其它段恢复"
+    )
+    print("✓ 会话元数据 0 值保留 / 坏段与非字符串标题计入 errors")
+
 def test_parse_export_rejects_invalid():
     sections, errors = parse_user_export("not json")
     assert sections == {} and "JSON 解析失败" in errors[0]
