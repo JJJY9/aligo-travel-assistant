@@ -3147,7 +3147,7 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
                 session_ids = {
                     str(item)
                     for item in (summary.get("sessions") or ())
-                    if item
+                    if item is not None
                 }
             else:
                 history = store.get_chat_history()
@@ -3155,7 +3155,7 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
                 session_ids = {
                     str(item.get("session_id"))
                     for item in history
-                    if item.get("session_id")
+                    if item.get("session_id") is not None
                 }
             archived = store.get_archived_sessions() or []
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -4519,7 +4519,10 @@ def _session_summaries(store, *, needle: str = "") -> list[dict]:
     best_keys: dict[str, str] = {}
     for message in history:
         session_id = message.get("session_id")
-        if not session_id:
+        # 整数 0 是合法会话 ID（与 Web 列表 / PG 同口径）：只跳过 None / 空白串
+        if session_id is None or (
+            isinstance(session_id, str) and not session_id.strip()
+        ):
             continue
         sid = str(session_id)
         entry = grouped.setdefault(
@@ -4827,6 +4830,21 @@ def run_session_delete_standalone(
                     )
                 except Exception:  # noqa: BLE001 - 读取失败按不存在处理
                     exists = False
+            metadata_only = False
+            if not exists:
+                # 仅剩元数据的幽灵会话（消息已删 / 从未落库，但标题 /
+                # 置顶 / 归档引用仍在）：Web DELETE 会清理，CLI 此前直接
+                # 报「不存在」，同一状态两入口结论相反。读取失败按命令
+                # 失败上报（破坏性命令不能把读故障当成不存在）
+                titles = store.get_session_titles() or {}
+                pinned = store.get_pinned_sessions() or []
+                archived = store.get_archived_sessions() or []
+                exists = (
+                    session_id in titles
+                    or any(str(item) == session_id for item in pinned)
+                    or any(str(item) == session_id for item in archived)
+                )
+                metadata_only = bool(exists)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取会话失败：{exc}")
         if not exists:
@@ -4853,6 +4871,15 @@ def run_session_delete_standalone(
                     user_id, session_id, source=tombstone_token, force=True
                 )
             return _fail(f"删除会话失败：{exc}")
+        if metadata_only and shared_tombstone:
+            # 仅元数据命中的「删除」没有会话可保护：撤销本进程刚写的墓碑，
+            # 允许同一 session_id 立即复用（与 Web DELETE 对「从未存在 /
+            # 已删空会话」的处理一致；只按本 token 撤销，不会误删并发删
+            # 除方 / 其它实例的墓碑）
+            unmark_session_deleted(
+                user_id, session_id, source=tombstone_token, force=True
+            )
+            shared_tombstone = False
     finally:
         close = getattr(store, "close", None)
         if callable(close):

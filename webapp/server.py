@@ -3354,24 +3354,45 @@ def _load_user_data(user_id: str, strict: bool = False) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="读取用户数据失败，请稍后重试") from exc
 
 
+def _visible_session_ids(history: list[dict[str, Any]]) -> set[str]:
+    """列表里可见的会话 ID 集合（与 ``_group_sessions`` 的归组谓词一致）。
+
+    跳过无归属（None）与纯空白字符串、跳过保留字会话，其余按字符串归一
+    （整数 0 是合法会话，``"0"`` 必须计入）；与归档 / 置顶标记同口径。
+    """
+    result: set[str] = set()
+    for message in history:
+        session_id = message.get("session_id")
+        if session_id is None or (
+            isinstance(session_id, str) and not session_id.strip()
+        ):
+            continue
+        text = str(session_id)
+        if text in RESERVED_SESSION_IDS:
+            continue
+        result.add(text)
+    return result
+
+
 def _archived_count(
     data: dict[str, Any], live_session_ids: set[str] | None = None
 ) -> int:
     """实际仍存在于历史中的归档会话数（消息被删光的归档标记不计入）。
 
-    ``live_session_ids`` 可由调用方传入（会话列表在聚合时顺带收集），
-    省掉对全部消息的第二次扫描；无归档账号直接返回 0。
+    ``live_session_ids`` 可由调用方传入（会话列表在聚合后直接复用其会话
+    集合）；无归档账号直接返回 0。归档列表按集合语义去重后与存活会话
+    求交：与归档视图（``_group_sessions``）逐项一致——重复条目只计一次、
+    保留字 / 空白会话不计、整数 0 的正常计入。
     """
-    archived = data.get("archived_sessions") or []
+    archived = _id_set(data.get("archived_sessions"))
     if not archived:
         return 0
-    if live_session_ids is None:
-        live_session_ids = {
-            str(message.get("session_id"))
-            for message in data.get("chat_history") or []
-            if message.get("session_id")
-        }
-    return sum(1 for session_id in archived if str(session_id) in live_session_ids)
+    live = (
+        live_session_ids
+        if live_session_ids is not None
+        else _visible_session_ids(data.get("chat_history") or [])
+    )
+    return len(archived & live)
 
 
 def _render_stored_message(message: dict[str, Any]) -> str:
@@ -3580,8 +3601,9 @@ def _group_sessions(
     """按会话聚合消息；提供 query 时只返回命中该关键字的会话，并附带命中片段。
 
     ``archived_mode``：``exclude`` 只返回未归档会话，``only`` 只返回归档会话。
-    ``live_session_ids``：可选出参，收集历史里出现过的会话 ID（口径与
-    ``_archived_count`` 的集合完全相同），供列表端点省掉第二次全量扫描。
+    ``live_session_ids``：可选出参，回填聚合后列表可见的会话 ID 集合
+    （与 ``_archived_count`` 的存活会话口径一致），供列表端点省掉第二次
+    全量扫描。
     """
     # 片段 / 标题匹配都用原文查询：_ci_find 自己处理大小写（lower() 改变
     # 长度时改在原文上用正则定位）。先把查询 lower 会让含 İ 的关键字在
@@ -3596,10 +3618,6 @@ def _group_sessions(
     updated_keys: dict[str, Any] = {}
     for message in history:
         session_id = message.get("session_id")
-        if live_session_ids is not None and session_id:
-            # 与 _archived_count 的原集合同一口径：在空白串 / 保留字过滤之前
-            # 收集（恢复语义），truthy 判断保持不变
-            live_session_ids.add(str(session_id))
         # 旧数据里会话 ID 可能是整数（0 也是合法值）：只跳过 None / 空白串
         if session_id is None or (
             isinstance(session_id, str) and not session_id.strip()
@@ -3632,6 +3650,11 @@ def _group_sessions(
                 entry["snippet"] = snippet
                 # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
                 entry["match_index"] = entry["message_count"] - 1
+
+    if live_session_ids is not None:
+        # 聚合后的会话集合即列表可见集合（已按 None / 空白串 / 保留字过滤），
+        # 与 _archived_count 的「存活会话」口径逐项一致
+        live_session_ids.update(grouped)
 
     # 输出前把 updated_at 归一为带偏移的 ISO（JSON 后端的 naive 本地时间
     # 需要补时间戳时刻的偏移；PG 本来就是 aware），否则前端按浏览器时区
@@ -5017,7 +5040,10 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(default="web_user", pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         response.headers.update(_enforce_read_rate_limit(state, request))
-        data = _load_user_data(user_id)
+        # strict：配置 PostgreSQL 但当前不可用时返回可重试 503，不能把
+        # 回退 JSON（陈旧甚至为空）当账号现状展示——详情、元数据写接口与
+        # CLI 已是 strict 口径，列表 / 概览曾静默展示降级数据、口径分叉
+        data = _load_user_data(user_id, strict=True)
         preferences = _visible_preferences(data["preferences"])
         today = datetime.now().date()
         travel_summary = summarize_travel(data["trip_history"], today=today)
@@ -5151,7 +5177,9 @@ def create_app(model: Any = None) -> FastAPI:
         archived: bool = Query(default=False),
     ) -> dict[str, Any]:
         response.headers.update(_enforce_read_rate_limit(state, request))
-        data = _load_user_data(user_id)
+        # strict：与详情 / 写接口 / CLI 同口径——PG 故障期不能把回退 JSON
+        # 的会话列表当「当前数据」展示（列表可点开的会话在详情却 503）
+        data = _load_user_data(user_id, strict=True)
         titles = data.get("session_titles") or {}
         pinned = data.get("pinned_sessions") or []
         archived_ids = data.get("archived_sessions") or []
@@ -5350,7 +5378,9 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("保存失败", exc) from exc
         finally:
             _close_long_term(store)
-        return {"session_id": session_id, "pinned": session_id in pinned}
+        # 读回按字符串归一（与 _group_sessions 的置顶标记同口径）：
+        # 历史整数置顶条目下精确成员判断会把已置顶的会话报成 pinned=false
+        return {"session_id": session_id, "pinned": session_id in _id_set(pinned)}
 
     @app.put("/api/sessions/{session_id}/archive")
     def archive_session(

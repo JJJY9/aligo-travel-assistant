@@ -1624,10 +1624,14 @@ class PostgresLongTermMemory:
         return True
 
     def get_archived_sessions(self) -> list[str]:
-        """返回归档会话 ID（按归档时间倒序）。"""
+        """返回归档会话 ID（按归档时间先后，最早归档在前）。
+
+        与 JSON 后端的追加顺序、pinned 列表的升序口径一致：导出 / 恢复
+        往返时顺序稳定（此前 DESC 让 PG 恢复出的归档列表整体反转）。
+        """
         rows = self._fetchall(
             "SELECT session_id FROM aligo_archived_sessions WHERE user_id = %s "
-            "ORDER BY archived_at DESC, session_id",
+            "ORDER BY archived_at, session_id",
             (self.user_id,),
         )
         return [row[0] for row in rows]

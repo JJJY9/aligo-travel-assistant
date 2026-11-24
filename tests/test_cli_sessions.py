@@ -1704,6 +1704,44 @@ def test_session_summaries_equal_instant_keeps_later_original():
     print("✓ 等时刻时间戳保留后一条原文")
 
 
+def test_session_delete_cleans_metadata_only_ghost(monkeypatch):
+    """仅剩元数据的幽灵会话：CLI 删除与 Web DELETE 同口径清理。"""
+    import json as json_module
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    store = LongTermMemory("u-ghost-meta", storage_dir)
+    store.data["session_titles"]["ghost"] = "旧标题"
+    store.data["pinned_sessions"].append("ghost")
+    store.data["archived_sessions"].append("ghost")
+    store._persist()
+    monkeypatch.setattr(
+        storage,
+        "create_long_term_memory",
+        lambda *args, **kwargs: LongTermMemory("u-ghost-meta", storage_dir),
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_delete_standalone(
+            "u-ghost-meta", "ghost", as_json=True
+        )
+    assert code == 0, out.getvalue()
+    payload = json_module.loads(out.getvalue())
+    assert payload["deleted"] == 0
+    reloaded = LongTermMemory("u-ghost-meta", storage_dir)
+    assert "ghost" not in reloaded.get_session_titles()
+    assert reloaded.get_pinned_sessions() == []
+    assert reloaded.get_archived_sessions() == []
+    # 真正不存在的会话仍然报错（行为不变）
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_delete_standalone("u-ghost-meta", "nope")
+    assert code == 1 and "不存在" in out.getvalue()
+    print("✓ CLI 清理仅剩元数据的幽灵会话")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

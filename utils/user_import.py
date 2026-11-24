@@ -1651,8 +1651,18 @@ def parse_user_export_data(
         cleaned_preferences[name] = value
     sections["preferences"] = cleaned_preferences
 
+    def _raw_list(name: str) -> list[Any]:
+        """按名取数组段：缺键 / null 静默（旧备份兼容），类型错误计入 errors。"""
+        raw = data.get(name)
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            errors.append(f"{name} 段不是数组，已忽略")
+            return []
+        return raw
+
     trips: list[dict[str, Any]] = []
-    raw_trips = _as_list(data.get("trip_history"))
+    raw_trips = _raw_list("trip_history")
     if len(raw_trips) > _MAX_TRIPS:
         errors.append(f"行程超过 {_MAX_TRIPS} 条，多余条目已跳过")
         raw_trips = raw_trips[:_MAX_TRIPS]
@@ -1730,7 +1740,7 @@ def parse_user_export_data(
     sections["trips"] = trips
 
     messages: list[dict[str, Any]] = []
-    raw_messages = _as_list(data.get("chat_history"))
+    raw_messages = _raw_list("chat_history")
     if len(raw_messages) > _MAX_MESSAGES:
         errors.append(f"聊天消息超过 {_MAX_MESSAGES} 条，多余条目已跳过")
         raw_messages = raw_messages[:_MAX_MESSAGES]
@@ -1773,13 +1783,24 @@ def parse_user_export_data(
     session_ids = {m["session_id"] for m in messages if m["session_id"]}
 
     titles: dict[str, str] = {}
-    for key, value in _as_dict(data.get("session_titles")).items():
+    raw_titles = data.get("session_titles")
+    if raw_titles is not None and not isinstance(raw_titles, dict):
+        errors.append("session_titles 段不是对象，已忽略")
+        raw_titles = {}
+    for key, value in (raw_titles or {}).items():
         session_id = str(key or "").strip()
-        title = str(value or "").strip()
-        if not session_id or not title:
+        if not session_id:
             continue
         if session_id not in session_ids:
             # 悬空的会话元数据（导出源自身也会忽略）不阻断恢复
+            continue
+        # 标题必须是字符串：Web PUT 与 CLI session-title 只接受字符串；
+        # str() 会把对象 / 数组 / 数字变成 Python repr 写成用户可见标题
+        if value is not None and not isinstance(value, str):
+            errors.append(f"忽略会话 {session_id} 的标题：不是字符串")
+            continue
+        title = (value or "").strip()
+        if not title:
             continue
         problem = _text_problem(title)
         if problem:
@@ -1793,8 +1814,12 @@ def parse_user_export_data(
         # 集合去重：恢复的置顶 / 归档列表可能很长（&~上万条），
         # list membership 会让解析变成 O(n²)、导入挂起
         seen: set[str] = set()
-        for item in _as_list(data.get(name)):
-            session_id = str(item or "").strip()
+        for item in _raw_list(name):
+            if isinstance(item, (dict, list, set, tuple)):
+                continue
+            # ``item or ""`` 会把整数 0（合法会话 ID）当成空值丢弃；
+            # 与 Web _id_set 同口径：None 视为空、False 归 "False"
+            session_id = str(item if item is not None else "").strip()
             if session_id and session_id in session_ids and session_id not in seen:
                 seen.add(session_id)
                 result.append(session_id)

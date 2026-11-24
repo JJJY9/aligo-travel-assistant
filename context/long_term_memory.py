@@ -67,6 +67,34 @@ def _session_dedupe_key(value: object) -> str | None:
     return session_dedupe_key(value)
 
 
+def _session_ref_matches(value: object, session_id: str) -> bool:
+    """会话元数据（置顶 / 归档）条目是否指向该会话：与消息同一字符串口径。
+
+    旧数据里 pinned_sessions / archived_sessions 可能存整数 ID；精确类型
+    成员判断既清不掉删除会话留下的整数幽灵，也会让批量恢复把 ``"42"``
+    追加在 ``42`` 旁边形成重复条目。``None`` 跳过（避免 ``str(None)`` 造出
+    名为 None 的幽灵引用），其余按字符串比较，与 PostgreSQL（TEXT 列）一致。
+    """
+    return value is not None and str(value) == session_id
+
+
+def _drop_session_refs(values: Any, session_id: str) -> bool:
+    """从置顶 / 归档列表中移除全部指向该会话的条目；返回是否有改动。
+
+    一次移除所有等价条目（``42`` 与 ``"42"`` 并存的历史数据）；非列表
+    形状保持原样（与既有防御一致）。
+    """
+    if not isinstance(values, list):
+        return False
+    kept = [
+        item for item in values if not _session_ref_matches(item, session_id)
+    ]
+    if len(kept) == len(values):
+        return False
+    values[:] = kept
+    return True
+
+
 def _merge_messages_chronologically(
     history: list[dict[str, Any]], incoming: list[dict[str, Any]]
 ) -> bool:
@@ -1831,7 +1859,9 @@ class LongTermMemory:
         sessions = {
             str(message.get("session_id"))
             for message in messages
-            if isinstance(message, dict) and message.get("session_id")
+            # 与 PG（session_id IS NOT NULL）同口径：整数 0 是合法会话
+            if isinstance(message, dict)
+            and message.get("session_id") is not None
         }
         return {"messages": len(messages), "sessions": sessions}
 
@@ -1892,8 +1922,14 @@ class LongTermMemory:
                 cleared_links += 1
         metadata_changed = (
             session_id in titles
-            or session_id in pinned_sessions
-            or session_id in archived_sessions
+            or any(
+                _session_ref_matches(item, session_id)
+                for item in pinned_sessions
+            )
+            or any(
+                _session_ref_matches(item, session_id)
+                for item in archived_sessions
+            )
         )
 
         if removed:
@@ -1903,10 +1939,11 @@ class LongTermMemory:
 
         if removed or metadata_changed or cleared_links:
             self.data.get("session_titles", {}).pop(session_id, None)
-            if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
-                pinned_sessions.remove(session_id)
-            if isinstance(archived_sessions, list) and session_id in archived_sessions:
-                archived_sessions.remove(session_id)
+            # 置顶 / 归档按字符串口径清理（历史整数条目一并移除）：
+            # 只清除字符串条目会让整数幽灵永久残留，同 ID 复用后新会话
+            # 被旧归档隐藏 / 异常置顶，且任何入口都无法清理
+            _drop_session_refs(pinned_sessions, session_id)
+            _drop_session_refs(archived_sessions, session_id)
             self._persist()
             logger.info(
                 "Deleted chat session: %s (%s messages, metadata=%s, trip_links=%s)",
@@ -1965,14 +2002,13 @@ class LongTermMemory:
             for message in self.data["chat_history"]
         ):
             archived_sessions = self.data.get("archived_sessions") or []
-            if session_id in archived_sessions:
-                archived_sessions.remove(session_id)
+            # 置顶 / 归档按字符串口径清理（历史整数条目一并移除）
+            _drop_session_refs(archived_sessions, session_id)
             titles = self.data.get("session_titles")
             if isinstance(titles, dict):
                 titles.pop(session_id, None)
             pinned_sessions = self.data.get("pinned_sessions") or []
-            if isinstance(pinned_sessions, list) and session_id in pinned_sessions:
-                pinned_sessions.remove(session_id)
+            _drop_session_refs(pinned_sessions, session_id)
             # 与整会话删除同口径：清空引用该会话的行程链接，否则面板里
             # 留下永远打不开的「查看对应对话」（单轮会话编辑重发时删空）
             for trip in self.data.get("trip_history") or []:
@@ -1981,8 +2017,7 @@ class LongTermMemory:
                 value = trip.get("session_id")
                 if value is not None and str(value) == session_id:
                     trip["session_id"] = None
-        if not self._save():
-            raise MemoryPersistenceError("长期记忆写入失败")
+        self._persist()
         logger.info("Deleted last turn of session %s (%s messages)", session_id, count)
         return count
 
@@ -2013,8 +2048,7 @@ class LongTermMemory:
             titles[session_id] = cleaned[:60]
         else:
             titles.pop(session_id, None)
-        if not self._save():
-            raise MemoryPersistenceError("长期记忆写入失败")
+        self._persist()
         logger.info(f"Set session title: {session_id} (len={len(cleaned)})")
         return True
 
@@ -2028,22 +2062,18 @@ class LongTermMemory:
         if not self._session_exists(session_id):
             return False
         pinned_sessions = self.data.setdefault("pinned_sessions", [])
-        # 旧数据的会话 ID 可能是整数：按字符串口径判断成员并移除，否则
-        # 面板「取消置顶」对历史整数 ID 永远无效
-        existing_index = next(
-            (
-                index
-                for index, item in enumerate(pinned_sessions)
-                if str(item) == session_id
-            ),
-            None,
-        )
-        if pinned and existing_index is None:
-            pinned_sessions.append(session_id)
-        elif not pinned and existing_index is not None:
-            del pinned_sessions[existing_index]
-        if not self._save():
-            raise MemoryPersistenceError("长期记忆写入失败")
+        # 旧数据的会话 ID 可能是整数：按字符串口径判断成员并移除全部等价
+        # 条目（历史整数 + 批量恢复追加的字符串副本），否则面板「取消置顶」
+        # 对旧数据一次点不掉、点两次才生效
+        if pinned:
+            if not any(
+                _session_ref_matches(item, session_id)
+                for item in pinned_sessions
+            ):
+                pinned_sessions.append(session_id)
+        else:
+            _drop_session_refs(pinned_sessions, session_id)
+        self._persist()
         return True
 
     def get_pinned_sessions(self) -> list[str]:
@@ -2056,20 +2086,16 @@ class LongTermMemory:
         if not self._session_exists(session_id):
             return False
         archived_sessions = self.data.setdefault("archived_sessions", [])
-        existing_index = next(
-            (
-                index
-                for index, item in enumerate(archived_sessions)
-                if str(item) == session_id
-            ),
-            None,
-        )
-        if archived and existing_index is None:
-            archived_sessions.append(session_id)
-        elif not archived and existing_index is not None:
-            del archived_sessions[existing_index]
-        if not self._save():
-            raise MemoryPersistenceError("长期记忆写入失败")
+        # 与置顶同口径：字符串归一判断、一次移除全部等价条目
+        if archived:
+            if not any(
+                _session_ref_matches(item, session_id)
+                for item in archived_sessions
+            ):
+                archived_sessions.append(session_id)
+        else:
+            _drop_session_refs(archived_sessions, session_id)
+        self._persist()
         logger.info("Set session archived: %s -> %s", session_id, archived)
         return True
 
@@ -2104,10 +2130,14 @@ class LongTermMemory:
         for session_id in session_ids:
             if not session_id or session_id not in existing:
                 continue
-            if pinned and session_id not in pinned_sessions:
+            has_ref = any(
+                _session_ref_matches(item, session_id)
+                for item in pinned_sessions
+            )
+            if pinned and not has_ref:
                 pinned_sessions.append(session_id)
-            elif not pinned and session_id in pinned_sessions:
-                pinned_sessions.remove(session_id)
+            elif not pinned and has_ref:
+                _drop_session_refs(pinned_sessions, session_id)
             applied += 1
         if applied:
             self._persist()
@@ -2124,10 +2154,14 @@ class LongTermMemory:
         for session_id in session_ids:
             if not session_id or session_id not in existing:
                 continue
-            if archived and session_id not in archived_sessions:
+            has_ref = any(
+                _session_ref_matches(item, session_id)
+                for item in archived_sessions
+            )
+            if archived and not has_ref:
                 archived_sessions.append(session_id)
-            elif not archived and session_id in archived_sessions:
-                archived_sessions.remove(session_id)
+            elif not archived and has_ref:
+                _drop_session_refs(archived_sessions, session_id)
             applied += 1
         if applied:
             self._persist()
@@ -2379,8 +2413,8 @@ class LongTermMemory:
     def _drop_trip_row(self, trips: list[dict], index: int) -> None:
         """移除行程行并同步统计；写盘失败按持久化错误抛出。"""
         self._remove_trip_row(trips, index)
-        if not self._save():
-            raise MemoryPersistenceError("写入长期记忆失败")
+        # 走 _persist：批量写（write_batch）内部只登记脏标记、批结束统一写盘
+        self._persist()
 
     @_locked_mutation
     def delete_trip(self, trip_id: str) -> bool:
