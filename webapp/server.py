@@ -2667,9 +2667,13 @@ _DAMAGE_MESSAGE_PREFIXES = (
 )
 
 
-# 大小写不敏感文件系统上「用户 ID 与已有账号仅大小写不同」：永久且
-# 用户可修正，不能报成可重试的存储故障
-_CASE_CONFLICT_PREFIXES = ("用户 ID 与已有记忆文件仅大小写不同",)
+# 大小写 / Unicode 规范化不敏感文件系统上「用户 ID 与已有账号仅大小写
+# 或规范形式不同」：永久且用户可修正，不能报成可重试的存储故障
+# （PostgreSQL 故障回退期的冲突是瞬时状态，文案以「PostgreSQL 暂不可用」
+# 开头，故意不匹配本前缀、按可重试的 503 处理）
+_CASE_CONFLICT_PREFIXES = (
+    "用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同",
+)
 
 # 聊天消息条数硬上限：永久且用户可修正（删除历史消息），不能报成
 # 「存储暂时不可用，请稍后再试」——重试永远不会成功
@@ -2701,8 +2705,8 @@ def _persistence_failure_detail(
     if text.startswith(_CASE_CONFLICT_PREFIXES):
         # 不回显已有账号的 owner ID：避免向任意请求方暴露账号存在性
         return (
-            "用户 ID 与已有账号仅大小写不同，请改用与已有账号完全一致的"
-            f"大小写{suffix}"
+            "用户 ID 与已有账号仅大小写或 Unicode 规范化形式不同，请改用"
+            f"与已有账号完全一致的大小写与字符形式{suffix}"
         )
     if text.startswith(_CHAT_CAP_PREFIXES):
         # 上限是永久状态：给出唯一可行动作，而不是引导无限重试

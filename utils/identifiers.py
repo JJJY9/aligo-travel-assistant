@@ -31,6 +31,14 @@ def is_web_word_char(char: str) -> bool:
     if not char:
         return False
     if _regex is not None:
+        # regex 模块打包的 Unicode 表可能新于 pydantic-core 的 Rust 表
+        # （实测 regex Unicode 18 与 Rust ≈15.1 有上万字符判定相反，全部是
+        # 「regex 接受而 Web 拒绝」）：未在 Python 自带表（随解释器发布，
+        # 通常不新于 Rust 表）中的字符一律拒绝——CLI / 导入绝不能产出
+        # Web 无法寻址（所有端点 422）的 ID。反向缺口（Rust 新增字符）只会
+        # 让 Web 更宽，不会造成不可打开的账号 / 会话
+        if unicodedata.category(char) == "Cn":
+            return False
         return _regex.fullmatch(r"\w", char) is not None
     if char in _JOIN_CONTROLS:
         return True
@@ -50,6 +58,13 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 
 
+# ID 会直接拼成 <user_id>.json 以及 .lock / 隔离备份名：POSIX 的单文件名
+# 上限是 NAME_MAX=255 字节（ext4 / XFS / APFS），64 个 4 字节字符（Deseret、
+# CJK 扩展 B 等）会得到 261 字节的文件名，写入必然 ENAMETOOLONG。按最长的
+# 派生名（mkstemp 前缀再加 14 字节）留足余量
+_MAX_ID_UTF8_BYTES = 240
+
+
 def is_valid_web_id(value: object, max_length: int = 64) -> bool:
     """是否为 Web 端点可寻址的 ID（``^[\\w-]{1,64}$``，Rust 语义）。
 
@@ -58,6 +73,9 @@ def is_valid_web_id(value: object, max_length: int = 64) -> bool:
     """
     text = str(value or "")
     if not text or len(text) > max_length:
+        return False
+    if len(text.encode("utf-8")) > _MAX_ID_UTF8_BYTES:
+        # 字符数达标但字节数超限：会成为超过 NAME_MAX 的文件名（见常量注释）
         return False
     if text.lower() in _WINDOWS_RESERVED_NAMES:
         return False

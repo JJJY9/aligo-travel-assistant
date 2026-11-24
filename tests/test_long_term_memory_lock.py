@@ -389,8 +389,48 @@ def test_case_collision_user_id_is_refused(tmp_path):
     assert again.get_preference()["home_location"] == "北京"
     print("✓ 用户 ID 大小写冲突拒绝访问同一记忆文件")
 
+def test_canonically_equivalent_user_ids_are_refused(tmp_path):
+    """macOS 文件名对 NFC/NFD 规范化不敏感：规范等价的 ID 不能读写同一记忆。"""
+    import shutil
+    import unicodedata
+
+    nfc = "José"
+    nfd = unicodedata.normalize("NFD", nfc)
+    assert nfc != nfd and nfc.casefold() != nfd.casefold()
+
+    store = LongTermMemory(nfc, str(tmp_path))
+    store.save_preference("home_location", "天津")
+    target = tmp_path / f"{nfc}.json"
+    alias = tmp_path / f"{nfd}.json"
+    if not alias.exists():
+        # 模拟 APFS/HFS+ 的规范化不敏感：NFD 拼写解析到同一文件
+        shutil.copyfile(target, alias)
+
+    with pytest.raises(MemoryPersistenceError, match="规范化"):
+        LongTermMemory(nfd, str(tmp_path))
+    print("✓ NFC/NFD 规范等价用户 ID 拒绝访问同一记忆文件")
+
+
+def test_pg_fallback_case_conflict_is_retryable_message(tmp_path):
+    """PostgreSQL 故障回退时的大小写冲突是瞬时状态：文案指向稍后重试。"""
+    import shutil
+
+    store = LongTermMemory("alice", str(tmp_path))
+    store.save_preference("home_location", "北京")
+    target = tmp_path / "alice.json"
+    alias = tmp_path / "Alice.json"
+    if not alias.exists():
+        shutil.copyfile(target, alias)
+
+    with pytest.raises(MemoryPersistenceError, match="稍后重试"):
+        LongTermMemory("Alice", str(tmp_path), pg_fallback=True)
+    print("✓ PG 回退期大小写冲突给出可重试文案")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_case_collision_user_id_is_refused": "需要 tmp_path 夹具",
+    "test_canonically_equivalent_user_ids_are_refused": "需要 tmp_path 夹具",
+    "test_pg_fallback_case_conflict_is_retryable_message": "需要 tmp_path 夹具",
     "test_corrupt_file_backed_up_before_overwrite": "需要 tmp_path 夹具",
     "test_corrupt_file_write_refused_when_backup_fails": "需要 tmp_path 夹具",
     "test_default_lock_timeout_covers_network_guard": "需要 tmp_path 夹具",

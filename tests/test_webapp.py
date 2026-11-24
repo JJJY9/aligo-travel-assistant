@@ -2521,7 +2521,7 @@ def test_chat_stream_quarantine_and_case_conflict_messages(monkeypatch):
     case_conflict = _stream_error_message(
         monkeypatch,
         MemoryPersistenceError(
-            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）"
+            "用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同（已有 alice）"
         ),
     )
     assert "大小写" in case_conflict, case_conflict
@@ -14341,7 +14341,7 @@ def test_persistence_detail_maps_case_conflict():
 
     detail = server_module._persistence_failure_detail(
         MemoryPersistenceError(
-            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）。当前文件系统"
+            "用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同（已有 alice）。当前文件系统"
             "大小写不敏感，请使用与已有账号完全一致的大小写"
         ),
         "rid-case",
@@ -14358,7 +14358,7 @@ def test_open_long_term_maps_case_conflict(monkeypatch):
 
     def boom(*args, **kwargs):
         raise MemoryPersistenceError(
-            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）"
+            "用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同（已有 alice）"
         )
 
     monkeypatch.setattr(server_module, "create_long_term_memory", boom)
@@ -14376,7 +14376,7 @@ def test_chat_maps_case_conflict_to_409(monkeypatch):
 
     async def boom(*args, **kwargs):
         raise MemoryPersistenceError(
-            "用户 ID 与已有记忆文件仅大小写不同（已有 alice）"
+            "用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同（已有 alice）"
         )
 
     monkeypatch.setattr(server_module, "_get_session_marked", boom)

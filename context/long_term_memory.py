@@ -10,6 +10,7 @@ import re
 import shutil
 import tempfile
 import threading
+import unicodedata
 import time
 import weakref
 from collections import Counter
@@ -162,11 +163,22 @@ def _locked_mutation(func):
 _QUARANTINE_NO_BACKUP_MARKER = "__quarantine_no_backup__"
 
 
+def _id_identity_key(value: str) -> str:
+    """账号"同一文件"判定键：先 NFC 归一、再 casefold。
+
+    大小写不敏感（Windows / macOS 默认）之外，macOS 的 APFS/HFS+ 文件名
+    对 NFC/NFD 规范等价也不敏感：`José`（NFC）与 `Jose`+U+0301（NFD）会
+    解析到同一 `<user_id>.json`。只比较 casefold 时两者不等，归属守卫被
+    绕过；先做 NFC 归一才能识别这类同一文件的两个拼写。
+    """
+    return unicodedata.normalize("NFC", value).casefold()
+
+
 def _case_conflict_message(owner: str) -> str:
     return (
-        f"用户 ID 与已有记忆文件仅大小写不同（已有 {owner}）。当前文件系统"
-        "大小写不敏感，两个 ID 会读写同一份数据；请使用与已有账号完全一致"
-        "的大小写"
+        f"用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同"
+        f"（已有 {owner}）。当前文件系统大小写 / 规范化不敏感，两个 ID 会"
+        "读写同一份数据；请使用与已有账号完全一致的大小写与字符形式"
     )
 
 
@@ -199,6 +211,7 @@ class LongTermMemory:
         storage_path: str = "data/memory",
         *,
         allow_quarantined: bool = False,
+        pg_fallback: bool = False,
     ):
         """
         初始化长期记忆
@@ -208,6 +221,9 @@ class LongTermMemory:
             storage_path: 存储路径
             allow_quarantined: 允许在「主文件缺失 + 存在隔离备份」时重建
                 主文件（仅恢复入口使用：user-import / /api/import）
+            pg_fallback: 本实例是 PostgreSQL 故障期的回退存储（工厂置位）：
+                大小写 / 规范化冲突是瞬时状态（PG 里两账号合法并存），
+                错误文案按「稍后重试」而非「更改 ID」给出
         """
         self.user_id = user_id
         # 相对路径锚定到项目根目录，避免从其它目录运行时数据写到 CWD（Issue #5）
@@ -218,6 +234,7 @@ class LongTermMemory:
         self.db_path = os.path.join(self.storage_path, f"{user_id}.json")
         self._write_lock = _lock_for_path(self.db_path)
         self._allow_quarantined = allow_quarantined
+        self._pg_fallback = pg_fallback
 
         # 确保存储目录存在
         Path(self.storage_path).mkdir(parents=True, exist_ok=True)
@@ -620,7 +637,9 @@ class LongTermMemory:
         owner = name[:index]
         if owner == self.user_id:
             return None
-        if owner.casefold() == self.user_id.casefold():
+        # 规范化等价（NFC/NFD）与大小写变体在 macOS 上都可能指向同一文件：
+        # 隔离备份 / 标记的归属判定必须与 _check_owner_case 同口径
+        if _id_identity_key(owner) == _id_identity_key(self.user_id):
             return owner
         return None
 
@@ -646,8 +665,17 @@ class LongTermMemory:
         owner = data.get("user_id")
         if not isinstance(owner, str) or not owner or owner == self.user_id:
             return
-        if owner.casefold() != self.user_id.casefold():
+        if _id_identity_key(owner) != _id_identity_key(self.user_id):
             return
+        if self._pg_fallback:
+            # PostgreSQL 里两者是合法并存的账号（大小写 / 规范形式无关），
+            # 只有回退本地 JSON 时才撞同一文件名：这是「稍后重试」的瞬时
+            # 状态，不能提示用户去改 ID 的大小写
+            raise MemoryPersistenceError(
+                "PostgreSQL 暂不可用，回退本地存储时与另一账号的落地文件"
+                f"仅大小写或 Unicode 规范化形式不同（已有 {owner}）；"
+                "请稍后重试（PostgreSQL 恢复后本账号自动回到原存储）"
+            )
         raise MemoryPersistenceError(_case_conflict_message(owner))
 
     def _check_owner_case_on_disk(self) -> None:

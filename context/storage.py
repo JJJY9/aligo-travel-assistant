@@ -317,6 +317,7 @@ def create_long_term_memory(
                     user_id,
                     storage_path,
                     allow_quarantined=allow_quarantined,
+                    pg_fallback=True,
                 )
         try:
             memory = PostgresLongTermMemory(user_id, dsn)
@@ -349,7 +350,10 @@ def create_long_term_memory(
         )
     _ACTUAL_BACKEND["long_term"] = "json"
     return LongTermMemory(
-        user_id, storage_path, allow_quarantined=allow_quarantined
+        user_id,
+        storage_path,
+        allow_quarantined=allow_quarantined,
+        pg_fallback=bool(dsn),
     )
 
 

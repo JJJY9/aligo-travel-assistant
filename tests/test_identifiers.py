@@ -107,6 +107,41 @@ def test_session_ids_allow_windows_device_names():
     assert is_valid_web_session_id(None) is False
     print("✓ 会话 ID 允许设备保留名（用户 ID 仍拒绝）")
 
+def test_unassigned_codepoints_never_accepted():
+    """regex 模块的 Unicode 表可能新于 pydantic-core 的 Rust 表。
+
+    未在 Python 自带表（随解释器发布，通常不新于 Rust 表）中的字符一律
+    拒绝：CLI / 导入绝不能产出 Web 全部端点 422 的 ID（实测 Unicode 18
+    与 Rust ≈15.1 有上万字符判定相反，全部是「regex 接受而 Web 拒绝」）。
+    """
+    import unicodedata
+
+    probe = None
+    for codepoint in range(0x323B0, 0x32400):
+        char = chr(codepoint)
+        if unicodedata.category(char) == "Cn":
+            probe = char
+            break
+    if probe is None:
+        # 解释器的 Unicode 表已覆盖探测区间（未来 Python）：本用例无字符可测
+        print("— 解释器 Unicode 表已覆盖探测区间，跳过未分配码位用例")
+        return
+    assert is_valid_web_session_id("s" + probe) is False
+    assert is_valid_web_id("u" + probe) is False
+    print("✓ 未分配码位（regex 新表 / Rust 旧表分歧区）一律拒绝")
+
+
+def test_oversized_filename_ids_rejected():
+    """64 个 4 字节字符会拼出 261 字节文件名（POSIX NAME_MAX=255）。"""
+    deseret = chr(0x10400)
+    assert is_valid_web_id(deseret * 60) is True  # 240 字节
+    assert is_valid_web_id(deseret * 61) is False  # 244 字节
+    assert is_valid_web_id(deseret * 64) is False
+    # 会话 ID 不拼记忆库文件名，不受字节上限约束
+    assert is_valid_web_session_id(deseret * 64) is True
+    print("✓ 超长文件名的用户 ID 被拒绝（会话 ID 不受影响）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -117,4 +152,6 @@ if __name__ == "__main__":
     test_prefixed_and_suffixed_fragments()
     test_windows_reserved_names_rejected()
     test_session_ids_allow_windows_device_names()
+    test_unassigned_codepoints_never_accepted()
+    test_oversized_filename_ids_rejected()
     print("\n全部通过")
