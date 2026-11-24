@@ -83,6 +83,7 @@ from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
     METADATA_KEY_MAX_CHARS,
     METADATA_VALUE_MAX_CHARS,
+    DocumentConflictError,
     add_document,
     cleanup_duplicate_contents,
     delete_document,
@@ -840,6 +841,11 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     # 文档大小上限 20000 字（分片长度之和）；回填的拼接文本含分片间分隔符，
     # 上限略高（JOINED_MAX_CHARS），面板按 size 字段判断是否可编辑
     content: str = Field(min_length=1, max_length=JOINED_MAX_CHARS)
+    # 乐观并发：面板进入编辑时载入的正文 / 分片快照。服务端写锁内比对，
+    # 不一致返回 409——并发编辑不会静默覆盖对方修改或删掉未见过的分片
+    expect: str | None = Field(default=None, max_length=JOINED_MAX_CHARS)
+    expect_parts: int | None = Field(default=None, ge=1, le=100000)
+    expect_group: str | None = Field(default=None, max_length=200)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -1489,6 +1495,10 @@ class AligoWebApp:
         # 只按次数限流挡不住 40 个并发导出同时申请数 GB 内存，这里限制
         # 同一时刻真正执行导出的请求数（超出立即 503，不排队占线程）
         self.export_slots = threading.BoundedSemaphore(2)
+        # 知识库面板只读接口（列表 / 分类 / 重复组）的全库扫描并发上限：
+        # 与导出槽分开，面板刷新（同拍分类 + 列表）不会互相踩踏，导出
+        # 下载在途时也不会让知识库面板得到「导出任务过多」这种无关 503
+        self.kb_read_slots = threading.BoundedSemaphore(4)
         # 同一时间只允许一个检索评测：配置 Redis 时跨实例共享，故障回退进程内；
         # 工厂让启动时 Redis 不可用的实例在恢复后重新参与共享锁
         self.eval_lock = DistributedLock(
@@ -3822,6 +3832,31 @@ def create_app(model: Any = None) -> FastAPI:
 
         return wrapper
 
+    def _kb_read_guard(func):
+        """知识库面板只读接口的并发上限（与导出槽分离）。
+
+        列表 / 分类 / 重复组都是全库扫描端点：此前复用导出槽（只有 2
+        个），面板一次刷新就并发占满两个——重叠刷新或导出下载在途时
+        必有一个 503「导出任务过多，请稍后再试」，与知识库毫不相关。
+        独立槽位（4 个）既保住全库扫描的内存界限，又不会让面板自己的
+        两个请求互相踩踏。
+        """
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not state.kb_read_slots.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=503,
+                    detail="知识库读取任务过多，请稍后再试",
+                    headers={"Retry-After": "5"},
+                )
+            try:
+                return func(*args, **kwargs)
+            finally:
+                state.kb_read_slots.release()
+
+        return wrapper
+
     @app.get("/")
     def index() -> FileResponse:
         # 入口页必须每次重新验证：缓存的旧 index.html 搭配新 app.js（新增
@@ -4022,7 +4057,7 @@ def create_app(model: Any = None) -> FastAPI:
         )
 
     @app.get("/api/knowledge/documents", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_kb_read_guard
     def knowledge_documents(
         request: Request,
         response: Response,
@@ -4053,7 +4088,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _knowledge_unavailable("知识库暂不可用", exc) from exc
 
     @app.get("/api/knowledge/categories", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_kb_read_guard
     def knowledge_categories(request: Request, response: Response) -> dict[str, Any]:
         """知识片段分类统计（维护面板筛选下拉框）。
 
@@ -4173,7 +4208,7 @@ def create_app(model: Any = None) -> FastAPI:
             state.eval_lock.release(token)
 
     @app.get("/api/knowledge/duplicates", dependencies=[Depends(_cross_site_side_effect)])
-    @_export_guard
+    @_kb_read_guard
     def knowledge_duplicates(
         request: Request,
         response: Response,
@@ -4303,7 +4338,21 @@ def create_app(model: Any = None) -> FastAPI:
                 if existing is None:
                     raise LookupError("知识片段不存在")
                 metadata = dict(existing.get("metadata") or {})
-            return update_document(doc_id, payload.content, metadata)
+            return update_document(
+                doc_id,
+                payload.content,
+                metadata,
+                expect_content=payload.expect,
+                expect_parts=payload.expect_parts,
+                expect_group=payload.expect_group,
+            )
+        except DocumentConflictError as exc:
+            # 并发修改冲突可刷新后重试：不能混进 400 的「内容不合法」口径
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+                headers={"Retry-After": "1"},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LookupError as exc:

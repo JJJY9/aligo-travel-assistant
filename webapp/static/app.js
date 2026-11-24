@@ -91,6 +91,9 @@ const state = {
   controller: null,
   lastUserText: "",
   kbItems: [],
+  // 列表区当前渲染的是语义检索结果（kbItems 只属于关键词列表）：
+  // 语义视图下的 429 / 失败分支据此决定保留 DOM 还是显示空态文本
+  kbShowingSemantic: false,
   // 服务端分页游标：以「已向服务端取回的条数」为准，而不是去重后的已显示
   // 条数——并发插入会让按显示数计算的 offset 永远追不上，加载更多失效
   kbOffset: 0,
@@ -1621,7 +1624,9 @@ async function importTripsFromFile(file) {
           (Array.isArray(preview.skipped) ? preview.skipped.length : 0),
       );
       // 扫描期间关闭面板：不再弹确认，更不能在看不见的界面里写入
-      if (!isModalOpen()) return;
+      // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
+      // 面板已关仍会弹确认并在看不见的界面里写库
+      if (els.memorySheet.hidden) return;
       // 确认框里带上前几条跳过原因：只报数量时用户无法判断是不是选错格式
       const skipPreview = Array.isArray(preview.skipped)
         ? preview.skipped.slice(0, 3)
@@ -4881,6 +4886,8 @@ let kbSearchTimer = null;
 // 知识库列表 / 语义检索共用的请求序号：只渲染最后一次发起的请求结果，
 // 避免先发出的子串搜索晚到后覆盖语义检索结果（或反之）
 let kbListSeq = 0;
+// 语义检索请求序号：被静默刷新作废的旧请求结束时不能复位按钮忙碌态
+let kbSemanticSeq = 0;
 
 function exitKbSemanticMode() {
   state.kbSemanticMode = false;
@@ -4891,9 +4898,10 @@ function knowledgeQueryParams(
   offset,
   query = state.kbQuery,
   category = state.kbCategory,
+  limit = KB_PAGE_SIZE,
 ) {
   const params = new URLSearchParams({
-    limit: String(KB_PAGE_SIZE),
+    limit: String(limit),
     offset: String(offset),
   });
   if (query) params.set("q", query);
@@ -4951,6 +4959,11 @@ async function refreshKnowledgeDocuments(
   // 条件入账（否则新查询的结果会以旧条件渲染）
   const query = state.kbQuery;
   const category = state.kbCategory;
+  // 删除 / 编辑 / 导入后的刷新保留已「加载更多」的分页深度与滚动位置：
+  // 固定回第一页会丢弃 240px 列表里的其余条目并把视口跳回顶部。服务端
+  // 单页上限 100，超过的部分（罕见）刷新后退回前 100 条。
+  const depth = Math.min(100, Math.max(KB_PAGE_SIZE, state.kbItems.length));
+  const scrollTop = els.kbList.scrollTop;
   state.kbListLoading = true;
   // 已有结果时保留列表直到新数据到达（失败不清空、不闪烁）
   if (!state.kbItems.length) {
@@ -4964,7 +4977,7 @@ async function refreshKnowledgeDocuments(
   if (refreshCategories) refreshKnowledgeCategories();
   try {
     const data = await getJSON(
-      `/api/knowledge/documents?${knowledgeQueryParams(0, query, category)}`,
+      `/api/knowledge/documents?${knowledgeQueryParams(0, query, category, depth)}`,
     );
     if (seq !== kbListSeq) return;
     state.kbTotal = Number(data.total || 0);
@@ -4973,17 +4986,17 @@ async function refreshKnowledgeDocuments(
     state.kbLoadedCategory = category;
     state.kbListFailed = false;
     renderKnowledgeDocuments(data.items || [], false);
+    // 恢复滚动位置：重建 DOM 后浏览器会把 overflow 容器归零
+    els.kbList.scrollTop = scrollTop;
   } catch (error) {
     if (seq !== kbListSeq) return;
     state.kbListFailed = true;
-    if (error && error.status === 429) {
-      // 限流（搜索防抖仍可能把 60 次/分钟的桶耗尽）：有结果时 toast 并
-      // 保留列表；首屏为空时给可读的错误文本，不能永远停在「加载中…」
-      if (!state.kbItems.length) {
-        els.kbList.textContent = error.message;
-      } else if (!silentFailure) {
-        toast(error.message);
-      }
+    const hasRendered = state.kbItems.length > 0 || state.kbShowingSemantic;
+    if (hasRendered) {
+      // 任何失败（429 限流 / 导入写锁 503 / 导出槽位 / 网络抖动）都不清空
+      // 已渲染的列表：内容仍在屏幕上，错误只作为提示；静默刷新（恢复 /
+      // 导入 / 删除后的收尾）连 toast 也不弹，避免覆盖操作结果摘要
+      if (!silentFailure) toast(error.message);
     } else {
       els.kbList.textContent = error.message;
       state.kbItems = [];
@@ -5080,6 +5093,7 @@ function knowledgePreview(content, query) {
 function renderKnowledgeDocuments(items, append) {
   if (!append) {
     els.kbList.innerHTML = "";
+    state.kbShowingSemantic = false;
     state.kbItems = [];
   }
   if (!append && !items.length) {
@@ -5202,6 +5216,7 @@ async function runSemanticSearch({ silent = false } = {}) {
   // 取消尚未触发的子串搜索刷新，并让已发出的列表请求作废
   clearTimeout(kbSearchTimer);
   const seq = ++kbListSeq;
+  const semanticSeq = ++kbSemanticSeq;
   // 先进入语义模式并记录查询词：请求在途时删除 / 编辑片段触发的
   // refreshKnowledgeDocuments 会静默重跑当前语义检索，而不是启动关键词
   // 刷新（自增序列）把本次结果静默作废
@@ -5236,9 +5251,13 @@ async function runSemanticSearch({ silent = false } = {}) {
       els.kbList.textContent = error.message;
     }
   } finally {
-    els.kbSemantic.disabled = false;
-    els.kbSemantic.textContent = "语义搜索";
-    els.kbMore.disabled = false;
+    // 只看最新一次语义请求：被静默刷新作废的旧请求结束时，不能把仍在途
+    // 的新请求的忙碌态清掉（按钮提前可点会再发第三个请求）
+    if (semanticSeq === kbSemanticSeq) {
+      els.kbSemantic.disabled = false;
+      els.kbSemantic.textContent = "语义搜索";
+      els.kbMore.disabled = false;
+    }
   }
 }
 
@@ -5370,7 +5389,9 @@ async function runKbDedupe() {
       return;
     }
     // 面板在扫描期间被关闭：不再弹确认，更不能在看不见的界面里执行删除
-    if (!isModalOpen()) return;
+    // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
+    // 面板已关仍会弹确认并在看不见的界面里写库
+    if (els.memorySheet.hidden) return;
     const ok = window.confirm(
       `将删除 ${planned} 条重复片段（${Number(preview.groups || 0)} 组，每组保留最早一条）。继续？`,
     );
@@ -5402,7 +5423,27 @@ async function runKbDedupe() {
       els.kbEvalResult.classList.toggle("warn", failed.length > 0);
       els.kbEvalResult.textContent = summary;
     }
-    await refreshKnowledgeDocuments({ refreshCategories: true });
+    // 清理删掉的可能是正在编辑的片段（每组保留最早一条，列表按 id 倒序
+    // 展示，被删的常是最靠前 / 最常被编辑的行）：退出编辑态，否则
+    // 「保存修改」只会对已删除 id 永远 404。plan 视图最多 2000 组（#929），
+    // 超大清理可能截断——命中不了时退回下面的 404 分支处理
+    const removedIds = new Set();
+    if (Array.isArray(result.plan)) {
+      for (const item of result.plan) {
+        for (const id of (item && item.remove) || []) {
+          removedIds.add(Number(id));
+        }
+      }
+    }
+    if (state.kbEditingId && removedIds.has(Number(state.kbEditingId))) {
+      resetKnowledgeForm();
+      toast("正在编辑的片段已被清理，已退出编辑");
+    }
+    // 清理同样改变片段总数：知识库状态 chip 一并刷新
+    await Promise.all([
+      refreshKnowledge(),
+      refreshKnowledgeDocuments({ refreshCategories: true }),
+    ]);
     if (stale) toast(summary);
   } catch (error) {
     if (seq === kbActionResultSeq && els.kbEvalResult) {
@@ -5416,7 +5457,9 @@ async function runKbDedupe() {
   }
 }
 
-function renderSemanticResults(query, results) {  els.kbList.innerHTML = "";
+function renderSemanticResults(query, results) {
+  els.kbList.innerHTML = "";
+  state.kbShowingSemantic = true;
   els.kbMore.hidden = true;
   const note = document.createElement("p");
   note.className = "kb-meta";
@@ -5543,12 +5586,20 @@ async function startEditKnowledge(doc) {
   }
   // 表单里已有未提交的新增 / 编辑草稿时先确认：点行内「编辑」会直接
   // 覆盖，用户会以为刚输入的内容被保存了。同一行再次点击也不例外——
-  // 编辑期间列表仍可点击，此前同 id 会跳过确认直接重置 textarea
+  // 编辑期间列表仍可点击，此前同 id 会跳过确认直接重置 textarea。
+  // 分类输入框同样是可提交的草稿：只改分类、正文未动时也要确认，
+  // 否则回填会把分类修改静默覆盖
   const editingSameDoc = state.kbEditingId === doc.id;
-  if (
+  const originalCategory = doc.metadata?.category
+    ? String(doc.metadata.category)
+    : "";
+  const contentDirty =
     els.kbContent.value.trim() &&
-    (!editingSameDoc || els.kbContent.value !== state.kbEditBaseline)
-  ) {
+    (!editingSameDoc || els.kbContent.value !== state.kbEditBaseline);
+  const categoryDirty =
+    state.kbEditingId !== null &&
+    els.kbCategory.value.trim() !== originalCategory;
+  if (contentDirty || categoryDirty) {
     if (!window.confirm("表单里有未提交的内容，编辑将覆盖，继续？")) return;
   }
   const seq = (state.kbEditSeq += 1);
@@ -5583,6 +5634,20 @@ async function startEditKnowledge(doc) {
       groupParts = Number(data.parts || parts);
       // 上限按文档大小（分片长度之和）判断；回填文本含分片间分隔符，略长
       docSize = Number(data.size || content.length);
+      const missingParts = Number(data.missing_parts || 0);
+      if (data.partial && missingParts > 0) {
+        // 残缺组（整组替换中断 / 导入缺片）：回填只有现有分片，保存会
+        // 按现有内容整组重建、清除缺片标记——必须让用户知情后再进入编辑
+        if (
+          !window.confirm(
+            `该文档当前缺少 ${missingParts} 个分片（共 ${groupParts} 片）。` +
+              "保存会用现有内容重建整组并清除缺片标记，继续编辑？",
+          )
+        ) {
+          els.kbContent.placeholder = previousPlaceholder;
+          return;
+        }
+      }
     } catch (error) {
       if (seq !== state.kbEditSeq || state.kbSaving) return;
       els.kbContent.placeholder = previousPlaceholder;
@@ -5602,6 +5667,9 @@ async function startEditKnowledge(doc) {
   }
   state.kbEditingId = doc.id;
   state.kbEditingGroupParts = groupParts;
+  // 乐观并发快照：保存时随 PUT 提交，服务端写锁内比对（并发编辑 409）
+  state.kbEditExpectParts = groupParts > 1 ? Number(groupParts) : 1;
+  state.kbEditExpectGroup = groupParts > 1 ? String(group || "") : "";
   // 保留完整 metadata：PUT 会整体覆盖，只回填分类会丢掉 title / source 等字段
   state.kbEditingMetadata = { ...(doc.metadata || {}) };
   // 与后端 JOINED_MAX_CHARS（文档 20000 字 + 分片分隔符余量 100）对齐，
@@ -5631,6 +5699,8 @@ function resetKnowledgeForm({ clear = true } = {}) {
   state.kbEditBaseline = "";
   state.kbEditingMetadata = {};
   state.kbEditingGroupParts = 0;
+  state.kbEditExpectParts = null;
+  state.kbEditExpectGroup = null;
   els.kbContent.maxLength = 2000;
   els.kbContent.placeholder = "新增知识片段，例如：一线城市住宿标准为每晚 600 元";
   els.kbSubmit.textContent = "添加片段";
@@ -5672,7 +5742,19 @@ async function addKnowledgeDocument(event) {
       {
         method: editingId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content, metadata }),
+        // 编辑时携带进入编辑时的正文 / 分片快照（乐观并发）：服务端写锁内
+        // 比对，另一标签页改过则 409，而不是用旧内容静默覆盖对方修改
+        body: JSON.stringify({
+          content,
+          metadata,
+          ...(editingId
+            ? {
+                expect: state.kbEditBaseline,
+                expect_parts: state.kbEditExpectParts,
+                expect_group: state.kbEditExpectGroup,
+              }
+            : {}),
+        }),
       },
     );
     state.kbSaving = false;
@@ -5707,7 +5789,19 @@ async function addKnowledgeDocument(event) {
     if (state.kbEditingId === editingId) resetKnowledgeForm({ clear: false });
     await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
   } catch (error) {
-    toast(error.message);
+    if (error && error.status === 409) {
+      // 并发编辑冲突：刷新列表让用户看到库内最新内容；保留表单草稿
+      // （不 reset），用户可对照后重新载入再保存
+      toast(`${error.message}（已刷新列表，可取消后重新编辑）`);
+      refreshKnowledgeDocuments({ silentFailure: true });
+    } else if (error && error.status === 404 && editingId) {
+      // 编辑目标已被删除（另一标签页 / 清理重复）：退出编辑态，保留草稿
+      toast(`${error.message}（该片段已被删除，已退出编辑，可重新添加）`);
+      resetKnowledgeForm({ clear: false });
+      refreshKnowledgeDocuments({ silentFailure: true });
+    } else {
+      toast(error.message);
+    }
   } finally {
     state.kbSaving = false;
     els.kbSubmit.disabled = false;
@@ -5865,6 +5959,12 @@ async function importKnowledgeFile() {
       }
       const wouldImport = Number(preview.would_import || 0);
       const skippedText = knowledgeImportSkipSummary(preview);
+      if (!wouldImport) {
+        // 全部已存在 / 无效：继续分批上传只会白耗导入队列与限流额度，
+        // 每批还要全库扫描判重——直接结束并说明原因
+        toast(`没有需要导入的知识片段${skippedText}`);
+        return;
+      }
       confirmText = `将导入 ${wouldImport} 条知识片段${skippedText}？`;
       } catch (error) {
         // 预览失败（如知识库暂不可用）不阻断：退回按文件条数确认
@@ -5874,7 +5974,9 @@ async function importKnowledgeFile() {
       confirmText += "（文件较大，已跳过导入前预览；重复项会在导入时自动跳过）";
     }
     // 预览期间面板被关闭：不再弹确认，更不能在看不见的界面里写库
-    if (!isModalOpen()) return;
+    // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
+    // 面板已关仍会弹确认并在看不见的界面里写库
+    if (els.memorySheet.hidden) return;
     if (!window.confirm(confirmText)) return;
 
     els.kbImport.textContent = "导入中…";
@@ -5905,11 +6007,33 @@ async function importKnowledgeFile() {
           ? `（其中 ${conflictSkipped} 条因布局冲突未导入，请整份编辑或删除整组后重试）`
           : ""),
     );
-    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+    // 收尾刷新全部静默：429 / 写锁 503 的 toast 会覆盖刚显示的导入摘要
+    await Promise.all([
+      refreshKnowledge(),
+      refreshKnowledgeDocuments({ silentFailure: true }),
+    ]);
   } catch (error) {
+    const status = Number((error && error.status) || 0);
+    const queueBusy =
+      status === 503 && String(error.message || "").includes("已有导入任务在处理");
     if (imported > 0) {
       toast(`已导入 ${imported} 条后失败：${error.message}（重试会跳过已导入内容）`);
-      await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+      await Promise.all([
+        refreshKnowledge(),
+        refreshKnowledgeDocuments({ silentFailure: true }),
+      ]);
+    } else if (!queueBusy && (!status || status >= 500)) {
+      // 首批结果未知（客户端超时 / 代理 504 / 断连）：服务端导入在专用
+      // 执行器里不可取消，该批可能已经写入——提示未知状态并刷新，
+      // 不能让用户以为什么都没导入
+      toast(
+        `${error.message}（服务端可能已写入部分片段，已刷新列表；` +
+          "重试会跳过已导入内容）",
+      );
+      await Promise.all([
+        refreshKnowledge(),
+        refreshKnowledgeDocuments({ silentFailure: true }),
+      ]);
     } else {
       toast(error.message);
     }
@@ -6220,11 +6344,19 @@ function bindEvents() {
       // 跳过本次；compositionend 会重新调度
       return;
     }
+    const wasSemanticMode = state.kbSemanticMode;
     exitKbSemanticMode();
     const query = els.kbSearch.value.trim();
     // 同值去重只用于防抖输入：刷新失败（429 / 网络错误）后的回车重试
-    // 与清空重输必须能再次请求，不能被去重静默吞掉
-    if (!force && query === state.kbQuery && !state.kbListFailed) return;
+    // 与清空重输必须能再次请求，不能被去重静默吞掉。语义模式下（DOM 是
+    // 语义结果）退出时必须刷新——否则模式位已清、界面仍停在语义结果
+    if (
+      !force &&
+      !wasSemanticMode &&
+      query === state.kbQuery &&
+      !state.kbListFailed
+    )
+      return;
     state.kbQuery = query;
     refreshKnowledgeDocuments({ refreshCategories: false });
   };
@@ -6441,7 +6573,9 @@ function bindEvents() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: userId, dry_run: true }),
         });
-        if (!isModalOpen()) return;
+        // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
+      // 面板已关仍会弹确认并在看不见的界面里写库
+      if (els.memorySheet.hidden) return;
         const count = Number(preview.would_remove || 0);
         const ambiguous = Array.isArray(preview.ambiguous_ids)
           ? preview.ambiguous_ids

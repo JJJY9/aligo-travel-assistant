@@ -431,6 +431,80 @@ def test_export_concurrency_guard():
     print("✓ 全量导出并发上限（槽位占满快速 503）")
 
 
+def test_knowledge_update_conflict_maps_409(monkeypatch):
+    """并发编辑冲突映射 409（可刷新重试），不混入 400 的内容不合法口径。"""
+    from utils.knowledge_admin import DocumentConflictError
+    from webapp import server as server_module
+
+    captured: dict = {}
+
+    def fake_update(doc_id, content, metadata=None, **kwargs):
+        captured.update(kwargs)
+        raise DocumentConflictError("知识片段已在其他会话被修改，请刷新后重新编辑")
+
+    monkeypatch.setattr(server_module, "update_document", fake_update)
+    client = _client()
+    response = client.put(
+        "/api/knowledge/documents/7",
+        json={
+            "content": "改动",
+            "metadata": {},
+            "expect": "旧内容",
+            "expect_parts": 1,
+            "expect_group": "",
+        },
+    )
+    assert response.status_code == 409, response.text[:300]
+    assert response.headers.get("retry-after") == "1"
+    assert captured == {
+        "expect_content": "旧内容",
+        "expect_parts": 1,
+        "expect_group": "",
+    }, captured
+    print("✓ 知识编辑冲突返回 409 并透传快照")
+
+
+def test_kb_reads_use_separate_slots_from_exports(monkeypatch):
+    """知识库面板只读接口与导出分槽：导出占满时面板刷新不再被 503。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "list_documents",
+        lambda **kwargs: {"items": [], "total": 0},
+    )
+    monkeypatch.setattr(server_module, "list_categories", lambda: [])
+    monkeypatch.setattr(
+        server_module, "find_duplicate_contents", lambda: []
+    )
+    client = _client()
+    state = client.app.state.aligo
+    held = [state.export_slots.acquire(blocking=False) for _ in range(2)]
+    try:
+        assert all(held), "测试应能占满导出槽位"
+        for path in (
+            "/api/knowledge/documents",
+            "/api/knowledge/categories",
+            "/api/knowledge/duplicates",
+        ):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text[:200])
+    finally:
+        for _ in held:
+            state.export_slots.release()
+    # 面板读接口自己的并发上限照样生效（不会变成无界全库扫描）
+    kb_held = [state.kb_read_slots.acquire(blocking=False) for _ in range(4)]
+    try:
+        assert all(kb_held)
+        response = client.get("/api/knowledge/documents")
+        assert response.status_code == 503
+        assert "知识库读取任务过多" in response.json()["detail"]
+    finally:
+        for _ in kb_held:
+            state.kb_read_slots.release()
+    print("✓ 知识库面板读接口独立并发槽（不再与导出互踩）")
+
+
 def test_knowledge_unavailable_recognizes_milvus3_missing_collection():
     """Milvus Lite 3.x 的 does not exist / released 文案给出可操作提示。"""
     from webapp import server as server_module
@@ -5914,7 +5988,7 @@ def test_knowledge_update_error_mappings(monkeypatch):
     )
     merged = {}
 
-    def raise_value(doc_id, content, metadata=None):
+    def raise_value(doc_id, content, metadata=None, **kwargs):
         merged["metadata"] = metadata
         raise ValueError("旧数据没有 group")
 
@@ -5926,7 +6000,7 @@ def test_knowledge_update_error_mappings(monkeypatch):
     assert "旧数据没有 group" in response.json()["detail"]
     assert merged["metadata"] == {"category": "交通"}, "省略 metadata 应沿用库中现有值"
 
-    def raise_missing(doc_id, content, metadata=None):
+    def raise_missing(doc_id, content, metadata=None, **kwargs):
         raise FileNotFoundError("知识库未初始化")
 
     monkeypatch.setattr(server_module, "update_document", raise_missing)
@@ -5936,7 +6010,7 @@ def test_knowledge_update_error_mappings(monkeypatch):
     assert response.status_code == 503
     assert "init_knowledge_base.py" in response.json()["detail"]
 
-    def raise_boom(doc_id, content, metadata=None):
+    def raise_boom(doc_id, content, metadata=None, **kwargs):
         raise RuntimeError("embed down")
 
     monkeypatch.setattr(server_module, "update_document", raise_boom)
@@ -11029,7 +11103,7 @@ def test_knowledge_document_write_api(monkeypatch):
 
     updated = {}
 
-    def fake_update(doc_id, content, metadata):
+    def fake_update(doc_id, content, metadata, **kwargs):
         updated["call"] = (doc_id, content, metadata)
         return {"status": "success", "id": doc_id}
 
