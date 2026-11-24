@@ -231,6 +231,150 @@ def test_host_header_allowlist_blocks_rebinding():
     print("✓ Host 白名单拒绝未知域名（防 DNS rebinding）")
 
 
+def test_host_authority_malformed_and_duplicate_rejected(monkeypatch):
+    """畸形 / 重复 Host 一律 400（白名单解析与 URL 解析同口径）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    for host in (
+        "127.0.0.1:8000@evil.com",
+        "[::1]evil.com",
+        "[::1]evil.com:8000",
+        "127.0.0.1:8000,evil.com",
+        "127.0.0.1:8000, evil.com",
+        "evil@x.localhost",
+        "x.localhost:8000@evil.com",
+    ):
+        response = client.get("/api/health", headers={"Host": host})
+        assert response.status_code == 400, (host, response.status_code)
+        assert server_module._host_allowed(host) is False, host
+    # 重复 Host（first/last-wins 分歧）：一律 400
+    duplicated = client.get(
+        "/api/health",
+        headers=[("host", "127.0.0.1"), ("host", "evil.com")],
+    )
+    assert duplicated.status_code == 400, duplicated.text
+    # Host 拒绝响应在所有路径都带 no-store（非 /api 路径同样不可缓存）
+    rejected = client.get("/", headers={"Host": "evil.example"})
+    assert rejected.status_code == 400
+    assert rejected.headers.get("cache-control") == "no-store"
+    # 合法形式保持放行：配置域名可带端口 / 尾点匹配
+    monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", "example.com")
+    assert (
+        client.get(
+            "/api/health", headers={"Host": "example.com.:8000"}
+        ).status_code
+        == 200
+    )
+    print("✓ 畸形 / 重复 Host 拒绝（尾点 + 端口归一仍放行）")
+
+
+def test_host_allowlist_idna(monkeypatch):
+    """ALIGO_ALLOWED_HOSTS 的 Unicode 域名按浏览器 A-label 匹配。"""
+    client = _client()
+    monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", "例子.中")
+    punycode = "例子.中".encode("idna").decode("ascii")
+    assert (
+        client.get("/api/health", headers={"Host": punycode}).status_code == 200
+    )
+    other = "别的.中".encode("idna").decode("ascii")
+    assert (
+        client.get("/api/health", headers={"Host": other}).status_code == 400
+    ), "未配置的 IDN 域名必须继续拒绝"
+    print("✓ ALIGO_ALLOWED_HOSTS 支持 IDN 域名（A-label 匹配）")
+
+
+def test_trailing_slash_redirect_uses_relative_location(monkeypatch):
+    """同源 307 的 Location 为相对路径：TLS 反代下不把 https 降级为 http。"""
+    monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", "aligo.example.com")
+    client = _client()
+    response = client.get(
+        "/api/health/",
+        headers={
+            "Host": "aligo.example.com",
+            "X-Forwarded-Proto": "https",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 307, response.text
+    assert response.headers["location"] == "/api/health"
+    assert "no-store" in response.headers.get("cache-control", "")
+    assert response.headers.get("x-request-id")
+    query = client.get(
+        "/api/sessions/export/?user_id=alice",
+        headers={"Host": "aligo.example.com"},
+        follow_redirects=False,
+    )
+    assert query.headers["location"] == "/api/sessions/export?user_id=alice"
+    print("✓ 尾斜杠 307 使用相对 Location（不解引用后端 http scheme）")
+
+
+def test_sse_and_exports_are_no_store():
+    """SSE 对话流与导出响应都不可缓存（/api 不变式无例外）。"""
+    client = _client()
+    user = _unique_user("web_test_cache_headers")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": user,
+                "session_id": "cache-1",
+            },
+        ) as stream:
+            assert stream.status_code == 200
+            assert "no-store" in stream.headers.get("cache-control", "")
+        export = client.get("/api/export", params={"user_id": user})
+        assert export.status_code == 200
+        assert "no-store" in export.headers.get("cache-control", "")
+        # 无历史的会话导出是 404：错误响应同样不可缓存
+        empty = client.get("/api/sessions/export", params={"user_id": user})
+        assert "no-store" in empty.headers.get("cache-control", "")
+    finally:
+        _cleanup(user)
+    print("✓ SSE / 导出响应 no-store 覆盖（含错误响应）")
+
+
+def test_index_conditional_get_returns_304():
+    """入口页带 ETag 的条件请求回 304 空体，仍带 no-cache 与安全头。"""
+    client = _client()
+    first = client.get("/")
+    assert first.status_code == 200
+    etag = first.headers.get("etag")
+    assert etag, "入口页响应必须带 ETag"
+    second = client.get("/", headers={"If-None-Match": etag})
+    assert second.status_code == 304
+    assert second.content == b""
+    assert second.headers.get("cache-control") == "no-cache"
+    assert second.headers.get("x-frame-options") == "DENY"
+    print("✓ 入口页条件请求返回 304")
+
+
+def test_docs_csp_frame_ancestors_and_disabled_strict(monkeypatch):
+    """文档页 CSP 的 frame-ancestors 恒为 none；docs 关闭时 404 用严格策略。"""
+    client = _client()
+    disabled = client.get("/docs")
+    assert disabled.status_code == 404
+    strict_csp = disabled.headers.get("content-security-policy", "")
+    assert "cdn.jsdelivr.net" not in strict_csp
+    assert "script-src 'self'" in strict_csp
+    assert "frame-ancestors 'none'" in strict_csp
+
+    monkeypatch.setenv("ALIGO_ENABLE_DOCS", "1")
+    docs_client = TestClient(create_app(model=UsageTrackingModel(_FakeModel())))
+    docs = docs_client.get("/docs")
+    assert docs.status_code == 200
+    docs_csp = docs.headers.get("content-security-policy", "")
+    assert "cdn.jsdelivr.net" in docs_csp, "文档页仍需放行 CDN"
+    assert "frame-ancestors 'none'" in docs_csp, (
+        "文档页 frame-ancestors 必须与 X-Frame-Options: DENY 一致"
+    )
+    assert docs.headers.get("x-frame-options") == "DENY"
+    assert docs.headers.get("cache-control") == "no-store"
+    print("✓ 文档页 CSP frame-ancestors=none；关闭时 404 用严格策略")
+
+
 def test_host_allowlist_env(monkeypatch):
     """ALIGO_ALLOWED_HOSTS 支持精确域名与 *.example.com 通配。"""
     monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", "*.example.com, aligo.lan")

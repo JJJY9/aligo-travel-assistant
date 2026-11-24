@@ -34,6 +34,7 @@ import threading
 import time
 import weakref
 import uuid
+from urllib.parse import urlsplit
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _worker
@@ -246,14 +247,22 @@ _DOCS_SECURITY_HEADERS = _BASE_SECURITY_HEADERS + [
         b"img-src 'self' data: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
         b"font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; "
         b"connect-src 'self'; worker-src blob:; "
-        b"base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
+        b"base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     ),
 ]
 
 
-def _security_headers_for(path: str) -> list[tuple[bytes, bytes]]:
-    """按路径返回安全响应头：文档页面使用放宽 CSP，其它页面保持严格策略。"""
-    if path in ("/docs", "/redoc") or path.startswith(("/docs/", "/redoc/")):
+def _security_headers_for(
+    path: str, *, docs_enabled: bool = False
+) -> list[tuple[bytes, bytes]]:
+    """按路径返回安全响应头：仅当文档路由已注册时，文档页使用放宽 CSP。
+
+    文档关闭（默认）时 ``/docs`` 等路径是 404：这些 404 必须继续使用严格
+    策略，否则「关闭文档」的部署仍会在错误响应上暴露出放宽后的 CSP 面。
+    """
+    if docs_enabled and (
+        path in ("/docs", "/redoc") or path.startswith(("/docs/", "/redoc/"))
+    ):
         return _DOCS_SECURITY_HEADERS
     return _SECURITY_HEADERS
 
@@ -354,21 +363,89 @@ def _metric_path_before_route(route_path: str) -> str:
 # 公网域名重新解析到 127.0.0.1 后，浏览器以同源身份读写本机数据。
 _ALLOWED_HOSTS_ENV = "ALIGO_ALLOWED_HOSTS"
 
+# RFC 9110 authority：域名/IPv4（字母数字 . _ -）或方括号 IPv6，端口 1-5 位。
+# @ , ; / \ 空白等可能被反向代理 / URL 解析器解释成不同 authority 的字符
+# 一律拒绝（Starlette 的 Host 解析同样拒绝 @，白名单判定必须与之一致）。
+_AUTHORITY_RE = re.compile(
+    r"^(?P<name>[a-z0-9._-]+|\[(?P<ipv6>[0-9a-f:.]+)\])"
+    r"(?::(?P<port>[0-9]{1,5}))?$",
+    re.IGNORECASE,
+)
+
 
 def _normalized_request_host(host_header: str) -> str:
+    """严格归一化请求 Host：小写、剥端口、去尾点；畸形 authority 返回空串。"""
     host = (host_header or "").strip().lower()
     if not host:
         return ""
-    if host.startswith("["):
-        end = host.find("]")
-        if end < 0:
+    match = _AUTHORITY_RE.fullmatch(host)
+    if match is None:
+        # 兼容不带方括号的 IPv6 字面量（既有行为；浏览器一律带方括号）
+        if host.count(":") >= 2:
+            try:
+                ipaddress.IPv6Address(host)
+                return host
+            except ValueError:
+                return ""
+        return ""
+    port = match.group("port")
+    if port is not None and int(port) > 65535:
+        return ""
+    if match.group("ipv6") is not None:
+        try:
+            ipaddress.IPv6Address(match.group("ipv6"))
+        except ValueError:
             return ""
-        return host[1:end]
-    if host.count(":") == 1:
-        host = host.rsplit(":", 1)[0]
+        return match.group("ipv6")
     # 先剥端口再去尾点：``Host: example.com.:8000`` 若先 rstrip('.') 是空操作，
     # 去端口后仍带尾点、永远匹配不到白名单
-    return host.rstrip(".")
+    return match.group("name").rstrip(".")
+
+
+@functools.lru_cache(maxsize=63)
+def _idna_ascii_host(host: str) -> str:
+    """非 ASCII 域名 → 浏览器 Host 头携带的 A-label；ASCII 原样返回。
+
+    配置项常按用户直觉写 Unicode 域名（``例子.中``），而浏览器发的是
+    punycode，不转换会让合法条目永不命中（全站 400）。ASCII 段不经过
+    idna：保持通配符 / 下划线 / IP 字面量的既有语义。不可编码的条目返回
+    空串（该条目失效、请求继续 fail-closed）。
+    """
+    if host.isascii():
+        return host
+    try:
+        import idna
+
+        return idna.encode(host, uts46=True).decode("ascii")
+    except Exception:  # noqa: BLE001 - 无效域名 / 依赖缺失一律忽略该条目
+        logger.warning(
+            "ALIGO_ALLOWED_HOSTS 条目不是有效域名（已忽略）：%r", host[:100]
+        )
+        return ""
+
+
+def _normalized_allowed_host(item: str) -> str:
+    """归一化白名单配置项（含 ``*.suffix`` 通配形式与 Unicode 域名）。"""
+    text = (item or "").strip().lower()
+    if not text:
+        return ""
+    wildcard = text.startswith("*.")
+    body = text[2:] if wildcard else text
+    if not body.isascii():
+        # 请求侧的严格字符集不接受非 ASCII：配置项先转成浏览器实际发送的
+        # A-label 再走同一归一化（端口 / 尾点在转换前剥离，Unicode 名不含冒号）
+        name, sep, port = body.rpartition(":")
+        if sep and port.isdigit() and len(port) <= 5:
+            body = name
+        body = body.rstrip(".")
+        converted = _idna_ascii_host(body)
+        if not converted:
+            return ""
+        body = converted
+    pattern = _normalized_request_host(body)
+    if not pattern:
+        return ""
+    return f"*.{pattern}" if wildcard else pattern
 
 
 def _test_client_host_allowed() -> bool:
@@ -381,8 +458,8 @@ def _test_client_host_allowed() -> bool:
     return os.environ.get("ALIGO_TEST_CLIENT", "").strip() == "1"
 
 
-def _host_allowed(host_header: str) -> bool:
-    host = _normalized_request_host(host_header)
+def _is_allowed_host(host: str) -> bool:
+    """判定已归一化的 Host 是否允许（IP 字面量 / localhost / 白名单）。"""
     if not host:
         return False
     try:
@@ -402,7 +479,7 @@ def _host_allowed(host_header: str) -> bool:
     for item in configured.split(","):
         # 配置项与请求 Host 同一归一化：操作员按地址栏写 ``域名:端口``
         # 时必须能匹配（此前只对请求侧剥端口，配置侧永不命中、全站 400）
-        pattern = _normalized_request_host(item)
+        pattern = _normalized_allowed_host(item)
         if not pattern:
             continue
         if pattern.startswith("*.") and host.endswith(pattern[1:]):
@@ -412,10 +489,17 @@ def _host_allowed(host_header: str) -> bool:
     return False
 
 
+def _host_allowed(host_header: str) -> bool:
+    return _is_allowed_host(_normalized_request_host(host_header))
+
+
 class RequestContextMiddleware:
     """为每个 HTTP 请求生成 / 透传 X-Request-ID，并记录 /api/ 请求耗时。"""
-    def __init__(self, app: Any) -> None:
+
+    def __init__(self, app: Any, docs_enabled: bool = False) -> None:
         self.app = app
+        # 文档路由是否已注册：只有注册时才给 /docs* 放宽 CSP
+        self.docs_enabled = docs_enabled
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
@@ -427,18 +511,34 @@ class RequestContextMiddleware:
         request_id = (
             re.sub(r"[^A-Za-z0-9._-]", "", incoming)[:64] or uuid.uuid4().hex[:12]
         )
-        scope.setdefault("state", {})["request_id"] = request_id
+        state = scope.setdefault("state", {})
+        state["request_id"] = request_id
 
-        host_rejected = not _host_allowed(
-            headers.get(b"host", b"").decode("latin-1")
+        # Host 只允许出现一次（RFC 7230 §5.4）：重复 Host 的 first/last-wins
+        # 分歧可被用于让代理与应用看到不同 authority
+        host_values = [
+            value for key, value in scope.get("headers") or [] if key.lower() == b"host"
+        ]
+        request_host = (
+            _normalized_request_host(host_values[0].decode("latin-1"))
+            if len(host_values) == 1
+            else ""
         )
+        state["request_host"] = request_host
+        host_rejected = not _is_allowed_host(request_host)
 
         started = time.perf_counter()
         status_code = 0
         response_started = False
         path = str(scope.get("path", ""))
         route_path = _route_path(scope)
-        response_headers = _security_headers_for(route_path)
+        response_headers = _security_headers_for(
+            route_path, docs_enabled=self.docs_enabled
+        )
+        docs_path = self.docs_enabled and (
+            route_path in ("/docs", "/redoc", "/openapi.json")
+            or route_path.startswith(("/docs/", "/redoc/"))
+        )
 
         async def send_wrapper(message: dict[str, Any]) -> None:
             nonlocal status_code, response_started
@@ -446,16 +546,59 @@ class RequestContextMiddleware:
                 response_started = True
                 status_code = int(message.get("status", 0))
                 headers_list = list(message.get("headers") or [])
-                # 用户数据接口不进入浏览器 / 代理缓存；响应自己声明了 Cache-Control
-                # （如导出接口的 no-cache）时保持原样，避免重复头
-                if not any(
-                    key.lower() == b"cache-control" for key, _ in headers_list
-                ):
-                    if route_path.startswith("/api/"):
+                # 同源重定向改相对 Location：TLS 终止反代下应用看到的是
+                # http://，绝对 Location 会把 https 访问降级为明文（仓库内
+                # 的 301/307 都是同源路径补斜杠 / 目录跳转）
+                if status_code in (301, 302, 303, 307, 308):
+                    allowed_authorities = {
+                        value.decode("latin-1").strip().lower()
+                        for value in host_values
+                    }
+                    for index, (key, value) in enumerate(headers_list):
+                        if key.lower() != b"location":
+                            continue
+                        try:
+                            parsed = urlsplit(value.decode("latin-1"))
+                        except ValueError:
+                            continue
+                        if (
+                            parsed.scheme in ("http", "https")
+                            and parsed.netloc
+                            and parsed.netloc.lower() in allowed_authorities
+                        ):
+                            relative = parsed.path or "/"
+                            if parsed.query:
+                                relative += f"?{parsed.query}"
+                            if parsed.fragment:
+                                relative += f"#{parsed.fragment}"
+                            headers_list[index] = (key, relative.encode("latin-1"))
+                # 用户数据接口不进入浏览器 / 代理缓存：/api/ 响应一律带
+                # no-store；端点自设 Cache-Control（如 SSE 的 no-cache）时
+                # 保留原指令并追加禁令，绝不静默覆盖该不变式
+                cache_values = [
+                    value
+                    for key, value in headers_list
+                    if key.lower() == b"cache-control"
+                ]
+                if route_path.startswith("/api/"):
+                    if not cache_values:
                         headers_list.append((b"cache-control", b"no-store"))
-                    elif route_path.startswith("/static/"):
-                        # 静态资源每次重新验证：ETag 命中只回 304；避免
-                        # 新版 app.js 与旧 index.html 之类的混合缓存
+                    elif not any(b"no-store" in value.lower() for value in cache_values):
+                        headers_list = [
+                            (key, value + b", no-store")
+                            if key.lower() == b"cache-control"
+                            else (key, value)
+                            for key, value in headers_list
+                        ]
+                elif docs_path:
+                    # 文档页（Swagger / OpenAPI schema）同样不缓存：schema
+                    # 会暴露全部接口与参数，缓存到浏览器 / 代理没有收益
+                    if not cache_values:
+                        headers_list.append((b"cache-control", b"no-store"))
+                elif route_path.startswith("/static/"):
+                    # 静态资源每次重新验证：ETag 命中只回 304；避免
+                    # 新版 app.js 与旧 index.html 之类的混合缓存
+                    if not cache_values:
                         headers_list.append((b"cache-control", b"no-cache"))
                 message["headers"] = (
                     headers_list
@@ -483,6 +626,7 @@ class RequestContextMiddleware:
                         "status": 400,
                         "headers": [
                             (b"content-type", b"application/json; charset=utf-8"),
+                            (b"cache-control", b"no-store"),
                         ],
                     }
                 )
@@ -2597,12 +2741,11 @@ def _reject_cross_site_side_effect(request: Request) -> None:
     site = (request.headers.get("sec-fetch-site") or "").lower()
     if site in {"cross-site", "same-site"}:
         raise HTTPException(status_code=403, detail="跨站请求被拒绝")
-    if (
-        _test_client_host_allowed()
-        and (request.headers.get("host") or "").strip().lower() == "testserver"
-    ):
+    validated_host = (request.scope.get("state") or {}).get("request_host")
+    if _test_client_host_allowed() and validated_host == "testserver":
         # 测试客户端没有浏览器头：仅在测试环境启用测试缝（显式跨站头在
-        # 上方已拒绝，测试仍能覆盖守卫本身）
+        # 上方已拒绝，测试仍能覆盖守卫本身）。读中间件校验过的规范化 Host，
+        # 避免与 Host 白名单的解析口径再次分叉
         return
     if request.headers.get("x-aligo-client") == "web":
         return
@@ -3993,7 +4136,7 @@ def create_app(model: Any = None) -> FastAPI:
     app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
     # 分块传输没有 Content-Length，需在读取时按实际字节数兜底限制
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
-    app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(RequestContextMiddleware, docs_enabled=docs_enabled)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error_handler(
@@ -4009,8 +4152,10 @@ def create_app(model: Any = None) -> FastAPI:
             content={"detail": _json_safe_value(jsonable_encoder(errors))},
         )
 
+    static_files: StaticFiles | None = None
     if STATIC_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+        static_files = StaticFiles(directory=STATIC_DIR)
+        app.mount("/static", static_files, name="static")
 
     def _cross_site_side_effect(request: Request) -> None:
         _reject_cross_site_side_effect(request)
@@ -4184,13 +4329,25 @@ def create_app(model: Any = None) -> FastAPI:
         return wrapper
 
     @app.get("/")
-    def index() -> FileResponse:
+    def index(request: Request) -> Response:
         # 入口页必须每次重新验证：缓存的旧 index.html 搭配新 app.js（新增
-        # DOM id）会让 bindEvents 找不到元素、整页脚本中止；ETag 命中时
-        # 重验证只回 304，开销可以忽略
-        return FileResponse(
-            STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"}
+        # DOM id）会让 bindEvents 找不到元素、整页脚本中止；带 ETag /
+        # Last-Modified 的重验证回 304，不再重复传输整份文档。
+        # stat_result 必须显式传入：FileResponse 只有这样才会在本次构造时
+        # 就按与实际发送一致的 mtime-size 口径设置验证器
+        path = STATIC_DIR / "index.html"
+        response = FileResponse(
+            path,
+            headers={"Cache-Control": "no-cache"},
+            stat_result=path.stat(),
         )
+        if static_files is not None and static_files.is_not_modified(
+            response.headers, request.headers
+        ):
+            from starlette.staticfiles import NotModifiedResponse
+
+            return NotModifiedResponse(response.headers)
+        return response
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -5928,7 +6085,7 @@ def create_app(model: Any = None) -> FastAPI:
                         stream_state=replay_state,
                         media_type="text/event-stream",
                         headers={
-                            "Cache-Control": "no-cache",
+                            "Cache-Control": "no-store, no-cache",
                             "X-Accel-Buffering": "no",
                             "Connection": "keep-alive",
                             **rate_headers,
@@ -6164,7 +6321,7 @@ def create_app(model: Any = None) -> FastAPI:
             stream_state=stream_state,
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-store, no-cache",
                 "X-Accel-Buffering": "no",
                 "Connection": "keep-alive",
                 **rate_headers,
@@ -7409,6 +7566,13 @@ def main() -> None:
             "服务监听在 %s，可能对外可访问；请通过反向代理提供认证与 HTTPS，"
             "并按 SECURITY.md 配置 REDIS_URL / TRUST_PROXY_HEADERS",
             args.host,
+        )
+    if _test_client_host_allowed():
+        # 测试缝会放行 Host: testserver 并跳过同源守卫：误设环境变量的
+        # 长时间运行实例会削弱 DNS rebinding 防护，启动时必须可见
+        logger.warning(
+            "ALIGO_TEST_CLIENT=1：已启用测试客户端缝隙（放行 Host: testserver "
+            "并跳过同源标记检查），仅测试环境使用；生产运行请移除该环境变量"
         )
     try:
         application = create_app()
