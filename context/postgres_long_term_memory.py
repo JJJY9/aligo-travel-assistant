@@ -256,6 +256,18 @@ class PostgresLongTermMemory:
             )
             if isinstance(error, type)
         )
+        # 并发实例的 DDL（ALTER TABLE / CREATE INDEX 需要强锁）可能把本实例
+        # 的初始化语句卡到 lock_timeout（55P03）或 statement_timeout（57014）：
+        # 连接本身健康、表结构由持锁方推进，不能让它冒到构造函数被工厂
+        # 当作连接故障（冷却 60 秒并回退 JSON）
+        contention_errors: tuple[type[BaseException], ...] = tuple(
+            error
+            for error in (
+                getattr(psycopg.errors, "LockNotAvailable", None),
+                getattr(psycopg.errors, "QueryCanceled", None),
+            )
+            if isinstance(error, type)
+        )
         with self._conn.cursor() as cursor:
             # 建索引可能让持锁方占用较久：等待 schema 锁期间放宽
             # lock_timeout（连接默认 3 秒，等待锁超时会冒到构造函数、
@@ -283,7 +295,20 @@ class PostgresLongTermMemory:
                             # 旧实例（不持本锁）并发建表：批次在失败语句处中止，
                             # 重跑一次补齐后面的建表语句
                             logger.info("表结构已被并发创建，重试剩余 DDL")
-                            cursor.execute(_SCHEMA_SQL)
+                            try:
+                                cursor.execute(_SCHEMA_SQL)
+                            except contention_errors:
+                                logger.warning(
+                                    "表结构 DDL 等待锁超时，跳过本次初始化"
+                                    "（下次构造重试）"
+                                )
+                                return False
+                        except contention_errors:
+                            logger.warning(
+                                "表结构 DDL 等待锁超时，跳过本次初始化"
+                                "（下次构造重试）"
+                            )
+                            return False
                         try:
                             # 历史库可能已有重复 trip_id，建索引失败只记录，不阻止后端启用
                             cursor.execute(
@@ -527,9 +552,14 @@ class PostgresLongTermMemory:
                 else:
                     self._held_locks.pop(lock_name, None)
                 with contextlib.suppress(Exception):
+                    # 非重放：连接已断时服务端随会话释放全部锁，_reconnect
+                    # 会按剩余记账重新获取外层持有；若这里重连后重放 unlock，
+                    # 会把外层刚重获的唯一一次持有又释放掉（锁记账与实际
+                    # 持有脱节、外层临界区失去跨进程互斥）
                     self._execute(
                         "SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
                         (lock_name,),
+                        replay_safe=False,
                     )
                 with contextlib.suppress(Exception):
                     self._execute("SET lock_timeout = 3000")
@@ -1031,9 +1061,14 @@ class PostgresLongTermMemory:
             params.append(exclude_session_id)
 
         if limit:
+            # 上界排除未来时间戳（导入允许 ≤2100，留 1 小时时钟偏差与
+            # memory_manager 的未来过滤同口径）：created_at 排序下 2030
+            # 这类未来行会永久占据「最近 N 条」，把此后所有真实消息挤出
+            # 汇总窗口 / 短期回填（JSON 后端随新消息追加自然恢复，PG 不会）
             rows = self._fetchall(
                 "SELECT role, content, session_id, created_at FROM aligo_chat_messages "
-                f"WHERE {where} ORDER BY created_at DESC, id DESC LIMIT %s",
+                f"WHERE {where} AND created_at <= now() + interval '1 hour' "
+                "ORDER BY created_at DESC, id DESC LIMIT %s",
                 (*params, limit),
             )
             rows = list(reversed(rows))
@@ -1092,6 +1127,15 @@ class PostgresLongTermMemory:
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:session_meta:{self.user_id}",),
                 )
+                # 与批量导入（add_chat_messages 只取 chat_messages 锁）互斥：
+                # 否则导入事务的去重快照与删除交错，会把已删除的消息判重跳过、
+                # 只提交备份中新增的消息，产生「部分复活」的混合态（两种串行
+                # 顺序都得不出该状态）。锁顺序与 add_chat_turn 一致：
+                # session_meta → chat_messages
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:chat_messages:{self.user_id}",),
+                )
                 cursor.execute(
                     "DELETE FROM aligo_chat_messages "
                     "WHERE user_id = %s AND session_id = %s",
@@ -1146,6 +1190,10 @@ class PostgresLongTermMemory:
         rows = self._fetchall(
             "SELECT id, role, content, created_at FROM aligo_chat_messages "
             "WHERE user_id = %s AND session_id = %s "
+            # 与 get_chat_history(limit) 同口径排除未来时间戳：否则导入的
+            # 2030 行会一直被当作「最后一轮」，用户真实最新一轮无法编辑 /
+            # 重新生成（expect 也对不上）
+            "AND created_at <= now() + interval '1 hour' "
             "ORDER BY created_at DESC, id DESC LIMIT 2",
             (self.user_id, session_id),
         )
@@ -1170,6 +1218,12 @@ class PostgresLongTermMemory:
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:session_meta:{self.user_id}",),
+                )
+                # 与批量导入互斥（见 delete_chat_session）：导入的 dedupe
+                # 快照不能与本删除交错；锁顺序 session_meta → chat_messages
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo:chat_messages:{self.user_id}",),
                 )
                 # 「更新」按与读取一致的 created_at, id 排序判定：只看 id
                 # 会把恢复写入的旧消息误当成新消息，导致删除被意外拒绝
@@ -1705,6 +1759,9 @@ class PostgresLongTermMemory:
                     and parse_iso_datetime(updated_timestamp) is not None
                     else None
                 )
+                # 非重放：候选行来自重连前的快照，断开期间其它实例可能
+                # 已删除该行——重连后重放会匹配 0 行却仍按旧 trip_id 报告
+                # 成功；按持久化失败上报，由调用方整体重试（重新取快照）
                 self._execute(
                     "UPDATE aligo_trips SET "
                     "purpose = COALESCE(%s, purpose), "
@@ -1717,6 +1774,7 @@ class PostgresLongTermMemory:
                         updated_at,
                         existing[0],
                     ),
+                    replay_safe=False,
                 )
                 trip_id = str(existing[1] or "")
                 if not trip_id:
@@ -1729,6 +1787,7 @@ class PostgresLongTermMemory:
                     self._execute(
                         "UPDATE aligo_trips SET trip_id = %s WHERE id = %s",
                         (trip_id, existing[0]),
+                        replay_safe=False,
                     )
                 return trip_id
 
