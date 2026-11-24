@@ -142,6 +142,41 @@ def test_eval_cases_match_bundled_documents():
     print("✓ 评测题库与知识文档一致且全量覆盖")
 
 
+def test_discount_figures_consistent_across_documents():
+    """协议价优惠区间在知识文档之间必须一致。
+
+    FAQ 的协议酒店条目曾写「低10%-20%」而平台指南写「低10%-30%」：
+    两个来源给出不同答案，检索命中哪个就答哪个，评测关键词也只认其一。
+    """
+    import re
+    from pathlib import Path
+
+    documents_dir = (
+        Path(__file__).resolve().parent.parent
+        / ".claude"
+        / "skills"
+        / "ask-question"
+        / "data"
+        / "documents"
+    )
+    pattern = re.compile(r"低\s*(\d+)%\s*-\s*(\d+)%")
+    figures: dict[str, set[tuple[int, int]]] = {}
+    for path in documents_dir.glob("*.txt"):
+        text = path.read_text(encoding="utf-8")
+        ranges = {
+            (int(match.group(1)), int(match.group(2)))
+            for match in pattern.finditer(text)
+        }
+        if ranges:
+            figures[path.name] = ranges
+    assert figures, "知识文档应至少声明一次协议价优惠区间"
+    distinct = set().union(*figures.values())
+    assert len(distinct) == 1, (
+        f"协议价优惠区间在各文档间不一致：{figures}"
+    )
+    print("✓ 协议价优惠区间跨文档一致")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -154,4 +189,5 @@ if __name__ == "__main__":
     test_top_k_truncation()
     test_empty_cases()
     test_eval_cases_match_bundled_documents()
+    test_discount_figures_consistent_across_documents()
     print("\n全部通过")
