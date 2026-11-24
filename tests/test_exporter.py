@@ -278,6 +278,31 @@ def test_backup_sanitize_strips_escaped_nul_and_dict_keys():
     print("✓ 备份清洗清除转义 NUL 与字典键")
 
 
+def test_write_export_files_matches_export_files_bytes():
+    """预清洗字节直接写盘与 export_files 的产物逐字节一致。"""
+    from utils.exporter import sanitize_backup_data, write_export_files
+
+    data = _base_data()
+    data["exported_at"] = "2026-11-25T10:00:00.123456"
+    data["chat_history"] = [
+        {
+            "role": "assistant",
+            "content": json.dumps({"answer": "a\x00b"}, ensure_ascii=False),
+            "session_id": "s1",
+        }
+    ]
+    direct_dir = Path(tempfile.mkdtemp())
+    reused_dir = Path(tempfile.mkdtemp())
+    direct = export_files(data, direct_dir)
+    cleaned = sanitize_backup_data(data)
+    payload = json.dumps(cleaned, ensure_ascii=False, indent=2).encode("utf-8")
+    reused = write_export_files(cleaned, payload, reused_dir)
+    assert [path.name for path in direct] == [path.name for path in reused]
+    for old, new in zip(direct, reused):
+        assert old.read_bytes() == new.read_bytes(), old.name
+    print("✓ 预清洗字节写盘与 export_files 产物一致")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -292,6 +317,7 @@ if __name__ == "__main__":
     test_backup_sanitize_nested_nonfinite_and_nul()
     test_backup_sanitize_strips_escaped_nul_and_dict_keys()
     test_export_files_cleans_backup_before_write()
+    test_write_export_files_matches_export_files_bytes()
     test_export_user_names_are_casefold_unique()
     test_export_files_json_is_nan_safe_and_md_written()
     test_markdown_chat_body_escapes_html_and_backslash_cells()

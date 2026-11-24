@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from utils.atomic_write import write_text_atomic
+from utils.atomic_write import write_bytes_atomic, write_text_atomic
 from utils.console import strip_terminal_controls
 from utils.json_safe import sanitize_json, strip_nul
 from utils.session_markdown import sanitize_body
@@ -188,40 +188,53 @@ def safe_export_user(user_id: str) -> str:
     return safe
 
 
+def _export_stem(data: dict[str, Any]) -> str:
+    """导出文件名主干：大小写折叠唯一 + 保留微秒（同秒两次导出不互相覆盖）。"""
+    timestamp = (
+        str(data.get("exported_at", ""))
+        .replace(":", "")
+        .replace("-", "")[:21]
+    )
+    user = safe_export_user(str(data.get("user_id", "user")) or "user")
+    return f"{user}_{timestamp or 'export'}"
+
+
+def write_export_files(
+    cleaned: dict[str, Any],
+    json_bytes: bytes,
+    out_dir: Path | str,
+    stem: str | None = None,
+) -> list[Path]:
+    """写出**已清洗**数据对应的 JSON / Markdown 两个文件，返回路径列表。
+
+    调用方已经 ``sanitize_backup_data`` 并按导出格式序列化过 JSON（上限
+    预检用的就是同一串字节）时走这里，避免同一份备份再清洗一次 + 再
+    ``indent=2`` 序列化一次；普通调用方用 :func:`export_files` 包装。
+    ``json_bytes`` 的字节必须等于 ``json.dumps(cleaned, ensure_ascii=False,
+    indent=2).encode("utf-8")``（LF，无 BOM）。
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if stem is None:
+        stem = _export_stem(cleaned)
+    json_path = out / f"{stem}.json"
+    md_path = out / f"{stem}.md"
+    write_bytes_atomic(json_path, json_bytes)
+    write_text_atomic(md_path, render_markdown(cleaned), newline="\n")
+    return [json_path, md_path]
+
+
 def export_files(
     data: dict[str, Any],
     out_dir: Path | str,
     stem: str | None = None,
 ) -> list[Path]:
     """把导出数据写入 `<out_dir>/<stem>.json` 与 `<stem>.md`，返回文件路径列表。"""
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    if stem is None:
-        # 与 CLI 各导出命令同一命名口径：大小写折叠后仍唯一（Alice /
-        # alice 在大小写不敏感文件系统上不再互相覆盖）；保留微秒避免
-        # 同一用户同一秒内两次导出互相覆盖
-        timestamp = (
-            str(data.get("exported_at", ""))
-            .replace(":", "")
-            .replace("-", "")[:21]
-        )
-        user = safe_export_user(str(data.get("user_id", "user")) or "user")
-        stem = f"{user}_{timestamp or 'export'}"
-
     # 备份与 Markdown 使用同一份清洗后的数据：嵌套非有限数 / NUL / 孤立
     # 代理项会让「导出成功」的备份在恢复时被整条拒绝，或让 write_text 抛
     # UnicodeEncodeError 留下半截文件
     cleaned = sanitize_backup_data(data)
-    json_path = out / f"{stem}.json"
-    md_path = out / f"{stem}.md"
-    write_text_atomic(
-        json_path,
-        json.dumps(cleaned, ensure_ascii=False, indent=2),
-        # 固定 LF：体积上限按 indent=2 的 LF 口径估算，CLI 与 Web 导出
-        # 同字节；Windows 的默认 CRLF 翻译会让同一份数据多出每行 1 字节，
-        # 接近上限时两通道结论不一致
-        newline="\n",
-    )
-    write_text_atomic(md_path, render_markdown(cleaned), newline="\n")
-    return [json_path, md_path]
+    json_bytes = json.dumps(
+        cleaned, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+    return write_export_files(cleaned, json_bytes, out_dir, stem)

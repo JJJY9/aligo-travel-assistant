@@ -231,12 +231,19 @@ def _session_title(
 def _latest_timestamp(messages: list[dict[str, Any]]) -> str:
     """会话内最大消息时间戳（与 /api/sessions、cli sessions 同一口径）。"""
     latest = ""
+    latest_key = ""
+    seen = False
     for message in messages:
         timestamp = str(message.get("timestamp") or "")
-        if timestamp and (
-            not latest or chronological_key(timestamp) > chronological_key(latest)
-        ):
+        if not timestamp:
+            continue
+        key = chronological_key(timestamp)
+        # 严格 >：并列时刻保留先出现者；用 seen 判断首条而不是「key 为空」，
+        # 全非法时间戳的会话不能从首条退化成末条
+        if not seen or key > latest_key:
+            seen = True
             latest = timestamp
+            latest_key = key
     return latest
 
 
@@ -266,10 +273,17 @@ def render_all_sessions_markdown(
     user_id: str,
     messages: list[dict[str, Any]],
     titles: dict[str, str] | None = None,
+    *,
+    sessions: list[tuple[str, list[dict[str, Any]]]] | None = None,
 ) -> tuple[str, int]:
-    """把全部会话渲染为一份 Markdown，返回 (文本, 会话数)。"""
+    """把全部会话渲染为一份 Markdown，返回 (文本, 会话数)。
+
+    ``sessions`` 传入调用方已算好的分组时直接复用（CLI 列表 / 导出同一份
+    确定性分组），不再对全量消息做第二遍分组与最大时间戳解析。
+    """
     titles = titles or {}
-    sessions = group_sessions(messages)
+    if sessions is None:
+        sessions = group_sessions(messages)
     exported_at = datetime.now().isoformat(timespec="seconds")
     lines = [
         "# Aligo 会话导出",
