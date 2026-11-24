@@ -20,67 +20,91 @@ from utils.json_safe import sanitize_json
 logger = logging.getLogger(__name__)
 
 
-_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+_FORMULA_CHARS = ("=", "+", "-", "@")
+# OWASP 把 CR / LF / 制表符同样列为公式注入前缀：表格软件会先剥掉前导
+# 空白 / 换行再把后续内容当公式求值
+_FORMULA_PREFIXES = _FORMULA_CHARS + ("\t", "\r", "\n")
+
+# 身份日期形态：分隔符兼容历史数据的 /（2026/3/12），\d 兼容非 ASCII 数字
+# （int() 会把它们解析成等价数值，输出再统一格式化为纯 ASCII）
+_IDENTITY_DATE_RE = re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})")
+
+
+def _identity_projection(text: str) -> str:
+    """导出清洗的投影（身份键与渲染输出共用同一口径）。
+
+    孤立代理项转义（避免写文件时 UnicodeEncodeError），CRLF / CR 归一为
+    LF，U+2028 / U+2029 替换为空格（``str.splitlines`` 会在它们处断行），
+    剥离终端控制序列（ESC / OSC 会在终端执行剪贴板写入等操作）。保留
+    制表符与换行。
+
+    存储里的行程字段是用户 / 模型输入，不可信；CSV / ICS / HTML 与
+    ``--stdout`` 输出、以及全部身份键（存储去重 / 导入预览 / trips-dedupe）
+    都必须经过这里——导出会把字段清洗成这个投影，身份若不跟着归一，
+    含控制字符 / U+2028 的行程导出再导入会被当成另一条行程重复新增。
+    """
+    text = str(sanitize_json(text))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace(" ", " ").replace(" ", " ")
+    return strip_terminal_controls(text)
 
 
 def normalize_identity_date(value: Any) -> str:
-    """日期归一：YYYY-M-D 补零到 YYYY-MM-DD（其它格式原样返回）。
+    """日期归一：YYYY-M-D / YYYY/M/D 补零为纯 ASCII 的 YYYY-MM-DD。
 
-    历史数据可能保留未补零写法（如 2026-1-5），存储去重与导入端都按补零
-    后的日期比对；导出（CSV / ICS）也用它，否则导出文件再导入时严格格式
-    校验会跳过这些行，造成静默丢行程。放在本模块供 trip_import 反向复用，
-    避免循环导入。
+    历史数据可能保留未补零写法（2026-1-5）或斜杠写法（2026/3/12：备份
+    恢复按保真优先原样保留），存储去重与导入端都按补零后的 ISO 日期比对；
+    导出（CSV / ICS）也用它——否则这些日期在导出再导入时会被严格格式
+    校验整行 / 整事件跳过，造成静默丢行程。非 ASCII 数字日期（\\d 匹配）
+    经 int() 归一为等价 ASCII 日期，避免混合字符集绕过去重口径。
+
+    无法识别或范围非法的值（待定 / 2026-13-40）原样返回（已做导出清洗
+    投影）；日期身份是否成立由调用方决定。放在本模块供 trip_import 反向
+    复用，避免循环导入。
     """
-    text = str(value or "").strip()
-    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    text = _identity_projection(str(value or "")).strip()
+    match = _IDENTITY_DATE_RE.fullmatch(text)
     if not match:
         return text
+    year = int(match.group(1))
     month = int(match.group(2))
     day = int(match.group(3))
     if not (1 <= month <= 12 and 1 <= day <= 31):
         return text
-    return f"{match.group(1)}-{month:02d}-{day:02d}"
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def normalize_identity_text(value: Any) -> str:
-    """行程文本字段的身份归一：CRLF / CR 统一为 LF（不改变其它内容）。
+    """行程文本字段的身份归一：与导出清洗使用同一投影。
 
-    ICS 往返会把换行还原成 LF，而 CSV 与手动录入可能保留 CRLF：存储去重、
-    导入预览与去重命令必须用同一口径，否则同一趟行程因换行写法不同被当成
+    ICS 往返会把换行还原成 LF，而 CSV 与手动录入可能保留 CRLF；导出还会
+    剥离控制字符 / 把 U+2028 / U+2029 换成空格。存储去重、导入预览与去重
+    命令必须用同一口径，否则同一趟行程因换行 / 控制字符写法不同被当成
     两条记录（导入回导时重复新增，且去重命令清不掉）。
     """
-    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _identity_projection(str(value or ""))
 
 
 def _needs_quote_guard(text: str) -> bool:
-    """以公式字符开头，或去掉任意个前导引号后仍需防护（保证导入端可逆）。
+    """以公式字符开头，或去掉任意个前导引号 / 前导空白后仍需防护。
 
     逐字符递归在字段包含上千个前导单引号时会触发 RecursionError（导入 /
-    导出都会崩溃），这里改为迭代剥离。
+    导出都会崩溃），这里改为迭代剥离。前导空白后的公式字符同样危险：
+    表格软件会忽略前导空白再求值，而导出清洗会把 U+2028 / CR 变成 LF /
+    空格，因此判定必须覆盖 lstrip 后的形态（导入端复用同一判定反解）。
     """
     index = 0
     while index < len(text) and text[index] == "'":
         index += 1
-    return text[index:].startswith(_FORMULA_PREFIXES)
+    rest = text[index:]
+    if rest.startswith(_FORMULA_PREFIXES):
+        return True
+    return rest.lstrip().startswith(_FORMULA_CHARS)
 
 
 def _clean_trip_value(value: object) -> str:
-    """渲染前的字段清洗：孤立代理项转义（避免写文件时 UnicodeEncodeError），
-    换行归一（CRLF / CR → LF，与身份口径一致），剥离终端控制序列
-    （ESC / OSC 会在终端执行剪贴板写入等操作）并清除 U+2028 / U+2029。
-
-    U+2028 / U+2029 不在终端控制序列范围内，但 ``str.splitlines`` 会在它们
-    处断行（ICS 计数、按 Unicode 行边界解析的导入器会把后续内容当成新
-    记录 / 新属性行），还会绕过「公式字符在首列」的 CSV 注入前缀防护；
-    行程字段是用户 / 模型输入，导出前统一替换为空格。
-
-    存储里的行程字段是用户 / 模型输入，不可信；CSV / ICS / HTML 与
-    ``--stdout`` 输出都必须经过这里。保留制表符与换行。
-    """
-    text = sanitize_json(str(value if value is not None else ""))
-    text = normalize_identity_text(text)
-    text = text.replace("\u2028", " ").replace("\u2029", " ")
-    return strip_terminal_controls(text)
+    """渲染前的字段清洗（与身份归一同一投影，见 ``_identity_projection``）。"""
+    return _identity_projection(str(value if value is not None else ""))
 
 
 def _csv_safe(value: object) -> str:
@@ -203,8 +227,22 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     end_identity = normalize_identity_date(
         trip.get("end_date") or trip.get("start_date")
     )
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_identity):
+    # 机器段只能写 YYYY-MM-DD：无法解析的返程日期（待定 / 旧格式 / 不存在的
+    # 日历日期）在这里被改写成单日日期，原值改由 X-ALIGO-TRIP-END 属性
+    # 携带——否则回导时身份键的 end 变成出发日，同一账号重复新增一条行程
+    # （README 承诺重复导入幂等）。X- 属性按 RFC 5545 是合法 x-name，外部
+    # 日历客户端与不认识的解析器都会忽略；旧版导入器行为与今天完全一致。
+    restored_end = ""
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", end_identity):
         end_identity = f"{end[:4]}-{end[4:6]}-{end[6:8]}"
+    if raw_end and _ics_date(str(raw_end)) is None:
+        normalized_raw_end = normalize_identity_date(
+            _clean_trip_value(raw_end)
+        )
+        # 超长脏值与导入端字段上限同口径：超出时宁可不带（回导退化为
+        # 单日），也不能让导入端因为一个附加属性拒绝整条事件
+        if normalized_raw_end and len(normalized_raw_end) <= 100:
+            restored_end = normalized_raw_end
     description = (
         f"Aligo 行程：{escape_ics_machine_field(_clean_trip_value(trip.get('origin')))} → "
         f"{escape_ics_machine_field(_clean_trip_value(trip.get('destination')))}，"
@@ -230,22 +268,41 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
     uid_digest = hashlib.sha1(uid_source.encode("utf-8")).hexdigest()[:16]
     uid = f"aligo-{uid_digest}@aligo.local"
 
-    return [
+    lines = [
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{stamp}",
         f"DTSTART;VALUE=DATE:{start}",
-        f"DTEND;VALUE=DATE:{end_exclusive}",
-        f"SUMMARY:{_ics_escape(summary)}",
-        f"DESCRIPTION:{_ics_escape(description)}",
-        # 全天事件的 DTSTART 是出发日 00:00，提前 15 小时即前一天 09:00 提醒
-        "BEGIN:VALARM",
-        "ACTION:DISPLAY",
-        f"DESCRIPTION:{_ics_escape(f'出行提醒：明天 {origin} → {destination}')}",
-        "TRIGGER:-PT15H",
-        "END:VALARM",
-        "END:VEVENT",
     ]
+    # RFC 5545 §3.8.2.2：DTEND 必须晚于 DTSTART。9999-12-31 各加一天会
+    # 溢出，此前写出的 DTEND==DTSTART 是非法零长度事件；单日时按 §3.6.1
+    # 省略 DTEND 表示一天，多日时 DTEND=99991231 本身合法（最后一天因
+    # 4 位年份上限不可表示，与既有行为一致）
+    if end_exclusive > start:
+        lines.append(f"DTEND;VALUE=DATE:{end_exclusive}")
+    lines.extend(
+        [
+            f"SUMMARY:{_ics_escape(summary)}",
+            f"DESCRIPTION:{_ics_escape(description)}",
+        ]
+    )
+    if restored_end:
+        lines.append(
+            "X-ALIGO-TRIP-END:"
+            + _ics_escape(escape_ics_machine_field(restored_end))
+        )
+    lines.extend(
+        [
+            # 全天事件的 DTSTART 是出发日 00:00，提前 15 小时即前一天 09:00 提醒
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{_ics_escape(f'出行提醒：明天 {origin} → {destination}')}",
+            "TRIGGER:-PT15H",
+            "END:VALARM",
+            "END:VEVENT",
+        ]
+    )
+    return lines
 
 
 def _ics_fold(line: str) -> str:
@@ -283,6 +340,18 @@ def _ics_calendar(events: list[list[str]]) -> str:
     ]
     for event in events:
         lines.extend(event)
+    if not events:
+        # RFC 5545 §3.6：iCalendar 对象 MUST 至少含一个组件（component = 1*）。
+        # 保持既有 200 / exit 0 的空导出语义，输出一个客户端必须忽略的
+        # 扩展组件（x-comp 是 component 的合法取值；不能只写 BEGIN/END
+        # 两行，x-comp 的 ABNF 要求至少一条内容行）
+        lines.extend(
+            [
+                "BEGIN:X-ALIGO-EMPTY",
+                "X-ALIGO-EMPTY:1",
+                "END:X-ALIGO-EMPTY",
+            ]
+        )
     lines.extend(["END:VCALENDAR", ""])
     return "\r\n".join(_ics_fold(line) for line in lines)
 

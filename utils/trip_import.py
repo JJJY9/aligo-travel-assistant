@@ -57,7 +57,8 @@ _HEADER_ALIASES = {
 
 
 def _normalize_header(cell: str) -> str:
-    return str(cell or "").strip().lstrip("﻿")
+    # 先去 BOM 再 strip：兼容「﻿ 出发地」这类 BOM 后跟空白的表头
+    return str(cell or "").lstrip("﻿").strip()
 
 
 def _normalize_trip_text(value: Any) -> str:
@@ -99,50 +100,104 @@ def parse_trips_csv(
     # 非严格模式会把后续多行静默合并成一条记录、零错误地导入错数据；
     # 严格模式走下面的 csv.Error 分支，保留已解析行并报出行号
     reader = csv.reader(io.StringIO(text), strict=True)
-    try:
-        header = next(reader)
-    except StopIteration:
-        return [], [(1, "文件为空")]
-    except csv.Error as exc:
-        # 单字段超过 field_size_limit（默认 131072 字符）时 csv 直接抛错：
-        # 按解析错误返回，不能穿透成 traceback、让已解析行全部丢失
-        return [], [(1, f"CSV 解析失败：{exc}")]
+    header: list[str] = []
+    header_line = 1
+    while True:
+        try:
+            candidate = next(reader)
+        except StopIteration:
+            return [], [(1, "文件为空")]
+        except csv.Error as exc:
+            # 单字段超过 field_size_limit（默认 131072 字符）时 csv 直接抛错：
+            # 按解析错误返回，不能穿透成 traceback、让已解析行全部丢失
+            return [], [(max(1, reader.line_num), f"CSV 解析失败：{exc}")]
+        header_line = max(1, reader.line_num)
+        # 表头前的空行 / 纯空白 / 仅 BOM 记录跳过：数据区本就跳过空行，
+        # 表头区不应因一个空行把整份文件判成「缺少必需列」
+        if any(_normalize_header(cell) for cell in candidate):
+            header = candidate
+            break
 
     mapping: dict[str, int] = {}
     for index, header_cell in enumerate(header):
-        name = _normalize_header(header_cell)
+        # 英文别名按 casefold 比较（Origin / START_DATE 等同小写），中文
+        # 不含大小写、不受影响
+        name = _normalize_header(header_cell).casefold()
         for key, aliases in _HEADER_ALIASES.items():
             if name in aliases and key not in mapping:
                 mapping[key] = index
                 break
     missing = {"destination", "start_date"} - set(mapping)
     if missing:
-        return [], [(1, f"缺少必需列：{'、'.join(sorted(missing))}")]
+        # 回显实际表头（限量、去控制字符）：只报内部键名时用户无法判断
+        # 是列名拼错还是文件选错
+        shown: list[str] = []
+        for header_cell_value in header[:10]:
+            text_cell = " ".join(_normalize_header(header_cell_value).split())
+            if text_cell:
+                shown.append(
+                    "".join(ch if ch.isprintable() else " " for ch in text_cell)[:40]
+                )
+        actual = "、".join(shown) or "空行"
+        return [], [
+            (
+                header_line,
+                f"缺少必需列：{'、'.join(sorted(missing))}"
+                f"（实际表头：{actual}；支持中文表头或 "
+                "origin/destination/start_date/end_date/purpose，"
+                "英文不区分大小写）",
+            )
+        ]
 
-    def cell(row: list[str], key: str) -> str:
+    def cell(row: list[str], key: str, *, trim: bool = False) -> str:
         index = mapping.get(key)
         if index is None or index >= len(row):
             return ""
-        value = str(row[index] or "").strip()
-        # 反转 trips-export 为防 CSV 公式注入加的前导单引号
-        if value.startswith("'") and _needs_quote_guard(value[1:]):
-            value = value[1:]
-        return value
+        raw = str(row[index] or "")
+        # 反转 trips-export 为防 CSV 公式注入加的前导单引号：导出端永远
+        # 加在字段首字符，因此只在原始值上判断（先 strip 会吞掉受保护
+        # 字段的前导空白，身份随之漂移）
+        if raw.startswith("'") and _needs_quote_guard(raw[1:]):
+            raw = raw[1:]
+        # 日期字段容忍首尾空白；文本字段保留原文（与导出清洗的保真口径
+        # 一致），纯空白由调用方归一
+        return raw.strip() if trim else raw
 
     rows: list[dict[str, Any]] = []
     errors = _BoundedErrors()
+    # 合法但可疑的跨行记录（错位引号被后文引号「闭合」时 csv 会把多条
+    # 物理行解析成一条合法记录）：只告警、不拒绝，由调用方展示给用户
+    warnings = _BoundedErrors()
     last_error_line = -1
     while True:
+        # 记录起始物理行：csv.reader.line_num 是上一条成功记录的最后一行
+        record_start = reader.line_num + 1
         try:
             row = next(reader)
         except StopIteration:
             break
         except csv.Error as exc:
+            if "unexpected end of data" in str(exc):
+                # 引号未闭合：csv 一直读到 EOF 才报错，reader.line_num
+                # 已是文件末行，record_start..末行全部被这条坏记录吞掉，
+                # 之后不会再有可解析行。报出行号必须指向记录起点（末行
+                # 本身通常是合法行），并按丢失的物理行数计入跳过总数
+                lost = max(1, reader.line_num - record_start + 1)
+                errors.add(
+                    (
+                        record_start,
+                        f"CSV 解析失败：第 {record_start} 行开始的记录中"
+                        f"引号未闭合，读到文件末尾第 {reader.line_num} 行，"
+                        f"共 {lost} 个物理行未导入"
+                        "（可能含多行字段，请检查该记录的引号是否成对）",
+                    )
+                )
+                errors.total += lost - 1
+                break
             # 错位引号 / 超长字段之后 csv.reader 仍能继续返回后续行：
             # 只跳过当前记录，不能 break 丢弃余下可解析的行（README 承诺
-            # 「非法行收集后列出并跳过、不中断其余项」）。未闭合引号会把
-            # 余下文本吞成一条，下一轮要么再次报错、要么整条被判非法行；
-            # 以行号是否推进作为继续条件，避免同一行上报错死循环
+            # 「非法行收集后列出并跳过、不中断其余项」）。以行号是否推进
+            # 作为继续条件，避免同一行上报错死循环
             errors.add((reader.line_num, f"CSV 解析失败：{exc}"))
             if reader.line_num <= last_error_line:
                 break
@@ -154,9 +209,11 @@ def parse_trips_csv(
         if not row or all(not str(item or "").strip() for item in row):
             continue
         destination = cell(row, "destination")
-        start_date = cell(row, "start_date")
-        end_date = cell(row, "end_date")
-        if not destination:
+        start_date = cell(row, "start_date", trim=True)
+        end_date = cell(row, "end_date", trim=True)
+        origin = cell(row, "origin")
+        purpose = cell(row, "purpose")
+        if not destination.strip():
             errors.add((line_no, "目的地为空"))
             continue
         start_dt = _strict_date(start_date)
@@ -171,36 +228,59 @@ def parse_trips_csv(
             if end_dt < start_dt:
                 errors.add((line_no, "结束日期不能早于出发日期"))
                 continue
-        purpose = cell(row, "purpose")
         oversize = next(
             (
                 field
                 for field, value in (
-                    ("origin", cell(row, "origin")),
+                    ("origin", origin),
                     ("destination", destination),
                     ("purpose", purpose),
                 )
-                if len(str(value or "")) > _MAX_TRIP_FIELD_CHARS
+                if len(str(value or "").strip()) > _MAX_TRIP_FIELD_CHARS
             ),
             None,
         )
         if oversize:
             errors.add((line_no, f"字段 {oversize} 超过 {_MAX_TRIP_FIELD_CHARS} 字"))
             continue
+        # 跨行记录里除目的外的列出现换行：极可能是错位引号把下一条行程
+        # 吞进了本行（合并后的路线 / 日期仍然「合法」，不告警则零错误）
+        span_lines = reader.line_num - record_start
+        if span_lines > 0:
+            newline_fields = [
+                key
+                for key, index in mapping.items()
+                if index < len(row) and "\n" in str(row[index] or "")
+            ]
+            suspicious = [key for key in newline_fields if key != "purpose"]
+            if not suspicious and "purpose" in newline_fields:
+                purpose_raw = str(row[mapping["purpose"]] or "")
+                if re.search(r"\n[^\n]*,\s*\d{4}-\d{2}-\d{2}", purpose_raw):
+                    suspicious = ["purpose"]
+            if suspicious:
+                warnings.add(
+                    (
+                        record_start,
+                        f"第{record_start}-{reader.line_num}行被解析为同一条"
+                        f"行程（{'、'.join(suspicious)} 跨行）；若本意每行"
+                        "一条行程，请检查引号是否成对",
+                    )
+                )
         rows.append(
             {
-                "origin": cell(row, "origin"),
+                "origin": origin if origin.strip() else "",
                 "destination": destination,
                 "start_date": start_date,
                 "end_date": end_date,
-                # 缺省 / 空白目的保留 None：去重更新时存储层保留原值
-                "purpose": purpose or None,
+                # 缺省 / 纯空白目的保留 None：去重更新时存储层保留原值
+                "purpose": purpose if purpose.strip() else None,
             }
         )
         if max_rows is not None and len(rows) > max_rows:
             raise ValueError(
                 f"单次最多导入 {max_rows} 条行程，请拆分文件后再导入"
             )
+    errors.warnings = warnings  # type: ignore[attr-defined]
     return rows, errors
 
 
@@ -258,14 +338,24 @@ _ICS_DT = re.compile(
 
 
 def _ics_local_datetime(
-    value: str, tzid: str = ""
+    value: str, tzid: str = "", user_tz: str | None = None
 ) -> "tuple[datetime, bool] | None":
     """解析 DATE / DATE-TIME 属性值，返回 (本机墙钟时间, 是否含时间成分)。
 
-    Z / ±HHMM / ``TZID`` 的 DATE-TIME 先换算到本机时区再取日期：UTC 23:30
+    Z / ±HHMM / ``TZID`` 的 DATE-TIME 先换算到目标时区再取日期：UTC 23:30
     在东八区已是第二天，只截前 8 位日期会把行程整体记错一天；带 TZID 的
     浮动写法（Outlook）与同一时刻的 UTC 写法（Google）必须得到同一天。
+    ``user_tz`` 是 Web 面板上报的浏览器时区：容器常以 UTC 部署，不传时
+    服务端按自身时区换算会把同一文件记成与 CLI（用户机器时区）不同的
+    日期；CLI / 旧客户端不传，行为与今天完全一致。
     """
+    target_zone = None
+    if user_tz:
+        try:
+            target_zone = ZoneInfo(str(user_tz))
+        except (KeyError, ValueError, OSError):
+            # 浏览器上报了未安装 / 非法时区：回退进程本机时区，不中断导入
+            target_zone = None
     text = str(value or "").strip()
     match = _ICS_DT.match(text)
     if match is None:
@@ -299,7 +389,13 @@ def _ics_local_datetime(
             sign = 1 if tz[0] == "+" else -1
             offset = timezone(sign * timedelta(hours=hours, minutes=minutes))
         try:
-            parsed = parsed.replace(tzinfo=offset).astimezone().replace(tzinfo=None)
+            aware = parsed.replace(tzinfo=offset)
+            converted = (
+                aware.astimezone(target_zone)
+                if target_zone is not None
+                else aware.astimezone()
+            )
+            parsed = converted.replace(tzinfo=None)
         except (OverflowError, OSError, ValueError):
             # 极端年份（如 0001-01-01+14:00）换算本机时区越界：按非法
             # 时间跳过该事件，整份导入不中断
@@ -311,7 +407,13 @@ def _ics_local_datetime(
             # 未安装的时区库 / 非法 TZID：按浮动时间处理（不中断整份导入）
             return parsed, has_time
         try:
-            parsed = parsed.replace(tzinfo=zone).astimezone().replace(tzinfo=None)
+            aware = parsed.replace(tzinfo=zone)
+            converted = (
+                aware.astimezone(target_zone)
+                if target_zone is not None
+                else aware.astimezone()
+            )
+            parsed = converted.replace(tzinfo=None)
         except (OverflowError, OSError, ValueError):
             return None
     return parsed, has_time
@@ -357,10 +459,36 @@ def _split_ics_summary(summary: str) -> dict[str, str] | None:
     }
 
 
-def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
+def _restored_end_from_props(props: dict[str, str]) -> str | None:
+    """读取 X-ALIGO-TRIP-END（无法解析的原始返程日期）；非法值返回 None。
+
+    值来自不可信文件：超长 / NUL / 孤立代理项 / 控制字符一律忽略该属性，
+    回退到 DESCRIPTION 机器段与 DTEND 推导（不能因为一个附加属性把整条
+    事件丢掉，否则第三方日历的脏属性会让行程静默消失）。
+    """
+    raw = props.get("X-ALIGO-TRIP-END")
+    if raw is None:
+        return None
+    value = unescape_ics_machine_field(_ics_unescape(raw)).strip()
+    if not value or len(value) > _MAX_TRIP_FIELD_CHARS:
+        return None
+    if _bad_import_text(value):
+        return None
+    if any(ord(char) < 0x20 and char != "\t" for char in value):
+        return None
+    if any(0x7F <= ord(char) <= 0x9F for char in value):
+        return None
+    if " " in value or " " in value:
+        return None
+    return value
+
+
+def _ics_event_row(
+    props: dict[str, str], user_tz: str | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
     """把一个 VEVENT 的属性映射为行程行；无法使用时返回 (None, 原因)。"""
     start_parsed = _ics_local_datetime(
-        props.get("DTSTART", ""), props.get("DTSTART_TZID", "")
+        props.get("DTSTART", ""), props.get("DTSTART_TZID", ""), user_tz
     )
     if start_parsed is None:
         return None, "缺少或非法的 DTSTART"
@@ -369,7 +497,7 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = ""
     end_parsed = _ics_local_datetime(
-        props.get("DTEND", ""), props.get("DTEND_TZID", "")
+        props.get("DTEND", ""), props.get("DTEND_TZID", ""), user_tz
     )
     if end_parsed is not None:
         end_dt, end_has_time = end_parsed
@@ -390,35 +518,53 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
                 inclusive = start_day
             end_date = inclusive.strftime("%Y-%m-%d")
 
-    description = _ics_unescape(props.get("DESCRIPTION", "")).strip()
-    summary = _ics_unescape(props.get("SUMMARY", "")).strip()
+    # 文本字段不做 strip：导出端保留原文（含首尾空白 / 制表符），导入
+    # 若改写字段，身份键随之漂移，同账号回导会重复新增
+    description = _ics_unescape(props.get("DESCRIPTION", ""))
+    summary = _ics_unescape(props.get("SUMMARY", ""))
     origin = destination = purpose = ""
     # 正则只扫描前缀：两个模式都含非贪婪 .*? 加尾部字面量，攻击者用大量
     # 「 → 」/缺少闭合括号的文本可触发二次方回溯（1M 字符可卡住数十分钟）。
     # 本工具生成的 DESCRIPTION / SUMMARY 都在数百字符内，超长前缀不可能是
     # 自己的格式。
-    match = _ALIGO_DESCRIPTION.match(description[:2000])
+    match = _ALIGO_DESCRIPTION.match(description[:2000].lstrip(" \t"))
     if match:
         # 导出端把出发地 / 目的地里的箭头与全角逗号转义成 \uXXXX：
         # 还原后才能得到原始字段（否则含「→」的出发地被误拆成两段）
-        origin = unescape_ics_machine_field(match.group("origin").strip())
-        destination = unescape_ics_machine_field(
-            match.group("destination").strip()
-        )
-        purpose = match.group("purpose").strip()
+        origin = unescape_ics_machine_field(match.group("origin"))
+        destination = unescape_ics_machine_field(match.group("destination"))
+        purpose = match.group("purpose")
         # 日期默认以 DTSTART / DTEND 为准：DESCRIPTION 里的时间段可能被外部
-        # 日历手工编辑过，与实际事件不一致。例外：机器段的 start 与 DTSTART
-        # 一致而 end 与 DTEND 推导结果不同——本工具导出的脏数据（end<start
-        # 被压成单日、9999-12-31 无法 +1 天）会在这里改写结束日，身份变化
-        # 导致重导新增重复行程；以机器段 end 为准才能闭合往返
+        # 日历手工编辑过，与实际事件不一致。只有导出端无法用 DTEND 表达
+        # 机器段 end 时才以机器段为准：① 无 DTEND（缺失 / 无法解析）时
+        # 机器段是唯一日期来源；② end<start 的脏数据被导出压成单日；
+        # ③ end=9999-12-31 无法 +1 天。其余差异视为外部日历对事件日期的
+        # 编辑（只改 DTEND），必须尊重——否则旧机器段会把用户的改期回滚。
+        # 机器段日期必须是 ASCII 真实日历日期：非 ASCII 数字 / 2026-02-31
+        # 之类的手工值不能借这条通道落库（CSV 导入同口径拒绝）。
+        raw_machine_end = match.group("end")
         machine_start = normalize_identity_date(match.group("start"))
-        machine_end = normalize_identity_date(match.group("end"))
+        machine_end = normalize_identity_date(raw_machine_end)
+        machine_end_wins = bool(machine_end) and (
+            end_date == ""
+            or machine_end == "9999-12-31"
+            or (machine_end < machine_start and end_date == start_date)
+        )
         if (
             machine_start == start_date
-            and machine_end
             and machine_end != end_date
+            and machine_end_wins
+            and raw_machine_end.isascii()
+            and _strict_date(machine_end) is not None
         ):
             end_date = machine_end
+        # X-ALIGO-TRIP-END 是导出端为「无法解析的返程日期」保留原值的专用
+        # 属性（DESCRIPTION 机器段只能写 YYYY-MM-DD）：只在 DTSTART 与机器段
+        # 一致时信任，回导后 identity 的 end 与原行闭合，不会重复新增
+        if machine_start == start_date:
+            restored_end = _restored_end_from_props(props)
+            if restored_end is not None:
+                end_date = restored_end
     else:
         parts = _split_ics_summary(summary[:400])
         if parts:
@@ -427,23 +573,23 @@ def _ics_event_row(props: dict[str, str]) -> tuple[dict[str, Any] | None, str | 
             purpose = parts["purpose"]
         else:
             destination = summary[:400]
-    if not destination:
+    if not destination.strip():
         return None, "缺少目的地（SUMMARY 为空）"
     for field, value in (
         ("origin", origin),
         ("destination", destination),
         ("purpose", purpose),
     ):
-        if len(str(value or "")) > _MAX_TRIP_FIELD_CHARS:
+        if len(str(value or "").strip()) > _MAX_TRIP_FIELD_CHARS:
             return None, f"字段 {field} 超过 {_MAX_TRIP_FIELD_CHARS} 字"
     return {
-        "origin": origin,
+        "origin": origin if origin.strip() else "",
         "destination": destination,
         "start_date": start_date,
         "end_date": end_date,
         # 未提供目的时保留 None：去重更新时存储层保留原值，不会把用户
         # 手动改过的目的覆盖成默认「出差」
-        "purpose": purpose or None,
+        "purpose": purpose if purpose.strip() else None,
     }, None
 
 
@@ -462,8 +608,18 @@ def _split_ics_property(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
-    """解析 iCalendar 文本，返回 ``(有效行程, [(事件序号, 原因)])``（序从 1 起）。"""
+def parse_trips_ics(
+    text: str,
+    *,
+    max_rows: int | None = _MAX_IMPORT_ROWS,
+    user_tz: str | None = None,
+) -> tuple[list[dict[str, Any]], list[tuple[int, str]]]:
+    """解析 iCalendar 文本，返回 ``(有效行程, [(事件序号, 原因)])``（序从 1 起）。
+
+    ``max_rows=None`` 关闭行数上限（只读导出侧的回导检查需要解析超过单次
+    导入上限的全量文件）；``user_tz`` 是 Web 面板上报的浏览器 IANA 时区，
+    定时事件换算日期时优先使用（CLI 不传，按本机时区，行为不变）。
+    """
     props: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
     errors = _BoundedErrors()
@@ -497,15 +653,15 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
             in_event = False
             in_alarm = False
             index += 1
-            row, reason = _ics_event_row(props)
+            row, reason = _ics_event_row(props, user_tz)
             props = {}
             if reason:
                 errors.add((index, reason))
             elif row is not None:
                 rows.append(row)
-                if len(rows) > _MAX_IMPORT_ROWS:
+                if max_rows is not None and len(rows) > max_rows:
                     raise ValueError(
-                        f"单次最多导入 {_MAX_IMPORT_ROWS} 条行程，请拆分文件后再导入"
+                        f"单次最多导入 {max_rows} 条行程，请拆分文件后再导入"
                     )
             continue
         if not in_event or in_alarm or ":" not in line:
@@ -515,9 +671,22 @@ def parse_trips_ics(text: str) -> tuple[list[dict[str, Any]], list[tuple[int, st
         left, raw_value = _split_ics_property(line)
         params = left.split(";")
         name = params[0].strip().upper()
-        if name in {"DTSTART", "DTEND", "SUMMARY", "DESCRIPTION"}:
-            # 事件级属性以首个出现为准（导出端保证事件级在前）
-            props.setdefault(name, raw_value.strip())
+        if name in {
+            "DTSTART",
+            "DTEND",
+            "SUMMARY",
+            "DESCRIPTION",
+            "X-ALIGO-TRIP-END",
+        }:
+            # 事件级属性以首个出现为准（导出端保证事件级在前）。文本属性
+            # 保留原文（导出保留首尾空白 / 制表符，strip 会让身份漂移）；
+            # 日期与 X 属性由各自解析函数在内部 strip
+            props.setdefault(
+                name,
+                raw_value
+                if name in {"SUMMARY", "DESCRIPTION", "X-ALIGO-TRIP-END"}
+                else raw_value.strip(),
+            )
             if name in {"DTSTART", "DTEND"}:
                 # 属性参数里的 TZID 决定 DATE-TIME 的时区（Outlook 导出
                 # 常见）；丢弃它会把同一时刻记成不同的日期。参数值可能
@@ -565,6 +734,7 @@ def import_trips_from_text(
     text: str,
     dry_run: bool = False,
     force_ics: bool = False,
+    user_tz: str | None = None,
 ) -> dict[str, Any]:
     """解析 CSV / iCalendar 文本并写入行程（与 CLI ``trips-import`` 同语义）。
 
@@ -572,11 +742,15 @@ def import_trips_from_text(
     - 重复行程沿用存储层去重（同路线 + 同起止日期更新目的）；导入未提供目的
       时不覆盖已有行程的目的，新建行程补默认「出差」；
     - 单次最多 5000 行；字段含 NUL / 孤立代理项时整份拒绝（与其它写接口同口径）；
-    - ``dry_run=True`` 只按同一去重键模拟新增 / 更新，不写库。
+    - ``dry_run=True`` 只按同一去重键模拟新增 / 更新，不写库；
+    - ``user_tz`` 为 Web 面板上报的浏览器 IANA 时区（定时事件取日期用，
+      缺省按服务端本机时区，CLI / 旧客户端行为不变）。
 
     Returns:
         ``{"dry_run", "format": "ics"|"csv", "rows", "created", "updated",
-        "skipped": [{"line", "reason"}]（最多 50 条）, "skipped_total"}``。
+        "skipped": [{"line", "reason"}]（最多 50 条）, "skipped_total",
+        "warnings": [{"line", "reason"}]（最多 50 条）, "warnings_total"}``。
+        CSV 的 ``line`` 是物理行号；ICS 的 ``line`` 是事件序号（从 1 起）。
     """
     if len(str(text or "")) > _MAX_IMPORT_CHARS:
         raise ValueError(
@@ -585,9 +759,10 @@ def import_trips_from_text(
     normalized = str(text or "").lstrip("﻿ \t\r\n")
     is_ics = force_ics or normalized.upper().startswith("BEGIN:VCALENDAR")
     if is_ics:
-        rows, errors = parse_trips_ics(text)
+        rows, errors = parse_trips_ics(text, user_tz=user_tz)
     else:
         rows, errors = parse_trips_csv(text)
+    warnings = getattr(errors, "warnings", None)
     result: dict[str, Any] = {
         "dry_run": dry_run,
         "format": "ics" if is_ics else "csv",
@@ -598,6 +773,12 @@ def import_trips_from_text(
             {"line": line, "reason": reason} for line, reason in errors[:_MAX_SKIPPED]
         ],
         "skipped_total": getattr(errors, "total", len(errors)),
+        # 合法但可疑（跨行记录疑似错位引号合并）：只提示，不影响计数
+        "warnings": [
+            {"line": line, "reason": reason}
+            for line, reason in (warnings or [])[:_MAX_SKIPPED]
+        ],
+        "warnings_total": getattr(warnings, "total", len(warnings or [])),
     }
     if not rows:
         return result
@@ -659,3 +840,44 @@ def import_trips_from_text(
     created, updated = store.save_trip_histories(rows)
     result["created"], result["updated"] = int(created), int(updated)
     return result
+
+
+def trip_skip_label(line: int, fmt: str) -> str:
+    """跳过项的位置标签（Web 400 / CLI / 前端共用，避免口径漂移）。
+
+    CSV 的 ``line`` 是物理行号，标成「第N行」；ICS 的 ``line`` 是事件序号
+    （从 1 起），标成「事件N」；ICS line<=0（如「未找到 VEVENT」这类整体
+    错误）不标序号，只显示原因。
+    """
+    try:
+        value = int(line)
+    except (TypeError, ValueError):
+        value = 0
+    if fmt == "csv":
+        return f"第{value}行"
+    return f"事件{value}" if value > 0 else ""
+
+
+def trip_export_roundtrip_problems(
+    text: str, *, is_ics: bool
+) -> tuple[int, list[tuple[int, str]]]:
+    """导出文件用真实导入解析器复核：返回 ``(会被跳过的总数, 前几条原因)``。
+
+    与 CLI trips-export 的 CSV 自检同源（README 承诺「重复导入幂等」）：
+    导出端渲染完立刻用同一解析器跑一遍，日期非法 / 倒置、字段超长等在
+    回导时会被整行 / 整事件拒绝的数据必须提前暴露，否则迁移 / 换机恢复
+    时静默丢行程。只读、不写库；``max_rows=None`` 兼容超过单次导入上限
+    的历史账号（上限只约束导入，不能把成功导出变成异常）。
+    """
+    if is_ics:
+        from utils.trip_export import count_ics_events
+
+        events = count_ics_events(text)
+        if events <= 0:
+            # 空日历没有可回导事件（「未找到 VEVENT」不是一条被跳过的数据）
+            return 0, []
+        _, errors = parse_trips_ics(text, max_rows=None)
+    else:
+        _, errors = parse_trips_csv(text, max_rows=None)
+    total = int(getattr(errors, "total", len(errors)))
+    return total, list(errors[:3])

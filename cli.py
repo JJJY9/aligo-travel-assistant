@@ -5510,6 +5510,7 @@ def run_trips_export_standalone(
     truncated_end = 0
     roundtrip_errors: list[tuple[int, str]] = []
     roundtrip_total = 0
+    roundtrip_unit = "行"
     safe_user = _safe_export_user(user_id)
     if ics:
         text = render_trips_ics(trips, user_id)
@@ -5519,6 +5520,14 @@ def run_trips_export_standalone(
         exported = count_ics_events(text)
         skipped = max(0, len(trips) - exported)
         truncated_end = sum(1 for trip in trips if trip_ics_end_unparsable(trip))
+        # 与 CSV 对称的回导自检：超长字段等会被导入端拒绝的事件同样要提前
+        # 告警（ICS 的跳过单位是事件，不是物理行）
+        from utils.trip_import import trip_export_roundtrip_problems
+
+        roundtrip_total, roundtrip_errors = trip_export_roundtrip_problems(
+            text, is_ics=True
+        )
+        roundtrip_unit = "个事件"
     elif html:
         text = render_trips_html(trips, user_id)
         default_name = f"aligo_{safe_user}_trips.html"
@@ -5531,11 +5540,10 @@ def run_trips_export_standalone(
         # 超长字段的行导入时会被整行跳过，导出侧必须提前告警，否则迁移 /
         # 换机恢复时静默丢行程。只读导出不受导入侧行数上限约束：超过
         # 5000 条也必须能导出（导入时再按文件拆分）
-        from utils.trip_import import parse_trips_csv
+        from utils.trip_import import trip_export_roundtrip_problems
 
-        _, roundtrip_errors = parse_trips_csv(text, max_rows=None)
-        roundtrip_total = getattr(
-            roundtrip_errors, "total", len(roundtrip_errors)
+        roundtrip_total, roundtrip_errors = trip_export_roundtrip_problems(
+            text, is_ics=False
         )
     if to_stdout:
         if ics:
@@ -5564,7 +5572,7 @@ def run_trips_export_standalone(
         # --stdout 下 stdout 只能有导出内容：跳过 / 回导告警走 stderr，
         # 否则空日历 + 退出码 0 会被脚本当成导出成功
         for note in _trip_export_notes(
-            skipped, truncated_end, roundtrip_errors, roundtrip_total
+            skipped, truncated_end, roundtrip_errors, roundtrip_total, roundtrip_unit
         ):
             print(f"注意：{note}", file=sys.stderr)
         return 0
@@ -5588,7 +5596,7 @@ def run_trips_export_standalone(
         filter_note += f"，状态「{status_label}」"
     print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}")
     for note in _trip_export_notes(
-        skipped, truncated_end, roundtrip_errors, roundtrip_total
+        skipped, truncated_end, roundtrip_errors, roundtrip_total, roundtrip_unit
     ):
         print(f"注意：{note}")
     return 0
@@ -5599,8 +5607,9 @@ def _trip_export_notes(
     truncated_end: int,
     roundtrip_errors: list[tuple[int, str]],
     roundtrip_total: int,
+    roundtrip_unit: str = "行",
 ) -> list[str]:
-    """导出后的数据质量提示（跳过 / 截断 / 回导会被拒绝的行）。"""
+    """导出后的数据质量提示（跳过 / 截断 / 回导会被拒绝的条目）。"""
     notes: list[str] = []
     if skipped:
         notes.append(f"跳过 {skipped} 条缺少出发日期（日历中不会出现）")
@@ -5609,10 +5618,17 @@ def _trip_export_notes(
             f"{truncated_end} 条行程的返程日期无法解析，日历按单日导出"
         )
     if roundtrip_total:
-        reasons = "；".join(
-            f"第{row}行：{reason}" for row, reason in roundtrip_errors[:3]
+        if roundtrip_unit == "行":
+            reasons = "；".join(
+                f"第{row}行：{reason}" for row, reason in roundtrip_errors[:3]
+            )
+        else:
+            reasons = "；".join(
+                f"事件{row}：{reason}" for row, reason in roundtrip_errors[:3]
+            )
+        notes.append(
+            f"导出文件回导时有 {roundtrip_total} {roundtrip_unit}会被跳过（{reasons}）"
         )
-        notes.append(f"导出文件回导时有 {roundtrip_total} 行会被跳过（{reasons}）")
     return notes
 
 
@@ -6378,7 +6394,7 @@ def run_trips_import_standalone(
     import io
 
     from utils.errors import PartialImportError
-    from utils.trip_import import import_trips_from_text
+    from utils.trip_import import import_trips_from_text, trip_skip_label
 
     def _fail(message: str) -> int:
         if as_json:
@@ -6445,18 +6461,18 @@ def run_trips_import_standalone(
     is_ics = result["format"] == "ics"
     skipped = result["skipped"]
     skipped_total = int(result.get("skipped_total", len(skipped)))
+    warnings = result.get("warnings") or []
+    warnings_total = int(result.get("warnings_total", len(warnings)))
     if not result["rows"]:
-        if is_ics:
-            detail = "；".join(
-                str(item["reason"])
-                if index == 0
-                else f"事件{item['line']}：{item['reason']}"
-                for index, item in enumerate(skipped[:5])
+        # 与 Web 400 共用同一标签口径：CSV 物理行 / ICS 事件序号
+        detail = "；".join(
+            (
+                f"{label}：{item['reason']}"
+                if (label := trip_skip_label(item.get("line", 0), result["format"]))
+                else str(item["reason"])
             )
-        else:
-            detail = "；".join(
-                f"第{item['line']}行：{item['reason']}" for item in skipped[:5]
-            )
+            for item in skipped[:5]
+        )
         return _fail(f"没有可导入的行程{f'（{detail}）' if detail else ''}")
 
     created = result["created"]
@@ -6475,6 +6491,8 @@ def run_trips_import_standalone(
                     "updated": updated,
                     "skipped": skipped,
                     "skipped_total": skipped_total,
+                    "warnings": warnings,
+                    "warnings_total": warnings_total,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -6490,10 +6508,18 @@ def run_trips_import_standalone(
         )
         print(f"{head}：新增 {created} 条，更新 {updated} 条{skipped_note}")
         for item in skipped:
-            label = f"事件{item['line']}" if is_ics else f"第{item['line']}行"
+            label = trip_skip_label(item.get("line", 0), result["format"])
             # 解析错误原因来自不可信文件（可能带 ESC / 换行伪造输出行）
             print(
                 f"  跳过{_single_line_safe(label)}："
+                f"{_single_line_safe(item['reason'])}"
+            )
+        # 合法但可疑的跨行记录（疑似错位引号把下一条行程吞进本行）：
+        # 不拦截导入，但必须让用户看到
+        for item in warnings:
+            label = trip_skip_label(item.get("line", 0), result["format"])
+            print(
+                f"  注意{_single_line_safe(label)}："
                 f"{_single_line_safe(item['reason'])}"
             )
     return 0

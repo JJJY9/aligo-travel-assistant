@@ -4395,7 +4395,7 @@ def test_trips_import_runs_in_import_executor_and_maps_errors(monkeypatch):
 
     names = []
 
-    def fake_import(store, text, dry_run=False, force_ics=False):
+    def fake_import(store, text, dry_run=False, force_ics=False, user_tz=None):
         names.append(threading.current_thread().name)
         if text == "row-cap":
             raise ValueError("单次最多导入 5000 条行程，请拆分文件后再导入")
@@ -4462,7 +4462,7 @@ def test_trips_import_rate_limited(monkeypatch):
 
     calls = []
 
-    def fake_import(store, text, dry_run=False, force_ics=False):
+    def fake_import(store, text, dry_run=False, force_ics=False, user_tz=None):
         calls.append(dry_run)
         return {
             "dry_run": dry_run,
@@ -6782,6 +6782,298 @@ def test_ics_export_reports_skipped_dateless_trips():
             "format=ics 与 /api/trips/calendar 同一口径"
         )
         print("✓ ICS 导出通报告被跳过的缺日期行程")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trips_export_reports_truncated_end_and_unimportable():
+    """返程日期无法解析 / 回导会被拒绝的数据：Web 导出用响应头提前提示。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    user_id = _unique_user("web_test_ics_truncated_end")
+    clean_user = _unique_user("web_test_ics_clean")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-11-09",
+                    "end_date": "待定",
+                    "purpose": "出差",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        clean_store = create_long_term_memory(clean_user, str(MEMORY_DIR))
+        try:
+            clean_store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-11-12",
+                    "end_date": "2026-11-13",
+                    "purpose": "出差",
+                }
+            )
+        finally:
+            close = getattr(clean_store, "close", None)
+            if callable(close):
+                close()
+
+        calendar = _client().get(
+            "/api/trips/calendar", params={"user_id": user_id}
+        )
+        assert calendar.status_code == 200
+        assert calendar.text.count("BEGIN:VEVENT") == 1
+        assert calendar.headers.get("x-aligo-export-skipped") == "0"
+        assert calendar.headers.get("x-aligo-export-truncated-end") == "1", (
+            "返回头必须告知返程日期被截成单日"
+        )
+        # X-ALIGO-TRIP-END 让导出的 ICS 仍可被本应用回导，不降低身份
+        assert calendar.headers.get("x-aligo-export-unimportable") == "0"
+        assert "DTEND;VALUE=DATE:20261110" in calendar.text, "日历仍按单日导出"
+        # 文件名带用户维度：多账号脚本下载不再互相覆盖（与 CLI 同口径）
+        safe_user = server_module._safe_filename(user_id, "user")
+        assert (
+            f'aligo_{safe_user}_trips.ics'
+            in calendar.headers.get("content-disposition", "")
+        )
+
+        filtered = _client().get(
+            "/api/trips/export", params={"user_id": user_id, "format": "ics"}
+        )
+        assert filtered.status_code == 200
+        assert filtered.headers.get("x-aligo-export-truncated-end") == "1"
+        assert filtered.headers.get("x-aligo-export-unimportable") == "0"
+
+        single = _client().get(
+            "/api/trips/trip_1/calendar", params={"user_id": user_id}
+        )
+        assert single.status_code == 200
+        assert single.headers.get("x-aligo-export-truncated-end") == "1"
+        assert single.headers.get("x-aligo-export-unimportable") == "0"
+        assert (
+            f'aligo_{safe_user}_trip_1.ics'
+            in single.headers.get("content-disposition", "")
+        )
+
+        clean = _client().get(
+            "/api/trips/calendar", params={"user_id": clean_user}
+        )
+        assert clean.headers.get("x-aligo-export-truncated-end") == "0"
+        assert clean.headers.get("x-aligo-export-unimportable") == "0"
+        clean_safe = server_module._safe_filename(clean_user, "user")
+        assert clean_safe != safe_user
+        assert (
+            f'aligo_{clean_safe}_trips.ics'
+            in clean.headers.get("content-disposition", "")
+        )
+        print("✓ Web 导出通报返程截断 / 回导不可用 + 文件名含用户维度")
+    finally:
+        _cleanup(user_id)
+        _cleanup(clean_user)
+
+
+def test_trips_csv_export_reports_unimportable_rows():
+    """CSV 台账导出的回导自检响应头与 CLI trips-export 同口径。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    user_id = _unique_user("web_test_csv_unimportable")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-11-09",
+                    "end_date": "2026-11-10",
+                    "purpose": "出差",
+                }
+            )
+            # 倒置日期：CSV 导入会整行拒绝（JSON 存储不校验日期，可写入）
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "广州",
+                    "start_date": "2026-11-20",
+                    "end_date": "2026-11-18",
+                    "purpose": "出差",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        response = _client().get(
+            "/api/trips/export", params={"user_id": user_id}
+        )
+        assert response.status_code == 200
+        assert response.headers.get("x-aligo-export-unimportable") == "1"
+        assert "广州" in response.text, "只告警，不得改变导出字节"
+        safe_user = server_module._safe_filename(user_id, "user")
+        assert (
+            f'aligo_{safe_user}_trips.csv'
+            in response.headers.get("content-disposition", "")
+        )
+        print("✓ CSV 导出带回导自检头（脏行仍在正文中）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trips_status_filter_uses_client_today():
+    """status 过滤接受面板上报的浏览器本地日期，与状态徽标同口径。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_today")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2099-01-01",
+                    "end_date": "2099-01-02",
+                    "purpose": "出差",
+                }
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        inside = _client().get(
+            "/api/trips",
+            params={
+                "user_id": user_id,
+                "status": "active",
+                "today": "2099-01-01",
+            },
+        )
+        assert inside.status_code == 200 and inside.json()["total"] == 1
+        outside = _client().get(
+            "/api/trips",
+            params={
+                "user_id": user_id,
+                "status": "active",
+                "today": "2098-12-31",
+            },
+        )
+        assert outside.status_code == 200 and outside.json()["total"] == 0
+        exported = _client().get(
+            "/api/trips/export",
+            params={
+                "user_id": user_id,
+                "status": "active",
+                "today": "2099-01-01",
+                "format": "ics",
+            },
+        )
+        assert exported.text.count("BEGIN:VEVENT") == 1
+        default_export = _client().get(
+            "/api/trips/export",
+            params={"user_id": user_id, "status": "active", "format": "ics"},
+        )
+        assert default_export.text.count("BEGIN:VEVENT") == 0, "缺省仍是服务器日期"
+        bad = _client().get(
+            "/api/trips",
+            params={"user_id": user_id, "status": "active", "today": "2099-02-30"},
+        )
+        assert bad.status_code == 422
+        print("✓ status 过滤按面板 today 计算（缺省服务器日期不变）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trips_import_ics_error_includes_event_index():
+    """全坏 ICS：400 detail 用「事件N」而不是丢失序号或误标行号。"""
+    user_id = _unique_user("web_test_import_ics_detail")
+    try:
+        bad_ics = (
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+            "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:北京 → 上海（会议）\r\n"
+            "END:VEVENT\r\n"
+            "BEGIN:VEVENT\r\nUID:b\r\nSUMMARY:北京 → 广州（会议）\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        response = _client().post(
+            "/api/trips/import",
+            params={"user_id": user_id},
+            json={"content": bad_ics},
+        )
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "事件1" in detail and "事件2" in detail, detail
+        assert "事件0" not in detail
+        print("✓ ICS 导入 400 带事件序号")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trips_import_uses_reported_timezone():
+    """面板上报的浏览器时区参与定时事件取日期（容器 UTC 也不漂一天）。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_import_tz")
+    try:
+        ics = (
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+            "BEGIN:VEVENT\r\nUID:tz\r\nDTSTART:20261110T233000Z\r\n"
+            "SUMMARY:北京 → 上海（会议）\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        response = _client().post(
+            "/api/trips/import",
+            params={"user_id": user_id},
+            json={"content": ics, "timezone": "Asia/Shanghai"},
+        )
+        assert response.status_code == 200, response.text
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            trips = store.get_trip_history(limit=None)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        assert trips and trips[0]["start_date"] == "2026-11-11", trips
+        too_long = _client().post(
+            "/api/trips/import",
+            params={"user_id": user_id},
+            json={"content": ics, "timezone": "A" * 65},
+        )
+        assert too_long.status_code == 422
+        print("✓ Web 导入按上报时区换算定时事件日期")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trips_import_returns_merge_warnings():
+    """跨行错位引号：dry-run 预览返回 warnings，不影响 skipped 计数。"""
+    user_id = _unique_user("web_test_import_warnings")
+    try:
+        text = (
+            "出发地,目的地,出发日期,返程日期,目的\n"
+            '广州,"深圳,2026-12-02\n北京,上海",2026-12-03,2026-12-03,会议\n'
+        )
+        response = _client().post(
+            "/api/trips/import",
+            params={"user_id": user_id, "dry_run": 1},
+            json={"content": text},
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["skipped_total"] == 0
+        assert payload["warnings_total"] == 1
+        assert payload["warnings"][0]["line"] == 2
+        print("✓ Web 导入预览透传跨行告警")
     finally:
         _cleanup(user_id)
 

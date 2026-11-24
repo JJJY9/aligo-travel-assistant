@@ -3028,6 +3028,92 @@ async function scenarioEditorsRound2(source) {
   return results;
 }
 
+async function scenarioTripExportQuality(source) {
+  // 行程导出质量提示：返程日期被截断 / 回导会被跳过的数据必须 toast
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const mockDownload = (headers) => {
+    run(`
+      globalThis.__toasts = [];
+      toast = (message) => { __toasts.push(message); };
+      fetch = async () => ({
+        ok: true,
+        status: 200,
+        headers: {
+          get(name) {
+            const key = String(name).toLowerCase();
+            const values = ${JSON.stringify(headers)};
+            if (Object.prototype.hasOwnProperty.call(values, key)) {
+              return values[key];
+            }
+            return "";
+          },
+        },
+        blob: async () => ({ __blob: true }),
+      });
+      URL.createObjectURL = () => "blob:x";
+      URL.revokeObjectURL = () => {};
+      document.body.appendChild = () => {};
+    `);
+  };
+  mockDownload({
+    "x-aligo-export-skipped": "0",
+    "x-aligo-export-truncated-end": "2",
+    "x-aligo-export-unimportable": "1",
+    "content-disposition": 'attachment; filename="aligo_u_trips.ics"',
+  });
+  await run(
+    'downloadFromApi("/api/trips/export?user_id=u&format=ics", "aligo_trips.ics")'
+  );
+  const toasts = run("__toasts.slice()");
+  // 其它下载没有这些头：Number("" || 0) 不能误报
+  mockDownload({ "content-disposition": 'attachment; filename="x"' });
+  await run('downloadFromApi("/api/trips/export?user_id=u", "aligo_trips.csv")');
+  const quiet = run("__toasts.slice()");
+  return { toasts, quiet };
+}
+
+async function scenarioTripImportIcsPreview(source) {
+  // ICS 预览：跳过项按「事件 N」标注、warnings 透传、请求体带浏览器时区
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const importFile = runIn(env, "importTripsFromFile");
+  run(`
+    globalThis.__toasts = [];
+    globalThis.__confirmMessage = null;
+    globalThis.__bodies = [];
+    toast = (message) => { __toasts.push(message); };
+    confirm = (message) => { __confirmMessage = message; return false; };
+    refreshStatus = async () => {};
+    getJSON = (url, options) => {
+      __bodies.push(options && options.body ? JSON.parse(options.body) : null);
+      return Promise.resolve({
+        format: "ics",
+        rows: 2,
+        created: 0,
+        updated: 2,
+        skipped: [
+          { line: 2, reason: "缺少或非法的 DTSTART" },
+          { line: 3, reason: "缺少目的地（SUMMARY 为空）" },
+        ],
+        skipped_total: 2,
+        warnings: [{ line: 4, reason: "第4-5行被解析为同一条行程" }],
+        warnings_total: 1,
+      });
+    };
+  `);
+  const utf8Bytes = Array.from(Buffer.from("目的地,杭州", "utf8"));
+  await importFile({
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  });
+  return {
+    confirm: run("__confirmMessage"),
+    bodies: run("__bodies.slice()"),
+    toasts: run("__toasts.slice()"),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -3126,6 +3212,10 @@ async function main() {
     payload = await scenarioRetiredThreadRegenerate(source);
   } else if (scenario === "knowledgeSkippedToast") {
     payload = await scenarioKnowledgeSkippedToast(source);
+  } else if (scenario === "tripExportQuality") {
+    payload = await scenarioTripExportQuality(source);
+  } else if (scenario === "tripImportIcsPreview") {
+    payload = await scenarioTripImportIcsPreview(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

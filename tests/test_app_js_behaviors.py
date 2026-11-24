@@ -558,6 +558,7 @@ def test_trips_export_button_uses_filtered_ics_endpoint():
     assert "format=ics" in url, url
     assert "q=%E4%B8%8A%E6%B5%B7" in url, "关键词筛选必须随导出提交"
     assert "status=past" in url, "状态筛选必须随导出提交"
+    assert "today=" in url, "状态筛选需带浏览器本地日期（与徽标同口径）"
     assert "user_id=u-trips" in url
     assert filtered[0]["filename"] == "aligo_trips.ics"
 
@@ -567,6 +568,31 @@ def test_trips_export_button_uses_filtered_ics_endpoint():
         "收起视图不带筛选（与 CSV / HTML 导出同口径）"
     )
     print("✓ 导出行程按钮按筛选走 format=ics")
+
+
+def test_trip_export_quality_toasts():
+    """行程导出：返程截断 / 回导会被跳过的数据必须 toast，缺头不得误报。"""
+    results = _run_harness("tripExportQuality")
+    toasts = results["toasts"]
+    assert len(toasts) == 2, toasts
+    assert "返程日期无法解析" in toasts[0] and "单日" in toasts[0], toasts
+    assert "会被跳过" in toasts[1], toasts
+    assert results["quiet"] == [], results["quiet"]
+    print("✓ 行程导出质量提示 toast")
+
+
+def test_trip_import_ics_preview_labels_and_timezone():
+    """ICS 预览按事件序号标注、warnings 透传、请求体带浏览器时区。"""
+    results = _run_harness("tripImportIcsPreview")
+    message = results["confirm"]
+    assert "事件 2：缺少或非法的 DTSTART" in message, message
+    assert "事件 3：缺少目的地（SUMMARY 为空）" in message, message
+    assert "第 2 行" not in message, "ICS 不能把事件序号标成物理行号"
+    assert "条记录请核对" in message, message
+    body = results["bodies"][0]
+    assert body["content"], body
+    assert isinstance(body.get("timezone"), str) and body["timezone"], body
+    print("✓ ICS 导入预览按事件标注并上报时区")
 
 
 def test_trips_dedupe_panel_flow():
@@ -969,6 +995,8 @@ if __name__ == "__main__":
     test_knowledge_actions_arbitrate_shared_result_bar()
     test_trip_import_file_decoding_and_size_guard()
     test_trips_export_button_uses_filtered_ics_endpoint()
+    test_trip_export_quality_toasts()
+    test_trip_import_ics_preview_labels_and_timezone()
     test_trips_dedupe_panel_flow()
     test_startup_stale_session_not_used_after_failed_click()
     test_send_message_http_error_not_connection_interruption()

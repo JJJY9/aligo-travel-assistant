@@ -2819,10 +2819,13 @@ def test_pg_delete_duplicate_trip_keeps_last_copy():
 
 
 def test_pg_trip_lookup_normalizes_identity_fields():
-    """PG 单条保存的去重查询按身份口径归一路线（CRLF / CR → LF）。"""
+    """PG 单条保存的去重查询按身份口径归一路线（CRLF / 控制符 / U+2028）。"""
     import contextlib
 
-    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from context.postgres_long_term_memory import (
+        _TRIP_ROUTE_CONTROL_CHARS,
+        PostgresLongTermMemory,
+    )
 
     store = object.__new__(PostgresLongTermMemory)
     store.user_id = "u1"
@@ -2845,9 +2848,29 @@ def test_pg_trip_lookup_normalizes_identity_fields():
         "a\rb\r\nc",
     )
     sql, params = calls[0]
+    # 与 Python 侧 normalize_identity_text 同一投影：CRLF/CR → LF、
+    # U+2028/29 → 空格、剥离控制字符（JSON 后端在 Python 侧比对）
+    assert "translate(" in sql and "chr(8232)" in sql and "chr(8233)" in sql
     assert "REPLACE(REPLACE(destination" in sql
     assert "REPLACE(REPLACE(COALESCE(origin" in sql
-    assert params == ("u1", "a\nb\nc", "北京\n西城")
+    assert params == (
+        "u1",
+        _TRIP_ROUTE_CONTROL_CHARS,
+        "a\nb\nc",
+        _TRIP_ROUTE_CONTROL_CHARS,
+        "北京\n西城",
+    )
+    # 控制符字符集必须与 strip_terminal_controls 严格一致（双后端不分叉）
+    from utils.console import _TERMINAL_CONTROLS
+
+    expected = "".join(
+        chr(code)
+        for code in (*range(0x01, 0x09), *range(0x0B, 0x20), *range(0x7F, 0xA0))
+    )
+    assert _TRIP_ROUTE_CONTROL_CHARS == expected
+    assert all(_TERMINAL_CONTROLS.fullmatch(ch) for ch in expected)
+    assert not _TERMINAL_CONTROLS.fullmatch("\n")
+    assert not _TERMINAL_CONTROLS.fullmatch("\t")
     assert trip_id == "trip_1"
     print("✓ PostgreSQL 行程去重按身份口径归一路线")
 

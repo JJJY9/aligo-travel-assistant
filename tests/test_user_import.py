@@ -371,6 +371,37 @@ def test_import_keeps_inverted_date_trip():
     print("✓ 倒置日期行程随备份恢复")
 
 
+def test_import_preserves_trip_text_whitespace():
+    """备份恢复保留行程文本首尾空白：与导出 / 去重身份口径一致（不 strip）。"""
+    payload = {
+        "trip_history": [
+            {
+                "origin": " 北京 ",
+                "destination": " 上海 ",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-06",
+                "purpose": " 会议 ",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert not any("跳过第 1 条行程" in error for error in errors), errors
+    store = _real_store("u-ws-trip")
+    try:
+        import_user_data(store, sections)
+        trips = store.get_trip_history(limit=None)
+        assert trips[0]["origin"] == " 北京 ", trips
+        assert trips[0]["destination"] == " 上海 ", trips
+        assert trips[0]["purpose"] == " 会议 ", trips
+        # 同一备份再次恢复按身份去重：不能因 strip 而重复新增
+        counts = import_user_data(store, sections)
+        assert counts["trips_created"] == 0 and counts["trips_updated"] == 1, counts
+        assert len(store.get_trip_history(limit=None)) == 1
+    finally:
+        store._close() if hasattr(store, "_close") else None
+    print("✓ 行程文本空白保真且重复恢复不新增")
+
+
 def test_import_roundtrip_and_idempotent():
     sections, errors = parse_user_export(json.dumps(_export_payload(), ensure_ascii=False))
     store = _real_store()

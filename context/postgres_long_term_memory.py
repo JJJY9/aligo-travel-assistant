@@ -57,6 +57,31 @@ def _trip_start_is_valid(value: Any) -> bool:
         return False
     return True
 
+
+# 行程路线身份投影的控制字符集：与 utils.console.strip_terminal_controls
+# 相同（C0 除 \t \n、DEL 与 C1 区），不含 NUL——PostgreSQL 的 TEXT 存不了
+# NUL，JSON 后端的那部分差异在 SQL 侧不存在
+_TRIP_ROUTE_CONTROL_CHARS = "".join(
+    chr(code) for code in (*range(0x01, 0x09), *range(0x0B, 0x20), *range(0x7F, 0xA0))
+)
+# 与 utils.trip_export.normalize_identity_text 同一投影的 SQL 形式：CRLF /
+# CR → LF、U+2028 / U+2029 → 空格、剥离控制字符。Python 侧入参已按投影
+# 清洗，DB 里的存量行可能没洗过——两侧不投影会让「同一行程」在候选查询
+# 里被漏掉，重复插入（JSON 后端在 Python 侧比对，不受影响）
+_TRIP_ROUTE_KEY_SQL_TEMPLATE = (
+    "translate("
+    "replace(replace(REPLACE(REPLACE({column}, E'\\r\\n', E'\\n'), "
+    "E'\\r', E'\\n'), chr(8232), ' '), chr(8233), ' '), %s, '')"
+)
+
+
+def _trip_route_key_sql(column: str) -> str:
+    return _TRIP_ROUTE_KEY_SQL_TEMPLATE.format(column=column)
+
+
+_TRIP_DESTINATION_KEY = "destination"
+_TRIP_ORIGIN_KEY = "COALESCE(origin, '')"
+
 # 进程内「该 DSN 的表结构已就绪」标记：Web 每个读写接口 / 每个新会话都会
 # 构造 PostgresLongTermMemory。若每次都跑整套 DDL，即使对象已存在，
 # ALTER TABLE ... ADD COLUMN 仍取 aligo_trips 的 ACCESS EXCLUSIVE 锁、
@@ -1726,11 +1751,13 @@ class PostgresLongTermMemory:
             candidates = self._fetchall(
                 "SELECT start_date, end_date FROM aligo_trips "
                 "WHERE user_id = %s "
-                "AND REPLACE(REPLACE(destination, E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s "
-                "AND REPLACE(REPLACE(COALESCE(origin, ''), E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s",
+                f"AND {_trip_route_key_sql(_TRIP_DESTINATION_KEY)} = %s "
+                f"AND {_trip_route_key_sql(_TRIP_ORIGIN_KEY)} = %s",
                 (
                     self.user_id,
+                    _TRIP_ROUTE_CONTROL_CHARS,
                     normalize_identity_text(destination),
+                    _TRIP_ROUTE_CONTROL_CHARS,
                     origin,
                 ),
             )
@@ -1775,11 +1802,13 @@ class PostgresLongTermMemory:
             candidates = self._fetchall(
                 "SELECT id, trip_id, start_date, end_date FROM aligo_trips "
                 "WHERE user_id = %s "
-                "AND REPLACE(REPLACE(destination, E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s "
-                "AND REPLACE(REPLACE(COALESCE(origin, ''), E'\\r\\n', E'\\n'), E'\\r', E'\\n') = %s",
+                f"AND {_trip_route_key_sql(_TRIP_DESTINATION_KEY)} = %s "
+                f"AND {_trip_route_key_sql(_TRIP_ORIGIN_KEY)} = %s",
                 (
                     self.user_id,
+                    _TRIP_ROUTE_CONTROL_CHARS,
                     normalize_identity_text(destination),
+                    _TRIP_ROUTE_CONTROL_CHARS,
                     normalize_identity_text(origin),
                 ),
             )
@@ -2065,13 +2094,13 @@ class PostgresLongTermMemory:
                 candidates = self._fetchall(
                     "SELECT id, start_date, end_date FROM aligo_trips "
                     "WHERE user_id = %s "
-                    "AND REPLACE(REPLACE(destination, E'\r\n', E'\n'), "
-                    "E'\r', E'\n') = %s "
-                    "AND REPLACE(REPLACE(COALESCE(origin, ''), E'\r\n', "
-                    "E'\n'), E'\r', E'\n') = %s",
+                    f"AND {_trip_route_key_sql(_TRIP_DESTINATION_KEY)} = %s "
+                    f"AND {_trip_route_key_sql(_TRIP_ORIGIN_KEY)} = %s",
                     (
                         self.user_id,
+                        _TRIP_ROUTE_CONTROL_CHARS,
                         normalize_identity_text(destination),
+                        _TRIP_ROUTE_CONTROL_CHARS,
                         normalize_identity_text(
                             str(merged.get("origin") or "")
                         ),
