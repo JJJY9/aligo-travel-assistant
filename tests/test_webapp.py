@@ -331,6 +331,20 @@ def test_side_effect_guard_requires_same_origin_marker():
         )
         assert bad_ref.status_code == 403, bad_ref.text
 
+        # 同主机不同 scheme / 协议相对串都是跨源：只比 netloc 会误放行
+        other_scheme = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "Referer": "https://127.0.0.1:8000/index.html"},
+        )
+        assert other_scheme.status_code == 403, other_scheme.text
+        relative = client.get(
+            "/api/status",
+            params={"user_id": user_id},
+            headers={**host, "Referer": "//127.0.0.1:8000/index.html"},
+        )
+        assert relative.status_code == 403, relative.text
+
         # 显式跨站头即使带了客户端标记也拒绝
         cross = client.get(
             "/api/status",
@@ -8515,6 +8529,33 @@ def test_rate_limit_trusted_proxy_headers(monkeypatch):
         assert sixth.status_code == 429, (
             "轮换 XFF 前缀不能绕过 IP 桶（实际 key 取最后一跳）"
         )
+
+        # 代理以多条独立头行追加（RFC 7230：等价于按顺序逗号拼接）：
+        # 只读第一行会把客户端自带的伪造值当成限流键
+        user_g = _unique_user("web_test_proxy_g")
+        user_h = _unique_user("web_test_proxy_h")
+        users += [user_g, user_h]
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        seventh = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_g, "session_id": "proxy-g1"},
+            headers=[
+                ("X-Forwarded-For", "1.1.1.1"),
+                ("X-Forwarded-For", "203.0.113.12"),
+            ],
+        )
+        assert seventh.status_code == 200
+        eighth = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_h, "session_id": "proxy-h1"},
+            headers=[
+                ("X-Forwarded-For", "2.2.2.2"),
+                ("X-Forwarded-For", "203.0.113.12"),
+            ],
+        )
+        assert eighth.status_code == 429, (
+            "多条 XFF 头行须按逗号拼接取最后一跳，轮换第一行不能获得新桶"
+        )
         print("✓ 可信代理开启后按 X-Forwarded-For 最后一跳地址限流")
     finally:
         for user_id in users:
@@ -10611,6 +10652,20 @@ def test_knowledge_rate_limit_is_separate_bucket(monkeypatch):
         export = client.get("/api/knowledge/export")
         assert export.status_code == 429, "导出也应使用知识库限流桶"
 
+        # 复用同一额度桶的端点：429 文案必须如实说明被限操作
+        doctor = client.get("/api/doctor")
+        assert doctor.status_code == 429, doctor.text
+        assert "自检操作过于频繁" in doctor.json()["detail"], doctor.text
+        restore = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={"backup": {"preferences": {}}},
+        )
+        assert restore.status_code == 429, restore.text
+        restore_detail = restore.json()["detail"]
+        assert "备份恢复操作过于频繁" in restore_detail, restore_detail
+        assert "知识库操作" not in restore_detail, restore_detail
+
         chat = client.post(
             "/api/chat",
             json={"message": "你好", "user_id": user_id, "session_id": "kb-limit"},
@@ -10743,6 +10798,85 @@ def test_knowledge_eval_api(monkeypatch):
     single = client.get("/api/knowledge/eval")
     assert single.status_code == 200 and "warning" not in single.json()
     print("✓ /api/knowledge/eval 检索评测（结果 / 503 / 额度头 / 并发 429 不耗额度）")
+
+
+def test_knowledge_list_sanitizes_legacy_surrogates(monkeypatch):
+    """历史脏数据里的孤立代理项在列表 / 分类响应里清洗，不再整条 500。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    bad = "坏" + chr(0xD800) + "片段"
+    monkeypatch.setattr(
+        server_module,
+        "list_documents",
+        lambda **kwargs: {
+            "total": 1,
+            "items": [{"id": 1, "content": bad, "metadata": {"title": bad}}],
+        },
+    )
+    monkeypatch.setattr(
+        server_module, "list_categories", lambda: [{"category": bad, "count": 1}]
+    )
+    client = _client()
+    client.app.state.aligo.kb_limiter = RateLimiter(limit=10, window_sec=60)
+    listed = client.get("/api/knowledge/documents")
+    assert listed.status_code == 200, listed.text[:300]
+    payload = listed.json()
+    assert "\\ud800" in payload["items"][0]["content"], payload
+    listed.text.encode("utf-8")
+    cats = client.get("/api/knowledge/categories")
+    assert cats.status_code == 200, cats.text[:300]
+    print("✓ 知识库列表 / 分类清洗孤立代理项")
+
+
+def test_knowledge_duplicates_limit_zero_caps_on_web(monkeypatch):
+    """Web limit=0 最多返回 2000 组并标记 truncated（全量审计走 CLI）。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    groups = [(f"内容{i}", [i * 2 + 1, i * 2 + 2]) for i in range(2001)]
+    monkeypatch.setattr(server_module, "find_duplicate_contents", lambda: groups)
+    client = _client()
+    client.app.state.aligo.kb_limiter = RateLimiter(limit=10, window_sec=60)
+    response = client.get("/api/knowledge/duplicates", params={"limit": 0})
+    assert response.status_code == 200, response.text[:200]
+    payload = response.json()
+    assert payload["total_groups"] == 2001, payload["total_groups"]
+    assert payload["shown"] == 2000
+    assert payload["truncated"] is True
+    print("✓ Web 重复组 limit=0 截断到 2000 并标记 truncated")
+
+
+def test_knowledge_cleanup_redacts_failed_errors(monkeypatch):
+    """清理接口的 failed[].error 不得回显本机绝对路径。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "cleanup_duplicate_contents",
+        lambda dry_run: {
+            "dry_run": dry_run,
+            "removed": 0,
+            "skipped": [],
+            "failed": [
+                {
+                    "id": 1,
+                    "error": r"IOError: D:\secret\dir\memory.json is locked",
+                }
+            ],
+        },
+    )
+    client = _client()
+    client.app.state.aligo.kb_limiter = RateLimiter(limit=10, window_sec=60)
+    response = client.post(
+        "/api/knowledge/duplicates/cleanup", json={"dry_run": False}
+    )
+    assert response.status_code == 200, response.text[:300]
+    error = response.json()["failed"][0]["error"]
+    assert r"D:\secret" not in error, error
+    assert "IOError" in error, error
+    print("✓ 清理接口脱敏 failed 错误")
 
 
 def test_knowledge_duplicates_api(monkeypatch):

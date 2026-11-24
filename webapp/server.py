@@ -2013,7 +2013,15 @@ def _client_host(request: Request) -> str:
     否则退回 TCP 对端地址（任意字符串不能各自成为限流桶）。
     """
     if RATE_LIMIT_CONFIG.get("trust_proxy_headers"):
-        forwarded = request.headers.get("x-forwarded-for", "")
+        # 代理可能以多条独立头行追加（RFC 7230：多个同名头行等价于按
+        # 顺序逗号拼接），只读第一行会把客户端自带的 XFF 当成实际值——
+        # 逐请求更换即可获得新桶 / 污染他人桶。合并全部头行后取最后一跳
+        getlist = getattr(request.headers, "getlist", None)
+        if callable(getlist):
+            values = getlist("x-forwarded-for")
+        else:
+            values = [request.headers.get("x-forwarded-for") or ""]
+        forwarded = ",".join(str(value) for value in values if value)
         if forwarded:
             candidate = forwarded.split(",")[-1].strip()
             try:
@@ -2238,7 +2246,16 @@ def _reject_cross_site_side_effect(request: Request) -> None:
         try:
             from urllib.parse import urlsplit
 
-            if urlsplit(referer).netloc.strip().lower() == host:
+            parsed = urlsplit(referer)
+            # 必须绝对 URL 且 scheme 与当前请求一致：同主机不同 scheme
+            # （http 页面打 https 面板或反之）与协议相对串（//host/path）
+            # 都是跨源，只比 netloc 会把它们当成同源放行
+            if (
+                parsed.scheme
+                and parsed.netloc
+                and parsed.scheme.lower() == request.url.scheme.lower()
+                and parsed.netloc.strip().lower() == host
+            ):
                 return
         except ValueError:
             pass
@@ -2251,8 +2268,13 @@ def _reject_cross_site_side_effect(request: Request) -> None:
     )
 
 
-def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, str]:
+def _enforce_kb_rate_limit(
+    state: AligoWebApp, request: Request, operation: str = "知识库操作"
+) -> dict[str, str]:
     """知识库高开销接口的独立限流（按客户端 IP，与对话额度互不影响）。
+
+    ``operation`` 用于 429 文案：复用同一额度桶的自检 / 备份恢复端点
+    需要如实说明被限的操作（固定「知识库操作过于频繁」会误导排查方向）。
 
     Returns:
         供响应附带的额度头（X-RateLimit-Limit / Remaining / Reset）。
@@ -2265,7 +2287,7 @@ def _enforce_kb_rate_limit(state: AligoWebApp, request: Request) -> dict[str, st
         wait_seconds = max(1, math.ceil(retry_after))
         raise HTTPException(
             status_code=429,
-            detail=f"知识库操作过于频繁，请约 {wait_seconds} 秒后重试"
+            detail=f"{operation}过于频繁，请约 {wait_seconds} 秒后重试"
             f"（请求 ID：{_request_id(request)}）",
             headers={
                 "Retry-After": str(wait_seconds),
@@ -2344,14 +2366,16 @@ def _enforce_read_rate_limit(
     }
 
 
-def _enforce_write_rate_limit(
-    state: AligoWebApp, request: Request
-) -> dict[str, str]:
+def _enforce_write_rate_limit(state: AligoWebApp, request: Request) -> None:
     """用户数据写接口的独立限流（按客户端 IP）。
 
     偏好 / 会话标题 / 置顶 / 归档 / 行程增删改 / 删除会话等每次都会全量
     重载并重写该用户记忆，并与对话落库共用文件锁或数据库连接：不设额度时
     几十个并发写就能把 anyio 共享线程池与存储打满。
+
+    写端点没有 ``response`` 参数、成功响应也不附额度头（全部调用方丢弃
+    返回值）：这里只做 ``check``（超限 429 自带额度头），不再额外计算
+    ``status()``——那会在 Redis 部署下为每个写请求多付一次网络往返。
     """
     client = _rate_identity(_client_host(request))
     retry_after = state.write_limiter.check(client)
@@ -2368,12 +2392,6 @@ def _enforce_write_rate_limit(
                 "X-RateLimit-Reset": str(wait_seconds),
             },
         )
-    remaining, reset = state.write_limiter.status(client)
-    return {
-        "X-RateLimit-Limit": str(state.write_limiter.limit),
-        "X-RateLimit-Remaining": str(remaining),
-        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
-    }
 
 
 _WEATHER_EXECUTOR_MAX_WORKERS = 8
@@ -3867,7 +3885,9 @@ def create_app(model: Any = None) -> FastAPI:
         # 未鉴权的自检接口同样需要限流，并拒绝浏览器跨站简单 GET
         _reject_cross_site_side_effect(request)
         response.headers.update(
-            await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
+            await asyncio.to_thread(
+                _enforce_kb_rate_limit, state, request, "自检操作"
+            )
         )
         results = await run_doctor(include_network=network)
         return {
@@ -3913,7 +3933,11 @@ def create_app(model: Any = None) -> FastAPI:
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            return list_documents(limit=limit, offset=offset, query=q, category=category)
+            # 历史脏数据里的孤立代理项 / 非有限数在序列化阶段会 500：
+            # 与导出同口径清洗后再返回
+            return _json_safe_value(
+                list_documents(limit=limit, offset=offset, query=q, category=category)
+            )
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503,
@@ -3932,7 +3956,7 @@ def create_app(model: Any = None) -> FastAPI:
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            return {"categories": list_categories()}
+            return _json_safe_value({"categories": list_categories()})
         except FileNotFoundError as exc:
             raise HTTPException(status_code=503, detail=f"{exc}（先运行初始化脚本）") from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503
@@ -3963,7 +3987,7 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
             logger.warning("语义检索知识片段失败: %s", exc)
             raise _knowledge_unavailable("检索失败", exc) from exc
-        return {"query": query, "results": results}
+        return _json_safe_value({"query": query, "results": results})
 
     @app.get("/api/knowledge/eval")
     def knowledge_eval(request: Request, response: Response) -> dict[str, Any]:
@@ -4050,8 +4074,11 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """列出内容完全相同的独立知识片段组（与 CLI ``kb-duplicates`` 同一实现）。
 
-        ``limit=0`` 返回全部组。只统计可单删的独立片段：带 ``group`` 或
-        旧版 ``parts > 1`` 的多分片记录内部重复属于同一篇文档，不算重复。
+        ``limit=0`` 表示「全部」，但 Web 侧最多返回
+        ``MAX_DUPLICATE_GROUPS_FULL``（2000）组并以 ``truncated`` 标记；
+        无上限的全量审计请用 CLI ``kb-duplicates 0``。只统计可单删的独立
+        片段：带 ``group`` 或旧版 ``parts > 1`` 的多分片记录内部重复属于
+        同一篇文档，不算重复。
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
@@ -4066,20 +4093,22 @@ def create_app(model: Any = None) -> FastAPI:
         shown = (
             groups[:MAX_DUPLICATE_GROUPS_FULL] if limit <= 0 else groups[:limit]
         )
-        return {
-            "total_groups": len(groups),
-            "total_fragments": sum(len(ids) for _, ids in groups),
-            "shown": len(shown),
-            "truncated": len(shown) < len(groups),
-            "groups": [
-                {
-                    "content": content,
-                    "preview": " ".join(content.split())[:60],
-                    "ids": list(ids),
-                }
-                for content, ids in shown
-            ],
-        }
+        return _json_safe_value(
+            {
+                "total_groups": len(groups),
+                "total_fragments": sum(len(ids) for _, ids in groups),
+                "shown": len(shown),
+                "truncated": len(shown) < len(groups),
+                "groups": [
+                    {
+                        "content": content,
+                        "preview": " ".join(content.split())[:60],
+                        "ids": list(ids),
+                    }
+                    for content, ids in shown
+                ],
+            }
+        )
 
     @app.post("/api/knowledge/duplicates/cleanup")
     def knowledge_duplicates_cleanup(
@@ -4095,7 +4124,7 @@ def create_app(model: Any = None) -> FastAPI:
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
-            return cleanup_duplicate_contents(dry_run=payload.dry_run)
+            result = cleanup_duplicate_contents(dry_run=payload.dry_run)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
@@ -4103,6 +4132,14 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 读取 / 删除失败统一提示
             logger.warning("清理重复知识片段失败: %s", exc)
             raise _knowledge_unavailable("清理失败", exc) from exc
+        # 单条删除失败的 error 是原始存储异常文本（可能含本机绝对路径）：
+        # 与其它知识库接口同一脱敏口径
+        from utils.log_redact import redact_paths
+
+        for item in result.get("failed") or []:
+            if isinstance(item, dict) and "error" in item:
+                item["error"] = redact_paths(item["error"])
+        return result
 
     @app.post("/api/knowledge/documents", status_code=201)
     def knowledge_add(
@@ -4173,7 +4210,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _knowledge_unavailable("读取失败", exc) from exc
         if result is None:
             raise HTTPException(status_code=404, detail="知识片段不存在")
-        return result
+        return _json_safe_value(result)
 
     @app.delete("/api/knowledge/documents/{doc_id}")
     def knowledge_delete(
@@ -6270,7 +6307,11 @@ def create_app(model: Any = None) -> FastAPI:
             .strip()
             .lower()
         )
-        if content_type != "application/json":
+        # 与 FastAPI 的 strict content-type 校验同一口径：接受
+        # application/json 与 application/*+json（带参数已剥离），其余
+        # （含缺失 / text/plain / 表单）在这一入口统一 415——手动检查早于
+        # 64MB 请求体读取，比其它破坏性端点的 422 更明确且能提前断开上传
+        if content_type != "application/json" and not content_type.endswith("+json"):
             raise HTTPException(
                 status_code=415,
                 detail="备份恢复只接受 application/json 请求体",
@@ -6284,7 +6325,9 @@ def create_app(model: Any = None) -> FastAPI:
         # 所有 SSE 与请求一起停摆；超限的风暴请求也不该先付出解析代价
         try:
             response.headers.update(
-                await asyncio.to_thread(_enforce_kb_rate_limit, state, request)
+                await asyncio.to_thread(
+                    _enforce_kb_rate_limit, state, request, "备份恢复操作"
+                )
             )
         except HTTPException as exc:
             if exc.status_code == 429:
