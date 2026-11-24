@@ -324,6 +324,27 @@ def test_pref_delete_text_and_json(monkeypatch):
     print("✓ pref-delete 文本 / JSON / 未设置")
 
 
+def test_pref_delete_allows_legacy_container(monkeypatch):
+    """pref-delete 允许删除保留类型 preferences（清历史脏数据）；pref-set 仍拒绝。"""
+    store = _WriteStore({"preferences": {"nested": "旧格式"}})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_delete_standalone("u1", "preferences")
+    assert code == 0, out.getvalue()
+    assert store.deleted == ["preferences"]
+    assert "保留的偏好类型" not in out.getvalue()
+
+    # 写入路径仍拒绝：该类型会在下次加载时被展开 / 丢弃
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "preferences", "北京")
+    assert code == 1 and "保留的偏好类型" in out.getvalue()
+    print("✓ pref-delete 可清保留类型 preferences，pref-set 仍拒绝")
+
+
 def test_pref_write_validation_and_failures(monkeypatch):
     store = _WriteStore({})
     monkeypatch.setattr(
@@ -569,7 +590,9 @@ def test_pref_set_rejects_reserved_type_and_nul(monkeypatch):
             "u1", "preferences", as_json=True
         )
     data = json.loads(out.getvalue())
-    assert code == 1 and "保留" in data["error"], data
+    # 删除路径已放行（历史脏数据只能经删除清理）：空库里如实报未设置
+    assert code == 1 and "未设置或已删除" in data["error"], data
+    assert "保留" not in data["error"], data
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -742,6 +765,7 @@ if __name__ == "__main__":
         test_pref_set_json_value_depth_guard,
         test_preferences_json_filters_blank_list_items,
         test_pref_delete_text_and_json,
+        test_pref_delete_allows_legacy_container,
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
         test_pref_set_rejects_oversized_value,

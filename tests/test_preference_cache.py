@@ -141,6 +141,79 @@ def test_pg_backend_cache_hit_and_invalidation(monkeypatch):
         shutil.rmtree(storage, ignore_errors=True)
 
 
+def test_inflight_read_does_not_repopulate_after_invalidate(monkeypatch):
+    """读库期间发生失效：写前快照不得回填缓存（下次读取必须回源）。"""
+    import threading
+
+    _with_pg(monkeypatch)
+    store = _FakeStore(snapshot_based=False)
+    manager, storage = _manager()
+    try:
+        manager.long_term = store
+        gate = threading.Event()
+        started = threading.Event()
+        real_get = store.get_preference
+
+        def blocking_get():
+            started.set()
+            gate.wait(5)
+            return real_get()
+
+        store.get_preference = blocking_get
+        result = {}
+        reader = threading.Thread(
+            target=lambda: result.update(manager.get_preferences())
+        )
+        reader.start()
+        assert started.wait(5), "读线程未进入读库"
+        # 面板写入的全局失效发生在读库与回填之间
+        manager.invalidate_preference_cache()
+        gate.set()
+        reader.join(5)
+        assert result["hotel_brands"] == ["汉庭"], result
+
+        reads_before = store.reads
+        manager.get_preferences()
+        assert store.reads == reads_before + 1, "失效后的在途读不能回填缓存"
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+    print("✓ 读库期间失效：在途读不回填缓存")
+
+
+def test_instance_registry_and_invalidate_all_share_lock(monkeypatch):
+    """实例注册与全局失效共享类级锁（WeakSet 迭代期间注册不打断失效）。"""
+    import weakref
+
+    class _ProbeSet(weakref.WeakSet):
+        def add(self, item):
+            assert MemoryManager._preference_cache_instances_lock.locked(), (
+                "实例注册必须持类级锁"
+            )
+            super().add(item)
+
+        def __iter__(self):
+            assert MemoryManager._preference_cache_instances_lock.locked(), (
+                "全局失效的快照迭代必须持类级锁"
+            )
+            return super().__iter__()
+
+    monkeypatch.setattr(
+        MemoryManager, "_preference_cache_instances", _ProbeSet()
+    )
+    first, first_storage = _manager()
+    second, second_storage = _manager()
+    try:
+        first._preference_cache = (0.0, None, {"a": 1})
+        second._preference_cache = (0.0, None, {"a": 2})
+        MemoryManager.invalidate_all_preference_caches()
+        assert first._preference_cache is None
+        assert second._preference_cache is None
+    finally:
+        shutil.rmtree(first_storage, ignore_errors=True)
+        shutil.rmtree(second_storage, ignore_errors=True)
+    print("✓ 实例注册 / 全局失效的类级锁快照")
+
+
 def test_invalidate_all_preference_caches(monkeypatch):
     """面板 / 导入直写时一次清空本进程所有实例的偏好快照。"""
     _with_pg(monkeypatch)
@@ -367,6 +440,34 @@ def test_version_recovery_from_none_not_counted(monkeypatch):
         shutil.rmtree(storage, ignore_errors=True)
 
 
+def test_version_bump_uses_atomic_lua_when_available(monkeypatch):
+    """支持 EVAL 的客户端用 Lua 原子完成 INCR+EXPIRE（不留无 TTL 的版本键）。"""
+    from context import storage as storage_module
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    calls = []
+
+    class _EvalRedis(_FakeRedis):
+        def eval(self, script, numkeys, *keys_and_args):
+            calls.append((script, numkeys, keys_and_args))
+            return 1
+
+    redis = _EvalRedis()
+    monkeypatch.setattr(
+        storage_module, "get_shared_redis_client", lambda *a, **k: redis
+    )
+    storage_module.reset_pref_version_failure()
+    store = PostgresLongTermMemory.__new__(PostgresLongTermMemory)
+    store.user_id = "u-eval"
+    store._bump_shared_preference_version()
+    assert len(calls) == 1, calls
+    script, numkeys, keys_and_args = calls[0]
+    assert numkeys == 1 and keys_and_args[0] == "aligo:prefver:u-eval"
+    assert "INCR" in script and "EXPIRE" in script, "INCR 与 EXPIRE 必须同一脚本原子执行"
+    assert redis.incr_calls == [], "EVAL 成功时不得再走两命令回退"
+    print("✓ 偏好版本推进优先 Lua 原子执行")
+
+
 def test_postgres_preference_writes_bump_shared_version(monkeypatch):
     """PG 存储层在偏好写入 / 删除 / 清空后推进跨进程版本键。"""
     import contextlib
@@ -459,6 +560,8 @@ if __name__ == "__main__":
     for _case in (
         test_json_backend_does_not_cache,
         test_pg_backend_cache_hit_and_invalidation,
+        test_inflight_read_does_not_repopulate_after_invalidate,
+        test_instance_registry_and_invalidate_all_share_lock,
         test_invalidate_all_preference_caches,
         test_pg_cache_ttl_expiry,
         test_shared_version_invalidates_cross_process_cache,
@@ -466,6 +569,7 @@ if __name__ == "__main__":
         test_version_protocol_order,
         test_version_invalidation_requires_fresh_snapshot,
         test_version_recovery_from_none_not_counted,
+        test_version_bump_uses_atomic_lua_when_available,
         test_postgres_preference_writes_bump_shared_version,
     ):
         _mp = pytest.MonkeyPatch()

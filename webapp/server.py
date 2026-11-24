@@ -4427,11 +4427,9 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """删除一条用户偏好（记忆面板的手动维护入口）。"""
         _enforce_write_rate_limit(state, request)
-        if pref_type == "preferences":
-            raise HTTPException(
-                status_code=422,
-                detail="preferences 是保留的偏好类型，请使用具体类型名",
-            )
+        # ``preferences`` 是旧版嵌套偏好容器：PUT 拒绝（写入会被下次加载
+        # 展开 / 丢弃），但 DELETE 必须放行——历史脏数据里保留的该类型行
+        # 是唯一一条无法经面板 / 导入自愈的偏好，不给删除入口就永远清不掉
         # 删除是破坏性操作：PostgreSQL 不可用时不能静默作用在回退 JSON 上
         # （恢复后偏好会「复活」），strict 打开会返回 503
         store = _open_long_term(user_id, strict=True)

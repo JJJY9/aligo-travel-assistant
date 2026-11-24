@@ -572,10 +572,31 @@ class PostgresLongTermMemory:
             if client is None:
                 return
             key = f"aligo:prefver:{self.user_id}"
-            client.incr(key)
-            # 与墓碑会话纪元同一约定：INCR 后 EXPIRE，避免每用户永久留键；
-            # 快照缓存 TTL 只有 5 秒，键过期只会让下一次读取多一次重读
-            client.expire(key, _PREF_VERSION_TTL_SEC)
+            # INCR 与 EXPIRE 必须原子：两条独立命令之间进程中断 / EXPIRE
+            # 单独失败会让版本键永久没有 TTL（与「INCR 后 EXPIRE 1 天」的
+            # 不变量不符）。优先 Lua 原子执行；不支持 EVAL 的客户端
+            # （测试假实现 / 受限代理）退回原两命令口径
+            bumped = False
+            eval_fn = getattr(client, "eval", None)
+            if callable(eval_fn):
+                try:
+                    eval_fn(
+                        "redis.call('INCR', KEYS[1]); "
+                        "redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])); "
+                        "return 1",
+                        1,
+                        key,
+                        _PREF_VERSION_TTL_SEC,
+                    )
+                    bumped = True
+                except Exception:  # noqa: BLE001 - 退回 INCR/EXPIRE 两命令
+                    logger.debug(
+                        "偏好版本 Lua 推进失败，退回 INCR/EXPIRE", exc_info=True
+                    )
+            if not bumped:
+                client.incr(key)
+                # 快照缓存 TTL 只有 5 秒，键过期只会让下一次读取多一次重读
+                client.expire(key, _PREF_VERSION_TTL_SEC)
         except Exception as exc:  # noqa: BLE001 - 版本推进失败由 TTL 兜底
             # 操作级冷却：故障期不再让每次偏好写入都等满 socket 超时
             note_pref_version_failure(exc)

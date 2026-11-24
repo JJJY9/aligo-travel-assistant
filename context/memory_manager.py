@@ -6,6 +6,7 @@ import asyncio
 import copy
 import logging
 import re
+import threading
 import time
 import weakref
 from collections.abc import Callable
@@ -105,8 +106,12 @@ class MemoryManager:
     """
 
     # 本进程内存活实例的弱引用集合：Web 面板 / 导入经独立 store 直写偏好
-    # 时，需要一次清掉所有已建会话的 5 秒快照缓存（弱引用不阻止 GC）
+    # 时，需要一次清掉所有已建会话的 5 秒快照缓存（弱引用不阻止 GC）。
+    # 会话构造在线程池中执行、与面板写入并发：add 与快照迭代都必须持类级
+    # 锁，否则 WeakSet 迭代期间新增会抛「Set changed size during
+    # iteration」，整批失效失败而被调用方吞掉
     _preference_cache_instances: weakref.WeakSet[Any] = weakref.WeakSet()
+    _preference_cache_instances_lock = threading.Lock()
 
     def __init__(self, user_id: str, session_id: str, storage_path: str = "data/memory", llm_model=None):
         """
@@ -140,7 +145,12 @@ class MemoryManager:
         self._recent_summary_failure_until = 0.0
         # 偏好快照缓存（v2.0）：(monotonic, preferences)，仅 PG 后端启用
         self._preference_cache: tuple[float, str | None, dict[str, Any]] | None = None
-        MemoryManager._preference_cache_instances.add(self)
+        # 失效代数：读库与回填之间发生了失效（面板 PUT / 延迟偏好提交）
+        # 时丢弃回填——否则写前快照会被写回缓存再活 5 秒
+        self._preference_cache_generation = 0
+        self._preference_cache_lock = threading.Lock()
+        with MemoryManager._preference_cache_instances_lock:
+            MemoryManager._preference_cache_instances.add(self)
 
         logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
 
@@ -212,7 +222,12 @@ class MemoryManager:
         now = time.monotonic()
         version: str | None = None
         cache_active = self._preference_cache_enabled()
+        generation = 0
         if cache_active:
+            # 失效代数在读库前记下：读库期间发生的失效（面板 PUT / 延迟
+            # 偏好提交）会让本次读到的「写前快照」作废，回填前比对
+            with self._preference_cache_lock:
+                generation = self._preference_cache_generation
             # 跨进程版本优先于 TTL：其它实例 / CLI 写入后本进程下一次读取
             # 就拿到新偏好，不用等满 5 秒
             version = self._shared_preference_version(self.user_id)
@@ -240,16 +255,21 @@ class MemoryManager:
             )
         preferences = self.long_term.get_preference()
         if cache_active:
-            self._preference_cache = (
-                now,
-                version,
-                copy.deepcopy(preferences),
-            )
+            with self._preference_cache_lock:
+                if self._preference_cache_generation == generation:
+                    # 时间戳用回填时刻：慢查询不会吃掉 TTL
+                    self._preference_cache = (
+                        time.monotonic(),
+                        version,
+                        copy.deepcopy(preferences),
+                    )
         return preferences
 
     def invalidate_preference_cache(self) -> None:
         """偏好写入 / 后端重建后立即失效快照缓存。"""
-        self._preference_cache = None
+        with self._preference_cache_lock:
+            self._preference_cache_generation += 1
+            self._preference_cache = None
 
     @classmethod
     def invalidate_all_preference_caches(cls) -> None:
@@ -259,7 +279,11 @@ class MemoryManager:
         会话的 MemoryManager；不全局失效时，PostgreSQL 后端下会话最多
         5 秒内仍按旧偏好规划。
         """
-        for instance in list(cls._preference_cache_instances):
+        # 锁内只做快照：会话构造线程同时在 add，直接迭代 WeakSet 会抛
+        # 「Set changed size during iteration」；逐实例失效在锁外执行
+        with cls._preference_cache_instances_lock:
+            instances = list(cls._preference_cache_instances)
+        for instance in instances:
             try:
                 instance.invalidate_preference_cache()
             except Exception:  # noqa: BLE001 - 单个实例失败不影响其它

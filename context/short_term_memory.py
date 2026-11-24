@@ -142,6 +142,20 @@ def seen_key(key: str) -> str:
     return f"{key}:seen"
 
 
+def _iso_order_key(value: Any) -> str:
+    """ISO 时间戳的字典序比较键（与 Lua ``timestamp_key`` 同一口径）。
+
+    空格分隔归一为 ``'T'``、截断到微秒（26 字符）；缺失 / 非字符串返回
+    空串（不参与比较）。
+    """
+    if not isinstance(value, str) or len(value) < 10:
+        return ""
+    normalized = value
+    if len(normalized) >= 11 and normalized[10] == " ":
+        normalized = normalized[:10] + "T" + normalized[11:]
+    return normalized[:26]
+
+
 def _canonical_timestamp(value: Any) -> str | None:
     """调用方时间戳统一为本地 naive ISO（与 ``datetime.now().isoformat()``
     同形）；空 / 非法返回 None。
@@ -339,6 +353,11 @@ if check == '1' then
 end
 if count >= n then
   redis.call('DEL', key)
+  -- seen 指纹随消息键一起清：不清的话，之后从长期记忆回填 / 故障重放
+  -- 的同批历史被 seen 检查永久跳过，空窗口再也进不了历史（ARGV[6]
+  -- 为旧日志重放时缺省 nil，按空串跳过）
+  local seen = ARGV[6]
+  if seen and seen ~= '' then redis.call('DEL', seen) end
 else
   redis.call('LTRIM', key, 0, -count - 1)
 end
@@ -763,6 +782,16 @@ class ShortTermMemory:
         ):
             count = 2
             last_user = self.messages[-2]
+        # 与 Redis Lua 同一口径：末尾提问的时间戳晚于本机当前时刻（时钟
+        # 回拨 / 导入自时钟超前的机器）时拒绝删除——在线与降级两条路径
+        # 对同一请求必须同结论，不能因有无 Redis 而行为相反
+        if last_user is not None:
+            message_time = _iso_order_key(last_user.get("timestamp"))
+            if message_time and message_time > _iso_order_key(
+                datetime.now().isoformat()
+            ):
+                logger.info("Skip truncating last turn: future timestamp")
+                return 0
         if isinstance(turn_id, str) and turn_id:
             if last_user is None:
                 return 0
@@ -1346,7 +1375,9 @@ class RedisShortTermMemory:
             self._append_op(journal, "clear", cutoff)
 
         self._call_redis(
-            lambda: self.client.delete(self.key, applied_key(self.key)),
+            lambda: self.client.delete(
+                self.key, applied_key(self.key), seen_key(self.key)
+            ),
             lambda: None,
             on_failure,
         )
@@ -1419,6 +1450,10 @@ class RedisShortTermMemory:
                 cutoff,
                 # 回合 id：跨实例精确区分「同一文本的不同回合」
                 (turn_id or ""),
+                # 清空整键时一并删除 seen 指纹集合（旧日志没有该参数时
+                # 为 nil，脚本按空串处理）：否则回填 / 重放的同批历史被
+                # seen 永久跳过，空窗口再也进不了历史
+                seen_key(self.key),
             ),
             fallback,
             on_failure,

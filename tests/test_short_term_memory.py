@@ -128,6 +128,29 @@ def test_truncate_trailing_user_only():
     print("✓ 只剩提问时只删除提问")
 
 
+def test_inprocess_truncate_rejects_future_timestamp():
+    """与 Redis Lua 同口径：末尾提问时间戳晚于当前时刻时拒删（时钟回拨）。"""
+    from datetime import datetime, timedelta
+
+    memory = ShortTermMemory(max_turns=10)
+    future = (datetime.now() + timedelta(hours=1)).isoformat()
+    memory.add_message("user", "未来的提问", timestamp=future)
+    memory.add_message("assistant", "回答", timestamp=future)
+    assert memory.truncate_last_turn("未来的提问") == 0
+    assert len(memory.messages) == 2
+    # 带匹配 turn_id 也同样拒删（cutoff 校验先于回合 id，与 Lua 顺序一致）
+    assert memory.truncate_last_turn("未来的提问", turn_id="t1") == 0
+    assert len(memory.messages) == 2
+
+    # 过去时间戳照常删除
+    past = (datetime.now() - timedelta(hours=1)).isoformat()
+    memory2 = ShortTermMemory(max_turns=10)
+    memory2.add_message("user", "正常提问", timestamp=past)
+    memory2.add_message("assistant", "回答", timestamp=past)
+    assert memory2.truncate_last_turn("正常提问") == 2
+    print("✓ 进程内截断与 Lua 同口径（未来时间戳拒删）")
+
+
 def test_truncate_empty():
     assert ShortTermMemory().truncate_last_turn() == 0
     print("✓ 空历史返回 0")
@@ -480,7 +503,12 @@ class _FlakyRedis:
                 return 0
             if content.strip() != expected:
                 return 0
+        len_before = len(self.data)
         del self.data[-count:]
+        # 整键删除时与真实 Lua 一致清 seen 指纹（ARGV[6]）：残留的指纹
+        # 会让之后回填 / 重放的同批历史被永久跳过
+        if count >= len_before and len(args) > 5 and args[5]:
+            self.seen.pop(args[5], None)
         return count
 
     def llen(self, key):
