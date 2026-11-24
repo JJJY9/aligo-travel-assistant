@@ -481,7 +481,7 @@ def test_export_csv_warns_about_unimportable_rows(monkeypatch):
     fake = _FakeStore(
         [
             _trip("上海", "2026-12-05", "2026-12-07"),
-            _trip("杭州", "2026-12-05", "2026/12/20"),
+            _trip("杭州", "2026-12-05", "待定"),
         ]
     )
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)

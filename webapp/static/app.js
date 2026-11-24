@@ -1435,6 +1435,24 @@ async function downloadFromApi(url, fallbackName) {
     if (skippedTrips > 0) {
       toast(`有 ${skippedTrips} 条行程缺少出发日期，未包含在日历中`);
     }
+    // 返程日期无法解析的行程按单日导出（日历里会少几天）：CLI 有同等
+    // 提示，面板不能静默截断
+    const truncatedEnd = Number(
+      response.headers.get("x-aligo-export-truncated-end") || 0,
+    );
+    if (truncatedEnd > 0) {
+      toast(`有 ${truncatedEnd} 条行程的返程日期无法解析，日历按单日导出`);
+    }
+    // 回导自检：文件里存在导入端会整行 / 整事件拒绝的数据（日期非法 /
+    // 倒置、字段超长），别等迁移 / 恢复时才发现行程变少
+    const unimportable = Number(
+      response.headers.get("x-aligo-export-unimportable") || 0,
+    );
+    if (unimportable > 0) {
+      toast(
+        `导出文件有 ${unimportable} 项在重新导入时会被跳过（日期非法 / 倒置、字段超长等），请先修正后再迁移`,
+      );
+    }
     // 含知识库的备份在恢复时可能跳过无法恢复的旧版 / 残缺片段：
     // 服务端用响应头给出计数，不能把「不含完整知识」的备份当完整成功
     const skippedKnowledge = Number(
@@ -1515,9 +1533,13 @@ async function toggleTripsExpanded() {
     // （服务端按 q 过滤完整历史，避免重开面板后旧行程又"消失"）
     const query = state.tripsFilter.trim();
     const status = state.tripsStatusFilter;
+    // status 过滤带上浏览器本地日期：服务端（容器常为 UTC）与徽标
+    // （todayISO）时区不一致时，筛选结果不能与徽标互相矛盾
     const suffix =
       (query ? `&q=${encodeURIComponent(query)}` : "") +
-      (status ? `&status=${encodeURIComponent(status)}` : "");
+      (status
+        ? `&status=${encodeURIComponent(status)}&today=${todayISO()}`
+        : "");
     const data = await getJSON(
       `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
     );
@@ -1612,7 +1634,15 @@ async function importTripsFromFile(file) {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: text }),
+          // 定时事件按浏览器时区取日期：服务端在容器里常是 UTC，不带上
+          // 时区会与面板 / CLI 记成不同的天
+          body: JSON.stringify({
+            content: text,
+            timezone:
+              typeof Intl !== "undefined" && Intl.DateTimeFormat
+                ? Intl.DateTimeFormat().resolvedOptions().timeZone
+                : undefined,
+          }),
         },
       );
     try {
@@ -1627,21 +1657,48 @@ async function importTripsFromFile(file) {
       // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
       // 面板已关仍会弹确认并在看不见的界面里写库
       if (els.memorySheet.hidden) return;
-      // 确认框里带上前几条跳过原因：只报数量时用户无法判断是不是选错格式
+      // 确认框里带上前几条跳过原因：只报数量时用户无法判断是不是选错格式。
+      // CSV 的 line 是物理行号、ICS 是事件序号（预览响应带 format）
+      const isIcsPreview = preview.format === "ics";
+      const skipLabel = (line) => {
+        const value = Number(line);
+        if (isIcsPreview) return value > 0 ? `事件 ${value}` : "";
+        return `第 ${value} 行`;
+      };
       const skipPreview = Array.isArray(preview.skipped)
         ? preview.skipped.slice(0, 3)
         : [];
       const skipReasons = skipPreview
-        .map((item) => `第 ${item.line} 行：${item.reason}`)
+        .map((item) => {
+          const label = skipLabel(item.line);
+          return label ? `${label}：${item.reason}` : String(item.reason);
+        })
+        .join("\n");
+      // 合法但可疑的跨行记录（疑似错位引号把下一条行程吞进本行）：只提示
+      const warningPreview = Array.isArray(preview.warnings)
+        ? preview.warnings.slice(0, 3)
+        : [];
+      const previewWarnings = Number(
+        preview.warnings_total ?? warningPreview.length,
+      );
+      const warningReasons = warningPreview
+        .map((item) => {
+          const label = skipLabel(item.line);
+          return label ? `${label}：${item.reason}` : String(item.reason);
+        })
         .join("\n");
       const ok = window.confirm(
         `将向用户 ${userId} 新增 ${Number(preview.created || 0)} 条、更新 ${Number(
           preview.updated || 0,
         )} 条行程` +
           (previewSkipped ? `，跳过 ${previewSkipped} 条` : "") +
+          (previewWarnings ? `，${previewWarnings} 条记录请核对` : "") +
           "。继续？" +
           (skipReasons
             ? `\n\n跳过原因（前 ${skipPreview.length} 条）：\n${skipReasons}`
+            : "") +
+          (warningReasons
+            ? `\n\n请核对（前 ${warningPreview.length} 条）：\n${warningReasons}`
             : ""),
       );
       if (!ok) {
@@ -1655,10 +1712,15 @@ async function importTripsFromFile(file) {
         result.skipped_total ??
           (Array.isArray(result.skipped) ? result.skipped.length : 0),
       );
+      const warnings = Number(
+        result.warnings_total ??
+          (Array.isArray(result.warnings) ? result.warnings.length : 0),
+      );
       toast(
         `已导入 ${created} 条行程` +
           (updated ? `，更新 ${updated} 条` : "") +
-          (skipped ? `，跳过 ${skipped} 条` : ""),
+          (skipped ? `，跳过 ${skipped} 条` : "") +
+          (warnings ? `，${warnings} 条记录请核对` : ""),
       );
       imported = true;
     } catch (error) {
@@ -3831,9 +3893,12 @@ async function loadExpandedTrips(options = {}) {
   const requestId = (tripsRequestId += 1);
   const query = state.tripsFilter.trim();
   const status = state.tripsStatusFilter;
+  // 与徽标同口径：status 过滤用浏览器本地日期（服务端可能 UTC）
   const suffix =
     (query ? `&q=${encodeURIComponent(query)}` : "") +
-    (status ? `&status=${encodeURIComponent(status)}` : "");
+    (status
+      ? `&status=${encodeURIComponent(status)}&today=${todayISO()}`
+      : "");
   try {
     const tripsData = await getJSON(
       `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
@@ -3861,7 +3926,8 @@ async function refreshStatus(options = {}) {
   const userId = state.userId;
   try {
     const data = await getJSON(
-      `/api/status?user_id=${encodeURIComponent(userId)}`,
+      // today：next_trip / 概览与状态徽标同口径（服务端可能 UTC）
+      `/api/status?user_id=${encodeURIComponent(userId)}&today=${todayISO()}`,
       undefined,
       30000,
     );
@@ -6543,9 +6609,12 @@ function bindEvents() {
     // 支持 q / status），否则筛选后的导出会包含被筛掉的全部行程
     const query = state.tripsExpanded ? state.tripsFilter.trim() : "";
     const status = state.tripsExpanded ? state.tripsStatusFilter || "" : "";
+    // status 筛选与列表 / 徽标同一口径：带上浏览器本地日期
     const suffix =
       (query ? `&q=${encodeURIComponent(query)}` : "") +
-      (status ? `&status=${encodeURIComponent(status)}` : "");
+      (status
+        ? `&status=${encodeURIComponent(status)}&today=${todayISO()}`
+        : "");
     const formatParam = format ? `&format=${format}` : "";
     downloadFromApi(
       `/api/trips/export?user_id=${encodeURIComponent(state.userId)}${suffix}${formatParam}`,

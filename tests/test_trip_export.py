@@ -331,7 +331,7 @@ def test_count_ics_events_unfolds_before_counting():
 
 
 def test_ics_unparsable_end_warns(caplog):
-    """返程日期无法解析：日历按单日导出，但必须留告警（不再静默截断）。"""
+    """返程日期无法解析：日历按单日导出，但必须留告警并不丢原始值。"""
     import logging
 
     from utils.trip_export import trip_ics_end_unparsable
@@ -341,7 +341,7 @@ def test_ics_unparsable_end_warns(caplog):
         "origin": "北京",
         "destination": "上海",
         "start_date": "2026-12-05",
-        "end_date": "2026/12/20",
+        "end_date": "待定",
     }
     assert trip_ics_end_unparsable(trip)
     with caplog.at_level(logging.WARNING):
@@ -349,7 +349,110 @@ def test_ics_unparsable_end_warns(caplog):
     assert "无法解析" in caplog.text
     assert "DTSTART;VALUE=DATE:20261205" in text
     assert "DTEND;VALUE=DATE:20261206" in text
-    print("✓ 返程日期无法解析时告警并按单日导出")
+    # 原始返程日期经专用属性保真携带：回导时身份才能与原行闭合
+    assert "X-ALIGO-TRIP-END:待定" in text
+    print("✓ 返程日期无法解析时告警并按单日导出（原值经 X 属性保留）")
+
+
+def test_ics_slash_dates_parse_like_iso():
+    """YYYY/M/D 旧格式日期与 ISO 同口径：导出为合法事件且不再告警。"""
+    from utils.trip_export import trip_ics_end_unparsable
+
+    trip = {
+        "trip_id": "t-slash",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026/3/12",
+        "end_date": "2026/3/13",
+    }
+    assert not trip_ics_end_unparsable(trip)
+    text = render_trips_ics([trip], "u1")
+    assert "DTSTART;VALUE=DATE:20260312" in text
+    assert "DTEND;VALUE=DATE:20260314" in text
+    assert "X-ALIGO-TRIP-END" not in text
+    csv_text = render_trips_csv([trip])
+    assert "2026-03-12" in csv_text and "2026-03-13" in csv_text
+    print("✓ 斜杠旧格式日期导出归一为 ISO（事件不再被跳过）")
+
+
+def test_ics_9999_single_day_omits_dtend():
+    """9999-12-31 单日：排他 DTEND 无法表示，按 RFC 5545 §3.6.1 省略。"""
+    single = {
+        "trip_id": "t-max",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "9999-12-31",
+        "end_date": "9999-12-31",
+    }
+    text = render_trip_ics(single, "u1")
+    assert text and "DTSTART;VALUE=DATE:99991231" in text
+    assert "DTEND" not in text, "DTEND==DTSTART 是非法零长度事件"
+    multi = {
+        "trip_id": "t-max2",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-01-01",
+        "end_date": "9999-12-31",
+    }
+    multi_text = render_trip_ics(multi, "u1")
+    assert multi_text and "DTEND;VALUE=DATE:99991231" in multi_text
+    print("✓ 9999-12-31 单日省略 DTEND，多日终点保留合法 DTEND")
+
+
+def test_empty_calendar_has_placeholder_component():
+    """空日历满足 RFC 5545「至少一个组件」：输出可被忽略的扩展组件。"""
+    text = render_trips_ics([], "u1")
+    assert "BEGIN:VEVENT" not in text
+    assert "BEGIN:X-ALIGO-EMPTY" in text
+    assert "X-ALIGO-EMPTY:1" in text
+    assert "END:X-ALIGO-EMPTY" in text
+    from utils.trip_import import parse_trips_ics
+
+    rows, errors = parse_trips_ics(text)
+    assert rows == [] and errors[0][1].startswith("未找到 VEVENT"), errors
+    print("✓ 空日历含可忽略的扩展组件（仍无 VEVENT）")
+
+
+def test_csv_formula_guard_covers_newlines_and_leading_space():
+    """CSV 注入防护覆盖换行 / 前导空白，且导入端可精确反解。"""
+    from utils.trip_import import parse_trips_csv
+
+    sep = chr(0x2028)
+    trip = {
+        "trip_id": "t-inject",
+        "origin": "\r=cmd|' /C calc'!A0",
+        "destination": "\n=HYPERLINK(\"http://evil\",\"x\")",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-06",
+        "purpose": " =SUM(A1)",
+    }
+    text = render_trips_csv([trip])
+    rows, errors = parse_trips_csv(text)
+    assert errors == [], errors
+    row = rows[0]
+    # CR 按身份口径归一为 LF；保护引号在字段首字符，导入可逆
+    assert row["origin"] == "\n=cmd|' /C calc'!A0", repr(row["origin"])
+    assert row["destination"].startswith("\n=HYPERLINK"), repr(row["destination"])
+    assert row["purpose"] == " =SUM(A1)", repr(row["purpose"])
+    # U+2028 清洗成空格后仍要防护（否则前导空白绕过）
+    trip2 = dict(trip, purpose=sep + "=cmd")
+    rows2, _ = parse_trips_csv(render_trips_csv([trip2]))
+    assert rows2[0]["purpose"] == " =cmd", repr(rows2[0]["purpose"])
+    print("✓ CSV 公式防护覆盖换行 / 前导空白且可逆")
+
+
+def test_identity_projection_matches_export_cleaning():
+    """身份归一与导出清洗同一投影：控制字符 / U+2028 不再制造重复身份。"""
+    from utils.trip_export import normalize_identity_text
+
+    sep = chr(0x2028)
+    assert normalize_identity_text("上" + sep + "海") == "上 海"
+    assert normalize_identity_text("上\x1b[31m海") == "上[31m海"
+    assert normalize_identity_text("北京\r\n上海") == "北京\n上海"
+    assert normalize_identity_text("北京 上海") != normalize_identity_text(
+        "北京\n上海"
+    ), "空格与换行仍是不同身份"
+    print("✓ 身份投影 = 导出清洗投影（空格 ≠ 换行不变）")
 
 
 def test_export_strips_unicode_line_separators_and_counts_events():
@@ -418,5 +521,10 @@ if __name__ == "__main__":
         test_ics_unparsable_end_warns(_shim)
     finally:
         _shim.close()
+    test_ics_slash_dates_parse_like_iso()
+    test_ics_9999_single_day_omits_dtend()
+    test_empty_calendar_has_placeholder_component()
+    test_csv_formula_guard_covers_newlines_and_leading_space()
+    test_identity_projection_matches_export_cleaning()
     test_export_strips_unicode_line_separators_and_counts_events()
     print("\n全部通过")

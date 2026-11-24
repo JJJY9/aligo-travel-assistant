@@ -135,7 +135,7 @@ def test_unparsable_end_notice(monkeypatch):
         monkeypatch,
         "u1",
         "trip_1",
-        [_trip(end_date="2026/12/20")],
+        [_trip(end_date="待定")],
         target=target,
     )
     assert code == 0

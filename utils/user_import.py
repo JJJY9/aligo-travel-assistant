@@ -1670,8 +1670,11 @@ def parse_user_export_data(
         if not isinstance(row, dict):
             errors.append(f"跳过第 {index} 条行程：不是对象")
             continue
-        destination = str(row.get("destination") or "").strip()
-        if not destination:
+        # 文本字段保留原文（与存储身份 / 导出的保真口径一致）：导出与
+        # 去重按原值计算身份，恢复时 strip 会让「 北京 」变成「北京」，
+        # 同账号恢复自身备份后按新身份重复新增。纯空白仍视为空
+        destination = str(row.get("destination") or "")
+        if not destination.strip():
             errors.append(f"跳过第 {index} 条行程：目的地为空")
             continue
         start_raw = str(row.get("start_date") or "").strip()
@@ -1697,11 +1700,11 @@ def parse_user_export_data(
         session_id, ok = _clean_session_id(row.get("session_id"))
         if not ok:
             errors.append(f"第 {index} 条行程：会话 ID 非法，已忽略会话关联")
-        origin = str(row.get("origin") or "").strip()
+        origin = str(row.get("origin") or "")
         # 备份缺失 / 空的目的不能补默认值：存储层对既有行程按「非 None」
         # 覆盖 purpose，补默认「出差」会把用户编辑过的目的静默改掉。
         # 键缺失即保留原值（新行程由展示层按缺省处理）
-        purpose = str(row.get("purpose") or "").strip()
+        purpose = str(row.get("purpose") or "")
         problem = (
             _text_problem(origin)
             or _text_problem(destination)
@@ -1711,12 +1714,12 @@ def parse_user_export_data(
             errors.append(f"跳过第 {index} 条行程：{problem}")
             continue
         trip_record: dict[str, Any] = {
-            "origin": origin,
+            "origin": origin if origin.strip() else "",
             "destination": destination,
             "start_date": start_date,
             "end_date": end_date,
         }
-        if purpose:
+        if purpose.strip():
             trip_record["purpose"] = purpose
         # 只在备份确实带有关联时写入 session_id：drop_sessions 显式置 None
         # 表示「清除关联」，与「备份本来没有关联」必须区分（否则恢复会

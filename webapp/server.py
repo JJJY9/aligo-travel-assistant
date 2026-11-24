@@ -39,7 +39,7 @@ from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _worker
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NoReturn
 
@@ -127,8 +127,14 @@ from utils.trip_export import (
     render_trips_csv,
     render_trips_html,
     render_trips_ics,
+    trip_ics_end_unparsable,
 )
-from utils.trip_import import import_trips_from_text, normalize_identity_date
+from utils.trip_import import (
+    import_trips_from_text,
+    normalize_identity_date,
+    trip_export_roundtrip_problems,
+    trip_skip_label,
+)
 from utils.travel_stats import summarize_travel
 from utils.timestamps import chronological_key
 from utils.turn_meta import extract_turn_meta
@@ -1115,6 +1121,10 @@ class TripImportPayload(BaseModel):
     """
 
     content: str = Field(min_length=1, max_length=500_000)
+    # 浏览器上报的 IANA 时区：定时事件（Z / ±HHMM / TZID）按该时区取日期，
+    # 容器以 UTC 部署时也不会与面板 / CLI 记成不同的一天；缺省回退服务器
+    # 本地时区（旧客户端行为不变）
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 class TripUpdatePayload(BaseModel):
@@ -2458,9 +2468,16 @@ def _rate_identity(host: str) -> str:
 
 
 def _filter_trips_by_status(
-    trips: list[dict[str, Any]], status: str | None
+    trips: list[dict[str, Any]],
+    status: str | None,
+    today: date | None = None,
 ) -> list[dict[str, Any]]:
-    """按面板状态徽标过滤行程（列表与导出同一口径）。"""
+    """按面板状态徽标过滤行程（列表与导出同一口径）。
+
+    ``today`` 是面板上报的浏览器本地日期：服务端（容器常为 UTC）与浏览器
+    时区不一致时，徽标（浏览器 local）与筛选（服务器本地）会给出互相矛盾
+    的结论；缺省保持服务器本地日期（CLI / API 兼容）。
+    """
     if status is None:
         return trips
     label = {
@@ -2468,7 +2485,7 @@ def _filter_trips_by_status(
         "upcoming": "即将出行",
         "past": "已结束",
     }[status]
-    return [trip for trip in trips if _trip_state_label(trip) == label]
+    return [trip for trip in trips if _trip_state_label(trip, today) == label]
 
 
 def _limiter_degraded(limiter: Any) -> bool:
@@ -5038,6 +5055,7 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         user_id: str = Query(default="web_user", pattern=_ID_PATTERN),
+        today: date | None = Query(default=None),
     ) -> dict[str, Any]:
         response.headers.update(_enforce_read_rate_limit(state, request))
         # strict：配置 PostgreSQL 但当前不可用时返回可重试 503，不能把
@@ -5045,7 +5063,10 @@ def create_app(model: Any = None) -> FastAPI:
         # CLI 已是 strict 口径，列表 / 概览曾静默展示降级数据、口径分叉
         data = _load_user_data(user_id, strict=True)
         preferences = _visible_preferences(data["preferences"])
-        today = datetime.now().date()
+        # today 由面板传浏览器本地日期：next_trip / 概览与徽标同口径，
+        # 缺省（CLI / 旧客户端）仍是服务器本地日期
+        if today is None:
+            today = datetime.now().date()
         travel_summary = summarize_travel(data["trip_history"], today=today)
         active_trips: list[tuple[datetime, dict[str, Any]]] = []
         upcoming_trips: list[tuple[datetime, dict[str, Any]]] = []
@@ -6368,6 +6389,7 @@ def create_app(model: Any = None) -> FastAPI:
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
         q: str = Query(default="", max_length=100),
         status: Literal["active", "upcoming", "past"] | None = Query(default=None),
+        today: date | None = Query(default=None),
     ) -> dict[str, Any]:
         """列出历史行程（默认记录顺序，支持分页；附带日期重叠信息）。
 
@@ -6375,7 +6397,9 @@ def create_app(model: Any = None) -> FastAPI:
         ``q`` 按路线 / 日期 / 目的过滤（与面板、CLI ``trips --query`` 同一
         口径：按空白拆词，全部词出现在五字段拼接文本中即命中，词序无关），
         ``status`` 按面板状态徽标过滤（active / upcoming / past ↔
-        进行中 / 即将出行 / 已结束），日期重叠仍按完整历史计算。
+        进行中 / 即将出行 / 已结束），日期重叠仍按完整历史计算。``today``
+        为面板上报的浏览器本地日期（与徽标同一函数），缺省用服务器本地
+        日期（CLI / 旧客户端不变）。
         """
         response.headers.update(_enforce_read_rate_limit(state, request))
         store = _open_long_term(user_id)
@@ -6387,7 +6411,7 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         trips = _filter_trips_by_query(all_trips, q)
-        trips = _filter_trips_by_status(trips, status)
+        trips = _filter_trips_by_status(trips, status, today)
         status_label = ""
         if status is not None:
             status_label = {
@@ -6521,7 +6545,10 @@ def create_app(model: Any = None) -> FastAPI:
                 store = _open_long_term(user_id, strict=True)
                 try:
                     return import_trips_from_text(
-                        store, payload.content, dry_run=dry_run
+                        store,
+                        payload.content,
+                        dry_run=dry_run,
+                        user_tz=payload.timezone,
                     )
                 finally:
                     _close_long_term(store)
@@ -6557,10 +6584,16 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             state.import_queue_slots.release()
         if not result["rows"]:
+            # CSV 标「第N行」（物理行号）、ICS 标「事件N」（事件序号）：
+            # 与 CLI / 前端共用同一 helper，不能让 ICS 的错误丢掉序号
             reasons = "；".join(
                 (
-                    f"第{item['line']}行：{item['reason']}"
-                    if result["format"] == "csv"
+                    f"{label}：{item['reason']}"
+                    if (
+                        label := trip_skip_label(
+                            item.get("line", 0), result["format"]
+                        )
+                    )
                     else str(item["reason"])
                 )
                 for item in result["skipped"][:5]
@@ -6699,12 +6732,23 @@ def create_app(model: Any = None) -> FastAPI:
         # 缺少出发日期的行程按既有语义跳过：用事件数反推跳过条数，前端
         # 据此提示，不能静默给出少行程的「全部日历」
         skipped = max(0, len(trips) - count_ics_events(content))
+        # 返程日期无法解析时事件按单日导出（日历里少几天）：与 CLI 同一
+        # 计数口径，经响应头告知面板，不能再静默截断
+        truncated_end = sum(1 for trip in trips if trip_ics_end_unparsable(trip))
+        # 回导自检：用真实导入解析器复核渲染结果（字段超长等会被导入端
+        # 拒绝），与 CLI trips-export 的告警同源
+        unimportable, _ = trip_export_roundtrip_problems(content, is_ics=True)
+        safe_user = _safe_filename(user_id, "user")
         return Response(
             content=content,
             media_type="text/calendar; charset=utf-8",
             headers={
-                "Content-Disposition": 'attachment; filename="aligo_trips.ics"',
+                "Content-Disposition": (
+                    f'attachment; filename="aligo_{safe_user}_trips.ics"'
+                ),
                 "X-Aligo-Export-Skipped": str(skipped),
+                "X-Aligo-Export-Truncated-End": str(truncated_end),
+                "X-Aligo-Export-Unimportable": str(unimportable),
                 **rate_headers,
             },
         )
@@ -6716,14 +6760,17 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
         q: str = Query(default="", max_length=100),
         status: Literal["active", "upcoming", "past"] | None = Query(default=None),
+        today: date | None = Query(default=None),
         format: Literal["csv", "html", "ics"] = Query(default="csv"),
     ) -> Response:
         """导出历史行程为 CSV（UTF-8 BOM）/ HTML 台账 / iCalendar 合集。
 
         ``q`` / ``status`` 与列表接口同一口径过滤后再导出（与面板筛选、
-        CLI ``trips-export --status`` 保持一致）；``format=html`` 与 CLI
-        ``trips-export --html``、``format=ics`` 与 CLI ``trips-export --ics``
-        同一渲染口径（ics 缺少出发日期的行程按既有语义跳过）。
+        CLI ``trips-export --status`` 保持一致）；``today`` 为面板上报的
+        浏览器本地日期（与状态徽标同口径，缺省用服务器本地日期）；
+        ``format=html`` 与 CLI ``trips-export --html``、``format=ics`` 与
+        CLI ``trips-export --ics`` 同一渲染口径（ics 缺少出发日期的行程
+        按既有语义跳过）。
         """
         rate_headers = _enforce_read_rate_limit(state, request)
         entry_epoch = _export_start_epoch(request, user_id)
@@ -6739,18 +6786,31 @@ def create_app(model: Any = None) -> FastAPI:
             _close_long_term(store)
         # 读完再确认：读取期间才开始（或已结束）的恢复同样让本次导出作废
         _reject_export_during_restore(request, user_id, entry_epoch)
-        filtered = _filter_trips_by_status(_filter_trips_by_query(trips, q), status)
+        filtered = _filter_trips_by_status(
+            _filter_trips_by_query(trips, q), status, today
+        )
+        safe_user = _safe_filename(user_id, "user")
         if format == "ics":
             # 与 CLI `trips-export --ics` 同一渲染：过滤后的行程合成一个
             # VCALENDAR（/api/trips/calendar 保留为不带筛选的旧入口）
             content = render_trips_ics(filtered, user_id)
             skipped = max(0, len(filtered) - count_ics_events(content))
+            truncated_end = sum(
+                1 for trip in filtered if trip_ics_end_unparsable(trip)
+            )
+            unimportable, _ = trip_export_roundtrip_problems(
+                content, is_ics=True
+            )
             return Response(
                 content=content,
                 media_type="text/calendar; charset=utf-8",
                 headers={
-                    "Content-Disposition": 'attachment; filename="aligo_trips.ics"',
+                    "Content-Disposition": (
+                        f'attachment; filename="aligo_{safe_user}_trips.ics"'
+                    ),
                     "X-Aligo-Export-Skipped": str(skipped),
+                    "X-Aligo-Export-Truncated-End": str(truncated_end),
+                    "X-Aligo-Export-Unimportable": str(unimportable),
                     **rate_headers,
                 },
             )
@@ -6759,15 +6819,24 @@ def create_app(model: Any = None) -> FastAPI:
                 content=render_trips_html(filtered, user_id),
                 media_type="text/html; charset=utf-8",
                 headers={
-                    "Content-Disposition": 'attachment; filename="aligo_trips.html"',
+                    "Content-Disposition": (
+                        f'attachment; filename="aligo_{safe_user}_trips.html"'
+                    ),
                     **rate_headers,
                 },
             )
+        content = render_trips_csv(filtered)
+        # 与 CLI trips-export 同一回导自检：日期非法 / 倒置、字段超长的行
+        # 导入时会被整行拒绝，导出侧必须提前暴露（只读解析，不改导出字节）
+        unimportable, _ = trip_export_roundtrip_problems(content, is_ics=False)
         return Response(
-            content=render_trips_csv(filtered),
+            content=content,
             media_type="text/csv; charset=utf-8",
             headers={
-                "Content-Disposition": 'attachment; filename="aligo_trips.csv"',
+                "Content-Disposition": (
+                    f'attachment; filename="aligo_{safe_user}_trips.csv"'
+                ),
+                "X-Aligo-Export-Unimportable": str(unimportable),
                 **rate_headers,
             },
         )
@@ -6878,13 +6947,21 @@ def create_app(model: Any = None) -> FastAPI:
         content = render_trip_ics(trip, user_id)
         if content is None:
             raise HTTPException(status_code=400, detail="该行程缺少出发日期，无法生成日历")
+        # 与批量导出同一契约：返程日期无法解析按单日导出、回导不可用
+        # 的数据都以响应头告知（单条事件的计数只有 0 / 1）
+        truncated_end = 1 if trip_ics_end_unparsable(trip) else 0
+        unimportable, _ = trip_export_roundtrip_problems(content, is_ics=True)
+        safe_user = _safe_filename(user_id, "user")
         return Response(
             content=content,
             media_type="text/calendar; charset=utf-8",
             headers={
                 "Content-Disposition": (
-                    f'attachment; filename="aligo_{_safe_filename(trip_id, "trip")}.ics"'
+                    f'attachment; filename="aligo_{safe_user}_'
+                    f'{_safe_filename(trip_id, "trip")}.ics"'
                 ),
+                "X-Aligo-Export-Truncated-End": str(truncated_end),
+                "X-Aligo-Export-Unimportable": str(unimportable),
                 **rate_headers,
             },
         )

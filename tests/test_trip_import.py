@@ -665,7 +665,12 @@ def test_ics_quoted_tzid_parameter_is_unquoted():
 
 
 def test_ics_roundtrip_unparsable_end_uses_machine_description():
-    """返程日期无法解析：DESCRIPTION 用 DTEND 的实际单日日期，回导走机器段。"""
+    """返程日期无法解析：X-ALIGO-TRIP-END 保真回导，身份与原行闭合。
+
+    日历事件本身仍按单日（DTEND=出发日+1）导出；DESCRIPTION 机器段继续
+    写单日日期以兼容旧导入器，但新的导入器优先采用 X 属性里的原始值，
+    否则同账号回导会按新身份重复新增行程。
+    """
     trip = {
         "trip_id": "t-bad-end",
         "origin": "",
@@ -675,6 +680,8 @@ def test_ics_roundtrip_unparsable_end_uses_machine_description():
         "purpose": "出差",
     }
     text = render_trips_ics([trip], "u1")
+    assert "X-ALIGO-TRIP-END:待定" in text
+    assert "DTEND;VALUE=DATE:20261206" in text, "日历仍按单日导出"
     rows, errors = parse_trips_ics(text)
     assert errors == [], errors
     assert len(rows) == 1, rows
@@ -682,9 +689,86 @@ def test_ics_roundtrip_unparsable_end_uses_machine_description():
     assert rows[0]["origin"] == "", rows[0]
     assert rows[0]["destination"] == "上海", rows[0]
     assert rows[0]["start_date"] == "2026-12-05"
-    assert rows[0]["end_date"] == "2026-12-05", "返程按 DTEND 的单日口径回导"
+    assert rows[0]["end_date"] == "待定", "原始返程日期经 X 属性保真回导"
     assert rows[0]["purpose"] == "出差"
-    print("✓ 无法解析的返程日期往返后身份一致（不退化为 SUMMARY 回退）")
+    from utils.trip_import import trip_identity
+
+    assert trip_identity(rows[0]) == trip_identity(trip), "往返身份必须闭合"
+    print("✓ 无法解析的返程日期经 X 属性往返（身份闭合，日历仍单日）")
+
+
+def test_ics_old_file_without_x_attr_falls_back():
+    """旧导出文件（无 X-ALIGO-TRIP-END）行为不变：回导为单日。"""
+    trip = {
+        "trip_id": "t-bad-end2",
+        "origin": "",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "待定",
+        "purpose": "出差",
+    }
+    text = render_trips_ics([trip], "u1")
+    lines = [
+        line
+        for line in text.replace("\r\n ", "").split("\r\n")
+        if not line.startswith("X-ALIGO-TRIP-END:")
+    ]
+    rows, errors = parse_trips_ics("\r\n".join(lines))
+    assert errors == [], errors
+    assert rows[0]["end_date"] == "2026-12-05", rows
+    print("✓ 旧导出文件无 X 属性时回导为单日（向后兼容）")
+
+
+def test_ics_calendar_dtend_only_edit_is_honored():
+    """外部日历只改 DTEND：以事件日期为准，旧机器段不能把改期回滚。"""
+    trip = {
+        "trip_id": "t-edit",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-07",
+        "purpose": "出差",
+    }
+    text = render_trips_ics([trip], "u1")
+    extended = text.replace(
+        "DTEND;VALUE=DATE:20261208", "DTEND;VALUE=DATE:20261211"
+    )
+    rows, errors = parse_trips_ics(extended)
+    assert errors == [] and rows[0]["end_date"] == "2026-12-10", rows
+    shortened = text.replace(
+        "DTEND;VALUE=DATE:20261208", "DTEND;VALUE=DATE:20261207"
+    )
+    rows, errors = parse_trips_ics(shortened)
+    assert errors == [] and rows[0]["end_date"] == "2026-12-06", rows
+    print("✓ 日历端只改 DTEND 的编辑被尊重（机器段不再回滚）")
+
+
+def test_ics_dirty_dates_use_x_attribute_only_when_needed():
+    """X 属性仅承载真正无法解析的日期；旧式脏 end<start 仍由机器段闭合。"""
+    slash = {
+        "trip_id": "t-slash-end",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026/12/20",
+    }
+    text = render_trips_ics([slash], "u1")
+    assert "X-ALIGO-TRIP-END" not in text, "可解析的斜杠日期不需要 X 属性"
+    from utils.trip_import import trip_identity
+
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert trip_identity(rows[0]) == trip_identity(slash), rows
+    # 形态合法但日历非法的日期（2026-13-40）同样进 X 属性：机器段的
+    # 严格日期闸门不会采用它，只有 X 能让身份闭合
+    impossible = dict(slash, trip_id="t-impossible", end_date="2026-13-40")
+    text2 = render_trips_ics([impossible], "u1")
+    assert "X-ALIGO-TRIP-END:2026-13-40" in text2
+    rows, errors = parse_trips_ics(text2)
+    assert errors == [], errors
+    assert rows[0]["end_date"] == "2026-13-40", rows
+    assert trip_identity(rows[0]) == trip_identity(impossible), rows
+    print("✓ 可解析的旧格式日期不产生 X 属性且身份闭合；非法日历日期经 X 闭合")
 
 
 def test_ics_empty_origin_roundtrip():
@@ -815,6 +899,237 @@ def test_csv_error_line_numbers_physical():
     assert len(rows) == 1
     assert errors == [(4, "出发日期格式应为 YYYY-MM-DD：2026-13-01")], errors
     print("✓ CSV 报错行号为物理行号")
+
+
+def test_csv_preserves_text_whitespace_and_trims_dates():
+    """文本字段保留首尾空白（身份保真）；日期字段先去空白再解析。"""
+    text = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        " 北京 , 上海 , 2026-12-01 ,2026-12-02, 出差 \n"
+    )
+    rows, errors = parse_trips_csv(text)
+    assert errors == [], errors
+    row = rows[0]
+    assert row["origin"] == " 北京 ", repr(row["origin"])
+    assert row["destination"] == " 上海 ", repr(row["destination"])
+    assert row["purpose"] == " 出差 ", repr(row["purpose"])
+    assert row["start_date"] == "2026-12-01"
+    # 纯空白的文本字段仍按空处理：目的地为空报错、目的归 None
+    rows, errors = parse_trips_csv(
+        "出发地,目的地,出发日期,目的\n北京,   ,2026-12-01,   \n"
+    )
+    assert rows == [] and errors[0][1] == "目的地为空", errors
+    rows, errors = parse_trips_csv(
+        "目的地,出发日期,目的\n上海,2026-12-01,   \n"
+    )
+    assert errors == [] and rows[0]["purpose"] is None, rows
+    print("✓ CSV 文本字段保真、空白归一、日期去空白")
+
+
+def test_csv_balanced_misquote_merge_warns():
+    """错位引号被后文引号闭合：仍导入但必须给出跨行告警。"""
+    from utils.trip_import import import_trips_from_text
+
+    text = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        '广州,"深圳,2026-12-02\n北京,上海",2026-12-03,2026-12-03,会议\n'
+    )
+    rows, errors = parse_trips_csv(text)
+    assert len(rows) == 1 and errors == [], (rows, errors)
+    warns = getattr(errors, "warnings")
+    assert warns.total == 1 and warns[0][0] == 2, list(warns)
+    store = _ImportStore()
+    result = import_trips_from_text(store, text)
+    assert result["skipped_total"] == 0, "告警不改变跳过计数"
+    assert result["warnings_total"] == 1
+    assert result["warnings"][0]["line"] == 2
+    # 合法多行目的不产生告警
+    ok_text = (
+        "出发地,目的地,出发日期,目的\n"
+        '北京,上海,2026-12-01,"第一行\n第二行"\n'
+    )
+    _, ok_errors = parse_trips_csv(ok_text)
+    assert getattr(ok_errors, "warnings").total == 0
+    print("✓ 跨行错位引号告警（不拦截合法多行目的）")
+
+
+def test_csv_unclosed_quote_reports_record_start_and_lost_lines():
+    """未闭合引号吞掉文件尾部：行号指向记录起点，按丢失物理行计数。"""
+    text = (
+        "出发地,目的地,出发日期,返程日期,目的\n"
+        "北京,上海,2026-12-01,2026-12-01,会议\n"
+        '广州,"深圳,2026-12-02,2026-12-02,会议\n'
+        "杭州,苏州,2026-12-03,2026-12-03,会议\n"
+        "南京,无锡,2026-12-04,2026-12-04,会议\n"
+    )
+    rows, errors = parse_trips_csv(text)
+    assert len(rows) == 1, "前缀有效行必须保留"
+    assert errors.total == 3, errors.total
+    assert errors[0][0] == 3, errors
+    assert "引号未闭合" in errors[0][1] and "3 个物理行" in errors[0][1], errors
+    print("✓ 未闭合引号报记录起点并按丢失物理行计入跳过总数")
+
+
+def test_parse_header_case_insensitive_and_skips_blank_lines():
+    """英文表头不区分大小写；表头前空行 / BOM 不再误报「缺少必需列」。"""
+    text = (
+        "\n \nOrigin,Destination,Start_Date,End_Date,Purpose\n"
+        "北京,上海,2026-12-01,2026-12-02,会议\n"
+    )
+    rows, errors = parse_trips_csv(text)
+    assert errors == [] and len(rows) == 1, (rows, errors)
+    assert rows[0]["destination"] == "上海"
+    text2 = (
+        "﻿\n\n出发地,目的地,出发日期\n"
+        "北京,上海,2026-12-01\n"
+        "北京,广州,2026-13-01,,\n"
+    )
+    rows2, errors2 = parse_trips_csv(text2)
+    assert len(rows2) == 1, rows2
+    assert errors2[0][0] == 5, errors2
+    rows3, errors3 = parse_trips_csv("From,To,Date\n北京,上海,2026-12-01\n")
+    assert rows3 == [] and errors3[0][0] == 1
+    assert "缺少必需列" in errors3[0][1] and "实际表头" in errors3[0][1], errors3
+    rows4, errors4 = parse_trips_csv("﻿\n\n")
+    assert rows4 == [] and errors4[0][1] == "文件为空"
+    print("✓ 表头大小写 / 前导空行 / 缺列回显 / 全空白文件")
+
+
+def test_ics_user_timezone_conversion():
+    """面板上报的浏览器时区决定定时事件取日期（与 CLI 本机时区同口径）。"""
+    text = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+        "BEGIN:VEVENT\r\nUID:x\r\nDTSTART:20261110T233000Z\r\n"
+        "SUMMARY:北京 → 上海（会议）\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    rows, errors = parse_trips_ics(text, user_tz="Asia/Shanghai")
+    assert errors == [] and rows[0]["start_date"] == "2026-11-11", rows
+    rows, errors = parse_trips_ics(text, user_tz="UTC")
+    assert errors == [] and rows[0]["start_date"] == "2026-11-10", rows
+    tzid_text = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+        "BEGIN:VEVENT\r\nUID:y\r\n"
+        "DTSTART;TZID=Asia/Shanghai:20261111T073000\r\n"
+        "SUMMARY:北京 → 上海（会议）\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    rows, errors = parse_trips_ics(tzid_text, user_tz="UTC")
+    assert errors == [] and rows[0]["start_date"] == "2026-11-10", rows
+    # 非法时区回退本机时区，不能中断导入
+    rows, errors = parse_trips_ics(text, user_tz="Not/AZone")
+    assert errors == [] and rows[0]["start_date"].startswith("2026-11-")
+    print("✓ ICS 导入按浏览器时区换算定时事件日期")
+
+
+def test_parse_ics_row_limit_can_be_disabled_for_export_roundtrip():
+    """只读导出自检可解析超过单次导入上限的全量 ICS，默认上限不变。"""
+    events = "".join(
+        "BEGIN:VEVENT\r\nUID:%d\r\nDTSTART;VALUE=DATE:20261201\r\n"
+        "SUMMARY:北京 → 上海（会议）\r\nEND:VEVENT\r\n" % index
+        for index in range(5001)
+    )
+    text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + events + "END:VCALENDAR\r\n"
+    rows, errors = parse_trips_ics(text, max_rows=None)
+    assert len(rows) == 5001 and errors == []
+    with pytest.raises(ValueError):
+        parse_trips_ics(text)
+    print("✓ ICS 解析行数上限可显式关闭（默认仍 5000）")
+
+
+def test_trip_skip_label_and_roundtrip_counts():
+    """跳过标签格式区分物理行 / 事件序号；回导自检计数与导入端一致。"""
+    from utils.trip_export import render_trips_csv, render_trips_ics
+    from utils.trip_import import trip_export_roundtrip_problems, trip_skip_label
+
+    assert trip_skip_label(3, "csv") == "第3行"
+    assert trip_skip_label(2, "ics") == "事件2"
+    assert trip_skip_label(0, "ics") == ""
+    assert trip_skip_label("x", "csv") == "第0行"
+    bad = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-01",
+        }
+    ]
+    total, errors = trip_export_roundtrip_problems(
+        render_trips_csv(bad), is_ics=False
+    )
+    assert total == 1 and errors, (total, errors)
+    long_trip = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-06",
+            "purpose": "A" * 150,
+        }
+    ]
+    total_ics, _ = trip_export_roundtrip_problems(
+        render_trips_ics(long_trip, "u1"), is_ics=True
+    )
+    assert total_ics == 1, total_ics
+    total_empty, _ = trip_export_roundtrip_problems(
+        render_trips_ics([], "u1"), is_ics=True
+    )
+    assert total_empty == 0
+    print("✓ 跳过标签格式 / 导出回导自检计数")
+
+
+def test_ics_unparsable_end_roundtrip_no_duplicate_real_store():
+    """真实存储：脏返程日期导出 ICS 再导入只更新、不重复新增。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_import import import_trips_from_text
+
+    store = LongTermMemory("u-x-roundtrip", tempfile.mkdtemp())
+    store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "待定",
+                "purpose": "会议",
+            }
+        ]
+    )
+    text = render_trips_ics(store.get_trip_history(limit=None), "u-x-roundtrip")
+    result = import_trips_from_text(store, text)
+    assert result["created"] == 0 and result["updated"] == 1, result
+    trips = store.get_trip_history(limit=None)
+    assert len(trips) == 1 and trips[0]["end_date"] == "待定", trips
+    assert store.data["statistics"]["total_trips"] == 1
+    print("✓ 脏返程日期 ICS 往返不再重复新增（真实存储）")
+
+
+def test_slash_date_roundtrip_no_duplicate_real_store():
+    """真实存储：斜杠旧格式日期导出 CSV / ICS 再导入只更新、不丢行。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_export import render_trips_csv
+    from utils.trip_import import import_trips_from_text
+
+    store = LongTermMemory("u-slash-roundtrip", tempfile.mkdtemp())
+    store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026/3/12",
+                "end_date": "2026/3/13",
+                "purpose": "会议",
+            }
+        ]
+    )
+    trips = store.get_trip_history(limit=None)
+    for text in (render_trips_csv(trips), render_trips_ics(trips, "u-slash-roundtrip")):
+        result = import_trips_from_text(store, text)
+        assert result["created"] == 0 and result["updated"] == 1, result
+    assert len(store.get_trip_history(limit=None)) == 1
+    print("✓ 斜杠旧格式日期 CSV / ICS 往返不新建重复行程")
 
 
 def test_runner_imports_ics_and_dedupes(monkeypatch):
@@ -1358,6 +1673,9 @@ if __name__ == "__main__":
     test_ics_structure_errors_do_not_duplicate_events()
     test_ics_quoted_tzid_parameter_is_unquoted()
     test_ics_roundtrip_unparsable_end_uses_machine_description()
+    test_ics_old_file_without_x_attr_falls_back()
+    test_ics_calendar_dtend_only_edit_is_honored()
+    test_ics_dirty_dates_use_x_attribute_only_when_needed()
     test_ics_empty_origin_roundtrip()
     test_ics_datetime_offset_converts_local_date()
     test_trip_identity_normalizes_unpadded_dates()
@@ -1373,6 +1691,15 @@ if __name__ == "__main__":
     test_ics_regex_scan_is_bounded()
     test_csv_formula_guard_roundtrip()
     test_csv_error_line_numbers_physical()
+    test_csv_preserves_text_whitespace_and_trims_dates()
+    test_csv_balanced_misquote_merge_warns()
+    test_csv_unclosed_quote_reports_record_start_and_lost_lines()
+    test_parse_header_case_insensitive_and_skips_blank_lines()
+    test_ics_user_timezone_conversion()
+    test_parse_ics_row_limit_can_be_disabled_for_export_roundtrip()
+    test_trip_skip_label_and_roundtrip_counts()
+    test_ics_unparsable_end_roundtrip_no_duplicate_real_store()
+    test_slash_date_roundtrip_no_duplicate_real_store()
     for case in (
         test_runner_imports_and_dedupes,
         test_runner_dry_run_preview,
