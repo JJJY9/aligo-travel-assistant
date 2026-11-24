@@ -419,6 +419,11 @@ def test_knowledge_dedupe_panel_states():
     assert applied["hidden"] is False, "清理结果必须真实可见（结果条此前可能是 hidden）"
     assert applied["requests"] == 4, "dry-run + 删除各一次"
     assert applied["button"] == "清理重复"
+    assert applied["editing"] is None, (
+        "正在编辑的片段被清理后必须退出编辑态（否则保存永远 404）"
+    )
+    assert applied["submit"] == "添加片段", applied
+    assert applied["chip_refreshes"] >= 1, "清理后知识库状态 chip 也要刷新"
 
     error = results["error"]
     assert error["text"] == "清理重复失败：boom"
@@ -895,6 +900,27 @@ def test_user_backup_restore_reports_recovery_incomplete():
     print("✓ 恢复完成度提示与错误分支接入 toast")
 
 
+def test_kb_panel_fixes():
+    """知识库面板：刷新失败保留列表 / 语义同值输入退出模式 / 预览零导入 /
+    只改分类再点编辑要确认。"""
+    data = _run_harness("kbPanelFixes")
+    keep = data["refresh_keep"]
+    assert keep["items"] == [11, 12], keep
+    assert keep["text"] == "", "刷新失败不能把已渲染列表替换成错误文本"
+    assert keep["toasts"] == [], "静默刷新失败不弹 toast"
+    toasts = data["refresh_toast"]
+    assert toasts and "导入进行中" in toasts[-1], toasts
+    assert data["semantic_exit"]["mode"] is False, data
+    assert data["semantic_exit"]["showingSemantic"] is False, data
+    assert data["semantic_exit"]["requests"], "退出语义模式必须刷新关键词列表"
+    zero = data["preview_zero"]
+    assert zero["imports"] == 0, "would_import=0 时不应再分批上传"
+    assert any("没有需要导入" in toast for toast in zero["toasts"]), zero
+    guard = data["category_guard"]
+    assert guard["confirms"] == 1, "只改分类也要弹覆盖确认"
+    print("✓ 知识库面板刷新 / 语义模式 / 预览 / 分类草稿守卫")
+
+
 def test_upcoming_weather_normalizes_unpadded_start_date():
     """历史未补零出发日期也要命中预报行，而不是退回今日。"""
     results = _run_harness("upcomingWeather")
@@ -939,6 +965,7 @@ if __name__ == "__main__":
     test_frontend_render_helpers()
     test_knowledge_duplicates_panel_states()
     test_knowledge_dedupe_panel_states()
+    test_kb_panel_fixes()
     test_knowledge_actions_arbitrate_shared_result_bar()
     test_trip_import_file_decoding_and_size_guard()
     test_trips_export_button_uses_filtered_ics_endpoint()

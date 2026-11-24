@@ -3474,7 +3474,7 @@ def test_import_whole_group_fails_closed_on_layout_error(monkeypatch):
 
 
 def test_import_rejects_out_of_range_part_numbers(monkeypatch):
-    """part 0 / 超出 parts 声明的分片整组拒绝，不拼进正文重排编号。"""
+    """part 0 / 负数 / 超出 parts 声明的分片整组拒绝，不拼进正文重排编号。"""
     from pathlib import Path
 
     monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
@@ -3496,7 +3496,63 @@ def test_import_rejects_out_of_range_part_numbers(monkeypatch):
     result = knowledge_admin.import_documents(documents, dry_run=True)
     assert result["would_import"] == 0, result
     assert "part 编号非法" in result["skipped_groups"][0]["reason"]
-    print("✓ 越界 / 缺失 part 编号整组拒绝")
+
+    # 负数编号：此前 `not part_no or part_no > declared` 放行负值，-1 会按
+    # 排序拼到正文最前并整体重排编号（内容顺序错乱）
+    documents = [
+        {"content": "甲", "metadata": {"group": "G", "part": "-1", "parts": "2"}},
+        {"content": "乙", "metadata": {"group": "G", "part": "2", "parts": "2"}},
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["would_import"] == 0, result
+    assert "part 编号非法" in result["skipped_groups"][0]["reason"]
+    print("✓ 越界 / 缺失 / 负数 part 编号整组拒绝")
+
+
+def test_update_document_rejects_stale_snapshot(monkeypatch):
+    """乐观并发：快照与库内当前状态不一致时拒绝，不静默覆盖 / 删未见分片。"""
+    from pathlib import Path
+
+    from utils.knowledge_admin import DocumentConflictError
+
+    # 内容轴：库内已是「新内容」，客户端载入的快照仍是「旧内容」
+    fake_client = _FakeMilvusClient(
+        [{"id": 7, "content": "新内容", "metadata": "{}"}]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    # 冲突在写入前抛出：agent 不应被真正调用
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: object())
+
+    with pytest.raises(DocumentConflictError):
+        knowledge_admin.update_document(
+            7, "旧内容加我的修改", expect_content="旧内容"
+        )
+    assert [row["content"] for row in fake_client.rows] == ["新内容"]
+
+    # 结构轴：客户端快照是单片，库内已被另一会话改成多分片组——
+    # 若不拒绝，整组替换会删掉本页从未见过的分片
+    fake_group = _FakeMilvusClient(
+        [
+            {
+                "id": 7,
+                "content": "甲",
+                "metadata": '{"group": "g1", "part": "1", "parts": "2"}',
+            },
+            {
+                "id": 8,
+                "content": "乙",
+                "metadata": '{"group": "g1", "part": "2", "parts": "2"}',
+            },
+        ]
+    )
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_group)
+    with pytest.raises(DocumentConflictError):
+        knowledge_admin.update_document(
+            7, "甲改", expect_content="甲", expect_parts=1
+        )
+    assert sorted(row["id"] for row in fake_group.rows) == [7, 8]
+    print("✓ 过期快照（内容 / 分片结构）在写入前被拒绝")
 
 
 def test_import_fast_path_runs_under_read_lock(monkeypatch):
@@ -3619,6 +3675,7 @@ if __name__ == "__main__":
         test_import_layout_scan_failure_skips_group,
         test_import_whole_group_fails_closed_on_layout_error,
         test_import_rejects_out_of_range_part_numbers,
+        test_update_document_rejects_stale_snapshot,
         test_import_fast_path_runs_under_read_lock,
         test_get_document_group_batches_id_queries,        test_existing_contents_scans_all_rows,
         test_import_skips_fully_existing_group,

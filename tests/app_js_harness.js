@@ -519,6 +519,7 @@ async function scenarioDedupe(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
   run("__kbRefreshes = 0; refreshKnowledgeDocuments = async () => { __kbRefreshes += 1; };");
+  run("__kbChipRefreshes = 0; refreshKnowledge = async () => { __kbChipRefreshes += 1; };");
   run(
     "__confirmResult = true; __confirmCalls = 0; confirm = () => { __confirmCalls += 1; return __confirmResult; };"
   );
@@ -547,8 +548,14 @@ async function scenarioDedupe(source) {
     confirm_calls: run("__confirmCalls"),
   };
 
-  // 确认执行：dry-run + 删除；期间库内变化（计划 2 → 3）+ 跳过 + 失败
-  run("__confirmResult = true; __confirmCalls = 0;");
+  // 确认执行：dry-run + 删除；期间库内变化（计划 2 → 3）+ 跳过 + 失败；
+  // 正在编辑的片段被清理：必须退出编辑态（否则「保存修改」永远 404）
+  run(`
+    __confirmResult = true; __confirmCalls = 0;
+    state.kbEditingId = 12;
+    state.kbEditBaseline = "待编辑";
+    els.kbSubmit.textContent = "保存修改";
+  `);
   promise = run("runKbDedupe()");
   await tick();
   env.__requests[2].resolve({ planned: 2, groups: 1, removed: 0, failed: [] });
@@ -559,6 +566,7 @@ async function scenarioDedupe(source) {
     removed: 1,
     skipped: [{ id: 12, reason: "片段不存在或已被删除" }],
     failed: [{ id: 11, error: "x" }],
+    plan: [{ keep: 11, remove: [12] }],
   });
   await promise;
   results.applied = {
@@ -567,6 +575,9 @@ async function scenarioDedupe(source) {
     hidden: run("els.kbEvalResult.hidden"),
     requests: run("__requests.length"),
     button: run("els.kbDedupe.textContent"),
+    editing: run("state.kbEditingId"),
+    submit: run("els.kbSubmit.textContent"),
+    chip_refreshes: run("__kbChipRefreshes"),
   };
 
   // 删除期间用户点了「查重复 / 评测」：结果条被新动作占用，但删除已发生，
@@ -600,6 +611,160 @@ async function scenarioDedupe(source) {
     button: run("els.kbDedupe.textContent"),
     disabled: run("els.kbDedupe.disabled"),
   };
+  return results;
+}
+
+async function scenarioKbPanelFixes(source) {
+  // 知识库面板：刷新失败保留列表 / 语义同值输入退出模式 / 预览零导入 /
+  // 只改分类再次点编辑要确认
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  run(`
+    const makeField = () => ({
+      value: "",
+      hidden: false,
+      textContent: "",
+      placeholder: "",
+      handlers: {},
+      addEventListener(type, fn) {
+        (this.handlers[type] = this.handlers[type] || []).push(fn);
+      },
+      dispatch(type, event) {
+        (this.handlers[type] || []).forEach((fn) => fn(event || {}));
+      },
+      focus() {},
+      setSelectionRange() {},
+      querySelectorAll: () => [],
+    });
+    els.memorySheet.hidden = false;
+    els.kbSearch = makeField();
+    els.kbContent = makeField();
+    els.kbCategory = makeField();
+    els.kbSubmit = makeField();
+    els.kbCancel = makeField();
+    els.kbList = {
+      textContent: "",
+      innerHTML: "",
+      scrollTop: 140,
+      appendChild() {},
+      focus() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    els.kbMore = {
+      hidden: true,
+      disabled: false,
+      addEventListener() {},
+      focus() {},
+    };
+    state.userId = "u1";
+    state.kbItems = [11, 12];
+    state.kbOffset = 2;
+    state.kbTotal = 2;
+    state.kbLoadedQuery = "";
+    state.kbLoadedCategory = "";
+    renderKnowledgeDocuments = (items, append) => {
+      state.kbItems = append ? state.kbItems.concat(items) : items.slice();
+      if (!append) state.kbShowingSemantic = false;
+    };
+    refreshKnowledgeCategories = () => {};
+    refreshKnowledge = async () => {};
+    globalThis.__kbChipRefreshes = 0;
+    setTimeout = (cb) => {
+      try {
+        cb();
+      } catch (_) {
+        // 调度内的异常由用例自身的状态断言暴露
+      }
+      return 0;
+    };
+    bindEvents();
+  `);
+
+  // 1) 刷新遇到 503（导入写锁）：保留已渲染列表；静默刷新不弹 toast
+  run(`
+    __toasts.length = 0;
+    getJSON = async () => {
+      const error = new Error("知识库正在写入（导入进行中），请稍后重试");
+      error.status = 503;
+      throw error;
+    };
+  `);
+  await run("refreshKnowledgeDocuments({ silentFailure: true })");
+  results.refresh_keep = run(
+    "({ items: state.kbItems.slice(), text: els.kbList.textContent, toasts: __toasts.slice() })",
+  );
+  await run("refreshKnowledgeDocuments()");
+  results.refresh_toast = run("__toasts.slice()");
+
+  // 2) 语义模式下输入同值：退出语义模式并刷新关键词列表（不能停在语义 DOM）
+  run(`
+    __toasts.length = 0;
+    state.kbSemanticMode = true;
+    state.kbSemanticQuery = "foo";
+    state.kbQuery = "foo";
+    state.kbShowingSemantic = true;
+    els.kbSearch.value = "foo";
+    globalThis.__kbRequests = [];
+    getJSON = async (url) => {
+      __kbRequests.push(url);
+      return { total: 0, items: [] };
+    };
+  `);
+  run('els.kbSearch.dispatch("input", {});');
+  await tick();
+  results.semantic_exit = run(
+    "({ mode: state.kbSemanticMode, requests: __kbRequests.slice(), showingSemantic: state.kbShowingSemantic })",
+  );
+
+  // 3) 导入预览 would_import=0：确认框不再出现、也不分批上传
+  run(`
+    __toasts.length = 0;
+    globalThis.__importCalls = 0;
+    confirm = () => true;
+    els.kbImport = { disabled: false, textContent: "", addEventListener() {} };
+    els.kbImportFile = {
+      value: "",
+      files: [{
+        size: 64,
+        arrayBuffer: async () =>
+          new TextEncoder().encode('{"documents":[{"content":"已存在"}]}').buffer,
+      }],
+    };
+    getJSON = async (url) => {
+      if (url.startsWith("/api/knowledge/import/preview")) {
+        return { would_import: 0, skipped: 1, skipped_duplicate: 1 };
+      }
+      __importCalls += 1;
+      return { imported: 0, skipped: 0 };
+    };
+  `);
+  await run("importKnowledgeFile()");
+  results.preview_zero = run(
+    "({ toasts: __toasts.slice(), imports: __importCalls })",
+  );
+
+  // 4) 只改分类、正文未动时再次点同一行编辑：必须弹覆盖确认
+  run(`
+    __toasts.length = 0;
+    globalThis.__confirmCalls = 0;
+    confirm = () => {
+      __confirmCalls += 1;
+      return true;
+    };
+    state.kbEditingId = 5;
+    state.kbEditBaseline = "原始内容";
+    state.kbEditingMetadata = { category: "旧分类" };
+    els.kbContent.value = "原始内容";
+    els.kbCategory.value = "新分类";
+  `);
+  await run(
+    'startEditKnowledge({ id: 5, content: "原始内容", metadata: { category: "旧分类" } })',
+  );
+  results.category_guard = run(
+    "({ confirms: __confirmCalls, category: els.kbCategory.value })",
+  );
   return results;
 }
 
@@ -2887,6 +3052,8 @@ async function main() {
     payload = await scenarioEval(source);
   } else if (scenario === "dedupe") {
     payload = await scenarioDedupe(source);
+  } else if (scenario === "kbPanelFixes") {
+    payload = await scenarioKbPanelFixes(source);
   } else if (scenario === "arbitrate") {
     payload = await scenarioArbitrate(source);
   } else if (scenario === "decode") {

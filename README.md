@@ -648,7 +648,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
-| PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404；带 `group` 的多分片记录按整组替换，内容上限 20000 字） |
+| PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404；带 `group` 的多分片记录按整组替换，内容上限 20000 字；可选 `expect` / `expect_parts` / `expect_group` 传入编辑时载入的快照，另一会话已修改时返回 409 而不是静默覆盖） |
 | GET | `/api/knowledge/documents/{id}/group` | 返回片段所属整篇文档（多分片按 `part` 拼接），供面板「编辑整份文档」回填 |
 | GET | `/api/knowledge/categories` | 知识片段分类统计（维护面板筛选下拉框） |
 | GET | `/api/knowledge/search` | 语义检索知识片段（`q` / `top_k`，返回相似度） |

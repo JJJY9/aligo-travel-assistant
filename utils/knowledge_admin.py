@@ -714,10 +714,26 @@ def _locked_user_snapshot(
     return "".join(text for _, text in pieces), user_meta
 
 
+class DocumentConflictError(ValueError):
+    """编辑冲突：客户端载入的版本与服务端当前状态不一致（并发修改）。"""
+
+
 def update_document(
-    doc_id: int, content: str, metadata: dict[str, str] | None = None
+    doc_id: int,
+    content: str,
+    metadata: dict[str, str] | None = None,
+    *,
+    expect_content: str | None = None,
+    expect_parts: int | None = None,
+    expect_group: str | None = None,
 ) -> dict[str, Any]:
     """按 id 覆盖更新知识片段（重新嵌入）；长内容其余分片以新记录追加。
+
+    ``expect_content`` / ``expect_parts`` / ``expect_group`` 为客户端进入
+    编辑时载入的快照（乐观并发）：写锁内与服务端当前状态比对，不一致
+    抛 :class:`DocumentConflictError`（Web 映射 409）——两个标签页同时
+    编辑同一条目时，后保存者不会静默覆盖对方的修改，也不会在快照为
+    单片、实际已被改成多分片时整组替换并删掉用户从未见过的分片。
 
     新拆分（带 group 元数据）的多分片记录按「整组替换」处理：先写新分片、
     再覆盖目标分片，最后删除同组的其余旧分片。顺序保证任一前缀失败时
@@ -787,6 +803,20 @@ def update_document(
                 f"该片段属于多分片知识内容（共 {existing_parts} 段），"
                 "暂不支持单条编辑：请删除整组后重新添加，避免旧分片残留"
             )
+        # 乐观并发（结构轴）：客户端快照与服务端当前分片结构不一致时拒绝。
+        # 典型：另一标签页已把该片段改成多分片文档，本页仍按单片快照保存——
+        # 服务端会按整组替换删掉本页从未看到的分片
+        if expect_parts is not None and int(existing_parts) != int(expect_parts):
+            raise DocumentConflictError(
+                "知识片段已被其他会话修改（分片结构已变化），请刷新后重试"
+            )
+        if (
+            expect_group is not None
+            and str(expect_group).strip() != str(group or "")
+        ):
+            raise DocumentConflictError(
+                "知识片段已被其他会话修改（所属文档分组已变化），请刷新后重试"
+            )
         # 原样保存（内容与回填完全一致、元数据未变）直接返回：重新切片会把
         # 空行 / 换行合并（排版逐渐劣化、分片边界变化），还白白重建分片与
         # 向量；面板「不做修改直接保存」应是 no-op
@@ -797,6 +827,16 @@ def update_document(
                 "id": int(doc_id),
                 "unchanged": True,
             }
+        # 乐观并发（内容轴）：本页载入的正文已不是库内当前正文，说明别的
+        # 会话改过——即使本页只改了分类，也不能用旧正文覆盖对方修改
+        if (
+            expect_content is not None
+            and snapshot is not None
+            and expect_content.strip() != snapshot[0]
+        ):
+            raise DocumentConflictError(
+                "知识片段已在其他会话被修改，请刷新后重新编辑"
+            )
         # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
         # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
         old_ids: list[int] = []
@@ -988,9 +1028,10 @@ def _merge_exported_group(
         return None, 0
     if declared:
         for part_no in part_numbers:
-            if not part_no or part_no > declared:
-                # 缺少编号 / 超出声明（part 0 或 5/parts=2）会把多余分片
-                # 当正文拼入并整体重排编号，与 user_import 的整组校验同口径
+            if part_no < 1 or part_no > declared:
+                # 缺少编号 / 负数 / 超出声明（part 0、-1 或 5/parts=2）会把
+                # 多余分片当正文拼入并整体重排编号，与 user_import 的整组
+                # 校验同口径
                 raise ValueError(
                     f"备份中的多分片文档 part 编号非法（group={key}，"
                     f"part={part_no}，parts={declared}）：请检查导出源后重新导出"
