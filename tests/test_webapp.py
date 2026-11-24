@@ -1148,6 +1148,212 @@ def test_leased_streaming_response_settles_after_drain():
     print("✓ 流式响应在 drain 之后执行收尾回调")
 
 
+def test_stream_abort_flag_recorded_as_499():
+    """流式断连（终态未送达）由响应包装器打标：日志 / 指标记 499、不计耗时。"""
+    from utils.metrics import REQUEST_METRICS
+    from webapp.server import RequestContextMiddleware
+
+    REQUEST_METRICS.reset()
+
+    async def stream_app(scope, receive, send):
+        scope.setdefault("state", {})["aligo_stream_aborted"] = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"data: {}\n\n"})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = RequestContextMiddleware(stream_app)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        await asyncio.sleep(0)
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/chat/stream",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+    asyncio.run(middleware(scope, receive, send))
+    snapshot = REQUEST_METRICS.snapshot()
+    assert snapshot["by_status"].get("499") == 1, snapshot
+    assert "200" not in snapshot["by_status"], snapshot
+    assert snapshot["duration_samples"] == 0, "499 不能计入耗时分位"
+    assert any(m.get("type") == "http.response.start" for m in sent)
+    REQUEST_METRICS.reset()
+    print("✓ 流式断连标记记 499（线上保持 200）")
+
+
+def test_leased_streaming_abort_flags_and_closes_generator():
+    """send 抛错（断连）时：显式关闭生成器、打断连标记、租约照常释放。"""
+    from webapp.server import _LeasedStreamingResponse
+
+    events: list[str] = []
+
+    class _Lease:
+        async def stop_turn(self):
+            events.append("stop")
+
+        def after_stop(self):
+            events.append("after")
+
+        def release(self):
+            events.append("release")
+
+    async def body():
+        try:
+            yield b"data: {}\n\n"
+            yield b"data: {}\n\n"
+        finally:
+            events.append("closed")
+
+    async def _run():
+        state = {"turn_started": True, "terminal_delivered": False}
+        response = _LeasedStreamingResponse(body(), _Lease(), stream_state=state)
+        sent: list[dict] = []
+
+        async def send(message):
+            if message.get("type") == "http.response.body" and message.get("body"):
+                if sent:
+                    raise OSError("broken pipe")
+            sent.append(message)
+
+        async def receive():
+            await asyncio.sleep(0)
+            return {"type": "http.request"}
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/chat/stream",
+            "headers": [(b"host", b"127.0.0.1")],
+            "asgi": {"spec_version": "2.4"},
+            "state": {},
+        }
+        try:
+            await response(scope, receive, send)
+        except Exception:  # noqa: BLE001 - 断连异常向上传播给服务器
+            pass
+        return scope
+
+    scope = asyncio.run(_run())
+    assert scope["state"].get("aligo_stream_aborted") is True, scope
+    assert "closed" in events, "断连后必须显式关闭生成器（取消心跳 / 落定状态）"
+    assert events[-1] == "release", events
+    print("✓ 流式断连关闭生成器并打标")
+
+
+def test_idempotent_replay_survives_open_breaker(monkeypatch):
+    """熔断打开时已缓存结果仍可回放（零 LLM 开销）；未缓存的新请求仍 503。"""
+    from utils.idempotency import make_key
+    from webapp import server as server_module  # noqa: F401 - 确保模块已加载
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_idem_breaker")
+
+    class _DenyBreaker:
+        def denies_new_calls(self):
+            return True
+
+        def raise_if_open(self):
+            raise AssertionError("回放路径不应进入对话")
+
+    try:
+        chat_key = make_key(
+            user_id, "s-brk", "k-chat", endpoint="chat", message="你好"
+        )
+        state.idempotency.put(
+            chat_key, {"session_id": "s-brk", "reply": "已缓存回答"}
+        )
+        stream_key = make_key(
+            user_id,
+            "s-brk",
+            "k-stream",
+            endpoint="chat_stream",
+            message="流式问题",
+        )
+        state.idempotency.put(
+            stream_key,
+            {"session_id": "s-brk", "type": "done", "reply": "流式缓存"},
+        )
+        monkeypatch.setattr(state, "breaker", _DenyBreaker(), raising=False)
+
+        resp = client.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "s-brk",
+                "idempotency_key": "k-chat",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers.get("x-idempotent-replay") == "1"
+        assert resp.json()["reply"] == "已缓存回答"
+
+        denied = client.post(
+            "/api/chat",
+            json={
+                "message": "新问题",
+                "user_id": user_id,
+                "session_id": "s-brk",
+                "idempotency_key": "k-other",
+            },
+        )
+        assert denied.status_code == 503, denied.text
+
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "流式问题",
+                "user_id": user_id,
+                "session_id": "s-brk",
+                "idempotency_key": "k-stream",
+            },
+        ) as stream:
+            assert stream.status_code == 200
+            events = [
+                json.loads(line[5:].strip())
+                for line in stream.iter_lines()
+                if line.startswith("data:")
+            ]
+        assert any(
+            event.get("type") == "done" and event.get("idempotent_replay")
+            for event in events
+        ), events
+    finally:
+        _cleanup(user_id)
+    print("✓ 熔断打开时已缓存结果仍可回放")
+
+
+def test_chat_lock_checks_disconnect_after_uncontended_acquire():
+    """锁无竞争直接拿到时也要检查断连：不能为已断开的客户端构造会话。"""
+    from webapp.server import _acquire_chat_lock
+
+    class _Req:
+        async def is_disconnected(self):
+            return True
+
+    lock = asyncio.Lock()
+
+    async def _run():
+        try:
+            await _acquire_chat_lock(_Req(), lock, "rid-lock")
+        except Exception as exc:  # noqa: BLE001 - HTTPException
+            return getattr(exc, "status_code", None)
+        return None
+
+    status = asyncio.run(_run())
+    assert status == 499, status
+    assert not lock.locked(), "断连时已拿到的锁必须释放"
+    print("✓ 对话锁拿到后补检断连（499 并释放锁）")
+
+
 def test_chat_stream_idempotency_replay():
     """流式重复提交只回放 session + done，不重新执行 Agent。"""
     class _CountingModel:

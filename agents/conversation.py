@@ -766,20 +766,29 @@ class ConversationRuntime:
         取消 ``ask()`` 只中断协程，``asyncio.to_thread`` 里的写线程不受影响。
         Web 入口在释放用户锁 / 会话占用标记前先等它结束，否则同一用户随后
         的删除会话 / 新一轮对话会与迟到的写入并发（已删除的会话被写回）。
+
+        ``timeout_sec`` 是**总预算**：落库等待、回滚等待与延迟记忆提交
+        共享同一个截止时刻（此前各自按 10s / 2s / 10s 串行累计，释放用户
+        锁前的实际上限约 22 秒，与 README 的 10 秒口径不符）。
         """
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+
+        def _remaining() -> float:
+            return max(0.05, deadline - time.monotonic())
+
         pending = getattr(self, "_pending_persist", None)
         if pending is None:
             # 落库可能刚被完成回调清掉、回滚线程仍在跑：释放用户锁前也要等它；
             # 完成回调补提交的延迟记忆写入同样可能仍在后台（此前直接返回，
             # 用户锁在偏好 / 行程仍在落库时释放）
-            await self._await_pending_rollback()
-            await self._await_deferred_commit(timeout_sec)
+            await self._await_pending_rollback(_remaining())
+            await self._await_deferred_commit(_remaining())
             return True
         failed = object()
         outcome: object = None
         try:
             outcome = await asyncio.wait_for(
-                asyncio.shield(pending), timeout=timeout_sec
+                asyncio.shield(pending), timeout=_remaining()
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -795,7 +804,7 @@ class ConversationRuntime:
             # 取消时跳过的回滚：确认写入并未提交后在这里补一次（等待线程
             # 结束，保证释放用户锁前回滚已落地）
             await self._request_staged_rollback(*last_turn)
-        await self._await_deferred_commit(timeout_sec)
+        await self._await_deferred_commit(_remaining())
         return True
 
     async def _await_deferred_commit(self, timeout_sec: float) -> None:

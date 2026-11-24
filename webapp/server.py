@@ -152,9 +152,11 @@ _DELETE_LOCK_TIMEOUT_SEC = 10.0
 
 # 对话入口等待同一用户锁的上限：排队期间响应头尚未发出、SSE 心跳也没
 # 开始，反向代理读超时（nginx 默认 60s）会把仍在排队的请求变成 504，
-# 而服务端随后还会为已断开的客户端构造会话并启动回合。最多等 55 秒，
-# 期间短轮询客户端断开；超时返回 503 + Retry-After，客户端可明确重试
-_CHAT_LOCK_WAIT_SEC = 55.0
+# 而服务端随后还会为已断开的客户端构造会话并启动回合。最多等 50 秒，
+# 期间短轮询客户端断开；超时返回 503 + Retry-After，客户端可明确重试。
+# 不能贴着 60s 设计：限流检查（可能走 Redis）与会话构造（最长数秒）发生
+# 在锁等待之前 / 之后，预算之外的时间也要留出余量
+_CHAT_LOCK_WAIT_SEC = 50.0
 _CHAT_LOCK_POLL_SEC = 0.5
 
 # 备份导入在读取 64MB 请求体前就先占用导入名额：客户端只发请求头、
@@ -561,6 +563,13 @@ class RequestContextMiddleware:
             except Exception:  # noqa: BLE001 - 客户端可能已断开
                 raise exc from None
         finally:
+            # 流式断连（200 头已发出、任一终态未送达）：线上状态保持 200，
+            # 日志 / 指标按 499 记账以便区分「完整送达」与「断连半截流」
+            account_status = status_code
+            if status_code == 200 and bool(
+                (scope.get("state") or {}).get("aligo_stream_aborted")
+            ):
+                account_status = 499
             # 被 Host 白名单拒绝的请求无论打哪个路径都要可观测（DNS rebinding
             # 扫描常直接探测 /），其余非 /api 路径保持不记访问日志
             if route_path.startswith("/api/") or host_rejected:
@@ -570,7 +579,7 @@ class RequestContextMiddleware:
                     format_access_log(
                         scope.get("method", ""),
                         path,
-                        status_code,
+                        account_status,
                         elapsed_ms,
                         request_id,
                     ),
@@ -589,16 +598,16 @@ class RequestContextMiddleware:
                 REQUEST_METRICS.record(
                     scope.get("method", ""),
                     metric_path,
-                    status_code,
+                    account_status,
                     elapsed_ms,
                     # SSE 长连接 / 客户端中止（499）的持续时间不能计入延迟分位；
                     # 流式路由上的路由前拒绝（307/308/413/429/503）不是长连接：
                     # 只有 2xx 才算真正进入流式输出（3xx 是尾斜杠重定向）
                     streaming=(
-                        status_code == 499
+                        account_status == 499
                         or (
                             metric_path == "/api/chat/stream"
-                            and status_code < 300
+                            and account_status < 300
                         )
                     ),
                 )
@@ -1206,17 +1215,43 @@ class _LeasedStreamingResponse(StreamingResponse):
         self,
         content: Any,
         lease: _SessionTurnLease | _LockReplayLease,
+        *,
+        stream_state: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(content, **kwargs)
         self._lease = lease
+        self._stream_state = stream_state
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
+            # Starlette 不负责关闭 body_iterator：断连取消 / send 抛错时
+            # 生成器停在 yield，其 finally（取消心跳、落定 stream_state）
+            # 只能等 GC 兜底。这里显式 aclose：正常结束是 no-op，异常路径
+            # 让生成器先收尾（含心跳任务），再走租约收尾
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if callable(aclose):
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await aclose()
+                except Exception:  # noqa: BLE001 - 关闭失败不影响租约释放
+                    logger.debug("关闭流式响应生成器失败", exc_info=True)
+            if self._stream_state is not None:
+                # 断连记账：ASGI 2.3（uvicorn 0.54）下 Starlette 会把
+                # http.disconnect 的取消吞掉、正常返回，中间件看不到任何
+                # 异常。回合已启动、任一终态都未送达 ⇒ 客户端断连 ——
+                # 在 scope 上打标，由中间件按 499 记账（线上状态保持 200）
+                if self._stream_state.get("turn_started") and not (
+                    self._stream_state.get("terminal_delivered")
+                ):
+                    scope.setdefault("state", {})["aligo_stream_aborted"] = True
             with contextlib.suppress(asyncio.CancelledError):
                 await self._lease.stop_turn()
+            # 让落库完成回调（turn_state["persisted"]）先于 after_stop 执行：
+            # drain 的唤醒回调与它同批调度，顺序不保证时断连标记会被跳过
+            await asyncio.sleep(0)
             # drain 完成后才决定断连未完成标记（作用域内的 stop_turn 在
             # 取消时可能没跑到 drain）
             try:
@@ -3498,7 +3533,6 @@ async def _acquire_chat_lock(
     while True:
         try:
             await asyncio.wait_for(lock.acquire(), timeout=_CHAT_LOCK_POLL_SEC)
-            return
         except asyncio.TimeoutError:
             if await request.is_disconnected():
                 # 499（客户端中止）：响应无人接收，不能记成 5xx 抬升错误率
@@ -3515,6 +3549,16 @@ async def _acquire_chat_lock(
                     ),
                     headers={"Retry-After": "5"},
                 ) from None
+            continue
+        # 拿到锁后再确认一次断连：锁无竞争 / 恰在两次轮询之间释放时上面的
+        # 探测从未执行，接着构造会话并启动回合只是为已断开的客户端白干
+        if await request.is_disconnected():
+            lock.release()
+            raise HTTPException(
+                status_code=499,
+                detail=f"客户端已断开（请求 ID：{request_id}）",
+            )
+        return
 
 
 @contextlib.asynccontextmanager
@@ -5043,13 +5087,32 @@ def create_app(model: Any = None) -> FastAPI:
     async def chat(
         request: Request, payload: ChatRequest, response: Response
     ) -> Any:
-        # 熔断打开（或半开且唯一试探名额已被长回合占用）时直接 503：
-        # 零 LLM 开销的拒绝不能先扣限流额度，否则恢复后的重试者会被 429
-        # 锁在滑动窗口里。只读状态判断：raise_if_open 在 HALF_OPEN 下会
-        # 占用唯一试探名额（owner=本请求任务），真正的对话跑在另一个
-        # asyncio 任务里再次申请会被拒——半开期所有对话永久 503，熔断器
-        # 再也回不到 CLOSED
-        if state.breaker.denies_new_calls():
+        # v2.0 幂等：键用请求里的 session_id（缺省空串）而不是服务端
+        # 新生成的会话 id——首条消息不带 session_id 时，同键重试必须
+        # 仍然命中缓存（否则会在新会话里再执行一遍、再落一份问答）；
+        # 缓存响应里带着首次执行生成的会话 id，客户端据此继续原会话。
+        # 键在熔断预检之前算好：已缓存结果的重试是零 LLM 开销的回放，
+        # 熔断打开 / 半开名额被长回合占用时也应能回放
+        idem_key = (
+            make_key(
+                payload.user_id,
+                payload.session_id or "",
+                payload.idempotency_key,
+                endpoint="chat",
+                message=payload.message,
+            )
+            if payload.idempotency_key
+            else None
+        )
+        if (
+            idem_key is None or state.idempotency.get(idem_key) is None
+        ) and state.breaker.denies_new_calls():
+            # 熔断打开（或半开且唯一试探名额已被长回合占用）时直接 503：
+            # 零 LLM 开销的拒绝不能先扣限流额度，否则恢复后的重试者会被 429
+            # 锁在滑动窗口里。只读状态判断：raise_if_open 在 HALF_OPEN 下会
+            # 占用唯一试探名额（owner=本请求任务），真正的对话跑在另一个
+            # asyncio 任务里再次申请会被拒——半开期所有对话永久 503，熔断器
+            # 再也回不到 CLOSED
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -5069,21 +5132,6 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
-            # v2.0 幂等：键用请求里的 session_id（缺省空串）而不是服务端
-            # 新生成的会话 id——首条消息不带 session_id 时，同键重试必须
-            # 仍然命中缓存（否则会在新会话里再执行一遍、再落一份问答）；
-            # 缓存响应里带着首次执行生成的会话 id，客户端据此继续原会话
-            idem_key = (
-                make_key(
-                    payload.user_id,
-                    payload.session_id or "",
-                    payload.idempotency_key,
-                    endpoint="chat",
-                    message=payload.message,
-                )
-                if payload.idempotency_key
-                else None
-            )
             if idem_key is not None:
                 cached = state.idempotency.get(idem_key)
                 if cached is not None:
@@ -5248,13 +5296,29 @@ def create_app(model: Any = None) -> FastAPI:
     @app.post("/api/chat/stream")
     async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
         """SSE 流式对话：先推送执行进度事件，最后推送完整结果或错误。"""
-        # 熔断打开（或半开且唯一试探名额已被长回合占用）时直接 503：
-        # 零 LLM 开销的拒绝不能先扣限流额度，否则恢复后的重试者会被 429
-        # 锁在滑动窗口里。只读状态判断：raise_if_open 在 HALF_OPEN 下会
-        # 占用唯一试探名额（owner=本请求任务），真正的对话跑在另一个
-        # asyncio 任务里再次申请会被拒——半开期所有对话永久 503，熔断器
-        # 再也回不到 CLOSED
-        if state.breaker.denies_new_calls():
+        # 幂等键提前计算：已缓存结果的重试是零 LLM 开销的回放，熔断打开 /
+        # 半开名额被长回合占用时也应能回放（否则断网重试恰逢熔断窗口只能
+        # 拿到 503，缓存里的完整回答形同丢失）
+        idem_key = (
+            make_key(
+                payload.user_id,
+                payload.session_id or "",
+                payload.idempotency_key,
+                endpoint="chat_stream",
+                message=payload.message,
+            )
+            if payload.idempotency_key
+            else None
+        )
+        if (
+            idem_key is None or state.idempotency.get(idem_key) is None
+        ) and state.breaker.denies_new_calls():
+            # 熔断打开（或半开且唯一试探名额已被长回合占用）时直接 503：
+            # 零 LLM 开销的拒绝不能先扣限流额度，否则恢复后的重试者会被 429
+            # 锁在滑动窗口里。只读状态判断：raise_if_open 在 HALF_OPEN 下会
+            # 占用唯一试探名额（owner=本请求任务），真正的对话跑在另一个
+            # asyncio 任务里再次申请会被拒——半开期所有对话永久 503，熔断器
+            # 再也回不到 CLOSED
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -5275,7 +5339,11 @@ def create_app(model: Any = None) -> FastAPI:
         lock = state.lock_for(payload.user_id)
         await _acquire_chat_lock(request, lock, rid)
         lease: _SessionTurnLease | None = None
-        stream_state = {"completed": False, "turn_started": False}
+        stream_state = {
+            "completed": False,
+            "turn_started": False,
+            "terminal_delivered": False,
+        }
         try:
             if await asyncio.to_thread(
                 state.is_recently_deleted, payload.user_id, payload.session_id
@@ -5283,20 +5351,10 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
-            # 幂等回放：键用请求里的 session_id（缺省空串），不依赖服务端
-            # 新生成的会话 id（否则不带 session_id 的首条消息同键重试永远
-            # 命不中）；回放不创建会话，会话事件回放首次执行的会话 id
-            idem_key = (
-                make_key(
-                    payload.user_id,
-                    payload.session_id or "",
-                    payload.idempotency_key,
-                    endpoint="chat_stream",
-                    message=payload.message,
-                )
-                if payload.idempotency_key
-                else None
-            )
+            # 幂等回放：键在入口处已按请求里的 session_id（缺省空串）算好
+            # ——不依赖服务端新生成的会话 id（否则不带 session_id 的首条
+            # 消息同键重试永远命不中）；回放不创建会话，会话事件回放首次
+            # 执行的会话 id
             if idem_key is not None:
                 cached = state.idempotency.get(idem_key)
                 if cached is not None:
@@ -5381,7 +5439,10 @@ def create_app(model: Any = None) -> FastAPI:
                 def _mark_stream_incomplete() -> None:
                     # 在响应包装器的 drain 之后执行：作用域内被取消时
                     # stop_turn 会立即抛 CancelledError，此处才是最终落库结果
-                    if stream_state.get("completed"):
+                    if stream_state.get("terminal_delivered"):
+                        # 任一终态（done / error）已送达：客户端知道结果，
+                        # 不能再改写成「响应未送达」——error 终态被覆盖会让
+                        # 用户的重试无法重新执行
                         return
                     if not stream_state.get("turn_started"):
                         # 回合从未启动（响应体未迭代即被取消）：没有本轮
@@ -5398,6 +5459,11 @@ def create_app(model: Any = None) -> FastAPI:
                     except Exception:  # noqa: BLE001 - 状态不明按未落库
                         persisted = False
                     if not persisted:
+                        return
+                    if state.idempotency.get(idem_key) is not None:
+                        # 服务器已缓存终态（done 在入队后、发送前写入缓存，
+                        # 断连可能发生在缓存之后）：同键重试应回放已缓存的
+                        # 完整回答，不能用「未送达」标记覆盖掉它
                         return
                     # 流在 done 之前结束（客户端断连），但 drain 后确认整轮
                     # 已落库：给幂等键留标记，同键重试回放错误终态而不是
@@ -5537,7 +5603,10 @@ def create_app(model: Any = None) -> FastAPI:
                         "\n\n"
                     )
                     if event["type"] in ("done", "error"):
+                        # 这行在消费方取下一项时才执行：能走到这里说明终态
+                        # 帧已成功发送（send 失败时生成器在 yield 处被关闭）
                         completed = event["type"] == "done"
+                        stream_state["terminal_delivered"] = True
                         break
             finally:
                 stream_state["completed"] = completed
@@ -5563,6 +5632,7 @@ def create_app(model: Any = None) -> FastAPI:
         return _LeasedStreamingResponse(
             event_stream(),
             lease,
+            stream_state=stream_state,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
