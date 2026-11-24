@@ -4632,7 +4632,16 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
     ) -> dict[str, Any]:
         response.headers.update(_enforce_read_rate_limit(state, request))
-        store = _open_long_term(user_id)
+        # strict：配置了 PostgreSQL 但当前不可用 / 冷却期时不能静默回退
+        # JSON 库——那里没有该会话，会返回 200 + 空消息，前端把「空」当成
+        # 「会话已删除」。读不到就如实 503
+        try:
+            store = _open_long_term(user_id, strict=True)
+        except MemoryPersistenceError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_persistence_failure_detail(exc, _request_id(request)),
+            ) from exc
         try:
             messages = store.get_chat_history(session_id=session_id)
             titles = store.get_session_titles()

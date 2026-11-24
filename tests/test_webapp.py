@@ -384,6 +384,21 @@ def test_side_effect_guard_requires_same_origin_marker():
         _cleanup(user_id)
     print("✓ 高开销 GET 需同源标记（缺失 Sec-Fetch-Site 不再放行）")
 
+def test_session_detail_fails_closed_when_store_unavailable(monkeypatch):
+    """配置了 PG 但不可用时会话详情返回 503，不能以空消息冒充「已删除」。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    def boom(user_id, *args, **kwargs):
+        raise MemoryPersistenceError("PostgreSQL 处于故障冷却期")
+
+    monkeypatch.setattr(server_module, "_open_long_term", boom)
+    client = _client()
+    response = client.get("/api/sessions/s1", params={"user_id": "u1"})
+    assert response.status_code == 503, response.text
+    print("✓ 会话详情在存储不可用时 503（不回退空消息）")
+
+
 def test_export_concurrency_guard():
     """全量导出并发受信号量限制：槽位占满时快速 503，不排队申请内存。"""
     client = _client()
