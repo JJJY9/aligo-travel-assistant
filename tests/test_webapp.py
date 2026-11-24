@@ -9168,7 +9168,9 @@ def test_rate_limit_trusted_proxy_headers(monkeypatch):
         )
         assert second.status_code == 429, "默认配置下不应信任 X-Forwarded-For"
 
-        # 开启信任后：相同 XFF 共享 IP 桶，不同 XFF 互不影响
+        # 开启信任后：相同 XFF 共享 IP 桶，不同 XFF 互不影响。
+        # 可信对端默认只有回环：TestClient 需以 127.0.0.1 作为对端地址，
+        # 否则（"testclient" 非 IP）XFF 一律被忽略
         user_c = _unique_user("web_test_proxy_c")
         user_d = _unique_user("web_test_proxy_d")
         user_e = _unique_user("web_test_proxy_e")
@@ -9176,6 +9178,7 @@ def test_rate_limit_trusted_proxy_headers(monkeypatch):
         users += [user_c, user_d, user_e, user_f]
         state.ip_limiter = RateLimiter(limit=1, window_sec=60)
         monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_headers", True)
+        client = TestClient(app, client=("127.0.0.1", 50000))
         forwarded = "203.0.113.9, 10.0.0.1"
         third = client.post(
             "/api/chat",
@@ -9235,6 +9238,288 @@ def test_rate_limit_trusted_proxy_headers(monkeypatch):
     finally:
         for user_id in users:
             _cleanup(user_id)
+
+
+def test_trusted_proxy_peer_and_hop_parsing(monkeypatch):
+    """XFF 只信任可信对端；末跳支持 [IPv6]/IP:port，非法形式回退 TCP 对端。"""
+    from config import RATE_LIMIT_CONFIG
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=100, window_sec=60)
+    monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_headers", True)
+    users = []
+    try:
+        def _chat(client, tag, xff):
+            user = _unique_user(f"web_test_hop_{tag}")
+            users.append(user)
+            return client.post(
+                "/api/chat",
+                json={
+                    "message": "你好",
+                    "user_id": user,
+                    "session_id": f"hop-{tag}",
+                },
+                headers={"X-Forwarded-For": xff},
+            )
+
+        # 非可信对端携带轮换 XFF：一律忽略，共用 TCP 对端桶
+        untrusted = TestClient(app, client=("203.0.113.50", 60000))
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat(untrusted, "u1", "198.51.100.1").status_code == 200
+        assert (
+            _chat(untrusted, "u2", "198.51.100.2").status_code == 429
+        ), "非可信对端的 XFF 不能被采信（否则任意客户端可自选限流身份）"
+
+        # 显式把该对端加入可信网段后恢复按末跳分桶
+        monkeypatch.setitem(
+            RATE_LIMIT_CONFIG, "trusted_proxy_cidrs", "203.0.113.0/24"
+        )
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat(untrusted, "u3", "198.51.100.7").status_code == 200
+        assert (
+            _chat(untrusted, "u4", "198.51.100.7").status_code == 429
+        ), "可信对端的相同末跳共享桶"
+        assert (
+            _chat(untrusted, "u5", "198.51.100.8").status_code == 200
+        ), "不同末跳互不影响"
+
+        # 末跳带端口 / 方括号：端口剥离后与裸 IP 同桶
+        trusted = TestClient(app, client=("127.0.0.1", 50000))
+        monkeypatch.setitem(
+            RATE_LIMIT_CONFIG, "trusted_proxy_cidrs", "127.0.0.1/32,::1/128"
+        )
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat(trusted, "p1", "198.51.100.20:5000").status_code == 200
+        assert (
+            _chat(trusted, "p2", "198.51.100.20").status_code == 429
+        ), "IP:port 应剥离端口后与裸 IP 共桶"
+
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat(trusted, "p3", "[2001:db8::7]:443").status_code == 200
+        assert (
+            _chat(trusted, "p4", "2001:db8::7").status_code == 429
+        ), "[IPv6]:port 应剥离端口后与裸 IPv6 共桶（/64 聚合）"
+
+        # 非法末跳（不是裸 IP / [IPv6] / IP:port）：回退 TCP 对端桶，
+        # 任意字符串不能各自成为限流桶
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat(trusted, "p5", "198.51.100.30:notaport").status_code == 200
+        assert (
+            _chat(trusted, "p6", "[zzz]:1").status_code == 429
+        ), "两个非法末跳都应回退到同一 TCP 对端桶"
+        # 合法末跳不会被拖进回退桶
+        assert _chat(trusted, "p7", "198.51.100.31").status_code == 200
+        print("✓ 可信代理对端与末跳解析（端口 / 非法回退）")
+    finally:
+        for user_id in users:
+            _cleanup(user_id)
+
+
+def test_ipv6_prefix_len_config_aggregates_delegated_blocks(monkeypatch):
+    """RATE_IPV6_PREFIX_LEN 可按委派粒度收紧 IPv6 聚合前缀。"""
+    from config import RATE_LIMIT_CONFIG
+    from webapp import server as server_module
+
+    monkeypatch.setitem(RATE_LIMIT_CONFIG, "ipv6_prefix_len", 56)
+    first = server_module._rate_identity("2001:db8:aa:1::1")
+    second = server_module._rate_identity("2001:db8:aa:2::1")
+    other = server_module._rate_identity("2001:db8:bb:1::1")
+    assert first == second, "同一 /56 的兄弟 /64 应归并为同一键"
+    assert first != other
+    monkeypatch.setitem(RATE_LIMIT_CONFIG, "ipv6_prefix_len", 64)
+    assert (
+        server_module._rate_identity("2001:db8:aa:1::1")
+        != server_module._rate_identity("2001:db8:aa:2::1")
+    ), "默认仍是 /64"
+    # 非法值回退 /64，不抛异常
+    monkeypatch.setitem(RATE_LIMIT_CONFIG, "ipv6_prefix_len", 12)
+    assert server_module._rate_identity("2001:db8:aa:1::1") == "2001:db8:aa:1::/64"
+    print("✓ IPv6 聚合前缀可配置（默认 /64 / 非法回退）")
+
+
+def test_rate_limit_capacity_429_does_not_consume_ip_bucket():
+    """用户桶键表满载：429 标注容量、发生在记录 IP 桶之前、信息量正确。"""
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=5, window_sec=60, max_keys=2)
+    state.ip_limiter = RateLimiter(limit=100, window_sec=60)
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    users = []
+    try:
+        for index in range(2):
+            user = _unique_user(f"web_test_capacity_{index}")
+            users.append(user)
+            ok = client.post(
+                "/api/chat",
+                json={
+                    "message": "你好",
+                    "user_id": user,
+                    "session_id": f"capacity-{index}",
+                },
+            )
+            assert ok.status_code == 200, ok.text
+        before = state.ip_limiter.status("127.0.0.1")[0]
+        third = _unique_user("web_test_capacity_x")
+        users.append(third)
+        blocked = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": third, "session_id": "capacity-x"},
+        )
+        assert blocked.status_code == 429, blocked.text
+        detail = blocked.json()["detail"]
+        assert "容量" in detail, detail
+        assert "X-RateLimit-Remaining" in blocked.headers
+        assert blocked.headers["X-RateLimit-Remaining"] == "0"
+        after = state.ip_limiter.status("127.0.0.1")[0]
+        assert after == before, "容量拒绝必须发生在记录 IP 桶之前（不连坐同 IP）"
+        print("✓ 容量 429 不消耗 IP 桶且文案可区分")
+    finally:
+        for user_id in users:
+            _cleanup(user_id)
+
+
+def test_export_guard_prechecks_rate_limit_before_slots():
+    """导出槽满 + 读额度已耗尽：预检 429 而非占槽后的 503。"""
+    from utils.rate_limit import RateLimiter
+
+    client = _client()
+    state = client.app.state.aligo
+    state.read_limiter = RateLimiter(limit=1, window_sec=60)
+    state.kb_limiter = RateLimiter(limit=100, window_sec=60)
+    user = _unique_user("web_test_export_precheck")
+    try:
+        assert state.read_limiter.check("testclient") is None
+        held = [state.export_slots.acquire(blocking=False) for _ in range(2)]
+        assert all(held)
+        try:
+            blocked = client.get(
+                "/api/sessions/export", params={"user_id": user, "format": "md"}
+            )
+            assert blocked.status_code == 429, blocked.text[:200]
+            assert "数据读取过于频繁" in blocked.json()["detail"]
+        finally:
+            for acquired in held:
+                if acquired:
+                    state.export_slots.release()
+        print("✓ 导出槽满时已超限请求先吃 429（不占槽）")
+    finally:
+        _cleanup(user)
+
+
+def test_kb_read_guard_prechecks_rate_limit_before_slots():
+    """知识库读槽满 + KB 额度耗尽：预检 429 而非槽满 503。"""
+    from utils.rate_limit import RateLimiter
+
+    client = _client()
+    state = client.app.state.aligo
+    state.kb_limiter = RateLimiter(limit=1, window_sec=60)
+    try:
+        assert state.kb_limiter.check("testclient") is None
+        held = [state.kb_read_slots.acquire(blocking=False) for _ in range(4)]
+        assert all(held)
+        try:
+            blocked = client.get("/api/knowledge/documents")
+            assert blocked.status_code == 429, blocked.text[:200]
+            assert "知识库操作过于频繁" in blocked.json()["detail"]
+        finally:
+            for acquired in held:
+                if acquired:
+                    state.kb_read_slots.release()
+        print("✓ 知识库读槽满时已超限请求先吃 429（不占槽）")
+    finally:
+        pass
+
+
+def test_knowledge_eval_precheck_rate_limit_before_lock():
+    """KB 额度耗尽时评测不触碰跨实例评测锁（429 为限流文案）。"""
+    from utils.rate_limit import RateLimiter
+
+    client = _client()
+    state = client.app.state.aligo
+    state.kb_limiter = RateLimiter(limit=1, window_sec=60)
+    assert state.kb_limiter.check("testclient") is None
+    token = state.eval_lock.acquire()
+    assert token is not None, "测试应能占住评测锁"
+    try:
+        blocked = client.get("/api/knowledge/eval")
+        assert blocked.status_code == 429, blocked.text[:200]
+        detail = blocked.json()["detail"]
+        assert "知识库操作过于频繁" in detail, detail
+        assert "已有检索评测在运行" not in detail
+        assert blocked.headers.get("X-RateLimit-Remaining") == "0"
+    finally:
+        state.eval_lock.release(token)
+    print("✓ 评测超限请求不触达评测锁")
+
+
+def test_export_with_knowledge_charges_kb_bucket(monkeypatch):
+    """with_knowledge 导出同时占用 KB 桶：KB 额度耗尽时直接 429。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    state.kb_limiter = RateLimiter(limit=1, window_sec=60)
+    state.read_limiter = RateLimiter(limit=1000, window_sec=60)
+    user = _unique_user("web_export_kb_bucket")
+    try:
+        monkeypatch.setattr(
+            server_module, "export_documents", lambda: []
+        )
+        first = client.get(
+            "/api/export", params={"user_id": user, "with_knowledge": "1"}
+        )
+        assert first.status_code == 200, first.text[:200]
+        second = client.get(
+            "/api/export", params={"user_id": user, "with_knowledge": "1"}
+        )
+        assert second.status_code == 429, second.text[:200]
+        assert "知识库导出操作过于频繁" in second.json()["detail"]
+        # 不计 KB 的普通导出不受 KB 额度影响
+        plain = client.get("/api/export", params={"user_id": user})
+        assert plain.status_code == 200, plain.text[:200]
+        print("✓ with_knowledge 导出计入知识库桶")
+    finally:
+        _cleanup(user)
+
+
+def test_rate_limit_probe_budget_bounds_health_latency(monkeypatch):
+    """健康探测受总预算约束：慢桶不会在单次请求内逐个叠加。"""
+    from webapp import server as server_module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(server_module.time, "monotonic", lambda: clock["now"])
+    probes: list[int] = []
+
+    class _SlowHealthy:
+        degraded = False
+        backend = "redis"
+        limit = 10
+        window_sec = 60.0
+
+        def probe(self):
+            probes.append(1)
+            clock["now"] += 0.9
+            return True
+
+    class _State:
+        rate_limiter = _SlowHealthy()
+        ip_limiter = _SlowHealthy()
+        kb_limiter = _SlowHealthy()
+        weather_limiter = _SlowHealthy()
+        import_limiter = _SlowHealthy()
+        read_limiter = _SlowHealthy()
+        write_limiter = _SlowHealthy()
+
+    info = server_module._rate_limit_info(_State())
+    assert info["degraded"] is False
+    assert len(probes) == 1, "预算内只做一次真实探测（其余沿用当前状态）"
+    assert clock["now"] - 1000.0 <= server_module.RATE_LIMIT_PROBE_BUDGET_SEC
+    print("✓ 健康探测受总预算约束")
 
 
 def test_ip_rejection_does_not_consume_user_bucket():

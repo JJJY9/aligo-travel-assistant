@@ -8,8 +8,9 @@
 Redis 运行中不可用时自动回退进程内实现（60 秒后重试），限流故障不影响请求。
 
 key 由请求方提供（用户 ID 可被轮换），因此调用方应同时用客户端 IP 作为独立
-限流维度，避免换一个用户 ID 就绕过限流。空 key 会定期清理，且 key 总数有上限，
-防止大量随机 key 造成内存无限增长。
+限流维度，避免换一个用户 ID 就绕过限流。进程内实现的空 key 会定期清理、且
+key 总数有上限（``RATE_LIMIT_MAX_KEYS``，满时对新 key fail-closed）；Redis
+实现不设键表上限，靠每个键的窗口 TTL 自动过期。
 """
 import logging
 import threading
@@ -25,10 +26,23 @@ logger = logging.getLogger(__name__)
 # 攻击者轮换 key 即可让受害者与自己的旧桶重新获得配额（限流绕过）。
 MAX_KEYS = 10000
 
+# 表满时清理过期桶的最小间隔：轮换 key 的风暴下不能每个新 key 都在全局锁内
+# 做 O(表大小) 扫描
+_SWEEP_INTERVAL_SEC = 0.5
+
 # Redis 限流键前缀（与其它 aligo: 键一致），name 区分用户桶 / IP 桶。
 REDIS_KEY_PREFIX = "aligo:ratelimit"
 # Redis 故障后的回退冷却时间：期间直接用进程内限流，避免每个请求都等超时。
 REDIS_FAILURE_COOLDOWN_SEC = 60.0
+
+
+class CapacityRetry(float):
+    """键表容量暂满被拒时返回的 Retry-After（float 子类，兼容量超限值）。
+
+    执行层按 ``isinstance(value, CapacityRetry)`` 区分「容量拒绝」与「配额
+    耗尽」：两者都是 429，但文案不同，且容量拒绝的等待时间按最早到期键
+    估算（不再固定返回整个窗口）。数值语义与普通 Retry-After 完全一致。
+    """
 
 # 以下 Lua 脚本用 Redis 服务器时间（TIME），多实例时钟不一致也不会算错窗口。
 # 返回值：放行 -1；触发限流时为 Retry-After 秒数字符串（Lua 数字返回会被
@@ -86,6 +100,35 @@ end
 return {limit - count, tostring(reset)}
 """
 
+# 恢复探测脚本：必须覆盖真实 CHECK 会用到的**写路径**。只用 STATUS（纯读）
+# 探测时，maxmemory 拒绝写（OOM）、只读副本、ACL 禁写等场景会谎报「已恢复」
+# 并清除降级标记，随后每个真实 CHECK 又失败回退。ZADD 与 CHECK 一样受
+# denyoom 约束；PEXPIRE 在前保证 ACL 拒绝 PEXPIRE 时不会留下无 TTL 成员；
+# ZREM 后空 ZSET 自动删除，5s TTL 兜底。键名与成员都按调用唯一，多实例
+# 并发探测互不干扰，且仍落在 aligo:ratelimit:<bucket>: 前缀内。
+_PROBE_SCRIPT = """
+local key = KEYS[1]
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+redis.call('PEXPIRE', key, 5000)
+redis.call('ZADD', key, now, ARGV[1])
+redis.call('PEXPIRE', key, 5000)
+redis.call('ZREM', key, ARGV[1])
+return 1
+"""
+
+
+def _is_wrongtype_error(exc: BaseException) -> bool:
+    """是否为键类型损坏（WRONGTYPE）：只影响该键，不代表后端不可用。
+
+    redis-py 对 WRONGTYPE 用通用 ``ResponseError``；OOM / 只读副本 / ACL
+    是专用子类（OutOfMemoryError / ReadOnlyError / NoPermissionError），
+    消息前缀也不是 WRONGTYPE。
+    """
+    return type(exc).__name__ == "ResponseError" and str(exc).startswith(
+        "WRONGTYPE"
+    )
+
 
 class RateLimiter:
     """滑动窗口限流器：窗口内最多允许 ``limit`` 次请求。"""
@@ -103,10 +146,34 @@ class RateLimiter:
         # 上一次全表清理的时刻：轮换 key 的风暴下不能每个新 key 都在全局
         # 锁内做 O(表大小) 扫描
         self._last_sweep = 0.0
+        # 下一次有键到期的最早时刻（_sweep 后计算）：容量拒绝时据此给出
+        # 真实的恢复等待，而不是固定整个窗口
+        self._next_expiry: float | None = None
+        # 容量拒绝日志节流
+        self._last_full_log = 0.0
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._events)
+
+    def _capacity_retry(self, now: float) -> "CapacityRetry":
+        """表满时的 Retry-After：按最早到期键估算（无信息时退化为整窗口）。"""
+        expiry = self._next_expiry
+        if expiry is None:
+            expiry = now + self.window_sec
+        wait = min(self.window_sec, expiry - now)
+        return CapacityRetry(round(max(0.1, wait), 1))
+
+    def _warn_capacity(self, now: float) -> None:
+        if now - self._last_full_log < 30.0:
+            return
+        self._last_full_log = now
+        logger.warning(
+            "限流器键表已满（max_keys=%d，窗口 %.1fs）：新客户端会被暂时"
+            "拒绝；调大 RATE_LIMIT_MAX_KEYS 或改用 Redis 后端",
+            self.max_keys,
+            self.window_sec,
+        )
 
     def check(self, key: str) -> float | None:
         """记录一次请求。
@@ -124,11 +191,14 @@ class RateLimiter:
                 # 重置其计数（本次被限流的请求重新获得额度）。
                 # 清理本身限频：轮换 key 的风暴下最多每 0.5 秒扫描一次
                 if len(self._events) >= self.max_keys // 2:
-                    if now - self._last_sweep >= 0.5:
+                    if now - self._last_sweep >= _SWEEP_INTERVAL_SEC:
                         self._sweep(now)
                         self._last_sweep = now
                 if len(self._events) >= self.max_keys:
-                    return round(self.window_sec, 1)
+                    self._warn_capacity(now)
+                    # 容量拒绝不是配额耗尽：按最早到期键给出真实等待，
+                    # 不再固定返回整个窗口（大窗口下等于永久封锁新客户端）
+                    return self._capacity_retry(now)
                 events = deque()
                 self._events[key] = events
 
@@ -145,12 +215,20 @@ class RateLimiter:
         """不记录请求，返回现在发起请求会被限流的 Retry-After（否则 None）。
 
         多桶限流时先用 peek 检查所有桶，全部有额度再 check 记录，
-        避免一个桶已经拒绝、另一个桶却仍被消耗配额。
+        避免一个桶已经拒绝、另一个桶却仍被消耗配额。容量状态与
+        :meth:`check` 保持完全一致：表满时对新 key 同样返回
+        ``CapacityRetry``（只清理过期桶，不记录请求）。
         """
         with self._lock:
             now = time.monotonic()
             events = self._events.get(key)
             if events is None:
+                if len(self._events) >= self.max_keys // 2:
+                    if now - self._last_sweep >= _SWEEP_INTERVAL_SEC:
+                        self._sweep(now)
+                        self._last_sweep = now
+                if len(self._events) >= self.max_keys:
+                    return self._capacity_retry(now)
                 return None
             while events and now - events[0] >= self.window_sec:
                 events.popleft()
@@ -180,6 +258,17 @@ class RateLimiter:
                 events.popleft()
             if not events:
                 del self._events[key]
+        # 下次有键到期的最早时刻：容量拒绝据此给出真实恢复等待。被删键
+        # 已不存在、新增事件的到期只会更晚，因此该值在下次 sweep 前是
+        # 保守下界（提前重试最多再吃一次容量拒绝）
+        self._next_expiry = min(
+            (
+                events[0] + self.window_sec
+                for events in self._events.values()
+                if events
+            ),
+            default=None,
+        )
 
     def reset(self) -> None:
         """清空所有限流状态（测试或运维需要时使用）。"""
@@ -204,6 +293,7 @@ class RedisRateLimiter:
         limit: int,
         window_sec: float,
         client_factory: Any = None,
+        max_keys: int = MAX_KEYS,
     ) -> None:
         self._client = client
         # 启动时 Redis 不可用时通过工厂在后续请求中重试接入，避免整个
@@ -212,7 +302,10 @@ class RedisRateLimiter:
         self.name = name
         self.limit = max(1, int(limit))
         self.window_sec = max(0.01, float(window_sec))
-        self._fallback = RateLimiter(limit=self.limit, window_sec=self.window_sec)
+        # 故障回退的进程内桶同样受键表上限约束（可用 RATE_LIMIT_MAX_KEYS 调大）
+        self._fallback = RateLimiter(
+            limit=self.limit, window_sec=self.window_sec, max_keys=max_keys
+        )
         self._degraded_until = 0.0
         # 是否正处于回退状态：失败后置 True，只有一次成功的 Redis 调用
         # 才会清除。不能用冷却窗口判断——冷却到期但从未重试成功时仍是降级
@@ -266,6 +359,14 @@ class RedisRateLimiter:
         try:
             result = client.eval(script, 1, self._key(key), *args)
         except Exception as exc:  # noqa: BLE001 - 限流后端故障不能影响请求
+            if _is_wrongtype_error(exc):
+                # 单个键被其它数据占用：本次走进程内回退，但桶本身仍健康，
+                # 其它键继续共享 Redis；不要把整桶打进 60 秒冷却
+                logger.warning(
+                    "限流键类型损坏（%s），该键回退为进程内计数",
+                    self._key(key),
+                )
+                return None
             self._degraded_until = time.monotonic() + REDIS_FAILURE_COOLDOWN_SEC
             self._degraded = True
             logger.warning(
@@ -305,9 +406,10 @@ class RedisRateLimiter:
         ``degraded`` 只会在「同一个桶」的 Redis 调用成功时清除；weather /
         import 等低频桶在 Redis 恢复后可能很久没有请求，健康检查若只看
         标记会永远报降级。冷却期内沿用上次失败的结论，冷却到期后用一次
-        真实限流脚本（STATUS，不记录请求）刷新状态：不能用 PING 代替——
-        PING 成功而 EVAL 不可用（maxmemory 拒绝写、只读副本、ACL 禁 EVAL）
-        时，健康检查会谎报限流已恢复。
+        真实**写路径**探测（ZADD + PEXPIRE + ZREM，唯一键与成员）刷新
+        状态：不能用 PING 或纯读的 STATUS 脚本代替——PING 成功而 EVAL
+        不可用、或 EVAL 可读但 OOM / 只读副本 / ACL 拒绝写时，健康检查
+        会谎报限流已恢复。
         """
         if not self._degraded:
             return True
@@ -320,7 +422,9 @@ class RedisRateLimiter:
             return not self._degraded
         self._last_probe = now
         result = self._eval(
-            _STATUS_SCRIPT, "__probe__", self.window_sec, self.limit
+            _PROBE_SCRIPT,
+            f"__probe__:{uuid.uuid4().hex}",
+            uuid.uuid4().hex,
         )
         return result is not None
 
@@ -369,15 +473,22 @@ def create_rate_limiter(
     window_sec: float,
     redis_client: Any = None,
     client_factory: Any = None,
+    max_keys: int = MAX_KEYS,
 ) -> RateLimiter | RedisRateLimiter:
     """优先创建 Redis 共享限流器；未提供客户端 / 工厂时使用进程内实现。
 
     配置了 ``REDIS_URL`` 但启动时不可达时传 ``client_factory``（如
     ``get_shared_redis_client``）：先回退进程内计数，工厂可用后自动重新
     接入共享计数，而不是整个进程生命周期固化为本地限流。
+    ``max_keys`` 只约束进程内实现（含 Redis 故障回退时的本地桶）。
     """
     if redis_client is not None or client_factory is not None:
         return RedisRateLimiter(
-            redis_client, name, limit, window_sec, client_factory=client_factory
+            redis_client,
+            name,
+            limit,
+            window_sec,
+            client_factory=client_factory,
+            max_keys=max_keys,
         )
-    return RateLimiter(limit=limit, window_sec=window_sec)
+    return RateLimiter(limit=limit, window_sec=window_sec, max_keys=max_keys)

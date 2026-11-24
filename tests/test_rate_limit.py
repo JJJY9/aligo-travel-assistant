@@ -451,6 +451,121 @@ def test_rate_window_non_positive_is_clamped():
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
+def test_capacity_full_retry_uses_earliest_expiry(monkeypatch):
+    """键表满载时按最早到期键给出 Retry-After（不再固定整窗口）。"""
+    from utils import rate_limit as module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+    limiter = RateLimiter(limit=5, window_sec=60, max_keys=2)
+    assert limiter.check("a") is None
+    clock["now"] += 1.0
+    assert limiter.check("b") is None
+    clock["now"] += 50.0  # a 已存在 51s，9s 后到期
+    result = limiter.check("c")
+    assert isinstance(result, module.CapacityRetry)
+    assert 8.0 <= result <= 10.0, result
+    # peek 与 check 在容量状态上保持一致（peek 不记录请求）
+    peeked = limiter.peek("d")
+    assert isinstance(peeked, module.CapacityRetry)
+    assert 8.0 <= peeked <= 10.0, peeked
+    assert len(limiter) == 2, "容量拒绝不建键、不淘汰活跃桶"
+    print("✓ 容量拒绝按最早到期键给出等待（check / peek 一致）")
+
+
+def test_capacity_rejects_briefly_after_stale_sweep_then_recovers(monkeypatch):
+    """清理节流窗内全部键已过期：短暂容量拒绝后下一次清理即放行。"""
+    from utils import rate_limit as module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+    limiter = RateLimiter(limit=5, window_sec=1.0, max_keys=2)
+    assert limiter.check("a") is None
+    clock["now"] += 0.3
+    assert limiter.check("b") is None
+    clock["now"] = 1000.7  # 距上次清理 0.7s（>= 0.5）：本次会真正清理
+    result = limiter.check("c")
+    assert isinstance(result, module.CapacityRetry)
+    assert result <= 0.5, "全部键将于 0.3s 内到期，不应返回整窗口"
+    clock["now"] = 1001.2  # 再过 0.5s：清理后放行
+    assert limiter.check("d") is None
+    print("✓ 过期键在清理节流后立即放行")
+
+
+def test_redis_probe_exercises_write_path(monkeypatch):
+    """恢复探测必须覆盖写路径：OOM 拒绝写时不能谎报已恢复。"""
+    from utils import rate_limit as module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+
+    class _ReadOnlyRedis:
+        def eval(self, script, numkeys, *args):
+            if "ZADD" in script:
+                raise ConnectionError("OOM command not allowed")
+            return ["5", "0"]
+
+    limiter = RedisRateLimiter(_ReadOnlyRedis(), "user", 5, 60)
+    assert limiter.check("k") is None  # 写路径失败 → 进程内回退放行
+    assert limiter.degraded is True
+    limiter._degraded_until = 0.0
+    limiter._last_probe = 0.0
+    assert limiter.probe() is False, "写被拒时探测不能谎报已恢复"
+
+    class _Healthy:
+        def eval(self, script, numkeys, *args):
+            assert "ZADD" in script, "探测脚本必须包含写命令"
+            return 1
+
+    limiter._client = _Healthy()
+    clock["now"] += 2.0
+    limiter._degraded_until = 0.0
+    limiter._last_probe = 0.0
+    assert limiter.probe() is True
+    assert limiter.degraded is False
+    print("✓ 限流恢复探测走写路径")
+
+
+def test_wrongtype_key_falls_back_without_degrading_bucket():
+    """单个键 WRONGTYPE 只回退该键，不把整桶打进 60 秒冷却。"""
+
+    class ResponseError(Exception):
+        pass
+
+    class _FakeRedis:
+        def eval(self, script, numkeys, key, *args):
+            if key.endswith(":bad"):
+                raise ResponseError(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value"
+                )
+            return "-1"
+
+    limiter = RedisRateLimiter(_FakeRedis(), "user", 5, 60)
+    assert limiter.check("bad") is None
+    assert limiter.degraded is False, "单键类型错误不应降级整桶"
+    assert limiter.check("good") is None
+    assert limiter.degraded is False
+
+    class _Down:
+        def eval(self, script, numkeys, *args):
+            raise ConnectionError("down")
+
+    sick = RedisRateLimiter(_Down(), "user", 5, 60)
+    sick.check("k")
+    assert sick.degraded is True, "连接类故障仍应降级"
+    print("✓ WRONGTYPE 单键回退不降级整桶")
+
+
+def test_create_rate_limiter_passes_max_keys():
+    """max_keys 透传到进程内实现与 Redis 回退实例。"""
+    memory_limiter = create_rate_limiter("x", 5, 60, max_keys=123)
+    assert memory_limiter.max_keys == 123
+    redis_limiter = create_rate_limiter("x", 5, 60, object(), max_keys=456)
+    assert isinstance(redis_limiter, RedisRateLimiter)
+    assert redis_limiter._fallback.max_keys == 456
+    print("✓ max_keys 透传（内存 / Redis 回退）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -489,4 +604,16 @@ if __name__ == "__main__":
         test_redis_limiter_recovers_after_cooldown(_mp)
     finally:
         _mp.undo()
+    for _case in (
+        test_capacity_full_retry_uses_earliest_expiry,
+        test_capacity_rejects_briefly_after_stale_sweep_then_recovers,
+        test_redis_probe_exercises_write_path,
+    ):
+        _mp = pytest.MonkeyPatch()
+        try:
+            _case(_mp)
+        finally:
+            _mp.undo()
+    test_wrongtype_key_falls_back_without_degrading_bucket()
+    test_create_rate_limiter_passes_max_keys()
     print("\n全部通过")

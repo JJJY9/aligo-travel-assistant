@@ -226,8 +226,14 @@ class RateLimitConfig(TypedDict):
     read_requests: int
     write_requests: int
     window_sec: int
+    # 进程内限流器每个桶的键表上限（满时对新 key fail-closed，Redis 后端不设上限）
+    max_keys: int
     # 是否信任反向代理写入的 X-Forwarded-For（默认关闭，避免客户端伪造 IP 绕过 IP 桶；采信末跳地址）
     trust_proxy_headers: bool
+    # TRUST_PROXY_HEADERS=1 时允许写入 XFF 的对端网段（逗号分隔 CIDR；默认只信回环）
+    trusted_proxy_cidrs: str
+    # IPv6 身份聚合前缀长度（默认 /64；按接入网络可收紧到 /56、/48）
+    ipv6_prefix_len: int
 
 
 LLM_CONFIG: LLMConfig = {
@@ -327,16 +333,27 @@ RESILIENCE_CONFIG: ResilienceConfig = {
 #   CHAT_RATE_LIMIT      单个用户（客户端 + 用户 ID）窗口内允许的对话请求数（默认 30）
 #   CHAT_RATE_LIMIT_IP   单个客户端 IP 窗口内允许的对话请求总数（默认 120，用户 ID 由
 #                        请求方提供、可轮换，IP 桶防止通过换 ID 绕过限流）
-#   CHAT_RATE_WINDOW_SEC 窗口长度（秒，默认 60）
+#   CHAT_RATE_WINDOW_SEC 窗口长度（秒，默认 60）。注意：它同时作用于全部 7 个
+#                        桶（对话 / 知识库 / 导入 / 天气 / 读 / 写），各桶额度都是
+#                        「每窗口 N 次」——调小窗口会按比例放大其它桶的每分钟额度
 #   KB_RATE_LIMIT        知识库写操作 / 语义检索的单 IP 窗口额度（默认 60）
-#   KB_IMPORT_RATE_LIMIT 知识库导入 / 导入预览的独立单 IP 窗口额度（默认 1200：
-#                        面板分批导入需要远高于普通知识库操作的额度）
+#   KB_IMPORT_RATE_LIMIT 知识库导入 / 导入预览与 /api/trips/import 的独立单 IP
+#                        窗口额度（默认 1200：面板分批导入需要远高于普通知识库
+#                        操作的额度；调整它会同时改变行程导入额度）
 #   READ_RATE_LIMIT      面板数据读接口（会话列表 / 状态 / 导出等每次全量读取）
 #                        的单 IP 窗口额度（默认 600）
 #   WRITE_RATE_LIMIT     用户数据写接口（偏好 / 会话元数据 / 行程 / 删除等）的
 #                        单 IP 窗口额度（默认 240）：每次写都会全量重载并重写
 #                        用户记忆，且与对话落库共用文件锁 / 数据库连接
+#   RATE_LIMIT_MAX_KEYS  进程内限流器每个桶的键表上限（默认 10000，钳制在
+#                        100..1000000）。表满时对新 key fail-closed，Retry-After
+#                        按最早到期键估算；小时 / 日窗口或单进程键基数可能超过
+#                        上限时应配置 REDIS_URL（Redis 后端不设键表上限）
 #   TRUST_PROXY_HEADERS  为 1 时按反向代理的 X-Forwarded-For 最后一个地址限流（默认关闭）
+#   TRUSTED_PROXY_CIDRS  TRUST_PROXY_HEADERS=1 时允许写 XFF 的对端网段（默认只信
+#                        回环 127.0.0.1/32,::1/128；容器 / 跨主机代理必须显式配置）
+#   RATE_IPV6_PREFIX_LEN IPv6 客户端身份的聚合前缀（默认 64；按接入网络委派粒度
+#                        可改为 56 或 48，多实例部署必须同值）
 RATE_LIMIT_CONFIG: RateLimitConfig = {
     "chat_requests": _env_int("CHAT_RATE_LIMIT", 30),
     "ip_requests": _env_int("CHAT_RATE_LIMIT_IP", 120),
@@ -346,7 +363,12 @@ RATE_LIMIT_CONFIG: RateLimitConfig = {
     "read_requests": _env_int("READ_RATE_LIMIT", 600),
     "write_requests": _env_int("WRITE_RATE_LIMIT", 240),
     "window_sec": _env_int("CHAT_RATE_WINDOW_SEC", 60),
+    "max_keys": _env_int("RATE_LIMIT_MAX_KEYS", 10000),
     "trust_proxy_headers": _env_bool("TRUST_PROXY_HEADERS", False),
+    "trusted_proxy_cidrs": _env_str(
+        "TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128"
+    ),
+    "ipv6_prefix_len": _env_int("RATE_IPV6_PREFIX_LEN", 64),
 }
 
 # 窗口 <= 0 会让所有滑动窗口桶退化成「永远是新窗口」（每次请求都被放行，
@@ -357,6 +379,27 @@ if int(RATE_LIMIT_CONFIG["window_sec"]) < 1:
         RATE_LIMIT_CONFIG["window_sec"],
     )
     RATE_LIMIT_CONFIG["window_sec"] = 1
+# 大窗口是有意支持的（小时 / 日配额），但进程内桶的键表在窗口内不会老化：
+# 窗口远大于正常业务节奏时，键表打满会持续整个窗口。只告警不硬钳，避免
+# 破坏有意的日配额配置
+if int(RATE_LIMIT_CONFIG["window_sec"]) > 86400:
+    logger.warning(
+        "CHAT_RATE_WINDOW_SEC=%s 超过一天：进程内限流器的键表在窗口内不会"
+        "老化，建议配置 REDIS_URL 或确认 RATE_LIMIT_MAX_KEYS 足够",
+        RATE_LIMIT_CONFIG["window_sec"],
+    )
+
+# 窗口同时作用于全部桶：非默认值时列出每个桶的等效每分钟额度，避免
+# 「只调对话窗口」却按比例放大知识库 / 读 / 写额度的静默耦合
+_window_sec = int(RATE_LIMIT_CONFIG["window_sec"])
+if _window_sec != 60:
+    logger.warning(
+        "CHAT_RATE_WINDOW_SEC=%s 同时作用于全部限流桶（对话 / IP / 知识库 / "
+        "导入 / 天气 / 读 / 写）：各桶额度按每窗口计，等效每分钟额度 = N×60/%s；"
+        "如只想调整对话窗口请改用独立部署或显式核对各桶额度",
+        _window_sec,
+        _window_sec,
+    )
 
 # 额度 <= 0 会被 RateLimiter 构造时静默钳成 max(1, limit)：常见的
 # 「0 = 关闭限流」写法反而把该桶变成每窗口只有 1 次（面板批量操作全部
@@ -379,3 +422,32 @@ for _limit_key, _limit_env in (
             _limit_value,
         )
         _rate_limits[_limit_key] = 1
+    elif _limit_value > 1_000_000:
+        # 超大额度时进程内单键的 deque 可增长到 limit 个时间戳：只告警，
+        # 不硬钳（有意的大额度配置需要保留语义）
+        logger.warning(
+            "%s=%s 过大：进程内限流器为每个键最多保存 limit 个时间戳，"
+            "内存上界为 max_keys×limit；请确认确有必要",
+            _limit_env,
+            _limit_value,
+        )
+
+# 键表上限：低于 100 会让正常部署频繁触发容量拒绝；高于 100 万时单桶内存
+# 上界过大。越界时钳制并告警（防止 0 / 负数把限流器变成永远满表的拒绝器）
+_max_keys_value = int(RATE_LIMIT_CONFIG["max_keys"])
+if _max_keys_value < 100 or _max_keys_value > 1_000_000:
+    logger.warning(
+        "RATE_LIMIT_MAX_KEYS=%s 越界（100..1000000），按最近边界处理",
+        _max_keys_value,
+    )
+    RATE_LIMIT_CONFIG["max_keys"] = min(1_000_000, max(100, _max_keys_value))
+
+# IPv6 聚合前缀：32..64 之外（<32 会把整片 ISP 范围并桶、>64 会把单个 /64
+# 再切细）没有聚合语义，按默认 /64 处理
+_prefix_value = int(RATE_LIMIT_CONFIG["ipv6_prefix_len"])
+if not 32 <= _prefix_value <= 64:
+    logger.warning(
+        "RATE_IPV6_PREFIX_LEN=%s 非法（需 32..64），按 64 处理",
+        _prefix_value,
+    )
+    RATE_LIMIT_CONFIG["ipv6_prefix_len"] = 64

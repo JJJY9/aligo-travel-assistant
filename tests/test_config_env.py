@@ -469,6 +469,46 @@ def test_rag_config_env_overrides():
     print("✓ RAG 嵌入模型 / 检索阈值环境变量覆盖")
 
 
+def test_rate_limit_max_keys_and_ipv6_prefix_env():
+    """RATE_LIMIT_MAX_KEYS / RATE_IPV6_PREFIX_LEN 读取与越界钳制。"""
+    tmp = tempfile.mkdtemp(prefix="chailv_cfg_")
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.RATE_LIMIT_CONFIG['max_keys']);"
+        "print(config.RATE_LIMIT_CONFIG['ipv6_prefix_len'])"
+    )
+
+    def _run(values: dict[str, str]) -> list[str]:
+        env = dict(os.environ)
+        env.pop("RATE_LIMIT_MAX_KEYS", None)
+        env.pop("RATE_IPV6_PREFIX_LEN", None)
+        env.update(values)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip().splitlines()
+
+    assert _run({}) == ["10000", "64"]
+    assert _run(
+        {"RATE_LIMIT_MAX_KEYS": "50000", "RATE_IPV6_PREFIX_LEN": "56"}
+    ) == ["50000", "56"]
+    # 越界钳制：max_keys < 100 按 100；非法前缀长度按 64
+    assert _run(
+        {"RATE_LIMIT_MAX_KEYS": "5", "RATE_IPV6_PREFIX_LEN": "129"}
+    ) == ["100", "64"]
+    print("✓ RATE_LIMIT_MAX_KEYS / RATE_IPV6_PREFIX_LEN（含越界钳制）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -485,6 +525,7 @@ if __name__ == "__main__":
     test_create_chat_model_max_retries_param()
     test_kb_import_rate_limit_env()
     test_read_rate_limit_env()
+    test_rate_limit_max_keys_and_ipv6_prefix_env()
     _mp = pytest.MonkeyPatch()
     try:
         test_init_agentscope_survives_gbk_print_failure(_mp)
