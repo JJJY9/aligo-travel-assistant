@@ -467,9 +467,7 @@ class _FlakyRedis:
                     else:
                         kept.append(item)
                 self.data = kept
-            # 列表删空时与真实 Lua 一致清 seen 指纹（KEYS[2]）
-            if not self.data and len(keys) > 1:
-                self.seen.pop(keys[1], None)
+            # 与真实 Lua 一致：精确删除保留 seen 指纹（删除的是用户内容）
             return removed
         # 截断脚本：角色判断、内容校验、一次性标记与 cutoff 与 Lua 对应
         marker = keys[1] if len(keys) > 1 else None
@@ -548,12 +546,9 @@ class _FlakyRedis:
                 return 0
             if content.strip() != expected:
                 return 0
-        len_before = len(self.data)
         del self.data[-count:]
-        # 整键删除时与真实 Lua 一致清 seen 指纹（ARGV[6]）：残留的指纹
-        # 会让之后回填 / 重放的同批历史被永久跳过
-        if count >= len_before and len(args) > 5 and args[5]:
-            self.seen.pop(args[5], None)
+        # 与真实 Lua 一致：截断删空整键保留 seen 指纹（用户删除的内容
+        # 不能被重放 / 回填写回窗口）
         return count
 
     def llen(self, key):
@@ -773,8 +768,8 @@ def test_outage_clear_replay_clears_seen_fingerprints(monkeypatch):
     print("✓ 故障期清空重放同时清 seen 指纹")
 
 
-def test_outage_truncate_replay_clears_seen_when_emptied(monkeypatch):
-    """故障期截断把列表删空：重放同样清理 seen（回填不被永久跳过）。"""
+def test_outage_truncate_replay_keeps_seen_when_emptied(monkeypatch):
+    """故障期截断把列表删空：重放保留 seen（已删除轮次不被重放复活）。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -792,14 +787,14 @@ def test_outage_truncate_replay_clears_seen_when_emptied(monkeypatch):
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     assert memory.get_recent_context() == []
     assert client.data == []
-    assert not client.seen.get(seen), (
-        "截断重放删空整键时必须与在线路径一致清理 seen 指纹"
+    assert client.seen.get(seen), (
+        "截断重放删空整键必须保留 seen 指纹（已删除内容不能被重放写回）"
     )
-    print("✓ 故障期截断删空重放同时清 seen 指纹")
+    print("✓ 故障期截断删空重放保留 seen 指纹")
 
 
-def test_outage_truncate_replay_clears_seen_from_other_instance(monkeypatch):
-    """影子缓存没有该轮时走「条件截断」重放：删空整键同样清 seen。"""
+def test_outage_truncate_replay_keeps_seen_from_other_instance(monkeypatch):
+    """影子缓存没有该轮时走「条件截断」重放：删空整键保留 seen。"""
     from context import short_term_memory as module
 
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
@@ -819,8 +814,8 @@ def test_outage_truncate_replay_clears_seen_from_other_instance(monkeypatch):
     monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
     alice.get_recent_context()
     assert client.data == []
-    assert not client.seen.get(seen), "条件截断重放删除整键时必须清 seen"
-    print("✓ 条件截断重放删空整键同时清 seen 指纹")
+    assert client.seen.get(seen), "条件截断重放删空整键必须保留 seen 指纹"
+    print("✓ 条件截断重放删空整键保留 seen 指纹")
 
 
 def test_outage_add_then_truncate_replays_in_order(monkeypatch):

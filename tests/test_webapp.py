@@ -3385,9 +3385,9 @@ def test_import_rejects_backup_over_export_size(monkeypatch):
     )
     assert response.status_code == 413, response.text
     detail = response.json()["detail"]
-    # 有快照时体积轴由合并复核判定（预检只做条数轴），两处文案都以
-    # 「无法（再次）导出」提示不可恢复状态
-    assert "无法再次导出" in detail or "无法再导出" in detail, detail
+    # 知识轴超限现在只是降级导出，文案统一提示先清理再加导，不再断言
+    # 「永久无法导出」
+    assert "导入上限" in detail and "请先清理部分数据" in detail, detail
     print("✓ 恢复前按导出口径复核体积上限")
 
 
@@ -11161,6 +11161,35 @@ def test_knowledge_duplicates_limit_zero_caps_on_web(monkeypatch):
     assert payload["shown"] == 2000
     assert payload["truncated"] is True
     print("✓ Web 重复组 limit=0 截断到 2000 并标记 truncated")
+
+
+def test_knowledge_cleanup_plan_truncated(monkeypatch):
+    """清理接口的 plan 与读接口同一上限：超过 2000 组时截断并标记。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    plan = [{"keep": i, "remove": [i + 10000]} for i in range(2001)]
+    monkeypatch.setattr(
+        server_module,
+        "cleanup_duplicate_contents",
+        lambda dry_run: {
+            "dry_run": dry_run,
+            "removed": 0,
+            "skipped": [],
+            "plan": plan,
+        },
+    )
+    client = _client()
+    client.app.state.aligo.kb_limiter = RateLimiter(limit=10, window_sec=60)
+    response = client.post(
+        "/api/knowledge/duplicates/cleanup", json={"dry_run": True}
+    )
+    assert response.status_code == 200, response.text[:300]
+    payload = response.json()
+    assert payload["truncated"] is True, payload.get("truncated")
+    assert payload["plan_total"] == 2001
+    assert len(payload["plan"]) == 2000
+    print("✓ 清理接口 plan 截断到 2000 组并标记")
 
 
 def test_knowledge_cleanup_redacts_failed_errors(monkeypatch):

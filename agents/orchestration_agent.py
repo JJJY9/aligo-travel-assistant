@@ -1091,11 +1091,16 @@ class OrchestrationAgent(AgentBase):
             # 只复用首轮已成功的结果：status=error（模型格式错误 / 超时）
             # 在整轮回退重试时应当重新执行，否则瞬时失败被缓存成永久失败
             retry_cache[cache_key] = result
+        deleted_now = (
+            await asyncio.to_thread(self._session_deleted_now)
+            if checkpoint_store is not None and checkpoint_key
+            else False
+        )
         if (
             checkpoint_store is not None
             and checkpoint_key
             and result.get("status") == "success"
-            and not self._session_deleted_now()
+            and not deleted_now
         ):
             # 会话删除（CLI / 另一实例）已清理该作用域的检查点：在途回合
             # 不能再写出新的检查点文件（会残留到 TTL 且含用户数据）

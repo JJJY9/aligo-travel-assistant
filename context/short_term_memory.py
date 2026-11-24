@@ -380,11 +380,10 @@ if check == '1' then
 end
 if count >= n then
   redis.call('DEL', key)
-  -- seen 指纹随消息键一起清：不清的话，之后从长期记忆回填 / 故障重放
-  -- 的同批历史被 seen 检查永久跳过，空窗口再也进不了历史（ARGV[6]
-  -- 为旧日志重放时缺省 nil，按空串跳过）
-  local seen = ARGV[6]
-  if seen and seen ~= '' then redis.call('DEL', seen) end
+  -- seen 指纹刻意保留：删空的末尾轮次是用户主动删除的内容，seen 是
+  -- 故障重放 / 长期记忆回填「不把已删除问答写回窗口」的唯一跨实例保护。
+  -- （只有 clear / 会话删除路径才随消息键一起清 seen——那些场景的旧
+  -- 历史本来就该由回填恢复）
 else
   redis.call('LTRIM', key, 0, -count - 1)
 end
@@ -398,15 +397,12 @@ return count
 # Redis 里。
 _REMOVE_MESSAGES_LUA = """
 local key = KEYS[1]
-local seen = KEYS[2]
 for i = 1, #ARGV do
   redis.call('LREM', key, 0, ARGV[i])
 end
--- 列表删空时一并删除 seen 指纹（残留会让回填 / 重放的同批历史被永久
--- 跳过）；仍有存活消息时保留 seen，避免重放把同一问答再推一遍
-if seen and redis.call('LLEN', key) == 0 then
-  redis.call('DEL', seen)
-end
+-- seen 指纹刻意保留：remove 只来自「删除最后一轮」的回滚，删掉的是
+-- 用户主动删除的内容——seen 是重放 / 回填不把已删除问答写回窗口的
+-- 唯一跨实例保护（clear / 会话删除路径才随消息键一起清 seen）
 return 1
 """
 
@@ -425,13 +421,32 @@ if cut == '' then
   if seen then redis.call('DEL', seen) end
   return n
 end
+-- 时间戳归一（与 _TRUNCATE_LAST_TURN_LUA 同一口径）：空格分隔 / 超长
+-- 微秒归一后再比较，迟到的清空重放不会把带非规范时间戳的新消息误删
+local function timestamp_key(value)
+  if type(value) ~= 'string' or #value < 10 then
+    return ''
+  end
+  local normalized = value
+  if string.sub(normalized, 11, 11) == ' ' then
+    normalized = string.sub(normalized, 1, 10)
+      .. 'T' .. string.sub(normalized, 12)
+  end
+  if #normalized > 26 then
+    normalized = string.sub(normalized, 1, 26)
+  end
+  return normalized
+end
+local cut_key = timestamp_key(cut)
 local stale = {}
 for i = 0, n - 1 do
   local raw = redis.call('LINDEX', key, i)
   local ok, msg = pcall(cjson.decode, raw)
-  if ok and type(msg) == 'table' and type(msg['timestamp']) == 'string'
-     and msg['timestamp'] <= cut then
-    stale[#stale + 1] = raw
+  if ok and type(msg) == 'table' then
+    local ts = timestamp_key(msg['timestamp'])
+    if ts ~= '' and cut_key ~= '' and ts <= cut_key then
+      stale[#stale + 1] = raw
+    end
   end
 end
 for _, raw in ipairs(stale) do
@@ -1176,8 +1191,6 @@ class RedisShortTermMemory:
                     str(_OP_MARKER_TTL_SEC),
                     cutoff or "",
                     turn_id or "",
-                    # 与在线调用同一口径：重放删空整键时一并清 seen 指纹
-                    seen_key(self.key),
                 )
                 or 0
             )
@@ -1194,13 +1207,7 @@ class RedisShortTermMemory:
             ops.pop(0)
         elif kind == "remove":
             if payload:
-                self.client.eval(
-                    _REMOVE_MESSAGES_LUA,
-                    2,
-                    self.key,
-                    seen_key(self.key),
-                    *payload,
-                )
+                self.client.eval(_REMOVE_MESSAGES_LUA, 1, self.key, *payload)
             ops.pop(0)
         else:  # clear
             cutoff = payload if isinstance(payload, str) else ""
@@ -1506,10 +1513,6 @@ class RedisShortTermMemory:
                 cutoff,
                 # 回合 id：跨实例精确区分「同一文本的不同回合」
                 (turn_id or ""),
-                # 清空整键时一并删除 seen 指纹集合（旧日志没有该参数时
-                # 为 nil，脚本按空串处理）：否则回填 / 重放的同批历史被
-                # seen 永久跳过，空窗口再也进不了历史
-                seen_key(self.key),
             ),
             fallback,
             on_failure,

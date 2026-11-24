@@ -717,6 +717,13 @@ def test_reconcile_confirms_after_open_session():
         all_failed
     )
 
+    # 判定期内曾拿到有效历史、仅最后一次轮询失败：按已确认未落库回填
+    last_poll_failed = data["lastPollFailed"]
+    assert last_poll_failed["input"] == "你好", last_poll_failed
+    assert any(
+        "暂未确认保存结果" in item for item in last_poll_failed["toasts"]
+    ), last_poll_failed
+
     # 对账期间用户点击了其它会话：不能把旧提问写进当前输入框
     interleaved = data["interleaved"]
     assert interleaved["input"] == "", interleaved

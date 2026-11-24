@@ -1411,8 +1411,10 @@ async function downloadFromApi(url, fallbackName) {
   downloadInFlight.add(url);
   const controller =
     typeof AbortController !== "undefined" ? new AbortController() : null;
+  // 端到端预算要覆盖服务端渲染 / 知识库分片规划 + 传输 + blob 缓冲：
+  // 50MB 备份在慢链路上 2 分钟可能不够，放宽到 5 分钟
   const timer = controller
-    ? setTimeout(() => controller.abort(), 120000)
+    ? setTimeout(() => controller.abort(), 300000)
     : null;
   try {
     const response = await fetch(url, {
@@ -1474,7 +1476,7 @@ async function downloadFromApi(url, fallbackName) {
   } catch (error) {
     if (error && error.name === "AbortError") {
       // 服务端挂起 / 连接黑洞：不能让按钮永远没有反馈
-      toast("下载超时：服务端未在 2 分钟内返回，请稍后重试");
+      toast("下载超时：服务端未在 5 分钟内完成，请稍后重试");
     } else {
       // 接口可能返回 400/404/409/503 JSON：不能把错误页当成文件下载
       toast(`下载失败：${error.message}`);
@@ -3422,7 +3424,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
   };
   // 服务端断连后最多等 10 秒 drain（超时后落库线程仍可能继续）：判定期限
   // 必须覆盖它，前 4 次 700ms 快速命中，之后放慢到 1.5s 直到 ~12 秒
-  let lastResponseValid = false;
+  let sawValidResponse = false;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     if (!canSync()) return;
     let data = null;
@@ -3435,7 +3437,9 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     } catch (_) {
       data = null;
     }
-    lastResponseValid = Boolean(data && Array.isArray(data.messages));
+    sawValidResponse = sawValidResponse || Boolean(
+      data && Array.isArray(data.messages),
+    );
     if (!canSync()) return;
     if (data && Array.isArray(data.messages)) {
       const messages = data.messages;
@@ -3512,7 +3516,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
   // 不把提问塞回输入框——服务端 drain 可能已经落库，诱导重发会产生重复
   // 问答；期间用户可能已切换会话 / 用户，也要避免写进新的输入框
   if (!canSync()) return;
-  if (!lastResponseValid) {
+  if (!sawValidResponse) {
     toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
     return;
   }

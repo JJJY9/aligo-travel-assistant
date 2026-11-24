@@ -2337,7 +2337,8 @@ def _import_user_data_locked(
     )
     if late_problem:
         raise ImportVolumeError(
-            f"恢复中止：{late_problem}（恢复后账号将无法再导出全量备份）"
+            f"恢复中止：{late_problem}（恢复后账号导出的备份将超过导入"
+            "上限，请先清理部分数据后重试）"
         )
     if late_unverified and sections.get("knowledge"):
         knowledge_unverified = late_unverified.get(

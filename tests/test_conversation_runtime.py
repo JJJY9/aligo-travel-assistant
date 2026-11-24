@@ -909,6 +909,33 @@ def test_drain_budget_covers_rollback_wait():
     print("✓ drain 总预算覆盖回滚等待")
 
 
+def test_cancel_cleanup_shares_drain_budget():
+    """取消收尾的剩余预算从 begin_drain_cleanup 的截止时刻扣减，drain 消费后复位。"""
+    import time as time_module
+
+    runtime, _ = _make_runtime()
+    # 未建立预算：退回各项默认值
+    assert runtime._cancel_remaining(5.0) == 5.0
+
+    runtime.begin_drain_cleanup(time_module.monotonic() + 0.3)
+    assert runtime._cancel_remaining(5.0) <= 0.35
+    assert runtime._cancel_remaining(2.0) <= 0.35
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()  # 永不完成：drain 用剩余预算超时
+        runtime._pending_persist = pending
+        started = time_module.monotonic()
+        ok = await runtime.drain_pending_persist(timeout_sec=10.0)
+        return ok, time_module.monotonic() - started
+
+    ok, elapsed = asyncio.run(_run())
+    assert ok is False
+    assert elapsed <= 0.8, "drain 必须使用共享截止时刻，而不是全新的 10 秒预算"
+    assert runtime._drain_deadline is None, "drain 消费后复位截止时刻"
+    print("✓ 取消收尾与 drain 共享同一预算")
+
+
 def test_deferred_commit_forwards_epoch():
     """落库回调把本轮纪元传给支持 epoch 的编排器；旧编排器按无参调用。"""
     runtime, _ = _make_runtime()
@@ -1854,6 +1881,7 @@ if __name__ == "__main__":
     test_late_persist_callback_cannot_poison_current_turn()
     test_turn_persisted_false_when_probe_fails_before_turn()
     test_deferred_commit_forwards_epoch()
+    test_cancel_cleanup_shares_drain_budget()
     test_drain_budget_is_shared_across_waits()
     test_drain_budget_covers_rollback_wait()
     test_late_callback_without_checkpoint_key_keeps_next_checkpoint()

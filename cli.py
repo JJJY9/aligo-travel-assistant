@@ -3265,7 +3265,8 @@ def run_user_export_standalone(
             else:
                 knowledge_omitted = (
                     "知识库整体超出导出上限，本次备份不含知识片段"
-                    "（用户数据仍可恢复；知识库请单独使用 kb-export）"
+                    "（用户数据仍可恢复；知识库需先在源机把片段删除到导出"
+                    "上限以内，再单独 kb-export / 迁移）"
                 )
             problem = None
     if problem:
@@ -3463,7 +3464,8 @@ def run_user_import_standalone(
             if merged_problem:
                 return _fail(
                     f"恢复中止：{merged_problem}"
-                    "（恢复后账号将无法再导出全量备份，请先清理数据或拆分备份）"
+                    "（恢复后账号导出的备份将超过导入上限，"
+                    "请先清理数据或拆分备份）"
                 )
             knowledge_skip_reason = knowledge_unverified.get("reason", "")
             if dry_run:

@@ -253,8 +253,8 @@ def test_redis_truncate_respects_turn_id():
     print("✓ Redis 截断按回合 id 精确匹配（缺 id / 空串退回内容校验）")
 
 
-def test_truncate_clears_seen_fingerprints_on_full_delete():
-    """截断删空整键时一并清 seen 指纹：回填 / 重放的同批历史不被永久跳过。"""
+def test_truncate_keeps_seen_fingerprints_on_full_delete():
+    """截断删空整键保留 seen：已删除的轮次不能被回填 / 重放写回窗口。"""
     from context.short_term_memory import _TRUNCATE_LAST_TURN_LUA
 
     client = fakeredis.FakeRedis(decode_responses=True)
@@ -272,19 +272,23 @@ def test_truncate_clears_seen_fingerprints_on_full_delete():
         "",
         "",
         "",
-        seen_key(key),
     )
     assert count == 1
     assert client.exists(key) == 0
-    assert client.exists(seen_key(key)) == 0, "seen 指纹必须随消息键一起清"
+    assert client.scard(seen_key(key)) == 1, (
+        "截断删空必须保留 seen 指纹：重放 / 回填不能把用户删除的问答写回"
+    )
 
-    # 清空后同一内容重新回填（op_id 不同）：不能被残留 seen 跳过
-    args = ["20", "3600", "op-new", "hash-new", "ordered", payload]
+    # 同一内容（同 role/content/timestamp → 同指纹）重放：被 seen 拦截
+    args = ["20", "3600", "op-new", f"hash-{payload}", "ordered", payload]
     client.eval(
         _ADD_MESSAGES_LUA, 3, key, applied_key(key), seen_key(key), *args
     )
-    assert _contents(client, key) == ["Q"]
-    print("✓ 截断整键删除同时清 seen 指纹，回填不被跳过")
+    assert client.llen(key) == 0, "已删除的轮次不能被重放复活"
+
+    # 对照组：clear 路径随消息键删除 seen（旧历史应由回填恢复）——
+    # 见 test_clear_before_and_remove_scripts_execute
+    print("✓ 截断删空保留 seen 指纹，重放不复活已删除轮次")
 
 
 def test_clear_before_and_remove_scripts_execute():
@@ -318,16 +322,18 @@ def test_clear_before_and_remove_scripts_execute():
     assert client.eval(_CLEAR_BEFORE_LUA, 2, key, seen, "") == 1
     assert client.exists(key) == 0 and client.exists(seen) == 0
 
-    # 按完整消息项精确删除（影子缓存镜像）：删空时同样清 seen
+    # 按完整消息项精确删除（影子缓存镜像）：删空时保留 seen——remove
+    # 只来自「删除最后一轮」的回滚，删除的是用户主动删除的内容
     client.rpush(key, old)
     client.rpush(key, new)
     client.sadd(seen, "hash-old", "hash-new")
-    client.eval(_REMOVE_MESSAGES_LUA, 2, key, seen, old)
+    client.eval(_REMOVE_MESSAGES_LUA, 1, key, old)
     assert _contents(client, key) == ["new"]
     assert client.scard(seen) == 2, "仍有存活消息时保留 seen"
-    client.eval(_REMOVE_MESSAGES_LUA, 2, key, seen, new)
-    assert client.exists(key) == 0 and client.exists(seen) == 0
-    print("✓ 条件清空 / 精确删除脚本在真实 Lua 下执行并清 seen")
+    client.eval(_REMOVE_MESSAGES_LUA, 1, key, new)
+    assert client.exists(key) == 0
+    assert client.scard(seen) == 2, "删空后 seen 保留（已删除内容不被复活）"
+    print("✓ 条件清空清 seen / 精确删除保留 seen")
 
 
 def test_truncate_cutoff_skips_identified_turn():
@@ -411,7 +417,7 @@ if __name__ == "__main__":
     test_untimestamped_old_entry_does_not_force_append()
     test_live_append_mode_ignores_clock_skew()
     test_redis_truncate_respects_turn_id()
-    test_truncate_clears_seen_fingerprints_on_full_delete()
+    test_truncate_keeps_seen_fingerprints_on_full_delete()
     test_clear_before_and_remove_scripts_execute()
     test_truncate_cutoff_skips_identified_turn()
     print("\n全部通过")

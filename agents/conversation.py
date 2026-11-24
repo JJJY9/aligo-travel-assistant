@@ -76,6 +76,8 @@ class ConversationRuntime:
         # 延迟记忆（偏好 / 行程）提交纪元：每轮开始推进，迟到的上一轮落库
         # 回调据此判断自己是否仍属于最近一轮
         self._deferred_epoch = 0
+        # 取消收尾与 drain 的共享截止时刻（begin_drain_cleanup 建立）
+        self._drain_deadline: float | None = None
         # 回合序号：每轮开始推进，落库状态按它确认「属于最近一轮」
         self._turn_seq = 0
         self._pending_rollback: asyncio.Future | None = None
@@ -172,6 +174,9 @@ class ConversationRuntime:
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         settlement = settlement if settlement is not None else {"done": False}
+        # cancel 收尾的共享截止时刻：由断连取消方在 cancel 之前建立，
+        # 暂存等待 / 回滚等待 / drain 都从同一预算扣减
+        self._drain_deadline = None
         # 推进延迟记忆纪元：上一轮迟到的落库回调不能提交本轮暂存的
         # 偏好 / 行程（那份负载属于本轮，必须等本轮自己的落库结果）
         self._deferred_epoch = getattr(self, "_deferred_epoch", 0) + 1
@@ -436,7 +441,11 @@ class ConversationRuntime:
             # 就跳过：它会把整轮问答完整写入长期记忆。
             if not persist_started or self._pending_persist is None:
                 await self._settle_staged_write(stage_future)
-                await self._request_staged_rollback(user_input, turn_state)
+                await self._request_staged_rollback(
+                    user_input,
+                    turn_state,
+                    timeout_sec=self._cancel_remaining(2.0),
+                )
             # 本轮用量没有写进任何持久化消息：记账到下一轮成功回合，否则
             # 下一轮的增量会把它们一起减掉，面板 / 趋势永久少记。取消时写
             # 线程可能仍在途——由完成回调按最终结果结算（成功则 _meta.usage
@@ -518,6 +527,25 @@ class ConversationRuntime:
             timeout_sec=timeout_sec,
         )
 
+    def begin_drain_cleanup(self, deadline: float | None = None) -> None:
+        """取消收尾前建立共享截止时刻（暂存等待 / 回滚 / drain 共用预算）。
+
+        此前取消收尾的 5s 暂存等待 + 2s 回滚等待发生在 drain 计时之前，
+        释放用户锁前的实际上限约 17 秒（与 README 的约 10 秒口径不符）。
+        """
+        if getattr(self, "_drain_deadline", None) is None:
+            self._drain_deadline = (
+                deadline if deadline is not None
+                else time.monotonic() + 10.0
+            )
+
+    def _cancel_remaining(self, default: float) -> float:
+        """收尾等待的剩余预算：未建立预算时退回各项默认值。"""
+        deadline = getattr(self, "_drain_deadline", None)
+        if deadline is None:
+            return default
+        return max(0.05, min(default, deadline - time.monotonic()))
+
     async def _settle_staged_write(
         self, stage_future: "asyncio.Future | None"
     ) -> None:
@@ -530,7 +558,10 @@ class ConversationRuntime:
         if stage_future is None or stage_future.done():
             return
         try:
-            await asyncio.wait_for(asyncio.shield(stage_future), timeout=5.0)
+            await asyncio.wait_for(
+                asyncio.shield(stage_future),
+                timeout=self._cancel_remaining(5.0),
+            )
         except asyncio.TimeoutError:
             logger.debug("等待暂存写入未在限时内完成，回滚可能跳过该条")
         except asyncio.CancelledError:
@@ -788,7 +819,11 @@ class ConversationRuntime:
         共享同一个截止时刻（此前各自按 10s / 2s / 10s 串行累计，释放用户
         锁前的实际上限约 22 秒，与 README 的 10 秒口径不符）。
         """
-        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        deadline = getattr(self, "_drain_deadline", None)
+        if deadline is None or deadline - time.monotonic() <= 0:
+            deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        # 截止时刻属于本轮的取消收尾：drain 消费后复位，下一轮重新计
+        self._drain_deadline = None
 
         def _remaining() -> float:
             return max(0.05, deadline - time.monotonic())
