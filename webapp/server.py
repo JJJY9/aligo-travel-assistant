@@ -4165,13 +4165,13 @@ def create_app(model: Any = None) -> FastAPI:
                 from utils.rag_eval import evaluate_retrieval
             except ImportError as exc:
                 logger.warning("检索评测依赖不可用: %s", exc)
-                raise _storage_failure("评测依赖不可用", exc) from exc
+                raise _knowledge_unavailable("评测依赖不可用", exc) from exc
 
             try:
                 agent = RAGKnowledgeAgent(collection_name=status["collection"])
             except Exception as exc:  # noqa: BLE001 - 嵌入模型缺失 / 离线下载失败等
                 logger.warning("检索评测初始化失败: %s", exc)
-                raise _storage_failure("评测初始化失败", exc) from exc
+                raise _knowledge_unavailable("评测初始化失败", exc) from exc
             if not agent.initialized:
                 raise HTTPException(status_code=503, detail="RAG 依赖未安装")
             try:
@@ -4207,7 +4207,7 @@ def create_app(model: Any = None) -> FastAPI:
                 return result
             except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
                 logger.warning("检索评测失败: %s", exc)
-                raise _storage_failure("评测失败", exc) from exc
+                raise _knowledge_unavailable("评测失败", exc) from exc
         finally:
             state.eval_lock.release(token)
 

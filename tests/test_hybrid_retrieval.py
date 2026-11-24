@@ -117,6 +117,31 @@ def test_normalized_score_is_length_neutral():
     print("✓ 归一化对长度中性（长片段不误拒、短片段不误放）")
 
 
+def test_single_token_query_does_not_score_full_marks():
+    """单 token 查询：含该词的片段不能恒得 1.0（否则 min_score 完全失效）。"""
+    docs = [
+        {"id": "1", "content": "出差住宿标准与报销流程"},
+        {"id": "2", "content": "其他无关内容"},
+    ]
+    index = BM25Index(docs)
+    score = index.normalized_score("出差", docs[0]["content"])
+    assert 0.0 < score < 0.75, score
+
+
+def test_partial_coverage_cannot_reach_full_marks_by_tf_saturation():
+    """只命中一部分查询词时，重复该词不能把归一化分抬到满分。"""
+    docs = [
+        {"id": "1", "content": "发票发票发票发票发票发票发票发票"},
+        {"id": "2", "content": "审批单与增值税发票：报销需要准备哪些材料"},
+    ]
+    index = BM25Index(docs)
+    query = "报销需要准备哪些发票材料"
+    saturated = index.normalized_score(query, docs[0]["content"])
+    full = index.normalized_score(query, docs[1]["content"])
+    assert saturated < 0.9, saturated
+    assert full > saturated, (full, saturated)
+
+
 def test_repeated_query_terms_do_not_inflate_bm25():
     """重复查询词不能把 BM25 原始分翻倍（否则归一后截断成 1.0）。"""
     index = BM25Index([{"id": 1, "content": "住宿标准每晚 600 元"}])
@@ -167,6 +192,8 @@ if __name__ == "__main__":
     test_bm25_query_reference_uses_unique_query_terms()
     test_unseen_query_terms_do_not_collapse_reference()
     test_normalized_score_is_length_neutral()
+    test_single_token_query_does_not_score_full_marks()
+    test_partial_coverage_cannot_reach_full_marks_by_tf_saturation()
     test_repeated_query_terms_do_not_inflate_bm25()
     test_annotate_uses_per_document_normalized_scores()
     test_annotate_with_query_reference_does_not_auto_pass_top_hit()
