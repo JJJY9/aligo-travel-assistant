@@ -5925,6 +5925,216 @@ def test_migrate_dedupes_preference_types():
     print("✓ 重复类型偏好迁移去重（保留最后一条）")
 
 
+def test_pg_delete_paths_lock_message_table_like_import():
+    """delete_chat_session / delete_last_turn 与批量导入互斥。
+
+    导入（add_chat_messages）只取 chat_messages 锁；删除若只取
+    session_meta 锁，两者交错会把已删除的消息判重跳过、只提交备份中
+    新增的消息（部分复活）。删除必须在 session_meta 之后补取
+    chat_messages 锁——与 add_chat_turn 同一锁顺序，不成环。
+    """
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    events: list[tuple] = []
+
+    class _Cursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            events.append((str(sql), params))
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        autocommit = True
+
+        def transaction(self):
+            return contextlib_module.nullcontext()
+
+        def cursor(self):
+            return _Cursor()
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-lock-order"
+    memory._conn = _Conn()
+    memory._retry_errors = ()
+
+    assert memory.delete_chat_session("s1") == 0
+    lock_calls = [
+        params for sql, params in events if "pg_advisory_xact_lock" in sql
+    ]
+    assert lock_calls == [
+        ("aligo:session_meta:u-lock-order",),
+        ("aligo:chat_messages:u-lock-order",),
+    ], lock_calls
+
+
+def test_pg_recent_reads_exclude_future_timestamps():
+    """最近 N 条与「最后一轮」查询排除未来时间戳（导入允许 ≤2100）。
+
+    created_at 排序下 2030 行会永久占据 newest-N，把此后所有真实消息
+    挤出汇总窗口 / 短期回填，且 delete_last_turn 一直把 2030 当最后
+    一轮——JSON 后端随新消息追加自然恢复，PG 不会。
+    """
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    captured: list[str] = []
+
+    class _Conn:
+        autocommit = True
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-future"
+    memory._conn = _Conn()
+    memory._retry_errors = ()
+
+    def fetchall(sql, params=None, **kwargs):
+        captured.append(str(sql))
+        return []
+
+    memory._fetchall = fetchall
+    memory.get_chat_history(limit=5)
+    assert "interval '1 hour'" in captured[-1], captured[-1]
+    memory.delete_last_turn("s1")
+    assert "interval '1 hour'" in captured[-1], captured[-1]
+
+
+def test_pg_advisory_unlock_never_replays_after_reconnect():
+    """解锁不自动重放：连接重建会按剩余记账重获外层锁，重放 unlock 会把
+    外层刚重获的唯一持有又释放掉（锁记账与实际持有脱节）。"""
+    import threading
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            return None
+
+    class _Conn:
+        autocommit = True
+
+        def cursor(self):
+            return _Cursor()
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-unlock"
+    memory._conn = _Conn()
+    memory._retry_errors = ()
+    memory._held_locks = {}
+    memory._conn_lock = threading.RLock()
+
+    recorded: list[tuple[str, bool]] = []
+    real_execute = memory._execute
+
+    def recording_execute(sql, params=None, replay_safe=True):
+        recorded.append((str(sql), replay_safe))
+        return real_execute(sql, params, replay_safe=replay_safe)
+
+    memory._execute = recording_execute
+    with memory._advisory_lock("aligo-test-lock"):
+        pass
+    unlocks = [
+        (sql, flag) for sql, flag in recorded if "pg_advisory_unlock" in sql
+    ]
+    assert unlocks and unlocks[0][1] is False, unlocks
+
+
+def test_pg_schema_lock_contention_defers_instead_of_failing():
+    """并发实例的 DDL 持锁超过 lock_timeout：跳过本次初始化（下次构造
+    重试），不能冒到构造函数被工厂当成连接故障冷却 60 秒。"""
+    import psycopg
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            if "CREATE TABLE" in str(sql):
+                raise psycopg.errors.LockNotAvailable(
+                    "canceling statement due to lock timeout"
+                )
+
+        def fetchone(self):
+            return None
+
+    class _Conn:
+        autocommit = True
+
+        def cursor(self):
+            return _Cursor()
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-schema"
+    memory._conn = _Conn()
+    memory._retry_errors = ()
+
+    assert memory._create_schema() is False
+
+
+def test_pg_trip_update_replay_is_not_safe():
+    """既有行程的 UPDATE 基于重连前的候选快照：非重放，失败上报由调用方
+    整体重试（重放可能匹配 0 行却按旧 trip_id 报告成功）。"""
+    import contextlib as contextlib_module
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u-trip-replay"
+    store._conn = object()
+    store._retry_errors = ()
+
+    @contextlib_module.contextmanager
+    def fake_lock(name):
+        yield
+
+    store._advisory_lock = fake_lock
+    store._abort_if_reconnected = lambda conn: None
+    store._fetchall = lambda sql, params=None: [
+        (1, "trip_1", "2026-12-01", "2026-12-03")
+    ]
+    # 行程上限检查的 COUNT 查询：小于上限，放行
+    store._fetchone = lambda sql, params=None, replay_safe=True: (0,)
+    executed: list[tuple[str, bool]] = []
+
+    def recording_execute(sql, params=None, replay_safe=True):
+        executed.append((str(sql), replay_safe))
+
+    store._execute = recording_execute
+    trip_id = store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+        }
+    )
+    assert trip_id == "trip_1"
+    updates = [
+        (sql, flag) for sql, flag in executed if "UPDATE aligo_trips" in sql
+    ]
+    assert updates and all(flag is False for _sql, flag in updates), updates
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
